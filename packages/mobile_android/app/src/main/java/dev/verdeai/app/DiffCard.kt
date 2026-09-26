@@ -54,11 +54,11 @@ internal const val DIFF_MAX_COPY_CHARS = 256 * 1024
 @Composable
 internal fun DiffCard(row: ChatRow, ctx: TranscriptContext) {
     val source = remember(ctx.model) { ctx.model.diffSource() }
-    DiffCard(row.id, row.body, source)
+    DiffCard(row.id, row.body, source, ctx.onCitation)
 }
 
 @Composable
-internal fun DiffCard(id: String, body: String, source: DiffRenderSource) {
+internal fun DiffCard(id: String, body: String, source: DiffRenderSource, onOpenFile: ((FileCitation) -> Unit)? = null) {
     val index by produceState(source.cachedIndex(body), body) { value = source.index(body) }
     val diffBody = remember(body) { DiffBody(body) }
     var wrap by rememberSaveable("$id:wrap") { mutableStateOf(false) }
@@ -89,7 +89,7 @@ internal fun DiffCard(id: String, body: String, source: DiffRenderSource) {
         if (files != null) {
             files.take(fileLimit).forEachIndexed { i, entry ->
                 if (i > 0) HorizontalDivider(color = colors.outlineVariant.copy(alpha = 0.5f))
-                DiffFileSection("$id:$i", entry, diffBody, source, wrap, defaultExpanded = files.size == 1)
+                DiffFileSection("$id:$i", entry, diffBody, source, wrap, defaultExpanded = files.size == 1, onOpenFile)
             }
             if (files.size > fileLimit) {
                 val more = files.size - fileLimit
@@ -112,7 +112,8 @@ private fun DiffCounts(added: ULong, removed: ULong) {
 }
 
 @Composable
-private fun DiffFileSection(key: String, entry: DiffIndexEntry, body: DiffBody, source: DiffRenderSource, wrap: Boolean, defaultExpanded: Boolean) {
+private fun DiffFileSection(key: String, entry: DiffIndexEntry, body: DiffBody, source: DiffRenderSource, wrap: Boolean, defaultExpanded: Boolean,
+                            onOpenFile: ((FileCitation) -> Unit)?) {
     var expanded by rememberSaveable("$key:open") { mutableStateOf(defaultExpanded) }
     val colors = MaterialTheme.colorScheme
     Column(Modifier.fillMaxWidth()) {
@@ -124,12 +125,13 @@ private fun DiffFileSection(key: String, entry: DiffIndexEntry, body: DiffBody, 
                 maxLines = 1, overflow = TextOverflow.StartEllipsis)
             DiffCounts(entry.additions, entry.deletions)
         }
-        if (expanded) DiffFileBody(key, entry, body, source, wrap)
+        if (expanded) DiffFileBody(key, entry, body, source, wrap, onOpenFile)
     }
 }
 
 @Composable
-private fun DiffFileBody(key: String, entry: DiffIndexEntry, body: DiffBody, source: DiffRenderSource, wrap: Boolean) {
+private fun DiffFileBody(key: String, entry: DiffIndexEntry, body: DiffBody, source: DiffRenderSource, wrap: Boolean,
+                         onOpenFile: ((FileCitation) -> Unit)?) {
     @Suppress("DEPRECATION") val clipboard = LocalClipboardManager.current
     val record by produceState<DiffRecord?>(null, entry, body) { value = withContext(Dispatchers.Default) { body.record(entry) } }
     val render by produceState<DiffFileRender?>(null, record) {
@@ -148,6 +150,10 @@ private fun DiffFileBody(key: String, entry: DiffIndexEntry, body: DiffBody, sou
         }
         val parsed = render as? DiffFileRender.Parsed
         if (parsed != null && parsed.model.hunks.isNotEmpty()) TextButton(onClick = { fullScreen = true }) { Text("Full screen") }
+        // D-12: the current file on the host, at the first changed line.
+        if (onOpenFile != null && !(parsed?.model?.binary == true && viewerKind(entry.path) == ViewerKind.Text)) TextButton(onClick = {
+            onOpenFile(FileCitation(entry.path, parsed?.model?.let(::firstNewLine)))
+        }) { Text("Open file") }
     }
     when (val r = render) {
         null -> Text("Rendering…", Modifier.padding(horizontal = 12.dp, vertical = 6.dp), style = MaterialTheme.typography.bodySmall,
@@ -360,4 +366,10 @@ private fun DiffFullScreen(path: String, model: DiffFileModel, initialWrap: Bool
             }
         }
     }
+}
+
+/** First line of the new file that a hunk touches, for opening the file at the change. */
+internal fun firstNewLine(model: DiffFileModel): ULong? {
+    val rows = model.hunks.asSequence().flatMap { it.rows }
+    return rows.firstOrNull { it.kind == "add" && it.newLine != null }?.newLine ?: rows.firstNotNullOfOrNull { it.newLine }
 }

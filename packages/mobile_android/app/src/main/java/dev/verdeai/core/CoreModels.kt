@@ -998,6 +998,18 @@ data class EventDirectoryList(
 ) : Event()
 
 @Serializable
+@SerialName("file_open")
+data class EventFileOpen(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `path`: String,
+    val `kind`: FileKind,
+    val `max_bytes`: Long,
+) : Event()
+
+@Serializable
 @SerialName("push_received")
 data class EventPushReceived(
     val `api_version`: Long = 1,
@@ -1194,6 +1206,19 @@ data class EffectTerminalOutput(
 ) : Effect()
 
 @Serializable
+@SerialName("file_fetch")
+data class EffectFileFetch(
+    val `effect_id`: String,
+    val `generation`: String,
+    val `intent_id`: String,
+    val `url`: String,
+    val `headers`: List<Header>,
+    val `timeout_ms`: Long,
+    val `max_response_bytes`: Long,
+    val `tls`: Tls,
+) : Effect()
+
+@Serializable
 data class EffectBatch(
     val `api_version`: Long,
     val `revision`: String,
@@ -1295,6 +1320,7 @@ data class RenderSpan(
 data class FileCitation(
     val `path`: String,
     val `line`: ULong? = null,
+    val `end_line`: ULong? = null,
 )
 
 @Serializable
@@ -1480,6 +1506,12 @@ enum class AttentionKind {
     `needs_approval`,
     `blocked`,
     `failed`,
+}
+
+@Serializable
+enum class FileKind {
+    `file`,
+    `preview`,
 }
 
 @Serializable

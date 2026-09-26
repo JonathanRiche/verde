@@ -170,6 +170,7 @@ test {
     _ = @import("terminal_test.zig");
     _ = @import("chat_test.zig");
     _ = @import("manage_test.zig");
+    _ = @import("files_test.zig");
     _ = @import("model_contract_test.zig");
     _ = @import("auth_harness.zig");
     _ = @import("attention_test.zig");

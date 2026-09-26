@@ -163,6 +163,9 @@ class CoreHost private constructor(
         catch (e: CoreInputRejected) { throw e } catch (_: Exception) { fail(); throw CoreFailure(-1) }
     }
 
+    /** D-12: the body fetched for a succeeded `file_open` intent, once; memory only. */
+    fun takeFile(intentId: String): FileBody? = executor.files.take(intentId)
+
     suspend fun query(selector: String): JsonElement = withContext(dispatcher) {
         check(!closed) { "host_closed" }
         try { read(selector) }
@@ -196,6 +199,7 @@ class CoreHost private constructor(
                                 // A core-driven wipe also retires any platform-cached projections.
                                 updated.clear()
                                 updated[it] = snapshot
+                                executor.files.clear()
                                 mutableHome.value = null
                                 mutableWorkspaces.value = null
                             }

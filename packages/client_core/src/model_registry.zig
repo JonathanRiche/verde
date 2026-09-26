@@ -8,6 +8,7 @@ const pump = @import("terminal_pump.zig");
 const push = @import("push.zig");
 const attention = @import("attention.zig");
 const manage = @import("manage.zig");
+const files = @import("files.zig");
 pub const types = .{
     .{ "TerminalConfig", terminal.Config },
     .{ "TerminalCursorShape", terminal.CursorShape },
@@ -81,6 +82,7 @@ pub const types = .{
     .{ "PushOpenRequest", push.OpenRequest },
     .{ "PushNotification", push.Notification },
     .{ "AttentionKind", attention.Kind },
+    .{ "FileKind", files.Kind },
     .{ "AttentionStatus", attention.Status },
     .{ "AttentionItem", attention.Item },
     .{ "AttentionView", attention.View },

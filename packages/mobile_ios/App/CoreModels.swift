@@ -1491,6 +1491,7 @@ enum Event: Codable {
     case `workspace_archive`(EventWorkspaceArchive)
     case `workspace_close`(EventWorkspaceClose)
     case `directory_list`(EventDirectoryList)
+    case `file_open`(EventFileOpen)
     case `push_received`(EventPushReceived)
     case `terminal_input`(EventTerminalInput)
     init(from decoder: Decoder) throws {
@@ -1549,6 +1550,7 @@ enum Event: Codable {
         case "workspace_archive": self = .`workspace_archive`(try EventWorkspaceArchive(from: decoder))
         case "workspace_close": self = .`workspace_close`(try EventWorkspaceClose(from: decoder))
         case "directory_list": self = .`directory_list`(try EventDirectoryList(from: decoder))
+        case "file_open": self = .`file_open`(try EventFileOpen(from: decoder))
         case "push_received": self = .`push_received`(try EventPushReceived(from: decoder))
         case "terminal_input": self = .`terminal_input`(try EventTerminalInput(from: decoder))
         default: throw DecodingError.dataCorruptedError(forKey: .type, in: c, debugDescription: "Unknown model tag")
@@ -1608,6 +1610,7 @@ enum Event: Codable {
         case .`workspace_archive`(let value): try value.encode(to: encoder)
         case .`workspace_close`(let value): try value.encode(to: encoder)
         case .`directory_list`(let value): try value.encode(to: encoder)
+        case .`file_open`(let value): try value.encode(to: encoder)
         case .`push_received`(let value): try value.encode(to: encoder)
         case .`terminal_input`(let value): try value.encode(to: encoder)
         }
@@ -3926,6 +3929,52 @@ extension EventDirectoryList {
     }
 }
 
+struct EventFileOpen: Codable {
+    var `api_version`: UInt32 = 1
+    var `now_ms`: Int64
+    var `wall_time_ms`: Int64
+    var `intent_id`: String
+    var `path`: String
+    var `kind`: FileKind
+    var `max_bytes`: UInt32
+}
+
+extension EventFileOpen {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `now_ms`
+        case `wall_time_ms`
+        case `intent_id`
+        case `path`
+        case `kind`
+        case `max_bytes`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`now_ms` = try c.decode(Int64.self, forKey: .`now_ms`)
+        self.`wall_time_ms` = try c.decode(Int64.self, forKey: .`wall_time_ms`)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+        self.`path` = try c.decode(String.self, forKey: .`path`)
+        self.`kind` = try c.decode(FileKind.self, forKey: .`kind`)
+        self.`max_bytes` = try c.decode(UInt32.self, forKey: .`max_bytes`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`now_ms`, forKey: .`now_ms`)
+        try c.encode(self.`wall_time_ms`, forKey: .`wall_time_ms`)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        try c.encode(self.`path`, forKey: .`path`)
+        try c.encode(self.`kind`, forKey: .`kind`)
+        try c.encode(self.`max_bytes`, forKey: .`max_bytes`)
+        var tag = encoder.container(keyedBy: ModelDiscriminator.self)
+        try tag.encode("file_open", forKey: .type)
+    }
+}
+
 struct EventPushReceived: Codable {
     var `api_version`: UInt32 = 1
     var `now_ms`: Int64
@@ -4082,6 +4131,7 @@ enum Effect: Codable {
     case `log`(EffectLog)
     case `tls_probe`(EffectTlsProbe)
     case `terminal_output`(EffectTerminalOutput)
+    case `file_fetch`(EffectFileFetch)
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: ModelDiscriminator.self)
         let tag = try c.decode(String.self, forKey: .type)
@@ -4101,6 +4151,7 @@ enum Effect: Codable {
         case "log": self = .`log`(try EffectLog(from: decoder))
         case "tls_probe": self = .`tls_probe`(try EffectTlsProbe(from: decoder))
         case "terminal_output": self = .`terminal_output`(try EffectTerminalOutput(from: decoder))
+        case "file_fetch": self = .`file_fetch`(try EffectFileFetch(from: decoder))
         default: throw DecodingError.dataCorruptedError(forKey: .type, in: c, debugDescription: "Unknown model tag")
         }
     }
@@ -4121,6 +4172,7 @@ enum Effect: Codable {
         case .`log`(let value): try value.encode(to: encoder)
         case .`tls_probe`(let value): try value.encode(to: encoder)
         case .`terminal_output`(let value): try value.encode(to: encoder)
+        case .`file_fetch`(let value): try value.encode(to: encoder)
         }
     }
 }
@@ -4671,6 +4723,54 @@ extension EffectTerminalOutput {
     }
 }
 
+struct EffectFileFetch: Codable {
+    var `effect_id`: String
+    var `generation`: String
+    var `intent_id`: String
+    var `url`: String
+    var `headers`: [Header]
+    var `timeout_ms`: UInt32
+    var `max_response_bytes`: UInt32
+    var `tls`: Tls
+}
+
+extension EffectFileFetch {
+    private enum CodingKeys: String, CodingKey {
+        case `effect_id`
+        case `generation`
+        case `intent_id`
+        case `url`
+        case `headers`
+        case `timeout_ms`
+        case `max_response_bytes`
+        case `tls`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`effect_id` = try c.decode(String.self, forKey: .`effect_id`)
+        self.`generation` = try c.decode(String.self, forKey: .`generation`)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+        self.`url` = try c.decode(String.self, forKey: .`url`)
+        self.`headers` = try c.decode([Header].self, forKey: .`headers`)
+        self.`timeout_ms` = try c.decode(UInt32.self, forKey: .`timeout_ms`)
+        self.`max_response_bytes` = try c.decode(UInt32.self, forKey: .`max_response_bytes`)
+        self.`tls` = try c.decode(Tls.self, forKey: .`tls`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`effect_id`, forKey: .`effect_id`)
+        try c.encode(self.`generation`, forKey: .`generation`)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        try c.encode(self.`url`, forKey: .`url`)
+        try c.encode(self.`headers`, forKey: .`headers`)
+        try c.encode(self.`timeout_ms`, forKey: .`timeout_ms`)
+        try c.encode(self.`max_response_bytes`, forKey: .`max_response_bytes`)
+        try c.encode(self.`tls`, forKey: .`tls`)
+        var tag = encoder.container(keyedBy: ModelDiscriminator.self)
+        try tag.encode("file_fetch", forKey: .type)
+    }
+}
+
 struct EffectBatch: Codable {
     var `api_version`: UInt32
     var `revision`: String
@@ -5044,12 +5144,14 @@ extension RenderSpan {
 struct FileCitation: Codable {
     var `path`: String
     var `line`: UInt64? = nil
+    var `end_line`: UInt64? = nil
 }
 
 extension FileCitation {
     private enum CodingKeys: String, CodingKey {
         case `path`
         case `line`
+        case `end_line`
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -5057,11 +5159,15 @@ extension FileCitation {
         if !c.contains(.`line`) { self.`line` = nil } else {
         self.`line` = try c.decodeIfPresent(UInt64.self, forKey: .`line`)
         }
+        if !c.contains(.`end_line`) { self.`end_line` = nil } else {
+        self.`end_line` = try c.decodeIfPresent(UInt64.self, forKey: .`end_line`)
+        }
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(self.`path`, forKey: .`path`)
         try c.encode(self.`line`, forKey: .`line`)
+        try c.encode(self.`end_line`, forKey: .`end_line`)
     }
 }
 
@@ -5776,6 +5882,11 @@ enum AttentionKind: String, Codable {
     case `needs_approval`
     case `blocked`
     case `failed`
+}
+
+enum FileKind: String, Codable {
+    case `file`
+    case `preview`
 }
 
 enum AttentionStatus: String, Codable {

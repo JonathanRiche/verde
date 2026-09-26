@@ -9,6 +9,7 @@ pub const chat = @import("chat.zig");
 pub const push = @import("push.zig");
 pub const attention = @import("attention.zig");
 pub const manage = @import("manage.zig");
+pub const files = @import("files.zig");
 const chat_index = @import("chat_index.zig");
 const profile = @import("verde_remote").profile;
 const A = std.mem.Allocator;
@@ -74,6 +75,7 @@ pub const State = struct {
     push: push.State = .{},
     attention: attention.State = .{},
     manage: manage.State = .{},
+    files: files.State = .{},
     chat_index: chat_index.State = .{},
     lifecycle: Lifecycle = .created,
     revision: u64 = 0,
@@ -123,6 +125,7 @@ pub const Host = struct {
         try terminal.pump(&tx);
         try chat.pump(&tx);
         try manage.pump(&tx);
+        try files.pump(&tx);
         try push.pump(&tx);
         try chat_index.pump(&tx);
         try attention.pump(&tx);
@@ -358,6 +361,7 @@ pub const Transaction = struct {
             _ = try terminal.intent(self, tag, event);
             _ = try chat.intent(self, tag, event);
             _ = try manage.intent(self, tag, event);
+            try files.intent(self, tag, event);
             _ = try push.intent(self, tag, event);
             try attention.intent(self, tag, event);
             // Pull-to-refresh: an explicit retry also re-reads a ready connection's snapshot and catalog.
@@ -494,6 +498,7 @@ pub const Transaction = struct {
             if (try push.complete(self, p, event)) return;
             if (try attention.complete(self, p, event)) return;
             if (try chat_index.complete(self, p, event)) return;
+            if (try files.complete(self, p, event)) return;
             if (kind == .store_get) {
                 if ((try field(event, "error")) != .null) {
                     self.state.host_error = .{ .domain = "storage", .code = try string(try field(event, "error"), "code"), .message = "Stored profile could not be loaded.", .retryable = true };
@@ -674,7 +679,7 @@ fn append(comptime T: type, a: A, slice: *[]const T, item: T) ApiError!void {
     next[slice.len] = item;
     slice.* = next;
 }
-const intents = [_][]const u8{ "sign_out", "forget_host", "pair", "trust_decision", "retry_connection", "focus", "thread_open", "thread_load_older", "history_search", "history_load_more", "draft_set", "composer_select", "send", "turn_cancel", "followup_submit", "followup_retry", "followup_pull_back", "followup_cancel", "approval_decide", "shell_prepare", "shell_confirm", "slash_search", "slash_run", "mention_search", "terminal_create", "terminal_attach", "terminal_detach", "terminal_input", "terminal_resize", "terminal_kill", "push_register", "thread_create", "new_chat_select", "workspace_create", "workspace_rename", "workspace_archive", "workspace_close", "directory_list" };
+const intents = [_][]const u8{ "sign_out", "forget_host", "pair", "trust_decision", "retry_connection", "focus", "thread_open", "thread_load_older", "history_search", "history_load_more", "draft_set", "composer_select", "send", "turn_cancel", "followup_submit", "followup_retry", "followup_pull_back", "followup_cancel", "approval_decide", "shell_prepare", "shell_confirm", "slash_search", "slash_run", "mention_search", "terminal_create", "terminal_attach", "terminal_detach", "terminal_input", "terminal_resize", "terminal_kill", "push_register", "thread_create", "new_chat_select", "workspace_create", "workspace_rename", "workspace_archive", "workspace_close", "directory_list", "file_open" };
 fn isIntent(tag: []const u8) bool {
     for (intents) |intent| if (eq(tag, intent)) return true;
     return false;
@@ -697,6 +702,8 @@ fn validateIntent(a: A, tag: []const u8, event: V) ApiError!void {
         try push.validate(a, event);
     } else if (manage.owns(tag)) {
         try manage.validate(a, tag, event);
+    } else if (eq(tag, "file_open")) {
+        try files.validate(a, event);
     } else if (eq(tag, "terminal_create")) {
         _ = try decode(struct { workspace_id: []const u8, cwd: ?[]const u8, cols: u16, rows: u16 }, a, event);
     } else if (std.mem.startsWith(u8, tag, "terminal_")) {
@@ -801,6 +808,7 @@ fn receiptField(context: []const u8, key: []const u8, top: bool) bool {
         if (eq(context, "terminal_kill")) break :blk "terminal_id";
         if (eq(context, "push_register")) break :blk "platform send_token key_seed_base64";
         if (manage.receiptFields(context)) |fields| break :blk fields;
+        if (eq(context, "file_open")) break :blk "path kind max_bytes";
         break :blk "";
     };
     var names = std.mem.tokenizeScalar(u8, fields, ' ');

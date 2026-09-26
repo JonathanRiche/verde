@@ -110,12 +110,13 @@ internal fun transcriptPlaceholder(state: TranscriptState): TranscriptPlaceholde
 
 /** Navigation entry: one [TranscriptModel] per back-stack entry, bound to the selected host. */
 @Composable
-internal fun ThreadRoute(hosts: HostsModel, browse: BrowseModel, workspaceId: String, threadId: String, onHosts: () -> Unit, onBack: () -> Unit) {
+internal fun ThreadRoute(hosts: HostsModel, browse: BrowseModel, workspaceId: String, threadId: String, onHosts: () -> Unit,
+                         onCitation: (FileCitation) -> Unit = {}, onBack: () -> Unit) {
     val model: TranscriptModel = viewModel(key = "transcript:$workspaceId:$threadId",
         factory = viewModelFactory { initializer { TranscriptModel(hosts, browse.state, workspaceId, threadId) } })
     val browseState by browse.state.collectAsState()
     val title = browseState.workspaces?.items?.find { it.workspace_id == workspaceId }?.threads?.find { it.thread_id == threadId }?.title
-    TranscriptScreen(model, title, onBack, onHosts, browse::refresh)
+    TranscriptScreen(model, title, onBack, onHosts, browse::refresh, onCitation)
 }
 
 @OptIn(ExperimentalMaterial3Api::class)

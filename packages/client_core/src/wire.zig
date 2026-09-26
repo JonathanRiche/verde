@@ -2,6 +2,7 @@
 //! Engine state is deliberately excluded; counters on the wire are decimal strings.
 const std = @import("std");
 const host = @import("host.zig");
+const files = @import("files.zig");
 pub const Config = host.Config;
 pub const Lifecycle = host.Lifecycle;
 pub const LocalError = host.LocalError;
@@ -65,6 +66,7 @@ pub const Event = union(enum) {
     workspace_archive: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, workspace_id: []const u8, archived: bool },
     workspace_close: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, workspace_id: []const u8 },
     directory_list: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, path: ?[]const u8 = null },
+    file_open: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, path: []const u8, kind: files.Kind, max_bytes: u32 },
     push_received: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, workspace_id: []const u8, thread_id: []const u8, turn_id: []const u8, kind: []const u8 },
     terminal_input: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, terminal_id: []const u8, vt_modes: VtModes, input: struct { kind: enum { text, key, paste }, text: ?[]const u8 = null, key: ?[]const u8 = null, ctrl: bool, alt: bool, shift: bool } },
 };
@@ -84,6 +86,9 @@ pub const Effect = union(enum) {
     log: struct { effect_id: []const u8, generation: []const u8, level: []const u8, code: []const u8, fields: std.json.Value },
     tls_probe: struct { effect_id: []const u8, generation: []const u8, origin: []const u8 },
     terminal_output: struct { effect_id: []const u8, generation: []const u8, terminal_id: []const u8, reset: bool, bytes_base64: []const u8, next_offset: []const u8 },
+    /// Like `http_request` (GET), but the platform keeps the body in memory and reports
+    /// `http_response` with `body_base64: null`; see files.zig.
+    file_fetch: struct { effect_id: []const u8, generation: []const u8, intent_id: []const u8, url: []const u8, headers: []const Header, timeout_ms: u32, max_response_bytes: u32, tls: Tls },
 };
 pub const EffectBatch = struct { api_version: u32, revision: []const u8, effects: []const Effect };
 pub const TrustProposal = struct { id: []const u8, origin: []const u8, spki_sha256: []const u8, runtime_id: ?[]const u8 };

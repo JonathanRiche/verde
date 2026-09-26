@@ -6,7 +6,8 @@ const A = std.mem.Allocator;
 const Error = rendering.Error;
 const eq = rendering.eq;
 
-pub const Citation = struct { path: []const u8, line: ?usize = null };
+/// `end_line` is set only for a range (`#L10-L20`, `:10-20`) and is never before `line`.
+pub const Citation = struct { path: []const u8, line: ?usize = null, end_line: ?usize = null };
 pub const Node = struct {
     kind: []const u8,
     start: usize,
@@ -330,17 +331,36 @@ pub fn citation(a: A, destination: []const u8) Error!?Citation {
     for (path) |c| if (c < 0x20 or c == 0x7f) return null;
     if (!std.mem.startsWith(u8, path, "/") or std.mem.startsWith(u8, path, "//") or std.mem.startsWith(u8, path, "/api/") or std.mem.startsWith(u8, path, "/assets/")) return null;
     var line: ?usize = null;
+    var end_line: ?usize = null;
     var end = path.len;
     const marker = std.mem.lastIndexOf(u8, path, "#L") orelse std.mem.lastIndexOf(u8, path, ":");
     if (marker) |pos| {
         const start = pos + (if (path[pos] == '#') @as(usize, 2) else 1);
-        const n = std.fmt.parseInt(usize, path[start..], 10) catch 0;
-        if (n > 0 and n <= 9007199254740991) {
-            line = n;
-            end = pos;
+        const suffix = path[start..];
+        const dash = std.mem.indexOfScalar(u8, suffix, '-');
+        const n = lineNumber(suffix[0 .. dash orelse suffix.len]);
+        if (n > 0) {
+            if (dash) |d| {
+                const last = lineNumber(std.mem.trimStart(u8, suffix[d + 1 ..], "L"));
+                if (last >= n) {
+                    line = n;
+                    end_line = last;
+                    end = pos;
+                }
+            } else {
+                line = n;
+                end = pos;
+            }
         }
     }
     // Absolute paths must look like files; app routes such as /login are inert.
     if (line == null and std.fs.path.extension(path[0..end]).len == 0) return null;
-    return .{ .path = try a.dupe(u8, path[0..end]), .line = line };
+    return .{ .path = try a.dupe(u8, path[0..end]), .line = line, .end_line = end_line };
+}
+
+/// Positive decimal line number within JS safe-integer range, or 0.
+fn lineNumber(digits: []const u8) usize {
+    for (digits) |c| if (!std.ascii.isDigit(c)) return 0;
+    const n = std.fmt.parseInt(usize, digits, 10) catch return 0;
+    return if (n <= 9007199254740991) n else 0;
 }

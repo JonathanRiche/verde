@@ -65,7 +65,7 @@ internal class TranscriptModel(
     val workspaceId: String,
     val threadId: String,
     private val unfocusDelayMs: Long = UNFOCUS_DELAY_MS,
-) : ViewModel() {
+) : ViewModel(), HighlightSource {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val mutableState = MutableStateFlow(TranscriptState(workspaceId, threadId))
     val state = mutableState.asStateFlow()
@@ -219,8 +219,8 @@ internal class TranscriptModel(
         result.also { renders.markdown[text] = it }
     }
 
-    fun cachedHighlight(code: String, language: String): RenderResult<List<RenderSpan>>? = renders.highlight[language + "\u0000" + code]
-    suspend fun highlight(code: String, language: String): RenderResult<List<RenderSpan>> = renders.highlight[language + "\u0000" + code] ?: run {
+    override fun cachedHighlight(code: String, language: String): RenderResult<List<RenderSpan>>? = renders.highlight[language + "\u0000" + code]
+    override suspend fun highlight(code: String, language: String): RenderResult<List<RenderSpan>> = renders.highlight[language + "\u0000" + code] ?: run {
         val result = utility<HighlightQuery, List<RenderSpan>>(buildJsonObject { put("utility", "highlight"); put("text", code); put("language", language) }.toString()) { it.data?.spans }
         result.also { renders.highlight[language + "\u0000" + code] = it }
     }

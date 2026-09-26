@@ -143,6 +143,58 @@ class CoreHostTest {
         override fun close() { server.shutdown(); client.dispatcher.executorService.shutdown(); client.connectionPool.evictAll() }
     }
 
+    @Test fun fileFetchKeepsTheBodyInMemoryAndReportsOnlyTheStatus() = runBlocking<Unit> {
+        TlsFixture().use { fixture ->
+            val core = FakeCore()
+            val host = CoreHost.create(config, executor(client=fixture.client), core)
+            fun fetch(id: String, cap: Long = 1000) = EffectFileFetch(id, "1", "intent-$id",
+                fixture.server.url("/api/file?path=/w/a.md").toString(), listOf(Header("Authorization", "Bearer t")), 3000, cap,
+                Tls(fixture.origin, fixture.pin))
+            try {
+                fixture.server.enqueue(MockResponse().setHeader("Content-Type", "text/markdown").setBody("# secret notes"))
+                core.effects = listOf(fetch("ok"))
+                start(host)
+                val response = core.next<EventHttpResponse>()
+                assertEquals(200, response.status)
+                assertNull(response.body_base64)
+                assertTrue(response.headers.isEmpty())
+                val request = fixture.server.takeRequest(2, TimeUnit.SECONDS)!!
+                assertEquals("GET", request.method)
+                assertEquals("Bearer t", request.getHeader("Authorization"))
+                val body = host.takeFile("intent-ok")!!
+                assertEquals("# secret notes", body.bytes.decodeToString())
+                assertEquals("text/markdown", body.contentType)
+                assertNull(host.takeFile("intent-ok"))
+
+                fixture.server.enqueue(MockResponse().setResponseCode(403).setBody("{\"error\":\"path_outside_workspace\"}"))
+                core.effects = listOf(fetch("denied"))
+                host.send { n,w -> EventForeground(now_ms=n, wall_time_ms=w) }
+                assertEquals(403, core.next<EventHttpResponse>().status)
+                assertNull(host.takeFile("intent-denied"))
+                fixture.server.takeRequest(2, TimeUnit.SECONDS)
+
+                fixture.server.enqueue(MockResponse().setBody("way too large"))
+                core.effects = listOf(fetch("cap", cap = 4))
+                host.send { n,w -> EventForeground(now_ms=n, wall_time_ms=w) }
+                assertEquals(TransportFailureCode.resource, core.next<EventHttpResponse>().error?.code)
+                assertNull(host.takeFile("intent-cap"))
+                fixture.server.takeRequest(2, TimeUnit.SECONDS)
+            } finally { host.close() }
+        }
+    }
+
+    @Test fun fileSinkIsBoundedAndClears() {
+        val sink = FileSink(capacity = 2)
+        sink.put("a", FileBody(byteArrayOf(1), null))
+        sink.put("b", FileBody(byteArrayOf(2), null))
+        sink.put("c", FileBody(byteArrayOf(3), null))
+        assertNull(sink.take("a"))
+        assertEquals(2, sink.size())
+        sink.clear()
+        assertNull(sink.take("b"))
+        assertEquals(0, sink.size())
+    }
+
     @Test fun httpSuccessPinMismatchAndSystemTrust() = runBlocking {
         TlsFixture().use { fixture ->
             val core = FakeCore()

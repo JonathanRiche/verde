@@ -37,6 +37,12 @@ internal sealed interface MdBlock {
 
 internal data class MdStyle(val link: Color, val codeBackground: Color)
 
+/** K-11 `highlight` queries for code blocks; the transcript and the file viewer (D-12) supply one. */
+internal interface HighlightSource {
+    fun cachedHighlight(code: String, language: String): RenderResult<List<RenderSpan>>?
+    suspend fun highlight(code: String, language: String): RenderResult<List<RenderSpan>>
+}
+
 /** Only the link schemes the core admits are ever made tappable. */
 internal fun safeLinkUrl(url: String?): String? {
     val value = url?.trim() ?: return null
@@ -44,7 +50,8 @@ internal fun safeLinkUrl(url: String?): String? {
     return value.takeIf { scheme == "http" || scheme == "https" || scheme == "mailto" }
 }
 
-internal fun citationLabel(citation: FileCitation) = basename(citation.path) + (citation.line?.let { ":$it" } ?: "")
+internal fun citationLabel(citation: FileCitation) = basename(citation.path) +
+    (citation.line?.let { line -> ":$line" + (citation.end_line?.takeIf { it > line }?.let { "-$it" } ?: "") } ?: "")
 
 internal fun markdownBlocks(nodes: List<MarkdownNode>, style: MdStyle, onCitation: (FileCitation) -> Unit): List<MdBlock> {
     val out = ArrayList<MdBlock>()
@@ -184,14 +191,14 @@ internal fun MarkdownText(text: String, model: TranscriptModel, onCitation: (Fil
 }
 
 @Composable
-internal fun MarkdownBlocks(blocks: List<MdBlock>, model: TranscriptModel, modifier: Modifier = Modifier) {
+internal fun MarkdownBlocks(blocks: List<MdBlock>, model: HighlightSource, modifier: Modifier = Modifier) {
     Column(modifier, verticalArrangement = Arrangement.spacedBy(6.dp)) {
         blocks.forEach { MdBlockView(it, model) }
     }
 }
 
 @Composable
-private fun MdBlockView(block: MdBlock, model: TranscriptModel) {
+private fun MdBlockView(block: MdBlock, model: HighlightSource) {
     val type = MaterialTheme.typography
     when (block) {
         is MdBlock.Paragraph -> Text(block.text, style = type.bodyMedium)
@@ -228,7 +235,7 @@ private fun MdBlockView(block: MdBlock, model: TranscriptModel) {
 internal const val CODE_BLOCK_TAG = "code-block"
 
 @Composable
-internal fun CodeBlock(code: String, language: String?, model: TranscriptModel) {
+internal fun CodeBlock(code: String, language: String?, model: HighlightSource) {
     @Suppress("DEPRECATION") val clipboard = LocalClipboardManager.current
     val spans by produceState(language?.let { model.cachedHighlight(code, it) }, code, language) {
         value = language?.let { model.highlight(code, it) }

@@ -21,6 +21,7 @@ import androidx.navigation.compose.rememberNavController
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
+import dev.verdeai.core.FileCitation
 import dev.verdeai.core.Pane
 import dev.verdeai.core.ThreadSummary
 
@@ -32,10 +33,14 @@ internal object Routes {
     const val THREAD = "thread/{ws}/{thread}"
     const val TERMINAL = "terminal/{ws}/{terminal}"
     const val NEW_TERMINAL = "terminal-new/{ws}"
+    /** D-12 viewer; the path is one encoded segment and 0 means "no line". */
+    const val FILE = "file/{ws}/{line}/{end}/{path}"
     fun workspace(ws: String) = "workspace/${Uri.encode(ws)}"
     fun thread(ws: String, thread: String) = "thread/${Uri.encode(ws)}/${Uri.encode(thread)}"
     fun terminal(ws: String, terminal: String) = "terminal/${Uri.encode(ws)}/${Uri.encode(terminal)}"
     fun newTerminal(ws: String) = "terminal-new/${Uri.encode(ws)}"
+    fun file(ws: String, citation: FileCitation) =
+        "file/${Uri.encode(ws)}/${citation.line ?: 0UL}/${citation.end_line ?: 0UL}/${Uri.encode(citation.path)}"
 }
 
 private data class Tab(val route: String, val label: String, val icon: ImageVector)
@@ -102,6 +107,7 @@ private fun Graph(nav: NavHostController, start: String, hosts: HostsModel, brow
     val openWorkspace: (String) -> Unit = { nav.navigate(Routes.workspace(it)) }
     val showHosts: () -> Unit = { nav.tab(Routes.HOSTS) }
     val manage: ManageModel = viewModel(key = "manage", factory = viewModelFactory { initializer { ManageModel(hosts, browse.state) } })
+    val openFile: (String, FileCitation) -> Unit = { ws, citation -> nav.navigate(Routes.file(ws, citation)) }
     val pair: () -> Unit = {
         browse.state.value.hostId?.let { id -> if (browse.state.value.row?.view?.auth_state != "signing_out") hosts.showPairing(id) }
         nav.tab(Routes.HOSTS)
@@ -124,11 +130,19 @@ private fun Graph(nav: NavHostController, start: String, hosts: HostsModel, brow
         manageRoutes(nav, browse, manage, openThread, openWorkspace)
         composable(Routes.THREAD) { entry ->
             val args = entry.arguments
-            ThreadRoute(hosts, browse, args?.getString("ws").orEmpty(), args?.getString("thread").orEmpty(), showHosts) { nav.popBackStack() }
+            val ws = args?.getString("ws").orEmpty()
+            ThreadRoute(hosts, browse, ws, args?.getString("thread").orEmpty(), showHosts, onCitation = { openFile(ws, it) }) { nav.popBackStack() }
         }
         composable(Routes.TERMINAL) { entry ->
             val args = entry.arguments
             TerminalScreen(hosts, browse, args?.getString("ws").orEmpty(), args?.getString("terminal").orEmpty()) { nav.popBackStack() }
+        }
+        composable(Routes.FILE) { entry ->
+            val args = entry.arguments
+            val ws = args?.getString("ws").orEmpty()
+            FileRoute(hosts, browse, ws, args?.getString("path").orEmpty(),
+                args?.getString("line")?.toLongOrNull()?.takeIf { it > 0 }, args?.getString("end")?.toLongOrNull()?.takeIf { it > 0 },
+                onCitation = { openFile(ws, it) }) { nav.popBackStack() }
         }
         composable(Routes.NEW_TERMINAL) { entry ->
             TerminalScreen(hosts, browse, entry.arguments?.getString("ws").orEmpty(), null) { nav.popBackStack() }

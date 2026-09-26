@@ -87,7 +87,16 @@ test "web file citation and document links produce abstract targets" {
         const citation = (try rendering.markdown.citation(a, target)).?;
         try eql("/src/main.zig", citation.path);
         try expect(citation.line == 42);
+        try expect(citation.end_line == null);
     }
+    for ([_][]const u8{ "/src/main.zig:10-20", "file:///src/main.zig#L10-L20", "/src/main.zig#L10-20" }) |target| {
+        const citation = (try rendering.markdown.citation(a, target)).?;
+        try eql("/src/main.zig", citation.path);
+        try expect(citation.line == 10 and citation.end_line == 20);
+    }
+    // A reversed or malformed range is not a line target.
+    for ([_][]const u8{ "/src/main.zig:20-10", "/src/main.zig#L1_0" }) |target|
+        try expect((try rendering.markdown.citation(a, target)).?.line == null);
     for ([_][]const u8{ "/api/file?path=%2Fhome%2Frtg%2Fplan.docx", "/api/preview?path=%2Fhome%2Frtg%2Fplan.docx" }) |target|
         try eql("/home/rtg/plan.docx", (try rendering.markdown.citation(a, target)).?.path);
     for ([_][]const u8{ "/login", "/assets/index.js", "https://example.com/report.pdf" }) |target|

@@ -30,6 +30,8 @@ class EffectExecutor(
     private val notify: (EffectNotify) -> Unit = {},
     // Tests may supply a loopback CA. Production always uses the platform trust manager.
     private val baseClient: OkHttpClient = OkHttpClient(),
+    /** D-12: bodies of `file_fetch` effects, held in memory only until the viewer takes them. */
+    val files: FileSink = FileSink(),
 ) : AutoCloseable {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     // The core caps outstanding correlations at 256. OkHttp's default five per
@@ -56,6 +58,7 @@ class EffectExecutor(
         when (effect) {
             is EffectHttpRequest -> http(effect)
             is EffectHttpCancel -> calls.remove(effect.request_id)?.cancel()
+            is EffectFileFetch -> fileFetch(effect)
             is EffectWsOpen -> websocket(effect)
             is EffectWsSend -> sockets[effect.socket_id]?.let {
                 if (!it.socket.send(effect.text)) it.finish(null, false, failure(TransportFailureKind.network, TransportFailureCode.reset))
@@ -195,6 +198,58 @@ class EffectExecutor(
         } catch (error: Exception) { client?.let(::release); httpDone(e, null, emptyList(), null, transport(error)) }
     }
 
+    /**
+     * `http_request` semantics (pinned, no redirects/cookies/retries) for a GET whose body stays in
+     * [files]; the core receives the status only. Nothing about the file is logged.
+     */
+    private fun fileFetch(e: EffectFileFetch) {
+        var client: OkHttpClient? = null
+        fun done(status: Int?, error: TransportFailure?) = emit { n, w ->
+            EventHttpResponse(now_ms=n, wall_time_ms=w, effect_id=e.effect_id, generation=e.generation,
+                status=status, headers=emptyList(), body_base64=null, error=error)
+        }
+        try {
+            val url = secureUrl(e.url, e.tls)
+            val active = client(url, e.tls, e.timeout_ms).also { client = it }
+            val request = Request.Builder().url(url).get()
+            e.headers.forEach { request.addHeader(it.name, it.value) }
+            val call = active.newCall(request.build())
+            calls[e.effect_id] = call
+            call.enqueue(object : Callback {
+                override fun onFailure(call: Call, error: IOException) {
+                    calls.remove(e.effect_id); release(active)
+                    done(null, if (call.isCanceled()) failure(TransportFailureKind.cancelled, TransportFailureCode.cancelled) else transport(error))
+                }
+                override fun onResponse(call: Call, response: Response) {
+                    try {
+                        response.use {
+                            if (!it.isSuccessful) { done(it.code, null); return }
+                            val body = it.body
+                            if (body != null && body.contentLength() > e.max_response_bytes) throw ResponseLimit()
+                            val output = ByteArrayOutputStream()
+                            val buffer = ByteArray(64 * 1024)
+                            val input = body?.byteStream()
+                            if (input != null) while (true) {
+                                val count = input.read(buffer)
+                                if (count < 0) break
+                                if (output.size().toLong() + count > e.max_response_bytes) throw ResponseLimit()
+                                output.write(buffer, 0, count)
+                            }
+                            if (call.isCanceled()) throw IOException()
+                            files.put(e.intent_id, FileBody(output.toByteArray(), it.header("Content-Type")))
+                            done(it.code, null)
+                        }
+                    } catch (error: Exception) {
+                        done(null, if (call.isCanceled()) failure(TransportFailureKind.cancelled, TransportFailureCode.cancelled) else transport(error))
+                    } catch (_: OutOfMemoryError) {
+                        // Reported like the size cap: the viewer shows "too large".
+                        done(null, transport(ResponseLimit()))
+                    } finally { calls.remove(e.effect_id); release(active) }
+                }
+            })
+        } catch (error: Exception) { client?.let(::release); done(null, transport(error)) }
+    }
+
     private fun httpDone(e: EffectHttpRequest, status: Int?, headers: List<Header>, body: String?, error: TransportFailure?) = emit { n,w ->
         EventHttpResponse(now_ms=n, wall_time_ms=w, effect_id=e.effect_id, generation=e.generation, status=status, headers=headers, body_base64=body, error=error)
     }
@@ -282,6 +337,7 @@ class EffectExecutor(
         probes.forEach { try { it.close() } catch (_: IOException) {} }; probes.clear()
         timers.values.forEach { it.cancel() }; timers.clear()
         storage.close(); scope.cancel()
+        files.clear()
         clients.forEach { it.connectionPool.evictAll() }; clients.clear()
         networkDispatcher.executorService.shutdown()
     }
