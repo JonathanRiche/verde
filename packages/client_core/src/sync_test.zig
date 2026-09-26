@@ -771,3 +771,36 @@ test "delta notices coalesce, replays are idempotent and heartbeats are free" {
     try expect(tx.state.sync.delta.enabled);
     try expect(tx.state.sync.delta.active_cursor.? == 13 and tx.state.sync.delta.active_catalog);
 }
+
+test "workspace projection normalizes legacy milliseconds before recent sorting and age buckets" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const data = try host.parse(a,
+        \\{"snapshot":{"workspaces":[{"workspace_id":"w","threads":[
+        \\{"local_thread_id":"old","title":"Legacy","last_activity_at":1700000000999},
+        \\{"local_thread_id":"new","title":"Current","last_activity_at":1790000000},
+        \\{"local_thread_id":"unknown","title":"Unknown"}]}]}}
+    );
+    const catalog = p.rows(p.get(p.rows(p.get(p.get(data, "snapshot"), "workspaces"))[0], "threads"));
+    // Both the initial snapshot and the completed catalog use the same units.
+    for ([_]bool{ false, true }) |has_catalog| {
+        var listed: std.ArrayList(std.json.Value) = .empty;
+        for (catalog) |row| {
+            var copy = try host.parse(a, try std.json.Stringify.valueAlloc(a, row, .{}));
+            try copy.object.put(a, "workspace_id", .{ .string = "w" });
+            try listed.append(a, copy);
+        }
+        const models = try p.project(a, data, listed.items, has_catalog, 1790000060000);
+        try eql("new", models.history[0].thread_id);
+        try eql("old", models.history[1].thread_id);
+        try eql("unknown", models.history[2].thread_id);
+        try std.testing.expectEqual(@as(?i64, 1700000000000), models.workspaces[0].threads[0].last_activity_at_ms);
+        try std.testing.expectEqual(@as(?i64, 1790000000000), models.history[0].last_activity_at_ms);
+        try std.testing.expectEqual(@as(?i64, null), models.history[2].last_activity_at_ms);
+        try eql("Today", models.history[0].history_bucket);
+        try eql("Older", models.history[1].history_bucket);
+        try eql("new", models.workspaces[0].panes[0].thread_id.?);
+        try eql("old", models.workspaces[0].panes[1].thread_id.?);
+    }
+}

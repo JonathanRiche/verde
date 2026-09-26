@@ -1,6 +1,7 @@
 //! Detached workspace projection, ported from web store.ts. No desktop mirrors.
 const std = @import("std");
 const host = @import("host.zig");
+const store = @import("headless").store_protocol;
 const A = std.mem.Allocator;
 const V = std.json.Value;
 const eq = host.eq;
@@ -89,7 +90,7 @@ fn turnFor(turns: V, ws: []const u8, id: []const u8) V {
     return result;
 }
 fn summary(ws: []const u8, t: V, turns: V, now: i64) ThreadSummary {
-    const sec = num(get(t, "last_activity_at"));
+    const sec = store.threadActivitySeconds(num(get(t, "last_activity_at")));
     const ms = if (sec) |n| std.math.mul(i64, n, 1000) catch null else null;
     const age = @as(i128, now) - @as(i128, ms orelse 0);
     return .{ .workspace_id = ws, .thread_id = s(t, "local_thread_id"), .title = fallback(s(t, "title"), "Chat"), .provider = fallback(s(t, "provider"), "opencode"), .model = nullable(get(t, "model_ref")), .cwd = nullable(get(t, "cwd")), .open = !eqFalse(get(t, "open")), .archived = yes(get(t, "archived")), .last_activity_at_ms = ms, .status = fallback(s(turnFor(turns, ws, s(t, "local_thread_id")), "status"), "idle"), .history_bucket = if (age < 86_400_000) "Today" else if (age < 604_800_000) "This week" else "Older" };
@@ -170,8 +171,8 @@ fn subagent(id: []const u8) bool {
     return std.mem.startsWith(u8, id, "subagent:");
 }
 fn recent(_: void, l: V, r: V) bool {
-    const x = num(get(l, "last_activity_at")) orelse 0;
-    const y = num(get(r, "last_activity_at")) orelse 0;
+    const x = store.threadActivitySeconds(num(get(l, "last_activity_at"))) orelse 0;
+    const y = store.threadActivitySeconds(num(get(r, "last_activity_at"))) orelse 0;
     return if (x == y) std.mem.lessThan(u8, s(l, "local_thread_id"), s(r, "local_thread_id")) else x > y;
 }
 pub fn panesForWorkspace(a: A, ws: V, threads: []const V, sessions: V, turns: V) host.ApiError![]const Pane {
