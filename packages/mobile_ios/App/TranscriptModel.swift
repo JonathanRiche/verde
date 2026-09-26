@@ -191,6 +191,7 @@ final class TranscriptModel: DiffRenderSource {
                         stopSending: stopSending, fatal: fatal)
     }
 
+    var latestOperations: [CoreOperation] { store?.operations?.data?.items ?? [] }
     private var store: CoreViewStore? { browse.hosts.session(boundHostID)?.store }
 
     func start() {
@@ -329,7 +330,11 @@ final class TranscriptModel: DiffRenderSource {
         if composerBytes != composerData {
             composerData = composerBytes
             composer = composerBytes.flatMap { try? JSONDecoder().decode(ComposerQuery.self, from: $0) }?.data
+            // Adopt once per core publication, outside SwiftUI rendering. Encoding
+            // unordered JSON in an onChange key caused a render/adopt feedback loop.
+            input.adopt(composer)
         }
+        input.settleSelection(store.operations?.data?.items ?? [])
         approvals.settle(operations: store.operations?.data?.items)
 
         let b = browse.state

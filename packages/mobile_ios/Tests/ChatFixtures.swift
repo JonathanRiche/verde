@@ -63,6 +63,9 @@ final class ChatCore: HostCore {
         new_chat: ManageNewChat(selection: ChatSelection(), catalogs: ChatCatalogs()),
         can_manage_workspaces: true, can_create_threads: true)
     var rejectDraft = false
+    var holdSelection = false
+    var rejectSelection = false
+    private var heldSelection: EventComposerSelect?
     private var _afterFocus: String?
     private var _missing = false
     private var _ensured = false
@@ -95,6 +98,23 @@ final class ChatCore: HostCore {
     }
     func setThreadLocked(_ name: String) { _thread = name }
     func operation(_ id: String, _ state: String, _ error: LocalError? = nil) { locked { setOperation(id, state, error) } }
+
+    func completeSelection() throws {
+        lock.lock(); defer { lock.unlock() }
+        guard let event = heldSelection else { return }
+        heldSelection = nil
+        try saveSelection(event)
+    }
+    private func saveSelection(_ event: EventComposerSelect) throws {
+        if rejectSelection {
+            setOperation(event.intent_id, "failed", LocalError(code: "invalid_selection", message: "That option isn't available for this model."))
+        } else {
+            var view = try draftView ?? JSONDecoder().decode(ComposerQuery.self, from: SharedFixtures.data("d06", "composer-idle.json")).data!
+            view.selection = ChatSelection(provider: event.provider, model: event.model, effort: event.effort, access: event.access, speed: event.speed)
+            draftView = view
+            setOperation(event.intent_id, "succeeded")
+        }
+    }
 
     func handle(_ bytes: Data) throws -> Data {
         lock.lock(); defer { lock.unlock() }
@@ -151,9 +171,12 @@ final class ChatCore: HostCore {
                 busy: ManageBusy(pending_turns: 2, running_tasks: 1), error: LocalError(code: "workspace_busy", message: "Busy")))
             setOperation(e.intent_id, "failed", LocalError(code: "workspace_busy", message: "Busy"))
         case .history_search(let e): setOperation(e.intent_id, "succeeded")
+        case .composer_select(let e):
+            if holdSelection { heldSelection = e; setOperation(e.intent_id, "pending") }
+            else { try saveSelection(e) }
         case .draft_set(let e):
             if rejectDraft { setOperation(e.intent_id, "failed", LocalError(code: "resource_limit", message: "Draft is too large.")); break }
-            var view = try JSONDecoder().decode(ComposerQuery.self, from: SharedFixtures.data("d06", "composer-idle.json")).data!
+            var view = try draftView ?? JSONDecoder().decode(ComposerQuery.self, from: SharedFixtures.data("d06", "composer-idle.json")).data!
             view.draft = ChatDraft(revision: e.intent_id, text: e.text, attachments: e.attachments.map { ChatAttachment(local_id: $0.local_id, name: $0.name, mime: $0.mime, byte_size: $0.byte_size) }, persisted: true)
             draftView = view
             setOperation(e.intent_id, "succeeded")

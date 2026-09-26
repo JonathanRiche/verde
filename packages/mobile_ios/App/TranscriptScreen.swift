@@ -76,23 +76,25 @@ private struct TranscriptBody: View {
 
     var body: some View {
         let state = model.state
-        VStack(spacing: 0) {
-            TimelineView(.periodic(from: .now, by: 30)) { context in
-                if let banner = transcriptBanner(state, nowMs(context.date)) {
-                    BannerCard(banner: banner, retry: {
-                        if state.thread?.error != nil { model.retry() } else { Task { await browse.refresh() } }
-                    }, hosts: onHosts)
+        GeometryReader { geometry in
+            VStack(spacing: 0) {
+                TimelineView(.periodic(from: .now, by: 30)) { context in
+                    if let banner = transcriptBanner(state, nowMs(context.date)) {
+                        BannerCard(banner: banner, retry: {
+                            if state.thread?.error != nil { model.retry() } else { Task { await browse.refresh() } }
+                        }, hosts: onHosts)
+                    }
                 }
-            }
-            ZStack {
-                if let placeholder = transcriptPlaceholder(state) {
-                    PlaceholderView(kind: placeholder, retry: model.retry)
-                } else {
-                    TranscriptList(model: model, page: state.thread?.page, approval: state.thread?.approval, turn: state.turn)
+                ZStack {
+                    if let placeholder = transcriptPlaceholder(state) {
+                        PlaceholderView(kind: placeholder, retry: model.retry)
+                    } else {
+                        TranscriptList(model: model, page: state.thread?.page, approval: state.thread?.approval, turn: state.turn)
+                    }
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                ChatComposer(model: model.input, availableHeight: geometry.size.height)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            ChatComposer(model: model.input)
         }
         .environment(\.openURL, OpenURLAction { url in
             if url.scheme == citationScheme {

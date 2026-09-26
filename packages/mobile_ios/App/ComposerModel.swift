@@ -39,6 +39,9 @@ final class ComposerModel {
     private(set) var text = ""
     private(set) var selection = NSRange(location: 0, length: 0)
     private(set) var busy = false
+    private(set) var pendingSelection: ChatSelection?
+    private var selectionVersion = 0
+    private var selectionReceipt: String?
     var notice: String?
     private(set) var view: ChatComposerView?
     private(set) var previews: [String: Data] = [:]
@@ -52,9 +55,10 @@ final class ComposerModel {
 
     init(chat: TranscriptModel) { self.chat = chat }
     var token: ComposerToken? { composerToken(text, caret: selection.location) }
+    var displayedSelection: ChatSelection? { pendingSelection ?? view?.selection }
     var pending: Bool { view?.send_operation?.state == "pending" }
     var canSubmit: Bool {
-        guard let view, !busy, !pending, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !view.draft.attachments.isEmpty else { return false }
+        guard let view, !busy, pendingSelection == nil, !pending, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !view.draft.attachments.isEmpty else { return false }
         if text.hasPrefix("/") && !text.hasPrefix("//") { return view.provider_ready }
         if chat.state.turn != nil { return view.provider_ready && (view.followup == nil || text.hasPrefix("!")) }
         return view.can_send
@@ -135,7 +139,7 @@ final class ComposerModel {
     }
 
     /// Receipts are read directly from the actor; UI publications may still be queued.
-    private func dispatch(_ event: (String) -> Event, wait: Bool = false) async -> Operation? {
+    private func dispatch(_ event: (String) -> Event, wait: Bool = false, retainFailure: Bool = false) async -> Operation? {
         guard let host = chat.host else { notice = "The host is unavailable. Your draft is kept."; return nil }
         let id = UUID().uuidString
         do {
@@ -146,7 +150,7 @@ final class ComposerModel {
                 let op = try JSONDecoder().decode(OperationsQuery.self, from: bytes).data?.items.first { $0.intent_id == id }
                 if let op, op.state != "pending" || !wait || ContinuousClock.now >= deadline {
                     await refresh()
-                    if op.state == "failed" { notice = op.error?.message ?? "The action failed. Your draft is kept."; return nil }
+                    if op.state == "failed" { notice = op.error?.message ?? "The action failed. Your draft is kept."; return retainFailure ? op : nil }
                     return op
                 }
                 if !wait || ContinuousClock.now >= deadline { break }
@@ -158,7 +162,7 @@ final class ComposerModel {
     }
 
     private func action(_ body: @escaping () async -> Void) {
-        guard !busy else { return }
+        guard !busy, pendingSelection == nil else { return }
         busy = true
         notice = nil
         debounce?.cancel()
@@ -201,18 +205,52 @@ final class ComposerModel {
     }
 
     func select(_ picker: ComposerPicker, _ value: String) {
-        action { [self] in
-            guard var next = view?.selection else { return }
-            switch picker {
-            case .provider: next = ChatSelection(provider: value, access: next.access)
-            case .model: next.model = value; next.effort = nil; next.speed = nil
-            case .effort: next.effort = value
-            case .access: next.access = value
-            case .speed: next.speed = value
-            }
-            _ = await dispatch { id in .composer_select(EventComposerSelect(now_ms: 0, wall_time_ms: 0, intent_id: id, workspace_id: chat.workspaceID, thread_id: chat.threadID, provider: next.provider, model: next.model, effort: next.effort, access: next.access, speed: next.speed)) }
-            slashRequested = false
+        guard !busy, !pending, var next = displayedSelection else { return }
+        switch picker {
+        case .provider: next = ChatSelection(provider: value, access: next.access)
+        case .model: next.model = value
+        case .effort: next.effort = value
+        case .access: next.access = value
+        case .speed: next.speed = value
         }
+        selectionReceipt = nil
+        selectionVersion += 1
+        let version = selectionVersion
+        pendingSelection = next
+        notice = nil
+        // All saves share the ordered lane with draft writes. Unlike a send,
+        // another picker change is accepted while this save awaits its receipt.
+        enqueue { [self] in
+            var result = await choose(next)
+            if result?.state == "failed", result?.error?.code == "invalid_selection", picker == .model {
+                next.effort = nil; next.speed = nil
+                result = await choose(next)
+            }
+            if result?.state == "succeeded" { slashRequested = false }
+            guard version == selectionVersion else { return }
+            if result?.state == "pending" {
+                selectionReceipt = result?.intent_id
+                notice = "This setting is still saving. Wait for confirmation before sending."
+                settleSelection(chat.latestOperations)
+                return
+            }
+            // dispatch refreshed the confirmed projection before this handoff.
+            pendingSelection = nil
+            if result?.state == "succeeded" { notice = nil }
+        }
+    }
+
+    func settleSelection(_ operations: [CoreOperation]) {
+        guard let id = selectionReceipt, let result = operations.first(where: { $0.intent_id == id }), result.state != "pending" else { return }
+        selectionReceipt = nil
+        pendingSelection = nil
+        notice = result.state == "failed" ? result.error?.message ?? "The setting could not be saved." : nil
+    }
+
+    private func choose(_ next: ChatSelection) async -> Operation? {
+        await dispatch({ id in .composer_select(EventComposerSelect(now_ms: 0, wall_time_ms: 0,
+            intent_id: id, workspace_id: chat.workspaceID, thread_id: chat.threadID,
+            provider: next.provider, model: next.model, effort: next.effort, access: next.access, speed: next.speed)) }, wait: true, retainFailure: true)
     }
 
     func confirmShell(_ confirmation: ChatShellConfirmation, accept: Bool) {
