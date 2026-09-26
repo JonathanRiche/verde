@@ -36,8 +36,12 @@ pub const Call = struct {
     auth_retried: bool = false,
     awaiting_auth: bool = false,
 };
+/// D-10: `workspace_busy` error data, the only remote error data kept besides
+/// `retry_after_ms`. Counts only; never turn or task identities.
+pub const Busy = struct { pending_turns: u32 = 0, running_tasks: u32 = 0 };
 pub const Result = struct {
     steer_can_fallback: bool = false,
+    busy: ?Busy = null,
     id: u64,
     intent_id: ?[]const u8,
     value: ?V = null,
@@ -213,6 +217,7 @@ fn receive(tx: *host.Transaction, call: Call, event: V) host.ApiError!void {
             return;
         }
         try finish(tx, call, null, rpcError(remote));
+        if (eq(u8, remote.code, "workspace_busy")) @constCast(&tx.state.rpc.results[tx.state.rpc.results.len - 1]).busy = busyData(remote.data);
         if (eq(u8, call.method, "chat.turn.steer") and eq(u8, remote.code, "invalid_state")) {
             inline for (.{ "provider does not support daemon steering", "turn cannot accept steering now", "provider thread is not ready", "Codex active turn is not ready" }) |message| {
                 if (eq(u8, remote.message, message)) @constCast(&tx.state.rpc.results[tx.state.rpc.results.len - 1]).steer_can_fallback = true;
@@ -321,6 +326,17 @@ fn rpcError(remote: protocol.Error) host.LocalError {
         }
     }
     return err;
+}
+fn busyData(data: ?V) Busy {
+    var out: Busy = .{};
+    const object = data orelse return out;
+    if (object != .object) return out;
+    inline for (.{ "pending_turns", "running_tasks" }) |name| {
+        if (object.object.get(name)) |count| {
+            if (count == .integer and count.integer >= 0) @field(out, name) = std.math.cast(u32, count.integer) orelse std.math.maxInt(u32);
+        }
+    }
+    return out;
 }
 fn append(comptime T: type, a: A, slice: *[]const T, item: T) host.ApiError!void {
     const next = try a.alloc(T, slice.len + 1);

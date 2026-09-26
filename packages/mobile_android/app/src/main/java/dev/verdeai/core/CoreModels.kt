@@ -915,6 +915,89 @@ data class EventPushRegister(
 ) : Event()
 
 @Serializable
+@SerialName("thread_create")
+data class EventThreadCreate(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `workspace_id`: String,
+    val `provider`: String,
+    val `model`: String? = null,
+    val `effort`: String? = null,
+    val `access`: String? = null,
+    val `speed`: String? = null,
+) : Event()
+
+@Serializable
+@SerialName("new_chat_select")
+data class EventNewChatSelect(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `workspace_id`: String,
+    val `provider`: String? = null,
+    val `model`: String? = null,
+    val `effort`: String? = null,
+    val `access`: String? = null,
+    val `speed`: String? = null,
+) : Event()
+
+@Serializable
+@SerialName("workspace_create")
+data class EventWorkspaceCreate(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `path`: String,
+    val `label`: String? = null,
+) : Event()
+
+@Serializable
+@SerialName("workspace_rename")
+data class EventWorkspaceRename(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `workspace_id`: String,
+    val `label`: String,
+) : Event()
+
+@Serializable
+@SerialName("workspace_archive")
+data class EventWorkspaceArchive(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `workspace_id`: String,
+    val `archived`: Boolean,
+) : Event()
+
+@Serializable
+@SerialName("workspace_close")
+data class EventWorkspaceClose(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `workspace_id`: String,
+) : Event()
+
+@Serializable
+@SerialName("directory_list")
+data class EventDirectoryList(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `path`: String? = null,
+) : Event()
+
+@Serializable
 @SerialName("push_received")
 data class EventPushReceived(
     val `api_version`: Long = 1,
@@ -1409,5 +1492,67 @@ data class AttentionQuery(
     val `api_version`: Long,
     val `revision`: String,
     val `data`: AttentionView?,
+    val `error`: LocalError?,
+)
+
+@Serializable
+data class ManageBusy(
+    val `pending_turns`: Long = 0,
+    val `running_tasks`: Long = 0,
+)
+
+@Serializable
+data class ManageJob(
+    val `intent_id`: String,
+    val `kind`: String,
+    val `state`: String = "pending",
+    val `workspace_id`: String? = null,
+    val `thread_id`: String? = null,
+    val `busy`: ManageBusy? = null,
+    val `error`: LocalError? = null,
+)
+
+@Serializable
+data class ManageDirectoryEntry(
+    val `name`: String,
+    val `path`: String,
+)
+
+@Serializable
+data class ManageDirectory(
+    val `path`: String = "",
+    val `parent`: String? = null,
+    val `entries`: List<ManageDirectoryEntry> = emptyList(),
+    val `suggestions`: List<String> = emptyList(),
+    val `supported`: Boolean = false,
+    val `loading`: Boolean = false,
+    val `error`: LocalError? = null,
+)
+
+@Serializable
+data class ManageNewChat(
+    val `workspace_id`: String? = null,
+    val `selection`: ChatSelection,
+    val `providers`: List<ChatChoice> = emptyList(),
+    val `catalogs`: ChatCatalogs,
+    val `loading`: Boolean = false,
+    val `can_create`: Boolean = false,
+    val `error`: LocalError? = null,
+)
+
+@Serializable
+data class ManageView(
+    val `operations`: List<ManageJob>,
+    val `directory`: ManageDirectory,
+    val `new_chat`: ManageNewChat,
+    val `can_manage_workspaces`: Boolean,
+    val `can_create_threads`: Boolean,
+)
+
+@Serializable
+data class ManageQuery(
+    val `api_version`: Long,
+    val `revision`: String,
+    val `data`: ManageView?,
     val `error`: LocalError?,
 )

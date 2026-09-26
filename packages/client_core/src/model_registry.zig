@@ -7,6 +7,7 @@ const terminal = @import("terminal.zig");
 const pump = @import("terminal_pump.zig");
 const push = @import("push.zig");
 const attention = @import("attention.zig");
+const manage = @import("manage.zig");
 pub const types = .{
     .{ "TerminalConfig", terminal.Config },
     .{ "TerminalCursorShape", terminal.CursorShape },
@@ -81,4 +82,11 @@ pub const types = .{
     .{ "AttentionItem", attention.Item },
     .{ "AttentionView", attention.View },
     .{ "AttentionQuery", wire.Query(attention.View) },
+    .{ "ManageBusy", manage.Busy },
+    .{ "ManageJob", manage.Job },
+    .{ "ManageDirectoryEntry", manage.DirectoryEntry },
+    .{ "ManageDirectory", manage.Directory },
+    .{ "ManageNewChat", manage.NewChat },
+    .{ "ManageView", manage.View },
+    .{ "ManageQuery", wire.Query(manage.View) },
 };

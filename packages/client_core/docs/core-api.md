@@ -248,6 +248,12 @@ Optional values below may be null. These are new local names, not RPC names.
 | `terminal_resize` | `terminal_id,cols,rows`; positive bounded grid, coalesce pending resize. |
 | `terminal_kill` | `terminal_id`; explicit session kill. |
 | `push_register` | `platform:android|ios,send_token,key_seed_base64`; keep this host's push key and call `device.push.register` (K-17, [push.md](push.md)). Needs `device:write`. |
+| `new_chat_select` | `workspace_id,provider?,model?,effort?,access?,speed?`; the New chat sheet's working selection, validated like `composer_select`. A missing provider keeps the current one, then falls back to the workspace's provider (else `codex`). A new workspace or provider loads `provider.models.list` into `manage.new_chat.catalogs` (D-10). |
+| `thread_create` | `workspace_id,provider,model?,effort?,access?,speed?`; validated against the same catalogs. Registers a client if needed, then calls `chat.thread.upsert` with a new `web-thread-*` ID, the title `New Chat`, `committed:false`, `profile_id:local`, `repository_id:primary`, and `access` defaulting to `full_access`. The job's `thread_id` is set immediately. On success the thread opens right away (`thread_open`), even before sync lists it. The first `send` commits it. A closed workspace fails locally with `workspace_archived`. Needs `chat:write`. |
+| `workspace_create` | `path,label?`; an absolute path without `.`/`..` segments, whitespace and trailing `/` trimmed. The ID matches the web's fallback (wyhash seed 0, lowercase hex), and the label defaults to the last path component. Calls `workspace.upsert` with `{workspace_id,label,path}`. A known open folder with no label succeeds without an RPC; a known closed folder is reopened like `workspace_archive`. Needs `repository:write`. |
+| `workspace_rename` / `workspace_archive` | `workspace_id,label` / `workspace_id,archived:bool` (false reopens). Reads `core.snapshot {workspace_id,scopes:[workspaces]}`, then sends `workspace.upsert` with the full metadata (minus threads/messages) at `expected_store_revision`. On `conflict` it re-reads, up to three attempts. Needs `repository:write`. |
+| `workspace_close` | `workspace_id`; `workspace.close`, which stops the workspace's sessions and archives it. A busy workspace fails with code `workspace_busy` and `busy:{pending_turns,running_tasks}` on its job; the UI asks the user to stop them first. Needs `repository:write`. |
+| `directory_list` | `path?`; `workspace.directory.list`, latest wins. A null path starts at the parent of the first known workspace (the daemon accepts workspace parents and home as roots). Needs `repository:read` and the runtime capability `workspace.directory.v1` (else `unsupported`). |
 
 `AttachmentInput` (new local type) is `{local_id,name,mime,byte_size,
 bytes_base64}`. Platform reads picker data before the event; the core never
@@ -261,7 +267,7 @@ reselection; do not silently send only its text.
 ## 6. Queries and new local view models
 
 Required UTF-8 selectors: `hosts`, `home`, `workspaces`, `thread:<id>`,
-`composer:<thread>`, `terminal:<id>`. Thread suffix is a percent-encoded JSON
+`composer:<thread>`, `terminal:<id>`, plus `attention` and `manage`. Thread suffix is a percent-encoded JSON
 array `[workspace_id,local_thread_id]`, terminal suffix an encoded session ID;
 decode once. This avoids collisions without assuming IDs are globally unique.
 `<id>` is a placeholder, not a literal identifier.
@@ -283,6 +289,7 @@ Fields marked `?` mean nullable, not unspecified data.
 | `thread:<id>` | `{thread:ThreadSummary,rows:[Row],page:{has_older,cursor:string?,loading},turn:Turn?,approval:Approval?,usage:Usage?,stale,error:Error?}` |
 | `composer:<thread>` | `{draft:{revision,text,attachments:[Attachment],persisted},selection:{provider,model,effort,access,speed},catalogs:{models:[Choice],efforts:[Choice],access:[Choice],speeds:[Choice],slash:[Choice]},mentions:[{path,label}],provider_ready,can_send,can_stop,send_operation:Operation?,followup:Followup?,shell_confirmation:{id,command,cwd}?,error:Error?}` |
 | `attention` | `{items:[AttentionItem],count,loading}`; K-17 per-thread attention, newest first ([push.md](push.md)). |
+| `manage` | `{operations:[Job],directory:{path,parent?,entries:[{name,path}],suggestions:[string],supported,loading,error?},new_chat:{workspace_id?,selection,providers:[Choice],catalogs,loading,can_create,error?},can_manage_workspaces,can_create_threads}`; D-10. The `Job` shape is `{intent_id,kind,state:pending|succeeded|failed|uncertain,workspace_id?,thread_id?,busy:{pending_turns,running_tasks}?,error?}`. It keeps the latest 16 thread/workspace mutations (not directory or selection intents). Daemon codes the UI acts on (`workspace_busy`, `workspace_archived`, `conflict`, `not_found`, `path_outside_roots`, …) become `error.code`. |
 | `terminal:<id>` | `{terminal_id,workspace_id,label,session_status,attached,cols,rows,next_offset:string?,grid_revision,stale,error:Error?}`; grid cells come from the independent VT snapshot below. |
 
 Supporting shapes:
@@ -392,6 +399,9 @@ web's explicit pre-acceptance rejection rules permit fallback. Pull-back/cancel
 is allowed only for unsent work. Remote image follow-ups queue for the next
 turn. Auto-dispatch a locally active queue only after successful parent
 completion while foregrounded; aborted/failed parents leave it paused.
+
+Every `send` upserts the thread with `committed:true`, as the web does, so
+other clients list a chat created with `thread_create` once it has a message.
 
 Approval comes from the current turn summary/tail (`approvalFromTurn` rules),
 not only an approval event. `chat.turn.approve` uses `turn_id`, `call_id` and

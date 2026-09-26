@@ -134,6 +134,20 @@ fn ensure(tx: *h.Transaction, ws: []const u8, id: []const u8) E!?usize {
     const meta = std.json.parseFromValueLeaky(store.Thread, tx.allocator(), source, .{ .ignore_unknown_fields = true }) catch |e| return h.mapError(e);
     if (meta.profile_id != null and !eq(meta.profile_id.?, "local")) return null;
     if (meta.runtime_id) |runtime| if (tx.state.rpc.runtime_id != null and !eq(runtime, tx.state.rpc.runtime_id.?)) return null;
+    return try insert(tx, ws, id, meta, path);
+}
+/// D-10: a thread this client just created opens before sync lists it.
+pub fn adopt(tx: *h.Transaction, ws: []const u8, meta: store.Thread) E!void {
+    for (tx.state.chat.threads) |t| if (eq(t.workspace_id, ws) and eq(t.id, meta.local_thread_id)) return;
+    // At the cap the created thread still opens once sync lists it.
+    if (tx.state.chat.threads.len >= 128) return;
+    var path: []const u8 = "";
+    for (p.rows(p.get(p.get(tx.state.sync.snapshot, "snapshot"), "workspaces"))) |w| if (eq(p.s(w, "workspace_id"), ws)) {
+        path = p.s(w, "path");
+    };
+    _ = try insert(tx, ws, meta.local_thread_id, meta, path);
+}
+fn insert(tx: *h.Transaction, ws: []const u8, id: []const u8, meta: store.Thread, path: []const u8) E!usize {
     if (tx.state.chat.threads.len >= 128) return error.ResourceLimit;
     const i = tx.state.chat.threads.len;
     const next = try tx.allocator().alloc(Thread, i + 1);
@@ -194,6 +208,8 @@ fn metadata(t: *const Thread) store.Thread {
     out.draft = "";
     out.draft_images = &.{};
     out.draft_image = null;
+    // Sending makes a draft chat visible to other clients, as the web does.
+    out.committed = true;
     out.provider = t.saved.selection.provider orelse out.provider;
     out.model_ref = t.saved.selection.model;
     out.reasoning_effort = if (eq(out.provider, "cursor") or eq(out.provider, "opencode")) null else t.saved.selection.effort;

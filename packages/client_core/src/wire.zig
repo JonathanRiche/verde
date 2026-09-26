@@ -58,6 +58,13 @@ pub const Event = union(enum) {
     terminal_kill: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, terminal_id: []const u8 },
     terminal_resize: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, terminal_id: []const u8, cols: u16, rows: u16 },
     push_register: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, platform: []const u8, send_token: []const u8, key_seed_base64: []const u8 },
+    thread_create: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, workspace_id: []const u8, provider: []const u8, model: ?[]const u8 = null, effort: ?[]const u8 = null, access: ?[]const u8 = null, speed: ?[]const u8 = null },
+    new_chat_select: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, workspace_id: []const u8, provider: ?[]const u8 = null, model: ?[]const u8 = null, effort: ?[]const u8 = null, access: ?[]const u8 = null, speed: ?[]const u8 = null },
+    workspace_create: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, path: []const u8, label: ?[]const u8 = null },
+    workspace_rename: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, workspace_id: []const u8, label: []const u8 },
+    workspace_archive: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, workspace_id: []const u8, archived: bool },
+    workspace_close: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, workspace_id: []const u8 },
+    directory_list: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, path: ?[]const u8 = null },
     push_received: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, workspace_id: []const u8, thread_id: []const u8, turn_id: []const u8, kind: []const u8 },
     terminal_input: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, terminal_id: []const u8, vt_modes: VtModes, input: struct { kind: enum { text, key, paste }, text: ?[]const u8 = null, key: ?[]const u8 = null, ctrl: bool, alt: bool, shift: bool } },
 };
