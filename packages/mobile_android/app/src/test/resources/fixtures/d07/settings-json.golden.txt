@@ -1,0 +1,5 @@
+@@ -0,0 +1,4 @@
+  1 + ⟦{⟧
+  2 + ⟦  "theme": "dark",⟧  | string@2-9 string@11-17
+  3 + ⟦  "size": 12⟧  | string@2-8 number@10-12
+  4 + ⟦}⟧

@@ -148,7 +148,7 @@ class TranscriptTest {
         compose.onNodeWithText("72% left", useUnmergedTree=true).assertExists()
         compose.onNodeWithText("resets Oct 2", useUnmergedTree=true).assertExists()
         list().performScrollToNode(hasText("Provider restarted after an update."))
-        // Changed-files default card lists files from the core diff utility (D-07 replaces it).
+        // Changed-files card (D-07) lists files from the core's diff_index; one file opens directly.
         list().performScrollToNode(hasText("Changed files · 1"))
         compose.onNodeWithText("src/main.zig", useUnmergedTree=true).assertExists()
         compose.onNodeWithText("+1 −1", useUnmergedTree=true).assertExists()
@@ -322,7 +322,11 @@ class TranscriptTest {
         private val texts=ConcurrentHashMap<String,String>()
         fun text(name: String): String = if (name.startsWith("{")) name else texts.getOrPut(name) { read("$name.json") }
         fun thread(name: String): ThreadQuery=CoreJson.decodeFromString(text(name))
-        private val renders: List<JsonObject> by lazy { Json.parseToJsonElement(read("render.json")).jsonArray.map { it.jsonObject } }
+        private val renders: List<JsonObject> by lazy {
+            // d07 adds the core's diff_index reply for the rich diff row (D-07 card).
+            (Json.parseToJsonElement(read("render.json")).jsonArray + Json.parseToJsonElement(
+                TranscriptTest::class.java.getResource("/fixtures/d07/transcript-render.json")!!.readText()).jsonArray).map { it.jsonObject }
+        }
         fun render(kind: String, body: String, language: String?=null): JsonElement? = renders.firstOrNull { entry ->
             val q=entry["query"]!!.jsonObject
             q["kind"]!!.jsonPrimitive.content == kind && q["text"]!!.jsonPrimitive.content == body &&

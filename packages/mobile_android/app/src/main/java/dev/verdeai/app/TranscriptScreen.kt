@@ -59,7 +59,7 @@ internal data class TranscriptRenderers(
     val tool: @Composable (TranscriptItem.Tool, TranscriptContext) -> Unit = { item, _ -> ToolCard(item.row, child = false) },
     val toolGroup: @Composable (TranscriptItem.ToolGroup, TranscriptContext) -> Unit = { item, ctx -> ToolGroupCard(item, ctx) },
     val think: @Composable (TranscriptItem.Think, TranscriptContext) -> Unit = { item, ctx -> ThinkCard(item.row, ctx) },
-    val diff: @Composable (TranscriptItem.Diff, TranscriptContext) -> Unit = { item, ctx -> DiffSummaryCard(item.row, ctx) },
+    val diff: @Composable (TranscriptItem.Diff, TranscriptContext) -> Unit = { item, ctx -> DiffCard(item.row, ctx) },
     val notice: @Composable (TranscriptItem.Notice, TranscriptContext) -> Unit = { item, ctx -> NoticeRow(item.row, ctx) },
     val usage: @Composable (TranscriptItem.Usage, TranscriptContext) -> Unit = { item, _ -> UsageCard(item.usage) },
     val working: @Composable (TranscriptItem.Working, TranscriptContext) -> Unit = { item, ctx -> WorkingRow(item, ctx) },

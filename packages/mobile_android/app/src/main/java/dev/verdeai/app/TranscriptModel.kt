@@ -228,8 +228,15 @@ internal class TranscriptModel(
         result.also { renders.diff[text] = it }
     }
 
-    private suspend inline fun <reified Q, T> utility(selector: String, crossinline data: (Q) -> T?): RenderResult<T> {
-        if (selector.length > MAX_RENDER_SELECTOR) return RenderResult(null)
+    /** D-07: locates each file record of a (possibly large) VERDE_DIFF_V2 body so files render one at a time. */
+    fun cachedDiffIndex(text: String): RenderResult<DiffIndexView>? = renders.diffIndex[text]
+    suspend fun diffIndex(text: String): RenderResult<DiffIndexView> = renders.diffIndex[text] ?: run {
+        val selector = buildJsonObject { put("utility", "diff_index"); put("text", text) }.toString()
+        utility<DiffIndexQuery, DiffIndexView>(selector, MAX_INDEX_SELECTOR) { it.data }.also { renders.diffIndex[text] = it }
+    }
+
+    private suspend inline fun <reified Q, T> utility(selector: String, limit: Int = MAX_RENDER_SELECTOR, crossinline data: (Q) -> T?): RenderResult<T> {
+        if (selector.length > limit) return RenderResult(null)
         val host = core ?: return RenderResult(null)
         return try {
             RenderResult(data(CoreJson.decodeFromJsonElement<Q>(host.query(selector))))
@@ -256,6 +263,8 @@ internal class TranscriptModel(
         const val UNFOCUS_DELAY_MS = 500L
         /** The core caps utility input at 64 KiB; larger bodies render as plain text. */
         const val MAX_RENDER_SELECTOR = 72 * 1024
+        /** `diff_index` only frames records; the core bounds it by the 1 MiB query selector. */
+        const val MAX_INDEX_SELECTOR = 1024 * 1024
         private val detached = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     }
 }
@@ -268,6 +277,7 @@ internal class RenderCache(max: Int = 256) {
     val markdown = lru<RenderResult<List<MarkdownNode>>>(max)
     val highlight = lru<RenderResult<List<RenderSpan>>>(max / 4)
     val diff = lru<RenderResult<DiffView>>(max / 8)
+    val diffIndex = lru<RenderResult<DiffIndexView>>(max / 16)
     private fun <V> lru(size: Int) = object : LinkedHashMap<String, V>(16, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, V>?) = this.size > size
     }

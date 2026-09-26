@@ -1,0 +1,7 @@
+VERDE_DIFF_V2
+FILE	4	1	1	62
+x.ts--- a/x.ts
++++ b/x.ts
+@@ -1 +1 @@
+-const a = 1;
++const a = 2;
