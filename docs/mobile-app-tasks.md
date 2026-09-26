@@ -164,7 +164,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | D-07 | Diff card | android | linux | D-06 | todo |
 | D-08 | Composer + pickers + attachments + follow-ups | android | linux | D-06 | todo |
 | D-09 | Approvals card | android | linux | D-06 | todo |
-| D-10 | History, new chat, workspace management | android | linux | D-05, A-03 | todo |
+| D-10 | History, new chat, workspace management | android | linux | D-05, A-03 | in_progress (claude opus cli-thread-1790406845038-4d8a9c2c8a809c73; includes core create-thread/workspace intents) |
 | D-11 | Native terminal view | android | linux+phone | D-05, K-12 | in_progress (claude opus cli-thread-1790405366306-80a778f6cd0e9eaa) |
 | D-12 | File viewer | android | linux | D-06, A-01 | todo |
 | D-13 | Theme + reduced motion | android | linux | D-05 | todo |
@@ -175,7 +175,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | I-01 | iOS project scaffold (XcodeGen) | ios | mac | K-02 | done (bdfcfd3e; unsigned simulator only until H-04) |
 | I-02 | Core bridge + effect executor | ios | mac | I-01, K-06, K-15 | done (f389ab00, b6dc5f03, 69c813af, 10b4f4cd) |
 | I-03 | Pairing flow | ios | mac+phone | I-02, K-07, A-06 | done (abe0dafd..ce41f917; phone verify pending H-06, universal links pending H-04) |
-| I-04 | Hosts + Home + Workspaces + lifecycle | ios | mac | I-03, D-05 | in_progress (claude opus cli-thread-1790405367953-3eaabcdee747f44e) |
+| I-04 | Hosts + Home + Workspaces + lifecycle | ios | mac | I-03, D-05 | done (60cf296c, 5dd5ac0c, 5764f9a4, b21f2614; device verify pending) |
 | I-05 | Transcript + diff + approvals | ios | mac | I-04, D-06, D-07, D-09 | todo |
 | I-06 | Composer + pickers + attachments + follow-ups | ios | mac | I-05, D-08 | todo |
 | I-07 | History, new chat, workspace management | ios | mac | I-04, D-10 | todo |
@@ -1169,6 +1169,7 @@ Shared rules:
 - **Do:** translate D-04/D-05. `scenePhase` → foreground/background;
   `NWPathMonitor` → `network_changed`.
 - **Done when:** tests pass.
+- **Done (60cf296c, 5dd5ac0c, 5764f9a4, b21f2614).** The iOS app has a hosts list (Keychain `ios/1/hosts`, with the single host from I-03 migrated), a per-host core confined to `vc/1/<host_id>/`, a host switcher, and sign-out with Remove anyway (`forget_host`) and Retry removal. Home, Workspaces and workspace detail match D-05, including K-17 badges, the archived toggle and pull-to-refresh. `scenePhase` and `NWPathMonitor` feed each core in order. The warm-start cache is encrypted with a Keychain key bound to the host, excluded from backup, and cleared on sign-out. `vc_push_open` has a Swift wrapper. `mobile-ios-build` and `mobile-ios-test` pass over SSH, and `mobile-models-check` passes. Follow-ups: there are no XCUITest screen tests yet (I-11); the push wrapper must move into the notification extension (I-10); the refresh spinner polls instead of reacting to updates; a cold-start universal-link pair needs a device check.
 
 #### I-05 · Transcript + diff + approvals
 - **depends:** I-04, D-06, D-07, D-09
