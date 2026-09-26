@@ -9,7 +9,7 @@ private final class HostsCore: HostCore {
     let events = EventLog()
     private let lock = NSLock()
     private var row: HostView
-    private var op: Operation?
+    private var op: CoreOperation?
     private var record = "credential"
     private var sequence = 0
     private var started = false
@@ -34,7 +34,7 @@ private final class HostsCore: HostCore {
                 key: "vc/1/\(saved.id)/\(record)")))
         }
         func wipe(_ intent: String) {
-            op = Operation(intent_id: intent, state: "pending", error: nil)
+            op = CoreOperation(intent_id: intent, state: "pending", error: nil)
             row.auth_state = "signing_out"
             row.error = nil
             if deleteDelayMs > 0 {
@@ -53,7 +53,7 @@ private final class HostsCore: HostCore {
         case .sign_out(let e):
             XCTAssertEqual(e.host_id, saved.id)
             if offline {
-                op = Operation(intent_id: e.intent_id, state: "uncertain", error: LocalError(domain: "auth",
+                op = CoreOperation(intent_id: e.intent_id, state: "uncertain", error: LocalError(domain: "auth",
                     code: "sign_out_unconfirmed", message: "", retryable: true))
             } else { wipe(e.intent_id) }
         case .forget_host(let e):

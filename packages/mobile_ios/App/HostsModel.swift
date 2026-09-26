@@ -11,6 +11,9 @@ struct HostCatalog: Codable, Equatable {
     var active: String?
 }
 
+/// Unambiguous name for the generated core model (Foundation also defines `Operation`).
+typealias CoreOperation = Operation
+
 struct HostRow {
     var saved: SavedHost
     var view: HostView?
