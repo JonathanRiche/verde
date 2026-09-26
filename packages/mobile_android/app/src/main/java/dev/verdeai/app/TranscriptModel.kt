@@ -1,6 +1,7 @@
 package dev.verdeai.app
 
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
 import dev.verdeai.core.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
@@ -79,6 +80,8 @@ internal class TranscriptModel(
     private var readyEpoch = 0
     private var requestedCursor: String? = null
     private val renders = RenderCache()
+    /** D-09: this thread's approval decisions (helpers in Approvals.kt are shared with D-14). */
+    val approvals = ApprovalController(viewModelScope, workspaceId, threadId, state.map { it.thread }, host = { core })
 
     init {
         scope.launch { browse.collect { value -> mutableState.update { it.copy(browse=value) } } }

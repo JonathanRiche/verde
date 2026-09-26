@@ -63,7 +63,7 @@ internal data class TranscriptRenderers(
     val notice: @Composable (TranscriptItem.Notice, TranscriptContext) -> Unit = { item, ctx -> NoticeRow(item.row, ctx) },
     val usage: @Composable (TranscriptItem.Usage, TranscriptContext) -> Unit = { item, _ -> UsageCard(item.usage) },
     val working: @Composable (TranscriptItem.Working, TranscriptContext) -> Unit = { item, ctx -> WorkingRow(item, ctx) },
-    val approval: @Composable (TranscriptItem.Approval, TranscriptContext) -> Unit = { item, _ -> ApprovalNotice(item.approval) },
+    val approval: @Composable (TranscriptItem.Approval, TranscriptContext) -> Unit = ApprovalRenderer,
 ) {
     @Composable
     fun Render(item: TranscriptItem, ctx: TranscriptContext) = when (item) {
@@ -87,7 +87,8 @@ internal fun transcriptBanner(state: TranscriptState, nowMs: Long): Banner? {
     if (state.fatal) return Banner("Connection unavailable — reopen Verde.", error=true)
     if (needsPairing(browse)) return Banner("This phone isn't paired with ${browse.row?.saved?.label ?: "this host"}.", BannerAction.Hosts, error=true)
     browseBanner(browse.copy(home=null, workspaces=null, savedAtMs=null), nowMs)?.let { return it }
-    val error = state.thread?.error
+    // A failed approval decision also lands in the thread error; the approval card reports it.
+    val error = state.thread?.error?.takeIf { it != state.thread?.approval?.error }
     if (error != null) return Banner("Couldn't load this chat. ${error.message}".trim(), BannerAction.Retry, error=true)
     return null
 }
@@ -232,6 +233,7 @@ private fun TranscriptList(items: List<TranscriptItem>, state: TranscriptState, 
             items(reversed, key = { it.key }, contentType = { it::class }) { item -> renderers.Render(item, ctx) }
             item(key = "page-header", contentType = "header") { PageHeader(page, ctx.model) }
         }
+        ApprovalBanner(reversed, list, ctx.model.approvals, Modifier.align(Alignment.TopCenter))
         if (!atBottom && reversed.isNotEmpty()) {
             SmallFloatingActionButton(
                 onClick = { follow = true; scope.launch { list.animateScrollToItem(0) } },
@@ -442,43 +444,6 @@ internal fun UsageCard(usage: ChatUsage) {
                     Text(stat.value, style = MaterialTheme.typography.bodySmall)
                 }
             }
-        }
-    }
-}
-
-/** Default D-07 slot: file list from the core's diff utility; the full diff card replaces it. */
-@Composable
-internal fun DiffSummaryCard(row: ChatRow, ctx: TranscriptContext) {
-    val result by produceState(ctx.model.cachedDiff(row.body), row.body) { value = ctx.model.diff(row.body) }
-    val files = result?.value?.files.orEmpty()
-    Card(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            Text(if (files.isEmpty()) "Changed files" else "Changed files · ${files.size}", style = MaterialTheme.typography.titleSmall)
-            files.forEach { file ->
-                val path = (file.new_path ?: file.old_path ?: "").removePrefix("b/").removePrefix("a/")
-                val lines = file.hunks.flatMap { it.lines }
-                val added = lines.count { it.kind == "add" }
-                val removed = lines.count { it.kind == "delete" }
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(path, Modifier.weight(1f), style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
-                        maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    if (file.binary) Text("binary", style = MaterialTheme.typography.labelSmall)
-                    else Text("+$added −$removed", style = MaterialTheme.typography.labelSmall)
-                }
-            }
-        }
-    }
-}
-
-/** Default D-09 slot: the request is shown; deciding it comes with the approvals card. */
-@Composable
-internal fun ApprovalNotice(approval: ChatApproval) {
-    Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)) {
-        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            Text("Needs approval · ${approval.title}", style = MaterialTheme.typography.titleSmall)
-            if (approval.body.isNotEmpty()) Text(approval.body, style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
-                maxLines = 8, overflow = TextOverflow.Ellipsis)
-            Text("Approve or deny it in Verde on your computer.", style = MaterialTheme.typography.bodySmall)
         }
     }
 }
