@@ -312,35 +312,6 @@ struct WorkspaceScreen: View {
     }
 }
 
-/// D-06 replaces this with the transcript; it deliberately sends no focus/open intents yet.
-struct ThreadPlaceholderScreen: View {
-    let model: BrowseModel
-    let workspaceID: String
-    let threadID: String
-    var body: some View {
-        let state = model.state
-        let workspace = state.workspaces?.items.first { $0.workspace_id == workspaceID }
-        let thread = workspace?.threads.first { $0.thread_id == threadID }
-        let pane = ((state.home?.items ?? []) + (workspace?.panes ?? []))
-            .first { $0.workspace_id == workspaceID && $0.thread_id == threadID }
-        Clock(ticking: pane?.can_stop == true && pane?.started_at_ms != nil) { now in
-            List {
-                if let workspace { Text(workspace.label).font(.headline) }
-                if let thread {
-                    Text([thread.provider, thread.model].compactMap { $0 }.joined(separator: " · "))
-                    if let last = thread.last_activity_at_ms { Text("Last activity \(agoLabel(last, now))") }
-                }
-                Text(pane.map { paneLine($0, now) } ?? statusLabel(thread?.status ?? "idle"))
-                if thread == nil && pane == nil { Text("This chat is no longer on the host.") }
-                Text("The transcript view is coming in the next update. Open this chat in Verde on your computer for now.")
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .navigationTitle(thread?.title ?? pane?.title ?? "Chat")
-        .navigationBarTitleDisplayMode(.inline)
-    }
-}
-
 /// One tab's stack: every browse route resolves against the selected host only.
 struct BrowseStack<Root: View>: View {
     let model: BrowseModel
@@ -352,7 +323,8 @@ struct BrowseStack<Root: View>: View {
             root().navigationDestination(for: BrowseRoute.self) { route in
                 switch route {
                 case .workspace(let id): WorkspaceScreen(model: model, workspaceID: id, actions: actions)
-                case .thread(let workspace, let thread): ThreadPlaceholderScreen(model: model, workspaceID: workspace, threadID: thread)
+                case .thread(let workspace, let thread):
+                    TranscriptScreen(browse: model, workspaceID: workspace, threadID: thread, onHosts: actions.hosts)
                 case .terminal(let workspace, let terminal):
                     TerminalScreen(browse: model, workspaceID: workspace, terminalID: terminal)
                 case .newTerminal(let workspace, _): TerminalScreen(browse: model, workspaceID: workspace, terminalID: nil)

@@ -94,6 +94,24 @@ final class CoreViewStore {
     func dismissNotifications() { notifications.removeAll() }
 }
 
+/// A batch's effects, tolerating tags newer than this build's generated models: those are
+/// dropped (their fields are never read or logged) instead of failing the host. A known
+/// effect that fails to decode is still fatal.
+struct EffectList: Decodable {
+    var effects: [Effect]
+    private enum Keys: String, CodingKey { case effects }
+    private struct Item: Decodable {
+        let effect: Effect?
+        init(from decoder: Decoder) throws {
+            do { effect = try Effect(from: decoder) }
+            catch DecodingError.dataCorrupted(let context) where context.codingPath.last?.stringValue == "type" { effect = nil }
+        }
+    }
+    init(from decoder: Decoder) throws {
+        effects = try decoder.container(keyedBy: Keys.self).decode([Item].self, forKey: .effects).compactMap(\.effect)
+    }
+}
+
 protocol CoreTransport: AnyObject {
     func execute(_ effect: Effect, emit: @escaping (Event) -> Void)
     func stop()
@@ -166,7 +184,7 @@ actor CoreHost {
                 // effects and leaves the handle usable (e.g. a malformed link).
                 throw RejectedEvent(status: status)
             }
-            let batch = try JSONDecoder().decode(EffectBatch.self, from: output)
+            let batch = try JSONDecoder().decode(EffectList.self, from: output)
             try dispatch(batch.effects)
             if case .shutdown = event { finish() }
         } catch let rejected as RejectedEvent {
@@ -186,12 +204,20 @@ actor CoreHost {
         switch event {
         case .pair, .trust_decision, .retry_connection, .sign_out, .forget_host,
              .foreground, .background, .network_changed, .focus,
+             // Chat intents (I-05): e.g. an overlapping page or an already-answered approval.
+             .thread_load_older, .turn_cancel, .approval_decide,
              // Terminal intents: e.g. an unencodable key or the 32-record limit.
              // A rejected device reply is dropped, never replayed.
              .terminal_create, .terminal_attach, .terminal_detach, .terminal_kill,
              .terminal_resize, .terminal_input, .terminal_reply: return true
         default: return false
         }
+    }
+
+    /// Pure K-11 utility queries (markdown, highlight, diff, diff_index); no state change.
+    func query(_ selector: String) throws -> Data {
+        guard !stopped else { throw CoreBridgeError.closed }
+        return try core.query(selector)
     }
 
     // MARK: Terminals (K-12)

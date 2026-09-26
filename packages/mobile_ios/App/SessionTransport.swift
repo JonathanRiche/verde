@@ -23,8 +23,24 @@ final class SessionTransport: CoreTransport {
                         generation: e.generation, code: nil, clean: false,
                         error: TransportFailure(kind: .network, code: .unavailable))))
                 }
-            default: preconditionFailure("transport_effect_required")
+            default:
+                // Never fatal: an effect this build can't run is refused where it has a
+                // completion (so the core settles its intent) and dropped otherwise.
+                if let refusal = Self.refusal(effect) { emit(refusal) }
             }
+        }
+    }
+
+    /// The completion reporting `effect` as unsupported, if the core awaits one.
+    /// D-12 `file_fetch` has no iOS viewer until I-09: it fails like an unreachable
+    /// transport with no status, headers or body, so no file bytes are ever read.
+    static func refusal(_ effect: Effect) -> Event? {
+        switch effect {
+        case .file_fetch(let e):
+            return .http_response(EventHttpResponse(now_ms: 0, wall_time_ms: 0, effect_id: e.effect_id,
+                generation: e.generation, status: nil, headers: [], body_base64: nil,
+                error: TransportFailure(kind: .network, code: .unavailable)))
+        default: return nil
         }
     }
     private func start(id: String, effect: Effect, emit: @escaping (Event) -> Void) {

@@ -56,7 +56,12 @@ targets:
   Tests:
     type: bundle.unit-test
     platform: iOS
-    sources: [Tests]
+    sources:
+      - Tests
+      # Recorded core fixtures shared with the Android tests (d06/d07/d09), never copied.
+      - path: ../mobile_android/app/src/test/resources/fixtures
+        type: folder
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.verdeai.app.Tests
