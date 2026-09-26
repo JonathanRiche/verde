@@ -167,10 +167,10 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | D-10 | History, new chat, workspace management | android | linux | D-05, A-03 | done (fe7bd30e, b283f9cb) |
 | D-11 | Native terminal view | android | linux+phone | D-05, K-12 | done (a114ffca; phone verify pending) |
 | D-12 | File viewer | android | linux | D-06, A-01 | done (0df099c8) |
-| D-13 | Theme + reduced motion | android | linux | D-05 | todo |
+| D-13 | Theme + reduced motion | android | linux | D-05 | in_progress (claude opus) |
 | D-14 | Push + actionable notifications | android | linux+phone | D-09, K-17, A-14, C-02, H-05 | todo |
-| D-15 | App lock + secure screen | android | linux | D-05 | in_progress (claude opus cli-thread-1790409422541-c5120ca8c7ab6da2) |
-| D-16 | Maestro flows + UI tests | android | linux+phone | D-08, D-09 | todo |
+| D-15 | App lock + secure screen | android | linux | D-05 | done (8ff186b1, d9e5f0d7) |
+| D-16 | Maestro flows + UI tests | android | linux+phone | D-08, D-09 | in_progress (claude opus) |
 | D-17 | Release build + Play internal track | android | linux | D-16, H-03 | todo |
 | I-01 | iOS project scaffold (XcodeGen) | ios | mac | K-02 | done (bdfcfd3e; unsigned simulator only until H-04) |
 | I-02 | Core bridge + effect executor | ios | mac | I-01, K-06, K-15 | done (f389ab00, b6dc5f03, 69c813af, 10b4f4cd) |
@@ -1115,6 +1115,7 @@ human-verify step.
 - **Do:** optional BiometricPrompt gate on launch and after N minutes in the
   background. Optional `FLAG_SECURE`.
 - **Done when:** tests pass.
+- **Done (8ff186b1, d9e5f0d7).** Optional biometric/device-credential lock (UI-only overlay; launch + background relock, default 1 min; 1-min grace for Verde-opened pickers/camera), hide-content (FLAG_SECURE, default on), no-lockout guards; 32 tests; emulator-verified. Follow-ups: dialogs opened while locked can surface above the lock (`LocalAppLocked`); attention badges may clear under the lock; notification approve needs its own unlock (D-14).
 
 #### D-16 · Maestro flows + UI tests
 - **depends:** D-08, D-09
