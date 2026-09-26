@@ -1,0 +1,6 @@
+.{
+    .name = .verde_fff_build,
+    .version = "0.0.0",
+    .fingerprint = 0x34aa02d3c9ffd335,
+    .paths = .{ "build.zig", "build.zig.zon" },
+}

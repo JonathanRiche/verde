@@ -86,11 +86,11 @@ pub fn build(b: *std.Build) void {
     const dev_build_step = b.step("dev-build", "Build only the private desktop GUI executable");
     dev_build_step.dependOn(&dev_build_cmd.step);
 
-    const daemon_cmd = addDaemonCommand(b, optimize, "daemon", target, cpu, version);
+    const daemon_cmd = addDaemonCommand(b, optimize, "daemon", target, cpu, version, .{ .build_fff = build_fff, .fff_cargo_target = fff_cargo_target, .fff_lib_dir = fff_lib_dir, .fff_import_lib = fff_import_lib, .fff_runtime_lib = fff_runtime_lib });
     const daemon_step = b.step("daemon", "Build and install the GUI-free Verde daemon");
     daemon_step.dependOn(&daemon_cmd.step);
 
-    const daemon_test_cmd = addDaemonCommand(b, optimize, "daemon-test", target, cpu, version);
+    const daemon_test_cmd = addDaemonCommand(b, optimize, "daemon-test", target, cpu, version, .{ .build_fff = build_fff, .fff_cargo_target = fff_cargo_target, .fff_lib_dir = fff_lib_dir, .fff_import_lib = fff_import_lib, .fff_runtime_lib = fff_runtime_lib });
     const daemon_test_step = b.step("daemon-test", "Run GUI-free Verde daemon tests");
     daemon_test_step.dependOn(&daemon_test_cmd.step);
 
@@ -377,6 +377,13 @@ fn addDaemonCommand(
     target: ?[]const u8,
     cpu: ?[]const u8,
     version: ?[]const u8,
+    fff: struct {
+        build_fff: ?bool,
+        fff_cargo_target: ?[]const u8,
+        fff_lib_dir: ?[]const u8,
+        fff_import_lib: ?[]const u8,
+        fff_runtime_lib: ?[]const u8,
+    },
 ) *std.Build.Step.Run {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(b.allocator);
@@ -390,6 +397,11 @@ fn addDaemonCommand(
     }
     appendStringOption(b, &argv, "cpu", cpu);
     appendStringOption(b, &argv, "version", version);
+    appendBoolOption(b, &argv, "build-fff", fff.build_fff);
+    appendStringOption(b, &argv, "fff-cargo-target", fff.fff_cargo_target);
+    appendStringOption(b, &argv, "fff-lib-dir", fff.fff_lib_dir);
+    appendStringOption(b, &argv, "fff-import-lib", fff.fff_import_lib);
+    appendStringOption(b, &argv, "fff-runtime-lib", fff.fff_runtime_lib);
     appendInstallArgs(b, &argv);
 
     const cmd = b.addSystemCommand(argv.items);

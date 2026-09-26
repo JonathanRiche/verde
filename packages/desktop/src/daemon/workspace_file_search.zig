@@ -1,8 +1,6 @@
-//! Bounded, repository-relative file search for composer `@` mentions served
-//! by the daemon to detached clients (web). The desktop GUI keeps its fff-c
-//! index; the daemon must not link that runtime library, so this lists files
-//! with `git ls-files` (honoring .gitignore) and falls back to a bounded walk
-//! that skips heavy build/dependency directories.
+//! Repository-relative file search for detached clients. A bounded daemon-owned
+//! fff index cache shares the desktop search engine without GUI state or history.
+//! Cold/unavailable indexes fall back to the bounded git listing/directory walk.
 
 const std = @import("std");
 
@@ -11,7 +9,7 @@ const process_env = @import("../platform/env.zig");
 pub const MAX_QUERY_BYTES: usize = 256;
 pub const DEFAULT_LIMIT: usize = 20;
 pub const MAX_LIMIT: usize = 100;
-/// Hard cap on candidates considered per search so huge trees stay bounded.
+/// Hard cap on candidates considered by the fallback listing.
 const MAX_CANDIDATES: usize = 200_000;
 /// Walk budget (directory entries visited) for non-git roots.
 const MAX_WALK_ENTRIES: usize = 60_000;
@@ -26,7 +24,7 @@ const SKIPPED_DIRECTORIES = [_][]const u8{
     ".idea",   "vendor", "Pods", ".direnv",      "coverage",
 };
 
-pub const Source = enum { git, walk };
+pub const Source = enum { git, walk, fff };
 
 pub const Match = struct {
     /// Slash-separated path relative to the search root.
@@ -48,6 +46,69 @@ pub const Results = struct {
 };
 
 pub const SearchError = error{ SearchUnavailable, OutOfMemory };
+
+/// Owned by one daemon; callers serialize access independently of its main lock.
+/// Entries are keyed by the resolved repository cwd, never by a client path.
+/// No disk cache or query history is written, and eviction stops index watchers.
+pub const IndexCache = struct {
+    entries: [4]?Entry = @splat(null),
+    next: usize = 0,
+    const Finder = @import("../workspace/file_search.zig").Finder;
+    const Entry = struct { root: []u8, finder: Finder };
+
+    pub fn deinit(self: *IndexCache, allocator: std.mem.Allocator) void {
+        for (&self.entries) |*slot| if (slot.*) |*entry| {
+            entry.finder.deinit();
+            allocator.free(entry.root);
+            slot.* = null;
+        };
+    }
+
+    /// Null means the caller should run the fallback after releasing its cache lock.
+    pub fn searchIndexed(self: *IndexCache, allocator: std.mem.Allocator, root: []const u8, query: []const u8, limit: usize) error{OutOfMemory}!?Results {
+        const finder = self.get(allocator, root) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        };
+        if (finder.isScanning()) return null;
+        var indexed = finder.search(allocator, query, @max(1, @min(limit, MAX_LIMIT))) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        };
+        defer indexed.deinit(allocator);
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var files: std.ArrayList(Match) = .empty;
+        for (indexed.items) |item| {
+            const path = try arena.dupe(u8, item.relative_path);
+            if (!normalizeIndexedPath(path, std.fs.path.sep)) continue;
+            try files.append(arena, .{
+                .path = path,
+                .file_name = try arena.dupe(u8, item.file_name),
+            });
+        }
+        return .{ .arena = arena_state, .files = try files.toOwnedSlice(arena), .total_files = indexed.total_files, .truncated = false, .source = .fff };
+    }
+
+    fn get(self: *IndexCache, allocator: std.mem.Allocator, root: []const u8) !*Finder {
+        for (&self.entries) |*slot| if (slot.*) |*entry| {
+            if (std.mem.eql(u8, entry.root, root)) return &entry.finder;
+        };
+        const path = try allocator.dupe(u8, root);
+        errdefer allocator.free(path);
+        var finder = try Finder.initEphemeral(allocator, root);
+        errdefer finder.deinit();
+        const slot = &self.entries[self.next];
+        if (slot.*) |*entry| {
+            entry.finder.deinit();
+            allocator.free(entry.root);
+        }
+        slot.* = .{ .root = path, .finder = finder };
+        self.next = (self.next + 1) % self.entries.len;
+        return &slot.*.?.finder;
+    }
+};
 
 /// Search `root` (an absolute directory already resolved from a trusted
 /// repository binding) for files matching `query`. Returned paths are always
@@ -167,6 +228,17 @@ fn walkListFiles(
 fn skippedDirectory(name: []const u8) bool {
     for (SKIPPED_DIRECTORIES) |skipped| if (std.mem.eql(u8, name, skipped)) return true;
     return false;
+}
+
+// fff emits native path separators; the RPC namespace is always slash-separated.
+fn normalizeIndexedPath(path: []u8, separator: u8) bool {
+    if (separator == '\\') {
+        if (path.len >= 2 and path[1] == ':') return false;
+        for (path) |*byte| if (byte.* == '\\') {
+            byte.* = '/';
+        };
+    }
+    return safeRelativePath(path);
 }
 
 /// Defense in depth: only emit plain relative slash paths.
@@ -299,4 +371,74 @@ test "walk fallback lists relative files and skips heavy directories" {
     try std.testing.expectEqual(@as(usize, 1), ranked.len);
     try std.testing.expectEqualStrings("src/nested/needle_file.ts", ranked[0].path);
     try std.testing.expectEqualStrings("needle_file.ts", ranked[0].file_name);
+}
+
+test "daemon fff cache reuses indexes and confines matches to each repository cwd" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "a");
+    try tmp.dir.createDirPath(io, "b");
+    try tmp.dir.writeFile(io, .{ .sub_path = "a/alpha-needle.txt", .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "a/second-needle.txt", .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b/beta-needle.txt", .data = "" });
+    const a = try tmp.dir.realPathFileAlloc(io, "a", allocator);
+    defer allocator.free(a);
+    const b = try tmp.dir.realPathFileAlloc(io, "b", allocator);
+    defer allocator.free(b);
+    var cache: IndexCache = .{};
+    defer cache.deinit(allocator);
+    for (0..200) |_| {
+        if (try cache.searchIndexed(allocator, a, "needle", 1)) |value| {
+            var result = value;
+            defer result.deinit();
+            if (result.source == .fff and result.files.len == 1) break;
+        }
+        try std.Io.sleep(io, .fromMilliseconds(25), .awake);
+    } else return error.IndexScanTimedOut;
+    const handle = cache.entries[0].?.finder.handle;
+    var result = (try cache.searchIndexed(allocator, a, "alpha", 20)).?;
+    defer result.deinit();
+    try std.testing.expectEqual(Source.fff, result.source);
+    try std.testing.expectEqual(@as(usize, 1), result.files.len);
+    try std.testing.expectEqualStrings("alpha-needle.txt", result.files[0].path);
+    try std.testing.expectEqual(handle, cache.entries[0].?.finder.handle);
+    for (0..200) |_| {
+        if (try cache.searchIndexed(allocator, b, "needle", 20)) |value| {
+            var other = value;
+            defer other.deinit();
+            if (other.source == .fff and other.files.len == 1) {
+                try std.testing.expectEqualStrings("beta-needle.txt", other.files[0].path);
+                break;
+            }
+        }
+        try std.Io.sleep(io, .fromMilliseconds(25), .awake);
+    } else return error.IndexScanTimedOut;
+    // The watcher updates the same warm index as the filesystem changes.
+    try tmp.dir.writeFile(io, .{ .sub_path = "a/new-needle.txt", .data = "" });
+    for (0..200) |_| {
+        if (try cache.searchIndexed(allocator, a, "new-needle", 20)) |value| {
+            var updated = value;
+            defer updated.deinit();
+            if (updated.source == .fff and updated.files.len == 1) break;
+        }
+        try std.Io.sleep(io, .fromMilliseconds(25), .awake);
+    } else return error.IndexWatcherTimedOut;
+    cache.deinit(allocator);
+    for (cache.entries) |slot| try std.testing.expect(slot == null);
+}
+
+test "indexed paths normalize Windows separators without accepting absolute or parent paths" {
+    var windows = "src\\main.zig".*;
+    try std.testing.expect(normalizeIndexedPath(&windows, '\\'));
+    try std.testing.expectEqualStrings("src/main.zig", &windows);
+    var linux = "src\\main.zig".*;
+    try std.testing.expect(!normalizeIndexedPath(&linux, '/'));
+    var drive = "C:\\private.txt".*;
+    try std.testing.expect(!normalizeIndexedPath(&drive, '\\'));
+    var parent = "..\\private.txt".*;
+    try std.testing.expect(!normalizeIndexedPath(&parent, '\\'));
+    var unc = "\\\\server\\private.txt".*;
+    try std.testing.expect(!normalizeIndexedPath(&unc, '\\'));
 }

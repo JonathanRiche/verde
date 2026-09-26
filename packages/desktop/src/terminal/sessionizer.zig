@@ -2430,6 +2430,9 @@ pub const Daemon = struct {
     /// Serializes verde.json snapshots and web-originated favorite updates.
     /// It is independent of lockDaemon so filesystem I/O never delays chat.
     config_mutex: ParkingMutex = .{},
+    /// File indexes never hold the daemon/store locks while scanning or searching.
+    file_search_mutex: ParkingMutex = .{},
+    file_search_indexes: workspace_file_search.IndexCache = .{},
     /// Serializes workspace close with chat-turn admission. Taken before
     /// lockDaemon/store locks, never while holding them.
     workspace_lifecycle_mutex: ParkingMutex = .{},
@@ -2514,6 +2517,7 @@ pub const Daemon = struct {
     }
 
     pub fn deinit(self: *Daemon) void {
+        self.file_search_indexes.deinit(self.allocator);
         if (self.pref_path.len != 0) self.allocator.free(self.pref_path);
         self.allocator.free(self.runtime_id);
         self.allocator.free(self.instance_id);
@@ -14649,10 +14653,17 @@ fn workspaceFilesSearchResponse(daemon: *Daemon, id_value: std.json.Value, param
     }) orelse return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid repository route params");
     defer route.deinit(allocator);
 
-    var results = workspace_file_search.search(allocator, route.cwd orelse route.project_path, query, limit) catch |err| switch (err) {
+    const root = route.cwd orelse route.project_path;
+    const indexed = blk: {
+        daemon.file_search_mutex.lock();
+        defer daemon.file_search_mutex.unlock();
+        break :blk try daemon.file_search_indexes.searchIndexed(allocator, root, query, limit);
+    };
+    // A cold git/walk fallback may be slow; never serialize other clients behind it.
+    var results = indexed orelse (workspace_file_search.search(allocator, root, query, limit) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.SearchUnavailable => return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "repository files could not be listed"),
-    };
+    });
     defer results.deinit();
     return try okValueResponse(allocator, id_value, .{
         .repository_id = route.repository_id,

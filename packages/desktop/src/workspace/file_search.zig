@@ -36,6 +36,7 @@ pub const SearchResults = struct {
 
 pub const Finder = struct {
     handle: ?*anyopaque = null,
+    log_errors: bool = true,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -86,6 +87,16 @@ pub const Finder = struct {
         };
     }
 
+    /// Daemon indexes share the engine without sharing desktop history databases.
+    pub fn initEphemeral(allocator: std.mem.Allocator, project_path: []const u8) !Finder {
+        const path = try allocator.dupeZ(u8, project_path);
+        defer allocator.free(path);
+        const result = c.fff_create_instance(path.ptr, null, null, false, false, false) orelse return error.FffUnavailable;
+        defer c.fff_free_result(result);
+        if (!result.*.success) return error.FffCreateFailed;
+        return .{ .handle = result.*.handle, .log_errors = false };
+    }
+
     pub fn deinit(self: *Finder) void {
         if (self.handle) |handle| {
             c.fff_destroy(handle);
@@ -116,7 +127,7 @@ pub const Finder = struct {
         defer c.fff_free_result(result_ptr);
 
         if (!result_ptr.*.success) {
-            logFffError("fff_search", result_ptr);
+            if (self.log_errors) logFffError("fff_search", result_ptr);
             return error.FffSearchFailed;
         }
 
@@ -167,7 +178,7 @@ pub const Finder = struct {
         defer c.fff_free_result(result_ptr);
 
         if (!result_ptr.*.success) {
-            logFffError("fff_track_query", result_ptr);
+            if (self.log_errors) logFffError("fff_track_query", result_ptr);
         }
     }
 

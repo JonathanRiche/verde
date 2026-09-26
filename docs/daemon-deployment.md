@@ -32,7 +32,8 @@ Keep the daemon binary and provider bridge in this relative layout when installi
 ```text
 verde-runtime/
 ├── bin/
-│   └── verde-daemon
+│   ├── verde-daemon
+│   └── libfff_c.so              # .dylib on macOS; fff_c.dll on Windows
 └── share/
     └── verde/
         └── provider_bridge.mjs
@@ -46,6 +47,7 @@ If the browser gateway is installed from the same staging prefix, a complete man
 /opt/verde/
 ├── bin/
 │   ├── verde-daemon
+│   ├── libfff_c.so
 │   ├── verde-web
 │   └── verde-server
 └── share/
@@ -58,10 +60,27 @@ From a source checkout, produce deployment artifacts for a baseline x86_64
 Linux target with:
 
 ```bash
-zig build daemon --release=safe -Dtarget=x86_64-linux-gnu.2.36
+# Build fff-c with cargo-zigbuild for the same architecture/glibc floor first.
+# FFF_TARGET_LIB_DIR must contain that library with SONAME libfff_c.so.
+zig build daemon --release=safe -Dtarget=x86_64-linux-gnu.2.36 \
+  -Dbuild-fff=false -Dfff-lib-dir="$FFF_TARGET_LIB_DIR"
 zig build server --release=safe -Dtarget=x86_64-linux-gnu.2.36
 mise run web-app
 ```
+
+Native `zig build daemon --release=safe` builds and installs the vendored `fff-c`
+library automatically. Cross-target or glibc-pinned daemon builds require a
+matching prebuilt library; `scripts/release/build-runtime-container.sh` handles
+this using `cargo-zigbuild` and `patchelf`. Always deploy the library beside the
+binary, including when updating an existing standalone runtime.
+
+`workspace.files.search` uses the desktop's fff search engine in the daemon.
+Up to four repository-cwd indexes are retained in memory with filesystem
+watchers; eviction and daemon shutdown release them. Indexes do not share the
+desktop's query-history databases. Initial scans and unavailable indexes use
+the existing bounded git listing/directory walk. Android and web keep the same
+RPC, authorization, result limits, and relative-path namespace. The first
+search can still pay the indexing and network cost.
 
 The daemon staging tree is under `zig-out/`. The gateway binary is under `packages/web_app/zig-out/bin/verde-web`, and its built SPA is under `packages/web_app/dist/`.
 

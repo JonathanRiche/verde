@@ -1,4 +1,5 @@
 const std = @import("std");
+const fff = @import("fff_build");
 
 /// Dependency-isolated build for the standalone Verde daemon.
 pub fn build(b: *std.Build) void {
@@ -9,6 +10,22 @@ pub fn build(b: *std.Build) void {
     // explicit `-Dcpu=native`.
     const target = b.standardTargetOptions(.{ .default_target = .{ .cpu_model = .baseline } });
     const optimize = b.standardOptimizeOption(.{});
+    const build_fff = b.option(bool, "build-fff", "Build fff-c with Cargo") orelse true;
+    const cargo_target = b.option([]const u8, "fff-cargo-target", "Rust target for fff-c") orelse
+        b.graph.environ_map.get("VERDE_FFF_CARGO_TARGET") orelse fff.windowsRustTarget(target.result);
+    const lib_dir = b.option([]const u8, "fff-lib-dir", "Target-matched fff-c library directory") orelse
+        b.graph.environ_map.get("VERDE_FFF_LIB_DIR") orelse
+        if (cargo_target) |t| b.pathJoin(&.{ "../../vendor/fff/target", t, "release" }) else "../../vendor/fff/target/release";
+    const import_lib = b.option([]const u8, "fff-import-lib", "Windows fff-c import library") orelse
+        b.graph.environ_map.get("VERDE_FFF_IMPORT_LIB") orelse fff.defaultWindowsFffImportLibrary(b, target.result, lib_dir);
+    const runtime_lib = b.option([]const u8, "fff-runtime-lib", "Target-matched fff-c runtime") orelse
+        b.graph.environ_map.get("VERDE_FFF_RUNTIME_LIB") orelse b.pathJoin(&.{ lib_dir, fff.fffRuntimeName(target.result.os.tag) });
+    // A native Rust library cannot satisfy a cross-target/glibc-pinned deployment.
+    // The container builder supplies a cargo-zigbuild library for those targets.
+    if (build_fff and (target.query.glibc_version != null or
+        target.result.cpu.arch != b.graph.host.result.cpu.arch or target.result.os.tag != b.graph.host.result.os.tag))
+        @panic("Cross-target daemon builds need -Dbuild-fff=false and -Dfff-lib-dir pointing to a target-matched fff-c library (see docs/daemon-deployment.md)");
+    const cargo = if (build_fff) fff.addFffBuild(b, b.path("../../vendor/fff"), target, cargo_target) else null;
     const version = b.option([]const u8, "version", "Version embedded in verde-daemon") orelse
         b.graph.environ_map.get("VERDE_VERSION") orelse
         "0.0.0";
@@ -81,8 +98,16 @@ pub fn build(b: *std.Build) void {
         }),
     });
     configureDaemonArtifact(daemon_exe, target.result.os.tag);
+    if (cargo) |run| daemon_exe.step.dependOn(&run.step);
+    daemon_exe.root_module.addIncludePath(b.path("../../vendor/fff/crates/fff-c/include"));
+    fff.addFffLink(daemon_exe, target.result.os.tag, lib_dir, import_lib);
 
     const install_daemon = b.addInstallArtifact(daemon_exe, .{});
+    const install_fff = b.addInstallBinFile(.{ .cwd_relative = runtime_lib }, fff.fffRuntimeName(target.result.os.tag));
+    if (cargo) |run| install_fff.step.dependOn(&run.step);
+    install_daemon.step.dependOn(&install_fff.step);
+    const install_fff_license = b.addInstallFileWithDir(b.path("../../vendor/fff/LICENSE"), .{ .custom = "share/verde/licenses" }, "fff-LICENSE.txt");
+    install_daemon.step.dependOn(&install_fff_license.step);
     const build_provider_bridge = b.addSystemCommand(&.{
         "bun",
         "build",
@@ -118,6 +143,10 @@ pub fn build(b: *std.Build) void {
         }),
     });
     configureDaemonArtifact(daemon_tests, target.result.os.tag);
+    daemon_tests.each_lib_rpath = true;
+    if (cargo) |run| daemon_tests.step.dependOn(&run.step);
+    daemon_tests.root_module.addIncludePath(b.path("../../vendor/fff/crates/fff-c/include"));
+    fff.addFffLink(daemon_tests, target.result.os.tag, lib_dir, import_lib);
     const daemon_test_step = b.step("daemon-test", "Run GUI-free Verde daemon tests");
     addTestArtifact(b, daemon_test_step, daemon_tests, target);
 }
@@ -126,6 +155,11 @@ fn configureDaemonArtifact(compile: *std.Build.Step.Compile, os_tag: std.Target.
     compile.build_id = .sha1;
     compile.each_lib_rpath = false;
     compile.root_module.link_libc = true;
+    switch (os_tag) {
+        .linux => compile.root_module.addRPathSpecial("$ORIGIN"),
+        .macos => compile.root_module.addRPathSpecial("@executable_path"),
+        else => {},
+    }
     if (os_tag == .linux) compile.root_module.linkSystemLibrary("util", .{});
 }
 

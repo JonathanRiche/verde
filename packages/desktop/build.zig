@@ -1,4 +1,5 @@
 const std = @import("std");
+const fff = @import("fff_build");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -21,7 +22,7 @@ pub fn build(b: *std.Build) void {
     const build_fff_enabled = b.option(bool, "build-fff", "Build the vendored fff-c library with Cargo") orelse true;
     const fff_cargo_target = b.option([]const u8, "fff-cargo-target", "Rust target triple used to build fff-c") orelse
         b.graph.environ_map.get("VERDE_FFF_CARGO_TARGET") orelse
-        windowsRustTarget(target.result);
+        fff.windowsRustTarget(target.result);
     const fff_target_dir = if (fff_cargo_target) |cargo_target|
         b.pathJoin(&.{ "../../vendor/fff/target", cargo_target, "release" })
     else
@@ -31,10 +32,10 @@ pub fn build(b: *std.Build) void {
         fff_target_dir;
     const fff_import_lib = b.option([]const u8, "fff-import-lib", "Exact fff-c import library for Windows builds") orelse
         b.graph.environ_map.get("VERDE_FFF_IMPORT_LIB") orelse
-        defaultWindowsFffImportLibrary(b, target.result, fff_lib_dir);
+        fff.defaultWindowsFffImportLibrary(b, target.result, fff_lib_dir);
     const fff_runtime_lib = b.option([]const u8, "fff-runtime-lib", "Path to the fff-c runtime library to install") orelse
         b.graph.environ_map.get("VERDE_FFF_RUNTIME_LIB") orelse
-        b.pathJoin(&.{ fff_lib_dir, fffRuntimeName(target.result.os.tag) });
+        b.pathJoin(&.{ fff_lib_dir, fff.fffRuntimeName(target.result.os.tag) });
     const sdl3_include_dir = b.option([]const u8, "sdl3-include-dir", "Directory containing SDL3 headers") orelse
         b.graph.environ_map.get("VERDE_SDL3_INCLUDE_DIR");
     const sdl3_lib_dir = b.option([]const u8, "sdl3-lib-dir", "Directory containing the SDL3 link library") orelse
@@ -264,12 +265,20 @@ pub fn build(b: *std.Build) void {
     if (target.result.os.tag == .macos) {
         gui_exe.headerpad_max_install_names = true;
     }
-    const build_fff = if (build_fff_enabled) addFffBuild(b, fff_root, target, fff_cargo_target) else null;
+    const build_fff = if (build_fff_enabled) fff.addFffBuild(b, fff_root, target, fff_cargo_target) else null;
     if (build_fff) |build_step| gui_exe.step.dependOn(&build_step.step);
+    if (build_fff) |build_step| daemon_exe.step.dependOn(&build_step.step);
+    daemon_exe.root_module.addIncludePath(b.path("../../vendor/fff/crates/fff-c/include"));
+    fff.addFffLink(daemon_exe, target.result.os.tag, fff_lib_dir, fff_import_lib);
+    switch (target.result.os.tag) {
+        .linux => daemon_exe.root_module.addRPathSpecial("$ORIGIN"),
+        .macos => daemon_exe.root_module.addRPathSpecial("@executable_path"),
+        else => {},
+    }
     gui_exe.root_module.link_libc = true;
     gui_exe.root_module.addIncludePath(b.path("../../vendor"));
     gui_exe.root_module.addIncludePath(b.path("../../vendor/fff/crates/fff-c/include"));
-    addFffLink(gui_exe, target.result.os.tag, fff_lib_dir, fff_import_lib);
+    fff.addFffLink(gui_exe, target.result.os.tag, fff_lib_dir, fff_import_lib);
     gui_exe.root_module.addCSourceFile(.{
         .file = b.path("../../vendor/stb_image_impl.c"),
         .flags = &.{},
@@ -393,14 +402,11 @@ pub fn build(b: *std.Build) void {
     // Keep patchelf only for caller-supplied libraries that may lack one.
     if (target.result.os.tag == .linux and !build_fff_enabled) {
         if (b.findProgram(&.{"patchelf"}, &.{})) |patchelf_path| {
-            const normalize_fff_needed = b.addSystemCommand(&.{
-                patchelf_path,
-                "--replace-needed",
-                fff_runtime_lib,
-                fffRuntimeName(.linux),
-            });
-            normalize_fff_needed.addArtifactArg(gui_exe);
-            install_gui.step.dependOn(&normalize_fff_needed.step);
+            inline for (.{ .{ gui_exe, install_gui }, .{ daemon_exe, install_daemon } }) |entry| {
+                const normalize = b.addSystemCommand(&.{ patchelf_path, "--replace-needed", fff_runtime_lib, fff.fffRuntimeName(.linux) });
+                normalize.addArtifactArg(entry[0]);
+                entry[1].step.dependOn(&normalize.step);
+            }
         } else |_| {}
     }
     const dev_build_step = b.step("dev-build", "Build and install only the private desktop GUI executable");
@@ -429,7 +435,7 @@ pub fn build(b: *std.Build) void {
         browser_helper.root_module.linkSystemLibrary("javascriptcoregtk-6.0", .{ .use_pkg_config = .force });
         b.installArtifact(browser_helper);
     }
-    const install_fff = b.addInstallBinFile(.{ .cwd_relative = fff_runtime_lib }, fffRuntimeName(target.result.os.tag));
+    const install_fff = b.addInstallBinFile(.{ .cwd_relative = fff_runtime_lib }, fff.fffRuntimeName(target.result.os.tag));
     if (build_fff) |build_step| install_fff.step.dependOn(&build_step.step);
     b.getInstallStep().dependOn(&install_fff.step);
     if (target.result.os.tag == .linux) {
@@ -550,6 +556,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
     runtime_tests.root_module.link_libc = true;
+    if (build_fff) |build_step| runtime_tests.step.dependOn(&build_step.step);
+    runtime_tests.root_module.addIncludePath(b.path("../../vendor/fff/crates/fff-c/include"));
+    fff.addFffLink(runtime_tests, target.result.os.tag, fff_lib_dir, fff_import_lib);
     const runtime_test_step = b.step("runtime-test", "Run remote-runtime infrastructure tests (no GUI deps)");
     addTestArtifact(b, runtime_test_step, runtime_tests, target);
     // main.zig registers these modules in the full desktop runner. Running the
@@ -608,7 +617,7 @@ pub fn build(b: *std.Build) void {
     if (build_fff) |build_step| exe_tests.step.dependOn(&build_step.step);
     exe_tests.root_module.addIncludePath(b.path("../../vendor"));
     exe_tests.root_module.addIncludePath(b.path("../../vendor/fff/crates/fff-c/include"));
-    addFffLink(exe_tests, target.result.os.tag, fff_lib_dir, fff_import_lib);
+    fff.addFffLink(exe_tests, target.result.os.tag, fff_lib_dir, fff_import_lib);
     exe_tests.root_module.addCSourceFile(.{
         .file = b.path("../../vendor/stb_image_impl.c"),
         .flags = &.{},
@@ -694,7 +703,7 @@ pub fn build(b: *std.Build) void {
     if (build_fff) |build_step| headless_daemon_it_exe.step.dependOn(&build_step.step);
     headless_daemon_it_exe.root_module.addIncludePath(b.path("../../vendor"));
     headless_daemon_it_exe.root_module.addIncludePath(b.path("../../vendor/fff/crates/fff-c/include"));
-    addFffLink(headless_daemon_it_exe, target.result.os.tag, fff_lib_dir, fff_import_lib);
+    fff.addFffLink(headless_daemon_it_exe, target.result.os.tag, fff_lib_dir, fff_import_lib);
     headless_daemon_it_exe.root_module.addCSourceFile(.{
         .file = b.path("../../vendor/stb_image_impl.c"),
         .flags = &.{},
@@ -1014,92 +1023,6 @@ test "build version accepts only resource-safe ASCII" {
     try std.testing.expect(!isValidVersion("-preview"));
 }
 
-fn addFffBuild(
-    b: *std.Build,
-    fff_root: std.Build.LazyPath,
-    target: std.Build.ResolvedTarget,
-    cargo_target: ?[]const u8,
-) *std.Build.Step.Run {
-    const build_fff = b.addSystemCommand(&.{"cargo"});
-    const cross_compiling_windows = target.result.os.tag == .windows and
-        b.graph.host.result.os.tag != .windows;
-    // Cargo's rustc subcommand scopes the SONAME linker argument to fff-c;
-    // dependency build scripts and the Windows/macOS link paths stay unchanged.
-    const cargo_subcommand = if (target.result.os.tag == .linux)
-        "rustc"
-    else
-        b.graph.environ_map.get("VERDE_FFF_CARGO_SUBCOMMAND") orelse
-            if (cross_compiling_windows) "zigbuild" else "build";
-    build_fff.addArg(cargo_subcommand);
-    build_fff.addArgs(&.{
-        "--quiet",
-        "--release",
-        "--package",
-        "fff-c",
-        "--features",
-        "zlob",
-    });
-    if (cargo_target) |value| build_fff.addArgs(&.{ "--target", value });
-    if (target.result.os.tag == .linux) {
-        build_fff.addArgs(&.{ "--", "-C", "link-arg=-Wl,-soname,libfff_c.so" });
-    }
-    if (target.result.os.tag == .windows) {
-        // The vendored crate tracks `stable`, which would otherwise move under
-        // release builds. Pin the Windows ABI/toolchain lane explicitly while
-        // retaining an escape hatch for deliberate toolchain upgrades.
-        build_fff.setEnvironmentVariable(
-            "RUSTUP_TOOLCHAIN",
-            b.graph.environ_map.get("VERDE_FFF_RUST_TOOLCHAIN") orelse "1.95.0",
-        );
-    }
-    if (cross_compiling_windows and target.result.abi == .gnu) {
-        const toolchain_bin = b.build_root.join(
-            b.allocator,
-            &.{ "..", "..", "scripts", "dev", "windows-toolchain-bin" },
-        ) catch @panic("OOM");
-        build_fff.addPathDir(toolchain_bin);
-        build_fff.setEnvironmentVariable(
-            "ZIG",
-            b.pathJoin(&.{ toolchain_bin, "verde-zig-windows-gnu" }),
-        );
-        build_fff.setEnvironmentVariable("VERDE_REAL_ZIG", b.graph.zig_exe);
-
-        // Zig deliberately rejects time macros for cross-Windows C builds.
-        // Mimalloc embeds them in a diagnostic string, so anchor their value to
-        // SOURCE_DATE_EPOCH and permit that deterministic expansion.
-        build_fff.setEnvironmentVariable(
-            "SOURCE_DATE_EPOCH",
-            b.graph.environ_map.get("SOURCE_DATE_EPOCH") orelse "0",
-        );
-        const reproducible_cflags = "-Wno-error=date-time";
-        build_fff.setEnvironmentVariable(
-            "CFLAGS_x86_64_pc_windows_gnu",
-            if (b.graph.environ_map.get("CFLAGS_x86_64_pc_windows_gnu")) |value|
-                b.fmt("{s} {s}", .{ value, reproducible_cflags })
-            else
-                reproducible_cflags,
-        );
-    }
-    build_fff.setCwd(fff_root);
-    return build_fff;
-}
-
-fn addFffLink(
-    compile: *std.Build.Step.Compile,
-    target_os: std.Target.Os.Tag,
-    library_dir: []const u8,
-    import_library: ?[]const u8,
-) void {
-    if (target_os == .windows) {
-        if (import_library) |path| {
-            compile.root_module.addObjectFile(.{ .cwd_relative = path });
-            return;
-        }
-    }
-    compile.root_module.addLibraryPath(.{ .cwd_relative = library_dir });
-    compile.root_module.linkSystemLibrary("fff_c", .{});
-}
-
 fn addTestArtifact(
     b: *std.Build,
     test_step: *std.Build.Step,
@@ -1128,43 +1051,6 @@ fn installWindowsRuntime(b: *std.Build, source_path: ?[]const u8, name: []const 
         .bin,
         name,
     ).step);
-}
-
-fn windowsRustTarget(target: std.Target) ?[]const u8 {
-    if (target.os.tag != .windows) return null;
-    return switch (target.cpu.arch) {
-        .x86_64 => switch (target.abi) {
-            .gnu => "x86_64-pc-windows-gnu",
-            .msvc => "x86_64-pc-windows-msvc",
-            else => null,
-        },
-        .aarch64 => switch (target.abi) {
-            .gnu => "aarch64-pc-windows-gnullvm",
-            .msvc => "aarch64-pc-windows-msvc",
-            else => null,
-        },
-        else => null,
-    };
-}
-
-fn defaultWindowsFffImportLibrary(
-    b: *std.Build,
-    target: std.Target,
-    library_dir: []const u8,
-) ?[]const u8 {
-    if (target.os.tag != .windows) return null;
-    return b.pathJoin(&.{ library_dir, switch (target.abi) {
-        .msvc => "fff_c.dll.lib",
-        else => "libfff_c.dll.a",
-    } });
-}
-
-fn fffRuntimeName(target_os: std.Target.Os.Tag) []const u8 {
-    return switch (target_os) {
-        .windows => "fff_c.dll",
-        .macos => "libfff_c.dylib",
-        else => "libfff_c.so",
-    };
 }
 
 fn addMacOSSwiftWebView(b: *std.Build, compile: *std.Build.Step.Compile, arch: std.Target.Cpu.Arch) void {

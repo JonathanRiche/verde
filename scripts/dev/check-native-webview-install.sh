@@ -49,18 +49,20 @@ if [[ "$(uname -s)" == "Linux" ]]; then
     exit 1
   fi
 
-  fff_needed="$(
-    readelf -d "$PREFIX_DIR/bin/verde-gui" |
-      sed -n 's/.*Shared library: \[\([^]]*libfff_c\.so\)\].*/\1/p'
-  )"
-  if [[ -z "$fff_needed" ]]; then
-    echo "native webview install has no libfff_c.so dynamic dependency" >&2
-    exit 1
-  fi
-  if [[ "$fff_needed" == */* ]]; then
-    echo "native webview install embeds a path-qualified libfff dependency: $fff_needed" >&2
-    exit 1
-  fi
+  for executable in verde-gui verde-daemon; do
+    fff_needed="$(
+      readelf -d "$PREFIX_DIR/bin/$executable" |
+        sed -n 's/.*Shared library: \[\([^]]*libfff_c\.so\)\].*/\1/p'
+    )"
+    if [[ -z "$fff_needed" ]]; then
+      echo "native install $executable has no libfff_c.so dynamic dependency" >&2
+      exit 1
+    fi
+    if [[ "$fff_needed" == */* ]]; then
+      echo "native install $executable embeds a path-qualified libfff dependency: $fff_needed" >&2
+      exit 1
+    fi
+  done
 fi
 
 (
