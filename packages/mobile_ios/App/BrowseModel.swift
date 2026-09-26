@@ -215,9 +215,16 @@ func paneLine(_ pane: Pane, _ nowMs: Int64) -> String {
 
 func isSubagent(_ thread: ThreadSummary) -> Bool { thread.thread_id.hasPrefix("subagent:") }
 
-/// Most recent non-archived top-level chats from the core's history projection.
+/// History is independently filtered and paged; Home uses the live workspace catalog.
 func recentThreads(_ workspaces: WorkspacesView?, limit: Int = 8) -> [ThreadSummary] {
-    Array((workspaces?.history.items ?? []).filter { !$0.archived && !isSubagent($0) }.prefix(limit))
+    Array((workspaces?.items ?? []).flatMap(\.threads)
+        .filter { !$0.archived && !isSubagent($0) }
+        .sorted {
+            let a = $0.last_activity_at_ms ?? 0, b = $1.last_activity_at_ms ?? 0
+            if a != b { return a > b }
+            if $0.workspace_id != $1.workspace_id { return $0.workspace_id < $1.workspace_id }
+            return $0.thread_id < $1.thread_id
+        }.prefix(max(0, limit)))
 }
 
 func workspaceThreads(_ workspace: Workspace) -> [ThreadSummary] {
