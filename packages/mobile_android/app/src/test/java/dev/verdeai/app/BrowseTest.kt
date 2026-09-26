@@ -128,6 +128,29 @@ class BrowseTest {
             workspaceThreads(workspace.copy(threads = threads)).map { it.thread_id })
     }
 
+    @Test fun recentChatsSortAcrossWorkspacesBeforeLimitingAndIgnoreHistorySearch() {
+        val view = K09.workspaces.data!!
+        val workspace = view.items.first()
+        val template = workspace.threads.first()
+        fun thread(id: String, time: Long?, ws: String = "a") =
+            template.copy(workspace_id = ws, thread_id = id, last_activity_at_ms = time, archived = false)
+        val catalog = view.copy(items = listOf(
+            workspace.copy(workspace_id = "a", threads = listOf(
+                thread("unknown", null), thread("older", 100),
+                thread("archived", 900).copy(archived = true),
+                thread("subagent:child", 800), thread("tie", 200))),
+            workspace.copy(workspace_id = "b", threads = listOf(
+                thread("newest", 300, "b"), thread("tie", 200, "b"))),
+        ), history = view.history.copy(query = "older", items = listOf(thread("older", 100))))
+        assertEquals(listOf("b:newest", "a:tie", "b:tie"),
+            recentThreads(catalog, 3).map { "${it.workspace_id}:${it.thread_id}" })
+        assertEquals(listOf("newest", "tie", "tie", "older", "unknown"),
+            recentThreads(catalog).map { it.thread_id })
+        assertEquals(recentThreads(catalog), recentThreads(catalog.copy(
+            history = catalog.history.copy(items = emptyList()))))
+        assertTrue(recentThreads(null).isEmpty())
+    }
+
     @Test fun drawerOnlyListsOpenChatsWhileWorkspaceKeepsHistory() {
         val workspace = K09.workspaces.data!!.items.first()
         val template = workspace.threads.first { it.thread_id == "layout-thread" }

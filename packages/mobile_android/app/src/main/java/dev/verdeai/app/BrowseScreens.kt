@@ -96,9 +96,13 @@ internal fun paneLine(pane: Pane, nowMs: Long): String {
 
 internal fun subagent(thread: ThreadSummary) = thread.thread_id.startsWith("subagent:")
 
-/** Most recent non-archived top-level chats from the core's history projection. */
+/** Use the live catalog: history belongs to the independently filtered, paged search screen. */
 internal fun recentThreads(workspaces: WorkspacesView?, limit: Int = 8): List<ThreadSummary> =
-    workspaces?.history?.items.orEmpty().filter { !it.archived && !subagent(it) }.take(limit)
+    workspaces?.items.orEmpty().flatMap { it.threads }
+        .filter { !it.archived && !subagent(it) }
+        .sortedWith(compareByDescending<ThreadSummary> { it.last_activity_at_ms ?: 0L }
+            .thenBy { it.workspace_id }.thenBy { it.thread_id })
+        .take(limit)
 
 internal fun workspaceThreads(workspace: Workspace): List<ThreadSummary> =
     workspace.threads.filter { !subagent(it) }.sortedWith(compareByDescending<ThreadSummary> { it.last_activity_at_ms ?: 0L }.thenBy { it.thread_id })
