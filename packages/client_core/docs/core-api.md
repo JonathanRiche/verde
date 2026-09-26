@@ -265,7 +265,12 @@ limits and reject oversized inputs before allocating/uploading. Initial API
 copies supplied bytes; chunking is on the remote upload, not hidden platform
 file callbacks. The view model exposes metadata and upload progress, never
 base64 payloads. A cached attachment without bytes after restart requires
-reselection; do not silently send only its text.
+reselection; do not silently send only its text. In `draft_set`, an input with
+empty `bytes_base64` keeps the current draft's attachment with the same
+`local_id` and `byte_size` (restored or pulled-back drafts, text-only edits), so
+platforms never hold or resend bytes they cannot read back; any other empty
+input is rejected. The composer's model `Choice.favorite` mirrors the desktop
+config's `chat.favorite_models` for the selected provider (read-only).
 
 ## 6. Queries and new local view models
 

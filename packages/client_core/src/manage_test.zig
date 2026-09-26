@@ -174,6 +174,36 @@ test "thread_create registers once, upserts a local draft thread and opens befor
     try eql("pending", p.s(try f.job(second), "state"));
 }
 
+test "a created thread takes a draft and its first send starts a turn" {
+    var f = try Fixture.init(all_scopes, &.{});
+    defer f.deinit();
+    _ = try f.intent("thread_create", .{ .workspace_id = "ws-1", .provider = "codex", .model = "gpt-5.5", .effort = null, .access = null, .speed = null });
+    try f.reply("daemon.client.register", .{ .client_id = "client-1" });
+    const thread_id = p.s(p.get(try f.params("chat.thread.upsert"), "thread"), "local_thread_id");
+    try f.reply("chat.thread.upsert", .{ .store_revision = 6, .applied = true });
+    // The empty draft record loads; an empty first page does not block sending.
+    const t = &f.host.state.chat.threads[0];
+    for (f.host.state.pending) |pending| if (pending.kind == .store_get and h.eq(pending.id, t.storage_id.?)) {
+        _ = try f.event("secure_store_value", .{ .effect_id = pending.id, .generation = try std.fmt.allocPrint(f.a(), "{d}", .{pending.generation}), .key = pending.key, .value_base64 = @as(?[]const u8, null), .@"error" = @as(?u8, null) });
+        break;
+    };
+    _ = try f.intent("thread_open", .{ .workspace_id = "ws-1", .thread_id = thread_id });
+    try f.reply("chat.message.list", .{ .messages = .{}, .next_cursor = @as(?[]const u8, null) });
+    const selector = try chat.selectorFor(f.a(), "composer", "ws-1", thread_id);
+    try expect(p.yes(p.get(p.get(try h.parse(f.a(), try f.host.query(selector, f.a())), "data"), "can_send")));
+    _ = try f.intent("draft_set", .{ .workspace_id = "ws-1", .thread_id = thread_id, .text = "hello", .attachments = .{} });
+    const draft = p.get(p.get(try h.parse(f.a(), try f.host.query(selector, f.a())), "data"), "draft");
+    _ = try f.intent("send", .{ .workspace_id = "ws-1", .thread_id = thread_id, .draft_revision = p.s(draft, "revision") });
+    const upsert = p.get(try f.params("chat.thread.upsert"), "thread");
+    try eql(thread_id, p.s(upsert, "local_thread_id"));
+    try expect(p.yes(p.get(upsert, "committed")));
+    try f.reply("chat.thread.upsert", .{ .store_revision = 7, .applied = true });
+    const start = try f.params("chat.turn.start");
+    try eql(thread_id, p.s(start, "local_thread_id"));
+    try eql("codex", p.s(start, "provider"));
+    try eql("gpt-5.5", p.s(start, "model_ref"));
+}
+
 test "thread_create rejects closed workspaces, bad selections and missing scope locally" {
     var f = try Fixture.init(all_scopes, &.{});
     defer f.deinit();

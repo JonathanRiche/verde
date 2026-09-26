@@ -239,3 +239,37 @@ itself never calls the daemon.
   closed workspaces, **Reopen** (`workspace_archive` with `archived:false`).
 
 Paths, titles and search text are shown on screen but never logged.
+
+## Composer (D-08)
+
+The transcript's bottom bar is the composer. The core owns the draft, the selection
+and the follow-up receipt; the app only holds the text field while you type.
+
+- **Draft:** typing is saved with `draft_set` after a 600 ms pause (each intent spends
+  a core receipt). The draft is also saved before sending, when the app goes to the
+  background, and when you leave the chat. The core's draft (restored,
+  pulled back, or cleared after a send) replaces the field only when there are no
+  unsaved local edits.
+- **Send** is revision-checked `send`. While a turn runs, the button becomes
+  **Steer** (Codex, Claude, Pi without images) or **Queue** (`followup_submit`). The
+  follow-up card offers *Pull back to edit*, *Remove* (unsent only) and *Retry*.
+  **Stop** sits next to the send button.
+- **`!command`** asks for confirmation in a sheet (command and cwd) before
+  `shell_confirm`; `!!` sends a literal `!`. **`/command`** runs `slash_run` from the
+  core's slash catalog (fetched once per provider on the first `/`), and `//` sends a
+  literal slash. **`@`** searches repository files with `mention_search`.
+- **Pickers:** provider (only before the first message), model (desktop favourites
+  first, starred), effort, access and speed come from the core's catalogs.
+  Favourites can't be changed from the phone.
+- **Images** from Photos, the camera or image files are downscaled to JPEG
+  (≤ 160 KiB each, 320 KiB total, 4 per message) because the draft is kept in the
+  core's 512 KiB record. After that they are re-sent by reference, never
+  re-uploaded. Upload progress shows while sending. Other file types are not
+  supported on the phone.
+
+Draft text, commands and image bytes are never logged.
+
+On a phone: type, background the app and reopen it (the draft is kept). Send; while
+the reply runs, steer, pull back and remove. Stop. Run `!pwd` (confirm, then cancel
+once). Try `/` and `@` suggestions. Switch model and effort. Attach a photo from each
+source and send it. Check that the keyboard never covers the field.

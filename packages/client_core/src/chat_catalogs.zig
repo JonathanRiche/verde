@@ -57,6 +57,18 @@ pub fn catalogs(a: A, selection: m.Selection, dynamic: V, slash: V) h.ApiError!m
     }
     return out;
 }
+/// Marks models starred in the desktop config (`config.chat.favorite_models`) for this provider.
+pub fn favorites(a: A, catalog: m.Catalogs, provider: []const u8, config: V) h.ApiError!m.Catalogs {
+    const starred = p.rows(p.get(p.get(config, "chat"), "favorite_models"));
+    if (starred.len == 0) return catalog;
+    var out = catalog;
+    const models = try a.dupe(m.Choice, catalog.models);
+    for (models) |*choice| for (starred) |row| {
+        if (eq(p.s(row, "provider"), provider) and eq(p.s(row, "model"), choice.id)) choice.favorite = true;
+    };
+    out.models = models;
+    return out;
+}
 fn fallback(provider: []const u8) []const []const u8 {
     if (eq(provider, "codex")) return &.{ "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.5", "gpt-5.6-terra", "gpt-5.6-luna" };
     if (eq(provider, "claude")) return &.{ "fable[1m]", "default", "opus[1m]", "sonnet", "haiku" };

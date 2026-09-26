@@ -442,3 +442,40 @@ test "chat bang send requests confirmation and double bang escapes into a prompt
     _ = try f.intent("send", .{ .draft_revision = "2" });
     try eql("!literal", f.host.state.chat.threads[0].send.?.text);
 }
+
+test "chat draft keeps attachments by reference and composer marks desktop favorites" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.open();
+    const image = .{ .local_id = "image", .name = "a.png", .mime = "image/png", .byte_size = "6", .bytes_base64 = "YWJjZGVm" };
+    _ = try f.intent("draft_set", .{ .text = "first", .attachments = .{image} });
+    _ = try f.storage(null, false);
+    // Later edits send only the ID and size; the stored bytes stay with the draft.
+    _ = try f.intent("draft_set", .{ .text = "second", .attachments = .{.{ .local_id = "image", .name = "a.png", .mime = "image/png", .byte_size = "6", .bytes_base64 = "" }} });
+    _ = try f.storage(null, false);
+    const saved = f.host.state.chat.threads[0].saved;
+    try eql("second", saved.text);
+    try expect(saved.inputs.len == 1);
+    try eql("YWJjZGVm", saved.inputs[0].bytes_base64);
+    // A reference to an unknown ID or a different size is not an attachment.
+    for ([_][]const u8{ "other", "image" }, [_][]const u8{ "6", "7" }) |id, size| {
+        const event = try h.encode(f.a(), .{ .api_version = 1, .type = "draft_set", .now_ms = f.now, .wall_time_ms = @as(i64, 1790363191001), .intent_id = try std.fmt.allocPrint(f.a(), "ref-{s}-{s}", .{ id, size }), .workspace_id = ws, .thread_id = thread, .text = "third", .attachments = .{.{ .local_id = id, .name = "a.png", .mime = "image/png", .byte_size = size, .bytes_base64 = "" }} });
+        try std.testing.expectError(error.InvalidArgument, f.host.handle(event, f.a()));
+    }
+    try eql("second", f.host.state.chat.threads[0].saved.text);
+    // Removing it is just leaving it out.
+    try f.draft("no image");
+    try expect(f.host.state.chat.threads[0].saved.inputs.len == 0);
+
+    var tx = try h.Transaction.init(&f.host);
+    defer tx.deinit();
+    tx.state.sync.snapshot = try h.parse(tx.allocator(), "{\"config\":{\"chat\":{\"favorite_models\":[{\"provider\":\"codex\",\"model\":\"gpt-6-sol\"},{\"provider\":\"claude\",\"model\":\"gpt-6-luna\"}]}}}");
+    _ = try tx.commit(&f.host, f.a());
+    const composer = try std.json.parseFromValueLeaky(wire.Query(m.ComposerView), f.a(), try f.query("composer"), .{});
+    var starred: usize = 0;
+    for (composer.data.?.catalogs.models) |choice| if (choice.favorite) {
+        try eql("gpt-6-sol", choice.id);
+        starred += 1;
+    };
+    try expect(starred == 1);
+}

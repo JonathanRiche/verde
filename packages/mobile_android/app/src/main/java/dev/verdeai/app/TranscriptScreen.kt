@@ -116,7 +116,7 @@ internal fun ThreadRoute(hosts: HostsModel, browse: BrowseModel, workspaceId: St
         factory = viewModelFactory { initializer { TranscriptModel(hosts, browse.state, workspaceId, threadId) } })
     val browseState by browse.state.collectAsState()
     val title = browseState.workspaces?.items?.find { it.workspace_id == workspaceId }?.threads?.find { it.thread_id == threadId }?.title
-    TranscriptScreen(model, title, onBack, onHosts, browse::refresh, onCitation)
+    TranscriptScreen(model, title, onBack, onHosts, browse::refresh, onCitation, bottomBar = { m, s -> ChatComposer(m, s) })
 }
 
 @OptIn(ExperimentalMaterial3Api::class)

@@ -333,8 +333,13 @@ pub fn intent(tx: *h.Transaction, tag: []const u8, event: V) E!bool {
     };
     const t = &tx.state.chat.threads[i];
     if (eq(tag, "draft_set")) {
-        const inputs = try h.decode([]const wire.AttachmentInput, tx.allocator(), p.get(event, "attachments"));
-        for (inputs, 0..) |input, n| {
+        const inputs = try tx.allocator().dupe(wire.AttachmentInput, try h.decode([]const wire.AttachmentInput, tx.allocator(), p.get(event, "attachments")));
+        for (inputs, 0..) |*input, n| {
+            // Empty bytes keep this draft's attachment with the same ID and size, so the platform
+            // never has to hold or resend bytes it cannot read back (restored or pulled-back drafts).
+            if (input.bytes_base64.len == 0) for (t.saved.inputs) |old| {
+                if (eq(old.local_id, input.local_id) and eq(old.byte_size, input.byte_size)) input.* = old;
+            };
             const bytes = try @import("auth.zig").decode64(tx.allocator(), input.bytes_base64);
             const size = std.fmt.parseInt(u64, input.byte_size, 10) catch return error.InvalidArgument;
             if (size != bytes.len or size > tx.state.rpc.limits.max_attachment_bytes or size == 0 or input.local_id.len == 0 or !std.mem.startsWith(u8, input.mime, "image/")) return error.InvalidArgument;
@@ -1173,7 +1178,7 @@ pub fn query(a: A, state: *const h.State, selector: []const u8) E!?V {
         if (state.auth.credential) |credential| for (credential.scopes) |s| if (eq(s, "chat:write")) {
             can_write = true;
         };
-        return try value(a, m.ComposerView{ .draft = .{ .revision = try decimal(a, t.saved.revision), .text = t.saved.text, .attachments = if (t.send != null and t.send.?.revision == t.saved.revision) try sendAttachments(a, t.send.?) else try attachments(a, t.saved.inputs), .persisted = t.loaded and !t.dirty and t.storage_id == null }, .selection = t.saved.selection, .catalogs = try c.catalogs(a, t.saved.selection, t.dynamic_models, t.slash), .mentions = t.mentions, .provider_ready = state.rpc.phase == .ready, .can_send = can_write and state.rpc.bearer != null and state.rpc.phase == .ready and state.lifecycle == .foreground and t.loaded and t.send == null and !active(t), .can_stop = can_write and active(t) and !t.turn.?.stop_pending, .send_operation = op, .followup = followup, .shell_confirmation = t.confirmation, .@"error" = t.@"error" });
+        return try value(a, m.ComposerView{ .draft = .{ .revision = try decimal(a, t.saved.revision), .text = t.saved.text, .attachments = if (t.send != null and t.send.?.revision == t.saved.revision) try sendAttachments(a, t.send.?) else try attachments(a, t.saved.inputs), .persisted = t.loaded and !t.dirty and t.storage_id == null }, .selection = t.saved.selection, .catalogs = try c.favorites(a, try c.catalogs(a, t.saved.selection, t.dynamic_models, t.slash), t.saved.selection.provider orelse t.metadata.provider, p.get(state.sync.snapshot, "config")), .mentions = t.mentions, .provider_ready = state.rpc.phase == .ready, .can_send = can_write and state.rpc.bearer != null and state.rpc.phase == .ready and state.lifecycle == .foreground and t.loaded and t.send == null and !active(t), .can_stop = can_write and active(t) and !t.turn.?.stop_pending, .send_operation = op, .followup = followup, .shell_confirmation = t.confirmation, .@"error" = t.@"error" });
     }
     var rows = t.rows;
     for (t.overlay) |overlay| {

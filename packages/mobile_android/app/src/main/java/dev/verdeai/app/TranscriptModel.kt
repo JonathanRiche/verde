@@ -74,6 +74,7 @@ internal class TranscriptModel(
     val composerSelector = chatSelector("composer", workspaceId, threadId)
 
     private var core: CoreHost? = null
+    private val connected = MutableStateFlow<CoreHost?>(null)
     private var focused = false
     private var focusIntent: String? = null
     private var focusEpoch = -1
@@ -89,12 +90,13 @@ internal class TranscriptModel(
     }
 
     private suspend fun observe(id: String?) = coroutineScope {
-        core = null; focused = false; focusIntent = null; requestedCursor = null
+        core = null; connected.value = null; focused = false; focusIntent = null; requestedCursor = null
         mutableState.update { it.copy(thread=null, composer=null, focusError=null, fatal=false) }
         if (id == null) return@coroutineScope
         val host = try { hosts.core(id) } catch (e: CancellationException) { throw e } catch (_: Exception) { null }
         if (host == null) { mutableState.update { it.copy(fatal=true) }; return@coroutineScope }
         core = host
+        connected.value = host
         launch {
             host.views.map { it[threadSelector] to it[composerSelector] }.distinctUntilChanged().collect { (thread, composer) ->
                 mutableState.update { it.copy(thread=decodeThread(thread), composer=decodeComposer(composer)) }
@@ -211,6 +213,40 @@ internal class TranscriptModel(
         }
     }
 
+    // ---- D-08 composer hooks ----
+
+    /** The composer in the transcript's bottom bar; shares this model's scope, core and lifetime. */
+    private val composerModel = lazy { ComposerModel(this, scope) }
+    internal val composer: ComposerModel by composerModel
+
+    /** Intent outcomes of the connected host, as the core reports them in `hosts`. */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    internal val operations: Flow<List<Operation>> = connected
+        .flatMapLatest { host -> host?.hosts?.map { it?.data?.operations.orEmpty() } ?: flowOf(emptyList()) }
+        .distinctUntilChanged()
+
+    /** The newest outcome of one of this screen's intents. */
+    internal fun operation(id: String): Operation? = core?.hosts?.value?.data?.operations?.find { it.intent_id == id }
+
+    /** The core's newest composer projection, read straight from the host (no collector lag). */
+    internal fun latestComposer(): ChatComposerView? = decodeComposer(core?.views?.value?.get(composerSelector))
+
+    /**
+     * Sends one chat intent with a fresh id and returns its operation. A call the core refuses
+     * outright (malformed or over a size limit; state unchanged) comes back as a failed operation
+     * with `invalid_input` / `resource_limit`; null means there is no connected core at all.
+     */
+    internal suspend fun dispatch(build: (id: String, now: Long, wall: Long) -> Event): Operation? {
+        val host = core ?: return null
+        val id = UUID.randomUUID().toString()
+        try { host.send { n, w -> build(id, n, w) } }
+        catch (e: CancellationException) { throw e }
+        catch (e: CoreInputRejected) {
+            return Operation(id, "failed", LocalError(code=if (e.status == 5) "resource_limit" else "invalid_input", message=""))
+        } catch (_: Exception) { mutableState.update { it.copy(fatal=true) }; return null }
+        return host.hosts.value?.data?.operations?.find { it.intent_id == id } ?: Operation(id, "pending", null)
+    }
+
     // ---- K-11 rendering utilities (pure core queries; work offline) ----
 
     fun cachedMarkdown(text: String): RenderResult<List<MarkdownNode>>? = renders.markdown[text]
@@ -247,6 +283,7 @@ internal class TranscriptModel(
     }
 
     override fun onCleared() {
+        if (composerModel.isInitialized()) composer.flushDetached()
         val host = core
         if (focused && host != null && FocusClaim.owner === this) {
             FocusClaim.owner = null
