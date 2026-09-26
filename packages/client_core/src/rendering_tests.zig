@@ -168,6 +168,50 @@ test "web V2 byte framing Unicode tabs newlines multiple files and empty patches
     try eql("x", numeric.files[0].new_path.?);
 }
 
+test "diff_index locates V2 records that render alone like the whole body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const patch = "@@ -1 +1 @@\n-say \"hello\" 😀 there friend\n+say \"hello\" 😁 there friend\n";
+    const path = "dir/é\t😀\n.ts";
+    const text = try std.fmt.allocPrint(a, "VERDE_DIFF_V2\n{s}{s}{s}", .{ try framed(a, path, patch), try framed(a, "empty.ts", ""), try framed(a, "b.json", "@@ -1 +1 @@\n-1\n+2\n") });
+    const whole = try rendering.diff.render(a, text);
+    const index = try rendering.diff.index(a, text);
+    try expect(index.files.len == 3 and whole.files.len == 3);
+    try eql(path, index.files[0].path);
+    try expect(index.files[0].additions == 1 and index.files[0].deletions == 1 and index.files[0].start == "VERDE_DIFF_V2\n".len);
+    try eql(patch, text[index.files[0].patch_start..index.files[0].end]);
+    try expect(index.files[1].patch_start == index.files[1].end and index.files[2].end == text.len);
+    for (index.files, whole.files) |entry, file| {
+        try expect(entry.start < entry.patch_start and entry.patch_start <= entry.end);
+        const alone = try rendering.diff.render(a, try std.fmt.allocPrint(a, "VERDE_DIFF_V2\n{s}", .{text[entry.start..entry.end]}));
+        try golden(a, try std.json.Stringify.valueAlloc(a, file, .{}), alone.files[0]);
+    }
+    try expect((try rendering.diff.index(a, "VERDE_DIFF_V2\n")).files.len == 0);
+    for ([_][]const u8{ "@@ -1 +1 @@\n-a\n+b\n", "VERDE_DIFF_V2\nFILE\t1\t0\t0\t1\nx", "VERDE_DIFF_V2\nFILE\t1\t0\t0\t0\né" }) |bad|
+        try std.testing.expectError(error.InvalidInput, rendering.diff.index(a, bad));
+}
+
+test "diff_index accepts bodies beyond the per-patch text budget" {
+    var h = try host.Host.init(std.testing.allocator, config);
+    defer h.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var body: std.ArrayList(u8) = .empty;
+    try body.appendSlice(a, "VERDE_DIFF_V2\n");
+    var count: usize = 0;
+    while (body.items.len <= rendering.MAX_TEXT) : (count += 1)
+        try body.appendSlice(a, try framed(a, try std.fmt.allocPrint(a, "f{d}.ts", .{count}), "@@ -1 +1 @@\n-const a = 1;\n+const a = 2;\n"));
+    const whole = try host.parse(a, try h.query(try std.json.Stringify.valueAlloc(a, .{ .utility = "diff", .text = body.items }, .{}), a));
+    try eql("resource_limit", whole.object.get("error").?.object.get("code").?.string);
+    const listed = try host.parse(a, try h.query(try std.json.Stringify.valueAlloc(a, .{ .utility = "diff_index", .text = body.items }, .{}), a));
+    try expect(listed.object.get("error").? == .null);
+    try expect(listed.object.get("data").?.object.get("files").?.array.items.len == count);
+    const plain = try host.parse(a, try h.query("{\"utility\":\"diff_index\",\"text\":\"@@ -1 +1 @@\\n-a\\n+b\\n\"}", a));
+    try eql("invalid_input", plain.object.get("error").?.object.get("code").?.string);
+}
+
 test "diff binary new deleted no-newline and multiple hunks" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -267,6 +311,7 @@ test "registered query models decode real rendering replies" {
         .{ "{\"utility\":\"markdown\",\"text\":\"# é **世界**\"}", rendering.markdown.Markdown },
         .{ "{\"utility\":\"highlight\",\"text\":\"const x = 1\",\"language\":\"ts\"}", rendering.Highlight },
         .{ "{\"utility\":\"diff\",\"text\":\"@@ -1 +1 @@\\n-old\\n+new\\n\"}", rendering.diff.Diff },
+        .{ "{\"utility\":\"diff_index\",\"text\":\"VERDE_DIFF_V2\\nFILE\\t1\\t0\\t0\\t0\\nx\"}", rendering.diff.Index },
     }) |entry| {
         const output = try h.query(entry[0], std.testing.allocator);
         defer std.testing.allocator.free(output);

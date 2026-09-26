@@ -430,6 +430,9 @@ query envelope/error model. Types here are proposed output types:
   span kinds: add, delete. Match web `parseDiffV2` for `VERDE_DIFF_V2`, using
   `zig_dif` parsing where applicable; malformed input returns a typed error
   so the renderer can show source text.
+- `{utility:"diff_index",text}` → `{files:[{path,additions,deletions,start,end,
+  patch_start}]}`: byte ranges of each `VERDE_DIFF_V2` record and its patch, so
+  large bodies can be rendered one file at a time. Only the selector limit applies.
 
 Offsets are half-open UTF-8 byte offsets into the supplied source (highlight/
 markdown) or the returned line text (diff spans). Native bridges translate to

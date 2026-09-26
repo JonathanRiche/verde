@@ -11,6 +11,11 @@ pub const Diff = struct { files: []const File };
 pub const File = struct { old_path: ?[]const u8, new_path: ?[]const u8, binary: bool, hunks: []const Hunk };
 pub const Hunk = struct { old_start: usize, old_count: usize, new_start: usize, new_count: usize, lines: []const Line };
 pub const Line = struct { kind: []const u8, text: []const u8, old_line: ?usize = null, new_line: ?usize = null, spans: []const Span = &.{} };
+/// One VERDE_DIFF_V2 record located in the source: `start..end` spans the whole record (header,
+/// path and patch) and `patch_start..end` the patch, as UTF-8 byte offsets. Counts are the
+/// writer's header fields; the platform prefixes MARKER to a record to render just that file.
+pub const IndexEntry = struct { path: []const u8, additions: usize, deletions: usize, start: usize, end: usize, patch_start: usize };
+pub const Index = struct { files: []const IndexEntry };
 const MARKER = "VERDE_DIFF_V2\n";
 const MAX_LINES = 4096;
 
@@ -20,26 +25,42 @@ pub fn render(a: A, text: []const u8) Error!Diff {
         try parsePatch(a, text, null, &files);
     } else {
         var pos: usize = MARKER.len;
-        while (pos < text.len) {
-            const nl = std.mem.indexOfScalarPos(u8, text, pos, '\n') orelse return error.InvalidInput;
-            const header = text[pos..nl];
-            if (!std.mem.startsWith(u8, header, "FILE\t")) return error.InvalidInput;
-            var fields = std.mem.splitScalar(u8, header[5..], '\t');
-            var sizes: [4]usize = undefined;
-            for (&sizes) |*size| size.* = try number(fields.next() orelse return error.InvalidInput);
-            if (fields.next() != null) return error.InvalidInput;
-            pos = nl + 1;
-            if (sizes[0] > text.len - pos) return error.InvalidInput;
-            const path = text[pos..][0..sizes[0]];
-            pos += sizes[0];
-            if (sizes[3] > text.len - pos) return error.InvalidInput;
-            const patch = text[pos..][0..sizes[3]];
-            pos += sizes[3];
-            if (!std.unicode.utf8ValidateSlice(path) or !std.unicode.utf8ValidateSlice(patch)) return error.InvalidInput;
-            try parsePatch(a, patch, path, &files);
-        }
+        while (try nextRecord(text, &pos)) |record| try parsePatch(a, text[record.patch_start..record.end], record.path, &files);
     }
     return .{ .files = try files.toOwnedSlice(a) };
+}
+
+/// Locates every VERDE_DIFF_V2 record without parsing patches, so bodies beyond the per-patch
+/// budgets can still list their files and be rendered one record at a time.
+pub fn index(a: A, text: []const u8) Error!Index {
+    if (!std.mem.startsWith(u8, text, MARKER)) return error.InvalidInput;
+    var entries: std.ArrayList(IndexEntry) = .empty;
+    var pos: usize = MARKER.len;
+    while (try nextRecord(text, &pos)) |record| try entries.append(a, record);
+    return .{ .files = try entries.toOwnedSlice(a) };
+}
+
+/// The one V2 framing reader shared by `render` and `index`.
+fn nextRecord(text: []const u8, pos: *usize) Error!?IndexEntry {
+    if (pos.* >= text.len) return null;
+    const start = pos.*;
+    const nl = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse return error.InvalidInput;
+    const header = text[start..nl];
+    if (!std.mem.startsWith(u8, header, "FILE\t")) return error.InvalidInput;
+    var fields = std.mem.splitScalar(u8, header[5..], '\t');
+    var sizes: [4]usize = undefined;
+    for (&sizes) |*size| size.* = try number(fields.next() orelse return error.InvalidInput);
+    if (fields.next() != null) return error.InvalidInput;
+    var at = nl + 1;
+    if (sizes[0] > text.len - at) return error.InvalidInput;
+    const path = text[at..][0..sizes[0]];
+    at += sizes[0];
+    if (sizes[3] > text.len - at) return error.InvalidInput;
+    const patch_start = at;
+    at += sizes[3];
+    if (!std.unicode.utf8ValidateSlice(path) or !std.unicode.utf8ValidateSlice(text[patch_start..at])) return error.InvalidInput;
+    pos.* = at;
+    return .{ .path = path, .additions = sizes[1], .deletions = sizes[2], .start = start, .end = at, .patch_start = patch_start };
 }
 
 fn number(bytes: []const u8) Error!usize {

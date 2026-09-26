@@ -21,12 +21,20 @@ Returned buffers remain valid until `vc_buf_free`, including after host free.
   numeric fields (path byte length, additions, deletions, patch byte length),
   followed immediately by the path and patch bytes; records have no separator.
   Numeric fields follow web `Number`/safe-integer validation (the writer emits
-  decimal integers). Counts are validated but not exposed as a second source of truth. Plain
+  decimal integers). `diff` validates the counts but does not expose them as a second source of truth beside its parsed lines; only `diff_index` reports them, for file lists. Plain
   unified patches use the same `zig_dif` parser. Word spans reuse desktop
   side-by-side change alignment, with no context collapsing. `/dev/null`
   becomes a null path; other patch paths are preserved verbatim (including
   Git a/b prefixes). Missing-newline notices become `meta` lines. Empty V2
   patches remain file entries; binary patches have `binary:true`.
+- `diff_index`: `data.files` lists each `VERDE_DIFF_V2` record without parsing
+  its patch: `{path, additions, deletions, start, end, patch_start}`. `start..end`
+  is the whole record and `patch_start..end` its patch, as UTF-8 byte offsets
+  into the body. The counts are the writer's header fields (web file-list parity).
+  The body is bounded only by the 1 MiB selector, not the 64 KiB text budget, so
+  a platform can list every file of a large diff and render one record at a time
+  by querying `diff` with `VERDE_DIFF_V2\n` followed by that record. Plain
+  unified patches are `invalid_input`.
 
 All ranges refer to the original UTF-8 source, or to a returned diff line's
 text. Inline ranges describe content; block ranges can include delimiters and

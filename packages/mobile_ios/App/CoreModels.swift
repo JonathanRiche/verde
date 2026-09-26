@@ -5381,6 +5381,92 @@ extension DiffQuery {
     }
 }
 
+struct DiffIndexEntry: Codable {
+    var `path`: String
+    var `additions`: UInt64
+    var `deletions`: UInt64
+    var `start`: UInt64
+    var `end`: UInt64
+    var `patch_start`: UInt64
+}
+
+extension DiffIndexEntry {
+    private enum CodingKeys: String, CodingKey {
+        case `path`
+        case `additions`
+        case `deletions`
+        case `start`
+        case `end`
+        case `patch_start`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`path` = try c.decode(String.self, forKey: .`path`)
+        self.`additions` = try c.decode(UInt64.self, forKey: .`additions`)
+        self.`deletions` = try c.decode(UInt64.self, forKey: .`deletions`)
+        self.`start` = try c.decode(UInt64.self, forKey: .`start`)
+        self.`end` = try c.decode(UInt64.self, forKey: .`end`)
+        self.`patch_start` = try c.decode(UInt64.self, forKey: .`patch_start`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`path`, forKey: .`path`)
+        try c.encode(self.`additions`, forKey: .`additions`)
+        try c.encode(self.`deletions`, forKey: .`deletions`)
+        try c.encode(self.`start`, forKey: .`start`)
+        try c.encode(self.`end`, forKey: .`end`)
+        try c.encode(self.`patch_start`, forKey: .`patch_start`)
+    }
+}
+
+struct DiffIndexView: Codable {
+    var `files`: [DiffIndexEntry]
+}
+
+extension DiffIndexView {
+    private enum CodingKeys: String, CodingKey {
+        case `files`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`files` = try c.decode([DiffIndexEntry].self, forKey: .`files`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`files`, forKey: .`files`)
+    }
+}
+
+struct DiffIndexQuery: Codable {
+    var `api_version`: UInt32
+    var `revision`: String
+    var `data`: DiffIndexView?
+    var `error`: LocalError?
+}
+
+extension DiffIndexQuery {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `revision`
+        case `data`
+        case `error`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        self.`revision` = try c.decode(String.self, forKey: .`revision`)
+        self.`data` = try c.decodeIfPresent(DiffIndexView.self, forKey: .`data`)
+        self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`revision`, forKey: .`revision`)
+        try c.encode(self.`data`, forKey: .`data`)
+        try c.encode(self.`error`, forKey: .`error`)
+    }
+}
+
 struct Pane: Codable {
     var `id`: String
     var `workspace_id`: String

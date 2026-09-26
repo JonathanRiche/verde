@@ -8,6 +8,8 @@ const A = std.mem.Allocator;
 const V = std.json.Value;
 
 pub const MAX_TEXT = 64 * 1024;
+/// `diff_index` only frames records, so it accepts any body that fits the query selector.
+pub const MAX_INDEX_TEXT = host.MAX_INPUT;
 pub const MAX_OUTPUT = 1024 * 1024;
 pub const Span = struct { start: usize, end: usize, kind: []const u8 };
 pub const Highlight = struct { spans: []const Span };
@@ -24,12 +26,15 @@ pub fn query(a: A, request: V) host.ApiError!Result {
 
 fn queryInner(a: A, request: V) Error!Result {
     const utility = try string(request, "utility");
-    if (!eq(utility, "markdown") and !eq(utility, "highlight") and !eq(utility, "diff"))
+    if (!eq(utility, "markdown") and !eq(utility, "highlight") and !eq(utility, "diff") and !eq(utility, "diff_index"))
         return .{ .failure = .{ .code = "unsupported", .message = "Unknown rendering utility." } };
     const text = try string(request, "text");
-    if (text.len > MAX_TEXT) return error.ResourceLimit;
+    const limit: usize = if (eq(utility, "diff_index")) MAX_INDEX_TEXT else MAX_TEXT;
+    if (text.len > limit) return error.ResourceLimit;
     if (!std.unicode.utf8ValidateSlice(text)) return error.InvalidInput;
-    const bytes = if (eq(utility, "markdown"))
+    const bytes = if (eq(utility, "diff_index"))
+        try encode(a, try diff.index(a, text))
+    else if (eq(utility, "markdown"))
         try encode(a, try markdown.render(a, text))
     else if (eq(utility, "diff"))
         try encode(a, try diff.render(a, text))

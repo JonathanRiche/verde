@@ -1377,6 +1377,29 @@ data class DiffQuery(
 )
 
 @Serializable
+data class DiffIndexEntry(
+    val `path`: String,
+    val `additions`: ULong,
+    val `deletions`: ULong,
+    val `start`: ULong,
+    val `end`: ULong,
+    val `patch_start`: ULong,
+)
+
+@Serializable
+data class DiffIndexView(
+    val `files`: List<DiffIndexEntry>,
+)
+
+@Serializable
+data class DiffIndexQuery(
+    val `api_version`: Long,
+    val `revision`: String,
+    val `data`: DiffIndexView?,
+    val `error`: LocalError?,
+)
+
+@Serializable
 data class Pane(
     val `id`: String,
     val `workspace_id`: String,
