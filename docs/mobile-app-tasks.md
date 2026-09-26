@@ -162,7 +162,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | D-05 | Home + Workspaces + lifecycle | android | linux+phone | D-04, K-09 | done (44117855; phone verify pending H-06/H-07) |
 | D-06 | Transcript screen | android | linux | D-05, K-10, K-11 | done (7dc772c2; phone verify pending) |
 | D-07 | Diff card | android | linux | D-06 | done (e369ee75, cc2bf9e7; phone verify pending) |
-| D-08 | Composer + pickers + attachments + follow-ups | android | linux | D-06 | in_progress (claude opus cli-thread-1790407267836-b7791f3bb1576d33) |
+| D-08 | Composer + pickers + attachments + follow-ups | android | linux | D-06 | done (a8cf4a2c) |
 | D-09 | Approvals card | android | linux | D-06 | done (5bb55bac) |
 | D-10 | History, new chat, workspace management | android | linux | D-05, A-03 | done (fe7bd30e, b283f9cb) |
 | D-11 | Native terminal view | android | linux+phone | D-05, K-12 | done (a114ffca; phone verify pending) |
@@ -1044,6 +1044,7 @@ human-verify step.
     confirm sheet.
 - **Done when:** UI tests pass. Human-verify: a full round trip on the
   phone (send, stream, stop, attach a photo, queue a follow-up).
+- **Done (a8cf4a2c).** Android composer (provider/model/effort/access/speed chips with desktop favourites, steer/queue/stop, `!cmd` confirm sheet, `/` and `@` suggestions, image attach via photos/camera/files, persisted drafts); new-chat first send starts a turn (core + Android tests). Follow-ups: favourite toggle needs an allowlisted RPC; dynamic models not refetched on provider switch; images only; queued images double stored bytes; tab bar visible on chat screen.
 
 #### D-09 · Approvals card
 - **depends:** D-06
