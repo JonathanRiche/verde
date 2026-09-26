@@ -600,6 +600,12 @@ fn finishResponse(tx: *h.Transaction, p: h.Pending, event: V) E!void {
         try tx.track(.socket, id, "auth_socket");
         s.need_ticket = false;
         s.unauthorized_retried = false;
+        // Ticket retries keep the existing RPC session. Publish its recovered
+        // state even when no subsequent handshake or snapshot changes it.
+        if (tx.state.host_error) |err| {
+            if (eq(err.domain, "auth") and eq(err.code, "network_unavailable")) tx.state.host_error = null;
+        }
+        tx.changed = true;
     }
     return;
 }

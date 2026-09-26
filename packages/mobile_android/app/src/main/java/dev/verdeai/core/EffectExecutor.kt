@@ -290,7 +290,11 @@ class EffectExecutor(
                 override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
                     state.finish(1003, false, failure(TransportFailureKind.network, TransportFailureCode.unknown))
                 }
-                override fun onClosing(webSocket: WebSocket, code: Int, reason: String) { webSocket.close(code, null) }
+                override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                    // 1005 means the peer sent an empty close frame; it is a
+                    // local sentinel and must never be echoed onto the wire.
+                    webSocket.close(if (code == 1005) 1000 else code, null)
+                }
                 override fun onClosed(webSocket: WebSocket, code: Int, reason: String) { state.finish(code, true, null) }
                 override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                     response?.close(); state.finish(null, false, transport(t))

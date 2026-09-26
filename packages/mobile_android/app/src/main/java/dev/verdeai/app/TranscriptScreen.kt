@@ -28,7 +28,6 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -88,7 +87,7 @@ internal fun transcriptBanner(state: TranscriptState, nowMs: Long): Banner? {
     if (needsPairing(browse)) return Banner("This phone isn't paired with ${browse.row?.saved?.label ?: "this host"}.", BannerAction.Hosts, error=true)
     browseBanner(browse.copy(home=null, workspaces=null, savedAtMs=null), nowMs)?.let { return it }
     // A failed approval decision also lands in the thread error; the approval card reports it.
-    val error = state.thread?.error?.takeIf { it != state.thread?.approval?.error }
+    val error = state.thread?.error?.takeIf { state.thread?.page?.loading != true && it != state.thread?.approval?.error }
     if (error != null) return Banner("Couldn't load this chat. ${error.message}".trim(), BannerAction.Retry, error=true)
     return null
 }
@@ -100,6 +99,7 @@ internal fun transcriptPlaceholder(state: TranscriptState): TranscriptPlaceholde
     val host = state.browse.host
     return when {
         thread != null && thread.rows.isNotEmpty() -> null
+        thread?.page?.loading == true -> TranscriptPlaceholder.Loading
         thread?.error != null -> TranscriptPlaceholder.Error
         thread != null && !thread.page.loading && state.focusError == null -> TranscriptPlaceholder.Empty
         state.focusError == "thread_unavailable" -> TranscriptPlaceholder.Missing
@@ -141,14 +141,13 @@ internal fun TranscriptScreen(
     val now = rememberNow(state.turn?.started_at_ms != null)
     val context = TranscriptContext(model, now, onCitation, state.turn?.started_at_ms)
     Column(Modifier.fillMaxSize()) {
-        TopAppBar(
+        VerdeTopBar(
             title = {
-                Column {
-                    Text(state.thread?.thread?.title ?: title ?: "Chat", maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    state.thread?.thread?.let { t ->
-                        Text(listOfNotNull(t.provider, t.model).joinToString(" · "), style = MaterialTheme.typography.labelMedium,
-                            maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    }
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    ProviderGlyph(state.thread?.thread?.provider)
+                    Text(state.thread?.thread?.title ?: title ?: "Chat", maxLines = 1,
+                        overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyMedium)
+
                 }
             },
             navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back") } })
@@ -270,13 +269,15 @@ internal fun MessageRow(row: ChatRow, ctx: TranscriptContext) {
     val colors = MaterialTheme.colorScheme
     Box(Modifier.fillMaxWidth(), contentAlignment = if (mine) Alignment.CenterEnd else Alignment.CenterStart) {
         Column(
-            Modifier.fillMaxWidth(if (mine) 0.88f else 1f)
-                .background(if (mine) colors.primaryContainer else colors.surfaceContainerLow, RoundedCornerShape(12.dp))
+            Modifier.fillMaxWidth()
+                .background(if (mine) VerdeColors.UserBubble else VerdeColors.Assistant, RoundedCornerShape(10.dp))
+                .border(1.dp, if (mine) VerdeColors.UserBubble else VerdeColors.Border, RoundedCornerShape(10.dp))
                 .combinedClickable(onClick = {}, onLongClickLabel = "Copy message", onLongClick = { menu = true })
                 .padding(horizontal = 12.dp, vertical = 10.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                if (!mine) ProviderGlyph(row.author, Modifier.size(16.dp))
                 Text(if (mine) "You" else row.author.ifEmpty { "Assistant" }, style = MaterialTheme.typography.labelMedium,
                     color = colors.onSurfaceVariant)
                 deliveryLabel(row.delivery)?.let {
@@ -286,7 +287,7 @@ internal fun MessageRow(row: ChatRow, ctx: TranscriptContext) {
             if (row.attachments.isNotEmpty()) Attachments(row.attachments)
             if (row.body.isNotEmpty()) {
                 // User text is shown verbatim (web parity); assistant output goes through the core AST.
-                if (mine) Text(row.body, style = MaterialTheme.typography.bodyMedium)
+                if (mine) Text(row.body, style = MaterialTheme.typography.bodyLarge)
                 else MarkdownText(streamTail(row), ctx.model, ctx.onCitation)
             }
         }
@@ -314,16 +315,20 @@ internal fun streamTail(row: ChatRow, max: Int = 16_000): String {
 private fun Attachments(attachments: List<ChatAttachment>) {
     Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
         attachments.forEach { a ->
-            // Host images need an authenticated fetch the core doesn't offer yet; show the name only.
-            AssistChip(onClick = {}, label = { Text((if (a.mime.startsWith("image/")) "Image · " else "") + basename(a.name), maxLines = 1,
-                overflow = TextOverflow.Ellipsis) })
+            // This projection has metadata only; do not advertise a nonfunctional tap action.
+            Surface(color = VerdeColors.PanelAlt, shape = RoundedCornerShape(7.dp)) {
+                Column(Modifier.padding(8.dp)) {
+                    Text((if (a.mime.startsWith("image/")) "Image · " else "") + basename(a.name), style = MaterialTheme.typography.labelMedium)
+                    Text("Preview unavailable", style = MaterialTheme.typography.labelSmall, color = VerdeColors.Subtle)
+                }
+            }
         }
     }
 }
 
 @Composable
-private fun StatusDot(color: Color, description: String) {
-    Box(Modifier.size(9.dp).background(color, CircleShape).semantics { contentDescription = description })
+private fun StatusDot(color: Color, description: String, active: Boolean = false) {
+    StatusPip(color, description, active, size = 8.dp, command = true)
 }
 
 @Composable
@@ -348,24 +353,26 @@ internal fun ToolCard(row: ChatRow, child: Boolean) {
     var all by rememberSaveable(row.id + ":all") { mutableStateOf(false) }
     val colors = MaterialTheme.colorScheme
     Column(Modifier.fillMaxWidth()
-        .border(1.dp, if (commandRunning(row)) colors.primary else colors.outlineVariant, RoundedCornerShape(10.dp))
+        .border(1.dp, if (commandFailed(row)) colors.error else if (commandRunning(row)) colors.primary else colors.outlineVariant, RoundedCornerShape(10.dp))
         .background(if (child) colors.surface else colors.surfaceContainerLow, RoundedCornerShape(10.dp))) {
         Row(Modifier.fillMaxWidth().clickable(onClickLabel = if (expanded) "Collapse" else "Expand") { expanded = !expanded }
             .padding(horizontal = 12.dp, vertical = 10.dp),
             verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            StatusDot(toolColor(row), toolStatusLabel(row))
-            Text(row.author.ifEmpty { "Tool" }, style = MaterialTheme.typography.labelLarge)
+            StatusDot(toolColor(row), toolStatusLabel(row), commandRunning(row))
+            Text(if (child) "$" else ">_", style = MaterialTheme.typography.bodySmall.copy(fontFamily = VerdeMono), color = colors.onSurfaceVariant)
+            Text(row.author.ifEmpty { "Tool" }, style = MaterialTheme.typography.labelMedium)
             Text(commandPreview(row.body), Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, maxLines = 1,
                 overflow = TextOverflow.Ellipsis, color = colors.onSurfaceVariant)
+            TextButton(onClick = { clipboard.setText(AnnotatedString(row.body)) },
+                modifier = Modifier.semantics { contentDescription = "Copy output" }) { Text("Copy", style = MaterialTheme.typography.labelSmall) }
             Text(if (expanded) "▾" else "▸", color = colors.onSurfaceVariant)
         }
         if (expanded) {
             val total = remember(row.body) { countLines(row.body) }
             val (shown, truncated) = remember(row.body, all) { if (all) row.body.trim() to false else leadingLines(row.body, TOOL_PREVIEW_LINES) }
-            Text(shown, Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp),
-                style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace), softWrap = false)
+            Text(shown, Modifier.fillMaxWidth().padding(horizontal = 12.dp),
+                style = MaterialTheme.typography.bodySmall.copy(fontFamily = VerdeMono), softWrap = true)
             Row(Modifier.padding(horizontal = 4.dp)) {
-                TextButton(onClick = { clipboard.setText(AnnotatedString(row.body)) }) { Text("Copy output") }
                 if (truncated) TextButton(onClick = { all = true }) { Text("Show all $total lines") }
             }
         }
@@ -379,13 +386,14 @@ internal fun ToolGroupCard(item: TranscriptItem.ToolGroup, ctx: TranscriptContex
     val colors = MaterialTheme.colorScheme
     val elapsed = ctx.turnStartedAt?.let { elapsedLabel(it, ctx.now) }
     Column(Modifier.fillMaxWidth()
-        .border(1.dp, if (counts.running > 0 && counts.failed == 0) colors.primary else colors.outlineVariant, RoundedCornerShape(10.dp))
+        .border(1.dp, if (counts.failed > 0) colors.error else if (counts.running > 0) colors.primary else colors.outlineVariant, RoundedCornerShape(10.dp))
         .background(colors.surfaceContainerLow, RoundedCornerShape(10.dp))) {
         Row(Modifier.fillMaxWidth().clickable(onClickLabel = if (expanded) "Collapse" else "Expand") { expanded = !expanded }
             .padding(horizontal = 12.dp, vertical = 12.dp),
             verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             StatusDot(when { counts.failed > 0 -> colors.error; counts.running > 0 -> colors.primary; else -> colors.outline },
-                if (counts.failed > 0) "Some failed" else if (counts.running > 0) "Running" else "Completed")
+                if (counts.failed > 0) "Some failed" else if (counts.running > 0) "Running" else "Completed",
+                active = counts.running > 0 && counts.failed == 0)
             Text(toolGroupSummary(item.rows, item.subagent, elapsed), Modifier.weight(1f), style = MaterialTheme.typography.bodySmall,
                 maxLines = 1, overflow = TextOverflow.Ellipsis, color = colors.onSurfaceVariant)
             Text(if (expanded) "▾" else "▸", color = colors.onSurfaceVariant)
@@ -454,7 +462,7 @@ internal fun WorkingRow(item: TranscriptItem.Working, ctx: TranscriptContext) {
     val elapsed = item.turn.started_at_ms?.let { elapsedLabel(it, ctx.now) }
     Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
+        StatusPip(active = true, size = 8.dp, command = true)
         Text(workingLabel(item, elapsed), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
     }
 }

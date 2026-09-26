@@ -2,16 +2,15 @@ package dev.verdeai.app
 
 import android.net.Uri
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.background
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.List
-import androidx.compose.material.icons.filled.Home
-import androidx.compose.material.icons.filled.Settings
-import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.compose.material.icons.filled.Menu
+import kotlinx.coroutines.launch
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
@@ -44,16 +43,14 @@ internal object Routes {
         "file/${Uri.encode(ws)}/${citation.line ?: 0UL}/${citation.end_line ?: 0UL}/${Uri.encode(citation.path)}"
 }
 
-private data class Tab(val route: String, val label: String, val icon: ImageVector)
-private val TABS = listOf(Tab(Routes.HOME, "Home", Icons.Filled.Home),
-    Tab(Routes.WORKSPACES, "Workspaces", Icons.AutoMirrored.Filled.List), Tab(Routes.HOSTS, "Hosts", Icons.Filled.Settings))
+private val TABS = listOf(Routes.HOME, Routes.WORKSPACES, Routes.HOSTS)
 
-/** App shell: bottom tabs over one NavHost. Every browse screen reads only the selected host's core. */
+/** App shell: workspace drawer over one NavHost. Every browse screen reads only the selected host's core. */
 @Composable
 internal fun VerdeApp(hosts: HostsModel, browse: BrowseModel, clock: UiClock = remember { UiClock() },
     lock: AppLockControls? = null) {
     val hostsState by hosts.state.collectAsState()
-    MaterialTheme {
+    VerdeTheme {
         CompositionLocalProvider(LocalUiClock provides clock, LocalAppLockControls provides lock) {
             val app = @Composable { if (hostsState.loading) HostsScreen(hosts) else Shell(hosts, browse, hostsState) }
             if (lock != null) AppLockGate(lock.model, lock.auth, app) else app()
@@ -68,38 +65,81 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
     val entry by nav.currentBackStackEntryAsState()
     val route = entry?.destination?.route
     val pairing = hostsState.pairing != null && route == Routes.HOSTS
-    // Terminals need the full height, and the tab bar would otherwise hide IME insets.
+    // Terminals keep the full height and their own back bar.
     val immersive = route == Routes.TERMINAL || route == Routes.NEW_TERMINAL
-    // Detail routes keep the tab they were opened from highlighted.
-    var lastTab by rememberSaveable { mutableStateOf(start) }
-    LaunchedEffect(route) { if (TABS.any { it.route == route }) lastTab = route!! }
-    val currentTab = route?.takeIf { r -> TABS.any { it.route == r } } ?: lastTab
-    Scaffold(
-        contentWindowInsets = WindowInsets.safeDrawing,
-        bottomBar = {
-            if (!pairing && !immersive) NavigationBar {
-                TABS.forEach { tab ->
-                    NavigationBarItem(selected = currentTab == tab.route, onClick = { nav.tab(tab.route) },
-                        icon = { Icon(tab.icon, contentDescription = null) },
-                        label = { Text(tab.label, textAlign = TextAlign.Center) })
+    // Highlight only actual root destinations; detail routes select their own row.
+    val currentTab = route?.takeIf { r -> r in TABS }.orEmpty()
+    val drawer = rememberDrawerState(DrawerValue.Closed)
+    val scope = rememberCoroutineScope()
+    val browseState by browse.state.collectAsState()
+    val manage: ManageModel = viewModel(key = "manage", factory = viewModelFactory { initializer { ManageModel(hosts, browse.state) } })
+    val manageState by manage.state.collectAsState()
+    var threadAction by remember { mutableStateOf<Pair<ThreadSummary, String>?>(null) }
+    fun open(route: String, tab: Boolean = false) {
+        if (tab) nav.tab(route) else nav.navigate(route) { launchSingleTop = true }
+        scope.launch { drawer.close() }
+    }
+    threadAction?.let { (thread, action) ->
+        key(browseState.hostId, thread.workspace_id, thread.thread_id, action) {
+            ThreadActionDialog(thread, action, manage, onDismiss = { threadAction = null }, onClosed = {
+                threadAction = null
+                if (entry?.arguments?.getString("thread") == thread.thread_id &&
+                    entry?.arguments?.getString("ws") == thread.workspace_id) open(Routes.HOME, tab = true)
+            })
+        }
+    }
+    LaunchedEffect(browseState.hostId) { threadAction = null }
+    ModalNavigationDrawer(drawerState = drawer, gesturesEnabled = !pairing && !immersive,
+        drawerContent = {
+            WorkspaceDrawer(browseState, currentTab, visible = drawer.isOpen || drawer.targetValue == DrawerValue.Open, onClose = { scope.launch { drawer.close() } },
+                onTab = { open(it, tab = true) }, onWorkspace = { open(Routes.workspace(it)) },
+                onThread = { ws, thread -> open(Routes.thread(ws, thread)) },
+                onHistory = { open(ManageRoutes.HISTORY) }, onNewChat = { open(ManageRoutes.newChat(null)) },
+                selectedWorkspace = entry?.arguments?.getString("ws"), selectedThread = entry?.arguments?.getString("thread"),
+                selectedTerminal = entry?.arguments?.getString("terminal"),
+                onTerminal = { ws, terminal -> open(Routes.terminal(ws, terminal)) },
+                onNewWorkspaceChat = { open(ManageRoutes.newChat(it)) }, onNewTerminal = { open(Routes.newTerminal(it)) },
+                onAddWorkspace = { open(ManageRoutes.ADD_WORKSPACE) },
+                canEditThreads = manageState.view?.can_create_threads == true,
+                onThreadAction = { thread, action -> scope.launch {
+                    drawer.close()
+                    threadAction = thread to action
+                } })
+        }) {
+        Scaffold(
+            contentWindowInsets = WindowInsets.safeDrawing,
+            topBar = {
+                if (!pairing && route in TABS) Box(Modifier.background(VerdeColors.Panel).statusBarsPadding()) {
+                    VerdeTopBar(title = { VerdeWordmark() },
+                        navigationIcon = { IconButton(onClick = { scope.launch { drawer.open() } }) {
+                            Icon(Icons.Filled.Menu, contentDescription = "Open workspace drawer")
+                        } }, actions = {
+                            Text(hostsState.rows.find { it.saved.id == hostsState.active }?.saved?.label.orEmpty(),
+                                style = MaterialTheme.typography.labelMedium, color = VerdeColors.Muted,
+                                maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                                modifier = Modifier.widthIn(max = 160.dp))
+                        })
+                }
+            },
+        ) { padding ->
+            Box(Modifier.padding(padding).consumeWindowInsets(padding)) {
+                CompositionLocalProvider(LocalWorkspaceMenu provides { scope.launch { drawer.open() }; Unit }) {
+                    Graph(nav, start, hosts, browse, manage)
                 }
             }
-        },
-    ) { padding ->
-        Box(Modifier.padding(padding).consumeWindowInsets(padding)) {
-            Graph(nav, start, hosts, browse)
         }
     }
 }
 
 private fun NavHostController.tab(route: String) = navigate(route) {
-    popUpTo(graph.findStartDestination().id) { saveState = true }
+    // Drawer destinations always open their root, never a saved nested chat.
+    popUpTo(graph.findStartDestination().id) { saveState = false }
     launchSingleTop = true
-    restoreState = true
+    restoreState = false
 }
 
 @Composable
-private fun Graph(nav: NavHostController, start: String, hosts: HostsModel, browse: BrowseModel) {
+private fun Graph(nav: NavHostController, start: String, hosts: HostsModel, browse: BrowseModel, manage: ManageModel) {
     val openPane: (Pane) -> Unit = { pane ->
         val thread = pane.thread_id
         val terminal = pane.terminal_id
@@ -109,7 +149,6 @@ private fun Graph(nav: NavHostController, start: String, hosts: HostsModel, brow
     val openThread: (ThreadSummary) -> Unit = { nav.navigate(Routes.thread(it.workspace_id, it.thread_id)) }
     val openWorkspace: (String) -> Unit = { nav.navigate(Routes.workspace(it)) }
     val showHosts: () -> Unit = { nav.tab(Routes.HOSTS) }
-    val manage: ManageModel = viewModel(key = "manage", factory = viewModelFactory { initializer { ManageModel(hosts, browse.state) } })
     val openFile: (String, FileCitation) -> Unit = { ws, citation -> nav.navigate(Routes.file(ws, citation)) }
     val pair: () -> Unit = {
         browse.state.value.hostId?.let { id -> if (browse.state.value.row?.view?.auth_state != "signing_out") hosts.showPairing(id) }

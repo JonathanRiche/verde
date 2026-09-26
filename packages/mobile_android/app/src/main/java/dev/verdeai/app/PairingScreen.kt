@@ -27,10 +27,11 @@ internal fun PairingScreen(model: PairingModel) {
         scanning = granted
         if (!granted) model.notice("Camera permission was denied. Paste a pairing link or enter it manually.")
     }
-    MaterialTheme {
+    VerdeTheme {
         Surface(Modifier.fillMaxSize()) {
             Column(Modifier.safeDrawingPadding().imePadding().verticalScroll(rememberScrollState())
                 .padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                VerdeWordmark()
                 Text(if (state.complete) "Home" else "Pair with Verde", style=MaterialTheme.typography.headlineLarge)
                 state.notice?.let { Text(it, color=MaterialTheme.colorScheme.error) }
                 when {
@@ -40,7 +41,7 @@ internal fun PairingScreen(model: PairingModel) {
                         Text("Paired securely")
                         Text("Your phone is securely paired with this host.")
                         state.error?.let { Text(pairingError(it)) }
-                        if (state.error?.retryable == true) Button(onClick=model::retry, enabled=!state.busy) { Text("Retry") }
+                        if (state.error?.retryable == true) Button(shape = MaterialTheme.shapes.small, onClick=model::retry, enabled=!state.busy) { Text("Retry") }
                     }
                     else -> {
                         Text("Connect Tailscale on your phone, then create a pairing link in Verde on your host.")
@@ -52,11 +53,11 @@ internal fun PairingScreen(model: PairingModel) {
                             proposal.runtime_id?.let { Text("Runtime: $it") }
                             Text("TLS key (SHA-256): ${proposal.spki_sha256}")
                             Text("Only trust this host if you recognize it. If its identity changed unexpectedly, verify it with the host owner first.")
-                            Button(onClick={ model.trust(proposal.id, true) }, enabled=!state.busy) { Text("Trust and pair") }
-                            OutlinedButton(onClick={ model.trust(proposal.id, false) }, enabled=!state.busy) { Text("Do not trust") }
+                            Button(shape = MaterialTheme.shapes.small, onClick={ model.trust(proposal.id, true) }, enabled=!state.busy) { Text("Trust and pair") }
+                            OutlinedButton(shape = MaterialTheme.shapes.small, onClick={ model.trust(proposal.id, false) }, enabled=!state.busy) { Text("Do not trust") }
                         }
                         if (state.error?.retryable == true) {
-                            Button(onClick=model::retry, enabled=!state.busy) { Text("Retry") }
+                            Button(shape = MaterialTheme.shapes.small, onClick=model::retry, enabled=!state.busy) { Text("Retry") }
                         }
                         if (state.canEnter) {
                             OutlinedTextField(value=model.deviceLabel, onValueChange={ model.deviceLabel=it.take(128) },
@@ -66,12 +67,12 @@ internal fun PairingScreen(model: PairingModel) {
                                     label={ Text("Pairing link") }, singleLine=true,
                                     visualTransformation=PasswordVisualTransformation(),
                                     keyboardOptions=KeyboardOptions(keyboardType=KeyboardType.Password), modifier=Modifier.fillMaxWidth())
-                                Button(onClick={ model.pair() }, enabled=model.link.isNotBlank()) { Text("Continue") }
-                                OutlinedButton(onClick={
+                                Button(shape = MaterialTheme.shapes.small, onClick={ model.pair() }, enabled=model.link.isNotBlank()) { Text("Continue") }
+                                OutlinedButton(shape = MaterialTheme.shapes.small, onClick={
                                     clipboard.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.text?.toString()?.let(model::receiveLink)
                                         ?: model.notice("No pairing link is on the clipboard.")
                                 }) { Text("Paste link") }
-                                OutlinedButton(onClick={ permission.launch(Manifest.permission.CAMERA) }) { Text("Scan QR code") }
+                                OutlinedButton(shape = MaterialTheme.shapes.small, onClick={ permission.launch(Manifest.permission.CAMERA) }) { Text("Scan QR code") }
                             } else {
                                 OutlinedTextField(model.manualHost, { model.manualHost=it.take(4096) }, label={ Text("Host HTTPS address") },
                                     singleLine=true, modifier=Modifier.fillMaxWidth())
@@ -80,7 +81,7 @@ internal fun PairingScreen(model: PairingModel) {
                                 OutlinedTextField(model.code, { model.code=it.take(256) }, label={ Text("Pairing code") },
                                     visualTransformation=PasswordVisualTransformation(), keyboardOptions=KeyboardOptions(keyboardType=KeyboardType.Password),
                                     singleLine=true, modifier=Modifier.fillMaxWidth())
-                                Button(onClick={ model.pair(manual=true) }, enabled=model.manualHost.isNotBlank() && model.grant.isNotBlank() && model.code.isNotBlank()) { Text("Continue") }
+                                Button(shape = MaterialTheme.shapes.small, onClick={ model.pair(manual=true) }, enabled=model.manualHost.isNotBlank() && model.grant.isNotBlank() && model.code.isNotBlank()) { Text("Continue") }
                             }
                             TextButton(onClick={ manual=!manual }) { Text(if (manual) "Use a link instead" else "Enter manually") }
                         } else if (state.host?.trust_proposal == null && state.error == null) {

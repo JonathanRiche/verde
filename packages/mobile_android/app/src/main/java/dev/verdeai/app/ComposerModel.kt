@@ -124,6 +124,10 @@ internal class ComposerModel(
     private val draftDelayMs: Long = DRAFT_DELAY_MS,
     private val searchDelayMs: Long = SEARCH_DELAY_MS,
 ) {
+    var focusRequest by mutableStateOf(0)
+        private set
+    var imagePreviews by mutableStateOf<Map<String, ByteArray>>(emptyMap())
+        private set
     var field by mutableStateOf(TextFieldValue(""))
         private set
     /** A local message (rejected intent, oversized image, …); cleared on the next action. */
@@ -145,6 +149,8 @@ internal class ComposerModel(
     private var searchJob: Job? = null
     private var searched: String? = null
     private var slashRequested = false
+    var slashLoading by mutableStateOf(false)
+        private set
     private val lock = Mutex()
 
     init {
@@ -156,6 +162,8 @@ internal class ComposerModel(
 
     /** Takes the core's draft (restore, pull-back, clear after send) unless the user is mid-edit. */
     private fun adopt(draft: ChatDraft?) {
+        val ids = draft?.attachments.orEmpty().map { it.local_id }.toSet()
+        imagePreviews = imagePreviews.filterKeys { it in ids }
         if (draft == null || editing || dispatching > 0) return
         if (!adopted || draft.text != field.text) {
             adopted = true
@@ -174,6 +182,18 @@ internal class ComposerModel(
             saveJob = scope.launch { delay(draftDelayMs); withContext(NonCancellable) { flush() } }
         }
         updateTokens(value)
+    }
+
+    /** Append a review prompt without discarding an unsent draft or dispatching a turn. */
+    fun commentOnDiff(path: String, additions: ULong, deletions: ULong) {
+        if (busy || chat.latestComposer()?.send_operation?.state == "pending") return
+        val root = chat.state.value.browse.workspaces?.items?.find { it.workspace_id == workspaceId }?.path.orEmpty().trimEnd('/')
+        val mention = if (root.isNotEmpty() && path.startsWith("$root/")) path.removePrefix("$root/") else path
+        val before = field.text
+        val next = before + (if (before.isEmpty() || before.endsWith('\n')) "" else "\n") +
+            "About your edit to @$mention (+$additions/-$deletions): "
+        edit(TextFieldValue(next, TextRange(next.length)))
+        focusRequest++
     }
 
     private fun updateTokens(value: TextFieldValue) {
@@ -196,9 +216,21 @@ internal class ComposerModel(
     private fun requestSlash() {
         if (slashRequested || chat.latestComposer()?.catalogs?.slash?.isNotEmpty() == true) return
         slashRequested = true
+        slashLoading = true
         scope.launch {
-            chat.dispatch { id, n, w -> EventSlashSearch(now_ms=n, wall_time_ms=w, intent_id=id, workspace_id=workspaceId, thread_id=threadId, query="") }
+            try {
+                val op = outcome(chat.dispatch { id, n, w -> EventSlashSearch(now_ms=n, wall_time_ms=w, intent_id=id, workspace_id=workspaceId, thread_id=threadId, query="") })
+                if (op == null || op.state == "failed") fail(op)
+            } finally { slashLoading = false }
         }
+    }
+
+    /** Opens the provider catalog without replacing an existing message. */
+    fun openSlashCommands() {
+        if (!field.text.isBlank() && slash == null) return
+        if (!slashLoading && chat.latestComposer()?.catalogs?.slash?.isEmpty() != false) slashRequested = false
+        if (field.text.isBlank()) edit(TextFieldValue("/", TextRange(1))) else requestSlash()
+        focusRequest++
     }
 
     fun acceptMention(path: String) {
@@ -372,6 +404,7 @@ internal class ComposerModel(
                 byte_size=it.bytes.size.toString(), bytes_base64=Base64.getEncoder().encodeToString(it.bytes)) }
             val op = setDraft(field.text, existing + added)
             if (op == null || op.state == "failed") return@action fail(op)
+            imagePreviews = imagePreviews + added.mapIndexed { index, input -> input.local_id to accepted[index].bytes }.toMap()
         }
         notice = when {
             rejected > 0 -> "Only images can be attached from the phone."

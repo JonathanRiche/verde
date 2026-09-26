@@ -14,6 +14,7 @@ import androidx.compose.material3.*
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
@@ -100,7 +101,7 @@ internal fun recentThreads(workspaces: WorkspacesView?, limit: Int = 8): List<Th
     workspaces?.history?.items.orEmpty().filter { !it.archived && !subagent(it) }.take(limit)
 
 internal fun workspaceThreads(workspace: Workspace): List<ThreadSummary> =
-    workspace.threads.filter { !subagent(it) }.sortedWith(compareByDescending<ThreadSummary> { it.last_activity_at_ms ?: 0 }.thenBy { it.thread_id })
+    workspace.threads.filter { !subagent(it) }.sortedWith(compareByDescending<ThreadSummary> { it.last_activity_at_ms ?: 0L }.thenBy { it.thread_id })
 
 internal fun openable(pane: Pane) = when (pane.kind) {
     "chat" -> pane.thread_id != null
@@ -113,7 +114,8 @@ internal data class Banner(val text: String, val action: BannerAction? = null, v
 
 /** Cached views, or a live projection backed by at least one snapshot. */
 internal fun hasContent(state: BrowseState) = state.hasData &&
-    (state.savedAtMs != null || state.host?.sync_state in setOf("ready", "stale"))
+    (state.savedAtMs != null || state.hasSynced || state.host?.sync_state in setOf("ready", "stale") ||
+        state.workspaces?.items?.isNotEmpty() == true || state.home?.items?.isNotEmpty() == true)
 
 internal fun showSpinner(state: BrowseState): Boolean {
     val host = state.host ?: return !state.fatal
@@ -151,15 +153,16 @@ internal fun browseBanner(state: BrowseState, nowMs: Long): Banner? {
 internal fun statusColor(status: String, attention: Boolean): Color {
     val colors = MaterialTheme.colorScheme
     return when {
-        attention || status == "waiting_approval" -> colors.error
+        status == "failed" -> colors.error
+        attention || status == "waiting_approval" -> VerdeColors.Warning
         status in setOf("working", "running", "accepted", "waiting") -> colors.primary
         else -> colors.outline
     }
 }
 
 @Composable
-private fun Dot(color: Color, description: String) {
-    Box(Modifier.size(10.dp).background(color, CircleShape).semantics { contentDescription = description })
+private fun Dot(color: Color, description: String, active: Boolean = false) {
+    StatusPip(color, description, active, size = 8.dp)
 }
 
 @OptIn(ExperimentalFoundationApi::class)
@@ -175,7 +178,7 @@ private fun MenuRow(
 ) {
     var expanded by remember { mutableStateOf(false) }
     Box {
-        ListItem(
+        VerdeListRow(
             headlineContent = { Text(headline, maxLines = 1, overflow = TextOverflow.Ellipsis) },
             supportingContent = supporting?.let { { Text(it, maxLines = 2, overflow = TextOverflow.Ellipsis) } },
             leadingContent = leading,
@@ -201,8 +204,12 @@ private fun AttentionBadge(text: String) {
     }
 }
 
+private fun paneProvider(state: BrowseState, pane: Pane): String? =
+    state.workspaces?.items?.find { it.workspace_id == pane.workspace_id }
+        ?.let(::workspaceThreads)?.find { it.thread_id == pane.thread_id }?.provider
+
 @Composable
-private fun PaneItem(pane: Pane, now: Long, onOpen: (Pane) -> Unit) {
+private fun PaneItem(pane: Pane, now: Long, onOpen: (Pane) -> Unit, provider: String? = null) {
     @Suppress("DEPRECATION") val clipboard = LocalClipboardManager.current
     val canOpen = openable(pane)
     val menu = buildList {
@@ -210,7 +217,10 @@ private fun PaneItem(pane: Pane, now: Long, onOpen: (Pane) -> Unit) {
         add("Copy title" to { clipboard.setText(AnnotatedString(pane.title)) })
     }
     MenuRow(pane.title, paneLine(pane, now), canOpen, { onOpen(pane) }, menu,
-        leading = { Dot(statusColor(pane.status, pane.attention), paneLabel(pane)) },
+        leading = { Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (pane.kind == "chat") ProviderGlyph(provider)
+            Dot(statusColor(pane.status, pane.attention), paneLabel(pane), activeStatus(pane.status))
+        } },
         badge = attentionLabel(pane.attention_kind))
 }
 
@@ -221,13 +231,15 @@ private fun ThreadItem(thread: ThreadSummary, now: Long, workspaceLabel: String?
         thread.last_activity_at_ms?.let { agoLabel(it, now) })
     MenuRow(thread.title, parts.joinToString(" · ").ifEmpty { null }, true, { onOpen(thread) },
         listOf("Open" to { onOpen(thread) }, "Copy title" to { clipboard.setText(AnnotatedString(thread.title)) }),
-        leading = { Dot(statusColor(thread.status, thread.status == "waiting_approval"), statusLabel(thread.status)) })
+        leading = { Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            ProviderGlyph(thread.provider)
+            Dot(statusColor(thread.status, thread.status == "waiting_approval"), statusLabel(thread.status), activeStatus(thread.status))
+        } })
 }
 
 private fun LazyListScope.header(text: String) {
     item(key = "header:$text") {
-        Text(text, style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary,
-            modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 20.dp, bottom = 4.dp))
+        VerdeSection(text)
     }
 }
 
@@ -249,14 +261,14 @@ private fun BrowseFrame(
 ) {
     Column(Modifier.fillMaxSize()) {
         if (onBack != null) {
-            TopAppBar(title = { Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+            VerdeTopBar(title = { Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                 navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back") } })
         }
         PullToRefreshBox(isRefreshing = state.refreshing, onRefresh = onRefresh, modifier = Modifier.fillMaxSize()) {
             LazyColumn(Modifier.fillMaxSize().testTag(BROWSE_LIST)) {
                 if (onBack == null) item(key = "title") {
                     Column(Modifier.padding(start = 16.dp, end = 16.dp, top = 16.dp)) {
-                        Text(title, style = MaterialTheme.typography.headlineLarge)
+                        Text(title, style = MaterialTheme.typography.titleLarge)
                         state.row?.let { row ->
                             Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -299,7 +311,7 @@ private fun LazyListScope.gate(state: BrowseState, onPair: () -> Unit): Boolean 
         }
         needsPairing(state) -> {
             note("unpaired", "This phone isn't paired with ${state.row?.saved?.label ?: "this host"} yet.")
-            item(key = "pair") { Button(onClick = onPair, modifier = Modifier.padding(horizontal = 16.dp)) { Text("Pair with this host") } }
+            item(key = "pair") { Button(shape = MaterialTheme.shapes.small, onClick = onPair, modifier = Modifier.padding(horizontal = 16.dp)) { Text("Pair with this host") } }
         }
         !hasContent(state) -> {
             if (showSpinner(state)) item(key = "loading") {
@@ -338,11 +350,11 @@ internal fun HomeScreen(
             val running = panes.filterNot { it.attention }
             if (attention.isNotEmpty()) {
                 header("Needs attention")
-                items(attention, key = { "attention:" + it.id }) { PaneItem(it, now, onOpenPane) }
+                items(attention, key = { "attention:" + it.id }) { PaneItem(it, now, onOpenPane, paneProvider(state, it)) }
             }
             if (running.isNotEmpty()) {
                 header("Running")
-                items(running, key = { "running:" + it.id }) { PaneItem(it, now, onOpenPane) }
+                items(running, key = { "running:" + it.id }) { PaneItem(it, now, onOpenPane, paneProvider(state, it)) }
             }
             if (panes.isEmpty()) note("idle", "Nothing is running or waiting on you.")
             val labels = state.workspaces?.items.orEmpty().associate { it.workspace_id to it.label }
@@ -358,7 +370,7 @@ internal fun HomeScreen(
             if (open.isNotEmpty()) {
                 header("Workspaces")
                 items(open, key = { "workspace:" + it.workspace_id }) { WorkspaceItem(it, onOpenWorkspace) }
-            } else if (state.workspaces != null) note("noworkspaces", "No workspaces on this host yet. Add one from the Workspaces tab.")
+            } else if (state.workspaces != null) note("noworkspaces", "No workspaces on this host yet. Add one from the Workspaces menu.")
         }
         if (onNewChat != null && hasContent(state) && !needsPairing(state) && state.workspaces?.items.orEmpty().any { it.open }) {
             ExtendedFloatingActionButton(onClick = onNewChat, modifier = Modifier.align(androidx.compose.ui.Alignment.BottomEnd).padding(16.dp)) {
@@ -435,7 +447,7 @@ internal fun WorkspaceScreen(
         if (actions != null) item(key = "actions") { actions(workspace) }
         header("Panes")
         if (workspace.panes.isEmpty()) note("nopanes", "No open panes.")
-        items(workspace.panes, key = { "pane:" + it.id }) { PaneItem(it, now, onOpenPane) }
+        items(workspace.panes, key = { "pane:" + it.id }) { PaneItem(it, now, onOpenPane, paneProvider(state, it)) }
         if (onNewTerminal != null && canWrite(state.host) && workspace.path.isNotEmpty()) item(key = "new-terminal") {
             TextButton(onClick = onNewTerminal, modifier = Modifier.padding(horizontal = 8.dp)) { Text("New terminal") }
         }

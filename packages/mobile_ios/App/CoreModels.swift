@@ -1484,6 +1484,9 @@ enum Event: Codable {
     case `terminal_kill`(EventTerminalKill)
     case `terminal_resize`(EventTerminalResize)
     case `push_register`(EventPushRegister)
+    case `thread_rename`(EventThreadRename)
+    case `thread_close`(EventThreadClose)
+    case `thread_sync`(EventThreadSync)
     case `thread_create`(EventThreadCreate)
     case `new_chat_select`(EventNewChatSelect)
     case `workspace_create`(EventWorkspaceCreate)
@@ -1543,6 +1546,9 @@ enum Event: Codable {
         case "terminal_kill": self = .`terminal_kill`(try EventTerminalKill(from: decoder))
         case "terminal_resize": self = .`terminal_resize`(try EventTerminalResize(from: decoder))
         case "push_register": self = .`push_register`(try EventPushRegister(from: decoder))
+        case "thread_rename": self = .`thread_rename`(try EventThreadRename(from: decoder))
+        case "thread_close": self = .`thread_close`(try EventThreadClose(from: decoder))
+        case "thread_sync": self = .`thread_sync`(try EventThreadSync(from: decoder))
         case "thread_create": self = .`thread_create`(try EventThreadCreate(from: decoder))
         case "new_chat_select": self = .`new_chat_select`(try EventNewChatSelect(from: decoder))
         case "workspace_create": self = .`workspace_create`(try EventWorkspaceCreate(from: decoder))
@@ -1603,6 +1609,9 @@ enum Event: Codable {
         case .`terminal_kill`(let value): try value.encode(to: encoder)
         case .`terminal_resize`(let value): try value.encode(to: encoder)
         case .`push_register`(let value): try value.encode(to: encoder)
+        case .`thread_rename`(let value): try value.encode(to: encoder)
+        case .`thread_close`(let value): try value.encode(to: encoder)
+        case .`thread_sync`(let value): try value.encode(to: encoder)
         case .`thread_create`(let value): try value.encode(to: encoder)
         case .`new_chat_select`(let value): try value.encode(to: encoder)
         case .`workspace_create`(let value): try value.encode(to: encoder)
@@ -3586,6 +3595,136 @@ extension EventPushRegister {
         try c.encode(self.`key_seed_base64`, forKey: .`key_seed_base64`)
         var tag = encoder.container(keyedBy: ModelDiscriminator.self)
         try tag.encode("push_register", forKey: .type)
+    }
+}
+
+struct EventThreadRename: Codable {
+    var `api_version`: UInt32 = 1
+    var `now_ms`: Int64
+    var `wall_time_ms`: Int64
+    var `intent_id`: String
+    var `workspace_id`: String
+    var `thread_id`: String
+    var `title`: String
+}
+
+extension EventThreadRename {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `now_ms`
+        case `wall_time_ms`
+        case `intent_id`
+        case `workspace_id`
+        case `thread_id`
+        case `title`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`now_ms` = try c.decode(Int64.self, forKey: .`now_ms`)
+        self.`wall_time_ms` = try c.decode(Int64.self, forKey: .`wall_time_ms`)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        self.`thread_id` = try c.decode(String.self, forKey: .`thread_id`)
+        self.`title` = try c.decode(String.self, forKey: .`title`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`now_ms`, forKey: .`now_ms`)
+        try c.encode(self.`wall_time_ms`, forKey: .`wall_time_ms`)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`thread_id`, forKey: .`thread_id`)
+        try c.encode(self.`title`, forKey: .`title`)
+        var tag = encoder.container(keyedBy: ModelDiscriminator.self)
+        try tag.encode("thread_rename", forKey: .type)
+    }
+}
+
+struct EventThreadClose: Codable {
+    var `api_version`: UInt32 = 1
+    var `now_ms`: Int64
+    var `wall_time_ms`: Int64
+    var `intent_id`: String
+    var `workspace_id`: String
+    var `thread_id`: String
+}
+
+extension EventThreadClose {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `now_ms`
+        case `wall_time_ms`
+        case `intent_id`
+        case `workspace_id`
+        case `thread_id`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`now_ms` = try c.decode(Int64.self, forKey: .`now_ms`)
+        self.`wall_time_ms` = try c.decode(Int64.self, forKey: .`wall_time_ms`)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        self.`thread_id` = try c.decode(String.self, forKey: .`thread_id`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`now_ms`, forKey: .`now_ms`)
+        try c.encode(self.`wall_time_ms`, forKey: .`wall_time_ms`)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`thread_id`, forKey: .`thread_id`)
+        var tag = encoder.container(keyedBy: ModelDiscriminator.self)
+        try tag.encode("thread_close", forKey: .type)
+    }
+}
+
+struct EventThreadSync: Codable {
+    var `api_version`: UInt32 = 1
+    var `now_ms`: Int64
+    var `wall_time_ms`: Int64
+    var `intent_id`: String
+    var `workspace_id`: String
+    var `thread_id`: String
+}
+
+extension EventThreadSync {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `now_ms`
+        case `wall_time_ms`
+        case `intent_id`
+        case `workspace_id`
+        case `thread_id`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`now_ms` = try c.decode(Int64.self, forKey: .`now_ms`)
+        self.`wall_time_ms` = try c.decode(Int64.self, forKey: .`wall_time_ms`)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        self.`thread_id` = try c.decode(String.self, forKey: .`thread_id`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`now_ms`, forKey: .`now_ms`)
+        try c.encode(self.`wall_time_ms`, forKey: .`wall_time_ms`)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`thread_id`, forKey: .`thread_id`)
+        var tag = encoder.container(keyedBy: ModelDiscriminator.self)
+        try tag.encode("thread_sync", forKey: .type)
     }
 }
 

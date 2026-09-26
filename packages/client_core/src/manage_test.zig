@@ -442,3 +442,61 @@ test "management receipts are idempotent and the manage scope is announced" {
     try std.testing.expectError(error.InvalidArgument, f.event("workspace_archive", .{ .intent_id = "bad", .workspace_id = "ws-1" }));
     try std.testing.expectError(error.InvalidArgument, f.event("thread_create", .{ .intent_id = "bad2", .workspace_id = "ws-1" }));
 }
+
+test "thread rename preserves full metadata, uses revision and retries a conflicting read" {
+    var f = try Fixture.init(all_scopes, &.{});
+    defer f.deinit();
+    const id = try f.intent("thread_rename", .{ .workspace_id = "ws-1", .thread_id = "chat-1", .title = " New title " });
+    try f.reply("daemon.client.register", .{ .client_id = "client-1" });
+    try eql("chat-1", p.s(try f.params("chat.thread.get"), "local_thread_id"));
+    const original = .{ .thread = .{ .local_thread_id = "chat-1", .title = "Old", .provider = "claude", .draft = "keep draft", .profile_id = "remote", .repository_cwd = "src", .provider_thread_id = "provider-1", .messages = .{} }, .store_revision = 7 };
+    try f.reply("chat.thread.get", original);
+    const write = try f.params("chat.thread.upsert");
+    try eql("New title", p.s(p.get(write, "thread"), "title"));
+    try eql("keep draft", p.s(p.get(write, "thread"), "draft"));
+    try eql("remote", p.s(p.get(write, "thread"), "profile_id"));
+    try eql("src", p.s(p.get(write, "thread"), "repository_cwd"));
+    try expect(p.uint(p.get(p.get(write, "mutation"), "expected_store_revision")) == 7);
+    try f.reject("chat.thread.upsert", "conflict", .{});
+    try expect(f.pending("chat.thread.get") == 1);
+    try f.reply("chat.thread.get", original);
+    try f.reply("chat.thread.upsert", .{});
+    try eql("succeeded", p.s(try f.job(id), "state"));
+    _ = try f.event("thread_rename", .{ .intent_id = id, .workspace_id = "ws-1", .thread_id = "chat-1", .title = " New title " });
+    try expect(f.pending("chat.thread.upsert") == 0);
+}
+
+test "thread actions enforce scope and validate targets before mutation" {
+    var readonly = try Fixture.init(&.{"chat:read"}, &.{});
+    defer readonly.deinit();
+    const denied = try readonly.intent("thread_close", .{ .workspace_id = "ws-1", .thread_id = "chat-1" });
+    try readonly.expectFailed(denied, "insufficient_scope");
+    try expect(readonly.pending("chat.thread.close") == 0);
+    var f = try Fixture.init(all_scopes, &.{});
+    defer f.deinit();
+    const id = try f.intent("thread_close", .{ .workspace_id = "ws-1", .thread_id = "chat-1" });
+    try f.reply("daemon.client.register", .{ .client_id = "client-1" });
+    try f.reply("chat.thread.get", .{ .thread = .{ .local_thread_id = "other", .title = "Other" }, .store_revision = 8 });
+    try f.expectFailed(id, "invalid_thread");
+    try expect(f.pending("chat.thread.close") == 0);
+}
+
+test "close uses thread close and sync refuses remote provider bindings" {
+    var f = try Fixture.init(all_scopes, &.{});
+    defer f.deinit();
+    const id = try f.intent("thread_close", .{ .workspace_id = "ws-1", .thread_id = "chat-1" });
+    try f.reply("daemon.client.register", .{ .client_id = "client-1" });
+    try f.reply("chat.thread.get", .{ .thread = .{ .local_thread_id = "chat-1", .title = "Chat" }, .store_revision = 8 });
+    try eql("chat-1", p.s(try f.params("chat.thread.close"), "local_thread_id"));
+    try f.reply("chat.thread.close", .{});
+    try eql("succeeded", p.s(try f.job(id), "state"));
+    const sync_id = try f.intent("thread_sync", .{ .workspace_id = "ws-1", .thread_id = "chat-1" });
+    try f.reply("chat.thread.get", .{ .thread = .{ .local_thread_id = "chat-1", .title = "Chat", .provider_thread_id = "p-1", .profile_id = "remote" }, .store_revision = 9 });
+    try f.expectFailed(sync_id, "unsupported");
+    try expect(f.pending("provider.thread.sync") == 0);
+    const local_id = try f.intent("thread_sync", .{ .workspace_id = "ws-1", .thread_id = "chat-1" });
+    try f.reply("chat.thread.get", .{ .thread = .{ .local_thread_id = "chat-1", .title = "Chat", .provider_thread_id = "p-1", .profile_id = "local" }, .store_revision = 9 });
+    try eql("p-1", p.s(try f.params("provider.thread.sync"), "provider_thread_id"));
+    try f.reply("provider.thread.sync", .{});
+    try eql("succeeded", p.s(try f.job(local_id), "state"));
+}

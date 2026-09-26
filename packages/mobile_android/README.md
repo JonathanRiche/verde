@@ -30,6 +30,32 @@ adb -s SERIAL shell am start -n dev.verdeai.app/.MainActivity
 
 Verify that the pairing screen opens without a native loading crash.
 
+## Appearance
+
+`Theme.kt` maps the web client's `web/src/styles.css` tokens to a fixed dark
+Compose theme. The phone shell uses a left workspace/chat drawer; Home,
+Workspaces, Hosts, history and management routes remain available. Controls
+keep Android's 48 dp minimum touch targets while using the web's compact
+spacing and 7/10/14 dp corners.
+
+Noto Sans (regular/bold), Cal Sans and JetBrains Mono are bundled unchanged
+from the desktop assets (about 3.5 MiB before APK compression). Their SIL OFL
+licenses ship in `app/src/main/assets/licenses`. Terminal glyphs use the same
+monospace font; terminal colors still come from the VT snapshot.
+
+Long-press a sidebar chat (or right-click with a mouse) for Open, Copy title,
+Rename, Sync and Close. Mutations use native core intents, retain device scope
+checks and report uncertain delivery without automatic resubmission. Closing
+keeps the chat available in History. Title generation, handoff and TUI launch
+are not yet exposed by the Android menu.
+
+Type `/` at the start of the composer or tap its `/` button to browse the host's
+provider commands. The list scrolls and filters as you type. Choosing a command
+fills the draft; the Run button executes it. Existing message text is preserved.
+
+Workspace refreshes retain the last complete projection. A compatible fallback
+while loading a chat remains a loading state; final failures still show Retry.
+
 ## Core bridge
 
 `CoreHost.create(config, EffectExecutor(store, config.host_id))` allocates one
@@ -273,3 +299,7 @@ On a phone: type, background the app and reopen it (the draft is kept). Send; wh
 the reply runs, steer, pull back and remove. Stop. Run `!pwd` (confirm, then cancel
 once). Try `/` and `@` suggestions. Switch model and effort. Attach a photo from each
 source and send it. Check that the keyboard never covers the field.
+
+Logo artwork is copied unchanged from the desktop assets used by web `ui/Icons.tsx`.
+`Brand.kt` shares those marks across the drawer, transcript and composer, and
+matches the web status/Stop pulse timing using Android motion preferences.

@@ -14,7 +14,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.*
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
@@ -91,7 +90,7 @@ private fun AnnotatedString.Builder.appendInline(node: MarkdownNode, style: MdSt
         "emphasis" -> withStyle(SpanStyle(fontStyle = FontStyle.Italic)) { children() }
         "strong" -> withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { children() }
         "strike" -> withStyle(SpanStyle(textDecoration = TextDecoration.LineThrough)) { children() }
-        "code" -> withStyle(SpanStyle(fontFamily = FontFamily.Monospace, background = style.codeBackground)) { append(node.text ?: "") }
+        "code" -> withStyle(SpanStyle(fontFamily = VerdeMono, color = VerdeColors.Heading1, background = style.codeBackground)) { append(node.text ?: "") }
         "line_break" -> append('\n')
         "link" -> {
             val citation = node.citation
@@ -157,12 +156,12 @@ internal fun tokenStyle(): (String) -> SpanStyle? {
     return remember(c) {
         { kind ->
             when (kind) {
-                "keyword" -> SpanStyle(color = c.primary, fontWeight = FontWeight.SemiBold)
-                "string" -> SpanStyle(color = Color(0xFF2E7D32))
-                "number", "constant_name" -> SpanStyle(color = Color(0xFFB45309))
+                "keyword" -> SpanStyle(color = Color(0xFFFBC12D), fontWeight = FontWeight.SemiBold)
+                "string" -> SpanStyle(color = Color(0xFF4EE29E))
+                "number", "constant_name" -> SpanStyle(color = VerdeColors.Heading1)
                 "comment" -> SpanStyle(color = c.outline, fontStyle = FontStyle.Italic)
                 "type_name" -> SpanStyle(color = c.tertiary)
-                "function_name" -> SpanStyle(color = Color(0xFF1D4ED8))
+                "function_name" -> SpanStyle(color = Color(0xFF5ECB83))
                 "property_name" -> SpanStyle(color = c.secondary)
                 "operator", "punctuation" -> SpanStyle(color = c.onSurfaceVariant)
                 else -> null
@@ -202,7 +201,9 @@ private fun MdBlockView(block: MdBlock, model: HighlightSource) {
     val type = MaterialTheme.typography
     when (block) {
         is MdBlock.Paragraph -> Text(block.text, style = type.bodyMedium)
-        is MdBlock.Heading -> Text(block.text, style = when (block.level) { 1 -> type.titleLarge; 2 -> type.titleMedium; else -> type.titleSmall })
+        is MdBlock.Heading -> Text(block.text,
+            color = when (block.level) { 1 -> VerdeColors.Heading1; 2 -> VerdeColors.Heading2; 3 -> VerdeColors.Heading3; else -> VerdeColors.Heading4 },
+            style = (when (block.level) { 1 -> type.headlineMedium; 2 -> type.headlineSmall; else -> type.titleLarge }))
         is MdBlock.Bullets -> Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
             block.items.forEachIndexed { index, item ->
                 Row {
@@ -243,12 +244,13 @@ internal fun CodeBlock(code: String, language: String?, model: HighlightSource) 
     val style = tokenStyle()
     // Spans index the exact code the core highlighted; only the trailing newline is dropped for display.
     val text = remember(code, spans, style) { highlighted(code, spans?.value.orEmpty(), style).let { if (code.endsWith("\n")) it.subSequence(0, code.length - 1) else it } }
-    Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(8.dp)).testTag(CODE_BLOCK_TAG)) {
-        Row(Modifier.fillMaxWidth().padding(start = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+    Column(Modifier.fillMaxWidth().background(VerdeColors.Background, RoundedCornerShape(7.dp))
+        .border(1.dp, VerdeColors.Border, RoundedCornerShape(7.dp)).testTag(CODE_BLOCK_TAG)) {
+        Row(Modifier.fillMaxWidth().background(VerdeColors.PanelAlt, RoundedCornerShape(topStart = 7.dp, topEnd = 7.dp)).padding(start = 10.dp), verticalAlignment = Alignment.CenterVertically) {
             Text(language ?: "code", Modifier.weight(1f), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             TextButton(onClick = { clipboard.setText(AnnotatedString(code.removeSuffix("\n"))) }) { Text("Copy code") }
         }
         Text(text, Modifier.horizontalScroll(rememberScrollState()).padding(start = 10.dp, end = 10.dp, bottom = 10.dp),
-            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace), softWrap = false)
+            style = MaterialTheme.typography.bodySmall.copy(fontFamily = VerdeMono), softWrap = false)
     }
 }

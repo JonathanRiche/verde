@@ -195,6 +195,7 @@ fn page(tx: *h.Transaction, i: usize, older: bool, intent_id: []const u8) E!void
     last.cursor = if (older) t.cursor else null;
     last.reconcile = t.reconcile and !older;
     t.loading = true;
+    t.@"error" = null;
 }
 fn tail(tx: *h.Transaction, i: usize) E!void {
     const t = &tx.state.chat.threads[i];
@@ -821,6 +822,16 @@ fn receiveTail(tx: *h.Transaction, i: usize, result: V) E!void {
 }
 fn failed(tx: *h.Transaction, request: Request, failure: h.LocalError, fallback: bool) E!void {
     const t = &tx.state.chat.threads[request.thread];
+    const rpc_code = failure.rpc_code orelse "";
+    if (request.kind == .page and request.cursor == null and (eq(rpc_code, "unknown_method") or eq(rpc_code, "method_not_found"))) {
+        // Capability fallback is still the same load, not a failed chat. Keep its
+        // receipt pending and expose an error only if the legacy read also fails.
+        t.@"error" = null;
+        t.loading = true;
+        try call(tx, request.thread, .legacy, "chat.thread.get", .{ .workspace_id = t.workspace_id, .local_thread_id = t.id }, false, request.intent);
+        @constCast(&tx.state.chat.requests[tx.state.chat.requests.len - 1]).reconcile = request.reconcile;
+        return;
+    }
     t.@"error" = failure;
     operation(tx, request.intent, if (eq(failure.delivery orelse "", "uncertain")) "uncertain" else "failed", failure);
     if (request.kind == .page or request.kind == .legacy) {
@@ -828,11 +839,7 @@ fn failed(tx: *h.Transaction, request: Request, failure: h.LocalError, fallback:
         t.retry_at = if (failure.retryable) (tx.state.now_ms orelse 0) + 1000 else std.math.maxInt(i64);
         if (failure.retryable and online(tx)) try tx.setTimer("chat_retry", 1000);
         const code = failure.rpc_code orelse "";
-        if (request.kind == .page and request.cursor == null and (eq(code, "unknown_method") or eq(code, "method_not_found"))) {
-            t.loading = true;
-            try call(tx, request.thread, .legacy, "chat.thread.get", .{ .workspace_id = t.workspace_id, .local_thread_id = t.id }, false, request.intent);
-            @constCast(&tx.state.chat.requests[tx.state.chat.requests.len - 1]).reconcile = request.reconcile;
-        } else if (eq(code, "revision_expired")) {
+        if (eq(code, "revision_expired")) {
             t.cursor = null;
             t.seen_cursors = &.{};
             t.retry_at = (tx.state.now_ms orelse 0) + 1000;

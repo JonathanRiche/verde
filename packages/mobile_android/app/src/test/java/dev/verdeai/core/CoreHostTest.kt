@@ -320,6 +320,37 @@ class CoreHostTest {
         }
     }
 
+    @Test fun websocketEmptyCloseFrameIsCleanInsteadOfTlsFailure() = runBlocking {
+        TlsFixture().use { fixture ->
+            // A legal empty close frame is surfaced by OkHttp as code 1005.
+            // Send it as raw bytes because WebSocket.close rightly forbids
+            // transmitting that sentinel as a status code.
+            fixture.server.dispatcher = object : okhttp3.mockwebserver.Dispatcher() {
+                override fun dispatch(request: okhttp3.mockwebserver.RecordedRequest): MockResponse {
+                    val key = request.getHeader("Sec-WebSocket-Key")!!
+                    val accept = Base64.getEncoder().encodeToString(java.security.MessageDigest.getInstance("SHA-1")
+                        .digest((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").toByteArray()))
+                    return MockResponse().setResponseCode(101)
+                        .setHeader("Connection", "Upgrade").setHeader("Upgrade", "websocket")
+                        .setHeader("Sec-WebSocket-Accept", accept).setHeader("Sec-WebSocket-Protocol", "verde.v1")
+                        .setBody(okio.Buffer().write(byteArrayOf(0x88.toByte(), 0)))
+                }
+            }
+            val core = FakeCore()
+            val host = CoreHost.create(config, executor(client=fixture.client), core)
+            try {
+                core.effects = listOf(EffectWsOpen("ws", "1", fixture.server.url("/ws").toString().replace("https:", "wss:"),
+                    listOf("verde.v1"), Tls(fixture.origin, fixture.pin), 1000))
+                start(host)
+                core.next<EventWsOpen>()
+                val closed = core.next<EventWsClosed>()
+                assertTrue(closed.clean)
+                assertEquals(1005, closed.code)
+                assertNull(closed.error)
+            } finally { host.close() }
+        }
+    }
+
     @Test fun encryptedStoreRoundTripAndTampering() = runBlocking {
         val master = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
         val serializer = CredentialSerializer { master }

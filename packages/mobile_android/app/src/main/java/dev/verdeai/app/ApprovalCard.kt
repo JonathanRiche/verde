@@ -21,7 +21,6 @@ import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.*
 import androidx.compose.ui.text.AnnotatedString
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -73,8 +72,8 @@ internal fun ApprovalCard(approval: ChatApproval, controller: ApprovalController
     }
     Column(
         Modifier.fillMaxWidth().testTag(APPROVAL_CARD)
-            .border(1.dp, colors.tertiary, RoundedCornerShape(12.dp))
-            .background(colors.tertiaryContainer.copy(alpha = 0.35f), RoundedCornerShape(12.dp))
+            .border(1.dp, colors.tertiary, RoundedCornerShape(10.dp))
+            .background(VerdeColors.Assistant, RoundedCornerShape(10.dp))
             .padding(12.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
@@ -102,13 +101,13 @@ internal fun ApprovalCard(approval: ChatApproval, controller: ApprovalController
             val enabled = phase.canDecide()
             val sending = (phase as? ApprovalPhase.Sending)?.decision
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End)) {
-                OutlinedButton(
+                OutlinedButton(shape = MaterialTheme.shapes.small,
                     onClick = {
                         if (controller.decide(approval, ApprovalDecision.Deny)) haptics.performHapticFeedback(HapticFeedbackType.Reject)
                     },
                     enabled = enabled, modifier = Modifier.heightIn(min = 48.dp).semantics { contentDescription = "Deny: $title" },
                 ) { Text(if (sending == ApprovalDecision.Deny) "Denying…" else DENY_LABEL) }
-                Button(
+                Button(shape = MaterialTheme.shapes.small,
                     onClick = {
                         if (controller.decide(approval, ApprovalDecision.Approve)) haptics.performHapticFeedback(HapticFeedbackType.Confirm)
                     },
@@ -122,7 +121,7 @@ internal fun ApprovalCard(approval: ChatApproval, controller: ApprovalController
 @Composable
 private fun ApprovalSummary(preview: ApprovalPreview) {
     val colors = MaterialTheme.colorScheme
-    val mono = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace)
+    val mono = MaterialTheme.typography.bodySmall.copy(fontFamily = VerdeMono)
     if (preview.tool != null || preview.path != null) {
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
             preview.tool?.let { Label(it) }
@@ -149,8 +148,8 @@ private fun Label(text: String) {
 @Composable
 private fun ChangePreview(preview: ApprovalPreview) {
     val colors = MaterialTheme.colorScheme
-    val mono = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace)
-    val added = Color(0x3325A244); val removed = Color(0x33D0383E)
+    val mono = MaterialTheme.typography.bodySmall.copy(fontFamily = VerdeMono)
+    val added = VerdeColors.DiffAdd.copy(alpha = .08f); val removed = VerdeColors.Danger.copy(alpha = .10f)
     Column(Modifier.fillMaxWidth().background(colors.surfaceContainerHighest, RoundedCornerShape(8.dp)).padding(vertical = 6.dp)
         .horizontalScroll(rememberScrollState())) {
         preview.changes.forEach { line ->
@@ -187,7 +186,7 @@ private fun ApprovalDetails(approval: ChatApproval, preview: ApprovalPreview, on
             Text(shown, Modifier.fillMaxWidth().background(colors.surfaceContainerHighest, RoundedCornerShape(8.dp))
                 .horizontalScroll(rememberScrollState()).padding(horizontal = 10.dp, vertical = 8.dp)
                 .semantics { contentDescription = "Approval details" },
-                style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace), softWrap = false)
+                style = MaterialTheme.typography.bodySmall.copy(fontFamily = VerdeMono), softWrap = false)
             Row {
                 TextButton(onClick = onCopy) { Text("Copy request") }
                 if (truncated) TextButton(onClick = { all = true }) { Text("Show all $total lines") }

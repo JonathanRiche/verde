@@ -127,6 +127,16 @@ internal class ManageModel(
             model=selection.model, effort=selection.effort, access=selection.access, speed=selection.speed)
     }
 
+    fun renameThread(workspaceId: String, threadId: String, title: String) = send { n, w, id ->
+        EventThreadRename(now_ms=n, wall_time_ms=w, intent_id=id, workspace_id=workspaceId, thread_id=threadId, title=title.trim())
+    }
+    fun closeThread(workspaceId: String, threadId: String) = send { n, w, id ->
+        EventThreadClose(now_ms=n, wall_time_ms=w, intent_id=id, workspace_id=workspaceId, thread_id=threadId)
+    }
+    fun syncThread(workspaceId: String, threadId: String) = send { n, w, id ->
+        EventThreadSync(now_ms=n, wall_time_ms=w, intent_id=id, workspace_id=workspaceId, thread_id=threadId)
+    }
+
     fun createWorkspace(path: String, label: String?) = send { n, w, id ->
         EventWorkspaceCreate(now_ms=n, wall_time_ms=w, intent_id=id, path=path, label=label?.trim()?.ifEmpty { null })
     }

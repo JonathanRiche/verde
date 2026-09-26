@@ -106,7 +106,7 @@ internal fun TerminalScreen(hosts: HostsModel, browse: BrowseModel, workspaceId:
     val send = remember(model) { { input: TermInput -> selection = null; model.input(input) } }
 
     Column(Modifier.fillMaxSize()) {
-        TopAppBar(title = { Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+        VerdeTopBar(title = { Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
             navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back") } })
         // Overlays (notice, "Latest") never change the measured grid, so they cause no host resize.
         Box(Modifier.weight(1f).fillMaxWidth()) {
@@ -134,7 +134,7 @@ internal fun TerminalScreen(hosts: HostsModel, browse: BrowseModel, workspaceId:
         }
         val selected = selection
         // Selection actions replace the key row at the same height, so selecting never resizes.
-        if (selected != null || writable) Box(Modifier.fillMaxWidth().height(KEY_ROW_HEIGHT)) {
+        if (selected != null || writable) Box(Modifier.fillMaxWidth().background(VerdeColors.Panel).height(KEY_ROW_HEIGHT)) {
             if (selected != null) Row(Modifier.fillMaxSize().padding(horizontal = 8.dp), horizontalArrangement = Arrangement.End,
                 verticalAlignment = Alignment.CenterVertically) {
                 TextButton(onClick = { selection = null }) { Text("Cancel") }
@@ -209,7 +209,9 @@ private fun TerminalCanvas(state: TerminalUiState, fontSp: Float, selection: Gri
     onSelect: (GridSelection) -> Unit) {
     val density = LocalDensity.current
     val textPx = with(density) { fontSp.sp.toPx() }
-    val paint = remember(textPx) { Paint(Paint.ANTI_ALIAS_FLAG).apply { typeface = Typeface.MONOSPACE; textSize = textPx } }
+    val context = LocalContext.current
+    val font = remember(context) { androidx.core.content.res.ResourcesCompat.getFont(context, R.font.jetbrains_mono) ?: Typeface.MONOSPACE }
+    val paint = remember(textPx, font) { Paint(Paint.ANTI_ALIAS_FLAG).apply { typeface = font; textSize = textPx } }
     val metrics = remember(paint) { cellMetrics(paint) }
     var size by remember { mutableStateOf(IntSize.Zero) }
     LaunchedEffect(size, metrics) {
@@ -222,7 +224,7 @@ private fun TerminalCanvas(state: TerminalUiState, fontSp: Float, selection: Gri
     val latestZoom by rememberUpdatedState(onZoom)
     val latestSelect by rememberUpdatedState(onSelect)
     val grid by rememberUpdatedState(plan?.let { it.cols to it.rows })
-    val background = plan?.let { Color(it.background) } ?: Color.Black
+    val background = plan?.let { Color(it.background) } ?: VerdeColors.Background
     Canvas(Modifier.fillMaxSize().background(background).clipToBounds().onSizeChanged { size = it }.testTag("terminal-canvas")
         .pointerInput(metrics) {
             fun cell(position: Offset): Pair<Int, Int> {

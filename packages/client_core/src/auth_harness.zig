@@ -456,3 +456,30 @@ test "forget host still wipes while revoke waits on a failed token refresh" {
         if (h.eq(r.operation.intent_id, "forget")) try expect(h.eq(r.operation.state, "succeeded"));
     }
 }
+
+test "auth socket reconnect publishes ready state after ticket retry" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const batch = try f.token(try f.credential(try f.exchange(true)));
+    const ticket = try findUrl(batch, "/auth/websocket-ticket");
+    const socket = try find(try f.response(ticket, 200, .{ .access_protocol_version = 1, .ticket = secret, .expires_at_ms = f.now + 30000 }), "ws_open");
+    // Keep the established RPC session, as a push-only socket reconnect does.
+    f.host.state.rpc.phase = .ready;
+    const closed = try f.event("ws_closed", .{ .socket_id = get(socket, "effect_id").string, .generation = get(socket, "generation").string, .code = 1000, .clean = true, .@"error" = @as(?u8, null) });
+    try expect(h.eq(f.host.state.auth.phase, "reconnecting"));
+    try expect(f.host.state.host_error != null);
+    const retry_ticket = try findUrl(try f.fire(try find(closed, "set_timer")), "/auth/websocket-ticket");
+    const recovered = try f.response(retry_ticket, 200, .{ .access_protocol_version = 1, .ticket = secret, .expires_at_ms = f.now + 30000 });
+    _ = try find(recovered, "ws_open");
+    const changed = try find(recovered, "state_changed");
+    var hosts_changed = false;
+    for (get(changed, "scopes").array.items) |scope| {
+        if (h.eq(scope.string, "hosts")) hosts_changed = true;
+    }
+    try expect(hosts_changed);
+    const view = try h.parse(f.arena.allocator(), try f.host.query("hosts", f.arena.allocator()));
+    const item = get(get(view, "data"), "items").array.items[0];
+    try expect(h.eq(get(item, "phase").string, "ready"));
+    try expect(get(item, "error") == .null);
+    try expect(get(item, "retry_at_ms") == .null);
+}

@@ -29,14 +29,14 @@ internal fun HostsScreen(model: HostsModel, onUse: () -> Unit = {}, onSecurity: 
                 TextButton(onClick={ model.showPairing(null) }) { Text("Back to hosts") }
                 Box(Modifier.weight(1f)) { PairingScreen(pair) }
             }
-        } else Column(Modifier.safeDrawingPadding().verticalScroll(rememberScrollState()).padding(24.dp),
+        } else Column(Modifier.safeDrawingPadding().verticalScroll(rememberScrollState()).padding(16.dp),
             verticalArrangement=Arrangement.spacedBy(16.dp)) {
-            Text("Hosts", style=MaterialTheme.typography.headlineLarge)
+            Text("Hosts", style=MaterialTheme.typography.titleLarge)
             state.error?.let { Text(it, color=MaterialTheme.colorScheme.error) }
             when {
                 state.loading -> {
                     if (state.busy) CircularProgressIndicator()
-                    else Button(onClick=model::load) { Text("Retry loading hosts") }
+                    else Button(shape = MaterialTheme.shapes.small, onClick=model::load) { Text("Retry loading hosts") }
                 }
                 state.busy -> CircularProgressIndicator()
                 else -> {
@@ -45,13 +45,14 @@ internal fun HostsScreen(model: HostsModel, onUse: () -> Unit = {}, onSecurity: 
                         val id = row.saved.id
                         val pending = row.busy || row.operation?.state == "pending"
                         val failure = row.operation?.error ?: row.view?.error
-                        OutlinedCard(Modifier.fillMaxWidth()) {
+                        OutlinedCard(Modifier.fillMaxWidth(), colors = CardDefaults.outlinedCardColors(containerColor = VerdeColors.Panel),
+                            border = androidx.compose.foundation.BorderStroke(1.dp, if (state.active == id) VerdeColors.Accent else VerdeColors.Border)) {
                             Column(Modifier.padding(16.dp), verticalArrangement=Arrangement.spacedBy(8.dp)) {
                                 Row(horizontalArrangement=Arrangement.spacedBy(8.dp)) {
                                     val status = hostStatus(row)
                                     Box(Modifier.size(12.dp).background(hostDotColor(row), CircleShape).semantics { contentDescription=status })
                                     Text(row.saved.label, style=MaterialTheme.typography.titleMedium)
-                                    if (state.active == id) Text("Selected")
+                                    if (state.active == id) Text("Selected", color = VerdeColors.Accent, style = MaterialTheme.typography.labelSmall)
                                 }
                                 Text(hostStatus(row))
                                 when {
@@ -86,10 +87,10 @@ internal fun HostsScreen(model: HostsModel, onUse: () -> Unit = {}, onSecurity: 
                             }
                         }
                     }
-                    Button(onClick={ adding=true }) { Text("Add host") }
+                    Button(shape = MaterialTheme.shapes.small, onClick={ adding=true }) { Text("Add host") }
                 }
             }
-            onSecurity?.let { open -> OutlinedButton(onClick=open) { Text("App lock & privacy") } }
+            onSecurity?.let { open -> OutlinedButton(shape = MaterialTheme.shapes.small, onClick=open) { Text("App lock & privacy") } }
         }
     }
     if (adding) AlertDialog(onDismissRequest={ adding=false }, title={ Text("Add host") },

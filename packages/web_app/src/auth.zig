@@ -466,6 +466,9 @@ pub const PairCredentialManager = struct {
     const AccessEntry = struct {
         active: bool = false,
         digest: Digest = @splat(0),
+        // Tickets must be redeemed promptly, but an accepted socket retains
+        // the access token's authority deadline, not this redemption deadline.
+        ticket_deadline_ms: ?i64 = null,
         claims: PairClaims = .{
             .device_id = @splat(0),
             .scope_mask = 0,
@@ -554,14 +557,16 @@ pub const PairCredentialManager = struct {
             saturatingAdd(now_ms, self.options.websocket_ticket_ttl_ms),
         );
         const expires_at_ms = saturatingAdd(unix_now_ms, ticket_deadline - now_ms);
-        return self.issueLocked(
+        const issued = try self.issueLocked(
             io,
             slot,
             claims.device_id[0..],
             claims.scope_mask,
-            ticket_deadline,
+            claims.deadline_ms,
             expires_at_ms,
         );
+        slot.ticket_deadline_ms = ticket_deadline;
+        return issued;
     }
 
     /// Atomically validate and erase a WebSocket ticket. Concurrent callers
@@ -647,7 +652,7 @@ pub const PairCredentialManager = struct {
             if (entry.active and entry.claims.deadline_ms <= now_ms) clearPairEntry(entry);
         }
         for (self.ticket_entries[0..self.options.max_websocket_tickets]) |*entry| {
-            if (entry.active and entry.claims.deadline_ms <= now_ms) clearPairEntry(entry);
+            if (entry.active and (entry.ticket_deadline_ms orelse entry.claims.deadline_ms) <= now_ms) clearPairEntry(entry);
         }
     }
 };
@@ -1294,4 +1299,29 @@ test "concurrent WebSocket ticket replay has exactly one winner" {
     if (first.failure) |err| return err;
     if (second.failure) |err| return err;
     try std.testing.expect(first.consumed != second.consumed);
+}
+
+test "redeemed WebSocket ticket retains access lifetime while unused tickets expire" {
+    var manager = try PairCredentialManager.init(.{ .access_token_ttl_ms = 900_000, .websocket_ticket_ttl_ms = 30_000 });
+    defer manager.deinit();
+    var token = try manager.issueAccessToken(std.testing.io, "0123456789abcdef0123456789abcdef", 5, 1_000, 10_000);
+    defer token.clear();
+    const claims = (try manager.validateAccessToken(std.testing.io, &token.value, 1_000)).?;
+    var ticket = try manager.issueWebSocketTicket(std.testing.io, claims, 1_000, 10_000);
+    defer ticket.clear();
+    try std.testing.expectEqual(@as(i64, 40_000), ticket.expires_at_ms);
+    const consumed = (try manager.consumeWebSocketTicket(std.testing.io, &ticket.value, 30_999)).?;
+    try std.testing.expectEqual(claims.deadline_ms, consumed.deadline_ms);
+    try std.testing.expect(consumed.deadline_ms > 31_000);
+    try std.testing.expectEqual(claims.scope_mask, consumed.scope_mask);
+    try std.testing.expectEqualStrings(&claims.device_id, &consumed.device_id);
+    try std.testing.expect((try manager.consumeWebSocketTicket(std.testing.io, &ticket.value, 30_999)) == null);
+
+    var expired = try manager.issueWebSocketTicket(std.testing.io, claims, 31_000, 40_000);
+    defer expired.clear();
+    try std.testing.expect((try manager.consumeWebSocketTicket(std.testing.io, &expired.value, 61_000)) == null);
+    var capped = try manager.issueWebSocketTicket(std.testing.io, claims, 900_000, 909_000);
+    defer capped.clear();
+    try std.testing.expectEqual(@as(i64, 910_000), capped.expires_at_ms);
+    try std.testing.expect((try manager.consumeWebSocketTicket(std.testing.io, &capped.value, 901_000)) == null);
 }

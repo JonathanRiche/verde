@@ -711,7 +711,7 @@ fn append(comptime T: type, a: A, slice: *[]const T, item: T) ApiError!void {
     next[slice.len] = item;
     slice.* = next;
 }
-const intents = [_][]const u8{ "sign_out", "forget_host", "pair", "trust_decision", "retry_connection", "focus", "thread_open", "thread_load_older", "history_search", "history_load_more", "draft_set", "composer_select", "send", "turn_cancel", "followup_submit", "followup_retry", "followup_pull_back", "followup_cancel", "approval_decide", "shell_prepare", "shell_confirm", "slash_search", "slash_run", "mention_search", "terminal_create", "terminal_attach", "terminal_detach", "terminal_input", "terminal_resize", "terminal_kill", "push_register", "thread_create", "new_chat_select", "workspace_create", "workspace_rename", "workspace_archive", "workspace_close", "directory_list", "file_open" };
+const intents = [_][]const u8{ "sign_out", "forget_host", "pair", "trust_decision", "retry_connection", "focus", "thread_open", "thread_load_older", "history_search", "history_load_more", "draft_set", "composer_select", "send", "turn_cancel", "followup_submit", "followup_retry", "followup_pull_back", "followup_cancel", "approval_decide", "shell_prepare", "shell_confirm", "slash_search", "slash_run", "mention_search", "terminal_create", "terminal_attach", "terminal_detach", "terminal_input", "terminal_resize", "terminal_kill", "push_register", "thread_rename", "thread_close", "thread_sync", "thread_create", "new_chat_select", "workspace_create", "workspace_rename", "workspace_archive", "workspace_close", "directory_list", "file_open" };
 fn isIntent(tag: []const u8) bool {
     for (intents) |intent| if (eq(tag, intent)) return true;
     return false;

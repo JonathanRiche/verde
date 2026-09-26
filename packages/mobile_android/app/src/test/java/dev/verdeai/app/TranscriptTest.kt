@@ -230,6 +230,19 @@ class TranscriptTest {
         assertEquals(2, focuses().size)
     }
 
+    @Test fun loadingDoesNotFlashAnOldErrorButFinalFailureStillShows() {
+        val failed = Fixtures.thread("thread-error")
+        val loading = failed.copy(data=failed.data!!.copy(page=failed.data!!.page.copy(loading=true)))
+        setup={ it.thread=CoreJson.encodeToString(loading) }
+        launch()
+        awaitText("Loading conversation…")
+        compose.onNodeWithText("Couldn't load this chat.", substring=true).assertDoesNotExist()
+        compose.onNodeWithText("Couldn't load this conversation.").assertDoesNotExist()
+        deliver { thread="thread-error" }
+        awaitText("Couldn't load this conversation.")
+        awaitText("Couldn't load this chat.", substring=true)
+    }
+
     @Test fun loadingErrorRetryAndMissingStates() {
         setup={ it.thread="thread-loading" }
         launch()

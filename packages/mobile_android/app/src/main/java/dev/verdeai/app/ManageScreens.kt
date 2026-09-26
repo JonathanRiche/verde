@@ -12,6 +12,8 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -52,7 +54,7 @@ private fun connected(state: BrowseState) = state.host?.phase == "ready" && stat
 @Composable
 private fun ManageFrame(title: String, onBack: () -> Unit, content: LazyListScope.() -> Unit) {
     Column(Modifier.fillMaxSize()) {
-        TopAppBar(title = { Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+        VerdeTopBar(title = { Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
             navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back") } })
         LazyColumn(Modifier.fillMaxSize().testTag(MANAGE_LIST), content = content)
     }
@@ -67,8 +69,7 @@ private fun LazyListScope.line(key: String, text: String, error: Boolean = false
 
 private fun LazyListScope.section(text: String) {
     item(key = "section:$text") {
-        Text(text, style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary,
-            modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 20.dp, bottom = 4.dp))
+        VerdeSection(text)
     }
 }
 
@@ -114,8 +115,17 @@ internal fun HistoryScreen(browse: BrowseModel, manage: ManageModel, onOpenThrea
     ManageFrame("History", onBack) {
         if (!ready(state)) return@ManageFrame
         item(key = "search") {
-            OutlinedTextField(query, { query = it }, Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp).testTag(HISTORY_SEARCH),
-                singleLine = true, label = { Text("Search chats") })
+            BasicTextField(query, { query = it }, Modifier.fillMaxWidth().padding(horizontal = 16.dp).testTag(HISTORY_SEARCH),
+                singleLine = true, textStyle = MaterialTheme.typography.bodyLarge.copy(color = VerdeColors.Text),
+                cursorBrush = SolidColor(VerdeColors.Accent), decorationBox = { field ->
+                    Column {
+                        Box(Modifier.fillMaxWidth().heightIn(min = 48.dp).padding(vertical = 12.dp)) {
+                            if (query.isEmpty()) Text("Search chats", color = VerdeColors.Subtle)
+                            field()
+                        }
+                        HorizontalDivider(color = VerdeColors.Border)
+                    }
+                })
         }
         if (workspaces.size > 1) item(key = "filters") {
             LazyRow(contentPadding = PaddingValues(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -134,7 +144,8 @@ internal fun HistoryScreen(browse: BrowseModel, manage: ManageModel, onOpenThrea
                 val parts = listOfNotNull(labels[thread.workspace_id].takeIf { filter == null },
                     statusLabel(thread.status).takeIf { thread.status != "idle" }, "Archived".takeIf { thread.archived },
                     thread.last_activity_at_ms?.let { agoLabel(it, now) })
-                ListItem(headlineContent = { Text(thread.title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                VerdeListRow(headlineContent = { Text(thread.title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                    leadingContent = { ProviderGlyph(thread.provider) },
                     supportingContent = parts.takeIf { it.isNotEmpty() }?.let { { Text(it.joinToString(" · "), maxLines = 1) } },
                     modifier = Modifier.fillMaxWidth().clickable(onClickLabel = "Open") { onOpenThread(thread) })
             }
@@ -155,18 +166,23 @@ internal fun HistoryScreen(browse: BrowseModel, manage: ManageModel, onOpenThrea
 // ---- New chat ----
 
 @Composable
-private fun Picker(label: String, value: String, choices: List<ChatChoice>, enabled: Boolean, onPick: (String) -> Unit) {
+private fun Picker(label: String, value: String, choices: List<ChatChoice>, enabled: Boolean, providerIcons: Boolean = false, onPick: (String) -> Unit) {
     var open by remember { mutableStateOf(false) }
     Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)) {
         Text(label, style = MaterialTheme.typography.labelMedium)
         Box {
-            OutlinedButton(onClick = { open = true }, enabled = enabled && choices.isNotEmpty(), modifier = Modifier.fillMaxWidth().testTag("picker:$label")) {
+            OutlinedButton(shape = MaterialTheme.shapes.small, onClick = { open = true }, enabled = enabled && choices.isNotEmpty(), modifier = Modifier.fillMaxWidth().testTag("picker:$label")) {
+                if (providerIcons) {
+                    ProviderGlyph(choices.find { it.label == value }?.id ?: value)
+                    Spacer(Modifier.width(8.dp))
+                }
                 Text(value, Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
                 Icon(Icons.Filled.ArrowDropDown, contentDescription = null)
             }
             DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
                 choices.forEach { choice ->
-                    DropdownMenuItem(text = { Text(choice.label) }, enabled = choice.enabled, onClick = { open = false; onPick(choice.id) })
+                    DropdownMenuItem(text = { Text(choice.label) },
+                        leadingIcon = if (providerIcons) ({ ProviderGlyph(choice.id) }) else null, enabled = choice.enabled, onClick = { open = false; onPick(choice.id) })
                 }
             }
         }
@@ -221,7 +237,7 @@ internal fun NewChatScreen(
         }
         item(key = "provider") {
             val providers = chat?.providers.orEmpty()
-            Picker("Provider", label(providers, selection.provider, "Provider"), providers, chat != null && !busy) {
+            Picker("Provider", label(providers, selection.provider, "Provider"), providers, chat != null && !busy, providerIcons = true) {
                 if (it != selection.provider) manage.select(ws, ChatSelection(provider=it))
             }
         }
@@ -248,7 +264,7 @@ internal fun NewChatScreen(
             manageState.view?.can_create_threads == false -> line("create-scope", "This phone can't start chats on this host.")
         }
         item(key = "create") {
-            Button(onClick = { createIntent = manage.createThread(ws, selection) }, enabled = chat?.can_create == true && !busy,
+            Button(shape = MaterialTheme.shapes.small, onClick = { createIntent = manage.createThread(ws, selection) }, enabled = chat?.can_create == true && !busy,
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
                 Text(if (busy) "Creating…" else "Start chat")
             }
@@ -293,7 +309,7 @@ internal fun AddWorkspaceScreen(browse: BrowseModel, manage: ManageModel, onCrea
             view?.can_manage_workspaces == false -> line("add-scope", "This phone can't change workspaces on this host.")
         }
         item(key = "add") {
-            Button(onClick = { createIntent = manage.createWorkspace(path.trim(), name) },
+            Button(shape = MaterialTheme.shapes.small, onClick = { createIntent = manage.createWorkspace(path.trim(), name) },
                 enabled = path.isNotBlank() && view?.can_manage_workspaces == true && !busy,
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) { Text(if (busy) "Adding…" else "Add workspace") }
         }
@@ -320,12 +336,12 @@ internal fun AddWorkspaceScreen(browse: BrowseModel, manage: ManageModel, onCrea
         if (directory.loading) progress("browse-loading")
         directory.parent?.let { parent ->
             item(key = "parent") {
-                ListItem(headlineContent = { Text("..") }, supportingContent = { Text("Up one folder") },
+                VerdeListRow(headlineContent = { Text("..") }, supportingContent = { Text("Up one folder") },
                     modifier = Modifier.fillMaxWidth().clickable { manage.listDirectory(parent) })
             }
         }
         items(directory.entries, key = { "dir:" + it.path }) { entry ->
-            ListItem(headlineContent = { Text(entry.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+            VerdeListRow(headlineContent = { Text(entry.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                 modifier = Modifier.fillMaxWidth().clickable(onClickLabel = "Browse") { manage.listDirectory(entry.path) })
         }
         if (!directory.loading && directory.error == null && directory.entries.isEmpty() && directory.path.isNotEmpty()) line("browse-empty", "No folders here.")

@@ -180,11 +180,23 @@ test "chat fallback only on unsupported paging and duplicate page intent does no
     _ = try f.intent("thread_open", .{});
     _ = try f.storage(null, false);
     _ = try f.response("chat.message.list", .null, .{ .code = "method_not_found", .message = "missing" });
+    try expect(f.host.state.chat.threads[0].loading);
+    try expect(f.host.state.chat.threads[0].@"error" == null);
+    const pending_view = p.get(try f.query("thread"), "data");
+    try expect(p.get(pending_view, "error") == .null);
+    try expect(p.yes(p.get(p.get(pending_view, "page"), "loading")));
     try f.recorded("chat.thread.get", @embedFile("fixtures/chat/thread.json"));
     try expect(f.host.state.chat.threads[0].rows.len > 40);
     _ = try f.intent("thread_open", .{});
     _ = try f.response("chat.message.list", .null, .{ .code = "forbidden", .message = "no scope" });
     try std.testing.expectError(error.MissingRequest, f.find("chat.thread.get"));
+    try expect(f.host.state.chat.threads[0].@"error" != null);
+    _ = try f.intent("thread_open", .{});
+    try expect(f.host.state.chat.threads[0].loading);
+    try expect(f.host.state.chat.threads[0].@"error" == null);
+    _ = try f.response("chat.message.list", .null, .{ .code = "unknown_method", .message = "missing" });
+    _ = try f.response("chat.thread.get", .null, .{ .code = "forbidden", .message = "no scope" });
+    try expect(!f.host.state.chat.threads[0].loading);
     try expect(f.host.state.chat.threads[0].@"error" != null);
 }
 

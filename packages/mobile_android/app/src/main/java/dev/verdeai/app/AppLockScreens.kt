@@ -80,13 +80,13 @@ internal fun AppLockGate(model: AppLockModel, auth: DeviceAuth, content: @Compos
         properties = DialogProperties(dismissOnBackPress = true, dismissOnClickOutside = false,
             usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
     ) {
-        // The dialog window has its own system bars; keep their icons readable on the light surface.
+        // The dialog window has its own system bars; keep their icons readable on the dark surface.
         val view = LocalView.current
         SideEffect {
             (view.parent as? DialogWindowProvider)?.window?.let { window ->
                 WindowCompat.getInsetsController(window, view).apply {
-                    isAppearanceLightStatusBars = true
-                    isAppearanceLightNavigationBars = true
+                    isAppearanceLightStatusBars = false
+                    isAppearanceLightNavigationBars = false
                 }
             }
         }
@@ -102,12 +102,13 @@ internal fun LockScreen(state: AppLockState, onUnlock: () -> Unit) {
             verticalArrangement = Arrangement.spacedBy(16.dp, Alignment.CenterVertically),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
+            VerdeWordmark()
             Icon(Icons.Filled.Lock, contentDescription = null, Modifier.size(48.dp), tint = MaterialTheme.colorScheme.primary)
             Text("Verde is locked", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.semantics { heading() })
-            Text("Unlock with your fingerprint, face or screen lock. Your hosts keep syncing in the background.",
+            Text("Unlock with your fingerprint, face or screen lock. Your chats keep running on your hosts.",
                 textAlign = TextAlign.Center, style = MaterialTheme.typography.bodyMedium)
             state.message?.let { Text(it, color = MaterialTheme.colorScheme.error, textAlign = TextAlign.Center) }
-            Button(onClick = onUnlock) { Text(if (state.authenticating) "Try again" else "Unlock") }
+            Button(shape = MaterialTheme.shapes.small, onClick = onUnlock) { Text(if (state.authenticating) "Try again" else "Unlock") }
         }
     }
 }
@@ -125,12 +126,12 @@ internal fun SecuritySettingsScreen(model: AppLockModel, auth: DeviceAuth, onBac
     val settings = state.settings
     val lockOn = settings.enabled
     Column(Modifier.fillMaxSize()) {
-        TopAppBar(title = { Text("App lock & privacy") },
+        VerdeTopBar(title = { Text("App lock & privacy") },
             navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back") } })
         Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)) {
             SettingSwitch("Require unlock",
-                "Ask for your fingerprint, face or screen lock when you open Verde. Sync and notifications keep running while locked.",
+                "Ask for your fingerprint, face or screen lock when you open Verde.",
                 checked = lockOn, enabled = state.loaded && !state.authenticating && (lockOn || state.available),
             ) { model.setEnabled(it, auth) }
             if (!state.available) {
@@ -138,7 +139,7 @@ internal fun SecuritySettingsScreen(model: AppLockModel, auth: DeviceAuth, onBac
                     Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Text(if (lockOn) "App lock is paused because this phone has no screen lock."
                             else "This phone has no screen lock. Set a PIN, pattern or password to use app lock.")
-                        Button(onClick = { openScreenLockSetup(context) }) { Text("Set up screen lock") }
+                        Button(shape = MaterialTheme.shapes.small, onClick = { openScreenLockSetup(context) }) { Text("Set up screen lock") }
                     }
                 }
             }

@@ -915,6 +915,40 @@ data class EventPushRegister(
 ) : Event()
 
 @Serializable
+@SerialName("thread_rename")
+data class EventThreadRename(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `workspace_id`: String,
+    val `thread_id`: String,
+    val `title`: String,
+) : Event()
+
+@Serializable
+@SerialName("thread_close")
+data class EventThreadClose(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `workspace_id`: String,
+    val `thread_id`: String,
+) : Event()
+
+@Serializable
+@SerialName("thread_sync")
+data class EventThreadSync(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `workspace_id`: String,
+    val `thread_id`: String,
+) : Event()
+
+@Serializable
 @SerialName("thread_create")
 data class EventThreadCreate(
     val `api_version`: Long = 1,

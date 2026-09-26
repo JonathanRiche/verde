@@ -1,5 +1,7 @@
 package dev.verdeai.app
 
+import androidx.activity.OnBackPressedDispatcher
+import androidx.activity.compose.LocalOnBackPressedDispatcherOwner
 import android.content.ClipboardManager
 import android.content.Context
 import android.os.Looper
@@ -31,6 +33,7 @@ import java.util.concurrent.CopyOnWriteArrayList
 class BrowseTest {
     @get:Rule val compose = createComposeRule()
     private val models = ViewModelStore()
+    private lateinit var backDispatcher: OnBackPressedDispatcher
     private lateinit var hosts: HostsModel
     private lateinit var browse: BrowseModel
     private val store = Store()
@@ -64,7 +67,10 @@ class BrowseTest {
             hosts=provider[HostsModel::class.java]
             browse=provider[BrowseModel::class.java]
         }
-        compose.setContent { VerdeApp(hosts, browse, UiClock(now={ NOW }, ticking=false)) }
+        compose.setContent {
+            backDispatcher = LocalOnBackPressedDispatcherOwner.current!!.onBackPressedDispatcher
+            VerdeApp(hosts, browse, UiClock(now={ NOW }, ticking=false))
+        }
     }
     private fun list() = compose.onNodeWithTag(BROWSE_LIST)
     private fun scrollTo(text: String) { list().performScrollToNode(hasText(text)) }
@@ -76,13 +82,13 @@ class BrowseTest {
 
     @Test fun homeShowsAttentionRunningRecentAndWorkspacesWithTimers() {
         launch()
-        awaitText("Needs attention")
+        awaitText("NEEDS ATTENTION")
         compose.onNodeWithText("Studio · Connected", useUnmergedTree=true).assertExists()
         compose.onNodeWithText("Chat · Needs approval · 1:00", useUnmergedTree=true).assertExists()
         compose.onNodeWithText("Terminal · Running", useUnmergedTree=true).assertExists()
-        scrollTo("Running")
+        scrollTo("RUNNING")
         compose.onNodeWithText("Chat · Working · 0:55", useUnmergedTree=true).assertExists()
-        scrollTo("Recent chats")
+        scrollTo("RECENT CHATS")
         // Subagent threads never surface as top-level recent chats.
         compose.onNodeWithText("Child", useUnmergedTree=true).assertDoesNotExist()
         scrollTo("Fixture workspace")
@@ -101,29 +107,104 @@ class BrowseTest {
                 ws.copy(panes=ws.panes.map { if (it.thread_id == "web-thread-fixture") it.copy(attention=true, attention_kind="unread") else it }) })) }
         }
         launch()
-        awaitText("Needs attention")
+        awaitText("NEEDS ATTENTION")
         compose.onNodeWithText("Needs approval", useUnmergedTree=true).assertExists()
+        compose.onNodeWithContentDescription("Open workspace drawer").performClick()
         compose.onNode(hasText("Workspaces") and hasClickAction()).performClick()
         awaitText("1 needs attention")
         compose.onNodeWithText("Fixture workspace").performClick()
         awaitText("Unread")
     }
 
+    @Test fun workspaceThreadsSortMixedMissingAndPresentTimestamps() {
+        val workspace = K09.workspaces.data!!.items.first()
+        val template = workspace.threads.first()
+        val threads = listOf(
+            template.copy(thread_id = "unknown", last_activity_at_ms = null),
+            template.copy(thread_id = "older", last_activity_at_ms = 100L),
+            template.copy(thread_id = "newest", last_activity_at_ms = 200L),
+        )
+        assertEquals(listOf("newest", "older", "unknown"),
+            workspaceThreads(workspace.copy(threads = threads)).map { it.thread_id })
+    }
+
+    @Test fun drawerOnlyListsOpenChatsWhileWorkspaceKeepsHistory() {
+        val workspace = K09.workspaces.data!!.items.first()
+        val template = workspace.threads.first { it.thread_id == "layout-thread" }
+        val threads = listOf(template, template.copy(thread_id = "history-only"))
+        val withHistory = workspace.copy(threads = threads)
+        assertEquals(listOf("layout-thread"), drawerThreads(withHistory).map { it.thread_id })
+        assertEquals(2, workspaceThreads(withHistory).size)
+    }
+
+    @Test fun drawerOpensWorkspaceAndChatAndClosesAfterNavigation() {
+        launch()
+        awaitText("NEEDS ATTENTION")
+        compose.onNodeWithContentDescription("Open workspace drawer").performClick()
+        compose.onNode(hasText("Fixture workspace") and hasAnyAncestor(hasTestTag("workspace-drawer"))).performClick()
+        awaitText("PANES")
+        compose.onNodeWithContentDescription("Close workspace drawer").assertDoesNotExist()
+        compose.onNodeWithContentDescription("Open workspace drawer").performClick()
+        compose.onAllNodes(hasText("Layout chat") and hasClickAction() and hasAnyAncestor(hasTestTag("workspace-drawer")))[0].performClick()
+        await { core.events.any { it is EventFocus && it.thread_id == "layout-thread" } }
+        compose.onNodeWithContentDescription("Close workspace drawer").assertDoesNotExist()
+        compose.onNodeWithContentDescription("Back").performClick()
+        awaitText("PANES")
+    }
+
+    @Test fun drawerHostsReturnsToRootAfterOpeningAChatFromHosts() {
+        launch()
+        awaitText("NEEDS ATTENTION")
+        compose.onNodeWithContentDescription("Open workspace drawer").performClick()
+        compose.onNode(hasText("Hosts") and hasClickAction()).performClick()
+        awaitText("Sign out of host")
+        compose.onNodeWithContentDescription("Open workspace drawer").performClick()
+        compose.onAllNodes(hasText("Layout chat") and hasClickAction() and hasAnyAncestor(hasTestTag("workspace-drawer")))[0].performClick()
+        await { core.events.any { it is EventFocus && it.thread_id == "layout-thread" } }
+        compose.onNodeWithContentDescription("Open workspace drawer").performClick()
+        compose.onNode(hasText("Hosts") and hasClickAction()).performClick()
+        awaitText("Sign out of host")
+        compose.onNodeWithTag(TRANSCRIPT_LIST).assertDoesNotExist()
+        compose.onNodeWithContentDescription("Open workspace drawer").performClick()
+        compose.onNode(hasText("Home") and hasClickAction()).performClick()
+        awaitText("NEEDS ATTENTION")
+        compose.onNodeWithContentDescription("Open workspace drawer").performClick()
+        compose.onNode(hasText("Workspaces") and hasClickAction()).performClick()
+        awaitText("Add workspace")
+    }
+
+    @Test fun systemBackClosesDrawerBeforeNavigatingTheConversation() {
+        launch()
+        awaitText("NEEDS ATTENTION")
+        compose.onAllNodesWithText("Layout chat")[0].performClick()
+        await { core.events.any { it is EventFocus && it.thread_id == "layout-thread" } }
+        compose.onNodeWithContentDescription("Open workspace drawer").performClick()
+        compose.onNodeWithContentDescription("Close workspace drawer").assertIsDisplayed()
+        compose.runOnUiThread { backDispatcher.onBackPressed() }
+        await { compose.onAllNodesWithContentDescription("Close workspace drawer").fetchSemanticsNodes().isEmpty() }
+        compose.onNodeWithContentDescription("Close workspace drawer").assertDoesNotExist()
+        compose.onNodeWithContentDescription("Back").assertIsDisplayed()
+        assertEquals("layout-thread", core.events.filterIsInstance<EventFocus>().last().thread_id)
+        compose.onNodeWithContentDescription("Back").performClick()
+        awaitText("NEEDS ATTENTION")
+    }
+
     @Test fun tappingAChatOpensTheFocusedTranscriptAndBackUnfocuses() {
         launch()
-        awaitText("Needs attention")
+        awaitText("NEEDS ATTENTION")
         compose.onAllNodesWithText("Layout chat")[0].performClick()
         // D-06: the transcript focuses its thread (K-17 attention clears) and loads from the core.
         awaitText("Loading conversation…")
         await { core.events.any { it is EventFocus && it.thread_id == "layout-thread" } }
         compose.onNodeWithContentDescription("Back").performClick()
-        awaitText("Needs attention")
+        awaitText("NEEDS ATTENTION")
         await { core.events.any { it is EventFocus && it.thread_id == null } }
     }
 
     @Test fun workspacesListDetailAndLongPressMenus() {
         launch()
-        awaitText("Needs attention")
+        awaitText("NEEDS ATTENTION")
+        compose.onNodeWithContentDescription("Open workspace drawer").performClick()
         compose.onNode(hasText("Workspaces") and hasClickAction()).performClick()
         awaitText("/tmp/k09-fixture-project", substring=true)
         compose.onNodeWithText("Fixture workspace").performTouchInput { longClick() }
@@ -131,9 +212,9 @@ class BrowseTest {
         val clipboard=ApplicationProvider.getApplicationContext<Context>().getSystemService(ClipboardManager::class.java)
         assertEquals("/tmp/k09-fixture-project", clipboard.primaryClip?.getItemAt(0)?.text?.toString())
         compose.onNodeWithText("Fixture workspace").performClick()
-        awaitText("Panes")
+        awaitText("PANES")
         compose.onNodeWithText("Browser · Unavailable", useUnmergedTree=true).assertExists()
-        scrollTo("Chats")
+        scrollTo("CHATS")
         compose.onNodeWithText("Child", useUnmergedTree=true).assertDoesNotExist()
         // The workspace's chats come from the paged catalog, newest first.
         val chats=compose.onAllNodes(hasText("Web chat") or hasText("Layout chat")).fetchSemanticsNodes()
@@ -145,19 +226,19 @@ class BrowseTest {
         awaitText("Opening terminal…")
         await { core.events.any { it is EventTerminalAttach && it.terminal_id == "sess-7" } }
         compose.onNodeWithContentDescription("Back").performClick()
-        awaitText("Panes")
+        awaitText("PANES")
         await { core.events.any { it is EventTerminalDetach && it.terminal_id == "sess-7" } }
     }
 
     @Test fun pullToRefreshSendsRetryAndShowsTheRefreshedProjection() {
         setup={ it.afterRefresh=K09.home to K09.workspaces }
         launch()
-        awaitText("Needs attention")
+        awaitText("NEEDS ATTENTION")
         list().performTouchInput { swipeDown(startY=top + 10f, endY=bottom, durationMillis=600) }
         await { core.events.any { it is EventRetryConnection } }
         awaitText("Nothing is running or waiting on you.")
         await { !browse.state.value.refreshing }
-        compose.onNodeWithText("Needs attention").assertDoesNotExist()
+        compose.onNodeWithText("NEEDS ATTENTION").assertDoesNotExist()
     }
 
     @Test fun warmStartShowsCacheUntilLiveSyncThenSavesLiveViews() {
@@ -185,7 +266,7 @@ class BrowseTest {
 
     @Test fun backgroundAndNetworkChangesReachTheCoreAndForegroundRecovers() {
         launch()
-        awaitText("Needs attention")
+        awaitText("NEEDS ATTENTION")
         compose.runOnIdle { signals.foreground.value=false }
         await { core.events.any { it is EventBackground } }
         compose.runOnIdle { signals.foreground.value=false; signals.network.value=NetworkState(true, "net-1") }
@@ -197,17 +278,17 @@ class BrowseTest {
         // Unchanged values are deduplicated before reaching the core.
         assertEquals(1, core.events.count { it is EventBackground })
         assertEquals(2, core.events.count { it is EventForeground })
-        awaitText("Needs attention")
+        awaitText("NEEDS ATTENTION")
     }
 
     @Test fun signOutClearsCachedAndShownViews() {
         launch()
-        awaitText("Needs attention")
+        awaitText("NEEDS ATTENTION")
         await { runBlocking { cache.load("alpha") } != null }
         compose.runOnIdle { hosts.signOut("alpha") }
         await { runBlocking { cache.load("alpha") } == null && !cacheStore.values.containsKey(ViewCache.key("alpha")) }
         awaitText("This phone isn't paired with Studio yet.")
-        compose.onNodeWithText("Needs attention").assertDoesNotExist()
+        compose.onNodeWithText("NEEDS ATTENTION").assertDoesNotExist()
         compose.onNodeWithText("Pair with this host").assertExists()
     }
 
@@ -215,7 +296,23 @@ class BrowseTest {
         launch(active=false)
         awaitText("Hosts")
         compose.onNodeWithText("Use Studio").performScrollTo().performClick()
-        awaitText("Needs attention")
+        awaitText("NEEDS ATTENTION")
+    }
+
+    @Test fun refreshKeepsWorkspacesVisibleAcrossRepeatedLoadingCycles() {
+        launch()
+        awaitText("NEEDS ATTENTION")
+        compose.onNodeWithContentDescription("Open workspace drawer").performClick()
+        compose.onNode(hasText("Workspaces") and hasClickAction()).performClick()
+        awaitText("Fixture workspace")
+        repeat(3) {
+            compose.runOnUiThread { browse.refresh() }
+            await { browse.state.value.row?.view?.sync_state == "loading" }
+            compose.onNodeWithText("Fixture workspace").assertExists()
+            compose.onNodeWithText("Loading workspaces…").assertDoesNotExist()
+            await { !browse.state.value.refreshing }
+        }
+        assertEquals(3, core.events.filterIsInstance<EventRetryConnection>().size)
     }
 
     @Test fun bannerAndLabelRules() {
@@ -230,7 +327,7 @@ class BrowseTest {
         assertEquals(BannerAction.Hosts, browseBanner(ready.copy(row=row.copy(view=row.view.copy(auth_state="repair_required"))), NOW)!!.action)
         val failed=ready.copy(home=ready.home!!.copy(error=LocalError(domain="rpc",code="x",message="",retryable=true)))
         assertTrue(browseBanner(failed, NOW)!!.text.startsWith("Couldn't load"))
-        assertFalse(hasContent(ready.copy(row=row.copy(view=row.view.copy(sync_state="loading")))))
+        assertTrue(hasContent(ready.copy(row=row.copy(view=row.view.copy(sync_state="loading")))))
         assertTrue(showSpinner(ready.copy(row=row.copy(view=row.view.copy(sync_state="loading")))))
         assertEquals("1:01:05", elapsedLabel(0, 3_665_000))
         assertEquals("0:00", elapsedLabel(10, 0))
@@ -313,9 +410,9 @@ class BrowseTest {
                 }
                 is EventTimerFired -> when (decoded.timer_id) {
                     "sync" -> if (row.phase == "connecting") { synced=true; row=row.copy(phase="ready", sync_state="ready") }
-                    "refresh" -> { loading=false; afterRefresh?.let { (h, w) -> home=h; workspaces=w } }
+                    "refresh" -> { loading=false; row=row.copy(sync_state="ready"); afterRefresh?.let { (h, w) -> home=h; workspaces=w } }
                 }
-                is EventRetryConnection -> if (row.phase == "ready") { loading=true; timer("refresh", 30) }
+                is EventRetryConnection -> if (row.phase == "ready") { loading=true; row=row.copy(sync_state="loading"); timer("refresh", 150) }
                 is EventSignOut -> { synced=false; row=row.copy(auth_state="signed_out", phase="disabled", sync_state="empty") }
                 else -> Unit
             }

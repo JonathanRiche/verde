@@ -87,11 +87,12 @@ class TerminalTest {
     }
 
     private fun openWorkspace() {
-        awaitText("Needs attention")
+        awaitText("NEEDS ATTENTION")
+        compose.onNodeWithContentDescription("Open workspace drawer").performClick()
         compose.onNode(hasText("Workspaces") and hasClickAction()).performClick()
         awaitText("Fixture workspace")
         compose.onNodeWithText("Fixture workspace").performClick()
-        awaitText("Panes")
+        awaitText("PANES")
     }
 
     private fun openHtop(inWorkspace: Boolean = false) {
@@ -169,7 +170,7 @@ class TerminalTest {
         compose.onNodeWithContentDescription("Back").performClick()
         await { events<EventTerminalDetach>().any { it.terminal_id == "sess-7" } }
         await { vt.freed.isNotEmpty() }
-        awaitText("Panes")
+        awaitText("PANES")
         await { events<EventFocus>().size == 2 }
         assertEquals(listOf(null, null, null), events<EventFocus>().last().let { listOf(it.workspace_id, it.thread_id, it.terminal_id) })
         assertNull(FocusClaim.owner)

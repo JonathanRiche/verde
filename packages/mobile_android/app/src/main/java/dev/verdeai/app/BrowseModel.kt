@@ -17,6 +17,7 @@ internal data class BrowseState(
     val refreshing: Boolean = false,
     val networkAvailable: Boolean = true,
     val fatal: Boolean = false,
+    val hasSynced: Boolean = false,
 ) {
     val host get() = row?.view
     val hasData get() = home != null || workspaces != null
@@ -69,12 +70,16 @@ internal class BrowseModel(
         live.collect { (view, home, workspaces) ->
             val auth = view?.auth_state
             if (auth in HostsModel.WIPED) {
-                mutableState.update { it.copy(home=null, workspaces=null, savedAtMs=null) }
+                mutableState.update { it.copy(home=null, workspaces=null, savedAtMs=null, hasSynced=false) }
+                synced = false
                 return@collect
             }
             if (view?.sync_state == "ready") synced = true
+            // A background snapshot/catalog refresh must not replace the last complete
+            // projection with an empty/loading one. Host selection and auth wipes reset it.
+            if (synced && view?.sync_state == "loading") return@collect
             if (synced || mutableState.value.savedAtMs == null) {
-                mutableState.update { it.copy(home=home, workspaces=workspaces, savedAtMs=null) }
+                mutableState.update { it.copy(home=home, workspaces=workspaces, savedAtMs=null, hasSynced=synced) }
             }
         }
     }

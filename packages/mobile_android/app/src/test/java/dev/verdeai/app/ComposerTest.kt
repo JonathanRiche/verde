@@ -143,12 +143,22 @@ class ComposerTest {
         repeat(40) { pump() }
         // Two edits inside the debounce spend one receipt.
         assertEquals(listOf("Fix the build"), sent<EventDraftSet>().map { it.text })
-        send().assertTextEquals("Send").performClick()
+        send().assertContentDescriptionEquals("Send").performClick()
         await { sent<EventSend>().isNotEmpty() }
         assertEquals(core.revisionAtSend, sent<EventSend>().single().draft_revision)
         // The core cleared the committed draft; the field follows it.
         await { transcript.composer.field.text.isEmpty() }
         assertEquals(1, sent<EventDraftSet>().size)
+    }
+
+    @Test fun diffCommentAppendsToTheDraftWithoutSendingATurn() {
+        launch()
+        type("Keep this note")
+        compose.runOnUiThread { transcript.composer.commentOnDiff("src/app.kt", 3uL, 1uL) }
+        await { sent<EventDraftSet>().lastOrNull()?.text == "Keep this note\nAbout your edit to @src/app.kt (+3/-1): " }
+        assertTrue(sent<EventSend>().isEmpty())
+        assertEquals(transcript.composer.field.text.length, transcript.composer.field.selection.start)
+        field().assertIsFocused()
     }
 
     @Test fun aNewlyCreatedChatTakesItsFirstMessage() {
@@ -158,7 +168,7 @@ class ComposerTest {
         awaitText("No messages yet.")
         compose.onNodeWithContentDescription("Provider: Codex. Change").assertExists()
         type("hello")
-        send().assertTextEquals("Send").assertIsEnabled().performClick()
+        send().assertContentDescriptionEquals("Send").assertIsEnabled().performClick()
         await { sent<EventSend>().isNotEmpty() }
         assertEquals(core.revisionAtSend, sent<EventSend>().single().draft_revision)
     }
@@ -175,7 +185,7 @@ class ComposerTest {
         launch()
         awaitText("Send to steer the current reply.")
         type("also add tests")
-        send().assertTextEquals("Steer").performClick()
+        send().assertContentDescriptionEquals("Steer").performClick()
         await { sent<EventFollowupSubmit>().isNotEmpty() }
         assertEquals(EventFollowupSubmitKind.steer, sent<EventFollowupSubmit>().single().kind)
         awaitText("Steer follow-up")
@@ -205,7 +215,7 @@ class ComposerTest {
     @Test fun bangCommandsNeedConfirmationBeforeRunning() {
         launch()
         type("!ls -la")
-        send().assertTextEquals("Run").performClick()
+        send().assertContentDescriptionEquals("Run").performClick()
         await { sent<EventSend>().isNotEmpty() }
         await { exists("Run this command on the host?") }
         assertTrue(exists("ls -la"))
@@ -218,6 +228,18 @@ class ComposerTest {
         await { !exists("Run this command on the host?") }
     }
 
+    @Test fun slashButtonOpensCatalogWithoutSubmittingAndPreservesDrafts() {
+        launch()
+        compose.onNodeWithContentDescription("Slash commands").performClick()
+        await { transcript.composer.field.text == "/" && exists("/compact") }
+        assertEquals(1, sent<EventSlashSearch>().size)
+        assertTrue(sent<EventSlashRun>().isEmpty())
+        assertTrue(sent<EventSend>().isEmpty())
+        field().performTextReplacement("Keep my draft")
+        compose.onNodeWithContentDescription("Slash commands").assertIsNotEnabled()
+        assertEquals("Keep my draft", transcript.composer.field.text)
+    }
+
     @Test fun slashCommandsAndFileMentionsComeFromTheCore() {
         launch()
         field().performTextInput("/co")
@@ -227,7 +249,7 @@ class ComposerTest {
         assertFalse(exists("/review"))
         compose.onNode(hasText("/compact") and hasAnyAncestor(hasTestTag(COMPOSER_SUGGESTIONS))).performClick()
         await { transcript.composer.field.text == "/compact " }
-        send().assertTextEquals("Run").performClick()
+        send().assertContentDescriptionEquals("Run").performClick()
         await { sent<EventSlashRun>().isNotEmpty() }
         assertEquals("compact", sent<EventSlashRun>().single().command)
         assertEquals("", sent<EventSlashRun>().single().args)
@@ -276,6 +298,8 @@ class ComposerTest {
         await { exists("photo.jpg", substring=true) }
         val first=sent<EventDraftSet>().single().attachments.single()
         assertEquals("2048", first.byte_size); assertTrue(first.bytes_base64.isNotEmpty())
+        await { transcript.composer.imagePreviews.containsKey(first.local_id) }
+        assertArrayEquals(image.bytes, transcript.composer.imagePreviews[first.local_id])
         type("look")
         // Later draft saves keep the image by reference; the bytes are never re-sent.
         assertEquals(first.local_id, sent<EventDraftSet>().last().attachments.single().local_id)
@@ -288,6 +312,7 @@ class ComposerTest {
         compose.onNodeWithContentDescription("Remove photo.jpg").performClick()
         await { transcript.state.value.composer?.draft?.attachments?.isEmpty() == true }
         assertTrue(sent<EventDraftSet>().last().attachments.isEmpty())
+        await { transcript.composer.imagePreviews.isEmpty() }
         compose.onNodeWithTag(COMPOSER_ATTACH).assertIsEnabled()
     }
 

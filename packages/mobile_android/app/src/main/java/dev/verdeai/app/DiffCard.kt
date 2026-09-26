@@ -24,7 +24,6 @@ import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.*
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.style.TextIndent
 import androidx.compose.ui.text.style.TextOverflow
@@ -54,11 +53,13 @@ internal const val DIFF_MAX_COPY_CHARS = 256 * 1024
 @Composable
 internal fun DiffCard(row: ChatRow, ctx: TranscriptContext) {
     val source = remember(ctx.model) { ctx.model.diffSource() }
-    DiffCard(row.id, row.body, source, ctx.onCitation)
+    DiffCard(row.id, row.body, source, ctx.onCitation) { entry ->
+        ctx.model.composer.commentOnDiff(entry.path, entry.additions, entry.deletions)
+    }
 }
 
 @Composable
-internal fun DiffCard(id: String, body: String, source: DiffRenderSource, onOpenFile: ((FileCitation) -> Unit)? = null) {
+internal fun DiffCard(id: String, body: String, source: DiffRenderSource, onOpenFile: ((FileCitation) -> Unit)? = null, onComment: ((DiffIndexEntry) -> Unit)? = null) {
     val index by produceState(source.cachedIndex(body), body) { value = source.index(body) }
     val diffBody = remember(body) { DiffBody(body) }
     var wrap by rememberSaveable("$id:wrap") { mutableStateOf(false) }
@@ -89,7 +90,7 @@ internal fun DiffCard(id: String, body: String, source: DiffRenderSource, onOpen
         if (files != null) {
             files.take(fileLimit).forEachIndexed { i, entry ->
                 if (i > 0) HorizontalDivider(color = colors.outlineVariant.copy(alpha = 0.5f))
-                DiffFileSection("$id:$i", entry, diffBody, source, wrap, defaultExpanded = files.size == 1, onOpenFile)
+                DiffFileSection("$id:$i", entry, diffBody, source, wrap, defaultExpanded = files.size == 1, onOpenFile, onComment)
             }
             if (files.size > fileLimit) {
                 val more = files.size - fileLimit
@@ -108,12 +109,12 @@ private fun DiffCounts(added: ULong, removed: ULong) {
         withStyle(SpanStyle(color = palette.addSign)) { append("+$added") }
         append(' ')
         withStyle(SpanStyle(color = palette.deleteSign)) { append("−$removed") }
-    }, style = MaterialTheme.typography.labelMedium.copy(fontFamily = FontFamily.Monospace))
+    }, style = MaterialTheme.typography.labelMedium.copy(fontFamily = VerdeMono))
 }
 
 @Composable
 private fun DiffFileSection(key: String, entry: DiffIndexEntry, body: DiffBody, source: DiffRenderSource, wrap: Boolean, defaultExpanded: Boolean,
-                            onOpenFile: ((FileCitation) -> Unit)?) {
+                            onOpenFile: ((FileCitation) -> Unit)?, onComment: ((DiffIndexEntry) -> Unit)?) {
     var expanded by rememberSaveable("$key:open") { mutableStateOf(defaultExpanded) }
     val colors = MaterialTheme.colorScheme
     Column(Modifier.fillMaxWidth()) {
@@ -121,17 +122,17 @@ private fun DiffFileSection(key: String, entry: DiffIndexEntry, body: DiffBody, 
             .padding(horizontal = 12.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Text(if (expanded) "▾" else "▸", color = colors.onSurfaceVariant)
-            Text(entry.path, Modifier.weight(1f), style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+            Text(entry.path, Modifier.weight(1f), style = MaterialTheme.typography.bodySmall.copy(fontFamily = VerdeMono),
                 maxLines = 1, overflow = TextOverflow.StartEllipsis)
             DiffCounts(entry.additions, entry.deletions)
         }
-        if (expanded) DiffFileBody(key, entry, body, source, wrap, onOpenFile)
+        if (expanded) DiffFileBody(key, entry, body, source, wrap, onOpenFile, onComment)
     }
 }
 
 @Composable
 private fun DiffFileBody(key: String, entry: DiffIndexEntry, body: DiffBody, source: DiffRenderSource, wrap: Boolean,
-                         onOpenFile: ((FileCitation) -> Unit)?) {
+                         onOpenFile: ((FileCitation) -> Unit)?, onComment: ((DiffIndexEntry) -> Unit)?) {
     @Suppress("DEPRECATION") val clipboard = LocalClipboardManager.current
     val record by produceState<DiffRecord?>(null, entry, body) { value = withContext(Dispatchers.Default) { body.record(entry) } }
     val render by produceState<DiffFileRender?>(null, record) {
@@ -143,6 +144,7 @@ private fun DiffFileBody(key: String, entry: DiffIndexEntry, body: DiffBody, sou
     val colors = MaterialTheme.colorScheme
     val patch = record?.patch
     Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp), horizontalArrangement = Arrangement.spacedBy(0.dp)) {
+        if (onComment != null) TextButton(onClick = { onComment(entry) }) { Text("Comment") }
         TextButton(onClick = { clipboard.setText(AnnotatedString(entry.path)) }) { Text("Copy path") }
         val copyable = patch != null && patch.length <= DIFF_MAX_COPY_CHARS
         TextButton(onClick = { if (patch != null) clipboard.setText(AnnotatedString(patch)) }, enabled = copyable) {
@@ -185,7 +187,7 @@ private fun DiffSourceText(patch: String, budget: Int, onMore: () -> Unit) {
     DiffNote("Too large or unusual to render as a diff here; showing the patch text.")
     val (shown, truncated) = remember(patch, budget) { leadingLines(patch, budget) }
     Text(shown, Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp).testTag(DIFF_LINES),
-        style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace), softWrap = false)
+        style = MaterialTheme.typography.bodySmall.copy(fontFamily = VerdeMono), softWrap = false)
     if (truncated) TextButton(onClick = onMore, Modifier.padding(horizontal = 4.dp)) { Text("Show more lines") }
 }
 
@@ -204,7 +206,7 @@ private fun DiffHunks(key: String, model: DiffFileModel, wrap: Boolean, budget: 
                 collapsed = if (isCollapsed) collapsed - i else collapsed + i
             }.padding(start = 12.dp), verticalAlignment = Alignment.CenterVertically) {
             Text(if (isCollapsed) "▸" else "▾", color = colors.onSurfaceVariant)
-            Text(hunk.header, Modifier.weight(1f).padding(start = 6.dp), style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+            Text(hunk.header, Modifier.weight(1f).padding(start = 6.dp), style = MaterialTheme.typography.labelSmall.copy(fontFamily = VerdeMono),
                 color = colors.onSecondaryContainer, maxLines = 1, overflow = TextOverflow.Ellipsis)
             TextButton(onClick = { clipboard.setText(AnnotatedString(hunkPatch(hunk))) }) { Text("Copy hunk") }
         }
@@ -228,9 +230,9 @@ internal data class DiffPalette(
 internal fun diffPalette(): DiffPalette {
     val c = MaterialTheme.colorScheme
     return remember(c) {
-        val add = Color(0xFF2E7D32)
-        val delete = Color(0xFFC62828)
-        DiffPalette(add.copy(alpha = 0.12f), delete.copy(alpha = 0.12f), add.copy(alpha = 0.34f), delete.copy(alpha = 0.34f),
+        val add = VerdeColors.DiffAdd
+        val delete = VerdeColors.Danger
+        DiffPalette(add.copy(alpha = 0.08f), delete.copy(alpha = 0.10f), add.copy(alpha = 0.26f), delete.copy(alpha = 0.32f),
             add, delete, c.outline, c.onSurfaceVariant)
     }
 }
@@ -260,7 +262,7 @@ internal fun diffChunk(rows: List<DiffRow>, width: Int, palette: DiffPalette, sy
 }
 
 @Composable
-private fun diffTextStyle() = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace)
+private fun diffTextStyle() = MaterialTheme.typography.bodySmall.copy(fontFamily = VerdeMono)
 
 /** Chunked rows of one hunk: scrolled horizontally together, or wrapped under a hanging gutter. */
 @Composable
@@ -328,7 +330,7 @@ private fun DiffFullScreen(path: String, model: DiffFileModel, initialWrap: Bool
     Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
         Surface(Modifier.fillMaxSize().testTag(DIFF_FULL_SCREEN)) {
             Column {
-                TopAppBar(
+                VerdeTopBar(showWorkspaceMenu = false,
                     title = { Text(path, maxLines = 1, overflow = TextOverflow.StartEllipsis, style = MaterialTheme.typography.titleSmall) },
                     navigationIcon = { IconButton(onClick = onClose) { Icon(Icons.Filled.Close, contentDescription = "Close diff") } },
                     actions = {
@@ -353,7 +355,7 @@ private fun DiffFullScreen(path: String, model: DiffFileModel, initialWrap: Bool
                             when (item) {
                                 is DiffScreenItem.Header -> Text(model.hunks[item.hunk].header,
                                     Modifier.fillMaxWidth().background(colors.secondaryContainer.copy(alpha = 0.45f)).padding(horizontal = 8.dp, vertical = 4.dp),
-                                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace), color = colors.onSecondaryContainer)
+                                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = VerdeMono), color = colors.onSecondaryContainer)
                                 is DiffScreenItem.Line -> {
                                     val row = model.hunks[item.hunk].rows[item.row]
                                     val chunk = remember(row, palette, syntax) { diffChunk(listOf(row), model.numberWidth, palette, syntax) }

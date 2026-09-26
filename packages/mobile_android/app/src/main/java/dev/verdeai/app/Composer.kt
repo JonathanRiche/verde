@@ -7,8 +7,18 @@ import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.ui.res.painterResource
+import androidx.compose.foundation.focusGroup
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -30,7 +40,6 @@ import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.style.TextOverflow
@@ -80,7 +89,7 @@ internal fun sendLabel(text: String, running: Boolean, kind: EventFollowupSubmit
 private fun attachmentSize(bytes: Long) = if (bytes < 1024 * 1024) "${(bytes + 1023) / 1024} KB" else "%.1f MB".format(bytes / (1024.0 * 1024.0))
 
 /** D-08: the chat composer in the transcript's bottom bar. */
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 internal fun ChatComposer(model: TranscriptModel, state: TranscriptState) {
     val composer = model.composer
@@ -116,6 +125,8 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState) {
         if (granted) startCamera() else composer.showNotice("Camera access is off. Allow it in Settings to take photos.")
     }
 
+    val fieldFocus = remember { FocusRequester() }
+    LaunchedEffect(composer.focusRequest) { if (composer.focusRequest > 0) fieldFocus.requestFocus() }
     var picker by remember { mutableStateOf<ComposerPicker?>(null) }
     val running = state.turn != null
     val provider = view?.selection?.provider ?: state.thread?.thread?.provider
@@ -132,7 +143,12 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState) {
         else -> view.can_send
     }
 
-    Surface(tonalElevation = 3.dp, modifier = Modifier.fillMaxWidth().imePadding().testTag(COMPOSER)) {
+    var composerFocused by remember { mutableStateOf(false) }
+    Surface(color = VerdeColors.Panel, shape = RoundedCornerShape(14.dp),
+        border = BorderStroke(if (composerFocused) 1.5.dp else 1.dp,
+            if (composerFocused) VerdeColors.Accent else VerdeColors.PanelMuted),
+        modifier = Modifier.fillMaxWidth().imePadding().padding(horizontal = 8.dp, vertical = 6.dp).testTag(COMPOSER)
+            .onFocusChanged { composerFocused = it.hasFocus }.focusGroup()) {
         Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             view?.followup?.let { FollowupCard(it, composer, kind) }
             val notice = composer.notice ?: composerError(view?.error)
@@ -142,7 +158,29 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState) {
             }
             Suggestions(composer, view)
             if (attachments.isNotEmpty()) Attachments(attachments, sendPending || composer.busy, composer)
-            Row(verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            BasicTextField(
+                value = composer.field,
+                onValueChange = { if (!sendPending) composer.edit(it) },
+                modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp).focusRequester(fieldFocus).testTag(COMPOSER_FIELD),
+                readOnly = sendPending,
+                decorationBox = { innerTextField ->
+                    Box(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+                        if (text.isEmpty()) Text(when {
+                            view == null -> "Loading…"
+                            !ready -> "Offline. Your draft is kept."
+                            running -> followupHint(null, kind)
+                            else -> "Message"
+                        }, color = VerdeColors.Subtle, style = MaterialTheme.typography.bodyLarge,
+                            maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        innerTextField()
+                    }
+                },
+                cursorBrush = SolidColor(VerdeColors.Accent),
+                textStyle = MaterialTheme.typography.bodyLarge.copy(color = VerdeColors.Text),
+                maxLines = 6,
+                keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
+            )
+            FlowRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 AttachButton(enabled = view != null && !sendPending && !composer.busy,
                     onPhotos = { photos.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) },
                     onCamera = {
@@ -150,33 +188,21 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState) {
                         else permission.launch(Manifest.permission.CAMERA)
                     },
                     onFiles = { files.launch(arrayOf("image/*")) })
-                OutlinedTextField(
-                    value = composer.field,
-                    onValueChange = { if (!sendPending) composer.edit(it) },
-                    modifier = Modifier.weight(1f).testTag(COMPOSER_FIELD),
-                    readOnly = sendPending,
-                    placeholder = {
-                        Text(when {
-                            view == null -> "Loading…"
-                            !ready -> "Offline. Your draft is kept."
-                            running -> followupHint(null, kind)
-                            else -> "Message"
-                        }, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    },
-                    maxLines = 6,
-                    keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
-                )
+                IconButton(onClick = composer::openSlashCommands,
+                    enabled = ready && !sendPending && !composer.busy && (text.isBlank() || composer.slash != null),
+                    modifier = Modifier.semantics { contentDescription = "Slash commands" }) {
+                    Text("/", style = MaterialTheme.typography.titleMedium, color = VerdeColors.Muted)
+                }
+                if (view != null) SettingsControls(view, state, provider) { picker = it }
                 if (running) {
-                    OutlinedButton(onClick = model::stop, enabled = state.canStop, modifier = Modifier.testTag(COMPOSER_STOP),
-                        colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)) {
-                        Text(if (state.stopping) "Stopping…" else "Stop")
-                    }
+                    StopControl(state.stopping, state.canStop, model::stop, Modifier.testTag(COMPOSER_STOP))
                 }
-                Button(onClick = composer::submit, enabled = canSubmit, modifier = Modifier.testTag(COMPOSER_SEND)) {
-                    Text(if (sendPending || composer.busy) "Sending…" else sendLabel(text, running, kind))
-                }
+                SendControl(label = if (sendPending || composer.busy) "Sending…" else sendLabel(text, running, kind),
+                    enabled = canSubmit, onClick = composer::submit, modifier = Modifier.testTag(COMPOSER_SEND))
             }
-            if (view != null) SettingsRow(view, state, provider) { picker = it }
+            if (running && view?.followup == null) Text(followupHint(null, kind),
+                color = VerdeColors.Subtle, style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.testTag("composer-action-hint"))
         }
     }
 
@@ -192,7 +218,7 @@ private fun AttachButton(enabled: Boolean, onPhotos: () -> Unit, onCamera: () ->
     var menu by remember { mutableStateOf(false) }
     Box {
         IconButton(onClick = { menu = true }, enabled = enabled, modifier = Modifier.testTag(COMPOSER_ATTACH)) {
-            Icon(Icons.Filled.Add, contentDescription = "Attach image")
+            Icon(painterResource(R.drawable.composer_attach), contentDescription = "Attach image", modifier = Modifier.size(18.dp))
         }
         DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
             DropdownMenuItem(text = { Text("Photos") }, onClick = { menu = false; onPhotos() })
@@ -241,10 +267,21 @@ private fun Suggestions(composer: ComposerModel, view: ChatComposerView?) {
             val prefix = "/" + slash.query
             view.catalogs.slash.map { it to if (it.label.startsWith("/")) it.label else "/" + it.label }
                 .filter { (c, name) -> c.enabled && name.startsWith(prefix, ignoreCase = true) }
-                .take(8).map { (_, name) -> name to { composer.acceptSlash(name) } }
+                .map { (_, name) -> name to { composer.acceptSlash(name) } }
         }
         mention != null -> view.mentions.take(8).map { m -> m.path to { composer.acceptMention(m.path) } }
         else -> emptyList()
+    }
+    if (slash != null) {
+        Column(Modifier.fillMaxWidth().heightIn(max = 168.dp).verticalScroll(rememberScrollState()).testTag(COMPOSER_SUGGESTIONS)) {
+            VerdeSection("Commands")
+            if (rows.isEmpty()) Text(if (composer.slashLoading) "Loading commands…" else "No matching commands for this provider.",
+                color = VerdeColors.Subtle, style = MaterialTheme.typography.bodySmall)
+            for ((label, accept) in rows) TextButton(onClick = accept, modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp)) {
+                Text(label, modifier = Modifier.fillMaxWidth(), color = VerdeColors.Text)
+            }
+        }
+        return
     }
     if (rows.isEmpty()) return
     Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).testTag(COMPOSER_SUGGESTIONS), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -261,6 +298,7 @@ private fun Attachments(items: List<ChatAttachment>, locked: Boolean, composer: 
             val size = a.byte_size.toLongOrNull() ?: 0L
             val uploaded = a.uploaded_bytes.toLongOrNull() ?: 0L
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                composer.imagePreviews[a.local_id]?.let { DraftImagePreview(it, a.name) }
                 Column(Modifier.weight(1f)) {
                     Text("${a.name} · ${attachmentSize(size)}", maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall)
                     if (a.status == "uploading" || (locked && uploaded in 1 until size)) {
@@ -278,24 +316,26 @@ private fun Attachments(items: List<ChatAttachment>, locked: Boolean, composer: 
 private fun label(choices: List<ChatChoice>, id: String?) = choices.find { it.id == (id ?: "") }?.label ?: choices.firstOrNull()?.label
 
 @Composable
-private fun SettingsRow(view: ChatComposerView, state: TranscriptState, provider: String?, open: (ComposerPicker) -> Unit) {
+private fun SettingsControls(view: ChatComposerView, state: TranscriptState, provider: String?, open: (ComposerPicker) -> Unit) {
     val c = view.catalogs
     val s = view.selection
     // Like the desktop, the provider is fixed once a conversation has started.
     val fresh = state.thread?.rows?.isEmpty() == true && state.turn == null
-    Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+
         val providerLabel = PROVIDERS.find { it.first == provider }?.second ?: provider ?: "Provider"
         if (fresh) SettingChip("Provider", providerLabel) { open(ComposerPicker.Provider) }
-        SettingChip("Model", label(c.models, s.model ?: c.models.firstOrNull()?.id) ?: "Model") { open(ComposerPicker.Model) }
+        SettingChip("Model", label(c.models, s.model ?: c.models.firstOrNull()?.id) ?: "Model", provider) { open(ComposerPicker.Model) }
         if (c.efforts.isNotEmpty()) SettingChip("Effort", label(c.efforts, s.effort) ?: "Default") { open(ComposerPicker.Effort) }
         if (c.access.isNotEmpty()) SettingChip("Access", label(c.access, s.access) ?: "Access") { open(ComposerPicker.Access) }
         if (c.speeds.size > 1) SettingChip("Speed", label(c.speeds, s.speed) ?: "Speed") { open(ComposerPicker.Speed) }
-    }
 }
 
 @Composable
-private fun SettingChip(name: String, value: String, onClick: () -> Unit) {
-    AssistChip(onClick = onClick, label = { Text(value, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+private fun SettingChip(name: String, value: String, provider: String? = null, onClick: () -> Unit) {
+    AssistChip(onClick = onClick, leadingIcon = provider?.let { { ProviderGlyph(it, Modifier.size(14.dp)) } }, label = { Text(value, style = MaterialTheme.typography.labelMedium,
+        maxLines = 1, overflow = TextOverflow.Ellipsis) },
+        shape = RoundedCornerShape(14.dp), border = null,
+        colors = AssistChipDefaults.assistChipColors(containerColor = VerdeColors.PanelAlt, labelColor = VerdeColors.Muted),
         modifier = Modifier.semantics { contentDescription = "$name: $value. Change" })
 }
 
@@ -317,10 +357,10 @@ private fun PickerSheet(kind: ComposerPicker, view: ChatComposerView, provider: 
         LazyColumn(Modifier.fillMaxWidth().padding(bottom = 16.dp)) {
             items(choices, key = { it.id }) { choice ->
                 val selected = choice.id == current
-                ListItem(
+                VerdeListRow(
                     headlineContent = { Text(choice.label) },
                     supportingContent = if (!choice.enabled) ({ Text(choice.reason ?: "Unavailable") }) else null,
-                    leadingContent = if (choice.favorite) ({ Icon(Icons.Filled.Star, contentDescription = "Favourite") }) else null,
+                    leadingContent = if (kind == ComposerPicker.Provider) ({ ProviderGlyph(choice.id) }) else if (choice.favorite) ({ Icon(Icons.Filled.Star, contentDescription = "Favourite") }) else null,
                     trailingContent = if (selected) ({ Icon(Icons.Filled.Check, contentDescription = "Selected") }) else null,
                     modifier = Modifier.fillMaxWidth().clickable(enabled = choice.enabled && !selected) { onPick(choice.id) },
                 )
@@ -336,7 +376,7 @@ private fun ShellSheet(confirmation: ChatShellConfirmation, composer: ComposerMo
         Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp).padding(bottom = 24.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("Run this command on the host?", style = MaterialTheme.typography.titleMedium)
             Surface(color = MaterialTheme.colorScheme.surfaceVariant, shape = MaterialTheme.shapes.small) {
-                Text(confirmation.command, fontFamily = FontFamily.Monospace, modifier = Modifier.fillMaxWidth().padding(10.dp))
+                Text(confirmation.command, fontFamily = VerdeMono, modifier = Modifier.fillMaxWidth().padding(10.dp))
             }
             if (confirmation.cwd.isNotEmpty()) Text("In ${confirmation.cwd}", style = MaterialTheme.typography.bodySmall)
             Text("It runs in a terminal with your desktop's permissions.", style = MaterialTheme.typography.bodySmall)

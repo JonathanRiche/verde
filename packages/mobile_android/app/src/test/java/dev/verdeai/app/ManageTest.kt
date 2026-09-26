@@ -43,8 +43,11 @@ class ManageTest {
     private fun awaitText(text: String, substring: Boolean = false) = await { exists(text, substring) }
     private fun click(text: String) = compose.onNode(hasText(text) and hasClickAction()).performClick()
     private fun list() = compose.onNodeWithTag(MANAGE_LIST)
-    private fun tab(label: String) = compose.onNode(hasText(label) and hasClickAction() and hasAnyAncestor(hasTestTag(MANAGE_LIST)).not()
+    private fun tab(label: String) {
+        compose.onNodeWithContentDescription("Open workspace drawer").performClick()
+        compose.onNode(hasText(label) and hasClickAction() and hasAnyAncestor(hasTestTag(MANAGE_LIST)).not()
         and hasAnyAncestor(hasTestTag(BROWSE_LIST)).not()).performClick()
+    }
     private inline fun <reified T : Event> sent() = core.events.filterIsInstance<T>()
 
     private fun launch() {
@@ -73,16 +76,44 @@ class ManageTest {
         FocusClaim.owner=null
     }
 
+    @Test fun drawerRenameAndCloseConfirmExactlyOneIntent() {
+        setup={ it.contextThread=true }
+        launch()
+        compose.onNodeWithContentDescription("Open workspace drawer").performClick()
+        compose.onNode(hasText("Alpha plan") and hasAnyAncestor(hasTestTag("workspace-drawer"))).performTouchInput { longClick() }
+        click("Rename chat")
+        compose.onNodeWithTag("thread-rename-title").performTextReplacement("Renamed on phone")
+        click("Rename chat")
+        await { sent<EventThreadRename>().size == 1 }
+        val rename=sent<EventThreadRename>().single()
+        assertEquals("ws-one", rename.workspace_id)
+        assertEquals("t1", rename.thread_id)
+        assertEquals("Renamed on phone", rename.title)
+        await { !exists("Chat title") }
+        compose.onNodeWithContentDescription("Open workspace drawer").performClick()
+        compose.onNode(hasText("Alpha plan") and hasAnyAncestor(hasTestTag("workspace-drawer"))).performTouchInput { longClick() }
+        click("Close chat")
+        assertTrue(sent<EventThreadClose>().isEmpty())
+        click("Cancel")
+        assertTrue(sent<EventThreadClose>().isEmpty())
+        compose.onNodeWithContentDescription("Open workspace drawer").performClick()
+        compose.onNode(hasText("Alpha plan") and hasAnyAncestor(hasTestTag("workspace-drawer"))).performTouchInput { longClick() }
+        click("Close chat")
+        click("Close chat")
+        await { sent<EventThreadClose>().size == 1 }
+        assertEquals("t1", sent<EventThreadClose>().single().thread_id)
+    }
+
     @Test fun historyGroupsPagesSearchesFiltersAndResetsOnLeave() {
         launch()
         awaitText("All chats")
         click("All chats")
         await { compose.onAllNodesWithTag(HISTORY_SEARCH).fetchSemanticsNodes().isNotEmpty() }
         awaitText("Alpha plan")
-        compose.onNodeWithText("Today").assertExists()
+        compose.onNodeWithText("TODAY").assertExists()
         // Reaching the end loads exactly one more page per cursor.
         list().performScrollToNode(hasText("Gamma notes"))
-        compose.onNodeWithText("Older").assertExists()
+        compose.onNodeWithText("OLDER").assertExists()
         assertEquals(1, sent<EventHistoryLoadMore>().size)
         compose.onNodeWithText("Load more").assertDoesNotExist()
         // Subagent threads are never listed.
@@ -132,7 +163,7 @@ class ManageTest {
         await { sent<EventFocus>().any { it.workspace_id == "ws-one" && it.thread_id == "web-thread-1" } }
         // Back skips the finished form.
         compose.onNodeWithContentDescription("Back").performClick()
-        awaitText("Recent chats")
+        awaitText("RECENT CHATS")
     }
 
     @Test fun newChatShowsCreateFailures() {
@@ -171,7 +202,7 @@ class ManageTest {
         awaitText("/home/u/src/verde")
         compose.onNodeWithText("Verde app").assertExists()
         compose.onNodeWithContentDescription("Back").performClick()
-        awaitText("Closed")
+        awaitText("CLOSED")
     }
 
     @Test fun unsupportedDaemonStillAcceptsATypedPath() {
@@ -257,6 +288,7 @@ class ManageTest {
         @Volatile var busy: ManageBusy?=null
         @Volatile var createFailure: String?=null
         @Volatile var directorySupported=true
+        @Volatile var contextThread=false
         private var row=HostView(saved.id,saved.label,null,null,null,"idle",Lifecycle.background,"paired","empty",
             emptyList(),listOf("chat:read","chat:write","repository:read","repository:write"),null,null,false,null)
         private var network=true
@@ -312,6 +344,9 @@ class ManageTest {
                 is EventThreadCreate -> if (createFailure != null) job("thread_create", decoded.intent_id, decoded.workspace_id, code=createFailure,
                     message="That model setting is not available.")
                     else job("thread_create", decoded.intent_id, decoded.workspace_id, "web-thread-${++threads}")
+                is EventThreadRename -> job("thread_rename", decoded.intent_id, decoded.workspace_id, decoded.thread_id)
+                is EventThreadClose -> job("thread_close", decoded.intent_id, decoded.workspace_id, decoded.thread_id)
+                is EventThreadSync -> job("thread_sync", decoded.intent_id, decoded.workspace_id, decoded.thread_id)
                 is EventWorkspaceCreate -> {
                     val id="ws-new"
                     workspaces+=Workspace(id, decoded.label ?: decoded.path.substringAfterLast('/'), decoded.path, true, emptyList(), emptyList())
@@ -347,7 +382,8 @@ class ManageTest {
             "hosts" -> CoreJson.encodeToString(HostsQuery(1,"1",HostsView(listOf(row),emptyList()),null))
             "home" -> CoreJson.encodeToString(HomeQuery(1,"1",HomeView(emptyList(),false,false,emptyList(),null),null))
             "workspaces" -> CoreJson.encodeToString(WorkspacesQuery(1,"1",WorkspacesView(workspaces.map { ws ->
-                ws.copy(threads=allHistory.filter { it.workspace_id == ws.workspace_id }) }, false, false, null, history()),null))
+                ws.copy(threads=allHistory.filter { it.workspace_id == ws.workspace_id },
+                    panes=if (contextThread && ws.workspace_id == "ws-one") listOf(Pane("p1", "ws-one", "chat", "Alpha plan", thread_id="t1")) else ws.panes) }, false, false, null, history()),null))
             "manage" -> {
                 val ready=row.phase == "ready"
                 CoreJson.encodeToString(ManageQuery(1,"1",ManageView(jobs.toList(), directory.copy(supported=directorySupported,

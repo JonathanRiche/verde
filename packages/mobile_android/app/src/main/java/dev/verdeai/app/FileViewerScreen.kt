@@ -24,7 +24,6 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.AnnotatedString
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -107,7 +106,7 @@ internal fun FileViewerScreen(
 private fun FileScaffold(title: String, subtitle: String?, onBack: () -> Unit,
                          actions: @Composable RowScope.() -> Unit = {}, body: @Composable () -> Unit) {
     Column(Modifier.fillMaxSize()) {
-        TopAppBar(
+        VerdeTopBar(
             title = {
                 Column {
                     Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -164,7 +163,7 @@ private fun TextFile(content: FileContent.Text, target: LineTarget?) {
     val gutter = remember(count) { count.toString().length }
     // Open with a little context above the cited line.
     val state = rememberLazyListState(initialFirstVisibleItemIndex = target?.let { (it.line - 4).coerceIn(0, count - 1) } ?: 0)
-    val mono = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace)
+    val mono = MaterialTheme.typography.bodySmall.copy(fontFamily = VerdeMono)
     val highlight = MaterialTheme.colorScheme.tertiaryContainer
     LazyColumn(Modifier.fillMaxSize(), state = state) {
         items(count, key = { it }) { index ->

@@ -1,0 +1,6 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="16dp" android:height="16dp"
+    android:viewportWidth="24" android:viewportHeight="24">
+    <!-- Same arrow path as the web ChatPane composer. -->
+    <path android:fillColor="#06210f" android:pathData="M12,6l-6,7h4v5h4v-5h4z" />
+</vector>

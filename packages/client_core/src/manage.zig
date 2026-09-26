@@ -58,7 +58,7 @@ pub const View = struct {
     can_create_threads: bool,
 };
 
-const Step = enum { register, snapshot, workspace_upsert, thread_upsert, close, done };
+const Step = enum { register, snapshot, workspace_upsert, thread_upsert, thread_get, thread_mutate, close, done };
 const Task = struct {
     job: Job,
     step: Step = .register,
@@ -68,6 +68,7 @@ const Task = struct {
     label: ?[]const u8 = null,
     archived: ?bool = null,
     thread: ?store.Thread = null,
+    revision: ?u64 = null,
 };
 pub const State = struct {
     tasks: []Task = &.{},
@@ -83,7 +84,7 @@ pub const State = struct {
 
 const MAX_TASKS = 16;
 const MAX_LABEL = 256;
-const tags = [_][]const u8{ "thread_create", "new_chat_select", "workspace_create", "workspace_rename", "workspace_archive", "workspace_close", "directory_list" };
+const tags = [_][]const u8{ "thread_rename", "thread_close", "thread_sync", "thread_create", "new_chat_select", "workspace_create", "workspace_rename", "workspace_archive", "workspace_close", "directory_list" };
 const providers = [_][2][]const u8{ .{ "codex", "Codex" }, .{ "claude", "Claude" }, .{ "opencode", "OpenCode" }, .{ "cursor", "Cursor" }, .{ "pi", "Pi" }, .{ "fx", "FX" }, .{ "grok", "Grok" }, .{ "muse", "Muse" } };
 
 pub fn owns(tag: []const u8) bool {
@@ -93,7 +94,10 @@ pub fn owns(tag: []const u8) bool {
 
 const Selected = struct { provider: ?[]const u8 = null, model: ?[]const u8 = null, effort: ?[]const u8 = null, access: ?[]const u8 = null, speed: ?[]const u8 = null };
 pub fn validate(a: A, tag: []const u8, event: V) E!void {
-    if (eq(tag, "thread_create")) {
+    if (eq(tag, "thread_rename") or eq(tag, "thread_close") or eq(tag, "thread_sync")) {
+        _ = try h.decode(struct { workspace_id: []const u8, thread_id: []const u8 }, a, event);
+        if (eq(tag, "thread_rename")) _ = try h.decode(struct { title: []const u8 }, a, event);
+    } else if (eq(tag, "thread_create")) {
         _ = try h.decode(struct { workspace_id: []const u8, provider: []const u8 }, a, event);
         _ = try h.decode(Selected, a, event);
     } else if (eq(tag, "new_chat_select")) {
@@ -113,6 +117,8 @@ pub fn validate(a: A, tag: []const u8, event: V) E!void {
 }
 
 pub fn receiptFields(context: []const u8) ?[]const u8 {
+    if (eq(context, "thread_rename")) return "workspace_id thread_id title";
+    if (eq(context, "thread_close") or eq(context, "thread_sync")) return "workspace_id thread_id";
     if (eq(context, "thread_create")) return "workspace_id provider model effort access speed";
     if (eq(context, "new_chat_select")) return "workspace_id provider model effort access speed";
     if (eq(context, "workspace_create")) return "path label";
@@ -235,13 +241,29 @@ pub fn intent(tx: *h.Transaction, tag: []const u8, event: V) E!bool {
     }
     const ws_id = p.s(event, "workspace_id");
     var job: Job = .{ .intent_id = id, .kind = tag, .workspace_id = if (ws_id.len > 0) ws_id else null };
-    const write_scope = if (eq(tag, "thread_create")) "chat:write" else "repository:write";
+    const write_scope = if (std.mem.startsWith(u8, tag, "thread_")) "chat:write" else "repository:write";
     if (!online(tx)) {
         try fail(tx, job, "unavailable", "Connect to the host first.");
         return true;
     }
     if (!scoped(&tx.state, write_scope)) {
         try fail(tx, job, "insufficient_scope", "This device may not change workspaces.");
+        return true;
+    }
+    if (eq(tag, "thread_rename") or eq(tag, "thread_close") or eq(tag, "thread_sync")) {
+        job.thread_id = p.s(event, "thread_id");
+        if (ws_id.len == 0 or job.thread_id.?.len == 0) {
+            try fail(tx, job, "not_found", "Chat not found.");
+            return true;
+        }
+        const label = if (eq(tag, "thread_rename")) cleanLabel(p.s(event, "title")) else null;
+        if (eq(tag, "thread_rename") and label == null) {
+            try fail(tx, job, "invalid_title", "Use a chat title between 1 and 256 bytes, without line breaks.");
+            return true;
+        }
+        const i = try begin(tx, job);
+        tx.state.manage.tasks[i].label = label;
+        try advance(tx, i);
         return true;
     }
     if (eq(tag, "thread_create")) {
@@ -427,6 +449,23 @@ fn advance(tx: *h.Transaction, i: usize) E!void {
         .register => t.rpc_id = try rpc.request(tx, "daemon.client.register", .{ .persistent = false }, .{ .intent_id = "@manage" }),
         .snapshot => t.rpc_id = try rpc.request(tx, "core.snapshot", .{ .workspace_id = t.job.workspace_id.?, .scopes = [_][]const u8{"workspaces"} }, .{ .mutation = false, .legacy_snapshot = true, .intent_id = "@manage" }),
         .workspace_upsert => t.rpc_id = try rpc.request(tx, "workspace.upsert", .{ .mutation = .{ .request_key = try requestKey(tx, t), .client_id = tx.state.chat.client_id.? }, .workspace = .{ .workspace_id = t.job.workspace_id.?, .label = t.label orelse std.fs.path.basenamePosix(t.path), .path = t.path } }, .{ .intent_id = "@manage" }),
+        .thread_get => t.rpc_id = try rpc.request(tx, "chat.thread.get", .{ .workspace_id = t.job.workspace_id.?, .local_thread_id = t.job.thread_id.? }, .{ .mutation = false, .intent_id = "@manage" }),
+        .thread_mutate => {
+            const mutation = .{ .client_id = tx.state.chat.client_id.?, .request_key = try requestKey(tx, t), .expected_store_revision = t.revision };
+            if (eq(t.job.kind, "thread_rename")) {
+                t.rpc_id = try rpc.request(tx, "chat.thread.upsert", .{ .workspace_id = t.job.workspace_id.?, .thread = t.thread.?, .mutation = mutation }, .{ .intent_id = "@manage" });
+            } else if (eq(t.job.kind, "thread_close")) {
+                t.rpc_id = try rpc.request(tx, "chat.thread.close", .{ .workspace_id = t.job.workspace_id.?, .local_thread_id = t.job.thread_id.?, .mutation = mutation }, .{ .intent_id = "@manage" });
+            } else {
+                const thread = t.thread.?;
+                if (thread.provider_thread_id == null or (thread.profile_id != null and !eq(thread.profile_id.?, "local"))) return finish(tx, i, failure("unsupported", "Sync requires a saved provider thread on this host."));
+                const projected = try p.project(tx.allocator(), tx.state.sync.snapshot, tx.state.sync.catalog, tx.state.sync.has_catalog, tx.state.wall_time_ms);
+                for (projected.active) |item| if ((item.can_stop or eq(item.status, "waiting_approval")) and item.thread_id != null and eq(item.thread_id.?, t.job.thread_id.?) and eq(item.workspace_id, t.job.workspace_id.?)) {
+                    return finish(tx, i, failure("thread_busy", "Wait for this chat to finish before syncing."));
+                };
+                t.rpc_id = try rpc.request(tx, "provider.thread.sync", .{ .workspace_id = t.job.workspace_id.?, .local_thread_id = t.job.thread_id.?, .provider_thread_id = thread.provider_thread_id.? }, .{ .intent_id = "@manage" });
+            }
+        },
         .thread_upsert => t.rpc_id = try rpc.request(tx, "chat.thread.upsert", .{ .workspace_id = t.job.workspace_id.?, .thread = t.thread.?, .mutation = .{ .client_id = tx.state.chat.client_id.?, .request_key = try requestKey(tx, t) } }, .{ .intent_id = "@manage" }),
         .close => t.rpc_id = try rpc.request(tx, "workspace.close", .{ .workspace_id = t.job.workspace_id.? }, .{ .intent_id = "@manage" }),
         .done => {},
@@ -434,6 +473,7 @@ fn advance(tx: *h.Transaction, i: usize) E!void {
 }
 fn firstStep(t: *const Task) Step {
     if (eq(t.job.kind, "thread_create")) return .thread_upsert;
+    if (std.mem.startsWith(u8, t.job.kind, "thread_")) return .thread_get;
     // Rename, archive and reopen rewrite the full metadata read at a revision.
     if (t.archived != null or eq(t.job.kind, "workspace_rename")) return .snapshot;
     return .workspace_upsert;
@@ -520,6 +560,11 @@ fn step(tx: *h.Transaction, i: usize, result: rpc.Result) E!void {
             t.step = .snapshot;
             return advance(tx, i);
         }
+        if (t.step == .thread_mutate and eq(t.job.kind, "thread_rename") and eq(code, "conflict") and t.attempts < 2 and online(tx)) {
+            t.attempts += 1;
+            t.step = .thread_get;
+            return advance(tx, i);
+        }
         t.job.busy = result.busy;
         return finish(tx, i, typed(e));
     }
@@ -552,7 +597,16 @@ fn step(tx: *h.Transaction, i: usize, result: rpc.Result) E!void {
             t.step = .workspace_upsert;
             t.rpc_id = try rpc.request(tx, "workspace.upsert", .{ .mutation = .{ .request_key = try requestKey(tx, t), .client_id = tx.state.chat.client_id.?, .expected_store_revision = revision.? }, .workspace = V{ .object = metadata } }, .{ .intent_id = "@manage" });
         },
-        .workspace_upsert, .close => {
+        .thread_get => {
+            const read = std.json.parseFromValueLeaky(store.ThreadGetResult, tx.allocator(), v, .{ .ignore_unknown_fields = true }) catch return finish(tx, i, failure("invalid_thread", "The host returned an unreadable chat."));
+            if (!eq(read.thread.local_thread_id, t.job.thread_id.?)) return finish(tx, i, failure("invalid_thread", "The host returned a different chat."));
+            t.thread = read.thread;
+            t.revision = read.store_revision;
+            if (t.label) |title| t.thread.?.title = title;
+            t.step = .thread_mutate;
+            try advance(tx, i);
+        },
+        .thread_mutate, .workspace_upsert, .close => {
             finish(tx, i, null);
             try sync.refresh(tx);
         },
