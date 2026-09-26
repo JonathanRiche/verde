@@ -52,7 +52,7 @@ private struct Dot: View {
     let color: Color
     let label: String
     var body: some View {
-        Circle().fill(color).frame(width: 10, height: 10).accessibilityLabel(label)
+        Circle().fill(color).frame(width: 6, height: 6).modifier(Pulse(active: ["Working", "Running", "Waiting", "Active"].contains(label))).accessibilityLabel(label)
     }
 }
 
@@ -68,13 +68,14 @@ private struct RowContent: View {
     let title: String
     let detail: String?
     let dot: Dot
+    var provider: String?
     var badge: String?
     var body: some View {
         HStack(spacing: 12) {
-            dot
+            if let provider { ProviderGlyph(provider: provider) } else { dot }
             VStack(alignment: .leading, spacing: 2) {
                 Text(title).lineLimit(1)
-                if let detail { Text(detail).font(.subheadline).foregroundStyle(.secondary).lineLimit(2) }
+                if let detail { Text(detail) .font(VerdeTheme.ui(14)).foregroundStyle(.secondary).lineLimit(2) }
             }
             Spacer(minLength: 4)
             if let badge { AttentionBadge(text: badge) }
@@ -122,7 +123,7 @@ private struct ThreadItem: View {
                      thread.last_activity_at_ms.map { agoLabel($0, now) }].compactMap { $0 }
         MenuRow(content: RowContent(title: thread.title, detail: parts.isEmpty ? nil : parts.joined(separator: " · "),
                                     dot: Dot(color: statusColor(thread.status, attention: thread.status == "waiting_approval"),
-                                             label: statusLabel(thread.status))),
+                                             label: statusLabel(thread.status)), provider: thread.provider),
                 destination: .thread(workspace: thread.workspace_id, thread: thread.thread_id),
                 copies: [("Copy title", thread.title)])
     }
@@ -169,7 +170,7 @@ private struct BrowseFrame<Content: View>: View {
                     let status = hostStatus(row)
                     HStack(spacing: 8) {
                         Dot(color: hostDotColor(row), label: status)
-                        Text("\(row.saved.label) · \(status)").font(.subheadline)
+                        Text("\(row.saved.label) · \(status)") .font(VerdeTheme.ui(14))
                     }.listRowSeparator(.hidden)
                 }
                 if let banner = browseBanner(state, now) {
@@ -194,7 +195,11 @@ private struct BrowseFrame<Content: View>: View {
             .refreshable { await model.refresh() }
         }
         .navigationTitle(title)
-        .navigationBarTitleDisplayMode(large ? .large : .inline)
+        .toolbar { if title == "Home" { ToolbarItem(placement: .principal) { VerdeWordmark() } } }
+        .navigationBarTitleDisplayMode(.inline)
+        .listStyle(.plain)
+        .scrollContentBackground(.hidden)
+        .background(VerdeTheme.background)
     }
 }
 
@@ -290,7 +295,7 @@ struct WorkspaceScreen: View {
                     large: false) { _, now in
             if let workspace {
                 ManageContainer(browse: model) { manage in WorkspaceActions(workspace: workspace, manage: manage) }
-                if !workspace.path.isEmpty { Text(workspace.path).font(.footnote).foregroundStyle(.secondary) }
+                if !workspace.path.isEmpty { Text(workspace.path) .font(VerdeTheme.ui(13)).foregroundStyle(.secondary) }
                 Section("Panes") {
                     if workspace.panes.isEmpty { Text("No open panes.") }
                     ForEach(workspace.panes, id: \.id) { PaneItem(pane: $0, now: now) }
@@ -328,8 +333,8 @@ struct BrowseStack<Root: View>: View {
     @ViewBuilder let root: () -> Root
     var body: some View {
         NavigationStack(path: $path) {
-            root().navigationDestination(for: BrowseRoute.self) { route in
-                switch route {
+            root().modifier(VerdeNavigation()).navigationDestination(for: BrowseRoute.self) { route in
+                Group { switch route {
                 case .history: ManageContainer(browse: model) { manage in HistoryScreen(browse: model, manage: manage) }
                 case .newChat(let id): ManageContainer(browse: model) { manage in NewChatScreen(browse: model, manage: manage, initialWorkspace: id) }
                 case .addWorkspace: ManageContainer(browse: model) { manage in AddWorkspaceScreen(manage: manage) }
@@ -339,7 +344,7 @@ struct BrowseStack<Root: View>: View {
                 case .terminal(let workspace, let terminal):
                     TerminalScreen(browse: model, workspaceID: workspace, terminalID: terminal)
                 case .newTerminal(let workspace, _): TerminalScreen(browse: model, workspaceID: workspace, terminalID: nil)
-                }
+                } }.modifier(VerdeNavigation())
             }
         }
         .environment(\.openRoute, { route in path.append(route) })

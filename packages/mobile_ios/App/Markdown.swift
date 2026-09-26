@@ -119,7 +119,7 @@ private struct InlineStyle {
 private typealias SwiftUIKeys = AttributeScopes.SwiftUIAttributes
 private typealias FoundationKeys = AttributeScopes.FoundationAttributes
 
-let inlineCodeBackground = Color(uiColor: .tertiarySystemFill)
+let inlineCodeBackground = VerdeTheme.alternate
 
 private func inline(_ nodes: [MarkdownNode]) -> AttributedString {
     var out = AttributedString()
@@ -277,7 +277,7 @@ struct MarkdownText: View {
                 MarkdownBlocks(blocks: blocks, source: model).accessibilityIdentifier("markdown")
             } else {
                 // Pending (first frame) or unrenderable: the source text, never re-parsed in Swift.
-                Text(text).font(.body).textSelection(.enabled).accessibilityIdentifier("plain-text")
+                Text(text) .font(VerdeTheme.ui(15)).textSelection(.enabled).accessibilityIdentifier("plain-text")
             }
         }
         .task(id: text) { result = await model.markdown(text) }
@@ -302,23 +302,23 @@ private struct MdBlockView: View {
     var body: some View {
         switch block {
         case .paragraph(let text):
-            Text(text).font(.body).frame(maxWidth: .infinity, alignment: .leading)
+            Text(text) .font(VerdeTheme.ui(15)).frame(maxWidth: .infinity, alignment: .leading)
         case .heading(let level, let text):
-            Text(text).font(level == 1 ? .title2.bold() : level == 2 ? .title3.bold() : .headline)
+            Text(text).font(VerdeTheme.ui(level == 1 ? 24 : level == 2 ? 20 : 17, bold: true)).foregroundStyle(level == 1 ? Color(hex: 0xf5c84a) : level == 2 ? Color(hex: 0xf6d27a) : Color(hex: 0x99dcb3))
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .accessibilityAddTraits(.isHeader)
         case .bullets(let ordered, let items):
             VStack(alignment: .leading, spacing: 4) {
                 ForEach(Array(items.enumerated()), id: \.offset) { index, item in
                     HStack(alignment: .firstTextBaseline, spacing: 4) {
-                        Text(ordered ? "\(index + 1)." : "•").font(.body).frame(minWidth: 20, alignment: .leading)
+                        Text(ordered ? "\(index + 1)." : "•") .font(VerdeTheme.ui(15)).frame(minWidth: 20, alignment: .leading)
                         MarkdownBlocks(blocks: item, source: source)
                     }
                 }
             }
         case .quote(let blocks):
             HStack(alignment: .top, spacing: 8) {
-                RoundedRectangle(cornerRadius: 1.5).fill(Color(uiColor: .separator)).frame(width: 3)
+                RoundedRectangle(cornerRadius: 1.5).fill(VerdeTheme.border).frame(width: 3)
                 MarkdownBlocks(blocks: blocks, source: source)
             }
             .fixedSize(horizontal: false, vertical: true)
@@ -339,7 +339,7 @@ private struct MdBlockView: View {
                         if index < rows.count - 1 { Divider() }
                     }
                 }
-                .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color(uiColor: .separator)))
+                .overlay(RoundedRectangle(cornerRadius: 4).stroke(VerdeTheme.border))
             }
         }
     }
@@ -360,20 +360,20 @@ struct CodeBlock: View {
         if code.hasSuffix("\n"), let last = text.characters.indices.last { text.removeSubrange(last...) }
         return VStack(alignment: .leading, spacing: 0) {
             HStack {
-                Text(language ?? "code").font(.caption2).foregroundStyle(.secondary)
+                Text(language ?? "code") .font(VerdeTheme.ui(10)).foregroundStyle(.secondary)
                 Spacer()
                 Button("Copy code") { UIPasteboard.general.string = code.hasSuffix("\n") ? String(code.dropLast()) : code }
-                    .font(.caption)
+                     .font(VerdeTheme.ui(12))
             }
             .padding(.horizontal, 10).padding(.vertical, 4)
             ScrollView(.horizontal, showsIndicators: false) {
-                Text(text).font(.system(.footnote, design: .monospaced)).fixedSize()
+                Text(text).font(VerdeTheme.mono()).fixedSize()
                     .padding(.horizontal, 10).padding(.bottom, 10)
                     .textSelection(.enabled)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 8))
+        .background(VerdeTheme.assistant, in: RoundedRectangle(cornerRadius: 8))
         .accessibilityIdentifier("code-block")
         .task(id: key) {
             guard let language else { return }

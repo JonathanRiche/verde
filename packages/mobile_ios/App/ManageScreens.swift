@@ -44,7 +44,7 @@ struct HistoryScreen: View {
                         NavigationLink(value: BrowseRoute.thread(workspace: thread.workspace_id, thread: thread.thread_id)) {
                             VStack(alignment: .leading, spacing: 4) {
                                 Text(thread.title).lineLimit(2)
-                                Text([thread.provider, thread.archived ? "Archived" : nil, thread.cwd].compactMap { $0 }.joined(separator: " · ")).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                                Text([thread.provider, thread.archived ? "Archived" : nil, thread.cwd].compactMap { $0 }.joined(separator: " · ")) .font(VerdeTheme.ui(12)).foregroundStyle(.secondary).lineLimit(1)
                             }
                         }
                     }
@@ -83,7 +83,7 @@ struct NewChatScreen: View {
                 ForEach(workspaces, id: \.workspace_id) { Text($0.label).tag($0.workspace_id) }
             }.disabled(manage.busy)
             if let path = workspaces.first(where: { $0.workspace_id == workspace })?.path {
-                LabeledContent("Working directory", value: path).font(.caption)
+                LabeledContent("Working directory", value: path) .font(VerdeTheme.ui(12))
             }
             if chat?.workspace_id == workspace {
                 choice("Provider", value: selection.provider, choices: chat?.providers ?? []) { value in ChatSelection(provider: value) }
@@ -140,7 +140,7 @@ struct AddWorkspaceScreen: View {
                     else {
                         ForEach(directory.suggestions, id: \.self) { root in Button(root) { Task { await manage.directory(root) } } }
                         if !directory.path.isEmpty {
-                            Text(directory.path).font(.caption)
+                            Text(directory.path) .font(VerdeTheme.ui(12))
                             Button("Use this folder") { path = directory.path }.disabled(directory.loading || directory.error != nil)
                         }
                         if let parent = directory.parent { Button("Up one folder") { Task { await manage.directory(parent) } } }

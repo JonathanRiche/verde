@@ -17,7 +17,7 @@ struct ChatComposer: View {
             if let followup = model.view?.followup {
                 VStack(alignment: .leading) {
                     Text("\(followup.kind.capitalized) · \(followup.state)").font(.caption.bold())
-                    Text(followup.text).lineLimit(3).font(.caption)
+                    Text(followup.text).lineLimit(3) .font(VerdeTheme.ui(12))
                     HStack {
                         if followup.can_retry { Button("Retry") { model.followup("retry", followup) } }
                         if followup.can_pull_back { Button("Pull back") { model.followup("pull", followup) } }
@@ -26,7 +26,7 @@ struct ChatComposer: View {
                 }.accessibilityIdentifier("composer-followup")
             }
             if let notice = model.notice ?? model.view?.error?.message {
-                Text(notice).font(.caption).foregroundStyle(.red).accessibilityIdentifier("composer-notice")
+                Text(notice) .font(VerdeTheme.ui(12)).foregroundStyle(.red).accessibilityIdentifier("composer-notice")
             }
             if let token = model.token {
                 ScrollView(.horizontal) {
@@ -38,7 +38,7 @@ struct ChatComposer: View {
                                 Button(item.label) { model.accept(item.label) }.disabled(!item.enabled)
                             }
                         }
-                    }.font(.caption)
+                    } .font(VerdeTheme.ui(12))
                 }.accessibilityIdentifier("composer-suggestions")
             }
             if let attachments = model.view?.draft.attachments, !attachments.isEmpty {
@@ -49,7 +49,7 @@ struct ChatComposer: View {
                                 if let data = model.previews[item.local_id], let image = UIImage(data: data) {
                                     Image(uiImage: image).resizable().scaledToFit().frame(width: 44, height: 44)
                                 }
-                                Text(item.name).font(.caption)
+                                Text(item.name) .font(VerdeTheme.ui(12))
                                 Button { model.detach(item.local_id) } label: { Image(systemName: "xmark.circle.fill") }
                                     .accessibilityLabel("Remove \(item.name)").disabled(model.busy || model.pending)
                             }
@@ -58,7 +58,13 @@ struct ChatComposer: View {
                 }
             }
             ComposerText(text: model.text, selection: model.selection, editable: !model.pending, edit: model.edit, focus: { focused = $0 })
-                .frame(minHeight: 64, maxHeight: 120)
+                .frame(height: 72)
+                .overlay(alignment: .topLeading) {
+                    if model.text.isEmpty {
+                        Text("Ask anything, or use / for commands and @ to search files.")
+                            .font(VerdeTheme.ui()).foregroundStyle(VerdeTheme.subtle).allowsHitTesting(false).accessibilityHidden(true)
+                    }
+                }
                 .accessibilityIdentifier("composer-field")
             HStack {
                 Menu {
@@ -70,25 +76,25 @@ struct ChatComposer: View {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
                         ForEach(ComposerPicker.allCases) { kind in
-                            Button(selectionLabel(kind)) { picker = kind }.font(.caption)
-                                .padding(.horizontal, 10).padding(.vertical, 8).background(.quaternary, in: Capsule())
+                            Button { picker = kind } label: { HStack(spacing: 6) { if kind == .provider { ProviderGlyph(provider: model.view?.selection.provider) }; Text(selectionLabel(kind)) } }.font(VerdeTheme.ui(12))
+                                .padding(.horizontal, 10).padding(.vertical, 8).background(VerdeTheme.alternate, in: Capsule())
                         }
                     }
                 }
                 if model.chat.state.turn != nil {
-                    Button(action: model.chat.stopTurn) { Image(systemName: "stop.fill").frame(width: 44, height: 44) }
-                        .tint(.yellow).disabled(!model.chat.state.canStop).accessibilityLabel("Stop")
+                    Button(action: model.chat.stopTurn) { Image(systemName: "stop.fill").font(.system(size: 10)).foregroundStyle(VerdeTheme.background).frame(width: 44, height: 44).background(VerdeTheme.warning, in: Circle()).modifier(Pulse(active: !model.chat.state.stopping, minimum: 0.74, period: 1.4)) }
+                        .buttonStyle(.plain).disabled(!model.chat.state.canStop).accessibilityLabel("Stop")
                 }
                 Button(action: model.submit) {
-                    Image(systemName: "arrow.up").font(.body.bold()).frame(width: 44, height: 44)
-                }.buttonStyle(.borderedProminent).buttonBorderShape(.circle).tint(.green)
+                    Image(systemName: "arrow.up").font(.system(size: 18, weight: .bold)).foregroundStyle(VerdeTheme.background).frame(width: 44, height: 44).background(VerdeTheme.accent, in: Circle()).opacity(model.canSubmit ? 1 : 0.35)
+                }.buttonStyle(.plain)
                     .disabled(!model.canSubmit).accessibilityLabel(sendLabel).accessibilityIdentifier("composer-send")
             }
-            if model.chat.state.turn != nil { Text(sendLabel + " a follow-up while the agent works.").font(.caption).foregroundStyle(.secondary) }
+            if model.chat.state.turn != nil { Text(sendLabel + " a follow-up while the agent works.") .font(VerdeTheme.ui(12)).foregroundStyle(.secondary) }
         }
         .padding(12)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
-        .overlay(RoundedRectangle(cornerRadius: 14).stroke(focused ? Color.green : Color.secondary.opacity(0.3), lineWidth: focused ? 1.5 : 1))
+        .background(VerdeTheme.panel, in: RoundedRectangle(cornerRadius: 14))
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(focused ? VerdeTheme.accent : VerdeTheme.mutedPanel, lineWidth: focused ? 1.5 : 1))
         .padding(8)
         .onAppear { model.adopt(model.chat.composer) }
         .onChange(of: model.chat.composer?.draft.revision) { model.adopt(model.chat.composer) }
@@ -99,7 +105,7 @@ struct ChatComposer: View {
             NavigationStack {
                 List(choices(kind).sorted { $0.favorite && !$1.favorite }, id: \.id) { choice in
                     Button { model.select(kind, choice.id); picker = nil } label: {
-                        HStack { Text(choice.label); if choice.favorite { Image(systemName: "star.fill") }; Spacer(); if let reason = choice.reason { Text(reason).font(.caption) } }
+                        HStack { Text(choice.label); if choice.favorite { Image(systemName: "star.fill") }; Spacer(); if let reason = choice.reason { Text(reason) .font(VerdeTheme.ui(12)) } }
                     }.disabled(!choice.enabled)
                 }.navigationTitle(kind.rawValue.capitalized).toolbar { Button("Done") { picker = nil } }
             }.presentationDetents([.medium, .large])
@@ -111,9 +117,9 @@ struct ChatComposer: View {
             if let confirmation = model.view?.shell_confirmation {
                 NavigationStack {
                     VStack(alignment: .leading, spacing: 20) {
-                        Text("Run this command on the host?").font(.headline)
+                        Text("Run this command on the host?") .font(VerdeTheme.ui(15, bold: true))
                         Text(confirmation.command).font(.system(.body, design: .monospaced)).textSelection(.enabled)
-                        Text(confirmation.cwd).font(.caption)
+                        Text(confirmation.cwd) .font(VerdeTheme.ui(12))
                         HStack { Button("Cancel") { model.confirmShell(confirmation, accept: false) }; Spacer(); Button("Run") { model.confirmShell(confirmation, accept: true) }.buttonStyle(.borderedProminent) }
                     }.padding().disabled(model.busy)
                 }.presentationDetents([.medium])
@@ -203,7 +209,7 @@ private struct ComposerText: UIViewRepresentable {
     func makeUIView(context: Context) -> UITextView {
         let view = UITextView()
         view.delegate = context.coordinator; view.backgroundColor = .clear
-        view.font = .preferredFont(forTextStyle: .body); view.adjustsFontForContentSizeCategory = true
+        view.font = UIFontMetrics(forTextStyle: .body).scaledFont(for: UIFont(name: "NotoSans-Regular", size: 15) ?? .systemFont(ofSize: 15)); view.textColor = UIColor(VerdeTheme.text); view.tintColor = UIColor(VerdeTheme.accent); view.adjustsFontForContentSizeCategory = true
         view.textContainerInset = .zero; view.textContainer.lineFragmentPadding = 0
         view.accessibilityLabel = "Message"; view.accessibilityIdentifier = "composer-field"
         return view

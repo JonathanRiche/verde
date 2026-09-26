@@ -19,9 +19,9 @@ struct PairingView: View {
                 if let proposal = model.row?.trust_proposal {
                     Section("Confirm host") {
                         Text("Only trust a host you recognize. A changed identity or key requires your approval again.")
-                        Text(proposal.origin).font(.headline)
+                        Text(proposal.origin) .font(VerdeTheme.ui(15, bold: true))
                         if let runtime = proposal.runtime_id { LabeledContent("Runtime", value: runtime) }
-                        Text("SHA-256 key fingerprint").font(.caption)
+                        Text("SHA-256 key fingerprint") .font(VerdeTheme.ui(12))
                         Text(proposal.spki_sha256).font(.system(.caption, design: .monospaced))
                         Button("Trust and pair") { Task { await model.trust(proposal, accept: true) } }
                             .disabled(model.submitting).accessibilityIdentifier("trustHost")
@@ -34,7 +34,7 @@ struct PairingView: View {
                         Text(model.row?.phase == "ready" ? "Connected to your Verde host." : "Pairing is saved. Connecting to your host…")
                         if let origin = model.row?.https_url { Text(origin) }
                         if let scopes = model.row?.scopes, !scopes.isEmpty {
-                            Text("Permissions: " + scopes.joined(separator: ", ")).font(.caption)
+                            Text("Permissions: " + scopes.joined(separator: ", ")) .font(VerdeTheme.ui(12))
                         }
                     }
                 } else {
@@ -96,7 +96,8 @@ struct PairingView: View {
             }
             .blur(radius: scenePhase == .active ? 0 : 12)
             .privacySensitive()
-            .navigationTitle("Pair with Verde")
+            .navigationTitle("Pair with Verde").navigationBarTitleDisplayMode(.inline)
+            .scrollContentBackground(.hidden).background(VerdeTheme.background)
             .toolbar {
                 if let onClose {
                     ToolbarItem(placement: .cancellationAction) { Button("Back to hosts", action: onClose) }
@@ -122,7 +123,7 @@ struct PairingView: View {
                     .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { scanning = false } } }
                 }
             }
-        }
+        }.tint(VerdeTheme.accent).font(VerdeTheme.ui()).foregroundStyle(VerdeTheme.text).preferredColorScheme(.dark)
     }
 
     private func clearSecrets() { link = ""; grant = ""; code = ""; manualHost = "" }

@@ -12,6 +12,7 @@ struct VerdeApp: App {
     @State private var browse: BrowseModel
 
     init() {
+        VerdeTheme.configure()
         let hosts = HostsModel.live(deviceLabel: UIDevice.current.name)
         _hosts = State(initialValue: hosts)
         _browse = State(initialValue: BrowseModel(hosts: hosts, cache: hosts.cache))
@@ -33,8 +34,9 @@ struct RootView: View {
     let browse: BrowseModel
     @Environment(\.scenePhase) private var scenePhase
     @State private var tab: RootTab = .home
-    @State private var homePath: [BrowseRoute] = []
-    @State private var workspacesPath: [BrowseRoute] = []
+    @State private var path: [BrowseRoute] = []
+    @State private var drawer = false
+    @Environment(\.accessibilityReduceMotion) private var reducedMotion
     @State private var monitor = NetworkMonitor()
 
     var body: some View {
@@ -42,18 +44,42 @@ struct RootView: View {
             tab = .hosts
             hosts.showPairing(hosts.active)
         })
-        TabView(selection: $tab) {
-            BrowseStack(model: browse, actions: actions, path: $homePath) { HomeScreen(model: browse, actions: actions) }
-                .tabItem { Label("Home", systemImage: "house") }.tag(RootTab.home)
-            BrowseStack(model: browse, actions: actions, path: $workspacesPath) { WorkspacesScreen(model: browse, actions: actions) }
-                .tabItem { Label("Workspaces", systemImage: "square.stack") }.tag(RootTab.workspaces)
-            HostsScreen(model: hosts) { tab = .home }
-                .tabItem { Label("Hosts", systemImage: "desktopcomputer") }.tag(RootTab.hosts)
+        GeometryReader { geometry in
+            ZStack(alignment: .leading) {
+                Group {
+                    if tab == .hosts { HostsScreen(model: hosts) { tab = .home; path = [] } }
+                    else {
+                        BrowseStack(model: browse, actions: actions, path: $path) {
+                            if tab == .home { HomeScreen(model: browse, actions: actions) }
+                            else { WorkspacesScreen(model: browse, actions: actions) }
+                        }
+                    }
+                }.allowsHitTesting(!drawer).accessibilityHidden(drawer)
+                if drawer {
+                    Color.black.opacity(0.5).ignoresSafeArea().onTapGesture { drawer = false }.accessibilityLabel("Close workspace drawer").accessibilityAddTraits(.isButton)
+                    WorkspaceDrawer(browse: browse, selected: path.last, tab: tab, close: { drawer = false }, open: { route in
+                        if tab == .hosts { tab = .home }
+                        path.append(route); drawer = false
+                    }, root: { next in tab = next; path = []; drawer = false })
+                    .allowsHitTesting(true).disabled(false).zIndex(2)
+                    .frame(width: min(380, geometry.size.width * 0.92))
+                    .transition(.move(edge: .leading))
+                }
+            }
+            .animation(reducedMotion ? nil : .easeOut(duration: 0.2), value: drawer)
+            .environment(\.openWorkspaceDrawer, { drawer = true })
+            .background(VerdeTheme.background.ignoresSafeArea())
         }
+        .preferredColorScheme(.dark)
+        .tint(VerdeTheme.accent)
+        .foregroundStyle(VerdeTheme.text)
+        .font(VerdeTheme.ui())
+        .scrollContentBackground(.hidden)
+        .environment(\.defaultMinListRowHeight, 44)
         .onChange(of: hosts.active) { _, _ in
             // Routes belong to the previous host's projections.
-            homePath = []
-            workspacesPath = []
+            path = []
+            drawer = false
         }
         .onChange(of: scenePhase, initial: true) { _, phase in
             // `.inactive` (app switcher, system sheets) keeps the current state.

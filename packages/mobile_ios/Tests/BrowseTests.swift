@@ -229,6 +229,8 @@ final class BrowseTests: XCTestCase {
         XCTAssertTrue(browseBanner(failed, NOW)?.text.hasPrefix("Couldn't load") == true)
         var loading = ready
         loading.row?.view?.sync_state = "loading"
+        XCTAssertTrue(hasContent(loading))
+        loading.home = nil; loading.workspaces = nil
         XCTAssertFalse(hasContent(loading))
         XCTAssertTrue(showSpinner(loading))
         var fatal = ready

@@ -34,7 +34,8 @@ struct HostsScreen: View {
                     }
                 }
             }
-            .navigationTitle("Hosts")
+            .navigationTitle("Hosts").modifier(VerdeNavigation())
+            .listStyle(.plain).scrollContentBackground(.hidden).background(VerdeTheme.background)
         }
         .alert("Add host", isPresented: $adding) {
             TextField("Host name", text: $label)
@@ -73,15 +74,15 @@ private struct HostCard: View {
         let status = hostStatus(row)
         HStack(spacing: 8) {
             Circle().fill(hostDotColor(row)).frame(width: 12, height: 12).accessibilityLabel(status)
-            Text(row.saved.label).font(.headline)
+            Text(row.saved.label) .font(VerdeTheme.ui(15, bold: true))
             Spacer()
-            if model.active == id { Text("Selected").font(.caption).foregroundStyle(.secondary) }
+            if model.active == id { Text("Selected") .font(VerdeTheme.ui(12)).foregroundStyle(.secondary) }
         }
         Text(status).accessibilityIdentifier("hostStatus")
         if failure?.code == "sign_out_unconfirmed" {
             Text("Sign out could not be confirmed. Your local pairing is still saved.")
             Text("If you remove it anyway, this device may remain listed on the desktop. Revoke it there when you can.")
-                .font(.footnote).foregroundStyle(.secondary)
+                 .font(VerdeTheme.ui(13)).foregroundStyle(.secondary)
             Button("Retry sign out") { model.signOut(id) }.disabled(pending)
             Button("Remove from this phone anyway") { confirm(Confirmation(id: id, name: row.saved.label, forget: true)) }
                 .disabled(pending).accessibilityIdentifier("forgetHost")
@@ -103,7 +104,7 @@ private struct HostCard: View {
         if pending {
             VStack(alignment: .leading) {
                 ProgressView().progressViewStyle(.linear)
-                Text("Finishing host action…").font(.footnote)
+                Text("Finishing host action…") .font(VerdeTheme.ui(13))
             }
         }
         if let view = row.view, !["loading", "signed_out", "signing_out"].contains(view.auth_state) {

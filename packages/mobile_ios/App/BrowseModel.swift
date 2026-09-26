@@ -9,6 +9,7 @@ struct BrowseState {
     /// Non-nil while the warm-start cache is shown instead of this session's live projection.
     var savedAtMs: Int64?
     var refreshing = false
+    var hasSynced = false
     var networkAvailable = true
     var fatal = false
     var host: HostView? { row?.view }
@@ -56,6 +57,7 @@ final class BrowseModel {
             state.fatal = hostID != nil && !hosts.loading
             return state
         }
+        state.hasSynced = store.synced
         if let auth = row?.view?.auth_state, HostsModel.wiped.contains(auth) { return state }
         // The cache stays visible until this session's core has synced once; afterwards the
         // core's own (possibly stale) projection is always at least as new as the cache.
@@ -249,7 +251,8 @@ func workspaceSummary(_ workspace: Workspace) -> (summary: String, active: Int, 
 
 /// Cached views, or a live projection backed by at least one snapshot.
 func hasContent(_ state: BrowseState) -> Bool {
-    state.hasData && (state.savedAtMs != nil || ["ready", "stale"].contains(state.host?.sync_state ?? ""))
+    state.hasData && (state.savedAtMs != nil || state.hasSynced || ["ready", "stale"].contains(state.host?.sync_state ?? "")
+        || state.workspaces?.items.isEmpty == false || state.home?.items.isEmpty == false)
 }
 
 func showSpinner(_ state: BrowseState) -> Bool {

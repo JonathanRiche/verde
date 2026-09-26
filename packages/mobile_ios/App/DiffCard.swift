@@ -67,12 +67,12 @@ struct DiffCard: View {
                     let totals = diffTotals(files)
                     DiffCounts(added: totals.additions, removed: totals.deletions)
                 }
-                Toggle("Wrap lines", isOn: wrap).toggleStyle(.button).font(.caption).controlSize(.small)
+                Toggle("Wrap lines", isOn: wrap).toggleStyle(.button) .font(VerdeTheme.ui(12)).controlSize(.small)
             }
             .padding(.leading, 12).padding(.trailing, 8).padding(.vertical, 6)
             Divider()
             if let note = note(current, files) {
-                Text(note).font(.footnote).foregroundStyle(.secondary).padding(12)
+                Text(note) .font(VerdeTheme.ui(13)).foregroundStyle(.secondary).padding(12)
             }
             if let files {
                 let diffBody = self.diffBody ?? DiffBody(text)
@@ -86,13 +86,13 @@ struct DiffCard: View {
                     Button("Show \(min(more, diffFilePage)) more files · \(more) hidden") {
                         disclosure.setNumber("\(id):files", limit + diffFilePage)
                     }
-                    .font(.footnote).padding(.horizontal, 12).padding(.vertical, 8)
+                     .font(VerdeTheme.ui(13)).padding(.horizontal, 12).padding(.vertical, 8)
                 }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 10))
-        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color(uiColor: .separator)))
+        .background(VerdeTheme.assistant, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(VerdeTheme.border))
         .accessibilityIdentifier("diff-card")
         .task(id: text) {
             if diffBody?.body != text { diffBody = DiffBody(text) }
@@ -132,7 +132,7 @@ private struct DiffFileSection: View {
             Button { disclosure.toggle("\(key):open", defaultExpanded) } label: {
                 HStack(spacing: 8) {
                     Text(expanded ? "▾" : "▸").foregroundStyle(.secondary)
-                    Text(entry.path).font(.footnote.monospaced()).lineLimit(1).truncationMode(.head)
+                    Text(entry.path).font(VerdeTheme.mono()).lineLimit(1).truncationMode(.head)
                         .frame(maxWidth: .infinity, alignment: .leading)
                     DiffCounts(added: entry.additions, removed: entry.deletions)
                 }
@@ -170,7 +170,7 @@ private struct DiffFileBody: View {
                     Button("Full screen") { fullScreen = true }
                 }
             }
-            .font(.caption).padding(.horizontal, 12).padding(.vertical, 6)
+             .font(VerdeTheme.ui(12)).padding(.horizontal, 12).padding(.vertical, 6)
             switch render {
             case nil:
                 DiffNote(text: "Rendering…")
@@ -203,7 +203,7 @@ private struct DiffFileBody: View {
 private struct DiffNote: View {
     let text: String
     var body: some View {
-        Text(text).font(.footnote).foregroundStyle(.secondary).padding(.horizontal, 12).padding(.vertical, 6)
+        Text(text) .font(VerdeTheme.ui(13)).foregroundStyle(.secondary).padding(.horizontal, 12).padding(.vertical, 6)
     }
 }
 
@@ -220,7 +220,7 @@ private struct DiffSourceText: View {
                 Text(shown).font(diffFont).fixedSize().padding(.horizontal, 12).textSelection(.enabled)
             }
             .accessibilityIdentifier("diff-lines")
-            if truncated { Button("Show more lines", action: onMore).font(.footnote).padding(.horizontal, 12) }
+            if truncated { Button("Show more lines", action: onMore) .font(VerdeTheme.ui(13)).padding(.horizontal, 12) }
         }
     }
 }
@@ -262,7 +262,7 @@ private struct DiffHunks: View {
                     }
                     .buttonStyle(.plain)
                     .accessibilityHint(item.collapsed ? "Expand hunk" : "Collapse hunk")
-                    Button("Copy hunk") { copy(hunkPatch(item.hunk)) }.font(.caption)
+                    Button("Copy hunk") { copy(hunkPatch(item.hunk)) } .font(VerdeTheme.ui(12))
                 }
                 .padding(.leading, 12).padding(.trailing, 8).padding(.vertical, 4)
                 .background(Color.accentColor.opacity(0.08))
@@ -270,7 +270,7 @@ private struct DiffHunks: View {
             }
             if hidden > 0 {
                 Button(budget >= diffInlineMax ? "Open full screen · \(hidden) more lines" : "Show more lines · \(hidden) remaining", action: onMore)
-                    .font(.footnote).padding(.horizontal, 12).padding(.vertical, 6)
+                     .font(VerdeTheme.ui(13)).padding(.horizontal, 12).padding(.vertical, 6)
             }
         }
     }

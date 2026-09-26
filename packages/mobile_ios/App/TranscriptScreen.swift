@@ -32,6 +32,7 @@ struct TranscriptScreen: View {
                 Spacer()
             }
         }
+        .background(VerdeTheme.background)
         .navigationTitle(model?.thread?.thread.title ?? fallbackTitle ?? "Chat")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -40,10 +41,13 @@ struct TranscriptScreen: View {
             }
             if let summary = model?.thread?.thread {
                 ToolbarItem(placement: .principal) {
-                    VStack(spacing: 0) {
-                        Text(summary.title.isEmpty ? "Chat" : summary.title).font(.headline).lineLimit(1)
+                    HStack(spacing: 8) {
+                        ProviderGlyph(provider: summary.provider)
+                        VStack(alignment: .leading, spacing: 0) {
+                        Text(summary.title.isEmpty ? "Chat" : summary.title) .font(VerdeTheme.ui(15, bold: true)).lineLimit(1)
                         Text([summary.provider, summary.model].compactMap { $0 }.joined(separator: " · "))
-                            .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                             .font(VerdeTheme.ui(12)).foregroundStyle(.secondary).lineLimit(1)
+                        }
                     }
                     .accessibilityElement(children: .combine)
                 }
@@ -104,7 +108,7 @@ private struct BannerCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(banner.text).font(.subheadline).accessibilityIdentifier("transcriptBanner")
+            Text(banner.text) .font(VerdeTheme.ui(14)).accessibilityIdentifier("transcriptBanner")
             if banner.busy { ProgressView().progressViewStyle(.linear) }
             switch banner.action {
             case .some(.retry): Button("Retry", action: retry)
@@ -259,11 +263,11 @@ private struct PageHeader: View {
             if let page {
                 if page.loading {
                     ProgressView().controlSize(.small)
-                    Text("Loading earlier messages…").font(.footnote).foregroundStyle(.secondary)
+                    Text("Loading earlier messages…") .font(VerdeTheme.ui(13)).foregroundStyle(.secondary)
                 } else if page.has_older {
-                    Button("Load earlier messages", action: loadOlder).font(.footnote)
+                    Button("Load earlier messages", action: loadOlder) .font(VerdeTheme.ui(13))
                 } else {
-                    Text("Start of conversation").font(.caption).foregroundStyle(.tertiary)
+                    Text("Start of conversation") .font(VerdeTheme.ui(12)).foregroundStyle(.tertiary)
                 }
             }
             Spacer()
@@ -279,7 +283,7 @@ private struct StopBar: View {
     var body: some View {
         if state.turn != nil {
             HStack {
-                Text(state.stopping ? "Stopping the current turn…" : "The agent is working.").font(.subheadline)
+                Text(state.stopping ? "Stopping the current turn…" : "The agent is working.") .font(VerdeTheme.ui(14))
                 Spacer()
                 if state.stopping {
                     Button("Stopping…") {}.buttonStyle(.bordered).disabled(true)
@@ -324,13 +328,13 @@ private struct MessageRow: View {
     var body: some View {
         let mine = row.role == "user"
         HStack {
-            if mine { Spacer(minLength: 40) }
+
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {
                     Text(mine ? "You" : (row.author.isEmpty ? "Assistant" : row.author)).font(.caption.weight(.medium))
                         .foregroundStyle(.secondary)
                     if let label = deliveryLabel(row.delivery) {
-                        Text(label).font(.caption2).foregroundStyle(row.delivery == "failed" ? Color.red : Color.secondary)
+                        Text(label) .font(VerdeTheme.ui(10)).foregroundStyle(row.delivery == "failed" ? Color.red : Color.secondary)
                     }
                 }
                 if !row.attachments.isEmpty {
@@ -339,21 +343,21 @@ private struct MessageRow: View {
                             // Host images need an authenticated fetch the core doesn't offer yet; name only.
                             ForEach(row.attachments, id: \.local_id) { attachment in
                                 Text((attachment.mime.hasPrefix("image/") ? "Image · " : "") + basename(attachment.name))
-                                    .font(.caption).lineLimit(1).padding(.horizontal, 8).padding(.vertical, 4)
-                                    .background(Color(uiColor: .tertiarySystemFill), in: Capsule())
+                                     .font(VerdeTheme.ui(12)).lineLimit(1).padding(.horizontal, 8).padding(.vertical, 4)
+                                    .background(VerdeTheme.alternate, in: Capsule())
                             }
                         }
                     }
                 }
                 if !row.body.isEmpty {
                     // User text is verbatim (web parity); assistant output goes through the core AST.
-                    if mine { Text(row.body).font(.body).textSelection(.enabled) }
+                    if mine { Text(row.body) .font(VerdeTheme.ui(15)).textSelection(.enabled) }
                     else { MarkdownText(text: streamTail(row), model: model) }
                 }
             }
             .padding(.horizontal, 12).padding(.vertical, 10)
-            .frame(maxWidth: mine ? nil : .infinity, alignment: .leading)
-            .background(mine ? Color.accentColor.opacity(0.15) : Color(uiColor: .secondarySystemBackground),
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(mine ? VerdeTheme.user : VerdeTheme.assistant,
                         in: RoundedRectangle(cornerRadius: 12))
             .contextMenu { Button("Copy message") { UIPasteboard.general.string = row.body } }
         }
@@ -387,7 +391,7 @@ private struct ToolCard: View {
                 HStack(spacing: 8) {
                     StatusDot(color: toolColor(row), label: toolStatusLabel(row))
                     Text(row.author.isEmpty ? "Tool" : row.author).font(.subheadline.weight(.medium))
-                    Text(commandPreview(row.body)).font(.footnote).foregroundStyle(.secondary).lineLimit(1)
+                    Text(commandPreview(row.body)) .font(VerdeTheme.ui(13)).foregroundStyle(.secondary).lineLimit(1)
                         .frame(maxWidth: .infinity, alignment: .leading)
                     Text(expanded ? "▾" : "▸").foregroundStyle(.secondary)
                 }
@@ -400,20 +404,20 @@ private struct ToolCard: View {
                 let (shown, truncated) = all ? (row.body.trimmingCharacters(in: .whitespacesAndNewlines), false)
                     : leadingLines(row.body, toolPreviewLines)
                 ScrollView(.horizontal) {
-                    Text(shown).font(.footnote.monospaced()).fixedSize().textSelection(.enabled).padding(.horizontal, 12)
+                    Text(shown).font(VerdeTheme.mono()).fixedSize().textSelection(.enabled).padding(.horizontal, 12)
                 }
                 HStack(spacing: 16) {
                     Button("Copy output") { UIPasteboard.general.string = row.body }
                     if truncated { Button("Show all \(countLines(row.body)) lines") { disclosure.setFlag(key + ":all", true) } }
                 }
-                .font(.caption)
+                 .font(VerdeTheme.ui(12))
                 .padding(.horizontal, 12).padding(.vertical, 8)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(child ? Color(uiColor: .systemBackground) : Color(uiColor: .secondarySystemBackground),
+        .background(child ? VerdeTheme.background : VerdeTheme.assistant,
                     in: RoundedRectangle(cornerRadius: 10))
-        .overlay(RoundedRectangle(cornerRadius: 10).stroke(commandRunning(row) ? Color.accentColor : Color(uiColor: .separator)))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(commandRunning(row) ? Color.accentColor : VerdeTheme.border))
     }
 }
 
@@ -436,7 +440,7 @@ private struct ToolGroupCard: View {
                     TimelineView(.periodic(from: .now, by: counts.running > 0 && turnStartedAt != nil ? 1 : 3600)) { context in
                         Text(toolGroupSummary(rows, subagent: subagent,
                                               elapsed: turnStartedAt.map { elapsedLabel($0, nowMs(context.date)) }))
-                            .font(.footnote).foregroundStyle(.secondary).lineLimit(1)
+                             .font(VerdeTheme.ui(13)).foregroundStyle(.secondary).lineLimit(1)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     Text(expanded ? "▾" : "▸").foregroundStyle(.secondary)
@@ -454,8 +458,8 @@ private struct ToolGroupCard: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 10))
-        .overlay(RoundedRectangle(cornerRadius: 10).stroke(counts.running > 0 && counts.failed == 0 ? Color.accentColor : Color(uiColor: .separator)))
+        .background(VerdeTheme.assistant, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(counts.running > 0 && counts.failed == 0 ? Color.accentColor : VerdeTheme.border))
     }
 }
 
@@ -492,7 +496,7 @@ private struct NoticeRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            if !row.author.isEmpty { Text(row.author).font(.caption2).foregroundStyle(.secondary) }
+            if !row.author.isEmpty { Text(row.author) .font(VerdeTheme.ui(10)).foregroundStyle(.secondary) }
             MarkdownText(text: row.body, model: model)
         }
         .padding(.horizontal, 12).padding(.vertical, 8)
@@ -510,26 +514,26 @@ private struct UsageCard: View {
             ForEach(Array(usage.limits.enumerated()), id: \.offset) { _, limit in
                 VStack(alignment: .leading, spacing: 2) {
                     HStack {
-                        Text(limit.label).font(.footnote)
+                        Text(limit.label) .font(VerdeTheme.ui(13))
                         Spacer()
-                        Text("\(limit.percent_left)% left").font(.footnote)
+                        Text("\(limit.percent_left)% left") .font(VerdeTheme.ui(13))
                     }
                     ProgressView(value: Double(min(limit.percent_left, 100)), total: 100)
                         .accessibilityLabel("\(limit.label) \(limit.percent_left)% left")
-                    if !limit.reset.isEmpty { Text(limit.reset).font(.caption2).foregroundStyle(.secondary) }
+                    if !limit.reset.isEmpty { Text(limit.reset) .font(VerdeTheme.ui(10)).foregroundStyle(.secondary) }
                 }
             }
             ForEach(Array((usage.stats + usage.recent).enumerated()), id: \.offset) { _, stat in
                 HStack {
-                    Text(stat.label).font(.footnote)
+                    Text(stat.label) .font(VerdeTheme.ui(13))
                     Spacer()
-                    Text(stat.value).font(.footnote)
+                    Text(stat.value) .font(VerdeTheme.ui(13))
                 }
             }
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
+        .background(VerdeTheme.assistant, in: RoundedRectangle(cornerRadius: 12))
     }
 }
 
@@ -540,7 +544,7 @@ private struct WorkingRow: View {
     var body: some View {
         TimelineView(.periodic(from: .now, by: 1)) { context in
             HStack(spacing: 8) {
-                ProgressView().controlSize(.small)
+                StatusPip(active: !waitingApproval, attention: waitingApproval)
                 Text(workingLabel(turn, waitingApproval: waitingApproval,
                                   elapsed: turn.started_at_ms.map { elapsedLabel($0, nowMs(context.date)) }))
                     .font(.caption.weight(.medium)).foregroundStyle(Color.accentColor)

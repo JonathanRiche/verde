@@ -274,6 +274,10 @@ final class TranscriptModelTests: XCTestCase {
         XCTAssertNil(transcriptPlaceholder(state))
         state.thread = SharedFixtures.thread("d06", "thread-loading").data
         XCTAssertEqual(transcriptPlaceholder(state), .loading)
+        state.thread?.error = SharedFixtures.thread("d06", "thread-error").data?.error
+        XCTAssertNil(transcriptBanner(state, 0))
+        XCTAssertEqual(transcriptPlaceholder(state), .loading)
+        state.thread?.error = nil
         state.thread?.page.loading = false
         XCTAssertEqual(transcriptPlaceholder(state), .empty)
         state.focusError = "unavailable"

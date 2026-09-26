@@ -52,7 +52,7 @@ struct ApprovalCard: View {
             if let text = phaseText(phase) {
                 HStack(spacing: 8) {
                     if case .sending = phase { ProgressView().controlSize(.mini) }
-                    Text(text).font(.footnote).foregroundStyle(phase.isFailed ? Color.red : Color.secondary)
+                    Text(text) .font(VerdeTheme.ui(13)).foregroundStyle(phase.isFailed ? Color.red : Color.secondary)
                 }
                 .accessibilityElement(children: .combine)
             }
@@ -108,34 +108,34 @@ private struct ApprovalSummary: View {
                 }
                 // Host paths stay abstract on the phone: the file name here, the full request in details.
                 if let path = preview.path {
-                    Text(basename(path)).font(.footnote.monospaced()).lineLimit(1)
+                    Text(basename(path)).font(VerdeTheme.mono()).lineLimit(1)
                         .accessibilityLabel("File \(basename(path))")
                 }
             }
         }
-        if let reason = preview.reason { Text(reason).font(.footnote).lineLimit(4) }
+        if let reason = preview.reason { Text(reason) .font(VerdeTheme.ui(13)).lineLimit(4) }
         if let command = preview.command {
-            Text("$ \(command)").font(.footnote.monospaced()).lineLimit(6)
+            Text("$ \(command)").font(VerdeTheme.mono()).lineLimit(6)
                 .padding(.horizontal, 10).padding(.vertical, 8)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color(uiColor: .tertiarySystemFill), in: RoundedRectangle(cornerRadius: 8))
+                .background(VerdeTheme.alternate, in: RoundedRectangle(cornerRadius: 8))
                 .accessibilityLabel("Command: \(command)")
         }
         if !preview.changes.isEmpty {
             ScrollView(.horizontal, showsIndicators: false) {
                 VStack(alignment: .leading, spacing: 0) {
                     ForEach(Array(preview.changes.enumerated()), id: \.offset) { _, line in
-                        Text(changePrefix(line.kind) + line.text).font(.footnote.monospaced()).fixedSize()
+                        Text(changePrefix(line.kind) + line.text).font(VerdeTheme.mono()).fixedSize()
                             .foregroundStyle(line.kind == .hunk ? Color.secondary : Color.primary)
                             .padding(.horizontal, 10)
                             .background(changeBackground(line.kind))
                     }
-                    if preview.changesTruncated { Text("…").font(.footnote.monospaced()).foregroundStyle(.secondary).padding(.horizontal, 10) }
+                    if preview.changesTruncated { Text("…").font(VerdeTheme.mono()).foregroundStyle(.secondary).padding(.horizontal, 10) }
                 }
                 .padding(.vertical, 6)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color(uiColor: .tertiarySystemFill), in: RoundedRectangle(cornerRadius: 8))
+            .background(VerdeTheme.alternate, in: RoundedRectangle(cornerRadius: 8))
         }
     }
 }
@@ -180,17 +180,17 @@ private struct ApprovalDetails: View {
                     let (shown, truncated) = all ? (approval.body.trimmingCharacters(in: .whitespacesAndNewlines), false)
                         : leadingLines(approval.body, detailLines)
                     ScrollView(.horizontal) {
-                        Text(shown).font(.footnote.monospaced()).fixedSize().textSelection(.enabled)
+                        Text(shown).font(VerdeTheme.mono()).fixedSize().textSelection(.enabled)
                             .padding(.horizontal, 10).padding(.vertical, 8)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color(uiColor: .tertiarySystemFill), in: RoundedRectangle(cornerRadius: 8))
+                    .background(VerdeTheme.alternate, in: RoundedRectangle(cornerRadius: 8))
                     .accessibilityLabel("Approval details")
                     HStack(spacing: 16) {
                         Button("Copy request") { UIPasteboard.general.string = approval.body }
                         if truncated { Button("Show all \(countLines(approval.body)) lines") { disclosure.setFlag(key + ":all", true) } }
                     }
-                    .font(.caption)
+                     .font(VerdeTheme.ui(12))
                 }
             }
         }

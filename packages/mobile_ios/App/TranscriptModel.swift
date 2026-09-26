@@ -49,7 +49,7 @@ func transcriptBanner(_ state: TranscriptState, _ nowMs: Int64) -> Banner? {
     gates.savedAtMs = nil
     if let banner = browseBanner(gates, nowMs) { return banner }
     // A failed approval decision is also mirrored into the thread error; the approval card reports it.
-    if let error = state.thread?.error, !sameError(error, state.thread?.approval?.error) {
+    if let error = state.thread?.error, state.thread?.page.loading != true, !sameError(error, state.thread?.approval?.error) {
         return Banner(text: "Couldn't load this chat. \(error.message)".trimmingCharacters(in: .whitespaces), action: .retry, error: true)
     }
     return nil
@@ -61,6 +61,7 @@ func transcriptPlaceholder(_ state: TranscriptState) -> TranscriptPlaceholder? {
     let thread = state.thread
     let host = state.browse.host
     if let thread, !thread.rows.isEmpty { return nil }
+    if thread?.page.loading == true { return .loading }
     if thread?.error != nil { return .error }
     if let thread, !thread.page.loading, state.focusError == nil { return .empty }
     if state.focusError == "thread_unavailable" { return .missing }

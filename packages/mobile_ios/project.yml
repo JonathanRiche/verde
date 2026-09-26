@@ -23,6 +23,7 @@ targets:
       path: Generated/App-Info.plist
       properties:
         CFBundleDisplayName: Verde
+        UIAppFonts: [cal_sans.ttf, jetbrains_mono.ttf, noto_sans_bold.ttf, noto_sans_regular.ttf]
         NSCameraUsageDescription: Scan a Verde pairing QR code or attach a photo to a chat.
         CFBundleURLTypes:
           - CFBundleURLName: dev.verdeai.app.pair
