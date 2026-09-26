@@ -325,34 +325,46 @@ internal fun HomeScreen(
     onOpenWorkspace: (String) -> Unit,
     onHosts: () -> Unit,
     onPair: () -> Unit,
+    onNewChat: (() -> Unit)? = null,
+    onHistory: (() -> Unit)? = null,
 ) {
     val state by model.state.collectAsState()
     val panes = state.home?.items.orEmpty()
     val now = rememberNow(panes.any { it.can_stop && it.started_at_ms != null })
-    BrowseFrame("Home", state, now, model::refresh, onHosts) {
-        if (!gate(state, onPair)) return@BrowseFrame
-        val attention = panes.filter { it.attention }
-        val running = panes.filterNot { it.attention }
-        if (attention.isNotEmpty()) {
-            header("Needs attention")
-            items(attention, key = { "attention:" + it.id }) { PaneItem(it, now, onOpenPane) }
+    Box(Modifier.fillMaxSize()) {
+        BrowseFrame("Home", state, now, model::refresh, onHosts) {
+            if (!gate(state, onPair)) return@BrowseFrame
+            val attention = panes.filter { it.attention }
+            val running = panes.filterNot { it.attention }
+            if (attention.isNotEmpty()) {
+                header("Needs attention")
+                items(attention, key = { "attention:" + it.id }) { PaneItem(it, now, onOpenPane) }
+            }
+            if (running.isNotEmpty()) {
+                header("Running")
+                items(running, key = { "running:" + it.id }) { PaneItem(it, now, onOpenPane) }
+            }
+            if (panes.isEmpty()) note("idle", "Nothing is running or waiting on you.")
+            val labels = state.workspaces?.items.orEmpty().associate { it.workspace_id to it.label }
+            val recent = recentThreads(state.workspaces)
+            if (recent.isNotEmpty()) {
+                header("Recent chats")
+                items(recent, key = { "recent:${it.workspace_id}:${it.thread_id}" }) { ThreadItem(it, now, labels[it.workspace_id], onOpenThread) }
+                if (onHistory != null) item(key = "history") {
+                    TextButton(onClick = onHistory, modifier = Modifier.padding(horizontal = 8.dp)) { Text("All chats") }
+                }
+            }
+            val open = state.workspaces?.items.orEmpty().filter { it.open }
+            if (open.isNotEmpty()) {
+                header("Workspaces")
+                items(open, key = { "workspace:" + it.workspace_id }) { WorkspaceItem(it, onOpenWorkspace) }
+            } else if (state.workspaces != null) note("noworkspaces", "No workspaces on this host yet. Add one from the Workspaces tab.")
         }
-        if (running.isNotEmpty()) {
-            header("Running")
-            items(running, key = { "running:" + it.id }) { PaneItem(it, now, onOpenPane) }
+        if (onNewChat != null && hasContent(state) && !needsPairing(state) && state.workspaces?.items.orEmpty().any { it.open }) {
+            ExtendedFloatingActionButton(onClick = onNewChat, modifier = Modifier.align(androidx.compose.ui.Alignment.BottomEnd).padding(16.dp)) {
+                Text("New chat")
+            }
         }
-        if (panes.isEmpty()) note("idle", "Nothing is running or waiting on you.")
-        val labels = state.workspaces?.items.orEmpty().associate { it.workspace_id to it.label }
-        val recent = recentThreads(state.workspaces)
-        if (recent.isNotEmpty()) {
-            header("Recent chats")
-            items(recent, key = { "recent:${it.workspace_id}:${it.thread_id}" }) { ThreadItem(it, now, labels[it.workspace_id], onOpenThread) }
-        }
-        val open = state.workspaces?.items.orEmpty().filter { it.open }
-        if (open.isNotEmpty()) {
-            header("Workspaces")
-            items(open, key = { "workspace:" + it.workspace_id }) { WorkspaceItem(it, onOpenWorkspace) }
-        } else if (state.workspaces != null) note("noworkspaces", "No workspaces on this host yet. Add one from Verde on your computer.")
     }
 }
 
@@ -377,13 +389,20 @@ private fun WorkspaceItem(workspace: Workspace, onOpen: (String) -> Unit) {
 }
 
 @Composable
-internal fun WorkspacesScreen(model: BrowseModel, onOpenWorkspace: (String) -> Unit, onHosts: () -> Unit, onPair: () -> Unit) {
+internal fun WorkspacesScreen(model: BrowseModel, onOpenWorkspace: (String) -> Unit, onHosts: () -> Unit, onPair: () -> Unit,
+    onAddWorkspace: (() -> Unit)? = null) {
     val state by model.state.collectAsState()
     val now = rememberNow(false)
     BrowseFrame("Workspaces", state, now, model::refresh, onHosts) {
         if (!gate(state, onPair)) return@BrowseFrame
         val all = state.workspaces?.items.orEmpty()
-        if (all.isEmpty()) { note("empty", "No workspaces on this host yet. Add one from Verde on your computer."); return@BrowseFrame }
+        if (onAddWorkspace != null) item(key = "add-workspace") {
+            TextButton(onClick = onAddWorkspace, modifier = Modifier.padding(horizontal = 8.dp)) { Text("Add workspace") }
+        }
+        if (all.isEmpty()) {
+            note("empty", if (onAddWorkspace != null) "No workspaces on this host yet." else "No workspaces on this host yet. Add one from Verde on your computer.")
+            return@BrowseFrame
+        }
         items(all.filter { it.open }, key = { it.workspace_id }) { WorkspaceItem(it, onOpenWorkspace) }
         val closed = all.filterNot { it.open }
         if (closed.isNotEmpty()) {
@@ -402,6 +421,7 @@ internal fun WorkspaceScreen(
     onHosts: () -> Unit,
     onPair: () -> Unit,
     onNewTerminal: (() -> Unit)? = null,
+    actions: (@Composable (Workspace) -> Unit)? = null,
     onBack: () -> Unit,
 ) {
     val state by model.state.collectAsState()
@@ -412,6 +432,7 @@ internal fun WorkspaceScreen(
         if (!gate(state, onPair)) return@BrowseFrame
         if (workspace == null) { note("missing", "This workspace is no longer on the host."); return@BrowseFrame }
         if (workspace.path.isNotEmpty()) note("path", workspace.path)
+        if (actions != null) item(key = "actions") { actions(workspace) }
         header("Panes")
         if (workspace.panes.isEmpty()) note("nopanes", "No open panes.")
         items(workspace.panes, key = { "pane:" + it.id }) { PaneItem(it, now, onOpenPane) }

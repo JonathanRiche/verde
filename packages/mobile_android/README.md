@@ -216,3 +216,26 @@ On a phone, check that htop and nvim are usable: open each from a workspace,
 type, use arrows/Esc/Ctrl-c, rotate to landscape (the grid resizes), show and
 hide the keyboard, pinch to zoom, scroll back, copy a selection, and toggle
 airplane mode (offline notice, then a replay-gap notice after reconnecting).
+
+## History, new chat and workspaces (D-10)
+
+These screens use the core's `manage` selector plus the history intents; the app
+itself never calls the daemon.
+
+- **All chats** (below Home's recent chats) lists every thread, grouped by the
+  core's history bucket. It supports a debounced search and a per-workspace filter,
+  and loads the next page once per cursor at the end of the list. Subagent threads
+  are hidden. When you leave the screen the shared history is reset, so Home's
+  recent chats stay unfiltered.
+- **New chat** (the Home button, or on a workspace) sends `new_chat_select` for the
+  workspace and for each provider, model, effort or access change. The core
+  validates the choice against its composer catalog. `thread_create` then opens
+  the new thread in the transcript, and the form leaves the back stack.
+- **Add workspace** (Workspaces tab) takes a typed path or uses the folder picker
+  (`directory_list`, which needs a daemon with `workspace.directory.v1`). Once the
+  workspace is created, its screen opens.
+- A workspace screen offers **Rename**, **Close** (`workspace_close`; a busy host
+  answers with "Stop N running requests and M background tasks first.") and, for
+  closed workspaces, **Reopen** (`workspace_archive` with `archived:false`).
+
+Paths, titles and search text are shown on screen but never logged.

@@ -18,6 +18,9 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
+import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.lifecycle.viewmodel.initializer
+import androidx.lifecycle.viewmodel.viewModelFactory
 import dev.verdeai.core.Pane
 import dev.verdeai.core.ThreadSummary
 
@@ -98,18 +101,27 @@ private fun Graph(nav: NavHostController, start: String, hosts: HostsModel, brow
     val openThread: (ThreadSummary) -> Unit = { nav.navigate(Routes.thread(it.workspace_id, it.thread_id)) }
     val openWorkspace: (String) -> Unit = { nav.navigate(Routes.workspace(it)) }
     val showHosts: () -> Unit = { nav.tab(Routes.HOSTS) }
+    val manage: ManageModel = viewModel(key = "manage", factory = viewModelFactory { initializer { ManageModel(hosts, browse.state) } })
     val pair: () -> Unit = {
         browse.state.value.hostId?.let { id -> if (browse.state.value.row?.view?.auth_state != "signing_out") hosts.showPairing(id) }
         nav.tab(Routes.HOSTS)
     }
     NavHost(nav, startDestination = start) {
-        composable(Routes.HOME) { HomeScreen(browse, openPane, openThread, openWorkspace, showHosts, pair) }
-        composable(Routes.WORKSPACES) { WorkspacesScreen(browse, openWorkspace, showHosts, pair) }
+        composable(Routes.HOME) {
+            HomeScreen(browse, openPane, openThread, openWorkspace, showHosts, pair,
+                onNewChat = { nav.navigate(ManageRoutes.newChat(null)) }, onHistory = { nav.navigate(ManageRoutes.HISTORY) })
+        }
+        composable(Routes.WORKSPACES) { WorkspacesScreen(browse, openWorkspace, showHosts, pair) { nav.navigate(ManageRoutes.ADD_WORKSPACE) } }
         composable(Routes.HOSTS) { HostsScreen(hosts, onUse = { nav.tab(Routes.HOME) }) }
         composable(Routes.WORKSPACE) { entry ->
             val ws = entry.arguments?.getString("ws").orEmpty()
-            WorkspaceScreen(browse, ws, openPane, openThread, showHosts, pair, onNewTerminal = { nav.navigate(Routes.newTerminal(ws)) }) { nav.popBackStack() }
+            WorkspaceScreen(browse, ws, openPane, openThread, showHosts, pair, onNewTerminal = { nav.navigate(Routes.newTerminal(ws)) },
+                actions = { workspace ->
+                    val state by browse.state.collectAsState()
+                    WorkspaceActions(state, manage, workspace) { nav.navigate(ManageRoutes.newChat(workspace.workspace_id)) }
+                }) { nav.popBackStack() }
         }
+        manageRoutes(nav, browse, manage, openThread, openWorkspace)
         composable(Routes.THREAD) { entry ->
             val args = entry.arguments
             ThreadRoute(hosts, browse, args?.getString("ws").orEmpty(), args?.getString("thread").orEmpty(), showHosts) { nav.popBackStack() }
@@ -121,5 +133,23 @@ private fun Graph(nav: NavHostController, start: String, hosts: HostsModel, brow
         composable(Routes.NEW_TERMINAL) { entry ->
             TerminalScreen(hosts, browse, entry.arguments?.getString("ws").orEmpty(), null) { nav.popBackStack() }
         }
+    }
+}
+
+/** D-10 history, new chat and add-workspace routes. A created chat replaces the form in the back stack. */
+private fun androidx.navigation.NavGraphBuilder.manageRoutes(nav: NavHostController, browse: BrowseModel, manage: ManageModel,
+    openThread: (ThreadSummary) -> Unit, openWorkspace: (String) -> Unit) {
+    composable(ManageRoutes.HISTORY) { HistoryScreen(browse, manage, openThread) { nav.popBackStack() } }
+    val created: (String, String) -> Unit = { ws, thread ->
+        nav.navigate(Routes.thread(ws, thread)) { popUpTo(nav.currentBackStackEntry?.destination?.id ?: 0) { inclusive = true } }
+    }
+    composable(ManageRoutes.NEW_CHAT) { NewChatScreen(browse, manage, null, created) { nav.popBackStack() } }
+    composable(ManageRoutes.NEW_CHAT_IN) { entry ->
+        NewChatScreen(browse, manage, entry.arguments?.getString("ws"), created) { nav.popBackStack() }
+    }
+    composable(ManageRoutes.ADD_WORKSPACE) {
+        AddWorkspaceScreen(browse, manage, onCreated = { ws ->
+            nav.navigate(Routes.workspace(ws)) { popUpTo(ManageRoutes.ADD_WORKSPACE) { inclusive = true } }
+        }) { nav.popBackStack() }
     }
 }
