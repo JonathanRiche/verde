@@ -160,10 +160,10 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | D-03 | Pairing flow | android | linux+phone | D-02, K-07, A-06, H-06, H-07 | done (13f210cf; phone verify pending H-06/H-07; verified App Links need W-01) |
 | D-04 | Hosts list + switcher + sign out | android | linux | D-03, A-04 | done (f086c429, 7ab2629e; phone verify pending H-06/H-07) |
 | D-05 | Home + Workspaces + lifecycle | android | linux+phone | D-04, K-09 | done (44117855; phone verify pending H-06/H-07) |
-| D-06 | Transcript screen | android | linux | D-05, K-10, K-11 | in_progress (claude opus cli-thread-1790405365173-51c1a9aea695ce24) |
-| D-07 | Diff card | android | linux | D-06 | todo |
-| D-08 | Composer + pickers + attachments + follow-ups | android | linux | D-06 | todo |
-| D-09 | Approvals card | android | linux | D-06 | todo |
+| D-06 | Transcript screen | android | linux | D-05, K-10, K-11 | done (7dc772c2; phone verify pending) |
+| D-07 | Diff card | android | linux | D-06 | in_progress (claude opus cli-thread-1790407271462-7ea5683c249f1d83) |
+| D-08 | Composer + pickers + attachments + follow-ups | android | linux | D-06 | in_progress (claude opus cli-thread-1790407267836-b7791f3bb1576d33) |
+| D-09 | Approvals card | android | linux | D-06 | in_progress (claude opus cli-thread-1790407269611-f227ceb059b64580) |
 | D-10 | History, new chat, workspace management | android | linux | D-05, A-03 | in_progress (claude opus cli-thread-1790406845038-4d8a9c2c8a809c73; includes core create-thread/workspace intents) |
 | D-11 | Native terminal view | android | linux+phone | D-05, K-12 | in_progress (claude opus cli-thread-1790405366306-80a778f6cd0e9eaa) |
 | D-12 | File viewer | android | linux | D-06, A-01 | todo |
@@ -1023,6 +1023,7 @@ human-verify step.
 - **Done when:** screenshot/UI tests of a fixture transcript pass;
   scrolling a 500-message fixture holds frame rate on the phone
   (human-verify).
+- **Done (7dc772c2).** The Android transcript screen has a `TranscriptModel` per thread. Focus goes through `FocusClaim`, so attention clears on view, with a delayed release and one retry when offline. Older pages load once each, and the Stop button uses the core's turn id. `TranscriptItems.kt` defines a sealed item type with grouping rules copied from the web. `Markdown.kt` renders the core's markdown AST (only http, https and mailto links are tappable) and highlighted code. Output auto-follows only at the bottom, with a jump-to-latest button, and the screen covers loading, empty, error, offline and gone states. Extension points: the `TranscriptRenderers` registry (`diff` for D-07, `approval` for D-09) and a `bottomBar` slot for D-08. `mobile-android-test` passes 89/0, and the APK build and model check pass. Follow-ups: the core's 1024-receipt session budget (a core fix is running); D-11 must share `FocusClaim`; images show only as filename chips; there's no subagent thread id to open children; grouping should move into the core for iOS parity; D-12 handles citations.
 
 #### D-07 · Diff card
 - **depends:** D-06
