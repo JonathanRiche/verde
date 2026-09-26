@@ -87,3 +87,90 @@ Android 11+ can install over Wi-Fi.
   `https://richetech.tailc28f01.ts.net` opens in the phone's browser.
 - Collect logs: `adb logcat | grep -i verde` (the app never logs tokens,
   URLs or pair links).
+
+## Emulator
+
+A local emulator replaces the phone for install and UI checks. It needs no
+Tailscale app, because its traffic goes out through the host's network stack.
+
+### One-time setup (already done on `richetech`)
+
+Everything is user-level under `~/Android/Sdk`; the AVD lives in
+`~/.android/avd`. `/dev/kvm` must be readable and writable by your user
+(`ls -l /dev/kvm`; otherwise `sudo usermod -aG kvm $USER` and log in again).
+
+```bash
+export ANDROID_HOME="$HOME/Android/Sdk"
+sdk="mise exec java@openjdk-17 -- $ANDROID_HOME/cmdline-tools/latest/bin"
+yes | $sdk/sdkmanager emulator 'system-images;android-35;google_apis;x86_64'
+echo no | ANDROID_AVD_HOME="$HOME/.android/avd" $sdk/avdmanager create avd \
+  -n verde-pixel -k 'system-images;android-35;google_apis;x86_64' -d pixel_8
+```
+
+`verde-pixel` is a Pixel 8 profile (1080×2400) with 4 GB RAM, 4 cores and an
+8 GB data partition (`~/.android/avd/verde-pixel.avd/config.ini`). Set
+`ANDROID_AVD_HOME` when creating it: without it, `avdmanager` follows
+`XDG_CONFIG_HOME` to `~/.config/.android/avd`, where the emulator cannot find it.
+
+### Start, install, stop
+
+```bash
+mise run mobile-android-emulator                  # window; waits for boot (300 s deadline)
+mise run mobile-android-emulator -- --headless    # no window, for agents
+mise run mobile-android-install                   # newest APK, install -r, launch
+mise run mobile-android-install -- --build        # assembleDebug first
+mise run mobile-android-install -- --apk path/to/app-debug.apk
+~/Android/Sdk/platform-tools/adb emu kill         # stop (or Ctrl+C in the emulator task)
+```
+
+- The emulator task runs in the foreground and owns the emulator. It prints
+  `BOOTED verde-pixel as emulator-5554` once `sys.boot_completed` is set, then
+  keeps running until the emulator stops. Run it in its own terminal or as a
+  tracked process. If the AVD is already running, the task reports its serial
+  and exits. Other options: `--timeout SECONDS`, `--wipe` (fresh data),
+  `--avd NAME`, `--dns-server IP`.
+- Without `--apk`, the install task picks the newest `app-debug.apk` under
+  `../verde-wt/artifacts/` (next to the main checkout, including from
+  worktrees) or `packages/mobile_android/app/build/outputs/apk/debug/`. It
+  installs to `$ANDROID_SERIAL` or to the only connected device, and refuses
+  to guess when several are connected.
+- Each boot is a cold boot (about 40–50 s); installed apps and app data persist.
+  On a busy host, a "System UI isn't responding" dialog can appear right after
+  boot; tap **Wait**.
+- The emulator ships only the X11 (xcb) Qt plugin, so the windowed mode
+  starts after Qt logs a missing `wayland` plugin. That message is harmless.
+
+### Screenshots
+
+`adb exec-out screencap -p` returns an all-black image on this emulator build,
+both windowed and headless. Use the emulator console instead:
+
+```bash
+adb emu screenrecord screenshot /home/rtg/development/verde-wt/artifacts/emulator/
+```
+
+This writes `Screenshot_<time>.png` (1080×2400) into that directory. Use
+`adb shell uiautomator dump` to read on-screen text.
+
+### Networking
+
+Verified on 2026-09-26 with `verde-pixel` (API 35, google_apis):
+
+- The emulator uses the host's resolver (systemd-resolved `127.0.0.53`), which
+  forwards `*.tailc28f01.ts.net` to Tailscale MagicDNS. Inside the emulator,
+  `richetech.tailc28f01.ts.net` resolves to `100.105.26.102` and responds to
+  ping. `100.100.100.100` is reachable too.
+- Chrome in the emulator opens `https://richetech.tailc28f01.ts.net`, is
+  redirected to the verde-web `/login` page, and shows "Connection is secure".
+  The Tailscale Let's Encrypt certificate is trusted by the Android system
+  store. The app's TLS probe uses the same trust store.
+- No `-dns-server` flag, Play Store image or Tailscale app is needed. Pair with
+  the same gateway URL as a phone, `https://richetech.tailc28f01.ts.net`.
+  Section 4 applies unchanged, except that you paste the pair link: the
+  emulator's default camera is a virtual scene and can't scan the desktop QR
+  code.
+- If the host resolver changes and MagicDNS stops resolving inside the
+  emulator, start it with `-- --dns-server 100.100.100.100`.
+- `10.0.2.2` is the host's loopback from inside the emulator. Don't pair
+  against `http://10.0.2.2:6783`: the app refuses cleartext traffic and the
+  gateway expects the Tailscale origin.

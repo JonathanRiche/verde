@@ -143,6 +143,14 @@ run = "bash packages/mobile_android/run-gradle.sh assembleDebug"
 description = "Runs Android JVM and Robolectric tests."
 run = "bash packages/mobile_android/run-gradle.sh testDebugUnitTest"
 
+[tasks.mobile-android-emulator]
+description = "Starts the verde-pixel Android emulator in the foreground (--headless for no window) and waits for boot with a deadline."
+run = "bash packages/mobile_android/scripts/emulator.sh"
+
+[tasks.mobile-android-install]
+description = "Installs the newest debug APK (or --build / --apk PATH) on the only connected device or ANDROID_SERIAL and launches it."
+run = "bash packages/mobile_android/scripts/install.sh"
+
 [tasks.mobile-models-generate]
 description = "Regenerates committed Kotlin and Swift models from the Zig export registry."
 dir = "packages/client_core"
