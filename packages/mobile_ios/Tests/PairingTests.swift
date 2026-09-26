@@ -96,6 +96,8 @@ final class PairingTests: XCTestCase {
                 client_revision: 1, session_nonce: String(repeating: "0", count: 32), jitter_seed: 1)
             return CoreHost(core: try NativeHostCore(config: config), store: store, transport: transport, storage: storage)
         }
+        // RootView feeds scene phase; pairing input is accepted only in the foreground.
+        model.foreground(true)
         return (model, storage, transport)
     }
     private func until(_ condition: () -> Bool) async throws {
@@ -105,7 +107,7 @@ final class PairingTests: XCTestCase {
     }
     private func begin(_ model: PairingModel, native: Bool = false) async throws {
         await model.start()
-        try await until { model.row?.auth_state == "unpaired" }
+        try await until { model.row?.auth_state == "unpaired" && model.row?.lifecycle == .foreground }
         await model.open(try XCTUnwrap(URL(string: fixtureLink(native: native))))
         try await until { model.row?.trust_proposal != nil }
     }
@@ -154,7 +156,7 @@ final class PairingTests: XCTestCase {
     func testCoreRejectsBadLinksWithoutClosingHost() async throws {
         let (model, _, _) = try fixture()
         await model.start()
-        try await until { model.row?.auth_state == "unpaired" }
+        try await until { model.row?.auth_state == "unpaired" && model.row?.lifecycle == .foreground }
         let valid = fixtureLink()
         let invalid = ["not a link", PairingInput.manual(host: "http://host.invalid", grant: String(repeating: "6", count: 32), code: String(repeating: "7", count: 64)),
             valid + "&code=duplicate", valid.replacingOccurrences(of: "#code=", with: "&code="),
@@ -174,7 +176,7 @@ final class PairingTests: XCTestCase {
         let (model, _, transport) = try fixture()
         transport.rejectExchange = true
         await model.open(try XCTUnwrap(URL(string: fixtureLink())))
-        try await until { model.row?.auth_state == "unpaired" }
+        try await until { model.row?.auth_state == "unpaired" && model.row?.lifecycle == .foreground }
         // The view invokes this when the hosts revision changes after reads.
         await model.submitPending()
         try await until { model.row?.trust_proposal != nil }

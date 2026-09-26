@@ -4,6 +4,7 @@ import AVFoundation
 
 struct PairingView: View {
     @Bindable var model: PairingModel
+    var onClose: (() -> Void)?
     @Environment(\.scenePhase) private var scenePhase
     @State private var link = ""
     @State private var manualHost = ""
@@ -59,7 +60,7 @@ struct PairingView: View {
                             clearSecrets()
                             Task { await model.receive(input) }
                         }.disabled(link.isEmpty || model.busy).accessibilityIdentifier("submitPairingLink")
-                    }.disabled(model.store.failed)
+                    }.disabled(model.fatal)
                     Section("Enter details manually") {
                         TextField("HTTPS host address", text: $manualHost).keyboardType(.URL)
                         SecureField("Grant ID", text: $grant).privacySensitive()
@@ -70,7 +71,7 @@ struct PairingView: View {
                             Task { await model.receive(input) }
                         }.disabled(manualHost.isEmpty || grant.isEmpty || code.isEmpty || model.busy)
                     }.textInputAutocapitalization(.never).autocorrectionDisabled()
-                        .disabled(model.store.failed)
+                        .disabled(model.fatal)
                     if model.busy && model.errorText == nil {
                         Section { ProgressView("Connecting and pairing…") }
                     }
@@ -96,17 +97,15 @@ struct PairingView: View {
             .blur(radius: scenePhase == .active ? 0 : 12)
             .privacySensitive()
             .navigationTitle("Pair with Verde")
-            .task { await model.start() }
-            .onChange(of: model.store.hosts?.revision) { _, _ in Task { await model.submitPending() } }
-            .onChange(of: scenePhase) { _, phase in
-                if phase == .background { scanning = false; clearSecrets() }
-                if phase != .inactive { Task { await model.foreground(phase == .active) } }
+            .toolbar {
+                if let onClose {
+                    ToolbarItem(placement: .cancellationAction) { Button("Back to hosts", action: onClose) }
+                }
             }
-            .onOpenURL { url in clearSecrets(); Task { await model.open(url) } }
-            .onContinueUserActivity(NSUserActivityTypeBrowsingWeb) { activity in
-                guard let url = activity.webpageURL else { return }
-                clearSecrets()
-                Task { await model.open(url) }
+            .task { await model.start() }
+            .onChange(of: scenePhase) { _, phase in
+                // Lifecycle signals are app-wide (RootView); this screen only hides secrets.
+                if phase == .background { scanning = false; clearSecrets() }
             }
             .sheet(isPresented: $scanning) {
                 NavigationStack {

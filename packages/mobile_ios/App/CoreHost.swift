@@ -12,7 +12,9 @@ protocol HostCore: AnyObject {
 
 private struct RejectedEvent: Error { let status: Int32 }
 
-enum CoreBridgeError: Error { case status(Int32), closed, invalidOutput }
+/// `rejected` is a transactional core refusal (no state change, host still usable);
+/// every other error means the host was closed.
+enum CoreBridgeError: Error { case status(Int32), rejected(Int32), closed, invalidOutput }
 
 final class NativeHostCore: HostCore {
     private var handle: OpaquePointer?
@@ -55,6 +57,11 @@ final class CoreViewStore {
     private(set) var snapshots: [String: Data] = [:]
     private(set) var notifications: [EffectNotify] = []
     private(set) var failed = false
+    /// Set once this handle's core has reported a completed sync; its projections
+    /// are then at least as new as any warm-start cache.
+    private(set) var synced = false
+    /// Platform observers (host catalog, warm-start cache) run after each publication.
+    @ObservationIgnored var onApply: (() -> Void)?
 
     func apply(_ updates: [String: Data], notifications: [EffectNotify]) {
         do {
@@ -67,10 +74,20 @@ final class CoreViewStore {
                 }
                 snapshots[selector] = data
             }
+            if let row = hosts?.data?.items.first {
+                if ["signing_out", "signed_out"].contains(row.auth_state) {
+                    // A core-driven wipe also retires every projection held by the platform.
+                    home = nil
+                    workspaces = nil
+                    synced = false
+                    snapshots = snapshots.filter { $0.key == "hosts" }
+                } else if row.sync_state == "ready" { synced = true }
+            }
             self.notifications.append(contentsOf: notifications)
         } catch { failed = true }
+        onApply?()
     }
-    func markFailed() { failed = true }
+    func markFailed() { failed = true; onApply?() }
     func dismissNotifications() { notifications.removeAll() }
 }
 
@@ -112,7 +129,8 @@ actor CoreHost {
         let seed = entropy.suffix(8).reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
         let config = Config(api_version: 1, host_id: hostID, label: label, https_url: httpsURL,
                             wss_url: wssURL, client_revision: 1, session_nonce: nonce, jitter_seed: seed)
-        return CoreHost(core: try NativeHostCore(config: config), store: store)
+        return CoreHost(core: try NativeHostCore(config: config), store: store,
+                        storage: HostScopedStorage(base: KeychainStorage(), hostID: hostID))
     }
 
     /// The actor stamps time at delivery, including user intents and async completions.
@@ -131,14 +149,9 @@ actor CoreHost {
             }
             object["now_ms"] = .integer(Int64(ProcessInfo.processInfo.systemUptime * 1000))
             object["wall_time_ms"] = .integer(Int64(Date().timeIntervalSince1970 * 1000))
-            let isPairingIntent: Bool
-            switch event {
-            case .pair, .trust_decision, .retry_connection: isPairingIntent = true
-            default: isPairingIntent = false
-            }
             let output: Data
             do { output = try core.handle(JSONEncoder().encode(JSONValue.object(object))) }
-            catch CoreBridgeError.status(let status) where isPairingIntent && (status == 1 || status == 4 || status == 5) {
+            catch CoreBridgeError.status(let status) where Self.recoverable(event) && (status == 1 || status == 4 || status == 5) {
                 // Transactional input/lifecycle/resource rejection returns no
                 // effects and leaves the handle usable (e.g. a malformed link).
                 throw RejectedEvent(status: status)
@@ -147,13 +160,23 @@ actor CoreHost {
             try dispatch(batch.effects)
             if case .shutdown = event { finish() }
         } catch let rejected as RejectedEvent {
-            throw CoreBridgeError.status(rejected.status)
+            throw CoreBridgeError.rejected(rejected.status)
         } catch {
             // A lost/undecodable batch is fatal; never replay partially dispatched work.
             finish()
             let previous = publication
             publication = Task { await previous?.value; await store.markFailed() }
             throw error
+        }
+    }
+
+    /// User intents and lifecycle signals. Platform completions stay fatal when
+    /// rejected: dropping one would lose an effect the core is waiting for.
+    private static func recoverable(_ event: Event) -> Bool {
+        switch event {
+        case .pair, .trust_decision, .retry_connection, .sign_out, .forget_host,
+             .foreground, .background, .network_changed: return true
+        default: return false
         }
     }
 

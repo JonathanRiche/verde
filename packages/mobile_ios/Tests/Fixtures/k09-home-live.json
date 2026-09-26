@@ -1,0 +1,49 @@
+{
+  "api_version": 1,
+  "revision": "1",
+  "data": {
+    "items": [
+      {
+        "id": "fixture-ws:chat:layout-thread",
+        "workspace_id": "fixture-ws",
+        "kind": "chat",
+        "title": "Layout chat",
+        "thread_id": "layout-thread",
+        "terminal_id": null,
+        "status": "waiting_approval",
+        "attention": true,
+        "started_at_ms": 1700000040000,
+        "can_stop": true
+      },
+      {
+        "id": "fixture-ws:term:sess-7",
+        "workspace_id": "fixture-ws",
+        "kind": "terminal",
+        "title": "htop",
+        "thread_id": null,
+        "terminal_id": "sess-7",
+        "status": "working",
+        "attention": true,
+        "started_at_ms": null,
+        "can_stop": false
+      },
+      {
+        "id": "fixture-ws:chat:web-thread-fixture",
+        "workspace_id": "fixture-ws",
+        "kind": "chat",
+        "title": "Web chat",
+        "thread_id": "web-thread-fixture",
+        "terminal_id": null,
+        "status": "working",
+        "attention": false,
+        "started_at_ms": 1700000045000,
+        "can_stop": true
+      }
+    ],
+    "loading": false,
+    "stale": false,
+    "incomplete_scopes": [],
+    "error": null
+  },
+  "error": null
+}

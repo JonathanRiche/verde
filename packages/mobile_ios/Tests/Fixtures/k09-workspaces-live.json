@@ -1,0 +1,156 @@
+{
+  "api_version": 1,
+  "revision": "1",
+  "data": {
+    "items": [
+      {
+        "workspace_id": "fixture-ws",
+        "label": "Fixture workspace",
+        "path": "/tmp/k09-fixture-project",
+        "open": true,
+        "panes": [
+          {
+            "id": "fixture-ws:chat:layout-thread",
+            "workspace_id": "fixture-ws",
+            "kind": "chat",
+            "title": "Layout chat",
+            "thread_id": "layout-thread",
+            "terminal_id": null,
+            "status": "waiting_approval",
+            "attention": true,
+            "started_at_ms": 1700000040000,
+            "can_stop": true
+          },
+          {
+            "id": "fixture-ws:term:sess-7",
+            "workspace_id": "fixture-ws",
+            "kind": "terminal",
+            "title": "htop",
+            "thread_id": null,
+            "terminal_id": "sess-7",
+            "status": "working",
+            "attention": true,
+            "started_at_ms": null,
+            "can_stop": false
+          },
+          {
+            "id": "fixture-ws:browser:4",
+            "workspace_id": "fixture-ws",
+            "kind": "browser",
+            "title": "Browser",
+            "thread_id": null,
+            "terminal_id": null,
+            "status": "unavailable",
+            "attention": false,
+            "started_at_ms": null,
+            "can_stop": false
+          },
+          {
+            "id": "fixture-ws:chat:web-thread-fixture",
+            "workspace_id": "fixture-ws",
+            "kind": "chat",
+            "title": "Web chat",
+            "thread_id": "web-thread-fixture",
+            "terminal_id": null,
+            "status": "working",
+            "attention": false,
+            "started_at_ms": 1700000045000,
+            "can_stop": true
+          }
+        ],
+        "threads": [
+          {
+            "workspace_id": "fixture-ws",
+            "thread_id": "layout-thread",
+            "title": "Layout chat",
+            "provider": "codex",
+            "model": null,
+            "cwd": null,
+            "open": true,
+            "archived": false,
+            "last_activity_at_ms": 1700000000000,
+            "status": "waiting_approval",
+            "history_bucket": "Today"
+          },
+          {
+            "workspace_id": "fixture-ws",
+            "thread_id": "web-thread-fixture",
+            "title": "Web chat",
+            "provider": "codex",
+            "model": null,
+            "cwd": null,
+            "open": true,
+            "archived": false,
+            "last_activity_at_ms": 1700000010000,
+            "status": "working",
+            "history_bucket": "Today"
+          },
+          {
+            "workspace_id": "fixture-ws",
+            "thread_id": "subagent:fixture",
+            "title": "Child",
+            "provider": "codex",
+            "model": null,
+            "cwd": null,
+            "open": true,
+            "archived": false,
+            "last_activity_at_ms": 1700000020000,
+            "status": "idle",
+            "history_bucket": "Today"
+          }
+        ]
+      }
+    ],
+    "loading": false,
+    "stale": false,
+    "error": null,
+    "history": {
+      "query": "",
+      "items": [
+        {
+          "workspace_id": "fixture-ws",
+          "thread_id": "subagent:fixture",
+          "title": "Child",
+          "provider": "codex",
+          "model": null,
+          "cwd": null,
+          "open": true,
+          "archived": false,
+          "last_activity_at_ms": 1700000020000,
+          "status": "idle",
+          "history_bucket": "Today"
+        },
+        {
+          "workspace_id": "fixture-ws",
+          "thread_id": "web-thread-fixture",
+          "title": "Web chat",
+          "provider": "codex",
+          "model": null,
+          "cwd": null,
+          "open": true,
+          "archived": false,
+          "last_activity_at_ms": 1700000010000,
+          "status": "working",
+          "history_bucket": "Today"
+        },
+        {
+          "workspace_id": "fixture-ws",
+          "thread_id": "layout-thread",
+          "title": "Layout chat",
+          "provider": "codex",
+          "model": null,
+          "cwd": null,
+          "open": true,
+          "archived": false,
+          "last_activity_at_ms": 1700000000000,
+          "status": "waiting_approval",
+          "history_bucket": "Today"
+        }
+      ],
+      "next_cursor": null,
+      "loading": false,
+      "error": null
+    }
+  },
+  "error": null
+}

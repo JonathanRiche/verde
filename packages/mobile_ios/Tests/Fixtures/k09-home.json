@@ -1,0 +1,12 @@
+{
+  "api_version": 1,
+  "revision": "1",
+  "data": {
+    "items": [],
+    "loading": false,
+    "stale": false,
+    "incomplete_scopes": [],
+    "error": null
+  },
+  "error": null
+}

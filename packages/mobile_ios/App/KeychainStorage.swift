@@ -96,3 +96,17 @@ struct KeychainStorage: SecureStorage {
         }
     }
 }
+
+/// Confines one host handle to its own `vc/1/<host_id>/` records, so a core can
+/// never read or erase another host's credential, pin or caches.
+struct HostScopedStorage: SecureStorage {
+    let base: SecureStorage
+    let prefix: String
+    init(base: SecureStorage, hostID: String) { self.base = base; prefix = "vc/1/\(hostID)/" }
+    private func check(_ key: String) throws {
+        guard key.hasPrefix(prefix), key.utf8.count <= 4096 else { throw StorageError(code: .denied) }
+    }
+    func get(_ key: String) throws -> Data? { try check(key); return try base.get(key) }
+    func put(_ key: String, value: Data) throws { try check(key); try base.put(key, value: value) }
+    func delete(_ key: String) throws { try check(key); try base.delete(key) }
+}
