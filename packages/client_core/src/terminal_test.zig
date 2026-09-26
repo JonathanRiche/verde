@@ -423,3 +423,62 @@ test "VT answers primary device attributes across split input" {
     defer A.free(reply);
     try same("\x1b[?62;22c", reply);
 }
+
+test "accepted terminal input wakes idle output polling and keeps empty replies interactive" {
+    var host = try h.Host.init(A, config);
+    defer host.deinit();
+    var tx = try h.Transaction.init(&host);
+    defer tx.deinit();
+    try ready(&tx);
+    try attach(&tx);
+    try response(&tx, try findCall(&tx, "session.tail"), try h.parse(tx.allocator(),
+        \\{"text":"","running":true,"next_offset":0}
+    ));
+    try ack(&tx, try output(&tx), false);
+    const idle = try timer(&tx);
+    try expect(idle.deadline == 1000);
+    try event(&tx, "terminal_input", .{ .intent_id = "typed", .terminal_id = "k12-fixture", .vt_modes = .{ .application_cursor = false, .bracketed_paste = false }, .input = .{ .kind = "text", .text = "ls\r", .ctrl = false, .alt = false, .shift = false } });
+    try fixture(&tx, "session.write", @embedFile("fixtures/terminal/write.json"));
+    // The read is issued immediately, without waiting for the old one-second timer.
+    const call = try findCall(&tx, "session.tail");
+    for (tx.state.pending) |pending| try expect(!h.eq(pending.id, idle.id));
+    try response(&tx, call, try h.parse(tx.allocator(),
+        \\{"text":"","running":true,"next_offset":0}
+    ));
+    try ack(&tx, try output(&tx), false);
+    try expect((try timer(&tx)).deadline == 160);
+    // A cancelled timer callback cannot start a duplicate read.
+    try fire(&tx, idle);
+    try expect(tx.state.rpc.calls.len == 0);
+    tx.state.now_ms = 4000;
+    try fire(&tx, try timer(&tx));
+    try response(&tx, try findCall(&tx, "session.tail"), try h.parse(tx.allocator(),
+        \\{"text":"","running":true,"next_offset":0}
+    ));
+    try ack(&tx, try output(&tx), false);
+    try expect((try timer(&tx)).deadline == 5000);
+}
+
+test "terminal input during an in-flight read waits for VT acknowledgement before refreshing" {
+    var host = try h.Host.init(A, config);
+    defer host.deinit();
+    var tx = try h.Transaction.init(&host);
+    defer tx.deinit();
+    try ready(&tx);
+    try attach(&tx);
+    const original = try findCall(&tx, "session.tail");
+    try event(&tx, "terminal_input", .{ .intent_id = "typed-during-read", .terminal_id = "k12-fixture", .vt_modes = .{ .application_cursor = false, .bracketed_paste = false }, .input = .{ .kind = "text", .text = "x", .ctrl = false, .alt = false, .shift = false } });
+    try fixture(&tx, "session.write", @embedFile("fixtures/terminal/write.json"));
+    try expect(tx.state.rpc.calls.len == 1);
+    try expect((try findCall(&tx, "session.tail")).id == original.id);
+    try response(&tx, original, try h.parse(tx.allocator(),
+        \\{"text":"","running":true,"next_offset":0}
+    ));
+    try expect(tx.state.rpc.calls.len == 0);
+    try ack(&tx, try output(&tx), false);
+    const immediate = try timer(&tx);
+    try expect(immediate.deadline == 0);
+    try fire(&tx, immediate);
+    try expect(tx.state.rpc.calls.len == 1);
+    try expect((try findCall(&tx, "session.tail")).id != original.id);
+}

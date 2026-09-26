@@ -208,7 +208,13 @@ class CoreHostTest {
                 assertNull(response.error?.code?.name, response.error)
                 assertEquals(200, response.status)
                 assertEquals("reply", String(Base64.getDecoder().decode(response.body_base64)))
-                assertNotNull(fixture.server.takeRequest(2, TimeUnit.SECONDS))
+                assertEquals(0, fixture.server.takeRequest(2, TimeUnit.SECONDS)!!.sequenceNumber)
+                fixture.server.enqueue(MockResponse().setBody("reused"))
+                core.effects = listOf(fixture.http("warm"))
+                host.send { n,w -> EventForeground(now_ms=n, wall_time_ms=w) }
+                assertNull(core.next<EventHttpResponse>().error)
+                // A second request with the same trust decision uses the established TLS socket.
+                assertEquals(1, fixture.server.takeRequest(2, TimeUnit.SECONDS)!!.sequenceNumber)
                 core.effects = listOf(fixture.http("bad", "0".repeat(64)))
                 host.send { n,w -> EventForeground(now_ms=n, wall_time_ms=w) }
                 assertEquals(TransportFailureCode.pin_mismatch, core.next<EventHttpResponse>().error?.code)
@@ -217,7 +223,8 @@ class CoreHostTest {
                 core.effects = listOf(fixture.http("cap", cap=2))
                 host.send { n,w -> EventForeground(now_ms=n, wall_time_ms=w) }
                 assertEquals(TransportFailureCode.resource, core.next<EventHttpResponse>().error?.code)
-                fixture.server.takeRequest(2, TimeUnit.SECONDS)
+                // Returning to the original pin still gets a new connection after trust changed.
+                assertEquals(0, fixture.server.takeRequest(2, TimeUnit.SECONDS)!!.sequenceNumber)
             } finally { host.close() }
             val untrustedCore = FakeCore()
             val untrustedHost = CoreHost.create(config, executor(), untrustedCore)

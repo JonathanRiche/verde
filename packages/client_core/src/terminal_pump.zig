@@ -32,6 +32,8 @@ const Row = struct {
     staged_offset: u64 = 0,
     delay: u32 = 1000,
     waiting: bool = false,
+    interactive_until_ms: i64 = 0,
+    refresh_pending: bool = false,
 };
 pub const State = struct { rows: []Row = &.{} };
 fn append(comptime T: type, a: A, list: *[]const T, item: T) !void {
@@ -252,7 +254,7 @@ pub fn complete(tx: *h.Transaction, pending: h.Pending, event: V) h.ApiError!boo
         r.view.grid_revision = try h.string(event, "grid_revision");
         r.view.stale = false;
         r.view.@"error" = null;
-        try wait(tx, r, r.delay);
+        try wait(tx, r, if (r.refresh_pending) 0 else r.delay);
     }
     tx.changed = true;
     return true;
@@ -297,6 +299,20 @@ pub fn pump(tx: *h.Transaction) h.ApiError!void {
                     }
                 } else {
                     if (action.last) operation(tx, action.intent_id, "succeeded", null);
+                    if (eq(action.method, "session.write")) {
+                        // An accepted key must not sit behind the idle polling timer.
+                        r.interactive_until_ms = (tx.state.now_ms orelse 0) +| 3000;
+                        r.refresh_pending = true;
+                        var index: usize = 0;
+                        while (index < tx.state.pending.len) {
+                            const pending = tx.state.pending[index];
+                            if (pending.kind == .timer and eq(pending.purpose, try purpose(tx.allocator(), r))) {
+                                _ = try tx.emit("cancel_timer", .{ .timer_id = pending.id });
+                                try tx.remove(index);
+                            } else index += 1;
+                        }
+                        r.waiting = false;
+                    }
                     if (eq(action.method, "session.create")) r.view.session_status = "running";
                     if (eq(action.method, "session.resize")) {
                         r.view.cols = @intCast(p.uint(p.get(action.params, "cols")).?);
@@ -326,6 +342,7 @@ pub fn pump(tx: *h.Transaction) h.ApiError!void {
         var params = try h.parse(tx.allocator(), try h.encode(tx.allocator(), .{ .id = r.view.terminal_id, .max_bytes = @as(u32, 256 * 1024) }));
         if (r.offset) |offset| try params.object.put(tx.allocator(), "offset", .{ .number_string = try std.fmt.allocPrint(tx.allocator(), "{d}", .{offset}) });
         r.tail_id = try rpc.request(tx, "session.tail", params, .{ .mutation = false, .intent_id = "@terminal" });
+        r.refresh_pending = false;
     }
 }
 fn tail(tx: *h.Transaction, r: *Row, value: V) !void {
@@ -356,7 +373,7 @@ fn tail(tx: *h.Transaction, r: *Row, value: V) !void {
     const reset = r.offset == null or gap or p.yes(p.get(value, "truncated"));
     const bytes = if (reset) alignPtyStream(text.string) else text.string;
     r.view.session_status = if (p.yes(p.get(value, "running"))) "running" else "exited";
-    r.delay = if (text.string.len > 0) 160 else 1000;
+    r.delay = if (text.string.len > 0 or (tx.state.now_ms orelse 0) < r.interactive_until_ms) 160 else 1000;
     r.staged_offset = next;
     const id = try tx.emit("terminal_output", .{ .terminal_id = r.view.terminal_id, .reset = reset, .bytes_base64 = try rpc.encodeBase64(tx.allocator(), bytes), .next_offset = try std.fmt.allocPrint(tx.allocator(), "{d}", .{next}) });
     try tx.track(.terminal, id, r.view.terminal_id);

@@ -44,6 +44,21 @@ class EffectExecutor(
     private val sockets = ConcurrentHashMap<String, SocketState>()
     private val timers = ConcurrentHashMap<String, Job>()
     private val clients = ConcurrentHashMap.newKeySet<OkHttpClient>()
+    private var poolKey: Pair<String, String>? = null
+    private var trustedPool: ConnectionPool? = null
+
+    /** Reuse TLS only within the exact origin and pin authorized by the core. */
+    @Synchronized private fun pool(url: HttpUrl, tls: Tls): ConnectionPool {
+        check(!closed.get())
+        val key = Pair("${url.scheme}://${url.host}:${url.port}", tls.spki_sha256)
+        if (key != poolKey) {
+            trustedPool?.evictAll()
+            trustedPool = ConnectionPool()
+            poolKey = key
+        }
+        return trustedPool!!
+    }
+
     private val storage = Channel<suspend () -> Unit>(Channel.UNLIMITED)
     @Volatile private var completion: ((Completion) -> Unit)? = null
     private val closed = AtomicBoolean(false)
@@ -129,10 +144,10 @@ class EffectExecutor(
         val digest = tls.spki_sha256.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
         val okhttpPin = "sha256/" + Base64.getEncoder().encodeToString(digest)
         // Pinner is checked after system trust + hostname validation and before HTTP bytes.
-        // A private pool per effect also prevents reuse across changed trust decisions.
+        // A trust-scoped pool avoids a TCP/TLS handshake for every terminal key/poll.
         var originalHeaders: Headers? = null
         val sent = AtomicBoolean(false)
-        return baseClient.newBuilder().dispatcher(networkDispatcher).connectionPool(ConnectionPool())
+        return baseClient.newBuilder().dispatcher(networkDispatcher).connectionPool(pool(url, tls))
             .eventListener(object : EventListener() {
                 override fun requestHeadersStart(call: Call) {
                     if (!sent.compareAndSet(false, true)) call.cancel()
@@ -159,7 +174,10 @@ class EffectExecutor(
             .build().also { clients.add(it) }
     }
 
-    private fun release(client: OkHttpClient) { clients.remove(client); client.connectionPool.evictAll() }
+    @Synchronized private fun release(client: OkHttpClient) {
+        clients.remove(client)
+        if (closed.get() || client.connectionPool !== trustedPool) client.connectionPool.evictAll()
+    }
 
     private fun http(e: EffectHttpRequest) {
         var client: OkHttpClient? = null
@@ -343,6 +361,7 @@ class EffectExecutor(
         storage.close(); scope.cancel()
         files.clear()
         clients.forEach { it.connectionPool.evictAll() }; clients.clear()
+        synchronized(this) { trustedPool?.evictAll(); trustedPool = null; poolKey = null }
         networkDispatcher.executorService.shutdown()
     }
 
