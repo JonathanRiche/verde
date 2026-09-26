@@ -166,7 +166,7 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | D-09 | Approvals card | android | linux | D-06 | done (5bb55bac) |
 | D-10 | History, new chat, workspace management | android | linux | D-05, A-03 | in_progress (claude opus cli-thread-1790406845038-4d8a9c2c8a809c73; includes core create-thread/workspace intents) |
 | D-11 | Native terminal view | android | linux+phone | D-05, K-12 | done (a114ffca; phone verify pending) |
-| D-12 | File viewer | android | linux | D-06, A-01 | in_progress (claude opus cli-thread-1790408971195-db5b6fa85bded5cb) |
+| D-12 | File viewer | android | linux | D-06, A-01 | done (0df099c8) |
 | D-13 | Theme + reduced motion | android | linux | D-05 | todo |
 | D-14 | Push + actionable notifications | android | linux+phone | D-09, K-17, A-14, C-02, H-05 | todo |
 | D-15 | App lock + secure screen | android | linux | D-05 | in_progress (claude opus cli-thread-1790409422541-c5120ca8c7ab6da2) |
@@ -1081,6 +1081,7 @@ human-verify step.
   markdown/text native; Share / Open with. Files go to cache storage only
   and are cleared on sign-out.
 - **Done when:** tests pass.
+- **Done (0df099c8).** Core `file_open` intent + `files.zig` (host `/api/file`/`/api/preview` fetch, token refresh, TLS pin, typed errors); Android in-memory viewer (text/markdown/image/PDF/Office), citation ranges, diff "Open file". Deviations: no Share/Open-with (in-memory rule); PDF needs Android 11+; host 415s `.js/.html/.svg`. Follow-ups: iOS must handle the new fetch effect (I-09); PDF pinch-zoom; late downloads linger until evicted.
 
 #### D-13 · Theme + reduced motion
 - **depends:** D-05
