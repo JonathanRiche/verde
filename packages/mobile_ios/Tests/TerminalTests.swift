@@ -126,21 +126,26 @@ final class TerminalVTTests: XCTestCase {
         }
         XCTAssertEqual(sent, ["\u{1b}[3;1R"])
         await vt.resize(cols: 30, rows: 6)
-        var snapshot = try XCTUnwrap(await vt.current().snapshot)
+        var state = await vt.current()
+        var snapshot = try XCTUnwrap(state.snapshot)
         XCTAssertEqual([snapshot.cols, snapshot.rows], [30, 6])
         let lines = (1...40).map { "line \($0)\r\n" }.joined()
         _ = await vt.apply(reset: false, bytes: Data(lines.utf8), cols: 30, rows: 6)
-        XCTAssertGreaterThan(try XCTUnwrap(await vt.current().snapshot).scrollback_rows, 0)
+        state = await vt.current()
+        XCTAssertGreaterThan(try XCTUnwrap(state.snapshot).scrollback_rows, 0)
         await vt.scroll(3)
-        snapshot = try XCTUnwrap(await vt.current().snapshot)
+        state = await vt.current()
+        snapshot = try XCTUnwrap(state.snapshot)
         XCTAssertEqual(snapshot.scroll_offset, 3)
         XCTAssertNil(renderPlan(snapshot).cursor, "no cursor while viewing history")
         await vt.scroll(-3)
-        XCTAssertEqual(try XCTUnwrap(await vt.current().snapshot).scroll_offset, 0)
+        state = await vt.current()
+        XCTAssertEqual(try XCTUnwrap(state.snapshot).scroll_offset, 0)
         // A reset replay recreates the emulator at the core's size.
         _ = await vt.apply(reset: true, bytes: K12.tail, cols: 20, rows: 4)
-        XCTAssertEqual(await vt.current().resets, 2)
-        XCTAssertEqual(cellsJSON(await vt.current().snapshot), cellsJSON(K12.snapshot))
+        state = await vt.current()
+        XCTAssertEqual(state.resets, 2)
+        XCTAssertEqual(cellsJSON(state.snapshot), cellsJSON(K12.snapshot))
         // The main-thread feed follows in order.
         let feed = vt.feed
         try await waitUntil("feed") { feed.resets == 2 && feed.snapshot?.cols == 20 }
@@ -290,13 +295,17 @@ final class TerminalGridViewTests: XCTestCase {
     }
 
     private func close(_ a: UInt32, _ b: UInt32, tolerance: Int = 6) -> Bool {
-        (0..<3).allSatisfy { shift in abs(Int((a >> (shift * 8)) & 0xff) - Int((b >> (shift * 8)) & 0xff)) <= tolerance }
+        [0, 8, 16].allSatisfy { (shift: UInt32) -> Bool in
+            let x = Int((a >> shift) & 0xff), y = Int((b >> shift) & 0xff)
+            return abs(x - y) <= tolerance
+        }
     }
 
     func testRealSnapshotDrawsColorsGlyphsAndCursor() async throws {
         let vt = TerminalVT(bridge: NativeTerminalBridge.shared)
         _ = await vt.apply(reset: true, bytes: K12.tail, cols: 20, rows: 4)
-        let snapshot = try XCTUnwrap(await vt.current().snapshot)
+        let state = await vt.current()
+        let snapshot = try XCTUnwrap(state.snapshot)
         await vt.close()
         let view = TerminalGridView(frame: CGRect(x: 0, y: 0, width: 300, height: 120))
         view.fontSize = 20
