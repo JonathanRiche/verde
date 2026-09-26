@@ -228,15 +228,17 @@ class ComposerTest {
         await { !exists("Run this command on the host?") }
     }
 
-    @Test fun slashButtonOpensCatalogWithoutSubmittingAndPreservesDrafts() {
+    @Test fun placeholderExplainsTypedCommandsAndFileSearchWithoutAnExtraButton() {
         launch()
-        compose.onNodeWithContentDescription("Slash commands").performClick()
+        compose.onNodeWithText("Ask anything, or use / for commands and @ to search files.").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Slash commands").assertDoesNotExist()
+        field().performTextInput("/")
         await { transcript.composer.field.text == "/" && exists("/compact") }
         assertEquals(1, sent<EventSlashSearch>().size)
         assertTrue(sent<EventSlashRun>().isEmpty())
         assertTrue(sent<EventSend>().isEmpty())
         field().performTextReplacement("Keep my draft")
-        compose.onNodeWithContentDescription("Slash commands").assertIsNotEnabled()
+        compose.onNodeWithContentDescription("Slash commands").assertDoesNotExist()
         assertEquals("Keep my draft", transcript.composer.field.text)
     }
 

@@ -49,9 +49,11 @@ checks and report uncertain delivery without automatic resubmission. Closing
 keeps the chat available in History. Title generation, handoff and TUI launch
 are not yet exposed by the Android menu.
 
-Type `/` at the start of the composer or tap its `/` button to browse the host's
-provider commands. The list scrolls and filters as you type. Choosing a command
-fills the draft; the Run button executes it. Existing message text is preserved.
+Type `/` at the start of the composer to browse the host's provider commands.
+The list scrolls and filters as you type. Choosing a command
+fills the draft; the Run button executes it. Type `@` to search workspace files
+and select a result to insert its reference at the caret. The empty composer
+shows both shortcuts; existing message text is preserved.
 
 Workspace refreshes retain the last complete projection. A compatible fallback
 while loading a chat remains a loading state; final failures still show Retry.

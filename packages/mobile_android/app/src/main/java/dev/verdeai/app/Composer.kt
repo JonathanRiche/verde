@@ -169,9 +169,9 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState) {
                             view == null -> "Loading…"
                             !ready -> "Offline. Your draft is kept."
                             running -> followupHint(null, kind)
-                            else -> "Message"
+                            else -> "Ask anything, or use / for commands and @ to search files."
                         }, color = VerdeColors.Subtle, style = MaterialTheme.typography.bodyLarge,
-                            maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            maxLines = 3, overflow = TextOverflow.Ellipsis)
                         innerTextField()
                     }
                 },
@@ -188,11 +188,6 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState) {
                         else permission.launch(Manifest.permission.CAMERA)
                     },
                     onFiles = { files.launch(arrayOf("image/*")) })
-                IconButton(onClick = composer::openSlashCommands,
-                    enabled = ready && !sendPending && !composer.busy && (text.isBlank() || composer.slash != null),
-                    modifier = Modifier.semantics { contentDescription = "Slash commands" }) {
-                    Text("/", style = MaterialTheme.typography.titleMedium, color = VerdeColors.Muted)
-                }
                 if (view != null) SettingsControls(view, state, provider) { picker = it }
                 if (running) {
                     StopControl(state.stopping, state.canStop, model::stop, Modifier.testTag(COMPOSER_STOP))

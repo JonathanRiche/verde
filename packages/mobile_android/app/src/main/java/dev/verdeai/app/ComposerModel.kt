@@ -225,14 +225,6 @@ internal class ComposerModel(
         }
     }
 
-    /** Opens the provider catalog without replacing an existing message. */
-    fun openSlashCommands() {
-        if (!field.text.isBlank() && slash == null) return
-        if (!slashLoading && chat.latestComposer()?.catalogs?.slash?.isEmpty() != false) slashRequested = false
-        if (field.text.isBlank()) edit(TextFieldValue("/", TextRange(1))) else requestSlash()
-        focusRequest++
-    }
-
     fun acceptMention(path: String) {
         acceptFileMention(field, path)?.let { edit(it) }
     }
