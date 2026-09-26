@@ -35,6 +35,9 @@ struct TranscriptScreen: View {
         .navigationTitle(model?.thread?.thread.title ?? fallbackTitle ?? "Chat")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                ManageContainer(browse: browse) { manage in ThreadActions(workspace: workspaceID, thread: threadID, title: model?.thread?.thread.title ?? fallbackTitle ?? "Chat", manage: manage) }
+            }
             if let summary = model?.thread?.thread {
                 ToolbarItem(placement: .principal) {
                     VStack(spacing: 0) {

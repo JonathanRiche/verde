@@ -59,6 +59,9 @@ final class ChatCore: HostCore {
     private var _thread: String
     private var _composer = "composer-idle"
     private var draftView: ChatComposerView?
+    private var manageView = ManageView(operations: [], directory: ManageDirectory(),
+        new_chat: ManageNewChat(selection: ChatSelection(), catalogs: ChatCatalogs()),
+        can_manage_workspaces: true, can_create_threads: true)
     var rejectDraft = false
     private var _afterFocus: String?
     private var _missing = false
@@ -135,6 +138,19 @@ final class ChatCore: HostCore {
             } else {
                 setOperation(e.intent_id, "failed", LocalError(code: "stale_turn", message: ""))
             }
+        case .new_chat_select(let e):
+            manageView.new_chat = ManageNewChat(workspace_id: e.workspace_id,
+                selection: ChatSelection(provider: e.provider ?? "codex", model: e.model, effort: e.effort, access: e.access, speed: e.speed),
+                providers: [ChatChoice(id: "codex", label: "Codex")], catalogs: ChatCatalogs(), can_create: true)
+            setOperation(e.intent_id, "succeeded")
+        case .thread_create(let e):
+            manageView.operations.append(ManageJob(intent_id: e.intent_id, kind: "thread_create", state: "succeeded", workspace_id: e.workspace_id, thread_id: "created-thread"))
+            setOperation(e.intent_id, "succeeded")
+        case .workspace_close(let e):
+            manageView.operations.append(ManageJob(intent_id: e.intent_id, kind: "workspace_close", state: "failed", workspace_id: e.workspace_id,
+                busy: ManageBusy(pending_turns: 2, running_tasks: 1), error: LocalError(code: "workspace_busy", message: "Busy")))
+            setOperation(e.intent_id, "failed", LocalError(code: "workspace_busy", message: "Busy"))
+        case .history_search(let e): setOperation(e.intent_id, "succeeded")
         case .draft_set(let e):
             if rejectDraft { setOperation(e.intent_id, "failed", LocalError(code: "resource_limit", message: "Draft is too large.")); break }
             var view = try JSONDecoder().decode(ComposerQuery.self, from: SharedFixtures.data("d06", "composer-idle.json")).data!
@@ -153,7 +169,7 @@ final class ChatCore: HostCore {
         default: break
         }
         // Like the real core: `hosts`/`operations` are announced only when they changed.
-        var scopes = ["home", "workspaces"]
+        var scopes = ["home", "workspaces", "manage"]
         if try encoded(row) != hostBefore { scopes.append("hosts") }
         if operationsChanged { scopes.append("operations"); operationsChanged = false }
         if _ensured { scopes += [chatSelector("thread", chatWS, chatThread), chatSelector("composer", chatWS, chatThread)] }
@@ -172,6 +188,7 @@ final class ChatCore: HostCore {
         case "operations":
             return try encoded(OperationsQuery(api_version: 1, revision: String(sequence),
                                                data: OperationsView(items: order.compactMap { _operations[$0] }), error: nil))
+        case "manage": return try encoded(ManageQuery(api_version: 1, revision: String(sequence), data: manageView, error: nil))
         case "home": return try encoded(K09.homeLive)
         case "workspaces": return try encoded(K09.workspacesLive)
         default:

@@ -3,6 +3,9 @@ import UIKit
 
 enum BrowseRoute: Hashable {
     case workspace(String)
+    case history
+    case newChat(String?)
+    case addWorkspace
     case thread(workspace: String, thread: String)
     case terminal(workspace: String, terminal: String)
     /// Each push is a distinct new session request.
@@ -246,7 +249,7 @@ struct HomeScreen: View {
             if !open.isEmpty {
                 Section("Workspaces") { ForEach(open, id: \.workspace_id) { WorkspaceItem(workspace: $0) } }
             } else if state.workspaces != nil {
-                Section { Text("No workspaces on this host yet. Add one from Verde on your computer.") }
+                Section { NavigationLink("Add a workspace", value: BrowseRoute.addWorkspace) }
             }
         }
     }
@@ -259,9 +262,13 @@ struct WorkspacesScreen: View {
         BrowseFrame(title: "Workspaces", model: model, actions: actions) { state, _ in
             let all = state.workspaces?.items ?? []
             if all.isEmpty {
-                Text("No workspaces on this host yet. Add one from Verde on your computer.")
+                NavigationLink("Add a workspace", value: BrowseRoute.addWorkspace)
             } else {
-                Section { ForEach(all.filter(\.open), id: \.workspace_id) { WorkspaceItem(workspace: $0) } }
+                Section {
+                    NavigationLink("Add workspace", value: BrowseRoute.addWorkspace)
+                    NavigationLink("New chat", value: BrowseRoute.newChat(nil))
+                    NavigationLink("History", value: BrowseRoute.history)
+                    ForEach(all.filter(\.open), id: \.workspace_id) { WorkspaceItem(workspace: $0) } }
                 let closed = all.filter { !$0.open }
                 if !closed.isEmpty {
                     Section("Closed") { ForEach(closed, id: \.workspace_id) { WorkspaceItem(workspace: $0) } }
@@ -282,6 +289,7 @@ struct WorkspaceScreen: View {
                     ticking: workspace?.panes.contains { $0.can_stop && $0.started_at_ms != nil } ?? false,
                     large: false) { _, now in
             if let workspace {
+                ManageContainer(browse: model) { manage in WorkspaceActions(workspace: workspace, manage: manage) }
                 if !workspace.path.isEmpty { Text(workspace.path).font(.footnote).foregroundStyle(.secondary) }
                 Section("Panes") {
                     if workspace.panes.isEmpty { Text("No open panes.") }
@@ -322,6 +330,9 @@ struct BrowseStack<Root: View>: View {
         NavigationStack(path: $path) {
             root().navigationDestination(for: BrowseRoute.self) { route in
                 switch route {
+                case .history: ManageContainer(browse: model) { manage in HistoryScreen(browse: model, manage: manage) }
+                case .newChat(let id): ManageContainer(browse: model) { manage in NewChatScreen(browse: model, manage: manage, initialWorkspace: id) }
+                case .addWorkspace: ManageContainer(browse: model) { manage in AddWorkspaceScreen(manage: manage) }
                 case .workspace(let id): WorkspaceScreen(model: model, workspaceID: id, actions: actions)
                 case .thread(let workspace, let thread):
                     TranscriptScreen(browse: model, workspaceID: workspace, threadID: thread, onHosts: actions.hosts)

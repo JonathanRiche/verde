@@ -1198,6 +1198,8 @@ Shared rules:
 - **depends:** I-04, D-10
 - **Done when:** tests pass.
 
+- **Implemented:** native History search/filter/paging with core buckets, New Chat with workspace/provider/model/effort/access/speed, confined folder browser and typed-path fallback, workspace add/rename/close/reopen, and chat rename/sync/close. Management receipts gate duplicate actions and surface busy/uncertain outcomes. Mac scratch build and 97 tests pass. Matches Android’s current scope: thread archive, title regeneration, and independent new-chat cwd overrides remain core/API follow-ups.
+
 #### I-08 · Native terminal view
 - **depends:** I-04, D-11
 - **Do:** translate. A Core Text / Canvas renderer, `inputAccessoryView` key
