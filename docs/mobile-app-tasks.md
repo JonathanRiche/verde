@@ -161,12 +161,12 @@ exact question and stop. Report: commit sha, files changed, verification output,
 | D-04 | Hosts list + switcher + sign out | android | linux | D-03, A-04 | done (f086c429, 7ab2629e; phone verify pending H-06/H-07) |
 | D-05 | Home + Workspaces + lifecycle | android | linux+phone | D-04, K-09 | done (44117855; phone verify pending H-06/H-07) |
 | D-06 | Transcript screen | android | linux | D-05, K-10, K-11 | done (7dc772c2; phone verify pending) |
-| D-07 | Diff card | android | linux | D-06 | in_progress (claude opus cli-thread-1790407271462-7ea5683c249f1d83) |
+| D-07 | Diff card | android | linux | D-06 | done (e369ee75, cc2bf9e7; phone verify pending) |
 | D-08 | Composer + pickers + attachments + follow-ups | android | linux | D-06 | in_progress (claude opus cli-thread-1790407267836-b7791f3bb1576d33) |
 | D-09 | Approvals card | android | linux | D-06 | in_progress (claude opus cli-thread-1790407269611-f227ceb059b64580) |
 | D-10 | History, new chat, workspace management | android | linux | D-05, A-03 | in_progress (claude opus cli-thread-1790406845038-4d8a9c2c8a809c73; includes core create-thread/workspace intents) |
 | D-11 | Native terminal view | android | linux+phone | D-05, K-12 | done (a114ffca; phone verify pending) |
-| D-12 | File viewer | android | linux | D-06, A-01 | todo |
+| D-12 | File viewer | android | linux | D-06, A-01 | in_progress (claude opus cli-thread-1790408971195-db5b6fa85bded5cb) |
 | D-13 | Theme + reduced motion | android | linux | D-05 | todo |
 | D-14 | Push + actionable notifications | android | linux+phone | D-09, K-17, A-14, C-02, H-05 | todo |
 | D-15 | App lock + secure screen | android | linux | D-05 | todo |
@@ -1030,6 +1030,7 @@ human-verify step.
 - **Do:** stacked diff, per-file collapse, word-level highlights,
   horizontal scroll.
 - **Done when:** golden tests against K-11 fixtures pass.
+- **Done (e369ee75, cc2bf9e7).** In the core, the new `diff_index` query finds each file's path, counts and byte range without parsing, up to the 1 MiB query limit. The card then parses one file at a time with `diff`, which keeps its 64 KiB and 4096-line limits. Both share one file splitter. On Android, `DiffModel.kt` and `DiffCard.kt` show a paged file list with +/- counts, collapsible files and hunks, unified old and new line numbers, word-level highlights and core syntax colors (TS/JS/JSON only). Long lines scroll sideways by default, with a Wrap toggle. Large files show more lines on request, then open in a lazy full-screen view. Copy path, hunk and patch are capped at 256 KiB, and unparseable files show their raw patch. `mobile-android-test` passes 117/0, and the core and model checks pass. Follow-ups: remove the unused `DiffSummaryCard` (D-09 is doing it); file taps go to D-12; iOS can reuse `diff_index`.
 
 #### D-08 · Composer + pickers + attachments + follow-ups
 - **depends:** D-06
