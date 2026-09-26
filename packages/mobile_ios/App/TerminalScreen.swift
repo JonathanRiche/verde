@@ -374,7 +374,7 @@ final class TerminalGridView: UIView, UITextInput {
     private func font(_ style: TextStyle) -> CTFont {
         let key = (style.bold ? 1 : 0) | (style.italic ? 2 : 0)
         if let font = fonts[key] { return font }
-        let base = UIFont.monospacedSystemFont(ofSize: fontSize, weight: style.bold ? .bold : .regular) as CTFont
+        let base = terminalFont(size: fontSize, bold: style.bold) as CTFont
         var font = base
         if style.italic {
             if let italic = CTFontCreateCopyWithSymbolicTraits(base, fontSize, nil, .traitItalic, .traitItalic) {

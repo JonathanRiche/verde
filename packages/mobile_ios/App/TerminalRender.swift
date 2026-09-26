@@ -10,6 +10,14 @@ struct GridSize: Equatable {
     var rows: UInt16
 }
 
+/// Use the bundled Nerd Font for shell prompts, with the same face for measurement and drawing.
+func terminalFont(size: CGFloat, bold: Bool = false) -> UIFont {
+    let base = UIFont(name: "JetBrainsMonoNF-Regular", size: max(size, 1))
+        ?? UIFont.monospacedSystemFont(ofSize: max(size, 1), weight: .regular)
+    guard bold, let descriptor = base.fontDescriptor.withSymbolicTraits(.traitBold) else { return base }
+    return UIFont(descriptor: descriptor, size: base.pointSize)
+}
+
 /// Monospace cell size in points and the text baseline offset within a cell.
 struct CellMetrics: Equatable {
     var width: CGFloat
@@ -18,7 +26,7 @@ struct CellMetrics: Equatable {
 
     /// Cell width is rounded to device pixels so background runs never leave seams.
     static func monospaced(size: CGFloat, scale: CGFloat) -> CellMetrics {
-        let font = UIFont.monospacedSystemFont(ofSize: max(size, 1), weight: .regular)
+        let font = terminalFont(size: size)
         let ctFont = font as CTFont
         var character: UniChar = 0x4d // "M"
         var glyph: CGGlyph = 0

@@ -166,6 +166,18 @@ final class TerminalVTTests: XCTestCase {
 // MARK: - Pure rules
 
 final class TerminalRulesTests: XCTestCase {
+    func testTerminalUsesBundledPromptGlyphs() {
+        let font = terminalFont(size: 14)
+        XCTAssertEqual(font.fontName, "JetBrainsMonoNF-Regular")
+        var character: UniChar = 0xe0b0 // Powerline separator in common shell prompts.
+        var glyph: CGGlyph = 0
+        XCTAssertTrue(CTFontGetGlyphsForCharacters(font as CTFont, &character, &glyph, 1))
+        XCTAssertNotEqual(glyph, 0)
+        let regular = CellMetrics.monospaced(size: 14, scale: 3)
+        XCTAssertGreaterThan(regular.width, 0)
+        XCTAssertTrue(terminalFont(size: 14, bold: true).fontName.contains("JetBrains"))
+    }
+
     func testHardwareKeysMapToCoreKeyNames() {
         XCTAssertEqual(hardwareKey(input: "\r", flags: []), .key("Enter"))
         XCTAssertEqual(hardwareKey(input: "\t", flags: .shift), .key("Tab", shift: true))
