@@ -188,6 +188,26 @@ final class TerminalGridView: UIView, UITextInput {
         onInput(mapped)
     }
 
+    /// Forward delete has no key-command input string; take it from the raw press.
+    private func forwardDelete(_ press: UIPress) -> TermInput? {
+        guard inputEnabled, let key = press.key, key.keyCode == .keyboardDeleteForward else { return nil }
+        let flags = key.modifierFlags
+        return .key("Delete", ctrl: flags.contains(.control), alt: flags.contains(.alternate), shift: flags.contains(.shift))
+    }
+
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        var rest = Set<UIPress>()
+        for press in presses {
+            if let input = forwardDelete(press) { onInput(input) } else { rest.insert(press) }
+        }
+        if !rest.isEmpty { super.pressesBegan(rest, with: event) }
+    }
+
+    override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        let rest = presses.filter { forwardDelete($0) == nil }
+        if !rest.isEmpty { super.pressesEnded(rest, with: event) }
+    }
+
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
         if action == #selector(paste(_:)) { return inputEnabled && UIPasteboard.general.hasStrings }
         if action == #selector(copy(_:)) { return selection != nil }

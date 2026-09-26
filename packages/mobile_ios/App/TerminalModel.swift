@@ -51,8 +51,10 @@ func hardwareKey(input: String, flags: UIKeyModifierFlags) -> TermInput? {
     case UIKeyCommand.inputEscape: named = "Escape"
     case "\t": named = "Tab"
     case "\r": named = "Enter"
-    case "\u{8}", "\u{7f}": named = "Backspace"
-    case UIKeyCommand.inputDelete: named = "Delete"
+    // `UIKeyCommand.inputDelete` is the Backspace key ("\u{8}"); forward delete
+    // arrives through `pressesBegan` (`keyboardDeleteForward`).
+    case UIKeyCommand.inputDelete: named = "Backspace"
+    case "\u{7f}": named = "Delete"
     case UIKeyCommand.inputUpArrow: named = "ArrowUp"
     case UIKeyCommand.inputDownArrow: named = "ArrowDown"
     case UIKeyCommand.inputLeftArrow: named = "ArrowLeft"
@@ -74,7 +76,7 @@ func hardwareKey(input: String, flags: UIKeyModifierFlags) -> TermInput? {
 /// Every hardware combination the terminal claims ahead of the system (focus, text
 /// editing). Plain printable keys and Return stay with the text system (IME, repeat).
 func terminalKeyCommands() -> [(input: String, flags: UIKeyModifierFlags)] {
-    let named = [UIKeyCommand.inputEscape, "\t", UIKeyCommand.inputDelete, UIKeyCommand.inputUpArrow,
+    let named = [UIKeyCommand.inputEscape, "\t", UIKeyCommand.inputUpArrow,
                  UIKeyCommand.inputDownArrow, UIKeyCommand.inputLeftArrow, UIKeyCommand.inputRightArrow,
                  UIKeyCommand.inputHome, UIKeyCommand.inputEnd, UIKeyCommand.inputPageUp, UIKeyCommand.inputPageDown]
     let combos: [UIKeyModifierFlags] = [[], .shift, .control, .alternate, [.control, .shift], [.alternate, .shift],
@@ -87,7 +89,7 @@ func terminalKeyCommands() -> [(input: String, flags: UIKeyModifierFlags)] {
         out.append((key, .alternate))
         if key.first!.isLetter { out.append((key, [.alternate, .shift])) }
     }
-    for key in ["\r", "\u{8}"] {
+    for key in ["\r", UIKeyCommand.inputDelete] {
         for flags: UIKeyModifierFlags in [.control, .alternate, .shift] { out.append((key, flags)) }
     }
     return out
