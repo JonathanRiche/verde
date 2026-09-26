@@ -171,7 +171,7 @@ final class BrowseTests: XCTestCase {
         setup = { $0.configure(syncDelayMs: .some(nil), home: K09.home, workspaces: K09.workspaces) }
         try launch()
         try await waitUntil("cached banner") {
-            browseBanner(browse.state, NOW)?.text.contains("Showing saved data from 3 min ago.") == true
+            !cores.isEmpty && browseBanner(browse.state, NOW)?.text == "Connecting… Showing saved data from 3 min ago."
         }
         XCTAssertEqual(browse.state.home?.items.count, 3)
         XCTAssertTrue(hasContent(browse.state))
