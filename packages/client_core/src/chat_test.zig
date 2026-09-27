@@ -221,6 +221,8 @@ test "chat send freezes draft, stages ordered chunks, and preserves newer typing
     try f.reply("chat.attachment.commit", .{ .attachment_id = "abc" });
     const start = try f.params("chat.turn.start");
     try eql("send this", p.s(start, "prompt"));
+    try eql("abc", p.rows(p.get(start, "attachments"))[0].string);
+    try expect(p.get(start, "attachment_ids") == .null);
     try expect(p.get(start, "image_paths") == .null);
     try f.draft("new typing");
     try f.reply("chat.turn.start", .{ .turn_id = p.s(start, "turn_id") });
@@ -677,7 +679,10 @@ test "phone-sized image survives draft persistence restore and chunk upload" {
         received += chunk.len;
         try restored.reply("chat.attachment.append", .{ .received_bytes = received });
     }
-    _ = try restored.find("chat.attachment.commit");
+    try restored.reply("chat.attachment.commit", .{ .attachment_id = "large" });
+    const start = try restored.params("chat.turn.start");
+    try expect(p.rows(p.get(start, "attachments")).len == 1);
+    try eql("large", p.rows(p.get(start, "attachments"))[0].string);
 }
 
 test "chat discovers externally started turn after a completed turn without replaying stale snapshot" {

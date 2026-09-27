@@ -286,7 +286,7 @@ fn uploadNext(tx: *h.Transaction, i: usize) E!void {
         var ids: []const []const u8 = &.{};
         for (send.attachments) |item| try add([]const u8, tx.allocator(), &ids, item.attachment_id.?);
         const meta = send.settings;
-        var params = try value(tx.allocator(), .{ .turn_id = send.turn_id, .workspace_id = t.workspace_id, .local_thread_id = t.id, .message_id = send.message_id, .prompt = send.text, .thread_title = meta.title, .provider = meta.provider, .harness = meta.harness, .provider_thread_id = meta.provider_thread_id, .model_ref = meta.model_ref, .reasoning_effort = meta.reasoning_effort, .opencode_reasoning_variant = meta.reasoning_variant, .fast_mode = eq(meta.fast_mode orelse "off", "on"), .access_mode = meta.access_mode, .attachment_ids = ids });
+        var params = try value(tx.allocator(), .{ .turn_id = send.turn_id, .workspace_id = t.workspace_id, .local_thread_id = t.id, .message_id = send.message_id, .prompt = send.text, .thread_title = meta.title, .provider = meta.provider, .harness = meta.harness, .provider_thread_id = meta.provider_thread_id, .model_ref = meta.model_ref, .reasoning_effort = meta.reasoning_effort, .opencode_reasoning_variant = meta.reasoning_variant, .fast_mode = eq(meta.fast_mode orelse "off", "on"), .access_mode = meta.access_mode, .attachments = ids });
         try addRoute(tx.allocator(), t, &params);
         try call(tx, i, .start, "chat.turn.start", params, true, send.intent);
     }
