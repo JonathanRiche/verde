@@ -92,7 +92,8 @@ class HostsScreenTest {
     }
     @Test fun signOutIsHostScopedAndRemovalWaitsForDeleteAcknowledgements() {
         seed(); store.deleteGate=CompletableDeferred(); launch()
-        compose.onAllNodesWithText("Sign out of host")[0].performScrollTo().performClick()
+        compose.onNodeWithContentDescription("Actions for Alpha").performScrollTo().performClick()
+        compose.onNodeWithText("Sign out of host").performClick()
         compose.onNodeWithText("Sign out of Alpha?").assertExists()
         assertFalse(cores.any { core -> core.events.any { it is EventSignOut } })
         compose.onNodeWithText("Sign out",useUnmergedTree=true).performClick()
@@ -177,6 +178,50 @@ class HostsScreenTest {
         assertNotEquals("primary",added.id)
         assertEquals(added.id,model.state.value.pairing)
         assertTrue(store.values[HostsModel.CATALOG_KEY]!!.contains("Second host"))
+    }
+    @Test fun renamePersistsNicknameWithoutReopeningOrChangingIdentity() {
+        seed(); launch()
+        val credentials = store.values.filterKeys { it != HostsModel.CATALOG_KEY }
+        compose.onNodeWithContentDescription("Actions for Beta").performScrollTo().performClick()
+        compose.onNodeWithText("Rename machine").performClick()
+        compose.onNodeWithText("Machine name").performTextReplacement("  Office workstation  ")
+        compose.onNodeWithText("Save").performClick()
+        await { row("beta").saved.label == "Office workstation" && !model.state.value.busy }
+        compose.onNodeWithContentDescription("Actions for Office workstation").assertExists()
+        val saved = CoreJson.decodeFromString<HostCatalog>(store.values[HostsModel.CATALOG_KEY]!!)
+        assertEquals("Office workstation", saved.hosts.single { it.id == "beta" }.label)
+        assertEquals("alpha", saved.active)
+        assertEquals(credentials, store.values.filterKeys { it != HostsModel.CATALOG_KEY })
+        assertEquals(2, cores.size)
+        assertTrue(cores.none { it.freed })
+        assertEquals("Alpha", row("alpha").saved.label)
+    }
+    @Test fun renameRejectsBlankAndRetainsInputWhenStorageFails() {
+        seed(); launch()
+        compose.onNodeWithContentDescription("Actions for Alpha").performScrollTo().performClick()
+        compose.onNodeWithText("Rename machine").performClick()
+        compose.onNodeWithText("Machine name").performTextReplacement("   ")
+        compose.onNodeWithText("Save").assertIsNotEnabled()
+        compose.onNodeWithText("Machine name").performTextReplacement("My laptop")
+        store.failWrite = true
+        compose.onNodeWithText("Save").performClick()
+        await { model.state.value.error != null && !model.state.value.busy }
+        assertEquals("Alpha", row("alpha").saved.label)
+        compose.onNodeWithText("My laptop").assertExists()
+        store.failWrite = false
+        compose.onNodeWithText("Save").performClick()
+        await { row("alpha").saved.label == "My laptop" && !model.state.value.busy }
+        compose.onNodeWithText("Rename machine").assertDoesNotExist()
+    }
+    @Test fun failedSwitchDoesNotNavigateAndKeepsCardsVisible() {
+        seed(); launch()
+        store.failWrite = true
+        compose.onNodeWithText("Use Beta").performScrollTo().performClick()
+        await { model.state.value.error != null && !model.state.value.busy }
+        assertEquals(0, used)
+        assertEquals("alpha", model.state.value.active)
+        compose.onNodeWithContentDescription("Actions for Alpha").assertExists()
+        compose.onNodeWithContentDescription("Actions for Beta").assertExists()
     }
     private class MemoryStore : SecureStore {
         val values=ConcurrentHashMap<String,String>()

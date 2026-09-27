@@ -141,7 +141,7 @@ internal fun browseBanner(state: BrowseState, nowMs: Long): Banner? {
         host.update_required -> Banner("Update required — update Verde on this phone or host.", error=true)
         !state.networkAvailable -> Banner("You're offline.$saved", error=true)
         host.phase == "failed" || host.error?.failure_kind == "network" ->
-            Banner("Can't reach ${host.label}. Is Tailscale on?$saved", BannerAction.Retry, error=true)
+            Banner("Can't reach ${state.row?.saved?.label ?: host.label}. Is Tailscale on?$saved", BannerAction.Retry, error=true)
         state.home?.error != null || state.workspaces?.error != null ->
             Banner("Couldn't load the latest data. Pull down to retry.$saved", BannerAction.Retry, error=true)
         host.phase != "ready" -> Banner("Connecting…$saved", busy=true)

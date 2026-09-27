@@ -113,10 +113,23 @@ internal class HostsModel(private val store: SecureStore,
             finally { mutableState.update { it.copy(busy=false) } }
         }
     }
-    fun select(id: String) = catalogAction {
+    fun select(id: String, onSelected: () -> Unit = {}) = catalogAction {
         if (catalog.hosts.none { it.id == id }) return@catalogAction
         persist(catalog.copy(active=id))
         mutableState.update { it.copy(active=id, pairing=null) }
+        onSelected()
+    }
+    /** A phone-local nickname; keep the core, credentials and stable host identity intact. */
+    fun rename(id: String, label: String, onRenamed: () -> Unit = {}) = catalogAction {
+        val name = label.trim().take(128)
+        if (name.isBlank()) {
+            mutableState.update { it.copy(error="Enter a name for this machine.") }
+            return@catalogAction
+        }
+        if (catalog.hosts.none { it.id == id }) return@catalogAction
+        persist(catalog.copy(hosts=catalog.hosts.map { if (it.id == id) it.copy(label=name) else it }))
+        row(id) { it.copy(saved=it.saved.copy(label=name)) }
+        onRenamed()
     }
     fun add(label: String, link: String? = null) = catalogAction {
         if (catalog.hosts.size >= 32) {
