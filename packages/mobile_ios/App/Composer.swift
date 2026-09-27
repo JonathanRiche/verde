@@ -3,6 +3,11 @@ import PhotosUI
 import UniformTypeIdentifiers
 import AVFoundation
 
+func composerChoiceLabel(_ choices: [ChatChoice], value: String?) -> String {
+    choices.first { $0.id == (value ?? "") }?.label
+        ?? value.flatMap { $0.isEmpty ? nil : $0 } ?? "Default"
+}
+
 struct ChatComposer: View {
     let model: ComposerModel
     let availableHeight: CGFloat
@@ -219,7 +224,7 @@ struct ChatComposer: View {
     }
     private func selectionLabel(_ kind: ComposerPicker) -> String {
         let list = choices(kind)
-        return list.first { $0.id == selectedID(kind) }?.label ?? list.first?.label ?? kind.rawValue.capitalized
+        return composerChoiceLabel(list, value: selectedID(kind))
     }
     private func settingIcon(_ kind: ComposerPicker, value: String? = nil) -> String? {
         switch kind {

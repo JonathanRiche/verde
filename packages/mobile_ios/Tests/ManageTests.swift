@@ -51,6 +51,15 @@ final class ManageTests: XCTestCase {
         await harness.close()
     }
 
+    func testOptionalModelDiscoveryNoticePreservesOtherErrors() {
+        let unavailable = LocalError(code: "remote_error", message: "The runtime rejected the request.", rpc_code: "provider_unavailable")
+        XCTAssertEqual(newChatModelMessage(unavailable), "Live models are unavailable. You can start a chat with the built-in choices.")
+        for code in ["scope_denied", "unauthorized", "invalid_params"] {
+            let failure = LocalError(code: "remote_error", message: "Actual failure", rpc_code: code)
+            XCTAssertEqual(newChatModelMessage(failure), "Actual failure")
+        }
+    }
+
     func testUncertainMutationRequiresRefresh() {
         let job = ManageJob(intent_id: "i", kind: "thread_create", state: "uncertain")
         XCTAssertTrue(manageMessage(job).contains("Refresh"))

@@ -9,6 +9,14 @@ func manageMessage(_ job: ManageJob) -> String {
     return job.error?.message.isEmpty == false ? job.error!.message : "The host couldn't complete this action."
 }
 
+/// Only optional provider discovery failures use the built-in catalog notice.
+func newChatModelMessage(_ error: LocalError) -> String {
+    if error.rpc_code == "provider_unavailable" {
+        return "Live models are unavailable. You can start a chat with the built-in choices."
+    }
+    return error.message
+}
+
 func historySections(_ items: [ThreadSummary]) -> [(String, [ThreadSummary])] {
     var sections: [(String, [ThreadSummary])] = []
     for item in items where !isSubagent(item) {

@@ -4,6 +4,15 @@ import UIKit
 
 @MainActor
 final class ComposerTests: XCTestCase {
+    func testMissingSelectionDoesNotDisplayFirstCatalogOption() {
+        let choices = [ChatChoice(id: "high", label: "High"), ChatChoice(id: "medium", label: "Medium")]
+        XCTAssertEqual(composerChoiceLabel(choices, value: "medium"), "Medium")
+        XCTAssertEqual(composerChoiceLabel(choices, value: "custom-effort"), "custom-effort")
+        XCTAssertEqual(composerChoiceLabel(choices, value: nil), "Default")
+        XCTAssertEqual(composerChoiceLabel(choices, value: ""), "Default")
+        XCTAssertEqual(composerChoiceLabel([], value: "model-outside-catalog"), "model-outside-catalog")
+    }
+
     func testCoreProjectionAdoptsWithoutAViewObserver() async throws {
         let harness = ChatHarness()
         try await harness.launch()

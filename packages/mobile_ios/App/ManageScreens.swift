@@ -92,7 +92,11 @@ struct NewChatScreen: View {
                 choice("Access", value: selection.access, choices: chat?.catalogs.access ?? []) { value in var s = selection; s.access = value; return s }
                 choice("Speed", value: selection.speed, choices: chat?.catalogs.speeds ?? []) { value in var s = selection; s.speed = value; return s }
                 if chat?.loading == true { ProgressView("Loading models…") }
-                if let error = chat?.error { Text(error.message).foregroundStyle(.red) }
+                if let error = chat?.error {
+                    Text(newChatModelMessage(error))
+                        .foregroundStyle(error.rpc_code == "provider_unavailable" ? VerdeTheme.warning : VerdeTheme.danger)
+                        .accessibilityIdentifier("new-chat-model-notice")
+                }
             }
             Button("Start chat") {
                 Task {
