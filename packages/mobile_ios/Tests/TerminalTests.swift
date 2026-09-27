@@ -584,6 +584,30 @@ final class TerminalModelTests: XCTestCase {
     private var attaches: [String] { events { if case .terminal_attach(let e) = $0 { return e.terminal_id }; return nil } }
     private var creates: [EventTerminalCreate] { events { if case .terminal_create(let e) = $0 { return e }; return nil } }
 
+    func testRapidTextCoalescesWithoutChangingUnicodeOrKeyBoundaries() async throws {
+        try await launch()
+        let model = open()
+        try await waitUntil("interactive") { model.interactive }
+        for character in "hello 👋" { model.input(.text(String(character))) }
+        model.input(.key("ArrowLeft"))
+        model.input(.text("é")); model.input(.text("!"))
+        model.input(.paste("paste\n"))
+        model.input(.text("done\n"))
+        try await waitUntil("batched text") { inputs.count == 6 }
+        XCTAssertEqual(inputs, [.text("hello 👋"), .key("ArrowLeft"), .text("é!"),
+                                .paste("paste\n"), .text("done"), .key("Enter")])
+    }
+
+    func testQueuedTextIsDiscardedWhenTerminalCloses() async throws {
+        try await launch()
+        let model = open()
+        try await waitUntil("interactive") { model.interactive }
+        model.input(.text("never replay"))
+        model.stop()
+        try await waitUntil("detached") { !detaches.isEmpty }
+        XCTAssertTrue(inputs.isEmpty)
+    }
+
     func testAttachReplaysTheK12TailTypesThroughTheCoreAndDetachesOnLeave() async throws {
         setup = { $0.configure(attachSuffix: "\u{1b}[6n") }
         try await launch()
@@ -624,8 +648,8 @@ final class TerminalModelTests: XCTestCase {
         model.toggleAlt()
         model.input(.key("ArrowLeft"))
         model.input(.paste("echo hi"))
-        try await waitUntil("inputs") { inputs.count == 10 }
-        XCTAssertEqual(inputs, [.key("Escape"), .key("ArrowUp"), .text("|"), .text("ls"), .key("Enter"), .key("c", ctrl: true),
+        try await waitUntil("inputs") { inputs.count == 9 }
+        XCTAssertEqual(inputs, [.key("Escape"), .key("ArrowUp"), .text("|ls"), .key("Enter"), .key("c", ctrl: true),
                                 .key("Backspace"), .key("d", ctrl: true), .key("ArrowLeft", alt: true), .paste("echo hi")])
         // DECCKM and bracketed paste from the replayed stream reach the core's key encoding.
         let modes = events { event -> VtModes? in if case .terminal_input(let e) = event { return e.vt_modes }; return nil }
@@ -644,7 +668,7 @@ final class TerminalModelTests: XCTestCase {
         // Input after leaving is dropped.
         model.input(.text("x"))
         try await Task.sleep(nanoseconds: 100_000_000)
-        XCTAssertEqual(inputs.count, 10)
+        XCTAssertEqual(inputs.count, 9)
     }
 
     func testScrollbackSnapsBackBeforeTyping() async throws {

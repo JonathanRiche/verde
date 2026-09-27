@@ -172,7 +172,8 @@ final class TerminalModel {
     @ObservationIgnored private let resizeDelay: TimeInterval
     @ObservationIgnored private var host: CoreHost?
     @ObservationIgnored private var vt: TerminalVT?
-    @ObservationIgnored private var inputs: AsyncStream<TermInput>.Continuation?
+    @ObservationIgnored private var pendingInput: [TermInput] = []
+    @ObservationIgnored private var inputTask: Task<Void, Never>?
     @ObservationIgnored private var tasks: [Task<Void, Never>] = []
     @ObservationIgnored private var resizeTask: Task<Void, Never>?
     @ObservationIgnored private var resizeKey: ResizeKey?
@@ -230,11 +231,6 @@ final class TerminalModel {
     func start() {
         guard !started, !closed else { return }
         started = true
-        let (stream, continuation) = AsyncStream<TermInput>.makeStream()
-        inputs = continuation
-        tasks.append(Task { [weak self] in
-            for await input in stream { await self?.deliver(input) }
-        })
         tasks.append(Task { [weak self] in await self?.open() })
         track()
     }
@@ -245,7 +241,8 @@ final class TerminalModel {
         closed = true
         tasks.forEach { $0.cancel() }
         resizeTask?.cancel()
-        inputs?.finish()
+        inputTask?.cancel()
+        pendingInput.removeAll()
         let host = self.host, id = terminalID, vt = self.vt
         let releaseFocus = FocusClaim.owner == ObjectIdentifier(self)
         if releaseFocus { FocusClaim.owner = nil }
@@ -266,11 +263,30 @@ final class TerminalModel {
     func dismissGap() { dismissedResets = feed?.resets ?? dismissedResets }
 
     func input(_ input: TermInput) {
-        guard interactive else { return }
+        guard !closed, interactive else { return }
         let (c, a) = (ctrl, alt)
         if ctrl { ctrl = false }
         if alt { alt = false }
-        withModifiers(input, ctrl: c, alt: a).forEach { inputs?.yield($0) }
+        for next in withModifiers(input, ctrl: c, alt: a) {
+            // Preserve key/paste boundaries and Unicode. Text queued while a
+            // core operation runs can share a bounded write instead of building
+            // a separate transaction and RPC for every character.
+            if case .text(let text) = next, case .text(let previous) = pendingInput.last,
+               previous.utf8.count + text.utf8.count <= 4096 {
+                pendingInput[pendingInput.count - 1] = .text(previous + text)
+            } else { pendingInput.append(next) }
+        }
+        guard inputTask == nil else { return }
+        inputTask = Task { [weak self] in
+            // Coalesce same-frame keyboard commits without a visible debounce.
+            try? await Task.sleep(for: .milliseconds(8))
+            guard let self else { return }
+            defer { inputTask = nil }
+            while !Task.isCancelled && !closed && !pendingInput.isEmpty {
+                guard interactive else { pendingInput.removeAll(); return }
+                await deliver(pendingInput.removeFirst())
+            }
+        }
     }
 
     /// Scrollback in rows (positive = older), within the VT's page-granular history.
