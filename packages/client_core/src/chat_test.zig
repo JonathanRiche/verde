@@ -77,7 +77,7 @@ const Fixture = struct {
     }
     fn params(f: *Fixture, method: []const u8) !V {
         const call = try f.find(method);
-        const bytes = try @import("auth.zig").decode64(f.a(), call.body_base64);
+        const bytes = try @import("auth.zig").decode64Limit(f.a(), call.body_base64, h.MAX_HTTP_INPUT);
         const request = try h.parse(f.a(), bytes);
         try expect(p.get(request, "target") == .object);
         return p.get(request, "params");
@@ -645,4 +645,67 @@ test "opening and refocusing Codex uses its static model catalog without discove
     try std.testing.expectError(error.MissingRequest, f.find("provider.models.list"));
     const view = p.get(try f.query("composer"), "data");
     try expect(p.rows(p.get(p.get(view, "catalogs"), "models")).len > 0);
+}
+
+test "phone-sized image survives draft persistence restore and chunk upload" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.open();
+    const image = try f.a().alloc(u8, 160 * 1024);
+    @memset(image, 42);
+    // Auth payloads retain their separate 64 KiB limit.
+    try std.testing.expectError(error.ResourceLimit, @import("auth.zig").decode64(f.a(), try rpc.encodeBase64(f.a(), image)));
+    _ = try f.intent("draft_set", .{ .text = "fixture image", .attachments = .{.{ .local_id = "large-image", .name = "fixture.jpg", .mime = "image/jpeg", .byte_size = "163840", .bytes_base64 = try rpc.encodeBase64(f.a(), image) }} });
+    _ = try f.storage(null, false);
+    const saved = try h.encode(f.a(), f.host.state.chat.threads[0].saved);
+    var restored = try Fixture.init();
+    defer restored.deinit();
+    _ = try restored.intent("thread_open", .{});
+    _ = try restored.storage(saved, false);
+    const t = restored.host.state.chat.threads[0];
+    try eql(f.host.state.chat.threads[0].saved.inputs[0].bytes_base64, t.saved.inputs[0].bytes_base64);
+    _ = try restored.intent("send", .{ .draft_revision = try std.fmt.allocPrint(restored.a(), "{d}", .{t.saved.revision}) });
+    try restored.reply("daemon.client.register", .{ .client_id = "fixture-client" });
+    try restored.reply("chat.thread.upsert", .{ .store_revision = 100 });
+    try restored.reply("chat.attachment.create", .{ .attachment_id = "large", .max_chunk_bytes = 48 * 1024 });
+    var received: usize = 0;
+    while (received < image.len) {
+        const params = try restored.params("chat.attachment.append");
+        try expect(p.uint(p.get(params, "offset")).? == received);
+        const chunk = try @import("auth.zig").decode64(restored.a(), p.s(params, "data"));
+        try expect(std.mem.eql(u8, image[received .. received + chunk.len], chunk));
+        received += chunk.len;
+        try restored.reply("chat.attachment.append", .{ .received_bytes = received });
+    }
+    _ = try restored.find("chat.attachment.commit");
+}
+
+test "chat discovers externally started turn after a completed turn without replaying stale snapshot" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.open();
+    try f.seedTurn();
+    try f.tail(.{ .status = "completed", .events = .{.{ .seq = 1, .kind = "assistant_delta", .payload_json = "{\"text\":\"previous answer\"}" }} });
+    try f.recorded("chat.message.list", @embedFile("fixtures/chat/page-0.json"));
+    {
+        var tx = try h.Transaction.init(&f.host);
+        defer tx.deinit();
+        tx.state.sync.snapshot = try h.parse(tx.allocator(), try h.encode(f.a(), .{ .turns = .{.{ .workspace_id = ws, .local_thread_id = thread, .turn_id = "fixture-turn", .status = "running" }} }));
+        try chat.pump(&tx);
+        _ = try tx.commit(&f.host, f.a());
+    }
+    try std.testing.expectError(error.MissingRequest, f.find("chat.turn.tail"));
+    {
+        var tx = try h.Transaction.init(&f.host);
+        defer tx.deinit();
+        tx.state.sync.snapshot = try h.parse(tx.allocator(), try h.encode(f.a(), .{ .turns = .{.{ .workspace_id = ws, .local_thread_id = thread, .turn_id = "external-next", .status = "running", .started_at_ms = 1790363200000 }} }));
+        try chat.pump(&tx);
+        _ = try tx.commit(&f.host, f.a());
+    }
+    try eql("external-next", p.s(try f.params("chat.turn.tail"), "turn_id"));
+    try expect(p.uint(p.get(try f.params("chat.turn.tail"), "after_seq")).? == 0);
+    try f.tail(.{ .status = "running", .events = .{.{ .seq = 1, .kind = "tool_call", .payload_json = "{\"call_id\":\"next-tool\",\"title\":\"Fixture tool\",\"kind\":\"execute\",\"status\":\"in_progress\",\"input\":\"fixture\"}" }} });
+    const t = f.host.state.chat.threads[0];
+    try eql("running", t.turn.?.status);
+    try expect(t.overlay.len > 0);
 }

@@ -52,8 +52,13 @@ pub fn encode64(a: std.mem.Allocator, bytes: []const u8) E![]const u8 {
     return std.base64.standard.Encoder.encode(out, bytes);
 }
 pub fn decode64(a: std.mem.Allocator, bytes: []const u8) E![]const u8 {
+    return decode64Limit(a, bytes, 64 * 1024);
+}
+
+/// Decode a non-auth payload under its own explicit storage or transport bound.
+pub fn decode64Limit(a: std.mem.Allocator, bytes: []const u8, limit: usize) E![]const u8 {
     const n = std.base64.standard.Decoder.calcSizeForSlice(bytes) catch return error.InvalidArgument;
-    if (n > 64 * 1024) return error.ResourceLimit;
+    if (n > limit) return error.ResourceLimit;
     const out = try a.alloc(u8, n);
     std.base64.standard.Decoder.decode(out, bytes) catch return error.InvalidArgument;
     return out;

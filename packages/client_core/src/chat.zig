@@ -300,7 +300,7 @@ fn addRoute(a: A, t: *const Thread, params: *V) E!void {
 fn uploadChunk(tx: *h.Transaction, i: usize) E!void {
     const send = &tx.state.chat.threads[i].send.?;
     const input = send.inputs[send.index];
-    const bytes = try @import("auth.zig").decode64(tx.allocator(), input.bytes_base64);
+    const bytes = try @import("auth.zig").decode64Limit(tx.allocator(), input.bytes_base64, tx.state.rpc.limits.max_attachment_bytes);
     const item = send.attachments[send.index];
     if (send.offset == bytes.len) {
         try call(tx, i, .commit, "chat.attachment.commit", .{ .attachment_id = item.attachment_id.? }, true, send.intent);
@@ -377,7 +377,7 @@ pub fn intent(tx: *h.Transaction, tag: []const u8, event: V) E!bool {
             if (input.bytes_base64.len == 0) for (t.saved.inputs) |old| {
                 if (eq(old.local_id, input.local_id) and eq(old.byte_size, input.byte_size)) input.* = old;
             };
-            const bytes = try @import("auth.zig").decode64(tx.allocator(), input.bytes_base64);
+            const bytes = try @import("auth.zig").decode64Limit(tx.allocator(), input.bytes_base64, tx.state.rpc.limits.max_attachment_bytes);
             const size = std.fmt.parseInt(u64, input.byte_size, 10) catch return error.InvalidArgument;
             if (size != bytes.len or size > tx.state.rpc.limits.max_attachment_bytes or size == 0 or input.local_id.len == 0 or !std.mem.startsWith(u8, input.mime, "image/")) return error.InvalidArgument;
             for (inputs[0..n]) |previous| if (eq(previous.local_id, input.local_id)) return error.InvalidArgument;
@@ -621,7 +621,7 @@ pub fn complete(tx: *h.Transaction, pending: h.Pending, event: V) E!bool {
         if (pending.kind == .store_get) {
             const encoded = p.get(event, "value_base64");
             if (encoded == .string) {
-                const bytes = try @import("auth.zig").decode64(tx.allocator(), encoded.string);
+                const bytes = try @import("auth.zig").decode64Limit(tx.allocator(), encoded.string, h.MAX_INPUT / 2);
                 const saved = std.json.parseFromSliceLeaky(Saved, tx.allocator(), bytes, .{ .ignore_unknown_fields = true }) catch |e| {
                     if (e == error.OutOfMemory) return error.OutOfMemory;
                     t.@"error" = err("invalid_saved_chat");
@@ -1172,11 +1172,28 @@ pub fn pump(tx: *h.Transaction) E!void {
                 @field(t.metadata, field) = @field(latest, field);
             }
         }
-        if (t.turn == null) for (p.rows(p.get(tx.state.sync.snapshot, "turns"))) |turn| {
-            if (!eq(p.s(turn, "workspace_id"), t.workspace_id) or !eq(p.s(turn, "local_thread_id"), t.id) or !activeStatus(p.s(turn, "status")) or p.s(turn, "turn_id").len == 0) continue;
-            t.turn = .{ .turn_id = p.s(turn, "turn_id"), .status = p.s(turn, "status"), .started_at_ms = p.num(p.get(turn, "started_at_ms")) };
-            approvalFromTurn(t, turn);
-        };
+        // A different client can start another turn after the one we tailed.
+        // Finish durable reconciliation first, and never revive that same turn
+        // from a snapshot which still reports it running after its final tail.
+        if (!active(t) and !t.reconcile and !exists(tx, i, .tail)) {
+            var next: V = .null;
+            for (p.rows(p.get(tx.state.sync.snapshot, "turns"))) |turn| {
+                if (!eq(p.s(turn, "workspace_id"), t.workspace_id) or !eq(p.s(turn, "local_thread_id"), t.id) or !activeStatus(p.s(turn, "status")) or p.s(turn, "turn_id").len == 0) continue;
+                if (t.turn) |previous| {
+                    if (eq(previous.turn_id, p.s(turn, "turn_id")) or (p.num(p.get(turn, "started_at_ms")) orelse 0) < (previous.started_at_ms orelse 0)) continue;
+                }
+                if (next == .null or (p.num(p.get(turn, "started_at_ms")) orelse 0) >= (p.num(p.get(next, "started_at_ms")) orelse 0)) next = turn;
+            }
+            if (next != .null) {
+                t.turn = .{ .turn_id = p.s(next, "turn_id"), .status = p.s(next, "status"), .started_at_ms = p.num(p.get(next, "started_at_ms")) };
+                t.events = &.{};
+                t.overlay = &.{};
+                t.after_seq = 0;
+                t.retry_at = 0;
+                t.@"error" = null;
+                approvalFromTurn(t, next);
+            }
+        }
         if (t.followup_dispatch and t.storage_id == null and t.loaded and t.saved.followup != null) {
             const f = &t.saved.followup.?;
             const eligible = (eq(f.kind, "steer") and eq(f.state, "pending") and active(t)) or (!active(t) and t.turn != null and eq(t.turn.?.status, "completed"));
