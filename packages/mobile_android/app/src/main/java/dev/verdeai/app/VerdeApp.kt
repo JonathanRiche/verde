@@ -124,7 +124,7 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
         ) { padding ->
             Box(Modifier.padding(padding).consumeWindowInsets(padding)) {
                 CompositionLocalProvider(LocalWorkspaceMenu provides { scope.launch { drawer.open() }; Unit }) {
-                    Graph(nav, start, hosts, browse, manage)
+                    Graph(nav, start, hosts, browse, manage) { thread, action -> threadAction = thread to action }
                 }
             }
         }
@@ -139,7 +139,8 @@ private fun NavHostController.tab(route: String) = navigate(route) {
 }
 
 @Composable
-private fun Graph(nav: NavHostController, start: String, hosts: HostsModel, browse: BrowseModel, manage: ManageModel) {
+private fun Graph(nav: NavHostController, start: String, hosts: HostsModel, browse: BrowseModel, manage: ManageModel,
+    onThreadAction: (ThreadSummary, String) -> Unit) {
     val openPane: (Pane) -> Unit = { pane ->
         val thread = pane.thread_id
         val terminal = pane.terminal_id
@@ -179,7 +180,7 @@ private fun Graph(nav: NavHostController, start: String, hosts: HostsModel, brow
         composable(Routes.THREAD) { entry ->
             val args = entry.arguments
             val ws = args?.getString("ws").orEmpty()
-            ThreadRoute(hosts, browse, ws, args?.getString("thread").orEmpty(), showHosts, onCitation = { openFile(ws, it) }) { nav.popBackStack() }
+            ThreadRoute(hosts, browse, manage, ws, args?.getString("thread").orEmpty(), showHosts, onCitation = { openFile(ws, it) }, onThreadAction = onThreadAction) { nav.popBackStack() }
         }
         composable(Routes.TERMINAL) { entry ->
             val args = entry.arguments

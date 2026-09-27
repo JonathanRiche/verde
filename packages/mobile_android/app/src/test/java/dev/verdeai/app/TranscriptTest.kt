@@ -62,7 +62,9 @@ class TranscriptTest {
     private fun exists(text: String, substring: Boolean = false) =
         compose.onAllNodesWithText(text, substring=substring, useUnmergedTree=true).fetchSemanticsNodes().isNotEmpty()
 
-    private fun launch(workspace: String = WS, thread: String = THREAD) {
+    private var drawerOpens = 0
+    private val headerActions = mutableListOf<Pair<ThreadSummary, String>>()
+    private fun launch(workspace: String = WS, thread: String = THREAD, withHeader: Boolean = false, canEdit: Boolean = true) {
         store.values[HostsModel.CATALOG_KEY]=CoreJson.encodeToString(HostCatalog(listOf(SavedHost("alpha","Studio")), "alpha"))
         compose.runOnUiThread {
             val provider=ViewModelProvider(models, object : ViewModelProvider.Factory {
@@ -82,9 +84,11 @@ class TranscriptTest {
         }
         compose.setContent {
             MaterialTheme {
-                CompositionLocalProvider(LocalUiClock provides UiClock(now={ NOW }, ticking=false)) {
+                CompositionLocalProvider(LocalUiClock provides UiClock(now={ NOW }, ticking=false),
+                    LocalWorkspaceMenu provides if (withHeader) ({ drawerOpens++; Unit }) else null) {
                     TranscriptScreen(transcript, "Chat fixture", onBack={}, onHosts={}, onRetryConnection=browse::refresh,
-                        onCitation={ citations.add(it) })
+                        onCitation={ citations.add(it) }, canEditThread=canEdit,
+                        onThreadAction=if (withHeader) ({ item, action -> headerActions.add(item to action); Unit }) else null)
                 }
             }
         }
@@ -102,6 +106,34 @@ class TranscriptTest {
         compose.runOnUiThread { models.clear() }
         await { cores.all { it.freed } }
         FocusClaim.owner=null
+    }
+
+    @Test fun chatHeaderPlacesNavigationLeftAndActionsRight() {
+        launch(withHeader=true)
+        awaitText("History 44")
+        val back = compose.onNodeWithContentDescription("Back").fetchSemanticsNode().boundsInRoot
+        val drawer = compose.onNodeWithContentDescription("Open workspace drawer")
+        val menu = compose.onNodeWithContentDescription("Chat actions")
+        assertTrue(back.right <= drawer.fetchSemanticsNode().boundsInRoot.left)
+        assertTrue(drawer.fetchSemanticsNode().boundsInRoot.right < menu.fetchSemanticsNode().boundsInRoot.left)
+        drawer.performClick()
+        assertEquals(1, drawerOpens)
+        for ((label, action) in listOf("Rename chat" to "rename", "Sync chat" to "sync", "Close chat" to "close")) {
+            menu.performClick()
+            compose.onNodeWithText(label).assertIsEnabled().performClick()
+            assertEquals(action, headerActions.last().second)
+            assertEquals(THREAD, headerActions.last().first.thread_id)
+            assertEquals(WS, headerActions.last().first.workspace_id)
+        }
+    }
+
+    @Test fun readOnlyChatHeaderKeepsMutationActionsDisabled() {
+        launch(withHeader=true, canEdit=false)
+        awaitText("History 44")
+        compose.onNodeWithContentDescription("Chat actions").performClick()
+        for (label in listOf("Rename chat", "Sync chat", "Close chat"))
+            compose.onNodeWithText(label).assertIsNotEnabled()
+        assertTrue(headerActions.isEmpty())
     }
 
     @Test fun opensFocusedRendersCoreMarkdownAndPagesOlderOncePerCursor() {

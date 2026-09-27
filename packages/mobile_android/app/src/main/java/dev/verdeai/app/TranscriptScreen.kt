@@ -15,6 +15,9 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.ui.draw.rotate
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material3.*
@@ -110,13 +113,15 @@ internal fun transcriptPlaceholder(state: TranscriptState): TranscriptPlaceholde
 
 /** Navigation entry: one [TranscriptModel] per back-stack entry, bound to the selected host. */
 @Composable
-internal fun ThreadRoute(hosts: HostsModel, browse: BrowseModel, workspaceId: String, threadId: String, onHosts: () -> Unit,
-                         onCitation: (FileCitation) -> Unit = {}, onBack: () -> Unit) {
+internal fun ThreadRoute(hosts: HostsModel, browse: BrowseModel, manage: ManageModel, workspaceId: String, threadId: String, onHosts: () -> Unit,
+                         onCitation: (FileCitation) -> Unit = {}, onThreadAction: (ThreadSummary, String) -> Unit, onBack: () -> Unit) {
     val model: TranscriptModel = viewModel(key = "transcript:$workspaceId:$threadId",
         factory = viewModelFactory { initializer { TranscriptModel(hosts, browse.state, workspaceId, threadId) } })
     val browseState by browse.state.collectAsState()
     val title = browseState.workspaces?.items?.find { it.workspace_id == workspaceId }?.threads?.find { it.thread_id == threadId }?.title
-    TranscriptScreen(model, title, onBack, onHosts, browse::refresh, onCitation, bottomBar = { m, s -> ChatComposer(m, s) })
+    val manageState by manage.state.collectAsState()
+    TranscriptScreen(model, title, onBack, onHosts, browse::refresh, onCitation,
+        canEditThread = manageState.view?.can_create_threads == true, onThreadAction = onThreadAction, bottomBar = { m, s -> ChatComposer(m, s) })
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -129,6 +134,8 @@ internal fun TranscriptScreen(
     onRetryConnection: () -> Unit,
     onCitation: (FileCitation) -> Unit = {},
     renderers: TranscriptRenderers = TranscriptRenderers.Default,
+    canEditThread: Boolean = false,
+    onThreadAction: ((ThreadSummary, String) -> Unit)? = null,
     /** D-08 swaps in the composer; the default is the stop bar. */
     bottomBar: @Composable (TranscriptModel, TranscriptState) -> Unit = { m, s -> StopBar(m, s) },
 ) {
@@ -140,6 +147,8 @@ internal fun TranscriptScreen(
     val items = remember(state.thread) { state.thread?.let(::transcriptItems).orEmpty() }
     val now = rememberNow(state.turn?.started_at_ms != null)
     val context = TranscriptContext(model, now, onCitation, state.turn?.started_at_ms)
+    val openDrawer = LocalWorkspaceMenu.current
+    var chatMenu by remember { mutableStateOf(false) }
     Column(Modifier.fillMaxSize()) {
         VerdeTopBar(
             title = {
@@ -150,7 +159,31 @@ internal fun TranscriptScreen(
 
                 }
             },
-            navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back") } })
+            showWorkspaceMenu = false,
+            navigationIcon = {
+                Row {
+                    IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back") }
+                    openDrawer?.let { open ->
+                        IconButton(onClick = open) { Icon(Icons.Filled.Menu, contentDescription = "Open workspace drawer") }
+                    }
+                }
+            },
+            actions = {
+                if (onThreadAction != null) Box {
+                    val thread = state.thread?.thread
+                    IconButton(onClick = { chatMenu = true }, enabled = thread != null) {
+                        Icon(Icons.Filled.MoreVert, contentDescription = "Chat actions", modifier = Modifier.rotate(90f))
+                    }
+                    DropdownMenu(expanded = chatMenu, onDismissRequest = { chatMenu = false }) {
+                        listOf("Rename chat" to "rename", "Sync chat" to "sync", "Close chat" to "close").forEach { (label, action) ->
+                            DropdownMenuItem(text = { Text(label) },
+                                enabled = canEditThread && thread != null &&
+                                    (action != "sync" || (!activeStatus(thread.status) && thread.status != "waiting_approval")),
+                                onClick = { chatMenu = false; thread?.let { onThreadAction(it, action) } })
+                        }
+                    }
+                }
+            })
         transcriptBanner(state, now)?.let { banner ->
             BannerCard(banner, onRetry = { if (state.thread?.error != null) model.retry() else onRetryConnection() }, onHosts = onHosts)
         }
