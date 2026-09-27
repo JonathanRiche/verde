@@ -2,6 +2,21 @@ import XCTest
 @testable import VerdeApp
 
 final class SessionTransportTests: XCTestCase {
+    func testSocketLifetimeIsIndependentOfShortRequestDeadlines() {
+        let socket = Effect.ws_open(EffectWsOpen(effect_id: "socket", generation: "2",
+            url: "wss://bridge.invalid/ws", protocols: ["verde.v1"],
+            tls: Tls(origin: "https://bridge.invalid", spki_sha256: String(repeating: "a", count: 64)), max_message_bytes: 1024))
+        let config = SessionOperation.configuration(for: socket)
+        // A healthy feed must survive the 15-minute access-token lifetime;
+        // reusing the probe's 30-second resource deadline closed live sockets.
+        XCTAssertGreaterThan(config.timeoutIntervalForResource, 15 * 60)
+        XCTAssertEqual(config.timeoutIntervalForRequest, 30)
+        let http = SessionOperation.configuration(for: request())
+        XCTAssertEqual(http.timeoutIntervalForRequest, 35)
+        XCTAssertEqual(http.timeoutIntervalForResource, 35)
+        XCTAssertEqual(SessionOperation.configuration().timeoutIntervalForResource, 30)
+    }
+
     func testHTTPPoolReusesExactPolicyAndEvictsOnTrustChange() {
         let queue = DispatchQueue(label: "pool.policy.fixture")
         queue.sync {

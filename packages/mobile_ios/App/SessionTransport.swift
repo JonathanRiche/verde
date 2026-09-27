@@ -240,7 +240,7 @@ final class SessionOperation: NSObject, URLSessionDataDelegate, URLSessionWebSoc
         default: preconditionFailure("session_effect_required")
         }
     }
-    static func configuration() -> URLSessionConfiguration {
+    static func configuration(for effect: Effect? = nil) -> URLSessionConfiguration {
         let config = URLSessionConfiguration.ephemeral
         config.httpShouldSetCookies = false
         config.httpCookieStorage = nil
@@ -249,15 +249,22 @@ final class SessionOperation: NSObject, URLSessionDataDelegate, URLSessionWebSoc
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         config.timeoutIntervalForRequest = 30
         config.timeoutIntervalForResource = 30
-        return config
-    }
-    func start(resume: Bool = true) {
-        let config = Self.configuration()
-        if case .http_request(let e) = effect {
+        switch effect {
+        case .http_request(let e):
             // Parked RPCs carry longer core deadlines than interactive requests.
             config.timeoutIntervalForRequest = Double(e.timeout_ms) / 1000
             config.timeoutIntervalForResource = Double(e.timeout_ms) / 1000
+        case .ws_open:
+            // Resource timeout is the total socket lifetime, including time spent
+            // receiving messages. Auth renewal/backgrounding owns its closure;
+            // the short request timeout still bounds connection establishment.
+            config.timeoutIntervalForResource = 24 * 60 * 60
+        default: break
         }
+        return config
+    }
+    func start(resume: Bool = true) {
+        let config = Self.configuration(for: effect)
         let delegates = OperationQueue()
         delegates.maxConcurrentOperationCount = 1
         delegates.underlyingQueue = queue
