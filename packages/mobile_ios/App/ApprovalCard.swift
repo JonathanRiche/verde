@@ -39,9 +39,9 @@ struct ApprovalCard: View {
         let title = approvalTitle(approval)
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
-                Circle().fill(Color.orange).frame(width: 9, height: 9).accessibilityHidden(true)
+                Circle().fill(VerdeTheme.warning).frame(width: 9, height: 9).accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Approval required").font(.caption.weight(.semibold)).foregroundStyle(.orange)
+                    Text("Approval required").font(.caption.weight(.semibold)).foregroundStyle(VerdeTheme.warning)
                         .accessibilityLabel("Approval required: \(title)")
                     Text(title).font(.subheadline.weight(.semibold)).lineLimit(3)
                         .accessibilityAddTraits(.isHeader)
@@ -52,7 +52,7 @@ struct ApprovalCard: View {
             if let text = phaseText(phase) {
                 HStack(spacing: 8) {
                     if case .sending = phase { ProgressView().controlSize(.mini) }
-                    Text(text) .font(VerdeTheme.ui(13)).foregroundStyle(phase.isFailed ? Color.red : Color.secondary)
+                    Text(text) .font(VerdeTheme.ui(13)).foregroundStyle(phase.isFailed ? VerdeTheme.danger : VerdeTheme.muted)
                 }
                 .accessibilityElement(children: .combine)
             }
@@ -76,8 +76,8 @@ struct ApprovalCard: View {
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.orange.opacity(0.7)))
+        .background(VerdeTheme.assistant, in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(VerdeTheme.warning))
         .accessibilityIdentifier("approval-card")
         .onAppear {
             // Announced once when the card appears.
@@ -211,13 +211,13 @@ struct ApprovalBanner: View {
                 let phase = approvalPhase(approval, controller.local)
                 Button(action: onJump) {
                     HStack(spacing: 8) {
-                        Circle().fill(Color.orange).frame(width: 8, height: 8)
+                        Circle().fill(VerdeTheme.warning).frame(width: 8, height: 8)
                         Text(phase.canDecide ? "Needs approval · \(approvalTitle(approval))" : phaseText(phase) ?? "Needs approval")
                             .font(.subheadline.weight(.medium)).lineLimit(1)
-                        Text("View").font(.subheadline.weight(.semibold)).foregroundStyle(.orange)
+                        Text("View").font(.subheadline.weight(.semibold)).foregroundStyle(VerdeTheme.warning)
                     }
                     .padding(.horizontal, 14).padding(.vertical, 10)
-                    .background(.regularMaterial, in: Capsule())
+                    .background(VerdeTheme.panel, in: Capsule())
                     .shadow(radius: 3)
                 }
                 .buttonStyle(.plain)
@@ -225,7 +225,7 @@ struct ApprovalBanner: View {
             } else if approval == nil, let outcome = controller.outcome {
                 Text(outcome.outcome.text).font(.subheadline.weight(.medium))
                     .padding(.horizontal, 14).padding(.vertical, 8)
-                    .background(.regularMaterial, in: Capsule())
+                    .background(VerdeTheme.panel, in: Capsule())
                     .accessibilityIdentifier("approval-outcome")
                     .onAppear { ApprovalAnnouncer.post(ApprovalAnnouncement(text: outcome.outcome.text, urgent: false)) }
                     .id(outcome.serial)

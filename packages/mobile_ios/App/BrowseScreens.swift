@@ -42,12 +42,6 @@ private struct Clock<Content: View>: View {
     }
 }
 
-private func statusColor(_ status: String, attention: Bool) -> Color {
-    if attention || status == "waiting_approval" { return .red }
-    if ["working", "running", "accepted", "waiting"].contains(status) { return .accentColor }
-    return .secondary
-}
-
 private struct Dot: View {
     let color: Color
     let label: String
@@ -56,11 +50,13 @@ private struct Dot: View {
     }
 }
 
-private struct AttentionBadge: View {
+struct AttentionBadge: View {
     let text: String
     var body: some View {
-        Text(text).font(.caption.weight(.semibold)).padding(.horizontal, 6).padding(.vertical, 2)
-            .background(Color.red.opacity(0.15), in: Capsule()).foregroundStyle(.red)
+        Text(text).font(VerdeTheme.ui(11, bold: true)).padding(.horizontal, 6).padding(.vertical, 2)
+            .foregroundStyle(VerdeTheme.text)
+            .background(VerdeTheme.attentionBackground, in: Capsule())
+            .background(VerdeTheme.panel, in: Capsule())
     }
 }
 
@@ -108,7 +104,7 @@ private struct PaneItem: View {
     let now: Int64
     var body: some View {
         MenuRow(content: RowContent(title: pane.title, detail: paneLine(pane, now),
-                                    dot: Dot(color: statusColor(pane.status, attention: pane.attention), label: paneLabel(pane)),
+                                    dot: Dot(color: VerdeTheme.status(pane.status, attention: pane.attention), label: paneLabel(pane)),
                                     badge: attentionLabel(pane.attention_kind)),
                 destination: route(pane), copies: [("Copy title", pane.title)])
     }
@@ -122,7 +118,7 @@ private struct ThreadItem: View {
         let parts = [workspaceLabel, thread.status == "idle" ? nil : statusLabel(thread.status),
                      thread.last_activity_at_ms.map { agoLabel($0, now) }].compactMap { $0 }
         MenuRow(content: RowContent(title: thread.title, detail: parts.isEmpty ? nil : parts.joined(separator: " · "),
-                                    dot: Dot(color: statusColor(thread.status, attention: thread.status == "waiting_approval"),
+                                    dot: Dot(color: VerdeTheme.status(thread.status, attention: thread.status == "waiting_approval"),
                                              label: statusLabel(thread.status)), provider: thread.provider),
                 destination: .thread(workspace: thread.workspace_id, thread: thread.thread_id),
                 copies: [("Copy title", thread.title)])
@@ -135,7 +131,7 @@ private struct WorkspaceItem: View {
         let info = workspaceSummary(workspace)
         MenuRow(content: RowContent(title: workspace.label,
                                     detail: [info.summary, workspace.path].filter { !$0.isEmpty }.joined(separator: "\n"),
-                                    dot: Dot(color: info.active > 0 ? .accentColor : .secondary, label: info.active > 0 ? "Active" : "Idle"),
+                                    dot: Dot(color: info.active > 0 ? VerdeTheme.accent : VerdeTheme.subtle, label: info.active > 0 ? "Active" : "Idle"),
                                     badge: info.badge),
                 destination: .workspace(workspace.workspace_id), copies: [("Copy path", workspace.path)])
     }
@@ -143,9 +139,9 @@ private struct WorkspaceItem: View {
 
 func hostDotColor(_ row: HostRow) -> Color {
     let status = hostStatus(row)
-    if status == "Connected" { return .green }
-    if row.fatal || row.view?.auth_state == "repair_required" || status.hasPrefix("Unreachable") { return .red }
-    return .secondary
+    if status == "Connected" { return VerdeTheme.accent }
+    if row.fatal || row.view?.auth_state == "repair_required" || status.hasPrefix("Unreachable") { return VerdeTheme.danger }
+    return VerdeTheme.subtle
 }
 
 struct BrowseActions {

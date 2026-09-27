@@ -13,6 +13,20 @@ enum VerdeTheme {
     static var accent: Color { AppearanceSettings.shared.color("accent", fallback: 0x50c878, light: 0x197d43) }
     static var warning: Color { AppearanceSettings.shared.color("warning", fallback: 0xfbbf24, light: 0xa36800) }
     static var danger: Color { AppearanceSettings.shared.color("diff_remove", fallback: 0xff6464, light: 0xb52828) }
+    /// Android's attention badge uses errorContainer/onErrorContainer, rather
+    /// than bright error text. Host themes tint their own panel and text.
+    static var attentionBackground: Color {
+        if AppearanceSettings.shared.mode == .host, AppearanceSettings.shared.palette != nil {
+            return danger.opacity(0.18)
+        }
+        return AppearanceSettings.shared.color("attention_background", fallback: 0x422829, light: 0xf6dddd)
+    }
+    static func status(_ status: String, attention: Bool = false) -> Color {
+        if status == "failed" { return danger }
+        if attention || status == "waiting_approval" { return warning }
+        if ["working", "running", "accepted", "waiting"].contains(status) { return accent }
+        return subtle
+    }
     static var user: Color { AppearanceSettings.shared.color("selection", fallback: 0x2a4636, light: 0xd8eddf) }
     static var assistant: Color { AppearanceSettings.shared.color("background", fallback: 0x161c1e, light: 0xffffff) }
     static func ui(_ size: CGFloat = 15, bold: Bool = false) -> Font { .custom(bold ? "NotoSans-Bold" : "NotoSans-Regular", size: size, relativeTo: .body) }
@@ -72,9 +86,10 @@ struct Pulse: ViewModifier {
 struct StatusPip: View {
     var active = false
     var attention = false
+    var failed = false
     var body: some View {
-        Circle().fill(attention ? VerdeTheme.warning : active ? VerdeTheme.accent : VerdeTheme.subtle)
-            .frame(width: 6, height: 6).modifier(Pulse(active: active)).accessibilityLabel(attention ? "Needs attention" : active ? "Working" : "Idle")
+        Circle().fill(failed ? VerdeTheme.danger : attention ? VerdeTheme.warning : active ? VerdeTheme.accent : VerdeTheme.subtle)
+            .frame(width: 6, height: 6).modifier(Pulse(active: active)).accessibilityLabel(failed ? "Failed" : attention ? "Needs attention" : active ? "Working" : "Idle")
     }
 }
 private struct DrawerActionKey: EnvironmentKey { static let defaultValue: () -> Void = {} }
