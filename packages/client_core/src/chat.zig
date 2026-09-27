@@ -1270,14 +1270,30 @@ pub fn query(a: A, state: *const h.State, selector: []const u8) E!?V {
     return try value(a, m.ThreadView{ .thread = try summary(a, t, state.wall_time_ms), .rows = rows, .page = .{ .has_older = t.cursor != null, .cursor = t.cursor, .loading = t.loading }, .turn = turn, .approval = t.approval, .usage = usage_, .stale = state.stale, .@"error" = t.@"error" });
 }
 /// Include precise chat selectors in the coalesced host notification.
-pub fn scopes(tx: *h.Transaction) E![]const []const u8 {
-    // `hosts`/`operations` are diffed separately by the host commit.
-    var out: []const []const u8 = &.{ "home", "workspaces" };
-    for (tx.state.chat.threads) |t| {
+pub fn scopes(tx: *h.Transaction, before: *const h.State, host_changed: bool) E![]const []const u8 {
+    const equal = @import("state_clone.zig").equal;
+    const after = &tx.state;
+    const context_changed = host_changed or before.stale != after.stale or
+        before.rpc.phase != after.rpc.phase or (before.rpc.bearer == null) != (after.rpc.bearer == null) or
+        !equal(V, p.get(before.sync.snapshot, "config"), p.get(after.sync.snapshot, "config"));
+    var out: []const []const u8 = &.{};
+    for (after.chat.threads) |t| {
+        var previous: ?Thread = null;
+        for (before.chat.threads) |old| if (eq(old.workspace_id, t.workspace_id) and eq(old.id, t.id)) {
+            previous = old;
+            break;
+        };
+        const receipt_changed = if (t.send_intent) |id| !equal(?h.Operation, sendReceipt(before, id), sendReceipt(after, id)) else false;
+        if (!context_changed and previous != null and equal(Thread, previous.?, t) and !receipt_changed and
+            !(t.focused and before.wall_time_ms != after.wall_time_ms)) continue;
         try add([]const u8, tx.allocator(), &out, try selectorFor(tx.allocator(), "thread", t.workspace_id, t.id));
         try add([]const u8, tx.allocator(), &out, try selectorFor(tx.allocator(), "composer", t.workspace_id, t.id));
     }
     return out;
+}
+fn sendReceipt(state: *const h.State, id: []const u8) ?h.Operation {
+    for (state.receipts) |receipt| if (eq(receipt.operation.intent_id, id)) return receipt.operation;
+    return null;
 }
 
 /// Encode the revision-1 workspace-qualified thread identity exactly once.

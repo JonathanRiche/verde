@@ -124,3 +124,27 @@ HTTP writes remained about 22 ms median; VT apply/resumption was 32 ms median.
 This is a controlled throughput comparison, not a claim of measured display
 latency or SSH-equivalent streaming. Both temporary shells were explicitly
 exited. No daemon or gateway restart was involved.
+
+### Chat input and streaming projections
+
+When enabled before opening the host, the opt-in trace also records `core_event`, `handle_ms`, `publish_ms`, and query
+counts. `query_kind`, `native_ms`, `decode_ms`, and byte counts separate projection
+encoding from platform JSON parsing. Labels are fixed categories: no selector,
+thread identifier, message body, or request content is emitted. These timings
+exclude executor queueing and display latency.
+
+On the same long chat on the owner's phone, an unsent fixture draft took
+26 ms handling + 209 ms publication (7 queries) before narrowing invalidation,
+and 39 ms + 31 ms (3 queries) afterward. The fixture was removed without sending.
+This is a single controlled processing comparison, not a measured end-to-end
+send latency or frame-rate claim. Active chat HTTP updates after the change
+published in roughly 19–33 ms in the observed sample, versus 197–227 ms before.
+
+Drafts and transcript deltas now invalidate changed chats without re-projecting
+unrelated retained chats or browse catalogs. Host, catalog, connectivity, and
+send-receipt changes still refresh their dependent views. Android decodes
+transcript models off the UI thread, avoids JSON stringify/decode round trips,
+and conflates pending markdown updates while allowing the current parse to
+finish. A Compose regression exercises a blocked parse followed by multiple
+stream updates, checking completion and the final displayed text. The existing
+send regression checks the local prompt overlay before any server response.

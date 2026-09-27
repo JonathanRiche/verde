@@ -10,6 +10,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.decodeFromJsonElement
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.security.SecureRandom
@@ -54,6 +55,7 @@ class CoreHost private constructor(
     private val handle: Long,
     private val executor: EffectExecutor,
     private val terminalBridge: TerminalBridge,
+    private val traceMetadata: ((String) -> Unit)?,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + dispatcher)
     private var closed = false
@@ -177,10 +179,35 @@ class CoreHost private constructor(
         catch (_: Exception) { throw CoreFailure(-1) }
     }
 
-    private fun read(selector: String) = CoreJson.parseToJsonElement(core.query(handle, selector).decodeToString())
+    private fun read(selector: String): JsonElement {
+        val trace = traceMetadata != null
+        val started = System.nanoTime()
+        val bytes = core.query(handle, selector)
+        val queried = System.nanoTime()
+        val result = CoreJson.parseToJsonElement(bytes.decodeToString())
+        if (trace) {
+            val kind = when {
+                selector.startsWith("thread:") -> "thread"
+                selector.startsWith("composer:") -> "composer"
+                selector in setOf("hosts", "operations", "home", "workspaces", "attention", "manage") -> selector
+                else -> "utility"
+            }
+            traceMetadata?.invoke("query_kind=$kind native_ms=${(queried-started)/1_000_000} decode_ms=${(System.nanoTime()-queried)/1_000_000} bytes=${bytes.size}")
+        }
+        return result
+    }
 
     private fun dispatch(event: Event) {
         val started = System.nanoTime()
+        val trace = traceMetadata != null
+        val eventKind = when (event) {
+            is EventDraftSet -> "draft"
+            is EventSend -> "send"
+            is EventFollowupSubmit -> "followup"
+            is EventHttpResponse -> "http"
+            is EventWsMessage -> "socket"
+            else -> "other"
+        }
         val bytes = try {
             core.handle(handle, CoreJson.encodeToString<Event>(event).encodeToByteArray())
         } catch (e: CoreFailure) {
@@ -191,17 +218,20 @@ class CoreHost private constructor(
             throw e
         }
         if (event is EventTerminalInput) executor.recordTerminalTiming(TerminalTimingStage.InputHandle, started)
+        val handled = System.nanoTime()
+        var queries = 0
         val batch = CoreJson.decodeFromString<EffectBatch>(bytes.decodeToString())
         check(batch.api_version == 1L) { "unsupported_core_revision" }
         for (effect in batch.effects) {
             if (effect is EffectStateChanged) {
                 val updated = mutableViews.value.toMutableMap()
                 effect.scopes.forEach {
+                    queries++
                     val snapshot = read(it)
                     updated[it] = snapshot
                     when (it) {
                         "hosts" -> {
-                            val hosts = CoreJson.decodeFromString<HostsQuery>(snapshot.toString())
+                            val hosts = CoreJson.decodeFromJsonElement<HostsQuery>(snapshot)
                             if (hosts.data?.items?.any { host -> host.auth_state == "signing_out" || host.auth_state == "signed_out" } == true) {
                                 // A core-driven wipe also retires any platform-cached projections.
                                 updated.clear()
@@ -212,15 +242,16 @@ class CoreHost private constructor(
                             }
                             mutableHosts.value = hosts
                         }
-                        "operations" -> mutableOperations.value = CoreJson.decodeFromString<OperationsQuery>(snapshot.toString())
-                        "home" -> mutableHome.value = CoreJson.decodeFromString<HomeQuery>(snapshot.toString())
-                        "workspaces" -> mutableWorkspaces.value = CoreJson.decodeFromString<WorkspacesQuery>(snapshot.toString())
+                        "operations" -> mutableOperations.value = CoreJson.decodeFromJsonElement<OperationsQuery>(snapshot)
+                        "home" -> mutableHome.value = CoreJson.decodeFromJsonElement<HomeQuery>(snapshot)
+                        "workspaces" -> mutableWorkspaces.value = CoreJson.decodeFromJsonElement<WorkspacesQuery>(snapshot)
                     }
                 }
                 mutableViews.value = updated.toMap()
             } else if (effect is EffectTerminalOutput) terminalOutput(effect)
             else executor.execute(effect)
         }
+        if (trace) traceMetadata?.invoke("core_event=$eventKind handle_ms=${(handled-started)/1_000_000} publish_ms=${(System.nanoTime()-handled)/1_000_000} queries=$queries")
         if (event is EventTerminalInput) executor.recordTerminalTiming(TerminalTimingStage.InputDispatch, started)
     }
 
@@ -252,7 +283,7 @@ class CoreHost private constructor(
 
     companion object {
         suspend fun create(config: Config, executor: EffectExecutor, core: CoreBridge = JniCoreBridge,
-            terminals: TerminalBridge = JniTerminalBridge): CoreHost {
+            terminals: TerminalBridge = JniTerminalBridge, traceMetadata: ((String) -> Unit)? = null): CoreHost {
             val dispatcher = Executors.newSingleThreadExecutor { r -> Thread(r, "verde-core") }.asCoroutineDispatcher()
             var allocated = 0L
             try {
@@ -262,7 +293,7 @@ class CoreHost private constructor(
                 val handle = withContext(dispatcher) {
                     core.create(CoreJson.encodeToString(session).encodeToByteArray()).also { allocated = it }
                 }
-                return CoreHost(core, dispatcher, handle, executor, terminals)
+                return CoreHost(core, dispatcher, handle, executor, terminals, traceMetadata)
             } catch (_: Exception) {
                 withContext(NonCancellable + dispatcher) { if (allocated != 0L) core.free(allocated) }
                 dispatcher.close(); executor.close(); throw CoreFailure(-1)

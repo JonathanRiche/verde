@@ -665,7 +665,24 @@ fn changedScopes(tx: *Transaction, before: *const State) ApiError![]const []cons
     // cached transcript and workspace. Querying those on each key overwhelms
     // the platform's serial core executor even when network RTT is tiny.
     if (!otherViewsChanged(before, &tx.state, host_changed)) return own;
-    return std.mem.concat(a, []const u8, &.{ own, try chat.scopes(tx), &.{ "attention", "manage" } });
+    const shared: []const []const u8 = if (sharedViewsChanged(before, &tx.state, host_changed)) &.{ "home", "workspaces", "attention", "manage" } else &.{};
+    return std.mem.concat(a, []const u8, &.{ own, try chat.scopes(tx, before, host_changed), shared });
+}
+// Transcript deltas and draft edits do not change the workspace catalog. Its
+// large projection must not sit ahead of every key/send on the platform queue.
+fn sharedViewsChanged(before: *const State, after: *const State, host_changed: bool) bool {
+    if (host_changed or before.network_available != after.network_available or before.stale != after.stale) return true;
+    inline for (.{ "config", "sync", "attention", "manage" }) |name| {
+        if (!state_clone.equal(@TypeOf(@field(before.*, name)), @field(before.*, name), @field(after.*, name))) return true;
+    }
+    // Browse age buckets refresh while browsing, and again when chat loses focus.
+    var focused = false;
+    for (after.chat.threads) |t| focused = focused or t.focused;
+    if (!focused and before.wall_time_ms != after.wall_time_ms) return true;
+    for (before.chat.threads) |t| if (t.focused and !focused) return true;
+    if (before.terminal.rows.len != after.terminal.rows.len) return true;
+    for (before.terminal.rows, after.terminal.rows) |old, new| if (old.view.attached != new.view.attached) return true;
+    return false;
 }
 fn otherViewsChanged(before: *const State, after: *const State, host_changed: bool) bool {
     if (host_changed or before.network_available != after.network_available or before.stale != after.stale) return true;

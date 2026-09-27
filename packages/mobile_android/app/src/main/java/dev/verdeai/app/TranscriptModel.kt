@@ -65,7 +65,7 @@ internal class TranscriptModel(
     val workspaceId: String,
     val threadId: String,
     private val unfocusDelayMs: Long = UNFOCUS_DELAY_MS,
-) : ViewModel(), HighlightSource {
+) : ViewModel(), MarkdownSource {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val mutableState = MutableStateFlow(TranscriptState(workspaceId, threadId))
     val state = mutableState.asStateFlow()
@@ -98,9 +98,13 @@ internal class TranscriptModel(
         core = host
         connected.value = host
         launch {
-            host.views.map { it[threadSelector] to it[composerSelector] }.distinctUntilChanged().collect { (thread, composer) ->
-                mutableState.update { it.copy(thread=decodeThread(thread), composer=decodeComposer(composer)) }
-            }
+            host.views.map { it[threadSelector] to it[composerSelector] }.distinctUntilChanged()
+                .map { (thread, composer) -> decodeThread(thread) to decodeComposer(composer) }
+                .flowOn(Dispatchers.Default)
+                .conflate()
+                .collect { (thread, composer) ->
+                    mutableState.update { it.copy(thread=thread, composer=composer) }
+                }
         }
         launch { host.failed.collect { failed -> if (failed) mutableState.update { it.copy(fatal=true) } } }
         var lastReady = false
@@ -249,8 +253,8 @@ internal class TranscriptModel(
 
     // ---- K-11 rendering utilities (pure core queries; work offline) ----
 
-    fun cachedMarkdown(text: String): RenderResult<List<MarkdownNode>>? = renders.markdown[text]
-    suspend fun markdown(text: String): RenderResult<List<MarkdownNode>> = renders.markdown[text] ?: run {
+    override fun cachedMarkdown(text: String): RenderResult<List<MarkdownNode>>? = renders.markdown[text]
+    override suspend fun markdown(text: String): RenderResult<List<MarkdownNode>> = renders.markdown[text] ?: run {
         val result = utility<MarkdownQuery, List<MarkdownNode>>(buildJsonObject { put("utility", "markdown"); put("text", text) }.toString()) { it.data?.nodes }
         result.also { renders.markdown[text] = it }
     }
@@ -278,7 +282,8 @@ internal class TranscriptModel(
         if (selector.length > limit) return RenderResult(null)
         val host = core ?: return RenderResult(null)
         return try {
-            RenderResult(data(CoreJson.decodeFromJsonElement<Q>(host.query(selector))))
+            val response = host.query(selector)
+            withContext(Dispatchers.Default) { RenderResult(data(CoreJson.decodeFromJsonElement<Q>(response))) }
         } catch (e: CancellationException) { throw e } catch (_: Exception) { RenderResult(null) }
     }
 

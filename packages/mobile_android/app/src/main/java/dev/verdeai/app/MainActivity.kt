@@ -36,7 +36,8 @@ class MainActivity : ComponentActivity() {
             override fun <T : ViewModel> create(modelClass: Class<T>): T = when (modelClass) {
                 HostsModel::class.java -> HostsModel(app.secureStore, app.signals, cache) { saved ->
                     CoreHost.create(Config(1, saved.id, saved.label, null, null, 1, "", 0uL),
-                        EffectExecutor(app.secureStore, saved.id, socketTrace = ConnectionDiagnostics::socket, terminalTiming = if (ConnectionDiagnostics.enabled) ConnectionDiagnostics::terminal else null))
+                        EffectExecutor(app.secureStore, saved.id, socketTrace = ConnectionDiagnostics::socket, terminalTiming = if (ConnectionDiagnostics.enabled) ConnectionDiagnostics::terminal else null),
+                        traceMetadata = if (ConnectionDiagnostics.enabled) ConnectionDiagnostics::core else null)
                 }
                 BrowseModel::class.java -> BrowseModel(hosts, cache, app.signals)
                 else -> error("unknown model")

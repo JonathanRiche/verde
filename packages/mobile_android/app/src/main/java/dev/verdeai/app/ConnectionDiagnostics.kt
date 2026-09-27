@@ -13,6 +13,7 @@ internal object ConnectionDiagnostics {
     private const val TAG = "VerdeConnection"
     val enabled: Boolean get() = Log.isLoggable(TAG, Log.INFO)
     private fun log(value: String) { if (Log.isLoggable(TAG, Log.INFO)) Log.i(TAG, value) }
+    fun core(value: String) = log(value)
     fun socket(value: SocketTrace) = log("socket=${value.socket} event=${value.event} age_ms=${value.ageMs} messages=${value.messages} code=${value.code} failure=${value.failure}")
     fun terminal(value: TerminalTiming) = log("terminal_stage=${value.stage} elapsed_ms=${value.elapsedMs}")
     fun observe(scope: CoroutineScope, signals: AppSignals, browse: BrowseModel) {

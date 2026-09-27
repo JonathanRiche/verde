@@ -714,3 +714,34 @@ test "chat discovers externally started turn after a completed turn without repl
     try eql("running", t.turn.?.status);
     try expect(t.overlay.len > 0);
 }
+
+test "focused draft and tail updates leave cached chats and browse catalogs alone" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.open();
+    {
+        var tx = try h.Transaction.init(&f.host);
+        defer tx.deinit();
+        var cached = tx.state.chat.threads[0];
+        cached.id = "offscreen-chat";
+        cached.focused = false;
+        tx.state.chat.threads = try tx.allocator().dupe(chat.Thread, &.{ tx.state.chat.threads[0], cached });
+        _ = try tx.commit(&f.host, f.a());
+    }
+    const visible = try chat.selectorFor(f.a(), "thread", ws, thread);
+    const cached = try chat.selectorFor(f.a(), "thread", ws, "offscreen-chat");
+    const draft = try f.intent("draft_set", .{ .text = "fixture prompt", .attachments = .{} });
+    try expect(announced(draft, visible));
+    try expect(!announced(draft, cached));
+    try expect(!announced(draft, "home") and !announced(draft, "workspaces"));
+    _ = try f.storage(null, false);
+    try f.seedTurn();
+    const batch = try f.response("chat.turn.tail", try f.value(.{ .status = "running", .events = .{.{ .seq = 1, .kind = "assistant_delta", .payload_json = "{\"text\":\"live text\"}" }} }), null);
+    try expect(announced(batch, visible));
+    try expect(!announced(batch, cached));
+    try expect(!announced(batch, "home") and !announced(batch, "workspaces"));
+    // Real connectivity changes still invalidate both cached and visible views.
+    const background = try f.event("background", .{});
+    try expect(announced(background, visible) and announced(background, cached));
+    try expect(announced(background, "home"));
+}

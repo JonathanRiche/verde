@@ -1,5 +1,7 @@
 package dev.verdeai.app
 
+import kotlinx.coroutines.flow.conflate
+
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.horizontalScroll
@@ -40,6 +42,11 @@ internal data class MdStyle(val link: Color, val codeBackground: Color)
 internal interface HighlightSource {
     fun cachedHighlight(code: String, language: String): RenderResult<List<RenderSpan>>?
     suspend fun highlight(code: String, language: String): RenderResult<List<RenderSpan>>
+}
+
+internal interface MarkdownSource : HighlightSource {
+    fun cachedMarkdown(text: String): RenderResult<List<MarkdownNode>>?
+    suspend fun markdown(text: String): RenderResult<List<MarkdownNode>>
 }
 
 /** Only the link schemes the core admits are ever made tappable. */
@@ -175,8 +182,13 @@ internal const val PLAIN_TAG = "plain-text"
 
 /** Renders [text] from the core's markdown AST, falling back to the literal source. */
 @Composable
-internal fun MarkdownText(text: String, model: TranscriptModel, onCitation: (FileCitation) -> Unit, modifier: Modifier = Modifier) {
-    val result by produceState(model.cachedMarkdown(text), text) { value = model.markdown(text) }
+internal fun MarkdownText(text: String, model: MarkdownSource, onCitation: (FileCitation) -> Unit, modifier: Modifier = Modifier) {
+    val latestText by rememberUpdatedState(text)
+    // Let one parse finish, then take the newest body. Restarting on every delta
+    // leaves obsolete native queries ahead of input and may starve rendering.
+    val result by produceState(model.cachedMarkdown(text), model) {
+        snapshotFlow { latestText }.conflate().collect { value = model.markdown(it) }
+    }
     val nodes = result?.value
     if (nodes == null) {
         // Pending (first frame) or unrenderable: the source text, never re-parsed in Kotlin.
