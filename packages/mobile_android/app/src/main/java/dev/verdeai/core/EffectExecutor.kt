@@ -17,9 +17,16 @@ import java.util.Base64
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import javax.net.ssl.*
 
 typealias Completion = (Long, Long) -> Event
+
+/** Allowlisted transport metadata only: never include URLs, payloads, headers or exception text. */
+enum class SocketTraceEvent { Starting, Open, Traffic, LocalClose, PeerClose, Failure, SendRejected, InvalidProtocol, Oversized, Binary, ExecutorClosed }
+data class SocketTrace(val socket: Long, val event: SocketTraceEvent, val ageMs: Long,
+    val messages: Long, val code: Int? = null, val failure: TransportFailureCode? = null)
+
 
 /** Owns platform work for one host. Callbacks enqueue events; they never call JNI. */
 class EffectExecutor(
@@ -32,6 +39,7 @@ class EffectExecutor(
     private val baseClient: OkHttpClient = OkHttpClient(),
     /** D-12: bodies of `file_fetch` effects, held in memory only until the viewer takes them. */
     val files: FileSink = FileSink(),
+    private val socketTrace: (SocketTrace) -> Unit = {},
 ) : AutoCloseable {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     // The core caps outstanding correlations at 256. OkHttp's default five per
@@ -42,6 +50,7 @@ class EffectExecutor(
     }
     private val calls = ConcurrentHashMap<String, Call>()
     private val sockets = ConcurrentHashMap<String, SocketState>()
+    private val socketSequence = AtomicLong()
     private val timers = ConcurrentHashMap<String, Job>()
     private val clients = ConcurrentHashMap.newKeySet<OkHttpClient>()
     private var poolKey: Pair<String, String>? = null
@@ -76,12 +85,12 @@ class EffectExecutor(
             is EffectFileFetch -> fileFetch(effect)
             is EffectWsOpen -> websocket(effect)
             is EffectWsSend -> sockets[effect.socket_id]?.let {
-                if (!it.socket.send(effect.text)) it.finish(null, false, failure(TransportFailureKind.network, TransportFailureCode.reset))
+                if (!it.socket.send(effect.text)) it.finish(null, false, failure(TransportFailureKind.network, TransportFailureCode.reset), SocketTraceEvent.SendRejected)
             }
             is EffectWsClose -> sockets[effect.socket_id]?.let {
                 it.socket.close(effect.code, null)
                 // Local close must promptly release the socket even if the peer never replies.
-                it.finish(effect.code, true, null)
+                it.finish(effect.code, true, null, SocketTraceEvent.LocalClose)
             }
             is EffectSetTimer -> {
                 timers.remove(effect.timer_id)?.cancel()
@@ -274,9 +283,22 @@ class EffectExecutor(
 
     private inner class SocketState(val effect: EffectWsOpen, val client: OkHttpClient) {
         lateinit var socket: WebSocket
+        private val sequence = socketSequence.incrementAndGet()
+        private val started = System.nanoTime()
+        private val messages = AtomicLong()
+        private var lastTraffic = 0L
+        fun trace(event: SocketTraceEvent, code: Int? = null, failure: TransportFailureCode? = null) {
+            socketTrace(SocketTrace(sequence, event, (System.nanoTime() - started) / 1_000_000, messages.get(), code, failure))
+        }
+        fun traffic() {
+            messages.incrementAndGet()
+            val now = System.nanoTime()
+            if (now - lastTraffic >= 10_000_000_000L) { lastTraffic = now; trace(SocketTraceEvent.Traffic) }
+        }
         val finished = AtomicBoolean(false)
-        fun finish(code: Int?, clean: Boolean, error: TransportFailure?) {
+        fun finish(code: Int?, clean: Boolean, error: TransportFailure?, source: SocketTraceEvent = SocketTraceEvent.Failure) {
             if (!finished.compareAndSet(false, true)) return
+            trace(source, code, error?.code)
             sockets.remove(effect.effect_id)
             if (::socket.isInitialized) socket.cancel()
             release(client)
@@ -288,32 +310,37 @@ class EffectExecutor(
         var active: OkHttpClient? = null
         try {
             val url = secureUrl(e.url, e.tls)
+            // OkHttp 4.12 exits callTimeout at upgrade (Exchange.newWebSocketStreams).
+            // Keep establishment bounded; this is not the lifetime of an open socket.
             active = client(url, e.tls, 30_000)
             val state = SocketState(e, active)
+            state.trace(SocketTraceEvent.Starting)
             val request = Request.Builder().url(url).header("Sec-WebSocket-Protocol", e.protocols.joinToString(", ")).build()
             state.socket = active.newWebSocket(request, object : WebSocketListener() {
                 override fun onOpen(webSocket: WebSocket, response: Response) {
                     val protocol = response.header("Sec-WebSocket-Protocol") ?: ""
                     if (protocol !in e.protocols || protocol.startsWith("verde.ticket.")) {
-                        state.finish(null, false, failure(TransportFailureKind.network, TransportFailureCode.unknown)); return
+                        state.finish(null, false, failure(TransportFailureKind.network, TransportFailureCode.unknown), SocketTraceEvent.InvalidProtocol); return
                     }
+                    state.trace(SocketTraceEvent.Open)
                     emit { n,w -> EventWsOpen(now_ms=n, wall_time_ms=w, socket_id=e.effect_id, generation=e.generation, protocol=protocol) }
                 }
                 override fun onMessage(webSocket: WebSocket, text: String) {
                     if (text.toByteArray().size.toLong() > e.max_message_bytes) {
-                        state.finish(1009, false, failure(TransportFailureKind.resource, TransportFailureCode.resource)); return
+                        state.finish(1009, false, failure(TransportFailureKind.resource, TransportFailureCode.resource), SocketTraceEvent.Oversized); return
                     }
+                    state.traffic()
                     if (!state.finished.get()) emit { n,w -> EventWsMessage(now_ms=n, wall_time_ms=w, socket_id=e.effect_id, generation=e.generation, text=text) }
                 }
                 override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-                    state.finish(1003, false, failure(TransportFailureKind.network, TransportFailureCode.unknown))
+                    state.finish(1003, false, failure(TransportFailureKind.network, TransportFailureCode.unknown), SocketTraceEvent.Binary)
                 }
                 override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                     // 1005 means the peer sent an empty close frame; it is a
                     // local sentinel and must never be echoed onto the wire.
                     webSocket.close(if (code == 1005) 1000 else code, null)
                 }
-                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) { state.finish(code, true, null) }
+                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) { state.finish(code, true, null, SocketTraceEvent.PeerClose) }
                 override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                     response?.close(); state.finish(null, false, transport(t))
                 }
@@ -355,7 +382,7 @@ class EffectExecutor(
         if (!closed.compareAndSet(false, true)) return
         completion = null
         calls.values.forEach { it.cancel() }; calls.clear()
-        sockets.values.forEach { it.socket.cancel() }; sockets.clear()
+        sockets.values.forEach { it.trace(SocketTraceEvent.ExecutorClosed); it.socket.cancel() }; sockets.clear()
         probes.forEach { try { it.close() } catch (_: IOException) {} }; probes.clear()
         timers.values.forEach { it.cancel() }; timers.clear()
         storage.close(); scope.cancel()

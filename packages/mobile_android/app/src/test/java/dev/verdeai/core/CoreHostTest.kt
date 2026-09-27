@@ -327,6 +327,36 @@ class CoreHostTest {
         }
     }
 
+    @Test fun upgradedWebsocketOutlivesThirtySecondCallTimeoutAndStillClosesLocally() = runBlocking {
+        TlsFixture().use { fixture ->
+            fixture.server.enqueue(MockResponse().setHeader("Sec-WebSocket-Protocol", "verde.v1")
+                .withWebSocketUpgrade(object : WebSocketListener() {
+                    override fun onMessage(socket: WebSocket, text: String) { socket.send(text) }
+                    override fun onClosing(socket: WebSocket, code: Int, reason: String) { socket.close(code, null) }
+                }))
+            val core = FakeCore()
+            val host = CoreHost.create(config, executor(client=fixture.client), core)
+            try {
+                core.effects = listOf(EffectWsOpen("long-lived", "1",
+                    fixture.server.url("/ws").toString().replace("https:", "wss:"),
+                    listOf("verde.v1"), Tls(fixture.origin, fixture.pin), 1000))
+                start(host)
+                core.next<EventWsOpen>()
+                // Exercise the production 30s deadline, including an idle upgraded socket.
+                delay(35_000)
+                core.effects = listOf(EffectWsSend("send", "1", "long-lived", "fixture"))
+                host.send { n,w -> EventForeground(now_ms=n, wall_time_ms=w) }
+                assertEquals("fixture", core.next<EventWsMessage>().text)
+                core.effects = listOf(EffectWsClose("close", "1", "long-lived", 1000))
+                host.send { n,w -> EventBackground(now_ms=n, wall_time_ms=w) }
+                val closed = core.next<EventWsClosed>()
+                assertTrue(closed.clean)
+                assertEquals(1000, closed.code)
+                assertNull(closed.error)
+            } finally { host.close() }
+        }
+    }
+
     @Test fun websocketEmptyCloseFrameIsCleanInsteadOfTlsFailure() = runBlocking {
         TlsFixture().use { fixture ->
             // A legal empty close frame is surfaced by OkHttp as code 1005.

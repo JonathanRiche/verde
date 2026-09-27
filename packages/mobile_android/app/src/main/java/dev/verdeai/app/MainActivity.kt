@@ -36,7 +36,7 @@ class MainActivity : ComponentActivity() {
             override fun <T : ViewModel> create(modelClass: Class<T>): T = when (modelClass) {
                 HostsModel::class.java -> HostsModel(app.secureStore, app.signals, cache) { saved ->
                     CoreHost.create(Config(1, saved.id, saved.label, null, null, 1, "", 0uL),
-                        EffectExecutor(app.secureStore, saved.id))
+                        EffectExecutor(app.secureStore, saved.id, socketTrace = ConnectionDiagnostics::socket))
                 }
                 BrowseModel::class.java -> BrowseModel(hosts, cache, app.signals)
                 else -> error("unknown model")
@@ -44,6 +44,7 @@ class MainActivity : ComponentActivity() {
         })
         hosts = provider[HostsModel::class.java]
         browse = provider[BrowseModel::class.java]
+        ConnectionDiagnostics.observe(lifecycleScope, app.signals, browse)
         consumePairIntent(intent)
         val auth = AndroidDeviceAuth(this)
         setContent { VerdeApp(hosts, browse, lock = AppLockControls(lock, auth)) }
