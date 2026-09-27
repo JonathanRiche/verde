@@ -415,7 +415,7 @@ test "new_chat_select defaults to the workspace provider and validates against i
     try f.expectFailed(try f.intent("thread_create", .{ .workspace_id = "ws-1", .provider = "claude", .model = "opus[1m]" }), "invalid_selection");
 
     _ = try f.intent("new_chat_select", .{ .workspace_id = "ws-1", .provider = "codex" });
-    try expect(f.pending("provider.models.list") == 1);
+    try expect(f.pending("provider.models.list") == 0);
     try eql("codex", p.s(p.get(p.get(try f.view(), "new_chat"), "selection"), "provider"));
     const closed = try f.intent("new_chat_select", .{ .workspace_id = "ws-closed" });
     try eql("succeeded", (try f.receipt(closed)).state);
@@ -499,4 +499,28 @@ test "close uses thread close and sync refuses remote provider bindings" {
     try eql("p-1", p.s(try f.params("provider.thread.sync"), "provider_thread_id"));
     try f.reply("provider.thread.sync", .{});
     try eql("succeeded", p.s(try f.job(local_id), "state"));
+}
+
+test "new chat uses Codex static models and retains OpenCode choices when discovery is unavailable" {
+    var f = try Fixture.init(all_scopes, &.{});
+    defer f.deinit();
+    _ = try f.intent("new_chat_select", .{ .workspace_id = "ws-1", .provider = "codex" });
+    try expect(f.pending("provider.models.list") == 0);
+    var view = p.get(try f.view(), "new_chat");
+    try expect(!p.yes(p.get(view, "loading")));
+    try expect(p.get(view, "error") == .null);
+    try expect(p.yes(p.get(view, "can_create")));
+    try expect(p.rows(p.get(p.get(view, "catalogs"), "models")).len > 0);
+
+    _ = try f.intent("new_chat_select", .{ .workspace_id = "ws-1", .provider = "opencode" });
+    try expect(f.pending("provider.models.list") == 1);
+    try f.reject("provider.models.list", "provider_unavailable", null);
+    view = p.get(try f.view(), "new_chat");
+    try expect(!p.yes(p.get(view, "loading")));
+    try expect(p.yes(p.get(view, "can_create")));
+    try eql("provider_unavailable", p.s(p.get(view, "error"), "rpc_code"));
+    const models = p.rows(p.get(p.get(view, "catalogs"), "models"));
+    try expect(models.len > 0);
+    _ = try f.intent("thread_create", .{ .workspace_id = "ws-1", .provider = "opencode", .model = p.s(models[0], "id") });
+    try expect(f.pending("daemon.client.register") == 1);
 }

@@ -189,7 +189,7 @@ fn reconcileSelection(tx: *h.Transaction, i: usize, latest: store.Thread) E!void
             t.catalog_epoch += 1;
             t.dynamic_models = .null;
             t.slash = .null;
-            if (online(tx) and scope(tx, "runtime:read")) try call(tx, i, .model_list, "provider.models.list", .{ .provider = selection.provider orelse latest.provider, .project_path = t.cwd }, false, "");
+            if (online(tx) and scope(tx, "runtime:read") and c.supportsModelDiscovery(selection.provider orelse latest.provider)) try call(tx, i, .model_list, "provider.models.list", .{ .provider = selection.provider orelse latest.provider, .project_path = t.cwd }, false, "");
         }
         t.confirmation = null;
     }
@@ -428,7 +428,7 @@ pub fn intent(tx: *h.Transaction, tag: []const u8, event: V) E!bool {
             t.storage_id = effect;
         }
         try page(tx, i, false, id);
-        if (scope(tx, "runtime:read") and !exists(tx, i, .model_list)) try call(tx, i, .model_list, "provider.models.list", .{ .provider = t.saved.selection.provider orelse t.metadata.provider, .project_path = t.cwd }, false, "");
+        if (scope(tx, "runtime:read") and c.supportsModelDiscovery(t.saved.selection.provider orelse t.metadata.provider) and !exists(tx, i, .model_list)) try call(tx, i, .model_list, "provider.models.list", .{ .provider = t.saved.selection.provider orelse t.metadata.provider, .project_path = t.cwd }, false, "");
         return true;
     }
     if (eq(tag, "thread_load_older")) {

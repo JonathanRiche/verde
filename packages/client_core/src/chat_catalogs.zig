@@ -18,6 +18,10 @@ fn choices(a: A, ids: []const []const u8) ![]const m.Choice {
     for (ids, out) |id, *v| v.* = .{ .id = id, .label = choiceLabel(id) };
     return out;
 }
+/// Codex has no model discovery RPC; the host explicitly requires its static catalog.
+pub fn supportsModelDiscovery(provider: []const u8) bool {
+    return !eq(provider, "codex");
+}
 pub fn catalogs(a: A, selection: m.Selection, dynamic: V, slash: V) h.ApiError!m.Catalogs {
     const provider = selection.provider orelse "codex";
     var out: m.Catalogs = .{};

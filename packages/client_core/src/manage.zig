@@ -396,7 +396,7 @@ fn select(tx: *h.Transaction, id: []const u8, event: V) E!void {
     s.models = .null;
     s.models_id = null;
     s.models_error = null;
-    if (!online(tx) or !scoped(&tx.state, "runtime:read")) return;
+    if (!online(tx) or !scoped(&tx.state, "runtime:read") or !c.supportsModelDiscovery(provider)) return;
     s.models_id = try rpc.request(tx, "provider.models.list", .{ .provider = provider, .project_path = p.s(ws, "path") }, .{ .mutation = false, .intent_id = "@manage" });
 }
 

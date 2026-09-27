@@ -106,7 +106,7 @@ const Fixture = struct {
         _ = try f.intent("thread_open", .{});
         _ = try f.storage(null, false);
         try f.recorded("chat.message.list", @embedFile("fixtures/chat/page-0.json"));
-        try f.reply("provider.models.list", .{ .models = .{} });
+        if (@import("chat_catalogs.zig").supportsModelDiscovery(f.host.state.chat.threads[0].metadata.provider)) try f.reply("provider.models.list", .{ .models = .{} });
     }
     fn draft(f: *Fixture, text: []const u8) !void {
         _ = try f.intent("draft_set", .{ .text = text, .attachments = .{} });
@@ -634,4 +634,15 @@ test "composer preserves a restored local choice until host selection changes" {
     try eql("low", p.s(p.get(view, "selection"), "effort"));
     try eql("off", p.s(p.get(view, "selection"), "speed"));
     try eql("draft", p.s(p.get(view, "draft"), "text"));
+}
+
+test "opening and refocusing Codex uses its static model catalog without discovery" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.open();
+    try std.testing.expectError(error.MissingRequest, f.find("provider.models.list"));
+    _ = try f.intent("focus", .{ .terminal_id = @as(?[]const u8, null) });
+    try std.testing.expectError(error.MissingRequest, f.find("provider.models.list"));
+    const view = p.get(try f.query("composer"), "data");
+    try expect(p.rows(p.get(p.get(view, "catalogs"), "models")).len > 0);
 }
