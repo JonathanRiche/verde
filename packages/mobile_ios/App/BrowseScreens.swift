@@ -253,6 +253,20 @@ struct HomeScreen: View {
                 Section { NavigationLink("Add a workspace", value: BrowseRoute.addWorkspace) }
             }
         }
+        .safeAreaInset(edge: .bottom, alignment: .trailing, spacing: 0) {
+            if gateOpen(model.state), model.state.workspaces?.items.contains(where: \.open) == true {
+                NavigationLink(value: BrowseRoute.newChat(nil)) {
+                    Text("New chat").font(VerdeTheme.ui(14, bold: true))
+                        .padding(.horizontal, 24).frame(minHeight: 56)
+                        .foregroundStyle(VerdeTheme.text)
+                        .background(VerdeTheme.user, in: RoundedRectangle(cornerRadius: 16))
+                        .shadow(color: .black.opacity(0.22), radius: 6, y: 3)
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("home-new-chat")
+                .padding(.horizontal, 16).padding(.vertical, 12)
+            }
+        }
     }
 }
 
