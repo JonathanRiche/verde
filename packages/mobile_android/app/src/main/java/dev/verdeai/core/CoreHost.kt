@@ -154,8 +154,10 @@ class CoreHost private constructor(
         val view = CoreJson.decodeFromString<TerminalQuery>(core.query(handle, terminalSelector(effect.terminal_id)).decodeToString()).data
         val bytes = java.util.Base64.getDecoder().decode(effect.bytes_base64)
         scope.launch {
+            val started = System.nanoTime()
             val result = try { vt.apply(effect.reset, bytes, view?.cols ?: 80, view?.rows ?: 24) }
                 catch (e: CancellationException) { if (closed) throw e; TerminalApplied("0", PlatformFailure(PlatformFailureCode.unavailable)) }
+            executor.recordTerminalTiming(TerminalTimingStage.OutputApply, started)
             applied(result)
         }
     }
@@ -178,6 +180,7 @@ class CoreHost private constructor(
     private fun read(selector: String) = CoreJson.parseToJsonElement(core.query(handle, selector).decodeToString())
 
     private fun dispatch(event: Event) {
+        val started = System.nanoTime()
         val bytes = try {
             core.handle(handle, CoreJson.encodeToString<Event>(event).encodeToByteArray())
         } catch (e: CoreFailure) {
@@ -217,6 +220,7 @@ class CoreHost private constructor(
             } else if (effect is EffectTerminalOutput) terminalOutput(effect)
             else executor.execute(effect)
         }
+        if (event is EventTerminalInput) executor.recordTerminalTiming(TerminalTimingStage.InputDispatch, started)
     }
 
     private fun fail() {

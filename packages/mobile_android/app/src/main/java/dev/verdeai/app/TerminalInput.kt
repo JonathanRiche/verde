@@ -72,17 +72,27 @@ internal class TerminalInputView(context: Context, var onInput: (TermInput) -> U
         context.getSystemService(InputMethodManager::class.java)?.showSoftInput(this, 0)
     }
 
-    /** Committed text is sent once and cleared; composition stays local until committed. */
+    /** Mirror composing edits immediately: an IME may hold a word for seconds before commit. */
     private class Connection(private val view: TerminalInputView) : BaseInputConnection(view, true) {
+        private var echoed = ""
+
+        override fun setComposingText(text: CharSequence?, newCursorPosition: Int): Boolean {
+            super.setComposingText(text, newCursorPosition)
+            echoEdits()
+            return true
+        }
+
         override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
             super.commitText(text, newCursorPosition)
-            flush()
+            echoEdits()
+            clearCommitted()
             return true
         }
 
         override fun finishComposingText(): Boolean {
             super.finishComposingText()
-            flush()
+            echoEdits()
+            clearCommitted()
             return true
         }
 
@@ -90,22 +100,37 @@ internal class TerminalInputView(context: Context, var onInput: (TermInput) -> U
             val buffer = editable
             if (buffer.isNullOrEmpty()) {
                 repeat(beforeLength.coerceIn(0, 64)) { view.onInput(TermInput.Key("Backspace")) }
+                repeat(afterLength.coerceIn(0, 64)) { view.onInput(TermInput.Key("Delete")) }
                 return true
             }
-            return super.deleteSurroundingText(beforeLength, afterLength)
+            val result = super.deleteSurroundingText(beforeLength, afterLength)
+            echoEdits()
+            return result
         }
 
         override fun performEditorAction(actionCode: Int): Boolean {
+            finishComposingText()
             view.onInput(TermInput.Key("Enter"))
             return true
         }
 
-        private fun flush() {
-            val buffer = editable ?: return
-            if (BaseInputConnection.getComposingSpanStart(buffer) >= 0) return
-            val text = buffer.toString()
-            buffer.clear()
-            if (text.isNotEmpty()) view.onInput(TermInput.Text(text))
+        private fun clearCommitted() {
+            editable?.clear()
+            echoed = ""
+        }
+
+        private fun echoEdits() {
+            val text = editable?.toString().orEmpty()
+            // Compare code points so replacing an emoji never splits a surrogate pair.
+            var common = 0
+            while (common < echoed.length && common < text.length) {
+                val previous = echoed.codePointAt(common)
+                if (previous != text.codePointAt(common)) break
+                common += Character.charCount(previous)
+            }
+            repeat(echoed.codePointCount(common, echoed.length)) { view.onInput(TermInput.Key("Backspace")) }
+            if (common < text.length) view.onInput(TermInput.Text(text.substring(common)))
+            echoed = text
         }
     }
 }

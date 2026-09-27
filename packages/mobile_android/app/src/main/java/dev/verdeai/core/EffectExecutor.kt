@@ -3,6 +3,8 @@ package dev.verdeai.core
 import android.os.SystemClock
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.*
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -28,6 +30,9 @@ data class SocketTrace(val socket: Long, val event: SocketTraceEvent, val ageMs:
     val messages: Long, val code: Int? = null, val failure: TransportFailureCode? = null)
 
 
+enum class TerminalTimingStage { WriteHttp, TailHttp, InputDispatch, OutputApply }
+data class TerminalTiming(val stage: TerminalTimingStage, val elapsedMs: Long)
+
 /** Owns platform work for one host. Callbacks enqueue events; they never call JNI. */
 class EffectExecutor(
     private val store: SecureStore,
@@ -40,6 +45,7 @@ class EffectExecutor(
     /** D-12: bodies of `file_fetch` effects, held in memory only until the viewer takes them. */
     val files: FileSink = FileSink(),
     private val socketTrace: (SocketTrace) -> Unit = {},
+    private val terminalTiming: ((TerminalTiming) -> Unit)? = null,
 ) : AutoCloseable {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     // The core caps outstanding correlations at 256. OkHttp's default five per
@@ -188,6 +194,10 @@ class EffectExecutor(
         if (closed.get() || client.connectionPool !== trustedPool) client.connectionPool.evictAll()
     }
 
+    internal fun recordTerminalTiming(stage: TerminalTimingStage, started: Long) {
+        terminalTiming?.invoke(TerminalTiming(stage, ((System.nanoTime() - started) / 1_000_000).coerceAtLeast(0)))
+    }
+
     private fun http(e: EffectHttpRequest) {
         var client: OkHttpClient? = null
         try {
@@ -197,10 +207,21 @@ class EffectExecutor(
             e.headers.forEach { request.addHeader(it.name, it.value) }
             val body = e.body_base64?.let { Base64.getDecoder().decode(it).toRequestBody() }
             request.method(e.method, body)
+            val timingStage = if (terminalTiming == null) null else try {
+                when (e.body_base64?.let { CoreJson.parseToJsonElement(Base64.getDecoder().decode(it).decodeToString()) }
+                    ?.jsonObject?.get("method")?.jsonPrimitive?.content) {
+                    "session.write" -> TerminalTimingStage.WriteHttp
+                    "session.tail" -> TerminalTimingStage.TailHttp
+                    else -> null
+                }
+            } catch (_: Exception) { null }
+            val started = System.nanoTime()
+            fun recordTiming() { timingStage?.let { recordTerminalTiming(it, started) } }
             val call = active.newCall(request.build())
             calls[e.effect_id] = call
             call.enqueue(object : Callback {
                 override fun onFailure(call: Call, error: IOException) {
+                    recordTiming()
                     calls.remove(e.effect_id); release(active)
                     httpDone(e, null, emptyList(), null, if (call.isCanceled()) failure(TransportFailureKind.cancelled, TransportFailureCode.cancelled) else transport(error))
                 }
@@ -219,7 +240,7 @@ class EffectExecutor(
                             httpDone(e, it.code, it.headers.map { h -> Header(h.first, h.second) }, Base64.getEncoder().encodeToString(output.toByteArray()), null)
                         }
                     } catch (error: Exception) { httpDone(e, null, emptyList(), null, transport(error)) }
-                    finally { calls.remove(e.effect_id); release(active) }
+                    finally { recordTiming(); calls.remove(e.effect_id); release(active) }
                 }
             })
         } catch (error: Exception) { client?.let(::release); httpDone(e, null, emptyList(), null, transport(error)) }

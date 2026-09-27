@@ -69,3 +69,26 @@ The existing intermittent
 `TranscriptTest.offlineFocusIsRetriedOnceWhenTheHostBecomesReady` timeout is a
 separate unresolved test issue; do not equate its occurrence with a device
 WebSocket failure.
+
+## Terminal latency
+
+The terminal previously retained IME composing text until commit/finish. A
+keyboard can keep a word composing indefinitely, so characters never reached
+the core during that interval. `TerminalInputTest` now checks immediate
+incremental delivery, replacement/deletion by Unicode code point, and no replay
+on commit or finish. This proves removal of that buffering path; it does not
+establish that every reported delay came from the keyboard.
+
+With `VerdeConnection` enabled **before opening the host**, the trace also
+records `terminal_stage` and `elapsed_ms` for input dispatch, VT output apply,
+and HTTP `session.write`/`session.tail` completion (including failures). It
+contains no terminal/session identifiers, commands, response bodies, or URLs.
+HTTP timing spans enqueue through response consumption; it is not a pure
+network RTT. Input dispatch excludes time waiting for the core executor.
+No per-request timing is emitted when the trace is disabled at host creation.
+
+Compare these durations while typing to distinguish keyboard buffering, core
+processing, transport/host latency, and local VT rendering. A short write time
+alone does not prove fast visible echo: the subsequent tail and VT apply also
+have to complete. Do not label the owner's end-to-end latency fixed without a
+fresh device observation.
