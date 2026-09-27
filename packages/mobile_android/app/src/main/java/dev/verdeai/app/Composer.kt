@@ -359,7 +359,7 @@ private fun Attachments(items: List<ChatAttachment>, locked: Boolean, composer: 
     }
 }
 
-private fun label(choices: List<ChatChoice>, id: String?) = choices.find { it.id == (id ?: "") }?.label ?: choices.firstOrNull()?.label
+internal fun composerChoiceLabel(choices: List<ChatChoice>, id: String?) = choices.find { it.id == (id ?: "") }?.label ?: id?.takeIf { it.isNotEmpty() }
 
 @Composable
 private fun SettingsControls(view: ChatComposerView, state: TranscriptState, provider: String?, open: (ComposerPicker) -> Unit) {
@@ -374,15 +374,15 @@ private fun SettingsControls(view: ChatComposerView, state: TranscriptState, pro
         val compact = maxWidth < 480.dp
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp),
             verticalAlignment = Alignment.CenterVertically) {
-            SettingChip("Model", label(c.models, s.model ?: c.models.firstOrNull()?.id) ?: "Model", provider,
+            SettingChip("Model", composerChoiceLabel(c.models, s.model ?: c.models.firstOrNull()?.id) ?: "Model", provider,
                 modifier = Modifier.weight(1f)) { open(ComposerPicker.Model) }
-            if (c.efforts.isNotEmpty()) SettingChip("Effort", label(c.efforts, s.effort) ?: "Default",
+            if (c.efforts.isNotEmpty()) SettingChip("Effort", composerChoiceLabel(c.efforts, s.effort) ?: "Default",
                 modifier = Modifier.widthIn(max = if (compact) 100.dp else 160.dp),
                 icon = R.drawable.composer_reasoning,
                 fill = ((c.efforts.indexOfFirst { it.id == (s.effort ?: "") }.coerceAtLeast(0) + 1).toFloat() / c.efforts.size)) { open(ComposerPicker.Effort) }
-            if (c.speeds.size > 1) SettingChip("Speed", label(c.speeds, s.speed) ?: "Speed", compact = compact,
+            if (c.speeds.size > 1) SettingChip("Speed", composerChoiceLabel(c.speeds, s.speed ?: "off") ?: "Standard", compact = compact,
                 icon = if (s.speed == "on") R.drawable.composer_fast else R.drawable.composer_standard) { open(ComposerPicker.Speed) }
-            if (c.access.isNotEmpty()) SettingChip("Access", label(c.access, s.access) ?: "Access", compact = compact,
+            if (c.access.isNotEmpty()) SettingChip("Access", composerChoiceLabel(c.access, s.access) ?: "Access", compact = compact,
                 icon = if ((s.access ?: c.access.firstOrNull()?.id) == "full_access") R.drawable.composer_unlocked else R.drawable.composer_locked) { open(ComposerPicker.Access) }
         }
     }

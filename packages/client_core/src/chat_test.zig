@@ -574,3 +574,64 @@ test "chat keeps generated title and activity when route is unchanged" {
     try eql("Generated title", p.s(settings, "title"));
     try std.testing.expectEqual(@as(?i64, 1790460000), p.num(p.get(settings, "last_activity_at")));
 }
+
+test "composer replaces legacy cached settings with host settings without losing draft" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    _ = try f.intent("thread_open", .{});
+    _ = try f.storage("{\"version\":1,\"text\":\"unsent draft\",\"selection\":{\"provider\":\"codex\",\"effort\":\"high\",\"speed\":\"on\"}}", false);
+    const view = p.get(try f.query("composer"), "data");
+    try eql("unsent draft", p.s(p.get(view, "draft"), "text"));
+    try expect(p.get(p.get(view, "selection"), "effort") == .null);
+    try eql("off", p.s(p.get(view, "selection"), "speed"));
+}
+
+test "composer follows host changes while preserving draft and frozen send settings" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.open();
+    try f.draft("unsent draft");
+    const revision = p.s(p.get(p.get(try f.query("composer"), "data"), "draft"), "revision");
+    _ = try f.intent("send", .{ .draft_revision = revision });
+    try expect(f.host.state.chat.threads[0].send != null);
+    var tx = try h.Transaction.init(&f.host);
+    defer tx.deinit();
+    const a = tx.allocator();
+    var latest = tx.state.sync.catalog[0];
+    try latest.object.put(a, "reasoning_effort", .{ .string = "low" });
+    try latest.object.put(a, "fast_mode", .{ .string = "on" });
+    try latest.object.put(a, "model_ref", .{ .string = "fixture-new-model" });
+    tx.state.sync.catalog = try a.dupe(V, &.{latest});
+    try chat.pump(&tx);
+    _ = try tx.commit(&f.host, f.a());
+    const frozen = f.host.state.chat.threads[0].send.?.settings;
+    try expect(frozen.reasoning_effort == null);
+    try eql("off", frozen.fast_mode.?);
+    try expect(frozen.model_ref == null);
+    const view = p.get(try f.query("composer"), "data");
+    try eql("unsent draft", p.s(p.get(view, "draft"), "text"));
+    try eql("low", p.s(p.get(view, "selection"), "effort"));
+    try eql("on", p.s(p.get(view, "selection"), "speed"));
+    try eql("fixture-new-model", p.s(p.get(view, "selection"), "model"));
+}
+
+test "composer preserves a restored local choice until host selection changes" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    _ = try f.intent("thread_open", .{});
+    _ = try f.storage("{\"version\":1,\"text\":\"draft\",\"selection\":{\"provider\":\"codex\",\"effort\":\"high\",\"speed\":\"on\"},\"selection_base\":{\"provider\":\"codex\",\"model\":null,\"effort\":null,\"access\":\"full_access\",\"speed\":\"off\"}}", false);
+    var view = p.get(try f.query("composer"), "data");
+    try eql("high", p.s(p.get(view, "selection"), "effort"));
+    try eql("on", p.s(p.get(view, "selection"), "speed"));
+    var tx = try h.Transaction.init(&f.host);
+    defer tx.deinit();
+    var latest = tx.state.sync.catalog[0];
+    try latest.object.put(tx.allocator(), "reasoning_effort", .{ .string = "low" });
+    tx.state.sync.catalog = try tx.allocator().dupe(V, &.{latest});
+    try chat.pump(&tx);
+    _ = try tx.commit(&f.host, f.a());
+    view = p.get(try f.query("composer"), "data");
+    try eql("low", p.s(p.get(view, "selection"), "effort"));
+    try eql("off", p.s(p.get(view, "selection"), "speed"));
+    try eql("draft", p.s(p.get(view, "draft"), "text"));
+}

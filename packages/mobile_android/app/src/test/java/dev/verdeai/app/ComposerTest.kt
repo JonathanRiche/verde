@@ -32,6 +32,14 @@ import java.util.concurrent.CopyOnWriteArrayList
 
 /** Pure composer parsing, mirroring the web client's composer_commands.ts / followups.ts. */
 class ComposerParsingTest {
+    @Test fun settingsLabelsNeverSubstituteTheFirstAvailableOption() {
+        val choices = listOf(ChatChoice(id="high", label="High"))
+        assertNull(composerChoiceLabel(choices, null))
+        assertEquals("max", composerChoiceLabel(choices, "max"))
+        assertEquals("High", composerChoiceLabel(choices, "high"))
+        assertEquals("Default", composerChoiceLabel(listOf(ChatChoice(id="", label="Default")), null))
+    }
+
     @Test fun tokensFollowTheCaretLikeTheWebComposer() {
         assertEquals(ComposerToken(4, 13, "src/m"), fileMentionAtCaret("see @src/main now", 10))
         assertNull(fileMentionAtCaret("mail a@b", 3))

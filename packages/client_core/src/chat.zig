@@ -17,7 +17,7 @@ const A = std.mem.Allocator;
 const Kind = enum { page, legacy, tail, register, upsert, create, append, commit, start, cancel, approve, steer, shell, slash_list, slash_run, model_list, mentions, history };
 const Request = struct { id: u64, thread: usize, kind: Kind, intent: []const u8 = "", cursor: ?[]const u8 = null, reconcile: bool = false, epoch: u64 = 0 };
 const Send = struct { intent: []const u8, revision: u64, text: []const u8, inputs: []const wire.AttachmentInput, settings: store.Thread, turn_id: []const u8, message_id: []const u8, attachments: []const m.Attachment = &.{}, index: usize = 0, offset: usize = 0, chunk: usize = 0, sent_bytes: usize = 0, followup: bool = false };
-const Saved = struct { version: u32 = 1, revision: u64 = 0, text: []const u8 = "", inputs: []const wire.AttachmentInput = &.{}, selection: m.Selection = .{}, followup: ?m.Followup = null, followup_inputs: []const wire.AttachmentInput = &.{}, followup_settings: ?store.Thread = null, route: []const u8 = "" };
+const Saved = struct { version: u32 = 1, revision: u64 = 0, text: []const u8 = "", inputs: []const wire.AttachmentInput = &.{}, selection: m.Selection = .{}, selection_base: ?m.Selection = null, followup: ?m.Followup = null, followup_inputs: []const wire.AttachmentInput = &.{}, followup_settings: ?store.Thread = null, route: []const u8 = "" };
 pub const Thread = struct {
     workspace_id: []const u8,
     id: []const u8,
@@ -152,13 +152,49 @@ fn insert(tx: *h.Transaction, ws: []const u8, id: []const u8, meta: store.Thread
     const i = tx.state.chat.threads.len;
     const next = try tx.allocator().alloc(Thread, i + 1);
     @memcpy(next[0..i], tx.state.chat.threads);
-    next[i] = .{ .workspace_id = ws, .id = id, .metadata = meta, .cwd = meta.cwd orelse path, .saved = .{ .selection = .{ .provider = meta.provider, .model = meta.model_ref, .effort = meta.reasoning_effort orelse meta.reasoning_variant, .access = meta.access_mode, .speed = meta.fast_mode } } };
+    const selection = hostSelection(meta);
+    next[i] = .{ .workspace_id = ws, .id = id, .metadata = meta, .cwd = meta.cwd orelse path, .saved = .{ .selection = selection, .selection_base = selection } };
     tx.state.chat.threads = next;
     const storage_key = try key(tx, &next[i]);
     const effect = try tx.emit("secure_store_get", .{ .key = storage_key });
     try tx.track(.store_get, effect, storage_key);
     next[i].storage_id = effect;
     return i;
+}
+fn hostSelection(meta: store.Thread) m.Selection {
+    return .{ .provider = meta.provider, .model = meta.model_ref, .effort = meta.reasoning_effort orelse meta.reasoning_variant, .access = meta.access_mode, .speed = meta.fast_mode };
+}
+fn sameSelection(left: m.Selection, right: m.Selection) bool {
+    inline for (std.meta.fields(m.Selection)) |field| {
+        const l = @field(left, field.name);
+        const r = @field(right, field.name);
+        if ((l == null) != (r == null)) return false;
+        if (l) |v| if (!eq(v, r.?)) return false;
+    }
+    return true;
+}
+/// Local choices survive unchanged host settings. A newer host choice wins;
+/// legacy drafts have no baseline and must not override authoritative settings.
+fn reconcileSelection(tx: *h.Transaction, i: usize, latest: store.Thread) E!void {
+    const t = &tx.state.chat.threads[i];
+    const selection = hostSelection(latest);
+    if (t.saved.selection_base) |base| if (sameSelection(base, selection)) return;
+    t.saved.selection_base = selection;
+    if (!sameSelection(t.saved.selection, selection)) {
+        if (t.saved.revision == std.math.maxInt(u64)) return error.ResourceLimit;
+        t.saved.revision += 1;
+        const provider_changed = !eq(t.saved.selection.provider orelse "", selection.provider orelse "");
+        t.saved.selection = selection;
+        if (provider_changed) {
+            t.catalog_epoch += 1;
+            t.dynamic_models = .null;
+            t.slash = .null;
+            if (online(tx) and scope(tx, "runtime:read")) try call(tx, i, .model_list, "provider.models.list", .{ .provider = selection.provider orelse latest.provider, .project_path = t.cwd }, false, "");
+        }
+        t.confirmation = null;
+    }
+    tx.changed = true;
+    try persist(tx, i);
 }
 fn persist(tx: *h.Transaction, i: usize) E!void {
     const t = &tx.state.chat.threads[i];
@@ -608,6 +644,7 @@ pub fn complete(tx: *h.Transaction, pending: h.Pending, event: V) E!bool {
                     f.can_retry = !eq(f.delivery, "accepted");
                 }
             }
+            try reconcileSelection(tx, i, t.metadata);
             t.loaded = true;
             if (t.dirty) try persist(tx, i);
         } else {
@@ -1130,6 +1167,10 @@ pub fn pump(tx: *h.Transaction) E!void {
             // change. Do not write the initial "New Chat" metadata back on send.
             t.metadata.title = latest.title;
             t.metadata.last_activity_at = latest.last_activity_at;
+            try reconcileSelection(tx, i, latest);
+            inline for (.{ "provider", "model_ref", "reasoning_effort", "reasoning_variant", "access_mode", "fast_mode" }) |field| {
+                @field(t.metadata, field) = @field(latest, field);
+            }
         }
         if (t.turn == null) for (p.rows(p.get(tx.state.sync.snapshot, "turns"))) |turn| {
             if (!eq(p.s(turn, "workspace_id"), t.workspace_id) or !eq(p.s(turn, "local_thread_id"), t.id) or !activeStatus(p.s(turn, "status")) or p.s(turn, "turn_id").len == 0) continue;
