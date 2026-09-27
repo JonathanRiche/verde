@@ -19,6 +19,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.verdeai.app
         PRODUCT_MODULE_NAME: VerdeApp
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
     info:
       path: Generated/App-Info.plist
       properties:
