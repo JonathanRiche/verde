@@ -75,8 +75,8 @@ private struct TranscriptBody: View {
     let onHosts: () -> Void
 
     var body: some View {
-        let state = model.state
         GeometryReader { geometry in
+            let state = model.state
             VStack(spacing: 0) {
                 TimelineView(.periodic(from: .now, by: 30)) { context in
                     if let banner = transcriptBanner(state, nowMs(context.date)) {
@@ -182,9 +182,11 @@ private struct TranscriptList: View {
     }
 
     var body: some View {
-        let items = model.items
         GeometryReader { outer in
             ScrollViewReader { proxy in
+                // Observe rows inside the deferred content instead of capturing
+                // a snapshot that can stay on the optimistic Sending row.
+                let items = model.items
                 ZStack(alignment: .top) {
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 8) {
