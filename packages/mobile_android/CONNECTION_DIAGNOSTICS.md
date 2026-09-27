@@ -92,3 +92,35 @@ processing, transport/host latency, and local VT rendering. A short write time
 alone does not prove fast visible echo: the subsequent tail and VT apply also
 have to complete. Do not label the owner's end-to-end latency fixed without a
 fresh device observation.
+
+### Terminal processing bottleneck confirmed on the device
+
+The owner's trace showed terminal writes/tails mostly around 15–40 ms while
+input dispatch took 400–600 ms. The terminal was waiting for local core work,
+not a similarly long HTTP round trip. The IME composition fix did not resolve
+this measured backlog.
+
+Two costs were identified:
+
+- Every transaction copied the entire retained state through JSON twice. State
+  now uses direct deep copies into separate arenas; it still commits only after
+  successful output encoding, retains no event/effect arena, and rolls back on
+  allocation failure.
+- Terminal state/receipt changes invalidated every cached chat, workspace,
+  attention and management view. They now invalidate terminal/operation views
+  without rebuilding unrelated projections. Host data and relevant chat/send
+  changes still propagate; focused clocks and leaving a terminal refresh views.
+
+`InputHandle` measures native event handling, while `InputDispatch` also includes
+projection reads and effect delivery. In a controlled typing burst after only
+the first optimization, native handling had a 17 ms median, HTTP writes 21 ms,
+and full dispatch 225 ms. This isolated the remaining projection cost. These
+are processing-stage durations, not direct key-to-screen latency measurements.
+
+After both optimizations, the same 28-key device burst had a 28 ms median full
+input dispatch (20 ms native handling), versus 225 ms after the copy change
+alone. Its first-to-last input-dispatch span fell from 15,773 ms to 1,740 ms.
+HTTP writes remained about 22 ms median; VT apply/resumption was 32 ms median.
+This is a controlled throughput comparison, not a claim of measured display
+latency or SSH-equivalent streaming. Both temporary shells were explicitly
+exited. No daemon or gateway restart was involved.

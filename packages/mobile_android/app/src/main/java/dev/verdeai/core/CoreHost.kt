@@ -190,6 +190,7 @@ class CoreHost private constructor(
             if (e.status == 1 || e.status == 4 || e.status == 5) throw CoreInputRejected(e.status)
             throw e
         }
+        if (event is EventTerminalInput) executor.recordTerminalTiming(TerminalTimingStage.InputHandle, started)
         val batch = CoreJson.decodeFromString<EffectBatch>(bytes.decodeToString())
         check(batch.api_version == 1L) { "unsupported_core_revision" }
         for (effect in batch.effects) {

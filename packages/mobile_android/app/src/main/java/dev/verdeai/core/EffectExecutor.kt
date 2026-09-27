@@ -30,7 +30,7 @@ data class SocketTrace(val socket: Long, val event: SocketTraceEvent, val ageMs:
     val messages: Long, val code: Int? = null, val failure: TransportFailureCode? = null)
 
 
-enum class TerminalTimingStage { WriteHttp, TailHttp, InputDispatch, OutputApply }
+enum class TerminalTimingStage { WriteHttp, TailHttp, InputHandle, InputDispatch, OutputApply }
 data class TerminalTiming(val stage: TerminalTimingStage, val elapsedMs: Long)
 
 /** Owns platform work for one host. Callbacks enqueue events; they never call JNI. */

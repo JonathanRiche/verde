@@ -12,6 +12,7 @@ pub const manage = @import("manage.zig");
 pub const files = @import("files.zig");
 const chat_index = @import("chat_index.zig");
 const profile = @import("verde_remote").profile;
+const state_clone = @import("state_clone.zig");
 const A = std.mem.Allocator;
 const V = std.json.Value;
 pub const MAX_INPUT = 1024 * 1024;
@@ -184,8 +185,7 @@ pub const Transaction = struct {
         var arena = std.heap.ArenaAllocator.init(host.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
-        const bytes = try encode(a, host.state);
-        const state = std.json.parseFromSliceLeaky(State, a, bytes, .{ .allocate = .alloc_always }) catch |err| return mapError(err);
+        const state = try state_clone.clone(State, a, host.state);
         return .{ .arena = arena, .state = state };
     }
     pub fn deinit(self: *Transaction) void {
@@ -509,8 +509,7 @@ pub const Transaction = struct {
         // Retain only state, never the call's decoded secrets or effect payloads.
         var retained = std.heap.ArenaAllocator.init(host.allocator);
         errdefer retained.deinit();
-        const state_bytes = try encode(self.allocator(), self.state);
-        const next = std.json.parseFromSliceLeaky(State, retained.allocator(), state_bytes, .{ .allocate = .alloc_always }) catch |err| return mapError(err);
+        const next = try state_clone.clone(State, retained.allocator(), self.state);
         const output = try encode(output_allocator, .{ .api_version = 1, .revision = try decimal(self.allocator(), self.state.revision), .effects = self.effects.items });
         host.arena.deinit();
         host.arena = retained;
@@ -662,7 +661,40 @@ fn changedScopes(tx: *Transaction, before: *const State) ApiError![]const []cons
     const own: []const []const u8 = if (host_changed and operations_changed)
         &.{ "hosts", "operations" }
     else if (host_changed) &.{"hosts"} else if (operations_changed) &.{"operations"} else &.{};
+    // Terminal receipts/output invalidate terminals and operations, not every
+    // cached transcript and workspace. Querying those on each key overwhelms
+    // the platform's serial core executor even when network RTT is tiny.
+    if (!otherViewsChanged(before, &tx.state, host_changed)) return own;
     return std.mem.concat(a, []const u8, &.{ own, try chat.scopes(tx), &.{ "attention", "manage" } });
+}
+fn otherViewsChanged(before: *const State, after: *const State, host_changed: bool) bool {
+    if (host_changed or before.network_available != after.network_available or before.stale != after.stale) return true;
+    inline for (.{ "config", "sync", "chat", "attention", "manage" }) |name| {
+        if (!state_clone.equal(@TypeOf(@field(before.*, name)), @field(before.*, name), @field(after.*, name))) return true;
+    }
+    // Composer send receipts can settle without changing the saved draft.
+    for (after.receipts) |receipt| {
+        const id = receipt.operation.intent_id;
+        if (!chat.holdsIntent(&after.chat, id)) continue;
+        var previous: ?Operation = null;
+        for (before.receipts) |old| if (eq(old.operation.intent_id, id)) {
+            previous = old.operation;
+            break;
+        };
+        if (previous == null or !same(Operation, previous.?, receipt.operation)) return true;
+    }
+    if (before.wall_time_ms != after.wall_time_ms) {
+        // Offscreen elapsed clocks refresh on focus, rather than making terminal
+        // traffic re-render cached chats. Visible browse/chat views still tick.
+        var attached = false;
+        for (after.terminal.rows) |row| attached = attached or row.view.attached;
+        if (!attached) return true;
+        for (after.chat.threads) |thread| if (thread.focused) return true;
+    }
+    // Leaving a terminal refreshes browse age buckets even if no host data changed.
+    if (before.terminal.rows.len != after.terminal.rows.len) return true;
+    for (before.terminal.rows, after.terminal.rows) |old, new| if (old.view.attached != new.view.attached) return true;
+    return false;
 }
 /// The single `hosts` item, encoded; also the change fingerprint for that selector.
 fn hostItem(a: A, s: *const State) ApiError![]u8 {

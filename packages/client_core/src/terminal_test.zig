@@ -482,3 +482,56 @@ test "terminal input during an in-flight read waits for VT acknowledgement befor
     try expect(tx.state.rpc.calls.len == 1);
     try expect((try findCall(&tx, "session.tail")).id != original.id);
 }
+
+test "terminal traffic invalidates operations and terminal without rebuilding background views" {
+    var host = try h.Host.init(A, config);
+    defer host.deinit();
+    {
+        var tx = try h.Transaction.init(&host);
+        defer tx.deinit();
+        try ready(&tx);
+        try attach(&tx);
+        tx.state.sync.snapshot = try h.parse(tx.allocator(), "{\"snapshot\":{\"workspaces\":[]}}");
+        const encoded = try tx.commit(&host, A);
+        A.free(encoded);
+    }
+    {
+        var tx = try h.Transaction.init(&host);
+        defer tx.deinit();
+        try event(&tx, "terminal_input", .{ .intent_id = "isolated-key", .terminal_id = "k12-fixture", .vt_modes = .{ .application_cursor = false, .bracketed_paste = false }, .input = .{ .kind = "text", .text = "x", .ctrl = false, .alt = false, .shift = false } });
+        tx.state.wall_time_ms += 100;
+        const encoded = try tx.commit(&host, A);
+        defer A.free(encoded);
+        const parsed = try std.json.parseFromSlice(V, A, encoded, .{});
+        defer parsed.deinit();
+        var operations = false;
+        var terminal_scope = false;
+        for (p.rows(p.get(parsed.value, "effects"))) |effect| {
+            if (!h.eq(p.s(effect, "type"), "state_changed")) continue;
+            for (p.rows(p.get(effect, "scopes"))) |scope_value| {
+                const scope_name = scope_value.string;
+                operations = operations or h.eq(scope_name, "operations");
+                terminal_scope = terminal_scope or std.mem.startsWith(u8, scope_name, "terminal:");
+                try expect(!h.eq(scope_name, "home") and !h.eq(scope_name, "workspaces") and !h.eq(scope_name, "attention") and !h.eq(scope_name, "manage"));
+            }
+        }
+        try expect(operations and terminal_scope);
+    }
+    // A host snapshot update must still refresh browse views during terminal use.
+    {
+        var tx = try h.Transaction.init(&host);
+        defer tx.deinit();
+        tx.state.sync.snapshot = try h.parse(tx.allocator(), "{\"snapshot\":{\"workspaces\":[]},\"store_revision\":2}");
+        tx.changed = true;
+        const encoded = try tx.commit(&host, A);
+        defer A.free(encoded);
+        const parsed = try std.json.parseFromSlice(V, A, encoded, .{});
+        defer parsed.deinit();
+        var refreshed = false;
+        for (p.rows(p.get(parsed.value, "effects"))) |effect| {
+            if (!h.eq(p.s(effect, "type"), "state_changed")) continue;
+            for (p.rows(p.get(effect, "scopes"))) |scope_value| refreshed = refreshed or h.eq(scope_value.string, "workspaces");
+        }
+        try expect(refreshed);
+    }
+}
