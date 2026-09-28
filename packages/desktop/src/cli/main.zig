@@ -4863,6 +4863,7 @@ const CHAT_FOLLOWUP_MCP_INPUTS = [_]McpToolInput{
     .{ .name = "prompt", .type_name = "string", .description = "Steering text.", .required = true },
     .{ .name = "image_paths", .type_name = "array", .items_type_name = "string", .description = "Optional local images." },
     .{ .name = "steer_id", .type_name = "string", .description = "Stable retry id; minted when omitted." },
+    .{ .name = "parent_thread_id", .type_name = "string", .description = "Your Verde local thread id, so the child knows which agent is steering it." },
 };
 
 const CHAT_TAIL_MCP_INPUTS = [_]McpToolInput{
@@ -5228,10 +5229,14 @@ fn mcpToolsCall(
         var image_path_storage: [16][]const u8 = undefined;
         const image_paths = mcpArgStringArray(arguments, "image_paths", &image_path_storage) catch
             return try mcpError(allocator, out, id_value, -32602, "queue_chat_followup image_paths must be an array of at most 16 strings");
+        // Steers are persisted verbatim, so mark agent-sent ones inline; the
+        // child must not mistake the parent agent for the human user.
+        const steer_prompt = try mcpParentSteerPromptAlloc(allocator, prompt, mcpArgString(arguments, "parent_thread_id"));
+        defer allocator.free(steer_prompt);
         const response = chatDaemonFollowupEnvelopeAlloc(allocator, io, .{
             .workspace_id = workspace_id,
             .pane_id = followup_pane_id,
-            .prompt = prompt,
+            .prompt = steer_prompt,
             .image_paths = image_paths,
             .steer_id = mcpArgString(arguments, "steer_id"),
         }) catch |err| return try mcpChatDaemonError(allocator, out, id_value, err);
@@ -5754,6 +5759,16 @@ fn mcpToolsCall(
     };
     defer allocator.free(response);
     try mcpToolLiveTextResult(allocator, out, id_value, response, tool_name);
+}
+
+fn mcpParentSteerPromptAlloc(allocator: std.mem.Allocator, prompt: []const u8, parent_thread_id: ?[]const u8) ![]u8 {
+    const fenced = try std.mem.replaceOwned(u8, allocator, prompt, "</verde_parent_message>", "<\\/verde_parent_message>");
+    defer allocator.free(fenced);
+    return std.fmt.allocPrint(
+        allocator,
+        "<verde_parent_message from_thread=\"{s}\">\n{s}\n</verde_parent_message>\n(Steering from the Verde agent orchestrating you, not the human user.)",
+        .{ parent_thread_id orelse "unknown", fenced },
+    );
 }
 
 fn mcpDaemonSessionCallAlloc(
