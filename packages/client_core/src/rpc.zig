@@ -33,6 +33,7 @@ pub const Call = struct {
     response_cap: usize,
     body_base64: []const u8 = "",
     timeout_ms: u32 = 15000,
+    retry_auth: bool = true,
     auth_retried: bool = false,
     awaiting_auth: bool = false,
 };
@@ -51,7 +52,9 @@ pub const Options = struct {
     // Conservative default: callers must explicitly identify safe reads.
     mutation: bool = true,
     intent_id: ?[]const u8 = null,
+    retry_auth: bool = true,
     parked_wait_ms: u32 = 0,
+    timeout_ms: ?u32 = null,
     page_items: ?u32 = null,
     legacy_snapshot: bool = false,
 };
@@ -94,6 +97,8 @@ pub fn request(tx: *host.Transaction, method: []const u8, params: anytype, optio
     if (!status and (s.instance_id == null or (s.phase != .ready and !eq(u8, method, "core.capabilities")))) return error.InvalidLifecycle;
     if (s.calls.len + s.results.len >= host.MAX_PENDING or s.next_id == std.math.maxInt(u64)) return error.ResourceLimit;
     if (method.len == 0 or method.len > 128) return error.InvalidArgument;
+    const timeout_ms = options.timeout_ms orelse (options.parked_wait_ms + 15_000);
+    if (timeout_ms < 1000 or timeout_ms > 180_000) return error.InvalidArgument;
     if (options.parked_wait_ms > s.limits.max_parked_wait_ms) return error.ResourceLimit;
     if (options.page_items) |count| if (count == 0 or count > s.limits.max_page_items) return error.ResourceLimit;
     if (options.legacy_snapshot and !eq(u8, method, "core.snapshot")) return error.InvalidArgument;
@@ -120,12 +125,12 @@ pub fn request(tx: *host.Transaction, method: []const u8, params: anytype, optio
         .url = try std.fmt.allocPrint(a, "{s}/api/rpc", .{std.mem.trimEnd(u8, origin, "/")}),
         .headers = .{ .{ .name = "Authorization", .value = try std.fmt.allocPrint(a, "Bearer {s}", .{s.bearer.?}) }, .{ .name = "Content-Type", .value = "application/json" } },
         .body_base64 = try encodeBase64(a, bytes),
-        .timeout_ms = options.parked_wait_ms + 15_000,
+        .timeout_ms = timeout_ms,
         .max_response_bytes = cap,
         .tls = .{ .origin = origin, .spki_sha256 = s.spki_sha256.? },
     });
     try tx.track(.http, effect_id, "rpc");
-    try append(Call, a, &s.calls, .{ .effect_id = effect_id, .id = id, .method = try a.dupe(u8, method), .mutation = options.mutation, .intent_id = if (options.intent_id) |intent| try a.dupe(u8, intent) else null, .response_cap = cap, .body_base64 = try encodeBase64(a, bytes), .timeout_ms = options.parked_wait_ms + 15_000 });
+    try append(Call, a, &s.calls, .{ .effect_id = effect_id, .id = id, .method = try a.dupe(u8, method), .mutation = options.mutation, .intent_id = if (options.intent_id) |intent| try a.dupe(u8, intent) else null, .response_cap = cap, .body_base64 = try encodeBase64(a, bytes), .timeout_ms = timeout_ms, .retry_auth = options.retry_auth });
     s.next_id += 1;
     return id;
 }

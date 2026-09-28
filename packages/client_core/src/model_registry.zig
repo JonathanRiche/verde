@@ -8,6 +8,7 @@ const pump = @import("terminal_pump.zig");
 const push = @import("push.zig");
 const attention = @import("attention.zig");
 const manage = @import("manage.zig");
+const git = @import("git_changes.zig");
 const files = @import("files.zig");
 pub const types = .{
     .{ "TerminalConfig", terminal.Config },
@@ -96,4 +97,34 @@ pub const types = .{
     .{ "ManageNewChat", manage.NewChat },
     .{ "ManageView", manage.View },
     .{ "ManageQuery", wire.Query(manage.View) },
+    .{ "GitSummaryRequest", git.m.SummaryRequest },
+    .{ "GitThreadSummary", git.m.ThreadSummary },
+    .{ "GitSummaryResult", git.m.SummaryResult },
+    .{ "GitReviewRequest", git.m.ReviewRequest },
+    .{ "GitOtherThread", git.m.OtherThread },
+    .{ "GitReviewHunk", git.m.ReviewHunk },
+    .{ "GitReviewFile", git.m.ReviewFile },
+    .{ "GitReviewRepo", git.m.ReviewRepo },
+    .{ "GitReviewResult", git.m.ReviewResult },
+    .{ "GitFileSelection", git.m.FileSelection },
+    .{ "GitRepoSelection", git.m.RepoSelection },
+    .{ "GitCommitMessageRequest", git.m.CommitMessageRequest },
+    .{ "GitCommitMessageResult", git.m.CommitMessageResult },
+    .{ "GitCommitRequest", git.m.CommitRequest },
+    .{ "GitRepoCommit", git.m.RepoCommit },
+    .{ "GitCommitResult", git.m.CommitResult },
+    .{ "GitPullPushRequest", git.m.PullPushRequest },
+    .{ "GitPullPushResult", git.m.PullPushResult },
+    .{ "GitConfigCommitSetRequest", git.m.ConfigCommitSetRequest },
+    .{ "GitConfigCommitSnapshot", git.m.ConfigCommitSnapshot },
+    .{ "GitStatusRequest", git.m.StatusRequest },
+    .{ "GitStatusResult", git.m.StatusResult },
+    .{ "GitRepoStatus", git.m.RepoStatus },
+    .{ "GitPushRequest", git.m.PushRequest },
+    .{ "GitStatusView", git.StatusView },
+    .{ "GitStatusQuery", wire.Query(git.StatusView) },
+    .{ "GitSummary", git.Summary },
+    .{ "GitReviewView", git.ReviewView },
+    .{ "GitSummaryQuery", wire.Query(git.Summary) },
+    .{ "GitReviewQuery", wire.Query(git.ReviewView) },
 };

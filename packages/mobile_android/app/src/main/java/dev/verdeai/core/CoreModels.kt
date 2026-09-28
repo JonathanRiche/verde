@@ -1033,6 +1033,107 @@ data class EventDirectoryList(
 ) : Event()
 
 @Serializable
+@SerialName("git_status_refresh")
+data class EventGitStatusRefresh(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `workspace_id`: String,
+    val `thread_id`: String,
+) : Event()
+
+@Serializable
+@SerialName("git_push")
+data class EventGitPush(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `workspace_id`: String,
+    val `root`: String,
+) : Event()
+
+@Serializable
+@SerialName("git_retry")
+data class EventGitRetry(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+) : Event()
+
+@Serializable
+@SerialName("git_summary_refresh")
+data class EventGitSummaryRefresh(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `workspace_id`: String,
+) : Event()
+
+@Serializable
+@SerialName("git_review_open")
+data class EventGitReviewOpen(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `workspace_id`: String,
+    val `thread_id`: String,
+) : Event()
+
+@Serializable
+@SerialName("git_message_generate")
+data class EventGitMessageGenerate(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `review_id`: String,
+    val `selections`: List<GitRepoSelection>? = null,
+) : Event()
+
+@Serializable
+@SerialName("git_commit")
+data class EventGitCommit(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `review_id`: String,
+    val `message`: String,
+    val `selections`: List<GitRepoSelection>,
+    val `push`: Boolean = false,
+    val `new_branch`: Boolean = false,
+    val `branch_name`: String? = null,
+) : Event()
+
+@Serializable
+@SerialName("git_pull_push")
+data class EventGitPullPush(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `workspace_id`: String,
+    val `root`: String,
+) : Event()
+
+@Serializable
+@SerialName("git_config_set")
+data class EventGitConfigSet(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `commit_message_provider`: String? = null,
+    val `commit_message_model`: String? = null,
+    val `commit_default_action`: String? = null,
+) : Event()
+
+@Serializable
 @SerialName("file_open")
 data class EventFileOpen(
     val `api_version`: Long = 1,
@@ -1658,5 +1759,273 @@ data class ManageQuery(
     val `api_version`: Long,
     val `revision`: String,
     val `data`: ManageView?,
+    val `error`: LocalError?,
+)
+
+@Serializable
+data class GitSummaryRequest(
+    val `workspace_id`: String,
+)
+
+@Serializable
+data class GitThreadSummary(
+    val `local_thread_id`: String,
+    val `files`: Long,
+    val `additions`: Long,
+    val `deletions`: Long,
+    val `attention`: Long,
+)
+
+@Serializable
+data class GitSummaryResult(
+    val `workspace_id`: String,
+    val `revision`: ULong,
+    val `threads`: List<GitThreadSummary> = emptyList(),
+)
+
+@Serializable
+data class GitReviewRequest(
+    val `workspace_id`: String,
+    val `local_thread_id`: String,
+    val `repository_id`: String? = null,
+    val `relative_cwd`: String? = null,
+    val `project_path`: String? = null,
+    val `cwd`: String? = null,
+    val `include_unassigned`: Boolean = true,
+    val `hunk_budget_bytes`: ULong? = null,
+)
+
+@Serializable
+data class GitOtherThread(
+    val `local_thread_id`: String,
+    val `title`: String,
+)
+
+@Serializable
+data class GitReviewHunk(
+    val `index`: Long,
+    val `header`: String,
+    val `text`: String,
+)
+
+@Serializable
+data class GitReviewFile(
+    val `path`: String,
+    val `status`: String,
+    val `ownership`: String,
+    val `other_threads`: List<GitOtherThread> = emptyList(),
+    val `additions`: Long,
+    val `deletions`: Long,
+    val `binary`: Boolean,
+    val `hunk_selectable`: Boolean,
+    val `preview_truncated`: Boolean,
+    val `hunks`: List<GitReviewHunk> = emptyList(),
+)
+
+@Serializable
+data class GitReviewRepo(
+    val `root`: String,
+    val `name`: String,
+    val `branch`: String? = null,
+    val `head`: String? = null,
+    val `default_branch`: String? = null,
+    val `is_default_branch`: Boolean = false,
+    val `upstream`: String? = null,
+    val `ahead`: Long = 0,
+    val `behind`: Long = 0,
+    val `has_remote`: Boolean = false,
+    val `files`: List<GitReviewFile> = emptyList(),
+)
+
+@Serializable
+data class GitReviewResult(
+    val `review_id`: String,
+    val `workspace_id`: String,
+    val `local_thread_id`: String,
+    val `turn_running`: Boolean,
+    val `default_action`: String,
+    val `repos`: List<GitReviewRepo> = emptyList(),
+)
+
+@Serializable
+data class GitFileSelection(
+    val `path`: String,
+    val `hunks`: List<Long>? = null,
+)
+
+@Serializable
+data class GitRepoSelection(
+    val `root`: String,
+    val `files`: List<GitFileSelection>,
+)
+
+@Serializable
+data class GitCommitMessageRequest(
+    val `review_id`: String,
+    val `selections`: List<GitRepoSelection>? = null,
+)
+
+@Serializable
+data class GitCommitMessageResult(
+    val `message`: String,
+    val `branch`: String? = null,
+    val `provider`: String,
+    val `model`: String,
+)
+
+@Serializable
+data class GitCommitRequest(
+    val `review_id`: String,
+    val `message`: String,
+    val `selections`: List<GitRepoSelection>,
+    val `push`: Boolean = false,
+    val `new_branch`: Boolean = false,
+    val `branch_name`: String? = null,
+)
+
+@Serializable
+data class GitRepoCommit(
+    val `root`: String,
+    val `commit`: String,
+    val `short_commit`: String,
+    val `subject`: String,
+    val `files`: Long,
+    val `branch`: String? = null,
+    val `branch_created`: Boolean = false,
+    val `push`: String,
+    val `push_message`: String? = null,
+    val `index_reset`: Boolean = false,
+)
+
+@Serializable
+data class GitCommitResult(
+    val `workspace_id`: String,
+    val `local_thread_id`: String,
+    val `files`: Long,
+    val `repos`: List<GitRepoCommit> = emptyList(),
+    val `transcript_message_id`: String? = null,
+)
+
+@Serializable
+data class GitPullPushRequest(
+    val `workspace_id`: String,
+    val `root`: String,
+)
+
+@Serializable
+data class GitPullPushResult(
+    val `root`: String,
+    val `push`: String,
+    val `push_message`: String? = null,
+)
+
+@Serializable
+data class GitConfigCommitSetRequest(
+    val `commit_message_provider`: String? = null,
+    val `commit_message_model`: String? = null,
+    val `commit_default_action`: String? = null,
+)
+
+@Serializable
+data class GitConfigCommitSnapshot(
+    val `commit_message_provider`: String = "auto",
+    val `commit_message_model`: String? = null,
+    val `commit_default_action`: String = "commit",
+)
+
+@Serializable
+data class GitStatusRequest(
+    val `workspace_id`: String,
+    val `local_thread_id`: String,
+    val `repository_id`: String? = null,
+    val `relative_cwd`: String? = null,
+    val `project_path`: String? = null,
+    val `cwd`: String? = null,
+)
+
+@Serializable
+data class GitStatusResult(
+    val `workspace_id`: String,
+    val `local_thread_id`: String,
+    val `repos`: List<GitRepoStatus> = emptyList(),
+)
+
+@Serializable
+data class GitRepoStatus(
+    val `root`: String,
+    val `name`: String,
+    val `branch`: String? = null,
+    val `default_branch`: String? = null,
+    val `is_default_branch`: Boolean = false,
+    val `upstream`: String? = null,
+    val `ahead`: Long = 0,
+    val `behind`: Long = 0,
+    val `has_remote`: Boolean = false,
+)
+
+@Serializable
+data class GitPushRequest(
+    val `workspace_id`: String,
+    val `root`: String,
+    val `request_id`: String? = null,
+)
+
+@Serializable
+data class GitStatusView(
+    val `loading`: Boolean = false,
+    val `supported`: Boolean = true,
+    val `can_commit`: Boolean = false,
+    val `status`: GitStatusResult? = null,
+    val `error`: LocalError? = null,
+)
+
+@Serializable
+data class GitStatusQuery(
+    val `api_version`: Long,
+    val `revision`: String,
+    val `data`: GitStatusView?,
+    val `error`: LocalError?,
+)
+
+@Serializable
+data class GitSummary(
+    val `workspace_id`: String,
+    val `threads`: List<GitThreadSummary> = emptyList(),
+    val `loading`: Boolean = false,
+    val `supported`: Boolean = true,
+    val `error`: LocalError? = null,
+)
+
+@Serializable
+data class GitReviewView(
+    val `state`: String = "idle",
+    val `loading`: Boolean = false,
+    val `supported`: Boolean = true,
+    val `can_commit`: Boolean = false,
+    val `can_configure`: Boolean = false,
+    val `can_retry`: Boolean = false,
+    val `review`: GitReviewResult? = null,
+    val `message_state`: String = "idle",
+    val `message`: GitCommitMessageResult? = null,
+    val `mutation_state`: String = "idle",
+    val `result`: GitCommitResult? = null,
+    val `pull_push_result`: GitPullPushResult? = null,
+    val `config`: GitConfigCommitSnapshot? = null,
+    val `error`: LocalError? = null,
+)
+
+@Serializable
+data class GitSummaryQuery(
+    val `api_version`: Long,
+    val `revision`: String,
+    val `data`: GitSummary?,
+    val `error`: LocalError?,
+)
+
+@Serializable
+data class GitReviewQuery(
+    val `api_version`: Long,
+    val `revision`: String,
+    val `data`: GitReviewView?,
     val `error`: LocalError?,
 )

@@ -9,6 +9,7 @@ pub fn intercept(tx: *h.Transaction, effect_id: []const u8, event: std.json.Valu
     if (status != .integer or status.integer != 401) return false;
     for (@constCast(tx.state.rpc.calls)) |*call| {
         if (!h.eq(call.effect_id, effect_id)) continue;
+        if (!call.retry_auth) return false;
         if (call.auth_retried) {
             // Complete this proven rejection before invalidating other work.
             try h.rpc.complete(tx, effect_id, event);

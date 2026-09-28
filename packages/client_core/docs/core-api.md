@@ -579,3 +579,77 @@ replay after uncertain delivery. No blocking product decision is required.
 A-05 exchange nonce and A-11 delta protocol remain their owning tasks' wire
 additions, not invented existing RPCs. Future terminal protocols beyond the
 two specified mode flags require an additive extension and matching fixtures.
+
+## Per-chat Git changes (mobile)
+
+Selectors: `git_summary:<workspace_id>` → `GitSummary`, `git_status` →
+`GitStatusView` (active chat branch facts), `git_review` → `GitReviewView`.
+Summaries include thread/file/addition/deletion/attention counts. Cached counts
+stay visible while refreshing. Reviews include frozen files/hunks, generated
+message/branch, operation results and scope flags. Only one mutation/review is
+active per host; opening a different review cannot replace an unresolved write.
+
+Intents (standard timestamps and unique `intent_id` apply):
+
+- `git_summary_refresh(workspace_id)` subscribes a workspace summary.
+- `git_status_refresh(workspace_id, thread_id)` reads active-chat branch facts.
+- `git_review_open(workspace_id, thread_id)` freezes changes for review.
+- `git_message_generate(review_id, selections?)` generates/regenerates a message.
+- `git_commit(review_id, message, selections, push=false, new_branch=false,
+  branch_name?)` commits the selection; new branch uses the generated branch
+  suggestion or the daemon's message-derived fallback.
+- `git_push(workspace_id, root)` pushes a repository whose current status has
+  `ahead > 0 && has_remote`; the core creates and retains `request_id`.
+- `git_pull_push(workspace_id, root)` is available after a rejected push.
+- `git_retry()` explicitly checks an unresolved commit/push after automatic
+  recovery attempts stop. UI availability is `GitReviewView.can_retry`.
+- `git_config_set(commit_message_provider?, commit_message_model?,
+  commit_default_action?)` fails `scope_denied`; settings remain owner-only.
+
+`repository:read` gates reads/generation. `can_commit` requires **chat:write AND
+repository:read** (Chat and Full presets); Monitor is read-only.
+`can_configure` is always false. Configuration is read from `config.chat`.
+Routes come from the synced catalog; remote-runtime chats are unsupported.
+Selections are `[{root, files:[{path, hunks?}]}]`. Omitted hunks select whole files.
+Paths and hunk indices must exist in the frozen review. Binary, truncated and
+non-selectable files allow whole-file selection only. UI defaults must exclude
+unassigned edits; shared/unclear/unassigned files require the full review sheet.
+
+Subscribed summaries and active status refresh on focus/foreground, accepted
+`chat.turn` journal entries and successful writes. Reads coalesce; there is no
+refresh polling loop. Status reads do not fetch from remotes. Branch facts also
+arrive with reviews, including default-branch detection for confirmation.
+
+RPC deadlines remain 15 seconds for normal reads, 30 seconds for local commits,
+and 120 seconds for model generation or commit/push/pull-push network operations.
+Provider startup and remote Git operations can legitimately exceed 15 seconds.
+`rpc.Options.timeout_ms` is bounded to 1–180 seconds. Review hunk text is capped
+at **min(128 KiB, max_response_bytes / 16)**, leaving room for JSON escaping and
+file metadata. Transport response caps are unchanged; oversized responses fail
+visibly rather than silently truncating whole-file lists.
+
+A commit retains its exact review ID, message, selections, push and branch
+options. Ambiguous responses or `in_progress` retry **that identical action**,
+never a newly generated review, at a two-second interval, at most three times.
+Further recovery requires `git_retry`. Commit recovery stops one hour after
+review request start; push recovery stops ten minutes after its first request.
+Both use monotonic event time. Auth 401s are not automatically replayed. Definitive
+errors settle the receipt. `review_expired` and `changed_since_review` re-review;
+`head_moved`, identity and branch-creation errors require explicit user action.
+Pull & push is not idempotent and never retries automatically. No new user action
+is started automatically. Recovery state is in-memory only; after process death,
+users must refresh/check the repository before starting another action.
+
+The daemon's git transcript notice is an ordinary system row with author `git`;
+unknown added fields/row kinds remain tolerated. Native UI renders the notice
+quietly rather than as a conversation bubble.
+
+### Staged daemon protocol verification
+
+The owner-authorized Git protocol is currently uncommitted in the daemon owner's
+checkout. Until its allowlist lands, the audit uses a narrow fixture for these
+seven exact RPC names/scopes. Once `git.changes.summary` is mapped, all seven must
+match the real scope table; missing/different mappings fail. This does **not**
+claim deployed-daemon compatibility. Git workflows use offline response fixtures;
+the existing loopback contract suite remains unchanged. Real-device Git checks
+must wait for the owner's daemon relaunch and use a scratch workspace only.

@@ -1494,6 +1494,15 @@ enum Event: Codable {
     case `workspace_archive`(EventWorkspaceArchive)
     case `workspace_close`(EventWorkspaceClose)
     case `directory_list`(EventDirectoryList)
+    case `git_status_refresh`(EventGitStatusRefresh)
+    case `git_push`(EventGitPush)
+    case `git_retry`(EventGitRetry)
+    case `git_summary_refresh`(EventGitSummaryRefresh)
+    case `git_review_open`(EventGitReviewOpen)
+    case `git_message_generate`(EventGitMessageGenerate)
+    case `git_commit`(EventGitCommit)
+    case `git_pull_push`(EventGitPullPush)
+    case `git_config_set`(EventGitConfigSet)
     case `file_open`(EventFileOpen)
     case `push_received`(EventPushReceived)
     case `terminal_input`(EventTerminalInput)
@@ -1556,6 +1565,15 @@ enum Event: Codable {
         case "workspace_archive": self = .`workspace_archive`(try EventWorkspaceArchive(from: decoder))
         case "workspace_close": self = .`workspace_close`(try EventWorkspaceClose(from: decoder))
         case "directory_list": self = .`directory_list`(try EventDirectoryList(from: decoder))
+        case "git_status_refresh": self = .`git_status_refresh`(try EventGitStatusRefresh(from: decoder))
+        case "git_push": self = .`git_push`(try EventGitPush(from: decoder))
+        case "git_retry": self = .`git_retry`(try EventGitRetry(from: decoder))
+        case "git_summary_refresh": self = .`git_summary_refresh`(try EventGitSummaryRefresh(from: decoder))
+        case "git_review_open": self = .`git_review_open`(try EventGitReviewOpen(from: decoder))
+        case "git_message_generate": self = .`git_message_generate`(try EventGitMessageGenerate(from: decoder))
+        case "git_commit": self = .`git_commit`(try EventGitCommit(from: decoder))
+        case "git_pull_push": self = .`git_pull_push`(try EventGitPullPush(from: decoder))
+        case "git_config_set": self = .`git_config_set`(try EventGitConfigSet(from: decoder))
         case "file_open": self = .`file_open`(try EventFileOpen(from: decoder))
         case "push_received": self = .`push_received`(try EventPushReceived(from: decoder))
         case "terminal_input": self = .`terminal_input`(try EventTerminalInput(from: decoder))
@@ -1619,6 +1637,15 @@ enum Event: Codable {
         case .`workspace_archive`(let value): try value.encode(to: encoder)
         case .`workspace_close`(let value): try value.encode(to: encoder)
         case .`directory_list`(let value): try value.encode(to: encoder)
+        case .`git_status_refresh`(let value): try value.encode(to: encoder)
+        case .`git_push`(let value): try value.encode(to: encoder)
+        case .`git_retry`(let value): try value.encode(to: encoder)
+        case .`git_summary_refresh`(let value): try value.encode(to: encoder)
+        case .`git_review_open`(let value): try value.encode(to: encoder)
+        case .`git_message_generate`(let value): try value.encode(to: encoder)
+        case .`git_commit`(let value): try value.encode(to: encoder)
+        case .`git_pull_push`(let value): try value.encode(to: encoder)
+        case .`git_config_set`(let value): try value.encode(to: encoder)
         case .`file_open`(let value): try value.encode(to: encoder)
         case .`push_received`(let value): try value.encode(to: encoder)
         case .`terminal_input`(let value): try value.encode(to: encoder)
@@ -4074,6 +4101,406 @@ extension EventDirectoryList {
     }
 }
 
+struct EventGitStatusRefresh: Codable {
+    var `api_version`: UInt32 = 1
+    var `now_ms`: Int64
+    var `wall_time_ms`: Int64
+    var `intent_id`: String
+    var `workspace_id`: String
+    var `thread_id`: String
+}
+
+extension EventGitStatusRefresh {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `now_ms`
+        case `wall_time_ms`
+        case `intent_id`
+        case `workspace_id`
+        case `thread_id`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`now_ms` = try c.decode(Int64.self, forKey: .`now_ms`)
+        self.`wall_time_ms` = try c.decode(Int64.self, forKey: .`wall_time_ms`)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        self.`thread_id` = try c.decode(String.self, forKey: .`thread_id`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`now_ms`, forKey: .`now_ms`)
+        try c.encode(self.`wall_time_ms`, forKey: .`wall_time_ms`)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`thread_id`, forKey: .`thread_id`)
+        var tag = encoder.container(keyedBy: ModelDiscriminator.self)
+        try tag.encode("git_status_refresh", forKey: .type)
+    }
+}
+
+struct EventGitPush: Codable {
+    var `api_version`: UInt32 = 1
+    var `now_ms`: Int64
+    var `wall_time_ms`: Int64
+    var `intent_id`: String
+    var `workspace_id`: String
+    var `root`: String
+}
+
+extension EventGitPush {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `now_ms`
+        case `wall_time_ms`
+        case `intent_id`
+        case `workspace_id`
+        case `root`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`now_ms` = try c.decode(Int64.self, forKey: .`now_ms`)
+        self.`wall_time_ms` = try c.decode(Int64.self, forKey: .`wall_time_ms`)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        self.`root` = try c.decode(String.self, forKey: .`root`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`now_ms`, forKey: .`now_ms`)
+        try c.encode(self.`wall_time_ms`, forKey: .`wall_time_ms`)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`root`, forKey: .`root`)
+        var tag = encoder.container(keyedBy: ModelDiscriminator.self)
+        try tag.encode("git_push", forKey: .type)
+    }
+}
+
+struct EventGitRetry: Codable {
+    var `api_version`: UInt32 = 1
+    var `now_ms`: Int64
+    var `wall_time_ms`: Int64
+    var `intent_id`: String
+}
+
+extension EventGitRetry {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `now_ms`
+        case `wall_time_ms`
+        case `intent_id`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`now_ms` = try c.decode(Int64.self, forKey: .`now_ms`)
+        self.`wall_time_ms` = try c.decode(Int64.self, forKey: .`wall_time_ms`)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`now_ms`, forKey: .`now_ms`)
+        try c.encode(self.`wall_time_ms`, forKey: .`wall_time_ms`)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        var tag = encoder.container(keyedBy: ModelDiscriminator.self)
+        try tag.encode("git_retry", forKey: .type)
+    }
+}
+
+struct EventGitSummaryRefresh: Codable {
+    var `api_version`: UInt32 = 1
+    var `now_ms`: Int64
+    var `wall_time_ms`: Int64
+    var `intent_id`: String
+    var `workspace_id`: String
+}
+
+extension EventGitSummaryRefresh {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `now_ms`
+        case `wall_time_ms`
+        case `intent_id`
+        case `workspace_id`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`now_ms` = try c.decode(Int64.self, forKey: .`now_ms`)
+        self.`wall_time_ms` = try c.decode(Int64.self, forKey: .`wall_time_ms`)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`now_ms`, forKey: .`now_ms`)
+        try c.encode(self.`wall_time_ms`, forKey: .`wall_time_ms`)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        var tag = encoder.container(keyedBy: ModelDiscriminator.self)
+        try tag.encode("git_summary_refresh", forKey: .type)
+    }
+}
+
+struct EventGitReviewOpen: Codable {
+    var `api_version`: UInt32 = 1
+    var `now_ms`: Int64
+    var `wall_time_ms`: Int64
+    var `intent_id`: String
+    var `workspace_id`: String
+    var `thread_id`: String
+}
+
+extension EventGitReviewOpen {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `now_ms`
+        case `wall_time_ms`
+        case `intent_id`
+        case `workspace_id`
+        case `thread_id`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`now_ms` = try c.decode(Int64.self, forKey: .`now_ms`)
+        self.`wall_time_ms` = try c.decode(Int64.self, forKey: .`wall_time_ms`)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        self.`thread_id` = try c.decode(String.self, forKey: .`thread_id`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`now_ms`, forKey: .`now_ms`)
+        try c.encode(self.`wall_time_ms`, forKey: .`wall_time_ms`)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`thread_id`, forKey: .`thread_id`)
+        var tag = encoder.container(keyedBy: ModelDiscriminator.self)
+        try tag.encode("git_review_open", forKey: .type)
+    }
+}
+
+struct EventGitMessageGenerate: Codable {
+    var `api_version`: UInt32 = 1
+    var `now_ms`: Int64
+    var `wall_time_ms`: Int64
+    var `intent_id`: String
+    var `review_id`: String
+    var `selections`: [GitRepoSelection]? = nil
+}
+
+extension EventGitMessageGenerate {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `now_ms`
+        case `wall_time_ms`
+        case `intent_id`
+        case `review_id`
+        case `selections`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`now_ms` = try c.decode(Int64.self, forKey: .`now_ms`)
+        self.`wall_time_ms` = try c.decode(Int64.self, forKey: .`wall_time_ms`)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+        self.`review_id` = try c.decode(String.self, forKey: .`review_id`)
+        if !c.contains(.`selections`) { self.`selections` = nil } else {
+        self.`selections` = try c.decodeIfPresent([GitRepoSelection].self, forKey: .`selections`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`now_ms`, forKey: .`now_ms`)
+        try c.encode(self.`wall_time_ms`, forKey: .`wall_time_ms`)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        try c.encode(self.`review_id`, forKey: .`review_id`)
+        try c.encode(self.`selections`, forKey: .`selections`)
+        var tag = encoder.container(keyedBy: ModelDiscriminator.self)
+        try tag.encode("git_message_generate", forKey: .type)
+    }
+}
+
+struct EventGitCommit: Codable {
+    var `api_version`: UInt32 = 1
+    var `now_ms`: Int64
+    var `wall_time_ms`: Int64
+    var `intent_id`: String
+    var `review_id`: String
+    var `message`: String
+    var `selections`: [GitRepoSelection]
+    var `push`: Bool = false
+    var `new_branch`: Bool = false
+    var `branch_name`: String? = nil
+}
+
+extension EventGitCommit {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `now_ms`
+        case `wall_time_ms`
+        case `intent_id`
+        case `review_id`
+        case `message`
+        case `selections`
+        case `push`
+        case `new_branch`
+        case `branch_name`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`now_ms` = try c.decode(Int64.self, forKey: .`now_ms`)
+        self.`wall_time_ms` = try c.decode(Int64.self, forKey: .`wall_time_ms`)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+        self.`review_id` = try c.decode(String.self, forKey: .`review_id`)
+        self.`message` = try c.decode(String.self, forKey: .`message`)
+        self.`selections` = try c.decode([GitRepoSelection].self, forKey: .`selections`)
+        if !c.contains(.`push`) { self.`push` = false } else {
+        self.`push` = try c.decode(Bool.self, forKey: .`push`)
+        }
+        if !c.contains(.`new_branch`) { self.`new_branch` = false } else {
+        self.`new_branch` = try c.decode(Bool.self, forKey: .`new_branch`)
+        }
+        if !c.contains(.`branch_name`) { self.`branch_name` = nil } else {
+        self.`branch_name` = try c.decodeIfPresent(String.self, forKey: .`branch_name`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`now_ms`, forKey: .`now_ms`)
+        try c.encode(self.`wall_time_ms`, forKey: .`wall_time_ms`)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        try c.encode(self.`review_id`, forKey: .`review_id`)
+        try c.encode(self.`message`, forKey: .`message`)
+        try c.encode(self.`selections`, forKey: .`selections`)
+        try c.encode(self.`push`, forKey: .`push`)
+        try c.encode(self.`new_branch`, forKey: .`new_branch`)
+        try c.encode(self.`branch_name`, forKey: .`branch_name`)
+        var tag = encoder.container(keyedBy: ModelDiscriminator.self)
+        try tag.encode("git_commit", forKey: .type)
+    }
+}
+
+struct EventGitPullPush: Codable {
+    var `api_version`: UInt32 = 1
+    var `now_ms`: Int64
+    var `wall_time_ms`: Int64
+    var `intent_id`: String
+    var `workspace_id`: String
+    var `root`: String
+}
+
+extension EventGitPullPush {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `now_ms`
+        case `wall_time_ms`
+        case `intent_id`
+        case `workspace_id`
+        case `root`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`now_ms` = try c.decode(Int64.self, forKey: .`now_ms`)
+        self.`wall_time_ms` = try c.decode(Int64.self, forKey: .`wall_time_ms`)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        self.`root` = try c.decode(String.self, forKey: .`root`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`now_ms`, forKey: .`now_ms`)
+        try c.encode(self.`wall_time_ms`, forKey: .`wall_time_ms`)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`root`, forKey: .`root`)
+        var tag = encoder.container(keyedBy: ModelDiscriminator.self)
+        try tag.encode("git_pull_push", forKey: .type)
+    }
+}
+
+struct EventGitConfigSet: Codable {
+    var `api_version`: UInt32 = 1
+    var `now_ms`: Int64
+    var `wall_time_ms`: Int64
+    var `intent_id`: String
+    var `commit_message_provider`: String? = nil
+    var `commit_message_model`: String? = nil
+    var `commit_default_action`: String? = nil
+}
+
+extension EventGitConfigSet {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `now_ms`
+        case `wall_time_ms`
+        case `intent_id`
+        case `commit_message_provider`
+        case `commit_message_model`
+        case `commit_default_action`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`now_ms` = try c.decode(Int64.self, forKey: .`now_ms`)
+        self.`wall_time_ms` = try c.decode(Int64.self, forKey: .`wall_time_ms`)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+        if !c.contains(.`commit_message_provider`) { self.`commit_message_provider` = nil } else {
+        self.`commit_message_provider` = try c.decodeIfPresent(String.self, forKey: .`commit_message_provider`)
+        }
+        if !c.contains(.`commit_message_model`) { self.`commit_message_model` = nil } else {
+        self.`commit_message_model` = try c.decodeIfPresent(String.self, forKey: .`commit_message_model`)
+        }
+        if !c.contains(.`commit_default_action`) { self.`commit_default_action` = nil } else {
+        self.`commit_default_action` = try c.decodeIfPresent(String.self, forKey: .`commit_default_action`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`now_ms`, forKey: .`now_ms`)
+        try c.encode(self.`wall_time_ms`, forKey: .`wall_time_ms`)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        try c.encode(self.`commit_message_provider`, forKey: .`commit_message_provider`)
+        try c.encode(self.`commit_message_model`, forKey: .`commit_message_model`)
+        try c.encode(self.`commit_default_action`, forKey: .`commit_default_action`)
+        var tag = encoder.container(keyedBy: ModelDiscriminator.self)
+        try tag.encode("git_config_set", forKey: .type)
+    }
+}
+
 struct EventFileOpen: Codable {
     var `api_version`: UInt32 = 1
     var `now_ms`: Int64
@@ -6454,6 +6881,1166 @@ extension ManageQuery {
         self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
         self.`revision` = try c.decode(String.self, forKey: .`revision`)
         self.`data` = try c.decodeIfPresent(ManageView.self, forKey: .`data`)
+        self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`revision`, forKey: .`revision`)
+        try c.encode(self.`data`, forKey: .`data`)
+        try c.encode(self.`error`, forKey: .`error`)
+    }
+}
+
+struct GitSummaryRequest: Codable {
+    var `workspace_id`: String
+}
+
+extension GitSummaryRequest {
+    private enum CodingKeys: String, CodingKey {
+        case `workspace_id`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+    }
+}
+
+struct GitThreadSummary: Codable {
+    var `local_thread_id`: String
+    var `files`: UInt32
+    var `additions`: UInt32
+    var `deletions`: UInt32
+    var `attention`: UInt32
+}
+
+extension GitThreadSummary {
+    private enum CodingKeys: String, CodingKey {
+        case `local_thread_id`
+        case `files`
+        case `additions`
+        case `deletions`
+        case `attention`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`local_thread_id` = try c.decode(String.self, forKey: .`local_thread_id`)
+        self.`files` = try c.decode(UInt32.self, forKey: .`files`)
+        self.`additions` = try c.decode(UInt32.self, forKey: .`additions`)
+        self.`deletions` = try c.decode(UInt32.self, forKey: .`deletions`)
+        self.`attention` = try c.decode(UInt32.self, forKey: .`attention`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`local_thread_id`, forKey: .`local_thread_id`)
+        try c.encode(self.`files`, forKey: .`files`)
+        try c.encode(self.`additions`, forKey: .`additions`)
+        try c.encode(self.`deletions`, forKey: .`deletions`)
+        try c.encode(self.`attention`, forKey: .`attention`)
+    }
+}
+
+struct GitSummaryResult: Codable {
+    var `workspace_id`: String
+    var `revision`: UInt64
+    var `threads`: [GitThreadSummary] = []
+}
+
+extension GitSummaryResult {
+    private enum CodingKeys: String, CodingKey {
+        case `workspace_id`
+        case `revision`
+        case `threads`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        self.`revision` = try c.decode(UInt64.self, forKey: .`revision`)
+        if !c.contains(.`threads`) { self.`threads` = [] } else {
+        self.`threads` = try c.decode([GitThreadSummary].self, forKey: .`threads`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`revision`, forKey: .`revision`)
+        try c.encode(self.`threads`, forKey: .`threads`)
+    }
+}
+
+struct GitReviewRequest: Codable {
+    var `workspace_id`: String
+    var `local_thread_id`: String
+    var `repository_id`: String? = nil
+    var `relative_cwd`: String? = nil
+    var `project_path`: String? = nil
+    var `cwd`: String? = nil
+    var `include_unassigned`: Bool = true
+    var `hunk_budget_bytes`: UInt64? = nil
+}
+
+extension GitReviewRequest {
+    private enum CodingKeys: String, CodingKey {
+        case `workspace_id`
+        case `local_thread_id`
+        case `repository_id`
+        case `relative_cwd`
+        case `project_path`
+        case `cwd`
+        case `include_unassigned`
+        case `hunk_budget_bytes`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        self.`local_thread_id` = try c.decode(String.self, forKey: .`local_thread_id`)
+        if !c.contains(.`repository_id`) { self.`repository_id` = nil } else {
+        self.`repository_id` = try c.decodeIfPresent(String.self, forKey: .`repository_id`)
+        }
+        if !c.contains(.`relative_cwd`) { self.`relative_cwd` = nil } else {
+        self.`relative_cwd` = try c.decodeIfPresent(String.self, forKey: .`relative_cwd`)
+        }
+        if !c.contains(.`project_path`) { self.`project_path` = nil } else {
+        self.`project_path` = try c.decodeIfPresent(String.self, forKey: .`project_path`)
+        }
+        if !c.contains(.`cwd`) { self.`cwd` = nil } else {
+        self.`cwd` = try c.decodeIfPresent(String.self, forKey: .`cwd`)
+        }
+        if !c.contains(.`include_unassigned`) { self.`include_unassigned` = true } else {
+        self.`include_unassigned` = try c.decode(Bool.self, forKey: .`include_unassigned`)
+        }
+        if !c.contains(.`hunk_budget_bytes`) { self.`hunk_budget_bytes` = nil } else {
+        self.`hunk_budget_bytes` = try c.decodeIfPresent(UInt64.self, forKey: .`hunk_budget_bytes`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`local_thread_id`, forKey: .`local_thread_id`)
+        try c.encode(self.`repository_id`, forKey: .`repository_id`)
+        try c.encode(self.`relative_cwd`, forKey: .`relative_cwd`)
+        try c.encode(self.`project_path`, forKey: .`project_path`)
+        try c.encode(self.`cwd`, forKey: .`cwd`)
+        try c.encode(self.`include_unassigned`, forKey: .`include_unassigned`)
+        try c.encode(self.`hunk_budget_bytes`, forKey: .`hunk_budget_bytes`)
+    }
+}
+
+struct GitOtherThread: Codable {
+    var `local_thread_id`: String
+    var `title`: String
+}
+
+extension GitOtherThread {
+    private enum CodingKeys: String, CodingKey {
+        case `local_thread_id`
+        case `title`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`local_thread_id` = try c.decode(String.self, forKey: .`local_thread_id`)
+        self.`title` = try c.decode(String.self, forKey: .`title`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`local_thread_id`, forKey: .`local_thread_id`)
+        try c.encode(self.`title`, forKey: .`title`)
+    }
+}
+
+struct GitReviewHunk: Codable {
+    var `index`: UInt32
+    var `header`: String
+    var `text`: String
+}
+
+extension GitReviewHunk {
+    private enum CodingKeys: String, CodingKey {
+        case `index`
+        case `header`
+        case `text`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`index` = try c.decode(UInt32.self, forKey: .`index`)
+        self.`header` = try c.decode(String.self, forKey: .`header`)
+        self.`text` = try c.decode(String.self, forKey: .`text`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`index`, forKey: .`index`)
+        try c.encode(self.`header`, forKey: .`header`)
+        try c.encode(self.`text`, forKey: .`text`)
+    }
+}
+
+struct GitReviewFile: Codable {
+    var `path`: String
+    var `status`: String
+    var `ownership`: String
+    var `other_threads`: [GitOtherThread] = []
+    var `additions`: UInt32
+    var `deletions`: UInt32
+    var `binary`: Bool
+    var `hunk_selectable`: Bool
+    var `preview_truncated`: Bool
+    var `hunks`: [GitReviewHunk] = []
+}
+
+extension GitReviewFile {
+    private enum CodingKeys: String, CodingKey {
+        case `path`
+        case `status`
+        case `ownership`
+        case `other_threads`
+        case `additions`
+        case `deletions`
+        case `binary`
+        case `hunk_selectable`
+        case `preview_truncated`
+        case `hunks`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`path` = try c.decode(String.self, forKey: .`path`)
+        self.`status` = try c.decode(String.self, forKey: .`status`)
+        self.`ownership` = try c.decode(String.self, forKey: .`ownership`)
+        if !c.contains(.`other_threads`) { self.`other_threads` = [] } else {
+        self.`other_threads` = try c.decode([GitOtherThread].self, forKey: .`other_threads`)
+        }
+        self.`additions` = try c.decode(UInt32.self, forKey: .`additions`)
+        self.`deletions` = try c.decode(UInt32.self, forKey: .`deletions`)
+        self.`binary` = try c.decode(Bool.self, forKey: .`binary`)
+        self.`hunk_selectable` = try c.decode(Bool.self, forKey: .`hunk_selectable`)
+        self.`preview_truncated` = try c.decode(Bool.self, forKey: .`preview_truncated`)
+        if !c.contains(.`hunks`) { self.`hunks` = [] } else {
+        self.`hunks` = try c.decode([GitReviewHunk].self, forKey: .`hunks`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`path`, forKey: .`path`)
+        try c.encode(self.`status`, forKey: .`status`)
+        try c.encode(self.`ownership`, forKey: .`ownership`)
+        try c.encode(self.`other_threads`, forKey: .`other_threads`)
+        try c.encode(self.`additions`, forKey: .`additions`)
+        try c.encode(self.`deletions`, forKey: .`deletions`)
+        try c.encode(self.`binary`, forKey: .`binary`)
+        try c.encode(self.`hunk_selectable`, forKey: .`hunk_selectable`)
+        try c.encode(self.`preview_truncated`, forKey: .`preview_truncated`)
+        try c.encode(self.`hunks`, forKey: .`hunks`)
+    }
+}
+
+struct GitReviewRepo: Codable {
+    var `root`: String
+    var `name`: String
+    var `branch`: String? = nil
+    var `head`: String? = nil
+    var `default_branch`: String? = nil
+    var `is_default_branch`: Bool = false
+    var `upstream`: String? = nil
+    var `ahead`: UInt32 = 0
+    var `behind`: UInt32 = 0
+    var `has_remote`: Bool = false
+    var `files`: [GitReviewFile] = []
+}
+
+extension GitReviewRepo {
+    private enum CodingKeys: String, CodingKey {
+        case `root`
+        case `name`
+        case `branch`
+        case `head`
+        case `default_branch`
+        case `is_default_branch`
+        case `upstream`
+        case `ahead`
+        case `behind`
+        case `has_remote`
+        case `files`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`root` = try c.decode(String.self, forKey: .`root`)
+        self.`name` = try c.decode(String.self, forKey: .`name`)
+        if !c.contains(.`branch`) { self.`branch` = nil } else {
+        self.`branch` = try c.decodeIfPresent(String.self, forKey: .`branch`)
+        }
+        if !c.contains(.`head`) { self.`head` = nil } else {
+        self.`head` = try c.decodeIfPresent(String.self, forKey: .`head`)
+        }
+        if !c.contains(.`default_branch`) { self.`default_branch` = nil } else {
+        self.`default_branch` = try c.decodeIfPresent(String.self, forKey: .`default_branch`)
+        }
+        if !c.contains(.`is_default_branch`) { self.`is_default_branch` = false } else {
+        self.`is_default_branch` = try c.decode(Bool.self, forKey: .`is_default_branch`)
+        }
+        if !c.contains(.`upstream`) { self.`upstream` = nil } else {
+        self.`upstream` = try c.decodeIfPresent(String.self, forKey: .`upstream`)
+        }
+        if !c.contains(.`ahead`) { self.`ahead` = 0 } else {
+        self.`ahead` = try c.decode(UInt32.self, forKey: .`ahead`)
+        }
+        if !c.contains(.`behind`) { self.`behind` = 0 } else {
+        self.`behind` = try c.decode(UInt32.self, forKey: .`behind`)
+        }
+        if !c.contains(.`has_remote`) { self.`has_remote` = false } else {
+        self.`has_remote` = try c.decode(Bool.self, forKey: .`has_remote`)
+        }
+        if !c.contains(.`files`) { self.`files` = [] } else {
+        self.`files` = try c.decode([GitReviewFile].self, forKey: .`files`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`root`, forKey: .`root`)
+        try c.encode(self.`name`, forKey: .`name`)
+        try c.encode(self.`branch`, forKey: .`branch`)
+        try c.encode(self.`head`, forKey: .`head`)
+        try c.encode(self.`default_branch`, forKey: .`default_branch`)
+        try c.encode(self.`is_default_branch`, forKey: .`is_default_branch`)
+        try c.encode(self.`upstream`, forKey: .`upstream`)
+        try c.encode(self.`ahead`, forKey: .`ahead`)
+        try c.encode(self.`behind`, forKey: .`behind`)
+        try c.encode(self.`has_remote`, forKey: .`has_remote`)
+        try c.encode(self.`files`, forKey: .`files`)
+    }
+}
+
+struct GitReviewResult: Codable {
+    var `review_id`: String
+    var `workspace_id`: String
+    var `local_thread_id`: String
+    var `turn_running`: Bool
+    var `default_action`: String
+    var `repos`: [GitReviewRepo] = []
+}
+
+extension GitReviewResult {
+    private enum CodingKeys: String, CodingKey {
+        case `review_id`
+        case `workspace_id`
+        case `local_thread_id`
+        case `turn_running`
+        case `default_action`
+        case `repos`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`review_id` = try c.decode(String.self, forKey: .`review_id`)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        self.`local_thread_id` = try c.decode(String.self, forKey: .`local_thread_id`)
+        self.`turn_running` = try c.decode(Bool.self, forKey: .`turn_running`)
+        self.`default_action` = try c.decode(String.self, forKey: .`default_action`)
+        if !c.contains(.`repos`) { self.`repos` = [] } else {
+        self.`repos` = try c.decode([GitReviewRepo].self, forKey: .`repos`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`review_id`, forKey: .`review_id`)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`local_thread_id`, forKey: .`local_thread_id`)
+        try c.encode(self.`turn_running`, forKey: .`turn_running`)
+        try c.encode(self.`default_action`, forKey: .`default_action`)
+        try c.encode(self.`repos`, forKey: .`repos`)
+    }
+}
+
+struct GitFileSelection: Codable {
+    var `path`: String
+    var `hunks`: [UInt32]? = nil
+}
+
+extension GitFileSelection {
+    private enum CodingKeys: String, CodingKey {
+        case `path`
+        case `hunks`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`path` = try c.decode(String.self, forKey: .`path`)
+        if !c.contains(.`hunks`) { self.`hunks` = nil } else {
+        self.`hunks` = try c.decodeIfPresent([UInt32].self, forKey: .`hunks`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`path`, forKey: .`path`)
+        try c.encode(self.`hunks`, forKey: .`hunks`)
+    }
+}
+
+struct GitRepoSelection: Codable {
+    var `root`: String
+    var `files`: [GitFileSelection]
+}
+
+extension GitRepoSelection {
+    private enum CodingKeys: String, CodingKey {
+        case `root`
+        case `files`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`root` = try c.decode(String.self, forKey: .`root`)
+        self.`files` = try c.decode([GitFileSelection].self, forKey: .`files`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`root`, forKey: .`root`)
+        try c.encode(self.`files`, forKey: .`files`)
+    }
+}
+
+struct GitCommitMessageRequest: Codable {
+    var `review_id`: String
+    var `selections`: [GitRepoSelection]? = nil
+}
+
+extension GitCommitMessageRequest {
+    private enum CodingKeys: String, CodingKey {
+        case `review_id`
+        case `selections`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`review_id` = try c.decode(String.self, forKey: .`review_id`)
+        if !c.contains(.`selections`) { self.`selections` = nil } else {
+        self.`selections` = try c.decodeIfPresent([GitRepoSelection].self, forKey: .`selections`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`review_id`, forKey: .`review_id`)
+        try c.encode(self.`selections`, forKey: .`selections`)
+    }
+}
+
+struct GitCommitMessageResult: Codable {
+    var `message`: String
+    var `branch`: String? = nil
+    var `provider`: String
+    var `model`: String
+}
+
+extension GitCommitMessageResult {
+    private enum CodingKeys: String, CodingKey {
+        case `message`
+        case `branch`
+        case `provider`
+        case `model`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`message` = try c.decode(String.self, forKey: .`message`)
+        if !c.contains(.`branch`) { self.`branch` = nil } else {
+        self.`branch` = try c.decodeIfPresent(String.self, forKey: .`branch`)
+        }
+        self.`provider` = try c.decode(String.self, forKey: .`provider`)
+        self.`model` = try c.decode(String.self, forKey: .`model`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`message`, forKey: .`message`)
+        try c.encode(self.`branch`, forKey: .`branch`)
+        try c.encode(self.`provider`, forKey: .`provider`)
+        try c.encode(self.`model`, forKey: .`model`)
+    }
+}
+
+struct GitCommitRequest: Codable {
+    var `review_id`: String
+    var `message`: String
+    var `selections`: [GitRepoSelection]
+    var `push`: Bool = false
+    var `new_branch`: Bool = false
+    var `branch_name`: String? = nil
+}
+
+extension GitCommitRequest {
+    private enum CodingKeys: String, CodingKey {
+        case `review_id`
+        case `message`
+        case `selections`
+        case `push`
+        case `new_branch`
+        case `branch_name`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`review_id` = try c.decode(String.self, forKey: .`review_id`)
+        self.`message` = try c.decode(String.self, forKey: .`message`)
+        self.`selections` = try c.decode([GitRepoSelection].self, forKey: .`selections`)
+        if !c.contains(.`push`) { self.`push` = false } else {
+        self.`push` = try c.decode(Bool.self, forKey: .`push`)
+        }
+        if !c.contains(.`new_branch`) { self.`new_branch` = false } else {
+        self.`new_branch` = try c.decode(Bool.self, forKey: .`new_branch`)
+        }
+        if !c.contains(.`branch_name`) { self.`branch_name` = nil } else {
+        self.`branch_name` = try c.decodeIfPresent(String.self, forKey: .`branch_name`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`review_id`, forKey: .`review_id`)
+        try c.encode(self.`message`, forKey: .`message`)
+        try c.encode(self.`selections`, forKey: .`selections`)
+        try c.encode(self.`push`, forKey: .`push`)
+        try c.encode(self.`new_branch`, forKey: .`new_branch`)
+        try c.encode(self.`branch_name`, forKey: .`branch_name`)
+    }
+}
+
+struct GitRepoCommit: Codable {
+    var `root`: String
+    var `commit`: String
+    var `short_commit`: String
+    var `subject`: String
+    var `files`: UInt32
+    var `branch`: String? = nil
+    var `branch_created`: Bool = false
+    var `push`: String
+    var `push_message`: String? = nil
+    var `index_reset`: Bool = false
+}
+
+extension GitRepoCommit {
+    private enum CodingKeys: String, CodingKey {
+        case `root`
+        case `commit`
+        case `short_commit`
+        case `subject`
+        case `files`
+        case `branch`
+        case `branch_created`
+        case `push`
+        case `push_message`
+        case `index_reset`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`root` = try c.decode(String.self, forKey: .`root`)
+        self.`commit` = try c.decode(String.self, forKey: .`commit`)
+        self.`short_commit` = try c.decode(String.self, forKey: .`short_commit`)
+        self.`subject` = try c.decode(String.self, forKey: .`subject`)
+        self.`files` = try c.decode(UInt32.self, forKey: .`files`)
+        if !c.contains(.`branch`) { self.`branch` = nil } else {
+        self.`branch` = try c.decodeIfPresent(String.self, forKey: .`branch`)
+        }
+        if !c.contains(.`branch_created`) { self.`branch_created` = false } else {
+        self.`branch_created` = try c.decode(Bool.self, forKey: .`branch_created`)
+        }
+        self.`push` = try c.decode(String.self, forKey: .`push`)
+        if !c.contains(.`push_message`) { self.`push_message` = nil } else {
+        self.`push_message` = try c.decodeIfPresent(String.self, forKey: .`push_message`)
+        }
+        if !c.contains(.`index_reset`) { self.`index_reset` = false } else {
+        self.`index_reset` = try c.decode(Bool.self, forKey: .`index_reset`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`root`, forKey: .`root`)
+        try c.encode(self.`commit`, forKey: .`commit`)
+        try c.encode(self.`short_commit`, forKey: .`short_commit`)
+        try c.encode(self.`subject`, forKey: .`subject`)
+        try c.encode(self.`files`, forKey: .`files`)
+        try c.encode(self.`branch`, forKey: .`branch`)
+        try c.encode(self.`branch_created`, forKey: .`branch_created`)
+        try c.encode(self.`push`, forKey: .`push`)
+        try c.encode(self.`push_message`, forKey: .`push_message`)
+        try c.encode(self.`index_reset`, forKey: .`index_reset`)
+    }
+}
+
+struct GitCommitResult: Codable {
+    var `workspace_id`: String
+    var `local_thread_id`: String
+    var `files`: UInt32
+    var `repos`: [GitRepoCommit] = []
+    var `transcript_message_id`: String? = nil
+}
+
+extension GitCommitResult {
+    private enum CodingKeys: String, CodingKey {
+        case `workspace_id`
+        case `local_thread_id`
+        case `files`
+        case `repos`
+        case `transcript_message_id`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        self.`local_thread_id` = try c.decode(String.self, forKey: .`local_thread_id`)
+        self.`files` = try c.decode(UInt32.self, forKey: .`files`)
+        if !c.contains(.`repos`) { self.`repos` = [] } else {
+        self.`repos` = try c.decode([GitRepoCommit].self, forKey: .`repos`)
+        }
+        if !c.contains(.`transcript_message_id`) { self.`transcript_message_id` = nil } else {
+        self.`transcript_message_id` = try c.decodeIfPresent(String.self, forKey: .`transcript_message_id`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`local_thread_id`, forKey: .`local_thread_id`)
+        try c.encode(self.`files`, forKey: .`files`)
+        try c.encode(self.`repos`, forKey: .`repos`)
+        try c.encode(self.`transcript_message_id`, forKey: .`transcript_message_id`)
+    }
+}
+
+struct GitPullPushRequest: Codable {
+    var `workspace_id`: String
+    var `root`: String
+}
+
+extension GitPullPushRequest {
+    private enum CodingKeys: String, CodingKey {
+        case `workspace_id`
+        case `root`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        self.`root` = try c.decode(String.self, forKey: .`root`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`root`, forKey: .`root`)
+    }
+}
+
+struct GitPullPushResult: Codable {
+    var `root`: String
+    var `push`: String
+    var `push_message`: String? = nil
+}
+
+extension GitPullPushResult {
+    private enum CodingKeys: String, CodingKey {
+        case `root`
+        case `push`
+        case `push_message`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`root` = try c.decode(String.self, forKey: .`root`)
+        self.`push` = try c.decode(String.self, forKey: .`push`)
+        if !c.contains(.`push_message`) { self.`push_message` = nil } else {
+        self.`push_message` = try c.decodeIfPresent(String.self, forKey: .`push_message`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`root`, forKey: .`root`)
+        try c.encode(self.`push`, forKey: .`push`)
+        try c.encode(self.`push_message`, forKey: .`push_message`)
+    }
+}
+
+struct GitConfigCommitSetRequest: Codable {
+    var `commit_message_provider`: String? = nil
+    var `commit_message_model`: String? = nil
+    var `commit_default_action`: String? = nil
+}
+
+extension GitConfigCommitSetRequest {
+    private enum CodingKeys: String, CodingKey {
+        case `commit_message_provider`
+        case `commit_message_model`
+        case `commit_default_action`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`commit_message_provider`) { self.`commit_message_provider` = nil } else {
+        self.`commit_message_provider` = try c.decodeIfPresent(String.self, forKey: .`commit_message_provider`)
+        }
+        if !c.contains(.`commit_message_model`) { self.`commit_message_model` = nil } else {
+        self.`commit_message_model` = try c.decodeIfPresent(String.self, forKey: .`commit_message_model`)
+        }
+        if !c.contains(.`commit_default_action`) { self.`commit_default_action` = nil } else {
+        self.`commit_default_action` = try c.decodeIfPresent(String.self, forKey: .`commit_default_action`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`commit_message_provider`, forKey: .`commit_message_provider`)
+        try c.encode(self.`commit_message_model`, forKey: .`commit_message_model`)
+        try c.encode(self.`commit_default_action`, forKey: .`commit_default_action`)
+    }
+}
+
+struct GitConfigCommitSnapshot: Codable {
+    var `commit_message_provider`: String = "auto"
+    var `commit_message_model`: String? = nil
+    var `commit_default_action`: String = "commit"
+}
+
+extension GitConfigCommitSnapshot {
+    private enum CodingKeys: String, CodingKey {
+        case `commit_message_provider`
+        case `commit_message_model`
+        case `commit_default_action`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`commit_message_provider`) { self.`commit_message_provider` = "auto" } else {
+        self.`commit_message_provider` = try c.decode(String.self, forKey: .`commit_message_provider`)
+        }
+        if !c.contains(.`commit_message_model`) { self.`commit_message_model` = nil } else {
+        self.`commit_message_model` = try c.decodeIfPresent(String.self, forKey: .`commit_message_model`)
+        }
+        if !c.contains(.`commit_default_action`) { self.`commit_default_action` = "commit" } else {
+        self.`commit_default_action` = try c.decode(String.self, forKey: .`commit_default_action`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`commit_message_provider`, forKey: .`commit_message_provider`)
+        try c.encode(self.`commit_message_model`, forKey: .`commit_message_model`)
+        try c.encode(self.`commit_default_action`, forKey: .`commit_default_action`)
+    }
+}
+
+struct GitStatusRequest: Codable {
+    var `workspace_id`: String
+    var `local_thread_id`: String
+    var `repository_id`: String? = nil
+    var `relative_cwd`: String? = nil
+    var `project_path`: String? = nil
+    var `cwd`: String? = nil
+}
+
+extension GitStatusRequest {
+    private enum CodingKeys: String, CodingKey {
+        case `workspace_id`
+        case `local_thread_id`
+        case `repository_id`
+        case `relative_cwd`
+        case `project_path`
+        case `cwd`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        self.`local_thread_id` = try c.decode(String.self, forKey: .`local_thread_id`)
+        if !c.contains(.`repository_id`) { self.`repository_id` = nil } else {
+        self.`repository_id` = try c.decodeIfPresent(String.self, forKey: .`repository_id`)
+        }
+        if !c.contains(.`relative_cwd`) { self.`relative_cwd` = nil } else {
+        self.`relative_cwd` = try c.decodeIfPresent(String.self, forKey: .`relative_cwd`)
+        }
+        if !c.contains(.`project_path`) { self.`project_path` = nil } else {
+        self.`project_path` = try c.decodeIfPresent(String.self, forKey: .`project_path`)
+        }
+        if !c.contains(.`cwd`) { self.`cwd` = nil } else {
+        self.`cwd` = try c.decodeIfPresent(String.self, forKey: .`cwd`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`local_thread_id`, forKey: .`local_thread_id`)
+        try c.encode(self.`repository_id`, forKey: .`repository_id`)
+        try c.encode(self.`relative_cwd`, forKey: .`relative_cwd`)
+        try c.encode(self.`project_path`, forKey: .`project_path`)
+        try c.encode(self.`cwd`, forKey: .`cwd`)
+    }
+}
+
+struct GitStatusResult: Codable {
+    var `workspace_id`: String
+    var `local_thread_id`: String
+    var `repos`: [GitRepoStatus] = []
+}
+
+extension GitStatusResult {
+    private enum CodingKeys: String, CodingKey {
+        case `workspace_id`
+        case `local_thread_id`
+        case `repos`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        self.`local_thread_id` = try c.decode(String.self, forKey: .`local_thread_id`)
+        if !c.contains(.`repos`) { self.`repos` = [] } else {
+        self.`repos` = try c.decode([GitRepoStatus].self, forKey: .`repos`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`local_thread_id`, forKey: .`local_thread_id`)
+        try c.encode(self.`repos`, forKey: .`repos`)
+    }
+}
+
+struct GitRepoStatus: Codable {
+    var `root`: String
+    var `name`: String
+    var `branch`: String? = nil
+    var `default_branch`: String? = nil
+    var `is_default_branch`: Bool = false
+    var `upstream`: String? = nil
+    var `ahead`: UInt32 = 0
+    var `behind`: UInt32 = 0
+    var `has_remote`: Bool = false
+}
+
+extension GitRepoStatus {
+    private enum CodingKeys: String, CodingKey {
+        case `root`
+        case `name`
+        case `branch`
+        case `default_branch`
+        case `is_default_branch`
+        case `upstream`
+        case `ahead`
+        case `behind`
+        case `has_remote`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`root` = try c.decode(String.self, forKey: .`root`)
+        self.`name` = try c.decode(String.self, forKey: .`name`)
+        if !c.contains(.`branch`) { self.`branch` = nil } else {
+        self.`branch` = try c.decodeIfPresent(String.self, forKey: .`branch`)
+        }
+        if !c.contains(.`default_branch`) { self.`default_branch` = nil } else {
+        self.`default_branch` = try c.decodeIfPresent(String.self, forKey: .`default_branch`)
+        }
+        if !c.contains(.`is_default_branch`) { self.`is_default_branch` = false } else {
+        self.`is_default_branch` = try c.decode(Bool.self, forKey: .`is_default_branch`)
+        }
+        if !c.contains(.`upstream`) { self.`upstream` = nil } else {
+        self.`upstream` = try c.decodeIfPresent(String.self, forKey: .`upstream`)
+        }
+        if !c.contains(.`ahead`) { self.`ahead` = 0 } else {
+        self.`ahead` = try c.decode(UInt32.self, forKey: .`ahead`)
+        }
+        if !c.contains(.`behind`) { self.`behind` = 0 } else {
+        self.`behind` = try c.decode(UInt32.self, forKey: .`behind`)
+        }
+        if !c.contains(.`has_remote`) { self.`has_remote` = false } else {
+        self.`has_remote` = try c.decode(Bool.self, forKey: .`has_remote`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`root`, forKey: .`root`)
+        try c.encode(self.`name`, forKey: .`name`)
+        try c.encode(self.`branch`, forKey: .`branch`)
+        try c.encode(self.`default_branch`, forKey: .`default_branch`)
+        try c.encode(self.`is_default_branch`, forKey: .`is_default_branch`)
+        try c.encode(self.`upstream`, forKey: .`upstream`)
+        try c.encode(self.`ahead`, forKey: .`ahead`)
+        try c.encode(self.`behind`, forKey: .`behind`)
+        try c.encode(self.`has_remote`, forKey: .`has_remote`)
+    }
+}
+
+struct GitPushRequest: Codable {
+    var `workspace_id`: String
+    var `root`: String
+    var `request_id`: String? = nil
+}
+
+extension GitPushRequest {
+    private enum CodingKeys: String, CodingKey {
+        case `workspace_id`
+        case `root`
+        case `request_id`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        self.`root` = try c.decode(String.self, forKey: .`root`)
+        if !c.contains(.`request_id`) { self.`request_id` = nil } else {
+        self.`request_id` = try c.decodeIfPresent(String.self, forKey: .`request_id`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`root`, forKey: .`root`)
+        try c.encode(self.`request_id`, forKey: .`request_id`)
+    }
+}
+
+struct GitStatusView: Codable {
+    var `loading`: Bool = false
+    var `supported`: Bool = true
+    var `can_commit`: Bool = false
+    var `status`: GitStatusResult? = nil
+    var `error`: LocalError? = nil
+}
+
+extension GitStatusView {
+    private enum CodingKeys: String, CodingKey {
+        case `loading`
+        case `supported`
+        case `can_commit`
+        case `status`
+        case `error`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`loading`) { self.`loading` = false } else {
+        self.`loading` = try c.decode(Bool.self, forKey: .`loading`)
+        }
+        if !c.contains(.`supported`) { self.`supported` = true } else {
+        self.`supported` = try c.decode(Bool.self, forKey: .`supported`)
+        }
+        if !c.contains(.`can_commit`) { self.`can_commit` = false } else {
+        self.`can_commit` = try c.decode(Bool.self, forKey: .`can_commit`)
+        }
+        if !c.contains(.`status`) { self.`status` = nil } else {
+        self.`status` = try c.decodeIfPresent(GitStatusResult.self, forKey: .`status`)
+        }
+        if !c.contains(.`error`) { self.`error` = nil } else {
+        self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`loading`, forKey: .`loading`)
+        try c.encode(self.`supported`, forKey: .`supported`)
+        try c.encode(self.`can_commit`, forKey: .`can_commit`)
+        try c.encode(self.`status`, forKey: .`status`)
+        try c.encode(self.`error`, forKey: .`error`)
+    }
+}
+
+struct GitStatusQuery: Codable {
+    var `api_version`: UInt32
+    var `revision`: String
+    var `data`: GitStatusView?
+    var `error`: LocalError?
+}
+
+extension GitStatusQuery {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `revision`
+        case `data`
+        case `error`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        self.`revision` = try c.decode(String.self, forKey: .`revision`)
+        self.`data` = try c.decodeIfPresent(GitStatusView.self, forKey: .`data`)
+        self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`revision`, forKey: .`revision`)
+        try c.encode(self.`data`, forKey: .`data`)
+        try c.encode(self.`error`, forKey: .`error`)
+    }
+}
+
+struct GitSummary: Codable {
+    var `workspace_id`: String
+    var `threads`: [GitThreadSummary] = []
+    var `loading`: Bool = false
+    var `supported`: Bool = true
+    var `error`: LocalError? = nil
+}
+
+extension GitSummary {
+    private enum CodingKeys: String, CodingKey {
+        case `workspace_id`
+        case `threads`
+        case `loading`
+        case `supported`
+        case `error`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        if !c.contains(.`threads`) { self.`threads` = [] } else {
+        self.`threads` = try c.decode([GitThreadSummary].self, forKey: .`threads`)
+        }
+        if !c.contains(.`loading`) { self.`loading` = false } else {
+        self.`loading` = try c.decode(Bool.self, forKey: .`loading`)
+        }
+        if !c.contains(.`supported`) { self.`supported` = true } else {
+        self.`supported` = try c.decode(Bool.self, forKey: .`supported`)
+        }
+        if !c.contains(.`error`) { self.`error` = nil } else {
+        self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`threads`, forKey: .`threads`)
+        try c.encode(self.`loading`, forKey: .`loading`)
+        try c.encode(self.`supported`, forKey: .`supported`)
+        try c.encode(self.`error`, forKey: .`error`)
+    }
+}
+
+struct GitReviewView: Codable {
+    var `state`: String = "idle"
+    var `loading`: Bool = false
+    var `supported`: Bool = true
+    var `can_commit`: Bool = false
+    var `can_configure`: Bool = false
+    var `can_retry`: Bool = false
+    var `review`: GitReviewResult? = nil
+    var `message_state`: String = "idle"
+    var `message`: GitCommitMessageResult? = nil
+    var `mutation_state`: String = "idle"
+    var `result`: GitCommitResult? = nil
+    var `pull_push_result`: GitPullPushResult? = nil
+    var `config`: GitConfigCommitSnapshot? = nil
+    var `error`: LocalError? = nil
+}
+
+extension GitReviewView {
+    private enum CodingKeys: String, CodingKey {
+        case `state`
+        case `loading`
+        case `supported`
+        case `can_commit`
+        case `can_configure`
+        case `can_retry`
+        case `review`
+        case `message_state`
+        case `message`
+        case `mutation_state`
+        case `result`
+        case `pull_push_result`
+        case `config`
+        case `error`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`state`) { self.`state` = "idle" } else {
+        self.`state` = try c.decode(String.self, forKey: .`state`)
+        }
+        if !c.contains(.`loading`) { self.`loading` = false } else {
+        self.`loading` = try c.decode(Bool.self, forKey: .`loading`)
+        }
+        if !c.contains(.`supported`) { self.`supported` = true } else {
+        self.`supported` = try c.decode(Bool.self, forKey: .`supported`)
+        }
+        if !c.contains(.`can_commit`) { self.`can_commit` = false } else {
+        self.`can_commit` = try c.decode(Bool.self, forKey: .`can_commit`)
+        }
+        if !c.contains(.`can_configure`) { self.`can_configure` = false } else {
+        self.`can_configure` = try c.decode(Bool.self, forKey: .`can_configure`)
+        }
+        if !c.contains(.`can_retry`) { self.`can_retry` = false } else {
+        self.`can_retry` = try c.decode(Bool.self, forKey: .`can_retry`)
+        }
+        if !c.contains(.`review`) { self.`review` = nil } else {
+        self.`review` = try c.decodeIfPresent(GitReviewResult.self, forKey: .`review`)
+        }
+        if !c.contains(.`message_state`) { self.`message_state` = "idle" } else {
+        self.`message_state` = try c.decode(String.self, forKey: .`message_state`)
+        }
+        if !c.contains(.`message`) { self.`message` = nil } else {
+        self.`message` = try c.decodeIfPresent(GitCommitMessageResult.self, forKey: .`message`)
+        }
+        if !c.contains(.`mutation_state`) { self.`mutation_state` = "idle" } else {
+        self.`mutation_state` = try c.decode(String.self, forKey: .`mutation_state`)
+        }
+        if !c.contains(.`result`) { self.`result` = nil } else {
+        self.`result` = try c.decodeIfPresent(GitCommitResult.self, forKey: .`result`)
+        }
+        if !c.contains(.`pull_push_result`) { self.`pull_push_result` = nil } else {
+        self.`pull_push_result` = try c.decodeIfPresent(GitPullPushResult.self, forKey: .`pull_push_result`)
+        }
+        if !c.contains(.`config`) { self.`config` = nil } else {
+        self.`config` = try c.decodeIfPresent(GitConfigCommitSnapshot.self, forKey: .`config`)
+        }
+        if !c.contains(.`error`) { self.`error` = nil } else {
+        self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`state`, forKey: .`state`)
+        try c.encode(self.`loading`, forKey: .`loading`)
+        try c.encode(self.`supported`, forKey: .`supported`)
+        try c.encode(self.`can_commit`, forKey: .`can_commit`)
+        try c.encode(self.`can_configure`, forKey: .`can_configure`)
+        try c.encode(self.`can_retry`, forKey: .`can_retry`)
+        try c.encode(self.`review`, forKey: .`review`)
+        try c.encode(self.`message_state`, forKey: .`message_state`)
+        try c.encode(self.`message`, forKey: .`message`)
+        try c.encode(self.`mutation_state`, forKey: .`mutation_state`)
+        try c.encode(self.`result`, forKey: .`result`)
+        try c.encode(self.`pull_push_result`, forKey: .`pull_push_result`)
+        try c.encode(self.`config`, forKey: .`config`)
+        try c.encode(self.`error`, forKey: .`error`)
+    }
+}
+
+struct GitSummaryQuery: Codable {
+    var `api_version`: UInt32
+    var `revision`: String
+    var `data`: GitSummary?
+    var `error`: LocalError?
+}
+
+extension GitSummaryQuery {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `revision`
+        case `data`
+        case `error`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        self.`revision` = try c.decode(String.self, forKey: .`revision`)
+        self.`data` = try c.decodeIfPresent(GitSummary.self, forKey: .`data`)
+        self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`revision`, forKey: .`revision`)
+        try c.encode(self.`data`, forKey: .`data`)
+        try c.encode(self.`error`, forKey: .`error`)
+    }
+}
+
+struct GitReviewQuery: Codable {
+    var `api_version`: UInt32
+    var `revision`: String
+    var `data`: GitReviewView?
+    var `error`: LocalError?
+}
+
+extension GitReviewQuery {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `revision`
+        case `data`
+        case `error`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        self.`revision` = try c.decode(String.self, forKey: .`revision`)
+        self.`data` = try c.decodeIfPresent(GitReviewView.self, forKey: .`data`)
         self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
     }
     func encode(to encoder: Encoder) throws {

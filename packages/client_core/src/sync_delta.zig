@@ -252,6 +252,7 @@ pub fn changes(tx: *h.Transaction, params: V) E!void {
     if (result.next_cursor < previous) return fallback(tx, false);
     var scopes_bits: u8 = 0;
     var catalog = false;
+    var git_changes = false;
     for (result.entries) |entry| {
         if (entry.change_seq > result.next_cursor) return fallback(tx, false);
         // Replayed entries are already incorporated or already queued.
@@ -263,6 +264,7 @@ pub fn changes(tx: *h.Transaction, params: V) E!void {
         } else if (eq(topic, "surface")) {
             scopes_bits |= WORKSPACES;
         } else if (eq(topic, "chat.turn")) {
+            git_changes = true;
             scopes_bits |= TURNS;
         } else if (eq(topic, "process") or eq(topic, "lease")) {
             scopes_bits |= REGISTRY;
@@ -275,6 +277,7 @@ pub fn changes(tx: *h.Transaction, params: V) E!void {
         }
     }
     if (result.next_cursor == previous) return;
+    if (git_changes) h.git.turnChanged(tx);
     d.queued_scopes |= scopes_bits;
     d.queued_catalog = d.queued_catalog or catalog;
     d.queued_cursor = result.next_cursor;

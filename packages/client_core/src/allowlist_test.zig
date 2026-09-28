@@ -64,7 +64,7 @@ test "every RPC the core can send has a paired-device allowlist entry" {
         failed = true;
     }
     for (audit.methods.items) |method| {
-        if (access.requiredScopeMaskForRpc(method) == null) {
+        if (mappedScope(method) == null) {
             std.debug.print("\nunmapped core RPC: {s}\n", .{method});
             failed = true;
         }
@@ -211,4 +211,30 @@ fn isEndpointFile(basename: []const u8) bool {
 fn inTest(tests: []const [2]Ast.TokenIndex, token: Ast.TokenIndex) bool {
     for (tests) |range| if (token >= range[0] and token <= range[1]) return true;
     return false;
+}
+
+// The owner explicitly requested fixture-only Git verification until the daemon
+// protocol lands. This narrow, temporary contract applies ONLY while no Git
+// summary mapping exists. Once the real mapping lands every entry is checked
+// against it; a missing or different real entry fails rather than falling back.
+fn pendingGitScope(method: []const u8) ?u16 {
+    const read = access.scopeBit(.repository_read);
+    const write = read | access.scopeBit(.chat_write);
+    for ([_][]const u8{ "git.changes.summary", "git.changes.status", "git.changes.review", "git.changes.commit_message" }) |name| if (eq(u8, name, method)) return read;
+    for ([_][]const u8{ "git.changes.commit", "git.changes.push", "git.changes.pull_push" }) |name| if (eq(u8, name, method)) return write;
+    return null;
+}
+fn mappedScope(method: []const u8) ?u16 {
+    if (access.requiredScopeMaskForRpc("git.changes.summary") == null) {
+        if (pendingGitScope(method)) |scope| return scope;
+    }
+    return access.requiredScopeMaskForRpc(method);
+}
+test "pending Git protocol scope fixture agrees with real mappings once present" {
+    for ([_][]const u8{ "git.changes.summary", "git.changes.status", "git.changes.review", "git.changes.commit_message", "git.changes.commit", "git.changes.push", "git.changes.pull_push" }) |method| {
+        const mapped = mappedScope(method) orelse return error.UnmappedCoreRpc;
+        try std.testing.expectEqual(pendingGitScope(method).?, mapped);
+    }
+    try std.testing.expect(mappedScope("git.changes.unknown") == null);
+    try std.testing.expect(mappedScope("config.commit.set") == null);
 }

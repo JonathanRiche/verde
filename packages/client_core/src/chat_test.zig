@@ -745,3 +745,18 @@ test "focused draft and tail updates leave cached chats and browse catalogs alon
     try expect(announced(background, visible) and announced(background, cached));
     try expect(announced(background, "home"));
 }
+
+test "git system transcript row and future row kind do not break paging" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    _ = try f.intent("thread_open", .{});
+    _ = try f.storage(null, false);
+    var page = try h.parse(f.a(), @embedFile("fixtures/chat/page-1.json"));
+    var message = &page.object.getPtr("messages").?.array.items[0];
+    try message.object.put(f.a(), "author", .{ .string = "git" });
+    try message.object.put(f.a(), "body", .{ .string = "Committed 1 files: abc1234" });
+    try message.object.put(f.a(), "kind", .{ .string = "future_git_commit" });
+    _ = try f.response("chat.message.list", page, null);
+    try expect(f.host.state.chat.threads[0].rows.len == 5);
+    try eql("system", f.host.state.chat.threads[0].rows[0].role);
+}

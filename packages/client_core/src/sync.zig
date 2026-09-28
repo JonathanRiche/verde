@@ -363,6 +363,10 @@ pub fn pushFrom(tx: *host.Transaction, socket: ?[]const u8, text: []const u8) ho
             if (changed) tx.state.sync.nonce = nonce;
             tx.state.stale = true;
         }
+        for (p.rows(p.get(value, "entries"))) |entry| if (eq(p.s(entry, "topic"), "chat.turn")) {
+            host.git.turnChanged(tx);
+            break;
+        };
         if (changed or p.yes(p.get(value, "expired")) or p.rows(p.get(value, "entries")).len > 0 or p.get(params, "error") != .null) try refresh(tx);
     }
 }
