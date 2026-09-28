@@ -449,7 +449,8 @@ pub const Transaction = struct {
             _ = try decode(struct { key: []const u8, @"error": ?PlatformFailure }, a, event);
         } else if (eq(tag, "tls_peer")) {
             kind = .tls;
-            _ = try decode(struct { origin: []const u8, spki_sha256: []const u8, system_trusted: bool }, a, event);
+            const peer = try decode(struct { origin: []const u8, spki_sha256: []const u8, system_trusted: bool, @"error": ?TransportFailure = null }, a, event);
+            if (peer.@"error" != null and (peer.system_trusted or peer.spki_sha256.len != 0)) return error.InvalidArgument;
         } else if (eq(tag, "terminal_applied")) {
             kind = .terminal;
             _ = try decode(struct { terminal_id: []const u8, grid_revision: []const u8, @"error": ?PlatformFailure }, a, event);

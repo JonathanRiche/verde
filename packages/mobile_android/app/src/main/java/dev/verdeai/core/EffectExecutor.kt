@@ -378,6 +378,7 @@ class EffectExecutor(
     private fun probe(e: EffectTlsProbe) { scope.launch {
         var pin = ""
         var trusted = false
+        var error: TransportFailure? = null
         try {
             val url = e.origin.toHttpUrl()
             require(url.isHttps && url.encodedPath == "/" && url.query == null && url.fragment == null && url.username.isEmpty() && url.password.isEmpty())
@@ -395,8 +396,8 @@ class EffectExecutor(
                     .joinToString("") { "%02x".format(it) }
                 trusted = true
             } finally { probes.remove(raw); raw.close() }
-        } catch (_: Exception) { /* No exception diagnostics may leave this boundary. */ }
-        emit { n,w -> EventTlsPeer(now_ms=n, wall_time_ms=w, effect_id=e.effect_id, generation=e.generation, origin=e.origin, spki_sha256=pin, system_trusted=trusted) }
+        } catch (cause: Exception) { pin = ""; trusted = false; error = transport(cause) }
+        emit { n,w -> EventTlsPeer(now_ms=n, wall_time_ms=w, effect_id=e.effect_id, generation=e.generation, origin=e.origin, spki_sha256=pin, system_trusted=trusted, error=error) }
     } }
 
     override fun close() {

@@ -483,3 +483,54 @@ test "auth socket reconnect publishes ready state after ticket retry" {
     try expect(get(item, "error") == .null);
     try expect(get(item, "retry_at_ms") == .null);
 }
+
+test "auth resume probe retries transient failure without process restart" {
+    inline for (.{ "network", "timeout" }) |kind| {
+        var f = try Fixture.init();
+        defer f.deinit();
+        _ = try f.credential(try f.exchange(true));
+        _ = try f.event("background", .{});
+        const probe = try find(try f.event("foreground", .{}), "tls_probe");
+        const failed = try f.event("tls_peer", .{
+            .effect_id = get(probe, "effect_id").string,
+            .generation = get(probe, "generation").string,
+            .origin = "https://host.example",
+            .spki_sha256 = "",
+            .system_trusted = false,
+            .@"error" = .{ .kind = kind, .code = if (h.eq(kind, "timeout")) "timeout" else "offline" },
+        });
+        try expect(!f.host.state.auth.blocked);
+        try expect(f.host.state.auth.credential != null);
+        try no(failed, "http_request");
+        const retried = try find(try f.fire(try find(failed, "set_timer")), "tls_probe");
+        const discovery = try find(try f.event("tls_peer", .{
+            .effect_id = get(retried, "effect_id").string,
+            .generation = get(retried, "generation").string,
+            .origin = "https://host.example",
+            .spki_sha256 = pin,
+            .system_trusted = true,
+        }), "http_request");
+        const recovered = try f.response(discovery, 200, .{ .access_protocol_version = 1, .runtime_id = runtime_id, .instance_id = instance_id, .https_url = "https://host.example", .wss_url = "wss://host.example/ws", .capabilities = &[_][]const u8{"access.pair.v1"} });
+        _ = try find(recovered, "http_request");
+        try expect(f.host.state.auth.verified);
+        try expect(!f.host.state.auth.blocked);
+    }
+}
+
+test "auth probe certificate failure remains blocked without retry" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.loaded();
+    const probe = try find(try f.pair(), "tls_probe");
+    const failed = try f.event("tls_peer", .{
+        .effect_id = get(probe, "effect_id").string,
+        .generation = get(probe, "generation").string,
+        .origin = "https://host.example",
+        .spki_sha256 = "",
+        .system_trusted = false,
+        .@"error" = .{ .kind = "tls", .code = "certificate" },
+    });
+    try expect(f.host.state.auth.blocked);
+    try no(failed, "http_request");
+    try no(failed, "set_timer");
+}

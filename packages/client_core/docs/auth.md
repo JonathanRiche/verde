@@ -50,7 +50,10 @@ transport/timers but preserves issued writes and their original correlations.
 Token replacement closes the previous socket and requests a fresh ticket.
 No ticket is reused or put in a URL. Authentication stops in `repair_required`
 after one rejected credential/token retry. Ordinary transport failures use the
-shared bounded jittered exponential delay and never imply revocation.
+shared bounded jittered exponential delay and never imply revocation. This includes
+TLS probes that fail before validating a peer due to a network error or timeout.
+Adapters report the typed transport error separately from an untrusted peer;
+certificate rejection still blocks the session and never retries as connectivity.
 
 `auth_rpc.zig` bridges K-08's correlated HTTP completions: on a first 401 it
 holds the rejected call, single-flights refresh, then re-emits exactly the same

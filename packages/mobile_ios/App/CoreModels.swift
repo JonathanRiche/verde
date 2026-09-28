@@ -2199,6 +2199,7 @@ struct EventTlsPeer: Codable {
     var `origin`: String
     var `spki_sha256`: String
     var `system_trusted`: Bool
+    var `error`: TransportFailure? = nil
 }
 
 extension EventTlsPeer {
@@ -2211,6 +2212,7 @@ extension EventTlsPeer {
         case `origin`
         case `spki_sha256`
         case `system_trusted`
+        case `error`
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -2224,6 +2226,9 @@ extension EventTlsPeer {
         self.`origin` = try c.decode(String.self, forKey: .`origin`)
         self.`spki_sha256` = try c.decode(String.self, forKey: .`spki_sha256`)
         self.`system_trusted` = try c.decode(Bool.self, forKey: .`system_trusted`)
+        if !c.contains(.`error`) { self.`error` = nil } else {
+        self.`error` = try c.decodeIfPresent(TransportFailure.self, forKey: .`error`)
+        }
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -2235,6 +2240,7 @@ extension EventTlsPeer {
         try c.encode(self.`origin`, forKey: .`origin`)
         try c.encode(self.`spki_sha256`, forKey: .`spki_sha256`)
         try c.encode(self.`system_trusted`, forKey: .`system_trusted`)
+        try c.encode(self.`error`, forKey: .`error`)
         var tag = encoder.container(keyedBy: ModelDiscriminator.self)
         try tag.encode("tls_peer", forKey: .type)
     }

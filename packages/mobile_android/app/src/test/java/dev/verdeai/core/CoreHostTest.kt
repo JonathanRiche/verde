@@ -301,6 +301,27 @@ class CoreHostTest {
         }
     }
 
+    @Test fun probeDistinguishesUnavailableNetworkFromUntrustedCertificate() = runBlocking {
+        TlsFixture().use { fixture ->
+            val closedPort = java.net.ServerSocket(0, 1, java.net.InetAddress.getLoopbackAddress()).use { it.localPort }
+            val core = FakeCore()
+            val host = CoreHost.create(config, executor(), core)
+            try {
+                core.effects = listOf(EffectTlsProbe("network-probe", "1", "https://127.0.0.1:$closedPort"))
+                start(host)
+                val unavailable = core.next<EventTlsPeer>()
+                assertFalse(unavailable.system_trusted)
+                assertEquals(TransportFailureKind.network, unavailable.error?.kind)
+                assertTrue(unavailable.spki_sha256.isEmpty())
+                core.effects = listOf(EffectTlsProbe("certificate-probe", "1", fixture.origin))
+                host.send { n,w -> EventForeground(now_ms=n, wall_time_ms=w) }
+                val rejected = core.next<EventTlsPeer>()
+                assertFalse(rejected.system_trusted)
+                assertEquals(TransportFailureKind.tls, rejected.error?.kind)
+            } finally { host.close() }
+        }
+    }
+
     @Test fun websocketRoundTripAndProbe() = runBlocking {
         TlsFixture().use { fixture ->
             fixture.server.enqueue(MockResponse().setHeader("Sec-WebSocket-Protocol", "verde.v1").withWebSocketUpgrade(object : WebSocketListener() {

@@ -548,6 +548,7 @@ data class EventTlsPeer(
     val `origin`: String,
     val `spki_sha256`: String,
     val `system_trusted`: Boolean,
+    val `error`: TransportFailure? = null,
 ) : Event()
 
 @Serializable

@@ -158,7 +158,7 @@ and `sync_state` (`empty`, `loading`, `ready`, `stale`). These are orthogonal.
 | `timer_fired` | `timer_id,generation`; one-shot, at or after its deadline. Ignore cancelled IDs; if delivered early re-arm for the remaining delay. |
 | `secure_store_value` | `effect_id,generation,key,value_base64:string|null,error:PlatformFailure|null`; null without error means missing, not storage failure. |
 | `secure_store_done` | `effect_id,generation,key,error:PlatformFailure|null`; acknowledgement for put/delete, required before dependent auth/send effects. |
-| `tls_peer` | `effect_id,generation,origin,spki_sha256,system_trusted:bool`; preflight result for the same origin, before sending sensitive bytes (see below). |
+| `tls_peer` | `effect_id,generation,origin,spki_sha256,system_trusted:bool,error?:TransportFailure|null`; failed probes report an empty SPKI, `system_trusted:false`, and a typed error (network/timeouts retry; TLS rejection does not). Omitted error preserves the original trust-result behavior. Preflight result for the same origin, before sending sensitive bytes (see below). |
 | `terminal_applied` | `effect_id,generation,terminal_id,grid_revision,error:PlatformFailure|null`; acknowledgement that a PTY output batch reached its VT handle. |
 | `terminal_reply` | `terminal_id,bytes_base64`; raw VT-generated device reply, as described in §10. |
 | `push_received` | `workspace_id,thread_id,turn_id,kind`; a push the platform opened while this handle is loaded (K-17). Updates attention without another `notify`; see [push.md](push.md). |

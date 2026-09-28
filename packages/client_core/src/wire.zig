@@ -28,7 +28,7 @@ pub const Event = union(enum) {
     timer_fired: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, timer_id: []const u8, generation: []const u8 },
     secure_store_value: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, effect_id: []const u8, generation: []const u8, key: []const u8, value_base64: ?[]const u8, @"error": ?PlatformFailure },
     secure_store_done: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, effect_id: []const u8, generation: []const u8, key: []const u8, @"error": ?PlatformFailure },
-    tls_peer: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, effect_id: []const u8, generation: []const u8, origin: []const u8, spki_sha256: []const u8, system_trusted: bool },
+    tls_peer: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, effect_id: []const u8, generation: []const u8, origin: []const u8, spki_sha256: []const u8, system_trusted: bool, @"error": ?TransportFailure = null },
     terminal_applied: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, effect_id: []const u8, generation: []const u8, terminal_id: []const u8, grid_revision: []const u8, @"error": ?PlatformFailure },
     terminal_reply: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, terminal_id: []const u8, bytes_base64: []const u8 },
     pair: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, link: []const u8, device_label: []const u8, client_nonce: []const u8 },

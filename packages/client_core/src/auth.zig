@@ -459,7 +459,17 @@ pub fn complete(tx: *h.Transaction, p: h.Pending, event: V) E!bool {
         return true;
     }
     if (p.kind == .tls and eq(p.key, "auth_probe")) {
-        if (!eq(try h.string(event, "origin"), endpoint(tx).?) or !try h.boolean(event, "system_trusted")) {
+        if (!eq(try h.string(event, "origin"), endpoint(tx).?)) {
+            fail(tx, "tls_rejected", false);
+            return true;
+        }
+        // A probe may fail before seeing a certificate (offline, DNS, timeout).
+        // Only a reported trust failure is terminal; transport failures use backoff.
+        if (event.object.get("error")) |failure| if (failure != .null) {
+            if (eq(try h.string(failure, "kind"), "tls")) fail(tx, "tls_rejected", false) else try retry(tx, "auth_probe");
+            return true;
+        };
+        if (!try h.boolean(event, "system_trusted")) {
             fail(tx, "tls_rejected", false);
             return true;
         }

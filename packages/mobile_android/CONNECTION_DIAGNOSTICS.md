@@ -148,3 +148,25 @@ and conflates pending markdown updates while allowing the current parse to
 finish. A Compose regression exercises a blocked parse followed by multiple
 stream updates, checking completion and the final displayed text. The existing
 send regression checks the local prompt overlay before any server response.
+
+### Recovery after a failed TLS preflight
+
+Android previously converted every TLS-probe exception into
+`system_trusted=false`, including connection refusal, DNS failure, and timeout.
+The core interpreted that as a non-retryable certificate rejection and kept
+`auth.blocked` in memory across foreground/network changes. Recreating the host
+cleared it, explaining one concrete path where restarting the app was necessary.
+
+The probe now reports a typed, content-free transport failure separately from
+its trust result. The core backs off and repeats network/timeout failures;
+certificate failures still block, and no credential request precedes successful
+TLS validation and pinned discovery. Regressions cover paired-session resume,
+network/timeout retry, and certificate rejection. This establishes the defect,
+not that it caused every reported loop: the observed phone resumed successfully
+before the fix, and no trace of the owner's original stuck session was captured.
+
+The updated APK was installed on the connected phone. After about 62 seconds
+in the background, the same process reopened its socket and reached ready +
+synced about 1.3 seconds after foregrounding. No daemon/gateway restart or test
+prompt was needed. This validates normal resume; the transient-failure recovery
+is validated with isolated fixtures rather than by interrupting the owner's VPN.
