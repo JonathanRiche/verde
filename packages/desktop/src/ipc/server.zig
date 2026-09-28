@@ -20,6 +20,9 @@ const platform_runtime = @import("platform_runtime");
 const provider_types = @import("../providers/types.zig");
 const terminal = @import("../terminal/terminal.zig");
 const workspace_process_poll = @import("../cli/workspace_process_poll.zig");
+const daemon_client = @import("../daemon/client.zig");
+
+const log = std.log.scoped(.live_ipc);
 const test_backend = if (builtin.is_test) @import("desktop_test_root").test_backend else struct {};
 
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -3137,11 +3140,32 @@ fn workspaceAcquireLeaseResponse(allocator: std.mem.Allocator, id_value: std.jso
     if (!force and workspaceProcessConflictCount(state, project_index, owner, resources.items()) > 0) {
         return try workspaceCheckCommandResponse(allocator, id_value, state, params, true);
     }
-    const lease = state.acquireWorkspaceLease(project_index, owner, command, resources.items(), ttl_ms, force) catch |err| switch (err) {
+    // The session daemon owns the lease registry; every volatile projection
+    // replaces `workspace_leases` with the daemon's list, so a GUI-only lease
+    // would vanish within a second. Acquire there first, then mirror locally
+    // under the daemon's lease id so reads before the next projection agree.
+    var daemon_arena = std.heap.ArenaAllocator.init(allocator);
+    defer daemon_arena.deinit();
+    const daemon_lease = switch (daemonLeaseAcquire(daemon_arena.allocator(), state, project_index, owner, command, resources.items(), ttl_ms, force)) {
+        .acquired => |value| value,
+        .conflict => return try workspaceCheckCommandResponse(allocator, id_value, state, params, true),
+        .failed => |message| return try errorResponseAlloc(allocator, id_value, "daemon_error", message),
+        .unavailable => null,
+    };
+    // Mirror with force: the daemon already arbitrated, and stale projected
+    // entries are replaced by the next projection anyway.
+    const lease = state.acquireWorkspaceLease(project_index, owner, command, resources.items(), ttl_ms, force or daemon_lease != null) catch |err| switch (err) {
         error.LeaseConflict => return try workspaceCheckCommandResponse(allocator, id_value, state, params, true),
         error.LeaseOwnerRequired, error.LeaseResourcesRequired => return try errorResponseAlloc(allocator, id_value, "invalid_request", @errorName(err)),
         else => return err,
     };
+    if (daemon_lease) |acquired| {
+        const daemon_id = try state.allocator.dupe(u8, acquired.lease_id);
+        state.allocator.free(lease.id);
+        lease.id = daemon_id;
+        if (acquired.expires_at_ms) |expires_at_ms| lease.expires_at_ms = expires_at_ms;
+        if (acquired.created_at_ms) |created_at_ms| lease.created_at_ms = created_at_ms;
+    }
     if (force) notifyForcedWorkspaceConflictOwners(state, project_index, owner, command, resources.items());
 
     return try okValueResponse(allocator, id_value, .{
@@ -3164,7 +3188,8 @@ fn workspaceReleaseLeaseResponse(allocator: std.mem.Allocator, id_value: std.jso
     const owner = stringParam(params, "owner") orelse
         return try errorResponseAlloc(allocator, id_value, "invalid_request", "workspace.releaseLease requires owner");
     const lease_id = stringParam(params, "lease_id") orelse stringParam(params, "id");
-    const released = state.releaseWorkspaceLease(project_index, owner, lease_id);
+    const daemon_released = daemonLeaseRelease(allocator, state, project_index, owner, lease_id);
+    const released = @max(state.releaseWorkspaceLease(project_index, owner, lease_id), daemon_released);
     return try okValueResponse(allocator, id_value, .{
         .released = released,
         .workspace_index = project_index,
@@ -3172,6 +3197,111 @@ fn workspaceReleaseLeaseResponse(allocator: std.mem.Allocator, id_value: std.jso
         .lease_id = lease_id,
         .owner = owner,
     });
+}
+
+const DAEMON_LEASE_TIMEOUT_MS: u32 = 1_500;
+
+const DaemonLeaseAcquire = union(enum) {
+    acquired: struct {
+        lease_id: []const u8,
+        created_at_ms: ?i64,
+        expires_at_ms: ?i64,
+    },
+    conflict,
+    failed: []const u8,
+    /// No reachable daemon (or a test build): fall back to the local list.
+    unavailable,
+};
+
+fn daemonLeaseWorkspaceRef(state: *app_state.AppState, project_index: usize) headless.registry.WorkspaceRef {
+    const project = &state.project_controller.projects.items[project_index];
+    return .{ .workspace_id = project.id };
+}
+
+/// `arena` owns the returned strings.
+fn daemonLeaseAcquire(
+    arena: std.mem.Allocator,
+    state: *app_state.AppState,
+    project_index: usize,
+    owner: []const u8,
+    command: []const u8,
+    resources: []const []const u8,
+    ttl_ms: i64,
+    force: bool,
+) DaemonLeaseAcquire {
+    if (builtin.is_test) return .unavailable;
+    var transport: daemon_client.HeadlessTransport = .{
+        .allocator = arena,
+        .pref_path = state.storage.pref_path,
+        .timeout_ms = DAEMON_LEASE_TIMEOUT_MS,
+    };
+    var client = daemon_client.headlessClient(arena, &transport);
+    var parsed = client.call("lease.acquire", headless.registry.LeaseAcquireRequest{
+        .workspace = daemonLeaseWorkspaceRef(state, project_index),
+        .owner = owner,
+        .command = command,
+        .resources = resources,
+        .force = force,
+        .ttl_ms = ttl_ms,
+    }) catch |err| {
+        log.warn("daemon lease.acquire unavailable, using local lease: {s}", .{@errorName(err)});
+        return .unavailable;
+    };
+    defer parsed.deinit();
+    if (parsed.response.err) |err| {
+        if (std.mem.eql(u8, err.code, headless.protocol.ERR_CONFLICT)) return .conflict;
+        return .{ .failed = arena.dupe(u8, err.message) catch "daemon lease.acquire failed" };
+    }
+    const result = parsed.response.result orelse return .{ .failed = "daemon lease.acquire returned no result" };
+    if (result != .object) return .{ .failed = "daemon lease.acquire returned an invalid result" };
+    const lease_id = switch (result.object.get("lease_id") orelse .null) {
+        .string => |value| arena.dupe(u8, value) catch return .{ .failed = "out of memory" },
+        else => return .{ .failed = "daemon lease.acquire returned no lease_id" },
+    };
+    return .{ .acquired = .{
+        .lease_id = lease_id,
+        .created_at_ms = jsonI64Field(result, "created_at_ms"),
+        .expires_at_ms = jsonI64Field(result, "expires_at_ms"),
+    } };
+}
+
+fn jsonI64Field(object: std.json.Value, name: []const u8) ?i64 {
+    return switch (object.object.get(name) orelse .null) {
+        .integer => |value| value,
+        else => null,
+    };
+}
+
+/// Returns the daemon's released count; 0 when the daemon is unreachable.
+fn daemonLeaseRelease(
+    allocator: std.mem.Allocator,
+    state: *app_state.AppState,
+    project_index: usize,
+    owner: []const u8,
+    lease_id: ?[]const u8,
+) usize {
+    if (builtin.is_test) return 0;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var transport: daemon_client.HeadlessTransport = .{
+        .allocator = arena.allocator(),
+        .pref_path = state.storage.pref_path,
+        .timeout_ms = DAEMON_LEASE_TIMEOUT_MS,
+    };
+    var client = daemon_client.headlessClient(arena.allocator(), &transport);
+    var parsed = client.call("lease.release", headless.registry.LeaseReleaseRequest{
+        .workspace = daemonLeaseWorkspaceRef(state, project_index),
+        .owner = owner,
+        .lease_id = lease_id,
+    }) catch |err| {
+        log.warn("daemon lease.release unavailable: {s}", .{@errorName(err)});
+        return 0;
+    };
+    defer parsed.deinit();
+    const result = parsed.response.result orelse return 0;
+    if (result != .object) return 0;
+    const count = jsonI64Field(result, "released_count") orelse return 0;
+    return @intCast(@max(count, 0));
 }
 
 /// Registers a GUI-side waiter that resumes a blocked chat (through the
