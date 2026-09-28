@@ -46,7 +46,15 @@ export function decorateFileCitations(body: string): string {
 /// links at `/api/file` so the in-app reader can intercept them.
 export function decorateWorkspaceFileLinks(body: string): string {
   return body.replace(MARKDOWN_FILE_LINK_RE, (_match, label: string, path: string) => {
-    const href = workspaceFileUrl(path)
+    // Markdown destinations are URLs; decode once before encoding the filesystem
+    // path into the API query (notably macOS's Application%20Support directory).
+    let decoded = path
+    try {
+      decoded = decodeURIComponent(path)
+    } catch {
+      // Preserve literal percent signs in paths that are not valid URI escapes.
+    }
+    const href = workspaceFileUrl(decoded)
     return `[${label}](${href})`
   })
 }
