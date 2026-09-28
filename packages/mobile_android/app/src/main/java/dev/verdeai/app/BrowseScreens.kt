@@ -237,6 +237,7 @@ private fun ThreadItem(thread: ThreadSummary, now: Long, workspaceLabel: String?
         listOf("Open" to { onOpen(thread) }, "Copy title" to { clipboard.setText(AnnotatedString(thread.title)) }),
         leading = { Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             ProviderGlyph(thread.provider)
+            GitChangesDot(GitChat(thread.workspace_id, thread.thread_id))
             Dot(statusColor(thread.status, thread.status == "waiting_approval"), statusLabel(thread.status), activeStatus(thread.status))
         } })
 }

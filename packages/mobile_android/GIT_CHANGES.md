@@ -1,0 +1,56 @@
+# Per-chat git changes on Android
+
+`GitChangesClient` is the presentation boundary. The production adapter is pending
+shared-core support; `LocalGitChangesClient` is null until an adapter is supplied.
+No fixture data, daemon RPC bypass, or local git commands are used in production.
+
+The Compose header, sheet, confirmations, snackbar, settings section, and row
+markers consume this boundary. The model freezes the returned review, tracks
+file/hunk selections, and keeps typed text separate from generated suggestions.
+Shared, unclear, and unassigned files start unticked. Quick commit & push falls
+back to review for those files, an active turn, or detached HEAD. Default branches
+require confirmation. Branch creation uses the generated suggestion when present.
+
+## Adapter obligations once the mobile core lands
+
+- Map the shared git-changes selector to `GitSnapshot`, scoped to the selected
+  host; clear prior host data and in-flight presentation models on host changes.
+- Supply `LocalGitChangesClient` around the app shell, so thread and drawer
+  markers, chat headers, and settings share one snapshot.
+- Refresh on focus/foreground, chat-turn changes, and successful commits.
+  Coalesce event refreshes; do not poll. Core owns journal invalidation.
+- Use only core review/message/commit/push/pull-push intents and receipt outcomes.
+  Message generation and commit operations need the core's long timeouts.
+- One UI commit call represents one user intent. For uncertain delivery, core
+  resends the same review id, consumes `in_progress`, and resolves the stored
+  result. Invoke `onChecking` and keep `commit` suspended until a terminal result;
+  never throw `in_progress` as a terminal failure or create a fresh review to retry.
+  Android shows “Checking commit…” and keeps actions disabled during recovery.
+- Automatically refresh reviews only for `review_expired` or
+  `changed_since_review`. A refreshed review requires a new user confirmation.
+- Map access from chat:write + repository:read (Chat and Full). Monitor can review
+  but cannot mutate. Remote-runtime chats remain unavailable.
+- Forward immutable review ids, selected roots/files/hunk indices, new_branch,
+  and optional branch_name. Missing hunk lists mean whole file. Truncated/binary
+  previews remain eligible for whole-file commits. Request a bounded hunk budget.
+- Map status/review branch facts (default branch, upstream, ahead, behind, remote)
+  and plain push. Preserve each push request_id through core recovery. Pull & push
+  appears only after rejection; a rejected push preserves the successful commit.
+- Read commit settings from config; paired devices cannot change them.
+- Render system/git/git-commit-* transcript rows as quiet one-line notices.
+
+Create PR remains hidden. This lane does not change daemon protocol, generated
+models, or shared core. The updated daemon protocol exists in the owner's main
+checkout and must be relaunched by the owner before live verification.
+
+## Checks
+
+`GitChangesTest` uses synthetic `/scratch` fixtures for selection, main-branch
+confirmation, feature-branch quick commit, attention/running fallback, branch
+creation, uncertain-delivery presentation, rejected push, error mapping, scope
+gating, settings, transcript notices, and row markers.
+
+Run `mise run mobile-android-build` and `mise run mobile-android-test` from the
+worktree root with the required build lease. After wiring and the owner's daemon
+relaunch, device checks must use a scratch workspace/repository and a disposable
+local bare remote only, never an owner repository or real remote.
