@@ -5,7 +5,11 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.test.*
-import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.activity.ComponentActivity
+import org.junit.Before
+import org.robolectric.Shadows
+import org.robolectric.shadows.ShadowDisplay
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.flow.MutableStateFlow
 import dev.verdeai.core.ChatRow
@@ -17,12 +21,21 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import org.robolectric.annotation.GraphicsMode
 
 /** Synthetic protocol-shaped fixtures only. No repository commands or live providers. */
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [35], qualifiers = "w411dp-h1100dp")
+@Config(sdk = [35], qualifiers = "w411dp-h891dp-mdpi")
+// Native text metrics and dialog hit testing are required for real sheet taps.
+@GraphicsMode(GraphicsMode.Mode.NATIVE)
 class GitChangesTest {
-    @get:Rule val compose = createComposeRule()
+    @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()
+    @Before fun phoneWindow() {
+        Shadows.shadowOf(ShadowDisplay.getDefaultDisplay()).apply {
+            setWidth(411); setHeight(891); setRealWidth(411); setRealHeight(891); setDensity(1f)
+        }
+        compose.activity.window.setLayout(411, 891)
+    }
     private val models = ViewModelStore()
     @After fun closeModels() { models.clear() }
     private val chat = GitChat("workspace", "thread")
@@ -53,15 +66,15 @@ class GitChangesTest {
         override suspend fun message(reviewId: String, selections: List<GitSelection>): GitMessage {
             messages++; messageGate?.await(); return GitMessage("Improve mobile flow", "codex", "fast", "feature/mobile-flow")
         }
-        override suspend fun commit(reviewId: String, message: String, selections: List<GitSelection>, push: Boolean, newBranch: Boolean, branchName: String?, onChecking: () -> Unit): GitCommitResult {
+        override suspend fun commit(reviewId: String, message: String, selections: List<GitSelection>, push: Boolean, newBranch: Boolean, branchName: String?, onChecking: (Boolean) -> Unit): GitCommitResult {
             commits++; committedMessage = message; committedSelections = selections; committedPush = push
             committedNewBranch = newBranch; committedBranchName = branchName
-            if (checking) onChecking()
+            if (checking) onChecking(true)
             commitGate?.await()
             failure?.let { throw GitFailure(it) }
             return GitCommitResult(listOf(GitRepoCommit("/scratch", "123abcd", selections.sumOf { it.files.size }, outcome)))
         }
-        override suspend fun push(chat: GitChat, root: String, pull: Boolean, requestId: String): GitPush { pushes++; pulled = pull; return GitPush.Pushed }
+        override suspend fun push(chat: GitChat, root: String, pull: Boolean, requestId: String, onChecking: (Boolean) -> Unit): GitPush { pushes++; pulled = pull; return GitPush.Pushed }
     }
     private fun mount(fake: Fake): GitChangesModel {
         val model = GitChangesModel(chat, fake)
@@ -90,7 +103,7 @@ class GitChangesTest {
         assertEquals(listOf(0), model.state.value.selections.single().files.single().hunks)
         assertEquals(1 to 1, model.state.value.totals)
         compose.onNodeWithTag("git-message").performTextInput("My precise message")
-        compose.onNodeWithTag("git-submit").performClick()
+        compose.onNodeWithTag("git-submit").assertIsDisplayed().assertIsEnabled().performClick()
         await { fake.commits == 1 && !model.state.value.busy }
         assertEquals("My precise message", fake.committedMessage)
         assertFalse(fake.committedPush)
@@ -196,7 +209,7 @@ class GitChangesTest {
         }
         assertEquals(0, fake.commits)
         compose.onNodeWithTag("git-submit").assertDoesNotExist()
-        compose.onNodeWithText(GitAccess.ReadOnly.reason!!).assertExists()
+        compose.onAllNodesWithText(GitAccess.ReadOnly.reason!!).assertCountEquals(2)
     }
 
     @Test fun remoteShowsReasonAndNeverRequestsReview() {
@@ -295,7 +308,7 @@ class GitChangesTest {
         val model = mount(fake)
         compose.runOnIdle { model.open() }
         await { model.state.value.generated != null }
-        compose.onNodeWithTag("git-new-branch").performClick()
+        compose.onNodeWithTag("git-new-branch").assertIsDisplayed().assertIsEnabled().performClick()
         await { fake.commits == 1 && !model.state.value.busy }
         assertTrue(fake.committedNewBranch)
         assertFalse(fake.committedPush)
@@ -307,7 +320,7 @@ class GitChangesTest {
         val model = mount(fake)
         compose.runOnIdle { model.open() }
         await { model.state.value.generated != null }
-        compose.onNodeWithTag("git-submit").performClick()
+        compose.onNodeWithTag("git-submit").assertIsDisplayed().assertIsEnabled().performClick()
         await { model.state.value.checking }
         compose.onNodeWithTag("git-submit").assertTextContains("Checking commit…").assertIsNotEnabled()
         compose.runOnIdle { model.commit(); model.dismiss(); model.open() }

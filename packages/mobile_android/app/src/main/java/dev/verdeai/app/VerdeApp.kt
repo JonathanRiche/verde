@@ -50,8 +50,10 @@ private val TABS = listOf(Routes.HOME, Routes.WORKSPACES, Routes.HOSTS)
 internal fun VerdeApp(hosts: HostsModel, browse: BrowseModel, clock: UiClock = remember { UiClock() },
     lock: AppLockControls? = null) {
     val hostsState by hosts.state.collectAsState()
+    val gitBinding: GitChangesBinding = viewModel(factory = viewModelFactory { initializer { GitChangesBinding(hosts, browse.state) } })
+    val gitClient by gitBinding.client.collectAsState()
     VerdeTheme {
-        CompositionLocalProvider(LocalUiClock provides clock, LocalAppLockControls provides lock) {
+        CompositionLocalProvider(LocalUiClock provides clock, LocalAppLockControls provides lock, LocalGitChangesClient provides gitClient) {
             val app = @Composable { if (hostsState.loading) HostsScreen(hosts) else Shell(hosts, browse, hostsState) }
             if (lock != null) AppLockGate(lock.model, lock.auth, app) else app()
         }

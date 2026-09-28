@@ -23,7 +23,7 @@ import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 
-/** No fake production data: absent until the shared-core adapter is installed. */
+/** Shared host-scoped core boundary; null while no host is selected. */
 internal val LocalGitChangesClient = staticCompositionLocalOf<GitChangesClient?> { null }
 
 @Composable
@@ -82,6 +82,7 @@ internal fun GitChangesHeader(model: GitChangesModel) {
                 }
             }
         }
+        if (state.canRetry) TextButton(onClick = model::retry) { Text("Check again") }
         if (!writable) Text(access.reason!!, style = MaterialTheme.typography.bodySmall, color = VerdeColors.Subtle)
     }
 }
@@ -112,6 +113,8 @@ internal fun GitChangesLayer(model: GitChangesModel) {
                     Text("Couldn't generate a message.", color = VerdeColors.Warning)
                     TextButton(onClick = model::regenerate) { Text("Regenerate message") }
                 }
+                if (state.canRetry) TextButton(onClick = model::retry) { Text("Check again") }
+                if (state.checking && !state.confirmingMain) Text("Checking commit…", color = VerdeColors.Muted)
                 state.generated?.branch?.let { Text("New branch · $it", style = MaterialTheme.typography.bodySmall, color = VerdeColors.Muted) }
                 if (state.confirmingMain) TextButton(onClick = { model.commit(newBranch = true) }, enabled = model.canCommit()) { Text("Create branch & continue") }
             } },
@@ -140,7 +143,7 @@ private fun GitCommitSheet(model: GitChangesModel, state: GitChangesState) {
         LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             state.review?.repos.orEmpty().forEach { repo ->
                 item(key = "branch:${repo.branch.root}") { GitBranchCard(repo.branch) }
-                items(repo.files, key = { GitFileKey(repo.branch.root, it.path) }) { file -> GitFileRow(model, state, repo, file, writable) }
+                items(repo.files, key = { "file:${repo.branch.root.length}:${repo.branch.root}${it.path}" }) { file -> GitFileRow(model, state, repo, file, writable) }
             }
             if (state.review != null && state.review.repos.all { it.files.isEmpty() }) item { Text("No uncommitted changes for this chat.", Modifier.padding(vertical = 16.dp), color = VerdeColors.Muted) }
         }
@@ -160,6 +163,7 @@ private fun GitCommitSheet(model: GitChangesModel, state: GitChangesState) {
             state.generated?.let { Text("${it.provider} · ${it.model}", style = MaterialTheme.typography.labelSmall, color = VerdeColors.Subtle) }
             if (state.messageError) Text("Couldn't generate a message. Write one or regenerate.", style = MaterialTheme.typography.bodySmall, color = VerdeColors.Warning)
         }
+        if (state.canRetry) TextButton(onClick = model::retry) { Text("Check again") }
         state.error?.let { Text(it, Modifier.padding(vertical = 6.dp).semantics { liveRegion = LiveRegionMode.Polite }, color = VerdeColors.Warning, style = MaterialTheme.typography.bodySmall) }
         if (state.review == null && !state.loading) TextButton(onClick = { model.open(state.action) }) { Text("Refresh review") }
         if (writable) TextButton(onClick = { model.commit(newBranch = true) }, enabled = model.canCommit(), modifier = Modifier.testTag("git-new-branch")) { Text("Commit on new branch") }
