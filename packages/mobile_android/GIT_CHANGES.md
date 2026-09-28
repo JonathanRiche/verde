@@ -1,7 +1,8 @@
 # Per-chat git changes on Android
 
-`GitChangesClient` is the presentation boundary. The production adapter is pending
-shared-core support; `LocalGitChangesClient` is null until an adapter is supplied.
+`GitChangesClient` is the presentation boundary. `CoreGitChangesClient` adapts the
+shared core selectors, intents, and operation receipts. `GitChangesBinding` supplies
+a host-scoped client around the app shell and retires it on host changes.
 No fixture data, daemon RPC bypass, or local git commands are used in production.
 
 The Compose header, sheet, confirmations, snackbar, settings section, and row
@@ -11,7 +12,7 @@ Shared, unclear, and unassigned files start unticked. Quick commit & push falls
 back to review for those files, an active turn, or detached HEAD. Default branches
 require confirmation. Branch creation uses the generated suggestion when present.
 
-## Adapter obligations once the mobile core lands
+## Core integration
 
 - Map the shared git-changes selector to `GitSnapshot`, scoped to the selected
   host; clear prior host data and in-flight presentation models on host changes.
@@ -23,9 +24,11 @@ require confirmation. Branch creation uses the generated suggestion when present
   Message generation and commit operations need the core's long timeouts.
 - One UI commit call represents one user intent. For uncertain delivery, core
   resends the same review id, consumes `in_progress`, and resolves the stored
-  result. Invoke `onChecking` and keep `commit` suspended until a terminal result;
+  result. The adapter invokes `onChecking` and keeps `commit` suspended until a terminal result;
   never throw `in_progress` as a terminal failure or create a fresh review to retry.
-  Android shows “Checking commit…” and keeps actions disabled during recovery.
+  Android shows “Checking commit…” and keeps new mutations disabled during recovery.
+  When core exposes `can_retry`, “Check again” sends `git_retry` for the original
+  operation; it does not submit another commit.
 - Automatically refresh reviews only for `review_expired` or
   `changed_since_review`. A refreshed review requires a new user confirmation.
 - Map access from chat:write + repository:read (Chat and Full). Monitor can review
@@ -40,8 +43,8 @@ require confirmation. Branch creation uses the generated suggestion when present
 - Render system/git/git-commit-* transcript rows as quiet one-line notices.
 
 Create PR remains hidden. This lane does not change daemon protocol, generated
-models, or shared core. The updated daemon protocol exists in the owner's main
-checkout and must be relaunched by the owner before live verification.
+models, or shared core. It is based on shared-core commit `2bf18894`. The updated
+daemon protocol must be relaunched by the owner before live verification.
 
 ## Checks
 
@@ -51,6 +54,6 @@ creation, uncertain-delivery presentation, rejected push, error mapping, scope
 gating, settings, transcript notices, and row markers.
 
 Run `mise run mobile-android-build` and `mise run mobile-android-test` from the
-worktree root with the required build lease. After wiring and the owner's daemon
+worktree root with the required build lease. After the owner's daemon
 relaunch, device checks must use a scratch workspace/repository and a disposable
 local bare remote only, never an owner repository or real remote.

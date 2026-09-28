@@ -123,7 +123,7 @@ internal fun ThreadRoute(hosts: HostsModel, browse: BrowseModel, manage: ManageM
     val title = browseState.workspaces?.items?.find { it.workspace_id == workspaceId }?.threads?.find { it.thread_id == threadId }?.title
     val manageState by manage.state.collectAsState()
     val gitClient = LocalGitChangesClient.current
-    val git = if (gitClient == null) null else viewModel<GitChangesModel>(key = "git:${browseState.hostId}:$workspaceId:$threadId",
+    val git = if (gitClient == null) null else viewModel<GitChangesModel>(key = "git:${browseState.hostId}:${System.identityHashCode(gitClient)}:$workspaceId:$threadId",
         factory = viewModelFactory { initializer { GitChangesModel(GitChat(workspaceId, threadId), gitClient) } })
     val lifecycleState by LocalLifecycleOwner.current.lifecycle.currentStateFlow.collectAsState()
     LaunchedEffect(git, lifecycleState) { if (lifecycleState == Lifecycle.State.RESUMED) git?.focus() }
