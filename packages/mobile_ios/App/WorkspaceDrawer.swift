@@ -123,6 +123,7 @@ struct WorkspaceDrawer: View {
                 ProviderGlyph(provider: thread.provider)
                 Text(thread.title.isEmpty ? "New chat" : thread.title).lineLimit(1)
                 Spacer(minLength: 0)
+                GitThreadDot(browse: browse, workspace: thread.workspace_id, thread: thread.thread_id)
                 StatusPip(active: activeTurn(thread.status), attention: thread.status == "waiting_approval", failed: thread.status == "failed")
             }.font(VerdeTheme.ui(13)).padding(.horizontal, 12).frame(minHeight: 44).contentShape(Rectangle())
                 .background(selected == target ? VerdeTheme.accent.opacity(0.19) : Color.clear, in: RoundedRectangle(cornerRadius: 7))

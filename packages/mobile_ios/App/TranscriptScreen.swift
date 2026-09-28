@@ -36,6 +36,7 @@ struct TranscriptScreen: View {
         .navigationTitle(model?.thread?.thread.title ?? fallbackTitle ?? "Chat")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
+            ToolbarItem(placement: .topBarTrailing) { GitChatControls(browse: browse, workspace: workspaceID, thread: threadID) }
             ToolbarItem(placement: .topBarTrailing) {
                 ManageContainer(browse: browse) { manage in ThreadActions(workspace: workspaceID, thread: threadID, title: model?.thread?.thread.title ?? fallbackTitle ?? "Chat", manage: manage) }
             }
@@ -322,7 +323,10 @@ private struct TranscriptRow: View {
             ToolGroupCard(id: item.id, rows: rows, subagent: subagent, turnStartedAt: turnStartedAt, disclosure: model.disclosure)
         case .think(let row): ThinkCard(row: row, model: model)
         case .diff(let row): DiffCard(id: row.id, text: row.body, source: model, disclosure: model.disclosure)
-        case .notice(let row): NoticeRow(row: row, model: model)
+        case .notice(let row):
+            if row.author == "git" {
+                Text(row.body).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted).lineLimit(1).frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 12).padding(.vertical, 6)
+            } else { NoticeRow(row: row, model: model) }
         case .usage(_, let usage): UsageCard(usage: usage)
         case .working(let turn, let waiting): WorkingRow(turn: turn, waitingApproval: waiting)
         case .approval(let approval): ApprovalCard(approval: approval, controller: model.approvals, disclosure: model.disclosure)

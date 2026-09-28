@@ -100,6 +100,7 @@ private struct MenuRow: View {
 }
 
 private struct PaneItem: View {
+    let browse: BrowseModel
     let pane: Pane
     let now: Int64
     var body: some View {
@@ -107,10 +108,12 @@ private struct PaneItem: View {
                                     dot: Dot(color: VerdeTheme.status(pane.status, attention: pane.attention), label: paneLabel(pane)),
                                     badge: attentionLabel(pane.attention_kind)),
                 destination: route(pane), copies: [("Copy title", pane.title)])
+            .overlay(alignment: .topTrailing) { if let thread = pane.thread_id { GitThreadDot(browse: browse, workspace: pane.workspace_id, thread: thread).padding(8) } }
     }
 }
 
 private struct ThreadItem: View {
+    let browse: BrowseModel
     let thread: ThreadSummary
     let now: Int64
     var workspaceLabel: String?
@@ -122,6 +125,7 @@ private struct ThreadItem: View {
                                              label: statusLabel(thread.status)), provider: thread.provider),
                 destination: .thread(workspace: thread.workspace_id, thread: thread.thread_id),
                 copies: [("Copy title", thread.title)])
+            .overlay(alignment: .topTrailing) { GitThreadDot(browse: browse, workspace: thread.workspace_id, thread: thread.thread_id).padding(8) }
     }
 }
 
@@ -232,10 +236,10 @@ struct HomeScreen: View {
             let attention = panes.filter(\.attention)
             let running = panes.filter { !$0.attention }
             if !attention.isEmpty {
-                Section("Needs attention") { ForEach(attention, id: \.id) { PaneItem(pane: $0, now: now) } }
+                Section("Needs attention") { ForEach(attention, id: \.id) { PaneItem(browse: model, pane: $0, now: now) } }
             }
             if !running.isEmpty {
-                Section("Running") { ForEach(running, id: \.id) { PaneItem(pane: $0, now: now) } }
+                Section("Running") { ForEach(running, id: \.id) { PaneItem(browse: model, pane: $0, now: now) } }
             }
             if panes.isEmpty { Section { Text("Nothing is running or waiting on you.") } }
             let workspaces = state.workspaces?.items ?? []
@@ -243,7 +247,7 @@ struct HomeScreen: View {
             let recent = recentThreads(state.workspaces)
             if !recent.isEmpty {
                 Section("Recent chats") {
-                    ForEach(recent, id: \.thread_id) { ThreadItem(thread: $0, now: now, workspaceLabel: labels[$0.workspace_id]) }
+                    ForEach(recent, id: \.thread_id) { ThreadItem(browse: model, thread: $0, now: now, workspaceLabel: labels[$0.workspace_id]) }
                 }
             }
             let open = workspaces.filter(\.open)
@@ -308,7 +312,7 @@ struct WorkspaceScreen: View {
                 if !workspace.path.isEmpty { Text(workspace.path) .font(VerdeTheme.ui(13)).foregroundStyle(.secondary) }
                 Section("Panes") {
                     if workspace.panes.isEmpty { Text("No open panes.") }
-                    ForEach(workspace.panes, id: \.id) { PaneItem(pane: $0, now: now) }
+                    ForEach(workspace.panes, id: \.id) { PaneItem(browse: model, pane: $0, now: now) }
                     if canWrite(model.state.host) && !workspace.path.isEmpty {
                         NavigationLink(value: BrowseRoute.newTerminal(workspace: workspaceID, request: UUID())) {
                             Label("New terminal", systemImage: "plus.rectangle.on.rectangle")
@@ -320,12 +324,12 @@ struct WorkspaceScreen: View {
                 let archived = threads.filter(\.archived)
                 Section("Chats") {
                     if current.isEmpty { Text("No chats in this workspace yet.") }
-                    ForEach(current, id: \.thread_id) { ThreadItem(thread: $0, now: now) }
+                    ForEach(current, id: \.thread_id) { ThreadItem(browse: model, thread: $0, now: now) }
                     if !archived.isEmpty {
                         Button(showArchived ? "Hide archived (\(archived.count))" : "Show archived (\(archived.count))") {
                             showArchived.toggle()
                         }
-                        if showArchived { ForEach(archived, id: \.thread_id) { ThreadItem(thread: $0, now: now) } }
+                        if showArchived { ForEach(archived, id: \.thread_id) { ThreadItem(browse: model, thread: $0, now: now) } }
                     }
                 }
             } else {

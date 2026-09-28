@@ -82,6 +82,7 @@ struct AppSettings: View {
                     }
                     Text("Animations follow Reduce Motion in iOS Accessibility settings and the host theme when supplied.").font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted)
                 }
+                CommitSettingsSection(browse: browse)
                 SecuritySettings(lock: lock)
             }.scrollContentBackground(.hidden).background(VerdeTheme.background)
             .navigationTitle("Settings").navigationBarTitleDisplayMode(.inline)

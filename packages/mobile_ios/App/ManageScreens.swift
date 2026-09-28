@@ -43,7 +43,7 @@ struct HistoryScreen: View {
                     ForEach(sections[index].1, id: \.thread_id) { thread in
                         NavigationLink(value: BrowseRoute.thread(workspace: thread.workspace_id, thread: thread.thread_id)) {
                             VStack(alignment: .leading, spacing: 4) {
-                                Text(thread.title).lineLimit(2)
+                                HStack { Text(thread.title).lineLimit(2); Spacer(); GitThreadDot(browse: browse, workspace: thread.workspace_id, thread: thread.thread_id) }
                                 Text([thread.provider, thread.archived ? "Archived" : nil, thread.cwd].compactMap { $0 }.joined(separator: " · ")) .font(VerdeTheme.ui(12)).foregroundStyle(.secondary).lineLimit(1)
                             }
                         }

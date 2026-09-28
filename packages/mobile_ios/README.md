@@ -126,3 +126,23 @@ Connection checks should include foreground observation beyond 30 seconds,
 background/resume, and a fresh operation after reconnect. A cached transcript
 remaining visible or absence of a sampled Connecting banner alone does not prove
 that the socket stayed connected or that synchronization resumed.
+
+### Per-chat Git changes
+
+The chat header opens a frozen Git review, with file/hunk selection, generated
+commit messages, new-branch commits, and Commit & push. Chat and Full access can
+write; Monitor can review. Shared/unclear/unassigned files require the review
+sheet; unassigned files start unticked. Main/default-branch quick commits require
+confirmation. Commit-message settings are read-only on paired devices.
+
+The shared core owns scope checks and retained idempotent recovery. If a commit
+or push response is lost, the phone checks that same operation rather than
+creating a new commit. Pull & push is offered after rejection and never retried
+automatically. A system `git` transcript row is rendered as a quiet notice.
+
+`GitChangesTests` uses an injected fake core boundary; its review screenshot is
+an XCTest attachment named `git-review-sheet`. No fixture sends a real Git write.
+Live Git verification is deferred until the owner relaunches the daemon with the
+new `git.changes` protocol. Use a temporary repository/workspace afterward, and
+never push a device test to a real remote. The existing local signing/keychain
+setup is unchanged.
