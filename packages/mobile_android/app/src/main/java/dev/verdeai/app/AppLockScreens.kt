@@ -164,6 +164,11 @@ internal fun SecuritySettingsScreen(model: AppLockModel, auth: DeviceAuth, onBac
                         " On this Android version app lock keeps this on." else "",
                 checked = settings.secure_screen, enabled = state.loaded) { model.setSecureScreen(it) }
             state.saveError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+            LocalGitChangesClient.current?.let { client ->
+                val git by client.snapshot.collectAsState()
+                HorizontalDivider(color = VerdeColors.Border)
+                GitCommitSettingsSection(git.settings)
+            }
         }
     }
 }

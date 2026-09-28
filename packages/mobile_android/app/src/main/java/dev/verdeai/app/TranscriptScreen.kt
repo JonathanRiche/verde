@@ -33,6 +33,8 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
@@ -120,8 +122,13 @@ internal fun ThreadRoute(hosts: HostsModel, browse: BrowseModel, manage: ManageM
     val browseState by browse.state.collectAsState()
     val title = browseState.workspaces?.items?.find { it.workspace_id == workspaceId }?.threads?.find { it.thread_id == threadId }?.title
     val manageState by manage.state.collectAsState()
+    val gitClient = LocalGitChangesClient.current
+    val git = if (gitClient == null) null else viewModel<GitChangesModel>(key = "git:${browseState.hostId}:$workspaceId:$threadId",
+        factory = viewModelFactory { initializer { GitChangesModel(GitChat(workspaceId, threadId), gitClient) } })
+    val lifecycleState by LocalLifecycleOwner.current.lifecycle.currentStateFlow.collectAsState()
+    LaunchedEffect(git, lifecycleState) { if (lifecycleState == Lifecycle.State.RESUMED) git?.focus() }
     TranscriptScreen(model, title, onBack, onHosts, browse::refresh, onCitation,
-        canEditThread = manageState.view?.can_create_threads == true, onThreadAction = onThreadAction, bottomBar = { m, s -> ChatComposer(m, s) })
+        canEditThread = manageState.view?.can_create_threads == true, onThreadAction = onThreadAction, gitChanges = git, bottomBar = { m, s -> ChatComposer(m, s) })
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -136,6 +143,7 @@ internal fun TranscriptScreen(
     renderers: TranscriptRenderers = TranscriptRenderers.Default,
     canEditThread: Boolean = false,
     onThreadAction: ((ThreadSummary, String) -> Unit)? = null,
+    gitChanges: GitChangesModel? = null,
     /** D-08 swaps in the composer; the default is the stop bar. */
     bottomBar: @Composable (TranscriptModel, TranscriptState) -> Unit = { m, s -> StopBar(m, s) },
 ) {
@@ -149,6 +157,7 @@ internal fun TranscriptScreen(
     val context = TranscriptContext(model, now, onCitation, state.turn?.started_at_ms)
     val openDrawer = LocalWorkspaceMenu.current
     var chatMenu by remember { mutableStateOf(false) }
+    Box(Modifier.fillMaxSize()) {
     Column(Modifier.fillMaxSize()) {
         VerdeTopBar(
             title = {
@@ -184,6 +193,7 @@ internal fun TranscriptScreen(
                     }
                 }
             })
+        gitChanges?.let { GitChangesHeader(it) }
         transcriptBanner(state, now)?.let { banner ->
             BannerCard(banner, onRetry = { if (state.thread?.error != null) model.retry() else onRetryConnection() }, onHosts = onHosts)
         }
@@ -194,6 +204,8 @@ internal fun TranscriptScreen(
             }
         }
         bottomBar(model, state)
+    }
+    gitChanges?.let { GitChangesLayer(it) }
     }
 }
 
@@ -455,6 +467,10 @@ internal fun ThinkCard(row: ChatRow, ctx: TranscriptContext) {
 
 @Composable
 internal fun NoticeRow(row: ChatRow, ctx: TranscriptContext) {
+    if (isGitCommitRow(row)) {
+        GitCommitNotice(row.body)
+        return
+    }
     val colors = MaterialTheme.colorScheme
     Column(Modifier.fillMaxWidth().background(colors.secondaryContainer.copy(alpha = 0.6f), RoundedCornerShape(10.dp))
         .padding(horizontal = 12.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
@@ -515,4 +531,10 @@ internal fun StopBar(model: TranscriptModel, state: TranscriptState) {
                 colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)) { Text("Stop") }
         }
     }
+}
+
+@Composable
+internal fun GitCommitNotice(body: String) {
+    Text(body, Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp).testTag("git-commit-notice"),
+        style = MaterialTheme.typography.bodySmall, color = VerdeColors.Subtle, maxLines = 1, overflow = TextOverflow.Ellipsis)
 }

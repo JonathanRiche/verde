@@ -141,7 +141,10 @@ internal fun DrawerChat(thread: ThreadSummary, active: Boolean, canEdit: Boolean
 
     VerdeListRow(headlineContent = { Text(thread.title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
         leadingContent = { ProviderGlyph(thread.provider) },
-        trailingContent = { StatusPip(statusColor(thread.status, thread.status == "waiting_approval"), statusLabel(thread.status), active = activeStatus(thread.status)) },
+        trailingContent = { Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            GitChangesDot(GitChat(thread.workspace_id, thread.thread_id))
+            StatusPip(statusColor(thread.status, thread.status == "waiting_approval"), statusLabel(thread.status), active = activeStatus(thread.status))
+        } },
         modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp)
             .background(if (active) VerdeColors.AccentWash else VerdeColors.Panel, RoundedCornerShape(7.dp))
             .semantics { selected = active }
