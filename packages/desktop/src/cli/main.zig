@@ -4552,9 +4552,10 @@ fn mcpToolsList(allocator: std.mem.Allocator, out: output.Output, id_value: std.
     try writeMcpTypedTool(&s, "present_chat", "Present an existing durable chat thread in the desktop GUI without changing focus. Use this to recover a headless or deferred open_chat result.", &CHAT_PRESENT_MCP_INPUTS);
     try writeMcpTypedTool(&s, "set_chat_draft", "Stage or append a composer draft without sending it. Address either a live pane_id or a durable local_thread_id.", &CHAT_DRAFT_SET_MCP_INPUTS);
     try writeMcpTypedTool(&s, "get_chat_draft", "Read a staged composer draft without sending it. Address either a live pane_id or a durable local_thread_id.", &CHAT_DRAFT_GET_MCP_INPUTS);
-    try writeMcpTypedTool(&s, "report_chat_blocked", "Report a concrete blocker to the orchestrating parent, then yield. A follow-up chat turn resumes work. Use your current Verde turn_id.", &.{
+    try writeMcpTypedTool(&s, "report_chat_blocked", "Report a concrete blocker, then yield. Delegated chats notify their orchestrating parent; top-level chats notify the user. A follow-up chat turn resumes work. When blocked only by a busy shared resource (a held lease or a conflicting build/process), pass waiting_for_resources and Verde starts a follow-up turn in this chat once they are free. Use your current Verde turn_id.", &.{
         .{ .name = "turn_id", .type_name = "string", .description = "Your current Verde turn id.", .required = true },
         .{ .name = "reason", .type_name = "string", .description = "What input or dependency is needed to continue.", .required = true },
+        .{ .name = "waiting_for_resources", .type_name = "array", .items_type_name = "string", .description = "Optional workspace resources (build, deps, db, browser, port:<n>) whose release should resume this chat automatically." },
     });
     try writeMcpTypedTool(&s, "list_linked_chats", "List chats delegated by a parent conversation and their current status.", &CHAT_LINKS_MCP_INPUTS);
     try writeMcpTypedTool(&s, "clear_linked_chats", "Hide a specific linked chat or finished links. Does not cancel work, delete chats, or disable delivery.", &CHAT_LINKS_MCP_INPUTS);
@@ -4853,6 +4854,7 @@ const CHAT_SEND_MCP_INPUTS = [_]McpToolInput{
     .{ .name = "prompt", .type_name = "string", .description = "User prompt text for the new turn.", .required = true },
     .{ .name = "project_path", .type_name = "string", .description = "Optional provider working directory; defaults to VERDE_WORKSPACE_PATH. Required when that environment variable is absent." },
     .{ .name = "turn_id", .type_name = "string", .description = "Optional stable turn id for idempotent retry; minted when omitted." },
+    .{ .name = "title", .type_name = "string", .description = "Optional short title for this task (single line, at most 200 bytes). Set it when reusing a child chat for a new task so the chat list and orchestration drawer show the current task instead of the first one." },
 };
 
 const CHAT_FOLLOWUP_MCP_INPUTS = [_]McpToolInput{
@@ -5163,12 +5165,19 @@ fn mcpToolsCall(
         return try mcpToolLiveTextResult(allocator, out, id_value, resolved, tool_name);
     }
     if (std.mem.eql(u8, tool_name, "report_chat_blocked")) {
+        var wait_storage: [16][]const u8 = undefined;
+        const wait_for = mcpArgStringArray(arguments, "waiting_for_resources", &wait_storage) catch
+            return try mcpError(allocator, out, id_value, -32602, "waiting_for_resources must be an array of at most 16 strings");
+        const reason = mcpArgString(arguments, "reason") orelse return error.InvalidParams;
         const response = try chatDaemonCallEnvelopeAlloc(allocator, io, "chat.tasks.blocked", .{
             .task_id = mcpArgString(arguments, "turn_id") orelse return error.InvalidParams,
-            .reason = mcpArgString(arguments, "reason") orelse return error.InvalidParams,
+            .reason = reason,
         });
         defer allocator.free(response);
-        return mcpToolTextResult(allocator, out, id_value, response, tool_name);
+        if (wait_for.len == 0) return mcpToolTextResult(allocator, out, id_value, response, tool_name);
+        const combined = try reportBlockedWithResourceWaitAlloc(allocator, io, response, reason, wait_for);
+        defer allocator.free(combined);
+        return mcpToolTextResult(allocator, out, id_value, combined, tool_name);
     }
     if (std.mem.eql(u8, tool_name, "list_linked_chats") or std.mem.eql(u8, tool_name, "clear_linked_chats")) {
         const response = try chatDaemonCallEnvelopeAlloc(allocator, io, if (std.mem.eql(u8, tool_name, "list_linked_chats")) "chat.links.list" else "chat.links.clear", .{
@@ -5197,6 +5206,7 @@ fn mcpToolsCall(
             .turn_id = mcpArgString(arguments, "turn_id"),
             .task_owner = default_owner,
             .parent_thread_id = mcpArgString(arguments, "parent_thread_id"),
+            .title = mcpArgString(arguments, "title"),
         }) catch |err| return try mcpChatDaemonError(allocator, out, id_value, err);
         defer allocator.free(response);
         if (mcpTasksSupported(params)) {
@@ -5291,9 +5301,11 @@ fn mcpToolsCall(
             return try mcpError(allocator, out, id_value, -32602, "present_chat axis must be a string");
         }
 
+        // Presentation only needs existence and the store revision.
         const thread_response = chatDaemonCallEnvelopeAlloc(allocator, io, headless.store.METHOD_CHAT_THREAD_GET, .{
             .workspace_id = workspace_id,
             .local_thread_id = local_thread_id,
+            .message_limit = @as(u32, 0),
         }) catch |err| return try mcpChatDaemonError(allocator, out, id_value, err);
         defer allocator.free(thread_response);
         var thread_parsed = std.json.parseFromSlice(std.json.Value, allocator, thread_response, .{}) catch |err|
@@ -6205,6 +6217,8 @@ const ChatDaemonSendArgs = struct {
     project_path: []const u8,
     /// Stable id for idempotent retry; minted when null.
     turn_id: ?[]const u8 = null,
+    /// Explicit thread title for this task; replaces the current title.
+    title: ?[]const u8 = null,
 };
 
 /// Daemon-direct chat send: read the durable thread for its provider/model
@@ -6228,9 +6242,12 @@ fn chatDaemonSendEnvelopeAlloc(allocator: std.mem.Allocator, io: std.Io, send: C
     var client = daemon_client.headlessClient(arena, &transport);
     try chatDaemonRequireCapability(&client);
 
+    // Only settings and "has any message" are needed; a full transcript of a
+    // long-lived child can exceed the daemon response cap.
     var get = try client.call(headless.store.METHOD_CHAT_THREAD_GET, .{
         .workspace_id = send.workspace_id,
         .local_thread_id = send.local_thread_id,
+        .message_limit = @as(u32, 1),
     });
     defer get.deinit();
     // Pass the daemon's structured error through (not_found and friends).
@@ -6239,10 +6256,27 @@ fn chatDaemonSendEnvelopeAlloc(allocator: std.mem.Allocator, io: std.Io, send: C
 
     const turn_id = send.turn_id orelse try mintChatIdAlloc(arena, io, "cli-turn-");
     const fast_mode = if (thread.fast_mode) |value| std.mem.eql(u8, value, "on") else false;
+    const explicit_title: ?[]const u8 = if (send.title) |title| blk: {
+        const trimmed = std.mem.trim(u8, title, &std.ascii.whitespace);
+        break :blk if (trimmed.len == 0) null else trimmed;
+    } else null;
+    if (explicit_title) |title| {
+        // Reused children otherwise keep the title of their first task.
+        var retitle = try client.call("chat.tasks.retitle", .{
+            .workspace_id = send.workspace_id,
+            .local_thread_id = send.local_thread_id,
+            .title = title,
+        });
+        defer retitle.deinit();
+        if (!retitle.response.isOk()) return try daemonResponseEnvelopeAlloc(allocator, &retitle);
+    }
     // open_chat must be durable before a prompt exists, so it starts with a
     // pinned placeholder. The accepted turn owns the same first-prompt
-    // fallback used by GUI-created threads.
-    const thread_title = if (thread.messages.len == 0 and chat_threads.isPlaceholderThreadTitle(thread.title))
+    // fallback used by GUI-created threads. An explicit title is a real
+    // title, so it also suppresses automatic title generation.
+    const thread_title = if (explicit_title) |title|
+        title
+    else if (thread.messages.len == 0 and chat_threads.isPlaceholderThreadTitle(thread.title))
         try chat_threads.makeThreadTitle(arena, send.prompt)
     else
         thread.title;
@@ -7721,6 +7755,59 @@ fn mcpBeginResult(s: *std.json.Stringify, id_value: std.json.Value) !void {
 fn mcpArgString(arguments: std.json.Value, name: []const u8) ?[]const u8 {
     if (arguments != .object) return null;
     return jsonString(arguments.object.get(name) orelse .null);
+}
+
+/// Registers a GUI resource waiter for a reported blocker. The GUI owns
+/// leases and process state, so it decides when the resources are free and
+/// asks the daemon to resume the chat. A missing GUI leaves the report intact.
+fn reportBlockedWithResourceWaitAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    daemon_response: []const u8,
+    reason: []const u8,
+    resources: []const []const u8,
+) ![]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, daemon_response, .{}) catch
+        return allocator.dupe(u8, daemon_response);
+    defer parsed.deinit();
+    const result = if (parsed.value == .object) parsed.value.object.get("result") else null;
+    const ok = parsed.value == .object and (jsonBool(parsed.value.object.get("ok") orelse .null) orelse false);
+    if (!ok or result == null or result.? != .object) return allocator.dupe(u8, daemon_response);
+    const workspace_id = jsonString(result.?.object.get("workspace_id") orelse .null) orelse return allocator.dupe(u8, daemon_response);
+    const local_thread_id = jsonString(result.?.object.get("local_thread_id") orelse .null) orelse return allocator.dupe(u8, daemon_response);
+    const registered = blk: {
+        const live = sendLiveRequestAlloc(allocator, io, "workspace.waitForResources", .{
+            .workspace = workspace_id,
+            .workspace_id = workspace_id,
+            .local_thread_id = local_thread_id,
+            .resources = resources,
+            .reason = reason,
+        }, 1) catch break :blk false;
+        defer allocator.free(live);
+        var live_parsed = std.json.parseFromSlice(std.json.Value, allocator, live, .{}) catch break :blk false;
+        defer live_parsed.deinit();
+        break :blk live_parsed.value == .object and (jsonBool(live_parsed.value.object.get("ok") orelse .null) orelse false);
+    };
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try s.beginObject();
+    try s.objectField("ok");
+    try s.write(true);
+    try s.objectField("result");
+    try s.beginObject();
+    var it = result.?.object.iterator();
+    while (it.next()) |entry| {
+        try s.objectField(entry.key_ptr.*);
+        try s.write(entry.value_ptr.*);
+    }
+    try s.objectField("waiting_for_resources");
+    try s.write(resources);
+    try s.objectField("resource_wait");
+    try s.write(if (registered) "registered" else "unavailable: the Verde desktop app did not accept the wait (not running or workspace closed); resume manually");
+    try s.endObject();
+    try s.endObject();
+    return writer.toOwnedSlice();
 }
 
 fn mcpArgStringArray(arguments: std.json.Value, name: []const u8, storage: *[16][]const u8) ![]const []const u8 {

@@ -308,6 +308,8 @@ pub const PAIRED_RPC_METHODS = [_]PairedRpcMethod{
     .{ .method = "chat.subagent.open", .scope_mask = CHAT_WRITE },
     .{ .method = "chat.links.clear", .scope_mask = CHAT_WRITE },
     .{ .method = "chat.tasks.blocked", .scope_mask = CHAT_WRITE },
+    .{ .method = "chat.tasks.resume", .scope_mask = CHAT_WRITE },
+    .{ .method = "chat.tasks.retitle", .scope_mask = CHAT_WRITE },
     .{ .method = "chat.turn.start", .scope_mask = CHAT_WRITE },
     .{ .method = "provider.slash.run", .scope_mask = CHAT_WRITE },
     .{ .method = attachment_protocol.METHOD_CHAT_ATTACHMENT_CREATE, .scope_mask = CHAT_WRITE },

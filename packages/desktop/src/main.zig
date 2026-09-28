@@ -674,6 +674,7 @@ fn mainInner(init: std.process.Init) !void {
         if (live_server) |*server| {
             if (server.processPending(&state)) presentation_demand.request();
         }
+        live_ipc.pollResourceWaiters(&state);
         state.noteWorkspaceSwitchStage("pre_render_poll_complete");
 
         var observed_fb_width: c_int = 0;

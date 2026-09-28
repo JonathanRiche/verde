@@ -651,6 +651,10 @@ pub const StoreStatusResult = struct {
 pub const ThreadGetRequest = struct {
     workspace_id: []const u8,
     local_thread_id: []const u8,
+    /// Return at most this many of the earliest messages. Callers that only
+    /// need thread settings (and whether any message exists) pass a small
+    /// limit so long transcripts stay under the response cap.
+    message_limit: ?u32 = null,
 };
 
 /// A bounded thread-list row. Messages are deliberately absent from this DTO.

@@ -1262,6 +1262,15 @@ fn renderLinkedChatsDrawer(state: *app_state.AppState, rect: palette.Rect, layou
     }
 }
 
+/// Bounded, UTF-8-safe prefix of a child's one-line summary for the row meta.
+fn linkedChatSummarySnippet(summary: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, summary, " \t\r\n");
+    if (trimmed.len <= 300) return trimmed;
+    var end: usize = 300;
+    while (end > 0 and (trimmed[end] & 0xC0) == 0x80) end -= 1;
+    return trimmed[0..end];
+}
+
 fn renderLinkedChatRow(
     state: *app_state.AppState,
     row: palette.Rect,
@@ -1319,14 +1328,21 @@ fn renderLinkedChatRow(
     const meta_font = theme.scaledUi(11.0);
     var age_buf: [16]u8 = undefined;
     const age = linkedChatAgeLabel(&age_buf, entry.updated_at_ms);
-    var meta_buf: [160]u8 = undefined;
+    var meta_buf: [512]u8 = undefined;
+    // Children append their last result (or blocker) so the drawer doubles
+    // as an orchestration overview: task (title), state, and latest outcome.
+    const summary = linkedChatSummarySnippet(entry.summary);
     const meta_raw = if (entry.is_parent)
         (if (std.meta.stringToEnum(app_state.Provider, entry.provider)) |provider| runtime.providerLabel(provider) else entry.provider)
+    else if (age.len > 0 and summary.len > 0)
+        std.fmt.bufPrint(&meta_buf, "{s} \u{00B7} {s} \u{00B7} {s}", .{ entry.statusLabel(), age, summary }) catch entry.statusLabel()
+    else if (summary.len > 0)
+        std.fmt.bufPrint(&meta_buf, "{s} \u{00B7} {s}", .{ entry.statusLabel(), summary }) catch entry.statusLabel()
     else if (age.len > 0)
         std.fmt.bufPrint(&meta_buf, "{s} \u{00B7} {s}", .{ entry.statusLabel(), age }) catch entry.statusLabel()
     else
         entry.statusLabel();
-    var meta_trunc: [192]u8 = undefined;
+    var meta_trunc: [544]u8 = undefined;
     const meta = truncateUiLabel(&meta_trunc, meta_raw, row.x + row.w - pad_x - text_x, meta_font);
     const meta_color = switch (entry.status) {
         .waiting_approval, .failed, .aborted, .interrupted => status_color,
@@ -5543,6 +5559,56 @@ fn childNotification(role: app_state.ChatRole, body: []const u8) ?ChildNotificat
     return .{ .child_id = child_id, .status = status, .body = rest[status_end + 1 ..] };
 }
 
+/// Long child results collapse to a short preview; the full text stays one
+/// click away and in the child transcript.
+const CHILD_NOTIFICATION_COLLAPSED_LINES: usize = 6;
+const CHILD_NOTIFICATION_COLLAPSED_BYTES: usize = 480;
+
+const ChildNotificationView = struct {
+    text: []const u8,
+    collapsible: bool,
+    expanded: bool,
+};
+
+fn childNotificationKey(message_index: usize) u64 {
+    var hasher = std.hash.Wyhash.init(0xC41D0C41D0C41D0);
+    hasher.update(std.mem.asBytes(&message_index));
+    hasher.update("child_notification");
+    return hasher.final();
+}
+
+fn childNotificationCollapsedEnd(body: []const u8) usize {
+    var end: usize = @min(body.len, CHILD_NOTIFICATION_COLLAPSED_BYTES);
+    var lines: usize = 0;
+    for (body[0..end], 0..) |byte, index| {
+        if (byte != '\n') continue;
+        lines += 1;
+        if (lines == CHILD_NOTIFICATION_COLLAPSED_LINES) {
+            end = index;
+            break;
+        }
+    }
+    while (end > 0 and end < body.len and (body[end] & 0xC0) == 0x80) end -= 1;
+    return end;
+}
+
+fn childNotificationView(state: ?*app_state.AppState, message_index: ?usize, body: []const u8) ChildNotificationView {
+    const trimmed = std.mem.trim(u8, body, "\n\r\t ");
+    const end = childNotificationCollapsedEnd(trimmed);
+    // Avoid a toggle that would only reveal a few trailing characters.
+    if (end >= trimmed.len or trimmed.len - end < 16) return .{ .text = trimmed, .collapsible = false, .expanded = false };
+    const expanded = if (state) |app| (if (message_index) |index| app.isCardExpanded(childNotificationKey(index)) else false) else false;
+    return .{
+        .text = if (expanded) trimmed else std.mem.trimEnd(u8, trimmed[0..end], "\n\r\t "),
+        .collapsible = true,
+        .expanded = expanded,
+    };
+}
+
+fn childNotificationToggleHeight(view: ChildNotificationView) f32 {
+    return if (view.collapsible) theme.scaledUi(26.0) else 0.0;
+}
+
 fn transcriptDisplayBody(role: app_state.ChatRole, body: []const u8) []const u8 {
     return if (childNotification(role, body)) |notification| notification.body else body;
 }
@@ -5578,8 +5644,9 @@ fn transcriptCommittedMessageHeight(state: *app_state.AppState, message_index: u
     // Command rows and diff cards have per-frame expand/collapse state that the
     // height cache key does not include — bypass the cache so toggles take
     // effect immediately.
-    const has_dynamic_collapse = message.role == .system and
-        (shouldRenderPaletteCommandRow(message.author, message.body) or isDiffSummaryMessage(message.author, message.body) or isUsageSummaryMessage(message.author, message.body));
+    const has_dynamic_collapse = (message.role == .system and
+        (shouldRenderPaletteCommandRow(message.author, message.body) or isDiffSummaryMessage(message.author, message.body) or isUsageSummaryMessage(message.author, message.body))) or
+        childNotification(message.role, message.body) != null;
     if (!has_dynamic_collapse) {
         if (state.cachedTranscriptMessageHeight(message_index, column_width, message.body, message.role, message.author, false, image_present)) |height| {
             return height;
@@ -5634,7 +5701,9 @@ fn transcriptMessageHeightStream(
     streaming: bool,
 ) f32 {
     if (childNotification(role, body_raw)) |notification| {
-        return transcriptMessageHeightStream(state, message_index, notification.body, .assistant, column_width, "Child chat", true, streaming);
+        const view = childNotificationView(state, message_index, notification.body);
+        return transcriptMessageHeightStream(state, message_index, view.text, .assistant, column_width, "Child chat", true, streaming) +
+            childNotificationToggleHeight(view);
     }
     if (role == .system and isSlashCommandResultMessage(message_author, body_raw)) {
         return slashCommandResultHeight(state, message_index, body_raw, column_width);
@@ -8228,12 +8297,36 @@ fn renderTranscriptBubbleFromParts(
         const bubble = snapRect(palette.Rect{ .x = column.x, .y = y, .w = column.w, .h = height });
         queueRoundedShellClipped(state, bubble, paletteColor(fill), paletteColor(theme.COLOR_PANEL_MUTED), transcriptBubbleCornerRadius(), clip);
         last_body_tail = null;
+        const view = childNotificationView(state, message_index, notification.body);
+        const toggle_h = childNotificationToggleHeight(view);
         renderPlainSelectableBody(state, message_index, .{
             .x = bubble.x + pad,
             .y = bubble.y + theme.scaledUi(34.0),
             .w = bubble.w - pad * 2.0,
-            .h = bubble.h - theme.scaledUi(42.0),
-        }, std.mem.trim(u8, notification.body, "\n\r\t "), theme.COLOR_WHITE, clip, streaming);
+            .h = @max(bubble.h - theme.scaledUi(42.0) - toggle_h, 0.0),
+        }, view.text, theme.COLOR_WHITE, clip, streaming);
+        if (view.collapsible) {
+            const toggle_label = if (view.expanded) "Show less" else "Show more";
+            const toggle_font = theme.scaledUi(12.0);
+            const toggle_pad_x = theme.scaledUi(6.0);
+            const toggle_w = chromeLabelWidth(toggle_font, toggle_label) + toggle_pad_x * 2.0;
+            const toggle_rect = palette.Rect{
+                .x = bubble.x + bubble.w - pad - toggle_w,
+                .y = bubble.y + bubble.h - theme.scaledUi(8.0) - toggle_h,
+                .w = toggle_w,
+                .h = toggle_h,
+            };
+            queueFixedTextLine(state, .{
+                .x = toggle_rect.x + toggle_pad_x,
+                .y = toggle_rect.y,
+                .w = toggle_rect.w - toggle_pad_x * 2.0,
+                .h = toggle_rect.h,
+            }, toggle_label, paletteColor(theme.COLOR_GREEN), toggle_font, clip);
+            const toggle_visible = intersectRect(toggle_rect, clip);
+            if (toggle_visible.w > 0.0 and toggle_visible.h > 0.0) {
+                state.recordCardToggleHit(.{ .rect = toggle_visible, .key = childNotificationKey(message_index), .kind = .tool_output, .message_index = message_index });
+            }
+        }
         queueChromeLabel(state, .{ .x = header_rect.x, .y = y + theme.scaledUi(8.0), .w = title_w, .h = theme.scaledUi(22.0) }, title, paletteColor(theme.COLOR_WHITE), title_font, clip);
         if (show_provider) queueChromeLabel(state, .{ .x = provider_x, .y = y + theme.scaledUi(11.0), .w = provider_w, .h = theme.scaledUi(18.0) }, identity.provider, paletteColor(theme.COLOR_TEXT_MUTED), meta_font, clip);
         queueChromeLabel(state, .{ .x = status_x, .y = y + theme.scaledUi(11.0), .w = status_w, .h = theme.scaledUi(18.0) }, status, paletteColor(linkedChatStatusColor(notification.status)), meta_font, clip);

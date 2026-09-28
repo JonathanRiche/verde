@@ -29,6 +29,8 @@ const MUTATING_METHODS = [_][]const u8{
     "chat.subagent.open",
     "chat.links.clear",
     "chat.tasks.blocked",
+    "chat.tasks.resume",
+    "chat.tasks.retitle",
     "chat.turn.approve",
     "chat.turn.steer",
     "chat.followup",

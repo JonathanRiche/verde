@@ -56,6 +56,7 @@ const acknowledgement_controller = @import("state/acknowledgement_controller.zig
 const composer_controller = @import("state/composer_controller.zig");
 const companion_controller = @import("state/companion_controller.zig");
 const linked_chats_controller = @import("state/linked_chats_controller.zig");
+pub const resource_waiters_controller = @import("state/resource_waiters.zig");
 const browser_controller = @import("state/browser_controller.zig");
 const cookie_import_controller = @import("state/cookie_import_controller.zig");
 const workspace_controller = @import("state/workspace_controller.zig");
@@ -4613,6 +4614,8 @@ pub const AppState = struct {
     companion_controller: companion_controller,
     /// Daemon-linked child chats shown in the parent pane drawer.
     linked_chats: linked_chats_controller = .{},
+    /// Chats blocked on workspace resources, resumed when they free up.
+    resource_waiters: resource_waiters_controller = .{},
     companion_composer: CompanionComposerPrompt,
     palette_overlay_batch: palette.RenderBatch,
     palette_frame_text: std.ArrayList(u8),
@@ -14665,6 +14668,7 @@ pub const AppState = struct {
         startShutdownWatchdog();
         // Join linked-chat fetch workers before any owner they read from goes away.
         self.linked_chats.deinit(self.allocator);
+        self.resource_waiters.deinit(self.allocator);
         // Flag the cursor loop first so an in-flight long-poll (bounded by
         // the 4s wait budget + 5s transport timeout) drains concurrently with
         // the shutdown work below; the blocking join happens further down,

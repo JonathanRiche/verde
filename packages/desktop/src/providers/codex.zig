@@ -3154,8 +3154,10 @@ fn emitMcpToolCallItem(
     context: ?*anyopaque,
     on_stream_event: *const fn (?*anyopaque, provider_types.StreamEvent) void,
 ) !bool {
-    var label_buf: [512]u8 = undefined;
-    const label = formatMcpToolCallLabel(&label_buf, item) orelse return false;
+    // Input carries the call arguments too so the transcript shows what an
+    // orchestrating agent actually sent (e.g. a child chat's prompt).
+    const input = try formatMcpToolCallInputAlloc(allocator, item) orelse return false;
+    defer allocator.free(input);
     const call_id = getOptionalObjectString(item, "id") orelse "";
     if (started) {
         on_stream_event(context, .{ .tool_call = .{
@@ -3163,7 +3165,7 @@ fn emitMcpToolCallItem(
             .title = "",
             .kind = .mcp,
             .status = .in_progress,
-            .input = label,
+            .input = input,
         } });
         return true;
     }
@@ -3181,7 +3183,7 @@ fn emitMcpToolCallItem(
         .title = "",
         .kind = .mcp,
         .status = toolCallStatusFromCodex(status),
-        .input = label,
+        .input = input,
         .output = output,
         .error_text = error_text,
     } });
@@ -3254,6 +3256,104 @@ fn formatMcpToolCallLabel(buffer: []u8, item: std.json.Value) ?[]const u8 {
     const server = getOptionalObjectString(item, "server") orelse return null;
     const tool = getOptionalObjectString(item, "tool") orelse return null;
     return std.fmt.bufPrint(buffer, "{s}.{s}", .{ server, tool }) catch tool;
+}
+
+/// Caps the arguments section of an MCP tool-call input so a huge payload
+/// (e.g. a pasted file) cannot bloat the persisted transcript row.
+const MCP_TOOL_ARGUMENTS_LIMIT: usize = 16 * 1024;
+/// String arguments at least this long (or multiline) render as a block.
+const MCP_TOOL_ARGUMENT_BLOCK_MIN_LEN: usize = 80;
+
+/// Tool-call input for an MCP item: `server.tool` on the first line (the
+/// card header keys off it), then the call arguments. Returns null when the
+/// item has no server/tool; returns the bare label when there are no
+/// arguments.
+fn formatMcpToolCallInputAlloc(allocator: std.mem.Allocator, item: std.json.Value) !?[]u8 {
+    var label_buf: [512]u8 = undefined;
+    const label = formatMcpToolCallLabel(&label_buf, item) orelse return null;
+
+    const arguments = getObjectField(item, "arguments") orelse return try allocator.dupe(u8, label);
+    var args_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer args_writer.deinit();
+    try writeMcpToolArguments(&args_writer.writer, arguments);
+    const args_text = std.mem.trim(u8, args_writer.written(), &std.ascii.whitespace);
+    if (args_text.len == 0) return try allocator.dupe(u8, label);
+
+    if (args_text.len <= MCP_TOOL_ARGUMENTS_LIMIT)
+        return try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ label, args_text });
+
+    var end: usize = MCP_TOOL_ARGUMENTS_LIMIT;
+    while (end > 0 and args_text[end] & 0xC0 == 0x80) end -= 1;
+    return try std.fmt.allocPrint(allocator, "{s}\n{s}\n… [arguments truncated: {d} of {d} bytes shown]", .{
+        label,
+        args_text[0..end],
+        end,
+        args_text.len,
+    });
+}
+
+/// Pretty JSON, except objects carrying long/multiline string values render
+/// one `key: value` per line with those strings as indented text blocks so
+/// prompts stay readable. Indenting also keeps a `\n\nOutput:\n`-looking line
+/// inside a prompt from being parsed as the card's next body section.
+fn writeMcpToolArguments(writer: *std.Io.Writer, arguments: std.json.Value) !void {
+    switch (arguments) {
+        .null => return,
+        .string => |text| return writeMcpIndentedBlock(writer, text),
+        .object => |object| {
+            if (object.count() == 0) return;
+            if (!hasMcpBlockStringArgument(object)) return writeMcpPrettyJson(writer, arguments);
+            var first = true;
+            var iterator = object.iterator();
+            while (iterator.next()) |entry| {
+                if (!first) try writer.writeAll("\n");
+                first = false;
+                const value = entry.value_ptr.*;
+                if (value == .string and isMcpBlockString(value.string)) {
+                    try writer.print("{s}:\n", .{entry.key_ptr.*});
+                    try writeMcpIndentedBlock(writer, value.string);
+                    continue;
+                }
+                try writer.print("{s}: ", .{entry.key_ptr.*});
+                var stringify: std.json.Stringify = .{ .writer = writer, .options = .{} };
+                try stringify.write(value);
+            }
+        },
+        else => return writeMcpPrettyJson(writer, arguments),
+    }
+}
+
+fn writeMcpPrettyJson(writer: *std.Io.Writer, value: std.json.Value) !void {
+    var stringify: std.json.Stringify = .{ .writer = writer, .options = .{ .whitespace = .indent_2 } };
+    try stringify.write(value);
+}
+
+fn hasMcpBlockStringArgument(object: std.json.ObjectMap) bool {
+    var iterator = object.iterator();
+    while (iterator.next()) |entry| {
+        const value = entry.value_ptr.*;
+        if (value == .string and isMcpBlockString(value.string)) return true;
+    }
+    return false;
+}
+
+fn isMcpBlockString(text: []const u8) bool {
+    return text.len >= MCP_TOOL_ARGUMENT_BLOCK_MIN_LEN or std.mem.indexOfScalar(u8, text, '\n') != null;
+}
+
+/// Writes `text` with every non-empty line indented two spaces; blank lines
+/// stay empty so copies do not pick up trailing whitespace.
+fn writeMcpIndentedBlock(writer: *std.Io.Writer, text_raw: []const u8) !void {
+    const text = std.mem.trimEnd(u8, text_raw, &std.ascii.whitespace);
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var first = true;
+    while (lines.next()) |line_raw| {
+        if (!first) try writer.writeAll("\n");
+        first = false;
+        const line = std.mem.trimEnd(u8, line_raw, "\r");
+        if (line.len == 0) continue;
+        try writer.print("  {s}", .{line});
+    }
 }
 
 /// Extracts readable MCP text results while retaining structured-only data.
@@ -5222,6 +5322,88 @@ test "MCP calls emit lifecycle tool call updates" {
     try std.testing.expectEqualStrings("mcp-2", capture.tool_call_id.?);
     try std.testing.expectEqual(provider_types.ToolCallStatus.failed, capture.tool_status.?);
     try std.testing.expectEqualStrings("blender.execute_blender_code", capture.tool_input.?);
+}
+
+test "MCP call input includes readable arguments" {
+    const allocator = std.testing.allocator;
+    const started_json =
+        \\{
+        \\  "method": "item/started",
+        \\  "params": {
+        \\    "item": {
+        \\      "id": "mcp-3",
+        \\      "type": "mcpToolCall",
+        \\      "server": "verde",
+        \\      "tool": "send_chat_message",
+        \\      "status": "inProgress",
+        \\      "arguments": {
+        \\        "workspace": "abc",
+        \\        "prompt": "Fix the bug.\n\nOutput:\nkeep this inside the prompt\r\n",
+        \\        "wait": true
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    var started = try std.json.parseFromSlice(std.json.Value, allocator, started_json, .{});
+    defer started.deinit();
+
+    var capture: TestStreamEventCapture = .{};
+    try std.testing.expect(try emitItemEvent(allocator, started.value, &capture, TestStreamEventCapture.handle));
+    try std.testing.expectEqualStrings(
+        "verde.send_chat_message\n" ++
+            "workspace: \"abc\"\n" ++
+            "prompt:\n" ++
+            "  Fix the bug.\n" ++
+            "\n" ++
+            "  Output:\n" ++
+            "  keep this inside the prompt\n" ++
+            "wait: true",
+        capture.tool_input.?,
+    );
+
+    const short_json =
+        \\{ "server": "verde", "tool": "list_panes", "arguments": { "workspace": "abc", "limit": 2 } }
+    ;
+    var short = try std.json.parseFromSlice(std.json.Value, allocator, short_json, .{});
+    defer short.deinit();
+    const short_input = (try formatMcpToolCallInputAlloc(allocator, short.value)).?;
+    defer allocator.free(short_input);
+    try std.testing.expectEqualStrings(
+        "verde.list_panes\n{\n  \"workspace\": \"abc\",\n  \"limit\": 2\n}",
+        short_input,
+    );
+
+    const empty_json =
+        \\{ "server": "verde", "tool": "list_workspaces", "arguments": {} }
+    ;
+    var empty = try std.json.parseFromSlice(std.json.Value, allocator, empty_json, .{});
+    defer empty.deinit();
+    const empty_input = (try formatMcpToolCallInputAlloc(allocator, empty.value)).?;
+    defer allocator.free(empty_input);
+    try std.testing.expectEqualStrings("verde.list_workspaces", empty_input);
+}
+
+test "MCP call input truncates oversized arguments" {
+    const allocator = std.testing.allocator;
+    const huge = try allocator.alloc(u8, MCP_TOOL_ARGUMENTS_LIMIT * 2);
+    defer allocator.free(huge);
+    @memset(huge, 'x');
+
+    var arguments: std.json.ObjectMap = .empty;
+    defer arguments.deinit(allocator);
+    try arguments.put(allocator, "prompt", .{ .string = huge });
+    var item: std.json.ObjectMap = .empty;
+    defer item.deinit(allocator);
+    try item.put(allocator, "server", .{ .string = "verde" });
+    try item.put(allocator, "tool", .{ .string = "open_chat" });
+    try item.put(allocator, "arguments", .{ .object = arguments });
+
+    const input = (try formatMcpToolCallInputAlloc(allocator, .{ .object = item })).?;
+    defer allocator.free(input);
+    try std.testing.expect(std.mem.startsWith(u8, input, "verde.open_chat\nprompt:\n  xxx"));
+    try std.testing.expect(std.mem.endsWith(u8, input, "\n… [arguments truncated: 16384 of 32778 bytes shown]"));
+    try std.testing.expect(input.len < MCP_TOOL_ARGUMENTS_LIMIT + 128);
 }
 
 test "collab agent spawn emits subagent lifecycle updates" {

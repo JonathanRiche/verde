@@ -3754,6 +3754,43 @@ pub const Store = struct {
         return next_revision;
     }
 
+    /// Explicit title from an orchestrating parent (one child chat reused for
+    /// a new task). Unconditional, like a manual rename. Returns the new store
+    /// revision, or null when the title was already current.
+    pub fn setThreadTitle(
+        self: *Self,
+        workspace_id: []const u8,
+        local_thread_id: []const u8,
+        title: []const u8,
+    ) StoreError!?u64 {
+        self.conn.execNoArgs("begin immediate") catch |err| return mapStoreError(err);
+        var transaction_open = true;
+        defer if (transaction_open) self.conn.rollback();
+
+        const owner = self.conn.row(
+            "select t.title from threads t join workspaces w on w.id = t.workspace_id where w.workspace_id = ?1 and t.local_thread_id = ?2",
+            .{ workspace_id, local_thread_id },
+        ) catch |err| return mapStoreError(err);
+        const current = owner orelse return error.ResourceNotFound;
+        const unchanged = std.mem.eql(u8, current.text(0), title);
+        current.deinit();
+        if (unchanged) return null;
+        self.conn.exec(
+            "update threads set title = ?1, committed = 1 where workspace_id = (select id from workspaces where workspace_id = ?2) and local_thread_id = ?3",
+            .{ title, workspace_id, local_thread_id },
+        ) catch |err| return mapStoreError(err);
+        const revision = self.readStoreRevision() catch |err| return mapStoreError(err);
+        const next_revision = std.math.add(u64, revision, 1) catch return error.StoreUnavailable;
+        const next_revision_sql: i64 = std.math.cast(i64, next_revision) orelse return error.StoreUnavailable;
+        self.conn.exec(
+            "update store_state set store_revision = ?1 where id = 1",
+            .{next_revision_sql},
+        ) catch |err| return mapStoreError(err);
+        self.conn.commit() catch |err| return mapStoreError(err);
+        transaction_open = false;
+        return next_revision;
+    }
+
     /// True only for the opening user prompt while the durable title still
     /// matches the fallback the worker intends to replace.
     pub fn canGenerateAutomaticTitle(

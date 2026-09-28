@@ -437,8 +437,8 @@ fn capabilitiesResponse(allocator: std.mem.Allocator, id_value: std.json.Value) 
             "process.list",                         "process.inspect",                    "process.start",                       "process.stop",
             "process.restart",                      "process.logs",                       "agent.open",                          "stack.status",
             "stack.start",                          "stack.stop",                         "stack.restart",                       "workspace.processes",
-            "workspace.checkCommand",               "workspace.acquireLease",             "workspace.releaseLease",              "tab.select",
-            "tab.add",
+            "workspace.checkCommand",               "workspace.acquireLease",             "workspace.releaseLease",              "workspace.waitForResources",
+            "tab.select",                           "tab.add",
         },
         .events = &.{},
         .encodings = &.{"json"},
@@ -916,6 +916,9 @@ fn workspaceCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Val
     }
     if (std.mem.eql(u8, command, "releaseLease")) {
         return try workspaceReleaseLeaseResponse(allocator, id_value, state, params);
+    }
+    if (std.mem.eql(u8, command, "waitForResources")) {
+        return try workspaceWaitForResourcesResponse(allocator, id_value, state, params);
     }
     if (std.mem.eql(u8, command, "select")) {
         const project_index = resolveProjectIndex(state, params) orelse
@@ -3169,6 +3172,77 @@ fn workspaceReleaseLeaseResponse(allocator: std.mem.Allocator, id_value: std.jso
         .lease_id = lease_id,
         .owner = owner,
     });
+}
+
+/// Registers a GUI-side waiter that resumes a blocked chat (through the
+/// session daemon's `chat.tasks.resume`) once no other owner holds any of the
+/// requested resources. Leases and process conflicts are GUI state, which is
+/// why the waiter lives here rather than in the daemon.
+fn workspaceWaitForResourcesResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value) ![]u8 {
+    const project_index = resolveProjectIndex(state, params) orelse
+        return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
+    const local_thread_id = stringParam(params, "local_thread_id") orelse
+        return try errorResponseAlloc(allocator, id_value, "invalid_request", "workspace.waitForResources requires local_thread_id");
+    if (local_thread_id.len == 0 or local_thread_id.len > 256)
+        return try errorResponseAlloc(allocator, id_value, "invalid_request", "invalid local_thread_id");
+    const resources = workspaceResourceRequest(params, "") catch |err|
+        return try errorResponseAlloc(allocator, id_value, "invalid_request", @errorName(err));
+    if (resources.len == 0) return try errorResponseAlloc(allocator, id_value, "invalid_request", "workspace.waitForResources requires resources");
+    const reason_full = stringParam(params, "reason") orelse "";
+    const reason = reason_full[0..@min(reason_full.len, 2048)];
+    const workspace_id = state.project_controller.projects.items[project_index].id;
+    state.resource_waiters.register(
+        state.allocator,
+        workspace_id,
+        local_thread_id,
+        resources.items(),
+        reason,
+        platform_runtime.unixTimestampMs(),
+    ) catch |err| return try errorResponseAlloc(allocator, id_value, "rejected", @errorName(err));
+    state.pollWorkspaceTerminalProcessLifecyclesForLiveRead(project_index);
+    return try okValueResponse(allocator, id_value, .{
+        .waiting = true,
+        .workspace_index = project_index,
+        .workspace_id = workspace_id,
+        .local_thread_id = local_thread_id,
+        .resources = resources.items(),
+        .busy_now = resourcesBusy(state, project_index, local_thread_id, resources.items()),
+    });
+}
+
+fn resourcesBusy(state: *app_state.AppState, project_index: usize, owner: []const u8, resources: []const []const u8) bool {
+    if (workspaceProcessConflictCount(state, project_index, owner, resources) > 0) return true;
+    const project = &state.project_controller.projects.items[project_index];
+    for (project.workspace_leases.items) |*lease| {
+        if (std.mem.eql(u8, owner, lease.owner)) continue;
+        if (firstWorkspaceResourceOverlap(resources, lease.resources.items) != null) return true;
+    }
+    return false;
+}
+
+const ResourceWaiterChecker = struct {
+    state: *app_state.AppState,
+    polled: std.StaticBitSet(64) = .initEmpty(),
+
+    pub fn busy(self: *ResourceWaiterChecker, workspace_id: []const u8, owner: []const u8, resources: []const []const u8) ?bool {
+        for (self.state.project_controller.projects.items, 0..) |project, index| {
+            if (!std.mem.eql(u8, project.id, workspace_id)) continue;
+            if (index < 64 and !self.polled.isSet(index)) {
+                self.polled.set(index);
+                self.state.pollWorkspaceTerminalProcessLifecyclesForLiveRead(index);
+                self.state.pruneExpiredWorkspaceLeases(index);
+            }
+            return resourcesBusy(self.state, index, owner, resources);
+        }
+        return null;
+    }
+};
+
+/// Main-loop tick for chats waiting on workspace resources.
+pub fn pollResourceWaiters(state: *app_state.AppState) void {
+    if (state.resource_waiters.isEmpty()) return;
+    var checker: ResourceWaiterChecker = .{ .state = state };
+    state.resource_waiters.poll(state.allocator, state.storage.pref_path, platform_runtime.unixTimestampMs(), &checker);
 }
 
 fn writeWorkspaceConflicts(
