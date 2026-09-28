@@ -53,6 +53,8 @@ internal class CoreGitChangesClient(private val core: GitCoreConnection, scope: 
     private val alive = MutableStateFlow(true)
     private var scopes = emptySet<String>()
     private var chats = emptySet<GitChat>()
+    private var catalogChats = emptySet<GitChat>()
+    private var catalogSynced = false
     private val subscribed = mutableSetOf<String>()
     private val requested = mutableSetOf<String>()
     private var active: GitChat? = null
@@ -63,15 +65,28 @@ internal class CoreGitChangesClient(private val core: GitCoreConnection, scope: 
     fun close() { alive.value = false; mutable.value = GitSnapshot() }
     fun catalog(browse: BrowseState) {
         if (browse.host?.auth_state in HostsModel.WIPED) {
-            scopes = emptySet(); chats = emptySet(); active = null
+            scopes = emptySet(); chats = emptySet(); catalogChats = emptySet(); catalogSynced = false; active = null
             subscribed.clear(); latestViews = emptyMap(); mutable.value = GitSnapshot()
             return
         }
         scopes = browse.host?.scopes.orEmpty().toSet()
         val workspaces = browse.workspaces?.items.orEmpty()
-        chats = workspaces.flatMap { w -> w.threads.map { GitChat(w.workspace_id, it.thread_id) } }.toSet() + listOfNotNull(active)
-        mutable.update { it.copy(connected = browse.host?.phase == "ready" && browse.host?.auth_state == "paired" && browse.networkAvailable) }
+        val nextChats = workspaces.flatMap { w -> w.threads.map { GitChat(w.workspace_id, it.thread_id) } }.toSet()
+        val connected = browse.host?.phase == "ready" && browse.host?.auth_state == "paired" && browse.networkAvailable
+        val arrived = active?.takeIf { it in nextChats && browse.hasSynced &&
+            (it !in catalogChats || !catalogSynced || (!mutable.value.connected && connected)) }
+        catalogChats = nextChats
+        catalogSynced = browse.hasSynced
+        chats = nextChats + listOfNotNull(active)
+        mutable.update { it.copy(connected = connected) }
         project(latestViews)
+        // A newly created chat can focus before its synced route exists. Core reports
+        // unsupported for that missing route; retry once when the catalog catches up.
+        if (arrived != null && "repository:read" in scopes && mutable.value.connected) scope.launch {
+            try { refreshStatus(arrived) }
+            catch (e: CancellationException) { throw e }
+            catch (_: Exception) { /* A later focus can retry this read. */ }
+        }
         if ("repository:read" in scopes && mutable.value.connected) workspaces.forEach { w ->
             if (w.workspace_id !in subscribed && requested.add(w.workspace_id)) scope.launch {
                 try { subscribe(w.workspace_id) }
@@ -97,13 +112,15 @@ internal class CoreGitChangesClient(private val core: GitCoreConnection, scope: 
             branches[chat] = value.repos.map { it.presentation() }
             access[chat] = if (!status.supported) GitAccess.Unavailable else gitAccess(scopes)
         }
-        if (status?.supported == false) active?.let { access[it] = if (status.error?.code == "unsupported") GitAccess.Remote else GitAccess.Unavailable }
         val review = decode<GitReviewQuery>(views["git_review"])?.data
         review?.review?.let { value ->
             val chat = GitChat(value.workspace_id, value.local_thread_id)
-            branches[chat] = value.repos.map { it.presentation().branch }
+            // Header counts use live status; the sheet alone keeps the frozen branch facts.
+            if (status?.status?.let { GitChat(it.workspace_id, it.local_thread_id) } != chat)
+                branches[chat] = value.repos.map { it.presentation().branch }
             access[chat] = gitAccess(scopes)
         }
+        if (status?.supported == false) active?.let { access[it] = if (status.error?.code == "unsupported" && it in catalogChats) GitAccess.Remote else GitAccess.Unavailable }
         val config = review?.config
         mutable.update { it.copy(summaries = summaries, branches = branches, access = access,
             settings = config?.let { c -> GitSettings(c.commit_message_provider, c.commit_message_model, action(c.commit_default_action)) } ?: it.settings) }
@@ -118,8 +135,12 @@ internal class CoreGitChangesClient(private val core: GitCoreConnection, scope: 
         chats = chats + chat
         project(latestViews)
         subscribe(chat.workspace)
+        refreshStatus(chat)
+        seed("git_review")
+    }
+    private suspend fun refreshStatus(chat: GitChat) {
         receipt { n, w, id -> EventGitStatusRefresh(now_ms=n, wall_time_ms=w, intent_id=id, workspace_id=chat.workspace, thread_id=chat.thread) }
-        seed("git_status"); seed("git_review")
+        seed("git_status")
     }
     private suspend fun seed(selector: String) { latestViews = latestViews + (selector to core.query(selector)); project(latestViews) }
     override suspend fun review(chat: GitChat, hunkBudgetBytes: Int): GitReview {

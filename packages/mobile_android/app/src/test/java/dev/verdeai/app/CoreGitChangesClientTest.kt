@@ -101,6 +101,46 @@ class CoreGitChangesClientTest {
         assertEquals(1, core.sent.size)
     }
 
+    @Test fun newlyCreatedChatRetriesStatusWhenItsCatalogRouteArrives() = fixture { core, adapter ->
+        val host = HostView("host", "Fixture", null, null, null, "ready", Lifecycle.foreground,
+            "paired", "ready", emptyList(), listOf("chat:write", "repository:read"), null, null, false, null)
+        val base = BrowseState(hostId="host", row=HostRow(SavedHost("host", "Fixture"), host), hasSynced=true)
+        var routeReady = false
+        core.review()
+        core.handle = { event -> when(event) {
+            is EventGitSummaryRefresh -> {
+                core.views.value = core.views.value + ("git_summary:scratch" to CoreJson.parseToJsonElement("""{"api_version":1,"revision":"1","error":null,"data":{"workspace_id":"scratch"}}"""))
+                core.settle(event.intent_id, "succeeded")
+            }
+            is EventGitStatusRefresh -> {
+                val body = if (routeReady) """"supported":true,"can_commit":true,"status":{"workspace_id":"scratch","local_thread_id":"chat","repos":[{"root":"/scratch","name":"scratch","branch":"main","ahead":1,"has_remote":true}]}"""
+                    else """"supported":false,"error":{"code":"unsupported","message":"route unavailable"}"""
+                core.views.value = core.views.value + ("git_status" to CoreJson.parseToJsonElement("""{"api_version":1,"revision":"1","error":null,"data":{$body}}"""))
+                core.settle(event.intent_id, if (routeReady) "succeeded" else "failed", if (routeReady) null else "unsupported")
+            }
+            else -> error("unexpected_event")
+        } }
+        adapter.catalog(base)
+        try { adapter.refresh(chat); fail("route not ready") } catch (e: GitFailure) { assertEquals("unsupported", e.code) }
+        assertEquals(GitAccess.Unavailable, adapter.snapshot.value.access[chat])
+        routeReady = true
+        val thread = ThreadSummary("scratch", "chat", "Fixture", "codex", null, null, true, false, null, "idle", "today")
+        val catalog = base.copy(workspaces=WorkspacesView(listOf(Workspace("scratch", "Scratch", "/scratch", true, emptyList(), listOf(thread))),
+            false, false, null, HistoryView("", emptyList(), null, false, null)))
+        adapter.catalog(catalog)
+        yield()
+        assertEquals(2, core.sent.filterIsInstance<EventGitStatusRefresh>().size)
+        assertEquals(GitAccess.Writable, adapter.snapshot.value.access[chat])
+        assertEquals(1, adapter.snapshot.value.branches[chat]?.single()?.ahead) // Frozen review still says two ahead.
+        adapter.catalog(catalog)
+        yield()
+        assertEquals(2, core.sent.filterIsInstance<EventGitStatusRefresh>().size)
+        adapter.catalog(catalog.copy(networkAvailable=false))
+        adapter.catalog(catalog)
+        yield()
+        assertEquals(3, core.sent.filterIsInstance<EventGitStatusRefresh>().size)
+    }
+
     @Test fun closedHostBoundaryCannotSendIntoAnotherHost() = fixture { core, adapter ->
         adapter.close()
         try { adapter.review(chat); fail("expected failure") } catch (e: GitFailure) { assertEquals("offline", e.code) }
