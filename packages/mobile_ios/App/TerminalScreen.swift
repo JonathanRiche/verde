@@ -463,7 +463,7 @@ final class TerminalGridView: UIView, UITextInput {
             }
             decorate(context, row: run.row, col: run.col, cells: run.cells, style: run.style, color: run.style.fg)
         }
-        if let cursor = plan.cursor, marked.isEmpty {
+        if let cursor = plan.cursor {
             let box = rect(cursor.row, cursor.col, cursor.cells)
             context.setFillColor(cgColor(cursor.color))
             switch cursor.shape {
@@ -478,17 +478,7 @@ final class TerminalGridView: UIView, UITextInput {
                 context.fill(CGRect(x: box.minX, y: box.minY, width: 2, height: box.height))
             }
         }
-        if !marked.isEmpty, let cursor = snapshot?.cursor {
-            // In-progress IME composition, drawn over the cursor cell.
-            let row = Int(cursor.row), col = Int(cursor.col)
-            let fg: UInt32 = 0xffffff
-            let width = CGFloat(max(marked.count, 1)) * metrics.width
-            context.setFillColor(cgColor(plan.background))
-            context.fill(CGRect(x: CGFloat(col) * metrics.width, y: CGFloat(row) * metrics.height, width: width, height: metrics.height))
-            drawLine(context, marked, row: row, col: col, style: TextStyle(fg: fg), color: fg)
-            context.setFillColor(cgColor(fg))
-            context.fill(CGRect(x: CGFloat(col) * metrics.width, y: CGFloat(row) * metrics.height + metrics.baseline + 1, width: width, height: 1))
-        }
+        // Composing text is already sent; the remote grid owns its echo.
         if let selection {
             context.setFillColor(UIColor.systemBlue.withAlphaComponent(0.4).cgColor)
             let start = selection.start, end = selection.end

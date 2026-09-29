@@ -3,7 +3,7 @@ import XCTest
 
 final class ClientCoreTests: XCTestCase {
     func testLargeNetworkEnvelopesCrossSwiftAndNativeBoundary() throws {
-        let core = try NativeHostCore(config: Config(api_version: 1, host_id: "fixture", label: "Fixture", client_revision: 1, session_nonce: "fixture", jitter_seed: 1))
+        let core = try NativeHostCore(config: Config(api_version: 1, host_id: "fixture", label: "Fixture", client_revision: 1, session_nonce: String(repeating: "a", count: 32), jitter_seed: 1))
         defer { core.close() }
         let payload = String(repeating: "A", count: 1024 * 1024)
         let events: [Event] = [

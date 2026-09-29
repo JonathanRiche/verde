@@ -67,6 +67,7 @@ struct GitChatControls: View {
             model = next; await next.start()
         }
         .onChange(of: browse.session?.store.snapshots["operations"]) { _, _ in Task { await model?.refresh() } }
+        .onChange(of: browse.session?.row?.phase) { _, _ in Task { await catalogChanged() } }
         .onChange(of: browse.session?.store.snapshots["workspaces"]) { _, _ in
             Task { await catalogChanged() }
         }
@@ -77,7 +78,7 @@ struct GitChatControls: View {
     private func catalogChanged() async {
         let workspaceValue = browse.session?.store.workspaces?.data?.items.first { $0.workspace_id == workspace }
         let available = workspaceValue?.threads.contains { $0.thread_id == thread } == true
-        await model?.catalog(available: available, connected: browse.session?.store.synced == true)
+        await model?.catalog(available: available, connected: browse.session?.row?.phase == "ready" && browse.session?.store.synced == true)
     }
 
 }

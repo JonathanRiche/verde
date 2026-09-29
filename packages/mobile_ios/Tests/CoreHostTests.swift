@@ -6,6 +6,7 @@ private final class FakeCore: HostCore {
     var initial: [Effect]
     var onEvent: ((Event) -> Void)?
     var closed = false
+    var queried: [String] = []
     init(_ initial: [Effect]) { self.initial = initial }
     func handle(_ bytes: Data) throws -> Data {
         let event = try JSONDecoder().decode(Event.self, from: bytes)
@@ -15,7 +16,8 @@ private final class FakeCore: HostCore {
         return try JSONEncoder().encode(EffectBatch(api_version: 1, revision: "9007199254740993", effects: effects))
     }
     func query(_ selector: String) throws -> Data {
-        Data(#"{"api_version":1,"revision":"9007199254740993","data":{"items":[],"operations":[]},"error":null}"#.utf8)
+        queried.append(selector)
+        return Data(#"{"api_version":1,"revision":"9007199254740993","data":{"items":[],"operations":[]},"error":null}"#.utf8)
     }
     func close() { closed = true }
 }
@@ -27,6 +29,15 @@ private final class FakeTransport: CoreTransport {
 }
 
 final class CoreHostTests: XCTestCase {
+    @MainActor
+    func testTerminalInvalidationDoesNotQueryOtherViews() async throws {
+        let core = FakeCore([.state_changed(EffectStateChanged(effect_id: "fixture", generation: "1", revision: "1", scopes: ["terminal:fixture"]))])
+        let host = CoreHost(core: core, store: CoreViewStore(), transport: FakeTransport(), storage: MemoryStorage())
+        try await host.send(.start(EventStart(now_ms: 0, wall_time_ms: 0, foreground: true, network_available: true)))
+        XCTAssertEqual(core.queried, ["terminal:fixture"])
+        try await host.shutdown()
+    }
+
     @MainActor
     func testEffectRoundTripsAndStore() async throws {
         let key = "vc/1/I02-\(UUID().uuidString)/credential"
