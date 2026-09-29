@@ -52,12 +52,44 @@ final class GitChangesTests: XCTestCase {
         let fake = Fake(); let model = fake.model()
         await model.receive(review(ownership: "shared"))
         model.toggleFile(GitFileKey(root: "/repo", path: "a.swift"))
+        fake.receiptState = "pending"
         await model.commit()
         XCTAssertEqual(fake.events.filter { if case .git_message_generate = $0 { return true }; return false }.count, 1)
         XCTAssertFalse(fake.events.contains { if case .git_commit = $0 { return true }; return false })
         model.message = "Chosen subject"
         await model.commit()
         XCTAssertEqual(fake.events.filter { if case .git_commit = $0 { return true }; return false }.count, 1)
+    }
+
+    func testBlankCommitWaitsForFreshMessageThenCommitsOnce() async {
+        let fake = Fake(); let model = fake.model()
+        fake.view = review(ownership: "shared")
+        await model.receive(fake.view)
+        model.toggleFile(GitFileKey(root: "/repo", path: "a.swift"))
+        XCTAssertEqual(model.generated, "")
+        fake.receiptState = "pending"
+        await model.commit()
+        XCTAssertFalse(fake.events.contains { if case .git_commit = $0 { return true }; return false })
+        fake.receiptState = "succeeded"
+        fake.view.message?.message = "Fresh selected changes"
+        await model.refresh()
+        let commits = fake.events.compactMap { if case .git_commit(let e) = $0 { return e }; return nil }
+        XCTAssertEqual(commits.count, 1)
+        XCTAssertEqual(commits.first?.message, "Fresh selected changes")
+    }
+    func testReadOnlySelectionCannotChangeAndBlankGenerationStaysOpen() async {
+        let fake = Fake(); let model = fake.model()
+        fake.view = review(ownership: "shared"); fake.view.can_commit = false
+        await model.receive(fake.view)
+        model.toggleFile(GitFileKey(root: "/repo", path: "a.swift"))
+        XCTAssertEqual(model.count, 0)
+        fake.view.can_commit = true; fake.view.message?.message = ""
+        await model.receive(fake.view)
+        model.toggleFile(GitFileKey(root: "/repo", path: "a.swift"))
+        await model.commit()
+        XCTAssertTrue(model.sheet)
+        XCTAssertNotNil(model.notice)
+        XCTAssertFalse(fake.events.contains { if case .git_commit = $0 { return true }; return false })
     }
 
     func testFailedGenerationCannotCommitAnOldSuggestion() async {

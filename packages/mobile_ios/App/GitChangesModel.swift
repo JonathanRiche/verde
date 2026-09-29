@@ -19,10 +19,11 @@ final class GitChangesModel {
     var expanded: Set<GitFileKey> = []
     private var generatedSelection: Data?
     private var generatingSelection: (id: String, key: Data)?
-    var message = ""
+    var message = "" { didSet { if message != oldValue { commitAfterMessage = nil } } }
     var notice: String?
     var selected: Set<GitFileKey> = []
     var hunks: [GitFileKey: Set<UInt32>] = [:]
+    private var commitAfterMessage: (review: String, selection: Data, push: Bool, branch: Bool)?
     private var loadedID: String?
     private var quick = false
     private var wantsPush = false
@@ -60,7 +61,7 @@ final class GitChangesModel {
     var ahead: UInt32 { repos.filter { $0.has_remote }.reduce(0) { $0 + $1.ahead } }
     var canCommit: Bool { view?.can_commit == true || status?.can_commit == true }
     var busy: Bool { submitting || pending.values.contains(true) || view?.mutation_state == "pending" }
-    var generated: String { view?.message?.message ?? "" }
+    var generated: String { generatedSelection == selectionKey ? (view?.message?.message ?? "") : "" }
     var finalMessage: String { message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? generated : message }
     var mainBranch: String? {
         review?.repos.first { $0.is_default_branch || ["main", "master"].contains($0.branch ?? "") }?.branch
@@ -102,12 +103,14 @@ final class GitChangesModel {
         return !keys.isEmpty && keys.allSatisfy { expanded.contains($0) }
     }
     func toggleFile(_ key: GitFileKey) {
-        guard !busy else { return }
+        guard canCommit, !busy else { return }
+        commitAfterMessage = nil
         if selected.contains(key) { selected.remove(key) } else { selected.insert(key) }
         hunks[key] = nil
     }
     func toggleHunk(_ key: GitFileKey, file: GitReviewFile, index: UInt32, on: Bool) {
-        guard !busy, file.hunk_selectable, !file.binary, !file.preview_truncated else { return }
+        guard canCommit, !busy, file.hunk_selectable, !file.binary, !file.preview_truncated else { return }
+        commitAfterMessage = nil
         var indices = selected.contains(key) ? (hunks[key] ?? Set(file.hunks.map(\.index))) : []
         if on { indices.insert(index) } else { indices.remove(index) }
         if indices.isEmpty { selected.remove(key); hunks[key] = nil }
@@ -140,6 +143,7 @@ final class GitChangesModel {
             await receive(next)
             await receipts()
             await advanceQuickAction()
+            await finishGeneratedCommit()
         } catch { notice = "Connect to the host to review changes." }
     }
     func receive(_ next: GitReviewView?) async {
@@ -181,7 +185,7 @@ final class GitChangesModel {
         await refresh()
     }
     func generate() async {
-        guard let review, !generating, !selections.isEmpty, view?.message_state != "loading" else { return }
+        guard let review, !generating, generatingSelection == nil, !selections.isEmpty, view?.message_state != "loading" else { return }
         generating = true; defer { generating = false }
         let id = UUID().uuidString
         generatedSelection = nil
@@ -191,14 +195,26 @@ final class GitChangesModel {
     func commit(push: Bool? = nil, newBranch: Bool = false) async {
         guard let review, canSubmit else { return }
         if usesGeneratedMessage && (generatedSelection != selectionKey || generated.isEmpty) {
-            notice = "Generating a message for the selected changes. Review it, then commit."
+            commitAfterMessage = (review.review_id, selectionKey, push ?? wantsPush, newBranch)
+            notice = "Generating a message for the selected changes…"
             await generate()
+            await finishGeneratedCommit()
             return
         }
         submitting = true; defer { submitting = false }
         confirmMain = false
         await dispatch(.git_commit(EventGitCommit(now_ms: 0, wall_time_ms: 0, intent_id: UUID().uuidString, review_id: review.review_id, message: finalMessage, selections: selections, push: push ?? wantsPush, new_branch: newBranch, branch_name: newBranch ? view?.message?.branch : nil)))
         await refresh()
+    }
+    func dismissSheet() { sheet = false; quick = false; commitAfterMessage = nil }
+    private func finishGeneratedCommit() async {
+        guard let action = commitAfterMessage, generatingSelection == nil, !generating else { return }
+        commitAfterMessage = nil
+        guard review?.review_id == action.review, selectionKey == action.selection else { return }
+        guard !generated.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            sheet = true; notice = "Enter a commit message or try generating one again."; return
+        }
+        await commit(push: action.push, newBranch: action.branch)
     }
     func push(root: String? = nil) async {
         guard canCommit, !busy else { return }

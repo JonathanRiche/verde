@@ -37,7 +37,7 @@ struct GitChatControls: View {
                         .foregroundStyle((model.change?.attention ?? 0) > 0 ? VerdeTheme.warning : VerdeTheme.text)
                         .background(VerdeTheme.panel, in: RoundedRectangle(cornerRadius: 9))
                         .overlay(RoundedRectangle(cornerRadius: 9).stroke(VerdeTheme.border))
-                        .sheet(isPresented: Binding(get: { model.sheet }, set: { model.sheet = $0 })) { GitCommitSheet(model: model) }
+                        .sheet(isPresented: Binding(get: { model.sheet }, set: { if $0 { model.sheet = true } else { model.dismissSheet() } })) { GitCommitSheet(model: model) }
                         .confirmationDialog("Push repository", isPresented: Binding(get: { model.choosePush }, set: { model.choosePush = $0 })) {
                             ForEach(model.repos.filter { $0.has_remote && $0.ahead > 0 }, id: \.root) { repo in
                                 Button("\(repo.name) · ↑\(repo.ahead)") { Task { await model.push(root: repo.root) } }
@@ -132,7 +132,7 @@ struct GitCommitSheet: View {
             .background(VerdeTheme.background)
             .safeAreaInset(edge: .bottom) {
                 HStack(spacing: 12) {
-                    Button("Cancel") { model.sheet = false }
+                    Button("Cancel") { model.dismissSheet() }
                     Spacer(minLength: 0)
                     if model.canCommit {
                         Button("Commit on new branch") { Task { await model.commit(newBranch: true) } }.disabled(!model.canSubmit)
@@ -159,7 +159,7 @@ struct GitCommitSheet: View {
                 }.accessibilityLabel("Show diffs for \(file.path)")
                 Button { model.toggleFile(key) } label: {
                     HStack(spacing: 8) {
-                        Image(systemName: selected ? "checkmark.square.fill" : "square")
+                        Image(systemName: selected ? (model.hunks[key] == nil ? "checkmark.square.fill" : "minus.square.fill") : "square")
                         VStack(alignment: .leading) {
                             Text(file.path).font(VerdeTheme.mono(11)).lineLimit(2)
                             if file.ownership != "mine" { Text(file.ownership.capitalized).font(VerdeTheme.ui(10)).foregroundStyle(VerdeTheme.warning) }
@@ -168,8 +168,8 @@ struct GitCommitSheet: View {
                         Text("+\(file.additions)").foregroundStyle(VerdeTheme.accent)
                         Text("−\(file.deletions)").foregroundStyle(VerdeTheme.danger)
                     }.frame(maxWidth: .infinity, minHeight: 40).contentShape(Rectangle())
-                }.buttonStyle(.plain)
-                    .accessibilityLabel("Select \(file.path)").accessibilityValue(selected ? "Selected" : "Not selected")
+                }.buttonStyle(.plain).disabled(!model.canCommit)
+                    .accessibilityLabel("Select \(file.path)").accessibilityValue(selected ? (model.hunks[key] == nil ? "Selected" : "Partially selected") : "Not selected")
             }
             if model.expanded.contains(key) {
                 if file.hunk_selectable && !file.preview_truncated && !file.binary {
@@ -177,7 +177,7 @@ struct GitCommitSheet: View {
                         VStack(alignment: .leading) {
                             Toggle(hunk.header, isOn: Binding(get: {
                                 model.selected.contains(key) && (model.hunks[key]?.contains(hunk.index) ?? true)
-                            }, set: { model.toggleHunk(key, file: file, index: hunk.index, on: $0) }))
+                            }, set: { model.toggleHunk(key, file: file, index: hunk.index, on: $0) })).disabled(!model.canCommit)
                             ScrollView(.horizontal) { Text(hunk.text).textSelection(.enabled) }
                         }.font(VerdeTheme.mono(10))
                     }
