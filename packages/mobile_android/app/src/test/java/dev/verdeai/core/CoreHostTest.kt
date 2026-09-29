@@ -71,12 +71,14 @@ class CoreHostTest {
         val core = FakeCore()
         core.queryStatus = 1
         core.effects = listOf(EffectStateChanged("view", "1", "1", listOf("hosts")))
-        val host = CoreHost.create(config, executor(), core)
+        val traces = java.util.concurrent.CopyOnWriteArrayList<String>()
+        val host = CoreHost.create(config, executor(), core, traceMetadata=traces::add)
         try {
             try { start(host); fail("Expected batch failure") }
             catch (_: CoreFailure) { }
             assertTrue(host.failed.value)
             assertTrue(core.freed)
+            assertEquals(listOf("core_failure kind=native status=1"), traces.filter { it.startsWith("core_failure") })
         } finally { host.close() }
     }
 

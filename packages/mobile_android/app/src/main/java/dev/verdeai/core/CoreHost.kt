@@ -83,7 +83,7 @@ class CoreHost private constructor(
     private fun complete(completion: Completion) {
         scope.launch {
             if (!closed) try { dispatch(completion(executor.now(), executor.wall())) }
-            catch (_: Exception) { fail() }
+            catch (error: Exception) { fail(error) }
         }
     }
 
@@ -109,7 +109,7 @@ class CoreHost private constructor(
                 terminals.remove(id)
                 if (!closed) try { dispatch(EventTerminalDetach(now_ms=executor.now(), wall_time_ms=executor.wall(),
                     intent_id=java.util.UUID.randomUUID().toString(), terminal_id=id)) }
-                catch (_: CoreInputRejected) {} catch (_: Exception) { fail() }
+                catch (_: CoreInputRejected) {} catch (error: Exception) { fail(error) }
             }
             vt.close()
         }
@@ -123,7 +123,7 @@ class CoreHost private constructor(
         check(!closed) { "host_closed" }
         val before = mutableViews.value.keys.filter { it.startsWith("terminal:") }.toSet()
         try { dispatch(event(executor.now(), executor.wall())) }
-        catch (e: CoreInputRejected) { throw e } catch (_: Exception) { fail(); throw CoreFailure(-1) }
+        catch (e: CoreInputRejected) { throw e } catch (error: Exception) { fail(error); throw CoreFailure(-1) }
         val id = mutableViews.value.filterKeys { it.startsWith("terminal:") && it !in before }.values.firstNotNullOfOrNull {
             CoreJson.decodeFromJsonElement(TerminalQuery.serializer(), it).data?.terminal_id
         } ?: return@withContext null
@@ -167,7 +167,7 @@ class CoreHost private constructor(
     suspend fun send(event: (Long, Long) -> Event) = withContext(dispatcher) {
         check(!closed) { "host_closed" }
         try { dispatch(event(executor.now(), executor.wall())) }
-        catch (e: CoreInputRejected) { throw e } catch (_: Exception) { fail(); throw CoreFailure(-1) }
+        catch (e: CoreInputRejected) { throw e } catch (error: Exception) { fail(error); throw CoreFailure(-1) }
     }
 
     /** D-12: the body fetched for a succeeded `file_open` intent, once; memory only. */
@@ -211,9 +211,11 @@ class CoreHost private constructor(
             is EventWsMessage -> "socket"
             else -> "other"
         }
+        val encodedEvent = CoreJson.encodeToString<Event>(event).encodeToByteArray()
         val bytes = try {
-            core.handle(handle, CoreJson.encodeToString<Event>(event).encodeToByteArray())
+            core.handle(handle, encodedEvent)
         } catch (e: CoreFailure) {
+            traceMetadata?.invoke("core_rejected event=$eventKind bytes=${encodedEvent.size} status=${e.status}")
             // Only a rejected call (before any effects) is recoverable. Decode,
             // query and effect failures must still tear down the host. A resource
             // limit also rolls the transaction back (e.g. the 32 terminal records).
@@ -258,7 +260,22 @@ class CoreHost private constructor(
         if (event is EventTerminalInput) executor.recordTerminalTiming(TerminalTimingStage.InputDispatch, started)
     }
 
-    private fun fail() {
+    private fun fail(error: Exception) {
+        // Never include exception messages or stacks: serializers may include payloads.
+        val kind = when (error) {
+            is CoreInputRejected -> "input_rejected"
+            is CoreFailure -> "native"
+            is kotlinx.serialization.SerializationException -> "decode"
+            is CancellationException -> "cancelled"
+            is IllegalStateException -> "state"
+            else -> "platform"
+        }
+        val status = when (error) {
+            is CoreInputRejected -> error.status
+            is CoreFailure -> error.status
+            else -> null
+        }
+        traceMetadata?.invoke("core_failure kind=$kind status=$status")
         mutableFailure.value = true
         if (!closed) { closed = true; executor.close(); core.free(handle); closeTerminals() }
     }
