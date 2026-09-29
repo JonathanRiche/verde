@@ -52,6 +52,7 @@ internal class TranscriptContext(
     val onCitation: (FileCitation) -> Unit,
     /** The core's active turn start, for running-tool timers; null when idle. */
     val turnStartedAt: Long? = null,
+    val git: GitChangesModel? = null,
 )
 
 /**
@@ -154,7 +155,7 @@ internal fun TranscriptScreen(
     }
     val items = remember(state.thread) { state.thread?.let(::transcriptItems).orEmpty() }
     val now = rememberNow(state.turn?.started_at_ms != null)
-    val context = TranscriptContext(model, now, onCitation, state.turn?.started_at_ms)
+    val context = TranscriptContext(model, now, onCitation, state.turn?.started_at_ms, gitChanges)
     val openDrawer = LocalWorkspaceMenu.current
     var chatMenu by remember { mutableStateOf(false) }
     Box(Modifier.fillMaxSize()) {
@@ -468,7 +469,7 @@ internal fun ThinkCard(row: ChatRow, ctx: TranscriptContext) {
 @Composable
 internal fun NoticeRow(row: ChatRow, ctx: TranscriptContext) {
     if (isGitCommitRow(row)) {
-        GitCommitNotice(row.body)
+        GitCommitNotice(row.body, ctx.git)
         return
     }
     val colors = MaterialTheme.colorScheme

@@ -9,6 +9,10 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Warning
+import kotlinx.coroutines.delay
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -91,17 +95,18 @@ internal fun GitChangesHeader(model: GitChangesModel) {
 @Composable
 internal fun GitChangesLayer(model: GitChangesModel) {
     val state by model.state.collectAsState()
-    val snack = remember { SnackbarHostState() }
     val committing by rememberUpdatedState(state.busy)
-    LaunchedEffect(state.notice) {
-        state.notice?.let { notice ->
-            val result = snack.showSnackbar(notice.text, actionLabel = if (notice.rejectedRoots.isNotEmpty()) "Pull & push" else null,
-                withDismissAction = true, duration = if (notice.rejectedRoots.isNotEmpty()) SnackbarDuration.Indefinite else SnackbarDuration.Long)
-            model.dismissNotice()
-            if (result == SnackbarResult.ActionPerformed) model.push(true)
+    LaunchedEffect(state.notice?.id) {
+        state.notice?.takeIf { it.phase == GitResultPhase.Success }?.let { notice ->
+            delay(5000)
+            model.dismissNotice(notice.id)
         }
     }
-    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.BottomCenter) { SnackbarHost(snack, Modifier.imePadding().padding(12.dp)) }
+    if (!state.sheet && !state.confirmingMain && !state.preparing) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.BottomCenter) {
+            GitResultCard(state.notice, model, Modifier.imePadding().padding(12.dp))
+        }
+    }
     if (state.preparing || state.confirmingMain) {
         val branches = state.review?.repos.orEmpty().filter { it.files.isNotEmpty() && it.branch.defaultOrMain }.mapNotNull { it.branch.branch }.distinct().joinToString(", ")
         AlertDialog(onDismissRequest = model::dismiss,
@@ -116,6 +121,7 @@ internal fun GitChangesLayer(model: GitChangesModel) {
                 if (state.canRetry) TextButton(onClick = model::retry) { Text("Check again") }
                 if (state.checking && !state.confirmingMain) Text("Checking commit…", color = VerdeColors.Muted)
                 state.generated?.branch?.let { Text("New branch · $it", style = MaterialTheme.typography.bodySmall, color = VerdeColors.Muted) }
+                GitResultCard(state.notice, model)
                 if (state.confirmingMain) TextButton(onClick = { model.commit(newBranch = true) }, enabled = model.canCommit()) { Text("Create branch & continue") }
             } },
             confirmButton = { if (state.confirmingMain) TextButton(onClick = { model.commit() }, enabled = model.canCommit(), modifier = Modifier.testTag("git-confirm-main")) { Text(if (state.checking) "Checking commit…" else if (state.busy) "Committing…" else "Commit & push to $branches") } },
@@ -165,7 +171,7 @@ private fun GitCommitSheet(model: GitChangesModel, state: GitChangesState) {
             if (state.messageError) Text("Couldn't generate a message. Write one or regenerate.", style = MaterialTheme.typography.bodySmall, color = VerdeColors.Warning)
         }
         if (state.canRetry) TextButton(onClick = model::retry) { Text("Check again") }
-        state.error?.let { Text(it, Modifier.padding(vertical = 6.dp).semantics { liveRegion = LiveRegionMode.Polite }, color = VerdeColors.Warning, style = MaterialTheme.typography.bodySmall) }
+        if (state.notice == null) state.error?.let { Text(it, Modifier.padding(vertical = 6.dp).semantics { liveRegion = LiveRegionMode.Polite }, color = VerdeColors.Warning, style = MaterialTheme.typography.bodySmall) }
         if (state.review == null && !state.loading) TextButton(onClick = { model.open(state.action) }) { Text("Refresh review") }
         val alternate = if (state.action == GitAction.Commit) GitAction.CommitAndPush else GitAction.Commit
         fun label(action: GitAction, newBranch: Boolean = false): String {
@@ -188,6 +194,7 @@ private fun GitCommitSheet(model: GitChangesModel, state: GitChangesState) {
                 Button(onClick = { model.commit() }, enabled = model.canCommit(), shape = RoundedCornerShape(7.dp), modifier = Modifier.testTag("git-submit")) { Text(label(state.action)) }
             }
         }
+        GitResultCard(state.notice, model, Modifier.padding(bottom = 12.dp))
     }
 }
 
@@ -254,5 +261,28 @@ internal fun GitCommitSettingsSection(settings: GitSettings) {
         Text("Model · ${settings.model?.takeIf { it.isNotBlank() } ?: "Default (fast model)"}", style = MaterialTheme.typography.bodyMedium)
         Text("Default action · ${settings.action.label}", style = MaterialTheme.typography.bodyMedium)
         Text("Change on your computer", style = MaterialTheme.typography.bodySmall, color = VerdeColors.Subtle)
+    }
+}
+
+@Composable
+internal fun GitResultCard(notice: GitNotice?, model: GitChangesModel, modifier: Modifier = Modifier) {
+    if (notice == null) return
+    val color = when (notice.phase) {
+        GitResultPhase.Running -> VerdeColors.Muted
+        GitResultPhase.Success -> VerdeColors.Accent
+        GitResultPhase.Failure -> VerdeColors.Warning
+    }
+    Surface(modifier.fillMaxWidth().testTag("git-result").semantics { liveRegion = LiveRegionMode.Polite },
+        color = VerdeColors.Panel, shape = RoundedCornerShape(10.dp), border = BorderStroke(1.dp, color.copy(alpha = .4f))) {
+        Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (notice.phase == GitResultPhase.Running) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+            else Icon(if (notice.phase == GitResultPhase.Success) Icons.Filled.Check else Icons.Filled.Warning, null, tint = color, modifier = Modifier.size(20.dp))
+            Column(Modifier.weight(1f)) {
+                Text(notice.text, style = MaterialTheme.typography.labelLarge)
+                if (notice.detail.isNotBlank()) Text(notice.detail, style = MaterialTheme.typography.bodySmall, color = VerdeColors.Muted, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                if (notice.rejectedRoots.isNotEmpty()) TextButton(onClick = { model.push(true) }) { Text("Pull & push") }
+            }
+            if (notice.phase != GitResultPhase.Running) IconButton(onClick = { model.dismissNotice(notice.id) }, modifier = Modifier.size(44.dp)) { Icon(Icons.Filled.Close, "Dismiss Git result") }
+        }
     }
 }

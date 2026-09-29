@@ -79,7 +79,9 @@ internal fun gitErrorText(code: String?) = when (code) {
     "scope_denied", "forbidden" -> "This device does not have permission to commit."
     else -> "Could not confirm the result. Check the changes on your computer before trying again."
 }
-internal data class GitNotice(val text: String, val rejectedRoots: List<String> = emptyList())
+internal enum class GitResultPhase { Running, Success, Failure }
+internal data class GitNotice(val text: String, val rejectedRoots: List<String> = emptyList(),
+    val detail: String = "", val phase: GitResultPhase = GitResultPhase.Success, val id: String = UUID.randomUUID().toString())
 internal data class GitChangesState(val snapshot: GitSnapshot = GitSnapshot(), val review: GitReview? = null,
     val sheet: Boolean = false, val preparing: Boolean = false, val confirmingMain: Boolean = false,
     val loading: Boolean = false, val generating: Boolean = false, val busy: Boolean = false, val checking: Boolean = false, val canRetry: Boolean = false,
@@ -208,14 +210,15 @@ internal class GitChangesModel(val chat: GitChat, private val client: GitChanges
         if (!canCommit()) return
         val review = state.value.review ?: return
         val epoch = generation
-        mutable.update { it.copy(busy = true, error = null, submittingAction = action, submittingNewBranch = newBranch) }
+        mutable.update { it.copy(busy = true, error = null, submittingAction = action, submittingNewBranch = newBranch,
+            notice = GitNotice(if (action == GitAction.CommitAndPush) "Committing & pushing…" else "Committing…", phase = GitResultPhase.Running)) }
         viewModelScope.launch {
             try {
                 if (state.value.message.isBlank()) generate(epoch)
                 if (generation != epoch) return@launch
                 val current = state.value
                 if (current.message.isBlank() || !writable()) {
-                    mutable.update { it.copy(busy = false, preparing = false, confirmingMain = false, sheet = true) }
+                    mutable.update { it.copy(busy = false, preparing = false, confirmingMain = false, sheet = true, notice = GitNotice(if (!writable()) gitErrorText("scope_denied") else "Couldn’t generate a message. Write one or regenerate.", phase = GitResultPhase.Failure)) }
                     return@launch
                 }
                 val result = client.commit(review.id, current.message, current.selections, action == GitAction.CommitAndPush,
@@ -227,15 +230,19 @@ internal class GitChangesModel(val chat: GitChat, private val client: GitChanges
                 val count = result.repos.sumOf { it.files }
                 val sha = result.repos.joinToString(", ") { it.shortCommit }
                 val pushed = result.repos.isNotEmpty() && result.repos.all { it.push == GitPush.Pushed }
-                val suffix = when { pushed -> " · pushed"; rejected.isNotEmpty() -> " · push rejected"; result.repos.any { it.push == GitPush.Failed } -> " · push failed"; else -> "" }
+                val failed = result.repos.any { it.push in setOf(GitPush.Rejected, GitPush.Failed) }
+                val branches = result.repos.mapNotNull { receipt -> receipt.branch ?: review.repos.find { it.branch.root == receipt.root }?.branch?.branch }.distinct()
+                val detail = (listOf(sha) + branches + current.message.lineSequence().first()).filter { it.isNotBlank() }.joinToString(" · ")
+                val title = "${if (pushed) "Committed & pushed" else "Committed"} $count ${if (count == 1) "file" else "files"}"
                 mutable.update { it.copy(busy = false, checking = false, canRetry = false, sheet = false, confirmingMain = false, preparing = false,
-                    review = null, notice = GitNotice("Committed $count ${if (count == 1) "file" else "files"} · $sha$suffix", rejected), rejectedRoots = it.rejectedRoots + rejected) }
+                    review = null, notice = GitNotice(title, rejected, detail + if (failed) " · Push did not complete. Your commits are saved." else "",
+                        if (failed) GitResultPhase.Failure else GitResultPhase.Success), rejectedRoots = it.rejectedRoots + rejected) }
                 focus()
             } catch (e: CancellationException) { throw e }
             catch (e: Exception) {
                 if (generation != epoch) return@launch
                 val code = (e as? GitFailure)?.code
-                mutable.update { it.copy(busy = false, checking = false, canRetry = false, preparing = false, confirmingMain = false, sheet = true, error = gitErrorText(code)) }
+                mutable.update { it.copy(busy = false, checking = false, canRetry = false, preparing = false, confirmingMain = false, sheet = true, error = gitErrorText(code), notice = GitNotice(gitErrorText(code), phase = GitResultPhase.Failure)) }
                 if (code in setOf("changed_since_review", "review_expired")) {
                     mutable.update { it.copy(loading = true, review = null, generated = null, selected = emptyMap()) }
                     load(epoch, false) // Refresh only; never resubmit a commit.
@@ -250,16 +257,20 @@ internal class GitChangesModel(val chat: GitChat, private val client: GitChanges
         if (!writable() || state.value.busy) return
         val roots = if (pull) state.value.rejectedRoots.toList() else client.snapshot.value.branches[chat].orEmpty().filter { it.hasRemote && it.ahead > 0 }.map { it.root }
         if (roots.isEmpty()) return
-        mutable.update { it.copy(busy = true) }
+        val branches = client.snapshot.value.branches[chat].orEmpty().filter { it.root in roots }
+        mutable.update { it.copy(busy = true, notice = GitNotice(if (pull) "Pulling & pushing…" else "Pushing…", phase = GitResultPhase.Running)) }
         viewModelScope.launch {
             try {
                 val results = roots.map { it to client.push(chat, it, pull, UUID.randomUUID().toString()) { canRetry -> mutable.update { it.copy(checking = true, canRetry = canRetry) } } }
                 val rejected = results.filter { it.second == GitPush.Rejected }.map { it.first }
                 val success = results.all { it.second == GitPush.Pushed }
-                mutable.update { it.copy(notice = GitNotice(if (success) "${if (pull) "Pulled and pushed" else "Pushed"} ${roots.size} repositories" else "Push did not complete. Your commits are saved.", rejected),
+                mutable.update { it.copy(notice = GitNotice(if (!success) "Push did not complete. Your commits are saved." else if (pull) "Pulled & pushed" else {
+                    val count = branches.sumOf { it.ahead }
+                    "Pushed $count ${if (count == 1) "commit" else "commits"}" + branches.mapNotNull { it.upstream }.distinct().takeIf { it.isNotEmpty() }?.joinToString(", ", " to ").orEmpty()
+                }, rejected, branches.mapNotNull { it.branch }.distinct().joinToString(" · "), if (success) GitResultPhase.Success else GitResultPhase.Failure),
                     rejectedRoots = (it.rejectedRoots - results.filter { row -> row.second == GitPush.Pushed }.map { row -> row.first }.toSet()) + rejected) }
             } catch (e: CancellationException) { throw e }
-            catch (e: Exception) { mutable.update { it.copy(notice = GitNotice(gitErrorText((e as? GitFailure)?.code))) } }
+            catch (e: Exception) { mutable.update { it.copy(notice = GitNotice(gitErrorText((e as? GitFailure)?.code), phase = GitResultPhase.Failure)) } }
             finally { mutable.update { it.copy(busy = false, checking = false, canRetry = false) }; focus() }
         }
     }
@@ -272,5 +283,5 @@ internal class GitChangesModel(val chat: GitChat, private val client: GitChanges
             catch (_: Exception) { mutable.update { it.copy(canRetry = true) } }
         }
     }
-    fun dismissNotice() { mutable.update { it.copy(notice = null) } }
+    fun dismissNotice(id: String? = null) { mutable.update { if (id == null || it.notice?.id == id) it.copy(notice = null) else it } }
 }

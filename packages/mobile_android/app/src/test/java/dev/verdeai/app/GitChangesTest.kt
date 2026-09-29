@@ -159,7 +159,7 @@ class GitChangesTest {
         await { fake.commits == 1 && !model.state.value.busy }
         assertTrue(fake.committedPush)
         assertEquals("Improve mobile flow", fake.committedMessage)
-        compose.onNodeWithText("Committed 1 file · 123abcd · pushed").assertIsDisplayed()
+        compose.onNodeWithText("Committed & pushed 1 file").assertIsDisplayed()
     }
 
     @Test fun featureQuickActionCommitsExactlyOnceWithoutSheet() {
@@ -195,8 +195,8 @@ class GitChangesTest {
         val fake = Fake(); fake.outcome = GitPush.Rejected
         val model = mount(fake)
         compose.runOnIdle { model.open(GitAction.CommitAndPush, true) }
-        await { model.state.value.notice != null }
-        compose.onNodeWithText("Committed 1 file · 123abcd · push rejected").assertIsDisplayed()
+        await { model.state.value.notice?.phase == GitResultPhase.Failure }
+        compose.onNodeWithText("Committed 1 file").assertIsDisplayed()
         assertEquals(0, fake.pushes)
         compose.onNodeWithText("Pull & push").performClick()
         await { fake.pushes == 1 && !model.state.value.busy }
@@ -393,7 +393,7 @@ class GitChangesTest {
         assertFalse(isCommandRow(row))
         compose.setContent { VerdeTheme { GitCommitNotice(row.body) } }
         compose.onNodeWithTag("git-commit-notice").assertIsDisplayed()
-        compose.onNodeWithText("Committed 1 file").assertIsDisplayed()
+        compose.onNodeWithText("Committed & pushed 1 file").assertIsDisplayed()
         compose.onNodeWithText("123abcd").assertIsDisplayed()
         compose.onNodeWithText("Pushed").assertIsDisplayed()
     }
@@ -441,12 +441,57 @@ class GitChangesTest {
         assertEquals(GitCommitNoticeData("Committed 1 file", "123abcd", false), parseGitCommitNotice("Committed 1 file: 123abcd"))
         assertEquals(GitCommitNoticeData("Committed 3 files", "123abcd (app), abc1234 (lib)", true, "Improve fixtures", "feature/fixtures"),
             parseGitCommitNotice("Committed 3 files: 123abcd (app), abc1234 (lib) · pushed\nImprove fixtures\nbranch feature/fixtures"))
-        assertEquals("feature/fixtures", parseGitCommitNotice("Committed 1 file: 123abcd\nbranch feature/fixtures").branch)
-        assertNull(parseGitCommitNotice("Committed 1 file: 123abcd\nbranch feature/fixtures").subject)
+        assertEquals("feature/fixtures", parseGitCommitNotice("Committed 1 file: 123abcd\n\nbranch feature/fixtures").branch)
+        assertNull(parseGitCommitNotice("Committed 1 file: 123abcd\n\nbranch feature/fixtures").subject)
         assertEquals(GitCommitNoticeData("Unknown receipt", null, false), parseGitCommitNotice("Unknown receipt"))
         compose.setContent { VerdeTheme { GitCommitNotice("Committed 3 files: 123abcd · pushed\nImprove fixtures\nbranch feature/fixtures") } }
         compose.onNodeWithText("Improve fixtures").assertIsDisplayed()
         compose.onNodeWithText("branch feature/fixtures").assertIsDisplayed()
+    }
+
+    @Test fun positionalReceiptLinksAndUpdatedBodyReplacePushControl() {
+        val chatState = GitChangesState(snapshot = GitSnapshot(connected = true, access = mapOf(chat to GitAccess.Writable),
+            branches = mapOf(chat to listOf(GitBranch("/scratch", "scratch", ahead = 2, hasRemote = true)))))
+        val original = "Committed 1 file: 123abcd"
+        val updated = "$original · pushed\n\nbranch feature/test\nremote https://github.com/example/repo/commit/123abcd\nremote https://gitlab.com/example/repo/commit/123abcd"
+        val parsed = parseGitCommitNotice(updated)
+        assertNull(parsed.subject)
+        assertEquals("feature/test", parsed.branch)
+        assertEquals(2, parsed.remotes.size)
+        assertTrue(showGitCardPush(parseGitCommitNotice(original), chatState, chat))
+        assertFalse(showGitCardPush(parsed, chatState, chat))
+        assertFalse(showGitCardPush(parseGitCommitNotice(original), chatState.copy(snapshot = chatState.snapshot.copy(access = mapOf(chat to GitAccess.ReadOnly))), chat))
+        assertNull(gitCommitLinkHost("javascript:alert(1)"))
+        assertNull(gitCommitLinkHost("https://user:secret@example.com/commit/123abcd"))
+        assertNull(gitCommitLinkHost("http://example.com/commit/123abcd"))
+        assertEquals("branch named subject", parseGitCommitNotice("$original\nbranch named subject\n\nremote https://github.com/a/b/commit/123abcd").subject)
+        val fake = Fake(); fake.snapshot.value = chatState.snapshot
+        val model = GitChangesModel(chat, fake); models.put("git", model)
+        val body = androidx.compose.runtime.mutableStateOf(original)
+        compose.setContent { VerdeTheme { GitCommitNotice(body.value, model) } }
+        compose.onNodeWithTag("git-card-push").assertIsDisplayed()
+        compose.runOnIdle { body.value = updated }
+        compose.onNodeWithTag("git-card-push").assertDoesNotExist()
+        compose.onNodeWithText("Committed & pushed 1 file").assertIsDisplayed()
+        compose.onNodeWithText("View on github.com").assertIsDisplayed()
+        compose.onNodeWithText("View on gitlab.com").assertIsDisplayed()
+    }
+
+    @Test fun resultCardShowsProgressThenSuccessAndDismisses() {
+        val fake = Fake(); fake.commitGate = CompletableDeferred()
+        val model = mount(fake)
+        compose.runOnIdle { model.open() }
+        await { model.state.value.generated != null }
+        compose.onNodeWithTag("git-submit").performClick()
+        await { fake.commits == 1 }
+        assertEquals(GitResultPhase.Running, model.state.value.notice?.phase)
+        compose.onNodeWithTag("git-result").assertIsDisplayed()
+        compose.runOnIdle { fake.commitGate!!.complete(Unit) }
+        await { model.state.value.notice?.phase == GitResultPhase.Success }
+        compose.onNodeWithText("Committed 1 file").assertIsDisplayed()
+        assertTrue(model.state.value.notice!!.detail.contains("123abcd"))
+        compose.onNodeWithContentDescription("Dismiss Git result").performClick()
+        assertNull(model.state.value.notice)
     }
 
     @Test fun namedErrorsHavePlainActionableCopy() {

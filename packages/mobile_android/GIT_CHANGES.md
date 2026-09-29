@@ -61,3 +61,5 @@ Run `mise run mobile-android-build` and `mise run mobile-android-test` from the
 worktree root with the required build lease. After the owner's daemon
 relaunch, device checks must use a scratch workspace/repository and a disposable
 local bare remote only, never an owner repository or real remote.
+
+Git results use bottom cards for progress, success (five-second dismissal), and persistent errors. Rejected pushes expose Pull & push. Commit cards parse positional subject/branch/remote lines, open validated HTTPS commit URLs, and offer Push only with write access and ahead commits. Body-keyed parsing updates the card when the daemon rewrites a receipt. Standalone push counts/upstream labels come from the pre-action status snapshot; its receipt does not supply a commit subject or SHA.
