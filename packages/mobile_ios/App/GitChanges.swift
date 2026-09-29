@@ -13,12 +13,12 @@ struct GitChatControls: View {
                         Button {
                             Task {
                                 if (model.change?.files ?? 0) == 0 && model.ahead > 0 { await model.push() }
-                                else { await model.begin(push: model.defaultPush, quick: model.defaultPush && model.canCommit) }
+                                else { await model.begin(push: model.defaultPush, quick: model.canCommit) }
                             }
                         } label: {
                             HStack(spacing: 4) {
                                 Text(model.canCommit ? model.label : "Changes").lineLimit(1)
-                                if let count = model.change?.files, count > 0 { Text("\(count)").monospacedDigit() }
+                                if model.change != nil { Text("\(model.mineCount)").monospacedDigit() }
                             }.padding(.horizontal, 8).padding(.vertical, 7)
                         }.disabled(model.busy)
                         if model.canCommit {

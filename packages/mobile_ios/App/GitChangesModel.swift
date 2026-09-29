@@ -44,6 +44,7 @@ final class GitChangesModel {
     private var commitAfterMessage: (review: String, selection: Data, push: Bool, branch: Bool)?
     private var loadedID: String?
     private var quick = false
+    private var omittedFiles = 0
     private var wantsPush = false
     private var submitting = false
     private(set) var activeCommitAction: GitCommitAction?
@@ -69,6 +70,7 @@ final class GitChangesModel {
         })
     }
     var change: GitThreadSummary? { summary?.threads.first { $0.local_thread_id == thread } }
+    var mineCount: UInt32 { guard let change else { return 0 }; return change.files > change.attention ? change.files - change.attention : 0 }
     var review: GitReviewResult? {
         guard view?.review?.workspace_id == workspace, view?.review?.local_thread_id == thread else { return nil }
         return view?.review
@@ -83,7 +85,7 @@ final class GitChangesModel {
     var generated: String { generatedSelection == selectionKey ? (view?.message?.message ?? "") : "" }
     var finalMessage: String { message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? generated : message }
     var mainBranch: String? {
-        review?.repos.first { $0.is_default_branch || ["main", "master"].contains($0.branch ?? "") }?.branch
+        review?.repos.first { repo in repo.is_default_branch && selections.contains { $0.root == repo.root } }.map { $0.branch ?? $0.default_branch ?? "default branch" }
     }
     var selections: [GitRepoSelection] {
         (review?.repos ?? []).compactMap { repo in
@@ -197,7 +199,7 @@ final class GitChangesModel {
                     let details = result.repos.map { [$0.short_commit, $0.branch, $0.subject].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ") }.joined(separator: ", ")
                     let errors = failed.map { $0.push_message ?? ($0.push == "rejected" ? "Push rejected. Pull & push to reconcile remote changes." : "Push failed.") }.joined(separator: " ")
                     showToast(failed.isEmpty ? .success : (failed.contains { $0.push == "rejected" } ? .warning : .failure),
-                              title, [details, errors].filter { !$0.isEmpty }.joined(separator: "\n"),
+                              title, [omittedFiles > 0 ? "\(omittedFiles) \(omittedFiles == 1 ? "file" : "files") left out (shared/unclear) — use Commit… to review them" : "", details, errors].filter { !$0.isEmpty }.joined(separator: "\n"),
                               rejected: failed.filter { $0.push == "rejected" }.map(\.root))
                     toastOperation = nil
                 }
@@ -224,7 +226,17 @@ final class GitChangesModel {
             loadedID = review.review_id
             message = ""; hunks = [:]; selected = []; expanded = []; generatedSelection = nil
             for repo in review.repos { for file in repo.files where file.ownership == "mine" { selected.insert(GitFileKey(root: repo.root, path: file.path)) } }
-            if quick && (review.turn_running || review.repos.contains { $0.branch == nil || $0.files.contains { $0.ownership != "mine" } }) { quick = false; sheet = true }
+            if quick {
+                if review.repos.allSatisfy({ $0.files.isEmpty }) {
+                    quick = false; sheet = false; notice = "No uncommitted changes"
+                    showToast(.warning, "No uncommitted changes"); toastOperation = nil
+                    return
+                }
+                if selected.isEmpty { quick = false; sheet = true; omittedFiles = 0 }
+                else {
+                    omittedFiles = review.repos.flatMap(\.files).filter { ["shared", "unclear"].contains($0.ownership) }.count
+                }
+            }
             if toastOperation == "prepare" && !quick { dismissToast(); toastOperation = nil }
             if !selections.isEmpty { await generate() }
             else if quick { quick = false; sheet = true; notice = "No selected changes to commit."; failAction(notice!) }
@@ -232,12 +244,18 @@ final class GitChangesModel {
         await advanceQuickAction()
     }
     private func advanceQuickAction() async {
-        if quick, view?.message_state == "ready", generatedSelection == selectionKey, !generated.isEmpty, canSubmit {
+        if quick, view?.message_state == "ready", generatedSelection == selectionKey, canSubmit {
             quick = false
-            if mainBranch != nil { confirmMain = true; dismissToast(); toastOperation = nil } else { await commit(push: true) }
+            if generated.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                sheet = true; notice = "Enter a commit message or try generating one again."
+                failAction(notice!); omittedFiles = 0
+                return
+            }
+            if wantsPush && mainBranch != nil { confirmMain = true; dismissToast(); toastOperation = nil } else { await commit(push: wantsPush) }
         }
     }
     func begin(push: Bool, quick: Bool = false) async {
+        omittedFiles = 0
         wantsPush = push; self.quick = quick; sheet = !quick; notice = nil; loadedID = nil
         toastOperation = "prepare"; showToast(.running, "Reviewing changes…")
         await dispatch(.git_review_open(EventGitReviewOpen(now_ms: 0, wall_time_ms: 0, intent_id: UUID().uuidString, workspace_id: workspace, thread_id: thread)))
