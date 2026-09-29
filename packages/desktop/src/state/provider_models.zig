@@ -178,7 +178,7 @@ pub const CLAUDE_MODEL_OPTIONS = [_]ModelOption{
     .{ .label = "Fable 5.1", .value = DEFAULT_CLAUDE_MODEL, .reasoning_supported = true, .claude_effort_values = CLAUDE_FULL_EFFORT_VALUES[0..] },
     .{ .label = "Default (Opus 5.5)", .value = "default", .reasoning_supported = true, .claude_effort_values = CLAUDE_FULL_EFFORT_VALUES[0..] },
     .{ .label = "Opus 5.5 (1M context)", .value = "opus[1m]", .reasoning_supported = true, .claude_effort_values = CLAUDE_FULL_EFFORT_VALUES[0..] },
-    .{ .label = "Sonnet 5", .value = "sonnet", .reasoning_supported = true, .claude_effort_values = CLAUDE_FULL_EFFORT_VALUES[0..] },
+    .{ .label = "Sonnet 5.5", .value = "sonnet", .reasoning_supported = true, .claude_effort_values = CLAUDE_FULL_EFFORT_VALUES[0..] },
     .{ .label = "Haiku 4.5", .value = "haiku", .reasoning_supported = false },
 };
 

@@ -4077,12 +4077,52 @@ pub fn approveDaemonChatTurn(self: anytype, turn_id: []const u8, call_id: []cons
 
 pub fn consumeDaemonChatTurn(self: anytype, turn_id: ?[]u8) void {
     const owned_turn_id = turn_id orelse return;
-    defer std.heap.page_allocator.free(owned_turn_id);
-    const response = daemon_client.requestAlloc(self.allocator, self.storage.pref_path, "chat.turn.consume", .{ .turn_id = owned_turn_id }, 5) catch |err| {
+    const allocator = std.heap.page_allocator;
+    const args = allocator.create(CompletedTurnConsumeArgs) catch {
+        allocator.free(owned_turn_id);
+        return;
+    };
+    args.* = .{
+        .turn_id = owned_turn_id,
+        .pref_path = allocator.dupe(u8, self.storage.pref_path) catch {
+            allocator.free(owned_turn_id);
+            allocator.destroy(args);
+            return;
+        },
+    };
+    const worker = std.Thread.spawn(.{}, consumeCompletedDaemonTurn, .{args}) catch {
+        args.deinit();
+        return;
+    };
+    worker.detach();
+}
+
+const CompletedTurnConsumeArgs = struct {
+    pref_path: []u8,
+    turn_id: []u8,
+
+    fn deinit(self: *CompletedTurnConsumeArgs) void {
+        const allocator = std.heap.page_allocator;
+        allocator.free(self.pref_path);
+        allocator.free(self.turn_id);
+        allocator.destroy(self);
+    }
+};
+
+// A retention hint must not hold up the SDL thread. Like snapshot consume
+// workers, this owns its arguments and never accesses AppState after dispatch.
+fn consumeCompletedDaemonTurn(args: *CompletedTurnConsumeArgs) void {
+    defer args.deinit();
+    const allocator = std.heap.page_allocator;
+    const response = daemon_client.requestAlloc(allocator, args.pref_path, "chat.turn.consume", .{ .turn_id = args.turn_id }, 5) catch |err| {
         log.warn("failed to consume daemon chat turn: {s}", .{@errorName(err)});
         return;
     };
-    defer self.allocator.free(response);
+    defer allocator.free(response);
+    _ = terminalConsumeDisposition(response) catch |err| {
+        log.warn("invalid completed chat turn consume result: {s}", .{@errorName(err)});
+        return;
+    };
 }
 
 fn consumeDaemonChatTurnForThread(self: anytype, thread: *const ChatThread, turn_id: ?[]u8) void {

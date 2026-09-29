@@ -1396,6 +1396,12 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button
 
 /// Handles pane chrome before browser and terminal content can consume its click.
 pub fn handlePaneChromeMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, down: bool) bool {
+    // An open pane menu floats above native browser content, which would
+    // otherwise consume the press first; the menu must own it so rows
+    // activate and outside presses dismiss it.
+    if (down and split_menu_open_for != null and (button == 1 or button == 3)) {
+        return handlePaletteMouseButton(state, x, y, button, down, false, false);
+    }
     if (button != 1) return false;
     if (!down and scrolling_edge_pressed != null) {
         scrolling_edge_pressed = null;

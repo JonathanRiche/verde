@@ -20,6 +20,9 @@ static_dir: []const u8 = "",
 /// Exact public HTTPS origin supplied by the only trusted loopback proxy.
 /// Empty keeps the original SSH/loopback request-envelope policy.
 trusted_proxy_origin: []const u8 = "",
+/// Opt-in VNC backend. Never selected from browser input or chat routing.
+desktop_socket: []const u8 = "",
+desktop_port: ?u16 = null,
 
 /// Parses the loopback gateway and optional trusted HTTPS proxy profile.
 ///
@@ -38,6 +41,9 @@ pub fn parse(allocator: std.mem.Allocator, env: *const std.process.Environ.Map, 
     if (env.get(TRUSTED_PROXY_ORIGIN_ENV)) |value| config.trusted_proxy_origin = value;
     if (env.get(SESSIONIZER_SOCKET_ENV)) |value| config.sessionizer_endpoint = value;
 
+    if (env.get("VERDE_WEB_DESKTOP_SOCKET")) |value| config.desktop_socket = value;
+    config.desktop_port = try parsePort(env.get("VERDE_WEB_DESKTOP_PORT"));
+
     var index: usize = 1;
     while (index < args.len) : (index += 1) {
         const arg = args[index];
@@ -47,6 +53,10 @@ pub fn parse(allocator: std.mem.Allocator, env: *const std.process.Environ.Map, 
             return error.RawTokenForbidden;
         } else if (legacyBackendArgument(arg)) {
             return error.LegacyBackendForbidden;
+        } else if (try takeValue(args, &index, arg, "--desktop-socket")) |value| {
+            config.desktop_socket = value;
+        } else if (try takeValue(args, &index, arg, "--desktop-port")) |value| {
+            config.desktop_port = try parsePortRequired(value);
         } else if (try takeValue(args, &index, arg, "--host")) |value| {
             config.host = value;
         } else if (try takeValue(args, &index, arg, "--port")) |value| {
@@ -71,6 +81,12 @@ pub fn parse(allocator: std.mem.Allocator, env: *const std.process.Environ.Map, 
     config.host = std.mem.trim(u8, config.host, &std.ascii.whitespace);
     config.token_file = std.mem.trim(u8, config.token_file, &std.ascii.whitespace);
     config.trusted_proxy_origin = std.mem.trim(u8, config.trusted_proxy_origin, &std.ascii.whitespace);
+    if (config.desktop_socket.len != 0 and config.desktop_port != null) return error.AmbiguousDesktopBackend;
+    if (config.desktop_socket.len != 0) {
+        if (!std.fs.path.isAbsolute(config.desktop_socket)) return error.InvalidDesktopSocket;
+        _ = std.Io.net.UnixAddress.init(config.desktop_socket) catch return error.InvalidDesktopSocket;
+        if (std.mem.indexOfScalar(u8, config.desktop_socket, 0) != null) return error.InvalidDesktopSocket;
+    }
     if (!isLoopback(config.host)) return error.NonLoopbackHost;
     if (std.ascii.eqlIgnoreCase(config.host, "localhost")) config.host = DEFAULT_HOST;
     if (config.token_file.len == 0) return error.TokenFileRequired;
@@ -101,12 +117,14 @@ pub fn printUsage() void {
         \\  --pref-path <dir>     Verde data dir (default ~/.local/share/verde/Native)
         \\  --sessionizer <path>  Session-daemon unix socket
         \\  --static <dir>        Built Solid SPA directory
+        \\  --desktop-socket <path>  Opt in to a local VNC Unix socket
+        \\  --desktop-port <n>       Or a VNC port on 127.0.0.1 (owner access only)
         \\  --trusted-proxy-origin <https-origin>
         \\                        Trust exact forwarded HTTPS host/origin from a loopback proxy
         \\
         \\Environment: VERDE_WEB_HOST, VERDE_WEB_PORT, VERDE_WEB_TOKEN_FILE,
         \\VERDE_PREF_PATH, VERDE_WEB_STATIC, VERDE_SESSIONIZER_SOCKET,
-        \\VERDE_WEB_TRUSTED_PROXY_ORIGIN
+        \\VERDE_WEB_TRUSTED_PROXY_ORIGIN, VERDE_WEB_DESKTOP_SOCKET, VERDE_WEB_DESKTOP_PORT
         \\
         \\The listener always remains loopback-only. Use an SSH local-forward,
         \\or explicitly name the HTTPS origin of one trusted loopback proxy.
@@ -314,5 +332,19 @@ test "trusted proxy mode requires one exact pathless HTTPS origin" {
     }));
     try std.testing.expectError(error.InvalidTrustedProxyOrigin, parse(std.testing.allocator, &env, &.{
         "verde-web", "--token-file", "/tmp/verde-token", "--trusted-proxy-origin", "https://runtime.example.test/path",
+    }));
+}
+
+test "desktop configuration rejects ambiguous or nonlocal socket targets" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try std.testing.expectError(error.AmbiguousDesktopBackend, parse(std.testing.allocator, &env, &.{
+        "verde-web", "--token-file", "/token", "--desktop-socket", "/vnc.sock", "--desktop-port", "5900",
+    }));
+    try std.testing.expectError(error.InvalidDesktopSocket, parse(std.testing.allocator, &env, &.{
+        "verde-web", "--token-file", "/token", "--desktop-socket", "relative.sock",
+    }));
+    try std.testing.expectError(error.InvalidPort, parse(std.testing.allocator, &env, &.{
+        "verde-web", "--token-file", "/token", "--desktop-port", "0",
     }));
 }

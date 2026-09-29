@@ -9,6 +9,7 @@ const daemon_mod = @import("daemon.zig");
 const office_preview = @import("office_preview.zig");
 const served_files = @import("served_files.zig");
 const theme_mod = @import("theme.zig");
+const desktop_mod = @import("desktop.zig");
 
 const log = std.log.scoped(.web_http);
 
@@ -112,6 +113,7 @@ const BASE_SECURITY_HEADERS = [_]std.http.Header{
 const Runtime = struct {
     connection_slots: std.Io.Semaphore = .{ .permits = MAX_CONNECTIONS },
     active_websockets: std.atomic.Value(usize) = .init(0),
+    desktop_active: std.atomic.Value(bool) = .init(false),
 
     fn tryAcquireWebSocket(self: *Runtime) bool {
         var active = self.active_websockets.load(.acquire);
@@ -319,6 +321,9 @@ fn handleWebSocketUpgrade(
     request: *std.http.Server.Request,
     opt_key: ?[]const u8,
 ) !void {
+    if (desktopWebSocketTargetAllowed(request.head.method, request.head.target)) {
+        return handleDesktopUpgrade(allocator, io, auth, runtime, config, request_envelope, request, opt_key);
+    }
     if (!webSocketTargetAllowed(request.head.method, request.head.target)) {
         try respondJson(request, .not_found, "{\"ok\":false,\"error\":\"websocket_not_found\"}");
         return;
@@ -1089,6 +1094,18 @@ fn handleApi(
     if (std.mem.eql(u8, split.path, "/api/file") or std.mem.eql(u8, split.path, "/api/preview")) {
         try handleWorkspaceFile(allocator, io, config, daemon, auth, env_map, auth_context, split, request);
         return;
+    }
+
+    if (std.mem.eql(u8, split.path, "/api/desktop")) {
+        if (auth_context == .pair) return respondJson(request, .forbidden, "{\"ok\":false,\"error\":\"owner_required\"}");
+        if (request.head.method != .GET) return respondMethodNotAllowed(request);
+        // Enabled is configuration, not a claim that the graphical session is alive.
+        const body = try std.json.Stringify.valueAlloc(allocator, .{
+            .enabled = desktop_mod.enabled(config),
+            .target = "gateway_host",
+        }, .{});
+        defer allocator.free(body);
+        return respondJson(request, .ok, body);
     }
 
     if (std.mem.eql(u8, split.path, "/api/chat-connections")) {
@@ -4056,4 +4073,76 @@ test "subagent open is daemon routed and requires chat write" {
     try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy("chat.subagent.open", headless.access_protocol.scopeBit(.repository_write)));
     // The GUI's read-only provider-subagent view stays desktop-only.
     try std.testing.expectEqual(PairedRpcPolicy.forbidden, pairedRpcPolicy("chat.open_subagent", 0xffff));
+}
+
+fn desktopWebSocketTargetAllowed(method: std.http.Method, target: []const u8) bool {
+    return method == .GET and std.mem.eql(u8, target, "/ws/desktop");
+}
+
+fn handleDesktopUpgrade(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    auth: *auth_mod.Service,
+    runtime: *Runtime,
+    config: config_mod,
+    envelope: RequestEnvelope,
+    request: *std.http.Server.Request,
+    opt_key: ?[]const u8,
+) !void {
+    // No pairing-ticket fallback: existing device grants do not authorize the desktop.
+    const owner = (try authenticate(auth, io, request)) orelse return respondUnauthorized(request);
+    if (!requestOriginAllowed(config, envelope, request, owner == .owner_session)) {
+        return respondJson(request, .forbidden, "{\"ok\":false,\"error\":\"origin_forbidden\"}");
+    }
+    if (!desktop_mod.enabled(config)) return respondJson(request, .not_found, "{\"ok\":false,\"error\":\"desktop_disabled\"}");
+    if (runtime.desktop_active.swap(true, .acq_rel)) {
+        return respondJson(request, .conflict, "{\"ok\":false,\"error\":\"desktop_in_use\"}");
+    }
+    defer runtime.desktop_active.store(false, .release);
+    if (!runtime.tryAcquireWebSocket()) return respondJson(request, .service_unavailable, "{\"ok\":false,\"error\":\"websocket_limit\"}");
+    defer runtime.releaseWebSocket();
+    const key = opt_key orelse return respondJson(request, .bad_request, "{\"ok\":false,\"error\":\"missing_websocket_key\"}");
+    var authentication = try webSocketAuthenticationFromOwner(owner);
+    defer authentication.clear();
+    const backend = desktop_mod.connect(io, config) catch |err| {
+        if (err == error.Canceled) return error.Canceled;
+        request.head.keep_alive = false;
+        return respondJson(request, .service_unavailable, "{\"ok\":false,\"error\":\"desktop_unavailable\"}");
+    };
+    defer backend.close(io);
+    const headers = BASE_SECURITY_HEADERS ++ [_]std.http.Header{
+        .{ .name = "cache-control", .value = "no-store" },
+    };
+    var socket = try request.respondWebSocket(.{ .key = key, .extra_headers = &headers });
+    try socket.flush();
+    const buffer = try allocator.alloc(u8, desktop_mod.MAX_FRAME_BYTES + 14);
+    defer allocator.free(buffer);
+    defer std.crypto.secureZero(u8, buffer);
+    const unread = socket.input.buffer[socket.input.seek..socket.input.end];
+    if (unread.len > buffer.len) return error.MessageOversize;
+    @memcpy(buffer[0..unread.len], unread);
+    socket.input.buffer = buffer;
+    socket.input.seek = 0;
+    socket.input.end = unread.len;
+    var session: desktop_mod.Session = .{
+        .io = io,
+        .socket = &socket,
+        .backend = backend,
+        .auth = auth,
+        .session_id = switch (authentication) {
+            .owner_session => |id| id,
+            .owner_bearer => null,
+            .pair => unreachable,
+        },
+    };
+    try session.run();
+}
+
+test "desktop upgrade target is exact and separate from RPC" {
+    try std.testing.expect(desktopWebSocketTargetAllowed(.GET, "/ws/desktop"));
+    try std.testing.expect(!desktopWebSocketTargetAllowed(.GET, "/ws/desktop?token=x"));
+    try std.testing.expect(!desktopWebSocketTargetAllowed(.GET, "/ws/desktop/"));
+    try std.testing.expect(!desktopWebSocketTargetAllowed(.POST, "/ws/desktop"));
+    try std.testing.expect(!desktopWebSocketTargetAllowed(.GET, "/ws"));
+    try std.testing.expect(!webSocketTargetAllowed(.GET, "/ws/desktop"));
 }

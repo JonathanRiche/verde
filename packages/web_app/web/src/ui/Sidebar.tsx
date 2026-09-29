@@ -5,6 +5,7 @@ import { store, type SidebarContextAction } from '../lib/store'
 import { paneIsActive, type LayoutNode, type LivePane, type Workspace } from '../lib/types'
 import { Icon, ProviderGlyph, StatusPip, VerdeLogo } from './Icons'
 import { ChatRouting } from './ChatRouting'
+import { openDesktopViewer } from './DesktopViewer'
 import { openHistory } from './History'
 import { sidebarMenuAvailability } from '../lib/commands'
 
@@ -204,6 +205,7 @@ export function Sidebar(props: { drawer?: boolean }) {
           <div class="mr-auto truncate text-[11px] text-[var(--text-subtle)]">
             {store.connected() ? store.source() : 'reconnecting'}
           </div>
+          <button type="button" class="mr-2 rounded-[7px] px-2 py-1.5 text-[12px] text-[var(--text-subtle)] hover:bg-[var(--accent-row)] hover:text-[var(--text)]" onClick={() => { store.setDrawerOpen(false); openDesktopViewer() }}>Host desktop</button>
           <IconButton label="Settings" onClick={() => store.setSettingsOpen(true)}>
             <Icon name="settings" class="h-4 w-4" />
           </IconButton>

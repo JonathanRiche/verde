@@ -144,7 +144,7 @@ fn choiceLabel(id: []const u8) []const u8 {
     if (eq(id, "gpt-5.6-luna")) return "GPT-5.6 Luna";
     if (eq(id, "fable[1m]")) return "Fable 5.1";
     if (eq(id, "opus[1m]")) return "Opus 5.5 (1M context)";
-    if (eq(id, "sonnet")) return "Sonnet 5";
+    if (eq(id, "sonnet")) return "Sonnet 5.5";
     if (eq(id, "haiku")) return "Haiku 4.5";
     if (eq(id, "opencode/gpt-5.5")) return "GPT-5.5";
     if (eq(id, "opencode/gpt-5.4")) return "GPT-5.4";

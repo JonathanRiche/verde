@@ -182,3 +182,60 @@ or omitted. Linux permits relative in-root directory symlinks; the portable
 fallback rejects symlinks. Listing uses a descriptor opened beneath the root,
 so the desktop need not be running. The legacy `web.directory.list` remains
 blocked.
+
+## Host desktop (experimental)
+
+The sidebar's **Host desktop** opens an owner-only noVNC viewer for the gateway
+host. This is independent of the chat connection selector: selecting a saved
+remote chat runtime does **not** switch the desktop. For a remote Omarchy box,
+run the gateway and host helper on that box and use its private SSH/Tailscale web
+address. Routing desktop streams through saved runtime profiles is not implemented.
+
+Desktop access is disabled by default. Opt in with exactly one backend:
+
+- `--desktop-socket /absolute/private/vnc.sock` or `VERDE_WEB_DESKTOP_SOCKET`:
+  raw RFB Unix socket, same UID, no symlinks, socket and containing directory with
+  no group/other access. This is the recommended Omarchy backend.
+- `--desktop-port 5900` or `VERDE_WEB_DESKTOP_PORT`: raw RFB TCP on **127.0.0.1**
+  only. The VNC server remains responsible for authentication and its own listener
+  exposure. This option does not make a wildcard VNC listener private.
+
+See [Omarchy setup](../../docs/remote-desktop-omarchy.md) and
+[macOS candidate/diagnostics](../../docs/remote-desktop-macos.md). After starting
+the Omarchy helper explicitly, launch a gateway with your existing arguments plus:
+
+```sh
+--desktop-socket "$XDG_RUNTIME_DIR/verde-remote-desktop/vnc.sock"
+```
+
+`GET /api/desktop` returns whether a backend is configured, not whether capture is
+working. Exact `GET /ws/desktop` upgrades to a separate binary RFB relay after
+owner authentication and origin validation. Paired runtime/device grants are
+rejected; they do not acquire host control. The relay permits one viewer, bounds
+frames/buffers and backend connection time, and joins both directions when either
+peer closes. Login revocation/expiry disconnects the stream (checked at most one
+second later); all connections have a one-hour limit and can reconnect.
+
+The viewer starts with input paused. **Enable control** permits mouse/keyboard;
+**Stop control** disconnects to release held input, and reconnecting starts paused
+again. This UI toggle is not a server-enforced view-only permission. Use the
+Omarchy helper's `--view-only` for a backend that disables input. Password/username
+prompts use transient noVNC credentials, never browser storage or URLs. Clipboard
+sync, audio, file transfer, remote resizing, separate sessions, pre-login access,
+and saved-profile routing are outside this first version. Browser/OS-reserved
+shortcuts may not reach the host. NoVNC is lazy-loaded and pinned in `package.json`;
+its MPL-2.0 and bundled third-party notices ship in its package.
+
+Verification after `mise run web-app`:
+
+```sh
+python3 scripts/remote-desktop/gateway-test.py
+python3 scripts/remote-desktop/omarchy_test.py
+bash scripts/remote-desktop/macos-screen-sharing-test.sh
+# Optional, with agent-browser on PATH and a workspace browser lease:
+python3 scripts/remote-desktop/browser-test.py
+```
+
+Tests use temporary state and synthetic RFB, never the user's desktop or daemon.
+Live Omarchy capture/input and native macOS compatibility still require host
+validation. Do not restart Verde from a Verde-hosted session to deploy this change.

@@ -1604,6 +1604,7 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             .thread_import_select => state.selectThreadImport(hit.index),
             .cookie_import_source_select => state.selectCookieImportSource(hit.index),
             .cookie_import_domain_toggle => state.toggleCookieImportDomain(hit.index),
+            .cookie_import_select_all => state.toggleCookieImportSelectAll(),
             .cookie_import_cancel => state.cancelCookieImport(),
             .cookie_import_submit => state.submitCookieImport(),
             .handoff_cancel => state.cancelHandoff(),
@@ -3717,6 +3718,7 @@ const CookieImportGeometry = struct {
     warning: palette.Rect,
     source_list: palette.Rect,
     search: palette.Rect,
+    select_all: palette.Rect,
     domain_list: palette.Rect,
     cancel: palette.Rect,
     submit: palette.Rect,
@@ -3735,7 +3737,9 @@ fn cookieImportGeometry(width: f32, height: f32) CookieImportGeometry {
     y += theme.scaledUi(42.0);
     const source_list: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = inner_w, .h = theme.scaledUi(96.0) };
     y += source_list.h + theme.scaledUi(10.0);
-    const search: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = inner_w, .h = theme.scaledUi(32.0) };
+    const select_all_w = theme.scaledUi(112.0);
+    const search: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = inner_w - select_all_w - theme.scaledUi(8.0), .h = theme.scaledUi(32.0) };
+    const select_all: palette.Rect = .{ .x = search.x + search.w + theme.scaledUi(8.0), .y = y, .w = select_all_w, .h = search.h };
     y += search.h + theme.scaledUi(10.0);
     const button_h = theme.scaledUi(34.0);
     const button_y = modal.y + modal.h - pad - button_h;
@@ -3749,12 +3753,29 @@ fn cookieImportGeometry(width: f32, height: f32) CookieImportGeometry {
         .warning = warning,
         .source_list = source_list,
         .search = search,
+        .select_all = select_all,
         .domain_list = domain_list,
         .cancel = cancel,
         .submit = submit,
         .row_h = theme.scaledUi(28.0),
         .source_row_h = theme.scaledUi(28.0),
     };
+}
+
+/// Inner area of the domain list that rows may occupy (inside the border).
+fn cookieImportListInner(geo: CookieImportGeometry) palette.Rect {
+    const inset = theme.scaledUi(4.0);
+    return .{ .x = geo.domain_list.x + inset, .y = geo.domain_list.y + inset, .w = geo.domain_list.w - inset * 2.0, .h = geo.domain_list.h - inset * 2.0 };
+}
+
+/// Row rect at `row_y` intersected with the list's inner area; null when the
+/// row is scrolled fully out of view.
+fn clipCookieImportRow(geo: CookieImportGeometry, row_y: f32) ?palette.Rect {
+    const inner = cookieImportListInner(geo);
+    const top = @max(row_y, inner.y);
+    const bottom = @min(row_y + geo.row_h - theme.scaledUi(2.0), inner.y + inner.h);
+    if (bottom <= top) return null;
+    return .{ .x = inner.x, .y = top, .w = inner.w, .h = bottom - top };
 }
 
 fn registerCookieImportModalHits(state: *runtime.AppState, width: f32, height: f32) void {
@@ -3771,16 +3792,17 @@ fn registerCookieImportModalHits(state: *runtime.AppState, width: f32, height: f
 
     // Search field (only actionable once a source is chosen, but always hit-registered).
     queueModalHit(state, geo.search, .cookie_import_search_input, 0);
+    queueModalHit(state, geo.select_all, .cookie_import_select_all, 0);
 
-    // Domain rows (filtered).
+    // Domain rows (filtered). Rows are clipped to the list box so a partially
+    // scrolled row cannot register a hit under the buttons below.
     var visible: usize = 0;
     for (state.cookie_import.domains.items, 0..) |domain, index| {
         const query = state.cookie_import.searchQuery();
         if (query.len != 0 and std.mem.indexOf(u8, domain.domain, query) == null) continue;
         const row_y = geo.domain_list.y + theme.scaledUi(4.0) + @as(f32, @floatFromInt(visible)) * geo.row_h - state.cookie_import.domain_scroll;
         visible += 1;
-        if (row_y + geo.row_h < geo.domain_list.y or row_y > geo.domain_list.y + geo.domain_list.h) continue;
-        const row: palette.Rect = .{ .x = geo.domain_list.x + theme.scaledUi(4.0), .y = row_y, .w = geo.domain_list.w - theme.scaledUi(8.0), .h = geo.row_h - theme.scaledUi(2.0) };
+        const row = clipCookieImportRow(geo, row_y) orelse continue;
         queueModalHit(state, row, .cookie_import_domain_toggle, index);
     }
 
@@ -3872,6 +3894,8 @@ fn renderCookieImportModal(state: *runtime.AppState, width: f32, height: f32) vo
 
     // Search field.
     drawTextField(state, geo.search, state.cookie_import.searchQuery(), "Filter sites…", state.palette_modal_text_focus == .cookie_import_search, state.cookie_import.search_cursor);
+    const select_all_label: []const u8 = if (state.cookieImportAllFilteredSelected()) "Clear all" else "Select all";
+    drawActionButton(state, geo.select_all, select_all_label, theme.COLOR_PANEL_MUTED);
 
     // Domain list.
     queuePaletteRoundedRect(state, geo.domain_list, paletteColor(theme.sink(theme.COLOR_PANEL_ALT, 0.03)), theme.scaledUi(8.0));
@@ -3885,15 +3909,18 @@ fn renderCookieImportModal(state: *runtime.AppState, width: f32, height: f32) vo
             if (query.len != 0 and std.mem.indexOf(u8, domain.domain, query) == null) continue;
             const row_y = geo.domain_list.y + theme.scaledUi(4.0) + @as(f32, @floatFromInt(visible)) * geo.row_h - state.cookie_import.domain_scroll;
             visible += 1;
-            if (row_y + geo.row_h < geo.domain_list.y or row_y > geo.domain_list.y + geo.domain_list.h) continue;
-            const row: palette.Rect = .{ .x = geo.domain_list.x + theme.scaledUi(4.0), .y = row_y, .w = geo.domain_list.w - theme.scaledUi(8.0), .h = geo.row_h - theme.scaledUi(2.0) };
+            // Only the portion inside the list box is painted; text is clipped
+            // to the same area so a half-scrolled row never spills over the
+            // buttons below.
+            const visible_row = clipCookieImportRow(geo, row_y) orelse continue;
+            const row: palette.Rect = .{ .x = visible_row.x, .y = row_y, .w = visible_row.w, .h = geo.row_h - theme.scaledUi(2.0) };
             const hovered = state.cookie_import.hover_index != null and state.cookie_import.hover_index.? == index;
-            if (hovered) queuePaletteRoundedRect(state, row, paletteColor(theme.raise(theme.COLOR_PANEL_MUTED, 0.06)), theme.scaledUi(6.0));
+            if (hovered) queuePaletteRoundedRect(state, visible_row, paletteColor(theme.raise(theme.COLOR_PANEL_MUTED, 0.06)), theme.scaledUi(6.0));
             const check = if (domain.selected) "\xE2\x9C\x93 " else "  ";
             var line_buf: [256]u8 = undefined;
             const line = std.fmt.bufPrint(&line_buf, "{s}{s}  ({d})", .{ check, domain.domain, domain.count }) catch domain.domain;
             const col = if (domain.selected) theme.COLOR_GREEN else theme.COLOR_WHITE;
-            queuePaletteText(state, .{ .x = row.x + theme.scaledUi(8.0), .y = row.y + theme.scaledUi(5.0), .w = row.w - theme.scaledUi(16.0), .h = theme.scaledUi(18.0) }, line, paletteColor(col), theme.scaledUi(13.0), row);
+            queuePaletteText(state, .{ .x = row.x + theme.scaledUi(8.0), .y = row.y + theme.scaledUi(5.0), .w = row.w - theme.scaledUi(16.0), .h = theme.scaledUi(18.0) }, line, paletteColor(col), theme.scaledUi(13.0), visible_row);
         }
     }
 

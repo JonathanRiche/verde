@@ -2145,6 +2145,7 @@ pub const PaletteModalAction = enum {
     thread_import_select,
     cookie_import_source_select,
     cookie_import_domain_toggle,
+    cookie_import_select_all,
     cookie_import_cancel,
     cookie_import_submit,
     cookie_import_search_input,
@@ -8195,6 +8196,8 @@ pub const AppState = struct {
     pub const cookieImportOpen = cookie_import_controller.cookieImportOpen;
     pub const selectCookieImportSource = cookie_import_controller.selectCookieImportSource;
     pub const toggleCookieImportDomain = cookie_import_controller.toggleCookieImportDomain;
+    pub const toggleCookieImportSelectAll = cookie_import_controller.toggleCookieImportSelectAll;
+    pub const cookieImportAllFilteredSelected = cookie_import_controller.cookieImportAllFilteredSelected;
     pub const submitCookieImport = cookie_import_controller.submitCookieImport;
     pub const pollCookieImport = cookie_import_controller.pollCookieImport;
     pub const noteCookieImportCompleted = cookie_import_controller.noteCookieImportCompleted;
@@ -13523,6 +13526,7 @@ pub const AppState = struct {
                 .command_palette_action_row,
                 .cookie_import_source_select,
                 .cookie_import_domain_toggle,
+                .cookie_import_select_all,
                 .cookie_import_cancel,
                 .cookie_import_submit,
                 => true,

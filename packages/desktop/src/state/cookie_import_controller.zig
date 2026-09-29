@@ -361,6 +361,34 @@ pub fn toggleCookieImportDomain(self: anytype, index: usize) void {
     self.markDirty();
 }
 
+/// True when every domain matching the current filter is selected (and
+/// there is at least one). Drives the "Select all" / "Clear all" label.
+pub fn cookieImportAllFilteredSelected(self: anytype) bool {
+    const state = &self.cookie_import;
+    const query = state.searchQuery();
+    var seen: usize = 0;
+    for (state.domains.items) |domain| {
+        if (query.len != 0 and std.mem.indexOf(u8, domain.domain, query) == null) continue;
+        seen += 1;
+        if (!domain.selected) return false;
+    }
+    return seen != 0;
+}
+
+/// Selects every domain matching the current filter, or clears them all when
+/// they are already all selected. Scoped to the filtered set so a search can
+/// be used to bulk-pick a subset.
+pub fn toggleCookieImportSelectAll(self: anytype) void {
+    const state = &self.cookie_import;
+    const query = state.searchQuery();
+    const select = !cookieImportAllFilteredSelected(self);
+    for (state.domains.items) |*domain| {
+        if (query.len != 0 and std.mem.indexOf(u8, domain.domain, query) == null) continue;
+        domain.selected = select;
+    }
+    self.markDirty();
+}
+
 /// Exports the selected domains' cookies and injects them into the browser.
 pub fn submitCookieImport(self: anytype) void {
     const state = &self.cookie_import;

@@ -11,11 +11,14 @@ import { ActionDialog } from './ActionDialog'
 import { PrefixBar } from './PrefixBar'
 import { PaneActionsButton, Sidebar } from './Sidebar'
 import { WorkspaceCanvas } from './WorkspaceCanvas'
+import { DesktopViewer, desktopViewerOpen } from './DesktopViewer'
 
 export function App() {
   onMount(() => {
     store.start()
-    const onKey = (event: KeyboardEvent) => store.handleKey(event)
+    const onKey = (event: KeyboardEvent) => {
+      if (!desktopViewerOpen()) store.handleKey(event)
+    }
     window.addEventListener('keydown', onKey)
     onCleanup(() => window.removeEventListener('keydown', onKey))
   })
@@ -90,6 +93,7 @@ export function App() {
       <ActionDialog />
       <History />
       <FileViewer />
+      <DesktopViewer />
       <NoticeToast />
     </div>
   )
