@@ -29,6 +29,37 @@ final class GitChangesTests: XCTestCase {
         let file = GitReviewFile(path: "a.swift", status: "modified", ownership: ownership, additions: 2, deletions: 1, binary: false, hunk_selectable: true, preview_truncated: false, hunks: [GitReviewHunk(index: 0, header: "@@ -1 +1 @@", text: "fixture")])
         return GitReviewView(state: "loaded", can_commit: true, review: GitReviewResult(review_id: "r", workspace_id: "w", local_thread_id: "t", turn_running: false, default_action: "commit", repos: [GitReviewRepo(root: "/repo", name: "repo", branch: branch, files: [file])]), message_state: "ready", message: GitCommitMessageResult(message: "Fixture subject", branch: "feature/fixture", provider: "codex", model: "fixture"))
     }
+    func testFilesAndHunksCanBeSelectedWithoutShowingDiffs() async throws {
+        let fake = Fake(); let model = fake.model()
+        await model.receive(review(ownership: "shared"))
+        let key = GitFileKey(root: "/repo", path: "a.swift")
+        XCTAssertFalse(model.canSubmit)
+        model.toggleFile(key)
+        XCTAssertTrue(model.canSubmit)
+        XCTAssertTrue(model.expanded.isEmpty)
+        await model.toggleDiffs()
+        XCTAssertTrue(model.expanded.contains(key))
+        let file = try XCTUnwrap(model.review?.repos.first?.files.first)
+        model.toggleHunk(key, file: file, index: 0, on: false)
+        XCTAssertFalse(model.canSubmit)
+        model.toggleHunk(key, file: file, index: 0, on: true)
+        XCTAssertTrue(model.canSubmit)
+        await model.toggleDiffs()
+        XCTAssertTrue(model.expanded.isEmpty)
+        XCTAssertTrue(model.selected.contains(key))
+    }
+    func testChangedSelectionRegeneratesBeforeCommitButTypedMessageDoesNot() async {
+        let fake = Fake(); let model = fake.model()
+        await model.receive(review(ownership: "shared"))
+        model.toggleFile(GitFileKey(root: "/repo", path: "a.swift"))
+        await model.commit()
+        XCTAssertEqual(fake.events.filter { if case .git_message_generate = $0 { return true }; return false }.count, 1)
+        XCTAssertFalse(fake.events.contains { if case .git_commit = $0 { return true }; return false })
+        model.message = "Chosen subject"
+        await model.commit()
+        XCTAssertEqual(fake.events.filter { if case .git_commit = $0 { return true }; return false }.count, 1)
+    }
+
     func testReviewSheetScreenshot() async throws {
         let fake = Fake(); let model = fake.model()
         await model.receive(review())

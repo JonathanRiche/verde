@@ -16,7 +16,9 @@ final class GitChangesModel {
     var sheet = false
     var confirmMain = false
     var choosePush = false
-    var edit = false
+    var expanded: Set<GitFileKey> = []
+    private var generatedSelection: Data?
+    private var generatingSelection: (id: String, key: Data)?
     var message = ""
     var notice: String?
     var selected: Set<GitFileKey> = []
@@ -90,7 +92,36 @@ final class GitChangesModel {
         } }
         return (added, removed)
     }
-    var canSubmit: Bool { canCommit && !busy && view?.state == "loaded" && view?.loading != true && count > 0 && !finalMessage.isEmpty }
+    private var selectionKey: Data {
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+        return (try? encoder.encode(selections)) ?? Data()
+    }
+    var usesGeneratedMessage: Bool { message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    var allDiffsShown: Bool {
+        let keys = (review?.repos ?? []).flatMap { repo in repo.files.map { GitFileKey(root: repo.root, path: $0.path) } }
+        return !keys.isEmpty && keys.allSatisfy { expanded.contains($0) }
+    }
+    func toggleFile(_ key: GitFileKey) {
+        guard !busy else { return }
+        if selected.contains(key) { selected.remove(key) } else { selected.insert(key) }
+        hunks[key] = nil
+    }
+    func toggleHunk(_ key: GitFileKey, file: GitReviewFile, index: UInt32, on: Bool) {
+        guard !busy, file.hunk_selectable, !file.binary, !file.preview_truncated else { return }
+        var indices = selected.contains(key) ? (hunks[key] ?? Set(file.hunks.map(\.index))) : []
+        if on { indices.insert(index) } else { indices.remove(index) }
+        if indices.isEmpty { selected.remove(key); hunks[key] = nil }
+        else { selected.insert(key); hunks[key] = indices.count == file.hunks.count ? nil : indices }
+    }
+    func toggleDiffs() async {
+        if allDiffsShown {
+            expanded = []
+            if usesGeneratedMessage && generatedSelection != selectionKey { await generate() }
+        } else {
+            expanded = Set((review?.repos ?? []).flatMap { repo in repo.files.map { GitFileKey(root: repo.root, path: $0.path) } })
+        }
+    }
+    var canSubmit: Bool { canCommit && !busy && view?.state == "loaded" && view?.loading != true && count > 0 && view?.message_state != "loading" && !generating }
     var defaultPush: Bool { (view?.config?.commit_default_action ?? "commit") == "commit_and_push" }
     var label: String {
         if (change?.files ?? 0) == 0 && ahead > 0 { return "↑\(ahead) Push" }
@@ -129,13 +160,13 @@ final class GitChangesModel {
         guard let review, next?.state == "loaded", next?.loading != true else { return }
         if review.review_id != loadedID {
             loadedID = review.review_id
-            message = ""; hunks = [:]; selected = []
+            message = ""; hunks = [:]; selected = []; expanded = []; generatedSelection = nil
             for repo in review.repos { for file in repo.files where file.ownership == "mine" { selected.insert(GitFileKey(root: repo.root, path: file.path)) } }
             if quick && (review.turn_running || review.repos.contains { $0.branch == nil || $0.files.contains { $0.ownership != "mine" } }) { quick = false; sheet = true }
             if !selections.isEmpty { await generate() }
             else if quick { quick = false; sheet = true; notice = "No selected changes to commit." }
         }
-        if quick, next?.message_state == "ready", canSubmit {
+        if quick, next?.message_state == "ready", generatedSelection == selectionKey, !generated.isEmpty, canSubmit {
             quick = false
             if mainBranch != nil { confirmMain = true } else { await commit(push: true) }
         }
@@ -148,10 +179,17 @@ final class GitChangesModel {
     func generate() async {
         guard let review, !generating, !selections.isEmpty, view?.message_state != "loading" else { return }
         generating = true; defer { generating = false }
-        await dispatch(.git_message_generate(EventGitMessageGenerate(now_ms: 0, wall_time_ms: 0, intent_id: UUID().uuidString, review_id: review.review_id, selections: selections)))
+        let id = UUID().uuidString
+        generatingSelection = (id, selectionKey)
+        await dispatch(.git_message_generate(EventGitMessageGenerate(now_ms: 0, wall_time_ms: 0, intent_id: id, review_id: review.review_id, selections: selections)))
     }
     func commit(push: Bool? = nil, newBranch: Bool = false) async {
         guard let review, canSubmit else { return }
+        if usesGeneratedMessage && (generatedSelection != selectionKey || generated.isEmpty) {
+            await generate()
+            notice = "Generating a message for the selected changes. Review it, then commit."
+            return
+        }
         submitting = true; defer { submitting = false }
         confirmMain = false
         await dispatch(.git_commit(EventGitCommit(now_ms: 0, wall_time_ms: 0, intent_id: UUID().uuidString, review_id: review.review_id, message: finalMessage, selections: selections, push: push ?? wantsPush, new_branch: newBranch, branch_name: newBranch ? view?.message?.branch : nil)))
@@ -200,6 +238,10 @@ final class GitChangesModel {
         for operation in operations where pending[operation.intent_id] != nil && operation.state != "pending" {
             // Core alone owns recovery. An uncertain receipt never becomes a new commit.
             pending[operation.intent_id] = nil
+            if let generation = generatingSelection, generation.id == operation.intent_id {
+                if operation.state == "succeeded" { generatedSelection = generation.key }
+                generatingSelection = nil
+            }
             if operation.state == "uncertain" { notice = "Checking original operation…"; continue }
             if operation.state != "succeeded" {
                 quick = false; confirmMain = false

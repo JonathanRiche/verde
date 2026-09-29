@@ -137,7 +137,7 @@ struct GitCommitSheet: View {
                 }.font(VerdeTheme.ui(12, bold: true)).padding().background(VerdeTheme.panel)
             }
             .navigationTitle("Commit changes").navigationBarTitleDisplayMode(.inline)
-            .toolbar { Button(model.edit ? "Done" : "Edit") { model.edit.toggle() }.disabled(model.busy) }
+            .toolbar { Button(model.allDiffsShown ? "Hide diffs" : "Show diffs") { Task { await model.toggleDiffs() } }.disabled(model.busy) }
         }
         .presentationDetents([.medium, .large]).presentationDragIndicator(.visible)
         .tint(VerdeTheme.accent).foregroundStyle(VerdeTheme.text).font(VerdeTheme.ui(14))
@@ -145,38 +145,46 @@ struct GitCommitSheet: View {
     }
     @ViewBuilder private func fileRow(_ repo: GitReviewRepo, _ file: GitReviewFile) -> some View {
         let key = GitFileKey(root: repo.root, path: file.path)
+        let selected = model.selected.contains(key)
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
-                if model.edit {
-                    Button {
-                        if model.selected.contains(key) { model.selected.remove(key); model.hunks[key] = nil } else { model.selected.insert(key) }
-                    } label: { Image(systemName: model.selected.contains(key) ? "checkmark.square.fill" : "square").frame(width: 26, height: 26) }
-                    .accessibilityLabel("Select \(file.path)").accessibilityValue(model.selected.contains(key) ? "Selected" : "Not selected")
-                }
-                Text(file.path).font(VerdeTheme.mono(11)).lineLimit(2)
-                Spacer(minLength: 4)
-                Text("+\(file.additions)").foregroundStyle(VerdeTheme.accent)
-                Text("−\(file.deletions)").foregroundStyle(VerdeTheme.danger)
+                Button {
+                    if model.expanded.contains(key) { model.expanded.remove(key) } else { model.expanded.insert(key) }
+                } label: {
+                    Image(systemName: model.expanded.contains(key) ? "chevron.down" : "chevron.right").frame(width: 28, height: 40)
+                }.accessibilityLabel("Show diffs for \(file.path)")
+                Button { model.toggleFile(key) } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: selected ? "checkmark.square.fill" : "square")
+                        VStack(alignment: .leading) {
+                            Text(file.path).font(VerdeTheme.mono(11)).lineLimit(2)
+                            if file.ownership != "mine" { Text(file.ownership.capitalized).font(VerdeTheme.ui(10)).foregroundStyle(VerdeTheme.warning) }
+                        }
+                        Spacer(minLength: 4)
+                        Text("+\(file.additions)").foregroundStyle(VerdeTheme.accent)
+                        Text("−\(file.deletions)").foregroundStyle(VerdeTheme.danger)
+                    }.frame(maxWidth: .infinity, minHeight: 40).contentShape(Rectangle())
+                }.buttonStyle(.plain)
+                    .accessibilityLabel("Select \(file.path)").accessibilityValue(selected ? "Selected" : "Not selected")
             }
-            if file.ownership != "mine" { Text(file.ownership.capitalized).font(VerdeTheme.ui(10)).foregroundStyle(VerdeTheme.warning) }
-            if model.edit && model.selected.contains(key) && file.hunk_selectable && !file.preview_truncated && !file.binary {
-                ForEach(file.hunks, id: \.index) { hunk in
-                    DisclosureGroup {
-                        ScrollView(.horizontal) { Text(hunk.text).font(VerdeTheme.mono(10)).textSelection(.enabled) }
-                    } label: {
-                        Toggle(hunk.header, isOn: Binding(get: { model.hunks[key]?.contains(hunk.index) ?? true }, set: { on in
-                            var selected = model.hunks[key] ?? Set(file.hunks.map(\.index))
-                            if on { selected.insert(hunk.index) } else { selected.remove(hunk.index) }
-                            if selected.isEmpty { model.selected.remove(key); model.hunks[key] = nil }
-                            else { model.hunks[key] = selected.count == file.hunks.count ? nil : selected }
-                        })).font(VerdeTheme.mono(10))
+            if model.expanded.contains(key) {
+                if file.hunk_selectable && !file.preview_truncated && !file.binary {
+                    ForEach(file.hunks, id: \.index) { hunk in
+                        VStack(alignment: .leading) {
+                            Toggle(hunk.header, isOn: Binding(get: {
+                                model.selected.contains(key) && (model.hunks[key]?.contains(hunk.index) ?? true)
+                            }, set: { model.toggleHunk(key, file: file, index: hunk.index, on: $0) }))
+                            ScrollView(.horizontal) { Text(hunk.text).textSelection(.enabled) }
+                        }.font(VerdeTheme.mono(10))
                     }
+                } else {
+                    Text("Can only be committed whole").font(VerdeTheme.ui(10)).foregroundStyle(VerdeTheme.muted)
                 }
             }
-            if file.preview_truncated { Text("Preview limited · select the whole file").font(VerdeTheme.ui(10)).foregroundStyle(VerdeTheme.muted) }
             Divider().overlay(VerdeTheme.border)
-        }.opacity(file.ownership == "mine" ? 1 : 0.65).disabled(model.busy)
+        }.opacity(selected ? 1 : 0.65).disabled(model.busy)
     }
+
 }
 
 struct GitThreadDot: View {
