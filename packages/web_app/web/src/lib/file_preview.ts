@@ -4,6 +4,9 @@ import { officePreviewUrl, workspaceFileUrl } from './live'
 const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp'])
 const MARKDOWN_EXTS = new Set(['md', 'markdown'])
 const OFFICE_EXTS = new Set(['pptx', 'ppt', 'odp', 'docx', 'doc', 'odt', 'xlsx', 'xls', 'ods', 'rtf'])
+/// The gateway refuses these inline (they would run in its origin) and serves
+/// them only as `download=1` attachments.
+const ATTACHMENT_EXTS = new Set(['html', 'htm', 'svg', 'js', 'mjs', 'cjs', 'wasm'])
 
 export function extOf(path: string): string {
   const name = fileCitationName(path)
@@ -29,13 +32,17 @@ export async function loadFilePreview(path: string): Promise<FilePreview> {
   if (IMAGE_EXTS.has(ext)) {
     return await loadBinary(workspaceFileUrl(path), { kind: 'image', mime: imageMime(ext) })
   }
+  if (ext === 'svg') {
+    // An <img> never runs SVG scripts or loads its external resources.
+    return await loadBinary(workspaceFileUrl(path, true), { kind: 'image', mime: 'image/svg+xml' })
+  }
   if (ext === 'pdf') {
     return await loadBinary(workspaceFileUrl(path), { kind: 'pdf' })
   }
   if (OFFICE_EXTS.has(ext)) {
     return await loadBinary(officePreviewUrl(path), { kind: 'office' })
   }
-  const response = await fetch(workspaceFileUrl(path), { credentials: 'same-origin' })
+  const response = await fetch(workspaceFileUrl(path, ATTACHMENT_EXTS.has(ext)), { credentials: 'same-origin' })
   if (!response.ok) return previewFailure(response)
   const text = await response.text()
   if (text.includes('\u0000')) return { kind: 'none', reason: 'No preview for binary files.' }

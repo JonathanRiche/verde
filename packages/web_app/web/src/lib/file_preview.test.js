@@ -3,9 +3,12 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { loadFilePreview, revokeFilePreview } from './file_preview.ts'
 
 const original_fetch = globalThis.fetch
+const { createObjectURL, revokeObjectURL } = URL
 
 afterEach(() => {
   globalThis.fetch = original_fetch
+  URL.createObjectURL = createObjectURL
+  URL.revokeObjectURL = revokeObjectURL
 })
 
 describe('loadFilePreview', () => {
@@ -46,5 +49,27 @@ describe('loadFilePreview', () => {
     expect(preview.kind).toBe('office')
     expect(preview.kind === 'office' && preview.data.byteLength).toBe(4)
     revokeFilePreview(preview)
+  })
+
+  test('renders SVG as an image from the download attachment', async () => {
+    globalThis.URL.createObjectURL = () => 'blob:svg'
+    globalThis.URL.revokeObjectURL = () => {}
+    globalThis.fetch = async (input) => {
+      expect(String(input)).toContain('download=1')
+      return new Response('<svg xmlns="http://www.w3.org/2000/svg"/>', { status: 200 })
+    }
+
+    const preview = await loadFilePreview('/home/rtg/find-your-chapter.svg')
+    expect(preview).toEqual({ kind: 'image', url: 'blob:svg' })
+    revokeFilePreview(preview)
+  })
+
+  test('shows HTML source from the download attachment', async () => {
+    globalThis.fetch = async (input) => {
+      expect(String(input)).toContain('download=1')
+      return new Response('<h1>hi</h1>', { status: 200 })
+    }
+
+    expect(await loadFilePreview('/home/rtg/page.html')).toEqual({ kind: 'text', text: '<h1>hi</h1>' })
   })
 })
