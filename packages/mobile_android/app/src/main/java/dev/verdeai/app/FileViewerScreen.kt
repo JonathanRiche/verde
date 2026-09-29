@@ -303,7 +303,8 @@ private fun SvgFile(base64: String) {
             "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=8\">" +
             "<style>html,body{margin:0;height:100%;background:$color}" +
             "body{display:flex;align-items:center;justify-content:center}" +
-            "img{max-width:100%;max-height:100%;object-fit:contain}</style></head>" +
+            // Most SVGs assume a white page (dark ink, no background): back the image like a PDF page.
+            "img{max-width:100%;max-height:100%;object-fit:contain;background:#fff}</style></head>" +
             "<body><img alt=\"\" src=\"data:image/svg+xml;base64,$base64\"></body></html>"
     }
     AndroidView(

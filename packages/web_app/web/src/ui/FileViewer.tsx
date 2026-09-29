@@ -100,7 +100,7 @@ export function FileViewer() {
                       <img
                         src={(preview() as { url: string }).url}
                         alt={fileCitationName(path())}
-                        class="max-h-full max-w-full rounded-[8px] object-contain"
+                        class="max-h-full max-w-full rounded-[8px] bg-white object-contain"
                       />
                     </div>
                   </Match>

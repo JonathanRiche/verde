@@ -90,7 +90,7 @@ enum ViewerKind { case text, markdown, image, svg, pdf, office
 /// A static page that shows SVG only through `<img>` (no scripts, no fetches) under a
 /// CSP that forbids everything but inline style and the data: image itself.
 func svgPreviewHTML(_ data: Data) -> String {
-    #"<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'"><meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=8, user-scalable=yes"><style>html,body{margin:0;height:100%;background:transparent}body{display:flex;align-items:center;justify-content:center}img{width:100%;height:100%;object-fit:contain}</style></head><body><img alt="" src="data:image/svg+xml;base64,"# + data.base64EncodedString() + #""></body></html>"#
+    #"<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'"><meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=8, user-scalable=yes"><style>html,body{margin:0;height:100%;background:transparent}body{display:flex;align-items:center;justify-content:center}img{max-width:100%;max-height:100%;object-fit:contain;background:#fff}</style></head><body><img alt="" src="data:image/svg+xml;base64,"# + data.base64EncodedString() + #""></body></html>"#
 }
 
 func resolveFilePath(_ path: String, root: String?) -> String? {
