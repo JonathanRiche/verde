@@ -1357,7 +1357,10 @@ fn handleWorkspaceFile(
     const served_path = path_buffer[0..path_len];
     const stat = try file.stat(io);
     if (stat.size > MAX_SERVED_FILE_BYTES) return respondJson(request, .payload_too_large, "{\"ok\":false,\"error\":\"file_too_large\"}");
-    if (executableDocumentPath(served_path)) {
+    // Attachments are never rendered, so SVG/HTML may download; only inline
+    // responses refuse documents that would execute in the gateway's origin.
+    const download = queryValue(split.query, "download") != null;
+    if (!download and executableDocumentPath(served_path)) {
         try respondJson(request, .unsupported_media_type, "{\"ok\":false,\"error\":\"unsupported_document_type\"}");
         return;
     }
@@ -1404,7 +1407,7 @@ fn handleWorkspaceFile(
         },
     };
     defer allocator.free(bytes);
-    if (queryValue(split.query, "download") != null) {
+    if (download) {
         // The cited name is what the user clicked; the resolved path decides the type.
         const disposition = try attachmentDisposition(allocator, decoded);
         defer allocator.free(disposition);
