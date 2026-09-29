@@ -8,7 +8,10 @@ No fixture data, daemon RPC bypass, or local git commands are used in production
 The Compose header, sheet, confirmations, snackbar, settings section, and row
 markers consume this boundary. The model freezes the returned review, tracks
 file/hunk selections, and keeps typed text separate from generated suggestions.
-Shared, unclear, and unassigned files start unticked. Quick commit & push falls
+Shared, unclear, and unassigned files start unticked. File checkboxes are always
+visible; tapping a row toggles whole-file selection. Independent chevrons and
+Show diffs / Hide diffs control hunk previews. Changed selections discard stale
+generated messages; an empty message regenerates on commit or Hide diffs. Quick commit & push falls
 back to review for those files, an active turn, or detached HEAD. Default branches
 require confirmation. Branch creation uses the generated suggestion when present.
 

@@ -83,7 +83,7 @@ internal data class GitNotice(val text: String, val rejectedRoots: List<String> 
 internal data class GitChangesState(val snapshot: GitSnapshot = GitSnapshot(), val review: GitReview? = null,
     val sheet: Boolean = false, val preparing: Boolean = false, val confirmingMain: Boolean = false,
     val loading: Boolean = false, val generating: Boolean = false, val busy: Boolean = false, val checking: Boolean = false, val canRetry: Boolean = false,
-    val editing: Boolean = false, val action: GitAction = GitAction.Commit,
+    val expanded: Set<GitFileKey> = emptySet(), val editing: Boolean = false, val action: GitAction = GitAction.Commit,
     val selected: Map<GitFileKey, Set<Int>?> = emptyMap(), val typedMessage: String = "",
     val generated: GitMessage? = null, val error: String? = null, val messageError: Boolean = false,
     val notice: GitNotice? = null, val rejectedRoots: Set<String> = emptySet()) {
@@ -147,7 +147,7 @@ internal class GitChangesModel(val chat: GitChat, private val client: GitChanges
                 sheet = !safe, preparing = safe && !main, confirmingMain = main) }
             if (access == GitAccess.Writable) generate(epoch)
             if (generation == epoch && safe && !main) {
-                if (canCommit()) commit() else mutable.update { it.copy(sheet = true, preparing = false) }
+                if (canCommit() && state.value.message.isNotBlank()) commit() else mutable.update { it.copy(sheet = true, preparing = false) }
             }
         } catch (e: CancellationException) { throw e }
         catch (e: Exception) { if (generation == epoch) mutable.update { it.copy(loading = false, preparing = false, sheet = true, error = gitErrorText((e as? GitFailure)?.code)) } }
@@ -157,7 +157,18 @@ internal class GitChangesModel(val chat: GitChat, private val client: GitChanges
         generation++; messageGeneration++
         mutable.update { it.copy(sheet = false, preparing = false, confirmingMain = false, loading = false, generating = false) }
     }
-    fun edit(value: Boolean) { mutable.update { it.copy(editing = value) } }
+    fun edit(value: Boolean) {
+        if (state.value.busy) return
+        mutable.update { it.copy(editing = value, expanded = if (value) it.review?.repos.orEmpty().flatMap { repo -> repo.files.map { GitFileKey(repo.branch.root, it.path) } }.toSet() else emptySet()) }
+        if (!value && state.value.typedMessage.isBlank() && state.value.generated == null) regenerate()
+    }
+    fun expand(key: GitFileKey) {
+        if (state.value.busy) return
+        mutable.update {
+            val expanded = if (key in it.expanded) it.expanded - key else it.expanded + key
+            it.copy(expanded = expanded, editing = expanded.isNotEmpty())
+        }
+    }
     fun message(value: String) { mutable.update { it.copy(typedMessage = value) } }
     fun toggleFile(root: String, file: GitFile) {
         if (!writable() || state.value.busy) return
@@ -191,15 +202,21 @@ internal class GitChangesModel(val chat: GitChat, private val client: GitChanges
         } catch (e: CancellationException) { throw e }
         catch (_: Exception) { if (generation == epoch && messageGeneration == request) mutable.update { it.copy(generating = false, messageError = true) } }
     }
-    fun canCommit() = writable() && !state.value.busy && !state.value.loading && state.value.review != null && state.value.fileCount > 0 && state.value.message.isNotBlank()
+    fun canCommit() = writable() && !state.value.busy && !state.value.loading && state.value.review != null && state.value.fileCount > 0 && !state.value.generating
     fun commit(newBranch: Boolean = false) {
         if (!canCommit()) return
-        val current = state.value
-        val review = current.review ?: return
+        val review = state.value.review ?: return
         val epoch = generation
         mutable.update { it.copy(busy = true, error = null) }
         viewModelScope.launch {
             try {
+                if (state.value.message.isBlank()) generate(epoch)
+                if (generation != epoch) return@launch
+                val current = state.value
+                if (current.message.isBlank() || !writable()) {
+                    mutable.update { it.copy(busy = false, preparing = false, confirmingMain = false, sheet = true) }
+                    return@launch
+                }
                 val result = client.commit(review.id, current.message, current.selections, current.action == GitAction.CommitAndPush,
                     newBranch, current.generated?.branch.takeIf { newBranch }) { canRetry ->
                     if (generation == epoch) mutable.update { it.copy(checking = true, canRetry = canRetry) }

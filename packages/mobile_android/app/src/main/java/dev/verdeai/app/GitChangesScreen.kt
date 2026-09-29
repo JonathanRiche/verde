@@ -149,7 +149,7 @@ private fun GitCommitSheet(model: GitChangesModel, state: GitChangesState) {
         }
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Text("${state.fileCount} files · +${state.totals.first} −${state.totals.second}", Modifier.weight(1f), style = MaterialTheme.typography.labelMedium)
-            if (writable) TextButton(onClick = { model.edit(!state.editing) }, enabled = !state.busy, modifier = Modifier.testTag("git-edit")) { Text(if (state.editing) "Done" else "Edit") }
+            TextButton(onClick = { model.edit(!state.editing) }, enabled = !state.busy, modifier = Modifier.testTag("git-edit")) { Text(if (state.editing) "Hide diffs" else "Show diffs") }
         }
         if (writable) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -190,14 +190,18 @@ private fun GitBranchCard(branch: GitBranch) {
 
 @Composable
 private fun GitFileRow(model: GitChangesModel, state: GitChangesState, repo: GitRepo, file: GitFile, writable: Boolean) {
-    var expanded by remember(state.review?.id, repo.branch.root, file.path) { mutableStateOf(false) }
     val key = GitFileKey(repo.branch.root, file.path)
+    val expanded = key in state.expanded
     val selected = state.selected.containsKey(key)
     Column(Modifier.fillMaxWidth()) {
-        Row(Modifier.fillMaxWidth().heightIn(min = 44.dp).alpha(if (file.ownership == GitOwnership.Mine) 1f else .72f), verticalAlignment = Alignment.CenterVertically) {
-            if (state.editing && writable) TriStateCheckbox(if (!selected) ToggleableState.Off else if (state.selected[key] != null) ToggleableState.Indeterminate else ToggleableState.On, onClick = { model.toggleFile(repo.branch.root, file) }, enabled = !state.busy,
+        Row(Modifier.fillMaxWidth().heightIn(min = 44.dp).alpha(if (selected) 1f else .72f).clickable(enabled = writable && !state.busy) { model.toggleFile(repo.branch.root, file) }.testTag("git-file:${file.path}"), verticalAlignment = Alignment.CenterVertically) {
+            TriStateCheckbox(if (!selected) ToggleableState.Off else if (state.selected[key] != null) ToggleableState.Indeterminate else ToggleableState.On, onClick = { model.toggleFile(repo.branch.root, file) }, enabled = writable && !state.busy,
                 modifier = Modifier.semantics { contentDescription = "Include ${file.path}" })
-            Column(Modifier.weight(1f).clickable { expanded = !expanded }.padding(vertical = 8.dp).semantics { contentDescription = "${if (expanded) "Hide" else "Show"} diff for ${file.path}" }) {
+            IconButton(onClick = { model.expand(key) }, enabled = !state.busy,
+                modifier = Modifier.size(40.dp).semantics { contentDescription = "${if (expanded) "Hide" else "Show"} diff for ${file.path}" }) {
+                Text(if (expanded) "▾" else "▸")
+            }
+            Column(Modifier.weight(1f).padding(vertical = 8.dp)) {
                 Text(file.path, style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
                 if (file.ownership != GitOwnership.Mine) Text(file.ownership.label, color = VerdeColors.Warning, style = MaterialTheme.typography.labelSmall)
             }
@@ -206,10 +210,10 @@ private fun GitFileRow(model: GitChangesModel, state: GitChangesState, repo: Git
         }
         if (expanded) {
             if (file.otherThreads.isNotEmpty()) Text("Also changed by ${file.otherThreads.joinToString(", ")}", style = MaterialTheme.typography.bodySmall, color = VerdeColors.Subtle)
-            if (file.binary || file.previewTruncated) Text(if (file.binary) "Binary file — whole file only." else "Preview truncated — whole file only.", color = VerdeColors.Muted, style = MaterialTheme.typography.bodySmall)
+            if (file.binary || file.previewTruncated) Text(if (file.binary) "Binary file — can only be committed whole." else "Preview truncated — can only be committed whole.", color = VerdeColors.Muted, style = MaterialTheme.typography.bodySmall)
             file.hunks.forEach { hunk ->
                 Row(verticalAlignment = Alignment.Top) {
-                    if (state.editing && writable && file.canSelectHunks) Checkbox(selected && (state.selected[key] == null || hunk.index in state.selected[key].orEmpty()),
+                    if (writable && file.canSelectHunks) Checkbox(selected && (state.selected[key] == null || hunk.index in state.selected[key].orEmpty()),
                         onCheckedChange = { model.toggleHunk(repo.branch.root, file, hunk.index) }, enabled = !state.busy,
                         modifier = Modifier.semantics { contentDescription = "Include hunk ${hunk.index + 1} of ${file.path}" })
                     Text(remember(hunk.text) { buildAnnotatedString {
