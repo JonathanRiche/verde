@@ -132,6 +132,7 @@ pub const OPENCODE_MODEL_OPTIONS = [_]ModelOption{
 
 pub const CODEX_MODEL_OPTIONS = [_]ModelOption{
     .{ .label = "GPT-6 Astra", .value = "gpt-6-astra" },
+    .{ .label = "GPT-6.1 Sol", .value = "gpt-6.1-sol" },
     .{ .label = "GPT-6 Sol", .value = "gpt-6-sol" },
     .{ .label = "GPT-6 Luna", .value = "gpt-6-luna" },
     .{ .label = "GPT-5.6 Sol", .value = "gpt-5.6-sol" },
@@ -286,6 +287,7 @@ pub const CODEX_MAX_REASONING_OPTIONS = CODEX_REASONING_OPTIONS ++ [_]ReasoningO
 pub fn codexReasoningOptions(model_ref: ?[]const u8) []const ReasoningOption {
     const model = model_ref orelse DEFAULT_CODEX_MODEL;
     if (std.mem.eql(u8, model, "gpt-6-astra") or
+        std.mem.eql(u8, model, "gpt-6.1-sol") or
         std.mem.eql(u8, model, "gpt-6-sol") or
         std.mem.eql(u8, model, "gpt-6-luna") or
         std.mem.eql(u8, model, "gpt-5.6-sol") or

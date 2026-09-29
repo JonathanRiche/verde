@@ -74,7 +74,7 @@ pub fn favorites(a: A, catalog: m.Catalogs, provider: []const u8, config: V) h.A
     return out;
 }
 fn fallback(provider: []const u8) []const []const u8 {
-    if (eq(provider, "codex")) return &.{ "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.5", "gpt-5.6-terra", "gpt-5.6-luna" };
+    if (eq(provider, "codex")) return &.{ "gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.5", "gpt-5.6-terra", "gpt-5.6-luna" };
     if (eq(provider, "claude")) return &.{ "fable[1m]", "default", "opus[1m]", "sonnet", "haiku" };
     if (eq(provider, "opencode")) return &.{ "opencode/gpt-5.5", "opencode/gpt-5.4", "opencode/claude-opus-4-7", "opencode/claude-opus-4-6", "opencode/claude-sonnet-4-5", "opencode/gemini-3.1-pro" };
     if (eq(provider, "grok")) return &.{ "default", "grok-4.7", "grok-4.6", "grok-4.5" };
@@ -136,6 +136,7 @@ fn choiceLabel(id: []const u8) []const u8 {
     if (eq(id, "medium")) return "Medium";
     if (eq(id, "high")) return "High";
     if (eq(id, "gpt-6-astra")) return "GPT-6 Astra";
+    if (eq(id, "gpt-6.1-sol")) return "GPT-6.1 Sol";
     if (eq(id, "gpt-6-sol")) return "GPT-6 Sol";
     if (eq(id, "gpt-6-luna")) return "GPT-6 Luna";
     if (eq(id, "gpt-5.6-sol")) return "GPT-5.6 Sol";
