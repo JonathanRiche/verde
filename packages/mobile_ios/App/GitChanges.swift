@@ -76,7 +76,7 @@ struct GitChatControls: View {
     }
     private func catalogChanged() async {
         let workspaceValue = browse.session?.store.workspaces?.data?.items.first { $0.workspace_id == workspace }
-        let available = workspaceValue?.threads.contains { $0.local_thread_id == thread } == true
+        let available = workspaceValue?.threads.contains { $0.thread_id == thread } == true
         await model?.catalog(available: available, connected: browse.session?.store.synced == true)
     }
 
@@ -184,7 +184,7 @@ struct GitThreadDot: View {
     let thread: String
     private var summary: GitThreadSummary? {
         guard let data = browse.session?.store.snapshots["git_summary:" + workspace] else { return nil }
-        return (try? JSONDecoder().decode(GitSummaryQuery.self, from: data))?.data?.threads.first { $0.local_thread_id == thread }
+        return (try? JSONDecoder().decode(GitSummaryQuery.self, from: data))?.data?.threads.first { $0.thread_id == thread }
     }
     var body: some View {
         Group {

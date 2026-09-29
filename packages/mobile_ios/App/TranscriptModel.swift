@@ -155,6 +155,7 @@ final class TranscriptModel: DiffRenderSource {
     @ObservationIgnored private var lastGate: Gate?
     @ObservationIgnored private var unfocusTask: Task<Void, Never>?
     @ObservationIgnored private var requestedCursor: String?
+    @ObservationIgnored private var decodeTask: Task<Void, Never>?
     @ObservationIgnored private var threadData: Data?
     @ObservationIgnored private var composerData: Data?
     @ObservationIgnored private var sends: AsyncStream<(CoreHost, Event, ((Bool) -> Void)?)>.Continuation?
@@ -314,6 +315,29 @@ final class TranscriptModel: DiffRenderSource {
         }
     }
 
+    /// One decode at a time, off the UI thread. Superseded snapshots never publish.
+    private func scheduleThreadDecode() {
+        guard decodeTask == nil else { return }
+        decodeTask = Task { [weak self] in
+            guard let self else { return }
+            while !self.closed {
+                let bytes = self.threadData
+                let identity = self.boundSession
+                let decoded = await Task.detached(priority: .userInitiated) {
+                    let thread = bytes.flatMap { try? JSONDecoder().decode(ThreadQuery.self, from: $0) }?.data
+                    return (thread, thread.map(transcriptItems) ?? [])
+                }.value
+                guard !self.closed else { break }
+                if bytes != self.threadData || identity != self.boundSession { continue }
+                self.thread = decoded.0
+                self.items = decoded.1
+                self.approvals.update(thread: self.thread)
+                break
+            }
+            self.decodeTask = nil
+        }
+    }
+
     private func reevaluate() {
         guard started, !closed else { return }
         bind()
@@ -322,9 +346,7 @@ final class TranscriptModel: DiffRenderSource {
         let threadBytes = store.snapshots[threadSelector]
         if threadBytes != threadData {
             threadData = threadBytes
-            thread = threadBytes.flatMap { try? JSONDecoder().decode(ThreadQuery.self, from: $0) }?.data
-            items = thread.map(transcriptItems) ?? []
-            approvals.update(thread: thread)
+            scheduleThreadDecode()
         }
         let composerBytes = store.snapshots[composerSelector]
         if composerBytes != composerData {
