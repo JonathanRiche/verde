@@ -139,6 +139,7 @@ final class GitChangesModel {
             summary = try JSONDecoder().decode(GitSummaryQuery.self, from: await query("git_summary:" + workspace)).data
             await receive(next)
             await receipts()
+            await advanceQuickAction()
         } catch { notice = "Connect to the host to review changes." }
     }
     func receive(_ next: GitReviewView?) async {
@@ -166,7 +167,10 @@ final class GitChangesModel {
             if !selections.isEmpty { await generate() }
             else if quick { quick = false; sheet = true; notice = "No selected changes to commit." }
         }
-        if quick, next?.message_state == "ready", generatedSelection == selectionKey, !generated.isEmpty, canSubmit {
+        await advanceQuickAction()
+    }
+    private func advanceQuickAction() async {
+        if quick, view?.message_state == "ready", generatedSelection == selectionKey, !generated.isEmpty, canSubmit {
             quick = false
             if mainBranch != nil { confirmMain = true } else { await commit(push: true) }
         }
@@ -180,14 +184,15 @@ final class GitChangesModel {
         guard let review, !generating, !selections.isEmpty, view?.message_state != "loading" else { return }
         generating = true; defer { generating = false }
         let id = UUID().uuidString
+        generatedSelection = nil
         generatingSelection = (id, selectionKey)
         await dispatch(.git_message_generate(EventGitMessageGenerate(now_ms: 0, wall_time_ms: 0, intent_id: id, review_id: review.review_id, selections: selections)))
     }
     func commit(push: Bool? = nil, newBranch: Bool = false) async {
         guard let review, canSubmit else { return }
         if usesGeneratedMessage && (generatedSelection != selectionKey || generated.isEmpty) {
-            await generate()
             notice = "Generating a message for the selected changes. Review it, then commit."
+            await generate()
             return
         }
         submitting = true; defer { submitting = false }

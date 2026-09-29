@@ -60,6 +60,28 @@ final class GitChangesTests: XCTestCase {
         XCTAssertEqual(fake.events.filter { if case .git_commit = $0 { return true }; return false }.count, 1)
     }
 
+    func testFailedGenerationCannotCommitAnOldSuggestion() async {
+        let fake = Fake(); let model = fake.model()
+        fake.view = review()
+        await model.receive(fake.view)
+        fake.receiptState = "failed"
+        fake.receiptError = LocalError(domain: "git", code: "unavailable", message: "Generation failed", retryable: true)
+        await model.generate()
+        await model.commit()
+        XCTAssertFalse(fake.events.contains { if case .git_commit = $0 { return true }; return false })
+    }
+    func testDelayedQuickGenerationResumesWhenReceiptArrives() async {
+        let fake = Fake(); let model = fake.model()
+        await model.begin(push: true, quick: true)
+        fake.view = review(branch: "feature/test")
+        fake.receiptState = "pending"
+        await model.receive(fake.view)
+        XCTAssertFalse(fake.events.contains { if case .git_commit = $0 { return true }; return false })
+        fake.receiptState = "succeeded"
+        await model.refresh()
+        XCTAssertEqual(fake.events.filter { if case .git_commit = $0 { return true }; return false }.count, 1)
+    }
+
     func testReviewSheetScreenshot() async throws {
         let fake = Fake(); let model = fake.model()
         await model.receive(review())
