@@ -8,6 +8,13 @@ final class GitChangesTests: XCTestCase {
         var events: [Event] = []
         var view = GitReviewView()
         func query(_ selector: String) throws -> Data {
+            if selector == "operations" {
+                let items = try events.compactMap { event -> CoreOperation? in
+                    let object = try JSONSerialization.jsonObject(with: JSONEncoder().encode(event)) as? [String: Any]
+                    return (object?["intent_id"] as? String).map { CoreOperation(intent_id: $0, state: "succeeded", error: nil) }
+                }
+                return try JSONEncoder().encode(OperationsQuery(api_version: 1, revision: "1", data: OperationsView(items: items), error: nil))
+            }
             if selector == "git_review" { return try JSONEncoder().encode(GitReviewQuery(api_version: 1, revision: "1", data: view, error: nil)) }
             if selector == "git_status" { return try JSONEncoder().encode(GitStatusQuery(api_version: 1, revision: "1", data: GitStatusView(), error: nil)) }
             return try JSONEncoder().encode(GitSummaryQuery(api_version: 1, revision: "1", data: GitSummary(workspace_id: "w"), error: nil))
@@ -18,7 +25,7 @@ final class GitChangesTests: XCTestCase {
     }
     private func review(ownership: String = "mine", branch: String = "main") -> GitReviewView {
         let file = GitReviewFile(path: "a.swift", status: "modified", ownership: ownership, additions: 2, deletions: 1, binary: false, hunk_selectable: true, preview_truncated: false, hunks: [GitReviewHunk(index: 0, header: "@@ -1 +1 @@", text: "fixture")])
-        return GitReviewView(state: "loaded", can_commit: true, review: GitReviewResult(review_id: "r", workspace_id: "w", local_thread_id: "t", turn_running: true, default_action: "commit", repos: [GitReviewRepo(root: "/repo", name: "repo", branch: branch, files: [file])]), message_state: "ready", message: GitCommitMessageResult(message: "Fixture subject", branch: "feature/fixture", provider: "codex", model: "fixture"))
+        return GitReviewView(state: "loaded", can_commit: true, review: GitReviewResult(review_id: "r", workspace_id: "w", local_thread_id: "t", turn_running: false, default_action: "commit", repos: [GitReviewRepo(root: "/repo", name: "repo", branch: branch, files: [file])]), message_state: "ready", message: GitCommitMessageResult(message: "Fixture subject", branch: "feature/fixture", provider: "codex", model: "fixture"))
     }
     func testReviewSheetScreenshot() async throws {
         let fake = Fake(); let model = fake.model()
@@ -67,6 +74,8 @@ final class GitChangesTests: XCTestCase {
         await model.receive(fake.view)
         XCTAssertTrue(model.sheet); XCTAssertFalse(model.confirmMain)
         XCTAssertFalse(fake.events.contains { if case .git_commit = $0 { return true }; return false })
+        XCTAssertEqual(model.count, 0)
+        model.selected.insert(GitFileKey(root: "/repo", path: "a.swift"))
         model.message = "Chosen subject"
         await model.commit()
         let event = try XCTUnwrap(fake.events.compactMap { if case .git_commit(let e) = $0 { return e }; return nil }.first)
@@ -86,6 +95,16 @@ final class GitChangesTests: XCTestCase {
         XCTAssertTrue(model.notice?.contains("abcdefg") == true)
         XCTAssertFalse(model.notice?.contains("· pushed") == true)
     }
+    func testRunningTurnAlwaysRequiresReview() async {
+        let fake = Fake(); let model = fake.model()
+        await model.begin(push: true, quick: true)
+        var active = review(branch: "feature/test")
+        active.review?.turn_running = true
+        await model.receive(active)
+        XCTAssertTrue(model.sheet)
+        XCTAssertFalse(fake.events.contains { if case .git_commit = $0 { return true }; return false })
+    }
+
     func testHunkSelectionAndPendingMutationGuard() async {
         let fake = Fake(); let model = fake.model()
         await model.receive(review())

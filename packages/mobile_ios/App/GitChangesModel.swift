@@ -28,6 +28,9 @@ final class GitChangesModel {
     private var reportedCommit: String?
     private var reportedPush: String?
     private var generating = false
+    private var pending: [String: Bool] = [:]
+    private var routeReady = false
+    private var routeConnected = false
 
     init(workspace: String, thread: String,
          send: @escaping (Event) async throws -> Void, query: @escaping (String) async throws -> Data) {
@@ -54,7 +57,7 @@ final class GitChangesModel {
     }
     var ahead: UInt32 { repos.filter { $0.has_remote }.reduce(0) { $0 + $1.ahead } }
     var canCommit: Bool { view?.can_commit == true || status?.can_commit == true }
-    var busy: Bool { submitting || view?.mutation_state == "pending" }
+    var busy: Bool { submitting || pending.values.contains(true) || view?.mutation_state == "pending" }
     var generated: String { view?.message?.message ?? "" }
     var finalMessage: String { message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? generated : message }
     var mainBranch: String? {
@@ -104,6 +107,7 @@ final class GitChangesModel {
             status = try JSONDecoder().decode(GitStatusQuery.self, from: await query("git_status")).data
             summary = try JSONDecoder().decode(GitSummaryQuery.self, from: await query("git_summary:" + workspace)).data
             await receive(next)
+            await receipts()
         } catch { notice = "Connect to the host to review changes." }
     }
     func receive(_ next: GitReviewView?) async {
@@ -126,8 +130,8 @@ final class GitChangesModel {
         if review.review_id != loadedID {
             loadedID = review.review_id
             message = ""; hunks = [:]; selected = []
-            for repo in review.repos { for file in repo.files where file.ownership != "unassigned" { selected.insert(GitFileKey(root: repo.root, path: file.path)) } }
-            if quick && (review.repos.contains { $0.branch == nil || $0.files.contains { $0.ownership != "mine" } }) { quick = false; sheet = true }
+            for repo in review.repos { for file in repo.files where file.ownership == "mine" { selected.insert(GitFileKey(root: repo.root, path: file.path)) } }
+            if quick && (review.turn_running || review.repos.contains { $0.branch == nil || $0.files.contains { $0.ownership != "mine" } }) { quick = false; sheet = true }
             if !selections.isEmpty { await generate() }
             else if quick { quick = false; sheet = true; notice = "No selected changes to commit." }
         }
@@ -180,7 +184,45 @@ final class GitChangesModel {
         await dispatch(.git_retry(EventGitRetry(now_ms: 0, wall_time_ms: 0, intent_id: UUID().uuidString)))
         await refresh()
     }
+    /// Retry a read when a newly-created chat finally gains a synced route.
+    func catalog(available: Bool, connected: Bool) async {
+        let arrived = available && connected && (!routeReady || !routeConnected)
+        routeReady = available; routeConnected = connected
+        if arrived {
+            await dispatch(.git_status_refresh(EventGitStatusRefresh(now_ms: 0, wall_time_ms: 0, intent_id: UUID().uuidString, workspace_id: workspace, thread_id: thread)))
+            await refresh()
+        }
+    }
+    private func receipts() async {
+        guard !pending.isEmpty,
+              let bytes = try? await query("operations"),
+              let operations = try? JSONDecoder().decode(OperationsQuery.self, from: bytes).data?.items else { return }
+        for operation in operations where pending[operation.intent_id] != nil && operation.state != "pending" {
+            // Core alone owns recovery. An uncertain receipt never becomes a new commit.
+            pending[operation.intent_id] = nil
+            if operation.state == "uncertain" { notice = "Checking original operation…"; continue }
+            if operation.state != "succeeded" {
+                quick = false; confirmMain = false
+                notice = operation.error?.message ?? "The host refused this action."
+                if ["review_expired", "changed_since_review"].contains(operation.error?.code ?? "") {
+                    await begin(push: wantsPush)
+                }
+            }
+        }
+    }
     private func dispatch(_ event: Event) async {
-        do { try await sendEvent(event) } catch { notice = "The host is unavailable. Check the operation before trying again." }
+        var id: String?
+        do {
+            let data = try JSONEncoder().encode(event)
+            id = (try JSONSerialization.jsonObject(with: data) as? [String: Any])?["intent_id"] as? String
+            let mutation: Bool
+            switch event { case .git_commit, .git_push, .git_pull_push, .git_retry: mutation = true; default: mutation = false }
+            if let id { pending[id] = mutation }
+            try await sendEvent(event)
+            await receipts()
+        } catch {
+            if let id { pending[id] = nil }
+            notice = "The host is unavailable. Check the operation before trying again."
+        }
     }
 }

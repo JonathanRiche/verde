@@ -66,6 +66,8 @@ private struct HostCard: View {
     let row: HostRow
     let onUse: () -> Void
     let confirm: (Confirmation) -> Void
+    @State private var renaming = false
+    @State private var nickname = ""
 
     var body: some View {
         let id = row.saved.id
@@ -76,6 +78,19 @@ private struct HostCard: View {
             Circle().fill(hostDotColor(row)).frame(width: 12, height: 12).accessibilityLabel(status)
             Text(row.saved.label) .font(VerdeTheme.ui(15, bold: true))
             Spacer()
+            Menu {
+                Button("Rename machine") { nickname = row.saved.label; renaming = true }
+                if let view = row.view, !["loading", "signed_out", "signing_out"].contains(view.auth_state) {
+                    Button("Sign out", role: .destructive) { confirm(Confirmation(id: id, name: row.saved.label, forget: false)) }
+                }
+            } label: { Image(systemName: "ellipsis").accessibilityLabel("Machine actions") }
+            .disabled(pending || row.fatal)
+            .alert("Rename machine", isPresented: $renaming) {
+                TextField("Name on this phone", text: $nickname)
+                Button("Cancel", role: .cancel) {}
+                Button("Save") { model.rename(id, label: nickname) }
+                    .disabled(nickname.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || nickname.count > 128)
+            } message: { Text("This nickname is saved on this phone.") }
             if model.active == id { Text("Selected") .font(VerdeTheme.ui(12)).foregroundStyle(.secondary) }
         }
         Text(status).accessibilityIdentifier("hostStatus")
@@ -95,7 +110,7 @@ private struct HostCard: View {
             Button("Pair again") { model.showPairing(id) }
         } else {
             if row.view?.auth_state == "paired" && row.view?.trust_proposal == nil {
-                Button("Use \(row.saved.label)") { model.select(id); onUse() }.disabled(pending || row.fatal)
+                Button("Use \(row.saved.label)") { if model.select(id) { onUse() } }.disabled(pending || row.fatal)
             } else if row.view?.auth_state != "signing_out" {
                 Button("Pair / review host") { model.showPairing(id) }.disabled(pending || row.fatal)
             }
@@ -107,9 +122,6 @@ private struct HostCard: View {
                 Text("Finishing host action…") .font(VerdeTheme.ui(13))
             }
         }
-        if let view = row.view, !["loading", "signed_out", "signing_out"].contains(view.auth_state) {
-            Button("Sign out of host", role: .destructive) { confirm(Confirmation(id: id, name: row.saved.label, forget: false)) }
-                .disabled(pending || row.fatal).accessibilityIdentifier("signOutHost")
-        }
+
     }
 }

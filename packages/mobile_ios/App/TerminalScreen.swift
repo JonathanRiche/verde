@@ -228,10 +228,8 @@ final class TerminalGridView: UIView, UITextInput {
     var hasText: Bool { true }
 
     func insertText(_ text: String) {
-        let hadMarked = !marked.isEmpty
-        if hadMarked { clearMarked() }
-        guard !text.isEmpty else { return }
-        onInput(.text(text))
+        sendCompositionChange(from: marked, to: text)
+        clearMarked()
     }
 
     func deleteBackward() {
@@ -240,6 +238,13 @@ final class TerminalGridView: UIView, UITextInput {
             return
         }
         onInput(.key("Backspace"))
+    }
+
+    private func sendCompositionChange(from previous: String, to next: String) {
+        let common = zip(previous, next).prefix { $0 == $1 }.count
+        for _ in previous.dropFirst(common) { onInput(.key("Backspace")) }
+        let suffix = String(next.dropFirst(common))
+        if !suffix.isEmpty { onInput(.text(suffix)) }
     }
 
     private func clearMarked() {
@@ -263,7 +268,9 @@ final class TerminalGridView: UIView, UITextInput {
     lazy var tokenizer: UITextInputTokenizer = UITextInputStringTokenizer(textInput: self)
 
     func setMarkedText(_ markedText: String?, selectedRange: NSRange) {
-        marked = markedText ?? ""
+        let next = markedText ?? ""
+        sendCompositionChange(from: marked, to: next)
+        marked = next
         let length = (marked as NSString).length
         let location = min(max(selectedRange.location, 0), length)
         markedSelection = NSRange(location: location, length: min(selectedRange.length, length - location))
@@ -272,9 +279,7 @@ final class TerminalGridView: UIView, UITextInput {
 
     func unmarkText() {
         guard !marked.isEmpty else { return }
-        let text = marked
         clearMarked()
-        onInput(.text(text))
     }
 
     func text(in range: UITextRange) -> String? {

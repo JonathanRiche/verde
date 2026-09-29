@@ -63,6 +63,13 @@ struct GitChatControls: View {
             let next = GitChangesModel(browse: browse, workspace: workspace, thread: thread)
             model = next; await next.start()
         }
+        .onChange(of: browse.session?.store.snapshots["operations"]) { _, _ in Task { await model?.refresh() } }
+        .onChange(of: browse.session?.store.snapshots["workspaces"]) { _, _ in
+            Task {
+                let available = browse.session?.store.workspaces?.data?.items.contains { $0.workspace_id == workspace && $0.threads.contains { $0.local_thread_id == thread } } == true
+                await model?.catalog(available: available, connected: browse.session?.store.synced == true)
+            }
+        }
         .onChange(of: browse.session?.store.snapshots["git_review"]) { _, _ in Task { await model?.refresh() } }
         .onChange(of: browse.session?.store.snapshots["git_status"]) { _, _ in Task { await model?.refresh() } }
         .onChange(of: browse.session?.store.snapshots["git_summary:" + workspace]) { _, _ in Task { await model?.refresh() } }
