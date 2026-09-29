@@ -86,6 +86,43 @@ class GitChangesTest {
     }
     private fun await(condition: () -> Boolean) = compose.waitUntil(5000, condition)
 
+    @Test fun wholeRowsSelectWithoutEditAndCommitGeneratesForTheSelection() {
+        val fake = Fake(review(files = listOf(ownEdits)))
+        val model = mount(fake)
+        compose.runOnIdle { model.open() }
+        await { model.state.value.review != null }
+        compose.onNodeWithContentDescription("Include notes.txt").assertIsOff()
+        compose.onNodeWithTag("git-submit").assertIsNotEnabled()
+        compose.onNodeWithTag("git-new-branch").assertIsNotEnabled()
+        compose.onNodeWithTag("git-file:notes.txt").performClick()
+        compose.onNodeWithContentDescription("Include notes.txt").assertIsOn()
+        compose.onNodeWithTag("git-submit").assertIsEnabled().performClick()
+        await { fake.commits == 1 }
+        assertEquals(1, fake.messages)
+        assertEquals(listOf(GitSelection("/scratch", listOf(GitFileSelection("notes.txt")))), fake.committedSelections)
+    }
+
+    @Test fun bulkDiffToggleDoesNotGateSelectionAndRegeneratesStaleMessage() {
+        val fake = Fake(review(files = listOf(mine, ownEdits)))
+        val model = mount(fake)
+        compose.runOnIdle { model.open() }
+        await { model.state.value.generated != null }
+        compose.onNodeWithText("Show diffs").performClick()
+        compose.onNodeWithContentDescription("Hide diff for app.kt").assertExists()
+        compose.onNodeWithTag("git-file:notes.txt").performScrollTo().performClick()
+        assertEquals(2, model.state.value.fileCount)
+        assertNull(model.state.value.generated)
+        compose.onNodeWithText("Hide diffs").performClick()
+        await { fake.messages == 2 && model.state.value.generated != null }
+        compose.onNodeWithContentDescription("Show diff for app.kt").assertExists()
+        compose.onNodeWithTag("git-file:notes.txt").performClick()
+        assertEquals(1, model.state.value.fileCount)
+        compose.onNodeWithTag("git-submit").performClick()
+        await { fake.commits == 1 }
+        assertEquals(3, fake.messages)
+        assertEquals(listOf(GitSelection("/scratch", listOf(GitFileSelection("app.kt")))), fake.committedSelections)
+    }
+
     @Test fun sheetHasBranchFilesPlaceholderAndExplicitHunkSelection() {
         val fake = Fake(review("main", listOf(mine, ownEdits)))
         val model = mount(fake)
@@ -96,7 +133,6 @@ class GitChangesTest {
         compose.onNodeWithTag("git-message").assertTextContains("Improve mobile flow")
         assertEquals("", model.state.value.typedMessage)
         assertEquals(listOf(GitSelection("/scratch", listOf(GitFileSelection("app.kt")))), model.state.value.selections)
-        compose.onNodeWithTag("git-edit").performClick()
         compose.onNodeWithContentDescription("Include notes.txt").assertIsOff()
         compose.onNodeWithContentDescription("Show diff for app.kt").performClick()
         compose.onNodeWithContentDescription("Include hunk 2 of app.kt").performScrollTo().performClick()
@@ -286,7 +322,6 @@ class GitChangesTest {
         await { model.state.value.review != null }
         compose.runOnIdle { model.toggleHunk("/scratch", file, 0) }
         assertNull(model.state.value.selections.single().files.single().hunks)
-        compose.onNodeWithTag("git-edit").performClick()
         compose.onNodeWithContentDescription("Show diff for app.kt").performClick()
         compose.onNodeWithContentDescription("Include hunk 1 of app.kt").assertDoesNotExist()
     }
