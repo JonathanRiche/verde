@@ -5,7 +5,7 @@ struct GitChatControls: View {
     let workspace: String
     let thread: String
     @State private var model: GitChangesModel?
-    var body: some View {
+    private var controls: some View {
         Group {
             if let model {
                 if (model.change?.files ?? 0) > 0 || model.ahead > 0 || model.notice != nil {
@@ -59,21 +59,27 @@ struct GitChatControls: View {
                 }
             }
         }
+    }
+    var body: some View {
+        controls
         .task(id: browse.hostID) {
             let next = GitChangesModel(browse: browse, workspace: workspace, thread: thread)
             model = next; await next.start()
         }
         .onChange(of: browse.session?.store.snapshots["operations"]) { _, _ in Task { await model?.refresh() } }
         .onChange(of: browse.session?.store.snapshots["workspaces"]) { _, _ in
-            Task {
-                let available = browse.session?.store.workspaces?.data?.items.contains { $0.workspace_id == workspace && $0.threads.contains { $0.local_thread_id == thread } } == true
-                await model?.catalog(available: available, connected: browse.session?.store.synced == true)
-            }
+            Task { await catalogChanged() }
         }
         .onChange(of: browse.session?.store.snapshots["git_review"]) { _, _ in Task { await model?.refresh() } }
         .onChange(of: browse.session?.store.snapshots["git_status"]) { _, _ in Task { await model?.refresh() } }
         .onChange(of: browse.session?.store.snapshots["git_summary:" + workspace]) { _, _ in Task { await model?.refresh() } }
     }
+    private func catalogChanged() async {
+        let workspaceValue = browse.session?.store.workspaces?.data?.items.first { $0.workspace_id == workspace }
+        let available = workspaceValue?.threads.contains { $0.local_thread_id == thread } == true
+        await model?.catalog(available: available, connected: browse.session?.store.synced == true)
+    }
+
 }
 
 struct GitCommitSheet: View {

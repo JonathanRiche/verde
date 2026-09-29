@@ -33,11 +33,13 @@ final class NativeHostCore: HostCore {
         guard let handle else { throw CoreBridgeError.closed }
         var output = vc_buf(ptr: nil, len: 0)
         defer { vc_buf_free(output) }
+        let began = ProcessInfo.processInfo.systemUptime
         let status = input.withUnsafeBytes { bytes in
             let pointer = bytes.bindMemory(to: UInt8.self).baseAddress
             return query ? vc_host_query(handle, pointer, input.count, &output)
                 : vc_host_handle(handle, pointer, input.count, &output)
         }
+        if !query { CoreDiagnostics.event(bytes: input.count, nativeMilliseconds: (ProcessInfo.processInfo.systemUptime - began) * 1000, status: status) }
         guard status == 0 else { throw CoreBridgeError.status(status) }
         guard let pointer = output.ptr else { throw CoreBridgeError.invalidOutput }
         return Data(bytes: pointer, count: output.len)
@@ -196,6 +198,7 @@ actor CoreHost {
         } catch let rejected as RejectedEvent {
             throw CoreBridgeError.rejected(rejected.status)
         } catch {
+            CoreDiagnostics.failure(error)
             // A lost/undecodable batch is fatal; never replay partially dispatched work.
             finish()
             let previous = publication

@@ -223,6 +223,7 @@ final class SessionOperation: NSObject, URLSessionDataDelegate, URLSessionWebSoc
     private var response: HTTPURLResponse?
     private var pendingSends: [String] = []
     private var sending = false
+    private var openedAt: TimeInterval?
 
     init(effect: Effect, queue: DispatchQueue, pool: HTTPConnectionPool? = nil, emit: @escaping (Event) -> Void, fileReceived: @escaping (String, FileBytes) -> Void = { _, _ in }, ended: @escaping () -> Void) {
         if case .file_fetch(let e) = effect {
@@ -391,6 +392,8 @@ final class SessionOperation: NSObject, URLSessionDataDelegate, URLSessionWebSoc
         guard let selected = `protocol`, e.protocols.contains(selected), selected == "verde.v1" else {
             fail(.network, .unknown); return
         }
+        openedAt = ProcessInfo.processInfo.systemUptime
+        CoreDiagnostics.socket(open: true, ageMilliseconds: 0, code: nil, clean: true)
         emit(.ws_open(EventWsOpen(now_ms: 0, wall_time_ms: 0, socket_id: e.effect_id,
             generation: e.generation, protocol: selected)))
         receive()
@@ -441,6 +444,7 @@ final class SessionOperation: NSObject, URLSessionDataDelegate, URLSessionWebSoc
     }
     private func emitClosed(code: UInt16?, clean: Bool, error: TransportFailure?) {
         guard case .ws_open(let e) = effect else { return }
+        CoreDiagnostics.socket(open: false, ageMilliseconds: Int((ProcessInfo.processInfo.systemUptime - (openedAt ?? ProcessInfo.processInfo.systemUptime)) * 1000), code: code, clean: clean)
         emit(.ws_closed(EventWsClosed(now_ms: 0, wall_time_ms: 0, socket_id: e.effect_id,
             generation: e.generation, code: code, clean: clean, error: error)))
     }

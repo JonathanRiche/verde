@@ -269,6 +269,23 @@ final class HostsModelTests: XCTestCase {
         XCTAssertEqual(model.active, "beta")
     }
 
+    func testNicknamePersistsWithoutReopeningHostAndFailedSaveDoesNotChangeIt() async throws {
+        try seed()
+        let model = try await launch()
+        let count = cores.count
+        let session = model.session("alpha")
+        XCTAssertTrue(model.rename("alpha", label: "  Work machine  "))
+        XCTAssertEqual(model.row("alpha")?.saved.label, "Work machine")
+        XCTAssertEqual(try catalog().hosts.first?.label, "Work machine")
+        XCTAssertTrue(model.session("alpha") === session)
+        XCTAssertEqual(cores.count, count)
+        XCTAssertFalse(model.rename("alpha", label: "  "))
+        storage.fail(write: true)
+        XCTAssertFalse(model.rename("alpha", label: "Unsaved"))
+        XCTAssertEqual(model.row("alpha")?.saved.label, "Work machine")
+        storage.fail()
+    }
+
     func testAddPersistsUniqueHostAndSeedsPrimarySlot() async throws {
         let model = try await launch()
         XCTAssertEqual(model.active, "primary")
