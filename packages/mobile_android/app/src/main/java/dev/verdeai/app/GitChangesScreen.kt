@@ -67,10 +67,10 @@ internal fun GitChangesHeader(model: GitChangesModel) {
                     TextButton(onClick = {
                         if (!writable) model.open(GitAction.Commit)
                         else if (summary.files == 0) model.push()
-                        else model.open(state.snapshot.settings.action, quick = state.snapshot.settings.action == GitAction.CommitAndPush)
+                        else model.open(state.snapshot.settings.action, quick = true)
                     }, enabled = !state.busy && !state.loading && state.snapshot.connected, modifier = Modifier.testTag("git-primary")) {
                         Text(if (state.checking) "Checking commit…" else if (state.busy) "Working…" else label, color = color)
-                        if (summary.files > 0) Text(summary.files.toString(), Modifier.padding(start = 8.dp).background(color.copy(alpha = .16f), CircleShape).padding(horizontal = 6.dp, vertical = 2.dp), color = color)
+                        if (summary.files > 0) Text((summary.files - summary.attention).coerceAtLeast(0).toString(), Modifier.padding(start = 8.dp).background(color.copy(alpha = .16f), CircleShape).padding(horizontal = 6.dp, vertical = 2.dp), color = color)
                     }
                     if (writable) Box {
                         IconButton(onClick = { menu = true }, enabled = !state.busy && !state.loading && state.snapshot.connected, modifier = Modifier.size(44.dp)) {
@@ -108,7 +108,7 @@ internal fun GitChangesLayer(model: GitChangesModel) {
         }
     }
     if (state.preparing || state.confirmingMain) {
-        val branches = state.review?.repos.orEmpty().filter { it.files.isNotEmpty() && it.branch.defaultOrMain }.mapNotNull { it.branch.branch }.distinct().joinToString(", ")
+        val branches = state.review?.repos.orEmpty().filter { it.branch.isDefault && it.files.any { file -> GitFileKey(it.branch.root, file.path) in state.selected } }.mapNotNull { it.branch.branch }.distinct().joinToString(", ")
         AlertDialog(onDismissRequest = model::dismiss,
             title = { Text(if (state.confirmingMain) "Commit & push to $branches?" else "Preparing commit…") },
             text = { Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {

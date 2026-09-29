@@ -83,7 +83,7 @@ internal enum class GitResultPhase { Running, Success, Failure }
 internal data class GitNotice(val text: String, val rejectedRoots: List<String> = emptyList(),
     val detail: String = "", val phase: GitResultPhase = GitResultPhase.Success, val id: String = UUID.randomUUID().toString())
 internal data class GitChangesState(val snapshot: GitSnapshot = GitSnapshot(), val review: GitReview? = null,
-    val sheet: Boolean = false, val preparing: Boolean = false, val confirmingMain: Boolean = false,
+    val mineOnly: Boolean = false, val sheet: Boolean = false, val preparing: Boolean = false, val confirmingMain: Boolean = false,
     val loading: Boolean = false, val generating: Boolean = false, val busy: Boolean = false, val checking: Boolean = false, val canRetry: Boolean = false,
     val submittingAction: GitAction? = null, val submittingNewBranch: Boolean = false,
     val expanded: Set<GitFileKey> = emptySet(), val editing: Boolean = false, val action: GitAction = GitAction.Commit,
@@ -130,7 +130,7 @@ internal class GitChangesModel(val chat: GitChat, private val client: GitChanges
         if (state.value.busy || state.value.loading || access in setOf(GitAccess.Unavailable, GitAccess.Remote)) return
         val epoch = ++generation
         ++messageGeneration
-        mutable.update { GitChangesState(snapshot = it.snapshot, action = action, sheet = !quick,
+        mutable.update { GitChangesState(snapshot = it.snapshot, action = action, mineOnly = quick, sheet = !quick,
             preparing = quick, loading = true, rejectedRoots = it.rejectedRoots) }
         viewModelScope.launch { load(epoch, quick) }
     }
@@ -142,10 +142,15 @@ internal class GitChangesModel(val chat: GitChat, private val client: GitChanges
             val selected = buildMap<GitFileKey, Set<Int>?> {
                 review.repos.forEach { repo -> repo.files.filter { it.ownership == GitOwnership.Mine }.forEach { put(GitFileKey(repo.branch.root, it.path), null) } }
             }
-            val safe = quick && writable() && !review.turnRunning && review.repos.any { it.files.isNotEmpty() } &&
-                review.repos.filter { it.files.isNotEmpty() }.all { it.branch.branch != null } &&
-                review.repos.flatMap { it.files }.all { it.ownership == GitOwnership.Mine }
-            val main = safe && review.repos.any { it.files.isNotEmpty() && it.branch.defaultOrMain }
+            if (quick && review.repos.all { it.files.isEmpty() }) {
+                mutable.update { it.copy(review = review, loading = false, preparing = false, sheet = false,
+                    notice = GitNotice("No uncommitted changes")) }
+                return
+            }
+            val safe = quick && writable() && selected.isNotEmpty()
+            val main = safe && state.value.action == GitAction.CommitAndPush && review.repos.any { repo ->
+                repo.branch.isDefault && repo.files.any { it.ownership == GitOwnership.Mine }
+            }
             mutable.update { it.copy(review = review, selected = selected, loading = false,
                 sheet = !safe, preparing = safe && !main, confirmingMain = main) }
             if (access == GitAccess.Writable) generate(epoch)
@@ -232,7 +237,11 @@ internal class GitChangesModel(val chat: GitChat, private val client: GitChanges
                 val pushed = result.repos.isNotEmpty() && result.repos.all { it.push == GitPush.Pushed }
                 val failed = result.repos.any { it.push in setOf(GitPush.Rejected, GitPush.Failed) }
                 val branches = result.repos.mapNotNull { receipt -> receipt.branch ?: review.repos.find { it.branch.root == receipt.root }?.branch?.branch }.distinct()
-                val detail = (listOf(sha) + branches + current.message.lineSequence().first()).filter { it.isNotBlank() }.joinToString(" · ")
+                val excluded = if (current.mineOnly) review.repos.sumOf { repo -> repo.files.count { file ->
+                    file.ownership in setOf(GitOwnership.Shared, GitOwnership.Unclear) && GitFileKey(repo.branch.root, file.path) !in current.selected
+                } } else 0
+                val leftOut = if (excluded > 0) "$excluded ${if (excluded == 1) "file" else "files"} left out (shared/unclear) — use Commit… to review them · " else ""
+                val detail = leftOut + (listOf(sha) + branches + current.message.lineSequence().first()).filter { it.isNotBlank() }.joinToString(" · ")
                 val title = "${if (pushed) "Committed & pushed" else "Committed"} $count ${if (count == 1) "file" else "files"}"
                 mutable.update { it.copy(busy = false, checking = false, canRetry = false, sheet = false, confirmingMain = false, preparing = false,
                     review = null, notice = GitNotice(title, rejected, detail + if (failed) " · Push did not complete. Your commits are saved." else "",

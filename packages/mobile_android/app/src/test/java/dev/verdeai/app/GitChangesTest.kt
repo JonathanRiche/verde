@@ -44,7 +44,7 @@ class GitChangesTest {
         GitHunk(1, "@@ -4 +4 @@", "@@ -4 +4 @@\n+added")))
     private val ownEdits = GitFile("notes.txt", ownership = GitOwnership.Unassigned, additions = 1)
     private fun review(branch: String? = "feature/mobile", files: List<GitFile> = listOf(mine), running: Boolean = false) = GitReview(
-        "review-1", chat, running, repos = listOf(GitRepo(GitBranch("/scratch", "scratch", branch, hasRemote = true), "fixture-head", files)))
+        "review-1", chat, running, repos = listOf(GitRepo(GitBranch("/scratch", "scratch", branch, isDefault = branch in setOf("main", "master"), hasRemote = true), "fixture-head", files)))
     private inner class Fake(var review: GitReview = review(), access: GitAccess = GitAccess.Writable) : GitChangesClient {
         override val snapshot = MutableStateFlow(GitSnapshot(
             summaries = mapOf(chat to GitSummary(review.repos.sumOf { it.files.size }, 2, 1, review.repos.flatMap { it.files }.count { it.ownership != GitOwnership.Mine })),
@@ -174,7 +174,7 @@ class GitChangesTest {
         await { !model.state.value.busy }
     }
 
-    @Test fun attentionAndRunningTurnsAlwaysOpenReviewInsteadOfQuickCommit() {
+    @Test fun noMineOpensReviewButRunningMineUsesQuickCommit() {
         val fake = Fake(review(files = listOf(mine.copy(ownership = GitOwnership.Shared))))
         val model = mount(fake)
         for (ownership in listOf(GitOwnership.Shared, GitOwnership.Unclear, GitOwnership.Unassigned)) {
@@ -187,8 +187,8 @@ class GitChangesTest {
         }
         compose.runOnIdle { fake.review = review(running = true); model.open(GitAction.CommitAndPush, true) }
         await { !model.state.value.loading }
-        compose.onNodeWithText("Frozen snapshot", substring = true).assertIsDisplayed()
-        assertEquals(0, fake.commits)
+        await { fake.commits == 1 }
+        assertEquals(listOf(GitSelection("/scratch", listOf(GitFileSelection("app.kt")))), fake.committedSelections)
     }
 
     @Test fun rejectedPushKeepsCommitAndOffersExplicitPullPush() {
@@ -294,17 +294,11 @@ class GitChangesTest {
         assertEquals(0, fake.messages + fake.commits + fake.pushes)
     }
 
-    @Test fun detachedHeadAndPermissionLossCannotFastCommit() {
-        val fake = Fake(review(branch = null))
+    @Test fun permissionLossCannotFastCommit() {
+        val fake = Fake()
+        fake.messageGate = CompletableDeferred()
         val model = mount(fake)
         compose.runOnIdle { model.open(GitAction.CommitAndPush, true) }
-        await { model.state.value.review != null }
-        compose.onNodeWithTag("git-sheet").assertIsDisplayed()
-        assertEquals(0, fake.commits)
-        compose.runOnIdle {
-            model.dismiss(); fake.review = review(); fake.messageGate = CompletableDeferred()
-            model.open(GitAction.CommitAndPush, true)
-        }
         await { model.state.value.generating }
         compose.runOnIdle {
             fake.snapshot.value = fake.snapshot.value.copy(access = mapOf(chat to GitAccess.ReadOnly))
@@ -492,6 +486,39 @@ class GitChangesTest {
         assertTrue(model.state.value.notice!!.detail.contains("123abcd"))
         compose.onNodeWithContentDescription("Dismiss Git result").performClick()
         assertNull(model.state.value.notice)
+    }
+
+    @Test fun headerCommitUsesOnlyMineAndReportsExcludedFiles() {
+        val fake = Fake(review("main", listOf(mine, ownEdits, mine.copy(path = "shared.kt", ownership = GitOwnership.Shared), mine.copy(path = "unclear.kt", ownership = GitOwnership.Unclear))))
+        val model = mount(fake)
+        compose.onNodeWithTag("git-primary").assertTextContains("1").performClick()
+        await { fake.commits == 1 && !model.state.value.busy }
+        assertFalse(fake.committedPush)
+        assertEquals(listOf(GitSelection("/scratch", listOf(GitFileSelection("app.kt")))), fake.committedSelections)
+        assertTrue(model.state.value.notice!!.detail.startsWith("2 files left out (shared/unclear) — use Commit… to review them"))
+        compose.onNodeWithTag("git-sheet").assertDoesNotExist()
+        compose.onNodeWithTag("git-confirm-main").assertDoesNotExist()
+    }
+
+    @Test fun quickPushIgnoresDefaultRepoWithoutMineAndUsesSingularExclusion() {
+        val fake = Fake(review().copy(repos = review().repos + GitRepo(GitBranch("/other", "other", "main", isDefault = true), files = listOf(ownEdits, mine.copy(ownership = GitOwnership.Shared)))))
+        val model = mount(fake)
+        compose.runOnIdle { model.open(GitAction.CommitAndPush, true) }
+        await { fake.commits == 1 && !model.state.value.busy }
+        assertTrue(fake.committedPush)
+        assertEquals(listOf(GitSelection("/scratch", listOf(GitFileSelection("app.kt")))), fake.committedSelections)
+        assertTrue(model.state.value.notice!!.detail.startsWith("1 file left out (shared/unclear)"))
+        compose.onNodeWithTag("git-confirm-main").assertDoesNotExist()
+    }
+
+    @Test fun emptyQuickReviewShowsNoticeWithoutGeneratingOrCommitting() {
+        val fake = Fake(review(files = emptyList()))
+        val model = mount(fake)
+        compose.runOnIdle { model.open(GitAction.Commit, true) }
+        await { !model.state.value.loading }
+        compose.onNodeWithText("No uncommitted changes").assertIsDisplayed()
+        compose.onNodeWithTag("git-sheet").assertDoesNotExist()
+        assertEquals(0, fake.commits + fake.messages)
     }
 
     @Test fun namedErrorsHavePlainActionableCopy() {

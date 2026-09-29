@@ -11,9 +11,9 @@ file/hunk selections, and keeps typed text separate from generated suggestions.
 Shared, unclear, and unassigned files start unticked. File checkboxes are always
 visible; tapping a row toggles whole-file selection. Independent chevrons and
 Show diffs / Hide diffs control hunk previews. Changed selections discard stale
-generated messages; an empty message regenerates on commit or Hide diffs. Quick commit & push falls
-back to review for those files, an active turn, or detached HEAD. Default branches
-require confirmation. Branch creation uses the generated suggestion when present.
+generated messages; an empty message regenerates on commit or Hide diffs. Header
+quick actions commit only mine files; no-mine reviews open the sheet. Commit & push
+confirms default branches holding mine files. Branch creation uses the generated suggestion when present.
 
 ## Core integration
 
@@ -53,7 +53,7 @@ daemon protocol must be relaunched by the owner before live verification.
 ## Checks
 
 `GitChangesTest` uses synthetic `/scratch` fixtures for selection, main-branch
-confirmation, feature-branch quick commit, attention/running fallback, branch
+confirmation, feature-branch quick commit, mixed ownership and no-mine fallback, branch
 creation, uncertain-delivery presentation, rejected push, error mapping, scope
 gating, settings, transcript notices, and row markers.
 
@@ -63,3 +63,5 @@ relaunch, device checks must use a scratch workspace/repository and a disposable
 local bare remote only, never an owner repository or real remote.
 
 Git results use bottom cards for progress, success (five-second dismissal), and persistent errors. Rejected pushes expose Pull & push. Commit cards parse positional subject/branch/remote lines, open validated HTTPS commit URLs, and offer Push only with write access and ahead commits. Body-keyed parsing updates the card when the daemon rewrites a receipt. Standalone push counts/upstream labels come from the pre-action status snapshot; its receipt does not supply a commit subject or SHA.
+
+Header quick actions select only whole files owned by this chat (mine). Commit saves directly; Commit & push confirms only selected repos flagged is_default_branch. Empty reviews show No uncommitted changes; reviews without mine files open the sheet. Quick results lead with any shared/unclear files left out. Header counts subtract summary attention. Review requests retain the daemon include_unassigned=true default.

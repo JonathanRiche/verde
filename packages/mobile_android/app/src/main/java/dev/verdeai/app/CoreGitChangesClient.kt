@@ -145,6 +145,7 @@ internal class CoreGitChangesClient(private val core: GitCoreConnection, scope: 
     private suspend fun seed(selector: String) { latestViews = latestViews + (selector to core.query(selector)); project(latestViews) }
     override suspend fun review(chat: GitChat, hunkBudgetBytes: Int): GitReview {
         // Core enforces min(128 KiB, response limit / 16), tighter than this UI budget.
+        // The daemon review defaults include_unassigned=true; retain all ownership categories for the sheet.
         receipt { n, w, id -> EventGitReviewOpen(now_ms=n, wall_time_ms=w, intent_id=id, workspace_id=chat.workspace, thread_id=chat.thread) }
         val value = reviewView().review ?: throw GitFailure("invalid_response")
         if (value.workspace_id != chat.workspace || value.local_thread_id != chat.thread) throw GitFailure("review_expired")
