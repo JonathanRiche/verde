@@ -380,7 +380,7 @@ final class SessionOperation: NSObject, URLSessionDataDelegate, URLSessionWebSoc
                 headers: failure == nil && fileIntent == nil ? headers : [], body_base64: failure == nil && fileIntent == nil ? body.base64EncodedString() : nil, error: failure)))
         case .tls_probe(let e):
             emit(.tls_peer(EventTlsPeer(now_ms: 0, wall_time_ms: 0, effect_id: e.effect_id,
-                generation: e.generation, origin: e.origin, spki_sha256: "", system_trusted: false)))
+                generation: e.generation, origin: e.origin, spki_sha256: "", system_trusted: false, error: failure)))
         case .ws_open: emitClosed(code: nil, clean: false, error: failure ?? TransportFailure(kind: .network, code: .unknown))
         default: break
         }
@@ -457,7 +457,7 @@ final class SessionOperation: NSObject, URLSessionDataDelegate, URLSessionWebSoc
             case .ws_open: emitClosed(code: nil, clean: false, error: failure)
             case .tls_probe(let e):
                 emit(.tls_peer(EventTlsPeer(now_ms: 0, wall_time_ms: 0, effect_id: e.effect_id,
-                    generation: e.generation, origin: e.origin, spki_sha256: "", system_trusted: false)))
+                    generation: e.generation, origin: e.origin, spki_sha256: "", system_trusted: false, error: failure)))
             default: break
             }
             finish()

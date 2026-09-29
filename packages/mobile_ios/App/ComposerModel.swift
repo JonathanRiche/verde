@@ -288,3 +288,8 @@ final class ComposerModel {
         }
     }
 }
+
+/// A confirmed inline steer is retained by core as a receipt, not pending UI.
+func visibleFollowup(_ followup: ChatFollowup) -> Bool {
+    !(followup.state == "sent_inline" && followup.delivery == "accepted")
+}
