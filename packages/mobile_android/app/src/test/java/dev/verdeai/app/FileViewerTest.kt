@@ -117,7 +117,7 @@ class FileViewerTest {
     @Test fun failuresShowClearStatesAndRetrySpendsANewIntent() {
         start()
         val cases=listOf(
-            Triple("too_large", "Too large to open", "2 MB limit"),
+            Triple("too_large", "Too large to preview", "2 MB limit"),
             Triple("forbidden", "No access", "outside the host's shared workspaces"),
             Triple("not_found", "File not found", "moved or deleted"),
             Triple("preview_unavailable", "No preview available", "LibreOffice"),
@@ -130,8 +130,9 @@ class FileViewerTest {
             await { model.state.value.problem != null }
             await { exists(title) }
             assertTrue(exists(detail, substring=true))
-            // Only transient failures offer Retry.
+            // Only transient failures offer Retry; only files that exist offer Download.
             assertEquals(code == "offline", exists("Retry"))
+            assertEquals(code == "too_large" || code == "preview_unavailable", exists("Download file"))
         }
         val path="/home/u/offline.txt"
         failures.remove(path)
@@ -152,7 +153,55 @@ class FileViewerTest {
         assertTrue(core.events.none { it is EventFileOpen })
         files["/home/u/blob.dat"]=byteArrayOf(0x7f, 0x45, 0, 0x4c)
         open("/home/u/blob.dat")
-        await { exists("Binary file") }
+        await { exists("No preview for this file") }
+        assertTrue(exists("Download file"))
+    }
+
+    @Test fun svgAndScriptTypesComeAsAttachmentsAndSvgRendersSandboxed() {
+        start()
+        val svg="<svg xmlns=\"http://www.w3.org/2000/svg\"><circle r=\"4\"/></svg>\n"
+        files["/home/u/find-your-chapter.svg"]=svg.encodeToByteArray()
+        val model=open("/home/u/find-your-chapter.svg")
+        await { tagged(FILE_SVG_TAG).isNotEmpty() }
+        val open=core.events.filterIsInstance<EventFileOpen>().last()
+        assertEquals(FileKind.download, open.kind)
+        assertEquals(MAX_IMAGE_BYTES, open.max_bytes)
+        assertTrue(model.state.value.content is FileContent.Svg)
+        compose.onNodeWithText("Source").performClick()
+        await { exists(svg.trim()) }
+        compose.onNodeWithText("Image").assertExists()
+
+        files["/home/u/page.html"]="<h1>hi</h1>\n".encodeToByteArray()
+        open("/home/u/page.html")
+        await { exists("<h1>hi</h1>") }
+        assertEquals(FileKind.download, core.events.filterIsInstance<EventFileOpen>().last().kind)
+    }
+
+    @Test fun downloadFetchesTheOriginalAndDiscardsTheTargetOnFailure() {
+        start()
+        files["/home/u/deck.pptx"]=byteArrayOf(4, 5, 6)
+        val model=open("/home/u/deck.pptx")
+        await { tagged(FILE_PDF_TAG).isNotEmpty() }
+        compose.onNodeWithContentDescription("Download file").assertExists()
+        val written=CopyOnWriteArrayList<ByteArray>()
+        var discarded=0
+        compose.runOnUiThread { model.save({ written.add(it) }, { discarded++ }) }
+        await { model.download.value == DownloadStatus.Saved }
+        // The original document, not the converted preview.
+        val fetch=core.events.filterIsInstance<EventFileOpen>().last()
+        assertEquals(FileKind.download, fetch.kind)
+        assertEquals(MAX_DOCUMENT_BYTES, fetch.max_bytes)
+        assertArrayEquals(byteArrayOf(4, 5, 6), written.single())
+        assertEquals(0, discarded)
+        assertEquals(0, sink.size())
+        compose.runOnUiThread { model.downloadShown() }
+
+        files.remove("/home/u/deck.pptx")
+        compose.runOnUiThread { model.save({ written.add(it) }, { discarded++ }) }
+        await { model.download.value == DownloadStatus.Failed(FileProblem.NotFound) }
+        assertEquals(1, written.size)
+        assertEquals(1, discarded)
+        assertEquals("Update Verde on the host to download this file type", downloadFailureText(FileProblem.Unsupported))
     }
 
     @Test fun markdownRendersTheCoreAstAndSourceKeepsLineNumbers() {
@@ -219,6 +268,11 @@ class FileViewerTest {
         assertEquals(ViewerKind.Office, viewerKind("/a/b.docx"))
         assertEquals(ViewerKind.Text, viewerKind("/a/Makefile"))
         assertEquals(ViewerKind.Text, viewerKind("/a/.env"))
+        assertEquals(ViewerKind.Svg, viewerKind("/a/b.SVG"))
+        assertEquals(FileKind.download, viewerFetchKind("/a/b.svg"))
+        assertEquals(FileKind.download, viewerFetchKind("/a/index.htm"))
+        assertEquals(FileKind.preview, viewerFetchKind("/a/b.docx"))
+        assertEquals(FileKind.file, viewerFetchKind("/a/b.ts"))
         assertEquals(MAX_TEXT_BYTES, viewerLimit(ViewerKind.Markdown))
         assertEquals(MAX_DOCUMENT_BYTES, viewerLimit(ViewerKind.Office))
 

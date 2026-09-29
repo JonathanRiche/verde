@@ -25,13 +25,17 @@ import java.util.UUID
  * D-12 file viewer. Bytes come from the core's authenticated `file_open` fetch (the host's bearer
  * and TLS pin) and live only in this model's memory: never written to disk, cached, logged or
  * backed up. PDFs are handed to [PdfRenderer] through an anonymous in-memory file (memfd).
+ * The one exception is an explicit Download, which writes the original bytes only to the
+ * document the user picked in the system file picker.
  */
-internal enum class ViewerKind { Text, Markdown, Image, Pdf, Office }
+internal enum class ViewerKind { Text, Markdown, Image, Svg, Pdf, Office }
 
 private val IMAGE_EXTS = setOf("png", "jpg", "jpeg", "webp", "gif", "bmp")
 private val MARKDOWN_EXTS = setOf("md", "markdown")
 /** The host converts these to PDF (`/api/preview`, LibreOffice); same list as the gateway. */
 private val OFFICE_EXTS = setOf("pptx", "ppt", "odp", "docx", "doc", "odt", "xlsx", "xls", "ods", "rtf")
+/** The gateway refuses these inline (they'd run in its origin) and serves them only as downloads. */
+private val ATTACHMENT_EXTS = setOf("html", "htm", "svg", "js", "mjs", "cjs", "wasm")
 
 internal fun fileExtension(path: String) = path.substringAfterLast('/').let { name ->
     val dot = name.lastIndexOf('.')
@@ -40,11 +44,23 @@ internal fun fileExtension(path: String) = path.substringAfterLast('/').let { na
 
 internal fun viewerKind(path: String): ViewerKind = when (val ext = fileExtension(path)) {
     in IMAGE_EXTS -> ViewerKind.Image
+    "svg" -> ViewerKind.Svg
     in MARKDOWN_EXTS -> ViewerKind.Markdown
     "pdf" -> ViewerKind.Pdf
     in OFFICE_EXTS -> ViewerKind.Office
     else -> ViewerKind.Text
 }
+
+/** How [path] is fetched for viewing: Office converts to PDF; script-capable types come as attachments. */
+internal fun viewerFetchKind(path: String): FileKind = when {
+    viewerKind(path) == ViewerKind.Office -> FileKind.preview
+    fileExtension(path) in ATTACHMENT_EXTS -> FileKind.download
+    else -> FileKind.file
+}
+
+/** Best-effort MIME type for the save picker. */
+internal fun downloadMime(path: String): String =
+    android.webkit.MimeTypeMap.getSingleton().getMimeTypeFromExtension(fileExtension(path)) ?: "application/octet-stream"
 
 internal const val MAX_TEXT_BYTES = 2L * 1024 * 1024
 internal const val MAX_IMAGE_BYTES = 16L * 1024 * 1024
@@ -54,7 +70,7 @@ internal const val MAX_DOCUMENT_BYTES = 32L * 1024 * 1024
 /** Per-kind phone limit, enforced while streaming; bigger files get the "too large" state. */
 internal fun viewerLimit(kind: ViewerKind) = when (kind) {
     ViewerKind.Text, ViewerKind.Markdown -> MAX_TEXT_BYTES
-    ViewerKind.Image -> MAX_IMAGE_BYTES
+    ViewerKind.Image, ViewerKind.Svg -> MAX_IMAGE_BYTES
     ViewerKind.Pdf, ViewerKind.Office -> MAX_DOCUMENT_BYTES
 }
 
@@ -107,7 +123,20 @@ internal sealed interface FileContent {
     class Text(val text: String, val lineStarts: IntArray, val spans: List<RenderSpan>) : FileContent
     class Markdown(val source: Text, val nodes: List<MarkdownNode>) : FileContent
     class Image(val bitmap: ImageBitmap) : FileContent
+    /** Rendered by a sandboxed WebView (no scripts, network or file access); [source] is the XML. */
+    class Svg(val source: Text, val base64: String) : FileContent
     class Pdf(val document: PdfDocument) : FileContent
+}
+
+/** Problems where the file exists on the host but the phone can't preview it: offer a download. */
+internal val DOWNLOADABLE_PROBLEMS = setOf(FileProblem.TooLarge, FileProblem.Unsupported, FileProblem.PreviewUnavailable,
+    FileProblem.Binary, FileProblem.PdfNeedsNewerAndroid, FileProblem.Unreadable)
+
+internal sealed interface DownloadStatus {
+    data object Idle : DownloadStatus
+    data object Saving : DownloadStatus
+    data object Saved : DownloadStatus
+    data class Failed(val problem: FileProblem) : DownloadStatus
 }
 
 internal data class FileViewState(
@@ -235,6 +264,8 @@ internal class FileViewerModel(
     private var job: Job? = null
     private val highlights = RenderCache(32).highlight
     private val highlightLock = Any()
+    private val mutableDownload = MutableStateFlow<DownloadStatus>(DownloadStatus.Idle)
+    val download = mutableDownload.asStateFlow()
 
     init {
         if (path != null) scope.launch { observe(hostId) }
@@ -263,6 +294,31 @@ internal class FileViewerModel(
         load(host)
     }
 
+    /**
+     * Fetches the original file (never the Office preview) and hands it to [write], which targets
+     * the document the user just picked. [discard] removes that document if nothing was saved.
+     */
+    fun save(write: (ByteArray) -> Unit, discard: () -> Unit) {
+        val target = path ?: return
+        if (download.value == DownloadStatus.Saving) return
+        val host = core ?: run { discard(); mutableDownload.value = DownloadStatus.Failed(FileProblem.Unavailable); return }
+        mutableDownload.value = DownloadStatus.Saving
+        scope.launch {
+            val next = try {
+                when (val bytes = fetchBytes(host, target, FileKind.download, MAX_DOCUMENT_BYTES)) {
+                    is ByteArray -> { withContext(Dispatchers.IO) { write(bytes) }; DownloadStatus.Saved }
+                    else -> DownloadStatus.Failed((bytes as FileViewState).problem ?: FileProblem.Failed)
+                }
+            } catch (e: CancellationException) { withContext(NonCancellable + Dispatchers.IO) { runCatching(discard) }; throw e }
+                catch (_: Exception) { DownloadStatus.Failed(FileProblem.Failed) }
+            if (next is DownloadStatus.Failed) withContext(Dispatchers.IO) { runCatching(discard) }
+            mutableDownload.value = next
+        }
+    }
+
+    /** Clears a reported save result. */
+    fun downloadShown() { if (download.value != DownloadStatus.Saving) mutableDownload.value = DownloadStatus.Idle }
+
     private fun load(host: CoreHost) {
         val target = path ?: return
         job?.cancel()
@@ -276,18 +332,26 @@ internal class FileViewerModel(
         }
     }
 
-    private suspend fun fetch(host: CoreHost, target: String): FileViewState {
+    /** Returns the body as a [ByteArray], or a failed [FileViewState]. */
+    private suspend fun fetchBytes(host: CoreHost, target: String, fetchKind: FileKind, maxBytes: Long): Any {
         val intent = UUID.randomUUID().toString()
         host.send { n, w -> EventFileOpen(now_ms = n, wall_time_ms = w, intent_id = intent, path = target,
-            kind = if (kind == ViewerKind.Office) FileKind.preview else FileKind.file, max_bytes = limit) }
+            kind = fetchKind, max_bytes = maxBytes) }
         val op = withTimeoutOrNull(waitMs) {
             host.operations.map { q -> q?.data?.items?.find { it.intent_id == intent } }.first { it != null && it.state != "pending" }
         } ?: return FileViewState(loading = false, problem = FileProblem.Offline, retryable = true)
         if (op.state != "succeeded") {
             return FileViewState(loading = false, problem = fileProblem(op.error?.code), retryable = op.error?.retryable == true)
         }
-        val body = host.takeFile(intent) ?: return FileViewState(loading = false, problem = FileProblem.Failed, retryable = true)
-        val content = try { withContext(Dispatchers.Default) { decode(host, body.bytes) } }
+        return host.takeFile(intent)?.bytes ?: FileViewState(loading = false, problem = FileProblem.Failed, retryable = true)
+    }
+
+    private suspend fun fetch(host: CoreHost, target: String): FileViewState {
+        val bytes = when (val body = fetchBytes(host, target, viewerFetchKind(target), limit)) {
+            is ByteArray -> body
+            else -> return body as FileViewState
+        }
+        val content = try { withContext(Dispatchers.Default) { decode(host, bytes) } }
             catch (e: CancellationException) { throw e }
             catch (_: PdfUnsupported) { return FileViewState(loading = false, problem = FileProblem.PdfNeedsNewerAndroid) }
             catch (_: OutOfMemoryError) { return FileViewState(loading = false, problem = FileProblem.TooLarge) }
@@ -299,6 +363,10 @@ internal class FileViewerModel(
     /** Returns a [FileContent] or a [FileProblem]. */
     private suspend fun decode(host: CoreHost, bytes: ByteArray): Any = when (kind) {
         ViewerKind.Image -> decoders.image(bytes)?.let { FileContent.Image(it) } ?: FileProblem.Unreadable
+        ViewerKind.Svg -> decodeText(bytes)?.takeIf { it.isNotBlank() }?.let { text ->
+            FileContent.Svg(FileContent.Text(text, lineStarts(text), emptyList()),
+                java.util.Base64.getEncoder().encodeToString(bytes))
+        } ?: FileProblem.Unreadable
         ViewerKind.Pdf, ViewerKind.Office ->
             (if (bytes.isEmpty()) null else decoders.pdf(bytes))?.let { FileContent.Pdf(it) } ?: FileProblem.Unreadable
         ViewerKind.Text, ViewerKind.Markdown -> {
