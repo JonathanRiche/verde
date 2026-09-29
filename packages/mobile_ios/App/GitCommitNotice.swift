@@ -8,7 +8,10 @@ struct GitCommitNotice: Equatable {
     let pushed: Bool
     let subject: String?
     let branch: String?
-    var title: String { "Committed \(count) \(count == 1 ? "file" : "files")" }
+    let remotes: [URL]
+    var title: String { "\(pushed ? "Committed & pushed" : "Committed") \(count) \(count == 1 ? "file" : "files")" }
+
+    func showsPush(canCommit: Bool, ahead: UInt32) -> Bool { !pushed && canCommit && ahead > 0 }
 
     static func parse(_ body: String) -> GitCommitNotice? {
         let lines = body.components(separatedBy: .newlines)
@@ -29,11 +32,19 @@ struct GitCommitNotice: Equatable {
         let subject = value(1)
         let branchLine = value(2)
         let branch = branchLine.flatMap { $0.hasPrefix("branch ") ? String($0.dropFirst(7)).trimmingCharacters(in: .whitespaces) : nil }
-        return GitCommitNotice(count: count, revisions: revisions, pushed: pushed, subject: subject, branch: branch?.isEmpty == false ? branch : nil)
+        let remotes = lines.dropFirst(3).compactMap { line -> URL? in
+            guard line.hasPrefix("remote "),
+                  let url = URL(string: String(line.dropFirst(7))),
+                  url.scheme?.lowercased() == "https", url.host?.isEmpty == false,
+                  url.user == nil, url.password == nil else { return nil }
+            return url
+        }
+        return GitCommitNotice(count: count, revisions: revisions, pushed: pushed, subject: subject, branch: branch?.isEmpty == false ? branch : nil, remotes: remotes.reduce(into: [URL]()) { if !$0.contains($1) { $0.append($1) } })
     }
 }
 
 struct GitCommitNoticeCard: View {
+    @Environment(\.gitChangesModel) private var git
     let bodyText: String
     var body: some View {
         Group {
@@ -55,8 +66,19 @@ struct GitCommitNoticeCard: View {
                         Label(branch, systemImage: "arrow.triangle.branch").font(VerdeTheme.mono(10)).lineLimit(1)
                             .padding(.horizontal, 6).padding(.vertical, 3).background(VerdeTheme.border.opacity(0.4), in: Capsule())
                     }
+                    ForEach(notice.remotes, id: \.self) { url in
+                        Link("View on \(url.host ?? "remote")", destination: url).font(VerdeTheme.ui(12))
+                    }
+                    if let git, notice.showsPush(canCommit: git.canCommit, ahead: git.ahead) {
+                        Button { Task { await git.push() } } label: {
+                            HStack {
+                                if git.isPushing { ProgressView() }
+                                Text("Push")
+                            }
+                        }.disabled(git.busy).accessibilityIdentifier("git-receipt-push")
+                    }
                 }.padding(10).background(VerdeTheme.panel.opacity(0.6), in: RoundedRectangle(cornerRadius: 8))
-                    .accessibilityElement(children: .combine)
+                    .accessibilityElement(children: .contain)
             } else {
                 // Preserve unknown/older daemon notices without inventing success metadata.
                 Text(bodyText.components(separatedBy: .newlines).first ?? "")

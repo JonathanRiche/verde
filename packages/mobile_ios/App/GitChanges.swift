@@ -4,7 +4,7 @@ struct GitChatControls: View {
     let browse: BrowseModel
     let workspace: String
     let thread: String
-    @State private var model: GitChangesModel?
+    let model: GitChangesModel?
     private var controls: some View {
         Group {
             if let model {
@@ -48,24 +48,13 @@ struct GitChatControls: View {
                             Button("Commit & push to \(model.mainBranch ?? "main")") { Task { await model.commit(push: true) } }
                             Button("Create branch & continue") { Task { await model.commit(push: true, newBranch: true) } }
                         } message: { Text("\(model.count) files · \(model.finalMessage.components(separatedBy: .newlines).first ?? "")") }
-                        .popover(isPresented: Binding(get: { model.notice != nil && !model.sheet && !model.confirmMain }, set: { if !$0 { model.notice = nil } })) {
-                            VStack(alignment: .leading, spacing: 12) {
-                                Text(model.notice ?? "")
-                                if model.canCommit && model.view?.can_retry == true { Button("Check original operation") { Task { await model.retry() } } }
-                                if model.canCommit { ForEach(model.rejectedRoots, id: \.self) { root in Button("Pull & push") { Task { await model.pullPush(root) } } } }
-                                Button("Dismiss") { model.notice = nil }
-                            }.padding().presentationCompactAdaptation(.popover)
-                        }
+
                 }
             }
         }
     }
     var body: some View {
         controls
-        .task(id: browse.hostID) {
-            let next = GitChangesModel(browse: browse, workspace: workspace, thread: thread)
-            model = next; await next.start()
-        }
         .onChange(of: browse.session?.store.snapshots["operations"]) { _, _ in Task { await model?.refresh() } }
         .onChange(of: browse.session?.row?.phase) { _, _ in Task { await catalogChanged() } }
         .onChange(of: browse.session?.store.snapshots["workspaces"]) { _, _ in
@@ -132,6 +121,7 @@ struct GitCommitSheet: View {
             .background(VerdeTheme.background)
             .safeAreaInset(edge: .bottom) {
                 VStack(spacing: 10) {
+                    GitActionToastCard(model: model)
                     HStack {
                         Button("Cancel") { model.dismissSheet() }.disabled(model.busy)
                         Spacer()

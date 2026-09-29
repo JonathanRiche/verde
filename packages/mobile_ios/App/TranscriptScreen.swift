@@ -19,6 +19,7 @@ struct TranscriptScreen: View {
     var onHosts: () -> Void = {}
 
     @State private var model: TranscriptModel?
+    @State private var git: GitChangesModel?
 
     private var fallbackTitle: String? {
         browse.state.workspaces?.items.first { $0.workspace_id == workspaceID }?.threads.first { $0.thread_id == threadID }?.title
@@ -32,11 +33,17 @@ struct TranscriptScreen: View {
                 Spacer()
             }
         }
+        .environment(\.gitChangesModel, git)
+        .overlay(alignment: .bottom) { if let git, !git.sheet { GitActionToastCard(model: git) } }
+        .task(id: browse.hostID) {
+            let next = GitChangesModel(browse: browse, workspace: workspaceID, thread: threadID)
+            git = next; await next.start()
+        }
         .background(VerdeTheme.background)
         .navigationTitle(model?.thread?.thread.title ?? fallbackTitle ?? "Chat")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) { GitChatControls(browse: browse, workspace: workspaceID, thread: threadID) }
+            ToolbarItem(placement: .topBarTrailing) { GitChatControls(browse: browse, workspace: workspaceID, thread: threadID, model: git) }
             ToolbarItem(placement: .topBarTrailing) {
                 ManageContainer(browse: browse) { manage in ThreadActions(workspace: workspaceID, thread: threadID, title: model?.thread?.thread.title ?? fallbackTitle ?? "Chat", manage: manage) }
             }

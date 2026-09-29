@@ -8,6 +8,7 @@ final class GitChangesTests: XCTestCase {
         var events: [Event] = []
         var view = GitReviewView()
         var receiptState = "succeeded"
+        var status = GitStatusView()
         var receiptError: LocalError?
         func query(_ selector: String) throws -> Data {
             if selector == "operations" {
@@ -18,7 +19,7 @@ final class GitChangesTests: XCTestCase {
                 return try JSONEncoder().encode(OperationsQuery(api_version: 1, revision: "1", data: OperationsView(items: items), error: nil))
             }
             if selector == "git_review" { return try JSONEncoder().encode(GitReviewQuery(api_version: 1, revision: "1", data: view, error: nil)) }
-            if selector == "git_status" { return try JSONEncoder().encode(GitStatusQuery(api_version: 1, revision: "1", data: GitStatusView(), error: nil)) }
+            if selector == "git_status" { return try JSONEncoder().encode(GitStatusQuery(api_version: 1, revision: "1", data: status, error: nil)) }
             return try JSONEncoder().encode(GitSummaryQuery(api_version: 1, revision: "1", data: GitSummary(workspace_id: "w"), error: nil))
         }
         func model() -> GitChangesModel {
@@ -158,6 +159,110 @@ final class GitChangesTests: XCTestCase {
         XCTAssertFalse(localModel.hasRemote)
         await localModel.submitSheet(.push)
         XCTAssertFalse(local.events.contains { if case .git_commit = $0 { return true }; return false })
+    }
+
+    func testCommitResultToastAndExpiryDoNotDismissLaterErrors() async throws {
+        let fake = Fake(); let model = fake.model()
+        fake.view = review()
+        await model.receive(fake.view)
+        fake.receiptState = "pending"
+        await model.submitSheet(.commit)
+        XCTAssertEqual(model.toast?.phase, .running)
+        XCTAssertEqual(model.toast?.title, "Committing…")
+        fake.receiptState = "succeeded"
+        fake.view.result = GitCommitResult(workspace_id: "w", local_thread_id: "t", files: 1,
+            repos: [GitRepoCommit(root: "/repo", commit: "abc1234", short_commit: "abc1234", subject: "Fixture", files: 1, branch: "feature/test", push: "not_requested")])
+        await model.refresh()
+        XCTAssertEqual(model.toast?.phase, .success)
+        XCTAssertEqual(model.toast?.title, "Committed 1 file")
+        XCTAssertEqual(model.toast?.detail, "abc1234 · feature/test · Fixture")
+        let successID = try XCTUnwrap(model.toast?.id)
+        model.expireToast(successID)
+        XCTAssertNil(model.toast)
+        XCTAssertNil(model.notice)
+        fake.receiptState = "failed"
+        fake.receiptError = LocalError(domain: "git", code: "missing_git_identity", message: "Set your Git identity on the host.", retryable: false)
+        await model.commit()
+        XCTAssertEqual(model.toast?.phase, .failure)
+        XCTAssertEqual(model.toast?.detail, "Set your Git identity on the host.")
+        model.expireToast(successID)
+        XCTAssertEqual(model.toast?.phase, .failure)
+        model.expireToast(try XCTUnwrap(model.toast?.id))
+        XCTAssertNotNil(model.toast)
+    }
+
+    func testCommitPushRejectionKeepsCommitAndOffersPullPush() async throws {
+        let fake = Fake(); let model = fake.model()
+        fake.view = review(); fake.view.review?.repos[0].has_remote = true
+        await model.receive(fake.view)
+        fake.receiptState = "pending"
+        await model.submitSheet(.push)
+        XCTAssertEqual(model.toast?.title, "Committing & pushing…")
+        fake.receiptState = "succeeded"
+        fake.view.result = GitCommitResult(workspace_id: "w", local_thread_id: "t", files: 3,
+            repos: [GitRepoCommit(root: "/repo", commit: "abc1234", short_commit: "abc1234", subject: "Fixture", files: 3, branch: "main", push: "rejected", push_message: "Remote has new commits.")])
+        await model.refresh()
+        XCTAssertEqual(model.toast?.title, "Committed 3 files")
+        XCTAssertEqual(model.toast?.phase, .warning)
+        XCTAssertTrue(model.toast?.detail.contains("Remote has new commits.") == true)
+        XCTAssertEqual(model.toast?.rejectedRoots, ["/repo"])
+        fake.view.pull_push_result = GitPullPushResult(root: "/repo", push: "rejected")
+        fake.view.mutation_state = "pending"
+        await model.pullPush("/repo")
+        XCTAssertEqual(model.toast?.title, "Pulling & pushing…")
+        fake.view.mutation_state = "succeeded"
+        fake.view.pull_push_result = GitPullPushResult(root: "/repo", push: "pushed")
+        await model.refresh()
+        XCTAssertEqual(model.toast?.title, "Pulled & pushed")
+        XCTAssertEqual(model.toast?.phase, .success)
+    }
+
+    func testPlainPushToastUsesPrePushCountAndUpstream() async {
+        let fake = Fake(); let model = fake.model()
+        fake.status = GitStatusView(can_commit: true, status: GitStatusResult(workspace_id: "w", local_thread_id: "t",
+            repos: [GitRepoStatus(root: "/repo", name: "repo", branch: "feature/test", upstream: "origin/feature/test", ahead: 2, has_remote: true)]))
+        await model.refresh()
+        fake.receiptState = "pending"
+        await model.push()
+        XCTAssertTrue(model.isPushing)
+        XCTAssertEqual(model.toast?.phase, .running)
+        fake.receiptState = "succeeded"
+        fake.status.status?.repos[0].ahead = 0
+        fake.view.mutation_state = "succeeded"
+        fake.view.pull_push_result = GitPullPushResult(root: "/repo", push: "pushed")
+        await model.refresh()
+        XCTAssertEqual(model.toast?.title, "Pushed 2 commits to origin/feature/test")
+        XCTAssertEqual(model.toast?.detail, "feature/test")
+        XCTAssertEqual(model.toast?.phase, .success)
+        XCTAssertFalse(model.isPushing)
+    }
+
+    func testCompletedCardsScreenshot() async throws {
+        let fake = Fake(); let model = fake.model()
+        fake.view = review()
+        await model.receive(fake.view)
+        await model.commit(push: true)
+        fake.view.result = GitCommitResult(workspace_id: "w", local_thread_id: "t", files: 3,
+            repos: [GitRepoCommit(root: "/repo", commit: "abc1234", short_commit: "abc1234", subject: "Improve fixture", files: 3, branch: "feature/fixture", push: "pushed")])
+        await model.refresh()
+        XCTAssertEqual(model.toast?.title, "Committed & pushed 3 files")
+        let content = VStack {
+            GitCommitNoticeCard(bodyText: "Committed 3 files: abc1234 · pushed\nImprove fixture\nbranch feature/fixture\nremote https://github.com/owner/repo/commit/abc1234")
+            Spacer()
+            GitActionToastCard(model: model)
+        }.padding(.top, 30).background(VerdeTheme.background).preferredColorScheme(.dark)
+        let controller = UIHostingController(rootView: content)
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
+        window.rootViewController = controller; window.makeKeyAndVisible()
+        defer { window.isHidden = true; window.rootViewController = nil }
+        controller.view.frame = window.bounds
+        controller.view.layoutIfNeeded()
+        try await Task.sleep(for: .milliseconds(300))
+        let image = UIGraphicsImageRenderer(bounds: window.bounds).image { _ in window.drawHierarchy(in: window.bounds, afterScreenUpdates: true) }
+        let attachment = XCTAttachment(image: image); attachment.name = "git-completed-cards"; attachment.lifetime = .keepAlways
+        add(attachment)
     }
 
     func testReviewSheetScreenshot() async throws {
