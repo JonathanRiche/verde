@@ -200,6 +200,9 @@ class CoreHost private constructor(
     private fun dispatch(event: Event) {
         val started = System.nanoTime()
         val trace = traceMetadata != null
+        if (trace && event is EventHttpResponse && (event.error != null || event.status !in 200..299)) {
+            traceMetadata?.invoke("http_status=${event.status} failure=${event.error?.kind} code=${event.error?.code}")
+        }
         val eventKind = when (event) {
             is EventDraftSet -> "draft"
             is EventSend -> "send"

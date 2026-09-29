@@ -185,6 +185,9 @@ class EffectExecutor(
             .cookieJar(CookieJar.NO_COOKIES).cache(null).authenticator(Authenticator.NONE)
             .proxyAuthenticator(Authenticator.NONE)
             .certificatePinner(CertificatePinner.Builder().add(url.host, okhttpPin).build())
+            // Parked chat tails may wait 25s before sending headers. OkHttp's
+            // default 10s read timeout must not undercut the core's deadline.
+            .readTimeout(timeout.coerceAtLeast(1), TimeUnit.MILLISECONDS)
             .callTimeout(timeout.coerceAtLeast(1), TimeUnit.MILLISECONDS)
             .build().also { clients.add(it) }
     }

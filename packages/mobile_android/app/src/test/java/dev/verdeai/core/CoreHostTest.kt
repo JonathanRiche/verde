@@ -144,6 +144,27 @@ class CoreHostTest {
         override fun close() { server.shutdown(); client.dispatcher.executorService.shutdown(); client.connectionPool.evictAll() }
     }
 
+    @Test fun parkedResponseUsesTheCoreDeadlineInsteadOfTheClientsShortReadTimeout() = runBlocking<Unit> {
+        TlsFixture().use { fixture ->
+            val core = FakeCore()
+            val client = fixture.client.newBuilder().readTimeout(100, TimeUnit.MILLISECONDS).build()
+            val host = CoreHost.create(config, executor(client=client), core)
+            try {
+                fixture.server.enqueue(MockResponse().setHeadersDelay(400, TimeUnit.MILLISECONDS).setBody("{}"))
+                core.effects = listOf(fixture.http("parked"))
+                start(host)
+                val response = core.next<EventHttpResponse>()
+                assertEquals(200, response.status)
+                assertNull(response.error)
+                fixture.server.takeRequest(2, TimeUnit.SECONDS)
+                fixture.server.enqueue(MockResponse().setHeadersDelay(600, TimeUnit.MILLISECONDS).setBody("{}"))
+                core.effects = listOf(fixture.http("deadline").copy(timeout_ms=200))
+                host.send { n,w -> EventForeground(now_ms=n, wall_time_ms=w) }
+                assertNotNull(core.next<EventHttpResponse>().error)
+            } finally { host.close() }
+        }
+    }
+
     @Test fun fileFetchKeepsTheBodyInMemoryAndReportsOnlyTheStatus() = runBlocking<Unit> {
         TlsFixture().use { fixture ->
             val core = FakeCore()
