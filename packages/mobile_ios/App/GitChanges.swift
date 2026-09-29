@@ -99,12 +99,16 @@ struct GitCommitSheet: View {
                                 Text("BRANCH").font(VerdeTheme.ui(10, bold: true))
                                 Label(repo.branch ?? "Detached HEAD", systemImage: "arrow.triangle.branch").font(VerdeTheme.ui(14, bold: true))
                                 Text(repo.name).font(VerdeTheme.ui(12))
+                                if repo.is_default_branch || ["main", "master"].contains(repo.branch ?? "") {
+                                    Text("You're committing to the default branch")
+                                        .font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.warning)
+                                }
                             }.frame(maxWidth: .infinity, alignment: .leading).padding(12)
                                 .background((repo.is_default_branch || ["main", "master"].contains(repo.branch ?? "") ? VerdeTheme.warning : VerdeTheme.muted).opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
                             ForEach(repo.files, id: \.path) { file in fileRow(repo, file) }
                         }
                         HStack {
-                            Text("\(model.count) selected files")
+                            Text("\(model.count) selected \(model.count == 1 ? "file" : "files")")
                             Spacer()
                             Text("+\(model.totals.0)").foregroundStyle(VerdeTheme.accent)
                             Text("−\(model.totals.1)").foregroundStyle(VerdeTheme.danger)
