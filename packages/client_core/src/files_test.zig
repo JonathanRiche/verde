@@ -106,6 +106,9 @@ test "file_open emits an authenticated, pinned, bounded fetch and succeeds witho
     try eql("https://host.example/api/preview?path=/home/u/deck.pptx", effect.object.get("url").?.string);
     try expect(effect.object.get("timeout_ms").?.integer > 30_000);
     try expect(effect.object.get("max_response_bytes").?.integer == 1024);
+
+    const download = try f.open("/home/u/icon.svg", "download", 1024);
+    try eql("https://host.example/api/file?download=1&path=/home/u/icon.svg", find(download.batch, "file_fetch").?.object.get("url").?.string);
 }
 
 test "file_open classifies gateway and transport failures" {

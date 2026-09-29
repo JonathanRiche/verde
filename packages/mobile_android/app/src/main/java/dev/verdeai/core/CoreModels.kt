@@ -1662,6 +1662,7 @@ enum class FileKind {
     `file`,
     `preview`,
     `theme`,
+    `download`,
 }
 
 @Serializable

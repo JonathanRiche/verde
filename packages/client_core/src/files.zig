@@ -20,7 +20,9 @@ const FILE_TIMEOUT_MS: u32 = 30_000;
 /// Office conversion runs LibreOffice on the host.
 const PREVIEW_TIMEOUT_MS: u32 = 120_000;
 
-pub const Kind = enum { file, preview, theme };
+/// `download` fetches the original bytes as an attachment, which the gateway
+/// also allows for types it refuses to serve inline (HTML, SVG, scripts).
+pub const Kind = enum { file, preview, theme, download };
 const Fetch = struct {
     intent_id: []const u8,
     path: []const u8,
@@ -117,6 +119,7 @@ fn send(tx: *h.Transaction, f: Fetch) E![]const u8 {
     try url.appendSlice(a, switch (f.kind) {
         .preview => "/api/preview?path=",
         .file => "/api/file?path=",
+        .download => "/api/file?download=1&path=",
         .theme => "/api/theme",
     });
     for (if (f.kind == .theme) "" else f.path) |c| {

@@ -6508,6 +6508,7 @@ enum FileKind: String, Codable {
     case `file`
     case `preview`
     case `theme`
+    case `download`
 }
 
 enum AttentionStatus: String, Codable {
