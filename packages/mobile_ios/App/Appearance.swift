@@ -48,7 +48,7 @@ struct HostPalette: Decodable {
         do {
             let bytes = try await host.fetchFile(path: "/", kind: .theme, limit: 64 * 1024)
             let value = try JSONDecoder().decode(HostPalette.self, from: bytes.data)
-            guard value.color("background") != nil, value.color("text") != nil else { throw FileProblem(message: "Invalid host theme") }
+            guard value.color("background") != nil, value.color("text") != nil else { throw FileProblem.unreadable }
             guard !Task.isCancelled, stamp == revision, hostID == browse.hostID else { return }
             palette = value; paletteHost = hostID
             VerdeTheme.configure()

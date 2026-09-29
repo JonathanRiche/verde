@@ -7,11 +7,30 @@ final class FileViewerTests: XCTestCase {
         XCTAssertEqual(ViewerKind.of("/w/a.docx"), .office)
         XCTAssertEqual(ViewerKind.of("/w/a.md"), .markdown)
         XCTAssertEqual(ViewerKind.image.limit, 16 * 1024 * 1024)
+        XCTAssertEqual(ViewerKind.of("/w/find-your-chapter.SVG"), .svg)
+        XCTAssertEqual(ViewerKind.svg.limit, 16 * 1024 * 1024)
+        XCTAssertEqual(ViewerKind.of("/w/index.html"), .text)
+        XCTAssertEqual(ViewerKind.fetchKind("/w/a.svg"), .download)
+        for path in ["/w/index.html", "/w/a.htm", "/w/a.js", "/w/a.mjs", "/w/a.cjs", "/w/a.wasm"] { XCTAssertEqual(ViewerKind.fetchKind(path), .download, path) }
+        XCTAssertEqual(ViewerKind.fetchKind("/w/a.swift"), .file)
+        XCTAssertEqual(ViewerKind.fetchKind("/w/a.png"), .file)
+        XCTAssertEqual(ViewerKind.fetchKind("/w/a.docx"), .preview)
         XCTAssertEqual(resolveFilePath("./a.swift", root: "/w/"), "/w/a.swift")
         XCTAssertNil(resolveFilePath("../secret", root: "/w"))
         XCTAssertNil(resolveFilePath("a", root: nil))
         XCTAssertEqual(fileLineRange("a😀\nsecond\nthird", line: 2, end: 3), NSRange(location: 4, length: 12))
         XCTAssertNil(fileLineRange("one", line: UInt64.max, end: nil))
+    }
+    func testSVGPreviewIsInertAndProblemsMatchAndroid() {
+        let html = svgPreviewHTML(Data("<svg><script>alert(1)</script></svg>".utf8))
+        XCTAssertTrue(html.contains("default-src 'none'; img-src data:; style-src 'unsafe-inline'"))
+        XCTAssertTrue(html.contains("<img alt=\"\" src=\"data:image/svg+xml;base64,"))
+        XCTAssertFalse(html.contains("<script"))
+        XCTAssertEqual(FileProblem.of("too_large", limit: 2 * 1024 * 1024).detail, "This file is over the 2 MB limit for viewing on the phone. Open it on the host.")
+        XCTAssertEqual(FileProblem.of("unsupported", limit: 1).title, "Can't show this file")
+        XCTAssertEqual(FileProblem.of("timeout", limit: 1).title, "Can't reach the host")
+        XCTAssertEqual(FileProblem.download("too_large", limit: ViewerKind.downloadLimit).title, "Too large to download")
+        XCTAssertEqual(FileProblem.of(nil, limit: 1), .failed)
     }
     func testFileBufferEvictsConsumesAndDiscardsLateCompletions() {
         let buffer = FileBuffer()

@@ -2,10 +2,40 @@ import SwiftUI
 import PDFKit
 import ImageIO
 import Observation
+import WebKit
 
-struct FileProblem: LocalizedError {
-    let message: String
-    var errorDescription: String? { message }
+/// Failure code from the core's file operation (`LocalError.code`), mapped to text by callers.
+struct FileFetchFailure: Error { let code: String? }
+
+/// Title/detail wording mirrors Android's `problemText`.
+struct FileProblem: LocalizedError, Equatable {
+    let title: String
+    let detail: String
+    var errorDescription: String? { detail }
+    static func sizeLabel(_ bytes: UInt32) -> String { bytes >= 1024 * 1024 ? "\(bytes / (1024 * 1024)) MB" : "\(bytes / 1024) KB" }
+    static func of(_ code: String?, limit: UInt32) -> FileProblem {
+        switch code {
+        case "offline", "cancelled", "timeout", "busy", "server_unavailable": return FileProblem(title: "Can't reach the host", detail: "Check your connection and try again.")
+        case "forbidden": return FileProblem(title: "No access", detail: "This file is outside the host's shared workspaces.")
+        case "not_found": return FileProblem(title: "File not found", detail: "It may have been moved or deleted on the host.")
+        case "too_large": return FileProblem(title: "Too large to open", detail: "This file is over the \(sizeLabel(limit)) limit for viewing on the phone. Open it on the host.")
+        case "unsupported": return FileProblem(title: "Can't show this file", detail: "The host doesn't serve this file type to the phone.")
+        case "invalid_path": return unresolved
+        case "preview_unavailable": return FileProblem(title: "No preview available", detail: "Office previews need LibreOffice on the host.")
+        case "unavailable", "unauthorized": return unavailable
+        default: return failed
+        }
+    }
+    /// Download failures reuse the viewer wording except where "viewing" would be wrong.
+    static func download(_ code: String?, limit: UInt32) -> FileProblem {
+        code == "too_large" ? FileProblem(title: "Too large to download", detail: "This file is over the \(sizeLabel(limit)) download limit for the phone. Open it on the host.") : of(code, limit: limit)
+    }
+    static let binary = FileProblem(title: "Binary file", detail: "This file isn't text, so it can't be shown here.")
+    static let unresolved = FileProblem(title: "Can't open this link", detail: "The path couldn't be resolved to a file in the workspace.")
+    static let unreadable = FileProblem(title: "Can't display this file", detail: "The file couldn't be decoded.")
+    static let unavailable = FileProblem(title: "Host not connected", detail: "Reconnect to the host to view files.")
+    static let failed = FileProblem(title: "Couldn't open the file", detail: "Something went wrong loading it.")
+    static let shareFailed = FileProblem(title: "Couldn't share the file", detail: "A private copy for sharing couldn't be prepared.")
 }
 
 extension CoreHost {
@@ -19,31 +49,48 @@ extension CoreHost {
             try Task.checkCancellation()
             let result = try JSONDecoder().decode(OperationsQuery.self, from: query("operations"))
             if let op = result.data?.items.first(where: { $0.intent_id == id }) {
-                if op.state == "failed" { throw FileProblem(message: op.error?.message ?? "The host couldn't open this file.") }
+                if op.state == "failed" { throw FileFetchFailure(code: op.error?.code) }
                 if op.state == "succeeded" {
-                    guard let bytes = takeFile(id) else { throw FileProblem(message: "The file expired. Try opening it again.") }
+                    guard let bytes = takeFile(id) else { throw FileFetchFailure(code: nil) }
                     return bytes
                 }
             }
             try await Task.sleep(for: .milliseconds(100))
         } while ContinuousClock.now < deadline
-        throw FileProblem(message: "The host took too long to respond.")
+        throw FileFetchFailure(code: "timeout")
     }
 }
 
-enum ViewerKind { case text, markdown, image, pdf, office
+enum ViewerKind { case text, markdown, image, svg, pdf, office
+    /// Largest original file the Download/Share action fetches.
+    static let downloadLimit: UInt32 = 32 * 1024 * 1024
     var limit: UInt32 {
-        switch self { case .text, .markdown: return 2 * 1024 * 1024; case .image: return 16 * 1024 * 1024; case .pdf, .office: return 32 * 1024 * 1024 }
+        switch self { case .text, .markdown: return 2 * 1024 * 1024; case .image, .svg: return 16 * 1024 * 1024; case .pdf, .office: return 32 * 1024 * 1024 }
     }
     static func of(_ path: String) -> ViewerKind {
         switch (path as NSString).pathExtension.lowercased() {
         case "png", "jpg", "jpeg", "webp", "gif", "bmp": return .image
+        case "svg": return .svg
         case "md", "markdown": return .markdown
         case "pdf": return .pdf
         case "pptx", "ppt", "odp", "docx", "doc", "odt", "xlsx", "xls", "ods", "rtf": return .office
         default: return .text
         }
     }
+    /// The gateway serves active content (SVG, HTML, scripts, WASM) only as attachments.
+    static func fetchKind(_ path: String) -> FileKind {
+        switch of(path) {
+        case .office: return .preview
+        case .svg: return .download
+        default: return ["html", "htm", "js", "mjs", "cjs", "wasm"].contains((path as NSString).pathExtension.lowercased()) ? .download : .file
+        }
+    }
+}
+
+/// A static page that shows SVG only through `<img>` (no scripts, no fetches) under a
+/// CSP that forbids everything but inline style and the data: image itself.
+func svgPreviewHTML(_ data: Data) -> String {
+    #"<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'"><meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=8, user-scalable=yes"><style>html,body{margin:0;height:100%;background:transparent}body{display:flex;align-items:center;justify-content:center}img{width:100%;height:100%;object-fit:contain}</style></head><body><img alt="" src="data:image/svg+xml;base64,"# + data.base64EncodedString() + #""></body></html>"#
 }
 
 func resolveFilePath(_ path: String, root: String?) -> String? {
@@ -69,33 +116,42 @@ func fileLineRange(_ text: String, line: UInt64?, end: UInt64?) -> NSRange? {
 @MainActor @Observable
 final class FileViewerModel: HighlightSource {
     var loading = false
-    var problem: String?
+    var problem: FileProblem?
     var text: String?
+    var svg: Data?
     var blocks: [MdBlock]?
     var image: UIImage?
     var pdf: PDFDocument?
     private(set) var bytes: Data?
+    /// False when `bytes` are a converted preview (office → PDF), not the original file.
+    private(set) var original = false
     private var host: CoreHost?
     private var highlights = RenderLRU<RenderResult<[RenderSpan]>>(32)
-    func clear() { bytes = nil; text = nil; blocks = nil; image = nil; pdf = nil; host = nil; highlights = RenderLRU(32) }
+    func clear() { bytes = nil; original = false; svg = nil; text = nil; blocks = nil; image = nil; pdf = nil; host = nil; highlights = RenderLRU(32) }
     func load(host: CoreHost, path: String) async {
         clear(); self.host = host; loading = true; problem = nil
         defer { loading = false }
         do {
             let kind = ViewerKind.of(path)
-            let file = try await host.fetchFile(path: path, kind: kind == .office ? .preview : .file, limit: kind.limit)
+            let file: FileBytes
+            do { file = try await host.fetchFile(path: path, kind: ViewerKind.fetchKind(path), limit: kind.limit) }
+            catch let failure as FileFetchFailure { throw FileProblem.of(failure.code, limit: kind.limit) }
             try Task.checkCancellation()
-            bytes = file.data
+            bytes = file.data; original = kind != .office
             switch kind {
             case .pdf, .office:
-                guard let document = PDFDocument(data: file.data), document.pageCount > 0 else { throw FileProblem(message: "This PDF couldn't be read.") }
+                guard let document = PDFDocument(data: file.data), document.pageCount > 0 else { throw FileProblem.unreadable }
                 pdf = document
+            case .svg:
+                guard !file.data.isEmpty else { throw FileProblem.unreadable }
+                svg = file.data
+                text = String(data: file.data, encoding: .utf8)
             case .image:
                 guard let source = CGImageSourceCreateWithData(file.data as CFData, nil),
-                      let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceCreateThumbnailWithTransform: true, kCGImageSourceThumbnailMaxPixelSize: 4096] as CFDictionary) else { throw FileProblem(message: "This image couldn't be read.") }
+                      let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceCreateThumbnailWithTransform: true, kCGImageSourceThumbnailMaxPixelSize: 4096] as CFDictionary) else { throw FileProblem.unreadable }
                 image = UIImage(cgImage: thumbnail)
             case .text, .markdown:
-                guard !file.data.contains(0), let decoded = String(data: file.data, encoding: .utf8) else { throw FileProblem(message: "This file isn't UTF-8 text.") }
+                guard !file.data.contains(0), let decoded = String(data: file.data, encoding: .utf8) else { throw FileProblem.binary }
                 text = decoded
                 if kind == .markdown, decoded.utf8.count <= 64 * 1024,
                    let data = await utility("markdown", decoded), let parsed = try? JSONDecoder().decode(MarkdownQuery.self, from: data).data {
@@ -103,7 +159,7 @@ final class FileViewerModel: HighlightSource {
                 }
             }
         } catch is CancellationError { clear() }
-        catch { clear(); problem = (error as? FileProblem)?.message ?? "This host isn't connected. Try again." }
+        catch { clear(); problem = (error as? FileProblem) ?? .unavailable }
     }
     private func utility(_ utility: String, _ text: String, language: String? = nil) async -> Data? {
         guard let host, text.utf8.count <= 64 * 1024 else { return nil }
@@ -133,14 +189,29 @@ struct FileViewer: View {
     @State private var source = false
     @State private var attempt = 0
     @State private var share: SharedFile?
+    @State private var host: CoreHost?
+    @State private var download: Task<Void, Never>?
+    @State private var downloadProblem: FileProblem?
     private var path: String? { resolveFilePath(citation.path, root: browse.state.workspaces?.items.first { $0.workspace_id == workspaceID }?.path) }
     var body: some View {
         NavigationStack {
             Group {
                 if model.loading { ProgressView("Loading file…") }
-                else if let problem = model.problem { VStack(spacing: 16) { Text(problem); Button("Retry") { attempt += 1 } }.padding() }
+                else if let problem = model.problem {
+                    VStack(spacing: 8) {
+                        Text(problem.title).font(VerdeTheme.ui(17, bold: true)).multilineTextAlignment(.center)
+                        Text(problem.detail).foregroundStyle(VerdeTheme.muted).multilineTextAlignment(.center)
+                        if canDownload {
+                            Button { export() } label: {
+                                if download != nil { ProgressView() } else { Label("Download file", systemImage: "arrow.down.circle") }
+                            }.buttonStyle(.borderedProminent).disabled(download != nil).padding(.top, 8)
+                        }
+                        Button("Retry") { attempt += 1 }.padding(.top, 4)
+                    }.padding()
+                }
                 else if let pdf = model.pdf { NativePDF(document: pdf) }
                 else if let image = model.image { ZoomImage(image: image) }
+                else if let svg = model.svg, !source || model.text == nil { SVGPreview(html: svgPreviewHTML(svg)) }
                 else if let blocks = model.blocks, !source { ScrollView { MarkdownBlocks(blocks: blocks, source: model).padding() } }
                 else if let text = model.text { FileText(text: text, target: fileLineRange(text, line: citation.line, end: citation.end_line)) }
             }
@@ -149,29 +220,54 @@ struct FileViewer: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }
                 ToolbarItemGroup(placement: .primaryAction) {
-                    if model.blocks != nil { Button(source ? "Preview" : "Source") { source.toggle() } }
-                    if model.bytes != nil { Button { export() } label: { Image(systemName: "square.and.arrow.up") }.accessibilityLabel("Share or open file") }
+                    if model.blocks != nil || (model.svg != nil && model.text != nil) { Button(source ? "Preview" : "Source") { source.toggle() } }
+                    if canDownload {
+                        if download != nil { ProgressView() }
+                        else { Button { export() } label: { Image(systemName: "square.and.arrow.up") }.accessibilityLabel("Share or open file") }
+                    }
                 }
             }
         }
         .tint(VerdeTheme.accent).foregroundStyle(VerdeTheme.text).font(VerdeTheme.ui())
         .task(id: attempt) {
             source = citation.line != nil
-            guard let path, let session = browse.session else { model.problem = "This file link can't be resolved in this workspace."; return }
+            guard let path, let session = browse.session else { model.problem = .unresolved; return }
             await session.start()
-            guard let host = session.host else { model.problem = "This host isn't connected."; return }
+            guard let host = session.host else { self.host = nil; model.problem = .unavailable; return }
+            self.host = host
             await model.load(host: host, path: path)
         }
-        .onChange(of: browse.hostID) { dismiss(); model.clear() }
-        .onChange(of: browse.state.host?.auth_state) { _, state in if state != "paired" { dismiss(); model.clear() } }
-        .onDisappear { model.clear(); share?.remove() }
+        .onChange(of: browse.hostID) { dismiss(); model.clear(); host = nil; download?.cancel() }
+        .onChange(of: browse.state.host?.auth_state) { _, state in if state != "paired" { dismiss(); model.clear(); host = nil; download?.cancel() } }
+        .onDisappear { model.clear(); host = nil; download?.cancel(); share?.remove() }
         .sheet(item: $share, onDismiss: { SharedFile.cleanup() }) { file in ShareFile(url: file.url) }
+        .alert(downloadProblem?.title ?? "", isPresented: Binding(get: { downloadProblem != nil }, set: { if !$0 { downloadProblem = nil } }), presenting: downloadProblem) { _ in
+            Button("OK", role: .cancel) {}
+        } message: { problem in Text(problem.detail) }
         .environment(\.openURL, OpenURLAction { url in safeLinkUrl(url.absoluteString) != nil ? .systemAction : .discarded })
     }
+    private var canDownload: Bool { path != nil && host != nil }
+    /// Shares the original file (Save to Files included), reusing preview bytes when they are the original.
     private func export() {
-        guard let bytes = model.bytes else { return }
-        do { share = try SharedFile(bytes, name: ViewerKind.of(citation.path) == .office ? "preview.pdf" : (citation.path as NSString).lastPathComponent) }
-        catch { model.problem = "Couldn't prepare a private copy for sharing." }
+        guard download == nil, let path, let host else { return }
+        let name = (path as NSString).lastPathComponent
+        if model.original, let bytes = model.bytes { return write(bytes, name: name) }
+        download = Task {
+            defer { download = nil }
+            do {
+                let file = try await host.fetchFile(path: path, kind: .download, limit: ViewerKind.downloadLimit)
+                try Task.checkCancellation()
+                write(file.data, name: name)
+            } catch is CancellationError {
+            } catch let failure as FileFetchFailure {
+                if !Task.isCancelled { downloadProblem = .download(failure.code, limit: ViewerKind.downloadLimit) }
+            } catch {
+                if !Task.isCancelled { downloadProblem = .unavailable }
+            }
+        }
+    }
+    private func write(_ data: Data, name: String) {
+        do { share = try SharedFile(data, name: name) } catch { downloadProblem = .shareFailed }
     }
 }
 
@@ -179,6 +275,33 @@ private struct NativePDF: UIViewRepresentable {
     let document: PDFDocument
     func makeUIView(context: Context) -> PDFView { let v = PDFView(); v.autoScales = true; v.displayMode = .singlePageContinuous; v.backgroundColor = UIColor(VerdeTheme.background); return v }
     func updateUIView(_ view: PDFView, context: Context) { if view.document !== document { view.document = document } }
+}
+/// JavaScript off, no persistent storage, no navigation beyond the initial static page.
+private struct SVGPreview: UIViewRepresentable {
+    let html: String
+    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeUIView(context: Context) -> WKWebView {
+        let configuration = WKWebViewConfiguration()
+        configuration.defaultWebpagePreferences.allowsContentJavaScript = false
+        configuration.websiteDataStore = .nonPersistent()
+        let view = WKWebView(frame: .zero, configuration: configuration)
+        view.navigationDelegate = context.coordinator
+        view.allowsLinkPreview = false
+        view.isOpaque = false
+        view.backgroundColor = UIColor(VerdeTheme.background); view.scrollView.backgroundColor = UIColor(VerdeTheme.background)
+        return view
+    }
+    func updateUIView(_ view: WKWebView, context: Context) {
+        guard context.coordinator.html != html else { return }
+        context.coordinator.html = html
+        view.loadHTMLString(html, baseURL: nil)
+    }
+    @MainActor final class Coordinator: NSObject, WKNavigationDelegate {
+        var html: String?
+        func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction) async -> WKNavigationActionPolicy {
+            action.request.url?.absoluteString == "about:blank" ? .allow : .cancel
+        }
+    }
 }
 private struct FileText: UIViewRepresentable {
     let text: String
