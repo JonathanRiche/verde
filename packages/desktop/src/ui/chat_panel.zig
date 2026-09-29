@@ -1931,6 +1931,7 @@ fn transcriptSelectableBodyRect(
     if (childNotification(role, body)) |notification| {
         return transcriptSelectableBodyRect(column, y, height, .assistant, "Child chat", notification.body);
     }
+    if (parentSteerBody(role, body)) |inner| return transcriptSelectableBodyRect(column, y, height, role, author, inner);
     if (role == .system and isSlashCommandResultMessage(author, body)) {
         const pad = theme.scaledUi(16.0);
         const body_y = y + pad + theme.scaledUi(46.0) + theme.scaledUi(12.0);
@@ -5621,7 +5622,22 @@ fn childNotificationToggleHeight(view: ChildNotificationView) f32 {
 }
 
 fn transcriptDisplayBody(role: app_state.ChatRole, body: []const u8) []const u8 {
-    return if (childNotification(role, body)) |notification| notification.body else body;
+    if (childNotification(role, body)) |notification| return notification.body;
+    return parentSteerBody(role, body) orelse body;
+}
+
+/// Parent-agent steers arrive fenced for the provider (see cli
+/// mcpParentSteerPromptAlloc); show only the parent's words, labelled.
+fn parentSteerBody(role: app_state.ChatRole, body: []const u8) ?[]const u8 {
+    if (role != .user) return null;
+    const open = "<verde_parent_message from_thread=\"";
+    const close = "\n</verde_parent_message>";
+    if (!std.mem.startsWith(u8, body, open)) return null;
+    const header_end = std.mem.indexOfPos(u8, body, open.len, "\">\n") orelse return null;
+    const inner_start = header_end + 3;
+    const inner_end = std.mem.lastIndexOf(u8, body, close) orelse return null;
+    if (inner_end < inner_start) return "";
+    return body[inner_start..inner_end];
 }
 
 const ChildNotificationIdentity = struct {
@@ -5716,6 +5732,7 @@ fn transcriptMessageHeightStream(
         return transcriptMessageHeightStream(state, message_index, view.text, .assistant, column_width, "Child chat", false, streaming) +
             childNotificationToggleHeight(view);
     }
+    if (parentSteerBody(role, body_raw)) |inner| return transcriptMessageHeightStream(state, message_index, inner, role, column_width, message_author, assistant_plain_layout, streaming);
     if (role == .system and isSlashCommandResultMessage(message_author, body_raw)) {
         return slashCommandResultHeight(state, message_index, body_raw, column_width);
     }
@@ -8351,6 +8368,9 @@ fn renderTranscriptBubbleFromParts(
         }
         return;
     }
+    if (parentSteerBody(role, body_raw)) |inner| {
+        return renderTranscriptBubbleFromParts(state, column, y, height, role, "Parent agent", inner, muted_body, assistant_plain_layout, clip, message_index, streaming, active);
+    }
     const bubble_width = if (role == .user) column.w * 0.62 else column.w;
     const bubble_x = if (role == .user) column.x + column.w - bubble_width else column.x;
     const bubble = snapRect(palette.Rect{ .x = bubble_x, .y = y, .w = bubble_width, .h = height });
@@ -10344,6 +10364,14 @@ test "split diff layout aligns replacement rows" {
     const split_lines = diffPatchDisplayLineCountForLayout(null, patch, .split);
     try std.testing.expectEqual(@as(usize, 5), stacked_lines);
     try std.testing.expectEqual(@as(usize, 4), split_lines);
+}
+
+test "parent steer wrapper is hidden in the child transcript" {
+    const wrapped = "<verde_parent_message from_thread=\"cli-thread-1\">\nplease rebase\n</verde_parent_message>\n(Steering from the Verde agent orchestrating you, not the human user.)";
+    try std.testing.expectEqualStrings("please rebase", parentSteerBody(.user, wrapped).?);
+    try std.testing.expectEqualStrings("please rebase", transcriptDisplayBody(.user, wrapped));
+    try std.testing.expect(parentSteerBody(.assistant, wrapped) == null);
+    try std.testing.expect(parentSteerBody(.user, "plain prompt") == null);
 }
 
 test "child notification card parses fenced and legacy replies" {

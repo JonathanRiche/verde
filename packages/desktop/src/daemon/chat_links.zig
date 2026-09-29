@@ -163,5 +163,8 @@ pub fn recoverTasks(conn: zqlite.Conn, allocator: std.mem.Allocator, now: i64) !
     for (pending.items) |item| {
         const result = try std.json.Stringify.valueAlloc(arena, .{ .content = .{.{ .type = "text", .text = item.summary }}, .isError = !std.mem.eql(u8, item.status, "completed") }, .{});
         try updateTask(conn, item.id, item.status, item.summary, null, result, now);
+        // Work cut short by the restart itself is not news for the parent;
+        // waking it would start a turn nobody asked for.
+        if (std.mem.eql(u8, item.status, "interrupted")) try conn.exec("update chat_deliveries set delivered=1 where task_id=? and delivered=0", .{item.id});
     }
 }

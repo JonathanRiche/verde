@@ -10524,8 +10524,12 @@ fn maybeInitStoreService(daemon: *Daemon) !void {
     // become `interrupted` before the writer is published.
     try sweepInterruptedChatTurns(&service.store);
     try chat_links.recoverTasks(service.store.conn, daemon.allocator, nowMs());
-    try service.store.conn.execNoArgs("update chat_deliveries set delivered=0,parent_turn_id=null where delivered=2");
-    try service.store.conn.execNoArgs("insert or ignore into chat_deliveries(task_id,link_id,revision,status,summary) select t.task_id,l.link_id,t.revision,t.status,t.summary from chat_tasks t join chat_links l on l.workspace_id=t.workspace_id and l.local_thread_id=t.local_thread_id where l.delivery_enabled=1 and t.status<>'running' and not exists(select 1 from chat_deliveries d where d.task_id=t.task_id and d.link_id=l.link_id and d.status=t.status and d.summary=t.summary)");
+    // A restart must never wake an idle parent. Steers already reached the
+    // parent turn this restart interrupted; results parked behind a
+    // user-stopped parent stay dropped rather than flooding in once the
+    // link is re-enabled. Finished tasks are not backfilled here.
+    try service.store.conn.execNoArgs("update chat_deliveries set delivered=1 where delivered=2");
+    try service.store.conn.execNoArgs("update chat_deliveries set delivered=1 where delivered=0 and link_id in (select link_id from chat_links where delivery_enabled=0)");
 
     lockDaemon(daemon);
     daemon.store_service = service;
@@ -10942,7 +10946,12 @@ fn commitChatTurnDurable(daemon: *Daemon, turn: *ChatTurn) !void {
     // parent's transcript is durable. A crash before this point replays them.
     try service.store.conn.exec("update chat_deliveries set delivered=1 where delivered=2 and parent_turn_id=?", .{turn_id});
 
-    if (status == .aborted and !followup_pending) try service.store.conn.exec("update chat_links set delivery_enabled=0 where workspace_id=? and parent_thread_id=?", .{ workspace_id, local_thread_id });
+    if (status == .aborted and !followup_pending) {
+        // The user stopped this parent: drop queued child results with the
+        // link so a later re-enable does not replay them as a burst of turns.
+        try service.store.conn.exec("update chat_deliveries set delivered=1 where delivered=0 and link_id in (select link_id from chat_links where workspace_id=? and parent_thread_id=?)", .{ workspace_id, local_thread_id });
+        try service.store.conn.exec("update chat_links set delivery_enabled=0 where workspace_id=? and parent_thread_id=?", .{ workspace_id, local_thread_id });
+    }
 
     // 4. Publish revision on the turn after the receipt. The store service
     // mutex is still held here (defer releases at fn exit); store→turn nesting
