@@ -108,7 +108,10 @@ pub fn status(err: engine.ApiError) i32 {
     };
 }
 fn inputSlice(ptr: ?[*]const u8, len: usize) engine.ApiError![]const u8 {
-    if (len > engine.MAX_INPUT) return error.ResourceLimit;
+    return inputSliceLimit(ptr, len, engine.MAX_INPUT);
+}
+fn inputSliceLimit(ptr: ?[*]const u8, len: usize, limit: usize) engine.ApiError![]const u8 {
+    if (len > limit) return error.ResourceLimit;
     if (ptr) |p| return p[0..len];
     if (len != 0) return error.InvalidArgument;
     return "";
@@ -135,7 +138,9 @@ pub fn vcHostHandle(host: ?*engine.Host, ptr: ?[*]const u8, len: usize, out: ?*B
     const result = out orelse return 1;
     result.* = .{};
     const h = host orelse return 1;
-    const input = inputSlice(ptr, len) catch |err| return status(err);
+    // Network completion envelopes include base64/JSON overhead. Host.handle
+    // retains the smaller limit for all non-network events after parsing.
+    const input = inputSliceLimit(ptr, len, engine.MAX_HTTP_INPUT) catch |err| return status(err);
     const bytes = h.handle(input, std.heap.c_allocator) catch |err| return status(err);
     result.* = .{ .ptr = bytes.ptr, .len = bytes.len };
     return 0;
