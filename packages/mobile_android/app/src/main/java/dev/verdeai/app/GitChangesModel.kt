@@ -83,6 +83,7 @@ internal data class GitNotice(val text: String, val rejectedRoots: List<String> 
 internal data class GitChangesState(val snapshot: GitSnapshot = GitSnapshot(), val review: GitReview? = null,
     val sheet: Boolean = false, val preparing: Boolean = false, val confirmingMain: Boolean = false,
     val loading: Boolean = false, val generating: Boolean = false, val busy: Boolean = false, val checking: Boolean = false, val canRetry: Boolean = false,
+    val submittingAction: GitAction? = null, val submittingNewBranch: Boolean = false,
     val expanded: Set<GitFileKey> = emptySet(), val editing: Boolean = false, val action: GitAction = GitAction.Commit,
     val selected: Map<GitFileKey, Set<Int>?> = emptyMap(), val typedMessage: String = "",
     val generated: GitMessage? = null, val error: String? = null, val messageError: Boolean = false,
@@ -203,11 +204,11 @@ internal class GitChangesModel(val chat: GitChat, private val client: GitChanges
         catch (_: Exception) { if (generation == epoch && messageGeneration == request) mutable.update { it.copy(generating = false, messageError = true) } }
     }
     fun canCommit() = writable() && !state.value.busy && !state.value.loading && state.value.review != null && state.value.fileCount > 0 && !state.value.generating
-    fun commit(newBranch: Boolean = false) {
+    fun commit(newBranch: Boolean = false, action: GitAction = state.value.action) {
         if (!canCommit()) return
         val review = state.value.review ?: return
         val epoch = generation
-        mutable.update { it.copy(busy = true, error = null) }
+        mutable.update { it.copy(busy = true, error = null, submittingAction = action, submittingNewBranch = newBranch) }
         viewModelScope.launch {
             try {
                 if (state.value.message.isBlank()) generate(epoch)
@@ -217,7 +218,7 @@ internal class GitChangesModel(val chat: GitChat, private val client: GitChanges
                     mutable.update { it.copy(busy = false, preparing = false, confirmingMain = false, sheet = true) }
                     return@launch
                 }
-                val result = client.commit(review.id, current.message, current.selections, current.action == GitAction.CommitAndPush,
+                val result = client.commit(review.id, current.message, current.selections, action == GitAction.CommitAndPush,
                     newBranch, current.generated?.branch.takeIf { newBranch }) { canRetry ->
                     if (generation == epoch) mutable.update { it.copy(checking = true, canRetry = canRetry) }
                 }

@@ -392,7 +392,61 @@ class GitChangesTest {
         assertTrue(isGitCommitRow(row))
         assertFalse(isCommandRow(row))
         compose.setContent { VerdeTheme { GitCommitNotice(row.body) } }
-        compose.onNodeWithTag("git-commit-notice").assertTextContains(row.body).assertIsDisplayed()
+        compose.onNodeWithTag("git-commit-notice").assertIsDisplayed()
+        compose.onNodeWithText("Committed 1 file").assertIsDisplayed()
+        compose.onNodeWithText("123abcd").assertIsDisplayed()
+        compose.onNodeWithText("Pushed").assertIsDisplayed()
+    }
+
+    @Test fun alternatePushRegeneratesAndKeepsBusyLabelOnTappedButton() {
+        val fake = Fake(review("main", files = listOf(ownEdits)))
+        fake.review = fake.review.copy(repos = fake.review.repos.map { it.copy(branch = it.branch.copy(hasRemote = true)) })
+        fake.messageGate = CompletableDeferred()
+        fake.commitGate = CompletableDeferred()
+        val model = mount(fake)
+        compose.runOnIdle { model.open() }
+        await { model.state.value.review != null }
+        compose.onNodeWithTag("git-file:notes.txt").performClick()
+        compose.onNodeWithTag("git-alternate").performClick()
+        await { model.state.value.generating }
+        compose.onNodeWithTag("git-alternate").assertTextContains("Writing message…").assertIsNotEnabled()
+        compose.onNodeWithTag("git-submit").assertTextContains("Commit")
+        compose.onNodeWithTag("git-confirm-main").assertDoesNotExist()
+        compose.runOnIdle { fake.messageGate!!.complete(Unit) }
+        await { fake.commits == 1 }
+        compose.onNodeWithTag("git-alternate").assertTextContains("Committing…")
+        assertTrue(fake.committedPush)
+        assertFalse(fake.committedNewBranch)
+        assertEquals(1, fake.committedSelections!!.single().files.size)
+        compose.runOnIdle { fake.commitGate!!.complete(Unit) }
+        await { !model.state.value.busy }
+    }
+
+    @Test fun alternateCommitDoesNotPushAndPushAlternativeNeedsRemote() {
+        val fake = Fake()
+        fake.review = fake.review.copy(repos = fake.review.repos.map { it.copy(branch = it.branch.copy(hasRemote = false)) })
+        val model = mount(fake)
+        compose.runOnIdle { model.open() }
+        await { model.state.value.generated != null }
+        compose.onNodeWithTag("git-alternate").assertDoesNotExist()
+        compose.runOnIdle { model.dismiss(); model.open(GitAction.CommitAndPush) }
+        await { model.state.value.generated != null }
+        compose.onNodeWithTag("git-alternate").assertTextContains("Commit").performClick()
+        await { fake.commits == 1 }
+        assertFalse(fake.committedPush)
+        assertFalse(fake.committedNewBranch)
+    }
+
+    @Test fun commitNoticeParserSupportsOldRichAndUnknownReceipts() {
+        assertEquals(GitCommitNoticeData("Committed 1 file", "123abcd", false), parseGitCommitNotice("Committed 1 file: 123abcd"))
+        assertEquals(GitCommitNoticeData("Committed 3 files", "123abcd (app), abc1234 (lib)", true, "Improve fixtures", "feature/fixtures"),
+            parseGitCommitNotice("Committed 3 files: 123abcd (app), abc1234 (lib) · pushed\nImprove fixtures\nbranch feature/fixtures"))
+        assertEquals("feature/fixtures", parseGitCommitNotice("Committed 1 file: 123abcd\nbranch feature/fixtures").branch)
+        assertNull(parseGitCommitNotice("Committed 1 file: 123abcd\nbranch feature/fixtures").subject)
+        assertEquals(GitCommitNoticeData("Unknown receipt", null, false), parseGitCommitNotice("Unknown receipt"))
+        compose.setContent { VerdeTheme { GitCommitNotice("Committed 3 files: 123abcd · pushed\nImprove fixtures\nbranch feature/fixtures") } }
+        compose.onNodeWithText("Improve fixtures").assertIsDisplayed()
+        compose.onNodeWithText("branch feature/fixtures").assertIsDisplayed()
     }
 
     @Test fun namedErrorsHavePlainActionableCopy() {

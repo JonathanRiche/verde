@@ -532,9 +532,3 @@ internal fun StopBar(model: TranscriptModel, state: TranscriptState) {
         }
     }
 }
-
-@Composable
-internal fun GitCommitNotice(body: String) {
-    Text(body, Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp).testTag("git-commit-notice"),
-        style = MaterialTheme.typography.bodySmall, color = VerdeColors.Subtle, maxLines = 1, overflow = TextOverflow.Ellipsis)
-}

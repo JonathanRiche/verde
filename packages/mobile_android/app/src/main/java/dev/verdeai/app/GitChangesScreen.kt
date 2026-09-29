@@ -130,6 +130,7 @@ internal fun GitChangesLayer(model: GitChangesModel) {
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun GitCommitSheet(model: GitChangesModel, state: GitChangesState) {
     val writable = state.snapshot.access[model.chat] == GitAccess.Writable
@@ -166,11 +167,25 @@ private fun GitCommitSheet(model: GitChangesModel, state: GitChangesState) {
         if (state.canRetry) TextButton(onClick = model::retry) { Text("Check again") }
         state.error?.let { Text(it, Modifier.padding(vertical = 6.dp).semantics { liveRegion = LiveRegionMode.Polite }, color = VerdeColors.Warning, style = MaterialTheme.typography.bodySmall) }
         if (state.review == null && !state.loading) TextButton(onClick = { model.open(state.action) }) { Text("Refresh review") }
-        if (writable) TextButton(onClick = { model.commit(newBranch = true) }, enabled = model.canCommit(), modifier = Modifier.testTag("git-new-branch")) { Text("Commit on new branch") }
-        Row(Modifier.fillMaxWidth().padding(bottom = 16.dp), horizontalArrangement = Arrangement.End) {
+        val alternate = if (state.action == GitAction.Commit) GitAction.CommitAndPush else GitAction.Commit
+        fun label(action: GitAction, newBranch: Boolean = false): String {
+            val active = state.busy && state.submittingAction == action && state.submittingNewBranch == newBranch
+            return when {
+                active && state.checking -> "Checking commit…"
+                active && state.generating -> "Writing message…"
+                active -> "Committing…"
+                newBranch -> "New branch"
+                else -> action.label
+            }
+        }
+        FlowRow(Modifier.fillMaxWidth().padding(bottom = 16.dp), horizontalArrangement = Arrangement.End) {
             TextButton(onClick = model::dismiss, enabled = !state.busy) { Text("Cancel") }
-            if (writable) Button(onClick = { model.commit() }, enabled = model.canCommit(), shape = RoundedCornerShape(7.dp), modifier = Modifier.testTag("git-submit")) {
-                Text(if (state.checking) "Checking commit…" else if (state.busy) "Committing…" else state.action.label)
+            if (writable) {
+                TextButton(onClick = { model.commit(newBranch = true) }, enabled = model.canCommit(), modifier = Modifier.testTag("git-new-branch")) { Text(label(state.action, true)) }
+                if (alternate == GitAction.Commit || state.review?.repos.orEmpty().any { it.branch.hasRemote }) {
+                    TextButton(onClick = { model.commit(action = alternate) }, enabled = model.canCommit(), modifier = Modifier.testTag("git-alternate")) { Text(label(alternate)) }
+                }
+                Button(onClick = { model.commit() }, enabled = model.canCommit(), shape = RoundedCornerShape(7.dp), modifier = Modifier.testTag("git-submit")) { Text(label(state.action)) }
             }
         }
     }

@@ -43,7 +43,8 @@ require confirmation. Branch creation uses the generated suggestion when present
   and plain push. Preserve each push request_id through core recovery. Pull & push
   appears only after rejection; a rejected push preserves the successful commit.
 - Read commit settings from config; paired devices cannot change them.
-- Render system/git/git-commit-* transcript rows as quiet one-line notices.
+- Render system/git/git-commit-* transcript rows as compact commit cards, with optional subject/branch metadata and a backward-compatible one-line receipt parser.
+- The sheet offers the alternate Commit / Commit & push action (push requires a remote), using the same selection-aware message generation. Footer controls wrap on phone widths and show progress on the tapped action.
 
 Create PR remains hidden. This lane does not change daemon protocol, generated
 models, or shared core. It is based on shared-core commit `2bf18894`. The updated
