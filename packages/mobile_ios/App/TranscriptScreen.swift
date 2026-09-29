@@ -325,7 +325,7 @@ private struct TranscriptRow: View {
         case .diff(let row): DiffCard(id: row.id, text: row.body, source: model, disclosure: model.disclosure)
         case .notice(let row):
             if row.author == "git" {
-                Text(row.body).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted).lineLimit(1).frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 12).padding(.vertical, 6)
+                GitCommitNoticeCard(bodyText: row.body)
             } else { NoticeRow(row: row, model: model) }
         case .usage(_, let usage): UsageCard(usage: usage)
         case .working(let turn, let waiting): WorkingRow(turn: turn, waitingApproval: waiting)

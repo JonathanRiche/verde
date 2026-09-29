@@ -131,12 +131,23 @@ struct GitCommitSheet: View {
             }
             .background(VerdeTheme.background)
             .safeAreaInset(edge: .bottom) {
-                HStack(spacing: 12) {
-                    Button("Cancel") { model.dismissSheet() }
-                    Spacer(minLength: 0)
+                VStack(spacing: 10) {
+                    HStack {
+                        Button("Cancel") { model.dismissSheet() }.disabled(model.busy)
+                        Spacer()
+                        if model.canCommit {
+                            Button(model.actionTitle(.branch)) { Task { await model.submitSheet(.branch) } }.disabled(!model.canSubmit)
+                        }
+                    }
                     if model.canCommit {
-                        Button("Commit on new branch") { Task { await model.commit(newBranch: true) } }.disabled(!model.canSubmit)
-                        Button("Commit") { Task { await model.commit() } }.buttonStyle(.borderedProminent).disabled(!model.canSubmit)
+                        HStack(spacing: 12) {
+                            Spacer(minLength: 0)
+                            if model.hasRemote {
+                                Button(model.actionTitle(model.alternateAction)) { Task { await model.submitSheet(model.alternateAction) } }.disabled(!model.canSubmit)
+                            }
+                            Button(model.actionTitle(model.primaryAction)) { Task { await model.submitSheet(model.primaryAction) } }
+                                .buttonStyle(.borderedProminent).disabled(!model.canSubmit)
+                        }
                     }
                 }.font(VerdeTheme.ui(12, bold: true)).padding().background(VerdeTheme.panel)
             }

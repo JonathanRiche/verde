@@ -114,9 +114,56 @@ final class GitChangesTests: XCTestCase {
         XCTAssertEqual(fake.events.filter { if case .git_commit = $0 { return true }; return false }.count, 1)
     }
 
+    func testAlternatePushWaitsForMessageAndLabelsOnlyTappedButton() async throws {
+        let fake = Fake(); let model = fake.model()
+        fake.view = review(ownership: "shared")
+        fake.view.review?.repos[0].has_remote = true
+        await model.receive(fake.view)
+        model.toggleFile(GitFileKey(root: "/repo", path: "a.swift"))
+        XCTAssertEqual(model.primaryAction, .commit)
+        XCTAssertEqual(model.alternateAction, .push)
+        fake.receiptState = "pending"
+        await model.submitSheet(.push)
+        XCTAssertEqual(model.actionTitle(.push), "Writing message…")
+        XCTAssertEqual(model.actionTitle(.commit), "Commit")
+        XCTAssertEqual(model.actionTitle(.branch), "New branch")
+        XCTAssertFalse(model.canSubmit)
+        XCTAssertFalse(model.confirmMain)
+        fake.receiptState = "succeeded"
+        fake.view.message?.message = "Fresh selected changes"
+        await model.refresh()
+        let commits = fake.events.compactMap { if case .git_commit(let e) = $0 { return e }; return nil }
+        let event = try XCTUnwrap(commits.first)
+        XCTAssertEqual(commits.count, 1)
+        XCTAssertTrue(event.push)
+        XCTAssertFalse(event.new_branch)
+        XCTAssertEqual(event.selections.first?.files.first?.path, "a.swift")
+        XCTAssertEqual(event.message, "Fresh selected changes")
+        XCTAssertFalse(model.confirmMain)
+    }
+    func testPushSheetAlternateCommitsWithoutPushAndRemoteIsRequired() async throws {
+        let fake = Fake(); let model = fake.model()
+        fake.view = review()
+        fake.view.review?.repos[0].has_remote = true
+        await model.begin(push: true)
+        XCTAssertEqual(model.primaryAction, .push)
+        XCTAssertEqual(model.alternateAction, .commit)
+        await model.submitSheet(.commit)
+        let event = try XCTUnwrap(fake.events.compactMap { if case .git_commit(let e) = $0 { return e }; return nil }.first)
+        XCTAssertFalse(event.push)
+        XCTAssertFalse(event.new_branch)
+
+        let local = Fake(); let localModel = local.model()
+        await localModel.receive(review())
+        XCTAssertFalse(localModel.hasRemote)
+        await localModel.submitSheet(.push)
+        XCTAssertFalse(local.events.contains { if case .git_commit = $0 { return true }; return false })
+    }
+
     func testReviewSheetScreenshot() async throws {
         let fake = Fake(); let model = fake.model()
-        await model.receive(review())
+        var fixture = review(); fixture.review?.repos[0].has_remote = true
+        await model.receive(fixture)
         let controller = UIHostingController(rootView: GitCommitSheet(model: model).preferredColorScheme(.dark))
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let window = UIWindow(windowScene: scene)

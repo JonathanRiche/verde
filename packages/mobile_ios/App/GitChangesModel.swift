@@ -1,6 +1,8 @@
 import Foundation
 import Observation
 
+enum GitCommitAction { case commit, push, branch }
+
 struct GitFileKey: Hashable { let root: String; let path: String }
 
 /// Presentation only: routing, authorization, retained retries and RPCs belong to the core.
@@ -28,6 +30,7 @@ final class GitChangesModel {
     private var quick = false
     private var wantsPush = false
     private var submitting = false
+    private(set) var activeCommitAction: GitCommitAction?
     private var reportedCommit: String?
     private var reportedPush: String?
     private var generating = false
@@ -60,7 +63,7 @@ final class GitChangesModel {
     }
     var ahead: UInt32 { repos.filter { $0.has_remote }.reduce(0) { $0 + $1.ahead } }
     var canCommit: Bool { view?.can_commit == true || status?.can_commit == true }
-    var busy: Bool { submitting || pending.values.contains(true) || view?.mutation_state == "pending" }
+    var busy: Bool { commitAfterMessage != nil || submitting || pending.values.contains(true) || view?.mutation_state == "pending" }
     var generated: String { generatedSelection == selectionKey ? (view?.message?.message ?? "") : "" }
     var finalMessage: String { message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? generated : message }
     var mainBranch: String? {
@@ -125,6 +128,21 @@ final class GitChangesModel {
         }
     }
     var canSubmit: Bool { canCommit && !busy && view?.state == "loaded" && view?.loading != true && count > 0 && view?.message_state != "loading" && !generating }
+    var hasRemote: Bool { review?.repos.contains { $0.has_remote } == true }
+    var sheetPush: Bool { wantsPush && hasRemote }
+    var primaryAction: GitCommitAction { sheetPush ? .push : .commit }
+    var alternateAction: GitCommitAction { sheetPush ? .commit : .push }
+    func actionTitle(_ action: GitCommitAction) -> String {
+        if activeCommitAction == action {
+            if commitAfterMessage != nil { return "Writing message…" }
+            if busy { return "Committing…" }
+        }
+        switch action { case .commit: return "Commit"; case .push: return "Commit & push"; case .branch: return "New branch" }
+    }
+    func submitSheet(_ action: GitCommitAction) async {
+        guard action != .push || hasRemote else { return }
+        await commit(push: action == .push || (action == .branch && sheetPush), newBranch: action == .branch)
+    }
     var defaultPush: Bool { (view?.config?.commit_default_action ?? "commit") == "commit_and_push" }
     var label: String {
         if (change?.files ?? 0) == 0 && ahead > 0 { return "↑\(ahead) Push" }
@@ -186,6 +204,7 @@ final class GitChangesModel {
     }
     func generate() async {
         guard let review, !generating, generatingSelection == nil, !selections.isEmpty, view?.message_state != "loading" else { return }
+        if commitAfterMessage == nil { activeCommitAction = nil }
         generating = true; defer { generating = false }
         let id = UUID().uuidString
         generatedSelection = nil
@@ -194,6 +213,7 @@ final class GitChangesModel {
     }
     func commit(push: Bool? = nil, newBranch: Bool = false) async {
         guard let review, canSubmit else { return }
+        activeCommitAction = newBranch ? .branch : (push ?? wantsPush) ? .push : .commit
         if usesGeneratedMessage && (generatedSelection != selectionKey || generated.isEmpty) {
             commitAfterMessage = (review.review_id, selectionKey, push ?? wantsPush, newBranch)
             notice = "Generating a message for the selected changes…"
