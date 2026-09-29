@@ -83,7 +83,8 @@ private struct HostCard: View {
                 if let view = row.view, !["loading", "signed_out", "signing_out"].contains(view.auth_state) {
                     Button("Sign out", role: .destructive) { confirm(Confirmation(id: id, name: row.saved.label, forget: false)) }
                 }
-            } label: { Image(systemName: "ellipsis").accessibilityLabel("Machine actions") }
+            } label: { Image(systemName: "ellipsis").frame(width: 44, height: 44).contentShape(Rectangle()).accessibilityLabel("Machine actions") }
+            .buttonStyle(.borderless)
             .disabled(pending || row.fatal)
             .alert("Rename machine", isPresented: $renaming) {
                 TextField("Name on this phone", text: $nickname)
