@@ -7,11 +7,13 @@ final class GitChangesTests: XCTestCase {
     @MainActor private final class Fake {
         var events: [Event] = []
         var view = GitReviewView()
+        var receiptState = "succeeded"
+        var receiptError: LocalError?
         func query(_ selector: String) throws -> Data {
             if selector == "operations" {
                 let items = try events.compactMap { event -> CoreOperation? in
                     let object = try JSONSerialization.jsonObject(with: JSONEncoder().encode(event)) as? [String: Any]
-                    return (object?["intent_id"] as? String).map { CoreOperation(intent_id: $0, state: "succeeded", error: nil) }
+                    return (object?["intent_id"] as? String).map { CoreOperation(intent_id: $0, state: self.receiptState, error: self.receiptError) }
                 }
                 return try JSONEncoder().encode(OperationsQuery(api_version: 1, revision: "1", data: OperationsView(items: items), error: nil))
             }
@@ -95,6 +97,35 @@ final class GitChangesTests: XCTestCase {
         XCTAssertTrue(model.notice?.contains("abcdefg") == true)
         XCTAssertFalse(model.notice?.contains("· pushed") == true)
     }
+    func testRejectedReceiptIsVisibleAndDoesNotResubmit() async {
+        let fake = Fake(); let model = fake.model()
+        fake.receiptState = "failed"
+        fake.receiptError = LocalError(domain: "git", code: "scope_denied", message: "Read-only device", retryable: false)
+        await model.begin(push: false)
+        XCTAssertEqual(model.notice, "Read-only device")
+        XCTAssertEqual(fake.events.count, 1)
+    }
+    func testCatalogArrivalRefreshesStatusOnceAndReconnectRefreshesAgain() async {
+        let fake = Fake(); let model = fake.model()
+        await model.catalog(available: false, connected: true)
+        XCTAssertTrue(fake.events.isEmpty)
+        await model.catalog(available: true, connected: true)
+        await model.catalog(available: true, connected: true)
+        XCTAssertEqual(fake.events.count, 1)
+        await model.catalog(available: true, connected: false)
+        await model.catalog(available: true, connected: true)
+        XCTAssertEqual(fake.events.count, 2)
+    }
+    func testUncertainReceiptNeverCreatesAnotherCommit() async {
+        let fake = Fake(); let model = fake.model()
+        await model.receive(review())
+        fake.receiptState = "uncertain"
+        await model.commit()
+        await model.refresh()
+        XCTAssertEqual(fake.events.filter { if case .git_commit = $0 { return true }; return false }.count, 1)
+        XCTAssertEqual(model.notice, "Checking original operation…")
+    }
+
     func testRunningTurnAlwaysRequiresReview() async {
         let fake = Fake(); let model = fake.model()
         await model.begin(push: true, quick: true)
