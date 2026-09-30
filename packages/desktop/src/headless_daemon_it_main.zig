@@ -8994,6 +8994,15 @@ const McpToolText = struct {
 
 /// Extract the tool result's `content[0].text` envelope plus its isError flag
 /// from a raw JSON-RPC tools/call response.
+/// MCP steers are stored fenced as parent-agent messages (cli
+/// mcpParentSteerPromptAlloc); match the parent's text inside the fence.
+fn isWrappedSteer(body: []const u8, text: []const u8) bool {
+    if (!std.mem.startsWith(u8, body, "<verde_parent_message from_thread=\"")) return false;
+    var buf: [256]u8 = undefined;
+    const inner = std.fmt.bufPrint(&buf, "\">\n{s}\n</verde_parent_message>\n", .{text}) catch return false;
+    return std.mem.indexOf(u8, body, inner) != null;
+}
+
 fn mcpToolTextFromResponseAlloc(allocator: std.mem.Allocator, response: std.json.Value) !McpToolText {
     const result = jsonObjectField(response, "result") orelse return error.McpToolResponseNoResult;
     const is_error = blk: {
@@ -9673,7 +9682,7 @@ fn runChatMcpToolLayerScenario(allocator: std.mem.Allocator, io: std.Io) !void {
                 const body = jsonObjectField(message, "body") orelse continue;
                 if (author == .string and body == .string and
                     std.mem.eql(u8, author.string, "Steering current turn") and
-                    std.mem.eql(u8, body.string, "change direction")) steer_rows += 1;
+                    isWrappedSteer(body.string, "change direction")) steer_rows += 1;
             }
             if (steer_rows != 1) return error.McpReadSteerAudit;
         }
@@ -9737,7 +9746,7 @@ fn runChatMcpToolLayerScenario(allocator: std.mem.Allocator, io: std.Io) !void {
             const body = jsonObjectField(message, "body") orelse continue;
             if (author == .string and body == .string and
                 std.mem.eql(u8, author.string, "Steering current turn") and
-                std.mem.eql(u8, body.string, "change direction")) steer_rows += 1;
+                isWrappedSteer(body.string, "change direction")) steer_rows += 1;
         }
         if (steer_rows != 1) return error.McpSteerReopenAudit;
 
