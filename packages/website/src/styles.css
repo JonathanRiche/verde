@@ -3086,7 +3086,7 @@ thead .comp-rowhead { background: transparent; }
 }
 
 /* Long-form legal copy shares the site's theme and reading rhythm. */
-.privacy-page { padding: 5rem 0 3rem; }
+.privacy-page { padding-block: 5rem 3rem; }
 .privacy-policy { max-width: 52rem; margin-inline: auto; }
 .privacy-policy h1 { font-size: clamp(2.4rem, 7vw, 4rem); }
 .privacy-policy h2 { margin: 2.2rem 0 0.8rem; font-size: 1.45rem; line-height: 1.3; }
