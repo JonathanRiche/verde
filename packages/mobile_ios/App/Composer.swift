@@ -22,7 +22,7 @@ struct ChatComposer: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            if let followup = model.view?.followup {
+            if let followup = model.view?.followup, visibleFollowup(followup) {
                 VStack(alignment: .leading) {
                     Text("\(followup.kind.capitalized) · \(followup.state)").font(.caption.bold())
                     Text(followup.text).lineLimit(3) .font(VerdeTheme.ui(12))

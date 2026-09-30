@@ -73,6 +73,38 @@ final class SessionTransportTests: XCTestCase {
         }
     }
 
+    func testProbeNetworkFailureIsNotACertificateRejection() throws {
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let task = session.dataTask(with: URL(string: "https://bridge.invalid")!)
+        for code in [URLError.timedOut, .networkConnectionLost, .serverCertificateUntrusted] {
+            var events: [Event] = []
+            let effect = Effect.tls_probe(EffectTlsProbe(effect_id: "probe", generation: "1", origin: "https://bridge.invalid"))
+            let operation = SessionOperation(effect: effect, queue: DispatchQueue(label: "probe.fixture"), emit: { events.append($0) }, ended: {})
+            operation.urlSession(session, task: task, didCompleteWithError: URLError(code))
+            operation.cancel()
+            XCTAssertEqual(events.count, 1)
+            guard case .tls_peer(let peer) = events.first else { return XCTFail() }
+            XCTAssertEqual(peer.error?.kind, code == .serverCertificateUntrusted ? .tls : code == .timedOut ? .timeout : .network)
+            XCTAssertFalse(peer.system_trusted)
+            XCTAssertEqual(peer.spki_sha256, "")
+        }
+    }
+
+    func testPooledRequestPreservesLongCoreDeadline() throws {
+        let queue = DispatchQueue(label: "deadline.fixture")
+        let pool = HTTPConnectionPool(queue: queue)
+        defer { pool.close() }
+        guard case .http_request(var value) = request() else { return XCTFail() }
+        value.timeout_ms = 120000
+        let operation = SessionOperation(effect: .http_request(value), queue: queue, pool: pool, emit: { _ in }, ended: {})
+        operation.start(resume: false)
+        defer { operation.cancel() }
+        XCTAssertEqual(try XCTUnwrap(operation.task?.originalRequest).timeoutInterval, 120)
+        let connection = pool.connection(origin: value.tls.origin, pin: value.tls.spki_sha256)
+        XCTAssertGreaterThan(connection.session.configuration.timeoutIntervalForResource, 120)
+    }
+
     private func request(limit: UInt32 = 4) -> Effect {
         .http_request(EffectHttpRequest(effect_id: "request", generation: "9007199254740993",
             method: "POST", url: "https://bridge.invalid/api/rpc", headers: [], body_base64: nil,

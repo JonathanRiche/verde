@@ -267,6 +267,8 @@ struct MarkdownText: View {
     let text: String
     let model: TranscriptModel
     @State private var result: RenderResult<[MdBlock]>?
+    @State private var requested: String?
+    @State private var rendering: Task<Void, Never>?
 
     var body: some View {
         // A newer body keeps showing the previous render until its own arrives (no plain flash
@@ -280,7 +282,22 @@ struct MarkdownText: View {
                 Text(text) .font(VerdeTheme.ui(15)).textSelection(.enabled).accessibilityIdentifier("plain-text")
             }
         }
-        .task(id: text) { result = await model.markdown(text) }
+        .onAppear { schedule() }
+        .onChange(of: text) { _, _ in schedule() }
+        .onDisappear { rendering?.cancel(); rendering = nil; requested = nil }
+    }
+    private func schedule() {
+        requested = text
+        guard rendering == nil else { return }
+        rendering = Task { @MainActor in
+            while let next = requested, !Task.isCancelled {
+                requested = nil
+                let decoded = await model.markdown(next)
+                guard !Task.isCancelled else { return }
+                result = decoded
+            }
+            rendering = nil
+        }
     }
 }
 

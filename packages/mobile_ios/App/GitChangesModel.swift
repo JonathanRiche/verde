@@ -1,6 +1,8 @@
 import Foundation
 import Observation
 
+enum GitCommitAction { case commit, push, branch }
+
 struct GitFileKey: Hashable { let root: String; let path: String }
 
 /// Presentation only: routing, authorization, retained retries and RPCs belong to the core.
@@ -16,18 +18,42 @@ final class GitChangesModel {
     var sheet = false
     var confirmMain = false
     var choosePush = false
-    var edit = false
-    var message = ""
+    var expanded: Set<GitFileKey> = []
+    private var generatedSelection: Data?
+    private var generatingSelection: (id: String, key: Data)?
+    var message = "" { didSet { if message != oldValue { commitAfterMessage = nil } } }
     var notice: String?
+    private(set) var toast: GitActionToast?
+    private var toastOperation: String?
+    private var pushSuccessTitle = "Pushed"
+    private var pushDetail = ""
+    var isPushing: Bool { toast?.phase == .running && ["push", "pull_push"].contains(toastOperation ?? "") }
+    func dismissToast() { toast = nil; notice = nil }
+    func expireToast(_ id: UUID) {
+        if toast?.id == id && toast?.phase == .success { dismissToast() }
+    }
+    private func showToast(_ phase: GitActionToast.Phase, _ title: String, _ detail: String = "", rejected: [String] = []) {
+        toast = GitActionToast(phase: phase, title: title, detail: detail, rejectedRoots: rejected)
+    }
+    private func failAction(_ text: String, uncertain: Bool = false) {
+        guard toastOperation != nil else { return }
+        showToast(uncertain ? .warning : .failure, uncertain ? "Checking original operation…" : "Git action failed", text)
+    }
     var selected: Set<GitFileKey> = []
     var hunks: [GitFileKey: Set<UInt32>] = [:]
+    private var commitAfterMessage: (review: String, selection: Data, push: Bool, branch: Bool)?
     private var loadedID: String?
     private var quick = false
+    private var omittedFiles = 0
     private var wantsPush = false
     private var submitting = false
+    private(set) var activeCommitAction: GitCommitAction?
     private var reportedCommit: String?
     private var reportedPush: String?
     private var generating = false
+    private var pending: [String: Bool] = [:]
+    private var routeReady = false
+    private var routeConnected = false
 
     init(workspace: String, thread: String,
          send: @escaping (Event) async throws -> Void, query: @escaping (String) async throws -> Data) {
@@ -44,6 +70,7 @@ final class GitChangesModel {
         })
     }
     var change: GitThreadSummary? { summary?.threads.first { $0.local_thread_id == thread } }
+    var mineCount: UInt32 { guard let change else { return 0 }; return change.files > change.attention ? change.files - change.attention : 0 }
     var review: GitReviewResult? {
         guard view?.review?.workspace_id == workspace, view?.review?.local_thread_id == thread else { return nil }
         return view?.review
@@ -54,11 +81,11 @@ final class GitChangesModel {
     }
     var ahead: UInt32 { repos.filter { $0.has_remote }.reduce(0) { $0 + $1.ahead } }
     var canCommit: Bool { view?.can_commit == true || status?.can_commit == true }
-    var busy: Bool { submitting || view?.mutation_state == "pending" }
-    var generated: String { view?.message?.message ?? "" }
+    var busy: Bool { commitAfterMessage != nil || submitting || pending.values.contains(true) || view?.mutation_state == "pending" }
+    var generated: String { generatedSelection == selectionKey ? (view?.message?.message ?? "") : "" }
     var finalMessage: String { message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? generated : message }
     var mainBranch: String? {
-        review?.repos.first { $0.is_default_branch || ["main", "master"].contains($0.branch ?? "") }?.branch
+        review?.repos.first { repo in repo.is_default_branch && selections.contains { $0.root == repo.root } }.map { $0.branch ?? $0.default_branch ?? "default branch" }
     }
     var selections: [GitRepoSelection] {
         (review?.repos ?? []).compactMap { repo in
@@ -87,7 +114,53 @@ final class GitChangesModel {
         } }
         return (added, removed)
     }
-    var canSubmit: Bool { canCommit && !busy && view?.state == "loaded" && view?.loading != true && count > 0 && !finalMessage.isEmpty }
+    private var selectionKey: Data {
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+        return (try? encoder.encode(selections)) ?? Data()
+    }
+    var usesGeneratedMessage: Bool { message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    var allDiffsShown: Bool {
+        let keys = (review?.repos ?? []).flatMap { repo in repo.files.map { GitFileKey(root: repo.root, path: $0.path) } }
+        return !keys.isEmpty && keys.allSatisfy { expanded.contains($0) }
+    }
+    func toggleFile(_ key: GitFileKey) {
+        guard canCommit, !busy else { return }
+        commitAfterMessage = nil
+        if selected.contains(key) { selected.remove(key) } else { selected.insert(key) }
+        hunks[key] = nil
+    }
+    func toggleHunk(_ key: GitFileKey, file: GitReviewFile, index: UInt32, on: Bool) {
+        guard canCommit, !busy, file.hunk_selectable, !file.binary, !file.preview_truncated else { return }
+        commitAfterMessage = nil
+        var indices = selected.contains(key) ? (hunks[key] ?? Set(file.hunks.map(\.index))) : []
+        if on { indices.insert(index) } else { indices.remove(index) }
+        if indices.isEmpty { selected.remove(key); hunks[key] = nil }
+        else { selected.insert(key); hunks[key] = indices.count == file.hunks.count ? nil : indices }
+    }
+    func toggleDiffs() async {
+        if allDiffsShown {
+            expanded = []
+            if usesGeneratedMessage && generatedSelection != selectionKey { await generate() }
+        } else {
+            expanded = Set((review?.repos ?? []).flatMap { repo in repo.files.map { GitFileKey(root: repo.root, path: $0.path) } })
+        }
+    }
+    var canSubmit: Bool { canCommit && !busy && view?.state == "loaded" && view?.loading != true && count > 0 && view?.message_state != "loading" && !generating }
+    var hasRemote: Bool { review?.repos.contains { $0.has_remote } == true }
+    var sheetPush: Bool { wantsPush && hasRemote }
+    var primaryAction: GitCommitAction { sheetPush ? .push : .commit }
+    var alternateAction: GitCommitAction { sheetPush ? .commit : .push }
+    func actionTitle(_ action: GitCommitAction) -> String {
+        if activeCommitAction == action {
+            if commitAfterMessage != nil { return "Writing message…" }
+            if busy { return "Committing…" }
+        }
+        switch action { case .commit: return "Commit"; case .push: return "Commit & push"; case .branch: return "New branch" }
+    }
+    func submitSheet(_ action: GitCommitAction) async {
+        guard action != .push || hasRemote else { return }
+        await commit(push: action == .push || (action == .branch && sheetPush), newBranch: action == .branch)
+    }
     var defaultPush: Bool { (view?.config?.commit_default_action ?? "commit") == "commit_and_push" }
     var label: String {
         if (change?.files ?? 0) == 0 && ahead > 0 { return "↑\(ahead) Push" }
@@ -104,54 +177,128 @@ final class GitChangesModel {
             status = try JSONDecoder().decode(GitStatusQuery.self, from: await query("git_status")).data
             summary = try JSONDecoder().decode(GitSummaryQuery.self, from: await query("git_summary:" + workspace)).data
             await receive(next)
-        } catch { notice = "Connect to the host to review changes." }
+            await receipts()
+            await advanceQuickAction()
+            await finishGeneratedCommit()
+        } catch { notice = "Connect to the host to review changes."; failAction(notice!) }
     }
     func receive(_ next: GitReviewView?) async {
         view = next
         if let error = next?.error { notice = error.message }
-        if let result = next?.result, result.workspace_id == workspace, result.local_thread_id == thread {
+        if next?.mutation_state != "pending", next?.mutation_state != "failed", next?.mutation_state != "uncertain", let result = next?.result, result.workspace_id == workspace, result.local_thread_id == thread {
             let identity = result.repos.map(\.commit).joined(separator: ",")
             if !identity.isEmpty && reportedCommit != identity {
                 reportedCommit = identity
                 let entries = result.repos.map { $0.short_commit + ($0.push == "pushed" ? " · pushed" : "") }.joined(separator: ", ")
                 notice = "Committed \(result.files) files · \(entries)"
                 sheet = false; confirmMain = false; quick = false
+                if toastOperation == "commit" {
+                    let failed = result.repos.filter { ["rejected", "failed"].contains($0.push) }
+                    let pushed = !result.repos.isEmpty && result.repos.allSatisfy { $0.push == "pushed" }
+                    let title = "\(pushed ? "Committed & pushed" : "Committed") \(result.files) \(result.files == 1 ? "file" : "files")"
+                    let details = result.repos.map { [$0.short_commit, $0.branch, $0.subject].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ") }.joined(separator: ", ")
+                    let errors = failed.map { $0.push_message ?? ($0.push == "rejected" ? "Push rejected. Pull & push to reconcile remote changes." : "Push failed.") }.joined(separator: " ")
+                    showToast(failed.isEmpty ? .success : (failed.contains { $0.push == "rejected" } ? .warning : .failure),
+                              title, [omittedFiles > 0 ? "\(omittedFiles) \(omittedFiles == 1 ? "file" : "files") left out (shared/unclear) — use Commit… to review them" : "", details, errors].filter { !$0.isEmpty }.joined(separator: "\n"),
+                              rejected: failed.filter { $0.push == "rejected" }.map(\.root))
+                    toastOperation = nil
+                }
             }
         }
-        if let result = next?.pull_push_result {
+        if next?.mutation_state != "pending", next?.mutation_state != "failed", next?.mutation_state != "uncertain", let result = next?.pull_push_result {
             let key = result.root + ":" + result.push
-            if reportedPush != key { reportedPush = key; notice = result.push == "pushed" ? "Pushed to remote" : result.push == "rejected" ? "Push rejected. Pull & push to reconcile remote changes." : "Push failed. Check the remote on your computer." }
+            if reportedPush != key {
+                reportedPush = key
+                notice = result.push == "pushed" ? "Pushed to remote" : result.push == "rejected" ? "Push rejected. Pull & push to reconcile remote changes." : "Push failed. Check the remote on your computer."
+                if ["push", "pull_push"].contains(toastOperation ?? "") {
+                    if result.push == "pushed" {
+                        showToast(.success, toastOperation == "pull_push" ? "Pulled & pushed" : pushSuccessTitle, pushDetail)
+                    } else {
+                        showToast(result.push == "rejected" ? .warning : .failure, result.push == "rejected" ? "Push rejected" : "Push failed",
+                                  result.push_message ?? notice ?? "", rejected: result.push == "rejected" ? [result.root] : [])
+                    }
+                    toastOperation = nil
+                }
+            }
         }
         guard let review, next?.state == "loaded", next?.loading != true else { return }
         if review.review_id != loadedID {
             loadedID = review.review_id
-            message = ""; hunks = [:]; selected = []
-            for repo in review.repos { for file in repo.files where file.ownership != "unassigned" { selected.insert(GitFileKey(root: repo.root, path: file.path)) } }
-            if quick && (review.repos.contains { $0.branch == nil || $0.files.contains { $0.ownership != "mine" } }) { quick = false; sheet = true }
+            message = ""; hunks = [:]; selected = []; expanded = []; generatedSelection = nil
+            for repo in review.repos { for file in repo.files where file.ownership == "mine" { selected.insert(GitFileKey(root: repo.root, path: file.path)) } }
+            if quick {
+                if review.repos.allSatisfy({ $0.files.isEmpty }) {
+                    quick = false; sheet = false; notice = "No uncommitted changes"
+                    showToast(.warning, "No uncommitted changes"); toastOperation = nil
+                    return
+                }
+                if selected.isEmpty { quick = false; sheet = true; omittedFiles = 0 }
+                else {
+                    omittedFiles = review.repos.flatMap(\.files).filter { ["shared", "unclear"].contains($0.ownership) }.count
+                }
+            }
+            if toastOperation == "prepare" && !quick { dismissToast(); toastOperation = nil }
             if !selections.isEmpty { await generate() }
-            else if quick { quick = false; sheet = true; notice = "No selected changes to commit." }
+            else if quick { quick = false; sheet = true; notice = "No selected changes to commit."; failAction(notice!) }
         }
-        if quick, next?.message_state == "ready", canSubmit {
+        await advanceQuickAction()
+    }
+    private func advanceQuickAction() async {
+        if quick, view?.message_state == "ready", generatedSelection == selectionKey, canSubmit {
             quick = false
-            if mainBranch != nil { confirmMain = true } else { await commit(push: true) }
+            if generated.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                sheet = true; notice = "Enter a commit message or try generating one again."
+                failAction(notice!); omittedFiles = 0
+                return
+            }
+            if wantsPush && mainBranch != nil { confirmMain = true; dismissToast(); toastOperation = nil } else { await commit(push: wantsPush) }
         }
     }
     func begin(push: Bool, quick: Bool = false) async {
+        omittedFiles = 0
         wantsPush = push; self.quick = quick; sheet = !quick; notice = nil; loadedID = nil
+        toastOperation = "prepare"; showToast(.running, "Reviewing changes…")
         await dispatch(.git_review_open(EventGitReviewOpen(now_ms: 0, wall_time_ms: 0, intent_id: UUID().uuidString, workspace_id: workspace, thread_id: thread)))
         await refresh()
     }
     func generate() async {
-        guard let review, !generating, !selections.isEmpty, view?.message_state != "loading" else { return }
+        guard let review, !generating, generatingSelection == nil, !selections.isEmpty, view?.message_state != "loading" else { return }
+        if commitAfterMessage == nil { activeCommitAction = nil }
+        if quick { showToast(.running, "Writing message…") }
         generating = true; defer { generating = false }
-        await dispatch(.git_message_generate(EventGitMessageGenerate(now_ms: 0, wall_time_ms: 0, intent_id: UUID().uuidString, review_id: review.review_id, selections: selections)))
+        let id = UUID().uuidString
+        generatedSelection = nil
+        generatingSelection = (id, selectionKey)
+        await dispatch(.git_message_generate(EventGitMessageGenerate(now_ms: 0, wall_time_ms: 0, intent_id: id, review_id: review.review_id, selections: selections)))
     }
     func commit(push: Bool? = nil, newBranch: Bool = false) async {
         guard let review, canSubmit else { return }
+        toastOperation = "commit"
+        activeCommitAction = newBranch ? .branch : (push ?? wantsPush) ? .push : .commit
+        if usesGeneratedMessage && (generatedSelection != selectionKey || generated.isEmpty) {
+            commitAfterMessage = (review.review_id, selectionKey, push ?? wantsPush, newBranch)
+            notice = "Generating a message for the selected changes…"
+            showToast(.running, "Writing message…")
+            await generate()
+            await finishGeneratedCommit()
+            return
+        }
         submitting = true; defer { submitting = false }
         confirmMain = false
+        showToast(.running, (push ?? wantsPush) ? "Committing & pushing…" : "Committing…")
         await dispatch(.git_commit(EventGitCommit(now_ms: 0, wall_time_ms: 0, intent_id: UUID().uuidString, review_id: review.review_id, message: finalMessage, selections: selections, push: push ?? wantsPush, new_branch: newBranch, branch_name: newBranch ? view?.message?.branch : nil)))
         await refresh()
+    }
+    func dismissSheet() { sheet = false; quick = false; commitAfterMessage = nil; if toastOperation == "prepare" { dismissToast(); toastOperation = nil } }
+    private func finishGeneratedCommit() async {
+        guard let action = commitAfterMessage, generatingSelection == nil, !generating else { return }
+        commitAfterMessage = nil
+        guard review?.review_id == action.review, selectionKey == action.selection else { return }
+        guard !generated.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            sheet = true; notice = toast?.phase == .failure ? toast?.detail : "Enter a commit message or try generating one again."
+            failAction(notice!); return
+        }
+        await commit(push: action.push, newBranch: action.branch)
     }
     func push(root: String? = nil) async {
         guard canCommit, !busy else { return }
@@ -159,7 +306,11 @@ final class GitChangesModel {
         if root == nil && candidates.count > 1 { choosePush = true; return }
         guard let repo = candidates.first(where: { root == nil || $0.root == root }) else { return }
         submitting = true; defer { submitting = false }
+        toastOperation = "push"
+        pushSuccessTitle = "Pushed \(repo.ahead) \(repo.ahead == 1 ? "commit" : "commits")" + (repo.upstream.map { " to " + $0 } ?? "")
+        pushDetail = repo.branch ?? ""
         reportedPush = nil
+        showToast(.running, "Pushing…", pushDetail)
         await dispatch(.git_push(EventGitPush(now_ms: 0, wall_time_ms: 0, intent_id: UUID().uuidString, workspace_id: workspace, root: repo.root)))
         await refresh()
     }
@@ -171,16 +322,64 @@ final class GitChangesModel {
     func pullPush(_ root: String) async {
         guard canCommit, !busy else { return }
         submitting = true; defer { submitting = false }
+        toastOperation = "pull_push"
+        pushDetail = repos.first { $0.root == root }?.branch ?? ""
         reportedPush = nil
+        showToast(.running, "Pulling & pushing…", pushDetail)
         await dispatch(.git_pull_push(EventGitPullPush(now_ms: 0, wall_time_ms: 0, intent_id: UUID().uuidString, workspace_id: workspace, root: root)))
         await refresh()
     }
     func retry() async {
         guard canCommit, !busy else { return }
+        showToast(.running, "Checking original operation…")
         await dispatch(.git_retry(EventGitRetry(now_ms: 0, wall_time_ms: 0, intent_id: UUID().uuidString)))
         await refresh()
     }
+    /// Retry a read when a newly-created chat finally gains a synced route.
+    func catalog(available: Bool, connected: Bool) async {
+        let arrived = available && connected && (!routeReady || !routeConnected)
+        routeReady = available; routeConnected = connected
+        if arrived {
+            await dispatch(.git_status_refresh(EventGitStatusRefresh(now_ms: 0, wall_time_ms: 0, intent_id: UUID().uuidString, workspace_id: workspace, thread_id: thread)))
+            await refresh()
+        }
+    }
+    private func receipts() async {
+        guard !pending.isEmpty,
+              let bytes = try? await query("operations"),
+              let operations = try? JSONDecoder().decode(OperationsQuery.self, from: bytes).data?.items else { return }
+        for operation in operations where pending[operation.intent_id] != nil && operation.state != "pending" {
+            // Core alone owns recovery. An uncertain receipt never becomes a new commit.
+            pending[operation.intent_id] = nil
+            if let generation = generatingSelection, generation.id == operation.intent_id {
+                if operation.state == "succeeded" { generatedSelection = generation.key }
+                generatingSelection = nil
+            }
+            if operation.state == "uncertain" { notice = "Checking original operation…"; failAction("The connection dropped. Checking the original request without creating another action.", uncertain: true); continue }
+            if operation.state != "succeeded" {
+                quick = false; confirmMain = false
+                notice = operation.error?.message ?? "The host refused this action."
+                failAction(notice!)
+                if ["review_expired", "changed_since_review"].contains(operation.error?.code ?? "") {
+                    await begin(push: wantsPush)
+                }
+            }
+        }
+    }
     private func dispatch(_ event: Event) async {
-        do { try await sendEvent(event) } catch { notice = "The host is unavailable. Check the operation before trying again." }
+        var id: String?
+        do {
+            let data = try JSONEncoder().encode(event)
+            id = (try JSONSerialization.jsonObject(with: data) as? [String: Any])?["intent_id"] as? String
+            let mutation: Bool
+            switch event { case .git_commit, .git_push, .git_pull_push, .git_retry: mutation = true; default: mutation = false }
+            if let id { pending[id] = mutation }
+            try await sendEvent(event)
+            await receipts()
+        } catch {
+            if let id { pending[id] = nil }
+            notice = "The host is unavailable. Check the operation before trying again."
+            failAction(notice!, uncertain: true)
+        }
     }
 }

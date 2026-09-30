@@ -378,7 +378,7 @@ final class TerminalGridViewTests: XCTestCase {
         view.insertText("l")
         view.insertText("s\n")
         view.deleteBackward()
-        // IME composition stays local until committed.
+        // Composing edits reach the terminal immediately; committing does not replay them.
         view.setMarkedText("に", selectedRange: NSRange(location: 1, length: 0))
         XCTAssertNotNil(view.markedTextRange)
         view.setMarkedText("にほ", selectedRange: NSRange(location: 2, length: 0))
@@ -388,7 +388,7 @@ final class TerminalGridViewTests: XCTestCase {
         XCTAssertNil(view.markedTextRange)
         view.setMarkedText("k", selectedRange: NSRange(location: 1, length: 0))
         view.unmarkText()
-        XCTAssertEqual(inputs, [.text("l"), .text("s\n"), .key("Backspace"), .text("日"), .text("k")])
+        XCTAssertEqual(inputs, [.text("l"), .text("s\n"), .key("Backspace"), .text("に"), .text("ほ"), .key("Backspace"), .key("Backspace"), .text("日"), .text("k")])
         XCTAssertFalse(view.canBecomeFirstResponder, "read-only until the host is writable")
         view.inputEnabled = true
         XCTAssertTrue(view.canBecomeFirstResponder)

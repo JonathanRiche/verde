@@ -4,6 +4,16 @@ import UIKit
 
 @MainActor
 final class ComposerTests: XCTestCase {
+    func testOnlyConfirmedInlineSteerIsHidden() {
+        var followup = ChatFollowup(id: "fixture", kind: "steer", turn_id: "turn", steer_id: "steer", next_turn_id: "", text: "synthetic")
+        followup.state = "sent_inline"; followup.delivery = "uncertain"
+        XCTAssertTrue(visibleFollowup(followup))
+        followup.delivery = "accepted"
+        XCTAssertFalse(visibleFollowup(followup))
+        followup.state = "fallback_next_turn"
+        XCTAssertTrue(visibleFollowup(followup))
+    }
+
     func testMissingSelectionDoesNotDisplayFirstCatalogOption() {
         let choices = [ChatChoice(id: "high", label: "High"), ChatChoice(id: "medium", label: "Medium")]
         XCTAssertEqual(composerChoiceLabel(choices, value: "medium"), "Medium")

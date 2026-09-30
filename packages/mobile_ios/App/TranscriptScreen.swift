@@ -19,6 +19,7 @@ struct TranscriptScreen: View {
     var onHosts: () -> Void = {}
 
     @State private var model: TranscriptModel?
+    @State private var git: GitChangesModel?
 
     private var fallbackTitle: String? {
         browse.state.workspaces?.items.first { $0.workspace_id == workspaceID }?.threads.first { $0.thread_id == threadID }?.title
@@ -32,11 +33,17 @@ struct TranscriptScreen: View {
                 Spacer()
             }
         }
+        .environment(\.gitChangesModel, git)
+        .overlay(alignment: .bottom) { if let git, !git.sheet { GitActionToastCard(model: git) } }
+        .task(id: browse.hostID) {
+            let next = GitChangesModel(browse: browse, workspace: workspaceID, thread: threadID)
+            git = next; await next.start()
+        }
         .background(VerdeTheme.background)
         .navigationTitle(model?.thread?.thread.title ?? fallbackTitle ?? "Chat")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) { GitChatControls(browse: browse, workspace: workspaceID, thread: threadID) }
+            ToolbarItem(placement: .topBarTrailing) { GitChatControls(browse: browse, workspace: workspaceID, thread: threadID, model: git) }
             ToolbarItem(placement: .topBarTrailing) {
                 ManageContainer(browse: browse) { manage in ThreadActions(workspace: workspaceID, thread: threadID, title: model?.thread?.thread.title ?? fallbackTitle ?? "Chat", manage: manage) }
             }
@@ -325,7 +332,7 @@ private struct TranscriptRow: View {
         case .diff(let row): DiffCard(id: row.id, text: row.body, source: model, disclosure: model.disclosure)
         case .notice(let row):
             if row.author == "git" {
-                Text(row.body).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted).lineLimit(1).frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 12).padding(.vertical, 6)
+                GitCommitNoticeCard(bodyText: row.body)
             } else { NoticeRow(row: row, model: model) }
         case .usage(_, let usage): UsageCard(usage: usage)
         case .childNotification(let row, let notification): ChildNotificationCard(row: row, notification: notification, model: model)

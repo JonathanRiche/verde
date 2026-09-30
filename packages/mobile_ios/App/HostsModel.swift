@@ -154,12 +154,33 @@ final class HostsModel {
         do { try block() } catch { self.error = "Could not save hosts. Unlock your phone and retry." }
     }
 
-    func select(_ id: String) {
+    @discardableResult
+    func select(_ id: String) -> Bool {
+        var saved = false
         catalogAction {
             guard catalog.hosts.contains(where: { $0.id == id }) else { return }
             try persist(HostCatalog(hosts: catalog.hosts, active: id))
             pairing = nil
+            saved = true
         }
+        return saved
+    }
+
+    /// Local nickname only; existing core handles, endpoints and credentials stay intact.
+    @discardableResult
+    func rename(_ id: String, label: String) -> Bool {
+        let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.count <= 128 else { return false }
+        var saved = false
+        catalogAction {
+            guard let index = catalog.hosts.firstIndex(where: { $0.id == id }) else { return }
+            var next = catalog
+            next.hosts[index].label = trimmed
+            try persist(next)
+            saved = true
+            onActiveChange?()
+        }
+        return saved
     }
 
     func add(label: String, link: String? = nil) {
