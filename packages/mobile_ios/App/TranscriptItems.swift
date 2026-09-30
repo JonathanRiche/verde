@@ -16,6 +16,8 @@ enum TranscriptItem: Identifiable {
     case diff(ChatRow)
     /// System notices, including A-09 access-cap notices.
     case notice(ChatRow)
+    /// A linked child chat's status notification, delivered to its parent as a user or system turn.
+    case childNotification(ChatRow, ChildNotification)
     /// The latest provider usage summary, parsed by the core.
     case usage(ChatRow, ChatUsage)
     /// Live "Working · m:ss" footer for the core's active turn.
@@ -25,7 +27,8 @@ enum TranscriptItem: Identifiable {
 
     var id: String {
         switch self {
-        case .message(let row), .tool(let row), .think(let row), .diff(let row), .notice(let row), .usage(let row, _):
+        case .message(let row), .tool(let row), .think(let row), .diff(let row), .notice(let row), .usage(let row, _),
+             .childNotification(let row, _):
             return "r:" + row.id
         case .toolGroup(let rows, let subagent): return "g:\(subagent ? "subagent" : "tool"):" + (rows.first?.id ?? "")
         case .working: return "working"
@@ -42,6 +45,7 @@ enum TranscriptItem: Identifiable {
         case .think: return "Think"
         case .diff: return "Diff"
         case .notice: return "Notice"
+        case .childNotification: return "ChildNotification"
         case .usage: return "Usage"
         case .working: return "Working"
         case .approval: return "Approval"
@@ -190,6 +194,11 @@ func transcriptItems(_ view: ChatThreadView) -> [TranscriptItem] {
     }
     for (index, row) in view.rows.enumerated() {
         if row.author == hiddenAuthor { continue }
+        if let notification = childNotification(role: row.role, body: row.body) {
+            flush()
+            out.append(.childNotification(row, notification))
+            continue
+        }
         if isCommandRow(row) && !isDiffRow(row) {
             let subagent = isSubagentRow(row)
             if !run.isEmpty && subagent != runSubagent { flush() }

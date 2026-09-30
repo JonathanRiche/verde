@@ -328,6 +328,7 @@ private struct TranscriptRow: View {
                 Text(row.body).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted).lineLimit(1).frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 12).padding(.vertical, 6)
             } else { NoticeRow(row: row, model: model) }
         case .usage(_, let usage): UsageCard(usage: usage)
+        case .childNotification(let row, let notification): ChildNotificationCard(row: row, notification: notification, model: model)
         case .working(let turn, let waiting): WorkingRow(turn: turn, waitingApproval: waiting)
         case .approval(let approval): ApprovalCard(approval: approval, controller: model.approvals, disclosure: model.disclosure)
         }
@@ -340,12 +341,20 @@ private struct MessageRow: View {
 
     var body: some View {
         let mine = row.role == "user"
+        // A parent agent's steer shows only its words, labelled apart from the human's turns.
+        let steer = parentSteerBody(role: row.role, body: row.body)
+        let shown = steer ?? row.body
         HStack {
 
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {
-                    Text(mine ? "You" : (row.author.isEmpty ? "Assistant" : row.author)).font(.caption.weight(.medium))
-                        .foregroundStyle(.secondary)
+                    if steer != nil {
+                        Label("Parent agent", systemImage: "arrow.turn.down.right").font(.caption.weight(.medium))
+                            .foregroundStyle(VerdeTheme.accent)
+                    } else {
+                        Text(mine ? "You" : (row.author.isEmpty ? "Assistant" : row.author)).font(.caption.weight(.medium))
+                            .foregroundStyle(.secondary)
+                    }
                     if let label = deliveryLabel(row.delivery) {
                         Text(label) .font(VerdeTheme.ui(10)).foregroundStyle(row.delivery == "failed" ? Color.red : Color.secondary)
                     }
@@ -362,9 +371,9 @@ private struct MessageRow: View {
                         }
                     }
                 }
-                if !row.body.isEmpty {
+                if !shown.isEmpty {
                     // User text is verbatim (web parity); assistant output goes through the core AST.
-                    if mine { Text(row.body) .font(VerdeTheme.ui(15)).textSelection(.enabled) }
+                    if mine { Text(shown) .font(VerdeTheme.ui(15)).textSelection(.enabled) }
                     else { MarkdownText(text: streamTail(row), model: model) }
                 }
             }
@@ -372,9 +381,71 @@ private struct MessageRow: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(mine ? VerdeTheme.user : VerdeTheme.assistant,
                         in: RoundedRectangle(cornerRadius: 12))
-            .contextMenu { Button("Copy message") { UIPasteboard.general.string = row.body } }
+            .overlay {
+                if steer != nil { RoundedRectangle(cornerRadius: 12).stroke(VerdeTheme.accent.opacity(0.5)) }
+            }
+            .contextMenu { Button("Copy message") { UIPasteboard.general.string = shown } }
         }
         .accessibilityIdentifier("message-row")
+    }
+}
+
+private func childStatusColor(_ status: ChildStatus) -> Color {
+    switch status {
+    case .completed: return VerdeTheme.accent
+    case .blocked, .waiting_approval: return VerdeTheme.warning
+    case .failed: return VerdeTheme.danger
+    default: return VerdeTheme.muted
+    }
+}
+
+/// A linked child chat's result in the parent transcript (desktop parity): a neutral full-width
+/// card with the child's title, provider and status, an Open chat action and the reply as
+/// markdown, collapsed when long. The envelope's turn id and footer stay hidden.
+private struct ChildNotificationCard: View {
+    @Environment(\.openRoute) private var openRoute
+    let row: ChatRow
+    let notification: ChildNotification
+    let model: TranscriptModel
+
+    var body: some View {
+        let child = model.linkedThread(notification.childID)
+        let title = child.map { $0.title.isEmpty ? notification.childID : $0.title } ?? notification.childID
+        let preview = childReplyPreview(notification.reply)
+        let key = "\(row.id):child"
+        let expanded = model.disclosure.flag(key)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(title).font(VerdeTheme.ui(15, bold: true)).lineLimit(1).truncationMode(.tail)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                if let provider = child?.provider, !provider.isEmpty {
+                    Text(providerLabel(provider)).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted).lineLimit(1)
+                }
+                Text(notification.status.label).font(VerdeTheme.ui(12)).foregroundStyle(childStatusColor(notification.status))
+                    .lineLimit(1).fixedSize()
+            }
+            .accessibilityElement(children: .combine)
+            if !preview.full.isEmpty {
+                MarkdownText(text: expanded ? preview.full : (preview.collapsed ?? preview.full), model: model)
+            }
+            HStack {
+                Button("Open chat") {
+                    openRoute(.thread(workspace: child?.workspace_id ?? model.workspaceID, thread: notification.childID))
+                }
+                .accessibilityIdentifier("child-open-chat")
+                Spacer()
+                if preview.collapsed != nil {
+                    Button(expanded ? "Show less" : "Show more") { model.disclosure.toggle(key) }
+                }
+            }
+            .font(VerdeTheme.ui(13)).foregroundStyle(VerdeTheme.accent).buttonStyle(.plain)
+        }
+        .padding(.horizontal, 14).padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(VerdeTheme.panel, in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(VerdeTheme.border))
+        .contextMenu { Button("Copy reply") { UIPasteboard.general.string = notification.reply } }
+        .accessibilityIdentifier("child-notification")
     }
 }
 

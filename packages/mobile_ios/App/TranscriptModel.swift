@@ -191,6 +191,13 @@ final class TranscriptModel: DiffRenderSource {
                         stopSending: stopSending, fatal: fatal)
     }
 
+    /// A linked chat by its local thread id, preferring this chat's workspace (child notification cards).
+    func linkedThread(_ id: String) -> ThreadSummary? {
+        let workspaces = browse.state.workspaces?.items ?? []
+        return workspaces.first { $0.workspace_id == workspaceID }?.threads.first { $0.thread_id == id }
+            ?? workspaces.lazy.flatMap(\.threads).first { $0.thread_id == id }
+    }
+
     var latestOperations: [CoreOperation] { store?.operations?.data?.items ?? [] }
     private var store: CoreViewStore? { browse.hosts.session(boundHostID)?.store }
 
