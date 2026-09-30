@@ -68,7 +68,7 @@ private final class VerdeHostWindowCloseMonitor {
 
 private var verdeHostWindowCloseMonitors: [ObjectIdentifier: VerdeHostWindowCloseMonitor] = [:]
 
-private final class VerdeMacBrowser: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
+private final class VerdeMacBrowser: NSObject, WKScriptMessageHandler, WKNavigationDelegate, WKUIDelegate {
     private weak var window: NSWindow?
     private let focusSink: VerdeFocusSinkView
     private let container: NSView
@@ -111,6 +111,7 @@ private final class VerdeMacBrowser: NSObject, WKScriptMessageHandler, WKNavigat
 
         contentController.add(self, name: "verde")
         self.webView.navigationDelegate = self
+        self.webView.uiDelegate = self
         self.container.addSubview(self.webView)
         window.contentView?.addSubview(self.focusSink, positioned: .below, relativeTo: nil)
         window.contentView?.addSubview(self.container, positioned: .above, relativeTo: nil)
@@ -138,6 +139,7 @@ private final class VerdeMacBrowser: NSObject, WKScriptMessageHandler, WKNavigat
         urlObservation?.invalidate()
         urlObservation = nil
         webView.navigationDelegate = nil
+        webView.uiDelegate = nil
         webView.configuration.userContentController.removeScriptMessageHandler(forName: "verde")
         webView.stopLoading()
         focusSink.removeFromSuperview()
@@ -312,6 +314,28 @@ private final class VerdeMacBrowser: NSObject, WKScriptMessageHandler, WKNavigat
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
         queueEvent(.failed, payload: error.localizedDescription)
+    }
+
+    // WKWebView ignores <input type=file> clicks unless the UI delegate
+    // presents an open panel and hands the chosen URLs back.
+    func webView(
+        _ webView: WKWebView,
+        runOpenPanelWith parameters: WKOpenPanelParameters,
+        initiatedByFrame frame: WKFrameInfo,
+        completionHandler: @escaping ([URL]?) -> Void
+    ) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = parameters.allowsDirectories
+        panel.allowsMultipleSelection = parameters.allowsMultipleSelection
+        let finish: (NSApplication.ModalResponse) -> Void = { response in
+            completionHandler(response == .OK ? panel.urls : nil)
+        }
+        if let window = webView.window ?? window {
+            panel.beginSheetModal(for: window, completionHandler: finish)
+        } else {
+            finish(panel.runModal())
+        }
     }
 
     private static func jsonOrDescription(_ value: Any?) -> String {

@@ -1373,6 +1373,177 @@ static gboolean verde_browser_linux_on_context_menu(WebKitWebView *web_view, Web
     return TRUE;
 }
 
+// WPE has no built-in file dialog, so <input type=file> requests are routed
+// through the XDG desktop portal (org.freedesktop.portal.FileChooser).
+struct verde_browser_linux_file_chooser {
+    WebKitFileChooserRequest *request;
+    GDBusConnection *connection;
+    char *handle_path;
+    guint response_subscription;
+    gboolean call_pending;
+    gboolean answered;
+};
+
+static void verde_browser_linux_file_chooser_maybe_free(struct verde_browser_linux_file_chooser *chooser) {
+    if (chooser->call_pending || !chooser->answered) return;
+    if (chooser->response_subscription != 0) {
+        g_dbus_connection_signal_unsubscribe(chooser->connection, chooser->response_subscription);
+    }
+    g_object_unref(chooser->request);
+    g_object_unref(chooser->connection);
+    g_free(chooser->handle_path);
+    g_free(chooser);
+}
+
+static void verde_browser_linux_file_chooser_answer(struct verde_browser_linux_file_chooser *chooser, const gchar *const *uris) {
+    if (chooser->answered) return;
+    chooser->answered = TRUE;
+
+    GPtrArray *paths = g_ptr_array_new_with_free_func(g_free);
+    for (guint index = 0; uris != NULL && uris[index] != NULL; index += 1) {
+        gchar *path = g_filename_from_uri(uris[index], NULL, NULL);
+        if (path != NULL) g_ptr_array_add(paths, path);
+    }
+    if (paths->len > 0) {
+        g_ptr_array_add(paths, NULL);
+        webkit_file_chooser_request_select_files(chooser->request, (const gchar *const *)paths->pdata);
+    } else {
+        webkit_file_chooser_request_cancel(chooser->request);
+    }
+    g_ptr_array_unref(paths);
+}
+
+static void verde_browser_linux_on_file_chooser_response(
+    GDBusConnection *connection,
+    const gchar *sender_name,
+    const gchar *object_path,
+    const gchar *interface_name,
+    const gchar *signal_name,
+    GVariant *parameters,
+    gpointer user_data
+) {
+    struct verde_browser_linux_file_chooser *chooser = user_data;
+    (void)connection;
+    (void)sender_name;
+    (void)object_path;
+    (void)interface_name;
+    (void)signal_name;
+
+    guint32 response = 2;
+    GVariant *results = NULL;
+    g_variant_get(parameters, "(u@a{sv})", &response, &results);
+    const gchar **uris = NULL;
+    if (response == 0 && results != NULL) (void)g_variant_lookup(results, "uris", "^a&s", &uris);
+    verde_browser_linux_file_chooser_answer(chooser, uris);
+    g_free(uris);
+    if (results != NULL) g_variant_unref(results);
+    verde_browser_linux_file_chooser_maybe_free(chooser);
+}
+
+static guint verde_browser_linux_file_chooser_subscribe(struct verde_browser_linux_file_chooser *chooser) {
+    return g_dbus_connection_signal_subscribe(
+        chooser->connection,
+        "org.freedesktop.portal.Desktop",
+        "org.freedesktop.portal.Request",
+        "Response",
+        chooser->handle_path,
+        NULL,
+        G_DBUS_SIGNAL_FLAGS_NO_MATCH_RULE,
+        verde_browser_linux_on_file_chooser_response,
+        chooser,
+        NULL
+    );
+}
+
+static void verde_browser_linux_on_file_chooser_opened(GObject *source, GAsyncResult *result, gpointer user_data) {
+    struct verde_browser_linux_file_chooser *chooser = user_data;
+    GError *error = NULL;
+    GVariant *reply = g_dbus_connection_call_finish(G_DBUS_CONNECTION(source), result, &error);
+    chooser->call_pending = FALSE;
+    if (reply == NULL) {
+        g_warning("verde browser: file chooser portal unavailable: %s", error != NULL ? error->message : "unknown error");
+        g_clear_error(&error);
+        verde_browser_linux_file_chooser_answer(chooser, NULL);
+    } else {
+        const gchar *handle_path = NULL;
+        g_variant_get(reply, "(&o)", &handle_path);
+        // Portals older than 0.9 ignore handle_token and pick their own path.
+        if (!chooser->answered && g_strcmp0(handle_path, chooser->handle_path) != 0) {
+            g_dbus_connection_signal_unsubscribe(chooser->connection, chooser->response_subscription);
+            g_free(chooser->handle_path);
+            chooser->handle_path = g_strdup(handle_path);
+            chooser->response_subscription = verde_browser_linux_file_chooser_subscribe(chooser);
+        }
+        g_variant_unref(reply);
+    }
+    verde_browser_linux_file_chooser_maybe_free(chooser);
+}
+
+static gboolean verde_browser_linux_on_run_file_chooser(WebKitWebView *web_view, WebKitFileChooserRequest *request, gpointer user_data) {
+    (void)web_view;
+    (void)user_data;
+    GError *error = NULL;
+    GDBusConnection *connection = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, &error);
+    if (connection == NULL) {
+        g_warning("verde browser: file chooser needs a session bus: %s", error != NULL ? error->message : "unknown error");
+        g_clear_error(&error);
+        webkit_file_chooser_request_cancel(request);
+        return TRUE;
+    }
+
+    struct verde_browser_linux_file_chooser *chooser = g_new0(struct verde_browser_linux_file_chooser, 1);
+    chooser->request = g_object_ref(request);
+    chooser->connection = connection;
+    chooser->call_pending = TRUE;
+
+    gchar *token = g_strdup_printf("verde%u", g_random_int());
+    gchar *sender = g_strdup(g_dbus_connection_get_unique_name(connection) + 1);
+    g_strdelimit(sender, ".", '_');
+    chooser->handle_path = g_strdup_printf("/org/freedesktop/portal/desktop/request/%s/%s", sender, token);
+    g_free(sender);
+    // Subscribe before calling so a fast Response can never be missed.
+    chooser->response_subscription = verde_browser_linux_file_chooser_subscribe(chooser);
+
+    GVariantBuilder options;
+    g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);
+    g_variant_builder_add(&options, "{sv}", "handle_token", g_variant_new_string(token));
+    g_variant_builder_add(&options, "{sv}", "modal", g_variant_new_boolean(TRUE));
+    g_variant_builder_add(&options, "{sv}", "multiple", g_variant_new_boolean(webkit_file_chooser_request_get_select_multiple(request)));
+    const gchar *const *mime_types = webkit_file_chooser_request_get_mime_types(request);
+    if (mime_types != NULL && mime_types[0] != NULL) {
+        GVariantBuilder accepted;
+        g_variant_builder_init(&accepted, G_VARIANT_TYPE("a(us)"));
+        for (guint index = 0; mime_types[index] != NULL; index += 1) {
+            g_variant_builder_add(&accepted, "(us)", 1u, mime_types[index]);
+        }
+        GVariant *accepted_filter = g_variant_ref_sink(g_variant_new("(s@a(us))", "Accepted files", g_variant_builder_end(&accepted)));
+        GVariantBuilder filters;
+        g_variant_builder_init(&filters, G_VARIANT_TYPE("a(sa(us))"));
+        g_variant_builder_add_value(&filters, accepted_filter);
+        g_variant_builder_add(&filters, "(s@a(us))", "All files", g_variant_new_parsed("[(uint32 0, '*')]"));
+        g_variant_builder_add(&options, "{sv}", "filters", g_variant_builder_end(&filters));
+        g_variant_builder_add(&options, "{sv}", "current_filter", accepted_filter);
+        g_variant_unref(accepted_filter);
+    }
+    g_free(token);
+
+    g_dbus_connection_call(
+        connection,
+        "org.freedesktop.portal.Desktop",
+        "/org/freedesktop/portal/desktop",
+        "org.freedesktop.portal.FileChooser",
+        "OpenFile",
+        g_variant_new("(ssa{sv})", "", webkit_file_chooser_request_get_select_multiple(request) ? "Upload files" : "Upload file", &options),
+        G_VARIANT_TYPE("(o)"),
+        G_DBUS_CALL_FLAGS_NONE,
+        -1,
+        NULL,
+        verde_browser_linux_on_file_chooser_opened,
+        chooser
+    );
+    return TRUE;
+}
+
 static void verde_browser_linux_on_context_menu_dismissed(WebKitWebView *web_view, gpointer user_data) {
     (void)web_view;
     (void)user_data;
@@ -1719,6 +1890,7 @@ struct verde_browser_linux *verde_browser_linux_create(void) {
     g_signal_connect(browser->web_view, "context-menu", G_CALLBACK(verde_browser_linux_on_context_menu), browser);
     g_signal_connect(browser->web_view, "context-menu-dismissed", G_CALLBACK(verde_browser_linux_on_context_menu_dismissed), browser);
     g_signal_connect(browser->web_view, "show-option-menu", G_CALLBACK(verde_browser_linux_on_show_option_menu), browser);
+    g_signal_connect(browser->web_view, "run-file-chooser", G_CALLBACK(verde_browser_linux_on_run_file_chooser), browser);
     // The first show or navigate owns the initial document. An eager blank
     // load here can finish after the host has requested its actual URL.
     return browser;
