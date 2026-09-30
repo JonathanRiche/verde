@@ -87,7 +87,8 @@ internal class CoreGitChangesClient(private val core: GitCoreConnection, scope: 
             catch (e: CancellationException) { throw e }
             catch (_: Exception) { /* A later focus can retry this read. */ }
         }
-        if ("repository:read" in scopes && mutable.value.connected) workspaces.forEach { w ->
+        // Subscribe lazily: visiting one chat must not start Git scans across the host.
+        if ("repository:read" in scopes && mutable.value.connected) workspaces.filter { it.workspace_id == active?.workspace }.forEach { w ->
             if (w.workspace_id !in subscribed && requested.add(w.workspace_id)) scope.launch {
                 try { subscribe(w.workspace_id) }
                 catch (e: CancellationException) { throw e }

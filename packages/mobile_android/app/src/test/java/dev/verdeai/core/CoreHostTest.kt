@@ -146,6 +146,22 @@ class CoreHostTest {
         override fun close() { server.shutdown(); client.dispatcher.executorService.shutdown(); client.connectionPool.evictAll() }
     }
 
+    @Test fun chatResponsesOvertakeQueuedSummariesWithoutDroppingThem() = runBlocking<Unit> {
+        val order = mutableListOf<String>()
+        val queue = SummaryResponseQueue(this) { completion, _, _ ->
+            order += (completion(1, 1) as EventHttpResponse).effect_id
+        }
+        fun response(id: String): Completion = { n, w ->
+            EventHttpResponse(now_ms=n, wall_time_ms=w, effect_id=id, generation="1",
+                status=200, headers=emptyList(), body_base64="e30=", error=null)
+        }
+        repeat(20) { queue.submit(response("summary-$it"), 0, true) }
+        queue.submit(response("chat-load"), 0, false)
+        assertEquals(listOf("chat-load"), order)
+        withTimeout(2000) { while (order.size < 21) delay(1) }
+        assertEquals(listOf("chat-load") + (0..19).map { "summary-$it" }, order)
+    }
+
     @Test fun rpcTimingContainsOnlyAllowlistedMetadata() = runBlocking<Unit> {
         TlsFixture().use { fixture ->
             val core = FakeCore()

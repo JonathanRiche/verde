@@ -33,7 +33,7 @@ pub const ReviewView = struct {
     config: ?m.ConfigCommitSnapshot = null,
     @"error": ?h.LocalError = null,
 };
-const Watch = struct { view: Summary, dirty: bool = true, rpc_id: ?u64 = null };
+const Watch = struct { view: Summary, dirty: bool = true, rpc_id: ?u64 = null, due_ms: i64 = 0, eager: bool = false };
 pub const StatusView = struct {
     loading: bool = false,
     supported: bool = true,
@@ -54,6 +54,7 @@ const Retained = struct {
 const Request = struct { id: u64, kind: Kind, intent_id: []const u8, workspace_id: []const u8, epoch: u64 };
 pub const State = struct {
     watches: []Watch = &.{},
+    focused_workspace: []const u8 = "",
     requests: []const Request = &.{},
     view: ReviewView = .{},
     route: ?m.ReviewRequest = null,
@@ -159,7 +160,8 @@ pub fn intent(tx: *h.Transaction, tag: []const u8, v: V) E!void {
     }
     if (eq(tag, "git_summary_refresh")) {
         const i = try watch(tx, try h.string(v, "workspace_id"));
-        s.watches[i].dirty = true;
+        markDirty(tx, &s.watches[i]);
+        s.watches[i].eager = true;
         receipt(tx, id, "succeeded", null);
         return;
     }
@@ -377,7 +379,9 @@ pub fn pump(tx: *h.Transaction) E!void {
             if (eq(err.code, "changed_since_review") or eq(err.code, "review_expired")) {
                 s.view.state = if (eq(err.code, "review_expired")) "expired" else "stale";
                 s.rereview = true;
-                s.watches[try watch(tx, r.workspace_id)].dirty = true;
+                const i = try watch(tx, r.workspace_id);
+                markDirty(tx, &s.watches[i]);
+                s.watches[i].eager = true;
             }
             receipt(tx, r.intent_id, if (uncertain) "uncertain" else "failed", err);
             continue;
@@ -423,7 +427,9 @@ pub fn pump(tx: *h.Transaction) E!void {
                 s.view.mutation_state = "succeeded";
                 s.view.state = "stale";
                 s.rereview = true;
-                s.watches[try watch(tx, r.workspace_id)].dirty = true;
+                const i = try watch(tx, r.workspace_id);
+                markDirty(tx, &s.watches[i]);
+                s.watches[i].eager = true;
             },
             .push, .pull_push => {
                 s.view.pull_push_result = h.decode(m.PullPushResult, tx.allocator(), value) catch |err| {
@@ -435,19 +441,37 @@ pub fn pump(tx: *h.Transaction) E!void {
                 s.status_dirty = true;
                 s.view.mutation_state = "succeeded";
                 s.rereview = true;
-                s.watches[try watch(tx, r.workspace_id)].dirty = true;
+                const i = try watch(tx, r.workspace_id);
+                markDirty(tx, &s.watches[i]);
+                s.watches[i].eager = true;
             },
             .summary, .status => unreachable,
         }
         receipt(tx, r.intent_id, "succeeded", null);
     }
     if (!online(&tx.state) or !scoped(&tx.state, "repository:read")) return;
-    for (s.watches) |*w| if (w.dirty and w.rpc_id == null and w.view.supported) {
+    var next_due: ?i64 = null;
+    const now = tx.state.now_ms orelse 0;
+    for (s.watches) |*w| if (w.dirty and w.rpc_id == null and w.view.supported and
+        (w.eager or eq(w.view.workspace_id, s.focused_workspace)))
+    {
+        if (now < w.due_ms) {
+            next_due = @min(next_due orelse w.due_ms, w.due_ms);
+            continue;
+        }
         w.rpc_id = try rpc.request(tx, "git.changes.summary", .{ .workspace_id = w.view.workspace_id }, .{ .mutation = false, .intent_id = "@git" });
         w.dirty = false;
+        w.eager = false;
         w.view.loading = true;
         try track(tx, w.rpc_id.?, .summary, "", w.view.workspace_id);
     };
+    if (next_due) |due| {
+        var armed = false;
+        for (tx.state.pending) |pending| if (pending.kind == .timer and eq(pending.purpose, "git_summary") and pending.deadline == due) {
+            armed = true;
+        };
+        if (!armed) try tx.setTimer("git_summary", @intCast(@max(1, due - now)));
+    }
     if (s.status_dirty and s.status_id == null) {
         if (s.status_route) |route| {
             s.status_id = try rpc.request(tx, "git.changes.status", route, .{ .mutation = false, .intent_id = "@git" });
@@ -474,15 +498,28 @@ pub fn observe(tx: *h.Transaction, event: V) E!void {
         return;
     }
     const tag = p.s(event, "type");
-    const dirty = eq(tag, "foreground") or eq(tag, "focus");
-    if (eq(tag, "focus") and p.s(event, "workspace_id").len > 0) _ = try watch(tx, p.s(event, "workspace_id"));
-    if (dirty) {
+    if (eq(tag, "focus")) {
+        const ws = p.s(event, "workspace_id");
+        tx.state.git.focused_workspace = try tx.allocator().dupe(u8, ws);
+        if (ws.len > 0) {
+            const i = try watch(tx, ws);
+            markDirty(tx, &tx.state.git.watches[i]);
+            tx.state.git.watches[i].due_ms = (tx.state.now_ms orelse 0) +| 400;
+            tx.state.git.status_dirty = true;
+        }
+    } else if (eq(tag, "foreground")) {
         turnChanged(tx);
     }
 }
+fn markDirty(tx: *h.Transaction, w: *Watch) void {
+    // One trailing refresh at most, even if many changes arrive during a request.
+    if (!w.dirty or w.due_ms == 0) w.due_ms = (tx.state.now_ms orelse 0) +| 400;
+    w.dirty = true;
+}
 pub fn turnChanged(tx: *h.Transaction) void {
     tx.state.git.status_dirty = true;
-    for (tx.state.git.watches) |*w| w.dirty = true;
+    // Background summaries retain their cached values until next focus/explicit refresh.
+    for (tx.state.git.watches) |*w| markDirty(tx, w);
 }
 fn invalidResponse(tx: *h.Transaction, r: Request) E!void {
     if ((r.kind == .commit or r.kind == .push) and tx.state.git.retained != null) return recovery(tx);
@@ -573,7 +610,7 @@ fn recovery(tx: *h.Transaction) E!void {
     try tx.setTimer("git_retry", 2_000);
 }
 pub fn complete(_: *h.Transaction, pending: h.Pending) bool {
-    return pending.kind == .timer and eq(pending.purpose, "git_retry");
+    return pending.kind == .timer and (eq(pending.purpose, "git_retry") or eq(pending.purpose, "git_summary"));
 }
 fn retryRetained(tx: *h.Transaction) E!void {
     const s = &tx.state.git;
