@@ -61,6 +61,10 @@ class CoreHost private constructor(
     private val traceMetadata: ((String) -> Unit)?,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + dispatcher)
+    private val summaryEffects = mutableSetOf<String>()
+    private val responses = SummaryResponseQueue(scope) { completion, received, kind ->
+        if (!closed) completeNow(completion, received, kind)
+    }
     private val tracedRequests = mutableMapOf<String, Pair<String, Long>>()
     private var closed = false
     private val closing = AtomicBoolean(false)
@@ -85,10 +89,22 @@ class CoreHost private constructor(
     }
 
     private fun complete(completion: Completion) {
+        val received = System.nanoTime()
         scope.launch {
-            if (!closed) try { dispatch(completion(executor.now(), executor.wall())) }
-            catch (error: Exception) { fail(error) }
+            if (closed) return@launch
+            try {
+                // Completions construct immutable events; stamp again when actually dispatched
+                // so deferred summaries cannot send an older clock value into the core.
+                val event = completion(executor.now(), executor.wall())
+                responses.submit(completion, received, event is EventHttpResponse && summaryEffects.remove(event.effect_id))
+            } catch (error: Exception) { fail(error) }
         }
+    }
+
+    private fun completeNow(completion: Completion, received: Long, kind: String) {
+        traceMetadata?.invoke("response_kind=$kind queue_ms=${(System.nanoTime()-received)/1_000_000}")
+        try { dispatch(completion(executor.now(), executor.wall())) }
+        catch (error: Exception) { fail(error) }
     }
 
     /**
@@ -262,13 +278,18 @@ class CoreHost private constructor(
                 mutableViews.value = updated.toMap()
             } else if (effect is EffectTerminalOutput) terminalOutput(effect)
             else {
-                if (trace && effect is EffectHttpRequest) {
+                if (effect is EffectHttpCancel) {
+                    summaryEffects.remove(effect.request_id)
+                    tracedRequests.remove(effect.request_id)
+                }
+                if (effect is EffectHttpRequest) {
                     val method = try { effect.body_base64?.let { CoreJson.parseToJsonElement(Base64.getDecoder().decode(it).decodeToString()).jsonObject["method"]?.jsonPrimitive?.content } } catch (_: Exception) { null }
+                    if (method == "git.changes.summary") summaryEffects.add(effect.effect_id)
                     val kind = when (method) {
                         "git.changes.summary", "git.changes.status", "chat.thread.get", "chat.message.list", "chat.turn.tail", "chat.thread.list", "provider.models.list", "core.snapshot", "core.changes", "daemon.changes", "chat.catalog.list" -> method
                         else -> "other"
                     }
-                    if (tracedRequests.size < 512) tracedRequests[effect.effect_id] = kind to System.nanoTime()
+                    if (trace && tracedRequests.size < 512) tracedRequests[effect.effect_id] = kind to System.nanoTime()
                 }
                 executor.execute(effect)
             }
@@ -334,6 +355,27 @@ class CoreHost private constructor(
             } catch (_: Exception) {
                 withContext(NonCancellable + dispatcher) { if (allocated != 0L) core.free(allocated) }
                 dispatcher.close(); executor.close(); throw CoreFailure(-1)
+            }
+        }
+    }
+}
+
+/** Core-thread-only queue. A running JNI call is atomic; waiting summaries yield to chat/input. */
+internal class SummaryResponseQueue(
+    private val scope: CoroutineScope,
+    private val dispatch: (Completion, Long, String) -> Unit,
+) {
+    private val pending = ArrayDeque<Pair<Completion, Long>>()
+    private var drain: Job? = null
+    fun submit(completion: Completion, received: Long, summary: Boolean) {
+        if (!summary) { dispatch(completion, received, "foreground"); return }
+        pending.addLast(completion to received)
+        if (drain?.isActive != true) drain = scope.launch {
+            while (pending.isNotEmpty()) {
+                // Leave a scheduling opportunity for newly arrived chat loads, focus and input.
+                delay(1)
+                val (next, arrival) = pending.removeFirst()
+                dispatch(next, arrival, "git_summary")
             }
         }
     }

@@ -101,6 +101,16 @@ class CoreGitChangesClientTest {
         assertEquals(1, core.sent.size)
     }
 
+    @Test fun catalogDoesNotSubscribeEveryBackgroundWorkspace() = fixture { core, adapter ->
+        val host = HostView("host", "Fixture", null, null, null, "ready", Lifecycle.foreground,
+            "paired", "ready", emptyList(), listOf("chat:write", "repository:read"), null, null, false, null)
+        val workspaces = (1..20).map { Workspace("ws-$it", "Workspace", "/fixture", true, emptyList(), emptyList()) }
+        adapter.catalog(BrowseState(hostId="host", row=HostRow(SavedHost("host", "Fixture"), host), hasSynced=true,
+            workspaces=WorkspacesView(workspaces, false, false, null, HistoryView("", emptyList(), null, false, null))))
+        yield()
+        assertTrue(core.sent.filterIsInstance<EventGitSummaryRefresh>().isEmpty())
+    }
+
     @Test fun newlyCreatedChatRetriesStatusWhenItsCatalogRouteArrives() = fixture { core, adapter ->
         val host = HostView("host", "Fixture", null, null, null, "ready", Lifecycle.foreground,
             "paired", "ready", emptyList(), listOf("chat:write", "repository:read"), null, null, false, null)

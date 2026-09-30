@@ -72,6 +72,14 @@ const Fixture = struct {
         _ = try f.event(tag, v);
         return id;
     }
+    fn summaryTimer(f: *Fixture) !void {
+        for (f.host.state.pending) |timer| if (timer.kind == .timer and h.eq(timer.purpose, "git_summary")) {
+            f.now = @max(f.now, timer.deadline);
+            _ = try f.event("timer_fired", .{ .timer_id = timer.id, .generation = try std.fmt.allocPrint(f.a(), "{d}", .{f.host.state.generation}) });
+            return;
+        };
+        return error.MissingSummaryTimer;
+    }
     fn pending(f: *Fixture, method: []const u8) usize {
         var n: usize = 0;
         for (f.host.state.rpc.calls) |call| if (h.eq(call.method, method)) {
@@ -242,27 +250,57 @@ test "git mutation rejects 401 without auth replay" {
     try expect(f.pending("git.changes.commit") == 0);
 }
 
-test "git summary signals coalesce and cached changes remain during refresh" {
+test "git summary bursts debounce and in flight signals coalesce once" {
     var f = try Fixture.init(all_scopes, &.{});
     defer f.deinit();
-    _ = try f.intent("git_summary_refresh", .{ .workspace_id = "ws-1" });
+    for (0..10) |_| _ = try f.intent("git_summary_refresh", .{ .workspace_id = "ws-1" });
+    try expect(f.pending("git.changes.summary") == 0);
+    try f.summaryTimer();
+    try expect(f.now == 401);
     try expect(f.pending("git.changes.summary") == 1);
-    _ = try f.intent("git_summary_refresh", .{ .workspace_id = "ws-1" });
+    for (0..10) |_| _ = try f.intent("git_summary_refresh", .{ .workspace_id = "ws-1" });
     try expect(f.pending("git.changes.summary") == 1);
     const response = .{ .workspace_id = "ws-1", .revision = 1, .threads = .{.{ .local_thread_id = "thread", .files = 2, .additions = 4, .deletions = 1, .attention = 1 }} };
     try f.reply("git.changes.summary", response);
-    try expect(f.pending("git.changes.summary") == 1);
+    try expect(f.pending("git.changes.summary") == 0);
     const q = try h.parse(f.a(), try f.host.query("git_summary:ws-1", f.a()));
-    try expect(p.yes(p.get(p.get(q, "data"), "loading")));
     try expect(p.rows(p.get(p.get(q, "data"), "threads")).len == 1);
-    try f.reply("git.changes.summary", response);
-    try expect(f.pending("git.changes.summary") == 0);
-    // Neither a tick nor an unrelated input can create a polling request.
-    _ = try f.event("foreground", .{});
+    try f.summaryTimer();
     try expect(f.pending("git.changes.summary") == 1);
     try f.reply("git.changes.summary", response);
-    _ = try f.intent("retry_connection", .{});
     try expect(f.pending("git.changes.summary") == 0);
+    _ = try f.event("foreground", .{});
+    try expect(f.pending("git.changes.summary") == 0); // Background watch remains lazy.
+}
+
+test "git focus refreshes only its workspace and defers background turn changes" {
+    var f = try Fixture.init(all_scopes, &.{});
+    defer f.deinit();
+    for ([_][]const u8{ "ws-1", "ws-closed" }) |ws| {
+        _ = try f.intent("git_summary_refresh", .{ .workspace_id = ws });
+        try f.summaryTimer();
+        try f.reply("git.changes.summary", .{ .workspace_id = ws, .revision = 1, .threads = .{} });
+    }
+    // Exercise observation independently of route loading/provider fixtures.
+    var tx = try h.Transaction.init(&f.host);
+    defer tx.deinit();
+    try g.observe(&tx, try f.value(.{ .type = "focus", .workspace_id = "ws-1" }));
+    g.turnChanged(&tx);
+    try g.pump(&tx);
+    _ = try tx.commit(&f.host, f.a());
+    try f.summaryTimer();
+    try expect(f.pending("git.changes.summary") == 1);
+    try eql("ws-1", p.s(try f.params("git.changes.summary"), "workspace_id"));
+    try f.reply("git.changes.summary", .{ .workspace_id = "ws-1", .revision = 2, .threads = .{} });
+    try expect(f.pending("git.changes.summary") == 0);
+    var next = try h.Transaction.init(&f.host);
+    defer next.deinit();
+    try g.observe(&next, try f.value(.{ .type = "focus", .workspace_id = "ws-closed" }));
+    try g.pump(&next);
+    _ = try next.commit(&f.host, f.a());
+    try f.summaryTimer();
+    try expect(f.pending("git.changes.summary") == 1);
+    try eql("ws-closed", p.s(try f.params("git.changes.summary"), "workspace_id"));
 }
 
 test "git remote runtime review is unsupported and signout clears projections" {
