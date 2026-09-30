@@ -44,7 +44,7 @@ fn openRoot(io: std.Io, path: []const u8) !std.Io.Dir {
 
 // Same confinement strategy as web served_files: openat2 on Linux, a
 // conservative no-follow component walk on other hosts/older kernels.
-fn openBeneath(allocator: std.mem.Allocator, io: std.Io, root: std.Io.Dir, relative: []const u8) !std.Io.Dir {
+fn openBeneath(allocator: std.mem.Allocator, io: std.Io, root: std.Io.Dir, relative: []const u8) (std.mem.Allocator.Error || error{ FileNotFound, NotDir, PathOutsideRoots })!std.Io.Dir {
     if (builtin.os.tag == .linux) {
         const linux = std.os.linux;
         const path_z = try allocator.dupeZ(u8, relative);
