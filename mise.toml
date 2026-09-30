@@ -139,6 +139,10 @@ run = "bash packages/mobile_ios/scripts/xcode.sh test"
 description = "Builds the Android debug APK, including both Zig JNI libraries."
 run = "bash packages/mobile_android/run-gradle.sh assembleDebug"
 
+[tasks.mobile-android-play-bundle]
+description = "Builds a signed Google Play AAB using external upload-key credentials."
+run = "bash packages/mobile_android/scripts/play-bundle.sh"
+
 [tasks.mobile-android-test]
 description = "Runs Android JVM and Robolectric tests."
 run = "bash packages/mobile_android/run-gradle.sh testDebugUnitTest"

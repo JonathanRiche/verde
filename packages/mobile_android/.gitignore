@@ -4,3 +4,9 @@
 local.properties
 .idea/
 *.iml
+
+# Upload signing credentials never belong in the repository.
+*.jks
+*.p12
+*.keystore
+keystore.properties

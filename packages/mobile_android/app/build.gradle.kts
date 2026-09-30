@@ -19,17 +19,39 @@ val syncNativeLibraries by tasks.registering(Sync::class) {
     into(layout.buildDirectory.dir("generated/jniLibs"))
 }
 
+val uploadKeystore = providers.environmentVariable("VERDE_ANDROID_UPLOAD_KEYSTORE").orNull
+val uploadStorePassword = providers.environmentVariable("VERDE_ANDROID_STORE_PASSWORD").orNull
+val uploadKeyAlias = providers.environmentVariable("VERDE_ANDROID_KEY_ALIAS").orNull
+val uploadKeyPassword = providers.environmentVariable("VERDE_ANDROID_KEY_PASSWORD").orNull
+val uploadSigning = listOf(uploadKeystore, uploadStorePassword, uploadKeyAlias, uploadKeyPassword)
+require(uploadSigning.all { it.isNullOrBlank() } || uploadSigning.all { !it.isNullOrBlank() }) {
+    "Supply all four VERDE_ANDROID upload-signing environment variables, or none."
+}
+val playVersionCode = providers.environmentVariable("VERDE_ANDROID_VERSION_CODE").orNull?.let {
+    requireNotNull(it.toIntOrNull()?.takeIf { value -> value in 1..2100000000 }) { "Invalid VERDE_ANDROID_VERSION_CODE" }
+} ?: 1
+
 android {
     namespace = "dev.verdeai.app"
-    compileSdk = 35
+    compileSdk = 36
+    buildToolsVersion = "36.0.0"
     ndkVersion = "30.0.16248370"
     defaultConfig {
         applicationId = "dev.verdeai.app"
         minSdk = 29
-        targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        targetSdk = 36
+        versionCode = playVersionCode
+        versionName = providers.environmentVariable("VERDE_ANDROID_VERSION_NAME").orElse("0.1.0").get()
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
+    }
+    if (!uploadKeystore.isNullOrBlank()) {
+        signingConfigs.create("upload") {
+            storeFile = file(uploadKeystore)
+            storePassword = uploadStorePassword
+            keyAlias = uploadKeyAlias
+            keyPassword = uploadKeyPassword
+        }
+        buildTypes.getByName("release").signingConfig = signingConfigs.getByName("upload")
     }
     sourceSets.getByName("main").jniLibs.srcDir(layout.buildDirectory.dir("generated/jniLibs"))
     buildFeatures { compose = true }
