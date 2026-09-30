@@ -10529,6 +10529,7 @@ fn maybeInitStoreService(daemon: *Daemon) !void {
     // user-stopped parent stay dropped rather than flooding in once the
     // link is re-enabled. Finished tasks are not backfilled here.
     try service.store.conn.execNoArgs("update chat_deliveries set delivered=1 where delivered=2");
+    try service.store.conn.execNoArgs("update chat_links set delivery_enabled=0 where hidden=1");
     try service.store.conn.execNoArgs("update chat_deliveries set delivered=1 where delivered=0 and link_id in (select link_id from chat_links where delivery_enabled=0)");
 
     lockDaemon(daemon);
@@ -10678,9 +10679,9 @@ fn stageAcceptedChatTurn(daemon: *Daemon, turn: *ChatTurn) !AcceptanceOwnership 
 
     if (std.mem.startsWith(u8, turn_id, "child-event:")) try svc.store.conn.exec("update chat_deliveries set delivered=1 where 'child-event:' || task_id || ':' || (select parent_thread_id from chat_links where link_id=chat_deliveries.link_id) || ':' || revision = ?", .{turn_id});
 
-    if (!std.mem.startsWith(u8, turn_id, "child-event:")) try svc.store.conn.exec("update chat_links set delivery_enabled=1 where workspace_id=? and parent_thread_id=?", .{ workspace_id, local_thread_id });
+    if (!std.mem.startsWith(u8, turn_id, "child-event:")) try svc.store.conn.exec("update chat_links set delivery_enabled=1 where workspace_id=? and parent_thread_id=? and hidden=0", .{ workspace_id, local_thread_id });
     if (turn.task_owner == null) {
-        var linked = try svc.store.conn.row("select 1 from chat_links where workspace_id=? and local_thread_id=? limit 1", .{ workspace_id, local_thread_id });
+        var linked = try svc.store.conn.row("select 1 from chat_links where workspace_id=? and local_thread_id=? and hidden=0 limit 1", .{ workspace_id, local_thread_id });
         if (linked) |*row| {
             row.deinit();
             turn.task_owner = try daemon.allocator.dupe(u8, "verde");

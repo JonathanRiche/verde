@@ -91,9 +91,12 @@ pub fn writeLinks(conn: zqlite.Conn, s: *std.json.Stringify, workspace: []const 
 
 pub fn clear(conn: zqlite.Conn, workspace: []const u8, parent: []const u8, link_id: ?[]const u8, completed_only: bool) !void {
     try conn.exec(
-        \\update chat_links set hidden=1 where workspace_id=? and parent_thread_id=? and (? is null or link_id=?)
+        \\update chat_links set hidden=1,delivery_enabled=0 where workspace_id=? and parent_thread_id=? and (? is null or link_id=?)
         \\and (not ? or (select status from chat_tasks where workspace_id=chat_links.workspace_id and local_thread_id=chat_links.local_thread_id order by created_at_ms desc,rowid desc limit 1) in ('completed','failed','aborted','interrupted'))
     , .{ workspace, parent, link_id, link_id, completed_only });
+    // Removing a child from the panel unlinks it: queued results are dropped
+    // and it stops notifying the parent until the parent delegates to it again.
+    try conn.exec("update chat_deliveries set delivered=1 where delivered=0 and link_id in (select link_id from chat_links where workspace_id=? and parent_thread_id=? and hidden=1)", .{ workspace, parent });
 }
 
 /// Write the MCP task representation from durable state, including its result.
@@ -167,4 +170,22 @@ pub fn recoverTasks(conn: zqlite.Conn, allocator: std.mem.Allocator, now: i64) !
         // waking it would start a turn nobody asked for.
         if (std.mem.eql(u8, item.status, "interrupted")) try conn.exec("update chat_deliveries set delivered=1 where task_id=? and delivered=0", .{item.id});
     }
+}
+
+test "removing a linked chat stops parent delivery" {
+    var conn = try zqlite.open(":memory:", zqlite.OpenFlags.Create | zqlite.OpenFlags.EXResCode);
+    defer conn.close();
+    try conn.execNoArgs(@import("../db/chat_links_schema.zig").SCHEMA_SQL);
+    try conn.execNoArgs("insert into chat_links(link_id,workspace_id,parent_thread_id,local_thread_id) values('l','w','p','c')");
+    try createTask(conn, "t1", "w", "c", "verde", 1);
+    try updateTask(conn, "t1", "completed", "queued", null, null, 2);
+    try clear(conn, "w", "p", "l", false);
+    var pending = (try conn.row("select count(*) from chat_deliveries where delivered=0", .{})).?;
+    try std.testing.expectEqual(@as(i64, 0), pending.int(0));
+    pending.deinit();
+    try createTask(conn, "t2", "w", "c", "verde", 3);
+    try updateTask(conn, "t2", "completed", "after removal", null, null, 4);
+    var rows = (try conn.row("select count(*) from chat_deliveries where task_id='t2'", .{})).?;
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(i64, 0), rows.int(0));
 }
