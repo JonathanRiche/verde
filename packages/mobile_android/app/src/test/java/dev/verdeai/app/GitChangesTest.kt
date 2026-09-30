@@ -49,6 +49,7 @@ class GitChangesTest {
         override val snapshot = MutableStateFlow(GitSnapshot(
             summaries = mapOf(chat to GitSummary(review.repos.sumOf { it.files.size }, 2, 1, review.repos.flatMap { it.files }.count { it.ownership != GitOwnership.Mine })),
             branches = mapOf(chat to review.repos.map { it.branch }), access = mapOf(chat to access), connected = true))
+        val pushedRoots = mutableListOf<String>()
         var refreshes = 0; var reviews = 0; var messages = 0; var commits = 0; var pushes = 0
         var messageGate: CompletableDeferred<Unit>? = null
         var commitGate: CompletableDeferred<Unit>? = null
@@ -74,7 +75,7 @@ class GitChangesTest {
             failure?.let { throw GitFailure(it) }
             return GitCommitResult(listOf(GitRepoCommit("/scratch", "123abcd", selections.sumOf { it.files.size }, outcome)))
         }
-        override suspend fun push(chat: GitChat, root: String, pull: Boolean, requestId: String, onChecking: (Boolean) -> Unit): GitPush { pushes++; pulled = pull; return GitPush.Pushed }
+        override suspend fun push(chat: GitChat, root: String, pull: Boolean, requestId: String, onChecking: (Boolean) -> Unit): GitPush { pushes++; pushedRoots += root; pulled = pull; return GitPush.Pushed }
     }
     private fun mount(fake: Fake): GitChangesModel {
         val model = GitChangesModel(chat, fake)
@@ -432,9 +433,9 @@ class GitChangesTest {
     }
 
     @Test fun commitNoticeParserSupportsOldRichAndUnknownReceipts() {
-        assertEquals(GitCommitNoticeData("Committed 1 file", "123abcd", false), parseGitCommitNotice("Committed 1 file: 123abcd"))
-        assertEquals(GitCommitNoticeData("Committed 3 files", "123abcd (app), abc1234 (lib)", true, "Improve fixtures", "feature/fixtures"),
-            parseGitCommitNotice("Committed 3 files: 123abcd (app), abc1234 (lib) · pushed\nImprove fixtures\nbranch feature/fixtures"))
+        assertEquals(GitCommitNoticeData("Committed 1 file", "123abcd", false, entries = listOf(GitCommitEntry("123abcd", null, false))), parseGitCommitNotice("Committed 1 file: 123abcd"))
+        assertEquals(GitCommitNoticeData("Committed 3 files", "123abcd (app), abc1234 (lib)", true, "Improve fixtures", "feature/fixtures", listOf(GitCommitEntry("123abcd (app)", "app", true), GitCommitEntry("abc1234 (lib)", "lib", true))),
+            parseGitCommitNotice("Committed 3 files: 123abcd (app) · pushed, abc1234 (lib) · pushed\nImprove fixtures\nbranch feature/fixtures"))
         assertEquals("feature/fixtures", parseGitCommitNotice("Committed 1 file: 123abcd\n\nbranch feature/fixtures").branch)
         assertNull(parseGitCommitNotice("Committed 1 file: 123abcd\n\nbranch feature/fixtures").subject)
         assertEquals(GitCommitNoticeData("Unknown receipt", null, false), parseGitCommitNotice("Unknown receipt"))
@@ -447,7 +448,7 @@ class GitChangesTest {
         val chatState = GitChangesState(snapshot = GitSnapshot(connected = true, access = mapOf(chat to GitAccess.Writable),
             branches = mapOf(chat to listOf(GitBranch("/scratch", "scratch", ahead = 2, hasRemote = true)))))
         val original = "Committed 1 file: 123abcd"
-        val updated = "$original · pushed\n\nbranch feature/test\nremote https://github.com/example/repo/commit/123abcd\nremote https://gitlab.com/example/repo/commit/123abcd"
+        val updated = "Committed 2 files: 123abcd (app) · pushed, abc1234 (lib) · pushed\n\nbranch feature/test\nremote https://github.com/example/repo/commit/123abcd\nremote https://gitlab.com/example/repo/commit/123abcd"
         val parsed = parseGitCommitNotice(updated)
         assertNull(parsed.subject)
         assertEquals("feature/test", parsed.branch)
@@ -466,9 +467,62 @@ class GitChangesTest {
         compose.onNodeWithTag("git-card-push").assertIsDisplayed()
         compose.runOnIdle { body.value = updated }
         compose.onNodeWithTag("git-card-push").assertDoesNotExist()
-        compose.onNodeWithText("Committed & pushed 1 file").assertIsDisplayed()
+        compose.onNodeWithText("Committed & pushed 2 files").assertIsDisplayed()
         compose.onNodeWithText("View on github.com").assertIsDisplayed()
         compose.onNodeWithText("View on gitlab.com").assertIsDisplayed()
+    }
+
+    @Test fun commitMarkersPreserveRepoPositionsAndNeverLinkUnpushedEntries() {
+        val notice = parseGitCommitNotice("Committed 4 files: 123abcd (local), abc1234 (old), bbb1234 (pushed) · pushed, ccc1234 (unknown)\nSubject\nbranch feature/test\nlocal\nremote https://github.com/a/b/commit/abc1234\nremote https://gitlab.com/a/b/commit/bbb1234")
+        assertTrue(notice.entries[0].local)
+        assertNull(notice.entries[1].url) // Old daemon rows emitted links before push.
+        assertEquals(listOf("https://gitlab.com/a/b/commit/bbb1234"), notice.remotes)
+        assertFalse(notice.entries[3].local) // Missing trailing marker means unknown/remote.
+        assertFalse(notice.pushed)
+        val state = GitChangesState(snapshot = GitSnapshot(access=mapOf(chat to GitAccess.Writable), branches=mapOf(chat to
+            listOf("local", "old", "pushed", "unknown").map { GitBranch("/$it", it, ahead=1, hasRemote=true) })))
+        assertEquals(setOf("/old", "/unknown"), gitCardPushRoots(notice, state, chat))
+        val bare = parseGitCommitNotice("Committed 2 files: 123abcd (a), abc1234 (b)\n\n\nremote\nlocal")
+        assertFalse(bare.entries[0].local)
+        assertTrue(bare.entries[1].local)
+        assertTrue(bare.remotes.isEmpty())
+    }
+
+    @Test fun mixedCardPushTargetsOnlyUnpushedRemoteRepo() {
+        val fake = Fake()
+        fake.snapshot.value = GitSnapshot(connected=true, access=mapOf(chat to GitAccess.Writable),
+            branches=mapOf(chat to listOf("local", "remote").map { GitBranch("/$it", it, ahead=1, hasRemote=true) }))
+        val model = GitChangesModel(chat, fake); models.put("git", model)
+        compose.setContent { VerdeTheme {
+            GitCommitNotice("Committed 2 files: 123abcd (local), abc1234 (remote)\n\n\nlocal\nremote", model)
+        } }
+        compose.onNodeWithTag("git-card-push").performClick()
+        await { fake.pushes == 1 && !model.state.value.busy }
+        assertEquals(listOf("/remote"), fake.pushedRoots)
+        compose.onNodeWithText("local: Local only · no remote").assertIsDisplayed()
+    }
+
+    @Test fun localOnlyCardHidesPushAndOldUnpushedLinks() {
+        val fake = Fake()
+        fake.snapshot.value = GitSnapshot(connected=true, access=mapOf(chat to GitAccess.Writable),
+            branches=mapOf(chat to listOf(GitBranch("/scratch", "scratch", ahead=1, hasRemote=true))))
+        val model = GitChangesModel(chat, fake); models.put("git", model)
+        val body = androidx.compose.runtime.mutableStateOf("Committed 1 file: 0aae44a\nSubject\nbranch main\nremote https://github.com/a/b/commit/0aae44a")
+        compose.setContent { VerdeTheme { GitCommitNotice(body.value, model) } }
+        compose.onNodeWithText("View on github.com").assertDoesNotExist()
+        compose.onNodeWithText("Not pushed").assertIsDisplayed()
+        compose.onNodeWithTag("git-card-push").assertIsDisplayed()
+        compose.runOnIdle { body.value = "Committed 1 file: 0aae44a\nSubject\nbranch main\nlocal" }
+        compose.onNodeWithText("Local only · no remote").assertIsDisplayed()
+        compose.onNodeWithTag("git-card-push").assertDoesNotExist()
+        compose.onNodeWithText("Not pushed").assertDoesNotExist()
+        compose.runOnIdle {
+            body.value = "Committed 1 file: 0aae44a\nSubject\nbranch main\nremote"
+            fake.snapshot.value = fake.snapshot.value.copy(branches=emptyMap())
+        }
+        compose.onNodeWithText("Not pushed").assertDoesNotExist()
+        compose.onNodeWithText("Local only · no remote").assertDoesNotExist()
+        compose.onNodeWithTag("git-card-push").assertDoesNotExist()
     }
 
     @Test fun resultCardShowsProgressThenSuccessAndDismisses() {

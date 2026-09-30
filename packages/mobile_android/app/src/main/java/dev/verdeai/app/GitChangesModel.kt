@@ -262,9 +262,9 @@ internal class GitChangesModel(val chat: GitChat, private val client: GitChanges
             }
         }
     }
-    fun push(pull: Boolean = false) {
+    fun push(pull: Boolean = false, onlyRoots: Set<String>? = null) {
         if (!writable() || state.value.busy) return
-        val roots = if (pull) state.value.rejectedRoots.toList() else client.snapshot.value.branches[chat].orEmpty().filter { it.hasRemote && it.ahead > 0 }.map { it.root }
+        val roots = if (pull) state.value.rejectedRoots.toList() else client.snapshot.value.branches[chat].orEmpty().filter { it.hasRemote && it.ahead > 0 && (onlyRoots == null || it.root in onlyRoots) }.map { it.root }
         if (roots.isEmpty()) return
         val branches = client.snapshot.value.branches[chat].orEmpty().filter { it.root in roots }
         mutable.update { it.copy(busy = true, notice = GitNotice(if (pull) "Pulling & pushing…" else "Pushing…", phase = GitResultPhase.Running)) }
