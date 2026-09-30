@@ -1898,6 +1898,9 @@ const ChatTurn = struct {
     followup_pending: bool = false,
     /// Optional client-supplied user message id staged at acceptance (M4-P2/P3).
     user_message_id: ?[]u8 = null,
+    /// Author of the staged user row ("You" or "Agent · <parent>"), mirrored
+    /// so attach hydration labels agent-sent prompts like the durable row.
+    user_author: ?[]u8 = null,
     /// Hermetic IT stub path (also armed by VERDE_SESSION_DAEMON_CHAT_STUB).
     use_stub: bool = false,
     /// Unit-test-only Store message override for immutable acceptance fields
@@ -1957,6 +1960,7 @@ const ChatTurn = struct {
         for (self.steers.items) |*steer| steer.deinit(allocator);
         self.steers.deinit(allocator);
         if (self.user_message_id) |value| allocator.free(value);
+        if (self.user_author) |value| allocator.free(value);
         if (self.durability_error) |value| allocator.free(value);
         if (self.provider_thread_id) |value| allocator.free(value);
         if (self.active_turn_id) |value| allocator.free(value);
@@ -10709,6 +10713,13 @@ fn stageAcceptedChatTurn(daemon: *Daemon, turn: *ChatTurn) !AcceptanceOwnership 
             turn.user_message_id = daemon.allocator.dupe(u8, user_message_id) catch null;
         }
     }
+    if (turn.user_author == null) {
+        lockTurn(turn);
+        defer turn.mutex.unlock();
+        if (turn.user_author == null) {
+            turn.user_author = daemon.allocator.dupe(u8, user_message.author) catch null;
+        }
+    }
     return .owned;
 }
 
@@ -14115,6 +14126,8 @@ fn writeChatTurnTail(
     // (after_seq == 0) instead of being re-sent on every poll of the turn.
     try s.objectField("user_prompt");
     if (after_seq == 0) try s.write(turn.request.prompt) else try s.write(null);
+    try s.objectField("user_author");
+    if (turn.user_author) |value| try s.write(value) else try s.write(null);
     try s.objectField("result_reply_text");
     if (!has_more_events) {
         if (turn.result_reply_text) |value| try s.write(value) else try s.write(null);
@@ -14276,6 +14289,7 @@ fn chatTailMetadataUpperBound(turn: *const ChatTurn, include_prompt: bool, inclu
     if (turn.provider_thread_id) |value| total = saturatedAdd(total, jsonStringUpperBound(value));
     if (turn.active_turn_id) |value| total = saturatedAdd(total, jsonStringUpperBound(value));
     if (turn.user_message_id) |value| total = saturatedAdd(total, jsonStringUpperBound(value));
+    if (turn.user_author) |value| total = saturatedAdd(total, jsonStringUpperBound(value));
     if (include_prompt) total = saturatedAdd(total, jsonStringUpperBound(turn.request.prompt));
     if (turn.generated_title_applied) {
         if (turn.generated_title) |value| total = saturatedAdd(total, jsonStringUpperBound(value));

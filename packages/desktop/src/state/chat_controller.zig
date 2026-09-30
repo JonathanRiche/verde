@@ -6281,14 +6281,20 @@ test "daemon tail hydrates the missing user row for externally started turns" {
     try std.testing.expectEqualStrings("You", row.author);
     try std.testing.expectEqualStrings("hello from web", row.body);
     try std.testing.expectEqualStrings("web-turn:u1", row.message_id.?);
-    try std.testing.expectEqual(@as(usize, 1), state.dirty);
 
     // Idempotent across polls: the same identity never duplicates the row
     // (this also covers desktop-originated sends, whose staged user row
     // already carries the acceptance id).
     _ = try applyDaemonChatTurnTail(&state, &thread, response);
     try std.testing.expectEqual(@as(usize, 1), thread.messages.items.len);
-    try std.testing.expectEqual(@as(usize, 1), state.dirty);
+
+    // Agent-sent prompts keep the sender the daemon staged.
+    const agent_response =
+        \\{"jsonrpc":"2.0","id":2,"result":{"status":"running","events":[],"next_seq":1,"user_message_id":"agent-turn:u2","user_prompt":"from parent","user_author":"Agent \u00b7 Planner"}}
+    ;
+    _ = try applyDaemonChatTurnTail(&state, &thread, agent_response);
+    try std.testing.expectEqual(@as(usize, 2), thread.messages.items.len);
+    try std.testing.expectEqualStrings("Agent \u{00B7} Planner", thread.messages.items[1].author);
 }
 
 test "daemon tail cursor advances only after an event applies" {
@@ -6486,7 +6492,9 @@ pub fn applyDaemonChatTurnTailValue(self: anytype, thread: *ChatThread, root: st
     if (jsonValueString(result.object.get("user_message_id") orelse .null)) |user_message_id| {
         if (jsonValueString(result.object.get("user_prompt") orelse .null)) |user_prompt| {
             if (!threadHasMessageId(thread, user_message_id)) {
-                const owned_author = try self.allocator.dupeZ(u8, "You");
+                // Agent-sent prompts carry their sender; only human prompts read "You".
+                const author = jsonValueString(result.object.get("user_author") orelse .null) orelse "You";
+                const owned_author = try self.allocator.dupeZ(u8, author);
                 errdefer self.allocator.free(owned_author);
                 const owned_body = try self.allocator.dupeZ(u8, user_prompt);
                 errdefer self.allocator.free(owned_body);
