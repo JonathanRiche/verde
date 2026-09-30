@@ -131,6 +131,8 @@ actor CoreHost {
     private let events: AsyncStream<Event>
     private let continuation: AsyncStream<Event>.Continuation
     private var pump: Task<Void, Never>?
+    private var summaries = CoreSummaryQueue()
+    private var summaryDrain: Task<Void, Never>?
     private var timers: [String: Task<Void, Never>] = [:]
     private var publication: Task<Void, Never>?
     private var stopped = false
@@ -314,7 +316,23 @@ actor CoreHost {
     }
     private func receive(_ event: Event) {
         guard !stopped else { return }
+        if summaries.deferResponse(event) {
+            if summaryDrain == nil {
+                summaryDrain = Task { [weak self] in await self?.drainSummaries() }
+            }
+            return
+        }
         do { try send(event) } catch { /* send publishes a fixed, non-sensitive failure. */ }
+    }
+    private func drainSummaries() async {
+        defer { summaryDrain = nil }
+        while !stopped && !summaries.isEmpty {
+            // A native call is atomic. Yield between summaries so queued
+            // chat/input work runs first; send stamps clocks at dispatch.
+            do { try await Task.sleep(for: .milliseconds(1)) } catch { return }
+            guard !Task.isCancelled, !stopped, let event = summaries.pop() else { return }
+            do { try send(event) } catch { return }
+        }
     }
     private func dispatch(_ effects: [Effect]) throws {
         var updates: [String: Data] = [:]
@@ -322,6 +340,7 @@ actor CoreHost {
         let continuation = self.continuation
         let emit: (Event) -> Void = { continuation.yield($0) }
         for effect in effects {
+            summaries.track(effect)
             switch effect {
             case .set_timer(let value):
                 timers.removeValue(forKey: value.timer_id)?.cancel()
@@ -355,6 +374,7 @@ actor CoreHost {
     }
     private func finish() {
         stopped = true
+        summaryDrain?.cancel(); summaryDrain = nil; summaries.clear()
         continuation.finish()
         pump?.cancel()
         pump = nil
@@ -376,6 +396,7 @@ actor CoreHost {
             if let bytes = try? JSONEncoder().encode(event) { _ = try? core.handle(bytes) }
         }
         continuation.finish()
+        summaryDrain?.cancel()
         pump?.cancel()
         timers.values.forEach { $0.cancel() }
         transport.stop()

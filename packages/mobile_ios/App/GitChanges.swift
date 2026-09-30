@@ -178,11 +178,9 @@ struct GitThreadDot: View {
             if let summary, summary.files > 0 {
                 Circle().fill(summary.attention > 0 ? VerdeTheme.warning : VerdeTheme.accent).frame(width: 6, height: 6).accessibilityLabel("\(summary.files) uncommitted files")
             }
-        }.task(id: browse.hostID) {
-            guard let session = browse.session else { return }
-            await session.start()
-            try? await session.host?.send(.git_summary_refresh(EventGitSummaryRefresh(now_ms: 0, wall_time_ms: 0, intent_id: UUID().uuidString, workspace_id: workspace)))
         }
+        // Rows only read cached summaries. Opening a chat subscribes its workspace
+        // through GitChangesModel.start; a drawer must not scan every workspace.
     }
 }
 
