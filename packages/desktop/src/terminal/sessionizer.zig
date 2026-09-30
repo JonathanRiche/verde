@@ -3177,7 +3177,11 @@ pub const Daemon = struct {
                     .request_id = stable_request_id,
                     .provider = link_request.provider,
                     .external_descriptor = descriptor,
-                    .now_seconds = @divFloor(nowMs(), std.time.ms_per_s),
+                    .now_seconds_fn = struct {
+                        fn now() i64 {
+                            return @divFloor(nowMs(), std.time.ms_per_s);
+                        }
+                    }.now,
                 }) catch |err| return try self.recordConnectRetry(id_value, service, state.retry_attempt, err);
                 defer linked.deinit(arena);
                 lockStoreService(service);

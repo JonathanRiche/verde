@@ -20,6 +20,7 @@ test {
     _ = @import("daemon/access_store.zig");
     _ = @import("daemon/connect_store.zig");
     _ = @import("daemon/connect_grants.zig");
+    _ = @import("daemon/connect_lifecycle.zig");
     _ = @import("daemon/repository_path.zig");
     _ = @import("daemon/shell_command.zig");
     _ = @import("daemon/workspace_file_search.zig");

@@ -20,7 +20,8 @@ pub const LinkInput = struct {
     request_id: []const u8,
     provider: []const u8,
     external_descriptor: ?connect.RuntimeDescriptor,
-    now_seconds: i64,
+    /// Sample when signing, after the bounded discovery/challenge exchanges.
+    now_seconds_fn: *const fn () i64,
 };
 
 pub const LinkResult = struct {
@@ -184,8 +185,9 @@ pub fn link(
         !validBase64Url43(challenge.value.nonce) or
         !validPrincipal(challenge.value.principal)) return error.InvalidControlPlaneResponse;
     const challenge_expiry = try parseRfc3339Seconds(challenge.value.expires_at);
-    const proof_expiry = @min(challenge_expiry, input.now_seconds + 60);
-    if (proof_expiry <= input.now_seconds) return error.LinkChallengeExpired;
+    const proof_now = input.now_seconds_fn();
+    const proof_expiry = @min(challenge_expiry, proof_now + 60);
+    if (proof_expiry <= proof_now) return error.LinkChallengeExpired;
     const signing_thumbprint = try crypto.thumbprintAlloc(allocator, "Ed25519", &signing_public);
     defer allocator.free(signing_thumbprint);
     const encryption_thumbprint = try crypto.thumbprintAlloc(allocator, "X25519", &keys.encryption.public_key);
@@ -205,8 +207,8 @@ pub fn link(
         .sub = input.runtime_id,
         .aud = challenge.value.audience,
         .jti = challenge.value.challenge_id,
-        .iat = input.now_seconds,
-        .nbf = input.now_seconds,
+        .iat = proof_now,
+        .nbf = proof_now,
         .exp = proof_expiry,
     }, .{});
     defer allocator.free(link_payload);
@@ -258,7 +260,8 @@ pub fn link(
     }
     _ = parseRfc3339Seconds(linked.value.created_at) catch return error.InvalidControlPlaneResponse;
 
-    const expires_at = try formatRfc3339Alloc(allocator, input.now_seconds + 90);
+    const enrollment_now = input.now_seconds_fn();
+    const expires_at = try formatRfc3339Alloc(allocator, enrollment_now + 90);
     defer allocator.free(expires_at);
     const unsigned_enrollment = .{
         .contract_version = connect.CONTRACT_VERSION,
@@ -287,9 +290,9 @@ pub fn link(
         .sub = input.runtime_id,
         .aud = discovery.value().issuer,
         .jti = input.request_id,
-        .iat = input.now_seconds,
-        .nbf = input.now_seconds,
-        .exp = input.now_seconds + 90,
+        .iat = enrollment_now,
+        .nbf = enrollment_now,
+        .exp = enrollment_now + 90,
     }, .{});
     defer allocator.free(enrollment_payload);
     const enrollment_proof = try crypto.signCompactAlloc(
@@ -347,7 +350,7 @@ pub fn link(
     if (enrollment.value.connector_enrollment) |sealed| {
         const connector_expiry = parseRfc3339Seconds(sealed.expires_at) catch
             return error.InvalidControlPlaneResponse;
-        if (connector_expiry <= input.now_seconds) return error.ConnectorEnrollmentExpired;
+        if (connector_expiry <= input.now_seconds_fn()) return error.ConnectorEnrollmentExpired;
         const owned_connector = connector orelse return error.ConnectorAdapterUnavailable;
         const plaintext = try crypto.decryptConnectorJweAlloc(
             allocator,
@@ -570,4 +573,90 @@ test "request IDs are canonical and generated from secure entropy" {
     const id = try randomRequestId(std.testing.io);
     try validateRequestId(&id);
     try std.testing.expectError(error.InvalidConnectRequestId, validateRequestId("req_NOT_HEX"));
+}
+
+test "native link signs with fresh time after delayed challenge and rejects expired challenge" {
+    const Fixture = struct {
+        var seconds: i64 = 1_893_456_000;
+        keys: *crypto.RuntimeKeys,
+        expire: bool,
+        verified: bool = false,
+
+        fn now() i64 {
+            return seconds;
+        }
+
+        fn send(raw: *anyopaque, allocator: std.mem.Allocator, request: client_mod.Request) !client_mod.Response {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (std.mem.endsWith(u8, request.url, "/.well-known/verde-connect-configuration")) {
+                return .{ .status = .ok, .body = try allocator.dupe(u8,
+                    \\{"contract_version":"1","issuer":"https://connect.example.test","api_base_url":"https://connect.example.test","oidc":{"issuer":"https://id.example.test","authorization_endpoint":"https://id.example.test/auth","token_endpoint":"https://id.example.test/token","public_client":{"client_id":"verde","scopes":["openid"],"redirect_uris":["http://127.0.0.1:48123/callback"],"response_type":"code","token_endpoint_auth_method":"none"},"code_challenge_methods_supported":["S256"],"headless_authorization":{"supported":false}},"jwks_uri":"https://connect.example.test/v1/.well-known/jwks.json","signer_metadata_url":"https://connect.example.test/v1/signer-metadata","capabilities":["runtime-link-proof-ed25519","inventory-v1","bootstrap-grant-eddsa","connector-credential-jwe-x25519","endpoint-external"]}
+                ) };
+            }
+            if (std.mem.endsWith(u8, request.url, "/v1/signer-metadata")) {
+                return .{ .status = .ok, .body = try allocator.dupe(u8,
+                    \\{"contract_version":"1","issuer":"https://connect.example.test","jwks_uri":"https://connect.example.test/v1/.well-known/jwks.json","algorithms":["EdDSA"],"maximum_grant_lifetime_seconds":300}
+                ) };
+            }
+            if (std.mem.endsWith(u8, request.url, "/v1/runtime-links/challenges")) {
+                // The challenge arrives after lookup/network delay, without a
+                // wall-clock sleep. Sampling before these requests is stale.
+                seconds = if (self.expire) 1_893_456_090 else 1_893_456_003;
+                return .{ .status = .created, .body = try allocator.dupe(u8,
+                    \\{"contract_version":"1","challenge_id":"chl_11111111111111111111111111111111","audience":"https://connect.example.test","principal":{"issuer":"https://id.example.test","subject":"fixture"},"nonce":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","expires_at":"2030-01-01T00:01:00.000Z"}
+                ) };
+            }
+            if (std.mem.endsWith(u8, request.url, "/v1/runtime-links")) {
+                var body = try std.json.parseFromSlice(std.json.Value, allocator, request.body.?, .{});
+                defer body.deinit();
+                const jwt = body.value.object.get("proof_jwt").?.string;
+                var parts = std.mem.splitScalar(u8, jwt, '.');
+                _ = parts.next().?;
+                const encoded_payload = parts.next().?;
+                const encoded_signature = parts.next().?;
+                try std.testing.expect(parts.next() == null);
+                const payload = try crypto.base64UrlDecodeAlloc(allocator, encoded_payload);
+                defer allocator.free(payload);
+                var claims = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+                defer claims.deinit();
+                try std.testing.expectEqual(@as(i64, 1_893_456_003), claims.value.object.get("iat").?.integer);
+                try std.testing.expectEqual(seconds, claims.value.object.get("nbf").?.integer);
+                try std.testing.expectEqual(@as(i64, 1_893_456_060), claims.value.object.get("exp").?.integer);
+                const signature = try crypto.base64UrlDecodeAlloc(allocator, encoded_signature);
+                defer allocator.free(signature);
+                try std.testing.expectEqual(@as(usize, 64), signature.len);
+                // Verify the actual native Ed25519 proof, not just JSON fields.
+                try std.crypto.sign.Ed25519.Signature.fromBytes(signature[0..64].*).verify(
+                    jwt[0 .. jwt.len - encoded_signature.len - 1],
+                    self.keys.signing.public_key,
+                );
+                self.verified = true;
+                return error.FixtureProofVerified;
+            }
+            return error.UnexpectedFixtureRequest;
+        }
+    };
+    var keys = crypto.RuntimeKeys.generate(std.testing.io);
+    defer keys.clear();
+    for ([_]bool{ false, true }) |expired| {
+        Fixture.seconds = 1_893_456_000;
+        var fixture: Fixture = .{ .keys = &keys, .expire = expired };
+        const result = link(std.testing.allocator, .{ .context = &fixture, .send_fn = Fixture.send }, &keys, null, .{
+            .control_plane_url = "https://connect.example.test",
+            .bearer_token = "synthetic-offline-fixture-token",
+            .runtime_id = "11111111111111111111111111111111",
+            .instance_id = "22222222222222222222222222222222",
+            .request_id = "req_33333333333333333333333333333333",
+            .provider = "noop_test",
+            .external_descriptor = null,
+            .now_seconds_fn = Fixture.now,
+        });
+        if (expired) {
+            try std.testing.expectError(error.LinkChallengeExpired, result);
+            try std.testing.expect(!fixture.verified);
+        } else {
+            try std.testing.expectError(error.FixtureProofVerified, result);
+            try std.testing.expect(fixture.verified);
+        }
+    }
 }
