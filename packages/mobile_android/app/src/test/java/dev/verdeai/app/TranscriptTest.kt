@@ -65,7 +65,7 @@ class TranscriptTest {
     private var drawerOpens = 0
     private val headerActions = mutableListOf<Pair<ThreadSummary, String>>()
     private val openedThreads = mutableListOf<String>()
-    private fun launch(workspace: String = WS, thread: String = THREAD, withHeader: Boolean = false, canEdit: Boolean = true) {
+    private fun launch(workspace: String = WS, thread: String = THREAD, withHeader: Boolean = false, canEdit: Boolean = true, unfocusDelayMs: Long = 50) {
         store.values[HostsModel.CATALOG_KEY]=CoreJson.encodeToString(HostCatalog(listOf(SavedHost("alpha","Studio")), "alpha"))
         compose.runOnUiThread {
             val provider=ViewModelProvider(models, object : ViewModelProvider.Factory {
@@ -76,7 +76,7 @@ class TranscriptTest {
                         CoreHost.create(dev.verdeai.core.Config(1,saved.id,saved.label,null,null,1,"",0uL), EffectExecutor(store,saved.id), fake)
                     }
                     BrowseModel::class.java -> BrowseModel(hosts, null, signals, wallClock={ NOW })
-                    else -> TranscriptModel(hosts, browse.state, workspace, thread, unfocusDelayMs=50)
+                    else -> TranscriptModel(hosts, browse.state, workspace, thread, unfocusDelayMs=unfocusDelayMs)
                 } as T
             })
             hosts=provider[HostsModel::class.java]
@@ -309,6 +309,20 @@ class TranscriptTest {
         repeat(20) { pump() }
         compose.waitForIdle()
         assertEquals(1, focuses().count { it.thread_id == null })
+    }
+
+    @Test fun quickReturnReclaimsFocusFromAnotherScreenBeforeUnfocusDebounce() {
+        launch(unfocusDelayMs = 60_000)
+        awaitText("History 44")
+        compose.runOnIdle { transcript.setVisible(false) }
+        pump()
+        compose.runOnIdle { FocusClaim.owner = Any(); transcript.setVisible(true) }
+        await { focuses().count { it.thread_id == THREAD } == 2 }
+        assertSame(transcript, FocusClaim.owner)
+        assertEquals(0, focuses().count { it.thread_id == null })
+        deliver { }
+        compose.waitForIdle()
+        assertEquals(2, focuses().count { it.thread_id == THREAD })
     }
 
     @Test fun orchestrationEnvelopesRenderAsCardsAndParentSteers() {

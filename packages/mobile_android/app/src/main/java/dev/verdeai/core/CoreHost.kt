@@ -10,6 +10,9 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import java.util.Base64
 import kotlinx.serialization.json.decodeFromJsonElement
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -58,6 +61,7 @@ class CoreHost private constructor(
     private val traceMetadata: ((String) -> Unit)?,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + dispatcher)
+    private val tracedRequests = mutableMapOf<String, Pair<String, Long>>()
     private var closed = false
     private val closing = AtomicBoolean(false)
     private val mutableViews = MutableStateFlow<Map<String, JsonElement>>(emptyMap())
@@ -203,6 +207,9 @@ class CoreHost private constructor(
         if (trace && event is EventHttpResponse && (event.error != null || event.status !in 200..299)) {
             traceMetadata?.invoke("http_status=${event.status} failure=${event.error?.kind} code=${event.error?.code}")
         }
+        if (trace && event is EventHttpResponse) tracedRequests.remove(event.effect_id)?.let { (kind, start) ->
+            traceMetadata?.invoke("rpc_kind=$kind elapsed_ms=${(started-start)/1_000_000} status=${event.status} failure=${event.error?.code}")
+        }
         val eventKind = when (event) {
             is EventDraftSet -> "draft"
             is EventSend -> "send"
@@ -254,7 +261,17 @@ class CoreHost private constructor(
                 }
                 mutableViews.value = updated.toMap()
             } else if (effect is EffectTerminalOutput) terminalOutput(effect)
-            else executor.execute(effect)
+            else {
+                if (trace && effect is EffectHttpRequest) {
+                    val method = try { effect.body_base64?.let { CoreJson.parseToJsonElement(Base64.getDecoder().decode(it).decodeToString()).jsonObject["method"]?.jsonPrimitive?.content } } catch (_: Exception) { null }
+                    val kind = when (method) {
+                        "git.changes.summary", "git.changes.status", "chat.thread.get", "chat.message.list", "chat.turn.tail", "chat.thread.list", "provider.models.list", "core.snapshot", "core.changes", "daemon.changes", "chat.catalog.list" -> method
+                        else -> "other"
+                    }
+                    if (tracedRequests.size < 512) tracedRequests[effect.effect_id] = kind to System.nanoTime()
+                }
+                executor.execute(effect)
+            }
         }
         if (trace) traceMetadata?.invoke("core_event=$eventKind handle_ms=${(handled-started)/1_000_000} publish_ms=${(System.nanoTime()-handled)/1_000_000} queries=$queries")
         if (event is EventTerminalInput) executor.recordTerminalTiming(TerminalTimingStage.InputDispatch, started)
