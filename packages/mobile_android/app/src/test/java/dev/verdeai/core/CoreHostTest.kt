@@ -146,6 +146,29 @@ class CoreHostTest {
         override fun close() { server.shutdown(); client.dispatcher.executorService.shutdown(); client.connectionPool.evictAll() }
     }
 
+    @Test fun rpcTimingContainsOnlyAllowlistedMetadata() = runBlocking<Unit> {
+        TlsFixture().use { fixture ->
+            val core = FakeCore()
+            val traces = java.util.concurrent.CopyOnWriteArrayList<String>()
+            val host = CoreHost.create(config, executor(client=fixture.client), core, traceMetadata=traces::add)
+            try {
+                for (method in listOf("chat.message.list", "private-method")) {
+                    fixture.server.enqueue(MockResponse().setBody("private-response"))
+                    val body = """{"method":"$method","params":{"token":"private-token","text":"private-content"}}"""
+                    core.effects = listOf(fixture.http("private-effect-id").copy(
+                        body_base64=Base64.getEncoder().encodeToString(body.encodeToByteArray())))
+                    start(host)
+                    assertEquals(200, core.next<EventHttpResponse>().status)
+                }
+                val timings = traces.filter { it.startsWith("rpc_kind=") }
+                assertEquals(2, timings.size)
+                assertTrue(timings[0].startsWith("rpc_kind=chat.message.list elapsed_ms="))
+                assertTrue(timings[1].startsWith("rpc_kind=other elapsed_ms="))
+                assertTrue(traces.none { "private-" in it })
+            } finally { host.close() }
+        }
+    }
+
     @Test fun parkedResponseUsesTheCoreDeadlineInsteadOfTheClientsShortReadTimeout() = runBlocking<Unit> {
         TlsFixture().use { fixture ->
             val core = FakeCore()

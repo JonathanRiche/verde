@@ -180,7 +180,12 @@ internal class TranscriptModel(
     catch (_: Exception) { mutableState.update { it.copy(fatal=true) }; false }
 
     /** The screen is on display; focus (and so K-17 attention clearing) follows it. */
-    fun setVisible(shown: Boolean) { visible.value = shown }
+    fun setVisible(shown: Boolean) {
+        // A quick return can cancel delayed unfocus after another surface claimed the slot.
+        // Reclaim only on entry, never in response to unrelated host/receipt updates.
+        if (shown && !visible.value && FocusClaim.owner !== this) focused = false
+        visible.value = shown
+    }
 
     /** Explicit user retry: re-focus reloads the newest page and restarts the live tail. */
     fun retry() {
