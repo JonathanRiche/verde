@@ -33,6 +33,8 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
@@ -54,6 +56,7 @@ internal class TranscriptContext(
     val threads: List<ThreadSummary> = emptyList(),
     /** Opens another chat in this workspace by thread id; null when navigation is unavailable. */
     val onOpenThread: ((String) -> Unit)? = null,
+    val git: GitChangesModel? = null,
 )
 
 /**
@@ -128,9 +131,14 @@ internal fun ThreadRoute(hosts: HostsModel, browse: BrowseModel, manage: ManageM
     val threads = browseState.workspaces?.items?.find { it.workspace_id == workspaceId }?.threads.orEmpty()
     val title = threads.find { it.thread_id == threadId }?.title
     val manageState by manage.state.collectAsState()
+    val gitClient = LocalGitChangesClient.current
+    val git = if (gitClient == null) null else viewModel<GitChangesModel>(key = "git:${browseState.hostId}:${System.identityHashCode(gitClient)}:$workspaceId:$threadId",
+        factory = viewModelFactory { initializer { GitChangesModel(GitChat(workspaceId, threadId), gitClient) } })
+    val lifecycleState by LocalLifecycleOwner.current.lifecycle.currentStateFlow.collectAsState()
+    LaunchedEffect(git, lifecycleState) { if (lifecycleState == Lifecycle.State.RESUMED) git?.focus() }
     TranscriptScreen(model, title, onBack, onHosts, browse::refresh, onCitation,
         canEditThread = manageState.view?.can_create_threads == true, onThreadAction = onThreadAction,
-        threads = threads, onOpenThread = onOpenThread, bottomBar = { m, s -> ChatComposer(m, s) })
+        gitChanges = git, threads = threads, onOpenThread = onOpenThread, bottomBar = { m, s -> ChatComposer(m, s) })
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -147,6 +155,7 @@ internal fun TranscriptScreen(
     onThreadAction: ((ThreadSummary, String) -> Unit)? = null,
     threads: List<ThreadSummary> = emptyList(),
     onOpenThread: ((String) -> Unit)? = null,
+    gitChanges: GitChangesModel? = null,
     /** D-08 swaps in the composer; the default is the stop bar. */
     bottomBar: @Composable (TranscriptModel, TranscriptState) -> Unit = { m, s -> StopBar(m, s) },
 ) {
@@ -157,9 +166,10 @@ internal fun TranscriptScreen(
     }
     val items = remember(state.thread) { state.thread?.let(::transcriptItems).orEmpty() }
     val now = rememberNow(state.turn?.started_at_ms != null)
-    val context = TranscriptContext(model, now, onCitation, state.turn?.started_at_ms, threads, onOpenThread)
+    val context = TranscriptContext(model, now, onCitation, state.turn?.started_at_ms, threads, onOpenThread, gitChanges)
     val openDrawer = LocalWorkspaceMenu.current
     var chatMenu by remember { mutableStateOf(false) }
+    Box(Modifier.fillMaxSize()) {
     Column(Modifier.fillMaxSize()) {
         VerdeTopBar(
             title = {
@@ -195,6 +205,7 @@ internal fun TranscriptScreen(
                     }
                 }
             })
+        gitChanges?.let { GitChangesHeader(it) }
         transcriptBanner(state, now)?.let { banner ->
             BannerCard(banner, onRetry = { if (state.thread?.error != null) model.retry() else onRetryConnection() }, onHosts = onHosts)
         }
@@ -205,6 +216,8 @@ internal fun TranscriptScreen(
             }
         }
         bottomBar(model, state)
+    }
+    gitChanges?.let { GitChangesLayer(it) }
     }
 }
 
@@ -469,6 +482,10 @@ internal fun ThinkCard(row: ChatRow, ctx: TranscriptContext) {
 
 @Composable
 internal fun NoticeRow(row: ChatRow, ctx: TranscriptContext) {
+    if (isGitCommitRow(row)) {
+        GitCommitNotice(row.body, ctx.git)
+        return
+    }
     val colors = MaterialTheme.colorScheme
     Column(Modifier.fillMaxWidth().background(colors.secondaryContainer.copy(alpha = 0.6f), RoundedCornerShape(10.dp))
         .padding(horizontal = 12.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {

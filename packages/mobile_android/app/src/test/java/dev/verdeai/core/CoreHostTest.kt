@@ -71,12 +71,14 @@ class CoreHostTest {
         val core = FakeCore()
         core.queryStatus = 1
         core.effects = listOf(EffectStateChanged("view", "1", "1", listOf("hosts")))
-        val host = CoreHost.create(config, executor(), core)
+        val traces = java.util.concurrent.CopyOnWriteArrayList<String>()
+        val host = CoreHost.create(config, executor(), core, traceMetadata=traces::add)
         try {
             try { start(host); fail("Expected batch failure") }
             catch (_: CoreFailure) { }
             assertTrue(host.failed.value)
             assertTrue(core.freed)
+            assertEquals(listOf("core_failure kind=native status=1"), traces.filter { it.startsWith("core_failure") })
         } finally { host.close() }
     }
 
@@ -142,6 +144,27 @@ class CoreHostTest {
         val origin get() = server.url("/").toString().removeSuffix("/")
         fun http(id: String = "http", pin: String = this.pin, cap: Long = 1000) = EffectHttpRequest(id,"1","POST",server.url("/api/rpc").toString(),emptyList(),"e30=",3000,cap,Tls(origin,pin))
         override fun close() { server.shutdown(); client.dispatcher.executorService.shutdown(); client.connectionPool.evictAll() }
+    }
+
+    @Test fun parkedResponseUsesTheCoreDeadlineInsteadOfTheClientsShortReadTimeout() = runBlocking<Unit> {
+        TlsFixture().use { fixture ->
+            val core = FakeCore()
+            val client = fixture.client.newBuilder().readTimeout(100, TimeUnit.MILLISECONDS).build()
+            val host = CoreHost.create(config, executor(client=client), core)
+            try {
+                fixture.server.enqueue(MockResponse().setHeadersDelay(400, TimeUnit.MILLISECONDS).setBody("{}"))
+                core.effects = listOf(fixture.http("parked"))
+                start(host)
+                val response = core.next<EventHttpResponse>()
+                assertEquals(200, response.status)
+                assertNull(response.error)
+                fixture.server.takeRequest(2, TimeUnit.SECONDS)
+                fixture.server.enqueue(MockResponse().setHeadersDelay(600, TimeUnit.MILLISECONDS).setBody("{}"))
+                core.effects = listOf(fixture.http("deadline").copy(timeout_ms=200))
+                host.send { n,w -> EventForeground(now_ms=n, wall_time_ms=w) }
+                assertNotNull(core.next<EventHttpResponse>().error)
+            } finally { host.close() }
+        }
     }
 
     @Test fun fileFetchKeepsTheBodyInMemoryAndReportsOnlyTheStatus() = runBlocking<Unit> {

@@ -43,13 +43,15 @@ private fun shellLike(body: String): Boolean {
     return listOf("/usr/bin/bash", "/bin/bash", "bash -lc", "/usr/bin/env bash", "/bin/sh -lc", "/usr/bin/sh").any { t.startsWith(it) }
 }
 
+internal fun isGitCommitRow(row: ChatRow) = row.role == "system" && row.author == "git" && row.id.startsWith("git-commit-")
+
 internal fun isDiffRow(row: ChatRow) = row.role == "system" && row.author == "Changed files" && row.body.startsWith(DIFF_MARKER)
 
 internal fun isThinkRow(row: ChatRow) = row.role == "system" && (row.tool?.kind == "think" ||
     (row.tool == null && row.kind == "tool" && (row.author == "Think" || row.author == "Thinking")))
 
 internal fun isCommandRow(row: ChatRow): Boolean {
-    if (row.role != "system") return false
+    if (row.role != "system" || isGitCommitRow(row)) return false
     if (row.tool?.kind == "subagent" || row.author == "Subagent") return true
     if (row.tool != null && row.tool.kind != "think") return true
     return row.author == "Ran command" || row.author == "Command failed" || shellLike(row.body)

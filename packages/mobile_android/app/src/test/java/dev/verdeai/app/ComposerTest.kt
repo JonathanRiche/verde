@@ -256,6 +256,34 @@ class ComposerTest {
         assertEquals("fixture-turn", sent<EventTurnCancel>().single().turn_id)
     }
 
+    @Test fun deliveredSteerDisappearsButUncertainDeliveryRemainsVisible() {
+        setup={ it.running() }
+        launch()
+        type("synthetic steer")
+        send().performClick()
+        awaitText("Steer follow-up")
+        compose.runOnUiThread { core.followupDelivery("sent_inline", "uncertain"); browse.refresh() }
+        awaitText("Unconfirmed")
+        compose.onNodeWithTag(COMPOSER_FOLLOWUP).assertExists()
+        compose.runOnUiThread { core.followupDelivery("sent_inline", "accepted"); browse.refresh() }
+        await { transcript.state.value.composer?.followup?.delivery == "accepted" }
+        compose.onNodeWithTag(COMPOSER_FOLLOWUP).assertDoesNotExist()
+        assertFalse(exists("Steer delivered"))
+        assertTrue(sent<EventFollowupCancel>().isEmpty())
+        assertTrue(sent<EventFollowupRetry>().isEmpty())
+    }
+
+    @Test fun acceptedNextTurnFollowupStaysVisible() {
+        setup={ it.running() }
+        launch()
+        type("synthetic follow-up")
+        send().performClick()
+        awaitText("Steer follow-up")
+        compose.runOnUiThread { core.followupDelivery("fallback_next_turn", "accepted"); browse.refresh() }
+        awaitText("Queued follow-up")
+        compose.onNodeWithTag(COMPOSER_FOLLOWUP).assertExists()
+    }
+
     @Test fun bangCommandsNeedConfirmationBeforeRunning() {
         launch()
         type("!ls -la")
@@ -420,6 +448,9 @@ class ComposerTest {
         fun running() {
             thread=decode("thread-running")
             view=view.copy(can_send=false, can_stop=true)
+        }
+        fun followupDelivery(state: String, delivery: String) {
+            view = view.copy(followup = view.followup!!.copy(state = state, delivery = delivery))
         }
         fun fresh() {
             thread=thread.copy(data=thread.data!!.copy(rows=emptyList()))
