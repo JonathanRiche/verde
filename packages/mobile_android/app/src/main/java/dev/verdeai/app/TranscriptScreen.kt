@@ -50,6 +50,10 @@ internal class TranscriptContext(
     val onCitation: (FileCitation) -> Unit,
     /** The core's active turn start, for running-tool timers; null when idle. */
     val turnStartedAt: Long? = null,
+    /** Workspace chats, to name child chats in orchestration cards. */
+    val threads: List<ThreadSummary> = emptyList(),
+    /** Opens another chat in this workspace by thread id; null when navigation is unavailable. */
+    val onOpenThread: ((String) -> Unit)? = null,
 )
 
 /**
@@ -66,6 +70,7 @@ internal data class TranscriptRenderers(
     val usage: @Composable (TranscriptItem.Usage, TranscriptContext) -> Unit = { item, _ -> UsageCard(item.usage) },
     val working: @Composable (TranscriptItem.Working, TranscriptContext) -> Unit = { item, ctx -> WorkingRow(item, ctx) },
     val approval: @Composable (TranscriptItem.Approval, TranscriptContext) -> Unit = ApprovalRenderer,
+    val childNotice: @Composable (TranscriptItem.ChildNotice, TranscriptContext) -> Unit = { item, ctx -> ChildNotificationCard(item, ctx) },
 ) {
     @Composable
     fun Render(item: TranscriptItem, ctx: TranscriptContext) = when (item) {
@@ -78,6 +83,7 @@ internal data class TranscriptRenderers(
         is TranscriptItem.Usage -> usage(item, ctx)
         is TranscriptItem.Working -> working(item, ctx)
         is TranscriptItem.Approval -> approval(item, ctx)
+        is TranscriptItem.ChildNotice -> childNotice(item, ctx)
     }
 
     companion object { val Default = TranscriptRenderers() }
@@ -114,14 +120,17 @@ internal fun transcriptPlaceholder(state: TranscriptState): TranscriptPlaceholde
 /** Navigation entry: one [TranscriptModel] per back-stack entry, bound to the selected host. */
 @Composable
 internal fun ThreadRoute(hosts: HostsModel, browse: BrowseModel, manage: ManageModel, workspaceId: String, threadId: String, onHosts: () -> Unit,
-                         onCitation: (FileCitation) -> Unit = {}, onThreadAction: (ThreadSummary, String) -> Unit, onBack: () -> Unit) {
+                         onCitation: (FileCitation) -> Unit = {}, onThreadAction: (ThreadSummary, String) -> Unit,
+                         onOpenThread: ((String) -> Unit)? = null, onBack: () -> Unit) {
     val model: TranscriptModel = viewModel(key = "transcript:$workspaceId:$threadId",
         factory = viewModelFactory { initializer { TranscriptModel(hosts, browse.state, workspaceId, threadId) } })
     val browseState by browse.state.collectAsState()
-    val title = browseState.workspaces?.items?.find { it.workspace_id == workspaceId }?.threads?.find { it.thread_id == threadId }?.title
+    val threads = browseState.workspaces?.items?.find { it.workspace_id == workspaceId }?.threads.orEmpty()
+    val title = threads.find { it.thread_id == threadId }?.title
     val manageState by manage.state.collectAsState()
     TranscriptScreen(model, title, onBack, onHosts, browse::refresh, onCitation,
-        canEditThread = manageState.view?.can_create_threads == true, onThreadAction = onThreadAction, bottomBar = { m, s -> ChatComposer(m, s) })
+        canEditThread = manageState.view?.can_create_threads == true, onThreadAction = onThreadAction,
+        threads = threads, onOpenThread = onOpenThread, bottomBar = { m, s -> ChatComposer(m, s) })
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -136,6 +145,8 @@ internal fun TranscriptScreen(
     renderers: TranscriptRenderers = TranscriptRenderers.Default,
     canEditThread: Boolean = false,
     onThreadAction: ((ThreadSummary, String) -> Unit)? = null,
+    threads: List<ThreadSummary> = emptyList(),
+    onOpenThread: ((String) -> Unit)? = null,
     /** D-08 swaps in the composer; the default is the stop bar. */
     bottomBar: @Composable (TranscriptModel, TranscriptState) -> Unit = { m, s -> StopBar(m, s) },
 ) {
@@ -146,7 +157,7 @@ internal fun TranscriptScreen(
     }
     val items = remember(state.thread) { state.thread?.let(::transcriptItems).orEmpty() }
     val now = rememberNow(state.turn?.started_at_ms != null)
-    val context = TranscriptContext(model, now, onCitation, state.turn?.started_at_ms)
+    val context = TranscriptContext(model, now, onCitation, state.turn?.started_at_ms, threads, onOpenThread)
     val openDrawer = LocalWorkspaceMenu.current
     var chatMenu by remember { mutableStateOf(false) }
     Column(Modifier.fillMaxSize()) {
@@ -299,11 +310,14 @@ internal fun MessageRow(row: ChatRow, ctx: TranscriptContext) {
     @Suppress("DEPRECATION") val clipboard = LocalClipboardManager.current
     var menu by remember { mutableStateOf(false) }
     val mine = row.role == "user"
+    // Steers from an orchestrating parent agent show only its words, labelled as the parent.
+    val steer = remember(row.role, row.body) { parentSteerBody(row.role, row.body) }
+    val body = steer ?: row.body
     val colors = MaterialTheme.colorScheme
     Box(Modifier.fillMaxWidth(), contentAlignment = if (mine) Alignment.CenterEnd else Alignment.CenterStart) {
         Column(
             Modifier.fillMaxWidth()
-                .background(if (mine) VerdeColors.UserBubble else VerdeColors.Assistant, RoundedCornerShape(10.dp))
+                .background(when { steer != null -> VerdeColors.Panel; mine -> VerdeColors.UserBubble; else -> VerdeColors.Assistant }, RoundedCornerShape(10.dp))
                 .border(1.dp, if (mine) VerdeColors.UserBubble else VerdeColors.Border, RoundedCornerShape(10.dp))
                 .combinedClickable(onClick = {}, onLongClickLabel = "Copy message", onLongClick = { menu = true })
                 .padding(horizontal = 12.dp, vertical = 10.dp),
@@ -311,21 +325,21 @@ internal fun MessageRow(row: ChatRow, ctx: TranscriptContext) {
         ) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 if (!mine) ProviderGlyph(row.author, Modifier.size(16.dp))
-                Text(if (mine) "You" else row.author.ifEmpty { "Assistant" }, style = MaterialTheme.typography.labelMedium,
-                    color = colors.onSurfaceVariant)
+                Text(when { steer != null -> "Parent agent"; mine -> "You"; else -> row.author.ifEmpty { "Assistant" } },
+                    style = MaterialTheme.typography.labelMedium, color = if (steer != null) colors.primary else colors.onSurfaceVariant)
                 deliveryLabel(row.delivery)?.let {
                     Text(it, style = MaterialTheme.typography.labelSmall, color = if (row.delivery == "failed") colors.error else colors.outline)
                 }
             }
             if (row.attachments.isNotEmpty()) Attachments(row.attachments)
-            if (row.body.isNotEmpty()) {
+            if (body.isNotEmpty()) {
                 // User text is shown verbatim (web parity); assistant output goes through the core AST.
-                if (mine) Text(row.body, style = MaterialTheme.typography.bodyLarge)
+                if (mine) Text(body, style = MaterialTheme.typography.bodyLarge)
                 else MarkdownText(streamTail(row), ctx.model, ctx.onCitation)
             }
         }
         DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-            DropdownMenuItem(text = { Text("Copy message") }, onClick = { menu = false; clipboard.setText(AnnotatedString(row.body)) })
+            DropdownMenuItem(text = { Text("Copy message") }, onClick = { menu = false; clipboard.setText(AnnotatedString(body)) })
         }
     }
 }
@@ -460,6 +474,64 @@ internal fun NoticeRow(row: ChatRow, ctx: TranscriptContext) {
         .padding(horizontal = 12.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
         if (row.author.isNotEmpty()) Text(row.author, style = MaterialTheme.typography.labelSmall, color = colors.onSecondaryContainer)
         MarkdownText(row.body, ctx.model, ctx.onCitation)
+    }
+}
+
+internal fun providerLabel(provider: String) =
+    PROVIDERS.firstOrNull { it.first == provider.lowercase() }?.second ?: provider.replaceFirstChar { it.uppercase() }
+
+@Composable
+internal fun childStatusColor(status: ChildStatus): Color = when (status) {
+    ChildStatus.Running, ChildStatus.Completed -> MaterialTheme.colorScheme.primary
+    ChildStatus.WaitingApproval, ChildStatus.Blocked -> VerdeColors.Warning
+    ChildStatus.Failed -> MaterialTheme.colorScheme.error
+    ChildStatus.Idle, ChildStatus.Aborted, ChildStatus.Interrupted -> MaterialTheme.colorScheme.outline
+}
+
+/** A child chat's result in its orchestrating parent: neutral card, child identity, reply markdown. */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+internal fun ChildNotificationCard(item: TranscriptItem.ChildNotice, ctx: TranscriptContext) {
+    @Suppress("DEPRECATION") val clipboard = LocalClipboardManager.current
+    val notification = item.notification
+    val child = ctx.threads.find { it.thread_id == notification.childId }
+    val title = child?.title?.ifEmpty { null } ?: notification.childId
+    var menu by remember { mutableStateOf(false) }
+    var expanded by rememberSaveable(item.key) { mutableStateOf(false) }
+    val (preview, collapsible) = remember(notification.reply) { childReplyPreview(notification.reply) }
+    val colors = MaterialTheme.colorScheme
+    val open = ctx.onOpenThread?.let { { it(notification.childId) } }
+    Box(Modifier.fillMaxWidth()) {
+        Column(Modifier.fillMaxWidth()
+            .background(VerdeColors.Panel, RoundedCornerShape(10.dp))
+            .border(1.dp, VerdeColors.Border, RoundedCornerShape(10.dp))
+            .combinedClickable(onClick = {}, onLongClickLabel = "Copy reply", onLongClick = { menu = true })) {
+            Row(Modifier.fillMaxWidth()
+                .then(if (open != null) Modifier.clickable(onClickLabel = "Open chat", onClick = open) else Modifier)
+                .heightIn(min = 44.dp).padding(start = 12.dp, end = if (open != null) 4.dp else 12.dp),
+                verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                ProviderGlyph(child?.provider, Modifier.size(16.dp))
+                Text(title, Modifier.weight(1f), style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                child?.provider?.takeIf { it.isNotEmpty() }?.let {
+                    Text(providerLabel(it), style = MaterialTheme.typography.labelMedium, color = colors.onSurfaceVariant, maxLines = 1)
+                }
+                Text(notification.status.label, style = MaterialTheme.typography.labelMedium, color = childStatusColor(notification.status), maxLines = 1)
+                if (open != null) TextButton(onClick = open, contentPadding = PaddingValues(horizontal = 8.dp)) {
+                    Text("Open chat", style = MaterialTheme.typography.labelMedium)
+                }
+            }
+            Column(Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, bottom = if (collapsible) 0.dp else 10.dp)) {
+                val text = if (expanded || !collapsible) notification.reply.trim() else preview
+                if (text.isNotEmpty()) MarkdownText(text, ctx.model, ctx.onCitation)
+                else Text("No reply", style = MaterialTheme.typography.bodySmall, color = colors.outline)
+            }
+            if (collapsible) TextButton(onClick = { expanded = !expanded }, Modifier.align(Alignment.End).padding(end = 4.dp)) {
+                Text(if (expanded) "Show less" else "Show more", style = MaterialTheme.typography.labelMedium)
+            }
+        }
+        DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+            DropdownMenuItem(text = { Text("Copy reply") }, onClick = { menu = false; clipboard.setText(AnnotatedString(notification.reply.trim())) })
+        }
     }
 }
 

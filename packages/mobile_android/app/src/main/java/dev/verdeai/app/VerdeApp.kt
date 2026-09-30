@@ -180,7 +180,8 @@ private fun Graph(nav: NavHostController, start: String, hosts: HostsModel, brow
         composable(Routes.THREAD) { entry ->
             val args = entry.arguments
             val ws = args?.getString("ws").orEmpty()
-            ThreadRoute(hosts, browse, manage, ws, args?.getString("thread").orEmpty(), showHosts, onCitation = { openFile(ws, it) }, onThreadAction = onThreadAction) { nav.popBackStack() }
+            ThreadRoute(hosts, browse, manage, ws, args?.getString("thread").orEmpty(), showHosts, onCitation = { openFile(ws, it) }, onThreadAction = onThreadAction,
+                onOpenThread = { nav.navigate(Routes.thread(ws, it)) }) { nav.popBackStack() }
         }
         composable(Routes.TERMINAL) { entry ->
             val args = entry.arguments
