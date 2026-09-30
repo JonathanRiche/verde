@@ -10680,7 +10680,10 @@ fn stageAcceptedChatTurn(daemon: *Daemon, turn: *ChatTurn) !AcceptanceOwnership 
     if (std.mem.startsWith(u8, turn_id, "child-event:")) try svc.store.conn.exec("update chat_deliveries set delivered=1 where 'child-event:' || task_id || ':' || (select parent_thread_id from chat_links where link_id=chat_deliveries.link_id) || ':' || revision = ?", .{turn_id});
 
     if (!std.mem.startsWith(u8, turn_id, "child-event:")) try svc.store.conn.exec("update chat_links set delivery_enabled=1 where workspace_id=? and parent_thread_id=? and hidden=0", .{ workspace_id, local_thread_id });
-    if (turn.task_owner == null) {
+    // A parent's automatic reply to a child notification is not delegated
+    // work; reporting it upward would cascade one child turn through every
+    // ancestor as a chain of child-event turns.
+    if (turn.task_owner == null and !std.mem.startsWith(u8, turn_id, "child-event:")) {
         var linked = try svc.store.conn.row("select 1 from chat_links where workspace_id=? and local_thread_id=? and hidden=0 limit 1", .{ workspace_id, local_thread_id });
         if (linked) |*row| {
             row.deinit();
