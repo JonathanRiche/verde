@@ -6,3 +6,7 @@ Captured from the real Pixel on 2026-09-30, at a temporary 1080x1920 display siz
 2. Reasoning controls: the same demo conversation with the reasoning-effort sheet open.
 
 No existing private conversations or repository contents are shown. Captures use the locally installed Android build (versionCode 1, target SDK 35), not the Play-signed API 36 build. Verify against the final release before publishing the store listing. The demo chat is named “TypeScript task count formatter”.
+
+## Cropped exports
+
+Use `01-code-conversation-cropped.png` and `02-reasoning-controls-cropped.png` for the listing. These remove exactly the first 137 rows (Android status bar) from the originals. All remaining pixels are unchanged; PNG round-trip equality was verified. Output size: 1080 × 1783. Originals are retained.
