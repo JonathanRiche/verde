@@ -10633,6 +10633,15 @@ fn stageAcceptedChatTurn(daemon: *Daemon, turn: *ChatTurn) !AcceptanceOwnership 
         }
         staged_images = images;
     }
+    // Prompts another agent sent through MCP carry the sender, so the
+    // transcript does not present them as typed by the human.
+    const user_author: []const u8 = if (turn.agent_sent) blk: {
+        const parent = turn.parent_thread_id orelse break :blk "Agent";
+        var row = (svc.store.conn.row("select t.title from threads t join workspaces w on w.id=t.workspace_id where w.workspace_id=? and t.local_thread_id=?", .{ workspace_id, parent }) catch null) orelse break :blk "Agent";
+        defer row.deinit();
+        const title = row.text(0);
+        break :blk if (title.len == 0) "Agent" else try std.fmt.allocPrint(arena, "Agent \u{00B7} {s}", .{title});
+    } else "You";
     const user_message: store_protocol.Message = turn.acceptance_message_override orelse .{
         .message_id = user_message_id,
         .role = "user",
@@ -10712,15 +10721,6 @@ fn mapStageStoreError(err: anyerror) daemon_store.StoreError {
 
 /// Process-global one-shot for VERDE_SESSION_DAEMON_CHAT_COMMIT_FAULT=fail_once.
 /// Consumed on first armed check; subsequent calls return false.
-    // Prompts another agent sent through MCP carry the sender, so the
-    // transcript does not present them as typed by the human.
-    const user_author: []const u8 = if (turn.agent_sent) blk: {
-        const parent = turn.parent_thread_id orelse break :blk "Agent";
-        var row = (svc.store.conn.row("select t.title from threads t join workspaces w on w.id=t.workspace_id where w.workspace_id=? and t.local_thread_id=?", .{ workspace_id, parent }) catch null) orelse break :blk "Agent";
-        defer row.deinit();
-        const title = row.text(0);
-        break :blk if (title.len == 0) "Agent" else try std.fmt.allocPrint(arena, "Agent \u{00B7} {s}", .{title});
-    } else "You";
 var chat_commit_fault_once_consumed = std.atomic.Value(bool).init(false);
 
 /// Hermetic-only: true when store-dir override is set AND commit-fault env is

@@ -5626,6 +5626,13 @@ fn transcriptDisplayBody(role: app_state.ChatRole, body: []const u8) []const u8 
     return parentSteerBody(role, body) orelse body;
 }
 
+/// Agent-sent prompts are stored with an "Agent" author by the daemon;
+/// everything else in the user role was typed by the human.
+fn userRoleLabel(author: []const u8) []const u8 {
+    if (std.mem.eql(u8, author, "Agent") or std.mem.startsWith(u8, author, "Agent \u{00B7} ")) return author;
+    return "You";
+}
+
 /// Parent-agent steers arrive fenced for the provider (see cli
 /// mcpParentSteerPromptAlloc); show only the parent's words, labelled.
 fn parentSteerBody(role: app_state.ChatRole, body: []const u8) ?[]const u8 {
@@ -5992,13 +5999,6 @@ fn renderTranscriptImagesFromParts(
     role: app_state.ChatRole,
     first_image: ?app_state.ChatImageAttachment,
     extra_images: []const app_state.ChatImageAttachment,
-/// Agent-sent prompts are stored with an "Agent" author by the daemon;
-/// everything else in the user role was typed by the human.
-fn userRoleLabel(author: []const u8) []const u8 {
-    if (std.mem.eql(u8, author, "Agent") or std.mem.startsWith(u8, author, "Agent \u{00B7} ")) return author;
-    return "You";
-}
-
     clip: palette.Rect,
 ) void {
     const count = (if (first_image != null) @as(usize, 1) else 0) + extra_images.len;
@@ -8340,7 +8340,7 @@ fn renderTranscriptBubbleFromParts(
             .y = bubble.y + theme.scaledUi(34.0),
             .w = bubble.w - pad * 2.0,
             .h = @max(bubble.h - theme.scaledUi(42.0) - toggle_h, 0.0),
-        }, view.text, theme.COLOR_WHITE, clip, streaming);
+        }, view.text, clip, streaming);
         if (view.collapsible) {
             const toggle_label = if (view.expanded) "Show less" else "Show more";
             const toggle_font = theme.scaledUi(12.0);
@@ -8383,6 +8383,9 @@ fn renderTranscriptBubbleFromParts(
     const bubble = snapRect(palette.Rect{ .x = bubble_x, .y = y, .w = bubble_width, .h = height });
     // Replies sit on the panel surface so they lift off the pane background;
     // the user's own turns carry a light accent wash with an accent edge.
+    // Messages another agent sent keep the user's side but drop the accent
+    // wash, so only prompts the human typed read as "You".
+    const human_user = role == .user and std.mem.eql(u8, role_label, "You");
     const bg = switch (role) {
         .user => if (human_user) theme.wash(theme.accent(), 64) else theme.withAlpha(theme.COLOR_PANEL, 250),
         .assistant => theme.withAlpha(theme.COLOR_PANEL, 250),
@@ -9249,9 +9252,6 @@ fn renderInactiveComposerSubmit(state: *app_state.AppState, rect: palette.Rect) 
         };
         queueRounded(state, stop, paletteColor(theme.withAlpha(theme.background(), 230)), theme.scaledUi(2.0));
     } else {
-    // Messages another agent sent keep the user's side but drop the accent
-    // wash, so only prompts the human typed read as "You".
-    const human_user = role == .user and std.mem.eql(u8, role_label, "You");
         // This preview is read-only; keep the send affordance disabled so it
         // does not imply that clicks/keystrokes will be handled by this pane.
         queueRounded(state, button, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 122)), size * 0.5);
@@ -10380,7 +10380,10 @@ test "parent steer wrapper is hidden in the child transcript" {
     const wrapped = "<verde_parent_message from_thread=\"cli-thread-1\">\nplease rebase\n</verde_parent_message>\n(Steering from the Verde agent orchestrating you, not the human user.)";
     try std.testing.expectEqualStrings("please rebase", parentSteerBody(.user, wrapped).?);
     try std.testing.expectEqualStrings("please rebase", transcriptDisplayBody(.user, wrapped));
+    try std.testing.expectEqualStrings("please rebase", parentSteerBody(.system, wrapped).?);
     try std.testing.expect(parentSteerBody(.assistant, wrapped) == null);
+    try std.testing.expectEqualStrings("You", userRoleLabel("Codex"));
+    try std.testing.expectEqualStrings("Agent \u{00B7} Planner", userRoleLabel("Agent \u{00B7} Planner"));
     try std.testing.expect(parentSteerBody(.user, "plain prompt") == null);
 }
 
@@ -10397,6 +10400,3 @@ test "child notification card parses fenced and legacy replies" {
     const empty = "[Verde child status notification]\nChild chat: child-1\nTurn: t-1\nStatus: completed\n<child_reply>\n\n</child_reply>" ++ footer;
     try std.testing.expectEqualStrings("", childNotification(.user, empty).?.body);
 }
-    try std.testing.expectEqualStrings("please rebase", parentSteerBody(.system, wrapped).?);
-    try std.testing.expectEqualStrings("You", userRoleLabel("Codex"));
-    try std.testing.expectEqualStrings("Agent \u{00B7} Planner", userRoleLabel("Agent \u{00B7} Planner"));
