@@ -4558,7 +4558,7 @@ fn mcpToolsList(allocator: std.mem.Allocator, out: output.Output, id_value: std.
         .{ .name = "waiting_for_resources", .type_name = "array", .items_type_name = "string", .description = "Optional workspace resources (build, deps, db, browser, port:<n>) whose release should resume this chat automatically." },
     });
     try writeMcpTypedTool(&s, "list_linked_chats", "List chats delegated by a parent conversation and their current status.", &CHAT_LINKS_MCP_INPUTS);
-    try writeMcpTypedTool(&s, "clear_linked_chats", "Hide a specific linked chat or finished links. Does not cancel work, delete chats, or disable delivery.", &CHAT_LINKS_MCP_INPUTS);
+    try writeMcpTypedTool(&s, "clear_linked_chats", "Unlink a specific linked chat (link_id from list_linked_chats), or every finished link when link_id is omitted: it leaves the panel and stops notifying the parent. Does not cancel work or delete the chat; delegating to it again relinks it.", &CHAT_LINKS_MCP_INPUTS);
     try writeMcpTypedTool(&s, "send_chat_message", "Send a prompt on an existing chat thread daemon-direct (no GUI required) and return the accepted turn_id. The thread and its workspace row must already exist in the daemon store (open_chat creates the thread, the desktop dual-write creates the workspace). Task-capable clients receive an asynchronous task handle; subscribe through subscriptions/listen for completion and input-needed notifications. Set parent_thread_id for automatic Verde parent delivery. Legacy clients can read tail_chat_turn.", &CHAT_SEND_MCP_INPUTS);
     try writeMcpTypedTool(&s, "queue_chat_followup", "Steer a running chat pane daemon-direct. Reuse steer_id after an ambiguous response; idle or unsupported panes return invalid_state.", &CHAT_FOLLOWUP_MCP_INPUTS);
     try writeMcpTypedTool(&s, "tail_chat_turn", "Read streamed events and status. Accepted steering is kind=steer with steer_id, message_id, title, body, and images; terminal status follows durable commit.", &CHAT_TAIL_MCP_INPUTS);
@@ -4844,7 +4844,7 @@ const CHAT_DRAFT_GET_MCP_INPUTS = [_]McpToolInput{
 const CHAT_LINKS_MCP_INPUTS = [_]McpToolInput{
     .{ .name = "workspace_id", .type_name = "string", .description = "Workspace owning the parent chat.", .required = true },
     .{ .name = "parent_thread_id", .type_name = "string", .description = "Your Verde conversation local thread id.", .required = true },
-    .{ .name = "link_id", .type_name = "string", .description = "Optional specific link to hide; otherwise clear finished links." },
+    .{ .name = "link_id", .type_name = "string", .description = "Optional specific link to unlink; otherwise unlink all finished links." },
 };
 
 const CHAT_SEND_MCP_INPUTS = [_]McpToolInput{
