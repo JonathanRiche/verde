@@ -965,6 +965,9 @@ bash ./scripts/release/install-linux-local.sh
           <div class="footer-cols">
             <div class="footer-col">
               <p class="footer-col-title">Project</p>
+              <a href="/privacy" class="footer-link">
+                Privacy policy
+              </a>
               <a href="/about" class="footer-link">
                 About
               </a>

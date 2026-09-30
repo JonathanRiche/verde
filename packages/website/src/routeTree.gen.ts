@@ -10,6 +10,7 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as SitemapDotxmlRouteImport } from './routes/sitemap[.]xml'
+import { Route as PrivacyRouteImport } from './routes/privacy'
 import { Route as LlmsDottxtRouteImport } from './routes/llms[.]txt'
 import { Route as LlmsFullDottxtRouteImport } from './routes/llms-full[.]txt'
 import { Route as InstallDotshRouteImport } from './routes/install[.]sh'
@@ -24,6 +25,11 @@ import { Route as DocsSlugRouteImport } from './routes/docs/$slug'
 const SitemapDotxmlRoute = SitemapDotxmlRouteImport.update({
   id: '/sitemap.xml',
   path: '/sitemap.xml',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const PrivacyRoute = PrivacyRouteImport.update({
+  id: '/privacy',
+  path: '/privacy',
   getParentRoute: () => rootRouteImport,
 } as any)
 const LlmsDottxtRoute = LlmsDottxtRouteImport.update({
@@ -85,6 +91,7 @@ export interface FileRoutesByFullPath {
   '/install.sh': typeof InstallDotshRoute
   '/llms-full.txt': typeof LlmsFullDottxtRoute
   '/llms.txt': typeof LlmsDottxtRoute
+  '/privacy': typeof PrivacyRoute
   '/sitemap.xml': typeof SitemapDotxmlRoute
   '/docs/$slug': typeof DocsSlugRoute
   '/themes/$slug': typeof ThemesSlugRoute
@@ -98,6 +105,7 @@ export interface FileRoutesByTo {
   '/install.sh': typeof InstallDotshRoute
   '/llms-full.txt': typeof LlmsFullDottxtRoute
   '/llms.txt': typeof LlmsDottxtRoute
+  '/privacy': typeof PrivacyRoute
   '/sitemap.xml': typeof SitemapDotxmlRoute
   '/docs/$slug': typeof DocsSlugRoute
   '/themes/$slug': typeof ThemesSlugRoute
@@ -112,6 +120,7 @@ export interface FileRoutesById {
   '/install.sh': typeof InstallDotshRoute
   '/llms-full.txt': typeof LlmsFullDottxtRoute
   '/llms.txt': typeof LlmsDottxtRoute
+  '/privacy': typeof PrivacyRoute
   '/sitemap.xml': typeof SitemapDotxmlRoute
   '/docs/$slug': typeof DocsSlugRoute
   '/themes/$slug': typeof ThemesSlugRoute
@@ -127,6 +136,7 @@ export interface FileRouteTypes {
     | '/install.sh'
     | '/llms-full.txt'
     | '/llms.txt'
+    | '/privacy'
     | '/sitemap.xml'
     | '/docs/$slug'
     | '/themes/$slug'
@@ -140,6 +150,7 @@ export interface FileRouteTypes {
     | '/install.sh'
     | '/llms-full.txt'
     | '/llms.txt'
+    | '/privacy'
     | '/sitemap.xml'
     | '/docs/$slug'
     | '/themes/$slug'
@@ -153,6 +164,7 @@ export interface FileRouteTypes {
     | '/install.sh'
     | '/llms-full.txt'
     | '/llms.txt'
+    | '/privacy'
     | '/sitemap.xml'
     | '/docs/$slug'
     | '/themes/$slug'
@@ -167,6 +179,7 @@ export interface RootRouteChildren {
   InstallDotshRoute: typeof InstallDotshRoute
   LlmsFullDottxtRoute: typeof LlmsFullDottxtRoute
   LlmsDottxtRoute: typeof LlmsDottxtRoute
+  PrivacyRoute: typeof PrivacyRoute
   SitemapDotxmlRoute: typeof SitemapDotxmlRoute
   DocsSlugRoute: typeof DocsSlugRoute
   ThemesSlugRoute: typeof ThemesSlugRoute
@@ -180,6 +193,13 @@ declare module '@tanstack/solid-router' {
       path: '/sitemap.xml'
       fullPath: '/sitemap.xml'
       preLoaderRoute: typeof SitemapDotxmlRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/privacy': {
+      id: '/privacy'
+      path: '/privacy'
+      fullPath: '/privacy'
+      preLoaderRoute: typeof PrivacyRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/llms.txt': {
@@ -263,6 +283,7 @@ const rootRouteChildren: RootRouteChildren = {
   InstallDotshRoute: InstallDotshRoute,
   LlmsFullDottxtRoute: LlmsFullDottxtRoute,
   LlmsDottxtRoute: LlmsDottxtRoute,
+  PrivacyRoute: PrivacyRoute,
   SitemapDotxmlRoute: SitemapDotxmlRoute,
   DocsSlugRoute: DocsSlugRoute,
   ThemesSlugRoute: ThemesSlugRoute,

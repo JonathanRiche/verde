@@ -3084,3 +3084,18 @@ thead .comp-rowhead { background: transparent; }
     text-align: center;
   }
 }
+
+/* Long-form legal copy shares the site's theme and reading rhythm. */
+.privacy-page { padding: 5rem 0 3rem; }
+.privacy-policy { max-width: 52rem; margin-inline: auto; }
+.privacy-policy h1 { font-size: clamp(2.4rem, 7vw, 4rem); }
+.privacy-policy h2 { margin: 2.2rem 0 0.8rem; font-size: 1.45rem; line-height: 1.3; }
+.privacy-policy p, .privacy-policy li { color: var(--muted); font-size: 1rem; line-height: 1.8; }
+.privacy-policy p + p { margin-top: 1rem; }
+.privacy-policy ul { padding-left: 1.3rem; }
+.privacy-policy li + li { margin-top: 0.8rem; }
+.privacy-policy strong { color: var(--text); }
+.privacy-policy a { color: var(--accent-strong); text-decoration: underline; text-underline-offset: 0.2em; overflow-wrap: anywhere; }
+.privacy-policy code { overflow-wrap: anywhere; }
+.privacy-policy .privacy-date { margin: 1rem 0 2rem; font-size: 0.9rem; }
+.privacy-policy .privacy-back { margin-top: 2.5rem; }
