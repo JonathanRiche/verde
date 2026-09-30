@@ -1,6 +1,7 @@
 //! Bounded, no-redirect Verde Connect public-v1 control-plane client.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const headless = @import("headless");
 
 const connect = headless.connect_protocol;
@@ -40,11 +41,14 @@ pub const Transport = struct {
 };
 
 pub const HttpTransport = struct {
+    // Native verified trust injection exists only in test compilation.
+    test_ca_file: if (builtin.is_test) ?[]const u8 else void = if (builtin.is_test) null else {},
     pub fn transport(self: *HttpTransport) Transport {
         return .{ .context = self, .send_fn = send };
     }
 
-    fn send(_: *anyopaque, allocator: std.mem.Allocator, request: Request) !Response {
+    fn send(context: *anyopaque, allocator: std.mem.Allocator, request: Request) !Response {
+        const self: *HttpTransport = @ptrCast(@alignCast(context));
         try validateRequest(request);
         const response_buffer = try allocator.alloc(u8, MAX_RESPONSE_BYTES);
         defer {
@@ -70,6 +74,14 @@ pub const HttpTransport = struct {
             .read_buffer_size = 16 * 1024,
         };
         defer client.deinit();
+        // The isolated IT root can supply a temporary CA. Production roots
+        // do not declare this hook, and cannot enable it through environment.
+        const test_ca_file = if (builtin.is_test) self.test_ca_file else if (@hasDecl(@import("root"), "connectTestCaFile")) @import("root").connectTestCaFile() else null;
+        if (test_ca_file) |path| {
+            const now = std.Io.Clock.real.now(threaded.io());
+            try client.ca_bundle.addCertsFromFilePathAbsolute(allocator, threaded.io(), now, path);
+            client.now = now;
+        }
         // Proxy fields intentionally remain null. A configured proxy could
         // receive the bearer credential or rewrite the pinned destination.
 
@@ -88,12 +100,12 @@ pub const HttpTransport = struct {
             .privileged_headers = &.{.{ .name = "accept", .value = "application/json" }},
         };
         const SelectResult = union(enum) {
-            fetch: std.http.Client.FetchError!std.http.Client.FetchResult,
+            fetch: FetchConnectError!std.http.Client.FetchResult,
             timeout: std.Io.Cancelable!void,
         };
         var select_buffer: [2]SelectResult = undefined;
         var select = std.Io.Select(SelectResult).init(threaded.io(), &select_buffer);
-        select.async(.fetch, std.http.Client.fetch, .{ &client, options });
+        select.async(.fetch, fetchConnect, .{ &client, options });
         select.async(.timeout, std.Io.sleep, .{
             threaded.io(),
             std.Io.Duration.fromMilliseconds(request.timeout_ms),
@@ -118,6 +130,59 @@ pub const HttpTransport = struct {
         return .{ .status = result.status, .body = try allocator.dupe(u8, response_writer.buffered()) };
     }
 };
+
+// Native std.http owns TLS and HTTP parsing, including DELETE responses.
+// Zig 0.16's convenience body writer asserts for DELETE, although Connect v1
+// requires its bounded JSON body. Send one internally generated Content-Length
+// with the native head writer, then the exact bounded bytes on its TLS stream.
+const FetchConnectError = std.http.Client.FetchError || error{ControlPlaneResponseTruncated};
+
+fn fetchConnect(client: *std.http.Client, options: std.http.Client.FetchOptions) FetchConnectError!std.http.Client.FetchResult {
+    if (options.method != .DELETE or options.payload == null) return client.fetch(options);
+    const payload = options.payload.?;
+    const uri = switch (options.location) {
+        .url => |url| try std.Uri.parse(url),
+        .uri => |uri| uri,
+    };
+    var length_buffer: [32]u8 = undefined;
+    const content_length = std.fmt.bufPrint(&length_buffer, "{d}", .{payload.len}) catch unreachable;
+    var req = try client.request(.DELETE, uri, .{
+        .keep_alive = false,
+        .redirect_behavior = .not_allowed,
+        .headers = options.headers,
+        .extra_headers = &.{.{ .name = "content-length", .value = content_length }},
+        .privileged_headers = options.privileged_headers,
+    });
+    defer req.deinit();
+    // Keep transfer_encoding=.none: sendBodilessUnflushed is the native head
+    // writer for this method. No chunking, method substitution or retry occurs.
+    try req.sendBodilessUnflushed();
+    try req.connection.?.writer().writeAll(payload);
+    try req.connection.?.flush();
+    var response = try req.receiveHead(&.{});
+    const response_writer = options.response_writer.?;
+    const decompress_buffer: []u8 = switch (response.head.content_encoding) {
+        .identity => &.{},
+        .zstd => try client.allocator.alloc(u8, std.compress.zstd.default_window_len),
+        .deflate, .gzip => try client.allocator.alloc(u8, std.compress.flate.max_window_len),
+        .compress => return error.UnsupportedCompressionMethod,
+    };
+    defer if (decompress_buffer.len != 0) client.allocator.free(decompress_buffer);
+    var transfer_buffer: [64]u8 = undefined;
+    var decompress: std.http.Decompress = undefined;
+    const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
+    _ = reader.streamRemaining(response_writer) catch |err| switch (err) {
+        error.ReadFailed => return response.bodyErr().?,
+        else => |e| return e,
+    };
+    // Zig's Content-Length reader propagates peer EOF as EndOfStream even
+    // with bytes outstanding. Never accept a partial JSON response as complete.
+    switch (req.reader.state) {
+        .body_remaining_content_length, .body_remaining_chunk_len => return error.ControlPlaneResponseTruncated,
+        else => {},
+    }
+    return .{ .status = response.head.status };
+}
 
 pub const Discovery = struct {
     contract_version: []const u8,
@@ -441,4 +506,8 @@ test "HTTP request policy rejects redirects, proxies by construction, and oversi
         .body = &([_]u8{'x'} ** (MAX_REQUEST_BYTES + 1)),
     }));
     try std.testing.expect(isRedirect(.temporary_redirect));
+}
+
+test {
+    _ = @import("connect_transport_test.zig");
 }

@@ -105,8 +105,16 @@ comptime {
     }
 }
 
+// This hook exists only in this hermetic IT executable; installed runtime roots
+// cannot select an alternate trust store.
+var connect_test_ca_file: ?[]const u8 = null;
+pub fn connectTestCaFile() ?[]const u8 {
+    return connect_test_ca_file;
+}
+
 pub fn main(init: std.process.Init) !void {
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    // ReleaseSafe IT shutdown diagnostics need allocation call sites.
+    var gpa_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 16 }) = .init;
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
     const io = init.io;
@@ -127,7 +135,9 @@ pub fn main(init: std.process.Init) !void {
             if (comptime posix_pty_supported) {
                 var parent_pid: ?std.posix.pid_t = null;
                 while (iterator.next()) |flag| {
-                    if (std.mem.eql(u8, flag, "--parent-pid")) {
+                    if (std.mem.eql(u8, flag, "--connect-test-ca")) {
+                        connect_test_ca_file = iterator.next() orelse return error.MissingConnectTestCa;
+                    } else if (std.mem.eql(u8, flag, "--parent-pid")) {
                         const raw = iterator.next() orelse {
                             std.debug.print("headless-daemon-it --daemon --parent-pid requires a pid\n", .{});
                             std.process.exit(2);
@@ -207,6 +217,12 @@ pub fn main(init: std.process.Init) !void {
         try runChatOrchestrationScenario(allocator, io);
         return;
     };
+
+    if (scenario) |value| if (std.mem.eql(u8, value, "connect")) {
+        try runConnectUnlinkLogoutScenario(allocator, io);
+        return;
+    };
+    if (posix_pty_supported) try runConnectUnlinkLogoutScenario(allocator, io);
 
     // Transport tier first so a Windows subset exits cleanly without PTY work.
     try runRegistryFixtureScenario(allocator, io);
@@ -436,6 +452,7 @@ const EndpointIsolation = struct {
 /// P3 adds `store_disable` so store-less capability pins survive production open.
 /// M4-P2 adds `chat_stub` so turn-commit ITs stay offline (no real provider).
 const IsolatedDaemonOptions = struct {
+    connect_test_ca: ?[]const u8 = null,
     idle_exit_ms: ?[]const u8 = null,
     store_dir: ?[]const u8 = null,
     /// When set with `store_dir`, maps to `VERDE_SESSION_DAEMON_STORE_FAULT`.
@@ -535,7 +552,10 @@ fn spawnIsolatedDaemonWithOptions(
     const parent_pid_arg = try std.fmt.bufPrint(&parent_pid_buf, "{d}", .{platform_runtime.processId()});
 
     var child = try std.process.spawn(io, .{
-        .argv = &.{ self_exe, "--daemon", pref_path, "--parent-pid", parent_pid_arg },
+        .argv = if (options.connect_test_ca) |ca|
+            &.{ self_exe, "--daemon", pref_path, "--parent-pid", parent_pid_arg, "--connect-test-ca", ca }
+        else
+            &.{ self_exe, "--daemon", pref_path, "--parent-pid", parent_pid_arg },
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
@@ -816,11 +836,15 @@ fn runRegistryFixtureScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     var child = try spawnIsolatedDaemon(allocator, io, self_exe, pref_path);
     defer child.kill(io);
 
+    // Typed DTO decoding allocates outside ParsedResponse; retain it only
+    // for this scenario and release it with the other borrowed values.
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
     var transport: sessionizer.HeadlessTransport = .{
-        .allocator = allocator,
+        .allocator = decode_arena.allocator(),
         .pref_path = pref_path,
     };
-    var client = sessionizer.headlessClient(allocator, &transport);
+    var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
     var scenario: FixtureScenario = .{ .client = &client };
     scenario.registrySessionObservationHook("phase-2-registry-observation");
 
@@ -861,11 +885,15 @@ fn runRegistryCapabilityScenario(allocator: std.mem.Allocator, io: std.Io) !void
     var child = try spawnIsolatedDaemon(allocator, io, self_exe, pref_path);
     defer child.kill(io);
 
+    // Typed DTO decoding allocates outside ParsedResponse; retain it only
+    // for this scenario and release it with the other borrowed values.
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
     var transport: sessionizer.HeadlessTransport = .{
-        .allocator = allocator,
+        .allocator = decode_arena.allocator(),
         .pref_path = pref_path,
     };
-    var client = sessionizer.headlessClient(allocator, &transport);
+    var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
     const empty_params: struct {} = .{};
     var parsed = try client.call("core.status", empty_params);
     defer parsed.deinit();
@@ -1457,8 +1485,12 @@ fn runRegistryMethodPresenceScenario(allocator: std.mem.Allocator, io: std.Io) !
     var child = try spawnIsolatedDaemon(allocator, io, self_exe, pref_path);
     defer child.kill(io);
 
-    var transport: sessionizer.HeadlessTransport = .{ .allocator = allocator, .pref_path = pref_path };
-    var client = sessionizer.headlessClient(allocator, &transport);
+    // Typed DTO decoding allocates outside ParsedResponse; retain it only
+    // for this scenario and release it with the other borrowed values.
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    var transport: sessionizer.HeadlessTransport = .{ .allocator = decode_arena.allocator(), .pref_path = pref_path };
+    var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
     const empty_params: struct {} = .{};
     for (DISPATCHED_REGISTRY_METHODS) |method| {
         var parsed = try client.call(method, empty_params);
@@ -7533,14 +7565,36 @@ fn runWireConcurrentTailDuringSlowStoreCommitScenario(allocator: std.mem.Allocat
     var killed = try client.call("session.kill", .{ .id = session_id });
     defer killed.deinit();
     if (!killed.response.isOk()) return error.M5WireSessionKillFailed;
-    var cleanup = try client.call("session.cleanup", .{});
-    defer cleanup.deinit();
-
-    var prepare = try client.call("daemon.prepareShutdown", .{});
-    defer prepare.deinit();
-    if (!prepare.response.isOk()) return error.M5WirePrepareFailed;
+    // PTY kill is asynchronous. A single cleanup can run before the child
+    // exits; wait only for that exact gate, rather than suppressing failures.
+    var shutdown_accepted = false;
+    for (0..100) |_| {
+        var cleanup = try client.call("session.cleanup", .{});
+        defer cleanup.deinit();
+        if (!cleanup.response.isOk()) return error.M5WireCleanupFailed;
+        var prepare = try client.call("daemon.prepareShutdown", .{});
+        defer prepare.deinit();
+        if (prepare.response.isOk()) {
+            const result = prepare.response.result orelse return error.M5WirePrepareShape;
+            if (result != .object or (result.object.get("accepted") orelse .null) != .bool or
+                !result.object.get("accepted").?.bool) return error.M5WirePrepareNotAccepted;
+            shutdown_accepted = true;
+            break;
+        }
+        const failure = prepare.response.err orelse return error.M5WirePrepareFailed;
+        const data = failure.data orelse return error.M5WirePrepareFailed;
+        if (!std.mem.eql(u8, failure.code, headless.registry.ERR_INVALID_STATE) or data != .object or
+            (data.object.get("running_sessions") orelse .null) != .integer or
+            data.object.get("running_sessions").?.integer != 1) return error.M5WirePrepareFailed;
+        for ([_][]const u8{ "managed", "turns", "leases", "registry_jobs" }) |gate| {
+            const value = data.object.get(gate) orelse return error.M5WirePrepareFailed;
+            if (value != .integer or value.integer != 0) return error.M5WirePrepareFailed;
+        }
+        std.Io.sleep(io, .fromMilliseconds(20), .awake) catch {};
+    }
+    if (!shutdown_accepted) return error.M5WirePrepareFailed;
     kill_on_unwind = false;
-    _ = waitChildBounded(&child, io, 10_000) catch {};
+    _ = try waitChildBounded(&child, io, 10_000);
 }
 
 /// Scenario 6: chat.turn.record / chat.thread.get typed DTO round-trip.
@@ -10099,11 +10153,13 @@ fn runIntegration(allocator: std.mem.Allocator, io: std.Io) !void {
     var child = try spawnIsolatedDaemon(allocator, io, self_exe, pref_path);
     defer child.kill(io);
 
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
     var transport: sessionizer.HeadlessTransport = .{
-        .allocator = allocator,
+        .allocator = decode_arena.allocator(),
         .pref_path = pref_path,
     };
-    var client = sessionizer.headlessClient(allocator, &transport);
+    var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
     const session_id = "verde:headless-it:session";
     var session_created = false;
     defer if (session_created) {
@@ -11204,3 +11260,96 @@ const OrchestrationSseCheck = struct {
         return error.OrchestrationSseClosed;
     }
 };
+
+/// Synthetic linked-state regression, separate from real enrollment acceptance.
+/// The actual daemon sends DELETE over verified native TLS and commits cleanup.
+fn runConnectUnlinkLogoutScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    if (!posix_pty_supported) return;
+    const identity_mod = @import("daemon/runtime_identity.zig");
+    const connect_store = @import("daemon/connect_store.zig");
+    const connect_auth = @import("daemon/connect_auth.zig");
+    const cp = headless.connect_protocol;
+    const exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(exe);
+    for ([_]bool{ false, true }) |direct_logout| {
+        const pref = try makePrefPath(allocator, "connect-delete");
+        defer allocator.free(pref);
+        defer std.Io.Dir.cwd().deleteTree(io, pref) catch {};
+        try std.Io.Dir.cwd().createDirPath(io, pref);
+        var fixture = try @import("daemon/connect_tls_fixture.zig").Fixture.init(allocator, io, pref);
+        defer fixture.deinit(allocator, io);
+        const db_path = try std.fs.path.join(allocator, &.{ pref, identity_mod.DATABASE_FILE_NAME });
+        defer allocator.free(db_path);
+        {
+            var initialized = try identity_mod.initStore(allocator, io, pref, db_path, .none);
+            defer initialized.deinit(allocator);
+            try connect_store.initialize(initialized.store.conn, initialized.identity.runtime_id, initialized.identity.instance_id);
+            try connect_store.recordLogin(initialized.store.conn, fixture.base_url, fixture.base_url, "{\"keys\":[]}", 300, 1);
+            try connect_store.recordLinked(initialized.store.conn, .{
+                .link_id = "lnk_11111111111111111111111111111111",
+                .enrollment_id = "enr_22222222222222222222222222222222",
+                .endpoint_https_url = "https://runtime.example.test",
+                .endpoint_wss_url = "wss://runtime.example.test/ws",
+                .connector_provider = "external",
+            }, false, 2);
+            const identity_json = try std.json.Stringify.valueAlloc(allocator, initialized.identity.borrowed(), .{});
+            defer allocator.free(identity_json);
+            var dir = try std.Io.Dir.cwd().openDir(io, pref, .{});
+            defer dir.close(io);
+            try dir.writeFile(io, .{ .sub_path = "identity.json", .data = identity_json });
+            var source = try dir.createFile(io, "source.token", .{ .permissions = @enumFromInt(0o600) });
+            try source.writeStreamingAll(io, "synthetic-connect-fixture-credential-0001");
+            source.close(io);
+            const source_path = try std.fs.path.join(allocator, &.{ pref, "source.token" });
+            defer allocator.free(source_path);
+            var token = try connect_auth.importCredential(allocator, io, pref, source_path);
+            token.deinit(allocator);
+            try dir.deleteFile(io, "source.token");
+        }
+        var isolation = try EndpointIsolation.install(allocator, pref);
+        defer isolation.deinit(allocator);
+        var daemon = try spawnIsolatedDaemonWithEnv(allocator, io, exe, pref, .{ .store_dir = pref, .connect_test_ca = fixture.ca_file });
+        defer daemon.kill(io);
+        var arena_state: std.heap.ArenaAllocator = .init(allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var transport: sessionizer.HeadlessTransport = .{ .allocator = arena, .pref_path = pref };
+        var client = sessionizer.headlessClient(arena, &transport);
+        var before = try client.call(cp.METHOD_STATUS, cp.StatusRequest{ .connect_protocol_version = 1 });
+        const original = try client.decodeConnectStatus(&before);
+        if (original.state != .linked or !original.authenticated) return error.ConnectFixtureNotLinked;
+        if (direct_logout) {
+            // A refused unlink must retain the credential and link for retry.
+            var dir = try std.Io.Dir.cwd().openDir(io, pref, .{});
+            defer dir.close(io);
+            try dir.writeFile(io, .{ .sub_path = "refuse", .data = "403" });
+            var denied = try client.call(cp.METHOD_LOGOUT, cp.LogoutRequest{ .connect_protocol_version = 1 });
+            if (denied.response.isOk()) return error.ConnectLogoutIgnoredRefusal;
+            var token = try connect_auth.load(allocator, io, pref);
+            token.deinit(allocator);
+            var retry_status = try client.call(cp.METHOD_STATUS, cp.StatusRequest{ .connect_protocol_version = 1 });
+            const retained = try client.decodeConnectStatus(&retry_status);
+            if (!retained.authenticated or retained.link_id == null) return error.ConnectRefusalLostAuthority;
+            try dir.deleteFile(io, "refuse");
+        } else {
+            var unlinked = try client.call(cp.METHOD_UNLINK, cp.UnlinkRequest{ .connect_protocol_version = 1 });
+            const status = try client.decodeConnectStatus(&unlinked);
+            if (status.state != .logged_in or status.link_id != null or !status.authenticated) return error.ConnectUnlinkCleanup;
+            var token = try connect_auth.load(allocator, io, pref);
+            token.deinit(allocator);
+        }
+        var logged_out = try client.call(cp.METHOD_LOGOUT, cp.LogoutRequest{ .connect_protocol_version = 1 });
+        const status = try client.decodeConnectStatus(&logged_out);
+        if (status.state != .logged_out or status.authenticated or status.link_id != null or status.control_plane_url != null) return error.ConnectLogoutCleanup;
+        if (!std.mem.eql(u8, original.runtime_id, status.runtime_id) or !std.mem.eql(u8, original.instance_id, status.instance_id)) return error.ConnectLogoutRotatedIdentity;
+        if (connect_auth.load(allocator, io, pref)) |value| {
+            var unexpected = value;
+            unexpected.deinit(allocator);
+            return error.ConnectLogoutRetainedCredential;
+        } else |err| if (err != error.FileNotFound) return err;
+        // A final real IPC call also proves the child survived both operations.
+        var alive = try client.call(cp.METHOD_STATUS, cp.StatusRequest{ .connect_protocol_version = 1 });
+        _ = try client.decodeConnectStatus(&alive);
+    }
+    std.debug.print("Connect native TLS unlink/logout isolated regression passed\n", .{});
+}
