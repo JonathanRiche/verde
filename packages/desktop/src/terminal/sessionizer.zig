@@ -2439,6 +2439,9 @@ pub const Daemon = struct {
     /// Serializes verde.json snapshots and web-originated favorite updates.
     /// It is independent of lockDaemon so filesystem I/O never delays chat.
     config_mutex: ParkingMutex = .{},
+    // Serialize low-frequency Connect mutations without holding SQLite locks
+    // across HTTP. Duplicate creation attempts cannot roll back each other.
+    connect_lifecycle_mutex: ParkingMutex = .{},
     /// File indexes never hold the daemon/store locks while scanning or searching.
     file_search_mutex: ParkingMutex = .{},
     file_search_indexes: workspace_file_search.IndexCache = .{},
@@ -3040,6 +3043,10 @@ pub const Daemon = struct {
             );
         }
 
+        const mutation = request.isMutating();
+        if (mutation) self.connect_lifecycle_mutex.lock();
+        defer if (mutation) self.connect_lifecycle_mutex.unlock();
+
         var daemon_locked = true;
         lockDaemon(self);
         defer if (daemon_locked) self.mutex.unlock();
@@ -3168,6 +3175,23 @@ pub const Daemon = struct {
                     self.instance_id,
                 ) catch |err| return try self.recordConnectRetry(id_value, service, state.retry_attempt, err);
                 defer keys.clear();
+                const Recovery = struct {
+                    service: *StoreService,
+                    request_id: []const u8,
+                    fn save(raw: *anyopaque, link_id: []const u8) !void {
+                        const recovery: *@This() = @ptrCast(@alignCast(raw));
+                        lockStoreService(recovery.service);
+                        defer recovery.service.mutex.unlock();
+                        try connect_store.recordLinkRecovery(recovery.service.store.conn, recovery.request_id, link_id, nowMs());
+                    }
+                    fn clear(raw: *anyopaque, link_id: []const u8) !void {
+                        const recovery: *@This() = @ptrCast(@alignCast(raw));
+                        lockStoreService(recovery.service);
+                        defer recovery.service.mutex.unlock();
+                        try connect_store.clearLinkRecovery(recovery.service.store.conn, recovery.request_id, link_id, nowMs());
+                    }
+                };
+                var recovery: Recovery = .{ .service = service, .request_id = stable_request_id };
                 var http_transport: connect_client.HttpTransport = .{};
                 var linked = connect_lifecycle.link(arena, http_transport.transport(), &keys, null, .{
                     .control_plane_url = control_plane_url,
@@ -3177,6 +3201,7 @@ pub const Daemon = struct {
                     .request_id = stable_request_id,
                     .provider = link_request.provider,
                     .external_descriptor = descriptor,
+                    .recovery = .{ .context = &recovery, .save_fn = Recovery.save, .clear_fn = Recovery.clear },
                     .now_seconds_fn = struct {
                         fn now() i64 {
                             return @divFloor(nowMs(), std.time.ms_per_s);
@@ -3185,7 +3210,7 @@ pub const Daemon = struct {
                 }) catch |err| return try self.recordConnectRetry(id_value, service, state.retry_attempt, err);
                 defer linked.deinit(arena);
                 lockStoreService(service);
-                connect_store.recordLinked(service.store.conn, .{
+                connect_store.recordLinkedForRequest(service.store.conn, stable_request_id, .{
                     .link_id = linked.link_id,
                     .enrollment_id = linked.enrollment_id,
                     .endpoint_https_url = linked.endpoint_https_url,

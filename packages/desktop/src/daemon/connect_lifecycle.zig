@@ -12,6 +12,14 @@ const client_mod = @import("connect_client.zig");
 const crypto = @import("connect_crypto.zig");
 const reconciler_mod = @import("connect_reconciler.zig");
 
+/// Persist only an identity-verified service receipt. Clearing is called only
+/// after a verified authenticated rollback response; failed cleanup retains it.
+pub const LinkRecovery = struct {
+    context: *anyopaque,
+    save_fn: *const fn (*anyopaque, []const u8) anyerror!void,
+    clear_fn: *const fn (*anyopaque, []const u8) anyerror!void,
+};
+
 pub const LinkInput = struct {
     control_plane_url: []const u8,
     bearer_token: []const u8,
@@ -22,6 +30,7 @@ pub const LinkInput = struct {
     external_descriptor: ?connect.RuntimeDescriptor,
     /// Sample when signing, after the bounded discovery/challenge exchanges.
     now_seconds_fn: *const fn () i64,
+    recovery: ?LinkRecovery = null,
 };
 
 pub const LinkResult = struct {
@@ -259,6 +268,15 @@ pub fn link(
         return error.LinkIdentityMismatch;
     }
     _ = parseRfc3339Seconds(linked.value.created_at) catch return error.InvalidControlPlaneResponse;
+
+    // A 200 receipt can refer to a preexisting link: never compensate it.
+    // Invalid/ambiguous creation responses never authorize guessed deletion.
+    errdefer if (link_response.status == .created) {
+        if (unlink(allocator, transport, input.control_plane_url, input.bearer_token, linked.value.link_id, input.runtime_id, input.instance_id, input.request_id)) |_| {
+            if (input.recovery) |recovery| recovery.clear_fn(recovery.context, linked.value.link_id) catch {};
+        } else |_| {}
+    };
+    if (input.recovery) |recovery| try recovery.save_fn(recovery.context, linked.value.link_id);
 
     const enrollment_now = input.now_seconds_fn();
     const expires_at = try formatRfc3339Alloc(allocator, enrollment_now + 90);
@@ -657,6 +675,113 @@ test "native link signs with fresh time after delayed challenge and rejects expi
         } else {
             try std.testing.expectError(error.FixtureProofVerified, result);
             try std.testing.expect(fixture.verified);
+        }
+    }
+}
+
+test "enrollment failures rollback only verified created links and retain failed cleanup recovery" {
+    const Fixture = struct {
+        const Mode = enum { enrollment_failure, rollback_failure, ambiguous_rollback, preexisting, ambiguous_creation, wrong_identity };
+        keys: *crypto.RuntimeKeys,
+        mode: Mode,
+        saved: bool = false,
+        cleared: bool = false,
+        deleted: bool = false,
+        fn now() i64 {
+            return 1_893_456_003;
+        }
+        fn save(raw: *anyopaque, id: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqualStrings("lnk_22222222222222222222222222222222", id);
+            self.saved = true;
+        }
+        fn clear(raw: *anyopaque, id: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqualStrings("lnk_22222222222222222222222222222222", id);
+            try std.testing.expect(self.deleted);
+            self.cleared = true;
+        }
+        fn receipt(self: *@This(), allocator: std.mem.Allocator, removed: bool) ![]u8 {
+            const signing = self.keys.signing.public_key.toBytes();
+            const encryption = self.keys.encryption.public_key;
+            const signing_thumb = try crypto.thumbprintAlloc(allocator, "Ed25519", &signing);
+            defer allocator.free(signing_thumb);
+            const encryption_thumb = try crypto.thumbprintAlloc(allocator, "X25519", &encryption);
+            defer allocator.free(encryption_thumb);
+            return std.json.Stringify.valueAlloc(allocator, .{
+                .contract_version = "1",
+                .link_id = "lnk_22222222222222222222222222222222",
+                .runtime_id = "11111111111111111111111111111111",
+                .instance_id = if (self.mode == .wrong_identity) "99999999999999999999999999999999" else "22222222222222222222222222222222",
+                .runtime_key_thumbprint = signing_thumb,
+                .runtime_encryption_key_thumbprint = encryption_thumb,
+                .status = if (removed) "unlinked" else "linked",
+                .created_at = "2030-01-01T00:00:03.000Z",
+                .unlinked_at = if (removed) @as(?[]const u8, "2030-01-01T00:00:04.000Z") else null,
+            }, .{});
+        }
+        fn send(raw: *anyopaque, allocator: std.mem.Allocator, request: client_mod.Request) !client_mod.Response {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (std.mem.endsWith(u8, request.url, "/.well-known/verde-connect-configuration")) {
+                return .{ .status = .ok, .body = try allocator.dupe(u8,
+                    \\{"contract_version":"1","issuer":"https://connect.example.test","api_base_url":"https://connect.example.test","oidc":{"issuer":"https://id.example.test","authorization_endpoint":"https://id.example.test/auth","token_endpoint":"https://id.example.test/token","public_client":{"client_id":"verde","scopes":["openid"],"redirect_uris":["http://127.0.0.1:48123/callback"],"response_type":"code","token_endpoint_auth_method":"none"},"code_challenge_methods_supported":["S256"],"headless_authorization":{"supported":false}},"jwks_uri":"https://connect.example.test/v1/.well-known/jwks.json","signer_metadata_url":"https://connect.example.test/v1/signer-metadata","capabilities":["runtime-link-proof-ed25519","inventory-v1","bootstrap-grant-eddsa","connector-credential-jwe-x25519","endpoint-external"]}
+                ) };
+            }
+            if (std.mem.endsWith(u8, request.url, "/v1/signer-metadata")) {
+                return .{ .status = .ok, .body = try allocator.dupe(u8,
+                    \\{"contract_version":"1","issuer":"https://connect.example.test","jwks_uri":"https://connect.example.test/v1/.well-known/jwks.json","algorithms":["EdDSA"],"maximum_grant_lifetime_seconds":300}
+                ) };
+            }
+
+            if (std.mem.endsWith(u8, request.url, "/v1/runtime-links/challenges")) {
+                return .{ .status = .created, .body = try allocator.dupe(u8,
+                    \\{"contract_version":"1","challenge_id":"chl_11111111111111111111111111111111","audience":"https://connect.example.test","principal":{"issuer":"https://id.example.test","subject":"fixture"},"nonce":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","expires_at":"2030-01-01T00:01:00.000Z"}
+                ) };
+            }
+            if (std.mem.endsWith(u8, request.url, "/v1/runtime-links")) {
+                return .{ .status = if (self.mode == .preexisting) .ok else .created, .body = if (self.mode == .ambiguous_creation) try allocator.dupe(u8, "{broken") else try self.receipt(allocator, false) };
+            }
+            if (std.mem.endsWith(u8, request.url, "/endpoint-enrollments")) {
+                try std.testing.expect(self.saved and !self.cleared);
+                return error.EnrollmentRefused;
+            }
+            if (request.method == .DELETE) {
+                try std.testing.expect(self.saved);
+                try std.testing.expectEqualStrings("https://connect.example.test/v1/runtime-links/lnk_22222222222222222222222222222222", request.url);
+                try std.testing.expectEqualStrings("synthetic-offline-fixture-token", request.bearer_token.?);
+                self.deleted = true;
+                if (self.mode == .rollback_failure) return error.RollbackTransportFailed;
+                return .{ .status = .ok, .body = if (self.mode == .ambiguous_rollback) try allocator.dupe(u8, "{broken") else try self.receipt(allocator, true) };
+            }
+            return error.UnexpectedFixtureRequest;
+        }
+    };
+    var keys = crypto.RuntimeKeys.generate(std.testing.io);
+    defer keys.clear();
+    inline for (std.meta.tags(Fixture.Mode)) |mode| {
+        var fixture: Fixture = .{ .keys = &keys, .mode = mode };
+        const result = link(std.testing.allocator, .{ .context = &fixture, .send_fn = Fixture.send }, &keys, null, .{
+            .control_plane_url = "https://connect.example.test",
+            .bearer_token = "synthetic-offline-fixture-token",
+            .runtime_id = "11111111111111111111111111111111",
+            .instance_id = "22222222222222222222222222222222",
+            .request_id = "req_33333333333333333333333333333333",
+            .provider = "noop_test",
+            .external_descriptor = null,
+            .now_seconds_fn = Fixture.now,
+            .recovery = .{ .context = &fixture, .save_fn = Fixture.save, .clear_fn = Fixture.clear },
+        });
+        if (mode == .ambiguous_creation) {
+            try std.testing.expectError(error.InvalidControlPlaneResponse, result);
+            try std.testing.expect(!fixture.saved and !fixture.deleted);
+        } else if (mode == .wrong_identity) {
+            try std.testing.expectError(error.LinkIdentityMismatch, result);
+            try std.testing.expect(!fixture.saved and !fixture.deleted);
+        } else {
+            try std.testing.expectError(error.EnrollmentRefused, result);
+            try std.testing.expect(fixture.saved);
+            try std.testing.expectEqual(mode != .preexisting, fixture.deleted);
+            try std.testing.expectEqual(mode == .enrollment_failure, fixture.cleared);
         }
     }
 }

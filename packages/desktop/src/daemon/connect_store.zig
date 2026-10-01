@@ -184,7 +184,7 @@ pub fn recordLogin(
         \\update runtime_connect_state
         \\set control_plane_url = ?1, issuer = ?2, signer_jwks_json = ?3,
         \\    maximum_grant_lifetime_seconds = ?4, authenticated = 1,
-        \\    lifecycle_state = case when desired_state = 'linked' then lifecycle_state else 'logged_in' end,
+        \\    lifecycle_state = case when link_id is not null or desired_state = 'linked' then lifecycle_state else 'logged_in' end,
         \\    last_error_code = null, updated_at_ms = ?5
         \\where singleton = 1
     , .{ control_plane_url, issuer, signer_jwks_json, maximum_grant_lifetime_seconds, now_ms });
@@ -194,12 +194,14 @@ pub fn beginLink(conn: zqlite.Conn, request_id: []const u8, provider: []const u8
     try conn.execNoArgs("begin immediate");
     errdefer conn.rollback();
     var row = (try conn.row(
-        "select authenticated, desired_state from runtime_connect_state where singleton = 1",
+        "select authenticated, link_id from runtime_connect_state where singleton = 1",
         .{},
     )).?;
     const authenticated = row.int(0) == 1;
+    const recovery_pending = row.nullableText(1) != null;
     row.deinit();
     if (!authenticated) return error.ConnectLoginRequired;
+    if (recovery_pending) return error.ConnectAlreadyLinked;
     try conn.exec(
         \\update runtime_connect_state
         \\set desired_state = 'linked', lifecycle_state = 'linking', request_id = ?1,
@@ -208,6 +210,49 @@ pub fn beginLink(conn: zqlite.Conn, request_id: []const u8, provider: []const u8
         \\where singleton = 1
     , .{ request_id, provider, now_ms });
     try conn.commit();
+}
+
+/// Keep a verified remote link unlinkable across enrollment failure/restart.
+/// Pending recovery cannot accept grants or claim a completed enrollment.
+pub fn recordLinkRecovery(conn: zqlite.Conn, request_id: []const u8, link_id: []const u8, now_ms: i64) !void {
+    var row = (try conn.row(
+        \\update runtime_connect_state
+        \\set desired_state = 'unlinked', lifecycle_state = 'unlinking', link_id = ?1,
+        \\    connector_running = 0, updated_at_ms = ?3
+        \\where singleton = 1 and authenticated = 1 and desired_state = 'linked'
+        \\    and lifecycle_state = 'linking' and request_id = ?2 and link_id is null
+        \\returning link_id
+    , .{ link_id, request_id, now_ms })) orelse return error.ConnectRecoveryStateChanged;
+    row.deinit();
+}
+
+/// Clear only the exact request's verified rollback; never a replacement link.
+pub fn clearLinkRecovery(conn: zqlite.Conn, request_id: []const u8, link_id: []const u8, now_ms: i64) !void {
+    var row = (try conn.row(
+        \\update runtime_connect_state
+        \\set link_id = null, request_id = null, desired_state = 'unlinked',
+        \\    lifecycle_state = case when authenticated = 1 then 'logged_in' else 'logged_out' end,
+        \\    updated_at_ms = ?3
+        \\where singleton = 1 and request_id = ?2 and link_id = ?1
+        \\    and lifecycle_state = 'unlinking' and enrollment_id is null
+        \\returning singleton
+    , .{ link_id, request_id, now_ms })) orelse return error.ConnectRecoveryStateChanged;
+    row.deinit();
+}
+
+/// Completing enrollment must still own the durable request and recovery ID.
+pub fn recordLinkedForRequest(conn: zqlite.Conn, request_id: []const u8, linked: Linked, connector_running: bool, now_ms: i64) !void {
+    var row = (try conn.row(
+        \\update runtime_connect_state
+        \\set desired_state = 'linked', lifecycle_state = 'linked', enrollment_id = ?3,
+        \\    endpoint_https_url = ?4, endpoint_wss_url = ?5, connector_provider = ?6,
+        \\    connector_running = ?7, retry_attempt = 0, next_retry_at_ms = null,
+        \\    last_error_code = null, updated_at_ms = ?8
+        \\where singleton = 1 and authenticated = 1 and link_id = ?1 and request_id = ?2
+        \\    and desired_state = 'unlinked' and lifecycle_state = 'unlinking' and enrollment_id is null
+        \\returning singleton
+    , .{ linked.link_id, request_id, linked.enrollment_id, linked.endpoint_https_url, linked.endpoint_wss_url, linked.connector_provider, @intFromBool(connector_running), now_ms })) orelse return error.ConnectRecoveryStateChanged;
+    row.deinit();
 }
 
 pub fn recordLinked(conn: zqlite.Conn, linked: Linked, connector_running: bool, now_ms: i64) !void {
@@ -233,7 +278,7 @@ pub fn recordRetry(conn: zqlite.Conn, error_code: []const u8, attempt: u16, next
 pub fn beginUnlink(conn: zqlite.Conn, now_ms: i64) !void {
     try conn.exec(
         \\update runtime_connect_state
-        \\set desired_state = 'unlinked', lifecycle_state = 'unlinking',
+        \\set desired_state = 'unlinked', lifecycle_state = 'unlinking', request_id = null,
         \\    connector_running = 0, retry_attempt = 0, next_retry_at_ms = null,
         \\    last_error_code = null, updated_at_ms = ?1
         \\where singleton = 1
@@ -427,4 +472,91 @@ test "bootstrap grant ID and nonce are consumed atomically once" {
     try std.testing.expectError(error.ConnectBootstrapReplay, consumeBootstrap(conn, "grt_33333333333333333333333333333333", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", runtime_id, instance_id, "lnk_99999999999999999999999999999999", "https://connect.example.test", "https://runtime.example.test", "dev_22222222222222222222222222222222", 1_002, 90_000));
     try beginUnlink(conn, 4);
     try std.testing.expectError(error.ConnectLinkRequired, consumeBootstrap(conn, "grt_44444444444444444444444444444444", "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC", runtime_id, instance_id, "lnk_99999999999999999999999999999999", "https://connect.example.test", "https://runtime.example.test", "dev_22222222222222222222222222222222", 1_003, 90_000));
+}
+
+test "partial remote link remains unlinkable after restart and cannot complete after cancellation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const runtime_id = "0123456789abcdef0123456789abcdef";
+    const instance_id = "abcdef0123456789abcdef0123456789";
+    const request_id = "req_11111111111111111111111111111111";
+    const link_id = "lnk_22222222222222222222222222222222";
+    var conn = try openTestStore(&tmp);
+    try initialize(conn, runtime_id, instance_id);
+    try recordLogin(conn, "https://connect.example.test", "https://connect.example.test", "{\"keys\":[]}", 300, 1);
+    try beginLink(conn, request_id, "external", 2);
+    try recordLinkRecovery(conn, request_id, link_id, 3);
+    conn.close();
+    conn = try openTestStore(&tmp);
+    defer conn.close();
+    var state = try load(std.testing.allocator, conn);
+    defer state.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(link_id, state.link_id.?);
+    try std.testing.expectEqual(connect.DesiredState.unlinked, state.desired_state);
+    try std.testing.expectEqual(connect.LifecycleState.unlinking, state.lifecycle_state);
+    try std.testing.expect(state.enrollment_id == null and !state.connector_running);
+    try std.testing.expectError(error.ConnectLinkRequired, consumeBootstrap(conn, "grt_44444444444444444444444444444444", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", runtime_id, instance_id, link_id, "https://connect.example.test", "https://runtime.example.test", "dev_55555555555555555555555555555555", 4, 90_000));
+    // Reauthentication must preserve the durable pending cleanup, not claim
+    // login completion or allow a second creation to replace its recovery ID.
+    try recordLogin(conn, "https://connect.example.test", "https://connect.example.test", "{}", 300, 4);
+    try std.testing.expectError(error.ConnectAlreadyLinked, beginLink(conn, "other-request", "external", 4));
+    var relogged = try load(std.testing.allocator, conn);
+    defer relogged.deinit(std.testing.allocator);
+    try std.testing.expectEqual(connect.LifecycleState.unlinking, relogged.lifecycle_state);
+    try std.testing.expectEqualStrings(link_id, relogged.link_id.?);
+    try beginUnlink(conn, 5);
+    try std.testing.expectError(error.ConnectRecoveryStateChanged, recordLinkedForRequest(conn, request_id, .{
+        .link_id = link_id,
+        .enrollment_id = "enr_33333333333333333333333333333333",
+        .endpoint_https_url = "https://runtime.example.test",
+        .endpoint_wss_url = "wss://runtime.example.test/ws",
+        .connector_provider = "external",
+    }, false, 6));
+    try recordUnlinked(conn, 7);
+    var cleared = try load(std.testing.allocator, conn);
+    defer cleared.deinit(std.testing.allocator);
+    try std.testing.expect(cleared.link_id == null);
+}
+
+test "rollback callbacks are fenced to exact pending link and request" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const conn = try openTestStore(&tmp);
+    defer conn.close();
+    try initialize(conn, "0123456789abcdef0123456789abcdef", "abcdef0123456789abcdef0123456789");
+    try recordLogin(conn, "https://connect.example.test", "https://connect.example.test", "{\"keys\":[]}", 300, 1);
+    const request_id = "req_11111111111111111111111111111111";
+    const link_id = "lnk_22222222222222222222222222222222";
+    try beginLink(conn, request_id, "external", 2);
+    try std.testing.expectError(error.ConnectRecoveryStateChanged, recordLinkRecovery(conn, "other-request", link_id, 3));
+    try recordLinkRecovery(conn, request_id, link_id, 3);
+    try std.testing.expectError(error.ConnectRecoveryStateChanged, clearLinkRecovery(conn, request_id, "other-link", 4));
+    try std.testing.expectError(error.ConnectRecoveryStateChanged, clearLinkRecovery(conn, "other-request", link_id, 4));
+    var pending = try load(std.testing.allocator, conn);
+    defer pending.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(link_id, pending.link_id.?);
+    try clearLinkRecovery(conn, request_id, link_id, 5);
+    var cleared = try load(std.testing.allocator, conn);
+    defer cleared.deinit(std.testing.allocator);
+    try std.testing.expect(cleared.link_id == null and cleared.request_id == null);
+}
+
+test "verified enrollment completes only its exact durable recovery" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const conn = try openTestStore(&tmp);
+    defer conn.close();
+    try initialize(conn, "0123456789abcdef0123456789abcdef", "abcdef0123456789abcdef0123456789");
+    try recordLogin(conn, "https://connect.example.test", "https://connect.example.test", "{\"keys\":[]}", 300, 1);
+    const request_id = "req_11111111111111111111111111111111";
+    const linked: Linked = .{ .link_id = "lnk_22222222222222222222222222222222", .enrollment_id = "enr_33333333333333333333333333333333", .endpoint_https_url = "https://runtime.example.test", .endpoint_wss_url = "wss://runtime.example.test/ws", .connector_provider = "external" };
+    try beginLink(conn, request_id, "external", 2);
+    try recordLinkRecovery(conn, request_id, linked.link_id, 3);
+    try std.testing.expectError(error.ConnectRecoveryStateChanged, recordLinkedForRequest(conn, "stale-request", linked, false, 4));
+    try recordLinkedForRequest(conn, request_id, linked, false, 4);
+    try std.testing.expectError(error.ConnectRecoveryStateChanged, clearLinkRecovery(conn, request_id, linked.link_id, 5));
+    var completed = try load(std.testing.allocator, conn);
+    defer completed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(connect.LifecycleState.linked, completed.lifecycle_state);
+    try std.testing.expectEqualStrings(linked.enrollment_id, completed.enrollment_id.?);
 }
