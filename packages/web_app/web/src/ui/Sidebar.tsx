@@ -5,6 +5,7 @@ import { store, type SidebarContextAction } from '../lib/store'
 import { paneIsActive, type LayoutNode, type LivePane, type Workspace } from '../lib/types'
 import { Icon, ProviderGlyph, StatusPip, VerdeLogo } from './Icons'
 import { ChatRouting } from './ChatRouting'
+import { GitChangesDot } from './GitChanges'
 import { openDesktopViewer } from './DesktopViewer'
 import { openHistory } from './History'
 import { sidebarMenuAvailability } from '../lib/commands'
@@ -12,6 +13,10 @@ import { sidebarMenuAvailability } from '../lib/commands'
 // Sidebar-only view state: the selected workspace whose pane list is folded.
 // Keyed by id so selecting a different workspace always shows its panes.
 const [foldedWorkspaceId, setFoldedWorkspaceId] = createSignal<string | null>(null)
+
+/// Live workspace reorder drag: the dragged id and the id it would land
+/// before (null = end of list), mirroring the desktop sidebar drop line.
+const [workspaceDrag, setWorkspaceDrag] = createSignal<{ id: string; before_id: string | null } | null>(null)
 
 function sameKeys(a: readonly string[], b: readonly string[]): boolean {
   return a.length === b.length && a.every((key, index) => key === b[index])
@@ -162,7 +167,7 @@ export function Sidebar(props: { drawer?: boolean }) {
 
         <Show
           when={!collapsed()}
-          fallback={<CollapsedRail onOpenContext={openWorkspaceMenu} />}
+          fallback={<CollapsedRail onOpenContext={openWorkspaceMenu} onDragStart={() => setMenu(null)} />}
         >
           <div
             class="min-h-0 flex-1 overflow-y-auto px-4 scrollbar-thin"
@@ -194,10 +199,14 @@ export function Sidebar(props: { drawer?: boolean }) {
                     workspace={workspace()}
                     onOpenContext={(x, y) => openWorkspaceMenu(workspace(), x, y)}
                     onOpenPaneContext={openPaneMenu}
+                    onDragStart={() => setMenu(null)}
                   />
                 )
               }}
             </For>
+            <Show when={workspaceDrag()?.before_id === null}>
+              <div class="h-[2px] rounded-full bg-[var(--accent)]" />
+            </Show>
           </div>
         </Show>
 
@@ -348,12 +357,17 @@ function WorkspaceGroup(props: {
   workspace: Workspace
   onOpenContext: (x: number, y: number) => void
   onOpenPaneContext: (pane: LivePane, x: number, y: number) => void
+  onDragStart: () => void
 }) {
   const selected = () => store.workspaceId() === props.workspace.workspace_id
+  const drag = createWorkspaceDrag(() => props.workspace.workspace_id, props.onDragStart)
   // Tapping the already-open workspace folds its pane list; selecting any
   // workspace (including this one again) unfolds it.
   const expanded = () => selected() && foldedWorkspaceId() !== props.workspace.workspace_id
-  const context = createContextTrigger(props.onOpenContext)
+  const context = createContextTrigger((x, y) => {
+    drag.arm()
+    props.onOpenContext(x, y)
+  })
   // Split groups render their layout tree once per mount, so a layout change
   // is part of the key; everything else updates in place.
   const group_rows = keyedRows(
@@ -361,18 +375,23 @@ function WorkspaceGroup(props: {
     (group) => (group.panes.length > 1 ? `${group.key}\u0000${JSON.stringify(group.layout)}` : group.key),
   )
   return (
-    <section class="relative mb-2">
+    <section class={`relative mb-2 ${drag.dragging() ? 'opacity-50' : ''}`}>
+      <Show when={drag.dropBefore()}>
+        <span class="absolute -top-[5px] right-0 left-0 h-[2px] rounded-full bg-[var(--accent)]" />
+      </Show>
       <Show when={selected()}>
         <span class="absolute top-1 bottom-1 -left-3 w-[3px] rounded-full bg-[var(--accent)]" />
       </Show>
       <div
+        ref={drag.ref}
+        data-workspace-drag-row={props.workspace.workspace_id}
         class="group flex h-11 w-full touch-pan-y select-none items-center rounded-[6px] pr-1 hover:bg-[var(--accent-hover)] lg:h-[30px]"
         style={{ '-webkit-touch-callout': 'none' }}
         onContextMenu={context.onContextMenu}
-        onPointerDown={context.onPointerDown}
-        onPointerMove={context.onPointerMove}
-        onPointerUp={context.onPointerUp}
-        onPointerCancel={context.onPointerCancel}
+        onPointerDown={(event) => { context.onPointerDown(event); drag.onPointerDown(event) }}
+        onPointerMove={(event) => { context.onPointerMove(event); drag.onPointerMove(event) }}
+        onPointerUp={(event) => { context.onPointerUp(); drag.onPointerUp(event) }}
+        onPointerCancel={() => { context.onPointerCancel(); drag.onPointerCancel() }}
       >
         <button
           type="button"
@@ -524,6 +543,7 @@ function PaneRow(props: {
         <ProviderGlyph provider={props.pane.provider} />
       </Show>
       <span class="min-w-0 flex-1 truncate text-[15px] text-[var(--text-muted)] lg:text-[13px]">{store.paneTitle(props.pane)}</span>
+      <GitChangesDot pane={props.pane} />
       <Show when={working()}>
         <StatusPip active />
       </Show>
@@ -531,7 +551,7 @@ function PaneRow(props: {
   )
 }
 
-function CollapsedRail(props: { onOpenContext: (workspace: Workspace, x: number, y: number) => void }) {
+function CollapsedRail(props: { onOpenContext: (workspace: Workspace, x: number, y: number) => void; onDragStart: () => void }) {
   const workspace_rows = keyedRows(() => store.workspaces(), (workspace) => workspace.workspace_id)
   return (
     <div class="flex min-h-0 flex-1 flex-col items-center gap-2 overflow-y-auto pt-1 scrollbar-thin">
@@ -539,11 +559,17 @@ function CollapsedRail(props: { onOpenContext: (workspace: Workspace, x: number,
         {(id) => {
           const row = workspace_rows.row(id)
           const selected = () => store.workspaceId() === id
-          const context = createContextTrigger((x, y) => props.onOpenContext(row(), x, y))
+          const drag = createWorkspaceDrag(() => id, props.onDragStart)
+          const context = createContextTrigger((x, y) => {
+            drag.arm()
+            props.onOpenContext(row(), x, y)
+          })
           return (
             <button
+              ref={drag.ref}
               type="button"
-              class={`relative grid h-9 w-9 touch-pan-y select-none place-items-center rounded-[6px] ${selected() ? 'bg-[var(--accent-row)]' : 'hover:bg-[var(--accent-hover)]'}`}
+              data-workspace-drag-row={id}
+              class={`relative grid h-9 w-9 shrink-0 touch-pan-y select-none place-items-center rounded-[6px] ${selected() ? 'bg-[var(--accent-row)]' : 'hover:bg-[var(--accent-hover)]'} ${drag.dragging() ? 'opacity-50' : ''}`}
               style={{ '-webkit-touch-callout': 'none' }}
               title={row().label}
               onClick={(event) => {
@@ -551,11 +577,14 @@ function CollapsedRail(props: { onOpenContext: (workspace: Workspace, x: number,
                 store.selectWorkspace(id)
               }}
               onContextMenu={context.onContextMenu}
-              onPointerDown={context.onPointerDown}
-              onPointerMove={context.onPointerMove}
-              onPointerUp={context.onPointerUp}
-              onPointerCancel={context.onPointerCancel}
+              onPointerDown={(event) => { context.onPointerDown(event); drag.onPointerDown(event) }}
+              onPointerMove={(event) => { context.onPointerMove(event); drag.onPointerMove(event) }}
+              onPointerUp={(event) => { context.onPointerUp(); drag.onPointerUp(event) }}
+              onPointerCancel={() => { context.onPointerCancel(); drag.onPointerCancel() }}
             >
+              <Show when={drag.dropBefore()}>
+                <span class="absolute -top-[5px] right-0 left-0 h-[2px] rounded-full bg-[var(--accent)]" />
+              </Show>
               <Show when={selected()}>
                 <span class="absolute top-1 bottom-1 left-0 w-[3px] rounded-full bg-[var(--accent)]" />
               </Show>
@@ -564,6 +593,9 @@ function CollapsedRail(props: { onOpenContext: (workspace: Workspace, x: number,
           )
         }}
       </For>
+      <Show when={workspaceDrag()?.before_id === null}>
+        <div class="h-[2px] w-9 shrink-0 rounded-full bg-[var(--accent)]" />
+      </Show>
     </div>
   )
 }
@@ -827,6 +859,111 @@ function contextMenuItems(target: SidebarMenuTarget): MenuItem[] {
 function paneZoomItem(pane: LivePane): MenuItem {
   const zoomed = store.maximizedPaneId() === pane.pane_id
   return { action: 'pane-zoom', label: zoomed ? 'Unzoom pane' : 'Zoom pane' }
+}
+
+/// Sidebar workspace reorder drag. Mouse drags start after a small move, like
+/// the desktop rail. Touch keeps vertical swipes for scrolling: a long press
+/// (which also opens the context menu) arms the drag, and moving afterwards
+/// closes the menu and drags the row instead.
+function createWorkspaceDrag(id: () => string, onStart: () => void) {
+  const START_DISTANCE = 6
+  const EDGE_SCROLL = 36
+  let element: HTMLElement | undefined
+  let pointer: number | null = null
+  let origin_x = 0
+  let origin_y = 0
+  let armed = false
+  const [dragging, setDragging] = createSignal(false)
+
+  // Once armed, the touch must not become a scroll gesture (which would
+  // pointercancel the drag); only a non-passive touchmove can veto that.
+  const blockTouchScroll = (event: TouchEvent) => {
+    if (armed || dragging()) event.preventDefault()
+  }
+  const reset = () => {
+    pointer = null
+    armed = false
+    if (dragging()) {
+      setDragging(false)
+      setWorkspaceDrag(null)
+    }
+  }
+  onCleanup(() => {
+    element?.removeEventListener('touchmove', blockTouchScroll)
+    if (dragging()) setWorkspaceDrag(null)
+  })
+
+  const dropTarget = (y: number): string | null => {
+    const rows = [...document.querySelectorAll<HTMLElement>('[data-workspace-drag-row]')]
+      .filter((row) => row.getClientRects().length > 0)
+    for (const row of rows) {
+      const rect = row.getBoundingClientRect()
+      if (y < rect.top + rect.height / 2) return row.dataset.workspaceDragRow ?? null
+    }
+    return null
+  }
+  const autoScroll = (y: number) => {
+    let scroller = element?.parentElement ?? null
+    while (scroller && !(scroller.scrollHeight > scroller.clientHeight && getComputedStyle(scroller).overflowY !== 'visible')) {
+      scroller = scroller.parentElement
+    }
+    if (!scroller) return
+    const box = scroller.getBoundingClientRect()
+    if (y < box.top + EDGE_SCROLL) scroller.scrollBy(0, -12)
+    else if (y > box.bottom - EDGE_SCROLL) scroller.scrollBy(0, 12)
+  }
+  // The drop's trailing click must not also select or toggle the row.
+  const swallowNextClick = () => {
+    const swallow = (event: MouseEvent) => {
+      event.preventDefault()
+      event.stopPropagation()
+    }
+    window.addEventListener('click', swallow, { capture: true, once: true })
+    window.setTimeout(() => window.removeEventListener('click', swallow, { capture: true }), 0)
+  }
+
+  return {
+    dragging,
+    dropBefore: () => {
+      const state = workspaceDrag()
+      return Boolean(state && state.id !== id() && state.before_id === id())
+    },
+    ref: (el: HTMLElement) => {
+      element = el
+      el.addEventListener('touchmove', blockTouchScroll, { passive: false })
+    },
+    arm: () => {
+      if (pointer !== null) armed = true
+    },
+    onPointerDown: (event: PointerEvent) => {
+      if (event.button !== 0) return
+      pointer = event.pointerId
+      origin_x = event.clientX
+      origin_y = event.clientY
+      armed = event.pointerType === 'mouse'
+    },
+    onPointerMove: (event: PointerEvent) => {
+      if (event.pointerId !== pointer) return
+      if (!dragging()) {
+        if (!armed || Math.hypot(event.clientX - origin_x, event.clientY - origin_y) < START_DISTANCE) return
+        element?.setPointerCapture(event.pointerId)
+        setDragging(true)
+        onStart()
+      }
+      event.preventDefault()
+      setWorkspaceDrag({ id: id(), before_id: dropTarget(event.clientY) })
+      autoScroll(event.clientY)
+    },
+    onPointerUp: (event: PointerEvent) => {
+      if (event.pointerId !== pointer) return
+      const state = dragging() ? workspaceDrag() : null
+      reset()
+      if (!state) return
+      swallowNextClick()
+      void store.moveWorkspace(state.id, state.before_id)
+    },
+    onPointerCancel: reset,
+  }
 }
 
 function createContextTrigger(onOpen: (x: number, y: number) => void) {

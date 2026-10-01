@@ -22,6 +22,7 @@ export const COMMANDS = [
   native('workspace.add', 'Add workspace', 'none'),
   native('workspace.rename', 'Rename workspace', 'workspace'),
   native('workspace.close', 'Close workspace', 'workspace'),
+  native('workspace.reopen', 'Reopen last closed workspace', 'none'),
   native('workspace.previous', 'Previous workspace', 'workspace', 'Alt+Up'),
   native('workspace.next', 'Next workspace', 'workspace', 'Alt+Down'),
   native('app.settings', 'Open settings', 'none', 'Ctrl+,'),
