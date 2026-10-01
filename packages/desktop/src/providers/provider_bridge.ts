@@ -399,7 +399,7 @@ function diffFromClaudeToolUse(item) {
   if (item?.type !== "tool_use") return null;
   const name = String(item.name ?? "").toLowerCase();
   const input = item.input && typeof item.input === "object" ? item.input : {};
-  const path = input.file_path ?? input.path;
+  const path = input.file_path ?? input.path ?? input.notebook_path;
   if (typeof path !== "string" || path.length === 0) return null;
 
   const makePatch = (oldText, newText, created = false) => {
@@ -437,6 +437,29 @@ function diffFromClaudeToolUse(item) {
       additions: content.length === 0 ? 0 : content.split("\n").length,
       deletions: 0,
       patch: makePatch("", content, true),
+    };
+  }
+  // The daemon attributes changed files to the chat from these events, so
+  // every file-editing tool reports its path, even without an exact patch.
+  if (name === "multiedit") {
+    const edits = Array.isArray(input.edits) ? input.edits : [];
+    const pairs = edits.filter((edit) => typeof edit?.old_string === "string" && typeof edit?.new_string === "string");
+    const oldText = pairs.map((edit) => edit.old_string).join("\n");
+    const newText = pairs.map((edit) => edit.new_string).join("\n");
+    return {
+      path,
+      additions: newText.length === 0 ? 0 : newText.split("\n").length,
+      deletions: oldText.length === 0 ? 0 : oldText.split("\n").length,
+      patch: pairs.length > 0 ? makePatch(oldText, newText) : undefined,
+    };
+  }
+  if (name === "notebookedit") {
+    const source = typeof input.new_source === "string" ? input.new_source : "";
+    return {
+      path,
+      additions: source.length === 0 ? 0 : source.split("\n").length,
+      deletions: 0,
+      patch: undefined,
     };
   }
   return null;
@@ -1044,6 +1067,22 @@ function claudeRejectedRateLimitMessage(message) {
   }
 }
 
+// Keep in sync with CLAUDE_SIGN_IN_REQUIRED_MESSAGE in desktop/src/utils.zig,
+// which renders this exact text as a sign-in card.
+const CLAUDE_SIGN_IN_REQUIRED_MESSAGE = "Claude Code is not signed in. Sign in, then send your message again.";
+
+function isClaudeSignedOutText(text) {
+  return typeof text === "string" && /not logged in|please run \/login|invalid api key|oauth token has expired|oauth token (?:was )?revoked/i.test(text);
+}
+
+// A signed-out CLI answers with a synthetic assistant message whose
+// stop_reason is "stop_sequence"; report the actionable cause instead.
+function claudeSignedOutMessage(message) {
+  if (message?.type === "assistant" && message.error === "authentication_failed") return CLAUDE_SIGN_IN_REQUIRED_MESSAGE;
+  if (message?.type === "result" && message.is_error && isClaudeSignedOutText(message.result)) return CLAUDE_SIGN_IN_REQUIRED_MESSAGE;
+  return null;
+}
+
 function formatClaudeCompactSummary(metadata, fallbackText) {
   const lines = [
     "Claude thread context compacted.",
@@ -1283,6 +1322,8 @@ async function handleClaudeSendPrompt(sdk, request) {
     for await (const message of query) {
       const rateLimitFailure = claudeRejectedRateLimitMessage(message);
       if (rateLimitFailure) throw new Error(rateLimitFailure);
+      const signedOutFailure = claudeSignedOutMessage(message);
+      if (signedOutFailure) throw new Error(signedOutFailure);
       if (message?.type === "stream_event") {
         if (emitClaudeChildTranscriptDelta(message, subagentByToolUseId, nestedAncestorByToolUseId)) continue;
         const streamedDelta = claudeTextDeltaFromStreamEvent(message);
@@ -1307,7 +1348,8 @@ async function handleClaudeSendPrompt(sdk, request) {
         sessionId = message.session_id ?? sessionId;
         if (message.is_error) {
           const errors = Array.isArray(message.errors) ? message.errors.filter((item) => typeof item === "string" && item.length > 0) : [];
-          throw new Error(errors.join("\n") || message.stop_reason || "Claude request failed during execution.");
+          const detail = errors.join("\n") || (typeof message.result === "string" ? message.result.trim() : "");
+          throw new Error(detail || "Claude request failed during execution.");
         }
         if (typeof message.result === "string") reply = message.result;
         if (backgroundState.pendingBackgrounds.length > 0) {
@@ -1341,7 +1383,8 @@ async function handleClaudeSendPrompt(sdk, request) {
   } catch (err) {
     finishInput();
     const stderr = stderrChunks.join("").trim();
-    if (stderr) throw new Error(`${err?.message ?? String(err)}\n${stderr}`);
+    // The GUI matches the sign-in text exactly to offer a sign-in action.
+    if (stderr && err?.message !== CLAUDE_SIGN_IN_REQUIRED_MESSAGE) throw new Error(`${err?.message ?? String(err)}\n${stderr}`);
     throw err;
   } finally {
     finishInput();

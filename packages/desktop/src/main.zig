@@ -614,6 +614,7 @@ fn mainInner(init: std.process.Init) !void {
                 app_state.pollMuseModelOptionsCache();
                 app_state.pollProviderReadiness();
                 app_state.pollCookieImport();
+                app_state.pollGitChanges();
                 app_state.pollUpdateCheck();
             }
         }.run, .{&state});
@@ -1872,6 +1873,8 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
         .window_focus_gained => {
             state.window_input_focus = true;
             _ = state.acknowledgeFocusedPaneCompletion();
+            // Files may have been committed or edited outside Verde.
+            state.refreshSelectedWorkspaceGitChanges(false);
         },
         .window_focus_lost => {
             state.window_input_focus = false;
@@ -2283,6 +2286,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             state.notePaletteWorkspaceMouseMotion(event.motion.x, event.motion.y);
             ui_layout.updateThreadImportModalHover(state, event.motion.x, event.motion.y);
             ui_layout.updateCookieImportModalHover(state, event.motion.x, event.motion.y);
+            ui_layout.updateCommitSheetHover(state, event.motion.x, event.motion.y);
             ui_layout.updateSettingsModalHover(state, event.motion.x, event.motion.y);
             ui_layout.updateCommandPaletteHover(state, event.motion.x, event.motion.y);
             const modal_owns_motion = ui_layout.handlePaletteMouseMotion(state, event.motion.x, event.motion.y);
@@ -2393,6 +2397,11 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             // The approval card overlays the gap between transcript and
             // composer, so it must receive clicks before pane/browser routing.
             if (event.button.button == 1 and chat_panel_ui.handleApprovalPaletteMouseButton(state, event.button.x, event.button.y, event.button.down)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            // The git outcome card floats over the bottom of the workspace.
+            if (event.button.button == 1 and ui_layout.handleGitToastMouseButton(state, event.button.x, event.button.y, event.button.down)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
@@ -2518,6 +2527,16 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             var input_fb_h: c_int = 0;
             getWindowSizeInPixels(window, &input_fb_w, &input_fb_h);
             if (ui_layout.handleCommandPaletteWheel(
+                state,
+                @floatFromInt(input_fb_w),
+                @floatFromInt(input_fb_h),
+                event.wheel.mouse_x,
+                event.wheel.mouse_y,
+                event.wheel.y,
+            )) {
+                return true;
+            }
+            if (ui_layout.handleCommitSheetWheel(
                 state,
                 @floatFromInt(input_fb_w),
                 @floatFromInt(input_fb_h),
