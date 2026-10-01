@@ -25,7 +25,7 @@ The gateway supports two explicit request envelopes while its listener remains l
 - Every runtime API and the exact `/ws` WebSocket upgrade requires that cookie or an `Authorization: Bearer` credential.
 - `GET /healthz` is the only unauthenticated health route and exposes liveness, not runtime inventory. `GET /login`, `GET /login.js`, and trusted static assets are public; unauthenticated app navigation redirects to `/login`.
 - The gateway talks only to `verde-sessionizer.sock`. It has no Desktop Live or mock fallback.
-- Arbitrary filesystem browsing is not available. Authenticated `/api/file` and `/api/preview` serve workspace documents opened from chat (PDF and office files) after absolute-path validation; HTML/SVG/JS are rejected.
+- Folder browsing is confined to daemon-authorized roots. Authenticated `/api/file` and `/api/preview` serve workspace documents opened from chat (PDF and office files) after absolute-path validation; HTML/SVG/JS are rejected.
 - Plain loopback requests support local use and SSH forwarding. Optional trusted-proxy mode accepts only the complete, exact forwarded HTTPS envelope for one configured origin, as used by Tailscale Serve; partial, mixed, duplicate, or standard `Forwarded` headers fail closed.
 
 Do not pass secrets through `--token`, `VERDE_WEB_TOKEN`, `?token=...`, or `X-Verde-Token`. Those legacy forms are rejected. Pass only a token-file path through `--token-file` or `VERDE_WEB_TOKEN_FILE`.
@@ -170,9 +170,18 @@ with the draft attachments retained; local uploads continue to work.
 
 ### Confined directory browsing
 
+The web **Add Workspace** dialog creates a managed folder when its optional
+path is empty, using the same Verde data-root `workspaces/` directory and
+`verde.toml` defaults as desktop. **Browse** opens a tappable host folder picker;
+no path typing or native dialog on the phone is required. Creation uses daemon
+RPC `workspace.create` with store mutation metadata and optional `path`, under
+`repository:write` for paired clients. Existing directories are imported without
+changing their files.
+
 Paired clients can call daemon RPC `workspace.directory.list {"path":"/absolute/path"}`
 with `repository:read`; `workspace.directory.v1` advertises support. It returns
 `{path,parent,directories:[{name,path}]}` with directories only (maximum 4096).
+Omit `path` to start at the daemon home directory (or the first authorized root).
 The daemon allows its home directory, parents of existing persisted workspace
 directories, and additional absolute roots in its colon-separated
 `VERDE_DIRECTORY_ROOTS` environment variable. Missing roots are ignored. No
