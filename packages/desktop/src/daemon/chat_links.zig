@@ -33,6 +33,11 @@ pub fn createTask(conn: zqlite.Conn, task: []const u8, workspace: []const u8, ch
     if (!std.mem.eql(u8, existing.text(0), workspace) or !std.mem.eql(u8, existing.text(1), child) or !std.mem.eql(u8, existing.text(2), owner)) return error.InvalidParams;
 }
 
+/// Messages sent to a busy child queue as separate turns that the provider
+/// folds into one run, so they all finish together with the same reply.
+/// The parent hears that outcome once, not once per queued message.
+const same_run_window_ms: i64 = 30_000;
+
 pub fn updateTask(conn: zqlite.Conn, task: []const u8, status: []const u8, summary: []const u8, approval: ?[]const u8, result: ?[]const u8, now: i64) !void {
     try conn.exec("savepoint chat_task_update", .{});
     errdefer conn.execNoArgs("rollback to chat_task_update; release chat_task_update") catch {};
@@ -44,7 +49,10 @@ pub fn updateTask(conn: zqlite.Conn, task: []const u8, status: []const u8, summa
             \\join chat_links l on l.workspace_id=t.workspace_id and l.local_thread_id=t.local_thread_id
             \\where t.task_id=? and l.delivery_enabled=1
             \\and not (t.status='blocked' and exists(select 1 from chat_deliveries d where d.task_id=t.task_id and d.link_id=l.link_id and d.status=t.status and d.summary=t.summary))
-        , .{task});
+            \\and not exists(select 1 from chat_deliveries d join chat_tasks o on o.task_id=d.task_id
+            \\ where d.link_id=l.link_id and d.task_id<>t.task_id and d.status=t.status and d.summary=t.summary
+            \\ and o.updated_at_ms>=t.updated_at_ms-?)
+        , .{ task, same_run_window_ms });
     }
     try conn.execNoArgs("release chat_task_update");
 }
@@ -188,4 +196,26 @@ test "removing a linked chat stops parent delivery" {
     var rows = (try conn.row("select count(*) from chat_deliveries where task_id='t2'", .{})).?;
     defer rows.deinit();
     try std.testing.expectEqual(@as(i64, 0), rows.int(0));
+}
+
+test "turns folded into one child run notify the parent once" {
+    var conn = try zqlite.open(":memory:", zqlite.OpenFlags.Create | zqlite.OpenFlags.EXResCode);
+    defer conn.close();
+    try conn.execNoArgs(@import("../db/chat_links_schema.zig").SCHEMA_SQL);
+    try conn.execNoArgs("insert into chat_links(link_id,workspace_id,parent_thread_id,local_thread_id) values('l','w','p','c')");
+    try createTask(conn, "t1", "w", "c", "verde", 1);
+    try createTask(conn, "t2", "w", "c", "verde", 2);
+    try createTask(conn, "t3", "w", "c", "verde", 3);
+    try updateTask(conn, "t1", "completed", "same reply", null, null, 100_000);
+    try updateTask(conn, "t2", "completed", "same reply", null, null, 100_300);
+    try updateTask(conn, "t3", "completed", "different reply", null, null, 100_400);
+    var folded = (try conn.row("select count(*) from chat_deliveries", .{})).?;
+    try std.testing.expectEqual(@as(i64, 2), folded.int(0));
+    folded.deinit();
+    // A later run that happens to repeat the reply is still news.
+    try createTask(conn, "t4", "w", "c", "verde", 4);
+    try updateTask(conn, "t4", "completed", "same reply", null, null, 500_000);
+    var later = (try conn.row("select count(*) from chat_deliveries where task_id='t4'", .{})).?;
+    defer later.deinit();
+    try std.testing.expectEqual(@as(i64, 1), later.int(0));
 }
