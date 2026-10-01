@@ -24,6 +24,8 @@ pub const BackgroundTask = struct {
     pid: ?u32 = null,
     pid_verified: bool = false,
     stop_requested: bool = false,
+    /// Set once a queued Codex stop has been handed to the shared poll worker.
+    stop_dispatched: bool = false,
     status: BackgroundTaskStatus,
     started_at_ms: i64 = 0,
     updated_at_ms: i64 = 0,

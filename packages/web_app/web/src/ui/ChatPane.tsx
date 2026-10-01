@@ -10,12 +10,14 @@ import { type Attachment, type LivePane, type Message, isSubagentThreadId } from
 import { effortLabel, effortOptionsIn, modelOptionsFor, modelSupportsFast, variantOptionsIn } from '../lib/models'
 import type { ModelOption } from '../lib/models'
 import { handleFileCitationClick, openFileViewer } from './FileViewer'
-import { Icon, ProviderGlyph, ZoomButton } from './Icons'
+import { Icon, ProviderGlyph, Spinner, ZoomButton } from './Icons'
 import { PaneActionsButton } from './Sidebar'
 
 import { ComposerFollowup } from './ComposerFollowup'
 import { ComposerSuggest, ComposerCommandStatus, type ComposerSuggestControls } from './ComposerSuggest'
 import { ProviderReadiness } from './ProviderReadiness'
+import { GitChangesChip } from './GitChanges'
+import { type CommitNotice, commitNoticeLink, commitNoticeLocalOnly, parseCommitNotice } from '../lib/git_changes'
 import { UsageCard } from './UsageCard'
 import { parseUsageSummary } from '../lib/usage'
 import { copyText, decorateCodeBlocks, emphasisSpans } from '../lib/highlight'
@@ -332,6 +334,7 @@ export function ChatPane(props: { pane: LivePane }) {
             </span>
           </Show>
         </Show>
+        <GitChangesChip pane={props.pane} />
         <ZoomButton pane={props.pane} />
         <PaneActionsButton pane={props.pane} />
       </header>
@@ -986,7 +989,7 @@ function DiffCell(props: { line?: DiffLine; side: 'old' | 'new' }) {
   )
 }
 
-function DiffPatch(props: { patch: string; path: string }) {
+export function DiffPatch(props: { patch: string; path: string }) {
   const [showAll, setShowAll] = createSignal(false)
   const allLines = createMemo(() => parsePatchLines(props.patch))
   const lines = createMemo(() => showAll() ? allLines() : allLines().slice(0, 2000))
@@ -1176,6 +1179,20 @@ function TranscriptRow(props: { message: Message; pane: LivePane }) {
   const usage = props.message.role === 'system' ? parseUsageSummary(props.message.author, props.message.body) : null
   if (usage && (usage.limits.length || usage.stats.length || usage.recent.length)) return <UsageCard usage={usage} />
 
+  const commit = isGitSystemRow(props.message) ? parseCommitNotice(props.message.body) : null
+  if (commit) return <CommitNoticeCard notice={commit} pane={props.pane} />
+
+  // Other daemon UI-only git notices render as a quiet one-liner rather than
+  // an assistant card.
+  if (isQuietSystemNotice(props.message)) {
+    return (
+      <div class="flex min-w-0 items-center gap-2 px-1 text-[12px] text-[var(--text-subtle)]" role="note">
+        <span class="h-px w-4 shrink-0 bg-[var(--border-muted)]" aria-hidden="true" />
+        <span class="min-w-0 truncate" title={props.message.body}>{props.message.body}</span>
+      </div>
+    )
+  }
+
   const mine = props.message.role === 'user'
   const html = () => renderMarkdown(props.message.body)
 
@@ -1198,6 +1215,87 @@ function TranscriptRow(props: { message: Message; pane: LivePane }) {
           <div class="mb-1.5 text-[12px] text-[var(--text-subtle)]">{props.message.author || 'Assistant'}</div>
           <MarkdownBody html={html()} highlight />
     </article>
+  )
+}
+
+function isGitSystemRow(message: Message): boolean {
+  return message.role === 'system' && !message.tool_call_kind && message.author === 'git'
+}
+
+function isQuietSystemNotice(message: Message): boolean {
+  return isGitSystemRow(message) && message.body.length > 0 && message.body.length <= 240 && !message.body.includes('\n')
+}
+
+/// Completed commit (daemon git row): check + file count, shas, Pushed pill,
+/// "View on <host>" links (pushed commits only); the subject and branch sit on
+/// a muted second line. Unpushed rows offer Push (with a muted "Not pushed")
+/// when the branch has something to push; rows from a repo with no remote say
+/// "Local only · no remote" instead. A push
+/// rewrites the row (same id), which remounts this card from the new body.
+function CommitNoticeCard(props: { notice: CommitNotice; pane: LivePane }) {
+  const git = store.gitChanges
+  const files = () => `${props.notice.files} ${props.notice.files === 1 ? 'file' : 'files'}`
+  const pushedAll = () => props.notice.commits.every((commit) => commit.pushed)
+  const canPush = () => git.canPushCommit(props.pane, props.notice)
+  const localOnly = () => commitNoticeLocalOnly(props.notice)
+  // Only the card that was clicked spins; other git actions just disable it.
+  const [clicked, setClicked] = createSignal(false)
+  const busy = () => git.actionRunning(props.pane)
+  const pushing = () => clicked() && busy()
+  const showPush = () => !localOnly() && (canPush() || pushing())
+  // Muted state: no remote at all, or unpushed while Push is offered (a hidden
+  // Push may mean it was pushed elsewhere, so stay quiet then).
+  const stateLabel = () => localOnly() ? 'Local only · no remote' : showPush() && !pushedAll() ? 'Not pushed' : null
+  const push = async () => {
+    setClicked(true)
+    try { await git.push(props.pane, true) } finally { setClicked(false) }
+  }
+  const pill = 'shrink-0 rounded-full bg-[color-mix(in_srgb,var(--accent)_14%,transparent)] px-1.5 py-px text-[10.5px] text-[var(--accent-hi)]'
+  return (
+    <div class="min-w-0 rounded-[8px] border border-[var(--border-muted)] bg-[color-mix(in_srgb,var(--panel-alt)_45%,transparent)] px-2.5 py-1.5 text-[12.5px]" role="note">
+      <div class="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+        <Icon name="check" class="h-3.5 w-3.5 shrink-0 text-[var(--diff-add)]" />
+        <span class="shrink-0 text-[var(--text-muted)]">{pushedAll() ? 'Committed & pushed' : 'Committed'} {files()}</span>
+        <For each={props.notice.commits}>
+          {(commit) => {
+            const link = commitNoticeLink(commit)
+            return (
+              <span class="flex min-w-0 items-center gap-1.5">
+                <span class="mono text-[var(--text)]">{commit.sha}</span>
+                <Show when={commit.repo}><span class="truncate text-[var(--text-subtle)]">{commit.repo}</span></Show>
+                <Show when={commit.pushed && !pushedAll()}><span class={pill}>Pushed</span></Show>
+                <Show when={link}>
+                  {(web) => (
+                    <a href={web().url} target="_blank" rel="noopener noreferrer"
+                      class="shrink-0 text-[12px] text-[var(--md-link)] underline-offset-2 hover:underline">View on {web().host}</a>
+                  )}
+                </Show>
+              </span>
+            )
+          }}
+        </For>
+        <Show when={stateLabel()}>
+          {(label) => <span class="ml-auto shrink-0 text-[11.5px] text-[var(--text-subtle)]">{label()}</span>}
+        </Show>
+        <Show when={showPush()}>
+          <button type="button" classList={{ 'ml-auto': !stateLabel() }}
+            class="flex h-6 shrink-0 items-center gap-1.5 rounded-[6px] border border-[var(--border-muted)] px-2 text-[12px] text-[var(--text)] hover:bg-[var(--accent-hover)] disabled:opacity-60"
+            disabled={busy()} aria-busy={pushing()} title="Push this branch"
+            onClick={() => void push()}>
+            <Show when={pushing()} fallback={<span aria-hidden="true">↑</span>}><Spinner class="h-3.5 w-3.5" /></Show>
+            {pushing() ? 'Pushing…' : 'Push'}
+          </button>
+        </Show>
+      </div>
+      <Show when={props.notice.subject || props.notice.branch}>
+        <div class="mt-0.5 flex min-w-0 items-center gap-2 pl-[22px] text-[12px] text-[var(--text-subtle)]">
+          <span class="min-w-0 flex-1 truncate" title={props.notice.subject ?? undefined}>{props.notice.subject ?? ''}</span>
+          <Show when={props.notice.branch}>
+            <span class="mono max-w-[45%] shrink-0 truncate rounded-[5px] border border-[var(--border-muted)] px-1.5 py-px text-[11px] text-[var(--text-muted)]" title={`branch ${props.notice.branch}`}>{props.notice.branch}</span>
+          </Show>
+        </div>
+      </Show>
+    </div>
   )
 }
 

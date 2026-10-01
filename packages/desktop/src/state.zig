@@ -59,6 +59,7 @@ const linked_chats_controller = @import("state/linked_chats_controller.zig");
 pub const resource_waiters_controller = @import("state/resource_waiters.zig");
 const browser_controller = @import("state/browser_controller.zig");
 const cookie_import_controller = @import("state/cookie_import_controller.zig");
+const git_changes_controller = @import("state/git_changes_controller.zig");
 const workspace_controller = @import("state/workspace_controller.zig");
 const lifecycle_controller = @import("state/lifecycle_controller.zig");
 const chat_controller = @import("state/chat_controller.zig");
@@ -1311,6 +1312,24 @@ fn prepareProjectionTranscriptContinuity(
             try keepLiveTranscriptRows(allocator, current, replacement);
             return;
         }
+        // Idle gap past hydrated rows (typically the turn's trailing
+        // snapshot row the tail poll never projected, or a few rows another
+        // client wrote). Dropping the hydrated history here collapsed a long
+        // thread to its newest rows and re-paged it under the viewport — the
+        // "transcript jumps after a turn" bug. Keep the live rows and let the
+        // render path fetch the bounded missing suffix instead; only a gap
+        // too large for one page falls back to the lazy-tail reload.
+        const replacement_end = replacement_start + replacement.messages.items.len;
+        if (replacement_start > current_end and current.messages.items.len > 0 and
+            replacement_end - current_end <= session_protocol.TRANSCRIPT_MESSAGE_PAGE_SIZE)
+        {
+            try keepLiveTranscriptRows(allocator, current, replacement);
+            replacement.transcript_suffix_checked_end = current.transcript_suffix_checked_end;
+            if (replacement_end != current.transcript_suffix_checked_end) {
+                replacement.transcript_suffix_gap_end = replacement_end;
+            }
+            return;
+        }
         if (replacement.messages.items.len == 0) {
             runtime_log.trace(
                 "projection transcript continuity skipped thread={s} current_start={d} current_end={d} replacement_start={d}",
@@ -1416,16 +1435,38 @@ test "lazy-tail refresh during a pending daemon turn keeps the live rows" {
     try std.testing.expectEqual(@as(usize, 0), replacement.persisted_message_offset);
     try std.testing.expectEqualStrings("earlier reply", replacement.messages.items[1].body);
 
-    // Same gap with no send in flight is foreign: leave the lazy tail alone
-    // so hydration reloads the durable rows.
+    // Same bounded gap with no send in flight keeps the hydrated rows too and
+    // records the durable end so the render path fetches the missing suffix
+    // instead of dropping history and re-paging it under the viewport.
     current.send_state.status = .idle;
     current.send_state.daemon_owned = false;
+    var idle = try ChatThread.init(allocator, "idle");
+    defer idle.deinit(allocator);
+    idle.persisted_message_offset = 4;
+    try prepareProjectionTranscriptContinuity(allocator, &current, &idle);
+    try std.testing.expectEqual(@as(usize, 2), idle.messages.items.len);
+    try std.testing.expectEqual(@as(usize, 0), idle.persisted_message_offset);
+    try std.testing.expectEqual(@as(usize, 4), idle.transcript_suffix_gap_end);
+
+    // A suffix already fetched empty at that end (sort-index gaps) is not
+    // requested again on every refresh.
+    current.transcript_suffix_checked_end = 4;
+    var checked = try ChatThread.init(allocator, "checked");
+    defer checked.deinit(allocator);
+    checked.persisted_message_offset = 4;
+    try prepareProjectionTranscriptContinuity(allocator, &current, &checked);
+    try std.testing.expectEqual(@as(usize, 2), checked.messages.items.len);
+    try std.testing.expectEqual(@as(usize, 0), checked.transcript_suffix_gap_end);
+    current.transcript_suffix_checked_end = 0;
+
+    // A gap larger than one page is foreign bulk history: leave the lazy
+    // tail alone so hydration reloads the durable rows.
     var foreign = try ChatThread.init(allocator, "foreign");
     defer foreign.deinit(allocator);
-    foreign.persisted_message_offset = 4;
+    foreign.persisted_message_offset = 2 + session_protocol.TRANSCRIPT_MESSAGE_PAGE_SIZE + 1;
     try prepareProjectionTranscriptContinuity(allocator, &current, &foreign);
     try std.testing.expectEqual(@as(usize, 0), foreign.messages.items.len);
-    try std.testing.expectEqual(@as(usize, 4), foreign.persisted_message_offset);
+    try std.testing.expectEqual(@as(usize, 0), foreign.transcript_suffix_gap_end);
 }
 
 fn prepareProjectionTranscriptRuntime(
@@ -1452,6 +1493,18 @@ fn prepareProjectionTranscriptRuntime(
             }
         }
     }
+}
+
+/// True when a projection refresh replaced hydrated rows with a window that
+/// starts later (continuity fell back to the lazy tail). Saved scroll offsets
+/// are top-relative in the old estimate space and must not survive that.
+/// An unchanged covered range is kept by transferProjectionThreadRuntime, so
+/// it is not a drop; after that swap the offsets read in reverse (also not a
+/// drop), which lets the pane pass run after the thread transfer.
+fn replacementDropsHydratedTranscript(current: *const ChatThread, replacement: *const ChatThread) bool {
+    return current.messages.items.len > 0 and
+        replacement.persisted_message_offset > current.persisted_message_offset and
+        !replacementTranscriptIsUnchangedCoveredRange(current, replacement);
 }
 
 fn replacementTranscriptPreservesLayoutCoordinates(current: *const ChatThread, replacement: *const ChatThread) bool {
@@ -1499,6 +1552,10 @@ fn transferProjectionThreadRuntime(current: *ChatThread, replacement: *ChatThrea
     }
     replacement.draft_mutation_generation = current.draft_mutation_generation;
     replacement.draft_mutation_ack_revision = current.draft_mutation_ack_revision;
+    // Suffix-gap bookkeeping is GUI runtime state; continuity may already
+    // have set it on the replacement for this refresh.
+    if (replacement.transcript_suffix_gap_end == 0) replacement.transcript_suffix_gap_end = current.transcript_suffix_gap_end;
+    replacement.transcript_suffix_checked_end = @max(replacement.transcript_suffix_checked_end, current.transcript_suffix_checked_end);
     // Title generation is GUI-owned and is never reconstructed from a daemon
     // projection, so its worker/result state always follows the stable thread.
     std.mem.swap(@TypeOf(current.title_generation_state), &current.title_generation_state, &replacement.title_generation_state);
@@ -1573,14 +1630,16 @@ fn preserveProjectionRuntime(
                 // Borrowed threads alias their live slot; nothing to carry.
                 if (next_thread.projection_borrowed) continue;
                 const current_thread = threadByIdForViewport(current_project, next_thread.local_thread_id) orelse continue;
-                next_thread.transcript_scroll_valid = current_thread.transcript_scroll_valid;
+                next_thread.transcript_scroll_valid = current_thread.transcript_scroll_valid and
+                    !replacementDropsHydratedTranscript(current_thread, next_thread);
                 next_thread.transcript_scroll_y = current_thread.transcript_scroll_y;
                 transferProjectionThreadRuntime(current_thread, next_thread);
             }
             for (next_project.archived_threads.items) |*next_thread| {
                 if (next_thread.projection_borrowed) continue;
                 const current_thread = threadByIdForViewport(current_project, next_thread.local_thread_id) orelse continue;
-                next_thread.transcript_scroll_valid = current_thread.transcript_scroll_valid;
+                next_thread.transcript_scroll_valid = current_thread.transcript_scroll_valid and
+                    !replacementDropsHydratedTranscript(current_thread, next_thread);
                 next_thread.transcript_scroll_y = current_thread.transcript_scroll_y;
                 transferProjectionThreadRuntime(current_thread, next_thread);
             }
@@ -1617,7 +1676,12 @@ fn preserveProjectionRuntime(
                 next_ref.thread_index = rebound_index;
                 const next_thread_id = next_project.threads.items[next_ref.thread_index].local_thread_id;
                 if (!std.mem.eql(u8, next_thread_id, current_thread_id)) continue;
-                next_ref.transcript_scroll_valid = current_ref.transcript_scroll_valid;
+                // A refresh that dropped the hydrated rows invalidates the
+                // pane's top-relative anchor: carrying it into the collapsed
+                // estimate space walked the viewport up through history as
+                // older pages re-hydrated. Fall back to tail-follow.
+                next_ref.transcript_scroll_valid = current_ref.transcript_scroll_valid and
+                    !replacementDropsHydratedTranscript(&current_project.threads.items[current_ref.thread_index], &next_project.threads.items[next_ref.thread_index]);
                 next_ref.transcript_scroll_y = current_ref.transcript_scroll_y;
             }
         }
@@ -2149,6 +2213,14 @@ pub const PaletteModalAction = enum {
     cookie_import_cancel,
     cookie_import_submit,
     cookie_import_search_input,
+    /// index = `commit_sheet.Control` ordinal (buttons in the review sheet).
+    commit_sheet_control,
+    /// index = flat file index across the review's repos.
+    commit_sheet_file_toggle,
+    commit_sheet_file_expand,
+    /// index = (flat file index << 16) | hunk position.
+    commit_sheet_hunk_toggle,
+    commit_sheet_message_input,
     handoff_cancel,
     handoff_prepare,
     handoff_menu_toggle,
@@ -2210,6 +2282,7 @@ pub const PaletteModalAction = enum {
     settings_new_chat_provider_option,
     settings_new_chat_model_option,
     settings_new_chat_reasoning_option,
+    settings_commit_option,
     command_palette_input,
     command_palette_row,
     command_palette_action_row,
@@ -2279,6 +2352,7 @@ pub const BackgroundTaskActionHit = struct {
 
 pub const PaletteModalTextFocus = enum {
     cookie_import_search,
+    commit_message,
     none,
     project_rename,
     thread_import,
@@ -2718,6 +2792,16 @@ fn composerModelOptions(state: *const AppState, provider: Provider) []const Mode
         state.grokModelOptionsSnapshot(),
         state.museModelOptionsSnapshot(),
     );
+}
+
+/// Model shown for a thread with no stored model_ref (for example a chat
+/// created by the web or mobile client). Prefers the user's remembered choice
+/// so the picker never falls back to an unrelated built-in default.
+fn composerUnsetModelRef(state: *const AppState, provider: Provider) []const u8 {
+    if (state.app_config.remembered_models[@intFromEnum(configChatProvider(provider))]) |entry| {
+        if (entry.model.len > 0 and state.providerSupportsModel(provider, entry.model)) return entry.model;
+    }
+    return composerDefaultModelRef(state, provider);
 }
 
 fn composerDefaultModelRef(state: *const AppState, provider: Provider) [:0]const u8 {
@@ -4210,6 +4294,11 @@ const TranscriptHydrationArgs = struct {
     before_offset: usize,
     limit: usize,
     generation: u64,
+    /// Forward suffix fill (projection refresh left a gap past the live
+    /// rows) rather than an older-history page. `suffix_start` is the live
+    /// absolute end at request time; the commit requires it unchanged.
+    suffix: bool = false,
+    suffix_start: usize = 0,
     // Worker output, readable after `done` is acquired.
     page: ?db_types.LoadedMessagePage = null,
     failed: bool = false,
@@ -4223,7 +4312,14 @@ const TranscriptHydrationArgs = struct {
     }
 };
 
-const PALETTE_HISTORY_LIMIT: usize = 400;
+/// Extra live rows scanned past the page length when locating a suffix
+/// page's overlap with rows already materialized.
+const TRANSCRIPT_SUFFIX_OVERLAP_SCAN_EXTRA: usize = 16;
+/// Closed threads fetched per palette open (daemon pages of 200). Bounds the
+/// synchronous open cost while covering typical multi-month histories.
+const PALETTE_HISTORY_LIMIT: usize = 2000;
+/// Open threads whose search descriptions the palette fetches.
+const PALETTE_OPEN_DESCRIPTION_LIMIT: usize = 1000;
 
 fn transcriptHydrationWorkerMain(args: *TranscriptHydrationArgs) void {
     args.page = args.storage.loadMessagePage(
@@ -4722,6 +4818,7 @@ pub const AppState = struct {
     runtime_connections: runtime_connections_controller.State = .{},
     /// Browser "Import cookies…" flow (per-site, agent-safety gated).
     cookie_import: cookie_import_controller.State = .{},
+    git_changes: git_changes_controller.State = .{},
     app_config_file_mtime: i128,
     app_config_runtime_sync_pending: bool,
     project_directory_browse_requested: bool,
@@ -4805,6 +4902,12 @@ pub const AppState = struct {
     last_projection_reuse: persistence.ProjectionReuseStats = .{},
     /// Closed threads fetched when the command palette opens (item 5b); freed on close.
     palette_history: ?state_storage.LoadedThreadHistory = null,
+    /// Open-thread metadata fetched with `palette_history`, used only for
+    /// search descriptions keyed by `palette_open_descriptions_index`.
+    palette_open_threads: ?state_storage.LoadedThreadHistory = null,
+    /// local_thread_id -> description for open threads; borrows
+    /// `palette_open_threads`' arena strings.
+    palette_open_descriptions_index: std.StringHashMapUnmanaged([]const u8) = .{},
     /// Web-started chats this session already tiled (or saw tiled). A chat is
     /// tiled at most once, so a pane the user later moves or closes stays so.
     tiled_web_threads: std.StringHashMapUnmanaged(void) = .{},
@@ -5740,6 +5843,7 @@ pub const AppState = struct {
             self.transcriptSelectionBuffer() != null or
             self.thread_import_provider != null or
             self.cookie_import.open or
+            self.git_changes.overlayOpen() or
             self.handoff_controller.sheet_open or
             self.project_controller.show_creator or
             self.settings_controller.modal_visible or
@@ -7438,15 +7542,42 @@ pub const AppState = struct {
     /// round trip per palette open; nothing is held between opens.
     pub fn refreshPaletteHistory(self: *AppState) void {
         self.clearPaletteHistory();
+        const started_ms = platform_runtime.unixTimestampMs();
         self.palette_history = self.storage.loadThreadHistory(self.allocator, PALETTE_HISTORY_LIMIT) catch |err| blk: {
             log.warn("palette history query failed: {s}", .{@errorName(err)});
             break :blk null;
         };
+        self.palette_open_threads = self.storage.loadThreadList(self.allocator, .{
+            .open = true,
+            .limit = PALETTE_OPEN_DESCRIPTION_LIMIT,
+        }) catch |err| blk: {
+            log.warn("palette open-thread description query failed: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (self.palette_open_threads) |open_threads| {
+            for (open_threads.items) |item| {
+                if (item.description.len == 0) continue;
+                self.palette_open_descriptions_index.put(self.allocator, item.local_thread_id, item.description) catch break;
+            }
+        }
+        runtime_log.trace("palette history loaded closed={d} open={d} elapsed_ms={d}", .{
+            self.paletteHistoryItems().len,
+            if (self.palette_open_threads) |open_threads| open_threads.items.len else 0,
+            platform_runtime.unixTimestampMs() - started_ms,
+        });
     }
 
     pub fn clearPaletteHistory(self: *AppState) void {
         if (self.palette_history) |*history| history.deinit();
         self.palette_history = null;
+        self.palette_open_descriptions_index.clearAndFree(self.allocator);
+        if (self.palette_open_threads) |*open_threads| open_threads.deinit();
+        self.palette_open_threads = null;
+    }
+
+    /// Search description for an open thread, or "" when none was fetched.
+    pub fn paletteThreadDescription(self: *const AppState, local_thread_id: []const u8) []const u8 {
+        return self.palette_open_descriptions_index.get(local_thread_id) orelse "";
     }
 
     pub fn paletteHistoryItems(self: *const AppState) []const headless.store.ThreadListItem {
@@ -8129,6 +8260,12 @@ pub const AppState = struct {
     pub const toggleSettingsProviderEnabled = settings_controller.toggleSettingsProviderEnabled;
     pub const installSettingsProvider = settings_controller.installSettingsProvider;
     pub const loginSettingsProvider = settings_controller.loginSettingsProvider;
+
+    /// Opens `provider`'s sign-in command in a workspace terminal.
+    pub fn loginChatProvider(self: *AppState, provider: Provider) void {
+        settings_controller.loginProvider(self, configChatProvider(provider));
+    }
+
     pub const settingsProviderEnabled = settings_controller.settingsProviderEnabled;
     pub const selectSettingsNewChatModel = settings_controller.selectSettingsNewChatModel;
     pub const selectSettingsNewChatReasoning = settings_controller.selectSettingsNewChatReasoning;
@@ -8201,6 +8338,47 @@ pub const AppState = struct {
     pub const submitCookieImport = cookie_import_controller.submitCookieImport;
     pub const pollCookieImport = cookie_import_controller.pollCookieImport;
     pub const noteCookieImportCompleted = cookie_import_controller.noteCookieImportCompleted;
+    pub const refreshGitChangesSummary = git_changes_controller.refreshGitChangesSummary;
+    pub const refreshSelectedWorkspaceGitChanges = git_changes_controller.refreshSelectedWorkspaceGitChanges;
+    pub const ensureGitChangesSummary = git_changes_controller.ensureGitChangesSummary;
+    pub const noteGitChangesJournalActivity = git_changes_controller.noteGitChangesJournalActivity;
+    pub const gitChangesThreadSummary = git_changes_controller.gitChangesThreadSummary;
+    pub const commitSheet = git_changes_controller.commitSheet;
+    pub const commitSheetOpen = git_changes_controller.commitSheetOpen;
+    pub const openCommitSheet = git_changes_controller.openCommitSheet;
+    pub const openCommitSheetForFocusedChat = git_changes_controller.openCommitSheetForFocusedChat;
+    pub const openCommitSheetForThreadId = git_changes_controller.openCommitSheetForThreadId;
+    pub const closeCommitSheet = git_changes_controller.closeCommitSheet;
+    pub const reloadCommitSheet = git_changes_controller.reloadCommitSheet;
+    pub const commitSheetToggleFile = git_changes_controller.commitSheetToggleFile;
+    pub const commitSheetToggleHunk = git_changes_controller.commitSheetToggleHunk;
+    pub const commitSheetToggleExpanded = git_changes_controller.commitSheetToggleExpanded;
+    pub const generateCommitMessage = git_changes_controller.generateCommitMessage;
+    pub const commitSheetCommit = git_changes_controller.commitSheetCommit;
+    pub const commitSheetCommitAlternate = git_changes_controller.commitSheetCommitAlternate;
+    pub const commitSheetPrimaryAction = git_changes_controller.commitSheetPrimaryAction;
+    pub const commitSheetPullPush = git_changes_controller.commitSheetPullPush;
+    pub const setCommitSettings = git_changes_controller.setCommitSettings;
+    pub const pollGitChanges = git_changes_controller.pollGitChanges;
+    pub const refreshGitChangesStatus = git_changes_controller.refreshGitChangesStatus;
+    pub const ensureGitChangesStatus = git_changes_controller.ensureGitChangesStatus;
+    pub const gitChangesHeader = git_changes_controller.gitChangesHeader;
+    pub const gitHeaderPrimary = git_changes_controller.gitHeaderPrimary;
+    pub const openCommitSheetForThreadIdMode = git_changes_controller.openCommitSheetForThreadIdMode;
+    pub const commitSheetToggleEditing = git_changes_controller.commitSheetToggleEditing;
+    pub const startCommitAndPush = git_changes_controller.startCommitAndPush;
+    pub const startCommitAndPushForFocusedChat = git_changes_controller.startCommitAndPushForFocusedChat;
+    pub const startPush = git_changes_controller.startPush;
+    pub const startPushForFocusedChat = git_changes_controller.startPushForFocusedChat;
+    pub const startPullPush = git_changes_controller.startPullPush;
+    pub const gitQuickConfirm = git_changes_controller.gitQuickConfirm;
+    pub const gitQuickContinue = git_changes_controller.gitQuickContinue;
+    pub const gitQuickAbort = git_changes_controller.gitQuickAbort;
+    pub const gitQuickProgressText = git_changes_controller.gitQuickProgressText;
+    pub const gitToastView = git_changes_controller.gitToastView;
+    pub const gitCommitCardPush = git_changes_controller.gitCommitCardPush;
+    pub const dismissGitToast = git_changes_controller.dismissGitToast;
+    pub const gitToastPullPush = git_changes_controller.gitToastPullPush;
     pub const cookieImportFilteredIndices = cookie_import_controller.cookieImportFilteredIndices;
     pub const flushIfDirty = lifecycle_controller.flushIfDirty;
     pub const pollFlushWorker = lifecycle_controller.pollFlushWorker;
@@ -9658,7 +9836,7 @@ pub const AppState = struct {
         if (self.composerModelIndex(thread.provider, thread.model_ref)) |index| {
             if (index < options.len) return std.mem.sliceTo(options[index].label, 0);
         }
-        return if (thread.model_ref) |model_ref| std.mem.sliceTo(model_ref, 0) else std.mem.sliceTo(composerDefaultModelRef(self, thread.provider), 0);
+        return if (thread.model_ref) |model_ref| std.mem.sliceTo(model_ref, 0) else composerUnsetModelRef(self, thread.provider);
     }
 
     pub fn currentComposerReasoningLabel(self: *const AppState) []const u8 {
@@ -10050,6 +10228,43 @@ pub const AppState = struct {
             session_protocol.TRANSCRIPT_MESSAGE_PAGE_SIZE;
     }
 
+    /// Owned ChatMessage copy of a durable page row; the caller owns the
+    /// result (release with deinitProjectionMessage).
+    fn chatMessageFromPersisted(self: *AppState, message: PersistedMessage) !ChatMessage {
+        const author = try self.dupeZ(message.author);
+        errdefer self.allocator.free(author);
+        const body = try self.dupeZ(message.body);
+        errdefer self.allocator.free(body);
+        const image = if (message.image) |source|
+            try ChatImageAttachment.init(self.allocator, source.path, source.mime, source.byte_size)
+        else
+            null;
+        errdefer if (image) |owned| owned.deinit(self.allocator);
+        const extra_images = try persistence.chatImageListFromPersisted(self.allocator, message.extra_images);
+        errdefer {
+            for (extra_images) |*owned| owned.deinit(self.allocator);
+            if (extra_images.len > 0) self.allocator.free(extra_images);
+        }
+        const tool_call_id = try dupeOptionalSlice(self.allocator, message.tool_call_id);
+        errdefer if (tool_call_id) |owned| self.allocator.free(owned);
+        const message_id = if (message.message_id) |id|
+            if (id.len == 0) null else try self.allocator.dupe(u8, id)
+        else
+            null;
+        errdefer if (message_id) |owned| self.allocator.free(owned);
+        return .{
+            .role = message.role,
+            .author = author,
+            .body = body,
+            .image = image,
+            .extra_images = extra_images,
+            .tool_call_id = tool_call_id,
+            .tool_call_kind = message.tool_call_kind,
+            .tool_call_status = message.tool_call_status,
+            .message_id = message_id,
+        };
+    }
+
     /// Prepend an already-loaded older durable page to the identified thread,
     /// shifting the render caches and layout bookkeeping so scroll anchors
     /// stay on their rows. The target is passed explicitly — it may be an
@@ -10088,38 +10303,11 @@ pub const AppState = struct {
         const overlap = transcriptPageSuffixOverlap(page.messages, thread.messages.items);
         const new_messages = page.messages[0 .. page.messages.len - overlap];
         for (new_messages) |message| {
-            const author = try self.dupeZ(message.author);
-            errdefer self.allocator.free(author);
-            const body = try self.dupeZ(message.body);
-            errdefer self.allocator.free(body);
-            const image = if (message.image) |source|
-                try ChatImageAttachment.init(self.allocator, source.path, source.mime, source.byte_size)
-            else
-                null;
-            errdefer if (image) |owned| owned.deinit(self.allocator);
-            const extra_images = try persistence.chatImageListFromPersisted(self.allocator, message.extra_images);
-            errdefer {
-                for (extra_images) |*owned| owned.deinit(self.allocator);
-                if (extra_images.len > 0) self.allocator.free(extra_images);
-            }
-            const tool_call_id = try dupeOptionalSlice(self.allocator, message.tool_call_id);
-            errdefer if (tool_call_id) |owned| self.allocator.free(owned);
-            const message_id = if (message.message_id) |id|
-                if (id.len == 0) null else try self.allocator.dupe(u8, id)
-            else
-                null;
-            errdefer if (message_id) |owned| self.allocator.free(owned);
-            try prepended.append(self.allocator, .{
-                .role = message.role,
-                .author = author,
-                .body = body,
-                .image = image,
-                .extra_images = extra_images,
-                .tool_call_id = tool_call_id,
-                .tool_call_kind = message.tool_call_kind,
-                .tool_call_status = message.tool_call_status,
-                .message_id = message_id,
-            });
+            const converted = try self.chatMessageFromPersisted(message);
+            prepended.append(self.allocator, converted) catch |err| {
+                deinitProjectionMessage(self.allocator, converted);
+                return err;
+            };
         }
         try thread.messages.insertSlice(self.allocator, 0, prepended.items);
         ownership_transferred = true;
@@ -10190,6 +10378,94 @@ pub const AppState = struct {
         return prepended_count > 0;
     }
 
+    /// Append the durable rows a projection refresh reported past the live
+    /// tail (see prepareProjectionTranscriptContinuity). The page holds the
+    /// last `limit` durable rows before the gap end; sort-index gaps can make
+    /// it overlap rows already live, so rows up to the newest live identity
+    /// are skipped. Appending leaves every existing row index, cache slot and
+    /// scroll anchor in place. Returns true when rows were appended.
+    fn commitTranscriptSuffixPage(
+        self: *AppState,
+        thread: *ChatThread,
+        page: *const db_types.LoadedMessagePage,
+    ) !bool {
+        const gap_end = thread.transcript_suffix_gap_end;
+        thread.transcript_suffix_gap_end = 0;
+        const live = thread.messages.items;
+        const scan_from = live.len -| (page.messages.len + TRANSCRIPT_SUFFIX_OVERLAP_SCAN_EXTRA);
+        var first_new: usize = 0;
+        var index = page.messages.len;
+        search: while (index > 0) {
+            index -= 1;
+            const page_id = page.messages[index].message_id orelse continue;
+            if (page_id.len == 0) continue;
+            for (live[scan_from..]) |row| {
+                const live_id = row.message_id orelse continue;
+                if (std.mem.eql(u8, live_id, page_id)) {
+                    first_new = index + 1;
+                    break :search;
+                }
+            }
+        }
+        const new_rows = page.messages[first_new..];
+        if (new_rows.len == 0) {
+            thread.transcript_suffix_checked_end = gap_end;
+            return false;
+        }
+        try thread.messages.ensureUnusedCapacity(self.allocator, new_rows.len);
+        for (new_rows) |message| {
+            thread.messages.appendAssumeCapacity(try self.chatMessageFromPersisted(message));
+        }
+        thread.rebuildBackgroundTasksFromMessages(self.allocator);
+        thread.touch();
+        return true;
+    }
+
+    /// Render-path entry: fetch the durable suffix a projection refresh left
+    /// past the focused thread's live rows. Shares the single hydration
+    /// worker slot with older-page requests.
+    pub fn requestCurrentThreadTranscriptSuffix(self: *AppState) void {
+        if (self.transcript_hydration.in_flight) return;
+        const project = self.currentProjectMutable();
+        const thread = project.currentThreadMutable();
+        const live_end = thread.persisted_message_offset + thread.messages.items.len;
+        const gap_end = thread.transcript_suffix_gap_end;
+        if (gap_end <= live_end) {
+            thread.transcript_suffix_gap_end = 0;
+            return;
+        }
+        const args = self.allocator.create(TranscriptHydrationArgs) catch return;
+        const workspace_id = self.allocator.dupe(u8, project.id) catch {
+            self.allocator.destroy(args);
+            return;
+        };
+        const local_thread_id = self.allocator.dupe(u8, thread.local_thread_id) catch {
+            self.allocator.free(workspace_id);
+            self.allocator.destroy(args);
+            return;
+        };
+        args.* = .{
+            .allocator = self.allocator,
+            .storage = self.storage,
+            .workspace_id = workspace_id,
+            .local_thread_id = local_thread_id,
+            .before_offset = gap_end,
+            .limit = gap_end - live_end,
+            .generation = self.transcript_hydration.generation,
+            .suffix = true,
+            .suffix_start = live_end,
+        };
+        const worker = std.Thread.spawn(.{}, transcriptHydrationWorkerMain, .{args}) catch {
+            // No worker: leave the gap; the next refresh or turn tail fills it.
+            args.deinitAndDestroy();
+            thread.transcript_suffix_gap_end = 0;
+            return;
+        };
+        self.transcript_hydration.worker = worker;
+        self.transcript_hydration.args = args;
+        self.transcript_hydration.in_flight = true;
+    }
+
     /// Render-path entry: request one older durable page for the focused
     /// thread. Returns immediately; the page loads on a worker thread over a
     /// dedicated daemon RPC transport, so the worker shares no DB state with
@@ -10235,6 +10511,16 @@ pub const AppState = struct {
         self.transcript_hydration.in_flight = true;
     }
 
+    fn threadByIdentity(self: *AppState, workspace_id: []const u8, local_thread_id: []const u8) ?*ChatThread {
+        for (self.project_controller.projects.items) |*project| {
+            if (!std.mem.eql(u8, project.id, workspace_id)) continue;
+            for (project.threads.items) |*thread| {
+                if (std.mem.eql(u8, thread.local_thread_id, local_thread_id)) return thread;
+            }
+        }
+        return null;
+    }
+
     /// Frame-loop entry: commit a completed hydration page into the thread it
     /// was requested for, resolved by workspace/thread identity — never by the
     /// current selection. The render path requests pages for unfocused panes
@@ -10263,6 +10549,12 @@ pub const AppState = struct {
             // std.log goes to the GUI's stderr, which is not the pref-dir log;
             // record the failure where support actually looks.
             runtime_log.diagnostic("transcript hydration page load failed thread={s} before_offset={d} failures={d}", .{ args.local_thread_id, args.before_offset, self.transcript_hydration.consecutive_failures + 1 });
+            if (args.suffix) {
+                // Best-effort fill: drop the gap rather than re-request every
+                // frame; the next refresh or turn tail records it again.
+                if (self.threadByIdentity(args.workspace_id, args.local_thread_id)) |thread| thread.transcript_suffix_gap_end = 0;
+                return false;
+            }
             return self.noteHydrationLoadFailure();
         }
         const page = &args.page.?;
@@ -10279,6 +10571,20 @@ pub const AppState = struct {
             log.warn("transcript hydration target thread gone thread={s}", .{args.local_thread_id});
             return false;
         };
+        if (args.suffix) {
+            const thread = &project.threads.items[thread_index];
+            if (thread.persisted_message_offset + thread.messages.items.len != args.suffix_start) {
+                // Rows landed through another path meanwhile; the render path
+                // re-requests (or clears the gap) against the new live end.
+                return thread.transcript_suffix_gap_end != 0;
+            }
+            const appended = self.commitTranscriptSuffixPage(thread, page) catch |err| {
+                log.warn("failed to commit transcript suffix page: {s}", .{@errorName(err)});
+                return false;
+            };
+            self.transcript_hydration.consecutive_failures = 0;
+            return appended;
+        }
         if (project.threads.items[thread_index].persisted_message_offset != args.before_offset) {
             log.warn("transcript hydration offset moved thread={s} requested_before={d} current_offset={d}", .{ args.local_thread_id, args.before_offset, project.threads.items[thread_index].persisted_message_offset });
             return true;
@@ -13506,6 +13812,7 @@ pub const AppState = struct {
                 .settings_new_chat_provider_option,
                 .settings_new_chat_model_option,
                 .settings_new_chat_reasoning_option,
+                .settings_commit_option,
                 .settings_close,
                 .workspace_settings_folders,
                 .workspace_folder_add,
@@ -13529,6 +13836,10 @@ pub const AppState = struct {
                 .cookie_import_select_all,
                 .cookie_import_cancel,
                 .cookie_import_submit,
+                .commit_sheet_control,
+                .commit_sheet_file_toggle,
+                .commit_sheet_file_expand,
+                .commit_sheet_hunk_toggle,
                 => true,
                 .modal_dismiss,
                 .modal_block,
@@ -13540,6 +13851,7 @@ pub const AppState = struct {
                 .runtime_wizard_input,
                 .command_palette_input,
                 .cookie_import_search_input,
+                .commit_sheet_message_input,
                 => false,
             };
             if (interactive and hit.rect.contains(point)) return true;
@@ -14308,7 +14620,7 @@ pub const AppState = struct {
     fn rememberCurrentModelOptions(self: *AppState) void {
         const thread = self.currentThread();
         const reasoning: ?[]const u8 = if (thread.opencode_reasoning_variant) |value| value else if (thread.reasoning_effort) |value| @tagName(value) else null;
-        self.app_config.rememberGuiModelSelection(self.allocator, configChatProvider(thread.provider), thread.model_ref orelse composerDefaultModelRef(self, thread.provider), reasoning, thread.fast_mode == .on) catch |err| {
+        self.app_config.rememberGuiModelSelection(self.allocator, configChatProvider(thread.provider), thread.model_ref orelse composerUnsetModelRef(self, thread.provider), reasoning, thread.fast_mode == .on) catch |err| {
             log.warn("failed to remember model options: {s}", .{@errorName(err)});
             return;
         };
@@ -14371,7 +14683,7 @@ pub const AppState = struct {
     }
 
     fn composerModelIndex(self: *const AppState, provider: Provider, model_ref: ?[:0]const u8) ?usize {
-        const active = model_ref orelse composerDefaultModelRef(self, provider);
+        const active: []const u8 = model_ref orelse composerUnsetModelRef(self, provider);
         const options = composerModelOptions(self, provider);
         for (options, 0..) |option, index| {
             if (option.value) |value| {
@@ -14615,6 +14927,7 @@ pub const AppState = struct {
     /// True only during the slide-in and fade-out windows, so the loop pumps
     /// display-rate frames for ~400 ms per notice instead of the whole hold.
     pub fn noticeToastAnimating(self: *const AppState) bool {
+        if (git_changes_controller.gitToastAnimating(self)) return true;
         if (NOTICE_TOAST_SHOW_HEALTH and (self.close_durability_notice or self.daemon_projection_stale)) return false;
         if (self.sidebar_notice_set_at_ms == 0) return false;
         if (std.mem.sliceTo(self.sidebar_notice_storage[0..], 0).len == 0) return false;
@@ -14625,6 +14938,13 @@ pub const AppState = struct {
     /// Milliseconds until the held toast must start fading; the main loop
     /// caps its event wait on this so the fade begins without polling.
     pub fn noticeToastWakeMs(self: *const AppState) ?i64 {
+        const git_wake = git_changes_controller.gitToastWakeMs(self);
+        const notice_wake = self.plainNoticeToastWakeMs();
+        if (git_wake) |git_ms| return if (notice_wake) |notice_ms| @min(git_ms, notice_ms) else git_ms;
+        return notice_wake;
+    }
+
+    fn plainNoticeToastWakeMs(self: *const AppState) ?i64 {
         if (NOTICE_TOAST_SHOW_HEALTH and (self.close_durability_notice or self.daemon_projection_stale)) return null;
         if (self.sidebar_notice_set_at_ms == 0) return null;
         if (std.mem.sliceTo(self.sidebar_notice_storage[0..], 0).len == 0) return null;
@@ -14773,6 +15093,7 @@ pub const AppState = struct {
         self.transcript_controller.diff_view_cache.deinit(self.allocator);
         self.browser_controller.deinit(self.allocator);
         self.cookie_import.deinit();
+        self.git_changes.deinit();
         self.releaseAllImageTextures();
         self.thread_import_threads.deinit(self.allocator);
         if (self.handoff_controller.preview) |preview| self.allocator.free(preview);
@@ -15047,6 +15368,9 @@ pub const AppState = struct {
         const signals = self.change_cursor_loop.take();
         self.pollDaemonProjectionStaleness();
         if (signals.registry or signals.resync) self.terminal_controller.poll_requested = true;
+        // `chat.turn` entries mean a chat may have edited files; the summary
+        // call is debounced and coalesced in the git changes controller.
+        if (signals.chat or signals.resync) self.noteGitChangesJournalActivity();
     }
 
     fn clearTiledWebThreads(self: *AppState) void {
@@ -15781,11 +16105,18 @@ pub const AppState = struct {
             hit_index -= 1;
             const hit = self.background_task_action_hits.items[hit_index];
             if (x < hit.rect.x or x > hit.rect.x + hit.rect.w or y < hit.rect.y or y > hit.rect.y + hit.rect.h) continue;
-            if (hit.project_index >= self.project_controller.projects.items.len) return true;
+            runtime_log.diagnostic("bg-stop action click action={s} project={d} thread={d} message={d} task={?d}", .{ @tagName(hit.action), hit.project_index, hit.thread_index, hit.message_index, hit.task_index });
+            if (hit.project_index >= self.project_controller.projects.items.len or
+                hit.thread_index >= self.project_controller.projects.items[hit.project_index].threads.items.len)
+            {
+                runtime_log.diagnostic("bg-stop action click stale project/thread index", .{});
+                self.setSidebarNotice("Background task is no longer available.");
+                return true;
+            }
             var project = &self.project_controller.projects.items[hit.project_index];
-            if (hit.thread_index >= project.threads.items.len) return true;
             const thread = &project.threads.items[hit.thread_index];
             const target = resolveBackgroundTaskActionHit(thread, hit) orelse {
+                runtime_log.diagnostic("bg-stop action click unresolved (body/task changed) thread={s}", .{thread.local_thread_id});
                 self.setSidebarNotice("Background task is no longer available.");
                 return true;
             };
@@ -15875,7 +16206,15 @@ pub const AppState = struct {
     }
 
     fn stopBackgroundTask(self: *AppState, project_index: usize, thread: *ChatThread, task: *BackgroundTask) bool {
-        if (task.status != .running or task.stop_requested) return false;
+        runtime_log.diagnostic("bg-stop stopBackgroundTask thread={s} status={s} stop_requested={} provider={s} process={s} pid={?d}", .{ thread.local_thread_id, @tagName(task.status), task.stop_requested, if (task.provider) |provider| @tagName(provider) else "none", task.process_id orelse "none", task.pid });
+        if (task.status != .running) {
+            self.setSidebarNotice("This background task has already finished.");
+            return false;
+        }
+        if (task.stop_requested) {
+            self.setSidebarNotice("Already stopping this background task...");
+            return false;
+        }
         if (task.provider == .codex or task.process_id != null) {
             const thread_id = task.provider_thread_id orelse {
                 self.setSidebarNotice("Codex background task is missing its thread ID.");
@@ -15885,13 +16224,13 @@ pub const AppState = struct {
                 self.setSidebarNotice("Codex background task is missing its process ID.");
                 return false;
             };
-            const target = self.providerExecutionTargetForProjectThread(project_index, thread, 0) orelse return false;
-            _ = thread_id;
-            _ = process_id;
-            if (!chat_controller.requestCodexBackgroundTaskTermination(self, thread, task, target.cwd())) {
-                self.setSidebarNotice("A Codex background task check is already running. Try again shortly.");
+            if (self.providerExecutionTargetForProjectThread(project_index, thread, 0) == null) {
+                self.setSidebarNotice("Codex could not stop the background task: no execution target for this chat.");
                 return false;
             }
+            runtime_log.diagnostic("bg-stop codex stop queued thread={s} provider_thread={s} process={s}", .{ thread.local_thread_id, thread_id, process_id });
+            chat_controller.queueCodexBackgroundTaskTermination(self, task);
+            self.setSidebarNotice("Stopping background task...");
             self.markDirty();
             return true;
         }
@@ -16283,6 +16622,95 @@ fn testCompletedHydrationArgs(state: *AppState, before_offset: usize) !*Transcri
     state.transcript_hydration.args = args;
     state.transcript_hydration.in_flight = true;
     return args;
+}
+
+fn testCompletedSuffixArgs(state: *AppState, gap_end: usize, suffix_start: usize, rows: []const db_types.PersistedMessage) !void {
+    const allocator = state.allocator;
+    const thread = state.currentProjectMutable().currentThreadMutable();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const page_messages = try arena.allocator().dupe(db_types.PersistedMessage, rows);
+    const args = try allocator.create(TranscriptHydrationArgs);
+    errdefer allocator.destroy(args);
+    const workspace_id = try allocator.dupe(u8, state.currentProject().id);
+    errdefer allocator.free(workspace_id);
+    args.* = .{
+        .allocator = allocator,
+        .storage = undefined, // never dereferenced once `done` is set
+        .workspace_id = workspace_id,
+        .local_thread_id = try allocator.dupe(u8, thread.local_thread_id),
+        .before_offset = gap_end,
+        .limit = gap_end - suffix_start,
+        .generation = state.transcript_hydration.generation,
+        .suffix = true,
+        .suffix_start = suffix_start,
+        .page = .{ .arena = arena, .offset = gap_end - rows.len, .messages = page_messages },
+    };
+    args.done.store(true, .release);
+    state.transcript_hydration.args = args;
+    state.transcript_hydration.in_flight = true;
+}
+
+test "transcript suffix fill appends only rows past the newest live identity" {
+    const allocator = std.testing.allocator;
+    var state = try testTranscriptHydrationState(allocator);
+    defer testTranscriptHydrationCleanup(&state);
+    const thread = state.currentProjectMutable().currentThreadMutable();
+    thread.persisted_message_offset = 10;
+    try thread.messages.append(allocator, .{
+        .role = .user,
+        .author = try allocator.dupeZ(u8, "You"),
+        .body = try allocator.dupeZ(u8, "prompt"),
+        .message_id = try allocator.dupe(u8, "m:user"),
+    });
+    try thread.messages.append(allocator, .{
+        .role = .assistant,
+        .author = try allocator.dupeZ(u8, "Codex"),
+        .body = try allocator.dupeZ(u8, "reply"),
+        .message_id = try allocator.dupe(u8, "m:reply"),
+    });
+    // The refresh reported durable end 13 while the live end is 12; a
+    // sort-index gap makes the fetched page overlap the live reply row.
+    thread.transcript_suffix_gap_end = 13;
+    try testCompletedSuffixArgs(&state, 13, 12, &.{
+        .{ .role = .assistant, .author = "Codex", .body = "reply", .message_id = "m:reply" },
+        .{ .role = .system, .author = "Codex", .body = "Provider thread ID: x", .message_id = "m:snapshot" },
+    });
+    try std.testing.expect(state.pollTranscriptHydration());
+    try std.testing.expectEqual(@as(usize, 3), thread.messages.items.len);
+    try std.testing.expectEqualStrings("m:snapshot", thread.messages.items[2].message_id.?);
+    try std.testing.expectEqual(@as(usize, 10), thread.persisted_message_offset);
+    try std.testing.expectEqual(@as(usize, 0), thread.transcript_suffix_gap_end);
+
+    // A page with nothing new records the checked end so later refreshes
+    // reporting the same end do not refetch it.
+    thread.transcript_suffix_gap_end = 14;
+    try testCompletedSuffixArgs(&state, 14, 13, &.{
+        .{ .role = .system, .author = "Codex", .body = "Provider thread ID: x", .message_id = "m:snapshot" },
+    });
+    try std.testing.expect(!state.pollTranscriptHydration());
+    try std.testing.expectEqual(@as(usize, 3), thread.messages.items.len);
+    try std.testing.expectEqual(@as(usize, 14), thread.transcript_suffix_checked_end);
+}
+
+test "projection refresh that drops hydrated rows invalidates saved scroll" {
+    const allocator = std.testing.allocator;
+    var current = try ChatThread.init(allocator, "live");
+    defer current.deinit(allocator);
+    current.persisted_message_offset = 100;
+    try current.messages.append(allocator, .{
+        .role = .user,
+        .author = try allocator.dupeZ(u8, "You"),
+        .body = try allocator.dupeZ(u8, "prompt"),
+    });
+    var dropped = try ChatThread.init(allocator, "dropped");
+    defer dropped.deinit(allocator);
+    dropped.persisted_message_offset = 900;
+    try std.testing.expect(replacementDropsHydratedTranscript(&current, &dropped));
+    var widened = try ChatThread.init(allocator, "widened");
+    defer widened.deinit(allocator);
+    widened.persisted_message_offset = 100;
+    try std.testing.expect(!replacementDropsHydratedTranscript(&current, &widened));
 }
 
 test "async transcript hydration drops a page loaded for a superseded selection" {

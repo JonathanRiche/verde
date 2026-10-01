@@ -178,7 +178,10 @@ const StoreSession = struct {
     }
 };
 
-/// Closed-thread metadata fetched on demand for the command palette.
+const THREAD_LIST_PAGE_RETRIES: usize = 2;
+
+/// Thread metadata fetched on demand (command palette history and search
+/// descriptions, workspace hydration).
 pub const LoadedThreadHistory = struct {
     arena: std.heap.ArenaAllocator,
     items: []const headless.store.ThreadListItem = &.{},
@@ -364,20 +367,44 @@ pub const Storage = struct {
         const a = loaded.arena.allocator();
         var transport: daemon_client.HeadlessTransport = .{ .allocator = a, .pref_path = self.pref_path };
         var client = daemon_client.headlessClient(a, &transport);
-        const request: headless.store.ThreadListRequest = .{
-            .workspace_id = query.workspace_id,
-            .limit = @intCast(@min(query.limit, headless.store.MAX_PAGE_ITEMS)),
-            .open = query.open,
-            .recent_first = query.recent_first,
-        };
+        // The daemon caps each page; follow its cursor until `limit` rows.
+        // Cursors are revision-bound, so a store write between pages (any
+        // running turn) stales them: restart a few times, then keep the
+        // partial list rather than failing the whole query.
+        var items: std.ArrayList(headless.store.ThreadListItem) = .empty;
+        var attempt: usize = 0;
+        attempts: while (true) : (attempt += 1) {
+            items.clearRetainingCapacity();
+            var cursor: ?[]const u8 = null;
+            while (items.items.len < query.limit) {
+                const request: headless.store.ThreadListRequest = .{
+                    .workspace_id = query.workspace_id,
+                    .limit = @intCast(@min(query.limit - items.items.len, headless.store.MAX_PAGE_ITEMS)),
+                    .cursor = cursor,
+                    .open = query.open,
+                    .recent_first = query.recent_first,
+                };
+                const result = threadListPage(&client, request) catch |err| {
+                    if (cursor == null) return err;
+                    if (attempt < THREAD_LIST_PAGE_RETRIES) continue :attempts;
+                    break :attempts;
+                };
+                try items.appendSlice(a, result.threads);
+                self.noteStoreRevision(result.store_revision);
+                cursor = result.next_cursor orelse break :attempts;
+                if (result.threads.len == 0) break :attempts;
+            }
+            break;
+        }
+        for (items.items) |*item| item.last_activity_at = headless.store.threadActivitySeconds(item.last_activity_at);
+        loaded.items = items.items;
+        return loaded;
+    }
+
+    fn threadListPage(client: anytype, request: headless.store.ThreadListRequest) !headless.store.ThreadListResult {
         var parsed = try client.call(headless.store.METHOD_CHAT_THREAD_LIST, request);
         defer parsed.deinit();
-        const result = try client.decodeThreadList(&parsed);
-        const items = try a.dupe(headless.store.ThreadListItem, result.threads);
-        for (items) |*item| item.last_activity_at = headless.store.threadActivitySeconds(item.last_activity_at);
-        loaded.items = items;
-        self.noteStoreRevision(result.store_revision);
-        return loaded;
+        return try client.decodeThreadList(&parsed);
     }
 
     /// Queries browser history for the address-bar dropdown. Runs on the

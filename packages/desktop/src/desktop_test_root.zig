@@ -41,10 +41,13 @@ test {
     _ = @import("app/update_installer.zig");
     _ = @import("app/updater.zig");
     _ = @import("ui/command_palette.zig");
+    _ = @import("ui/fuzzy_match.zig");
     _ = @import("ui/companion.zig");
     _ = @import("ui/diff_view_cache.zig");
     _ = @import("ui/handoff_sheet.zig");
     _ = @import("state/handoff_controller.zig");
+    _ = @import("state/git_changes_controller.zig");
+    _ = @import("ui/commit_sheet.zig");
     _ = @import("ui/workspace_strip.zig");
     _ = @import("ui/browser.zig");
     _ = @import("ui/chat_panel.zig");

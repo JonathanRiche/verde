@@ -264,10 +264,12 @@ export function createFollowupApi(deps: FollowupDependencies) {
       // uncertain steer merely because that record is absent.
       try {
         let after_seq = 0
+        let status: string | undefined
         for (let page = 0; page < 100; page++) {
           const response = await deps.rpc(pane, 'chat.turn.tail', { turn_id: value.turn_id, after_seq, wait_ms: 0 })
           if (response.error || response.ok === false) throw followupRpcError(response)
-          const result = unwrapResult<{ events?: Array<{ kind?: string; seq?: number; payload_json?: string }> }>(response)
+          const result = unwrapResult<{ status?: string; events?: Array<{ kind?: string; seq?: number; payload_json?: string }> }>(response)
+          if (result?.status) status = result.status
           const events = result?.events ?? []
           let newest = after_seq
           for (const event of events) {
@@ -281,6 +283,17 @@ export function createFollowupApi(deps: FollowupDependencies) {
           }
           if (!events.length || newest <= after_seq) break
           after_seq = newest
+        }
+        if (status && ['completed', 'failed', 'aborted'].includes(status)) {
+          // The turn is over and never recorded this steer, so it can no
+          // longer land inline. Hand the decision back to the user instead of
+          // wedging the composer: pull back, remove, or explicitly send it as
+          // the next turn. Nothing is resent automatically.
+          outcomes.set(value.turn_id, status)
+          inhibited.add(followupKey(pane))
+          update(pane, value, { state: 'fallback_next_turn', delivery: 'unsent' })
+          deps.notice('The reply finished without recording this steer. Pull it back, remove it, or Retry to send it as a new message.')
+          return false
         }
         deps.notice('Delivery remains unconfirmed. The follow-up is retained and has not been resent.')
       } catch (error) { deps.notice(error instanceof Error ? error.message : 'Could not check follow-up delivery') }

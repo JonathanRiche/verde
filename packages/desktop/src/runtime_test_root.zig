@@ -24,6 +24,7 @@ test {
     _ = @import("daemon/repository_path.zig");
     _ = @import("daemon/shell_command.zig");
     _ = @import("daemon/workspace_file_search.zig");
+    _ = @import("daemon/git_changes.zig");
     _ = @import("daemon/browser_history.zig");
     _ = @import("daemon/browser_cookie_import.zig");
     _ = @import("db/client.zig");

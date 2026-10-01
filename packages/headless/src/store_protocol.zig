@@ -52,6 +52,9 @@ pub const METHOD_WORKSPACE_REPOSITORY_BINDING_UPSERT: []const u8 =
     "workspace.repository.binding.upsert";
 pub const METHOD_WORKSPACE_REPOSITORY_BINDING_REMOVE: []const u8 =
     "workspace.repository.binding.remove";
+/// Sidebar order: listed workspaces lead in the given order; unlisted rows
+/// (closed workspaces, rows the caller has not seen) keep their relative order after them.
+pub const METHOD_WORKSPACE_REORDER: []const u8 = "workspace.reorder";
 pub const METHOD_CHAT_MESSAGE_LIST: []const u8 = "chat.message.list";
 pub const METHOD_CHAT_TURN_RECORD: []const u8 = "chat.turn.record";
 /// Composer shell mode (`!command`): run one bounded command in the chat's
@@ -191,6 +194,11 @@ pub const WorkspaceRepositoryManifestResult = struct {
     default_repository_id: []const u8,
     repositories: []const Repository = &.{},
     store_revision: u64,
+};
+
+pub const WorkspaceReorderRequest = struct {
+    mutation: MutationHeader,
+    workspace_ids: []const []const u8,
 };
 
 pub const WorkspaceRepositoryUpsertRequest = struct {
@@ -570,6 +578,12 @@ pub const ConfigChatSnapshot = struct {
     /// clients regenerate titles with the same model as the desktop.
     title_provider: []const u8 = "codex",
     title_model: []const u8 = "",
+    /// `chat.commit_message_provider` (`auto` or a provider).
+    commit_message_provider: []const u8 = "auto",
+    /// Explicit commit-message model; null uses the provider's fast default.
+    commit_message_model: ?[]const u8 = null,
+    /// `commit` or `commit_and_push`.
+    commit_default_action: []const u8 = "commit",
 };
 
 pub const ConfigSnapshot = struct {
@@ -661,6 +675,8 @@ pub const ThreadGetRequest = struct {
 pub const ThreadListItem = struct {
     local_thread_id: []const u8,
     title: []const u8,
+    /// Model-generated one-line summary used for search; empty when none.
+    description: []const u8 = "",
     /// Owning workspace; filled so cross-workspace history queries resolve.
     workspace_id: []const u8 = "",
     /// Daemon-owned open/closed bit (see `ThreadCloseRequest`).
@@ -703,7 +719,7 @@ pub const ThreadListRequest = struct {
     cursor: ?[]const u8 = null,
     /// Null lists open and closed rows; false is the cold-history query.
     open: ?bool = null,
-    /// Case-insensitive title substring filter; empty matches all.
+    /// Case-insensitive title/description substring filter; empty matches all.
     query: []const u8 = "",
     /// Order by last activity (newest first) instead of sort_index.
     recent_first: bool = false,

@@ -173,10 +173,16 @@ pub const TitleGenerateRequest = struct {
     cwd: []const u8,
     user_text: []const u8,
     assistant_text: []const u8,
+    /// Optional durable identity; when both are set the daemon records the
+    /// generated search description for that thread.
+    workspace_id: ?[]const u8 = null,
+    local_thread_id: ?[]const u8 = null,
 };
 
 pub const TitleGenerateResult = struct {
     title: ?[]const u8 = null,
+    /// One-line search description, when the model produced one.
+    description: ?[]const u8 = null,
     error_message: ?[]const u8 = null,
 };
 

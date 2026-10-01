@@ -1246,6 +1246,8 @@ const CLAUDE_OPUS_WEEKLY_LIMIT_MESSAGE = "Claude's weekly Opus usage limit has b
 const CLAUDE_SONNET_WEEKLY_LIMIT_MESSAGE = "Claude's weekly Sonnet usage limit has been reached. View usage to see the reset time and your other plan limits.";
 const CODEX_USAGE_LIMIT_MESSAGE = "Codex's usage limit has been reached. View usage to see which window was exhausted and when it resets.";
 const CODEX_FIVE_HOUR_LIMIT_MESSAGE = "Codex's 5-hour usage limit has been reached. View usage to see the reset time and your other plan limits.";
+/// Emitted verbatim by `providers/provider_bridge.ts` when the Claude CLI is signed out.
+const CLAUDE_SIGN_IN_REQUIRED_MESSAGE = "Claude Code is not signed in. Sign in, then send your message again.";
 
 fn asciiContainsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     if (needle.len == 0) return true;
@@ -1338,9 +1340,17 @@ pub fn legacyProviderFailureForDisplayMessage(message_raw: []const u8) ?provider
     return null;
 }
 
-/// Returns the provider for any failure row that can offer a `/usage` action.
+/// Identifies a failure row that signing in to the provider CLI resolves.
+pub fn signInRequiredProviderForDisplayMessage(message: []const u8) ?provider_models.Provider {
+    if (std.mem.eql(u8, std.mem.trim(u8, message, &std.ascii.whitespace), CLAUDE_SIGN_IN_REQUIRED_MESSAGE)) return .claude;
+    return null;
+}
+
+/// Returns the provider for any failure row that can offer a usage or sign-in action.
 pub fn providerFailureActionProvider(message: []const u8) ?provider_models.Provider {
-    return usageLimitProviderForDisplayMessage(message) orelse legacyProviderFailureForDisplayMessage(message);
+    return usageLimitProviderForDisplayMessage(message) orelse
+        signInRequiredProviderForDisplayMessage(message) orelse
+        legacyProviderFailureForDisplayMessage(message);
 }
 
 /// Replaces opaque legacy enum names with an honest explanation.
@@ -2766,4 +2776,11 @@ test "legacy provider failures retain an actionable usage path" {
     try std.testing.expectEqual(provider_models.Provider.codex, providerFailureActionProvider("Provider request failed: CodexTurnFailed").?);
     try std.testing.expect(std.mem.indexOf(u8, providerFailureActionBody("ClaudeRequestFailed"), "did not save") != null);
     try std.testing.expect(providerFailureActionProvider("Authentication failed") == null);
+}
+
+test "signed-out Claude failures offer a sign-in action" {
+    try std.testing.expectEqual(provider_models.Provider.claude, signInRequiredProviderForDisplayMessage(CLAUDE_SIGN_IN_REQUIRED_MESSAGE).?);
+    try std.testing.expectEqual(provider_models.Provider.claude, providerFailureActionProvider(CLAUDE_SIGN_IN_REQUIRED_MESSAGE).?);
+    try std.testing.expectEqualStrings(CLAUDE_SIGN_IN_REQUIRED_MESSAGE, providerFailureActionBody(CLAUDE_SIGN_IN_REQUIRED_MESSAGE));
+    try std.testing.expect(signInRequiredProviderForDisplayMessage(CLAUDE_USAGE_LIMIT_MESSAGE) == null);
 }

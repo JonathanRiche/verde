@@ -2138,7 +2138,8 @@ fn openCodeToolKind(tool_name: []const u8) provider_types.ToolCallKind {
     if (provider_types.isSubagentToolName(tool_name)) return .subagent;
     if (std.mem.eql(u8, tool_name, "bash") or std.mem.eql(u8, tool_name, "shell")) return .execute;
     if (std.mem.eql(u8, tool_name, "read")) return .read;
-    if (std.mem.eql(u8, tool_name, "edit") or std.mem.eql(u8, tool_name, "write") or std.mem.eql(u8, tool_name, "patch")) return .edit;
+    if (std.mem.eql(u8, tool_name, "edit") or std.mem.eql(u8, tool_name, "write") or std.mem.eql(u8, tool_name, "patch") or
+        std.mem.eql(u8, tool_name, "multiedit") or std.mem.eql(u8, tool_name, "apply_patch")) return .edit;
     if (std.mem.eql(u8, tool_name, "grep") or std.mem.eql(u8, tool_name, "glob") or std.mem.eql(u8, tool_name, "list")) return .search;
     if (std.mem.eql(u8, tool_name, "webfetch") or std.mem.eql(u8, tool_name, "websearch")) return .fetch;
 

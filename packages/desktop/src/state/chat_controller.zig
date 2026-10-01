@@ -507,6 +507,8 @@ pub fn titleGenerationWorker(request: *TitleGenerationRequest) void {
         page_alloc.free(request.user_text);
         page_alloc.free(request.assistant_text);
         page_alloc.free(request.model_ref);
+        page_alloc.free(request.workspace_id);
+        page_alloc.free(request.local_thread_id);
         page_alloc.destroy(request);
         loop_wakeup.notify();
         state.worker_done.store(true, .release);
@@ -522,6 +524,8 @@ pub fn titleGenerationWorker(request: *TitleGenerationRequest) void {
         .cwd = request.project_path,
         .user_text = request.user_text,
         .assistant_text = request.assistant_text,
+        .workspace_id = if (request.workspace_id.len > 0) request.workspace_id else null,
+        .local_thread_id = if (request.local_thread_id.len > 0) request.local_thread_id else null,
     }) catch |err| {
         finishTitleGenerationFailure(request.state, @errorName(err));
         return;
@@ -532,6 +536,7 @@ pub fn titleGenerationWorker(request: *TitleGenerationRequest) void {
         return;
     };
     defer if (response.title) |title| page_alloc.free(title);
+    defer if (response.description) |description| page_alloc.free(description);
     defer if (response.error_message) |message| page_alloc.free(message);
     if (response.error_message) |message| {
         finishTitleGenerationFailure(request.state, message);
@@ -785,13 +790,19 @@ fn codexBackgroundPollWorker(state: *CodexBackgroundPollState, request: *const C
         running = if (request.terminate)
             if (client.decodeProviderCodexBackgroundTerminate(&parsed)) |result|
                 if (result.terminated) false else null
-            else |_|
-                null
+            else |err| blk: {
+                runtime_log.diagnostic("bg-stop codex terminate rejected process={s}: {s}", .{ request.process_id, @errorName(err) });
+                break :blk null;
+            }
         else if (client.decodeProviderCodexBackgroundStatus(&parsed)) |result|
             result.running
-        else |_|
-            null;
-    } else |_| {}
+        else |err| blk: {
+            runtime_log.diagnostic("bg-poll codex status rejected process={s}: {s}", .{ request.process_id, @errorName(err) });
+            break :blk null;
+        };
+    } else |err| {
+        runtime_log.diagnostic("bg-poll codex daemon call failed terminate={} process={s}: {s}", .{ request.terminate, request.process_id, @errorName(err) });
+    }
 
     const io = std.Io.Threaded.global_single_threaded.io();
     state.mutex.lockUncancelable(io);
@@ -5035,6 +5046,10 @@ pub fn startTitleGeneration(self: anytype, project_index: usize, thread: *ChatTh
     errdefer page_alloc.free(owned_assistant_text);
     const model_ref = try page_alloc.dupe(u8, self.app_config.chatTitleModel());
     errdefer page_alloc.free(model_ref);
+    const workspace_id = try page_alloc.dupe(u8, self.project_controller.projects.items[project_index].id);
+    errdefer page_alloc.free(workspace_id);
+    const local_thread_id = try page_alloc.dupe(u8, thread.local_thread_id);
+    errdefer page_alloc.free(local_thread_id);
     const request = try page_alloc.create(TitleGenerationRequest);
     errdefer page_alloc.destroy(request);
     request.* = .{
@@ -5045,6 +5060,8 @@ pub fn startTitleGeneration(self: anytype, project_index: usize, thread: *ChatTh
         .assistant_text = owned_assistant_text,
         .provider = harnessProviderForDbProvider(dbProviderForChatTitleProvider(self.app_config.chat_title_provider)),
         .model_ref = model_ref,
+        .workspace_id = workspace_id,
+        .local_thread_id = local_thread_id,
     };
 
     const state = thread.title_generation_state;
@@ -5372,6 +5389,18 @@ fn startCodexBackgroundPoll(self: anytype) void {
     poll.mutex.unlock(io);
     if (busy) return;
 
+    // User-requested stops share the single worker slot with status polls, so
+    // dispatch them first; otherwise a Stop click could wait behind (or be
+    // rejected by) the 2s status cadence.
+    for (self.project_controller.projects.items, 0..) |*project, project_index| {
+        for (project.threads.items) |*thread| {
+            if (startQueuedCodexStopForThread(self, poll, project_index, thread)) return;
+        }
+        for (project.archived_threads.items) |*thread| {
+            if (startQueuedCodexStopForThread(self, poll, project_index, thread)) return;
+        }
+    }
+
     const now_ms = unixTimestampMs();
     for (self.project_controller.projects.items, 0..) |*project, project_index| {
         for (project.threads.items) |*thread| {
@@ -5383,6 +5412,35 @@ fn startCodexBackgroundPoll(self: anytype) void {
     }
 }
 
+fn startQueuedCodexStopForThread(
+    self: anytype,
+    poll: *CodexBackgroundPollState,
+    project_index: usize,
+    thread: *ChatThread,
+) bool {
+    for (thread.background_tasks.items) |*task| {
+        if (task.status != .running or task.provider != .codex) continue;
+        if (!task.stop_requested or task.stop_dispatched) continue;
+        if (task.provider_thread_id == null or task.process_id == null) continue;
+        const target = self.providerExecutionTargetForProjectThread(project_index, thread, 0) orelse {
+            runtime_log.diagnostic("bg-stop codex stop: no execution target thread={s} process={s}", .{ thread.local_thread_id, task.process_id.? });
+            task.stop_requested = false;
+            self.setSidebarNotice("Codex could not stop the background task: no execution target for this chat.");
+            continue;
+        };
+        if (spawnCodexBackgroundPollWorker(self, poll, thread, task, target.cwd(), true)) {
+            task.stop_dispatched = true;
+            runtime_log.diagnostic("bg-stop codex stop dispatched thread={s} process={s}", .{ thread.local_thread_id, task.process_id.? });
+            return true;
+        }
+        runtime_log.diagnostic("bg-stop codex stop: worker spawn failed thread={s} process={s}", .{ thread.local_thread_id, task.process_id.? });
+        task.stop_requested = false;
+        self.setSidebarNotice("Codex could not stop the background task.");
+        return false;
+    }
+    return false;
+}
+
 fn startCodexBackgroundPollForThread(
     self: anytype,
     poll: *CodexBackgroundPollState,
@@ -5392,82 +5450,25 @@ fn startCodexBackgroundPollForThread(
 ) bool {
     for (thread.background_tasks.items) |*task| {
         if (task.status != .running or task.provider != .codex) continue;
+        if (task.stop_requested) continue;
         if (task.provider_thread_id == null or task.process_id == null) continue;
         const poll_interval_ms = codexBackgroundTaskPollIntervalMs(task.poll_failure_count);
         if (task.last_poll_ms != 0 and now_ms - task.last_poll_ms < poll_interval_ms) continue;
         const target = self.providerExecutionTargetForProjectThread(project_index, thread, 0) orelse return false;
         task.last_poll_ms = now_ms;
-
-        const allocator = std.heap.page_allocator;
-        const request = allocator.create(CodexBackgroundPollRequest) catch return false;
-        request.* = .{
-            .local_thread_id = allocator.dupe(u8, thread.local_thread_id) catch {
-                allocator.destroy(request);
-                return false;
-            },
-            .provider_thread_id = undefined,
-            .process_id = undefined,
-            .pref_path = undefined,
-            .cwd = undefined,
-            .terminate = false,
-        };
-        request.provider_thread_id = allocator.dupe(u8, task.provider_thread_id.?) catch {
-            allocator.free(request.local_thread_id);
-            allocator.destroy(request);
-            return false;
-        };
-        request.process_id = allocator.dupe(u8, task.process_id.?) catch {
-            allocator.free(request.provider_thread_id);
-            allocator.free(request.local_thread_id);
-            allocator.destroy(request);
-            return false;
-        };
-        request.pref_path = allocator.dupe(u8, self.storage.pref_path) catch {
-            allocator.free(request.process_id);
-            allocator.free(request.provider_thread_id);
-            allocator.free(request.local_thread_id);
-            allocator.destroy(request);
-            return false;
-        };
-        request.cwd = allocator.dupe(u8, target.cwd()) catch {
-            allocator.free(request.pref_path);
-            allocator.free(request.process_id);
-            allocator.free(request.provider_thread_id);
-            allocator.free(request.local_thread_id);
-            allocator.destroy(request);
-            return false;
-        };
-        const io = std.Io.Threaded.global_single_threaded.io();
-        poll.mutex.lockUncancelable(io);
-        poll.request = request;
-        poll.running = null;
-        poll.status = .pending;
-        poll.worker = std.Thread.spawn(.{}, codexBackgroundPollWorker, .{ poll, request }) catch {
-            poll.request = null;
-            poll.status = .idle;
-            poll.mutex.unlock(io);
-            request.deinit();
-            return false;
-        };
-        poll.mutex.unlock(io);
-        return true;
+        return spawnCodexBackgroundPollWorker(self, poll, thread, task, target.cwd(), false);
     }
     return false;
 }
 
-pub fn requestCodexBackgroundTaskTermination(
+fn spawnCodexBackgroundPollWorker(
     self: anytype,
-    thread: *ChatThread,
-    task: *BackgroundTask,
-    project_path: []const u8,
+    poll: *CodexBackgroundPollState,
+    thread: *const ChatThread,
+    task: *const BackgroundTask,
+    cwd: []const u8,
+    terminate: bool,
 ) bool {
-    const poll = &self.chat_controller.codex_background_poll;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    poll.mutex.lockUncancelable(io);
-    defer poll.mutex.unlock(io);
-    if (poll.status != .idle) return false;
-    const provider_thread_id = task.provider_thread_id orelse return false;
-    const process_id = task.process_id orelse return false;
     const allocator = std.heap.page_allocator;
     const request = allocator.create(CodexBackgroundPollRequest) catch return false;
     request.* = .{
@@ -5479,14 +5480,14 @@ pub fn requestCodexBackgroundTaskTermination(
         .process_id = undefined,
         .pref_path = undefined,
         .cwd = undefined,
-        .terminate = true,
+        .terminate = terminate,
     };
-    request.provider_thread_id = allocator.dupe(u8, provider_thread_id) catch {
+    request.provider_thread_id = allocator.dupe(u8, task.provider_thread_id.?) catch {
         allocator.free(request.local_thread_id);
         allocator.destroy(request);
         return false;
     };
-    request.process_id = allocator.dupe(u8, process_id) catch {
+    request.process_id = allocator.dupe(u8, task.process_id.?) catch {
         allocator.free(request.provider_thread_id);
         allocator.free(request.local_thread_id);
         allocator.destroy(request);
@@ -5499,7 +5500,7 @@ pub fn requestCodexBackgroundTaskTermination(
         allocator.destroy(request);
         return false;
     };
-    request.cwd = allocator.dupe(u8, project_path) catch {
+    request.cwd = allocator.dupe(u8, cwd) catch {
         allocator.free(request.pref_path);
         allocator.free(request.process_id);
         allocator.free(request.provider_thread_id);
@@ -5507,6 +5508,13 @@ pub fn requestCodexBackgroundTaskTermination(
         allocator.destroy(request);
         return false;
     };
+    const io = std.Io.Threaded.global_single_threaded.io();
+    poll.mutex.lockUncancelable(io);
+    defer poll.mutex.unlock(io);
+    if (poll.status != .idle or poll.worker != null) {
+        request.deinit();
+        return false;
+    }
     poll.request = request;
     poll.running = null;
     poll.status = .pending;
@@ -5516,8 +5524,16 @@ pub fn requestCodexBackgroundTaskTermination(
         request.deinit();
         return false;
     };
-    task.stop_requested = true;
     return true;
+}
+
+/// Queues a user Stop for one Codex background terminal. The shared poll
+/// worker dispatches it immediately when idle, or as soon as the in-flight
+/// status poll finishes, so the click is never rejected for being busy.
+pub fn queueCodexBackgroundTaskTermination(self: anytype, task: *BackgroundTask) void {
+    task.stop_requested = true;
+    task.stop_dispatched = false;
+    startCodexBackgroundPoll(self);
 }
 
 fn finishCodexBackgroundPoll(self: anytype) bool {
@@ -5542,12 +5558,24 @@ fn finishCodexBackgroundPoll(self: anytype) bool {
     if (running == null) {
         if (task) |entry| {
             entry.poll_failure_count = std.math.add(u8, entry.poll_failure_count, 1) catch std.math.maxInt(u8);
-            if (request.terminate) entry.stop_requested = false;
+            if (request.terminate) {
+                entry.stop_requested = false;
+                entry.stop_dispatched = false;
+                // A restarted Codex app-server forgets retained terminals, so
+                // terminate fails forever; re-check liveness right away so a
+                // terminal Codex no longer tracks leaves the pin stack.
+                entry.last_poll_ms = 0;
+                entry.poll_failure_count = 0;
+            }
         }
-        if (request.terminate) self.setSidebarNotice("Codex could not stop the background task.");
+        if (request.terminate) {
+            runtime_log.diagnostic("bg-stop codex stop failed thread={s} process={s}", .{ request.local_thread_id, request.process_id });
+            self.setSidebarNotice("Codex could not stop the background task.");
+        }
         return false;
     }
     if (task) |entry| entry.poll_failure_count = 0;
+    if (request.terminate) runtime_log.diagnostic("bg-stop codex stop succeeded thread={s} process={s}", .{ request.local_thread_id, request.process_id });
     if (running.?) return false;
     return completeCodexBackgroundTask(self, request);
 }

@@ -182,6 +182,22 @@ test('provider acknowledgement failures retain uncertainty through completion an
   expect(methods).toEqual(['chat.turn.steer', 'chat.turn.tail'])
 })
 
+test('uncertain steer on a finished turn without a steer record becomes recallable, never auto-sent', async () => {
+  const f = fixture({ rpc: async (_pane, method) => method === 'chat.turn.steer'
+    ? { error: { code: 'invalid_state', message: 'provider could not accept steering for this turn' } }
+    : { result: { status: 'completed', events: [{ seq: 1, kind: 'completed', payload_json: '{}' }] } } })
+  await f.submit(pane, 'glass mirror', [])
+  expect(f.pendingFollowup(pane)?.delivery).toBe('uncertain')
+  f.finish(); await f.flushReady()
+  expect(await f.retryFollowup(pane)).toBe(false)
+  expect(f.pendingFollowup(pane)).toMatchObject({ state: 'fallback_next_turn', delivery: 'unsent' })
+  await f.flushReady()
+  expect(f.starts).toHaveLength(0)
+  expect(f.pendingFollowupHint(pane)).toContain('paused')
+  expect(await f.retryFollowup(pane)).toBe(true)
+  expect(f.starts).toHaveLength(1)
+})
+
 test('receipt is durable before RPC and staging; reload keeps identity and never dispatches uncertain work', async () => {
   const storage = memoryStorage()
   let release

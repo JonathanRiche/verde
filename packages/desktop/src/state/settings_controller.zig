@@ -288,6 +288,10 @@ pub const State = struct {
     title_model_dropdown_open: bool = false,
     title_menu_hover_index: ?usize = null,
     title_model_menu_scroll: usize = 0,
+    /// Open "Commit messages" dropdown, if any.
+    commit_menu: ?CommitMenu = null,
+    commit_menu_hover_index: ?usize = null,
+    commit_model_menu_scroll: usize = 0,
     new_chat_provider_dropdown_open: bool = false,
     new_chat_model_dropdown_open: bool = false,
     new_chat_reasoning_dropdown_open: bool = false,
@@ -556,6 +560,9 @@ fn closeSettingsDropdowns(self: anytype) void {
     self.settings_controller.title_model_dropdown_open = false;
     self.settings_controller.title_menu_hover_index = null;
     self.settings_controller.title_model_menu_scroll = 0;
+    self.settings_controller.commit_menu = null;
+    self.settings_controller.commit_menu_hover_index = null;
+    self.settings_controller.commit_model_menu_scroll = 0;
     self.settings_controller.new_chat_provider_dropdown_open = false;
     self.settings_controller.new_chat_model_dropdown_open = false;
     self.settings_controller.new_chat_reasoning_dropdown_open = false;
@@ -911,7 +918,8 @@ fn defaultChatTitleModelRef(self: anytype, provider: app_config.ChatTitleProvide
         // ChatTitleProvider deliberately excludes pi, fx, and grok.
         .codex, .pi, .fx, .grok, .muse => unreachable,
         .opencode => self.cachedDefaultModelRefForProvider(.opencode),
-        .claude => provider_models.DEFAULT_CLAUDE_MODEL,
+        // Titles use the fast tier, matching the daemon's fallback.
+        .claude => app_config.DEFAULT_CLAUDE_FAST_MODEL,
         .cursor => provider_models.DEFAULT_CURSOR_MODEL,
     };
 }
@@ -920,6 +928,116 @@ fn replaceSettingsChatTitleModel(self: anytype, model_ref: []const u8) !void {
     const owned_model = try self.allocator.dupe(u8, model_ref);
     if (self.settings_controller.chat_title_model) |previous| self.allocator.free(previous);
     self.settings_controller.chat_title_model = owned_model;
+}
+
+// ------------------------------------------------------------------
+// Commit messages (config.commit.set; applied immediately, not drafted)
+// ------------------------------------------------------------------
+
+pub const CommitMenu = enum { provider, model };
+
+const COMMIT_PROVIDER_OPTIONS = [_]app_config.CommitMessageProvider{ .auto, .codex, .claude, .cursor, .opencode };
+
+pub fn settingsCommitProviderCount() usize {
+    return COMMIT_PROVIDER_OPTIONS.len;
+}
+
+pub fn settingsCommitProviderSelectedIndex(self: anytype) usize {
+    for (COMMIT_PROVIDER_OPTIONS, 0..) |provider, index| {
+        if (provider == self.app_config.commit_message_provider) return index;
+    }
+    return 0;
+}
+
+pub fn settingsCommitProviderLabel(option_index: usize) []const u8 {
+    if (option_index >= COMMIT_PROVIDER_OPTIONS.len) return "Unknown provider";
+    return switch (COMMIT_PROVIDER_OPTIONS[option_index]) {
+        .auto => "Auto",
+        .codex => "Codex / ChatGPT",
+        .claude => "Claude",
+        .cursor => "Cursor",
+        .opencode => "OpenCode",
+    };
+}
+
+fn settingsCommitModelOptions(self: anytype) []const ModelOption {
+    const provider = self.app_config.commit_message_provider.fixed() orelse return &.{};
+    return chat_threads.modelOptions(
+        ModelOption,
+        dbProviderForChatTitleProvider(provider),
+        self.opencodeModelOptionsSnapshot(),
+        provider_models.CODEX_MODEL_OPTIONS[0..],
+        self.claudeModelOptionsSnapshot(),
+        self.cursorModelOptionsSnapshot(),
+        self.piModelOptionsSnapshot(),
+        self.fxModelOptionsSnapshot(),
+        self.grokModelOptionsSnapshot(),
+        self.museModelOptionsSnapshot(),
+    );
+}
+
+/// Row 0 is always "provider default" (an empty model); the provider's
+/// catalog follows. Auto has no fixed provider, so only row 0 exists.
+pub fn settingsCommitModelCount(self: anytype) usize {
+    return 1 + settingsCommitModelOptions(self).len;
+}
+
+pub fn settingsCommitModelLabel(self: anytype, option_index: usize, buf: []u8) []const u8 {
+    if (option_index == 0) {
+        const provider = self.app_config.commit_message_provider.fixed() orelse return "Provider default";
+        return std.fmt.bufPrint(buf, "Default ({s})", .{app_config.defaultFastModel(provider)}) catch "Provider default";
+    }
+    const options = settingsCommitModelOptions(self);
+    if (option_index - 1 >= options.len) return "Unknown model";
+    return options[option_index - 1].label;
+}
+
+pub fn settingsCommitModelSelectedIndex(self: anytype) ?usize {
+    const selected = self.app_config.commit_message_model orelse return 0;
+    if (selected.len == 0) return 0;
+    for (settingsCommitModelOptions(self), 0..) |option, index| {
+        const value = option.value orelse continue;
+        if (std.mem.eql(u8, value, selected)) return index + 1;
+    }
+    return null;
+}
+
+pub fn settingsCommitModelSelectedLabel(self: anytype, buf: []u8) []const u8 {
+    if (settingsCommitModelSelectedIndex(self)) |index| return settingsCommitModelLabel(self, index, buf);
+    return self.app_config.commit_message_model orelse "Provider default";
+}
+
+pub fn selectSettingsCommitProvider(self: anytype, option_index: usize) void {
+    if (option_index >= COMMIT_PROVIDER_OPTIONS.len) return;
+    const provider = COMMIT_PROVIDER_OPTIONS[option_index];
+    if (provider != self.app_config.commit_message_provider) {
+        self.setCommitSettings(provider, null, null);
+        switch (provider) {
+            .auto, .codex => {},
+            .claude => self.startClaudeModelOptionsRefresh(),
+            .cursor => self.startCursorModelOptionsRefresh(),
+            .opencode => self.startOpencodeModelOptionsRefresh(),
+        }
+    }
+    self.settings_controller.commit_menu = null;
+    self.settings_controller.commit_menu_hover_index = null;
+    self.settings_controller.commit_model_menu_scroll = 0;
+}
+
+pub fn selectSettingsCommitModel(self: anytype, option_index: usize) void {
+    const model: []const u8 = if (option_index == 0) "" else blk: {
+        const options = settingsCommitModelOptions(self);
+        if (option_index - 1 >= options.len) return;
+        break :blk options[option_index - 1].value orelse return;
+    };
+    self.setCommitSettings(null, model, null);
+    self.settings_controller.commit_menu = null;
+    self.settings_controller.commit_menu_hover_index = null;
+}
+
+pub fn selectSettingsCommitAction(self: anytype, action: app_config.CommitDefaultAction) void {
+    if (self.app_config.commit_default_action == action) return;
+    self.setCommitSettings(null, null, action);
 }
 
 pub fn settingsNewChatProviderCount(self: anytype) usize {
@@ -1272,12 +1390,15 @@ pub fn installSettingsProvider(self: anytype, row: usize) void {
     };
 }
 
+pub fn loginSettingsProvider(self: anytype, row: usize) void {
+    if (row >= PROVIDER_OPTIONS.len) return;
+    loginProvider(self, PROVIDER_OPTIONS[row]);
+}
+
 /// Opens the provider's own sign-in command in a workspace terminal. The CLI
 /// owns the flow (browser OAuth, device code, or a TUI `/login`); Verde
 /// rechecks readiness when the terminal exits.
-pub fn loginSettingsProvider(self: anytype, row: usize) void {
-    if (row >= PROVIDER_OPTIONS.len) return;
-    const provider = PROVIDER_OPTIONS[row];
+pub fn loginProvider(self: anytype, provider: app_config.ChatProvider) void {
     const shell = headless.provider_install.loginShell(providerProtocol(provider));
     if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) {
         self.setSidebarNotice(if (self.setClipboardText(shell))

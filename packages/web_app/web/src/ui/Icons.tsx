@@ -93,6 +93,7 @@ export function Icon(props: { name: string; class?: string }) {
     more: 'M7 12h.01 M12 12h.01 M17 12h.01',
     menu: 'M6 8h12 M6 12h12 M6 16h12',
     close: 'M7 7l10 10 M17 7 7 17',
+    check: 'M6.5 12.5l3.5 3.5 7.5-8',
     zoom: 'M9 5H5v4 M19 9V5h-4 M5 15v4h4 M15 19h4v-4',
     unzoom: 'M9 5v4H5 M15 5v4h4 M9 19v-4H5 M15 19v-4h4',
     lock: 'M8 11h8v7H8z M9.4 11V8.8a2.6 2.6 0 0 1 5.2 0V11',
@@ -108,6 +109,16 @@ export function Icon(props: { name: string; class?: string }) {
         stroke-linecap="round"
         stroke-linejoin="round"
       />
+    </svg>
+  )
+}
+
+/// Indeterminate progress ring (git actions).
+export function Spinner(props: { class?: string }) {
+  return (
+    <svg class={`animate-spin shrink-0 ${props.class ?? 'h-4 w-4'}`} viewBox="0 0 24 24" aria-hidden="true">
+      <circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-opacity="0.25" stroke-width="2.2" />
+      <path d="M20 12a8 8 0 0 0-8-8" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" />
     </svg>
   )
 }

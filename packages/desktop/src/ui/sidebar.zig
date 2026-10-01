@@ -2374,6 +2374,7 @@ fn renderOpenPaneRow(
             if (ref.thread_index < project.threads.items.len) {
                 const thread = &project.threads.items[ref.thread_index];
                 queuePaletteProviderGlyph(state, thread.provider, icon_x, cy, clip);
+                queueGitChangesDot(state, project, thread, icon_x, cy, clip);
                 title = thread.title;
                 status = chatSurfaceStatusForUi(thread);
                 running = status.? == .working;
@@ -2965,6 +2966,28 @@ pub fn formatRelativeTime(buffer: []u8, timestamp: i64) []const u8 {
     }
     const days = @divFloor(elapsed, 86_400);
     return std.fmt.bufPrint(buffer, "{d}d", .{days}) catch "…";
+}
+
+/// Small dot at the provider glyph's lower-right corner when the chat owns
+/// uncommitted git changes; amber when a file needs an ownership decision.
+fn queueGitChangesDot(
+    state: *runtime.AppState,
+    project: *const native_state.Project,
+    thread: *const native_state.ChatThread,
+    icon_x: f32,
+    center_y: f32,
+    clip: palette.Rect,
+) void {
+    state.ensureGitChangesSummary(project.id);
+    if (!thread.committed) return;
+    const summary = state.gitChangesThreadSummary(thread.local_thread_id) orelse return;
+    if (summary.files == 0) return;
+    const slot = theme.scaledUi(SIDEBAR_THREAD_PROVIDER_GLYPH_CSS);
+    const dot = theme.scaledUi(7.0);
+    const cx = icon_x + slot - dot * 0.35;
+    const dot_cy = center_y + slot * 0.5 - dot * 0.35;
+    const color = if (summary.attention > 0) theme.COLOR_YELLOW else theme.COLOR_TEXT_MUTED;
+    queuePaletteRoundedRectClipped(state, snapRect(.{ .x = cx - dot * 0.5, .y = dot_cy - dot * 0.5, .w = dot, .h = dot }), paletteColor(color), dot * 0.5, clip);
 }
 
 pub fn queuePaletteProviderGlyph(state: *runtime.AppState, provider: Provider, x: f32, center_y: f32, clip: palette.Rect) void {

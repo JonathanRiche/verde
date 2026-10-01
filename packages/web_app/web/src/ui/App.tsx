@@ -12,6 +12,8 @@ import { PrefixBar } from './PrefixBar'
 import { PaneActionsButton, Sidebar } from './Sidebar'
 import { WorkspaceCanvas } from './WorkspaceCanvas'
 import { DesktopViewer, desktopViewerOpen } from './DesktopViewer'
+import { GitChangesLayer } from './CommitSheet'
+import { GitChangesChip } from './GitChanges'
 
 export function App() {
   onMount(() => {
@@ -75,6 +77,9 @@ export function App() {
           <div class="min-w-0 flex-1 truncate text-[14px] font-medium">
             {focused() ? store.paneTitle(focused()!) : (store.workspace()?.label ?? 'Verde')}
           </div>
+          <Show when={focused()?.kind === 'chat' ? focused() : undefined} keyed>
+            {(pane) => <GitChangesChip pane={pane} />}
+          </Show>
           <Show
             when={(focused()?.kind === 'chat' || focused()?.kind === 'terminal') ? focused() : undefined}
             keyed
@@ -94,6 +99,7 @@ export function App() {
       <History />
       <FileViewer />
       <DesktopViewer />
+      <GitChangesLayer />
       <NoticeToast />
     </div>
   )

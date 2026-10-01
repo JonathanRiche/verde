@@ -255,3 +255,43 @@ test('workspace roots reach Claude on resumed turns without widening permission 
   assert.equal(options.permissionMode, 'default');
   assert.equal(options.allowDangerouslySkipPermissions, undefined);
 });
+
+const signInRequired = 'Claude Code is not signed in. Sign in, then send your message again.';
+test('signed-out Claude reports sign-in instead of the synthetic stop reason', { timeout: 2000 }, async () => {
+  const { context } = bridge();
+  const signedOut = { type: 'result', subtype: 'success', is_error: true, result: 'Not logged in · Please run /login', stop_reason: 'stop_sequence' };
+  await assert.rejects(
+    context.handleClaudeSendPrompt({ async *query() { yield signedOut; } }, { prompt: 'test' }),
+    { message: signInRequired },
+  );
+  await assert.rejects(
+    context.handleClaudeSendPrompt({ async *query() {
+      yield { type: 'assistant', error: 'authentication_failed', message: { content: [{ type: 'text', text: 'Not logged in · Please run /login' }] } };
+      yield signedOut;
+    } }, { prompt: 'test' }),
+    { message: signInRequired },
+  );
+});
+
+test('other Claude error results report their text instead of the stop reason', { timeout: 2000 }, async () => {
+  const { context } = bridge();
+  await assert.rejects(
+    context.handleClaudeSendPrompt({ async *query() {
+      yield { type: 'result', subtype: 'success', is_error: true, result: 'API Error: 500 overloaded', stop_reason: 'stop_sequence' };
+    } }, { prompt: 'test' }),
+    { message: 'API Error: 500 overloaded' },
+  );
+});
+
+test('every Claude file-editing tool reports its path for attribution', () => {
+  const { context } = bridge();
+  const diff = (name, input) => context.diffFromClaudeToolUse({ type: 'tool_use', name, input, id: 'x' });
+  assert.equal(diff('Edit', { file_path: '/r/a.zig', old_string: 'a', new_string: 'b' }).path, '/r/a.zig');
+  assert.equal(diff('Write', { file_path: '/r/w.md', content: 'x' }).path, '/r/w.md');
+  const multi = diff('MultiEdit', { file_path: '/r/m.zig', edits: [{ old_string: 'a', new_string: 'b' }, { old_string: 'c', new_string: 'd\ne' }] });
+  assert.equal(multi.path, '/r/m.zig');
+  assert.equal(multi.additions, 3);
+  assert.equal(multi.deletions, 2);
+  assert.equal(diff('NotebookEdit', { notebook_path: '/r/n.ipynb', new_source: 'x' }).path, '/r/n.ipynb');
+  assert.equal(diff('Read', { file_path: '/r/read.zig' }), null);
+});

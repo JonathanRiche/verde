@@ -17,6 +17,8 @@ const runtime_connections = @import("../state/runtime_connections_controller.zig
 const command_palette = @import("command_palette.zig");
 const companion = @import("companion.zig");
 const handoff_sheet = @import("handoff_sheet.zig");
+const commit_sheet = @import("commit_sheet.zig");
+const git_changes = @import("../state/git_changes_controller.zig");
 const companion_controller = @import("../state/companion_controller.zig");
 const cookie_import_controller = @import("../state/cookie_import_controller.zig");
 const profiler = @import("../runtime/profiler.zig");
@@ -85,6 +87,7 @@ pub fn refreshPaletteModalHits(state: *runtime.AppState, width: f32, height: f32
     registerWorkspaceRenameModalHits(state, width, height);
     registerThreadImportModalHits(state, width, height);
     registerCookieImportModalHits(state, width, height);
+    commit_sheet.registerHits(state, width, height, queueModalHit);
     settings_modal.registerHits(state, width, height, queueModalHit);
     registerWorkspaceSettingsModalHits(state, width, height);
     registerRuntimeWizardModalHits(state, width, height);
@@ -216,6 +219,7 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     renderWorkspaceRenameModal(state, width, height);
     renderThreadImportModal(state, width, height);
     renderCookieImportModal(state, width, height);
+    commit_sheet.render(state, width, height);
     renderProviderOnboardingModal(state, width, height);
     renderMcpOnboardingModal(state, width, height);
     settings_modal.render(state, width, height);
@@ -239,7 +243,14 @@ const NOTICE_TOAST_RISE_UI: f32 = 10.0;
 const NOTICE_TOAST_MAX_W_UI: f32 = 560.0;
 const NOTICE_TOAST_MAX_LINES: f32 = 4.0;
 
-fn renderNoticeToast(state: *runtime.AppState, workspace: palette.Rect) void {
+fn renderNoticeToast(state: *runtime.AppState, workspace_rect: palette.Rect) void {
+    // Git actions (Commit, Commit & push, Push, Pull & push) draw their own
+    // card; a plain notice stacks above it.
+    var workspace = workspace_rect;
+    if (renderGitToast(state, workspace_rect)) |card_top| {
+        const reserve = if (state.prefix_armed or state.prefix_navigate) prefixBarHeight() else 0.0;
+        workspace.h = @max(card_top - theme.scaledUi(8.0) + theme.scaledUi(NOTICE_TOAST_MARGIN_UI) + reserve - workspace.y, 0.0);
+    }
     const toast = state.noticeToast() orelse return;
     if (workspace.w <= 0.0 or workspace.h <= 0.0) return;
     const font_size = theme.scaledUi(NOTICE_TOAST_FONT_UI);
@@ -288,6 +299,204 @@ fn renderNoticeToast(state: *runtime.AppState, workspace: palette.Rect) void {
     queuePaletteRoundedRect(state, .{ .x = pill.x + inset, .y = pill.y + inset, .w = pill.w - inset * 2.0, .h = pill.h - inset * 2.0 }, bg, radius - inset);
     const text_rect: palette.Rect = .{ .x = pill.x + pad_x, .y = pill.y + pad_y, .w = text_w, .h = text_h * lines };
     queuePaletteRoleText(state, text_rect, toast.text, fg, font_size, .ui, pill, wrap);
+}
+
+// Git outcome card: bottom-centre, above the notice pill. A spinner while a
+// git action runs, then a green check (auto-dismisses), amber warning or red
+// error (stay until dismissed). Title, muted detail, × and, for a rejected
+// push, a Pull & push button. State and timing live in
+// git_changes_controller (`gitToastView`); this draws and records hit rects.
+const GIT_TOAST_TITLE_FONT_UI: f32 = 13.5;
+const GIT_TOAST_DETAIL_FONT_UI: f32 = 12.0;
+const GIT_TOAST_ICON_UI: f32 = 16.0;
+const GIT_TOAST_PAD_UI: f32 = 12.0;
+const GIT_TOAST_GAP_UI: f32 = 10.0;
+const GIT_TOAST_MAX_W_UI: f32 = 480.0;
+const GIT_TOAST_MIN_W_UI: f32 = 260.0;
+const GIT_TOAST_RADIUS_UI: f32 = 10.0;
+const GIT_TOAST_CLOSE_UI: f32 = 20.0;
+const GIT_TOAST_BUTTON_H_UI: f32 = 26.0;
+const GIT_TOAST_DETAIL_MAX_LINES: f32 = 3.0;
+const GIT_TOAST_SPINNER_DOTS: usize = 8;
+const NF_COD_CHECK = "\u{EAB2}";
+const NF_COD_WARNING = "\u{EA6C}";
+const NF_COD_ERROR = "\u{EA87}";
+const NF_COD_CLOSE = "\u{EA76}";
+
+/// Last drawn card geometry, for pointer routing (`handleGitToastMouseButton`).
+var git_toast_card: ?palette.Rect = null;
+var git_toast_close: ?palette.Rect = null;
+var git_toast_action: ?palette.Rect = null;
+var git_toast_dismissible: bool = false;
+
+/// Draws the git card; returns its top edge, or null when nothing is shown.
+fn renderGitToast(state: *runtime.AppState, workspace: palette.Rect) ?f32 {
+    git_toast_card = null;
+    git_toast_close = null;
+    git_toast_action = null;
+    const view = state.gitToastView() orelse return null;
+    if (workspace.w <= 0.0 or workspace.h <= 0.0) return null;
+    const alpha = std.math.clamp(view.alpha, 0.0, 1.0);
+    if (alpha <= 0.0) return null;
+    const pad = theme.scaledUi(GIT_TOAST_PAD_UI);
+    const gap = theme.scaledUi(GIT_TOAST_GAP_UI);
+    const icon_size = theme.scaledUi(GIT_TOAST_ICON_UI);
+    const title_font = theme.scaledUi(GIT_TOAST_TITLE_FONT_UI);
+    const detail_font = theme.scaledUi(GIT_TOAST_DETAIL_FONT_UI);
+    const title_h = title_font * 1.25;
+    const detail_line_h = detail_font * 1.25;
+    const close_size = if (view.dismissible) theme.scaledUi(GIT_TOAST_CLOSE_UI) else 0.0;
+    const button_label = "Pull & push";
+    const button_font = theme.scaledUi(12.5);
+    const button_w = if (view.pull_push)
+        runtime.paletteUiTextPrefixWidth(button_label, button_font, button_label.len) + theme.scaledUi(22.0)
+    else
+        0.0;
+
+    // Width: fit the title/detail, clamped to the workspace and a max.
+    const max_w = @min(@max(workspace.w - theme.scaledUi(32.0), theme.scaledUi(120.0)), theme.scaledUi(GIT_TOAST_MAX_W_UI));
+    const chrome_w = pad * 2.0 + icon_size + gap + (if (view.pull_push) button_w + gap else 0.0) + (if (view.dismissible) close_size + gap * 0.5 else 0.0);
+    const title_w = runtime.paletteUiTextPrefixWidth(view.title, title_font, view.title.len) + title_font * 0.35;
+    const detail_w = if (view.detail.len > 0) runtime.paletteUiTextPrefixWidth(view.detail, detail_font, view.detail.len) + detail_font * 0.35 else 0.0;
+    const card_w = std.math.clamp(chrome_w + @max(title_w, detail_w), @min(theme.scaledUi(GIT_TOAST_MIN_W_UI), max_w), max_w);
+    const text_w = @max(card_w - chrome_w, theme.scaledUi(40.0));
+    // Long details (git errors) wrap onto a few lines; one line of headroom
+    // for ragged breaks, as the notice pill does.
+    const detail_wrap = detail_w > text_w;
+    const detail_lines: f32 = if (view.detail.len == 0) 0.0 else if (detail_wrap) @min(@ceil(detail_w / text_w) + 1.0, GIT_TOAST_DETAIL_MAX_LINES) else 1.0;
+    const text_block_h = title_h + (if (detail_lines > 0.0) theme.scaledUi(2.0) + detail_line_h * detail_lines else 0.0);
+    const card_h = @max(text_block_h, @max(icon_size, if (view.pull_push) theme.scaledUi(GIT_TOAST_BUTTON_H_UI) else 0.0)) + pad * 2.0;
+
+    const bottom_reserve = if (state.prefix_armed or state.prefix_navigate) prefixBarHeight() else 0.0;
+    const settled_y = workspace.y + workspace.h - bottom_reserve - theme.scaledUi(NOTICE_TOAST_MARGIN_UI) - card_h;
+    const card: palette.Rect = snapRect(.{
+        .x = workspace.x + (workspace.w - card_w) * 0.5,
+        .y = settled_y + (1.0 - view.rise) * theme.scaledUi(NOTICE_TOAST_RISE_UI),
+        .w = card_w,
+        .h = card_h,
+    });
+
+    const tone_color: [4]f32 = switch (view.tone) {
+        .running => theme.COLOR_TEXT_MUTED,
+        .success => theme.success(),
+        .warning => theme.warning(),
+        .failure => theme.danger(),
+    };
+    var bg = paletteColor(theme.COLOR_PANEL_ALT);
+    bg.a *= alpha;
+    var border = paletteColor(if (view.tone == .running or view.tone == .success) theme.borderMuted() else tone_color);
+    border.a *= alpha;
+    var accent = paletteColor(tone_color);
+    accent.a *= alpha;
+    var title_color = paletteColor(theme.COLOR_WHITE);
+    title_color.a *= alpha;
+    var detail_color = paletteColor(theme.COLOR_TEXT_MUTED);
+    detail_color.a *= alpha;
+
+    // Shell: border colour under an inset fill (anti-aliased, like the pill).
+    const radius = theme.scaledUi(GIT_TOAST_RADIUS_UI);
+    const inset = theme.scaledUi(1.0);
+    queuePaletteRoundedRect(state, card, border, radius);
+    queuePaletteRoundedRect(state, .{ .x = card.x + inset, .y = card.y + inset, .w = card.w - inset * 2.0, .h = card.h - inset * 2.0 }, bg, radius - inset);
+
+    // State icon, vertically centred on the title line.
+    const icon_rect: palette.Rect = .{ .x = card.x + pad, .y = card.y + pad + (title_h - icon_size) * 0.5, .w = icon_size, .h = icon_size };
+    switch (view.tone) {
+        .running => drawGitToastSpinner(state, icon_rect, tone_color, alpha),
+        .success => queuePaletteRoleText(state, icon_rect, NF_COD_CHECK, accent, icon_size, .icon, card, false),
+        .warning => queuePaletteRoleText(state, icon_rect, NF_COD_WARNING, accent, icon_size, .icon, card, false),
+        .failure => queuePaletteRoleText(state, icon_rect, NF_COD_ERROR, accent, icon_size, .icon, card, false),
+    }
+
+    const text_x = icon_rect.x + icon_size + gap;
+    const text_y = card.y + (card.h - text_block_h) * 0.5;
+    const text_clip: palette.Rect = .{ .x = text_x, .y = card.y, .w = text_w, .h = card.h };
+    queuePaletteRoleText(state, .{ .x = text_x, .y = text_y, .w = text_w, .h = title_h }, view.title, title_color, title_font, .ui, text_clip, false);
+    if (detail_lines > 0.0) {
+        queuePaletteRoleText(state, .{
+            .x = text_x,
+            .y = text_y + title_h + theme.scaledUi(2.0),
+            .w = text_w,
+            .h = detail_line_h * detail_lines,
+        }, view.detail, detail_color, detail_font, .ui, text_clip, detail_wrap);
+    }
+
+    var right = card.x + card.w - pad;
+    if (view.dismissible) {
+        const close: palette.Rect = .{ .x = right - close_size, .y = card.y + pad + (title_h - close_size) * 0.5, .w = close_size, .h = close_size };
+        const hovered = pointInRect(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y, close);
+        if (hovered) {
+            var hover_bg = paletteColor(theme.COLOR_PANEL_MUTED);
+            hover_bg.a *= alpha;
+            queuePaletteRoundedRect(state, close, hover_bg, theme.scaledUi(5.0));
+        }
+        var close_color = paletteColor(if (hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED);
+        close_color.a *= alpha;
+        const glyph = theme.scaledUi(13.0);
+        queuePaletteRoleText(state, .{ .x = close.x + (close.w - glyph) * 0.5, .y = close.y + (close.h - glyph) * 0.5, .w = glyph, .h = glyph }, NF_COD_CLOSE, close_color, glyph, .icon, card, false);
+        git_toast_close = close;
+        right = close.x - gap * 0.5;
+    }
+    if (view.pull_push) {
+        const button_h = theme.scaledUi(GIT_TOAST_BUTTON_H_UI);
+        const button: palette.Rect = snapRect(.{ .x = right - button_w, .y = card.y + (card.h - button_h) * 0.5, .w = button_w, .h = button_h });
+        const hovered = pointInRect(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y, button);
+        const fill_color = if (hovered) theme.raise(theme.warning(), 0.06) else theme.warning();
+        var fill = paletteColor(fill_color);
+        fill.a *= alpha;
+        queuePaletteRoundedRect(state, button, fill, theme.scaledUi(6.0));
+        var label_color = paletteColor(theme.foregroundOn(fill_color));
+        label_color.a *= alpha;
+        const label_w = runtime.paletteUiTextPrefixWidth(button_label, button_font, button_label.len) + button_font * 0.35;
+        queuePaletteRoleText(state, .{
+            .x = button.x + (button.w - label_w) * 0.5,
+            .y = button.y + (button.h - button_font * 1.25) * 0.5,
+            .w = label_w,
+            .h = button_font * 1.25,
+        }, button_label, label_color, button_font, .ui, button, false);
+        git_toast_action = button;
+    }
+    git_toast_card = card;
+    git_toast_dismissible = view.dismissible;
+    return card.y;
+}
+
+/// Eight dots on a ring, the head brightest; steps on the toast's wake tick
+/// (`TOAST_SPINNER_STEP_MS`) rather than display-rate frames.
+fn drawGitToastSpinner(state: *runtime.AppState, rect: palette.Rect, color: [4]f32, alpha: f32) void {
+    const step_ns: i128 = @as(i128, git_changes.TOAST_SPINNER_STEP_MS) * std.time.ns_per_ms;
+    const head: usize = @intCast(@mod(@divTrunc(profiler.nowNs(), step_ns), GIT_TOAST_SPINNER_DOTS));
+    const cx = rect.x + rect.w * 0.5;
+    const cy = rect.y + rect.h * 0.5;
+    const ring = rect.w * 0.36;
+    const dot = @max(rect.w * 0.17, 2.0);
+    for (0..GIT_TOAST_SPINNER_DOTS) |index| {
+        const angle = @as(f32, @floatFromInt(index)) / @as(f32, @floatFromInt(GIT_TOAST_SPINNER_DOTS)) * std.math.tau - std.math.pi * 0.5;
+        const behind = (head + GIT_TOAST_SPINNER_DOTS - index) % GIT_TOAST_SPINNER_DOTS;
+        const strength = 1.0 - @as(f32, @floatFromInt(behind)) / @as(f32, @floatFromInt(GIT_TOAST_SPINNER_DOTS));
+        var dot_color = paletteColor(color);
+        dot_color.a *= alpha * (0.18 + 0.82 * strength * strength);
+        queuePaletteRoundedRect(state, .{
+            .x = cx + @cos(angle) * ring - dot * 0.5,
+            .y = cy + @sin(angle) * ring - dot * 0.5,
+            .w = dot,
+            .h = dot,
+        }, dot_color, dot * 0.5);
+    }
+}
+
+/// Pointer input on the git card: Pull & push runs, × or any other click on
+/// a finished card dismisses it. Consumes presses inside the card.
+pub fn handleGitToastMouseButton(state: *runtime.AppState, x: f32, y: f32, down: bool) bool {
+    const card = git_toast_card orelse return false;
+    if (!pointInRect(x, y, card)) return false;
+    if (!down) return true;
+    if (git_toast_action) |rect| if (pointInRect(x, y, rect)) {
+        state.gitToastPullPush();
+        return true;
+    };
+    if (git_toast_dismissible) state.dismissGitToast();
+    return true;
 }
 
 // Which-key overlay: while a tmux-style prefix chord is armed, a bottom-anchored
@@ -1323,6 +1532,7 @@ fn focusedCursorReadOnly(state: *runtime.AppState) usize {
         .project_rename => state.project_rename_cursor,
         .thread_import => state.thread_import_cursor,
         .cookie_import_search => state.cookie_import.search_cursor,
+        .commit_message => if (state.commitSheet()) |sheet| sheet.message_cursor else 0,
         .project_import_name => state.project_import_name_cursor,
         .project_import => state.project_import_cursor,
         .runtime_credential => state.runtime_credential_token_cursor,
@@ -1420,6 +1630,7 @@ fn focusedValue(state: *runtime.AppState) []const u8 {
         .project_rename => state.renameInput(),
         .thread_import => state.threadImportThreadId(),
         .cookie_import_search => state.cookie_import.searchQuery(),
+        .commit_message => if (state.commitSheet()) |sheet| sheet.message() else &[_]u8{},
         .project_import_name => state.importProjectNameDraft(),
         .project_import => state.importDirectoryDraft(),
         .runtime_credential => state.runtimeCredentialToken(),
@@ -1492,10 +1703,15 @@ fn pasteIntoModal(state: *runtime.AppState) bool {
     }
     _ = deleteModalSelection(state);
     // Modal inputs are single-line; strip control chars from pasted text.
-    var sanitized: [4096]u8 = undefined;
+    // The commit message is multi-line, so it keeps newlines (tabs become
+    // spaces; carriage returns are dropped).
+    const multiline = state.palette_modal_text_focus == .commit_message;
+    var sanitized: [8192]u8 = undefined;
     var n: usize = 0;
-    for (text) |b| {
-        if (b == '\n' or b == '\r' or b == '\t') continue;
+    for (text) |raw| {
+        const b: u8 = if (multiline and raw == '\t') ' ' else raw;
+        if (b == '\r' or b == '\t') continue;
+        if (b == '\n' and !multiline) continue;
         if (n >= sanitized.len) break;
         sanitized[n] = b;
         n += 1;
@@ -1682,6 +1898,7 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             .settings_new_chat_provider_option => settings_modal.applyNewChatProviderOption(state, hit.index),
             .settings_new_chat_model_option => settings_modal.applyNewChatModelOption(state, hit.index),
             .settings_new_chat_reasoning_option => settings_modal.applyNewChatReasoningOption(state, hit.index),
+            .settings_commit_option => settings_modal.applyCommitMenuOption(state, hit.index),
             .modal_dismiss => dismissTopModal(state),
             .modal_block => {
                 blurModalTextInput(state);
@@ -1701,6 +1918,11 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
                     state.settings_controller.title_menu_hover_index = null;
                     state.markDirty();
                 }
+                if (state.settings_controller.commit_menu != null) {
+                    state.settings_controller.commit_menu = null;
+                    state.settings_controller.commit_menu_hover_index = null;
+                    state.markDirty();
+                }
                 if (state.settings_controller.new_chat_provider_dropdown_open or state.settings_controller.new_chat_model_dropdown_open or state.settings_controller.new_chat_reasoning_dropdown_open) {
                     state.settings_controller.new_chat_provider_dropdown_open = false;
                     state.settings_controller.new_chat_model_dropdown_open = false;
@@ -1717,6 +1939,14 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             .project_rename_input => focusModalInput(state, .project_rename, hit.rect, x, clicks),
             .thread_import_input => focusModalInput(state, .thread_import, hit.rect, x, clicks),
             .cookie_import_search_input => focusModalInput(state, .cookie_import_search, hit.rect, x, clicks),
+            .commit_sheet_control => {
+                blurModalTextInput(state);
+                commit_sheet.applyControl(state, hit.index);
+            },
+            .commit_sheet_file_toggle => state.commitSheetToggleFile(hit.index),
+            .commit_sheet_file_expand => state.commitSheetToggleExpanded(hit.index),
+            .commit_sheet_hunk_toggle => commit_sheet.applyHunkToggle(state, hit.index),
+            .commit_sheet_message_input => commit_sheet.focusMessageAt(state, x, y, clicks),
             .project_import_name_input => focusModalInput(state, .project_import_name, hit.rect, x, clicks),
             .project_import_input => focusModalInput(state, .project_import, hit.rect, x, clicks),
             .command_palette_input => focusModalInput(state, .command_palette, hit.rect, x, clicks),
@@ -1762,7 +1992,9 @@ fn focusModalInput(state: *runtime.AppState, focus: runtime.PaletteModalTextFocu
 pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) bool {
     if (settings_modal.updateBrowserScrollSpeedDrag(state, x)) return true;
     if (state.updateImageModalPan(x, y)) return true;
-    if (state.modal_text_drag_active and state.palette_modal_text_focus != .none) {
+    if (state.modal_text_drag_active and state.palette_modal_text_focus == .commit_message) {
+        commit_sheet.dragMessageTo(state, x, y);
+    } else if (state.modal_text_drag_active and state.palette_modal_text_focus != .none) {
         const value = focusedValue(state);
         const rect = state.modal_text_input_rect;
         if (rect.w > 0.0) {
@@ -1790,7 +2022,8 @@ pub fn handlePaletteTextInput(state: *runtime.AppState, text: []const u8) bool {
         // input while open.
         return state.runtimeCredentialModalOpen() or
             state.runtimeTrustProposal() != null or
-            state.workspaceSettingsOpen();
+            state.workspaceSettingsOpen() or
+            state.commitSheetOpen();
     }
     if (state.palette_modal_text_focus == .runtime_credential) {
         return insertRuntimeCredentialText(state, text);
@@ -1800,6 +2033,7 @@ pub fn handlePaletteTextInput(state: *runtime.AppState, text: []const u8) bool {
         .project_rename => insertIntoZBuffer(state.renameBuffer(), &state.project_rename_cursor, text),
         .thread_import => insertIntoZBuffer(state.threadImportThreadIdBuffer(), &state.thread_import_cursor, text),
         .cookie_import_search => insertIntoZBuffer(state.cookie_import.searchBuffer(), &state.cookie_import.search_cursor, text),
+        .commit_message => if (state.commitSheet()) |sheet| (!sheet.locked() and insertIntoZBuffer(sheet.messageBuffer(), &sheet.message_cursor, text)) else false,
         .project_import_name => insertIntoZBuffer(state.importProjectNameBuffer(), &state.project_import_name_cursor, text),
         .project_import => insertIntoZBuffer(state.importPathBuffer(), &state.project_import_cursor, text),
         .runtime_credential => unreachable,
@@ -1866,6 +2100,7 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const sdl.Keyboard
         state.thread_import_provider != null or
         state.cookie_import.open or
         state.handoff_controller.sheet_open or
+        state.commitSheetOpen() or
         state.project_controller.show_creator or
         state.settings_controller.modal_visible or
         state.workspaceSettingsOpen() or
@@ -1903,6 +2138,7 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const sdl.Keyboard
     if (state.command_controller.open and command_palette.handleKeyDown(state, event)) return true;
     if (state.handoff_controller.sheet_open and handoff_sheet.handleKeyDown(state, event)) return true;
     if (state.settings_controller.modal_visible and settings_modal.handleKeyDown(state, event.key)) return true;
+    if (commitSheetOwnsKeys(state) and handleCommitSheetKeyDown(state, event)) return true;
     // Workspace Settings keyboard ownership: it has no editable field, so
     // with no higher-priority modal above it Escape closes through the shared
     // dismiss path and every other key is consumed — Enter, Backspace, and
@@ -2059,6 +2295,14 @@ fn dismissTopModal(state: *runtime.AppState) void {
         state.closeCommandPalette();
         return;
     }
+    if (state.commitSheetOpen() and !state.settings_controller.modal_visible) {
+        // A commit in flight keeps the sheet up so its result stays visible.
+        // (Without a sheet this dismisses the default-branch confirmation.)
+        if (state.commitSheet()) |sheet| if (sheet.busy != null) return;
+        state.closeCommitSheet();
+        blurModalTextInput(state);
+        return;
+    }
     if (state.settings_controller.provider_onboarding_visible) {
         state.dismissProviderOnboarding();
     } else if (state.settings_controller.mcp_onboarding_visible) {
@@ -2087,6 +2331,71 @@ fn dismissTopModal(state: *runtime.AppState) void {
         state.cancelSettingsModal();
     }
     blurModalTextInput(state);
+}
+
+/// The commit sheet takes keys only when no modal drawn above it is open.
+fn commitSheetOwnsKeys(state: *runtime.AppState) bool {
+    return state.commitSheetOpen() and
+        !state.command_controller.open and
+        !state.settings_controller.modal_visible and
+        !state.runtimeCredentialModalOpen() and
+        state.runtimeTrustProposal() == null and
+        !state.runtime_connections.wizard_open;
+}
+
+/// Commit-dialog keys: Ctrl+Enter runs the primary action, Enter adds a
+/// newline in the message, and Up/Down/Home/End follow wrapped lines.
+/// Everything else falls through to the shared modal text editing path. In
+/// the default-branch confirmation Enter creates a branch and continues.
+fn handleCommitSheetKeyDown(state: *runtime.AppState, event: *const sdl.KeyboardEvent) bool {
+    const sheet = state.commitSheet() orelse {
+        if (state.gitQuickConfirm() == null) return false;
+        switch (event.key) {
+            .@"return", .kp_enter => {
+                state.gitQuickContinue(true);
+                return true;
+            },
+            .escape => return false,
+            // The confirmation is modal: other keys go nowhere.
+            else => return true,
+        }
+    };
+    const primary = (keymodBits(event.mod) & (sdl.Keymod.ctrl | sdl.Keymod.gui)) != 0;
+    const shift = (keymodBits(event.mod) & sdl.Keymod.shift) != 0;
+    const editing = state.palette_modal_text_focus == .commit_message;
+    switch (event.key) {
+        .@"return", .kp_enter => {
+            if (primary) {
+                if (sheet.phase == .ready and !sheet.locked()) state.commitSheetCommit(false);
+                return true;
+            }
+            if (editing and !sheet.locked()) {
+                _ = deleteModalSelection(state);
+                _ = insertIntoZBuffer(sheet.messageBuffer(), &sheet.message_cursor, "\n");
+                state.markDirty();
+            }
+            return true;
+        },
+        .up, .down => {
+            if (!editing) return true;
+            return moveModalCursorWithShift(state, commit_sheet.verticalTarget(state, event.key == .down), shift);
+        },
+        .home, .end => {
+            if (!editing) return true;
+            if (primary) return moveModalCursorWithShift(state, if (event.key == .home) 0 else sheet.message().len, shift);
+            return moveModalCursorWithShift(state, commit_sheet.lineEdgeTarget(state, event.key == .home), shift);
+        },
+        else => return false,
+    }
+}
+
+pub fn updateCommitSheetHover(state: *runtime.AppState, x: f32, y: f32) void {
+    commit_sheet.updateHover(state, x, y);
+}
+
+pub fn handleCommitSheetWheel(state: *runtime.AppState, width: f32, height: f32, x: f32, y: f32, wheel_y: f32) bool {
+    if (!state.commitSheetOpen() or state.settings_controller.modal_visible or state.command_controller.open) return false;
+    return commit_sheet.handleWheel(state, width, height, x, y, wheel_y);
 }
 
 fn keymodBits(modifier_state: sdl.Keymod) u16 {
@@ -2152,6 +2461,7 @@ fn focusedCursor(state: *runtime.AppState) ?*usize {
         .project_rename => &state.project_rename_cursor,
         .thread_import => &state.thread_import_cursor,
         .cookie_import_search => &state.cookie_import.search_cursor,
+        .commit_message => if (state.commitSheet()) |sheet| &sheet.message_cursor else null,
         .project_import_name => &state.project_import_name_cursor,
         .project_import => &state.project_import_cursor,
         .runtime_credential => &state.runtime_credential_token_cursor,
@@ -2174,6 +2484,7 @@ fn focusedBuffer(state: *runtime.AppState) ?[:0]u8 {
         .project_rename => state.renameBuffer(),
         .thread_import => state.threadImportThreadIdBuffer(),
         .cookie_import_search => state.cookie_import.searchBuffer(),
+        .commit_message => if (state.commitSheet()) |sheet| sheet.messageBuffer() else null,
         .project_import_name => state.importProjectNameBuffer(),
         .project_import => state.importPathBuffer(),
         .runtime_credential => state.runtimeCredentialTokenBuffer(),
@@ -2196,6 +2507,7 @@ fn focusedTextLen(state: *runtime.AppState) usize {
         .project_rename => state.renameInput().len,
         .thread_import => state.threadImportThreadId().len,
         .cookie_import_search => state.cookie_import.searchQuery().len,
+        .commit_message => if (state.commitSheet()) |sheet| sheet.message().len else 0,
         .project_import_name => state.importProjectNameDraft().len,
         .project_import => state.importDirectoryDraft().len,
         .runtime_credential => state.runtimeCredentialToken().len,

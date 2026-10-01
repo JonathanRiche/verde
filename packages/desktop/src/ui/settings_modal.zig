@@ -56,6 +56,10 @@ pub const Control = enum(u8) {
     new_chat_provider_dropdown,
     new_chat_model_dropdown,
     new_chat_reasoning_dropdown,
+    commit_provider_dropdown,
+    commit_model_dropdown,
+    commit_action_commit,
+    commit_action_push,
     new_chat_new_pane,
     new_chat_replace_pane,
     workspace_split_default_chat,
@@ -243,6 +247,11 @@ const SettingsLayout = struct {
     new_chat_model_dropdown: palette.Rect,
     new_chat_reasoning_dropdown: palette.Rect,
     new_chat_defaults_hint_y: f32,
+    commit_card: palette.Rect,
+    commit_provider_dropdown: palette.Rect,
+    commit_model_dropdown: palette.Rect,
+    commit_action_commit: palette.Rect,
+    commit_action_push: palette.Rect,
     terminal_card: palette.Rect,
     terminal_font_dec: palette.Rect,
     terminal_font_inc: palette.Rect,
@@ -449,6 +458,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         (if (auto_titles) m.row_gap + labeled else 0.0) +
         m.row_gap + labeled +
         m.row_gap + m.row_h;
+    const commit_h = m.card_pad * 2.0 + m.title_h + m.row_gap + labeled + m.row_gap + labeled;
     const terminal_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.row_h;
     const browser_h = m.card_pad * 2.0 + m.title_h + m.row_gap +
         labeled * 4.0 + m.row_gap * 3.0;
@@ -501,7 +511,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const provider_rows_h = @as(f32, @floatFromInt(PROVIDER_ROW_COUNT)) * providerRowHeight();
     const providers_h = m.card_pad * 2.0 + m.title_h + m.row_gap + provider_rows_h + m.label_h * 2.0 + m.row_gap + m.row_h;
     const appearance_page_h = appearance_h;
-    const chat_page_h = transcript_h + m.card_gap + chat_h;
+    const chat_page_h = transcript_h + m.card_gap + chat_h + m.card_gap + commit_h;
     const workspace_page_h = workspace_h;
     const app_page_h = updates_h + m.card_gap + notifications_h;
     const body_h = switch (category) {
@@ -636,6 +646,24 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const file_links_y = new_chat_defaults_y + m.row_h + m.row_gap;
     const file_links_neovim_pane: palette.Rect = .{ .x = chat_card.x + m.card_pad, .y = file_links_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
     const file_links_hint_y = file_links_y + m.row_h;
+
+    // "Commit messages" card follows the Chat card (title generation lives there).
+    y = if (category == .chat) chat_card.y + chat_card.h + m.card_gap else offscreen_y;
+    const commit_card: palette.Rect = .{ .x = content_x, .y = y, .w = content_w, .h = commit_h };
+    const commit_inner_w = content_w - m.card_pad * 2.0;
+    const commit_generator_y = commit_card.y + m.card_pad + m.title_h + m.row_gap + m.label_h + m.inner_gap;
+    const commit_provider_w = (commit_inner_w - m.inner_gap) * 0.42;
+    const commit_provider_dropdown: palette.Rect = .{ .x = commit_card.x + m.card_pad, .y = commit_generator_y, .w = commit_provider_w, .h = m.row_h };
+    const commit_model_dropdown: palette.Rect = .{
+        .x = commit_provider_dropdown.x + commit_provider_w + m.inner_gap,
+        .y = commit_generator_y,
+        .w = commit_inner_w - commit_provider_w - m.inner_gap,
+        .h = m.row_h,
+    };
+    const commit_action_y = commit_generator_y + m.row_h + m.row_gap + m.label_h + m.inner_gap;
+    const commit_action_w = commit_inner_w * 0.5;
+    const commit_action_commit: palette.Rect = .{ .x = commit_card.x + m.card_pad, .y = commit_action_y, .w = commit_action_w, .h = m.row_h };
+    const commit_action_push: palette.Rect = .{ .x = commit_action_commit.x + commit_action_w, .y = commit_action_y, .w = commit_action_w, .h = m.row_h };
 
     y = if (category == .providers) page_y else offscreen_y;
 
@@ -865,6 +893,11 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .new_chat_model_dropdown = new_chat_model_dropdown,
         .new_chat_reasoning_dropdown = new_chat_reasoning_dropdown,
         .new_chat_defaults_hint_y = new_chat_defaults_hint_y,
+        .commit_card = commit_card,
+        .commit_provider_dropdown = commit_provider_dropdown,
+        .commit_model_dropdown = commit_model_dropdown,
+        .commit_action_commit = commit_action_commit,
+        .commit_action_push = commit_action_push,
         .terminal_card = terminal_card,
         .terminal_font_dec = terminal_stepper.dec,
         .terminal_font_inc = terminal_stepper.inc,
@@ -1161,6 +1194,178 @@ fn registerTitleOptionHits(
     }
 }
 
+// ------------------------------------------------------------------
+// Commit messages menus
+// ------------------------------------------------------------------
+
+fn commitMenuCount(state: *runtime.AppState, menu: settings_controller.CommitMenu) usize {
+    return switch (menu) {
+        .provider => settings_controller.settingsCommitProviderCount(),
+        .model => settings_controller.settingsCommitModelCount(state),
+    };
+}
+
+fn commitMenuVisibleCount(state: *runtime.AppState, menu: settings_controller.CommitMenu) usize {
+    return @min(commitMenuCount(state, menu), TITLE_MENU_MAX_ROWS);
+}
+
+fn commitMenuMaxScroll(state: *runtime.AppState, menu: settings_controller.CommitMenu) usize {
+    return commitMenuCount(state, menu) - commitMenuVisibleCount(state, menu);
+}
+
+fn commitMenuScroll(state: *runtime.AppState, menu: settings_controller.CommitMenu) usize {
+    return if (menu == .model) @min(state.settings_controller.commit_model_menu_scroll, commitMenuMaxScroll(state, .model)) else 0;
+}
+
+fn commitMenuRect(state: *runtime.AppState, layout: SettingsLayout, menu: settings_controller.CommitMenu) palette.Rect {
+    const dropdown = if (menu == .provider) layout.commit_provider_dropdown else layout.commit_model_dropdown;
+    return dropdownMenuRect(dropdown, commitMenuVisibleCount(state, menu));
+}
+
+fn commitMenuSelectedIndex(state: *runtime.AppState, menu: settings_controller.CommitMenu) ?usize {
+    return switch (menu) {
+        .provider => settings_controller.settingsCommitProviderSelectedIndex(state),
+        .model => settings_controller.settingsCommitModelSelectedIndex(state),
+    };
+}
+
+fn commitMenuLabel(state: *runtime.AppState, menu: settings_controller.CommitMenu, option_index: usize, buf: []u8) []const u8 {
+    return switch (menu) {
+        .provider => settings_controller.settingsCommitProviderLabel(option_index),
+        .model => settings_controller.settingsCommitModelLabel(state, option_index, buf),
+    };
+}
+
+fn registerCommitOptionHits(
+    state: *runtime.AppState,
+    layout: SettingsLayout,
+    queue_hit: *const fn (*runtime.AppState, palette.Rect, runtime.PaletteModalAction, usize) void,
+) void {
+    const menu = state.settings_controller.commit_menu orelse return;
+    const scroll = commitMenuScroll(state, menu);
+    state.settings_controller.commit_model_menu_scroll = if (menu == .model) scroll else state.settings_controller.commit_model_menu_scroll;
+    const rect = commitMenuRect(state, layout, menu);
+    for (0..commitMenuVisibleCount(state, menu)) |visible_index| {
+        const row = intersectRect(dropdownOptionRect(rect, visible_index), layout.body_clip) orelse continue;
+        queue_hit(state, row, .settings_commit_option, scroll + visible_index);
+    }
+}
+
+fn toggleCommitMenu(state: *runtime.AppState, menu: settings_controller.CommitMenu) void {
+    if (state.settings_controller.commit_menu == menu) {
+        state.settings_controller.commit_menu = null;
+        state.settings_controller.commit_menu_hover_index = null;
+        return;
+    }
+    state.settings_controller.commit_menu = menu;
+    const selected = commitMenuSelectedIndex(state, menu) orelse 0;
+    state.settings_controller.commit_menu_hover_index = selected;
+    if (menu == .model) ensureCommitModelChoiceVisible(state, selected);
+}
+
+fn ensureCommitModelChoiceVisible(state: *runtime.AppState, option_index: usize) void {
+    const visible_count = commitMenuVisibleCount(state, .model);
+    if (option_index < state.settings_controller.commit_model_menu_scroll) {
+        state.settings_controller.commit_model_menu_scroll = option_index;
+    } else if (option_index >= state.settings_controller.commit_model_menu_scroll + visible_count) {
+        state.settings_controller.commit_model_menu_scroll = option_index + 1 - visible_count;
+    }
+    state.settings_controller.commit_model_menu_scroll = @min(state.settings_controller.commit_model_menu_scroll, commitMenuMaxScroll(state, .model));
+}
+
+pub fn applyCommitMenuOption(state: *runtime.AppState, option_index: usize) void {
+    const menu = state.settings_controller.commit_menu orelse return;
+    switch (menu) {
+        .provider => settings_controller.selectSettingsCommitProvider(state, option_index),
+        .model => settings_controller.selectSettingsCommitModel(state, option_index),
+    }
+    state.markDirty();
+}
+
+fn handleCommitMenuKeyDown(state: *runtime.AppState, menu: settings_controller.CommitMenu, key: sdl.Keycode) bool {
+    const count = commitMenuCount(state, menu);
+    if (count == 0) return false;
+    const current = @min(state.settings_controller.commit_menu_hover_index orelse commitMenuSelectedIndex(state, menu) orelse 0, count - 1);
+    const next = switch (key) {
+        .up => current -| 1,
+        .down => @min(current + 1, count - 1),
+        .home => 0,
+        .end => count - 1,
+        .escape => {
+            state.settings_controller.commit_menu = null;
+            state.settings_controller.commit_menu_hover_index = null;
+            state.markDirty();
+            return true;
+        },
+        .@"return", .kp_enter => {
+            applyCommitMenuOption(state, current);
+            return true;
+        },
+        else => return false,
+    };
+    state.settings_controller.commit_menu_hover_index = next;
+    if (menu == .model) ensureCommitModelChoiceVisible(state, next);
+    state.markDirty();
+    return true;
+}
+
+fn drawCommitCard(state: *runtime.AppState, layout: SettingsLayout, m: Metrics) void {
+    drawCard(state, layout.commit_card, layout.body_clip);
+    drawCardTitle(state, layout.commit_card, "Commit messages", layout.body_clip);
+    const label_y = layout.commit_provider_dropdown.y - m.inner_gap - m.label_h;
+    queueText(state, .{ .x = layout.commit_provider_dropdown.x, .y = label_y, .w = layout.commit_provider_dropdown.w, .h = m.label_h }, "Provider", paletteColor(textLabel()), theme.scaledUi(12.5), layout.body_clip);
+    queueText(state, .{ .x = layout.commit_model_dropdown.x, .y = label_y, .w = layout.commit_model_dropdown.w, .h = m.label_h }, "Model", paletteColor(textLabel()), theme.scaledUi(12.5), layout.body_clip);
+    const open = state.settings_controller.commit_menu;
+    drawChatTitleDropdown(state, layout.commit_provider_dropdown, settings_controller.settingsCommitProviderLabel(settings_controller.settingsCommitProviderSelectedIndex(state)), .commit_provider_dropdown, open == .provider, layout.body_clip);
+    var model_buf: [128]u8 = undefined;
+    drawChatTitleDropdown(state, layout.commit_model_dropdown, settings_controller.settingsCommitModelSelectedLabel(state, &model_buf), .commit_model_dropdown, open == .model, layout.body_clip);
+    queueText(state, .{
+        .x = layout.commit_action_commit.x,
+        .y = layout.commit_action_commit.y - m.inner_gap - m.label_h,
+        .w = layout.commit_action_commit.w + layout.commit_action_push.w,
+        .h = m.label_h,
+    }, "Default action", paletteColor(textLabel()), theme.scaledUi(12.5), layout.body_clip);
+    drawSegmentedPair(state, layout.commit_action_commit, layout.commit_action_push, "Commit", "Commit & push", state.app_config.commit_default_action == .commit, isControlHovered(state, .commit_action_commit), isControlHovered(state, .commit_action_push), layout.body_clip);
+}
+
+fn drawCommitDropdownMenu(state: *runtime.AppState, layout: SettingsLayout) void {
+    const menu_kind = state.settings_controller.commit_menu orelse return;
+    const count = commitMenuCount(state, menu_kind);
+    const visible_count = commitMenuVisibleCount(state, menu_kind);
+    const scroll = commitMenuScroll(state, menu_kind);
+    const menu = commitMenuRect(state, layout, menu_kind);
+    queueRoundedRectClipped(state, menu, paletteColor(raisedSurface(0.14)), radiusSm(), layout.body_clip);
+    queueBorderClipped(state, menu, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 34)), radiusSm(), theme.scaledUi(1.0), layout.body_clip);
+    const selected_index = commitMenuSelectedIndex(state, menu_kind) orelse std.math.maxInt(usize);
+    for (0..visible_count) |visible_index| {
+        const option_index = scroll + visible_index;
+        const row = dropdownOptionRect(menu, visible_index);
+        const selected = option_index == selected_index;
+        const hovered = state.settings_controller.commit_menu_hover_index == option_index;
+        if (selected or hovered) {
+            const color = if (selected) theme.withAlpha(theme.accent(), 38) else controlHoverSurface();
+            queueRoundedRectClipped(state, row, paletteColor(color), theme.scaledUi(4.0), layout.body_clip);
+        }
+        const dot_size = theme.scaledUi(6.0);
+        const dot_color = if (selected) theme.accent() else theme.withAlpha(theme.COLOR_TEXT_MUTED, 110);
+        queueRoundedRectClipped(state, .{ .x = row.x + theme.scaledUi(10.0), .y = row.y + (row.h - dot_size) * 0.5, .w = dot_size, .h = dot_size }, paletteColor(dot_color), dot_size * 0.5, layout.body_clip);
+        var label_buf: [128]u8 = undefined;
+        queueText(state, .{
+            .x = row.x + theme.scaledUi(25.0),
+            .y = row.y + (row.h - theme.scaledUi(15.0)) * 0.5,
+            .w = row.w - theme.scaledUi(42.0),
+            .h = theme.scaledUi(15.0),
+        }, commitMenuLabel(state, menu_kind, option_index, &label_buf), paletteColor(if (selected or hovered) theme.COLOR_WHITE else textLabel()), theme.scaledUi(13.0), layout.body_clip);
+    }
+    if (count > visible_count) {
+        const track: palette.Rect = .{ .x = menu.x + menu.w - theme.scaledUi(5.0), .y = menu.y + theme.scaledUi(4.0), .w = theme.scaledUi(2.0), .h = menu.h - theme.scaledUi(8.0) };
+        const thumb_h = track.h * @as(f32, @floatFromInt(visible_count)) / @as(f32, @floatFromInt(count));
+        const progress = @as(f32, @floatFromInt(scroll)) / @as(f32, @floatFromInt(commitMenuMaxScroll(state, menu_kind)));
+        queueRoundedRectClipped(state, track, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 20)), theme.scaledUi(1.0), layout.body_clip);
+        queueRoundedRectClipped(state, .{ .x = track.x, .y = track.y + (track.h - thumb_h) * progress, .w = track.w, .h = thumb_h }, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 100)), theme.scaledUi(1.0), layout.body_clip);
+    }
+}
+
 const NewChatMenuKind = enum { provider, model, reasoning };
 
 fn newChatMenuCount(state: *const runtime.AppState, kind: NewChatMenuKind) usize {
@@ -1311,6 +1516,10 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
         queueControlHit(state, layout.new_chat_model_dropdown, layout.body_clip, .new_chat_model_dropdown, queue_hit);
         queueControlHit(state, layout.new_chat_reasoning_dropdown, layout.body_clip, .new_chat_reasoning_dropdown, queue_hit);
         queueControlHit(state, layout.file_links_neovim_pane, layout.body_clip, .file_links_neovim_pane, queue_hit);
+        queueControlHit(state, layout.commit_provider_dropdown, layout.body_clip, .commit_provider_dropdown, queue_hit);
+        queueControlHit(state, layout.commit_model_dropdown, layout.body_clip, .commit_model_dropdown, queue_hit);
+        queueControlHit(state, layout.commit_action_commit, layout.body_clip, .commit_action_commit, queue_hit);
+        queueControlHit(state, layout.commit_action_push, layout.body_clip, .commit_action_push, queue_hit);
     }
     if (category == .terminal) {
         queueControlHit(state, layout.terminal_font_dec, layout.body_clip, .terminal_font_dec, queue_hit);
@@ -1375,6 +1584,7 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
     registerCompanionCharacterOptionHits(state, layout, queue_hit);
     registerTitleOptionHits(state, layout, queue_hit);
     registerNewChatOptionHits(state, layout, queue_hit);
+    registerCommitOptionHits(state, layout, queue_hit);
     registerOpenActionOptionHits(state, layout, queue_hit);
 }
 
@@ -1549,6 +1759,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         drawChatTitleDropdown(state, layout.new_chat_model_dropdown, state.settingsNewChatModelSelectedLabel(), .new_chat_model_dropdown, state.settings_controller.new_chat_model_dropdown_open, layout.body_clip);
         drawChatTitleDropdown(state, layout.new_chat_reasoning_dropdown, state.settingsNewChatReasoningSelectedLabel(), .new_chat_reasoning_dropdown, state.settings_controller.new_chat_reasoning_dropdown_open, layout.body_clip);
         drawSwitchRow(state, layout.file_links_neovim_pane, "File links in Neovim", state.settings_controller.draft.file_links_in_neovim_pane, isControlHovered(state, .file_links_neovim_pane), layout.body_clip);
+        drawCommitCard(state, layout, m);
     } else if (category == .terminal) {
         drawCard(state, layout.terminal_card, layout.body_clip);
         drawCardTitle(state, layout.terminal_card, "Terminal", layout.body_clip);
@@ -1697,6 +1908,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     drawNewChatDropdownMenu(state, layout, .provider);
     drawNewChatDropdownMenu(state, layout, .model);
     drawNewChatDropdownMenu(state, layout, .reasoning);
+    drawCommitDropdownMenu(state, layout);
     drawOpenActionDropdownMenu(state, layout);
 }
 
@@ -1736,6 +1948,18 @@ pub fn handleWheel(state: *runtime.AppState, width: f32, height: f32, x: f32, y:
         if (next != state.settings_controller.title_model_menu_scroll) {
             state.settings_controller.title_model_menu_scroll = next;
             state.markDirty();
+        }
+        return true;
+    }
+    if (state.settings_controller.commit_menu != null and rectContains(commitMenuRect(state, layout, state.settings_controller.commit_menu.?), x, y)) {
+        if (state.settings_controller.commit_menu.? == .model) {
+            const max_scroll = commitMenuMaxScroll(state, .model);
+            const current = state.settings_controller.commit_model_menu_scroll;
+            const next = if (wheel_y < 0.0) @min(current + 1, max_scroll) else if (wheel_y > 0.0) current -| 1 else current;
+            if (next != current) {
+                state.settings_controller.commit_model_menu_scroll = next;
+                state.markDirty();
+            }
         }
         return true;
     }
@@ -1789,6 +2013,7 @@ pub fn updateHover(state: *runtime.AppState, x: f32, y: f32) void {
     var companion_hover: ?usize = null;
     var title_hover: ?usize = null;
     var new_chat_hover: ?usize = null;
+    var commit_hover: ?usize = null;
     var category_hover: ?u8 = null;
     var open_action_hover: ?usize = null;
     var close_hovered = false;
@@ -1824,6 +2049,10 @@ pub fn updateHover(state: *runtime.AppState, x: f32, y: f32) void {
             new_chat_hover = hit.index;
             break;
         }
+        if (hit.action == .settings_commit_option and rectContains(hit.rect, x, y)) {
+            commit_hover = hit.index;
+            break;
+        }
         if (hit.action == .settings_phone_action and rectContains(hit.rect, x, y)) {
             runtime_hover = hit.index | PHONE_HOVER_BIT;
             break;
@@ -1838,7 +2067,7 @@ pub fn updateHover(state: *runtime.AppState, x: f32, y: f32) void {
         break;
     }
 
-    if (state.settings_controller.hover_control == new_hover and state.settings_controller.hover_runtime_action == runtime_hover and state.settings_controller.close_hovered == close_hovered and state.settings_controller.hover_category == category_hover and state.settings_controller.open_action_hover_index == open_action_hover and state.settings_controller.theme_hover_index == theme_hover and state.settings_controller.companion_character_hover_index == companion_hover and state.settings_controller.title_menu_hover_index == title_hover and state.settings_controller.new_chat_menu_hover_index == new_chat_hover) return;
+    if (state.settings_controller.hover_control == new_hover and state.settings_controller.hover_runtime_action == runtime_hover and state.settings_controller.close_hovered == close_hovered and state.settings_controller.hover_category == category_hover and state.settings_controller.open_action_hover_index == open_action_hover and state.settings_controller.theme_hover_index == theme_hover and state.settings_controller.companion_character_hover_index == companion_hover and state.settings_controller.title_menu_hover_index == title_hover and state.settings_controller.new_chat_menu_hover_index == new_chat_hover and (state.settings_controller.commit_menu == null or state.settings_controller.commit_menu_hover_index == commit_hover)) return;
     state.settings_controller.hover_control = new_hover;
     state.settings_controller.hover_runtime_action = runtime_hover;
     state.settings_controller.close_hovered = close_hovered;
@@ -1848,6 +2077,7 @@ pub fn updateHover(state: *runtime.AppState, x: f32, y: f32) void {
     state.settings_controller.companion_character_hover_index = companion_hover;
     state.settings_controller.title_menu_hover_index = title_hover;
     state.settings_controller.new_chat_menu_hover_index = new_chat_hover;
+    if (state.settings_controller.commit_menu != null) state.settings_controller.commit_menu_hover_index = commit_hover;
     state.markDirty();
 }
 
@@ -1907,7 +2137,15 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
         state.settings_controller.open_action_dropdown_open = false;
         state.settings_controller.open_action_hover_index = null;
     }
+    if (control != .commit_provider_dropdown and control != .commit_model_dropdown) {
+        state.settings_controller.commit_menu = null;
+        state.settings_controller.commit_menu_hover_index = null;
+    }
     switch (control) {
+        .commit_provider_dropdown => toggleCommitMenu(state, .provider),
+        .commit_model_dropdown => toggleCommitMenu(state, .model),
+        .commit_action_commit => settings_controller.selectSettingsCommitAction(state, .commit),
+        .commit_action_push => settings_controller.selectSettingsCommitAction(state, .commit_and_push),
         .ui_font_dec => state.settings_controller.draft.font_size = theme.clampf(state.settings_controller.draft.font_size - 1.0, app_config.MIN_FONT_SIZE, app_config.MAX_FONT_SIZE),
         .ui_font_inc => state.settings_controller.draft.font_size = theme.clampf(state.settings_controller.draft.font_size + 1.0, app_config.MIN_FONT_SIZE, app_config.MAX_FONT_SIZE),
         .terminal_font_dec => state.settings_controller.draft.terminal_font_size = theme.clampf(state.settings_controller.draft.terminal_font_size - 1.0, app_config.MIN_TERMINAL_FONT_SIZE, app_config.MAX_TERMINAL_FONT_SIZE),
@@ -2208,6 +2446,7 @@ pub fn handleKeyDown(state: *runtime.AppState, key: sdl.Keycode) bool {
     if (state.settings_controller.new_chat_model_dropdown_open) return handleNewChatMenuKeyDown(state, key, .model);
     if (state.settings_controller.new_chat_reasoning_dropdown_open) return handleNewChatMenuKeyDown(state, key, .reasoning);
     if (state.settings_controller.open_action_dropdown_open) return handleOpenActionKeyDown(state, key);
+    if (state.settings_controller.commit_menu) |menu| return handleCommitMenuKeyDown(state, menu, key);
     return false;
 }
 
@@ -4378,26 +4617,66 @@ const PhoneLines = struct {
     width: f32,
     offset: usize = 0,
 
+    // Each measurement shapes the whole slice and this card is laid out several times per
+    // frame, so measure once per word and binary-search only inside an overlong word.
     fn next(self: *PhoneLines) ?[]const u8 {
-        while (self.offset < self.value.len and self.value[self.offset] == ' ') self.offset += 1;
-        if (self.offset == self.value.len) return null;
+        const value = self.value;
+        while (self.offset < value.len and value[self.offset] == ' ') self.offset += 1;
+        if (self.offset == value.len) return null;
         const start = self.offset;
         var end = start;
-        var space: ?usize = null;
-        while (end < self.value.len) {
-            const count = std.unicode.utf8ByteSequenceLength(self.value[end]) catch 1;
-            const next_end = @min(end + count, self.value.len);
-            if (end > start and text_measure.textWidth(.ui, theme.scaledUi(NOTES_FONT_SIZE), self.value[start..next_end]) > self.width) break;
-            if (self.value[end] == ' ') space = end;
-            end = next_end;
+        if (self.fits(start, value.len)) {
+            end = value.len;
+        } else while (end < value.len) {
+            var word_end = end;
+            while (word_end < value.len and value[word_end] == ' ') word_end += 1;
+            word_end = std.mem.indexOfScalarPos(u8, value, word_end, ' ') orelse value.len;
+            if (!self.fits(start, word_end)) break;
+            end = word_end;
         }
-        if (end < self.value.len) if (space) |boundary| {
-            if (boundary > start) end = boundary;
-        };
+        if (end == start) {
+            const word_end = std.mem.indexOfScalarPos(u8, value, start, ' ') orelse value.len;
+            var lo = @min(start + (std.unicode.utf8ByteSequenceLength(value[start]) catch 1), word_end);
+            var hi = word_end;
+            while (lo < hi) {
+                var mid = lo + (hi - lo + 1) / 2;
+                while (mid > lo and mid < value.len and value[mid] & 0xC0 == 0x80) mid -= 1;
+                if (mid == lo) break;
+                if (self.fits(start, mid)) lo = mid else hi = mid - 1;
+            }
+            end = lo;
+        }
         self.offset = end;
-        return self.value[start..end];
+        return value[start..end];
+    }
+
+    fn fits(self: *const PhoneLines, start: usize, end: usize) bool {
+        return text_measure.textWidth(.ui, theme.scaledUi(NOTES_FONT_SIZE), self.value[start..end]) <= self.width;
     }
 };
+
+test "phone card lines wrap at words and split only overlong words" {
+    const value = "Source: pair · Last seen: 12s ago https://verdeai.dev/pair?host=https%3A%2F%2Fhost.ts.net";
+    const width = text_measure.textWidth(.ui, theme.scaledUi(NOTES_FONT_SIZE), "Source: pair · Last");
+    var lines: PhoneLines = .{ .value = value, .width = width };
+    var rebuilt: std.ArrayList(u8) = .empty;
+    defer rebuilt.deinit(std.testing.allocator);
+    var count: usize = 0;
+    while (lines.next()) |line| : (count += 1) {
+        try std.testing.expect(line.len > 0 and line[0] != ' ' and line[line.len - 1] != ' ');
+        try std.testing.expect(text_measure.textWidth(.ui, theme.scaledUi(NOTES_FONT_SIZE), line) <= width);
+        if (count == 0) try std.testing.expectEqualStrings("Source: pair · Last", line);
+        try rebuilt.appendSlice(std.testing.allocator, line);
+    }
+    try std.testing.expect(count > 3);
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(std.testing.allocator);
+    for (value) |byte| if (byte != ' ') try expected.append(std.testing.allocator, byte);
+    var actual: std.ArrayList(u8) = .empty;
+    defer actual.deinit(std.testing.allocator);
+    for (rebuilt.items) |byte| if (byte != ' ') try actual.append(std.testing.allocator, byte);
+    try std.testing.expectEqualStrings(expected.items, actual.items);
+}
 
 // Phone pairing shares one measured layout for rendering, clipping and hit testing.
 const PhoneCard = struct {

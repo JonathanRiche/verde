@@ -25,6 +25,8 @@ pub const MIN_BROWSER_SCROLL_SPEED: f32 = 1.0;
 pub const MAX_BROWSER_SCROLL_SPEED: f32 = 5.0;
 pub const BROWSER_SCROLL_SPEED_STEP: f32 = 0.25;
 pub const DEFAULT_CHAT_TITLE_MODEL = "gpt-6-luna";
+/// Fast, cheap Claude model for background titles and commit messages.
+pub const DEFAULT_CLAUDE_FAST_MODEL = "sonnet";
 
 pub const ChatProvider = enum {
     codex,
@@ -97,6 +99,55 @@ pub const ChatTitleProvider = enum {
         if (std.mem.eql(u8, value, "claude")) return .claude;
         if (std.mem.eql(u8, value, "cursor")) return .cursor;
         if (std.mem.eql(u8, value, "opencode")) return .opencode;
+        return null;
+    }
+};
+
+/// Fast model a background provider uses when the user has not chosen one.
+pub fn defaultFastModel(provider: ChatTitleProvider) []const u8 {
+    return switch (provider) {
+        .codex => DEFAULT_CHAT_TITLE_MODEL,
+        .claude => DEFAULT_CLAUDE_FAST_MODEL,
+        .cursor => "composer-2",
+        .opencode => "opencode/gpt-5.4",
+    };
+}
+
+/// Provider that writes commit messages. `auto` picks the first installed
+/// provider in codex, claude, cursor, opencode order.
+pub const CommitMessageProvider = enum {
+    auto,
+    codex,
+    claude,
+    cursor,
+    opencode,
+
+    pub fn parse(value: []const u8) ?CommitMessageProvider {
+        inline for (std.meta.fields(CommitMessageProvider)) |field| {
+            if (std.mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
+        }
+        return null;
+    }
+
+    pub fn fixed(self: CommitMessageProvider) ?ChatTitleProvider {
+        return switch (self) {
+            .auto => null,
+            .codex => .codex,
+            .claude => .claude,
+            .cursor => .cursor,
+            .opencode => .opencode,
+        };
+    }
+};
+
+/// Primary button in the commit review sheet.
+pub const CommitDefaultAction = enum {
+    commit,
+    commit_and_push,
+
+    pub fn parse(value: []const u8) ?CommitDefaultAction {
+        if (std.mem.eql(u8, value, "commit")) return .commit;
+        if (std.mem.eql(u8, value, "commit_and_push")) return .commit_and_push;
         return null;
     }
 };
@@ -348,6 +399,10 @@ pub const AppConfig = struct {
     automatic_chat_titles_enabled: bool = true,
     chat_title_provider: ChatTitleProvider = .codex,
     chat_title_model: ?[]u8 = null,
+    commit_message_provider: CommitMessageProvider = .auto,
+    /// Only meaningful with a fixed provider; null uses `defaultFastModel`.
+    commit_message_model: ?[]u8 = null,
+    commit_default_action: CommitDefaultAction = .commit,
     new_chat_provider: ChatProvider = .codex,
     new_chat_model: ?[]u8 = null,
     new_chat_reasoning: ChatReasoning = .medium,
@@ -370,6 +425,7 @@ pub const AppConfig = struct {
     pub fn deinit(self: *AppConfig, allocator: std.mem.Allocator) void {
         if (self.active_theme) |name| allocator.free(name);
         if (self.chat_title_model) |model| allocator.free(model);
+        if (self.commit_message_model) |model| allocator.free(model);
         if (self.new_chat_model) |model| allocator.free(model);
         for (&self.remembered_models) |*entry| if (entry.*) |*value| value.deinit(allocator);
         for (self.favorite_models) |*favorite| favorite.deinit(allocator);
@@ -382,12 +438,22 @@ pub const AppConfig = struct {
     }
 
     pub fn chatTitleModel(self: AppConfig) []const u8 {
-        return self.chat_title_model orelse switch (self.chat_title_provider) {
-            .codex => DEFAULT_CHAT_TITLE_MODEL,
-            .claude => provider_models.DEFAULT_CLAUDE_MODEL,
-            .cursor => "composer-2",
-            .opencode => "opencode/gpt-5.4",
-        };
+        return self.chat_title_model orelse defaultFastModel(self.chat_title_provider);
+    }
+
+    /// Model for commit messages written by `provider`. A user-chosen model
+    /// applies only to the provider it was chosen for.
+    pub fn commitMessageModel(self: AppConfig, provider: ChatTitleProvider) []const u8 {
+        if (self.commit_message_provider.fixed()) |chosen| {
+            if (chosen == provider) if (self.commit_message_model) |model| return model;
+        }
+        return defaultFastModel(provider);
+    }
+
+    pub fn setCommitMessageModel(self: *AppConfig, allocator: std.mem.Allocator, model: ?[]const u8) !void {
+        const owned_model = if (model) |value| try allocator.dupe(u8, value) else null;
+        if (self.commit_message_model) |previous| allocator.free(previous);
+        self.commit_message_model = owned_model;
     }
 
     pub fn setChatTitleModel(self: *AppConfig, allocator: std.mem.Allocator, model: []const u8) !void {
@@ -812,6 +878,13 @@ fn writeChatSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, c
     try chat_object.put(allocator, "automatic_titles", .{ .bool = config.automatic_chat_titles_enabled });
     try chat_object.put(allocator, "title_provider", .{ .string = @tagName(config.chat_title_provider) });
     try chat_object.put(allocator, "title_model", .{ .string = config.chatTitleModel() });
+    try chat_object.put(allocator, "commit_message_provider", .{ .string = @tagName(config.commit_message_provider) });
+    if (config.commit_message_provider != .auto and config.commit_message_model != null) {
+        try chat_object.put(allocator, "commit_message_model", .{ .string = config.commit_message_model.? });
+    } else {
+        _ = chat_object.swapRemove("commit_message_model");
+    }
+    try chat_object.put(allocator, "commit_default_action", .{ .string = @tagName(config.commit_default_action) });
     try chat_object.put(allocator, "default_provider", .{ .string = @tagName(config.new_chat_provider) });
     if (config.new_chat_model) |model| {
         try chat_object.put(allocator, "default_model", .{ .string = model });
@@ -1062,6 +1135,29 @@ fn applyChatOverrides(allocator: std.mem.Allocator, config: *AppConfig, chat_val
             };
         } else {
             log.warn("chat.title_model must be a non-empty string when provided", .{});
+        }
+    }
+    if (chat_value.object.get("commit_message_provider")) |provider_value| {
+        if (provider_value == .string and CommitMessageProvider.parse(provider_value.string) != null) {
+            config.commit_message_provider = CommitMessageProvider.parse(provider_value.string).?;
+        } else {
+            log.warn("chat.commit_message_provider must be auto, codex, claude, cursor, or opencode", .{});
+        }
+    }
+    if (chat_value.object.get("commit_message_model")) |model_value| {
+        if (model_value == .string and model_value.string.len > 0) {
+            config.setCommitMessageModel(allocator, model_value.string) catch {
+                log.warn("could not allocate chat.commit_message_model", .{});
+            };
+        } else {
+            log.warn("chat.commit_message_model must be a non-empty string when provided", .{});
+        }
+    }
+    if (chat_value.object.get("commit_default_action")) |action_value| {
+        if (action_value == .string and CommitDefaultAction.parse(action_value.string) != null) {
+            config.commit_default_action = CommitDefaultAction.parse(action_value.string).?;
+        } else {
+            log.warn("chat.commit_default_action must be commit or commit_and_push", .{});
         }
     }
     if (chat_value.object.get("default_provider")) |provider_value| {
@@ -2311,6 +2407,24 @@ test "app config accepts chat title provider and model" {
 
     try std.testing.expectEqual(ChatTitleProvider.claude, config.chat_title_provider);
     try std.testing.expectEqualStrings("haiku", config.chatTitleModel());
+}
+
+test "app config commit message settings default to auto fast models" {
+    var config: AppConfig = .{};
+    defer config.deinit(std.testing.allocator);
+    try std.testing.expectEqual(CommitMessageProvider.auto, config.commit_message_provider);
+    try std.testing.expectEqualStrings("gpt-6-luna", config.commitMessageModel(.codex));
+    try std.testing.expectEqualStrings("sonnet", config.commitMessageModel(.claude));
+    try std.testing.expectEqual(CommitDefaultAction.commit, config.commit_default_action);
+
+    var root = try parseTestRoot("{\"chat\":{\"commit_message_provider\":\"claude\",\"commit_message_model\":\"haiku\",\"commit_default_action\":\"commit_and_push\"}}");
+    defer root.deinit();
+    applyAppOverrides(std.testing.allocator, &config, root.value);
+    try std.testing.expectEqual(CommitMessageProvider.claude, config.commit_message_provider);
+    try std.testing.expectEqualStrings("haiku", config.commitMessageModel(.claude));
+    // The chosen model belongs to the chosen provider only.
+    try std.testing.expectEqualStrings("gpt-6-luna", config.commitMessageModel(.codex));
+    try std.testing.expectEqual(CommitDefaultAction.commit_and_push, config.commit_default_action);
 }
 
 test "app config accepts new chat defaults and favorite models" {

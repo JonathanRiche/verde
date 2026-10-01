@@ -360,20 +360,20 @@ pub const Client = struct {
         active_process_state.mutex.lock();
         const bridge_index = activeBridgeIndexForThreadLocked(request.thread_id) orelse {
             active_process_state.mutex.unlock();
-            return error.ClaudeActiveTurnNotSteerable;
+            return error.SteerNotDelivered;
         };
         const bridge = &active_process_state.bridges.items[bridge_index];
         const child = bridge.child orelse {
             active_process_state.mutex.unlock();
-            return error.ClaudeActiveTurnNotSteerable;
+            return error.SteerNotDelivered;
         };
         if (bridge.pending_steer_request_id != null) {
             active_process_state.mutex.unlock();
-            return error.ClaudeSteerAlreadyPending;
+            return error.SteerNotDelivered;
         }
         const stdin = child.child.stdin orelse {
             active_process_state.mutex.unlock();
-            return error.ClaudeActiveTurnNotSteerable;
+            return error.SteerNotDelivered;
         };
         const request_id = active_process_state.next_steer_request_id;
         active_process_state.next_steer_request_id +%= 1;
@@ -405,7 +405,8 @@ pub const Client = struct {
                 current.pending_steer_request_id = null;
                 current.steer_response_request_id = null;
                 active_process_state.mutex.unlock();
-                if (!accepted) return error.ClaudeActiveTurnNotSteerable;
+                // An explicit bridge refusal is a definite non-delivery.
+                if (!accepted) return error.SteerNotDelivered;
                 return;
             }
             active_process_state.mutex.unlock();

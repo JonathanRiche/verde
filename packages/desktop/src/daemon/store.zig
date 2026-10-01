@@ -136,6 +136,7 @@ pub const Mutation = union(enum) {
     snapshot_replace: store_protocol.SnapshotReplaceRequest,
     app_state_set: store_protocol.AppStateSetRequest,
     workspace_upsert: store_protocol.WorkspaceUpsertRequest,
+    workspace_reorder: store_protocol.WorkspaceReorderRequest,
     workspace_repository_upsert: WorkspaceRepositoryUpsertRequest,
     workspace_repository_remove: WorkspaceRepositoryRemoveRequest,
     workspace_default_repository_set: WorkspaceDefaultRepositorySetRequest,
@@ -392,6 +393,7 @@ pub const ImportedLeasesAndOutcomes = struct {
 const SNAPSHOT_REPLACE_OPERATION = store_protocol.METHOD_STATE_SNAPSHOT_REPLACE;
 const APP_STATE_SET_OPERATION = store_protocol.METHOD_APP_STATE_SET;
 const WORKSPACE_UPSERT_OPERATION = store_protocol.METHOD_WORKSPACE_UPSERT;
+const WORKSPACE_REORDER_OPERATION = store_protocol.METHOD_WORKSPACE_REORDER;
 const WORKSPACE_REPOSITORY_UPSERT_OPERATION: []const u8 = "workspace.repository.upsert";
 const WORKSPACE_REPOSITORY_REMOVE_OPERATION: []const u8 = "workspace.repository.remove";
 const WORKSPACE_DEFAULT_REPOSITORY_SET_OPERATION: []const u8 = "workspace.repository.default.set";
@@ -763,6 +765,7 @@ pub const Store = struct {
                 self.applySnapshot(request.snapshot, next_revision_sql) catch |err| return mapStoreError(err),
             .app_state_set => |request| self.applyAppStateSet(request) catch |err| return mapStoreError(err),
             .workspace_upsert => |request| self.applyWorkspace(request.workspace) catch |err| return mapStoreError(err),
+            .workspace_reorder => |request| applied = self.applyWorkspaceReorder(request) catch |err| return mapStoreError(err),
             .workspace_repository_upsert => |request| self.applyWorkspaceRepositoryUpsert(request) catch |err| return mapStoreError(err),
             .workspace_repository_remove => |request| self.applyWorkspaceRepositoryRemove(request) catch |err| return mapStoreError(err),
             .workspace_default_repository_set => |request| self.applyWorkspaceDefaultRepositorySet(request) catch |err| return mapStoreError(err),
@@ -1079,6 +1082,10 @@ pub const Store = struct {
 
     pub fn closeThread(self: *Self, request: store_protocol.ThreadCloseRequest) StoreError!store_protocol.WriteResult {
         return self.applyMutation(.{ .thread_close = request });
+    }
+
+    pub fn reorderWorkspaces(self: *Self, request: store_protocol.WorkspaceReorderRequest) StoreError!store_protocol.WriteResult {
+        return self.applyMutation(.{ .workspace_reorder = request });
     }
 
     pub fn moveThread(self: *Self, request: store_protocol.ThreadMoveRequest) StoreError!store_protocol.WriteResult {
@@ -1804,6 +1811,7 @@ pub const Store = struct {
                 .sidebar_collapsed = request.sidebar_collapsed,
             }),
             .workspace_upsert => |request| self.fingerprintValue(request.workspace),
+            .workspace_reorder => |request| self.fingerprintValue(.{ .workspace_ids = request.workspace_ids }),
             .workspace_repository_upsert => |request| self.fingerprintValue(.{
                 .workspace_id = request.workspace_id,
                 .repository = request.repository,
@@ -2928,6 +2936,74 @@ pub const Store = struct {
         try self.reconcileWorkspaceRepositories(workspace_row_id, workspace);
     }
 
+    /// Listed workspaces take the leading slots in request order; every other
+    /// row keeps its relative order after them. The selected index addresses
+    /// open workspaces, so it follows the selected workspace to its new slot.
+    /// Returns false when the order is already current.
+    fn applyWorkspaceReorder(self: *Self, request: store_protocol.WorkspaceReorderRequest) !bool {
+        const Row = struct { id: i64, workspace_id: []u8, archived: bool };
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        var current: std.ArrayList(Row) = .empty;
+        {
+            var rows = try self.conn.rows("select id, workspace_id, archived from workspaces order by sort_index", .{});
+            defer rows.deinit();
+            while (rows.next()) |row| {
+                try current.append(arena, .{ .id = row.int(0), .workspace_id = try arena.dupe(u8, row.text(1)), .archived = row.int(2) != 0 });
+            }
+            if (rows.err) |err| return err;
+        }
+
+        var next: std.ArrayList(Row) = try .initCapacity(arena, current.items.len);
+        for (request.workspace_ids) |workspace_id| {
+            const found = for (current.items) |row| {
+                if (std.mem.eql(u8, row.workspace_id, workspace_id)) break row;
+            } else return error.ResourceNotFound;
+            next.appendAssumeCapacity(found);
+        }
+        for (current.items) |row| {
+            const listed = for (request.workspace_ids) |workspace_id| {
+                if (std.mem.eql(u8, row.workspace_id, workspace_id)) break true;
+            } else false;
+            if (!listed) next.appendAssumeCapacity(row);
+        }
+
+        const unchanged = for (current.items, next.items) |before, after| {
+            if (before.id != after.id) break false;
+        } else true;
+        if (unchanged) return false;
+
+        const selected_index: ?i64 = blk: {
+            const row = (try self.conn.row("select selected_workspace_index from app_state where id = 1", .{})) orelse break :blk null;
+            defer row.deinit();
+            break :blk row.int(0);
+        };
+        const selected_id: ?i64 = if (selected_index) |wanted| blk: {
+            var open_index: i64 = 0;
+            for (current.items) |row| {
+                if (row.archived) continue;
+                if (open_index == wanted) break :blk row.id;
+                open_index += 1;
+            }
+            break :blk null;
+        } else null;
+
+        // sort_index is unique: park every row in a disjoint negative range first.
+        try self.conn.execNoArgs("update workspaces set sort_index = -id");
+        var open_index: i64 = 0;
+        for (next.items, 0..) |row, index| {
+            try self.conn.exec("update workspaces set sort_index = ?1 where id = ?2", .{ @as(i64, @intCast(index)), row.id });
+            if (row.archived) continue;
+            if (selected_id != null and selected_id.? == row.id and open_index != selected_index.?) {
+                try self.conn.exec("update app_state set selected_workspace_index = ?1 where id = 1", .{open_index});
+            }
+            open_index += 1;
+        }
+        return true;
+    }
+
     fn applyAppStateSet(self: *Self, request: store_protocol.AppStateSetRequest) !void {
         const selected_index = std.math.cast(i64, request.selected_workspace_index) orelse
             return error.InvalidParams;
@@ -3791,6 +3867,80 @@ pub const Store = struct {
         return next_revision;
     }
 
+    /// Rewrites the body of one daemon-authored system transcript row in
+    /// place (same `message_id` and position) and advances store_revision.
+    /// The row's idempotency key fingerprint is refreshed to match. Returns
+    /// the new revision, or null when the row is missing or unchanged.
+    pub fn updateSystemMessageBody(
+        self: *Self,
+        workspace_id: []const u8,
+        local_thread_id: []const u8,
+        message_id: []const u8,
+        body: []const u8,
+        updated_at_ms: i64,
+    ) StoreError!?u64 {
+        self.conn.execNoArgs("begin immediate") catch |err| return mapStoreError(err);
+        var transaction_open = true;
+        defer if (transaction_open) self.conn.rollback();
+
+        const system_code = roleCode("system") catch return error.InvalidParams;
+        const current = (self.conn.row(
+            "select m.thread_id, m.body, m.author, m.created_at_ms from messages m join threads t on t.id = m.thread_id " ++
+                "join workspaces w on w.id = t.workspace_id where w.workspace_id = ?1 and t.local_thread_id = ?2 and m.message_id = ?3 and m.role = ?4",
+            .{ workspace_id, local_thread_id, message_id, system_code },
+        ) catch |err| return mapStoreError(err)) orelse return null;
+        defer current.deinit();
+        if (std.mem.eql(u8, current.text(1), body)) return null;
+        const thread_row_id = current.int(0);
+        self.conn.exec(
+            "update messages set body = ?1, updated_at_ms = ?2 where thread_id = ?3 and message_id = ?4",
+            .{ body, updated_at_ms, thread_row_id, message_id },
+        ) catch |err| return mapStoreError(err);
+        const fingerprint = self.fingerprintValue(store_protocol.Message{
+            .message_id = message_id,
+            .role = "system",
+            .author = current.text(2),
+            .body = body,
+            .created_at_ms = current.int(3),
+            .updated_at_ms = updated_at_ms,
+        }) catch |err| return mapStoreError(err);
+        defer self.allocator.free(fingerprint);
+        self.conn.exec(
+            "update client_message_keys set message_fingerprint = ?1, updated_at_ms = ?2 where thread_id = ?3 and message_id = ?4",
+            .{ fingerprint, updated_at_ms, thread_row_id, message_id },
+        ) catch |err| return mapStoreError(err);
+        const revision = self.readStoreRevision() catch |err| return mapStoreError(err);
+        const next_revision = std.math.add(u64, revision, 1) catch return error.StoreUnavailable;
+        const next_revision_sql: i64 = std.math.cast(i64, next_revision) orelse return error.StoreUnavailable;
+        self.conn.exec(
+            "update store_state set store_revision = ?1 where id = 1",
+            .{next_revision_sql},
+        ) catch |err| return mapStoreError(err);
+        self.conn.commit() catch |err| return mapStoreError(err);
+        transaction_open = false;
+        return next_revision;
+    }
+
+    /// Record the model-generated search description for one durable
+    /// thread. Descriptions are search metadata, not projection state, so
+    /// the write does not advance store_revision; readers pick it up on their
+    /// next thread-list query. Unknown threads are ignored.
+    pub fn setThreadDescription(
+        self: *Self,
+        workspace_id: []const u8,
+        local_thread_id: []const u8,
+        description: []const u8,
+        updated_at_ms: i64,
+    ) StoreError!void {
+        self.conn.exec(
+            "insert into thread_descriptions (workspace_id, local_thread_id, description, updated_at_ms) " ++
+                "select ?1, ?2, ?3, ?4 where exists (select 1 from threads t join workspaces w on w.id = t.workspace_id " ++
+                "where w.workspace_id = ?1 and t.local_thread_id = ?2) " ++
+                "on conflict(workspace_id, local_thread_id) do update set description = excluded.description, updated_at_ms = excluded.updated_at_ms",
+            .{ workspace_id, local_thread_id, description, updated_at_ms },
+        ) catch |err| return mapStoreError(err);
+    }
+
     /// True only for the opening user prompt while the durable title still
     /// matches the fallback the worker intends to replace.
     pub fn canGenerateAutomaticTitle(
@@ -4454,6 +4604,7 @@ fn mutationHeader(mutation: Mutation) store_protocol.MutationHeader {
         .snapshot_replace => |request| request.mutation,
         .app_state_set => |request| request.mutation,
         .workspace_upsert => |request| request.mutation,
+        .workspace_reorder => |request| request.mutation,
         .workspace_repository_upsert => |request| request.mutation,
         .workspace_repository_remove => |request| request.mutation,
         .workspace_default_repository_set => |request| request.mutation,
@@ -4477,6 +4628,7 @@ fn mutationOperation(mutation: Mutation) []const u8 {
         .snapshot_replace => SNAPSHOT_REPLACE_OPERATION,
         .app_state_set => APP_STATE_SET_OPERATION,
         .workspace_upsert => WORKSPACE_UPSERT_OPERATION,
+        .workspace_reorder => WORKSPACE_REORDER_OPERATION,
         .workspace_repository_upsert => WORKSPACE_REPOSITORY_UPSERT_OPERATION,
         .workspace_repository_remove => WORKSPACE_REPOSITORY_REMOVE_OPERATION,
         .workspace_default_repository_set => WORKSPACE_DEFAULT_REPOSITORY_SET_OPERATION,
@@ -4519,6 +4671,15 @@ fn validateMutation(mutation: Mutation) StoreError!void {
             if (request.workspace.workspace_id.len == 0 or request.workspace.label.len == 0 or request.workspace.path.len == 0) return error.InvalidParams;
             if (request.workspace.threads.len != 0 or request.workspace.messages.len != 0) return error.InvalidParams;
             try validateWorkspaceRepositoryManifest(request.workspace);
+        },
+        .workspace_reorder => |request| {
+            if (request.workspace_ids.len == 0) return error.InvalidParams;
+            for (request.workspace_ids, 0..) |workspace_id, index| {
+                if (!validWorkspaceId(workspace_id)) return error.InvalidParams;
+                for (request.workspace_ids[0..index]) |earlier| {
+                    if (std.mem.eql(u8, earlier, workspace_id)) return error.InvalidParams;
+                }
+            }
         },
         .workspace_repository_upsert => |request| {
             if (!validWorkspaceId(request.workspace_id) or !repositoryDefinitionValid(request.repository)) {
@@ -7609,6 +7770,45 @@ test "turn acceptance provider switch clears stale identity without touching GUI
     try std.testing.expectEqualStrings("failed", failed.text(2));
 }
 
+test "thread descriptions upsert for known threads and ignore unknown ones" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+
+    const workspace = testWorkspace("workspace-description", "Description workspace");
+    _ = try store.upsertWorkspace(.{
+        .mutation = testHeader("description-workspace", null),
+        .workspace = workspace,
+    });
+    _ = try store.acceptTurn(.{
+        .mutation = testHeader("turn:description:accept", null),
+        .turn_id = "turn-description",
+        .workspace = workspace,
+        .thread = .{ .local_thread_id = "thread-description", .title = "Palette search", .provider = "codex" },
+        .started_at_ms = 10,
+        .provider = "codex",
+        .harness = "local_cli",
+        .user_message = .{ .message_id = "description-user", .role = "user", .author = "You", .body = "Improve palette search" },
+    });
+
+    const before = try store.storeRevision();
+    try store.setThreadDescription(workspace.workspace_id, "thread-description", "First draft", 1);
+    try store.setThreadDescription(workspace.workspace_id, "thread-description", "Typo-tolerant palette matching", 2);
+    try store.setThreadDescription(workspace.workspace_id, "missing-thread", "Ignored", 3);
+    try std.testing.expectEqual(before, try store.storeRevision());
+
+    const row = (try store.conn.row(
+        "select description, (select count(*) from thread_descriptions) from thread_descriptions where local_thread_id = 'thread-description'",
+        .{},
+    )) orelse return error.TestExpectedEqual;
+    defer row.deinit();
+    try std.testing.expectEqualStrings("Typo-tolerant palette matching", row.text(0));
+    try std.testing.expectEqual(@as(i64, 1), row.int(1));
+}
+
 test "in-flight automatic titles apply mid-turn and yield to refinement or manual renames" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -9196,6 +9396,57 @@ test "app state mutation does not reconcile workspace or thread rows" {
     try std.testing.expectEqual(@as(i64, 1), row.int(1));
     try std.testing.expectEqual(@as(i64, 1), row.int(2));
     try std.testing.expectEqual(@as(i64, 0), row.int(3));
+}
+
+test "workspace reorder leads with listed ids and keeps the selected workspace" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+    var revision: u64 = 0;
+    for ([_][]const u8{ "ws-a", "ws-b", "ws-c", "ws-d" }) |workspace_id| {
+        var workspace = testWorkspace(workspace_id, workspace_id);
+        workspace.archived = std.mem.eql(u8, workspace_id, "ws-c");
+        const result = try store.upsertWorkspace(.{
+            .mutation = testHeader(workspace_id, if (revision == 0) null else revision),
+            .workspace = workspace,
+        });
+        revision = result.store_revision;
+    }
+    // Open order is a, b, d; index 1 selects ws-b.
+    revision = (try store.applyMutation(.{ .app_state_set = .{
+        .mutation = testHeader("select-b", revision),
+        .selected_workspace_index = 1,
+        .sidebar_collapsed = false,
+    } })).store_revision;
+
+    const ids = [_][]const u8{ "ws-d", "ws-a", "ws-b" };
+    const reordered = try store.reorderWorkspaces(.{ .mutation = testHeader("reorder", revision), .workspace_ids = &ids });
+    try std.testing.expect(reordered.applied);
+    {
+        var rows = try store.conn.rows("select workspace_id from workspaces order by sort_index", .{});
+        defer rows.deinit();
+        for ([_][]const u8{ "ws-d", "ws-a", "ws-b", "ws-c" }) |expected| {
+            const row = rows.next().?;
+            try std.testing.expectEqualStrings(expected, row.text(0));
+        }
+        try std.testing.expect(rows.next() == null);
+    }
+    {
+        var row = (try store.conn.row("select selected_workspace_index from app_state where id = 1", .{})).?;
+        defer row.deinit();
+        try std.testing.expectEqual(@as(i64, 2), row.int(0));
+    }
+
+    const unchanged = try store.reorderWorkspaces(.{ .mutation = testHeader("reorder-again", reordered.store_revision), .workspace_ids = &ids });
+    try std.testing.expect(!unchanged.applied);
+    const missing = [_][]const u8{"ws-missing"};
+    try std.testing.expectError(error.ResourceNotFound, store.reorderWorkspaces(.{ .mutation = testHeader("reorder-missing", null), .workspace_ids = &missing }));
+    const duplicate = [_][]const u8{ "ws-a", "ws-a" };
+    try std.testing.expectError(error.InvalidParams, store.reorderWorkspaces(.{ .mutation = testHeader("reorder-duplicate", null), .workspace_ids = &duplicate }));
 }
 
 test "external chat draft mutation is atomic and rejects a stale GUI snapshot" {

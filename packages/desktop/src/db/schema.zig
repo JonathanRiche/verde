@@ -6,7 +6,7 @@ const zqlite = @import("zqlite");
 /// Latest schema version understood by this build.
 pub const CURRENT_VERSION: i64 = 1;
 /// Maximum schema version understood by read-only clients and the daemon store.
-pub const MAX_SUPPORTED_VERSION: i64 = 15;
+pub const MAX_SUPPORTED_VERSION: i64 = 16;
 /// SQLite busy timeout shared by writer and read-only connections.
 pub const BUSY_TIMEOUT_MS = 5000;
 
@@ -319,6 +319,12 @@ fn migrateToVersionInternal(
                 if (failure_point == .before_version_bump) return error.TestMigrationFailure;
                 try conn.execNoArgs("pragma user_version = 15");
                 version = 15;
+            },
+            15 => {
+                try migrateV15ToV16(conn);
+                if (failure_point == .before_version_bump) return error.TestMigrationFailure;
+                try conn.execNoArgs("pragma user_version = 16");
+                version = 16;
             },
             else => return error.DatabaseSchemaInvalid,
         }
@@ -933,6 +939,24 @@ pub const BROWSER_HISTORY_SCHEMA_SQL =
 
 fn migrateV14ToV15(conn: zqlite.Conn) !void {
     try conn.execNoArgs(BROWSER_HISTORY_SCHEMA_SQL);
+}
+
+/// v16: model-generated one-line thread descriptions for palette search.
+/// A side ledger keyed by durable identity (like `chat_completions`) rather
+/// than a `threads` column, so GUI snapshot applies that rebuild thread rows
+/// never erase it. The daemon owns every write.
+pub const THREAD_DESCRIPTIONS_SCHEMA_SQL =
+    \\create table if not exists thread_descriptions (
+    \\    workspace_id text not null,
+    \\    local_thread_id text not null,
+    \\    description text not null,
+    \\    updated_at_ms integer not null default 0,
+    \\    primary key (workspace_id, local_thread_id)
+    \\);
+;
+
+fn migrateV15ToV16(conn: zqlite.Conn) !void {
+    try conn.execNoArgs(THREAD_DESCRIPTIONS_SCHEMA_SQL);
 }
 
 const OpenThreadPolicy = struct {

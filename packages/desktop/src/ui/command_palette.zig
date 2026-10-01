@@ -12,6 +12,7 @@ const std = @import("std");
 const palette = @import("palette");
 const sdl = @import("zsdl3");
 const theme = @import("theme.zig");
+const fuzzy_match = @import("fuzzy_match.zig");
 const runtime = @import("runtime.zig");
 const sidebar = @import("sidebar.zig");
 const workspace_panes = @import("workspace_panes.zig");
@@ -93,6 +94,9 @@ const STATIC_COMMANDS = [_]Command{
     .{ .id = "thread.rename_current", .title = "Rename Current Chat", .keywords = "thread title label", .section = .threads, .run = runRenameCurrentChat, .enabled = currentThreadCommitted },
     .{ .id = "thread.regenerate_title", .title = "Regenerate Chat Title", .keywords = "thread rename luna automatic", .section = .threads, .run = runRegenerateChatTitle, .enabled = canRegenerateChatTitle },
     .{ .id = "thread.sync_current", .title = "Sync Current Thread", .keywords = "refresh provider", .section = .threads, .run = runSyncCurrentThread, .enabled = canSyncCurrentThread },
+    .{ .id = "thread.review_changes", .title = "Review & commit changes", .keywords = "git commit push diff changes stage", .section = .threads, .run = runReviewChanges, .enabled = hasFocusedCommittedGuiChat },
+    .{ .id = "thread.commit_and_push", .title = "Commit & push", .keywords = "git commit push changes quick", .section = .threads, .run = runCommitAndPush, .enabled = hasFocusedCommittedGuiChat },
+    .{ .id = "thread.push", .title = "Push", .keywords = "git push branch upstream publish", .section = .threads, .run = runPush, .enabled = hasFocusedCommittedGuiChat },
     .{ .id = "thread.handoff_current", .title = "Handoff Current Chat or TUI", .keywords = "transfer provider model agent continue context", .section = .threads, .run = runHandoffCurrent, .enabled = canHandoffFocusedPane },
     .{ .id = "thread.open_current_codex_tui", .title = "Open Codex TUI for Current Thread", .keywords = "open codex tui current thread terminal resume active focused", .section = .threads, .run = runOpenCurrentThreadInTui, .enabled = canOpenFocusedCodexThreadInTui },
     .{ .id = "thread.open_current_tui", .title = "Open Current Thread in TUI", .keywords = "open agent tui current thread opencode claude cursor terminal resume active focused", .section = .threads, .run = runOpenCurrentThreadInTui, .enabled = canOpenFocusedNonCodexThreadInTui },
@@ -684,7 +688,7 @@ fn buildScopedHistory(state: *runtime.AppState, project_index: usize, query: []c
     for (sorted) |ti| {
         if (ti >= project.threads.items.len or entry_count >= entries.len) continue;
         const thread = &project.threads.items[ti];
-        if (query.len > 0 and matchThread(thread, query) == null) continue;
+        if (query.len > 0 and matchThread(thread, state.paletteThreadDescription(thread.local_thread_id), query) == null) continue;
         entries[entry_count] = .{
             .ref = .{ .thread = .{ .project = project_index, .thread = ti } },
             .at = thread.last_activity_at,
@@ -694,7 +698,7 @@ fn buildScopedHistory(state: *runtime.AppState, project_index: usize, query: []c
     for (state.paletteHistoryItems(), 0..) |item, hi| {
         if (entry_count >= entries.len) break;
         if (!std.mem.eql(u8, item.workspace_id, project.id)) continue;
-        if (query.len > 0 and fuzzyScore(item.title, query) == null) continue;
+        if (query.len > 0 and matchHistoryItem(item, query) == null) continue;
         entries[entry_count] = .{
             .ref = .{ .history = hi },
             .at = item.last_activity_at orelse 0,
@@ -734,10 +738,11 @@ fn buildRanked(state: *runtime.AppState, query: []const u8) void {
 
     for (STATIC_COMMANDS, 0..) |command, ci| {
         if (!command.enabled(state)) continue;
-        const title_score = fuzzyScore(command.title, query);
-        const keyword_score = fuzzyScore(command.keywords, query);
-        const best = maxOptional(title_score, if (keyword_score) |s| s - 100 else null);
-        if (best) |score| {
+        const fields = [_]fuzzy_match.Field{
+            .{ .text = command.title },
+            .{ .text = command.keywords, .penalty = 100 },
+        };
+        if (fuzzy_match.score(&fields, query)) |score| {
             appendCandidate(&candidates, &candidate_count, .{ .ref = .{ .command = ci }, .score = score + 50 });
         }
     }
@@ -751,7 +756,7 @@ fn buildRanked(state: *runtime.AppState, query: []const u8) void {
         }
         for (project.threads.items, 0..) |*thread, ti| {
             if (!thread.committed or thread.archived) continue;
-            if (matchThread(thread, query)) |score| {
+            if (matchThread(thread, state.paletteThreadDescription(thread.local_thread_id), query)) |score| {
                 // Mild recency boost keeps fresh threads above stale equal
                 // matches without letting recency beat match quality.
                 const age_days: i32 = @intCast(@min(@divTrunc(@max(now - thread.last_activity_at, 0), 60 * 60 * 24), 30));
@@ -774,7 +779,7 @@ fn buildRanked(state: *runtime.AppState, query: []const u8) void {
         }
     }
     for (state.paletteHistoryItems(), 0..) |item, hi| {
-        const score = fuzzyScore(item.title, query) orelse continue;
+        const score = matchHistoryItem(item, query) orelse continue;
         const age_days: i32 = @intCast(@min(@divTrunc(@max(now - (item.last_activity_at orelse 0), 0), 60 * 60 * 24), 30));
         // Cold threads rank just under an equally matching open thread.
         appendCandidate(&candidates, &candidate_count, .{ .ref = .{ .history = hi }, .score = score + (30 - age_days) - 5 });
@@ -817,21 +822,47 @@ fn appendResult(ref: ResultRef) void {
     result_count += 1;
 }
 
-/// Scores a thread against the query: title fuzzy match first, then message
-/// bodies (substring only, query >= 3 chars, capped scan) as a weaker hit.
-fn matchThread(thread: anytype, query: []const u8) ?i32 {
-    if (fuzzyScore(thread.title, query)) |score| return score;
-    if (query.len < 3) return null;
+/// Title/description penalty: a description hit ranks below an equal title
+/// hit but above message-body matches.
+const DESCRIPTION_PENALTY: i32 = 150;
+const BODY_MATCH_SCORE: i32 = 200;
+
+/// Scores a thread against the query: title and generated description
+/// (typo-tolerant, any word order) first, then message bodies as a weaker
+/// hit (every query word as a substring somewhere, words >= 3 bytes, capped
+/// scan).
+fn matchThread(thread: anytype, description: []const u8, query: []const u8) ?i32 {
+    if (scoreTitleAndDescription(thread.title, description, query)) |score| return score;
+    var token_buf: [fuzzy_match.MAX_TOKENS][]const u8 = undefined;
+    const tokens = fuzzy_match.tokenize(query, &token_buf);
+    if (tokens.len == 0) return null;
+    for (tokens) |token| if (token.len < 3) return null;
     // Body scan budget: enough to cover long threads without making each
     // keystroke scan megabytes across every workspace.
     var budget: usize = 64 * 1024;
+    var found = std.StaticBitSet(fuzzy_match.MAX_TOKENS).initEmpty();
     for (thread.messages.items) |*message| {
         const body = message.body[0..@min(message.body.len, budget)];
-        if (asciiIndexOfIgnoreCase(body, query) != null) return 200;
+        for (tokens, 0..) |token, index| {
+            if (!found.isSet(index) and fuzzy_match.indexOfIgnoreCase(body, token) != null) found.set(index);
+        }
+        if (found.count() == tokens.len) return BODY_MATCH_SCORE;
         if (budget <= body.len) break;
         budget -= body.len;
     }
     return null;
+}
+
+fn matchHistoryItem(item: anytype, query: []const u8) ?i32 {
+    return scoreTitleAndDescription(item.title, item.description, query);
+}
+
+fn scoreTitleAndDescription(title: []const u8, description: []const u8, query: []const u8) ?i32 {
+    const fields = [_]fuzzy_match.Field{
+        .{ .text = title },
+        .{ .text = description, .penalty = DESCRIPTION_PENALTY, .subsequence = false },
+    };
+    return fuzzy_match.score(&fields, query);
 }
 
 fn matchAgentTui(state: *runtime.AppState, project_index: usize, dock_id: u32, provider: AgentTuiHistoryProvider, query: []const u8) bool {
@@ -855,45 +886,9 @@ fn agentTuiSearchLabel(provider: AgentTuiHistoryProvider) []const u8 {
     };
 }
 
-/// Case-insensitive scoring: exact substring ranks far above subsequence
-/// matches; both prefer earlier/tighter hits. Returns null on no match.
+/// Single-field palette score; see `fuzzy_match` for the ranking tiers.
 fn fuzzyScore(haystack: []const u8, needle: []const u8) ?i32 {
-    if (needle.len == 0 or haystack.len == 0) return null;
-    if (asciiIndexOfIgnoreCase(haystack, needle)) |pos| {
-        return 1000 - @as(i32, @intCast(@min(pos, 400)));
-    }
-    // Subsequence walk: every needle byte must appear in order; gaps cost.
-    var hi: usize = 0;
-    var gaps: i32 = 0;
-    var last_hit: usize = 0;
-    for (needle) |nb| {
-        const nl = std.ascii.toLower(nb);
-        var found = false;
-        while (hi < haystack.len) : (hi += 1) {
-            if (std.ascii.toLower(haystack[hi]) == nl) {
-                if (last_hit != 0) gaps += @intCast(@min(hi - last_hit, 20));
-                last_hit = hi + 1;
-                hi += 1;
-                found = true;
-                break;
-            }
-        }
-        if (!found) return null;
-    }
-    return 500 - gaps;
-}
-
-fn asciiIndexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
-    if (needle.len == 0 or haystack.len < needle.len) return null;
-    var i: usize = 0;
-    const end = haystack.len - needle.len;
-    outer: while (i <= end) : (i += 1) {
-        for (needle, 0..) |nb, j| {
-            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(nb)) continue :outer;
-        }
-        return i;
-    }
-    return null;
+    return fuzzy_match.scoreText(haystack, needle);
 }
 
 /// Wall-clock seconds; `std.time.timestamp` was removed in the Zig 0.16 std
@@ -1160,6 +1155,25 @@ fn hasQuickPane(state: *runtime.AppState) bool {
 
 fn hasFocusedGuiChat(state: *runtime.AppState) bool {
     return focusedGuiThreadIndex(state) != null;
+}
+
+fn hasFocusedCommittedGuiChat(state: *runtime.AppState) bool {
+    if (state.project_controller.selected_index >= state.project_controller.projects.items.len) return false;
+    const index = focusedGuiThreadIndex(state) orelse return false;
+    const project = &state.project_controller.projects.items[state.project_controller.selected_index];
+    return index < project.threads.items.len and project.threads.items[index].committed;
+}
+
+fn runReviewChanges(state: *runtime.AppState) void {
+    if (!state.openCommitSheetForFocusedChat()) state.setSidebarNotice("Focus a chat to review its changes.");
+}
+
+fn runCommitAndPush(state: *runtime.AppState) void {
+    if (!state.startCommitAndPushForFocusedChat()) state.setSidebarNotice("Focus a chat to commit its changes.");
+}
+
+fn runPush(state: *runtime.AppState) void {
+    if (!state.startPushForFocusedChat()) state.setSidebarNotice("Focus a chat to push its branch.");
 }
 
 fn workspaceNotBusy(state: *runtime.AppState) bool {
@@ -2162,6 +2176,9 @@ test "workspace open settings command routes to the palette target workspace" {
     state.command_controller = .{};
     state.command_controller.open = true;
     state.command_controller.scope_project = 1;
+    state.palette_history = null;
+    state.palette_open_threads = null;
+    state.palette_open_descriptions_index = .{};
     state.composer_controller.composer = @TypeOf(state.composer_controller.composer).init();
     state.composer_controller.focused = false;
     state.project_controller.projects = .empty;
@@ -2216,10 +2233,29 @@ test "fuzzyScore ranks substring above subsequence and rejects non-matches" {
     try std.testing.expect(early > late);
 }
 
-test "asciiIndexOfIgnoreCase finds case-insensitive needles" {
-    try std.testing.expectEqual(@as(?usize, 6), asciiIndexOfIgnoreCase("Split CHAT Right", "chat"));
-    try std.testing.expectEqual(@as(?usize, null), asciiIndexOfIgnoreCase("Split", "chat"));
-    try std.testing.expectEqual(@as(?usize, 0), asciiIndexOfIgnoreCase("chat", "chat"));
+test "indexOfIgnoreCase finds case-insensitive needles" {
+    try std.testing.expectEqual(@as(?usize, 6), fuzzy_match.indexOfIgnoreCase("Split CHAT Right", "chat"));
+    try std.testing.expectEqual(@as(?usize, null), fuzzy_match.indexOfIgnoreCase("Split", "chat"));
+    try std.testing.expectEqual(@as(?usize, 0), fuzzy_match.indexOfIgnoreCase("chat", "chat"));
+}
+
+test "thread matching searches descriptions and multi-word bodies" {
+    const Message = struct { body: []const u8 };
+    const Thread = struct {
+        title: []const u8,
+        messages: struct { items: []const Message },
+    };
+    const thread: Thread = .{
+        .title = "Palette tweaks",
+        .messages = .{ .items = &.{ .{ .body = "we should add typo tolerance" }, .{ .body = "and rank the history rows" } } },
+    };
+    // Description hit ranks below the title but above bodies.
+    const description_score = matchThread(&thread, "Typo-tolerant fuzzy matching for history search", "fuzzy history").?;
+    try std.testing.expect(description_score > BODY_MATCH_SCORE);
+    try std.testing.expect(matchThread(&thread, "", "palette").? > description_score);
+    // Body words may be spread across messages, in any order.
+    try std.testing.expectEqual(BODY_MATCH_SCORE, matchThread(&thread, "", "history typo").?);
+    try std.testing.expect(matchThread(&thread, "", "history browser") == null);
 }
 
 test "formatKeybind renders modifiers and uppercases single letters" {
