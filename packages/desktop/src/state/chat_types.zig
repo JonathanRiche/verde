@@ -361,6 +361,15 @@ pub const ChatThread = struct {
     completed_at_ms: i64 = 0,
     /// Durable sort-index boundary before materialized messages.
     persisted_message_offset: usize = 0,
+    /// Durable transcript end a projection refresh reported past the live
+    /// rows. The refresh kept the hydrated rows instead of dropping them;
+    /// the render path fetches the missing suffix up to this end. Zero when
+    /// no gap is pending.
+    transcript_suffix_gap_end: usize = 0,
+    /// Last gap end whose suffix fetch found nothing new (sort-index gaps
+    /// make the live row count trail the durable extent permanently), so
+    /// repeated refreshes do not refetch the same empty suffix.
+    transcript_suffix_checked_end: usize = 0,
     messages: std.ArrayList(ChatMessage),
     background_tasks: std.ArrayList(BackgroundTask),
     send_state: *SendState,
@@ -1047,6 +1056,9 @@ pub const TitleGenerationRequest = struct {
     assistant_text: []u8,
     provider: provider_types.Provider,
     model_ref: []u8,
+    /// Durable identity so the daemon can store the generated description.
+    workspace_id: []u8,
+    local_thread_id: []u8,
 };
 pub const PendingApproval = struct {
     call_id: []u8,

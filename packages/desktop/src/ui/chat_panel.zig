@@ -14,6 +14,7 @@ const browser_panel = @import("browser.zig");
 const bang_commands = @import("../workspace/bang_commands.zig");
 const chat_types = @import("../state/chat_types.zig");
 const linked_chats = @import("../state/linked_chats_controller.zig");
+const git_changes = @import("../state/git_changes_controller.zig");
 const chat_markdown = @import("chat_markdown.zig");
 const colors = @import("colors.zig");
 const composer_pickers = @import("composer_pickers.zig");
@@ -150,6 +151,8 @@ const PinnedBackgroundCommand = struct {
 
 const UsageActionHit = struct {
     rect: palette.Rect = .{},
+    /// Set when the button signs in to this provider instead of showing usage.
+    sign_in_provider: ?app_state.Provider = null,
 };
 
 const MAX_USAGE_ACTION_HITS = 16;
@@ -189,6 +192,31 @@ const MAX_BANG_RETRY_HITS = 64;
 const BangRetryHit = struct { rect: palette.Rect = .{}, command: []const u8 = "" };
 var bang_retry_hit_count: usize = 0;
 var bang_retry_hits: [MAX_BANG_RETRY_HITS]BangRetryHit = [_]BangRetryHit{.{}} ** MAX_BANG_RETRY_HITS;
+const MAX_GIT_COMMIT_HITS = 32;
+/// Commit card controls. The payload (URL or thread id) is copied: the row
+/// body it came from can be swapped when a push marks the row pushed.
+const GitCommitHit = struct {
+    rect: palette.Rect = .{},
+    kind: enum { link, push } = .link,
+    buf: [512]u8 = undefined,
+    len: usize = 0,
+
+    fn payload(self: *const GitCommitHit) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+var git_commit_hit_count: usize = 0;
+var git_commit_hits: [MAX_GIT_COMMIT_HITS]GitCommitHit = [_]GitCommitHit{.{}} ** MAX_GIT_COMMIT_HITS;
+
+fn appendGitCommitHit(rect: palette.Rect, kind: @FieldType(GitCommitHit, "kind"), value: []const u8) void {
+    if (git_commit_hit_count >= git_commit_hits.len or value.len > git_commit_hits[0].buf.len) return;
+    const hit = &git_commit_hits[git_commit_hit_count];
+    hit.rect = rect;
+    hit.kind = kind;
+    @memcpy(hit.buf[0..value.len], value);
+    hit.len = value.len;
+    git_commit_hit_count += 1;
+}
 const MAX_TRANSCRIPT_IMAGE_HITS = 64;
 const TranscriptImageHit = struct {
     rect: palette.Rect = .{},
@@ -412,12 +440,55 @@ const WorkspaceHeaderHitCache = struct {
     open_main_rect: palette.Rect = .{},
     chevron_rect: palette.Rect = .{},
     browser_rect: palette.Rect = .{},
+    /// Git split button for `git_thread_buf`: the main part runs the
+    /// labelled action, the chevron opens the git menu.
+    git_main_rect: palette.Rect = .{},
+    git_chevron_rect: palette.Rect = .{},
+    git_thread_buf: [128]u8 = undefined,
+    git_thread_len: usize = 0,
+    git_menu_panel_rect: palette.Rect = .{},
+    git_menu_row_count: usize = 0,
+    git_menu_row_rects: [4]palette.Rect = [_]palette.Rect{.{ .x = 0, .y = 0, .w = 0, .h = 0 }} ** 4,
+    git_menu_row_kind: [4]GitMenuRow = [_]GitMenuRow{.commit} ** 4,
+    git_menu_row_enabled: [4]bool = [_]bool{false} ** 4,
     menu_panel_rect: palette.Rect = .{},
     menu_row_count: usize = 0,
     menu_row_rects: [5]palette.Rect = [_]palette.Rect{.{ .x = 0, .y = 0, .w = 0, .h = 0 }} ** 5,
     menu_row_kind: [5]WorkspaceHeaderOpenMenuRow = [_]WorkspaceHeaderOpenMenuRow{.folder} ** 5,
     menu_row_enabled: [5]bool = [_]bool{false} ** 5,
 };
+
+const GitMenuRow = enum { commit, commit_and_push, push, pull_push };
+
+/// The chat header's git menu (split-button chevron); one open at a time.
+var git_menu_open: bool = false;
+var git_menu_pane_id: ?app_state.WorkspacePaneId = null;
+
+fn closeGitMenu() void {
+    git_menu_open = false;
+    git_menu_pane_id = null;
+}
+
+fn gitMenuHit() ?*WorkspaceHeaderHitCache {
+    if (!git_menu_open) return null;
+    var i = workspace_header_hit_count;
+    while (i > 0) {
+        i -= 1;
+        const hit = &workspace_header_hits[i];
+        if (!hit.used or hit.git_menu_row_count == 0) continue;
+        if (paneIdEqual(hit.pane_id, git_menu_pane_id)) return hit;
+    }
+    return null;
+}
+
+fn runGitMenuRow(state: *app_state.AppState, kind: GitMenuRow, thread_id: []const u8) void {
+    switch (kind) {
+        .commit => state.openCommitSheetForThreadIdMode(thread_id, .commit),
+        .commit_and_push => state.startCommitAndPush(thread_id),
+        .push => state.startPush(thread_id),
+        .pull_push => state.startPullPush(thread_id),
+    }
+}
 
 const MAX_WORKSPACE_HEADER_HITS = 8;
 var workspace_header_hit_count: usize = 0;
@@ -439,6 +510,7 @@ pub fn resetTranscriptHitCache() void {
     diff_layout_hit_count = 0;
     bang_retry_hit_count = 0;
     transcript_image_hit_count = 0;
+    git_commit_hit_count = 0;
 }
 
 /// Keeps scrolling-strip input geometry inside the same viewport as rendering.
@@ -1451,6 +1523,31 @@ pub fn handleWorkspaceHeaderPaletteMouseButton(state: *app_state.AppState, x: f3
     if (!down) return false;
     if (state.project_controller.projects.items.len == 0) return false;
 
+    if (gitMenuHit()) |menu_hit| {
+        if (rectContains(menu_hit.git_menu_panel_rect, x, y)) {
+            closeGitMenu();
+            state.blurPaletteComposer();
+            var i: usize = 0;
+            while (i < menu_hit.git_menu_row_count) : (i += 1) {
+                if (!rectContains(menu_hit.git_menu_row_rects[i], x, y)) continue;
+                if (!menu_hit.git_menu_row_enabled[i] or menu_hit.git_thread_len == 0) break;
+                runGitMenuRow(state, menu_hit.git_menu_row_kind[i], menu_hit.git_thread_buf[0..menu_hit.git_thread_len]);
+                state.noteInteraction();
+                break;
+            }
+            state.markDirty();
+            return true;
+        }
+        // Any click outside the menu closes it; the chevron itself toggles
+        // below, so leave it to that branch.
+        if (!rectContains(menu_hit.git_chevron_rect, x, y)) {
+            closeGitMenu();
+            state.markDirty();
+        }
+    } else if (git_menu_open) {
+        closeGitMenu();
+    }
+
     if (workspaceHeaderMenuHit(state)) |menu_hit| {
         if (rectContains(menu_hit.menu_panel_rect, x, y)) {
             var i: usize = 0;
@@ -1500,6 +1597,26 @@ pub fn handleWorkspaceHeaderPaletteMouseButton(state: *app_state.AppState, x: f3
 
     if (control_hit.pane_id) |pane_id| _ = state.focusCurrentProjectWorkspacePane(pane_id);
 
+    if (rectContains(control_hit.git_main_rect, x, y) and control_hit.git_thread_len > 0) {
+        state.workspace_header_open_menu_open = false;
+        state.workspace_header_open_menu_pane_id = null;
+        closeGitMenu();
+        state.blurPaletteComposer();
+        state.gitHeaderPrimary(control_hit.git_thread_buf[0..control_hit.git_thread_len]);
+        state.noteInteraction();
+        return true;
+    }
+    if (rectContains(control_hit.git_chevron_rect, x, y) and control_hit.git_thread_len > 0) {
+        const was_open_here = git_menu_open and paneIdEqual(git_menu_pane_id, control_hit.pane_id);
+        state.workspace_header_open_menu_open = false;
+        state.workspace_header_open_menu_pane_id = null;
+        git_menu_open = !was_open_here;
+        git_menu_pane_id = if (git_menu_open) control_hit.pane_id else null;
+        state.blurPaletteComposer();
+        state.noteInteraction();
+        state.markDirty();
+        return true;
+    }
     if (rectContains(control_hit.open_main_rect, x, y)) {
         state.workspace_header_open_menu_open = false;
         state.workspace_header_open_menu_pane_id = null;
@@ -1518,6 +1635,7 @@ pub fn handleWorkspaceHeaderPaletteMouseButton(state: *app_state.AppState, x: f3
         return true;
     }
     if (rectContains(control_hit.chevron_rect, x, y)) {
+        closeGitMenu();
         const was_open_here = state.workspace_header_open_menu_open and paneIdEqual(state.workspace_header_open_menu_pane_id, control_hit.pane_id);
         state.workspace_header_open_menu_open = !was_open_here;
         state.workspace_header_open_menu_pane_id = if (state.workspace_header_open_menu_open) control_hit.pane_id else null;
@@ -1546,6 +1664,13 @@ pub fn handleWorkspaceHeaderPaletteMouseButton(state: *app_state.AppState, x: f3
 /// `handleWorkspaceHeaderPaletteMouseButton`.
 pub fn workspaceHeaderWantsPointerAt(state: *const app_state.AppState, x: f32, y: f32) bool {
     if (state.project_controller.projects.items.len == 0) return false;
+    if (gitMenuHit()) |menu_hit| {
+        var i: usize = 0;
+        while (i < menu_hit.git_menu_row_count) : (i += 1) {
+            if (menu_hit.git_menu_row_enabled[i] and rectContains(menu_hit.git_menu_row_rects[i], x, y)) return true;
+        }
+        if (rectContains(menu_hit.git_menu_panel_rect, x, y)) return false;
+    }
     if (workspaceHeaderMenuHit(state)) |menu_hit| {
         var i: usize = 0;
         while (i < menu_hit.menu_row_count) : (i += 1) {
@@ -1619,17 +1744,22 @@ pub fn transcriptActionWantsPointerAt(x: f32, y: f32) bool {
 
 const TranscriptAction = union(enum) {
     usage,
+    sign_in: app_state.Provider,
     diff_file_open: []const u8,
     diff_file_comment: DiffFileCommentHit,
     diff_layout: bool,
     retry_command: []const u8,
     image_open: [:0]const u8,
+    git_commit_link: []const u8,
+    git_commit_push: []const u8,
 };
 
 fn transcriptActionAt(x: f32, y: f32) ?TranscriptAction {
     var index: usize = 0;
     while (index < usage_action_hit_count) : (index += 1) {
-        if (rectContains(usage_action_hits[index].rect, x, y)) return .usage;
+        const hit = usage_action_hits[index];
+        if (!rectContains(hit.rect, x, y)) continue;
+        return if (hit.sign_in_provider) |provider| .{ .sign_in = provider } else .usage;
     }
     index = 0;
     while (index < diff_file_open_hit_count) : (index += 1) {
@@ -1655,6 +1785,15 @@ fn transcriptActionAt(x: f32, y: f32) ?TranscriptAction {
     while (index < transcript_image_hit_count) : (index += 1) {
         const hit = transcript_image_hits[index];
         if (rectContains(hit.rect, x, y)) return .{ .image_open = hit.path };
+    }
+    index = 0;
+    while (index < git_commit_hit_count) : (index += 1) {
+        const hit = &git_commit_hits[index];
+        if (!rectContains(hit.rect, x, y)) continue;
+        return switch (hit.kind) {
+            .link => .{ .git_commit_link = hit.payload() },
+            .push => .{ .git_commit_push = hit.payload() },
+        };
     }
     return null;
 }
@@ -1691,11 +1830,20 @@ pub fn backgroundTaskPinWantsPointerAt(x: f32, y: f32) bool {
 pub fn handleBackgroundTaskPinMouseButton(state: *app_state.AppState, x: f32, y: f32, down: bool, clicks: u8) bool {
     const hit = backgroundTaskPinHitAt(x, y) orelse return false;
     if (!down) return true;
+    runtime_log.diagnostic("bg-stop pin click x={d:.1} y={d:.1} clicks={d} pane={?d} action_hits={d}", .{ x, y, clicks, hit.pane_id, state.background_task_action_hits.items.len });
+    for (state.background_task_action_hits.items) |action_hit| {
+        runtime_log.diagnostic("bg-stop   hit action={s} rect=({d:.1},{d:.1},{d:.1},{d:.1}) project={d} thread={d} message={d} task={?d}", .{ @tagName(action_hit.action), action_hit.rect.x, action_hit.rect.y, action_hit.rect.w, action_hit.rect.h, action_hit.project_index, action_hit.thread_index, action_hit.message_index, action_hit.task_index });
+    }
     if (hit.pane_id) |pane_id| _ = state.focusCurrentProjectWorkspacePane(pane_id);
     if (clicks <= 1) {
-        if (state.consumeCodeCopyButtonClick(x, y)) return true;
+        if (state.consumeCodeCopyButtonClick(x, y)) {
+            runtime_log.diagnostic("bg-stop pin click consumed by code copy", .{});
+            return true;
+        }
         if (state.consumeBackgroundTaskActionClick(x, y)) return true;
-        if (state.consumeCardToggleClick(x, y)) return true;
+        const toggled = state.consumeCardToggleClick(x, y);
+        runtime_log.diagnostic("bg-stop pin click missed action hits; card_toggle={}", .{toggled});
+        if (toggled) return true;
     }
     return true;
 }
@@ -1746,6 +1894,13 @@ test "transcript action hit testing resolves every transcript action kind" {
     const usage = transcriptActionAt(20.0, 30.0) orelse return error.TestExpectedEqual;
     switch (usage) {
         .usage => {},
+        else => return error.TestExpectedEqual,
+    }
+    usage_action_hits[1] = .{ .rect = .{ .x = 10.0, .y = 70.0, .w = 30.0, .h = 20.0 }, .sign_in_provider = .claude };
+    usage_action_hit_count = 2;
+    const sign_in = transcriptActionAt(20.0, 80.0) orelse return error.TestExpectedEqual;
+    switch (sign_in) {
+        .sign_in => |provider| try std.testing.expectEqual(app_state.Provider.claude, provider),
         else => return error.TestExpectedEqual,
     }
 
@@ -1910,6 +2065,7 @@ fn transcriptSelectableBodyKind(
             isDiffSummaryMessage(author, body) or
             isUsageSummaryMessage(author, body) or
             isTodoListMessage(author, body) or
+            isGitCommitMessage(author, body) or
             utils.providerFailureActionProvider(body) != null)
         {
             return null;
@@ -1946,6 +2102,7 @@ fn transcriptSelectableBodyRect(
         isDiffSummaryMessage(author, body) or
         isUsageSummaryMessage(author, body) or
         isTodoListMessage(author, body) or
+        isGitCommitMessage(author, body) or
         utils.providerFailureActionProvider(body) != null))
     {
         return null;
@@ -2341,11 +2498,17 @@ pub fn handleTranscriptPaletteMouseButton(state: *app_state.AppState, x: f32, y:
         if (transcriptActionAt(x, y)) |action| {
             switch (action) {
                 .usage => _ = state.showCurrentProviderUsage(),
+                .sign_in => |provider| state.loginChatProvider(provider),
                 .diff_file_open => |path| state.openTranscriptFileReference(path),
                 .diff_file_comment => |comment| state.beginDiffCommentDraft(comment.path, comment.additions, comment.deletions, comment.patch),
                 .diff_layout => |split| state.setDiffLayoutPreference(if (split) .split else .stacked),
                 .retry_command => |command| state.retryBangCommand(command),
                 .image_open => |path| state.openImageModal(path),
+                .git_commit_link => |url| {
+                    state.blurPaletteComposer();
+                    state.openConfiguredChatWebLink(url);
+                },
+                .git_commit_push => |thread_id| state.startPush(thread_id),
             }
             return true;
         }
@@ -2727,7 +2890,9 @@ fn workspaceHeaderControlHit(x: f32, y: f32) ?*WorkspaceHeaderHitCache {
         if (!hit.used) continue;
         if (rectContains(hit.open_main_rect, x, y) or
             rectContains(hit.chevron_rect, x, y) or
-            rectContains(hit.browser_rect, x, y))
+            rectContains(hit.browser_rect, x, y) or
+            rectContains(hit.git_main_rect, x, y) or
+            rectContains(hit.git_chevron_rect, x, y))
         {
             return hit;
         }
@@ -2784,7 +2949,68 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
     const badge_w: f32 = if (subagent) chromeLabelWidth(badge_font, "Subagent") + badge_pad_x * 2.0 else 0.0;
     const badge_gap: f32 = if (subagent) theme.scaledUi(12.0) else 0.0;
     const title_x = rect.x + padding_x + badge_w + badge_gap;
-    const title_max_w = @max(actions_x - title_x - title_gap, theme.scaledUi(96.0));
+
+    // Git split button (`[↑ Commit & push (4) | ▾]`, `[↑ 2 Push | ▾]`) left
+    // of the actions, following the chat's changes and branch status; hidden
+    // when there is nothing to commit or push. The badge turns amber when a
+    // file needs a decision (shared or unclear ownership).
+    const project = state.currentProject();
+    state.ensureGitChangesSummary(project.id);
+    var git_view: git_changes.HeaderView = .{};
+    if (thread.committed and !subagent) {
+        state.ensureGitChangesStatus(thread.local_thread_id);
+        git_view = state.gitChangesHeader(thread.local_thread_id);
+    }
+    const git_font = theme.scaledUi(12.5);
+    const git_h = theme.scaledUi(28.0);
+    const git_icon_size = theme.scaledUi(14.0);
+    const git_pad_x = theme.scaledUi(10.0);
+    const git_inner_gap = theme.scaledUi(6.0);
+    const git_chevron_w = theme.scaledUi(24.0);
+    const git_badge_font = theme.scaledUi(11.0);
+    const git_badge_h = theme.scaledUi(18.0);
+    var git_label: []const u8 = "";
+    var git_icon: []const u8 = NF_COD_GIT_COMMIT;
+    var git_badge_buf: [16]u8 = undefined;
+    var git_badge: []const u8 = "";
+    var git_badge_w: f32 = 0.0;
+    var git_attention = false;
+    if (git_view.busy_label) |label| {
+        git_label = label;
+        git_icon = NF_COD_SYNC;
+    } else if (git_view.button) |*button| {
+        git_label = button.label();
+        git_icon = switch (button.kind) {
+            .commit => NF_COD_GIT_COMMIT,
+            .commit_and_push, .push => NF_COD_ARROW_UP,
+        };
+        git_attention = button.attention;
+        if (button.kind != .push and button.files > 0) {
+            git_badge = std.fmt.bufPrint(&git_badge_buf, "{d}", .{button.files}) catch "";
+            git_badge_w = @max(chromeLabelWidth(git_badge_font, git_badge) + theme.scaledUi(10.0), git_badge_h);
+        }
+    }
+    var git_main_rect: palette.Rect = .{};
+    var git_chevron_rect: palette.Rect = .{};
+    var title_limit_x = actions_x;
+    if (git_label.len > 0) {
+        const main_w = git_pad_x + git_icon_size + git_inner_gap + chromeLabelWidth(git_font, git_label) +
+            (if (git_badge.len > 0) git_inner_gap + git_badge_w else 0.0) + git_pad_x;
+        const git_x = actions_x - button_gap - main_w - git_chevron_w;
+        // Keep a minimum title width; drop the button on very narrow panes.
+        if (git_x - title_x - title_gap >= theme.scaledUi(96.0)) {
+            const git_y = rect.y + @max((rect.h - git_h) * 0.5, theme.scaledUi(4.0));
+            git_main_rect = snapRect(.{ .x = git_x, .y = git_y, .w = main_w, .h = git_h });
+            git_chevron_rect = snapRect(.{ .x = git_x + main_w, .y = git_y, .w = git_chevron_w, .h = git_h });
+            title_limit_x = git_x;
+            const id_len = @min(thread.local_thread_id.len, header_hit.git_thread_buf.len);
+            @memcpy(header_hit.git_thread_buf[0..id_len], thread.local_thread_id[0..id_len]);
+            header_hit.git_thread_len = if (id_len == thread.local_thread_id.len) id_len else 0;
+            header_hit.git_main_rect = git_main_rect;
+            header_hit.git_chevron_rect = git_chevron_rect;
+        }
+    }
+    const title_max_w = @max(title_limit_x - title_x - title_gap, theme.scaledUi(96.0));
 
     var title_buf: [256]u8 = undefined;
     const title_display = truncateWorkspaceTitle(&title_buf, title_src, title_max_w, title_font);
@@ -2819,6 +3045,48 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
     header_hit.open_main_rect = open_main_rect;
     header_hit.chevron_rect = chevron_rect;
     header_hit.browser_rect = browser_rect;
+
+    if (git_main_rect.w > 0.0) {
+        const busy = git_view.busy_label != null or git_view.menu.busy;
+        const whole: palette.Rect = .{ .x = git_main_rect.x, .y = git_main_rect.y, .w = git_main_rect.w + git_chevron_rect.w, .h = git_h };
+        const radius = theme.scaledUi(7.0);
+        const main_hover = mouse_ok and !busy and rectContains(git_main_rect, mx, my);
+        const chevron_hover_git = mouse_ok and rectContains(git_chevron_rect, mx, my);
+        queueRounded(state, whole, paletteColor(theme.mix(theme.background(), theme.COLOR_WHITE, 0.07)), radius);
+        // Hover fills the hovered half only: the same rounded shape clipped.
+        if (main_hover) queueRoundedClipped(state, whole, paletteColor(theme.mix(theme.background(), theme.COLOR_WHITE, 0.13)), radius, git_main_rect);
+        if (chevron_hover_git or (git_menu_open and paneIdEqual(git_menu_pane_id, pane_id))) {
+            queueRoundedClipped(state, whole, paletteColor(theme.mix(theme.background(), theme.COLOR_WHITE, 0.13)), radius, git_chevron_rect);
+        }
+        queueBorder(state, whole, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 28)), radius, theme.scaledUi(1.0));
+        queueRect(state, .{ .x = git_chevron_rect.x, .y = whole.y + theme.scaledUi(6.0), .w = theme.scaledUi(1.0), .h = git_h - theme.scaledUi(12.0) }, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 28)));
+
+        var gx = git_main_rect.x + git_pad_x;
+        queueIconText(state, .{
+            .x = gx,
+            .y = git_main_rect.y + (git_h - git_icon_size) * 0.5,
+            .w = git_icon_size,
+            .h = git_icon_size,
+        }, git_icon, paletteColor(if (git_view.busy_label != null) theme.COLOR_TEXT_MUTED else theme.accent()), git_icon_size, rect);
+        gx += git_icon_size + git_inner_gap;
+        const label_w = chromeLabelWidth(git_font, git_label);
+        const label_color = if (git_view.busy_label != null) theme.COLOR_TEXT_MUTED else if (main_hover) theme.COLOR_WHITE else theme.mix(theme.COLOR_WHITE, theme.COLOR_TEXT_MUTED, 0.25);
+        queueChromeLabel(state, .{ .x = gx, .y = git_main_rect.y + (git_h - git_font * 1.4) * 0.5, .w = label_w + theme.scaledUi(2.0), .h = git_font * 1.4 }, git_label, paletteColor(label_color), git_font, rect);
+        gx += label_w + git_inner_gap;
+        if (git_badge.len > 0) {
+            const badge_rect = snapRect(.{ .x = gx, .y = git_main_rect.y + (git_h - git_badge_h) * 0.5, .w = git_badge_w, .h = git_badge_h });
+            const tone = if (git_attention) theme.COLOR_YELLOW else theme.COLOR_TEXT_MUTED;
+            queueRounded(state, badge_rect, paletteColor(theme.wash(tone, if (git_attention) 48 else 36)), git_badge_h * 0.5);
+            queueCenteredChromeLabel(state, badge_rect, git_badge, paletteColor(if (git_attention) theme.COLOR_YELLOW else theme.COLOR_WHITE), git_badge_font, rect);
+        }
+        const git_chevron_size = theme.scaledUi(11.0);
+        queueIconText(state, .{
+            .x = git_chevron_rect.x + (git_chevron_rect.w - git_chevron_size) * 0.5,
+            .y = git_chevron_rect.y + (git_h - git_chevron_size) * 0.5,
+            .w = git_chevron_size,
+            .h = git_chevron_size,
+        }, NF_COD_CHEVRON_DOWN, paletteColor(if (chevron_hover_git) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE), git_chevron_size, rect);
+    }
 
     const open_main_hover = mouse_ok and rectContains(open_main_rect, mx, my);
     const chevron_hover = mouse_ok and rectContains(chevron_rect, mx, my);
@@ -2877,6 +3145,10 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
             var label_buf: [16]u8 = undefined;
             renderWorkspaceHeaderShortcutKeyTip(state, open_main_rect, rect, keybinds.formatCtrlShiftKeyTip(&label_buf, config.open_editor));
         }
+    }
+
+    if (git_menu_open and paneIdEqual(git_menu_pane_id, pane_id) and git_chevron_rect.w > 0.0) {
+        renderGitMenu(state, header_hit, rect, git_chevron_rect, git_view.menu, label_font);
     }
 
     if (!state.workspace_header_open_menu_open or !paneIdEqual(state.workspace_header_open_menu_pane_id, pane_id)) return;
@@ -2992,6 +3264,91 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
             .h = label_font * 1.25,
         }, stableText(state, labels[ri]), row_col, label_font, menu_clip);
 
+        ry += menu_row_h;
+    }
+}
+
+/// The git split button's menu: Commit…, Commit & push, and Push / Pull &
+/// push when they apply. Rows are disabled while a git action runs.
+fn renderGitMenu(
+    state: *app_state.AppState,
+    header_hit: *WorkspaceHeaderHitCache,
+    rect: palette.Rect,
+    anchor: palette.Rect,
+    menu: git_changes.HeaderMenu,
+    label_font: f32,
+) void {
+    var kinds: [4]GitMenuRow = undefined;
+    var enabled: [4]bool = undefined;
+    var count: usize = 0;
+    kinds[count] = .commit;
+    enabled[count] = menu.can_commit and !menu.busy;
+    count += 1;
+    kinds[count] = .commit_and_push;
+    enabled[count] = menu.can_commit and !menu.busy;
+    count += 1;
+    if (menu.can_push) {
+        kinds[count] = .push;
+        enabled[count] = !menu.busy;
+        count += 1;
+    }
+    if (menu.can_pull_push) {
+        kinds[count] = .pull_push;
+        enabled[count] = !menu.busy;
+        count += 1;
+    }
+
+    const mx = state.transcript_controller.palette_mouse_x;
+    const my = state.transcript_controller.palette_mouse_y;
+    const mouse_ok = state.transcript_controller.palette_mouse_in_workspace;
+    const menu_w = theme.scaledUi(220.0);
+    const menu_pad = theme.scaledUi(6.0);
+    const menu_row_h = theme.scaledUi(32.0);
+    const menu_h = menu_pad * 2.0 + @as(f32, @floatFromInt(count)) * menu_row_h;
+    const menu_x = @max(rect.x + theme.scaledUi(12.0), anchor.x + anchor.w - menu_w);
+    const menu_y = anchor.y + anchor.h + theme.scaledUi(6.0);
+    header_hit.git_menu_panel_rect = .{ .x = menu_x, .y = menu_y, .w = menu_w, .h = menu_h };
+    const menu_clip = header_hit.git_menu_panel_rect;
+    queueRounded(state, menu_clip, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(10.0));
+    queueBorder(state, menu_clip, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(10.0), theme.scaledUi(1.0));
+
+    header_hit.git_menu_row_count = count;
+    var ry = menu_y + menu_pad;
+    for (0..count) |ri| {
+        header_hit.git_menu_row_kind[ri] = kinds[ri];
+        header_hit.git_menu_row_enabled[ri] = enabled[ri];
+        const rr = palette.Rect{ .x = menu_x + theme.scaledUi(4.0), .y = ry, .w = menu_w - theme.scaledUi(8.0), .h = menu_row_h };
+        header_hit.git_menu_row_rects[ri] = rr;
+        const row_hover = mouse_ok and enabled[ri] and rectContains(rr, mx, my);
+        if (row_hover) queueRounded(state, rr, paletteColor(theme.raise(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(7.0));
+        const row_col = paletteColor(if (!enabled[ri])
+            theme.COLOR_TEXT_SUBTLE
+        else if (row_hover)
+            theme.COLOR_WHITE
+        else
+            theme.COLOR_TEXT_MUTED);
+        const icon: []const u8 = switch (kinds[ri]) {
+            .commit => NF_COD_GIT_COMMIT,
+            .commit_and_push => NF_COD_CLOUD_UPLOAD,
+            .push => NF_COD_ARROW_UP,
+            .pull_push => NF_COD_SYNC,
+        };
+        const label: []const u8 = switch (kinds[ri]) {
+            .commit => "Commit\u{2026}",
+            .commit_and_push => "Commit & push",
+            .push => "Push",
+            .pull_push => "Pull & push",
+        };
+        const icon_size = theme.scaledUi(15.0);
+        const icon_x = rr.x + theme.scaledUi(10.0);
+        queueIconText(state, .{ .x = icon_x, .y = rr.y + (menu_row_h - icon_size) * 0.5, .w = icon_size, .h = icon_size }, icon, row_col, icon_size, menu_clip);
+        const text_x = icon_x + icon_size + theme.scaledUi(10.0);
+        queueFixedTextLine(state, .{
+            .x = text_x,
+            .y = rr.y + (menu_row_h - label_font * 1.25) * 0.5,
+            .w = rr.w - (text_x - rr.x) - theme.scaledUi(8.0),
+            .h = label_font * 1.25,
+        }, label, row_col, label_font, menu_clip);
         ry += menu_row_h;
     }
 }
@@ -3463,6 +3820,11 @@ fn renderTranscriptContent(state: *app_state.AppState, rect: palette.Rect, lane:
     // hit-test.
     if (options.request_hydration and thread.messages.items.len == 0 and thread.persisted_message_offset > 0) {
         state.requestOlderCurrentThreadMessages();
+    }
+    // A projection refresh kept the hydrated rows but reported durable rows
+    // past them; fetch that suffix off-thread (appends never move anchors).
+    if (options.request_hydration and thread.transcript_suffix_gap_end > 0) {
+        state.requestCurrentThreadTranscriptSuffix();
     }
 
     if (thread.messages.items.len == 0 and !thread.isSendPendingForUi() and state.currentThreadPendingSlashCommandLabel() == null) {
@@ -4681,6 +5043,10 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
             if (y + item_h >= column.y and y <= column.y + column.h) {
                 renderTodoCard(state, column, y, item_h, event.body, clip);
             }
+        } else if (event.role == .system and isGitCommitMessage(event.author, event.body)) {
+            if (y + item_h >= column.y and y <= column.y + column.h) {
+                renderGitCommitCard(state, thread.local_thread_id, column, y, item_h, event.body, clip);
+            }
         } else {
             const role_label: []const u8 = switch (event.role) {
                 .user => userRoleLabel(event.author),
@@ -5755,6 +6121,9 @@ fn transcriptMessageHeightStream(
     if (role == .system and isTodoListMessage(message_author, body_raw)) {
         return todoCardHeight(body_raw, column_width);
     }
+    if (role == .system and isGitCommitMessage(message_author, body_raw)) {
+        return gitCommitCardHeight(body_raw);
+    }
     if (role == .system and utils.providerFailureActionProvider(body_raw) != null) {
         return providerFailureActionHeight(body_raw, column_width);
     }
@@ -5870,6 +6239,10 @@ fn renderTranscriptMessage(state: *app_state.AppState, thread: *const app_state.
         renderTodoCard(state, column, y, height, message.body, clip);
         return;
     }
+    if (message.role == .system and isGitCommitMessage(message.author, message.body)) {
+        renderGitCommitCard(state, thread.local_thread_id, column, y, height, message.body, clip);
+        return;
+    }
     if (message.role == .system) {
         if (utils.providerFailureActionProvider(message.body)) |provider| {
             renderProviderFailureActionCard(state, column, y, height, provider, message.body, clip, message_index);
@@ -5895,13 +6268,13 @@ fn providerFailureActionHeight(body_raw: []const u8, column_width: f32) f32 {
     return theme.scaledUi(99.0) + body_height;
 }
 
-fn recordUsageActionHit(rect: palette.Rect) void {
+fn recordUsageActionHit(rect: palette.Rect, sign_in_provider: ?app_state.Provider) void {
     if (usage_action_hit_count >= usage_action_hits.len) return;
-    usage_action_hits[usage_action_hit_count] = .{ .rect = rect };
+    usage_action_hits[usage_action_hit_count] = .{ .rect = rect, .sign_in_provider = sign_in_provider };
     usage_action_hit_count += 1;
 }
 
-// Provider failure region with a direct provider-usage action.
+// Provider failure region with a direct usage or sign-in action.
 fn renderProviderFailureActionCard(
     state: *app_state.AppState,
     column: palette.Rect,
@@ -5925,8 +6298,11 @@ fn renderProviderFailureActionCard(
     const pad = theme.scaledUi(16.0);
     var title_buf: [80]u8 = undefined;
     const is_usage_limit = utils.usageLimitProviderForDisplayMessage(body_raw) != null;
+    const is_sign_in = utils.signInRequiredProviderForDisplayMessage(body_raw) != null;
     const title = if (is_usage_limit)
         std.fmt.bufPrint(&title_buf, "{s} usage limit reached", .{utils.providerLabel(provider)}) catch "Usage limit reached"
+    else if (is_sign_in)
+        std.fmt.bufPrint(&title_buf, "{s} sign-in required", .{utils.providerLabel(provider)}) catch "Sign-in required"
     else
         std.fmt.bufPrint(&title_buf, "{s} request failed", .{utils.providerLabel(provider)}) catch "Provider request failed";
     queueChromeLabel(state, .{
@@ -5973,8 +6349,8 @@ fn renderProviderFailureActionCard(
         .y = button.y + theme.scaledUi(8.0),
         .w = button.w - theme.scaledUi(26.0),
         .h = theme.scaledUi(18.0),
-    }, "View usage", paletteColor(if (hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), clip);
-    if (intersectClipRect(clip, button)) |visible_button| recordUsageActionHit(visible_button);
+    }, if (is_sign_in) "Sign in" else "View usage", paletteColor(if (hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), clip);
+    if (intersectClipRect(clip, button)) |visible_button| recordUsageActionHit(visible_button, if (is_sign_in) provider else null);
 
     const copy_button = snapRect(.{
         .x = button.x + button.w + theme.scaledUi(8.0),
@@ -6813,6 +7189,480 @@ test "todo summary counts statuses" {
     const item = parseTodoLine("-  [X]   spaced   ").?;
     try std.testing.expectEqual(TodoItemStatus.completed, item.status);
     try std.testing.expectEqualStrings("spaced", item.text);
+}
+
+const GIT_COMMIT_MESSAGE_AUTHOR = "git";
+const GIT_COMMIT_MAX_ENTRIES: usize = 8;
+
+const GitCommitEntry = struct {
+    sha: []const u8,
+    repo: ?[]const u8 = null,
+    pushed: bool = false,
+    /// Web page of the commit (`remote <url>` line), when the daemon knew it.
+    /// Older daemons wrote it before the push; only linked once `pushed`.
+    remote: ?[]const u8 = null,
+    /// `local` line: the repository had no remote when it committed.
+    local: bool = false,
+};
+
+/// Parsed daemon commit row (format: `git_changes_protocol.zig`, "Committed
+/// transcript row"). Slices borrow the body.
+const GitCommitSummary = struct {
+    /// `Committed <N> file<s>`, everything before the `": "`.
+    headline: []const u8,
+    entries: [GIT_COMMIT_MAX_ENTRIES]GitCommitEntry = undefined,
+    entry_count: usize = 0,
+    subject: ?[]const u8 = null,
+    branch: ?[]const u8 = null,
+
+    fn entrySlice(self: *const GitCommitSummary) []const GitCommitEntry {
+        return self.entries[0..self.entry_count];
+    }
+
+    fn hasDetail(self: GitCommitSummary) bool {
+        return self.subject != null or self.branch != null;
+    }
+
+    fn allPushed(self: *const GitCommitSummary) bool {
+        for (self.entrySlice()) |entry| if (!entry.pushed) return false;
+        return self.entry_count > 0;
+    }
+
+    /// Any entry's commit page, pushed or not (a hint the repo has a remote).
+    fn firstRemote(self: *const GitCommitSummary) ?[]const u8 {
+        for (self.entrySlice()) |entry| if (entry.remote) |url| return url;
+        return null;
+    }
+
+    /// First pushed entry's commit page, for the card's "View on <host>"
+    /// link. Unpushed commits are never linked (the page would 404).
+    fn firstLink(self: *const GitCommitSummary) ?[]const u8 {
+        for (self.entrySlice()) |entry| if (entry.pushed) if (entry.remote) |url| return url;
+        return null;
+    }
+
+    /// Every entry's repository had no remote at all (`local` lines).
+    fn allLocal(self: *const GitCommitSummary) bool {
+        for (self.entrySlice()) |entry| if (!entry.local or entry.pushed) return false;
+        return self.entry_count > 0;
+    }
+
+    /// `Committed & pushed N files` once every entry is pushed (rows are
+    /// written `Committed N files` and later marked pushed in place).
+    fn displayHeadline(self: *const GitCommitSummary, buf: []u8) []const u8 {
+        const prefix = "Committed ";
+        if (!self.allPushed() or !std.mem.startsWith(u8, self.headline, prefix)) return self.headline;
+        if (std.mem.startsWith(u8, self.headline, "Committed & pushed")) return self.headline;
+        return std.fmt.bufPrint(buf, "Committed & pushed {s}", .{self.headline[prefix.len..]}) catch self.headline;
+    }
+};
+
+/// `https://github.com/o/r/commit/…` -> `github.com`.
+fn gitCommitLinkHost(url: []const u8) ?[]const u8 {
+    const scheme_end = std.mem.indexOf(u8, url, "://") orelse return null;
+    const rest = url[scheme_end + 3 ..];
+    const host = rest[0 .. std.mem.indexOfScalar(u8, rest, '/') orelse rest.len];
+    return if (host.len > 0) host else null;
+}
+
+/// Parses a commit row body. Line 1 is required; the subject (line 2) and
+/// `branch <name>` (line 3) are optional so rows written by older daemons
+/// still parse. Returns null for anything that is not a commit row.
+fn parseGitCommitBody(body_raw: []const u8) ?GitCommitSummary {
+    const body = std.mem.trim(u8, body_raw, "\n\r\t ");
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    const first = std.mem.trim(u8, lines.first(), " \t\r");
+    if (!std.mem.startsWith(u8, first, "Committed ")) return null;
+    const colon = std.mem.indexOf(u8, first, ": ") orelse return null;
+    var summary: GitCommitSummary = .{ .headline = first[0..colon] };
+    var entries = std.mem.splitSequence(u8, first[colon + 2 ..], ", ");
+    while (entries.next()) |entry_raw| {
+        const entry = parseGitCommitEntry(entry_raw) orelse return null;
+        if (summary.entry_count < GIT_COMMIT_MAX_ENTRIES) {
+            summary.entries[summary.entry_count] = entry;
+            summary.entry_count += 1;
+        }
+    }
+    if (summary.entry_count == 0) return null;
+    if (lines.next()) |subject_raw| {
+        const subject = std.mem.trim(u8, subject_raw, " \t\r");
+        if (subject.len > 0) summary.subject = subject;
+    }
+    if (lines.next()) |branch_raw| {
+        const branch_line = std.mem.trim(u8, branch_raw, " \t\r");
+        if (std.mem.startsWith(u8, branch_line, "branch ")) {
+            const branch = std.mem.trim(u8, branch_line["branch ".len..], " \t");
+            if (branch.len > 0) summary.branch = branch;
+        }
+    }
+    // Lines 4+, one per entry, positional: `remote <url>`, a bare `remote`
+    // (no link for that entry), or `local` (no remote at all).
+    var remote_index: usize = 0;
+    while (lines.next()) |remote_raw| : (remote_index += 1) {
+        if (remote_index >= summary.entry_count) break;
+        const line = std.mem.trim(u8, remote_raw, " \t\r");
+        if (std.mem.eql(u8, line, "local")) {
+            summary.entries[remote_index].local = true;
+            continue;
+        }
+        if (!std.mem.startsWith(u8, line, "remote")) break;
+        const url = std.mem.trim(u8, line["remote".len..], " \t");
+        if (webHref(url)) |href| summary.entries[remote_index].remote = href;
+    }
+    return summary;
+}
+
+fn parseGitCommitEntry(entry_raw: []const u8) ?GitCommitEntry {
+    var rest = std.mem.trim(u8, entry_raw, " \t\r");
+    const sha_end = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
+    const sha = rest[0..sha_end];
+    if (sha.len == 0) return null;
+    for (sha) |c| if (!std.ascii.isHex(c)) return null;
+    var entry: GitCommitEntry = .{ .sha = sha };
+    rest = std.mem.trimStart(u8, rest[sha_end..], " ");
+    if (rest.len > 0 and rest[0] == '(') {
+        const close = std.mem.indexOfScalar(u8, rest, ')') orelse return null;
+        entry.repo = rest[1..close];
+        rest = std.mem.trimStart(u8, rest[close + 1 ..], " ");
+    }
+    if (rest.len == 0) return entry;
+    if (!std.mem.eql(u8, rest, "\u{00B7} pushed")) return null;
+    entry.pushed = true;
+    return entry;
+}
+
+fn isGitCommitMessage(author: []const u8, body_raw: []const u8) bool {
+    if (!std.mem.eql(u8, author, GIT_COMMIT_MESSAGE_AUTHOR)) return false;
+    return parseGitCommitBody(body_raw) != null;
+}
+
+const GitCommitCardMetrics = struct {
+    pad_x: f32,
+    pad_y: f32,
+    head_h: f32,
+    detail_gap: f32,
+    detail_h: f32,
+    glyph_d: f32,
+    glyph_col_w: f32,
+    head_font: f32,
+    mono_font: f32,
+    detail_font: f32,
+    pill_font: f32,
+
+    fn init() GitCommitCardMetrics {
+        return .{
+            .pad_x = theme.scaledUi(14.0),
+            .pad_y = theme.scaledUi(10.0),
+            .head_h = theme.scaledUi(20.0),
+            .detail_gap = theme.scaledUi(4.0),
+            .detail_h = theme.scaledUi(18.0),
+            .glyph_d = theme.scaledUi(14.0),
+            .glyph_col_w = theme.scaledUi(24.0),
+            .head_font = theme.scaledUi(13.5),
+            .mono_font = theme.scaledUi(12.0),
+            .detail_font = theme.scaledUi(12.5),
+            .pill_font = theme.scaledUi(11.0),
+        };
+    }
+};
+
+fn gitCommitCardHeight(body_raw: []const u8) f32 {
+    const metrics = GitCommitCardMetrics.init();
+    var height = metrics.pad_y * 2.0 + metrics.head_h;
+    if (parseGitCommitBody(body_raw)) |summary| {
+        if (summary.hasDetail()) height += metrics.detail_gap + metrics.detail_h;
+    }
+    return height;
+}
+
+/// Mono text advances by a fixed `font_size * 0.55` cell (see
+/// `queueFixedTextLine`), so width and truncation are exact.
+fn gitCommitMonoWidth(font_size: f32, text: []const u8) f32 {
+    const glyphs = std.unicode.utf8CountCodepoints(text) catch text.len;
+    return @as(f32, @floatFromInt(glyphs)) * font_size * 0.55;
+}
+
+fn gitCommitTruncateMono(buf: []u8, text: []const u8, max_w: f32, font_size: f32) []const u8 {
+    if (gitCommitMonoWidth(font_size, text) <= max_w) return text;
+    const ellipsis = "\u{2026}";
+    const cell = font_size * 0.55;
+    if (cell <= 0.0 or max_w < cell * 2.0) return "";
+    const keep_cells: usize = @intFromFloat(@floor(max_w / cell) - 1.0);
+    var end: usize = 0;
+    var cells: usize = 0;
+    while (end < text.len and cells < keep_cells) {
+        const seq = std.unicode.utf8ByteSequenceLength(text[end]) catch 1;
+        if (end + seq > buf.len - ellipsis.len) break;
+        end = @min(end + seq, text.len);
+        cells += 1;
+    }
+    @memcpy(buf[0..end], text[0..end]);
+    @memcpy(buf[end .. end + ellipsis.len], ellipsis);
+    return buf[0 .. end + ellipsis.len];
+}
+
+/// Region: completed-commit card. Row 1 is a green check, "Committed N
+/// files", then each short sha in mono with its repo and a Pushed pill.
+/// Row 2 (newer rows only) is the muted subject with a branch chip at the
+/// right edge. Row 1 ends, right-aligned, with a "View on <host>" link to the
+/// commit (once pushed and the row carries one) and a Push button while the
+/// commit is still unpushed on the chat's branch. Unpushed rows say so in a
+/// muted label: "Not pushed" beside Push, or "Local only · no remote".
+fn renderGitCommitCard(
+    state: *app_state.AppState,
+    local_thread_id: []const u8,
+    column: palette.Rect,
+    y: f32,
+    height: f32,
+    body_raw: []const u8,
+    clip: palette.Rect,
+) void {
+    const summary = parseGitCommitBody(body_raw) orelse return;
+    const metrics = GitCommitCardMetrics.init();
+    const bubble = snapRect(palette.Rect{ .x = column.x, .y = y, .w = column.w, .h = height });
+    // Same shell as the plan card: agent chrome, not a notice.
+    queueRoundedShellClipped(state, bubble, paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 235)), paletteColor(theme.borderMuted()), transcriptBubbleCornerRadius(), clip);
+
+    const success = theme.success();
+    const inner_x = bubble.x + metrics.pad_x;
+    const right = bubble.x + bubble.w - metrics.pad_x;
+    const text_x = inner_x + metrics.glyph_col_w;
+    const head_y = bubble.y + metrics.pad_y;
+
+    // Check glyph: filled success disc with a two-bar tick (as the plan card).
+    const glyph_cx = inner_x + metrics.glyph_d * 0.5;
+    const glyph_cy = head_y + metrics.head_h * 0.5;
+    queueRoundedClipped(state, .{ .x = glyph_cx - metrics.glyph_d * 0.5, .y = glyph_cy - metrics.glyph_d * 0.5, .w = metrics.glyph_d, .h = metrics.glyph_d }, paletteColor(success), metrics.glyph_d * 0.5, clip);
+    {
+        const tick = theme.foregroundOn(success);
+        const stroke = @max(theme.scaledUi(1.6), 1.0);
+        const base_x = glyph_cx - metrics.glyph_d * 0.20;
+        const base_y = glyph_cy + metrics.glyph_d * 0.18;
+        queueRotatedBar(state, .{ .x = base_x, .y = base_y }, metrics.glyph_d * 0.22, stroke, -std.math.pi * 0.75, paletteColor(tick), clip);
+        queueRotatedBar(state, .{ .x = base_x, .y = base_y }, metrics.glyph_d * 0.42, stroke, -std.math.pi * 0.25, paletteColor(tick), clip);
+    }
+
+    // Row 1 right edge: Push button, then the commit link to its left.
+    const mouse_x = state.transcript_controller.palette_mouse_x;
+    const mouse_y = state.transcript_controller.palette_mouse_y;
+    var actions_x = right;
+    const all_local = summary.allLocal();
+    const row_push = state.gitCommitCardPush(local_thread_id, summary.allPushed(), summary.firstRemote() != null);
+    const push_state = if (all_local) .hidden else row_push;
+    if (push_state != .hidden) {
+        const button_font = theme.scaledUi(11.5);
+        const button_h = theme.scaledUi(22.0);
+        const button_pad = theme.scaledUi(10.0);
+        const label = if (push_state == .running) "Pushing\u{2026}" else "Push";
+        const spinner_w = if (push_state == .running) theme.scaledUi(16.0) else 0.0;
+        const button_w = chromeLabelWidth(button_font, label) + spinner_w + button_pad * 2.0;
+        const button = snapRect(.{ .x = actions_x - button_w, .y = glyph_cy - button_h * 0.5, .w = button_w, .h = button_h });
+        const hovered = push_state == .available and rectContains(button, mouse_x, mouse_y);
+        queueRoundedClipped(state, button, paletteColor(theme.wash(theme.accent(), if (hovered) 64 else 36)), theme.scaledUi(5.0), clip);
+        var label_x = button.x + button_pad;
+        if (push_state == .running) {
+            drawGitCommitSpinner(state, .{ .x = label_x, .y = glyph_cy - theme.scaledUi(6.0), .w = theme.scaledUi(12.0), .h = theme.scaledUi(12.0) }, theme.accent(), clip);
+            label_x += spinner_w;
+        }
+        const label_h = button_font * 1.4;
+        queueChromeLabel(state, .{ .x = label_x, .y = glyph_cy - label_h * 0.5, .w = chromeLabelWidth(button_font, label), .h = label_h }, label, paletteColor(if (hovered) theme.COLOR_WHITE else theme.accent()), button_font, clip);
+        if (push_state == .available) appendGitCommitHit(intersectRect(button, clip), .push, local_thread_id);
+        actions_x = button.x - theme.scaledUi(10.0);
+    }
+    // Muted state label: no remote at all, or unpushed while Push is offered
+    // (a hidden Push may mean it was pushed elsewhere; stay quiet then).
+    const state_label: ?[]const u8 = if (all_local)
+        "Local only \u{00B7} no remote"
+    else if (push_state != .hidden and !summary.allPushed())
+        "Not pushed"
+    else
+        null;
+    if (state_label) |label| {
+        const label_w = chromeLabelWidth(metrics.detail_font, label);
+        const label_h = metrics.detail_font * 1.4;
+        if (actions_x - label_w > text_x + theme.scaledUi(120.0)) {
+            queueChromeLabel(state, .{ .x = actions_x - label_w, .y = glyph_cy - label_h * 0.5, .w = label_w, .h = label_h }, label, paletteColor(theme.COLOR_TEXT_MUTED), metrics.detail_font, clip);
+            actions_x -= label_w + theme.scaledUi(12.0);
+        }
+    }
+    if (summary.firstLink()) |url| {
+        if (gitCommitLinkHost(url)) |host| {
+            var link_buf: [160]u8 = undefined;
+            const link_label = std.fmt.bufPrint(&link_buf, "View on {s} \u{2197}", .{host}) catch "View commit \u{2197}";
+            const link_w = chromeLabelWidth(metrics.detail_font, link_label);
+            const link_h = metrics.detail_font * 1.4;
+            if (actions_x - link_w > text_x + theme.scaledUi(120.0)) {
+                const link_rect = snapRect(.{ .x = actions_x - link_w, .y = glyph_cy - link_h * 0.5, .w = link_w, .h = link_h });
+                const hovered = rectContains(link_rect, mouse_x, mouse_y);
+                queueChromeLabel(state, link_rect, link_label, paletteColor(if (hovered) theme.COLOR_WHITE else theme.accent()), metrics.detail_font, clip);
+                if (hovered) {
+                    queueRectClipped(state, .{ .x = link_rect.x, .y = link_rect.y + link_rect.h - theme.scaledUi(2.0), .w = link_rect.w, .h = @max(theme.scaledUi(1.0), 1.0) }, paletteColor(theme.COLOR_WHITE), clip);
+                }
+                appendGitCommitHit(intersectRect(link_rect, clip), .link, url);
+                actions_x = link_rect.x - theme.scaledUi(12.0);
+            }
+        }
+    }
+
+    // Row 1: headline, then sha entries until the row runs out of room.
+    var headline_buf: [96]u8 = undefined;
+    const headline = summary.displayHeadline(&headline_buf);
+    const head_label_h = metrics.head_font * 1.4;
+    const head_label_y = glyph_cy - head_label_h * 0.5;
+    const headline_w = @min(chromeLabelWidth(metrics.head_font, headline), @max(actions_x - text_x, 0.0));
+    queueChromeLabel(state, .{ .x = text_x, .y = head_label_y, .w = headline_w, .h = head_label_h }, headline, paletteColor(theme.COLOR_WHITE), metrics.head_font, clip);
+    var x = text_x + headline_w + theme.scaledUi(10.0);
+    const entry_gap = theme.scaledUi(10.0);
+    const mono_h = metrics.mono_font * 1.3;
+    const pill_h = theme.scaledUi(16.0);
+    const pill_pad = theme.scaledUi(6.0);
+    for (summary.entrySlice()) |entry| {
+        const sha_w = gitCommitMonoWidth(metrics.mono_font, entry.sha);
+        const repo_w = if (entry.repo) |repo| theme.scaledUi(5.0) + chromeLabelWidth(metrics.detail_font, repo) else 0.0;
+        const pill_w = if (entry.pushed) theme.scaledUi(6.0) + chromeLabelWidth(metrics.pill_font, "Pushed") + pill_pad * 2.0 else 0.0;
+        if (x + sha_w + repo_w + pill_w > actions_x) break;
+        queueFixedTextLine(state, .{ .x = x, .y = glyph_cy - mono_h * 0.5, .w = sha_w + theme.scaledUi(2.0), .h = mono_h }, entry.sha, paletteColor(theme.mix(theme.COLOR_WHITE, theme.COLOR_TEXT_MUTED, 0.35)), metrics.mono_font, clip);
+        x += sha_w;
+        if (entry.repo) |repo| {
+            const label_w = chromeLabelWidth(metrics.detail_font, repo);
+            const label_h = metrics.detail_font * 1.4;
+            x += theme.scaledUi(5.0);
+            queueChromeLabel(state, .{ .x = x, .y = glyph_cy - label_h * 0.5, .w = label_w, .h = label_h }, repo, paletteColor(theme.COLOR_TEXT_MUTED), metrics.detail_font, clip);
+            x += label_w;
+        }
+        if (entry.pushed) {
+            x += theme.scaledUi(6.0);
+            const pill = snapRect(.{ .x = x, .y = glyph_cy - pill_h * 0.5, .w = pill_w - theme.scaledUi(6.0), .h = pill_h });
+            queueRoundedClipped(state, pill, paletteColor(theme.withAlpha(success, 34)), pill_h * 0.5, clip);
+            queueCenteredChromeLabel(state, pill, "Pushed", paletteColor(success), metrics.pill_font, clip);
+            x += pill.w;
+        }
+        x += entry_gap;
+    }
+
+    if (!summary.hasDetail()) return;
+
+    // Row 2: branch chip pinned right, subject ellipsized into the rest.
+    const detail_y = head_y + metrics.head_h + metrics.detail_gap;
+    const detail_cy = detail_y + metrics.detail_h * 0.5;
+    var subject_right = right;
+    if (summary.branch) |branch| {
+        const chip_pad = theme.scaledUi(7.0);
+        const chip_font = theme.scaledUi(11.0);
+        const max_text_w = @max((right - text_x) * 0.4 - chip_pad * 2.0, 0.0);
+        var branch_buf: [160]u8 = undefined;
+        const branch_text = gitCommitTruncateMono(&branch_buf, branch, max_text_w, chip_font);
+        if (branch_text.len > 0) {
+            const text_w = gitCommitMonoWidth(chip_font, branch_text);
+            const chip_h = theme.scaledUi(17.0);
+            const chip = snapRect(.{ .x = right - text_w - chip_pad * 2.0, .y = detail_cy - chip_h * 0.5, .w = text_w + chip_pad * 2.0, .h = chip_h });
+            queueRoundedClipped(state, chip, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 220)), theme.scaledUi(5.0), clip);
+            const mono_line_h = chip_font * 1.3;
+            queueFixedTextLine(state, .{ .x = chip.x + chip_pad, .y = detail_cy - mono_line_h * 0.5, .w = text_w + theme.scaledUi(2.0), .h = mono_line_h }, branch_text, paletteColor(theme.COLOR_TEXT_MUTED), chip_font, clip);
+            subject_right = chip.x - theme.scaledUi(10.0);
+        }
+    }
+    if (summary.subject) |subject| {
+        var subject_buf: [320]u8 = undefined;
+        const subject_w = subject_right - text_x;
+        const subject_text = truncateUiLabel(&subject_buf, subject, subject_w, metrics.detail_font);
+        if (subject_text.len > 0) {
+            const label_h = metrics.detail_font * 1.4;
+            queueChromeLabel(state, .{ .x = text_x, .y = detail_cy - label_h * 0.5, .w = subject_w, .h = label_h }, subject_text, paletteColor(theme.COLOR_TEXT_MUTED), metrics.detail_font, clip);
+        }
+    }
+}
+
+/// Eight-dot ring stepping every 90 ms, like the git toast's spinner.
+fn drawGitCommitSpinner(state: *app_state.AppState, rect: palette.Rect, color: [4]f32, clip: palette.Rect) void {
+    const dots: usize = 8;
+    const head: usize = @intCast(@mod(@divTrunc(unixTimestampMs(), 90), @as(i64, dots)));
+    const cx = rect.x + rect.w * 0.5;
+    const cy = rect.y + rect.h * 0.5;
+    const ring = rect.w * 0.36;
+    const dot = @max(rect.w * 0.17, 2.0);
+    for (0..dots) |index| {
+        const angle = @as(f32, @floatFromInt(index)) / @as(f32, @floatFromInt(dots)) * std.math.tau - std.math.pi * 0.5;
+        const behind = (head + dots - index) % dots;
+        const strength = 1.0 - @as(f32, @floatFromInt(behind)) / @as(f32, @floatFromInt(dots));
+        var dot_color = paletteColor(color);
+        dot_color.a *= 0.18 + 0.82 * strength * strength;
+        queueRoundedClipped(state, .{ .x = cx + @cos(angle) * ring - dot * 0.5, .y = cy + @sin(angle) * ring - dot * 0.5, .w = dot, .h = dot }, dot_color, dot * 0.5, clip);
+    }
+}
+
+test "git commit row parses remote links and pushed headline" {
+    const body = "Committed 3 files: 1a2b3c4 (verde) \u{00B7} pushed, abcdef0 (lib)\nfix: trim\nbranch main\nremote https://github.com/o/verde/commit/1a2b3c4ffff\nremote";
+    const summary = parseGitCommitBody(body).?;
+    try std.testing.expectEqualStrings("https://github.com/o/verde/commit/1a2b3c4ffff", summary.entries[0].remote.?);
+    try std.testing.expect(summary.entries[1].remote == null);
+    try std.testing.expectEqualStrings("https://github.com/o/verde/commit/1a2b3c4ffff", summary.firstRemote().?);
+    try std.testing.expectEqualStrings("github.com", gitCommitLinkHost(summary.firstRemote().?).?);
+    try std.testing.expectEqualStrings("main", summary.branch.?);
+    var buf: [96]u8 = undefined;
+    // Not every entry pushed: the headline stays as written.
+    try std.testing.expectEqualStrings("Committed 3 files", summary.displayHeadline(&buf));
+
+    const pushed = parseGitCommitBody("Committed 1 file: 1a2b3c4 \u{00B7} pushed\n\n\nremote https://gitlab.com/g/r/commit/1a2b3c4").?;
+    try std.testing.expectEqualStrings("Committed & pushed 1 file", pushed.displayHeadline(&buf));
+    try std.testing.expect(pushed.subject == null and pushed.branch == null);
+    try std.testing.expectEqualStrings("gitlab.com", gitCommitLinkHost(pushed.firstRemote().?).?);
+    // Unpushed rows are never linked, even when an older daemon wrote a link.
+    const unpushed = parseGitCommitBody("Committed 1 file: 0aae44a\nfix\nbranch main\nremote https://github.com/o/r/commit/0aae44a").?;
+    try std.testing.expect(unpushed.firstLink() == null);
+    try std.testing.expect(unpushed.firstRemote() != null and !unpushed.allLocal());
+    try std.testing.expectEqualStrings("https://github.com/o/verde/commit/1a2b3c4ffff", summary.firstLink().?);
+    // `local`: no remote at all; a bare `remote` is not local.
+    const local = parseGitCommitBody("Committed 1 file: 1a2b3c4\nwip\nbranch main\nlocal").?;
+    try std.testing.expect(local.entries[0].local and local.allLocal() and local.firstLink() == null);
+    try std.testing.expect(!parseGitCommitBody("Committed 1 file: 1a2b3c4\n\n\nremote").?.allLocal());
+    const mixed = parseGitCommitBody("Committed 2 files: 1a2b3c4 (app), abcdef0 (notes)\n\n\nremote\nlocal").?;
+    try std.testing.expect(!mixed.entries[0].local and mixed.entries[1].local and !mixed.allLocal());
+    // A non-web remote line is ignored rather than linked.
+    try std.testing.expect(parseGitCommitBody("Committed 1 file: 1a2b3c4\n\n\nremote git@x:y").?.firstRemote() == null);
+    // Card height is unchanged by links (they sit on row 1).
+    try std.testing.expectEqual(gitCommitCardHeight("Committed 1 file: 1a2b3c4\ns\nbranch main"), gitCommitCardHeight("Committed 1 file: 1a2b3c4\ns\nbranch main\nremote https://h/o/r/commit/1"));
+}
+
+test "git commit row parses old one-line bodies" {
+    const summary = parseGitCommitBody("Committed 1 file: 1a2b3c4").?;
+    try std.testing.expectEqualStrings("Committed 1 file", summary.headline);
+    try std.testing.expectEqual(@as(usize, 1), summary.entry_count);
+    try std.testing.expectEqualStrings("1a2b3c4", summary.entries[0].sha);
+    try std.testing.expect(summary.entries[0].repo == null);
+    try std.testing.expect(!summary.entries[0].pushed);
+    try std.testing.expect(summary.subject == null and summary.branch == null);
+    try std.testing.expect(!summary.hasDetail());
+    try std.testing.expect(isGitCommitMessage("git", "Committed 1 file: 1a2b3c4"));
+    try std.testing.expect(gitCommitCardHeight("Committed 1 file: 1a2b3c4") < gitCommitCardHeight("Committed 1 file: 1a2b3c4\nfix it"));
+}
+
+test "git commit row parses pushed, multi-repo, subject and branch" {
+    const pushed = parseGitCommitBody("Committed 3 files: 1a2b3c4 \u{00B7} pushed").?;
+    try std.testing.expectEqualStrings("Committed 3 files", pushed.headline);
+    try std.testing.expect(pushed.entries[0].pushed);
+
+    const multi = parseGitCommitBody("Committed 5 files: 1a2b3c4 (verde) \u{00B7} pushed, abcdef0 (verde-cloud)\nfeat: add commit card\nbranch feature/commit-card").?;
+    try std.testing.expectEqual(@as(usize, 2), multi.entry_count);
+    try std.testing.expectEqualStrings("verde", multi.entries[0].repo.?);
+    try std.testing.expect(multi.entries[0].pushed);
+    try std.testing.expectEqualStrings("abcdef0", multi.entries[1].sha);
+    try std.testing.expectEqualStrings("verde-cloud", multi.entries[1].repo.?);
+    try std.testing.expect(!multi.entries[1].pushed);
+    try std.testing.expectEqualStrings("feat: add commit card", multi.subject.?);
+    try std.testing.expectEqualStrings("feature/commit-card", multi.branch.?);
+
+    // An empty positional subject still lets the branch line through.
+    const branch_only = parseGitCommitBody("Committed 1 file: 1a2b3c4\n\nbranch main").?;
+    try std.testing.expect(branch_only.subject == null);
+    try std.testing.expectEqualStrings("main", branch_only.branch.?);
+}
+
+test "git commit row rejects other system rows" {
+    try std.testing.expect(!isGitCommitMessage("System", "Committed 1 file: 1a2b3c4"));
+    try std.testing.expect(!isGitCommitMessage("git", "Push rejected: remote has new commits"));
+    try std.testing.expect(!isGitCommitMessage("git", "Committed 1 file: not-a-sha"));
+    try std.testing.expect(!isGitCommitMessage("git", "Committed 1 file: 1a2b3c4 \u{00B7} something else"));
 }
 
 fn isDiffSummaryMessage(author: []const u8, body_raw: []const u8) bool {
@@ -7903,6 +8753,15 @@ fn renderToolCallGroup(
     }
 }
 
+fn backgroundStopPending(state: *app_state.AppState, live_task_index: ?usize, body: []const u8) bool {
+    const thread = state.currentThread();
+    if (live_task_index) |index| {
+        if (index < thread.background_tasks.items.len) return thread.background_tasks.items[index].stop_requested;
+    }
+    const task = app_state.backgroundTaskForEventBody(@constCast(thread), body) orelse return false;
+    return task.stop_requested;
+}
+
 fn renderCommandEventRow(
     state: *app_state.AppState,
     column: palette.Rect,
@@ -8108,8 +8967,15 @@ fn renderCommandEventRow(
             }
         }
         if (stop_visible) {
-            queueRoundedClipped(state, stop_rect, paletteColor(theme.withAlpha(theme.COLOR_DIFF_REMOVE, 55)), theme.scaledUi(5.0), clip);
-            queueFixedTextLine(state, .{ .x = stop_rect.x + theme.scaledUi(14.0), .y = stop_rect.y + theme.scaledUi(6.0), .w = stop_rect.w - theme.scaledUi(28.0), .h = theme.scaledUi(14.0) }, "Stop", paletteColor(theme.COLOR_DIFF_REMOVE), theme.scaledUi(11.5), clip);
+            // Codex stops round-trip through the daemon; show the pending state
+            // so a click never looks ignored while the request is in flight.
+            const stopping = backgroundStopPending(state, live_task_index, body_raw);
+            const stop_fill = if (stopping) theme.withAlpha(theme.COLOR_PANEL_MUTED, 86) else theme.withAlpha(theme.COLOR_DIFF_REMOVE, 55);
+            const stop_label: []const u8 = if (stopping) "Stopping" else "Stop";
+            const stop_label_inset = if (stopping) theme.scaledUi(5.0) else theme.scaledUi(14.0);
+            const stop_label_color = if (stopping) theme.COLOR_TEXT_MUTED else theme.COLOR_DIFF_REMOVE;
+            queueRoundedClipped(state, stop_rect, paletteColor(stop_fill), theme.scaledUi(5.0), clip);
+            queueFixedTextLine(state, .{ .x = stop_rect.x + stop_label_inset, .y = stop_rect.y + theme.scaledUi(6.0), .w = stop_rect.w - stop_label_inset * 2.0, .h = theme.scaledUi(14.0) }, stop_label, paletteColor(stop_label_color), theme.scaledUi(11.5), clip);
             if (intersectClipRect(intersectClipRect(stop_rect, bubble), clip)) |clipped_stop| {
                 state.recordBackgroundTaskActionForMessageWithTask(clipped_stop, message_index, body_raw, .stop, live_task_index);
             }
@@ -10079,6 +10945,10 @@ const NF_COD_LOCK = "\u{EA75}";
 const NF_COD_UNLOCK = "\u{EB74}";
 const NF_COD_CIRCLE = "\u{EABC}"; // hollow circle — reads as "inactive / default" next to the bolt
 const NF_COD_CHEVRON_DOWN = "\u{EAB4}";
+const NF_COD_GIT_COMMIT = "\u{EAFC}";
+const NF_COD_ARROW_UP = "\u{EAA1}";
+const NF_COD_CLOUD_UPLOAD = "\u{EAC3}";
+const NF_COD_SYNC = "\u{EA77}";
 const NF_COD_CHEVRON_LEFT = "\u{EAB5}";
 const NF_COD_CHEVRON_RIGHT = "\u{EAB6}";
 const NF_COD_CLOSE = "\u{EA76}";
