@@ -170,7 +170,9 @@ with the draft attachments retained; local uploads continue to work.
 
 ### Confined directory browsing
 
-The web **Add Workspace** dialog creates a managed folder when its optional
+The web **Add Workspace** dialog accepts an optional workspace name for both
+new and existing folders. A blank name keeps the generated or folder-derived
+name. It creates a managed folder when its optional
 path is empty, using the same Verde data-root `workspaces/` directory and
 `verde.toml` defaults as desktop. **Browse** opens a tappable host folder picker;
 no path typing or native dialog on the phone is required. Creation uses daemon

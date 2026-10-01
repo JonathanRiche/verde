@@ -53,8 +53,10 @@ const MUTATING_METHODS = [_][]const u8{
     "daemon.stop",
     // Full store mutation surface.
     "state.snapshot.replace",
+    "workspace.create",
     "workspace.close",
     "workspace.upsert",
+    "workspace.reorder",
     "workspace.repository.upsert",
     "workspace.repository.remove",
     "workspace.repository.default.set",
@@ -73,6 +75,11 @@ const MUTATING_METHODS = [_][]const u8{
     "notification.chatCompletion.clear",
     "config.favoriteModel.set",
     "config.ui.set",
+    "config.commit.set",
+    // Git commits and pushes change the repository, never automatically.
+    "git.changes.commit",
+    "git.changes.push",
+    "git.changes.pull_push",
     // Owner-only access administration. Lists are included because they
     // transactionally prune bounded terminal records before replying.
     access_protocol.METHOD_DAEMON_PAIRING_GRANT_CREATE,
@@ -458,6 +465,7 @@ test "reads are not mutators and store mutators drain" {
         "state.snapshot.replace",
         "workspace.close",
         "workspace.upsert",
+        "workspace.reorder",
         "workspace.repository.upsert",
         "workspace.repository.remove",
         "workspace.repository.default.set",

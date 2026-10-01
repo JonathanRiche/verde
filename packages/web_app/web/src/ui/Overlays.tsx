@@ -9,6 +9,10 @@ import { viewportDiagnostics } from '../lib/pwa'
 import { openHistory } from './History'
 import { loadTheme } from '../lib/theme'
 import { UI_CONFIG_LIMITS, type ReducedMotionParts } from '../lib/ui_config'
+import {
+  COMMIT_MESSAGE_PROVIDERS, COMMIT_PROVIDER_DEFAULT_MODELS, COMMIT_PROVIDER_LABELS, type CommitMessageProvider,
+} from '../lib/git_changes'
+import { modelOptionsFor } from '../lib/models'
 
 
 /** Keep keyboard focus in the visible sheet and return it to its opener. */
@@ -52,6 +56,7 @@ type PaletteSection = 'threads' | 'panes' | 'workspaces' | 'app'
 // Same sections, same order, as the desktop palette (command_palette.zig Section).
 const SECTIONS: PaletteSection[] = ['threads', 'panes', 'workspaces', 'app']
 const HISTORY_COMMAND = 'thread.history'
+const CLOSED_WORKSPACE_PREFIX = 'closed-workspace:'
 
 interface PaletteItem {
   id: string
@@ -62,6 +67,8 @@ interface PaletteItem {
   /// Muted trailing label (pane kind, "active").
   hint?: string
   disabled?: boolean
+  /// Extra lowercase-insensitive match text beyond the title.
+  search?: string
 }
 
 function sectionOf(id: string): PaletteSection {
@@ -80,11 +87,13 @@ export function Palette() {
   const results = createMemo(() => {
     const needle = query().trim().toLowerCase()
     const has_workspace = Boolean(store.workspace())
+    const closed = store.closedWorkspaces()
     const commands: PaletteItem[] = COMMANDS.map((command) => ({
       id: command.id,
       title: command.title,
       section: sectionOf(command.id),
       keys: command.hint || undefined,
+      disabled: command.id === 'workspace.reopen' && closed.length === 0,
     }))
     const history: PaletteItem = { id: HISTORY_COMMAND, title: 'History', section: 'threads', disabled: !has_workspace }
     const panes: PaletteItem[] = [
@@ -101,11 +110,20 @@ export function Palette() {
       title: workspace.label,
       section: 'workspaces',
     }))
+    // Desktop CLOSED WORKSPACES rows: newest first, also found by path or
+    // by searching "reopen"/"closed".
+    const reopen: PaletteItem[] = closed.map((workspace) => ({
+      id: `${CLOSED_WORKSPACE_PREFIX}${workspace.workspace_id}`,
+      title: `Reopen ${workspace.label}`,
+      section: 'workspaces',
+      hint: 'closed',
+      search: `${workspace.path} closed workspace`,
+    }))
     const seen = new Set<string>()
-    const matched = [history, ...commands, ...panes, ...workspaces].filter((item) => {
+    const matched = [history, ...commands, ...panes, ...workspaces, ...reopen].filter((item) => {
       if (seen.has(item.id)) return false
       seen.add(item.id)
-      return item.title.toLowerCase().includes(needle)
+      return item.title.toLowerCase().includes(needle) || Boolean(item.search?.toLowerCase().includes(needle))
     })
     // Flat, section-ordered list: row index doubles as the keyboard cursor.
     return SECTIONS.flatMap((section) => matched.filter((item) => item.section === section))
@@ -133,6 +151,11 @@ export function Palette() {
       )
       if (pane) store.focusPane(pane)
       close()
+      return
+    }
+    if (id.startsWith(CLOSED_WORKSPACE_PREFIX)) {
+      close()
+      void store.reopenClosedWorkspace(id.slice(CLOSED_WORKSPACE_PREFIX.length))
       return
     }
     if (id.startsWith('workspace:')) {
@@ -335,6 +358,7 @@ export function Settings() {
 
             <MotionSettings />
             <WorkspaceSettings />
+            <CommitMessageSettings />
             <PairedDevicesSettings />
 
             <SettingsSection title="Notifications">
@@ -523,6 +547,51 @@ function WorkspaceSettings() {
   )
 }
 
+/// Commit review: who writes the suggested message and the primary button.
+function CommitMessageSettings() {
+  const config = () => store.commitConfig()
+  const fixed = () => (config().provider === 'auto' ? null : config().provider as Exclude<CommitMessageProvider, 'auto'>)
+  createEffect(() => { const provider = fixed(); if (provider) store.ensureProviderModels(provider) })
+  const models = createMemo(() => {
+    const provider = fixed()
+    if (!provider) return []
+    const options = (store.providerModels(provider) ?? modelOptionsFor(provider)).map((row) => ({ value: row.value, label: row.label }))
+    const current = config().model
+    if (current && !options.some((row) => row.value === current)) options.unshift({ value: current, label: current })
+    return options
+  })
+  const select = 'h-9 max-w-[60%] min-w-0 rounded-[7px] border border-[var(--border-muted)] bg-[var(--chat-black)] px-2 text-[13px] text-[var(--text)] outline-none focus:border-[var(--accent)]'
+  return (
+    <SettingsSection title="Commit messages" note="Used by the chat change review. Shared with the desktop app through verde.json.">
+      <label class="flex min-h-[44px] items-center justify-between gap-4 border-b border-[var(--border-muted)] py-2">
+        <span>Provider</span>
+        <select class={select} value={config().provider}
+          onChange={(event) => store.updateCommitConfig({ commit_message_provider: event.currentTarget.value as CommitMessageProvider, commit_message_model: '' })}>
+          <For each={[...COMMIT_MESSAGE_PROVIDERS]}>{(provider) => <option value={provider}>{COMMIT_PROVIDER_LABELS[provider]}</option>}</For>
+        </select>
+      </label>
+      <Show when={fixed()}>
+        {(provider) => (
+          <label class="flex min-h-[44px] items-center justify-between gap-4 border-b border-[var(--border-muted)] py-2">
+            <span>Model</span>
+            <select class={select} value={config().model ?? ''}
+              onChange={(event) => store.updateCommitConfig({ commit_message_model: event.currentTarget.value })}>
+              <option value="">Default ({COMMIT_PROVIDER_DEFAULT_MODELS[provider()]})</option>
+              <For each={models()}>{(row) => <option value={row.value}>{row.label}</option>}</For>
+            </select>
+          </label>
+        )}
+      </Show>
+      <SegmentRow
+        label="Default action"
+        value={config().default_action}
+        options={[{ value: 'commit', label: 'Commit' }, { value: 'commit_and_push', label: 'Commit & Push' }]}
+        onChange={(value) => store.updateCommitConfig({ commit_default_action: value })}
+      />
+    </SettingsSection>
+  )
+}
+
 function SwitchRow(props: { id: string; label: string; checked: boolean; indent?: boolean; onChange: (checked: boolean) => void }) {
   return (
     <div class={`flex min-h-[44px] items-center justify-between gap-4 border-b border-[var(--border-muted)] py-2 ${props.indent ? 'pl-4' : ''}`}>
@@ -599,15 +668,14 @@ function SettingsSection(props: { title: string; note?: string; children: JSX.El
 }
 
 export function WorkspaceDialog() {
+  const [name, setName] = createSignal('')
   let pathField: HTMLInputElement | undefined
   const [path, setPath] = createSignal('')
   const [submitting, setSubmitting] = createSignal(false)
   const [browserOpen, setBrowserOpen] = createSignal(false)
   const [browserLoading, setBrowserLoading] = createSignal(false)
   const [browserError, setBrowserError] = createSignal<string | null>(null)
-  // The gateway refuses directory listing by design (security contract), so
-  // once it says so the Browse button is replaced by known-parent shortcuts.
-  const [browseUnsupported, setBrowseUnsupported] = createSignal(false)
+  let browseRequest = 0
   const parentFolders = () => {
     const parents = new Set<string>()
     for (const workspace of store.workspaces()) {
@@ -625,7 +693,11 @@ export function WorkspaceDialog() {
 
   const close = () => {
     if (submitting()) return
+    browseRequest += 1
+    setBrowserLoading(false)
+    setName('')
     setPath('')
+    if (pathField) pathField.value = ''
     setBrowserOpen(false)
     setBrowserError(null)
     setDirectoryListing(null)
@@ -633,23 +705,19 @@ export function WorkspaceDialog() {
   }
 
   const browse = async (requested_path?: string) => {
-    // The projected workspace can belong to a different host than verde-web,
-    // so an empty browser must start from the gateway machine's filesystem.
-    const target = requested_path ?? ((pathField?.value ?? path()).trim() || '/')
+    // Let the daemon choose its home directory when no folder is selected;
+    // the browser device's filesystem is unrelated to this workspace.
+    const target = requested_path ?? (pathField?.value ?? path()).trim()
+    const request = ++browseRequest
     setBrowserOpen(true)
     setBrowserLoading(true)
     setBrowserError(null)
     try {
       // HTTP on purpose: the shared websocket answers RPCs serially, so this
       // interactive browse must not queue behind a background projection sweep.
-      const response = await fetchRpc('web.directory.list', { path: target })
+      const response = await fetchRpc('workspace.directory.list', target ? { path: target } : {})
+      if (request !== browseRequest) return
       if (response.error || response.ok === false) {
-        if (response.error?.code === 'unsupported') {
-          setBrowseUnsupported(true)
-          setBrowserOpen(false)
-          setBrowserError('Folder browsing is turned off for web access. Type the full path, or tap a folder below to start from it.')
-          return
-        }
         setBrowserError(response.error?.message ?? 'could not list directory')
         return
       }
@@ -666,59 +734,65 @@ export function WorkspaceDialog() {
       setPath(listing.path)
       if (pathField) pathField.value = listing.path
     } catch (err) {
-      setBrowserError(err instanceof Error ? err.message : 'could not list directory')
+      if (request === browseRequest) setBrowserError(err instanceof Error ? err.message : 'could not list directory')
     } finally {
-      setBrowserLoading(false)
+      if (request === browseRequest) setBrowserLoading(false)
     }
   }
 
   const submit = async (event: SubmitEvent) => {
     event.preventDefault()
     const next = (pathField?.value ?? path()).trim()
-    if (!next || submitting()) return
+    if (submitting()) return
     setPath(next)
     setSubmitting(true)
-    const created = await store.createWorkspace(next)
+    const created = await store.createWorkspace(next, name())
     setSubmitting(false)
-    if (created) {
-      setPath('')
-      if (pathField) pathField.value = ''
-    }
+    if (created) close()
   }
 
   return (
     <Show when={store.workspaceDialogOpen()}>
       <div class="anim-fade fixed inset-0 z-40 bg-black/55" onClick={close}>
         <form
-          class="anim-pop mx-auto mt-[16vh] w-[32rem] max-w-[calc(100vw-2rem)] rounded-[10px] border border-[var(--border-muted)] bg-[var(--panel)] p-5 shadow-[0_24px_80px_rgba(0,0,0,0.55)]"
+          class="anim-pop mx-auto mt-[6vh] max-h-[88dvh] overflow-y-auto w-[32rem] max-w-[calc(100vw-2rem)] rounded-[10px] border border-[var(--border-muted)] bg-[var(--panel)] p-5 shadow-[0_24px_80px_rgba(0,0,0,0.55)]"
           onClick={(event) => event.stopPropagation()}
           onSubmit={submit}
         >
           <div class="wordmark text-[28px] leading-none">Add Workspace</div>
           <p class="mt-2 text-[13px] text-[var(--text-muted)]">
-            Enter the absolute path to a project directory on the machine running Verde.
+            Create a new workspace automatically, or browse for an existing folder on the machine running Verde.
           </p>
-          <div class="mt-4 flex gap-2">
+          <label class="mt-4 block text-[12px] text-[var(--text-muted)]" for="workspace-name">Workspace name</label>
+          <input
+            id="workspace-name"
+            class="mt-1 w-full rounded-[7px] border border-[var(--border-muted)] bg-[var(--chat-black)] px-3 py-2 text-[16px] outline-none lg:text-[13px] focus:border-[var(--accent)]"
+            placeholder="Optional name"
+            value={name()}
+            maxLength={256}
+            disabled={submitting()}
+            onInput={(event) => setName(event.currentTarget.value)}
+            onKeyDown={(event) => { if (event.key === 'Escape') close() }}
+          />
+          <div class="mt-3 flex gap-2">
             <input
               ref={(node) => { pathField = node }}
               class="mono min-w-0 flex-1 rounded-[7px] border border-[var(--border-muted)] bg-[var(--chat-black)] px-3 py-2 text-[16px] outline-none lg:text-[13px] focus:border-[var(--accent)]"
               aria-label="Workspace path"
-              placeholder="/path/to/project"
-              autofocus
+              placeholder="Optional folder path"
               onInput={(event) => setPath(event.currentTarget.value)}
               onKeyDown={(event) => {
                 if (event.key === 'Escape') close()
               }}
             />
-            <Show when={!browseUnsupported()}>
-              <button
-                type="button"
-                class="shrink-0 rounded-[7px] border border-[var(--border-muted)] px-3 py-2 text-[13px] hover:bg-[var(--accent-hover)]"
-                onClick={() => void browse()}
-              >
-                Browse…
-              </button>
-            </Show>
+            <button
+              type="button"
+              class="shrink-0 rounded-[7px] border border-[var(--border-muted)] px-3 py-2 text-[13px] hover:bg-[var(--accent-hover)]"
+              disabled={submitting() || browserLoading()}
+              onClick={() => void browse()}
+            >
+              Browse…
+            </button>
           </div>
           <Show when={parentFolders().length > 0}>
             <div class="mt-2 flex flex-wrap gap-1.5">
@@ -731,8 +805,8 @@ export function WorkspaceDialog() {
                       setPath(folder)
                       if (pathField) {
                         pathField.value = folder
-                        pathField.focus()
                       }
+                      void browse(folder)
                     }}
                   >
                     {folder}
@@ -768,7 +842,7 @@ export function WorkspaceDialog() {
                     {(directory) => (
                       <button
                         type="button"
-                        class="flex w-full items-center gap-2 rounded-[5px] px-3 py-1.5 text-left text-[13px] hover:bg-[var(--accent-hover)]"
+                        class="flex min-h-[44px] w-full items-center gap-2 rounded-[5px] px-3 py-2 text-left text-[13px] hover:bg-[var(--accent-hover)]"
                         onClick={() => void browse(directory.path)}
                       >
                         <span class="text-[var(--accent)]">▸</span>
@@ -798,9 +872,9 @@ export function WorkspaceDialog() {
             <button
               type="submit"
               class="rounded-[7px] bg-[var(--accent)] px-4 py-2 text-[13px] text-white disabled:opacity-50"
-              disabled={!path().trim() || submitting()}
+              disabled={submitting() || browserLoading()}
             >
-              {submitting() ? 'Adding…' : 'Add Workspace'}
+              {submitting() ? 'Adding…' : path().trim() ? 'Add Workspace' : 'Create Workspace'}
             </button>
           </div>
         </form>

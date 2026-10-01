@@ -20,6 +20,9 @@ const repository_path = @import("../daemon/repository_path.zig");
 const shell_command = @import("../daemon/shell_command.zig");
 const bang_commands = @import("../workspace/bang_commands.zig");
 const workspace_file_search = @import("../daemon/workspace_file_search.zig");
+const git_changes = @import("../daemon/git_changes.zig");
+const git_changes_protocol = headless.git_changes_protocol;
+const workspace_folders = @import("../workspace/folders.zig");
 const browser_cookie_import = @import("../daemon/browser_cookie_import.zig");
 const access_store = @import("../daemon/access_store.zig");
 const connect_auth = @import("../daemon/connect_auth.zig");
@@ -1888,6 +1891,9 @@ const ChatTurn = struct {
     status: ChatTurnStatus = .running,
     consumed: bool = false,
     worker_done: bool = false,
+    // Durable completion may precede parent delivery. GC must not join a
+    // worker under the daemon lock until it has finished using that lock.
+    worker_exited: bool = false,
     /// True from turn acceptance (when the store is open) until the store
     /// receipt returns, so consume cannot race a pre-commit terminal status.
     durability_pending: bool = false,
@@ -1929,6 +1935,8 @@ const ChatTurn = struct {
     pending_approval: ?PendingApproval = null,
     approval_call_id: ?[]u8 = null,
     approval_decision: ?ApprovalDecision = null,
+    /// Working-tree state when the provider started; worker thread only.
+    git_start_snapshot: ?git_changes.TurnSnapshot = null,
 
     fn deinit(self: *ChatTurn, allocator: std.mem.Allocator) void {
         if (self.worker_thread) |worker_thread| {
@@ -1970,6 +1978,7 @@ const ChatTurn = struct {
         if (self.error_message) |value| allocator.free(value);
         if (self.pending_approval) |*approval| approval.deinit(allocator);
         if (self.approval_call_id) |value| allocator.free(value);
+        if (self.git_start_snapshot) |*snapshot| snapshot.deinit();
         allocator.destroy(self);
     }
 
@@ -2442,6 +2451,8 @@ pub const Daemon = struct {
     /// File indexes never hold the daemon/store locks while scanning or searching.
     file_search_mutex: ParkingMutex = .{},
     file_search_indexes: workspace_file_search.IndexCache = .{},
+    /// Per-chat git change attribution and open commit reviews.
+    git_changes: GitChangesState,
     /// Serializes workspace close with chat-turn admission. Taken before
     /// lockDaemon/store locks, never while holding them.
     workspace_lifecycle_mutex: ParkingMutex = .{},
@@ -2522,11 +2533,13 @@ pub const Daemon = struct {
             .test_slow_io_delay_ms = slowIoDelayMsFromEnv(allocator),
             .test_retention_override_ms = retentionOverrideMsFromEnv(allocator),
             .journal = .{ .max_entries = journalEntryCapFromEnv(allocator) },
+            .git_changes = .init(allocator),
         };
     }
 
     pub fn deinit(self: *Daemon) void {
         self.file_search_indexes.deinit(self.allocator);
+        self.git_changes.deinit();
         if (self.pref_path.len != 0) self.allocator.free(self.pref_path);
         self.allocator.free(self.runtime_id);
         self.allocator.free(self.instance_id);
@@ -2655,7 +2668,7 @@ pub const Daemon = struct {
             const turn = self.chat_turns.items[index];
             lockTurn(turn);
             // Never drop a turn while its store commit is still in flight.
-            const remove = turn.consumed and turn.worker_done and !turn.durability_pending;
+            const remove = turn.consumed and chatTurnCanReclaim(turn);
             turn.mutex.unlock();
             if (remove) {
                 self.chat_turns.orderedRemove(index).deinit(self.allocator);
@@ -2909,6 +2922,7 @@ pub const Daemon = struct {
     fn handleMethodRequest(self: *Daemon, id_value: std.json.Value, method: []const u8, params: std.json.Value) ![]u8 {
         // Store methods own their drain/capability precedence and unlock
         // lockDaemon for SQLite work; route before the generic mutator drain gate.
+        if (std.mem.eql(u8, method, "workspace.create")) return try workspaceCreateResponse(self, id_value, params);
         if (std.mem.eql(u8, method, directory_browser.METHOD)) return try workspaceDirectoryListResponse(self, id_value, params);
         if (std.mem.eql(u8, method, "workspace.close")) return try self.workspaceCloseResponse(id_value, params);
         if (std.mem.eql(u8, method, "chat.subagent.open")) return try self.chatSubagentOpenResponse(id_value, params);
@@ -2986,6 +3000,14 @@ pub const Daemon = struct {
         if (std.mem.eql(u8, method, store_protocol.METHOD_CONFIG_UI_SET)) return try self.configUiSetResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.registry.METHOD_WORKSPACE_RESOLVE)) return try self.workspaceResolveResponse(id_value, params);
         if (std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_FILES_SEARCH)) return try workspaceFilesSearchResponse(self, id_value, params);
+        if (std.mem.eql(u8, method, git_changes_protocol.METHOD_SUMMARY)) return try gitChangesSummaryResponse(self, id_value, params);
+        if (std.mem.eql(u8, method, git_changes_protocol.METHOD_REVIEW)) return try gitChangesReviewResponse(self, id_value, params);
+        if (std.mem.eql(u8, method, git_changes_protocol.METHOD_COMMIT_MESSAGE)) return try gitChangesCommitMessageResponse(self, id_value, params);
+        if (std.mem.eql(u8, method, git_changes_protocol.METHOD_COMMIT)) return try gitChangesCommitResponse(self, id_value, params);
+        if (std.mem.eql(u8, method, git_changes_protocol.METHOD_PULL_PUSH)) return try gitChangesPullPushResponse(self, id_value, params);
+        if (std.mem.eql(u8, method, git_changes_protocol.METHOD_PUSH)) return try gitChangesPushResponse(self, id_value, params);
+        if (std.mem.eql(u8, method, git_changes_protocol.METHOD_STATUS)) return try gitChangesStatusResponse(self, id_value, params);
+        if (std.mem.eql(u8, method, git_changes_protocol.METHOD_CONFIG_COMMIT_SET)) return try configCommitSetResponse(self, id_value, params);
         if (std.mem.eql(u8, method, store_protocol.METHOD_BROWSER_COOKIE_SOURCES_LIST)) return try browserCookieSourcesListResponse(self, id_value);
         if (std.mem.eql(u8, method, store_protocol.METHOD_BROWSER_COOKIE_DOMAINS_LIST)) return try browserCookieDomainsListResponse(self, id_value, params);
         if (std.mem.eql(u8, method, store_protocol.METHOD_BROWSER_COOKIE_EXPORT)) return try browserCookieExportResponse(self, id_value, params);
@@ -4095,6 +4117,18 @@ pub const Daemon = struct {
                     .default_branch = value.repository.default_branch,
                 },
             } };
+        } else if (std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_REORDER)) {
+            const req = std.json.parseFromValueLeaky(
+                store_protocol.WorkspaceReorderRequest,
+                arena,
+                params,
+                .{ .ignore_unknown_fields = true },
+            ) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                decode_failed = true;
+                break :blk null;
+            };
+            if (req) |value| decoded_mutation = .{ .workspace_reorder = value };
         } else if (std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_REPOSITORY_REMOVE)) {
             const req = std.json.parseFromValueLeaky(
                 store_protocol.WorkspaceRepositoryRemoveRequest,
@@ -7446,6 +7480,20 @@ pub const Daemon = struct {
         const claimed_ptr: ?*const ClaimedAttachments = if (claimed_attachments) |*claim| claim else null;
         const turn = try createChatTurnFromParams(self.allocator, params, route_ptr, claimed_ptr);
         errdefer turn.deinit(self.allocator);
+        // Web and mobile clients may omit model_ref for fresh chats. Pin the
+        // user's remembered model so the stored thread (and every client's
+        // picker) names the model that actually runs.
+        if (turn.request.model_ref == null) {
+            self.config_mutex.lock();
+            defer self.config_mutex.unlock();
+            if (app_config.loadAppConfig(self.allocator)) |loaded| {
+                var config = loaded;
+                defer config.deinit(self.allocator);
+                try applyRememberedModelDefault(self.allocator, &turn.request, &config);
+            } else |err| {
+                log.warn("chat turn model default config load failed err={s}", .{@errorName(err)});
+            }
+        }
         // Wire the wake path before the turn is reachable by any worker.
         turn.daemon = self;
         // workspace.close samples chat_turns under this mutex, so admission
@@ -7810,12 +7858,19 @@ pub const Daemon = struct {
             .pi => .{ .pi = .{ .cwd = owned_project_path } },
             else => .{ .claude = .{ .cwd = owned_project_path } },
         };
+        // Set only when the provider provably never received the steer (no
+        // connection, no steerable turn, or an explicit refusal). Those can
+        // safely fall back to a queued next turn instead of staying uncertain.
+        var definitely_not_delivered = false;
         const provider_accepted = if (use_stub) blk: {
             if (provider_invocation_count) |count| count.* += 1;
             if (steer_invocation_capture) |capture| capture.record(steer_provider, owned_provider_thread_id, owned_provider_turn_id);
             break :blk std.mem.indexOf(u8, prompt, "reject steer") == null;
         } else blk: {
-            var client = harness.connect(self.allocator, steer_config) catch break :blk false;
+            var client = harness.connect(self.allocator, steer_config) catch {
+                definitely_not_delivered = true;
+                break :blk false;
+            };
             defer client.deinit();
             const images = try self.allocator.alloc(harness.types.ImageAttachment, image_paths.len);
             defer self.allocator.free(images);
@@ -7825,12 +7880,22 @@ pub const Daemon = struct {
                 .turn_id = owned_provider_turn_id,
                 .prompt = prompt,
                 .images = images,
-            }) catch break :blk false;
+            }) catch |err| {
+                definitely_not_delivered = err == error.SteerNotDelivered;
+                break :blk false;
+            };
             break :blk true;
         };
 
         lockTurn(turn);
         const audit_index = findSteerAuditIndex(turn, steer_id) orelse unreachable;
+        if (!provider_accepted and definitely_not_delivered) {
+            // Release the identity so the client may queue the same content.
+            var removed = turn.steers.orderedRemove(audit_index);
+            removed.deinit(self.allocator);
+            turn.mutex.unlock();
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_state", "turn cannot accept steering now");
+        }
         if (!provider_accepted) {
             // Provider errors include lost acknowledgements after acceptance.
             // Keep the identity reserved so retries never contact it twice.
@@ -7952,7 +8017,7 @@ pub const Daemon = struct {
                     "turn durability is still pending",
                 );
             }
-            const can_remove = turn.worker_done;
+            const can_remove = chatTurnCanReclaim(turn);
             turn.consumed = true;
             turn.mutex.unlock();
             if (can_remove) self.chat_turns.orderedRemove(index).deinit(self.allocator);
@@ -9011,8 +9076,16 @@ pub const Daemon = struct {
             "The model returned an empty title.",
         );
         defer self.allocator.free(generated_title);
+        const description = chat_threads.makeGeneratedThreadDescription(self.allocator, send_result.reply_text) catch null;
+        defer if (description) |value| self.allocator.free(value);
+        if (description) |value| {
+            if (request.workspace_id) |workspace_id| if (request.local_thread_id) |local_thread_id| {
+                storeThreadDescription(self, workspace_id, local_thread_id, value);
+            };
+        }
         return try okValueResponse(self.allocator, id_value, headless.providers_protocol.TitleGenerateResult{
             .title = generated_title,
+            .description = description,
         });
     }
 
@@ -10145,6 +10218,7 @@ fn isStoreMethod(method: []const u8) bool {
     return std.mem.eql(u8, method, store_protocol.METHOD_STATE_SNAPSHOT_REPLACE) or
         std.mem.eql(u8, method, store_protocol.METHOD_APP_STATE_SET) or
         std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_UPSERT) or
+        std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_REORDER) or
         std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_REPOSITORY_UPSERT) or
         std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_REPOSITORY_REMOVE) or
         std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_REPOSITORY_DEFAULT_SET) or
@@ -10254,6 +10328,7 @@ fn storeMutationCommittedHook(context: *anyopaque, mutation: *const daemon_store
         },
         .app_state_set => daemon.appendJournalEntry(.workspace, "*", null, revision),
         .workspace_upsert => |request| daemon.appendJournalEntry(.workspace, request.workspace.workspace_id, request.workspace.workspace_id, revision),
+        .workspace_reorder => daemon.appendJournalEntry(.workspace, "*", null, revision),
         .workspace_repository_upsert => |request| daemon.appendJournalEntry(.workspace, request.workspace_id, request.workspace_id, revision),
         .workspace_repository_remove => |request| daemon.appendJournalEntry(.workspace, request.workspace_id, request.workspace_id, revision),
         .workspace_default_repository_set => |request| daemon.appendJournalEntry(.workspace, request.workspace_id, request.workspace_id, revision),
@@ -10337,6 +10412,7 @@ fn mutationHeader(mutation: daemon_store.Mutation) store_protocol.MutationHeader
         .snapshot_replace => |request| request.mutation,
         .app_state_set => |request| request.mutation,
         .workspace_upsert => |request| request.mutation,
+        .workspace_reorder => |request| request.mutation,
         .workspace_repository_upsert => |request| request.mutation,
         .workspace_repository_remove => |request| request.mutation,
         .workspace_default_repository_set => |request| request.mutation,
@@ -10512,6 +10588,7 @@ fn maybeInitStoreService(daemon: *Daemon) !void {
     errdefer service.store.deinit();
     const identity = initialized.takeIdentity();
     replaceDaemonRuntimeIdentity(daemon, identity);
+    gitChangesLoadLedger(daemon, effective_dir.path);
     // M5-P2 journal hook: every durable commit (mutations AND turn commits)
     // publishes identity entries post-commit. Installed before the service is
     // published so no committed write can slip past the journal.
@@ -11543,13 +11620,16 @@ fn loadThreadListResult(
         \\       t.provider_thread_id, t.model_ref, t.reasoning_effort, t.reasoning_variant,
         \\       t.fast_mode, t.access_mode, t.provider, t.harness, t.sort_index, t.cwd,
         \\       t.profile_id, t.runtime_id, t.repository_id, t.repository_cwd,
-        \\       w.workspace_id, t.open
+        \\       w.workspace_id, t.open, coalesce(d.description, '')
         \\from threads t
         \\join workspaces w on w.id = t.workspace_id
+        \\left join thread_descriptions d
+        \\  on d.workspace_id = w.workspace_id and d.local_thread_id = t.local_thread_id
         \\where t.local_thread_id is not null
         \\  and (?1 = '' or w.workspace_id = ?1)
         \\  and (?4 < 0 or t.open = ?4)
-        \\  and (?5 = '' or instr(lower(t.title), lower(?5)) > 0)
+        \\  and (?5 = '' or instr(lower(t.title), lower(?5)) > 0
+        \\       or instr(lower(coalesce(d.description, '')), lower(?5)) > 0)
         \\order by
         \\  case when ?6 = 1 then -(case when t.last_activity_at >= 1000000000000
         \\    then t.last_activity_at / 1000 else coalesce(t.last_activity_at, 0) end)
@@ -11587,9 +11667,12 @@ fn loadThreadListResult(
         errdefer if (repository_cwd) |value| allocator.free(value);
         const item_workspace_id = allocator.dupe(u8, row.text(19)) catch return error.OutOfMemory;
         errdefer allocator.free(item_workspace_id);
+        const description = allocator.dupe(u8, row.text(21)) catch return error.OutOfMemory;
+        errdefer allocator.free(description);
         items.append(allocator, .{
             .local_thread_id = local_thread_id,
             .title = title,
+            .description = description,
             .workspace_id = item_workspace_id,
             .open = row.int(20) != 0,
             .sort_index = std.math.cast(usize, row.int(13)) orelse 0,
@@ -11646,6 +11729,7 @@ fn freeThreadListResult(allocator: std.mem.Allocator, result: store_protocol.Thr
 fn freeThreadListItem(allocator: std.mem.Allocator, item: store_protocol.ThreadListItem) void {
     allocator.free(item.local_thread_id);
     allocator.free(item.title);
+    allocator.free(item.description);
     allocator.free(item.workspace_id);
     if (item.provider_thread_id) |value| allocator.free(value);
     if (item.model_ref) |value| allocator.free(value);
@@ -11943,6 +12027,9 @@ fn configSnapshotFromApp(allocator: std.mem.Allocator, config: *const app_config
             .favorite_models = favorites,
             .title_provider = @tagName(config.chat_title_provider),
             .title_model = config.chatTitleModel(),
+            .commit_message_provider = @tagName(config.commit_message_provider),
+            .commit_message_model = if (config.commit_message_provider == .auto) null else config.commit_message_model,
+            .commit_default_action = @tagName(config.commit_default_action),
         },
     };
 }
@@ -13094,7 +13181,7 @@ const ServerRequestClass = enum { slow_registry, store, unlocked_method, normal 
 fn methodRunsUnlocked(method: []const u8) bool {
     // M4-P4: ledger identity guard on accept must read SQLite under the store
     // mutex only; the `.normal` outer lockDaemon window cannot nest that work.
-    return std.mem.eql(u8, method, "workspace.close") or std.mem.eql(u8, method, "chat.subagent.open") or
+    return std.mem.eql(u8, method, "workspace.create") or std.mem.eql(u8, method, "workspace.close") or std.mem.eql(u8, method, "chat.subagent.open") or
         std.mem.eql(u8, method, directory_browser.METHOD) or
         std.mem.startsWith(u8, method, "chat.links.") or std.mem.startsWith(u8, method, "chat.tasks.") or
         // Browser history is per-keystroke SQLite work under the store mutex
@@ -13133,6 +13220,10 @@ fn methodRunsUnlocked(method: []const u8) bool {
         // Composer file search resolves its route under short lockDaemon/store
         // windows, then lists files (git subprocess/walk) with no lock held.
         std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_FILES_SEARCH) or
+        // Git review/commit and commit-message generation run git and a
+        // provider with no daemon lock; state sits behind git_changes.mutex.
+        std.mem.startsWith(u8, method, "git.changes.") or
+        std.mem.eql(u8, method, git_changes_protocol.METHOD_CONFIG_COMMIT_SET) or
         std.mem.eql(u8, method, store_protocol.METHOD_BROWSER_COOKIE_SOURCES_LIST) or
         std.mem.eql(u8, method, store_protocol.METHOD_BROWSER_COOKIE_DOMAINS_LIST) or
         std.mem.eql(u8, method, store_protocol.METHOD_BROWSER_COOKIE_EXPORT) or
@@ -14665,6 +14756,107 @@ fn browserHistoryResponse(daemon: *Daemon, id_value: std.json.Value, method: []c
     return try okValueResponse(allocator, id_value, .{ .cleared = true });
 }
 
+/// Create a managed workspace or import a host directory without Desktop Live.
+/// The lifecycle lock serializes directory allocation with workspace closure.
+fn workspaceCreateResponse(daemon: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+    const allocator = daemon.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Request = struct { path: []const u8 = "", label: []const u8 = "", mutation: store_protocol.MutationHeader };
+    const request = std.json.parseFromValueLeaky(Request, arena, params, .{ .ignore_unknown_fields = true }) catch
+        return try errorResponseAlloc(allocator, id_value, "invalid_params", "workspace.create requires mutation metadata");
+    if (request.mutation.request_key.len == 0 or request.mutation.client_id.len == 0) return try errorResponseAlloc(allocator, id_value, "invalid_params", "missing mutation identity");
+    const requested_label = std.mem.trim(u8, request.label, &std.ascii.whitespace);
+    if (requested_label.len > 256 or !std.unicode.utf8ValidateSlice(requested_label)) return try errorResponseAlloc(allocator, id_value, "invalid_params", "workspace name is too long or invalid");
+    for (requested_label) |c| if (c < 0x20 or c == 0x7f) return try errorResponseAlloc(allocator, id_value, "invalid_params", "workspace name cannot contain control characters");
+    const requested_path = std.mem.trim(u8, request.path, &std.ascii.whitespace);
+    if (requested_path.len > 0 and !directory_browser.validPath(requested_path)) return try errorResponseAlloc(allocator, id_value, "invalid_params", "workspace path must be absolute without parent traversal");
+    daemon.workspace_lifecycle_mutex.lock();
+    defer daemon.workspace_lifecycle_mutex.unlock();
+    lockDaemon(daemon);
+    if (!daemon.accepting_mutations) {
+        daemon.mutex.unlock();
+        return try errorResponseAlloc(allocator, id_value, "invalid_state", "daemon is preparing shutdown");
+    }
+    if (daemon.registry.client(request.mutation.client_id) == null) {
+        daemon.mutex.unlock();
+        return try errorResponseAlloc(allocator, id_value, "invalid_params", "unknown client_id");
+    }
+    const service = daemon.store_service orelse {
+        daemon.mutex.unlock();
+        return try storeErrorResponse(allocator, id_value, error.StoreUnavailable);
+    };
+    _ = service.in_flight.fetchAdd(1, .monotonic);
+    daemon.mutex.unlock();
+    defer _ = service.in_flight.fetchSub(1, .monotonic);
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const managed = requested_path.len == 0;
+    // Managed identities follow the logical request, so a retry reopens the
+    // same directory rather than allocating another workspace.
+    var workspace_id: []const u8 = if (managed) try std.fmt.allocPrint(arena, "{x}", .{std.hash.Wyhash.hash(0, request.mutation.request_key)}) else "";
+    var path: []const u8 = requested_path;
+    var label: []const u8 = "";
+    if (managed) {
+        lockStoreService(service);
+        defer service.mutex.unlock();
+        var existing = service.store.conn.rows("select path, label from workspaces where workspace_id = ?1", .{workspace_id}) catch return try storeErrorResponse(allocator, id_value, error.StoreUnavailable);
+        defer existing.deinit();
+        if (existing.next()) |row| {
+            path = try arena.dupe(u8, row.text(0));
+            label = try arena.dupe(u8, row.text(1));
+        }
+        if (existing.err) |_| return try storeErrorResponse(allocator, id_value, error.StoreUnavailable);
+    }
+    var created_directory = false;
+    defer if (created_directory) std.Io.Dir.cwd().deleteTree(io, path) catch {};
+    if (managed and path.len == 0) {
+        if (daemon.pref_path.len == 0) return try errorResponseAlloc(allocator, id_value, "invalid_state", "Verde data directory is unavailable");
+        const pref = std.mem.trimEnd(u8, daemon.pref_path, "/\\");
+        const data_root = if (std.mem.eql(u8, std.fs.path.basename(pref), "Native")) std.fs.path.dirname(pref) orelse pref else pref;
+        const root = try std.fs.path.join(arena, &.{ data_root, "workspaces" });
+        try std.Io.Dir.cwd().createDirPath(io, root);
+        var number: usize = 1;
+        while (number <= 100000) : (number += 1) {
+            path = try std.fmt.allocPrint(arena, "{s}/workspace-{d}", .{ root, number });
+            std.Io.Dir.cwd().createDir(io, path, .default_dir) catch |err| switch (err) {
+                error.PathAlreadyExists => continue,
+                else => return try errorResponseAlloc(allocator, id_value, "directory_unavailable", "could not create workspace folder"),
+            };
+            created_directory = true;
+            label = try std.fmt.allocPrint(arena, "Workspace {d}", .{number});
+            try @import("../workspace/folders.zig").initManaged(allocator, path);
+            break;
+        } else return try errorResponseAlloc(allocator, id_value, "directory_unavailable", "could not allocate workspace folder");
+    } else if (!managed) {
+        path = std.Io.Dir.cwd().realPathFileAlloc(io, path, arena) catch return try errorResponseAlloc(allocator, id_value, "not_found", "workspace directory not found");
+        const dir = std.Io.Dir.openDirAbsolute(io, path, .{}) catch return try errorResponseAlloc(allocator, id_value, "not_found", "workspace path is not a directory");
+        dir.close(io);
+        workspace_id = try std.fmt.allocPrint(arena, "{x}", .{std.hash.Wyhash.hash(0, path)});
+        label = std.fs.path.basename(path);
+        lockStoreService(service);
+        defer service.mutex.unlock();
+        var existing = service.store.conn.rows("select workspace_id, label from workspaces where path = ?1", .{path}) catch return try storeErrorResponse(allocator, id_value, error.StoreUnavailable);
+        defer existing.deinit();
+        if (existing.next()) |row| {
+            workspace_id = try arena.dupe(u8, row.text(0));
+            label = try arena.dupe(u8, row.text(1));
+        }
+        if (existing.err) |_| return try storeErrorResponse(allocator, id_value, error.StoreUnavailable);
+    }
+    if (requested_label.len > 0) label = requested_label;
+    const write = blk: {
+        lockStoreService(service);
+        defer service.mutex.unlock();
+        if (service.draining) return try errorResponseAlloc(allocator, id_value, "invalid_state", "store is draining");
+        break :blk service.store.upsertWorkspace(.{ .mutation = request.mutation, .workspace = .{ .workspace_id = workspace_id, .path = path, .label = label } }) catch |err| return try storeErrorResponse(allocator, id_value, err);
+    };
+    created_directory = false;
+    return try okValueResponse(allocator, id_value, .{ .workspace_id = workspace_id, .path = path, .label = label, .store_revision = write.store_revision });
+}
+
 fn workspaceDirectoryListResponse(daemon: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
     return workspaceDirectoryListWithEnvironment(daemon, id_value, params, if (std.c.getenv("HOME")) |value| std.mem.span(value) else null, if (std.c.getenv(directory_browser.ROOTS_ENV)) |value| std.mem.span(value) else null);
 }
@@ -14672,7 +14864,7 @@ fn workspaceDirectoryListResponse(daemon: *Daemon, id_value: std.json.Value, par
 fn workspaceDirectoryListWithEnvironment(daemon: *Daemon, id_value: std.json.Value, params: std.json.Value, home: ?[]const u8, configured_roots: ?[]const u8) ![]u8 {
     const allocator = daemon.allocator;
     const path = if (params == .object) jsonString(params.object.get("path") orelse .null) else null;
-    if (path == null or !directory_browser.validPath(path.?)) {
+    if (path != null and !directory_browser.validPath(path.?)) {
         return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "directory path must be absolute without parent traversal");
     }
     var arena_state: std.heap.ArenaAllocator = .init(allocator);
@@ -14712,7 +14904,7 @@ fn workspaceDirectoryListWithEnvironment(daemon: *Daemon, id_value: std.json.Val
         var paths = std.mem.tokenizeScalar(u8, configured, ':');
         while (paths.next()) |root| try directory_browser.appendRoot(arena, io, &roots, root);
     }
-    const result = directory_browser.list(arena, io, roots.items, path.?) catch |err| return switch (err) {
+    const result = directory_browser.list(arena, io, roots.items, path orelse (if (roots.items.len > 0) roots.items[0] else return try errorResponseAlloc(allocator, id_value, "not_found", "no folders are available"))) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.ResponseTooLarge => error.ResponseTooLarge,
         error.FileNotFound, error.NotDir => try errorResponseAlloc(allocator, id_value, "not_found", "directory not found"),
@@ -14779,6 +14971,1213 @@ fn workspaceFilesSearchResponse(daemon: *Daemon, id_value: std.json.Value, param
         .total_files = results.total_files,
         .truncated = results.truncated,
         .source = @tagName(results.source),
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Per-chat git change attribution and user-initiated commits.
+//
+// Turns snapshot every reachable repository at start and end; the ledger
+// claims changed files for the turn's chat. Reviews, commit messages and
+// commits run git and providers with no daemon/store lock held; ledger and
+// review state sit behind `daemon.git_changes.mutex` only.
+
+const GitChangesState = struct {
+    mutex: ParkingMutex = .{},
+    allocator: std.mem.Allocator,
+    ledger: git_changes.Ledger,
+    reviews: git_changes.Reviews,
+    nonce: std.atomic.Value(u64) = .init(1),
+    /// Unclear claims were settled from stored transcripts (once per daemon).
+    repaired: std.atomic.Value(bool) = .init(false),
+    /// Repositories surfaced through `git.changes.status`, so push and
+    /// pull & push accept a chat's route repository before any claim.
+    known_roots: std.ArrayList(GitKnownRoot) = .empty,
+    /// `git.changes.push` results by client `request_id`.
+    push_memos: std.ArrayList(GitPushMemo) = .empty,
+
+    fn init(allocator: std.mem.Allocator) GitChangesState {
+        return .{ .allocator = allocator, .ledger = .init(allocator), .reviews = .init(allocator) };
+    }
+
+    fn deinit(self: *GitChangesState) void {
+        self.ledger.deinit();
+        self.reviews.deinit();
+        for (self.known_roots.items) |*item| item.deinit(self.allocator);
+        self.known_roots.deinit(self.allocator);
+        for (self.push_memos.items) |*item| item.deinit(self.allocator);
+        self.push_memos.deinit(self.allocator);
+    }
+};
+
+const GIT_KNOWN_ROOTS_MAX: usize = 64;
+const GIT_PUSH_MEMO_MAX: usize = 16;
+const GIT_PUSH_MEMO_TTL_MS: i64 = 10 * 60 * 1000;
+
+const GitKnownRoot = struct {
+    workspace_id: []u8,
+    root: []u8,
+
+    fn deinit(self: *GitKnownRoot, allocator: std.mem.Allocator) void {
+        allocator.free(self.workspace_id);
+        allocator.free(self.root);
+    }
+};
+
+const GitPushMemo = struct {
+    workspace_id: []u8,
+    request_id: []u8,
+    at_ms: i64,
+    /// Null while the push is running.
+    result_json: ?[]u8 = null,
+
+    fn deinit(self: *GitPushMemo, allocator: std.mem.Allocator) void {
+        allocator.free(self.workspace_id);
+        allocator.free(self.request_id);
+        if (self.result_json) |json| allocator.free(json);
+    }
+};
+
+const GIT_COMMIT_MESSAGE_DIFF_BUDGET: usize = 20 * 1024;
+
+/// Directories a turn may write: its cwd, the workspace path, and any extra
+/// configured workspace folders.
+fn gitChangesTurnPaths(arena: std.mem.Allocator, project_path: []const u8, cwd: ?[]const u8) ![]const []const u8 {
+    var paths: std.ArrayList([]const u8) = .empty;
+    if (cwd) |value| try paths.append(arena, value);
+    try paths.append(arena, project_path);
+    if (workspace_folders.resolve(arena, project_path)) |resolved| {
+        // Owned by the arena; no deinit needed beyond the arena.
+        for (resolved.roots) |root| try paths.append(arena, root);
+    } else |_| {}
+    return paths.items;
+}
+
+fn gitChangesBeginTurn(daemon: *Daemon, turn: *ChatTurn) void {
+    var arena_state = std.heap.ArenaAllocator.init(daemon.allocator);
+    defer arena_state.deinit();
+    const paths = gitChangesTurnPaths(arena_state.allocator(), turn.request.project_path, turn.request.cwd) catch return;
+    var snapshot = git_changes.captureSnapshot(daemon.allocator, paths) catch |err| {
+        log.warn("git change snapshot failed turn_id={s} err={s}", .{ turn.turn_id, @errorName(err) });
+        return;
+    };
+    if (snapshot.repos.len == 0) {
+        snapshot.deinit();
+        return;
+    }
+    daemon.git_changes.mutex.lock();
+    daemon.git_changes.ledger.beginTurn(turn.turn_id, &snapshot, .{
+        .workspace_id = turn.workspace_id,
+        .thread_id = turn.local_thread_id,
+        .cwd = turn.request.cwd orelse turn.request.project_path,
+    }) catch {
+        daemon.git_changes.mutex.unlock();
+        snapshot.deinit();
+        return;
+    };
+    daemon.git_changes.mutex.unlock();
+    // Only the turn worker touches the start snapshot.
+    turn.git_start_snapshot = snapshot;
+}
+
+fn gitChangesEndTurn(daemon: *Daemon, turn: *ChatTurn) void {
+    var start = turn.git_start_snapshot orelse return;
+    turn.git_start_snapshot = null;
+    defer start.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(daemon.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var roots: std.ArrayList([]const u8) = .empty;
+    for (start.repos) |repo| roots.append(arena, repo.root) catch break;
+    var end = git_changes.captureSnapshot(daemon.allocator, roots.items) catch |err| {
+        log.warn("git change end snapshot failed turn_id={s} err={s}", .{ turn.turn_id, @errorName(err) });
+        daemon.git_changes.mutex.lock();
+        daemon.git_changes.ledger.abandonTurn(turn.turn_id);
+        daemon.git_changes.mutex.unlock();
+        return;
+    };
+    defer end.deinit();
+
+    // Edit evidence was recorded on the ledger as the provider streamed.
+    daemon.git_changes.mutex.lock();
+    defer daemon.git_changes.mutex.unlock();
+    const changed = daemon.git_changes.ledger.endTurn(.{
+        .turn_id = turn.turn_id,
+        .workspace_id = turn.workspace_id,
+        .thread_id = turn.local_thread_id,
+        .cwd = turn.request.cwd orelse turn.request.project_path,
+        .hints = &.{},
+        .now_ms = nowMs(),
+    }, &start, &end) catch |err| blk: {
+        log.warn("git change attribution failed turn_id={s} err={s}", .{ turn.turn_id, @errorName(err) });
+        break :blk false;
+    };
+    if (changed) gitChangesPersistLocked(daemon);
+}
+
+/// Caller holds `daemon.git_changes.mutex`; the claims file is small.
+fn gitChangesPersistLocked(daemon: *Daemon) void {
+    const path = daemon.git_changes.ledger.persist_path orelse return;
+    const bytes = daemon.git_changes.ledger.encode(daemon.allocator) catch return;
+    defer daemon.allocator.free(bytes);
+    git_changes.writePersisted(daemon.allocator, path, bytes);
+}
+
+/// Record the files a provider event says the turn edited (diffs, file
+/// editing tools, and edits by subagents reported on the parent turn) as
+/// attribution evidence. Call with no turn or daemon lock held.
+fn gitChangesRecordEventHints(daemon: *Daemon, turn: *ChatTurn, event: harness.StreamEvent) void {
+    var arena_state = std.heap.ArenaAllocator.init(daemon.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var paths: std.ArrayList([]const u8) = .empty;
+    switch (event) {
+        .diff => |diff| for (diff.files) |file| paths.append(arena, file.path) catch return,
+        .tool_call => |tool| git_changes.collectToolHints(arena, .{
+            .kind = if (tool.kind) |kind| @tagName(kind) else null,
+            .input = tool.input,
+            .locations = tool.locations,
+            .transcript = tool.transcript,
+        }, &paths) catch return,
+        .message => return,
+    }
+    if (paths.items.len == 0) return;
+    daemon.git_changes.mutex.lock();
+    defer daemon.git_changes.mutex.unlock();
+    daemon.git_changes.ledger.recordHints(turn.turn_id, paths.items);
+}
+
+/// Stored transcript rows scanned per chat when repairing unclear claims.
+const GIT_REPAIR_ROWS_PER_THREAD: i64 = 400;
+/// Largest stored row body read for evidence (subagent transcripts).
+const GIT_REPAIR_BODY_LIMIT: usize = 2 * 1024 * 1024;
+/// Stored row bytes read across all chats in one repair.
+const GIT_REPAIR_TOTAL_BYTES: usize = 48 * 1024 * 1024;
+
+/// Once per daemon: settle unclear claims from the chats' stored tool rows,
+/// for claims made before tool events produced live evidence.
+fn gitChangesRepairOnce(daemon: *Daemon) void {
+    if (daemon.git_changes.repaired.swap(true, .acq_rel)) return;
+    var arena_state = std.heap.ArenaAllocator.init(daemon.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const candidates = blk: {
+        daemon.git_changes.mutex.lock();
+        defer daemon.git_changes.mutex.unlock();
+        break :blk daemon.git_changes.ledger.repairCandidates(arena) catch return;
+    };
+    if (candidates.len == 0) return;
+    const service = gitChangesPinStore(daemon) orelse {
+        daemon.git_changes.repaired.store(false, .release);
+        return;
+    };
+    defer _ = service.in_flight.fetchSub(1, .monotonic);
+
+    const StoredRow = struct { kind: ?[]const u8, body: []const u8 };
+    var budget: usize = GIT_REPAIR_TOTAL_BYTES;
+    var evidence: std.ArrayList(git_changes.ThreadEvidence) = .empty;
+    for (candidates) |candidate| {
+        // Copy rows out under the store lock; parse with no lock held.
+        var stored: std.ArrayList(StoredRow) = .empty;
+        {
+            lockStoreService(service);
+            defer service.mutex.unlock();
+            var rows = service.store.conn.rows(
+                \\select m.tool_call_kind, m.body from messages m
+                \\join threads t on t.id = m.thread_id
+                \\join workspaces w on w.id = t.workspace_id
+                \\where w.workspace_id = ?1 and t.local_thread_id = ?2
+                \\  and (m.tool_call_kind in (1, 2, 3, 10) or substr(m.body, 1, 13) = 'VERDE_DIFF_V2')
+                \\order by m.sort_index desc limit ?3
+            , .{ candidate.workspace_id, candidate.thread_id, GIT_REPAIR_ROWS_PER_THREAD }) catch continue;
+            defer rows.deinit();
+            while (rows.next()) |row| {
+                const body = row.text(1);
+                if (body.len > GIT_REPAIR_BODY_LIMIT or body.len > budget) continue;
+                budget -= body.len;
+                const kind: ?[]const u8 = if (row.nullableInt(0)) |code| switch (code) {
+                    1 => "edit",
+                    2 => "delete",
+                    3 => "move",
+                    10 => "subagent",
+                    else => null,
+                } else null;
+                const owned = arena.dupe(u8, body) catch break;
+                stored.append(arena, .{ .kind = kind, .body = owned }) catch break;
+            }
+        }
+        var hints: std.ArrayList([]const u8) = .empty;
+        for (stored.items) |row| git_changes.collectStoredRowHints(arena, row.kind, row.body, &hints) catch break;
+        evidence.append(arena, .{
+            .workspace_id = candidate.workspace_id,
+            .thread_id = candidate.thread_id,
+            .hints = hints.items,
+        }) catch return;
+    }
+
+    daemon.git_changes.mutex.lock();
+    defer daemon.git_changes.mutex.unlock();
+    if (daemon.git_changes.ledger.repairUnclear(evidence.items)) {
+        log.info("git change claims repaired from stored tool events", .{});
+        gitChangesPersistLocked(daemon);
+    }
+}
+
+fn gitChangesLoadLedger(daemon: *Daemon, dir: []const u8) void {
+    const path = std.fs.path.join(daemon.allocator, &.{ dir, git_changes.LEDGER_FILE_NAME }) catch return;
+    defer daemon.allocator.free(path);
+    daemon.git_changes.mutex.lock();
+    defer daemon.git_changes.mutex.unlock();
+    daemon.git_changes.ledger.load(path) catch |err| log.warn("git change claims load failed err={s}", .{@errorName(err)});
+}
+
+/// Pin the store for short read windows from unlocked handlers.
+fn gitChangesPinStore(daemon: *Daemon) ?*StoreService {
+    lockDaemon(daemon);
+    defer daemon.mutex.unlock();
+    const service = daemon.store_service orelse return null;
+    _ = service.in_flight.fetchAdd(1, .monotonic);
+    return service;
+}
+
+fn gitChangesThreadTitle(arena: std.mem.Allocator, service: ?*StoreService, workspace_id: []const u8, thread_id: []const u8) []const u8 {
+    const svc = service orelse return "";
+    lockStoreService(svc);
+    defer svc.mutex.unlock();
+    const row = (svc.store.conn.row(
+        "select t.title from threads t join workspaces w on w.id = t.workspace_id where w.workspace_id = ?1 and t.local_thread_id = ?2",
+        .{ workspace_id, thread_id },
+    ) catch return "") orelse return "";
+    defer row.deinit();
+    return arena.dupe(u8, row.text(0)) catch "";
+}
+
+fn gitChangesThreadIdle(service: ?*StoreService, workspace_id: []const u8, thread_id: []const u8) bool {
+    const svc = service orelse return true;
+    lockStoreService(svc);
+    defer svc.mutex.unlock();
+    svc.store.requireIdleThread(workspace_id, thread_id) catch return false;
+    return true;
+}
+
+fn gitChangesSummaryResponse(daemon: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+    const allocator = daemon.allocator;
+    gitChangesRepairOnce(daemon);
+    var parsed = parseDaemonParams(git_changes_protocol.SummaryRequest, allocator, params) catch
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid git changes summary request");
+    defer parsed.deinit();
+    const workspace_id = parsed.value.workspace_id;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const RepoFacts = struct {
+        root: []const u8,
+        claims: []git_changes.ClaimView,
+        entries: ?[]git_changes.StatusEntry = null,
+        stats: std.StringHashMapUnmanaged(git_changes.LineStat) = .empty,
+    };
+    var repos: std.ArrayList(RepoFacts) = .empty;
+    {
+        daemon.git_changes.mutex.lock();
+        defer daemon.git_changes.mutex.unlock();
+        for (try daemon.git_changes.ledger.workspaceRepos(arena, workspace_id)) |root| {
+            try repos.append(arena, .{ .root = root, .claims = try daemon.git_changes.ledger.claimsForRepo(arena, root) });
+        }
+    }
+
+    // git status/numstat with no lock held.
+    var git = git_changes.Git.init(arena) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "git is not available"),
+    };
+    defer git.deinit();
+    for (repos.items) |*repo| {
+        repo.entries = (git_changes.dirtyPaths(&git, repo.root) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => null,
+        }) orelse continue;
+        repo.stats = git_changes.lineStats(&git, repo.root, repo.entries.?) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => .empty,
+        };
+    }
+
+    // Drop claims for files that are clean again (committed or reverted).
+    const revision = blk: {
+        daemon.git_changes.mutex.lock();
+        defer daemon.git_changes.mutex.unlock();
+        var pruned = false;
+        for (repos.items) |repo| {
+            const entries = repo.entries orelse continue;
+            if (daemon.git_changes.ledger.pruneRepoPaths(repo.root, entries)) pruned = true;
+        }
+        if (pruned) gitChangesPersistLocked(daemon);
+        break :blk daemon.git_changes.ledger.revision;
+    };
+
+    var threads: std.ArrayList(git_changes_protocol.ThreadSummary) = .empty;
+    for (repos.items) |repo| {
+        const entries = repo.entries orelse continue;
+        for (repo.claims) |claim| {
+            if (!std.mem.eql(u8, claim.workspace_id, workspace_id)) continue;
+            var still_dirty = false;
+            for (entries) |entry| if (std.mem.eql(u8, entry.path, claim.path)) {
+                still_dirty = true;
+                break;
+            };
+            if (!still_dirty) continue;
+            var shared = false;
+            for (repo.claims) |other| {
+                if (std.mem.eql(u8, other.path, claim.path) and !std.mem.eql(u8, other.thread_id, claim.thread_id)) shared = true;
+            }
+            const summary = for (threads.items) |*item| {
+                if (std.mem.eql(u8, item.local_thread_id, claim.thread_id)) break item;
+            } else new_summary: {
+                try threads.append(arena, .{ .local_thread_id = claim.thread_id, .files = 0, .additions = 0, .deletions = 0, .attention = 0 });
+                break :new_summary &threads.items[threads.items.len - 1];
+            };
+            const stat = repo.stats.get(claim.path) orelse git_changes.LineStat{};
+            summary.files += 1;
+            summary.additions += stat.additions;
+            summary.deletions += stat.deletions;
+            if (shared or claim.unclear) summary.attention += 1;
+        }
+    }
+    return try okValueResponse(allocator, id_value, git_changes_protocol.SummaryResult{
+        .workspace_id = workspace_id,
+        .revision = revision,
+        .threads = threads.items,
+    });
+}
+
+/// `request` is a ReviewRequest or StatusRequest (same route fields).
+fn gitChangesRouteRoot(daemon: *Daemon, arena: std.mem.Allocator, request: anytype) ?[]const u8 {
+    var route_params: std.json.ObjectMap = .empty;
+    route_params.put(arena, "workspace_id", .{ .string = request.workspace_id }) catch return null;
+    if (request.relative_cwd) |value| route_params.put(arena, "relative_cwd", .{ .string = value }) catch return null;
+    if (request.project_path) |value| route_params.put(arena, "project_path", .{ .string = value }) catch return null;
+    if (request.cwd) |value| route_params.put(arena, "cwd", .{ .string = value }) catch return null;
+    route_params.put(arena, "repository_id", .{ .string = request.repository_id orelse store_protocol.PRIMARY_REPOSITORY_ID }) catch return null;
+    var route = (resolveChatExecutionRoute(daemon, .{ .object = route_params }) catch return null) orelse return null;
+    defer route.deinit(daemon.allocator);
+    return arena.dupe(u8, route.cwd orelse route.project_path) catch null;
+}
+
+fn gitChangesReviewResponse(daemon: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+    const allocator = daemon.allocator;
+    gitChangesRepairOnce(daemon);
+    var parsed = parseDaemonParams(git_changes_protocol.ReviewRequest, allocator, params) catch
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid git changes review request");
+    defer parsed.deinit();
+    const request = parsed.value;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Repositories: every one with claims in this workspace, plus the chat's
+    // own checkout so unassigned edits show before anything was attributed.
+    var roots: std.ArrayList([]const u8) = .empty;
+    {
+        daemon.git_changes.mutex.lock();
+        defer daemon.git_changes.mutex.unlock();
+        try roots.appendSlice(arena, try daemon.git_changes.ledger.workspaceRepos(arena, request.workspace_id));
+    }
+    if (gitChangesRouteRoot(daemon, arena, request)) |route_root| {
+        var git = git_changes.Git.init(arena) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "git is not available"),
+        };
+        defer git.deinit();
+        if (try git_changes.repoToplevel(&git, route_root)) |top| {
+            const seen = for (roots.items) |root| {
+                if (std.mem.eql(u8, root, top)) break true;
+            } else false;
+            if (!seen) try roots.append(arena, top);
+        }
+    }
+
+    var repo_claims: std.ArrayList(git_changes.RepoClaims) = .empty;
+    const review_id = blk: {
+        daemon.git_changes.mutex.lock();
+        defer daemon.git_changes.mutex.unlock();
+        for (roots.items) |root| {
+            try repo_claims.append(arena, .{ .root = root, .claims = try daemon.git_changes.ledger.claimsForRepo(arena, root) });
+        }
+        break :blk try daemon.git_changes.reviews.nextId(arena, nowMs());
+    };
+
+    const review = git_changes.buildReview(allocator, .{
+        .id = review_id,
+        .workspace_id = request.workspace_id,
+        .thread_id = request.local_thread_id,
+        .repos = repo_claims.items,
+        .now_ms = nowMs(),
+        .include_unassigned = request.include_unassigned,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "git changes could not be read"),
+    };
+
+    const service = gitChangesPinStore(daemon);
+    defer if (service) |svc| {
+        _ = svc.in_flight.fetchSub(1, .monotonic);
+    };
+    const turn_running = !gitChangesThreadIdle(service, request.workspace_id, request.local_thread_id);
+
+    var preview_budget = git_changes.PreviewBudget.init(request.hunk_budget_bytes);
+    var repos: std.ArrayList(git_changes_protocol.ReviewRepo) = .empty;
+    for (review.repos) |*repo| {
+        var files: std.ArrayList(git_changes_protocol.ReviewFile) = .empty;
+        for (repo.files) |*file| {
+            // Hunks beyond the response budget are omitted; the frozen patch
+            // is kept, so the file still commits whole.
+            const show_hunks = preview_budget.admit(file);
+            var others: std.ArrayList(git_changes_protocol.OtherThread) = .empty;
+            for (file.other_threads) |thread_id| try others.append(arena, .{
+                .local_thread_id = thread_id,
+                .title = gitChangesThreadTitle(arena, service, request.workspace_id, thread_id),
+            });
+            var hunks: std.ArrayList(git_changes_protocol.ReviewHunk) = .empty;
+            if (show_hunks) for (file.hunks, 0..) |hunk, index| try hunks.append(arena, .{
+                .index = @intCast(index),
+                .header = git_changes.hunkHeader(file, hunk),
+                .text = git_changes.hunkText(file, hunk),
+            });
+            try files.append(arena, .{
+                .path = file.path,
+                .status = @tagName(file.status),
+                .ownership = @tagName(file.ownership),
+                .other_threads = others.items,
+                .additions = file.additions,
+                .deletions = file.deletions,
+                .binary = file.binary,
+                .hunk_selectable = show_hunks and git_changes.hunkSelectable(file),
+                .preview_truncated = !file.binary and !show_hunks,
+                .hunks = hunks.items,
+            });
+        }
+        try repos.append(arena, .{
+            .root = repo.root,
+            .name = std.fs.path.basename(repo.root),
+            .branch = repo.branch,
+            .head = repo.head,
+            .default_branch = repo.status.default_branch,
+            .is_default_branch = repo.status.is_default_branch,
+            .upstream = repo.status.upstream,
+            .ahead = repo.status.ahead,
+            .behind = repo.status.behind,
+            .has_remote = repo.status.has_remote,
+            .files = files.items,
+        });
+    }
+
+    const default_action = blk: {
+        daemon.config_mutex.lock();
+        defer daemon.config_mutex.unlock();
+        var config = app_config.loadAppConfig(allocator) catch break :blk "commit";
+        defer config.deinit(allocator);
+        break :blk @tagName(config.commit_default_action);
+    };
+    const response = try okValueResponse(allocator, id_value, git_changes_protocol.ReviewResult{
+        .review_id = review.id,
+        .workspace_id = request.workspace_id,
+        .local_thread_id = request.local_thread_id,
+        .turn_running = turn_running,
+        .default_action = default_action,
+        .repos = repos.items,
+    });
+    errdefer allocator.free(response);
+
+    daemon.git_changes.mutex.lock();
+    defer daemon.git_changes.mutex.unlock();
+    _ = try daemon.git_changes.reviews.put(review, nowMs());
+    return response;
+}
+
+fn gitChangesReviewErrorResponse(allocator: std.mem.Allocator, id_value: std.json.Value) ![]u8 {
+    return try errorResponseAlloc(allocator, id_value, git_changes_protocol.ERR_REVIEW_EXPIRED, "This review expired. Reopen the changes to review them again.");
+}
+
+/// Pin a review for lock-free reading; pair with `gitChangesReleaseReview`.
+fn gitChangesAcquireReview(daemon: *Daemon, review_id: []const u8) ?*git_changes.Review {
+    daemon.git_changes.mutex.lock();
+    defer daemon.git_changes.mutex.unlock();
+    return daemon.git_changes.reviews.acquire(review_id);
+}
+
+fn gitChangesReleaseReview(daemon: *Daemon, review: *git_changes.Review) void {
+    daemon.git_changes.mutex.lock();
+    defer daemon.git_changes.mutex.unlock();
+    daemon.git_changes.reviews.release(review);
+}
+
+/// Answer with a result stored as JSON (idempotent replays).
+fn gitChangesReplayResponse(allocator: std.mem.Allocator, id_value: std.json.Value, json: []const u8) ![]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const value = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), json, .{});
+    return try okValueResponse(allocator, id_value, value);
+}
+
+/// Caller holds `daemon.git_changes.mutex`.
+fn gitChangesRememberRootLocked(daemon: *Daemon, workspace_id: []const u8, root: []const u8) void {
+    const state = &daemon.git_changes;
+    for (state.known_roots.items) |item| {
+        if (std.mem.eql(u8, item.workspace_id, workspace_id) and std.mem.eql(u8, item.root, root)) return;
+    }
+    if (state.known_roots.items.len >= GIT_KNOWN_ROOTS_MAX) {
+        var oldest = state.known_roots.orderedRemove(0);
+        oldest.deinit(state.allocator);
+    }
+    const owned_ws = state.allocator.dupe(u8, workspace_id) catch return;
+    const owned_root = state.allocator.dupe(u8, root) catch {
+        state.allocator.free(owned_ws);
+        return;
+    };
+    state.known_roots.append(state.allocator, .{ .workspace_id = owned_ws, .root = owned_root }) catch {
+        state.allocator.free(owned_ws);
+        state.allocator.free(owned_root);
+    };
+}
+
+/// Only repositories this workspace changed, reviewed, or inspected through
+/// `git.changes.status` may be pushed. Caller holds the git mutex.
+fn gitChangesRootKnownLocked(daemon: *Daemon, arena: std.mem.Allocator, workspace_id: []const u8, root: []const u8) !bool {
+    for (try daemon.git_changes.ledger.workspaceRepos(arena, workspace_id)) |candidate| {
+        if (std.mem.eql(u8, candidate, root)) return true;
+    }
+    for (daemon.git_changes.reviews.items.items) |review| {
+        if (std.mem.eql(u8, review.workspace_id, workspace_id) and review.findRepo(root) != null) return true;
+    }
+    for (daemon.git_changes.known_roots.items) |item| {
+        if (std.mem.eql(u8, item.workspace_id, workspace_id) and std.mem.eql(u8, item.root, root)) return true;
+    }
+    return false;
+}
+
+fn gitChangesSelectionSelected(selections: ?[]const git_changes_protocol.RepoSelection, root: []const u8, file: *const git_changes.ReviewFile) ?git_changes_protocol.FileSelection {
+    const chosen = selections orelse {
+        // Default: every file the chat owns.
+        if (file.ownership == .unassigned) return null;
+        return .{ .path = file.path };
+    };
+    for (chosen) |repo| {
+        if (!std.mem.eql(u8, repo.root, root)) continue;
+        for (repo.files) |selected| if (std.mem.eql(u8, selected.path, file.path)) return selected;
+    }
+    return null;
+}
+
+fn gitChangesCommitMessageResponse(daemon: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+    const allocator = daemon.allocator;
+    var parsed = parseDaemonParams(git_changes_protocol.CommitMessageRequest, allocator, params) catch
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid commit message request");
+    defer parsed.deinit();
+    const request = parsed.value;
+    const review = gitChangesAcquireReview(daemon, request.review_id) orelse return try gitChangesReviewErrorResponse(allocator, id_value);
+    defer gitChangesReleaseReview(daemon, review);
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Bounded diff of just the selected hunks.
+    var diff: std.ArrayList(u8) = .empty;
+    var first_root: ?[]const u8 = null;
+    var file_count: usize = 0;
+    for (review.repos) |*repo| {
+        for (repo.files) |*file| {
+            const selected = gitChangesSelectionSelected(request.selections, repo.root, file) orelse continue;
+            if (first_root == null) first_root = repo.root;
+            file_count += 1;
+            if (diff.items.len >= GIT_COMMIT_MESSAGE_DIFF_BUDGET) continue;
+            if (file.patch == null or file.binary) {
+                try diff.print(arena, "{s} {s} (binary or too large to show)\n", .{ @tagName(file.status), file.path });
+                continue;
+            }
+            if (selected.hunks) |indices| {
+                try diff.appendSlice(arena, git_changes.fileHeaderText(file));
+                for (indices) |index| if (index < file.hunks.len) try diff.appendSlice(arena, git_changes.hunkText(file, file.hunks[index]));
+            } else {
+                try diff.appendSlice(arena, file.patch.?);
+            }
+        }
+    }
+    if (file_count == 0) return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "no files selected");
+    if (diff.items.len > GIT_COMMIT_MESSAGE_DIFF_BUDGET) {
+        diff.shrinkRetainingCapacity(GIT_COMMIT_MESSAGE_DIFF_BUDGET);
+        try diff.appendSlice(arena, "\n[diff truncated]\n");
+    }
+    const root = first_root.?;
+    const subjects = git_changes.recentSubjects(arena, root, 8) catch "";
+    const service = gitChangesPinStore(daemon);
+    const title = gitChangesThreadTitle(arena, service, review.workspace_id, review.thread_id);
+    if (service) |svc| _ = svc.in_flight.fetchSub(1, .monotonic);
+
+    const prompt = try std.fmt.allocPrint(arena,
+        \\Write a git commit message for the diff below.
+        \\Output only the commit message: a concise imperative subject line of at most 72 characters, optionally followed by a blank line and a short body explaining why. No code fences, no quotes, no preamble. Do not run tools or read files; everything you need is here.
+        \\Then end with one final line of the form `Branch: <slug>`, where <slug> is a short kebab-case git branch name (2-5 words, lowercase letters, digits and dashes) describing the change.
+        \\
+        \\Match the style of this repository's recent subjects:
+        \\{s}
+        \\Chat that made the changes: {s}
+        \\
+        \\Diff:
+        \\{s}
+    , .{ subjects, title, diff.items });
+
+    var config = blk: {
+        daemon.config_mutex.lock();
+        defer daemon.config_mutex.unlock();
+        break :blk app_config.loadAppConfig(allocator) catch |err|
+            return try errorResponseAlloc(allocator, id_value, "config_unavailable", @errorName(err));
+    };
+    defer config.deinit(allocator);
+    var candidates: std.ArrayList(app_config.ChatTitleProvider) = .empty;
+    if (config.commit_message_provider.fixed()) |provider| {
+        try candidates.append(arena, provider);
+    } else for ([_]app_config.ChatTitleProvider{ .codex, .claude, .cursor, .opencode }) |provider| {
+        if (nativeProviderInstalled(nativeProviderFromHarness(chatTitleProvider(provider)))) try candidates.append(arena, provider);
+    }
+    if (candidates.items.len == 0) {
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_PROVIDER_UNAVAILABLE, "No provider is installed to write commit messages.");
+    }
+    var last_error: []const u8 = "The model returned an empty message.";
+    for (candidates.items) |candidate| {
+        const provider = chatTitleProvider(candidate);
+        const model = config.commitMessageModel(candidate);
+        const result = send_runner.run(allocator, .{
+            .provider = provider,
+            .harness_kind = .local_cli,
+            .project_path = root,
+            .cwd = root,
+            .prompt = prompt,
+            .model_ref = model,
+            .fast_mode = if (provider == .codex) .on else .off,
+            .access_mode = .supervised,
+        }, .{}) catch |err| {
+            log.warn("commit message generation failed provider={s} err={s}", .{ @tagName(candidate), @errorName(err) });
+            last_error = @errorName(err);
+            continue;
+        };
+        defer allocator.free(result.provider_thread_id);
+        defer allocator.free(result.reply_text);
+        const generated = (try git_changes.splitGeneratedMessage(arena, result.reply_text)) orelse continue;
+        return try okValueResponse(allocator, id_value, git_changes_protocol.CommitMessageResult{
+            .message = generated.message,
+            .branch = generated.branch,
+            .provider = @tagName(candidate),
+            .model = model,
+        });
+    }
+    return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_PROVIDER_UNAVAILABLE, last_error);
+}
+
+fn gitChangesCommitError(err: git_changes.Error) struct { code: []const u8, message: []const u8 } {
+    return switch (err) {
+        error.ChangedSinceReview => .{ .code = git_changes_protocol.ERR_CHANGED_SINCE_REVIEW, .message = "The files changed after the review opened. Reopen the review and try again." },
+        error.HeadMoved => .{ .code = git_changes_protocol.ERR_HEAD_MOVED, .message = "Another commit landed while committing. Nothing was written; try again." },
+        error.MissingIdentity => .{ .code = git_changes_protocol.ERR_MISSING_IDENTITY, .message = "git needs user.name and user.email before it can commit." },
+        error.NothingToCommit => .{ .code = headless.protocol.ERR_INVALID_PARAMS, .message = "The selected changes are already committed." },
+        error.NothingSelected, error.InvalidSelection => .{ .code = headless.protocol.ERR_INVALID_PARAMS, .message = "The selection does not match the review." },
+        error.BranchCreateFailed => .{ .code = git_changes_protocol.ERR_BRANCH_CREATE_FAILED, .message = "The new branch could not be created. Nothing was committed." },
+        error.NotARepository => .{ .code = headless.protocol.ERR_INVALID_PARAMS, .message = "Not a git repository." },
+        else => .{ .code = headless.protocol.ERR_CAPABILITY_UNAVAILABLE, .message = "git could not create the commit." },
+    };
+}
+
+fn gitChangesCommitResponse(daemon: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+    const allocator = daemon.allocator;
+    var parsed = parseDaemonParams(git_changes_protocol.CommitRequest, allocator, params) catch
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid commit request");
+    defer parsed.deinit();
+    const request = parsed.value;
+    if (std.mem.trim(u8, request.message, " \t\r\n").len == 0) {
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "commit message is empty");
+    }
+    if (request.selections.len == 0) {
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "no files selected");
+    }
+    // One commit per review: a repeat returns the stored result, a
+    // concurrent repeat is told to wait.
+    const review = blk: {
+        daemon.git_changes.mutex.lock();
+        defer daemon.git_changes.mutex.unlock();
+        const found = daemon.git_changes.reviews.find(request.review_id) orelse
+            return try gitChangesReviewErrorResponse(allocator, id_value);
+        if (found.committed_result) |json| return try gitChangesReplayResponse(allocator, id_value, json);
+        if (found.committing) return try errorResponseAlloc(allocator, id_value, git_changes_protocol.ERR_IN_PROGRESS, "This review is already being committed.");
+        found.committing = true;
+        found.users += 1;
+        break :blk found;
+    };
+    defer {
+        daemon.git_changes.mutex.lock();
+        review.committing = false;
+        daemon.git_changes.reviews.release(review);
+        daemon.git_changes.mutex.unlock();
+    }
+    for (request.selections) |selection| {
+        if (review.findRepo(selection.root) == null) {
+            return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "selection names a repository outside the review");
+        }
+    }
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const branch_base: ?[]const u8 = if (request.new_branch) base: {
+        if (request.branch_name) |name| if (std.mem.trim(u8, name, " \t\r\n").len > 0) break :base try git_changes.sanitizeFeatureBranchName(arena, name);
+        break :base try git_changes.branchFromSubject(arena, request.message);
+    } else null;
+
+    var commits: std.ArrayList(git_changes_protocol.RepoCommit) = .empty;
+    var total_files: u32 = 0;
+    for (request.selections) |selection| {
+        const files = try arena.alloc(git_changes.FileSelection, selection.files.len);
+        for (selection.files, files) |chosen, *file| file.* = .{ .path = chosen.path, .hunks = chosen.hunks };
+        const nonce = daemon.git_changes.nonce.fetchAdd(1, .monotonic);
+        const result = git_changes.commitRepo(arena, .{
+            .review = review,
+            .selection = .{ .root = selection.root, .files = files },
+            .message = request.message,
+            .push = request.push,
+            .nonce = nonce,
+            .new_branch = branch_base,
+        }) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            const mapped = gitChangesCommitError(err);
+            if (commits.items.len == 0) return try errorResponseAlloc(allocator, id_value, mapped.code, mapped.message);
+            // Earlier repositories already committed; report them and stop.
+            log.warn("git commit stopped after partial success root={s} err={s}", .{ selection.root, @errorName(err) });
+            break;
+        };
+        total_files += @intCast(result.files);
+        try commits.append(arena, .{
+            .root = result.root,
+            .commit = result.commit,
+            .short_commit = result.commit[0..@min(result.commit.len, 7)],
+            .subject = result.subject,
+            .files = @intCast(result.files),
+            .branch = result.branch,
+            .branch_created = result.branch_created,
+            .push = @tagName(result.push),
+            .push_message = result.push_message,
+            .index_reset = result.index_reset,
+        });
+    }
+
+    // Committed files are clean now (unless edited again); drop their claims.
+    {
+        var git = git_changes.Git.init(arena) catch null;
+        defer if (git) |*g| g.deinit();
+        var fresh: std.ArrayList(struct { root: []const u8, entries: []git_changes.StatusEntry }) = .empty;
+        if (git) |*g| for (commits.items) |commit| {
+            const entries = (git_changes.dirtyPaths(g, commit.root) catch null) orelse continue;
+            try fresh.append(arena, .{ .root = commit.root, .entries = entries });
+        };
+        daemon.git_changes.mutex.lock();
+        defer daemon.git_changes.mutex.unlock();
+        var pruned = false;
+        for (fresh.items) |item| {
+            if (daemon.git_changes.ledger.pruneRepoPaths(item.root, item.entries)) pruned = true;
+        }
+        if (pruned) gitChangesPersistLocked(daemon);
+    }
+
+    // UI-only transcript row. Verde never replays transcript rows into a
+    // provider's context. Handoffs in full/recent mode embed system rows as
+    // text; summary mode skips them.
+    var transcript_message_id: ?[]const u8 = null;
+    if (gitChangesPinStore(daemon)) |service| {
+        defer _ = service.in_flight.fetchSub(1, .monotonic);
+        if (gitChangesThreadIdle(service, review.workspace_id, review.thread_id)) {
+            // Format and optional detail lines: git_changes_protocol.zig
+            // ("Committed transcript row").
+            var link_git = git_changes.Git.init(arena) catch null;
+            defer if (link_git) |*g| g.deinit();
+            const entries = try arena.alloc(git_changes.RowEntry, commits.items.len);
+            for (commits.items, entries) |commit, *entry| {
+                const pushed = std.mem.eql(u8, commit.push, "pushed");
+                entry.* = .{
+                    .sha = commit.short_commit,
+                    .repo = if (commits.items.len > 1) std.fs.path.basename(commit.root) else null,
+                    .pushed = pushed,
+                    // Link only published commits; a later push fills it in.
+                    .remote = if (!pushed) null else if (link_git) |*g| (git_changes.commitWebUrlFor(g, commit.root, commit.commit) catch null) else null,
+                    .local = if (pushed) false else if (link_git) |*g| !(git_changes.hasRemote(g, commit.root) catch true) else false,
+                };
+            }
+            const headline = try std.fmt.allocPrint(arena, "Committed {d} file{s}", .{ total_files, if (total_files == 1) "" else "s" });
+            const body_text = try git_changes.formatCommitRow(arena, .{
+                .headline = headline,
+                .entries = entries,
+                .subject = if (commits.items.len > 0) commits.items[0].subject else "",
+                .branch = if (commits.items.len > 0) commits.items[0].branch else null,
+            });
+            const message_id = try std.fmt.allocPrint(arena, "git-commit-{d}-{d}", .{ nowMs(), daemon.git_changes.nonce.fetchAdd(1, .monotonic) });
+            const now = nowMs();
+            lockStoreService(service);
+            const written = service.store.appendMessage(.{
+                .mutation = .{ .request_key = message_id, .client_id = "daemon" },
+                .workspace_id = review.workspace_id,
+                .thread_id = review.thread_id,
+                .message = .{
+                    .message_id = message_id,
+                    .role = "system",
+                    .author = git_changes.ROW_AUTHOR,
+                    .body = body_text,
+                    .created_at_ms = now,
+                    .updated_at_ms = now,
+                },
+            });
+            service.mutex.unlock();
+            if (written) |_| {
+                transcript_message_id = message_id;
+            } else |err| log.warn("git commit transcript row failed err={s}", .{@errorName(err)});
+        }
+    }
+
+    // A push also publishes earlier commit-only rows of this chat.
+    var updated_rows: std.ArrayList(git_changes_protocol.UpdatedRow) = .empty;
+    for (commits.items) |commit| {
+        if (!std.mem.eql(u8, commit.push, "pushed")) continue;
+        try updated_rows.appendSlice(arena, gitChangesMarkPushedRows(daemon, arena, review.workspace_id, review.thread_id, commit.root, transcript_message_id));
+    }
+    const commit_result: git_changes_protocol.CommitResult = .{
+        .workspace_id = review.workspace_id,
+        .local_thread_id = review.thread_id,
+        .files = total_files,
+        .repos = commits.items,
+        .updated_rows = updated_rows.items,
+        .transcript_message_id = transcript_message_id,
+    };
+    {
+        // Keep the result on the review so a retried request replays it.
+        const json = try std.json.Stringify.valueAlloc(arena, commit_result, .{});
+        daemon.git_changes.mutex.lock();
+        defer daemon.git_changes.mutex.unlock();
+        review.committed_result = review.arena_state.allocator().dupe(u8, json) catch null;
+    }
+    return try okValueResponse(allocator, id_value, commit_result);
+}
+
+/// Recent `git` rows of a chat considered by `gitChangesMarkPushedRows`.
+const GIT_ROW_SCAN_LIMIT: i64 = 20;
+
+/// After a successful push from `root`, marks the chat's recent committed
+/// rows whose commit the upstream now contains as pushed and fills missing
+/// commit links, rewriting each row in place. Idle chats only (a running
+/// turn owns the transcript tail). `skip_message_id` is a row just written
+/// with its final state. Returns the rewritten rows; failures are logged and
+/// skipped since the push itself already succeeded.
+fn gitChangesMarkPushedRows(
+    daemon: *Daemon,
+    arena: std.mem.Allocator,
+    workspace_id: []const u8,
+    thread_id: []const u8,
+    root: []const u8,
+    skip_message_id: ?[]const u8,
+) []const git_changes_protocol.UpdatedRow {
+    const service = gitChangesPinStore(daemon) orelse return &.{};
+    defer _ = service.in_flight.fetchSub(1, .monotonic);
+    if (!gitChangesThreadIdle(service, workspace_id, thread_id)) return &.{};
+    const Row = struct { message_id: []const u8, body: []const u8 };
+    var rows: std.ArrayList(Row) = .empty;
+    {
+        lockStoreService(service);
+        defer service.mutex.unlock();
+        var result = service.store.conn.rows(
+            "select m.message_id, m.body from messages m join threads t on t.id = m.thread_id join workspaces w on w.id = t.workspace_id " ++
+                "where w.workspace_id = ?1 and t.local_thread_id = ?2 and m.author = ?3 and m.message_id is not null " ++
+                "order by m.sort_index desc limit ?4",
+            .{ workspace_id, thread_id, git_changes.ROW_AUTHOR, GIT_ROW_SCAN_LIMIT },
+        ) catch |err| {
+            log.warn("git pushed rows scan failed err={s}", .{@errorName(err)});
+            return &.{};
+        };
+        defer result.deinit();
+        while (result.next()) |row| {
+            const message_id = arena.dupe(u8, row.text(0)) catch return &.{};
+            if (skip_message_id) |skip| if (std.mem.eql(u8, skip, message_id)) continue;
+            rows.append(arena, .{ .message_id = message_id, .body = arena.dupe(u8, row.text(1)) catch return &.{} }) catch return &.{};
+        }
+    }
+    if (rows.items.len == 0) return &.{};
+
+    var git = git_changes.Git.init(arena) catch return &.{};
+    defer git.deinit();
+    const remote_url = git_changes.pushRemoteUrl(&git, root) catch null;
+    const repo_name = std.fs.path.basename(root);
+    var updated: std.ArrayList(git_changes_protocol.UpdatedRow) = .empty;
+    for (rows.items) |row| {
+        const parsed = (git_changes.parseCommitRow(arena, row.body) catch null) orelse continue;
+        const pushed = arena.alloc(bool, parsed.entries.len) catch break;
+        const remotes = arena.alloc(?[]const u8, parsed.entries.len) catch break;
+        @memset(pushed, false);
+        @memset(remotes, null);
+        for (parsed.entries, 0..) |entry, i| {
+            if (entry.repo) |name| if (!std.mem.eql(u8, name, repo_name)) continue;
+            if (entry.pushed and entry.remote != null) continue;
+            const full = (git_changes.resolveCommit(&git, root, entry.sha) catch null) orelse continue;
+            if (!entry.pushed) {
+                if (!(git_changes.isAncestorOf(&git, root, full, "@{u}") catch false)) continue;
+                pushed[i] = true;
+            }
+            if (entry.remote == null) {
+                if (remote_url) |url| remotes[i] = git_changes.commitWebUrl(arena, url, full) catch null;
+            }
+        }
+        const body = (git_changes.rewriteCommitRowPushed(arena, row.body, pushed, remotes) catch null) orelse continue;
+        const revision = blk: {
+            lockStoreService(service);
+            defer service.mutex.unlock();
+            break :blk service.store.updateSystemMessageBody(workspace_id, thread_id, row.message_id, body, nowMs()) catch |err| {
+                log.warn("git pushed row rewrite failed err={s}", .{@errorName(err)});
+                continue;
+            };
+        };
+        const store_revision = revision orelse continue;
+        daemon.appendJournalEntry(.chat_thread, thread_id, workspace_id, .{ .store = store_revision });
+        updated.append(arena, .{ .message_id = row.message_id, .body = body }) catch break;
+    }
+    return updated.items;
+}
+
+fn gitChangesPullPushResponse(daemon: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+    const allocator = daemon.allocator;
+    var parsed = parseDaemonParams(git_changes_protocol.PullPushRequest, allocator, params) catch
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid pull and push request");
+    defer parsed.deinit();
+    const request = parsed.value;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    {
+        daemon.git_changes.mutex.lock();
+        defer daemon.git_changes.mutex.unlock();
+        if (!try gitChangesRootKnownLocked(daemon, arena, request.workspace_id, request.root)) return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "unknown repository for this workspace");
+        if (daemon.git_changes.ledger.repoHasActiveTurn(request.root)) {
+            return try errorResponseAlloc(allocator, id_value, git_changes_protocol.ERR_TURNS_RUNNING, "A chat is still working in this repository. Pull & push once it finishes.");
+        }
+    }
+    const outcome = git_changes.pullAndPush(arena, request.root) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "git is not available"),
+    };
+    const updated_rows = if (outcome.status == .pushed and request.local_thread_id != null)
+        gitChangesMarkPushedRows(daemon, arena, request.workspace_id, request.local_thread_id.?, request.root, null)
+    else
+        &.{};
+    return try okValueResponse(allocator, id_value, git_changes_protocol.PullPushResult{
+        .root = request.root,
+        .push = @tagName(outcome.status),
+        .push_message = outcome.message,
+        .updated_rows = updated_rows,
+        .commits = if (outcome.pushed) |facts| facts.commits else null,
+        .head = if (outcome.pushed) |facts| facts.head else null,
+        .subject = if (outcome.pushed) |facts| facts.subject else null,
+        .upstream = if (outcome.pushed) |facts| facts.upstream else null,
+        .remote_url = if (outcome.pushed) |facts| facts.remote_url else null,
+    });
+}
+
+fn gitChangesPushResponse(daemon: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+    const allocator = daemon.allocator;
+    var parsed = parseDaemonParams(git_changes_protocol.PushRequest, allocator, params) catch
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid push request");
+    defer parsed.deinit();
+    const request = parsed.value;
+    if (request.request_id) |value| if (value.len == 0 or value.len > 256) {
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid request_id");
+    };
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const state = &daemon.git_changes;
+    {
+        state.mutex.lock();
+        defer state.mutex.unlock();
+        if (!try gitChangesRootKnownLocked(daemon, arena, request.workspace_id, request.root)) {
+            return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "unknown repository for this workspace");
+        }
+        if (request.request_id) |request_id| {
+            const now = nowMs();
+            var i: usize = 0;
+            while (i < state.push_memos.items.len) {
+                const memo = &state.push_memos.items[i];
+                if (memo.result_json != null and now - memo.at_ms > GIT_PUSH_MEMO_TTL_MS) {
+                    memo.deinit(state.allocator);
+                    _ = state.push_memos.orderedRemove(i);
+                    continue;
+                }
+                if (std.mem.eql(u8, memo.workspace_id, request.workspace_id) and std.mem.eql(u8, memo.request_id, request_id)) {
+                    const json = memo.result_json orelse
+                        return try errorResponseAlloc(allocator, id_value, git_changes_protocol.ERR_IN_PROGRESS, "This push is already running.");
+                    return try gitChangesReplayResponse(allocator, id_value, json);
+                }
+                i += 1;
+            }
+            if (state.push_memos.items.len >= GIT_PUSH_MEMO_MAX) {
+                for (state.push_memos.items, 0..) |*memo, index| if (memo.result_json != null) {
+                    memo.deinit(state.allocator);
+                    _ = state.push_memos.orderedRemove(index);
+                    break;
+                };
+            }
+            const owned_ws = try state.allocator.dupe(u8, request.workspace_id);
+            errdefer state.allocator.free(owned_ws);
+            const owned_id = try state.allocator.dupe(u8, request_id);
+            errdefer state.allocator.free(owned_id);
+            try state.push_memos.append(state.allocator, .{ .workspace_id = owned_ws, .request_id = owned_id, .at_ms = now });
+        }
+    }
+    var result_json: ?[]u8 = null;
+    // Complete (or drop, on failure) this request's memo.
+    defer if (request.request_id) |request_id| {
+        state.mutex.lock();
+        defer state.mutex.unlock();
+        for (state.push_memos.items, 0..) |*memo, index| {
+            if (!std.mem.eql(u8, memo.workspace_id, request.workspace_id) or !std.mem.eql(u8, memo.request_id, request_id)) continue;
+            if (memo.result_json != null) break;
+            if (result_json) |json| {
+                memo.result_json = state.allocator.dupe(u8, json) catch null;
+                memo.at_ms = nowMs();
+            }
+            if (memo.result_json == null) {
+                memo.deinit(state.allocator);
+                _ = state.push_memos.orderedRemove(index);
+            }
+            break;
+        }
+    };
+
+    const outcome = git_changes.pushRepo(arena, request.root) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "git is not available"),
+    };
+    const result: git_changes_protocol.PullPushResult = .{
+        .root = request.root,
+        .push = @tagName(outcome.status),
+        .push_message = outcome.message,
+        .updated_rows = if (outcome.status == .pushed and request.local_thread_id != null)
+            gitChangesMarkPushedRows(daemon, arena, request.workspace_id, request.local_thread_id.?, request.root, null)
+        else
+            &.{},
+        .commits = if (outcome.pushed) |facts| facts.commits else null,
+        .head = if (outcome.pushed) |facts| facts.head else null,
+        .subject = if (outcome.pushed) |facts| facts.subject else null,
+        .upstream = if (outcome.pushed) |facts| facts.upstream else null,
+        .remote_url = if (outcome.pushed) |facts| facts.remote_url else null,
+    };
+    result_json = try std.json.Stringify.valueAlloc(arena, result, .{});
+    return try okValueResponse(allocator, id_value, result);
+}
+
+fn gitChangesStatusResponse(daemon: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+    const allocator = daemon.allocator;
+    var parsed = parseDaemonParams(git_changes_protocol.StatusRequest, allocator, params) catch
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid git changes status request");
+    defer parsed.deinit();
+    const request = parsed.value;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The chat's claimed repositories plus its own route repository.
+    var roots: std.ArrayList([]const u8) = .empty;
+    {
+        daemon.git_changes.mutex.lock();
+        defer daemon.git_changes.mutex.unlock();
+        try roots.appendSlice(arena, try daemon.git_changes.ledger.threadRepos(arena, request.workspace_id, request.local_thread_id));
+    }
+    var git = git_changes.Git.init(arena) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "git is not available"),
+    };
+    defer git.deinit();
+    if (gitChangesRouteRoot(daemon, arena, request)) |route_root| {
+        if (try git_changes.repoToplevel(&git, route_root)) |top| {
+            const seen = for (roots.items) |root| {
+                if (std.mem.eql(u8, root, top)) break true;
+            } else false;
+            if (!seen) try roots.append(arena, top);
+        }
+    }
+
+    var repos: std.ArrayList(git_changes_protocol.RepoStatus) = .empty;
+    for (roots.items) |root| {
+        const status = git_changes.repoStatus(&git, root) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue,
+        };
+        try repos.append(arena, .{
+            .root = root,
+            .name = std.fs.path.basename(root),
+            .branch = status.branch,
+            .default_branch = status.default_branch,
+            .is_default_branch = status.is_default_branch,
+            .upstream = status.upstream,
+            .ahead = status.ahead,
+            .behind = status.behind,
+            .has_remote = status.has_remote,
+        });
+    }
+    {
+        daemon.git_changes.mutex.lock();
+        defer daemon.git_changes.mutex.unlock();
+        for (repos.items) |repo| gitChangesRememberRootLocked(daemon, request.workspace_id, repo.root);
+    }
+    return try okValueResponse(allocator, id_value, git_changes_protocol.StatusResult{
+        .workspace_id = request.workspace_id,
+        .local_thread_id = request.local_thread_id,
+        .repos = repos.items,
+    });
+}
+
+fn configCommitSetResponse(daemon: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+    const allocator = daemon.allocator;
+    var parsed = parseDaemonParams(git_changes_protocol.ConfigCommitSetRequest, allocator, params) catch
+        return try errorResponseAlloc(allocator, id_value, "invalid_params", "invalid commit settings");
+    defer parsed.deinit();
+    const request = parsed.value;
+    const provider = if (request.commit_message_provider) |value|
+        app_config.CommitMessageProvider.parse(value) orelse
+            return try errorResponseAlloc(allocator, id_value, "invalid_params", "unknown commit_message_provider")
+    else
+        null;
+    const action = if (request.commit_default_action) |value|
+        app_config.CommitDefaultAction.parse(value) orelse
+            return try errorResponseAlloc(allocator, id_value, "invalid_params", "unknown commit_default_action")
+    else
+        null;
+    if (request.commit_message_model) |model| if (model.len > 512) {
+        return try errorResponseAlloc(allocator, id_value, "invalid_params", "invalid commit_message_model");
+    };
+
+    daemon.config_mutex.lock();
+    defer daemon.config_mutex.unlock();
+    var config = app_config.loadAppConfig(allocator) catch |err|
+        return try errorResponseAlloc(allocator, id_value, "config_unavailable", @errorName(err));
+    defer config.deinit(allocator);
+    if (provider) |value| {
+        // A model belongs to one provider; switching provider resets it.
+        if (value != config.commit_message_provider) try config.setCommitMessageModel(allocator, null);
+        config.commit_message_provider = value;
+    }
+    if (request.commit_message_model) |model| {
+        const trimmed = std.mem.trim(u8, model, " \t\r\n");
+        try config.setCommitMessageModel(allocator, if (trimmed.len == 0) null else trimmed);
+    }
+    if (action) |value| config.commit_default_action = value;
+    app_config.saveAppConfig(allocator, &config) catch |err|
+        return try errorResponseAlloc(allocator, id_value, "config_unavailable", @errorName(err));
+    return try okValueResponse(allocator, id_value, git_changes_protocol.ConfigCommitSnapshot{
+        .commit_message_provider = @tagName(config.commit_message_provider),
+        .commit_message_model = if (config.commit_message_provider == .auto) null else config.commit_message_model,
+        .commit_default_action = @tagName(config.commit_default_action),
     });
 }
 
@@ -15802,6 +17201,39 @@ test "attachment staging never follows a planted symlink at create or cleanup" {
     try std.testing.expectEqual(std.Io.File.Kind.directory, staging_stat.kind);
 }
 
+/// Fills an omitted model_ref from the provider's remembered model choice.
+fn applyRememberedModelDefault(
+    allocator: std.mem.Allocator,
+    request: *send_runner.Request,
+    config: *const app_config.AppConfig,
+) !void {
+    if (request.model_ref != null) return;
+    const config_provider = app_config.ChatProvider.parse(@tagName(request.provider)) orelse return;
+    const remembered = config.remembered_models[@intFromEnum(config_provider)] orelse return;
+    if (remembered.model.len == 0) return;
+    request.model_ref = try allocator.dupe(u8, remembered.model);
+}
+
+test "applyRememberedModelDefault fills only missing model refs" {
+    const allocator = std.testing.allocator;
+    var config: app_config.AppConfig = .{};
+    defer config.deinit(allocator);
+    try config.rememberModel(allocator, .claude, "opus[1m]", "medium", false);
+
+    var missing: send_runner.Request = .{ .provider = .claude, .harness_kind = .local_cli, .project_path = "/tmp", .prompt = "hi", .image_paths = &.{}, .thread_title = "t" };
+    try applyRememberedModelDefault(allocator, &missing, &config);
+    defer if (missing.model_ref) |value| allocator.free(value);
+    try std.testing.expectEqualStrings("opus[1m]", missing.model_ref.?);
+
+    var explicit: send_runner.Request = .{ .provider = .claude, .harness_kind = .local_cli, .project_path = "/tmp", .prompt = "hi", .image_paths = &.{}, .thread_title = "t", .model_ref = "sonnet" };
+    try applyRememberedModelDefault(allocator, &explicit, &config);
+    try std.testing.expectEqualStrings("sonnet", explicit.model_ref.?);
+
+    var unremembered: send_runner.Request = .{ .provider = .codex, .harness_kind = .local_cli, .project_path = "/tmp", .prompt = "hi", .image_paths = &.{}, .thread_title = "t" };
+    try applyRememberedModelDefault(allocator, &unremembered, &config);
+    try std.testing.expect(unremembered.model_ref == null);
+}
+
 fn createChatTurnFromParams(
     allocator: std.mem.Allocator,
     params: std.json.Value,
@@ -16027,6 +17459,28 @@ fn automaticChatTurnTitleStoreEligible(daemon: *Daemon, turn: *const ChatTurn, e
     };
 }
 
+/// Persist a generated search description. Best effort: a failure only
+/// costs search recall, so it is logged and never surfaced to the turn.
+fn storeThreadDescription(daemon: *Daemon, workspace_id: []const u8, local_thread_id: []const u8, description: []const u8) void {
+    lockDaemon(daemon);
+    const service = daemon.store_service;
+    if (service) |svc| _ = svc.in_flight.fetchAdd(1, .monotonic);
+    daemon.mutex.unlock();
+    const svc = service orelse return;
+    defer _ = svc.in_flight.fetchSub(1, .monotonic);
+
+    lockStoreService(svc);
+    defer svc.mutex.unlock();
+    svc.store.setThreadDescription(workspace_id, local_thread_id, description, nowMs()) catch |err| {
+        log.warn("thread description write failed err={s}", .{@errorName(err)});
+    };
+}
+
+const GeneratedChatTitle = struct {
+    title: [:0]const u8,
+    description: ?[:0]const u8,
+};
+
 /// Run the configured title model over the opening prompt and, when given,
 /// the first reply. An empty reply yields a prompt-only title.
 fn generateAutomaticChatTurnTitle(
@@ -16035,7 +17489,7 @@ fn generateAutomaticChatTurnTitle(
     turn: *ChatTurn,
     reply_text: []const u8,
     sink: send_runner.Sink,
-) ?[:0]const u8 {
+) ?GeneratedChatTitle {
     const user_text = if (std.mem.trim(u8, turn.request.prompt, &std.ascii.whitespace).len > 0)
         boundedTitleUtf8Prefix(turn.request.prompt, 4096)
     else
@@ -16074,7 +17528,8 @@ fn generateAutomaticChatTurnTitle(
         log.warn("automatic chat title provider returned an empty title", .{});
         return null;
     };
-    return generated_title;
+    const description = chat_threads.makeGeneratedThreadDescription(allocator, result.reply_text) catch null;
+    return .{ .title = generated_title, .description = description };
 }
 
 /// Start the prompt-only title beside the provider turn. Only opening turns
@@ -16130,13 +17585,19 @@ fn inFlightAutomaticChatTurnTitleThread(daemon: *Daemon, turn: *ChatTurn) void {
     const expected_title = automaticChatTurnExpectedTitle(allocator, turn, &fallback) orelse return;
     if (!automaticChatTurnTitleStoreEligible(daemon, turn, expected_title)) return;
 
-    const title = generateAutomaticChatTurnTitle(allocator, &config, turn, "", .{
+    const generated = generateAutomaticChatTurnTitle(allocator, &config, turn, "", .{
         .context = turn,
         .on_should_stop = inFlightTitleShouldStop,
     }) orelse return;
+    const title = generated.title;
     var owned_title: ?[:0]const u8 = title;
     defer if (owned_title) |value| allocator.free(value);
+    defer if (generated.description) |value| allocator.free(value);
     if (inFlightTitleShouldStop(turn)) return;
+    // The completion refinement overwrites this with a reply-informed one.
+    if (generated.description) |description| {
+        storeThreadDescription(daemon, turn.workspace_id, turn.local_thread_id, description);
+    }
 
     lockDaemon(daemon);
     const service = daemon.store_service;
@@ -16206,7 +17667,12 @@ fn maybeGenerateAutomaticChatTurnTitle(daemon: *Daemon, turn: *ChatTurn) void {
         if (in_flight_title) |value| automaticChatTurnTitleStoreEligible(daemon, turn, value) else false;
     if (!eligible) return;
 
-    const generated_title = generateAutomaticChatTurnTitle(allocator, &config, turn, reply_text, .{}) orelse return;
+    const generated = generateAutomaticChatTurnTitle(allocator, &config, turn, reply_text, .{}) orelse return;
+    const generated_title = generated.title;
+    if (generated.description) |description| {
+        defer allocator.free(description);
+        storeThreadDescription(daemon, turn.workspace_id, turn.local_thread_id, description);
+    }
 
     lockTurn(turn);
     defer turn.mutex.unlock();
@@ -16295,6 +17761,7 @@ fn interruptChatTurnProvider(
 }
 
 fn chatTurnThread(daemon: *Daemon, turn: *ChatTurn) void {
+    defer markChatTurnWorkerExited(turn);
     const allocator = daemon.allocator;
     // Acceptance staging before provider work so a mid-turn kill still leaves
     // the user row + running ledger for the interrupted sweep. Must not run
@@ -16344,6 +17811,7 @@ fn chatTurnThread(daemon: *Daemon, turn: *ChatTurn) void {
     // The opening prompt is durable now, so its title can be generated while
     // the provider streams instead of after the turn completes.
     if (!turn.use_stub) startInFlightAutomaticChatTurnTitle(daemon, turn);
+    if (!turn.use_stub) gitChangesBeginTurn(daemon, turn);
     // NIT-3: use_stub already folded the env at creation; do not re-eval.
     if (turn.use_stub) {
         runStubChatTurn(allocator, turn);
@@ -16406,6 +17874,7 @@ fn chatTurnThread(daemon: *Daemon, turn: *ChatTurn) void {
         turn.mutex.unlock();
     }
 
+    gitChangesEndTurn(daemon, turn);
     maybeGenerateAutomaticChatTurnTitle(daemon, turn);
     finalizeChatTurnWorker(daemon, turn);
 }
@@ -16415,6 +17884,20 @@ fn chatTurnThread(daemon: *Daemon, turn: *ChatTurn) void {
 /// with backoff sleeps taken while holding NO locks (MAJOR-3).
 fn finalizeChatTurnWorker(daemon: *Daemon, turn: *ChatTurn) void {
     publishChatTurnDurable(daemon, turn, true);
+}
+
+// Called as the last worker action, after parent delivery and all lock-taking
+// cleanup. Once published, joining under the daemon lock cannot deadlock.
+fn markChatTurnWorkerExited(turn: *ChatTurn) void {
+    lockTurn(turn);
+    turn.worker_exited = true;
+    turn.mutex.unlock();
+}
+
+// Caller holds the turn mutex. Synthetic/restored turns have no worker.
+fn chatTurnCanReclaim(turn: *const ChatTurn) bool {
+    return turn.worker_done and !turn.durability_pending and
+        (turn.worker_thread == null or turn.worker_exited);
 }
 
 // Answer-ready commits use the same retry policy without releasing the live
@@ -16946,6 +18429,9 @@ fn chatSinkEvent(context: ?*anyopaque, event: harness.StreamEvent) void {
         else => {},
     };
     const allocator = turn.allocator;
+    // Attribution hints outlive the visible answer: providers may keep
+    // editing while they drain after an early commit.
+    if (turn.daemon) |daemon| gitChangesRecordEventHints(daemon, turn, event);
     lockTurn(turn);
     defer turn.mutex.unlock();
     if (turn.committed_store_revision != null) return;
@@ -22701,6 +24187,60 @@ test "archive mutation preserves metadata and large transcripts with normal muta
     try std.testing.expect(std.mem.indexOf(u8, unknown, "unknown client_id") != null);
 }
 
+test "consumed durable turn is retained until its worker finishes bookkeeping" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    const turn = try appendTestChatTurn(&daemon, allocator, "cleanup-turn", "cleanup-ws", "/tmp", "Cleanup", "hello", .completed, 10);
+    var release = std.atomic.Value(bool).init(false);
+    // Release on assertions too, before daemon teardown joins the worker.
+    defer release.store(true, .release);
+    turn.worker_thread = try std.Thread.spawn(.{}, struct {
+        fn run(d: *Daemon, t: *ChatTurn, gate: *std.atomic.Value(bool)) void {
+            // A finite deadline makes the old premature join fail the test
+            // rather than hanging the runner. No provider or live daemon.
+            var attempts: usize = 0;
+            while (!gate.load(.acquire) and attempts < 400) : (attempts += 1) {
+                platform_runtime.sleepMillis(5);
+            }
+            if (gate.load(.acquire)) {
+                // Parent delivery still needs this lock after durability.
+                lockDaemon(d);
+                d.mutex.unlock();
+            }
+            markChatTurnWorkerExited(t);
+        }
+    }.run, .{ &daemon, turn, &release });
+
+    const request = try allocator.dupe(u8,
+        \\{"jsonrpc":"2.0","id":1,"method":"chat.turn.consume","params":{"turn_id":"cleanup-turn"}}
+    );
+    defer allocator.free(request);
+    const response = try handleSessionizerRequestBytes(&daemon, request);
+    defer allocator.free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"accepted\":true") != null);
+    try std.testing.expectEqual(@as(usize, 1), daemon.chat_turns.items.len);
+    lockDaemon(&daemon);
+    daemon.removeFinishedConsumedChatTurns();
+    daemon.mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 1), daemon.chat_turns.items.len);
+
+    release.store(true, .release);
+    var exited = false;
+    var attempts: usize = 0;
+    while (!exited and attempts < 400) : (attempts += 1) {
+        lockTurn(turn);
+        exited = turn.worker_exited;
+        turn.mutex.unlock();
+        if (!exited) platform_runtime.sleepMillis(5);
+    }
+    try std.testing.expect(exited);
+    lockDaemon(&daemon);
+    daemon.removeFinishedConsumedChatTurns();
+    daemon.mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 0), daemon.chat_turns.items.len);
+}
+
 test "answer-ready is durable and consumable while the provider worker still drains" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -23092,6 +24632,59 @@ fn expectPresetResponse(value: std.json.Value, preset: access_protocol.PairingPr
     try std.testing.expectEqual(try access_protocol.scopeMask(preset.scopes()), mask);
 }
 
+test "workspace create allocates managed folders, retries, and imports directories without desktop state" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state: std.heap.ArenaAllocator = .init(a);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(io, &buffer);
+    const pref = try std.fs.path.join(arena, &.{ buffer[0..len], "verde", "Native" });
+    const db_path = try testStoreDbPath(&tmp);
+    defer a.free(db_path);
+    var daemon = Daemon.initWithPrefPath(a, pref);
+    defer daemon.deinit();
+    try attachTestStoreService(&daemon, db_path);
+    defer detachTestStoreService(&daemon);
+    const client = try daemon.registry.registerClient(a, false, nowMs());
+    var first_path: []const u8 = "";
+    var first_id: []const u8 = "";
+    for ([_][]const u8{ "create-one", "create-one", "create-two" }, 0..) |key, index| {
+        const request = try std.json.Stringify.valueAlloc(arena, .{ .id = 1, .method = "workspace.create", .params = .{ .label = if (index < 2) "  Family trip  " else "", .mutation = .{ .request_key = key, .client_id = client.client_id } } }, .{});
+        const response = try daemon.handleRequest(request);
+        defer a.free(response);
+        var parsed = try headless.parseResponse(a, response);
+        defer parsed.deinit();
+        try std.testing.expect(parsed.response.isOk());
+        const result = parsed.response.result.?.object;
+        const path = result.get("path").?.string;
+        try std.testing.expectEqualStrings(if (index < 2) "Family trip" else "Workspace 2", result.get("label").?.string);
+        try std.testing.expect(std.mem.endsWith(u8, path, if (index < 2) "/verde/workspaces/workspace-1" else "/verde/workspaces/workspace-2"));
+        if (index == 0) {
+            first_path = try arena.dupe(u8, path);
+            first_id = try arena.dupe(u8, result.get("workspace_id").?.string);
+        } else if (index == 1) try std.testing.expectEqualStrings(first_id, result.get("workspace_id").?.string);
+        const config = try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(arena, &.{ path, "verde.toml" }), arena, .limited(1024));
+        try std.testing.expect(std.mem.indexOf(u8, config, "links = true") != null);
+    }
+    const imported = try std.json.Stringify.valueAlloc(arena, .{ .id = 2, .method = "workspace.create", .params = .{ .path = first_path, .label = "Imported project", .mutation = .{ .request_key = "import-existing", .client_id = client.client_id } } }, .{});
+    const response = try daemon.handleRequest(imported);
+    defer a.free(response);
+    var parsed = try headless.parseResponse(a, response);
+    defer parsed.deinit();
+    try std.testing.expect(parsed.response.isOk());
+    try std.testing.expectEqualStrings(first_id, parsed.response.result.?.object.get("workspace_id").?.string);
+    try std.testing.expectEqualStrings("Imported project", parsed.response.result.?.object.get("label").?.string);
+    daemon.accepting_mutations = false;
+    const drained = try daemon.handleRequest(imported);
+    defer a.free(drained);
+    try std.testing.expect(std.mem.indexOf(u8, drained, "invalid_state") != null);
+    try std.testing.expect(methodRunsUnlocked("workspace.create"));
+}
+
 test "directory RPC uses durable workspace parents and host roots without desktop state" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -23139,6 +24732,14 @@ test "directory RPC uses durable workspace parents and host roots without deskto
             try std.testing.expectEqual(@as(usize, 1), result.get("directories").?.array.items.len);
         } else try std.testing.expect(std.mem.indexOf(u8, response, "path_outside_roots") != null);
     }
+    var empty_params: std.json.ObjectMap = .empty;
+    defer empty_params.deinit(allocator);
+    const default_response = try workspaceDirectoryListWithEnvironment(&daemon, .{ .integer = 3 }, .{ .object = empty_params }, home, configured);
+    defer allocator.free(default_response);
+    var default_parsed = try headless.parseResponse(allocator, default_response);
+    defer default_parsed.deinit();
+    try std.testing.expect(default_parsed.response.isOk());
+    try std.testing.expectEqualStrings(home, default_parsed.response.result.?.object.get("path").?.string);
     // Real dispatch reaches the daemon handler without invoking Desktop Live.
     const invalid = try daemon.handleRequest(
         \\{"id":2,"method":"workspace.directory.list","params":{"path":"../escape"}}

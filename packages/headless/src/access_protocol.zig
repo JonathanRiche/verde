@@ -260,9 +260,13 @@ const REPOSITORY_READ: u16 = scopeBit(.repository_read);
 const REPOSITORY_WRITE: u16 = scopeBit(.repository_write);
 const PROCESS_READ: u16 = scopeBit(.process_read);
 const PROCESS_WRITE: u16 = scopeBit(.process_write);
+/// Committing and pushing a chat's own changes is a chat action: the Chat
+/// preset (chat:write + repository:read) may do it, Monitor (no chat:write)
+/// may not, and it never requires general repository:write.
+const GIT_COMMIT: u16 = CHAT_WRITE | REPOSITORY_READ;
 
 /// The complete paired-session allowlist. Every entry except the gateway-local
-/// `core.changes.mode` must be dispatched by the runtime daemon. Desktop-only workspace.create/rename,
+/// `core.changes.mode` must be dispatched by the runtime daemon. Desktop-only workspace.rename,
 /// chat.open_subagent (the GUI's read-only provider-subagent view) and
 /// terminal.open/tail/screen/write/key are intentionally excluded: they need
 /// the desktop app. Mobile uses workspace.upsert, chat.subagent.open,
@@ -353,9 +357,20 @@ pub const PAIRED_RPC_METHODS = [_]PairedRpcMethod{
     .{ .method = "workspace.repository.manifest.get", .scope_mask = REPOSITORY_READ },
     .{ .method = "workspace.directory.list", .scope_mask = REPOSITORY_READ },
     .{ .method = "workspace.files.search", .scope_mask = REPOSITORY_READ },
+    .{ .method = "git.changes.summary", .scope_mask = REPOSITORY_READ },
+    .{ .method = "git.changes.status", .scope_mask = REPOSITORY_READ },
+    .{ .method = "git.changes.review", .scope_mask = REPOSITORY_READ },
+    .{ .method = "git.changes.commit_message", .scope_mask = REPOSITORY_READ },
+    .{ .method = "git.changes.commit", .scope_mask = GIT_COMMIT },
+    .{ .method = "git.changes.push", .scope_mask = GIT_COMMIT },
+    .{ .method = "git.changes.pull_push", .scope_mask = GIT_COMMIT },
+    // config.commit.set is owner-only, like config.ui.set and
+    // config.favoriteModel.set: shared settings are not paired-device RPCs.
 
+    .{ .method = "workspace.create", .scope_mask = REPOSITORY_WRITE },
     .{ .method = "workspace.close", .scope_mask = REPOSITORY_WRITE },
     .{ .method = "workspace.upsert", .scope_mask = REPOSITORY_WRITE },
+    .{ .method = "workspace.reorder", .scope_mask = REPOSITORY_WRITE },
     .{ .method = "workspace.repository.upsert", .scope_mask = REPOSITORY_WRITE },
     .{ .method = "workspace.repository.remove", .scope_mask = REPOSITORY_WRITE },
     .{ .method = "workspace.repository.default.set", .scope_mask = REPOSITORY_WRITE },
@@ -893,12 +908,34 @@ test "P2 daemon RPC mappings require their exact scopes and desktop methods stay
     // The delta opt-in is authorized exactly like the stream it configures.
     try std.testing.expectEqual(requiredScopeMaskForRpc("core.changes").?, requiredScopeMaskForRpc("core.changes.mode").?);
     for ([_][]const u8{
-        "workspace.create",   "workspace.rename", "chat.open_subagent",
-        "terminal.open",      "terminal.tail",    "terminal.screen",
-        "terminal.write",     "terminal.key",     "workspaces",
-        "panes",              "chat.status",      "config.ui.set",
-        "web.directory.list",
+        "workspace.rename",  "chat.open_subagent",
+        "terminal.open",     "terminal.tail",
+        "terminal.screen",   "terminal.write",
+        "terminal.key",      "workspaces",
+        "panes",             "chat.status",
+        "config.ui.set",     "web.directory.list",
+        "config.commit.set", "config.favoriteModel.set",
     }) |method| try std.testing.expect(requiredScopeMaskForRpc(method) == null);
+}
+
+test "chat preset may commit and push but monitor may not" {
+    const chat = try scopeMask(PairingPreset.chat.scopes());
+    const monitor = try scopeMask(PairingPreset.monitor.scopes());
+    const full = try scopeMask(PairingPreset.full.scopes());
+    // Legacy grants (the frozen default scope list) keep commit authority.
+    const legacy = try scopeMask(&DEFAULT_SCOPE_NAMES);
+    for ([_][]const u8{ "git.changes.commit", "git.changes.push", "git.changes.pull_push" }) |method| {
+        const required = requiredScopeMaskForRpc(method).?;
+        try std.testing.expect(scopeMaskContains(chat, required));
+        try std.testing.expect(scopeMaskContains(full, required));
+        try std.testing.expect(scopeMaskContains(legacy, required));
+        try std.testing.expect(!scopeMaskContains(monitor, required));
+        try std.testing.expect(required & REPOSITORY_WRITE == 0);
+    }
+    for ([_][]const u8{ "git.changes.summary", "git.changes.status", "git.changes.review", "git.changes.commit_message" }) |method| {
+        try std.testing.expectEqual(@as(?u16, REPOSITORY_READ), requiredScopeMaskForRpc(method));
+        try std.testing.expect(scopeMaskContains(monitor, REPOSITORY_READ));
+    }
 }
 
 test "pair exchange accepts only canonical optional client nonces" {

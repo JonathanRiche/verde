@@ -1,4 +1,4 @@
-import { batch, createMemo, createRoot, createSignal, onCleanup } from 'solid-js'
+import { batch, createEffect, createMemo, createRoot, createSignal, onCleanup } from 'solid-js'
 
 import {
   acceleratorMatches,
@@ -33,6 +33,10 @@ import { pendingShellRows, runComposerShellCommand, shellRunParams } from './she
 import { createComposerCommands, parseSlashCommand, classifyBangCommand, repositoryCommandPath, type SlashCommandResult } from './composer_commands'
 import { isPlaceholderThreadTitle, makeThreadTitle } from './thread_title'
 import {
+  DEFAULT_COMMIT_CONFIG, applyCommitConfigPatch, createGitChanges, parseCommitConfig,
+  type CommitConfig, type CommitConfigPatch,
+} from './git_changes'
+import {
   LiveClient,
   chatImageUrl,
   deleteChatImage,
@@ -50,6 +54,7 @@ import {
   resolveWorkspaceId,
 } from './selection'
 import { linuxWorkspaceId } from './wyhash'
+import { applyWorkspaceOrder, closedWorkspacesFrom, moveWorkspaceBefore } from './workspace_order'
 import {
   DEFAULT_UI_CONFIG,
   applyUiConfigPatch,
@@ -1450,6 +1455,9 @@ export function createAppStore() {
   const [source, setSource] = createSignal<Source>('mock')
   const [connected, setConnected] = createSignal(false)
   const [workspaces, setWorkspaces] = createSignal<Workspace[]>([])
+  const [closedWorkspaces, setClosedWorkspaces] = createSignal<Workspace[]>([])
+  /// Order submitted by a sidebar drag, held until `workspace.reorder` settles.
+  let pendingWorkspaceOrder: string[] | null = null
   const [threadsByWorkspace, setThreadsByWorkspace] = createSignal<Record<string, Thread[]>>({})
   const [panesByWorkspace, setPanesByWorkspace] = createSignal<Record<string, LivePane[]>>({})
   const [workspaceId, setWorkspaceId] = createSignal<string | null>(null)
@@ -1496,6 +1504,11 @@ export function createAppStore() {
   const [favoriteModels, setFavoriteModels] = createSignal<FavoriteModel[]>([])
   /// verde.json chat.title_provider / title_model as resolved by the daemon.
   let titleConfig: { provider: string; model: string | null } = { provider: 'codex', model: null }
+  /// verde.json chat.commit_* (commit message generation + default action).
+  const [commitConfig, setCommitConfig] = createSignal<CommitConfig>(DEFAULT_COMMIT_CONFIG)
+  let pendingCommitConfigPatch: CommitConfigPatch | null = null
+  let commitConfigUpdateQueue: Promise<void> = Promise.resolve()
+  let commitConfigWrites = 0
   const [actionDialog, setActionDialog] = createSignal<ActionDialogRequest | null>(null)
   let actionDialogResolve: ((values: Record<string, string> | null) => void) | null = null
   /// Show the shared choice dialog and wait for the user's selection.
@@ -1735,8 +1748,14 @@ export function createAppStore() {
         provider: typeof chat_config?.title_provider === 'string' && chat_config.title_provider ? chat_config.title_provider : 'codex',
         model: typeof chat_config?.title_model === 'string' && chat_config.title_model ? chat_config.title_model : null,
       }
+      const next_commit = applyCommitConfigPatch(parseCommitConfig(root.config), pendingCommitConfigPatch ?? {})
+      setCommitConfig((prev) => (sameJson(prev, next_commit) ? prev : next_commit))
     }
     const stored = snapshot.workspaces ?? root.workspaces ?? []
+    if (Array.isArray(snapshot.workspaces ?? root.workspaces)) {
+      const closed = closedWorkspacesFrom(stored)
+      setClosedWorkspaces((prev) => (sameJson(prev, closed) ? prev : closed))
+    }
     // The desktop live listing decides which workspaces are open whenever the
     // desktop app is reachable; store rows only contribute their persisted
     // layout as the detached fallback. Store rows alone can be stale because
@@ -1749,7 +1768,7 @@ export function createAppStore() {
           return row ? { ...row, ...item, workspace_layout_json: row.workspace_layout_json } : item
         })
       : workspacesFromVolatile(root, stored)
-    const list = listed.filter((item) => item.workspace_id && !item.archived)
+    const list = applyWorkspaceOrder(listed.filter((item) => item.workspace_id && !item.archived), pendingWorkspaceOrder)
     if (list.length === 0 && lastSessions.length === 0) return
     setWorkspaces((prev) => (sameJson(prev, list) ? prev : list))
 
@@ -1790,12 +1809,17 @@ export function createAppStore() {
 
   const applyChanges = (params: unknown) => {
     const root = params as {
-      result?: { entries?: Array<{ topic: string }>; heartbeat?: boolean }
-      entries?: Array<{ topic: string }>
+      result?: { entries?: Array<{ topic: string; workspace_id?: string | null }>; heartbeat?: boolean }
+      entries?: Array<{ topic: string; workspace_id?: string | null }>
       heartbeat?: boolean
     }
     const result = root.result ?? root
     if (result.heartbeat && !(result.entries && result.entries.length > 0)) return
+    // Git change summaries have no journal topic; a chat.turn entry is the
+    // cue that a chat may have touched its working tree (debounced).
+    for (const entry of result.entries ?? []) {
+      if (entry.topic === 'chat.turn' && entry.workspace_id) gitChanges.scheduleSummaryRefresh(entry.workspace_id)
+    }
     void refreshProjection()
   }
 
@@ -2079,6 +2103,27 @@ export function createAppStore() {
     return connectionRpc(connection, routeThread(pane).runtime_id, method, params)
   }
   const readiness = createProviderReadinessApi(interactiveCall)
+  const gitChanges = createGitChanges<LivePane>({
+    localCall: interactiveCall,
+    paneCall: paneRpc,
+    // Same daemon-resolved route as `@` file search; never a client path.
+    route: (pane) => {
+      if (pane.kind !== 'chat' || !pane.thread_id) return null
+      const thread = routeThread(pane)
+      return { workspace_id: paneOwningWorkspaceId(pane), local_thread_id: pane.thread_id, repository_id: thread.repository_id ?? 'primary', relative_cwd: thread.repository_cwd ?? null }
+    },
+    defaultAction: () => commitConfig().default_action,
+    focusedPane: () => focusedPane() ?? null,
+    // A push rewrites the chat's commit row in place; refetch so it re-renders.
+    afterPush: (pane) => { void loadTranscript(pane, true) },
+  })
+  // Summaries for newly listed workspaces; later refreshes are event driven.
+  const gitSummarySeen = new Set<string>()
+  createEffect(() => {
+    const fresh = workspaces().map((row) => row.workspace_id).filter((id) => id && !gitSummarySeen.has(id))
+    for (const id of fresh) gitSummarySeen.add(id)
+    if (fresh.length) gitChanges.refreshSummaries(fresh)
+  })
   const chatRuntimeBlocker = (pane: LivePane) => runtimeBlocker(connectionFor(pane), routeThread(pane).runtime_id, connections())
   /// Per-connection provider status, fetched from that runtime's daemon.
   const remoteReadiness = new Map<string, { api: ReturnType<typeof createProviderReadinessApi>; requested: boolean }>()
@@ -3433,6 +3478,29 @@ export function createAppStore() {
     })
   }
 
+  /// Write `verde.json` chat.commit_* through the owner-only daemon RPC.
+  const updateCommitConfig = (patch: CommitConfigPatch) => {
+    pendingCommitConfigPatch = { ...(pendingCommitConfigPatch ?? {}), ...patch }
+    commitConfigWrites += 1
+    setCommitConfig((prev) => applyCommitConfigPatch(prev, patch))
+    setNotice(null)
+    const update = commitConfigUpdateQueue.then(async () => {
+      const response = await interactiveCall('config.commit.set', patch)
+      if (response.error || response.ok === false) setNotice(response.error?.message ?? 'setting did not apply')
+      else {
+        const saved = unwrapResult<Record<string, unknown>>(response)
+        if (saved) setCommitConfig(applyCommitConfigPatch(parseCommitConfig({ chat: saved }), pendingCommitConfigPatch ?? {}))
+      }
+    })
+    commitConfigUpdateQueue = update.catch((err) => {
+      setNotice(err instanceof Error ? err.message : 'setting change failed')
+    }).finally(() => {
+      commitConfigWrites -= 1
+      if (commitConfigWrites === 0) pendingCommitConfigPatch = null
+      void refreshProjection({ scope: 'selected', enrich_chat_status: false })
+    })
+  }
+
   /// Write one or more `verde.json` `ui` settings through the daemon, the
   /// same file the desktop Settings modal edits (the desktop reloads it).
   const updateUiConfig = (patch: UiConfigPatch) => {
@@ -3582,19 +3650,25 @@ export function createAppStore() {
     return next
   }
 
-  const createWorkspace = async (path: string): Promise<boolean> => {
+  const createWorkspace = async (path: string, name = ""): Promise<boolean> => {
     const trimmed_path = path.trim()
-    if (!trimmed_path) {
-      setNotice('enter a workspace path')
-      return false
-    }
+    const label = name.trim()
     setNotice(null)
     try {
-      const created = await interactiveCall('workspace.create', { path: trimmed_path })
+      const client_id = await ensureClientId()
+      const created = await interactiveCall('workspace.create', {
+        ...(trimmed_path ? { path: trimmed_path } : {}),
+        ...(label ? { label } : {}),
+        mutation: { request_key: mintId('web:workspace.create:'), client_id },
+      })
       let workspace_id: string | undefined
       if (created.error || created.ok === false) {
         if (!methodUnavailable(created)) {
           setNotice(created.error?.message ?? 'could not add workspace')
+          return false
+        }
+        if (!trimmed_path) {
+          setNotice('Update Verde on the host to create a workspace automatically.')
           return false
         }
         workspace_id = linuxWorkspaceId(trimmed_path)
@@ -3606,7 +3680,7 @@ export function createAppStore() {
           },
           workspace: {
             workspace_id,
-            label: labelFromPath(trimmed_path),
+            label: label || labelFromPath(trimmed_path),
             path: trimmed_path,
           },
         })
@@ -3615,8 +3689,9 @@ export function createAppStore() {
           return false
         }
       } else {
+        const result = unwrapResult<{ workspace_id?: string }>(created)
         const rows = workspacesFromLiveListing(created)
-        workspace_id = rows?.find((item) => item.path === trimmed_path)?.workspace_id ?? rows?.at(-1)?.workspace_id
+        workspace_id = result?.workspace_id ?? rows?.find((item) => item.path === trimmed_path)?.workspace_id ?? rows?.at(-1)?.workspace_id
       }
       liveWorkspaces = null
       liveLayouts = {}
@@ -3797,6 +3872,43 @@ export function createAppStore() {
     return false
   }
 
+  /// Sidebar drag drop: persist the new open-workspace order in the daemon
+  /// store, which the desktop re-projects like any other store change.
+  const moveWorkspace = async (id: string, before_id: string | null) => {
+    const current = workspaces()
+    const order = moveWorkspaceBefore(current.map((row) => row.workspace_id), id, before_id)
+    if (!order) return
+    pendingWorkspaceOrder = order
+    setWorkspaces(applyWorkspaceOrder(current, order))
+    publishPanes(workspaces())
+    try {
+      const response = await interactiveCall('workspace.reorder', {
+        mutation: { client_id: await ensureClientId(), request_key: mintId('web:workspace.reorder:') },
+        workspace_ids: order,
+      })
+      if (methodUnavailable(response)) setNotice('Update Verde to reorder workspaces from the web.')
+      else callSucceeded(response, 'could not reorder workspaces')
+    } catch {
+      setNotice('could not reorder workspaces')
+    } finally {
+      if (pendingWorkspaceOrder === order) pendingWorkspaceOrder = null
+      liveWorkspaces = null
+      await refreshProjection()
+    }
+  }
+
+  /// Desktop "Reopen Last Closed Workspace" and palette "Reopen <label>" rows.
+  const reopenClosedWorkspace = async (id?: string) => {
+    const target = id ?? closedWorkspaces()[0]?.workspace_id
+    if (!target) {
+      setNotice('No closed workspaces to reopen.')
+      return
+    }
+    if (await historyApi.reopenWorkspace(target)) {
+      setClosedWorkspaces((prev) => prev.filter((row) => row.workspace_id !== target))
+    }
+  }
+
   const workspaceCommand = (current: Workspace, patch: { label: string } | { archived: true }) =>
     requestWorkspaceCommand(interactiveCall, async () => ({
       client_id: await ensureClientId(),
@@ -3897,6 +4009,9 @@ export function createAppStore() {
       cwd: connectionFor(pane) === 'local' ? chatCwdPath(ws, routeThread(pane)) : ws.path,
       user_text: exchange.user,
       assistant_text: exchange.assistant,
+      // Lets the daemon store the generated search description.
+      workspace_id: ws.workspace_id,
+      local_thread_id: pane.thread_id,
     })
     const result = unwrapResult<{ title?: string | null; error_message?: string | null }>(response)
     const title = result?.title?.trim()
@@ -4743,6 +4858,7 @@ export function createAppStore() {
         'workspace.add': () => setWorkspaceDialogOpen(true),
         'workspace.rename': () => rename(false),
         'workspace.close': () => runSidebarContextAction({ action: 'workspace-close', workspace: current! }),
+        'workspace.reopen': () => reopenClosedWorkspace(),
         'workspace.previous': () => stepWorkspace(-1),
         'workspace.next': () => stepWorkspace(1),
         'app.settings': () => setSettingsOpen(true),
@@ -4827,6 +4943,12 @@ export function createAppStore() {
     window.addEventListener('pagehide', handlePageHide)
     window.addEventListener('pageshow', handlePageShow)
     window.addEventListener('online', recoverForeground)
+    // Working trees change outside Verde too; refresh chips when returning.
+    const refreshGitSummaries = () => {
+      if (document.visibilityState !== 'hidden') gitChanges.refreshSummaries(workspaces().map((row) => row.workspace_id))
+    }
+    window.addEventListener('focus', refreshGitSummaries)
+    document.addEventListener('visibilitychange', refreshGitSummaries)
     void refreshConnections()
     const connectionTick = window.setInterval(() => { void refreshConnections() }, 5000)
     const tick = window.setInterval(() => setConnected(client.connected), 1000)
@@ -4863,6 +4985,8 @@ export function createAppStore() {
       window.removeEventListener('pagehide', handlePageHide)
       window.removeEventListener('pageshow', handlePageShow)
       window.removeEventListener('online', recoverForeground)
+      window.removeEventListener('focus', refreshGitSummaries)
+      document.removeEventListener('visibilitychange', refreshGitSummaries)
       removeClientListener()
       client.disconnect()
     })
@@ -4889,6 +5013,9 @@ export function createAppStore() {
     connected,
     initialViewReady,
     workspaces,
+    closedWorkspaces,
+    moveWorkspace,
+    reopenClosedWorkspace,
     workspace,
     workspaceId,
     openPanes,
@@ -4921,6 +5048,9 @@ export function createAppStore() {
     compact,
     uiConfig,
     updateUiConfig,
+    commitConfig,
+    updateCommitConfig,
+    gitChanges,
     keybindConfig,
     prefixMode,
     prefixHelpVisible,

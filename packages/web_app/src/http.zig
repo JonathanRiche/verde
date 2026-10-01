@@ -4046,6 +4046,44 @@ test "paired directory listing uses repository read and the daemon route" {
     try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy("workspace.directory.list", 0));
 }
 
+test "git change review and commits are daemon routed with repository scopes" {
+    const access = headless.access_protocol;
+    const read = access.scopeBit(.repository_read);
+    const write = access.scopeBit(.repository_write);
+    const commit = access.scopeBit(.chat_write) | read;
+    const chat_preset = try access.scopeMask(access.PairingPreset.chat.scopes());
+    const monitor_preset = try access.scopeMask(access.PairingPreset.monitor.scopes());
+    inline for (.{ "git.changes.summary", "git.changes.status", "git.changes.review", "git.changes.commit_message" }) |method| {
+        try std.testing.expect(!blockedRpcMethod(method));
+        try std.testing.expectEqual(@as(PairedRpcPolicy, .{ .authorize = read }), pairedRpcPolicy(method, read));
+        try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy(method, 0));
+    }
+    // Chat-preset phones may commit and push their chats' changes without
+    // general repository:write; Monitor-preset phones stay read-only.
+    inline for (.{ "git.changes.commit", "git.changes.push", "git.changes.pull_push" }) |method| {
+        try std.testing.expect(!blockedRpcMethod(method));
+        try std.testing.expectEqual(@as(PairedRpcPolicy, .{ .authorize = commit }), pairedRpcPolicy(method, chat_preset));
+        try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy(method, monitor_preset));
+        try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy(method, read | write));
+        try std.testing.expect(@import("web_runtime").allowedMethod(method));
+    }
+    try std.testing.expect(@import("web_runtime").allowedMethod("git.changes.review"));
+    try std.testing.expect(@import("web_runtime").allowedMethod("git.changes.status"));
+    try std.testing.expect(@import("web_runtime").allowedMethod("git.changes.commit_message"));
+    // Settings writes are owner-only, like config.ui.set.
+    try std.testing.expectEqual(PairedRpcPolicy.forbidden, pairedRpcPolicy("config.commit.set", 0xffff));
+    try std.testing.expect(!blockedRpcMethod("config.commit.set"));
+    try std.testing.expect(!@import("web_runtime").allowedMethod("config.commit.set"));
+}
+
+test "workspace creation is daemon routed and requires repository write" {
+    const write = headless.access_protocol.scopeBit(.repository_write);
+    try std.testing.expect(!blockedRpcMethod("workspace.create"));
+    try std.testing.expect(@import("web_runtime").allowedMethod("workspace.create"));
+    try std.testing.expectEqual(@as(PairedRpcPolicy, .{ .authorize = write }), pairedRpcPolicy("workspace.create", write));
+    try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy("workspace.create", headless.access_protocol.scopeBit(.repository_read)));
+}
+
 test "workspace close is daemon routed and requires repository write" {
     const write = headless.access_protocol.scopeBit(.repository_write);
     try std.testing.expect(!blockedRpcMethod("workspace.close"));
