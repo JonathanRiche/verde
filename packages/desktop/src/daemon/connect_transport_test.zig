@@ -111,3 +111,32 @@ test "native Connect DELETE TLS framing bounds failures and unchanged POST" {
     try std.testing.expectEqual(@as(usize, 9), final_count);
     try std.testing.expectEqual(@as(usize, 3), ok_count);
 }
+
+test "native Connect DELETE completes compressed framing and refuses missing terminators" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(directory);
+    var fixture = try tls_fixture.Fixture.init(allocator, io, directory);
+    defer fixture.deinit(allocator, io);
+    var native: connect.HttpTransport = .{ .test_ca_file = fixture.ca_file };
+    for ([_][]const u8{ "/gzip-length", "/gzip-chunked", "/chunked" }) |path| {
+        const url = try std.fmt.allocPrint(allocator, "{s}{s}", .{ fixture.base_url, path });
+        defer allocator.free(url);
+        var response = try native.transport().send(allocator, .{ .method = .DELETE, .url = url, .body = BODY });
+        defer response.deinit(allocator);
+        try std.testing.expectEqual(.ok, response.status);
+        try std.testing.expectEqualStrings("{\"ok\":true}", response.body);
+    }
+    for ([_][]const u8{ "/gzip-truncated-length", "/gzip-truncated-chunk", "/gzip-delay-terminator" }) |path| {
+        const url = try std.fmt.allocPrint(allocator, "{s}{s}", .{ fixture.base_url, path });
+        defer allocator.free(url);
+        const started = std.Io.Clock.awake.now(io);
+        const expected = if (std.mem.eql(u8, path, "/gzip-delay-terminator")) error.ControlPlaneTimedOut else if (std.mem.eql(u8, path, "/gzip-truncated-chunk")) error.HttpChunkTruncated else error.ControlPlaneResponseTruncated;
+        try std.testing.expectError(expected, native.transport().send(allocator, .{ .method = .DELETE, .url = url, .body = BODY, .timeout_ms = if (expected == error.ControlPlaneTimedOut) 50 else 5000 }));
+        try std.testing.expect(started.durationTo(std.Io.Clock.awake.now(io)).nanoseconds < std.time.ns_per_s * 2);
+    }
+}

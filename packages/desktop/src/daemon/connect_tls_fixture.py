@@ -1,4 +1,5 @@
 """Finite offline native TLS fixture. Generated certs and synthetic authority only."""
+import gzip
 import http.server
 import json
 import os
@@ -39,13 +40,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if (root/'refuse').exists():status=403
             identity=json.loads((root/'identity.json').read_text())
             result=json.dumps(dict(contract_version='1',link_id=self.path.rsplit('/',1)[1],runtime_id=identity['runtime_id'],instance_id=identity['instance_id'],runtime_key_thumbprint='A'*43,runtime_encryption_key_thumbprint='B'*43,status='unlinked',created_at='2026-09-01T00:00:00Z',unlinked_at='2026-09-30T00:00:00Z')).encode()
+        compressed = self.path.startswith('/gzip-') or self.path.startswith('/v1/runtime-links/')
+        chunked = self.path in ('/chunked','/gzip-chunked','/gzip-truncated-chunk','/gzip-delay-terminator') or self.path.startswith('/v1/runtime-links/')
+        if compressed:result=gzip.compress(result)
         self.send_response(status)
         self.send_header('Content-Type','application/json')
-        self.send_header('Content-Length',str(len(result)+(5 if self.path=='/truncated' else 0)))
+        if compressed:self.send_header('Content-Encoding','gzip')
+        if chunked:self.send_header('Transfer-Encoding','chunked')
+        else:self.send_header('Content-Length',str(len(result)+(5 if self.path in ('/truncated','/gzip-truncated-length') else 0)))
         self.send_header('Connection','close')
         if status==302:self.send_header('Location','https://localhost:%d/ok'%self.server.server_port)
         self.end_headers()
-        try:self.wfile.write(result)
+        try:
+            if chunked:
+                self.wfile.write(('%x\r\n'%len(result)).encode()+result+b'\r\n')
+                self.wfile.flush()
+                if self.path=='/gzip-delay-terminator':time.sleep(.3)
+                if self.path!='/gzip-truncated-chunk':self.wfile.write(b'0\r\nX-Fixture: complete\r\n\r\n')
+            else:self.wfile.write(result)
         except (BrokenPipeError,ssl.SSLError):pass
         self.close_connection=True
 

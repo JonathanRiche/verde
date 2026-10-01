@@ -135,7 +135,7 @@ pub const HttpTransport = struct {
 // Zig 0.16's convenience body writer asserts for DELETE, although Connect v1
 // requires its bounded JSON body. Send one internally generated Content-Length
 // with the native head writer, then the exact bounded bytes on its TLS stream.
-const FetchConnectError = std.http.Client.FetchError || error{ControlPlaneResponseTruncated};
+const FetchConnectError = std.http.Client.FetchError || error{ ControlPlaneResponseTruncated, ControlPlaneResponseFramingInvalid };
 
 fn fetchConnect(client: *std.http.Client, options: std.http.Client.FetchOptions) FetchConnectError!std.http.Client.FetchResult {
     if (options.method != .DELETE or options.payload == null) return client.fetch(options);
@@ -172,11 +172,25 @@ fn fetchConnect(client: *std.http.Client, options: std.http.Client.FetchOptions)
     var decompress: std.http.Decompress = undefined;
     const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
     _ = reader.streamRemaining(response_writer) catch |err| switch (err) {
-        error.ReadFailed => return response.bodyErr().?,
+        error.ReadFailed => return response.bodyErr() orelse error.ReadFailed,
         else => |e| return e,
     };
-    // Zig's Content-Length reader propagates peer EOF as EndOfStream even
-    // with bytes outstanding. Never accept a partial JSON response as complete.
+    // A decompressor can finish before the native HTTP reader consumes the
+    // chunk terminator and trailers. Finish that framing through the native
+    // reader, permitting no additional encoded payload byte. The existing
+    // request deadline also covers this read; no unbounded drain occurs.
+    switch (req.reader.state) {
+        .body_remaining_content_length, .body_remaining_chunk_len => {
+            const trailing = req.reader.interface.discard(.limited(1)) catch |err| switch (err) {
+                error.EndOfStream => 0,
+                error.ReadFailed => return response.bodyErr() orelse error.ReadFailed,
+            };
+            if (trailing != 0) return error.ControlPlaneResponseFramingInvalid;
+        },
+        else => {},
+    }
+    // Content-Length EOF can occur with bytes outstanding. A complete JSON
+    // or compressed stream must never make an incomplete HTTP body valid.
     switch (req.reader.state) {
         .body_remaining_content_length, .body_remaining_chunk_len => return error.ControlPlaneResponseTruncated,
         else => {},
