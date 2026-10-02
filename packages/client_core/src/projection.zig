@@ -31,6 +31,8 @@ pub const ThreadSummary = struct {
     last_activity_at_ms: ?i64,
     status: []const u8,
     history_bucket: []const u8,
+    /// False for a draft that never sent a message; lists hide it like the desktop sidebar.
+    committed: bool = true,
 };
 pub const Workspace = struct {
     workspace_id: []const u8,
@@ -93,7 +95,7 @@ fn summary(ws: []const u8, t: V, turns: V, now: i64) ThreadSummary {
     const sec = store.threadActivitySeconds(num(get(t, "last_activity_at")));
     const ms = if (sec) |n| std.math.mul(i64, n, 1000) catch null else null;
     const age = @as(i128, now) - @as(i128, ms orelse 0);
-    return .{ .workspace_id = ws, .thread_id = s(t, "local_thread_id"), .title = fallback(s(t, "title"), "Chat"), .provider = fallback(s(t, "provider"), "opencode"), .model = nullable(get(t, "model_ref")), .cwd = nullable(get(t, "cwd")), .open = !eqFalse(get(t, "open")), .archived = yes(get(t, "archived")), .last_activity_at_ms = ms, .status = fallback(s(turnFor(turns, ws, s(t, "local_thread_id")), "status"), "idle"), .history_bucket = if (age < 86_400_000) "Today" else if (age < 604_800_000) "This week" else "Older" };
+    return .{ .workspace_id = ws, .thread_id = s(t, "local_thread_id"), .title = fallback(s(t, "title"), "Chat"), .provider = fallback(s(t, "provider"), "opencode"), .model = nullable(get(t, "model_ref")), .cwd = nullable(get(t, "cwd")), .open = !eqFalse(get(t, "open")), .archived = yes(get(t, "archived")), .committed = !eqFalse(get(t, "committed")), .last_activity_at_ms = ms, .status = fallback(s(turnFor(turns, ws, s(t, "local_thread_id")), "status"), "idle"), .history_bucket = if (age < 86_400_000) "Today" else if (age < 604_800_000) "This week" else "Older" };
 }
 fn eqFalse(v: V) bool {
     return v == .bool and !v.bool;
@@ -277,7 +279,7 @@ pub fn project(a: A, snapshot: V, catalog: []const V, has_catalog: bool, now: i6
         for (threads.items) |t| {
             const item = summary(wid, t, turns, now);
             try summaries.append(a, item);
-            try history.append(a, item);
+            if (item.committed) try history.append(a, item);
         }
         const panes = try panesForWorkspace(a, ws, threads.items, get(snapshot, "sessions"), turns);
         if (!yes(get(ws, "archived"))) {

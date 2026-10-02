@@ -215,10 +215,13 @@ func paneLine(_ pane: Pane, _ nowMs: Int64) -> String {
 
 func isSubagent(_ thread: ThreadSummary) -> Bool { thread.thread_id.hasPrefix("subagent:") }
 
+/// Chat lists match the desktop sidebar: a draft that never sent a message stays hidden unless a turn is live.
+func listed(_ thread: ThreadSummary) -> Bool { !isSubagent(thread) && (thread.committed || activeTurn(thread.status)) }
+
 /// History is independently filtered and paged; Home uses the live workspace catalog.
 func recentThreads(_ workspaces: WorkspacesView?, limit: Int = 8) -> [ThreadSummary] {
     Array((workspaces?.items ?? []).flatMap(\.threads)
-        .filter { !$0.archived && !isSubagent($0) }
+        .filter { !$0.archived && listed($0) }
         .sorted {
             let a = $0.last_activity_at_ms ?? 0, b = $1.last_activity_at_ms ?? 0
             if a != b { return a > b }
@@ -244,7 +247,7 @@ func openable(_ pane: Pane) -> Bool {
 
 /// Counts shown on a workspace row: "N chats · N terminals · N active · closed" plus a K-17 badge.
 func workspaceSummary(_ workspace: Workspace) -> (summary: String, active: Int, badge: String?) {
-    let chats = workspace.threads.filter { !isSubagent($0) && !$0.archived }.count
+    let chats = workspace.threads.filter { listed($0) && !$0.archived }.count
     let terminals = workspace.panes.filter { $0.kind == "terminal" && $0.terminal_id != nil }.count
     let active = workspace.panes.filter { $0.attention || $0.can_stop || $0.status == "working" }.count
     let flagged = workspace.panes.filter { $0.attention_kind != nil }.count

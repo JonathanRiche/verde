@@ -138,13 +138,15 @@ class BrowseTest {
             workspace.copy(workspace_id = "a", threads = listOf(
                 thread("unknown", null), thread("older", 100),
                 thread("archived", 900).copy(archived = true),
-                thread("subagent:child", 800), thread("tie", 200))),
+                thread("subagent:child", 800), thread("tie", 200),
+                thread("draft", 950).copy(committed = false),
+                thread("draft-running", 50).copy(committed = false, status = "running"))),
             workspace.copy(workspace_id = "b", threads = listOf(
                 thread("newest", 300, "b"), thread("tie", 200, "b"))),
         ), history = view.history.copy(query = "older", items = listOf(thread("older", 100))))
         assertEquals(listOf("b:newest", "a:tie", "b:tie"),
             recentThreads(catalog, 3).map { "${it.workspace_id}:${it.thread_id}" })
-        assertEquals(listOf("newest", "tie", "tie", "older", "unknown"),
+        assertEquals(listOf("newest", "tie", "tie", "older", "draft-running", "unknown"),
             recentThreads(catalog).map { it.thread_id })
         assertEquals(recentThreads(catalog), recentThreads(catalog.copy(
             history = catalog.history.copy(items = emptyList()))))

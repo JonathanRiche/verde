@@ -6277,6 +6277,7 @@ struct ThreadSummary: Codable {
     var `last_activity_at_ms`: Int64?
     var `status`: String
     var `history_bucket`: String
+    var `committed`: Bool = true
 }
 
 extension ThreadSummary {
@@ -6292,6 +6293,7 @@ extension ThreadSummary {
         case `last_activity_at_ms`
         case `status`
         case `history_bucket`
+        case `committed`
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -6306,6 +6308,9 @@ extension ThreadSummary {
         self.`last_activity_at_ms` = try c.decodeIfPresent(Int64.self, forKey: .`last_activity_at_ms`)
         self.`status` = try c.decode(String.self, forKey: .`status`)
         self.`history_bucket` = try c.decode(String.self, forKey: .`history_bucket`)
+        if !c.contains(.`committed`) { self.`committed` = true } else {
+        self.`committed` = try c.decode(Bool.self, forKey: .`committed`)
+        }
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -6320,6 +6325,7 @@ extension ThreadSummary {
         try c.encode(self.`last_activity_at_ms`, forKey: .`last_activity_at_ms`)
         try c.encode(self.`status`, forKey: .`status`)
         try c.encode(self.`history_bucket`, forKey: .`history_bucket`)
+        try c.encode(self.`committed`, forKey: .`committed`)
     }
 }
 

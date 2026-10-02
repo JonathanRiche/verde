@@ -96,10 +96,13 @@ internal fun paneLine(pane: Pane, nowMs: Long): String {
 
 internal fun subagent(thread: ThreadSummary) = thread.thread_id.startsWith("subagent:")
 
+/** Chat lists match the desktop sidebar: a draft that never sent a message stays hidden unless a turn is live. */
+internal fun listed(thread: ThreadSummary) = !subagent(thread) && (thread.committed || activeTurn(thread.status))
+
 /** Use the live catalog: history belongs to the independently filtered, paged search screen. */
 internal fun recentThreads(workspaces: WorkspacesView?, limit: Int = 8): List<ThreadSummary> =
     workspaces?.items.orEmpty().flatMap { it.threads }
-        .filter { !it.archived && !subagent(it) }
+        .filter { !it.archived && listed(it) }
         .sortedWith(compareByDescending<ThreadSummary> { it.last_activity_at_ms ?: 0L }
             .thenBy { it.workspace_id }.thenBy { it.thread_id })
         .take(limit)
@@ -388,7 +391,7 @@ internal fun HomeScreen(
 @Composable
 private fun WorkspaceItem(workspace: Workspace, onOpen: (String) -> Unit) {
     @Suppress("DEPRECATION") val clipboard = LocalClipboardManager.current
-    val chats = workspace.threads.count { !subagent(it) && !it.archived }
+    val chats = workspace.threads.count { listed(it) && !it.archived }
     val terminals = workspace.panes.count { it.kind == "terminal" && it.terminal_id != null }
     val active = workspace.panes.count { it.attention || it.can_stop || it.status == "working" }
     val flagged = workspace.panes.count { it.attention_kind != null }
@@ -456,7 +459,7 @@ internal fun WorkspaceScreen(
         if (onNewTerminal != null && canWrite(state.host) && workspace.path.isNotEmpty()) item(key = "new-terminal") {
             TextButton(onClick = onNewTerminal, modifier = Modifier.padding(horizontal = 8.dp)) { Text("New terminal") }
         }
-        val threads = workspaceThreads(workspace)
+        val threads = workspaceThreads(workspace).filter(::listed)
         val (archived, current) = threads.partition { it.archived }
         header("Chats")
         if (current.isEmpty()) note("nochats", "No chats in this workspace yet.")

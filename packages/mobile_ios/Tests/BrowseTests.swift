@@ -115,6 +115,9 @@ final class BrowseTests: XCTestCase {
         a.workspace_id = "a"
         a.threads = [thread("unknown", nil), thread("older", 100), thread("archived", 900, archived: true),
                      thread("subagent:child", 800), thread("tie", 200)]
+        var draft = thread("draft", 950); draft.committed = false
+        var running = thread("draft-running", 50); running.committed = false; running.status = "running"
+        a.threads += [draft, running]
         b.workspace_id = "b"
         b.threads = [thread("newest", 300, workspaceID: "b"), thread("tie", 200, workspaceID: "b")]
         view.items = [a, b]
@@ -122,7 +125,7 @@ final class BrowseTests: XCTestCase {
         view.history.next_cursor = "next-page"
         XCTAssertEqual(recentThreads(view, limit: 3).map { "\($0.workspace_id):\($0.thread_id)" }, ["b:newest", "a:tie", "b:tie"])
         let ids = recentThreads(view).map(\.thread_id)
-        XCTAssertEqual(ids, ["newest", "tie", "tie", "older", "unknown"])
+        XCTAssertEqual(ids, ["newest", "tie", "tie", "older", "draft-running", "unknown"])
         view.history.items = []; view.history.loading = true
         XCTAssertEqual(recentThreads(view).map(\.thread_id), ids)
         XCTAssertTrue(recentThreads(nil).isEmpty)

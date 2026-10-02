@@ -319,7 +319,7 @@ struct WorkspaceScreen: View {
                         }
                     }
                 }
-                let threads = workspaceThreads(workspace)
+                let threads = workspaceThreads(workspace).filter(listed)
                 let current = threads.filter { !$0.archived }
                 let archived = threads.filter(\.archived)
                 Section("Chats") {

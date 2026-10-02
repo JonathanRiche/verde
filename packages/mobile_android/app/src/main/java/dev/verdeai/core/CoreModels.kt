@@ -1602,6 +1602,7 @@ data class ThreadSummary(
     val `last_activity_at_ms`: Long?,
     val `status`: String,
     val `history_bucket`: String,
+    val `committed`: Boolean = true,
 )
 
 @Serializable

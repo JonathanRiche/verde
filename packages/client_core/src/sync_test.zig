@@ -804,3 +804,23 @@ test "workspace projection normalizes legacy milliseconds before recent sorting 
         try eql("old", models.workspaces[0].panes[1].thread_id.?);
     }
 }
+
+test "workspace projection keeps uncommitted drafts out of history but in the thread catalog" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const data = try host.parse(a,
+        \\{"snapshot":{"workspaces":[{"workspace_id":"w","threads":[]}]}}
+    );
+    const listed = [_]std.json.Value{
+        try host.parse(a, "{\"workspace_id\":\"w\",\"local_thread_id\":\"draft\",\"title\":\"New Chat\",\"committed\":false,\"last_activity_at\":1790000050}"),
+        try host.parse(a, "{\"workspace_id\":\"w\",\"local_thread_id\":\"real\",\"title\":\"Real\",\"committed\":true,\"last_activity_at\":1790000000}"),
+        try host.parse(a, "{\"workspace_id\":\"w\",\"local_thread_id\":\"legacy\",\"title\":\"Legacy\",\"last_activity_at\":1700000000}"),
+    };
+    const models = try p.project(a, data, &listed, true, 1790000060000);
+    try std.testing.expectEqual(@as(usize, 2), models.history.len);
+    try eql("real", models.history[0].thread_id);
+    try eql("legacy", models.history[1].thread_id);
+    try std.testing.expectEqual(@as(usize, 3), models.workspaces[0].threads.len);
+    for (models.workspaces[0].threads) |t| try expect(t.committed == !std.mem.eql(u8, t.thread_id, "draft"));
+}
