@@ -3525,6 +3525,68 @@ pub const Store = struct {
         );
     }
 
+    /// The inverse of `dropClosedThreadPanes`: a chat reopened by any client
+    /// (a phone send, History) gets a pane back in the stored layout, so the
+    /// desktop and every web client show it again. Existing chat panes are
+    /// rebound by identity because the reopened row can shift ordinals. Focus
+    /// stays where it was; a layout-less workspace is left to its fallback.
+    fn restoreReopenedThreadPane(self: *Self, workspace_row_id: i64, reopened_thread_id: []const u8, before: []const []u8) !void {
+        const allocator = self.allocator;
+        const stored = stored: {
+            const row = (try self.conn.row(
+                "select workspace_layout_json, selected_thread_index from workspaces where id = ?1",
+                .{workspace_row_id},
+            )) orelse return;
+            defer row.deinit();
+            const json = row.nullableText(0) orelse return;
+            if (json.len == 0) return;
+            break :stored .{ .json = try allocator.dupe(u8, json), .selected = row.nullableInt(1) orelse 0 };
+        };
+        defer allocator.free(stored.json);
+
+        var after = try self.visibleThreadIds(workspace_row_id);
+        defer freeThreadIds(allocator, &after);
+        const reopened_index = indexOfThreadId(after.items, reopened_thread_id) orelse return;
+
+        var layout: workspace_layout.WorkspaceLayout = .{};
+        defer layout.deinit(allocator);
+        layout.applyPersistedWorkspaceJson(allocator, stored.json) catch return;
+
+        var existing: ?workspace_layout.WorkspacePaneId = null;
+        for (layout.panes.items) |*pane| switch (pane.ref) {
+            .chat => |*ref| {
+                if (ref.thread_index >= before.len) continue;
+                const rebound = indexOfThreadId(after.items, before[ref.thread_index]) orelse continue;
+                ref.thread_index = rebound;
+                if (rebound == reopened_index and existing == null) existing = pane.id;
+            },
+            else => {},
+        };
+        if (existing == null or !layout.rootContainsPane(existing.?)) {
+            const focused = layout.focused_pane_id;
+            const pane_id = existing orelse try layout.createChatPane(allocator, reopened_index);
+            if (focused orelse layout.firstVisiblePaneId()) |target_id| {
+                try layout.splitPaneWithLeaf(allocator, target_id, pane_id, .vertical, true);
+            } else {
+                try layout.replaceRootWithLeaf(allocator, pane_id);
+            }
+            layout.focused_pane_id = focused orelse pane_id;
+        }
+
+        const selected_before: usize = std.math.cast(usize, stored.selected) orelse 0;
+        const selected_after: usize = if (selected_before < before.len)
+            indexOfThreadId(after.items, before[selected_before]) orelse selected_before
+        else
+            selected_before;
+
+        const json = try layout.persistedWorkspaceJson(allocator);
+        defer allocator.free(json);
+        try self.conn.exec(
+            "update workspaces set workspace_layout_json = ?1, selected_thread_index = ?2 where id = ?3",
+            .{ json, @as(i64, @intCast(selected_after)), workspace_row_id },
+        );
+    }
+
     fn indexOfThreadId(ids: []const []u8, thread_id: []const u8) ?usize {
         for (ids, 0..) |id, index| {
             if (std.mem.eql(u8, id, thread_id)) return index;
@@ -3549,10 +3611,12 @@ pub const Store = struct {
         const open = boolToInt(!request.archived);
         if (row.int(1) == archived and row.int(2) == open) return false;
         const closing = row.int(2) != 0 and open == 0;
-        var before: std.ArrayList([]u8) = if (closing) try self.visibleThreadIds(try self.threadWorkspaceRowId(row.int(0))) else .empty;
+        const reopening = row.int(2) == 0 and open != 0;
+        var before: std.ArrayList([]u8) = if (closing or reopening) try self.visibleThreadIds(try self.threadWorkspaceRowId(row.int(0))) else .empty;
         defer freeThreadIds(self.allocator, &before);
         try self.conn.exec("update threads set archived = ?1, open = ?2 where id = ?3", .{ archived, open, row.int(0) });
         if (closing) try self.dropClosedThreadPanes(try self.threadWorkspaceRowId(row.int(0)), request.local_thread_id, before.items);
+        if (reopening) try self.restoreReopenedThreadPane(try self.threadWorkspaceRowId(row.int(0)), request.local_thread_id, before.items);
         return true;
     }
 
@@ -3576,11 +3640,16 @@ pub const Store = struct {
         const access_code = if (thread.access_mode) |value| try accessModeCode(value) else null;
 
         const existing = try self.conn.row(
-            "select id from threads where workspace_id = ?1 and local_thread_id = ?2",
+            "select id, open from threads where workspace_id = ?1 and local_thread_id = ?2",
             .{ workspace_id, thread.local_thread_id },
         );
         if (existing) |row| {
             defer row.deinit();
+            // A send from another client (phone, web) reopens a closed chat;
+            // capture the pane ordinals first so its pane comes back too.
+            const reopening = row.int(1) == 0 and !thread.archived;
+            var before: std.ArrayList([]u8) = if (reopening) try self.visibleThreadIds(workspace_id) else .empty;
+            defer freeThreadIds(self.allocator, &before);
             const draft_images_json = try encodeExtraImagesJson(self.allocator, thread.draft_images);
             defer if (draft_images_json) |value| self.allocator.free(value);
             try self.conn.exec(
@@ -3613,6 +3682,7 @@ pub const Store = struct {
                 },
             );
             try self.conn.exec("update threads set open = ?1 where id = ?2 and open != ?1", .{ boolToInt(!thread.archived), row.int(0) });
+            if (reopening) try self.restoreReopenedThreadPane(workspace_id, thread.local_thread_id, before.items);
             return;
         }
 
@@ -5790,6 +5860,58 @@ test "thread close drops its panes from the stored layout and rebinds the rest" 
     try std.testing.expect(stored.rootContainsPane(c_pane));
     try std.testing.expectEqual(@as(usize, 0), stored.paneById(1).?.ref.chat.thread_index);
     try std.testing.expectEqual(@as(usize, 1), stored.paneById(c_pane).?.ref.chat.thread_index);
+}
+
+test "a chat reopened by another client gets its pane back in the stored layout" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer allocator.free(db_path);
+    var store = try Store.init(allocator, db_path);
+    defer store.deinit();
+
+    var layout = try workspace_layout.WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+    const b_pane = try layout.createChatPane(allocator, 1);
+    try layout.splitPaneWithLeaf(allocator, 1, b_pane, .vertical, true);
+    const c_pane = try layout.createChatPane(allocator, 2);
+    try layout.splitPaneWithLeaf(allocator, b_pane, c_pane, .vertical, true);
+    const layout_json = try layout.persistedWorkspaceJson(allocator);
+    defer allocator.free(layout_json);
+
+    var workspace = testWorkspace("ws", "WS");
+    workspace.workspace_layout_json = layout_json;
+    workspace.threads = &.{ testThread("a", "A"), testThread("b", "B"), testThread("c", "C") };
+    const bootstrap = try store.replaceSnapshot(testSnapshotRequest("boot", null, true, testSnapshot(&.{workspace})));
+    const closed = try store.closeThread(.{ .mutation = testHeader("close-b", bootstrap.store_revision), .workspace_id = "ws", .local_thread_id = "b" });
+    const focused_before = focused: {
+        var row = (try store.conn.row("select workspace_layout_json from workspaces where workspace_id = 'ws'", .{})).?;
+        defer row.deinit();
+        var stored: workspace_layout.WorkspaceLayout = .{};
+        defer stored.deinit(allocator);
+        try stored.applyPersistedWorkspaceJson(allocator, row.text(0));
+        break :focused stored.focused_pane_id;
+    };
+
+    // A phone send upserts the closed thread's settings, which reopens it.
+    const reopened = try store.upsertThread(.{ .mutation = testHeader("send-b", closed.store_revision), .workspace_id = "ws", .thread = testThread("b", "B") });
+    // Repeating the upsert on the open thread must not add a second pane.
+    _ = try store.upsertThread(.{ .mutation = testHeader("send-b-again", reopened.store_revision), .workspace_id = "ws", .thread = testThread("b", "B") });
+
+    var row = (try store.conn.row("select workspace_layout_json, open from threads t join workspaces w on w.id = t.workspace_id where w.workspace_id = 'ws' and t.local_thread_id = 'b'", .{})).?;
+    defer row.deinit();
+    try std.testing.expectEqual(@as(i64, 1), row.int(1));
+    var stored: workspace_layout.WorkspaceLayout = .{};
+    defer stored.deinit(allocator);
+    try stored.applyPersistedWorkspaceJson(allocator, row.text(0));
+    try std.testing.expectEqual(@as(usize, 3), stored.panes.items.len);
+    try std.testing.expectEqual(focused_before, stored.focused_pane_id);
+    // Visible order is now a, c, b: the reopened row sorts last.
+    try std.testing.expectEqual(@as(usize, 0), stored.paneById(1).?.ref.chat.thread_index);
+    try std.testing.expectEqual(@as(usize, 1), stored.paneById(c_pane).?.ref.chat.thread_index);
+    const restored = stored.visibleChatPaneIdForThread(2) orelse return error.TestExpectedEqual;
+    try std.testing.expect(restored != 1 and restored != c_pane);
 }
 
 test "thread move reassigns the row, rekeys turn records, and detaches links" {
