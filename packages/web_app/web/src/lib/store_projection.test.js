@@ -276,6 +276,30 @@ test('lastDeliveredTailSeq never advances to the daemon next unused sequence', (
 })
 
 describe('panesForWorkspace', () => {
+  test('binds layout panes to visible ordinals across sort_index gaps', () => {
+    const workspace = {
+      workspace_id: 'workspace-1',
+      label: 'Workspace',
+      path: '/workspace',
+      threads: [
+        { local_thread_id: 'a', title: 'A', sort_index: 0, open: true },
+        { local_thread_id: 'b', title: 'B', sort_index: 3, open: true },
+        { local_thread_id: 'closed', title: 'Closed', sort_index: 4, open: false },
+        { local_thread_id: 'busy', title: 'Busy', sort_index: 5, open: false },
+        { local_thread_id: 'pm', title: 'Project Manager', sort_index: 7, open: true },
+        { local_thread_id: 'late', title: 'Late', sort_index: 18, open: true },
+      ],
+      workspace_layout_json: JSON.stringify({
+        panes: [0, 1, 2, 3, 4].map((thread) => ({ id: thread + 1, kind: 'chat', thread })),
+      }),
+    }
+    const turns = [{ workspace_id: 'workspace-1', local_thread_id: 'busy', status: 'running' }]
+
+    const titles = panesForWorkspace(workspace, [], turns, new Set()).map((pane) => pane.thread_title)
+
+    expect(titles).toEqual(['A', 'B', 'Busy', 'Project Manager', 'Late'])
+  })
+
   test('shows open committed chats started by another web client', () => {
     const workspace = {
       workspace_id: 'workspace-1',

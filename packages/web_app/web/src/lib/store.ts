@@ -1121,6 +1121,31 @@ export function isOpenWebClientThread(thread: Thread): boolean {
   return thread.local_thread_id.startsWith('web-thread-') && thread.open !== false && thread.committed !== false
 }
 
+/// Layout chat panes index the daemon's visible thread list: open rows plus
+/// closed rows with a live turn, ordered by sort_index. Closes and moves leave
+/// gaps in sort_index, so matching it directly binds panes to the wrong chat
+/// (or none). Daemons without the open bit keep the sort_index contract.
+export function layoutThreadOrdinals(
+  workspace: Workspace,
+  threads: Thread[],
+  turns: SnapshotTurn[],
+): (thread: Thread, ordinal: number | undefined) => boolean {
+  if (!threads.some((thread) => typeof thread.open === 'boolean')) {
+    return (thread, ordinal) => thread.sort_index === ordinal
+  }
+  const live = new Set(
+    turns
+      .filter((turn) => (!turn.workspace_id || turn.workspace_id === workspace.workspace_id) && LIVE_TURN_STATUSES.has(turn.status ?? ''))
+      .map((turn) => turn.local_thread_id),
+  )
+  const visible = threads
+    .filter((thread) => thread.open !== false || live.has(thread.local_thread_id))
+    .sort((a, b) => (a.sort_index ?? Number.MAX_SAFE_INTEGER) - (b.sort_index ?? Number.MAX_SAFE_INTEGER))
+  return (thread, ordinal) => ordinal != null && visible[ordinal] === thread
+}
+
+const LIVE_TURN_STATUSES = new Set(['accepted', 'running', 'waiting_approval'])
+
 /// Panes actually open in a workspace. The desktop-persisted layout in the
 /// daemon store is the source of truth; the old N-most-recent-threads
 /// heuristic remains only as a fallback for daemons that cannot serve the
@@ -1141,12 +1166,13 @@ export function panesForWorkspace(
   const rows: LivePane[] = []
   const used_threads = new Set<string>()
   const used_sessions = new Set<string>()
+  const at_ordinal = layoutThreadOrdinals(workspace, threads, turns)
   if (layout) {
     for (const pane of layout.panes ?? []) {
       const focused = layout.focused != null && layout.focused === pane.id
       if (pane.kind === 'chat' && typeof pane.thread === 'number') {
         // Layout references chat panes by position in the desktop thread
-        // array, which the store mirrors as thread sort_index — but store
+        // array: the daemon's visible thread list (layoutThreadOrdinals) — but store
         // rows lag the desktop, so index and title both drift. Binding order:
         // provider thread id (rename-proof), exact title + sort index, then
         // title/index fallbacks only for persisted layouts. A live pane whose
@@ -1159,7 +1185,7 @@ export function panesForWorkspace(
         // only for that narrow transition.
         const placeholder_indexed = pane.title && isPlaceholderThreadTitle(pane.title)
           ? threads.find(
-              (item) => item.sort_index === pane.thread && localThreadIds.has(item.local_thread_id),
+              (item) => at_ordinal(item, pane.thread) && localThreadIds.has(item.local_thread_id),
             )
           : undefined
         const thread =
@@ -1169,12 +1195,12 @@ export function panesForWorkspace(
           (pane.provider_thread_id
             ? threads.find((item) => item.provider_thread_id === pane.provider_thread_id)
             : undefined) ??
-          titled.find((item) => item.sort_index === pane.thread) ??
+          titled.find((item) => at_ordinal(item, pane.thread)) ??
           placeholder_indexed ??
           (has_live_layout ? undefined : titled[0]) ??
           (has_live_layout || pane.title
             ? undefined
-            : threads.find((item) => item.sort_index === pane.thread))
+            : threads.find((item) => at_ordinal(item, pane.thread)))
         if (thread && (!thread.archived || pane.title)) {
           // The daemon thread is the authority for the next turn's settings.
           // Desktop chat.status can lag a web click by several projection
