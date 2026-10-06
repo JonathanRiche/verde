@@ -1491,6 +1491,7 @@ enum Event: Codable {
     case `new_chat_select`(EventNewChatSelect)
     case `workspace_create`(EventWorkspaceCreate)
     case `workspace_rename`(EventWorkspaceRename)
+    case `workspace_identity`(EventWorkspaceIdentity)
     case `workspace_archive`(EventWorkspaceArchive)
     case `workspace_close`(EventWorkspaceClose)
     case `directory_list`(EventDirectoryList)
@@ -1562,6 +1563,7 @@ enum Event: Codable {
         case "new_chat_select": self = .`new_chat_select`(try EventNewChatSelect(from: decoder))
         case "workspace_create": self = .`workspace_create`(try EventWorkspaceCreate(from: decoder))
         case "workspace_rename": self = .`workspace_rename`(try EventWorkspaceRename(from: decoder))
+        case "workspace_identity": self = .`workspace_identity`(try EventWorkspaceIdentity(from: decoder))
         case "workspace_archive": self = .`workspace_archive`(try EventWorkspaceArchive(from: decoder))
         case "workspace_close": self = .`workspace_close`(try EventWorkspaceClose(from: decoder))
         case "directory_list": self = .`directory_list`(try EventDirectoryList(from: decoder))
@@ -1634,6 +1636,7 @@ enum Event: Codable {
         case .`new_chat_select`(let value): try value.encode(to: encoder)
         case .`workspace_create`(let value): try value.encode(to: encoder)
         case .`workspace_rename`(let value): try value.encode(to: encoder)
+        case .`workspace_identity`(let value): try value.encode(to: encoder)
         case .`workspace_archive`(let value): try value.encode(to: encoder)
         case .`workspace_close`(let value): try value.encode(to: encoder)
         case .`directory_list`(let value): try value.encode(to: encoder)
@@ -3978,6 +3981,56 @@ extension EventWorkspaceRename {
         try c.encode(self.`label`, forKey: .`label`)
         var tag = encoder.container(keyedBy: ModelDiscriminator.self)
         try tag.encode("workspace_rename", forKey: .type)
+    }
+}
+
+struct EventWorkspaceIdentity: Codable {
+    var `api_version`: UInt32 = 1
+    var `now_ms`: Int64
+    var `wall_time_ms`: Int64
+    var `intent_id`: String
+    var `workspace_id`: String
+    var `icon_index`: UInt8? = nil
+    var `color_index`: UInt8? = nil
+}
+
+extension EventWorkspaceIdentity {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `now_ms`
+        case `wall_time_ms`
+        case `intent_id`
+        case `workspace_id`
+        case `icon_index`
+        case `color_index`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`now_ms` = try c.decode(Int64.self, forKey: .`now_ms`)
+        self.`wall_time_ms` = try c.decode(Int64.self, forKey: .`wall_time_ms`)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        if !c.contains(.`icon_index`) { self.`icon_index` = nil } else {
+        self.`icon_index` = try c.decodeIfPresent(UInt8.self, forKey: .`icon_index`)
+        }
+        if !c.contains(.`color_index`) { self.`color_index` = nil } else {
+        self.`color_index` = try c.decodeIfPresent(UInt8.self, forKey: .`color_index`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`now_ms`, forKey: .`now_ms`)
+        try c.encode(self.`wall_time_ms`, forKey: .`wall_time_ms`)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`icon_index`, forKey: .`icon_index`)
+        try c.encode(self.`color_index`, forKey: .`color_index`)
+        var tag = encoder.container(keyedBy: ModelDiscriminator.self)
+        try tag.encode("workspace_identity", forKey: .type)
     }
 }
 
@@ -6338,6 +6391,8 @@ struct Workspace: Codable {
     var `threads`: [ThreadSummary]
     var `icon_index`: UInt8 = 0
     var `color_index`: UInt8 = 0
+    var `icon_custom`: Bool = false
+    var `color_custom`: Bool = false
     var `recency_ms`: Int64? = nil
     var `recency_rank`: UInt32 = 0
 }
@@ -6352,6 +6407,8 @@ extension Workspace {
         case `threads`
         case `icon_index`
         case `color_index`
+        case `icon_custom`
+        case `color_custom`
         case `recency_ms`
         case `recency_rank`
     }
@@ -6368,6 +6425,12 @@ extension Workspace {
         }
         if !c.contains(.`color_index`) { self.`color_index` = 0 } else {
         self.`color_index` = try c.decode(UInt8.self, forKey: .`color_index`)
+        }
+        if !c.contains(.`icon_custom`) { self.`icon_custom` = false } else {
+        self.`icon_custom` = try c.decode(Bool.self, forKey: .`icon_custom`)
+        }
+        if !c.contains(.`color_custom`) { self.`color_custom` = false } else {
+        self.`color_custom` = try c.decode(Bool.self, forKey: .`color_custom`)
         }
         if !c.contains(.`recency_ms`) { self.`recency_ms` = nil } else {
         self.`recency_ms` = try c.decodeIfPresent(Int64.self, forKey: .`recency_ms`)
@@ -6386,6 +6449,8 @@ extension Workspace {
         try c.encode(self.`threads`, forKey: .`threads`)
         try c.encode(self.`icon_index`, forKey: .`icon_index`)
         try c.encode(self.`color_index`, forKey: .`color_index`)
+        try c.encode(self.`icon_custom`, forKey: .`icon_custom`)
+        try c.encode(self.`color_custom`, forKey: .`color_custom`)
         try c.encode(self.`recency_ms`, forKey: .`recency_ms`)
         try c.encode(self.`recency_rank`, forKey: .`recency_rank`)
     }

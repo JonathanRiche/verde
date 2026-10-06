@@ -62,14 +62,18 @@ internal data class DrawerItem(val workspace: Workspace, val thread: ThreadSumma
     val title get() = thread?.title ?: pane?.title.orEmpty()
 }
 
-/** Flat Active/Open rows for open workspaces in scope (null = All Workspaces), by workspace recency. */
+/**
+ * Flat Active/Open rows by workspace recency. Active always spans every open workspace;
+ * Open follows the scope (null = All Workspaces).
+ */
 internal fun drawerItems(items: List<Workspace>, scope: String?): Pair<List<DrawerItem>, List<DrawerItem>> {
-    val rows = switcherWorkspaces(items).filter { it.open && (scope == null || it.workspace_id == scope) }.flatMap { ws ->
+    val rows = switcherWorkspaces(items).filter { it.open }.flatMap { ws ->
         val panes = ws.panes.associateBy { it.thread_id }
         drawerThreads(ws).map { DrawerItem(ws, it, panes[it.thread_id]) } +
             ws.panes.filter { it.kind == "terminal" && it.terminal_id != null }.map { DrawerItem(ws, null, it) }
     }
-    return rows.partition { it.active }
+    val (active, open) = rows.partition { it.active }
+    return active to open.filter { scope == null || it.workspace.workspace_id == scope }
 }
 
 /** Shared browse projections only: scope and search never mutate the host. */
@@ -121,8 +125,7 @@ internal fun WorkspaceDrawer(state: BrowseState, currentTab: String, visible: Bo
                 if (ready) {
                     if (scoped != null && !scoped.open) item { Text("${scoped.label} is closed.", Modifier.padding(16.dp), color = VerdeColors.Muted) }
                     val (active, open) = drawerItems(all, scope)
-                    val chip = scope == null
-                    fun section(title: String, rows: List<DrawerItem>) {
+                    fun section(title: String, rows: List<DrawerItem>, chip: Boolean) {
                         val shown = rows.filter { matches(it.title) || matches(it.workspace.label) }
                         if (shown.isEmpty()) return
                         item(key = "section:$title") { VerdeSection(title) }
@@ -135,8 +138,9 @@ internal fun WorkspaceDrawer(state: BrowseState, currentTab: String, visible: Bo
                             }
                         }
                     }
-                    section("Active", active)
-                    section("Open", open)
+                    // Active is global, so its rows always name their workspace.
+                    section("Active", active, chip = true)
+                    section("Open", open, chip = scope == null)
                     if (filter.isNotEmpty()) item(key = "history") { DrawerRow("Search all chat history for \"$filter\"", false, onClick = onHistory) }
                 }
             }

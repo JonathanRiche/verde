@@ -255,6 +255,7 @@ Optional values below may be null. These are new local names, not RPC names.
 | `thread_create` | `workspace_id,provider,model?,effort?,access?,speed?`; validated against the same catalogs. Registers a client if needed, then calls `chat.thread.upsert` with a new `web-thread-*` ID, the title `New Chat`, `committed:false`, `profile_id:local`, `repository_id:primary`, and `access` defaulting to `full_access`. The job's `thread_id` is set immediately. On success the thread opens right away (`thread_open`), even before sync lists it. The first `send` commits it. A closed workspace fails locally with `workspace_archived`. Needs `chat:write`. |
 | `workspace_create` | `path,label?`; an absolute path without `.`/`..` segments, whitespace and trailing `/` trimmed. The ID matches the web's fallback (wyhash seed 0, lowercase hex), and the label defaults to the last path component. Calls `workspace.upsert` with `{workspace_id,label,path}`. A known open folder with no label succeeds without an RPC; a known closed folder is reopened like `workspace_archive`. Needs `repository:write`. |
 | `workspace_rename` / `workspace_archive` | `workspace_id,label` / `workspace_id,archived:bool` (false reopens). Reads `core.snapshot {workspace_id,scopes:[workspaces]}`, then sends `workspace.upsert` with the full metadata (minus threads/messages) at `expected_store_revision`. On `conflict` it re-reads, up to three attempts. Needs `repository:write`. |
+| `workspace_identity` | `workspace_id,icon_index:0..15?,color_index:0..7?`; null or absent means automatic (id hash). Out-of-range values fail locally with `invalid_identity`. Same snapshot → `workspace.upsert` path and conflict retry as rename; both keys are always written, a reset as explicit `null`. Needs `repository:write`. |
 | `workspace_close` | `workspace_id`; `workspace.close`, which stops the workspace's sessions and archives it. A busy workspace fails with code `workspace_busy` and `busy:{pending_turns,running_tasks}` on its job; the UI asks the user to stop them first. Needs `repository:write`. |
 | `directory_list` | `path?`; `workspace.directory.list`, latest wins. A null path starts at the parent of the first known workspace (the daemon accepts workspace parents and home as roots). Needs `repository:read` and the runtime capability `workspace.directory.v1` (else `unsupported`). |
 
@@ -311,7 +312,7 @@ Supporting shapes:
 - `Host`: `{host_id,label,https_url,runtime_id?,instance_id?,phase,lifecycle,
   auth_state,sync_state,capabilities:[string],scopes:[string],retry_at_ms?,
   trust_proposal:{id,origin,spki_sha256,runtime_id?}?,update_required,error?}`.
-- `Workspace`: `{workspace_id,label,path,open,panes:[Pane],threads:[ThreadSummary]}`.
+- `Workspace`: `{workspace_id,label,path,open,panes:[Pane],threads:[ThreadSummary],icon_index:0..15,color_index:0..7,icon_custom,color_custom,recency_ms?,recency_rank}`. Identity slots are the daemon row's `icon_index`/`color_index` overrides when present and in range (`*_custom: true`), otherwise the FNV-1a id hash (`h % 16`, `(h >> 8) % 8`); see docs/workspace-switcher-sidebar.md.
 - `Pane`: `{id,workspace_id,kind:chat|terminal|browser,title,thread_id?,
   terminal_id?,status,attention,attention_kind?,started_at_ms?,can_stop}`.
   `attention_kind` is `unread|needs_approval|blocked|failed` (K-17). Browser is a

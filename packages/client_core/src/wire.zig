@@ -66,6 +66,7 @@ pub const Event = union(enum) {
     new_chat_select: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, workspace_id: []const u8, provider: ?[]const u8 = null, model: ?[]const u8 = null, effort: ?[]const u8 = null, access: ?[]const u8 = null, speed: ?[]const u8 = null },
     workspace_create: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, path: []const u8, label: ?[]const u8 = null },
     workspace_rename: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, workspace_id: []const u8, label: []const u8 },
+    workspace_identity: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, workspace_id: []const u8, icon_index: ?u8 = null, color_index: ?u8 = null },
     workspace_archive: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, workspace_id: []const u8, archived: bool },
     workspace_close: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, workspace_id: []const u8 },
     directory_list: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, path: ?[]const u8 = null },

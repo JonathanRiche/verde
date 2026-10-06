@@ -340,6 +340,9 @@ pub const Project = struct {
     path: [:0]const u8,
     herdr_link: ?HerdrWorkspaceLink = null,
     archived: bool = false,
+    /// User-chosen identity overrides; null derives from the id hash.
+    icon_index: ?u8 = null,
+    color_index: ?u8 = null,
     unread_count: u8 = 0,
     collapsed: bool = false,
     thread_list_expanded: bool = false,

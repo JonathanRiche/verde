@@ -838,6 +838,32 @@ test "workspace identity matches the cross-client FNV-1a vectors" {
     try std.testing.expectEqual(@as(u8, 5), p.colorIndex(""));
 }
 
+test "workspace identity overrides replace the hash independently" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const data = try host.parse(a,
+        \\{"snapshot":{"workspaces":[
+        \\{"workspace_id":"ws-alpha","icon_index":3,"color_index":null,"threads":[]},
+        \\{"workspace_id":"ws-alpha","color_index":7,"threads":[]},
+        \\{"workspace_id":"ws-alpha","icon_index":16,"color_index":-1,"threads":[]},
+        \\{"workspace_id":"ws-alpha","icon_index":"3","color_index":0,"threads":[]}]}}
+    );
+    const models = try p.project(a, data, &.{}, false, 1790000300000);
+    const expected = [_]struct { u8, bool, u8, bool }{
+        .{ 3, true, 2, false },
+        .{ 14, false, 7, true },
+        .{ 14, false, 2, false },
+        .{ 14, false, 0, true },
+    };
+    for (models.workspaces, expected) |w, e| {
+        try std.testing.expectEqual(e[0], w.icon_index);
+        try std.testing.expectEqual(e[1], w.icon_custom);
+        try std.testing.expectEqual(e[2], w.color_index);
+        try std.testing.expectEqual(e[3], w.color_custom);
+    }
+}
+
 test "workspace recency ranks focus and activity, then untimed open before closed" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

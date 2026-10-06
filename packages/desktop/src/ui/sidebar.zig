@@ -1106,7 +1106,7 @@ fn renderWorkspaceSwitcherTrigger(state: *runtime.AppState, rect: palette.Rect, 
     const cy = rect.y + rect.h * 0.5;
     const chip_rect: palette.Rect = .{ .x = rect.x + theme.scaledUi(6.0), .y = cy - chip * 0.5, .w = chip, .h = chip };
     const project: ?*const native_state.Project = if (scope) |pi| (if (pi < projects.len) &projects[pi] else null) else null;
-    queueWorkspaceChip(state, chip_rect, if (project) |p| p.id else null, false, rect);
+    queueWorkspaceChip(state, chip_rect, project, false, rect);
 
     const chevron_x = rect.x + rect.w - theme.scaledUi(18.0);
     var label_right = chevron_x - theme.scaledUi(6.0);
@@ -1326,7 +1326,12 @@ fn renderAttentionClusterSection(
         const shown_y = activeRowShownY(row.project_index, row.pane.id, target_y, motion_t);
         const row_rect: palette.Rect = .{ .x = x, .y = rows_top + shown_y, .w = rail_w, .h = row_h };
         if (rowVisible(row_rect, rows_clip)) {
+            // Active rows span every workspace, so they always carry the
+            // workspace chip; OPEN rows follow the scope.
+            const scoped_chip = open_rows_show_chip;
+            open_rows_show_chip = true;
             renderOpenPaneRow(state, row.project_index, project, row.pane, row_rect, rows_clip, true, true, active_index, false);
+            open_rows_show_chip = scoped_chip;
         }
     }
 
@@ -1365,8 +1370,8 @@ fn renderAttentionClusterSection(
 fn collectAttentionClusterRows(state: *runtime.AppState, rows: []AttentionClusterRow) usize {
     var row_count: usize = 0;
     for (state.project_controller.projects.items, 0..) |*project, project_index| {
-        // Single-workspace scope lists only that workspace's panes.
-        if (!state.sidebar_all_workspaces and project_index != state.project_controller.selected_index) continue;
+        // ACTIVE is global: it lists working/waiting panes from every open
+        // workspace regardless of the switcher scope (scope filters OPEN only).
         for (project.workspace_layout.panes.items) |*pane| {
             if (!paneNeedsAttention(state, project_index, project, pane)) continue;
             var duplicate = false;
@@ -1822,7 +1827,7 @@ fn renderOpenPaneRow(
     if (open_rows_show_chip and !compact_tile) {
         const chip = theme.scaledUi(18.0);
         const chip_rect: palette.Rect = .{ .x = rect.x + theme.scaledUi(4.0), .y = cy - chip * 0.5, .w = chip, .h = chip };
-        queueWorkspaceChip(state, chip_rect, project.id, false, clip);
+        queueWorkspaceChip(state, chip_rect, project, false, clip);
         const shift = chip + theme.scaledUi(8.0);
         icon_x += shift;
         title_left += shift;
@@ -2249,12 +2254,21 @@ fn queuePaletteIcon(state: *runtime.AppState, rect: palette.Rect, glyph: []const
 
 /// Workspace identity chip: the workspace's hashed icon in its theme-derived
 /// slot color on a tinted rounded square (see
-/// docs/workspace-switcher-sidebar.md). `id == null` draws the All Workspaces
-/// chip in the accent color.
-pub fn queueWorkspaceChip(state: *runtime.AppState, rect: palette.Rect, id: ?[]const u8, dimmed: bool, clip: ?palette.Rect) void {
-    var color = if (id) |value| workspace_identity.colorFor(value) else theme.accent();
+/// docs/workspace-switcher-sidebar.md). `project == null` draws the All
+/// Workspaces chip in the accent color. User overrides win over the hash.
+pub fn queueWorkspaceChip(state: *runtime.AppState, rect: palette.Rect, project: ?*const native_state.Project, dimmed: bool, clip: ?palette.Rect) void {
+    if (project) |p| {
+        const identity = workspace_identity.resolve(p.id, p.icon_index, p.color_index);
+        queueIdentityChip(state, rect, workspace_identity.glyphAt(identity.icon_index), workspace_identity.slotColor(identity.color_index), dimmed, clip);
+    } else {
+        queueIdentityChip(state, rect, workspace_identity.ALL_WORKSPACES_GLYPH, theme.accent(), dimmed, clip);
+    }
+}
+
+/// Draws one identity chip (glyph tinted `base_color` on a tinted square).
+pub fn queueIdentityChip(state: *runtime.AppState, rect: palette.Rect, glyph: []const u8, base_color: [4]f32, dimmed: bool, clip: ?palette.Rect) void {
+    var color = base_color;
     if (dimmed) color[3] = 0.55;
-    const glyph = if (id) |value| workspace_identity.iconGlyph(value) else workspace_identity.ALL_WORKSPACES_GLYPH;
     const radius = @max(rect.w * 0.24, theme.scaledUi(3.0));
     var fill = color;
     fill[3] = if (dimmed) 0.10 else 0.18;
@@ -2764,8 +2778,10 @@ test "ACTIVE collection sees every restored chat pane and deduplicates one threa
     var state: runtime.AppState = undefined;
     state.allocator = allocator;
     state.project_controller.projects = .empty;
-    state.project_controller.selected_index = 0;
-    state.sidebar_all_workspaces = true;
+    // Scoped to a different workspace: ACTIVE is global and must still see
+    // this workspace's attention panes.
+    state.project_controller.selected_index = 1;
+    state.sidebar_all_workspaces = false;
     defer {
         for (state.project_controller.projects.items) |*project| project.deinit(allocator);
         state.project_controller.projects.deinit(allocator);

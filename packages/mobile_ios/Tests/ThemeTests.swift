@@ -34,6 +34,25 @@ final class ThemeTests: XCTestCase {
         XCTAssertFalse(fuzzyMatches("dv", "Verde"))
         XCTAssertTrue(drawerItems([ws("a", 0)], scope: "other").active.isEmpty)
     }
+    func testDrawerActiveSpansEveryOpenWorkspaceWhileOpenFollowsScope() {
+        func ws(_ id: String, _ status: String, open: Bool = true) -> Workspace {
+            let thread = ThreadSummary(workspace_id: id, thread_id: id + "-t", title: id, provider: "codex", model: nil, cwd: nil, open: true,
+                                       archived: false, last_activity_at_ms: 1, status: status, history_bucket: "Today")
+            return Workspace(workspace_id: id, label: id, path: "/" + id, open: open,
+                             panes: [Pane(id: "p-" + id, workspace_id: id, kind: "chat", title: id, thread_id: thread.thread_id)], threads: [thread])
+        }
+        let items = [ws("a", "working"), ws("b", "idle"), ws("c", "failed", open: false)]
+        let scoped = drawerItems(items, scope: "b")
+        XCTAssertEqual(scoped.active.map { $0.workspace.workspace_id }, ["a"])
+        XCTAssertEqual(scoped.open.map { $0.workspace.workspace_id }, ["b"])
+        XCTAssertTrue(drawerItems(items, scope: "a").open.isEmpty)
+        XCTAssertEqual(drawerItems(items, scope: nil).open.map { $0.workspace.workspace_id }, ["b"])
+    }
+    func testWorkspaceAutoIdentityMatchesCrossClientVectors() {
+        XCTAssertTrue(workspaceAutoIdentity("ws-alpha") == (14, 2))
+        XCTAssertTrue(workspaceAutoIdentity("baaa819e66d8f3be") == (9, 6))
+        XCTAssertTrue(workspaceAutoIdentity("") == (5, 5))
+    }
     func testWorkspaceColorsRotateTheClampedAccent() {
         XCTAssertEqual(workspaceIconNames.count, 16)
         let accent = (r: 0x50 / 255.0, g: 0xc8 / 255.0, b: 0x78 / 255.0)

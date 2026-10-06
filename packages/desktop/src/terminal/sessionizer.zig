@@ -12515,7 +12515,7 @@ fn loadSnapshotContents(
             \\       companion_thread_local_id, herdr_remote_alias, herdr_session_name,
             \\       herdr_workspace_id, herdr_local_dir, herdr_remote_cwd,
             \\       herdr_last_pane_id, herdr_attach_dock_id, herdr_attach_pane_id,
-            \\       herdr_pane_links_json, herdr_updated_at_ms
+            \\       herdr_pane_links_json, herdr_updated_at_ms, icon_index, color_index
             \\from workspaces order by sort_index
         , .{}) catch return error.StoreUnavailable;
         defer rows.deinit();
@@ -12556,6 +12556,8 @@ fn loadSnapshotContents(
                     .selected_thread_index = std.math.cast(usize, row.int(12)) orelse 0,
                     .companion_thread_local_id = dupeOptionalText(arena, row.nullableText(13)) catch return error.OutOfMemory,
                     .herdr_link = herdr_link,
+                    .icon_index = if (row.nullableInt(24)) |value| (if (value >= 0 and value < 16) @as(u8, @intCast(value)) else null) else null,
+                    .color_index = if (row.nullableInt(25)) |value| (if (value >= 0 and value < 8) @as(u8, @intCast(value)) else null) else null,
                 },
             }) catch return error.OutOfMemory;
         }

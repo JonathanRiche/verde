@@ -190,10 +190,25 @@ class BrowseTest {
         assertTrue(all.isNotEmpty())
         assertTrue(all.all { it.workspace.workspace_id == workspace.workspace_id })
         assertTrue(active.all { it.active } && open.none { it.active })
+        // Active ignores the scope; Open follows it.
         val (scopedActive, scopedOpen) = drawerItems(listOf(workspace), "other")
-        assertTrue(scopedActive.isEmpty() && scopedOpen.isEmpty())
+        assertEquals(active.map { it.key }, scopedActive.map { it.key })
+        assertTrue(scopedOpen.isEmpty())
+        assertEquals(open.map { it.key }, drawerItems(listOf(workspace), workspace.workspace_id).second.map { it.key })
         val closed = drawerItems(listOf(workspace.copy(open = false)), null)
         assertTrue(closed.first.isEmpty() && closed.second.isEmpty())
+    }
+
+    @Test fun drawerActiveSpansEveryOpenWorkspaceWhileOpenFollowsScope() {
+        fun t(ws: String, id: String, status: String) = ThreadSummary(ws, id, id, "codex", null, null, true, false, 1L, status, "Today")
+        fun w(id: String, thread: ThreadSummary, open: Boolean = true) = Workspace(id, id, "/$id", open,
+            listOf(Pane("p-${thread.thread_id}", id, "chat", thread.title, thread_id = thread.thread_id)), listOf(thread))
+        val items = listOf(w("a", t("a", "busy", "working")), w("b", t("b", "idle", "idle")), w("c", t("c", "gone", "failed"), open = false))
+        val (active, open) = drawerItems(items, "b")
+        assertEquals(listOf("busy"), active.map { it.thread?.thread_id })
+        assertEquals(listOf("idle"), open.map { it.thread?.thread_id })
+        assertTrue(drawerItems(items, "a").second.isEmpty())
+        assertEquals(listOf("idle"), drawerItems(items, null).second.map { it.thread?.thread_id })
     }
 
     @Test fun drawerOnlyListsOpenChatsWhileWorkspaceKeepsHistory() {

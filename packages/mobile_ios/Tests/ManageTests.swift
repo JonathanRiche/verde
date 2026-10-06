@@ -37,6 +37,24 @@ final class ManageTests: XCTestCase {
         await harness.close()
     }
 
+    func testIdentityPinsAndResetsWithExplicitNulls() async throws {
+        let harness = ChatHarness()
+        try await harness.launch()
+        let model = ManageModel(browse: harness.browse)
+        await model.start()
+        let job = await model.identity(chatWS, icon: 3, color: nil)
+        XCTAssertEqual(job?.kind, "workspace_identity")
+        let sent = harness.core.events.all.compactMap { if case .workspace_identity(let e) = $0 { return e }; return nil }
+        XCTAssertEqual(sent.count, 1)
+        XCTAssertEqual(sent.first?.workspace_id, chatWS)
+        XCTAssertEqual(sent.first?.icon_index, 3)
+        XCTAssertNil(sent.first?.color_index)
+        // The reset travels as an explicit null so the daemon row returns to automatic.
+        let json = String(decoding: try JSONEncoder().encode(Event.workspace_identity(sent[0])), as: UTF8.self)
+        XCTAssertTrue(json.contains("\"color_index\":null"), json)
+        await harness.close()
+    }
+
     func testHistorySearchCarriesFilterAndCanResetForHome() async throws {
         let harness = ChatHarness()
         try await harness.launch()

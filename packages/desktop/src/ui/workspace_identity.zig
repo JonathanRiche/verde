@@ -43,8 +43,25 @@ pub fn identityFor(id: []const u8) Identity {
     return .{ .icon_index = h % ICON_COUNT, .color_index = (h >> 8) % COLOR_COUNT };
 }
 
+/// Identity with the workspace's persisted overrides applied (null slots
+/// fall back to the id hash). Out-of-range overrides are ignored.
+pub fn resolve(id: []const u8, icon_override: ?u8, color_override: ?u8) Identity {
+    var identity = identityFor(id);
+    if (icon_override) |value| if (value < ICON_COUNT) {
+        identity.icon_index = value;
+    };
+    if (color_override) |value| if (value < COLOR_COUNT) {
+        identity.color_index = value;
+    };
+    return identity;
+}
+
+pub fn glyphAt(icon_index: u32) []const u8 {
+    return ICON_GLYPHS[icon_index % ICON_COUNT];
+}
+
 pub fn iconGlyph(id: []const u8) []const u8 {
-    return ICON_GLYPHS[identityFor(id).icon_index];
+    return glyphAt(identityFor(id).icon_index);
 }
 
 /// Theme accent rotated by `slot * 45°`, clamped so every slot stays legible

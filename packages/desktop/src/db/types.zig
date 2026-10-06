@@ -255,6 +255,9 @@ pub const PersistedProject = struct {
     selected_thread_index: usize = 0,
     companion_thread_local_id: ?[]const u8 = null,
     herdr_link: ?PersistedHerdrWorkspaceLink = null,
+    /// User-chosen identity overrides; null derives from the workspace id.
+    icon_index: ?u8 = null,
+    color_index: ?u8 = null,
     threads: ?[]const PersistedThread = null,
     provider: Provider = .opencode,
     harness: Harness = .local_cli,

@@ -254,6 +254,9 @@ pub const Workspace = struct {
     selected_thread_index: usize = 0,
     companion_thread_local_id: ?[]const u8 = null,
     herdr_link: ?HerdrWorkspaceLink = null,
+    /// User-chosen identity overrides; null derives from the workspace id.
+    icon_index: ?u8 = null,
+    color_index: ?u8 = null,
     provider: []const u8 = "opencode",
     harness: []const u8 = "local_cli",
     draft: []const u8 = "",

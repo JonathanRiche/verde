@@ -124,6 +124,8 @@ fn snapshotWorkspaceToPersisted(
         .selected_thread_index = workspace.selected_thread_index,
         .companion_thread_local_id = workspace.companion_thread_local_id,
         .herdr_link = herdr_link,
+        .icon_index = workspace.icon_index,
+        .color_index = workspace.color_index,
         .threads = threads,
         .provider = snapshotEnum(db_types.Provider, workspace.provider, .opencode),
         .harness = snapshotEnum(db_types.Harness, workspace.harness, .local_cli),

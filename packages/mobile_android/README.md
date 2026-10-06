@@ -265,6 +265,8 @@ itself never calls the daemon.
 - A workspace screen offers **Rename**, **Close** (`workspace_close`; a busy host
   answers with "Stop N running requests and M background tasks first.") and, for
   closed workspaces, **Reopen** (`workspace_archive` with `archived:false`).
+  **Icon** opens a picker with the 16 identity icons and 8 color circles; each
+  has an **Automatic** choice, and Save sends `workspace_identity` (null = automatic).
 
 Paths, titles and search text are shown on screen but never logged.
 

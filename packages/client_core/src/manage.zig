@@ -69,6 +69,9 @@ const Task = struct {
     archived: ?bool = null,
     thread: ?store.Thread = null,
     revision: ?u64 = null,
+    /// `workspace_identity` overrides; null writes an explicit null (automatic).
+    icon_index: ?u8 = null,
+    color_index: ?u8 = null,
 };
 pub const State = struct {
     tasks: []Task = &.{},
@@ -84,7 +87,7 @@ pub const State = struct {
 
 const MAX_TASKS = 16;
 const MAX_LABEL = 256;
-const tags = [_][]const u8{ "thread_rename", "thread_close", "thread_sync", "thread_create", "new_chat_select", "workspace_create", "workspace_rename", "workspace_archive", "workspace_close", "directory_list" };
+const tags = [_][]const u8{ "thread_rename", "thread_close", "thread_sync", "thread_create", "new_chat_select", "workspace_create", "workspace_rename", "workspace_identity", "workspace_archive", "workspace_close", "directory_list" };
 const providers = [_][2][]const u8{ .{ "codex", "Codex" }, .{ "claude", "Claude" }, .{ "opencode", "OpenCode" }, .{ "cursor", "Cursor" }, .{ "pi", "Pi" }, .{ "fx", "FX" }, .{ "grok", "Grok" }, .{ "muse", "Muse" } };
 
 pub fn owns(tag: []const u8) bool {
@@ -107,6 +110,8 @@ pub fn validate(a: A, tag: []const u8, event: V) E!void {
         _ = try h.decode(struct { path: []const u8, label: ?[]const u8 = null }, a, event);
     } else if (eq(tag, "workspace_rename")) {
         _ = try h.decode(struct { workspace_id: []const u8, label: []const u8 }, a, event);
+    } else if (eq(tag, "workspace_identity")) {
+        _ = try h.decode(struct { workspace_id: []const u8, icon_index: ?i64 = null, color_index: ?i64 = null }, a, event);
     } else if (eq(tag, "workspace_archive")) {
         _ = try h.decode(struct { workspace_id: []const u8, archived: bool }, a, event);
     } else if (eq(tag, "workspace_close")) {
@@ -123,6 +128,7 @@ pub fn receiptFields(context: []const u8) ?[]const u8 {
     if (eq(context, "new_chat_select")) return "workspace_id provider model effort access speed";
     if (eq(context, "workspace_create")) return "path label";
     if (eq(context, "workspace_rename")) return "workspace_id label";
+    if (eq(context, "workspace_identity")) return "workspace_id icon_index color_index";
     if (eq(context, "workspace_archive")) return "workspace_id archived";
     if (eq(context, "workspace_close")) return "workspace_id";
     if (eq(context, "directory_list")) return "path";
@@ -178,6 +184,13 @@ fn cleanLabel(raw: []const u8) ?[]const u8 {
     if (label.len == 0 or label.len > MAX_LABEL) return null;
     for (label) |byte| if (byte < 0x20 or byte == 0x7f) return null;
     return label;
+}
+/// Outer null = out of range or wrong type; inner null = automatic (absent or null).
+fn slot(v: V, slots: u8) ??u8 {
+    if (v == .null) return @as(?u8, null);
+    const n = p.num(v) orelse return null;
+    if (n < 0 or n >= slots) return null;
+    return @as(?u8, @intCast(n));
 }
 fn digestHex(tx: *h.Transaction, parts: anytype, len: usize) E![]const u8 {
     var digest: [32]u8 = undefined;
@@ -304,6 +317,19 @@ pub fn intent(tx: *h.Transaction, tag: []const u8, event: V) E!bool {
     if (eq(tag, "workspace_close")) {
         const i = try begin(tx, job);
         tx.state.manage.tasks[i].step = .close;
+        try advance(tx, i);
+        return true;
+    }
+    if (eq(tag, "workspace_identity")) {
+        const icon = slot(p.get(event, "icon_index"), 16);
+        const color = slot(p.get(event, "color_index"), 8);
+        if (icon == null or color == null) {
+            try fail(tx, job, "invalid_identity", "Choose an icon from 0 to 15 and a color from 0 to 7.");
+            return true;
+        }
+        const i = try begin(tx, job);
+        tx.state.manage.tasks[i].icon_index = icon.?;
+        tx.state.manage.tasks[i].color_index = color.?;
         try advance(tx, i);
         return true;
     }
@@ -474,8 +500,8 @@ fn advance(tx: *h.Transaction, i: usize) E!void {
 fn firstStep(t: *const Task) Step {
     if (eq(t.job.kind, "thread_create")) return .thread_upsert;
     if (std.mem.startsWith(u8, t.job.kind, "thread_")) return .thread_get;
-    // Rename, archive and reopen rewrite the full metadata read at a revision.
-    if (t.archived != null or eq(t.job.kind, "workspace_rename")) return .snapshot;
+    // Rename, identity, archive and reopen rewrite the full metadata read at a revision.
+    if (t.archived != null or eq(t.job.kind, "workspace_rename") or eq(t.job.kind, "workspace_identity")) return .snapshot;
     return .workspace_upsert;
 }
 
@@ -594,6 +620,11 @@ fn step(tx: *h.Transaction, i: usize, result: rpc.Result) E!void {
             }
             if (t.label) |label| try metadata.put(tx.allocator(), "label", .{ .string = label });
             if (t.archived) |archived| try metadata.put(tx.allocator(), "archived", .{ .bool = archived });
+            if (eq(t.job.kind, "workspace_identity")) {
+                // Explicit nulls: the upsert replaces the row, so null resets to automatic.
+                try metadata.put(tx.allocator(), "icon_index", if (t.icon_index) |n| .{ .integer = n } else .null);
+                try metadata.put(tx.allocator(), "color_index", if (t.color_index) |n| .{ .integer = n } else .null);
+            }
             t.step = .workspace_upsert;
             t.rpc_id = try rpc.request(tx, "workspace.upsert", .{ .mutation = .{ .request_key = try requestKey(tx, t), .client_id = tx.state.chat.client_id.?, .expected_store_revision = revision.? }, .workspace = V{ .object = metadata } }, .{ .intent_id = "@manage" });
         },

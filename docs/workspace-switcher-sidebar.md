@@ -19,10 +19,12 @@ per-workspace identity so a workspace looks identical everywhere.
    - **Active** – panes/chats that are working, waiting, failed, or have an
      unread completion.
    - **Open** (inactive) – every other open pane/chat.
-   Under *All Workspaces* both sections span every open workspace and each
-   row carries a small workspace identity chip (icon on tinted square). Under
-   a single-workspace scope both sections list only that workspace and rows
-   omit the chip.
+   **Active is global**: it always spans every open workspace, whatever the
+   scope, and every Active row carries the small workspace identity chip
+   (icon on tinted square) — you always want to see what is working.
+   **Open follows the scope**: under *All Workspaces* it spans every open
+   workspace with chips; under a single-workspace scope it lists only that
+   workspace and rows omit the chip.
 5. **Footer** – global settings.
 
 ## Scope semantics
@@ -64,8 +66,8 @@ after open ones in most-recently-closed order.
 
 ## Workspace identity (icon + color)
 
-Deterministic from the workspace **id** (UTF-8 bytes), so no persistence or
-protocol change is needed and every client agrees:
+By default derived from the workspace **id** (UTF-8 bytes) so every client
+agrees without any stored state:
 
 ```
 h = 0x811C9DC5                       // FNV-1a 32-bit
@@ -73,6 +75,26 @@ for byte b in id: h = (h XOR b) * 0x01000193  (mod 2^32)
 icon_index  = h mod 16
 color_index = (h >> 8) mod 8
 ```
+
+### User overrides
+
+Users can pick the icon and color per workspace. The daemon stores two
+optional workspace fields (SQLite `workspaces.icon_index` / `color_index`,
+schema v17), carried on the wire as `icon_index` (0..15) and `color_index`
+(0..7) in `core.snapshot` workspaces and `workspace.upsert`. `null`/absent
+means automatic (the hash above); each slot is independent:
+
+```
+icon  = icon_index  ?? (h mod 16)
+color = color_index ?? ((h >> 8) mod 8)
+```
+
+`workspace.upsert` replaces the whole row, so writers must carry the current
+values and send explicit `null` to reset. Editors: desktop workspace settings
+(gear in the switcher) and `verde workspace identity --icon <0-15|auto>
+--color <0-7|auto>`; web "Edit icon…" in the workspace menu; mobile workspace
+screen (`workspace_identity` intent). Each offers the 16 icons, 8 color
+circles and an **Automatic** reset.
 
 ### Icon set (index → semantic name)
 

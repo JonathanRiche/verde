@@ -21,7 +21,7 @@ import { createProviderReadinessApi, runtimeBlocker } from './provider_readiness
 import { latestPaneUsage } from './usage'
 import { createTranscriptHistory, mergeTranscriptPage, type TranscriptContext, type TranscriptPage } from './transcript_history'
 import { dispatchWebCommand, openChatCommandPicker, sidebarActionUnavailableReason, requestSidebarThreadSync, type ChatPickerCommand } from './commands'
-import { requestNewThread, requestWorkspaceCommand } from './command_requests'
+import { requestNewThread, requestWorkspaceCommand, type WorkspaceCommandPatch } from './command_requests'
 import { createHistoryApi, groupHistory, reconcileHistoryArchives, registerHistoryClient } from './history'
 import {
   HANDOFF_PROVIDERS, TITLE_PROVIDERS, agentResumeCommand, agentTerminalArgv, agentTuiCommand, buildHandoffPackage,
@@ -4001,11 +4001,39 @@ export function createAppStore() {
     return workspace()?.workspace_id ?? switcherRows().find((row) => !row.closed)?.workspace.workspace_id
   }
 
-  const workspaceCommand = (current: Workspace, patch: { label: string } | { archived: true }) =>
+  const workspaceCommand = (current: Workspace, patch: WorkspaceCommandPatch) =>
     requestWorkspaceCommand(interactiveCall, async () => ({
       client_id: await ensureClientId(),
       request_key: `web:workspace.context:${current.workspace_id}:${mintId('')}`,
     }), current, patch)
+
+  /// Persists a user-chosen icon/color (null = automatic hash slot). Applied
+  /// optimistically and rolled back if the daemon rejects the upsert.
+  const setWorkspaceIdentity = async (
+    target: Workspace,
+    identity: { icon_index: number | null; color_index: number | null },
+  ) => {
+    const current = workspaceById(target.workspace_id) ?? target
+    const previous = { icon_index: current.icon_index ?? null, color_index: current.color_index ?? null }
+    if (previous.icon_index === identity.icon_index && previous.color_index === identity.color_index) return
+    const apply = (slots: typeof identity) => setWorkspaces((prev) => prev.map((row) =>
+      row.workspace_id === current.workspace_id ? { ...row, ...slots } : row,
+    ))
+    setNotice(null)
+    apply(identity)
+    try {
+      const response = await workspaceCommand(current, identity)
+      if (!callSucceeded(response, 'could not update workspace icon')) {
+        apply(previous)
+        return
+      }
+      liveWorkspaces = null
+      await refreshProjection()
+    } catch (error) {
+      apply(previous)
+      setNotice(error instanceof Error ? error.message : String(error))
+    }
+  }
 
   const upsertThreadMetadata = async (
     current_workspace: Workspace,
@@ -5182,6 +5210,7 @@ export function createAppStore() {
     providerModels,
     ensureProviderModels,
     runSidebarContextAction,
+    setWorkspaceIdentity,
     actionDialog,
     resolveActionDialog,
     runCommand,

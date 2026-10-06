@@ -2,7 +2,7 @@ import { Show, createMemo } from 'solid-js'
 
 import { store } from '../lib/store'
 import { themeTone } from '../lib/theme'
-import type { LivePane } from '../lib/types'
+import type { LivePane, Workspace } from '../lib/types'
 import { workspaceIdentity } from '../lib/workspace_identity'
 
 import logoMaskUrl from '../../../../desktop/src/assets/verde_logo_mask.png'
@@ -133,10 +133,17 @@ export function Icon(props: { name: string; class?: string }) {
   )
 }
 
-/// Workspace identity chip: the workspace's deterministic icon drawn in its
-/// theme-derived slot color on a square tinted with that color.
-export function WorkspaceGlyph(props: { workspaceId: string; class?: string; iconClass?: string; dim?: boolean }) {
-  const identity = createMemo(() => workspaceIdentity(props.workspaceId, themeTone().accent, themeTone().dark))
+/// Workspace identity chip: the workspace's icon drawn in its theme-derived
+/// slot color on a square tinted with that color. User-chosen slots on the
+/// row override the hash-derived ones.
+export function WorkspaceGlyph(props: {
+  workspace: Pick<Workspace, 'workspace_id' | 'icon_index' | 'color_index'>
+  class?: string
+  iconClass?: string
+  dim?: boolean
+}) {
+  const identity = createMemo(() =>
+    workspaceIdentity(props.workspace.workspace_id, themeTone().accent, themeTone().dark, props.workspace))
   return (
     <span
       class={`grid shrink-0 place-items-center rounded-[5px] ${props.class ?? 'h-5 w-5'} ${props.dim ? 'opacity-50' : ''}`}

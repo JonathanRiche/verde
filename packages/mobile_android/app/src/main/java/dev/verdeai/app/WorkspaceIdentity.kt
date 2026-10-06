@@ -92,3 +92,14 @@ internal fun WorkspaceChip(workspace: Workspace, size: Dp = 18.dp, modifier: Mod
             modifier = Modifier.padding(size * .17f).size(size * .66f))
     }
 }
+
+/**
+ * The automatic (icon, color) slots for [id]: FNV-1a 32-bit over its UTF-8 bytes, icon
+ * `h % 16`, color `(h >> 8) % 8`, as in client_core projection.zig. The core projects the
+ * effective slots; this only previews "Automatic" while a pinned slot is being edited.
+ */
+internal fun workspaceAutoIdentity(id: String): Pair<Int, Int> {
+    var h = 0x811C9DC5u
+    for (b in id.encodeToByteArray()) h = (h xor b.toUByte().toUInt()) * 0x01000193u
+    return (h % 16u).toInt() to ((h shr 8) % 8u).toInt()
+}

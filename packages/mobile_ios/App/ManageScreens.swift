@@ -164,6 +164,7 @@ struct WorkspaceActions: View {
     let manage: ManageModel
     @State private var rename = false
     @State private var close = false
+    @State private var styling = false
     @State private var label = ""
     var body: some View {
         Section("Workspace actions") {
@@ -171,6 +172,9 @@ struct WorkspaceActions: View {
             NavigationLink("New chat", value: BrowseRoute.newChat(workspace.workspace_id)).disabled(manage.view?.can_create_threads != true)
             NavigationLink("History", value: BrowseRoute.history)
             Button("Rename workspace") { label = workspace.label; rename = true }.disabled(manage.view?.can_manage_workspaces != true)
+            Button { styling = true } label: {
+                HStack { Text("Icon and color"); Spacer(); WorkspaceChip(workspace: workspace, size: 22) }
+            }.disabled(manage.view?.can_manage_workspaces != true).accessibilityIdentifier("workspace-identity")
             if workspace.open { Button("Close workspace", role: .destructive) { close = true }.disabled(manage.view?.can_manage_workspaces != true) }
             else { Button("Reopen workspace") { Task { await manage.workspace("reopen", id: workspace.workspace_id) } }.disabled(manage.view?.can_manage_workspaces != true) }
         }.disabled(manage.busy)
@@ -178,6 +182,11 @@ struct WorkspaceActions: View {
             TextField("Name", text: $label)
             Button("Cancel", role: .cancel) {}
             Button("Rename") { Task { await manage.workspace("rename", id: workspace.workspace_id, value: label) } }.disabled(label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        }
+        .sheet(isPresented: $styling) {
+            WorkspaceIdentitySheet(workspace: workspace) { icon, color in
+                Task { await manage.identity(workspace.workspace_id, icon: icon, color: color) }
+            }.presentationDetents([.medium, .large])
         }
         .confirmationDialog("Close this workspace and its sessions?", isPresented: $close, titleVisibility: .visible) {
             Button("Close workspace", role: .destructive) { Task { await manage.workspace("close", id: workspace.workspace_id) } }

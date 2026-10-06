@@ -72,3 +72,84 @@ struct WorkspaceChip: View {
             .accessibilityHidden(true)
     }
 }
+
+/// Automatic (icon, color) slots for `id`: FNV-1a 32-bit over its UTF-8 bytes, icon `h % 16`,
+/// color `(h >> 8) % 8`, as in client_core projection.zig. The core projects the effective
+/// slots; this only previews "Automatic" while a pinned slot is being edited.
+func workspaceAutoIdentity(_ id: String) -> (icon: Int, color: Int) {
+    var h: UInt32 = 0x811C9DC5
+    for b in id.utf8 { h = (h ^ UInt32(b)) &* 0x01000193 }
+    return (Int(h % 16), Int((h >> 8) % 8))
+}
+
+/// Picks a pinned icon and color, or Automatic (nil) for either; Save sends one intent.
+struct WorkspaceIdentitySheet: View {
+    let workspace: Workspace
+    let save: (Int?, Int?) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var icon: Int?
+    @State private var color: Int?
+
+    init(workspace: Workspace, save: @escaping (Int?, Int?) -> Void) {
+        self.workspace = workspace
+        self.save = save
+        _icon = State(initialValue: workspace.icon_custom ? Int(workspace.icon_index) : nil)
+        _color = State(initialValue: workspace.color_custom ? Int(workspace.color_index) : nil)
+    }
+
+    var body: some View {
+        let auto = workspaceAutoIdentity(workspace.workspace_id)
+        let tint = workspaceColor(color ?? auto.color)
+        let changed = icon != (workspace.icon_custom ? Int(workspace.icon_index) : nil)
+            || color != (workspace.color_custom ? Int(workspace.color_index) : nil)
+        NavigationStack {
+            Form {
+                Section("Icon") {
+                    automatic(icon == nil) { icon = nil }
+                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 4), spacing: 10) {
+                        ForEach(0..<16, id: \.self) { k in
+                            let shown = (icon ?? auto.icon) == k
+                            Button { icon = k } label: {
+                                Image(systemName: workspaceSymbol(k)).font(.system(size: 20, weight: .semibold)).foregroundStyle(tint)
+                                    .frame(maxWidth: .infinity, minHeight: 48)
+                                    .background(shown ? tint.opacity(0.18) : Color.clear, in: RoundedRectangle(cornerRadius: 10))
+                                    .overlay(RoundedRectangle(cornerRadius: 10).stroke(icon == k ? tint : Color.clear, lineWidth: 2))
+                            }.buttonStyle(.plain)
+                                .accessibilityLabel(workspaceIconNames[k]).accessibilityAddTraits(icon == k ? .isSelected : [])
+                                .accessibilityIdentifier("identity-icon-\(k)")
+                        }
+                    }.padding(.vertical, 6)
+                }
+                Section("Color") {
+                    automatic(color == nil) { color = nil }
+                    HStack(spacing: 6) {
+                        ForEach(0..<8, id: \.self) { k in
+                            Button { color = k } label: {
+                                Circle().fill(workspaceColor(k)).padding(4)
+                                    .overlay(Circle().stroke(color == k ? VerdeTheme.text : Color.clear, lineWidth: 2))
+                                    .frame(maxWidth: .infinity).aspectRatio(1, contentMode: .fit)
+                            }.buttonStyle(.plain)
+                                .accessibilityLabel("Color \(k + 1)").accessibilityAddTraits(color == k ? .isSelected : [])
+                                .accessibilityIdentifier("identity-color-\(k)")
+                        }
+                    }.padding(.vertical, 6)
+                }
+            }
+            .navigationTitle("Icon and color").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) { Button("Save") { save(icon, color); dismiss() }.disabled(!changed) }
+            }
+        }
+    }
+
+    private func automatic(_ selected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack {
+                Text("Automatic").foregroundStyle(VerdeTheme.text)
+                Spacer()
+                if selected { Image(systemName: "checkmark").foregroundStyle(VerdeTheme.accent) }
+            }.contentShape(Rectangle())
+        }.buttonStyle(.plain).accessibilityAddTraits(selected ? .isSelected : [])
+    }
+}

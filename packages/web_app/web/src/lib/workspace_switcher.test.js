@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { activityMs, fuzzyMatches, orderSwitcherRows, workspaceRecency } from './workspace_switcher'
+import { activityMs, fuzzyMatches, orderSwitcherRows, sidebarSections, workspaceRecency } from './workspace_switcher'
 
 const ws = (workspace_id, threads = []) => ({ workspace_id, label: workspace_id, path: '', threads })
 
@@ -27,5 +27,22 @@ describe('workspace switcher', () => {
     expect(fuzzyMatches('verde', 'VE')).toBe(true)
     expect(fuzzyMatches('verde', 'dv')).toBe(false)
     expect(fuzzyMatches('anything', '  ')).toBe(true)
+  })
+})
+
+describe('sidebar sections', () => {
+  const active = [{ workspace_id: 'b', pane_id: 'b1' }, { workspace_id: 'a', pane_id: 'a1' }]
+  const open = [{ workspace_id: 'a', pane_id: 'a2' }, { workspace_id: 'b', pane_id: 'b2' }]
+
+  test('Active spans every workspace in its own order regardless of scope', () => {
+    for (const scope of ['all', 'a', 'b', 'missing']) {
+      expect(sidebarSections(active, open, scope).active).toEqual(active)
+    }
+  })
+
+  test('Open follows the scope and carries chips only under All', () => {
+    expect(sidebarSections(active, open, 'all')).toMatchObject({ open, open_chips: true })
+    expect(sidebarSections(active, open, 'a')).toMatchObject({ open: [open[0]], open_chips: false })
+    expect(sidebarSections(active, open, 'missing').open).toEqual([])
   })
 })

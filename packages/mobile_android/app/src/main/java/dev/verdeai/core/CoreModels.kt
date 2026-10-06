@@ -1002,6 +1002,18 @@ data class EventWorkspaceRename(
 ) : Event()
 
 @Serializable
+@SerialName("workspace_identity")
+data class EventWorkspaceIdentity(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `workspace_id`: String,
+    val `icon_index`: Int? = null,
+    val `color_index`: Int? = null,
+) : Event()
+
+@Serializable
 @SerialName("workspace_archive")
 data class EventWorkspaceArchive(
     val `api_version`: Long = 1,
@@ -1615,6 +1627,8 @@ data class Workspace(
     val `threads`: List<ThreadSummary>,
     val `icon_index`: Int = 0,
     val `color_index`: Int = 0,
+    val `icon_custom`: Boolean = false,
+    val `color_custom`: Boolean = false,
     val `recency_ms`: Long? = null,
     val `recency_rank`: Long = 0,
 )

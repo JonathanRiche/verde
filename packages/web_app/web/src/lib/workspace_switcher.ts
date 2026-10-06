@@ -6,6 +6,20 @@ import type { Thread, Workspace } from './types'
 /// Sidebar list scope: every open workspace, or one workspace id.
 export type SidebarScope = 'all' | string
 
+/// Sidebar body sections. Active is global (every open workspace, always
+/// chipped); Open follows the scope and carries chips only under All.
+export function sidebarSections<T extends { workspace_id: string }>(
+  active: readonly T[],
+  inactive: readonly T[],
+  scope: SidebarScope,
+): { active: T[]; open: T[]; open_chips: boolean } {
+  return {
+    active: [...active],
+    open: scope === 'all' ? [...inactive] : inactive.filter((pane) => pane.workspace_id === scope),
+    open_chips: scope === 'all',
+  }
+}
+
 export interface SwitcherRow {
   workspace: Workspace
   closed: boolean

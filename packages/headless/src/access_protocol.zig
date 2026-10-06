@@ -908,7 +908,8 @@ test "P2 daemon RPC mappings require their exact scopes and desktop methods stay
     // The delta opt-in is authorized exactly like the stream it configures.
     try std.testing.expectEqual(requiredScopeMaskForRpc("core.changes").?, requiredScopeMaskForRpc("core.changes.mode").?);
     for ([_][]const u8{
-        "workspace.rename",  "chat.open_subagent",
+        "workspace.rename",  "workspace.identity",
+        "chat.open_subagent",
         "terminal.open",     "terminal.tail",
         "terminal.screen",   "terminal.write",
         "terminal.key",      "workspaces",

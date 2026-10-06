@@ -123,6 +123,11 @@ final class ManageModel {
             }
         }, mutation: true)
     }
+    /// Pins the icon (0..15) and color (0..7); nil returns that slot to automatic.
+    func identity(_ workspace: String, icon: Int?, color: Int?) async -> ManageJob? {
+        await run({ id in .workspace_identity(EventWorkspaceIdentity(now_ms: 0, wall_time_ms: 0, intent_id: id, workspace_id: workspace,
+            icon_index: icon.map { UInt8($0) }, color_index: color.map { UInt8($0) })) }, mutation: true)
+    }
     func createWorkspace(path: String, label: String) async -> ManageJob? {
         await run({ id in .workspace_create(EventWorkspaceCreate(now_ms: 0, wall_time_ms: 0, intent_id: id, path: path.trimmingCharacters(in: .whitespacesAndNewlines), label: label.isEmpty ? nil : label)) }, mutation: true)
     }

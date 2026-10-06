@@ -252,7 +252,7 @@ pub const Client = struct {
         {
             var workspace_rows = try self.conn.rows(
                 "select id, workspace_id, label, path, archived, unread_count, collapsed, thread_list_expanded, terminal_height, terminal_layout_json, terminal_docks_json, workspace_layout_json, selected_thread_index, companion_thread_local_id, " ++
-                    "herdr_remote_alias, herdr_session_name, herdr_workspace_id, herdr_local_dir, herdr_remote_cwd, herdr_last_pane_id, herdr_attach_dock_id, herdr_attach_pane_id, herdr_pane_links_json, herdr_updated_at_ms " ++
+                    "herdr_remote_alias, herdr_session_name, herdr_workspace_id, herdr_local_dir, herdr_remote_cwd, herdr_last_pane_id, herdr_attach_dock_id, herdr_attach_pane_id, herdr_pane_links_json, herdr_updated_at_ms, icon_index, color_index " ++
                     "from workspaces order by sort_index",
                 .{},
             );
@@ -287,6 +287,8 @@ pub const Client = struct {
                         workspace_row.nullableText(22),
                         workspace_row.nullableInt(23),
                     ),
+                    .icon_index = if (workspace_row.nullableInt(24)) |value| (if (value >= 0 and value < 16) @as(u8, @intCast(value)) else null) else null,
+                    .color_index = if (workspace_row.nullableInt(25)) |value| (if (value >= 0 and value < 8) @as(u8, @intCast(value)) else null) else null,
                     .threads = &.{},
                 });
             }
@@ -483,8 +485,8 @@ pub const Client = struct {
             const herdr_link = project.herdr_link;
             try self.conn.exec(
                 "insert into workspaces (workspace_id, sort_index, label, path, archived, unread_count, collapsed, thread_list_expanded, terminal_height, terminal_layout_json, terminal_docks_json, workspace_layout_json, selected_thread_index, companion_thread_local_id, " ++
-                    "herdr_remote_alias, herdr_session_name, herdr_workspace_id, herdr_local_dir, herdr_remote_cwd, herdr_last_pane_id, herdr_attach_dock_id, herdr_attach_pane_id, herdr_pane_links_json, herdr_updated_at_ms) " ++
-                    "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+                    "herdr_remote_alias, herdr_session_name, herdr_workspace_id, herdr_local_dir, herdr_remote_cwd, herdr_last_pane_id, herdr_attach_dock_id, herdr_attach_pane_id, herdr_pane_links_json, herdr_updated_at_ms, icon_index, color_index) " ++
+                    "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
                 .{
                     project.id orelse project.path,
                     @as(i64, @intCast(project_index)),
@@ -510,6 +512,8 @@ pub const Client = struct {
                     if (herdr_link) |link| if (link.attach_pane_id) |pane_id| @as(i64, @intCast(pane_id)) else null else null,
                     if (herdr_link) |link| link.pane_links_json else null,
                     if (herdr_link) |link| link.updated_at_ms else null,
+                    if (project.icon_index) |value| @as(i64, value) else null,
+                    if (project.color_index) |value| @as(i64, value) else null,
                 },
             );
             const workspace_row_id = self.conn.lastInsertedRowId();

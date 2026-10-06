@@ -170,6 +170,9 @@ final class ChatCore: HostCore {
             manageView.operations.append(ManageJob(intent_id: e.intent_id, kind: "workspace_close", state: "failed", workspace_id: e.workspace_id,
                 busy: ManageBusy(pending_turns: 2, running_tasks: 1), error: LocalError(code: "workspace_busy", message: "Busy")))
             setOperation(e.intent_id, "failed", LocalError(code: "workspace_busy", message: "Busy"))
+        case .workspace_identity(let e):
+            manageView.operations.append(ManageJob(intent_id: e.intent_id, kind: "workspace_identity", state: "succeeded", workspace_id: e.workspace_id))
+            setOperation(e.intent_id, "succeeded")
         case .history_search(let e): setOperation(e.intent_id, "succeeded")
         case .composer_select(let e):
             if holdSelection { heldSelection = e; setOperation(e.intent_id, "pending") }

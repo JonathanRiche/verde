@@ -143,6 +143,7 @@ pub const live_capabilities = [_][]const u8{
     "workspace.select",
     "workspace.create",
     "workspace.rename",
+    "workspace.identity",
     "workspace.close",
     "workspace.reopen",
     "workspace.archive",
@@ -262,6 +263,7 @@ pub const workspace_commands = [_][]const u8{
     "select",
     "create",
     "rename",
+    "identity",
     "close",
     "reopen",
     "archive",
@@ -432,6 +434,7 @@ pub const pane_maximize_flags = [_][]const u8{ "--workspace", "--pane", "--focus
 pub const workspace_select_flags = [_][]const u8{ "--workspace", "--project", "--json" };
 pub const workspace_create_flags = [_][]const u8{ "--path", "--json" };
 pub const workspace_rename_flags = [_][]const u8{ "--workspace", "--project", "--label", "--json" };
+pub const workspace_identity_flags = [_][]const u8{ "--workspace", "--project", "--icon", "--color", "--json" };
 pub const workspace_close_flags = [_][]const u8{ "--workspace", "--project", "--json" };
 pub const workspace_reopen_flags = [_][]const u8{ "--workspace", "--project", "--json" };
 pub const workspace_archive_flags = workspace_close_flags;

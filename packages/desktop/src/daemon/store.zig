@@ -2100,11 +2100,11 @@ pub const Store = struct {
 
     fn upsertSnapshotWorkspace(self: *Self, workspace: store_protocol.Workspace, workspace_index: usize) !void {
         try self.conn.exec(
-            "insert into workspaces (workspace_id, sort_index, label, path, archived, unread_count, collapsed, thread_list_expanded, terminal_height, terminal_layout_json, terminal_docks_json, workspace_layout_json, selected_thread_index, companion_thread_local_id, herdr_remote_alias, herdr_session_name, herdr_workspace_id, herdr_local_dir, herdr_remote_cwd, herdr_last_pane_id, herdr_attach_dock_id, herdr_attach_pane_id, herdr_pane_links_json, herdr_updated_at_ms) " ++
-                "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24) " ++
-                "on conflict(workspace_id) do update set sort_index = excluded.sort_index, label = excluded.label, path = excluded.path, archived = excluded.archived, unread_count = excluded.unread_count, collapsed = excluded.collapsed, thread_list_expanded = excluded.thread_list_expanded, terminal_height = excluded.terminal_height, terminal_layout_json = excluded.terminal_layout_json, terminal_docks_json = excluded.terminal_docks_json, workspace_layout_json = excluded.workspace_layout_json, selected_thread_index = excluded.selected_thread_index, companion_thread_local_id = excluded.companion_thread_local_id, herdr_remote_alias = excluded.herdr_remote_alias, herdr_session_name = excluded.herdr_session_name, herdr_workspace_id = excluded.herdr_workspace_id, herdr_local_dir = excluded.herdr_local_dir, herdr_remote_cwd = excluded.herdr_remote_cwd, herdr_last_pane_id = excluded.herdr_last_pane_id, herdr_attach_dock_id = excluded.herdr_attach_dock_id, herdr_attach_pane_id = excluded.herdr_attach_pane_id, herdr_pane_links_json = excluded.herdr_pane_links_json, herdr_updated_at_ms = excluded.herdr_updated_at_ms " ++
-                "where (workspaces.sort_index, workspaces.label, workspaces.path, workspaces.archived, workspaces.unread_count, workspaces.collapsed, workspaces.thread_list_expanded, workspaces.terminal_height, workspaces.terminal_layout_json, workspaces.terminal_docks_json, workspaces.workspace_layout_json, workspaces.selected_thread_index, workspaces.companion_thread_local_id, workspaces.herdr_remote_alias, workspaces.herdr_session_name, workspaces.herdr_workspace_id, workspaces.herdr_local_dir, workspaces.herdr_remote_cwd, workspaces.herdr_last_pane_id, workspaces.herdr_attach_dock_id, workspaces.herdr_attach_pane_id, workspaces.herdr_pane_links_json, workspaces.herdr_updated_at_ms) is not " ++
-                "(excluded.sort_index, excluded.label, excluded.path, excluded.archived, excluded.unread_count, excluded.collapsed, excluded.thread_list_expanded, excluded.terminal_height, excluded.terminal_layout_json, excluded.terminal_docks_json, excluded.workspace_layout_json, excluded.selected_thread_index, excluded.companion_thread_local_id, excluded.herdr_remote_alias, excluded.herdr_session_name, excluded.herdr_workspace_id, excluded.herdr_local_dir, excluded.herdr_remote_cwd, excluded.herdr_last_pane_id, excluded.herdr_attach_dock_id, excluded.herdr_attach_pane_id, excluded.herdr_pane_links_json, excluded.herdr_updated_at_ms)",
+            "insert into workspaces (workspace_id, sort_index, label, path, archived, unread_count, collapsed, thread_list_expanded, terminal_height, terminal_layout_json, terminal_docks_json, workspace_layout_json, selected_thread_index, companion_thread_local_id, herdr_remote_alias, herdr_session_name, herdr_workspace_id, herdr_local_dir, herdr_remote_cwd, herdr_last_pane_id, herdr_attach_dock_id, herdr_attach_pane_id, herdr_pane_links_json, herdr_updated_at_ms, icon_index, color_index) " ++
+                "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26) " ++
+                "on conflict(workspace_id) do update set sort_index = excluded.sort_index, label = excluded.label, path = excluded.path, archived = excluded.archived, unread_count = excluded.unread_count, collapsed = excluded.collapsed, thread_list_expanded = excluded.thread_list_expanded, terminal_height = excluded.terminal_height, terminal_layout_json = excluded.terminal_layout_json, terminal_docks_json = excluded.terminal_docks_json, workspace_layout_json = excluded.workspace_layout_json, selected_thread_index = excluded.selected_thread_index, companion_thread_local_id = excluded.companion_thread_local_id, herdr_remote_alias = excluded.herdr_remote_alias, herdr_session_name = excluded.herdr_session_name, herdr_workspace_id = excluded.herdr_workspace_id, herdr_local_dir = excluded.herdr_local_dir, herdr_remote_cwd = excluded.herdr_remote_cwd, herdr_last_pane_id = excluded.herdr_last_pane_id, herdr_attach_dock_id = excluded.herdr_attach_dock_id, herdr_attach_pane_id = excluded.herdr_attach_pane_id, herdr_pane_links_json = excluded.herdr_pane_links_json, herdr_updated_at_ms = excluded.herdr_updated_at_ms, icon_index = excluded.icon_index, color_index = excluded.color_index " ++
+                "where (workspaces.sort_index, workspaces.label, workspaces.path, workspaces.archived, workspaces.unread_count, workspaces.collapsed, workspaces.thread_list_expanded, workspaces.terminal_height, workspaces.terminal_layout_json, workspaces.terminal_docks_json, workspaces.workspace_layout_json, workspaces.selected_thread_index, workspaces.companion_thread_local_id, workspaces.herdr_remote_alias, workspaces.herdr_session_name, workspaces.herdr_workspace_id, workspaces.herdr_local_dir, workspaces.herdr_remote_cwd, workspaces.herdr_last_pane_id, workspaces.herdr_attach_dock_id, workspaces.herdr_attach_pane_id, workspaces.herdr_pane_links_json, workspaces.herdr_updated_at_ms, workspaces.icon_index, workspaces.color_index) is not " ++
+                "(excluded.sort_index, excluded.label, excluded.path, excluded.archived, excluded.unread_count, excluded.collapsed, excluded.thread_list_expanded, excluded.terminal_height, excluded.terminal_layout_json, excluded.terminal_docks_json, excluded.workspace_layout_json, excluded.selected_thread_index, excluded.companion_thread_local_id, excluded.herdr_remote_alias, excluded.herdr_session_name, excluded.herdr_workspace_id, excluded.herdr_local_dir, excluded.herdr_remote_cwd, excluded.herdr_last_pane_id, excluded.herdr_attach_dock_id, excluded.herdr_attach_pane_id, excluded.herdr_pane_links_json, excluded.herdr_updated_at_ms, excluded.icon_index, excluded.color_index)",
             workspaceValues(workspace, @as(i64, @intCast(workspace_index))),
         );
     }
@@ -2559,7 +2559,9 @@ pub const Store = struct {
             \\    herdr_attach_dock_id integer,
             \\    herdr_attach_pane_id integer,
             \\    herdr_pane_links_json text,
-            \\    herdr_updated_at_ms integer
+            \\    herdr_updated_at_ms integer,
+            \\    icon_index integer,
+            \\    color_index integer
             \\);
             \\create temp table if not exists preserved_chat_messages (
             \\    workspace_key text not null,
@@ -2618,7 +2620,7 @@ pub const Store = struct {
             \\       w.companion_thread_local_id, w.herdr_remote_alias, w.herdr_session_name,
             \\       w.herdr_workspace_id, w.herdr_local_dir, w.herdr_remote_cwd, w.herdr_last_pane_id,
             \\       w.herdr_attach_dock_id, w.herdr_attach_pane_id, w.herdr_pane_links_json,
-            \\       w.herdr_updated_at_ms
+            \\       w.herdr_updated_at_ms, w.icon_index, w.color_index
             \\from workspaces w
             \\where exists (
             \\    select 1 from chat_turns ct
@@ -2807,7 +2809,7 @@ pub const Store = struct {
             \\                        companion_thread_local_id, herdr_remote_alias, herdr_session_name,
             \\                        herdr_workspace_id, herdr_local_dir, herdr_remote_cwd, herdr_last_pane_id,
             \\                        herdr_attach_dock_id, herdr_attach_pane_id, herdr_pane_links_json,
-            \\                        herdr_updated_at_ms)
+            \\                        herdr_updated_at_ms, icon_index, color_index)
             \\select p.workspace_id,
             \\       (select coalesce(max(w2.sort_index) + 1, 0) from workspaces w2)
             \\           + (row_number() over (order by p.sort_index) - 1),
@@ -2816,7 +2818,7 @@ pub const Store = struct {
             \\       p.workspace_layout_json, p.selected_thread_index, p.companion_thread_local_id,
             \\       p.herdr_remote_alias, p.herdr_session_name, p.herdr_workspace_id, p.herdr_local_dir,
             \\       p.herdr_remote_cwd, p.herdr_last_pane_id, p.herdr_attach_dock_id, p.herdr_attach_pane_id,
-            \\       p.herdr_pane_links_json, p.herdr_updated_at_ms
+            \\       p.herdr_pane_links_json, p.herdr_updated_at_ms, p.icon_index, p.color_index
             \\from temp.preserved_workspaces p
             \\where not exists (
             \\    select 1 from workspaces w3 where w3.workspace_id = p.workspace_id
@@ -2925,11 +2927,12 @@ pub const Store = struct {
         // A targeted workspace write must not smuggle transcript replacement
         // through the metadata operation. The snapshot command owns that path.
         if (workspace.threads.len != 0 or workspace.messages.len != 0) return error.InvalidParams;
+        if ((workspace.icon_index orelse 0) >= 16 or (workspace.color_index orelse 0) >= 8) return error.InvalidParams;
 
         try self.conn.exec(
-            "insert into workspaces (workspace_id, sort_index, label, path, archived, unread_count, collapsed, thread_list_expanded, terminal_height, terminal_layout_json, terminal_docks_json, workspace_layout_json, selected_thread_index, companion_thread_local_id, herdr_remote_alias, herdr_session_name, herdr_workspace_id, herdr_local_dir, herdr_remote_cwd, herdr_last_pane_id, herdr_attach_dock_id, herdr_attach_pane_id, herdr_pane_links_json, herdr_updated_at_ms) " ++
-                "values (?1, coalesce(?2, (select max(sort_index) + 1 from workspaces), 0), ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24) " ++
-                "on conflict(workspace_id) do update set label = excluded.label, path = excluded.path, archived = excluded.archived, unread_count = excluded.unread_count, collapsed = excluded.collapsed, thread_list_expanded = excluded.thread_list_expanded, terminal_height = excluded.terminal_height, terminal_layout_json = excluded.terminal_layout_json, terminal_docks_json = excluded.terminal_docks_json, workspace_layout_json = excluded.workspace_layout_json, selected_thread_index = excluded.selected_thread_index, companion_thread_local_id = excluded.companion_thread_local_id, herdr_remote_alias = excluded.herdr_remote_alias, herdr_session_name = excluded.herdr_session_name, herdr_workspace_id = excluded.herdr_workspace_id, herdr_local_dir = excluded.herdr_local_dir, herdr_remote_cwd = excluded.herdr_remote_cwd, herdr_last_pane_id = excluded.herdr_last_pane_id, herdr_attach_dock_id = excluded.herdr_attach_dock_id, herdr_attach_pane_id = excluded.herdr_attach_pane_id, herdr_pane_links_json = excluded.herdr_pane_links_json, herdr_updated_at_ms = excluded.herdr_updated_at_ms",
+            "insert into workspaces (workspace_id, sort_index, label, path, archived, unread_count, collapsed, thread_list_expanded, terminal_height, terminal_layout_json, terminal_docks_json, workspace_layout_json, selected_thread_index, companion_thread_local_id, herdr_remote_alias, herdr_session_name, herdr_workspace_id, herdr_local_dir, herdr_remote_cwd, herdr_last_pane_id, herdr_attach_dock_id, herdr_attach_pane_id, herdr_pane_links_json, herdr_updated_at_ms, icon_index, color_index) " ++
+                "values (?1, coalesce(?2, (select max(sort_index) + 1 from workspaces), 0), ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26) " ++
+                "on conflict(workspace_id) do update set label = excluded.label, path = excluded.path, archived = excluded.archived, unread_count = excluded.unread_count, collapsed = excluded.collapsed, thread_list_expanded = excluded.thread_list_expanded, terminal_height = excluded.terminal_height, terminal_layout_json = excluded.terminal_layout_json, terminal_docks_json = excluded.terminal_docks_json, workspace_layout_json = excluded.workspace_layout_json, selected_thread_index = excluded.selected_thread_index, companion_thread_local_id = excluded.companion_thread_local_id, herdr_remote_alias = excluded.herdr_remote_alias, herdr_session_name = excluded.herdr_session_name, herdr_workspace_id = excluded.herdr_workspace_id, herdr_local_dir = excluded.herdr_local_dir, herdr_remote_cwd = excluded.herdr_remote_cwd, herdr_last_pane_id = excluded.herdr_last_pane_id, herdr_attach_dock_id = excluded.herdr_attach_dock_id, herdr_attach_pane_id = excluded.herdr_attach_pane_id, herdr_pane_links_json = excluded.herdr_pane_links_json, herdr_updated_at_ms = excluded.herdr_updated_at_ms, icon_index = excluded.icon_index, color_index = excluded.color_index",
             workspaceValues(workspace, null),
         );
         const workspace_row_id = try self.requireWorkspaceRowId(workspace.workspace_id);
@@ -4421,8 +4424,8 @@ pub const Store = struct {
             return error.InvalidParams;
         }
         try self.conn.exec(
-            "insert into workspaces (workspace_id, sort_index, label, path, archived, unread_count, collapsed, thread_list_expanded, terminal_height, terminal_layout_json, terminal_docks_json, workspace_layout_json, selected_thread_index, companion_thread_local_id, herdr_remote_alias, herdr_session_name, herdr_workspace_id, herdr_local_dir, herdr_remote_cwd, herdr_last_pane_id, herdr_attach_dock_id, herdr_attach_pane_id, herdr_pane_links_json, herdr_updated_at_ms) " ++
-                "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+            "insert into workspaces (workspace_id, sort_index, label, path, archived, unread_count, collapsed, thread_list_expanded, terminal_height, terminal_layout_json, terminal_docks_json, workspace_layout_json, selected_thread_index, companion_thread_local_id, herdr_remote_alias, herdr_session_name, herdr_workspace_id, herdr_local_dir, herdr_remote_cwd, herdr_last_pane_id, herdr_attach_dock_id, herdr_attach_pane_id, herdr_pane_links_json, herdr_updated_at_ms, icon_index, color_index) " ++
+                "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
             workspaceValues(workspace, @as(i64, @intCast(workspace_index))),
         );
         // Capture the workspaces rowid before any other insert can change it.
@@ -5405,6 +5408,10 @@ fn workspaceValues(workspace: store_protocol.Workspace, sort_index: ?i64) struct
         if (link) |value| if (value.attach_pane_id) |id| @as(i64, @intCast(id)) else null else null,
         if (link) |value| value.pane_links_json else null,
         if (link) |value| value.updated_at_ms else null,
+        // Out-of-range overrides from older or buggy writers fall back to the
+        // derived identity instead of corrupting the row.
+        if (workspace.icon_index) |value| if (value < 16) @as(i64, value) else null else null,
+        if (workspace.color_index) |value| if (value < 8) @as(i64, value) else null else null,
     };
 }
 
@@ -7890,6 +7897,38 @@ test "turn acceptance provider switch clears stale identity without touching GUI
     try std.testing.expect(failed.nullableText(0) == null);
     try std.testing.expect(failed.nullableText(1) == null);
     try std.testing.expectEqualStrings("failed", failed.text(2));
+}
+
+test "workspace identity overrides persist, reset to null, and reject out-of-range slots" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+
+    var workspace = testWorkspace("workspace-identity", "Identity workspace");
+    workspace.icon_index = 9;
+    workspace.color_index = 3;
+    _ = try store.upsertWorkspace(.{ .mutation = testHeader("identity-set", null), .workspace = workspace });
+    {
+        const row = (try store.conn.row("select icon_index, color_index from workspaces where workspace_id = 'workspace-identity'", .{})) orelse return error.TestExpectedEqual;
+        defer row.deinit();
+        try std.testing.expectEqual(@as(?i64, 9), row.nullableInt(0));
+        try std.testing.expectEqual(@as(?i64, 3), row.nullableInt(1));
+    }
+
+    workspace.icon_index = null;
+    _ = try store.upsertWorkspace(.{ .mutation = testHeader("identity-reset-icon", null), .workspace = workspace });
+    {
+        const row = (try store.conn.row("select icon_index, color_index from workspaces where workspace_id = 'workspace-identity'", .{})) orelse return error.TestExpectedEqual;
+        defer row.deinit();
+        try std.testing.expectEqual(@as(?i64, null), row.nullableInt(0));
+        try std.testing.expectEqual(@as(?i64, 3), row.nullableInt(1));
+    }
+
+    workspace.color_index = 8;
+    try std.testing.expectError(error.InvalidParams, store.upsertWorkspace(.{ .mutation = testHeader("identity-bad", null), .workspace = workspace }));
 }
 
 test "thread descriptions upsert for known threads and ignore unknown ones" {

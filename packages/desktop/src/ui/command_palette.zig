@@ -2198,7 +2198,7 @@ fn renderSwitcherRow(state: *runtime.AppState, row_index: usize, rect: palette.R
         .workspace => |pi| {
             if (pi >= state.project_controller.projects.items.len) return;
             const project = &state.project_controller.projects.items[pi];
-            sidebar.queueWorkspaceChip(state, chip_rect, project.id, false, row_clip);
+            sidebar.queueWorkspaceChip(state, chip_rect, project, false, row_clip);
             const gear = gear_rects[row_index] orelse rect;
             const current = !state.sidebar_all_workspaces and pi == state.project_controller.selected_index;
             var hint_buf_local: [32]u8 = undefined;
@@ -2222,7 +2222,7 @@ fn renderSwitcherRow(state: *runtime.AppState, row_index: usize, rect: palette.R
         .closed_workspace => |ai| {
             if (ai >= state.project_controller.archived_projects.items.len) return;
             const project = &state.project_controller.archived_projects.items[ai];
-            sidebar.queueWorkspaceChip(state, chip_rect, project.id, true, row_clip);
+            sidebar.queueWorkspaceChip(state, chip_rect, project, true, row_clip);
             const closed_w = theme.scaledUi(52.0);
             queueText(state, .{ .x = label_x, .y = text_y, .w = right_edge - label_x - closed_w, .h = line_h }, project.label, paletteColor(if (emphasis) theme.COLOR_TEXT_MUTED else theme.COLOR_TEXT_SUBTLE), font_size, row_clip);
             queueText(state, .{ .x = right_edge - closed_w, .y = text_y, .w = closed_w, .h = line_h }, "Closed", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.5), row_clip);

@@ -321,6 +321,47 @@ test "rename and reopen rewrite full metadata at the read revision and retry con
     try f.expectFailed(gone, "workspace_unavailable");
 }
 
+test "workspace_identity rewrites metadata with explicit overrides and nulls" {
+    var f = try Fixture.init(all_scopes, &.{});
+    defer f.deinit();
+    const id = try f.intent("workspace_identity", .{ .workspace_id = "ws-1", .icon_index = 3, .color_index = @as(?u8, null) });
+    try f.reply("daemon.client.register", .{ .client_id = "client-1" });
+    try eql("ws-1", p.s(try f.params("core.snapshot"), "workspace_id"));
+    try f.replyJson("core.snapshot",
+        \\{"store_revision":5,"snapshot":{"workspaces":[{"workspace_id":"ws-1","label":"One","path":"/home/u/src/one","icon_index":9,"color_index":4,"terminal_layout_json":"{}","threads":[]}]}}
+    );
+    var params = try f.params("workspace.upsert");
+    try expect(p.uint(p.get(p.get(params, "mutation"), "expected_store_revision")).? == 5);
+    var ws = p.get(params, "workspace");
+    try expect(p.num(p.get(ws, "icon_index")).? == 3);
+    // The reset must travel as an explicit null: the upsert replaces the row.
+    try expect(ws.object.get("color_index").? == .null);
+    try eql("One", p.s(ws, "label"));
+    try eql("{}", p.s(ws, "terminal_layout_json"));
+    try expect(p.get(ws, "threads") == .null);
+
+    // A conflict re-reads and re-applies the same overrides.
+    try f.reject("workspace.upsert", "conflict", null);
+    try f.replyJson("core.snapshot", snapshot);
+    params = try f.params("workspace.upsert");
+    ws = p.get(params, "workspace");
+    try expect(p.num(p.get(ws, "icon_index")).? == 3);
+    try expect(ws.object.get("color_index").? == .null);
+    try f.reply("workspace.upsert", .{ .store_revision = 6, .applied = true });
+    try eql("succeeded", p.s(try f.job(id), "state"));
+
+    // Absent fields also mean automatic; both resets are written.
+    _ = try f.intent("workspace_identity", .{ .workspace_id = "ws-1" });
+    try f.replyJson("core.snapshot", snapshot);
+    ws = p.get(try f.params("workspace.upsert"), "workspace");
+    try expect(ws.object.get("icon_index").? == .null and ws.object.get("color_index").? == .null);
+
+    try f.expectFailed(try f.intent("workspace_identity", .{ .workspace_id = "ws-1", .icon_index = 16 }), "invalid_identity");
+    try f.expectFailed(try f.intent("workspace_identity", .{ .workspace_id = "ws-1", .color_index = 8 }), "invalid_identity");
+    try f.expectFailed(try f.intent("workspace_identity", .{ .workspace_id = "ws-1", .icon_index = -1 }), "invalid_identity");
+    try std.testing.expectError(error.InvalidArgument, f.event("workspace_identity", .{ .intent_id = "bad", .workspace_id = "ws-1", .icon_index = "3" }));
+}
+
 test "workspace_close surfaces busy counts, then succeeds" {
     var f = try Fixture.init(all_scopes, &.{});
     defer f.deinit();

@@ -237,6 +237,8 @@ pub fn projectMetadataSnapshot(allocator: std.mem.Allocator, project: *const Pro
         .selected_thread_index = if (project.threads.items.len == 0) 0 else @min(project.selected_thread_index, project.threads.items.len - 1),
         .companion_thread_local_id = try dupeOptionalSlice(allocator, project.companion_thread_local_id),
         .herdr_link = if (project.herdr_link) |*link| try link.toPersisted(allocator) else null,
+        .icon_index = project.icon_index,
+        .color_index = project.color_index,
         .threads = &.{},
     };
 }
@@ -664,6 +666,8 @@ pub fn projectToProtocol(allocator: std.mem.Allocator, project: PersistedProject
             if (link.remote_alias.len == 0) try herdrToProtocol(allocator, link) else null
         else
             null,
+        .icon_index = project.icon_index,
+        .color_index = project.color_index,
         .provider = try allocator.dupe(u8, @tagName(project.provider)),
         .harness = try allocator.dupe(u8, @tagName(project.harness)),
         .draft = try allocator.dupe(u8, project.draft),
@@ -1189,6 +1193,8 @@ pub fn applyPersistedReusing(
             loaded.companion_thread_local_id = try self.allocator.dupeZ(u8, local_id);
         }
         loaded.archived = project.archived;
+        loaded.icon_index = project.icon_index;
+        loaded.color_index = project.color_index;
         loaded.collapsed = project.collapsed orelse false;
         loaded.thread_list_expanded = project.thread_list_expanded orelse false;
         if (project.herdr_link) |link| {
@@ -1677,6 +1683,8 @@ fn cloneProjects(
             .selected_thread_index = project.selected_thread_index,
             .companion_thread_local_id = try cloneOptionalSlice(allocator, project.companion_thread_local_id),
             .herdr_link = try cloneHerdrLink(allocator, project.herdr_link),
+            .icon_index = project.icon_index,
+            .color_index = project.color_index,
             .threads = try cloneThreads(allocator, project.threads, include_messages),
             .provider = project.provider,
             .harness = project.harness,

@@ -3,13 +3,15 @@ import { Portal } from 'solid-js/web'
 
 import { store, type SidebarContextAction } from '../lib/store'
 import { paneIsActive, type LivePane, type Workspace } from '../lib/types'
-import { fuzzyMatches, type SidebarScope } from '../lib/workspace_switcher'
+import { fuzzyMatches, sidebarSections, type SidebarScope } from '../lib/workspace_switcher'
 import { Icon, ProviderGlyph, StatusPip, VerdeLogo, WorkspaceGlyph } from './Icons'
 import { ChatRouting } from './ChatRouting'
 import { GitChangesDot } from './GitChanges'
 import { openDesktopViewer } from './DesktopViewer'
 import { openHistory } from './History'
 import { sidebarMenuAvailability } from '../lib/commands'
+import { themeTone } from '../lib/theme'
+import { WORKSPACE_COLOR_SLOTS, WORKSPACE_ICONS, workspaceIdentity, workspaceSlotColor } from '../lib/workspace_identity'
 
 function sameKeys(a: readonly string[], b: readonly string[]): boolean {
   return a.length === b.length && a.every((key, index) => key === b[index])
@@ -49,8 +51,8 @@ type SidebarMenuTarget =
   | { kind: 'terminal'; workspace: Workspace; pane: LivePane; x: number; y: number }
 
 interface MenuItem {
-  // 'workspace-history' is view-only: it opens the overlay, not a store action.
-  action: SidebarContextAction | 'workspace-history'
+  // View-only actions open overlays, not store actions.
+  action: SidebarContextAction | 'workspace-history' | 'workspace-edit-identity'
   label: string
   disabled?: boolean
   danger?: boolean
@@ -69,17 +71,20 @@ interface PromptState {
 export function Sidebar(props: { drawer?: boolean }) {
   const [menu, setMenu] = createSignal<SidebarMenuTarget | null>(null)
   const [prompt, setPrompt] = createSignal<PromptState | null>(null)
+  const [identityTarget, setIdentityTarget] = createSignal<Workspace | null>(null)
   const [switcherOpen, setSwitcherOpen] = createSignal(false)
   let switcherTrigger!: HTMLButtonElement
 
   const scope = () => store.sidebarScope()
-  const inScope = (pane: LivePane) => scope() === 'all' || pane.workspace_id === scope()
-  // Active keeps store.activePanes() order so active_select ordinals match.
-  const active_rows = keyedRows(() => store.activePanes().filter(inScope), paneRowKey)
-  const open_rows = keyedRows(
-    () => store.sidebarPanes().filter((pane) => inScope(pane) && !paneIsActive(pane)),
-    paneRowKey,
-  )
+  // Active is global (spec section 4) and keeps store.activePanes() order so
+  // active_select ordinals match; only Open follows the switcher scope.
+  const sections = createMemo(() => sidebarSections(
+    store.activePanes(),
+    store.sidebarPanes().filter((pane) => !paneIsActive(pane)),
+    scope(),
+  ))
+  const active_rows = keyedRows(() => sections().active, paneRowKey)
+  const open_rows = keyedRows(() => sections().open, paneRowKey)
   const scopedWorkspace = () => {
     const id = scope()
     return id === 'all' ? null : store.workspaces().find((row) => row.workspace_id === id) ?? null
@@ -104,6 +109,10 @@ export function Sidebar(props: { drawer?: boolean }) {
     const workspace = actionWorkspace(target.kind === 'workspace' ? undefined : target.pane) ?? target.workspace
     if (item.action === 'workspace-history') {
       openHistory(workspace.workspace_id)
+      return
+    }
+    if (item.action === 'workspace-edit-identity') {
+      setIdentityTarget(workspace)
       return
     }
     if (item.action === 'workspace-rename') {
@@ -134,12 +143,12 @@ export function Sidebar(props: { drawer?: boolean }) {
     })
   }
 
-  const renderRow = (rows: typeof active_rows) => (key: string) => {
+  const renderRow = (rows: typeof active_rows, chip: () => boolean) => (key: string) => {
     const pane = rows.row(key)
     return (
       <PaneRow
         pane={pane()}
-        chip={scope() === 'all'}
+        chip={chip()}
         onClick={() => store.focusPane(pane())}
         onOpenContext={(x, y) => openPaneMenu(pane(), x, y)}
       />
@@ -180,7 +189,7 @@ export function Sidebar(props: { drawer?: boolean }) {
                 </span>
               )}
             >
-              {(workspace) => <WorkspaceGlyph workspaceId={workspace().workspace_id} />}
+              {(workspace) => <WorkspaceGlyph workspace={workspace()} />}
             </Show>
             <span class="min-w-0 flex-1 truncate text-[15px] text-[var(--text)] lg:text-[13px]">
               {scopedWorkspace()?.label ?? 'All Workspaces'}
@@ -213,14 +222,14 @@ export function Sidebar(props: { drawer?: boolean }) {
         >
           <Show when={active_rows.keys().length > 0}>
             <SectionLabel>ACTIVE</SectionLabel>
-            <For each={active_rows.keys()}>{renderRow(active_rows)}</For>
+            <For each={active_rows.keys()}>{renderRow(active_rows, () => true)}</For>
           </Show>
           <Show when={open_rows.keys().length > 0}>
             <Show when={active_rows.keys().length > 0}>
               <div class="my-3 h-px bg-[var(--border-muted)]" />
             </Show>
             <SectionLabel>OPEN</SectionLabel>
-            <For each={open_rows.keys()}>{renderRow(open_rows)}</For>
+            <For each={open_rows.keys()}>{renderRow(open_rows, () => sections().open_chips)}</For>
           </Show>
           <Show when={active_rows.keys().length === 0 && open_rows.keys().length === 0}>
             <div class="px-1 py-3 text-[12px] text-[var(--text-subtle)]">
@@ -284,6 +293,18 @@ export function Sidebar(props: { drawer?: boolean }) {
                 pane: state.pane,
                 value,
               })
+            }}
+          />
+        )}
+      </Show>
+      <Show when={identityTarget()} keyed>
+        {(workspace) => (
+          <WorkspaceIdentityDialog
+            workspace={store.workspaces().find((row) => row.workspace_id === workspace.workspace_id) ?? workspace}
+            onClose={() => setIdentityTarget(null)}
+            onSave={(identity) => {
+              setIdentityTarget(null)
+              void store.setWorkspaceIdentity(workspace, identity)
             }}
           />
         )}
@@ -429,7 +450,7 @@ function WorkspaceSwitcher(props: {
                   <Show when={item.kind === 'workspace' ? item : null}>
                     {(row) => (
                       <>
-                        <WorkspaceGlyph workspaceId={row().workspace.workspace_id} dim={row().closed} />
+                        <WorkspaceGlyph workspace={row().workspace} dim={row().closed} />
                         <span class={`min-w-0 flex-1 truncate text-[14px] lg:text-[13px] ${row().closed ? 'text-[var(--text-subtle)]' : 'text-[var(--text)]'}`}>
                           {row().workspace.label}
                         </span>
@@ -510,6 +531,8 @@ export function PaneActionsButton(props: { pane: LivePane; mobile?: boolean }) {
       openHistory(workspace.workspace_id)
       return
     }
+    // Pane menus carry no workspace items; the identity editor lives in the sidebar.
+    if (item.action === 'workspace-edit-identity') return
     void store.runSidebarContextAction({
       action: item.action,
       workspace,
@@ -571,7 +594,8 @@ export function PaneActionsButton(props: { pane: LivePane; mobile?: boolean }) {
 
 function PaneRow(props: {
   pane: LivePane
-  /// Under All Workspaces, rows carry their workspace identity chip.
+  /// Active rows always, and Open rows under All Workspaces, carry their
+  /// workspace identity chip.
   chip?: boolean
   onClick: () => void
   onOpenContext?: (x: number, y: number) => void
@@ -605,7 +629,11 @@ function PaneRow(props: {
       <span class="min-w-0 flex-1 truncate text-[15px] text-[var(--text-muted)] lg:text-[13px]">{store.paneTitle(props.pane)}</span>
       <GitChangesDot pane={props.pane} />
       <Show when={props.chip}>
-        <WorkspaceGlyph workspaceId={props.pane.workspace_id} class="h-[18px] w-[18px]" iconClass="h-3 w-3" />
+        <WorkspaceGlyph
+          workspace={store.workspaces().find((row) => row.workspace_id === props.pane.workspace_id) ?? { workspace_id: props.pane.workspace_id }}
+          class="h-[18px] w-[18px]"
+          iconClass="h-3 w-3"
+        />
       </Show>
       <Show when={working()}>
         <StatusPip active />
@@ -802,6 +830,135 @@ function SidebarPrompt(props: {
   )
 }
 
+/// Icon/color picker for one workspace. Edits a draft with a live preview;
+/// Save persists both slots (null = automatic hash-derived slot).
+function WorkspaceIdentityDialog(props: {
+  workspace: Workspace
+  onClose: () => void
+  onSave: (identity: { icon_index: number | null; color_index: number | null }) => void
+}) {
+  const [icon, setIcon] = createSignal<number | null>(props.workspace.icon_index ?? null)
+  const [color, setColor] = createSignal<number | null>(props.workspace.color_index ?? null)
+  const automatic = () => icon() === null && color() === null
+  const identity = createMemo(() => workspaceIdentity(
+    props.workspace.workspace_id, themeTone().accent, themeTone().dark, { icon_index: icon(), color_index: color() },
+  ))
+  const slotColor = (slot: number) => workspaceSlotColor(themeTone().accent, slot, themeTone().dark)
+  let panel!: HTMLFormElement
+  queueMicrotask(() => panel?.querySelector<HTMLButtonElement>('[role="radio"][aria-checked="true"]')?.focus())
+  return (
+    <Portal>
+      <div class="anim-fade fixed inset-0 z-[60] grid place-items-center bg-black/60 p-4" onPointerDown={props.onClose}>
+        <form
+          ref={panel}
+          class="anim-pop w-full max-w-[340px] rounded-[14px] border border-[var(--border-muted)] bg-[var(--panel-alt)] p-5 shadow-[0_24px_70px_rgba(0,0,0,0.55)]"
+          role="dialog"
+          aria-label={`Edit ${props.workspace.label} icon`}
+          onPointerDown={(event) => event.stopPropagation()}
+          onKeyDown={(event) => {
+            if (event.key === 'Escape') {
+              event.preventDefault()
+              props.onClose()
+            }
+          }}
+          onSubmit={(event) => {
+            event.preventDefault()
+            props.onSave({ icon_index: icon(), color_index: color() })
+          }}
+        >
+          <div class="flex items-center gap-3">
+            <WorkspaceGlyph
+              workspace={{ workspace_id: props.workspace.workspace_id, icon_index: icon(), color_index: color() }}
+              class="h-9 w-9"
+              iconClass="h-5 w-5"
+            />
+            <div class="min-w-0">
+              <div class="wordmark text-[20px] text-white">Workspace icon</div>
+              <div class="truncate text-[12px] text-[var(--text-subtle)]">{props.workspace.label}</div>
+            </div>
+          </div>
+
+          <div class="mt-4 text-[11px] font-bold uppercase tracking-[0.08em] text-[var(--text-subtle)]">Icon</div>
+          <div class="mt-2 grid grid-cols-4 gap-1.5" role="radiogroup" aria-label="Icon">
+            <For each={[...WORKSPACE_ICONS]}>
+              {(name, index) => (
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={identity().icon_index === index()}
+                  aria-label={name}
+                  title={name}
+                  class={`grid h-11 place-items-center rounded-[8px] border lg:h-10 ${
+                    identity().icon_index === index()
+                      ? 'border-[var(--accent)]'
+                      : 'border-transparent hover:bg-[var(--accent-hover)]'
+                  }`}
+                  style={{
+                    color: identity().color,
+                    background: identity().icon_index === index() ? `${identity().color}2e` : undefined,
+                  }}
+                  onClick={() => setIcon(index())}
+                >
+                  <Icon name={`ws-${name}`} class="h-5 w-5" />
+                </button>
+              )}
+            </For>
+          </div>
+
+          <div class="mt-4 text-[11px] font-bold uppercase tracking-[0.08em] text-[var(--text-subtle)]">Color</div>
+          <div class="mt-2 flex justify-between" role="radiogroup" aria-label="Color">
+            <For each={Array.from({ length: WORKSPACE_COLOR_SLOTS }, (_, slot) => slot)}>
+              {(slot) => (
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={identity().color_index === slot}
+                  aria-label={`Color ${slot + 1}`}
+                  class={`grid h-9 w-9 place-items-center rounded-full border-2 lg:h-8 lg:w-8 ${
+                    identity().color_index === slot ? 'border-[var(--text)]' : 'border-transparent'
+                  }`}
+                  onClick={() => setColor(slot)}
+                >
+                  <span class="h-6 w-6 rounded-full lg:h-5 lg:w-5" style={{ background: slotColor(slot) }} />
+                </button>
+              )}
+            </For>
+          </div>
+
+          <div class="mt-5 flex items-center gap-2">
+            <button
+              type="button"
+              aria-pressed={automatic()}
+              title="Derive icon and color from the workspace id"
+              class={`h-9 rounded-[7px] px-3 text-[13px] ${
+                automatic()
+                  ? 'bg-[var(--accent-dim)] text-[var(--accent)]'
+                  : 'text-[var(--text-muted)] hover:bg-white/5'
+              }`}
+              onClick={() => { setIcon(null); setColor(null) }}
+            >
+              Automatic
+            </button>
+            <button
+              type="button"
+              class="ml-auto h-9 rounded-[7px] px-3 text-[13px] text-[var(--text-muted)] hover:bg-white/5"
+              onClick={props.onClose}
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              class="h-9 rounded-[7px] bg-[var(--accent)] px-4 text-[13px] font-bold text-[#0d1213] hover:bg-[var(--accent-hi)]"
+            >
+              Save
+            </button>
+          </div>
+        </form>
+      </div>
+    </Portal>
+  )
+}
+
 function contextMenuItems(target: SidebarMenuTarget): MenuItem[] {
   if (target.kind === 'workspace') {
     const linked = target.workspace.herdr_link != null
@@ -824,6 +981,7 @@ function contextMenuItems(target: SidebarMenuTarget): MenuItem[] {
       { action: 'workspace-history', label: 'History' },
       ...herdr,
       { action: 'workspace-rename', label: 'Rename workspace' },
+      { action: 'workspace-edit-identity', label: 'Edit icon…' },
       { action: 'workspace-import-codex', label: 'Import Codex thread' },
       { action: 'workspace-import-opencode', label: 'Import OpenCode thread' },
       { action: 'workspace-import-claude', label: 'Import Claude thread' },

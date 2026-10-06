@@ -45,6 +45,10 @@ pub const Workspace = struct {
     icon_index: u8 = 0,
     /// Theme color slot 0..7; the UI rotates its accent hue by `color_index * 45`.
     color_index: u8 = 0,
+    /// True when the daemon row pins `icon_index`; false means automatic (hash).
+    icon_custom: bool = false,
+    /// True when the daemon row pins `color_index`; false means automatic (hash).
+    color_custom: bool = false,
     /// max(last local focus, newest thread activity); null when neither is known.
     recency_ms: ?i64 = null,
     /// 0 = most recently used; the switcher lists workspaces in this order.
@@ -63,6 +67,11 @@ pub fn iconIndex(id: []const u8) u8 {
 }
 pub fn colorIndex(id: []const u8) u8 {
     return @intCast((identityHash(id) >> 8) % 8);
+}
+/// A daemon-stored identity override, or null (automatic) when absent, null or out of range.
+pub fn identityOverride(ws: V, key: []const u8, slots: u8) ?u8 {
+    const n = num(get(ws, key)) orelse return null;
+    return if (n >= 0 and n < slots) @intCast(n) else null;
 }
 pub const Models = struct {
     workspaces: []const Workspace,
@@ -293,11 +302,12 @@ fn recencyBefore(workspaces: []const Workspace, l: u32, r: u32) bool {
     return l < r;
 }
 /// Fills identity and recency fields; `focus` holds client-local selection times.
+/// Slots flagged custom keep their daemon override; the rest use the id hash.
 pub fn rankWorkspaces(a: A, workspaces: []Workspace, focus: []const FocusStamp) error{OutOfMemory}!void {
     const order = try a.alloc(u32, workspaces.len);
     for (workspaces, order, 0..) |*w, *o, i| {
-        w.icon_index = iconIndex(w.workspace_id);
-        w.color_index = colorIndex(w.workspace_id);
+        if (!w.icon_custom) w.icon_index = iconIndex(w.workspace_id);
+        if (!w.color_custom) w.color_index = colorIndex(w.workspace_id);
         var best: ?i64 = null;
         for (w.threads) |t| if (t.last_activity_at_ms) |ms| {
             best = @max(best orelse ms, ms);
@@ -342,7 +352,9 @@ pub fn projectFocused(a: A, snapshot: V, catalog: []const V, has_catalog: bool, 
                 if (p.attention or p.can_stop or eq(p.status, "working")) try home.append(a, p);
             }
         }
-        try workspaces.append(a, .{ .workspace_id = wid, .label = fallback(s(ws, "label"), wid), .path = s(ws, "path"), .open = !yes(get(ws, "archived")), .panes = panes, .threads = try summaries.toOwnedSlice(a) });
+        const icon = identityOverride(ws, "icon_index", 16);
+        const color = identityOverride(ws, "color_index", 8);
+        try workspaces.append(a, .{ .workspace_id = wid, .label = fallback(s(ws, "label"), wid), .path = s(ws, "path"), .open = !yes(get(ws, "archived")), .panes = panes, .threads = try summaries.toOwnedSlice(a), .icon_index = icon orelse 0, .color_index = color orelse 0, .icon_custom = icon != null, .color_custom = color != null });
     }
     try rankWorkspaces(a, workspaces.items, focus);
     std.mem.sort(Pane, home.items, {}, attentionOrder);

@@ -258,7 +258,7 @@ fn printHelp(out: output.Output) !void {
         \\  terminals [--workspace <id|index|current>] [--json]
         \\  surfaces [--json]
         \\  inspect --pane <id> [--workspace <id|index|current>] [--json]
-        \\  workspace select|create|rename|close|reopen ...
+        \\  workspace select|create|rename|identity|close|reopen ...
         \\  pane focus|split|resize|move|maximize|close ...
         \\  chat open|status|transcript|send|followup|stop|approve|draft ...
         \\  browser open|navigate|status|close|toggle|back|forward|reload|eval|screenshot|post-json|inspector-* ...
@@ -1594,6 +1594,7 @@ fn liveFlagAllowed(argv: []const []const u8, flag: []const u8) bool {
     if (std.mem.eql(u8, command, "workspace")) {
         if (std.mem.eql(u8, subcommand, "create")) return std.mem.eql(u8, flag, "--path");
         if (std.mem.eql(u8, subcommand, "rename")) return flagIn(flag, &.{ "--workspace", "--project", "--label", "--name" });
+        if (std.mem.eql(u8, subcommand, "identity")) return flagIn(flag, &.{ "--workspace", "--project", "--icon", "--color" });
         if (std.mem.eql(u8, subcommand, "select") or std.mem.eql(u8, subcommand, "close") or
             std.mem.eql(u8, subcommand, "archive") or std.mem.eql(u8, subcommand, "reopen")) return flagIn(flag, &workspace_flags);
         return false;
@@ -2579,6 +2580,20 @@ fn handleLiveWorkspace(allocator: std.mem.Allocator, out: output.Output, io: std
         try sendLiveRequest(allocator, out, io, "workspace.rename", .{
             .workspace = workspaceOption(argv),
             .label = label,
+        }, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "identity")) {
+        const icon = args.optionValue(argv, "--icon");
+        const color = args.optionValue(argv, "--color");
+        if (icon == null and color == null) {
+            try out.stderr("verde live workspace identity requires --icon <0-15|auto> and/or --color <0-7|auto>\n", .{});
+            std.process.exit(2);
+        }
+        try sendLiveRequest(allocator, out, io, "workspace.identity", .{
+            .workspace = workspaceOption(argv),
+            .icon = icon,
+            .color = color,
         }, json);
         return;
     }

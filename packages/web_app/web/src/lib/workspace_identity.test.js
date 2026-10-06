@@ -37,6 +37,18 @@ describe('workspace identity', () => {
     expect(workspaceSlotColor('#808080', 0, true)).not.toBe('#808080')
   })
 
+  test('user overrides replace hash slots independently', () => {
+    // ws-alpha hashes to icon 14 / color 2.
+    expect(workspaceIdentitySlots('ws-alpha', { icon_index: 3 })).toEqual({ hash: 0x48d4ea0e, icon_index: 3, color_index: 2, icon: 'leaf' })
+    expect(workspaceIdentitySlots('ws-alpha', { color_index: 7 })).toMatchObject({ icon_index: 14, color_index: 7, icon: 'compass' })
+    expect(workspaceIdentitySlots('ws-alpha', { icon_index: 0, color_index: 0 })).toMatchObject({ icon_index: 0, color_index: 0, icon: 'folder' })
+    // null/absent/out-of-range fall back to the hash.
+    for (const overrides of [undefined, {}, { icon_index: null, color_index: null }, { icon_index: 16, color_index: 8 }, { icon_index: -1, color_index: 1.5 }]) {
+      expect(workspaceIdentitySlots('ws-alpha', overrides)).toEqual(workspaceIdentitySlots('ws-alpha'))
+    }
+    expect(workspaceIdentity('ws-alpha', '#50c878', true, { color_index: 0 }).color).toBe('#50c878')
+  })
+
   test('keeps the icon order fixed', () => {
     expect(WORKSPACE_ICONS).toHaveLength(16)
     expect(WORKSPACE_ICONS[0]).toBe('folder')

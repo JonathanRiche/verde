@@ -276,6 +276,40 @@ class ManageTest {
         awaitText("Renamed")
     }
 
+    @Test fun iconDialogPinsAndResetsIconAndColor() {
+        launch()
+        tab("Workspaces")
+        awaitText("One")
+        compose.onNode(hasText("One") and hasClickAction()).performClick()
+        awaitText("/home/u/one")
+        click("Icon")
+        awaitText("Icon and color")
+        compose.onNodeWithTag(IDENTITY_ICON + 3).performClick()
+        compose.onNodeWithTag(IDENTITY_COLOR + 5).performClick()
+        click("Save")
+        await { sent<EventWorkspaceIdentity>().isNotEmpty() }
+        val pinned=sent<EventWorkspaceIdentity>().single()
+        assertEquals(Triple("ws-one", 3, 5), Triple(pinned.workspace_id, pinned.icon_index, pinned.color_index))
+        await { !exists("Icon and color") }
+
+        click("Icon")
+        awaitText("Icon and color")
+        compose.onAllNodes(hasText("Automatic") and hasClickAction())[0].performClick()
+        click("Save")
+        await { sent<EventWorkspaceIdentity>().size == 2 }
+        val reset=sent<EventWorkspaceIdentity>().last()
+        assertEquals(null, reset.icon_index)
+        assertEquals(5, reset.color_index)
+        // Explicit nulls reach the core so the daemon row resets to automatic.
+        assertTrue(CoreJson.encodeToString<Event>(reset).contains("\"icon_index\":null"))
+    }
+
+    @Test fun autoIdentityMatchesCrossClientVectors() {
+        assertEquals(14 to 2, workspaceAutoIdentity("ws-alpha"))
+        assertEquals(9 to 6, workspaceAutoIdentity("baaa819e66d8f3be"))
+        assertEquals(5 to 5, workspaceAutoIdentity(""))
+    }
+
     @Test fun presentationRules() {
         assertEquals("Stop 1 running request first.", busyMessage(ManageBusy(1, 0)))
         assertEquals("Stop 3 running background tasks first.", busyMessage(ManageBusy(0, 3)))
@@ -385,6 +419,12 @@ class ManageTest {
                     else { ws(decoded.workspace_id) { it.copy(open=false) }; job("workspace_close", decoded.intent_id, decoded.workspace_id) }
                 }
                 is EventWorkspaceArchive -> { ws(decoded.workspace_id) { it.copy(open=!decoded.archived) }; job("workspace_archive", decoded.intent_id, decoded.workspace_id) }
+                is EventWorkspaceIdentity -> {
+                    val (autoIcon, autoColor) = workspaceAutoIdentity(decoded.workspace_id)
+                    ws(decoded.workspace_id) { it.copy(icon_index=decoded.icon_index ?: autoIcon, color_index=decoded.color_index ?: autoColor,
+                        icon_custom=decoded.icon_index != null, color_custom=decoded.color_index != null) }
+                    job("workspace_identity", decoded.intent_id, decoded.workspace_id)
+                }
                 is EventWorkspaceRename -> { ws(decoded.workspace_id) { it.copy(label=decoded.label) }; job("workspace_rename", decoded.intent_id, decoded.workspace_id) }
                 is EventDirectoryList -> {
                     val path=decoded.path ?: "/home/u"

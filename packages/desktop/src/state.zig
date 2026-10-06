@@ -1036,6 +1036,8 @@ fn overlayCurrentProjectEdits(
     if (current.selected_thread_index != baseline.selected_thread_index) remote.selected_thread_index = current.selected_thread_index;
     if (!optionalSliceEqual(current.companion_thread_local_id, baseline.companion_thread_local_id)) remote.companion_thread_local_id = current.companion_thread_local_id;
     if (!optionalHerdrEqual(current.herdr_link, baseline.herdr_link)) remote.herdr_link = current.herdr_link;
+    if (current.icon_index != baseline.icon_index) remote.icon_index = current.icon_index;
+    if (current.color_index != baseline.color_index) remote.color_index = current.color_index;
     if (current.provider != baseline.provider) remote.provider = current.provider;
     if (current.harness != baseline.harness) remote.harness = current.harness;
     if (!std.mem.eql(u8, current.draft, baseline.draft)) remote.draft = current.draft;
@@ -2268,6 +2270,12 @@ pub const PaletteModalAction = enum {
     workspace_settings_scroll_mode,
     workspace_settings_scroll_threshold_dec,
     workspace_settings_scroll_threshold_inc,
+    /// index = icon slot 0..15.
+    workspace_settings_icon,
+    /// index = color slot 0..7.
+    workspace_settings_color,
+    /// Clears both identity overrides back to the id-derived defaults.
+    workspace_settings_identity_auto,
     settings_cancel,
     settings_close,
     settings_save,
@@ -5395,6 +5403,24 @@ pub const AppState = struct {
         return null;
     }
 
+    /// Identity edits from the workspace settings modal. `icon`/`color` set
+    /// that slot override and keep the other; `reset` clears both.
+    pub fn applyWorkspaceSettingsIdentity(self: *AppState, edit: union(enum) { icon: u8, color: u8, reset }) void {
+        const bound = self.workspace_settings_project_id orelse return;
+        for (self.project_controller.projects.items, 0..) |project, index| {
+            if (!std.mem.eql(u8, project.id, bound)) continue;
+            const icon: ?u8, const color: ?u8 = switch (edit) {
+                .icon => |value| .{ value, project.color_index },
+                .color => |value| .{ project.icon_index, value },
+                .reset => .{ null, null },
+            };
+            self.setProjectIdentityAtIndex(index, icon, color) catch |err| {
+                log.warn("workspace identity update failed: {s}", .{@errorName(err)});
+            };
+            return;
+        }
+    }
+
     pub fn workspaceSettingsProjectMutable(self: *AppState) ?*Project {
         const bound = self.workspace_settings_project_id orelse return null;
         for (self.project_controller.projects.items) |*project| {
@@ -6453,6 +6479,18 @@ pub const AppState = struct {
         project.label = copied;
         if (self.project_controller.selected_index == index) self.syncRenameBuffer();
         self.setSidebarNotice("Workspace renamed.");
+        self.markDirty();
+    }
+
+    /// Sets or clears (null) the workspace's icon/color overrides. Values are
+    /// slot indices into the shared identity tables (16 icons, 8 colors).
+    pub fn setProjectIdentityAtIndex(self: *AppState, index: usize, icon_index: ?u8, color_index: ?u8) !void {
+        if (index >= self.project_controller.projects.items.len) return error.ProjectNotFound;
+        if ((icon_index orelse 0) >= 16 or (color_index orelse 0) >= 8) return error.InvalidWorkspaceIdentity;
+        const project = &self.project_controller.projects.items[index];
+        if (project.icon_index == icon_index and project.color_index == color_index) return;
+        project.icon_index = icon_index;
+        project.color_index = color_index;
         self.markDirty();
     }
 
@@ -13863,6 +13901,9 @@ pub const AppState = struct {
                 .workspace_settings_scroll_mode,
                 .workspace_settings_scroll_threshold_dec,
                 .workspace_settings_scroll_threshold_inc,
+                .workspace_settings_icon,
+                .workspace_settings_color,
+                .workspace_settings_identity_auto,
                 .settings_cancel,
                 .settings_save,
                 .command_palette_row,

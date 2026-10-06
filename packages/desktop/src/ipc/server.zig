@@ -413,35 +413,35 @@ fn capabilitiesResponse(allocator: std.mem.Allocator, id_value: std.json.Value) 
     return try okValueResponse(allocator, id_value, .{
         .protocol_version = PROTOCOL_VERSION,
         .commands = &.{
-            "status",                               "capabilities",                       "workspaces",                          "panes",
-            "active",                               "inspect",                            "threads",                             "terminals",
-            "herdr.open",                           "herdr.handoff",                      "herdr.unlink",                        "herdr.status",
-            "surfaces",                             "surface.list",                       "surface.inspect",                     "surface.focus",
-            "surface.clearAttention",               "notification.create",                "notification.update",                 "notification.clear",
-            "processes",                            "workspace.select",                   "workspace.create",                    "workspace.rename",
-            "workspace.close",                      "workspace.reopen",                   "workspace.archive",                   "pane.focus",
-            "pane.split",                           "pane.resize",                        "pane.move",                           "pane.maximize",
-            "pane.close",                           "chat.open",                          "chat.open.validate",                  "chat.present",
-            "chat.open_subagent",                   "chat.status",                        "chat.transcript",                     "chat.draft.get",
-            "chat.draft.set",                       "chat.draft.append",                  "chat.send",                           "chat.followup",
-            "chat.stop",                            "chat.approve",                       "browser.open",                        "browser.navigate",
-            "browser.tabOpen",                      "browser.status",                     "browser.close",                       "browser.toggle",
-            "browser.back",                         "browser.forward",                    "browser.reload",                      "browser.focus",
-            "browser.blur",                         "browser.restart",                    "browser.reset",                       "browser.pointerDown",
-            "browser.pointerMove",                  "browser.pointerUp",                  "browser.toolbarHit",                  "browser.selectAllFocused",
-            "browser.copyFocused",                  "browser.pasteTextFocused",           "browser.eval",                        "browser.postJson",
-            "browser.screenshot",                   "browser.inspector.enable",           "browser.inspector.disable",           "browser.inspector.toggle",
-            "browser.inspector.mode",               "browser.inspector.menuOpen",         "browser.inspector.menuClose",         "browser.overlay.workspaceMenuOpen",
-            "browser.overlay.workspaceMenuClose",   "browser.overlay.sidebarMenuOpen",    "browser.overlay.sidebarMenuClose",    "browser.overlay.composerMenuOpen",
-            "browser.overlay.composerMenuClose",    "browser.overlay.workspaceModalOpen", "browser.overlay.workspaceModalClose", "browser.overlay.threadModalOpen",
-            "browser.overlay.threadModalClose",     "browser.overlay.imageModalOpen",     "browser.overlay.imageModalClose",     "browser.overlay.transcriptModalOpen",
-            "browser.overlay.transcriptModalClose", "palette.list",                       "palette.run",                         "terminal.open",
-            "terminal.write",                       "terminal.key",                       "terminal.tail",                       "terminal.screen",
-            "process.list",                         "process.inspect",                    "process.start",                       "process.stop",
-            "process.restart",                      "process.logs",                       "agent.open",                          "stack.status",
-            "stack.start",                          "stack.stop",                         "stack.restart",                       "workspace.processes",
-            "workspace.checkCommand",               "workspace.acquireLease",             "workspace.releaseLease",              "workspace.waitForResources",
-            "tab.select",                           "tab.add",
+            "status",                              "capabilities",                         "workspaces",                         "panes",
+            "active",                              "inspect",                              "threads",                            "terminals",
+            "herdr.open",                          "herdr.handoff",                        "herdr.unlink",                       "herdr.status",
+            "surfaces",                            "surface.list",                         "surface.inspect",                    "surface.focus",
+            "surface.clearAttention",              "notification.create",                  "notification.update",                "notification.clear",
+            "processes",                           "workspace.select",                     "workspace.create",                   "workspace.rename",
+            "workspace.identity",                  "workspace.close",                      "workspace.reopen",                   "workspace.archive",
+            "pane.focus",                          "pane.split",                           "pane.resize",                        "pane.move",
+            "pane.maximize",                       "pane.close",                           "chat.open",                          "chat.open.validate",
+            "chat.present",                        "chat.open_subagent",                   "chat.status",                        "chat.transcript",
+            "chat.draft.get",                      "chat.draft.set",                       "chat.draft.append",                  "chat.send",
+            "chat.followup",                       "chat.stop",                            "chat.approve",                       "browser.open",
+            "browser.navigate",                    "browser.tabOpen",                      "browser.status",                     "browser.close",
+            "browser.toggle",                      "browser.back",                         "browser.forward",                    "browser.reload",
+            "browser.focus",                       "browser.blur",                         "browser.restart",                    "browser.reset",
+            "browser.pointerDown",                 "browser.pointerMove",                  "browser.pointerUp",                  "browser.toolbarHit",
+            "browser.selectAllFocused",            "browser.copyFocused",                  "browser.pasteTextFocused",           "browser.eval",
+            "browser.postJson",                    "browser.screenshot",                   "browser.inspector.enable",           "browser.inspector.disable",
+            "browser.inspector.toggle",            "browser.inspector.mode",               "browser.inspector.menuOpen",         "browser.inspector.menuClose",
+            "browser.overlay.workspaceMenuOpen",   "browser.overlay.workspaceMenuClose",   "browser.overlay.sidebarMenuOpen",    "browser.overlay.sidebarMenuClose",
+            "browser.overlay.composerMenuOpen",    "browser.overlay.composerMenuClose",    "browser.overlay.workspaceModalOpen", "browser.overlay.workspaceModalClose",
+            "browser.overlay.threadModalOpen",     "browser.overlay.threadModalClose",     "browser.overlay.imageModalOpen",     "browser.overlay.imageModalClose",
+            "browser.overlay.transcriptModalOpen", "browser.overlay.transcriptModalClose", "palette.list",                       "palette.run",
+            "terminal.open",                       "terminal.write",                       "terminal.key",                       "terminal.tail",
+            "terminal.screen",                     "process.list",                         "process.inspect",                    "process.start",
+            "process.stop",                        "process.restart",                      "process.logs",                       "agent.open",
+            "stack.status",                        "stack.start",                          "stack.stop",                         "stack.restart",
+            "workspace.processes",                 "workspace.checkCommand",               "workspace.acquireLease",             "workspace.releaseLease",
+            "workspace.waitForResources",          "tab.select",                           "tab.add",
         },
         .events = &.{},
         .encodings = &.{"json"},
@@ -474,6 +474,10 @@ fn workspacesResponse(allocator: std.mem.Allocator, id_value: std.json.Value, st
         try s.write(project.path);
         try s.objectField("archived");
         try s.write(project.archived);
+        try s.objectField("icon_index");
+        try s.write(project.icon_index);
+        try s.objectField("color_index");
+        try s.write(project.color_index);
         try s.objectField("thread_count");
         try s.write(project.threads.items.len);
         try s.objectField("pane_count");
@@ -952,6 +956,19 @@ fn workspaceCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Val
             error.EmptyProjectName => return try errorResponseAlloc(allocator, id_value, "invalid_request", "workspace name cannot be empty"),
             else => return try errorResponseAlloc(allocator, id_value, "internal_error", @errorName(err)),
         };
+        return try workspacesResponse(allocator, id_value, state);
+    }
+
+    if (std.mem.eql(u8, command, "identity")) {
+        const project_index = resolveProjectIndex(state, params) orelse
+            return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
+        const project = state.project_controller.projects.items[project_index];
+        const icon = identityParam(params, "icon", 16, project.icon_index) orelse
+            return try errorResponseAlloc(allocator, id_value, "invalid_request", "icon must be 0-15 or \"auto\"");
+        const color = identityParam(params, "color", 8, project.color_index) orelse
+            return try errorResponseAlloc(allocator, id_value, "invalid_request", "color must be 0-7 or \"auto\"");
+        state.setProjectIdentityAtIndex(project_index, icon.value, color.value) catch |err|
+            return try errorResponseAlloc(allocator, id_value, "internal_error", @errorName(err));
         return try workspacesResponse(allocator, id_value, state);
     }
 
@@ -4362,6 +4379,25 @@ fn writeJsonValue(s: *std.json.Stringify, value: std.json.Value) !void {
 fn stringParam(params: std.json.Value, name: []const u8) ?[]const u8 {
     if (params != .object) return null;
     return jsonString(params.object.get(name) orelse .null);
+}
+
+/// Workspace identity slot param: absent/null keeps `current`, "auto" clears
+/// the override, an integer (or numeric string) below `limit` sets it.
+/// Returns null when the value is invalid.
+fn identityParam(params: std.json.Value, name: []const u8, limit: u8, current: ?u8) ?struct { value: ?u8 } {
+    if (params != .object) return .{ .value = current };
+    const raw = params.object.get(name) orelse return .{ .value = current };
+    const parsed: i64 = switch (raw) {
+        .null => return .{ .value = current },
+        .integer => |i| i,
+        .string => |text| blk: {
+            if (std.ascii.eqlIgnoreCase(text, "auto")) return .{ .value = null };
+            break :blk std.fmt.parseInt(i64, text, 10) catch return null;
+        },
+        else => return null,
+    };
+    if (parsed < 0 or parsed >= limit) return null;
+    return .{ .value = @intCast(parsed) };
 }
 
 fn intParam(params: std.json.Value, name: []const u8) ?i64 {

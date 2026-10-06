@@ -22,6 +22,27 @@ describe('workspace command RPC handlers', () => {
       expect(workspace.threads).toHaveLength(1)
     })
   }
+  test('identity edits go straight to workspace.upsert and keep explicit nulls', async () => {
+    const pinned = { ...workspace, icon_index: 4, color_index: 2 }
+    for (const patch of [{ icon_index: 7, color_index: null }, { icon_index: null, color_index: null }]) {
+      const calls = []
+      const call = async (method, params) => { calls.push({ method, params }); return ok }
+      expect(await requestWorkspaceCommand(call, mutation, pinned, patch)).toBe(ok)
+      expect(calls.map((row) => row.method)).toEqual(['workspace.upsert'])
+      expect(calls[0].params).toEqual({ mutation: await mutation(), workspace: {
+        workspace_id: 'owner', label: 'Saved', path: '/repo', workspace_layout_json: 'layout', ...patch,
+      } })
+      const wire = JSON.parse(JSON.stringify(calls[0].params)).workspace
+      expect('icon_index' in wire && 'color_index' in wire).toBe(true)
+      expect(wire.color_index).toBeNull()
+    }
+  })
+  test('rename fallback carries the current identity slots', async () => {
+    const calls = []
+    const call = async (method, params) => { calls.push({ method, params }); return method === 'workspace.upsert' ? ok : forbidden }
+    await requestWorkspaceCommand(call, mutation, { ...workspace, icon_index: 3, color_index: null }, { label: 'New' })
+    expect(calls[1].params.workspace).toMatchObject({ label: 'New', icon_index: 3, color_index: null })
+  })
   test('write-scope rejection from the daemon fallback is propagated', async () => {
     const denied = { ok: false, error: { code: 'insufficient_scope', message: 'repository:write required' } }
     const call = async (method) => method === 'workspace.upsert' ? denied : forbidden

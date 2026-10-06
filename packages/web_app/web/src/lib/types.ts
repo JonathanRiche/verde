@@ -101,6 +101,9 @@ export interface Workspace {
   pane_count?: number
   thread_count?: number
   herdr_link?: HerdrWorkspaceLink | null
+  /// User-chosen identity slots (icon 0..15, color 0..7); null/absent = hash.
+  icon_index?: number | null
+  color_index?: number | null
 }
 
 export interface LivePane {

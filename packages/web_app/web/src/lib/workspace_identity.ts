@@ -27,13 +27,24 @@ export interface WorkspaceIdentitySlots {
   icon: WorkspaceIconName
 }
 
-export function workspaceIdentitySlots(id: string): WorkspaceIdentitySlots {
+/// User-chosen slots persisted on the daemon workspace row; null/absent (or
+/// out of range) falls back to the hash-derived slot. Independent fields.
+export interface WorkspaceIdentityOverrides {
+  icon_index?: number | null
+  color_index?: number | null
+}
+
+function overrideSlot(value: number | null | undefined, count: number): number | null {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value < count ? value : null
+}
+
+export function workspaceIdentitySlots(id: string, overrides?: WorkspaceIdentityOverrides): WorkspaceIdentitySlots {
   const hash = workspaceIdentityHash(id)
-  const icon_index = hash % WORKSPACE_ICONS.length
+  const icon_index = overrideSlot(overrides?.icon_index, WORKSPACE_ICONS.length) ?? hash % WORKSPACE_ICONS.length
   return {
     hash,
     icon_index,
-    color_index: (hash >>> 8) % WORKSPACE_COLOR_SLOTS,
+    color_index: overrideSlot(overrides?.color_index, WORKSPACE_COLOR_SLOTS) ?? (hash >>> 8) % WORKSPACE_COLOR_SLOTS,
     icon: WORKSPACE_ICONS[icon_index]!,
   }
 }
@@ -52,8 +63,10 @@ export interface WorkspaceIdentity extends WorkspaceIdentitySlots {
   color: string
 }
 
-export function workspaceIdentity(id: string, accent: string, dark: boolean): WorkspaceIdentity {
-  const slots = workspaceIdentitySlots(id)
+export function workspaceIdentity(
+  id: string, accent: string, dark: boolean, overrides?: WorkspaceIdentityOverrides,
+): WorkspaceIdentity {
+  const slots = workspaceIdentitySlots(id, overrides)
   return { ...slots, color: workspaceSlotColor(accent, slots.color_index, dark) }
 }
 

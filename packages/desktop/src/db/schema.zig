@@ -6,7 +6,7 @@ const zqlite = @import("zqlite");
 /// Latest schema version understood by this build.
 pub const CURRENT_VERSION: i64 = 1;
 /// Maximum schema version understood by read-only clients and the daemon store.
-pub const MAX_SUPPORTED_VERSION: i64 = 16;
+pub const MAX_SUPPORTED_VERSION: i64 = 17;
 /// SQLite busy timeout shared by writer and read-only connections.
 pub const BUSY_TIMEOUT_MS = 5000;
 
@@ -56,7 +56,9 @@ pub const INIT_SQL: [:0]const u8 =
     \\    herdr_attach_dock_id integer,
     \\    herdr_attach_pane_id integer,
     \\    herdr_pane_links_json text,
-    \\    herdr_updated_at_ms integer
+    \\    herdr_updated_at_ms integer,
+    \\    icon_index integer,
+    \\    color_index integer
     \\);
     \\create unique index if not exists workspaces_sort_index_idx on workspaces(sort_index);
     \\create table if not exists threads (
@@ -325,6 +327,12 @@ fn migrateToVersionInternal(
                 if (failure_point == .before_version_bump) return error.TestMigrationFailure;
                 try conn.execNoArgs("pragma user_version = 16");
                 version = 16;
+            },
+            16 => {
+                try migrateV16ToV17(conn);
+                if (failure_point == .before_version_bump) return error.TestMigrationFailure;
+                try conn.execNoArgs("pragma user_version = 17");
+                version = 17;
             },
             else => return error.DatabaseSchemaInvalid,
         }
@@ -877,6 +885,9 @@ fn migrateV0ToV1(conn: zqlite.Conn) !void {
     try ensureColumn(conn, "workspaces", "herdr_attach_pane_id", "alter table workspaces add column herdr_attach_pane_id integer");
     try ensureColumn(conn, "workspaces", "herdr_pane_links_json", "alter table workspaces add column herdr_pane_links_json text");
     try ensureColumn(conn, "workspaces", "herdr_updated_at_ms", "alter table workspaces add column herdr_updated_at_ms integer");
+    // Also added at v17; the GUI compatibility client stays at v1 and reads them.
+    try ensureColumn(conn, "workspaces", "icon_index", "alter table workspaces add column icon_index integer");
+    try ensureColumn(conn, "workspaces", "color_index", "alter table workspaces add column color_index integer");
     try ensureColumn(conn, "threads", "archived", "alter table threads add column archived integer not null default 0");
     try ensureColumn(conn, "threads", "local_thread_id", "alter table threads add column local_thread_id text");
     try ensureColumn(conn, "threads", "reasoning_variant", "alter table threads add column reasoning_variant text");
@@ -957,6 +968,13 @@ pub const THREAD_DESCRIPTIONS_SCHEMA_SQL =
 
 fn migrateV15ToV16(conn: zqlite.Conn) !void {
     try conn.execNoArgs(THREAD_DESCRIPTIONS_SCHEMA_SQL);
+}
+
+/// Adds optional user-chosen workspace identity overrides (null = derived
+/// from the workspace id hash; see docs/workspace-switcher-sidebar.md).
+fn migrateV16ToV17(conn: zqlite.Conn) !void {
+    try ensureColumn(conn, "workspaces", "icon_index", "alter table workspaces add column icon_index integer");
+    try ensureColumn(conn, "workspaces", "color_index", "alter table workspaces add column color_index integer");
 }
 
 const OpenThreadPolicy = struct {

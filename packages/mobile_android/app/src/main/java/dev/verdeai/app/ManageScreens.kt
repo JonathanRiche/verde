@@ -1,7 +1,12 @@
 package dev.verdeai.app
 
 import android.net.Uri
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
@@ -13,11 +18,15 @@ import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.verdeai.core.*
@@ -36,6 +45,8 @@ internal const val HISTORY_SEARCH = "history-search"
 internal const val WORKSPACE_PATH = "workspace-path"
 internal const val WORKSPACE_LABEL = "workspace-label"
 internal const val RENAME_FIELD = "rename-field"
+internal const val IDENTITY_ICON = "identity-icon-"
+internal const val IDENTITY_COLOR = "identity-color-"
 internal const val SEARCH_DEBOUNCE_MS = 300L
 
 /** History rows in core order with a header whenever the core's bucket changes. */
@@ -357,6 +368,7 @@ internal fun WorkspaceActions(state: BrowseState, manage: ManageModel, workspace
     var intent by rememberSaveable(workspace.workspace_id) { mutableStateOf<String?>(null) }
     var renaming by rememberSaveable(workspace.workspace_id) { mutableStateOf(false) }
     var closing by rememberSaveable(workspace.workspace_id) { mutableStateOf(false) }
+    var styling by rememberSaveable(workspace.workspace_id) { mutableStateOf(false) }
     val result = outcome(manageState, intent)
     val busy = result == JobOutcome.Pending
     val canManage = manageState.view?.can_manage_workspaces == true && !busy
@@ -364,6 +376,7 @@ internal fun WorkspaceActions(state: BrowseState, manage: ManageModel, workspace
         Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
             if (workspace.open) TextButton(onClick = onNewChat, enabled = manageState.view?.can_create_threads == true) { Text("New chat") }
             TextButton(onClick = { renaming = true }, enabled = canManage) { Text("Rename") }
+            TextButton(onClick = { styling = true }, enabled = canManage) { Text("Icon") }
             if (workspace.open) TextButton(onClick = { closing = true }, enabled = canManage) { Text("Close") }
             else TextButton(onClick = { intent = manage.setArchived(workspace.workspace_id, false) }, enabled = canManage) { Text("Reopen") }
         }
@@ -390,4 +403,59 @@ internal fun WorkspaceActions(state: BrowseState, manage: ManageModel, workspace
             confirmButton = { TextButton(onClick = { closing = false; intent = manage.close(workspace.workspace_id) }) { Text("Close workspace") } },
             dismissButton = { TextButton(onClick = { closing = false }) { Text("Cancel") } })
     }
+    if (styling) WorkspaceIdentityDialog(workspace, onDismiss = { styling = false }) { icon, color ->
+        styling = false
+        intent = manage.setIdentity(workspace.workspace_id, icon, color)
+    }
+}
+
+/** Picks a pinned icon and color, or "Automatic" (null) for either; Save sends one intent. */
+@Composable
+internal fun WorkspaceIdentityDialog(workspace: Workspace, onDismiss: () -> Unit, onSave: (Int?, Int?) -> Unit) {
+    val id = workspace.workspace_id
+    var icon by rememberSaveable(id) { mutableStateOf(if (workspace.icon_custom) workspace.icon_index else null) }
+    var color by rememberSaveable(id) { mutableStateOf(if (workspace.color_custom) workspace.color_index else null) }
+    val (autoIcon, autoColor) = remember(id) { workspaceAutoIdentity(id) }
+    val tint = workspaceColor(color ?: autoColor)
+    val changed = icon != (if (workspace.icon_custom) workspace.icon_index else null) ||
+        color != (if (workspace.color_custom) workspace.color_index else null)
+    AlertDialog(onDismissRequest = onDismiss, title = { Text("Icon and color") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Icon", Modifier.weight(1f), style = MaterialTheme.typography.titleSmall)
+                    FilterChip(selected = icon == null, onClick = { icon = null }, label = { Text("Automatic") })
+                }
+                for (row in 0 until 4) Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    for (col in 0 until 4) {
+                        val k = row * 4 + col
+                        val selected = (icon ?: autoIcon) == k
+                        Box(Modifier.weight(1f).aspectRatio(1f).testTag(IDENTITY_ICON + k)
+                            .background(if (selected) tint.copy(alpha = .18f) else Color.Transparent, RoundedCornerShape(10.dp))
+                            .then(if (selected && icon != null) Modifier.border(2.dp, tint, RoundedCornerShape(10.dp)) else Modifier)
+                            .selectable(selected = selected && icon != null, role = Role.RadioButton) { icon = k }
+                            .semantics { contentDescription = WORKSPACE_ICON_NAMES[k] },
+                            contentAlignment = Alignment.Center) {
+                            Icon(workspaceIcon(k), contentDescription = null, tint = tint, modifier = Modifier.size(24.dp))
+                        }
+                    }
+                }
+                Row(Modifier.padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text("Color", Modifier.weight(1f), style = MaterialTheme.typography.titleSmall)
+                    FilterChip(selected = color == null, onClick = { color = null }, label = { Text("Automatic") })
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    for (k in 0 until 8) {
+                        val selected = color == k
+                        Box(Modifier.weight(1f).aspectRatio(1f).testTag(IDENTITY_COLOR + k)
+                            .then(if (selected) Modifier.border(2.dp, MaterialTheme.colorScheme.onSurface, CircleShape) else Modifier)
+                            .padding(4.dp).background(workspaceColor(k), CircleShape)
+                            .selectable(selected = selected, role = Role.RadioButton) { color = k }
+                            .semantics { contentDescription = "Color ${k + 1}" })
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = { onSave(icon, color) }, enabled = changed) { Text("Save") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } })
 }

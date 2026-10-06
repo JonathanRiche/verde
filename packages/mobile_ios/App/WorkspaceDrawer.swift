@@ -36,13 +36,14 @@ struct DrawerItem: Identifiable {
     }
 }
 
-/// Flat Active/Open rows for open workspaces in scope (nil = All Workspaces), by workspace recency.
+/// Flat Active/Open rows by workspace recency. Active always spans every open workspace;
+/// Open follows the scope (nil = All Workspaces).
 func drawerItems(_ items: [Workspace], scope: String?) -> (active: [DrawerItem], open: [DrawerItem]) {
-    let rows = switcherWorkspaces(items).filter { $0.open && (scope == nil || $0.workspace_id == scope) }.flatMap { ws -> [DrawerItem] in
+    let rows = switcherWorkspaces(items).filter(\.open).flatMap { ws -> [DrawerItem] in
         let chats: [DrawerItem] = drawerThreads(ws).map { thread in DrawerItem(workspace: ws, thread: thread, pane: ws.panes.first { $0.thread_id == thread.thread_id }) }
         return chats + ws.panes.filter { $0.kind == "terminal" && $0.terminal_id != nil }.map { DrawerItem(workspace: ws, thread: nil, pane: $0) }
     }
-    return (rows.filter(\.active), rows.filter { !$0.active })
+    return (rows.filter(\.active), rows.filter { !$0.active && (scope == nil || $0.workspace.workspace_id == scope) })
 }
 
 struct WorkspaceDrawer: View {
@@ -95,9 +96,9 @@ struct WorkspaceDrawer: View {
                         Text("\(scoped.label) is closed.").font(VerdeTheme.ui(13)).foregroundStyle(VerdeTheme.muted).padding(16)
                     }
                     let sections = drawerItems(all, scope: scope)
-                    let chip = scope == nil
-                    rows("Active", sections.active, chip: chip)
-                    rows("Open", sections.open, chip: chip)
+                    // Active is global, so its rows always name their workspace.
+                    rows("Active", sections.active, chip: true)
+                    rows("Open", sections.open, chip: scope == nil)
                     if !search.isEmpty { row("Search all chat history", icon: "clock") { open(.history) } }
                     if all.isEmpty { Text("Pair with a host to see your workspaces.").font(VerdeTheme.ui(13)).foregroundStyle(VerdeTheme.muted).padding(16) }
                 }.padding(.horizontal, 8)

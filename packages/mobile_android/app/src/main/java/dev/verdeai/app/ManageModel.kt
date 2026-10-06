@@ -145,6 +145,11 @@ internal class ManageModel(
         EventWorkspaceRename(now_ms=n, wall_time_ms=w, intent_id=id, workspace_id=workspaceId, label=label.trim())
     }
 
+    /** Pins the workspace icon (0..15) and color (0..7); null returns that slot to automatic. */
+    fun setIdentity(workspaceId: String, icon: Int?, color: Int?) = send { n, w, id ->
+        EventWorkspaceIdentity(now_ms=n, wall_time_ms=w, intent_id=id, workspace_id=workspaceId, icon_index=icon, color_index=color)
+    }
+
     fun setArchived(workspaceId: String, archived: Boolean) = send { n, w, id ->
         EventWorkspaceArchive(now_ms=n, wall_time_ms=w, intent_id=id, workspace_id=workspaceId, archived=archived)
     }

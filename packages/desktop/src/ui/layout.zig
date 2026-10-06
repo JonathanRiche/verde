@@ -7,6 +7,7 @@ const theme = @import("theme.zig");
 const text_measure = @import("text_measure.zig");
 const colors = @import("colors.zig");
 const sidebar = @import("sidebar.zig");
+const workspace_identity = @import("workspace_identity.zig");
 const workspace_panes = @import("workspace_panes.zig");
 const workspace_strip = @import("workspace_strip.zig");
 const runtime = @import("runtime.zig");
@@ -1011,6 +1012,11 @@ const WORKSPACE_SETTINGS_ROW_H_UI: f32 = 46.0;
 const WorkspaceSettingsLayout = struct {
     modal: palette.Rect,
     title_y: f32,
+    identity_section_y: f32,
+    /// Row of the 16 icon cells, then the color circles + Automatic button.
+    icon_row: palette.Rect,
+    color_row: palette.Rect,
+    identity_auto: palette.Rect,
     section_y: f32,
     /// Clip rect of the scrollable option list.
     list: palette.Rect,
@@ -1053,7 +1059,11 @@ fn workspaceSettingsLayout(state: *const runtime.AppState, width: f32, height: f
     if (show_scroll_threshold) scroll_block_h += gap + control_h;
     const modal_w = @min(theme.scaledUi(560.0), @max(width - theme.scaledUi(64.0), theme.scaledUi(320.0)));
     const rows_h = row_h * @as(f32, @floatFromInt(state.workspaceSettingsOptionCount()));
-    const fixed_h = pad + title_h + gap + section_h + gap + gap + explain_h + gap + scroll_block_h + gap + notice_h + gap + button_h + pad;
+    const content_w = modal_w - pad * 2.0;
+    const icon_cell = @min(content_w / @as(f32, @floatFromInt(workspace_identity.ICON_COUNT)), theme.scaledUi(34.0));
+    const color_h = theme.scaledUi(30.0);
+    const identity_h = section_h + gap + icon_cell + gap + color_h + gap;
+    const fixed_h = pad + title_h + gap + identity_h + section_h + gap + gap + explain_h + gap + scroll_block_h + gap + notice_h + gap + button_h + pad;
     const max_modal_h = @max(height - theme.scaledUi(96.0), theme.scaledUi(300.0));
     const list_h = theme.clampf(rows_h, row_h, @max(max_modal_h - fixed_h, row_h));
     const modal_h = fixed_h + list_h;
@@ -1064,7 +1074,12 @@ fn workspaceSettingsLayout(state: *const runtime.AppState, width: f32, height: f
         .h = modal_h,
     };
     const title_y = modal.y + pad;
-    const section_y = title_y + title_h + gap;
+    const identity_section_y = title_y + title_h + gap;
+    const icon_row: palette.Rect = .{ .x = modal.x + pad, .y = identity_section_y + section_h + gap, .w = icon_cell * @as(f32, @floatFromInt(workspace_identity.ICON_COUNT)), .h = icon_cell };
+    const auto_w = theme.scaledUi(104.0);
+    const color_row: palette.Rect = .{ .x = modal.x + pad, .y = icon_row.y + icon_cell + gap, .w = @min(color_h * @as(f32, @floatFromInt(workspace_identity.COLOR_COUNT)) * 1.25, content_w - auto_w - gap), .h = color_h };
+    const identity_auto: palette.Rect = .{ .x = modal.x + modal_w - pad - auto_w, .y = color_row.y, .w = auto_w, .h = color_h };
+    const section_y = color_row.y + color_h + gap;
     const list: palette.Rect = .{
         .x = modal.x + pad,
         .y = section_y + section_h + gap,
@@ -1109,6 +1124,10 @@ fn workspaceSettingsLayout(state: *const runtime.AppState, width: f32, height: f
     return .{
         .modal = modal,
         .title_y = title_y,
+        .identity_section_y = identity_section_y,
+        .icon_row = icon_row,
+        .color_row = color_row,
+        .identity_auto = identity_auto,
         .section_y = section_y,
         .list = list,
         .row_h = row_h,
@@ -1129,6 +1148,16 @@ fn workspaceSettingsLayout(state: *const runtime.AppState, width: f32, height: f
         .close_button = close_button,
         .max_scroll_y = @max(rows_h - list_h, 0.0),
     };
+}
+
+fn workspaceSettingsIconCell(layout: WorkspaceSettingsLayout, index: usize) palette.Rect {
+    const cell = layout.icon_row.h;
+    return .{ .x = layout.icon_row.x + @as(f32, @floatFromInt(index)) * cell, .y = layout.icon_row.y, .w = cell, .h = cell };
+}
+
+fn workspaceSettingsColorCell(layout: WorkspaceSettingsLayout, index: usize) palette.Rect {
+    const cell = layout.color_row.w / @as(f32, @floatFromInt(workspace_identity.COLOR_COUNT));
+    return .{ .x = layout.color_row.x + @as(f32, @floatFromInt(index)) * cell, .y = layout.color_row.y, .w = cell, .h = layout.color_row.h };
 }
 
 fn workspaceSettingsOptionRowRect(layout: WorkspaceSettingsLayout, index: usize, scroll_y: f32) palette.Rect {
@@ -1167,6 +1196,9 @@ fn registerWorkspaceSettingsModalHits(state: *runtime.AppState, width: f32, heig
         if (clipped.h <= 0.0) continue;
         queueModalHit(state, clipped, .workspace_settings_option, index);
     }
+    for (0..workspace_identity.ICON_COUNT) |slot| queueModalHit(state, workspaceSettingsIconCell(layout, slot), .workspace_settings_icon, slot);
+    for (0..workspace_identity.COLOR_COUNT) |slot| queueModalHit(state, workspaceSettingsColorCell(layout, slot), .workspace_settings_color, slot);
+    queueModalHit(state, layout.identity_auto, .workspace_settings_identity_auto, 0);
     queueModalHit(state, layout.folders_button, .workspace_settings_folders, 0);
     queueModalHit(state, layout.manage_button, .workspace_settings_manage, 0);
     queueModalHit(state, layout.close_button, .workspace_settings_close, 0);
@@ -1225,6 +1257,7 @@ fn renderWorkspaceSettingsModal(state: *runtime.AppState, width: f32, height: f3
     var title_buffer: [192]u8 = undefined;
     const title = std.fmt.bufPrint(&title_buffer, "Workspace settings — {s}", .{project.label}) catch "Workspace settings";
     queuePaletteText(state, .{ .x = layout.modal.x + pad, .y = layout.title_y, .w = content_w, .h = theme.scaledUi(24.0) }, title, paletteColor(theme.COLOR_WHITE), theme.scaledUi(17.0), layout.modal);
+    renderWorkspaceSettingsIdentity(state, layout, project);
     queuePaletteText(state, .{ .x = layout.modal.x + pad, .y = layout.section_y, .w = content_w, .h = theme.scaledUi(20.0) }, "Default runtime for new chats", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.5), layout.modal);
 
     state.workspace_settings_scroll_y = theme.clampf(state.workspace_settings_scroll_y, 0.0, layout.max_scroll_y);
@@ -1351,6 +1384,44 @@ fn renderWorkspaceSettingsModal(state: *runtime.AppState, width: f32, height: f3
     drawActionButton(state, layout.folders_button, "Folders…", theme.COLOR_PANEL_ALT);
     drawActionButton(state, layout.manage_button, "Connections", theme.COLOR_PANEL_ALT);
     drawActionButton(state, layout.close_button, "Close", theme.accent());
+}
+
+/// Icon + color picker band: 16 icon cells tinted in the effective color,
+/// 8 theme-derived color circles, and an Automatic reset. Selection rings
+/// mark the effective identity; Automatic is active when neither slot is
+/// overridden (see docs/workspace-switcher-sidebar.md).
+fn renderWorkspaceSettingsIdentity(state: *runtime.AppState, layout: WorkspaceSettingsLayout, project: *const runtime.Project) void {
+    const pad = theme.scaledUi(20.0);
+    const mouse_x = state.transcript_controller.palette_mouse_x;
+    const mouse_y = state.transcript_controller.palette_mouse_y;
+    queuePaletteText(state, .{ .x = layout.modal.x + pad, .y = layout.identity_section_y, .w = layout.modal.w - pad * 2.0, .h = theme.scaledUi(20.0) }, "Icon & color", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.5), layout.modal);
+    const identity = workspace_identity.resolve(project.id, project.icon_index, project.color_index);
+    const color = workspace_identity.slotColor(identity.color_index);
+    for (0..workspace_identity.ICON_COUNT) |slot| {
+        const cell = workspaceSettingsIconCell(layout, slot);
+        const inset = theme.scaledUi(2.0);
+        const chip: palette.Rect = .{ .x = cell.x + inset, .y = cell.y + inset, .w = cell.w - inset * 2.0, .h = cell.h - inset * 2.0 };
+        const selected = slot == identity.icon_index;
+        const hovered = pointInRect(mouse_x, mouse_y, cell);
+        if (selected or hovered) {
+            queuePaletteBorder(state, chip, paletteColor(if (selected) color else theme.withAlpha(theme.COLOR_WHITE, 60)), chip.w * 0.24, theme.scaledUi(1.5));
+        }
+        sidebar.queueIdentityChip(state, chip, workspace_identity.glyphAt(@intCast(slot)), color, !selected and !hovered, null);
+    }
+    for (0..workspace_identity.COLOR_COUNT) |slot| {
+        const cell = workspaceSettingsColorCell(layout, slot);
+        const d = @min(cell.w, cell.h) - theme.scaledUi(8.0);
+        const circle: palette.Rect = .{ .x = cell.x + (cell.w - d) * 0.5, .y = cell.y + (cell.h - d) * 0.5, .w = d, .h = d };
+        const selected = slot == identity.color_index;
+        const hovered = pointInRect(mouse_x, mouse_y, cell);
+        const ring_pad = theme.scaledUi(3.0);
+        if (selected or hovered) {
+            queuePaletteBorder(state, .{ .x = circle.x - ring_pad, .y = circle.y - ring_pad, .w = circle.w + ring_pad * 2.0, .h = circle.h + ring_pad * 2.0 }, paletteColor(if (selected) theme.COLOR_WHITE else theme.withAlpha(theme.COLOR_WHITE, 60)), (circle.w + ring_pad * 2.0) * 0.5, theme.scaledUi(1.5));
+        }
+        queuePaletteRoundedRect(state, circle, paletteColor(workspace_identity.slotColor(@intCast(slot))), d * 0.5);
+    }
+    const automatic = project.icon_index == null and project.color_index == null;
+    drawWorkspaceSettingsSegment(state, layout.identity_auto, "Automatic", automatic, pointInRect(mouse_x, mouse_y, layout.identity_auto));
 }
 
 // Folder management shares the workspace-bound modal and native picker. Rows
@@ -1869,6 +1940,9 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             .workspace_folder_config => state.openWorkspaceFolderConfig(),
             .workspace_settings_close => state.closeWorkspaceSettings(),
             .workspace_settings_option => state.applyWorkspaceSettingsOption(hit.index),
+            .workspace_settings_icon => state.applyWorkspaceSettingsIdentity(.{ .icon = @intCast(@min(hit.index, workspace_identity.ICON_COUNT - 1)) }),
+            .workspace_settings_color => state.applyWorkspaceSettingsIdentity(.{ .color = @intCast(@min(hit.index, workspace_identity.COLOR_COUNT - 1)) }),
+            .workspace_settings_identity_auto => state.applyWorkspaceSettingsIdentity(.reset),
             .workspace_settings_manage => state.openManageConnectionsFromWorkspaceSettings(),
             .workspace_settings_scroll_scope => state.applyWorkspaceSettingsScrollScope(hit.index != 0),
             .workspace_settings_scroll_mode => {
