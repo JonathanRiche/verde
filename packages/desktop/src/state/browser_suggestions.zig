@@ -143,18 +143,22 @@ pub fn buildRows(allocator: std.mem.Allocator, query: []const u8, entries: []con
 
     var next_history: usize = 0;
     if (lead_with_history) {
-        try rows.append(allocator, historyRow(entries[0]));
+        try rows.append(allocator, try historyRow(allocator, entries[0]));
         next_history = 1;
     }
     try rows.append(allocator, primary);
     while (next_history < history_count) : (next_history += 1) {
-        try rows.append(allocator, historyRow(entries[next_history]));
+        try rows.append(allocator, try historyRow(allocator, entries[next_history]));
     }
     return rows.toOwnedSlice(allocator);
 }
 
-fn historyRow(entry: HistoryEntry) Suggestion {
-    return .{ .kind = .history, .url = entry.url, .title = if (entry.title.len > 0) entry.title else entry.url };
+/// Copies the entry into `allocator`: callers free the daemon's history
+/// response right after `setResults`, so rows must not borrow its strings.
+fn historyRow(allocator: std.mem.Allocator, entry: HistoryEntry) !Suggestion {
+    const url = try allocator.dupe(u8, entry.url);
+    const title = if (entry.title.len > 0) try allocator.dupe(u8, entry.title) else url;
+    return .{ .kind = .history, .url = url, .title = title };
 }
 
 /// Heuristic mirroring what browsers treat as an address rather than a
@@ -311,6 +315,21 @@ test "State selection wraps and hides cleanly" {
     try std.testing.expect(!state.visible);
     try std.testing.expect(state.selectedSuggestion() == null);
     try std.testing.expectEqual(@as(usize, 0), state.items.len);
+}
+
+test "setResults rows outlive the caller's history entries" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit(std.testing.allocator);
+    const url = try std.testing.allocator.dupe(u8, "https://ziglang.org/");
+    const title = try std.testing.allocator.dupe(u8, "Zig");
+    try state.setResults("zig", &.{.{ .url = url, .title = title }});
+    @memset(url, 'x');
+    @memset(title, 'x');
+    std.testing.allocator.free(url);
+    std.testing.allocator.free(title);
+    try std.testing.expectEqualStrings("https://ziglang.org/", state.items[0].url);
+    try std.testing.expectEqualStrings("Zig", state.items[0].title);
+    try std.testing.expectEqualStrings("lang.org", state.completion);
 }
 
 test "visit gate suppresses automation loads through redirects and resets on completion" {
