@@ -1552,16 +1552,23 @@ fn renderPaletteSidebarToggle(state: *runtime.AppState, rect: palette.Rect, expa
     if (hovered) {
         queuePaletteRoundedRect(state, rect, paletteColor(theme.wash(theme.COLOR_GREEN, 56)), theme.scaledUi(8.0));
     }
+    queueSidebarToggleGlyph(state, rect, expanded, hovered, null);
+    addPaletteHit(rect, .collapse, 0, 0);
+}
+
+/// Panel-left codicon centered in `rect` (filled while the rail is shown,
+/// hollow while hidden). Shared with the workspace tab strip's leading
+/// show-sidebar button.
+pub fn queueSidebarToggleGlyph(state: *runtime.AppState, rect: palette.Rect, expanded: bool, hovered: bool, clip: ?palette.Rect) void {
     const fg = if (hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED;
-    const icon_font = theme.scaledUi(17.0);
+    const icon_font = @min(theme.scaledUi(17.0), rect.h);
     const glyph = if (expanded) NF_COD_LAYOUT_SIDEBAR_LEFT else NF_COD_LAYOUT_SIDEBAR_LEFT_OFF;
     queuePaletteIcon(state, .{
         .x = rect.x + (rect.w - icon_font) * 0.5,
         .y = rect.y + (rect.h - icon_font) * 0.5,
         .w = icon_font,
         .h = icon_font,
-    }, glyph, icon_font, paletteColor(fg), null);
-    addPaletteHit(rect, .collapse, 0, 0);
+    }, glyph, icon_font, paletteColor(fg), clip);
 }
 
 /// Renders add/edit actions with the same themed geometry as the sidebar toggle.

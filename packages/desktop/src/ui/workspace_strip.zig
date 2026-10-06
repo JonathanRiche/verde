@@ -48,7 +48,9 @@ const LINE_HEIGHT_FACTOR: f32 = 1.25;
 /// Bounded label buffer; tabs are short so longer titles are truncated.
 const LABEL_BUFFER_LEN: usize = 96;
 
-pub const HitKind = enum { tab, add_tab };
+/// `sidebar_toggle` is the leading show-sidebar button drawn while the rail
+/// is hidden (the old collapsed rail carried it; the hidden rail cannot).
+pub const HitKind = enum { tab, add_tab, sidebar_toggle };
 
 const StripHit = struct {
     rect: palette.Rect,
@@ -151,8 +153,11 @@ pub fn render(state: *runtime.AppState, strip: palette.Rect) void {
     const tab_buffer = state.palette_frame_text_arena.allocator().alloc(runtime.WorkspaceTab, layout.panes.items.len) catch return;
     const tabs = runtime.workspace_tabs.collect(layout, tab_buffer);
     const focused_tab_id = runtime.workspace_tabs.focusedTabId(layout);
-    const cap = tabWidthCap(strip.w, tabs.len);
     const gap = theme.scaledUi(TAB_GAP_UI);
+    // Hidden sidebar: a leading show-sidebar button takes the first slot so
+    // the rail can be brought back without a keybind or edge hover.
+    const leading_w = if (state.isSidebarHidden()) theme.scaledUi(PLUS_TAB_WIDTH_UI) + gap else 0.0;
+    const cap = tabWidthCap(strip.w - leading_w, tabs.len);
     const font_size = theme.scaledUi(LABEL_FONT_UI);
     const pad_x = theme.scaledUi(TAB_PAD_X_UI);
     const plus_w = theme.scaledUi(PLUS_TAB_WIDTH_UI);
@@ -163,6 +168,14 @@ pub fn render(state: *runtime.AppState, strip: palette.Rect) void {
     // sidebar pane rows; the badge takes a slot at the tab's right edge.
     const key_tip_w = theme.scaledUi(KEY_TIP_SIZE_UI) + theme.scaledUi(KEY_TIP_INSET_X_UI);
     var x = strip.x + strip_pad;
+    if (leading_w > 0.0) {
+        const toggle_rect = tabRect(strip, x, theme.scaledUi(PLUS_TAB_WIDTH_UI));
+        const toggle_hovered = hovered_hit == strip_hit_count;
+        if (toggle_hovered) queueRoundedRectClipped(state, toggle_rect, paletteColor(theme.wash(theme.COLOR_GREEN, 56)), theme.scaledUi(TAB_RADIUS_UI), strip);
+        sidebar.queueSidebarToggleGlyph(state, toggle_rect, false, toggle_hovered, strip);
+        addHit(toggle_rect, .sidebar_toggle, project_index, 0);
+        x += leading_w;
+    }
     for (tabs, 0..) |tab, tab_index| {
         // Backs a terminal tab's live title for the measure + draw below.
         var term_title_buf: sidebar.TerminalTitleBuffer = undefined;
@@ -275,6 +288,7 @@ pub fn activateHit(state: *runtime.AppState, hit: StripHit) void {
     switch (hit.kind) {
         .tab => state.focusWorkspaceOpenPaneFromSidebar(hit.project_index, hit.pane_id),
         .add_tab => state.addWorkspaceTab(hit.project_index, null),
+        .sidebar_toggle => state.setSidebarHidden(false),
     }
 }
 
@@ -537,6 +551,33 @@ test "workspace strip hits resolve tabs and the add-tab button" {
     // A hidden strip owns no pointer input even with stale hits.
     state.sidebar_hidden = false;
     try std.testing.expect(!handlePaletteMouseButton(&state, second.x + 1.0, second.y + 1.0, true));
+}
+
+test "workspace strip show-sidebar button restores the hidden rail" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    var storage = try storage_mod.Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
+    defer storage.deinit();
+    var state = try fullTestState(allocator, &storage);
+    defer {
+        state.lifecycle.clearDirty();
+        state.deinit();
+    }
+    state.setSidebarHidden(true);
+    try std.testing.expect(isVisible(&state));
+
+    strip_rect = .{ .x = 0.0, .y = 0.0, .w = 800.0, .h = STRIP_HEIGHT_UI };
+    strip_hit_count = 0;
+    defer strip_hit_count = 0;
+    const toggle = tabRect(strip_rect, strip_rect.x + STRIP_PAD_X_UI, PLUS_TAB_WIDTH_UI);
+    addHit(toggle, .sidebar_toggle, 0, 0);
+    const hit = hitAt(toggle.x + toggle.w * 0.5, toggle.y + toggle.h * 0.5) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(HitKind.sidebar_toggle, hit.kind);
+    activateHit(&state, hit);
+    try std.testing.expect(!state.isSidebarHidden());
 }
 
 fn fullTestState(allocator: std.mem.Allocator, storage: *storage_mod.Storage) !runtime.AppState {
