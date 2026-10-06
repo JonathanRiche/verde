@@ -24,6 +24,8 @@ pub const State = struct {
     dirty: bool = false,
     loading: bool = false,
     @"error": ?host.LocalError = null,
+    /// Client-local workspace selection times for switcher recency; survives resets.
+    focus: []const p.FocusStamp = &.{},
 };
 pub const scopes = [_][]const u8{ "workspaces", "registry", "sessions", "turns", "config" };
 fn append(comptime T: type, tx: *host.Transaction, dest: *[]const T, item: T) !void {
@@ -53,7 +55,8 @@ pub fn startSnapshot(tx: *host.Transaction, requested: []const []const u8) host.
 /// Clears sync inputs but keeps delta checkpoint/socket bookkeeping.
 pub fn reset(tx: *host.Transaction) void {
     const d = tx.state.sync.delta;
-    tx.state.sync = .{ .delta = d };
+    const focus = tx.state.sync.focus;
+    tx.state.sync = .{ .delta = d, .focus = focus };
     delta.clearWork(&tx.state.sync.delta);
 }
 fn page(tx: *host.Transaction, cursor: ?[]const u8) host.ApiError!void {
@@ -370,9 +373,23 @@ pub fn pushFrom(tx: *host.Transaction, socket: ?[]const u8, text: []const u8) ho
         if (changed or p.yes(p.get(value, "expired")) or p.rows(p.get(value, "entries")).len > 0 or p.get(params, "error") != .null) try refresh(tx);
     }
 }
+/// Records when the user selected a workspace (focus, opening/creating a chat, or reopening it).
+pub fn intent(tx: *host.Transaction, tag: []const u8, event: V) host.ApiError!void {
+    const reopen = eq(tag, "workspace_archive") and p.get(event, "archived") == .bool and !p.get(event, "archived").bool;
+    if (!reopen and !eq(tag, "focus") and !eq(tag, "thread_open") and !eq(tag, "thread_create")) return;
+    const ws = p.get(event, "workspace_id");
+    if (ws != .string or ws.string.len == 0) return;
+    const s = &tx.state.sync;
+    const at = tx.state.wall_time_ms;
+    for (s.focus) |*f| if (eq(f.workspace_id, ws.string)) {
+        @constCast(f).at_ms = @max(f.at_ms, at);
+        return;
+    };
+    try append(p.FocusStamp, tx, &s.focus, .{ .workspace_id = try tx.allocator().dupe(u8, ws.string), .at_ms = at });
+}
 pub fn query(a: std.mem.Allocator, state: *const host.State, selector: []const u8) host.ApiError!V {
     const s = &state.sync;
-    const models = try p.project(a, s.snapshot, s.catalog, s.has_catalog, state.wall_time_ms);
+    const models = try p.projectFocused(a, s.snapshot, s.catalog, s.has_catalog, state.wall_time_ms, s.focus);
     const bytes = if (eq(selector, "home")) try std.json.Stringify.valueAlloc(a, .{ .items = models.active, .loading = s.loading, .stale = state.stale, .incomplete_scopes = if (p.get(s.snapshot, "incomplete_scopes") == .array) p.get(s.snapshot, "incomplete_scopes") else V{ .array = std.array_list.Managed(V).init(a) }, .@"error" = s.@"error" }, .{}) else try std.json.Stringify.valueAlloc(a, .{ .items = models.workspaces, .loading = s.loading, .stale = state.stale, .@"error" = s.@"error", .history = .{ .query = "", .items = models.history, .next_cursor = @as(?[]const u8, null), .loading = s.loading, .@"error" = s.@"error" } }, .{});
     return host.parse(a, bytes);
 }

@@ -16,6 +16,7 @@ const fuzzy_match = @import("fuzzy_match.zig");
 const runtime = @import("runtime.zig");
 const sidebar = @import("sidebar.zig");
 const workspace_panes = @import("workspace_panes.zig");
+const workspace_identity = @import("workspace_identity.zig");
 const native_state = @import("../state.zig");
 const app_config = @import("../app/config.zig");
 const keybinds = @import("../app/keybinds.zig");
@@ -172,6 +173,10 @@ const ResultRef = union(enum) {
     workspace: usize,
     /// Archived-project index for a "Reopen <workspace>" row.
     closed_workspace: usize,
+    /// Workspace switcher: widen the sidebar list to every workspace.
+    all_workspaces,
+    /// Workspace switcher footer row: open the Add Workspace flow.
+    new_workspace,
 };
 
 const Result = struct {
@@ -219,6 +224,17 @@ var action_labels: [MAX_ACTIONS][]const u8 = undefined;
 var action_enabled: [MAX_ACTIONS]bool = undefined;
 var action_count: usize = 0;
 var action_menu_rect: palette.Rect = .{};
+
+/// Workspace switcher (sidebar dropdown) geometry: per-row gear buttons.
+const SWITCHER_ROW_H_CSS: f32 = 34.0;
+const SWITCHER_INPUT_H_CSS: f32 = 32.0;
+const SWITCHER_PAD_CSS: f32 = 6.0;
+var gear_rects: [MAX_ROWS]?palette.Rect = undefined;
+var hovered_gear: ?usize = null;
+
+fn switcherMode(state: *runtime.AppState) bool {
+    return state.command_controller.mode == .workspaces;
+}
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -290,6 +306,9 @@ pub fn registerHits(
         if (results[i].ref == .header) continue;
         if (!rowVisible(row_rects[i])) continue;
         queueHit(state, row_rects[i], .command_palette_row, i);
+        if (switcherMode(state)) {
+            if (gear_rects[i]) |gear| queueHit(state, gear, .command_palette_row_settings, i);
+        }
     }
     if (state.command_controller.action_menu_open) {
         var ai: usize = 0;
@@ -309,17 +328,23 @@ pub fn updateHover(state: *runtime.AppState, x: f32, y: f32) void {
         return;
     }
     var new_hover: ?usize = null;
+    var new_gear: ?usize = null;
     var i = state.palette_modal_hits.items.len;
     while (i > 0) {
         i -= 1;
         const hit = state.palette_modal_hits.items[i];
-        if (hit.action != .command_palette_row) continue;
         if (!rectContainsPoint(hit.rect, x, y)) continue;
+        if (hit.action == .command_palette_row_settings) {
+            if (new_gear == null) new_gear = hit.index;
+            continue;
+        }
+        if (hit.action != .command_palette_row) continue;
         new_hover = hit.index;
         break;
     }
-    if (hovered_row == new_hover) return;
+    if (hovered_row == new_hover and hovered_gear == new_gear) return;
     hovered_row = new_hover;
+    hovered_gear = new_gear;
     state.markDirty();
 }
 
@@ -367,7 +392,7 @@ pub fn handleKeyDown(state: *runtime.AppState, event: *const sdl.KeyboardEvent) 
             return true;
         },
         .tab => {
-            toggleActionMenu(state);
+            if (!switcherMode(state)) toggleActionMenu(state);
             return true;
         },
         .@"return", .kp_enter => {
@@ -381,6 +406,7 @@ pub fn handleKeyDown(state: *runtime.AppState, event: *const sdl.KeyboardEvent) 
         .p => {
             // Ctrl+Shift+P while open: scoped → widen to global; global → toggle off.
             if (primary) {
+                if (switcherMode(state)) return true;
                 if (state.command_controller.scope_project != null) {
                     state.command_controller.scope_project = null;
                     state.command_controller.selected = 0;
@@ -428,13 +454,44 @@ pub fn activateRow(state: *runtime.AppState, row_index: usize, replace: bool) vo
             openAgentTuiHistoryEntry(state, tui);
         },
         .workspace => |pi| {
+            // Read the mode before closing: close resets palette state.
+            const scoped = switcherMode(state);
             state.closeCommandPalette();
-            _ = state.selectProjectAtIndex(pi);
+            if (scoped) {
+                _ = state.selectProjectScoped(pi);
+            } else {
+                _ = state.selectProjectAtIndex(pi);
+            }
         },
         .closed_workspace => |ai| {
             state.closeCommandPalette();
-            _ = state.reopenClosedProjectAtIndex(ai);
+            if (switcherMode(state)) {
+                _ = state.reopenClosedProjectScoped(ai);
+            } else {
+                _ = state.reopenClosedProjectAtIndex(ai);
+            }
         },
+        .all_workspaces => {
+            state.closeCommandPalette();
+            state.showAllWorkspacesInSidebar();
+        },
+        .new_workspace => {
+            state.closeCommandPalette();
+            state.openWorkspaceCreator(false);
+        },
+    }
+}
+
+/// Switcher row gear: opens that workspace's settings.
+pub fn openRowWorkspaceSettings(state: *runtime.AppState, row_index: usize) void {
+    if (row_index >= result_count) return;
+    switch (results[row_index].ref) {
+        .workspace => |pi| {
+            state.noteInteraction();
+            state.closeCommandPalette();
+            state.openWorkspaceSettingsForProject(pi);
+        },
+        else => {},
     }
 }
 
@@ -491,6 +548,7 @@ pub fn runActionRow(state: *runtime.AppState, action_index: usize) void {
 pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     if (!state.command_controller.open) return;
     computeLayout(state, width, height);
+    if (switcherMode(state)) return renderSwitcher(state, width, height);
 
     // Scrim + modal chrome. The panel fill derives from the dark `background`
     // via a small lighten, NOT COLOR_PANEL_ALT: under omarchy themes panel_alt /
@@ -532,6 +590,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
 /// Recomputes the modal geometry and result rows for the current state. Pure
 /// function of state + window size; cheap enough to run twice per frame.
 fn computeLayout(state: *runtime.AppState, width: f32, height: f32) void {
+    if (switcherMode(state)) return computeSwitcherLayout(state, width, height);
     const modal_w = theme.clampf(width * 0.46, theme.scaledUi(480.0), theme.scaledUi(720.0));
     const modal_h = theme.clampf(height * 0.62, theme.scaledUi(340.0), theme.scaledUi(640.0));
     // Anchored in the upper third like launcher UIs, so results grow downward
@@ -587,6 +646,128 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) void {
     computeActionMenuLayout(state);
 }
 
+/// Workspace switcher popover: anchored under the sidebar trigger, sized to
+/// its rows, no scope line or footer.
+fn computeSwitcherLayout(state: *runtime.AppState, width: f32, height: f32) void {
+    rebuildResults(state);
+    const anchor = sidebar.workspaceSwitcherAnchor();
+    const margin = theme.scaledUi(8.0);
+    const pad = theme.scaledUi(SWITCHER_PAD_CSS);
+    const row_h = theme.scaledUi(SWITCHER_ROW_H_CSS);
+    const input_h = theme.scaledUi(SWITCHER_INPUT_H_CSS);
+    const popover_w = @min(@max(anchor.w, theme.scaledUi(300.0)), @max(width - margin * 2.0, theme.scaledUi(200.0)));
+    const x = if (anchor.w > 0.0) anchor.x else margin;
+    const y = if (anchor.h > 0.0) anchor.y + anchor.h + theme.scaledUi(4.0) else theme.scaledUi(48.0);
+    const content_h = row_h * @as(f32, @floatFromInt(@max(result_count, 1)));
+    const max_h = @max(height - y - margin, theme.scaledUi(120.0));
+    const popover_h = @min(pad * 3.0 + input_h + content_h, max_h);
+    modal_rect = .{ .x = x, .y = y, .w = popover_w, .h = popover_h };
+    input_rect = .{ .x = x + pad, .y = y + pad, .w = popover_w - pad * 2.0, .h = input_h };
+    const list_top = input_rect.y + input_h + pad;
+    list_rect = .{
+        .x = x + pad,
+        .y = list_top,
+        .w = popover_w - pad * 2.0,
+        .h = @max(y + popover_h - pad - list_top, 0.0),
+    };
+    max_scroll_y = @max(content_h - list_rect.h, 0.0);
+    scroll_y = theme.clampf(scroll_y, 0.0, max_scroll_y);
+    layoutSwitcherRows();
+    if (reveal_selected) {
+        reveal_selected = false;
+        ensureSelectedVisible(state);
+        layoutSwitcherRows();
+    }
+    action_count = 0;
+    state.command_controller.action_menu_open = false;
+}
+
+fn layoutSwitcherRows() void {
+    const row_h = theme.scaledUi(SWITCHER_ROW_H_CSS);
+    const gear_size = theme.scaledUi(26.0);
+    var y = list_rect.y - scroll_y;
+    var i: usize = 0;
+    while (i < result_count) : (i += 1) {
+        row_rects[i] = .{ .x = list_rect.x, .y = y, .w = list_rect.w, .h = row_h };
+        gear_rects[i] = switch (results[i].ref) {
+            .workspace => .{
+                .x = list_rect.x + list_rect.w - gear_size - theme.scaledUi(4.0),
+                .y = y + (row_h - gear_size) * 0.5,
+                .w = gear_size,
+                .h = gear_size,
+            },
+            else => null,
+        };
+        y += row_h;
+    }
+}
+
+const SwitcherEntry = struct {
+    ref: ResultRef,
+    /// Recency in ms (0 = unknown).
+    at: i64,
+    score: i32,
+    /// Tie-break: open before closed; open by index asc, closed newest-closed first.
+    order: i64,
+};
+
+fn switcherEntryLessThan(has_query: bool, a: SwitcherEntry, b: SwitcherEntry) bool {
+    if (has_query and a.score != b.score) return a.score > b.score;
+    if (a.at != b.at) return a.at > b.at;
+    return a.order < b.order;
+}
+
+/// Newest recency signal for an open workspace: GUI selection time or the
+/// newest thread activity (seconds → ms), whichever is later.
+fn openWorkspaceRecencyMs(project: *const native_state.Project) i64 {
+    var at = workspace_identity.lastUsedMs(project.id);
+    for (project.threads.items) |*thread| {
+        if (thread.archived) continue;
+        at = @max(at, thread.last_activity_at * std.time.ms_per_s);
+    }
+    return at;
+}
+
+/// Switcher rows: All Workspaces, then open + closed workspaces by recency
+/// (filtered by the query), then New workspace.
+fn buildWorkspaceSwitcher(state: *runtime.AppState, query: []const u8) void {
+    const has_query = query.len > 0;
+    if (!has_query or fuzzyScore("All Workspaces", query) != null) appendResult(.all_workspaces);
+
+    var entries: [MAX_CANDIDATES]SwitcherEntry = undefined;
+    var entry_count: usize = 0;
+    for (state.project_controller.projects.items, 0..) |*project, pi| {
+        if (entry_count >= entries.len) break;
+        const score = if (has_query) (maxOptional(fuzzyScore(project.label, query), if (fuzzyScore(project.path, query)) |v| v - 50 else null) orelse continue) else 0;
+        entries[entry_count] = .{
+            .ref = .{ .workspace = pi },
+            .at = openWorkspaceRecencyMs(project),
+            .score = score,
+            .order = @intCast(pi),
+        };
+        entry_count += 1;
+    }
+    const archived = state.project_controller.archived_projects.items;
+    for (archived, 0..) |*project, ai| {
+        if (entry_count >= entries.len) break;
+        const score = if (has_query) (maxOptional(fuzzyScore(project.label, query), if (fuzzyScore(project.path, query)) |v| v - 50 else null) orelse continue) else 0;
+        entries[entry_count] = .{
+            .ref = .{ .closed_workspace = ai },
+            .at = workspace_identity.lastUsedMs(project.id),
+            .score = score,
+            // After every open workspace; newest-closed (highest index) first.
+            .order = @as(i64, 1 << 32) + @as(i64, @intCast(archived.len - ai)),
+        };
+        entry_count += 1;
+    }
+    std.sort.pdq(SwitcherEntry, entries[0..entry_count], has_query, switcherEntryLessThan);
+    for (entries[0..entry_count]) |entry| {
+        if (result_count + 1 >= MAX_ROWS) break;
+        appendResult(entry.ref);
+    }
+    if (!has_query or fuzzyScore("New workspace", query) != null) appendResult(.new_workspace);
+}
+
 /// Builds the result list for the current query + scope, resetting selection
 /// when either changed since the last frame.
 fn rebuildResults(state: *runtime.AppState) void {
@@ -605,7 +786,9 @@ fn rebuildResults(state: *runtime.AppState) void {
     }
 
     result_count = 0;
-    if (state.command_controller.scope_project) |pi| {
+    if (switcherMode(state)) {
+        buildWorkspaceSwitcher(state, query);
+    } else if (state.command_controller.scope_project) |pi| {
         buildScopedHistory(state, pi, query);
     } else if (query.len == 0) {
         buildSuggestions(state);
@@ -1634,7 +1817,8 @@ fn renderSearchField(state: *runtime.AppState) void {
         }
     }
 
-    const shown = if (value.len > 0) value else "Search threads and commands...";
+    const placeholder = if (switcherMode(state)) "Search workspaces" else "Search threads and commands...";
+    const shown = if (value.len > 0) value else placeholder;
     const color = if (value.len > 0) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE;
     queueRoleText(state, .{ .x = text_x, .y = text_y, .w = text_w, .h = line_height }, shown, paletteColor(color), font_size, input_rect);
 
@@ -1700,6 +1884,8 @@ fn renderRows(state: *runtime.AppState) void {
             .agent_tui => |tui| renderAgentTuiRow(state, i, tui, rect, row_clip),
             .workspace => |pi| renderWorkspaceRow(state, i, pi, rect, row_clip),
             .closed_workspace => |ai| renderClosedWorkspaceRow(state, i, ai, rect, row_clip),
+            // Switcher-only rows; never produced in command mode.
+            .all_workspaces, .new_workspace => {},
         }
     }
 }
@@ -1939,6 +2125,139 @@ fn renderClosedWorkspaceRow(state: *runtime.AppState, row_index: usize, archived
         .w = theme.scaledUi(78.0),
         .h = font_size * 1.3,
     }, "closed", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), row_clip);
+}
+
+// ---------------------------------------------------------------------------
+// Workspace switcher rendering
+// ---------------------------------------------------------------------------
+
+fn renderSwitcher(state: *runtime.AppState, width: f32, height: f32) void {
+    // Light scrim: the popover is a dropdown, not a modal takeover.
+    queueRect(state, .{ .x = 0.0, .y = 0.0, .w = width, .h = height }, paletteColor(theme.scrim(0.12)));
+    const radius = theme.scaledUi(10.0);
+    queueRoundedRect(state, modal_rect, paletteColor(theme.raise(theme.background(), 0.06)), radius);
+    queueBorder(state, modal_rect, paletteColor(theme.COLOR_PANEL_MUTED), radius, theme.scaledUi(1.0));
+    renderSearchField(state);
+
+    if (result_count == 0) {
+        queueText(state, .{
+            .x = list_rect.x + theme.scaledUi(8.0),
+            .y = list_rect.y + theme.scaledUi(8.0),
+            .w = list_rect.w - theme.scaledUi(16.0),
+            .h = theme.scaledUi(18.0),
+        }, "No workspaces match.", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.0), list_rect);
+        return;
+    }
+    var i: usize = 0;
+    while (i < result_count) : (i += 1) {
+        const rect = row_rects[i];
+        if (!rowVisible(rect)) continue;
+        const row_clip = intersectRects(rect, list_rect);
+        if (row_clip.w <= 0.0 or row_clip.h <= 0.0) continue;
+        renderRowBackground(state, i, rect, row_clip);
+        renderSwitcherRow(state, i, rect, row_clip);
+    }
+    if (max_scroll_y > 1.0) {
+        const track: palette.Rect = .{
+            .x = modal_rect.x + modal_rect.w - theme.scaledUi(4.0),
+            .y = list_rect.y,
+            .w = theme.scaledUi(2.5),
+            .h = list_rect.h,
+        };
+        const thumb_h = @max(theme.scaledUi(24.0), track.h * (track.h / (track.h + max_scroll_y)));
+        const thumb_y = track.y + (track.h - thumb_h) * (scroll_y / max_scroll_y);
+        queueRoundedRect(state, .{ .x = track.x, .y = thumb_y, .w = track.w, .h = thumb_h }, paletteColor(theme.withAlpha(theme.COLOR_TEXT_MUTED, 160)), theme.scaledUi(2.0));
+    }
+}
+
+const SWITCHER_CHECK_GLYPH = "\u{EAB2}";
+const SWITCHER_GEAR_GLYPH = "\u{EB51}";
+const SWITCHER_ADD_GLYPH = "\u{EA60}";
+
+fn renderSwitcherRow(state: *runtime.AppState, row_index: usize, rect: palette.Rect, row_clip: palette.Rect) void {
+    const emphasis = state.command_controller.selected == row_index or (hovered_row != null and hovered_row.? == row_index);
+    const font_size = theme.scaledUi(13.0);
+    const line_h = font_size * 1.3;
+    const text_y = rect.y + (rect.h - line_h) * 0.5;
+    const chip_size = theme.scaledUi(22.0);
+    const chip_rect: palette.Rect = .{ .x = rect.x + theme.scaledUi(6.0), .y = rect.y + (rect.h - chip_size) * 0.5, .w = chip_size, .h = chip_size };
+    const label_x = chip_rect.x + chip_size + theme.scaledUi(10.0);
+    const right_edge = rect.x + rect.w - theme.scaledUi(6.0);
+    const text_color = paletteColor(if (emphasis) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED);
+
+    switch (results[row_index].ref) {
+        .all_workspaces => {
+            sidebar.queueWorkspaceChip(state, chip_rect, null, false, row_clip);
+            const hint = switcherShowAllHint(state);
+            const hint_w = if (hint.len > 0) theme.scaledUi(56.0) else 0.0;
+            const check_w = theme.scaledUi(22.0);
+            queueText(state, .{ .x = label_x, .y = text_y, .w = right_edge - label_x - hint_w - check_w, .h = line_h }, "All Workspaces", text_color, font_size, row_clip);
+            if (state.sidebar_all_workspaces) queueSwitcherIcon(state, right_edge - check_w, rect, SWITCHER_CHECK_GLYPH, theme.COLOR_GREEN, row_clip);
+            if (hint.len > 0) queueText(state, .{ .x = right_edge - check_w - hint_w, .y = text_y, .w = hint_w, .h = line_h }, hint, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.5), row_clip);
+        },
+        .workspace => |pi| {
+            if (pi >= state.project_controller.projects.items.len) return;
+            const project = &state.project_controller.projects.items[pi];
+            sidebar.queueWorkspaceChip(state, chip_rect, project.id, false, row_clip);
+            const gear = gear_rects[row_index] orelse rect;
+            const current = !state.sidebar_all_workspaces and pi == state.project_controller.selected_index;
+            var hint_buf_local: [32]u8 = undefined;
+            const hint = workspaceSelectHintFor(state, &hint_buf_local, pi);
+            const hint_w = if (hint.len > 0) theme.scaledUi(52.0) else 0.0;
+            const check_w = if (current) theme.scaledUi(20.0) else 0.0;
+            var right = gear.x - theme.scaledUi(4.0);
+            if (current) {
+                right -= check_w;
+                queueSwitcherIcon(state, right, rect, SWITCHER_CHECK_GLYPH, theme.COLOR_GREEN, row_clip);
+            }
+            if (hint.len > 0) {
+                right -= hint_w;
+                queueText(state, .{ .x = right, .y = text_y, .w = hint_w, .h = line_h }, hint, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.5), row_clip);
+            }
+            queueText(state, .{ .x = label_x, .y = text_y, .w = right - label_x - theme.scaledUi(4.0), .h = line_h }, project.label, text_color, font_size, row_clip);
+            const gear_hovered = hovered_gear != null and hovered_gear.? == row_index;
+            if (gear_hovered) queueRoundedRect(state, gear, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 28)), theme.scaledUi(6.0));
+            queueSwitcherIcon(state, gear.x + (gear.w - theme.scaledUi(20.0)) * 0.5, rect, SWITCHER_GEAR_GLYPH, if (gear_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE, row_clip);
+        },
+        .closed_workspace => |ai| {
+            if (ai >= state.project_controller.archived_projects.items.len) return;
+            const project = &state.project_controller.archived_projects.items[ai];
+            sidebar.queueWorkspaceChip(state, chip_rect, project.id, true, row_clip);
+            const closed_w = theme.scaledUi(52.0);
+            queueText(state, .{ .x = label_x, .y = text_y, .w = right_edge - label_x - closed_w, .h = line_h }, project.label, paletteColor(if (emphasis) theme.COLOR_TEXT_MUTED else theme.COLOR_TEXT_SUBTLE), font_size, row_clip);
+            queueText(state, .{ .x = right_edge - closed_w, .y = text_y, .w = closed_w, .h = line_h }, "Closed", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.5), row_clip);
+        },
+        .new_workspace => {
+            queueSwitcherIcon(state, chip_rect.x + (chip_size - theme.scaledUi(20.0)) * 0.5, rect, SWITCHER_ADD_GLYPH, if (emphasis) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED, row_clip);
+            queueText(state, .{ .x = label_x, .y = text_y, .w = right_edge - label_x, .h = line_h }, "New workspace", text_color, font_size, row_clip);
+        },
+        else => {},
+    }
+}
+
+/// Codicon centered vertically in `row`, in a 20px square starting at `x`.
+fn queueSwitcherIcon(state: *runtime.AppState, x: f32, row: palette.Rect, glyph: []const u8, color: [4]f32, clip: palette.Rect) void {
+    const size = theme.scaledUi(15.0);
+    const box = theme.scaledUi(20.0);
+    const stable = stableText(state, glyph) orelse return;
+    state.palette_overlay_batch.roleText(
+        state.allocator,
+        .{ .x = x + (box - size) * 0.5, .y = row.y + (row.h - size) * 0.5, .w = size, .h = size },
+        stable,
+        paletteColor(color),
+        size,
+        .icon,
+        null,
+        clip,
+    ) catch |err| {
+        log.warn("failed to queue switcher icon: {s}", .{@errorName(err)});
+    };
+}
+
+fn switcherShowAllHint(state: *runtime.AppState) []const u8 {
+    const config = state.command_controller.keyboard_config orelse return "";
+    if (config.workspace_show_all.len == 0) return "";
+    return formatKeybind(&hint_buf, config.workspace_show_all[0]);
 }
 
 fn renderActionMenu(state: *runtime.AppState) void {

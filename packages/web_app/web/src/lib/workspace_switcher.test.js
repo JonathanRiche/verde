@@ -1,0 +1,31 @@
+import { describe, expect, test } from 'bun:test'
+import { activityMs, fuzzyMatches, orderSwitcherRows, workspaceRecency } from './workspace_switcher'
+
+const ws = (workspace_id, threads = []) => ({ workspace_id, label: workspace_id, path: '', threads })
+
+describe('workspace switcher', () => {
+  test('normalizes second and millisecond activity stamps', () => {
+    expect(activityMs(1_700_000_000)).toBe(1_700_000_000_000)
+    expect(activityMs(1_700_000_000_000)).toBe(1_700_000_000_000)
+    expect(activityMs(null)).toBe(0)
+  })
+
+  test('recency is max(selection, newest thread activity)', () => {
+    const row = ws('a', [{ local_thread_id: 't', title: '', last_activity_at: 1_700_000_000 }])
+    expect(workspaceRecency(row, undefined, {})).toBe(1_700_000_000_000)
+    expect(workspaceRecency(row, undefined, { a: 1_800_000_000_000 })).toBe(1_800_000_000_000)
+  })
+
+  test('orders open by recency, then closed in incoming order', () => {
+    const at = { a: 1, b: 3, c: 2 }
+    const rows = orderSwitcherRows([ws('a'), ws('b'), ws('c')], [ws('x'), ws('y'), ws('b')], (row) => at[row.workspace_id] ?? 0)
+    expect(rows.map((row) => `${row.workspace.workspace_id}${row.closed ? '*' : ''}`)).toEqual(['b', 'c', 'a', 'x*', 'y*'])
+  })
+
+  test('fuzzy-matches labels as subsequences', () => {
+    expect(fuzzyMatches('verde', 'vrd')).toBe(true)
+    expect(fuzzyMatches('verde', 'VE')).toBe(true)
+    expect(fuzzyMatches('verde', 'dv')).toBe(false)
+    expect(fuzzyMatches('anything', '  ')).toBe(true)
+  })
+})

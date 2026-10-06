@@ -2,31 +2,24 @@ import { For, Show, createEffect, createMemo, createSignal, onCleanup, type JSX 
 import { Portal } from 'solid-js/web'
 
 import { store, type SidebarContextAction } from '../lib/store'
-import { paneIsActive, type LayoutNode, type LivePane, type Workspace } from '../lib/types'
-import { Icon, ProviderGlyph, StatusPip, VerdeLogo } from './Icons'
+import { paneIsActive, type LivePane, type Workspace } from '../lib/types'
+import { fuzzyMatches, type SidebarScope } from '../lib/workspace_switcher'
+import { Icon, ProviderGlyph, StatusPip, VerdeLogo, WorkspaceGlyph } from './Icons'
 import { ChatRouting } from './ChatRouting'
 import { GitChangesDot } from './GitChanges'
 import { openDesktopViewer } from './DesktopViewer'
 import { openHistory } from './History'
 import { sidebarMenuAvailability } from '../lib/commands'
 
-// Sidebar-only view state: the selected workspace whose pane list is folded.
-// Keyed by id so selecting a different workspace always shows its panes.
-const [foldedWorkspaceId, setFoldedWorkspaceId] = createSignal<string | null>(null)
-
-/// Live workspace reorder drag: the dragged id and the id it would land
-/// before (null = end of list), mirroring the desktop sidebar drop line.
-const [workspaceDrag, setWorkspaceDrag] = createSignal<{ id: string; before_id: string | null } | null>(null)
-
 function sameKeys(a: readonly string[], b: readonly string[]): boolean {
   return a.length === b.length && a.every((key, index) => key === b[index])
 }
 
 /// Background refreshes (`core.snapshot` pushes, catalog refetches) rebuild
-/// workspace and pane objects even when only one field changed, and <For>
-/// keys rows by object identity, so each refresh remounted every row and
-/// replayed the `anim-reveal` fold-out. Iterate stable string keys instead and
-/// read the latest row through an accessor so DOM nodes survive refreshes.
+/// pane objects even when only one field changed, and <For> keys rows by
+/// object identity, so each refresh remounted every row. Iterate stable
+/// string keys instead and read the latest row through an accessor so DOM
+/// nodes survive refreshes.
 function keyedRows<T>(rows: () => readonly T[], key: (row: T) => string) {
   const keys = createMemo(() => rows().map(key), [], { equals: sameKeys })
   const by_key = createMemo(() => new Map(rows().map((row) => [key(row), row] as const)))
@@ -40,7 +33,7 @@ function keyedRows<T>(rows: () => readonly T[], key: (row: T) => string) {
   }
 }
 
-function activePaneKey(pane: LivePane): string {
+function paneRowKey(pane: LivePane): string {
   return `${pane.workspace_id}\u0000${pane.pane_id}`
 }
 
@@ -74,17 +67,33 @@ interface PromptState {
 }
 
 export function Sidebar(props: { drawer?: boolean }) {
-  // The icon rail only makes sense for the docked desktop sidebar. In the
-  // phone drawer the panel is always full, and its header button closes it.
-  const collapsed = () => !props.drawer && store.sidebarCollapsed()
   const [menu, setMenu] = createSignal<SidebarMenuTarget | null>(null)
   const [prompt, setPrompt] = createSignal<PromptState | null>(null)
-  const active_rows = keyedRows(() => store.activePanes(), activePaneKey)
-  const workspace_rows = keyedRows(() => store.workspaces(), (workspace) => workspace.workspace_id)
+  const [switcherOpen, setSwitcherOpen] = createSignal(false)
+  let switcherTrigger!: HTMLButtonElement
 
-  const openWorkspaceMenu = (workspace: Workspace, x: number, y: number) => {
-    setMenu({ kind: 'workspace', workspace, x, y })
+  const scope = () => store.sidebarScope()
+  const inScope = (pane: LivePane) => scope() === 'all' || pane.workspace_id === scope()
+  // Active keeps store.activePanes() order so active_select ordinals match.
+  const active_rows = keyedRows(() => store.activePanes().filter(inScope), paneRowKey)
+  const open_rows = keyedRows(
+    () => store.sidebarPanes().filter((pane) => inScope(pane) && !paneIsActive(pane)),
+    paneRowKey,
+  )
+  const scopedWorkspace = () => {
+    const id = scope()
+    return id === 'all' ? null : store.workspaces().find((row) => row.workspace_id === id) ?? null
   }
+  const newInScope = (command: 'new-thread' | 'new-terminal') => {
+    const target = store.sidebarTargetWorkspaceId()
+    if (!target) {
+      store.setNotice(null)
+      store.setWorkspaceDialogOpen(true)
+      return
+    }
+    void store.runCommand(command, target)
+  }
+
   const openPaneMenu = (pane: LivePane, x: number, y: number) => {
     if (pane.kind !== 'chat' && pane.kind !== 'terminal') return
     const workspace = actionWorkspace(pane)
@@ -125,90 +134,100 @@ export function Sidebar(props: { drawer?: boolean }) {
     })
   }
 
+  const renderRow = (rows: typeof active_rows) => (key: string) => {
+    const pane = rows.row(key)
+    return (
+      <PaneRow
+        pane={pane()}
+        chip={scope() === 'all'}
+        onClick={() => store.focusPane(pane())}
+        onOpenContext={(x, y) => openPaneMenu(pane(), x, y)}
+      />
+    )
+  }
+
   return (
     <>
       <aside class="flex h-full min-h-0 flex-col bg-[var(--panel)] text-[13px]">
         <div class="shrink-0 px-4 pt-3.5 pb-2">
           <div class="flex h-8 items-center">
             <VerdeLogo class="h-7 w-7" />
-            <Show when={!collapsed()}>
-              <div class="ml-auto flex items-center gap-1">
-                <IconButton label="Add workspace" onClick={() => { store.setNotice(null); store.setWorkspaceDialogOpen(true) }}>
-                  <Icon name="plus" class="h-3.5 w-3.5" />
-                </IconButton>
-                <IconButton
-                  label={props.drawer ? 'Close menu' : 'Collapse sidebar'}
-                  onClick={() => (props.drawer ? store.setDrawerOpen(false) : store.setSidebarCollapsed(true))}
-                >
-                  <Icon name={props.drawer ? 'close' : 'collapse'} class="h-4 w-4 lg:h-3.5 lg:w-3.5" />
-                </IconButton>
-              </div>
-            </Show>
-            <Show when={collapsed()}>
-              <div class="ml-auto">
-                <IconButton label="Expand sidebar" onClick={() => store.setSidebarCollapsed(false)}>
-                  <Icon name="expand" class="h-3.5 w-3.5" />
-                </IconButton>
-              </div>
-            </Show>
+            <div class="ml-auto flex items-center gap-1">
+              <IconButton
+                label={props.drawer ? 'Close menu' : 'Hide sidebar'}
+                onClick={() => (props.drawer ? store.setDrawerOpen(false) : store.setSidebarHidden(true))}
+              >
+                <Icon name={props.drawer ? 'close' : 'collapse'} class="h-4 w-4 lg:h-3.5 lg:w-3.5" />
+              </IconButton>
+            </div>
           </div>
-          <Show when={!collapsed()}>
+
+          <button
+            ref={switcherTrigger}
+            type="button"
+            class={`mt-2.5 flex h-11 w-full items-center gap-2 rounded-[7px] border border-[var(--border-muted)] px-2 text-left lg:h-[34px] ${
+              switcherOpen() ? 'bg-[var(--accent-hover)]' : 'hover:bg-[var(--accent-hover)]'
+            }`}
+            aria-haspopup="listbox"
+            aria-expanded={switcherOpen()}
+            onClick={() => { setMenu(null); setSwitcherOpen((open) => !open) }}
+          >
+            <Show
+              when={scopedWorkspace()}
+              fallback={(
+                <span class="grid h-5 w-5 shrink-0 place-items-center rounded-[5px] bg-[var(--accent-dim)] text-[var(--accent)]">
+                  <Icon name="layers" class="h-3.5 w-3.5" />
+                </span>
+              )}
+            >
+              {(workspace) => <WorkspaceGlyph workspaceId={workspace().workspace_id} />}
+            </Show>
+            <span class="min-w-0 flex-1 truncate text-[15px] text-[var(--text)] lg:text-[13px]">
+              {scopedWorkspace()?.label ?? 'All Workspaces'}
+            </span>
+            <Icon name="chevronDown" class="h-4 w-4 shrink-0 text-[var(--text-subtle)]" />
+          </button>
+
+          <div class="mt-2 flex items-center gap-1">
             <button
               type="button"
-              class="mt-2.5 flex h-10 w-full items-center rounded-[6px] px-2 text-[15px] lg:h-[30px] lg:text-[12.5px] text-[var(--text-subtle)] hover:bg-[var(--accent-hover)] hover:text-white"
+              class="flex h-10 min-w-0 flex-1 items-center rounded-[6px] bg-[var(--panel-alt)] px-2 text-[15px] text-[var(--text-subtle)] hover:bg-[var(--accent-hover)] hover:text-white lg:h-[30px] lg:text-[12.5px]"
               onClick={() => store.setPaletteOpen(true)}
             >
-              <Icon name="search" class="h-3.5 w-3.5" />
-              <span class="ml-2">Search</span>
+              <Icon name="search" class="h-3.5 w-3.5 shrink-0" />
+              <span class="ml-2 truncate">Search</span>
               <span class="mono ml-auto hidden text-[10px] text-[var(--text-subtle)] lg:inline">Ctrl+Shift+P</span>
             </button>
-          </Show>
+            <IconButton label="New chat" onClick={() => newInScope('new-thread')}>
+              <Icon name="chat" class="h-[18px] w-[18px]" />
+            </IconButton>
+            <IconButton label="New terminal" onClick={() => newInScope('new-terminal')}>
+              <Icon name="terminal" class="h-[18px] w-[18px]" />
+            </IconButton>
+          </div>
         </div>
 
-        <Show
-          when={!collapsed()}
-          fallback={<CollapsedRail onOpenContext={openWorkspaceMenu} onDragStart={() => setMenu(null)} />}
+        <div
+          class="min-h-0 flex-1 overflow-y-auto px-4 scrollbar-thin"
+          onScroll={() => setMenu(null)}
         >
-          <div
-            class="min-h-0 flex-1 overflow-y-auto px-4 scrollbar-thin"
-            onScroll={() => setMenu(null)}
-          >
-            <Show when={store.activePanes().length > 0}>
-              <div class="mb-1 text-[11px] tracking-wide text-[var(--text-subtle)]">ACTIVE</div>
-              <For each={active_rows.keys()}>
-                {(key) => {
-                  const pane = active_rows.row(key)
-                  return (
-                    <PaneRow
-                      pane={pane()}
-                      activeCluster
-                      onClick={() => store.focusPane(pane())}
-                      onOpenContext={(x, y) => openPaneMenu(pane(), x, y)}
-                    />
-                  )
-                }}
-              </For>
+          <Show when={active_rows.keys().length > 0}>
+            <SectionLabel>ACTIVE</SectionLabel>
+            <For each={active_rows.keys()}>{renderRow(active_rows)}</For>
+          </Show>
+          <Show when={open_rows.keys().length > 0}>
+            <Show when={active_rows.keys().length > 0}>
               <div class="my-3 h-px bg-[var(--border-muted)]" />
             </Show>
-
-            <For each={workspace_rows.keys()}>
-              {(id) => {
-                const workspace = workspace_rows.row(id)
-                return (
-                  <WorkspaceGroup
-                    workspace={workspace()}
-                    onOpenContext={(x, y) => openWorkspaceMenu(workspace(), x, y)}
-                    onOpenPaneContext={openPaneMenu}
-                    onDragStart={() => setMenu(null)}
-                  />
-                )
-              }}
-            </For>
-            <Show when={workspaceDrag()?.before_id === null}>
-              <div class="h-[2px] rounded-full bg-[var(--accent)]" />
-            </Show>
-          </div>
-        </Show>
+            <SectionLabel>OPEN</SectionLabel>
+            <For each={open_rows.keys()}>{renderRow(open_rows)}</For>
+          </Show>
+          <Show when={active_rows.keys().length === 0 && open_rows.keys().length === 0}>
+            <div class="px-1 py-3 text-[12px] text-[var(--text-subtle)]">
+              {store.workspaces().length === 0 ? 'No open workspaces.' : 'Nothing open here yet.'}
+            </div>
+          </Show>
+        </div>
 
         <div class="flex h-14 shrink-0 items-center justify-end border-t border-[var(--border-muted)] px-4">
           <div class="mr-auto truncate text-[11px] text-[var(--text-subtle)]">
@@ -221,6 +240,28 @@ export function Sidebar(props: { drawer?: boolean }) {
         </div>
       </aside>
 
+      <Show when={switcherOpen()}>
+        <WorkspaceSwitcher
+          anchor={switcherTrigger}
+          onClose={() => {
+            setSwitcherOpen(false)
+            queueMicrotask(() => switcherTrigger?.focus())
+          }}
+          onSelect={(next) => {
+            setSwitcherOpen(false)
+            void store.selectSidebarScope(next)
+          }}
+          onSettings={(workspace, x, y) => {
+            setSwitcherOpen(false)
+            setMenu({ kind: 'workspace', workspace, x, y })
+          }}
+          onNewWorkspace={() => {
+            setSwitcherOpen(false)
+            store.setNotice(null)
+            store.setWorkspaceDialogOpen(true)
+          }}
+        />
+      </Show>
       <Show when={menu()} keyed>
         {(target) => (
           <SidebarContextMenu
@@ -248,6 +289,181 @@ export function Sidebar(props: { drawer?: boolean }) {
         )}
       </Show>
     </>
+  )
+}
+
+function SectionLabel(props: { children: JSX.Element }) {
+  return <div class="mb-1 text-[11px] tracking-wide text-[var(--text-subtle)]">{props.children}</div>
+}
+
+type SwitcherItem =
+  | { kind: 'all' }
+  | { kind: 'workspace'; workspace: Workspace; closed: boolean }
+  | { kind: 'new' }
+
+/// Context-menu styled workspace picker anchored under the sidebar trigger.
+function WorkspaceSwitcher(props: {
+  anchor: HTMLElement
+  onClose: () => void
+  onSelect: (scope: SidebarScope) => void
+  onSettings: (workspace: Workspace, x: number, y: number) => void
+  onNewWorkspace: () => void
+}) {
+  const [query, setQuery] = createSignal('')
+  const [highlight, setHighlight] = createSignal(0)
+  let input!: HTMLInputElement
+  let list!: HTMLDivElement
+
+  const items = createMemo((): SwitcherItem[] => {
+    const text = query()
+    const rows = store.switcherRows()
+      .filter((row) => fuzzyMatches(row.workspace.label, text))
+      .map((row): SwitcherItem => ({ kind: 'workspace', workspace: row.workspace, closed: row.closed }))
+    return [
+      ...(fuzzyMatches('all workspaces', text) ? [{ kind: 'all' } as const] : []),
+      ...rows,
+      { kind: 'new' } as const,
+    ]
+  })
+  createEffect(() => {
+    query()
+    setHighlight(0)
+  })
+  createEffect(() => {
+    const index = highlight()
+    list?.querySelector<HTMLElement>(`[data-switcher-index="${index}"]`)?.scrollIntoView({ block: 'nearest' })
+  })
+  queueMicrotask(() => input?.focus())
+
+  const position = () => {
+    const rect = props.anchor.getBoundingClientRect()
+    const width = Math.min(Math.max(rect.width, 260), window.innerWidth - 16)
+    return {
+      left: `${Math.max(8, Math.min(rect.left, window.innerWidth - width - 8))}px`,
+      top: `${rect.bottom + 6}px`,
+      width: `${width}px`,
+      'max-height': `${Math.max(160, window.innerHeight - rect.bottom - 16)}px`,
+    }
+  }
+  const choose = (item: SwitcherItem | undefined) => {
+    if (!item) return
+    if (item.kind === 'all') props.onSelect('all')
+    else if (item.kind === 'new') props.onNewWorkspace()
+    else props.onSelect(item.workspace.workspace_id)
+  }
+  const onKeyDown = (event: KeyboardEvent) => {
+    const count = items().length
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      props.onClose()
+    } else if (event.key === 'ArrowDown') {
+      event.preventDefault()
+      setHighlight((index) => (index + 1) % count)
+    } else if (event.key === 'ArrowUp') {
+      event.preventDefault()
+      setHighlight((index) => (index - 1 + count) % count)
+    } else if (event.key === 'Enter') {
+      event.preventDefault()
+      choose(items()[highlight()])
+    }
+  }
+  const isCurrent = (item: SwitcherItem) => {
+    const scope = store.sidebarScope()
+    return item.kind === 'all' ? scope === 'all' : item.kind === 'workspace' && scope === item.workspace.workspace_id
+  }
+
+  return (
+    <Portal>
+      <div class="anim-fade fixed inset-0 z-50" onContextMenu={(event) => event.preventDefault()}>
+        <button
+          type="button"
+          class="absolute inset-0 cursor-default bg-transparent"
+          aria-label="Close workspace switcher"
+          onPointerDown={props.onClose}
+        />
+        <div
+          class="anim-menu fixed z-10 flex flex-col overflow-hidden rounded-[12px] border border-[var(--border-muted)] bg-[var(--panel-alt)] shadow-[0_18px_55px_rgba(0,0,0,0.5)]"
+          style={position()}
+          onKeyDown={onKeyDown}
+          onPointerDown={(event) => event.stopPropagation()}
+        >
+          <div class="flex shrink-0 items-center gap-2 border-b border-[var(--border-muted)] px-3">
+            <Icon name="search" class="h-3.5 w-3.5 shrink-0 text-[var(--text-subtle)]" />
+            <input
+              ref={input}
+              class="h-10 min-w-0 flex-1 bg-transparent text-[14px] text-[var(--text)] outline-none placeholder:text-[var(--text-subtle)] lg:h-9 lg:text-[13px]"
+              placeholder="Search workspaces"
+              aria-label="Search workspaces"
+              aria-controls="workspace-switcher-list"
+              aria-activedescendant={`workspace-switcher-${highlight()}`}
+              value={query()}
+              onInput={(event) => setQuery(event.currentTarget.value)}
+            />
+          </div>
+          <div ref={list} id="workspace-switcher-list" role="listbox" aria-label="Workspaces" class="min-h-0 flex-1 overflow-y-auto p-1.5 scrollbar-thin">
+            <For each={items()}>
+              {(item, index) => (
+                <div
+                  id={`workspace-switcher-${index()}`}
+                  data-switcher-index={index()}
+                  role="option"
+                  aria-selected={highlight() === index()}
+                  class={`group flex min-h-11 cursor-pointer items-center gap-2 rounded-[8px] px-2 lg:min-h-9 ${
+                    highlight() === index() ? 'bg-[var(--accent-hover)]' : ''
+                  } ${item.kind === 'new' ? 'mt-1' : ''}`}
+                  onPointerMove={() => setHighlight(index())}
+                  onClick={() => choose(item)}
+                >
+                  <Show when={item.kind === 'new'}>
+                    <span class="grid h-5 w-5 shrink-0 place-items-center text-[var(--text-subtle)]">
+                      <Icon name="plus" class="h-3.5 w-3.5" />
+                    </span>
+                    <span class="min-w-0 flex-1 truncate text-[14px] text-[var(--text-muted)] lg:text-[13px]">New workspace</span>
+                  </Show>
+                  <Show when={item.kind === 'all'}>
+                    <span class="grid h-5 w-5 shrink-0 place-items-center rounded-[5px] bg-[var(--accent-dim)] text-[var(--accent)]">
+                      <Icon name="layers" class="h-3.5 w-3.5" />
+                    </span>
+                    <span class="min-w-0 flex-1 truncate text-[14px] text-[var(--text)] lg:text-[13px]">All Workspaces</span>
+                  </Show>
+                  <Show when={item.kind === 'workspace' ? item : null}>
+                    {(row) => (
+                      <>
+                        <WorkspaceGlyph workspaceId={row().workspace.workspace_id} dim={row().closed} />
+                        <span class={`min-w-0 flex-1 truncate text-[14px] lg:text-[13px] ${row().closed ? 'text-[var(--text-subtle)]' : 'text-[var(--text)]'}`}>
+                          {row().workspace.label}
+                        </span>
+                        <Show when={row().closed}>
+                          <span class="shrink-0 text-[11px] text-[var(--text-subtle)]">Closed</span>
+                        </Show>
+                        <Show when={!row().closed}>
+                          <button
+                            type="button"
+                            class="grid h-8 w-8 shrink-0 place-items-center rounded-[6px] text-[var(--text-subtle)] hover:bg-[var(--accent-row)] hover:text-[var(--text)] lg:h-6 lg:w-6"
+                            aria-label={`${row().workspace.label} workspace settings`}
+                            title="Workspace settings"
+                            onClick={(event) => {
+                              event.stopPropagation()
+                              const rect = event.currentTarget.getBoundingClientRect()
+                              props.onSettings(row().workspace, rect.left, rect.bottom + 4)
+                            }}
+                          >
+                            <Icon name="settings" class="h-3.5 w-3.5" />
+                          </button>
+                        </Show>
+                      </>
+                    )}
+                  </Show>
+                  <Show when={item.kind !== 'new' && isCurrent(item)}>
+                    <Icon name="check" class="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
+                  </Show>
+                </div>
+              )}
+            </For>
+          </div>
+        </div>
+      </div>
+    </Portal>
   )
 }
 
@@ -353,166 +569,10 @@ export function PaneActionsButton(props: { pane: LivePane; mobile?: boolean }) {
   )
 }
 
-function WorkspaceGroup(props: {
-  workspace: Workspace
-  onOpenContext: (x: number, y: number) => void
-  onOpenPaneContext: (pane: LivePane, x: number, y: number) => void
-  onDragStart: () => void
-}) {
-  const selected = () => store.workspaceId() === props.workspace.workspace_id
-  const drag = createWorkspaceDrag(() => props.workspace.workspace_id, props.onDragStart)
-  // Tapping the already-open workspace folds its pane list; selecting any
-  // workspace (including this one again) unfolds it.
-  const expanded = () => selected() && foldedWorkspaceId() !== props.workspace.workspace_id
-  const context = createContextTrigger((x, y) => {
-    drag.arm()
-    props.onOpenContext(x, y)
-  })
-  // Split groups render their layout tree once per mount, so a layout change
-  // is part of the key; everything else updates in place.
-  const group_rows = keyedRows(
-    () => (expanded() ? store.paneGroups() : []),
-    (group) => (group.panes.length > 1 ? `${group.key}\u0000${JSON.stringify(group.layout)}` : group.key),
-  )
-  return (
-    <section class={`relative mb-2 ${drag.dragging() ? 'opacity-50' : ''}`}>
-      <Show when={drag.dropBefore()}>
-        <span class="absolute -top-[5px] right-0 left-0 h-[2px] rounded-full bg-[var(--accent)]" />
-      </Show>
-      <Show when={selected()}>
-        <span class="absolute top-1 bottom-1 -left-3 w-[3px] rounded-full bg-[var(--accent)]" />
-      </Show>
-      <div
-        ref={drag.ref}
-        data-workspace-drag-row={props.workspace.workspace_id}
-        class="group flex h-11 w-full touch-pan-y select-none items-center rounded-[6px] pr-1 hover:bg-[var(--accent-hover)] lg:h-[30px]"
-        style={{ '-webkit-touch-callout': 'none' }}
-        onContextMenu={context.onContextMenu}
-        onPointerDown={(event) => { context.onPointerDown(event); drag.onPointerDown(event) }}
-        onPointerMove={(event) => { context.onPointerMove(event); drag.onPointerMove(event) }}
-        onPointerUp={(event) => { context.onPointerUp(); drag.onPointerUp(event) }}
-        onPointerCancel={() => { context.onPointerCancel(); drag.onPointerCancel() }}
-      >
-        <button
-          type="button"
-          class="flex h-full min-w-0 flex-1 items-center text-left"
-          onClick={(event) => {
-            if (context.consumeClick(event)) return
-            if (selected()) {
-              setFoldedWorkspaceId((value) => value === props.workspace.workspace_id ? null : props.workspace.workspace_id)
-              return
-            }
-            setFoldedWorkspaceId(null)
-            store.selectWorkspace(props.workspace.workspace_id)
-          }}
-        >
-          <Icon
-            name={expanded() ? 'chevronDown' : 'chevron'}
-            class={`h-4 w-4 lg:h-3.5 lg:w-3.5 ${selected() ? 'text-white' : 'text-[var(--text-subtle)]'}`}
-          />
-          <Icon
-            name="folder"
-            class={`ml-1 h-4 w-4 lg:h-3.5 lg:w-3.5 ${selected() ? 'text-[var(--accent)]' : 'text-[var(--text-subtle)]'}`}
-          />
-          <span class={`ml-2 min-w-0 flex-1 truncate text-[17px] lg:text-[15px] ${selected() ? 'text-white' : 'text-[var(--text-muted)]'}`}>
-            {props.workspace.label}
-          </span>
-        </button>
-        <span class={`${selected() ? 'flex lg:hidden' : 'hidden'} items-center gap-1 lg:gap-0.5 lg:group-hover:flex`}>
-          <TinyIcon label="New chat" onClick={(event) => { event.stopPropagation(); void store.runCommand('new-thread', props.workspace.workspace_id) }}>
-            <Icon name="chat" class="h-[18px] w-[18px]" />
-          </TinyIcon>
-          <TinyIcon label="New terminal" onClick={(event) => { event.stopPropagation(); void store.runCommand('new-terminal', props.workspace.workspace_id) }}>
-            <Icon name="terminal" class="h-[18px] w-[18px]" />
-          </TinyIcon>
-          <TinyIcon label="History" onClick={(event) => { event.stopPropagation(); openHistory(props.workspace.workspace_id) }}>
-            <Icon name="history" class="h-[18px] w-[18px]" />
-          </TinyIcon>
-        </span>
-      </div>
-      <Show when={expanded()}>
-        <div class="anim-reveal mt-1 ml-4">
-          <For each={group_rows.keys()}>
-            {(key) => {
-              const group = group_rows.row(key)
-              return (
-                <Show
-                  when={group().panes.length > 1}
-                  fallback={<PaneRow
-                    pane={group().panes[0]!}
-                    onClick={() => store.focusPane(group().panes[0]!)}
-                    onOpenContext={(x, y) => props.onOpenPaneContext(group().panes[0]!, x, y)}
-                  />}
-                >
-                  <div
-                    class="mb-1 flex min-h-0 min-w-0 overflow-hidden"
-                    style={{ height: `${sidebarGroupRows(group().layout) * 38 + (sidebarGroupRows(group().layout) - 1) * 4}px` }}
-                  >
-                    <SidebarGroupNode
-                      node={group().layout}
-                      panes={group().panes}
-                      onOpenPaneContext={props.onOpenPaneContext}
-                    />
-                  </div>
-                </Show>
-              )
-            }}
-          </For>
-        </div>
-      </Show>
-    </section>
-  )
-}
-
-function sidebarGroupRows(node: LayoutNode): number {
-  if ('leaf' in node) return 1
-  const first = sidebarGroupRows(node.split.first)
-  const second = sidebarGroupRows(node.split.second)
-  return node.split.axis === 'horizontal' ? first + second : Math.max(first, second)
-}
-
-function SidebarGroupNode(props: {
-  node: LayoutNode
-  panes: LivePane[]
-  onOpenPaneContext: (pane: LivePane, x: number, y: number) => void
-}) {
-  if ('leaf' in props.node) {
-    const leaf_id = props.node.leaf
-    // Non-keyed: refreshed pane objects update the row instead of remounting it.
-    const pane = () => props.panes.find((item) => item.pane_id === leaf_id)
-    return (
-      <Show when={pane()}>
-        {(item) => (
-          <div class="min-h-0 min-w-0 flex-1 overflow-hidden rounded-[7px] border border-[var(--border-muted)] bg-[var(--panel-alt)]">
-            <PaneRow
-              pane={item()}
-              tiled
-              onClick={() => store.focusPane(item())}
-              onOpenContext={(x, y) => props.onOpenPaneContext(item(), x, y)}
-            />
-          </div>
-        )}
-      </Show>
-    )
-  }
-  const split = props.node.split
-  const ratio = Math.min(0.78, Math.max(0.22, split.ratio))
-  return (
-    <div class={`flex min-h-0 min-w-0 flex-1 gap-1 ${split.axis === 'vertical' ? 'flex-row' : 'flex-col'}`}>
-      <div class="flex min-h-0 min-w-0 overflow-hidden" style={{ flex: `${ratio} 1 0%` }}>
-        <SidebarGroupNode node={split.first} panes={props.panes} onOpenPaneContext={props.onOpenPaneContext} />
-      </div>
-      <div class="flex min-h-0 min-w-0 overflow-hidden" style={{ flex: `${1 - ratio} 1 0%` }}>
-        <SidebarGroupNode node={split.second} panes={props.panes} onOpenPaneContext={props.onOpenPaneContext} />
-      </div>
-    </div>
-  )
-}
-
 function PaneRow(props: {
   pane: LivePane
-  activeCluster?: boolean
-  tiled?: boolean
+  /// Under All Workspaces, rows carry their workspace identity chip.
+  chip?: boolean
   onClick: () => void
   onOpenContext?: (x: number, y: number) => void
 }) {
@@ -522,7 +582,7 @@ function PaneRow(props: {
   return (
     <button
       type="button"
-      class={`${props.tiled ? 'h-full min-h-[38px]' : 'mb-[4px] h-[46px] lg:h-[38px]'} flex w-full touch-pan-y select-none items-center gap-2.5 rounded-[7px] px-2.5 text-left ${focused() ? 'bg-[var(--accent-row)]' : 'hover:bg-[var(--accent-hover)]'}`}
+      class={`mb-[4px] h-[46px] lg:h-[38px] flex w-full touch-pan-y select-none items-center gap-2.5 rounded-[7px] px-2.5 text-left ${focused() ? 'bg-[var(--accent-row)]' : 'hover:bg-[var(--accent-hover)]'}`}
       style={{ '-webkit-touch-callout': 'none' }}
       onClick={(event) => {
         if (context.consumeClick(event)) return
@@ -544,59 +604,13 @@ function PaneRow(props: {
       </Show>
       <span class="min-w-0 flex-1 truncate text-[15px] text-[var(--text-muted)] lg:text-[13px]">{store.paneTitle(props.pane)}</span>
       <GitChangesDot pane={props.pane} />
+      <Show when={props.chip}>
+        <WorkspaceGlyph workspaceId={props.pane.workspace_id} class="h-[18px] w-[18px]" iconClass="h-3 w-3" />
+      </Show>
       <Show when={working()}>
         <StatusPip active />
       </Show>
     </button>
-  )
-}
-
-function CollapsedRail(props: { onOpenContext: (workspace: Workspace, x: number, y: number) => void; onDragStart: () => void }) {
-  const workspace_rows = keyedRows(() => store.workspaces(), (workspace) => workspace.workspace_id)
-  return (
-    <div class="flex min-h-0 flex-1 flex-col items-center gap-2 overflow-y-auto pt-1 scrollbar-thin">
-      <For each={workspace_rows.keys()}>
-        {(id) => {
-          const row = workspace_rows.row(id)
-          const selected = () => store.workspaceId() === id
-          const drag = createWorkspaceDrag(() => id, props.onDragStart)
-          const context = createContextTrigger((x, y) => {
-            drag.arm()
-            props.onOpenContext(row(), x, y)
-          })
-          return (
-            <button
-              ref={drag.ref}
-              type="button"
-              data-workspace-drag-row={id}
-              class={`relative grid h-9 w-9 shrink-0 touch-pan-y select-none place-items-center rounded-[6px] ${selected() ? 'bg-[var(--accent-row)]' : 'hover:bg-[var(--accent-hover)]'} ${drag.dragging() ? 'opacity-50' : ''}`}
-              style={{ '-webkit-touch-callout': 'none' }}
-              title={row().label}
-              onClick={(event) => {
-                if (context.consumeClick(event)) return
-                store.selectWorkspace(id)
-              }}
-              onContextMenu={context.onContextMenu}
-              onPointerDown={(event) => { context.onPointerDown(event); drag.onPointerDown(event) }}
-              onPointerMove={(event) => { context.onPointerMove(event); drag.onPointerMove(event) }}
-              onPointerUp={(event) => { context.onPointerUp(); drag.onPointerUp(event) }}
-              onPointerCancel={() => { context.onPointerCancel(); drag.onPointerCancel() }}
-            >
-              <Show when={drag.dropBefore()}>
-                <span class="absolute -top-[5px] right-0 left-0 h-[2px] rounded-full bg-[var(--accent)]" />
-              </Show>
-              <Show when={selected()}>
-                <span class="absolute top-1 bottom-1 left-0 w-[3px] rounded-full bg-[var(--accent)]" />
-              </Show>
-              <span class="text-[11px] font-bold text-[var(--text-muted)]">{row().label.slice(0, 1).toUpperCase()}</span>
-            </button>
-          )
-        }}
-      </For>
-      <Show when={workspaceDrag()?.before_id === null}>
-        <div class="h-[2px] w-9 shrink-0 rounded-full bg-[var(--accent)]" />
-      </Show>
-    </div>
   )
 }
 
@@ -861,111 +875,6 @@ function paneZoomItem(pane: LivePane): MenuItem {
   return { action: 'pane-zoom', label: zoomed ? 'Unzoom pane' : 'Zoom pane' }
 }
 
-/// Sidebar workspace reorder drag. Mouse drags start after a small move, like
-/// the desktop rail. Touch keeps vertical swipes for scrolling: a long press
-/// (which also opens the context menu) arms the drag, and moving afterwards
-/// closes the menu and drags the row instead.
-function createWorkspaceDrag(id: () => string, onStart: () => void) {
-  const START_DISTANCE = 6
-  const EDGE_SCROLL = 36
-  let element: HTMLElement | undefined
-  let pointer: number | null = null
-  let origin_x = 0
-  let origin_y = 0
-  let armed = false
-  const [dragging, setDragging] = createSignal(false)
-
-  // Once armed, the touch must not become a scroll gesture (which would
-  // pointercancel the drag); only a non-passive touchmove can veto that.
-  const blockTouchScroll = (event: TouchEvent) => {
-    if (armed || dragging()) event.preventDefault()
-  }
-  const reset = () => {
-    pointer = null
-    armed = false
-    if (dragging()) {
-      setDragging(false)
-      setWorkspaceDrag(null)
-    }
-  }
-  onCleanup(() => {
-    element?.removeEventListener('touchmove', blockTouchScroll)
-    if (dragging()) setWorkspaceDrag(null)
-  })
-
-  const dropTarget = (y: number): string | null => {
-    const rows = [...document.querySelectorAll<HTMLElement>('[data-workspace-drag-row]')]
-      .filter((row) => row.getClientRects().length > 0)
-    for (const row of rows) {
-      const rect = row.getBoundingClientRect()
-      if (y < rect.top + rect.height / 2) return row.dataset.workspaceDragRow ?? null
-    }
-    return null
-  }
-  const autoScroll = (y: number) => {
-    let scroller = element?.parentElement ?? null
-    while (scroller && !(scroller.scrollHeight > scroller.clientHeight && getComputedStyle(scroller).overflowY !== 'visible')) {
-      scroller = scroller.parentElement
-    }
-    if (!scroller) return
-    const box = scroller.getBoundingClientRect()
-    if (y < box.top + EDGE_SCROLL) scroller.scrollBy(0, -12)
-    else if (y > box.bottom - EDGE_SCROLL) scroller.scrollBy(0, 12)
-  }
-  // The drop's trailing click must not also select or toggle the row.
-  const swallowNextClick = () => {
-    const swallow = (event: MouseEvent) => {
-      event.preventDefault()
-      event.stopPropagation()
-    }
-    window.addEventListener('click', swallow, { capture: true, once: true })
-    window.setTimeout(() => window.removeEventListener('click', swallow, { capture: true }), 0)
-  }
-
-  return {
-    dragging,
-    dropBefore: () => {
-      const state = workspaceDrag()
-      return Boolean(state && state.id !== id() && state.before_id === id())
-    },
-    ref: (el: HTMLElement) => {
-      element = el
-      el.addEventListener('touchmove', blockTouchScroll, { passive: false })
-    },
-    arm: () => {
-      if (pointer !== null) armed = true
-    },
-    onPointerDown: (event: PointerEvent) => {
-      if (event.button !== 0) return
-      pointer = event.pointerId
-      origin_x = event.clientX
-      origin_y = event.clientY
-      armed = event.pointerType === 'mouse'
-    },
-    onPointerMove: (event: PointerEvent) => {
-      if (event.pointerId !== pointer) return
-      if (!dragging()) {
-        if (!armed || Math.hypot(event.clientX - origin_x, event.clientY - origin_y) < START_DISTANCE) return
-        element?.setPointerCapture(event.pointerId)
-        setDragging(true)
-        onStart()
-      }
-      event.preventDefault()
-      setWorkspaceDrag({ id: id(), before_id: dropTarget(event.clientY) })
-      autoScroll(event.clientY)
-    },
-    onPointerUp: (event: PointerEvent) => {
-      if (event.pointerId !== pointer) return
-      const state = dragging() ? workspaceDrag() : null
-      reset()
-      if (!state) return
-      swallowNextClick()
-      void store.moveWorkspace(state.id, state.before_id)
-    },
-    onPointerCancel: reset,
-  }
-}
-
 function createContextTrigger(onOpen: (x: number, y: number) => void) {
   const HOLD_MS = 560
   const MOVE_TOLERANCE = 10
@@ -1021,19 +930,6 @@ function IconButton(props: { label: string; onClick: () => void; children: JSX.E
     <button
       type="button"
       class="grid h-10 w-10 place-items-center rounded-[6px] text-[var(--text-subtle)] hover:bg-[var(--accent-hover)] hover:text-white lg:h-7 lg:w-7"
-      aria-label={props.label}
-      onClick={props.onClick}
-    >
-      {props.children}
-    </button>
-  )
-}
-
-function TinyIcon(props: { label: string; onClick: (event: MouseEvent) => void; children: JSX.Element }) {
-  return (
-    <button
-      type="button"
-      class="grid h-10 w-10 place-items-center text-[var(--text-subtle)] hover:text-white lg:h-[30px] lg:w-[30px]"
       aria-label={props.label}
       onClick={props.onClick}
     >

@@ -6336,6 +6336,10 @@ struct Workspace: Codable {
     var `open`: Bool
     var `panes`: [Pane]
     var `threads`: [ThreadSummary]
+    var `icon_index`: UInt8 = 0
+    var `color_index`: UInt8 = 0
+    var `recency_ms`: Int64? = nil
+    var `recency_rank`: UInt32 = 0
 }
 
 extension Workspace {
@@ -6346,6 +6350,10 @@ extension Workspace {
         case `open`
         case `panes`
         case `threads`
+        case `icon_index`
+        case `color_index`
+        case `recency_ms`
+        case `recency_rank`
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -6355,6 +6363,18 @@ extension Workspace {
         self.`open` = try c.decode(Bool.self, forKey: .`open`)
         self.`panes` = try c.decode([Pane].self, forKey: .`panes`)
         self.`threads` = try c.decode([ThreadSummary].self, forKey: .`threads`)
+        if !c.contains(.`icon_index`) { self.`icon_index` = 0 } else {
+        self.`icon_index` = try c.decode(UInt8.self, forKey: .`icon_index`)
+        }
+        if !c.contains(.`color_index`) { self.`color_index` = 0 } else {
+        self.`color_index` = try c.decode(UInt8.self, forKey: .`color_index`)
+        }
+        if !c.contains(.`recency_ms`) { self.`recency_ms` = nil } else {
+        self.`recency_ms` = try c.decodeIfPresent(Int64.self, forKey: .`recency_ms`)
+        }
+        if !c.contains(.`recency_rank`) { self.`recency_rank` = 0 } else {
+        self.`recency_rank` = try c.decode(UInt32.self, forKey: .`recency_rank`)
+        }
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -6364,6 +6384,10 @@ extension Workspace {
         try c.encode(self.`open`, forKey: .`open`)
         try c.encode(self.`panes`, forKey: .`panes`)
         try c.encode(self.`threads`, forKey: .`threads`)
+        try c.encode(self.`icon_index`, forKey: .`icon_index`)
+        try c.encode(self.`color_index`, forKey: .`color_index`)
+        try c.encode(self.`recency_ms`, forKey: .`recency_ms`)
+        try c.encode(self.`recency_rank`, forKey: .`recency_rank`)
     }
 }
 

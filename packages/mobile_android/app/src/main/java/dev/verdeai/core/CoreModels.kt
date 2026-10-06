@@ -1613,6 +1613,10 @@ data class Workspace(
     val `open`: Boolean,
     val `panes`: List<Pane>,
     val `threads`: List<ThreadSummary>,
+    val `icon_index`: Int = 0,
+    val `color_index`: Int = 0,
+    val `recency_ms`: Long? = null,
+    val `recency_rank`: Long = 0,
 )
 
 @Serializable

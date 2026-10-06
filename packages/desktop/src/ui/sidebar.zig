@@ -8,6 +8,7 @@ const colors = @import("colors.zig");
 const context_menu = @import("context_menu.zig");
 const globe_icon = @import("globe_icon.zig");
 const runtime = @import("runtime.zig");
+const workspace_identity = @import("workspace_identity.zig");
 const command_palette = @import("command_palette.zig");
 const keybinds = @import("../app/keybinds.zig");
 const utils = @import("../utils.zig");
@@ -45,8 +46,6 @@ const SIDEBAR_STATUS_COLUMN_CSS: f32 = 96.0;
 /// Horizontal padding of the expanded rail's content column. Kept tight so
 /// pane titles keep as many characters as possible at typical rail widths.
 const SIDEBAR_PAD_X_CSS: f32 = 16.0;
-/// Indent of pane rows beneath their workspace header row.
-const SIDEBAR_ROW_INDENT_CSS: f32 = 16.0;
 /// Compact workspace-row badge width for Herdr-backed workspaces.
 const SIDEBAR_HERDR_BADGE_W_CSS: f32 = 50.0;
 const HIDDEN_SIDEBAR_EDGE_REVEAL_CSS: f32 = 8.0;
@@ -71,26 +70,18 @@ const THREAD_DRAG_FLOATING_Z: i32 = 160;
 const SIDEBAR_CONTEXT_MENU_Z: i32 = 1450;
 
 const SidebarHitKind = enum {
+    /// Header toggle: hides the rail, or pins a hover-revealed rail open.
     collapse,
-    expand,
-    add_workspace,
     new_thread,
     new_terminal,
-    workspace_row,
-    workspace_avatar,
+    /// Workspace switcher trigger; opens the switcher popover.
+    workspace_switcher,
     open_pane,
-    /// Live pane row in its owning workspace subtree; supports click focus
-    /// and drag reordering in addition to the open-pane actions.
+    /// Live pane row in the OPEN section; supports click focus and drag
+    /// reordering in addition to the open-pane actions.
     open_pane_reorder,
-    /// Per-workspace history action icon; opens the command palette scoped to
-    /// that workspace's saved threads.
-    history,
-    /// Search trigger (expanded pill / collapsed icon); opens the command
-    /// palette unscoped.
+    /// Search trigger pill; opens the command palette unscoped.
     command_palette,
-    /// Per-workspace gear icon; opens Workspace Settings bound to that
-    /// workspace (distinct from global `settings` below).
-    workspace_settings,
     settings,
 };
 
@@ -104,6 +95,13 @@ const SidebarHit = struct {
 var palette_hits: [512]SidebarHit = undefined;
 var palette_hit_count: usize = 0;
 var palette_sidebar_rect: palette.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+/// Last-rendered workspace switcher trigger; the switcher popover anchors to
+/// it. Zero-sized while the rail is hidden.
+var workspace_switcher_anchor: palette.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+
+pub fn workspaceSwitcherAnchor() palette.Rect {
+    return workspace_switcher_anchor;
+}
 var sidebar_scroll_y: f32 = 0.0;
 var sidebar_max_scroll_y: f32 = 0.0;
 var sidebar_revealed_project_index: ?usize = null;
@@ -241,27 +239,10 @@ var sidebar_menu_row_count: usize = 0;
 
 var settings_hovered: bool = false;
 var terminal_action_hovered: ?usize = null;
-var history_action_hovered: ?usize = null;
-var workspace_settings_action_hovered: ?usize = null;
 var search_trigger_hovered: bool = false;
-
-const WorkspaceDragState = struct {
-    pending: bool = false,
-    active: bool = false,
-    project_index: usize = 0,
-    toggle_project_on_click: bool = true,
-    start_x: f32 = 0.0,
-    start_y: f32 = 0.0,
-    x: f32 = 0.0,
-    y: f32 = 0.0,
-};
-
-var workspace_drag: WorkspaceDragState = .{};
-/// Drop slot computed during an active workspace drag: insert the dragged
-/// project immediately before `workspace_drop_before` (array coordinates).
-var workspace_drop_before: usize = 0;
-var workspace_drop_line_y: f32 = 0.0;
-var workspace_drop_valid: bool = false;
+var switcher_trigger_hovered: bool = false;
+/// Per-frame: OPEN rows carry a workspace identity chip (All Workspaces).
+var open_rows_show_chip: bool = false;
 
 const PaneRowDragState = struct {
     pending: bool = false,
@@ -302,11 +283,7 @@ pub fn renderPalette(state: *runtime.AppState, rect: palette.Rect) void {
         .h = rect.h,
     }, paletteColor(theme.borderMuted()));
 
-    if (state.isSidebarCollapsed()) {
-        renderPaletteCollapsedSidebar(state, rect);
-    } else {
-        renderPaletteExpandedSidebar(state, rect);
-    }
+    renderPaletteExpandedSidebar(state, rect);
 }
 
 /// Renders the context menu after workspace-local clipping has completed.
@@ -356,15 +333,12 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
         state.setSidebarHoverRevealed(reveal);
     }
 
-    updateWorkspaceDrag(state, x, y);
     updatePaneRowDrag(state, x, y);
 
-    var new_project_hover: ?usize = null;
     var new_new_thread_hover: ?usize = null;
     var new_terminal_hover: ?usize = null;
-    var new_history_hover: ?usize = null;
-    var new_workspace_settings_hover: ?usize = null;
     var new_search_hover = false;
+    var new_switcher_hover = false;
     var new_settings_hover = false;
     if (rectContainsPoint(palette_sidebar_rect, x, y)) {
         // Walk hits in reverse so later (visually-topmost) rows win when
@@ -375,21 +349,13 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
             const hit = palette_hits[index];
             if (!rectContainsPoint(hit.rect, x, y)) continue;
             switch (hit.kind) {
-                .workspace_row => {
-                    if (!state.isSidebarCollapsed() and new_project_hover == null) new_project_hover = hit.project_index;
-                },
                 .new_thread => {
-                    if (!state.isSidebarCollapsed() and new_new_thread_hover == null) new_new_thread_hover = hit.project_index;
+                    if (new_new_thread_hover == null) new_new_thread_hover = hit.project_index;
                 },
                 .new_terminal => {
-                    if (!state.isSidebarCollapsed() and new_terminal_hover == null) new_terminal_hover = hit.project_index;
+                    if (new_terminal_hover == null) new_terminal_hover = hit.project_index;
                 },
-                .history => {
-                    if (!state.isSidebarCollapsed() and new_history_hover == null) new_history_hover = hit.project_index;
-                },
-                .workspace_settings => {
-                    if (!state.isSidebarCollapsed() and new_workspace_settings_hover == null) new_workspace_settings_hover = hit.project_index;
-                },
+                .workspace_switcher => new_switcher_hover = true,
                 .command_palette => new_search_hover = true,
                 .settings => new_settings_hover = true,
                 else => {},
@@ -397,21 +363,17 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
         }
     }
 
-    const project_changed = state.sidebar_project_hover != new_project_hover;
     const new_thread_changed = state.sidebar_new_thread_hover != new_new_thread_hover;
     const terminal_changed = terminal_action_hovered != new_terminal_hover;
-    const history_changed = history_action_hovered != new_history_hover;
-    const workspace_settings_changed = workspace_settings_action_hovered != new_workspace_settings_hover;
     const search_changed = search_trigger_hovered != new_search_hover;
+    const switcher_changed = switcher_trigger_hovered != new_switcher_hover;
     const settings_changed = settings_hovered != new_settings_hover;
     terminal_action_hovered = new_terminal_hover;
-    history_action_hovered = new_history_hover;
-    workspace_settings_action_hovered = new_workspace_settings_hover;
     search_trigger_hovered = new_search_hover;
+    switcher_trigger_hovered = new_switcher_hover;
     settings_hovered = new_settings_hover;
-    if (!project_changed and !new_thread_changed and !terminal_changed and !history_changed and !workspace_settings_changed and !search_changed and !settings_changed) return;
+    if (!new_thread_changed and !terminal_changed and !search_changed and !switcher_changed and !settings_changed) return;
 
-    state.sidebar_project_hover = new_project_hover;
     state.sidebar_new_thread_hover = new_new_thread_hover;
     state.markDirty();
 }
@@ -419,7 +381,6 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
 pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: bool) bool {
     if (!down) {
         if (pane_row_drag.pending or pane_row_drag.active) return finishPaneRowDrag(state, x, y);
-        if (workspace_drag.pending or workspace_drag.active) return finishWorkspaceDrag(state, x, y);
         return rectContainsPoint(palette_sidebar_rect, x, y) or (state.sidebar_context_menu_open and rectContainsPoint(sidebar_menu_panel_rect, x, y));
     }
 
@@ -436,36 +397,20 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
         if (!rectContainsPoint(hit.rect, x, y)) continue;
 
         switch (hit.kind) {
-            .collapse => state.setSidebarCollapsed(true),
-            .expand => state.setSidebarCollapsed(false),
-            .add_workspace => state.openWorkspaceCreator(true),
+            // A hover-revealed rail is hidden: the toggle pins it open.
+            .collapse => state.toggleSidebarHidden(),
+            .workspace_switcher => state.openWorkspaceSwitcher(),
             .new_thread => {
                 if (state.project_controller.projects.items.len > 0) state.createThreadForProject(@min(hit.project_index, state.project_controller.projects.items.len - 1));
             },
             .new_terminal => {
                 if (hit.project_index < state.project_controller.projects.items.len) _ = state.openTerminalPaneForProjectIndex(hit.project_index);
             },
-            .workspace_row => {
-                startWorkspaceDrag(state, hit.project_index, x, y, true);
-            },
             .open_pane => {
                 state.focusWorkspaceOpenPaneFromSidebar(hit.project_index, @intCast(hit.thread_index));
             },
             .open_pane_reorder => {
                 startPaneRowDrag(state, hit.project_index, @intCast(hit.thread_index), x, y);
-            },
-            .workspace_avatar => {
-                startWorkspaceDrag(state, hit.project_index, x, y, false);
-            },
-            .history => {
-                if (hit.project_index < state.project_controller.projects.items.len) {
-                    state.openCommandPalette(hit.project_index);
-                }
-            },
-            .workspace_settings => {
-                if (hit.project_index < state.project_controller.projects.items.len) {
-                    state.openWorkspaceSettingsForProject(hit.project_index);
-                }
             },
             .command_palette => {
                 state.openCommandPalette(null);
@@ -519,7 +464,8 @@ pub fn handlePaletteSecondaryMouseButton(state: *runtime.AppState, x: f32, y: f3
                 state.markDirty();
                 return true;
             },
-            .workspace_row, .workspace_avatar => {
+            .workspace_switcher => {
+                if (hit.project_index >= state.project_controller.projects.items.len) return true;
                 state.workspace_header_open_menu_open = false;
                 state.sidebar_context_menu_anchor_x = x;
                 state.sidebar_context_menu_anchor_y = y;
@@ -554,22 +500,17 @@ pub fn handlePaletteSecondaryMouseButton(state: *runtime.AppState, x: f32, y: f3
 }
 
 pub fn renderFloatingDragPreview(state: *runtime.AppState) void {
-    renderWorkspaceDragOverlay(state);
     renderPaneRowDragOverlay(state);
 }
 
 pub fn hasActiveThreadDrag() bool {
-    return workspace_drag.pending or workspace_drag.active or pane_row_drag.pending or pane_row_drag.active;
+    return pane_row_drag.pending or pane_row_drag.active;
 }
 
 pub fn finishThreadDragIfMouseReleased(state: *runtime.AppState, x: f32, y: f32, buttons: sdl.MouseButtonFlags) bool {
     if (pane_row_drag.pending or pane_row_drag.active) {
         if (buttons.left != 0) return false;
         return finishPaneRowDrag(state, x, y);
-    }
-    if (workspace_drag.pending or workspace_drag.active) {
-        if (buttons.left != 0) return false;
-        return finishWorkspaceDrag(state, x, y);
     }
     return false;
 }
@@ -593,8 +534,9 @@ fn updatePaneRowDrag(state: *runtime.AppState, x: f32, y: f32) void {
     state.markDirty();
 }
 
-/// A dragged chat row over another workspace's header or rows targets that
-/// workspace. Returns true when a move target is set; reorder is then off.
+/// A dragged chat row over another workspace's OPEN rows (All Workspaces
+/// scope) targets that workspace. Returns true when a move target is set;
+/// reorder is then off. The highlight spans the target's visible rows.
 fn computePaneMoveTarget(state: *const runtime.AppState, x: f32, y: f32) bool {
     pane_drop_target_project = null;
     const source = pane_row_drag.project_index;
@@ -604,24 +546,29 @@ fn computePaneMoveTarget(state: *const runtime.AppState, x: f32, y: f32) bool {
         index -= 1;
         const hit = palette_hits[index];
         if (hit.project_index == source or !rectContainsPoint(hit.rect, x, y)) continue;
-        switch (hit.kind) {
-            .workspace_row, .workspace_avatar, .open_pane_reorder => break hit.project_index,
-            else => {},
-        }
+        if (hit.kind == .open_pane_reorder) break hit.project_index;
     } else return false;
     if (target >= state.project_controller.projects.items.len) return false;
     if (state.project_controller.projects.items[target].herdr_link != null) return false;
+    var bounds: ?palette.Rect = null;
     index = 0;
     while (index < palette_hit_count) : (index += 1) {
         const hit = palette_hits[index];
-        if (hit.project_index != target) continue;
-        if (hit.kind != .workspace_row and hit.kind != .workspace_avatar) continue;
-        pane_drop_target_rect = hit.rect;
-        pane_drop_target_project = target;
-        pane_drop_valid = false;
-        return true;
+        if (hit.project_index != target or hit.kind != .open_pane_reorder) continue;
+        bounds = if (bounds) |b| unionRects(b, hit.rect) else hit.rect;
     }
-    return false;
+    pane_drop_target_rect = bounds orelse return false;
+    pane_drop_target_project = target;
+    pane_drop_valid = false;
+    return true;
+}
+
+fn unionRects(a: palette.Rect, b: palette.Rect) palette.Rect {
+    const x0 = @min(a.x, b.x);
+    const y0 = @min(a.y, b.y);
+    const x1 = @max(a.x + a.w, b.x + b.w);
+    const y1 = @max(a.y + a.h, b.y + b.h);
+    return .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
 }
 
 /// Finds the insertion slot among the visible rows of the dragged pane's
@@ -686,145 +633,6 @@ fn finishPaneRowDrag(state: *runtime.AppState, x: f32, y: f32) bool {
     pane_drop_valid = false;
     state.markDirty();
     return true;
-}
-
-fn updateWorkspaceDrag(state: *runtime.AppState, x: f32, y: f32) void {
-    if (!workspace_drag.pending and !workspace_drag.active) return;
-    workspace_drag.x = x;
-    workspace_drag.y = y;
-    if (workspace_drag.pending) {
-        const dx = x - workspace_drag.start_x;
-        const dy = y - workspace_drag.start_y;
-        const threshold = theme.scaledUi(THREAD_DRAG_THRESHOLD_CSS);
-        if (dx * dx + dy * dy >= threshold * threshold) {
-            workspace_drag.pending = false;
-            workspace_drag.active = true;
-        }
-    }
-    if (workspace_drag.active) computeWorkspaceDropTarget(y);
-    state.markDirty();
-}
-
-/// Scans the retained workspace-row hit rects (in project order) to find where
-/// a drop at vertical position `y` should insert.
-fn computeWorkspaceDropTarget(y: f32) void {
-    workspace_drop_valid = false;
-    var index: usize = 0;
-    while (index < palette_hit_count) : (index += 1) {
-        const hit = palette_hits[index];
-        if (hit.kind != .workspace_row and hit.kind != .workspace_avatar) continue;
-        const r = hit.rect;
-        if (y < r.y) {
-            workspace_drop_before = hit.project_index;
-            workspace_drop_line_y = r.y;
-            workspace_drop_valid = true;
-            return;
-        }
-        if (y <= r.y + r.h) {
-            if (y < r.y + r.h * 0.5) {
-                workspace_drop_before = hit.project_index;
-                workspace_drop_line_y = r.y;
-            } else {
-                workspace_drop_before = hit.project_index + 1;
-                workspace_drop_line_y = r.y + r.h;
-            }
-            workspace_drop_valid = true;
-            return;
-        }
-        // Cursor is below this row; remember it as the running candidate so a
-        // drop past the last row lands at the end.
-        workspace_drop_before = hit.project_index + 1;
-        workspace_drop_line_y = r.y + r.h;
-        workspace_drop_valid = true;
-    }
-}
-
-fn startWorkspaceDrag(state: *runtime.AppState, project_index: usize, x: f32, y: f32, toggle_project_on_click: bool) void {
-    if (project_index >= state.project_controller.projects.items.len) return;
-    // Begin a pending drag; release without movement is treated as the normal
-    // click behavior for that control, while movement past the threshold
-    // promotes to a workspace reorder drag.
-    workspace_drop_valid = false;
-    workspace_drag = .{
-        .pending = true,
-        .project_index = project_index,
-        .toggle_project_on_click = toggle_project_on_click,
-        .start_x = x,
-        .start_y = y,
-        .x = x,
-        .y = y,
-    };
-    _ = sdl.captureMouse(true);
-}
-
-fn finishWorkspaceDrag(state: *runtime.AppState, x: f32, y: f32) bool {
-    _ = x;
-    _ = y;
-    const drag = workspace_drag;
-    workspace_drag = .{};
-    _ = sdl.captureMouse(false);
-
-    if (!drag.active) {
-        // No meaningful movement — treat as a plain click on the row. First
-        // click selects the workspace (which auto-expands its subtree in the
-        // expanded rail); only a click on the already-selected row toggles the
-        // manual collapse flag, so selecting never immediately re-hides panes.
-        if (drag.project_index < state.project_controller.projects.items.len) {
-            state.noteInteraction();
-            const was_selected = state.project_controller.selected_index == drag.project_index;
-            _ = state.selectProjectAtIndex(drag.project_index);
-            if (drag.toggle_project_on_click and was_selected) {
-                state.project_controller.projects.items[drag.project_index].collapsed = !state.project_controller.projects.items[drag.project_index].collapsed;
-            }
-            state.requestTranscriptScrollToBottom();
-            state.markDirty();
-        }
-        workspace_drop_valid = false;
-        return true;
-    }
-
-    if (workspace_drop_valid) state.moveProject(drag.project_index, workspace_drop_before);
-    workspace_drop_valid = false;
-    state.markDirty();
-    return true;
-}
-
-fn renderWorkspaceDragOverlay(state: *runtime.AppState) void {
-    if (!workspace_drag.active) return;
-    if (workspace_drag.project_index >= state.project_controller.projects.items.len) return;
-
-    const previous_z = state.palette_overlay_batch.setZIndex(THREAD_DRAG_FLOATING_Z);
-    defer state.palette_overlay_batch.restoreZIndex(previous_z);
-
-    if (workspace_drop_valid) {
-        const line_h = theme.scaledUi(2.0);
-        const inset = theme.scaledUi(25.0);
-        queuePaletteRoundedRect(state, .{
-            .x = palette_sidebar_rect.x + inset,
-            .y = workspace_drop_line_y - line_h * 0.5,
-            .w = palette_sidebar_rect.w - inset * 2.0,
-            .h = line_h,
-        }, paletteColor(theme.COLOR_GREEN), line_h * 0.5);
-    }
-
-    const project = &state.project_controller.projects.items[workspace_drag.project_index];
-    const w = theme.scaledUi(200.0);
-    const h = theme.scaledUi(30.0);
-    const rect: palette.Rect = .{
-        .x = workspace_drag.x + theme.scaledUi(12.0),
-        .y = workspace_drag.y + theme.scaledUi(8.0),
-        .w = w,
-        .h = h,
-    };
-    queuePaletteRoundedRect(state, rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 232)), theme.scaledUi(8.0));
-    queuePaletteBorder(state, rect, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 180)), theme.scaledUi(8.0), theme.scaledUi(1.0));
-    const font = theme.scaledUi(13.5);
-    queuePaletteText(state, .{
-        .x = rect.x + theme.scaledUi(12.0),
-        .y = rect.y + (rect.h - font * 1.25) * 0.5,
-        .w = rect.w - theme.scaledUi(20.0),
-        .h = font * 1.25,
-    }, project.label, paletteColor(theme.COLOR_WHITE), font, rect);
 }
 
 // Renders the pane-row insertion marker and floating drag preview.
@@ -1125,25 +933,27 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
     const pad_x = theme.scaledUi(SIDEBAR_PAD_X_CSS);
     const rail_w = @max(rect.w - pad_x * 2.0, theme.scaledUi(140.0));
     const x = rect.x + pad_x;
+    const projects = state.project_controller.projects.items;
+    const selected_index = state.project_controller.selected_index;
+    const has_selected = selected_index < projects.len;
+    // Feed switcher recency: the selected workspace is the one in use.
+    if (has_selected) workspace_identity.noteUsed(projects[selected_index].id, unixTimestampMs());
+    const all_scope = state.sidebar_all_workspaces or !has_selected;
+    open_rows_show_chip = all_scope;
 
-    // Single pinned header row (logo mark + right-aligned add/collapse
-    // controls); the old wordmark + "WORKSPACES" band spent ~130px of rail
-    // height on labels the list itself already communicates. The header is
-    // rendered AFTER the list (with a background strip first) so any list rows
-    // scrolled into the header band are visually overwritten — no z-index
-    // plumbing required.
+    // Pinned chrome, top to bottom: header (logo + toggle), workspace
+    // switcher trigger, search pill with new chat / new terminal buttons.
+    // Chrome paints AFTER the list (over a panel strip) so rows scrolled into
+    // the band are covered — no z-index plumbing required.
     const header_top = rect.y + theme.scaledUi(14.0);
     const header_h = theme.scaledUi(32.0);
-    // Command-palette trigger pill sits pinned between the header row and the
-    // scrolling list, so the palette — now the only route to saved threads —
-    // keeps a visible entry point.
+    const switcher_h = theme.scaledUi(34.0);
+    const switcher_top = header_top + header_h + theme.scaledUi(8.0);
     const search_h = theme.scaledUi(30.0);
-    const search_top = header_top + header_h + theme.scaledUi(10.0);
+    const search_top = switcher_top + switcher_h + theme.scaledUi(6.0);
     const list_top = search_top + search_h + theme.scaledUi(12.0);
-    // Reserve a band at the bottom of the rail for sticky chrome. Clipping the
-    // workspace tree short here also caps `sidebar_max_scroll_y` (computed
-    // below from `workspace_clip`), so the tree scrolls to rest above the
-    // footer instead of running off the bottom edge.
+    // Reserve a band at the bottom of the rail for the sticky footer; the list
+    // clip stops here so `sidebar_max_scroll_y` rests above it.
     const footer_reserve = theme.scaledUi(SIDEBAR_FOOTER_RESERVE_CSS);
     const list_bottom = @max(rect.y + rect.h - footer_reserve, list_top);
     const available_list_h = @max(list_bottom - list_top, 0.0);
@@ -1160,159 +970,61 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
         .h = easedAttentionViewportH(cluster_layout.viewport_h, motion_t),
     };
 
-    const workspace_top = list_top + cluster_layout.viewport_h;
-    const workspace_clip: palette.Rect = .{
+    // OPEN section: the scoped workspace's panes, or every open workspace's
+    // panes under All Workspaces. No workspace folder rows.
+    const open_top = list_top + cluster_layout.viewport_h;
+    const open_clip: palette.Rect = .{
         .x = rect.x,
-        .y = workspace_top,
+        .y = open_top,
         .w = rect.w,
-        .h = @max(list_bottom - workspace_top, 0.0),
+        .h = @max(list_bottom - open_top, 0.0),
     };
-    const focused_project_index = state.project_controller.selected_index;
-    const focused_pane_id = if (focused_project_index < state.project_controller.projects.items.len)
-        state.project_controller.projects.items[focused_project_index].workspace_layout.focused_pane_id
-    else
-        null;
-    const focus_changed = sidebar_revealed_project_index != focused_project_index or
-        sidebar_revealed_pane_id != focused_pane_id or sidebar_revealed_view_h != workspace_clip.h;
-    var content_y = workspace_top;
+    const caption_h = theme.scaledUi(SIDEBAR_ACTIVE_LABEL_H_CSS);
+    const focused_pane_id = if (has_selected) projects[selected_index].workspace_layout.focused_pane_id else null;
+    const focus_changed = sidebar_revealed_project_index != selected_index or
+        sidebar_revealed_pane_id != focused_pane_id or sidebar_revealed_view_h != open_clip.h;
+    var content_y = open_top + caption_h;
     var focused_row: ?palette.Rect = null;
-    for (state.project_controller.projects.items, 0..) |*project, index| {
-        content_y += theme.scaledUi(34.0);
-        if (index == focused_project_index and !project.collapsed) {
-            const measured = measureSidebarPaneRows(&project.workspace_layout, focused_pane_id);
+    for (projects, 0..) |*project, index| {
+        if (!all_scope and index != selected_index) continue;
+        const measured = measureSidebarPaneRows(&project.workspace_layout, if (index == selected_index) focused_pane_id else null);
+        if (index == selected_index) {
             if (measured.focused_top) |top| {
                 focused_row = .{ .x = 0.0, .y = content_y + top, .w = 0.0, .h = measured.focused_h };
             }
-            content_y += measured.height;
         }
-        content_y += theme.scaledUi(8.0);
+        if (project.workspace_layout.panes.items.len > 0) content_y += measured.height;
     }
-    sidebar_max_scroll_y = @max(0.0, content_y - (workspace_clip.y + workspace_clip.h) + theme.scaledUi(8.0));
+    sidebar_max_scroll_y = @max(0.0, content_y - (open_clip.y + open_clip.h) + theme.scaledUi(8.0));
     sidebar_scroll_y = theme.clampf(sidebar_scroll_y, 0.0, sidebar_max_scroll_y);
     if (focus_changed) {
         if (focused_row) |row| {
-            sidebar_scroll_y = revealSidebarRow(sidebar_scroll_y, row.y, row.h, workspace_clip, sidebar_max_scroll_y);
+            sidebar_scroll_y = revealSidebarRow(sidebar_scroll_y, row.y, row.h, open_clip, sidebar_max_scroll_y);
         }
-        sidebar_revealed_project_index = focused_project_index;
+        sidebar_revealed_project_index = selected_index;
         sidebar_revealed_pane_id = focused_pane_id;
-        sidebar_revealed_view_h = workspace_clip.h;
-    }
-    var y = workspace_top - sidebar_scroll_y;
-
-    var project_index: usize = 0;
-    while (project_index < state.project_controller.projects.items.len) : (project_index += 1) {
-        const project = &state.project_controller.projects.items[project_index];
-        const selected = state.project_controller.selected_index == project_index;
-        // Only the selected workspace expands. Other workspaces stay one
-        // header row tall — their live panes surface through the cluster
-        // above — so the tree never buries the active workspace under idle
-        // pane lists and rail height keeps tracking activity.
-        const effective_collapsed = project.collapsed or !selected;
-        const row_h = theme.scaledUi(30.0);
-        const group_top = y;
-        // Full-width row: the hover zone covers the trailing action cluster so
-        // moving onto the hover-revealed icons doesn't clear the row hover.
-        const row_rect: palette.Rect = .{ .x = x, .y = y, .w = rail_w, .h = row_h };
-        const project_visible = rowVisible(row_rect, workspace_clip);
-        const project_hovered = state.sidebar_project_hover == project_index;
-        var workspace_shortcut_buf: [16]u8 = undefined;
-        const workspace_shortcut = if (state.alt_shortcut_hints_visible)
-            if (state.command_controller.keyboard_config) |config|
-                keybinds.formatAltKeyTipAt(&workspace_shortcut_buf, config.workspace_select, project_index)
-            else
-                ""
-        else
-            "";
-        if (project_visible) {
-            if (project_hovered and !selected) {
-                queuePaletteRoundedRect(state, snapRect(row_rect), paletteColor(theme.wash(theme.COLOR_GREEN, 48)), theme.scaledUi(6.0));
-            }
-            addClippedPaletteHit(row_rect, workspace_clip, .workspace_row, project_index, 0);
-        }
-
-        const cy = y + row_h * 0.5;
-        var tx = x + theme.scaledUi(6.0);
-        const chevron_color: [4]f32 = if (selected or project_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE;
-        if (project_visible) queuePaletteChevron(state, tx, cy, chevron_color, effective_collapsed);
-        // Chevron renders into a ~14px wide cell — leave room before the
-        // folder icon so the arrow doesn't crowd the project title.
-        tx += theme.scaledUi(18.0);
-        if (project_visible) queuePaletteFolderIcon(state, tx, cy, theme.scaledUi(14.0), theme.scaledUi(10.0), if (selected) theme.COLOR_GREEN else if (project_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE, selected);
-        tx += theme.scaledUi(20.0);
-
-        // Trailing action cluster (new chat, new terminal, history, workspace
-        // settings) renders only on hover/selection to keep quiet rows quiet,
-        // but its width is always reserved so the workspace label never
-        // reflows on hover.
-        const action_w = theme.scaledUi(30.0);
-        const action_gap = theme.scaledUi(2.0);
-        const action_cluster_w = action_w * 4.0 + action_gap * 3.0;
-        const show_actions = workspace_shortcut.len == 0 and (selected or project_hovered);
-        const content_right = if (workspace_shortcut.len > 0)
-            row_rect.x + row_rect.w - theme.scaledUi(32.0)
-        else
-            row_rect.x + row_rect.w - action_cluster_w - theme.scaledUi(6.0);
-        const badge_label = herdrRuntimeBadgeLabel(project);
-        const badge_w = theme.scaledUi(SIDEBAR_HERDR_BADGE_W_CSS);
-        const badge_gap = theme.scaledUi(6.0);
-        const label_right = if (badge_label != null) content_right - badge_w - badge_gap else content_right;
-        if (project_visible) queuePaletteText(state, .{ .x = tx, .y = y + theme.scaledUi(5.0), .w = @max(label_right - tx, theme.scaledUi(24.0)), .h = row_h }, project.label, paletteColor(if (selected or project_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), theme.scaledUi(15.0), row_rect);
-        if (project_visible) {
-            if (badge_label) |label| {
-                renderHerdrRuntimeBadge(state, .{ .x = content_right - badge_w, .y = y + theme.scaledUi(6.0), .w = badge_w, .h = row_h - theme.scaledUi(12.0) }, label, selected or project_hovered, row_rect);
-            }
-            if (workspace_shortcut.len > 0) renderSidebarShortcutKeyTip(state, row_rect, workspace_clip, workspace_shortcut);
-        }
-        if (project_visible and show_actions) {
-            const action_x = row_rect.x + row_rect.w - action_cluster_w;
-            const new_rect: palette.Rect = .{ .x = action_x, .y = y, .w = action_w, .h = row_h };
-            const terminal_rect: palette.Rect = .{ .x = action_x + action_w + action_gap, .y = y, .w = action_w, .h = row_h };
-            const history_rect: palette.Rect = .{ .x = action_x + (action_w + action_gap) * 2.0, .y = y, .w = action_w, .h = row_h };
-            renderPaletteSidebarActionIcon(state, new_rect, NF_COD_EDIT, state.sidebar_new_thread_hover == project_index, workspace_clip);
-            addClippedPaletteHit(new_rect, workspace_clip, .new_thread, project_index, 0);
-            renderPaletteSidebarActionIcon(state, terminal_rect, NF_COD_TERMINAL, terminal_action_hovered == project_index, workspace_clip);
-            addClippedPaletteHit(terminal_rect, workspace_clip, .new_terminal, project_index, 0);
-            renderPaletteSidebarActionIcon(state, history_rect, NF_COD_HISTORY, history_action_hovered == project_index, workspace_clip);
-            addClippedPaletteHit(history_rect, workspace_clip, .history, project_index, 0);
-            const workspace_settings_rect: palette.Rect = .{ .x = action_x + (action_w + action_gap) * 3.0, .y = y, .w = action_w, .h = row_h };
-            renderPaletteSidebarActionIcon(state, workspace_settings_rect, NF_COD_GEAR, workspace_settings_action_hovered == project_index, workspace_clip);
-            addClippedPaletteHit(workspace_settings_rect, workspace_clip, .workspace_settings, project_index, 0);
-        }
-        y += row_h + theme.scaledUi(4.0);
-
-        if (!effective_collapsed) {
-            y = renderOpenPanesSection(state, project_index, project, x, rail_w, workspace_clip, workspace_clip, y);
-        }
-
-        // 3px accent bar spanning the active workspace group — mirrors the
-        // collapsed rail's selected-chip bar so both rails share one selection
-        // cue. Clamped to the workspace band so it never bleeds into the
-        // pinned ACTIVE/header/footer strips while scrolled.
-        if (selected) {
-            const bar_top = @max(group_top + theme.scaledUi(4.0), workspace_clip.y);
-            const bar_bottom = @min(y - theme.scaledUi(4.0), workspace_clip.y + workspace_clip.h);
-            if (bar_bottom - bar_top > theme.scaledUi(4.0)) {
-                queuePaletteRoundedRect(state, .{
-                    .x = rect.x + theme.scaledUi(2.0),
-                    .y = bar_top,
-                    .w = theme.scaledUi(3.0),
-                    .h = bar_bottom - bar_top,
-                }, paletteColor(theme.COLOR_GREEN), theme.scaledUi(1.5));
-            }
-        }
-        y += theme.scaledUi(8.0);
+        sidebar_revealed_view_h = open_clip.h;
     }
 
-    // Scrollbar must clip to the workspace tree so the thumb never extends
-    // behind the pinned ACTIVE cluster or header strip drawn below.
-    sidebar_max_scroll_y = @max(0.0, y + sidebar_scroll_y - (workspace_clip.y + workspace_clip.h) + theme.scaledUi(8.0));
+    var y = open_top - sidebar_scroll_y;
+    queuePaletteText(state, .{ .x = x, .y = y, .w = rail_w, .h = theme.scaledUi(18.0) }, "OPEN", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), open_clip);
+    y += caption_h;
+    const rows_top = y;
+    for (projects, 0..) |*project, index| {
+        if (!all_scope and index != selected_index) continue;
+        y = renderOpenPanesSection(state, index, project, x, rail_w, open_clip, open_clip, y);
+    }
+    if (y == rows_top) {
+        queuePaletteText(state, .{ .x = x + theme.scaledUi(4.0), .y = y + theme.scaledUi(4.0), .w = rail_w, .h = theme.scaledUi(18.0) }, "No open panes", paletteColor(theme.withAlpha(theme.COLOR_TEXT_SUBTLE, 190)), theme.scaledUi(12.5), open_clip);
+    }
+
+    // Scrollbar clips to the OPEN band so the thumb never extends behind the
+    // pinned ACTIVE cluster or chrome drawn below.
+    sidebar_max_scroll_y = @max(0.0, y + sidebar_scroll_y - (open_clip.y + open_clip.h) + theme.scaledUi(8.0));
     sidebar_scroll_y = theme.clampf(sidebar_scroll_y, 0.0, sidebar_max_scroll_y);
-    renderSidebarOverflowScrollbar(state, workspace_clip, sidebar_scroll_y, sidebar_max_scroll_y);
+    renderSidebarOverflowScrollbar(state, open_clip, sidebar_scroll_y, sidebar_max_scroll_y);
 
-    // Pinned footer band — painted after the list so any row scrolled into the
-    // reserved band is covered by the panel-colored strip. A divider marks the
-    // top edge so the boundary is visible; sticky chrome (settings, etc.) lands
-    // here later.
+    // Pinned footer band with the global settings gear.
     if (list_bottom < rect.y + rect.h) {
         const footer_rect: palette.Rect = .{
             .x = rect.x,
@@ -1320,8 +1032,6 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
             .w = rect.w - theme.scaledUi(1.0),
             .h = rect.y + rect.h - list_bottom,
         };
-        // Blend with the sidebar (COLOR_PANEL) so the band reads as part of the
-        // rail, with just a hairline divider separating it from the list.
         queuePaletteRect(state, footer_rect, paletteColor(theme.COLOR_PANEL));
         queuePaletteRect(state, .{
             .x = rect.x,
@@ -1340,8 +1050,8 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
         renderPaletteSettingsButton(state, btn_rect, footer_rect);
     }
 
-    // Pin ACTIVE after the workspace tree so any tree row that scrolled into
-    // the cluster band is covered — same overwrite trick as the header strip.
+    // Pin ACTIVE after the OPEN list so any row scrolled into the cluster
+    // band is covered.
     if (attention_clip.h > 0.0) {
         queuePaletteRect(state, .{
             .x = attention_clip.x,
@@ -1353,22 +1063,83 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
     }
     pruneActiveRowSlots();
 
-    // Pinned header — painted last so any scrolled rows in the header band
-    // are covered by the panel-colored strip before the chrome paints on top.
-    // A single compact row: logo mark, then add-workspace and collapse
-    // controls right-aligned.
+    // Pinned chrome, painted last.
     queuePaletteRect(state, .{ .x = rect.x, .y = rect.y, .w = rect.w - theme.scaledUi(1.0), .h = list_top - rect.y }, paletteColor(theme.COLOR_PANEL));
     const logo = theme.scaledUi(28.0);
     queuePaletteLogoMark(state, .{ .x = x, .y = header_top + (header_h - logo) * 0.5, .w = logo, .h = logo });
-
     const btn_w = theme.scaledUi(28.0);
     const toggle_rect: palette.Rect = .{ .x = rect.x + rect.w - pad_x - btn_w, .y = header_top + (header_h - btn_w) * 0.5, .w = btn_w, .h = btn_w };
-    renderPaletteSidebarToggle(state, toggle_rect, true);
-    const add_rect: palette.Rect = .{ .x = toggle_rect.x - btn_w - theme.scaledUi(4.0), .y = toggle_rect.y, .w = btn_w, .h = btn_w };
-    renderPaletteSidebarActionIcon(state, add_rect, NF_COD_ADD, null, rect);
-    addPaletteHit(add_rect, .add_workspace, 0, 0);
+    renderPaletteSidebarToggle(state, toggle_rect, !state.isSidebarHidden());
 
-    renderPaletteSearchTrigger(state, .{ .x = x, .y = search_top, .w = rail_w, .h = search_h });
+    renderWorkspaceSwitcherTrigger(state, .{ .x = x, .y = switcher_top, .w = rail_w, .h = switcher_h }, if (all_scope) null else selected_index);
+
+    // Search pill + new chat / new terminal. Under All Workspaces they target
+    // the selected (= most recently used) workspace.
+    const action_w = theme.scaledUi(30.0);
+    const action_gap = theme.scaledUi(2.0);
+    const actions_w = if (has_selected) action_w * 2.0 + action_gap + theme.scaledUi(6.0) else 0.0;
+    renderPaletteSearchTrigger(state, .{ .x = x, .y = search_top, .w = rail_w - actions_w, .h = search_h });
+    if (has_selected) {
+        const new_rect: palette.Rect = .{ .x = x + rail_w - action_w * 2.0 - action_gap, .y = search_top, .w = action_w, .h = search_h };
+        const terminal_rect: palette.Rect = .{ .x = x + rail_w - action_w, .y = search_top, .w = action_w, .h = search_h };
+        renderPaletteSidebarActionIcon(state, new_rect, NF_COD_EDIT, state.sidebar_new_thread_hover == selected_index, rect);
+        addPaletteHit(new_rect, .new_thread, selected_index, 0);
+        renderPaletteSidebarActionIcon(state, terminal_rect, NF_COD_TERMINAL, terminal_action_hovered == selected_index, rect);
+        addPaletteHit(terminal_rect, .new_terminal, selected_index, 0);
+    }
+}
+
+/// Workspace switcher trigger: scope chip, scope label, Herdr badge, chevron.
+/// `scope == null` is All Workspaces. Click opens the switcher popover;
+/// right-click opens the selected workspace's context menu.
+fn renderWorkspaceSwitcherTrigger(state: *runtime.AppState, rect: palette.Rect, scope: ?usize) void {
+    workspace_switcher_anchor = rect;
+    const open = state.command_controller.open and state.command_controller.mode == .workspaces;
+    const hovered = switcher_trigger_hovered or open;
+    const radius = theme.scaledUi(7.0);
+    queuePaletteRoundedRect(state, snapRect(rect), paletteColor(if (hovered) theme.wash(theme.COLOR_GREEN, 48) else theme.withAlpha(theme.COLOR_PANEL_ALT, 120)), radius);
+    queuePaletteBorder(state, snapRect(rect), paletteColor(theme.borderMuted()), radius, theme.scaledUi(1.0));
+    addPaletteHit(rect, .workspace_switcher, state.project_controller.selected_index, 0);
+
+    const projects = state.project_controller.projects.items;
+    const chip = theme.scaledUi(22.0);
+    const cy = rect.y + rect.h * 0.5;
+    const chip_rect: palette.Rect = .{ .x = rect.x + theme.scaledUi(6.0), .y = cy - chip * 0.5, .w = chip, .h = chip };
+    const project: ?*const native_state.Project = if (scope) |pi| (if (pi < projects.len) &projects[pi] else null) else null;
+    queueWorkspaceChip(state, chip_rect, if (project) |p| p.id else null, false, rect);
+
+    const chevron_x = rect.x + rect.w - theme.scaledUi(18.0);
+    var label_right = chevron_x - theme.scaledUi(6.0);
+    if (project) |p| {
+        if (herdrRuntimeBadgeLabel(p)) |badge| {
+            const badge_w = theme.scaledUi(SIDEBAR_HERDR_BADGE_W_CSS);
+            label_right -= badge_w;
+            renderHerdrRuntimeBadge(state, .{ .x = label_right, .y = rect.y + theme.scaledUi(8.0), .w = badge_w, .h = rect.h - theme.scaledUi(16.0) }, badge, hovered, rect);
+            label_right -= theme.scaledUi(6.0);
+        }
+    }
+    var shortcut_buf: [16]u8 = undefined;
+    const shortcut = if (state.alt_shortcut_hints_visible)
+        if (state.command_controller.keyboard_config) |config|
+            keybinds.formatAltKeyTipAt(&shortcut_buf, config.workspace_show_all, 0)
+        else
+            ""
+    else
+        "";
+    const label = if (project) |p| p.label else "All Workspaces";
+    const label_x = chip_rect.x + chip + theme.scaledUi(10.0);
+    const font = theme.scaledUi(14.0);
+    queuePaletteText(state, .{
+        .x = label_x,
+        .y = @round(cy - font * 0.65),
+        .w = @max(label_right - label_x, theme.scaledUi(24.0)),
+        .h = font * 1.3,
+    }, label, paletteColor(if (hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), font, rect);
+    if (shortcut.len > 0) {
+        renderSidebarShortcutKeyTip(state, rect, rect, shortcut);
+    } else {
+        queuePaletteChevron(state, chevron_x, cy, if (hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE, false);
+    }
 }
 
 const SidebarPaneRowsMeasurement = struct {
@@ -1594,6 +1365,8 @@ fn renderAttentionClusterSection(
 fn collectAttentionClusterRows(state: *runtime.AppState, rows: []AttentionClusterRow) usize {
     var row_count: usize = 0;
     for (state.project_controller.projects.items, 0..) |*project, project_index| {
+        // Single-workspace scope lists only that workspace's panes.
+        if (!state.sidebar_all_workspaces and project_index != state.project_controller.selected_index) continue;
         for (project.workspace_layout.panes.items) |*pane| {
             if (!paneNeedsAttention(state, project_index, project, pane)) continue;
             var duplicate = false;
@@ -1766,130 +1539,6 @@ fn renderHerdrRuntimeBadge(state: *runtime.AppState, rect: palette.Rect, label: 
     }, label, paletteColor(if (emphasized) theme.background() else theme.COLOR_TEXT_MUTED), theme.scaledUi(9.0), clip);
 }
 
-fn renderPaletteCollapsedSidebar(state: *runtime.AppState, rect: palette.Rect) void {
-    const button = theme.scaledUi(36.0);
-    const x = rect.x + (rect.w - button) * 0.5;
-    var y = rect.y + theme.scaledUi(30.0);
-    queuePaletteLogoMark(state, .{ .x = x + theme.scaledUi(2.0), .y = y, .w = theme.scaledUi(32.0), .h = theme.scaledUi(32.0) });
-    y += theme.scaledUi(58.0);
-    const expand_rect: palette.Rect = .{ .x = x, .y = y, .w = button, .h = theme.scaledUi(30.0) };
-    renderPaletteSidebarToggle(state, expand_rect, false);
-    y += theme.scaledUi(38.0);
-    const add_top_rect: palette.Rect = .{ .x = x, .y = y, .w = button, .h = theme.scaledUi(30.0) };
-    renderPaletteSidebarActionIcon(state, add_top_rect, NF_COD_ADD, null, rect);
-    addPaletteHit(add_top_rect, .add_workspace, 0, 0);
-    y += theme.scaledUi(34.0);
-    const new_rect: palette.Rect = .{ .x = x, .y = y, .w = button, .h = theme.scaledUi(30.0) };
-    renderPaletteSidebarActionIcon(state, new_rect, NF_COD_EDIT, null, rect);
-    addPaletteHit(new_rect, .new_thread, state.project_controller.selected_index, 0);
-    y += theme.scaledUi(34.0);
-    const terminal_rect: palette.Rect = .{ .x = x, .y = y, .w = button, .h = theme.scaledUi(30.0) };
-    renderPaletteSidebarActionIcon(state, terminal_rect, NF_COD_TERMINAL, null, rect);
-    addPaletteHit(terminal_rect, .new_terminal, state.project_controller.selected_index, 0);
-    y += theme.scaledUi(34.0);
-    // Palette trigger parity with the expanded rail's search pill, so the
-    // collapsed rail keeps a visible route to search/history too.
-    const search_rect: palette.Rect = .{ .x = x, .y = y, .w = button, .h = theme.scaledUi(30.0) };
-    renderPaletteSidebarActionIcon(state, search_rect, NF_COD_SEARCH, null, rect);
-    addPaletteHit(search_rect, .command_palette, 0, 0);
-    y += theme.scaledUi(34.0);
-
-    // Hairline divider, then a vertical "activity dock" of workspace avatars so
-    // the narrow rail shows every workspace, which one is active, and whether
-    // any of its panes need attention — instead of being a dead button strip.
-    queuePaletteRect(state, .{ .x = x + theme.scaledUi(6.0), .y = y, .w = button - theme.scaledUi(12.0), .h = theme.scaledUi(1.0) }, paletteColor(theme.borderMuted()));
-    y += theme.scaledUi(12.0);
-
-    const avatar = theme.scaledUi(36.0);
-    const dock_bottom = rect.y + rect.h - theme.scaledUi(48.0);
-    var project_index: usize = 0;
-    while (project_index < state.project_controller.projects.items.len) : (project_index += 1) {
-        if (y + avatar > dock_bottom) break; // keep the rail tidy; expand to see the rest
-        const project = &state.project_controller.projects.items[project_index];
-        const selected = state.project_controller.selected_index == project_index;
-        const avatar_rect: palette.Rect = .{ .x = x, .y = y, .w = avatar, .h = avatar };
-        const hovered = state.transcript_controller.palette_mouse_in_workspace and rectContainsPoint(avatar_rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
-
-        // The active workspace reads as a bold filled chip in the theme accent —
-        // mirroring (and amplifying) the green filled folder of the expanded
-        // view's selected row — with a left accent bar for an unmistakable cue.
-        const bg = if (selected)
-            paletteColor(theme.COLOR_GREEN)
-        else if (hovered)
-            paletteColor(theme.wash(theme.COLOR_GREEN, 56))
-        else
-            paletteColor(theme.COLOR_PANEL_ALT);
-        queuePaletteRoundedRect(state, avatar_rect, bg, theme.scaledUi(9.0));
-        if (selected) {
-            const bar_h = avatar * 0.55;
-            queuePaletteRoundedRect(state, .{
-                .x = rect.x + theme.scaledUi(2.0),
-                .y = avatar_rect.y + (avatar - bar_h) * 0.5,
-                .w = theme.scaledUi(3.0),
-                .h = bar_h,
-            }, paletteColor(theme.COLOR_GREEN), theme.scaledUi(1.5));
-        }
-
-        var workspace_shortcut_buf: [16]u8 = undefined;
-        const workspace_shortcut = if (state.alt_shortcut_hints_visible)
-            if (state.command_controller.keyboard_config) |config|
-                keybinds.formatAltKeyTipAt(&workspace_shortcut_buf, config.workspace_select, project_index)
-            else
-                ""
-        else
-            "";
-
-        // Workspace initial as the avatar mark. queuePaletteText is left-aligned,
-        // so center it manually (single glyph ~= font * 0.6 wide). On the filled
-        // active chip the initial reverses out to the dark panel color.
-        var letter_buf: [1]u8 = undefined;
-        const letter = workspaceInitial(&letter_buf, project.label);
-        const letter_font = theme.scaledUi(15.0);
-        const letter_w = letter_font * 0.6;
-        const letter_color = if (selected)
-            theme.background()
-        else if (hovered)
-            theme.COLOR_WHITE
-        else
-            theme.COLOR_TEXT_MUTED;
-        if (workspace_shortcut.len > 0) {
-            renderSidebarShortcutKeyTip(state, avatar_rect, rect, workspace_shortcut);
-        } else {
-            queuePaletteText(state, .{
-                .x = @round(avatar_rect.x + (avatar - letter_w) * 0.5),
-                .y = @round(avatar_rect.y + (avatar - letter_font * 1.25) * 0.5),
-                .w = letter_w + theme.scaledUi(3.0),
-                .h = letter_font * 1.25,
-            }, letter, paletteColor(letter_color), letter_font, null);
-        }
-
-        // Attention badge tucked into the top-right corner, kept fully inside the
-        // narrow rail so it doesn't clip against the panel edge.
-        if (workspace_shortcut.len == 0) if (workspaceStatusColor(state, project_index)) |badge| {
-            const pulse = attentionPulse(state, project_index);
-            const badge_d = theme.scaledUi(8.0);
-            queuePaletteRoundedRect(state, .{
-                .x = avatar_rect.x + avatar - badge_d - theme.scaledUi(2.0),
-                .y = avatar_rect.y + theme.scaledUi(2.0),
-                .w = badge_d,
-                .h = badge_d,
-            }, paletteColor(theme.withAlpha(badge, @intFromFloat(pulse * 255.0))), badge_d * 0.5);
-        };
-
-        addPaletteHit(avatar_rect, .workspace_avatar, project_index, 0);
-        y += avatar + theme.scaledUi(5.0);
-
-        // Composition dots: one per open pane. The selected
-        // pane uses the active color; status colors temporarily take over when
-        // a pane has live work or needs attention.
-        renderCollapsedCompositionDots(state, project_index, project, avatar_rect.x + avatar * 0.5, y);
-        y += theme.scaledUi(11.0);
-    }
-
-    const settings_rect: palette.Rect = .{ .x = x, .y = rect.y + rect.h - theme.scaledUi(42.0), .w = button, .h = theme.scaledUi(30.0) };
-    renderPaletteSettingsButton(state, settings_rect, rect);
-}
-
 /// Renders the sidebar collapse/expand toggle used by both rails: a modern
 /// panel-left codicon (filled while expanded, hollow while collapsed) with the
 /// same hover treatment as the settings button, replacing the old "<"/">" text.
@@ -1907,7 +1556,7 @@ fn renderPaletteSidebarToggle(state: *runtime.AppState, rect: palette.Rect, expa
         .w = icon_font,
         .h = icon_font,
     }, glyph, icon_font, paletteColor(fg), null);
-    addPaletteHit(rect, if (expanded) .collapse else .expand, 0, 0);
+    addPaletteHit(rect, .collapse, 0, 0);
 }
 
 /// Renders add/edit actions with the same themed geometry as the sidebar toggle.
@@ -1943,17 +1592,6 @@ fn renderPaletteSettingsButton(state: *runtime.AppState, rect: palette.Rect, cli
     addPaletteHit(rect, .settings, 0, 0);
 }
 
-/// Writes the uppercase first letter of a workspace label into `buf` for use as
-/// a collapsed-rail avatar mark, returning the rendered slice.
-fn workspaceInitial(buf: *[1]u8, label: []const u8) []const u8 {
-    if (label.len == 0) return "?";
-    buf[0] = switch (label[0]) {
-        'a'...'z' => label[0] - 32,
-        else => label[0],
-    };
-    return buf[0..1];
-}
-
 fn chatSurfaceStatusForUi(thread: *const native_state.ChatThread) native_state.SurfaceStatus {
     return switch (thread.activityStatusForUi()) {
         .idle => .idle,
@@ -1964,171 +1602,10 @@ fn chatSurfaceStatusForUi(thread: *const native_state.ChatThread) native_state.S
     };
 }
 
-/// Aggregate attention color for a workspace's panes
-/// (error > waiting > done > working), or null when nothing needs attention.
-/// Used by the collapsed activity dock.
-fn workspaceStatusColor(state: *runtime.AppState, project_index: usize) ?[4]f32 {
-    if (project_index >= state.project_controller.projects.items.len) return null;
-    const project = &state.project_controller.projects.items[project_index];
-    var has_waiting = false;
-    var has_done = false;
-    var has_working = false;
-    for (project.workspace_layout.panes.items) |pane| {
-        switch (pane.ref) {
-            .terminal => |ref| {
-                if (state.projectTerminalSurface(project_index, ref.dock_id)) |surface| {
-                    switch (state.terminalSurfaceDisplayStatus(surface)) {
-                        .@"error" => return theme.COLOR_DIFF_REMOVE,
-                        .waiting => has_waiting = true,
-                        .done => has_done = true,
-                        .working => has_working = true,
-                        else => {},
-                    }
-                }
-            },
-            .chat => |ref| {
-                if (ref.thread_index < project.threads.items.len) {
-                    const thread = &project.threads.items[ref.thread_index];
-                    switch (chatSurfaceStatusForUi(thread)) {
-                        .@"error" => return theme.COLOR_DIFF_REMOVE,
-                        .waiting => has_waiting = true,
-                        .done => has_done = true,
-                        .working => has_working = true,
-                        .idle => {},
-                    }
-                }
-            },
-            .browser => {},
-        }
-    }
-    if (has_waiting) return theme.COLOR_YELLOW;
-    if (has_done) return theme.success();
-    if (has_working) return theme.COLOR_GREEN;
-    return null;
-}
-
-/// Draws a centered row of small dots — one per open pane — beneath a collapsed
-/// workspace avatar, using stable active/inactive colors plus live status pulses.
-fn renderCollapsedCompositionDots(
-    state: *runtime.AppState,
-    project_index: usize,
-    project: *const native_state.Project,
-    center_x: f32,
-    y: f32,
-) void {
-    const max_dots = 4;
-    const layout = &project.workspace_layout;
-    var order: CollapsedPaneOrder(max_dots) = .{};
-    if (layout.root) |root| collectCollapsedPaneOrder(layout, root, &order);
-    if (order.total == 0) collectCollapsedPaneOrderFallback(layout, &order);
-    if (order.total == 0) return;
-
-    const shown = @min(order.total, max_dots);
-    const dot = theme.scaledUi(4.0);
-    const gap = theme.scaledUi(3.0);
-    const total_w = @as(f32, @floatFromInt(shown)) * dot + @as(f32, @floatFromInt(shown - 1)) * gap;
-    var dx = center_x - total_w * 0.5;
-    var index: usize = 0;
-    while (index < shown) : (index += 1) {
-        const pane = order.panes[index];
-        const selected_pane = state.project_controller.selected_index == project_index and
-            layout.focused_pane_id != null and
-            layout.focused_pane_id.? == pane.id;
-        const indicator = collapsedPaneIndicator(state, project_index, project, pane, selected_pane);
-        const alpha: u8 = @intFromFloat(indicator.opacity * 255.0);
-        const dot_rect: palette.Rect = .{ .x = dx, .y = y, .w = dot, .h = dot };
-        queuePaletteRoundedRect(state, dot_rect, paletteColor(theme.withAlpha(indicator.color, alpha)), dot * 0.5);
-        const hit_size = theme.scaledUi(12.0);
-        addPaletteHit(.{
-            .x = dot_rect.x + (dot_rect.w - hit_size) * 0.5,
-            .y = dot_rect.y + (dot_rect.h - hit_size) * 0.5,
-            .w = hit_size,
-            .h = hit_size,
-        }, .open_pane, project_index, pane.id);
-        dx += dot + gap;
-    }
-}
-
-fn CollapsedPaneOrder(comptime capacity: usize) type {
-    return struct {
-        panes: [capacity]*const native_state.WorkspacePane = undefined,
-        total: usize = 0,
-    };
-}
-
-/// Collects collapsed pips from the split tree, which reflects the current
-/// visual pane order after splits, closes, swaps, and drag re-arrangements.
-fn collectCollapsedPaneOrder(
-    layout: *const native_state.WorkspaceLayout,
-    node: *const native_state.WorkspaceNode,
-    order: anytype,
-) void {
-    switch (node.*) {
-        .leaf => |pane_id| {
-            const pane = layout.paneById(pane_id) orelse return;
-            if (order.total < order.panes.len) order.panes[order.total] = pane;
-            order.total += 1;
-        },
-        .split => |split| {
-            collectCollapsedPaneOrder(layout, split.first, order);
-            collectCollapsedPaneOrder(layout, split.second, order);
-        },
-    }
-}
-
-/// Falls back to the storage order only if the visual split tree is unavailable.
-fn collectCollapsedPaneOrderFallback(layout: *const native_state.WorkspaceLayout, order: anytype) void {
-    for (layout.panes.items) |*pane| {
-        if (order.total < order.panes.len) order.panes[order.total] = pane;
-        order.total += 1;
-    }
-}
-
 const CollapsedPaneIndicator = struct {
     color: [4]f32,
     opacity: f32 = 1.0,
 };
-
-/// Returns the collapsed-rail dot color for a pane. Status colors intentionally
-/// share the expanded row pip mapping, while quiet panes fall back to one active
-/// color and one inactive color so pane kind no longer changes dot semantics.
-fn collapsedPaneIndicator(
-    state: *runtime.AppState,
-    project_index: usize,
-    project: *const native_state.Project,
-    pane: *const native_state.WorkspacePane,
-    selected_pane: bool,
-) CollapsedPaneIndicator {
-    var running = false;
-    var status: ?native_state.SurfaceStatus = null;
-    switch (pane.ref) {
-        .chat => |ref| {
-            if (ref.thread_index < project.threads.items.len) {
-                const thread = &project.threads.items[ref.thread_index];
-                status = chatSurfaceStatusForUi(thread);
-                running = status.? == .working;
-            }
-        },
-        .terminal => |ref| {
-            if (state.projectTerminalSurface(project_index, ref.dock_id)) |surface| {
-                status = state.terminalSurfaceDisplayStatus(surface);
-                running = !surface.completion_pending and surface.status == .working;
-            }
-        },
-        .browser => {},
-    }
-    const show_status_color = !(selected_pane and status != null and status.? == .done);
-    if (show_status_color) {
-        if (paneStatusColor(status, running)) |status_color| {
-            const animated = running or (if (status) |s| s == .waiting else false);
-            return .{
-                .color = status_color,
-                .opacity = if (animated) attentionPulse(state, project_index) else 1.0,
-            };
-        }
-    }
-    return .{ .color = if (selected_pane) theme.COLOR_GREEN else theme.COLOR_TEXT_SUBTLE };
-}
 
 fn queuePaletteRect(state: *runtime.AppState, rect: palette.Rect, color: palette.Color) void {
     state.palette_overlay_batch.rect(state.allocator, rect, color) catch |err| {
@@ -2155,7 +1632,10 @@ fn renderOpenPanesSection(
     const layout = &project.workspace_layout;
     if (layout.panes.items.len == 0) return y;
 
-    const indent = theme.scaledUi(SIDEBAR_ROW_INDENT_CSS);
+    // Rows sit flush: there are no workspace folder rows to nest under.
+    const indent: f32 = 0.0;
+    // Ctrl+N tips address the selected workspace's tabs only.
+    const shortcuts = project_index == state.project_controller.selected_index;
     // Ctrl+N badges number tabs, so a split tile shares one ordinal and its
     // mini-rows show none.
     const tab_buffer = state.palette_frame_text_arena.allocator().alloc(native_state.WorkspaceTab, layout.panes.items.len) catch return y;
@@ -2181,7 +1661,7 @@ fn renderOpenPanesSection(
             // The tile carries its tab's Ctrl badge once, in a column beside
             // the mini-rows, so the sidebar numbering has no hole at a split.
             var tile_shortcut_buf: [16]u8 = undefined;
-            const tile_shortcut = tileShortcutLabel(state, &tile_shortcut_buf, native_state.workspace_tabs.indexOfTab(tabs, group_id));
+            const tile_shortcut = if (shortcuts) tileShortcutLabel(state, &tile_shortcut_buf, native_state.workspace_tabs.indexOfTab(tabs, group_id)) else "";
             const badge_column = if (tile_shortcut.len > 0) theme.scaledUi(30.0) else 0.0;
             const group_rect: palette.Rect = .{
                 .x = x + indent,
@@ -2204,7 +1684,7 @@ fn renderOpenPanesSection(
             .w = rail_w - indent,
             .h = theme.scaledUi(SIDEBAR_THREAD_ROW_HEIGHT_CSS),
         };
-        if (rowVisible(row_rect, list_clip)) renderOpenPaneRow(state, project_index, project, pane, row_rect, clip, false, false, native_state.workspace_tabs.indexOfTab(tabs, group_id), false);
+        if (rowVisible(row_rect, list_clip)) renderOpenPaneRow(state, project_index, project, pane, row_rect, clip, false, false, if (shortcuts) native_state.workspace_tabs.indexOfTab(tabs, group_id) else null, false);
         y += theme.scaledUi(SIDEBAR_THREAD_ROW_STEP_CSS);
     }
     y += theme.scaledUi(4.0);
@@ -2289,8 +1769,8 @@ fn renderOpenPaneGroupSplit(
 
 /// Renders one live pane row: provider glyph, truncated title, and a trailing
 /// status column ("Working · m:ss" / "Waiting" / "Done" / "Failed"). With
-/// `show_workspace_tag` (attention-cluster rows) a small workspace-initial
-/// chip leads the row so cross-workspace rows stay attributable.
+/// `show_workspace_tag` (attention-cluster rows) the row focuses only (no
+/// reorder drag); the identity chip follows `open_rows_show_chip`.
 fn renderOpenPaneRow(
     state: *runtime.AppState,
     project_index: usize,
@@ -2337,22 +1817,12 @@ fn renderOpenPaneRow(
     var title_left = theme.scaledUi(leading_pad + SIDEBAR_THREAD_PROVIDER_GLYPH_CSS + icon_title_gap);
     const muted = theme.COLOR_TEXT_MUTED;
 
-    if (show_workspace_tag) {
-        // Workspace-initial chip mirrors the collapsed rail's avatar mark so
-        // cross-workspace rows reuse an already-learned identity cue.
+    // Workspace identity chip under All Workspaces, so rows from different
+    // workspaces stay attributable; single-workspace scope omits it.
+    if (open_rows_show_chip and !compact_tile) {
         const chip = theme.scaledUi(18.0);
         const chip_rect: palette.Rect = .{ .x = rect.x + theme.scaledUi(4.0), .y = cy - chip * 0.5, .w = chip, .h = chip };
-        queuePaletteRoundedRectClipped(state, chip_rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(5.0), clip);
-        var letter_buf: [1]u8 = undefined;
-        const letter = workspaceInitial(&letter_buf, project.label);
-        const letter_font = theme.scaledUi(10.0);
-        const letter_w = letter_font * 0.6;
-        queuePaletteText(state, .{
-            .x = @round(chip_rect.x + (chip - letter_w) * 0.5),
-            .y = @round(chip_rect.y + (chip - letter_font * 1.25) * 0.5),
-            .w = letter_w + theme.scaledUi(3.0),
-            .h = letter_font * 1.25,
-        }, letter, paletteColor(theme.COLOR_TEXT_MUTED), letter_font, clip);
+        queueWorkspaceChip(state, chip_rect, project.id, false, clip);
         const shift = chip + theme.scaledUi(8.0);
         icon_x += shift;
         title_left += shift;
@@ -2738,28 +2208,6 @@ fn queuePalettePanel(state: *runtime.AppState, rect: palette.Rect, fill: palette
     };
 }
 
-fn queuePaletteFolderIcon(state: *runtime.AppState, x: f32, center_y: f32, width: f32, height: f32, color: [4]f32, filled: bool) void {
-    const tab_rect: palette.Rect = .{
-        .x = x,
-        .y = center_y - height * 0.5 - theme.scaledUi(2.0),
-        .w = width * 0.4,
-        .h = theme.scaledUi(3.0),
-    };
-    const body_rect: palette.Rect = .{
-        .x = x,
-        .y = center_y - height * 0.5,
-        .w = width,
-        .h = height,
-    };
-    const palette_color = paletteColor(color);
-    queuePaletteRoundedRect(state, tab_rect, palette_color, theme.scaledUi(1.0));
-    if (filled) {
-        queuePaletteRoundedRect(state, body_rect, palette_color, theme.scaledUi(1.5));
-    } else {
-        queuePaletteBorder(state, body_rect, palette_color, theme.scaledUi(1.5), theme.scaledUi(1.4));
-    }
-}
-
 // Nerd Font Symbols codicon glyphs used throughout the sidebar. Codepoints
 // confirmed against SymbolsNerdFontMono-Regular.ttf's cmap.
 const NF_COD_CHEVRON_RIGHT = "\u{EAB6}";
@@ -2797,6 +2245,40 @@ fn queuePaletteIcon(state: *runtime.AppState, rect: palette.Rect, glyph: []const
     ) catch |err| {
         log.warn("failed to queue sidebar icon: {s}", .{@errorName(err)});
     };
+}
+
+/// Workspace identity chip: the workspace's hashed icon in its theme-derived
+/// slot color on a tinted rounded square (see
+/// docs/workspace-switcher-sidebar.md). `id == null` draws the All Workspaces
+/// chip in the accent color.
+pub fn queueWorkspaceChip(state: *runtime.AppState, rect: palette.Rect, id: ?[]const u8, dimmed: bool, clip: ?palette.Rect) void {
+    var color = if (id) |value| workspace_identity.colorFor(value) else theme.accent();
+    if (dimmed) color[3] = 0.55;
+    const glyph = if (id) |value| workspace_identity.iconGlyph(value) else workspace_identity.ALL_WORKSPACES_GLYPH;
+    const radius = @max(rect.w * 0.24, theme.scaledUi(3.0));
+    var fill = color;
+    fill[3] = if (dimmed) 0.10 else 0.18;
+    const draw_rect = if (clip) |c| intersectChipRect(rect, c) else rect;
+    if (draw_rect.w > 0.0 and draw_rect.h > 0.0) {
+        state.palette_overlay_batch.roundedRect(state.allocator, snapRect(rect), paletteColor(fill), radius) catch |err| {
+            log.warn("failed to queue workspace chip: {s}", .{@errorName(err)});
+        };
+    }
+    const font_size = rect.h * 0.58;
+    queuePaletteIcon(state, .{
+        .x = rect.x + (rect.w - font_size) * 0.5,
+        .y = rect.y + (rect.h - font_size) * 0.5,
+        .w = font_size,
+        .h = font_size,
+    }, glyph, font_size, paletteColor(color), clip);
+}
+
+fn intersectChipRect(a: palette.Rect, b: palette.Rect) palette.Rect {
+    const x0 = @max(a.x, b.x);
+    const y0 = @max(a.y, b.y);
+    const x1 = @min(a.x + a.w, b.x + b.w);
+    const y1 = @min(a.y + a.h, b.y + b.h);
+    return .{ .x = x0, .y = y0, .w = @max(x1 - x0, 0.0), .h = @max(y1 - y0, 0.0) };
 }
 
 fn queuePaletteChevron(state: *runtime.AppState, x: f32, center_y: f32, color: [4]f32, collapsed: bool) void {
@@ -3282,6 +2764,8 @@ test "ACTIVE collection sees every restored chat pane and deduplicates one threa
     var state: runtime.AppState = undefined;
     state.allocator = allocator;
     state.project_controller.projects = .empty;
+    state.project_controller.selected_index = 0;
+    state.sidebar_all_workspaces = true;
     defer {
         for (state.project_controller.projects.items) |*project| project.deinit(allocator);
         state.project_controller.projects.deinit(allocator);
@@ -3371,11 +2855,9 @@ test "ACTIVE wheel stays in the pinned cluster when it overflows" {
 
 test "workspace settings entry points bind to the invoked workspace" {
     const source = @embedFile("sidebar.zig");
-    // Gear icon in the per-workspace action cluster registers its own hit
-    // kind, distinct from the global settings gear in the footer.
-    try std.testing.expect(std.mem.indexOf(u8, source, "addClippedPaletteHit(workspace_settings_rect, workspace_clip, .workspace_settings, project_index, 0)") != null);
-    // Both the icon and the labelled context-menu row route through the
-    // id-bound opener, never through the currently-selected workspace.
-    try std.testing.expect(std.mem.indexOf(u8, source, "state.openWorkspaceSettingsForProject(hit.project_index)") != null);
+    const switcher_source = @embedFile("command_palette.zig");
+    // The switcher row gear and the labelled context-menu row both route
+    // through the id-bound opener, never through the selected workspace.
+    try std.testing.expect(std.mem.indexOf(u8, switcher_source, "state.openWorkspaceSettingsForProject(pi)") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, ".workspace_open_settings => state.openWorkspaceSettingsForProject(pi)") != null);
 }

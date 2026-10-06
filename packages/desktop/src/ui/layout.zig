@@ -1952,6 +1952,7 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             .command_palette_input => focusModalInput(state, .command_palette, hit.rect, x, clicks),
             .command_palette_row => command_palette.activateRow(state, hit.index, false),
             .command_palette_action_row => command_palette.runActionRow(state, hit.index),
+            .command_palette_row_settings => command_palette.openRowWorkspaceSettings(state, hit.index),
         }
         return true;
     }

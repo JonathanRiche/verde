@@ -824,3 +824,81 @@ test "workspace projection keeps uncommitted drafts out of history but in the th
     try std.testing.expectEqual(@as(usize, 3), models.workspaces[0].threads.len);
     for (models.workspaces[0].threads) |t| try expect(t.committed == !std.mem.eql(u8, t.thread_id, "draft"));
 }
+
+test "workspace identity matches the cross-client FNV-1a vectors" {
+    // Pinned in docs/workspace-switcher-sidebar.md consumers (desktop, web, iOS, Android).
+    try std.testing.expectEqual(@as(u32, 0x48d4ea0e), p.identityHash("ws-alpha"));
+    try std.testing.expectEqual(@as(u8, 14), p.iconIndex("ws-alpha"));
+    try std.testing.expectEqual(@as(u8, 2), p.colorIndex("ws-alpha"));
+    try std.testing.expectEqual(@as(u32, 0x9f38bee9), p.identityHash("baaa819e66d8f3be"));
+    try std.testing.expectEqual(@as(u8, 9), p.iconIndex("baaa819e66d8f3be"));
+    try std.testing.expectEqual(@as(u8, 6), p.colorIndex("baaa819e66d8f3be"));
+    try std.testing.expectEqual(@as(u32, 0x811c9dc5), p.identityHash(""));
+    try std.testing.expectEqual(@as(u8, 5), p.iconIndex(""));
+    try std.testing.expectEqual(@as(u8, 5), p.colorIndex(""));
+}
+
+test "workspace recency ranks focus and activity, then untimed open before closed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const data = try host.parse(a,
+        \\{"snapshot":{"workspaces":[
+        \\{"workspace_id":"closed-idle","archived":true,"threads":[]},
+        \\{"workspace_id":"open-idle","threads":[]},
+        \\{"workspace_id":"ws-alpha","threads":[{"local_thread_id":"a","title":"A","last_activity_at":1790000000}]},
+        \\{"workspace_id":"closed-busy","archived":true,"threads":[{"local_thread_id":"b","title":"B","last_activity_at":1790000100}]},
+        \\{"workspace_id":"focused","threads":[{"local_thread_id":"c","title":"C","last_activity_at":1700000000}]}]}}
+    );
+    const focus = [_]p.FocusStamp{.{ .workspace_id = "focused", .at_ms = 1790000200000 }};
+    const models = try p.projectFocused(a, data, &.{}, false, 1790000300000, &focus);
+    const expected = [_]struct { []const u8, u32, ?i64 }{
+        .{ "closed-idle", 4, null },
+        .{ "open-idle", 3, null },
+        .{ "ws-alpha", 2, 1790000000000 },
+        .{ "closed-busy", 1, 1790000100000 },
+        .{ "focused", 0, 1790000200000 },
+    };
+    for (models.workspaces, expected) |w, e| {
+        try eql(e[0], w.workspace_id);
+        try std.testing.expectEqual(e[1], w.recency_rank);
+        try std.testing.expectEqual(e[2], w.recency_ms);
+        try std.testing.expectEqual(p.iconIndex(e[0]), w.icon_index);
+        try std.testing.expectEqual(p.colorIndex(e[0]), w.color_index);
+    }
+    // Snapshot order is preserved; only the rank changes.
+    try eql("ws-alpha", models.workspaces[2].workspace_id);
+    try std.testing.expectEqual(@as(u8, 14), models.workspaces[2].icon_index);
+}
+
+test "focus intents stamp workspace recency at wall time and survive sync resets" {
+    var h = try init();
+    defer h.deinit();
+    var tx = try host.Transaction.init(&h);
+    defer tx.deinit();
+    const a = tx.allocator();
+    tx.state.sync.snapshot = try host.parse(a,
+        \\{"snapshot":{"workspaces":[
+        \\{"workspace_id":"one","threads":[{"local_thread_id":"a","title":"A","last_activity_at":1790000000}]},
+        \\{"workspace_id":"two","threads":[]}]}}
+    );
+    tx.state.wall_time_ms = 1790000500000;
+    try sync.intent(&tx, "focus", try host.parse(a, "{\"workspace_id\":\"two\",\"thread_id\":null,\"terminal_id\":null}"));
+    try sync.intent(&tx, "focus", try host.parse(a, "{\"workspace_id\":null,\"thread_id\":null,\"terminal_id\":null}"));
+    try sync.intent(&tx, "send", try host.parse(a, "{\"workspace_id\":\"one\"}"));
+    try sync.intent(&tx, "workspace_archive", try host.parse(a, "{\"workspace_id\":\"one\",\"archived\":true}"));
+    try std.testing.expectEqual(@as(usize, 1), tx.state.sync.focus.len);
+    try sync.intent(&tx, "workspace_archive", try host.parse(a, "{\"workspace_id\":\"three\",\"archived\":false}"));
+    try std.testing.expectEqual(@as(usize, 2), tx.state.sync.focus.len);
+    sync.reset(&tx);
+    tx.state.sync.snapshot = try host.parse(a,
+        \\{"snapshot":{"workspaces":[
+        \\{"workspace_id":"one","threads":[{"local_thread_id":"a","title":"A","last_activity_at":1790000000}]},
+        \\{"workspace_id":"two","threads":[]}]}}
+    );
+    const items = p.rows(p.get(try sync.query(a, &tx.state, "workspaces"), "items"));
+    try eql("two", p.s(items[1], "workspace_id"));
+    try std.testing.expectEqual(@as(?i64, 0), p.num(p.get(items[1], "recency_rank")));
+    try std.testing.expectEqual(@as(?i64, 1790000500000), p.num(p.get(items[1], "recency_ms")));
+    try std.testing.expectEqual(@as(?i64, 1), p.num(p.get(items[0], "recency_rank")));
+}

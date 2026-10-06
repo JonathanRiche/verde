@@ -1,6 +1,10 @@
 //! Apply the theme the Zig gateway resolved from verde.json / Omarchy,
 //! the same search order as the desktop app.
 
+import { createSignal } from 'solid-js'
+
+import { isDarkBackground } from './workspace_identity'
+
 export interface TerminalTheme {
   background: string
   foreground: string
@@ -19,6 +23,10 @@ export interface ThemePayload {
 }
 
 let lastJson = ''
+
+/// Accent + light/dark for JS-side color derivation (workspace identity chips).
+const [themeTone, setThemeTone] = createSignal({ accent: '#50c878', dark: true })
+export { themeTone }
 
 export async function loadTheme(): Promise<ThemePayload | null> {
   try {
@@ -77,6 +85,7 @@ export function applyTheme(payload: ThemePayload): void {
   set('--tok-keyword', mix(warning, text, 0.05))
   set('--tok-function', mix(accent, text, 0.1))
   root.style.setProperty('--accent-rgb', hexToRgb(accent).join(', '))
+  setThemeTone({ accent, dark: isDarkBackground(bg) })
   document.body.style.background = bg
   applyTerminalTheme(payload)
 }

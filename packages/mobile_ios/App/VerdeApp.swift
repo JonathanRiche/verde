@@ -37,6 +37,8 @@ struct RootView: View {
     @State private var tab: RootTab = .home
     @State private var path: [BrowseRoute] = []
     @State private var drawer = false
+    /// Drawer scope (nil = All Workspaces); survives drawer open/close, resets per host.
+    @State private var workspaceScope: String?
     @Environment(\.accessibilityReduceMotion) private var reducedMotion
     @State private var monitor = NetworkMonitor()
     @State private var lock = AppLock()
@@ -61,7 +63,7 @@ struct RootView: View {
                 }.allowsHitTesting(!drawer).accessibilityHidden(drawer)
                 if drawer {
                     Color.black.opacity(0.5).ignoresSafeArea().onTapGesture { drawer = false }.accessibilityLabel("Close workspace drawer").accessibilityAddTraits(.isButton)
-                    WorkspaceDrawer(browse: browse, selected: path.last, tab: tab, close: { drawer = false }, open: { route in
+                    WorkspaceDrawer(browse: browse, selected: path.last, tab: tab, scope: $workspaceScope, close: { drawer = false }, open: { route in
                         if tab == .hosts { tab = .home }
                         path.append(route); drawer = false
                     }, root: { next in tab = next; path = []; drawer = false }, settings: { drawer = false; settings = true })
@@ -72,6 +74,10 @@ struct RootView: View {
             }
             .animation(reducedMotion || appearance.reducedMotion ? nil : .easeOut(duration: 0.2), value: drawer)
             .environment(\.openWorkspaceDrawer, { drawer = true })
+            .onChange(of: browse.hostID) { workspaceScope = nil }
+            .onChange(of: browse.state.workspaces?.items.map(\.workspace_id)) { _, ids in
+                if let scope = workspaceScope, let ids, !ids.contains(scope) { workspaceScope = nil }
+            }
             .background(VerdeTheme.background.ignoresSafeArea())
         }
     }

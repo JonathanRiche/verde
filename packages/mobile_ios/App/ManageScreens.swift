@@ -107,7 +107,7 @@ struct NewChatScreen: View {
             }.disabled(manage.busy || chat?.workspace_id != workspace || chat?.can_create != true)
                 .accessibilityIdentifier("create-chat")
         }.navigationTitle("New chat").navigationBarTitleDisplayMode(.inline)
-        .onAppear { workspace = initialWorkspace ?? workspaces.first?.workspace_id ?? "" }
+        .onAppear { workspace = initialWorkspace ?? mostRecentOpenWorkspace(workspaces)?.workspace_id ?? "" }
         .task(id: workspace) { if !workspace.isEmpty { await manage.select(workspace) } }
     }
     @ViewBuilder private func choice(_ label: String, value: String?, choices: [ChatChoice], update: @escaping (String) -> ChatSelection) -> some View {

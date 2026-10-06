@@ -2286,6 +2286,8 @@ pub const PaletteModalAction = enum {
     command_palette_input,
     command_palette_row,
     command_palette_action_row,
+    /// Gear on a workspace-switcher row: opens that workspace's settings.
+    command_palette_row_settings,
 };
 
 pub const SettingsOpenAction = settings_controller.OpenAction;
@@ -4676,9 +4678,15 @@ pub const AppState = struct {
     close_durability_notice: bool = false,
     import_thread_id_storage: [256:0]u8,
     import_notice_storage: [256:0]u8,
+    /// Persisted "sidebar hidden" flag. The icon-only collapsed rail was
+    /// removed; this legacy field now means hidden so the choice survives
+    /// restarts (`sidebar_hidden` alone is session-only).
     sidebar_collapsed: bool,
     sidebar_hidden: bool,
     sidebar_hover_revealed: bool,
+    /// Sidebar list scope: true lists every open workspace (default); false
+    /// lists only the selected workspace. Never changes the canvas.
+    sidebar_all_workspaces: bool = true,
     /// Held Alt exposes small, non-layout-affecting shortcut key tips beside
     /// visible controls that own a plain Alt binding.
     alt_shortcut_hints_visible: bool,
@@ -8324,6 +8332,7 @@ pub const AppState = struct {
     pub const handoffTargetModelLabel = handoff_controller.handoffTargetModelLabel;
     pub const prepareHandoffTarget = handoff_controller.prepareHandoffTarget;
     pub const openCommandPalette = command_controller.openCommandPalette;
+    pub const openWorkspaceSwitcher = command_controller.openWorkspaceSwitcher;
     pub const closeCommandPalette = command_controller.closeCommandPalette;
     pub const commandPaletteQuery = command_controller.commandPaletteQuery;
     pub const commandPaletteQueryBuffer = command_controller.commandPaletteQueryBuffer;
@@ -10670,41 +10679,68 @@ pub const AppState = struct {
         self.transcript_hydration.in_flight = false;
     }
 
+    /// The icon-only collapsed rail no longer exists; kept so layout callers
+    /// compile unchanged while always taking the full-rail path.
     pub fn isSidebarCollapsed(self: *const AppState) bool {
-        return self.sidebar_collapsed;
+        _ = self;
+        return false;
     }
 
     pub fn isSidebarHidden(self: *const AppState) bool {
-        return self.sidebar_hidden;
+        return self.sidebar_hidden or self.sidebar_collapsed;
     }
 
     pub fn isSidebarHoverRevealed(self: *const AppState) bool {
         return self.sidebar_hover_revealed;
     }
 
+    /// Legacy collapse entry points now show the full rail or hide it.
     pub fn setSidebarCollapsed(self: *AppState, collapsed: bool) void {
-        if (self.sidebar_collapsed == collapsed) return;
-        self.sidebar_collapsed = collapsed;
-        self.markDirty();
+        self.setSidebarHidden(collapsed);
     }
 
     pub fn toggleSidebarCollapsed(self: *AppState) void {
-        self.setSidebarCollapsed(!self.sidebar_collapsed);
+        self.toggleSidebarHidden();
     }
 
     pub fn setSidebarHidden(self: *AppState, hidden: bool) void {
-        if (self.sidebar_hidden == hidden) return;
+        if (self.isSidebarHidden() == hidden) return;
         self.sidebar_hidden = hidden;
+        self.sidebar_collapsed = hidden;
         if (!hidden) self.sidebar_hover_revealed = false;
         self.markDirty();
     }
 
     pub fn toggleSidebarHidden(self: *AppState) void {
-        self.setSidebarHidden(!self.sidebar_hidden);
+        self.setSidebarHidden(!self.isSidebarHidden());
+    }
+
+    /// Widens the sidebar list to every open workspace (Alt+0).
+    pub fn showAllWorkspacesInSidebar(self: *AppState) void {
+        if (self.sidebar_all_workspaces) return;
+        self.sidebar_all_workspaces = true;
+        self.markDirty();
+    }
+
+    /// Selects a workspace and narrows the sidebar list to it (switcher row,
+    /// Alt+N).
+    pub fn selectProjectScoped(self: *AppState, index: usize) bool {
+        if (!self.selectProjectAtIndex(index)) return false;
+        self.sidebar_all_workspaces = false;
+        self.markDirty();
+        return true;
+    }
+
+    /// Reopens a closed workspace from the switcher and scopes the list to it.
+    pub fn reopenClosedProjectScoped(self: *AppState, archived_index: usize) bool {
+        if (!self.reopenClosedProjectAtIndex(archived_index)) return false;
+        self.sidebar_all_workspaces = false;
+        self.markDirty();
+        return true;
     }
 
     pub fn setSidebarHoverRevealed(self: *AppState, revealed: bool) void {
-        const next = self.sidebar_hidden and revealed;
+        const next = self.isSidebarHidden() and revealed;
         if (self.sidebar_hover_revealed == next) return;
         self.sidebar_hover_revealed = next;
         self.markDirty();
@@ -13831,6 +13867,7 @@ pub const AppState = struct {
                 .settings_save,
                 .command_palette_row,
                 .command_palette_action_row,
+                .command_palette_row_settings,
                 .cookie_import_source_select,
                 .cookie_import_domain_toggle,
                 .cookie_import_select_all,

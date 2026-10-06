@@ -52,6 +52,8 @@ pub const NativeKeyboardAction = enum {
     workspace_grow_right,
     workspace_grow_up,
     workspace_grow_down,
+    /// Widens the sidebar list to every open workspace (default Alt+0).
+    workspace_show_all,
 };
 
 pub const NativeTerminalAction = enum {
@@ -279,6 +281,7 @@ pub const NativeKeyboardConfig = struct {
     workspace_grow_up: []Keybind,
     workspace_grow_down: []Keybind,
     workspace_select: []Keybind,
+    workspace_show_all: []Keybind,
     prefix: PrefixConfig,
 
     pub fn load(allocator: std.mem.Allocator) !NativeKeyboardConfig {
@@ -345,6 +348,7 @@ pub const NativeKeyboardConfig = struct {
             .workspace_grow_up = try cloneDefaultWorkspaceGrowUpKeybinds(allocator),
             .workspace_grow_down = try cloneDefaultWorkspaceGrowDownKeybinds(allocator),
             .workspace_select = try cloneDefaultWorkspaceSelectKeybinds(allocator),
+            .workspace_show_all = try cloneDefaultWorkspaceShowAllKeybinds(allocator),
             .prefix = try cloneDefaultPrefixConfig(allocator),
         };
 
@@ -422,6 +426,7 @@ pub const NativeKeyboardConfig = struct {
         self.allocator.free(self.workspace_grow_up);
         self.allocator.free(self.workspace_grow_down);
         self.allocator.free(self.workspace_select);
+        self.allocator.free(self.workspace_show_all);
         self.prefix.deinit(self.allocator);
     }
 
@@ -588,6 +593,10 @@ pub const NativeKeyboardConfig = struct {
         if (matchesAny(self.chat_run_config, event)) return .run_config;
         if (matchesAny(self.chat_directory_picker, event)) return .directory_picker;
         return null;
+    }
+
+    pub fn workspaceShowAllForEvent(self: *const NativeKeyboardConfig, event: *const sdl.KeyboardEvent) bool {
+        return matchesAny(self.workspace_show_all, event);
     }
 
     pub fn workspaceSelectIndexForEvent(self: *const NativeKeyboardConfig, event: *const sdl.KeyboardEvent) ?usize {
@@ -1057,6 +1066,12 @@ pub const NativeKeyboardConfig = struct {
                 self.workspace_select = bindings;
             }
         }
+        if (workspace_value.object.get("show_all")) |value| {
+            if (self.parseOverrideValue(value, "workspace.show_all")) |bindings| {
+                self.allocator.free(self.workspace_show_all);
+                self.workspace_show_all = bindings;
+            }
+        }
         if (workspace_value.object.get("previous")) |value| {
             if (self.parseOverrideValue(value, "workspace.previous")) |bindings| {
                 self.allocator.free(self.workspace_previous);
@@ -1328,6 +1343,7 @@ const PREFIX_ACTION_NAMES = [_]PrefixActionName{
     .{ .name = "new_thread", .target = .{ .app = .new_thread } },
     .{ .name = "workspace.add", .target = .{ .app = .add_workspace } },
     .{ .name = "workspace.add_tab", .target = .{ .app = .add_workspace_tab } },
+    .{ .name = "workspace.show_all", .target = .{ .app = .workspace_show_all } },
     .{ .name = "workspace.add_tab_terminal", .target = .{ .app = .add_workspace_tab_terminal } },
     .{ .name = "new_terminal", .target = .new_terminal },
     .{ .name = "command_palette", .target = .{ .app = .command_palette } },
@@ -1417,6 +1433,7 @@ pub fn prefixTargetLabel(buf: []u8, target: PrefixTarget) []const u8 {
             .new_thread => "New thread",
             .add_workspace => "Add workspace",
             .add_workspace_tab => "New tab",
+            .workspace_show_all => "All workspaces",
             .add_workspace_tab_terminal => "Terminal tab",
             .command_palette => "Command palette",
             .settings => "Settings",
@@ -1593,6 +1610,7 @@ const DEFAULT_PREFIX_TABLE = [_]DefaultPrefixEntry{
     // `c` follows Herdr/tmux: a new tab appended to the end of the strip.
     .{ .accelerator = "C", .target = "workspace.add_tab" },
     .{ .accelerator = "A", .target = "workspace.add" },
+    .{ .accelerator = "Shift+A", .target = "workspace.show_all" },
     .{ .accelerator = "Shift+C", .target = "workspace.split_chat_horizontal" },
     .{ .accelerator = "V", .target = "workspace.split_default_vertical" },
     .{ .accelerator = "Minus", .target = "workspace.split_default_horizontal" },
@@ -1698,7 +1716,7 @@ const DEFAULT_NAVIGATE_TABLE = [_]DefaultPrefixEntry{
     .{ .accelerator = "7", .target = "workspace.select.7" },
     .{ .accelerator = "8", .target = "workspace.select.8" },
     .{ .accelerator = "9", .target = "workspace.select.9" },
-    .{ .accelerator = "0", .target = "workspace.select.10" },
+    .{ .accelerator = "0", .target = "workspace.show_all" },
 };
 
 fn cloneDefaultPrefixTable(allocator: std.mem.Allocator, table: []const DefaultPrefixEntry) !std.ArrayList(PrefixBinding) {
@@ -2070,6 +2088,11 @@ fn cloneDefaultWorkspaceSelectKeybinds(allocator: std.mem.Allocator) ![]Keybind 
         try parseDefaultAccelerator("Alt+7"),
         try parseDefaultAccelerator("Alt+8"),
         try parseDefaultAccelerator("Alt+9"),
+    });
+}
+
+fn cloneDefaultWorkspaceShowAllKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("Alt+0"),
     });
 }

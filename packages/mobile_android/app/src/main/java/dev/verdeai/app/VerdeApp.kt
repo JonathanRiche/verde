@@ -90,18 +90,28 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
             })
         }
     }
+    // Sidebar scope: null is All Workspaces. It filters the drawer only and resets per host.
+    var workspaceScope by rememberSaveable(browseState.hostId) { mutableStateOf<String?>(null) }
     LaunchedEffect(browseState.hostId) { threadAction = null }
+    LaunchedEffect(browseState.workspaces?.items?.map { it.workspace_id }) {
+        val ids = browseState.workspaces?.items?.map { it.workspace_id } ?: return@LaunchedEffect
+        if (workspaceScope != null && workspaceScope !in ids) workspaceScope = null
+    }
     ModalNavigationDrawer(drawerState = drawer, gesturesEnabled = !pairing && !immersive,
         drawerContent = {
             WorkspaceDrawer(browseState, currentTab, visible = drawer.isOpen || drawer.targetValue == DrawerValue.Open, onClose = { scope.launch { drawer.close() } },
-                onTab = { open(it, tab = true) }, onWorkspace = { open(Routes.workspace(it)) },
+                onTab = { open(it, tab = true) },
                 onThread = { ws, thread -> open(Routes.thread(ws, thread)) },
-                onHistory = { open(ManageRoutes.HISTORY) }, onNewChat = { open(ManageRoutes.newChat(null)) },
+                onHistory = { open(ManageRoutes.HISTORY) },
+                scope = workspaceScope, onScope = { workspaceScope = it }, onNewChat = { open(ManageRoutes.newChat(it)) },
                 selectedWorkspace = entry?.arguments?.getString("ws"), selectedThread = entry?.arguments?.getString("thread"),
                 selectedTerminal = entry?.arguments?.getString("terminal"),
                 onTerminal = { ws, terminal -> open(Routes.terminal(ws, terminal)) },
-                onNewWorkspaceChat = { open(ManageRoutes.newChat(it)) }, onNewTerminal = { open(Routes.newTerminal(it)) },
+                onNewTerminal = { open(Routes.newTerminal(it)) },
                 onAddWorkspace = { open(ManageRoutes.ADD_WORKSPACE) },
+                onWorkspaceSettings = { open(Routes.workspace(it)) },
+                canManageWorkspaces = manageState.view?.can_manage_workspaces == true,
+                onReopen = { manage.setArchived(it, false) },
                 canEditThreads = manageState.view?.can_create_threads == true,
                 onThreadAction = { thread, action -> scope.launch {
                     drawer.close()

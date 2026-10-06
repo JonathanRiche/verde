@@ -22,7 +22,7 @@ class ThreadActionsTest {
             DrawerChat(thread, false, edit, { target, action ->
                 assertEquals(thread.thread_id, target.thread_id)
                 actions.add(action)
-            }, { opens++ })
+            }, onClick = { opens++ })
         } }
     }
     @Test fun longPressOffersThreadActionsWithoutOpeningChat() {

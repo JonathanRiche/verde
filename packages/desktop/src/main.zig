@@ -2056,11 +2056,16 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
+            if (keyboard.workspaceShowAllForEvent(&event.key)) {
+                state.showAllWorkspacesInSidebar();
+                syncWindowTextInput(window, state);
+                return true;
+            }
             if (keyboard.workspaceSelectIndexForEvent(&event.key)) |workspace_ordinal| {
                 if (workspace_ordinal < state.project_controller.projects.items.len) {
                     state.noteWorkspaceSwitchInput(workspace_ordinal, event.key.timestamp, profiler.nowNs());
                 }
-                if (state.selectProjectAtIndex(workspace_ordinal)) {
+                if (state.selectProjectScoped(workspace_ordinal)) {
                     syncWindowTextInput(window, state);
                     return true;
                 }
@@ -3118,7 +3123,7 @@ fn dispatchPrefixTarget(state: *AppState, keyboard: *keybinds.NativeKeyboardConf
             state.prefix_help_visible = false;
             state.markDirty();
         },
-        .workspace_select => |index| _ = state.selectProjectAtIndex(index),
+        .workspace_select => |index| _ = state.selectProjectScoped(index),
         .pane_select => |index| _ = state.selectWorkspaceTabAtIndex(index),
         .active_select => |index| _ = sidebar_ui.focusAttentionClusterRowAtIndex(state, index),
         .command => |command| state.runPrefixCommand(command),
@@ -3239,6 +3244,7 @@ fn handleKeyboardAction(
         .companion => state.toggleCompanion(),
         .toggle_sidebar => state.toggleSidebarCollapsed(),
         .toggle_sidebar_hidden => state.toggleSidebarHidden(),
+        .workspace_show_all => state.showAllWorkspacesInSidebar(),
         .toggle_browser => state.toggleBrowser(),
         .toggle_terminal => state.toggleCurrentProjectTerminal(),
         .chat_up => if (canHandleTranscriptScrollAction(state)) {

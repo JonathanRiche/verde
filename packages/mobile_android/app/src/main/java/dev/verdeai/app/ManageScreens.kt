@@ -205,7 +205,7 @@ internal fun NewChatScreen(
     var workspaceId by rememberSaveable { mutableStateOf(initialWorkspace) }
     LaunchedEffect(open.map { it.workspace_id }) {
         if (workspaceId == null || open.none { it.workspace_id == workspaceId }) workspaceId = initialWorkspace?.takeIf { id -> open.any { it.workspace_id == id } }
-            ?: open.firstOrNull()?.workspace_id
+            ?: mostRecentOpenWorkspace(open)?.workspace_id
     }
     val chat = manageState.view?.new_chat?.takeIf { it.workspace_id != null && it.workspace_id == workspaceId }
     // One select per workspace (and host) so the core loads that workspace's provider and models.

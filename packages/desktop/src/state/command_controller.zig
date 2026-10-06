@@ -249,8 +249,16 @@ pub fn slashCommandFallbackName(command: provider_types.ProviderSlashCommandId) 
     };
 }
 
+pub const PaletteMode = enum {
+    /// Ctrl+Shift+P launcher: commands, threads, workspaces.
+    commands,
+    /// Sidebar workspace switcher popover anchored under the rail trigger.
+    workspaces,
+};
+
 pub const State = struct {
     open: bool = false,
+    mode: PaletteMode = .commands,
     scope_project: ?usize = null,
     query_storage: [256:0]u8 = std.mem.zeroes([256:0]u8),
     cursor: usize = 0,
@@ -262,6 +270,7 @@ pub const State = struct {
 
     pub fn begin(self: *State, scope_project: ?usize) void {
         self.open = true;
+        self.mode = .commands;
         self.scope_project = scope_project;
         self.query_storage[0] = 0;
         self.cursor = 0;
@@ -401,6 +410,20 @@ pub fn finishProviderSlashCatalog(self: anytype) void {
 pub fn openCommandPalette(self: anytype, scope_project: ?usize) void {
     self.command_controller.begin(scope_project);
     self.refreshPaletteHistory();
+    self.modal_text_selection_anchor = null;
+    self.palette_modal_text_focus = .command_palette;
+    self.closeSidebarContextMenu();
+    self.workspace_header_open_menu_open = false;
+    self.workspace_header_open_menu_pane_id = null;
+    self.blurPaletteComposer();
+    self.noteInteraction();
+    self.markDirty();
+}
+
+/// Opens the sidebar workspace switcher (palette in `.workspaces` mode).
+pub fn openWorkspaceSwitcher(self: anytype) void {
+    self.command_controller.begin(null);
+    self.command_controller.mode = .workspaces;
     self.modal_text_selection_anchor = null;
     self.palette_modal_text_focus = .command_palette;
     self.closeSidebarContextMenu();

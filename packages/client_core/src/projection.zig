@@ -41,7 +41,29 @@ pub const Workspace = struct {
     open: bool,
     panes: []const Pane,
     threads: []const ThreadSummary,
+    /// Switcher identity (docs/workspace-switcher-sidebar.md): semantic icon slot 0..15.
+    icon_index: u8 = 0,
+    /// Theme color slot 0..7; the UI rotates its accent hue by `color_index * 45`.
+    color_index: u8 = 0,
+    /// max(last local focus, newest thread activity); null when neither is known.
+    recency_ms: ?i64 = null,
+    /// 0 = most recently used; the switcher lists workspaces in this order.
+    recency_rank: u32 = 0,
 };
+/// Wall-clock time the user last focused a workspace on this client.
+pub const FocusStamp = struct { workspace_id: []const u8, at_ms: i64 };
+/// FNV-1a 32-bit over the workspace id bytes; shared with desktop and web.
+pub fn identityHash(id: []const u8) u32 {
+    var h: u32 = 0x811C9DC5;
+    for (id) |b| h = (h ^ b) *% 0x01000193;
+    return h;
+}
+pub fn iconIndex(id: []const u8) u8 {
+    return @intCast(identityHash(id) % 16);
+}
+pub fn colorIndex(id: []const u8) u8 {
+    return @intCast((identityHash(id) >> 8) % 8);
+}
 pub const Models = struct {
     workspaces: []const Workspace,
     active: []const Pane,
@@ -257,6 +279,39 @@ fn historyOrder(_: void, l: ThreadSummary, r: ThreadSummary) bool {
     return if (order == .eq) std.mem.lessThan(u8, l.thread_id, r.thread_id) else order == .lt;
 }
 pub fn project(a: A, snapshot: V, catalog: []const V, has_catalog: bool, now: i64) host.ApiError!Models {
+    return projectFocused(a, snapshot, catalog, has_catalog, now, &.{});
+}
+/// Recency order: timestamped workspaces newest first, then untimed open, then
+/// untimed closed; snapshot order breaks ties (no closed-at time is synced).
+fn recencyBefore(workspaces: []const Workspace, l: u32, r: u32) bool {
+    const x = workspaces[l];
+    const y = workspaces[r];
+    if ((x.recency_ms == null) != (y.recency_ms == null)) return x.recency_ms != null;
+    if (x.recency_ms) |xm| {
+        if (xm != y.recency_ms.?) return xm > y.recency_ms.?;
+    } else if (x.open != y.open) return x.open;
+    return l < r;
+}
+/// Fills identity and recency fields; `focus` holds client-local selection times.
+pub fn rankWorkspaces(a: A, workspaces: []Workspace, focus: []const FocusStamp) error{OutOfMemory}!void {
+    const order = try a.alloc(u32, workspaces.len);
+    for (workspaces, order, 0..) |*w, *o, i| {
+        w.icon_index = iconIndex(w.workspace_id);
+        w.color_index = colorIndex(w.workspace_id);
+        var best: ?i64 = null;
+        for (w.threads) |t| if (t.last_activity_at_ms) |ms| {
+            best = @max(best orelse ms, ms);
+        };
+        for (focus) |f| if (eq(f.workspace_id, w.workspace_id)) {
+            best = @max(best orelse f.at_ms, f.at_ms);
+        };
+        w.recency_ms = best;
+        o.* = @intCast(i);
+    }
+    std.mem.sort(u32, order, workspaces, recencyBefore);
+    for (order, 0..) |i, rank| workspaces[i].recency_rank = @intCast(rank);
+}
+pub fn projectFocused(a: A, snapshot: V, catalog: []const V, has_catalog: bool, now: i64, focus: []const FocusStamp) host.ApiError!Models {
     var workspaces: std.ArrayList(Workspace) = .empty;
     var home: std.ArrayList(Pane) = .empty;
     var history: std.ArrayList(ThreadSummary) = .empty;
@@ -289,6 +344,7 @@ pub fn project(a: A, snapshot: V, catalog: []const V, has_catalog: bool, now: i6
         }
         try workspaces.append(a, .{ .workspace_id = wid, .label = fallback(s(ws, "label"), wid), .path = s(ws, "path"), .open = !yes(get(ws, "archived")), .panes = panes, .threads = try summaries.toOwnedSlice(a) });
     }
+    try rankWorkspaces(a, workspaces.items, focus);
     std.mem.sort(Pane, home.items, {}, attentionOrder);
     std.mem.sort(ThreadSummary, history.items, {}, historyOrder);
     return .{ .workspaces = try workspaces.toOwnedSlice(a), .active = try home.toOwnedSlice(a), .history = try history.toOwnedSlice(a) };

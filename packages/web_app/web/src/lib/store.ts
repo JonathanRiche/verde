@@ -1,4 +1,4 @@
-import { batch, createEffect, createMemo, createRoot, createSignal, onCleanup } from 'solid-js'
+import { batch, createEffect, createMemo, createRoot, createSignal, on, onCleanup } from 'solid-js'
 
 import {
   acceleratorMatches,
@@ -54,7 +54,8 @@ import {
   resolveWorkspaceId,
 } from './selection'
 import { linuxWorkspaceId } from './wyhash'
-import { applyWorkspaceOrder, closedWorkspacesFrom, moveWorkspaceBefore } from './workspace_order'
+import { closedWorkspacesFrom } from './workspace_order'
+import { orderSwitcherRows, workspaceRecency, type SidebarScope } from './workspace_switcher'
 import {
   DEFAULT_UI_CONFIG,
   applyUiConfigPatch,
@@ -435,6 +436,32 @@ export interface LastChatPaneLocation {
   thread_id?: string
   thread_index?: number
   thread_title?: string
+}
+
+const WORKSPACE_SELECTED_AT_KEY = 'verde.web.workspace_selected_at'
+const WORKSPACE_SELECTED_AT_LIMIT = 64
+
+/// Client-side "last selected/focused" stamps feeding switcher recency.
+function readWorkspaceSelectedAt(): Record<string, number> {
+  try {
+    const parsed = asRecord(JSON.parse(localStorage.getItem(WORKSPACE_SELECTED_AT_KEY) ?? 'null'))
+    if (!parsed) return {}
+    const out: Record<string, number> = {}
+    for (const [id, at] of Object.entries(parsed)) {
+      if (typeof at === 'number' && Number.isFinite(at)) out[id] = at
+    }
+    return out
+  } catch {
+    return {}
+  }
+}
+
+function writeWorkspaceSelectedAt(stamps: Record<string, number>): void {
+  try {
+    localStorage.setItem(WORKSPACE_SELECTED_AT_KEY, JSON.stringify(stamps))
+  } catch {
+    // Storage can be unavailable in hardened/private browser contexts.
+  }
 }
 
 function readLastChatPaneLocation(): LastChatPaneLocation | null {
@@ -1482,8 +1509,6 @@ export function createAppStore() {
   const [connected, setConnected] = createSignal(false)
   const [workspaces, setWorkspaces] = createSignal<Workspace[]>([])
   const [closedWorkspaces, setClosedWorkspaces] = createSignal<Workspace[]>([])
-  /// Order submitted by a sidebar drag, held until `workspace.reorder` settles.
-  let pendingWorkspaceOrder: string[] | null = null
   const [threadsByWorkspace, setThreadsByWorkspace] = createSignal<Record<string, Thread[]>>({})
   const [panesByWorkspace, setPanesByWorkspace] = createSignal<Record<string, LivePane[]>>({})
   const [workspaceId, setWorkspaceId] = createSignal<string | null>(null)
@@ -1503,7 +1528,11 @@ export function createAppStore() {
   }
   const [workspaceDialogOpen, setWorkspaceDialogOpen] = createSignal(false)
   const [drawerOpen, setDrawerOpen] = createSignal(false)
-  const [sidebarCollapsed, setSidebarCollapsed] = createSignal(false)
+  /// Docked desktop sidebar visibility; there is no icon-only rail.
+  const [sidebarHidden, setSidebarHidden] = createSignal(false)
+  /// Sidebar list filter. Never changes what the canvas shows.
+  const [sidebarScope, setSidebarScope] = createSignal<SidebarScope>('all')
+  const [workspaceSelectedAt, setWorkspaceSelectedAt] = createSignal(readWorkspaceSelectedAt())
   const [sending, setSending] = createSignal(false)
   const [notice, setNotice] = createSignal<string | null>(null)
   const [composerNonce, setComposerNonce] = createSignal(0)
@@ -1656,6 +1685,18 @@ export function createAppStore() {
     }
     return rows
   })
+  /// Every open workspace's panes in workspace order, for the sidebar's flat
+  /// Active/Open sections.
+  const sidebarPanes = createMemo(() => {
+    const by_workspace = panesByWorkspace()
+    const rows: LivePane[] = []
+    for (const item of workspaces()) {
+      for (const pane of by_workspace[item.workspace_id] ?? []) {
+        rows.push(pane.workspace_id ? pane : { ...pane, workspace_id: item.workspace_id })
+      }
+    }
+    return rows
+  })
   const focusedChat = createMemo(() => {
     const pane = focusedPane()
     return pane?.kind === 'chat' ? pane : visiblePanes().find((item) => item.kind === 'chat') ?? null
@@ -1794,7 +1835,7 @@ export function createAppStore() {
           return row ? { ...row, ...item, workspace_layout_json: row.workspace_layout_json } : item
         })
       : workspacesFromVolatile(root, stored)
-    const list = applyWorkspaceOrder(listed.filter((item) => item.workspace_id && !item.archived), pendingWorkspaceOrder)
+    const list = listed.filter((item) => item.workspace_id && !item.archived)
     if (list.length === 0 && lastSessions.length === 0) return
     setWorkspaces((prev) => (sameJson(prev, list) ? prev : list))
 
@@ -3898,41 +3939,66 @@ export function createAppStore() {
     return false
   }
 
-  /// Sidebar drag drop: persist the new open-workspace order in the daemon
-  /// store, which the desktop re-projects like any other store change.
-  const moveWorkspace = async (id: string, before_id: string | null) => {
-    const current = workspaces()
-    const order = moveWorkspaceBefore(current.map((row) => row.workspace_id), id, before_id)
-    if (!order) return
-    pendingWorkspaceOrder = order
-    setWorkspaces(applyWorkspaceOrder(current, order))
-    publishPanes(workspaces())
-    try {
-      const response = await interactiveCall('workspace.reorder', {
-        mutation: { client_id: await ensureClientId(), request_key: mintId('web:workspace.reorder:') },
-        workspace_ids: order,
-      })
-      if (methodUnavailable(response)) setNotice('Update Verde to reorder workspaces from the web.')
-      else callSucceeded(response, 'could not reorder workspaces')
-    } catch {
-      setNotice('could not reorder workspaces')
-    } finally {
-      if (pendingWorkspaceOrder === order) pendingWorkspaceOrder = null
-      liveWorkspaces = null
-      await refreshProjection()
-    }
-  }
-
   /// Desktop "Reopen Last Closed Workspace" and palette "Reopen <label>" rows.
-  const reopenClosedWorkspace = async (id?: string) => {
+  const reopenClosedWorkspace = async (id?: string): Promise<boolean> => {
     const target = id ?? closedWorkspaces()[0]?.workspace_id
     if (!target) {
       setNotice('No closed workspaces to reopen.')
+      return false
+    }
+    if (!(await historyApi.reopenWorkspace(target))) return false
+    setClosedWorkspaces((prev) => prev.filter((row) => row.workspace_id !== target))
+    return true
+  }
+
+  // Switcher recency: max(last selection here, newest thread activity).
+  createEffect(on(workspaceId, (id) => {
+    if (!id) return
+    const next = { ...workspaceSelectedAt(), [id]: Date.now() }
+    const kept = Object.entries(next).sort((a, b) => b[1] - a[1]).slice(0, WORKSPACE_SELECTED_AT_LIMIT)
+    const stamps = Object.fromEntries(kept)
+    setWorkspaceSelectedAt(stamps)
+    writeWorkspaceSelectedAt(stamps)
+    // A single-workspace scope follows the current workspace (keyboard
+    // stepping, reopen); the All scope stays put.
+    if (sidebarScope() !== 'all' && sidebarScope() !== id) setSidebarScope(id)
+  }))
+  // A scoped workspace that closes drops the sidebar back to All.
+  createEffect(() => {
+    const scope = sidebarScope()
+    if (scope === 'all' || workspaces().length === 0) return
+    if (!workspaces().some((row) => row.workspace_id === scope)) setSidebarScope('all')
+  })
+  const switcherRows = createMemo(() => {
+    const catalogs = threadsByWorkspace()
+    const stamps = workspaceSelectedAt()
+    return orderSwitcherRows(workspaces(), closedWorkspaces(), (row) => workspaceRecency(row, catalogs[row.workspace_id], stamps))
+  })
+
+  /// Switcher selection: All only rescopes; a workspace also becomes current
+  /// (reopening it first when closed).
+  const selectSidebarScope = async (scope: SidebarScope) => {
+    if (scope === 'all') {
+      setSidebarScope('all')
       return
     }
-    if (await historyApi.reopenWorkspace(target)) {
-      setClosedWorkspaces((prev) => prev.filter((row) => row.workspace_id !== target))
+    if (!workspaces().some((row) => row.workspace_id === scope)) {
+      if (!(await reopenClosedWorkspace(scope))) return
+      setSidebarScope(scope)
+      return
     }
+    setSidebarScope(scope)
+    if (workspaceId() !== scope) selectWorkspace(scope)
+    else setDrawerOpen(false)
+  }
+
+  /// Sidebar New chat / New terminal: the scoped workspace, or under All the
+  /// most recently used one (the current workspace, which every selection
+  /// and pane focus updates).
+  const sidebarTargetWorkspaceId = () => {
+    const scope = sidebarScope()
+    if (scope !== 'all') return scope
+    return workspace()?.workspace_id ?? switcherRows().find((row) => !row.closed)?.workspace.workspace_id
   }
 
   const workspaceCommand = (current: Workspace, patch: { label: string } | { archived: true }) =>
@@ -4626,7 +4692,7 @@ export function createAppStore() {
       if (action.kind === 'pane_select') selectPaneAt(action.index)
       if (action.kind === 'workspace_select') {
         const next = workspaces()[action.index]
-        if (next) selectWorkspace(next.workspace_id)
+        if (next) void selectSidebarScope(next.workspace_id)
       }
       if (action.kind === 'active_select') selectPaneAt(action.index, activePanes())
       return
@@ -4637,7 +4703,7 @@ export function createAppStore() {
         break
       case 'toggle_sidebar':
       case 'toggle_sidebar_hidden':
-        if (window.matchMedia('(min-width: 1024px)').matches) setSidebarCollapsed((value) => !value)
+        if (window.matchMedia('(min-width: 1024px)').matches) setSidebarHidden((value) => !value)
         else setDrawerOpen((open) => !open)
         break
       case 'new_thread':
@@ -4701,7 +4767,7 @@ export function createAppStore() {
       const index = Number(ordinal[2]) - 1
       if (ordinal[1] === 'select') {
         const next = workspaces()[index]
-        if (next) selectWorkspace(next.workspace_id)
+        if (next) void selectSidebarScope(next.workspace_id)
       } else selectPaneAt(index, ordinal[1] === 'active_select' ? activePanes() : openPanes())
       return
     }
@@ -5040,8 +5106,11 @@ export function createAppStore() {
     initialViewReady,
     workspaces,
     closedWorkspaces,
-    moveWorkspace,
     reopenClosedWorkspace,
+    sidebarScope,
+    selectSidebarScope,
+    switcherRows,
+    sidebarTargetWorkspaceId,
     workspace,
     workspaceId,
     openPanes,
@@ -5049,6 +5118,7 @@ export function createAppStore() {
     visiblePanes,
     canvasLayout,
     activePanes,
+    sidebarPanes,
     focusedPane,
     focusedPaneId,
     focusedChat,
@@ -5064,8 +5134,8 @@ export function createAppStore() {
     setWorkspaceDialogOpen,
     drawerOpen,
     setDrawerOpen,
-    sidebarCollapsed,
-    setSidebarCollapsed,
+    sidebarHidden,
+    setSidebarHidden,
     sending,
     notice,
     setNotice,

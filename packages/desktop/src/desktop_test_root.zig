@@ -49,6 +49,7 @@ test {
     _ = @import("state/git_changes_controller.zig");
     _ = @import("ui/commit_sheet.zig");
     _ = @import("ui/workspace_strip.zig");
+    _ = @import("ui/workspace_identity.zig");
     _ = @import("ui/browser.zig");
     _ = @import("ui/chat_panel.zig");
     _ = @import("ui/terminal_panel.zig");

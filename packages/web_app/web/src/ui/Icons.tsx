@@ -1,7 +1,9 @@
-import { Show } from 'solid-js'
+import { Show, createMemo } from 'solid-js'
 
 import { store } from '../lib/store'
+import { themeTone } from '../lib/theme'
 import type { LivePane } from '../lib/types'
+import { workspaceIdentity } from '../lib/workspace_identity'
 
 import logoMaskUrl from '../../../../desktop/src/assets/verde_logo_mask.png'
 import openaiUrl from '../../../../desktop/src/assets/OpenAI-white-monoblossom.png'
@@ -98,6 +100,24 @@ export function Icon(props: { name: string; class?: string }) {
     unzoom: 'M9 5v4H5 M15 5v4h4 M9 19v-4H5 M15 19v-4h4',
     lock: 'M8 11h8v7H8z M9.4 11V8.8a2.6 2.6 0 0 1 5.2 0V11',
     paperclip: 'M8.5 12.5l5.8-5.8a3 3 0 0 1 4.2 4.2l-7.2 7.2a4.5 4.5 0 0 1-6.4-6.4l7-7 M9.2 14.8l6.6-6.6',
+    layers: 'M12 4.5l7.5 3.8-7.5 3.8-7.5-3.8z M4.5 12.2l7.5 3.8 7.5-3.8 M4.5 15.9l7.5 3.8 7.5-3.8',
+    // Workspace identity set (lib/workspace_identity.ts WORKSPACE_ICONS order).
+    'ws-folder': 'M4 8h6l2 2h8v8H4z',
+    'ws-rocket': 'M12 4c2.6 1.8 4 4.8 4 8.2V15H8v-2.8C8 8.8 9.4 5.8 12 4z M8 12.5l-2.5 2.5v2.5H8 M16 12.5l2.5 2.5v2.5H16 M11 18.5h2 M12 9h.01',
+    'ws-flask': 'M10 4h4 M10.5 4v5L6 17.5a1 1 0 0 0 .9 1.5h10.2a1 1 0 0 0 .9-1.5L13.5 9V4 M8 14h8',
+    'ws-leaf': 'M6 18c0-7 4-12 12-12 0 8-5 12-12 12z M6 18l6-6',
+    'ws-bolt': 'M13 4L6.5 13H12l-1 7 6.5-9H12z',
+    'ws-star': 'M12 4.5l2.3 4.7 5.2.8-3.8 3.7.9 5.2-4.6-2.4-4.6 2.4.9-5.2-3.8-3.7 5.2-.8z',
+    'ws-flame': 'M12 4c.5 3 4.5 5 4.5 9a4.5 4.5 0 0 1-9 0c0-2 1-3.5 2-4.5.3 1.5 1 2.5 2 2.5 0-2.5-.5-5 .5-7z',
+    'ws-cube': 'M12 4l7 4v8l-7 4-7-4V8z M5 8l7 4 7-4 M12 12v8',
+    'ws-code': 'M9 8l-4 4 4 4 M15 8l4 4-4 4 M13.5 6.5l-3 11',
+    'ws-terminal': 'M5 7h14v10H5z M7.5 10l2.2 2-2.2 2 M11.5 14h4',
+    'ws-globe': 'M12 4.5a7.5 7.5 0 1 0 0 15 7.5 7.5 0 0 0 0-15z M4.5 12h15 M12 4.5c2.2 2.3 3 4.8 3 7.5s-.8 5.2-3 7.5c-2.2-2.3-3-4.8-3-7.5s.8-5.2 3-7.5z',
+    'ws-heart': 'M12 18.5S5 14.5 5 9.6A3.4 3.4 0 0 1 12 8a3.4 3.4 0 0 1 7 1.6c0 4.9-7 8.9-7 8.9z',
+    'ws-moon': 'M18 14.5A7 7 0 0 1 9.5 6a7 7 0 1 0 8.5 8.5z',
+    'ws-sun': 'M12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6z M12 4v2 M12 18v2 M4 12h2 M18 12h2 M6.3 6.3l1.4 1.4 M16.3 16.3l1.4 1.4 M6.3 17.7l1.4-1.4 M16.3 7.7l1.4-1.4',
+    'ws-compass': 'M12 4.5a7.5 7.5 0 1 0 0 15 7.5 7.5 0 0 0 0-15z M14.8 9.2l-1.6 4-4 1.6 1.6-4z',
+    'ws-puzzle': 'M5 9h3a2 2 0 1 1 4 0h3v3a2 2 0 1 1 0 4v3H5v-3.5a2 2 0 1 0 0-4z',
   }
   return (
     <svg class={props.class ?? 'h-4 w-4'} viewBox="0 0 24 24" aria-hidden="true">
@@ -110,6 +130,21 @@ export function Icon(props: { name: string; class?: string }) {
         stroke-linejoin="round"
       />
     </svg>
+  )
+}
+
+/// Workspace identity chip: the workspace's deterministic icon drawn in its
+/// theme-derived slot color on a square tinted with that color.
+export function WorkspaceGlyph(props: { workspaceId: string; class?: string; iconClass?: string; dim?: boolean }) {
+  const identity = createMemo(() => workspaceIdentity(props.workspaceId, themeTone().accent, themeTone().dark))
+  return (
+    <span
+      class={`grid shrink-0 place-items-center rounded-[5px] ${props.class ?? 'h-5 w-5'} ${props.dim ? 'opacity-50' : ''}`}
+      style={{ color: identity().color, background: `${identity().color}2e` }}
+      aria-hidden="true"
+    >
+      <Icon name={`ws-${identity().icon}`} class={props.iconClass ?? 'h-3.5 w-3.5'} />
+    </span>
   )
 }
 

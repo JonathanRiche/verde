@@ -39,13 +39,21 @@ export function App() {
   })
   onCleanup(() => clearTimeout(drawerExitTimer))
 
-  const railWidth = () => (store.sidebarCollapsed() ? 'var(--sidebar-collapsed)' : 'var(--sidebar-w)')
   const focused = () => store.focusedPane()
 
   return (
     <div class="flex h-full min-h-0 bg-[var(--chat-black)]">
-      <div class="sidebar-rail hidden shrink-0 lg:block" style={{ width: railWidth() }}>
-        <Sidebar />
+      {/* The docked sidebar is either fully shown or fully hidden (no icon
+          rail); the inner box keeps its width so the slide does not reflow. */}
+      <div
+        class="sidebar-rail hidden shrink-0 lg:block"
+        style={{ width: store.sidebarHidden() ? '0px' : 'var(--sidebar-w)' }}
+        aria-hidden={store.sidebarHidden()}
+        inert={store.sidebarHidden()}
+      >
+        <div class="h-full w-[var(--sidebar-w)]">
+          <Sidebar />
+        </div>
       </div>
 
       <Show when={drawerMounted()}>
@@ -90,6 +98,17 @@ export function App() {
 
         <WorkspaceCanvas />
         <PrefixBar />
+        <Show when={store.sidebarHidden()}>
+          <button
+            type="button"
+            class="absolute bottom-3 left-3 z-20 hidden h-8 w-8 place-items-center rounded-[7px] border border-[var(--border-muted)] bg-[var(--panel)] text-[var(--text-subtle)] shadow-[0_6px_20px_rgba(0,0,0,0.35)] hover:text-white lg:grid"
+            aria-label="Show sidebar"
+            title="Show sidebar (Ctrl+S)"
+            onClick={() => store.setSidebarHidden(false)}
+          >
+            <Icon name="expand" class="h-4 w-4" />
+          </button>
+        </Show>
       </div>
 
       <Palette />

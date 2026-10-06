@@ -153,6 +153,49 @@ class BrowseTest {
         assertTrue(recentThreads(null).isEmpty())
     }
 
+    @Test fun switcherOrdersByRecencyFiltersFuzzilyAndTargetsMostRecentOpenWorkspace() {
+        fun ws(id: String, rank: Long, open: Boolean = true) = Workspace(id, id, "/$id", open, emptyList(), emptyList(), recency_rank = rank)
+        val items = listOf(ws("c", 2), ws("closed", 0, open = false), ws("a", 1))
+        assertEquals(listOf("closed", "a", "c"), switcherWorkspaces(items).map { it.workspace_id })
+        assertEquals("a", mostRecentOpenWorkspace(items)?.workspace_id)
+        assertNull(mostRecentOpenWorkspace(listOf(ws("closed", 0, open = false))))
+        assertTrue(fuzzyMatches("vrd", "Verde"))
+        assertTrue(fuzzyMatches(" ", "anything"))
+        assertTrue(fuzzyMatches("all", "All Workspaces"))
+        assertFalse(fuzzyMatches("dv", "Verde"))
+    }
+
+    @Test fun workspaceIdentityColorsRotateTheClampedAccent() {
+        assertEquals(16, WORKSPACE_ICON_NAMES.size)
+        val slot0 = workspaceColor(0)
+        val slot4 = workspaceColor(4)
+        // Slot 0 keeps the accent hue (green dominant); slot 4 is the complement (+180°).
+        assertTrue(slot0.green > slot0.red && slot0.green > slot0.blue)
+        assertTrue(slot4.red > slot4.green || slot4.blue > slot4.green)
+        assertEquals(workspaceColor(1), workspaceColor(9))
+        (0 until 8).forEach { k ->
+            val c = workspaceColor(k)
+            val l = (maxOf(c.red, c.green, c.blue) + minOf(c.red, c.green, c.blue)) / 2f
+            assertTrue("slot $k lightness $l", l in .545f..0.725f)
+            val light = workspaceColor(k, dark = false)
+            val ll = (maxOf(light.red, light.green, light.blue) + minOf(light.red, light.green, light.blue)) / 2f
+            assertTrue("light slot $k lightness $ll", ll in .375f..0.505f)
+        }
+    }
+
+    @Test fun drawerSectionsSplitActiveFromOpenAcrossScope() {
+        val workspace = K09.workspaces.data!!.items.first()
+        val (active, open) = drawerItems(listOf(workspace), null)
+        val all = active + open
+        assertTrue(all.isNotEmpty())
+        assertTrue(all.all { it.workspace.workspace_id == workspace.workspace_id })
+        assertTrue(active.all { it.active } && open.none { it.active })
+        val (scopedActive, scopedOpen) = drawerItems(listOf(workspace), "other")
+        assertTrue(scopedActive.isEmpty() && scopedOpen.isEmpty())
+        val closed = drawerItems(listOf(workspace.copy(open = false)), null)
+        assertTrue(closed.first.isEmpty() && closed.second.isEmpty())
+    }
+
     @Test fun drawerOnlyListsOpenChatsWhileWorkspaceKeepsHistory() {
         val workspace = K09.workspaces.data!!.items.first()
         val template = workspace.threads.first { it.thread_id == "layout-thread" }
@@ -166,7 +209,9 @@ class BrowseTest {
         launch()
         awaitText("NEEDS ATTENTION")
         compose.onNodeWithContentDescription("Open workspace drawer").performClick()
-        compose.onNode(hasText("Fixture workspace") and hasAnyAncestor(hasTestTag("workspace-drawer"))).performClick()
+        compose.onNodeWithTag("workspace-switcher").performClick()
+        compose.onNodeWithText("Search workspaces").assertExists()
+        compose.onNodeWithContentDescription("Settings for Fixture workspace").performClick()
         awaitText("PANES")
         compose.onNodeWithContentDescription("Close workspace drawer").assertDoesNotExist()
         compose.onNodeWithContentDescription("Open workspace drawer").performClick()

@@ -104,6 +104,33 @@ class ManageTest {
         assertEquals("t1", sent<EventThreadClose>().single().thread_id)
     }
 
+    @Test fun switcherScopesReopensClosedWorkspacesAndOpensSettings() {
+        launch()
+        compose.onNodeWithContentDescription("Open workspace drawer").performClick()
+        compose.onNodeWithContentDescription("Workspace scope: All Workspaces").assertExists()
+        compose.onNodeWithTag("workspace-switcher").performClick()
+        compose.onNodeWithTag("workspace-switcher-search").performTextInput("od")
+        val menuAll = hasText("All Workspaces") and hasAnyAncestor(hasTestTag("workspace-switcher-menu"))
+        await { exists("Old") && compose.onAllNodes(menuAll).fetchSemanticsNodes().isEmpty() }
+        assertTrue(exists("Closed"))
+        click("Old")
+        await { sent<EventWorkspaceArchive>().size == 1 }
+        assertEquals("ws-old", sent<EventWorkspaceArchive>().single().workspace_id)
+        assertFalse(sent<EventWorkspaceArchive>().single().archived)
+        compose.onNodeWithContentDescription("Workspace scope: Old").assertExists()
+        compose.onNodeWithTag("workspace-switcher").performClick()
+        compose.onNodeWithContentDescription("Settings for One").performClick()
+        awaitText("Rename")
+    }
+
+    @Test fun drawerNewChatUnderAllWorkspacesTargetsTheMostRecentOpenWorkspace() {
+        launch()
+        compose.onNodeWithContentDescription("Open workspace drawer").performClick()
+        compose.onNode(hasContentDescription("New chat") and hasAnyAncestor(hasTestTag("workspace-drawer"))).performClick()
+        await { sent<EventNewChatSelect>().isNotEmpty() }
+        assertEquals("ws-one", sent<EventNewChatSelect>().last().workspace_id)
+    }
+
     @Test fun historyGroupsPagesSearchesFiltersAndResetsOnLeave() {
         launch()
         awaitText("All chats")
