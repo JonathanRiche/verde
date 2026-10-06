@@ -3,6 +3,7 @@
 - SDL3 owns windows, events, logical size, drawable pixels, and display scale; SDL_GPU renders; Palette owns layout and batches. This is not HTML/CSS or ImGui.
 - `main.zig` coordinates sizing/events; `palette_frame_renderer.zig` owns rendering/fonts. Inspect `window.getSize`,  `SDL_GetWindowSizeInPixels`, and `SDL_GetWindowDisplayScale` before adding scale factors. Layout, commands, and renderer must share a coordinate space; render against drawable pixels.
 - Use explicit `palette.Rect`s, shared spacing, measured text, and clamped ratios. Name unusual geometry tokens. Never guess character widths for truncation or caret placement.
+- Borders, rings, and dividers follow [Palette's crisp-chrome rules](../../../palette/AGENTS.md): whole-pixel strokes, edge-snapped rects, one `panel` command per bordered surface.
 - Start render methods with a short region comment; explain non-obvious geometry. For major changes check wide, laptop, short-height, and differing-scale layouts in the real app with screenshots, subject to root session-safety rules.
 - Transcript scrolling is direct: apply wheel/keyboard offsets once, without inertia or continuous frames. Clear pending scroll on thread switches and jump-to-bottom.
 

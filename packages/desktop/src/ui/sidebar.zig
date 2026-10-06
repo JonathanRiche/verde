@@ -1097,8 +1097,8 @@ fn renderWorkspaceSwitcherTrigger(state: *runtime.AppState, rect: palette.Rect, 
     const open = state.command_controller.open and state.command_controller.mode == .workspaces;
     const hovered = switcher_trigger_hovered or open;
     const radius = theme.scaledUi(7.0);
-    queuePaletteRoundedRect(state, snapRect(rect), paletteColor(if (hovered) theme.wash(theme.COLOR_GREEN, 48) else theme.withAlpha(theme.COLOR_PANEL_ALT, 120)), radius);
-    queuePaletteBorder(state, snapRect(rect), paletteColor(theme.borderMuted()), radius, theme.scaledUi(1.0));
+    // One panel command: fill + whole-pixel border composited in a single SDF pass.
+    queuePalettePanel(state, rect, paletteColor(if (hovered) theme.wash(theme.COLOR_GREEN, 48) else theme.withAlpha(theme.COLOR_PANEL_ALT, 120)), paletteColor(theme.borderMuted()), radius, theme.scaledUi(1.0));
     addPaletteHit(rect, .workspace_switcher, state.project_controller.selected_index, 0);
 
     const projects = state.project_controller.projects.items;
@@ -2454,13 +2454,12 @@ fn queuePaletteImage(state: *runtime.AppState, rect: palette.Rect, cached: nativ
     return true;
 }
 
+/// Snaps each edge to the pixel grid (not origin + size) so adjacent rects
+/// share edges without one-pixel gaps or overlaps.
 fn snapRect(rect: palette.Rect) palette.Rect {
-    return .{
-        .x = @round(rect.x),
-        .y = @round(rect.y),
-        .w = @round(rect.w),
-        .h = @round(rect.h),
-    };
+    const x = @round(rect.x);
+    const y = @round(rect.y);
+    return .{ .x = x, .y = y, .w = @round(rect.x + rect.w) - x, .h = @round(rect.y + rect.h) - y };
 }
 
 /// Strips a leading run of non-ASCII bytes (a symbol/emoji marker such as the

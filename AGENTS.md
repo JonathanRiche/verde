@@ -50,6 +50,7 @@ Run commands from the repository root. Use the narrowest check during iteration.
 Read the relevant file before working on that subsystem, including changes from outside its directory:
 
 - [Desktop architecture and subsystem index](packages/desktop/AGENTS.md)
+- [Palette renderer and crisp UI chrome](packages/palette/AGENTS.md)
 - [Web client and gateway](packages/web_app/AGENTS.md)
 - [Website](packages/website/AGENTS.md)
 - [Tree-sitter package](packages/zig_treesitter/AGENTS.md)

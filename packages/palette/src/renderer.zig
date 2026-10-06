@@ -2034,14 +2034,21 @@ fn appendCommand(allocator: std.mem.Allocator, mesh: *Mesh, command: draw.Comman
 const SDF_HALO: f32 = 1.0;
 
 fn appendSdfRectCommand(allocator: std.mem.Allocator, mesh: *Mesh, command: draw.Command) !void {
-    const rect = command.rect;
-    if (rect.w <= 0.0 or rect.h <= 0.0) return;
+    if (command.rect.w <= 0.0 or command.rect.h <= 0.0) return;
 
     const border_color: draw.Color = if (command.border_color) |bc|
         if (command.border_width > 0.0 and bc.a > 0.0) bc else .{ .a = 0.0 }
     else
         .{ .a = 0.0 };
-    const border_width: f32 = if (border_color.a > 0.0) @max(command.border_width, 1.0) else 0.0;
+    // Stroked rects land on the device pixel grid: edges snap independently
+    // and the stroke is a whole number of pixels. A fractional stroke (e.g.
+    // `1.0 * 1.25` display scale) or a half-pixel edge smears the ring across
+    // two pixel rows, which reads as a soft, uneven, "pixelated" border with
+    // lumpy corners. Fill-only rects keep sub-pixel geometry for smooth motion.
+    const stroked = border_color.a > 0.0;
+    const rect = if (stroked) snapRectToPixelGrid(command.rect) else command.rect;
+    if (rect.w <= 0.0 or rect.h <= 0.0) return;
+    const border_width: f32 = if (stroked) strokePixelWidth(command.border_width) else 0.0;
     const fill_color: draw.Color = if (command.color.a > 0.0) command.color else .{ .a = 0.0 };
     if (fill_color.a <= 0.0 and border_color.a <= 0.0) return;
 
@@ -2066,6 +2073,30 @@ fn appendSdfRectCommand(allocator: std.mem.Allocator, mesh: *Mesh, command: draw
         .border_width = border_width,
         .border = border_color,
     });
+}
+
+/// Rounds each edge (not origin + size) so neighbours sharing an edge stay
+/// gap-free at fractional display scales.
+pub fn snapRectToPixelGrid(rect: draw.Rect) draw.Rect {
+    const x = @round(rect.x);
+    const y = @round(rect.y);
+    return .{ .x = x, .y = y, .w = @round(rect.x + rect.w) - x, .h = @round(rect.y + rect.h) - y };
+}
+
+/// Whole-pixel stroke width, never thinner than one device pixel.
+pub fn strokePixelWidth(width: f32) f32 {
+    return @max(@round(width), 1.0);
+}
+
+test "stroked rects snap to whole device pixels" {
+    const snapped = snapRectToPixelGrid(.{ .x = 10.4, .y = 20.6, .w = 100.3, .h = 30.2 });
+    try std.testing.expectEqual(@as(f32, 10.0), snapped.x);
+    try std.testing.expectEqual(@as(f32, 21.0), snapped.y);
+    try std.testing.expectEqual(@as(f32, 101.0), snapped.w); // right edge 110.7 -> 111
+    try std.testing.expectEqual(@as(f32, 30.0), snapped.h); // bottom edge 50.8 -> 51
+    try std.testing.expectEqual(@as(f32, 1.0), strokePixelWidth(1.25));
+    try std.testing.expectEqual(@as(f32, 1.0), strokePixelWidth(0.5));
+    try std.testing.expectEqual(@as(f32, 2.0), strokePixelWidth(1.75));
 }
 
 const SdfParams = struct {
