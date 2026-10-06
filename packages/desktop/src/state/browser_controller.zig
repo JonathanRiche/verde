@@ -9,6 +9,7 @@ const browser_readiness = @import("../browser/readiness.zig");
 const browser_background_events = @import("browser_background_events.zig");
 const browser_history_controller = @import("browser_history_controller.zig");
 const browser_suggestions = @import("browser_suggestions.zig");
+const local_servers = @import("local_servers.zig");
 const browser_screenshot = @import("../browser/screenshot.zig");
 const runtime_log = @import("../runtime/log.zig");
 const theme = @import("../ui/theme.zig");
@@ -225,6 +226,8 @@ pub const State = struct {
     context_menu_active_parent: ?u32 = null,
     /// Address-bar history dropdown plus the visit-recording gate.
     suggestions: browser_suggestions.State,
+    /// Loopback HTTP servers offered on the empty new-tab page.
+    local_servers: local_servers.Scanner = .{},
 
     pub fn init(allocator: std.mem.Allocator) !State {
         return .{
@@ -234,6 +237,7 @@ pub const State = struct {
     }
 
     pub fn deinit(self: *State, allocator: std.mem.Allocator) void {
+        self.local_servers.deinit();
         self.suggestions.deinit(allocator);
         for (self.context_menu_items.items) |item| allocator.free(item.label);
         self.context_menu_items.deinit(allocator);
@@ -2107,11 +2111,22 @@ pub fn setBrowserInspectorMode(self: anytype, mode: browser_runtime.InspectorMod
     self.applyBrowserInspector(true, inspectorModeSwitchedNotice(mode));
 }
 
+/// Mirrors the renderer's empty-page test so the new-tab server list only
+/// scans while it can be seen.
+fn browserEmptyStateVisible(self: anytype) bool {
+    if (!self.isBrowserVisible()) return false;
+    const runtime = &self.browser_controller.runtime;
+    const raw = runtime.current_url orelse runtime.addressInput();
+    const url = std.mem.trim(u8, raw, &std.ascii.whitespace);
+    return url.len == 0 or isBlankBrowserUrl(url);
+}
+
 /// Applies queued browser runtime events back onto app-visible browser state.
 pub fn pollBrowser(self: anytype) bool {
     if (!self.browser_textures_enabled) return false;
 
     var needs_render = self.pollPendingBrowserDevServer();
+    needs_render = self.browser_controller.local_servers.poll(unixTimestampMs(), browserEmptyStateVisible(self)) or needs_render;
     // Retained helpers keep running even when the presented slot has no backend.
     needs_render = pollRetainedBrowserRuntimes(self) or needs_render;
     if (self.browser_controller.launch_open_delay_frames == 0 and !self.browser_controller.runtime.controller.hasBackend()) return needs_render;

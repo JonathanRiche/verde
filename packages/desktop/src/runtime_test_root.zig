@@ -29,6 +29,7 @@ test {
     _ = @import("daemon/browser_cookie_import.zig");
     _ = @import("db/client.zig");
     _ = @import("state/browser_suggestions.zig");
+    _ = @import("state/local_servers.zig");
     _ = @import("state/browser_history_controller.zig");
     _ = @import("cli/runtime_profiles.zig");
 }

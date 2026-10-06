@@ -10,6 +10,7 @@ const browser_runtime = @import("../browser/mod.zig");
 const colors = @import("colors.zig");
 const context_menu = @import("context_menu.zig");
 const theme = @import("theme.zig");
+const local_servers = @import("../state/local_servers.zig");
 
 // Nerd Font Symbols codicon glyphs. Codepoints match the Microsoft Codicons
 // table (https://microsoft.github.io/vscode-codicons/dist/codicon.html) and
@@ -30,6 +31,7 @@ const NF_COD_LOCK = "\u{EA75}";
 const NF_COD_WARNING = "\u{EA6C}";
 const NF_COD_LINK_EXTERNAL = "\u{EB14}";
 const NF_COD_GLOBE = "\u{EB01}";
+const NF_COD_RADIO_TOWER = "\u{EB6C}";
 
 const TAB_ROW_HEIGHT: f32 = 36.0;
 const NAV_ROW_HEIGHT: f32 = 44.0;
@@ -65,6 +67,7 @@ const BrowserHitKind = enum {
     inspect_mode_draw_box,
     inspect_mode_draw_freeform,
     setup_dev_server,
+    local_server,
     new_tab,
     close_tab,
     copy_url,
@@ -77,9 +80,11 @@ const BrowserHitKind = enum {
 const BrowserHit = struct {
     rect: palette.Rect,
     kind: BrowserHitKind,
+    /// Loopback port for `.local_server` rows.
+    port: u16 = 0,
 };
 
-var palette_hits: [24]BrowserHit = undefined;
+var palette_hits: [40]BrowserHit = undefined;
 var palette_hit_count: usize = 0;
 var palette_toolbar_rect: palette.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
 var palette_menu_rect: palette.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
@@ -454,6 +459,12 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down
             .setup_dev_server => {
                 blurAddress(state);
                 state.setupBrowserDevServer();
+            },
+            .local_server => {
+                blurAddress(state);
+                var url_buffer: [32]u8 = undefined;
+                const url = std.fmt.bufPrint(&url_buffer, "http://localhost:{d}", .{hit.port}) catch unreachable;
+                state.navigateBrowserToUrl(url) catch {};
             },
             .new_tab => {
                 blurAddress(state);
@@ -1368,7 +1379,7 @@ fn renderToolbarTooltip(state: *app_state.AppState) void {
     while (index > 0) {
         index -= 1;
         const hit = palette_hits[index];
-        if (!rectHovered(hit.rect) or hit.kind == .address) continue;
+        if (!rectHovered(hit.rect) or hit.kind == .address or hit.kind == .local_server) continue;
         const label = toolbarTooltipLabel(state, hit.kind);
         const font_size = theme.scaledUi(11.0);
         const text_w = app_state.paletteUiTextPrefixWidth(label, font_size, label.len);
@@ -1406,6 +1417,7 @@ fn toolbarTooltipLabel(state: *app_state.AppState, kind: BrowserHitKind) []const
         .inspect_mode_draw_box => "Box inspector",
         .inspect_mode_draw_freeform => "Freeform inspector",
         .setup_dev_server => "Set up development server",
+        .local_server => "",
         .new_tab => "New tab",
         .close_tab => "Close active tab",
         .copy_url => "Copy URL",
@@ -1879,8 +1891,12 @@ fn wordBoundsAt(address: []const u8, offset: usize) SelectionRange {
 }
 
 fn addPaletteHit(rect: palette.Rect, kind: BrowserHitKind) void {
+    addPaletteHitWithPort(rect, kind, 0);
+}
+
+fn addPaletteHitWithPort(rect: palette.Rect, kind: BrowserHitKind, port: u16) void {
     if (palette_hit_count >= palette_hits.len) return;
-    palette_hits[palette_hit_count] = .{ .rect = rect, .kind = kind };
+    palette_hits[palette_hit_count] = .{ .rect = rect, .kind = kind, .port = port };
     palette_hit_count += 1;
 }
 
@@ -2077,7 +2093,11 @@ fn renderPanePlaceholder(state: *app_state.AppState, pane_rect: palette.Rect) vo
     const body_size = theme.scaledUi(14.0);
     const button_width = theme.scaledUi(170.0);
     const button_height = theme.scaledUi(38.0);
-    const block_height = theme.scaledUi(180.0);
+    const intro_height = theme.scaledUi(180.0);
+    const servers = state.browser_controller.local_servers.list();
+    const server_rows = visibleLocalServerRows(servers.len, pane_rect.h - intro_height - theme.scaledUi(56.0));
+    const servers_height = if (server_rows > 0) theme.scaledUi(LOCAL_SERVERS_GAP) + localServersSectionHeight(server_rows) else 0.0;
+    const block_height = intro_height + servers_height;
     const x = pane_rect.x + (pane_rect.w - content_width) * 0.5;
     const y = pane_rect.y + @max((pane_rect.h - block_height) * 0.38, theme.scaledUi(28.0));
 
@@ -2105,6 +2125,148 @@ fn renderPanePlaceholder(state: *app_state.AppState, pane_rect: palette.Rect) vo
         .h = body_size * 1.25,
     }, "Set up dev server", paletteColor(theme.foregroundOn(button_fill)), body_size, button_rect);
     addPaletteHit(button_rect, .setup_dev_server);
+
+    if (server_rows > 0) {
+        renderLocalServers(state, .{
+            .x = x,
+            .y = button_rect.y + button_rect.h + theme.scaledUi(LOCAL_SERVERS_GAP),
+            .w = content_width,
+            .h = localServersSectionHeight(server_rows),
+        }, servers[0..server_rows], pane_rect);
+    }
+}
+
+const LOCAL_SERVERS_GAP: f32 = 36.0;
+const LOCAL_SERVER_HEADER_HEIGHT: f32 = 34.0;
+const LOCAL_SERVER_ROW_HEIGHT: f32 = 72.0;
+const LOCAL_SERVER_CAPTION_HEIGHT: f32 = 34.0;
+const LOCAL_SERVER_RADIUS: f32 = 12.0;
+const LOCAL_SERVER_ICON_SIZE: f32 = 32.0;
+
+fn localServersSectionHeight(rows: usize) f32 {
+    return theme.scaledUi(LOCAL_SERVER_HEADER_HEIGHT + LOCAL_SERVER_CAPTION_HEIGHT) +
+        theme.scaledUi(LOCAL_SERVER_ROW_HEIGHT) * @as(f32, @floatFromInt(rows));
+}
+
+/// Drops rows that would overflow short panes; the list hides entirely when
+/// not even one row fits.
+fn visibleLocalServerRows(count: usize, available_height: f32) usize {
+    var rows = count;
+    while (rows > 0 and theme.scaledUi(LOCAL_SERVERS_GAP) + localServersSectionHeight(rows) > available_height) rows -= 1;
+    return rows;
+}
+
+// Renders the "Local servers" card: header, one clickable row per loopback
+// server, and a caption. Rows share a bordered card split by hairlines.
+fn renderLocalServers(
+    state: *app_state.AppState,
+    rect: palette.Rect,
+    servers: []const local_servers.Server,
+    clip: palette.Rect,
+) void {
+    const header_size = theme.scaledUi(15.0);
+    const name_size = theme.scaledUi(15.0);
+    const detail_size = theme.scaledUi(12.5);
+    const icon_glyph_size = theme.scaledUi(16.0);
+    const header_h = theme.scaledUi(LOCAL_SERVER_HEADER_HEIGHT);
+    const row_h = theme.scaledUi(LOCAL_SERVER_ROW_HEIGHT);
+    const radius = theme.scaledUi(LOCAL_SERVER_RADIUS);
+    const muted = paletteColor(theme.COLOR_TEXT_MUTED);
+
+    queuePaletteIcon(state, .{
+        .x = rect.x,
+        .y = rect.y + (header_h - icon_glyph_size) * 0.5 - theme.scaledUi(4.0),
+        .w = icon_glyph_size,
+        .h = icon_glyph_size,
+    }, NF_COD_RADIO_TOWER, icon_glyph_size, muted);
+    queuePaletteText(state, .{
+        .x = rect.x + icon_glyph_size + theme.scaledUi(10.0),
+        .y = rect.y + (header_h - header_size * 1.3) * 0.5 - theme.scaledUi(4.0),
+        .w = rect.w,
+        .h = header_size * 1.3,
+    }, "Local servers", muted, header_size, clip);
+
+    const card: palette.Rect = .{
+        .x = rect.x,
+        .y = rect.y + header_h,
+        .w = rect.w,
+        .h = row_h * @as(f32, @floatFromInt(servers.len)),
+    };
+    queuePaletteRoundedRect(state, card, paletteColor(theme.raise(theme.background(), 0.03)), radius);
+
+    for (servers, 0..) |*server, index| {
+        const row: palette.Rect = .{
+            .x = card.x,
+            .y = card.y + row_h * @as(f32, @floatFromInt(index)),
+            .w = card.w,
+            .h = row_h,
+        };
+        if (rectHovered(row)) {
+            const first = index == 0;
+            const last = index + 1 == servers.len;
+            // Round only the card's outer corners so the hover fill hugs the border.
+            if (first or last) {
+                queuePaletteRoundedRect(state, row, paletteColor(theme.raise(theme.background(), 0.08)), radius);
+                if (!first) queuePaletteRect(state, .{ .x = row.x, .y = row.y, .w = row.w, .h = radius }, paletteColor(theme.raise(theme.background(), 0.08)));
+                if (!last) queuePaletteRect(state, .{ .x = row.x, .y = row.y + row.h - radius, .w = row.w, .h = radius }, paletteColor(theme.raise(theme.background(), 0.08)));
+            } else {
+                queuePaletteRect(state, row, paletteColor(theme.raise(theme.background(), 0.08)));
+            }
+        }
+        if (index > 0) {
+            queuePaletteRect(state, .{ .x = row.x, .y = row.y, .w = row.w, .h = theme.scaledUi(1.0) }, paletteColor(theme.COLOR_PANEL_MUTED));
+        }
+
+        const icon_size = theme.scaledUi(LOCAL_SERVER_ICON_SIZE);
+        const pad = theme.scaledUi(16.0);
+        renderLocalServerIcon(state, .{
+            .x = row.x + pad,
+            .y = row.y + (row.h - icon_size) * 0.5,
+            .w = icon_size,
+            .h = icon_size,
+        });
+
+        const text_x = row.x + pad + icon_size + theme.scaledUi(14.0);
+        const text_w = row.x + row.w - pad - text_x;
+        const text_block_h = name_size * 1.3 + detail_size * 1.3;
+        const text_y = row.y + (row.h - text_block_h) * 0.5;
+        queuePaletteText(state, .{ .x = text_x, .y = text_y, .w = text_w, .h = name_size * 1.3 }, server.name(), paletteColor(theme.COLOR_WHITE), name_size, row);
+        var detail_buffer: [24]u8 = undefined;
+        const detail = std.fmt.bufPrint(&detail_buffer, "localhost:{d}", .{server.port}) catch "";
+        queuePaletteText(state, .{ .x = text_x, .y = text_y + name_size * 1.3, .w = text_w, .h = detail_size * 1.3 }, detail, muted, detail_size, row);
+        addPaletteHitWithPort(row, .local_server, server.port);
+    }
+    queuePaletteBorder(state, card, paletteColor(theme.COLOR_PANEL_MUTED), radius, theme.scaledUi(1.0));
+
+    const caption_size = theme.scaledUi(13.0);
+    queuePaletteText(state, .{
+        .x = rect.x + theme.scaledUi(4.0),
+        .y = card.y + card.h + theme.scaledUi(12.0),
+        .w = rect.w,
+        .h = caption_size * 1.3,
+    }, "Select a live local server to open it in this browser tab.", muted, caption_size, clip);
+}
+
+// Draws a miniature app-window glyph: traffic-light dots over two text bars.
+fn renderLocalServerIcon(state: *app_state.AppState, rect: palette.Rect) void {
+    const accent = theme.accent();
+    queuePaletteRoundedRect(state, rect, paletteColor(theme.mix(theme.background(), accent, 0.12)), theme.scaledUi(6.0));
+    queuePaletteBorder(state, rect, paletteColor(theme.mix(theme.background(), accent, 0.35)), theme.scaledUi(6.0), theme.scaledUi(1.0));
+    const dot = theme.scaledUi(3.0);
+    const dot_y = rect.y + theme.scaledUi(7.0);
+    const dot_colors = [_][4]f32{ theme.COLOR_DIFF_REMOVE, theme.COLOR_YELLOW, accent };
+    for (dot_colors, 0..) |color, index| {
+        queuePaletteRoundedRect(state, .{
+            .x = rect.x + theme.scaledUi(6.0) + @as(f32, @floatFromInt(index)) * (dot + theme.scaledUi(2.5)),
+            .y = dot_y,
+            .w = dot,
+            .h = dot,
+        }, paletteColor(color), dot * 0.5);
+    }
+    const bar_color = paletteColor(theme.mix(theme.background(), accent, 0.45));
+    const bar_h = theme.scaledUi(2.0);
+    queuePaletteRoundedRect(state, .{ .x = rect.x + theme.scaledUi(6.0), .y = rect.y + theme.scaledUi(15.0), .w = rect.w - theme.scaledUi(12.0), .h = bar_h }, bar_color, bar_h * 0.5);
+    queuePaletteRoundedRect(state, .{ .x = rect.x + theme.scaledUi(6.0), .y = rect.y + theme.scaledUi(20.0), .w = (rect.w - theme.scaledUi(12.0)) * 0.6, .h = bar_h }, bar_color, bar_h * 0.5);
 }
 
 fn browserPageIsEmpty(browser_state: *const browser_runtime.State) bool {
