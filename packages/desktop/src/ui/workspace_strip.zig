@@ -37,6 +37,8 @@ pub const TAB_PAD_X_UI: f32 = 12.0;
 pub const PLUS_TAB_WIDTH_UI: f32 = 30.0;
 const LABEL_FONT_UI: f32 = 13.0;
 const TAB_RADIUS_UI: f32 = 3.0;
+const PIP_SIZE_UI: f32 = 6.0;
+const PIP_GAP_UI: f32 = 6.0;
 /// Ctrl-reveal key tip: same square badge the sidebar pane rows draw so the
 /// Ctrl+N ordinal reads identically in both places.
 const KEY_TIP_SIZE_UI: f32 = 18.0;
@@ -173,6 +175,18 @@ pub fn render(state: *runtime.AppState, strip: palette.Rect) void {
         const toggle_hovered = hovered_hit == strip_hit_count;
         if (toggle_hovered) queueRoundedRectClipped(state, toggle_rect, paletteColor(theme.wash(theme.COLOR_GREEN, 56)), theme.scaledUi(TAB_RADIUS_UI), strip);
         sidebar.queueSidebarToggleGlyph(state, toggle_rect, false, toggle_hovered, strip);
+        // The hidden rail's ACTIVE section is out of view: badge the toggle
+        // when another workspace has a working/waiting pane.
+        if (backgroundActivityPip(state, project_index)) |bg| {
+            const dot = theme.scaledUi(PIP_SIZE_UI);
+            const alpha: f32 = if (bg.pip.animated) sidebar.pipPulse(state, bg.project_index) else 1.0;
+            queueRoundedRectClipped(state, .{
+                .x = toggle_rect.x + toggle_rect.w - dot - theme.scaledUi(2.0),
+                .y = toggle_rect.y + theme.scaledUi(3.0),
+                .w = dot,
+                .h = dot,
+            }, paletteColor(theme.withAlpha(bg.pip.color, @intFromFloat(alpha * 255.0))), dot * 0.5, strip);
+        }
         addHit(toggle_rect, .sidebar_toggle, project_index, 0);
         x += leading_w;
     }
@@ -183,16 +197,29 @@ pub fn render(state: *runtime.AppState, strip: palette.Rect) void {
         var key_tip_buf: [16]u8 = undefined;
         const key_tip = tabKeyTip(state, &key_tip_buf, tab_index);
         const tip_reserve = if (key_tip.len > 0) key_tip_w else 0.0;
+        const pip = tabActivityPip(state, project_index, layout, tab.id);
+        const pip_reserve = if (pip != null) theme.scaledUi(PIP_SIZE_UI) + theme.scaledUi(PIP_GAP_UI) else 0.0;
         // Measure through the GPU text path so tab widths match drawn glyphs.
         const label_w = runtime.paletteUiTextPrefixWidth(title, font_size, title.len);
-        const rect = tabRect(strip, x, tabWidth(label_w + tip_reserve, cap));
+        const rect = tabRect(strip, x, tabWidth(label_w + tip_reserve + pip_reserve, cap));
         if (rect.x + theme.scaledUi(MIN_TAB_WIDTH_UI) > tabs_right) break;
         const clip: palette.Rect = .{ .x = strip.x, .y = strip.y, .w = @max(tabs_right - strip.x, 0.0), .h = strip.h };
         const selected = focused_tab_id != null and focused_tab_id.? == tab.id;
         const hovered = hovered_hit == strip_hit_count;
         renderTab(state, rect, clip, selected, hovered);
         var label_buf: [LABEL_BUFFER_LEN]u8 = undefined;
-        const label_area: palette.Rect = .{ .x = rect.x, .y = rect.y, .w = @max(rect.w - tip_reserve, 0.0), .h = rect.h };
+        const label_area: palette.Rect = .{ .x = rect.x + pip_reserve, .y = rect.y, .w = @max(rect.w - tip_reserve - pip_reserve, 0.0), .h = rect.h };
+        if (pip) |p| {
+            // Same pulsing status pip as the sidebar pane rows, leading the label.
+            const dot = theme.scaledUi(PIP_SIZE_UI);
+            const alpha: f32 = if (p.animated) sidebar.pipPulse(state, project_index) else 1.0;
+            queueRoundedRectClipped(state, .{
+                .x = rect.x + pad_x * 0.75,
+                .y = rect.y + (rect.h - dot) * 0.5,
+                .w = dot,
+                .h = dot,
+            }, paletteColor(theme.withAlpha(p.color, @intFromFloat(alpha * 255.0))), dot * 0.5, clip);
+        }
         const label = truncatedLabel(&label_buf, title, @max(label_area.w - pad_x * 2.0, 0.0), font_size);
         const shown_w = runtime.paletteUiTextPrefixWidth(label, font_size, label.len);
         const text_color = if (selected) theme.COLOR_WHITE else if (hovered) theme.raise(theme.COLOR_TEXT_MUTED, 0.12) else theme.COLOR_TEXT_MUTED;
@@ -212,6 +239,35 @@ pub fn render(state: *runtime.AppState, strip: palette.Rect) void {
 
 /// One tab body: rectangular background with a hairline edge so adjacent
 /// tabs separate cleanly; the active tab carries the accent tint.
+/// Strongest status pip among the panes of tab `tab_id`, or null when idle.
+fn tabActivityPip(state: *runtime.AppState, project_index: usize, layout: *const runtime.WorkspaceLayout, tab_id: runtime.workspace_tabs.WorkspaceTabId) ?sidebar.PanePip {
+    const project = &state.project_controller.projects.items[project_index];
+    var best: ?sidebar.PanePip = null;
+    for (layout.panes.items) |*pane| {
+        if (runtime.workspace_tabs.tabIdForPane(layout, pane.id) != tab_id) continue;
+        const pip = sidebar.panePip(state, project_index, project, pane) orelse continue;
+        if (best == null or pip.rank > best.?.rank) best = pip;
+    }
+    return best;
+}
+
+const BackgroundPip = struct { project_index: usize, pip: sidebar.PanePip };
+
+/// Strongest working/waiting pip in any workspace other than `current`.
+/// Settled states (done/error) stay off the toggle; they are not "happening".
+fn backgroundActivityPip(state: *runtime.AppState, current: usize) ?BackgroundPip {
+    var best: ?BackgroundPip = null;
+    for (state.project_controller.projects.items, 0..) |*project, project_index| {
+        if (project_index == current) continue;
+        for (project.workspace_layout.panes.items) |*pane| {
+            const pip = sidebar.panePip(state, project_index, project, pane) orelse continue;
+            if (!pip.animated) continue;
+            if (best == null or pip.rank > best.?.pip.rank) best = .{ .project_index = project_index, .pip = pip };
+        }
+    }
+    return best;
+}
+
 fn renderTab(state: *runtime.AppState, rect: palette.Rect, clip: palette.Rect, selected: bool, hovered: bool) void {
     const radius = theme.scaledUi(TAB_RADIUS_UI);
     const fill: [4]f32 = if (selected)

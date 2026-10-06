@@ -2112,6 +2112,53 @@ fn paneNeedsAttention(
     }
 }
 
+/// Status pip for one pane, shared by the sidebar rows' semantics and the
+/// workspace tab strip. `rank` orders competing pips within a tab:
+/// waiting > error > working > done.
+pub const PanePip = struct {
+    color: [4]f32,
+    animated: bool,
+    rank: u8,
+};
+
+pub fn panePip(
+    state: *runtime.AppState,
+    project_index: usize,
+    project: *const native_state.Project,
+    pane: *const native_state.WorkspacePane,
+) ?PanePip {
+    var status: ?native_state.SurfaceStatus = null;
+    var running = false;
+    switch (pane.ref) {
+        .chat => |ref| {
+            if (ref.thread_index >= project.threads.items.len) return null;
+            status = chatSurfaceStatusForUi(&project.threads.items[ref.thread_index]);
+            running = status.? == .working;
+        },
+        .terminal => |ref| {
+            const surface = state.projectTerminalSurface(project_index, ref.dock_id) orelse return null;
+            status = state.terminalSurfaceDisplayStatus(surface);
+            running = !surface.completion_pending and surface.status == .working;
+        },
+        .browser => return null,
+    }
+    const color = paneStatusColor(status, running) orelse return null;
+    const s = status orelse .idle;
+    const rank: u8 = switch (s) {
+        .waiting => 4,
+        .@"error" => 3,
+        .working => 2,
+        .done => 1,
+        .idle => if (running) 2 else 0,
+    };
+    return .{ .color = color, .animated = running or s == .working or s == .waiting, .rank = rank };
+}
+
+/// Pulse alpha (0.35..1.0) for an animated pip; see `attentionPulse`.
+pub fn pipPulse(state: *runtime.AppState, project_index: usize) f32 {
+    return attentionPulse(state, project_index);
+}
+
 /// Maps a terminal surface status (and chat running state) to a sidebar status
 /// pip color, or null when the pane needs no attention indicator.
 fn paneStatusColor(status: ?native_state.SurfaceStatus, running: bool) ?[4]f32 {
