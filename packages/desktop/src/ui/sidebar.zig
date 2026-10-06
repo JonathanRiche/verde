@@ -241,6 +241,9 @@ var settings_hovered: bool = false;
 var terminal_action_hovered: ?usize = null;
 var search_trigger_hovered: bool = false;
 var switcher_trigger_hovered: bool = false;
+/// Per-frame: OPEN rows are interleaved newest-activity first (All
+/// Workspaces), so in-workspace drag reorder is off.
+var open_rows_recency_sorted: bool = false;
 /// Per-frame: OPEN rows carry a workspace identity chip (All Workspaces).
 var open_rows_show_chip: bool = false;
 
@@ -542,14 +545,23 @@ fn computePaneMoveTarget(state: *const runtime.AppState, x: f32, y: f32) bool {
     const source = pane_row_drag.project_index;
     if (openPaneChatThreadIndex(state, source, pane_row_drag.pane_id) == null) return false;
     var index = palette_hit_count;
-    const target = while (index > 0) {
+    const target_hit = while (index > 0) {
         index -= 1;
         const hit = palette_hits[index];
         if (hit.project_index == source or !rectContainsPoint(hit.rect, x, y)) continue;
-        if (hit.kind == .open_pane_reorder) break hit.project_index;
+        if (hit.kind == .open_pane_reorder) break hit;
     } else return false;
+    const target = target_hit.project_index;
     if (target >= state.project_controller.projects.items.len) return false;
     if (state.project_controller.projects.items[target].herdr_link != null) return false;
+    if (open_rows_recency_sorted) {
+        // Recency-interleaved rows: a union would span other workspaces'
+        // rows, so highlight only the hovered target row.
+        pane_drop_target_rect = target_hit.rect;
+        pane_drop_target_project = target;
+        pane_drop_valid = false;
+        return true;
+    }
     var bounds: ?palette.Rect = null;
     index = 0;
     while (index < palette_hit_count) : (index += 1) {
@@ -575,6 +587,8 @@ fn unionRects(a: palette.Rect, b: palette.Rect) palette.Rect {
 /// owning workspace. Attention-cluster duplicates are deliberately excluded.
 fn computePaneDropTarget(state: *const runtime.AppState, y: f32) void {
     pane_drop_valid = false;
+    // Recency order is not layout order; in-place reorder has no meaning there.
+    if (open_rows_recency_sorted) return;
     if (pane_row_drag.project_index >= state.project_controller.projects.items.len) return;
     const layout = &state.project_controller.projects.items[pane_row_drag.project_index].workspace_layout;
     var index: usize = 0;
@@ -940,6 +954,7 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
     if (has_selected) workspace_identity.noteUsed(projects[selected_index].id, unixTimestampMs());
     const all_scope = state.sidebar_all_workspaces or !has_selected;
     open_rows_show_chip = all_scope;
+    open_rows_recency_sorted = all_scope;
 
     // Pinned chrome, top to bottom: header (logo + toggle), workspace
     // switcher trigger, search pill with new chat / new terminal buttons.
@@ -983,18 +998,21 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
     const focused_pane_id = if (has_selected) projects[selected_index].workspace_layout.focused_pane_id else null;
     const focus_changed = sidebar_revealed_project_index != selected_index or
         sidebar_revealed_pane_id != focused_pane_id or sidebar_revealed_view_h != open_clip.h;
+    // One ordered list drives measuring, focus reveal, and rendering, so the
+    // three passes cannot disagree about row positions.
+    const open_units = collectOpenUnits(state, all_scope);
     var content_y = open_top + caption_h;
     var focused_row: ?palette.Rect = null;
-    for (projects, 0..) |*project, index| {
-        if (!all_scope and index != selected_index) continue;
-        const measured = measureSidebarPaneRows(&project.workspace_layout, if (index == selected_index) focused_pane_id else null);
-        if (index == selected_index) {
-            if (measured.focused_top) |top| {
-                focused_row = .{ .x = 0.0, .y = content_y + top, .w = 0.0, .h = measured.focused_h };
-            }
+    for (open_units) |unit| {
+        const unit_h = openUnitHeight(&projects[unit.project_index].workspace_layout, unit.pane_index);
+        if (unit.project_index == selected_index and focused_pane_id != null and
+            openUnitContainsPane(&projects[unit.project_index].workspace_layout, unit.pane_index, focused_pane_id.?))
+        {
+            focused_row = .{ .x = 0.0, .y = content_y, .w = 0.0, .h = unit_h.row };
         }
-        if (project.workspace_layout.panes.items.len > 0) content_y += measured.height;
+        content_y += unit_h.step;
     }
+    if (open_units.len > 0) content_y += theme.scaledUi(4.0);
     sidebar_max_scroll_y = @max(0.0, content_y - (open_clip.y + open_clip.h) + theme.scaledUi(8.0));
     sidebar_scroll_y = theme.clampf(sidebar_scroll_y, 0.0, sidebar_max_scroll_y);
     if (focus_changed) {
@@ -1010,10 +1028,15 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
     queuePaletteText(state, .{ .x = x, .y = y, .w = rail_w, .h = theme.scaledUi(18.0) }, "OPEN", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), open_clip);
     y += caption_h;
     const rows_top = y;
-    for (projects, 0..) |*project, index| {
-        if (!all_scope and index != selected_index) continue;
-        y = renderOpenPanesSection(state, index, project, x, rail_w, open_clip, open_clip, y);
+    const selected_tabs: []const native_state.WorkspaceTab = if (has_selected) blk: {
+        const layout = &projects[selected_index].workspace_layout;
+        const buf = state.palette_frame_text_arena.allocator().alloc(native_state.WorkspaceTab, layout.panes.items.len) catch break :blk &.{};
+        break :blk native_state.workspace_tabs.collect(layout, buf);
+    } else &.{};
+    for (open_units) |unit| {
+        y = renderOpenPaneUnit(state, unit, selected_tabs, x, rail_w, open_clip, open_clip, y);
     }
+    if (open_units.len > 0) y += theme.scaledUi(4.0);
     if (y == rows_top) {
         queuePaletteText(state, .{ .x = x + theme.scaledUi(4.0), .y = y + theme.scaledUi(4.0), .w = rail_w, .h = theme.scaledUi(18.0) }, "No open panes", paletteColor(theme.withAlpha(theme.COLOR_TEXT_SUBTLE, 190)), theme.scaledUi(12.5), open_clip);
     }
@@ -1142,49 +1165,102 @@ fn renderWorkspaceSwitcherTrigger(state: *runtime.AppState, rect: palette.Rect, 
     }
 }
 
-const SidebarPaneRowsMeasurement = struct {
-    height: f32 = 0.0,
-    focused_top: ?f32 = null,
-    focused_h: f32 = 0.0,
+/// One OPEN-list entry: a standalone pane or a whole split tile, addressed
+/// by the first pane of its scroll group in persisted pane order.
+const OpenUnit = struct {
+    project_index: usize,
+    pane_index: usize,
+    /// Latest activity across the unit's panes (unix ms); orders All Workspaces.
+    recency_ms: i64,
 };
 
-fn measureSidebarPaneRows(layout: *const native_state.WorkspaceLayout, focused_pane_id: ?native_state.WorkspacePaneId) SidebarPaneRowsMeasurement {
-    var measured: SidebarPaneRowsMeasurement = .{};
-    if (layout.panes.items.len == 0) return measured;
-    const row_h = theme.scaledUi(SIDEBAR_THREAD_ROW_HEIGHT_CSS);
-    const row_step = theme.scaledUi(SIDEBAR_THREAD_ROW_STEP_CSS);
-    const tile_gap = theme.scaledUi(4.0);
-    for (layout.panes.items, 0..) |pane, pane_index| {
-        const group_id = layout.scrollGroupIdForPane(pane.id) orelse continue;
-        const group_count = layout.scrollGroupPaneCount(group_id);
-        if (group_count > 1) {
-            var seen = false;
-            for (layout.panes.items[0..pane_index]) |earlier| {
-                if (layout.scrollGroupIdForPane(earlier.id) == group_id) {
-                    seen = true;
-                    break;
-                }
+/// OPEN units in display order. A single-workspace scope keeps layout order;
+/// All Workspaces interleaves every workspace's units newest-activity first
+/// (stable, so ties keep workspace + layout order).
+fn collectOpenUnits(state: *runtime.AppState, all_scope: bool) []OpenUnit {
+    const projects = state.project_controller.projects.items;
+    const selected_index = state.project_controller.selected_index;
+    var total: usize = 0;
+    for (projects, 0..) |*project, index| {
+        if (!all_scope and index != selected_index) continue;
+        total += project.workspace_layout.panes.items.len;
+    }
+    const units = state.palette_frame_text_arena.allocator().alloc(OpenUnit, total) catch return &.{};
+    var count: usize = 0;
+    for (projects, 0..) |*project, project_index| {
+        if (!all_scope and project_index != selected_index) continue;
+        const layout = &project.workspace_layout;
+        for (layout.panes.items, 0..) |pane, pane_index| {
+            if (!isOpenUnitHead(layout, pane_index)) continue;
+            const group_id = layout.scrollGroupIdForPane(pane.id).?;
+            var recency: i64 = 0;
+            for (layout.panes.items) |*member| {
+                if (layout.scrollGroupIdForPane(member.id) != group_id) continue;
+                recency = @max(recency, paneRecencyMs(state, project_index, project, member));
             }
-            if (seen) continue;
-            const root = layout.root orelse continue;
-            const rows = sidebarScrollGroupRows(layout, root, group_id);
-            const group_h = row_h * @as(f32, @floatFromInt(@max(rows, 1))) +
-                tile_gap * @as(f32, @floatFromInt(if (rows > 0) rows - 1 else 0));
-            if (focused_pane_id != null and layout.scrollGroupIdForPane(focused_pane_id.?) == group_id) {
-                measured.focused_top = measured.height;
-                measured.focused_h = group_h;
-            }
-            measured.height += group_h + tile_gap;
-        } else {
-            if (focused_pane_id == pane.id) {
-                measured.focused_top = measured.height;
-                measured.focused_h = row_h;
-            }
-            measured.height += row_step;
+            units[count] = .{ .project_index = project_index, .pane_index = pane_index, .recency_ms = recency };
+            count += 1;
         }
     }
-    measured.height += theme.scaledUi(4.0);
-    return measured;
+    const result = units[0..count];
+    if (all_scope) std.sort.insertion(OpenUnit, result, {}, openUnitNewerFirst);
+    return result;
+}
+
+fn openUnitNewerFirst(_: void, a: OpenUnit, b: OpenUnit) bool {
+    return a.recency_ms > b.recency_ms;
+}
+
+/// Last activity of one pane in unix ms: a chat's last turn activity, or a
+/// terminal's last status change. Browsers carry no activity signal.
+fn paneRecencyMs(
+    state: *runtime.AppState,
+    project_index: usize,
+    project: *const native_state.Project,
+    pane: *const native_state.WorkspacePane,
+) i64 {
+    return switch (pane.ref) {
+        .chat => |ref| if (ref.thread_index < project.threads.items.len)
+            project.threads.items[ref.thread_index].last_activity_at *| std.time.ms_per_s
+        else
+            0,
+        .terminal => |ref| if (state.projectTerminalSurface(project_index, ref.dock_id)) |surface|
+            surface.status_changed_at_ms
+        else
+            0,
+        .browser => 0,
+    };
+}
+
+/// True for a rooted pane that is the first of its scroll group (tile).
+fn isOpenUnitHead(layout: *const native_state.WorkspaceLayout, pane_index: usize) bool {
+    const pane = layout.panes.items[pane_index];
+    const group_id = layout.scrollGroupIdForPane(pane.id) orelse return false;
+    if (layout.scrollGroupPaneCount(group_id) <= 1) return true;
+    if (layout.root == null) return false;
+    for (layout.panes.items[0..pane_index]) |earlier| {
+        if (layout.scrollGroupIdForPane(earlier.id) == group_id) return false;
+    }
+    return true;
+}
+
+fn openUnitContainsPane(layout: *const native_state.WorkspaceLayout, pane_index: usize, pane_id: native_state.WorkspacePaneId) bool {
+    const group_id = layout.scrollGroupIdForPane(layout.panes.items[pane_index].id) orelse return false;
+    return layout.scrollGroupIdForPane(pane_id) == group_id;
+}
+
+const OpenUnitHeight = struct { row: f32, step: f32 };
+
+/// Drawn height and vertical advance of one OPEN unit.
+fn openUnitHeight(layout: *const native_state.WorkspaceLayout, pane_index: usize) OpenUnitHeight {
+    const row_h = theme.scaledUi(SIDEBAR_THREAD_ROW_HEIGHT_CSS);
+    const group_id = layout.scrollGroupIdForPane(layout.panes.items[pane_index].id) orelse return .{ .row = row_h, .step = theme.scaledUi(SIDEBAR_THREAD_ROW_STEP_CSS) };
+    if (layout.scrollGroupPaneCount(group_id) <= 1) return .{ .row = row_h, .step = theme.scaledUi(SIDEBAR_THREAD_ROW_STEP_CSS) };
+    const tile_gap = theme.scaledUi(4.0);
+    const rows = if (layout.root) |root| sidebarScrollGroupRows(layout, root, group_id) else 1;
+    const group_h = row_h * @as(f32, @floatFromInt(@max(rows, 1))) +
+        tile_gap * @as(f32, @floatFromInt(if (rows > 0) rows - 1 else 0));
+    return .{ .row = group_h, .step = group_h + tile_gap };
 }
 
 fn revealSidebarRow(scroll_y: f32, row_y: f32, row_h: f32, clip: palette.Rect, max_scroll_y: f32) f32 {
@@ -1625,82 +1701,48 @@ fn queuePaletteRect(state: *runtime.AppState, rect: palette.Rect, color: palette
     };
 }
 
-/// Renders the live list of a workspace's layout panes (chat / terminal /
-/// browser), so every pane kind is visible and directly focusable from the
-/// sidebar. Indentation alone carries the grouping — the old "OPEN" section
-/// label repeated per workspace without adding information. Returns the
-/// advanced y cursor.
-fn renderOpenPanesSection(
+/// Renders one OPEN unit (standalone pane row or split-tile miniature) at
+/// `y_in`; returns the advanced y cursor. Rows sit flush: there are no
+/// workspace folder rows to nest under.
+fn renderOpenPaneUnit(
     state: *runtime.AppState,
-    project_index: usize,
-    project: *const native_state.Project,
+    unit: OpenUnit,
+    selected_tabs: []const native_state.WorkspaceTab,
     x: f32,
     rail_w: f32,
     list_clip: palette.Rect,
     clip: palette.Rect,
     y_in: f32,
 ) f32 {
-    var y = y_in;
+    const project_index = unit.project_index;
+    const project = &state.project_controller.projects.items[project_index];
     const layout = &project.workspace_layout;
-    if (layout.panes.items.len == 0) return y;
-
-    // Rows sit flush: there are no workspace folder rows to nest under.
-    const indent: f32 = 0.0;
-    // Ctrl+N tips address the selected workspace's tabs only.
+    const pane = &layout.panes.items[unit.pane_index];
+    const group_id = layout.scrollGroupIdForPane(pane.id) orelse return y_in;
+    // Ctrl+N tips address the selected workspace's tabs only; a split tile
+    // shares one ordinal and its mini-rows show none.
     const shortcuts = project_index == state.project_controller.selected_index;
-    // Ctrl+N badges number tabs, so a split tile shares one ordinal and its
-    // mini-rows show none.
-    const tab_buffer = state.palette_frame_text_arena.allocator().alloc(native_state.WorkspaceTab, layout.panes.items.len) catch return y;
-    const tabs = native_state.workspace_tabs.collect(layout, tab_buffer);
-    for (layout.panes.items, 0..) |*pane, pane_index| {
-        const group_id = layout.scrollGroupIdForPane(pane.id) orelse continue;
-        const group_count = layout.scrollGroupPaneCount(group_id);
-        if (group_count > 1) {
-            var seen = false;
-            for (layout.panes.items[0..pane_index]) |earlier| {
-                if (layout.scrollGroupIdForPane(earlier.id) == group_id) {
-                    seen = true;
-                    break;
-                }
+    const tab_index = if (shortcuts) native_state.workspace_tabs.indexOfTab(selected_tabs, group_id) else null;
+    const height = openUnitHeight(layout, unit.pane_index);
+    if (layout.scrollGroupPaneCount(group_id) > 1) {
+        const root = layout.root orelse return y_in;
+        // The tile carries its tab's Ctrl badge once, in a column beside
+        // the mini-rows, so the sidebar numbering has no hole at a split.
+        var tile_shortcut_buf: [16]u8 = undefined;
+        const tile_shortcut = if (shortcuts) tileShortcutLabel(state, &tile_shortcut_buf, tab_index) else "";
+        const badge_column = if (tile_shortcut.len > 0) theme.scaledUi(30.0) else 0.0;
+        const group_rect: palette.Rect = .{ .x = x, .y = y_in, .w = rail_w - badge_column, .h = height.row };
+        if (rowVisible(group_rect, list_clip)) {
+            renderOpenPaneGroupNode(state, project_index, project, root, group_id, group_rect, clip);
+            if (tile_shortcut.len > 0) {
+                renderSidebarShortcutKeyTip(state, .{ .x = x, .y = y_in, .w = rail_w, .h = height.row }, clip, tile_shortcut);
             }
-            if (seen) continue;
-            const root = layout.root orelse continue;
-            const rows = sidebarScrollGroupRows(layout, root, group_id);
-            const row_h = theme.scaledUi(SIDEBAR_THREAD_ROW_HEIGHT_CSS);
-            const tile_gap = theme.scaledUi(4.0);
-            const group_h = row_h * @as(f32, @floatFromInt(@max(rows, 1))) +
-                tile_gap * @as(f32, @floatFromInt(if (rows > 0) rows - 1 else 0));
-            // The tile carries its tab's Ctrl badge once, in a column beside
-            // the mini-rows, so the sidebar numbering has no hole at a split.
-            var tile_shortcut_buf: [16]u8 = undefined;
-            const tile_shortcut = if (shortcuts) tileShortcutLabel(state, &tile_shortcut_buf, native_state.workspace_tabs.indexOfTab(tabs, group_id)) else "";
-            const badge_column = if (tile_shortcut.len > 0) theme.scaledUi(30.0) else 0.0;
-            const group_rect: palette.Rect = .{
-                .x = x + indent,
-                .y = y,
-                .w = rail_w - indent - badge_column,
-                .h = group_h,
-            };
-            if (rowVisible(group_rect, list_clip)) {
-                renderOpenPaneGroupNode(state, project_index, project, root, group_id, group_rect, clip);
-                if (tile_shortcut.len > 0) {
-                    renderSidebarShortcutKeyTip(state, .{ .x = x + indent, .y = y, .w = rail_w - indent, .h = group_h }, clip, tile_shortcut);
-                }
-            }
-            y += group_h + tile_gap;
-            continue;
         }
-        const row_rect: palette.Rect = .{
-            .x = x + indent,
-            .y = y,
-            .w = rail_w - indent,
-            .h = theme.scaledUi(SIDEBAR_THREAD_ROW_HEIGHT_CSS),
-        };
-        if (rowVisible(row_rect, list_clip)) renderOpenPaneRow(state, project_index, project, pane, row_rect, clip, false, false, if (shortcuts) native_state.workspace_tabs.indexOfTab(tabs, group_id) else null, false);
-        y += theme.scaledUi(SIDEBAR_THREAD_ROW_STEP_CSS);
+        return y_in + height.step;
     }
-    y += theme.scaledUi(4.0);
-    return y;
+    const row_rect: palette.Rect = .{ .x = x, .y = y_in, .w = rail_w, .h = height.row };
+    if (rowVisible(row_rect, list_clip)) renderOpenPaneRow(state, project_index, project, pane, row_rect, clip, false, false, tab_index, false);
+    return y_in + height.step;
 }
 
 fn sidebarScrollGroupRows(
@@ -2861,6 +2903,42 @@ test "ACTIVE collection sees every restored chat pane and deduplicates one threa
     sortAttentionClusterRows(rows[0..row_count]);
     try std.testing.expectEqual(@as(usize, 0), rows[0].pane.ref.chat.thread_index);
     try std.testing.expectEqual(second_thread_index, rows[1].pane.ref.chat.thread_index);
+}
+
+test "OPEN interleaves All Workspaces newest-activity first and keeps layout order when scoped" {
+    const allocator = std.testing.allocator;
+    var state: runtime.AppState = undefined;
+    state.allocator = allocator;
+    state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
+    defer state.palette_frame_text_arena.deinit();
+    state.project_controller.projects = .empty;
+    state.project_controller.selected_index = 0;
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+    }
+    const activity = [_]i64{ 10, 30, 20 };
+    for (activity, 0..) |seconds, index| {
+        var id_buf: [16]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "ws-{d}", .{index});
+        var project = try native_state.Project.init(allocator, id, id, "/tmp/ws", 0);
+        project.threads.items[0].last_activity_at = seconds;
+        state.project_controller.projects.append(allocator, project) catch |err| {
+            project.deinit(allocator);
+            return err;
+        };
+    }
+
+    const all = collectOpenUnits(&state, true);
+    try std.testing.expectEqual(@as(usize, 3), all.len);
+    try std.testing.expectEqual(@as(usize, 1), all[0].project_index);
+    try std.testing.expectEqual(@as(usize, 2), all[1].project_index);
+    try std.testing.expectEqual(@as(usize, 0), all[2].project_index);
+    try std.testing.expectEqual(@as(i64, 30_000), all[0].recency_ms);
+
+    const scoped = collectOpenUnits(&state, false);
+    try std.testing.expectEqual(@as(usize, 1), scoped.len);
+    try std.testing.expectEqual(@as(usize, 0), scoped[0].project_index);
 }
 
 test "ACTIVE cluster caps viewport at ten rows and leaves room for the workspace tree" {

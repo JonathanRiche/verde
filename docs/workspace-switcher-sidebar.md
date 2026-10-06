@@ -23,8 +23,14 @@ per-workspace identity so a workspace looks identical everywhere.
    scope, and every Active row carries the small workspace identity chip
    (icon on tinted square) — you always want to see what is working.
    **Open follows the scope**: under *All Workspaces* it spans every open
-   workspace with chips; under a single-workspace scope it lists only that
-   workspace and rows omit the chip.
+   workspace with chips, interleaved **newest activity first** rather than
+   grouped by workspace (a chat ranks by its last turn activity, a terminal by
+   its last status change, a split tile by its newest pane; desktop only so
+   far — web and mobile still group by workspace). Under a single-workspace
+   scope it lists only that workspace in layout (tab) order and rows omit the
+   chip. Drag-to-reorder applies only in the single-workspace scope; under
+   *All Workspaces* a chat row can still be dragged onto another workspace's
+   row to move it there.
 5. **Footer** – global settings.
 
 ## Scope semantics
