@@ -34,16 +34,26 @@ struct DrawerItem: Identifiable {
         if let thread { return activeTurn(thread.status) || thread.status == "failed" || pane?.attention_kind != nil }
         return pane?.attention == true
     }
+    /// A chat's last activity; terminals carry no synced status-change time yet.
+    var activityMs: Int64? { thread?.last_activity_at_ms }
 }
 
 /// Flat Active/Open rows by workspace recency. Active always spans every open workspace;
-/// Open follows the scope (nil = All Workspaces).
+/// Open follows the scope (nil = All Workspaces). Under All Workspaces Open interleaves
+/// every workspace newest activity first (untimed last; ties keep workspace then layout
+/// order), matching the desktop sidebar.
 func drawerItems(_ items: [Workspace], scope: String?) -> (active: [DrawerItem], open: [DrawerItem]) {
     let rows = switcherWorkspaces(items).filter(\.open).flatMap { ws -> [DrawerItem] in
         let chats: [DrawerItem] = drawerThreads(ws).map { thread in DrawerItem(workspace: ws, thread: thread, pane: ws.panes.first { $0.thread_id == thread.thread_id }) }
         return chats + ws.panes.filter { $0.kind == "terminal" && $0.terminal_id != nil }.map { DrawerItem(workspace: ws, thread: nil, pane: $0) }
     }
-    return (rows.filter(\.active), rows.filter { !$0.active && (scope == nil || $0.workspace.workspace_id == scope) })
+    let open = rows.filter { !$0.active && (scope == nil || $0.workspace.workspace_id == scope) }
+    guard scope == nil else { return (rows.filter(\.active), open) }
+    let recent = open.enumerated().sorted {
+        let (l, r) = ($0.element.activityMs ?? .min, $1.element.activityMs ?? .min)
+        return l != r ? l > r : $0.offset < $1.offset
+    }.map(\.element)
+    return (rows.filter(\.active), recent)
 }
 
 struct WorkspaceDrawer: View {

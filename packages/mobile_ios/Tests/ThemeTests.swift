@@ -48,6 +48,24 @@ final class ThemeTests: XCTestCase {
         XCTAssertTrue(drawerItems(items, scope: "a").open.isEmpty)
         XCTAssertEqual(drawerItems(items, scope: nil).open.map { $0.workspace.workspace_id }, ["b"])
     }
+    func testDrawerAllWorkspacesOpenInterleavesNewestActivityFirst() {
+        func t(_ ws: String, _ id: String, _ at: Int64?) -> ThreadSummary {
+            ThreadSummary(workspace_id: ws, thread_id: id, title: id, provider: "codex", model: nil, cwd: nil, open: true,
+                          archived: false, last_activity_at_ms: at, status: "idle", history_bucket: "Today")
+        }
+        func w(_ id: String, _ rank: UInt32, _ threads: [ThreadSummary]) -> Workspace {
+            let panes = threads.map { Pane(id: "p-" + $0.thread_id, workspace_id: id, kind: "chat", title: $0.title, thread_id: $0.thread_id) }
+                + [Pane(id: "p-\(id)-term", workspace_id: id, kind: "terminal", title: "shell", terminal_id: id + "-term")]
+            return Workspace(workspace_id: id, label: id, path: "/" + id, open: true, panes: panes, threads: threads, recency_rank: rank)
+        }
+        let items = [w("a", 0, [t("a", "a-old", 10), t("a", "a-tie", 20)]),
+                     w("b", 1, [t("b", "b-new", 30), t("b", "b-tie", 20), t("b", "b-none", nil)])]
+        func keys(_ rows: [DrawerItem]) -> [String] { rows.map { $0.thread?.thread_id ?? $0.pane?.terminal_id ?? "" } }
+        // Ties keep workspace then layout order; untimed chats and terminals sort last.
+        XCTAssertEqual(keys(drawerItems(items, scope: nil).open), ["b-new", "a-tie", "b-tie", "a-old", "a-term", "b-none", "b-term"])
+        // A single-workspace scope keeps its own order.
+        XCTAssertEqual(keys(drawerItems(items, scope: "b").open), ["b-new", "b-tie", "b-none", "b-term"])
+    }
     func testWorkspaceAutoIdentityMatchesCrossClientVectors() {
         XCTAssertTrue(workspaceAutoIdentity("ws-alpha") == (14, 2))
         XCTAssertTrue(workspaceAutoIdentity("baaa819e66d8f3be") == (9, 6))

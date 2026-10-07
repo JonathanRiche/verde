@@ -211,6 +211,23 @@ class BrowseTest {
         assertEquals(listOf("idle"), drawerItems(items, null).second.map { it.thread?.thread_id })
     }
 
+    @Test fun drawerAllWorkspacesOpenInterleavesNewestActivityFirst() {
+        fun t(ws: String, id: String, at: Long?) = ThreadSummary(ws, id, id, "codex", null, null, true, false, at, "idle", "Today")
+        fun w(id: String, rank: Long, vararg threads: ThreadSummary) = Workspace(id, id, "/$id", true,
+            threads.map { Pane("p-${it.thread_id}", id, "chat", it.title, thread_id = it.thread_id) } +
+                Pane("p-$id-term", id, "terminal", "shell", terminal_id = "$id-term"),
+            threads.toList(), recency_rank = rank)
+        val items = listOf(
+            w("a", 0, t("a", "a-old", 10L), t("a", "a-tie", 20L)),
+            w("b", 1, t("b", "b-new", 30L), t("b", "b-tie", 20L), t("b", "b-none", null)),
+        )
+        fun keys(rows: List<DrawerItem>) = rows.map { it.thread?.thread_id ?: it.pane?.terminal_id }
+        // Ties keep workspace then layout order; untimed chats and terminals sort last.
+        assertEquals(listOf("b-new", "a-tie", "b-tie", "a-old", "a-term", "b-none", "b-term"), keys(drawerItems(items, null).second))
+        // A single-workspace scope keeps its own order.
+        assertEquals(listOf("b-new", "b-tie", "b-none", "b-term"), keys(drawerItems(items, "b").second))
+    }
+
     @Test fun drawerOnlyListsOpenChatsWhileWorkspaceKeepsHistory() {
         val workspace = K09.workspaces.data!!.items.first()
         val template = workspace.threads.first { it.thread_id == "layout-thread" }

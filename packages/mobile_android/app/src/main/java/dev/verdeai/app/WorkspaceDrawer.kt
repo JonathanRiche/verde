@@ -60,11 +60,15 @@ internal data class DrawerItem(val workspace: Workspace, val thread: ThreadSumma
         activeStatus(t.status) || t.status == "waiting_approval" || t.status == "failed" || pane?.attention_kind != null
     } ?: (pane?.attention == true)
     val title get() = thread?.title ?: pane?.title.orEmpty()
+    /** A chat's last activity; terminals carry no synced status-change time yet. */
+    val activityMs get() = thread?.last_activity_at_ms
 }
 
 /**
  * Flat Active/Open rows by workspace recency. Active always spans every open workspace;
- * Open follows the scope (null = All Workspaces).
+ * Open follows the scope (null = All Workspaces). Under All Workspaces Open interleaves
+ * every workspace newest activity first (untimed last; the stable sort keeps workspace
+ * then layout order for ties), matching the desktop sidebar.
  */
 internal fun drawerItems(items: List<Workspace>, scope: String?): Pair<List<DrawerItem>, List<DrawerItem>> {
     val rows = switcherWorkspaces(items).filter { it.open }.flatMap { ws ->
@@ -73,7 +77,8 @@ internal fun drawerItems(items: List<Workspace>, scope: String?): Pair<List<Draw
             ws.panes.filter { it.kind == "terminal" && it.terminal_id != null }.map { DrawerItem(ws, null, it) }
     }
     val (active, open) = rows.partition { it.active }
-    return active to open.filter { scope == null || it.workspace.workspace_id == scope }
+    if (scope == null) return active to open.sortedWith(compareByDescending { it.activityMs ?: Long.MIN_VALUE })
+    return active to open.filter { it.workspace.workspace_id == scope }
 }
 
 /** Shared browse projections only: scope and search never mutate the host. */
