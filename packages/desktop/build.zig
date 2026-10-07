@@ -196,6 +196,12 @@ pub fn build(b: *std.Build) void {
     const provider_bridge_output = build_provider_bridge.addOutputFileArg("provider_bridge.mjs");
     build_provider_bridge.setCwd(b.path("."));
     build_provider_bridge.addFileInput(b.path("src/providers/provider_bridge.ts"));
+    // The bundle inlines @anthropic-ai/claude-agent-sdk from the root
+    // node_modules; key the cache on the root manifests so an SDK bump
+    // rebuilds provider_bridge.mjs instead of reusing the stale bundle.
+    build_provider_bridge.addFileInput(b.path("../../package.json"));
+    build_provider_bridge.addFileInput(b.path("../../package-lock.json"));
+    build_provider_bridge.addFileInput(b.path("../../bun.lock"));
     const install_provider_bridge = b.addInstallFileWithDir(
         provider_bridge_output,
         .{ .custom = "share/verde" },

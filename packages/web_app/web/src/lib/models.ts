@@ -148,7 +148,7 @@ const CLAUDE_MODELS: ModelOption[] = [
   { label: 'Default (Opus 5.5)', value: 'default', efforts: CLAUDE_FULL_EFFORTS },
   { label: 'Opus 5.5 (1M context)', value: 'opus[1m]', efforts: CLAUDE_FULL_EFFORTS },
   { label: 'Sonnet 5.5', value: 'sonnet', efforts: CLAUDE_FULL_EFFORTS },
-  { label: 'Haiku 4.5', value: 'haiku' },
+  { label: 'Haiku 5.5', value: 'haiku', efforts: CLAUDE_FULL_EFFORTS },
 ]
 
 /// OpenCode reasoning variants are dynamic model metadata the desktop fetches

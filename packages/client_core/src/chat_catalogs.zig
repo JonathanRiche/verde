@@ -45,7 +45,7 @@ pub fn catalogs(a: A, selection: m.Selection, dynamic: V, slash: V) h.ApiError!m
     };
     if (effort_values.len > 0) {
         out.efforts = try choices(a, effort_values);
-    } else if ((eq(provider, "codex") or eq(provider, "claude") or eq(provider, "pi") or eq(provider, "grok") or eq(provider, "muse")) and !eq(model, "haiku") and !(p.get(selected, "reasoning_supported") == .bool and !p.yes(p.get(selected, "reasoning_supported")))) {
+    } else if ((eq(provider, "codex") or eq(provider, "claude") or eq(provider, "pi") or eq(provider, "grok") or eq(provider, "muse")) and !(p.get(selected, "reasoning_supported") == .bool and !p.yes(p.get(selected, "reasoning_supported")))) {
         out.efforts = try choices(a, if (eq(provider, "grok") or eq(model, "gpt-5.5")) &.{ "", "low", "medium", "high", "xhigh" } else &.{ "", "low", "medium", "high", "xhigh", "max" });
     }
     if (eq(provider, "cursor") and selected == .null) {
@@ -146,7 +146,7 @@ fn choiceLabel(id: []const u8) []const u8 {
     if (eq(id, "fable[1m]")) return "Fable 5.1";
     if (eq(id, "opus[1m]")) return "Opus 5.5 (1M context)";
     if (eq(id, "sonnet")) return "Sonnet 5.5";
-    if (eq(id, "haiku")) return "Haiku 4.5";
+    if (eq(id, "haiku")) return "Haiku 5.5";
     if (eq(id, "opencode/gpt-5.5")) return "GPT-5.5";
     if (eq(id, "opencode/gpt-5.4")) return "GPT-5.4";
     if (eq(id, "opencode/claude-opus-4-7")) return "Claude Opus 4.7";
