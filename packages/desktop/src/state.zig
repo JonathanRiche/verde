@@ -4192,6 +4192,7 @@ pub const ORG_NAME: [:0]const u8 = "verde";
 pub const APP_NAME: [:0]const u8 = "Native";
 pub const LEGACY_STATE_FILE_NAME = "state.json";
 const CURSOR_MODEL_CACHE_FILE_NAME = "cursor-models.json";
+const SIDEBAR_SCOPE_FILE_NAME = "sidebar-scope";
 pub const DEFAULT_CODEX_MODEL = provider_models.DEFAULT_CODEX_MODEL;
 pub const DEFAULT_CODEX_REASONING_EFFORT = provider_models.DEFAULT_CODEX_REASONING_EFFORT;
 pub const DEFAULT_OPENCODE_MODEL = provider_models.DEFAULT_OPENCODE_MODEL;
@@ -5168,6 +5169,7 @@ pub const AppState = struct {
         // starts. The composite snapshot remains authoritative for durable
         // state, but a live turn must be visible immediately after relaunch.
         state.restoreDaemonChatTurnsOnLaunch();
+        state.loadSidebarScope();
         state.loadCursorModelOptionsDiskCache() catch |err| {
             log.warn("failed to load Cursor model cache: {s}", .{@errorName(err)});
             state.clearCursorModelOptions();
@@ -10778,24 +10780,63 @@ pub const AppState = struct {
     /// Widens the sidebar list to every open workspace (Alt+0).
     pub fn showAllWorkspacesInSidebar(self: *AppState) void {
         if (self.sidebar_all_workspaces) return;
-        self.sidebar_all_workspaces = true;
+        self.setSidebarAllWorkspaces(true);
+    }
+
+    /// Updates the sidebar list scope and remembers it across relaunches so
+    /// the app reopens on the workspace (or All Workspaces) last in view.
+    /// The scope is a per-device view choice, so it lives in a GUI-local
+    /// file next to other client caches rather than the daemon store.
+    fn setSidebarAllWorkspaces(self: *AppState, all: bool) void {
+        const changed = self.sidebar_all_workspaces != all;
+        self.sidebar_all_workspaces = all;
         self.markDirty();
+        if (changed) self.saveSidebarScope() catch |err| {
+            log.warn("failed to save sidebar scope: {s}", .{@errorName(err)});
+        };
+    }
+
+    fn saveSidebarScope(self: *AppState) !void {
+        if (self.storage.pref_path.len == 0) return;
+        const path = try std.fs.path.join(self.allocator, &.{ self.storage.pref_path, SIDEBAR_SCOPE_FILE_NAME });
+        defer self.allocator.free(path);
+        var threaded: std.Io.Threaded = .init(self.allocator, .{});
+        defer threaded.deinit();
+        var file = try std.Io.Dir.createFileAbsolute(threaded.io(), path, .{ .truncate = true });
+        defer file.close(threaded.io());
+        try file.writeStreamingAll(threaded.io(), if (self.sidebar_all_workspaces) "all" else "workspace");
+    }
+
+    /// Restores the last sidebar scope. A missing or unreadable file keeps
+    /// the All Workspaces default.
+    fn loadSidebarScope(self: *AppState) void {
+        if (self.storage.pref_path.len == 0) return;
+        var threaded: std.Io.Threaded = .init(self.allocator, .{});
+        defer threaded.deinit();
+        var dir = std.Io.Dir.openDirAbsolute(threaded.io(), self.storage.pref_path, .{}) catch return;
+        defer dir.close(threaded.io());
+        const bytes = dir.readFileAlloc(threaded.io(), SIDEBAR_SCOPE_FILE_NAME, self.allocator, .limited(64)) catch return;
+        defer self.allocator.free(bytes);
+        const value = std.mem.trim(u8, bytes, " \t\r\n");
+        if (std.mem.eql(u8, value, "workspace") and self.project_controller.projects.items.len > 0) {
+            self.sidebar_all_workspaces = false;
+        } else if (std.mem.eql(u8, value, "all")) {
+            self.sidebar_all_workspaces = true;
+        }
     }
 
     /// Selects a workspace and narrows the sidebar list to it (switcher row,
     /// Alt+N).
     pub fn selectProjectScoped(self: *AppState, index: usize) bool {
         if (!self.selectProjectAtIndex(index)) return false;
-        self.sidebar_all_workspaces = false;
-        self.markDirty();
+        self.setSidebarAllWorkspaces(false);
         return true;
     }
 
     /// Reopens a closed workspace from the switcher and scopes the list to it.
     pub fn reopenClosedProjectScoped(self: *AppState, archived_index: usize) bool {
         if (!self.reopenClosedProjectAtIndex(archived_index)) return false;
-        self.sidebar_all_workspaces = false;
-        self.markDirty();
+        self.setSidebarAllWorkspaces(false);
         return true;
     }
 
