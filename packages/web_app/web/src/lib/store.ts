@@ -55,7 +55,7 @@ import {
 } from './selection'
 import { linuxWorkspaceId } from './wyhash'
 import { closedWorkspacesFrom } from './workspace_order'
-import { orderSwitcherRows, workspaceRecency, type SidebarScope } from './workspace_switcher'
+import { activityMs, orderSwitcherRows, workspaceRecency, type SidebarScope } from './workspace_switcher'
 import {
   DEFAULT_UI_CONFIG,
   applyUiConfigPatch,
@@ -1697,6 +1697,49 @@ export function createAppStore() {
     }
     return rows
   })
+  /// Newest activity per chat thread (ms): the catalog's last_activity_at
+  /// and the start of any turn the snapshot still reports.
+  const threadActivityMs = createMemo(() => {
+    const at = new Map<string, number>()
+    const bump = (id: string | undefined, value: number) => {
+      if (id && value > (at.get(id) ?? 0)) at.set(id, value)
+    }
+    for (const threads of Object.values(threadsByWorkspace())) {
+      for (const thread of threads) bump(thread.local_thread_id, activityMs(thread.last_activity_at))
+    }
+    for (const turn of lastTurns()) bump(turn.local_thread_id, activityMs(turn.started_at_ms))
+    return at
+  })
+  /// Client-observed terminal status changes (ms). The detached daemon's
+  /// session rows carry no status timestamp, so record when this client sees
+  /// a terminal's `working` flag flip, or first sees it working.
+  const [terminalStatusAt, setTerminalStatusAt] = createSignal<Record<string, number>>({})
+  const terminalStatusSeen = new Map<string, boolean>()
+  const terminalActivityKey = (pane: LivePane) =>
+    `${pane.workspace_id}\u0000${pane.session_id ?? pane.native_pane_id ?? pane.pane_id}`
+  createEffect(() => {
+    const now = Date.now()
+    const changed: Record<string, number> = {}
+    for (const pane of sidebarPanes()) {
+      if (pane.kind !== 'terminal') continue
+      const key = terminalActivityKey(pane)
+      const working = pane.working === true
+      const seen = terminalStatusSeen.get(key)
+      terminalStatusSeen.set(key, working)
+      if (seen === undefined ? working : seen !== working) changed[key] = now
+    }
+    if (Object.keys(changed).length > 0) setTerminalStatusAt((prev) => ({ ...prev, ...changed }))
+  })
+  /// Sidebar Open recency (ms, 0 = unknown): a chat's last turn activity, a
+  /// terminal's last observed status change.
+  const paneActivityMs = (pane: LivePane): number => {
+    if (pane.kind === 'chat') {
+      const thread_at = pane.thread_id ? threadActivityMs().get(pane.thread_id) ?? 0 : 0
+      return Math.max(thread_at, activityMs(pane.completed_at_ms))
+    }
+    if (pane.kind === 'terminal') return terminalStatusAt()[terminalActivityKey(pane)] ?? 0
+    return 0
+  }
   const focusedChat = createMemo(() => {
     const pane = focusedPane()
     return pane?.kind === 'chat' ? pane : visiblePanes().find((item) => item.kind === 'chat') ?? null
@@ -5147,6 +5190,7 @@ export function createAppStore() {
     canvasLayout,
     activePanes,
     sidebarPanes,
+    paneActivityMs,
     focusedPane,
     focusedPaneId,
     focusedChat,

@@ -77,11 +77,13 @@ export function Sidebar(props: { drawer?: boolean }) {
 
   const scope = () => store.sidebarScope()
   // Active is global (spec section 4) and keeps store.activePanes() order so
-  // active_select ordinals match; only Open follows the switcher scope.
+  // active_select ordinals match; only Open follows the switcher scope, and
+  // under All it interleaves workspaces newest activity first.
   const sections = createMemo(() => sidebarSections(
     store.activePanes(),
     store.sidebarPanes().filter((pane) => !paneIsActive(pane)),
     scope(),
+    store.paneActivityMs,
   ))
   const active_rows = keyedRows(() => sections().active, paneRowKey)
   const open_rows = keyedRows(() => sections().open, paneRowKey)

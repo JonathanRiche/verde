@@ -7,17 +7,56 @@ import type { Thread, Workspace } from './types'
 export type SidebarScope = 'all' | string
 
 /// Sidebar body sections. Active is global (every open workspace, always
-/// chipped); Open follows the scope and carries chips only under All.
-export function sidebarSections<T extends { workspace_id: string }>(
+/// chipped); Open follows the scope and carries chips only under All. Under
+/// All, Open interleaves every workspace newest activity first
+/// (`orderByActivity`); a single-workspace scope keeps layout order.
+export function sidebarSections<T extends SidebarOpenRow>(
   active: readonly T[],
   inactive: readonly T[],
   scope: SidebarScope,
+  activity: (pane: T) => number = () => 0,
 ): { active: T[]; open: T[]; open_chips: boolean } {
   return {
     active: [...active],
-    open: scope === 'all' ? [...inactive] : inactive.filter((pane) => pane.workspace_id === scope),
+    open: scope === 'all' ? orderByActivity(inactive, activity) : inactive.filter((pane) => pane.workspace_id === scope),
     open_chips: scope === 'all',
   }
+}
+
+/// Pane fields the Open ordering reads.
+export interface SidebarOpenRow {
+  workspace_id: string
+  /// Native scrolling-tile identity; panes sharing it (within a workspace)
+  /// are one split tile.
+  scroll_group_id?: number
+}
+
+/// Newest activity first, a split tile moving as one unit ranked by its
+/// newest pane (members stay adjacent, in incoming order). Stable: ties and
+/// rows without activity (0) keep incoming order, i.e. workspace order then
+/// layout order, so untimed panes sort last in that order.
+export function orderByActivity<T extends SidebarOpenRow>(
+  rows: readonly T[],
+  activity: (pane: T) => number,
+): T[] {
+  const units: { members: T[]; index: number; at: number }[] = []
+  const by_tile = new Map<string, (typeof units)[number]>()
+  rows.forEach((pane, index) => {
+    const at = activity(pane) || 0
+    const tile = pane.scroll_group_id != null ? `${pane.workspace_id}\u0000${pane.scroll_group_id}` : null
+    const unit = tile ? by_tile.get(tile) : undefined
+    if (unit) {
+      unit.members.push(pane)
+      unit.at = Math.max(unit.at, at)
+      return
+    }
+    const next = { members: [pane], index, at }
+    units.push(next)
+    if (tile) by_tile.set(tile, next)
+  })
+  return units
+    .sort((a, b) => b.at - a.at || a.index - b.index)
+    .flatMap((unit) => unit.members)
 }
 
 export interface SwitcherRow {
