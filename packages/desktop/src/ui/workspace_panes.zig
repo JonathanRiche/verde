@@ -3252,23 +3252,21 @@ fn renderSplitTriggerButton(state: *runtime.AppState, rect: palette.Rect, active
     else
         theme.COLOR_TEXT_SUBTLE;
 
-    const cell = theme.scaledUi(4.0);
-    const gap = theme.scaledUi(2.0);
-    const grid_w = cell * 2.0 + gap;
-    const grid_h = grid_w;
-    const start_x = rect.x + (rect.w - grid_w) * 0.5;
-    const start_y = rect.y + (rect.h - grid_h) * 0.5;
-    var row: usize = 0;
-    while (row < 2) : (row += 1) {
-        var col: usize = 0;
-        while (col < 2) : (col += 1) {
-            queueRect(state, .{
-                .x = start_x + @as(f32, @floatFromInt(col)) * (cell + gap),
-                .y = start_y + @as(f32, @floatFromInt(row)) * (cell + gap),
-                .w = cell,
-                .h = cell,
-            }, paletteColor(icon_color));
-        }
+    // Horizontal ellipsis: three round dots, sized and placed on whole
+    // pixels so they stay crisp at fractional UI scales.
+    const dot = @max(2.0, @round(theme.scaledUi(3.5)));
+    const gap = @max(2.0, @round(theme.scaledUi(3.0)));
+    const total_w = dot * 3.0 + gap * 2.0;
+    const start_x = @round(rect.x + (rect.w - total_w) * 0.5);
+    const start_y = @round(rect.y + (rect.h - dot) * 0.5);
+    var i: usize = 0;
+    while (i < 3) : (i += 1) {
+        queueRounded(state, .{
+            .x = start_x + @as(f32, @floatFromInt(i)) * (dot + gap),
+            .y = start_y,
+            .w = dot,
+            .h = dot,
+        }, paletteColor(icon_color), dot * 0.5);
     }
 }
 
