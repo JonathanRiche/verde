@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { activityMs, fuzzyMatches, orderByActivity, orderSwitcherRows, sidebarSections, workspaceRecency } from './workspace_switcher'
+import { activityMs, fuzzyMatches, orderByActivity, orderSwitcherRows, sidebarSections, switcherItems, workspaceRecency } from './workspace_switcher'
 
 const ws = (workspace_id, threads = []) => ({ workspace_id, label: workspace_id, path: '', threads })
 
@@ -77,5 +77,21 @@ describe('Open recency under All Workspaces', () => {
   test('without an activity source All keeps incoming order', () => {
     const rows = [pane('a', 'a1', 1), pane('b', 'b1', 99)]
     expect(ids(sidebarSections([], rows, 'all').open)).toEqual(['a1', 'b1'])
+  })
+  test('closed workspaces collapse under a header that a query expands', () => {
+    const rows = [
+      { workspace: ws('verde'), closed: false },
+      { workspace: ws('mirage'), closed: false },
+      { workspace: ws('kohl'), closed: true },
+      { workspace: ws('auditui'), closed: true },
+    ]
+    const kinds = (items) => items.map((item) => item.kind === 'workspace' ? item.workspace.label : item.kind)
+
+    expect(kinds(switcherItems(rows, '', false))).toEqual(['all', 'verde', 'mirage', 'new', 'closed_header'])
+    expect(switcherItems(rows, '', false).at(-1)).toEqual({ kind: 'closed_header', count: 2, expanded: false })
+    expect(kinds(switcherItems(rows, '', true))).toEqual(['all', 'verde', 'mirage', 'new', 'closed_header', 'kohl', 'auditui'])
+    // A query searches closed workspaces even while collapsed.
+    expect(kinds(switcherItems(rows, 'kohl', false))).toEqual(['new', 'closed_header', 'kohl'])
+    expect(kinds(switcherItems(rows.slice(0, 2), '', true))).toEqual(['all', 'verde', 'mirage', 'new'])
   })
 })

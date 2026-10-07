@@ -175,6 +175,9 @@ const ResultRef = union(enum) {
     closed_workspace: usize,
     /// Workspace switcher: widen the sidebar list to every workspace.
     all_workspaces,
+    /// Workspace switcher: collapsible "Closed Workspaces" group header
+    /// carrying how many closed workspaces it holds.
+    closed_section: usize,
     /// Workspace switcher footer row: open the Add Workspace flow.
     new_workspace,
 };
@@ -475,6 +478,14 @@ pub fn activateRow(state: *runtime.AppState, row_index: usize, replace: bool) vo
             state.closeCommandPalette();
             state.showAllWorkspacesInSidebar();
         },
+        .closed_section => {
+            // Toggle in place: the popover stays open on the header row.
+            state.command_controller.switcher_closed_expanded = !state.command_controller.switcher_closed_expanded;
+            rebuildResults(state);
+            state.command_controller.selected = row_index;
+            reveal_selected = true;
+            state.markDirty();
+        },
         .new_workspace => {
             state.closeCommandPalette();
             state.openWorkspaceCreator(false);
@@ -728,8 +739,8 @@ fn openWorkspaceRecencyMs(project: *const native_state.Project) i64 {
     return at;
 }
 
-/// Switcher rows: All Workspaces, then open + closed workspaces by recency
-/// (filtered by the query), then New workspace.
+/// Switcher rows: All Workspaces, open workspaces by recency, New workspace,
+/// then a collapsible "Closed Workspaces" group (all filtered by the query).
 fn buildWorkspaceSwitcher(state: *runtime.AppState, query: []const u8) void {
     const has_query = query.len > 0;
     if (!has_query or fuzzyScore("All Workspaces", query) != null) appendResult(.all_workspaces);
@@ -747,6 +758,16 @@ fn buildWorkspaceSwitcher(state: *runtime.AppState, query: []const u8) void {
         };
         entry_count += 1;
     }
+    std.sort.pdq(SwitcherEntry, entries[0..entry_count], has_query, switcherEntryLessThan);
+    for (entries[0..entry_count]) |entry| {
+        if (result_count + 2 >= MAX_ROWS) break;
+        appendResult(entry.ref);
+    }
+    if (!has_query or fuzzyScore("New workspace", query) != null) appendResult(.new_workspace);
+
+    // Closed workspaces sit in a collapsible group below; a query searches
+    // them regardless so a match is never hidden behind the toggle.
+    entry_count = 0;
     const archived = state.project_controller.archived_projects.items;
     for (archived, 0..) |*project, ai| {
         if (entry_count >= entries.len) break;
@@ -760,12 +781,14 @@ fn buildWorkspaceSwitcher(state: *runtime.AppState, query: []const u8) void {
         };
         entry_count += 1;
     }
+    if (entry_count == 0) return;
+    appendResult(.{ .closed_section = entry_count });
+    if (!has_query and !state.command_controller.switcher_closed_expanded) return;
     std.sort.pdq(SwitcherEntry, entries[0..entry_count], has_query, switcherEntryLessThan);
     for (entries[0..entry_count]) |entry| {
-        if (result_count + 1 >= MAX_ROWS) break;
+        if (result_count >= MAX_ROWS) break;
         appendResult(entry.ref);
     }
-    if (!has_query or fuzzyScore("New workspace", query) != null) appendResult(.new_workspace);
 }
 
 /// Builds the result list for the current query + scope, resetting selection
@@ -1885,7 +1908,7 @@ fn renderRows(state: *runtime.AppState) void {
             .workspace => |pi| renderWorkspaceRow(state, i, pi, rect, row_clip),
             .closed_workspace => |ai| renderClosedWorkspaceRow(state, i, ai, rect, row_clip),
             // Switcher-only rows; never produced in command mode.
-            .all_workspaces, .new_workspace => {},
+            .all_workspaces, .new_workspace, .closed_section => {},
         }
     }
 }
@@ -2173,6 +2196,8 @@ fn renderSwitcher(state: *runtime.AppState, width: f32, height: f32) void {
 const SWITCHER_CHECK_GLYPH = "\u{EAB2}";
 const SWITCHER_GEAR_GLYPH = "\u{EB51}";
 const SWITCHER_ADD_GLYPH = "\u{EA60}";
+const SWITCHER_CHEVRON_RIGHT_GLYPH = "\u{EAB6}";
+const SWITCHER_CHEVRON_DOWN_GLYPH = "\u{EAB4}";
 
 fn renderSwitcherRow(state: *runtime.AppState, row_index: usize, rect: palette.Rect, row_clip: palette.Rect) void {
     const emphasis = state.command_controller.selected == row_index or (hovered_row != null and hovered_row.? == row_index);
@@ -2222,10 +2247,19 @@ fn renderSwitcherRow(state: *runtime.AppState, row_index: usize, rect: palette.R
         .closed_workspace => |ai| {
             if (ai >= state.project_controller.archived_projects.items.len) return;
             const project = &state.project_controller.archived_projects.items[ai];
+            // Grouped under the Closed Workspaces header, so no per-row tag.
             sidebar.queueWorkspaceChip(state, chip_rect, project, true, row_clip);
-            const closed_w = theme.scaledUi(52.0);
-            queueText(state, .{ .x = label_x, .y = text_y, .w = right_edge - label_x - closed_w, .h = line_h }, project.label, paletteColor(if (emphasis) theme.COLOR_TEXT_MUTED else theme.COLOR_TEXT_SUBTLE), font_size, row_clip);
-            queueText(state, .{ .x = right_edge - closed_w, .y = text_y, .w = closed_w, .h = line_h }, "Closed", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.5), row_clip);
+            queueText(state, .{ .x = label_x, .y = text_y, .w = right_edge - label_x, .h = line_h }, project.label, paletteColor(if (emphasis) theme.COLOR_TEXT_MUTED else theme.COLOR_TEXT_SUBTLE), font_size, row_clip);
+        },
+        .closed_section => |count| {
+            const expanded = state.command_controller.switcher_closed_expanded or state.commandPaletteQuery().len > 0;
+            const glyph = if (expanded) SWITCHER_CHEVRON_DOWN_GLYPH else SWITCHER_CHEVRON_RIGHT_GLYPH;
+            queueSwitcherIcon(state, chip_rect.x + (chip_size - theme.scaledUi(20.0)) * 0.5, rect, glyph, if (emphasis) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE, row_clip);
+            var count_buf: [16]u8 = undefined;
+            const count_text = std.fmt.bufPrint(&count_buf, "{d}", .{count}) catch "";
+            const count_w = theme.scaledUi(32.0);
+            queueText(state, .{ .x = label_x, .y = text_y, .w = right_edge - label_x - count_w, .h = line_h }, "Closed Workspaces", paletteColor(if (emphasis) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE), font_size, row_clip);
+            queueText(state, .{ .x = right_edge - count_w, .y = text_y, .w = count_w, .h = line_h }, count_text, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.5), row_clip);
         },
         .new_workspace => {
             queueSwitcherIcon(state, chip_rect.x + (chip_size - theme.scaledUi(20.0)) * 0.5, rect, SWITCHER_ADD_GLYPH, if (emphasis) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED, row_clip);

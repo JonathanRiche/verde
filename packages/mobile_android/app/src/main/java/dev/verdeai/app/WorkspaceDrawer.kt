@@ -13,6 +13,8 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.draw.rotate
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Search
@@ -165,8 +167,10 @@ private fun WorkspaceSwitcher(all: List<Workspace>, scoped: Workspace?, onScope:
     onSettings: (String) -> Unit, onAddWorkspace: () -> Unit, canManage: Boolean, onReopen: (String) -> Unit) {
     var open by remember { mutableStateOf(false) }
     var query by remember { mutableStateOf("") }
+    // Closed workspaces sit in a collapsed group; a query searches them regardless.
+    var closedExpanded by remember { mutableStateOf(false) }
     Box(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp)) {
-        Row(Modifier.fillMaxWidth().heightIn(min = 44.dp).clip(RoundedCornerShape(7.dp)).clickable { query = ""; open = true }
+        Row(Modifier.fillMaxWidth().heightIn(min = 44.dp).clip(RoundedCornerShape(7.dp)).clickable { query = ""; closedExpanded = false; open = true }
             .padding(horizontal = 8.dp).testTag("workspace-switcher")
             .semantics { contentDescription = "Workspace scope: ${scoped?.label ?: "All Workspaces"}" },
             verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -185,24 +189,36 @@ private fun WorkspaceSwitcher(all: List<Workspace>, scoped: Workspace?, onScope:
                 leadingIcon = { Icon(Icons.Filled.Menu, null, Modifier.size(20.dp)) },
                 trailingIcon = if (scoped == null) ({ Icon(Icons.Filled.Check, null, Modifier.size(18.dp)) }) else null,
                 onClick = { open = false; onScope(null) })
-            switcherWorkspaces(all).filter { fuzzyMatches(query, it.label) }.forEach { ws ->
+            val matching = switcherWorkspaces(all).filter { fuzzyMatches(query, it.label) }
+            val row: @Composable (Workspace) -> Unit = { ws ->
                 // Closed rows reopen on select, which needs workspace management rights.
                 val enabled = ws.open || canManage
                 DropdownMenuItem(enabled = enabled,
                     modifier = Modifier.alpha(if (ws.open) 1f else .55f).semantics { selected = scoped?.workspace_id == ws.workspace_id },
                     leadingIcon = { WorkspaceChip(ws, 22.dp) },
-                    text = { Column {
-                        Text(ws.label, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        if (!ws.open) Text("Closed", style = MaterialTheme.typography.labelSmall, color = VerdeColors.Subtle)
-                    } },
-                    trailingIcon = { IconButton(onClick = { open = false; onSettings(ws.workspace_id) }) {
+                    text = { Text(ws.label, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                    trailingIcon = if (ws.open) ({ IconButton(onClick = { open = false; onSettings(ws.workspace_id) }) {
                         Icon(Icons.Filled.Settings, "Settings for ${ws.label}", Modifier.size(18.dp))
-                    } },
+                    } }) else null,
                     onClick = {
                         open = false
                         if (!ws.open) onReopen(ws.workspace_id)
                         onScope(ws.workspace_id)
                     })
+            }
+            matching.filter { it.open }.forEach { row(it) }
+            val closed = matching.filter { !it.open }
+            if (closed.isNotEmpty()) {
+                val expanded = closedExpanded || query.isNotBlank()
+                DropdownMenuItem(enabled = query.isBlank(),
+                    modifier = Modifier.testTag("workspace-switcher-closed")
+                        .semantics { stateDescription = if (expanded) "expanded" else "collapsed" },
+                    leadingIcon = { Icon(Icons.Filled.KeyboardArrowDown, null,
+                        Modifier.size(22.dp).rotate(if (expanded) 0f else -90f), tint = VerdeColors.Subtle) },
+                    text = { Text("Closed Workspaces", color = VerdeColors.Muted) },
+                    trailingIcon = { Text("${closed.size}", style = MaterialTheme.typography.labelSmall, color = VerdeColors.Subtle) },
+                    onClick = { closedExpanded = !closedExpanded })
+                if (expanded) closed.forEach { row(it) }
             }
             HorizontalDivider(color = VerdeColors.Border)
             DropdownMenuItem(text = { Text("New workspace") }, leadingIcon = { Icon(Icons.Filled.Add, null, Modifier.size(20.dp)) },

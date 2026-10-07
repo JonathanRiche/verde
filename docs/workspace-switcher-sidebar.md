@@ -57,13 +57,18 @@ Context-menu styled popover anchored under the trigger:
 - Search field, placeholder **"Search workspaces"**, fuzzy filters by label.
 - **All Workspaces** row first (hidden while the query is non-empty and does
   not match "all").
-- One row per workspace — **open and closed** — sorted by recency (most
-  recent first). Closed workspaces render dimmed with a "Closed" hint.
+- One row per **open** workspace, sorted by recency (most recent first).
 - Row: identity icon, label, Alt+N hint (open workspaces, desktop only),
   and a trailing **gear** that opens that workspace's settings (this replaces
   the per-row gear that used to sit beside each workspace).
-- Footer row: **New workspace**.
-- Keyboard: Up/Down move, Enter selects, Esc closes.
+- **New workspace** row after the open workspaces (a fixed footer on mobile).
+- **Closed Workspaces** group: a chevron header row with the closed count,
+  collapsed each time the popover opens. Activating the header toggles it in
+  place; expanded, it lists closed workspaces (dimmed icon, no gear) in
+  recency order, and selecting one reopens it. A non-empty query shows
+  matching closed workspaces regardless of the toggle. The header is hidden
+  when no closed workspace matches.
+- Keyboard: Up/Down move, Enter selects (or toggles the header), Esc closes.
 
 ### Recency
 

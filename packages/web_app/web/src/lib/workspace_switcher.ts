@@ -117,3 +117,31 @@ export function fuzzyMatches(label: string, query: string): boolean {
   }
   return true
 }
+
+/// One switcher popover row.
+export type SwitcherItem<W> =
+  | { kind: 'all' }
+  | { kind: 'workspace'; workspace: W; closed: boolean }
+  | { kind: 'new' }
+  | { kind: 'closed_header'; count: number; expanded: boolean }
+
+/// Popover rows: All Workspaces, open workspaces, New workspace, then a
+/// collapsible "Closed Workspaces" group. A query searches closed workspaces
+/// regardless of the toggle so a match is never hidden behind it.
+export function switcherItems<W extends { label: string }>(
+  rows: readonly { workspace: W; closed: boolean }[],
+  query: string,
+  closed_expanded: boolean,
+): SwitcherItem<W>[] {
+  const matching = rows.filter((row) => fuzzyMatches(row.workspace.label, query))
+  const open = matching.filter((row) => !row.closed)
+  const closed = matching.filter((row) => row.closed)
+  const expanded = closed_expanded || query.trim().length > 0
+  return [
+    ...(fuzzyMatches('all workspaces', query) ? [{ kind: 'all' } as const] : []),
+    ...open.map((row) => ({ kind: 'workspace', workspace: row.workspace, closed: false }) as const),
+    { kind: 'new' } as const,
+    ...(closed.length > 0 ? [{ kind: 'closed_header', count: closed.length, expanded } as const] : []),
+    ...(expanded ? closed.map((row) => ({ kind: 'workspace', workspace: row.workspace, closed: true }) as const) : []),
+  ]
+}

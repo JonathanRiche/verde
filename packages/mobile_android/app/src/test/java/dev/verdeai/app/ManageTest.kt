@@ -109,10 +109,18 @@ class ManageTest {
         compose.onNodeWithContentDescription("Open workspace drawer").performClick()
         compose.onNodeWithContentDescription("Workspace scope: All Workspaces").assertExists()
         compose.onNodeWithTag("workspace-switcher").performClick()
+        // Closed workspaces start collapsed under their header.
+        awaitText("Closed Workspaces")
+        assertFalse(exists("Old"))
+        compose.onNodeWithTag("workspace-switcher-closed").performClick()
+        await { exists("Old") }
+        compose.onNodeWithTag("workspace-switcher-closed").performClick()
+        await { !exists("Old") }
+        // A query searches them regardless of the toggle.
         compose.onNodeWithTag("workspace-switcher-search").performTextInput("od")
         val menuAll = hasText("All Workspaces") and hasAnyAncestor(hasTestTag("workspace-switcher-menu"))
         await { exists("Old") && compose.onAllNodes(menuAll).fetchSemanticsNodes().isEmpty() }
-        assertTrue(exists("Closed"))
+        assertTrue(exists("Closed Workspaces"))
         click("Old")
         await { sent<EventWorkspaceArchive>().size == 1 }
         assertEquals("ws-old", sent<EventWorkspaceArchive>().single().workspace_id)

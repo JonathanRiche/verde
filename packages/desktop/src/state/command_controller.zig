@@ -265,6 +265,9 @@ pub const State = struct {
     selected: usize = 0,
     action_menu_open: bool = false,
     action_selected: usize = 0,
+    /// Workspace switcher: the "Closed Workspaces" group is expanded. Starts
+    /// collapsed on every open; a non-empty query shows matches regardless.
+    switcher_closed_expanded: bool = false,
     keyboard_config: ?*const keybinds.NativeKeyboardConfig = null,
     provider_slash_catalog: ProviderSlashCatalogState = .{},
 
@@ -424,6 +427,7 @@ pub fn openCommandPalette(self: anytype, scope_project: ?usize) void {
 pub fn openWorkspaceSwitcher(self: anytype) void {
     self.command_controller.begin(null);
     self.command_controller.mode = .workspaces;
+    self.command_controller.switcher_closed_expanded = false;
     self.modal_text_selection_anchor = null;
     self.palette_modal_text_focus = .command_palette;
     self.closeSidebarContextMenu();

@@ -3,7 +3,7 @@ import { Portal } from 'solid-js/web'
 
 import { store, type SidebarContextAction } from '../lib/store'
 import { paneIsActive, type LivePane, type Workspace } from '../lib/types'
-import { fuzzyMatches, sidebarSections, type SidebarScope } from '../lib/workspace_switcher'
+import { sidebarSections, switcherItems, type SidebarScope, type SwitcherItem as SwitcherItemOf } from '../lib/workspace_switcher'
 import { Icon, ProviderGlyph, StatusPip, VerdeLogo, WorkspaceGlyph } from './Icons'
 import { ChatRouting } from './ChatRouting'
 import { GitChangesDot } from './GitChanges'
@@ -333,10 +333,7 @@ function SectionLabel(props: { children: JSX.Element }) {
   return <div class="mb-1 text-[11px] tracking-wide text-[var(--text-subtle)]">{props.children}</div>
 }
 
-type SwitcherItem =
-  | { kind: 'all' }
-  | { kind: 'workspace'; workspace: Workspace; closed: boolean }
-  | { kind: 'new' }
+type SwitcherItem = SwitcherItemOf<Workspace>
 
 /// Context-menu styled workspace picker anchored under the sidebar trigger.
 /// "All Workspaces" identity chip, sized like a workspace chip.
@@ -360,17 +357,8 @@ function WorkspaceSwitcher(props: {
   let input!: HTMLInputElement
   let list!: HTMLDivElement
 
-  const items = createMemo((): SwitcherItem[] => {
-    const text = query()
-    const rows = store.switcherRows()
-      .filter((row) => fuzzyMatches(row.workspace.label, text))
-      .map((row): SwitcherItem => ({ kind: 'workspace', workspace: row.workspace, closed: row.closed }))
-    return [
-      ...(fuzzyMatches('all workspaces', text) ? [{ kind: 'all' } as const] : []),
-      ...rows,
-      { kind: 'new' } as const,
-    ]
-  })
+  const [closedExpanded, setClosedExpanded] = createSignal(false)
+  const items = createMemo((): SwitcherItem[] => switcherItems(store.switcherRows(), query(), closedExpanded()))
   createEffect(() => {
     query()
     setHighlight(0)
@@ -395,6 +383,11 @@ function WorkspaceSwitcher(props: {
     if (!item) return
     if (item.kind === 'all') props.onSelect('all')
     else if (item.kind === 'new') props.onNewWorkspace()
+    else if (item.kind === 'closed_header') {
+      // Toggle in place; keep the highlight on the header row.
+      if (!query().trim()) setClosedExpanded((open) => !open)
+      queueMicrotask(() => input?.focus())
+    }
     else props.onSelect(item.workspace.workspace_id)
   }
   const onKeyDown = (event: KeyboardEvent) => {
@@ -467,6 +460,17 @@ function WorkspaceSwitcher(props: {
                     </span>
                     <span class="min-w-0 flex-1 truncate">New workspace</span>
                   </Show>
+                  <Show when={item.kind === 'closed_header' ? item : null}>
+                    {(header) => (
+                      <>
+                        <span class="grid h-[22px] w-[22px] shrink-0 place-items-center">
+                          <Icon name={header().expanded ? 'chevronDown' : 'chevron'} class="h-4 w-4" />
+                        </span>
+                        <span class={`min-w-0 flex-1 truncate ${highlight() === index() ? '' : 'text-[var(--text-subtle)]'}`}>Closed Workspaces</span>
+                        <span class="shrink-0 pr-1.5 text-[11px] text-[var(--text-subtle)]">{header().count}</span>
+                      </>
+                    )}
+                  </Show>
                   <Show when={item.kind === 'all'}>
                     <AllWorkspacesGlyph />
                     <span class="min-w-0 flex-1 truncate">All Workspaces</span>
@@ -478,9 +482,6 @@ function WorkspaceSwitcher(props: {
                         <span class={`min-w-0 flex-1 truncate ${row().closed ? 'text-[var(--text-subtle)]' : ''}`}>
                           {row().workspace.label}
                         </span>
-                        <Show when={row().closed}>
-                          <span class="shrink-0 text-[11px] text-[var(--text-subtle)]">Closed</span>
-                        </Show>
                         <Show when={isCurrent(item)}>
                           <Icon name="check" class="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
                         </Show>

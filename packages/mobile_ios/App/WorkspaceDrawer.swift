@@ -69,6 +69,8 @@ struct WorkspaceDrawer: View {
     @State private var search = ""
     @State private var switching = false
     @State private var workspaceQuery = ""
+    /// Closed workspaces sit in a collapsed group; a query searches them regardless.
+    @State private var closedExpanded = false
     @State private var manage: ManageModel?
     @State private var renaming: ThreadSummary?
     @State private var title = ""
@@ -141,7 +143,7 @@ struct WorkspaceDrawer: View {
 
     /// Full-width scope trigger plus its context-menu popover (spec "Switcher popover").
     private func switcher(_ all: [Workspace], scoped: Workspace?) -> some View {
-        Button { workspaceQuery = ""; switching = true } label: {
+        Button { workspaceQuery = ""; closedExpanded = false; switching = true } label: {
             HStack(spacing: 10) {
                 if let scoped { WorkspaceChip(workspace: scoped, size: 22) }
                 else { Image(systemName: "square.grid.2x2").frame(width: 22, height: 22).foregroundStyle(VerdeTheme.muted) }
@@ -173,22 +175,24 @@ struct WorkspaceDrawer: View {
                             Text("All Workspaces")
                         }
                     }
-                    ForEach(switcherWorkspaces(all).filter { fuzzyMatches(workspaceQuery, $0.label) }, id: \.workspace_id) { ws in
-                        HStack(spacing: 0) {
-                            // Closed rows reopen on select, which needs workspace management rights.
-                            menuRow(selected: scoped?.workspace_id == ws.workspace_id, enabled: ws.open || canManage, action: {
-                                if !ws.open, let manage { Task { _ = await manage.workspace("reopen", id: ws.workspace_id) } }
-                                scope = ws.workspace_id; switching = false
-                            }) {
-                                WorkspaceChip(workspace: ws, size: 22)
-                                VStack(alignment: .leading, spacing: 0) {
-                                    Text(ws.label).lineLimit(1)
-                                    if !ws.open { Text("Closed").font(VerdeTheme.ui(10)).foregroundStyle(VerdeTheme.subtle) }
-                                }
-                            }.opacity(ws.open ? 1 : 0.55)
-                            Button { switching = false; open(.workspace(ws.workspace_id)) } label: {
-                                Image(systemName: "gearshape").frame(width: 44, height: 44)
-                            }.buttonStyle(.plain).foregroundStyle(VerdeTheme.muted).accessibilityLabel("Settings for " + ws.label)
+                    let matching = switcherWorkspaces(all).filter { fuzzyMatches(workspaceQuery, $0.label) }
+                    ForEach(matching.filter(\.open), id: \.workspace_id) { ws in
+                        switcherRow(ws, scoped: scoped, canManage: canManage)
+                    }
+                    let closed = matching.filter { !$0.open }
+                    if !closed.isEmpty {
+                        let expanded = closedExpanded || !workspaceQuery.isEmpty
+                        Button { closedExpanded.toggle() } label: {
+                            HStack(spacing: 10) {
+                                Image(systemName: expanded ? "chevron.down" : "chevron.right").font(.caption).frame(width: 22, height: 22)
+                                Text("Closed Workspaces")
+                                Spacer(minLength: 0)
+                                Text("\(closed.count)").font(VerdeTheme.ui(11)).foregroundStyle(VerdeTheme.subtle)
+                            }.padding(.horizontal, 12).frame(minHeight: 44).contentShape(Rectangle())
+                        }.buttonStyle(.plain).foregroundStyle(VerdeTheme.muted).disabled(!workspaceQuery.isEmpty)
+                            .accessibilityIdentifier("workspace-switcher-closed").accessibilityValue(expanded ? "expanded" : "collapsed")
+                        if expanded {
+                            ForEach(closed, id: \.workspace_id) { ws in switcherRow(ws, scoped: scoped, canManage: canManage) }
                         }
                     }
                 }
@@ -217,6 +221,23 @@ struct WorkspaceDrawer: View {
         }
     }
 
+    private func switcherRow(_ ws: Workspace, scoped: Workspace?, canManage: Bool) -> some View {
+        HStack(spacing: 0) {
+            // Closed rows reopen on select, which needs workspace management rights.
+            menuRow(selected: scoped?.workspace_id == ws.workspace_id, enabled: ws.open || canManage, action: {
+                if !ws.open, let manage { Task { _ = await manage.workspace("reopen", id: ws.workspace_id) } }
+                scope = ws.workspace_id; switching = false
+            }) {
+                WorkspaceChip(workspace: ws, size: 22)
+                Text(ws.label).lineLimit(1)
+            }.opacity(ws.open ? 1 : 0.55)
+            if ws.open {
+                Button { switching = false; open(.workspace(ws.workspace_id)) } label: {
+                    Image(systemName: "gearshape").frame(width: 44, height: 44)
+                }.buttonStyle(.plain).foregroundStyle(VerdeTheme.muted).accessibilityLabel("Settings for " + ws.label)
+            }
+        }
+    }
     private func menuRow<Label: View>(selected: Bool, enabled: Bool, action: @escaping () -> Void, @ViewBuilder label: () -> Label) -> some View {
         Button(action: action) {
             HStack(spacing: 10) {
