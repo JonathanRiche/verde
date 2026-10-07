@@ -22,6 +22,7 @@ const handoff_sheet = @import("handoff_sheet.zig");
 const profiler = @import("../runtime/profiler.zig");
 const terminal_panel = @import("terminal_panel.zig");
 const theme = @import("theme.zig");
+const sidebar_ui = @import("sidebar.zig");
 const utils = @import("../utils.zig");
 
 const THREAD_DROP_PREVIEW_Z: i32 = 140;
@@ -523,6 +524,12 @@ pub fn focusPaneInDirection(state: *runtime.AppState, dir: FocusDirection) bool 
         const direction = workspacePaneDirection(dir);
         if (layout.neighborPaneIdInScrollGroup(current_id, direction)) |inner_target| {
             return focusPaneNavigationTarget(state, inner_target);
+        }
+        // Under All Workspaces, stepping off a tab follows the sidebar's
+        // displayed order (right/down = next row, left/up = previous),
+        // crossing workspaces, rather than this workspace's strip order.
+        if (sidebar_ui.allWorkspacesOrderActive(state)) {
+            return sidebar_ui.focusAdjacentOpenRow(state, dir == .right or dir == .down, false);
         }
         const strip_direction = scrollingPaneDirection(state.app_config.workspace_scroll_direction, dir) orelse return false;
         const target = layout.adjacentScrollGroupPaneId(current_id, strip_direction) orelse return false;

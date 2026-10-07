@@ -1045,8 +1045,9 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
         const buf = state.palette_frame_text_arena.allocator().alloc(native_state.WorkspaceTab, layout.panes.items.len) catch break :blk &.{};
         break :blk native_state.workspace_tabs.collect(layout, buf);
     } else &.{};
-    for (open_units) |unit| {
-        y = renderOpenPaneUnit(state, unit, selected_tabs, x, rail_w, open_clip, open_clip, y);
+    const row_ordinals = allWorkspacesOrderActive(state);
+    for (open_units, 0..) |unit, ordinal| {
+        y = renderOpenPaneUnit(state, unit, selected_tabs, if (row_ordinals) ordinal else null, x, rail_w, open_clip, open_clip, y);
     }
     if (open_units.len > 0) y += theme.scaledUi(4.0);
     if (y == rows_top) {
@@ -1228,6 +1229,59 @@ fn collectOpenUnits(state: *runtime.AppState, all_scope: bool) []OpenUnit {
 
 fn openUnitNewerFirst(_: void, a: OpenUnit, b: OpenUnit) bool {
     return a.recency_ms > b.recency_ms;
+}
+
+/// True while the visible sidebar lists every workspace. Keyboard ordinals
+/// (Ctrl+N) and tab-to-tab navigation then follow the sidebar's displayed
+/// cross-workspace order instead of the selected workspace's layout order,
+/// so what you press matches what you see.
+pub fn allWorkspacesOrderActive(state: *const runtime.AppState) bool {
+    return state.sidebar_all_workspaces and !state.isSidebarHidden() and state.project_controller.projects.items.len > 0;
+}
+
+fn focusOpenUnit(state: *runtime.AppState, unit: OpenUnit) bool {
+    const layout = &state.project_controller.projects.items[unit.project_index].workspace_layout;
+    const group_id = layout.scrollGroupIdForPane(layout.panes.items[unit.pane_index].id) orelse return false;
+    return state.selectWorkspaceTab(unit.project_index, group_id);
+}
+
+/// Index of the unit holding the focused pane of the selected workspace.
+fn focusedOpenUnitIndex(state: *runtime.AppState, units: []const OpenUnit) ?usize {
+    const projects = state.project_controller.projects.items;
+    const selected = state.project_controller.selected_index;
+    if (selected >= projects.len) return null;
+    const layout = &projects[selected].workspace_layout;
+    const focused = layout.focused_pane_id orelse return null;
+    for (units, 0..) |unit, index| {
+        if (unit.project_index == selected and openUnitContainsPane(layout, unit.pane_index, focused)) return index;
+    }
+    return null;
+}
+
+/// Ctrl+1…Ctrl+0 / `pane_select`: the N-th row of the sidebar under All
+/// Workspaces, else the N-th tab of the selected workspace.
+pub fn selectOpenRowAtOrdinal(state: *runtime.AppState, ordinal: usize) bool {
+    if (!allWorkspacesOrderActive(state)) return state.selectWorkspaceTabAtIndex(ordinal);
+    const units = collectOpenUnits(state, true);
+    if (ordinal >= units.len) return false;
+    return focusOpenUnit(state, units[ordinal]);
+}
+
+/// Steps focus to the previous/next sidebar row under All Workspaces,
+/// crossing into other workspaces. Returns false outside that scope (or at
+/// an end without `wrap`) so callers can fall back to their own order.
+/// `wrap` cycles past either end (Ctrl+Tab) instead of stopping (hjkl).
+pub fn focusAdjacentOpenRow(state: *runtime.AppState, forward: bool, wrap: bool) bool {
+    if (!allWorkspacesOrderActive(state)) return false;
+    const units = collectOpenUnits(state, true);
+    if (units.len == 0) return false;
+    const current = focusedOpenUnitIndex(state, units) orelse return focusOpenUnit(state, units[0]);
+    const target = if (forward)
+        (if (current + 1 < units.len) current + 1 else if (wrap) 0 else return false)
+    else
+        (if (current > 0) current - 1 else if (wrap) units.len - 1 else return false);
+    if (target == current) return false;
+    return focusOpenUnit(state, units[target]);
 }
 
 /// Last activity of one pane in unix ms: a chat's last turn activity, or a
@@ -1728,6 +1782,9 @@ fn renderOpenPaneUnit(
     state: *runtime.AppState,
     unit: OpenUnit,
     selected_tabs: []const native_state.WorkspaceTab,
+    /// Sidebar row ordinal under All Workspaces; overrides the per-workspace
+    /// tab ordinal so Ctrl+N badges count down the visible list.
+    row_ordinal: ?usize,
     x: f32,
     rail_w: f32,
     list_clip: palette.Rect,
@@ -1741,8 +1798,8 @@ fn renderOpenPaneUnit(
     const group_id = layout.scrollGroupIdForPane(pane.id) orelse return y_in;
     // Ctrl+N tips address the selected workspace's tabs only; a split tile
     // shares one ordinal and its mini-rows show none.
-    const shortcuts = project_index == state.project_controller.selected_index;
-    const tab_index = if (shortcuts) native_state.workspace_tabs.indexOfTab(selected_tabs, group_id) else null;
+    const shortcuts = row_ordinal != null or project_index == state.project_controller.selected_index;
+    const tab_index = row_ordinal orelse if (shortcuts) native_state.workspace_tabs.indexOfTab(selected_tabs, group_id) else null;
     const height = openUnitHeight(layout, unit.pane_index);
     if (layout.scrollGroupPaneCount(group_id) > 1) {
         const root = layout.root orelse return y_in;
@@ -2944,6 +3001,43 @@ test "OPEN interleaves All Workspaces newest-activity first and keeps layout ord
     const scoped = collectOpenUnits(&state, false);
     try std.testing.expectEqual(@as(usize, 1), scoped.len);
     try std.testing.expectEqual(@as(usize, 0), scoped[0].project_index);
+}
+
+test "All Workspaces keyboard order follows the displayed OPEN rows" {
+    const allocator = std.testing.allocator;
+    var state: runtime.AppState = undefined;
+    state.allocator = allocator;
+    state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
+    defer state.palette_frame_text_arena.deinit();
+    state.project_controller.projects = .empty;
+    state.project_controller.selected_index = 0;
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+    }
+    const activity = [_]i64{ 10, 30, 20 };
+    for (activity, 0..) |seconds, index| {
+        var id_buf: [16]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "ws-{d}", .{index});
+        var project = try native_state.Project.init(allocator, id, id, "/tmp/ws", 0);
+        project.threads.items[0].last_activity_at = seconds;
+        project.workspace_layout.focused_pane_id = project.workspace_layout.panes.items[0].id;
+        state.project_controller.projects.append(allocator, project) catch |err| {
+            project.deinit(allocator);
+            return err;
+        };
+    }
+
+    // Displayed order is ws-1, ws-2, ws-0 (newest first). The selected
+    // workspace's focused row sits at that displayed position, so Ctrl+N and
+    // next/previous step from what the user sees, not layout order.
+    const units = collectOpenUnits(&state, true);
+    state.project_controller.selected_index = 2;
+    try std.testing.expectEqual(@as(?usize, 1), focusedOpenUnitIndex(&state, units));
+    state.project_controller.selected_index = 0;
+    try std.testing.expectEqual(@as(?usize, 2), focusedOpenUnitIndex(&state, units));
+    state.project_controller.selected_index = 1;
+    try std.testing.expectEqual(@as(?usize, 0), focusedOpenUnitIndex(&state, units));
 }
 
 test "ACTIVE cluster caps viewport at ten rows and leaves room for the workspace tree" {

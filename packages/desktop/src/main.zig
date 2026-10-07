@@ -1990,7 +1990,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 }
             }
             if (keyboard.workspacePaneSelectIndexForEvent(&event.key)) |tab_ordinal| {
-                if (state.selectWorkspaceTabAtIndex(tab_ordinal)) {
+                if (sidebar_ui.selectOpenRowAtOrdinal(state, tab_ordinal)) {
                     syncWindowTextInput(window, state);
                     return true;
                 }
@@ -3124,7 +3124,7 @@ fn dispatchPrefixTarget(state: *AppState, keyboard: *keybinds.NativeKeyboardConf
             state.markDirty();
         },
         .workspace_select => |index| _ = state.selectProjectScoped(index),
-        .pane_select => |index| _ = state.selectWorkspaceTabAtIndex(index),
+        .pane_select => |index| _ = sidebar_ui.selectOpenRowAtOrdinal(state, index),
         .active_select => |index| _ = sidebar_ui.focusAttentionClusterRowAtIndex(state, index),
         .command => |command| state.runPrefixCommand(command),
     }
@@ -3263,8 +3263,8 @@ fn handleKeyboardAction(
         .workspace_next => _ = state.selectAdjacentProject(1),
         .workspace_active_previous => _ = sidebar_ui.focusAdjacentAttentionClusterRow(state, -1),
         .workspace_active_next => _ = sidebar_ui.focusAdjacentAttentionClusterRow(state, 1),
-        .workspace_pane_previous => _ = state.focusCurrentProjectWorkspacePaneInSidebarOrder(-1),
-        .workspace_pane_next => _ = state.focusCurrentProjectWorkspacePaneInSidebarOrder(1),
+        .workspace_pane_previous => _ = sidebar_ui.focusAdjacentOpenRow(state, false, true) or state.focusCurrentProjectWorkspacePaneInSidebarOrder(-1),
+        .workspace_pane_next => _ = sidebar_ui.focusAdjacentOpenRow(state, true, true) or state.focusCurrentProjectWorkspacePaneInSidebarOrder(1),
         .workspace_split_chat_vertical => _ = openHotkeyWorkspacePane(state, .chat, .vertical),
         .workspace_split_chat_horizontal => _ = openHotkeyWorkspacePane(state, .chat, .horizontal),
         .workspace_split_terminal_vertical => _ = openHotkeyWorkspacePane(state, .terminal, .vertical),
