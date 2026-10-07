@@ -1080,6 +1080,9 @@ pub fn suspendBrowserForHostWindowHidden(self: anytype) void {
     if (!self.isBrowserRuntimeActive()) return;
     self.unfocusBrowserPane();
     self.browser_controller.address_focused = false;
+    // An already suspended surface is hidden. Hiding again emits no close
+    // event, so arming suppression would swallow a later genuine close.
+    if (browserSurfaceSuspended(self)) return;
     self.browser_controller.runtime.controller.hide() catch |err| {
         log.warn("failed to hide browser runtime for host window lifecycle: {s}", .{@errorName(err)});
         self.browser_controller.runtime.status = .failed;
@@ -1089,12 +1092,21 @@ pub fn suspendBrowserForHostWindowHidden(self: anytype) void {
     self.suppressNextBrowserClosedEvent();
 }
 
+fn browserSurfaceSuspended(self: anytype) bool {
+    return self.browser_controller.surface_suspended_for_layout or
+        self.browser_controller.surface_suspended_for_palette_overlay or
+        self.browser_controller.surface_suspended_for_empty_state;
+}
+
 /// Restores a visible browser dock after the host SDL window is shown/restored.
 pub fn resumeBrowserAfterHostWindowShown(self: anytype) void {
     if (!self.isBrowserRuntimeActive()) return;
     const runtime_project_index = self.browser_controller.runtime_project_index orelse return;
     if (runtime_project_index != self.project_controller.selected_index) return;
-    if (self.browser_controller.surface_suspended_for_empty_state) return;
+    // Layout and Palette suspensions own re-showing their surface. Showing it
+    // here leaves the backend visible while suspended, so the owner's later
+    // show() is a no-op that never emits .opened and strands status Opening.
+    if (browserSurfaceSuspended(self)) return;
     self.browser_controller.runtime.status = .opening;
     self.browser_controller.runtime.controller.show() catch |err| {
         log.warn("failed to restore browser runtime after host window lifecycle: {s}", .{@errorName(err)});
@@ -3635,4 +3647,57 @@ test "internal and clipboard evals preserve the last automation result" {
     try std.testing.expectEqual(@as(usize, 1), app.notices);
     recordBrowserEvalResult(&app, "next automation result");
     try std.testing.expectEqualStrings("next automation result", app.browser_controller.runtime.result.?);
+}
+
+test "host window resume leaves layout-suspended browsers for the layout restore" {
+    const Stub = @import("../browser/platform/stub_backend.zig").Controller;
+    const allocator = std.testing.allocator;
+    const Mock = struct {
+        browser_controller: State,
+        project_controller: struct { selected_index: usize = 0 } = .{},
+
+        pub fn isBrowserRuntimeActive(_: *@This()) bool {
+            return true;
+        }
+        pub fn unfocusBrowserPane(self: *@This()) void {
+            self.browser_controller.pane_focused = false;
+        }
+        pub fn suppressNextBrowserClosedEvent(self: *@This()) void {
+            self.browser_controller.runtime.suppressNextClosedEvent();
+        }
+        pub fn browserBlockedByPaletteOverlay(_: *@This()) bool {
+            return false;
+        }
+        pub fn syncBrowserPaneBoundsToBackend(_: *@This()) void {}
+        fn drainOpened(self: *@This()) bool {
+            var opened = false;
+            while (self.browser_controller.runtime.controller.pollEvent()) |event| {
+                defer event.deinit(std.testing.allocator);
+                if (event == .opened) opened = true;
+                if (event == .closed) _ = self.browser_controller.runtime.consumeSuppressedClosedEvent();
+            }
+            return opened;
+        }
+    };
+    var app = Mock{ .browser_controller = try State.init(allocator) };
+    defer app.browser_controller.deinit(allocator);
+    app.browser_controller.runtime_project_index = 0;
+    app.browser_controller.runtime.controller.backend = .{ .stub = try Stub.init(allocator) };
+    try app.browser_controller.runtime.controller.show();
+    _ = app.drainOpened();
+    app.browser_controller.runtime.status = .ready;
+
+    // The pane scrolls out of the strip, then the app window hides and returns.
+    noteBrowserPaneNotRendered(&app);
+    _ = app.drainOpened();
+    suspendBrowserForHostWindowHidden(&app);
+    resumeBrowserAfterHostWindowShown(&app);
+    try std.testing.expect(!app.drainOpened());
+    try std.testing.expectEqual(browser_runtime.Status.ready, app.browser_controller.runtime.status);
+    try std.testing.expectEqual(@as(u8, 0), app.browser_controller.runtime.suppressed_closed_events);
+
+    // Scrolling back must produce the .opened event that settles Opening.
+    restoreBrowserSurfaceForRenderedLayout(&app);
+    try std.testing.expectEqual(browser_runtime.Status.opening, app.browser_controller.runtime.status);
+    try std.testing.expect(app.drainOpened());
 }

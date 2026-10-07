@@ -16420,14 +16420,24 @@ pub const AppState = struct {
                 return false;
             }
             const pid = task.pid orelse if (task.pid_path) |path| readBackgroundTaskPid(self.allocator, path) else null;
+            // No PID to signal (never written, or the pid file is gone):
+            // nothing Verde can kill, so end the tracked row instead of
+            // leaving a Stop button that can never succeed.
             const resolved_pid = pid orelse {
-                self.setSidebarNotice("Background task PID is not available yet.");
-                return false;
+                runtime_log.diagnostic("bg-stop pid unavailable; collapsing row thread={s}", .{thread.local_thread_id});
+                return self.endTrackedBackgroundTaskRow(thread, task);
             };
-            platform_process.terminateProcessIdTree(resolved_pid) catch |err| {
-                log.warn("failed to stop background process tree: {s}", .{@errorName(err)});
-                self.setSidebarNotice("Failed to request background task termination.");
-                return false;
+            platform_process.terminateProcessIdTree(resolved_pid) catch |err| switch (err) {
+                // The process already exited; collapse the row.
+                error.ProcessNotFound => {
+                    runtime_log.diagnostic("bg-stop pid={d} not found; collapsing row thread={s}", .{ resolved_pid, thread.local_thread_id });
+                    return self.endTrackedBackgroundTaskRow(thread, task);
+                },
+                else => {
+                    log.warn("failed to stop background process tree: {s}", .{@errorName(err)});
+                    self.setSidebarNotice("Failed to request background task termination.");
+                    return false;
+                },
             };
             task.pid = resolved_pid;
             task.stop_requested = true;
@@ -16440,6 +16450,12 @@ pub const AppState = struct {
         // Query-scoped commands (Claude tracked bash) have no independent PID.
         // Aborting the turn would also stop every sibling background command
         // in this chat, so Verde ends only this tracked row.
+        return self.endTrackedBackgroundTaskRow(thread, task);
+    }
+
+    /// Marks a background task stopped and appends its completion row so the
+    /// live card collapses, without signalling any process.
+    fn endTrackedBackgroundTaskRow(self: *AppState, thread: *ChatThread, task: *BackgroundTask) bool {
         task.stop_requested = true;
         task.status = .stopped;
         const body = backgroundTaskCompletionBodyAlloc(self.allocator, task) catch return false;
