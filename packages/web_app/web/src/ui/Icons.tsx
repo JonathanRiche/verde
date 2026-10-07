@@ -99,6 +99,7 @@ export function Icon(props: { name: string; class?: string }) {
     zoom: 'M9 5H5v4 M19 9V5h-4 M5 15v4h4 M15 19h4v-4',
     unzoom: 'M9 5v4H5 M15 5v4h4 M9 19v-4H5 M15 19v-4h4',
     lock: 'M8 11h8v7H8z M9.4 11V8.8a2.6 2.6 0 0 1 5.2 0V11',
+    monitor: 'M4.5 6h15v10h-15z M9 19.5h6 M12 16v3.5',
     paperclip: 'M8.5 12.5l5.8-5.8a3 3 0 0 1 4.2 4.2l-7.2 7.2a4.5 4.5 0 0 1-6.4-6.4l7-7 M9.2 14.8l6.6-6.6',
     layers: 'M12 4.5l7.5 3.8-7.5 3.8-7.5-3.8z M4.5 12.2l7.5 3.8 7.5-3.8 M4.5 15.9l7.5 3.8 7.5-3.8',
     // Workspace identity set (lib/workspace_identity.ts WORKSPACE_ICONS order).

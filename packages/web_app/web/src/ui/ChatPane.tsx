@@ -11,6 +11,7 @@ import { effortLabel, effortOptionsIn, modelOptionsFor, modelSupportsFast, varia
 import type { ModelOption } from '../lib/models'
 import { handleFileCitationClick, openFileViewer } from './FileViewer'
 import { Icon, ProviderGlyph, Spinner, ZoomButton } from './Icons'
+import { ComposerRouting } from './ComposerRouting'
 import { PaneActionsButton } from './Sidebar'
 
 import { ComposerFollowup } from './ComposerFollowup'
@@ -1729,6 +1730,7 @@ function Composer(props: { pane: LivePane; focused: boolean }) {
         </div>
         <Show when={running() && !store.pendingFollowup(props.pane)}><p class="composer-detail composer-followup-hint">{store.pendingFollowupHint(props.pane)}</p></Show>
       </div>
+      <ComposerRouting pane={props.pane} />
     </form>
   )
 }
