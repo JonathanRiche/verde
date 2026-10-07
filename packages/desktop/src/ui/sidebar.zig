@@ -9,6 +9,7 @@ const context_menu = @import("context_menu.zig");
 const globe_icon = @import("globe_icon.zig");
 const runtime = @import("runtime.zig");
 const workspace_identity = @import("workspace_identity.zig");
+const text_measure = @import("text_measure.zig");
 const command_palette = @import("command_palette.zig");
 const keybinds = @import("../app/keybinds.zig");
 const utils = @import("../utils.zig");
@@ -1134,8 +1135,8 @@ fn renderWorkspaceSwitcherTrigger(state: *runtime.AppState, rect: palette.Rect, 
     const open = state.command_controller.open and state.command_controller.mode == .workspaces;
     const hovered = switcher_trigger_hovered or open;
     const radius = theme.scaledUi(7.0);
-    // One panel command: fill + whole-pixel border composited in a single SDF pass.
-    queuePalettePanel(state, rect, paletteColor(if (hovered) theme.wash(theme.COLOR_GREEN, 48) else theme.withAlpha(theme.COLOR_PANEL_ALT, 120)), paletteColor(theme.borderMuted()), radius, theme.scaledUi(1.0));
+    // Borderless: the tinted fill alone separates the trigger from the rail.
+    queuePaletteRoundedRect(state, snapRect(rect), paletteColor(if (hovered) theme.wash(theme.COLOR_GREEN, 48) else theme.withAlpha(theme.COLOR_PANEL_ALT, 120)), radius);
     addPaletteHit(rect, .workspace_switcher, state.project_controller.selected_index, 0);
 
     const projects = state.project_controller.projects.items;
@@ -2389,11 +2390,13 @@ pub fn queueIdentityChip(state: *runtime.AppState, rect: palette.Rect, glyph: []
         };
     }
     const font_size = rect.h * 0.58;
+    // Center the glyph's ink, not its line box (see centeredGlyphOrigin).
+    const origin = text_measure.centeredGlyphOrigin(.icon, glyph, font_size, rect.x + rect.w * 0.5, rect.y + rect.h * 0.5);
     queuePaletteIcon(state, .{
-        .x = rect.x + (rect.w - font_size) * 0.5,
-        .y = rect.y + (rect.h - font_size) * 0.5,
-        .w = font_size,
-        .h = font_size,
+        .x = origin.x,
+        .y = origin.y,
+        .w = rect.w,
+        .h = rect.h,
     }, glyph, font_size, paletteColor(color), clip);
 }
 

@@ -88,6 +88,30 @@ pub fn fontAscent(role: palette.FontRole, font_size: f32) f32 {
     return fallbackAscent(render_size);
 }
 
+/// Top-left origin that centers one glyph's *ink* on (`cx`, `cy`). Text is
+/// drawn from its line-box top-left, and icon glyphs (Nerd Font / Font
+/// Awesome) neither fill their advance nor sit centered in the line box, so
+/// boxing an icon at `font_size` square lands it up-left of center. Falls
+/// back to the font-size box when metrics are unavailable.
+pub const GlyphOrigin = struct { x: f32, y: f32 };
+
+pub fn centeredGlyphOrigin(role: palette.FontRole, glyph: []const u8, font_size: f32, cx: f32, cy: f32) GlyphOrigin {
+    const fallback: GlyphOrigin = .{ .x = cx - font_size * 0.5, .y = cy - font_size * 0.5 };
+    const configured = fonts orelse return fallback;
+    const view = std.unicode.Utf8View.init(glyph) catch return fallback;
+    var it = view.iterator();
+    const cp = it.nextCodepoint() orelse return fallback;
+    const render_size = font_size * GPU_TEXT_FONT_SCALE;
+    const font = fontForRole(configured, role);
+    const ink = palette.sdl.ttfGlyphInk(font, cp, render_size) catch return fallback;
+    if (ink[1] <= ink[0] or ink[3] <= ink[2]) return fallback;
+    const ascent = palette.sdl.ttfFontAscent(font, render_size) catch return fallback;
+    return .{
+        .x = cx - (ink[0] + ink[1]) * 0.5,
+        .y = cy - ascent + (ink[2] + ink[3]) * 0.5,
+    };
+}
+
 pub fn baselineOffset(reference_role: palette.FontRole, reference_size: f32, role: palette.FontRole, font_size: f32) f32 {
     return fontAscent(reference_role, reference_size) - fontAscent(role, font_size);
 }

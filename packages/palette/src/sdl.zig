@@ -425,6 +425,19 @@ pub fn ttfFontAscent(font: *Font, point_size: f32) Error!f32 {
     return @floatFromInt(TTF_GetFontAscent(font));
 }
 
+/// Ink bounds of one glyph relative to its pen origin on the baseline
+/// (y up, as FreeType reports): `[min_x, max_x, min_y, max_y]` in pixels.
+pub fn ttfGlyphInk(font: *Font, codepoint: u32, point_size: f32) Error![4]f32 {
+    try ttfSetFontSize(font, point_size);
+    var min_x: c_int = 0;
+    var max_x: c_int = 0;
+    var min_y: c_int = 0;
+    var max_y: c_int = 0;
+    var advance: c_int = 0;
+    if (!TTF_GetGlyphMetrics(font, codepoint, &min_x, &max_x, &min_y, &max_y, &advance)) return error.SdlError;
+    return .{ @floatFromInt(min_x), @floatFromInt(max_x), @floatFromInt(min_y), @floatFromInt(max_y) };
+}
+
 pub fn ttfMeasureTextOffset(font: *Font, text: []const u8, point_size: f32, offset: usize) Error!f32 {
     if (text.len == 0 or offset == 0) return 0.0;
     const layout = try createMeasureText(font, text, point_size);
@@ -519,6 +532,7 @@ extern fn TTF_CloseFont(font: *Font) void;
 extern fn TTF_SetFontSize(font: *Font, ptsize: f32) bool;
 extern fn TTF_GetStringSize(font: *Font, text: [*]const u8, length: usize, w: *c_int, h: *c_int) bool;
 extern fn TTF_GetFontAscent(font: *Font) c_int;
+extern fn TTF_GetGlyphMetrics(font: *Font, ch: u32, minx: *c_int, maxx: *c_int, miny: *c_int, maxy: *c_int, advance: *c_int) bool;
 extern fn TTF_CreateSurfaceTextEngine() ?*TextEngine;
 extern fn TTF_DestroySurfaceTextEngine(engine: ?*TextEngine) void;
 extern fn TTF_CreateText(engine: ?*TextEngine, font: *Font, text: [*]const u8, length: usize) ?*Text;
