@@ -275,7 +275,7 @@ export function resetRuntimeIdentityForTests(): void {
   runtimeIdentityRejected = false
 }
 
-export async function uploadChatImage(file: File, mime: string): Promise<Attachment> {
+export async function uploadChatImage(file: Blob, mime: string, name: string): Promise<Attachment> {
   const response = await fetch('/api/attachment', {
     method: 'POST',
     credentials: 'same-origin',
@@ -289,7 +289,7 @@ export async function uploadChatImage(file: File, mime: string): Promise<Attachm
     const reason = payload?.error?.replaceAll('_', ' ') ?? `upload failed (${response.status})`
     throw new Error(reason)
   }
-  return { ...payload.attachment, name: file.name }
+  return { ...payload.attachment, name }
 }
 
 /// Uploads a non-image chat file to the gateway host and returns the absolute

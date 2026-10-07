@@ -28,6 +28,7 @@ import {
   buildHerdrHandoffScript, chainLayouts, herdrPanePlan, openingExchange, parseHerdrLinkMarker, providerLabel,
   type HandoffContextMode, type HerdrPanePlan,
 } from './web_actions'
+import { fitImageForUpload } from './image_fit'
 import { turnImageParams } from './staged_attachments'
 import { pendingShellRows, runComposerShellCommand, shellRunParams } from './shell_mode'
 import { createComposerCommands, parseSlashCommand, classifyBangCommand, repositoryCommandPath, type SlashCommandResult } from './composer_commands'
@@ -191,7 +192,7 @@ export interface SidebarContextActionRequest {
 }
 
 const MAX_CHAT_IMAGE_BYTES = 10 * 1024 * 1024
-const MAX_CHAT_FILE_BYTES = 50 * 1024 * 1024
+const MAX_CHAT_FILE_BYTES = 100 * 1024 * 1024
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' ? (value as Record<string, unknown>) : null
@@ -3121,7 +3122,7 @@ export function createAppStore() {
     }
     const sized = files.filter((file) => {
       if (file.size <= MAX_CHAT_FILE_BYTES) return true
-      setNotice(`${file.name || 'That file'} is larger than 50 MB.`)
+      setNotice(`${file.name || 'That file'} is larger than 100 MB.`)
       return false
     })
     if (sized.length === 0) return
@@ -3165,10 +3166,6 @@ export function createAppStore() {
         documents.push(file)
         continue
       }
-      if (file.size > MAX_CHAT_IMAGE_BYTES) {
-        setNotice(`${file.name || 'That image'} is larger than 10 MB.`)
-        continue
-      }
       accepted.push({ file, mime })
     }
     if (documents.length > 0) await attachDocuments(pane, documents)
@@ -3177,7 +3174,10 @@ export function createAppStore() {
     setNotice(null)
     try {
       const results = await Promise.allSettled(
-        accepted.map(({ file, mime }) => uploadChatImage(file, mime)),
+        accepted.map(async ({ file, mime }) => {
+          const fitted = await fitImageForUpload(file, mime, MAX_CHAT_IMAGE_BYTES)
+          return uploadChatImage(fitted.blob, fitted.mime, fitted.name)
+        }),
       )
       const uploaded: Attachment[] = []
       let failure: string | null = null

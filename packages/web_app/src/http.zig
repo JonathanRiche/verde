@@ -26,7 +26,7 @@ const MIN_CHANGES_RETRY_MS: u64 = 250;
 const WEB_CHAT_IMAGE_DIR = "web-chat-images";
 const MAX_CHAT_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 const WEB_CHAT_FILE_DIR = "web-chat-files";
-const MAX_CHAT_FILE_BYTES: usize = 50 * 1024 * 1024;
+const MAX_CHAT_FILE_BYTES: usize = 100 * 1024 * 1024;
 /// Workspace files opened from chat citations are read into memory.
 const MAX_SERVED_FILE_BYTES: usize = 32 * 1024 * 1024;
 const CSP = "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; worker-src 'self' blob:; frame-src 'self' blob:";

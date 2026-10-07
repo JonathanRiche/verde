@@ -1691,7 +1691,7 @@ function Composer(props: { pane: LivePane; focused: boolean }) {
             disabled={uploading() || store.sending()}
             onClick={() => filePicker?.click()}
             aria-label="Attach files"
-            title="Attach files (images up to 10 MB, other files up to 50 MB)"
+            title="Attach files (large images are downscaled to fit, other files up to 100 MB)"
           >
             <Show
               when={!uploading()}
