@@ -55,7 +55,7 @@ import {
 } from './selection'
 import { linuxWorkspaceId } from './wyhash'
 import { closedWorkspacesFrom } from './workspace_order'
-import { activityMs, orderSwitcherRows, workspaceRecency, type SidebarScope } from './workspace_switcher'
+import { activityMs, orderSwitcherRows, sidebarSections, workspaceRecency, type SidebarScope } from './workspace_switcher'
 import {
   DEFAULT_UI_CONFIG,
   applyUiConfigPatch,
@@ -1773,6 +1773,14 @@ export function createAppStore() {
     if (pane.kind === 'terminal') return terminalStatusAt()[terminalActivityKey(pane)] ?? 0
     return 0
   }
+  /// The sidebar's Open rows top-down while it shows All Workspaces and is
+  /// visible, else null. Ctrl+1..0 and Ctrl+Tab then follow the displayed
+  /// cross-workspace order (desktop parity) instead of the focused
+  /// workspace's layout order, so what you press matches what you see.
+  const allWorkspacesOpenRows = createMemo((): LivePane[] | null => {
+    if (sidebarScope() !== 'all' || sidebarHidden() || workspaces().length === 0) return null
+    return sidebarSections(activePanes(), sidebarPanes().filter((pane) => !paneIsActive(pane)), 'all', paneActivityMs).open
+  })
   const focusedChat = createMemo(() => {
     const pane = focusedPane()
     return pane?.kind === 'chat' ? pane : visiblePanes().find((item) => item.kind === 'chat') ?? null
@@ -4770,15 +4778,24 @@ export function createAppStore() {
     }
   }
 
-  const selectPaneAt = (index: number, list: LivePane[] = openPanes()) => {
+  const selectPaneAt = (index: number, list: LivePane[] = allWorkspacesOpenRows() ?? openPanes()) => {
     const pane = list[index]
     if (pane) focusPane(pane)
   }
 
   const stepPane = (delta: number) => {
-    const panes = openPanes()
+    const rows = allWorkspacesOpenRows()
+    const panes = rows ?? openPanes()
     if (panes.length === 0) return
-    const current = panes.findIndex((pane) => pane.pane_id === focusedPaneId())
+    const focused = focusedPane()
+    const current = rows
+      ? rows.findIndex((pane) => pane.pane_id === focused?.pane_id && pane.workspace_id === focused?.workspace_id)
+      : panes.findIndex((pane) => pane.pane_id === focusedPaneId())
+    // Focus sitting on an Active row (not in Open): start from the top.
+    if (rows && current < 0) {
+      focusPane(rows[delta > 0 ? 0 : rows.length - 1]!)
+      return
+    }
     const next = (current + delta + panes.length) % panes.length
     focusPane(panes[next]!)
   }
@@ -4880,7 +4897,7 @@ export function createAppStore() {
       if (ordinal[1] === 'select') {
         const next = workspaces()[index]
         if (next) void selectSidebarScope(next.workspace_id)
-      } else selectPaneAt(index, ordinal[1] === 'active_select' ? activePanes() : openPanes())
+      } else selectPaneAt(index, ordinal[1] === 'active_select' ? activePanes() : undefined)
       return
     }
     const simple: Partial<Record<string, KeyAction>> = {
