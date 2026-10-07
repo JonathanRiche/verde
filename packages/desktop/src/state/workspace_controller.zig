@@ -1302,7 +1302,7 @@ pub fn closeWorkspacePane(self: anytype, project_index: usize, pane_id: Workspac
     if (project_index >= self.project_controller.projects.items.len) return false;
     var project = &self.project_controller.projects.items[project_index];
     var layout = &project.workspace_layout;
-    var removed_ref = layout.closePane(self.allocator, pane_id) orelse return false;
+    var removed_ref = layout.closePaneWithZoomScope(self.allocator, pane_id, self.workspaceScrollingStripActive(layout)) orelse return false;
     defer deinitWorkspacePaneRef(&removed_ref, self.allocator);
     switch (removed_ref) {
         .chat => |ref| {
@@ -1466,6 +1466,7 @@ pub fn openWorkspaceChat(
         request.target_pane_id,
         request.axis,
         request.focus,
+        self.project_controller.projects.items[project_index].workspace_layout.effectiveScrollMode(self.app_config.workspace_scroll_mode) != .disabled,
     );
     if (request.focus) {
         self.project_controller.selected_index = project_index;
@@ -1489,7 +1490,7 @@ pub fn presentWorkspaceChat(self: anytype, project_index: usize, request: Presen
     for (project.workspace_layout.panes.items) |pane| switch (pane.ref) {
         .chat => |chat_ref| if (chat_ref.thread_index == thread_index) {
             if (request.focus) {
-                project.workspace_layout.focusCreatedPane(pane.id);
+                project.workspace_layout.focusCreatedPane(pane.id, self.workspaceScrollingStripActive(&project.workspace_layout));
                 project.selected_thread_index = thread_index;
                 project.last_content_pane_id = pane.id;
                 self.project_controller.selected_index = project_index;
@@ -1510,6 +1511,7 @@ pub fn presentWorkspaceChat(self: anytype, project_index: usize, request: Presen
         request.target_pane_id,
         request.axis,
         request.focus,
+        self.project_controller.projects.items[project_index].workspace_layout.effectiveScrollMode(self.app_config.workspace_scroll_mode) != .disabled,
     );
     if (request.focus) {
         self.project_controller.selected_index = project_index;
@@ -1873,7 +1875,7 @@ fn presentSubagentThread(
     for (project.workspace_layout.panes.items) |pane| switch (pane.ref) {
         .chat => |chat_ref| if (chat_ref.thread_index == thread_index) {
             if (focus) {
-                project.workspace_layout.focusCreatedPane(pane.id);
+                project.workspace_layout.focusCreatedPane(pane.id, self.workspaceScrollingStripActive(&project.workspace_layout));
                 project.selected_thread_index = thread_index;
                 project.last_content_pane_id = pane.id;
                 self.project_controller.selected_index = project_index;
@@ -1894,6 +1896,7 @@ fn presentSubagentThread(
         target_pane_id,
         axis,
         focus,
+        project.workspace_layout.effectiveScrollMode(self.app_config.workspace_scroll_mode) != .disabled,
     );
     if (focus) {
         self.project_controller.selected_index = project_index;
@@ -2150,7 +2153,7 @@ pub fn splitWorkspacePaneWithChatPlacementAndFocus(self: anytype, project_index:
         self.setSidebarNotice("Failed to split workspace.");
         return false;
     };
-    if (focus) layout.focusCreatedPane(new_pane_id);
+    if (focus) layout.focusCreatedPane(new_pane_id, self.workspaceScrollingStripActive(layout));
     project.selected_thread_index = thread_index;
     if (focus and self.project_controller.selected_index == project_index) {
         self.terminal_controller.focused = false;
@@ -2171,6 +2174,7 @@ pub fn createWorkspaceChatPane(
     target_pane_id: ?WorkspacePaneId,
     axis: WorkspaceSplitAxis,
     focus: bool,
+    strip_active: bool,
 ) !OpenChatResult {
     var layout = &project.workspace_layout;
     const target_id = target_pane_id orelse layout.focused_pane_id orelse layout.firstVisiblePaneId() orelse
@@ -2231,7 +2235,7 @@ pub fn createWorkspaceChatPane(
     thread_appended = false;
 
     if (focus) {
-        layout.focusCreatedPane(new_pane_id);
+        layout.focusCreatedPane(new_pane_id, strip_active);
         project.selected_thread_index = thread_index;
         project.last_content_pane_id = new_pane_id;
     } else {
@@ -2261,6 +2265,7 @@ fn createWorkspaceChatPaneForThread(
     target_pane_id: ?WorkspacePaneId,
     axis: WorkspaceSplitAxis,
     focus: bool,
+    strip_active: bool,
 ) !OpenChatResult {
     var layout = &project.workspace_layout;
     const target_id = target_pane_id orelse layout.focused_pane_id orelse layout.firstVisiblePaneId() orelse
@@ -2307,7 +2312,7 @@ fn createWorkspaceChatPaneForThread(
     try layout.splitPaneWithLeaf(allocator, target_id, new_pane_id, axis, true);
     pane_inserted = false;
     if (focus) {
-        layout.focusCreatedPane(new_pane_id);
+        layout.focusCreatedPane(new_pane_id, strip_active);
         project.selected_thread_index = thread_index;
         project.last_content_pane_id = new_pane_id;
     } else {
@@ -2354,7 +2359,7 @@ pub fn splitCurrentProjectWorkspacePaneWithThread(
         self.setSidebarNotice("Failed to split workspace.");
         return false;
     };
-    layout.focusCreatedPane(new_pane_id);
+    layout.focusCreatedPane(new_pane_id, self.workspaceScrollingStripActive(layout));
     project.selected_thread_index = thread_index;
     self.terminal_controller.focused = false;
     self.requestComposerFocus();
@@ -2410,7 +2415,7 @@ fn openTerminalPaneInEmptyWorkspace(self: anytype, project_index: usize) bool {
         self.setSidebarNotice("Failed to open terminal pane.");
         return false;
     };
-    project.workspace_layout.focusCreatedPane(pane_id);
+    project.workspace_layout.focusCreatedPane(pane_id, self.workspaceScrollingStripActive(&project.workspace_layout));
     if (self.projectTerminalDockMutable(project_index, dock_id)) |dock| dock.visible = false;
     self.requestTerminalDockFocus(dock_id);
     self.setSidebarNotice("Terminal pane created.");
@@ -2454,7 +2459,7 @@ pub fn openCurrentProjectTerminalPaneForCommand(self: anytype) ?WorkspacePaneId 
         self.setSidebarNotice("Failed to split workspace.");
         return null;
     };
-    layout.focusCreatedPane(new_pane_id);
+    layout.focusCreatedPane(new_pane_id, self.workspaceScrollingStripActive(layout));
     dock.visible = false;
     self.requestTerminalDockFocus(dock_id);
     return new_pane_id;
@@ -2714,7 +2719,7 @@ pub fn splitWorkspacePaneWithTerminalPlacementAndFocus(self: anytype, project_in
         self.setSidebarNotice("Failed to split workspace.");
         return false;
     };
-    if (focus) layout.focusCreatedPane(new_pane_id);
+    if (focus) layout.focusCreatedPane(new_pane_id, self.workspaceScrollingStripActive(layout));
     dock.visible = false;
     if (focus and self.project_controller.selected_index == project_index) self.requestTerminalDockFocus(dock_id);
     self.setSidebarNotice("Terminal pane created.");
@@ -2917,6 +2922,9 @@ test "background splits preserve selection and viewport without requesting input
         focus_requests: usize = 0,
         terminal_starts: usize = 0,
 
+        pub fn workspaceScrollingStripActive(_: *@This(), _: *const WorkspaceLayout) bool {
+            return true;
+        }
         pub fn applyNewChatDefaults(_: *@This(), _: usize, _: usize) !void {}
         pub fn setSidebarNotice(_: *@This(), _: []const u8) void {}
         pub fn markDirty(_: *@This()) void {}
@@ -2975,6 +2983,7 @@ test "background splits preserve selection and viewport without requesting input
     try std.testing.expect(!state.dock.focus_requested);
     try std.testing.expect(splitWorkspacePaneWithChatPlacement(&state, 0, pane_id, .horizontal, true));
     try std.testing.expect(layout.focused_pane_id.? != pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, pane_id), layout.maximized_pane_id);
     try std.testing.expectEqual(@as(usize, 1), state.focus_requests);
 }
 
@@ -3007,6 +3016,7 @@ test "background chat creation preserves the scrolling viewport" {
         focused_pane_id,
         .horizontal,
         false,
+        true,
     );
 
     try std.testing.expect(!result.focused);

@@ -895,7 +895,7 @@ const TestRpc = struct {
 
         const runtime_id = switch (target) {
             .loopback => |port| if (port == 43_127) TEST_RUNTIME_A else TEST_RUNTIME_B,
-            .direct_https => TEST_RUNTIME_A,
+            .direct_https, .connect => TEST_RUNTIME_A,
         };
         if (parsed.request.target) |request_target| {
             _ = self.targeted_calls.fetchAdd(1, .acq_rel);

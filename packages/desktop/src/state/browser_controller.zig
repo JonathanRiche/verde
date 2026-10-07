@@ -722,7 +722,7 @@ pub fn closeBrowserInWorkspace(self: anytype, project_index: usize) bool {
             return true;
         }
     }
-    var removed_ref = self.project_controller.projects.items[project_index].workspace_layout.closePane(self.allocator, pane_id) orelse return false;
+    var removed_ref = self.project_controller.projects.items[project_index].workspace_layout.closePaneWithZoomScope(self.allocator, pane_id, self.workspaceScrollingStripActive(&self.project_controller.projects.items[project_index].workspace_layout)) orelse return false;
     deinitWorkspacePaneRef(&removed_ref, self.allocator);
     self.reconcileBrowserRuntimeAfterPaneRemoval(project_index, pane_id);
     self.setSidebarNotice("Browser closed in workspace.");

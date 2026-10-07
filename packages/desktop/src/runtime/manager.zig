@@ -37,21 +37,36 @@ pub const TransportKind = enum {
     connect,
 };
 
-/// Prepared request target. Direct and Connect calls intentionally share the
-/// same authenticated operations; only endpoint resolution differs.
+/// Prepared request target. Connect retains its issuer so an injected native
+/// backend can select the correct trust context without changing RPC frames.
 pub const TransportTarget = union(enum) {
     loopback: u16,
     direct_https: []const u8,
+    connect: struct { https_url: []const u8, control_plane_url: []const u8 },
+
+    pub fn httpsUrl(self: TransportTarget) ?[]const u8 {
+        return switch (self) {
+            .loopback => null,
+            .direct_https => |url| url,
+            .connect => |value| value.https_url,
+        };
+    }
 };
 
 const OwnedTransportTarget = union(enum) {
     loopback: u16,
     direct_https: []u8,
+    connect: struct { https_url: []u8, control_plane_url: []u8 },
 
     fn clone(allocator: std.mem.Allocator, target: TransportTarget) !OwnedTransportTarget {
         return switch (target) {
             .loopback => |port| .{ .loopback = port },
             .direct_https => |url| .{ .direct_https = try allocator.dupe(u8, url) },
+            .connect => |value| blk: {
+                const url = try allocator.dupe(u8, value.https_url);
+                errdefer allocator.free(url);
+                break :blk .{ .connect = .{ .https_url = url, .control_plane_url = try allocator.dupe(u8, value.control_plane_url) } };
+            },
         };
     }
 
@@ -59,6 +74,7 @@ const OwnedTransportTarget = union(enum) {
         return switch (self) {
             .loopback => |port| .{ .loopback = port },
             .direct_https => |url| .{ .direct_https = url },
+            .connect => |value| .{ .connect = .{ .https_url = value.https_url, .control_plane_url = value.control_plane_url } },
         };
     }
 
@@ -66,6 +82,10 @@ const OwnedTransportTarget = union(enum) {
         switch (self.*) {
             .loopback => {},
             .direct_https => |url| allocator.free(url),
+            .connect => |value| {
+                allocator.free(value.https_url);
+                allocator.free(value.control_plane_url);
+            },
         }
         self.* = undefined;
     }
@@ -2162,8 +2182,8 @@ fn callSystemAccess(
             .authorization = authorization,
             .body = body,
         }),
-        .direct_https => |url| pair_client.postDirectAlloc(allocator, .{
-            .https_url = url,
+        .direct_https, .connect => pair_client.postDirectAlloc(allocator, .{
+            .https_url = target.httpsUrl().?,
             .path = path,
             .authorization = authorization,
             .body = body,
@@ -2393,8 +2413,8 @@ fn callSystemGateway(
             .bearer_token = bearer_token,
             .rpc_json = rpc_json,
         }),
-        .direct_https => |url| gateway_transport.callDirectAlloc(allocator, .{
-            .https_url = url,
+        .direct_https, .connect => gateway_transport.callDirectAlloc(allocator, .{
+            .https_url = target.httpsUrl().?,
             .bearer_token = bearer_token,
             .rpc_json = rpc_json,
         }),
@@ -2645,7 +2665,15 @@ fn directEndpoint(entry: *const Entry) ?[]const u8 {
 
 fn transportTarget(entry: *const Entry) !TransportTarget {
     if (entry.tunnel_owned) return .{ .loopback = entry.local_port orelse return error.MissingTunnelPort };
-    return .{ .direct_https = directEndpoint(entry) orelse return error.MissingDirectEndpoint };
+    const url = directEndpoint(entry) orelse return error.MissingDirectEndpoint;
+    if (entry.owned_profile.transport == .connect) {
+        const access = switch (entry.owned_profile.access) {
+            .connect => |value| value,
+            else => return error.MissingDirectEndpoint,
+        };
+        return .{ .connect = .{ .https_url = url, .control_plane_url = access.control_plane_url } };
+    }
+    return .{ .direct_https = url };
 }
 
 fn entryExecutionReady(entry: *const Entry) bool {
@@ -3037,7 +3065,7 @@ const TestRpc = struct {
 
         const runtime_id = switch (target) {
             .loopback => |port| if (port == 43_127) self.runtime_a else self.runtime_b,
-            .direct_https => self.runtime_a,
+            .direct_https, .connect => self.runtime_a,
         };
         if (parsed.request.target) |request_target| {
             if (!std.mem.eql(u8, request_target.runtime_id, runtime_id) or
@@ -4264,4 +4292,14 @@ test "manager-owned profiles secrets and snapshots clean up allocation failures"
         checkManagerAllocationFailures,
         .{},
     );
+}
+
+test "prepared Connect transport retains issuer through worker-owned cloning without changing direct or loopback targets" {
+    var owned = try OwnedTransportTarget.clone(std.testing.allocator, .{ .connect = .{ .https_url = "https://runtime.example", .control_plane_url = "https://connect.example" } });
+    defer owned.deinit(std.testing.allocator);
+    const target = owned.borrow();
+    try std.testing.expectEqualStrings("https://runtime.example", target.httpsUrl().?);
+    try std.testing.expectEqualStrings("https://connect.example", target.connect.control_plane_url);
+    try std.testing.expect((@as(TransportTarget, .{ .loopback = 1234 })).httpsUrl() == null);
+    try std.testing.expectEqualStrings("https://self.example", (@as(TransportTarget, .{ .direct_https = "https://self.example" })).httpsUrl().?);
 }

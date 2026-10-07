@@ -2959,9 +2959,9 @@ fn renderRuntimeWizardModal(state: *runtime.AppState, width: f32, height: f32) v
             const status: []const u8 = if (rc.connect_failure) |failure| failure.message() else switch (rc.connect_phase) {
                 .idle => "Not checked yet.",
                 .discovering => "Fetching /.well-known/verde-connect-configuration…",
-                .discovered => "Discovery verified. Signed out.",
+                .discovered => "Ready to sign in.",
                 .signing_in => if (rc.connect_login_open) "Browser opened. Finish sign-in there; this window waits for the loopback redirect." else "Starting sign-in…",
-                .signed_in, .loading_inventory => "Signed in. Loading linked runtimes…",
+                .signed_in, .loading_inventory => "Signed in. Loading authorized runtimes…",
                 .inventory_loaded => "Signed in.",
                 .bootstrapping => "Creating the runtime-local device credential…",
                 .bootstrap_ready => "Runtime bootstrap complete.",

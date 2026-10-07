@@ -614,7 +614,7 @@ pub fn toggleCurrentProjectTerminal(self: anytype) void {
         self.setSidebarNotice("Failed to open terminal pane.");
         return;
     };
-    if (!terminal_open) layout.focusCreatedPane(pane_id);
+    if (!terminal_open) layout.focusCreatedPane(pane_id, self.workspaceScrollingStripActive(layout));
     dock.visible = false;
     self.requestTerminalFocus();
     self.setSidebarNotice(if (terminal_open) "Terminal focused." else "Terminal opened.");
@@ -809,7 +809,7 @@ fn closeExitedEditorTerminalPane(self: anytype, project_index: usize, dock_id: u
             _ = project.removeTerminalDockById(self.allocator, dock_id);
         }
     }
-    var removed_ref = layout.closePane(self.allocator, pane_id) orelse return false;
+    var removed_ref = layout.closePaneWithZoomScope(self.allocator, pane_id, self.workspaceScrollingStripActive(layout)) orelse return false;
     defer deinitWorkspacePaneRef(&removed_ref, self.allocator);
     if (self.project_controller.selected_index == project_index and !layout.hasVisiblePaneKind(.terminal)) self.terminal_controller.focused = false;
     // A provider installer already reported its own result. Don't replace

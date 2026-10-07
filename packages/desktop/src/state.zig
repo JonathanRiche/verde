@@ -25,6 +25,7 @@ const runtime_profile_store = @import("runtime/profile_store.zig");
 const runtime_secret_store = @import("runtime/secret_store.zig");
 const runtime_workspace_defaults = @import("runtime/workspace_runtime_defaults.zig");
 const RuntimeService = @import("runtime/service.zig");
+const runtime_connect_client = @import("runtime/connect_client.zig");
 const thread_binding = @import("runtime/thread_binding.zig");
 const runtime_log = @import("runtime/log.zig");
 const slash_commands = @import("chat/slash_commands.zig");
@@ -4669,6 +4670,15 @@ test "committed or hydrated threads keep their provider" {
 }
 
 pub const AppState = struct {
+    /// Optional installed native composition. Backend contexts must implement
+    /// the manager's retained-worker lifetime contract. Ownership transfers
+    /// after attach succeeds and is released after service/session teardown.
+    pub const RuntimeIntegration = struct {
+        context: *anyopaque,
+        dependencies: RuntimeService.Dependencies,
+        create_session: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror!?*runtime_connect_client.Session,
+        release_owner: *const fn (*anyopaque) void,
+    };
     pub const DRAFT_CAPACITY = chat_types.DRAFT_CAPACITY;
 
     allocator: std.mem.Allocator,
@@ -4865,6 +4875,7 @@ pub const AppState = struct {
     /// addresses after AppState.init returns by value. The borrowed `std.Io`
     /// is the process-owned backend supplied by `std.process.Init`.
     runtime_service: ?*RuntimeService = null,
+    runtime_integration: ?RuntimeIntegration = null,
     /// Profile IDs are copied because Service snapshots are borrowed only
     /// until the next manager mutation. Labels and secret-free status are
     /// looked up live on the single SDL owner thread.
@@ -5195,6 +5206,10 @@ pub const AppState = struct {
     /// `process_io` must remain valid until AppState.deinit; the native shell
     /// supplies `std.process.Init.io`, whose lifetime covers the whole app.
     pub fn attachRuntimeService(self: *AppState, process_io: std.Io) !void {
+        return self.attachRuntimeServiceWithIntegration(process_io, null);
+    }
+
+    pub fn attachRuntimeServiceWithIntegration(self: *AppState, process_io: std.Io, integration: ?RuntimeIntegration) !void {
         if (self.runtime_service != null) return error.RuntimeServiceAlreadyAttached;
 
         const profile_path = try runtime_profile_store.pathAlloc(self.allocator);
@@ -5202,7 +5217,7 @@ pub const AppState = struct {
 
         const service = try self.allocator.create(RuntimeService);
         errdefer self.allocator.destroy(service);
-        service.* = try RuntimeService.init(self.allocator, process_io, profile_path, .{});
+        service.* = try RuntimeService.init(self.allocator, process_io, profile_path, if (integration) |value| value.dependencies else .{});
         errdefer service.deinit();
 
         const snapshots = try service.snapshotsAlloc(self.allocator);
@@ -5226,7 +5241,15 @@ pub const AppState = struct {
         }
 
         self.runtime_service = service;
+        self.runtime_integration = integration;
         self.runtime_picker_profiles = configured;
+    }
+
+    pub fn createRuntimeConnectSession(self: *AppState, url: []const u8) !*runtime_connect_client.Session {
+        if (self.runtime_integration) |integration| {
+            if (try integration.create_session(integration.context, self.allocator, url)) |session| return session;
+        }
+        return runtime_connect_client.Session.start(self.allocator, url);
     }
 
     /// Loads desktop-owned workspace defaults after runtime profiles are
@@ -5955,6 +5978,8 @@ pub const AppState = struct {
             self.allocator.destroy(service);
             self.runtime_service = null;
         }
+        if (self.runtime_integration) |integration| integration.release_owner(integration.context);
+        self.runtime_integration = null;
     }
 
     /// Cheat-sheet filter text typed after `/`.
@@ -6840,7 +6865,7 @@ pub const AppState = struct {
                 return;
             };
         }
-        layout.focusCreatedPane(new_pane_id);
+        layout.focusCreatedPane(new_pane_id, self.workspaceScrollingStripActive(layout));
         project.selected_thread_index = thread_index;
         self.terminal_controller.focused = false;
         self.requestComposerFocus();
@@ -7489,7 +7514,7 @@ pub const AppState = struct {
             const candidate = source_layout.panes.items[pane_index];
             switch (candidate.ref) {
                 .chat => |ref| if (ref.thread_index == thread_index) {
-                    var removed = source_layout.closePane(self.allocator, candidate.id) orelse continue;
+                    var removed = source_layout.closePaneWithZoomScope(self.allocator, candidate.id, self.workspaceScrollingStripActive(source_layout)) orelse continue;
                     workspace_layout.deinitWorkspacePaneRef(&removed, self.allocator);
                 },
                 else => {},
@@ -7889,9 +7914,8 @@ pub const AppState = struct {
         // Tab order is persisted pane order, independent of focus.
         const updated_layout = &self.project_controller.projects.items[index].workspace_layout;
         if (updated_layout.movePaneBefore(new_pane_id, updated_layout.panes.items.len)) self.markDirty();
-        // focusCreatedPane copies zoom onto the new pane. A fresh space group
-        // is not that pane's tile, so put the zoom back while the strip can
-        // show both spaces.
+        // Creating the second tab can enable the strip. Keep its zoom
+        // scoped to the original tab even across that layout transition.
         if (focus) {
             if (previous_maximized_pane_id) |previous_zoom| {
                 if (updated_layout.restoreZoomToPreviousSpace(
@@ -8077,13 +8101,11 @@ pub const AppState = struct {
             created_pane = true;
         }
 
-        const preserve_viewport = layout.maximized_pane_id != null;
+        const preserve_viewport = layout.maximized_pane_id != null and !self.workspaceScrollingStripActive(layout);
         if (created_pane) {
-            layout.focusCreatedPane(chat_pane_id.?);
+            layout.focusCreatedPane(chat_pane_id.?, self.workspaceScrollingStripActive(layout));
         } else if (layout.focused_pane_id != chat_pane_id) {
-            const was_maximized = layout.maximized_pane_id != null;
-            layout.focused_pane_id = chat_pane_id;
-            if (was_maximized) layout.maximized_pane_id = chat_pane_id;
+            layout.focusCreatedPane(chat_pane_id.?, self.workspaceScrollingStripActive(layout));
         }
         if (preserve_viewport) {
             layout.scroll_leading_pane_id = null;
@@ -9203,7 +9225,7 @@ pub const AppState = struct {
             log.err("failed to seed prefix command pane: {s}", .{@errorName(err)});
             return false;
         };
-        project.workspace_layout.focusCreatedPane(pane_id);
+        project.workspace_layout.focusCreatedPane(pane_id, self.workspaceScrollingStripActive(&project.workspace_layout));
         dock.visible = false;
         self.requestTerminalDockFocus(dock_id);
         self.markDirty();
@@ -9240,7 +9262,7 @@ pub const AppState = struct {
             log.err("failed to split prefix command pane: {s}", .{@errorName(err)});
             return false;
         };
-        layout.focusCreatedPane(new_pane_id);
+        layout.focusCreatedPane(new_pane_id, self.workspaceScrollingStripActive(layout));
         dock.visible = false;
         if (self.project_controller.selected_index == project_index) self.requestTerminalDockFocus(dock_id);
         self.markDirty();
@@ -11317,7 +11339,7 @@ pub const AppState = struct {
             if (terminal_pane_open) {
                 project.workspace_layout.maximized_pane_id = null;
             } else {
-                project.workspace_layout.focusCreatedPane(process.pane_id.?);
+                project.workspace_layout.focusCreatedPane(process.pane_id.?, self.workspaceScrollingStripActive(&project.workspace_layout));
             }
             self.requestTerminalDockFocus(dock_id);
         }
@@ -11411,7 +11433,7 @@ pub const AppState = struct {
             }
         }
         if (process.kind == .agent) _ = self.workspaceAgentTuiHistoryAt(project_index, dock_id);
-        layout.focusCreatedPane(new_pane_id);
+        layout.focusCreatedPane(new_pane_id, self.workspaceScrollingStripActive(layout));
         dock.visible = false;
         self.requestTerminalDockFocus(dock_id);
         var notice_buf: [96]u8 = undefined;
@@ -11548,7 +11570,7 @@ pub const AppState = struct {
             self.setSidebarNotice("Failed to split workspace.");
             return false;
         };
-        layout.focusCreatedPane(new_pane_id);
+        layout.focusCreatedPane(new_pane_id, self.workspaceScrollingStripActive(layout));
         dock.visible = false;
         self.requestTerminalDockFocus(dock_id);
         _ = self.writeWorkspaceTerminalPaneForProject(project_index, new_pane_id, "amp\r") catch |err| {
@@ -11790,7 +11812,7 @@ pub const AppState = struct {
         }
         if (process.dock_id) |dock_id| {
             process.pane_id = try self.project_controller.projects.items[project_index].workspace_layout.ensureTerminalPane(self.allocator, dock_id);
-            self.project_controller.projects.items[project_index].workspace_layout.focusCreatedPane(process.pane_id.?);
+            self.project_controller.projects.items[project_index].workspace_layout.focusCreatedPane(process.pane_id.?, self.workspaceScrollingStripActive(&self.project_controller.projects.items[project_index].workspace_layout));
             _ = self.focusCurrentProjectWorkspacePane(process.pane_id.?);
             self.requestTerminalDockFocus(dock_id);
             self.markDirty();
@@ -18599,6 +18621,7 @@ test "activating a thread already visible focuses its pane without changing spli
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
     state.allocator = allocator;
+    state.app_config = .{ .workspace_scroll_mode = .disabled };
     state.project_controller.projects = .empty;
     state.project_controller.selected_index = 0;
     state.terminal_controller.focused = false;
@@ -18728,6 +18751,7 @@ test "focused chat creation transfers zoom to the new pane" {
         initial_pane_id,
         .vertical,
         true,
+        false,
     );
     try std.testing.expectEqual(@as(?WorkspacePaneId, zoomed_result.pane_id), project.workspace_layout.focused_pane_id);
     try std.testing.expectEqual(@as(?WorkspacePaneId, zoomed_result.pane_id), project.workspace_layout.maximized_pane_id);
@@ -18747,6 +18771,7 @@ test "focused chat creation transfers zoom to the new pane" {
         zoomed_result.pane_id,
         .horizontal,
         true,
+        false,
     );
     try std.testing.expectEqual(@as(?WorkspacePaneId, unzoomed_result.pane_id), project.workspace_layout.focused_pane_id);
     try std.testing.expect(project.workspace_layout.maximized_pane_id == null);

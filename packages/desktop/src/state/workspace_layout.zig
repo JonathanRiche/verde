@@ -374,10 +374,9 @@ pub const WorkspaceLayout = struct {
         return self.paneById(pane_id);
     }
 
-    pub fn focusCreatedPane(self: *WorkspaceLayout, pane_id: WorkspacePaneId) void {
-        const was_maximized = self.maximized_pane_id != null;
+    pub fn focusCreatedPane(self: *WorkspaceLayout, pane_id: WorkspacePaneId, strip_active: bool) void {
+        self.maximized_pane_id = self.zoomAfterFocus(pane_id, strip_active);
         self.focused_pane_id = pane_id;
-        if (was_maximized) self.maximized_pane_id = pane_id;
     }
 
     pub fn visiblePaneCount(self: *const WorkspaceLayout) usize {
@@ -453,8 +452,8 @@ pub const WorkspaceLayout = struct {
 
     /// Puts zoom back on `previous_zoom` after a new pane was focused, when
     /// that pane opened a different space group and the strip is showing.
-    /// `focusCreatedPane` hands zoom to every new pane; a fresh space should
-    /// not take it. Returns whether zoom moved. Full-workspace zoom is left
+    /// Used when creating a pane changes the layout from tiled to strip.
+    /// Returns whether zoom moved. Full-workspace zoom is left
     /// on the new pane, because that zoom fills the workspace and hiding the
     /// pane that was just focused would make the new space unreachable.
     pub fn restoreZoomToPreviousSpace(
@@ -510,6 +509,11 @@ pub const WorkspaceLayout = struct {
         const group_id = self.panes.items[target_index].scroll_group_id orelse target_pane_id;
         self.panes.items[target_index].scroll_group_id = group_id;
         self.panes.items[new_index].scroll_group_id = group_id;
+        // Creation focuses the leaf before tiled splits assign its tabspace.
+        // Resolve zoom again now that the leaf has its final membership.
+        if (self.focused_pane_id == new_pane_id) {
+            self.maximized_pane_id = self.zoomAfterFocus(new_pane_id, true);
+        }
         return true;
     }
 
@@ -613,6 +617,23 @@ pub const WorkspaceLayout = struct {
         var matched = false;
         for (self.panes.items) |pane| {
             if (!self.rootContainsPane(pane.id)) continue;
+            if (backwards and pane.id == pane_id) return previous;
+            if (matched) return pane.id;
+            if (pane.id == pane_id) matched = true;
+            previous = pane.id;
+        }
+        return null;
+    }
+
+    /// Previous (left) or next (right) tiled pane of the same tab in sidebar order.
+    fn adjacentPaneIdInScrollGroupSidebarOrder(self: *const WorkspaceLayout, pane_id: WorkspacePaneId, direction: WorkspacePaneDirection) ?WorkspacePaneId {
+        const group_id = self.scrollGroupIdForPane(pane_id) orelse return null;
+        const backwards = direction == .left or direction == .up;
+
+        var previous: ?WorkspacePaneId = null;
+        var matched = false;
+        for (self.panes.items) |pane| {
+            if (pane.id != pane_id and ((pane.scroll_group_id orelse pane.id) != group_id or !self.rootContainsPane(pane.id))) continue;
             if (backwards and pane.id == pane_id) return previous;
             if (matched) return pane.id;
             if (pane.id == pane_id) matched = true;
@@ -957,10 +978,21 @@ pub const WorkspaceLayout = struct {
     }
 
     pub fn closePane(self: *WorkspaceLayout, allocator: std.mem.Allocator, pane_id: WorkspacePaneId) ?WorkspacePaneRef {
+        return self.closePaneWithZoomScope(allocator, pane_id, false);
+    }
+
+    pub fn closePaneWithZoomScope(self: *WorkspaceLayout, allocator: std.mem.Allocator, pane_id: WorkspacePaneId, strip_active: bool) ?WorkspacePaneRef {
         const pane_index = self.paneIndexById(pane_id) orelse return null;
         const removed_ref = self.panes.items[pane_index].ref;
         const was_maximized = self.maximized_pane_id == pane_id;
         const was_focused = self.focused_pane_id == pane_id;
+        // In the strip, zoom never leaves its tab: it passes to the closest
+        // tab sibling in sidebar order, preferring the left like tiled zoom.
+        const next_zoom_pane_id: ?WorkspacePaneId = if (was_maximized and strip_active)
+            self.adjacentPaneIdInScrollGroupSidebarOrder(pane_id, .left) orelse
+                self.adjacentPaneIdInScrollGroupSidebarOrder(pane_id, .right)
+        else
+            null;
         // Capture left-preferring neighbor before the pane leaves the tree.
         const preferred_neighbor = self.preferredFocusAfterClose(pane_id);
         var next_focus_pane_id: ?WorkspacePaneId = preferred_neighbor;
@@ -1003,7 +1035,25 @@ pub const WorkspaceLayout = struct {
         if (self.quick_pane) |quick| {
             if (quick.pane_id == pane_id) self.quick_pane = null;
         }
-        if (was_maximized) {
+        if (was_maximized and strip_active) {
+            self.maximized_pane_id = next_zoom_pane_id;
+            // Closing a zoomed pane in another tab leaves focus where it is.
+            if (was_focused) {
+                const quick_focus = if (self.quick_pane) |quick| next_focus_pane_id == quick.pane_id else false;
+                // Focus follows the zoom so the focused pane is never hidden
+                // behind a zoomed sibling of the same tab.
+                self.focused_pane_id = if (quick_focus)
+                    next_focus_pane_id
+                else
+                    next_zoom_pane_id orelse next_focus_pane_id orelse self.firstVisiblePaneId();
+            }
+            if (self.quick_pane) |*quick| {
+                if (quick.pane_id == self.focused_pane_id) {
+                    quick.visible = true;
+                    quick.return_focus_pane_id = self.maximized_pane_id orelse self.firstVisiblePaneId();
+                }
+            }
+        } else if (was_maximized) {
             self.focused_pane_id = next_focus_pane_id orelse self.firstVisiblePaneId();
             self.maximized_pane_id = next_tiled_pane_id orelse self.firstVisiblePaneId();
             if (self.quick_pane) |*quick| {
@@ -1018,6 +1068,13 @@ pub const WorkspaceLayout = struct {
         } else {
             if (was_focused) self.focused_pane_id = preferred_neighbor orelse self.firstVisiblePaneId();
             if (self.maximized_pane_id == pane_id) self.maximized_pane_id = null;
+            // Focus that lands in the zoomed tab takes its zoom, as navigation
+            // does; otherwise the focused pane would sit behind the zoom.
+            if (was_focused and strip_active) {
+                if (self.focused_pane_id) |focused| {
+                    if (self.rootContainsPane(focused)) self.maximized_pane_id = self.zoomAfterFocus(focused, true);
+                }
+            }
         }
         return removed_ref;
     }
@@ -2285,7 +2342,7 @@ test "a fresh space group keeps zoom on the space that already had it" {
     layout.maximized_pane_id = first_pane_id;
     const second_pane_id = try layout.createTerminalPane(allocator, 10);
     try layout.splitPaneWithLeaf(allocator, first_pane_id, second_pane_id, .vertical, true);
-    layout.focusCreatedPane(second_pane_id);
+    layout.focusCreatedPane(second_pane_id, false);
     try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), layout.maximized_pane_id);
     try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), layout.focused_pane_id);
 
@@ -2293,7 +2350,7 @@ test "a fresh space group keeps zoom on the space that already had it" {
     try std.testing.expectEqual(@as(?WorkspacePaneId, first_pane_id), layout.maximized_pane_id);
     try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), layout.focused_pane_id);
 
-    layout.focusCreatedPane(second_pane_id);
+    layout.focusCreatedPane(second_pane_id, false);
     try std.testing.expect(!layout.restoreZoomToPreviousSpace(second_pane_id, first_pane_id, false));
     try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), layout.maximized_pane_id);
 
@@ -2457,4 +2514,104 @@ test "background browser creation and reuse preserve pane selection and zoom" {
     try std.testing.expectEqual(focused, layout.maximized_pane_id);
     try std.testing.expectEqual(focused, layout.scroll_revealed_pane_id);
     try std.testing.expect(layout.paneById(browser).?.ref == .browser);
+}
+
+test "tabspace zoom stays local when another tabspace opens a tiled split" {
+    const allocator = std.testing.allocator;
+    var layout = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+    const first = layout.focused_pane_id.?;
+    layout.maximized_pane_id = first;
+    const second = try layout.createTerminalPane(allocator, 10);
+    try layout.splitPaneWithLeaf(allocator, first, second, .horizontal, true);
+    layout.focusCreatedPane(second, true);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, first), layout.maximized_pane_id);
+    const child = try layout.createChatPane(allocator, 1);
+    try layout.splitPaneWithLeaf(allocator, second, child, .vertical, true);
+    layout.focusCreatedPane(child, true);
+    try std.testing.expect(layout.joinPaneToScrollGroup(second, child));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, first), layout.maximized_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, child), layout.focused_pane_id);
+    // Re-entering a zoomed tab and splitting it hands zoom to its new child.
+    const first_child = try layout.createTerminalPane(allocator, 11);
+    try layout.splitPaneWithLeaf(allocator, first, first_child, .vertical, true);
+    layout.focusCreatedPane(first_child, true);
+    try std.testing.expect(layout.joinPaneToScrollGroup(first, first_child));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, first_child), layout.maximized_pane_id);
+    var removed = layout.closePaneWithZoomScope(allocator, first_child, true).?;
+    deinitWorkspacePaneRef(&removed, allocator);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, first), layout.maximized_pane_id);
+    removed = layout.closePaneWithZoomScope(allocator, first, true).?;
+    deinitWorkspacePaneRef(&removed, allocator);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, null), layout.maximized_pane_id);
+}
+
+/// Tab A holds `a`, `a2`, `a3` and tab B holds `b`, in that sidebar order.
+fn buildTwoTabZoomFixture(allocator: std.mem.Allocator) !struct { layout: WorkspaceLayout, a: WorkspacePaneId, a2: WorkspacePaneId, a3: WorkspacePaneId, b: WorkspacePaneId } {
+    var layout = try WorkspaceLayout.initDefaultChat(allocator);
+    errdefer layout.deinit(allocator);
+    const a = layout.focused_pane_id.?;
+    const b = try layout.createTerminalPane(allocator, 10);
+    try layout.splitPaneWithLeaf(allocator, a, b, .horizontal, true);
+    const a2 = try layout.createTerminalPane(allocator, 11);
+    try layout.splitPaneWithLeaf(allocator, a, a2, .vertical, true);
+    try std.testing.expect(layout.joinPaneToScrollGroup(a, a2));
+    const a3 = try layout.createTerminalPane(allocator, 12);
+    try layout.splitPaneWithLeaf(allocator, a2, a3, .vertical, true);
+    try std.testing.expect(layout.joinPaneToScrollGroup(a, a3));
+    for ([_]WorkspacePaneId{ a, a2, a3, b }, 0..) |pane_id, index| {
+        _ = layout.movePaneBefore(pane_id, index);
+    }
+    return .{ .layout = layout, .a = a, .a2 = a2, .a3 = a3, .b = b };
+}
+
+test "closing a zoomed tabspace pane keeps focus on the pane that takes its zoom" {
+    const allocator = std.testing.allocator;
+    var fixture = try buildTwoTabZoomFixture(allocator);
+    defer fixture.layout.deinit(allocator);
+    const layout = &fixture.layout;
+    layout.focused_pane_id = fixture.a3;
+    layout.maximized_pane_id = fixture.a3;
+
+    var removed = layout.closePaneWithZoomScope(allocator, fixture.a3, true).?;
+    deinitWorkspacePaneRef(&removed, allocator);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, fixture.a2), layout.maximized_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, fixture.a2), layout.focused_pane_id);
+
+    // The leftmost sibling passes zoom right, still inside its tab.
+    layout.focused_pane_id = fixture.a;
+    layout.maximized_pane_id = fixture.a;
+    removed = layout.closePaneWithZoomScope(allocator, fixture.a, true).?;
+    deinitWorkspacePaneRef(&removed, allocator);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, fixture.a2), layout.maximized_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, fixture.a2), layout.focused_pane_id);
+}
+
+test "closing a zoomed pane in another tabspace leaves focus in place" {
+    const allocator = std.testing.allocator;
+    var fixture = try buildTwoTabZoomFixture(allocator);
+    defer fixture.layout.deinit(allocator);
+    const layout = &fixture.layout;
+    layout.focused_pane_id = fixture.b;
+    layout.maximized_pane_id = fixture.a2;
+
+    var removed = layout.closePaneWithZoomScope(allocator, fixture.a2, true).?;
+    deinitWorkspacePaneRef(&removed, allocator);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, fixture.a), layout.maximized_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, fixture.b), layout.focused_pane_id);
+}
+
+test "focus that lands in a zoomed tabspace after a close takes its zoom" {
+    const allocator = std.testing.allocator;
+    var fixture = try buildTwoTabZoomFixture(allocator);
+    defer fixture.layout.deinit(allocator);
+    const layout = &fixture.layout;
+    layout.focused_pane_id = fixture.b;
+    layout.maximized_pane_id = fixture.a;
+
+    // b's left sidebar neighbor is a3, which a's zoom would otherwise hide.
+    var removed = layout.closePaneWithZoomScope(allocator, fixture.b, true).?;
+    deinitWorkspacePaneRef(&removed, allocator);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, fixture.a3), layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, fixture.a3), layout.maximized_pane_id);
 }

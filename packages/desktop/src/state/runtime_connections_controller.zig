@@ -926,7 +926,7 @@ fn submitConnectSetup(self: anytype) void {
             self.syncPaletteRuntimePicker();
         }
         destroyConnectSession(rc, self.allocator);
-        rc.connect_session = connect_client.Session.start(self.allocator, url) catch |err| {
+        rc.connect_session = self.createRuntimeConnectSession(url) catch |err| {
             setNotice(&rc.wizard_notice_storage, if (err == error.OutOfMemory) "Out of memory." else "Enter the control plane as https://host[:port].");
             self.markDirty();
             return;
@@ -963,7 +963,7 @@ fn adoptSelectedConnectRuntime(self: anytype, service: *RuntimeService) void {
         return;
     };
     const row = rc.connectRuntimeAt(index) orelse return;
-    service.selectConnectRuntime(profile_id, .{
+    if (row.selection_key == null) service.selectConnectRuntime(profile_id, .{
         .link_id = row.link_id,
         .runtime_id = row.runtime_id,
         .instance_id = row.instance_id,
@@ -981,7 +981,7 @@ fn adoptSelectedConnectRuntime(self: anytype, service: *RuntimeService) void {
         return;
     }
     rc.connect_phase = .bootstrapping;
-    setNotice(&rc.wizard_notice_storage, "Endpoint saved. Requesting a signed grant and creating the runtime-local device…");
+    setNotice(&rc.wizard_notice_storage, "Requesting a signed grant and creating the runtime-local device…");
     blurWizardField(self);
     self.syncPaletteRuntimePicker();
 }
@@ -1021,7 +1021,7 @@ pub fn runtimeConnectionWizardConnect(self: anytype) void {
                 session.signOut();
                 clearConnectRuntimes(rc, self.allocator);
                 rc.connect_phase = .discovered;
-                setNotice(&rc.wizard_notice_storage, "Signed out. The OIDC token was wiped from memory.");
+                setNotice(&rc.wizard_notice_storage, "Signed out. Local connection authority was cleared.");
             }
         },
         .method, .form, .pair_grant => {},
@@ -1136,6 +1136,21 @@ fn pollConnectSession(self: anytype) bool {
             defer result.deinit();
             const service = self.runtime_service orelse return changed;
             const profile_id = rc.wizard_profile_id orelse return changed;
+            if (result.selection) |selection| {
+                service.selectConnectRuntime(profile_id, .{
+                    .link_id = selection.link_id,
+                    .runtime_id = result.runtime_id,
+                    .instance_id = result.instance_id,
+                    .https_url = selection.https_url,
+                    .wss_url = selection.wss_url,
+                    .spki_sha256 = selection.spki_sha256,
+                }) catch |err| {
+                    destroyConnectSession(rc, self.allocator);
+                    rc.connect_phase = .failed;
+                    setNotice(&rc.wizard_notice_storage, saveFailureMessage(err));
+                    return true;
+                };
+            }
             const committed = service.commitConnectBootstrap(profile_id, .{
                 .runtime_id = result.runtime_id,
                 .instance_id = result.instance_id,
@@ -1152,7 +1167,7 @@ fn pollConnectSession(self: anytype) bool {
             invalidateReadiness(self, profile_id);
             rc.wizard_step = .testing;
             setNotice(&rc.wizard_notice_storage, if (committed.durable)
-                "Connected. OIDC, signed grant, and device-key staging were wiped; the runtime-local credential is in the secret store."
+                "Connected. The runtime-local credential is in the secret store; temporary device staging was cleared."
             else
                 "Connected, but this platform could keep the runtime-local credential only in memory.");
             blurWizardField(self);
@@ -1165,7 +1180,7 @@ fn pollConnectSession(self: anytype) bool {
         rc.connect_issuer = if (snapshot.issuer) |value| self.allocator.dupe(u8, value) catch null else null;
         changed = true;
     }
-    if (snapshot.runtimes.len != rc.connect_runtimes.items.len or snapshot.runtimes_truncated != rc.connect_runtimes_truncated) {
+    if (!connectRowsEqual(rc.connect_runtimes.items, snapshot.runtimes) or snapshot.runtimes_truncated != rc.connect_runtimes_truncated) {
         clearConnectRuntimes(rc, self.allocator);
         for (snapshot.runtimes) |row| {
             const copy = ConnectRuntimeRow.clone(self.allocator, row) catch break;
@@ -1183,14 +1198,14 @@ fn pollConnectSession(self: anytype) bool {
         if (snapshot.failure) |failure| {
             setNotice(&rc.wizard_notice_storage, failure.message());
         } else switch (snapshot.phase) {
-            .discovered => setNotice(&rc.wizard_notice_storage, "Discovery verified. Sign in with the control plane's identity provider to list your runtimes."),
+            .discovered => setNotice(&rc.wizard_notice_storage, "Control plane ready. Sign in with its identity provider to list your authorized runtimes."),
             .signed_in => {
                 // Inventory needs no further user input; fetch it right away.
                 if (session.loadInventory()) rc.connect_phase = .loading_inventory;
-                setNotice(&rc.wizard_notice_storage, "Signed in. Loading linked runtimes…");
+                setNotice(&rc.wizard_notice_storage, "Signed in. Loading authorized runtimes…");
             },
             .inventory_loaded => setNotice(&rc.wizard_notice_storage, if (rc.connect_runtimes.items.len == 0)
-                "No runtimes are linked to this account yet. Link one with `verde-daemon connect link` on the runtime host."
+                "No authorized ready runtimes are available for this account."
             else
                 "Select the runtime to use with this profile."),
             .bootstrapping => setNotice(&rc.wizard_notice_storage, "Requesting and consuming the signed Connect bootstrap…"),
@@ -1204,6 +1219,7 @@ fn pollConnectSession(self: anytype) bool {
 
 /// UI copy of one inventory row so rendering never borrows worker memory.
 pub const ConnectRuntimeRow = struct {
+    selection_key: ?[]u8 = null,
     link_id: []u8,
     runtime_id: []u8,
     instance_id: []u8,
@@ -1213,6 +1229,8 @@ pub const ConnectRuntimeRow = struct {
 
     fn clone(allocator: std.mem.Allocator, row: connect_client.RuntimeRow) !ConnectRuntimeRow {
         var out: ConnectRuntimeRow = undefined;
+        out.selection_key = if (row.selection_key) |key| try allocator.dupe(u8, key) else null;
+        errdefer if (out.selection_key) |key| allocator.free(key);
         out.link_id = try allocator.dupe(u8, row.link_id);
         errdefer allocator.free(out.link_id);
         out.runtime_id = try allocator.dupe(u8, row.runtime_id);
@@ -1228,6 +1246,7 @@ pub const ConnectRuntimeRow = struct {
     }
 
     fn deinit(self: *ConnectRuntimeRow, allocator: std.mem.Allocator) void {
+        if (self.selection_key) |key| allocator.free(key);
         allocator.free(self.link_id);
         allocator.free(self.runtime_id);
         allocator.free(self.instance_id);
@@ -1237,6 +1256,20 @@ pub const ConnectRuntimeRow = struct {
         self.* = undefined;
     }
 };
+
+fn connectRowsEqual(previous: []const ConnectRuntimeRow, current: []const connect_client.RuntimeRow) bool {
+    if (previous.len != current.len) return false;
+    for (previous, current) |old, fresh| {
+        if (!optionalStringsEqual(old.selection_key, fresh.selection_key) or
+            !std.mem.eql(u8, old.link_id, fresh.link_id) or
+            !std.mem.eql(u8, old.runtime_id, fresh.runtime_id) or
+            !std.mem.eql(u8, old.instance_id, fresh.instance_id) or
+            !std.mem.eql(u8, old.https_url, fresh.https_url) or
+            !std.mem.eql(u8, old.wss_url, fresh.wss_url) or
+            !std.mem.eql(u8, old.spki_sha256, fresh.spki_sha256)) return false;
+    }
+    return true;
+}
 
 fn clearConnectRuntimes(rc: *State, allocator: std.mem.Allocator) void {
     for (rc.connect_runtimes.items) |*row| row.deinit(allocator);

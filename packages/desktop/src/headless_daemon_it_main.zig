@@ -11271,7 +11271,8 @@ fn runConnectUnlinkLogoutScenario(allocator: std.mem.Allocator, io: std.Io) !voi
     const cp = headless.connect_protocol;
     const exe = try std.process.executablePathAlloc(io, allocator);
     defer allocator.free(exe);
-    for ([_]bool{ false, true }) |direct_logout| {
+    const Mode = enum { unlink, logout, recovery_logout };
+    for ([_]Mode{ .unlink, .logout, .recovery_logout }) |mode| {
         const pref = try makePrefPath(allocator, "connect-delete");
         defer allocator.free(pref);
         defer std.Io.Dir.cwd().deleteTree(io, pref) catch {};
@@ -11285,13 +11286,18 @@ fn runConnectUnlinkLogoutScenario(allocator: std.mem.Allocator, io: std.Io) !voi
             defer initialized.deinit(allocator);
             try connect_store.initialize(initialized.store.conn, initialized.identity.runtime_id, initialized.identity.instance_id);
             try connect_store.recordLogin(initialized.store.conn, fixture.base_url, fixture.base_url, "{\"keys\":[]}", 300, 1);
-            try connect_store.recordLinked(initialized.store.conn, .{
-                .link_id = "lnk_11111111111111111111111111111111",
-                .enrollment_id = "enr_22222222222222222222222222222222",
-                .endpoint_https_url = "https://runtime.example.test",
-                .endpoint_wss_url = "wss://runtime.example.test/ws",
-                .connector_provider = "external",
-            }, false, 2);
+            if (mode == .recovery_logout) {
+                try connect_store.beginLink(initialized.store.conn, "req_33333333333333333333333333333333", "external", 2);
+                try connect_store.recordLinkRecovery(initialized.store.conn, "req_33333333333333333333333333333333", "lnk_11111111111111111111111111111111", 3);
+            } else {
+                try connect_store.recordLinked(initialized.store.conn, .{
+                    .link_id = "lnk_11111111111111111111111111111111",
+                    .enrollment_id = "enr_22222222222222222222222222222222",
+                    .endpoint_https_url = "https://runtime.example.test",
+                    .endpoint_wss_url = "wss://runtime.example.test/ws",
+                    .connector_provider = "external",
+                }, false, 2);
+            }
             const identity_json = try std.json.Stringify.valueAlloc(allocator, initialized.identity.borrowed(), .{});
             defer allocator.free(identity_json);
             var dir = try std.Io.Dir.cwd().openDir(io, pref, .{});
@@ -11317,8 +11323,11 @@ fn runConnectUnlinkLogoutScenario(allocator: std.mem.Allocator, io: std.Io) !voi
         var client = sessionizer.headlessClient(arena, &transport);
         var before = try client.call(cp.METHOD_STATUS, cp.StatusRequest{ .connect_protocol_version = 1 });
         const original = try client.decodeConnectStatus(&before);
-        if (original.state != .linked or !original.authenticated) return error.ConnectFixtureNotLinked;
-        if (direct_logout) {
+        if (!original.authenticated) return error.ConnectFixtureNotLinked;
+        if (mode == .recovery_logout) {
+            if (original.state != .unlinking or original.link_id == null or original.enrollment_id != null or original.connector_running) return error.ConnectRecoveryNotRetained;
+        } else if (original.state != .linked) return error.ConnectFixtureNotLinked;
+        if (mode != .unlink) {
             // A refused unlink must retain the credential and link for retry.
             var dir = try std.Io.Dir.cwd().openDir(io, pref, .{});
             defer dir.close(io);

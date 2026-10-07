@@ -751,7 +751,7 @@ fn ensureHerdrAttachTerminal(self: anytype, project_index: usize, request: herdr
 
     project = &self.project_controller.projects.items[project_index];
     const pane_id = try project.workspace_layout.ensureTerminalPane(self.allocator, dock_id);
-    project.workspace_layout.focusCreatedPane(pane_id);
+    project.workspace_layout.focusCreatedPane(pane_id, self.workspaceScrollingStripActive(&project.workspace_layout));
     self.requestTerminalDockFocus(dock_id);
     return .{ .dock_id = dock_id, .pane_id = pane_id };
 }
@@ -783,7 +783,7 @@ fn replaceOnlyDraftChatPaneWithTerminal(self: anytype, project_index: usize, doc
             if (thread.committed or thread.messages.items.len > 0 or thread.currentDraft().len > 0) return null;
             deinitWorkspacePaneRef(&pane.ref, self.allocator);
             pane.ref = .{ .terminal = .{ .dock_id = dock_id } };
-            layout.focusCreatedPane(pane.id);
+            layout.focusCreatedPane(pane.id, self.workspaceScrollingStripActive(layout));
             return pane.id;
         },
         else => return null,

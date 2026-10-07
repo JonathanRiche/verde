@@ -1,5 +1,13 @@
 //! Focused tests for desktop remote-runtime infrastructure without GUI deps.
 
+test "optional runtime integration uses the installed session and manager ABI" {
+    if (@import("runtime_integration_test_options").enabled) {
+        const integration = @import("runtime_integration");
+        if (@hasDecl(integration, "verifyDesktopAbi"))
+            try integration.verifyDesktopAbi(@import("runtime/connect_client.zig"), @import("runtime/manager.zig"), @import("runtime/connection.zig").TransportError, @import("runtime/profile.zig"), @import("headless"));
+    }
+}
+
 test {
     _ = @import("runtime/profile.zig");
     _ = @import("runtime/profile_store.zig");

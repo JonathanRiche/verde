@@ -132,6 +132,9 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zsdl3", .module = zsdl.module("zsdl3") },
         },
     });
+    // Opt-in native composition supplied by a separately maintained build.
+    // Default artifacts have no external source, payload or system dependency.
+    const integration_source = b.graph.environ_map.get("VERDE_RUNTIME_INTEGRATION_SOURCE");
     const build_options = b.addOptions();
     build_options.addOption([:0]const u8, "version", version_z);
     build_options.addOption(bool, "ui_debug", ui_debug);
@@ -395,6 +398,29 @@ pub fn build(b: *std.Build) void {
         else => {},
     }
 
+    var runtime_integration_module: ?*std.Build.Module = null;
+    const integration_mode_options = b.addOptions();
+    integration_mode_options.addOption(bool, "enabled", integration_source != null);
+    const integration_mode_module = integration_mode_options.createModule();
+    gui_exe.root_module.addImport("runtime_integration_mode", integration_mode_module);
+    if (integration_source) |source| {
+        if (!std.fs.path.isAbsolute(source)) @panic("Runtime integration source must be absolute");
+        const integration_options = b.addOptions();
+        integration_options.addOption([]const u8, "payload_path", b.graph.environ_map.get("VERDE_RUNTIME_INTEGRATION_PAYLOAD") orelse "");
+        integration_options.addOption([]const u8, "payload_sha256", b.graph.environ_map.get("VERDE_RUNTIME_INTEGRATION_PAYLOAD_SHA256") orelse "");
+        const integration_module = b.createModule(.{ .root_source_file = .{ .cwd_relative = source }, .target = target, .optimize = optimize, .link_libc = true });
+        integration_module.addImport("runtime_integration_options", integration_options.createModule());
+        if (b.graph.environ_map.get("VERDE_RUNTIME_INTEGRATION_LIBRARIES")) |libraries| {
+            var names = std.mem.splitScalar(u8, libraries, ',');
+            while (names.next()) |name| {
+                if (name.len == 0) @panic("Empty runtime integration library");
+                integration_module.linkSystemLibrary(name, .{});
+            }
+        }
+        gui_exe.root_module.addImport("runtime_integration", integration_module);
+        runtime_integration_module = integration_module;
+    }
+
     const install_gui = b.addInstallArtifact(gui_exe, .{});
     const install_cli = b.addInstallArtifact(cli_exe, .{});
     // Normal Linux builds give the Rust cdylib a stable SONAME, so the
@@ -556,6 +582,10 @@ pub fn build(b: *std.Build) void {
         }),
     });
     runtime_tests.root_module.link_libc = true;
+    const integration_test_options = b.addOptions();
+    integration_test_options.addOption(bool, "enabled", runtime_integration_module != null);
+    runtime_tests.root_module.addImport("runtime_integration_test_options", integration_test_options.createModule());
+    if (runtime_integration_module) |module| runtime_tests.root_module.addImport("runtime_integration", module);
     if (build_fff) |build_step| runtime_tests.step.dependOn(&build_step.step);
     runtime_tests.root_module.addIncludePath(b.path("../../vendor/fff/crates/fff-c/include"));
     fff.addFffLink(runtime_tests, target.result.os.tag, fff_lib_dir, fff_import_lib);
@@ -614,6 +644,8 @@ pub fn build(b: *std.Build) void {
     // test runner, so test-only backend access reaches this root through a
     // self-import instead. Production modules never analyze the branch.
     exe_tests.root_module.addImport("desktop_test_root", exe_tests.root_module);
+    exe_tests.root_module.addImport("runtime_integration_mode", integration_mode_module);
+    if (runtime_integration_module) |module| exe_tests.root_module.addImport("runtime_integration", module);
     if (build_fff) |build_step| exe_tests.step.dependOn(&build_step.step);
     exe_tests.root_module.addIncludePath(b.path("../../vendor"));
     exe_tests.root_module.addIncludePath(b.path("../../vendor/fff/crates/fff-c/include"));

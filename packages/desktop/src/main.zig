@@ -490,7 +490,7 @@ fn mainInner(init: std.process.Init) !void {
     // AppState.init returns by value, so attach the heap-owned runtime service
     // only after `state` has its final address. `init.io` is process-owned and
     // remains valid for every service worker through application shutdown.
-    state.attachRuntimeService(init.io) catch |err| {
+    attachRuntimeService(&state, allocator, init.io) catch |err| {
         // Error names are bounded and contain neither profile contents nor
         // process-memory-only bearer credentials.
         log.warn("failed to load remote runtime profiles: {s}", .{@errorName(err)});
@@ -3797,4 +3797,15 @@ fn reloadApplication(state: *AppState, keyboard: *keybinds.NativeKeyboardConfig)
     state.app_config_file_mtime = app_config.configFileMtime(state.allocator) catch state.app_config_file_mtime;
     applyAppConfigRuntime(state);
     state.setSidebarNotice("Config, keybinds, and theme refreshed.");
+}
+
+/// The default build retains its existing backend. Optional native composition
+/// transfers ownership only after the service attachment succeeds.
+fn attachRuntimeService(app: *AppState, allocator: std.mem.Allocator, io: std.Io) !void {
+    const integration: ?AppState.RuntimeIntegration = if (@import("runtime_integration_mode").enabled)
+        try @import("runtime_integration").create(AppState, @import("runtime/connect_client.zig"), @import("runtime/manager.zig"), @import("runtime/connection.zig").TransportError, utils.openUrlInDefaultBrowser, allocator, io)
+    else
+        null;
+    errdefer if (integration) |value| value.release_owner(value.context);
+    try app.attachRuntimeServiceWithIntegration(io, integration);
 }

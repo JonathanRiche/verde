@@ -3501,7 +3501,8 @@ test "directional navigation transfers zoom unless unzoom is configured" {
     const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
     var storage = try storage_mod.Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
     defer storage.deinit();
-    var state = try runtime.AppState.init(allocator, &storage, app_config.AppConfig{}, .{
+    // Tiled zoom follows focus; the strip keeps zoom inside its tab instead.
+    var state = try runtime.AppState.init(allocator, &storage, app_config.AppConfig{ .workspace_scroll_mode = .disabled }, .{
         .gl_texture_uploads_enabled = false,
         .browser_textures_enabled = false,
     });

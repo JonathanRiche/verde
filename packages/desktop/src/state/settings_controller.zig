@@ -1436,7 +1436,7 @@ fn startProviderInstallTerminal(self: anytype, provider: app_config.ChatProvider
         .terminal => |*terminal_ref| terminal_ref.purpose = .editor,
         else => return error.TerminalPaneUnavailable,
     }
-    layout.focusCreatedPane(pane_id);
+    layout.focusCreatedPane(pane_id, self.workspaceScrollingStripActive(layout));
     dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return error.NoProjectSelected;
     dock.visible = false;
     if (dock.activePane()) |leaf| leaf.revive_policy = .attach_only;
@@ -1586,7 +1586,7 @@ fn startUpdateTerminal(self: anytype) !void {
         .terminal => |*terminal_ref| terminal_ref.purpose = .editor,
         else => return error.TerminalPaneUnavailable,
     }
-    layout.focusCreatedPane(pane_id);
+    layout.focusCreatedPane(pane_id, self.workspaceScrollingStripActive(layout));
     dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return error.NoProjectSelected;
     dock.visible = false;
     // Reopening a saved terminal must never run the installer again.

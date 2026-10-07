@@ -82,6 +82,9 @@ pub const Failure = enum {
 
 /// One linked runtime from the inventory. Never contains credentials.
 pub const RuntimeRow = struct {
+    /// An external inventory may expose an opaque selection key before a
+    /// signed bootstrap supplies the actual link identity.
+    selection_key: ?[]u8 = null,
     link_id: []u8,
     runtime_id: []u8,
     instance_id: []u8,
@@ -90,6 +93,7 @@ pub const RuntimeRow = struct {
     spki_sha256: []u8,
 
     fn deinit(self: *RuntimeRow, allocator: std.mem.Allocator) void {
+        if (self.selection_key) |key| allocator.free(key);
         allocator.free(self.link_id);
         allocator.free(self.runtime_id);
         allocator.free(self.instance_id);
@@ -123,8 +127,10 @@ pub const BootstrapResult = struct {
     instance_id: []u8,
     device_id: []u8,
     device_credential: []u8,
+    selection: ?BootstrapSelection = null,
 
     pub fn deinit(self: *BootstrapResult) void {
+        if (self.selection) |*selection| selection.deinit(self.allocator);
         self.allocator.free(self.runtime_id);
         self.allocator.free(self.instance_id);
         self.allocator.free(self.device_id);
@@ -132,6 +138,38 @@ pub const BootstrapResult = struct {
         self.allocator.free(self.device_credential);
         self.* = undefined;
     }
+};
+
+/// The signed, verified selection supplied by an external session backend.
+/// The service still validates endpoint pairing, pin and runtime identities
+/// before committing the runtime-local device to the profile.
+pub const BootstrapSelection = struct {
+    link_id: []u8,
+    https_url: []u8,
+    wss_url: []u8,
+    spki_sha256: []u8,
+
+    fn deinit(self: *BootstrapSelection, allocator: std.mem.Allocator) void {
+        allocator.free(self.link_id);
+        allocator.free(self.https_url);
+        allocator.free(self.wss_url);
+        allocator.free(self.spki_sha256);
+    }
+};
+
+/// Optional native composition. Its commands must enqueue bounded worker work,
+/// not perform network I/O on the UI thread. Snapshot slices remain valid until
+/// the next poll; bootstrap result ownership transfers to the caller. Destroy
+/// cancels/joins all owned workers. No credentials belong in the snapshot.
+pub const SessionBackend = struct {
+    context: *anyopaque,
+    poll: *const fn (*anyopaque) Snapshot,
+    sign_in: *const fn (*anyopaque) bool,
+    load_inventory: *const fn (*anyopaque) bool,
+    bootstrap: *const fn (*anyopaque, usize, []const u8) bool,
+    take_bootstrap_result: *const fn (*anyopaque) ?BootstrapResult,
+    sign_out: *const fn (*anyopaque) void,
+    destroy: *const fn (*anyopaque) void,
 };
 
 /// Worker-owned state shared with the UI thread under `mutex`.
@@ -191,6 +229,19 @@ pub const Session = struct {
     allocator: std.mem.Allocator,
     shared: *Shared,
     worker: ?std.Thread = null,
+    backend: ?SessionBackend = null,
+
+    /// Ownership of backend transfers only after this function succeeds.
+    pub fn startWithBackend(allocator: std.mem.Allocator, control_plane_url: []const u8, backend: SessionBackend) !*Session {
+        const sanitized = try profile.sanitizedHttpsUrlAlloc(allocator, control_plane_url);
+        errdefer allocator.free(sanitized);
+        const shared = try allocator.create(Shared);
+        errdefer allocator.destroy(shared);
+        shared.* = .{ .allocator = allocator, .control_plane_url = sanitized };
+        const self = try allocator.create(Session);
+        self.* = .{ .allocator = allocator, .shared = shared, .backend = backend };
+        return self;
+    }
 
     /// Starts discovery immediately. The URL is validated with the profile
     /// rules before any network access.
@@ -210,6 +261,7 @@ pub const Session = struct {
     /// Stops the worker, wipes the token, and frees everything.
     pub fn destroy(self: *Session) void {
         const shared = self.shared;
+        if (self.backend) |backend| backend.destroy(backend.context);
         shared.stop_requested.store(true, .release);
         if (self.worker) |worker| worker.join();
         shared.clearToken();
@@ -232,15 +284,18 @@ pub const Session = struct {
 
     /// Requests the browser sign-in. Only valid once discovery succeeded.
     pub fn signIn(self: *Session) bool {
+        if (self.backend) |backend| return backend.sign_in(backend.context);
         return self.request(.login, .discovered);
     }
 
     pub fn loadInventory(self: *Session) bool {
+        if (self.backend) |backend| return backend.load_inventory(backend.context);
         return self.request(.inventory, .signed_in);
     }
 
     pub fn bootstrap(self: *Session, index: usize, device_label: []const u8) bool {
         headless.access_protocol.validateDeviceLabel(device_label) catch return false;
+        if (self.backend) |backend| return backend.bootstrap(backend.context, index, device_label);
         const shared = self.shared;
         shared.lock();
         defer shared.unlock();
@@ -256,6 +311,7 @@ pub const Session = struct {
     }
 
     pub fn takeBootstrapResult(self: *Session) ?BootstrapResult {
+        if (self.backend) |backend| return backend.take_bootstrap_result(backend.context);
         const shared = self.shared;
         shared.lock();
         defer shared.unlock();
@@ -266,6 +322,7 @@ pub const Session = struct {
 
     /// Forgets the OIDC session without touching persisted profiles.
     pub fn signOut(self: *Session) void {
+        if (self.backend) |backend| return backend.sign_out(backend.context);
         const shared = self.shared;
         shared.lock();
         defer shared.unlock();
@@ -278,6 +335,7 @@ pub const Session = struct {
 
     /// Copies the latest worker state into UI-owned buffers.
     pub fn poll(self: *Session) Snapshot {
+        if (self.backend) |backend| return backend.poll(backend.context);
         const shared = self.shared;
         shared.lock();
         defer shared.unlock();
@@ -327,6 +385,8 @@ pub const Session = struct {
 
 fn cloneRow(allocator: std.mem.Allocator, row: RuntimeRow) !RuntimeRow {
     var out: RuntimeRow = undefined;
+    out.selection_key = if (row.selection_key) |key| try allocator.dupe(u8, key) else null;
+    errdefer if (out.selection_key) |key| allocator.free(key);
     out.link_id = try allocator.dupe(u8, row.link_id);
     errdefer allocator.free(out.link_id);
     out.runtime_id = try allocator.dupe(u8, row.runtime_id);
@@ -1423,4 +1483,78 @@ test "inventory parsing rejects unpinnable endpoints and keeps valid rows" {
     const bad =
         "{\"runtimes\":[{\"link_id\":\"lnk_" ++ "0" ** 32 ++ "\",\"descriptor\":{\"runtime_id\":\"" ++ "1" ** 32 ++ "\",\"instance_id\":\"" ++ "2" ** 32 ++ "\",\"https_url\":\"http://rt.test\",\"wss_url\":\"wss://rt.test/ws\",\"tls_identity\":{\"kind\":\"spki_sha256\",\"sha256\":\"" ++ spki ++ "\"}}}]}";
     try std.testing.expectError(error.InvalidUrl, parseInventory(&shared, bad));
+}
+
+test "external native session delegates worker commands and transfers verified bootstrap ownership" {
+    const Fixture = struct {
+        phase: Phase = .discovered,
+        destroyed: bool = false,
+        label_checked: bool = false,
+        fn state(raw: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(raw));
+        }
+        fn poll(raw: *anyopaque) Snapshot {
+            return .{ .phase = state(raw).phase, .failure = null, .issuer = "https://control.test", .device_flow_advertised = false, .login_url_open = false, .runtimes = &.{}, .runtimes_truncated = 0 };
+        }
+        fn signIn(raw: *anyopaque) bool {
+            state(raw).phase = .signed_in;
+            return true;
+        }
+        fn inventory(raw: *anyopaque) bool {
+            state(raw).phase = .inventory_loaded;
+            return true;
+        }
+        fn bootstrap(raw: *anyopaque, index: usize, label: []const u8) bool {
+            if (index != 0 or !std.mem.eql(u8, label, "Fixture desktop")) return false;
+            state(raw).label_checked = true;
+            state(raw).phase = .bootstrap_ready;
+            return true;
+        }
+        fn take(raw: *anyopaque) ?BootstrapResult {
+            if (state(raw).phase != .bootstrap_ready) return null;
+            state(raw).phase = .signed_in;
+            // Fixture allocation is cleaned by the transferred result's deinit.
+            return .{
+                .allocator = std.testing.allocator,
+                .runtime_id = std.testing.allocator.dupe(u8, "1" ** 32) catch unreachable,
+                .instance_id = std.testing.allocator.dupe(u8, "2" ** 32) catch unreachable,
+                .device_id = std.testing.allocator.dupe(u8, "3" ** 32) catch unreachable,
+                .device_credential = std.testing.allocator.dupe(u8, "4" ** 64) catch unreachable,
+                .selection = .{
+                    .link_id = std.testing.allocator.dupe(u8, "lnk_" ++ "5" ** 32) catch unreachable,
+                    .https_url = std.testing.allocator.dupe(u8, "https://runtime.test") catch unreachable,
+                    .wss_url = std.testing.allocator.dupe(u8, "wss://runtime.test/ws") catch unreachable,
+                    .spki_sha256 = std.testing.allocator.dupe(u8, "A" ** 43) catch unreachable,
+                },
+            };
+        }
+        fn signOut(raw: *anyopaque) void {
+            state(raw).phase = .discovered;
+        }
+        fn destroy(raw: *anyopaque) void {
+            state(raw).destroyed = true;
+        }
+        fn backend(self: *@This()) SessionBackend {
+            return .{ .context = self, .poll = poll, .sign_in = signIn, .load_inventory = inventory, .bootstrap = bootstrap, .take_bootstrap_result = take, .sign_out = signOut, .destroy = destroy };
+        }
+    };
+    var fixture: Fixture = .{};
+    try std.testing.expectError(error.InvalidUrl, Session.startWithBackend(std.testing.allocator, "http://control.test", fixture.backend()));
+    try std.testing.expect(!fixture.destroyed);
+    const session = try Session.startWithBackend(std.testing.allocator, "https://control.test", fixture.backend());
+    try std.testing.expect(session.worker == null);
+    try std.testing.expectEqualStrings("https://control.test", session.controlPlaneUrl());
+    try std.testing.expectEqual(Phase.discovered, session.poll().phase);
+    try std.testing.expect(session.signIn());
+    try std.testing.expect(session.loadInventory());
+    try std.testing.expect(!session.bootstrap(0, "bad\nlabel"));
+    try std.testing.expect(session.bootstrap(0, "Fixture desktop"));
+    var result = session.takeBootstrapResult().?;
+    defer result.deinit();
+    try std.testing.expectEqualStrings("lnk_" ++ "5" ** 32, result.selection.?.link_id);
+    try std.testing.expect(session.takeBootstrapResult() == null);
+    session.signOut();
+    try std.testing.expectEqual(Phase.discovered, session.poll().phase);
+    session.destroy();
+    try std.testing.expect(fixture.destroyed);
 }

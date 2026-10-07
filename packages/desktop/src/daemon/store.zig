@@ -3504,7 +3504,10 @@ pub const Store = struct {
             else => {},
         };
         for (doomed.items) |pane_id| {
-            var removed = layout.closePane(allocator, pane_id) orelse continue;
+            // The daemon cannot see the desktop's strip setting. Tab-scoped
+            // zoom never hands zoom to another tab, and it keeps focus on the
+            // new zoom target, so the result is valid in either layout.
+            var removed = layout.closePaneWithZoomScope(allocator, pane_id, true) orelse continue;
             workspace_layout.deinitWorkspacePaneRef(&removed, allocator);
             changed = true;
         }
@@ -5381,6 +5384,8 @@ fn workspaceValues(workspace: store_protocol.Workspace, sort_index: ?i64) struct
     ?i64,
     ?[]const u8,
     ?i64,
+    ?i64,
+    ?i64,
 } {
     const link = workspace.herdr_link;
     return .{
@@ -5867,6 +5872,46 @@ test "thread close drops its panes from the stored layout and rebinds the rest" 
     try std.testing.expect(stored.rootContainsPane(c_pane));
     try std.testing.expectEqual(@as(usize, 0), stored.paneById(1).?.ref.chat.thread_index);
     try std.testing.expectEqual(@as(usize, 1), stored.paneById(c_pane).?.ref.chat.thread_index);
+}
+
+test "thread close keeps zoom inside the closed pane's tab" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer allocator.free(db_path);
+    var store = try Store.init(allocator, db_path);
+    defer store.deinit();
+
+    // Tab A holds pane 1; tab B holds b then c. b is zoomed and focused, and
+    // its left sidebar neighbor is pane 1 in the other tab.
+    var layout = try workspace_layout.WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+    const b_pane = try layout.createChatPane(allocator, 1);
+    try layout.splitPaneWithLeaf(allocator, 1, b_pane, .vertical, true);
+    const c_pane = try layout.createChatPane(allocator, 2);
+    try layout.splitPaneWithLeaf(allocator, b_pane, c_pane, .vertical, true);
+    try std.testing.expect(layout.joinPaneToScrollGroup(b_pane, c_pane));
+    _ = layout.movePaneBefore(c_pane, layout.panes.items.len);
+    layout.focused_pane_id = b_pane;
+    layout.maximized_pane_id = b_pane;
+    const layout_json = try layout.persistedWorkspaceJson(allocator);
+    defer allocator.free(layout_json);
+
+    var workspace = testWorkspace("ws", "WS");
+    workspace.workspace_layout_json = layout_json;
+    workspace.selected_thread_index = 1;
+    workspace.threads = &.{ testThread("a", "A"), testThread("b", "B"), testThread("c", "C") };
+    const bootstrap = try store.replaceSnapshot(testSnapshotRequest("boot", null, true, testSnapshot(&.{workspace})));
+    _ = try store.closeThread(.{ .mutation = testHeader("close-b", bootstrap.store_revision), .workspace_id = "ws", .local_thread_id = "b" });
+
+    var row = (try store.conn.row("select workspace_layout_json from workspaces where workspace_id = 'ws'", .{})).?;
+    defer row.deinit();
+    var stored: workspace_layout.WorkspaceLayout = .{};
+    defer stored.deinit(allocator);
+    try stored.applyPersistedWorkspaceJson(allocator, row.text(0));
+    try std.testing.expectEqual(@as(?workspace_layout.WorkspacePaneId, c_pane), stored.maximized_pane_id);
+    try std.testing.expectEqual(@as(?workspace_layout.WorkspacePaneId, c_pane), stored.focused_pane_id);
 }
 
 test "a chat reopened by another client gets its pane back in the stored layout" {

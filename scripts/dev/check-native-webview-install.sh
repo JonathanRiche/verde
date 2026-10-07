@@ -4,7 +4,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PREFIX_DIR="$REPO_ROOT/zig-out"
 TEMP_PREFIX_DIR=""
-SMOKE_CWD="$(mktemp -d /tmp/verde-native-cwd.XXXXXX)"
+SMOKE_CWD="$(mktemp -d "${TMPDIR:-/tmp}/verde-native-cwd.XXXXXX")"
 
 cleanup() {
   if [[ -n "$TEMP_PREFIX_DIR" ]]; then
@@ -15,7 +15,7 @@ cleanup() {
 trap cleanup EXIT
 
 if [[ "${1:-}" == "--isolated" ]]; then
-  TEMP_PREFIX_DIR="$(mktemp -d /tmp/verde-native-install.XXXXXX)"
+  TEMP_PREFIX_DIR="$(mktemp -d "${TMPDIR:-/tmp}/verde-native-install.XXXXXX")"
   PREFIX_DIR="$TEMP_PREFIX_DIR"
   (
     cd "$REPO_ROOT"
