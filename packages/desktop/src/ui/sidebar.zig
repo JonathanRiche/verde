@@ -1138,8 +1138,9 @@ fn renderWorkspaceSwitcherTrigger(state: *runtime.AppState, rect: palette.Rect, 
     const open = state.command_controller.open and state.command_controller.mode == .workspaces;
     const hovered = switcher_trigger_hovered or open;
     const radius = theme.scaledUi(7.0);
-    // Borderless: the tinted fill alone separates the trigger from the rail.
-    queuePaletteRoundedRect(state, snapRect(rect), paletteColor(if (hovered) theme.wash(theme.COLOR_GREEN, 48) else theme.withAlpha(theme.COLOR_PANEL_ALT, 120)), radius);
+    // No resting chrome: the trigger sits flush on the rail and only shows
+    // the accent wash on hover / while the switcher is open.
+    if (hovered) queuePaletteRoundedRect(state, snapRect(rect), paletteColor(theme.wash(theme.COLOR_GREEN, 48)), radius);
     addPaletteHit(rect, .workspace_switcher, state.project_controller.selected_index, 0);
 
     const projects = state.project_controller.projects.items;
