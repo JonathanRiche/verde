@@ -38,6 +38,9 @@ const SIDEBAR_THREAD_PROVIDER_GLYPH_CSS: f32 = 22.0;
 const SIDEBAR_THREAD_ROW_HEIGHT_CSS: f32 = 38.0;
 /// Vertical advance per thread row (row + gap).
 const SIDEBAR_THREAD_ROW_STEP_CSS: f32 = 42.0;
+// Mini-rows inside a split-tile group are tighter than standalone rows so a
+// tab group does not dominate the OPEN list.
+const SIDEBAR_TILE_ROW_HEIGHT_CSS: f32 = 30.0;
 const SIDEBAR_THREAD_ICON_LEADING_PAD_CSS: f32 = 10.0;
 /// Horizontal gap between the icon slot and the title.
 const SIDEBAR_THREAD_ICON_TITLE_GAP_CSS: f32 = 10.0;
@@ -1272,8 +1275,9 @@ fn openUnitHeight(layout: *const native_state.WorkspaceLayout, pane_index: usize
     const group_id = layout.scrollGroupIdForPane(layout.panes.items[pane_index].id) orelse return .{ .row = row_h, .step = theme.scaledUi(SIDEBAR_THREAD_ROW_STEP_CSS) };
     if (layout.scrollGroupPaneCount(group_id) <= 1) return .{ .row = row_h, .step = theme.scaledUi(SIDEBAR_THREAD_ROW_STEP_CSS) };
     const tile_gap = theme.scaledUi(4.0);
+    const tile_row_h = theme.scaledUi(SIDEBAR_TILE_ROW_HEIGHT_CSS);
     const rows = if (layout.root) |root| sidebarScrollGroupRows(layout, root, group_id) else 1;
-    const group_h = row_h * @as(f32, @floatFromInt(@max(rows, 1))) +
+    const group_h = tile_row_h * @as(f32, @floatFromInt(@max(rows, 1))) +
         tile_gap * @as(f32, @floatFromInt(if (rows > 0) rows - 1 else 0));
     return .{ .row = group_h, .step = group_h + tile_gap };
 }
@@ -1746,8 +1750,16 @@ fn renderOpenPaneUnit(
         var tile_shortcut_buf: [16]u8 = undefined;
         const tile_shortcut = if (shortcuts) tileShortcutLabel(state, &tile_shortcut_buf, tab_index) else "";
         const badge_column = if (tile_shortcut.len > 0) theme.scaledUi(30.0) else 0.0;
-        const group_rect: palette.Rect = .{ .x = x, .y = y_in, .w = rail_w - badge_column, .h = height.row };
-        if (rowVisible(group_rect, list_clip)) {
+        // Under All Workspaces the group gets the same identity chip as a
+        // standalone row, in a leading column centred on the whole group.
+        const chip = theme.scaledUi(18.0);
+        const chip_column = if (open_rows_show_chip) theme.scaledUi(4.0) + chip + theme.scaledUi(6.0) else 0.0;
+        const group_rect: palette.Rect = .{ .x = x + chip_column, .y = y_in, .w = rail_w - badge_column - chip_column, .h = height.row };
+        if (rowVisible(.{ .x = x, .y = y_in, .w = rail_w, .h = height.row }, list_clip)) {
+            if (open_rows_show_chip) {
+                const chip_rect: palette.Rect = .{ .x = x + theme.scaledUi(4.0), .y = y_in + (height.row - chip) * 0.5, .w = chip, .h = chip };
+                queueWorkspaceChip(state, chip_rect, project, false, clip);
+            }
             renderOpenPaneGroupNode(state, project_index, project, root, group_id, group_rect, clip);
             if (tile_shortcut.len > 0) {
                 renderSidebarShortcutKeyTip(state, .{ .x = x, .y = y_in, .w = rail_w, .h = height.row }, clip, tile_shortcut);
