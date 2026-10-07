@@ -1007,6 +1007,14 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
         .h = @max(list_bottom - open_top, 0.0),
     };
     const caption_h = theme.scaledUi(SIDEBAR_ACTIVE_LABEL_H_CSS);
+    // The OPEN caption stays pinned at the top of the band; only the rows
+    // beneath it scroll, clipped so they slide under the caption.
+    const rows_clip: palette.Rect = .{
+        .x = open_clip.x,
+        .y = open_clip.y + caption_h,
+        .w = open_clip.w,
+        .h = @max(open_clip.h - caption_h, 0.0),
+    };
     const focused_pane_id = if (has_selected) projects[selected_index].workspace_layout.focused_pane_id else null;
     const focus_changed = sidebar_revealed_project_index != selected_index or
         sidebar_revealed_pane_id != focused_pane_id or sidebar_revealed_view_h != open_clip.h;
@@ -1029,16 +1037,14 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
     sidebar_scroll_y = theme.clampf(sidebar_scroll_y, 0.0, sidebar_max_scroll_y);
     if (focus_changed) {
         if (focused_row) |row| {
-            sidebar_scroll_y = revealSidebarRow(sidebar_scroll_y, row.y, row.h, open_clip, sidebar_max_scroll_y);
+            sidebar_scroll_y = revealSidebarRow(sidebar_scroll_y, row.y, row.h, rows_clip, sidebar_max_scroll_y);
         }
         sidebar_revealed_project_index = selected_index;
         sidebar_revealed_pane_id = focused_pane_id;
         sidebar_revealed_view_h = open_clip.h;
     }
 
-    var y = open_top - sidebar_scroll_y;
-    queuePaletteText(state, .{ .x = x, .y = y, .w = rail_w, .h = theme.scaledUi(18.0) }, "OPEN", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), open_clip);
-    y += caption_h;
+    var y = open_top + caption_h - sidebar_scroll_y;
     const rows_top = y;
     const selected_tabs: []const native_state.WorkspaceTab = if (has_selected) blk: {
         const layout = &projects[selected_index].workspace_layout;
@@ -1047,18 +1053,25 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
     } else &.{};
     const row_ordinals = allWorkspacesOrderActive(state);
     for (open_units, 0..) |unit, ordinal| {
-        y = renderOpenPaneUnit(state, unit, selected_tabs, if (row_ordinals) ordinal else null, x, rail_w, open_clip, open_clip, y);
+        y = renderOpenPaneUnit(state, unit, selected_tabs, if (row_ordinals) ordinal else null, x, rail_w, rows_clip, rows_clip, y);
     }
     if (open_units.len > 0) y += theme.scaledUi(4.0);
     if (y == rows_top) {
-        queuePaletteText(state, .{ .x = x + theme.scaledUi(4.0), .y = y + theme.scaledUi(4.0), .w = rail_w, .h = theme.scaledUi(18.0) }, "No open panes", paletteColor(theme.withAlpha(theme.COLOR_TEXT_SUBTLE, 190)), theme.scaledUi(12.5), open_clip);
+        queuePaletteText(state, .{ .x = x + theme.scaledUi(4.0), .y = y + theme.scaledUi(4.0), .w = rail_w, .h = theme.scaledUi(18.0) }, "No open panes", paletteColor(theme.withAlpha(theme.COLOR_TEXT_SUBTLE, 190)), theme.scaledUi(12.5), rows_clip);
     }
 
     // Scrollbar clips to the OPEN band so the thumb never extends behind the
     // pinned ACTIVE cluster or chrome drawn below.
     sidebar_max_scroll_y = @max(0.0, y + sidebar_scroll_y - (open_clip.y + open_clip.h) + theme.scaledUi(8.0));
     sidebar_scroll_y = theme.clampf(sidebar_scroll_y, 0.0, sidebar_max_scroll_y);
-    renderSidebarOverflowScrollbar(state, open_clip, sidebar_scroll_y, sidebar_max_scroll_y);
+    renderSidebarOverflowScrollbar(state, rows_clip, sidebar_scroll_y, sidebar_max_scroll_y);
+
+    // Pinned OPEN caption, painted after the rows over a panel strip so a
+    // row scrolled up under it is covered (same approach as the chrome).
+    if (caption_h > 0.0 and open_clip.h > 0.0) {
+        queuePaletteRect(state, .{ .x = rect.x, .y = open_top, .w = rect.w - theme.scaledUi(1.0), .h = @min(caption_h, open_clip.h) }, paletteColor(theme.COLOR_PANEL));
+        queuePaletteText(state, .{ .x = x, .y = open_top, .w = rail_w, .h = theme.scaledUi(18.0) }, "OPEN", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), open_clip);
+    }
 
     // Pinned footer band with the global settings gear.
     if (list_bottom < rect.y + rect.h) {
