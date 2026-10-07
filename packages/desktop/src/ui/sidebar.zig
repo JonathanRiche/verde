@@ -76,6 +76,8 @@ const SidebarHitKind = enum {
     new_terminal,
     /// Workspace switcher trigger; opens the switcher popover.
     workspace_switcher,
+    /// "+" beside the switcher trigger; opens the new-workspace creator.
+    add_workspace,
     open_pane,
     /// Live pane row in the OPEN section; supports click focus and drag
     /// reordering in addition to the open-pane actions.
@@ -238,6 +240,7 @@ var sidebar_menu_row_labels: [16][]const u8 = undefined;
 var sidebar_menu_row_count: usize = 0;
 
 var settings_hovered: bool = false;
+var add_workspace_hovered: bool = false;
 var terminal_action_hovered: ?usize = null;
 var search_trigger_hovered: bool = false;
 var switcher_trigger_hovered: bool = false;
@@ -343,6 +346,7 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
     var new_search_hover = false;
     var new_switcher_hover = false;
     var new_settings_hover = false;
+    var new_add_workspace_hover = false;
     if (rectContainsPoint(palette_sidebar_rect, x, y)) {
         // Walk hits in reverse so later (visually-topmost) rows win when
         // overlapping during scroll edge cases.
@@ -359,6 +363,7 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
                     if (new_terminal_hover == null) new_terminal_hover = hit.project_index;
                 },
                 .workspace_switcher => new_switcher_hover = true,
+                .add_workspace => new_add_workspace_hover = true,
                 .command_palette => new_search_hover = true,
                 .settings => new_settings_hover = true,
                 else => {},
@@ -371,11 +376,13 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
     const search_changed = search_trigger_hovered != new_search_hover;
     const switcher_changed = switcher_trigger_hovered != new_switcher_hover;
     const settings_changed = settings_hovered != new_settings_hover;
+    const add_workspace_changed = add_workspace_hovered != new_add_workspace_hover;
+    add_workspace_hovered = new_add_workspace_hover;
     terminal_action_hovered = new_terminal_hover;
     search_trigger_hovered = new_search_hover;
     switcher_trigger_hovered = new_switcher_hover;
     settings_hovered = new_settings_hover;
-    if (!new_thread_changed and !terminal_changed and !search_changed and !switcher_changed and !settings_changed) return;
+    if (!new_thread_changed and !terminal_changed and !search_changed and !switcher_changed and !settings_changed and !add_workspace_changed) return;
 
     state.sidebar_new_thread_hover = new_new_thread_hover;
     state.markDirty();
@@ -403,6 +410,7 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             // A hover-revealed rail is hidden: the toggle pins it open.
             .collapse => state.toggleSidebarHidden(),
             .workspace_switcher => state.openWorkspaceSwitcher(),
+            .add_workspace => state.openWorkspaceCreator(true),
             .new_thread => {
                 if (state.project_controller.projects.items.len > 0) state.createThreadForProject(@min(hit.project_index, state.project_controller.projects.items.len - 1));
             },
@@ -1094,12 +1102,18 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
     const toggle_rect: palette.Rect = .{ .x = rect.x + rect.w - pad_x - btn_w, .y = header_top + (header_h - btn_w) * 0.5, .w = btn_w, .h = btn_w };
     renderPaletteSidebarToggle(state, toggle_rect, !state.isSidebarHidden());
 
-    renderWorkspaceSwitcherTrigger(state, .{ .x = x, .y = switcher_top, .w = rail_w, .h = switcher_h }, if (all_scope) null else selected_index);
+    // Switcher trigger with a trailing "+" (new workspace). The button shares
+    // the action column below so it sits directly above the terminal button.
+    const action_w = theme.scaledUi(30.0);
+    const action_gap = theme.scaledUi(2.0);
+    const add_gap = theme.scaledUi(6.0);
+    renderWorkspaceSwitcherTrigger(state, .{ .x = x, .y = switcher_top, .w = rail_w - action_w - add_gap, .h = switcher_h }, if (all_scope) null else selected_index);
+    const add_rect: palette.Rect = .{ .x = x + rail_w - action_w, .y = switcher_top + (switcher_h - action_w) * 0.5, .w = action_w, .h = action_w };
+    renderPaletteSidebarActionIcon(state, add_rect, NF_COD_ADD, add_workspace_hovered, rect);
+    addPaletteHit(add_rect, .add_workspace, 0, 0);
 
     // Search pill + new chat / new terminal. Under All Workspaces they target
     // the selected (= most recently used) workspace.
-    const action_w = theme.scaledUi(30.0);
-    const action_gap = theme.scaledUi(2.0);
     const actions_w = if (has_selected) action_w * 2.0 + action_gap + theme.scaledUi(6.0) else 0.0;
     renderPaletteSearchTrigger(state, .{ .x = x, .y = search_top, .w = rail_w - actions_w, .h = search_h });
     if (has_selected) {
