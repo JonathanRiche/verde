@@ -812,9 +812,36 @@ fn queuePaletteRect(state: *app_state.AppState, rect: palette.Rect, color: palet
 }
 
 fn queuePaletteBorder(state: *app_state.AppState, rect: palette.Rect, color: palette.Color, radius: f32, width: f32) void {
-    state.palette_overlay_batch.rectBorder(state.allocator, rect, color, radius, width) catch |err| {
+    state.palette_overlay_batch.rectBorder(state.allocator, snapEdges(rect), color, radius, strokeWidth(width)) catch |err| {
         app_state.log.warn("failed to queue browser palette border: {s}", .{@errorName(err)});
     };
+}
+
+/// Draws a bordered surface as ONE panel command (fill + border composited in
+/// a single SDF pass) on edge-snapped geometry with a whole-pixel stroke, so
+/// borders stay crisp at fractional display scales.
+fn queuePalettePanel(state: *app_state.AppState, rect: palette.Rect, fill: palette.Color, border: palette.Color, radius: f32, width: f32) void {
+    state.palette_overlay_batch.panel(state.allocator, snapEdges(rect), fill, border, radius, strokeWidth(width)) catch |err| {
+        app_state.log.warn("failed to queue browser palette panel: {s}", .{@errorName(err)});
+    };
+}
+
+/// Whole-device-pixel stroke width for a UI-unit width (1.25 px -> 1 px).
+fn strokeWidth(ui_width: f32) f32 {
+    return @max(@round(ui_width), 1.0);
+}
+
+/// Standard one-UI-unit hairline/border width, rounded to whole pixels.
+fn hairline() f32 {
+    return strokeWidth(theme.scaledUi(1.0));
+}
+
+/// Snaps each edge independently to the pixel grid (not origin + size) so
+/// chrome edges land on whole pixels and neighbours never gap or overlap.
+fn snapEdges(rect: palette.Rect) palette.Rect {
+    const x = @round(rect.x);
+    const y = @round(rect.y);
+    return .{ .x = x, .y = y, .w = @max(@round(rect.x + rect.w) - x, 0.0), .h = @max(@round(rect.y + rect.h) - y, 0.0) };
 }
 
 fn queuePaletteText(state: *app_state.AppState, rect: palette.Rect, value: []const u8, color: palette.Color, font_size: f32, clip: ?palette.Rect) void {
@@ -902,7 +929,7 @@ fn renderToolbarIconButton(
         theme.raise(base_color, 0.10)
     else
         base_color;
-    queuePaletteRoundedRect(state, rect, paletteColor(bg), theme.scaledUi(TOOLBAR_BUTTON_RADIUS));
+    queuePaletteRoundedRect(state, snapEdges(rect), paletteColor(bg), theme.scaledUi(TOOLBAR_BUTTON_RADIUS));
     const icon_size = theme.scaledUi(TOOLBAR_ICON_SIZE);
     queuePaletteIcon(state, iconRectForButton(rect, icon_size), glyph, icon_size, paletteColor(icon_color));
 }
@@ -954,8 +981,7 @@ fn renderInspectorIconButton(
     active: bool,
 ) void {
     if (active and !disabled) {
-        queuePaletteRoundedRect(state, rect, paletteColor(theme.withAlpha(theme.accent(), 92)), theme.scaledUi(5.0));
-        queuePaletteBorder(state, rect, paletteColor(theme.withAlpha(theme.accent(), 180)), theme.scaledUi(5.0), theme.scaledUi(1.0));
+        queuePalettePanel(state, rect, paletteColor(theme.withAlpha(theme.accent(), 92)), paletteColor(theme.withAlpha(theme.accent(), 180)), theme.scaledUi(5.0), hairline());
     } else if (hovered and !disabled) {
         queuePaletteRoundedRect(state, rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(5.0));
     }
@@ -984,7 +1010,7 @@ fn renderInspectorSplitButton(
         .h = inspect_rect.h,
     };
     const bg = if (disabled) theme.sink(base_color, 0.04) else base_color;
-    queuePaletteRoundedRect(state, combined, paletteColor(bg), theme.scaledUi(TOOLBAR_BUTTON_RADIUS));
+    queuePaletteRoundedRect(state, snapEdges(combined), paletteColor(bg), theme.scaledUi(TOOLBAR_BUTTON_RADIUS));
 
     if (!disabled and (inspect_hovered or dropdown_hovered)) {
         const pill_inset = theme.scaledUi(2.0);
@@ -1002,12 +1028,13 @@ fn renderInspectorSplitButton(
     // Hairline divider between the segments, inset vertically so it reads as
     // a separator rather than a hard edge.
     const divider_inset = theme.scaledUi(8.0);
-    queuePaletteRect(state, snapRect(.{
+    const divider = snapEdges(.{
         .x = dropdown_rect.x,
         .y = inspect_rect.y + divider_inset,
-        .w = theme.scaledUi(1.0),
+        .w = 0.0,
         .h = inspect_rect.h - divider_inset * 2.0,
-    }), paletteColor(theme.withAlpha(theme.background(), 70)));
+    });
+    queuePaletteRect(state, .{ .x = divider.x, .y = divider.y, .w = hairline(), .h = divider.h }, paletteColor(theme.withAlpha(theme.background(), 70)));
 
     const icon_size = theme.scaledUi(TOOLBAR_ICON_SIZE);
     queuePaletteIcon(state, iconRectForButton(inspect_rect, icon_size), NF_COD_INSPECT, icon_size, paletteColor(icon_color));
@@ -1057,8 +1084,7 @@ fn renderToolbar(state: *app_state.AppState, dock_rect: palette.Rect, right_rese
             .w = @min(tabs_w, theme.scaledUi(190.0)),
             .h = button_size,
         };
-        queuePaletteRoundedRect(state, tab_rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(6.0));
-        queuePaletteBorder(state, tab_rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(6.0), theme.scaledUi(1.0));
+        queuePalettePanel(state, tab_rect, paletteColor(theme.COLOR_PANEL_ALT), paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(6.0), hairline());
         const tab_close_size = theme.scaledUi(18.0);
         const tab_close_rect: palette.Rect = .{
             .x = tab_rect.x + tab_rect.w - tab_close_size - theme.scaledUi(3.0),
@@ -1089,18 +1115,13 @@ fn renderToolbar(state: *app_state.AppState, dock_rect: palette.Rect, right_rese
             if (tab_x + tab_width > tabs_right) break;
             const tab_rect: palette.Rect = .{ .x = tab_x, .y = row_y, .w = tab_width, .h = button_size };
             const active = tab_index == state.activeBrowserTabIndex();
-            queuePaletteRoundedRect(
+            queuePalettePanel(
                 state,
                 tab_rect,
                 paletteColor(if (active or rectHovered(tab_rect)) theme.COLOR_PANEL_ALT else theme.background()),
-                theme.scaledUi(6.0),
-            );
-            queuePaletteBorder(
-                state,
-                tab_rect,
                 paletteColor(if (active) theme.withAlpha(theme.accent(), 150) else theme.COLOR_PANEL_MUTED),
                 theme.scaledUi(6.0),
-                theme.scaledUi(1.0),
+                hairline(),
             );
             const tab_close_size = theme.scaledUi(18.0);
             const tab_close_rect: palette.Rect = .{
@@ -1254,8 +1275,7 @@ fn renderToolbarOverflowMenu(
         .w = menu_w,
         .h = menu_h,
     };
-    queuePaletteRoundedRect(state, palette_overflow_menu_rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(10.0));
-    queuePaletteBorder(state, palette_overflow_menu_rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(10.0), theme.scaledUi(1.0));
+    queuePalettePanel(state, palette_overflow_menu_rect, paletteColor(theme.COLOR_PANEL_ALT), paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(10.0), hairline());
 
     var y = palette_overflow_menu_rect.y + pad;
     for (0..max_tab_rows) |tab_index| {
@@ -1393,8 +1413,7 @@ fn renderToolbarTooltip(state: *app_state.AppState) void {
             .w = tooltip_w,
             .h = theme.scaledUi(24.0),
         };
-        queuePaletteRoundedRect(state, rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(5.0));
-        queuePaletteBorder(state, rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(5.0), theme.scaledUi(1.0));
+        queuePalettePanel(state, rect, paletteColor(theme.COLOR_PANEL_ALT), paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(5.0), hairline());
         queuePaletteText(state, .{
             .x = rect.x + pad_x,
             .y = rect.y + (rect.h - font_size * 1.25) * 0.5,
@@ -1438,8 +1457,7 @@ fn renderInspectorModeMenu(state: *app_state.AppState, anchor: palette.Rect, ins
         .w = menu_width,
         .h = row_height * 3.0 + pad * 2.0,
     };
-    queuePaletteRoundedRect(state, palette_menu_rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(12.0));
-    queuePaletteBorder(state, palette_menu_rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(12.0), theme.scaledUi(1.0));
+    queuePalettePanel(state, palette_menu_rect, paletteColor(theme.COLOR_PANEL_ALT), paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(12.0), hairline());
 
     var y = palette_menu_rect.y + pad;
     renderInspectorModeMenuRow(state, .{ .x = palette_menu_rect.x + pad, .y = y, .w = palette_menu_rect.w - pad * 2.0, .h = row_height }, "Point", inspector_mode == .point, .inspect_mode_point);
@@ -1685,18 +1703,13 @@ fn renderPaletteAddressField(state: *app_state.AppState, rect: palette.Rect) voi
         .w = rect.w - pad_x * 2.0 - security_slot,
         .h = font_size * 1.25,
     };
-    queuePaletteRoundedRect(
+    queuePalettePanel(
         state,
         rect,
         paletteColor(if (focused) theme.raise(theme.COLOR_PANEL_ALT, 0.10) else theme.COLOR_PANEL_ALT),
-        theme.scaledUi(8.0),
-    );
-    queuePaletteBorder(
-        state,
-        rect,
         paletteColor(if (state.browserState().status == .failed) theme.danger() else if (focused) theme.accent() else theme.COLOR_PANEL_MUTED),
         theme.scaledUi(8.0),
-        theme.scaledUi(1.0),
+        hairline(),
     );
 
     const security = browserSecurityState(state.browserState().current_url);
@@ -2117,7 +2130,7 @@ fn renderPanePlaceholder(state: *app_state.AppState, pane_rect: palette.Rect) vo
         .h = button_height,
     };
     const button_fill = if (rectHovered(button_rect)) theme.raise(theme.accent(), 0.08) else theme.accent();
-    queuePaletteRoundedRect(state, button_rect, paletteColor(button_fill), theme.scaledUi(8.0));
+    queuePaletteRoundedRect(state, snapEdges(button_rect), paletteColor(button_fill), theme.scaledUi(8.0));
     queuePaletteText(state, .{
         .x = button_rect.x + theme.scaledUi(14.0),
         .y = button_rect.y + (button_rect.h - body_size * 1.25) * 0.5,
@@ -2186,13 +2199,20 @@ fn renderLocalServers(
         .h = header_size * 1.3,
     }, "Local servers", muted, header_size, clip);
 
-    const card: palette.Rect = .{
+    // The card is one panel command on snapped edges; hover fills and
+    // hairlines sit inside its whole-pixel border so they never overdraw it.
+    const card = snapEdges(.{
         .x = rect.x,
         .y = rect.y + header_h,
         .w = rect.w,
         .h = row_h * @as(f32, @floatFromInt(servers.len)),
-    };
-    queuePaletteRoundedRect(state, card, paletteColor(theme.raise(theme.background(), 0.03)), radius);
+    });
+    const stroke = hairline();
+    queuePalettePanel(state, card, paletteColor(theme.raise(theme.background(), 0.03)), paletteColor(theme.COLOR_PANEL_MUTED), radius, stroke);
+    const inner_x = card.x + stroke;
+    const inner_w = @max(card.w - stroke * 2.0, 0.0);
+    const inner_radius = @max(radius - stroke, 0.0);
+    const hover_color = paletteColor(theme.raise(theme.background(), 0.08));
 
     for (servers, 0..) |*server, index| {
         const row: palette.Rect = .{
@@ -2201,20 +2221,24 @@ fn renderLocalServers(
             .w = card.w,
             .h = row_h,
         };
+        const first = index == 0;
+        const last = index + 1 == servers.len;
+        // Row bands snap to whole-pixel y so hairlines and hover fills share edges.
+        const band_top = if (first) card.y + stroke else @round(row.y);
+        const band_bottom = if (last) card.y + card.h - stroke else @round(row.y + row.h);
+        const band: palette.Rect = .{ .x = inner_x, .y = band_top, .w = inner_w, .h = @max(band_bottom - band_top, 0.0) };
         if (rectHovered(row)) {
-            const first = index == 0;
-            const last = index + 1 == servers.len;
             // Round only the card's outer corners so the hover fill hugs the border.
             if (first or last) {
-                queuePaletteRoundedRect(state, row, paletteColor(theme.raise(theme.background(), 0.08)), radius);
-                if (!first) queuePaletteRect(state, .{ .x = row.x, .y = row.y, .w = row.w, .h = radius }, paletteColor(theme.raise(theme.background(), 0.08)));
-                if (!last) queuePaletteRect(state, .{ .x = row.x, .y = row.y + row.h - radius, .w = row.w, .h = radius }, paletteColor(theme.raise(theme.background(), 0.08)));
+                queuePaletteRoundedRect(state, band, hover_color, inner_radius);
+                if (!first) queuePaletteRect(state, .{ .x = band.x, .y = band.y, .w = band.w, .h = @min(inner_radius, band.h) }, hover_color);
+                if (!last) queuePaletteRect(state, .{ .x = band.x, .y = band.y + band.h - @min(inner_radius, band.h), .w = band.w, .h = @min(inner_radius, band.h) }, hover_color);
             } else {
-                queuePaletteRect(state, row, paletteColor(theme.raise(theme.background(), 0.08)));
+                queuePaletteRect(state, band, hover_color);
             }
         }
-        if (index > 0) {
-            queuePaletteRect(state, .{ .x = row.x, .y = row.y, .w = row.w, .h = theme.scaledUi(1.0) }, paletteColor(theme.COLOR_PANEL_MUTED));
+        if (!first) {
+            queuePaletteRect(state, .{ .x = inner_x, .y = band_top, .w = inner_w, .h = stroke }, paletteColor(theme.COLOR_PANEL_MUTED));
         }
 
         const icon_size = theme.scaledUi(LOCAL_SERVER_ICON_SIZE);
@@ -2236,7 +2260,6 @@ fn renderLocalServers(
         queuePaletteText(state, .{ .x = text_x, .y = text_y + name_size * 1.3, .w = text_w, .h = detail_size * 1.3 }, detail, muted, detail_size, row);
         addPaletteHitWithPort(row, .local_server, server.port);
     }
-    queuePaletteBorder(state, card, paletteColor(theme.COLOR_PANEL_MUTED), radius, theme.scaledUi(1.0));
 
     const caption_size = theme.scaledUi(13.0);
     queuePaletteText(state, .{
@@ -2250,23 +2273,27 @@ fn renderLocalServers(
 // Draws a miniature app-window glyph: traffic-light dots over two text bars.
 fn renderLocalServerIcon(state: *app_state.AppState, rect: palette.Rect) void {
     const accent = theme.accent();
-    queuePaletteRoundedRect(state, rect, paletteColor(theme.mix(theme.background(), accent, 0.12)), theme.scaledUi(6.0));
-    queuePaletteBorder(state, rect, paletteColor(theme.mix(theme.background(), accent, 0.35)), theme.scaledUi(6.0), theme.scaledUi(1.0));
-    const dot = theme.scaledUi(3.0);
-    const dot_y = rect.y + theme.scaledUi(7.0);
+    // Tile and its marks sit on whole pixels: one panel command for the
+    // bordered tile, whole-pixel dot and bar sizes on snapped origins.
+    const tile = snapEdges(rect);
+    queuePalettePanel(state, tile, paletteColor(theme.mix(theme.background(), accent, 0.12)), paletteColor(theme.mix(theme.background(), accent, 0.35)), theme.scaledUi(6.0), hairline());
+    const dot = strokeWidth(theme.scaledUi(3.0));
+    const dot_y = @round(tile.y + theme.scaledUi(7.0));
     const dot_colors = [_][4]f32{ theme.COLOR_DIFF_REMOVE, theme.COLOR_YELLOW, accent };
     for (dot_colors, 0..) |color, index| {
         queuePaletteRoundedRect(state, .{
-            .x = rect.x + theme.scaledUi(6.0) + @as(f32, @floatFromInt(index)) * (dot + theme.scaledUi(2.5)),
+            .x = @round(tile.x + theme.scaledUi(6.0) + @as(f32, @floatFromInt(index)) * (dot + theme.scaledUi(2.5))),
             .y = dot_y,
             .w = dot,
             .h = dot,
         }, paletteColor(color), dot * 0.5);
     }
     const bar_color = paletteColor(theme.mix(theme.background(), accent, 0.45));
-    const bar_h = theme.scaledUi(2.0);
-    queuePaletteRoundedRect(state, .{ .x = rect.x + theme.scaledUi(6.0), .y = rect.y + theme.scaledUi(15.0), .w = rect.w - theme.scaledUi(12.0), .h = bar_h }, bar_color, bar_h * 0.5);
-    queuePaletteRoundedRect(state, .{ .x = rect.x + theme.scaledUi(6.0), .y = rect.y + theme.scaledUi(20.0), .w = (rect.w - theme.scaledUi(12.0)) * 0.6, .h = bar_h }, bar_color, bar_h * 0.5);
+    const bar_h = strokeWidth(theme.scaledUi(2.0));
+    const bar_x = @round(tile.x + theme.scaledUi(6.0));
+    const bar_w = @round(tile.x + tile.w - theme.scaledUi(6.0)) - bar_x;
+    queuePaletteRoundedRect(state, .{ .x = bar_x, .y = @round(tile.y + theme.scaledUi(15.0)), .w = bar_w, .h = bar_h }, bar_color, bar_h * 0.5);
+    queuePaletteRoundedRect(state, .{ .x = bar_x, .y = @round(tile.y + theme.scaledUi(20.0)), .w = @round(bar_w * 0.6), .h = bar_h }, bar_color, bar_h * 0.5);
 }
 
 fn browserPageIsEmpty(browser_state: *const browser_runtime.State) bool {

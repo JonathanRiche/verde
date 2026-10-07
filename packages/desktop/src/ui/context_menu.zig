@@ -54,8 +54,9 @@ pub fn queuePanel(state: *runtime.AppState, rect: palette.Rect) palette.Rect {
             .h = panel.h + spread * 2.0,
         }), color(theme.scrim(layer.alpha)), radius + spread);
     }
-    queueRounded(state, panel, color(theme.COLOR_PANEL_ALT), radius);
-    state.palette_overlay_batch.rectBorder(state.allocator, panel, color(theme.borderMuted()), radius, @max(@round(theme.scaledUi(1.0)), 1.0)) catch {};
+    // Fill + hairline border as one panel command so the two anti-aliased
+    // edges never stack at the corners.
+    state.palette_overlay_batch.panel(state.allocator, panel, color(theme.COLOR_PANEL_ALT), color(theme.borderMuted()), radius, @max(@round(theme.scaledUi(1.0)), 1.0)) catch {};
     return panel;
 }
 
