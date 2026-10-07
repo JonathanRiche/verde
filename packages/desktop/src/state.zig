@@ -20,6 +20,7 @@ const platform_runtime = @import("platform_runtime");
 const platform_process = @import("platform/process.zig");
 const platform_ipc = @import("platform/ipc.zig");
 const workspace_identity = @import("platform/workspace_identity.zig");
+const ui_workspace_identity = @import("ui/workspace_identity.zig");
 const process_env = @import("platform/env.zig");
 const runtime_profile_store = @import("runtime/profile_store.zig");
 const runtime_secret_store = @import("runtime/secret_store.zig");
@@ -3180,6 +3181,37 @@ fn paletteDirectoryPickerBadge(context: ?*anyopaque, index: usize) []const u8 {
     return if (entry.kind == .project) "Default" else "";
 }
 
+/// Leading identity chip per directory row: workspace rows reuse the
+/// sidebar's workspace chip (same icon + colour); the remaining rows get a
+/// neutral chip so labels stay aligned in one column.
+fn paletteDirectoryPickerRenderRowLeading(
+    context: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    batch: *palette.draw.RenderBatch,
+    index: usize,
+    clip: palette.draw.Rect,
+    leading_rect: palette.draw.Rect,
+) void {
+    const state = appStateFromContext(context) orelse return;
+    const entry = directoryPickerEntryAt(state, index) orelse return;
+    const size = leading_rect.w;
+    const chip: palette.Rect = .{ .x = leading_rect.x, .y = leading_rect.y + (leading_rect.h - size) * 0.5, .w = size, .h = size };
+    var glyph: []const u8 = "\u{EA83}"; // codicon folder
+    var color = theme.COLOR_TEXT_MUTED;
+    switch (entry.kind) {
+        .project, .workspace => if (entry.path) |path| if (state.openWorkspaceForPath(path)) |project| {
+            const identity = ui_workspace_identity.resolve(project.id, project.icon_index, project.color_index);
+            glyph = ui_workspace_identity.glyphAt(identity.icon_index);
+            color = ui_workspace_identity.slotColor(identity.color_index);
+        },
+        .home => glyph = "\u{EB06}", // codicon home
+        .scratch => glyph = "\u{EA79}", // codicon beaker
+        .browse => glyph = "\u{EAF7}", // codicon folder-opened
+        .recent => {},
+    }
+    ui_workspace_identity.drawChip(batch, allocator, chip, glyph, color, false, clip) catch {};
+}
+
 fn paletteDirectoryPickerGroup(context: ?*anyopaque, index: usize) []const u8 {
     const state = appStateFromContext(context) orelse return "";
     const entry = directoryPickerEntryAt(state, index) orelse return "";
@@ -3426,6 +3458,9 @@ pub const PaletteDirectoryPicker = palette.richPicker(.{
     .item_description = paletteDirectoryPickerDescription,
     .item_badge = paletteDirectoryPickerBadge,
     .item_group = paletteDirectoryPickerGroup,
+    .render_row_leading = paletteDirectoryPickerRenderRowLeading,
+    .row_leading_width = 22.0,
+    .row_leading_to_label_gap = 10.0,
     .check_icon = "\u{EAB2}",
     .check_inline = true,
     .placement = .above,
@@ -13207,15 +13242,19 @@ pub const AppState = struct {
         return self.openWorkspaceLabelForPath(self.currentThreadEffectiveCwd()) != null;
     }
 
-    /// Display label of the open, local workspace rooted at `path`, if any.
-    fn openWorkspaceLabelForPath(self: *const AppState, path: []const u8) ?[]const u8 {
+    /// The open, local workspace rooted at `path`, if any.
+    pub fn openWorkspaceForPath(self: *const AppState, path: []const u8) ?*const Project {
         for (self.project_controller.projects.items) |*project| {
             if (project.herdr_link != null or project.path.len == 0) continue;
-            if (std.mem.eql(u8, project.path, path)) {
-                return if (project.label.len > 0) project.label else directoryDisplayName(project.path);
-            }
+            if (std.mem.eql(u8, project.path, path)) return project;
         }
         return null;
+    }
+
+    /// Display label of the open, local workspace rooted at `path`, if any.
+    fn openWorkspaceLabelForPath(self: *const AppState, path: []const u8) ?[]const u8 {
+        const project = self.openWorkspaceForPath(path) orelse return null;
+        return if (project.label.len > 0) project.label else directoryDisplayName(project.path);
     }
 
     fn directoryPillLabel(self: *AppState, cwd: []const u8) []const u8 {

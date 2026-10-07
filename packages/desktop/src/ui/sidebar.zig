@@ -2391,34 +2391,9 @@ pub fn queueWorkspaceChip(state: *runtime.AppState, rect: palette.Rect, project:
 
 /// Draws one identity chip (glyph tinted `base_color` on a tinted square).
 pub fn queueIdentityChip(state: *runtime.AppState, rect: palette.Rect, glyph: []const u8, base_color: [4]f32, dimmed: bool, clip: ?palette.Rect) void {
-    var color = base_color;
-    if (dimmed) color[3] = 0.55;
-    const radius = @max(rect.w * 0.24, theme.scaledUi(3.0));
-    var fill = color;
-    fill[3] = if (dimmed) 0.10 else 0.18;
-    const draw_rect = if (clip) |c| intersectChipRect(rect, c) else rect;
-    if (draw_rect.w > 0.0 and draw_rect.h > 0.0) {
-        state.palette_overlay_batch.roundedRect(state.allocator, snapRect(rect), paletteColor(fill), radius) catch |err| {
-            log.warn("failed to queue workspace chip: {s}", .{@errorName(err)});
-        };
-    }
-    const font_size = rect.h * 0.58;
-    // Center the glyph's ink, not its line box (see centeredGlyphOrigin).
-    const origin = text_measure.centeredGlyphOrigin(.icon, glyph, font_size, rect.x + rect.w * 0.5, rect.y + rect.h * 0.5);
-    queuePaletteIcon(state, .{
-        .x = origin.x,
-        .y = origin.y,
-        .w = rect.w,
-        .h = rect.h,
-    }, glyph, font_size, paletteColor(color), clip);
-}
-
-fn intersectChipRect(a: palette.Rect, b: palette.Rect) palette.Rect {
-    const x0 = @max(a.x, b.x);
-    const y0 = @max(a.y, b.y);
-    const x1 = @min(a.x + a.w, b.x + b.w);
-    const y1 = @min(a.y + a.h, b.y + b.h);
-    return .{ .x = x0, .y = y0, .w = @max(x1 - x0, 0.0), .h = @max(y1 - y0, 0.0) };
+    workspace_identity.drawChip(&state.palette_overlay_batch, state.allocator, rect, glyph, base_color, dimmed, clip) catch |err| {
+        log.warn("failed to queue workspace chip: {s}", .{@errorName(err)});
+    };
 }
 
 fn queuePaletteChevron(state: *runtime.AppState, x: f32, center_y: f32, color: [4]f32, collapsed: bool) void {

@@ -6,6 +6,8 @@
 
 const std = @import("std");
 const theme = @import("theme.zig");
+const palette = @import("palette");
+const text_measure = @import("text_measure.zig");
 
 pub const ICON_COUNT: u32 = 16;
 pub const COLOR_COUNT: u32 = 8;
@@ -189,4 +191,39 @@ test "hsl round trip preserves primaries" {
     const back = rgbToHsl(.{ 0.2, 0.6, 0.4, 1.0 });
     const again = hslToRgb(back[0], back[1], back[2]);
     try std.testing.expectApproxEqAbs(@as(f32, 0.6), again[1], 0.001);
+}
+
+/// Draws one identity chip (glyph tinted `base_color` on a tinted rounded
+/// square) into `batch`. Shared by the sidebar, the switcher trigger, and
+/// composer pickers so every workspace icon renders identically. The glyph
+/// is centred by its ink so the icon sits optically centred in the square.
+pub fn drawChip(
+    batch: *palette.RenderBatch,
+    allocator: std.mem.Allocator,
+    rect: palette.Rect,
+    glyph: []const u8,
+    base_color: [4]f32,
+    dimmed: bool,
+    clip: ?palette.Rect,
+) !void {
+    var color = base_color;
+    if (dimmed) color[3] = 0.55;
+    const radius = @max(rect.w * 0.24, theme.scaledUi(3.0));
+    var fill = color;
+    fill[3] = if (dimmed) 0.10 else 0.18;
+    const visible = if (clip) |c| (@min(rect.x + rect.w, c.x + c.w) > @max(rect.x, c.x) and @min(rect.y + rect.h, c.y + c.h) > @max(rect.y, c.y)) else true;
+    if (visible) try batch.roundedRect(allocator, snapRect(rect), toPalette(fill), radius);
+    const font_size = rect.h * 0.58;
+    const origin = text_measure.centeredGlyphOrigin(.icon, glyph, font_size, rect.x + rect.w * 0.5, rect.y + rect.h * 0.5);
+    try batch.roleText(allocator, snapRect(.{ .x = origin.x, .y = origin.y, .w = rect.w, .h = rect.h }), glyph, toPalette(color), font_size, .icon, null, clip);
+}
+
+fn snapRect(rect: palette.Rect) palette.Rect {
+    const x = @round(rect.x);
+    const y = @round(rect.y);
+    return .{ .x = x, .y = y, .w = @round(rect.x + rect.w) - x, .h = @round(rect.y + rect.h) - y };
+}
+
+fn toPalette(value: [4]f32) palette.Color {
+    return .{ .r = value[0], .g = value[1], .b = value[2], .a = value[3] };
 }

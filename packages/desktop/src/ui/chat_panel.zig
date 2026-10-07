@@ -24,6 +24,7 @@ const runtime = @import("runtime.zig");
 const terminal_panel = @import("terminal_panel.zig");
 const text_measure = @import("text_measure.zig");
 const theme = @import("theme.zig");
+const workspace_identity = @import("workspace_identity.zig");
 
 const log = std.log.scoped(.chat_panel);
 const runtime_log = @import("../runtime/log.zig");
@@ -84,7 +85,6 @@ const COMPOSER_PROVIDER_LOGO_SLOT_CSS: f32 = 26.0;
 const COMPOSER_DIRECTORY_GLYPH_CSS: f32 = 17.0;
 /// codicon-layers: the directory pill's glyph when the chat runs in an
 /// open workspace root.
-const NF_COD_LAYERS = "\u{EBD2}";
 /// codicon-device-desktop: the composer runtime-route pill's glyph.
 const NF_COD_DEVICE_DESKTOP = "\u{EA7A}";
 /// Shared max width for the chat content column. The composer card and the
@@ -10784,10 +10784,22 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
             .w = glyph_size,
             .h = glyph_size,
         });
-        // Workspaces get their own glyph; a workspace may be tied to a
-        // directory, but the pill is about where the chat runs.
-        const directory_glyph = if (state.currentThreadCwdIsWorkspace()) NF_COD_LAYERS else file_icons.folder.glyph;
-        queueIconText(state, folder_slot, directory_glyph, icon_color, glyph_size, directory_rect);
+        // A chat running at an open workspace's root shows that workspace's
+        // identity chip (same icon + colour as the sidebar); anything else
+        // keeps the plain folder glyph.
+        if (state.openWorkspaceForPath(state.currentThreadEffectiveCwd())) |project| {
+            const identity = workspace_identity.resolve(project.id, project.icon_index, project.color_index);
+            const chip = @min(provider_slot, theme.scaledUi(20.0));
+            const chip_rect: palette.Rect = .{
+                .x = directory_rect.x + theme.scaledUi(COMPOSER_TOOLBAR_PILL_PAD_X) + (provider_slot - chip) * 0.5,
+                .y = directory_rect.y + (directory_rect.h - chip) * 0.5,
+                .w = chip,
+                .h = chip,
+            };
+            workspace_identity.drawChip(&state.palette_overlay_batch, state.allocator, chip_rect, workspace_identity.glyphAt(identity.icon_index), workspace_identity.slotColor(identity.color_index), false, directory_rect) catch {};
+        } else {
+            queueIconText(state, folder_slot, file_icons.folder.glyph, icon_color, glyph_size, directory_rect);
+        }
     }
     if (state.composer_controller.composer.showRuntimeToggle()) {
         const runtime_rect = state.composer_controller.composer.runtimeRect();
