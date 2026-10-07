@@ -111,6 +111,11 @@ interface SnapshotSession {
   dock_id?: number
   running?: boolean
   status?: string
+  /// Agent status the desktop persists for this terminal (`surface_states`):
+  /// idle, working, waiting, done or error. The session's own `status` only
+  /// says whether the shell is alive.
+  surface_status?: string
+  created_at_ms?: number
 }
 
 export interface SnapshotTurn {
@@ -131,6 +136,7 @@ interface SnapshotPayload {
   snapshot?: {
     workspaces?: Workspace[]
     selected_workspace_index?: number
+    surface_states?: SurfaceStatusRow[]
   }
   workspaces?: Workspace[]
   selected_workspace_index?: number
@@ -877,6 +883,27 @@ function sessionKey(session: SnapshotSession): string {
   return session.session_id ?? session.id ?? ''
 }
 
+export interface SurfaceStatusRow {
+  session_id?: string
+  status?: string
+  status_changed_at_ms?: number
+}
+
+/// Attach the desktop-persisted agent status to each daemon session row.
+/// Session ids are reused per dock, so a surface row recorded before the
+/// session was created belongs to an earlier shell and is ignored.
+export function withSurfaceStatus(
+  sessions: SnapshotSession[],
+  statuses: ReadonlyMap<string, SurfaceStatusRow>,
+): SnapshotSession[] {
+  return sessions.map((session) => {
+    const row = statuses.get(sessionKey(session))
+    const fresh = row && (row.status_changed_at_ms ?? 0) >= (session.created_at_ms ?? 0)
+    const surface_status = fresh ? row.status : undefined
+    return surface_status === session.surface_status ? session : { ...session, surface_status }
+  })
+}
+
 function storeIdForPath(path: string | undefined): string | null {
   if (!path) return null
   if (!path.startsWith('/')) return path
@@ -1131,11 +1158,16 @@ function termPane(workspace: Workspace, session: SnapshotSession): LivePane {
     thread_title: sessionTitle(session),
     dock_id: session.dock_id,
     running: session.running ?? session.status === 'working',
-    // Detached fallback: without the desktop's surface status, a session the
-    // daemon reports as working is the closest activity signal available.
-    working: session.status === 'working',
+    // Detached fallback: the desktop-persisted surface status is the same
+    // signal the desktop sidebar uses, so terminals that were already working
+    // when this client loaded still land in ACTIVE.
+    working: session.surface_status === 'working' || session.status === 'working',
     cwd: session.cwd ?? workspace.path,
-    attention: session.status === 'working',
+    attention:
+      session.surface_status === 'working' ||
+      session.surface_status === 'waiting' ||
+      session.surface_status === 'error' ||
+      session.status === 'working',
   }
 }
 
@@ -1601,6 +1633,7 @@ export function createAppStore() {
   let instantFocusPaneId: number | null = null
   let storeClientId: string | null = null
   let lastSessions: SnapshotSession[] = []
+  let surfaceStatusBySession = new Map<string, SurfaceStatusRow>()
   const [lastTurns, setLastTurns] = createSignal<SnapshotTurn[]>([])
   /// Desktop live-IPC mirrors. Non-null only while the desktop app is
   /// reachable; they then override the (possibly stale) store projection.
@@ -1821,7 +1854,15 @@ export function createAppStore() {
     const root = unwrapped ?? (asRecord(params) as SnapshotPayload | null)
     if (!root) return
     const snapshot = root.snapshot ?? root
-    if (root.sessions) lastSessions = root.sessions
+    if ('surface_states' in snapshot && Array.isArray(snapshot.surface_states)) {
+      surfaceStatusBySession = new Map(
+        snapshot.surface_states
+          .filter((row) => row.session_id && row.status)
+          .map((row) => [row.session_id!, row]),
+      )
+      lastSessions = withSurfaceStatus(lastSessions, surfaceStatusBySession)
+    }
+    if (root.sessions) lastSessions = withSurfaceStatus(root.sessions, surfaceStatusBySession)
     if (root.turns) {
       // Local snapshots cannot observe turns running on a saved connection.
       batch(() => {

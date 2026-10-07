@@ -13,6 +13,7 @@ import {
   prependTranscriptPage,
   mergeThreadCatalogSettings,
   panesForWorkspace,
+  withSurfaceStatus,
   parseFavoriteModels,
   requestPaneClose,
   requestTerminalOpen,
@@ -298,6 +299,26 @@ describe('panesForWorkspace', () => {
     const titles = panesForWorkspace(workspace, [], turns, new Set()).map((pane) => pane.thread_title)
 
     expect(titles).toEqual(['A', 'B', 'Busy', 'Project Manager', 'Late'])
+  })
+
+  test('terminals already working at load hydrate from desktop surface states', () => {
+    const workspace = { workspace_id: 'workspace-1', label: 'Workspace', path: '/workspace', threads: [] }
+    const session = (dock, created_at_ms) => ({
+      session_id: `verde:ws:dock:${dock}:pane:1`, workspace_id: 'workspace-1', dock_id: dock,
+      running: true, status: 'running', created_at_ms,
+    })
+    const statuses = new Map([
+      ['verde:ws:dock:1:pane:1', { status: 'working', status_changed_at_ms: 200 }],
+      ['verde:ws:dock:2:pane:1', { status: 'done', status_changed_at_ms: 200 }],
+      // Recorded for an earlier shell that reused this dock's session id.
+      ['verde:ws:dock:3:pane:1', { status: 'working', status_changed_at_ms: 50 }],
+    ])
+    const layout = { panes: [1, 2, 3].map((dock) => ({ id: dock, kind: 'terminal', dock })) }
+    const sessions = withSurfaceStatus([session(1, 100), session(2, 100), session(3, 100)], statuses)
+
+    const panes = panesForWorkspace(workspace, sessions, [], new Set(), layout)
+
+    expect(panes.map((pane) => pane.working)).toEqual([true, false, false])
   })
 
   test('shows open committed chats started by another web client', () => {

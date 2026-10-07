@@ -173,31 +173,45 @@ export function Sidebar(props: { drawer?: boolean }) {
             </div>
           </div>
 
-          <button
-            ref={switcherTrigger}
-            type="button"
-            class={`mt-2.5 flex h-11 w-full items-center gap-2 rounded-[7px] border border-[var(--border-muted)] px-2 text-left lg:h-[34px] ${
-              switcherOpen() ? 'bg-[var(--accent-hover)]' : 'hover:bg-[var(--accent-hover)]'
-            }`}
-            aria-haspopup="listbox"
-            aria-expanded={switcherOpen()}
-            onClick={() => { setMenu(null); setSwitcherOpen((open) => !open) }}
-          >
-            <Show
-              when={scopedWorkspace()}
-              fallback={(
-                <span class="grid h-5 w-5 shrink-0 place-items-center rounded-[5px] bg-[var(--accent-dim)] text-[var(--accent)]">
-                  <Icon name="layers" class="h-3.5 w-3.5" />
-                </span>
-              )}
+          <div class="mt-2.5 flex items-center gap-1.5">
+            {/* No resting chrome, like the desktop rail: the trigger sits
+                flush and only shows the accent wash on hover / while open. */}
+            <button
+              ref={switcherTrigger}
+              type="button"
+              class={`group flex h-11 min-w-0 flex-1 items-center gap-2.5 rounded-[7px] px-1.5 text-left lg:h-[34px] ${
+                switcherOpen() ? 'bg-[var(--accent-hover)]' : 'hover:bg-[var(--accent-hover)]'
+              }`}
+              aria-haspopup="listbox"
+              aria-expanded={switcherOpen()}
+              onClick={() => { setMenu(null); setSwitcherOpen((open) => !open) }}
             >
-              {(workspace) => <WorkspaceGlyph workspace={workspace()} />}
-            </Show>
-            <span class="min-w-0 flex-1 truncate text-[15px] text-[var(--text)] lg:text-[13px]">
-              {scopedWorkspace()?.label ?? 'All Workspaces'}
-            </span>
-            <Icon name="chevronDown" class="h-4 w-4 shrink-0 text-[var(--text-subtle)]" />
-          </button>
+              <Show when={scopedWorkspace()} fallback={<AllWorkspacesGlyph />}>
+                {(workspace) => <WorkspaceGlyph workspace={workspace()} class="h-[22px] w-[22px]" />}
+              </Show>
+              <span
+                class={`min-w-0 flex-1 truncate text-[15px] lg:text-[14px] ${
+                  switcherOpen() ? 'text-white' : 'text-[var(--text-muted)] group-hover:text-white'
+                }`}
+              >
+                {scopedWorkspace()?.label ?? 'All Workspaces'}
+              </span>
+              <Icon
+                name="chevronDown"
+                class={`h-4 w-4 shrink-0 ${switcherOpen() ? 'text-white' : 'text-[var(--text-subtle)] group-hover:text-white'}`}
+              />
+            </button>
+            <IconButton
+              label="New workspace"
+              onClick={() => {
+                setMenu(null)
+                store.setNotice(null)
+                store.setWorkspaceDialogOpen(true)
+              }}
+            >
+              <Icon name="plus" class="h-[18px] w-[18px]" />
+            </IconButton>
+          </div>
 
           <div class="mt-2 flex items-center gap-1">
             <button
@@ -325,6 +339,15 @@ type SwitcherItem =
   | { kind: 'new' }
 
 /// Context-menu styled workspace picker anchored under the sidebar trigger.
+/// "All Workspaces" identity chip, sized like a workspace chip.
+function AllWorkspacesGlyph() {
+  return (
+    <span class="grid h-[22px] w-[22px] shrink-0 place-items-center rounded-[5px] bg-[var(--accent-dim)] text-[var(--accent)]" aria-hidden="true">
+      <Icon name="layers" class="h-3.5 w-3.5" />
+    </span>
+  )
+}
+
 function WorkspaceSwitcher(props: {
   anchor: HTMLElement
   onClose: () => void
@@ -360,10 +383,10 @@ function WorkspaceSwitcher(props: {
 
   const position = () => {
     const rect = props.anchor.getBoundingClientRect()
-    const width = Math.min(Math.max(rect.width, 260), window.innerWidth - 16)
+    const width = Math.min(Math.max(rect.width, 300), window.innerWidth - 16)
     return {
       left: `${Math.max(8, Math.min(rect.left, window.innerWidth - width - 8))}px`,
-      top: `${rect.bottom + 6}px`,
+      top: `${rect.bottom + 4}px`,
       width: `${width}px`,
       'max-height': `${Math.max(160, window.innerHeight - rect.bottom - 16)}px`,
     }
@@ -405,16 +428,17 @@ function WorkspaceSwitcher(props: {
           onPointerDown={props.onClose}
         />
         <div
-          class="anim-menu fixed z-10 flex flex-col overflow-hidden rounded-[12px] border border-[var(--border-muted)] bg-[var(--panel-alt)] shadow-[0_18px_55px_rgba(0,0,0,0.5)]"
+          class="anim-menu fixed z-10 flex flex-col gap-1.5 overflow-hidden rounded-[10px] border border-[var(--panel-muted)] bg-[var(--panel-alt)] p-1.5 shadow-[0_18px_55px_rgba(0,0,0,0.5)]"
           style={position()}
           onKeyDown={onKeyDown}
           onPointerDown={(event) => event.stopPropagation()}
         >
-          <div class="flex shrink-0 items-center gap-2 border-b border-[var(--border-muted)] px-3">
-            <Icon name="search" class="h-3.5 w-3.5 shrink-0 text-[var(--text-subtle)]" />
+          {/* Recessed field, as on the desktop: darker than the popover with
+              an accent border while focused. */}
+          <div class="flex shrink-0">
             <input
               ref={input}
-              class="h-10 min-w-0 flex-1 bg-transparent text-[14px] text-[var(--text)] outline-none placeholder:text-[var(--text-subtle)] lg:h-9 lg:text-[13px]"
+              class="h-10 min-w-0 flex-1 rounded-[7px] border border-[var(--panel-muted)] bg-[var(--chat-black)] px-2.5 text-[14px] text-white outline-none placeholder:text-[var(--text-subtle)] focus:border-[var(--accent)] lg:h-8"
               placeholder="Search workspaces"
               aria-label="Search workspaces"
               aria-controls="workspace-switcher-list"
@@ -423,7 +447,7 @@ function WorkspaceSwitcher(props: {
               onInput={(event) => setQuery(event.currentTarget.value)}
             />
           </div>
-          <div ref={list} id="workspace-switcher-list" role="listbox" aria-label="Workspaces" class="min-h-0 flex-1 overflow-y-auto p-1.5 scrollbar-thin">
+          <div ref={list} id="workspace-switcher-list" role="listbox" aria-label="Workspaces" class="min-h-0 flex-1 overflow-y-auto scrollbar-thin">
             <For each={items()}>
               {(item, index) => (
                 <div
@@ -431,38 +455,39 @@ function WorkspaceSwitcher(props: {
                   data-switcher-index={index()}
                   role="option"
                   aria-selected={highlight() === index()}
-                  class={`group flex min-h-11 cursor-pointer items-center gap-2 rounded-[8px] px-2 lg:min-h-9 ${
-                    highlight() === index() ? 'bg-[var(--accent-hover)]' : ''
-                  } ${item.kind === 'new' ? 'mt-1' : ''}`}
+                  class={`group flex min-h-11 cursor-pointer items-center gap-2.5 rounded-[7px] px-1.5 text-[14px] lg:min-h-[34px] lg:text-[13px] ${
+                    highlight() === index() ? 'bg-[var(--accent-hover)] text-white' : 'text-[var(--text-muted)]'
+                  }`}
                   onPointerMove={() => setHighlight(index())}
                   onClick={() => choose(item)}
                 >
                   <Show when={item.kind === 'new'}>
-                    <span class="grid h-5 w-5 shrink-0 place-items-center text-[var(--text-subtle)]">
-                      <Icon name="plus" class="h-3.5 w-3.5" />
+                    <span class="grid h-[22px] w-[22px] shrink-0 place-items-center">
+                      <Icon name="plus" class="h-4 w-4" />
                     </span>
-                    <span class="min-w-0 flex-1 truncate text-[14px] text-[var(--text-muted)] lg:text-[13px]">New workspace</span>
+                    <span class="min-w-0 flex-1 truncate">New workspace</span>
                   </Show>
                   <Show when={item.kind === 'all'}>
-                    <span class="grid h-5 w-5 shrink-0 place-items-center rounded-[5px] bg-[var(--accent-dim)] text-[var(--accent)]">
-                      <Icon name="layers" class="h-3.5 w-3.5" />
-                    </span>
-                    <span class="min-w-0 flex-1 truncate text-[14px] text-[var(--text)] lg:text-[13px]">All Workspaces</span>
+                    <AllWorkspacesGlyph />
+                    <span class="min-w-0 flex-1 truncate">All Workspaces</span>
                   </Show>
                   <Show when={item.kind === 'workspace' ? item : null}>
                     {(row) => (
                       <>
-                        <WorkspaceGlyph workspace={row().workspace} dim={row().closed} />
-                        <span class={`min-w-0 flex-1 truncate text-[14px] lg:text-[13px] ${row().closed ? 'text-[var(--text-subtle)]' : 'text-[var(--text)]'}`}>
+                        <WorkspaceGlyph workspace={row().workspace} dim={row().closed} class="h-[22px] w-[22px]" />
+                        <span class={`min-w-0 flex-1 truncate ${row().closed ? 'text-[var(--text-subtle)]' : ''}`}>
                           {row().workspace.label}
                         </span>
                         <Show when={row().closed}>
                           <span class="shrink-0 text-[11px] text-[var(--text-subtle)]">Closed</span>
                         </Show>
+                        <Show when={isCurrent(item)}>
+                          <Icon name="check" class="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
+                        </Show>
                         <Show when={!row().closed}>
                           <button
                             type="button"
-                            class="grid h-8 w-8 shrink-0 place-items-center rounded-[6px] text-[var(--text-subtle)] hover:bg-[var(--accent-row)] hover:text-[var(--text)] lg:h-6 lg:w-6"
+                            class="grid h-8 w-8 shrink-0 place-items-center rounded-[6px] text-[var(--text-subtle)] hover:bg-white/10 hover:text-white lg:h-[26px] lg:w-[26px]"
                             aria-label={`${row().workspace.label} workspace settings`}
                             title="Workspace settings"
                             onClick={(event) => {
@@ -477,7 +502,7 @@ function WorkspaceSwitcher(props: {
                       </>
                     )}
                   </Show>
-                  <Show when={item.kind !== 'new' && isCurrent(item)}>
+                  <Show when={item.kind === 'all' && isCurrent(item)}>
                     <Icon name="check" class="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
                   </Show>
                 </div>
@@ -620,6 +645,15 @@ function PaneRow(props: {
       onPointerUp={context.onPointerUp}
       onPointerCancel={context.onPointerCancel}
     >
+      {/* Workspace chip leads the row, before the provider glyph, as on the
+          desktop rail. */}
+      <Show when={props.chip}>
+        <WorkspaceGlyph
+          workspace={store.workspaces().find((row) => row.workspace_id === props.pane.workspace_id) ?? { workspace_id: props.pane.workspace_id }}
+          class="h-[18px] w-[18px]"
+          iconClass="h-3 w-3"
+        />
+      </Show>
       {/* Terminal panes hosting a TUI agent carry its provider, mirroring the
           desktop's agent-terminal glyph; plain shells keep the terminal icon. */}
       <Show
@@ -630,13 +664,6 @@ function PaneRow(props: {
       </Show>
       <span class="min-w-0 flex-1 truncate text-[15px] text-[var(--text-muted)] lg:text-[13px]">{store.paneTitle(props.pane)}</span>
       <GitChangesDot pane={props.pane} />
-      <Show when={props.chip}>
-        <WorkspaceGlyph
-          workspace={store.workspaces().find((row) => row.workspace_id === props.pane.workspace_id) ?? { workspace_id: props.pane.workspace_id }}
-          class="h-[18px] w-[18px]"
-          iconClass="h-3 w-3"
-        />
-      </Show>
       <Show when={working()}>
         <StatusPip active />
       </Show>
