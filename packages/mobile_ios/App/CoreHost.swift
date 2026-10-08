@@ -220,6 +220,9 @@ actor CoreHost {
              .new_chat_select, .thread_create, .thread_rename, .thread_close, .thread_sync,
              .workspace_create, .workspace_rename, .workspace_identity, .workspace_archive, .workspace_close,
              .directory_list, .history_search, .history_load_more, .file_open,
+             // Workspace explorer: e.g. an old host or an invalid path.
+             .workspace_files_list, .workspace_file_read, .workspace_preview_close,
+             .workspace_changes_open, .workspace_changes_close, .workspace_file_patch,
              // Terminal intents: e.g. an unencodable key or the 32-record limit.
              // A rejected device reply is dropped, never replayed.
              .terminal_create, .terminal_attach, .terminal_detach, .terminal_kill,

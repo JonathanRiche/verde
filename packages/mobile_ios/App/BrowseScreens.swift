@@ -10,6 +10,13 @@ enum BrowseRoute: Hashable {
     case terminal(workspace: String, terminal: String)
     /// Each push is a distinct new session request.
     case newTerminal(workspace: String, request: UUID)
+    /// Workspace explorer: uncommitted changes, the file tree, one changed file's diff (repository
+    /// root and repo-relative path), and a Files-tab file (root id, root-relative path, and the
+    /// informational absolute path, possibly empty).
+    case changes(String)
+    case files(String)
+    case patch(workspace: String, root: String, path: String)
+    case workspaceFile(workspace: String, root: String, path: String, absolute: String)
 }
 
 func route(_ pane: Pane) -> BrowseRoute? {
@@ -303,6 +310,7 @@ struct WorkspaceScreen: View {
     let workspaceID: String
     let actions: BrowseActions
     @State private var showArchived = false
+    @Environment(\.openRoute) private var openRoute
     var body: some View {
         let workspace = model.state.workspaces?.items.first { $0.workspace_id == workspaceID }
         BrowseFrame(title: workspace?.label ?? "Workspace", model: model, actions: actions,
@@ -311,6 +319,7 @@ struct WorkspaceScreen: View {
             if let workspace {
                 ManageContainer(browse: model) { manage in WorkspaceActions(workspace: workspace, manage: manage) }
                 if !workspace.path.isEmpty { Text(workspace.path) .font(VerdeTheme.ui(13)).foregroundStyle(.secondary) }
+                ExplorerLinks(onChanges: { openRoute(.changes(workspaceID)) }, onFiles: { openRoute(.files(workspaceID)) })
                 Section("Panes") {
                     if workspace.panes.isEmpty { Text("No open panes.") }
                     ForEach(workspace.panes, id: \.id) { PaneItem(browse: model, pane: $0, now: now) }
@@ -359,6 +368,11 @@ struct BrowseStack<Root: View>: View {
                 case .terminal(let workspace, let terminal):
                     TerminalScreen(browse: model, workspaceID: workspace, terminalID: terminal)
                 case .newTerminal(let workspace, _): TerminalScreen(browse: model, workspaceID: workspace, terminalID: nil)
+                case .changes(let workspace): ChangesRoute(browse: model, workspaceID: workspace)
+                case .files(let workspace): FilesRoute(browse: model, workspaceID: workspace)
+                case .patch(let workspace, let root, let path): PatchRoute(browse: model, workspaceID: workspace, root: root, path: path)
+                case .workspaceFile(let workspace, let root, let path, let absolute):
+                    WorkspaceFileRoute(browse: model, workspaceID: workspace, root: root, path: path, absolute: absolute)
                 } }.modifier(VerdeNavigation())
             }
         }

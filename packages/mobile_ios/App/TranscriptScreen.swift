@@ -69,6 +69,10 @@ struct TranscriptScreen: View {
                 next.start()
             }
             model?.setVisible(true)
+            // An "Ask agent" selection from the file or diff viewer arrives with this navigation.
+            if let model, let prompt = PromptHandoff.take(host: browse.hostID, workspace: workspaceID, thread: threadID) {
+                model.input.ask(prompt)
+            }
         }
         // Focus is released after a short delay (or by the model's owner check once it is gone),
         // so a quick return to this chat doesn't churn the core's focus slot.

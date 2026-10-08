@@ -127,31 +127,53 @@ final class FileViewerModel: HighlightSource {
     private(set) var original = false
     private var host: CoreHost?
     private var highlights = RenderLRU<RenderResult<[RenderSpan]>>(32)
-    func clear() { bytes = nil; original = false; svg = nil; text = nil; blocks = nil; image = nil; pdf = nil; host = nil; highlights = RenderLRU(32) }
-    func load(host: CoreHost, path: String) async {
+    @ObservationIgnored private var cachedSplit: FileSplit?
+    func clear() { bytes = nil; original = false; svg = nil; text = nil; blocks = nil; image = nil; pdf = nil; host = nil; highlights = RenderLRU(32); cachedSplit = nil }
+    /// `text` split into display lines once, for the line-selectable viewer.
+    func split() -> FileSplit? {
+        guard let text else { return nil }
+        if let cachedSplit, cachedSplit.text == text { return cachedSplit }
+        let next = FileSplit(text)
+        cachedSplit = next
+        return next
+    }
+    /// `reader` replaces the path fetch (workspace Files reads by root and relative path); a nil
+    /// outcome means the host can't serve that read, so the path fetch is used instead.
+    func load(host: CoreHost, path: String, reader: ((CoreHost) async throws -> WorkspaceReadOutcome?)? = nil) async {
         clear(); self.host = host; loading = true; problem = nil
         defer { loading = false }
         do {
             let kind = ViewerKind.of(path)
-            let file: FileBytes
-            do { file = try await host.fetchFile(path: path, kind: ViewerKind.fetchKind(path), limit: kind.limit) }
-            catch let failure as FileFetchFailure { throw FileProblem.of(failure.code, limit: kind.limit) }
+            var read: Data?
+            if let reader {
+                switch try await reader(host) {
+                case .bytes(let bytes): read = bytes
+                case .problem(let problem): throw problem
+                case nil: break
+                }
+            }
+            let data: Data
+            if let read { data = read }
+            else {
+                do { data = try await host.fetchFile(path: path, kind: ViewerKind.fetchKind(path), limit: kind.limit).data }
+                catch let failure as FileFetchFailure { throw FileProblem.of(failure.code, limit: kind.limit) }
+            }
             try Task.checkCancellation()
-            bytes = file.data; original = kind != .office
+            bytes = data; original = kind != .office
             switch kind {
             case .pdf, .office:
-                guard let document = PDFDocument(data: file.data), document.pageCount > 0 else { throw FileProblem.unreadable }
+                guard let document = PDFDocument(data: data), document.pageCount > 0 else { throw FileProblem.unreadable }
                 pdf = document
             case .svg:
-                guard !file.data.isEmpty else { throw FileProblem.unreadable }
-                svg = file.data
-                text = String(data: file.data, encoding: .utf8)
+                guard !data.isEmpty else { throw FileProblem.unreadable }
+                svg = data
+                text = String(data: data, encoding: .utf8)
             case .image:
-                guard let source = CGImageSourceCreateWithData(file.data as CFData, nil),
+                guard let source = CGImageSourceCreateWithData(data as CFData, nil),
                       let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceCreateThumbnailWithTransform: true, kCGImageSourceThumbnailMaxPixelSize: 4096] as CFDictionary) else { throw FileProblem.unreadable }
                 image = UIImage(cgImage: thumbnail)
             case .text, .markdown:
-                guard !file.data.contains(0), let decoded = String(data: file.data, encoding: .utf8) else { throw FileProblem.binary }
+                guard !data.contains(0), let decoded = String(data: data, encoding: .utf8) else { throw FileProblem.binary }
                 text = decoded
                 if kind == .markdown, decoded.utf8.count <= 64 * 1024,
                    let data = await utility("markdown", decoded), let parsed = try? JSONDecoder().decode(MarkdownQuery.self, from: data).data {
@@ -184,7 +206,12 @@ struct FileViewer: View {
     let browse: BrowseModel
     let workspaceID: String
     let citation: FileCitation
+    /// Reads the file some other way than by path (see `FileViewerModel.load`).
+    var reader: ((CoreHost) async throws -> WorkspaceReadOutcome?)? = nil
+    /// Pushed inside a navigation stack (no own stack, no Done button).
+    var embedded = false
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.lineSelection) private var lineSelection
     @State private var model = FileViewerModel()
     @State private var source = false
     @State private var attempt = 0
@@ -194,48 +221,17 @@ struct FileViewer: View {
     @State private var downloadProblem: FileProblem?
     private var path: String? { resolveFilePath(citation.path, root: browse.state.workspaces?.items.first { $0.workspace_id == workspaceID }?.path) }
     var body: some View {
-        NavigationStack {
-            Group {
-                if model.loading { ProgressView("Loading file…") }
-                else if let problem = model.problem {
-                    VStack(spacing: 8) {
-                        Text(problem.title).font(VerdeTheme.ui(17, bold: true)).multilineTextAlignment(.center)
-                        Text(problem.detail).foregroundStyle(VerdeTheme.muted).multilineTextAlignment(.center)
-                        if canDownload {
-                            Button { export() } label: {
-                                if download != nil { ProgressView() } else { Label("Download file", systemImage: "arrow.down.circle") }
-                            }.buttonStyle(.borderedProminent).disabled(download != nil).padding(.top, 8)
-                        }
-                        Button("Retry") { attempt += 1 }.padding(.top, 4)
-                    }.padding()
-                }
-                else if let pdf = model.pdf { NativePDF(document: pdf) }
-                else if let image = model.image { ZoomImage(image: image) }
-                else if let svg = model.svg, !source || model.text == nil { SVGPreview(html: svgPreviewHTML(svg)) }
-                else if let blocks = model.blocks, !source { ScrollView { MarkdownBlocks(blocks: blocks, source: model).padding() } }
-                else if let text = model.text { FileText(text: text, target: fileLineRange(text, line: citation.line, end: citation.end_line)) }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity).background(VerdeTheme.background)
-            .navigationTitle((citation.path as NSString).lastPathComponent).navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }
-                ToolbarItemGroup(placement: .primaryAction) {
-                    if model.blocks != nil || (model.svg != nil && model.text != nil) { Button(source ? "Preview" : "Source") { source.toggle() } }
-                    if canDownload {
-                        if download != nil { ProgressView() }
-                        else { Button { export() } label: { Image(systemName: "square.and.arrow.up") }.accessibilityLabel("Share or open file") }
-                    }
-                }
-            }
+        Group {
+            if embedded { page } else { NavigationStack { page } }
         }
         .tint(VerdeTheme.accent).foregroundStyle(VerdeTheme.text).font(VerdeTheme.ui())
         .task(id: attempt) {
             source = citation.line != nil
-            guard let path, let session = browse.session else { model.problem = .unresolved; return }
+            guard path != nil || reader != nil, let session = browse.session else { model.problem = .unresolved; return }
             await session.start()
             guard let host = session.host else { self.host = nil; model.problem = .unavailable; return }
             self.host = host
-            await model.load(host: host, path: path)
+            await model.load(host: host, path: path ?? citation.path, reader: reader)
         }
         .onChange(of: browse.hostID) { dismiss(); model.clear(); host = nil; download?.cancel() }
         .onChange(of: browse.state.host?.auth_state) { _, state in if state != "paired" { dismiss(); model.clear(); host = nil; download?.cancel() } }
@@ -245,6 +241,47 @@ struct FileViewer: View {
             Button("OK", role: .cancel) {}
         } message: { problem in Text(problem.detail) }
         .environment(\.openURL, OpenURLAction { url in safeLinkUrl(url.absoluteString) != nil ? .systemAction : .discarded })
+    }
+    private var page: some View {
+        Group {
+            if model.loading { ProgressView("Loading file…") }
+            else if let problem = model.problem {
+                VStack(spacing: 8) {
+                    Text(problem.title).font(VerdeTheme.ui(17, bold: true)).multilineTextAlignment(.center)
+                    Text(problem.detail).foregroundStyle(VerdeTheme.muted).multilineTextAlignment(.center)
+                    if canDownload {
+                        Button { export() } label: {
+                            if download != nil { ProgressView() } else { Label("Download file", systemImage: "arrow.down.circle") }
+                        }.buttonStyle(.borderedProminent).disabled(download != nil).padding(.top, 8)
+                    }
+                    Button("Retry") { attempt += 1 }.padding(.top, 4)
+                }.padding()
+            }
+            else if let pdf = model.pdf { NativePDF(document: pdf) }
+            else if let image = model.image { ZoomImage(image: image) }
+            else if let svg = model.svg, !source || model.text == nil { SVGPreview(html: svgPreviewHTML(svg)) }
+            else if let blocks = model.blocks, !source { ScrollView { MarkdownBlocks(blocks: blocks, source: model).padding() } }
+            else if lineSelection != nil, let split = model.split() { SelectableFileText(split: split, target: citeLines) }
+            else if let text = model.text { FileText(text: text, target: fileLineRange(text, line: citation.line, end: citation.end_line)) }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity).background(VerdeTheme.background)
+        .navigationTitle((citation.path as NSString).lastPathComponent).navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            if !embedded { ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } } }
+            ToolbarItemGroup(placement: .primaryAction) {
+                if model.blocks != nil || (model.svg != nil && model.text != nil) { Button(source ? "Preview" : "Source") { source.toggle() } }
+                if canDownload {
+                    if download != nil { ProgressView() }
+                    else { Button { export() } label: { Image(systemName: "square.and.arrow.up") }.accessibilityLabel("Share or open file") }
+                }
+            }
+        }
+    }
+    /// The cited lines (1-based), highlighted in the selectable viewer.
+    private var citeLines: ClosedRange<Int>? {
+        guard let line = citation.line, line > 0, line <= UInt64(Int.max) else { return nil }
+        let first = Int(line)
+        return first...max(first, Int(clamping: citation.end_line ?? line))
     }
     private var canDownload: Bool { path != nil && host != nil }
     /// Shares the original file (Save to Files included), reusing preview bytes when they are the original.

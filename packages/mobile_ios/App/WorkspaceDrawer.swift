@@ -101,6 +101,11 @@ struct WorkspaceDrawer: View {
                     }
                 }
             }.padding(.horizontal, 12).padding(.vertical, 8)
+            if let target, search.isEmpty {
+                ExplorerLinks(onChanges: { open(.changes(target.workspace_id)) }, onFiles: { open(.files(target.workspace_id)) },
+                              workspace: scoped == nil ? target.label : nil)
+                    .padding(.horizontal, 12).padding(.bottom, 8)
+            }
             Rectangle().fill(VerdeTheme.border).frame(height: 1)
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 2) {

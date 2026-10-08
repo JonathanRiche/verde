@@ -106,6 +106,33 @@ final class ComposerModel {
         edit(next, selection: NSRange(location: token.range.location + (replacement as NSString).length, length: 0))
     }
 
+    nonisolated static let askWait: Duration = .seconds(15)
+
+    /// Ask-agent hand-off from the file/diff viewers: once the chat and its draft load, sends
+    /// `prompt` (as a follow-up when a turn is running). An unsent draft is never replaced: the
+    /// text is appended to it instead, for the user to send.
+    func ask(_ prompt: String, wait: Duration = ComposerModel.askWait) {
+        Task { [weak self] in
+            let deadline = ContinuousClock.now.advanced(by: wait)
+            while let self, self.view == nil || self.chat.thread == nil, ContinuousClock.now < deadline {
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            guard let self else { return }
+            let ready = view != nil && chat.thread != nil
+            if ready, let draft = view?.draft, draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, draft.attachments.isEmpty,
+               generation == savedGeneration, text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                edit(prompt, selection: NSRange(location: (prompt as NSString).length, length: 0))
+                submit()
+                return
+            }
+            let before = text
+            let next = before.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? prompt : before + (before.hasSuffix("\n") ? "\n" : "\n\n") + prompt
+            edit(next, selection: NSRange(location: (next as NSString).length, length: 0))
+            flushNow()
+            notice = ready ? "Added to your draft. Send when ready." : "Couldn't reach this chat yet. Your request is in the draft."
+        }
+    }
+
     private func enqueue(_ action: @escaping () async -> Void) {
         let previous = lane
         lane = Task { await previous?.value; await action() }

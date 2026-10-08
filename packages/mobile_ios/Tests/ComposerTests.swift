@@ -171,4 +171,52 @@ final class ComposerTests: XCTestCase {
         XCTAssertFalse(chat.fatal)
         chat.stop(); await harness.close()
     }
+
+    // MARK: Ask agent hand-off (file/diff viewer selections)
+
+    func testAskSendsIntoAnEmptyDraft() async throws {
+        let harness = ChatHarness()
+        try await harness.launch()
+        let chat = TranscriptModel(browse: harness.browse, workspaceID: chatWS, threadID: chatThread)
+        chat.start(); chat.setVisible(true)
+        chat.input.ask("Explain these lines")
+        try await waitUntil("send") { harness.core.events.count { if case .send = $0 { return true }; return false } == 1 }
+        let drafts = harness.core.events.all.compactMap { if case .draft_set(let value) = $0 { return value }; return nil }
+        XCTAssertEqual(drafts.map(\.text), ["Explain these lines"])
+        XCTAssertEqual(harness.core.events.count { if case .followup_submit = $0 { return true }; return false }, 0)
+        chat.stop(); await harness.close()
+    }
+
+    func testAskAppendsToAnUnsentDraftWithoutSending() async throws {
+        let harness = ChatHarness()
+        try await harness.launch()
+        let chat = TranscriptModel(browse: harness.browse, workspaceID: chatWS, threadID: chatThread)
+        chat.start(); chat.setVisible(true)
+        try await waitUntil { chat.input.view != nil && chat.thread != nil }
+        let model = chat.input
+        model.edit("Keep this note", selection: NSRange(location: 14, length: 0))
+        model.ask("Explain these lines")
+        let expected = "Keep this note\n\nExplain these lines"
+        try await waitUntil("draft") {
+            harness.core.events.all.compactMap { if case .draft_set(let value) = $0 { return value.text }; return nil }.last == expected
+        }
+        XCTAssertEqual(model.text, expected)
+        XCTAssertEqual(model.notice, "Added to your draft. Send when ready.")
+        XCTAssertEqual(harness.core.events.count { if case .send = $0 { return true }; return false }, 0)
+        chat.stop(); await harness.close()
+    }
+
+    func testAskDuringARunningTurnGoesInAsAFollowup() async throws {
+        let harness = ChatHarness()
+        try await harness.launch { $0.thread = "thread-running"; $0.composer = "composer-running" }
+        let chat = TranscriptModel(browse: harness.browse, workspaceID: chatWS, threadID: chatThread)
+        chat.start(); chat.setVisible(true)
+        try await waitUntil("running") { chat.state.turn != nil }
+        chat.input.ask("Explain these lines")
+        try await waitUntil("followup") { harness.core.events.count { if case .followup_submit = $0 { return true }; return false } == 1 }
+        let drafts = harness.core.events.all.compactMap { if case .draft_set(let value) = $0 { return value }; return nil }
+        XCTAssertEqual(drafts.map(\.text), ["Explain these lines"])
+        XCTAssertEqual(harness.core.events.count { if case .send = $0 { return true }; return false }, 0)
+        chat.stop(); await harness.close()
+    }
 }
