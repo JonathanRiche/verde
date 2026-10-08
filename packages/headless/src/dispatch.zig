@@ -452,6 +452,8 @@ test "reads are not mutators and store mutators drain" {
         "workspace.list",
         "workspace.repository.manifest.get",
         "workspace.files.search",
+        "workspace.files.list",
+        "workspace.files.read",
         "chat.thread.list",
         "chat.message.list",
         "providers.status",

@@ -19,6 +19,7 @@ pub const access_protocol = @import("access_protocol.zig");
 pub const connect_protocol = @import("connect_protocol.zig");
 pub const attachment_protocol = @import("attachment_protocol.zig");
 pub const git_changes_protocol = @import("git_changes_protocol.zig");
+pub const workspace_files_protocol = @import("workspace_files_protocol.zig");
 pub const qr = @import("qr.zig");
 pub const dispatch = @import("dispatch.zig");
 pub const client = @import("client.zig");

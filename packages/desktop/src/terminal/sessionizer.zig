@@ -43,6 +43,8 @@ const workspace_identity = @import("../platform/workspace_identity.zig");
 const stack = @import("../workspace/stack.zig");
 const platform_runtime = @import("platform_runtime");
 const directory_browser = @import("../daemon/directory_browser.zig");
+const workspace_files = @import("../daemon/workspace_files.zig");
+const workspace_files_protocol = headless.workspace_files_protocol;
 const process_env = @import("../platform/env.zig");
 const provider_cli_version = @import("../providers/cli_version.zig");
 const provider_hooks = @import("../providers/hooks.zig");
@@ -2927,6 +2929,7 @@ pub const Daemon = struct {
         // lockDaemon for SQLite work; route before the generic mutator drain gate.
         if (std.mem.eql(u8, method, "workspace.create")) return try workspaceCreateResponse(self, id_value, params);
         if (std.mem.eql(u8, method, directory_browser.METHOD)) return try workspaceDirectoryListResponse(self, id_value, params);
+        if (std.mem.eql(u8, method, workspace_files_protocol.METHOD_LIST) or std.mem.eql(u8, method, workspace_files_protocol.METHOD_READ)) return try workspaceFilesBrowseResponse(self, id_value, method, params);
         if (std.mem.eql(u8, method, "workspace.close")) return try self.workspaceCloseResponse(id_value, params);
         if (std.mem.eql(u8, method, "chat.subagent.open")) return try self.chatSubagentOpenResponse(id_value, params);
         if (isStoreMethod(method)) return try self.handleStoreRequest(id_value, method, params);
@@ -13210,6 +13213,10 @@ fn methodRunsUnlocked(method: []const u8) bool {
     // mutex only; the `.normal` outer lockDaemon window cannot nest that work.
     return std.mem.eql(u8, method, "workspace.create") or std.mem.eql(u8, method, "workspace.close") or std.mem.eql(u8, method, "chat.subagent.open") or
         std.mem.eql(u8, method, directory_browser.METHOD) or
+        // Explorer listing/preview: a short store read, then filesystem and
+        // `git check-ignore` work with no lock held.
+        std.mem.eql(u8, method, workspace_files_protocol.METHOD_LIST) or
+        std.mem.eql(u8, method, workspace_files_protocol.METHOD_READ) or
         std.mem.startsWith(u8, method, "chat.links.") or std.mem.startsWith(u8, method, "chat.tasks.") or
         // Browser history is per-keystroke SQLite work under the store mutex
         // only; it pins in_flight and checks the drain flag itself.
@@ -15008,6 +15015,75 @@ fn workspaceFilesSearchResponse(daemon: *Daemon, id_value: std.json.Value, param
     });
 }
 
+/// `workspace.files.list` / `workspace.files.read`: the explorer tree and
+/// file preview. Roots come only from the stored workspace path and its
+/// `verde.toml` folders; the store is read under its own short window and all
+/// filesystem/git work runs with no lock held.
+fn workspaceFilesBrowseResponse(daemon: *Daemon, id_value: std.json.Value, method: []const u8, params: std.json.Value) ![]u8 {
+    const allocator = daemon.allocator;
+    const is_read = std.mem.eql(u8, method, workspace_files_protocol.METHOD_READ);
+    var arena_state: std.heap.ArenaAllocator = .init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Request = struct {
+        workspace_id: []const u8,
+        root: ?[]const u8 = null,
+        path: ?[]const u8 = null,
+        limit: ?u32 = null,
+        max_bytes: ?u64 = null,
+        max_image_bytes: ?u64 = null,
+    };
+    const request = std.json.parseFromValueLeaky(Request, arena, params, .{ .ignore_unknown_fields = true }) catch
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid workspace files request");
+    if (request.workspace_id.len == 0 or (is_read and (request.root == null or request.path == null)))
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "workspace files request is missing workspace_id, root or path");
+
+    lockDaemon(daemon);
+    const service = daemon.store_service;
+    if (service) |svc| _ = svc.in_flight.fetchAdd(1, .monotonic);
+    daemon.mutex.unlock();
+    const svc = service orelse return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_STORE_UNAVAILABLE, "store is unavailable");
+    defer _ = svc.in_flight.fetchSub(1, .monotonic);
+    const home = blk: {
+        lockStoreService(svc);
+        defer svc.mutex.unlock();
+        const row = (svc.store.conn.row("select path from workspaces where workspace_id = ?1", .{request.workspace_id}) catch
+            return try storeErrorResponse(allocator, id_value, error.StoreUnavailable)) orelse
+            return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_RESOURCE_NOT_FOUND, "workspace not found");
+        defer row.deinit();
+        break :blk try arena.dupe(u8, row.text(0));
+    };
+    if (!directory_browser.validPath(home))
+        return try errorResponseAlloc(allocator, id_value, workspace_files_protocol.ERR_ROOT_NOT_FOUND, "workspace folder is unavailable");
+
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const roots = try workspace_files.rootsFor(arena, io, home);
+    if (roots.len == 0) return try errorResponseAlloc(allocator, id_value, workspace_files_protocol.ERR_ROOT_NOT_FOUND, "workspace folder is unavailable");
+    const root_id = request.root orelse return try okValueResponse(allocator, id_value, workspace_files_protocol.ListResult{ .roots = roots });
+    if (is_read) {
+        const result = workspace_files.read(arena, io, roots, root_id, request.path.?, .{ .max_bytes = request.max_bytes, .max_image_bytes = request.max_image_bytes }) catch |err|
+            return try workspaceFilesErrorResponse(allocator, id_value, err);
+        return try okValueResponse(allocator, id_value, result);
+    }
+    const result = workspace_files.list(arena, io, roots, root_id, request.path orelse "", request.limit) catch |err|
+        return try workspaceFilesErrorResponse(allocator, id_value, err);
+    return try okValueResponse(allocator, id_value, result);
+}
+
+fn workspaceFilesErrorResponse(allocator: std.mem.Allocator, id_value: std.json.Value, err: anyerror) ![]u8 {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.InvalidPath => errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "path must be root-relative without parent traversal"),
+        error.RootNotFound => errorResponseAlloc(allocator, id_value, workspace_files_protocol.ERR_ROOT_NOT_FOUND, "workspace folder not found"),
+        error.FileNotFound => errorResponseAlloc(allocator, id_value, workspace_files_protocol.ERR_NOT_FOUND, "file or folder not found"),
+        error.NotDir => errorResponseAlloc(allocator, id_value, workspace_files_protocol.ERR_NOT_DIRECTORY, "path is not a folder"),
+        error.NotFile => errorResponseAlloc(allocator, id_value, workspace_files_protocol.ERR_NOT_FILE, "path is not a regular file"),
+        else => errorResponseAlloc(allocator, id_value, workspace_files_protocol.ERR_PATH_OUTSIDE_ROOTS, "path is outside the workspace folders or inaccessible"),
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Per-chat git change attribution and user-initiated commits.
 //
@@ -16622,6 +16698,80 @@ test "workspace file search resolves the stored route and returns relative paths
         try std.testing.expectEqual(@as(usize, 1), files.len);
         try std.testing.expectEqualStrings(case.expected.?, files[0].object.get("path").?.string);
         try std.testing.expectEqualStrings("search_needle.zig", files[0].object.get("file_name").?.string);
+    }
+}
+
+test "workspace files list and read stay beneath the stored workspace folder" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "home/src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "home/src/main.zig", .data = "const x = 1;\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "outside.txt", .data = "secret" });
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const temporary_root_len = try tmp.dir.realPath(io, &root_buffer);
+    const home = try std.fs.path.join(allocator, &.{ root_buffer[0..temporary_root_len], "home" });
+    defer allocator.free(home);
+
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    const service = try allocator.create(StoreService);
+    const store = daemon_store.Store.initWithRuntimeIdentity(allocator, db_path, .none, .{
+        .runtime_id = daemon.runtime_id,
+        .instance_id = daemon.instance_id,
+    }) catch |err| {
+        allocator.destroy(service);
+        return err;
+    };
+    service.* = .{ .store = store };
+    daemon.store_service = service;
+    defer detachTestStoreService(&daemon);
+    {
+        lockStoreService(service);
+        defer service.mutex.unlock();
+        _ = try service.store.upsertWorkspace(.{
+            .mutation = .{ .request_key = "files-workspace", .client_id = "files-test" },
+            .workspace = .{ .workspace_id = "files-workspace", .label = "Files", .path = home },
+        });
+    }
+
+    var arena_state: std.heap.ArenaAllocator = .init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Case = struct { method: []const u8, params: []const u8, error_code: ?[]const u8 = null, expect: ?[]const u8 = null };
+    const cases = [_]Case{
+        .{ .method = workspace_files_protocol.METHOD_LIST, .params = "{\"workspace_id\":\"files-workspace\"}", .expect = "home" },
+        .{ .method = workspace_files_protocol.METHOD_LIST, .params = "{\"workspace_id\":\"files-workspace\",\"root\":\"home\"}", .expect = "src" },
+        .{ .method = workspace_files_protocol.METHOD_READ, .params = "{\"workspace_id\":\"files-workspace\",\"root\":\"home\",\"path\":\"src/main.zig\"}", .expect = "const x = 1;\n" },
+        .{ .method = workspace_files_protocol.METHOD_READ, .params = "{\"workspace_id\":\"files-workspace\",\"root\":\"home\",\"path\":\"../outside.txt\"}", .error_code = headless.protocol.ERR_INVALID_PARAMS },
+        .{ .method = workspace_files_protocol.METHOD_READ, .params = try std.fmt.allocPrint(arena, "{{\"workspace_id\":\"files-workspace\",\"root\":\"home\",\"path\":\"{s}/src/main.zig\"}}", .{home}), .error_code = headless.protocol.ERR_INVALID_PARAMS },
+        .{ .method = workspace_files_protocol.METHOD_READ, .params = "{\"workspace_id\":\"files-workspace\",\"root\":\"home\",\"path\":\"missing\"}", .error_code = workspace_files_protocol.ERR_NOT_FOUND },
+        .{ .method = workspace_files_protocol.METHOD_LIST, .params = "{\"workspace_id\":\"files-workspace\",\"root\":\"other\"}", .error_code = workspace_files_protocol.ERR_ROOT_NOT_FOUND },
+        .{ .method = workspace_files_protocol.METHOD_READ, .params = "{\"workspace_id\":\"files-workspace\"}", .error_code = headless.protocol.ERR_INVALID_PARAMS },
+        .{ .method = workspace_files_protocol.METHOD_LIST, .params = "{\"workspace_id\":\"nope\"}", .error_code = headless.protocol.ERR_RESOURCE_NOT_FOUND },
+    };
+    for (cases) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.params, .{});
+        defer parsed.deinit();
+        const response = try workspaceFilesBrowseResponse(&daemon, .{ .integer = 1 }, case.method, parsed.value);
+        defer allocator.free(response);
+        const decoded = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+        defer decoded.deinit();
+        if (case.error_code) |code| {
+            try std.testing.expectEqualStrings(code, decoded.value.object.get("error").?.object.get("code").?.string);
+            continue;
+        }
+        const result = decoded.value.object.get("result").?.object;
+        if (std.mem.eql(u8, case.method, workspace_files_protocol.METHOD_READ)) {
+            try std.testing.expectEqualStrings(case.expect.?, result.get("content").?.string);
+        } else if (result.get("entries").?.array.items.len > 0) {
+            try std.testing.expectEqualStrings(case.expect.?, result.get("entries").?.array.items[0].object.get("name").?.string);
+        } else {
+            try std.testing.expectEqualStrings(case.expect.?, result.get("roots").?.array.items[0].object.get("name").?.string);
+        }
     }
 }
 

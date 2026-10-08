@@ -30,7 +30,7 @@ fn contains(root: []const u8, path: []const u8) bool {
         (root.len == 1 or path.len == root.len or path[root.len] == '/');
 }
 
-fn openRoot(io: std.Io, path: []const u8) !std.Io.Dir {
+pub fn openRoot(io: std.Io, path: []const u8) !std.Io.Dir {
     var dir = try std.Io.Dir.openDirAbsolute(io, "/", .{});
     errdefer dir.close(io);
     var parts = std.mem.tokenizeScalar(u8, path, '/');
