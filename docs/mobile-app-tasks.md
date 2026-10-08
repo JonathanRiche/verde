@@ -266,6 +266,13 @@ exact question and stop. Report: commit sha, files changed, verification output,
   by the NSE).
 - **Done when:** the Team ID is recorded here, and the Mac's Xcode shows the
   team.
+- **Status (2026-10-08): enrolled.** Team ID `38GQPVTPNT` (organization;
+  developer name "Riche Works"). Bundle IDs `dev.verdeai.app` and
+  `dev.verdeai.app.NotificationServiceExtension` are registered without
+  capabilities; Push, Associated Domains and App Groups wait for I-10 / I-03.
+  The App Store Connect record is "Verde: AI Coding Agents" (app ID
+  `6820652003`, SKU `verde-ios`); plain "Verde" and "Verde AI" were taken.
+  Signing in the Mac's Xcode is still open.
 
 #### H-05 · Firebase project + push keys
 - **depends:** H-03, H-04
