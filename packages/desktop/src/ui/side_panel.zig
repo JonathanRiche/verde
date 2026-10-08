@@ -1,7 +1,13 @@
 //! Right side panel of the workspace: one per tab, with a Browser view (the
-//! tab's docked browser) and an Agents view (linked chats of the tab's chat).
-//! State lives in `WorkspaceLayout.side_panels`; actions in
+//! tab's docked browser), an Agents view (linked chats of the tab's chat), a
+//! Changes view (uncommitted git changes) and a Files view (workspace file
+//! explorer). State lives in `WorkspaceLayout.side_panels`; actions in
 //! `state/side_panel_controller.zig`.
+//!
+//! This file owns the chrome (divider, resize grip, view tabs, actions) and
+//! routes body input to the selected view. Changes and Files implement the
+//! hook contract documented in `side_panel_changes.zig`. Clicking their body
+//! gives the panel keyboard focus until another surface takes it.
 
 const std = @import("std");
 const sdl = @import("zsdl3");
@@ -10,7 +16,12 @@ const runtime = @import("runtime.zig");
 const theme = @import("theme.zig");
 const browser_panel = @import("browser.zig");
 const chat_panel = @import("chat_panel.zig");
+const changes_view = @import("side_panel_changes.zig");
+const files_view = @import("side_panel_files.zig");
+const keybinds = @import("../app/keybinds.zig");
 const workspace_layout = @import("../state/workspace_layout.zig");
+
+const SidePanelView = workspace_layout.SidePanelView;
 
 const HEADER_H_UI: f32 = 36.0;
 const HEADER_PAD_X_UI: f32 = 10.0;
@@ -32,18 +43,37 @@ const EMPTY_BUTTON_H_UI: f32 = 34.0;
 
 const NF_COD_CLOSE = "\u{EA76}";
 const NF_COD_LINK_EXTERNAL = "\u{EB14}";
+const NF_COD_GLOBE = "\u{EB01}";
+const NF_COD_HUBOT = "\u{EB08}";
+const NF_COD_SOURCE_CONTROL = "\u{EA68}";
+const NF_COD_FILES = "\u{EAF0}";
 
-pub const HitKind = enum { view_browser, view_agents, pop_out, close, open_browser };
+/// View tabs in header order.
+const VIEW_TABS = [_]struct { view: SidePanelView, label: []const u8, glyph: []const u8 }{
+    .{ .view = .browser, .label = "Browser", .glyph = NF_COD_GLOBE },
+    .{ .view = .agents, .label = "Agents", .glyph = NF_COD_HUBOT },
+    .{ .view = .changes, .label = "Changes", .glyph = NF_COD_SOURCE_CONTROL },
+    .{ .view = .files, .label = "Files", .glyph = NF_COD_FILES },
+};
 
-const Hit = struct { rect: palette.Rect, kind: HitKind };
+pub const HitKind = enum { view_tab, pop_out, close, open_browser };
 
-var hits: [8]Hit = undefined;
+const Hit = struct { rect: palette.Rect, kind: HitKind, view: SidePanelView = .browser };
+
+var hits: [16]Hit = undefined;
 var hit_count: usize = 0;
 var panel_rect: ?palette.Rect = null;
 var grip_rect: palette.Rect = .{};
 var header_rect: palette.Rect = .{};
 var workspace_rect: palette.Rect = .{};
+var body_rect: palette.Rect = .{};
+var body_view: ?SidePanelView = null;
 var resizing: bool = false;
+/// The panel body owns the keyboard. Only honoured while no composer,
+/// terminal or browser has focus, so any surface taking focus wins.
+var body_focused: bool = false;
+/// A press began in a Changes/Files body; its motion and release follow it.
+var body_drag: bool = false;
 
 pub const Split = struct {
     content: palette.Rect,
@@ -58,9 +88,14 @@ pub fn split(state: *runtime.AppState, rect: palette.Rect) Split {
     const layout = &state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout;
     const min_panel = theme.scaledUi(MIN_PANEL_W_UI);
     const min_content = theme.scaledUi(MIN_CONTENT_W_UI);
-    if (rect.w < min_panel + min_content) return none;
+    // Narrow windows split evenly rather than hiding an open panel, so the
+    // toggle never looks dead; only truly tiny windows hide it.
+    if (rect.w < min_panel * 2.0) return none;
     const desired = rect.w * layout.side_panel_ratio;
-    const width = theme.clampf(desired, min_panel, rect.w - min_content);
+    const width = if (rect.w < min_panel + min_content)
+        rect.w * 0.5
+    else
+        theme.clampf(desired, min_panel, rect.w - min_content);
     // Snap the shared edge once so content and panel neither gap nor overlap.
     const edge = @round(rect.x + rect.w - width);
     return .{
@@ -72,6 +107,7 @@ pub fn split(state: *runtime.AppState, rect: palette.Rect) Split {
 pub fn resetHitCache() void {
     hit_count = 0;
     panel_rect = null;
+    body_view = null;
 }
 
 /// Renders the panel. Returns true when the browser view drew the live page
@@ -84,8 +120,10 @@ pub fn render(state: *runtime.AppState, workspace: palette.Rect, rect: palette.R
     const stroke = @max(@round(theme.scaledUi(1.0)), 1.0);
     queueRect(state, rect, paletteColor(theme.COLOR_PANEL));
     queueRect(state, .{ .x = rect.x, .y = rect.y, .w = stroke, .h = rect.h }, paletteColor(theme.borderMuted()));
+    // The grip sits on the panel side of the divider so it never steals
+    // the neighbouring pane's edge (its scrollbar lives there).
     grip_rect = .{
-        .x = rect.x - theme.scaledUi(RESIZE_GRIP_UI),
+        .x = rect.x - stroke,
         .y = rect.y,
         .w = theme.scaledUi(RESIZE_GRIP_UI) * 2.0,
         .h = rect.h,
@@ -102,9 +140,21 @@ pub fn render(state: *runtime.AppState, workspace: palette.Rect, rect: palette.R
         .w = rect.w - stroke,
         .h = @max(rect.h - header_h - stroke, 0.0),
     };
+    body_rect = body;
+    body_view = panel.view;
     switch (panel.view) {
         .agents => {
             chat_panel.renderLinkedChatsPanel(state, body, state.sidePanelChatPaneId());
+            return false;
+        },
+        .changes => {
+            changes_view.resetHitCache();
+            changes_view.render(state, body, bodyHasKeyboard(state));
+            return false;
+        },
+        .files => {
+            files_view.resetHitCache();
+            files_view.render(state, body, bodyHasKeyboard(state));
             return false;
         },
         .browser => {
@@ -122,21 +172,32 @@ pub fn render(state: *runtime.AppState, workspace: palette.Rect, rect: palette.R
     }
 }
 
-fn renderHeader(state: *runtime.AppState, rect: palette.Rect, view: workspace_layout.SidePanelView) void {
+fn renderHeader(state: *runtime.AppState, rect: palette.Rect, view: SidePanelView) void {
     const pad = theme.scaledUi(HEADER_PAD_X_UI);
     const font = theme.scaledUi(LABEL_FONT_UI);
+    const icon_font = theme.scaledUi(ICON_FONT_UI);
     const tab_h = theme.scaledUi(VIEW_TAB_H_UI);
     const tab_y = rect.y + (rect.h - tab_h) * 0.5;
-    var x = rect.x + pad;
-    const views = [_]struct { kind: HitKind, label: []const u8, view: workspace_layout.SidePanelView }{
-        .{ .kind = .view_browser, .label = "Browser", .view = .browser },
-        .{ .kind = .view_agents, .label = "Agents", .view = .agents },
-    };
+    const tab_pad = theme.scaledUi(VIEW_TAB_PAD_X_UI);
+    const gap = theme.scaledUi(VIEW_TAB_GAP_UI);
+    const dot = theme.scaledUi(BADGE_UI);
     const agents_active = if (state.sidePanelChatPaneId()) |pane_id| chat_panel.linkedChatsActiveForPane(state, pane_id) else false;
-    for (views) |entry| {
-        const label_w = runtime.paletteUiTextPrefixWidth(entry.label, font, entry.label.len);
-        const badge_w = if (entry.view == .agents and agents_active) theme.scaledUi(BADGE_UI) + theme.scaledUi(6.0) else 0.0;
-        const tab = snap(.{ .x = x, .y = tab_y, .w = label_w + badge_w + theme.scaledUi(VIEW_TAB_PAD_X_UI) * 2.0, .h = tab_h });
+
+    // Labels when they fit beside the actions, else icon-only tabs.
+    const actions_w = theme.scaledUi(ICON_BUTTON_UI) * 2.0 + theme.scaledUi(4.0) + pad;
+    var labels_w: f32 = 0.0;
+    for (VIEW_TABS) |entry| {
+        labels_w += runtime.paletteUiTextPrefixWidth(entry.label, font, entry.label.len) + tab_pad * 2.0 + gap;
+        if (entry.view == .agents and agents_active) labels_w += dot + theme.scaledUi(6.0);
+    }
+    const compact = pad + labels_w + actions_w > rect.w;
+
+    var x = rect.x + pad;
+    for (VIEW_TABS) |entry| {
+        const content_w = if (compact) icon_font else runtime.paletteUiTextPrefixWidth(entry.label, font, entry.label.len);
+        const badge_w = if (entry.view == .agents and agents_active) dot + theme.scaledUi(if (compact) 3.0 else 6.0) else 0.0;
+        const inner_pad = if (compact) theme.scaledUi(6.0) else tab_pad;
+        const tab = snap(.{ .x = x, .y = tab_y, .w = content_w + badge_w + inner_pad * 2.0, .h = tab_h });
         const selected = entry.view == view;
         const hovered = mouseIn(state, tab);
         if (selected or hovered) {
@@ -144,24 +205,32 @@ fn renderHeader(state: *runtime.AppState, rect: palette.Rect, view: workspace_la
             queueRounded(state, tab, paletteColor(fill), theme.scaledUi(VIEW_TAB_RADIUS_UI), rect);
         }
         const color = if (selected) theme.COLOR_WHITE else if (hovered) theme.raise(theme.COLOR_TEXT_MUTED, 0.12) else theme.COLOR_TEXT_MUTED;
-        const line_h = font * 1.25;
-        queueText(state, .{
-            .x = tab.x + theme.scaledUi(VIEW_TAB_PAD_X_UI),
-            .y = tab.y + (tab.h - line_h) * 0.5,
-            .w = label_w + theme.scaledUi(2.0),
-            .h = line_h,
-        }, entry.label, paletteColor(color), font, rect);
+        if (compact) {
+            queueIcon(state, .{
+                .x = tab.x + inner_pad,
+                .y = tab.y + (tab.h - icon_font) * 0.5,
+                .w = icon_font,
+                .h = icon_font,
+            }, entry.glyph, paletteColor(color), icon_font, rect);
+        } else {
+            const line_h = font * 1.25;
+            queueText(state, .{
+                .x = tab.x + inner_pad,
+                .y = tab.y + (tab.h - line_h) * 0.5,
+                .w = content_w + theme.scaledUi(2.0),
+                .h = line_h,
+            }, entry.label, paletteColor(color), font, rect);
+        }
         if (badge_w > 0.0) {
-            const dot = theme.scaledUi(BADGE_UI);
             queueRounded(state, .{
-                .x = tab.x + theme.scaledUi(VIEW_TAB_PAD_X_UI) + label_w + theme.scaledUi(6.0),
+                .x = tab.x + tab.w - inner_pad - dot,
                 .y = tab.y + (tab.h - dot) * 0.5,
                 .w = dot,
                 .h = dot,
             }, paletteColor(theme.COLOR_GREEN), dot * 0.5, rect);
         }
-        addHit(tab, entry.kind);
-        x = tab.x + tab.w + theme.scaledUi(VIEW_TAB_GAP_UI);
+        addHit(.{ .rect = tab, .kind = .view_tab, .view = entry.view });
+        x = tab.x + tab.w + gap;
     }
 
     // Actions hug the right edge: close, then "move to own tab".
@@ -169,12 +238,12 @@ fn renderHeader(state: *runtime.AppState, rect: palette.Rect, view: workspace_la
     var right = rect.x + rect.w - pad;
     const close_rect = snap(.{ .x = right - button, .y = rect.y + (rect.h - button) * 0.5, .w = button, .h = button });
     renderIconButton(state, close_rect, NF_COD_CLOSE, rect);
-    addHit(close_rect, .close);
+    addHit(.{ .rect = close_rect, .kind = .close });
     right = close_rect.x - theme.scaledUi(4.0);
     if (view == .browser and state.sidePanelBrowserPaneId() != null) {
         const pop_rect = snap(.{ .x = right - button, .y = close_rect.y, .w = button, .h = button });
         renderIconButton(state, pop_rect, NF_COD_LINK_EXTERNAL, rect);
-        addHit(pop_rect, .pop_out);
+        addHit(.{ .rect = pop_rect, .kind = .pop_out });
     }
 }
 
@@ -230,46 +299,178 @@ fn renderBrowserEmpty(state: *runtime.AppState, rect: palette.Rect) void {
         .w = label_w + theme.scaledUi(2.0),
         .h = line_h,
     }, label, paletteColor(theme.foregroundOn(fill)), body_font * 1.08, button);
-    addHit(button, .open_browser);
+    addHit(.{ .rect = button, .kind = .open_browser });
 }
 
-/// Clicks on panel chrome and the resize grip. The browser page and agent
-/// rows are routed by their own handlers.
-pub fn handleMouseButton(state: *runtime.AppState, x: f32, y: f32, down: bool) bool {
-    if (resizing and !down) {
-        resizing = false;
-        return true;
+/// Clicks on the panel: chrome and resize grip first, then the selected
+/// view's body. Browser page input routes through the browser's own handler
+/// below; every other body click is swallowed so it never reaches panes.
+pub fn handleMouseButton(state: *runtime.AppState, x: f32, y: f32, down: bool, clicks: u8) bool {
+    if (!down) {
+        if (resizing) {
+            resizing = false;
+            return true;
+        }
+        if (body_drag) {
+            body_drag = false;
+            _ = dispatchBodyMouseButton(state, x, y, false, clicks);
+            return true;
+        }
+        // A pane drag released over the panel still belongs to the panes.
+        return false;
     }
-    const rect = panel_rect orelse return false;
-    if (!down) return hitAt(x, y) != null;
+    const rect = panel_rect orelse {
+        body_focused = false;
+        return false;
+    };
+    if (!rectContains(rect, x, y) and !rectContains(grip_rect, x, y)) {
+        body_focused = false;
+        return false;
+    }
     if (rectContains(grip_rect, x, y)) {
         resizing = true;
         return true;
     }
     if (hitAt(x, y)) |hit| {
-        activate(state, hit.kind);
+        activate(state, hit);
         return true;
     }
-    // Header gaps are inert rather than falling through to panes.
-    return rectContains(header_rect, x, y) and rectContains(rect, x, y);
+    if (rectContains(header_rect, x, y)) return true;
+    const view = body_view orelse return true;
+    switch (view) {
+        .browser => {
+            body_focused = false;
+            return false;
+        },
+        .agents => {
+            body_focused = false;
+            _ = chat_panel.handleLinkedChatsMouseButton(state, x, y, true);
+            return true;
+        },
+        .changes, .files => {
+            focusBody(state);
+            body_drag = true;
+            _ = dispatchBodyMouseButton(state, x, y, true, clicks);
+            return true;
+        },
+    }
 }
 
-pub fn handleMouseMotion(state: *runtime.AppState, x: f32, _: f32) bool {
-    if (!resizing) return false;
-    const ratio = (workspace_rect.x + workspace_rect.w - x) / @max(workspace_rect.w, 1.0);
-    state.setSidePanelRatio(ratio);
+pub fn handleMouseMotion(state: *runtime.AppState, x: f32, y: f32) bool {
+    if (resizing) {
+        const ratio = (workspace_rect.x + workspace_rect.w - x) / @max(workspace_rect.w, 1.0);
+        state.setSidePanelRatio(ratio);
+        return true;
+    }
+    const view = body_view orelse return false;
+    if (!body_drag and !rectContains(body_rect, x, y)) return false;
+    return switch (view) {
+        .changes => changes_view.handleMouseMotion(state, x, y),
+        .files => files_view.handleMouseMotion(state, x, y),
+        .browser, .agents => false,
+    };
+}
+
+/// Wheel over a Changes/Files body scrolls that view and never the panes.
+pub fn handleWheel(state: *runtime.AppState, x: f32, y: f32, wheel_y: f32) bool {
+    const view = body_view orelse return false;
+    if (panel_rect == null or !rectContains(body_rect, x, y)) return false;
+    switch (view) {
+        .changes => _ = changes_view.handleWheel(state, x, y, wheel_y),
+        .files => _ = files_view.handleWheel(state, x, y, wheel_y),
+        .browser, .agents => return false,
+    }
     return true;
+}
+
+/// Keys while the panel body owns the keyboard. Escape hands focus back;
+/// the close-pane shortcut closes the panel instead of the focused pane.
+pub fn handleKeyDown(state: *runtime.AppState, event: *const sdl.KeyboardEvent, action: ?keybinds.NativeKeyboardAction) bool {
+    if (!bodyHasKeyboard(state)) return false;
+    const view = body_view orelse return false;
+    const handled = switch (view) {
+        .changes => changes_view.handleKey(state, event),
+        .files => files_view.handleKey(state, event),
+        .browser, .agents => false,
+    };
+    if (handled) return true;
+    if (event.key == .escape) {
+        body_focused = false;
+        state.markDirty();
+        return true;
+    }
+    if (action) |resolved| {
+        if (resolved == .workspace_close or resolved == .workspace_close_current) {
+            body_focused = false;
+            state.setSidePanelOpen(false);
+            return true;
+        }
+    }
+    return false;
+}
+
+pub fn handleTextInput(state: *runtime.AppState, text: []const u8) bool {
+    if (!bodyHasKeyboard(state)) return false;
+    const view = body_view orelse return false;
+    return switch (view) {
+        .changes => changes_view.handleTextInput(state, text),
+        .files => files_view.handleTextInput(state, text),
+        .browser, .agents => false,
+    };
+}
+
+/// Whether a text field in the focused panel body needs SDL text input.
+pub fn wantsTextInput(state: *runtime.AppState) bool {
+    if (!bodyHasKeyboard(state)) return false;
+    const view = body_view orelse return false;
+    return switch (view) {
+        .changes => changes_view.wantsTextInput(state),
+        .files => files_view.wantsTextInput(state),
+        .browser, .agents => false,
+    };
 }
 
 pub fn isResizing() bool {
     return resizing;
 }
 
-pub fn systemCursorAt(x: f32, y: f32) ?sdl.SystemCursor {
-    if (panel_rect == null) return null;
+pub fn systemCursorAt(state: *runtime.AppState, x: f32, y: f32) ?sdl.SystemCursor {
+    const rect = panel_rect orelse return null;
     if (resizing or rectContains(grip_rect, x, y)) return .ew_resize;
     if (hitAt(x, y) != null) return .pointer;
-    return null;
+    if (!rectContains(rect, x, y) or !rectContains(body_rect, x, y)) return null;
+    const view = body_view orelse return null;
+    return switch (view) {
+        .changes => changes_view.systemCursorAt(state, x, y),
+        .files => files_view.systemCursorAt(state, x, y),
+        .browser, .agents => null,
+    };
+}
+
+/// True while the panel body, not a pane, receives keyboard input.
+pub fn bodyHasKeyboard(state: *runtime.AppState) bool {
+    if (!body_focused or panel_rect == null) return false;
+    if (state.composer_controller.focused or state.terminal_controller.focused) return false;
+    if (state.browser_controller.address_focused or state.isBrowserPaneFocused()) return false;
+    return true;
+}
+
+fn focusBody(state: *runtime.AppState) void {
+    state.blurPaletteComposer();
+    state.terminal_controller.focused = false;
+    state.browser_controller.address_focused = false;
+    state.unfocusBrowserPane();
+    body_focused = true;
+    state.markDirty();
+}
+
+fn dispatchBodyMouseButton(state: *runtime.AppState, x: f32, y: f32, down: bool, clicks: u8) bool {
+    const view = body_view orelse return false;
+    return switch (view) {
+        .changes => changes_view.handleMouseButton(state, x, y, down, clicks),
+        .files => files_view.handleMouseButton(state, x, y, down, clicks),
+        .browser, .agents => false,
+    };
 }
 
 /// Whether the point lies on the panel, so pane routing can skip it.
@@ -278,10 +479,9 @@ pub fn containsPoint(x: f32, y: f32) bool {
     return rectContains(rect, x, y);
 }
 
-fn activate(state: *runtime.AppState, kind: HitKind) void {
-    switch (kind) {
-        .view_browser => state.setSidePanelView(.browser),
-        .view_agents => state.setSidePanelView(.agents),
+fn activate(state: *runtime.AppState, hit: Hit) void {
+    switch (hit.kind) {
+        .view_tab => state.setSidePanelView(hit.view),
         .close => state.setSidePanelOpen(false),
         .pop_out => if (state.sidePanelBrowserPaneId()) |pane_id| state.moveBrowserToOwnTab(pane_id),
         .open_browser => state.openSidePanelBrowser(),
@@ -297,9 +497,9 @@ fn hitAt(x: f32, y: f32) ?Hit {
     return null;
 }
 
-fn addHit(rect: palette.Rect, kind: HitKind) void {
+fn addHit(hit: Hit) void {
     if (hit_count >= hits.len) return;
-    hits[hit_count] = .{ .rect = rect, .kind = kind };
+    hits[hit_count] = hit;
     hit_count += 1;
 }
 

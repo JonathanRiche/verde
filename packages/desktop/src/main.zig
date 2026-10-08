@@ -25,6 +25,7 @@ const ui_layout = @import("ui/layout.zig");
 const workspace_panes_ui = @import("ui/workspace_panes.zig");
 const workspace_strip_ui = @import("ui/workspace_strip.zig");
 const side_panel_ui = @import("ui/side_panel.zig");
+const file_viewer_ui = @import("ui/file_viewer.zig");
 const sidebar_ui = @import("ui/sidebar.zig");
 const chat_panel_ui = @import("ui/chat_panel.zig");
 const browser_ui = @import("ui/browser.zig");
@@ -616,6 +617,8 @@ fn mainInner(init: std.process.Init) !void {
                 app_state.pollProviderReadiness();
                 app_state.pollCookieImport();
                 app_state.pollGitChanges();
+                // Files stage 2 defines this; guarded so the hook lands first.
+                if (@hasDecl(AppState, "pollFileViewer")) app_state.pollFileViewer();
                 app_state.pollUpdateCheck();
             }
         }.run, .{&state});
@@ -874,7 +877,7 @@ fn syncMouseCursor(state: *AppState, cache: *SystemCursorCache) void {
             applySystemCursor(cache, cursor);
             return;
         }
-        if (side_panel_ui.systemCursorAt(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y)) |cursor| {
+        if (side_panel_ui.systemCursorAt(state, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y)) |cursor| {
             applySystemCursor(cache, cursor);
             return;
         }
@@ -1988,6 +1991,16 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
+            // A focused side panel body (Changes / Files) owns navigation keys
+            // before pane bindings, so Ctrl+W closes the panel, not a pane.
+            if (side_panel_ui.handleKeyDown(state, &event.key, action)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            if (file_viewer_ui.handleKeyDown(state, &event.key)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
             if (keyboard.workspaceActiveSelectIndexForEvent(&event.key)) |active_ordinal| {
                 if (sidebar_ui.focusAttentionClusterRowAtIndex(state, active_ordinal)) {
                     syncWindowTextInput(window, state);
@@ -2250,6 +2263,14 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
+            if (side_panel_ui.handleTextInput(state, text_input)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            if (file_viewer_ui.handleTextInput(state, text_input)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
             if (state.routePaletteComposerTextInput(text_input)) {
                 syncWindowTextInput(window, state);
                 return true;
@@ -2432,7 +2453,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             }
             // Side panel chrome (view tabs, actions, resize grip) owns its hits;
             // the browser page and agent rows inside route below.
-            if (event.button.button == 1 and side_panel_ui.handleMouseButton(state, event.button.x, event.button.y, event.button.down)) {
+            if (event.button.button == 1 and side_panel_ui.handleMouseButton(state, event.button.x, event.button.y, event.button.down, event.button.clicks)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
@@ -2606,6 +2627,9 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             if (sidebar_ui.handlePaletteWheel(event.wheel.mouse_x, event.wheel.mouse_y, event.wheel.y)) {
                 return true;
             }
+            if (side_panel_ui.handleWheel(state, event.wheel.mouse_x, event.wheel.mouse_y, event.wheel.y)) {
+                return true;
+            }
             if (workspace_panes_ui.handlePaletteWheel(
                 state,
                 event.wheel.mouse_x,
@@ -2669,6 +2693,8 @@ fn syncWindowTextInput(window: *sdl.Window, state: *AppState) void {
         state.composer_controller.runtime_picker.isOpen() or
         state.browser_controller.address_focused or
         state.palette_modal_text_focus != .none or
+        side_panel_ui.wantsTextInput(state) or
+        file_viewer_ui.wantsTextInput(state) or
         (state.isBrowserPaneFocused() and !macosNativeBrowserShouldOwnKeyboard(state));
     if (!needs_sdl_text_input) {
         if (SDL_TextInputActive(window)) {

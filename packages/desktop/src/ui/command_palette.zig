@@ -113,6 +113,8 @@ const STATIC_COMMANDS = [_]Command{
     .{ .id = "pane.browser", .title = "Toggle Browser", .keywords = "web url preview side panel", .section = .panes, .keybind = .toggle_browser, .run = runToggleBrowser, .enabled = hasProjects },
     .{ .id = "pane.side_panel", .title = "Toggle Side Panel", .keywords = "right panel browser agents linked chats preview", .section = .panes, .run = runToggleSidePanel, .enabled = hasProjects },
     .{ .id = "pane.side_panel_agents", .title = "Show Linked Agents", .keywords = "side panel right linked chats subagents children", .section = .panes, .run = runShowSidePanelAgents, .enabled = hasProjects },
+    .{ .id = "pane.side_panel_changes", .title = "Show Changes", .keywords = "side panel right git diff uncommitted modified files review", .section = .panes, .run = runShowSidePanelChanges, .enabled = hasProjects },
+    .{ .id = "pane.side_panel_files", .title = "Show Files", .keywords = "side panel right file explorer tree browse workspace folders", .section = .panes, .run = runShowSidePanelFiles, .enabled = hasProjects },
     .{ .id = "browser.tab.new", .title = "Browser: New Tab", .keywords = "web page create", .section = .panes, .run = runNewBrowserTab, .enabled = hasBrowserPane },
     .{ .id = "browser.tab.duplicate", .title = "Browser: Duplicate Active Tab", .keywords = "web page copy", .section = .panes, .run = runDuplicateBrowserTab, .enabled = hasBrowserTab },
     .{ .id = "browser.tab.pin", .title = "Browser: Pin or Unpin Active Tab", .keywords = "web page keep", .section = .panes, .run = runToggleBrowserTabPinned, .enabled = hasBrowserTab },
@@ -1594,6 +1596,14 @@ fn runToggleSidePanel(state: *runtime.AppState) void {
 
 fn runShowSidePanelAgents(state: *runtime.AppState) void {
     state.setSidePanelView(.agents);
+}
+
+fn runShowSidePanelChanges(state: *runtime.AppState) void {
+    state.setSidePanelView(.changes);
+}
+
+fn runShowSidePanelFiles(state: *runtime.AppState) void {
+    state.setSidePanelView(.files);
 }
 
 fn runNewBrowserTab(state: *runtime.AppState) void {

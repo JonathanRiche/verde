@@ -68,6 +68,10 @@ pub const WorkspacePane = struct {
 pub const SidePanelView = enum {
     browser,
     agents,
+    /// Uncommitted git changes across the workspace's repositories.
+    changes,
+    /// File explorer over the workspace's folders.
+    files,
 };
 
 /// Per-tab side panel state. Absent entries mean closed on the browser view.
