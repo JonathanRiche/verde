@@ -614,7 +614,9 @@ pub fn toggleBrowser(self: anytype) void {
     if (layout.focused_pane_id) |focused| {
         if (layout.paneById(focused)) |pane| {
             if (pane.ref == .browser and pane.docked_tab_id == null) {
-                self.closeBrowser();
+                // Close the browser the user is looking at, which need not be
+                // the one bound to the live runtime.
+                _ = self.closeWorkspacePane(self.project_controller.selected_index, focused);
                 return;
             }
         }

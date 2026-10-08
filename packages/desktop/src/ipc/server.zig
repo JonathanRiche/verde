@@ -1450,7 +1450,13 @@ fn browserCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value
         if (index != state.project_controller.selected_index and !backgroundBrowserCommandAllowed(command)) {
             return try errorResponseAlloc(allocator, id_value, "rejected", "browser presentation commands require the selected workspace");
         }
-        const target_pane_id = try browserCommandTargetPane(state, index, params, std.mem.eql(u8, command, "open"));
+        const target_pane_id = browserCommandTargetPane(state, index, params, std.mem.eql(u8, command, "open")) catch |err| switch (err) {
+            error.BrowserThreadNotFound => return try errorResponseAlloc(allocator, id_value, "not_found", "thread_id is not a chat in this workspace"),
+            error.BrowserThreadHasNoBrowser => return try errorResponseAlloc(allocator, id_value, "rejected", "no browser is open in this thread's tab; call open_browser with thread_id first"),
+            error.BrowserPaneNotFound => return try errorResponseAlloc(allocator, id_value, "not_found", "pane_id is not a browser pane in this workspace"),
+            error.BrowserDisabled => return try errorResponseAlloc(allocator, id_value, "unsupported", "browser runtime is disabled"),
+            else => return err,
+        };
         var access = try browser_runtime_access.Scope(@TypeOf(state.browser_controller)).begin(state, index, target_pane_id);
         defer access.end(state);
         defer if (!std.mem.eql(u8, command, "status")) browser_state_controller.finishBackgroundBrowserAccess(state);
@@ -1467,8 +1473,10 @@ fn browserCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value
 
 /// Browser pane a command addresses. An explicit `pane_id` wins; `thread_id`
 /// picks the side-panel browser of the tab showing that chat, created for
-/// `open` so agents get a browser in their own tabspace. Otherwise the
-/// workspace's live browser, then its most recently used hidden one.
+/// `open` so agents get a browser in their own tabspace. A `thread_id` never
+/// falls back to another browser: an agent addressing its own tab must not
+/// drive the user's page. Without either, the workspace's live browser, then
+/// its most recently used hidden one.
 fn browserCommandTargetPane(state: *app_state.AppState, project_index: usize, params: std.json.Value, create: bool) !?u32 {
     const project = &state.project_controller.projects.items[project_index];
     const layout = &project.workspace_layout;
@@ -1476,16 +1484,27 @@ fn browserCommandTargetPane(state: *app_state.AppState, project_index: usize, pa
         if (layout.paneById(pane_id)) |pane| {
             if (pane.ref == .browser) return pane_id;
         }
+        return error.BrowserPaneNotFound;
     }
-    if (stringParam(params, "thread_id")) |thread_id| thread: {
+    if (stringParam(params, "thread_id")) |thread_id| {
         const thread_index = for (project.threads.items, 0..) |*thread, index| {
             if (std.mem.eql(u8, thread.local_thread_id, thread_id)) break index;
-        } else break :thread;
-        const chat_pane_id = layout.visibleChatPaneIdForThread(thread_index) orelse break :thread;
-        const tab_id = layout.scrollGroupIdForPane(chat_pane_id) orelse break :thread;
-        if (layout.dockedBrowserPaneId(tab_id)) |pane_id| return pane_id;
-        if (!create) break :thread;
-        const pane_id = try layout.ensureDockedBrowserPane(state.allocator, tab_id);
+        } else return error.BrowserThreadNotFound;
+        const tab_id = tab: {
+            const chat_pane_id = layout.visibleChatPaneIdForThread(thread_index) orelse break :tab null;
+            break :tab layout.scrollGroupIdForPane(chat_pane_id);
+        };
+        if (tab_id) |tab| {
+            if (layout.dockedBrowserPaneId(tab)) |pane_id| return pane_id;
+        }
+        if (!create) return error.BrowserThreadHasNoBrowser;
+        // A chat without a tab (closed pane) opens in the focused tab, as an
+        // open without thread_id would.
+        const tab = tab_id orelse return null;
+        // Fail before mutating the layout so a disabled runtime leaves no
+        // empty docked pane behind.
+        if (!state.browser_textures_enabled) return error.BrowserDisabled;
+        const pane_id = try layout.ensureDockedBrowserPane(state.allocator, tab);
         state.markDirty();
         return pane_id;
     }

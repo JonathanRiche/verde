@@ -1350,6 +1350,15 @@ pub fn closeWorkspacePane(self: anytype, project_index: usize, pane_id: Workspac
         },
     }
     self.clearHerdrClosedPaneMetadata(project_index, pane_id, removed_ref);
+    // Closing a tab's last pane takes its side-panel browser with it.
+    // Otherwise the orphan would surface as a stray pane, keep its page live,
+    // and be persisted (a closed last tab would then restore as a default chat).
+    while (layout.orphanDockedPaneId()) |orphan_id| {
+        var orphan_ref = layout.closePaneWithZoomScope(self.allocator, orphan_id, self.workspaceScrollingStripActive(layout)) orelse break;
+        deinitWorkspacePaneRef(&orphan_ref, self.allocator);
+        self.reconcileBrowserRuntimeAfterPaneRemoval(project_index, orphan_id);
+    }
+    _ = layout.pruneSidePanels();
     if (layout.root == null) {
         if (layout.firstVisiblePaneId()) |next_id| {
             layout.replaceRootWithLeaf(self.allocator, next_id) catch {

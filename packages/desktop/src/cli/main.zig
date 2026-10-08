@@ -4642,12 +4642,10 @@ fn mcpToolsList(allocator: std.mem.Allocator, out: output.Output, id_value: std.
     try writeMcpTypedTool(&s, "open_browser", "Open this workspace's embedded browser at a URL in the side panel of your tab, without taking the user's focus. Defaults to the workspace containing the agent; pass thread_id to target your own tab.", &.{
         .{ .name = "url", .type_name = "string", .description = "Optional URL to open." },
         .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, or path; defaults to the agent's workspace." },
-        .{ .name = "thread_id", .type_name = "string", .description = "Your Verde local thread id; targets the browser in your tab's side panel instead of whichever browser was used last." },
     });
     try writeMcpTypedTool(&s, "open_browser_tab", "Add a background tab inside this workspace's existing browser pane. Preserves the active page and desktop focus; the URL loads when the user selects the tab. Use this to share another page without replacing the current one. Returns tab_index; browser_status lists tabs.", &.{
         .{ .name = "url", .type_name = "string", .description = "URL for the new background browser tab.", .required = true },
         .{ .name = "workspace", .type_name = "string", .description = "Workspace containing the existing browser pane." },
-        .{ .name = "thread_id", .type_name = "string", .description = "Your Verde local thread id; targets the browser in your tab's side panel instead of whichever browser was used last." },
     });
     try writeMcpTypedTool(&s, "navigate_browser", "Navigate this workspace's open embedded browser to a URL.", &.{
         .{ .name = "url", .type_name = "string", .description = "URL to navigate to.", .required = true },
@@ -4963,6 +4961,13 @@ fn writeMcpTypedTool(s: *std.json.Stringify, name: []const u8, description: []co
         try s.endObject();
     }
     if (browser_arguments.fields(name) != null) {
+        try s.objectField("thread_id");
+        try s.beginObject();
+        try s.objectField("type");
+        try s.write("string");
+        try s.objectField("description");
+        try s.write("Your Verde local thread id. Addresses the browser in your tab's side panel instead of whichever browser the workspace used last; remembered for later browser calls in this session.");
+        try s.endObject();
         inline for (.{ "workspace_id", "project" }) |alias| {
             try s.objectField(alias);
             try s.beginObject();
@@ -5011,6 +5016,30 @@ fn mcpOpenChatCreationSettings(arguments: std.json.Value) error{
     };
 }
 
+/// Browser thread for the browser tool call in progress: the call's
+/// `thread_id`, else the last one this MCP session used for the same
+/// workspace. Read by every `browser.*` request the call issues.
+threadlocal var mcp_browser_call_thread_id: ?[]const u8 = null;
+var mcp_browser_sticky_thread: [128]u8 = undefined;
+var mcp_browser_sticky_thread_len: usize = 0;
+var mcp_browser_sticky_workspace: [256]u8 = undefined;
+var mcp_browser_sticky_workspace_len: usize = 0;
+
+fn mcpBrowserThreadForCall(arguments: std.json.Value, workspace: []const u8) ?[]const u8 {
+    if (browser_arguments.threadId(arguments)) |thread_id| {
+        if (thread_id.len <= mcp_browser_sticky_thread.len and workspace.len <= mcp_browser_sticky_workspace.len) {
+            @memcpy(mcp_browser_sticky_thread[0..thread_id.len], thread_id);
+            mcp_browser_sticky_thread_len = thread_id.len;
+            @memcpy(mcp_browser_sticky_workspace[0..workspace.len], workspace);
+            mcp_browser_sticky_workspace_len = workspace.len;
+        }
+        return thread_id;
+    }
+    if (mcp_browser_sticky_thread_len == 0) return null;
+    if (!std.mem.eql(u8, mcp_browser_sticky_workspace[0..mcp_browser_sticky_workspace_len], workspace)) return null;
+    return mcp_browser_sticky_thread[0..mcp_browser_sticky_thread_len];
+}
+
 fn mcpToolsCall(
     allocator: std.mem.Allocator,
     out: output.Output,
@@ -5032,6 +5061,11 @@ fn mcpToolsCall(
         }
     else
         mcpArgString(arguments, "workspace") orelse mcpArgString(arguments, "project") orelse default_workspace;
+    mcp_browser_call_thread_id = if (browser_arguments.fields(tool_name) != null)
+        mcpBrowserThreadForCall(arguments, workspace orelse "")
+    else
+        null;
+    defer mcp_browser_call_thread_id = null;
     const process_name = mcpArgString(arguments, "name");
     const coordination_owner: ?[]const u8 = mcpArgString(arguments, "owner") orelse default_owner;
     const session_id = mcpArgString(arguments, "session_id") orelse mcpArgString(arguments, "session");
@@ -5082,7 +5116,7 @@ fn mcpToolsCall(
         return try mcpToolLiveTextResult(allocator, out, id_value, response, tool_name);
     }
     if (std.mem.eql(u8, tool_name, "capture_browser_screenshot")) {
-        const response = sendLiveRequestAlloc(allocator, io, "browser.screenshot", .{ .workspace = workspace }, 1) catch |err|
+        const response = sendLiveRequestAlloc(allocator, io, "browser.screenshot", .{ .workspace = workspace, .thread_id = mcp_browser_call_thread_id }, 1) catch |err|
             return try mcpLiveCallError(allocator, out, id_value, tool_name, err);
         defer allocator.free(response);
         return try mcpToolLiveScreenshotResult(allocator, out, id_value, response, tool_name);
@@ -5116,6 +5150,7 @@ fn mcpToolsCall(
         const y = mcpArgF32(arguments, "y") orelse return try mcpError(allocator, out, id_value, -32602, "browser_pointer_input requires y");
         const response = sendLiveRequestAlloc(allocator, io, method, .{
             .workspace = workspace,
+            .thread_id = mcp_browser_call_thread_id,
             .x = x,
             .y = y,
             .button = mcpArgString(arguments, "button") orelse "left",
@@ -5522,14 +5557,14 @@ fn mcpToolsCall(
             }, 1);
         }
         if (std.mem.eql(u8, tool_name, "browser_status")) {
-            break :blk sendLiveRequestAlloc(allocator, io, "browser.status", .{ .workspace = workspace }, 1);
+            break :blk sendLiveRequestAlloc(allocator, io, "browser.status", .{ .workspace = workspace, .thread_id = mcp_browser_call_thread_id }, 1);
         }
         if (std.mem.eql(u8, tool_name, "open_browser")) {
             const target_url = mcpArgString(arguments, "url");
             const browser_response = try sendLiveRequestAlloc(allocator, io, "browser.open", .{
                 .workspace = workspace,
+                .thread_id = mcp_browser_call_thread_id,
                 .url = target_url,
-                .thread_id = mcpArgString(arguments, "thread_id"),
             }, 1);
             errdefer allocator.free(browser_response);
             if (target_url) |target| {
@@ -5544,14 +5579,15 @@ fn mcpToolsCall(
             const url = mcpArgString(arguments, "url") orelse return try mcpError(allocator, out, id_value, -32602, "open_browser_tab requires url");
             break :blk sendLiveRequestAlloc(allocator, io, "browser.tabOpen", .{
                 .workspace = workspace,
+                .thread_id = mcp_browser_call_thread_id,
                 .url = url,
-                .thread_id = mcpArgString(arguments, "thread_id"),
             }, 1);
         }
         if (std.mem.eql(u8, tool_name, "navigate_browser")) {
             const url = mcpArgString(arguments, "url") orelse return try mcpError(allocator, out, id_value, -32602, "navigate_browser requires url");
             const browser_response = try sendLiveRequestAlloc(allocator, io, "browser.navigate", .{
                 .workspace = workspace,
+                .thread_id = mcp_browser_call_thread_id,
                 .url = url,
             }, 1);
             errdefer allocator.free(browser_response);
@@ -5564,7 +5600,7 @@ fn mcpToolsCall(
             break :blk browser_response;
         }
         if (std.mem.eql(u8, tool_name, "restart_browser")) {
-            const browser_response = try sendLiveRequestAlloc(allocator, io, "browser.restart", .{ .workspace = workspace }, 1);
+            const browser_response = try sendLiveRequestAlloc(allocator, io, "browser.restart", .{ .workspace = workspace, .thread_id = mcp_browser_call_thread_id }, 1);
             errdefer allocator.free(browser_response);
             if (liveResponseOk(allocator, browser_response)) {
                 const deadline_ms = daemon_client.monotonicNowMs() +| @as(i64, @intCast(MCP_BROWSER_ACTION_TIMEOUT_MS));
@@ -5573,7 +5609,7 @@ fn mcpToolsCall(
             break :blk browser_response;
         }
         if (std.mem.eql(u8, tool_name, "reset_browser")) {
-            const browser_response = try sendLiveRequestAlloc(allocator, io, "browser.reset", .{ .workspace = workspace }, 1);
+            const browser_response = try sendLiveRequestAlloc(allocator, io, "browser.reset", .{ .workspace = workspace, .thread_id = mcp_browser_call_thread_id }, 1);
             errdefer allocator.free(browser_response);
             if (liveResponseOk(allocator, browser_response)) {
                 const deadline_ms = daemon_client.monotonicNowMs() +| @as(i64, @intCast(MCP_BROWSER_ACTION_TIMEOUT_MS));
@@ -6986,13 +7022,14 @@ fn mcpBrowserProbeNavigationReadiness(
 
     const accepted = try sendLiveRequestAlloc(allocator, io, "browser.eval", .{
         .workspace = workspace,
+        .thread_id = mcp_browser_call_thread_id,
         .script = script,
     }, 1);
     defer allocator.free(accepted);
     if (!liveResponseOk(allocator, accepted)) return .passthrough;
 
     while (confirmationRemainingMs(deadline_ms)) |remaining_ms| {
-        const status = try sendLiveRequestAlloc(allocator, io, "browser.status", .{ .workspace = workspace }, 1);
+        const status = try sendLiveRequestAlloc(allocator, io, "browser.status", .{ .workspace = workspace, .thread_id = mcp_browser_call_thread_id }, 1);
         defer allocator.free(status);
         if (!liveResponseOk(allocator, status)) return .passthrough;
         if (try mcpBrowserActionResultAlloc(allocator, status, nonce)) |response| {
@@ -7014,7 +7051,7 @@ fn mcpBrowserWaitForNavigation(
 ) !void {
     var stable_since_ms: ?i64 = null;
     while (true) {
-        const status = try sendLiveRequestAlloc(allocator, io, "browser.status", .{ .workspace = workspace }, 1);
+        const status = try sendLiveRequestAlloc(allocator, io, "browser.status", .{ .workspace = workspace, .thread_id = mcp_browser_call_thread_id }, 1);
         defer allocator.free(status);
         switch (mcpBrowserNavigationReadinessFromStatus(allocator, status, target_url, previous_url)) {
             .passthrough => return,
@@ -7065,7 +7102,7 @@ fn mcpBrowserWaitForLifecycle(
 ) !void {
     var stable_since_ms: ?i64 = null;
     while (confirmationRemainingMs(deadline_ms)) |remaining_ms| {
-        const status = try sendLiveRequestAlloc(allocator, io, "browser.status", .{ .workspace = workspace }, 1);
+        const status = try sendLiveRequestAlloc(allocator, io, "browser.status", .{ .workspace = workspace, .thread_id = mcp_browser_call_thread_id }, 1);
         defer allocator.free(status);
         switch (mcpBrowserReadinessFromStatus(allocator, status)) {
             .passthrough => return error.BrowserUnavailable,
@@ -7096,7 +7133,7 @@ fn mcpBrowserWaitUntilReady(
     deadline_ms: i64,
 ) !void {
     while (true) {
-        const status = try sendLiveRequestAlloc(allocator, io, "browser.status", .{ .workspace = workspace }, 1);
+        const status = try sendLiveRequestAlloc(allocator, io, "browser.status", .{ .workspace = workspace, .thread_id = mcp_browser_call_thread_id }, 1);
         defer allocator.free(status);
         switch (mcpBrowserReadinessFromStatus(allocator, status)) {
             .ready, .passthrough => return,
@@ -7133,13 +7170,13 @@ fn mcpBrowserEvalAndWaitAlloc(
     const poll_script = try mcpBrowserPollScriptForModeAlloc(allocator, nonce, mode);
     defer if (poll_script) |script| allocator.free(script);
 
-    const accepted = try sendLiveRequestAlloc(allocator, io, "browser.eval", .{ .workspace = workspace, .script = start_script }, 1);
+    const accepted = try sendLiveRequestAlloc(allocator, io, "browser.eval", .{ .workspace = workspace, .thread_id = mcp_browser_call_thread_id, .script = start_script }, 1);
     defer allocator.free(accepted);
     if (!liveResponseOk(allocator, accepted)) return try allocator.dupe(u8, accepted);
 
     // Synchronous actions can finish before the first poll. Capture that
     // result before a click-triggered navigation replaces the page context.
-    const initial_status = try sendLiveRequestAlloc(allocator, io, "browser.status", .{ .workspace = workspace }, 1);
+    const initial_status = try sendLiveRequestAlloc(allocator, io, "browser.status", .{ .workspace = workspace, .thread_id = mcp_browser_call_thread_id }, 1);
     defer allocator.free(initial_status);
     if (try mcpBrowserActionResultAlloc(allocator, initial_status, nonce)) |result| return result;
 
@@ -7150,11 +7187,11 @@ fn mcpBrowserEvalAndWaitAlloc(
         // The Live acknowledgement precedes JS execution. A missing state is
         // only evidence of context loss after this nonce was seen in the page.
         if (if (start_observed) poll_script else null) |script| {
-            const poll_accepted = try sendLiveRequestAlloc(allocator, io, "browser.eval", .{ .workspace = workspace, .script = script }, 1);
+            const poll_accepted = try sendLiveRequestAlloc(allocator, io, "browser.eval", .{ .workspace = workspace, .thread_id = mcp_browser_call_thread_id, .script = script }, 1);
             defer allocator.free(poll_accepted);
             if (!liveResponseOk(allocator, poll_accepted)) return try allocator.dupe(u8, poll_accepted);
         }
-        const status = try sendLiveRequestAlloc(allocator, io, "browser.status", .{ .workspace = workspace }, 1);
+        const status = try sendLiveRequestAlloc(allocator, io, "browser.status", .{ .workspace = workspace, .thread_id = mcp_browser_call_thread_id }, 1);
         defer allocator.free(status);
         if (try mcpBrowserActionResultAlloc(allocator, status, nonce)) |result| return result;
         start_observed = start_observed or mcpBrowserActionStarted(allocator, status, nonce);

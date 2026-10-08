@@ -1321,6 +1321,9 @@ fn paneRecencyMs(
 /// True for a rooted pane that is the first of its scroll group (tile).
 fn isOpenUnitHead(layout: *const native_state.WorkspaceLayout, pane_index: usize) bool {
     const pane = layout.panes.items[pane_index];
+    // Side-panel browsers belong to their tab, not the OPEN list; listing
+    // them would also let Ctrl+N/Ctrl+Tab focus a hidden page.
+    if (layout.isDockedPane(pane.id)) return false;
     const group_id = layout.scrollGroupIdForPane(pane.id) orelse return false;
     if (layout.scrollGroupPaneCount(group_id) <= 1) return true;
     if (layout.root == null) return false;

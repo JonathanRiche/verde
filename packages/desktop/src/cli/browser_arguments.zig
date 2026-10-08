@@ -21,6 +21,14 @@ pub fn fields(tool: []const u8) ?[]const []const u8 {
     return null;
 }
 
+/// Every browser tool also accepts `thread_id`, which addresses the browser in
+/// that chat's tab instead of whichever browser the workspace used last.
+pub fn threadId(arguments: std.json.Value) ?[]const u8 {
+    if (arguments != .object) return null;
+    const value = arguments.object.get("thread_id") orelse return null;
+    return if (value == .string) value.string else null;
+}
+
 /// Never fall back to desktop selection when an agent has no workspace context.
 pub fn workspace(arguments: std.json.Value, allowed: []const []const u8, default: ?[]const u8) ![]const u8 {
     if (arguments != .object and arguments != .null) return error.InvalidBrowserArguments;
@@ -34,6 +42,9 @@ pub fn workspace(arguments: std.json.Value, allowed: []const []const u8, default
                 if (value != .string or std.mem.trim(u8, value.string, &std.ascii.whitespace).len == 0) return error.InvalidBrowserWorkspace;
                 if (selected) |previous| if (!std.mem.eql(u8, previous, value.string)) return error.ConflictingBrowserWorkspaces;
                 selected = value.string;
+            } else if (std.mem.eql(u8, key, "thread_id")) {
+                const value = entry.value_ptr.*;
+                if (value != .string or std.mem.trim(u8, value.string, &std.ascii.whitespace).len == 0) return error.InvalidBrowserThread;
             } else {
                 var found = false;
                 for (allowed) |field| if (std.mem.eql(u8, key, field)) {
@@ -74,4 +85,14 @@ test "browser invalid explicit addressing never falls back" {
         defer parsed.deinit();
         try std.testing.expectError(case.expected, workspace(parsed.value, fields("evaluate_browser_js").?, "mirage"));
     }
+}
+
+test "browser tools accept thread_id addressing on every tool" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"thread_id\":\"chat-1\",\"script\":\"return 1\"}", .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("mirage", try workspace(parsed.value, fields("evaluate_browser_js").?, "mirage"));
+    try std.testing.expectEqualStrings("chat-1", threadId(parsed.value).?);
+    var blank = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"thread_id\":\" \"}", .{});
+    defer blank.deinit();
+    try std.testing.expectError(error.InvalidBrowserThread, workspace(blank.value, fields("browser_status").?, "mirage"));
 }

@@ -121,6 +121,10 @@ pub fn moveBrowserToOwnTab(self: anytype, pane_id: WorkspacePaneId) void {
 /// before it (else after it) that has no browser of its own.
 pub fn attachBrowserToTab(self: anytype, pane_id: WorkspacePaneId) void {
     const layout = selectedLayout(self) orelse return;
+    if (ownTabHasDockedBrowser(layout, pane_id)) {
+        self.setSidebarNotice("Close this tab's side panel browser before attaching it to another tab.");
+        return;
+    }
     const tab_id = attachTargetTabId(self.allocator, layout, pane_id) orelse {
         self.setSidebarNotice("No tab without a browser to attach to.");
         return;
@@ -151,7 +155,16 @@ pub fn attachBrowserToTab(self: anytype, pane_id: WorkspacePaneId) void {
 pub fn canAttachBrowserToTab(self: anytype, pane_id: WorkspacePaneId) bool {
     const layout = selectedLayout(self) orelse return false;
     if (layout.isDockedPane(pane_id)) return false;
+    if (ownTabHasDockedBrowser(layout, pane_id)) return false;
     return attachTargetTabId(self.allocator, layout, pane_id) != null;
+}
+
+/// A browser tab can carry its own side-panel browser. Attaching the tab
+/// elsewhere would leave that browser without a tab, and it would be pruned.
+fn ownTabHasDockedBrowser(layout: *const WorkspaceLayout, pane_id: WorkspacePaneId) bool {
+    const own_tab = workspace_tabs.tabIdForPane(layout, pane_id) orelse return false;
+    const docked = layout.dockedBrowserPaneId(own_tab) orelse return false;
+    return docked != pane_id;
 }
 
 fn attachTargetTabId(allocator: std.mem.Allocator, layout: *const WorkspaceLayout, pane_id: WorkspacePaneId) ?WorkspacePaneId {

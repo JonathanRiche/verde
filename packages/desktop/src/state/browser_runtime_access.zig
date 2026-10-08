@@ -9,6 +9,9 @@ pub fn Scope(comptime Controller: type) type {
     return struct {
         saved: ?Controller = null,
         borrowed_current: bool = false,
+        /// Pane the command addressed; used to re-retain a runtime that
+        /// came up live during the command.
+        target_pane_id: ?u32 = null,
 
         const Self = @This();
         const Runtime = @FieldType(Controller, "runtime");
@@ -22,6 +25,11 @@ pub fn Scope(comptime Controller: type) type {
                     (pane_id == null or controller.runtime_pane_id == null or controller.runtime_pane_id.? == pane_id.?)
             else
                 false;
+            // An agent driving the presented browser counts as use: idle
+            // eviction must not close a page it is working in.
+            if (owns_target and controller.presented_hidden_since_ms != null) {
+                controller.presented_hidden_since_ms = clock.unixTimestampMs();
+            }
             if (project_index == state.project_controller.selected_index and
                 (owns_target or (controller.runtime_project_index == null and pane_id == null))) return .{};
             const host_window = controller.runtime.controller.host_window;
@@ -49,12 +57,14 @@ pub fn Scope(comptime Controller: type) type {
                 }
             }
             temporary.runtime_project_index = project_index;
-            if (temporary.runtime_pane_id == null) temporary.runtime_pane_id = pane_id;
+            // Leave runtime_pane_id unset when no live runtime was found, so
+            // an open binds the pane and restores its saved URL and history
+            // rather than treating an empty runtime as the restored page.
             // A lazy runtime inherits host configuration without attaching or showing a surface.
             temporary.runtime.controller.host_window = host_window;
             const saved = controller.*;
             controller.* = temporary;
-            return .{ .saved = saved, .borrowed_current = borrowed_current };
+            return .{ .saved = saved, .borrowed_current = borrowed_current, .target_pane_id = pane_id };
         }
 
         pub fn end(self: *Self, state: anytype) void {
@@ -78,10 +88,16 @@ pub fn Scope(comptime Controller: type) type {
                 std.mem.swap(Runtime, &saved.runtime, &temporary.runtime);
                 saved.runtime_pane_id = temporary.runtime_pane_id;
                 saved.runtime_project_index = temporary.runtime_project_index;
-            } else if (temporary.runtime_project_index != null and temporary.runtime_pane_id != null) {
+            } else if (temporary.runtime_project_index != null and
+                (temporary.runtime_pane_id orelse self.target_pane_id) != null and
+                temporary.runtime.controller.hasBackend())
+            {
+                // Only live pages are retained. An empty runtime (e.g. status
+                // on an evicted pane) would otherwise count toward the cap
+                // and push out a real page.
                 saved.retained_runtimes.appendAssumeCapacity(.{
                     .project_index = temporary.runtime_project_index.?,
-                    .pane_id = temporary.runtime_pane_id.?,
+                    .pane_id = (temporary.runtime_pane_id orelse self.target_pane_id).?,
                     .runtime = temporary.runtime,
                     .retained_at_ms = clock.unixTimestampMs(),
                 });
