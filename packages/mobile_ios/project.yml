@@ -31,6 +31,9 @@ targets:
       path: Generated/App-Info.plist
       properties:
         CFBundleDisplayName: Verde
+        # XcodeGen otherwise writes a fixed 1.0 (1); CI overrides the build number per run.
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         # Only standard TLS/platform crypto (export-exempt); skips the per-build compliance prompt.
         ITSAppUsesNonExemptEncryption: false
         UIAppFonts: [cal_sans.ttf, jetbrains_mono.ttf, noto_sans_bold.ttf, noto_sans_regular.ttf]
@@ -75,6 +78,8 @@ targets:
       path: Generated/NotificationServiceExtension-Info.plist
       properties:
         CFBundleDisplayName: Verde
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         NSExtension:
           NSExtensionPointIdentifier: com.apple.usernotifications.service
           NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).NotificationService
