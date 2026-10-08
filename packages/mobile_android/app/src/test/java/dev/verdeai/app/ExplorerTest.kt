@@ -69,6 +69,11 @@ class ExplorerLogicTest {
         assertEquals(FileProblem.Unreadable, (readOutcome(view("image", "base64", "!!")) as FileViewState).problem)
         assertEquals(FileProblem.Binary, (readOutcome(view("binary")) as FileViewState).problem)
         assertEquals(FileProblem.TooLarge, (readOutcome(view("too_large")) as FileViewState).problem)
+        val cut = readOutcome(ExplorerFileView("ws", "home", "a", result = ExplorerReadResult("home", "a", size = 3uL * 1024uL * 1024uL,
+            kind = "text", encoding = "utf8", content = "head", truncated = true))) as PartialBytes
+        assertArrayEquals("head".encodeToByteArray(), cut.bytes)
+        assertEquals("Showing the first 512 KB of 3 MB", partialText(cut.partial))
+        assertEquals("Showing the first 512 KB", partialText(FilePartial(READ_TEXT_BYTES, 0)))
         // PDFs and documents, and hosts without the method, fall back to the /api/file fetch.
         assertNull(readOutcome(view("external")))
         assertNull(readOutcome(ExplorerFileView(supported = false)))

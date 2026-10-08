@@ -125,10 +125,12 @@ final class FileViewerModel: HighlightSource {
     private(set) var bytes: Data?
     /// False when `bytes` are a converted preview (office → PDF), not the original file.
     private(set) var original = false
+    /// Set when the host sent only the file's first bytes (shown as a banner; Download fetches the whole file).
+    private(set) var partial: FilePartial?
     private var host: CoreHost?
     private var highlights = RenderLRU<RenderResult<[RenderSpan]>>(32)
     @ObservationIgnored private var cachedSplit: FileSplit?
-    func clear() { bytes = nil; original = false; svg = nil; text = nil; blocks = nil; image = nil; pdf = nil; host = nil; highlights = RenderLRU(32); cachedSplit = nil }
+    func clear() { bytes = nil; original = false; partial = nil; svg = nil; text = nil; blocks = nil; image = nil; pdf = nil; host = nil; highlights = RenderLRU(32); cachedSplit = nil }
     /// `text` split into display lines once, for the line-selectable viewer.
     func split() -> FileSplit? {
         guard let text else { return nil }
@@ -145,9 +147,11 @@ final class FileViewerModel: HighlightSource {
         do {
             let kind = ViewerKind.of(path)
             var read: Data?
+            var cut: FilePartial?
             if let reader {
                 switch try await reader(host) {
                 case .bytes(let bytes): read = bytes
+                case .partial(let bytes, let partial): read = bytes; cut = partial
                 case .problem(let problem): throw problem
                 case nil: break
                 }
@@ -159,7 +163,7 @@ final class FileViewerModel: HighlightSource {
                 catch let failure as FileFetchFailure { throw FileProblem.of(failure.code, limit: kind.limit) }
             }
             try Task.checkCancellation()
-            bytes = data; original = kind != .office
+            bytes = data; original = kind != .office && cut == nil; partial = cut
             switch kind {
             case .pdf, .office:
                 guard let document = PDFDocument(data: data), document.pageCount > 0 else { throw FileProblem.unreadable }
@@ -265,6 +269,9 @@ struct FileViewer: View {
             else if let text = model.text { FileText(text: text, target: fileLineRange(text, line: citation.line, end: citation.end_line)) }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity).background(VerdeTheme.background)
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if let partial = model.partial, !model.loading, model.problem == nil { partialBanner(partial) }
+        }
         .navigationTitle((citation.path as NSString).lastPathComponent).navigationBarTitleDisplayMode(.inline)
         .toolbar {
             if !embedded { ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } } }
@@ -276,6 +283,19 @@ struct FileViewer: View {
                 }
             }
         }
+    }
+    /// One line above a cut file, with the toolbar's share/download for the whole file.
+    private func partialBanner(_ partial: FilePartial) -> some View {
+        HStack(spacing: 8) {
+            Text(partial.text).font(VerdeTheme.ui(13)).foregroundStyle(VerdeTheme.muted).lineLimit(1).truncationMode(.tail)
+            Spacer(minLength: 0)
+            if canDownload {
+                Button { export() } label: { if download != nil { ProgressView() } else { Text("Download") } }
+                    .font(VerdeTheme.ui(13, bold: true)).disabled(download != nil)
+            }
+        }
+        .padding(.horizontal, 12).padding(.vertical, 6).frame(minHeight: 36)
+        .background(VerdeTheme.alternate).accessibilityElement(children: .contain).accessibilityIdentifier("file-partial")
     }
     /// The cited lines (1-based), highlighted in the selectable viewer.
     private var citeLines: ClosedRange<Int>? {

@@ -54,6 +54,11 @@ final class ExplorerTests: XCTestCase {
         XCTAssertEqual(readOutcome(view("image", "base64", "!!")), .problem(.unreadable))
         XCTAssertEqual(readOutcome(view("binary")), .problem(.binary))
         XCTAssertEqual(readOutcome(view("too_large")), .problem(.of("too_large", limit: ViewerKind.text.limit)))
+        let cut = ExplorerFileView(workspace_id: "ws", root: "home", path: "a",
+                                   result: ExplorerReadResult(root: "home", path: "a", size: 3 * 1024 * 1024, kind: "text", encoding: "utf8", content: "head", truncated: true))
+        XCTAssertEqual(readOutcome(cut), .partial(Data("head".utf8), FilePartial(shown: FilePartial.readTextBytes, total: 3 * 1024 * 1024)))
+        XCTAssertEqual(FilePartial(shown: FilePartial.readTextBytes, total: 3 * 1024 * 1024).text, "Showing the first 512 KB of 3 MB")
+        XCTAssertEqual(FilePartial(shown: FilePartial.readTextBytes, total: 0).text, "Showing the first 512 KB")
         // PDFs and documents, and hosts without the method, fall back to the path fetch.
         XCTAssertNil(readOutcome(view("external")))
         XCTAssertNil(readOutcome(ExplorerFileView(supported: false)))
@@ -132,6 +137,21 @@ final class ExplorerTests: XCTestCase {
     }
 
     /// A fake core: projections answered from `views`, the prompt utility from `prompt`.
+    func testACutReadKeepsTheBannerAndDownloadRefetchesTheWholeFile() async {
+        let fake = ChatCore(SavedHost(id: "alpha", label: "Studio"), directory: "d09", thread: "approval-command")
+        let host = CoreHost(core: fake, store: CoreViewStore(), transport: NullTransport(), storage: MemoryStorage())
+        let model = FileViewerModel()
+        let partial = FilePartial(shown: FilePartial.readTextBytes, total: 3 * 1024 * 1024)
+        await model.load(host: host, path: "/w/big.txt") { _ in .partial(Data("one\ntwo\n".utf8), partial) }
+        XCTAssertEqual(model.text, "one\ntwo\n")
+        XCTAssertEqual(model.partial, partial)
+        // The shown bytes aren't the original file, so Download fetches it instead of sharing them.
+        XCTAssertFalse(model.original)
+        await model.load(host: host, path: "/w/small.txt") { _ in .bytes(Data("one".utf8)) }
+        XCTAssertNil(model.partial)
+        XCTAssertTrue(model.original)
+    }
+
     @MainActor private final class Fake {
         var events: [Event] = []
         var queries: [String] = []

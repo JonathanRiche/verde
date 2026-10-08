@@ -144,7 +144,12 @@ internal data class FileViewState(
     val content: FileContent? = null,
     val problem: FileProblem? = null,
     val retryable: Boolean = false,
+    /** Set when the host sent only the file's first bytes. */
+    val partial: FilePartial? = null,
 )
+
+/** A cut read: [shown] leading bytes of a [total]-byte file (0 when unknown). */
+internal data class FilePartial(val shown: Long, val total: Long)
 
 /** A rendered page source; implemented over [PdfRenderer], faked in tests. */
 internal interface PdfDocument : Closeable {
@@ -253,6 +258,8 @@ internal class FileViewerModel(
     val path: String?,
     private val decoders: FileDecoders = AndroidFileDecoders,
     private val waitMs: Long = WAIT_MS,
+    /** Alternate source (Files tab: `workspace.files.read`): bytes, a failed state, or null for the `/api/file` fetch. */
+    private val reader: (suspend (CoreHost) -> Any?)? = null,
 ) : ViewModel(), HighlightSource {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val mutableState = MutableStateFlow(FileViewState(loading = path != null,
@@ -260,8 +267,6 @@ internal class FileViewerModel(
     val state = mutableState.asStateFlow()
     val kind = path?.let(::viewerKind) ?: ViewerKind.Text
     val limit = viewerLimit(kind)
-    /** Alternate source (Files tab: `workspace.files.read`): bytes, a failed state, or null for the `/api/file` fetch. */
-    private val reader: (suspend (CoreHost) -> Any?)? = null,
     private var core: CoreHost? = null
     private var job: Job? = null
     private val highlights = RenderCache(32).highlight
@@ -349,8 +354,10 @@ internal class FileViewerModel(
     }
 
     private suspend fun fetch(host: CoreHost, target: String): FileViewState {
+        var partial: FilePartial? = null
         val bytes = when (val body = reader?.invoke(host) ?: fetchBytes(host, target, viewerFetchKind(target), limit)) {
             is ByteArray -> body
+            is PartialBytes -> body.bytes.also { partial = body.partial }
             else -> return body as FileViewState
         }
         val content = try { withContext(Dispatchers.Default) { decode(host, bytes) } }
@@ -358,7 +365,7 @@ internal class FileViewerModel(
             catch (_: PdfUnsupported) { return FileViewState(loading = false, problem = FileProblem.PdfNeedsNewerAndroid) }
             catch (_: OutOfMemoryError) { return FileViewState(loading = false, problem = FileProblem.TooLarge) }
             catch (_: Exception) { return FileViewState(loading = false, problem = FileProblem.Unreadable) }
-        return if (content is FileContent) FileViewState(loading = false, content = content)
+        return if (content is FileContent) FileViewState(loading = false, content = content, partial = partial)
             else FileViewState(loading = false, problem = content as FileProblem)
     }
 

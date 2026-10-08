@@ -48,6 +48,7 @@ import dev.verdeai.core.FileCitation
 internal const val FILE_LINE_TAG = "file-line"
 internal const val FILE_TARGET_TAG = "file-line-target"
 internal const val FILE_PROBLEM_TAG = "file-problem"
+internal const val FILE_PARTIAL_TAG = "file-partial"
 internal const val FILE_MARKDOWN_TAG = "file-markdown"
 internal const val FILE_IMAGE_TAG = "file-image"
 internal const val FILE_PDF_TAG = "file-pdf"
@@ -113,12 +114,17 @@ internal fun FileViewerScreen(
         val content = state.content
         val problem = state.problem
         when {
-            content != null -> when (content) {
-                is FileContent.Text -> TextFile(content, target)
-                is FileContent.Markdown -> if (formatted) MarkdownFile(content, model, onCitation) else TextFile(content.source, target)
-                is FileContent.Image -> ImageFile(content.bitmap)
-                is FileContent.Svg -> if (formatted) SvgFile(content.base64) else TextFile(content.source, target)
-                is FileContent.Pdf -> PdfFile(content.document)
+            content != null -> Column(Modifier.fillMaxSize()) {
+                state.partial?.let { PartialBanner(it, if (model.path != null) download else null, saving) }
+                Box(Modifier.weight(1f).fillMaxWidth()) {
+                    when (content) {
+                        is FileContent.Text -> TextFile(content, target)
+                        is FileContent.Markdown -> if (formatted) MarkdownFile(content, model, onCitation) else TextFile(content.source, target)
+                        is FileContent.Image -> ImageFile(content.bitmap)
+                        is FileContent.Svg -> if (formatted) SvgFile(content.base64) else TextFile(content.source, target)
+                        is FileContent.Pdf -> PdfFile(content.document)
+                    }
+                }
             }
             problem != null -> ProblemState(problem, model.limit, if (state.retryable) model::retry else null,
                 if (model.path != null && problem in DOWNLOADABLE_PROBLEMS) download else null, saving)
@@ -212,6 +218,20 @@ internal fun downloadFailureText(problem: FileProblem): String = when (problem) 
     else -> "Couldn't download the file"
 }
 
+internal fun partialText(partial: FilePartial): String =
+    "Showing the first ${sizeLabel(partial.shown)}" + if (partial.total > partial.shown) " of ${sizeLabel(partial.total)}" else ""
+
+/** One line above a cut file, with the toolbar's Download for the whole file. */
+@Composable
+private fun PartialBanner(partial: FilePartial, onDownload: (() -> Unit)?, saving: Boolean) {
+    Row(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surfaceVariant).heightIn(min = 40.dp)
+        .padding(start = 12.dp, end = 4.dp).testTag(FILE_PARTIAL_TAG), verticalAlignment = Alignment.CenterVertically) {
+        Text(partialText(partial), Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, maxLines = 1,
+            overflow = TextOverflow.Ellipsis, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        if (onDownload != null) TextButton(onClick = onDownload, enabled = !saving) { Text("Download") }
+    }
+}
+
 @Composable
 private fun ProblemState(problem: FileProblem, limit: Long, onRetry: (() -> Unit)?, onDownload: (() -> Unit)?, saving: Boolean) {
     val (title, detail) = problemText(problem, limit)
@@ -247,6 +267,7 @@ private fun TextFile(content: FileContent.Text, target: LineTarget?) {
         items(count, key = { it }) { index ->
             val number = index + 1
             val hit = target != null && number in target
+            val picked = selection?.contains(number) == true
             val text = remember(full, index) {
                 val start = content.lineStarts[index]
                 full.subSequence(start, lineEnd(content.text, content.lineStarts, index))
@@ -260,7 +281,6 @@ private fun TextFile(content: FileContent.Text, target: LineTarget?) {
         }
     }
 }
-            val picked = selection?.contains(number) == true
 
 private fun AnnotatedString.ifEmpty(other: () -> AnnotatedString) = if (isEmpty()) other() else this
 

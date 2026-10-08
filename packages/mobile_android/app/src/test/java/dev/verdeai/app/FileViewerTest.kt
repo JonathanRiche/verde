@@ -114,6 +114,24 @@ class FileViewerTest {
         assertEquals(300, (model.state.value.content as FileContent.Text).lineStarts.size)
     }
 
+    @Test fun aCutWorkspaceReadShowsAOneLineBannerWithDownload() {
+        start()
+        compose.runOnUiThread {
+            val model=ViewModelProvider(models, object : ViewModelProvider.Factory {
+                @Suppress("UNCHECKED_CAST")
+                override fun <T : ViewModel> create(modelClass: Class<T>): T = FileViewerModel(hosts, "alpha", "/home/u/big.txt", FakeDecoders,
+                    reader = { PartialBytes("line one\nline two\n".encodeToByteArray(), FilePartial(READ_TEXT_BYTES, 3L * 1024 * 1024)) }) as T
+            })["file-cut", FileViewerModel::class.java]
+            current=model to null
+        }
+        await { tagged(FILE_PARTIAL_TAG).isNotEmpty() }
+        assertTrue(exists("Showing the first 512 KB of 3 MB"))
+        assertTrue(exists("line two"))
+        assertTrue(exists("Download"))
+        // The body came from the workspace read; nothing went through /api/file.
+        assertTrue(core.events.filterIsInstance<EventFileOpen>().isEmpty())
+    }
+
     @Test fun failuresShowClearStatesAndRetrySpendsANewIntent() {
         start()
         val cases=listOf(

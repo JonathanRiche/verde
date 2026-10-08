@@ -88,7 +88,19 @@ extension ExplorerRoot {
 /// What the viewer shows for a Files-tab read: the file's bytes or a problem.
 enum WorkspaceReadOutcome: Equatable {
     case bytes(Data)
+    /// The leading bytes of a file the host cut at its read cap.
+    case partial(Data, FilePartial)
     case problem(FileProblem)
+}
+
+/// A cut read: `shown` leading bytes of a `total`-byte file (0 when unknown).
+struct FilePartial: Equatable {
+    /// The host's `workspace.files.read` text cap (client_core `READ_TEXT_BYTES`).
+    static let readTextBytes: UInt64 = 512 * 1024
+    let shown: UInt64
+    let total: UInt64
+    var text: String { "Showing the first \(Self.label(shown))" + (total > shown ? " of \(Self.label(total))" : "") }
+    static func label(_ bytes: UInt64) -> String { bytes >= 1024 * 1024 ? "\(bytes / (1024 * 1024)) MB" : "\(bytes / 1024) KB" }
 }
 
 /// Viewer outcome of a failed `workspace_file_read`; nil falls back to the `/api/file` fetch (older hosts).
@@ -111,11 +123,12 @@ func readOutcome(_ view: ExplorerFileView, limit: UInt32 = ViewerKind.text.limit
     guard let result = view.result else { return .problem(.failed) }
     switch result.kind {
     case "text", "markdown", "image":
+        let data: Data
         if result.encoding == "base64" {
-            guard let data = Data(base64Encoded: result.content) else { return .problem(.unreadable) }
-            return .bytes(data)
-        }
-        return .bytes(Data(result.content.utf8))
+            guard let decoded = Data(base64Encoded: result.content) else { return .problem(.unreadable) }
+            data = decoded
+        } else { data = Data(result.content.utf8) }
+        return result.truncated ? .partial(data, FilePartial(shown: FilePartial.readTextBytes, total: result.size)) : .bytes(data)
     case "binary": return .problem(.binary)
     case "too_large": return .problem(.of("too_large", limit: limit))
     default: return nil

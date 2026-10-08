@@ -108,8 +108,14 @@ internal fun readFailure(code: String?, retryable: Boolean): Any? = when (code) 
     else -> readProblem(FileProblem.Failed, retryable = true)
 }
 
+/** The host's `workspace.files.read` text cap (client_core `READ_TEXT_BYTES`). */
+internal const val READ_TEXT_BYTES = 512L * 1024
+
+/** The leading bytes of a file the host cut at its read cap; the viewer says so above the content. */
+internal class PartialBytes(val bytes: ByteArray, val partial: FilePartial)
+
 /**
- * Viewer outcome of a finished `workspace_file` view: the file's bytes, a [FileViewState] problem,
+ * Viewer outcome of a finished `workspace_file` view: the file's bytes ([PartialBytes] when cut), a [FileViewState] problem,
  * or null to fetch through `/api/file` (`external` kinds such as PDFs, and older hosts).
  */
 internal fun readOutcome(view: ExplorerFileView): Any? {
@@ -120,7 +126,7 @@ internal fun readOutcome(view: ExplorerFileView): Any? {
         "text", "markdown", "image" -> when (result.encoding) {
             "base64" -> try { java.util.Base64.getDecoder().decode(result.content) } catch (_: IllegalArgumentException) { readProblem(FileProblem.Unreadable) }
             else -> result.content.encodeToByteArray()
-        }
+        }.let { if (it is ByteArray && result.truncated) PartialBytes(it, FilePartial(READ_TEXT_BYTES, result.size.toLong())) else it }
         "binary" -> readProblem(FileProblem.Binary)
         "too_large" -> readProblem(FileProblem.TooLarge)
         else -> null
