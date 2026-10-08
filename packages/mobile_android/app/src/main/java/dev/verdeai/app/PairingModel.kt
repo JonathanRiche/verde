@@ -20,6 +20,15 @@ class VerdeApplication : Application() {
     internal val signals: AppSignals by lazy { AndroidAppSignals(this) }
     /** Process-scoped so rotation and Activity recreation never relock; gates UI only. */
     internal val appLock by lazy { AppLockModel(secureStore, signals.foreground, { deviceSecure(this) }) }
+    /** D-14 push; Firebase is initialized here only when this build has its config. */
+    internal val push by lazy { PushCenter(this, secureStore) }
+
+    override fun onCreate() {
+        super.onCreate()
+        // Channels and FirebaseApp must exist before FCM delivers into VerdeMessagingService.
+        PushChannels.create(this)
+        initFirebase(this, PushBuild.current.firebase)
+    }
 }
 
 internal data class PairingState(

@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Status-bar icon: the system uses only the alpha channel of the logo. -->
+<bitmap xmlns:android="http://schemas.android.com/apk/res/android"
+    android:src="@drawable/verde_logo" android:gravity="fill" android:tint="#FFFFFFFF" />

@@ -56,11 +56,21 @@ jobs:
           VERDE_VERSION_CODE: ${{ github.run_number }}
           VERDE_UPLOAD_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_PASSWORD }}
           KEYSTORE_BASE64: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_BASE64 }}
+          # D-14 push, both optional: without them the build ships with notifications unavailable.
+          GOOGLE_SERVICES_JSON_BASE64: ${{ secrets.GOOGLE_SERVICES_JSON_BASE64 }}
+          VERDE_PUSH_RELAY_URL: ${{ vars.VERDE_PUSH_RELAY_URL }}
         run: |
           export VERDE_UPLOAD_KEYSTORE="$RUNNER_TEMP/upload.jks"
+          trap 'rm -f "$VERDE_UPLOAD_KEYSTORE" "$RUNNER_TEMP/google-services.json"' EXIT
           echo "$KEYSTORE_BASE64" | base64 --decode > "$VERDE_UPLOAD_KEYSTORE"
+          if [ -n "$GOOGLE_SERVICES_JSON_BASE64" ]; then
+            # Outside the workspace; Gradle reads only the four FirebaseOptions fields from it.
+            export VERDE_GOOGLE_SERVICES_JSON="$RUNNER_TEMP/google-services.json"
+            echo "$GOOGLE_SERVICES_JSON_BASE64" | base64 --decode > "$VERDE_GOOGLE_SERVICES_JSON"
+          else
+            echo "GOOGLE_SERVICES_JSON_BASE64 is not set; building without push notifications."
+          fi
           ./gradlew --no-daemon --console=plain bundleRelease
-          rm -f "$VERDE_UPLOAD_KEYSTORE"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

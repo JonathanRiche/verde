@@ -5,6 +5,7 @@ compose-bom = "2025.04.01"
 activity = "1.10.1"
 junit = "4.13.2"
 robolectric = "4.14.1"
+firebase-bom = "34.19.0"
 
 [libraries]
 camera-camera2 = { module = "androidx.camera:camera-camera2", version = "1.4.2" }
@@ -25,6 +26,8 @@ compose-material3 = { module = "androidx.compose.material3:material3" }
 compose-ui-test-junit4 = { module = "androidx.compose.ui:ui-test-junit4" }
 compose-ui-test-manifest = { module = "androidx.compose.ui:ui-test-manifest" }
 activity-compose = { module = "androidx.activity:activity-compose", version.ref = "activity" }
+firebase-bom = { module = "com.google.firebase:firebase-bom", version.ref = "firebase-bom" }
+firebase-messaging = { module = "com.google.firebase:firebase-messaging" }
 junit = { module = "junit:junit", version.ref = "junit" }
 robolectric = { module = "org.robolectric:robolectric", version.ref = "robolectric" }
 

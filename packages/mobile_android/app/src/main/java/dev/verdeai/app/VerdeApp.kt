@@ -60,12 +60,13 @@ private val TABS = listOf(Routes.HOME, Routes.WORKSPACES, Routes.HOSTS)
 /** App shell: workspace drawer over one NavHost. Every browse screen reads only the selected host's core. */
 @Composable
 internal fun VerdeApp(hosts: HostsModel, browse: BrowseModel, clock: UiClock = remember { UiClock() },
-    lock: AppLockControls? = null) {
+    lock: AppLockControls? = null, push: PushControls? = null) {
     val hostsState by hosts.state.collectAsState()
     val gitBinding: GitChangesBinding = viewModel(factory = viewModelFactory { initializer { GitChangesBinding(hosts, browse.state) } })
     val gitClient by gitBinding.client.collectAsState()
     VerdeTheme {
-        CompositionLocalProvider(LocalUiClock provides clock, LocalAppLockControls provides lock, LocalGitChangesClient provides gitClient) {
+        CompositionLocalProvider(LocalUiClock provides clock, LocalAppLockControls provides lock, LocalGitChangesClient provides gitClient,
+            LocalPushControls provides push) {
             val app = @Composable { if (hostsState.loading) HostsScreen(hosts) else Shell(hosts, browse, hostsState) }
             if (lock != null) AppLockGate(lock.model, lock.auth, app) else app()
         }
@@ -101,6 +102,18 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
                     entry?.arguments?.getString("ws") == thread.workspace_id) open(Routes.HOME, tab = true)
             })
         }
+    }
+    // D-14: a notification opens its thread once its host is the selected one.
+    LocalPushControls.current?.let { push ->
+        val link by push.links.collectAsState()
+        LaunchedEffect(link, hostsState.active) {
+            val target = link ?: return@LaunchedEffect
+            if (target.hostId != hostsState.active) return@LaunchedEffect
+            push.consumeLink(target)
+            nav.navigate(Routes.thread(target.workspaceId, target.threadId)) { launchSingleTop = true }
+            drawer.close()
+        }
+        PushOptInPrompt(hostsState)
     }
     // Sidebar scope: null is All Workspaces. It filters the drawer only and resets per host.
     var workspaceScope by rememberSaveable(browseState.hostId) { mutableStateOf<String?>(null) }
