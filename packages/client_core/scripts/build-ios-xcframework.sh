@@ -26,11 +26,7 @@ for slice in device simulator; do
     archive="$prefix/lib/ios/$slice/libverde_client.a"
     objects="$staging/$slice/objects"
     mkdir -p "$objects"
-    if [[ -n $(xcrun ar t "$archive" | sort | uniq -d) ]]; then
-        echo "duplicate member names in $archive; extraction would drop objects" >&2
-        exit 1
-    fi
-    (cd "$objects" && xcrun ar x "$archive")
+    python3 scripts/extract-archive-members.py "$archive" "$objects"
     xcrun libtool -static -no_warning_for_no_symbols \
         -o "$staging/$slice/libverde_client.a" "$objects"/*
 done
