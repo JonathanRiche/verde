@@ -40,7 +40,7 @@ android {
             create("upload") {
                 storeFile = file(uploadKeystore)
                 storePassword = providers.environmentVariable("VERDE_UPLOAD_KEYSTORE_PASSWORD").get()
-                keyAlias = "upload"
+                keyAlias = "verde-upload"
                 keyPassword = storePassword
             }
         }
