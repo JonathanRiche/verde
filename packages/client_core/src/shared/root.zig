@@ -8,6 +8,7 @@ pub const profile = @import("profile.zig");
 pub const pair_client = @import("pair_client.zig");
 pub const threads = @import("threads.zig");
 pub const slash_commands = @import("slash_commands.zig");
+pub const selection_prompt = @import("selection_prompt.zig");
 
 test {
     _ = connection;
@@ -18,4 +19,5 @@ test {
     _ = pair_client;
     _ = threads;
     _ = slash_commands;
+    _ = selection_prompt;
 }

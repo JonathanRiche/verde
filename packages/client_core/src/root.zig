@@ -182,7 +182,7 @@ test {
     _ = @import("model_contract_test.zig");
     _ = @import("auth_harness.zig");
     _ = @import("attention_test.zig");
-    _ = @import("selection_prompt.zig");
+    _ = @import("verde_remote").selection_prompt;
 }
 
 // Upstream parser diagnostics can include escape payloads. Never log them.

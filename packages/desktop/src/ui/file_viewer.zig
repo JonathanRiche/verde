@@ -11,17 +11,18 @@
 //!
 //! Line selection: press or drag on line numbers (Shift extends, Shift+Up/Down
 //! from the keyboard); Ctrl+C copies the selected source lines, Ctrl+A selects
-//! all, Escape clears.
+//! all, Escape clears. An "Ask agent" chip beside the selection (or Enter)
+//! opens `agent_prompt_popover` for those lines.
 //!
 //! Hook contract with `main.zig` (pointer input arrives through
 //! `workspace_panes.zig`, which owns pane geometry and calls `beginFrame`,
 //! `renderPane`, `handleMouseDown/Up/Motion`, `handleWheel`, `systemCursorAt`):
 //! - `handleKeyDown` runs for every key-down before pane-level bindings and
-//!   app shortcuts. It consumes keys only while a file pane is focused (or
-//!   its agent prompt popover is open); return false lets the app see them.
-//! - `handleTextInput` receives SDL text input; true when the popover's
-//!   instruction field consumed it.
-//! - `wantsTextInput` keeps SDL text input on while that field is focused.
+//!   app shortcuts. It consumes keys only while a file pane is focused;
+//!   return false lets the app see them.
+//! - `handleTextInput` / `wantsTextInput` forward to the ask-agent popover,
+//!   as do the key and pointer handlers while it is open: a fallback until
+//!   (and harmless after) `main.zig` routes the popover directly.
 
 const std = @import("std");
 const sdl = @import("zsdl3");
@@ -35,6 +36,7 @@ const zig_dif = @import("zig_dif");
 const platform_runtime = @import("platform_runtime");
 const viewer = @import("../state/file_viewer_controller.zig");
 const side_panel = @import("side_panel.zig");
+const agent_prompt_popover = @import("agent_prompt_popover.zig");
 
 const Document = viewer.Document;
 const WorkspacePaneId = runtime.WorkspacePaneId;
@@ -65,8 +67,11 @@ const BUTTON_HEIGHT_CSS: f32 = 30.0;
 const NF_COD_CLOSE = "\u{EA76}";
 const NF_COD_REFRESH = "\u{EB37}";
 const NF_COD_LINK_EXTERNAL = "\u{EB14}";
+const NF_COD_HUBOT = "\u{EB08}";
+const ASK_CHIP_H_CSS: f32 = 26.0;
+const ASK_CHIP_FONT_CSS: f32 = 12.5;
 
-const Action = enum { close, reload, open_external, retry };
+const Action = enum { close, reload, open_external, retry, ask_agent };
 
 const ButtonHit = struct {
     action: Action,
@@ -86,7 +91,9 @@ const PaneGeometry = struct {
     max_scroll_y: f32 = 0.0,
     max_scroll_x: f32 = 0.0,
     char_w: f32 = 1.0,
-    buttons: [6]ButtonHit = undefined,
+    buttons: [8]ButtonHit = undefined,
+    /// "Ask agent" chip next to the line selection, when drawn.
+    ask_rect: ?palette.Rect = null,
     button_count: usize = 0,
 
     fn addButton(self: *PaneGeometry, action: Action, rect: palette.Rect) void {
@@ -360,6 +367,61 @@ fn renderText(state: *runtime.AppState, doc: *Document, geometry: *PaneGeometry,
             queueRoleText(state, .{ .x = token_x, .y = y, .w = @max(width, 1.0), .h = line_h }, token.text, tokenColor(token.kind), font, .mono, code_clip);
         }
     }
+    if (selection) |range| {
+        const dragging = if (drag) |active| active.pane_id == geometry.pane_id else false;
+        if (!dragging) renderAskChip(state, geometry, range.first(), range.last(), body_clip);
+    }
+}
+
+/// "Ask agent" chip at the right edge, just below the selection (above it
+/// when the selection ends at the bottom of the view).
+fn renderAskChip(state: *runtime.AppState, geometry: *PaneGeometry, first: u32, last: u32, clip: palette.Rect) void {
+    const font = theme.scaledUi(ASK_CHIP_FONT_CSS);
+    const chip_h = theme.scaledUi(ASK_CHIP_H_CSS);
+    const gap = theme.scaledUi(4.0);
+    const label = "Ask agent";
+    const icon_w = theme.scaledUi(16.0);
+    const pad_x = theme.scaledUi(10.0);
+    const chip_w = pad_x * 2.0 + icon_w + theme.scaledUi(4.0) + text_measure.textWidth(.ui_bold, font, label);
+    const body = geometry.body;
+    var y = geometry.line_top + @as(f32, @floatFromInt(last + 1)) * geometry.line_h + gap;
+    if (y + chip_h > body.y + body.h - gap) y = geometry.line_top + @as(f32, @floatFromInt(first)) * geometry.line_h - chip_h - gap;
+    y = std.math.clamp(y, body.y + gap, @max(body.y + body.h - chip_h - gap, body.y + gap));
+    const rect: palette.Rect = .{ .x = body.x + body.w - chip_w - theme.scaledUi(16.0), .y = y, .w = chip_w, .h = chip_h };
+    if (rect.x < body.x + geometry.gutter.w) return;
+    geometry.ask_rect = rect;
+    geometry.addButton(.ask_agent, rect);
+    const hovered = if (hovered_button) |hover| hover.pane_id == geometry.pane_id and hover.action == .ask_agent else false;
+    const fill = if (hovered) theme.raise(theme.accent(), 0.08) else theme.accent();
+    state.palette_overlay_batch.roundedRectClipped(state.allocator, rect, paletteColor(fill), chip_h * 0.5, clip) catch {};
+    const on_accent = theme.legibleOn(theme.COLOR_WHITE, theme.accent());
+    const glyph_font = theme.scaledUi(13.0);
+    const glyph_w = text_measure.textWidth(.icon, glyph_font, NF_COD_HUBOT);
+    queueRoleText(state, .{ .x = rect.x + pad_x + (icon_w - glyph_w) * 0.5, .y = rect.y + (chip_h - glyph_font * 1.3) * 0.5, .w = @max(glyph_w, 1.0), .h = glyph_font * 1.3 }, NF_COD_HUBOT, on_accent, glyph_font, .icon, clip);
+    const text_h = font * 1.4;
+    queueRoleText(state, .{ .x = rect.x + pad_x + icon_w + theme.scaledUi(4.0), .y = rect.y + (chip_h - text_h) * 0.5, .w = chip_w, .h = text_h }, label, on_accent, font, .ui_bold, clip);
+}
+
+/// Opens the shared ask-agent popover for the pane's line selection.
+fn openAskAgent(state: *runtime.AppState, pane_id: WorkspacePaneId) void {
+    const geometry = geometryFor(pane_id) orelse return;
+    const doc = state.fileViewerDocument(pane_id) orelse return;
+    const selection = doc.selection orelse return;
+    if (!doc.has_content or doc.loaded.kind != .text) return;
+    const text = viewer.sourceForLines(doc.loaded.text, doc.loaded.model.lines, selection.first(), selection.last());
+    const anchor = geometry.ask_rect orelse palette.Rect{
+        .x = geometry.body.x + geometry.gutter.w,
+        .y = geometry.line_top + @as(f32, @floatFromInt(selection.last())) * geometry.line_h,
+        .w = geometry.line_h,
+        .h = geometry.line_h,
+    };
+    agent_prompt_popover.open(state, .{
+        .anchor = anchor,
+        .path = doc.path,
+        .first_line = selection.first() + 1,
+        .last_line = selection.last() + 1,
+        .selection_text = text,
+    });
 }
 
 fn renderTruncationNotice(state: *runtime.AppState, doc: *const Document, geometry: *PaneGeometry, rect: palette.Rect, clip: palette.Rect) void {
@@ -531,6 +593,7 @@ fn renderTextButton(state: *runtime.AppState, geometry: *PaneGeometry, action: A
 // ------------------------------------------------------------------
 
 pub fn handleMouseDown(state: *runtime.AppState, pane_id: WorkspacePaneId, x: f32, y: f32, shift: bool) bool {
+    if (agent_prompt_popover.isOpen() and agent_prompt_popover.handleMouseButton(state, x, y, true, 1)) return true;
     const geometry = geometryFor(pane_id) orelse return false;
     if (!contains(geometry.rect, x, y)) return false;
     state.focusFilePane();
@@ -558,6 +621,7 @@ pub fn handleMouseDown(state: *runtime.AppState, pane_id: WorkspacePaneId, x: f3
 }
 
 pub fn handleMouseUp(state: *runtime.AppState) bool {
+    if (agent_prompt_popover.endDrag()) return true;
     _ = state;
     if (drag == null) return false;
     drag = null;
@@ -565,6 +629,7 @@ pub fn handleMouseUp(state: *runtime.AppState) bool {
 }
 
 pub fn handleMouseMotion(state: *runtime.AppState, x: f32, y: f32) bool {
+    if (agent_prompt_popover.isOpen() and agent_prompt_popover.handleMouseMotion(state, x, y)) return true;
     if (drag) |active| {
         const geometry = geometryFor(active.pane_id) orelse {
             drag = null;
@@ -663,6 +728,7 @@ fn activate(state: *runtime.AppState, pane_id: WorkspacePaneId, action: Action) 
         .close => _ = state.closeCurrentProjectWorkspacePane(pane_id),
         .reload, .retry => state.reloadFileViewerDocument(pane_id),
         .open_external => state.openFileViewerExternally(pane_id),
+        .ask_agent => openAskAgent(state, pane_id),
     }
     state.markDirty();
 }
@@ -676,6 +742,9 @@ pub fn systemCursorAt(x: f32, y: f32) ?sdl.SystemCursor {
 }
 
 pub fn handleKeyDown(state: *runtime.AppState, event: *const sdl.KeyboardEvent) bool {
+    // Fallback routing for the ask-agent popover (main.zig routes it first
+    // once hooked; then it is closed or has already consumed the key).
+    if (agent_prompt_popover.isOpen()) return agent_prompt_popover.handleKeyDown(state, event);
     if (!event.down) return false;
     const pane_id = state.focusedFilePaneId() orelse return false;
     // Another surface holds a caret (composer, terminal, address bar).
@@ -725,6 +794,10 @@ pub fn handleKeyDown(state: *runtime.AppState, event: *const sdl.KeyboardEvent) 
             state.markDirty();
         },
         .f5 => state.reloadFileViewerDocument(pane_id),
+        .@"return", .kp_enter => {
+            if (primary or doc.selection == null) return false;
+            openAskAgent(state, pane_id);
+        },
         .a => {
             if (!primary or geometry.line_count == 0) return false;
             doc.selection = .{ .anchor = 0, .head = @intCast(geometry.line_count - 1) };
@@ -756,14 +829,12 @@ fn copyToClipboard(state: *runtime.AppState, text: []const u8) void {
 }
 
 pub fn handleTextInput(state: *runtime.AppState, text: []const u8) bool {
-    _ = state;
-    _ = text;
-    return false;
+    return agent_prompt_popover.handleTextInput(state, text);
 }
 
 pub fn wantsTextInput(state: *runtime.AppState) bool {
     _ = state;
-    return false;
+    return agent_prompt_popover.wantsTextInput();
 }
 
 // ------------------------------------------------------------------

@@ -16,6 +16,7 @@ const debug_window = @import("debug.zig");
 const settings_modal = @import("settings_modal.zig");
 const runtime_connections = @import("../state/runtime_connections_controller.zig");
 const command_palette = @import("command_palette.zig");
+const agent_prompt_popover = @import("agent_prompt_popover.zig");
 const companion = @import("companion.zig");
 const handoff_sheet = @import("handoff_sheet.zig");
 const commit_sheet = @import("commit_sheet.zig");
@@ -208,6 +209,8 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     // The which-key panel must sit above pane-local layers (composer, pane
     // chrome) that queue at higher z than the workspace body.
     const which_key_z = state.palette_overlay_batch.setZIndex(PALETTE_MODAL_Z);
+    // Ask-agent popover floats over panes and the side panel, under modals.
+    agent_prompt_popover.render(state, width, height);
     renderPrefixStatusBar(state, split.content);
     renderPrefixWhichKey(state, split.content);
     renderNoticeToast(state, split.content);
