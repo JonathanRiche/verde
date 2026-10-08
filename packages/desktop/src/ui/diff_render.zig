@@ -171,6 +171,45 @@ pub fn selectionText(
     return out.toOwnedSlice(allocator) catch null;
 }
 
+/// Old/new source line ranges (1-based, inclusive) covered by view rows
+/// `first..last`, including rows scrolled out of sight.
+pub const LineRanges = struct { old: ?[2]usize = null, new: ?[2]usize = null };
+
+pub fn selectionLines(state: *AppState, patch: []const u8, layout: Layout, context_lines: usize, selection: Selection) ?LineRanges {
+    var ranges: LineRanges = .{};
+    switch (layout) {
+        .stacked => {
+            const view = state.transcript_controller.diff_view_cache.stackedWithContext(state.allocator, patch, context_lines) orelse return null;
+            if (view.lines.len == 0) return null;
+            const last = @min(selection.last, view.lines.len - 1);
+            for (view.lines[@min(selection.first, last) .. last + 1]) |line| {
+                if (line.old_line) |number| ranges.old = widenRange(ranges.old, number);
+                if (line.new_line) |number| ranges.new = widenRange(ranges.new, number);
+            }
+        },
+        .split => {
+            const view = state.transcript_controller.diff_view_cache.splitWithContext(state.allocator, patch, context_lines) orelse return null;
+            if (view.rows.len == 0) return null;
+            const last = @min(selection.last, view.rows.len - 1);
+            for (view.rows[@min(selection.first, last) .. last + 1]) |row| {
+                if (row.kind != .code) continue;
+                if (row.left) |cell| if (cell.line_number) |number| {
+                    ranges.old = widenRange(ranges.old, number);
+                };
+                if (row.right) |cell| if (cell.line_number) |number| {
+                    ranges.new = widenRange(ranges.new, number);
+                };
+            }
+        },
+    }
+    return ranges;
+}
+
+fn widenRange(range: ?[2]usize, line: usize) [2]usize {
+    const value = range orelse return .{ line, line };
+    return .{ @min(value[0], line), @max(value[1], line) };
+}
+
 fn appendLine(out: *std.ArrayList(u8), allocator: std.mem.Allocator, prefix: u8, tokens: []const zig_dif.Token) !void {
     try out.append(allocator, prefix);
     for (tokens) |token| try out.appendSlice(allocator, token.text);

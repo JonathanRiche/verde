@@ -18,8 +18,9 @@
 //! Data and fetching live in `state/workspace_changes_controller.zig`; the
 //! patch drawing is the shared `diff_render.zig`. Everything here is
 //! read-only: rows expand, paths open in the file viewer, and dragging over
-//! diff lines selects them for an agent prompt (`state.workspace_changes
-//! .selection`).
+//! diff lines selects them (`state.workspace_changes.selection`). An "Ask
+//! agent" chip beside the selection, or Enter, opens `agent_prompt_popover`
+//! for those lines; Escape or a click on empty space clears it.
 
 const std = @import("std");
 const sdl = @import("zsdl3");
@@ -30,6 +31,7 @@ const theme = @import("theme.zig");
 const text_measure = @import("text_measure.zig");
 const file_icons = @import("file_icons.zig");
 const diff_render = @import("diff_render.zig");
+const agent_prompt_popover = @import("agent_prompt_popover.zig");
 const changes = @import("../state/workspace_changes_controller.zig");
 
 const AppState = runtime.AppState;
@@ -51,6 +53,7 @@ const WHEEL_STEP_UI: f32 = 48.0;
 const BAR_BLOCKS: usize = 5;
 
 const NF_REFRESH = "\u{eb37}";
+const NF_COD_HUBOT = "\u{EB08}";
 const NF_CHEVRON_RIGHT = "\u{eab6}";
 const NF_CHEVRON_DOWN = "\u{eab4}";
 
@@ -79,6 +82,7 @@ const HitKind = union(enum) {
     toggle_file: FileRef,
     open_file: FileRef,
     expand_all,
+    ask_agent,
 };
 
 const Hit = struct { rect: palette.Rect, kind: HitKind };
@@ -127,16 +131,38 @@ const LineSelection = struct {
 var selection: ?LineSelection = null;
 var dragging = false;
 
+// Same chip geometry as the file viewer's.
+const ASK_CHIP_H_UI: f32 = 26.0;
+const ASK_CHIP_FONT_UI: f32 = 12.5;
+
+/// Selection span of this frame's drawn block, for placing the chip.
+const AskSpan = struct { top: f32, bottom: f32, left: f32, right: f32 };
+var ask_span: ?AskSpan = null;
+/// "Ask agent" chip drawn last frame; anchors the popover.
+var ask_rect: ?palette.Rect = null;
+
 pub fn resetHitCache() void {
     hit_count = 0;
     row_used = 0;
     file_rows_count = 0;
+    ask_span = null;
+    ask_rect = null;
 }
 
 fn pushHit(rect: palette.Rect, kind: HitKind) void {
     if (hit_count >= MAX_HITS) return;
     hits[hit_count] = .{ .rect = rect, .kind = kind };
     hit_count += 1;
+}
+
+/// Hit limited to `clip`, so rows scrolled under the header stay inert.
+fn pushClippedHit(rect: palette.Rect, kind: HitKind, clip: palette.Rect) void {
+    const x0 = @max(rect.x, clip.x);
+    const y0 = @max(rect.y, clip.y);
+    const x1 = @min(rect.x + rect.w, clip.x + clip.w);
+    const y1 = @min(rect.y + rect.h, clip.y + clip.h);
+    if (x1 <= x0 or y1 <= y0) return;
+    pushHit(.{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 }, kind);
 }
 
 // ------------------------------------------------------------------
@@ -478,6 +504,7 @@ fn renderList(state: *AppState, rect: palette.Rect, result: changes.WorkspaceRes
         renderFileRow(state, pinned_rect, pinned.repo, pinned.file, pinned.ref, true, rect);
         queueRect(state, .{ .x = rect.x, .y = pinned_y + row_h - 1.0, .w = rect.w, .h = 1.0 }, paletteColor(theme.borderMuted()), rect);
     }
+    if (ask_span) |span| renderAskChip(state, rect, span);
     renderScrollbar(state, rect, content_h);
 }
 
@@ -506,7 +533,7 @@ fn renderFileRow(
     const small = theme.scaledUi(SMALL_FONT_UI);
     const hovered = pointIn(rect);
     if (hovered) queueRect(state, rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 110)), clip);
-    pushHit(rect, .{ .toggle_file = ref });
+    pushClippedHit(rect, .{ .toggle_file = ref }, clip);
 
     const text_y = rect.y + (rect.h - font * 1.4) * 0.5;
     var x = rect.x + pad - theme.scaledUi(2.0);
@@ -592,7 +619,7 @@ fn renderFileRow(
         queueRect(state, .{ .x = x + dir_w, .y = text_y + font * 1.3, .w = name_w, .h = @max(theme.scaledUi(1.0), 1.0) }, paletteColor(theme.withAlpha(theme.accent(), 160)), clip);
     }
     // Pushed after the row hit so it wins the lookup (hits search backwards).
-    pushHit(path_rect, .{ .open_file = ref });
+    pushClippedHit(path_rect, .{ .open_file = ref }, clip);
     _ = repo;
 }
 
@@ -665,6 +692,14 @@ fn renderBlock(state: *AppState, rect: palette.Rect, block: Block, ref: FileRef,
         .selection = selected,
     });
     row_used += sink.len;
+    if (selected) |range| {
+        if (!dragging and state.workspace_changes.selection != null) ask_span = .{
+            .top = patch_rect.y + @as(f32, @floatFromInt(range.first)) * line_h,
+            .bottom = patch_rect.y + @as(f32, @floatFromInt(range.last + 1)) * line_h,
+            .left = patch_rect.x,
+            .right = patch_rect.x + patch_rect.w,
+        };
+    }
     if (file_rows_count < MAX_FILE_ROWS) {
         file_rows[file_rows_count] = .{
             .file = ref,
@@ -677,6 +712,64 @@ fn renderBlock(state: *AppState, rect: palette.Rect, block: Block, ref: FileRef,
         };
         file_rows_count += 1;
     }
+}
+
+/// "Ask agent" chip at the diff's right edge, just below the selection
+/// (above it when there is no room), kept inside the list.
+fn renderAskChip(state: *AppState, list: palette.Rect, span: AskSpan) void {
+    const font = theme.scaledUi(ASK_CHIP_FONT_UI);
+    const chip_h = theme.scaledUi(ASK_CHIP_H_UI);
+    const gap = theme.scaledUi(4.0);
+    const label = "Ask agent";
+    const icon_w = theme.scaledUi(16.0);
+    const pad_x = theme.scaledUi(10.0);
+    const chip_w = pad_x * 2.0 + icon_w + theme.scaledUi(4.0) + text_measure.textWidth(.ui_bold, font, label);
+    var y = span.bottom + gap;
+    if (y + chip_h > list.y + list.h - gap) y = span.top - chip_h - gap;
+    y = std.math.clamp(y, list.y + gap, @max(list.y + list.h - chip_h - gap, list.y + gap));
+    const rect: palette.Rect = .{ .x = span.right - chip_w - theme.scaledUi(10.0), .y = y, .w = chip_w, .h = chip_h };
+    if (rect.x < span.left) return;
+    ask_rect = rect;
+    pushHit(rect, .ask_agent);
+    const fill = if (pointIn(rect)) theme.raise(theme.accent(), 0.08) else theme.accent();
+    queueRounded(state, rect, paletteColor(fill), chip_h * 0.5, list);
+    const on_accent = paletteColor(theme.legibleOn(theme.COLOR_WHITE, theme.accent()));
+    queueIcon(state, .{ .x = rect.x + pad_x, .y = rect.y, .w = icon_w, .h = chip_h }, NF_COD_HUBOT, on_accent, theme.scaledUi(13.0), list);
+    const text_h = font * 1.4;
+    state.palette_overlay_batch.roleText(state.allocator, snapRect(.{
+        .x = rect.x + pad_x + icon_w + theme.scaledUi(4.0),
+        .y = rect.y + (chip_h - text_h) * 0.5,
+        .w = chip_w,
+        .h = text_h,
+    }), label, on_accent, font, .ui_bold, null, list) catch {};
+}
+
+/// Opens the shared ask-agent popover for the published diff selection,
+/// anchored to the chip (or the list's top-right corner when it is hidden).
+fn openAskAgent(state: *AppState) void {
+    const current = state.workspace_changes.selection orelse return;
+    const lines = current.promptLines() orelse return;
+    const abs_path = std.fs.path.join(std.heap.page_allocator, &.{ current.root, current.path }) catch return;
+    defer std.heap.page_allocator.free(abs_path);
+    const fallback_h = theme.scaledUi(ASK_CHIP_H_UI);
+    const anchor = ask_rect orelse palette.Rect{
+        .x = list_rect.x + list_rect.w * 0.5,
+        .y = list_rect.y,
+        .w = list_rect.w * 0.5,
+        .h = fallback_h,
+    };
+    const max_line: usize = std.math.maxInt(u32);
+    agent_prompt_popover.open(state, .{
+        .anchor = anchor,
+        .path = abs_path,
+        .first_line = @intCast(@min(lines.first, max_line)),
+        .last_line = @intCast(@min(lines.last, max_line)),
+        .side = switch (lines.side) {
+            .new => .new,
+            .old => .old,
+        },
+        .selection_text = current.text,
+    });
 }
 
 fn renderScrollbar(state: *AppState, rect: palette.Rect, content_h: f32) void {
@@ -755,6 +848,13 @@ pub fn handleMouseButton(state: *AppState, x: f32, y: f32, down: bool, clicks: u
         }
         return true;
     }
+    // Chrome hits first: the pinned header and the Ask agent chip sit over
+    // diff rows.
+    if (hitAt(x, y)) |hit| {
+        activate(state, hit.kind);
+        state.markDirty();
+        return true;
+    }
     if (diffRowAt(x, y)) |hit| {
         switch (hit.row.kind) {
             .context_gap => if (hit.group.full) {
@@ -779,11 +879,12 @@ pub fn handleMouseButton(state: *AppState, x: f32, y: f32, down: bool, clicks: u
         state.markDirty();
         return true;
     }
-    const hit = hitAt(x, y) orelse {
-        if (selection != null) clearSelection(state);
-        return true;
-    };
-    switch (hit.kind) {
+    if (selection != null) clearSelection(state);
+    return true;
+}
+
+fn activate(state: *AppState, kind: HitKind) void {
+    switch (kind) {
         .refresh, .retry => state.refreshWorkspaceChangesNow(),
         .commit => state.openWorkspaceChangesCommit(),
         .expand_all => state.toggleAllWorkspaceChangesFiles(),
@@ -801,9 +902,8 @@ pub fn handleMouseButton(state: *AppState, x: f32, y: f32, down: bool, clicks: u
         .open_file => |ref| if (fileFor(state, ref)) |found| {
             state.openChangedFileInViewer(found.repo.root, found.file.path);
         },
+        .ask_agent => openAskAgent(state),
     }
-    state.markDirty();
-    return true;
 }
 
 pub fn handleMouseMotion(state: *AppState, x: f32, y: f32) bool {
@@ -831,13 +931,13 @@ pub fn handleMouseMotion(state: *AppState, x: f32, y: f32) bool {
 /// Identity of whatever is under the pointer, so motion repaints only when
 /// the hover target changes.
 fn hoverKey(x: f32, y: f32) u64 {
-    if (diffRowAt(x, y)) |hit| {
-        return 0x1000_0000 | (@as(u64, @intFromEnum(hit.row.kind)) << 20) | (hit.row.index & 0xFFFFF);
-    }
     var index = hit_count;
     while (index > 0) {
         index -= 1;
         if (rectContains(hits[index].rect, x, y)) return index + 1;
+    }
+    if (diffRowAt(x, y)) |hit| {
+        return 0x1000_0000 | (@as(u64, @intFromEnum(hit.row.kind)) << 20) | (hit.row.index & 0xFFFFF);
     }
     return 0;
 }
@@ -864,6 +964,11 @@ pub fn handleKey(state: *AppState, event: *const sdl.KeyboardEvent) bool {
         .escape => {
             if (selection == null) return false;
             clearSelection(state);
+            return true;
+        },
+        .@"return", .kp_enter => {
+            if (primary or selection == null or state.workspace_changes.selection == null) return false;
+            openAskAgent(state);
             return true;
         },
         .c => {
@@ -901,6 +1006,7 @@ pub fn wantsTextInput(state: *AppState) bool {
 
 pub fn systemCursorAt(state: *AppState, x: f32, y: f32) ?sdl.SystemCursor {
     _ = state;
+    if (hitAt(x, y) != null) return .pointer;
     if (diffRowAt(x, y)) |hit| {
         return switch (hit.row.kind) {
             .context_gap => if (hit.group.full) .pointer else null,
@@ -908,7 +1014,6 @@ pub fn systemCursorAt(state: *AppState, x: f32, y: f32) ?sdl.SystemCursor {
             else => .text,
         };
     }
-    if (hitAt(x, y) != null) return .pointer;
     return null;
 }
 
@@ -936,22 +1041,9 @@ fn publishSelection(state: *AppState) void {
         clearSelection(state);
         return;
     }
-    var old_range: ?[2]usize = null;
-    var new_range: ?[2]usize = null;
-    for (file_rows[0..file_rows_count]) |group| {
-        if (!group.file.eql(current.file)) continue;
-        for (row_buffer[group.first .. group.first + group.len]) |row| {
-            if (row.index < range.first or row.index > range.last) continue;
-            if (row.old_line) |line| old_range = widen(old_range, line);
-            if (row.new_line) |line| new_range = widen(new_range, line);
-        }
-    }
-    state.setWorkspaceChangesSelection(found.repo.root, found.file.path, old_range, new_range, text);
-}
-
-fn widen(range: ?[2]usize, line: usize) [2]usize {
-    const value = range orelse return .{ line, line };
-    return .{ @min(value[0], line), @max(value[1], line) };
+    // From the whole view, not just the drawn rows: a drag can scroll.
+    const lines = diff_render.selectionLines(state, patch, current.layout, current.context_lines, range) orelse diff_render.LineRanges{};
+    state.setWorkspaceChangesSelection(found.repo.root, found.file.path, lines.old, lines.new, text);
 }
 
 // ------------------------------------------------------------------

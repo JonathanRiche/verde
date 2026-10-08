@@ -381,6 +381,11 @@ pub const PatchEntry = struct {
 /// Lines picked in a diff for an agent prompt (`agent_prompt_popover`).
 /// Line numbers are 1-based and inclusive; null where the range has no
 /// lines on that side (pure additions or deletions).
+pub const PromptSide = enum { new, old };
+
+/// 1-based inclusive line range on one side of a diff.
+pub const PromptLines = struct { side: PromptSide, first: usize, last: usize };
+
 pub const DiffSelection = struct {
     root: []u8,
     path: []u8,
@@ -395,6 +400,15 @@ pub const DiffSelection = struct {
         page.free(self.root);
         page.free(self.path);
         page.free(self.text);
+    }
+
+    /// Lines an agent prompt cites: the new side whenever the selection
+    /// touches a new-side line (additions or context), else the old side
+    /// (a deletion-only selection). Null without line numbers.
+    pub fn promptLines(self: DiffSelection) ?PromptLines {
+        if (self.new_first) |first| return .{ .side = .new, .first = first, .last = self.new_last orelse first };
+        if (self.old_first) |first| return .{ .side = .old, .first = first, .last = self.old_last orelse first };
+        return null;
     }
 };
 
@@ -1020,6 +1034,22 @@ test "filters and totals follow chip choice" {
     const unassigned = totals(result, .{ .kind = .unassigned });
     try testing.expectEqual(@as(usize, 1), unassigned.files);
     try testing.expectEqual(@as(u64, 10), unassigned.additions);
+}
+
+test "prompt lines prefer the new side unless only deletions are selected" {
+    var empty: [0]u8 = .{};
+    const base = DiffSelection{ .root = &empty, .path = &empty, .text = &empty };
+    var mixed = base;
+    mixed.old_first = 10;
+    mixed.old_last = 12;
+    mixed.new_first = 10;
+    mixed.new_last = 14;
+    try std.testing.expectEqual(PromptLines{ .side = .new, .first = 10, .last = 14 }, mixed.promptLines().?);
+    var deletions = base;
+    deletions.old_first = 7;
+    deletions.old_last = 9;
+    try std.testing.expectEqual(PromptLines{ .side = .old, .first = 7, .last = 9 }, deletions.promptLines().?);
+    try std.testing.expect(base.promptLines() == null);
 }
 
 test "row labels" {
