@@ -1595,6 +1595,12 @@ fn rpcSucceeded(allocator: std.mem.Allocator, json: []const u8) bool {
     return parsed.response.isOk();
 }
 
+fn rpcErrorIs(allocator: std.mem.Allocator, json: []const u8, code: []const u8) bool {
+    var parsed = headless.parseResponse(allocator, json) catch return false;
+    defer parsed.deinit();
+    return std.mem.eql(u8, rpcErrorCode(parsed.response.err) orelse "", code);
+}
+
 fn callMethodTargetedAfterBootstrap(
     allocator: std.mem.Allocator,
     daemon: *daemon_mod.Daemon,
@@ -2026,6 +2032,17 @@ fn pollChanges(session: *WsSession) void {
             session.feed_mutex.lock(session.io) catch return;
             defer session.feed_mutex.unlock(session.io);
             if (generation != session.feed.generation) continue;
+            if (rpcErrorIs(session.allocator, result.json, headless.protocol.ERR_REVISION_EXPIRED)) {
+                // A resume cursor below the journal floor is stale client state, not a
+                // dead session. Closing made clients reconnect with the same cursor
+                // forever; forwarding lets them re-seed and re-negotiate from head.
+                sendNotification(session, "core.changes", result.json) catch {
+                    session.closed.store(true, .release);
+                    return;
+                };
+                session.feed.cursor = null;
+                continue;
+            }
             if (!rpcSucceeded(session.allocator, result.json)) {
                 session.closeExpired();
                 return;
@@ -3899,6 +3916,18 @@ test "delta opt-in validates params and resumes from explicit or snapshot cursor
     try feed.setMode(allocator, params.value);
     try std.testing.expectEqual(@as(?u64, 18), feed.cursor);
     try std.testing.expectEqual(@as(u64, 2), feed.generation);
+}
+
+test "a resume cursor below the journal floor is forwarded rather than closing the socket" {
+    const allocator = std.testing.allocator;
+    const expired = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":\"revision_expired\",\"message\":\"cursor below journal floor\",\"data\":{\"floor_seq\":57065}}}";
+    try std.testing.expect(rpcErrorIs(allocator, expired, headless.protocol.ERR_REVISION_EXPIRED));
+    const unavailable = try headless.encodeErrorResponse(allocator, 1, "unavailable", "daemon unavailable");
+    defer allocator.free(unavailable);
+    try std.testing.expect(!rpcErrorIs(allocator, unavailable, headless.protocol.ERR_REVISION_EXPIRED));
+    const ok = try headless.encodeOkResponse(allocator, 1, .{ .next_cursor = 7 });
+    defer allocator.free(ok);
+    try std.testing.expect(!rpcErrorIs(allocator, ok, headless.protocol.ERR_REVISION_EXPIRED));
 }
 
 test "delta changes resync on expiry or nonce change but legacy snapshots every change" {
