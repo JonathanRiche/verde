@@ -27,6 +27,8 @@ test {
     _ = @import("state/runtime_connections_controller.zig");
     _ = @import("state/workspace_layout.zig");
     _ = @import("state/file_viewer_controller.zig");
+    _ = @import("state/file_explorer.zig");
+    _ = @import("ui/text_edit.zig");
     _ = @import("state/workspace_tabs.zig");
     _ = @import("state/resource_waiters.zig");
     _ = @import("providers/acp.zig");

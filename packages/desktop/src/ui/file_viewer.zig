@@ -34,6 +34,7 @@ const chat_markdown = @import("chat_markdown.zig");
 const zig_dif = @import("zig_dif");
 const platform_runtime = @import("platform_runtime");
 const viewer = @import("../state/file_viewer_controller.zig");
+const side_panel = @import("side_panel.zig");
 
 const Document = viewer.Document;
 const WorkspacePaneId = runtime.WorkspacePaneId;
@@ -679,6 +680,8 @@ pub fn handleKeyDown(state: *runtime.AppState, event: *const sdl.KeyboardEvent) 
     const pane_id = state.focusedFilePaneId() orelse return false;
     // Another surface holds a caret (composer, terminal, address bar).
     if (state.composer_controller.focused or state.terminal_controller.focused or state.browser_controller.address_focused) return false;
+    // The side panel body (explorer filter, tree) owns the keyboard.
+    if (side_panel.bodyHasKeyboard(state)) return false;
     const geometry = geometryFor(pane_id) orelse return false;
     const doc = state.fileViewerDocument(pane_id) orelse return false;
     const primary = isPrimaryModifierPressed(event.mod);

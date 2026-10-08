@@ -20,6 +20,10 @@
 //!   started) on first use. `null` only when the pane is not a file pane.
 //! - `reloadFileViewerDocument(pane_id)`, `focusFilePane()`,
 //!   `pollFileViewer()`, `fileViewerRoots()`.
+//! - Side panel Files explorer (`state/file_explorer.zig` model):
+//!   `fileExplorer()`, `fileExplorerSetExpanded(key, bool)`,
+//!   `fileExplorerRefresh()`, `fileExplorerSetQuery(query)`,
+//!   `fileExplorerOpen(root_index, rel)`.
 
 const std = @import("std");
 
@@ -34,6 +38,7 @@ const stb_image = @import("../media/stb_image.zig");
 const workspace_layout = @import("workspace_layout.zig");
 const ui_types = @import("ui_types.zig");
 const chat_markdown = @import("../ui/chat_markdown.zig");
+const file_explorer = @import("file_explorer.zig");
 
 const proto = headless.workspace_files_protocol;
 const page = std.heap.page_allocator;
@@ -44,6 +49,13 @@ pub const Root = proto.Root;
 pub const ContentKind = proto.ContentKind;
 
 const ROOTS_TIMEOUT_MS: u32 = 10_000;
+const LIST_TIMEOUT_MS: u32 = 10_000;
+const SEARCH_TIMEOUT_MS: u32 = 10_000;
+/// Filter keystrokes settle this long before a search request.
+const SEARCH_DEBOUNCE_MS: i64 = 150;
+/// The explorer re-lists its expanded folders when it reappears after
+/// being hidden this long.
+const EXPLORER_STALE_MS: i64 = 1500;
 const READ_TIMEOUT_MS: u32 = 20_000;
 /// Text bytes requested per file; the daemon truncates beyond this.
 pub const TEXT_LIMIT_BYTES: u64 = proto.DEFAULT_TEXT_BYTES;
@@ -224,7 +236,7 @@ pub fn messageForError(code: ?[]const u8, message: []const u8) []const u8 {
 // Worker calls
 // ------------------------------------------------------------------
 
-const CallKind = enum { roots, read };
+const CallKind = enum { roots, read, list, search };
 
 const Call = struct {
     kind: CallKind,
@@ -243,6 +255,11 @@ const Call = struct {
     err_message: []const u8 = "",
     roots: []const Root = &.{},
     loaded: Loaded = .{},
+    /// `list`: the directory's entries; `search`: matching root-relative
+    /// paths (home root).
+    entries: []const proto.Entry = &.{},
+    search_paths: []const []const u8 = &.{},
+    truncated: bool = false,
 
     fn destroy(self: *Call) void {
         page.free(self.workspace_id);
@@ -284,12 +301,18 @@ fn runCall(call: *Call) void {
     var transport: daemon_client.HeadlessTransport = .{
         .allocator = page,
         .pref_path = call.pref_path,
-        .timeout_ms = if (call.kind == .roots) ROOTS_TIMEOUT_MS else READ_TIMEOUT_MS,
+        .timeout_ms = switch (call.kind) {
+            .roots => ROOTS_TIMEOUT_MS,
+            .read => READ_TIMEOUT_MS,
+            .list => LIST_TIMEOUT_MS,
+            .search => SEARCH_TIMEOUT_MS,
+        },
     };
     var client = daemon_client.headlessClient(page, &transport);
     const method = switch (call.kind) {
-        .roots => proto.METHOD_LIST,
+        .roots, .list => proto.METHOD_LIST,
         .read => proto.METHOD_READ,
+        .search => headless.store_protocol.METHOD_WORKSPACE_FILES_SEARCH,
     };
     var parsed = client.call(method, params.value) catch {
         call.err_message = "Could not reach the Verde daemon, or it took too long to answer.";
@@ -314,6 +337,32 @@ fn runCall(call: *Call) void {
             };
             call.roots = result.roots;
         },
+        .list => {
+            const result = std.json.parseFromValueLeaky(proto.ListResult, arena, value, options) catch {
+                call.err_message = "The daemon returned an unexpected response.";
+                return;
+            };
+            call.entries = result.entries;
+            call.truncated = result.truncated;
+        },
+        .search => {
+            const result = std.json.parseFromValueLeaky(SearchResult, arena, value, options) catch {
+                call.err_message = "The daemon returned an unexpected response.";
+                return;
+            };
+            // Matches are relative to the repository route; re-base them on
+            // the home root when the route names a subdirectory.
+            const prefix = std.mem.trim(u8, result.relative_cwd orelse "", "/");
+            const paths = arena.alloc([]const u8, result.files.len) catch {
+                call.err_message = "Not enough memory.";
+                return;
+            };
+            for (result.files, paths) |file, *path| {
+                path.* = if (prefix.len == 0) file.path else std.fmt.allocPrint(arena, "{s}/{s}", .{ prefix, file.path }) catch file.path;
+            }
+            call.search_paths = paths;
+            call.truncated = result.truncated;
+        },
         .read => {
             const result = std.json.parseFromValueLeaky(proto.ReadResult, arena, value, options) catch {
                 call.err_message = "The daemon returned an unexpected response.";
@@ -325,6 +374,13 @@ fn runCall(call: *Call) void {
         },
     }
 }
+
+/// `workspace.files.search` result fields the explorer uses.
+const SearchResult = struct {
+    relative_cwd: ?[]const u8 = null,
+    files: []const struct { path: []const u8 } = &.{},
+    truncated: bool = false,
+};
 
 fn prepareRead(call: *Call, arena: std.mem.Allocator, result: proto.ReadResult) !void {
     var loaded: Loaded = .{
@@ -517,6 +573,8 @@ pub const State = struct {
     roots: std.ArrayList(RootsEntry) = .empty,
     documents: std.ArrayList(*Document) = .empty,
     calls: std.ArrayList(*Call) = .empty,
+    /// Side panel explorers, one per workspace seen.
+    explorers: std.ArrayList(*file_explorer.Explorer) = .empty,
 
     /// Joins every worker (bounded by request timeouts) and frees all data.
     /// Textures are left to the GPU teardown.
@@ -533,6 +591,8 @@ pub const State = struct {
             page.destroy(doc);
         }
         self.documents.deinit(page);
+        for (self.explorers.items) |explorer| explorer.destroy();
+        self.explorers.deinit(page);
     }
 };
 
@@ -811,11 +871,15 @@ pub fn pollFileViewer(self: anytype) void {
         }
         _ = state.calls.orderedRemove(index);
         call.thread.join();
-        applyCall(self, call);
+        switch (call.kind) {
+            .roots, .read => applyCall(self, call),
+            .list, .search => applyExplorerCall(self, call),
+        }
         call.destroy();
         changed = true;
     }
     if (pruneDocuments(self)) changed = true;
+    if (startDueSearches(self)) changed = true;
     if (changed) self.markDirty();
 }
 
@@ -839,6 +903,7 @@ fn applyCall(self: anytype, call: *Call) void {
                 entry.status = .ready;
                 entry.message = "";
             }
+            if (findExplorer(self, call.workspace_id)) |explorer| explorer.rows_dirty = true;
             // Documents that waited for these roots start now.
             for (self.file_viewer.documents.items) |doc| {
                 if (!std.mem.eql(u8, doc.workspace_id, call.workspace_id)) continue;
@@ -905,7 +970,53 @@ fn applyCall(self: anytype, call: *Call) void {
                 if (count == 0 or selection.last() >= count) doc.selection = null;
             }
         },
+        .list, .search => {}, // applyExplorerCall
     }
+}
+
+fn applyExplorerCall(self: anytype, call: *Call) void {
+    const explorer = findExplorer(self, call.workspace_id) orelse return;
+    switch (call.kind) {
+        .list => {
+            const failed = call.err_message.len > 0 or call.err_code != null;
+            if (failed) {
+                const code = call.err_code orelse "";
+                if (std.mem.eql(u8, code, proto.ERR_ROOT_NOT_FOUND)) refreshRoots(self, call.workspace_id);
+                explorer.failListing(call.path, explorerErrorMessage(call.err_code, call.err_message)) catch {};
+            } else {
+                explorer.applyListing(call.path, &call.arena, call.entries, call.truncated, platform_runtime.unixTimestampMs()) catch {};
+            }
+        },
+        .search => {
+            const search = &explorer.search;
+            if (call.generation != search.generation) return;
+            if (call.err_message.len > 0 or call.err_code != null) {
+                search.arena.deinit();
+                search.arena = .init(page);
+                search.paths = &.{};
+                search.status = .failed;
+                search.message = search.arena.allocator().dupe(u8, explorerErrorMessage(call.err_code, call.err_message)) catch "";
+            } else {
+                search.arena.deinit();
+                search.arena = call.arena;
+                call.arena = .init(page);
+                search.paths = call.search_paths;
+                search.truncated = call.truncated;
+                search.status = .ready;
+                search.message = "";
+            }
+            explorer.rows_dirty = true;
+        },
+        .roots, .read => {},
+    }
+}
+
+fn explorerErrorMessage(code: ?[]const u8, message: []const u8) []const u8 {
+    const value = code orelse return if (message.len > 0) message else "Could not list this folder.";
+    if (std.mem.eql(u8, value, proto.ERR_NOT_FOUND)) return "This folder no longer exists.";
+    if (std.mem.eql(u8, value, proto.ERR_NOT_DIRECTORY)) return "This is no longer a folder.";
+    if (std.mem.eql(u8, value, "capability_unavailable")) return "File search is unavailable for this workspace.";
+    return messageForError(code, message);
 }
 
 fn hasReadInFlight(self: anytype, doc: *const Document) bool {
@@ -963,6 +1074,180 @@ pub fn noteDocumentRendered(self: anytype, doc: *Document, now_ms: i64) void {
     const reappeared = doc.last_render_ms != 0 and hidden_for > STALE_RELOAD_MS;
     doc.last_render_ms = now_ms;
     if (reappeared and doc.status == .ready and !doc.loading) startLoad(self, doc);
+}
+
+// ------------------------------------------------------------------
+// Side panel explorer
+// ------------------------------------------------------------------
+
+pub const Explorer = file_explorer.Explorer;
+
+fn findExplorer(self: anytype, workspace_id: []const u8) ?*Explorer {
+    for (self.file_viewer.explorers.items) |explorer| {
+        if (std.mem.eql(u8, explorer.workspace_id, workspace_id)) return explorer;
+    }
+    return null;
+}
+
+/// Explorer of the selected workspace (created on first use). On first
+/// sight of the roots it expands the home root (or the only root).
+pub fn fileExplorer(self: anytype) ?*Explorer {
+    const index = selectedProjectIndex(self) orelse return null;
+    const workspace_id = self.project_controller.projects.items[index].id;
+    const explorer = findExplorer(self, workspace_id) orelse blk: {
+        const created = Explorer.create(workspace_id) catch return null;
+        self.file_viewer.explorers.append(page, created) catch {
+            created.destroy();
+            return null;
+        };
+        break :blk created;
+    };
+    const roots = fileViewerRoots(self);
+    if (!explorer.initialized and roots.len > 0) {
+        explorer.initialized = true;
+        const root = for (roots) |root| {
+            if (std.mem.eql(u8, root.id, proto.HOME_ROOT_ID)) break root;
+        } else roots[0];
+        var key: std.ArrayList(u8) = .empty;
+        defer key.deinit(page);
+        file_explorer.makeKey(&key, root.id, "") catch return explorer;
+        fileExplorerSetExpanded(self, key.items, true);
+    }
+    return explorer;
+}
+
+/// Expands or collapses the directory `key`; expanding lists it when it
+/// has no listing yet, or re-lists a stale one.
+pub fn fileExplorerSetExpanded(self: anytype, key: []const u8, expanded: bool) void {
+    const explorer = fileExplorer(self) orelse return;
+    explorer.setExpanded(key, expanded) catch return;
+    if (expanded) {
+        const now = platform_runtime.unixTimestampMs();
+        const listing = explorer.dir(key);
+        if (listing == null or listing.?.status == .failed or now - listing.?.fetched_ms > file_explorer.LISTING_STALE_MS) {
+            listExplorerDir(self, explorer, key);
+        }
+    }
+    self.markDirty();
+}
+
+fn listExplorerDir(self: anytype, explorer: *Explorer, key: []const u8) void {
+    const listing = explorer.ensureDir(key) catch return;
+    if (listing.loading) return;
+    const parts = file_explorer.splitKey(key);
+    const workspace_id = page.dupe(u8, explorer.workspace_id) catch return;
+    const owned_key = page.dupe(u8, key) catch {
+        page.free(workspace_id);
+        return;
+    };
+    const started = startCall(self, .{
+        .kind = .list,
+        .workspace_id = workspace_id,
+        .path = owned_key,
+        .pref_path = &.{},
+        .params_json = &.{},
+    }, proto.ListRequest{
+        .workspace_id = explorer.workspace_id,
+        .root = parts.root_id,
+        .path = parts.path,
+    });
+    if (!started) {
+        page.free(workspace_id);
+        page.free(owned_key);
+        explorer.failListing(key, "Could not start a daemon request.") catch {};
+        return;
+    }
+    listing.loading = true;
+    explorer.rows_dirty = true;
+}
+
+/// Re-fetches the roots and every expanded folder's listing.
+pub fn fileExplorerRefresh(self: anytype) void {
+    const explorer = fileExplorer(self) orelse return;
+    refreshRoots(self, explorer.workspace_id);
+    for (explorer.expanded.items) |key| listExplorerDir(self, explorer, key);
+    if (explorer.search.query.len > 0) scheduleSearch(explorer, 0);
+    self.markDirty();
+}
+
+/// Records an explorer draw; re-lists after it was hidden for a while so
+/// files agents created in the background show up.
+pub fn fileExplorerNoteRendered(self: anytype, explorer: *Explorer, now_ms: i64) void {
+    const hidden_for = now_ms - explorer.last_render_ms;
+    const reappeared = explorer.last_render_ms != 0 and hidden_for > EXPLORER_STALE_MS;
+    explorer.last_render_ms = now_ms;
+    if (reappeared) fileExplorerRefresh(self);
+}
+
+/// Sets the filter query; non-empty queries search after a short debounce.
+pub fn fileExplorerSetQuery(self: anytype, query: []const u8) void {
+    const explorer = fileExplorer(self) orelse return;
+    const search = &explorer.search;
+    const trimmed = std.mem.trim(u8, query, " ");
+    if (std.mem.eql(u8, search.query, trimmed)) return;
+    const owned = page.dupe(u8, trimmed) catch return;
+    page.free(search.query);
+    search.query = owned;
+    search.generation +%= 1;
+    if (trimmed.len == 0) {
+        search.status = .idle;
+        search.arena.deinit();
+        search.arena = .init(page);
+        search.paths = &.{};
+    } else scheduleSearch(explorer, SEARCH_DEBOUNCE_MS);
+    explorer.rows_dirty = true;
+    self.markDirty();
+}
+
+fn scheduleSearch(explorer: *Explorer, delay_ms: i64) void {
+    explorer.search.status = .waiting;
+    explorer.search.due_ms = platform_runtime.unixTimestampMs() + delay_ms;
+}
+
+/// Starts debounced searches whose deadline passed. While one is waiting
+/// the loop keeps polling (the caller marks the frame dirty).
+fn startDueSearches(self: anytype) bool {
+    var pending = false;
+    const now = platform_runtime.unixTimestampMs();
+    for (self.file_viewer.explorers.items) |explorer| {
+        const search = &explorer.search;
+        if (search.status != .waiting) continue;
+        if (now < search.due_ms) {
+            pending = true;
+            continue;
+        }
+        search.status = .loading;
+        search.generation +%= 1;
+        const workspace_id = page.dupe(u8, explorer.workspace_id) catch continue;
+        const started = startCall(self, .{
+            .kind = .search,
+            .workspace_id = workspace_id,
+            .generation = search.generation,
+            .pref_path = &.{},
+            .params_json = &.{},
+        }, .{
+            .workspace_id = explorer.workspace_id,
+            .query = search.query,
+            .limit = file_explorer.SEARCH_LIMIT,
+        });
+        if (!started) {
+            page.free(workspace_id);
+            search.status = .failed;
+            search.message = "Could not start a daemon request.";
+        }
+        explorer.rows_dirty = true;
+        pending = true;
+    }
+    return pending;
+}
+
+/// Opens `rel` under root `root_index` of the selected workspace in a file tab.
+pub fn fileExplorerOpen(self: anytype, root_index: usize, rel: []const u8) void {
+    const roots = fileViewerRoots(self);
+    if (root_index >= roots.len) return;
+    const path = file_explorer.joinAbsolute(self.allocator, roots[root_index].path, rel) catch return;
+    defer self.allocator.free(path);
+    openFileInViewer(self, path);
 }
 
 // ------------------------------------------------------------------
