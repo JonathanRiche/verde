@@ -31,7 +31,6 @@ const NF_COD_LOCK = "\u{EA75}";
 const NF_COD_WARNING = "\u{EA6C}";
 const NF_COD_LINK_EXTERNAL = "\u{EB14}";
 const NF_COD_GLOBE = "\u{EB01}";
-const NF_COD_RADIO_TOWER = "\u{EB6C}";
 
 const TAB_ROW_HEIGHT: f32 = 36.0;
 const NAV_ROW_HEIGHT: f32 = 44.0;
@@ -2180,20 +2179,13 @@ fn renderLocalServers(
     const header_size = theme.scaledUi(15.0);
     const name_size = theme.scaledUi(15.0);
     const detail_size = theme.scaledUi(12.5);
-    const icon_glyph_size = theme.scaledUi(16.0);
     const header_h = theme.scaledUi(LOCAL_SERVER_HEADER_HEIGHT);
     const row_h = theme.scaledUi(LOCAL_SERVER_ROW_HEIGHT);
     const radius = theme.scaledUi(LOCAL_SERVER_RADIUS);
     const muted = paletteColor(theme.COLOR_TEXT_MUTED);
 
-    queuePaletteIcon(state, .{
-        .x = rect.x,
-        .y = rect.y + (header_h - icon_glyph_size) * 0.5 - theme.scaledUi(4.0),
-        .w = icon_glyph_size,
-        .h = icon_glyph_size,
-    }, NF_COD_RADIO_TOWER, icon_glyph_size, muted);
     queuePaletteText(state, .{
-        .x = rect.x + icon_glyph_size + theme.scaledUi(10.0),
+        .x = rect.x + theme.scaledUi(4.0),
         .y = rect.y + (header_h - header_size * 1.3) * 0.5 - theme.scaledUi(4.0),
         .w = rect.w,
         .h = header_size * 1.3,
@@ -2248,7 +2240,7 @@ fn renderLocalServers(
             .y = row.y + (row.h - icon_size) * 0.5,
             .w = icon_size,
             .h = icon_size,
-        });
+        }, server.name());
 
         const text_x = row.x + pad + icon_size + theme.scaledUi(14.0);
         const text_w = row.x + row.w - pad - text_x;
@@ -2270,30 +2262,33 @@ fn renderLocalServers(
     }, "Select a live local server to open it in this browser tab.", muted, caption_size, clip);
 }
 
-// Draws a miniature app-window glyph: traffic-light dots over two text bars.
-fn renderLocalServerIcon(state: *app_state.AppState, rect: palette.Rect) void {
-    const accent = theme.accent();
-    // Tile and its marks sit on whole pixels: one panel command for the
-    // bordered tile, whole-pixel dot and bar sizes on snapped origins.
-    const tile = snapEdges(rect);
-    queuePalettePanel(state, tile, paletteColor(theme.mix(theme.background(), accent, 0.12)), paletteColor(theme.mix(theme.background(), accent, 0.35)), theme.scaledUi(6.0), hairline());
-    const dot = strokeWidth(theme.scaledUi(3.0));
-    const dot_y = @round(tile.y + theme.scaledUi(7.0));
-    const dot_colors = [_][4]f32{ theme.COLOR_DIFF_REMOVE, theme.COLOR_YELLOW, accent };
-    for (dot_colors, 0..) |color, index| {
-        queuePaletteRoundedRect(state, .{
-            .x = @round(tile.x + theme.scaledUi(6.0) + @as(f32, @floatFromInt(index)) * (dot + theme.scaledUi(2.5))),
-            .y = dot_y,
-            .w = dot,
-            .h = dot,
-        }, paletteColor(color), dot * 0.5);
-    }
-    const bar_color = paletteColor(theme.mix(theme.background(), accent, 0.45));
-    const bar_h = strokeWidth(theme.scaledUi(2.0));
-    const bar_x = @round(tile.x + theme.scaledUi(6.0));
-    const bar_w = @round(tile.x + tile.w - theme.scaledUi(6.0)) - bar_x;
-    queuePaletteRoundedRect(state, .{ .x = bar_x, .y = @round(tile.y + theme.scaledUi(15.0)), .w = bar_w, .h = bar_h }, bar_color, bar_h * 0.5);
-    queuePaletteRoundedRect(state, .{ .x = bar_x, .y = @round(tile.y + theme.scaledUi(20.0)), .w = @round(bar_w * 0.6), .h = bar_h }, bar_color, bar_h * 0.5);
+/// Playful codicons for server rows; each server keeps one by name.
+const LOCAL_SERVER_GLYPHS = [_][]const u8{
+    "\u{EB44}", // rocket
+    "\u{EAF2}", // flame
+    "\u{EA79}", // beaker
+    "\u{EB05}", // heart
+    "\u{EB58}", // squirrel
+    "\u{EB68}", // telescope
+    "\u{EBD5}", // compass
+    "\u{EC10}", // sparkle
+    "\u{EC15}", // coffee
+    "\u{EC17}", // game
+    "\u{EC1B}", // music
+    "\u{EBCF}", // wand
+    "\u{EB29}", // package
+    "\u{EA61}", // lightbulb
+};
+
+// Draws a server's glyph on a soft round tile tinted from the active theme.
+fn renderLocalServerIcon(state: *app_state.AppState, rect: palette.Rect, name: []const u8) void {
+    const hash = std.hash.Wyhash.hash(0, name);
+    const tints = [_][4]f32{ theme.accent(), theme.COLOR_YELLOW, theme.COLOR_DIFF_REMOVE, theme.COLOR_DIFF_ADD, theme.COLOR_TEXT_MUTED };
+    const tint = tints[(hash >> 32) % tints.len];
+    const glyph = LOCAL_SERVER_GLYPHS[hash % LOCAL_SERVER_GLYPHS.len];
+    queuePaletteRoundedRect(state, rect, paletteColor(theme.mix(theme.background(), tint, 0.16)), rect.w * 0.5);
+    const glyph_size = rect.w * 0.5;
+    queuePaletteIcon(state, iconRectForButton(rect, glyph_size), glyph, glyph_size, paletteColor(tint));
 }
 
 fn browserPageIsEmpty(browser_state: *const browser_runtime.State) bool {
