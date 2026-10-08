@@ -8,19 +8,34 @@ enum ClientCore {
 
 @main
 struct VerdeApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var hosts: HostsModel
     @State private var browse: BrowseModel
+    @State private var push: PushRegistry
 
     init() {
         SharedFile.cleanup()
         VerdeTheme.configure()
         let hosts = HostsModel.live(deviceLabel: UIDevice.current.name)
+        let push = PushRegistry.live()
+        push.hosts = hosts
+        hosts.onPushChange = { [weak push] id in push?.hostChanged(id) }
+        AppDelegate.registry = push
+        PushInbox.shared.forward = { [weak hosts] target in
+            guard let host = hosts?.session(target.hostID)?.host, let workspace = target.workspaceID,
+                  let thread = target.threadID, let turn = target.turnID else { return }
+            Task {
+                try? await host.send(.push_received(EventPushReceived(now_ms: 0, wall_time_ms: 0, workspace_id: workspace,
+                    thread_id: thread, turn_id: turn, kind: target.kind)))
+            }
+        }
         _hosts = State(initialValue: hosts)
         _browse = State(initialValue: BrowseModel(hosts: hosts, cache: hosts.cache))
+        _push = State(initialValue: push)
     }
 
     var body: some Scene {
-        WindowGroup { RootView(hosts: hosts, browse: browse) }
+        WindowGroup { RootView(hosts: hosts, browse: browse, push: push) }
     }
 }
 
@@ -33,6 +48,10 @@ private struct PairingSheet: Identifiable { let id: String }
 struct RootView: View {
     let hosts: HostsModel
     let browse: BrowseModel
+    let push: PushRegistry
+    @State private var inbox = PushInbox.shared
+    /// A notification's chat, opened once the host switch has cleared the old routes.
+    @State private var routeAfterSwitch: BrowseRoute?
     @Environment(\.scenePhase) private var scenePhase
     @State private var tab: RootTab = .home
     @State private var path: [BrowseRoute] = []
@@ -92,7 +111,7 @@ struct RootView: View {
         .environment(\.defaultMinListRowHeight, 44)
         .accessibilityHidden(lock.covered)
         .background(SecurityShield(lock: lock, covered: lock.covered).frame(width: 0, height: 0))
-        .sheet(isPresented: $settings) { AppSettings(lock: lock, browse: browse) }
+        .sheet(isPresented: $settings) { AppSettings(lock: lock, browse: browse, push: push) }
     }
 
     private var themeRefreshKey: String {
@@ -113,17 +132,55 @@ struct RootView: View {
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
             lock.phase(.active)
             hosts.foreground(lock.loaded && !lock.locked)
+            Task { await push.refresh() }
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in lock.inactive = true }
         .onChange(of: hosts.active) { _, _ in
             // Routes belong to the previous host's projections.
-            path = []
+            path = routeAfterSwitch.map { [$0] } ?? []
+            routeAfterSwitch = nil
             drawer = false
         }
+        .onChange(of: inbox.pending, initial: true) { _, _ in openNotification() }
+        .onChange(of: hosts.loading) { _, _ in openNotification() }
+        .onChange(of: visibleThread, initial: true) { _, key in VisibleThread.shared.set(key) }
         .onChange(of: scenePhase, initial: true) { _, phase in
             // `.inactive` (app switcher, system sheets) keeps the current state.
             lock.phase(phase)
             if phase != .inactive { hosts.foreground(phase == .active && lock.loaded && !lock.locked) }
+        }
+    }
+
+    /// The chat on screen (`host/workspace/thread`) for foreground notification suppression.
+    private var visibleThread: String? {
+        guard tab != .hosts, !drawer, !settings, let host = hosts.active,
+              case .thread(let workspace, let thread)? = path.last else { return nil }
+        return [host, workspace, thread].joined(separator: "/")
+    }
+
+    /// A tapped notification or action: switch to its host and open the chat, handing any
+    /// approval or reply to the chat screen.
+    private func openNotification() {
+        guard !hosts.loading, inbox.pending != nil, let target = inbox.take(), hosts.row(target.hostID) != nil else { return }
+        var route: BrowseRoute?
+        if let workspace = target.workspaceID, let thread = target.threadID {
+            route = .thread(workspace: workspace, thread: thread)
+            switch target.action {
+            case .approve: ApprovalHandoff.put(host: target.hostID, workspace: workspace, thread: thread, .init(decision: .approve, turnID: target.turnID))
+            case .deny: ApprovalHandoff.put(host: target.hostID, workspace: workspace, thread: thread, .init(decision: .deny, turnID: target.turnID))
+            case .reply(let text): PromptHandoff.put(host: target.hostID, workspace: workspace, thread: thread, text: text)
+            case .open: break
+            }
+        }
+        settings = false
+        drawer = false
+        if tab == .hosts { tab = .home }
+        if hosts.active != target.hostID {
+            routeAfterSwitch = route
+            if !hosts.select(target.hostID) { routeAfterSwitch = nil }
+        } else if let route {
+            if path.last != route { path = [route] }
+            NotificationCenter.default.post(name: .verdeChatHandoff, object: nil)
         }
     }
 

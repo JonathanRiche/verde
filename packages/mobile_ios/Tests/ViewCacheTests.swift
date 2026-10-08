@@ -72,13 +72,13 @@ final class ViewCacheTests: XCTestCase {
     }
 
     func testPushOpenReturnsGenericNoticeOrRejectsMalformedRequests() throws {
-        let generic = try PushOpen.open(PushOpenRequest(api_version: 1, envelope: "not-an-envelope",
-            keys: [PushOpenKey(host_id: "alpha", record_base64: "e30=")], recent: []))
+        let generic = try PushDecrypt.open(PushOpenInput(envelope: "not-an-envelope",
+            keys: [.init(host_id: "alpha", record_base64: "e30=")], recent: []))
         XCTAssertFalse(generic.opened)
         XCTAssertNotNil(generic.error)
         XCTAssertNil(generic.host_id)
         XCTAssertTrue(generic.deep_link.hasPrefix("verde://open"))
         XCTAssertFalse(generic.title.isEmpty)
-        XCTAssertThrowsError(try PushOpen.open(PushOpenRequest(api_version: 2, envelope: "x", keys: [])))
+        XCTAssertThrowsError(try PushDecrypt.open(PushOpenInput(api_version: 2, envelope: "x", keys: [])))
     }
 }

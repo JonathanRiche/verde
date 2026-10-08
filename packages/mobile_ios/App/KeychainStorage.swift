@@ -39,28 +39,18 @@ extension SecureStorage {
     }
 }
 
-protocol KeychainAPI {
-    func copy(_ query: CFDictionary, _ result: UnsafeMutablePointer<CFTypeRef?>) -> OSStatus
-    func update(_ query: CFDictionary, _ attributes: CFDictionary) -> OSStatus
-    func add(_ query: CFDictionary) -> OSStatus
-    func remove(_ query: CFDictionary) -> OSStatus
-}
-
-struct SystemKeychainAPI: KeychainAPI {
-    func copy(_ query: CFDictionary, _ result: UnsafeMutablePointer<CFTypeRef?>) -> OSStatus { SecItemCopyMatching(query, result) }
-    func update(_ query: CFDictionary, _ attributes: CFDictionary) -> OSStatus { SecItemUpdate(query, attributes) }
-    func add(_ query: CFDictionary) -> OSStatus { SecItemAdd(query, nil) }
-    func remove(_ query: CFDictionary) -> OSStatus { SecItemDelete(query) }
-}
-
 struct KeychainStorage: SecureStorage {
-    var service = "dev.verdeai.app.core"
+    var service = SharedKeychain.service
     var api: KeychainAPI = SystemKeychainAPI()
+    /// Push key records go to the access group shared with the notification extension.
+    var sharedGroup: String? = SharedKeychain.group
 
     func query(_ key: String) -> [String: Any] {
-        [kSecClass as String: kSecClassGenericPassword,
-         kSecAttrService as String: service, kSecAttrAccount as String: key,
-         kSecAttrSynchronizable as String: false]
+        var query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                                    kSecAttrService as String: service, kSecAttrAccount as String: key,
+                                    kSecAttrSynchronizable as String: false]
+        if let sharedGroup, SharedKeychain.pushHost(key) != nil { query[kSecAttrAccessGroup as String] = sharedGroup }
+        return query
     }
     func get(_ key: String) throws -> Data? {
         var request = query(key)

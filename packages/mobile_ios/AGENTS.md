@@ -26,6 +26,13 @@ and [core toolchain](../client_core/docs/ios-toolchain.md).
   a rotating leaf certificate, with an explicit re-trust flow.
 - Foreground refreshes auth, opens a ticketed socket and catches up; background
   closes the socket and stops polling. Network changes use core backoff.
-- Push uses native APNs, no Firebase SDK. The extension is a pass-through
-  placeholder until I-10; do not add signing entitlements or secret keys here.
+- Push uses native APNs, no Firebase SDK and no App Group. Only the core's
+  `vc/1/<host>/push` key records go to the shared Keychain access group
+  `$(AppIdentifierPrefix)dev.verdeai.app.shared` (`SharedKeychain`); every other
+  record stays in the app's default group. The extension gets that group and
+  nothing else (no `aps-environment`). `aps-environment` is development for
+  Debug and production for Release, and `VerdeAPSEnvironment` keeps the relay
+  environment in step. An empty `VERDE_PUSH_RELAY_URL` turns registration off.
+  Ask for notification permission after a pair or from Settings, never at
+  launch. APNs tokens, `send_token`s, keys and decrypted content are never logged.
 - Tests use temporary state and finite deadlines, never a live host or provider.

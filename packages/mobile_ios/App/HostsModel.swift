@@ -51,6 +51,8 @@ final class HostsModel {
     /// Browse/cache observers: the active host changed, or a host's store published.
     @ObservationIgnored var onActiveChange: (() -> Void)?
     @ObservationIgnored var onStoreChange: ((String) -> Void)?
+    /// Push registration (I-10): a host's projection changed or the host was removed.
+    @ObservationIgnored var onPushChange: ((String) -> Void)?
 
     private let storage: SecureStorage
     let cache: ViewCache?
@@ -211,6 +213,7 @@ final class HostsModel {
             cleared.remove(id)
             cache?.clear(id)
             if pairing == id { pairing = nil }
+            onPushChange?(id)
         }
     }
 
@@ -242,6 +245,7 @@ final class HostsModel {
         }
         if session.awaitingSubmit { Task { await session.submitPending() } }
         onStoreChange?(id)
+        onPushChange?(id)
     }
 
     /// Pairing links (scanned, pasted, universal or custom-scheme) go to the host
@@ -312,6 +316,33 @@ final class HostsModel {
         let all = Array(sessions.values)
         sessions.removeAll()
         for session in all { await session.stop() }
+    }
+}
+
+extension HostsModel: PushHosts {
+    var pushCatalogLoaded: Bool { !loading }
+    var pushHostIDs: [String] { catalog.hosts.map(\.id) }
+    func pushView(_ id: String) -> HostView? { sessions[id]?.row }
+
+    /// Receipts are read from the actor; the X25519 key seed and capability exist only in
+    /// this event and the core's secure-store record.
+    func pushRegister(_ id: String, sendToken: String, keySeed: String) async -> Bool {
+        guard !closed, let host = sessions[id]?.host else { return false }
+        let intent = UUID().uuidString
+        do {
+            try await host.send(.push_register(EventPushRegister(now_ms: 0, wall_time_ms: 0, intent_id: intent,
+                platform: "ios", send_token: sendToken, key_seed_base64: keySeed)))
+        } catch { return false }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(30))
+        while ContinuousClock.now < deadline {
+            if let data = try? await host.query("operations"),
+               let op = (try? JSONDecoder().decode(OperationsQuery.self, from: data))?.data?.items.first(where: { $0.intent_id == intent }),
+               op.state != "pending" {
+                return op.state == "succeeded"
+            }
+            try? await Task.sleep(for: .milliseconds(200))
+        }
+        return false
     }
 }
 

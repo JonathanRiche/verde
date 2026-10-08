@@ -65,13 +65,18 @@ jobs:
             echo "$NSE_PROFILE_BASE64" | base64 --decode > "$dir/verde-nse.mobileprovision"
           done
 
+      # Release signs aps-environment=production plus keychain-access-groups (app and NSE);
+      # the "Verde App Store" profile must carry Push Notifications.
       - name: Archive
         working-directory: packages/mobile_ios
+        env:
+          # Empty (variable unset) builds without push registration.
+          VERDE_PUSH_RELAY_URL: ${{ vars.VERDE_PUSH_RELAY_URL }}
         run: |
           xcodegen generate
           xcodebuild -project Verde.xcodeproj -scheme Verde -configuration Release \
             -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/Verde.xcarchive" \
-            CURRENT_PROJECT_VERSION=${{ github.run_number }} archive
+            CURRENT_PROJECT_VERSION=${{ github.run_number }} VERDE_PUSH_RELAY_URL="$VERDE_PUSH_RELAY_URL" archive
 
       - name: Upload to TestFlight
         env:

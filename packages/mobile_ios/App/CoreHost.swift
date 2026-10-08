@@ -226,7 +226,9 @@ actor CoreHost {
              // Terminal intents: e.g. an unencodable key or the 32-record limit.
              // A rejected device reply is dropped, never replayed.
              .terminal_create, .terminal_attach, .terminal_detach, .terminal_kill,
-             .terminal_resize, .terminal_input, .terminal_reply: return true
+             .terminal_resize, .terminal_input, .terminal_reply,
+             // Push (I-10): e.g. registration while offline, or a forwarded push before start.
+             .push_register, .push_received: return true
         default: return false
         }
     }

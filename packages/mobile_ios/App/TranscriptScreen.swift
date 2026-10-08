@@ -69,14 +69,27 @@ struct TranscriptScreen: View {
                 next.start()
             }
             model?.setVisible(true)
-            // An "Ask agent" selection from the file or diff viewer arrives with this navigation.
-            if let model, let prompt = PromptHandoff.take(host: browse.hostID, workspace: workspaceID, thread: threadID) {
-                model.input.ask(prompt)
-            }
+            takeHandoffs()
         }
+        // A notification for this chat while it is already on screen.
+        .onReceive(NotificationCenter.default.publisher(for: .verdeChatHandoff)) { _ in takeHandoffs() }
         // Focus is released after a short delay (or by the model's owner check once it is gone),
         // so a quick return to this chat doesn't churn the core's focus slot.
         .onDisappear { model?.setVisible(false) }
+    }
+}
+
+extension TranscriptScreen {
+    /// "Ask agent" selections (file/diff viewers) and notification replies arrive as prompts;
+    /// notification Approve/Deny as an approval hand-off.
+    fileprivate func takeHandoffs() {
+        guard let model else { return }
+        if let prompt = PromptHandoff.take(host: browse.hostID, workspace: workspaceID, thread: threadID) {
+            model.input.ask(prompt)
+        }
+        if let request = ApprovalHandoff.take(host: browse.hostID, workspace: workspaceID, thread: threadID) {
+            Task { _ = await model.decideFromNotification(request) }
+        }
     }
 }
 

@@ -69,6 +69,7 @@ struct HostPalette: Decodable {
 struct AppSettings: View {
     let lock: AppLock
     let browse: BrowseModel
+    let push: PushRegistry
     @Environment(\.dismiss) private var dismiss
     @State private var appearance = AppearanceSettings.shared
     var body: some View {
@@ -83,6 +84,7 @@ struct AppSettings: View {
                     Text("Animations follow Reduce Motion in iOS Accessibility settings and the host theme when supplied.").font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted)
                 }
                 CommitSettingsSection(browse: browse)
+                NotificationSettingsSection(registry: push)
                 SecuritySettings(lock: lock)
             }.scrollContentBackground(.hidden).background(VerdeTheme.background)
             .navigationTitle("Settings").navigationBarTitleDisplayMode(.inline)
