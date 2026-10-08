@@ -63,6 +63,7 @@ const browser_controller = @import("state/browser_controller.zig");
 const side_panel_controller = @import("state/side_panel_controller.zig");
 const cookie_import_controller = @import("state/cookie_import_controller.zig");
 const git_changes_controller = @import("state/git_changes_controller.zig");
+const workspace_changes_controller = @import("state/workspace_changes_controller.zig");
 const workspace_controller = @import("state/workspace_controller.zig");
 const lifecycle_controller = @import("state/lifecycle_controller.zig");
 const chat_controller = @import("state/chat_controller.zig");
@@ -4932,6 +4933,8 @@ pub const AppState = struct {
     /// Browser "Import cookies…" flow (per-site, agent-safety gated).
     cookie_import: cookie_import_controller.State = .{},
     git_changes: git_changes_controller.State = .{},
+    /// Side panel Changes view (workspace-wide uncommitted files).
+    workspace_changes: workspace_changes_controller.State = .{},
     app_config_file_mtime: i128,
     app_config_runtime_sync_pending: bool,
     project_directory_browse_requested: bool,
@@ -8607,6 +8610,16 @@ pub const AppState = struct {
     pub const submitCookieImport = cookie_import_controller.submitCookieImport;
     pub const pollCookieImport = cookie_import_controller.pollCookieImport;
     pub const noteCookieImportCompleted = cookie_import_controller.noteCookieImportCompleted;
+    pub const refreshWorkspaceChangesNow = workspace_changes_controller.refreshWorkspaceChangesNow;
+    pub const setWorkspaceChangesFilter = workspace_changes_controller.setWorkspaceChangesFilter;
+    pub const toggleWorkspaceChangesFile = workspace_changes_controller.toggleWorkspaceChangesFile;
+    pub const toggleAllWorkspaceChangesFiles = workspace_changes_controller.toggleAllWorkspaceChangesFiles;
+    pub const expandWorkspaceChangesContext = workspace_changes_controller.expandWorkspaceChangesContext;
+    pub const expandWorkspaceChangesFully = workspace_changes_controller.expandWorkspaceChangesFully;
+    pub const workspaceChangesPatch = workspace_changes_controller.workspaceChangesPatch;
+    pub const setWorkspaceChangesSelection = workspace_changes_controller.setWorkspaceChangesSelection;
+    pub const openWorkspaceChangesCommit = workspace_changes_controller.openWorkspaceChangesCommit;
+    pub const openChangedFileInViewer = workspace_changes_controller.openChangedFileInViewer;
     pub const refreshGitChangesSummary = git_changes_controller.refreshGitChangesSummary;
     pub const refreshSelectedWorkspaceGitChanges = git_changes_controller.refreshSelectedWorkspaceGitChanges;
     pub const ensureGitChangesSummary = git_changes_controller.ensureGitChangesSummary;
@@ -15518,6 +15531,7 @@ pub const AppState = struct {
         self.browser_controller.deinit(self.allocator);
         self.cookie_import.deinit();
         self.git_changes.deinit();
+        self.workspace_changes.deinit();
         self.releaseAllImageTextures();
         self.thread_import_threads.deinit(self.allocator);
         if (self.handoff_controller.preview) |preview| self.allocator.free(preview);

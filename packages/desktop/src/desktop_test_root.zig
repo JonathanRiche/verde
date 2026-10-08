@@ -49,6 +49,7 @@ test {
     _ = @import("ui/handoff_sheet.zig");
     _ = @import("state/handoff_controller.zig");
     _ = @import("state/git_changes_controller.zig");
+    _ = @import("state/workspace_changes_controller.zig");
     _ = @import("ui/commit_sheet.zig");
     _ = @import("ui/workspace_strip.zig");
     _ = @import("ui/workspace_identity.zig");

@@ -15,6 +15,7 @@ const daemon_client = @import("../daemon/client.zig");
 const headless = @import("headless");
 const app_config = @import("../app/config.zig");
 const chat_types = @import("chat_types.zig");
+const workspace_changes = @import("workspace_changes_controller.zig");
 
 const proto = headless.git_changes_protocol;
 const Mutex = std.atomic.Mutex;
@@ -1562,6 +1563,7 @@ pub fn refreshSelectedWorkspaceGitChanges(self: anytype, debounce: bool) void {
 /// `chat.turn` journal activity: chats may have edited files.
 pub fn noteGitChangesJournalActivity(self: anytype) void {
     refreshSelectedWorkspaceGitChanges(self, true);
+    workspace_changes.noteWorkspaceChangesActivity(self);
 }
 
 pub fn gitChangesThreadSummary(self: anytype, local_thread_id: []const u8) ?ThreadSummary {
@@ -1805,6 +1807,7 @@ pub fn closeCommitSheet(self: anytype) void {
     closeCommitSheetSilently(self);
     if (workspace_id) |id| refreshGitChangesSummary(self, id, false);
     if (thread_id) |id| refreshGitChangesStatus(self, id);
+    workspace_changes.noteWorkspaceChangesActivity(self);
     self.markDirty();
 }
 
@@ -2215,6 +2218,7 @@ fn quickFallbackToSheet(self: anytype, notice: ?[]const u8) void {
 fn refreshAfterQuick(self: anytype, workspace_id: []const u8, local_thread_id: []const u8) void {
     refreshGitChangesSummary(self, workspace_id, false);
     refreshGitChangesStatus(self, local_thread_id);
+    workspace_changes.noteWorkspaceChangesActivity(self);
 }
 
 /// Commit & push: review, then commit this chat's own files (shared and
@@ -2722,6 +2726,7 @@ fn isUnknownMethod(code: ?[]const u8) bool {
 
 /// Drains finished workers on the UI thread. Call from the main poll loop.
 pub fn pollGitChanges(self: anytype) void {
+    workspace_changes.pollWorkspaceChanges(self);
     const state = &self.git_changes;
     if (takeCompleted(state.lane(.summary))) |done| {
         var result = done.result;
@@ -2908,6 +2913,7 @@ fn applyCommitResult(self: anytype, request: *Request, result: *Result) void {
                 state.setRejected(sheet.workspace_id, sheet.local_thread_id, root);
                 refreshGitChangesSummary(self, sheet.workspace_id, false);
                 refreshGitChangesStatus(self, thread_id);
+                workspace_changes.noteWorkspaceChangesActivity(self);
                 showToast(self, commitToast(parsed.value, push_requested));
             } else {
                 if (state.rejectedFor(thread_id) and parsed.value.repos.len > 0 and std.mem.eql(u8, parsed.value.repos[0].push, "pushed")) state.clearRejected();
