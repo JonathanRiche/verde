@@ -6258,6 +6258,7 @@ struct Pane: Codable {
     var `started_at_ms`: Int64? = nil
     var `can_stop`: Bool = false
     var `attention_kind`: String? = nil
+    var `provider`: String? = nil
 }
 
 extension Pane {
@@ -6273,6 +6274,7 @@ extension Pane {
         case `started_at_ms`
         case `can_stop`
         case `attention_kind`
+        case `provider`
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -6301,6 +6303,9 @@ extension Pane {
         if !c.contains(.`attention_kind`) { self.`attention_kind` = nil } else {
         self.`attention_kind` = try c.decodeIfPresent(String.self, forKey: .`attention_kind`)
         }
+        if !c.contains(.`provider`) { self.`provider` = nil } else {
+        self.`provider` = try c.decodeIfPresent(String.self, forKey: .`provider`)
+        }
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -6315,6 +6320,7 @@ extension Pane {
         try c.encode(self.`started_at_ms`, forKey: .`started_at_ms`)
         try c.encode(self.`can_stop`, forKey: .`can_stop`)
         try c.encode(self.`attention_kind`, forKey: .`attention_kind`)
+        try c.encode(self.`provider`, forKey: .`provider`)
     }
 }
 

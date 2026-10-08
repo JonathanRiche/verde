@@ -141,7 +141,7 @@ internal fun WorkspaceDrawer(state: BrowseState, currentTab: String, visible: Bo
                             if (row.thread != null) DrawerChat(row.thread, selectedWorkspace == ws && selectedThread == row.thread.thread_id,
                                 canEditThreads, onThreadAction, row.workspace.takeIf { chip }) { onThread(ws, row.thread.thread_id) }
                             else row.pane?.terminal_id?.let { id ->
-                                DrawerRow(">_ ${row.title}", selectedWorkspace == ws && selectedTerminal == id, chip = row.workspace.takeIf { chip }) { onTerminal(ws, id) }
+                                DrawerTerminal(row.pane, selectedWorkspace == ws && selectedTerminal == id, row.workspace.takeIf { chip }) { onTerminal(ws, id) }
                             }
                         }
                     }
@@ -271,6 +271,23 @@ internal fun DrawerChat(thread: ThreadSummary, active: Boolean, canEdit: Boolean
                 onClick = { menu = false; onAction(thread, "close") })
         }
     }
+}
+
+/** Terminal row: an agent TUI shows its provider glyph and a live status pip, like the desktop/web rail. */
+@Composable
+private fun DrawerTerminal(pane: Pane, active: Boolean, chip: Workspace?, onClick: () -> Unit) {
+    VerdeListRow(headlineContent = { Text(pane.title, color = if (active) VerdeColors.AccentHi else VerdeColors.Text, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+        leadingContent = { Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+            chip?.let { WorkspaceChip(it, 16.dp) }
+            if (pane.provider != null) ProviderGlyph(pane.provider)
+            else Text(">_", style = MaterialTheme.typography.labelMedium, color = VerdeColors.Subtle)
+        } },
+        trailingContent = if (activeStatus(pane.status)) ({
+            StatusPip(statusColor(pane.status, pane.status == "waiting"), paneLabel(pane), active = pane.status == "working")
+        }) else null,
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 2.dp)
+            .background(if (active) VerdeColors.AccentWash else VerdeColors.Panel, RoundedCornerShape(7.dp))
+            .semantics { selected = active }.clickable(onClick = onClick))
 }
 
 @Composable

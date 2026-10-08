@@ -1599,6 +1599,7 @@ data class Pane(
     val `started_at_ms`: Long? = null,
     val `can_stop`: Boolean = false,
     val `attention_kind`: String? = null,
+    val `provider`: String? = null,
 )
 
 @Serializable

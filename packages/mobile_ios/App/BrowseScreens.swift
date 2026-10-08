@@ -106,6 +106,7 @@ private struct PaneItem: View {
     var body: some View {
         MenuRow(content: RowContent(title: pane.title, detail: paneLine(pane, now),
                                     dot: Dot(color: VerdeTheme.status(pane.status, attention: pane.attention), label: paneLabel(pane)),
+                                    provider: pane.kind == "terminal" ? pane.provider : nil,
                                     badge: attentionLabel(pane.attention_kind)),
                 destination: route(pane), copies: [("Copy title", pane.title)])
             .overlay(alignment: .topTrailing) { if let thread = pane.thread_id { GitThreadDot(browse: browse, workspace: pane.workspace_id, thread: thread).padding(8) } }

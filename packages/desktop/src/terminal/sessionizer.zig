@@ -43,6 +43,8 @@ const workspace_identity = @import("../platform/workspace_identity.zig");
 const stack = @import("../workspace/stack.zig");
 const platform_runtime = @import("platform_runtime");
 const directory_browser = @import("../daemon/directory_browser.zig");
+const workspace_files = @import("../daemon/workspace_files.zig");
+const workspace_files_protocol = headless.workspace_files_protocol;
 const process_env = @import("../platform/env.zig");
 const provider_cli_version = @import("../providers/cli_version.zig");
 const provider_hooks = @import("../providers/hooks.zig");
@@ -2927,6 +2929,7 @@ pub const Daemon = struct {
         // lockDaemon for SQLite work; route before the generic mutator drain gate.
         if (std.mem.eql(u8, method, "workspace.create")) return try workspaceCreateResponse(self, id_value, params);
         if (std.mem.eql(u8, method, directory_browser.METHOD)) return try workspaceDirectoryListResponse(self, id_value, params);
+        if (std.mem.eql(u8, method, workspace_files_protocol.METHOD_LIST) or std.mem.eql(u8, method, workspace_files_protocol.METHOD_READ)) return try workspaceFilesBrowseResponse(self, id_value, method, params);
         if (std.mem.eql(u8, method, "workspace.close")) return try self.workspaceCloseResponse(id_value, params);
         if (std.mem.eql(u8, method, "chat.subagent.open")) return try self.chatSubagentOpenResponse(id_value, params);
         if (isStoreMethod(method)) return try self.handleStoreRequest(id_value, method, params);
@@ -3010,6 +3013,8 @@ pub const Daemon = struct {
         if (std.mem.eql(u8, method, git_changes_protocol.METHOD_PULL_PUSH)) return try gitChangesPullPushResponse(self, id_value, params);
         if (std.mem.eql(u8, method, git_changes_protocol.METHOD_PUSH)) return try gitChangesPushResponse(self, id_value, params);
         if (std.mem.eql(u8, method, git_changes_protocol.METHOD_STATUS)) return try gitChangesStatusResponse(self, id_value, params);
+        if (std.mem.eql(u8, method, git_changes_protocol.METHOD_WORKSPACE)) return try gitChangesWorkspaceResponse(self, id_value, params);
+        if (std.mem.eql(u8, method, git_changes_protocol.METHOD_FILE_PATCH)) return try gitChangesFilePatchResponse(self, id_value, params);
         if (std.mem.eql(u8, method, git_changes_protocol.METHOD_CONFIG_COMMIT_SET)) return try configCommitSetResponse(self, id_value, params);
         if (std.mem.eql(u8, method, store_protocol.METHOD_BROWSER_COOKIE_SOURCES_LIST)) return try browserCookieSourcesListResponse(self, id_value);
         if (std.mem.eql(u8, method, store_protocol.METHOD_BROWSER_COOKIE_DOMAINS_LIST)) return try browserCookieDomainsListResponse(self, id_value, params);
@@ -13210,6 +13215,10 @@ fn methodRunsUnlocked(method: []const u8) bool {
     // mutex only; the `.normal` outer lockDaemon window cannot nest that work.
     return std.mem.eql(u8, method, "workspace.create") or std.mem.eql(u8, method, "workspace.close") or std.mem.eql(u8, method, "chat.subagent.open") or
         std.mem.eql(u8, method, directory_browser.METHOD) or
+        // Explorer listing/preview: a short store read, then filesystem and
+        // `git check-ignore` work with no lock held.
+        std.mem.eql(u8, method, workspace_files_protocol.METHOD_LIST) or
+        std.mem.eql(u8, method, workspace_files_protocol.METHOD_READ) or
         std.mem.startsWith(u8, method, "chat.links.") or std.mem.startsWith(u8, method, "chat.tasks.") or
         // Browser history is per-keystroke SQLite work under the store mutex
         // only; it pins in_flight and checks the drain flag itself.
@@ -14138,6 +14147,13 @@ fn writeSessionSummary(s: *std.json.Stringify, session: *const PtySession) !void
     try s.write(session.child_pid);
     try s.objectField("foreground_process_group");
     if (session.foregroundProcessGroup()) |pgrp| try s.write(pgrp) else try s.write(null);
+    // Foreground program name (e.g. `claude`) so detached clients can show the
+    // agent provider of a TUI running in a shell, as the desktop sidebar does.
+    var comm_buffer: [64]u8 = undefined;
+    try s.objectField("foreground_process");
+    if (session.foregroundProcessGroup()) |pgrp| {
+        if (processComm(pgrp, &comm_buffer)) |comm| try s.write(comm) else try s.write(null);
+    } else try s.write(null);
     try s.objectField("child_process_count");
     try s.write(childProcessCount(session.child_pid));
     try s.objectField("running");
@@ -14999,6 +15015,66 @@ fn workspaceFilesSearchResponse(daemon: *Daemon, id_value: std.json.Value, param
         .truncated = results.truncated,
         .source = @tagName(results.source),
     });
+}
+
+/// `workspace.files.list` / `workspace.files.read`: the explorer tree and
+/// file preview. Roots come only from the stored workspace path and its
+/// `verde.toml` folders; the store is read under its own short window and all
+/// filesystem/git work runs with no lock held.
+fn workspaceFilesBrowseResponse(daemon: *Daemon, id_value: std.json.Value, method: []const u8, params: std.json.Value) ![]u8 {
+    const allocator = daemon.allocator;
+    const is_read = std.mem.eql(u8, method, workspace_files_protocol.METHOD_READ);
+    var arena_state: std.heap.ArenaAllocator = .init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Request = struct { workspace_id: []const u8, path: ?[]const u8 = null, max_bytes: ?u64 = null };
+    const request = std.json.parseFromValueLeaky(Request, arena, params, .{ .ignore_unknown_fields = true }) catch
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "workspace files request requires workspace_id");
+    if (request.workspace_id.len == 0 or (is_read and request.path == null))
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "workspace files request is missing workspace_id or path");
+
+    lockDaemon(daemon);
+    const service = daemon.store_service;
+    if (service) |svc| _ = svc.in_flight.fetchAdd(1, .monotonic);
+    daemon.mutex.unlock();
+    const svc = service orelse return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_STORE_UNAVAILABLE, "store is unavailable");
+    defer _ = svc.in_flight.fetchSub(1, .monotonic);
+    const home = blk: {
+        lockStoreService(svc);
+        defer svc.mutex.unlock();
+        const row = (svc.store.conn.row("select path from workspaces where workspace_id = ?1", .{request.workspace_id}) catch
+            return try storeErrorResponse(allocator, id_value, error.StoreUnavailable)) orelse
+            return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_RESOURCE_NOT_FOUND, "workspace not found");
+        defer row.deinit();
+        break :blk try arena.dupe(u8, row.text(0));
+    };
+    if (!directory_browser.validPath(home))
+        return try errorResponseAlloc(allocator, id_value, workspace_files_protocol.ERR_NOT_FOUND, "workspace folder is unavailable");
+
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const roots = try workspace_files.rootsFor(arena, io, home);
+    if (roots.len == 0) return try errorResponseAlloc(allocator, id_value, workspace_files_protocol.ERR_NOT_FOUND, "workspace folder is unavailable");
+    const requested = request.path orelse return try okValueResponse(allocator, id_value, workspace_files_protocol.ListResult{ .roots = roots });
+    if (is_read) {
+        const result = workspace_files.read(arena, io, roots, requested, request.max_bytes) catch |err|
+            return try workspaceFilesErrorResponse(allocator, id_value, err);
+        return try okValueResponse(allocator, id_value, result);
+    }
+    const result = workspace_files.list(arena, io, roots, requested) catch |err|
+        return try workspaceFilesErrorResponse(allocator, id_value, err);
+    return try okValueResponse(allocator, id_value, result);
+}
+
+fn workspaceFilesErrorResponse(allocator: std.mem.Allocator, id_value: std.json.Value, err: anyerror) ![]u8 {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.FileNotFound => errorResponseAlloc(allocator, id_value, workspace_files_protocol.ERR_NOT_FOUND, "file or folder not found"),
+        error.NotDir => errorResponseAlloc(allocator, id_value, workspace_files_protocol.ERR_NOT_DIRECTORY, "path is not a folder"),
+        error.NotFile => errorResponseAlloc(allocator, id_value, workspace_files_protocol.ERR_NOT_FILE, "path is not a regular file"),
+        else => errorResponseAlloc(allocator, id_value, workspace_files_protocol.ERR_PATH_OUTSIDE_ROOTS, "path is outside the workspace folders or inaccessible"),
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -16103,6 +16179,154 @@ fn gitChangesPushResponse(daemon: *Daemon, id_value: std.json.Value, params: std
     return try okValueResponse(allocator, id_value, result);
 }
 
+/// Repository roots of a workspace for the Changes view: its folder and
+/// configured extra folders (as a turn would snapshot them) plus every
+/// repository holding the workspace's claims.
+fn gitChangesWorkspaceRoots(daemon: *Daemon, arena: std.mem.Allocator, git: *git_changes.Git, workspace_id: []const u8) ![]const []const u8 {
+    var roots: std.ArrayList([]const u8) = .empty;
+    {
+        daemon.git_changes.mutex.lock();
+        defer daemon.git_changes.mutex.unlock();
+        try roots.appendSlice(arena, try daemon.git_changes.ledger.workspaceRepos(arena, workspace_id));
+    }
+    const route = git_changes_protocol.StatusRequest{ .workspace_id = workspace_id, .local_thread_id = "" };
+    const project_root = gitChangesRouteRoot(daemon, arena, route) orelse return roots.items;
+    for (try gitChangesTurnPaths(arena, project_root, null)) |path| {
+        const top = (try git_changes.repoToplevel(git, path)) orelse continue;
+        const seen = for (roots.items) |root| {
+            if (std.mem.eql(u8, root, top)) break true;
+        } else false;
+        if (!seen) try roots.append(arena, top);
+    }
+    return roots.items;
+}
+
+fn gitChangesWorkspaceResponse(daemon: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+    const allocator = daemon.allocator;
+    var parsed = parseDaemonParams(git_changes_protocol.WorkspaceRequest, allocator, params) catch
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid git changes workspace request");
+    defer parsed.deinit();
+    const workspace_id = parsed.value.workspace_id;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var git = git_changes.Git.init(arena) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "git is not available"),
+    };
+    defer git.deinit();
+    const roots = try gitChangesWorkspaceRoots(daemon, arena, &git, workspace_id);
+    var repo_claims: std.ArrayList(git_changes.RepoClaims) = .empty;
+    const revision = blk: {
+        daemon.git_changes.mutex.lock();
+        defer daemon.git_changes.mutex.unlock();
+        for (roots) |root| {
+            try repo_claims.append(arena, .{ .root = root, .claims = try daemon.git_changes.ledger.claimsForRepo(arena, root) });
+        }
+        break :blk daemon.git_changes.ledger.revision;
+    };
+
+    // git with no daemon lock held.
+    const changes = git_changes.workspaceChanges(&git, workspace_id, repo_claims.items) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "git changes could not be read"),
+    };
+
+    const service = gitChangesPinStore(daemon);
+    defer if (service) |svc| {
+        _ = svc.in_flight.fetchSub(1, .monotonic);
+    };
+    // One title lookup per chat, not per file.
+    var titles: std.StringHashMapUnmanaged([]const u8) = .empty;
+    var repos: std.ArrayList(git_changes_protocol.WorkspaceRepo) = .empty;
+    for (changes) |repo| {
+        const files = try arena.alloc(git_changes_protocol.WorkspaceFile, repo.files.len);
+        for (repo.files, files) |file, *out| {
+            const owners = try arena.alloc(git_changes_protocol.WorkspaceOwner, file.owners.len);
+            for (file.owners, owners) |owner, *owner_out| {
+                const title = titles.get(owner.thread_id) orelse title: {
+                    const value = gitChangesThreadTitle(arena, service, workspace_id, owner.thread_id);
+                    try titles.put(arena, owner.thread_id, value);
+                    break :title value;
+                };
+                owner_out.* = .{ .local_thread_id = owner.thread_id, .title = title, .unclear = owner.unclear };
+            }
+            out.* = .{
+                .path = file.path,
+                .status = @tagName(file.status),
+                .untracked = file.untracked,
+                .ownership = @tagName(file.ownership),
+                .owners = owners,
+                .additions = file.additions,
+                .deletions = file.deletions,
+                .binary = file.binary,
+            };
+        }
+        try repos.append(arena, .{
+            .root = repo.root,
+            .name = std.fs.path.basename(repo.root),
+            .head = repo.head,
+            .branch = repo.status.branch,
+            .default_branch = repo.status.default_branch,
+            .is_default_branch = repo.status.is_default_branch,
+            .upstream = repo.status.upstream,
+            .ahead = repo.status.ahead,
+            .behind = repo.status.behind,
+            .has_remote = repo.status.has_remote,
+            .too_many_files = repo.too_many_files,
+            .files = files,
+        });
+    }
+    return try okValueResponse(allocator, id_value, git_changes_protocol.WorkspaceResult{
+        .workspace_id = workspace_id,
+        .revision = revision,
+        .repos = repos.items,
+    });
+}
+
+fn gitChangesFilePatchResponse(daemon: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+    const allocator = daemon.allocator;
+    var parsed = parseDaemonParams(git_changes_protocol.FilePatchRequest, allocator, params) catch
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid git changes file patch request");
+    defer parsed.deinit();
+    const request = parsed.value;
+    if (!git_changes.validRelativePath(request.path))
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "path must be repository-relative");
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var git = git_changes.Git.init(arena) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "git is not available"),
+    };
+    defer git.deinit();
+    // Only this workspace's repositories may be read.
+    const known = for (try gitChangesWorkspaceRoots(daemon, arena, &git, request.workspace_id)) |root| {
+        if (std.mem.eql(u8, root, request.root)) break true;
+    } else false;
+    if (!known) return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "root is not a repository of this workspace");
+
+    const patch = git_changes.filePatch(&git, request.root, request.path, request.context_lines) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidSelection => return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "path must be repository-relative"),
+        else => return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "git changes could not be read"),
+    };
+    return try okValueResponse(allocator, id_value, git_changes_protocol.FilePatchResult{
+        .root = request.root,
+        .path = request.path,
+        .clean = patch.clean,
+        .status = @tagName(patch.status),
+        .binary = patch.binary,
+        .truncated = patch.truncated,
+        .additions = patch.additions,
+        .deletions = patch.deletions,
+        .context_lines = request.context_lines,
+        .patch = patch.patch,
+    });
+}
+
 fn gitChangesStatusResponse(daemon: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
     const allocator = daemon.allocator;
     var parsed = parseDaemonParams(git_changes_protocol.StatusRequest, allocator, params) catch
@@ -16615,6 +16839,78 @@ test "workspace file search resolves the stored route and returns relative paths
         try std.testing.expectEqual(@as(usize, 1), files.len);
         try std.testing.expectEqualStrings(case.expected.?, files[0].object.get("path").?.string);
         try std.testing.expectEqualStrings("search_needle.zig", files[0].object.get("file_name").?.string);
+    }
+}
+
+test "workspace files list and read stay beneath the stored workspace folder" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "home/src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "home/src/main.zig", .data = "const x = 1;\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "outside.txt", .data = "secret" });
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const temporary_root_len = try tmp.dir.realPath(io, &root_buffer);
+    const home = try std.fs.path.join(allocator, &.{ root_buffer[0..temporary_root_len], "home" });
+    defer allocator.free(home);
+
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    const service = try allocator.create(StoreService);
+    const store = daemon_store.Store.initWithRuntimeIdentity(allocator, db_path, .none, .{
+        .runtime_id = daemon.runtime_id,
+        .instance_id = daemon.instance_id,
+    }) catch |err| {
+        allocator.destroy(service);
+        return err;
+    };
+    service.* = .{ .store = store };
+    daemon.store_service = service;
+    defer detachTestStoreService(&daemon);
+    {
+        lockStoreService(service);
+        defer service.mutex.unlock();
+        _ = try service.store.upsertWorkspace(.{
+            .mutation = .{ .request_key = "files-workspace", .client_id = "files-test" },
+            .workspace = .{ .workspace_id = "files-workspace", .label = "Files", .path = home },
+        });
+    }
+
+    var arena_state: std.heap.ArenaAllocator = .init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Case = struct { method: []const u8, params: []const u8, error_code: ?[]const u8 = null, expect: ?[]const u8 = null };
+    const cases = [_]Case{
+        .{ .method = workspace_files_protocol.METHOD_LIST, .params = "{\"workspace_id\":\"files-workspace\"}", .expect = "home" },
+        .{ .method = workspace_files_protocol.METHOD_LIST, .params = try std.fmt.allocPrint(arena, "{{\"workspace_id\":\"files-workspace\",\"path\":\"{s}\"}}", .{home}), .expect = "src" },
+        .{ .method = workspace_files_protocol.METHOD_READ, .params = try std.fmt.allocPrint(arena, "{{\"workspace_id\":\"files-workspace\",\"path\":\"{s}/src/main.zig\"}}", .{home}), .expect = "const x = 1;\n" },
+        .{ .method = workspace_files_protocol.METHOD_READ, .params = try std.fmt.allocPrint(arena, "{{\"workspace_id\":\"files-workspace\",\"path\":\"{s}/../outside.txt\"}}", .{home}), .error_code = workspace_files_protocol.ERR_PATH_OUTSIDE_ROOTS },
+        .{ .method = workspace_files_protocol.METHOD_READ, .params = try std.fmt.allocPrint(arena, "{{\"workspace_id\":\"files-workspace\",\"path\":\"{s}/missing\"}}", .{home}), .error_code = workspace_files_protocol.ERR_NOT_FOUND },
+        .{ .method = workspace_files_protocol.METHOD_READ, .params = "{\"workspace_id\":\"files-workspace\"}", .error_code = headless.protocol.ERR_INVALID_PARAMS },
+        .{ .method = workspace_files_protocol.METHOD_LIST, .params = "{\"workspace_id\":\"nope\"}", .error_code = headless.protocol.ERR_RESOURCE_NOT_FOUND },
+    };
+    for (cases) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.params, .{});
+        defer parsed.deinit();
+        const response = try workspaceFilesBrowseResponse(&daemon, .{ .integer = 1 }, case.method, parsed.value);
+        defer allocator.free(response);
+        const decoded = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+        defer decoded.deinit();
+        if (case.error_code) |code| {
+            try std.testing.expectEqualStrings(code, decoded.value.object.get("error").?.object.get("code").?.string);
+            continue;
+        }
+        const result = decoded.value.object.get("result").?.object;
+        if (std.mem.eql(u8, case.method, workspace_files_protocol.METHOD_READ)) {
+            try std.testing.expectEqualStrings(case.expect.?, result.get("content").?.string);
+        } else if (result.get("entries").?.array.items.len > 0) {
+            try std.testing.expectEqualStrings(case.expect.?, result.get("entries").?.array.items[0].object.get("name").?.string);
+        } else {
+            try std.testing.expectEqualStrings(case.expect.?, result.get("roots").?.array.items[0].object.get("name").?.string);
+        }
     }
 }
 
@@ -18909,6 +19205,19 @@ fn outputWindowRange(session: *const PtySession, offset: ?u64, lines: u32, max_b
 fn bytesFromOffset(allocator: std.mem.Allocator, bytes: []const u8, offset: usize) ![]u8 {
     const start = @min(offset, bytes.len);
     return allocator.dupe(u8, bytes[start..]);
+}
+
+/// `/proc/<pid>/comm` for a live process (Linux only), trimmed.
+fn processComm(pid: usize, buffer: []u8) ?[]const u8 {
+    if (builtin.os.tag != .linux or pid == 0) return null;
+    var path_buffer: [64]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buffer, "/proc/{d}/comm", .{pid}) catch return null;
+    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return null;
+    defer _ = std.c.close(fd);
+    const read_raw = std.c.read(fd, buffer.ptr, buffer.len);
+    if (read_raw <= 0) return null;
+    const trimmed = std.mem.trim(u8, buffer[0..@intCast(read_raw)], &std.ascii.whitespace);
+    return if (trimmed.len == 0) null else trimmed;
 }
 
 fn childProcessCount(pid: usize) ?usize {

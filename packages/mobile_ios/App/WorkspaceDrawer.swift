@@ -213,9 +213,8 @@ struct WorkspaceDrawer: View {
             section(name)
             ForEach(shown) { item in
                 if let thread = item.thread { chat(thread, chip: chip ? item.workspace : nil) }
-                else if let id = item.pane?.terminal_id {
-                    let ws = item.workspace.workspace_id
-                    row(item.title, icon: "terminal", chip: chip ? item.workspace : nil, selected: selected == .terminal(workspace: ws, terminal: id)) { open(.terminal(workspace: ws, terminal: id)) }
+                else if let pane = item.pane, let id = pane.terminal_id {
+                    terminal(pane, id: id, chip: chip ? item.workspace : nil)
                 }
             }
         }
@@ -266,6 +265,22 @@ struct WorkspaceDrawer: View {
             notice = manage.notice
             if result != nil && action == "close" && selected == .thread(workspace: thread.workspace_id, thread: thread.thread_id) { root(.home) }
         }
+    }
+    /// Terminal row: an agent TUI shows its provider glyph and a live status pip, like the desktop/web rail.
+    private func terminal(_ pane: Pane, id: String, chip: Workspace?) -> some View {
+        let target = BrowseRoute.terminal(workspace: pane.workspace_id, terminal: id)
+        return Button { open(target) } label: {
+            HStack(spacing: 10) {
+                if let chip { WorkspaceChip(workspace: chip, size: 16) }
+                if let provider = pane.provider { ProviderGlyph(provider: provider) } else { Image(systemName: "terminal").frame(width: 18) }
+                Text(pane.title).lineLimit(1)
+                Spacer(minLength: 0)
+                if pane.status == "working" || pane.status == "waiting" {
+                    StatusPip(active: pane.status == "working", attention: pane.status == "waiting")
+                }
+            }.font(VerdeTheme.ui(13)).padding(.horizontal, 12).frame(minHeight: 44).contentShape(Rectangle())
+                .background(selected == target ? VerdeTheme.accent.opacity(0.19) : Color.clear, in: RoundedRectangle(cornerRadius: 7))
+        }.buttonStyle(.plain).accessibilityAddTraits(selected == target ? .isSelected : [])
     }
     private func chat(_ thread: ThreadSummary, chip: Workspace? = nil) -> some View {
         let target = BrowseRoute.thread(workspace: thread.workspace_id, thread: thread.thread_id)

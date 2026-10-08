@@ -225,7 +225,7 @@ private fun PaneItem(pane: Pane, now: Long, onOpen: (Pane) -> Unit, provider: St
     }
     MenuRow(pane.title, paneLine(pane, now), canOpen, { onOpen(pane) }, menu,
         leading = { Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            if (pane.kind == "chat") ProviderGlyph(provider)
+            if (pane.kind == "chat") ProviderGlyph(provider) else if (pane.provider != null) ProviderGlyph(pane.provider)
             Dot(statusColor(pane.status, pane.attention), paneLabel(pane), activeStatus(pane.status))
         } },
         badge = attentionLabel(pane.attention_kind))

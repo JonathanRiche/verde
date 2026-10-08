@@ -18,6 +18,8 @@ pub const Pane = struct {
     can_stop: bool = false,
     /// K-17 thread attention (unread, needs_approval, blocked, failed).
     attention_kind: ?[]const u8 = null,
+    /// Agent provider of a TUI running in a terminal pane (desktop `agent_provider`).
+    provider: ?[]const u8 = null,
 };
 pub const ThreadSummary = struct {
     workspace_id: []const u8,
@@ -180,9 +182,46 @@ fn sessionTitle(session: V) []const u8 {
     if (binary.len != 0 and !eq(binary, "fish") and !eq(binary, "bash") and !eq(binary, "zsh") and !eq(binary, "sh")) return binary;
     return fallback(label, fallback(binary, "Terminal"));
 }
-fn terminal(a: A, ws: []const u8, session: V) !Pane {
-    const working = eq(s(session, "status"), "working");
-    return .{ .id = try std.fmt.allocPrint(a, "{s}:term:{s}", .{ ws, sessionId(session) }), .workspace_id = ws, .kind = "terminal", .title = sessionTitle(session), .terminal_id = sessionId(session), .status = if (working) "working" else if (yes(get(session, "running"))) "idle" else "exited", .attention = working };
+/// Mirrors the desktop sidebar's `providerFromComm`.
+fn providerFromComm(comm: []const u8) ?[]const u8 {
+    if (eq(comm, "claude")) return "claude";
+    if (eq(comm, "codex")) return "codex";
+    if (eq(comm, "opencode") or eq(comm, "opencode2")) return "opencode";
+    if (std.mem.startsWith(u8, comm, "cursor") or eq(comm, "agent")) return "cursor";
+    if (eq(comm, "grok")) return "grok";
+    if (eq(comm, "amp")) return "amp";
+    if (eq(comm, "fx")) return "fx";
+    if (eq(comm, "muse") or std.mem.startsWith(u8, comm, "muse-bin-")) return "muse";
+    return null;
+}
+fn surfaceFor(surfaces: V, id: []const u8) V {
+    for (rows(surfaces)) |surface| {
+        if (eq(s(surface, "session_id"), id)) return surface;
+    }
+    return .null;
+}
+/// Terminal pane with the desktop's agent identity: the foreground program
+/// names the provider; the hook-written surface state supplies status/title.
+/// A daemon that reports the foreground program also tells us when the agent
+/// has exited (a shell is foreground), so a stale surface row is ignored.
+fn terminal(a: A, ws: []const u8, session: V, surfaces: V) !Pane {
+    const id = sessionId(session);
+    const running = yes(get(session, "running"));
+    const reports_foreground = session == .object and session.object.contains("foreground_process");
+    const comm = s(session, "foreground_process");
+    const from_comm = if (running) providerFromComm(comm) else null;
+    var surface: V = if (running) surfaceFor(surfaces, id) else .null;
+    const surface_provider = nullable(get(surface, "provider"));
+    if (reports_foreground) {
+        if (from_comm == null) surface = .null;
+        if (from_comm != null and surface_provider != null and !eq(from_comm.?, surface_provider.?)) surface = .null;
+    }
+    const provider = from_comm orelse nullable(get(surface, "provider"));
+    const surface_status = s(surface, "status");
+    const working = eq(s(session, "status"), "working") or eq(surface_status, "working");
+    const waiting = !working and eq(surface_status, "waiting");
+    const title = fallback(std.mem.trim(u8, s(surface, "title"), " \t\r\n"), if (from_comm != null) comm else sessionTitle(session));
+    return .{ .id = try std.fmt.allocPrint(a, "{s}:term:{s}", .{ ws, id }), .workspace_id = ws, .kind = "terminal", .title = title, .terminal_id = id, .status = if (working) "working" else if (waiting) "waiting" else if (running) "idle" else "exited", .attention = working or waiting, .provider = provider };
 }
 fn hasThread(panes: []const Pane, id: []const u8) bool {
     for (panes) |p| {
@@ -208,7 +247,7 @@ fn recent(_: void, l: V, r: V) bool {
     const y = store.threadActivitySeconds(num(get(r, "last_activity_at"))) orelse 0;
     return if (x == y) std.mem.lessThan(u8, s(l, "local_thread_id"), s(r, "local_thread_id")) else x > y;
 }
-pub fn panesForWorkspace(a: A, ws: V, threads: []const V, sessions: V, turns: V) host.ApiError![]const Pane {
+pub fn panesForWorkspace(a: A, ws: V, threads: []const V, sessions: V, surfaces: V, turns: V) host.ApiError![]const Pane {
     const wid = s(ws, "workspace_id");
     var panes: std.ArrayList(Pane) = .empty;
     const layout = try parseWorkspaceLayout(a, get(ws, "workspace_layout_json"));
@@ -252,7 +291,7 @@ pub fn panesForWorkspace(a: A, ws: V, threads: []const V, sessions: V, turns: V)
                     }
                 }
                 if (found != .null) {
-                    if (!hasSession(panes.items, sessionId(found))) try panes.append(a, try terminal(a, wid, found));
+                    if (!hasSession(panes.items, sessionId(found))) try panes.append(a, try terminal(a, wid, found, surfaces));
                 } else try panes.append(a, .{ .id = try std.fmt.allocPrint(a, "{s}:dock:{d}", .{ wid, num(get(p, "dock")).? }), .workspace_id = wid, .kind = "terminal", .title = fallback(s(p, "title"), fallback(s(p, "purpose"), "Terminal")), .status = "unavailable" });
             } else if (eq(kind, "browser")) try panes.append(a, .{ .id = try std.fmt.allocPrint(a, "{s}:browser:{d}", .{ wid, num(get(p, "id")) orelse @as(i64, @intCast(index)) }), .workspace_id = wid, .kind = "browser", .title = "Browser", .status = "unavailable" });
         }
@@ -272,7 +311,7 @@ pub fn panesForWorkspace(a: A, ws: V, threads: []const V, sessions: V, turns: V)
         }
     }
     for (rows(sessions)) |session| {
-        if (sessionMatches(session, ws) and sessionId(session).len > 0 and !hasSession(panes.items, sessionId(session)) and (yes(get(session, "running")) or eq(s(session, "status"), "working"))) try panes.append(a, try terminal(a, wid, session));
+        if (sessionMatches(session, ws) and sessionId(session).len > 0 and !hasSession(panes.items, sessionId(session)) and (yes(get(session, "running")) or eq(s(session, "status"), "working"))) try panes.append(a, try terminal(a, wid, session, surfaces));
     }
     return panes.toOwnedSlice(a);
 }
@@ -346,7 +385,7 @@ pub fn projectFocused(a: A, snapshot: V, catalog: []const V, has_catalog: bool, 
             try summaries.append(a, item);
             if (item.committed) try history.append(a, item);
         }
-        const panes = try panesForWorkspace(a, ws, threads.items, get(snapshot, "sessions"), turns);
+        const panes = try panesForWorkspace(a, ws, threads.items, get(snapshot, "sessions"), get(get(snapshot, "snapshot"), "surface_states"), turns);
         if (!yes(get(ws, "archived"))) {
             for (panes) |p| {
                 if (p.attention or p.can_stop or eq(p.status, "working")) try home.append(a, p);

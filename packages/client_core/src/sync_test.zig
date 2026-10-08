@@ -174,7 +174,7 @@ test "projection sort_index identity, omitted settings, explicit nulls and atten
     const ws = try host.parse(a, "{\"workspace_id\":\"w\",\"path\":\"/project\",\"workspace_layout_json\":\"{\\\"panes\\\":[{\\\"kind\\\":\\\"chat\\\",\\\"thread\\\":42},{\\\"kind\\\":\\\"chat\\\",\\\"thread\\\":42}]}\"}");
     const t = try host.parse(a, "{\"workspace_id\":\"w\",\"local_thread_id\":\"x\",\"title\":\"X\",\"sort_index\":42}");
     const turns = try host.parse(a, "[{\"workspace_id\":\"w\",\"local_thread_id\":\"x\",\"status\":\"waiting_approval\",\"started_at_ms\":123}]");
-    const panes = try p.panesForWorkspace(a, ws, &.{t}, .null, turns);
+    const panes = try p.panesForWorkspace(a, ws, &.{t}, .null, .null, turns);
     try expect(panes.len == 1);
     try expect(panes[0].attention and panes[0].can_stop);
     try expect(panes[0].started_at_ms.? == 123);
@@ -184,6 +184,38 @@ test "projection sort_index identity, omitted settings, explicit nulls and atten
     const explicit = try p.mergeThreadCatalogSettings(a, try host.parse(a, "{\"reasoning_effort\":null}"), source, .null);
     try expect(p.get(explicit, "reasoning_effort") == .null);
     try expect(try p.parseWorkspaceLayout(a, .{ .string = "invalid" }) == .null);
+}
+
+test "terminal panes carry agent TUI provider, surface status and title" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ws = try host.parse(a, "{\"workspace_id\":\"w\",\"path\":\"/project\"}");
+    const sessions = try host.parse(a,
+        \\[{"session_id":"agent","workspace_id":"w","label":"Shell","command":"/usr/bin/fish -i","running":true,"status":"running","foreground_process":"claude"},
+        \\ {"session_id":"exited-agent","workspace_id":"w","label":"Shell","command":"/usr/bin/fish -i","running":true,"status":"running","foreground_process":"fish"},
+        \\ {"session_id":"legacy","workspace_id":"w","label":"Shell","command":"/usr/bin/fish -i","running":true,"status":"running"}]
+    );
+    const surfaces = try host.parse(a,
+        \\[{"session_id":"agent","provider":"claude","title":"Fix the build","status":"working"},
+        \\ {"session_id":"exited-agent","provider":"codex","title":"Old","status":"working"},
+        \\ {"session_id":"legacy","provider":"grok","title":"","status":"waiting"}]
+    );
+    const panes = try p.panesForWorkspace(a, ws, &.{}, sessions, surfaces, .null);
+    try expect(panes.len == 3);
+    try eql("claude", panes[0].provider.?);
+    try eql("Fix the build", panes[0].title);
+    try eql("working", panes[0].status);
+    try expect(panes[0].attention);
+    // A shell back in the foreground means the agent exited: ignore its stale surface.
+    try expect(panes[1].provider == null);
+    try eql("Shell", panes[1].title);
+    try eql("idle", panes[1].status);
+    try expect(!panes[1].attention);
+    // Daemons without `foreground_process` fall back to the surface row.
+    try eql("grok", panes[2].provider.?);
+    try eql("waiting", panes[2].status);
+    try expect(panes[2].attention);
 }
 
 test "sync consumes only owned RPC outcomes and stale sockets have no effects" {
