@@ -15,12 +15,31 @@ pub const WorkspacePaneKind = enum {
     chat,
     terminal,
     browser,
+    file,
 };
 
 pub const WorkspacePaneRef = union(WorkspacePaneKind) {
     chat: ChatPaneRef,
     terminal: TerminalPaneRef,
     browser: BrowserPaneRef,
+    file: FilePaneRef,
+};
+
+/// Read-only file viewer tab. `path` is absolute and owned; the viewer maps it
+/// to a daemon workspace root + relative path when it loads.
+pub const FilePaneRef = struct {
+    path: []u8,
+    /// Vertical scroll offset in CSS pixels, persisted with the layout.
+    scroll_y: f32 = 0.0,
+
+    pub fn init(allocator: std.mem.Allocator, path: []const u8) !FilePaneRef {
+        return .{ .path = try allocator.dupe(u8, path) };
+    }
+
+    pub fn deinit(self: *FilePaneRef, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        self.path = &.{};
+    }
 };
 
 pub const ChatPaneRef = struct {
@@ -42,6 +61,7 @@ pub const TerminalPanePurpose = enum {
 pub fn deinitWorkspacePaneRef(ref: *WorkspacePaneRef, allocator: std.mem.Allocator) void {
     switch (ref.*) {
         .browser => |*browser| browser.deinit(allocator),
+        .file => |*file| file.deinit(allocator),
         .chat, .terminal => {},
     }
 }
@@ -788,6 +808,7 @@ pub const WorkspaceLayout = struct {
                 .chat => if (kind == .chat) return true,
                 .terminal => if (kind == .terminal) return true,
                 .browser => if (kind == .browser) return true,
+                .file => if (kind == .file) return true,
             }
         }
         return false;
@@ -801,6 +822,7 @@ pub const WorkspaceLayout = struct {
             .chat => kind == .chat,
             .terminal => kind == .terminal,
             .browser => kind == .browser,
+            .file => kind == .file,
         };
     }
 
@@ -1078,6 +1100,26 @@ pub const WorkspaceLayout = struct {
             .ref = .{ .chat = .{ .thread_index = thread_index } },
         });
         return pane_id;
+    }
+
+    /// Adds a file viewer pane after the focused pane; the caller places it in
+    /// the tree. Duplicates `path`.
+    pub fn createFilePane(self: *WorkspaceLayout, allocator: std.mem.Allocator, path: []const u8) !WorkspacePaneId {
+        var ref = try FilePaneRef.init(allocator, path);
+        errdefer ref.deinit(allocator);
+        const pane_id = self.next_pane_id;
+        try self.insertPaneAfterFocus(allocator, .{ .id = pane_id, .ref = .{ .file = ref } });
+        self.next_pane_id += 1;
+        return pane_id;
+    }
+
+    /// First pane (visible or not, never docked) viewing `path`.
+    pub fn filePaneIdForPath(self: *const WorkspaceLayout, path: []const u8) ?WorkspacePaneId {
+        for (self.panes.items) |pane| switch (pane.ref) {
+            .file => |ref| if (std.mem.eql(u8, ref.path, path)) return pane.id,
+            else => {},
+        };
+        return null;
     }
 
     fn insertPaneAfterFocus(self: *WorkspaceLayout, allocator: std.mem.Allocator, pane: WorkspacePane) !void {
@@ -1521,6 +1563,16 @@ pub const WorkspaceLayout = struct {
                     }
                     try stringify.endArray();
                 },
+                .file => |ref| {
+                    try stringify.objectField("kind");
+                    try stringify.write("file");
+                    try stringify.objectField("path");
+                    try stringify.write(ref.path);
+                    if (ref.scroll_y > 0) {
+                        try stringify.objectField("scroll");
+                        try stringify.write(ref.scroll_y);
+                    }
+                },
             }
             if (pane.scroll_group_id) |group_id| {
                 try stringify.objectField("scroll_group");
@@ -1707,6 +1759,15 @@ pub const WorkspaceLayout = struct {
                     .ref = .{ .browser = browser_ref },
                 });
                 browser_ref_owned = false;
+            } else if (std.mem.eql(u8, kind, "file")) {
+                const path = jsonString(pane_value.object.get("path") orelse .null) orelse "";
+                if (path.len > 0) {
+                    var file_ref = try FilePaneRef.init(allocator, path);
+                    errdefer file_ref.deinit(allocator);
+                    const scroll = jsonFloat(pane_value.object.get("scroll") orelse .null) orelse 0.0;
+                    file_ref.scroll_y = if (std.math.isFinite(scroll)) @max(0.0, scroll) else 0.0;
+                    try next_layout.panes.append(allocator, .{ .id = pane_id, .ref = .{ .file = file_ref } });
+                }
             }
             if (next_layout.panes.items.len > pane_count_before) {
                 const pane = &next_layout.panes.items[next_layout.panes.items.len - 1];
@@ -1784,6 +1845,10 @@ pub const WorkspaceLayout = struct {
                     return;
                 },
                 .browser => if (kind == .browser) {
+                    self.focused_pane_id = pane.id;
+                    return;
+                },
+                .file => if (kind == .file) {
                     self.focused_pane_id = pane.id;
                     return;
                 },
@@ -2472,6 +2537,29 @@ test "workspace layout round-trips nonuniform split and explicit focus exactly" 
         },
         .leaf => return error.TestExpectedEqual,
     }
+}
+
+test "workspace layout round-trips file viewer panes with path and scroll" {
+    const allocator = std.testing.allocator;
+    var layout = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+
+    const file_pane_id = try layout.createFilePane(allocator, "/home/user/project/src/main.zig");
+    try layout.splitPaneWithLeaf(allocator, 1, file_pane_id, .vertical, true);
+    layout.paneByIdMutable(file_pane_id).?.ref.file.scroll_y = 240.5;
+    try std.testing.expectEqual(@as(?WorkspacePaneId, file_pane_id), layout.filePaneIdForPath("/home/user/project/src/main.zig"));
+    try std.testing.expect(layout.filePaneIdForPath("/home/user/project/src/other.zig") == null);
+
+    const persisted = try layout.persistedWorkspaceJson(allocator);
+    defer allocator.free(persisted);
+    var restored = try WorkspaceLayout.initDefaultChat(allocator);
+    defer restored.deinit(allocator);
+    try restored.applyPersistedWorkspaceJson(allocator, persisted);
+
+    const restored_id = restored.filePaneIdForPath("/home/user/project/src/main.zig") orelse return error.TestExpectedEqual;
+    const pane = restored.paneById(restored_id) orelse return error.TestExpectedEqual;
+    try std.testing.expectApproxEqAbs(@as(f32, 240.5), pane.ref.file.scroll_y, 0.001);
+    try std.testing.expect(restored.hasVisiblePaneKind(.file));
 }
 
 test "workspace layout persists scrolling tile groups and skips their inner leaves" {

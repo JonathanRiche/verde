@@ -19,6 +19,7 @@ const chat_panel = @import("chat_panel.zig");
 const colors = @import("colors.zig");
 const context_menu = @import("context_menu.zig");
 const handoff_sheet = @import("handoff_sheet.zig");
+const file_viewer = @import("file_viewer.zig");
 const profiler = @import("../runtime/profiler.zig");
 const terminal_panel = @import("terminal_panel.zig");
 const theme = @import("theme.zig");
@@ -413,6 +414,12 @@ pub fn hasActivePaneDrag() bool {
 }
 
 pub fn handlePaletteWheel(state: *runtime.AppState, x: f32, y: f32, wheel_x: f32, wheel_y: f32, ctrl_held: bool) bool {
+    // File tab content scrolls before the strip; Ctrl+wheel stays with the
+    // strip, and horizontal wheel too when the strip scrolls sideways.
+    if (!ctrl_held) if (paneIdAt(x, y)) |pane_id| if (state.workspacePaneKindById(pane_id) == .file) {
+        const allow_horizontal = state.app_config.workspace_scroll_direction != .horizontal;
+        if (file_viewer.handleWheel(state, pane_id, x, y, if (allow_horizontal) wheel_x else 0.0, wheel_y)) return true;
+    };
     if (!scrolling_layout_rendered) return false;
     if (!rectContains(last_workspace_rect, x, y)) return false;
     if (state.project_controller.projects.items.len == 0) return false;
@@ -952,7 +959,7 @@ fn paneAgentVisualStatus(state: *const runtime.AppState, pane_id: runtime.Worksp
                 .idle => .idle,
             };
         },
-        .browser => .idle,
+        .browser, .file => .idle,
     };
 }
 
@@ -1017,6 +1024,7 @@ pub fn renderAtWithTranscriptLayoutWidth(state: *runtime.AppState, workspace_rec
     scrolling_next_proximity = null;
     hit_cache.count = 0;
     pane_rect_count = 0;
+    file_viewer.beginFrame();
     browser_pane_rendered = false;
     state.beginBrowserPresentationFrame();
     chat_panel.resetWorkspaceHeaderHitCache();
@@ -1244,6 +1252,7 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button
         return false;
     }
     if (button != 1) return false;
+    if (!down and file_viewer.handleMouseUp(state)) return true;
     if (!down) {
         if (quick_pane_drag != null) {
             quick_pane_drag = null;
@@ -1418,6 +1427,10 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button
         const pane_rect = pane_rects[i];
         if (!rectContains(pane_rect.rect, x, y)) continue;
         _ = state.focusCurrentProjectWorkspacePane(pane_rect.pane_id);
+        // File tabs own presses in their body (line selection, header actions).
+        if (state.workspacePaneKindById(pane_rect.pane_id) == .file) {
+            return file_viewer.handleMouseDown(state, pane_rect.pane_id, x, y, shift_down);
+        }
         return false;
     }
     return false;
@@ -1591,6 +1604,7 @@ fn toggleSplitMenu(state: *runtime.AppState, hit: WorkspacePaneHit) void {
 /// Returns the system cursor for interactive workspace pane chrome.
 pub fn systemCursorAt(x: f32, y: f32) ?sdl.SystemCursor {
     if (resize_drag) |hit| return resizeSystemCursor(hit.axis);
+    if (file_viewer.systemCursorAt(x, y)) |cursor| return cursor;
     var i: usize = hit_cache.count;
     while (i > 0) {
         i -= 1;
@@ -1605,11 +1619,22 @@ pub fn systemCursorAt(x: f32, y: f32) ?sdl.SystemCursor {
     return null;
 }
 
+/// Topmost pane drawn under a point this frame (later rects draw on top).
+fn paneIdAt(x: f32, y: f32) ?runtime.WorkspacePaneId {
+    var i = pane_rect_count;
+    while (i > 0) {
+        i -= 1;
+        if (rectContains(pane_rects[i].rect, x, y)) return pane_rects[i].pane_id;
+    }
+    return null;
+}
+
 fn resizeSystemCursor(axis: runtime.WorkspaceSplitAxis) sdl.SystemCursor {
     return if (axis == .vertical) .ew_resize else .ns_resize;
 }
 
 pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32, motion_dx: f32, motion_dy: f32, ctrl_down: bool) bool {
+    if (file_viewer.handleMouseMotion(state, x, y)) return true;
     if (quick_pane_drag) |drag| {
         const dx = (x - drag.start_x) / @max(drag.workspace.w, 1.0);
         const dy = (y - drag.start_y) / @max(drag.workspace.h, 1.0);
@@ -3059,6 +3084,7 @@ fn renderLeafWithin(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, 
         .chat => chat_panel.paneHeaderHeight(rect),
         .terminal => terminal_panel.paneHeaderHeight(),
         .browser => 0.0,
+        .file => file_viewer.headerHeight(),
     };
     switch (kind) {
         .chat => chat_panel.renderWorkspaceAtForPaneWithReserveAndTranscriptLayoutWidth(state, rect, pane_id, reserve, target_width),
@@ -3083,6 +3109,7 @@ fn renderLeafWithin(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, 
                 browser_panel.renderPendingPresentation(state, rect);
             }
         },
+        .file => file_viewer.renderPane(state, pane_id, rect, viewport_clip),
     }
     // Inline handoff sheet: docks over the source pane (chat or agent TUI)
     // instead of the former window-blocking modal.
@@ -3149,7 +3176,7 @@ fn renderZoomControl(
     const control_size = theme.scaledUi(PANE_CHROME_CONTROL_SIZE_CSS);
     const margin = theme.scaledUi(PANE_CHROME_RIGHT_MARGIN_CSS);
     // Browser owns the far-right close action; keep zoom immediately to its left.
-    const split_reserve = if (kind == .chat or kind == .terminal or kind == .browser)
+    const split_reserve = if (kind == .chat or kind == .terminal or kind == .browser or kind == .file)
         theme.scaledUi(PANE_CHROME_CONTROL_SIZE_CSS + PANE_CHROME_CONTROL_GAP_CSS)
     else
         0.0;
@@ -3163,6 +3190,7 @@ fn renderZoomControl(
             .chat => pane_rect.y + @max((header_h - control_size) * 0.5, theme.scaledUi(4.0)),
             .terminal => pane_rect.y + margin,
             .browser => pane_rect.y + (browser_panel.paneToolbarActionRowHeight() - control_size) * 0.5,
+            .file => pane_rect.y + (file_viewer.headerHeight() - control_size) * 0.5,
         },
         .w = control_size,
         .h = control_size,

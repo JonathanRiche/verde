@@ -70,6 +70,7 @@ const chat_controller = @import("state/chat_controller.zig");
 const provider_controller = @import("state/provider_controller.zig");
 const project_controller = @import("state/project_controller.zig");
 const file_search_controller = @import("state/file_search_controller.zig");
+const file_viewer_controller = @import("state/file_viewer_controller.zig");
 const herdr_controller = @import("state/herdr_controller.zig");
 const handoff_controller = @import("state/handoff_controller.zig");
 const settings_controller = @import("state/settings_controller.zig");
@@ -4913,6 +4914,8 @@ pub const AppState = struct {
     modal_image_pan_drag_active: bool,
     modal_image_pan_last_x: f32,
     modal_image_pan_last_y: f32,
+    /// File viewer tabs: workspace roots cache, per-pane documents, workers.
+    file_viewer: file_viewer_controller.State = .{},
     app_config: app_config.AppConfig,
     rename_project_index: ?usize,
     rename_thread_index: ?usize,
@@ -8892,7 +8895,7 @@ pub const AppState = struct {
         layout.maximized_pane_id = if (preserve_zoom) layout.zoomAfterFocus(pane_id, strip_active) else null;
         self.restorePersistedBrowserPaneAfterProjectSelection(project_index);
         switch (pane.ref) {
-            .chat, .terminal => {},
+            .chat, .terminal, .file => {},
             .browser => {
                 self.browser_controller.runtime.setControlsVisible(true);
                 self.browser_controller.runtime.controller.show() catch |err| {
@@ -11165,6 +11168,15 @@ pub const AppState = struct {
     pub const suppressNextBrowserClosedEvent = browser_controller.suppressNextBrowserClosedEvent;
     pub const consumeSuppressedBrowserClosedEvent = browser_controller.consumeSuppressedBrowserClosedEvent;
     pub const unfocusBrowserPane = browser_controller.unfocusBrowserPane;
+    pub const openFileInViewer = file_viewer_controller.openFileInViewer;
+    pub const pollFileViewer = file_viewer_controller.pollFileViewer;
+    pub const fileViewerDocument = file_viewer_controller.fileViewerDocument;
+    pub const reloadFileViewerDocument = file_viewer_controller.reloadFileViewerDocument;
+    pub const fileViewerRoots = file_viewer_controller.fileViewerRoots;
+    pub const focusFilePane = file_viewer_controller.focusFilePane;
+    pub const focusedFilePaneId = file_viewer_controller.focusedFilePaneId;
+    pub const filePaneRef = file_viewer_controller.filePaneRef;
+    pub const openFileViewerExternally = file_viewer_controller.openFileViewerExternally;
     pub const focusBrowserPane = browser_controller.focusBrowserPane;
     pub const focusBrowserPaneInWorkspace = browser_controller.focusBrowserPaneInWorkspace;
     pub const restoreBrowserPaneFocus = browser_controller.restoreBrowserPaneFocus;
@@ -15542,6 +15554,7 @@ pub const AppState = struct {
         self.clearFxModelOptions();
         self.clearGrokModelOptions();
         self.clearMuseModelOptions();
+        self.file_viewer.deinit(self.allocator);
         self.opencode_reasoning_menu.deinit(self.allocator);
         self.opencode_model_options.deinit(self.allocator);
         self.claude_model_options.deinit(self.allocator);

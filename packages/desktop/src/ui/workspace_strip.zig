@@ -46,6 +46,11 @@ const KEY_TIP_SIZE_UI: f32 = 18.0;
 const KEY_TIP_FONT_UI: f32 = 11.0;
 const KEY_TIP_RADIUS_UI: f32 = 5.0;
 const KEY_TIP_INSET_X_UI: f32 = 4.0;
+/// Close X on closable tabs (file viewer tabs), right-aligned in the tab.
+const CLOSE_SIZE_UI: f32 = 18.0;
+const CLOSE_GLYPH_UI: f32 = 12.0;
+const CLOSE_INSET_X_UI: f32 = 4.0;
+const NF_COD_CLOSE = "\u{EA76}";
 /// Same line box the other Palette UI text queues use (see sidebar/layout).
 const LINE_HEIGHT_FACTOR: f32 = 1.25;
 /// Bounded label buffer; tabs are short so longer titles are truncated.
@@ -54,7 +59,9 @@ const LABEL_BUFFER_LEN: usize = 96;
 /// `sidebar_toggle` is the leading show-sidebar button drawn while the rail
 /// is hidden (the old collapsed rail carried it; the hidden rail cannot).
 /// `side_panel_toggle` is the trailing show/hide for the tab's right panel.
-pub const HitKind = enum { tab, add_tab, sidebar_toggle, side_panel_toggle };
+/// `close_tab` is the X on closable (file viewer) tabs; it precedes its
+/// tab's hit so it wins the overlap.
+pub const HitKind = enum { tab, add_tab, sidebar_toggle, side_panel_toggle, close_tab };
 
 const StripHit = struct {
     rect: palette.Rect,
@@ -202,7 +209,9 @@ pub fn render(state: *runtime.AppState, strip: palette.Rect) void {
         const title = tabLabel(state, project_index, tab, &term_title_buf);
         var key_tip_buf: [16]u8 = undefined;
         const key_tip = tabKeyTip(state, &key_tip_buf, tab_index);
-        const tip_reserve = if (key_tip.len > 0) key_tip_w else 0.0;
+        const closable = tabClosable(layout, tab);
+        const close_w = theme.scaledUi(CLOSE_SIZE_UI) + theme.scaledUi(CLOSE_INSET_X_UI);
+        const tip_reserve = if (key_tip.len > 0) key_tip_w else if (closable) close_w else 0.0;
         const pip = tabActivityPip(state, project_index, layout, tab.id);
         const pip_reserve = if (pip != null) theme.scaledUi(PIP_SIZE_UI) + theme.scaledUi(PIP_GAP_UI) else 0.0;
         // Measure through the GPU text path so tab widths match drawn glyphs.
@@ -211,7 +220,12 @@ pub fn render(state: *runtime.AppState, strip: palette.Rect) void {
         if (rect.x + theme.scaledUi(MIN_TAB_WIDTH_UI) > tabs_right) break;
         const clip: palette.Rect = .{ .x = strip.x, .y = strip.y, .w = @max(tabs_right - strip.x, 0.0), .h = strip.h };
         const selected = focused_tab_id != null and focused_tab_id.? == tab.id;
-        const hovered = hovered_hit == strip_hit_count;
+        // A closable tab registers its X first, so the tab's own slot follows.
+        const show_close = closable and key_tip.len == 0;
+        const close_slot = strip_hit_count;
+        const tab_slot = if (show_close) strip_hit_count + 1 else strip_hit_count;
+        const close_hovered = show_close and hovered_hit == close_slot;
+        const hovered = hovered_hit == tab_slot or close_hovered;
         renderTab(state, rect, clip, selected, hovered);
         var label_buf: [LABEL_BUFFER_LEN]u8 = undefined;
         const label_area: palette.Rect = .{ .x = rect.x + pip_reserve, .y = rect.y, .w = @max(rect.w - tip_reserve - pip_reserve, 0.0), .h = rect.h };
@@ -231,6 +245,7 @@ pub fn render(state: *runtime.AppState, strip: palette.Rect) void {
         const text_color = if (selected) theme.COLOR_WHITE else if (hovered) theme.raise(theme.COLOR_TEXT_MUTED, 0.12) else theme.COLOR_TEXT_MUTED;
         queueCenteredText(state, label_area, label, shown_w, paletteColor(text_color), font_size, clip);
         if (key_tip.len > 0) renderTabKeyTip(state, rect, clip, key_tip);
+        if (show_close) renderTabClose(state, rect, clip, project_index, tab.preferred_pane_id, selected or hovered, close_hovered);
         addHit(rect, .tab, project_index, tab.preferred_pane_id);
         x = rect.x + rect.w + gap;
     }
@@ -337,6 +352,37 @@ fn renderTabKeyTip(state: *runtime.AppState, tab: palette.Rect, clip: palette.Re
     queueCenteredText(state, rect, label, text_w, paletteColor(theme.accent()), font_size, clip);
 }
 
+/// File viewer tabs carry a close X; other kinds close from their pane.
+fn tabClosable(layout: *const runtime.WorkspaceLayout, tab: runtime.WorkspaceTab) bool {
+    const pane = layout.paneById(tab.preferred_pane_id) orelse return false;
+    return pane.ref == .file;
+}
+
+/// Close X at the tab's right edge (where the key tip goes while Ctrl is
+/// held). Registers the `close_tab` hit; the glyph shows on the selected or
+/// hovered tab only, so idle tabs stay quiet.
+fn renderTabClose(state: *runtime.AppState, tab: palette.Rect, clip: palette.Rect, project_index: usize, pane_id: runtime.WorkspacePaneId, visible: bool, hovered: bool) void {
+    const size = @min(theme.scaledUi(CLOSE_SIZE_UI), tab.h);
+    const rect: palette.Rect = .{
+        .x = tab.x + tab.w - size - theme.scaledUi(CLOSE_INSET_X_UI),
+        .y = tab.y + @max((tab.h - size) * 0.5, 0.0),
+        .w = size,
+        .h = size,
+    };
+    addHit(rect, .close_tab, project_index, pane_id);
+    if (!visible) return;
+    if (hovered) queueRoundedRectClipped(state, rect, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 30)), theme.scaledUi(KEY_TIP_RADIUS_UI), clip);
+    const glyph_size = theme.scaledUi(CLOSE_GLYPH_UI);
+    const glyph_w = text_measure.textWidth(.icon, glyph_size, NF_COD_CLOSE);
+    const color = if (hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED;
+    state.palette_overlay_batch.roleText(state.allocator, .{
+        .x = rect.x + (rect.w - glyph_w) * 0.5,
+        .y = rect.y + (rect.h - glyph_size * 1.3) * 0.5,
+        .w = glyph_w,
+        .h = glyph_size * 1.3,
+    }, NF_COD_CLOSE, paletteColor(color), glyph_size, .icon, null, clip) catch {};
+}
+
 /// Truncates `label` with a trailing ellipsis so it fits `max_w` using
 /// Palette text metrics, cutting only at UTF-8 codepoint boundaries.
 pub fn truncatedLabel(buffer: *[LABEL_BUFFER_LEN]u8, label: []const u8, max_w: f32, font_size: f32) []const u8 {
@@ -375,6 +421,7 @@ pub fn activateHit(state: *runtime.AppState, hit: StripHit) void {
         .add_tab => state.addWorkspaceTab(hit.project_index, null),
         .sidebar_toggle => state.setSidebarHidden(false),
         .side_panel_toggle => state.toggleSidePanel(),
+        .close_tab => _ = state.closeCurrentProjectWorkspacePane(hit.pane_id),
     }
 }
 

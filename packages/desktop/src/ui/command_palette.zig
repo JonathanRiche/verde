@@ -1484,7 +1484,7 @@ fn canHandoffFocusedPane(state: *runtime.AppState) bool {
             const dock_id = state.workspaceTerminalDockIdByPane(pane_id) orelse break :blk false;
             break :blk state.projectTerminalSurface(state.project_controller.selected_index, dock_id) != null;
         },
-        .browser => false,
+        .browser, .file => false,
     };
 }
 

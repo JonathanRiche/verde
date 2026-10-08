@@ -632,6 +632,12 @@ fn herdrPaneDescriptor(self: anytype, project_index: usize, pane: *const Workspa
             const title = try std.fmt.allocPrint(self.allocator, "Browser: {s}", .{label});
             break :blk .{ .provider = .browser, .presentation = .browser_link, .cwd = default_cwd, .title = title };
         },
+        // Herdr has no viewer: mirror file tabs as a plain pane in the
+        // file's directory.
+        .file => |file_ref| blk: {
+            const title = try std.fmt.allocPrint(self.allocator, "File: {s}", .{std.fs.path.basename(file_ref.path)});
+            break :blk .{ .provider = .unknown, .presentation = .unknown, .cwd = std.fs.path.dirname(file_ref.path) orelse default_cwd, .title = title };
+        },
     };
 }
 

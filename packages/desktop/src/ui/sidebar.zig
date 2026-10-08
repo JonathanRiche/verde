@@ -10,6 +10,7 @@ const globe_icon = @import("globe_icon.zig");
 const runtime = @import("runtime.zig");
 const workspace_identity = @import("workspace_identity.zig");
 const text_measure = @import("text_measure.zig");
+const file_icons = @import("file_icons.zig");
 const command_palette = @import("command_palette.zig");
 const keybinds = @import("../app/keybinds.zig");
 const utils = @import("../utils.zig");
@@ -722,6 +723,7 @@ pub fn paneTitle(
         .chat => |ref| if (ref.thread_index < project.threads.items.len) project.threads.items[ref.thread_index].title else "Chat",
         .terminal => |ref| terminalPaneTitle(state, project_index, ref.dock_id, term_title_buf),
         .browser => browserPaneTitle(pane),
+        .file => |ref| std.fs.path.basename(ref.path),
     };
 }
 
@@ -1314,7 +1316,7 @@ fn paneRecencyMs(
             surface.status_changed_at_ms
         else
             0,
-        .browser => 0,
+        .browser, .file => 0,
     };
 }
 
@@ -1553,6 +1555,10 @@ fn collectAttentionClusterRows(state: *runtime.AppState, rows: []AttentionCluste
                         else => false,
                     },
                     .browser => false,
+                    .file => |ref| switch (row.pane.ref) {
+                        .file => |existing| std.mem.eql(u8, existing.path, ref.path),
+                        else => false,
+                    },
                 };
                 if (duplicate) break;
             }
@@ -2069,6 +2075,23 @@ fn renderOpenPaneRow(
             }
             title = browserPaneTitle(pane);
         },
+        .file => |ref| {
+            // File-type glyph centred in the shared provider glyph slot.
+            const name = std.fs.path.basename(ref.path);
+            const icon = file_icons.forFile(name);
+            const glyph_size = theme.scaledUi(13.0);
+            const slot = theme.scaledUi(SIDEBAR_THREAD_PROVIDER_GLYPH_CSS);
+            const glyph_w = text_measure.textWidth(.icon, glyph_size, icon.glyph);
+            queuePaletteIcon(
+                state,
+                .{ .x = icon_x + (slot - glyph_w) * 0.5, .y = cy - glyph_size * 0.65, .w = glyph_w, .h = glyph_size * 1.3 },
+                icon.glyph,
+                glyph_size,
+                paletteColor(theme.legibleOn(icon.color, theme.background())),
+                clip,
+            );
+            title = name;
+        },
     }
 
     // Small top-right badge on the existing pane glyph: accent while shown and
@@ -2264,7 +2287,7 @@ fn paneNeedsAttention(
                 .idle => false,
             };
         },
-        .browser => return false,
+        .browser, .file => return false,
     }
 }
 
@@ -2296,7 +2319,7 @@ pub fn panePip(
             status = state.terminalSurfaceDisplayStatus(surface);
             running = !surface.completion_pending and surface.status == .working;
         },
-        .browser => return null,
+        .browser, .file => return null,
     }
     const color = paneStatusColor(status, running) orelse return null;
     const s = status orelse .idle;

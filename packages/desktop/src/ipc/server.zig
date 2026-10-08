@@ -2522,6 +2522,12 @@ fn writePane(s: *std.json.Stringify, state: *app_state.AppState, project_index: 
             try s.objectField("visible");
             try s.write(state.isBrowserRuntimeActiveInWorkspace(project_index));
         },
+        .file => |ref| {
+            try s.objectField("kind");
+            try s.write("file");
+            try s.objectField("path");
+            try s.write(ref.path);
+        },
     }
     try s.endObject();
 }

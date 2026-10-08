@@ -97,7 +97,7 @@ pub fn beginHandoffFromFocusedPane(self: anytype) void {
             };
             beginHandoff(self, project_index, pane_id, null, chat_provider);
         },
-        .browser => self.setSidebarNotice("Focus a chat or agent TUI before handing off."),
+        .browser, .file => self.setSidebarNotice("Focus a chat or agent TUI before handing off."),
     }
 }
 

@@ -979,7 +979,7 @@ pub fn acknowledgeFocusedPaneCompletion(self: anytype) bool {
     return switch (pane.ref) {
         .chat => |ref| clearChatCompletion(self, project_index, ref.thread_index),
         .terminal => |ref| self.clearSurfaceAttentionForDock(project_index, ref.dock_id),
-        .browser => false,
+        .browser, .file => false,
     };
 }
 

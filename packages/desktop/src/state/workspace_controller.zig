@@ -201,6 +201,7 @@ pub fn focusedWorkspacePaneKind(self: anytype) ?WorkspacePaneKind {
         .chat => .chat,
         .terminal => .terminal,
         .browser => .browser,
+        .file => .file,
     };
 }
 
@@ -464,6 +465,7 @@ pub fn workspacePaneKindById(self: anytype, pane_id: WorkspacePaneId) ?Workspace
         .chat => .chat,
         .terminal => .terminal,
         .browser => .browser,
+        .file => .file,
     };
 }
 
@@ -1142,6 +1144,7 @@ fn focusWorkspacePaneWithCompletionPolicy(
                 }
             }
         },
+        .file => if (self.project_controller.selected_index == project_index) self.focusFilePane(),
     }
     if (acknowledge_completion and persisted_focus_changed) self.markWorkspaceDirty(project_index);
     return true;
@@ -1348,6 +1351,7 @@ pub fn closeWorkspacePane(self: anytype, project_index: usize, pane_id: Workspac
             self.reconcileBrowserRuntimeAfterPaneRemoval(project_index, pane_id);
             self.setSidebarNotice("Browser pane closed.");
         },
+        .file => {},
     }
     self.clearHerdrClosedPaneMetadata(project_index, pane_id, removed_ref);
     // Closing a tab's last pane takes its side-panel browser with it.
