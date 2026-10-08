@@ -735,6 +735,18 @@ fn changeCursorSleep(loop: *ChangeCursorLoopState, total_ms: u64) void {
     }
 }
 
+const MovedThreadTile = struct {
+    workspace_id: []u8,
+    local_thread_id: []u8,
+    /// Store revision of the move; refreshes older than it predate the move.
+    store_revision: u64,
+
+    fn deinit(self: MovedThreadTile, allocator: std.mem.Allocator) void {
+        allocator.free(self.workspace_id);
+        allocator.free(self.local_thread_id);
+    }
+};
+
 fn projectIndexById(projects: []const PersistedProject, id: []const u8) ?usize {
     for (projects, 0..) |project, index| {
         if (project.id) |candidate| if (std.mem.eql(u8, candidate, id)) return index;
@@ -1127,6 +1139,44 @@ fn preserveCurrentIdentitiesWithoutBaseline(
         remote_project.threads = try threads.toOwnedSlice(allocator);
     }
     remote.projects = try projects.toOwnedSlice(allocator);
+}
+
+/// Shallow copy of `base` with one thread moved between workspaces exactly as
+/// the daemon's `chat.thread.move` does: removed from the source, appended to
+/// the target (its sort_index goes to the end), unarchived, and with `cwd`
+/// pinned when given. Returns null when either workspace or the thread is not
+/// in `base`. Slices alias `base`; the caller deep-clones the result.
+fn persistedStateWithMovedThread(
+    allocator: std.mem.Allocator,
+    base: PersistedState,
+    source_id: []const u8,
+    local_thread_id: []const u8,
+    target_id: []const u8,
+    cwd: ?[]const u8,
+) !?PersistedState {
+    const source_index = projectIndexById(base.projects, source_id) orelse return null;
+    const target_index = projectIndexById(base.projects, target_id) orelse return null;
+    if (source_index == target_index) return null;
+    const source_threads = base.projects[source_index].threads orelse return null;
+    const thread_index = threadIndexById(source_threads, local_thread_id) orelse return null;
+    var moved = source_threads[thread_index];
+    moved.archived = false;
+    if (cwd) |path| moved.cwd = path;
+
+    const remaining = try allocator.alloc(PersistedThread, source_threads.len - 1);
+    @memcpy(remaining[0..thread_index], source_threads[0..thread_index]);
+    @memcpy(remaining[thread_index..], source_threads[thread_index + 1 ..]);
+    const target_threads = base.projects[target_index].threads orelse &.{};
+    const appended = try allocator.alloc(PersistedThread, target_threads.len + 1);
+    @memcpy(appended[0..target_threads.len], target_threads);
+    appended[target_threads.len] = moved;
+
+    const projects = try allocator.dupe(PersistedProject, base.projects);
+    projects[source_index].threads = remaining;
+    projects[target_index].threads = appended;
+    var next = base;
+    next.projects = projects;
+    return next;
 }
 
 fn projectByIdForViewport(
@@ -4974,6 +5024,9 @@ pub const AppState = struct {
     /// Web-started chats this session already tiled (or saw tiled). A chat is
     /// tiled at most once, so a pane the user later moves or closes stays so.
     tiled_web_threads: std.StringHashMapUnmanaged(void) = .{},
+    /// Chats moved between workspaces whose target pane may be dropped by
+    /// the next no-baseline refresh; see `retileMovedThreads`.
+    pending_moved_thread_tiles: std.ArrayList(MovedThreadTile) = .empty,
     /// Dedicated synchronization status, independent of generic notices.
     daemon_projection_stale: bool = false,
     daemon_projection_bootstrap_started_at_ms: i64 = 0,
@@ -7529,8 +7582,10 @@ pub const AppState = struct {
         }
 
         const pinned_cwd: ?[]const u8 = if (thread.cwd == null and thread.provider_thread_id != null) source.path else null;
+        const observed_before_move = self.storage.currentProjectionObservedRevision();
+        var move_revision: ?u64 = null;
         if (thread.committed) {
-            self.storage.moveThread(source.id, thread.local_thread_id, target.id, pinned_cwd) catch |err| {
+            move_revision = self.storage.moveThread(source.id, thread.local_thread_id, target.id, pinned_cwd) catch |err| {
                 self.setSidebarNotice(switch (err) {
                     error.MoveUnsupported => "Restart Verde to move chats between workspaces.",
                     error.MoveRefused => "This chat can't move there right now.",
@@ -7601,12 +7656,119 @@ pub const AppState = struct {
         if (self.project_controller.selected_index == source_index) {
             if (source_layout.focused_pane_id) |focused_pane_id| _ = self.focusWorkspacePane(source_index, focused_pane_id);
         }
+        if (move_revision) |revision| {
+            const moved_thread_id = target.threads.items[target_thread_index].local_thread_id;
+            if (!self.repairProjectionBaselineAfterThreadMove(source.id, moved_thread_id, target.id, pinned_cwd, observed_before_move, revision)) {
+                self.noteMovedThreadNeedsTile(target.id, moved_thread_id, revision);
+            }
+        }
         self.markWorkspaceDirty(source_index);
         self.markWorkspaceDirty(target_index);
         self.syncRenameBuffer();
         self.markDirty();
         self.setSidebarNotice(if (owned_cwd != null) "Chat moved. It keeps working in its original folder." else "Chat moved.");
         return true;
+    }
+
+    /// `chat.thread.move` commits outside the snapshot flush and advances the
+    /// observed revision, leaving the projection baseline one revision behind.
+    /// While it is unpaired every flush backs off, and the next foreign
+    /// durable refresh takes the no-baseline rebuild, which keeps the moved
+    /// thread but restores the daemon's target layout: the chat stays open
+    /// with no pane. When the move provably committed right after the paired
+    /// baseline (no foreign write in between, no flush holding the baseline),
+    /// apply the same move to the baseline and pair it with the move revision,
+    /// so the target pane merges as an ordinary local layout edit and flushes.
+    fn repairProjectionBaselineAfterThreadMove(
+        self: *AppState,
+        source_id: []const u8,
+        local_thread_id: []const u8,
+        target_id: []const u8,
+        cwd: ?[]const u8,
+        observed_before_move: u64,
+        move_revision: u64,
+    ) bool {
+        if (observed_before_move == std.math.maxInt(u64) or move_revision != observed_before_move + 1) return false;
+        if (self.lifecycle.flush_in_flight or self.lifecycle.rebase_snapshot != null) return false;
+        const baseline = self.lifecycle.projection_baseline orelse return false;
+        if (self.lifecycle.projection_baseline_revision != observed_before_move) return false;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const composed = (persistedStateWithMovedThread(
+            arena.allocator(),
+            baseline.value,
+            source_id,
+            local_thread_id,
+            target_id,
+            cwd,
+        ) catch return false) orelse return false;
+        const rebuilt = self.clonePersistedBaseline(self.allocator, composed) catch return false;
+        if (self.lifecycle.projection_baseline) |*old| old.deinit();
+        self.lifecycle.projection_baseline = rebuilt;
+        self.lifecycle.projection_baseline_revision = move_revision;
+        return true;
+    }
+
+    /// Fallback when the baseline could not be re-paired after a move: the
+    /// next durable refresh may rebuild the target from the daemon's layout,
+    /// which has no pane for the chat. Remember it so that refresh re-tiles it.
+    fn noteMovedThreadNeedsTile(self: *AppState, workspace_id: []const u8, local_thread_id: []const u8, store_revision: u64) void {
+        const owned_workspace = self.allocator.dupe(u8, workspace_id) catch return;
+        const owned_thread = self.allocator.dupe(u8, local_thread_id) catch {
+            self.allocator.free(owned_workspace);
+            return;
+        };
+        self.pending_moved_thread_tiles.append(self.allocator, .{
+            .workspace_id = owned_workspace,
+            .local_thread_id = owned_thread,
+            .store_revision = store_revision,
+        }) catch {
+            self.allocator.free(owned_workspace);
+            self.allocator.free(owned_thread);
+        };
+    }
+
+    /// After a durable projection at or past a move's revision is applied,
+    /// give each recorded moved chat a pane if the rebuild left it without
+    /// one. Focus and selection stay where the user left them.
+    fn retileMovedThreads(self: *AppState, applied_revision: u64) void {
+        var index: usize = 0;
+        while (index < self.pending_moved_thread_tiles.items.len) {
+            const entry = self.pending_moved_thread_tiles.items[index];
+            if (entry.store_revision > applied_revision) {
+                index += 1;
+                continue;
+            }
+            _ = self.pending_moved_thread_tiles.orderedRemove(index);
+            defer entry.deinit(self.allocator);
+            self.retileMovedThread(entry.workspace_id, entry.local_thread_id);
+        }
+    }
+
+    fn retileMovedThread(self: *AppState, workspace_id: []const u8, local_thread_id: []const u8) void {
+        const project_index = for (self.project_controller.projects.items, 0..) |*project, candidate| {
+            if (std.mem.eql(u8, project.id, workspace_id)) break candidate;
+        } else return;
+        const project = &self.project_controller.projects.items[project_index];
+        const thread_index = for (project.threads.items, 0..) |*thread, candidate| {
+            if (std.mem.eql(u8, thread.local_thread_id, local_thread_id)) break candidate;
+        } else return;
+        if (project.hasChatPaneForThread(thread_index)) return;
+        _ = self.presentWorkspaceChat(project_index, .{
+            .local_thread_id = local_thread_id,
+            .axis = .vertical,
+            .focus = false,
+        }) catch |err| {
+            log.warn("failed to re-tile moved chat {s}: {s}", .{ local_thread_id, @errorName(err) });
+            return;
+        };
+        runtime_log.trace("re-tiled moved chat project={d} thread={s}", .{ project_index, local_thread_id });
+    }
+
+    fn clearPendingMovedThreadTiles(self: *AppState) void {
+        for (self.pending_moved_thread_tiles.items) |entry| entry.deinit(self.allocator);
+        self.pending_moved_thread_tiles.deinit(self.allocator);
+        self.pending_moved_thread_tiles = .empty;
     }
 
     /// Fetches every open thread of one workspace by identity and appends
@@ -10899,6 +11061,10 @@ pub const AppState = struct {
     pub const applyInitialWorkspaceFocusOnLaunch = browser_controller.applyInitialWorkspaceFocusOnLaunch;
     pub const toggleBrowser = browser_controller.toggleBrowser;
     pub const openBrowserInWorkspace = browser_controller.openBrowserInWorkspace;
+    pub const openBrowserPaneInWorkspace = browser_controller.openBrowserPaneInWorkspace;
+    pub const beginBrowserPresentationFrame = browser_controller.beginBrowserPresentationFrame;
+    pub const claimBrowserPanePresentation = browser_controller.claimBrowserPanePresentation;
+    pub const finishBrowserPresentationFrame = browser_controller.finishBrowserPresentationFrame;
     pub const activateBrowserInWorkspace = browser_controller.activateBrowserInWorkspace;
     pub const closeBrowserInWorkspace = browser_controller.closeBrowserInWorkspace;
     pub const navigateBrowserToUrl = browser_controller.navigateBrowserToUrl;
@@ -15214,6 +15380,7 @@ pub const AppState = struct {
         runtime_log.diagnostic("AppState.deinit begin", .{});
         self.clearPaletteHistory();
         self.clearTiledWebThreads();
+        self.clearPendingMovedThreadTiles();
         // Shutdown durability and worker settlement may take time. Remove the
         // UI-owned bearer immediately; RuntimeService keeps only its separate
         // process-memory copy until remote work has been stopped below.
@@ -15607,6 +15774,7 @@ pub const AppState = struct {
             self.change_cursor_loop.noteRefreshApplication(true);
             _ = self.change_cursor_loop.acknowledgeProjectionRevision(self.storage.currentProjectionObservedRevision());
             self.tileWebClientThreads();
+            if (refresh.durable != null and !durable_already_projected) self.retileMovedThreads(refresh.result.store_revision);
         }
         const signals = self.change_cursor_loop.take();
         self.pollDaemonProjectionStaleness();
@@ -21724,6 +21892,155 @@ test "daemon refresh never moves pane focus or strip viewport from live state" {
     try std.testing.expect(std.mem.indexOf(u8, baseline_json, "\"focused\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, baseline_json, "\"scroll_x\":4.8e2") != null or
         std.mem.indexOf(u8, baseline_json, "\"scroll_x\":480") != null);
+}
+
+fn moveTestProjectionRefresh(
+    state: *AppState,
+    revision: u64,
+    workspaces: []const headless.store.Workspace,
+) !void {
+    try state.applyDaemonProjectionRefresh(.{
+        .snapshot = .{ .store_revision = revision, .workspaces = workspaces },
+        .store_revision = revision,
+        .envelope = .{ .instance_nonce = "thread-move", .registry_revision = revision },
+        .change_cursor = revision,
+    });
+}
+
+fn moveTestChatPaneForThread(project: *const project_state.Project, local_thread_id: []const u8) bool {
+    for (project.threads.items, 0..) |thread, thread_index| {
+        if (std.mem.eql(u8, thread.local_thread_id, local_thread_id)) return project.hasChatPaneForThread(thread_index);
+    }
+    return false;
+}
+
+/// Seeds workspaces A (two chat panes) and B (one), then performs the GUI
+/// half of a sidebar move of A's second chat into B and advances the
+/// observed revision as the daemon's `chat.thread.move` receipt does.
+fn moveTestSeedAndMove(state: *AppState, storage: *Storage, allocator: std.mem.Allocator) !void {
+    var layout_a = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout_a.deinit(allocator);
+    const second_pane_id = try layout_a.createChatPane(allocator, 1);
+    try layout_a.splitPaneWithLeaf(allocator, 1, second_pane_id, .vertical, true);
+    const layout_a_json = try layout_a.persistedWorkspaceJson(allocator);
+    defer allocator.free(layout_a_json);
+    var layout_b = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout_b.deinit(allocator);
+    const layout_b_json = try layout_b.persistedWorkspaceJson(allocator);
+    defer allocator.free(layout_b_json);
+    const threads_a = [_]headless.store.Thread{
+        .{ .local_thread_id = "a-keep", .title = "Keep" },
+        .{ .local_thread_id = "a-move", .title = "Move" },
+    };
+    const threads_b = [_]headless.store.Thread{.{ .local_thread_id = "b-one", .title = "B" }};
+    const workspaces = [_]headless.store.Workspace{
+        .{ .workspace_id = "ws-a", .label = "A", .path = "/tmp/move-a/", .workspace_layout_json = layout_a_json, .threads = &threads_a },
+        .{ .workspace_id = "ws-b", .label = "B", .path = "/tmp/move-b/", .workspace_layout_json = layout_b_json, .threads = &threads_b },
+    };
+    state.lifecycle.dirty = false;
+    try moveTestProjectionRefresh(state, 1, &workspaces);
+    try std.testing.expectEqual(@as(?u64, 1), state.lifecycle.projection_baseline_revision);
+
+    // Skip the daemon RPC (no daemon in unit tests); simulate its receipt.
+    const source = &state.project_controller.projects.items[0];
+    source.threads.items[1].committed = false;
+    try std.testing.expect(state.moveChatPaneToProject(0, second_pane_id, 1));
+    state.project_controller.projects.items[1].threads.items[1].committed = true;
+    storage.store_session.projection_observed_revision = 2;
+    try std.testing.expect(moveTestChatPaneForThread(&state.project_controller.projects.items[1], "a-move"));
+}
+
+/// The daemon after the move plus one foreign write (a turn acceptance): the
+/// thread sits at the end of B, A's layout lost its pane, B's layout is the
+/// one the GUI last flushed — it has no pane for the moved chat.
+fn moveTestForeignRefreshAfterMove(state: *AppState, allocator: std.mem.Allocator) !void {
+    var layout_a = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout_a.deinit(allocator);
+    const layout_a_json = try layout_a.persistedWorkspaceJson(allocator);
+    defer allocator.free(layout_a_json);
+    var layout_b = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout_b.deinit(allocator);
+    const layout_b_json = try layout_b.persistedWorkspaceJson(allocator);
+    defer allocator.free(layout_b_json);
+    const threads_a = [_]headless.store.Thread{.{ .local_thread_id = "a-keep", .title = "Keep" }};
+    const threads_b = [_]headless.store.Thread{
+        .{ .local_thread_id = "b-one", .title = "B" },
+        .{ .local_thread_id = "a-move", .title = "Move" },
+    };
+    const workspaces = [_]headless.store.Workspace{
+        .{ .workspace_id = "ws-a", .label = "A", .path = "/tmp/move-a/", .workspace_layout_json = layout_a_json, .threads = &threads_a },
+        .{ .workspace_id = "ws-b", .label = "B", .path = "/tmp/move-b/", .workspace_layout_json = layout_b_json, .threads = &threads_b },
+    };
+    try moveTestProjectionRefresh(state, 3, &workspaces);
+}
+
+test "moved chat keeps its target pane across the next daemon refresh" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+
+    // Unrepaired: the move leaves the baseline one revision behind, so a
+    // foreign refresh takes the no-baseline rebuild and drops the pane.
+    {
+        var storage = try Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
+        defer storage.deinit();
+        var state = try AppState.init(allocator, &storage, app_config.AppConfig{}, .{
+            .gl_texture_uploads_enabled = false,
+            .browser_textures_enabled = false,
+        });
+        defer {
+            state.lifecycle.dirty = false;
+            state.deinit();
+        }
+        try moveTestSeedAndMove(&state, &storage, allocator);
+        state.noteMovedThreadNeedsTile("ws-b", "a-move", 2);
+        try moveTestForeignRefreshAfterMove(&state, allocator);
+        try std.testing.expectEqual(persistence.ProjectionReuseGate.no_baseline, state.last_projection_reuse.gate);
+        const target = &state.project_controller.projects.items[1];
+        try std.testing.expect(!moveTestChatPaneForThread(target, "a-move"));
+        // Fallback: the recorded move re-tiles the chat after that refresh.
+        state.retileMovedThreads(3);
+        try std.testing.expect(moveTestChatPaneForThread(&state.project_controller.projects.items[1], "a-move"));
+        try std.testing.expectEqual(@as(usize, 0), state.pending_moved_thread_tiles.items.len);
+    }
+
+    // Repaired: the baseline carries the move and pairs with its revision.
+    {
+        var storage = try Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
+        defer storage.deinit();
+        var state = try AppState.init(allocator, &storage, app_config.AppConfig{}, .{
+            .gl_texture_uploads_enabled = false,
+            .browser_textures_enabled = false,
+        });
+        defer {
+            state.lifecycle.dirty = false;
+            state.deinit();
+        }
+        try moveTestSeedAndMove(&state, &storage, allocator);
+        // A foreign write between the paired baseline and the move cannot be
+        // ruled out, so the repair must refuse.
+        try std.testing.expect(!state.repairProjectionBaselineAfterThreadMove("ws-a", "a-move", "ws-b", null, 1, 3));
+        try std.testing.expect(state.repairProjectionBaselineAfterThreadMove("ws-a", "a-move", "ws-b", null, 1, 2));
+        try std.testing.expectEqual(@as(?u64, 2), state.lifecycle.projection_baseline_revision);
+        const baseline = state.lifecycle.projection_baseline.?.value;
+        try std.testing.expectEqual(@as(usize, 1), baseline.projects[0].threads.?.len);
+        try std.testing.expectEqual(@as(usize, 2), baseline.projects[1].threads.?.len);
+        try std.testing.expectEqualStrings("a-move", baseline.projects[1].threads.?[1].local_thread_id.?);
+
+        // Paired and dirty: the refresh waits for the flush instead of
+        // rebuilding over the unflushed layout.
+        try std.testing.expectError(error.ProjectionRefreshDeferred, moveTestForeignRefreshAfterMove(&state, allocator));
+        // If the flush then conflicts, the rebase merges through the
+        // repaired baseline and keeps the pane as a local layout edit.
+        state.lifecycle.rebase_snapshot = LoadedPersistedState.init(allocator);
+        try moveTestForeignRefreshAfterMove(&state, allocator);
+        try std.testing.expectEqual(persistence.ProjectionReuseGate.merged, state.last_projection_reuse.gate);
+        try std.testing.expect(moveTestChatPaneForThread(&state.project_controller.projects.items[1], "a-move"));
+        try std.testing.expect(!moveTestChatPaneForThread(&state.project_controller.projects.items[0], "a-move"));
+        try std.testing.expectEqual(@as(usize, 1), state.project_controller.projects.items[0].threads.items.len);
+    }
 }
 
 test "daemon refresh keeps just-attached draft images and committed row image extras" {

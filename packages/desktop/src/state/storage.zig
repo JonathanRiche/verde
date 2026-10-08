@@ -558,14 +558,16 @@ pub const Storage = struct {
 
     /// Reassigns one idle thread to another workspace in the daemon. Errors
     /// are reported to the caller without pausing persistence: a refusal or
-    /// an older daemon is not a connectivity failure.
+    /// an older daemon is not a connectivity failure. Returns the store
+    /// revision the move committed at, so the caller can re-pair its
+    /// projection baseline.
     pub fn moveThread(
         self: *const Storage,
         workspace_id: []const u8,
         local_thread_id: []const u8,
         target_workspace_id: []const u8,
         cwd: ?[]const u8,
-    ) MoveThreadError!void {
+    ) MoveThreadError!u64 {
         self.ensureGranularMutationAllowed() catch return error.MoveFailed;
         self.ensureDaemon() catch return error.MoveFailed;
         var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -604,6 +606,7 @@ pub const Storage = struct {
         const result = client.decodeWriteResult(&parsed) catch return error.MoveFailed;
         self.noteStoreRevision(result.store_revision);
         self.noteProjectionObservedRevision(result.store_revision);
+        return result.store_revision;
     }
 
     fn loadDaemonProjection(self: *const Storage, allocator: std.mem.Allocator) !LoadedPersistedState {
