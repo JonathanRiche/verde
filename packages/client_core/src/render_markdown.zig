@@ -268,8 +268,9 @@ const Builder = struct {
                     node.children = try self.inlines(link.children, depth + 1);
                     if (node.children.len > 0) node.start = node.children[0].start;
                     node.end = self.cursor;
-                    node.url = if (safeUrl(link.destination)) try self.a.dupe(u8, link.destination) else null;
-                    node.citation = try citation(self.a, link.destination);
+                    const destination = unwrapDestination(link.destination);
+                    node.url = if (safeUrl(destination)) try self.a.dupe(u8, destination) else null;
+                    node.citation = try citation(self.a, destination);
                     if (!eq(link.label, link.destination)) {
                         if (std.mem.indexOfPos(u8, self.source, self.cursor, link.destination)) |pos| {
                             self.cursor = pos + link.destination.len;
@@ -307,6 +308,14 @@ const Builder = struct {
     }
 };
 
+/// CommonMark `<...>` destinations allow spaces (agents use them for paths like
+/// `Application Support`); zig_markdown keeps the brackets, so drop them here.
+fn unwrapDestination(destination: []const u8) []const u8 {
+    if (destination.len >= 2 and destination[0] == '<' and destination[destination.len - 1] == '>')
+        return destination[1 .. destination.len - 1];
+    return destination;
+}
+
 fn safeUrl(url: []const u8) bool {
     for (url) |c| if (c <= 0x20 or c == 0x7f) return false;
     if (std.mem.startsWith(u8, url, "//")) return false;
@@ -316,7 +325,7 @@ fn safeUrl(url: []const u8) bool {
 }
 
 pub fn citation(a: A, destination: []const u8) Error!?Citation {
-    var path = destination;
+    var path = unwrapDestination(destination);
     if (std.mem.startsWith(u8, path, "/api/file?") or std.mem.startsWith(u8, path, "/api/preview?")) {
         var fields = std.mem.splitScalar(u8, path[std.mem.indexOfScalar(u8, path, '?').? + 1 ..], '&');
         var found: ?[]const u8 = null;

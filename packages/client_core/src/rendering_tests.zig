@@ -83,6 +83,16 @@ test "web file citation and document links produce abstract targets" {
     const items = find(docs.nodes, "list").?.children;
     try eql("/home/rtg/SJ-Co-Events-Business-Plan.docx", find(items[0].children, "link").?.citation.?.path);
     try eql("/home/rtg/SJ-Co-Events-Pitch-Deck.pdf", find(items[1].children, "link").?.citation.?.path);
+    const spaced = try rendering.markdown.render(a, "[Download labels](</Users/me/Library/Application Support/Verde/labels.pdf>) and [site](<https://verdeai.dev>)");
+    try eql("/Users/me/Library/Application Support/Verde/labels.pdf", find(spaced.nodes, "link").?.citation.?.path);
+    var spaced_links: usize = 0;
+    for (find(spaced.nodes, "paragraph").?.children) |child| {
+        if (!std.mem.eql(u8, child.kind, "link")) continue;
+        spaced_links += 1;
+        if (spaced_links == 2) try eql("https://verdeai.dev", child.url.?);
+    }
+    try expect(spaced_links == 2);
+    try ranges(spaced.nodes, "[Download labels](</Users/me/Library/Application Support/Verde/labels.pdf>) and [site](<https://verdeai.dev>)");
     for ([_][]const u8{ "/src/main.zig:42", "file:///src/main.zig#L42" }) |target| {
         const citation = (try rendering.markdown.citation(a, target)).?;
         try eql("/src/main.zig", citation.path);
@@ -328,4 +338,17 @@ test "registered query models decode real rendering replies" {
         defer model.deinit();
         try expect(model.value.data != null and model.value.@"error" == null);
     }
+}
+
+test "selection_prompt utility formats the shared ask-agent message" {
+    var h = try host.Host.init(std.testing.allocator, config);
+    defer h.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const request = .{ .utility = "selection_prompt", .path = "/w/app/src/a.kt", .roots = .{.{ .name = "app", .path = "/w/app", .home = true }}, .start_line = 2, .end_line = 4, .side = "new", .text = "val a = 1\n", .instruction = "Explain" };
+    const ok = try host.parse(a, try h.query(try std.json.Stringify.valueAlloc(a, request, .{}), a));
+    try eql("In `src/a.kt` lines 2\u{2013}4 (diff, new side):\n```kotlin\nval a = 1\n```\nExplain", ok.object.get("data").?.object.get("text").?.string);
+    const bad = try host.parse(a, try h.query("{\"utility\":\"selection_prompt\",\"path\":\"/a\",\"start_line\":0,\"text\":\"\",\"instruction\":\"\"}", a));
+    try eql("invalid_input", bad.object.get("error").?.object.get("code").?.string);
 }
