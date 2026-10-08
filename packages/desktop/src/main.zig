@@ -25,6 +25,7 @@ const ui_layout = @import("ui/layout.zig");
 const workspace_panes_ui = @import("ui/workspace_panes.zig");
 const workspace_strip_ui = @import("ui/workspace_strip.zig");
 const side_panel_ui = @import("ui/side_panel.zig");
+const agent_prompt_popover_ui = @import("ui/agent_prompt_popover.zig");
 const file_viewer_ui = @import("ui/file_viewer.zig");
 const sidebar_ui = @import("ui/sidebar.zig");
 const chat_panel_ui = @import("ui/chat_panel.zig");
@@ -855,6 +856,12 @@ fn syncMouseCursor(state: *AppState, cache: *SystemCursorCache) void {
     if (!modalHitAtMouse(state)) {
         if (ui_layout.companionHitAt(state, mouse_x, mouse_y)) |action| {
             applySystemCursor(cache, systemCursorForCompanionAction(action));
+            return;
+        }
+    }
+    if (!modalHitAtMouse(state)) {
+        if (agent_prompt_popover_ui.systemCursorAt(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y)) |cursor| {
+            applySystemCursor(cache, cursor);
             return;
         }
     }
@@ -1966,6 +1973,12 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
+            // The ask-agent popover floats over panes and the side panel, so it
+            // owns keys before any pane or panel body routing.
+            if (agent_prompt_popover_ui.handleKeyDown(state, &event.key)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
             if (event.key.key == .escape and ui_layout.handleCompanionEscapeKey(state, true)) {
                 syncWindowTextInput(window, state);
                 return true;
@@ -2254,6 +2267,10 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
+            if (agent_prompt_popover_ui.handleTextInput(state, text_input)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
             if (state.isCompanionEnabled() and state.companion_controller.mission_control_open) {
                 if (state.companion_composer.focused) _ = state.routeCompanionComposerTextInput(text_input);
                 syncWindowTextInput(window, state);
@@ -2324,6 +2341,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             if (state.palette_modal_pointer_captured or modal_owns_motion) {
                 return true;
             }
+            if (agent_prompt_popover_ui.handleMouseMotion(state, event.motion.x, event.motion.y)) return true;
             if (ui_layout.handleCompanionMouseMotion(state, event.motion.x, event.motion.y, event.motion.state.left != 0)) {
                 return true;
             }
@@ -2383,6 +2401,10 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 return true;
             }
             if (ui_layout.hasPaletteModal(state)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            if (event.button.button == 1 and agent_prompt_popover_ui.handleMouseButton(state, event.button.x, event.button.y, event.button.down, event.button.clicks)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
@@ -2616,6 +2638,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 return true;
             }
             if (ui_layout.hasPaletteModal(state)) return true;
+            if (agent_prompt_popover_ui.handleWheel(state, event.wheel.mouse_x, event.wheel.mouse_y, event.wheel.y)) return true;
             if (routeCompanionWheel(state, event.wheel.mouse_x, event.wheel.mouse_y, event.wheel.y)) {
                 return true;
             }
@@ -2694,6 +2717,7 @@ fn syncWindowTextInput(window: *sdl.Window, state: *AppState) void {
         state.browser_controller.address_focused or
         state.palette_modal_text_focus != .none or
         side_panel_ui.wantsTextInput(state) or
+        agent_prompt_popover_ui.wantsTextInput() or
         file_viewer_ui.wantsTextInput(state) or
         (state.isBrowserPaneFocused() and !macosNativeBrowserShouldOwnKeyboard(state));
     if (!needs_sdl_text_input) {
