@@ -21,12 +21,12 @@ val syncNativeLibraries by tasks.registering(Sync::class) {
 
 android {
     namespace = "dev.verdeai.app"
-    compileSdk = 35
+    compileSdk = 36
     ndkVersion = "30.0.16248370"
     defaultConfig {
         applicationId = "dev.verdeai.app"
         minSdk = 29
-        targetSdk = 35
+        targetSdk = 36
         // CI passes the run number so every Play upload is newer than the last.
         versionCode = providers.environmentVariable("VERDE_VERSION_CODE").orNull?.toInt() ?: 1
         versionName = "0.1.0"
