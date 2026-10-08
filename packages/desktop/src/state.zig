@@ -13841,8 +13841,71 @@ pub const AppState = struct {
                 self.setCurrentThreadCwd(ensured);
             },
             .project => self.setCurrentThreadCwd(null),
-            .workspace, .recent, .home => self.setCurrentThreadCwd(entry.path),
+            .workspace => {
+                const path = entry.path orelse return;
+                if (!self.moveCurrentChatToWorkspacePath(path)) self.setCurrentThreadCwd(path);
+            },
+            .recent, .home => self.setCurrentThreadCwd(entry.path),
         }
+    }
+
+    /// Composer workspace pick: the chat joins that workspace rather than
+    /// only borrowing its folder, so it shows under that workspace in the
+    /// sidebar and the switcher. Works in the target root (provider session
+    /// restarts there, like any directory change), then follows the chat.
+    /// Returns false when the pick can't be a move (same workspace, no open
+    /// local workspace at `path`, no pane for the chat) so the caller falls
+    /// back to a plain directory change.
+    fn moveCurrentChatToWorkspacePath(self: *AppState, path: []const u8) bool {
+        const projects = self.project_controller.projects.items;
+        const source_index = self.project_controller.selected_index;
+        if (source_index >= projects.len) return false;
+        const target_index = for (projects, 0..) |*project, index| {
+            if (project.herdr_link == null and project.path.len > 0 and std.mem.eql(u8, project.path, path)) break index;
+        } else return false;
+        if (target_index == source_index or projects[source_index].herdr_link != null) return false;
+        const source = &projects[source_index];
+        if (source.threads.items.len == 0) return false;
+        const thread_index = @min(source.selected_thread_index, source.threads.items.len - 1);
+        const pane_id = chatPaneForThread(&source.workspace_layout, thread_index) orelse return false;
+
+        // Root the chat in the target first. If that is refused (turn in
+        // flight) the notice is already up and nothing moves.
+        self.setCurrentThreadCwd(path);
+        const cwd = source.threads.items[thread_index].cwd orelse return true;
+        if (!std.mem.eql(u8, cwd, path)) return true;
+        if (!self.moveChatPaneToProject(source_index, pane_id, target_index)) return true;
+
+        const target = &self.project_controller.projects.items[target_index];
+        const moved_index = target.threads.items.len - 1;
+        const moved = &target.threads.items[moved_index];
+        // The target root is the implicit default; store it as no override.
+        if (moved.cwd) |moved_cwd| if (std.mem.eql(u8, moved_cwd, target.path)) {
+            self.allocator.free(moved_cwd);
+            moved.cwd = null;
+        };
+        if (chatPaneForThread(&target.workspace_layout, moved_index)) |moved_pane_id| {
+            if (target.workspace_layout.scrollGroupIdForPane(moved_pane_id)) |group_id| {
+                _ = self.selectWorkspaceTab(target_index, group_id);
+            }
+        }
+        self.markWorkspaceDirty(target_index);
+        self.syncPaletteComposerControls();
+        self.markDirty();
+        return true;
+    }
+
+    /// The pane showing chat `thread_index`, preferring the focused one.
+    fn chatPaneForThread(layout: *const WorkspaceLayout, thread_index: usize) ?WorkspacePaneId {
+        if (layout.focused_pane_id) |focused| if (layout.paneById(focused)) |pane| switch (pane.ref) {
+            .chat => |ref| if (ref.thread_index == thread_index) return focused,
+            else => {},
+        };
+        for (layout.panes.items) |pane| switch (pane.ref) {
+            .chat => |ref| if (ref.thread_index == thread_index) return pane.id,
+            else => {},
+        };
+        return null;
     }
 
     /// Sets the current thread's working-directory override; the project
