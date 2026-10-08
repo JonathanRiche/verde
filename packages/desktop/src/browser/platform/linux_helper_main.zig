@@ -3,15 +3,20 @@
 const std = @import("std");
 const ipc = @import("linux_ipc.zig");
 
-const IDLE_SLEEP_MS = 1;
+/// Upper bound on one idle block. Work normally wakes the helper first (GLib
+/// sources or the stdin reader); this only bounds a missed wakeup.
+const IDLE_WAIT_MAX_MS = 500;
 const IPC_LINE_BUFFER_BYTES = 256 * 1024;
 
 const RawBrowser = opaque {};
 
 extern fn verde_browser_linux_create() ?*RawBrowser;
 extern fn verde_browser_linux_destroy(browser: ?*RawBrowser) void;
+extern fn verde_browser_linux_wait_for_work(max_wait_ms: c_uint) void;
+extern fn verde_browser_linux_wakeup() void;
 extern fn verde_browser_linux_show(browser: ?*RawBrowser, width: c_int, height: c_int, url: ?[*:0]const u8) c_int;
 extern fn verde_browser_linux_hide(browser: ?*RawBrowser) c_int;
+extern fn verde_browser_linux_request_paint(browser: ?*RawBrowser, token: u64) c_int;
 extern fn verde_browser_linux_set_host_window(browser: ?*RawBrowser, host_window: usize) c_int;
 extern fn verde_browser_linux_set_device_scale(browser: ?*RawBrowser, scale: f64) c_int;
 extern fn verde_browser_linux_set_bounds(browser: ?*RawBrowser, x: c_int, y: c_int, width: c_int, height: c_int) c_int;
@@ -93,6 +98,7 @@ const CommandQueue = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         try self.items.append(allocator, command);
+        verde_browser_linux_wakeup();
     }
 
     /// Marks the queue as closed so the helper can terminate once pending commands drain.
@@ -100,6 +106,7 @@ const CommandQueue = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.closed = true;
+        verde_browser_linux_wakeup();
     }
 
     /// Removes and returns the oldest pending command, if one exists.
@@ -125,8 +132,9 @@ const ReaderContext = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
-    const allocator = gpa_state.allocator();
+    // The helper links libc for WebKit; the leak-checking DebugAllocator is
+    // per-allocation overhead with no reader in release builds.
+    const allocator = std.heap.c_allocator;
 
     // The desktop waits for EOF on this protocol pipe. WebKit subprocesses
     // must not inherit it or they can keep Verde's reader blocked after this
@@ -173,17 +181,9 @@ pub fn main(init: std.process.Init) !void {
         if (did_work) {
             std.atomic.spinLoopHint();
         } else {
-            sleepMillis(IDLE_SLEEP_MS);
+            verde_browser_linux_wait_for_work(IDLE_WAIT_MAX_MS);
         }
     }
-}
-
-fn sleepMillis(ms: u64) void {
-    const request: std.c.timespec = .{
-        .sec = @intCast(ms / 1000),
-        .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
-    };
-    _ = std.c.nanosleep(&request, null);
 }
 
 fn monotonicTimestampNs() u64 {
@@ -204,7 +204,10 @@ fn stdinReaderMain(context: *ReaderContext) !void {
         const line = std.mem.trimEnd(u8, maybe_line.?, "\r");
         if (line.len == 0) continue;
 
-        var parsed = try std.json.parseFromSlice(ipc.Command, context.allocator, line, .{ .allocate = .alloc_always });
+        var parsed = std.json.parseFromSlice(ipc.Command, context.allocator, line, .{ .allocate = .alloc_always }) catch |err| {
+            std.debug.print("verde-browser-linux: skipping unreadable command ({s})\n", .{@errorName(err)});
+            continue;
+        };
         defer parsed.deinit();
 
         const command: ipc.Command = .{
@@ -257,6 +260,7 @@ fn applyCommand(allocator: std.mem.Allocator, browser: *RawBrowser, command: ipc
             }
         },
         .hide => _ = verde_browser_linux_hide(browser),
+        .resume_painting => _ = verde_browser_linux_request_paint(browser, command.frame_sequence),
         .set_host_window => _ = verde_browser_linux_set_host_window(browser, @intCast(command.host_window)),
         .set_bounds => {
             _ = verde_browser_linux_set_device_scale(browser, command.scale);
@@ -522,6 +526,7 @@ fn mapEventKind(raw_kind: c_int) ipc.EventKind {
         10 => .context_menu_dismissed,
         11 => .cursor_changed,
         12 => .cookies_imported,
+        13 => .paint_ack,
         else => .failed,
     };
 }

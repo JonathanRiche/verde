@@ -24,6 +24,8 @@ pub const CommandKind = enum {
     context_menu_dismiss,
     frame_release,
     import_cookies,
+    /// Lets a hidden page whose painting was paused render a fresh frame.
+    resume_painting,
     quit,
 };
 
@@ -69,6 +71,8 @@ pub const EventKind = enum {
     cursor_changed,
     frame_ready,
     cookies_imported,
+    /// "<token>:<frame sequence>" once a resumed hidden page painted.
+    paint_ack,
     failed,
 };
 

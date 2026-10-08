@@ -50,6 +50,7 @@ enum verde_browser_linux_event_kind {
     VERDE_BROWSER_LINUX_EVENT_CONTEXT_MENU_DISMISSED = 10,
     VERDE_BROWSER_LINUX_EVENT_CURSOR_CHANGED = 11,
     VERDE_BROWSER_LINUX_EVENT_COOKIES_IMPORTED = 12,
+    VERDE_BROWSER_LINUX_EVENT_PAINT_ACK = 13,
 };
 
 enum verde_browser_linux_modifier_bits {
@@ -179,6 +180,10 @@ struct verde_browser_linux {
     gint64 metric_export_intervals_us[VERDE_BROWSER_LINUX_FRAME_INTERVAL_SAMPLE_MAX];
 
     gboolean visible;
+    gboolean painting_paused;
+    guint hidden_pause_timer_id;
+    struct verde_browser_linux_paint_ack *paint_ack_pending;
+    guint paint_ack_source_id;
     gint target_width;
     gint target_height;
     gdouble device_scale;
@@ -308,7 +313,37 @@ static void verde_browser_linux_schedule_frame_complete_at(struct verde_browser_
     browser->metric_frame_complete_scheduled += 1;
 }
 
+/* A hidden pane keeps painting briefly so MCP screenshots and agent actions
+ * right after it leaves the screen still see a current frame. After this grace
+ * WebKit is told the view is hidden: page timers and rAF throttle and no
+ * frames are exported until the pane is shown or driven again. */
+#define VERDE_BROWSER_LINUX_HIDDEN_PAINT_GRACE_MS 15000u
+
+static gboolean verde_browser_linux_hidden_pause_timer(gpointer user_data) {
+    struct verde_browser_linux *browser = user_data;
+    browser->hidden_pause_timer_id = 0;
+    if (!browser->visible && !browser->painting_paused && browser->view_backend != NULL) {
+        browser->painting_paused = TRUE;
+        wpe_view_backend_remove_activity_state(browser->view_backend, wpe_view_activity_state_visible);
+    }
+    return G_SOURCE_REMOVE;
+}
+
+static void verde_browser_linux_schedule_hidden_pause(struct verde_browser_linux *browser) {
+    if (browser->hidden_pause_timer_id != 0) g_source_remove(browser->hidden_pause_timer_id);
+    browser->hidden_pause_timer_id = g_timeout_add(VERDE_BROWSER_LINUX_HIDDEN_PAINT_GRACE_MS, verde_browser_linux_hidden_pause_timer, browser);
+}
+
+/* Lets a paused hidden page paint again, e.g. when an agent drives it. */
+static void verde_browser_linux_resume_painting(struct verde_browser_linux *browser) {
+    if (browser == NULL || !browser->painting_paused || browser->view_backend == NULL) return;
+    browser->painting_paused = FALSE;
+    wpe_view_backend_add_activity_state(browser->view_backend, wpe_view_activity_state_visible);
+    if (!browser->visible) verde_browser_linux_schedule_hidden_pause(browser);
+}
+
 static void verde_browser_linux_mark_active(struct verde_browser_linux *browser) {
+    verde_browser_linux_resume_painting(browser);
     if (browser == NULL || browser->frame_complete_timer_id == 0) return;
     const gint64 now_us = g_get_monotonic_time();
     const gint64 active_deadline_us = verde_browser_linux_completion_deadline_us(
@@ -1652,9 +1687,37 @@ static void verde_browser_linux_destroy_exportable(gpointer user_data) {
  * memory only, which signed users out whenever a helper restarted; the
  * SQLite cookie jar persists them. Created once per process and never freed:
  * web views in this helper keep referencing it until exit. */
+/* The embedded browser is a preview pane, not a daily-driver browser. Ask
+ * WebKit to shed caches early: conservative pressure at ~340 MB and strict at
+ * ~512 MB per process instead of the default 80%-of-RAM limit. The kill
+ * threshold stays disabled so a busy page is never terminated. */
+#define VERDE_BROWSER_LINUX_MEMORY_LIMIT_MB 1024u
+
+static WebKitMemoryPressureSettings *verde_browser_linux_memory_pressure_settings(void) {
+    WebKitMemoryPressureSettings *settings = webkit_memory_pressure_settings_new();
+    webkit_memory_pressure_settings_set_memory_limit(settings, VERDE_BROWSER_LINUX_MEMORY_LIMIT_MB);
+    return settings;
+}
+
+static WebKitWebContext *verde_browser_linux_web_context(void) {
+    static WebKitWebContext *context = NULL;
+    if (context != NULL) return context;
+    WebKitMemoryPressureSettings *pressure = verde_browser_linux_memory_pressure_settings();
+    context = WEBKIT_WEB_CONTEXT(g_object_new(WEBKIT_TYPE_WEB_CONTEXT, "memory-pressure-settings", pressure, NULL));
+    webkit_memory_pressure_settings_free(pressure);
+    // Smaller in-memory caches and no large back/forward page cache.
+    webkit_web_context_set_cache_model(context, WEBKIT_CACHE_MODEL_DOCUMENT_BROWSER);
+    return context;
+}
+
 static WebKitNetworkSession *verde_browser_linux_network_session(void) {
     static WebKitNetworkSession *session = NULL;
     if (session != NULL) return session;
+
+    // Must precede the first network session for the NetworkProcess to use it.
+    WebKitMemoryPressureSettings *pressure = verde_browser_linux_memory_pressure_settings();
+    webkit_network_session_set_memory_pressure_settings(pressure);
+    webkit_memory_pressure_settings_free(pressure);
 
     gchar *data_dir = g_build_filename(g_get_user_data_dir(), "verde", "browser", NULL);
     gchar *cache_dir = g_build_filename(g_get_user_cache_dir(), "verde", "browser", NULL);
@@ -1780,7 +1843,7 @@ struct verde_browser_linux *verde_browser_linux_create(void) {
     browser->web_view = WEBKIT_WEB_VIEW(g_object_new(
         WEBKIT_TYPE_WEB_VIEW,
         "backend", browser->webkit_backend,
-        "web-context", webkit_web_context_get_default(),
+        "web-context", verde_browser_linux_web_context(),
         "network-session", verde_browser_linux_network_session(),
         "settings", settings,
         NULL
@@ -1902,6 +1965,16 @@ void verde_browser_linux_destroy(struct verde_browser_linux *browser) {
         g_source_remove(browser->frame_complete_timer_id);
         browser->frame_complete_timer_id = 0;
     }
+    if (browser->hidden_pause_timer_id != 0) {
+        g_source_remove(browser->hidden_pause_timer_id);
+        browser->hidden_pause_timer_id = 0;
+    }
+    if (browser->paint_ack_source_id != 0) {
+        // The poll source owns (and frees) its ack.
+        g_source_remove(browser->paint_ack_source_id);
+        browser->paint_ack_source_id = 0;
+    }
+    browser->paint_ack_pending = NULL;
     if (browser->content_manager != NULL) {
         webkit_user_content_manager_unregister_script_message_handler(browser->content_manager, "verde", NULL);
         webkit_user_content_manager_unregister_script_message_handler(browser->content_manager, "verdeCursor", NULL);
@@ -1951,6 +2024,11 @@ int verde_browser_linux_show(struct verde_browser_linux *browser, int width, int
     if (width > 0 && height > 0) {
         verde_browser_linux_set_bounds(browser, 0, 0, width, height);
     }
+    if (browser->hidden_pause_timer_id != 0) {
+        g_source_remove(browser->hidden_pause_timer_id);
+        browser->hidden_pause_timer_id = 0;
+    }
+    browser->painting_paused = FALSE;
     if (!browser->visible) {
         browser->visible = TRUE;
         wpe_view_backend_add_activity_state(browser->view_backend, wpe_view_activity_state_visible | wpe_view_activity_state_in_window);
@@ -1967,11 +2045,93 @@ int verde_browser_linux_hide(struct verde_browser_linux *browser) {
     if (browser == NULL) return 0;
     if (browser->visible) {
         browser->visible = FALSE;
-        // This backend only exports offscreen pixels. Keep WebKit painting so
-        // background MCP screenshots remain current; `visible` above selects
-        // the lower hidden-frame cadence without revealing or focusing a pane.
+        // This backend only exports offscreen pixels. Keep WebKit painting
+        // for a grace period so background MCP screenshots remain current;
+        // `visible` above selects the lower hidden-frame cadence without
+        // revealing or focusing a pane. The pause timer then stops painting.
+        verde_browser_linux_schedule_hidden_pause(browser);
         verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_CLOSED, NULL);
     }
+    return 1;
+}
+
+/* Paint acknowledgement for captures of a hidden page whose painting was
+ * paused. "No new frame arrived" is not proof the held frame is current (a
+ * hung web process also produces none), so the helper only acks once:
+ *   1. the page completed two animation frames after painting resumed, i.e.
+ *      WebKit ran a full rendering update for any pending damage, and
+ *   2. the helper has no frame in flight (no deferred frame, no pending
+ *      frame-complete) for VERDE_BROWSER_LINUX_PAINT_ACK_QUIET_US.
+ * The ack carries the newest published frame sequence; the desktop treats a
+ * frame at or past it as current and reports a timeout when no ack arrives. */
+#define VERDE_BROWSER_LINUX_PAINT_ACK_QUIET_US 40000
+#define VERDE_BROWSER_LINUX_PAINT_ACK_POLL_MS 8u
+#define VERDE_BROWSER_LINUX_PAINT_ACK_SCRIPT \
+    "new Promise(function(r){requestAnimationFrame(function(){requestAnimationFrame(function(){r(1);});});})"
+
+struct verde_browser_linux_paint_ack {
+    struct verde_browser_linux *browser;
+    guint64 token;
+    guint64 last_seen_sequence;
+    gint64 quiet_since_us;
+};
+
+static gboolean verde_browser_linux_frame_in_flight(struct verde_browser_linux *browser) {
+    return browser->deferred_frame_ready || browser->frame_complete_timer_id != 0;
+}
+
+static gboolean verde_browser_linux_paint_ack_poll(gpointer user_data) {
+    struct verde_browser_linux_paint_ack *ack = user_data;
+    struct verde_browser_linux *browser = ack->browser;
+    const gint64 now_us = g_get_monotonic_time();
+    if (verde_browser_linux_frame_in_flight(browser) || browser->frame_ready_sequence != ack->last_seen_sequence) {
+        ack->last_seen_sequence = browser->frame_ready_sequence;
+        ack->quiet_since_us = now_us;
+        return G_SOURCE_CONTINUE;
+    }
+    if (now_us - ack->quiet_since_us < VERDE_BROWSER_LINUX_PAINT_ACK_QUIET_US) return G_SOURCE_CONTINUE;
+    char payload[64];
+    g_snprintf(payload, sizeof payload, "%" G_GUINT64_FORMAT ":%" G_GUINT64_FORMAT, ack->token, (guint64)browser->frame_ready_sequence);
+    verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_PAINT_ACK, payload);
+    browser->paint_ack_source_id = 0;
+    return G_SOURCE_REMOVE;
+}
+
+static void verde_browser_linux_on_paint_ack_script(GObject *object, GAsyncResult *result, gpointer user_data) {
+    struct verde_browser_linux_paint_ack *ack = user_data;
+    GError *error = NULL;
+    JSCValue *value = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(object), result, &error);
+    if (value != NULL) g_object_unref(value);
+    if (error != NULL || ack->browser->paint_ack_pending != ack) {
+        // Failed page script or a superseded request: no ack; the desktop
+        // reports the capture as unavailable after its bound.
+        if (error != NULL) g_error_free(error);
+        if (ack->browser->paint_ack_pending == ack) ack->browser->paint_ack_pending = NULL;
+        g_free(ack);
+        return;
+    }
+    ack->browser->paint_ack_pending = NULL;
+    ack->last_seen_sequence = ack->browser->frame_ready_sequence;
+    ack->quiet_since_us = g_get_monotonic_time();
+    ack->browser->paint_ack_source_id = g_timeout_add_full(G_PRIORITY_DEFAULT, VERDE_BROWSER_LINUX_PAINT_ACK_POLL_MS, verde_browser_linux_paint_ack_poll, ack, g_free);
+}
+
+/* Screenshot support: a hidden page past its paint grace renders again (and
+ * re-arms the grace), then acks `token` once its frame is provably current. */
+int verde_browser_linux_request_paint(struct verde_browser_linux *browser, guint64 token) {
+    if (browser == NULL || browser->web_view == NULL) return 0;
+    verde_browser_linux_mark_active(browser);
+    if (!browser->visible) verde_browser_linux_schedule_hidden_pause(browser);
+    if (browser->paint_ack_source_id != 0) {
+        g_source_remove(browser->paint_ack_source_id);
+        browser->paint_ack_source_id = 0;
+    }
+    struct verde_browser_linux_paint_ack *ack = g_new0(struct verde_browser_linux_paint_ack, 1);
+    ack->browser = browser;
+    ack->token = token;
+    // A superseded in-flight script frees its own ack when it finishes.
+    browser->paint_ack_pending = ack;
+    webkit_web_view_evaluate_javascript(browser->web_view, VERDE_BROWSER_LINUX_PAINT_ACK_SCRIPT, -1, NULL, "app://verde-paint-ack.js", NULL, verde_browser_linux_on_paint_ack_script, ack);
     return 1;
 }
 
@@ -2052,6 +2212,31 @@ int verde_browser_linux_blur(struct verde_browser_linux *browser) {
     if (browser == NULL) return 0;
     wpe_view_backend_remove_activity_state(browser->view_backend, wpe_view_activity_state_focused);
     return 1;
+}
+
+static gboolean verde_browser_linux_wait_timeout(gpointer data) {
+    (void)data;
+    return G_SOURCE_REMOVE;
+}
+
+/* Blocks the helper's main thread until a GLib source dispatches (WebKit IPC,
+ * frame timers), the stdin reader calls verde_browser_linux_wakeup, or
+ * max_wait_ms elapses. Replaces a 1ms sleep/poll loop that kept every idle
+ * helper waking ~1000 times a second. */
+void verde_browser_linux_wait_for_work(unsigned int max_wait_ms) {
+    GMainContext *context = g_main_context_default();
+    GSource *timeout = g_timeout_source_new(max_wait_ms);
+    g_source_set_callback(timeout, verde_browser_linux_wait_timeout, NULL, NULL);
+    g_source_attach(timeout, context);
+    g_main_context_iteration(context, TRUE);
+    g_source_destroy(timeout);
+    g_source_unref(timeout);
+}
+
+/* Thread-safe: interrupts verde_browser_linux_wait_for_work. The wakeup is
+ * latched, so a call that lands before the wait starts is not lost. */
+void verde_browser_linux_wakeup(void) {
+    g_main_context_wakeup(g_main_context_default());
 }
 
 int verde_browser_linux_poll_event(struct verde_browser_linux *browser, int *kind, char **payload) {

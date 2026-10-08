@@ -295,7 +295,28 @@ const SharedFrame = struct {
     uploaded_input_serial: u64 = 0,
     uploaded_input_sent_at_ns: u64 = 0,
     presented_sequence: u64 = 0,
+    /// Latest helper paint ack: request token and the frame sequence that
+    /// was current when the resumed page finished painting.
+    paint_ack_token: u64 = 0,
+    paint_ack_sequence: u64 = 0,
     metrics: FrameMetrics = .{},
+
+    /// Records a helper paint ack ("<token>:<frame sequence>").
+    fn notePaintAck(self: *SharedFrame, payload: []const u8) void {
+        const ack = parsePaintAck(payload) orelse return;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.paint_ack_token = ack.token;
+        self.paint_ack_sequence = ack.sequence;
+    }
+
+    /// True once `token` was acked and the frame current at the ack has
+    /// arrived (the helper may write the ack before that frame's event).
+    fn paintAckSatisfied(self: *SharedFrame, token: u64) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.paint_ack_token == token and self.sequence >= self.paint_ack_sequence;
+    }
 
     /// Releases the latest published helper frame metadata.
     fn deinit(self: *SharedFrame, allocator: std.mem.Allocator) void {
@@ -539,6 +560,14 @@ const WaylandSubsurface = struct {
 };
 
 /// Owns the Linux browser helper process and translates its stdout into browser events plus pane frames.
+/// Mirrors VERDE_BROWSER_LINUX_HIDDEN_PAINT_GRACE_MS (15 s) in linux_wpe.c,
+/// with a margin so a capture near the boundary still wakes the page.
+const HIDDEN_PAINT_RESUME_AFTER_NS: u64 = 13 * std.time.ns_per_s;
+/// Bound for the helper's paint ack (two animation frames plus a quiet
+/// window). Missing it means the page could not prove a current frame.
+const PAINT_ACK_WAIT_MAX_MS: u32 = 1500;
+const PAINT_ACK_WAIT_STEP_MS: u32 = 5;
+
 pub const Controller = struct {
     allocator: std.mem.Allocator,
     child_pid: ?std.posix.pid_t = null,
@@ -553,6 +582,11 @@ pub const Controller = struct {
     pane_screen_x: i32 = 0,
     pane_screen_y: i32 = 0,
     pane_scale: f32 = 1.0,
+    /// Monotonic time the pane was hidden; the helper stops painting a hidden
+    /// page after HIDDEN_PAINT_GRACE_MS, so captures must wake it first.
+    hidden_since_ns: ?u64 = null,
+    /// Last resume_painting request token; acks echo it back.
+    paint_ack_token: u64 = 0,
     host_window: u64 = 0,
     current_url: ?[]u8 = null,
     wayland_subsurface: WaylandSubsurface = .{},
@@ -676,6 +710,7 @@ pub const Controller = struct {
             try self.queue.push(self.allocator, .{ .failed = try self.allocator.dupe(u8, WAYLAND_SUBSURFACE_PROBE_MESSAGE) });
             return;
         }
+        self.hidden_since_ns = null;
         try self.sendCommand(.{
             .kind = .show,
             .width = self.pane_width,
@@ -694,6 +729,7 @@ pub const Controller = struct {
             return;
         }
         try self.sendCommand(.{ .kind = .hide });
+        if (self.hidden_since_ns == null) self.hidden_since_ns = monotonicTimestampNsU64();
     }
 
     /// Toggles the Linux browser helper window by delegating to the shared controller visibility state.
@@ -927,6 +963,7 @@ pub const Controller = struct {
     /// Returns a caller-owned copy of the most recent helper frame, or null when
     /// no frame has been produced yet (e.g. subsurface mode, browser not shown).
     pub fn copyFramePixels(self: *Controller, allocator: std.mem.Allocator) !?browser_texture.CopiedFrame {
+        try self.refreshPausedFrame();
         var frame_width: u32 = 0;
         var frame_height: u32 = 0;
         var frame_byte_len: usize = 0;
@@ -957,6 +994,37 @@ pub const Controller = struct {
             .format = .bgra,
             .pixels = try allocator.dupe(u8, self.frame_buffer.items[0..frame_byte_len]),
         };
+    }
+
+    /// A hidden page stops painting after the helper's grace period, leaving
+    /// the shared slot holding whatever it showed then. Before a capture, wake
+    /// it and wait (bounded) for a newer frame. No new frame within the bound
+    /// means nothing was damaged, so the held frame is still current.
+    fn refreshPausedFrame(self: *Controller) !void {
+        const hidden_since_ns = self.hidden_since_ns orelse return;
+        if (self.child_pid == null) return;
+        const now_ns = monotonicTimestampNsU64();
+        if (now_ns -| hidden_since_ns < HIDDEN_PAINT_RESUME_AFTER_NS) return;
+        self.paint_ack_token +%= 1;
+        if (self.paint_ack_token == 0) self.paint_ack_token = 1;
+        const token = self.paint_ack_token;
+        try self.sendCommand(.{ .kind = .resume_painting, .frame_sequence = token });
+        var waited_ms: u32 = 0;
+        while (waited_ms < PAINT_ACK_WAIT_MAX_MS) : (waited_ms += PAINT_ACK_WAIT_STEP_MS) {
+            // Hidden panes never upload, so return slots here or the helper
+            // can only defer the frame it is waiting to publish.
+            self.flushFrameReleases() catch {};
+            if (self.frame.paintAckSatisfied(token)) {
+                // The helper restarted its grace at the request; captures
+                // within it see live painting.
+                self.hidden_since_ns = now_ns;
+                return;
+            }
+            sleepMillis(PAINT_ACK_WAIT_STEP_MS);
+        }
+        // No ack: a hung or busy page cannot prove its held frame is current.
+        log.warn("browser capture: hidden page did not acknowledge a fresh paint within {d} ms", .{PAINT_ACK_WAIT_MAX_MS});
+        return error.BrowserFrameStale;
     }
 
     // Launches the installed browser helper binary beside the desktop executable.
@@ -1083,7 +1151,10 @@ pub const Controller = struct {
         var child_reaped = waitForChildExit(child_pid, 250);
         std.posix.kill(-child_process_group, std.posix.SIG.TERM) catch {};
         if (child_reaped) {
-            sleepMillis(250);
+            // Give WebKit's network/web processes a moment to exit on TERM,
+            // but return as soon as the group is empty rather than always
+            // stalling the UI thread for the full grace period.
+            waitForProcessGroupExit(child_process_group, 250);
         } else {
             child_reaped = waitForChildExit(child_pid, 250);
         }
@@ -1146,6 +1217,7 @@ fn commandWakesFrame(kind: ipc.CommandKind) bool {
         .text_input,
         .context_menu_activate,
         .import_cookies,
+        .resume_painting,
         => true,
         .hide, .set_host_window, .blur, .context_menu_dismiss, .frame_release, .quit => false,
     };
@@ -1254,6 +1326,11 @@ fn helperReaderMain(context: *ReaderContext) !void {
             continue;
         }
 
+        if (parsed.value.kind == .paint_ack) {
+            context.frame.notePaintAck(parsed.value.payload orelse "");
+            continue;
+        }
+
         const event = try convertHelperEvent(context.allocator, parsed.value);
         try context.queue.push(context.allocator, event);
         loop_wakeup.notify();
@@ -1275,8 +1352,35 @@ fn convertHelperEvent(allocator: std.mem.Allocator, event: ipc.Event) !browser_t
         .cursor_changed => .{ .cursor_changed = browser_types.CursorShape.parse(event.payload orelse "default") },
         .cookies_imported => .{ .cookies_imported = std.fmt.parseUnsigned(u32, event.payload orelse "0", 10) catch 0 },
         .failed => .{ .failed = try allocator.dupe(u8, event.payload orelse "Linux browser helper failed.") },
-        .frame_ready => unreachable,
+        .frame_ready, .paint_ack => unreachable,
     };
+}
+
+const PaintAck = struct { token: u64, sequence: u64 };
+
+fn parsePaintAck(payload: []const u8) ?PaintAck {
+    const colon = std.mem.indexOfScalar(u8, payload, ':') orelse return null;
+    return .{
+        .token = std.fmt.parseUnsigned(u64, payload[0..colon], 10) catch return null,
+        .sequence = std.fmt.parseUnsigned(u64, payload[colon + 1 ..], 10) catch return null,
+    };
+}
+
+test "paint ack requires the acked token and the frame current at the ack" {
+    try std.testing.expectEqual(PaintAck{ .token = 7, .sequence = 42 }, parsePaintAck("7:42").?);
+    try std.testing.expect(parsePaintAck("7") == null);
+    try std.testing.expect(parsePaintAck("x:1") == null);
+
+    var frame: SharedFrame = .{};
+    frame.sequence = 41;
+    try std.testing.expect(!frame.paintAckSatisfied(7));
+    frame.notePaintAck("7:42");
+    // Ack written before its frame's event: not yet current.
+    try std.testing.expect(!frame.paintAckSatisfied(7));
+    frame.sequence = 42;
+    try std.testing.expect(frame.paintAckSatisfied(7));
+    // A stale ack for an earlier request never satisfies a newer one.
+    try std.testing.expect(!frame.paintAckSatisfied(8));
 }
 
 fn execHelperChild(
@@ -1363,21 +1467,32 @@ fn createFrameSlots(frame: *SharedFrame, allocator: std.mem.Allocator) ![FRAME_S
             frame_fds[index],
             0,
         );
+        // A fresh memfd reads as zeros; touching it would commit every page
+        // of the 4K-sized slot up front.
         frame.slot_ready[index] = true;
-        @memset(frame.slots[index], 0);
     }
     return frame_fds;
 }
 
 fn waitForChildExit(child_pid: std.posix.pid_t, timeout_ms: u16) bool {
     var waited_ms: u16 = 0;
-    while (waited_ms <= timeout_ms) : (waited_ms += 25) {
+    while (waited_ms <= timeout_ms) {
         var status: c_int = 0;
         const result = std.c.waitpid(child_pid, &status, std.c.W.NOHANG);
         if (result == child_pid) return true;
-        sleepMillis(25);
+        sleepMillis(5);
+        waited_ms +|= 5;
     }
     return false;
+}
+
+fn waitForProcessGroupExit(process_group: std.posix.pid_t, timeout_ms: u16) void {
+    var waited_ms: u16 = 0;
+    while (waited_ms <= timeout_ms) : (waited_ms += 5) {
+        // kill(-pgid, 0) fails with ESRCH once no member remains.
+        if (std.c.kill(-process_group, @enumFromInt(0)) != 0) return;
+        sleepMillis(5);
+    }
 }
 
 fn sleepMillis(ms: u64) void {
