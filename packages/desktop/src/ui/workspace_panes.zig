@@ -24,6 +24,7 @@ const terminal_panel = @import("terminal_panel.zig");
 const theme = @import("theme.zig");
 const sidebar_ui = @import("sidebar.zig");
 const side_panel = @import("side_panel.zig");
+const workspace_strip = @import("workspace_strip.zig");
 const utils = @import("../utils.zig");
 
 const THREAD_DROP_PREVIEW_Z: i32 = 140;
@@ -125,6 +126,7 @@ const WorkspacePaneAction = enum {
     move_quick_pane,
     resize_quick_pane,
     attach_browser_to_tab,
+    toggle_side_panel,
 };
 
 const ScrollingEdgeDirection = enum { previous, next };
@@ -1271,6 +1273,10 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button
                 _ = state.toggleCurrentProjectWorkspacePaneMaximized(hit.pane_id);
                 split_menu_open_for = null;
             },
+            .toggle_side_panel => {
+                state.toggleSidePanel();
+                split_menu_open_for = null;
+            },
             .toggle_split_menu => toggleSplitMenu(state, hit),
             .copy_selection => {
                 copyTranscriptSelectionToClipboard(state);
@@ -1443,6 +1449,9 @@ pub fn handlePaneChromeMouseButton(state: *runtime.AppState, x: f32, y: f32, but
         switch (hit.action) {
             .maximize => {
                 if (down) _ = state.toggleCurrentProjectWorkspacePaneMaximized(hit.pane_id);
+            },
+            .toggle_side_panel => {
+                if (down) state.toggleSidePanel();
             },
             .toggle_split_menu => {
                 if (down) toggleSplitMenu(state, hit);
@@ -3042,7 +3051,10 @@ fn renderLeafWithin(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, 
         pane_rect_count += 1;
     }
     const maximized = state.isCurrentProjectWorkspacePaneMaximized(pane_id);
-    const reserve = if (kind == .chat) theme.scaledUi(CHAT_PANE_HEADER_RIGHT_RESERVE_CSS) else 0.0;
+    const reserve = if (kind == .chat)
+        theme.scaledUi(CHAT_PANE_HEADER_RIGHT_RESERVE_CSS + (if (paneShowsSidePanelToggle(state, kind)) PANE_CHROME_CONTROL_SIZE_CSS + PANE_CHROME_CONTROL_GAP_CSS else 0.0))
+    else
+        0.0;
     const header_h = switch (kind) {
         .chat => chat_panel.paneHeaderHeight(rect),
         .terminal => terminal_panel.paneHeaderHeight(),
@@ -3119,6 +3131,12 @@ fn renderLeafWithin(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, 
     }
 }
 
+/// Chat headers carry the side panel toggle only while the tab strip (its
+/// usual home) is hidden.
+fn paneShowsSidePanelToggle(state: *runtime.AppState, kind: runtime.WorkspacePaneKind) bool {
+    return kind == .chat and !workspace_strip.isVisible(state);
+}
+
 // Top-right zoom control for chat, terminal, and browser workspace panes.
 fn renderZoomControl(
     state: *runtime.AppState,
@@ -3135,8 +3153,12 @@ fn renderZoomControl(
         theme.scaledUi(PANE_CHROME_CONTROL_SIZE_CSS + PANE_CHROME_CONTROL_GAP_CSS)
     else
         0.0;
+    // With the tab strip hidden, the side panel toggle sits between zoom and
+    // the pane menu; zoom shifts one slot left to make room.
+    const side_toggle = paneShowsSidePanelToggle(state, kind);
+    const toggle_reserve = if (side_toggle) theme.scaledUi(PANE_CHROME_CONTROL_SIZE_CSS + PANE_CHROME_CONTROL_GAP_CSS) else 0.0;
     const control_rect: palette.Rect = .{
-        .x = pane_rect.x + pane_rect.w - margin - split_reserve - control_size,
+        .x = pane_rect.x + pane_rect.w - margin - split_reserve - toggle_reserve - control_size,
         .y = switch (kind) {
             .chat => pane_rect.y + @max((header_h - control_size) * 0.5, theme.scaledUi(4.0)),
             .terminal => pane_rect.y + margin,
@@ -3146,6 +3168,19 @@ fn renderZoomControl(
         .h = control_size,
     };
     const hovered = state.transcript_controller.palette_mouse_in_workspace and rectContains(control_rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
+    if (side_toggle) {
+        const toggle_rect: palette.Rect = .{
+            .x = pane_rect.x + pane_rect.w - margin - split_reserve - control_size,
+            .y = control_rect.y,
+            .w = control_size,
+            .h = control_size,
+        };
+        const toggle_hovered = state.transcript_controller.palette_mouse_in_workspace and rectContains(toggle_rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
+        const previous_z = state.palette_overlay_batch.setZIndex(PANE_ZOOM_CONTROL_Z);
+        defer state.palette_overlay_batch.restoreZIndex(previous_z);
+        sidebar_ui.queueSidePanelToggleGlyph(state, toggle_rect, state.isSidePanelOpen(), toggle_hovered, pane_rect);
+        appendHit(.{ .pane_id = pane_id, .action = .toggle_side_panel, .rect = toggle_rect });
+    }
     if (kind == .terminal and !maximized and !state.alt_shortcut_hints_visible) {
         const hover_rect: palette.Rect = .{
             .x = pane_rect.x + pane_rect.w - theme.scaledUi(TERMINAL_ZOOM_HOVER_WIDTH_CSS),

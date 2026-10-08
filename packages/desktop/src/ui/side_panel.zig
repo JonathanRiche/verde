@@ -197,14 +197,27 @@ fn renderBrowserEmpty(state: *runtime.AppState, rect: palette.Rect) void {
     if (width <= 0.0) return;
     const title_font = theme.scaledUi(14.0);
     const body_font = theme.scaledUi(12.0);
-    const y = rect.y + @max(rect.h * 0.3, pad);
-    queueText(state, .{ .x = rect.x + pad, .y = y, .w = width, .h = title_font * 1.4 }, "No preview yet", paletteColor(theme.COLOR_WHITE), title_font, rect);
-    queueText(state, .{ .x = rect.x + pad, .y = y + title_font * 1.4 + theme.scaledUi(6.0), .w = width, .h = body_font * 1.4 }, "Agents in this tab open pages here.", paletteColor(theme.COLOR_TEXT_MUTED), body_font, rect);
+    const title = "No preview yet";
+    const body = "Agents in this tab open pages here.";
+    const title_h = title_font * 1.4;
+    const body_h = body_font * 1.4;
+    const button_h = theme.scaledUi(EMPTY_BUTTON_H_UI);
+    const title_gap = theme.scaledUi(6.0);
+    const button_gap = theme.scaledUi(18.0);
+    // Centre the title, hint and button as one group in the body.
+    const group_h = title_h + title_gap + body_h + button_gap + button_h;
+    const y = rect.y + @max((rect.h - group_h) * 0.5, pad);
+    const center_x = rect.x + rect.w * 0.5;
+    const title_w = @min(runtime.paletteUiTextPrefixWidth(title, title_font, title.len) + theme.scaledUi(2.0), width);
+    const body_w = @min(runtime.paletteUiTextPrefixWidth(body, body_font, body.len) + theme.scaledUi(2.0), width);
+    queueText(state, .{ .x = @round(center_x - title_w * 0.5), .y = y, .w = title_w, .h = title_h }, title, paletteColor(theme.COLOR_WHITE), title_font, rect);
+    queueText(state, .{ .x = @round(center_x - body_w * 0.5), .y = y + title_h + title_gap, .w = body_w, .h = body_h }, body, paletteColor(theme.COLOR_TEXT_MUTED), body_font, rect);
+    const button_w = @min(theme.scaledUi(EMPTY_BUTTON_W_UI), width);
     const button = snap(.{
-        .x = rect.x + pad,
-        .y = y + title_font * 1.4 + body_font * 1.4 + theme.scaledUi(18.0),
-        .w = @min(theme.scaledUi(EMPTY_BUTTON_W_UI), width),
-        .h = theme.scaledUi(EMPTY_BUTTON_H_UI),
+        .x = center_x - button_w * 0.5,
+        .y = y + title_h + title_gap + body_h + button_gap,
+        .w = button_w,
+        .h = button_h,
     });
     const fill = if (mouseIn(state, button)) theme.raise(theme.accent(), 0.08) else theme.accent();
     queueRounded(state, button, paletteColor(fill), theme.scaledUi(8.0), rect);

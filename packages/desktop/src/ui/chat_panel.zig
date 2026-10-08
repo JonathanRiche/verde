@@ -19,8 +19,6 @@ const chat_markdown = @import("chat_markdown.zig");
 const colors = @import("colors.zig");
 const composer_pickers = @import("composer_pickers.zig");
 const file_icons = @import("file_icons.zig");
-const sidebar_ui = @import("sidebar.zig");
-const workspace_strip = @import("workspace_strip.zig");
 const runtime = @import("runtime.zig");
 const terminal_panel = @import("terminal_panel.zig");
 const text_measure = @import("text_measure.zig");
@@ -440,7 +438,6 @@ const WorkspaceHeaderHitCache = struct {
     header_rect: palette.Rect = .{},
     open_main_rect: palette.Rect = .{},
     chevron_rect: palette.Rect = .{},
-    browser_rect: palette.Rect = .{},
     /// Git split button for `git_thread_buf`: the main part runs the
     /// labelled action, the chevron opens the git menu.
     git_main_rect: palette.Rect = .{},
@@ -1711,14 +1708,6 @@ pub fn handleWorkspaceHeaderPaletteMouseButton(state: *app_state.AppState, x: f3
         state.noteInteraction();
         return true;
     }
-    if (control_hit.browser_rect.w > 0.0 and rectContains(control_hit.browser_rect, x, y)) {
-        state.workspace_header_open_menu_open = false;
-        state.workspace_header_open_menu_pane_id = null;
-        state.blurPaletteComposer();
-        state.toggleSidePanel();
-        state.noteInteraction();
-        return true;
-    }
     return false;
 }
 
@@ -2954,7 +2943,6 @@ fn workspaceHeaderControlHit(x: f32, y: f32) ?*WorkspaceHeaderHitCache {
         if (!hit.used) continue;
         if (rectContains(hit.open_main_rect, x, y) or
             rectContains(hit.chevron_rect, x, y) or
-            rectContains(hit.browser_rect, x, y) or
             rectContains(hit.git_main_rect, x, y) or
             rectContains(hit.git_chevron_rect, x, y))
         {
@@ -3000,12 +2988,8 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
     const open_tex = state.defaultOpenIconTexture();
     const open_main_w = theme.scaledUi(WORKSPACE_HEADER_ICON_CONTROL_CSS);
     const chevron_w = theme.scaledUi(WORKSPACE_HEADER_CHEVRON_CONTROL_CSS);
-    // The side panel toggle lives on the tab strip; while the strip is
-    // hidden it falls back to this slot (formerly the browser globe).
-    const side_panel_toggle_visible = !workspace_strip.isVisible(state);
-    const browser_w = if (side_panel_toggle_visible) theme.scaledUi(WORKSPACE_HEADER_ICON_CONTROL_CSS) else 0.0;
     const open_combo_w = open_main_w + chevron_w;
-    const actions_w = open_combo_w + (if (side_panel_toggle_visible) button_gap + browser_w else 0.0);
+    const actions_w = open_combo_w;
 
     const actions_right = rect.x + rect.w - right_reserve - button_gap;
     const actions_x = actions_right - actions_w;
@@ -3107,11 +3091,9 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
     const open_combo_x = actions_x;
     const open_main_rect = palette.Rect{ .x = open_combo_x, .y = actions_y, .w = open_main_w, .h = button_h };
     const chevron_rect = palette.Rect{ .x = open_combo_x + open_main_w, .y = actions_y, .w = chevron_w, .h = button_h };
-    const browser_rect = palette.Rect{ .x = open_combo_x + open_combo_w + button_gap, .y = actions_y, .w = browser_w, .h = button_h };
 
     header_hit.open_main_rect = open_main_rect;
     header_hit.chevron_rect = chevron_rect;
-    header_hit.browser_rect = browser_rect;
 
     if (git_main_rect.w > 0.0) {
         const busy = git_view.busy_label != null or git_view.menu.busy;
@@ -3157,7 +3139,6 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
 
     const open_main_hover = mouse_ok and rectContains(open_main_rect, mx, my);
     const chevron_hover = mouse_ok and rectContains(chevron_rect, mx, my);
-    const browser_hover = mouse_ok and rectContains(browser_rect, mx, my);
 
     const icon_slot = theme.scaledUi(16.0);
     const icon_x = open_main_rect.x + (open_main_rect.w - icon_slot) * 0.5;
@@ -3195,10 +3176,6 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
         .w = chevron_size,
         .h = chevron_size,
     }, NF_COD_CHEVRON_DOWN, paletteColor(if (chevron_hover) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE), chevron_size, rect);
-
-    if (side_panel_toggle_visible) {
-        sidebar_ui.queueSidePanelToggleGlyph(state, browser_rect, state.isSidePanelOpen(), browser_hover, rect);
-    }
 
     const pane_focused = if (pane_id) |id| state.isCurrentProjectWorkspacePaneFocused(id) else true;
     if (state.ctrl_shortcut_hints_visible and state.shift_shortcut_hints_visible and pane_focused) {
