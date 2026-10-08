@@ -11,6 +11,7 @@ pub const attention = @import("attention.zig");
 pub const manage = @import("manage.zig");
 pub const git = @import("git_changes.zig");
 pub const files = @import("files.zig");
+pub const explorer = @import("workspace_explorer.zig");
 const chat_index = @import("chat_index.zig");
 const profile = @import("verde_remote").profile;
 const state_clone = @import("state_clone.zig");
@@ -79,6 +80,7 @@ pub const State = struct {
     manage: manage.State = .{},
     git: git.State = .{},
     files: files.State = .{},
+    explorer: explorer.State = .{},
     chat_index: chat_index.State = .{},
     lifecycle: Lifecycle = .created,
     revision: u64 = 0,
@@ -131,6 +133,8 @@ pub const Host = struct {
         try git.observe(&tx, event);
         try git.pump(&tx);
         try files.pump(&tx);
+        try explorer.observe(&tx, event);
+        try explorer.pump(&tx);
         try push.pump(&tx);
         try chat_index.pump(&tx);
         try attention.pump(&tx);
@@ -161,6 +165,8 @@ pub const Host = struct {
             try attention.annotate(a, s, selector, &data);
         } else if (try git.query(a, s, selector)) |git_view| {
             data = git_view;
+        } else if (try explorer.query(a, s, selector)) |explorer_view| {
+            data = explorer_view;
         } else if (eq(selector, "manage")) {
             data = try manage.query(a, s);
         } else if (try attention.query(a, s, selector)) |attention_view| {
@@ -355,6 +361,7 @@ pub const Transaction = struct {
             _ = try manage.intent(self, tag, event);
             try git.intent(self, tag, event);
             try files.intent(self, tag, event);
+            try explorer.intent(self, tag, event);
             _ = try push.intent(self, tag, event);
             try attention.intent(self, tag, event);
             try sync.intent(self, tag, event);
@@ -674,7 +681,7 @@ fn changedScopes(tx: *Transaction, before: *const State) ApiError![]const []cons
     // Terminal receipts/output invalidate terminals and operations, not every
     // cached transcript and workspace. Querying those on each key overwhelms
     // the platform's serial core executor even when network RTT is tiny.
-    const git_scopes = try git.scopes(a, before, &tx.state);
+    const git_scopes = try std.mem.concat(a, []const u8, &.{ try git.scopes(a, before, &tx.state), try explorer.scopes(a, before, &tx.state) });
     if (!otherViewsChanged(before, &tx.state, host_changed)) return std.mem.concat(a, []const u8, &.{ own, git_scopes });
     const shared: []const []const u8 = if (sharedViewsChanged(before, &tx.state, host_changed)) &.{ "home", "workspaces", "attention", "manage" } else &.{};
     return std.mem.concat(a, []const u8, &.{ own, try chat.scopes(tx, before, host_changed), shared, git_scopes });
@@ -771,7 +778,7 @@ fn append(comptime T: type, a: A, slice: *[]const T, item: T) ApiError!void {
     next[slice.len] = item;
     slice.* = next;
 }
-const intents = [_][]const u8{ "git_status_refresh", "git_push", "git_retry", "git_summary_refresh", "git_review_open", "git_message_generate", "git_commit", "git_pull_push", "git_config_set", "sign_out", "forget_host", "pair", "trust_decision", "retry_connection", "focus", "thread_open", "thread_load_older", "history_search", "history_load_more", "draft_set", "composer_select", "send", "turn_cancel", "followup_submit", "followup_retry", "followup_pull_back", "followup_cancel", "approval_decide", "shell_prepare", "shell_confirm", "slash_search", "slash_run", "mention_search", "terminal_create", "terminal_attach", "terminal_detach", "terminal_input", "terminal_resize", "terminal_kill", "push_register", "thread_rename", "thread_close", "thread_sync", "thread_create", "new_chat_select", "workspace_create", "workspace_rename", "workspace_identity", "workspace_archive", "workspace_close", "directory_list", "file_open" };
+const intents = [_][]const u8{ "git_status_refresh", "git_push", "git_retry", "git_summary_refresh", "git_review_open", "git_message_generate", "git_commit", "git_pull_push", "git_config_set", "sign_out", "forget_host", "pair", "trust_decision", "retry_connection", "focus", "thread_open", "thread_load_older", "history_search", "history_load_more", "draft_set", "composer_select", "send", "turn_cancel", "followup_submit", "followup_retry", "followup_pull_back", "followup_cancel", "approval_decide", "shell_prepare", "shell_confirm", "slash_search", "slash_run", "mention_search", "terminal_create", "terminal_attach", "terminal_detach", "terminal_input", "terminal_resize", "terminal_kill", "push_register", "thread_rename", "thread_close", "thread_sync", "thread_create", "new_chat_select", "workspace_create", "workspace_rename", "workspace_identity", "workspace_archive", "workspace_close", "directory_list", "file_open", "workspace_files_list", "workspace_file_read", "workspace_preview_close", "workspace_changes_open", "workspace_changes_close", "workspace_file_patch" };
 fn isIntent(tag: []const u8) bool {
     for (intents) |intent| if (eq(tag, intent)) return true;
     return false;
@@ -796,6 +803,8 @@ fn validateIntent(a: A, tag: []const u8, event: V) ApiError!void {
         try git.validate(a, tag, event);
     } else if (manage.owns(tag)) {
         try manage.validate(a, tag, event);
+    } else if (explorer.owns(tag)) {
+        try explorer.validate(a, tag, event);
     } else if (eq(tag, "file_open")) {
         try files.validate(a, event);
     } else if (eq(tag, "terminal_create")) {
@@ -903,6 +912,7 @@ fn receiptField(context: []const u8, key: []const u8, top: bool) bool {
         if (eq(context, "push_register")) break :blk "platform send_token key_seed_base64";
         if (git.receiptFields(context)) |fields| break :blk fields;
         if (manage.receiptFields(context)) |fields| break :blk fields;
+        if (explorer.receiptFields(context)) |fields| break :blk fields;
         if (eq(context, "file_open")) break :blk "path kind max_bytes";
         break :blk "";
     };

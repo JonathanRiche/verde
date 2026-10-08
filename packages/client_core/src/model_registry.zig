@@ -10,6 +10,7 @@ const attention = @import("attention.zig");
 const manage = @import("manage.zig");
 const git = @import("git_changes.zig");
 const files = @import("files.zig");
+const explorer = @import("workspace_explorer.zig");
 pub const types = .{
     .{ "TerminalConfig", terminal.Config },
     .{ "TerminalCursorShape", terminal.CursorShape },
@@ -127,4 +128,20 @@ pub const types = .{
     .{ "GitReviewView", git.ReviewView },
     .{ "GitSummaryQuery", wire.Query(git.Summary) },
     .{ "GitReviewQuery", wire.Query(git.ReviewView) },
+    .{ "GitWorkspaceOwner", git.m.WorkspaceOwner },
+    .{ "GitWorkspaceFile", git.m.WorkspaceFile },
+    .{ "GitWorkspaceRepo", git.m.WorkspaceRepo },
+    .{ "GitFilePatchResult", git.m.FilePatchResult },
+    .{ "ExplorerRoot", explorer.Root },
+    .{ "ExplorerEntry", explorer.Entry },
+    .{ "ExplorerDir", explorer.Dir },
+    .{ "ExplorerFilesView", explorer.FilesView },
+    .{ "ExplorerChangesView", explorer.ChangesView },
+    .{ "ExplorerPatchView", explorer.PatchView },
+    .{ "ExplorerReadResult", explorer.ReadResult },
+    .{ "ExplorerFileView", explorer.FileView },
+    .{ "ExplorerFilesQuery", wire.Query(explorer.FilesView) },
+    .{ "ExplorerChangesQuery", wire.Query(explorer.ChangesView) },
+    .{ "ExplorerPatchQuery", wire.Query(explorer.PatchView) },
+    .{ "ExplorerFileQuery", wire.Query(explorer.FileView) },
 };

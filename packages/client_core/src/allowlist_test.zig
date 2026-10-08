@@ -220,7 +220,7 @@ fn inTest(tests: []const [2]Ast.TokenIndex, token: Ast.TokenIndex) bool {
 fn pendingGitScope(method: []const u8) ?u16 {
     const read = access.scopeBit(.repository_read);
     const write = read | access.scopeBit(.chat_write);
-    for ([_][]const u8{ "git.changes.summary", "git.changes.status", "git.changes.review", "git.changes.commit_message" }) |name| if (eq(u8, name, method)) return read;
+    for ([_][]const u8{ "git.changes.summary", "git.changes.status", "git.changes.review", "git.changes.commit_message", "git.changes.workspace", "git.changes.file_patch" }) |name| if (eq(u8, name, method)) return read;
     for ([_][]const u8{ "git.changes.commit", "git.changes.push", "git.changes.pull_push" }) |name| if (eq(u8, name, method)) return write;
     return null;
 }
@@ -231,7 +231,7 @@ fn mappedScope(method: []const u8) ?u16 {
     return access.requiredScopeMaskForRpc(method);
 }
 test "pending Git protocol scope fixture agrees with real mappings once present" {
-    for ([_][]const u8{ "git.changes.summary", "git.changes.status", "git.changes.review", "git.changes.commit_message", "git.changes.commit", "git.changes.push", "git.changes.pull_push" }) |method| {
+    for ([_][]const u8{ "git.changes.summary", "git.changes.status", "git.changes.review", "git.changes.commit_message", "git.changes.workspace", "git.changes.file_patch", "git.changes.commit", "git.changes.push", "git.changes.pull_push" }) |method| {
         const mapped = mappedScope(method) orelse return error.UnmappedCoreRpc;
         try std.testing.expectEqual(pendingGitScope(method).?, mapped);
     }

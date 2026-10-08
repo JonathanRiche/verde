@@ -177,6 +177,7 @@ test {
     _ = @import("chat_test.zig");
     _ = @import("manage_test.zig");
     _ = @import("git_changes_test.zig");
+    _ = @import("workspace_explorer_test.zig");
     _ = @import("files_test.zig");
     _ = @import("model_contract_test.zig");
     _ = @import("auth_harness.zig");

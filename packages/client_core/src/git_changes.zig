@@ -520,6 +520,7 @@ pub fn turnChanged(tx: *h.Transaction) void {
     tx.state.git.status_dirty = true;
     // Background summaries retain their cached values until next focus/explicit refresh.
     for (tx.state.git.watches) |*w| markDirty(tx, w);
+    @import("workspace_explorer.zig").turnChanged(tx);
 }
 fn invalidResponse(tx: *h.Transaction, r: Request) E!void {
     if ((r.kind == .commit or r.kind == .push) and tx.state.git.retained != null) return recovery(tx);

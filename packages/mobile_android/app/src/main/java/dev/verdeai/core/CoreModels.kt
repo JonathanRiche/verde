@@ -1146,6 +1146,73 @@ data class EventGitConfigSet(
 ) : Event()
 
 @Serializable
+@SerialName("workspace_files_list")
+data class EventWorkspaceFilesList(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `workspace_id`: String,
+    val `root`: String? = null,
+    val `path`: String? = null,
+) : Event()
+
+@Serializable
+@SerialName("workspace_file_read")
+data class EventWorkspaceFileRead(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `workspace_id`: String,
+    val `root`: String,
+    val `path`: String,
+) : Event()
+
+@Serializable
+@SerialName("workspace_preview_close")
+data class EventWorkspacePreviewClose(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `workspace_id`: String,
+) : Event()
+
+@Serializable
+@SerialName("workspace_changes_open")
+data class EventWorkspaceChangesOpen(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `workspace_id`: String,
+) : Event()
+
+@Serializable
+@SerialName("workspace_changes_close")
+data class EventWorkspaceChangesClose(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `workspace_id`: String,
+) : Event()
+
+@Serializable
+@SerialName("workspace_file_patch")
+data class EventWorkspaceFilePatch(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `workspace_id`: String,
+    val `root`: String,
+    val `path`: String,
+    val `context_lines`: Long? = null,
+) : Event()
+
+@Serializable
 @SerialName("file_open")
 data class EventFileOpen(
     val `api_version`: Long = 1,
@@ -2048,5 +2115,173 @@ data class GitReviewQuery(
     val `api_version`: Long,
     val `revision`: String,
     val `data`: GitReviewView?,
+    val `error`: LocalError?,
+)
+
+@Serializable
+data class GitWorkspaceOwner(
+    val `local_thread_id`: String,
+    val `title`: String,
+    val `unclear`: Boolean = false,
+)
+
+@Serializable
+data class GitWorkspaceFile(
+    val `path`: String,
+    val `status`: String,
+    val `untracked`: Boolean = false,
+    val `ownership`: String,
+    val `owners`: List<GitWorkspaceOwner> = emptyList(),
+    val `additions`: Long = 0,
+    val `deletions`: Long = 0,
+    val `binary`: Boolean = false,
+)
+
+@Serializable
+data class GitWorkspaceRepo(
+    val `root`: String,
+    val `name`: String,
+    val `head`: String? = null,
+    val `branch`: String? = null,
+    val `default_branch`: String? = null,
+    val `is_default_branch`: Boolean = false,
+    val `upstream`: String? = null,
+    val `ahead`: Long = 0,
+    val `behind`: Long = 0,
+    val `has_remote`: Boolean = false,
+    val `too_many_files`: Boolean = false,
+    val `files`: List<GitWorkspaceFile> = emptyList(),
+)
+
+@Serializable
+data class GitFilePatchResult(
+    val `root`: String,
+    val `path`: String,
+    val `clean`: Boolean = false,
+    val `status`: String = "modified",
+    val `binary`: Boolean = false,
+    val `truncated`: Boolean = false,
+    val `additions`: Long = 0,
+    val `deletions`: Long = 0,
+    val `context_lines`: Long? = null,
+    val `patch`: String? = null,
+)
+
+@Serializable
+data class ExplorerRoot(
+    val `id`: String,
+    val `name`: String,
+    val `path`: String = "",
+    val `home`: Boolean = false,
+)
+
+@Serializable
+data class ExplorerEntry(
+    val `name`: String,
+    val `path`: String,
+    val `kind`: String,
+    val `size`: ULong = 0uL,
+    val `ignored`: Boolean = false,
+    val `symlink`: Boolean = false,
+)
+
+@Serializable
+data class ExplorerDir(
+    val `root`: String,
+    val `path`: String,
+    val `entries`: List<ExplorerEntry> = emptyList(),
+    val `truncated`: Boolean = false,
+    val `loading`: Boolean = false,
+    val `loaded`: Boolean = false,
+    val `error`: LocalError? = null,
+)
+
+@Serializable
+data class ExplorerFilesView(
+    val `workspace_id`: String,
+    val `supported`: Boolean = true,
+    val `loading`: Boolean = false,
+    val `loaded`: Boolean = false,
+    val `roots`: List<ExplorerRoot> = emptyList(),
+    val `dirs`: List<ExplorerDir> = emptyList(),
+    val `error`: LocalError? = null,
+)
+
+@Serializable
+data class ExplorerChangesView(
+    val `workspace_id`: String,
+    val `supported`: Boolean = true,
+    val `loading`: Boolean = false,
+    val `loaded`: Boolean = false,
+    val `revision`: ULong = 0uL,
+    val `repos`: List<GitWorkspaceRepo> = emptyList(),
+    val `error`: LocalError? = null,
+)
+
+@Serializable
+data class ExplorerPatchView(
+    val `workspace_id`: String = "",
+    val `root`: String = "",
+    val `path`: String = "",
+    val `context_lines`: Long? = null,
+    val `supported`: Boolean = true,
+    val `loading`: Boolean = false,
+    val `result`: GitFilePatchResult? = null,
+    val `error`: LocalError? = null,
+)
+
+@Serializable
+data class ExplorerReadResult(
+    val `root`: String,
+    val `path`: String,
+    val `name`: String = "",
+    val `size`: ULong = 0uL,
+    val `kind`: String,
+    val `mime`: String? = null,
+    val `encoding`: String = "none",
+    val `content`: String = "",
+    val `truncated`: Boolean = false,
+)
+
+@Serializable
+data class ExplorerFileView(
+    val `workspace_id`: String = "",
+    val `root`: String = "",
+    val `path`: String = "",
+    val `supported`: Boolean = true,
+    val `loading`: Boolean = false,
+    val `result`: ExplorerReadResult? = null,
+    val `error`: LocalError? = null,
+)
+
+@Serializable
+data class ExplorerFilesQuery(
+    val `api_version`: Long,
+    val `revision`: String,
+    val `data`: ExplorerFilesView?,
+    val `error`: LocalError?,
+)
+
+@Serializable
+data class ExplorerChangesQuery(
+    val `api_version`: Long,
+    val `revision`: String,
+    val `data`: ExplorerChangesView?,
+    val `error`: LocalError?,
+)
+
+@Serializable
+data class ExplorerPatchQuery(
+    val `api_version`: Long,
+    val `revision`: String,
+    val `data`: ExplorerPatchView?,
+    val `error`: LocalError?,
+)
+
+@Serializable
+data class ExplorerFileQuery(
+    val `api_version`: Long,
+    val `revision`: String,
+    val `data`: ExplorerFileView?,
     val `error`: LocalError?,
 )

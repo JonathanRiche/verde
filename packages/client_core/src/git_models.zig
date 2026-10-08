@@ -248,3 +248,75 @@ pub const ConfigCommitSnapshot = struct {
     commit_message_model: ?[]const u8 = null,
     commit_default_action: []const u8 = "commit",
 };
+
+/// `git.changes.workspace`: every uncommitted file across the workspace's
+/// repositories, with the chats that claimed it.
+pub const WorkspaceRequest = struct {
+    workspace_id: []const u8,
+};
+
+pub const WorkspaceOwner = struct {
+    local_thread_id: []const u8,
+    title: []const u8,
+    /// The claim is a guess (overlapping turns without edit evidence).
+    unclear: bool = false,
+};
+
+pub const WorkspaceFile = struct {
+    /// Repository-relative path.
+    path: []const u8,
+    /// `modified`, `added`, or `deleted` (untracked files are `added`).
+    status: []const u8,
+    untracked: bool = false,
+    /// `unassigned`, `mine` (one chat), `unclear`, or `shared`.
+    ownership: []const u8,
+    owners: []const WorkspaceOwner = &.{},
+    additions: u32 = 0,
+    deletions: u32 = 0,
+    binary: bool = false,
+};
+
+pub const WorkspaceRepo = struct {
+    root: []const u8,
+    name: []const u8,
+    head: ?[]const u8 = null,
+    branch: ?[]const u8 = null,
+    default_branch: ?[]const u8 = null,
+    is_default_branch: bool = false,
+    upstream: ?[]const u8 = null,
+    ahead: u32 = 0,
+    behind: u32 = 0,
+    has_remote: bool = false,
+    /// Too many dirty paths to list; `files` is empty.
+    too_many_files: bool = false,
+    files: []const WorkspaceFile = &.{},
+};
+
+pub const WorkspaceResult = struct {
+    workspace_id: []const u8,
+    revision: u64 = 0,
+    repos: []const WorkspaceRepo = &.{},
+};
+
+/// `git.changes.file_patch`: one file's patch against HEAD.
+pub const FilePatchRequest = struct {
+    workspace_id: []const u8,
+    root: []const u8,
+    path: []const u8,
+    context_lines: ?u32 = null,
+};
+
+pub const FilePatchResult = struct {
+    root: []const u8,
+    path: []const u8,
+    /// The file is no longer dirty; the other fields are empty.
+    clean: bool = false,
+    status: []const u8 = "modified",
+    binary: bool = false,
+    truncated: bool = false,
+    additions: u32 = 0,
+    deletions: u32 = 0,
+    context_lines: ?u32 = null,
+    /// Unified diff; null when clean, binary, or truncated.
+    patch: ?[]const u8 = null,
+};

@@ -1504,6 +1504,12 @@ enum Event: Codable {
     case `git_commit`(EventGitCommit)
     case `git_pull_push`(EventGitPullPush)
     case `git_config_set`(EventGitConfigSet)
+    case `workspace_files_list`(EventWorkspaceFilesList)
+    case `workspace_file_read`(EventWorkspaceFileRead)
+    case `workspace_preview_close`(EventWorkspacePreviewClose)
+    case `workspace_changes_open`(EventWorkspaceChangesOpen)
+    case `workspace_changes_close`(EventWorkspaceChangesClose)
+    case `workspace_file_patch`(EventWorkspaceFilePatch)
     case `file_open`(EventFileOpen)
     case `push_received`(EventPushReceived)
     case `terminal_input`(EventTerminalInput)
@@ -1576,6 +1582,12 @@ enum Event: Codable {
         case "git_commit": self = .`git_commit`(try EventGitCommit(from: decoder))
         case "git_pull_push": self = .`git_pull_push`(try EventGitPullPush(from: decoder))
         case "git_config_set": self = .`git_config_set`(try EventGitConfigSet(from: decoder))
+        case "workspace_files_list": self = .`workspace_files_list`(try EventWorkspaceFilesList(from: decoder))
+        case "workspace_file_read": self = .`workspace_file_read`(try EventWorkspaceFileRead(from: decoder))
+        case "workspace_preview_close": self = .`workspace_preview_close`(try EventWorkspacePreviewClose(from: decoder))
+        case "workspace_changes_open": self = .`workspace_changes_open`(try EventWorkspaceChangesOpen(from: decoder))
+        case "workspace_changes_close": self = .`workspace_changes_close`(try EventWorkspaceChangesClose(from: decoder))
+        case "workspace_file_patch": self = .`workspace_file_patch`(try EventWorkspaceFilePatch(from: decoder))
         case "file_open": self = .`file_open`(try EventFileOpen(from: decoder))
         case "push_received": self = .`push_received`(try EventPushReceived(from: decoder))
         case "terminal_input": self = .`terminal_input`(try EventTerminalInput(from: decoder))
@@ -1649,6 +1661,12 @@ enum Event: Codable {
         case .`git_commit`(let value): try value.encode(to: encoder)
         case .`git_pull_push`(let value): try value.encode(to: encoder)
         case .`git_config_set`(let value): try value.encode(to: encoder)
+        case .`workspace_files_list`(let value): try value.encode(to: encoder)
+        case .`workspace_file_read`(let value): try value.encode(to: encoder)
+        case .`workspace_preview_close`(let value): try value.encode(to: encoder)
+        case .`workspace_changes_open`(let value): try value.encode(to: encoder)
+        case .`workspace_changes_close`(let value): try value.encode(to: encoder)
+        case .`workspace_file_patch`(let value): try value.encode(to: encoder)
         case .`file_open`(let value): try value.encode(to: encoder)
         case .`push_received`(let value): try value.encode(to: encoder)
         case .`terminal_input`(let value): try value.encode(to: encoder)
@@ -4551,6 +4569,268 @@ extension EventGitConfigSet {
         try c.encode(self.`commit_default_action`, forKey: .`commit_default_action`)
         var tag = encoder.container(keyedBy: ModelDiscriminator.self)
         try tag.encode("git_config_set", forKey: .type)
+    }
+}
+
+struct EventWorkspaceFilesList: Codable {
+    var `api_version`: UInt32 = 1
+    var `now_ms`: Int64
+    var `wall_time_ms`: Int64
+    var `intent_id`: String
+    var `workspace_id`: String
+    var `root`: String? = nil
+    var `path`: String? = nil
+}
+
+extension EventWorkspaceFilesList {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `now_ms`
+        case `wall_time_ms`
+        case `intent_id`
+        case `workspace_id`
+        case `root`
+        case `path`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`now_ms` = try c.decode(Int64.self, forKey: .`now_ms`)
+        self.`wall_time_ms` = try c.decode(Int64.self, forKey: .`wall_time_ms`)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        if !c.contains(.`root`) { self.`root` = nil } else {
+        self.`root` = try c.decodeIfPresent(String.self, forKey: .`root`)
+        }
+        if !c.contains(.`path`) { self.`path` = nil } else {
+        self.`path` = try c.decodeIfPresent(String.self, forKey: .`path`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`now_ms`, forKey: .`now_ms`)
+        try c.encode(self.`wall_time_ms`, forKey: .`wall_time_ms`)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`root`, forKey: .`root`)
+        try c.encode(self.`path`, forKey: .`path`)
+        var tag = encoder.container(keyedBy: ModelDiscriminator.self)
+        try tag.encode("workspace_files_list", forKey: .type)
+    }
+}
+
+struct EventWorkspaceFileRead: Codable {
+    var `api_version`: UInt32 = 1
+    var `now_ms`: Int64
+    var `wall_time_ms`: Int64
+    var `intent_id`: String
+    var `workspace_id`: String
+    var `root`: String
+    var `path`: String
+}
+
+extension EventWorkspaceFileRead {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `now_ms`
+        case `wall_time_ms`
+        case `intent_id`
+        case `workspace_id`
+        case `root`
+        case `path`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`now_ms` = try c.decode(Int64.self, forKey: .`now_ms`)
+        self.`wall_time_ms` = try c.decode(Int64.self, forKey: .`wall_time_ms`)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        self.`root` = try c.decode(String.self, forKey: .`root`)
+        self.`path` = try c.decode(String.self, forKey: .`path`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`now_ms`, forKey: .`now_ms`)
+        try c.encode(self.`wall_time_ms`, forKey: .`wall_time_ms`)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`root`, forKey: .`root`)
+        try c.encode(self.`path`, forKey: .`path`)
+        var tag = encoder.container(keyedBy: ModelDiscriminator.self)
+        try tag.encode("workspace_file_read", forKey: .type)
+    }
+}
+
+struct EventWorkspacePreviewClose: Codable {
+    var `api_version`: UInt32 = 1
+    var `now_ms`: Int64
+    var `wall_time_ms`: Int64
+    var `intent_id`: String
+    var `workspace_id`: String
+}
+
+extension EventWorkspacePreviewClose {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `now_ms`
+        case `wall_time_ms`
+        case `intent_id`
+        case `workspace_id`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`now_ms` = try c.decode(Int64.self, forKey: .`now_ms`)
+        self.`wall_time_ms` = try c.decode(Int64.self, forKey: .`wall_time_ms`)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`now_ms`, forKey: .`now_ms`)
+        try c.encode(self.`wall_time_ms`, forKey: .`wall_time_ms`)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        var tag = encoder.container(keyedBy: ModelDiscriminator.self)
+        try tag.encode("workspace_preview_close", forKey: .type)
+    }
+}
+
+struct EventWorkspaceChangesOpen: Codable {
+    var `api_version`: UInt32 = 1
+    var `now_ms`: Int64
+    var `wall_time_ms`: Int64
+    var `intent_id`: String
+    var `workspace_id`: String
+}
+
+extension EventWorkspaceChangesOpen {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `now_ms`
+        case `wall_time_ms`
+        case `intent_id`
+        case `workspace_id`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`now_ms` = try c.decode(Int64.self, forKey: .`now_ms`)
+        self.`wall_time_ms` = try c.decode(Int64.self, forKey: .`wall_time_ms`)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`now_ms`, forKey: .`now_ms`)
+        try c.encode(self.`wall_time_ms`, forKey: .`wall_time_ms`)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        var tag = encoder.container(keyedBy: ModelDiscriminator.self)
+        try tag.encode("workspace_changes_open", forKey: .type)
+    }
+}
+
+struct EventWorkspaceChangesClose: Codable {
+    var `api_version`: UInt32 = 1
+    var `now_ms`: Int64
+    var `wall_time_ms`: Int64
+    var `intent_id`: String
+    var `workspace_id`: String
+}
+
+extension EventWorkspaceChangesClose {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `now_ms`
+        case `wall_time_ms`
+        case `intent_id`
+        case `workspace_id`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`now_ms` = try c.decode(Int64.self, forKey: .`now_ms`)
+        self.`wall_time_ms` = try c.decode(Int64.self, forKey: .`wall_time_ms`)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`now_ms`, forKey: .`now_ms`)
+        try c.encode(self.`wall_time_ms`, forKey: .`wall_time_ms`)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        var tag = encoder.container(keyedBy: ModelDiscriminator.self)
+        try tag.encode("workspace_changes_close", forKey: .type)
+    }
+}
+
+struct EventWorkspaceFilePatch: Codable {
+    var `api_version`: UInt32 = 1
+    var `now_ms`: Int64
+    var `wall_time_ms`: Int64
+    var `intent_id`: String
+    var `workspace_id`: String
+    var `root`: String
+    var `path`: String
+    var `context_lines`: UInt32? = nil
+}
+
+extension EventWorkspaceFilePatch {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `now_ms`
+        case `wall_time_ms`
+        case `intent_id`
+        case `workspace_id`
+        case `root`
+        case `path`
+        case `context_lines`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`now_ms` = try c.decode(Int64.self, forKey: .`now_ms`)
+        self.`wall_time_ms` = try c.decode(Int64.self, forKey: .`wall_time_ms`)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        self.`root` = try c.decode(String.self, forKey: .`root`)
+        self.`path` = try c.decode(String.self, forKey: .`path`)
+        if !c.contains(.`context_lines`) { self.`context_lines` = nil } else {
+        self.`context_lines` = try c.decodeIfPresent(UInt32.self, forKey: .`context_lines`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`now_ms`, forKey: .`now_ms`)
+        try c.encode(self.`wall_time_ms`, forKey: .`wall_time_ms`)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`root`, forKey: .`root`)
+        try c.encode(self.`path`, forKey: .`path`)
+        try c.encode(self.`context_lines`, forKey: .`context_lines`)
+        var tag = encoder.container(keyedBy: ModelDiscriminator.self)
+        try tag.encode("workspace_file_patch", forKey: .type)
     }
 }
 
@@ -8143,6 +8423,780 @@ extension GitReviewQuery {
         self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
         self.`revision` = try c.decode(String.self, forKey: .`revision`)
         self.`data` = try c.decodeIfPresent(GitReviewView.self, forKey: .`data`)
+        self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`revision`, forKey: .`revision`)
+        try c.encode(self.`data`, forKey: .`data`)
+        try c.encode(self.`error`, forKey: .`error`)
+    }
+}
+
+struct GitWorkspaceOwner: Codable {
+    var `local_thread_id`: String
+    var `title`: String
+    var `unclear`: Bool = false
+}
+
+extension GitWorkspaceOwner {
+    private enum CodingKeys: String, CodingKey {
+        case `local_thread_id`
+        case `title`
+        case `unclear`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`local_thread_id` = try c.decode(String.self, forKey: .`local_thread_id`)
+        self.`title` = try c.decode(String.self, forKey: .`title`)
+        if !c.contains(.`unclear`) { self.`unclear` = false } else {
+        self.`unclear` = try c.decode(Bool.self, forKey: .`unclear`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`local_thread_id`, forKey: .`local_thread_id`)
+        try c.encode(self.`title`, forKey: .`title`)
+        try c.encode(self.`unclear`, forKey: .`unclear`)
+    }
+}
+
+struct GitWorkspaceFile: Codable {
+    var `path`: String
+    var `status`: String
+    var `untracked`: Bool = false
+    var `ownership`: String
+    var `owners`: [GitWorkspaceOwner] = []
+    var `additions`: UInt32 = 0
+    var `deletions`: UInt32 = 0
+    var `binary`: Bool = false
+}
+
+extension GitWorkspaceFile {
+    private enum CodingKeys: String, CodingKey {
+        case `path`
+        case `status`
+        case `untracked`
+        case `ownership`
+        case `owners`
+        case `additions`
+        case `deletions`
+        case `binary`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`path` = try c.decode(String.self, forKey: .`path`)
+        self.`status` = try c.decode(String.self, forKey: .`status`)
+        if !c.contains(.`untracked`) { self.`untracked` = false } else {
+        self.`untracked` = try c.decode(Bool.self, forKey: .`untracked`)
+        }
+        self.`ownership` = try c.decode(String.self, forKey: .`ownership`)
+        if !c.contains(.`owners`) { self.`owners` = [] } else {
+        self.`owners` = try c.decode([GitWorkspaceOwner].self, forKey: .`owners`)
+        }
+        if !c.contains(.`additions`) { self.`additions` = 0 } else {
+        self.`additions` = try c.decode(UInt32.self, forKey: .`additions`)
+        }
+        if !c.contains(.`deletions`) { self.`deletions` = 0 } else {
+        self.`deletions` = try c.decode(UInt32.self, forKey: .`deletions`)
+        }
+        if !c.contains(.`binary`) { self.`binary` = false } else {
+        self.`binary` = try c.decode(Bool.self, forKey: .`binary`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`path`, forKey: .`path`)
+        try c.encode(self.`status`, forKey: .`status`)
+        try c.encode(self.`untracked`, forKey: .`untracked`)
+        try c.encode(self.`ownership`, forKey: .`ownership`)
+        try c.encode(self.`owners`, forKey: .`owners`)
+        try c.encode(self.`additions`, forKey: .`additions`)
+        try c.encode(self.`deletions`, forKey: .`deletions`)
+        try c.encode(self.`binary`, forKey: .`binary`)
+    }
+}
+
+struct GitWorkspaceRepo: Codable {
+    var `root`: String
+    var `name`: String
+    var `head`: String? = nil
+    var `branch`: String? = nil
+    var `default_branch`: String? = nil
+    var `is_default_branch`: Bool = false
+    var `upstream`: String? = nil
+    var `ahead`: UInt32 = 0
+    var `behind`: UInt32 = 0
+    var `has_remote`: Bool = false
+    var `too_many_files`: Bool = false
+    var `files`: [GitWorkspaceFile] = []
+}
+
+extension GitWorkspaceRepo {
+    private enum CodingKeys: String, CodingKey {
+        case `root`
+        case `name`
+        case `head`
+        case `branch`
+        case `default_branch`
+        case `is_default_branch`
+        case `upstream`
+        case `ahead`
+        case `behind`
+        case `has_remote`
+        case `too_many_files`
+        case `files`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`root` = try c.decode(String.self, forKey: .`root`)
+        self.`name` = try c.decode(String.self, forKey: .`name`)
+        if !c.contains(.`head`) { self.`head` = nil } else {
+        self.`head` = try c.decodeIfPresent(String.self, forKey: .`head`)
+        }
+        if !c.contains(.`branch`) { self.`branch` = nil } else {
+        self.`branch` = try c.decodeIfPresent(String.self, forKey: .`branch`)
+        }
+        if !c.contains(.`default_branch`) { self.`default_branch` = nil } else {
+        self.`default_branch` = try c.decodeIfPresent(String.self, forKey: .`default_branch`)
+        }
+        if !c.contains(.`is_default_branch`) { self.`is_default_branch` = false } else {
+        self.`is_default_branch` = try c.decode(Bool.self, forKey: .`is_default_branch`)
+        }
+        if !c.contains(.`upstream`) { self.`upstream` = nil } else {
+        self.`upstream` = try c.decodeIfPresent(String.self, forKey: .`upstream`)
+        }
+        if !c.contains(.`ahead`) { self.`ahead` = 0 } else {
+        self.`ahead` = try c.decode(UInt32.self, forKey: .`ahead`)
+        }
+        if !c.contains(.`behind`) { self.`behind` = 0 } else {
+        self.`behind` = try c.decode(UInt32.self, forKey: .`behind`)
+        }
+        if !c.contains(.`has_remote`) { self.`has_remote` = false } else {
+        self.`has_remote` = try c.decode(Bool.self, forKey: .`has_remote`)
+        }
+        if !c.contains(.`too_many_files`) { self.`too_many_files` = false } else {
+        self.`too_many_files` = try c.decode(Bool.self, forKey: .`too_many_files`)
+        }
+        if !c.contains(.`files`) { self.`files` = [] } else {
+        self.`files` = try c.decode([GitWorkspaceFile].self, forKey: .`files`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`root`, forKey: .`root`)
+        try c.encode(self.`name`, forKey: .`name`)
+        try c.encode(self.`head`, forKey: .`head`)
+        try c.encode(self.`branch`, forKey: .`branch`)
+        try c.encode(self.`default_branch`, forKey: .`default_branch`)
+        try c.encode(self.`is_default_branch`, forKey: .`is_default_branch`)
+        try c.encode(self.`upstream`, forKey: .`upstream`)
+        try c.encode(self.`ahead`, forKey: .`ahead`)
+        try c.encode(self.`behind`, forKey: .`behind`)
+        try c.encode(self.`has_remote`, forKey: .`has_remote`)
+        try c.encode(self.`too_many_files`, forKey: .`too_many_files`)
+        try c.encode(self.`files`, forKey: .`files`)
+    }
+}
+
+struct GitFilePatchResult: Codable {
+    var `root`: String
+    var `path`: String
+    var `clean`: Bool = false
+    var `status`: String = "modified"
+    var `binary`: Bool = false
+    var `truncated`: Bool = false
+    var `additions`: UInt32 = 0
+    var `deletions`: UInt32 = 0
+    var `context_lines`: UInt32? = nil
+    var `patch`: String? = nil
+}
+
+extension GitFilePatchResult {
+    private enum CodingKeys: String, CodingKey {
+        case `root`
+        case `path`
+        case `clean`
+        case `status`
+        case `binary`
+        case `truncated`
+        case `additions`
+        case `deletions`
+        case `context_lines`
+        case `patch`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`root` = try c.decode(String.self, forKey: .`root`)
+        self.`path` = try c.decode(String.self, forKey: .`path`)
+        if !c.contains(.`clean`) { self.`clean` = false } else {
+        self.`clean` = try c.decode(Bool.self, forKey: .`clean`)
+        }
+        if !c.contains(.`status`) { self.`status` = "modified" } else {
+        self.`status` = try c.decode(String.self, forKey: .`status`)
+        }
+        if !c.contains(.`binary`) { self.`binary` = false } else {
+        self.`binary` = try c.decode(Bool.self, forKey: .`binary`)
+        }
+        if !c.contains(.`truncated`) { self.`truncated` = false } else {
+        self.`truncated` = try c.decode(Bool.self, forKey: .`truncated`)
+        }
+        if !c.contains(.`additions`) { self.`additions` = 0 } else {
+        self.`additions` = try c.decode(UInt32.self, forKey: .`additions`)
+        }
+        if !c.contains(.`deletions`) { self.`deletions` = 0 } else {
+        self.`deletions` = try c.decode(UInt32.self, forKey: .`deletions`)
+        }
+        if !c.contains(.`context_lines`) { self.`context_lines` = nil } else {
+        self.`context_lines` = try c.decodeIfPresent(UInt32.self, forKey: .`context_lines`)
+        }
+        if !c.contains(.`patch`) { self.`patch` = nil } else {
+        self.`patch` = try c.decodeIfPresent(String.self, forKey: .`patch`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`root`, forKey: .`root`)
+        try c.encode(self.`path`, forKey: .`path`)
+        try c.encode(self.`clean`, forKey: .`clean`)
+        try c.encode(self.`status`, forKey: .`status`)
+        try c.encode(self.`binary`, forKey: .`binary`)
+        try c.encode(self.`truncated`, forKey: .`truncated`)
+        try c.encode(self.`additions`, forKey: .`additions`)
+        try c.encode(self.`deletions`, forKey: .`deletions`)
+        try c.encode(self.`context_lines`, forKey: .`context_lines`)
+        try c.encode(self.`patch`, forKey: .`patch`)
+    }
+}
+
+struct ExplorerRoot: Codable {
+    var `id`: String
+    var `name`: String
+    var `path`: String = ""
+    var `home`: Bool = false
+}
+
+extension ExplorerRoot {
+    private enum CodingKeys: String, CodingKey {
+        case `id`
+        case `name`
+        case `path`
+        case `home`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`id` = try c.decode(String.self, forKey: .`id`)
+        self.`name` = try c.decode(String.self, forKey: .`name`)
+        if !c.contains(.`path`) { self.`path` = "" } else {
+        self.`path` = try c.decode(String.self, forKey: .`path`)
+        }
+        if !c.contains(.`home`) { self.`home` = false } else {
+        self.`home` = try c.decode(Bool.self, forKey: .`home`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`id`, forKey: .`id`)
+        try c.encode(self.`name`, forKey: .`name`)
+        try c.encode(self.`path`, forKey: .`path`)
+        try c.encode(self.`home`, forKey: .`home`)
+    }
+}
+
+struct ExplorerEntry: Codable {
+    var `name`: String
+    var `path`: String
+    var `kind`: String
+    var `size`: UInt64 = 0
+    var `ignored`: Bool = false
+    var `symlink`: Bool = false
+}
+
+extension ExplorerEntry {
+    private enum CodingKeys: String, CodingKey {
+        case `name`
+        case `path`
+        case `kind`
+        case `size`
+        case `ignored`
+        case `symlink`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`name` = try c.decode(String.self, forKey: .`name`)
+        self.`path` = try c.decode(String.self, forKey: .`path`)
+        self.`kind` = try c.decode(String.self, forKey: .`kind`)
+        if !c.contains(.`size`) { self.`size` = 0 } else {
+        self.`size` = try c.decode(UInt64.self, forKey: .`size`)
+        }
+        if !c.contains(.`ignored`) { self.`ignored` = false } else {
+        self.`ignored` = try c.decode(Bool.self, forKey: .`ignored`)
+        }
+        if !c.contains(.`symlink`) { self.`symlink` = false } else {
+        self.`symlink` = try c.decode(Bool.self, forKey: .`symlink`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`name`, forKey: .`name`)
+        try c.encode(self.`path`, forKey: .`path`)
+        try c.encode(self.`kind`, forKey: .`kind`)
+        try c.encode(self.`size`, forKey: .`size`)
+        try c.encode(self.`ignored`, forKey: .`ignored`)
+        try c.encode(self.`symlink`, forKey: .`symlink`)
+    }
+}
+
+struct ExplorerDir: Codable {
+    var `root`: String
+    var `path`: String
+    var `entries`: [ExplorerEntry] = []
+    var `truncated`: Bool = false
+    var `loading`: Bool = false
+    var `loaded`: Bool = false
+    var `error`: LocalError? = nil
+}
+
+extension ExplorerDir {
+    private enum CodingKeys: String, CodingKey {
+        case `root`
+        case `path`
+        case `entries`
+        case `truncated`
+        case `loading`
+        case `loaded`
+        case `error`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`root` = try c.decode(String.self, forKey: .`root`)
+        self.`path` = try c.decode(String.self, forKey: .`path`)
+        if !c.contains(.`entries`) { self.`entries` = [] } else {
+        self.`entries` = try c.decode([ExplorerEntry].self, forKey: .`entries`)
+        }
+        if !c.contains(.`truncated`) { self.`truncated` = false } else {
+        self.`truncated` = try c.decode(Bool.self, forKey: .`truncated`)
+        }
+        if !c.contains(.`loading`) { self.`loading` = false } else {
+        self.`loading` = try c.decode(Bool.self, forKey: .`loading`)
+        }
+        if !c.contains(.`loaded`) { self.`loaded` = false } else {
+        self.`loaded` = try c.decode(Bool.self, forKey: .`loaded`)
+        }
+        if !c.contains(.`error`) { self.`error` = nil } else {
+        self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`root`, forKey: .`root`)
+        try c.encode(self.`path`, forKey: .`path`)
+        try c.encode(self.`entries`, forKey: .`entries`)
+        try c.encode(self.`truncated`, forKey: .`truncated`)
+        try c.encode(self.`loading`, forKey: .`loading`)
+        try c.encode(self.`loaded`, forKey: .`loaded`)
+        try c.encode(self.`error`, forKey: .`error`)
+    }
+}
+
+struct ExplorerFilesView: Codable {
+    var `workspace_id`: String
+    var `supported`: Bool = true
+    var `loading`: Bool = false
+    var `loaded`: Bool = false
+    var `roots`: [ExplorerRoot] = []
+    var `dirs`: [ExplorerDir] = []
+    var `error`: LocalError? = nil
+}
+
+extension ExplorerFilesView {
+    private enum CodingKeys: String, CodingKey {
+        case `workspace_id`
+        case `supported`
+        case `loading`
+        case `loaded`
+        case `roots`
+        case `dirs`
+        case `error`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        if !c.contains(.`supported`) { self.`supported` = true } else {
+        self.`supported` = try c.decode(Bool.self, forKey: .`supported`)
+        }
+        if !c.contains(.`loading`) { self.`loading` = false } else {
+        self.`loading` = try c.decode(Bool.self, forKey: .`loading`)
+        }
+        if !c.contains(.`loaded`) { self.`loaded` = false } else {
+        self.`loaded` = try c.decode(Bool.self, forKey: .`loaded`)
+        }
+        if !c.contains(.`roots`) { self.`roots` = [] } else {
+        self.`roots` = try c.decode([ExplorerRoot].self, forKey: .`roots`)
+        }
+        if !c.contains(.`dirs`) { self.`dirs` = [] } else {
+        self.`dirs` = try c.decode([ExplorerDir].self, forKey: .`dirs`)
+        }
+        if !c.contains(.`error`) { self.`error` = nil } else {
+        self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`supported`, forKey: .`supported`)
+        try c.encode(self.`loading`, forKey: .`loading`)
+        try c.encode(self.`loaded`, forKey: .`loaded`)
+        try c.encode(self.`roots`, forKey: .`roots`)
+        try c.encode(self.`dirs`, forKey: .`dirs`)
+        try c.encode(self.`error`, forKey: .`error`)
+    }
+}
+
+struct ExplorerChangesView: Codable {
+    var `workspace_id`: String
+    var `supported`: Bool = true
+    var `loading`: Bool = false
+    var `loaded`: Bool = false
+    var `revision`: UInt64 = 0
+    var `repos`: [GitWorkspaceRepo] = []
+    var `error`: LocalError? = nil
+}
+
+extension ExplorerChangesView {
+    private enum CodingKeys: String, CodingKey {
+        case `workspace_id`
+        case `supported`
+        case `loading`
+        case `loaded`
+        case `revision`
+        case `repos`
+        case `error`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        if !c.contains(.`supported`) { self.`supported` = true } else {
+        self.`supported` = try c.decode(Bool.self, forKey: .`supported`)
+        }
+        if !c.contains(.`loading`) { self.`loading` = false } else {
+        self.`loading` = try c.decode(Bool.self, forKey: .`loading`)
+        }
+        if !c.contains(.`loaded`) { self.`loaded` = false } else {
+        self.`loaded` = try c.decode(Bool.self, forKey: .`loaded`)
+        }
+        if !c.contains(.`revision`) { self.`revision` = 0 } else {
+        self.`revision` = try c.decode(UInt64.self, forKey: .`revision`)
+        }
+        if !c.contains(.`repos`) { self.`repos` = [] } else {
+        self.`repos` = try c.decode([GitWorkspaceRepo].self, forKey: .`repos`)
+        }
+        if !c.contains(.`error`) { self.`error` = nil } else {
+        self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`supported`, forKey: .`supported`)
+        try c.encode(self.`loading`, forKey: .`loading`)
+        try c.encode(self.`loaded`, forKey: .`loaded`)
+        try c.encode(self.`revision`, forKey: .`revision`)
+        try c.encode(self.`repos`, forKey: .`repos`)
+        try c.encode(self.`error`, forKey: .`error`)
+    }
+}
+
+struct ExplorerPatchView: Codable {
+    var `workspace_id`: String = ""
+    var `root`: String = ""
+    var `path`: String = ""
+    var `context_lines`: UInt32? = nil
+    var `supported`: Bool = true
+    var `loading`: Bool = false
+    var `result`: GitFilePatchResult? = nil
+    var `error`: LocalError? = nil
+}
+
+extension ExplorerPatchView {
+    private enum CodingKeys: String, CodingKey {
+        case `workspace_id`
+        case `root`
+        case `path`
+        case `context_lines`
+        case `supported`
+        case `loading`
+        case `result`
+        case `error`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`workspace_id`) { self.`workspace_id` = "" } else {
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        }
+        if !c.contains(.`root`) { self.`root` = "" } else {
+        self.`root` = try c.decode(String.self, forKey: .`root`)
+        }
+        if !c.contains(.`path`) { self.`path` = "" } else {
+        self.`path` = try c.decode(String.self, forKey: .`path`)
+        }
+        if !c.contains(.`context_lines`) { self.`context_lines` = nil } else {
+        self.`context_lines` = try c.decodeIfPresent(UInt32.self, forKey: .`context_lines`)
+        }
+        if !c.contains(.`supported`) { self.`supported` = true } else {
+        self.`supported` = try c.decode(Bool.self, forKey: .`supported`)
+        }
+        if !c.contains(.`loading`) { self.`loading` = false } else {
+        self.`loading` = try c.decode(Bool.self, forKey: .`loading`)
+        }
+        if !c.contains(.`result`) { self.`result` = nil } else {
+        self.`result` = try c.decodeIfPresent(GitFilePatchResult.self, forKey: .`result`)
+        }
+        if !c.contains(.`error`) { self.`error` = nil } else {
+        self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`root`, forKey: .`root`)
+        try c.encode(self.`path`, forKey: .`path`)
+        try c.encode(self.`context_lines`, forKey: .`context_lines`)
+        try c.encode(self.`supported`, forKey: .`supported`)
+        try c.encode(self.`loading`, forKey: .`loading`)
+        try c.encode(self.`result`, forKey: .`result`)
+        try c.encode(self.`error`, forKey: .`error`)
+    }
+}
+
+struct ExplorerReadResult: Codable {
+    var `root`: String
+    var `path`: String
+    var `name`: String = ""
+    var `size`: UInt64 = 0
+    var `kind`: String
+    var `mime`: String? = nil
+    var `encoding`: String = "none"
+    var `content`: String = ""
+    var `truncated`: Bool = false
+}
+
+extension ExplorerReadResult {
+    private enum CodingKeys: String, CodingKey {
+        case `root`
+        case `path`
+        case `name`
+        case `size`
+        case `kind`
+        case `mime`
+        case `encoding`
+        case `content`
+        case `truncated`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`root` = try c.decode(String.self, forKey: .`root`)
+        self.`path` = try c.decode(String.self, forKey: .`path`)
+        if !c.contains(.`name`) { self.`name` = "" } else {
+        self.`name` = try c.decode(String.self, forKey: .`name`)
+        }
+        if !c.contains(.`size`) { self.`size` = 0 } else {
+        self.`size` = try c.decode(UInt64.self, forKey: .`size`)
+        }
+        self.`kind` = try c.decode(String.self, forKey: .`kind`)
+        if !c.contains(.`mime`) { self.`mime` = nil } else {
+        self.`mime` = try c.decodeIfPresent(String.self, forKey: .`mime`)
+        }
+        if !c.contains(.`encoding`) { self.`encoding` = "none" } else {
+        self.`encoding` = try c.decode(String.self, forKey: .`encoding`)
+        }
+        if !c.contains(.`content`) { self.`content` = "" } else {
+        self.`content` = try c.decode(String.self, forKey: .`content`)
+        }
+        if !c.contains(.`truncated`) { self.`truncated` = false } else {
+        self.`truncated` = try c.decode(Bool.self, forKey: .`truncated`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`root`, forKey: .`root`)
+        try c.encode(self.`path`, forKey: .`path`)
+        try c.encode(self.`name`, forKey: .`name`)
+        try c.encode(self.`size`, forKey: .`size`)
+        try c.encode(self.`kind`, forKey: .`kind`)
+        try c.encode(self.`mime`, forKey: .`mime`)
+        try c.encode(self.`encoding`, forKey: .`encoding`)
+        try c.encode(self.`content`, forKey: .`content`)
+        try c.encode(self.`truncated`, forKey: .`truncated`)
+    }
+}
+
+struct ExplorerFileView: Codable {
+    var `workspace_id`: String = ""
+    var `root`: String = ""
+    var `path`: String = ""
+    var `supported`: Bool = true
+    var `loading`: Bool = false
+    var `result`: ExplorerReadResult? = nil
+    var `error`: LocalError? = nil
+}
+
+extension ExplorerFileView {
+    private enum CodingKeys: String, CodingKey {
+        case `workspace_id`
+        case `root`
+        case `path`
+        case `supported`
+        case `loading`
+        case `result`
+        case `error`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`workspace_id`) { self.`workspace_id` = "" } else {
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        }
+        if !c.contains(.`root`) { self.`root` = "" } else {
+        self.`root` = try c.decode(String.self, forKey: .`root`)
+        }
+        if !c.contains(.`path`) { self.`path` = "" } else {
+        self.`path` = try c.decode(String.self, forKey: .`path`)
+        }
+        if !c.contains(.`supported`) { self.`supported` = true } else {
+        self.`supported` = try c.decode(Bool.self, forKey: .`supported`)
+        }
+        if !c.contains(.`loading`) { self.`loading` = false } else {
+        self.`loading` = try c.decode(Bool.self, forKey: .`loading`)
+        }
+        if !c.contains(.`result`) { self.`result` = nil } else {
+        self.`result` = try c.decodeIfPresent(ExplorerReadResult.self, forKey: .`result`)
+        }
+        if !c.contains(.`error`) { self.`error` = nil } else {
+        self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`root`, forKey: .`root`)
+        try c.encode(self.`path`, forKey: .`path`)
+        try c.encode(self.`supported`, forKey: .`supported`)
+        try c.encode(self.`loading`, forKey: .`loading`)
+        try c.encode(self.`result`, forKey: .`result`)
+        try c.encode(self.`error`, forKey: .`error`)
+    }
+}
+
+struct ExplorerFilesQuery: Codable {
+    var `api_version`: UInt32
+    var `revision`: String
+    var `data`: ExplorerFilesView?
+    var `error`: LocalError?
+}
+
+extension ExplorerFilesQuery {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `revision`
+        case `data`
+        case `error`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        self.`revision` = try c.decode(String.self, forKey: .`revision`)
+        self.`data` = try c.decodeIfPresent(ExplorerFilesView.self, forKey: .`data`)
+        self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`revision`, forKey: .`revision`)
+        try c.encode(self.`data`, forKey: .`data`)
+        try c.encode(self.`error`, forKey: .`error`)
+    }
+}
+
+struct ExplorerChangesQuery: Codable {
+    var `api_version`: UInt32
+    var `revision`: String
+    var `data`: ExplorerChangesView?
+    var `error`: LocalError?
+}
+
+extension ExplorerChangesQuery {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `revision`
+        case `data`
+        case `error`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        self.`revision` = try c.decode(String.self, forKey: .`revision`)
+        self.`data` = try c.decodeIfPresent(ExplorerChangesView.self, forKey: .`data`)
+        self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`revision`, forKey: .`revision`)
+        try c.encode(self.`data`, forKey: .`data`)
+        try c.encode(self.`error`, forKey: .`error`)
+    }
+}
+
+struct ExplorerPatchQuery: Codable {
+    var `api_version`: UInt32
+    var `revision`: String
+    var `data`: ExplorerPatchView?
+    var `error`: LocalError?
+}
+
+extension ExplorerPatchQuery {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `revision`
+        case `data`
+        case `error`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        self.`revision` = try c.decode(String.self, forKey: .`revision`)
+        self.`data` = try c.decodeIfPresent(ExplorerPatchView.self, forKey: .`data`)
+        self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`revision`, forKey: .`revision`)
+        try c.encode(self.`data`, forKey: .`data`)
+        try c.encode(self.`error`, forKey: .`error`)
+    }
+}
+
+struct ExplorerFileQuery: Codable {
+    var `api_version`: UInt32
+    var `revision`: String
+    var `data`: ExplorerFileView?
+    var `error`: LocalError?
+}
+
+extension ExplorerFileQuery {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `revision`
+        case `data`
+        case `error`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        self.`revision` = try c.decode(String.self, forKey: .`revision`)
+        self.`data` = try c.decodeIfPresent(ExplorerFileView.self, forKey: .`data`)
         self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
     }
     func encode(to encoder: Encoder) throws {
