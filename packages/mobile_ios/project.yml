@@ -72,6 +72,7 @@ targets:
     info:
       path: Generated/NotificationServiceExtension-Info.plist
       properties:
+        CFBundleDisplayName: Verde
         NSExtension:
           NSExtensionPointIdentifier: com.apple.usernotifications.service
           NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).NotificationService
