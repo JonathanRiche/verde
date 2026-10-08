@@ -103,6 +103,18 @@ struct DrawerButton: View {
     @Environment(\.openWorkspaceDrawer) private var open
     var body: some View { Button(action: open) { Image(systemName: "line.3.horizontal").frame(width: 32, height: 32) }.accessibilityLabel("Open workspace drawer") }
 }
+/// iOS 26 wraps toolbar items in Liquid Glass, so toolbar controls draw their own
+/// panel and border only on earlier systems; otherwise they nest a box in the glass.
+struct ToolbarChrome: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(iOS 26.0, *) {
+            content
+        } else {
+            content.background(VerdeTheme.panel, in: RoundedRectangle(cornerRadius: 9))
+                .overlay(RoundedRectangle(cornerRadius: 9).stroke(VerdeTheme.border))
+        }
+    }
+}
 struct VerdeNavigation: ViewModifier {
     func body(content: Content) -> some View {
         content.toolbar { ToolbarItem(placement: .topBarLeading) { DrawerButton() } }

@@ -35,8 +35,7 @@ struct GitChatControls: View {
                         }
                     }.font(VerdeTheme.ui(11, bold: true))
                         .foregroundStyle((model.change?.attention ?? 0) > 0 ? VerdeTheme.warning : VerdeTheme.text)
-                        .background(VerdeTheme.panel, in: RoundedRectangle(cornerRadius: 9))
-                        .overlay(RoundedRectangle(cornerRadius: 9).stroke(VerdeTheme.border))
+                        .modifier(ToolbarChrome())
                         .sheet(isPresented: Binding(get: { model.sheet }, set: { if $0 { model.sheet = true } else { model.dismissSheet() } })) { GitCommitSheet(model: model) }
                         .confirmationDialog("Push repository", isPresented: Binding(get: { model.choosePush }, set: { model.choosePush = $0 })) {
                             ForEach(model.repos.filter { $0.has_remote && $0.ahead > 0 }, id: \.root) { repo in
