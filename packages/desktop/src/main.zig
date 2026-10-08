@@ -24,6 +24,7 @@ const utils = @import("utils.zig");
 const ui_layout = @import("ui/layout.zig");
 const workspace_panes_ui = @import("ui/workspace_panes.zig");
 const workspace_strip_ui = @import("ui/workspace_strip.zig");
+const side_panel_ui = @import("ui/side_panel.zig");
 const sidebar_ui = @import("ui/sidebar.zig");
 const chat_panel_ui = @import("ui/chat_panel.zig");
 const browser_ui = @import("ui/browser.zig");
@@ -870,6 +871,10 @@ fn syncMouseCursor(state: *AppState, cache: *SystemCursorCache) void {
     }
     if (!modalHitAtMouse(state)) {
         if (workspace_strip_ui.systemCursorAt(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y)) |cursor| {
+            applySystemCursor(cache, cursor);
+            return;
+        }
+        if (side_panel_ui.systemCursorAt(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y)) |cursor| {
             applySystemCursor(cache, cursor);
             return;
         }
@@ -2308,6 +2313,9 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 return true;
             }
             chat_panel_ui.handleTranscriptPaletteMouseMotion(state);
+            if (side_panel_ui.handleMouseMotion(state, event.motion.x, event.motion.y)) {
+                return true;
+            }
             workspace_strip_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y);
             const ctrl_down = isCtrlPressed() or isKeymodPressed(SDL_GetModState(), sdl.Keymod.ctrl);
             if (workspace_panes_ui.hasActivePaneDrag() and workspace_panes_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y, event.motion.xrel, event.motion.yrel, ctrl_down)) {
@@ -2422,8 +2430,13 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
-            // The linked-chats drawer sits inside the parent pane beside the
-            // transcript, so it claims its rows before pane/transcript routing.
+            // Side panel chrome (view tabs, actions, resize grip) owns its hits;
+            // the browser page and agent rows inside route below.
+            if (event.button.button == 1 and side_panel_ui.handleMouseButton(state, event.button.x, event.button.y, event.button.down)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            // Linked-chat rows render in the side panel's Agents view.
             if (event.button.button == 1 and chat_panel_ui.handleLinkedChatsMouseButton(state, event.button.x, event.button.y, event.button.down)) {
                 syncWindowTextInput(window, state);
                 return true;

@@ -19,7 +19,8 @@ const chat_markdown = @import("chat_markdown.zig");
 const colors = @import("colors.zig");
 const composer_pickers = @import("composer_pickers.zig");
 const file_icons = @import("file_icons.zig");
-const globe_icon = @import("globe_icon.zig");
+const sidebar_ui = @import("sidebar.zig");
+const workspace_strip = @import("workspace_strip.zig");
 const runtime = @import("runtime.zig");
 const terminal_panel = @import("terminal_panel.zig");
 const text_measure = @import("text_measure.zig");
@@ -636,12 +637,11 @@ pub fn renderWorkspaceAtForPaneWithReserveAndTranscriptLayoutWidth(
     }
     const subagent_view = state.project_controller.projects.items.len > 0 and state.currentThread().isSubagentView();
     const live_composer = !blocked_by_quick and !subagent_view and paneOwnsActiveChatState(state, pane_id);
-    // Linked chats occupy a compact transcript-side panel. The composer
-    // keeps its normal width, including attachment previews and controls.
-    var linked = linkedChatsLayoutFor(state, rect.w, subagent_view);
-    defer linked.subagents.deinit(state.allocator);
-    const linked_lane_w = linked.lane_reserve;
-    const target_linked_lane_w = linkedChatsLaneReserve(transcript_layout_width, linked.parent);
+    // Linked chats live in the tab's side panel (Agents view). Keep marking
+    // every visible chat as wanted so the panel and its toggle badge stay fresh.
+    markLinkedChatsWanted(state, subagent_view);
+    const linked_lane_w: f32 = 0.0;
+    const target_linked_lane_w: f32 = 0.0;
 
     if (live_composer) {
         state.invalidateComposerToolbarOverlayHitRects();
@@ -804,17 +804,6 @@ pub fn renderWorkspaceAtForPaneWithReserveAndTranscriptLayoutWidth(
         });
     } else {
         renderTranscript(state, body, transcript_lane, pane_id);
-    }
-
-    const drawer_y = body.y + theme.scaledUi(LINKED_DRAWER_EDGE_CSS);
-    if (linked_lane_w > 0.0 and drawer_y + theme.scaledUi(56.0) < composer_y - attachment_reserve - bang_mode_reserve - background_task_reserve - followup_reserve - approval_reserve - runtime_block_reserve) {
-        const drawer_w = if (linked.overlay_width > 0.0) linked.overlay_width else linked_lane_w - theme.scaledUi(LINKED_DRAWER_GAP_CSS) - theme.scaledUi(LINKED_DRAWER_EDGE_CSS);
-        renderLinkedChatsDrawer(state, .{
-            .x = rect.x + rect.w - theme.scaledUi(LINKED_DRAWER_EDGE_CSS) - drawer_w,
-            .y = drawer_y,
-            .w = drawer_w,
-            .h = linkedChatsPanelHeight(linked, @max(composer_y - attachment_reserve - bang_mode_reserve - background_task_reserve - followup_reserve - approval_reserve - runtime_block_reserve - drawer_y, 0.0)),
-        }, linked, pane_id);
     }
 
     // Paint after the transcript so the opaque header strip wins over any scrolled
@@ -1082,6 +1071,79 @@ fn linkedChatsLaneReserve(pane_w: f32, parent_opt: ?*linked_chats.Parent) f32 {
     return width + theme.scaledUi(LINKED_DRAWER_GAP_CSS) + theme.scaledUi(LINKED_DRAWER_EDGE_CSS);
 }
 
+/// Registers the current thread as a wanted linked-chats parent so polling
+/// keeps running while its chat is visible.
+fn markLinkedChatsWanted(state: *app_state.AppState, subagent_view: bool) void {
+    if (subagent_view or state.project_controller.projects.items.len == 0) return;
+    const project = &state.project_controller.projects.items[state.project_controller.selected_index];
+    const thread = state.currentThread();
+    if (!thread.committed) return;
+    _ = state.linked_chats.markWanted(state.allocator, project.id, thread.local_thread_id, unixTimestampMs());
+}
+
+/// Whether the chat pane's thread has linked agents still working. Drives the
+/// side-panel toggle badge while the panel is closed.
+pub fn linkedChatsActiveForPane(state: *app_state.AppState, pane_id: app_state.WorkspacePaneId) bool {
+    if (state.project_controller.projects.items.len == 0) return false;
+    const project = &state.project_controller.projects.items[state.project_controller.selected_index];
+    const thread_index = state.workspaceChatThreadIndexByPane(pane_id) orelse return false;
+    if (thread_index >= project.threads.items.len) return false;
+    const thread = &project.threads.items[thread_index];
+    if (!thread.committed) return false;
+    const parent = state.linked_chats.find(project.id, thread.local_thread_id) orelse return false;
+    for (parent.entries.items) |entry| {
+        switch (entry.status) {
+            .running, .waiting_approval, .blocked => return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
+/// Agents view of the side panel: the linked chats and subagents of the chat
+/// shown by `pane_id`, at full panel height.
+pub fn renderLinkedChatsPanel(state: *app_state.AppState, rect: palette.Rect, pane_id: ?app_state.WorkspacePaneId) void {
+    const id = pane_id orelse {
+        renderLinkedChatsEmpty(state, rect, "No chat in this tab", "Open a chat here to see the agents it links and delegates to.");
+        return;
+    };
+    if (state.project_controller.projects.items.len == 0) return;
+    const project = &state.project_controller.projects.items[state.project_controller.selected_index];
+    const thread_index = state.workspaceChatThreadIndexByPane(id) orelse return;
+    if (thread_index >= project.threads.items.len) return;
+    const restore_thread_index = project.selected_thread_index;
+    project.selected_thread_index = thread_index;
+    defer {
+        if (restore_thread_index < project.threads.items.len) project.selected_thread_index = restore_thread_index;
+    }
+    var layout = linkedChatsLayoutFor(state, std.math.floatMax(f32), state.currentThread().isSubagentView());
+    defer layout.subagents.deinit(state.allocator);
+    const parent = layout.parent orelse {
+        renderLinkedChatsEmpty(state, rect, "No linked agents", "Chats this conversation delegates to, or is delegated from, appear here.");
+        return;
+    };
+    if (parent.entries.items.len + layout.subagents.items.len == 0) {
+        renderLinkedChatsEmpty(state, rect, "No linked agents", "Chats this conversation delegates to, or is delegated from, appear here.");
+        return;
+    }
+    layout.rail = false;
+    layout.overlay_width = 0.0;
+    renderLinkedChatsList(state, rect, layout, pane_id, true);
+}
+
+fn renderLinkedChatsEmpty(state: *app_state.AppState, rect: palette.Rect, title: []const u8, body: []const u8) void {
+    const pad = theme.scaledUi(20.0);
+    const width = @max(rect.w - pad * 2.0, 0.0);
+    if (width <= 0.0) return;
+    const title_font = theme.scaledUi(14.0);
+    const body_font = theme.scaledUi(12.0);
+    const y = rect.y + @max(rect.h * 0.3, pad);
+    queueChromeLabel(state, .{ .x = rect.x + pad, .y = y, .w = width, .h = title_font * 1.4 }, title, paletteColor(theme.COLOR_WHITE), title_font, rect);
+    var line_buf: [256]u8 = undefined;
+    const line = truncateUiLabel(&line_buf, body, width, body_font);
+    queueChromeLabel(state, .{ .x = rect.x + pad, .y = y + title_font * 1.4 + theme.scaledUi(6.0), .w = width, .h = body_font * 1.4 }, line, paletteColor(theme.COLOR_TEXT_MUTED), body_font, rect);
+}
+
 /// Registers the pane's thread as a wanted parent (so polling starts) and
 /// returns the drawer geometry for this frame. Drafts have no durable id yet
 /// and subagent views are children themselves, so neither gets a drawer.
@@ -1198,14 +1260,13 @@ fn linkedChatsPanelHeight(layout: LinkedChatsLayout, available: f32) f32 {
     return @min(desired, available);
 }
 
-fn renderLinkedChatsDrawer(state: *app_state.AppState, rect: palette.Rect, layout: LinkedChatsLayout, pane_id: ?app_state.WorkspacePaneId) void {
-    // Region: linked-chats drawer docked on the parent pane's right edge,
-    // sized to at most three rows and always above the composer.
+fn renderLinkedChatsList(state: *app_state.AppState, rect: palette.Rect, layout: LinkedChatsLayout, pane_id: ?app_state.WorkspacePaneId, embedded: bool) void {
+    // Embedded in the side panel: no card chrome and no collapse control.
     const parent = layout.parent orelse return;
     const workspace_id = parent.workspace_id;
     const parent_id = parent.parent_thread_id;
     const radius = theme.scaledUi(10.0);
-    queuePanel(state, rect, paletteColor(theme.COLOR_PANEL), paletteColor(theme.borderMuted()), radius, @max(theme.scaledUi(1.0), 1.0));
+    if (!embedded) queuePanel(state, rect, paletteColor(theme.COLOR_PANEL), paletteColor(theme.borderMuted()), radius, @max(theme.scaledUi(1.0), 1.0));
     const mouse_x = state.transcript_controller.palette_mouse_x;
     const mouse_y = state.transcript_controller.palette_mouse_y;
 
@@ -1222,30 +1283,33 @@ fn renderLinkedChatsDrawer(state: *app_state.AppState, rect: palette.Rect, layou
     const control_gap = theme.scaledUi(6.0);
 
     // Collapse chevron hugs the right edge; "Clear done" sits to its left.
+    // Embedded lists keep the slot empty: the side panel owns visibility.
     const chevron_rect = snapRect(.{
         .x = header.x + header.w - pad + theme.scaledUi(4.0) - control,
         .y = header.y + (header_h - control) * 0.5,
         .w = control,
         .h = control,
     });
-    const chevron_hover = rectContains(chevron_rect, mouse_x, mouse_y);
-    if (chevron_hover) queueRounded(state, chevron_rect, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 18)), theme.scaledUi(6.0));
-    const chevron_size = theme.scaledUi(12.0);
-    queueIconText(state, .{
-        .x = chevron_rect.x + (chevron_rect.w - chevron_size) * 0.5,
-        .y = chevron_rect.y + (chevron_rect.h - chevron_size) * 0.5,
-        .w = chevron_size,
-        .h = chevron_size,
-    }, NF_COD_CHEVRON_RIGHT, paletteColor(if (chevron_hover) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE), chevron_size, rect);
-    appendLinkedChatHit(pane_id, chevron_rect, .toggle, workspace_id, parent_id, "", "");
+    const chevron_hover = !embedded and rectContains(chevron_rect, mouse_x, mouse_y);
+    if (!embedded) {
+        if (chevron_hover) queueRounded(state, chevron_rect, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 18)), theme.scaledUi(6.0));
+        const chevron_size = theme.scaledUi(12.0);
+        queueIconText(state, .{
+            .x = chevron_rect.x + (chevron_rect.w - chevron_size) * 0.5,
+            .y = chevron_rect.y + (chevron_rect.h - chevron_size) * 0.5,
+            .w = chevron_size,
+            .h = chevron_size,
+        }, NF_COD_CHEVRON_RIGHT, paletteColor(if (chevron_hover) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE), chevron_size, rect);
+        appendLinkedChatHit(pane_id, chevron_rect, .toggle, workspace_id, parent_id, "", "");
+    }
 
-    var controls_left = chevron_rect.x;
+    var controls_left = if (embedded) header.x + header.w - pad + theme.scaledUi(4.0) + control_gap else chevron_rect.x;
     if (parent.hasFinished()) {
         const label = "Clear done";
         const label_font = theme.scaledUi(11.0);
         const pill_w = chromeLabelWidth(label_font, label) + theme.scaledUi(16.0);
         const pill = snapRect(.{
-            .x = chevron_rect.x - control_gap - pill_w,
+            .x = controls_left - control_gap - pill_w,
             .y = header.y + (header_h - control) * 0.5,
             .w = pill_w,
             .h = control,
@@ -1647,11 +1711,11 @@ pub fn handleWorkspaceHeaderPaletteMouseButton(state: *app_state.AppState, x: f3
         state.noteInteraction();
         return true;
     }
-    if (rectContains(control_hit.browser_rect, x, y)) {
+    if (control_hit.browser_rect.w > 0.0 and rectContains(control_hit.browser_rect, x, y)) {
         state.workspace_header_open_menu_open = false;
         state.workspace_header_open_menu_pane_id = null;
         state.blurPaletteComposer();
-        state.toggleBrowser();
+        state.toggleSidePanel();
         state.noteInteraction();
         return true;
     }
@@ -2936,9 +3000,12 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
     const open_tex = state.defaultOpenIconTexture();
     const open_main_w = theme.scaledUi(WORKSPACE_HEADER_ICON_CONTROL_CSS);
     const chevron_w = theme.scaledUi(WORKSPACE_HEADER_CHEVRON_CONTROL_CSS);
-    const browser_w = theme.scaledUi(WORKSPACE_HEADER_ICON_CONTROL_CSS);
+    // The side panel toggle lives on the tab strip; while the strip is
+    // hidden it falls back to this slot (formerly the browser globe).
+    const side_panel_toggle_visible = !workspace_strip.isVisible(state);
+    const browser_w = if (side_panel_toggle_visible) theme.scaledUi(WORKSPACE_HEADER_ICON_CONTROL_CSS) else 0.0;
     const open_combo_w = open_main_w + chevron_w;
-    const actions_w = open_combo_w + button_gap + browser_w;
+    const actions_w = open_combo_w + (if (side_panel_toggle_visible) button_gap + browser_w else 0.0);
 
     const actions_right = rect.x + rect.w - right_reserve - button_gap;
     const actions_x = actions_right - actions_w;
@@ -3129,15 +3196,9 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
         .h = chevron_size,
     }, NF_COD_CHEVRON_DOWN, paletteColor(if (chevron_hover) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE), chevron_size, rect);
 
-    const globe_size = theme.scaledUi(16.0);
-    const browser_cy = browser_rect.y + browser_rect.h * 0.5;
-    globe_icon.queue(
-        state,
-        browser_rect.x + browser_rect.w * 0.5,
-        browser_cy,
-        globe_size,
-        paletteColor(if (browser_hover) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED),
-    );
+    if (side_panel_toggle_visible) {
+        sidebar_ui.queueSidePanelToggleGlyph(state, browser_rect, state.isSidePanelOpen(), browser_hover, rect);
+    }
 
     const pane_focused = if (pane_id) |id| state.isCurrentProjectWorkspacePaneFocused(id) else true;
     if (state.ctrl_shortcut_hints_visible and state.shift_shortcut_hints_visible and pane_focused) {

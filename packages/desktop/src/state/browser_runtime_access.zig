@@ -1,6 +1,7 @@
 //! Temporary access to a background browser without changing the presented controller.
 
 const std = @import("std");
+const clock = @import("browser_controller.zig");
 
 /// Owns the presented controller until the synchronous command has serialized its response.
 /// No pointers into either controller may escape this scope.
@@ -12,12 +13,19 @@ pub fn Scope(comptime Controller: type) type {
         const Self = @This();
         const Runtime = @FieldType(Controller, "runtime");
 
-        pub fn begin(state: anytype, project_index: usize) !Self {
-            if (project_index == state.project_controller.selected_index and
-                (state.browser_controller.runtime_project_index == null or state.browser_controller.runtime_project_index == project_index)) return .{};
+        /// `pane_id` names the browser pane the command targets; null means
+        /// whichever browser the workspace is already running.
+        pub fn begin(state: anytype, project_index: usize, pane_id: ?u32) !Self {
             const controller = &state.browser_controller;
+            const owns_target = if (controller.runtime_project_index) |runtime_project|
+                runtime_project == project_index and
+                    (pane_id == null or controller.runtime_pane_id == null or controller.runtime_pane_id.? == pane_id.?)
+            else
+                false;
+            if (project_index == state.project_controller.selected_index and
+                (owns_target or (controller.runtime_project_index == null and pane_id == null))) return .{};
             const host_window = controller.runtime.controller.host_window;
-            const borrowed_current = controller.runtime_project_index == project_index;
+            const borrowed_current = owns_target;
             // Reserve before moving ownership: restoration must never allocate or fail.
             if (!borrowed_current) try controller.retained_runtimes.ensureUnusedCapacity(state.allocator, 1);
             var temporary = try Controller.init(state.allocator);
@@ -32,6 +40,7 @@ pub fn Scope(comptime Controller: type) type {
             } else {
                 for (controller.retained_runtimes.items, 0..) |entry, index| {
                     if (entry.project_index != project_index) continue;
+                    if (pane_id != null and entry.pane_id != pane_id.?) continue;
                     temporary.runtime.deinit();
                     const retained = controller.retained_runtimes.orderedRemove(index);
                     temporary.runtime = retained.runtime;
@@ -40,6 +49,7 @@ pub fn Scope(comptime Controller: type) type {
                 }
             }
             temporary.runtime_project_index = project_index;
+            if (temporary.runtime_pane_id == null) temporary.runtime_pane_id = pane_id;
             // A lazy runtime inherits host configuration without attaching or showing a surface.
             temporary.runtime.controller.host_window = host_window;
             const saved = controller.*;
@@ -68,11 +78,12 @@ pub fn Scope(comptime Controller: type) type {
                 std.mem.swap(Runtime, &saved.runtime, &temporary.runtime);
                 saved.runtime_pane_id = temporary.runtime_pane_id;
                 saved.runtime_project_index = temporary.runtime_project_index;
-            } else if (temporary.runtime_project_index) |project_index| {
+            } else if (temporary.runtime_project_index != null and temporary.runtime_pane_id != null) {
                 saved.retained_runtimes.appendAssumeCapacity(.{
-                    .project_index = project_index,
-                    .pane_id = temporary.runtime_pane_id,
+                    .project_index = temporary.runtime_project_index.?,
+                    .pane_id = temporary.runtime_pane_id.?,
                     .runtime = temporary.runtime,
+                    .retained_at_ms = clock.unixTimestampMs(),
                 });
                 // Transfer ownership, leaving an empty controller safe to destroy.
                 temporary.runtime = Runtime.init(state.allocator) catch unreachable;
@@ -140,7 +151,7 @@ const TestState = struct {
     }
 
     fn command(self: *TestState, fail: bool) !void {
-        var access = try Scope(Owner.State).begin(self, 1);
+        var access = try Scope(Owner.State).begin(self, 1, null);
         defer access.end(self);
         try std.testing.expectEqual(@as(?u32, 20), self.browser_controller.runtime_pane_id);
         self.browser_controller.pane_min = .{ 0, 0 };
@@ -221,7 +232,7 @@ test "H1 newly navigated background backend hides before asynchronous opened is 
     var state = try TestState.init();
     defer state.deinit();
     {
-        var access = try Scope(TestState.Owner.State).begin(&state, 2);
+        var access = try Scope(TestState.Owner.State).begin(&state, 2, 30);
         defer access.end(&state);
         state.browser_controller.runtime.controller.backend = .{ .stub = try TestState.Stub.init(state.allocator) };
         try state.browser_controller.runtime.controller.navigate("https://z.example/");
@@ -242,7 +253,7 @@ test "H1 status access preserves binding results and backend visibility without 
     var state = try TestState.init();
     defer state.deinit();
     {
-        var access = try Scope(TestState.Owner.State).begin(&state, 1);
+        var access = try Scope(TestState.Owner.State).begin(&state, 1, null);
         defer access.end(&state);
         try std.testing.expectEqual(@as(?u32, 20), state.browser_controller.runtime_pane_id);
         try std.testing.expectEqualStrings("Y-before", state.browser_controller.runtime.last_eval_result.?);

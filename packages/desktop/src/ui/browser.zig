@@ -120,6 +120,7 @@ const BrowserOverflowAction = union(enum) {
     toggle_inspector,
     clear_history,
     import_cookies,
+    tab_placement,
     close_pane,
 };
 
@@ -177,6 +178,21 @@ pub fn renderDockAtWithReserve(state: *app_state.AppState, rect: palette.Rect, t
     renderAddressSuggestions(state);
     renderBrowserContextMenu(state);
     renderToolbarTooltip(state);
+}
+
+/// Stand-in for a browser pane while its page takes over the live runtime
+/// (or reloads after idle eviction). Ownership moves on the next poll.
+pub fn renderPendingPresentation(state: *app_state.AppState, rect: palette.Rect) void {
+    queuePaletteRect(state, rect, paletteColor(theme.background()));
+    const font_size = theme.scaledUi(13.0);
+    const label = "Loading browser\u{2026}";
+    const width = @min(rect.w, theme.scaledUi(220.0));
+    queuePaletteText(state, .{
+        .x = rect.x + (rect.w - width) * 0.5,
+        .y = rect.y + rect.h * 0.4,
+        .w = width,
+        .h = font_size * 1.4,
+    }, label, paletteColor(theme.COLOR_TEXT_MUTED), font_size, rect);
 }
 
 /// Returns the height reserved for the browser pane's toolbar chrome.
@@ -1263,7 +1279,7 @@ fn renderToolbarOverflowMenu(
         @as(usize, if (copy_visible) 0 else 1) +
         @as(usize, if (external_visible) 0 else 1) +
         @as(usize, if (inspector_visible) 0 else 1);
-    const action_rows: usize = 8 + hidden_action_rows;
+    const action_rows: usize = 9 + hidden_action_rows;
     const row_count = max_tab_rows + action_rows;
     const menu_h = pad * 2.0 + row_h * @as(f32, @floatFromInt(row_count));
     const min_x = palette_toolbar_rect.x + theme.scaledUi(4.0);
@@ -1296,11 +1312,16 @@ fn renderToolbarOverflowMenu(
     );
     y += row_h;
     const pane_id = state.currentProjectVisibleBrowserPaneId();
+    const docked = browserPaneIsDocked(state);
     const maximized = if (pane_id) |id| state.isCurrentProjectWorkspacePaneMaximized(id) else false;
-    renderToolbarOverflowRow(state, overflowRowRect(y, row_h, pad, menu_w), if (maximized) "Restore pane" else "Maximize pane", .maximize_pane, pane_id != null);
+    renderToolbarOverflowRow(state, overflowRowRect(y, row_h, pad, menu_w), if (maximized) "Restore pane" else "Maximize pane", .maximize_pane, pane_id != null and !docked);
     y += row_h;
     const detached = browserPaneIsDetached(state);
-    renderToolbarOverflowRow(state, overflowRowRect(y, row_h, pad, menu_w), if (detached) "Return pane to layout" else "Float pane", .toggle_detach, pane_id != null);
+    renderToolbarOverflowRow(state, overflowRowRect(y, row_h, pad, menu_w), if (detached) "Return pane to layout" else "Float pane", .toggle_detach, pane_id != null and !docked);
+    y += row_h;
+    // A tab's side-panel browser can become its own tab, and back.
+    const can_attach = if (pane_id) |id| !docked and state.canAttachBrowserToTab(id) else false;
+    renderToolbarOverflowRow(state, overflowRowRect(y, row_h, pad, menu_w), if (docked) "Move to own tab" else "Attach to tab", .tab_placement, docked or can_attach);
     y += row_h;
     renderToolbarOverflowRow(state, overflowRowRect(y, row_h, pad, menu_w), "Reload page", .reload, true);
     y += row_h;
@@ -1360,6 +1381,12 @@ fn overflowActionAtPoint(x: f32, y: f32) ?BrowserOverflowHit {
     return null;
 }
 
+fn browserPaneIsDocked(state: *app_state.AppState) bool {
+    const pane_id = state.currentProjectVisibleBrowserPaneId() orelse return false;
+    if (state.project_controller.projects.items.len == 0) return false;
+    return state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout.isDockedPane(pane_id);
+}
+
 fn browserPaneIsDetached(state: *app_state.AppState) bool {
     const pane_id = state.currentProjectVisibleBrowserPaneId() orelse return false;
     const quick = state.currentProjectQuickPane() orelse return false;
@@ -1386,6 +1413,9 @@ fn activateOverflowAction(state: *app_state.AppState, action: BrowserOverflowAct
         .toggle_inspector => if (state.canUseBrowserInspector()) state.toggleBrowserInspector(),
         .clear_history => browser_history_controller.clearBrowserHistory(state),
         .import_cookies => state.beginCookieImport(),
+        .tab_placement => if (state.currentProjectVisibleBrowserPaneId()) |pane_id| {
+            if (browserPaneIsDocked(state)) state.moveBrowserToOwnTab(pane_id) else state.attachBrowserToTab(pane_id);
+        },
         .close_pane => if (state.currentProjectVisibleBrowserPaneId()) |pane_id| {
             _ = state.closeCurrentProjectWorkspacePane(pane_id);
         },

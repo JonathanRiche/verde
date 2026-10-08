@@ -4639,13 +4639,15 @@ fn mcpToolsList(allocator: std.mem.Allocator, out: output.Output, id_value: std.
     try writeMcpTypedTool(&s, "browser_status", "Inspect this workspace's embedded browser state, URL, and last action result.", &.{
         .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, or path; defaults to the agent's workspace." },
     });
-    try writeMcpTypedTool(&s, "open_browser", "Open this workspace's embedded browser at a URL. Defaults to the workspace containing the agent.", &.{
+    try writeMcpTypedTool(&s, "open_browser", "Open this workspace's embedded browser at a URL in the side panel of your tab, without taking the user's focus. Defaults to the workspace containing the agent; pass thread_id to target your own tab.", &.{
         .{ .name = "url", .type_name = "string", .description = "Optional URL to open." },
         .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, or path; defaults to the agent's workspace." },
+        .{ .name = "thread_id", .type_name = "string", .description = "Your Verde local thread id; targets the browser in your tab's side panel instead of whichever browser was used last." },
     });
     try writeMcpTypedTool(&s, "open_browser_tab", "Add a background tab inside this workspace's existing browser pane. Preserves the active page and desktop focus; the URL loads when the user selects the tab. Use this to share another page without replacing the current one. Returns tab_index; browser_status lists tabs.", &.{
         .{ .name = "url", .type_name = "string", .description = "URL for the new background browser tab.", .required = true },
         .{ .name = "workspace", .type_name = "string", .description = "Workspace containing the existing browser pane." },
+        .{ .name = "thread_id", .type_name = "string", .description = "Your Verde local thread id; targets the browser in your tab's side panel instead of whichever browser was used last." },
     });
     try writeMcpTypedTool(&s, "navigate_browser", "Navigate this workspace's open embedded browser to a URL.", &.{
         .{ .name = "url", .type_name = "string", .description = "URL to navigate to.", .required = true },
@@ -5527,6 +5529,7 @@ fn mcpToolsCall(
             const browser_response = try sendLiveRequestAlloc(allocator, io, "browser.open", .{
                 .workspace = workspace,
                 .url = target_url,
+                .thread_id = mcpArgString(arguments, "thread_id"),
             }, 1);
             errdefer allocator.free(browser_response);
             if (target_url) |target| {
@@ -5539,7 +5542,11 @@ fn mcpToolsCall(
         }
         if (std.mem.eql(u8, tool_name, "open_browser_tab")) {
             const url = mcpArgString(arguments, "url") orelse return try mcpError(allocator, out, id_value, -32602, "open_browser_tab requires url");
-            break :blk sendLiveRequestAlloc(allocator, io, "browser.tabOpen", .{ .workspace = workspace, .url = url }, 1);
+            break :blk sendLiveRequestAlloc(allocator, io, "browser.tabOpen", .{
+                .workspace = workspace,
+                .url = url,
+                .thread_id = mcpArgString(arguments, "thread_id"),
+            }, 1);
         }
         if (std.mem.eql(u8, tool_name, "navigate_browser")) {
             const url = mcpArgString(arguments, "url") orelse return try mcpError(allocator, out, id_value, -32602, "navigate_browser requires url");

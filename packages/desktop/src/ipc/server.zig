@@ -1450,7 +1450,8 @@ fn browserCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value
         if (index != state.project_controller.selected_index and !backgroundBrowserCommandAllowed(command)) {
             return try errorResponseAlloc(allocator, id_value, "rejected", "browser presentation commands require the selected workspace");
         }
-        var access = try browser_runtime_access.Scope(@TypeOf(state.browser_controller)).begin(state, index);
+        const target_pane_id = try browserCommandTargetPane(state, index, params, std.mem.eql(u8, command, "open"));
+        var access = try browser_runtime_access.Scope(@TypeOf(state.browser_controller)).begin(state, index, target_pane_id);
         defer access.end(state);
         defer if (!std.mem.eql(u8, command, "status")) browser_state_controller.finishBackgroundBrowserAccess(state);
         const notice = state.sidebar_notice_storage;
@@ -1459,9 +1460,50 @@ fn browserCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value
             state.sidebar_notice_storage = notice;
             state.sidebar_notice_set_at_ms = notice_time;
         };
-        return try browserCommandResponseInScope(allocator, id_value, state, params, command);
+        return try browserCommandResponseInScope(allocator, id_value, state, params, command, target_pane_id);
     }
-    return try browserCommandResponseInScope(allocator, id_value, state, params, command);
+    return try browserCommandResponseInScope(allocator, id_value, state, params, command, null);
+}
+
+/// Browser pane a command addresses. An explicit `pane_id` wins; `thread_id`
+/// picks the side-panel browser of the tab showing that chat, created for
+/// `open` so agents get a browser in their own tabspace. Otherwise the
+/// workspace's live browser, then its most recently used hidden one.
+fn browserCommandTargetPane(state: *app_state.AppState, project_index: usize, params: std.json.Value, create: bool) !?u32 {
+    const project = &state.project_controller.projects.items[project_index];
+    const layout = &project.workspace_layout;
+    if (u32Param(params, "pane_id")) |pane_id| {
+        if (layout.paneById(pane_id)) |pane| {
+            if (pane.ref == .browser) return pane_id;
+        }
+    }
+    if (stringParam(params, "thread_id")) |thread_id| thread: {
+        const thread_index = for (project.threads.items, 0..) |*thread, index| {
+            if (std.mem.eql(u8, thread.local_thread_id, thread_id)) break index;
+        } else break :thread;
+        const chat_pane_id = layout.visibleChatPaneIdForThread(thread_index) orelse break :thread;
+        const tab_id = layout.scrollGroupIdForPane(chat_pane_id) orelse break :thread;
+        if (layout.dockedBrowserPaneId(tab_id)) |pane_id| return pane_id;
+        if (!create) break :thread;
+        const pane_id = try layout.ensureDockedBrowserPane(state.allocator, tab_id);
+        state.markDirty();
+        return pane_id;
+    }
+    const controller = &state.browser_controller;
+    if (controller.runtime_project_index == project_index) {
+        if (controller.runtime_pane_id) |pane_id| {
+            if (state.browserPaneRefMutable(project_index, pane_id) != null) return pane_id;
+        }
+    }
+    var newest: ?u32 = null;
+    var newest_at: i64 = std.math.minInt(i64);
+    for (controller.retained_runtimes.items) |entry| {
+        if (entry.project_index != project_index or entry.retained_at_ms < newest_at) continue;
+        if (state.browserPaneRefMutable(project_index, entry.pane_id) == null) continue;
+        newest = entry.pane_id;
+        newest_at = entry.retained_at_ms;
+    }
+    return newest;
 }
 
 fn backgroundBrowserCommandAllowed(command: []const u8) bool {
@@ -1473,7 +1515,7 @@ fn backgroundBrowserCommandAllowed(command: []const u8) bool {
     return false;
 }
 
-fn browserCommandResponseInScope(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value, command: []const u8) ![]u8 {
+fn browserCommandResponseInScope(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value, command: []const u8, target_pane_id: ?u32) ![]u8 {
     if (std.mem.eql(u8, command, "status")) {
         if (browserCommandHasProjectRef(params)) {
             const project_index = browserCommandProjectIndex(state, params) orelse
@@ -1494,7 +1536,7 @@ fn browserCommandResponseInScope(allocator: std.mem.Allocator, id_value: std.jso
     if (std.mem.eql(u8, command, "tabOpen")) {
         const project_index = browserCommandProjectIndex(state, params) orelse
             return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
-        const pane_id = (if (state.browser_controller.runtime_project_index == project_index) state.browser_controller.runtime_pane_id else null) orelse state.browserPaneIdInWorkspace(project_index) orelse
+        const pane_id = target_pane_id orelse state.browserPaneIdInWorkspace(project_index) orelse
             return try errorResponseAlloc(allocator, id_value, "rejected", "open a browser pane with open_browser before adding tabs");
         const url = stringParam(params, "url") orelse
             return try errorResponseAlloc(allocator, id_value, "invalid_request", "browser.tabOpen requires url");
@@ -1523,7 +1565,7 @@ fn browserCommandResponseInScope(allocator: std.mem.Allocator, id_value: std.jso
             return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
         // Automation-driven loads stay out of the address-bar history.
         if (stringParam(params, "url") != null) browser_history_controller.beginSuppressedBrowserNavigation(state);
-        const result = state.openBrowserInWorkspace(project_index, stringParam(params, "url")) catch |err| switch (err) {
+        const result = state.openBrowserPaneInWorkspace(project_index, stringParam(params, "url"), target_pane_id) catch |err| switch (err) {
             error.WorkspaceNotFound => return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found"),
             error.BrowserDisabled => return try errorResponseAlloc(allocator, id_value, "unsupported", "browser runtime is disabled"),
             error.EmptyBrowserUrl => return try errorResponseAlloc(allocator, id_value, "invalid_request", "browser.open requires a non-empty url"),

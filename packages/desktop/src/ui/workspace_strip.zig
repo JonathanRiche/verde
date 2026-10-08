@@ -13,6 +13,7 @@ const theme = @import("theme.zig");
 const text_measure = @import("text_measure.zig");
 const runtime = @import("runtime.zig");
 const sidebar = @import("sidebar.zig");
+const chat_panel = @import("chat_panel.zig");
 
 /// Strip height in unscaled UI units: one compact tab row, matching the
 /// sidebar header row so the pane region loses the least height possible.
@@ -52,7 +53,8 @@ const LABEL_BUFFER_LEN: usize = 96;
 
 /// `sidebar_toggle` is the leading show-sidebar button drawn while the rail
 /// is hidden (the old collapsed rail carried it; the hidden rail cannot).
-pub const HitKind = enum { tab, add_tab, sidebar_toggle };
+/// `side_panel_toggle` is the trailing show/hide for the tab's right panel.
+pub const HitKind = enum { tab, add_tab, sidebar_toggle, side_panel_toggle };
 
 const StripHit = struct {
     rect: palette.Rect,
@@ -128,7 +130,9 @@ pub fn tabRect(strip: palette.Rect, x: f32, w: f32) palette.Rect {
 pub fn plusTabRect(strip: palette.Rect, after_x: f32) palette.Rect {
     const w = theme.scaledUi(PLUS_TAB_WIDTH_UI);
     const pad = theme.scaledUi(STRIP_PAD_X_UI);
-    const x = @min(after_x, strip.x + strip.w - pad - w);
+    // The side panel toggle keeps the last slot at the right edge.
+    const toggle_slot = w + theme.scaledUi(TAB_GAP_UI);
+    const x = @min(after_x, strip.x + strip.w - pad - toggle_slot - w);
     return tabRect(strip, @max(x, strip.x + pad), w);
 }
 
@@ -164,8 +168,10 @@ pub fn render(state: *runtime.AppState, strip: palette.Rect) void {
     const pad_x = theme.scaledUi(TAB_PAD_X_UI);
     const plus_w = theme.scaledUi(PLUS_TAB_WIDTH_UI);
     const strip_pad = theme.scaledUi(STRIP_PAD_X_UI);
-    // Tabs may not run under the "+" tab's reserved right-edge slot.
-    const tabs_right = strip.x + strip.w - strip_pad - plus_w - gap;
+    // The side panel toggle owns the right edge; tabs may not run under it
+    // or the "+" tab's reserved slot.
+    const toggle_slot_w = plus_w + gap;
+    const tabs_right = strip.x + strip.w - strip_pad - toggle_slot_w - plus_w - gap;
     // Holding Ctrl reveals the Ctrl+N ordinal of each tab, mirroring the
     // sidebar pane rows; the badge takes a slot at the tab's right edge.
     const key_tip_w = theme.scaledUi(KEY_TIP_SIZE_UI) + theme.scaledUi(KEY_TIP_INSET_X_UI);
@@ -235,6 +241,29 @@ pub fn render(state: *runtime.AppState, strip: palette.Rect) void {
     const plus_color = if (plus_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED;
     queueCenteredText(state, plus_rect, "+", plus_w_text, paletteColor(plus_color), font_size, strip);
     addHit(plus_rect, .add_tab, project_index, 0);
+    renderSidePanelToggle(state, strip, tabRect(strip, strip.x + strip.w - strip_pad - plus_w, plus_w), project_index);
+}
+
+fn renderSidePanelToggle(state: *runtime.AppState, strip: palette.Rect, rect: palette.Rect, project_index: usize) void {
+    const hovered = hovered_hit == strip_hit_count;
+    if (hovered) queueRoundedRectClipped(state, rect, paletteColor(theme.wash(theme.COLOR_GREEN, 56)), theme.scaledUi(TAB_RADIUS_UI), strip);
+    const open = state.isSidePanelOpen();
+    sidebar.queueSidePanelToggleGlyph(state, rect, open, hovered, strip);
+    if (!open) {
+        if (state.sidePanelChatPaneId()) |pane_id| {
+            // Linked agents still working while the panel is hidden.
+            if (chat_panel.linkedChatsActiveForPane(state, pane_id)) {
+                const dot = theme.scaledUi(PIP_SIZE_UI);
+                queueRoundedRectClipped(state, .{
+                    .x = rect.x + rect.w - dot - theme.scaledUi(2.0),
+                    .y = rect.y + theme.scaledUi(3.0),
+                    .w = dot,
+                    .h = dot,
+                }, paletteColor(theme.COLOR_GREEN), dot * 0.5, strip);
+            }
+        }
+    }
+    addHit(rect, .side_panel_toggle, project_index, 0);
 }
 
 /// One tab body: rectangular background with a hairline edge so adjacent
@@ -345,6 +374,7 @@ pub fn activateHit(state: *runtime.AppState, hit: StripHit) void {
         .tab => state.focusWorkspaceOpenPaneFromSidebar(hit.project_index, hit.pane_id),
         .add_tab => state.addWorkspaceTab(hit.project_index, null),
         .sidebar_toggle => state.setSidebarHidden(false),
+        .side_panel_toggle => state.toggleSidePanel(),
     }
 }
 
@@ -546,10 +576,12 @@ test "workspace strip plus tab trails the last tab and stays inside the strip" {
     try std.testing.expectEqual(PLUS_TAB_WIDTH_UI, trailing.w);
     try std.testing.expectEqual(STRIP_HEIGHT_UI - TAB_INSET_Y_UI * 2.0, trailing.h);
 
-    // Overflow pins the "+" to the right edge instead of pushing it off-screen.
+    // Overflow pins the "+" left of the side panel toggle instead of pushing
+    // it off-screen.
     const pinned = plusTabRect(strip, 5000.0);
-    try std.testing.expectEqual(strip.x + strip.w - STRIP_PAD_X_UI - PLUS_TAB_WIDTH_UI, pinned.x);
-    try std.testing.expect(pinned.x + pinned.w <= strip.x + strip.w - STRIP_PAD_X_UI);
+    const toggle_slot = PLUS_TAB_WIDTH_UI + TAB_GAP_UI;
+    try std.testing.expectEqual(strip.x + strip.w - STRIP_PAD_X_UI - toggle_slot - PLUS_TAB_WIDTH_UI, pinned.x);
+    try std.testing.expect(pinned.x + pinned.w <= strip.x + strip.w - STRIP_PAD_X_UI - toggle_slot);
     // Vertically centered: equal space above and below the text line box.
     const line_h = LABEL_FONT_UI * LINE_HEIGHT_FACTOR;
     try std.testing.expect(trailing.h >= line_h);

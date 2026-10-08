@@ -1734,6 +1734,19 @@ pub fn queueSidebarToggleGlyph(state: *runtime.AppState, rect: palette.Rect, exp
     }, glyph, icon_font, paletteColor(fg), clip);
 }
 
+/// Mirror of `queueSidebarToggleGlyph` for the right side panel toggle.
+pub fn queueSidePanelToggleGlyph(state: *runtime.AppState, rect: palette.Rect, open: bool, hovered: bool, clip: ?palette.Rect) void {
+    const fg = if (hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED;
+    const icon_font = @min(theme.scaledUi(17.0), rect.h);
+    const glyph = if (open) NF_COD_LAYOUT_SIDEBAR_RIGHT else NF_COD_LAYOUT_SIDEBAR_RIGHT_OFF;
+    queuePaletteIcon(state, .{
+        .x = rect.x + (rect.w - icon_font) * 0.5,
+        .y = rect.y + (rect.h - icon_font) * 0.5,
+        .w = icon_font,
+        .h = icon_font,
+    }, glyph, icon_font, paletteColor(fg), clip);
+}
+
 /// Renders add/edit actions with the same themed geometry as the sidebar toggle.
 fn renderPaletteSidebarActionIcon(state: *runtime.AppState, rect: palette.Rect, glyph: []const u8, hover_override: ?bool, clip: ?palette.Rect) void {
     const hovered = hover_override orelse (state.transcript_controller.palette_mouse_in_workspace and rectContainsPoint(rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y));
@@ -2424,6 +2437,8 @@ const NF_FA_WINDOW_RESTORE = "\u{F2D2}";
 // while the rail is expanded, hollow "off" variant while collapsed.
 const NF_COD_LAYOUT_SIDEBAR_LEFT = "\u{EBF3}";
 const NF_COD_LAYOUT_SIDEBAR_LEFT_OFF = "\u{EC02}";
+const NF_COD_LAYOUT_SIDEBAR_RIGHT = "\u{EBF4}";
+const NF_COD_LAYOUT_SIDEBAR_RIGHT_OFF = "\u{EC00}";
 
 /// Renders a centered codicon glyph through the icon font. Replaces the
 /// hand-drawn shapes / PNGs we used before.

@@ -218,7 +218,8 @@ pub fn currentProjectHasVisibleWorkspaceTerminalPane(self: anytype) bool {
 
 pub fn currentProjectVisibleBrowserPaneId(self: anytype) ?WorkspacePaneId {
     if (self.project_controller.projects.items.len == 0) return null;
-    return self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout.visibleBrowserPaneId();
+    // The pane whose page is presented, else the workspace's preferred one.
+    return self.browserPaneIdInWorkspace(self.project_controller.selected_index);
 }
 
 pub fn threadIsOpenInTui(self: anytype, project_index: usize, thread_index: usize) bool {
@@ -1077,6 +1078,12 @@ fn focusWorkspacePaneWithCompletionPolicy(
     if (project_index >= self.project_controller.projects.items.len) return false;
     var layout = &self.project_controller.projects.items[project_index].workspace_layout;
     if (layout.paneById(pane_id) == null) return false;
+    // Side-panel browsers take keyboard focus without becoming the focused
+    // tiled pane: the panel follows the focused tab.
+    if (layout.isDockedPane(pane_id)) {
+        self.focusBrowserPaneInWorkspace(project_index, pane_id);
+        return true;
+    }
     const pane_focus_changed = layout.focused_pane_id != pane_id;
     const scroll_group_focus_changed = layout.rememberScrollGroupFocusedPane(pane_id);
     const pane = layout.paneById(pane_id).?;

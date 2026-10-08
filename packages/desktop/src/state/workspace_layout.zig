@@ -59,7 +59,27 @@ pub const WorkspacePane = struct {
     /// dragging one pane does not force every other pane to the same width.
     scroll_extent_css: ?f32 = null,
     scroll_extent_ratio: ?f32 = null,
+    /// Browser panes docked in a tab's side panel name that tab here. Docked
+    /// panes never join `root`, so they are not tabs, tiles, or focus targets.
+    docked_tab_id: ?WorkspacePaneId = null,
 };
+
+/// Content shown by a tab's right-hand side panel.
+pub const SidePanelView = enum {
+    browser,
+    agents,
+};
+
+/// Per-tab side panel state. Absent entries mean closed on the browser view.
+pub const TabSidePanel = struct {
+    tab_id: WorkspacePaneId,
+    open: bool = false,
+    view: SidePanelView = .browser,
+};
+
+pub const DEFAULT_SIDE_PANEL_RATIO: f32 = 0.42;
+pub const MIN_SIDE_PANEL_RATIO: f32 = 0.2;
+pub const MAX_SIDE_PANEL_RATIO: f32 = 0.75;
 
 pub const WorkspacePanePlacement = struct {
     pane_id: WorkspacePaneId,
@@ -168,6 +188,10 @@ pub const WorkspaceLayout = struct {
     /// for the whole strip. New drags write `WorkspacePane.scroll_extent_*`.
     scroll_pane_extent_override: ?f32 = null,
     scroll_pane_extent_ratio_override: ?f32 = null,
+    /// Right-hand side panel state for tabs that have opened it.
+    side_panels: std.ArrayList(TabSidePanel) = .empty,
+    /// Share of the workspace width the side panel takes; shared by all tabs.
+    side_panel_ratio: f32 = DEFAULT_SIDE_PANEL_RATIO,
 
     pub fn initDefaultChat(allocator: std.mem.Allocator) !WorkspaceLayout {
         var layout: WorkspaceLayout = .{};
@@ -187,6 +211,7 @@ pub const WorkspaceLayout = struct {
         if (self.root) |root| destroyNode(allocator, root);
         for (self.panes.items) |*pane| deinitWorkspacePaneRef(&pane.ref, allocator);
         self.panes.deinit(allocator);
+        self.side_panels.deinit(allocator);
         self.* = .{};
     }
 
@@ -227,6 +252,7 @@ pub const WorkspaceLayout = struct {
         }
         for (self.panes.items) |pane| {
             if (self.rootContainsPane(pane.id)) continue;
+            if (pane.docked_tab_id != null) continue;
             if (self.quick_pane) |quick| {
                 if (quick.detached and quick.pane_id == pane.id) continue;
             }
@@ -254,6 +280,14 @@ pub const WorkspaceLayout = struct {
                 changed = true;
             }
         }
+        // A docked browser outlives nothing: its tab owns it.
+        while (self.orphanDockedPaneId()) |orphan_id| {
+            const index = self.paneIndexById(orphan_id) orelse break;
+            var removed = self.panes.orderedRemove(index);
+            deinitWorkspacePaneRef(&removed.ref, allocator);
+            changed = true;
+        }
+        if (self.pruneSidePanels()) changed = true;
         return changed;
     }
 
@@ -845,6 +879,7 @@ pub const WorkspaceLayout = struct {
 
     pub fn ensureBrowserPane(self: *WorkspaceLayout, allocator: std.mem.Allocator) !WorkspacePaneId {
         for (self.panes.items) |*pane| {
+            if (pane.docked_tab_id != null) continue;
             switch (pane.ref) {
                 .browser => {
                     self.focused_pane_id = pane.id;
@@ -866,6 +901,155 @@ pub const WorkspaceLayout = struct {
         self.focused_pane_id = pane_id;
         try self.ensurePaneInRootSplit(allocator, pane_id, .vertical, 0.58);
         return pane_id;
+    }
+
+    /// Whether `pane_id` lives in a tab's side panel rather than the tiled tree.
+    pub fn isDockedPane(self: *const WorkspaceLayout, pane_id: WorkspacePaneId) bool {
+        const pane = self.paneById(pane_id) orelse return false;
+        return pane.docked_tab_id != null;
+    }
+
+    /// Side-panel browser owned by `tab_id`, if the tab has one.
+    pub fn dockedBrowserPaneId(self: *const WorkspaceLayout, tab_id: WorkspacePaneId) ?WorkspacePaneId {
+        for (self.panes.items) |pane| {
+            if (pane.docked_tab_id == tab_id and pane.ref == .browser) return pane.id;
+        }
+        return null;
+    }
+
+    /// Whether any rooted pane still belongs to `tab_id`.
+    pub fn tabExists(self: *const WorkspaceLayout, tab_id: WorkspacePaneId) bool {
+        for (self.panes.items) |pane| {
+            if (pane.docked_tab_id != null) continue;
+            if ((pane.scroll_group_id orelse pane.id) != tab_id) continue;
+            if (self.rootContainsPane(pane.id)) return true;
+        }
+        return false;
+    }
+
+    /// Tab holding the focused tiled pane.
+    pub fn focusedTabId(self: *const WorkspaceLayout) ?WorkspacePaneId {
+        const focused = self.focused_pane_id orelse return null;
+        if (!self.rootContainsPane(focused)) return null;
+        return self.scrollGroupIdForPane(focused);
+    }
+
+    /// Returns the tab's side-panel browser, creating an empty one when the
+    /// tab has none. Focus, zoom, scroll, and the tiled tree are untouched.
+    pub fn ensureDockedBrowserPane(self: *WorkspaceLayout, allocator: std.mem.Allocator, tab_id: WorkspacePaneId) !WorkspacePaneId {
+        if (self.dockedBrowserPaneId(tab_id)) |pane_id| return pane_id;
+        const pane_id = self.next_pane_id;
+        var ref: BrowserPaneRef = .{};
+        errdefer ref.deinit(allocator);
+        _ = try ref.ensureTab(allocator);
+        try self.panes.append(allocator, .{
+            .id = pane_id,
+            .ref = .{ .browser = ref },
+            .docked_tab_id = tab_id,
+        });
+        self.next_pane_id += 1;
+        return pane_id;
+    }
+
+    /// Moves a docked browser into the tiled tree as its own tab, ordered
+    /// right after the tab it was docked in. Focus is left to the caller.
+    pub fn undockBrowserPane(self: *WorkspaceLayout, allocator: std.mem.Allocator, pane_id: WorkspacePaneId) !bool {
+        const index = self.paneIndexById(pane_id) orelse return false;
+        const tab_id = self.panes.items[index].docked_tab_id orelse return false;
+        try self.ensurePaneInRootSplit(allocator, pane_id, .vertical, 0.58);
+        const pane = &self.panes.items[index];
+        pane.docked_tab_id = null;
+        pane.scroll_group_id = null;
+        pane.last_focused_in_scroll_group = false;
+        var insert_at: usize = self.panes.items.len;
+        for (self.panes.items, 0..) |other, other_index| {
+            if (other.id == pane_id or other.docked_tab_id != null) continue;
+            if ((other.scroll_group_id orelse other.id) == tab_id) insert_at = other_index + 1;
+        }
+        _ = self.movePaneBefore(pane_id, insert_at);
+        if (self.sidePanelMutableIfPresent(tab_id)) |panel| {
+            if (panel.view == .browser) panel.open = false;
+        }
+        return true;
+    }
+
+    /// Moves a tiled browser into `tab_id`'s side panel. Fails when the tab
+    /// already has a docked browser or the pane is the workspace's last tile.
+    pub fn dockBrowserPane(self: *WorkspaceLayout, allocator: std.mem.Allocator, pane_id: WorkspacePaneId, tab_id: WorkspacePaneId) !bool {
+        const index = self.paneIndexById(pane_id) orelse return false;
+        if (self.panes.items[index].ref != .browser) return false;
+        if (self.panes.items[index].docked_tab_id != null) return false;
+        if (self.dockedBrowserPaneId(tab_id) != null) return false;
+        if ((self.panes.items[index].scroll_group_id orelse pane_id) == tab_id) return false;
+        if (!self.tabExists(tab_id)) return false;
+        if (self.visiblePaneCount() <= 1) return false;
+        const panel = try self.sidePanelMutable(allocator, tab_id);
+        const next_focus = if (self.focused_pane_id == pane_id) self.preferredFocusAfterClose(pane_id) else self.focused_pane_id;
+        if (self.root) |root_node| self.root = removePaneFromTree(allocator, root_node, pane_id);
+        const pane = &self.panes.items[index];
+        pane.docked_tab_id = tab_id;
+        pane.scroll_group_id = null;
+        pane.last_focused_in_scroll_group = false;
+        pane.scroll_extent_css = null;
+        pane.scroll_extent_ratio = null;
+        if (self.maximized_pane_id == pane_id) self.maximized_pane_id = null;
+        self.focused_pane_id = next_focus orelse self.firstVisiblePaneId();
+        if (self.scroll_revealed_pane_id == pane_id) self.scroll_revealed_pane_id = null;
+        panel.open = true;
+        panel.view = .browser;
+        return true;
+    }
+
+    /// First docked pane whose owning tab no longer exists.
+    pub fn orphanDockedPaneId(self: *const WorkspaceLayout) ?WorkspacePaneId {
+        for (self.panes.items) |pane| {
+            const tab_id = pane.docked_tab_id orelse continue;
+            if (!self.tabExists(tab_id)) return pane.id;
+        }
+        return null;
+    }
+
+    /// Side panel state for `tab_id`; closed on the browser view by default.
+    pub fn sidePanel(self: *const WorkspaceLayout, tab_id: WorkspacePaneId) TabSidePanel {
+        for (self.side_panels.items) |panel| {
+            if (panel.tab_id == tab_id) return panel;
+        }
+        return .{ .tab_id = tab_id };
+    }
+
+    pub fn sidePanelMutableIfPresent(self: *WorkspaceLayout, tab_id: WorkspacePaneId) ?*TabSidePanel {
+        for (self.side_panels.items) |*panel| {
+            if (panel.tab_id == tab_id) return panel;
+        }
+        return null;
+    }
+
+    pub fn sidePanelMutable(self: *WorkspaceLayout, allocator: std.mem.Allocator, tab_id: WorkspacePaneId) !*TabSidePanel {
+        if (self.sidePanelMutableIfPresent(tab_id)) |panel| return panel;
+        try self.side_panels.append(allocator, .{ .tab_id = tab_id });
+        return &self.side_panels.items[self.side_panels.items.len - 1];
+    }
+
+    /// Drops side-panel state for tabs that no longer exist.
+    pub fn pruneSidePanels(self: *WorkspaceLayout) bool {
+        var changed = false;
+        var index: usize = 0;
+        while (index < self.side_panels.items.len) {
+            if (self.tabExists(self.side_panels.items[index].tab_id)) {
+                index += 1;
+                continue;
+            }
+            _ = self.side_panels.orderedRemove(index);
+            changed = true;
+        }
+        return changed;
+    }
+
+    pub fn setSidePanelRatio(self: *WorkspaceLayout, ratio: f32) bool {
+        const clamped = std.math.clamp(ratio, MIN_SIDE_PANEL_RATIO, MAX_SIDE_PANEL_RATIO);
+        if (clamped == self.side_panel_ratio) return false;
+        self.side_panel_ratio = clamped;
+        return true;
     }
 
     pub fn createTerminalPane(self: *WorkspaceLayout, allocator: std.mem.Allocator, dock_id: u32) !WorkspacePaneId {
@@ -969,12 +1153,20 @@ pub const WorkspaceLayout = struct {
     /// Previous (left) or next (right) entry in persisted sidebar order.
     fn sidebarNeighborPaneId(self: *const WorkspaceLayout, pane_id: WorkspacePaneId, previous: bool) ?WorkspacePaneId {
         const pane_index = self.paneIndexById(pane_id) orelse return null;
+        // Docked side-panel browsers are never focus targets.
         if (previous) {
-            if (pane_index == 0) return null;
-            return self.panes.items[pane_index - 1].id;
+            var index = pane_index;
+            while (index > 0) {
+                index -= 1;
+                if (self.panes.items[index].docked_tab_id == null) return self.panes.items[index].id;
+            }
+            return null;
         }
-        if (pane_index + 1 >= self.panes.items.len) return null;
-        return self.panes.items[pane_index + 1].id;
+        var index = pane_index + 1;
+        while (index < self.panes.items.len) : (index += 1) {
+            if (self.panes.items[index].docked_tab_id == null) return self.panes.items[index].id;
+        }
+        return null;
     }
 
     pub fn closePane(self: *WorkspaceLayout, allocator: std.mem.Allocator, pane_id: WorkspacePaneId) ?WorkspacePaneRef {
@@ -1334,6 +1526,10 @@ pub const WorkspaceLayout = struct {
                 try stringify.objectField("scroll_group_focus");
                 try stringify.write(true);
             }
+            if (pane.docked_tab_id) |tab_id| {
+                try stringify.objectField("docked_tab");
+                try stringify.write(tab_id);
+            }
             if (pane.scroll_extent_css) |extent| {
                 try stringify.objectField("scroll_extent");
                 try stringify.write(extent);
@@ -1345,6 +1541,26 @@ pub const WorkspaceLayout = struct {
             try stringify.endObject();
         }
         try stringify.endArray();
+
+        if (self.side_panels.items.len > 0) {
+            try stringify.objectField("side_panels");
+            try stringify.beginArray();
+            for (self.side_panels.items) |panel| {
+                try stringify.beginObject();
+                try stringify.objectField("tab");
+                try stringify.write(panel.tab_id);
+                try stringify.objectField("open");
+                try stringify.write(panel.open);
+                try stringify.objectField("view");
+                try stringify.write(@tagName(panel.view));
+                try stringify.endObject();
+            }
+            try stringify.endArray();
+        }
+        if (self.side_panel_ratio != DEFAULT_SIDE_PANEL_RATIO) {
+            try stringify.objectField("side_panel_ratio");
+            try stringify.write(self.side_panel_ratio);
+        }
 
         try stringify.objectField("root");
         if (self.root) |root_node| {
@@ -1495,10 +1711,32 @@ pub const WorkspaceLayout = struct {
                 }
                 pane.last_focused_in_scroll_group = jsonBool(pane_value.object.get("scroll_group_focus") orelse .null) orelse false;
                 applyPersistedPaneScrollExtent(pane, pane_value);
+                if (pane.ref == .browser) {
+                    if (jsonInt(pane_value.object.get("docked_tab") orelse .null)) |tab_id| {
+                        if (tab_id > 0 and tab_id <= @as(i64, std.math.maxInt(WorkspacePaneId))) {
+                            pane.docked_tab_id = @intCast(tab_id);
+                            pane.scroll_group_id = null;
+                        }
+                    }
+                }
             }
             if (pane_id >= next_layout.next_pane_id) next_layout.next_pane_id = pane_id + 1;
         }
 
+        if (root_value.object.get("side_panels")) |panels_value| {
+            if (panels_value == .array) for (panels_value.array.items) |panel_value| {
+                if (panel_value != .object) continue;
+                const tab_id = jsonInt(panel_value.object.get("tab") orelse .null) orelse continue;
+                if (tab_id <= 0 or tab_id > @as(i64, std.math.maxInt(WorkspacePaneId))) continue;
+                const view_label = jsonString(panel_value.object.get("view") orelse .null) orelse "browser";
+                const panel = try next_layout.sidePanelMutable(allocator, @intCast(tab_id));
+                panel.open = jsonBool(panel_value.object.get("open") orelse .null) orelse false;
+                panel.view = std.meta.stringToEnum(SidePanelView, view_label) orelse .browser;
+            };
+        }
+        if (jsonFloat(root_value.object.get("side_panel_ratio") orelse .null)) |ratio| {
+            _ = next_layout.setSidePanelRatio(ratio);
+        }
         if (root_value.object.get("root")) |node_value| {
             next_layout.root = try parseWorkspaceNodeJson(allocator, node_value);
         }
@@ -1629,7 +1867,9 @@ pub const WorkspaceLayout = struct {
     pub fn pruneRootToVisiblePanes(allocator: std.mem.Allocator, layout: *const WorkspaceLayout, node: *WorkspaceNode) PruneRootResult {
         switch (node.*) {
             .leaf => |pane_id| {
-                if (layout.paneById(pane_id) != null) return .{ .node = node, .changed = false };
+                if (layout.paneById(pane_id)) |pane| {
+                    if (pane.docked_tab_id == null) return .{ .node = node, .changed = false };
+                }
                 allocator.destroy(node);
                 return .{ .node = null, .changed = true };
             },
@@ -2614,4 +2854,83 @@ test "focus that lands in a zoomed tabspace after a close takes its zoom" {
     deinitWorkspacePaneRef(&removed, allocator);
     try std.testing.expectEqual(@as(?WorkspacePaneId, fixture.a3), layout.focused_pane_id);
     try std.testing.expectEqual(@as(?WorkspacePaneId, fixture.a3), layout.maximized_pane_id);
+}
+
+test "docked browsers stay out of the tiled tree and follow their tab" {
+    const allocator = std.testing.allocator;
+    var layout = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+    const chat = layout.focused_pane_id.?;
+    const tab_id = layout.focusedTabId().?;
+
+    const docked = try layout.ensureDockedBrowserPane(allocator, tab_id);
+    try std.testing.expectEqual(docked, try layout.ensureDockedBrowserPane(allocator, tab_id));
+    try std.testing.expect(!layout.rootContainsPane(docked));
+    try std.testing.expect(layout.isDockedPane(docked));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, chat), layout.focused_pane_id);
+    try std.testing.expectEqual(@as(usize, 1), layout.visibleTabCount());
+    try std.testing.expect(!try layout.repairVisibleRoot(allocator));
+    try std.testing.expect(!layout.rootContainsPane(docked));
+
+    // Persistence keeps the docked owner and the panel state.
+    const panel = try layout.sidePanelMutable(allocator, tab_id);
+    panel.open = true;
+    panel.view = .agents;
+    _ = layout.setSidePanelRatio(0.5);
+    const json = try layout.persistedWorkspaceJson(allocator);
+    defer allocator.free(json);
+    var restored: WorkspaceLayout = .{};
+    defer restored.deinit(allocator);
+    try restored.applyPersistedWorkspaceJson(allocator, json);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, docked), restored.dockedBrowserPaneId(tab_id));
+    try std.testing.expect(!restored.rootContainsPane(docked));
+    try std.testing.expect(restored.sidePanel(tab_id).open);
+    try std.testing.expectEqual(SidePanelView.agents, restored.sidePanel(tab_id).view);
+    try std.testing.expectEqual(@as(f32, 0.5), restored.side_panel_ratio);
+}
+
+test "undocking a browser makes it its own tab and docking returns it" {
+    const allocator = std.testing.allocator;
+    var layout = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+    const chat = layout.focused_pane_id.?;
+    const tab_id = layout.focusedTabId().?;
+    const browser = try layout.ensureDockedBrowserPane(allocator, tab_id);
+    (try layout.sidePanelMutable(allocator, tab_id)).open = true;
+
+    try std.testing.expect(try layout.undockBrowserPane(allocator, browser));
+    try std.testing.expect(layout.rootContainsPane(browser));
+    try std.testing.expect(!layout.isDockedPane(browser));
+    try std.testing.expectEqual(@as(usize, 2), layout.visibleTabCount());
+    try std.testing.expect(!layout.sidePanel(tab_id).open);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, chat), layout.focused_pane_id);
+
+    layout.focused_pane_id = browser;
+    try std.testing.expect(try layout.dockBrowserPane(allocator, browser, tab_id));
+    try std.testing.expect(!layout.rootContainsPane(browser));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, browser), layout.dockedBrowserPaneId(tab_id));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, chat), layout.focused_pane_id);
+    try std.testing.expect(layout.sidePanel(tab_id).open);
+    try std.testing.expectEqual(@as(usize, 1), layout.visibleTabCount());
+}
+
+test "closing a tab orphans its docked browser and panel state" {
+    const allocator = std.testing.allocator;
+    var layout = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+    const first = layout.focused_pane_id.?;
+    const second = try layout.createChatPane(allocator, 1);
+    try layout.ensurePaneInRootSplit(allocator, second, .vertical, 0.5);
+    const second_tab = layout.scrollGroupIdForPane(second).?;
+    const docked = try layout.ensureDockedBrowserPane(allocator, second_tab);
+    (try layout.sidePanelMutable(allocator, second_tab)).open = true;
+    try std.testing.expectEqual(@as(?WorkspacePaneId, null), layout.orphanDockedPaneId());
+
+    var removed = layout.closePane(allocator, second).?;
+    deinitWorkspacePaneRef(&removed, allocator);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, docked), layout.orphanDockedPaneId());
+    try std.testing.expect(try layout.repairVisibleRoot(allocator));
+    try std.testing.expect(layout.paneById(docked) == null);
+    try std.testing.expectEqual(@as(usize, 0), layout.side_panels.items.len);
+    try std.testing.expect(layout.paneById(first) != null);
 }

@@ -23,6 +23,7 @@ const profiler = @import("../runtime/profiler.zig");
 const terminal_panel = @import("terminal_panel.zig");
 const theme = @import("theme.zig");
 const sidebar_ui = @import("sidebar.zig");
+const side_panel = @import("side_panel.zig");
 const utils = @import("../utils.zig");
 
 const THREAD_DROP_PREVIEW_Z: i32 = 140;
@@ -123,6 +124,7 @@ const WorkspacePaneAction = enum {
     scrolling_next,
     move_quick_pane,
     resize_quick_pane,
+    attach_browser_to_tab,
 };
 
 const ScrollingEdgeDirection = enum { previous, next };
@@ -993,7 +995,12 @@ pub fn renderAt(state: *runtime.AppState, rect: palette.Rect) void {
 }
 
 /// Renders workspace panes while transcripts use their destination sidebar width.
-pub fn renderAtWithTranscriptLayoutWidth(state: *runtime.AppState, rect: palette.Rect, target_workspace_width: f32) void {
+pub fn renderAtWithTranscriptLayoutWidth(state: *runtime.AppState, workspace_rect: palette.Rect, workspace_target_width: f32) void {
+    // The focused tab's side panel takes the right edge; panes tile the rest.
+    side_panel.resetHitCache();
+    const panel_split = side_panel.split(state, workspace_rect);
+    const rect = panel_split.content;
+    const target_workspace_width = if (panel_split.panel) |panel| @max(workspace_target_width - panel.w, 0.0) else workspace_target_width;
     tickPaneMotion(state, rect);
     last_workspace_rect = rect;
     focus_anim_duration_ms = theme.motionDurationMs(state.app_config.reduced_motion.pane_layout, theme.MOTION_BASE_MS);
@@ -1009,6 +1016,7 @@ pub fn renderAtWithTranscriptLayoutWidth(state: *runtime.AppState, rect: palette
     hit_cache.count = 0;
     pane_rect_count = 0;
     browser_pane_rendered = false;
+    state.beginBrowserPresentationFrame();
     chat_panel.resetWorkspaceHeaderHitCache();
     chat_panel.resetTranscriptHitCache();
     terminal_panel.resetHitCache();
@@ -1044,8 +1052,12 @@ pub fn renderAtWithTranscriptLayoutWidth(state: *runtime.AppState, rect: palette
         chat_panel.renderWorkspaceAtWithTranscriptLayoutWidth(state, rect, target_workspace_width);
     }
 
+    if (panel_split.panel) |panel| {
+        if (side_panel.render(state, workspace_rect, panel)) browser_pane_rendered = true;
+    }
     renderQuickPane(state, rect, target_workspace_width);
     renderSplitMenuOverlay(state, rect);
+    state.finishBrowserPresentationFrame();
     if (!browser_pane_rendered) state.noteBrowserPaneNotRendered();
     prunePaneRectSlots();
 }
@@ -1321,6 +1333,10 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button
             },
             .close => {
                 _ = state.closeCurrentProjectWorkspacePane(hit.pane_id);
+                split_menu_open_for = null;
+            },
+            .attach_browser_to_tab => {
+                state.attachBrowserToTab(hit.pane_id);
                 split_menu_open_for = null;
             },
             .open_link_nvim_pane => {
@@ -3047,8 +3063,13 @@ fn renderLeafWithin(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, 
             }
         },
         .browser => {
-            browser_pane_rendered = true;
-            browser_panel.renderDockAtWithReserve(state, rect, theme.scaledUi(BROWSER_TOOLBAR_RIGHT_RESERVE_CSS));
+            // One live page at a time: a second visible browser waits its turn.
+            if (state.claimBrowserPanePresentation(pane_id)) {
+                browser_pane_rendered = true;
+                browser_panel.renderDockAtWithReserve(state, rect, theme.scaledUi(BROWSER_TOOLBAR_RIGHT_RESERVE_CSS));
+            } else {
+                browser_panel.renderPendingPresentation(state, rect);
+            }
         },
     }
     // Inline handoff sheet: docks over the source pane (chat or agent TUI)
@@ -3298,7 +3319,9 @@ fn renderSplitMenuOverlay(state: *runtime.AppState, workspace_rect: palette.Rect
     const link_row_count: usize = if (is_chat_context) contextLinkRows(&link_rows) else 0;
     // A thin rule separates link targets from the pane commands below them.
     const link_separator_h: f32 = if (link_row_count > 0) theme.scaledUi(context_menu.SEPARATOR_HEIGHT_UI) else 0.0;
-    const command_count: usize = link_row_count + chat_command_count + 3;
+    // A browser tab can rejoin another tab's side panel.
+    const attach_count: usize = if (pane_kind == .browser and state.canAttachBrowserToTab(pane_id)) 1 else 0;
+    const command_count: usize = link_row_count + chat_command_count + attach_count + 3;
     const split_count: usize = 8;
     const menu_h = menu_pad_top + menu_pad_bottom + link_separator_h +
         @as(f32, @floatFromInt(command_count)) * row_h +
@@ -3338,6 +3361,7 @@ fn renderSplitMenuOverlay(state: *runtime.AppState, workspace_rect: palette.Rect
         y = renderContextMenuRow(state, pane_id, .new_chat_thread, "New Chat Thread", menu_rect, menu_pad_x, y, row_rect_w, row_h) + row_gap;
         y = renderContextMenuRow(state, pane_id, .refresh_chat_thread, "Refresh Chat Thread", menu_rect, menu_pad_x, y, row_rect_w, row_h) + row_gap;
     }
+    if (attach_count > 0) y = renderContextMenuRow(state, pane_id, .attach_browser_to_tab, "Attach to Tab", menu_rect, menu_pad_x, y, row_rect_w, row_h) + row_gap;
     const zoom_label = if (state.isCurrentProjectWorkspacePaneMaximized(pane_id)) "Unzoom Pane" else "Zoom Pane";
     y = renderContextMenuRow(state, pane_id, .maximize, zoom_label, menu_rect, menu_pad_x, y, row_rect_w, row_h) + row_gap;
     const split_trigger_rect = renderContextMenuStaticRow(state, "Split Pane", menu_rect, menu_pad_x, y, row_rect_w, row_h, true);

@@ -21,6 +21,8 @@ test {
     _ = @import("runtime/ssh_tunnel_supervisor.zig");
     _ = @import("runtime/thread_binding.zig");
     _ = @import("state/browser_controller.zig");
+    _ = @import("state/browser_runtime_access.zig");
+    _ = @import("state/side_panel_controller.zig");
     _ = @import("state/muse_tui.zig");
     _ = @import("state/runtime_connections_controller.zig");
     _ = @import("state/workspace_layout.zig");
