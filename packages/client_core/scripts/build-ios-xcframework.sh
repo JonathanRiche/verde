@@ -20,9 +20,16 @@ simulator_sdk=$(xcrun --sdk iphonesimulator --show-sdk-path)
 # a failed package must not replace the last successful xcframework.
 staging=$(mktemp -d "${TMPDIR:-/tmp}/verde-client-ios.XXXXXX")
 trap 'rm -rf "$staging"' EXIT
+# Zig's archiver leaves members 4-byte aligned; Xcode 26's linker rejects
+# them, so repack with Apple's libtool, which writes 8-byte aligned members.
+for slice in device simulator; do
+    mkdir -p "$staging/$slice"
+    xcrun libtool -static -no_warning_for_no_symbols \
+        -o "$staging/$slice/libverde_client.a" "$prefix/lib/ios/$slice/libverde_client.a"
+done
 xcodebuild -create-xcframework \
-    -library "$prefix/lib/ios/device/libverde_client.a" -headers "$PWD/include" \
-    -library "$prefix/lib/ios/simulator/libverde_client.a" -headers "$PWD/include" \
+    -library "$staging/device/libverde_client.a" -headers "$PWD/include" \
+    -library "$staging/simulator/libverde_client.a" -headers "$PWD/include" \
     -output "$staging/VerdeClient.xcframework"
 
 # Check Swift can import the module and link its C symbol for both platforms.
