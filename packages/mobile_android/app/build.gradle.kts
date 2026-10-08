@@ -27,9 +27,26 @@ android {
         applicationId = "dev.verdeai.app"
         minSdk = 29
         targetSdk = 35
-        versionCode = 1
+        // CI passes the run number so every Play upload is newer than the last.
+        versionCode = providers.environmentVariable("VERDE_VERSION_CODE").orNull?.toInt() ?: 1
         versionName = "0.1.0"
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
+    }
+    // The Play upload key comes from the environment (CI secrets); it never lives in the repo.
+    // Play App Signing re-signs releases with the app key. Without the variables release is unsigned.
+    val uploadKeystore = providers.environmentVariable("VERDE_UPLOAD_KEYSTORE").orNull
+    signingConfigs {
+        if (uploadKeystore != null) {
+            create("upload") {
+                storeFile = file(uploadKeystore)
+                storePassword = providers.environmentVariable("VERDE_UPLOAD_KEYSTORE_PASSWORD").get()
+                keyAlias = "upload"
+                keyPassword = storePassword
+            }
+        }
+    }
+    buildTypes {
+        release { signingConfig = signingConfigs.findByName("upload") }
     }
     sourceSets.getByName("main").jniLibs.srcDir(layout.buildDirectory.dir("generated/jniLibs"))
     buildFeatures { compose = true }
