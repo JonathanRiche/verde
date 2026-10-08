@@ -17,6 +17,7 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
+import androidx.navigation.navArgument
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
@@ -35,6 +36,17 @@ internal object Routes {
     /** D-12 viewer; the path is one encoded segment and 0 means "no line". */
     const val FILE = "file/{ws}/{line}/{end}/{path}"
     const val SECURITY = "settings/security"
+    const val CHANGES = "changes/{ws}"
+    const val FILES = "files/{ws}"
+    /** One changed file of the Changes list: repository root and repo-relative path, each one encoded segment. */
+    const val PATCH = "patch/{ws}/{root}/{path}"
+    fun changes(ws: String) = "changes/${Uri.encode(ws)}"
+    fun files(ws: String) = "files/${Uri.encode(ws)}"
+    fun patch(ws: String, root: String, path: String) = "patch/${Uri.encode(ws)}/${Uri.encode(root)}/${Uri.encode(path)}"
+    /** A Files-tab file: root id and root-relative path; `abs` is the informational host path (may be empty). */
+    const val WORKSPACE_FILE = "wfile/{ws}/{root}/{path}?abs={abs}"
+    fun workspaceFile(ws: String, root: String, path: String, absolute: String) =
+        "wfile/${Uri.encode(ws)}/${Uri.encode(root)}/${Uri.encode(path)}?abs=${Uri.encode(absolute)}"
     fun workspace(ws: String) = "workspace/${Uri.encode(ws)}"
     fun thread(ws: String, thread: String) = "thread/${Uri.encode(ws)}/${Uri.encode(thread)}"
     fun terminal(ws: String, terminal: String) = "terminal/${Uri.encode(ws)}/${Uri.encode(terminal)}"
@@ -110,6 +122,7 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
                 onNewTerminal = { open(Routes.newTerminal(it)) },
                 onAddWorkspace = { open(ManageRoutes.ADD_WORKSPACE) },
                 onWorkspaceSettings = { open(Routes.workspace(it)) },
+                onChanges = { open(Routes.changes(it)) }, onFiles = { open(Routes.files(it)) },
                 canManageWorkspaces = manageState.view?.can_manage_workspaces == true,
                 onReopen = { manage.setArchived(it, false) },
                 canEditThreads = manageState.view?.can_create_threads == true,
@@ -163,6 +176,7 @@ private fun Graph(nav: NavHostController, start: String, hosts: HostsModel, brow
     val openWorkspace: (String) -> Unit = { nav.navigate(Routes.workspace(it)) }
     val showHosts: () -> Unit = { nav.tab(Routes.HOSTS) }
     val openFile: (String, FileCitation) -> Unit = { ws, citation -> nav.navigate(Routes.file(ws, citation)) }
+    val openAsked: (String, String) -> Unit = { ws, thread -> nav.navigate(Routes.thread(ws, thread)) }
     val pair: () -> Unit = {
         browse.state.value.hostId?.let { id -> if (browse.state.value.row?.view?.auth_state != "signing_out") hosts.showPairing(id) }
         nav.tab(Routes.HOSTS)
@@ -185,6 +199,8 @@ private fun Graph(nav: NavHostController, start: String, hosts: HostsModel, brow
             WorkspaceScreen(browse, ws, openPane, openThread, showHosts, pair, onNewTerminal = { nav.navigate(Routes.newTerminal(ws)) },
                 actions = { workspace ->
                     val state by browse.state.collectAsState()
+                    ExplorerLinks(onChanges = { nav.navigate(Routes.changes(workspace.workspace_id)) }, onFiles = { nav.navigate(Routes.files(workspace.workspace_id)) },
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp))
                     WorkspaceActions(state, manage, workspace) { nav.navigate(ManageRoutes.newChat(workspace.workspace_id)) }
                 }) { nav.popBackStack() }
         }
@@ -202,9 +218,31 @@ private fun Graph(nav: NavHostController, start: String, hosts: HostsModel, brow
         composable(Routes.FILE) { entry ->
             val args = entry.arguments
             val ws = args?.getString("ws").orEmpty()
-            FileRoute(hosts, browse, ws, args?.getString("path").orEmpty(),
+            SelectableFileRoute(hosts, browse, ws, args?.getString("path").orEmpty(),
                 args?.getString("line")?.toLongOrNull()?.takeIf { it > 0 }, args?.getString("end")?.toLongOrNull()?.takeIf { it > 0 },
-                onCitation = { openFile(ws, it) }) { nav.popBackStack() }
+                onCitation = { openFile(ws, it) }, onOpenThread = openAsked) { nav.popBackStack() }
+        }
+        composable(Routes.CHANGES) { entry ->
+            val ws = entry.arguments?.getString("ws").orEmpty()
+            ChangesRoute(hosts, browse, ws, onOpenPatch = { root, path -> nav.navigate(Routes.patch(ws, root, path)) }) { nav.popBackStack() }
+        }
+        composable(Routes.FILES) { entry ->
+            val ws = entry.arguments?.getString("ws").orEmpty()
+            FilesRoute(hosts, browse, ws, onOpenFile = { root, path ->
+                nav.navigate(Routes.workspaceFile(ws, root.id, path, root.absolute(path).orEmpty()))
+            }) { nav.popBackStack() }
+        }
+        composable(Routes.WORKSPACE_FILE, arguments = listOf(navArgument("abs") { defaultValue = "" })) { entry ->
+            val args = entry.arguments
+            val ws = args?.getString("ws").orEmpty()
+            WorkspaceFileRoute(hosts, browse, ws, args?.getString("root").orEmpty(), args?.getString("path").orEmpty(), args?.getString("abs").orEmpty(),
+                onCitation = { openFile(ws, it) }, onOpenThread = openAsked) { nav.popBackStack() }
+        }
+        composable(Routes.PATCH) { entry ->
+            val args = entry.arguments
+            val ws = args?.getString("ws").orEmpty()
+            PatchRoute(hosts, browse, ws, args?.getString("root").orEmpty(), args?.getString("path").orEmpty(),
+                onOpenFile = { openFile(ws, it) }, onOpenThread = openAsked) { nav.popBackStack() }
         }
         composable(Routes.NEW_TERMINAL) { entry ->
             TerminalScreen(hosts, browse, entry.arguments?.getString("ws").orEmpty(), null) { nav.popBackStack() }

@@ -262,7 +262,7 @@ internal fun diffChunk(rows: List<DiffRow>, width: Int, palette: DiffPalette, sy
 }
 
 @Composable
-private fun diffTextStyle() = MaterialTheme.typography.bodySmall.copy(fontFamily = VerdeMono)
+internal fun diffTextStyle() = MaterialTheme.typography.bodySmall.copy(fontFamily = VerdeMono)
 
 /** Chunked rows of one hunk: scrolled horizontally together, or wrapped under a hanging gutter. */
 @Composable
@@ -278,7 +278,7 @@ private fun DiffLines(rows: List<DiffRow>, width: Int, wrap: Boolean) {
 }
 
 @Composable
-private fun DiffChunkText(chunk: DiffChunk, width: Int, wrap: Boolean, palette: DiffPalette, modifier: Modifier) {
+internal fun DiffChunkText(chunk: DiffChunk, width: Int, wrap: Boolean, palette: DiffPalette, modifier: Modifier) {
     var layout by remember { mutableStateOf<TextLayoutResult?>(null) }
     val style = diffTextStyle()
     val measurer = rememberTextMeasurer()

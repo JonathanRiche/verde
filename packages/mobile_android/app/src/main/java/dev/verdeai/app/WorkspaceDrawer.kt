@@ -92,7 +92,8 @@ internal fun WorkspaceDrawer(state: BrowseState, currentTab: String, visible: Bo
     selectedTerminal: String? = null, onTerminal: (String, String) -> Unit = { _, _ -> },
     onNewTerminal: (String) -> Unit = {}, onAddWorkspace: () -> Unit = {},
     onWorkspaceSettings: (String) -> Unit = {}, canManageWorkspaces: Boolean = false, onReopen: (String) -> Unit = {},
-    canEditThreads: Boolean = false, onThreadAction: (ThreadSummary, String) -> Unit = { _, _ -> }) {
+    canEditThreads: Boolean = false, onThreadAction: (ThreadSummary, String) -> Unit = { _, _ -> },
+    onChanges: ((String) -> Unit)? = null, onFiles: ((String) -> Unit)? = null) {
     var searching by rememberSaveable { mutableStateOf(false) }
     var query by rememberSaveable { mutableStateOf("") }
     val all = state.workspaces?.items.orEmpty()
@@ -127,6 +128,10 @@ internal fun WorkspaceDrawer(state: BrowseState, currentTab: String, visible: Bo
                         Icon(workspaceIcon(9), "New terminal", Modifier.size(20.dp))
                     }
                 }
+            }
+            if (ready && target != null && !searching && onChanges != null && onFiles != null) {
+                ExplorerLinks({ onChanges(target.workspace_id) }, { onFiles(target.workspace_id) }, target.label.takeIf { scoped == null },
+                    Modifier.padding(horizontal = 12.dp, vertical = 4.dp))
             }
             LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(bottom = 12.dp)) {
                 if (ready) {

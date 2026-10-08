@@ -241,7 +241,9 @@ private fun TextFile(content: FileContent.Text, target: LineTarget?) {
     val state = rememberLazyListState(initialFirstVisibleItemIndex = target?.let { (it.line - 4).coerceIn(0, count - 1) } ?: 0)
     val mono = MaterialTheme.typography.bodySmall.copy(fontFamily = VerdeMono)
     val highlight = MaterialTheme.colorScheme.tertiaryContainer
-    LazyColumn(Modifier.fillMaxSize(), state = state) {
+    val selection = LocalLineSelection.current
+    LazyColumn(Modifier.fillMaxSize().lineGestures(selection, state, gutter, { (it.key as? Int)?.plus(1) }) {
+        fileLines(content.text, content.lineStarts, it) }, state = state) {
         items(count, key = { it }) { index ->
             val number = index + 1
             val hit = target != null && number in target
@@ -249,7 +251,7 @@ private fun TextFile(content: FileContent.Text, target: LineTarget?) {
                 val start = content.lineStarts[index]
                 full.subSequence(start, lineEnd(content.text, content.lineStarts, index))
             }
-            Row(Modifier.fillMaxWidth().then(if (hit) Modifier.background(highlight) else Modifier)
+            Row(Modifier.fillMaxWidth().then(if (picked) Modifier.background(SelectedLineColor) else if (hit) Modifier.background(highlight) else Modifier)
                 .testTag(if (hit) FILE_TARGET_TAG else FILE_LINE_TAG)) {
                 Text(number.toString().padStart(gutter), Modifier.padding(start = 8.dp, end = 8.dp),
                     style = mono, color = MaterialTheme.colorScheme.outline)
@@ -258,6 +260,7 @@ private fun TextFile(content: FileContent.Text, target: LineTarget?) {
         }
     }
 }
+            val picked = selection?.contains(number) == true
 
 private fun AnnotatedString.ifEmpty(other: () -> AnnotatedString) = if (isEmpty()) other() else this
 

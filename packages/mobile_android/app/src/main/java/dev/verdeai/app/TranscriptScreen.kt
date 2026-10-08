@@ -136,6 +136,8 @@ internal fun ThreadRoute(hosts: HostsModel, browse: BrowseModel, manage: ManageM
         factory = viewModelFactory { initializer { GitChangesModel(GitChat(workspaceId, threadId), gitClient) } })
     val lifecycleState by LocalLifecycleOwner.current.lifecycle.currentStateFlow.collectAsState()
     LaunchedEffect(git, lifecycleState) { if (lifecycleState == Lifecycle.State.RESUMED) git?.focus() }
+    // An "Ask agent" selection from the file or diff viewer arrives with this navigation.
+    LaunchedEffect(model) { PromptHandoff.take(browseState.hostId, workspaceId, threadId)?.let(model.composer::ask) }
     TranscriptScreen(model, title, onBack, onHosts, browse::refresh, onCitation,
         canEditThread = manageState.view?.can_create_threads == true, onThreadAction = onThreadAction,
         gitChanges = git, threads = threads, onOpenThread = onOpenThread, bottomBar = { m, s -> ChatComposer(m, s) })

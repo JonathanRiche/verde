@@ -205,6 +205,33 @@ class ComposerTest {
         field().assertIsFocused()
     }
 
+    @Test fun askSendsTheSelectionPromptWhenTheDraftIsEmpty() {
+        launch()
+        val prompt = "In `src/app.kt` line 4:\n```kotlin\nval x = 1\n```\nRename x"
+        compose.runOnUiThread { transcript.composer.ask(prompt) }
+        await { sent<EventSend>().isNotEmpty() }
+        assertEquals(prompt, sent<EventDraftSet>().last().text)
+        assertEquals(core.revisionAtSend, sent<EventSend>().single().draft_revision)
+    }
+
+    @Test fun askNeverReplacesAnUnsentDraft() {
+        launch()
+        type("Keep this note")
+        compose.runOnUiThread { transcript.composer.ask("In `a.kt` line 1:\n```kotlin\nx\n```\nWhy?") }
+        await { sent<EventDraftSet>().lastOrNull()?.text == "Keep this note\n\nIn `a.kt` line 1:\n```kotlin\nx\n```\nWhy?" }
+        assertTrue(sent<EventSend>().isEmpty())
+        assertEquals("Added to your draft. Send when ready.", transcript.composer.notice)
+    }
+
+    @Test fun askWhileRunningGoesInAsAFollowup() {
+        setup={ it.running() }
+        launch()
+        awaitText("Send to steer the current reply.")
+        compose.runOnUiThread { transcript.composer.ask("In `a.kt` line 2:\n```kotlin\ny\n```\nAlso this") }
+        await { sent<EventFollowupSubmit>().isNotEmpty() }
+        assertTrue(sent<EventSend>().isEmpty())
+    }
+
     @Test fun aNewlyCreatedChatTakesItsFirstMessage() {
         // D-10's New chat opens an empty, uncommitted thread; the composer must work there.
         setup={ it.fresh() }

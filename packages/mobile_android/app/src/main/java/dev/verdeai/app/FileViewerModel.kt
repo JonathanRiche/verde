@@ -260,6 +260,8 @@ internal class FileViewerModel(
     val state = mutableState.asStateFlow()
     val kind = path?.let(::viewerKind) ?: ViewerKind.Text
     val limit = viewerLimit(kind)
+    /** Alternate source (Files tab: `workspace.files.read`): bytes, a failed state, or null for the `/api/file` fetch. */
+    private val reader: (suspend (CoreHost) -> Any?)? = null,
     private var core: CoreHost? = null
     private var job: Job? = null
     private val highlights = RenderCache(32).highlight
@@ -347,7 +349,7 @@ internal class FileViewerModel(
     }
 
     private suspend fun fetch(host: CoreHost, target: String): FileViewState {
-        val bytes = when (val body = fetchBytes(host, target, viewerFetchKind(target), limit)) {
+        val bytes = when (val body = reader?.invoke(host) ?: fetchBytes(host, target, viewerFetchKind(target), limit)) {
             is ByteArray -> body
             else -> return body as FileViewState
         }

@@ -189,6 +189,28 @@ internal class ComposerModel(
         updateTokens(value)
     }
 
+    /**
+     * Ask-agent hand-off from the file/diff viewers: once the chat and its draft load, sends [text]
+     * (as a follow-up when a turn is running). An unsent draft is never replaced: the text is
+     * appended to it instead, for the user to send.
+     */
+    fun ask(text: String) {
+        scope.launch {
+            val ready = withTimeoutOrNull(ASK_WAIT_MS) { chat.state.first { it.composer != null && it.thread != null } }
+            val draft = ready?.composer?.draft
+            if (draft != null && draft.text.isBlank() && draft.attachments.isEmpty() && !editing && field.text.isBlank()) {
+                edit(TextFieldValue(text, TextRange(text.length)))
+                submit()
+                return@launch
+            }
+            val before = field.text
+            val next = if (before.isBlank()) text else before + (if (before.endsWith('\n')) "\n" else "\n\n") + text
+            edit(TextFieldValue(next, TextRange(next.length)))
+            focusRequest++
+            notice = if (ready == null) "Couldn't reach this chat yet. Your request is in the draft." else "Added to your draft. Send when ready."
+        }
+    }
+
     /** Append a review prompt without discarding an unsent draft or dispatching a turn. */
     fun commentOnDiff(path: String, additions: ULong, deletions: ULong) {
         if (busy || chat.latestComposer()?.send_operation?.state == "pending") return
@@ -456,6 +478,7 @@ internal class ComposerModel(
         const val DRAFT_DELAY_MS = 600L
         const val SEARCH_DELAY_MS = 200L
         const val SLASH_WAIT_MS = 5_000L
+        const val ASK_WAIT_MS = 15_000L
         const val OUTCOME_WAIT_MS = 30_000L
         const val MAX_IMAGES = 4
         /** Per image after re-encoding; the core also enforces the daemon's own attachment limit. */
