@@ -54,6 +54,7 @@ const freePendingTimelineEvents = utils.freePendingTimelineEvents;
 const freePendingTimelineEventsLocked = utils.freePendingTimelineEventsLocked;
 const cancelLingeringToolCallEvents = utils.cancelLingeringToolCallEvents;
 const flushPendingAssistantTextLocked = utils.flushPendingAssistantTextLocked;
+const hasPendingToolCallEvent = utils.hasPendingToolCallEvent;
 const transientThinkStatus = utils.transientThinkStatus;
 const upsertPendingToolCallEvent = utils.upsertPendingToolCallEvent;
 const slashCommandFallbackName = command_controller.slashCommandFallbackName;
@@ -6684,8 +6685,12 @@ pub fn applyDaemonChatEventLocked(self: anytype, send_state: *SendState, kind: [
         }
         // Flush like the GUI-owned stream path does, so tool rows land
         // between assistant text segments instead of stacking above one
-        // ever-growing trailing bubble on daemon-owned turns.
-        flushPendingAssistantTextLocked(send_state, std.heap.page_allocator);
+        // ever-growing trailing bubble on daemon-owned turns. Updates to an
+        // existing row (a parallel subagent streaming into its card) insert
+        // nothing, so they must not split the reply; transcript_apply agrees.
+        if (!hasPendingToolCallEvent(send_state.pending_events.items, update.call_id)) {
+            flushPendingAssistantTextLocked(send_state, std.heap.page_allocator);
+        }
         try upsertPendingToolCallEvent(std.heap.page_allocator, &send_state.pending_events, update);
     } else if (std.mem.eql(u8, kind, "diff")) {
         try applyDaemonDiffEventLocked(send_state, payload_json);
@@ -7964,6 +7969,26 @@ test "daemon tail splits assistant text at terminal think like the durable reduc
     try std.testing.expectEqualStrings("Reply to prompt.", send_state.pending_events.items[0].body);
     try std.testing.expectEqualStrings("Reply to steer.", send_state.pending_events.items[1].body);
     try std.testing.expect(!send_state.thinking);
+}
+
+test "daemon tail keeps reply text whole while a parallel subagent streams" {
+    var send_state: SendState = .{ .provider = .codex };
+    defer {
+        send_state.partial_text.deinit(std.heap.page_allocator);
+        freePendingTimelineEventsLocked(std.heap.page_allocator, &send_state.pending_events);
+    }
+    try applyDaemonChatEventLocked({}, &send_state, "tool_call", "{\"call_id\":\"a1\",\"title\":\"keeper\",\"kind\":\"subagent\",\"status\":\"in_progress\"}");
+    try applyDaemonChatEventLocked({}, &send_state, "assistant_delta", "{\"text\":\"The pilot \"}");
+    try applyDaemonChatEventLocked({}, &send_state, "tool_call", "{\"call_id\":\"a1\",\"title\":\"\",\"kind\":\"subagent\",\"transcript_delta\":\"Gen\"}");
+    try applyDaemonChatEventLocked({}, &send_state, "assistant_delta", "{\"text\":\"is live.\"}");
+    try applyDaemonChatEventLocked({}, &send_state, "tool_call", "{\"call_id\":\"c2\",\"kind\":\"execute\",\"status\":\"in_progress\",\"input\":\"ls\"}");
+    try applyDaemonChatEventLocked({}, &send_state, "assistant_delta", "{\"text\":\"after\"}");
+    flushPendingAssistantTextLocked(&send_state, std.heap.page_allocator);
+    try std.testing.expectEqual(@as(usize, 4), send_state.pending_events.items.len);
+    try std.testing.expectEqualStrings("a1", send_state.pending_events.items[0].tool_call_id.?);
+    try std.testing.expectEqualStrings("The pilot is live.", send_state.pending_events.items[1].body);
+    try std.testing.expectEqualStrings("c2", send_state.pending_events.items[2].tool_call_id.?);
+    try std.testing.expectEqualStrings("after", send_state.pending_events.items[3].body);
 }
 
 test "adoption matcher reports committed divergence only with the whole turn in view" {

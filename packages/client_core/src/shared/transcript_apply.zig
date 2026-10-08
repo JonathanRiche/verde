@@ -96,7 +96,12 @@ pub fn apply(
             const update = ToolUpdate.fromJson(object);
             // Content-less think events only toggle the GUI's liveness label.
             if (update.isTransientThink()) continue;
-            try flushAssistant(allocator, &rows, &partial_text, outcome.provider);
+            // Updates to an existing row (a parallel subagent streaming into
+            // its card, a background command finishing) insert nothing between
+            // the text around them, so splitting there would fragment the reply.
+            if (!hasToolRow(rows.items, update.call_id)) {
+                try flushAssistant(allocator, &rows, &partial_text, outcome.provider);
+            }
             try upsertTool(allocator, &rows, update);
         } else if (std.mem.eql(u8, event.kind, "diff")) {
             try applyDiffEvent(
@@ -368,6 +373,15 @@ fn copyAttachment(allocator: std.mem.Allocator, value: std.json.Value) !store_pr
         .byte_size = if (jsonInteger(value.object, "byte_size") > 0) @intCast(jsonInteger(value.object, "byte_size")) else 0,
         .attachment_id = if (jsonString(value.object, "attachment_id")) |id| try allocator.dupe(u8, id) else null,
     };
+}
+
+fn hasToolRow(rows: []const Row, call_id: []const u8) bool {
+    if (call_id.len == 0) return false;
+    for (rows) |row| {
+        const existing_id = row.message.tool_call_id orelse continue;
+        if (std.mem.eql(u8, existing_id, call_id)) return true;
+    }
+    return false;
 }
 
 fn upsertTool(
@@ -748,6 +762,28 @@ test "delta flushes at message, tool, and diff boundaries" {
     try std.testing.expect(std.mem.startsWith(u8, messages[5].body, "VERDE_DIFF_V2\n"));
     try std.testing.expect(std.mem.indexOf(u8, messages[5].body, "b.zig") != null);
     try std.testing.expect(std.mem.indexOf(u8, messages[5].body, "a.zig") == null);
+}
+
+test "updates to an existing tool row keep surrounding assistant text together" {
+    const allocator = std.testing.allocator;
+    const events = [_]ChatEvent{
+        .{ .kind = "tool_call", .payload_json = "{\"call_id\":\"a1\",\"title\":\"keeper\",\"kind\":\"subagent\",\"status\":\"in_progress\"}" },
+        .{ .kind = "assistant_delta", .payload_json = "{\"text\":\"The pilot \"}" },
+        .{ .kind = "tool_call", .payload_json = "{\"call_id\":\"a1\",\"title\":\"\",\"kind\":\"subagent\",\"transcript_delta\":\"Gen\"}" },
+        .{ .kind = "assistant_delta", .payload_json = "{\"text\":\"is live \"}" },
+        .{ .kind = "tool_call", .payload_json = "{\"call_id\":\"a1\",\"title\":\"\",\"kind\":\"subagent\",\"transcript_delta\":\"eration\"}" },
+        .{ .kind = "assistant_delta", .payload_json = "{\"text\":\"now.\"}" },
+        .{ .kind = "tool_call", .payload_json = "{\"call_id\":\"a1\",\"kind\":\"subagent\",\"status\":\"completed\",\"output\":\"done\"}" },
+        .{ .kind = "tool_call", .payload_json = "{\"call_id\":\"c2\",\"kind\":\"execute\",\"status\":\"in_progress\",\"input\":\"ls\"}" },
+        .{ .kind = "assistant_delta", .payload_json = "{\"text\":\"after\"}" },
+    };
+    const messages = try apply(allocator, &events, .{ .status = .completed, .provider = "codex" });
+    defer freeMessages(allocator, messages);
+    try std.testing.expectEqual(@as(usize, 4), messages.len);
+    try std.testing.expectEqualStrings("Subagent", messages[0].author);
+    try std.testing.expectEqualStrings("The pilot is live now.", messages[1].body);
+    try std.testing.expectEqualStrings("c2", messages[2].tool_call_id.?);
+    try std.testing.expectEqualStrings("after", messages[3].body);
 }
 
 test "subagent transcript chunks append across tool_call events" {

@@ -1531,6 +1531,17 @@ fn toolCallFallbackBody(kind: ?provider_types.ToolCallKind, status: ?provider_ty
     return @tagName(status orelse .unknown);
 }
 
+/// Reports whether `call_id` already has a pending row that an upsert would
+/// update in place rather than append.
+pub fn hasPendingToolCallEvent(events: []const chat_types.PendingTimelineEvent, call_id: []const u8) bool {
+    if (call_id.len == 0) return false;
+    for (events) |event| {
+        const existing_id = event.tool_call_id orelse continue;
+        if (std.mem.eql(u8, existing_id, call_id)) return true;
+    }
+    return false;
+}
+
 /// Upserts a provider tool-call lifecycle update by stable call identity.
 ///
 /// Updates may omit title/content, so existing useful fields are retained

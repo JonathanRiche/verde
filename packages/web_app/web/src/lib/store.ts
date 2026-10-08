@@ -2692,8 +2692,11 @@ export function createAppStore() {
         return
       }
       tail.thinking = false
-      flushStreamPart(tail)
       const call_id = typeof payload.call_id === 'string' ? payload.call_id : ''
+      // Updates to an existing row (a parallel subagent streaming into its
+      // card) insert nothing, so they must not split the reply; the daemon's
+      // transcript reducer agrees.
+      if (!(call_id && tail.tool_rows.has(call_id))) flushStreamPart(tail)
       const status = typeof payload.status === 'string' ? payload.status : null
       const input = typeof payload.input === 'string' ? payload.input : null
       const output = typeof payload.output === 'string' ? payload.output : null
