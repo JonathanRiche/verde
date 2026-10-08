@@ -180,6 +180,7 @@ private struct TranscriptList: View {
     @State private var atBottom = true
     @State private var viewport: CGFloat = 0
     @State private var cardVisible = false
+    @State private var settled = false
 
     /// Changes whenever the bottom of the transcript grows (new row, streaming delta, turn state).
     private func tailKey(_ items: [TranscriptItem]) -> String {
@@ -219,6 +220,17 @@ private struct TranscriptList: View {
                     .coordinateSpace(name: "transcript")
                     .scrollPosition(id: $position)
                     .modifier(BottomAnchor())
+                    // Lazy rows start at estimated heights, so the initial bottom offset can land
+                    // past the measured content and show blank until a scroll. Re-anchor once
+                    // the rows are measured, then reveal.
+                    .opacity(settled ? 1 : 0)
+                    .task {
+                        for _ in 0..<3 {
+                            try? await Task.sleep(for: .milliseconds(30))
+                            proxy.scrollTo(bottomID, anchor: .bottom)
+                        }
+                        settled = true
+                    }
                     .accessibilityIdentifier("transcript-list")
                     .onPreferenceChange(BottomOffsetKey.self) { maxY in
                         let bottom = maxY - viewport <= bottomSlack
