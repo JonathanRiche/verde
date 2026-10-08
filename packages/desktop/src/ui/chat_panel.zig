@@ -18,6 +18,7 @@ const git_changes = @import("../state/git_changes_controller.zig");
 const chat_markdown = @import("chat_markdown.zig");
 const colors = @import("colors.zig");
 const composer_pickers = @import("composer_pickers.zig");
+const diff_render = @import("diff_render.zig");
 const file_icons = @import("file_icons.zig");
 const runtime = @import("runtime.zig");
 const terminal_panel = @import("terminal_panel.zig");
@@ -7793,20 +7794,10 @@ fn diffCopyIdentity(message_index: usize, file_path: []const u8, patch: []const 
     return hasher.final();
 }
 
-const DiffLayout = enum {
-    stacked,
-    split,
-};
+const DiffLayout = diff_render.Layout;
 
-const DIFF_SPLIT_MIN_WIDTH_CSS: f32 = 620.0;
-
-fn diffLayoutForWidth(
-    state: ?*app_state.AppState,
-    width: f32,
-) DiffLayout {
-    if (width < theme.scaledUi(DIFF_SPLIT_MIN_WIDTH_CSS)) return .stacked;
-    const app = state orelse return .stacked;
-    return if (app.app_config.diff_layout_preference == .split) .split else .stacked;
+fn diffLayoutForWidth(state: ?*app_state.AppState, width: f32) DiffLayout {
+    return diff_render.layoutForWidth(state, width);
 }
 
 fn diffSummaryHeight(state: ?*app_state.AppState, message_index: ?usize, body_raw: []const u8, column_width: f32) f32 {
@@ -7840,34 +7831,13 @@ fn diffSummaryHeightForFiles(state: ?*app_state.AppState, message_index: ?usize,
 }
 
 fn diffPatchDisplayLineCountForLayout(state: ?*app_state.AppState, patch: []const u8, layout: DiffLayout) usize {
-    return switch (layout) {
-        .stacked => diffPatchDisplayLineCount(state, patch),
-        .split => blk: {
-            if (patch.len == 0) break :blk 2;
-            if (state) |app| {
-                const view = app.transcript_controller.diff_view_cache.split(app.allocator, patch) orelse
-                    break :blk @max(wrappedLineCount(patch, 120), 2);
-                break :blk @max(view.rows.len, 1);
-            }
-            var view = zig_dif.buildSideBySidePatchViewWithOptions(std.heap.page_allocator, patch, .{ .context_lines = 4 }) catch
-                break :blk diffPatchDisplayLineCount(null, patch);
-            defer view.deinit();
-            break :blk @max(view.rows.len, 1);
-        },
-    };
+    return diff_render.displayLineCount(state, patch, layout);
 }
 
-fn diffPatchDisplayLineCount(state: ?*app_state.AppState, patch: []const u8) usize {
-    if (patch.len == 0) return 2;
-    if (state) |app| {
-        const view = app.transcript_controller.diff_view_cache.stacked(app.allocator, patch) orelse
-            return @max(wrappedLineCount(patch, 120), 2);
-        return @max(view.lines.len, 1);
-    }
-    var view = zig_dif.buildPatchViewWithOptions(std.heap.page_allocator, patch, .{ .context_lines = 4 }) catch
-        return @max(wrappedLineCount(patch, 120), 2);
-    defer view.deinit();
-    return @max(view.lines.len, 1);
+/// Pointer position for diff hover styling while it is over the transcript.
+fn diffMouse(state: *app_state.AppState) ?diff_render.Point {
+    if (!state.transcript_controller.palette_mouse_in_workspace) return null;
+    return .{ .x = state.transcript_controller.palette_mouse_x, .y = state.transcript_controller.palette_mouse_y };
 }
 
 fn renderDiffSummaryCard(
@@ -7915,7 +7885,7 @@ fn renderDiffSummaryCard(
     const pad_y = theme.scaledUi(12.0);
     const header_h = theme.scaledUi(42.0);
     const row_h = theme.scaledUi(44.0);
-    const can_split = bubble.w >= theme.scaledUi(DIFF_SPLIT_MIN_WIDTH_CSS);
+    const can_split = diff_render.canSplit(bubble.w);
     const layout = diffLayoutForWidth(state, bubble.w);
 
     // Header: "Changed files - N file(s) +A -D"
@@ -8102,62 +8072,12 @@ fn renderDiffLayoutToggle(
     layout: DiffLayout,
     clip: palette.Rect,
 ) void {
-    queueRoundedClipped(
-        state,
-        rect,
-        paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 105)),
-        theme.scaledUi(7.0),
-        clip,
-    );
-    const inset = theme.scaledUi(2.0);
-    const inner = palette.Rect{
-        .x = rect.x + inset,
-        .y = rect.y + inset,
-        .w = rect.w - inset * 2.0,
-        .h = rect.h - inset * 2.0,
-    };
-    const half_w = inner.w * 0.5;
-    const stacked_rect = palette.Rect{ .x = inner.x, .y = inner.y, .w = half_w, .h = inner.h };
-    const split_rect = palette.Rect{ .x = inner.x + half_w, .y = inner.y, .w = half_w, .h = inner.h };
-    renderDiffLayoutOption(state, stacked_rect, "Stacked", layout == .stacked, clip);
-    renderDiffLayoutOption(state, split_rect, "Split", layout == .split, clip);
+    const segments = diff_render.renderLayoutToggle(state, rect, layout, clip, diffMouse(state));
     if (diff_layout_hit_count + 2 <= diff_layout_hits.len) {
-        diff_layout_hits[diff_layout_hit_count] = .{ .rect = stacked_rect, .split = false };
-        diff_layout_hits[diff_layout_hit_count + 1] = .{ .rect = split_rect, .split = true };
+        diff_layout_hits[diff_layout_hit_count] = .{ .rect = segments[0], .split = false };
+        diff_layout_hits[diff_layout_hit_count + 1] = .{ .rect = segments[1], .split = true };
         diff_layout_hit_count += 2;
     }
-}
-
-// Renders one segment of the diff-layout selector.
-fn renderDiffLayoutOption(
-    state: *app_state.AppState,
-    rect: palette.Rect,
-    label: []const u8,
-    selected: bool,
-    clip: palette.Rect,
-) void {
-    const hovered = state.transcript_controller.palette_mouse_in_workspace and
-        rectContains(rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
-    if (selected or hovered) {
-        queueRoundedClipped(
-            state,
-            rect,
-            paletteColor(if (selected)
-                theme.withAlpha(theme.COLOR_PANEL_ALT, 245)
-            else
-                theme.withAlpha(theme.COLOR_PANEL_ALT, 155)),
-            theme.scaledUi(5.0),
-            clip,
-        );
-    }
-    queueCenteredChromeLabel(
-        state,
-        rect,
-        label,
-        paletteColor(if (selected or hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED),
-        theme.scaledUi(10.5),
-        clip,
-    );
 }
 
 // Renders one file-row action in the diff card.
@@ -8168,36 +8088,10 @@ fn renderDiffFileActionButton(
     primary: bool,
     clip: palette.Rect,
 ) void {
-    const hovered = state.transcript_controller.palette_mouse_in_workspace and
-        rectContains(rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
-    const background = if (primary and hovered)
-        theme.withAlpha(theme.COLOR_YELLOW, 42)
-    else if (hovered)
-        theme.withAlpha(theme.COLOR_PANEL_MUTED, 220)
-    else
-        theme.withAlpha(theme.COLOR_PANEL_MUTED, 128);
-    const border = if (primary and hovered)
-        theme.withAlpha(theme.COLOR_YELLOW, 150)
-    else
-        theme.withAlpha(theme.COLOR_TEXT_SUBTLE, if (hovered) 150 else 90);
-    const text = if (primary and hovered)
-        theme.COLOR_YELLOW
-    else if (hovered)
-        theme.COLOR_WHITE
-    else
-        theme.COLOR_TEXT_MUTED;
-    queueRoundedShellClipped(
-        state,
-        rect,
-        paletteColor(background),
-        paletteColor(border),
-        theme.scaledUi(6.0),
-        clip,
-    );
-    queueCenteredChromeLabel(state, rect, label, paletteColor(text), theme.scaledUi(11.5), clip);
+    diff_render.renderActionButton(state, rect, label, primary, clip, diffMouse(state));
 }
 
-// Selects the expanded file's stacked or split patch renderer.
+// Draws the expanded file's patch; hunk Copy buttons record transcript hits.
 fn renderDiffPatch(
     state: *app_state.AppState,
     rect: palette.Rect,
@@ -8207,395 +8101,14 @@ fn renderDiffPatch(
     layout: DiffLayout,
     clip: palette.Rect,
 ) void {
-    switch (layout) {
-        .stacked => renderDiffPatchLines(state, rect, patch, font_size, line_h, clip),
-        .split => renderDiffSplitPatchLines(state, rect, patch, font_size, line_h, clip),
-    }
-}
-
-// Renders an aligned old/new patch with independent line-number gutters.
-fn renderDiffSplitPatchLines(
-    state: *app_state.AppState,
-    rect: palette.Rect,
-    patch: []const u8,
-    font_size: f32,
-    line_h: f32,
-    clip: palette.Rect,
-) void {
-    if (patch.len == 0) {
-        renderDiffPatchLines(state, rect, patch, font_size, line_h, clip);
-        return;
-    }
-
-    const view = state.transcript_controller.diff_view_cache.split(state.allocator, patch) orelse {
-        renderDiffPatchLines(state, rect, patch, font_size, line_h, clip);
-        return;
-    };
-
-    queueRoundedShellClipped(
-        state,
-        rect,
-        paletteColor(theme.md.code_bg),
-        paletteColor(theme.md.code_border),
-        theme.scaledUi(6.0),
-        clip,
-    );
-
-    const divider_w = @max(theme.scaledUi(1.0), 1.0);
-    const half_w = (rect.w - divider_w) * 0.5;
-    const left_rect = palette.Rect{ .x = rect.x, .y = rect.y, .w = half_w, .h = rect.h };
-    const right_rect = palette.Rect{ .x = rect.x + half_w + divider_w, .y = rect.y, .w = half_w, .h = rect.h };
-    queueRectClipped(state, .{
-        .x = rect.x + half_w,
-        .y = rect.y,
-        .w = divider_w,
-        .h = rect.h,
-    }, paletteColor(theme.withAlpha(theme.md.code_border, 235)), clip);
-
-    for (view.rows, 0..) |row, index| {
-        const y = rect.y + @as(f32, @floatFromInt(index)) * line_h;
-        if (y > clip.y + clip.h or y + line_h < clip.y) continue;
-        switch (row.kind) {
-            .code => {
-                renderDiffSplitCell(state, .{
-                    .x = left_rect.x,
-                    .y = y,
-                    .w = left_rect.w,
-                    .h = line_h,
-                }, row.left, font_size, clip);
-                renderDiffSplitCell(state, .{
-                    .x = right_rect.x,
-                    .y = y,
-                    .w = right_rect.w,
-                    .h = line_h,
-                }, row.right, font_size, clip);
-            },
-            .hunk_header, .context_gap, .file_header, .prelude, .note => {
-                const row_rect = palette.Rect{ .x = rect.x, .y = y, .w = rect.w, .h = line_h };
-                const fill = switch (row.kind) {
-                    .hunk_header, .context_gap => theme.withAlpha(theme.COLOR_PANEL_MUTED, 155),
-                    .file_header, .prelude => theme.withAlpha(theme.COLOR_PANEL_ALT, 230),
-                    .note => theme.withAlpha(theme.COLOR_YELLOW, 22),
-                    .code => unreachable,
-                };
-                queueRectClipped(state, row_rect, paletteColor(fill), clip);
-                const display_kind: zig_dif.DisplayLineKind = switch (row.kind) {
-                    .hunk_header => .hunk_header,
-                    .context_gap => .context_gap,
-                    .file_header => .file_header,
-                    .prelude => .prelude,
-                    .note => .note,
-                    .code => unreachable,
-                };
-                renderDiffTokens(
-                    state,
-                    rect.x + theme.scaledUi(10.0),
-                    y,
-                    rect.w - theme.scaledUi(20.0),
-                    line_h,
-                    row.tokens,
-                    display_kind,
-                    font_size,
-                    intersectRect(clip, row_rect),
-                );
-            },
-        }
-    }
-}
-
-// Renders one old/new cell, including its blank alignment placeholder.
-fn renderDiffSplitCell(
-    state: *app_state.AppState,
-    rect: palette.Rect,
-    maybe_cell: ?zig_dif.SideBySideCell,
-    font_size: f32,
-    clip: palette.Rect,
-) void {
-    const cell = maybe_cell orelse {
-        queueRectClipped(
-            state,
-            rect,
-            paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 155)),
-            clip,
-        );
-        return;
-    };
-
-    const change_color: ?[4]f32 = switch (cell.kind) {
-        .addition => theme.COLOR_DIFF_ADD,
-        .deletion => theme.COLOR_DIFF_REMOVE,
-        else => null,
-    };
-    if (change_color) |color| {
-        queueRectClipped(state, rect, paletteColor(theme.withAlpha(color, 34)), clip);
-        queueRectClipped(state, .{
-            .x = rect.x,
-            .y = rect.y,
-            .w = theme.scaledUi(3.0),
-            .h = rect.h,
-        }, paletteColor(color), clip);
-    }
-
-    const number_w = theme.scaledUi(38.0);
-    const code_pad = theme.scaledUi(9.0);
-    const code_x = rect.x + number_w + code_pad;
-    queueRectClipped(state, .{
-        .x = rect.x + number_w,
-        .y = rect.y,
-        .w = @max(theme.scaledUi(1.0), 1.0),
-        .h = rect.h,
-    }, paletteColor(theme.md.code_border), clip);
-    renderDiffLineNumber(state, rect.x, rect.y, number_w, rect.h, cell.line_number, font_size, clip);
-
-    const code_clip = intersectRect(clip, .{
-        .x = code_x,
-        .y = rect.y,
-        .w = @max(rect.w - number_w - code_pad * 2.0, 1.0),
-        .h = rect.h,
+    diff_render.renderPatch(state, rect, patch, .{
+        .font_size = font_size,
+        .line_h = line_h,
+        .layout = layout,
+        .clip = clip,
+        .mouse = diffMouse(state),
+        .hunk_copy = true,
     });
-    if (change_color) |color| {
-        renderDiffSplitEmphasis(state, code_x, rect.y, rect.h, font_size, cell, color, code_clip);
-    }
-    renderDiffTokens(
-        state,
-        code_x,
-        rect.y,
-        code_clip.w,
-        rect.h,
-        cell.tokens,
-        cell.kind,
-        font_size,
-        code_clip,
-    );
-}
-
-// Renders word-level change emphasis supplied by zig_dif's aligned model.
-fn renderDiffSplitEmphasis(
-    state: *app_state.AppState,
-    code_x: f32,
-    y: f32,
-    line_h: f32,
-    font_size: f32,
-    cell: zig_dif.SideBySideCell,
-    color: [4]f32,
-    clip: palette.Rect,
-) void {
-    for (cell.emphasis_ranges) |range| {
-        if (range.start >= range.end or range.end > cell.text.len) continue;
-        const prefix_w = text_measure.textWidth(.mono, font_size, cell.text[0..range.start]);
-        const range_w = text_measure.textWidth(.mono, font_size, cell.text[range.start..range.end]);
-        queueRoundedClipped(state, .{
-            .x = code_x + prefix_w,
-            .y = y + theme.scaledUi(2.0),
-            .w = @max(range_w, theme.scaledUi(2.0)),
-            .h = @max(line_h - theme.scaledUi(4.0), 1.0),
-        }, paletteColor(theme.withAlpha(color, 72)), theme.scaledUi(2.0), clip);
-    }
-}
-
-fn renderDiffPatchLines(
-    state: *app_state.AppState,
-    rect: palette.Rect,
-    patch: []const u8,
-    font_size: f32,
-    line_h: f32,
-    clip: palette.Rect,
-) void {
-    queueRoundedShellClipped(
-        state,
-        rect,
-        paletteColor(theme.md.code_bg),
-        paletteColor(theme.md.code_border),
-        theme.scaledUi(6.0),
-        clip,
-    );
-
-    if (patch.len == 0) {
-        renderDiffFallback(state, rect, "No textual patch was supplied for this file.", font_size, line_h, clip);
-        return;
-    }
-
-    const view = state.transcript_controller.diff_view_cache.stacked(state.allocator, patch) orelse {
-        renderDiffFallback(state, rect, patch, font_size, line_h, clip);
-        return;
-    };
-
-    const number_w = theme.scaledUi(38.0);
-    const gutter_w = number_w * 2.0;
-    const code_x = rect.x + gutter_w + theme.scaledUi(10.0);
-    const code_clip = intersectRect(clip, .{
-        .x = code_x,
-        .y = rect.y,
-        .w = @max(rect.w - (code_x - rect.x) - theme.scaledUi(6.0), 1.0),
-        .h = rect.h,
-    });
-
-    var hunk_index: usize = 0;
-    for (view.lines, 0..) |line, index| {
-        const y = rect.y + @as(f32, @floatFromInt(index)) * line_h;
-        if (y > clip.y + clip.h or y + line_h < clip.y) continue;
-        const row = palette.Rect{ .x = rect.x, .y = y, .w = rect.w, .h = line_h };
-        const change_color: ?[4]f32 = switch (line.kind) {
-            .addition => theme.COLOR_DIFF_ADD,
-            .deletion => theme.COLOR_DIFF_REMOVE,
-            else => null,
-        };
-        if (change_color) |color| {
-            queueRectClipped(state, row, paletteColor(theme.withAlpha(color, 34)), clip);
-            queueRectClipped(state, .{ .x = row.x, .y = row.y, .w = theme.scaledUi(3.0), .h = row.h }, paletteColor(color), clip);
-        } else if (line.kind == .hunk_header or line.kind == .context_gap) {
-            queueRectClipped(state, row, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 145)), clip);
-        }
-        queueRectClipped(state, .{ .x = rect.x + gutter_w, .y = y, .w = 1.0, .h = line_h }, paletteColor(theme.md.code_border), clip);
-
-        renderDiffLineNumber(state, rect.x, y, number_w, line_h, line.old_line, font_size, clip);
-        renderDiffLineNumber(state, rect.x + number_w, y, number_w, line_h, line.new_line, font_size, clip);
-        renderDiffTokens(state, code_x, y, code_clip.w, line_h, line.tokens, line.kind, font_size, code_clip);
-        if (line.kind == .hunk_header) {
-            if (diffHunkSlice(patch, hunk_index)) |hunk| {
-                const copy_rect = palette.Rect{
-                    .x = rect.x + rect.w - theme.scaledUi(52.0),
-                    .y = y + theme.scaledUi(2.0),
-                    .w = theme.scaledUi(46.0),
-                    .h = line_h - theme.scaledUi(4.0),
-                };
-                const hovered = state.transcript_controller.palette_mouse_in_workspace and
-                    rectContains(copy_rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
-                queueRoundedClipped(
-                    state,
-                    copy_rect,
-                    paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, if (hovered) 255 else 210)),
-                    theme.scaledUi(4.0),
-                    clip,
-                );
-                queueCenteredChromeLabel(
-                    state,
-                    copy_rect,
-                    "Copy",
-                    paletteColor(if (hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED),
-                    theme.scaledUi(9.5),
-                    clip,
-                );
-                state.recordTranscriptCopyHit(copy_rect, hunk, toolCopyIdentity(hunk_index, hunk));
-            }
-            hunk_index += 1;
-        }
-    }
-}
-
-fn diffHunkSlice(patch: []const u8, target_index: usize) ?[]const u8 {
-    var found_index: usize = 0;
-    var cursor: usize = 0;
-    while (cursor < patch.len) {
-        const line_end = std.mem.indexOfScalarPos(u8, patch, cursor, '\n') orelse patch.len;
-        const line = patch[cursor..line_end];
-        if (std.mem.startsWith(u8, line, "@@ ")) {
-            if (found_index == target_index) {
-                var end = if (line_end < patch.len) line_end + 1 else line_end;
-                while (end < patch.len) {
-                    const next_end = std.mem.indexOfScalarPos(u8, patch, end, '\n') orelse patch.len;
-                    const next_line = patch[end..next_end];
-                    if (std.mem.startsWith(u8, next_line, "@@ ") or std.mem.startsWith(u8, next_line, "diff --git ")) break;
-                    end = if (next_end < patch.len) next_end + 1 else next_end;
-                }
-                return patch[cursor..end];
-            }
-            found_index += 1;
-        }
-        cursor = if (line_end < patch.len) line_end + 1 else line_end;
-    }
-    return null;
-}
-
-fn renderDiffFallback(
-    state: *app_state.AppState,
-    rect: palette.Rect,
-    text: []const u8,
-    font_size: f32,
-    line_h: f32,
-    clip: palette.Rect,
-) void {
-    const body = if (text.len == 0) "Diff unavailable" else text;
-    var lines = std.mem.splitScalar(u8, body, '\n');
-    var index: usize = 0;
-    while (lines.next()) |line| : (index += 1) {
-        if (index >= @max(wrappedLineCount(body, 120), 2)) break;
-        const y = rect.y + @as(f32, @floatFromInt(index)) * line_h;
-        queueFixedTextLine(state, .{
-            .x = rect.x + theme.scaledUi(10.0),
-            .y = y,
-            .w = rect.w - theme.scaledUi(16.0),
-            .h = line_h,
-        }, line, paletteColor(theme.COLOR_TEXT_MUTED), font_size, clip);
-    }
-}
-
-fn renderDiffLineNumber(
-    state: *app_state.AppState,
-    x: f32,
-    y: f32,
-    width: f32,
-    line_h: f32,
-    number: ?usize,
-    font_size: f32,
-    clip: palette.Rect,
-) void {
-    var buf: [32]u8 = undefined;
-    const label = if (number) |value| std.fmt.bufPrint(&buf, "{d}", .{value}) catch "" else "";
-    queueFixedTextLine(state, .{
-        .x = x + theme.scaledUi(3.0),
-        .y = y,
-        .w = width - theme.scaledUi(8.0),
-        .h = line_h,
-    }, label, paletteColor(theme.COLOR_TEXT_SUBTLE), font_size * 0.9, clip);
-}
-
-fn renderDiffTokens(
-    state: *app_state.AppState,
-    x: f32,
-    y: f32,
-    width: f32,
-    line_h: f32,
-    tokens: []const zig_dif.Token,
-    line_kind: zig_dif.DisplayLineKind,
-    font_size: f32,
-    clip: palette.Rect,
-) void {
-    var cursor_x = x;
-    for (tokens) |token| {
-        if (cursor_x >= x + width) break;
-        const color = diffTokenColor(token.kind, line_kind);
-        const token_w = text_measure.textWidth(.mono, font_size, token.text);
-        state.palette_overlay_batch.roleText(
-            state.allocator,
-            .{ .x = cursor_x, .y = y, .w = @max(token_w, 1.0), .h = line_h },
-            stableText(state, token.text),
-            paletteColor(color),
-            font_size,
-            .mono,
-            null,
-            clip,
-        ) catch {};
-        cursor_x += token_w;
-    }
-}
-
-fn diffTokenColor(kind: zig_dif.TokenKind, line_kind: zig_dif.DisplayLineKind) [4]f32 {
-    if (line_kind == .hunk_header or line_kind == .context_gap) return theme.md.link;
-    if (line_kind == .file_header or line_kind == .prelude or line_kind == .note) return theme.COLOR_TEXT_MUTED;
-    return switch (kind) {
-        .plain => theme.md.tok_plain,
-        .keyword => theme.md.tok_keyword,
-        .string => theme.md.tok_string,
-        .number => theme.md.tok_number,
-        .comment => theme.md.tok_comment,
-        .type_name => theme.md.tok_type,
-        .function_name => theme.md.tok_function,
-        .property_name => theme.md.tok_property,
-        .variable_name => theme.md.tok_variable,
-        .constant_name => theme.md.tok_constant,
-        .operator, .punctuation => theme.md.tok_punct,
-    };
 }
 
 /// Stable key for the command-row expand/collapse state per message index.
@@ -11280,20 +10793,6 @@ test "diff summary v2 round trips delimiter characters and multiple files" {
 test "diff summary v2 rejects truncated payloads" {
     const body = utils.PERSISTED_DIFF_MARKER ++ "FILE\t4\t1\t0\t99\nmain";
     try std.testing.expect(parseDiffSummary(std.testing.allocator, body) == null);
-}
-
-test "split diff layout aligns replacement rows" {
-    const patch =
-        \\@@ -1,2 +1,3 @@
-        \\-const oldValue = 1;
-        \\+const newValue = 2;
-        \\+const extraValue = 3;
-        \\ context();
-    ;
-    const stacked_lines = diffPatchDisplayLineCountForLayout(null, patch, .stacked);
-    const split_lines = diffPatchDisplayLineCountForLayout(null, patch, .split);
-    try std.testing.expectEqual(@as(usize, 5), stacked_lines);
-    try std.testing.expectEqual(@as(usize, 4), split_lines);
 }
 
 test "parent steer wrapper is hidden in the child transcript" {

@@ -46,6 +46,8 @@ test {
     _ = @import("ui/fuzzy_match.zig");
     _ = @import("ui/companion.zig");
     _ = @import("ui/diff_view_cache.zig");
+    _ = @import("ui/diff_render.zig");
+    _ = @import("ui/side_panel_changes.zig");
     _ = @import("ui/handoff_sheet.zig");
     _ = @import("state/handoff_controller.zig");
     _ = @import("state/git_changes_controller.zig");
