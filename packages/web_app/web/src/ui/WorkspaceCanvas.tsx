@@ -6,6 +6,7 @@ import { effectivePanesPerView } from '../lib/ui_config'
 import { ChatPane } from './ChatPane'
 import { Icon, ZoomButton } from './Icons'
 import { PaneActionsButton } from './Sidebar'
+import { SidePanelToggle } from './SidePanel'
 import { TerminalView } from './Terminals'
 
 export function WorkspaceCanvas() {
@@ -280,6 +281,7 @@ function PaneFrame(props: { pane: LivePane }) {
             <span class="text-[11px] tracking-wide text-[var(--accent)]">Live</span>
           </Show>
           <ZoomButton pane={props.pane} />
+          <SidePanelToggle />
           <PaneActionsButton pane={props.pane} />
         </header>
       </Show>

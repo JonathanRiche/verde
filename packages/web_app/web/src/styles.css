@@ -168,6 +168,11 @@ button { transition-property: background-color, color, border-color, opacity, bo
 @keyframes drawer-in { from { transform: translateX(-100%); } }
 @keyframes drawer-out { to { transform: translateX(-100%); } }
 @keyframes drawer-backdrop-out { to { opacity: 0; } }
+/* Right-edge side panel sheet (below lg). */
+.drawer-open .side-sheet-panel { animation: side-sheet-in 240ms var(--ease-out) both; }
+.drawer-closing .side-sheet-panel { animation: side-sheet-out 200ms ease-in both; }
+@keyframes side-sheet-in { from { transform: translateX(100%); } }
+@keyframes side-sheet-out { to { transform: translateX(100%); } }
 
 /* Desktop rail collapse/expand. */
 .sidebar-rail { transition: width 200ms var(--ease-out); overflow: hidden; }
@@ -185,7 +190,7 @@ button { transition-property: background-color, color, border-color, opacity, bo
 :root[data-reduce-motion-status-pulse] :is(.pulse, .cmd-dot-pulse, .composer-stop) { animation: none !important; }
 :root[data-reduce-motion-chat] .chat-pane :is(.anim-fade, .anim-pop, .anim-menu, .anim-reveal) { animation: none !important; }
 :root[data-reduce-motion-chat] .chat-pane * { transition-duration: 0s !important; }
-:root[data-reduce-motion-chrome] :is(.anim-fade, .anim-pop, .anim-menu, .anim-reveal, .drawer-panel, .drawer-backdrop):not(.chat-pane *) { animation: none !important; }
+:root[data-reduce-motion-chrome] :is(.anim-fade, .anim-pop, .anim-menu, .anim-reveal, .drawer-panel, .side-sheet-panel, .drawer-backdrop):not(.chat-pane *) { animation: none !important; }
 :root[data-reduce-motion-chrome] .sidebar-rail { transition: none; }
 /* Without the slide-out the drawer would sit open for its exit timer. */
 :root[data-reduce-motion-chrome] .drawer-closing { display: none; }
@@ -295,6 +300,43 @@ button { transition-property: background-color, color, border-color, opacity, bo
 .diff-emph-del { background: color-mix(in srgb, var(--danger) 32%, transparent); color: var(--text); border-radius: 2px; }
 .diff-file-toggle { display: flex; min-height: 44px; width: 100%; min-width: 0; align-items: center; gap: 8px; text-align: left; }
 .diff-file-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding-bottom: 8px; }
+/* Side panel: Changes and Files. */
+.side-panel-grip { position: absolute; inset-block: 0; left: -3px; z-index: 5; width: 6px; cursor: col-resize; touch-action: none; }
+.side-panel-grip:hover, .side-panel-grip:active { background: color-mix(in srgb, var(--accent) 45%, transparent); }
+.changes-file-row { display: flex; min-height: 34px; width: 100%; min-width: 0; align-items: center; gap: 8px; padding: 4px 12px; text-align: left; }
+.changes-file-row:hover { background: var(--accent-hover); }
+.changes-file-row:focus-visible, .files-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.changes-status { display: grid; width: 16px; height: 16px; flex-shrink: 0; place-items: center; border-radius: 4px; font: 600 10.5px/1 var(--font-mono); }
+.changes-status-add { color: var(--diff-add); background: color-mix(in srgb, var(--diff-add) 14%, transparent); }
+.changes-status-del { color: var(--danger); background: color-mix(in srgb, var(--danger) 14%, transparent); }
+.changes-status-mod { color: var(--warning); background: color-mix(in srgb, var(--warning) 14%, transparent); }
+.changes-owner { max-width: 9rem; flex-shrink: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border-radius: 999px; padding: 1px 7px; font-size: 11px; }
+.changes-owner-none { color: var(--text-subtle); border: 1px dashed var(--border-muted); }
+.changes-owner-owned { color: var(--text-muted); background: var(--panel-muted); }
+.changes-owner-attention { color: var(--warning); background: color-mix(in srgb, var(--warning) 14%, transparent); }
+.changes-bar { display: flex; flex-shrink: 0; gap: 1px; }
+.changes-bar > span { width: 6px; height: 6px; border-radius: 1px; }
+.changes-bar-add { background: var(--diff-add); }
+.changes-bar-del { background: var(--danger); }
+.changes-bar-none { background: var(--panel-muted); }
+.files-row { display: flex; min-height: 28px; width: 100%; min-width: 0; align-items: center; gap: 6px; padding-right: 12px; text-align: left; font-size: 12.5px; color: var(--text); }
+.files-row:hover { background: var(--accent-hover); }
+.files-row-ignored { opacity: 0.5; }
+.code-view { padding-block: 6px; }
+.code-line { display: flex; min-width: 0; }
+.code-line-selected { background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.code-no { position: sticky; left: 0; flex-shrink: 0; width: 4.5ch; padding-right: 1.2ch; text-align: right; color: var(--text-subtle); background: var(--chat-black); cursor: pointer; user-select: none; }
+.code-line-selected .code-no { color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, var(--chat-black)); }
+.code-no:hover { color: var(--text); }
+.code-text { white-space: pre; padding-right: 16px; color: var(--text-muted); }
+.line-prompt { position: absolute; left: max(5.5ch, 8px); z-index: 10; width: min(520px, calc(100vw - 2.5rem)); border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border-muted)); border-radius: 10px; background: var(--panel); padding: 8px 10px 10px; box-shadow: 0 14px 40px rgba(0, 0, 0, 0.5); font-family: var(--font-ui); }
+.line-prompt-inline { position: relative; left: auto; width: auto; margin: 4px 0 8px; box-shadow: none; }
+.diff-no-select { cursor: pointer; }
+.diff-no-select:hover { color: var(--text); }
+.diff-no-selected { color: var(--accent); background: color-mix(in srgb, var(--accent) 18%, transparent); }
+.diff-fold { grid-column: 1 / -1; display: flex; align-items: center; gap: 8px; padding: 2px 8px; text-align: left; color: var(--text-subtle); background: color-mix(in srgb, var(--accent) 6%, var(--panel-muted)); font-size: 11.5px; }
+.diff-fold:hover:not(:disabled) { color: var(--text); background: var(--accent-wash); }
+.diff-fold:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .diff-show-all { display: block; padding: 12px; width: 100%; text-align: left; color: var(--accent-hi); background: var(--panel-muted); white-space: normal; }
 @media (max-width: 1023px), (hover: none) {
   .code-copy, .copy-pill, .diff-action { opacity: 1; min-width: 44px; min-height: 44px; }

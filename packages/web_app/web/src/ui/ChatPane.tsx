@@ -21,7 +21,9 @@ import { GitChangesChip } from './GitChanges'
 import { type CommitNotice, commitNoticeLink, commitNoticeLocalOnly, parseCommitNotice } from '../lib/git_changes'
 import { UsageCard } from './UsageCard'
 import { parseUsageSummary } from '../lib/usage'
-import { copyText, decorateCodeBlocks, emphasisSpans } from '../lib/highlight'
+import { copyText, decorateCodeBlocks } from '../lib/highlight'
+import { DiffLayoutToggle, DiffPatch } from './DiffView'
+import { SidePanelToggle } from './SidePanel'
 
 // Shared 1s ticker driving working timers and group elapsed labels.
 const [nowMs, setNowMs] = createSignal(Date.now())
@@ -337,6 +339,7 @@ export function ChatPane(props: { pane: LivePane }) {
         </Show>
         <GitChangesChip pane={props.pane} />
         <ZoomButton pane={props.pane} />
+        <SidePanelToggle />
         <PaneActionsButton pane={props.pane} />
       </header>
       {/* [overflow-anchor:none]: the browser's own scroll anchoring repositions
@@ -839,208 +842,6 @@ function parseDiffSummary(body: string): DiffFileEntry[] | null {
   return null
 }
 
-type DiffLayout = 'stacked' | 'split'
-const DIFF_LAYOUT_KEY = 'verde.web.diff_layout'
-function readDiffLayout(): DiffLayout {
-  try {
-    return localStorage.getItem(DIFF_LAYOUT_KEY) === 'split' ? 'split' : 'stacked'
-  } catch {
-    return 'stacked'
-  }
-}
-// One preference for every diff card (desktop parity), so it is module state.
-const [diffLayout, setDiffLayoutSignal] = createSignal<DiffLayout>(readDiffLayout())
-function setDiffLayout(layout: DiffLayout) {
-  setDiffLayoutSignal(layout)
-  try {
-    localStorage.setItem(DIFF_LAYOUT_KEY, layout)
-  } catch {
-    // Private mode: the preference just lasts for this page.
-  }
-}
-// Split needs two readable columns; below lg it always renders stacked.
-const wideQuery = typeof matchMedia === 'function' ? matchMedia('(min-width: 1024px)') : null
-const [wideScreen, setWideScreen] = createSignal(wideQuery?.matches ?? false)
-wideQuery?.addEventListener('change', (event) => setWideScreen(event.matches))
-
-type DiffLineKind = 'meta' | 'hunk' | 'add' | 'del' | 'ctx'
-interface DiffLine {
-  kind: DiffLineKind
-  text: string
-  old_no: number | null
-  new_no: number | null
-  // [start, end) of the changed span within text, for paired -/+ lines.
-  emph?: [number, number]
-}
-interface DiffSplitRow {
-  full?: DiffLine
-  left?: DiffLine
-  right?: DiffLine
-}
-
-function parsePatchLines(patch: string): DiffLine[] {
-  const lines: DiffLine[] = []
-  let old_no = 0
-  let new_no = 0
-  let in_hunk = false
-  for (const raw of patch.split('\n')) {
-    const hunk = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(raw)
-    if (hunk) {
-      old_no = Number(hunk[1])
-      new_no = Number(hunk[2])
-      in_hunk = true
-      lines.push({ kind: 'hunk', text: raw, old_no: null, new_no: null })
-    } else if (!in_hunk || raw.startsWith('\\')) {
-      lines.push({ kind: 'meta', text: raw, old_no: null, new_no: null })
-    } else if (raw.startsWith('+')) {
-      lines.push({ kind: 'add', text: raw.slice(1), old_no: null, new_no: new_no++ })
-    } else if (raw.startsWith('-')) {
-      lines.push({ kind: 'del', text: raw.slice(1), old_no: old_no++, new_no: null })
-    } else if (raw.startsWith('diff ') || raw.startsWith('index ')) {
-      in_hunk = false
-      lines.push({ kind: 'meta', text: raw, old_no: null, new_no: null })
-    } else {
-      lines.push({ kind: 'ctx', text: raw.slice(1), old_no: old_no++, new_no: new_no++ })
-    }
-  }
-  if (lines.at(-1)?.kind === 'ctx' && lines.at(-1)?.text === '') lines.pop()
-  markWordEmphasis(lines)
-  return lines
-}
-
-/// Pairs each run of deletions with the additions that follow it and marks the
-/// span between their common prefix and suffix (desktop word-level emphasis).
-function markWordEmphasis(lines: DiffLine[]) {
-  let i = 0
-  while (i < lines.length) {
-    if (lines[i].kind !== 'del') { i += 1; continue }
-    let adds = i
-    while (adds < lines.length && lines[adds].kind === 'del') adds += 1
-    let end = adds
-    while (end < lines.length && lines[end].kind === 'add') end += 1
-    const pairs = Math.min(adds - i, end - adds)
-    for (let k = 0; k < pairs; k += 1) {
-      const a = lines[i + k]
-      const b = lines[adds + k]
-      const spans = emphasisSpans(a.text, b.text)
-      if (!spans) continue
-      a.emph = spans.a
-      b.emph = spans.b
-    }
-    i = end
-  }
-}
-
-function splitRows(lines: DiffLine[]): DiffSplitRow[] {
-  const rows: DiffSplitRow[] = []
-  let i = 0
-  while (i < lines.length) {
-    const line = lines[i]
-    if (line.kind === 'meta' || line.kind === 'hunk') { rows.push({ full: line }); i += 1; continue }
-    if (line.kind === 'ctx') { rows.push({ left: line, right: line }); i += 1; continue }
-    let adds = i
-    while (adds < lines.length && lines[adds].kind === 'del') adds += 1
-    let end = adds
-    while (end < lines.length && lines[end].kind === 'add') end += 1
-    const count = Math.max(adds - i, end - adds)
-    for (let k = 0; k < count; k += 1) {
-      rows.push({
-        left: i + k < adds ? lines[i + k] : undefined,
-        right: adds + k < end ? lines[adds + k] : undefined,
-      })
-    }
-    i = end
-  }
-  return rows
-}
-
-function diffTextClass(kind: DiffLineKind): string {
-  if (kind === 'add') return 'text-[var(--diff-add)]'
-  if (kind === 'del') return 'text-[var(--danger)]'
-  if (kind === 'ctx') return 'text-[var(--text-muted)]'
-  return 'text-[var(--text-subtle)]'
-}
-
-function DiffText(props: { line: DiffLine }) {
-  const emph = () => props.line.emph
-  return (
-    <Show when={emph() && emph()![1] > emph()![0]} fallback={<>{props.line.text.length > 0 ? props.line.text : ' '}</>}>
-      {props.line.text.slice(0, emph()![0])}
-      <span class={props.line.kind === 'add' ? 'diff-emph-add' : 'diff-emph-del'}>
-        {props.line.text.slice(emph()![0], emph()![1])}
-      </span>
-      {props.line.text.slice(emph()![1])}
-    </Show>
-  )
-}
-
-function DiffCell(props: { line?: DiffLine; side: 'old' | 'new' }) {
-  return (
-    <Show when={props.line} fallback={<><span class="diff-no" aria-hidden="true" /><span class="diff-blank" aria-hidden="true" /></>}>
-      {(line) => (
-        <>
-          <span class="diff-no">{(props.side === 'old' ? line().old_no : line().new_no) ?? ''}</span>
-          <span class={`diff-text diff-bg-${line().kind} ${diffTextClass(line().kind)}`}>
-            <span class="diff-sign">{line().kind === 'add' ? '+' : line().kind === 'del' ? '−' : ' '}</span>
-            <DiffText line={line()} />
-          </span>
-        </>
-      )}
-    </Show>
-  )
-}
-
-export function DiffPatch(props: { patch: string; path: string }) {
-  const [showAll, setShowAll] = createSignal(false)
-  const allLines = createMemo(() => parsePatchLines(props.patch))
-  const lines = createMemo(() => showAll() ? allLines() : allLines().slice(0, 2000))
-  const split = () => diffLayout() === 'split' && wideScreen()
-  return (
-    <div class="mono diff-patch mb-2 max-w-full overflow-x-auto text-[12.5px] leading-[1.45] scrollbar-thin">
-      <Show
-        when={split()}
-        fallback={
-          <div class="diff-grid diff-grid-stacked">
-            <For each={lines()}>
-              {(line) => (
-                <Show
-                  when={line.kind !== 'meta' && line.kind !== 'hunk'}
-                  fallback={<span class={`diff-full ${diffTextClass(line.kind)}`}>{line.text.length > 0 ? line.text : ' '}</span>}
-                >
-                  <span class="diff-no">{line.new_no ?? line.old_no ?? ''}</span>
-                  <span class={`diff-text diff-bg-${line.kind} ${diffTextClass(line.kind)}`}>
-                    <span class="diff-sign">{line.kind === 'add' ? '+' : line.kind === 'del' ? '-' : ' '}</span>
-                    <DiffText line={line} />
-                  </span>
-                </Show>
-              )}
-            </For>
-          </div>
-        }
-      >
-        <div class="diff-grid diff-grid-split">
-          <For each={splitRows(lines())}>
-            {(row) => (
-              <Show
-                when={!row.full}
-                fallback={<span class={`diff-full ${diffTextClass(row.full!.kind)}`}>{row.full!.text.length > 0 ? row.full!.text : ' '}</span>}
-              >
-                <DiffCell line={row.left} side="old" />
-                <DiffCell line={row.right} side="new" />
-              </Show>
-            )}
-          </For>
-        </div>
-      </Show>
-      <Show when={!showAll() && allLines().length > 2000}>
-        <button type="button" class="diff-show-all" aria-label={`Show all ${allLines().length} patch lines for ${props.path}`} onClick={() => setShowAll(true)}>
-          Showing 2,000 of {allLines().length.toLocaleString()} lines · Show all
-        </button>
-      </Show>
-    </div>
-  )
-}
-
 function DiffFileRow(props: { file: DiffFileEntry; cardId: string; pane: LivePane }) {
   const [expanded, toggleExpanded] = usePersistedFlag(
     () => `diff:${props.cardId}:${props.file.path}`,
@@ -1118,20 +919,7 @@ function DiffCard(props: { message: Message; pane: LivePane }) {
             <div class="min-w-0 flex-1 truncate text-[14px] text-[var(--text)]">
               Changed files — {parsed().length} {parsed().length === 1 ? 'file' : 'files'}
             </div>
-            <div role="group" aria-label="Diff layout" class="hidden shrink-0 overflow-hidden rounded-[6px] bg-[var(--panel-muted)] text-[11px] lg:flex">
-              <For each={['stacked', 'split'] as const}>
-                {(layout) => (
-                  <button
-                    type="button"
-                    aria-pressed={diffLayout() === layout}
-                    class={`px-2.5 py-1 capitalize ${diffLayout() === layout ? 'bg-[var(--accent-wash)] text-[var(--text)]' : 'text-[var(--text-muted)] hover:text-[var(--text)]'}`}
-                    onClick={() => setDiffLayout(layout)}
-                  >
-                    {layout}
-                  </button>
-                )}
-              </For>
-            </div>
+            <DiffLayoutToggle />
             <div class="mono flex shrink-0 gap-2 text-[13px] text-[var(--text-muted)]">
               <span>+{totals().additions}</span>
               <span>-{totals().deletions}</span>

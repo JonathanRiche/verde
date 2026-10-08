@@ -5,7 +5,7 @@ import {
   type CommitAction, type GitToastTone, type Ownership, type ReviewFile, type ReviewRepo,
 } from '../lib/git_changes'
 import { store } from '../lib/store'
-import { DiffPatch } from './ChatPane'
+import { DiffPatch } from './DiffView'
 import { Icon, Spinner } from './Icons'
 
 const git = store.gitChanges

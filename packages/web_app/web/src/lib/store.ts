@@ -1967,6 +1967,10 @@ export function createAppStore() {
     })
   }
 
+  /// Bumped per workspace on every chat.turn journal entry; views that read
+  /// the working tree (Changes) refetch once it settles.
+  const [turnActivity, setTurnActivity] = createSignal<Record<string, number>>({})
+
   const applyChanges = (params: unknown) => {
     const root = params as {
       result?: { entries?: Array<{ topic: string; workspace_id?: string | null }>; heartbeat?: boolean }
@@ -1977,9 +1981,11 @@ export function createAppStore() {
     if (result.heartbeat && !(result.entries && result.entries.length > 0)) return
     // Git change summaries have no journal topic; a chat.turn entry is the
     // cue that a chat may have touched its working tree (debounced).
+    const turned = new Set<string>()
     for (const entry of result.entries ?? []) {
-      if (entry.topic === 'chat.turn' && entry.workspace_id) gitChanges.scheduleSummaryRefresh(entry.workspace_id)
+      if (entry.topic === 'chat.turn' && entry.workspace_id) { gitChanges.scheduleSummaryRefresh(entry.workspace_id); turned.add(entry.workspace_id) }
     }
+    if (turned.size > 0) setTurnActivity((prev) => { const next = { ...prev }; for (const id of turned) next[id] = (next[id] ?? 0) + 1; return next })
     void refreshProjection()
   }
 
@@ -3103,6 +3109,38 @@ export function createAppStore() {
     )
     focusPane(pane)
     setComposerNonce((value) => value + 1)
+  }
+
+  /// Sends `text` as a message on the pane's chat (a follow-up while it is
+  /// working) without touching what the user has in that chat's composer:
+  /// sendDraft owns draft + attachments, so they are swapped out for the call
+  /// and put back after. Returns whether the message was accepted.
+  const sendPromptTo = async (pane: LivePane, text: string): Promise<boolean> => {
+    if (pane.kind !== 'chat' || !text.trim()) return false
+    if (sending() || uploadingAttachmentsFor(pane)) {
+      setNotice('Wait for the current send to finish.')
+      return false
+    }
+    const key = paneKey(pane.workspace_id, pane.pane_id)
+    const saved_draft = draftFor(pane)
+    const saved_images = attachmentsFor(pane)
+    setDraftFor(pane, text)
+    setDraftAttachments((prev) => ({ ...prev, [key]: [] }))
+    try {
+      await sendDraft(pane)
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : 'send failed')
+    }
+    // sendDraft clears the draft once accepted; a rollback or refusal leaves
+    // `text` in place.
+    const accepted = draftFor(pane) !== text
+    setDraftFor(pane, saved_draft)
+    setDraftAttachments((prev) => ({ ...prev, [key]: [...saved_images, ...(prev[key] ?? []).filter((image) => !saved_images.includes(image))] }))
+    scheduleComposerCacheWrite()
+    // The follow-up path re-syncs a focused composer from the swapped-out
+    // (empty) draft; copy the restored text back into it.
+    if (saved_draft) setComposerNonce((value) => value + 1)
+    return accepted
   }
 
   const attachmentsFor = (pane: LivePane | null | undefined) => {
@@ -5289,6 +5327,10 @@ export function createAppStore() {
     draftFor,
     setDraftFor,
     beginDiffComment,
+    sendPromptTo,
+    turnActivity,
+    /// Local daemon RPC for workspace-scoped views (Changes, Files).
+    workspaceCall: interactiveCall,
     attachmentsFor,
     uploadingAttachmentsFor,
     attachFiles,

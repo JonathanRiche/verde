@@ -14,6 +14,8 @@ import { WorkspaceCanvas } from './WorkspaceCanvas'
 import { DesktopViewer, desktopViewerOpen } from './DesktopViewer'
 import { GitChangesLayer } from './CommitSheet'
 import { GitChangesChip } from './GitChanges'
+import { SidePanelDock, SidePanelSheet, SidePanelSheetButton } from './SidePanel'
+import { WorkspaceFileViewer, workspaceFileViewerOpen } from './WorkspaceFiles'
 
 export function App() {
   onMount(() => {
@@ -88,6 +90,7 @@ export function App() {
           <Show when={focused()?.kind === 'chat' ? focused() : undefined} keyed>
             {(pane) => <GitChangesChip pane={pane} />}
           </Show>
+          <SidePanelSheetButton />
           <Show
             when={(focused()?.kind === 'chat' || focused()?.kind === 'terminal') ? focused() : undefined}
             keyed
@@ -109,7 +112,10 @@ export function App() {
             <Icon name="expand" class="h-4 w-4" />
           </button>
         </Show>
+        <SidePanelSheet />
       </div>
+
+      <SidePanelDock />
 
       <Palette />
       <Settings />
@@ -117,6 +123,7 @@ export function App() {
       <ActionDialog />
       <History />
       <FileViewer />
+      <WorkspaceFileViewer />
       <DesktopViewer />
       <GitChangesLayer />
       <NoticeToast />
@@ -131,7 +138,7 @@ const NOTICE_TOAST_MS = 4000
 /// workspace in focus, a sub-agent pane, or an overlay covering the composer.
 function NoticeToast() {
   const overlayOpen = () =>
-    store.paletteOpen() || store.settingsOpen() || store.workspaceDialogOpen() || historyOpen() || fileViewerOpen()
+    store.paletteOpen() || store.settingsOpen() || store.workspaceDialogOpen() || historyOpen() || fileViewerOpen() || workspaceFileViewerOpen()
   const composerShows = () => {
     const pane = store.focusedPane()
     return pane?.kind === 'chat' && !isSubagentThreadId(pane.thread_id)
