@@ -3,6 +3,7 @@ const std = @import("std");
 const host = @import("host.zig");
 pub const markdown = @import("render_markdown.zig");
 pub const diff = @import("render_diff.zig");
+pub const selection_prompt = @import("selection_prompt.zig");
 const syntax = @import("zig_dif").syntax;
 const A = std.mem.Allocator;
 const V = std.json.Value;
@@ -26,6 +27,16 @@ pub fn query(a: A, request: V) host.ApiError!Result {
 
 fn queryInner(a: A, request: V) Error!Result {
     const utility = try string(request, "utility");
+    if (eq(utility, "selection_prompt")) {
+        const parsed = std.json.parseFromValueLeaky(selection_prompt.Request, a, request, .{ .ignore_unknown_fields = true }) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.InvalidInput,
+        };
+        const text = try selection_prompt.format(a, parsed);
+        var object: std.json.ObjectMap = .empty;
+        try object.put(a, "text", .{ .string = text });
+        return .{ .data = .{ .object = object } };
+    }
     if (!eq(utility, "markdown") and !eq(utility, "highlight") and !eq(utility, "diff") and !eq(utility, "diff_index"))
         return .{ .failure = .{ .code = "unsupported", .message = "Unknown rendering utility." } };
     const text = try string(request, "text");
