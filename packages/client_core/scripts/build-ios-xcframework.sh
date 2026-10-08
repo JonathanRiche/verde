@@ -21,11 +21,18 @@ simulator_sdk=$(xcrun --sdk iphonesimulator --show-sdk-path)
 staging=$(mktemp -d "${TMPDIR:-/tmp}/verde-client-ios.XXXXXX")
 trap 'rm -rf "$staging"' EXIT
 # Zig's archiver leaves members 4-byte aligned; Xcode 26's linker rejects
-# them, so repack with Apple's libtool, which writes 8-byte aligned members.
+# them and libtool drops them, so extract the objects and archive them again.
 for slice in device simulator; do
-    mkdir -p "$staging/$slice"
+    archive="$prefix/lib/ios/$slice/libverde_client.a"
+    objects="$staging/$slice/objects"
+    mkdir -p "$objects"
+    if [[ -n $(xcrun ar t "$archive" | sort | uniq -d) ]]; then
+        echo "duplicate member names in $archive; extraction would drop objects" >&2
+        exit 1
+    fi
+    (cd "$objects" && xcrun ar x "$archive")
     xcrun libtool -static -no_warning_for_no_symbols \
-        -o "$staging/$slice/libverde_client.a" "$prefix/lib/ios/$slice/libverde_client.a"
+        -o "$staging/$slice/libverde_client.a" "$objects"/*
 done
 xcodebuild -create-xcframework \
     -library "$staging/device/libverde_client.a" -headers "$PWD/include" \
