@@ -4053,7 +4053,7 @@ test "git change review and commits are daemon routed with repository scopes" {
     const commit = access.scopeBit(.chat_write) | read;
     const chat_preset = try access.scopeMask(access.PairingPreset.chat.scopes());
     const monitor_preset = try access.scopeMask(access.PairingPreset.monitor.scopes());
-    inline for (.{ "git.changes.summary", "git.changes.status", "git.changes.review", "git.changes.commit_message" }) |method| {
+    inline for (.{ "git.changes.summary", "git.changes.status", "git.changes.review", "git.changes.commit_message", "git.changes.workspace", "git.changes.file_patch" }) |method| {
         try std.testing.expect(!blockedRpcMethod(method));
         try std.testing.expectEqual(@as(PairedRpcPolicy, .{ .authorize = read }), pairedRpcPolicy(method, read));
         try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy(method, 0));

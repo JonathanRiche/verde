@@ -109,7 +109,7 @@ pub const Router = struct {
 };
 
 pub fn allowedMethod(method: []const u8) bool {
-    inline for (.{ "chat.turn.start", "chat.turn.list", "chat.turn.tail", "chat.turn.cancel", "chat.turn.approve", "chat.turn.steer", "chat.followup", "chat.thread.get", "workspace.repository.manifest.get", "workspace.files.search", "workspace.files.list", "workspace.files.read", "workspace.directory.list", "workspace.create", "workspace.close", "chat.subagent.open", "provider.models.list", "providers.status", "chat.message.list", "provider.slash.list", "provider.slash.run", "provider.thread.sync", "chat.shell.run", "chat.attachment.create", "chat.attachment.append", "chat.attachment.commit", "git.changes.review", "git.changes.status", "git.changes.commit_message", "git.changes.commit", "git.changes.push", "git.changes.pull_push" }) |allowed| {
+    inline for (.{ "chat.turn.start", "chat.turn.list", "chat.turn.tail", "chat.turn.cancel", "chat.turn.approve", "chat.turn.steer", "chat.followup", "chat.thread.get", "workspace.repository.manifest.get", "workspace.files.search", "workspace.files.list", "workspace.files.read", "workspace.directory.list", "workspace.create", "workspace.close", "chat.subagent.open", "provider.models.list", "providers.status", "chat.message.list", "provider.slash.list", "provider.slash.run", "provider.thread.sync", "chat.shell.run", "chat.attachment.create", "chat.attachment.append", "chat.attachment.commit", "git.changes.review", "git.changes.status", "git.changes.commit_message", "git.changes.commit", "git.changes.push", "git.changes.pull_push", "git.changes.workspace", "git.changes.file_patch" }) |allowed| {
         if (std.mem.eql(u8, method, allowed)) return true;
     }
     return false;
@@ -127,6 +127,8 @@ test "web runtime routing exposes only chat execution and repository inspection"
     try std.testing.expect(allowedMethod("git.changes.commit"));
     try std.testing.expect(allowedMethod("git.changes.status"));
     try std.testing.expect(allowedMethod("git.changes.push"));
+    try std.testing.expect(allowedMethod("git.changes.workspace"));
+    try std.testing.expect(allowedMethod("git.changes.file_patch"));
     try std.testing.expect(!allowedMethod("config.commit.set"));
     try std.testing.expect(!allowedMethod("access.pairing.create"));
     try std.testing.expect(!allowedMethod("workspace.repository.binding.upsert"));

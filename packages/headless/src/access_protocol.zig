@@ -363,6 +363,8 @@ pub const PAIRED_RPC_METHODS = [_]PairedRpcMethod{
     .{ .method = "git.changes.status", .scope_mask = REPOSITORY_READ },
     .{ .method = "git.changes.review", .scope_mask = REPOSITORY_READ },
     .{ .method = "git.changes.commit_message", .scope_mask = REPOSITORY_READ },
+    .{ .method = "git.changes.workspace", .scope_mask = REPOSITORY_READ },
+    .{ .method = "git.changes.file_patch", .scope_mask = REPOSITORY_READ },
     .{ .method = "git.changes.commit", .scope_mask = GIT_COMMIT },
     .{ .method = "git.changes.push", .scope_mask = GIT_COMMIT },
     .{ .method = "git.changes.pull_push", .scope_mask = GIT_COMMIT },
@@ -935,7 +937,7 @@ test "chat preset may commit and push but monitor may not" {
         try std.testing.expect(!scopeMaskContains(monitor, required));
         try std.testing.expect(required & REPOSITORY_WRITE == 0);
     }
-    for ([_][]const u8{ "git.changes.summary", "git.changes.status", "git.changes.review", "git.changes.commit_message" }) |method| {
+    for ([_][]const u8{ "git.changes.summary", "git.changes.status", "git.changes.review", "git.changes.commit_message", "git.changes.workspace", "git.changes.file_patch" }) |method| {
         try std.testing.expectEqual(@as(?u16, REPOSITORY_READ), requiredScopeMaskForRpc(method));
         try std.testing.expect(scopeMaskContains(monitor, REPOSITORY_READ));
     }

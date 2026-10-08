@@ -16,6 +16,8 @@
 //! - `git.changes.commit`         CommitRequest -> CommitResult          [chat:write + repository:read]
 //! - `git.changes.push`           PushRequest -> PullPushResult          [chat:write + repository:read]
 //! - `git.changes.pull_push`      PullPushRequest -> PullPushResult      [chat:write + repository:read]
+//! - `git.changes.workspace`      WorkspaceRequest -> WorkspaceResult    [repository:read]
+//! - `git.changes.file_patch`     FilePatchRequest -> FilePatchResult    [repository:read]
 //! - `config.commit.set`          ConfigCommitSetRequest -> ConfigCommitSnapshot [owner only, like config.ui.set]
 //!
 //! Committing and pushing a chat's own changes is a chat action, so the Chat
@@ -25,6 +27,36 @@
 //! Reads run with `GIT_OPTIONAL_LOCKS=0` and never fetch. `push` and
 //! `pull_push` only accept repositories the workspace already surfaced
 //! through claims, `review`, or `status`.
+//!
+//! ## Workspace changes (`git.changes.workspace`, `git.changes.file_patch`)
+//!
+//! Client-agnostic read model behind the desktop side panel's Changes view
+//! (also meant for the web and mobile clients). Baseline is the working tree
+//! against HEAD; untracked files are listed as `added`.
+//! - Repository id: `WorkspaceRepo.root`, an opaque string (the repository's
+//!   absolute path on the daemon host). Clients echo it back verbatim in
+//!   `FilePatchRequest.root`; `WorkspaceRepo.name` is the display name.
+//! - File paths are repository-relative, `/`-separated, never `..`.
+//! - Ownership is workspace-wide (`unassigned`, `mine` = one confident chat,
+//!   `unclear`, `shared`); `owners` names the claiming chats; `title` is never empty
+//!   (closed, untitled, and subagent chats read `Chat <last 6 id chars>`).
+//! - Bounds: at most `MAX_WORKSPACE_FILES` files per response. A repository
+//!   with more dirty paths than the daemon tracks, or that would exceed the
+//!   remaining budget, comes back `too_many_files` with no files. Patches over
+//!   `MAX_FILE_PATCH_BYTES` come back `truncated` with no text; binary files
+//!   come back `binary` with no text.
+//! - Patch format: plain git unified diff for one file (`diff --git` header,
+//!   `---`/`+++`, `@@` hunks; new files diff from `/dev/null`), not
+//!   VERDE_DIFF_V2. `context_lines` is git's `-U` (null: 3, capped at
+//!   1_000_000 = whole file), so clients can expand collapsed context by
+//!   refetching with a larger value.
+//! - Errors: `invalid_params` (malformed request, or a path that is not
+//!   repository-relative), `resource_not_found` (`root` is not one of the
+//!   workspace's repositories), `capability_unavailable` (git missing or the
+//!   repository unreadable). A path that is no longer dirty is not an error:
+//!   it comes back `clean`.
+//! - Not journaled: refresh on `chat.turn`/`chat.completion` activity, on
+//!   open, and after commits, like `git.changes.summary`.
 //!
 //! ## Committed transcript row
 //!
@@ -87,6 +119,11 @@ pub const METHOD_PUSH: []const u8 = "git.changes.push";
 pub const METHOD_STATUS: []const u8 = "git.changes.status";
 /// Owner-only write of the `chat.commit_*` keys in verde.json.
 pub const METHOD_CONFIG_COMMIT_SET: []const u8 = "config.commit.set";
+/// Every uncommitted file across the workspace's repositories (the desktop
+/// side panel's Changes view). Read-only; claims are never pruned here.
+pub const METHOD_WORKSPACE: []const u8 = "git.changes.workspace";
+/// One file's patch against HEAD, fetched lazily per expanded file.
+pub const METHOD_FILE_PATCH: []const u8 = "git.changes.file_patch";
 
 /// Returned when a commit's frozen patch no longer applies. Re-open review.
 pub const ERR_CHANGED_SINCE_REVIEW: []const u8 = "changed_since_review";
@@ -382,6 +419,98 @@ pub const PullPushResult = struct {
     remote_url: ?[]const u8 = null,
 };
 
+pub const WorkspaceRequest = struct {
+    workspace_id: []const u8,
+};
+
+pub const WorkspaceOwner = struct {
+    local_thread_id: []const u8,
+    /// Never empty; falls back to `Chat <last 6 id chars>`.
+    title: []const u8,
+    /// The claim is a guess (overlapping turns without edit evidence).
+    unclear: bool = false,
+};
+
+pub const WorkspaceFile = struct {
+    /// Repository-relative path.
+    path: []const u8,
+    /// `modified`, `added`, or `deleted` (untracked files are `added`).
+    status: []const u8,
+    untracked: bool = false,
+    /// Workspace-wide, not relative to one chat: `unassigned` (no chat
+    /// claimed it), `mine` (one chat), `unclear` (one uncertain claim), or
+    /// `shared` (several chats).
+    ownership: []const u8,
+    owners: []const WorkspaceOwner = &.{},
+    additions: u32 = 0,
+    deletions: u32 = 0,
+    binary: bool = false,
+};
+
+pub const WorkspaceRepo = struct {
+    root: []const u8,
+    /// Last path component of `root`.
+    name: []const u8,
+    head: ?[]const u8 = null,
+    /// Same meaning as the `RepoStatus` fields.
+    branch: ?[]const u8 = null,
+    default_branch: ?[]const u8 = null,
+    is_default_branch: bool = false,
+    upstream: ?[]const u8 = null,
+    ahead: u32 = 0,
+    behind: u32 = 0,
+    has_remote: bool = false,
+    /// Too many dirty paths to list (or over the response's
+    /// `MAX_WORKSPACE_FILES` budget); `files` is empty.
+    too_many_files: bool = false,
+    /// Sorted by path; empty for a clean repository.
+    files: []const WorkspaceFile = &.{},
+};
+
+/// Repositories reachable from the workspace (its folder, configured extra
+/// folders, and any repository holding the workspace's claims), each with its
+/// uncommitted changes against HEAD.
+pub const WorkspaceResult = struct {
+    workspace_id: []const u8,
+    /// Claims revision, as in `SummaryResult`.
+    revision: u64 = 0,
+    repos: []const WorkspaceRepo = &.{},
+};
+
+/// Files listed across all repositories of one `git.changes.workspace`
+/// response (keeps it under the 1 MiB remote-runtime message limit).
+pub const MAX_WORKSPACE_FILES: usize = 2000;
+
+/// Patches larger than this come back `truncated` with no text.
+pub const MAX_FILE_PATCH_BYTES: u64 = 256 * 1024;
+
+pub const FilePatchRequest = struct {
+    workspace_id: []const u8,
+    /// A `WorkspaceRepo.root` of this workspace; others are refused.
+    root: []const u8,
+    path: []const u8,
+    /// Unchanged lines around each change (`git diff -U`); null means 3.
+    /// The view asks for a large value to expand collapsed context.
+    context_lines: ?u32 = null,
+};
+
+pub const FilePatchResult = struct {
+    root: []const u8,
+    path: []const u8,
+    /// The file is no longer dirty; the other fields are empty.
+    clean: bool = false,
+    status: []const u8 = "modified",
+    binary: bool = false,
+    truncated: bool = false,
+    additions: u32 = 0,
+    deletions: u32 = 0,
+    /// Echo of the request's `context_lines`.
+    context_lines: ?u32 = null,
+    /// Unified diff (`diff --git` header and hunks); null when clean,
+    /// binary, or truncated.
+    patch: ?[]const u8 = null,
+};
+
 pub const ConfigCommitSetRequest = struct {
     /// `auto`, `codex`, `claude`, `cursor`, or `opencode`.
     commit_message_provider: ?[]const u8 = null,
@@ -407,4 +536,6 @@ test "git changes method names are stable" {
     try std.testing.expectEqualStrings("git.changes.push", METHOD_PUSH);
     try std.testing.expectEqualStrings("git.changes.status", METHOD_STATUS);
     try std.testing.expectEqualStrings("config.commit.set", METHOD_CONFIG_COMMIT_SET);
+    try std.testing.expectEqualStrings("git.changes.workspace", METHOD_WORKSPACE);
+    try std.testing.expectEqualStrings("git.changes.file_patch", METHOD_FILE_PATCH);
 }

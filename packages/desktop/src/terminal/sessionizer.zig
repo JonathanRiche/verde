@@ -3013,6 +3013,8 @@ pub const Daemon = struct {
         if (std.mem.eql(u8, method, git_changes_protocol.METHOD_PULL_PUSH)) return try gitChangesPullPushResponse(self, id_value, params);
         if (std.mem.eql(u8, method, git_changes_protocol.METHOD_PUSH)) return try gitChangesPushResponse(self, id_value, params);
         if (std.mem.eql(u8, method, git_changes_protocol.METHOD_STATUS)) return try gitChangesStatusResponse(self, id_value, params);
+        if (std.mem.eql(u8, method, git_changes_protocol.METHOD_WORKSPACE)) return try gitChangesWorkspaceResponse(self, id_value, params);
+        if (std.mem.eql(u8, method, git_changes_protocol.METHOD_FILE_PATCH)) return try gitChangesFilePatchResponse(self, id_value, params);
         if (std.mem.eql(u8, method, git_changes_protocol.METHOD_CONFIG_COMMIT_SET)) return try configCommitSetResponse(self, id_value, params);
         if (std.mem.eql(u8, method, store_protocol.METHOD_BROWSER_COOKIE_SOURCES_LIST)) return try browserCookieSourcesListResponse(self, id_value);
         if (std.mem.eql(u8, method, store_protocol.METHOD_BROWSER_COOKIE_DOMAINS_LIST)) return try browserCookieDomainsListResponse(self, id_value, params);
@@ -16184,6 +16186,178 @@ fn gitChangesPushResponse(daemon: *Daemon, id_value: std.json.Value, params: std
     };
     result_json = try std.json.Stringify.valueAlloc(arena, result, .{});
     return try okValueResponse(allocator, id_value, result);
+}
+
+/// Repository roots of a workspace for the Changes view: its folder and
+/// configured extra folders (as a turn would snapshot them) plus every
+/// repository holding the workspace's claims.
+fn gitChangesWorkspaceRoots(daemon: *Daemon, arena: std.mem.Allocator, git: *git_changes.Git, workspace_id: []const u8) ![]const []const u8 {
+    var roots: std.ArrayList([]const u8) = .empty;
+    {
+        daemon.git_changes.mutex.lock();
+        defer daemon.git_changes.mutex.unlock();
+        try roots.appendSlice(arena, try daemon.git_changes.ledger.workspaceRepos(arena, workspace_id));
+    }
+    const route = git_changes_protocol.StatusRequest{ .workspace_id = workspace_id, .local_thread_id = "" };
+    const project_root = gitChangesRouteRoot(daemon, arena, route) orelse return roots.items;
+    for (try gitChangesTurnPaths(arena, project_root, null)) |path| {
+        const top = (try git_changes.repoToplevel(git, path)) orelse continue;
+        const seen = for (roots.items) |root| {
+            if (std.mem.eql(u8, root, top)) break true;
+        } else false;
+        if (!seen) try roots.append(arena, top);
+    }
+    return roots.items;
+}
+
+/// Owner titles are never empty: closed, deleted, untitled, and subagent chats
+/// fall back to "Chat <last 6 id chars>".
+fn workspaceOwnerTitle(arena: std.mem.Allocator, stored: []const u8, thread_id: []const u8) ![]const u8 {
+    const trimmed = std.mem.trim(u8, stored, " \t\r\n");
+    if (trimmed.len > 0) return trimmed;
+    const short = thread_id[thread_id.len -| 6..];
+    if (short.len == 0) return "Chat";
+    return try std.fmt.allocPrint(arena, "Chat {s}", .{short});
+}
+
+test "workspace owner titles fall back to a short chat id" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectEqualStrings("Fix tabs", try workspaceOwnerTitle(arena, "  Fix tabs\n", "chat-1"));
+    try std.testing.expectEqualStrings("Chat 28ee00", try workspaceOwnerTitle(arena, "", "chat-1791488817891-756f5628ee00"));
+    try std.testing.expectEqualStrings("Chat ab", try workspaceOwnerTitle(arena, " ", "ab"));
+    try std.testing.expectEqualStrings("Chat", try workspaceOwnerTitle(arena, "", ""));
+}
+
+fn gitChangesWorkspaceResponse(daemon: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+    const allocator = daemon.allocator;
+    var parsed = parseDaemonParams(git_changes_protocol.WorkspaceRequest, allocator, params) catch
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid git changes workspace request");
+    defer parsed.deinit();
+    const workspace_id = parsed.value.workspace_id;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var git = git_changes.Git.init(arena) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "git is not available"),
+    };
+    defer git.deinit();
+    const roots = try gitChangesWorkspaceRoots(daemon, arena, &git, workspace_id);
+    var repo_claims: std.ArrayList(git_changes.RepoClaims) = .empty;
+    const revision = blk: {
+        daemon.git_changes.mutex.lock();
+        defer daemon.git_changes.mutex.unlock();
+        for (roots) |root| {
+            try repo_claims.append(arena, .{ .root = root, .claims = try daemon.git_changes.ledger.claimsForRepo(arena, root) });
+        }
+        break :blk daemon.git_changes.ledger.revision;
+    };
+
+    // git with no daemon lock held.
+    const changes = git_changes.workspaceChanges(&git, workspace_id, repo_claims.items) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "git changes could not be read"),
+    };
+
+    const service = gitChangesPinStore(daemon);
+    defer if (service) |svc| {
+        _ = svc.in_flight.fetchSub(1, .monotonic);
+    };
+    // One title lookup per chat, not per file.
+    var titles: std.StringHashMapUnmanaged([]const u8) = .empty;
+    var repos: std.ArrayList(git_changes_protocol.WorkspaceRepo) = .empty;
+    var file_budget: usize = git_changes_protocol.MAX_WORKSPACE_FILES;
+    for (changes) |repo| {
+        const over_budget = repo.files.len > file_budget;
+        const listed = if (over_budget) repo.files[0..0] else repo.files;
+        file_budget -= listed.len;
+        const files = try arena.alloc(git_changes_protocol.WorkspaceFile, listed.len);
+        for (listed, files) |file, *out| {
+            const owners = try arena.alloc(git_changes_protocol.WorkspaceOwner, file.owners.len);
+            for (file.owners, owners) |owner, *owner_out| {
+                const title = titles.get(owner.thread_id) orelse title: {
+                    const value = try workspaceOwnerTitle(arena, gitChangesThreadTitle(arena, service, workspace_id, owner.thread_id), owner.thread_id);
+                    try titles.put(arena, owner.thread_id, value);
+                    break :title value;
+                };
+                owner_out.* = .{ .local_thread_id = owner.thread_id, .title = title, .unclear = owner.unclear };
+            }
+            out.* = .{
+                .path = file.path,
+                .status = @tagName(file.status),
+                .untracked = file.untracked,
+                .ownership = @tagName(file.ownership),
+                .owners = owners,
+                .additions = file.additions,
+                .deletions = file.deletions,
+                .binary = file.binary,
+            };
+        }
+        try repos.append(arena, .{
+            .root = repo.root,
+            .name = std.fs.path.basename(repo.root),
+            .head = repo.head,
+            .branch = repo.status.branch,
+            .default_branch = repo.status.default_branch,
+            .is_default_branch = repo.status.is_default_branch,
+            .upstream = repo.status.upstream,
+            .ahead = repo.status.ahead,
+            .behind = repo.status.behind,
+            .has_remote = repo.status.has_remote,
+            .too_many_files = repo.too_many_files or over_budget,
+            .files = files,
+        });
+    }
+    return try okValueResponse(allocator, id_value, git_changes_protocol.WorkspaceResult{
+        .workspace_id = workspace_id,
+        .revision = revision,
+        .repos = repos.items,
+    });
+}
+
+fn gitChangesFilePatchResponse(daemon: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+    const allocator = daemon.allocator;
+    var parsed = parseDaemonParams(git_changes_protocol.FilePatchRequest, allocator, params) catch
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid git changes file patch request");
+    defer parsed.deinit();
+    const request = parsed.value;
+    if (!git_changes.validRelativePath(request.path))
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "path must be repository-relative");
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var git = git_changes.Git.init(arena) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "git is not available"),
+    };
+    defer git.deinit();
+    // Only this workspace's repositories may be read.
+    const known = for (try gitChangesWorkspaceRoots(daemon, arena, &git, request.workspace_id)) |root| {
+        if (std.mem.eql(u8, root, request.root)) break true;
+    } else false;
+    if (!known) return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_RESOURCE_NOT_FOUND, "root is not a repository of this workspace");
+
+    const patch = git_changes.filePatch(&git, request.root, request.path, request.context_lines) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidSelection => return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "path must be repository-relative"),
+        else => return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "git changes could not be read"),
+    };
+    return try okValueResponse(allocator, id_value, git_changes_protocol.FilePatchResult{
+        .root = request.root,
+        .path = request.path,
+        .clean = patch.clean,
+        .status = @tagName(patch.status),
+        .binary = patch.binary,
+        .truncated = patch.truncated,
+        .additions = patch.additions,
+        .deletions = patch.deletions,
+        .context_lines = request.context_lines,
+        .patch = patch.patch,
+    });
 }
 
 fn gitChangesStatusResponse(daemon: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {

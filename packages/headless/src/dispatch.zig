@@ -454,6 +454,8 @@ test "reads are not mutators and store mutators drain" {
         "workspace.files.search",
         "workspace.files.list",
         "workspace.files.read",
+        "git.changes.workspace",
+        "git.changes.file_patch",
         "chat.thread.list",
         "chat.message.list",
         "providers.status",

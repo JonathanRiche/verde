@@ -1354,7 +1354,7 @@ pub fn buildReview(gpa: std.mem.Allocator, input: ReviewInput) Error!Review {
             }) catch return error.OutOfMemory;
         }
         if (files.items.len == 0) continue;
-        try freezePatches(&git, arena, root, head, entries, files.items);
+        try freezePatches(&git, arena, root, head, entries, files.items, null);
         repos.append(arena, .{
             .root = arena.dupe(u8, root) catch return error.OutOfMemory,
             .branch = branch,
@@ -1388,8 +1388,15 @@ fn freezePatches(
     head: ?[]const u8,
     entries: []const StatusEntry,
     files: []ReviewFile,
+    /// `git diff -U<n>`; null keeps git's default of 3.
+    context_lines: ?u32,
 ) Error!void {
-    const scratch = try scratchPath(git, arena, root, "review.index");
+    // Unique per call: a review and a Changes-view file patch may freeze
+    // patches in the same repository concurrently.
+    var random_bytes: [8]u8 = undefined;
+    std.Io.Threaded.global_single_threaded.io().random(&random_bytes);
+    const scratch_name = std.fmt.allocPrint(arena, "review-{s}.index", .{std.fmt.bytesToHex(random_bytes, .lower)}) catch return error.OutOfMemory;
+    const scratch = try scratchPath(git, arena, root, scratch_name);
     defer deleteQuiet(arena, scratch);
     const read_tree = if (head) |oid|
         try git.run(root, &.{ "read-tree", oid }, .{ .index_file = scratch, .read_only = false })
@@ -1412,10 +1419,11 @@ fn freezePatches(
         _ = try git.run(root, untracked.items, .{ .index_file = scratch, .read_only = false });
     }
 
+    const unified = std.fmt.allocPrint(arena, "-U{d}", .{context_lines orelse 3}) catch return error.OutOfMemory;
     var preview_budget: usize = MAX_PREVIEW_BYTES_TOTAL;
     for (files, 0..) |*file, i| {
         if (i >= MAX_REVIEW_PATCH_FILES) break;
-        const result = try git.run(root, &.{ "diff", "--no-color", "--no-ext-diff", "--no-renames", "--binary", "--full-index", "--", file.path }, .{ .index_file = scratch });
+        const result = try git.run(root, &.{ "diff", "--no-color", "--no-ext-diff", "--no-renames", "--binary", "--full-index", unified, "--", file.path }, .{ .index_file = scratch });
         if (!result.ok()) continue;
         const patch = result.stdout;
         if (patch.len == 0 or patch.len > MAX_FROZEN_PATCH_BYTES) continue;
@@ -1512,6 +1520,168 @@ pub const PreviewBudget = struct {
 /// True when the file supports choosing individual hunks.
 pub fn hunkSelectable(file: *const ReviewFile) bool {
     return file.patch != null and !file.binary and file.status == .modified and file.hunks.len > 1;
+}
+
+// ---------------------------------------------------------------------------
+// Workspace changes (side panel "Changes" view)
+
+/// Largest per-file patch `filePatch` returns; the review preview cap.
+pub const MAX_FILE_PATCH_BYTES: usize = MAX_PREVIEW_BYTES_PER_FILE;
+
+/// A chat claiming a dirty file.
+pub const FileOwner = struct {
+    thread_id: []const u8,
+    unclear: bool,
+};
+
+/// One uncommitted file (working tree vs HEAD, untracked as added).
+pub const WorkspaceFile = struct {
+    path: []const u8,
+    status: FileStatus,
+    untracked: bool,
+    additions: u32,
+    deletions: u32,
+    binary: bool,
+    /// Workspace-wide owner, not relative to a chat: `unassigned` without
+    /// claims, `shared` with more than one chat, `unclear` for a single
+    /// uncertain claim, else `mine` (one confident owner).
+    ownership: Ownership,
+    owners: []const FileOwner,
+};
+
+pub const WorkspaceRepo = struct {
+    root: []const u8,
+    head: ?[]const u8,
+    status: RepoStatus,
+    /// More dirty paths than `MAX_TRACKED_PATHS`; `files` is empty.
+    too_many_files: bool = false,
+    files: []const WorkspaceFile,
+};
+
+/// Every repository's uncommitted files with numstat and claim owners. Clean
+/// repositories are listed with no files. Runs git; call with no locks held.
+/// Repositories git cannot read are skipped.
+pub fn workspaceChanges(git: *Git, workspace_id: []const u8, repos: []const RepoClaims) Error![]WorkspaceRepo {
+    const arena = git.arena;
+    var out: std.ArrayList(WorkspaceRepo) = .empty;
+    for (repos) |repo_claims| {
+        const root = repo_claims.root;
+        const maybe_entries = dirtyPaths(git, root) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue,
+        };
+        const status = try repoStatus(git, root);
+        const head = try headOid(git, root);
+        const entries = maybe_entries orelse {
+            out.append(arena, .{ .root = root, .head = head, .status = status, .too_many_files = true, .files = &.{} }) catch return error.OutOfMemory;
+            continue;
+        };
+        const stats = try lineStats(git, root, entries);
+        const files = arena.alloc(WorkspaceFile, entries.len) catch return error.OutOfMemory;
+        for (entries, files) |entry, *file| {
+            var owners: std.ArrayList(FileOwner) = .empty;
+            for (repo_claims.claims) |claim| {
+                if (!std.mem.eql(u8, claim.path, entry.path) or !std.mem.eql(u8, claim.workspace_id, workspace_id)) continue;
+                const seen = for (owners.items) |owner| {
+                    if (std.mem.eql(u8, owner.thread_id, claim.thread_id)) break true;
+                } else false;
+                if (!seen) owners.append(arena, .{ .thread_id = claim.thread_id, .unclear = claim.unclear }) catch return error.OutOfMemory;
+            }
+            const stat = stats.get(entry.path) orelse LineStat{};
+            file.* = .{
+                .path = entry.path,
+                .status = fileStatus(entry),
+                .untracked = entry.untracked(),
+                .additions = stat.additions,
+                .deletions = stat.deletions,
+                .binary = stat.binary,
+                .ownership = switch (owners.items.len) {
+                    0 => .unassigned,
+                    1 => if (owners.items[0].unclear) .unclear else .mine,
+                    else => .shared,
+                },
+                .owners = owners.items,
+            };
+        }
+        std.mem.sort(WorkspaceFile, files, {}, workspaceFileLessThan);
+        out.append(arena, .{ .root = root, .head = head, .status = status, .files = files }) catch return error.OutOfMemory;
+    }
+    return out.items;
+}
+
+fn workspaceFileLessThan(_: void, a: WorkspaceFile, b: WorkspaceFile) bool {
+    return std.mem.order(u8, a.path, b.path) == .lt;
+}
+
+pub const FilePatch = struct {
+    /// The path is no longer dirty; every other field is empty.
+    clean: bool = false,
+    status: FileStatus = .modified,
+    binary: bool = false,
+    /// The patch exceeds `MAX_FILE_PATCH_BYTES`; `patch` is null.
+    truncated: bool = false,
+    additions: u32 = 0,
+    deletions: u32 = 0,
+    /// Unified diff against HEAD (untracked files diff as new files).
+    patch: ?[]const u8 = null,
+};
+
+/// True for a repository-relative path that cannot escape the repository.
+pub fn validRelativePath(path: []const u8) bool {
+    if (path.len == 0 or path[0] == '/' or std.mem.indexOfScalar(u8, path, 0) != null) return false;
+    var parts = std.mem.splitScalar(u8, path, '/');
+    while (parts.next()) |part| {
+        if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return false;
+    }
+    return true;
+}
+
+/// Largest `context_lines` a file patch honours; enough for "whole file".
+pub const MAX_FILE_PATCH_CONTEXT: u32 = 1_000_000;
+
+/// One dirty file's patch against HEAD, computed like a review's frozen patch
+/// (scratch index, so the user's staging is irrelevant). `context_lines` is
+/// git's `-U` (null: 3). Runs git; call with no locks held.
+pub fn filePatch(git: *Git, root: []const u8, path: []const u8, context_lines: ?u32) Error!FilePatch {
+    if (!validRelativePath(path)) return error.InvalidSelection;
+    const arena = git.arena;
+    const result = try git.run(root, &.{ "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames", "--ignore-submodules=dirty", "--", path }, .{});
+    if (!result.ok()) return error.GitUnavailable;
+    var entry: ?StatusEntry = null;
+    var it = std.mem.splitScalar(u8, result.stdout, 0);
+    while (it.next()) |record| {
+        if (record.len < 4 or record[2] != ' ') continue;
+        if (!std.mem.eql(u8, record[3..], path)) continue;
+        entry = .{ .path = record[3..], .x = record[0], .y = record[1] };
+        break;
+    }
+    const dirty = entry orelse return .{ .clean = true };
+    const head = try headOid(git, root);
+    var files = [_]ReviewFile{.{
+        .path = dirty.path,
+        .status = fileStatus(dirty),
+        .ownership = .unassigned,
+        .other_threads = &.{},
+        .additions = 0,
+        .deletions = 0,
+        .binary = false,
+        .patch = null,
+        .header_end = 0,
+        .hunks = &.{},
+    }};
+    const entries = [_]StatusEntry{dirty};
+    const context: ?u32 = if (context_lines) |value| @min(value, MAX_FILE_PATCH_CONTEXT) else null;
+    try freezePatches(git, arena, root, head, &entries, &files, context);
+    const file = files[0];
+    const patch = file.patch orelse return .{ .status = file.status, .truncated = true };
+    if (file.binary) return .{ .status = file.status, .binary = true };
+    if (patch.len > MAX_FILE_PATCH_BYTES) return .{
+        .status = file.status,
+        .truncated = true,
+        .additions = file.additions,
+        .deletions = file.deletions,
+    };
+    return .{ .status = file.status, .additions = file.additions, .deletions = file.deletions, .patch = patch };
 }
 
 /// Bounded LRU of open reviews.
@@ -1984,6 +2154,8 @@ pub fn pullAndPush(arena: std.mem.Allocator, root: []const u8) Error!PushOutcome
 pub const LineStat = struct {
     additions: u32 = 0,
     deletions: u32 = 0,
+    /// numstat reported `-`/`-`, or an untracked file holds a NUL byte.
+    binary: bool = false,
 };
 
 /// Added/deleted line counts per dirty path against HEAD. Untracked files
@@ -2004,6 +2176,7 @@ pub fn lineStats(git: *Git, root: []const u8, entries: []const StatusEntry) Erro
                 stats.put(arena, path, .{
                     .additions = std.fmt.parseInt(u32, added, 10) catch 0,
                     .deletions = std.fmt.parseInt(u32, deleted, 10) catch 0,
+                    .binary = std.mem.eql(u8, added, "-") and std.mem.eql(u8, deleted, "-"),
                 }) catch return error.OutOfMemory;
             }
         }
@@ -2020,8 +2193,9 @@ pub fn lineStats(git: *Git, root: []const u8, entries: []const StatusEntry) Erro
         budget -= bytes.len;
         var lines: u32 = @intCast(std.mem.count(u8, bytes, "\n"));
         if (bytes.len > 0 and bytes[bytes.len - 1] != '\n') lines += 1;
-        if (std.mem.indexOfScalar(u8, bytes[0..@min(bytes.len, 8000)], 0) != null) lines = 0;
-        stats.put(arena, entry.path, .{ .additions = lines }) catch return error.OutOfMemory;
+        const binary = std.mem.indexOfScalar(u8, bytes[0..@min(bytes.len, 8000)], 0) != null;
+        if (binary) lines = 0;
+        stats.put(arena, entry.path, .{ .additions = lines, .binary = binary }) catch return error.OutOfMemory;
     }
     return stats;
 }
@@ -3197,4 +3371,95 @@ test "commit rows round-trip and gain pushed state and links" {
 
     try testing.expect((try parseCommitRow(arena, "Push rejected: nope")) == null);
     try testing.expect((try parseCommitRow(arena, "Committed 1 file: zzz")) == null);
+}
+
+test "workspace changes list every dirty file with stats and owners" {
+    var repo = (try TestRepo.init()) orelse return error.SkipZigTest;
+    defer repo.deinit();
+    try repo.write("a.txt", "one\ntwo\n");
+    try repo.write("gone.txt", "bye\n");
+    try repo.write("bin.dat", "x\x00y");
+    try repo.commitAll("init");
+    try repo.write("a.txt", "one\nchanged\nthree\n");
+    _ = try repo.runGit(&.{ "rm", "-q", "gone.txt" });
+    try repo.write("bin.dat", "x\x00z");
+    try repo.write("new.txt", "n1\nn2\n");
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var git = try Git.init(arena_state.allocator());
+    defer git.deinit();
+    const claims = [_]ClaimView{
+        .{ .path = "a.txt", .workspace_id = "ws", .thread_id = "t1", .unclear = false },
+        .{ .path = "a.txt", .workspace_id = "ws", .thread_id = "t2", .unclear = false },
+        .{ .path = "new.txt", .workspace_id = "ws", .thread_id = "t1", .unclear = true },
+        // Another workspace's claim never shows.
+        .{ .path = "gone.txt", .workspace_id = "other", .thread_id = "t9", .unclear = false },
+    };
+    const repos = try workspaceChanges(&git, "ws", &.{.{ .root = repo.root, .claims = &claims }});
+    try testing.expectEqual(@as(usize, 1), repos.len);
+    try testing.expectEqualStrings("main", repos[0].status.branch.?);
+    const files = repos[0].files;
+    try testing.expectEqual(@as(usize, 4), files.len);
+    // Sorted by path.
+    try testing.expectEqualStrings("a.txt", files[0].path);
+    try testing.expectEqual(Ownership.shared, files[0].ownership);
+    try testing.expectEqual(@as(usize, 2), files[0].owners.len);
+    try testing.expectEqual(@as(u32, 2), files[0].additions);
+    try testing.expectEqual(@as(u32, 1), files[0].deletions);
+    try testing.expectEqualStrings("bin.dat", files[1].path);
+    try testing.expect(files[1].binary);
+    try testing.expectEqualStrings("gone.txt", files[2].path);
+    try testing.expectEqual(FileStatus.deleted, files[2].status);
+    try testing.expectEqual(Ownership.unassigned, files[2].ownership);
+    try testing.expectEqualStrings("new.txt", files[3].path);
+    try testing.expectEqual(FileStatus.added, files[3].status);
+    try testing.expect(files[3].untracked);
+    try testing.expectEqual(Ownership.unclear, files[3].ownership);
+    try testing.expectEqual(@as(u32, 2), files[3].additions);
+}
+
+test "file patches diff against HEAD and include untracked files" {
+    var repo = (try TestRepo.init()) orelse return error.SkipZigTest;
+    defer repo.deinit();
+    try repo.write("a.txt", "one\ntwo\n");
+    try repo.write("bin.dat", "x\x00y");
+    try repo.commitAll("init");
+    try repo.write("a.txt", "one\nTWO\n");
+    try repo.write("bin.dat", "x\x00z");
+    try repo.write("new.txt", "fresh\n");
+    // Staging must not change what the patch shows.
+    _ = try repo.runGit(&.{ "add", "a.txt" });
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var git = try Git.init(arena_state.allocator());
+    defer git.deinit();
+
+    const modified = try filePatch(&git, repo.root, "a.txt", null);
+    try testing.expect(!modified.clean and !modified.binary and !modified.truncated);
+    try testing.expectEqual(FileStatus.modified, modified.status);
+    try testing.expect(std.mem.indexOf(u8, modified.patch.?, "-two\n+TWO\n") != null);
+    try testing.expectEqual(@as(u32, 1), modified.additions);
+
+    const added = try filePatch(&git, repo.root, "new.txt", null);
+    try testing.expectEqual(FileStatus.added, added.status);
+    try testing.expect(std.mem.indexOf(u8, added.patch.?, "+fresh\n") != null);
+
+    const binary = try filePatch(&git, repo.root, "bin.dat", null);
+    try testing.expect(binary.binary and binary.patch == null);
+
+    try testing.expect((try filePatch(&git, repo.root, "missing.txt", null)).clean);
+    try testing.expectError(error.InvalidSelection, filePatch(&git, repo.root, "../outside", null));
+    try testing.expectError(error.InvalidSelection, filePatch(&git, repo.root, "/etc/passwd", null));
+    // The scratch index never leaks into the real one.
+    try testing.expectEqualStrings("M  a.txt", try repo.runGit(&.{ "status", "--porcelain", "--", "a.txt" }));
+    // Full context includes unchanged lines far from the change.
+    try repo.write("long.txt", "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\n");
+    try repo.commitAll("long");
+    try repo.write("long.txt", "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nL9\n");
+    const narrow = try filePatch(&git, repo.root, "long.txt", 1);
+    try testing.expect(std.mem.indexOf(u8, narrow.patch.?, " l1\n") == null);
+    const full = try filePatch(&git, repo.root, "long.txt", MAX_FILE_PATCH_CONTEXT + 5);
+    try testing.expect(std.mem.indexOf(u8, full.patch.?, " l1\n") != null);
 }
