@@ -148,8 +148,16 @@ pub fn render(state: *AppState, rect: palette.Rect, focused: bool) void {
 
     const roots = state.fileViewerRoots();
     if (roots.len == 0 and !filtering(explorer)) {
-        renderNote(state, list_rect, "Loading folders…", theme.COLOR_TEXT_MUTED);
         max_scroll = 0.0;
+        const roots_state = state.fileViewerRootsState();
+        if (roots_state.status != .failed) {
+            _ = renderNote(state, list_rect, "Loading folders…", theme.COLOR_TEXT_MUTED);
+            return;
+        }
+        // Failed fetch: say why, and let a click (or F5 / refresh) retry.
+        const message = if (roots_state.message.len > 0) roots_state.message else "Could not load this workspace's folders.";
+        const used = renderNote(state, list_rect, message, theme.danger());
+        _ = renderNote(state, .{ .x = list_rect.x, .y = list_rect.y + used - theme.scaledUi(PAD_UI), .w = list_rect.w, .h = @max(list_rect.h - used, 0.0) }, "Click here or press F5 to retry.", theme.COLOR_TEXT_SUBTLE);
         return;
     }
     renderRows(state, explorer, roots, focused and !filter_focused);
@@ -326,10 +334,42 @@ fn renderSpinnerDot(state: *AppState, rect: palette.Rect, right: f32) void {
     queueRounded(state, .{ .x = right - dot, .y = rect.y + (rect.h - dot) * 0.5, .w = dot, .h = dot }, theme.withAlpha(theme.accent(), 200), dot * 0.5, list_rect);
 }
 
-fn renderNote(state: *AppState, rect: palette.Rect, message: []const u8, color: [4]f32) void {
+/// Word-wrapped note at the top of `rect`; returns the height it used
+/// (top padding plus its lines).
+fn renderNote(state: *AppState, rect: palette.Rect, message: []const u8, color: [4]f32) f32 {
     const font = theme.scaledUi(NOTE_FONT_UI);
     const pad = theme.scaledUi(PAD_UI) * 1.5;
-    queueText(state, .{ .x = rect.x + pad, .y = rect.y + pad, .w = @max(rect.w - pad * 2.0, 0.0), .h = font * 1.4 }, message, color, font, .ui, rect);
+    const line_h = font * 1.4;
+    const max_w = @max(rect.w - pad * 2.0, 1.0);
+    var y = rect.y + pad;
+    var start: usize = 0;
+    while (start < message.len) {
+        // Longest run of whole words that fits; a lone long word is cut.
+        var end = message.len;
+        if (text_measure.textWidth(.ui, font, message[start..]) > max_w) {
+            end = start;
+            var cursor = start;
+            while (cursor < message.len) {
+                const space = std.mem.indexOfScalarPos(u8, message, cursor, ' ') orelse message.len;
+                if (text_measure.textWidth(.ui, font, message[start..space]) > max_w) break;
+                end = space;
+                cursor = space + 1;
+            }
+            if (end == start) {
+                end = start;
+                while (end < message.len) {
+                    const next = text_edit.nextBoundary(message, end);
+                    if (end > start and text_measure.textWidth(.ui, font, message[start..next]) > max_w) break;
+                    end = next;
+                }
+            }
+        }
+        queueText(state, .{ .x = rect.x + pad, .y = y, .w = max_w, .h = line_h }, message[start..end], color, font, .ui, rect);
+        y += line_h;
+        start = end;
+        while (start < message.len and message[start] == ' ') start += 1;
+    }
+    return y - rect.y;
 }
 
 fn loadingKey(explorer: *const Explorer, key: []const u8) bool {
@@ -529,6 +569,10 @@ pub fn handleMouseButton(state: *AppState, x: f32, y: f32, down: bool, clicks: u
     }
     filter_focused = false;
     const roots = state.fileViewerRoots();
+    if (roots.len == 0 and contains(list_rect, x, y) and state.fileViewerRootsState().status == .failed) {
+        state.fileExplorerRefresh();
+        return true;
+    }
     const index = rowAt(explorer, x, y) orelse {
         state.markDirty();
         return true;
@@ -581,6 +625,10 @@ pub fn handleKey(state: *AppState, event: *const sdl.KeyboardEvent) bool {
         return true;
     }
     if (primary) return false;
+    if (event.key == .f5) {
+        state.fileExplorerRefresh();
+        return true;
+    }
     const roots = state.fileViewerRoots();
     const rows = explorer.rows.items;
     if (rows.len == 0) return false;

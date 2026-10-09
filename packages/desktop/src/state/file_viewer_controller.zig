@@ -332,7 +332,9 @@ fn runCall(call: *Call) void {
     switch (call.kind) {
         .roots => {
             const result = std.json.parseFromValueLeaky(proto.ListResult, arena, value, options) catch {
-                call.err_message = "The daemon returned an unexpected response.";
+                // Typically a daemon built before these RPCs settled (roots
+                // without ids); the GUI and daemon rebuild separately.
+                call.err_message = "The Verde daemon answered in an older format. Rebuild and restart the daemon.";
                 return;
             };
             call.roots = result.roots;
@@ -645,6 +647,16 @@ pub fn fileViewerRoots(self: anytype) []const Root {
         return &.{};
     };
     return entry.roots;
+}
+
+pub const RootsState = struct { status: RootsStatus, message: []const u8 };
+
+/// Fetch state of the selected workspace's roots (`fileViewerRoots` is
+/// empty both while loading and after a failure).
+pub fn fileViewerRootsState(self: anytype) RootsState {
+    const index = selectedProjectIndex(self) orelse return .{ .status = .loading, .message = "" };
+    const entry = rootsEntry(self, self.project_controller.projects.items[index].id) orelse return .{ .status = .loading, .message = "" };
+    return .{ .status = entry.status, .message = entry.message };
 }
 
 /// Opens `abs_path` in a file tab of the selected workspace, or focuses the

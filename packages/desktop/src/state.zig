@@ -11173,6 +11173,7 @@ pub const AppState = struct {
     pub const fileViewerDocument = file_viewer_controller.fileViewerDocument;
     pub const reloadFileViewerDocument = file_viewer_controller.reloadFileViewerDocument;
     pub const fileViewerRoots = file_viewer_controller.fileViewerRoots;
+    pub const fileViewerRootsState = file_viewer_controller.fileViewerRootsState;
     pub const focusFilePane = file_viewer_controller.focusFilePane;
     pub const focusedFilePaneId = file_viewer_controller.focusedFilePaneId;
     pub const filePaneRef = file_viewer_controller.filePaneRef;
