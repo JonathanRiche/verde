@@ -5673,7 +5673,7 @@ pub const AppState = struct {
         self.setWorkspaceSettingsNotice(switch (mode) {
             .automatic => "Workspace scrolling set to Auto.",
             .always => "Workspace scrolling pinned on.",
-            .disabled => "Workspace scrolling off; using tiled panes.",
+            .disabled => "Workspace scrolling off; tabs switch in place.",
         });
         self.markDirty();
     }
@@ -19014,6 +19014,8 @@ test "activating a thread already visible focuses its pane without changing spli
     const second_thread_index = try project.addThread(allocator);
     const second_pane_id = try project.workspace_layout.createChatPane(allocator, second_thread_index);
     try project.workspace_layout.splitPaneWithLeaf(allocator, 1, second_pane_id, .horizontal, true);
+    // One tabspace holding a tiled split: zoom follows focus inside it.
+    try std.testing.expect(project.workspace_layout.joinPaneToScrollGroup(1, second_pane_id));
     try std.testing.expect(project.workspace_layout.resizeSplit(1, second_pane_id, .horizontal, 0.63));
     project.workspace_layout.focused_pane_id = 1;
     project.workspace_layout.maximized_pane_id = 1;

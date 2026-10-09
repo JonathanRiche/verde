@@ -1486,7 +1486,7 @@ pub fn openWorkspaceChat(
         request.target_pane_id,
         request.axis,
         request.focus,
-        self.project_controller.projects.items[project_index].workspace_layout.effectiveScrollMode(self.app_config.workspace_scroll_mode) != .disabled,
+        true,
     );
     if (request.focus) {
         self.project_controller.selected_index = project_index;
@@ -1531,7 +1531,7 @@ pub fn presentWorkspaceChat(self: anytype, project_index: usize, request: Presen
         request.target_pane_id,
         request.axis,
         request.focus,
-        self.project_controller.projects.items[project_index].workspace_layout.effectiveScrollMode(self.app_config.workspace_scroll_mode) != .disabled,
+        true,
     );
     if (request.focus) {
         self.project_controller.selected_index = project_index;
@@ -1916,7 +1916,7 @@ fn presentSubagentThread(
         target_pane_id,
         axis,
         focus,
-        project.workspace_layout.effectiveScrollMode(self.app_config.workspace_scroll_mode) != .disabled,
+        true,
     );
     if (focus) {
         self.project_controller.selected_index = project_index;

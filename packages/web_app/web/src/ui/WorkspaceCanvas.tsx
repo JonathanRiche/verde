@@ -67,6 +67,7 @@ export function WorkspaceCanvas() {
 
     const onWheel = (event: WheelEvent) => {
       if (event.ctrlKey) return
+      if (store.uiConfig().workspace_scroll_mode === 'disabled') return
       const target = event.target
       if (target instanceof Element && target.closest('.ghostty-host, .scrollbar-thin, textarea')) return
       if (Math.abs(event.deltaX) >= Math.abs(event.deltaY)) return
@@ -101,7 +102,7 @@ export function WorkspaceCanvas() {
 
   return (
     <div
-      class={`niri-strip flex min-h-0 min-w-0 flex-1 overflow-x-auto overflow-y-hidden ${store.initialViewReady() ? '' : 'invisible'} ${inset() ? 'niri-inset' : 'niri-zoomed'}`}
+      class={`niri-strip flex min-h-0 min-w-0 flex-1 ${store.uiConfig().workspace_scroll_mode === 'disabled' ? 'overflow-x-hidden' : 'overflow-x-auto'} overflow-y-hidden ${store.initialViewReady() ? '' : 'invisible'} ${inset() ? 'niri-inset' : 'niri-zoomed'}`}
       style={{
         '--workspace-pane-gap': inset() ? `${pane_gap()}px` : '0px',
         '--workspace-panes-per-view': String(Math.max(1, panes_per_view())),

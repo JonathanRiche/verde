@@ -42,7 +42,7 @@ export const DEFAULT_UI_CONFIG: UiConfig = {
   workspace_panes_per_view: 1,
   workspace_split_default_pane: 'chat',
   workspace_scroll_direction: 'horizontal',
-  workspace_scroll_mode: 'automatic',
+  workspace_scroll_mode: 'disabled',
   workspace_scroll_threshold: 3,
   unzoom_on_pane_navigation: false,
   reduced_motion: false,
@@ -98,9 +98,9 @@ export function parseUiConfig(raw: unknown): UiConfig {
   const ui = asRecord(root?.ui) ?? root ?? {}
   const direction = ui.workspace_scroll_direction === 'vertical' ? 'vertical' : 'horizontal'
   const mode =
-    ui.workspace_scroll_mode === 'always' || ui.workspace_scroll_mode === 'disabled'
+    ui.workspace_scroll_mode === 'always' || ui.workspace_scroll_mode === 'automatic'
       ? ui.workspace_scroll_mode
-      : 'automatic'
+      : 'disabled'
   const reduced_motion_parts = parseReducedMotion(ui)
   return {
     workspace_pane_gap: clamp(numberField(ui.workspace_pane_gap, DEFAULT_UI_CONFIG.workspace_pane_gap), MIN_PANE_GAP, MAX_PANE_GAP),
@@ -178,9 +178,10 @@ export function settleUiConfigPatch(pending: UiConfigPatch, sent: UiConfigPatch)
 /// How many columns the strip should fit, matching desktop scrollingLayoutEnabled.
 export function effectivePanesPerView(ui: UiConfig, visible_count: number, maximized: boolean): number {
   if (maximized || visible_count <= 1) return 1
-  const scrolling =
-    ui.workspace_scroll_mode === 'always' ||
-    (ui.workspace_scroll_mode === 'automatic' && visible_count >= ui.workspace_scroll_threshold)
-  if (!scrolling) return visible_count
+  // Scrolling off keeps tabspaces (one tab per view, switched in place), so
+  // it fits columns like the strip rather than tiling every tab together.
+  const strip =
+    ui.workspace_scroll_mode !== 'automatic' || visible_count >= ui.workspace_scroll_threshold
+  if (!strip) return visible_count
   return Math.min(ui.workspace_panes_per_view, visible_count)
 }

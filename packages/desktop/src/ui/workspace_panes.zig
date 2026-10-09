@@ -208,6 +208,9 @@ const PaneDragState = struct {
     start_y: f32 = 0.0,
     x: f32 = 0.0,
     y: f32 = 0.0,
+    /// Captured at drag start: with the scrolling layout off, only panes
+    /// fully inside the visible workspace may be grabbed or dropped onto.
+    offscreen_allowed: bool = false,
 };
 
 var last_thread_drop_target: ?ThreadDropTarget = null;
@@ -1735,19 +1738,42 @@ fn paneDragTargetAt(source_pane_id: runtime.WorkspacePaneId, x: f32, y: f32, spl
         const entry = pane_rects[i];
         if (entry.pane_id == source_pane_id) continue;
         if (!rectContains(entry.rect, x, y)) continue;
+        if (!paneDragRectAllowed(entry.rect, pane_drag.offscreen_allowed)) continue;
         if (split_placement) return threadDropTargetForPane(entry.pane_id, entry.rect, x, y);
         return .{ .pane_id = entry.pane_id, .axis = .vertical, .new_after = true, .preview = entry.rect };
     }
     return null;
 }
 
+/// Niri-style moves of panes outside the visible workspace are opt-in:
+/// they need the scrolling layout setting, which is off by default.
+fn paneDragOffscreenAllowed(state: *const runtime.AppState) bool {
+    if (state.project_controller.projects.items.len == 0) return false;
+    const layout = &state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout;
+    return layout.effectiveScrollMode(state.app_config.workspace_scroll_mode) != .disabled;
+}
+
+/// Whether a pane at `rect` may take part in a Ctrl-drag. Pane rects are
+/// recorded unclipped, so a pane peeking past the workspace edge is offscreen.
+fn paneDragRectAllowed(rect: palette.Rect, offscreen_allowed: bool) bool {
+    if (offscreen_allowed) return true;
+    const tolerance: f32 = 1.0;
+    const bounds = last_workspace_rect;
+    return rect.x >= bounds.x - tolerance and
+        rect.y >= bounds.y - tolerance and
+        rect.x + rect.w <= bounds.x + bounds.w + tolerance and
+        rect.y + rect.h <= bounds.y + bounds.h + tolerance;
+}
+
 fn beginPaneDrag(state: *runtime.AppState, x: f32, y: f32, split_placement: bool) bool {
     if (state.currentProjectWorkspaceVisiblePaneCount() <= 1) return false;
+    const offscreen_allowed = paneDragOffscreenAllowed(state);
     var i: usize = pane_rect_count;
     while (i > 0) {
         i -= 1;
         const entry = pane_rects[i];
         if (!rectContains(entry.rect, x, y)) continue;
+        if (!paneDragRectAllowed(entry.rect, offscreen_allowed)) return false;
         pane_drag = .{
             .pending = true,
             .split_placement = split_placement,
@@ -1756,6 +1782,7 @@ fn beginPaneDrag(state: *runtime.AppState, x: f32, y: f32, split_placement: bool
             .start_y = y,
             .x = x,
             .y = y,
+            .offscreen_allowed = offscreen_allowed,
         };
         last_pane_drop_target = null;
         split_menu_open_for = null;
@@ -3612,6 +3639,8 @@ test "directional navigation transfers zoom unless unzoom is configured" {
     const second_thread = try project.addThread(allocator);
     const second_pane_id = try project.workspace_layout.createChatPane(allocator, second_thread);
     try project.workspace_layout.splitPaneWithLeaf(allocator, first_pane_id, second_pane_id, .vertical, true);
+    // One tabspace holding a tiled split, so the tiled zoom rules apply.
+    try std.testing.expect(project.workspace_layout.joinPaneToScrollGroup(first_pane_id, second_pane_id));
     project.workspace_layout.focused_pane_id = first_pane_id;
     project.workspace_layout.maximized_pane_id = first_pane_id;
     state.project_controller.projects.append(allocator, project) catch |err| {
@@ -3730,7 +3759,7 @@ test "sidebar horizontal render preserves visible activation and minimally revea
     const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
     var storage = try storage_mod.Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
     defer storage.deinit();
-    var state = try runtime.AppState.init(allocator, &storage, app_config.AppConfig{}, .{
+    var state = try runtime.AppState.init(allocator, &storage, app_config.AppConfig{ .workspace_scroll_mode = .automatic }, .{
         .gl_texture_uploads_enabled = false,
         .browser_textures_enabled = false,
     });
@@ -3860,7 +3889,7 @@ test "sidebar vertical render minimally reveals after pre-render resize" {
     defer tmp.cleanup();
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
-    var config: app_config.AppConfig = .{};
+    var config: app_config.AppConfig = .{ .workspace_scroll_mode = .automatic };
     config.workspace_scroll_direction = .vertical;
     var storage = try storage_mod.Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
     defer storage.deinit();
@@ -4082,7 +4111,7 @@ test "menu split keeps the new pane inside the target scrolling tile" {
     const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
     var storage = try storage_mod.Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
     defer storage.deinit();
-    var state = try runtime.AppState.init(allocator, &storage, app_config.AppConfig{}, .{
+    var state = try runtime.AppState.init(allocator, &storage, app_config.AppConfig{ .workspace_scroll_mode = .automatic }, .{
         .gl_texture_uploads_enabled = false,
         .browser_textures_enabled = false,
     });
@@ -4258,7 +4287,8 @@ test "scrolling layout and strip scrolling follow mode and threshold" {
     try std.testing.expect(scrollingStripScrolls(.always, 64, 1));
     try std.testing.expect(!scrollingStripScrolls(.always, 1, 0));
     try std.testing.expect(!scrollingStripScrolls(.disabled, 1, 64));
-    try std.testing.expect(!scrollingLayoutEnabled(.disabled, 1, 64));
+    try std.testing.expect(scrollingLayoutEnabled(.disabled, 1, 64));
+    try std.testing.expect(!scrollingLayoutEnabled(.disabled, 1, 1));
 }
 
 test "automatic scrolling activation follows tab creation and closure" {
@@ -4404,4 +4434,15 @@ test "scrolling strip reveals every group beyond the visible rect budget" {
             try std.testing.expectEqual(index + 1 < count, available.next);
         }
     }
+}
+
+test "pane drag ignores offscreen panes unless the scrolling layout is enabled" {
+    const saved = last_workspace_rect;
+    defer last_workspace_rect = saved;
+    last_workspace_rect = .{ .x = 100.0, .y = 0.0, .w = 1000.0, .h = 800.0 };
+    const inside: palette.Rect = .{ .x = 100.0, .y = 0.0, .w = 1000.0, .h = 800.0 };
+    const peeking: palette.Rect = .{ .x = 1112.0, .y = 0.0, .w = 1000.0, .h = 800.0 };
+    try std.testing.expect(paneDragRectAllowed(inside, false));
+    try std.testing.expect(!paneDragRectAllowed(peeking, false));
+    try std.testing.expect(paneDragRectAllowed(peeking, true));
 }

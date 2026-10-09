@@ -2004,7 +2004,10 @@ pub const WorkspaceLayout = struct {
         return switch (mode) {
             .automatic => visible_tab_count > 1 or visible_tab_count >= @as(usize, threshold),
             .always => true,
-            .disabled => false,
+            // Scrolling off still keeps tabspaces: each tab owns the whole
+            // view and the strip jumps between them (herdr-style), never
+            // scrolling or peeking at neighbours.
+            .disabled => visible_tab_count > 1,
         };
     }
 

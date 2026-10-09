@@ -371,7 +371,7 @@ pub const AppConfig = struct {
     workspace_panes_per_view: u8 = DEFAULT_WORKSPACE_PANES_PER_VIEW,
     workspace_split_default_pane: WorkspaceSplitDefaultPane = .chat,
     workspace_scroll_direction: WorkspaceScrollDirection = .horizontal,
-    workspace_scroll_mode: WorkspaceScrollMode = .automatic,
+    workspace_scroll_mode: WorkspaceScrollMode = .disabled,
     workspace_scroll_threshold: u8 = DEFAULT_WORKSPACE_SCROLL_THRESHOLD,
     unzoom_on_pane_navigation: bool = false,
     reduced_motion: ReducedMotion = .{},
@@ -2075,7 +2075,7 @@ test "app config ignores unsupported workspace scrolling policy overrides" {
     defer config.deinit(std.testing.allocator);
     applyAppOverrides(std.testing.allocator, &config, root.value);
 
-    try std.testing.expectEqual(WorkspaceScrollMode.automatic, config.workspace_scroll_mode);
+    try std.testing.expectEqual(WorkspaceScrollMode.disabled, config.workspace_scroll_mode);
     try std.testing.expectEqual(DEFAULT_WORKSPACE_SCROLL_THRESHOLD, config.workspace_scroll_threshold);
 }
 

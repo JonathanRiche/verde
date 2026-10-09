@@ -158,7 +158,7 @@ pub const Draft = struct {
     workspace_new_tab_pane: app_config.WorkspaceSplitDefaultPane = .chat,
     workspace_scroll_direction: app_config.WorkspaceScrollDirection = .horizontal,
     workspace_scroll_override_enabled: bool = false,
-    workspace_scroll_mode: app_config.WorkspaceScrollMode = .automatic,
+    workspace_scroll_mode: app_config.WorkspaceScrollMode = .disabled,
     workspace_scroll_threshold: u8 = app_config.DEFAULT_WORKSPACE_SCROLL_THRESHOLD,
     unzoom_on_pane_navigation: bool = false,
     reduced_motion: app_config.ReducedMotion = .{},
@@ -725,7 +725,7 @@ pub fn setWorkspaceScrollMode(self: anytype, mode: ?app_config.WorkspaceScrollMo
     self.setSidebarNotice(if (mode) |workspace_mode| switch (workspace_mode) {
         .automatic => "Workspace scrolling set to Automatic.",
         .always => "Workspace scrolling pinned on.",
-        .disabled => "Workspace scrolling disabled; using tiled panes.",
+        .disabled => "Workspace scrolling off; tabs switch in place.",
     } else "Workspace scrolling now uses the global settings.");
     self.markDirty();
 }
