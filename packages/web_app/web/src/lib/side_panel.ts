@@ -52,5 +52,11 @@ export const sidePanel = createRoot(() => {
   const [sheetOpen, setSheetOpen] = createSignal(false)
   const showSheet = (target: SidePanelView) => { setView(target); setSheetOpen(true) }
 
-  return { view, setView, open, setOpen, width, setWidth, toggle, show, sheetOpen, setSheetOpen, showSheet }
+  /// Keyboard toggle (Ctrl+Alt+B): the dock at lg+, the sheet below.
+  const toggleVisible = (docked: boolean) => {
+    if (docked) setOpen(!open())
+    else setSheetOpen(!sheetOpen())
+  }
+
+  return { view, setView, open, setOpen, width, setWidth, toggle, show, sheetOpen, setSheetOpen, showSheet, toggleVisible }
 })

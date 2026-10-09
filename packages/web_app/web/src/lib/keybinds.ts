@@ -2,6 +2,7 @@ export type KeyAction =
   | 'command_palette'
   | 'toggle_sidebar'
   | 'toggle_sidebar_hidden'
+  | 'toggle_side_panel'
   | 'new_thread'
   | 'new_terminal'
   | 'close_pane'
@@ -70,6 +71,7 @@ const DIRECT_CHORDS: Chord[] = [
   { key: 'p', ctrl: true, shift: true, action: 'command_palette' },
   { key: 's', ctrl: true, action: 'toggle_sidebar' },
   { key: 's', ctrl: true, shift: true, action: 'toggle_sidebar_hidden' },
+  { key: 'b', ctrl: true, alt: true, action: 'toggle_side_panel' },
   { key: 't', ctrl: true, alt: true, action: 'new_terminal' },
   { key: 'arrowup', alt: true, action: 'workspace_previous' },
   { key: 'arrowdown', alt: true, action: 'workspace_next' },
@@ -98,7 +100,7 @@ const DEFAULT_PREFIX_ROWS: Array<[string, string]> = [
   ['Shift+Slash', 'prefix.keybinds'], ['W', 'prefix.navigate'],
   ['P', 'command_palette'], ['T', 'workspace.add_tab_terminal'], ['Shift+T', 'new_terminal'], ['R', 'refresh'], ['O', 'open'],
   ['E', 'open_editor'], ['Space', 'companion'], ['S', 'sidebar'], ['Shift+S', 'sidebar_hidden'],
-  ['B', 'browser'], ['Grave', 'terminal.toggle'], ['Q', 'workspace.toggle_quick_pane'],
+  ['B', 'browser'], ['Shift+B', 'side_panel'], ['Grave', 'terminal.toggle'], ['Q', 'workspace.toggle_quick_pane'],
   ['X', 'workspace.close'], ['Shift+X', 'workspace.close_current'], ['Z', 'workspace.toggle_maximize'],
   ['I', 'workspace.focus_prompt'], ['C', 'workspace.add_tab'],
   ['A', 'workspace.add'],
@@ -363,7 +365,7 @@ export function prefixTargetLabel(target: PrefixTarget): string {
   if (ordinal) return `${ordinal[1] === 'select' ? 'Workspace' : ordinal[1] === 'pane_select' ? 'Pane' : 'Active row'} ${ordinal[2]}`
   return ({
     'prefix.keybinds': 'Keybinds', 'prefix.navigate': 'Workspace nav', command_palette: 'Command palette',
-    new_thread: 'New thread', sidebar: 'Sidebar', sidebar_hidden: 'Hide sidebar',
+    new_thread: 'New thread', sidebar: 'Sidebar', sidebar_hidden: 'Hide sidebar', side_panel: 'Side panel',
     'workspace.add': 'Add workspace', 'workspace.add_tab': 'New tab', 'workspace.add_tab_terminal': 'Terminal tab',
     'workspace.close': 'Close pane', 'workspace.close_current': 'Close workspace',
     'workspace.toggle_maximize': 'Zoom pane', 'workspace.focus_prompt': 'Focus prompt',

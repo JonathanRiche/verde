@@ -36,6 +36,7 @@ command palette. Bind `workspace.close` / `workspace.close_current` in
 | -------------------------- | ------------------------------------- |
 | `Ctrl+S` / `Cmd+S`          | Toggle the sidebar (visible ↔ icon)   |
 | `Ctrl+Shift+S`             | Toggle the sidebar's hidden mode      |
+| `Ctrl+Alt+B` / `Cmd+Alt+B`  | Toggle the right side panel (Changes, Files, Agents, Browser) |
 | `Ctrl+Shift+B`              | Toggle the embedded browser pane      |
 | `Ctrl+R` / `Cmd+R`          | Reload the active browser tab (browser pane only) |
 | `Tab`                       | Inside a chat pane, focus the prompt box |
@@ -224,6 +225,7 @@ The table is overridable exactly like `bindings`, under `"navigate"`:
 | `Space`                          | `companion`                                       |
 | `s` / `Shift+S`                  | `sidebar` / `sidebar_hidden`                      |
 | `b`                              | `browser`                                         |
+| `Shift+B`                        | `side_panel`                                      |
 | `` ` ``                          | `terminal.toggle`                                 |
 | `q`                              | `workspace.toggle_quick_pane`                     |
 | `x` / `Shift+X`                  | `workspace.close` / `workspace.close_current`     |
@@ -259,7 +261,7 @@ exactly like their direct shortcuts.
 
 Action names mirror the remapping keys below, joined with `.` for nested
 groups: `refresh`, `open`, `open_editor`, `new_thread`, `new_terminal`, `workspace.add`, `workspace.add_tab`, `workspace.add_tab_terminal`, `command_palette`,
-`companion`, `sidebar`, `sidebar_hidden`, `browser`, `chat_up`, `chat_down`,
+`companion`, `sidebar`, `sidebar_hidden`, `side_panel`, `browser`, `chat_up`, `chat_down`,
 `chat_page_up`, `chat_page_down`, `chat.model_picker`, `chat.run_config`, `chat.directory_picker`,
 `terminal.toggle`, `prefix.keybinds`, `prefix.navigate`, and `terminal.<key>`
 for every terminal binding. The dynamic split names are `workspace.split_default_*`
@@ -375,7 +377,7 @@ or an array of shortcuts.
 
 | Group       | Keys (subset)                                                                                                                                                                                                                     |
 | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| top         | `refresh`, `open_default`, `open_editor`, `new_thread`, `command_palette`, `settings`, `companion`, `toggle_sidebar`, `toggle_sidebar_hidden`, `toggle_browser`, `toggle_terminal`                                                                       |
+| top         | `refresh`, `open_default`, `open_editor`, `new_thread`, `command_palette`, `settings`, `companion`, `toggle_sidebar`, `toggle_sidebar_hidden`, `toggle_side_panel`, `toggle_browser`, `toggle_terminal`                                                    |
 | chat        | `chat_up`, `chat_down`, `chat_page_up`, `chat_page_down`                                                                                                                                                                          |
 | `workspace` | `split_chat_vertical`, `split_chat_horizontal`, `split_terminal_vertical`, `split_terminal_horizontal`, `toggle_maximize`, `close`, `close_current`, `focus_left`, `focus_right`, `focus_up`, `focus_down`, `focus_prompt`, `pane_previous`, `pane_next`, `active_select`, `active_previous`, `active_next`, `pane_select`, `move_*`, `grow_*`, `select`, `previous`, `next` |
 | `terminal`  | `new_tab`, `close`, `rename_tab`, `tab_previous`, `tab_next`, `split_up`, `split_down`, `split_left`, `split_right`, `focus_up`, `focus_down`, `focus_left`, `focus_right`                                                       |

@@ -2169,6 +2169,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 .toggle_browser,
                 .toggle_sidebar,
                 .toggle_sidebar_hidden,
+                .toggle_side_panel,
                 .new_thread,
                 .settings,
                 => {
@@ -3307,6 +3308,7 @@ fn handleKeyboardAction(
         .companion => state.toggleCompanion(),
         .toggle_sidebar => state.toggleSidebarCollapsed(),
         .toggle_sidebar_hidden => state.toggleSidebarHidden(),
+        .toggle_side_panel => state.toggleSidePanel(),
         .workspace_show_all => state.showAllWorkspacesInSidebar(),
         .toggle_browser => state.toggleBrowser(),
         .toggle_terminal => state.toggleCurrentProjectTerminal(),

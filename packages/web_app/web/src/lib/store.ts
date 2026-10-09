@@ -13,6 +13,7 @@ import {
 } from './keybinds'
 import { dynamicModelOptions, type DynamicModelRow, type ModelOption } from './models'
 import { writePane } from './pty'
+import { sidePanel } from './side_panel'
 import { createApprovalTracker } from './approvals'
 import { createFollowupApi, followupKind, followupRpcError, FollowupRejectedError } from './followups'
 import { watchNotifications } from './notify'
@@ -4876,6 +4877,9 @@ export function createAppStore() {
         if (window.matchMedia('(min-width: 1024px)').matches) setSidebarHidden((value) => !value)
         else setDrawerOpen((open) => !open)
         break
+      case 'toggle_side_panel':
+        sidePanel.toggleVisible(window.matchMedia('(min-width: 1024px)').matches)
+        break
       case 'new_thread':
         void newThread()
         break
@@ -4945,7 +4949,7 @@ export function createAppStore() {
       command_palette: 'command_palette', new_thread: 'new_thread', new_terminal: 'new_terminal',
       'workspace.add_tab': 'new_thread', 'workspace.add_tab_terminal': 'new_terminal',
       sidebar: 'toggle_sidebar',
-      sidebar_hidden: 'toggle_sidebar_hidden', 'workspace.close': 'close_pane',
+      sidebar_hidden: 'toggle_sidebar_hidden', side_panel: 'toggle_side_panel', 'workspace.close': 'close_pane',
       'workspace.toggle_maximize': 'maximize', 'workspace.focus_prompt': 'focus_prompt',
       'workspace.previous': 'workspace_previous', 'workspace.next': 'workspace_next',
       'workspace.active_previous': 'pane_previous', 'workspace.active_next': 'pane_next',

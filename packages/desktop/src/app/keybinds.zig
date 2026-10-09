@@ -20,6 +20,7 @@ pub const NativeKeyboardAction = enum {
     companion,
     toggle_sidebar,
     toggle_sidebar_hidden,
+    toggle_side_panel,
     toggle_browser,
     toggle_terminal,
     chat_up,
@@ -229,6 +230,7 @@ pub const NativeKeyboardConfig = struct {
     companion: []Keybind,
     toggle_sidebar: []Keybind,
     toggle_sidebar_hidden: []Keybind,
+    toggle_side_panel: []Keybind,
     toggle_browser: []Keybind,
     toggle_terminal: []Keybind,
     chat_up: []Keybind,
@@ -296,6 +298,7 @@ pub const NativeKeyboardConfig = struct {
             .companion = try cloneDefaultCompanionKeybinds(allocator),
             .toggle_sidebar = try cloneDefaultSidebarKeybinds(allocator),
             .toggle_sidebar_hidden = try cloneDefaultSidebarHiddenKeybinds(allocator),
+            .toggle_side_panel = try cloneDefaultSidePanelKeybinds(allocator),
             .toggle_browser = try cloneDefaultBrowserKeybinds(allocator),
             .toggle_terminal = try cloneDefaultTerminalKeybinds(allocator),
             .chat_up = try cloneDefaultChatUpKeybinds(allocator),
@@ -374,6 +377,7 @@ pub const NativeKeyboardConfig = struct {
         self.allocator.free(self.companion);
         self.allocator.free(self.toggle_sidebar);
         self.allocator.free(self.toggle_sidebar_hidden);
+        self.allocator.free(self.toggle_side_panel);
         self.allocator.free(self.toggle_browser);
         self.allocator.free(self.toggle_terminal);
         self.allocator.free(self.chat_up);
@@ -457,6 +461,9 @@ pub const NativeKeyboardConfig = struct {
         }
         if (matchesAny(self.toggle_sidebar_hidden, event)) {
             return .toggle_sidebar_hidden;
+        }
+        if (matchesAny(self.toggle_side_panel, event)) {
+            return .toggle_side_panel;
         }
         if (matchesAny(self.toggle_browser, event)) {
             return .toggle_browser;
@@ -749,6 +756,12 @@ pub const NativeKeyboardConfig = struct {
             if (self.parseOverrideValue(sidebar_hidden_value, "sidebar_hidden")) |bindings| {
                 self.allocator.free(self.toggle_sidebar_hidden);
                 self.toggle_sidebar_hidden = bindings;
+            }
+        }
+        if (keybinds_value.object.get("side_panel")) |side_panel_value| {
+            if (self.parseOverrideValue(side_panel_value, "side_panel")) |bindings| {
+                self.allocator.free(self.toggle_side_panel);
+                self.toggle_side_panel = bindings;
             }
         }
         if (keybinds_value.object.get("browser")) |browser_value| {
@@ -1351,6 +1364,7 @@ const PREFIX_ACTION_NAMES = [_]PrefixActionName{
     .{ .name = "companion", .target = .{ .app = .companion } },
     .{ .name = "sidebar", .target = .{ .app = .toggle_sidebar } },
     .{ .name = "sidebar_hidden", .target = .{ .app = .toggle_sidebar_hidden } },
+    .{ .name = "side_panel", .target = .{ .app = .toggle_side_panel } },
     .{ .name = "browser", .target = .{ .app = .toggle_browser } },
     .{ .name = "chat_up", .target = .{ .app = .chat_up } },
     .{ .name = "chat_down", .target = .{ .app = .chat_down } },
@@ -1440,6 +1454,7 @@ pub fn prefixTargetLabel(buf: []u8, target: PrefixTarget) []const u8 {
             .companion => "Companion",
             .toggle_sidebar => "Sidebar",
             .toggle_sidebar_hidden => "Hide sidebar",
+            .toggle_side_panel => "Side panel",
             .toggle_browser => "Browser",
             .toggle_terminal => "Terminal",
             .chat_up => "Scroll up",
@@ -1600,6 +1615,7 @@ const DEFAULT_PREFIX_TABLE = [_]DefaultPrefixEntry{
     .{ .accelerator = "S", .target = "sidebar" },
     .{ .accelerator = "Shift+S", .target = "sidebar_hidden" },
     .{ .accelerator = "B", .target = "browser" },
+    .{ .accelerator = "Shift+B", .target = "side_panel" },
     .{ .accelerator = "Grave", .target = "terminal.toggle" },
     .{ .accelerator = "Q", .target = "workspace.toggle_quick_pane" },
     // Panes
@@ -1796,6 +1812,12 @@ fn cloneDefaultSidebarKeybinds(allocator: std.mem.Allocator) ![]Keybind {
 fn cloneDefaultSidebarHiddenKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("Ctrl+Shift+S"),
+    });
+}
+
+fn cloneDefaultSidePanelKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("CommandOrControl+Alt+B"),
     });
 }
 
