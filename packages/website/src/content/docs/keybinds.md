@@ -36,7 +36,7 @@ command palette. Bind `workspace.close` / `workspace.close_current` in
 | -------------------------- | ------------------------------------- |
 | `Ctrl+S` / `Cmd+S`          | Toggle the sidebar (visible ↔ icon)   |
 | `Ctrl+Shift+S`             | Toggle the sidebar's hidden mode      |
-| `Ctrl+Alt+B` / `Cmd+Alt+B`  | Toggle the right side panel (Changes, Files, Agents, Browser) |
+| `Ctrl+Alt+S` / `Cmd+Alt+S`  | Toggle the right side panel (Changes, Files, Agents, Browser) |
 | `Ctrl+Shift+B`              | Toggle the embedded browser pane      |
 | `Ctrl+R` / `Cmd+R`          | Reload the active browser tab (browser pane only) |
 | `Tab`                       | Inside a chat pane, focus the prompt box |

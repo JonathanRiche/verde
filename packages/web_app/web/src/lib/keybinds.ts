@@ -71,7 +71,7 @@ const DIRECT_CHORDS: Chord[] = [
   { key: 'p', ctrl: true, shift: true, action: 'command_palette' },
   { key: 's', ctrl: true, action: 'toggle_sidebar' },
   { key: 's', ctrl: true, shift: true, action: 'toggle_sidebar_hidden' },
-  { key: 'b', ctrl: true, alt: true, action: 'toggle_side_panel' },
+  { key: 's', ctrl: true, alt: true, action: 'toggle_side_panel' },
   { key: 't', ctrl: true, alt: true, action: 'new_terminal' },
   { key: 'arrowup', alt: true, action: 'workspace_previous' },
   { key: 'arrowdown', alt: true, action: 'workspace_next' },

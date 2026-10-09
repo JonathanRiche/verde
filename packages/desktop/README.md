@@ -146,7 +146,7 @@ Config supports UI and terminal font size, scrolling-pane activation and spacing
     "new_thread": "CommandOrControl+T",
     "sidebar": "CommandOrControl+S",
     "sidebar_hidden": "Ctrl+Shift+S",
-    "side_panel": "CommandOrControl+Alt+B",
+    "side_panel": "CommandOrControl+Alt+S",
     "browser": "Ctrl+Shift+B",
     "chat": {
       "model_picker": "Alt+M",

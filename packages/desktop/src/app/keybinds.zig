@@ -1817,7 +1817,7 @@ fn cloneDefaultSidebarHiddenKeybinds(allocator: std.mem.Allocator) ![]Keybind {
 
 fn cloneDefaultSidePanelKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
-        try parseDefaultAccelerator("CommandOrControl+Alt+B"),
+        try parseDefaultAccelerator("CommandOrControl+Alt+S"),
     });
 }
 
