@@ -4,6 +4,7 @@
 - Make the smallest correct change. Preserve unrelated user/agent work.
 - Finish implementation and relevant verification; report results and limitations briefly.
 - Never restart Verde from a Verde-hosted session. Build, then ask the user to relaunch.
+- Do not create worktrees, switch from the master branch, or open PRs unless the human user asks for it.
 
 ## Verification
 
