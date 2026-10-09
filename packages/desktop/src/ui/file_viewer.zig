@@ -14,6 +14,10 @@
 //! all, Escape clears. An "Ask agent" chip beside the selection (or Enter)
 //! opens `agent_prompt_popover` for those lines.
 //!
+//! Files opened from the side panel dock there instead: `side_panel.zig`
+//! draws them with `renderDockedPane` (no close X; the panel tab has one) and
+//! routes their input here, keys through `handlePaneKeyDown`.
+//!
 //! Hook contract with `main.zig` (pointer input arrives through
 //! `workspace_panes.zig`, which owns pane geometry and calls `beginFrame`,
 //! `renderPane`, `handleMouseDown/Up/Motion`, `handleWheel`, `systemCursorAt`):
@@ -94,6 +98,8 @@ const PaneGeometry = struct {
     buttons: [8]ButtonHit = undefined,
     /// "Ask agent" chip next to the line selection, when drawn.
     ask_rect: ?palette.Rect = null,
+    /// Drawn in the side panel: the panel's tab owns close and pop-out.
+    docked: bool = false,
     button_count: usize = 0,
 
     fn addButton(self: *PaneGeometry, action: Action, rect: palette.Rect) void {
@@ -156,6 +162,16 @@ fn geometryAt(x: f32, y: f32) ?*PaneGeometry {
 // ------------------------------------------------------------------
 
 pub fn renderPane(state: *runtime.AppState, pane_id: WorkspacePaneId, rect: palette.Rect, viewport_clip: ?palette.Rect) void {
+    renderPaneChrome(state, pane_id, rect, viewport_clip, false);
+}
+
+/// A docked file pane in the side panel body. Its header has no close X
+/// (the panel tab has one); input arrives through `side_panel.zig`.
+pub fn renderDockedPane(state: *runtime.AppState, pane_id: WorkspacePaneId, rect: palette.Rect) void {
+    renderPaneChrome(state, pane_id, rect, null, true);
+}
+
+fn renderPaneChrome(state: *runtime.AppState, pane_id: WorkspacePaneId, rect: palette.Rect, viewport_clip: ?palette.Rect, docked: bool) void {
     // File tab: header (icon, name, path, actions) above a kind-specific body.
     const pane_clip = if (viewport_clip) |clip| intersect(rect, clip) else rect;
     if (pane_clip.w <= 0.0 or pane_clip.h <= 0.0) return;
@@ -170,6 +186,7 @@ pub fn renderPane(state: *runtime.AppState, pane_id: WorkspacePaneId, rect: pale
         .pane_id = pane_id,
         .rect = rect,
         .body = .{ .x = rect.x, .y = rect.y + header_h, .w = rect.w, .h = @max(rect.h - header_h, 0.0) },
+        .docked = docked,
     };
 
     queueRect(state, rect, theme.md.code_bg, pane_clip);
@@ -208,14 +225,19 @@ fn renderHeader(state: *runtime.AppState, doc: *Document, geometry: *PaneGeometr
     queueRect(state, .{ .x = header.x, .y = header.y + header.h - 1.0, .w = header.w, .h = 1.0 }, theme.borderMuted(), clip);
 
     // Right edge: close X in the far slot; workspace_panes draws zoom one slot
-    // left of it; open-externally and reload sit left of zoom.
+    // left of it; open-externally and reload sit left of zoom. Docked panes
+    // have neither close nor zoom, so open-externally takes the far slot.
     const control = theme.scaledUi(CONTROL_SIZE_CSS);
     const gap = theme.scaledUi(CONTROL_GAP_CSS);
     const control_y = header.y + (header.h - control) * 0.5;
-    const close_rect: palette.Rect = .{ .x = header.x + header.w - theme.scaledUi(RIGHT_MARGIN_CSS) - control, .y = control_y, .w = control, .h = control };
-    renderIconButton(state, geometry, .close, close_rect, NF_COD_CLOSE, clip);
-    const zoom_x = close_rect.x - gap - control;
-    const open_rect: palette.Rect = .{ .x = zoom_x - gap - control, .y = control_y, .w = control, .h = control };
+    const far_x = header.x + header.w - theme.scaledUi(RIGHT_MARGIN_CSS) - control;
+    const open_x = if (geometry.docked) far_x else blk: {
+        const close_rect: palette.Rect = .{ .x = far_x, .y = control_y, .w = control, .h = control };
+        renderIconButton(state, geometry, .close, close_rect, NF_COD_CLOSE, clip);
+        const zoom_x = close_rect.x - gap - control;
+        break :blk zoom_x - gap - control;
+    };
+    const open_rect: palette.Rect = .{ .x = open_x, .y = control_y, .w = control, .h = control };
     renderIconButton(state, geometry, .open_external, open_rect, NF_COD_LINK_EXTERNAL, clip);
     const reload_rect: palette.Rect = .{ .x = open_rect.x - gap - control, .y = control_y, .w = control, .h = control };
     renderIconButton(state, geometry, .reload, reload_rect, NF_COD_REFRESH, clip);
@@ -749,8 +771,15 @@ pub fn handleKeyDown(state: *runtime.AppState, event: *const sdl.KeyboardEvent) 
     const pane_id = state.focusedFilePaneId() orelse return false;
     // Another surface holds a caret (composer, terminal, address bar).
     if (state.composer_controller.focused or state.terminal_controller.focused or state.browser_controller.address_focused) return false;
-    // The side panel body (explorer filter, tree) owns the keyboard.
+    // The side panel body (explorer filter, tree, docked file) owns the keyboard.
     if (side_panel.bodyHasKeyboard(state)) return false;
+    return handlePaneKeyDown(state, pane_id, event);
+}
+
+/// Navigation, selection and copy keys for one drawn file pane. The side
+/// panel calls this for its docked file while its body has the keyboard.
+pub fn handlePaneKeyDown(state: *runtime.AppState, pane_id: WorkspacePaneId, event: *const sdl.KeyboardEvent) bool {
+    if (!event.down) return false;
     const geometry = geometryFor(pane_id) orelse return false;
     const doc = state.fileViewerDocument(pane_id) orelse return false;
     const primary = isPrimaryModifierPressed(event.mod);

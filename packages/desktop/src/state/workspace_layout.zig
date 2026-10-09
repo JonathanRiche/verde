@@ -92,6 +92,8 @@ pub const SidePanelView = enum {
     changes,
     /// File explorer over the workspace's folders.
     files,
+    /// A file viewer docked in the panel (`TabSidePanel.file_pane_id`).
+    file,
 };
 
 /// Per-tab side panel state. Absent entries mean closed on the browser view.
@@ -99,6 +101,11 @@ pub const TabSidePanel = struct {
     tab_id: WorkspacePaneId,
     open: bool = false,
     view: SidePanelView = .browser,
+    /// Docked file pane shown by the `.file` view.
+    file_pane_id: ?WorkspacePaneId = null,
+    /// List view (Changes / Files) to return to when the last docked file
+    /// closes. Not persisted.
+    return_view: SidePanelView = .files,
 };
 
 pub const DEFAULT_SIDE_PANEL_RATIO: f32 = 0.42;
@@ -980,6 +987,18 @@ pub const WorkspaceLayout = struct {
     /// Moves a docked browser into the tiled tree as its own tab, ordered
     /// right after the tab it was docked in. Focus is left to the caller.
     pub fn undockBrowserPane(self: *WorkspaceLayout, allocator: std.mem.Allocator, pane_id: WorkspacePaneId) !bool {
+        const tab_id = (self.paneById(pane_id) orelse return false).docked_tab_id orelse return false;
+        if (!try self.undockPane(allocator, pane_id)) return false;
+        if (self.sidePanelMutableIfPresent(tab_id)) |panel| {
+            if (panel.view == .browser) panel.open = false;
+        }
+        return true;
+    }
+
+    /// Moves any docked pane into the tiled tree as its own tab, ordered
+    /// right after the tab it was docked in. Panel state and focus are left
+    /// to the caller.
+    pub fn undockPane(self: *WorkspaceLayout, allocator: std.mem.Allocator, pane_id: WorkspacePaneId) !bool {
         const index = self.paneIndexById(pane_id) orelse return false;
         const tab_id = self.panes.items[index].docked_tab_id orelse return false;
         try self.ensurePaneInRootSplit(allocator, pane_id, .vertical, 0.58);
@@ -993,10 +1012,70 @@ pub const WorkspaceLayout = struct {
             if ((other.scroll_group_id orelse other.id) == tab_id) insert_at = other_index + 1;
         }
         _ = self.movePaneBefore(pane_id, insert_at);
-        if (self.sidePanelMutableIfPresent(tab_id)) |panel| {
-            if (panel.view == .browser) panel.open = false;
-        }
         return true;
+    }
+
+    /// Whether `pane_id` is a file viewer docked in `tab_id`'s side panel.
+    pub fn isDockedFilePane(self: *const WorkspaceLayout, tab_id: WorkspacePaneId, pane_id: WorkspacePaneId) bool {
+        const pane = self.paneById(pane_id) orelse return false;
+        return pane.docked_tab_id == tab_id and pane.ref == .file;
+    }
+
+    /// File viewer docked in `tab_id`'s side panel showing `path`.
+    pub fn dockedFilePaneIdForPath(self: *const WorkspaceLayout, tab_id: WorkspacePaneId, path: []const u8) ?WorkspacePaneId {
+        for (self.panes.items) |pane| {
+            if (pane.docked_tab_id != tab_id) continue;
+            switch (pane.ref) {
+                .file => |ref| if (std.mem.eql(u8, ref.path, path)) return pane.id,
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    /// Docked file the `.file` view of `tab_id` shows: the remembered one
+    /// while it is still docked there, else the tab's first docked file.
+    pub fn sidePanelFilePaneId(self: *const WorkspaceLayout, tab_id: WorkspacePaneId) ?WorkspacePaneId {
+        if (self.sidePanel(tab_id).file_pane_id) |pane_id| {
+            if (self.isDockedFilePane(tab_id, pane_id)) return pane_id;
+        }
+        for (self.panes.items) |pane| {
+            if (pane.docked_tab_id == tab_id and pane.ref == .file) return pane.id;
+        }
+        return null;
+    }
+
+    /// Docked file shown after `pane_id` leaves `tab_id`'s panel: its left
+    /// neighbour in panel order, else its right one.
+    pub fn dockedFileNeighbor(self: *const WorkspaceLayout, tab_id: WorkspacePaneId, pane_id: WorkspacePaneId) ?WorkspacePaneId {
+        var previous: ?WorkspacePaneId = null;
+        var seen = false;
+        for (self.panes.items) |pane| {
+            if (pane.docked_tab_id != tab_id or pane.ref != .file) continue;
+            if (pane.id == pane_id) {
+                seen = true;
+                if (previous != null) return previous;
+                continue;
+            }
+            if (seen) return pane.id;
+            previous = pane.id;
+        }
+        return null;
+    }
+
+    /// Adds a file viewer docked in `tab_id`'s side panel, after the tab's
+    /// other docked files. Duplicates `path`. Focus and the tree are untouched.
+    pub fn createDockedFilePane(self: *WorkspaceLayout, allocator: std.mem.Allocator, tab_id: WorkspacePaneId, path: []const u8) !WorkspacePaneId {
+        var ref = try FilePaneRef.init(allocator, path);
+        errdefer ref.deinit(allocator);
+        const pane_id = self.next_pane_id;
+        try self.panes.append(allocator, .{
+            .id = pane_id,
+            .ref = .{ .file = ref },
+            .docked_tab_id = tab_id,
+        });
+        self.next_pane_id += 1;
+        return pane_id;
     }
 
     /// Moves a tiled browser into `tab_id`'s side panel. Fails when the tab
@@ -1115,10 +1194,13 @@ pub const WorkspaceLayout = struct {
 
     /// First pane (visible or not, never docked) viewing `path`.
     pub fn filePaneIdForPath(self: *const WorkspaceLayout, path: []const u8) ?WorkspacePaneId {
-        for (self.panes.items) |pane| switch (pane.ref) {
-            .file => |ref| if (std.mem.eql(u8, ref.path, path)) return pane.id,
-            else => {},
-        };
+        for (self.panes.items) |pane| {
+            if (pane.docked_tab_id != null) continue;
+            switch (pane.ref) {
+                .file => |ref| if (std.mem.eql(u8, ref.path, path)) return pane.id,
+                else => {},
+            }
+        }
         return null;
     }
 
@@ -1609,6 +1691,10 @@ pub const WorkspaceLayout = struct {
                 try stringify.write(panel.open);
                 try stringify.objectField("view");
                 try stringify.write(@tagName(panel.view));
+                if (panel.file_pane_id) |pane_id| {
+                    try stringify.objectField("file_pane");
+                    try stringify.write(pane_id);
+                }
                 try stringify.endObject();
             }
             try stringify.endArray();
@@ -1776,7 +1862,7 @@ pub const WorkspaceLayout = struct {
                 }
                 pane.last_focused_in_scroll_group = jsonBool(pane_value.object.get("scroll_group_focus") orelse .null) orelse false;
                 applyPersistedPaneScrollExtent(pane, pane_value);
-                if (pane.ref == .browser) {
+                if (pane.ref == .browser or pane.ref == .file) {
                     if (jsonInt(pane_value.object.get("docked_tab") orelse .null)) |tab_id| {
                         if (tab_id > 0 and tab_id <= @as(i64, std.math.maxInt(WorkspacePaneId))) {
                             pane.docked_tab_id = @intCast(tab_id);
@@ -1797,6 +1883,9 @@ pub const WorkspaceLayout = struct {
                 const panel = try next_layout.sidePanelMutable(allocator, @intCast(tab_id));
                 panel.open = jsonBool(panel_value.object.get("open") orelse .null) orelse false;
                 panel.view = std.meta.stringToEnum(SidePanelView, view_label) orelse .browser;
+                if (jsonInt(panel_value.object.get("file_pane") orelse .null)) |pane_id| {
+                    if (pane_id > 0 and pane_id <= @as(i64, std.math.maxInt(WorkspacePaneId))) panel.file_pane_id = @intCast(pane_id);
+                }
             };
         }
         if (jsonFloat(root_value.object.get("side_panel_ratio") orelse .null)) |ratio| {
@@ -2979,6 +3068,46 @@ test "docked browsers stay out of the tiled tree and follow their tab" {
     try std.testing.expect(restored.sidePanel(tab_id).open);
     try std.testing.expectEqual(SidePanelView.agents, restored.sidePanel(tab_id).view);
     try std.testing.expectEqual(@as(f32, 0.5), restored.side_panel_ratio);
+}
+
+test "docked files list in their tab's panel, persist, and undock into tabs" {
+    const allocator = std.testing.allocator;
+    var layout = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+    const chat = layout.focused_pane_id.?;
+    const tab_id = layout.focusedTabId().?;
+
+    const a = try layout.createDockedFilePane(allocator, tab_id, "/w/a.zig");
+    const b = try layout.createDockedFilePane(allocator, tab_id, "/w/b.zig");
+    try std.testing.expect(!layout.rootContainsPane(a));
+    try std.testing.expectEqual(@as(usize, 1), layout.visibleTabCount());
+    try std.testing.expectEqual(@as(?WorkspacePaneId, chat), layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, b), layout.dockedFilePaneIdForPath(tab_id, "/w/b.zig"));
+    // Docked files never stand in for a tiled file tab.
+    try std.testing.expectEqual(@as(?WorkspacePaneId, null), layout.filePaneIdForPath("/w/a.zig"));
+    // Without a remembered file the view falls back to the first one.
+    try std.testing.expectEqual(@as(?WorkspacePaneId, a), layout.sidePanelFilePaneId(tab_id));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, a), layout.dockedFileNeighbor(tab_id, b));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, b), layout.dockedFileNeighbor(tab_id, a));
+
+    const panel = try layout.sidePanelMutable(allocator, tab_id);
+    panel.open = true;
+    panel.view = .file;
+    panel.file_pane_id = b;
+    const json = try layout.persistedWorkspaceJson(allocator);
+    defer allocator.free(json);
+    var restored: WorkspaceLayout = .{};
+    defer restored.deinit(allocator);
+    try restored.applyPersistedWorkspaceJson(allocator, json);
+    try std.testing.expect(!restored.rootContainsPane(b));
+    try std.testing.expect(restored.isDockedFilePane(tab_id, b));
+    try std.testing.expectEqual(SidePanelView.file, restored.sidePanel(tab_id).view);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, b), restored.sidePanelFilePaneId(tab_id));
+
+    try std.testing.expect(try layout.undockPane(allocator, b));
+    try std.testing.expect(layout.rootContainsPane(b));
+    try std.testing.expectEqual(@as(usize, 2), layout.visibleTabCount());
+    try std.testing.expectEqual(@as(?WorkspacePaneId, a), layout.sidePanelFilePaneId(tab_id));
 }
 
 test "undocking a browser makes it its own tab and docking returns it" {

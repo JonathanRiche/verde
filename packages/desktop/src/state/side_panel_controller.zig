@@ -1,6 +1,7 @@
-//! Per-tab right side panel (Browser / Agents) and the docked browser panes
-//! that live in it. Layout storage is `WorkspaceLayout.side_panels`; this
-//! file holds the user-facing actions.
+//! Per-tab right side panel (Browser / Agents / Changes / Files, plus docked
+//! file tabs) and the docked browser and file panes that live in it. Layout
+//! storage is `WorkspaceLayout.side_panels`; this file holds the user-facing
+//! actions.
 
 const std = @import("std");
 const workspace_layout = @import("workspace_layout.zig");
@@ -101,6 +102,76 @@ pub fn sidePanelChatPaneId(self: anytype) ?WorkspacePaneId {
         if (workspace_tabs.tabIdForPane(layout, pane.id) == tab_id) return pane.id;
     }
     return null;
+}
+
+/// Docked file viewer the focused tab's `.file` view shows.
+pub fn sidePanelFilePaneId(self: anytype) ?WorkspacePaneId {
+    const layout = selectedLayout(self) orelse return null;
+    const tab_id = layout.focusedTabId() orelse return null;
+    return layout.sidePanelFilePaneId(tab_id);
+}
+
+/// Shows a docked file of the focused tab in its panel. Leaving a list view
+/// (Changes / Files) remembers it for when the last file closes.
+pub fn showSidePanelFile(self: anytype, pane_id: WorkspacePaneId) void {
+    const layout = selectedLayout(self) orelse return;
+    const tab_id = layout.focusedTabId() orelse return;
+    if (!layout.isDockedFilePane(tab_id, pane_id)) return;
+    const panel = layout.sidePanelMutable(self.allocator, tab_id) catch return;
+    if (panel.view == .changes or panel.view == .files) panel.return_view = panel.view;
+    panel.open = true;
+    panel.view = .file;
+    panel.file_pane_id = pane_id;
+    self.browser_controller.address_focused = false;
+    self.unfocusBrowserPane();
+    self.markWorkspaceDirty(self.project_controller.selected_index);
+    self.markDirty();
+}
+
+/// The x on a docked file's panel tab. The panel moves to the file's
+/// neighbour, or back to the list it was opened from.
+pub fn closeSidePanelFile(self: anytype, pane_id: WorkspacePaneId) void {
+    const layout = selectedLayout(self) orelse return;
+    const tab_id = layout.focusedTabId() orelse return;
+    if (!layout.isDockedFilePane(tab_id, pane_id)) return;
+    const next = layout.dockedFileNeighbor(tab_id, pane_id);
+    _ = self.closeCurrentProjectWorkspacePane(pane_id);
+    afterDockedFileLeft(self, tab_id, pane_id, next);
+}
+
+/// "Move to own tab" for a docked file: it becomes a focused tiled tab.
+pub fn moveSidePanelFileToOwnTab(self: anytype, pane_id: WorkspacePaneId) void {
+    const layout = selectedLayout(self) orelse return;
+    const tab_id = layout.focusedTabId() orelse return;
+    if (!layout.isDockedFilePane(tab_id, pane_id)) return;
+    const next = layout.dockedFileNeighbor(tab_id, pane_id);
+    const moved = layout.undockPane(self.allocator, pane_id) catch |err| {
+        log.warn("failed to move file to its own tab: {s}", .{@errorName(err)});
+        self.setSidebarNotice("Could not move the file to its own tab.");
+        return;
+    };
+    if (!moved) return;
+    afterDockedFileLeft(self, tab_id, pane_id, next);
+    _ = self.focusCurrentProjectWorkspacePane(pane_id);
+    self.focusFilePane();
+}
+
+fn afterDockedFileLeft(self: anytype, tab_id: WorkspacePaneId, pane_id: WorkspacePaneId, next: ?WorkspacePaneId) void {
+    const layout = selectedLayout(self) orelse return;
+    if (layout.sidePanelMutableIfPresent(tab_id)) |panel| {
+        if (panel.view == .file and (panel.file_pane_id == null or panel.file_pane_id == pane_id)) {
+            if (next) |next_id| {
+                panel.file_pane_id = next_id;
+            } else {
+                panel.file_pane_id = null;
+                panel.view = panel.return_view;
+            }
+        } else if (panel.file_pane_id == pane_id) {
+            panel.file_pane_id = next;
+        }
+    }
+    self.markWorkspaceDirty(self.project_controller.selected_index);
+    self.markDirty();
 }
 
 /// "Move to own tab": the docked browser becomes a tiled tab of its own.

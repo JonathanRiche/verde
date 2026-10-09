@@ -883,14 +883,14 @@ pub fn openWorkspaceChangesCommit(self: anytype) void {
     self.setSidebarNotice("Open a chat in this workspace to commit its changes.");
 }
 
-/// Hook for the Files viewer: opens `root/path` there when the app provides
-/// `openFileInViewer(abs_path)`; otherwise says it is unavailable.
+/// Opens `root/path` as a file tab in the side panel when the app provides
+/// `openFileInSidePanel(abs_path)`; otherwise says it is unavailable.
 pub fn openChangedFileInViewer(self: anytype, root: []const u8, path: []const u8) void {
     const Self = @TypeOf(self.*);
-    if (comptime @hasDecl(Self, "openFileInViewer")) {
+    if (comptime @hasDecl(Self, "openFileInSidePanel")) {
         const abs_path = std.fs.path.join(page, &.{ root, path }) catch return;
         defer page.free(abs_path);
-        self.openFileInViewer(abs_path);
+        self.openFileInSidePanel(abs_path);
     } else {
         self.setSidebarNotice("The file viewer is not available in this build.");
     }

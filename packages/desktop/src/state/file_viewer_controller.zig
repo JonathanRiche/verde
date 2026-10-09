@@ -16,6 +16,8 @@
 //! AppState API (`self` is `*AppState`):
 //! - `openFileInViewer(abs_path)`: focus the tab already showing `abs_path`,
 //!   or open a new file tab. Paths outside every root get a notice instead.
+//! - `openFileInSidePanel(abs_path)`: the same as a tab in the focused tab's
+//!   side panel (a docked file pane; see `side_panel_controller`).
 //! - `fileViewerDocument(pane_id)`: per-pane document, created (and its load
 //!   started) on first use. `null` only when the pane is not a file pane.
 //! - `reloadFileViewerDocument(pane_id)`, `focusFilePane()`,
@@ -659,23 +661,50 @@ pub fn fileViewerRootsState(self: anytype) RootsState {
     return .{ .status = entry.status, .message = entry.message };
 }
 
-/// Opens `abs_path` in a file tab of the selected workspace, or focuses the
-/// tab already showing it.
-pub fn openFileInViewer(self: anytype, abs_path: []const u8) void {
-    const project_index = selectedProjectIndex(self) orelse return;
-    const normalized = std.fs.path.resolve(self.allocator, &.{abs_path}) catch return;
-    defer self.allocator.free(normalized);
+/// Normalized absolute `abs_path` when the selected workspace may show it
+/// (caller frees); otherwise a notice says why and this returns null.
+fn viewablePath(self: anytype, project_index: usize, abs_path: []const u8) ?[]u8 {
+    const normalized = std.fs.path.resolve(self.allocator, &.{abs_path}) catch return null;
     if (!std.fs.path.isAbsolute(normalized)) {
+        self.allocator.free(normalized);
         self.setSidebarNotice("Only absolute file paths can be opened in the viewer.");
-        return;
+        return null;
     }
     const project = &self.project_controller.projects.items[project_index];
     if (rootsEntry(self, project.id)) |entry| {
         if (entry.status == .ready and locate(entry.roots, normalized) == null) {
+            self.allocator.free(normalized);
             self.setSidebarNotice("That file is outside this workspace's folders.");
-            return;
+            return null;
         }
     } else refreshRoots(self, project.id);
+    return normalized;
+}
+
+/// Opens `abs_path` as a tab in the focused tab's side panel, or shows the
+/// panel tab already holding it. Without a focused tab it opens a workspace
+/// file tab instead.
+pub fn openFileInSidePanel(self: anytype, abs_path: []const u8) void {
+    const project_index = selectedProjectIndex(self) orelse return;
+    const layout = &self.project_controller.projects.items[project_index].workspace_layout;
+    const tab_id = layout.focusedTabId() orelse return openFileInViewer(self, abs_path);
+    const normalized = viewablePath(self, project_index, abs_path) orelse return;
+    defer self.allocator.free(normalized);
+    const pane_id = layout.dockedFilePaneIdForPath(tab_id, normalized) orelse
+        layout.createDockedFilePane(self.allocator, tab_id, normalized) catch {
+        self.setSidebarNotice("Failed to open the file viewer.");
+        return;
+    };
+    self.showSidePanelFile(pane_id);
+}
+
+/// Opens `abs_path` in a file tab of the selected workspace, or focuses the
+/// tab already showing it.
+pub fn openFileInViewer(self: anytype, abs_path: []const u8) void {
+    const project_index = selectedProjectIndex(self) orelse return;
+    const normalized = viewablePath(self, project_index, abs_path) orelse return;
+    defer self.allocator.free(normalized);
+    const project = &self.project_controller.projects.items[project_index];
 
     const layout = &project.workspace_layout;
     if (layout.filePaneIdForPath(normalized)) |pane_id| {
@@ -1259,7 +1288,7 @@ pub fn fileExplorerOpen(self: anytype, root_index: usize, rel: []const u8) void 
     if (root_index >= roots.len) return;
     const path = file_explorer.joinAbsolute(self.allocator, roots[root_index].path, rel) catch return;
     defer self.allocator.free(path);
-    openFileInViewer(self, path);
+    openFileInSidePanel(self, path);
 }
 
 // ------------------------------------------------------------------
