@@ -7,6 +7,10 @@ on:
         description: Upload to the Play internal track (off for the first, manual upload)
         type: boolean
         default: true
+      version_code:
+        description: Reuse the version code when retrying an unpublished release (otherwise use the run number)
+        type: string
+        required: false
   push:
     tags:
       - "mobile-android-v*"
@@ -57,7 +61,7 @@ jobs:
       - name: Build release bundle
         working-directory: packages/mobile_android
         env:
-          VERDE_VERSION_CODE: ${{ github.run_number }}
+          VERDE_VERSION_CODE: ${{ inputs.version_code || github.run_number }}
           VERDE_UPLOAD_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_PASSWORD }}
           KEYSTORE_BASE64: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_BASE64 }}
           # D-14 push, both optional: without them the build ships with notifications unavailable.
@@ -78,7 +82,7 @@ jobs:
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: verde-android-${{ github.run_number }}
+          name: verde-android-${{ inputs.version_code || github.run_number }}
           path: packages/mobile_android/app/build/outputs/bundle/release/app-release.aab
           retention-days: 14
 

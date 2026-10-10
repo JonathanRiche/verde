@@ -170,6 +170,12 @@ class TranscriptTest {
         // Heading markers are consumed by the AST; the code block is highlighted by core spans.
         assertFalse(exists("## Build fixed", substring=true))
         list().performScrollToNode(hasText("Copy code"))
+        // Highlighting arrives asynchronously after the code block's first plain-text frame.
+        await {
+            val node = compose.onAllNodes(hasText("const answer", substring=true), useUnmergedTree=true)
+                .fetchSemanticsNodes().singleOrNull()
+            node != null && node.config[SemanticsProperties.Text].single().spanStyles.isNotEmpty()
+        }
         val code=compose.onNode(hasText("const answer", substring=true), useUnmergedTree=true).fetchSemanticsNode()
         val styled=code.config[SemanticsProperties.Text].single()
         assertTrue(styled.spanStyles.isNotEmpty())
