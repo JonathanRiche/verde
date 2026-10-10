@@ -6,6 +6,7 @@ const build_options = @import("build_options");
 
 const palette = @import("palette");
 const host = @import("ui/host.zig");
+const dev_inject = @import("ui/dev_inject.zig");
 
 const app_config = @import("app/config.zig");
 const browser_runtime = @import("browser/mod.zig");
@@ -1272,8 +1273,36 @@ fn processEvents(
         if (!dispatchEvent(window, renderer, state, keyboard, ui_scale, &event, event_flags, frame_sample)) return false;
     }
 
+    if (palette_frame_renderer.snapshotRequested()) event_flags.renderer_redraw = true;
+    if (dev_inject.enabled()) {
+        if (dev_inject.take(state.allocator)) |script| {
+            defer state.allocator.free(script);
+            var injector: Injector = .{ .window = window, .renderer = renderer, .state = state, .keyboard = keyboard, .ui_scale = ui_scale, .event_flags = event_flags, .frame_sample = frame_sample };
+            const logical = window.logicalSize();
+            const pixel = window.pixelSize();
+            const scale: f32 = if (logical.width == 0) 1 else @as(f32, @floatFromInt(pixel.width)) / @as(f32, @floatFromInt(logical.width));
+            if (!dev_inject.run(script, .{ .context = &injector, .dispatch = Injector.dispatch, .window = window.id, .scale = scale })) return false;
+        }
+    }
+
     return true;
 }
+
+/// Feeds `VERDE_PALETTE_INJECT` events through the same path as platform events.
+const Injector = struct {
+    window: *palette.platform.Window,
+    renderer: *palette_frame_renderer.Renderer,
+    state: *AppState,
+    keyboard: *keybinds.NativeKeyboardConfig,
+    ui_scale: f32,
+    event_flags: *EventFlags,
+    frame_sample: *profiler.FrameSample,
+
+    fn dispatch(context: *anyopaque, event: *palette.Event) bool {
+        const self: *Injector = @ptrCast(@alignCast(context));
+        return dispatchEvent(self.window, self.renderer, self.state, self.keyboard, self.ui_scale, event, self.event_flags, self.frame_sample);
+    }
+};
 
 fn dispatchEvent(
     window: *palette.platform.Window,

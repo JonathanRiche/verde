@@ -36,6 +36,29 @@ pub fn outcomePresented(outcome: palette.RenderOutcome) bool {
     };
 }
 
+var snapshot_path_state: enum { unknown, unset, set } = .unknown;
+var snapshot_path_value: [:0]const u8 = "";
+
+fn snapshotPath() ?[:0]const u8 {
+    if (snapshot_path_state == .unknown) {
+        if (std.c.getenv("VERDE_PALETTE_SNAPSHOT")) |value| {
+            snapshot_path_value = std.mem.span(value);
+            snapshot_path_state = if (snapshot_path_value.len > 0) .set else .unset;
+        } else snapshot_path_state = .unset;
+    }
+    return if (snapshot_path_state == .set) snapshot_path_value else null;
+}
+
+/// True while a `VERDE_PALETTE_SNAPSHOT` request is pending, so the loop can
+/// force a frame even when nothing else changed.
+pub fn snapshotRequested() bool {
+    if (comptime @import("builtin").os.tag == .windows) return false;
+    const path = snapshotPath() orelse return false;
+    var request_buffer: [4096 + 16]u8 = undefined;
+    const request = std.fmt.bufPrintZ(&request_buffer, "{s}.request", .{path}) catch return false;
+    return std.c.access(request.ptr, 0) == 0;
+}
+
 pub const Renderer = struct {
     gfx: *palette.Graphics,
     wr: palette.WindowRenderer,
@@ -91,11 +114,42 @@ pub const Renderer = struct {
         framebuffer_width: f32,
         framebuffer_height: f32,
     ) !palette.RenderOutcome {
-        _ = allocator;
-        _ = framebuffer_width;
-        _ = framebuffer_height;
         const bg = theme.background();
-        return try self.wr.render(batch, .{ .r = bg[0], .g = bg[1], .b = bg[2], .a = bg[3] });
+        const clear: palette.Color = .{ .r = bg[0], .g = bg[1], .b = bg[2], .a = bg[3] };
+        const outcome = try self.wr.render(batch, clear);
+        if (snapshotPath()) |path| self.maybeSnapshot(allocator, batch, framebuffer_width, framebuffer_height, clear, path);
+        return outcome;
+    }
+
+    /// Dev hook for headless checks: with `VERDE_PALETTE_SNAPSHOT=/path.png`,
+    /// creating `/path.png.request` makes the next frame render offscreen and
+    /// land as a PNG at `/path.png` (the request file is removed). The window
+    /// itself is untouched, so this works on hidden or locked outputs.
+    fn maybeSnapshot(self: *Renderer, allocator: std.mem.Allocator, batch: *const palette.RenderBatch, framebuffer_width: f32, framebuffer_height: f32, clear: palette.Color, path: [:0]const u8) void {
+        if (comptime @import("builtin").os.tag == .windows) return;
+        var request_buffer: [4096 + 16]u8 = undefined;
+        const request = std.fmt.bufPrintZ(&request_buffer, "{s}.request", .{path}) catch return;
+        if (std.c.access(request.ptr, 0) != 0) return;
+        _ = std.c.unlink(request.ptr);
+        const width: u32 = @intFromFloat(@max(framebuffer_width, 1));
+        const height: u32 = @intFromFloat(@max(framebuffer_height, 1));
+        var offscreen = palette.gpu.Offscreen.init(self.gfx.renderer, width, height) catch return;
+        defer offscreen.deinit();
+        _ = offscreen.render(batch, .{ .clear = clear }) catch return;
+        const pixels = allocator.alloc(u8, @as(usize, width) * height * 4) catch return;
+        defer allocator.free(pixels);
+        offscreen.readRgba(pixels) catch return;
+        const png = palette.image_codec.encodeRgba(allocator, pixels, width, height, .{}) catch return;
+        defer allocator.free(png);
+        const fd = std.c.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+        if (fd < 0) return;
+        defer _ = std.c.close(fd);
+        var written: usize = 0;
+        while (written < png.len) {
+            const n = std.c.write(fd, png[written..].ptr, png.len - written);
+            if (n <= 0) return;
+            written += @intCast(n);
+        }
     }
 
     pub fn lastFrameStats(self: *const Renderer) palette.gpu.FrameStats {

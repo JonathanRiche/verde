@@ -34,6 +34,7 @@ test {
     _ = @import("state/file_viewer_controller.zig");
     _ = @import("state/file_explorer.zig");
     _ = @import("ui/text_edit.zig");
+    _ = @import("ui/dev_inject.zig");
     _ = @import("state/workspace_tabs.zig");
     _ = @import("state/resource_waiters.zig");
     _ = @import("chat/slash_commands.zig");
