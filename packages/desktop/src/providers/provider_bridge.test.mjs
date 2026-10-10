@@ -322,3 +322,31 @@ test('every Claude file-editing tool reports its path for attribution', () => {
   assert.equal(diff('NotebookEdit', { notebook_path: '/r/n.ipynb', new_source: 'x' }).path, '/r/n.ipynb');
   assert.equal(diff('Read', { file_path: '/r/read.zig' }), null);
 });
+
+for (const ending of ['notification', 'membership']) {
+  test(`agent resumed from an earlier turn gets a live card that finishes (${ending})`, { timeout: 2000 }, async () => {
+    const { context, events } = bridge();
+    await context.handleClaudeSendPrompt({ async *query({ prompt }) {
+      const input = prompt[Symbol.asyncIterator]();
+      await input.next();
+      yield { type: 'system', subtype: 'background_tasks_changed', tasks: [{ task_id: 'task', task_type: 'local_agent', description: 'Zero-copy frames' }] };
+      // No Agent tool_use in this turn: the child streams under its original call.
+      yield { type: 'assistant', parent_tool_use_id: 'old-agent', message: { content: [{ type: 'text', text: 'Back at it.' }] } };
+      yield { type: 'assistant', parent_tool_use_id: 'old-agent', message: { content: [{ type: 'text', text: 'Still going.' }] } };
+      yield turn;
+      await new Promise(setImmediate);
+      const opened = events.filter(e => e.call_id === 'old-agent' && e.status === 'in_progress');
+      assert.equal(opened.length, 1, 'one live card for the resumed agent');
+      assert.ok(events.indexOf(opened[0]) < events.findIndex(e => e.call_id === 'old-agent' && e.transcript));
+      assert.equal(events.filter(e => e.call_id === 'old-agent' && e.status === 'completed').length, 0);
+      if (ending === 'notification') {
+        yield { type: 'system', subtype: 'task_notification', task_id: 'task', tool_use_id: 'old-agent', status: 'completed', summary: 'done' };
+      }
+      yield { type: 'system', subtype: 'background_tasks_changed', tasks: [] };
+      yield turn;
+      assert.equal((await input.next()).done, true);
+    } }, { prompt: 'test' });
+    const finished = events.filter(e => e.call_id === 'old-agent' && e.status === 'completed');
+    assert.equal(finished.length, 1);
+  });
+}

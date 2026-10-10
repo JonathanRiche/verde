@@ -1674,32 +1674,73 @@ fn applySubagentSource(allocator: std.mem.Allocator, child: *ChatThread, source:
     try child.replaceSubagentViewRows(allocator, source.title, rows.items, source.signature());
 }
 
-/// Locates the parent row that minted `child_local_id`. Returns null when the
-/// send worker holds the pending stream this frame; the next poll retries.
+/// Locates the parent rows that minted `child_local_id`. A background agent
+/// can outlive its turn and keep streaming into later turns under the same
+/// call id, so every matching card is merged oldest to newest. Returns null
+/// when the send worker holds the pending stream this frame; the next poll
+/// retries.
 fn findSubagentSourceForChild(allocator: std.mem.Allocator, parent: *ChatThread, child_local_id: []const u8) !?SubagentSource {
+    var merged: ?SubagentSource = null;
+    errdefer if (merged) |source| source.deinit(allocator);
     for (parent.messages.items, 0..) |message, index| {
         if (!chat_types.looksLikeSubagentCard(message.author, message.tool_call_kind, message.body)) continue;
         var identity_buf: [32]u8 = undefined;
         const identity = subagentIdentity(&identity_buf, message.tool_call_id, message.body, index);
         if (!try subagentIdentityMatches(allocator, parent.local_thread_id, identity, child_local_id)) continue;
-        return try buildSubagentSource(allocator, identity, message.body, message.tool_call_status, null);
+        merged = try mergeSubagentSource(allocator, merged, try buildSubagentSource(allocator, identity, message.body, message.tool_call_status, null));
     }
-    if (!parent.send_state.mutex.tryLock()) return null;
+    if (!parent.send_state.mutex.tryLock()) {
+        if (merged) |source| source.deinit(allocator);
+        return null;
+    }
     defer parent.send_state.mutex.unlock();
     for (parent.send_state.pending_events.items, 0..) |event, pending_index| {
         if (!chat_types.looksLikeSubagentCard(event.author, event.tool_call_kind, event.body)) continue;
         var identity_buf: [32]u8 = undefined;
         const identity = subagentIdentity(&identity_buf, event.tool_call_id, event.body, parent.messages.items.len + pending_index);
         if (!try subagentIdentityMatches(allocator, parent.local_thread_id, identity, child_local_id)) continue;
-        return try buildSubagentSource(allocator, identity, event.body, event.tool_call_status, event.tool_call_transcript_partial);
+        merged = try mergeSubagentSource(allocator, merged, try buildSubagentSource(allocator, identity, event.body, event.tool_call_status, event.tool_call_transcript_partial));
     }
-    return null;
+    return merged;
 }
 
 fn subagentIdentityMatches(allocator: std.mem.Allocator, parent_local_id: []const u8, identity: []const u8, child_local_id: []const u8) !bool {
     const minted = try chat_types.mintSubagentLocalThreadId(allocator, parent_local_id, identity);
     defer allocator.free(minted);
     return std.mem.eql(u8, minted, child_local_id);
+}
+
+/// Folds a later card for the same child into the earlier ones: the first
+/// card carries the task prompt, later cards add activity, and the newest
+/// definite status and result win. Consumes both sources.
+fn mergeSubagentSource(allocator: std.mem.Allocator, older_opt: ?SubagentSource, newer: SubagentSource) !SubagentSource {
+    const older = older_opt orelse return newer;
+    defer older.deinit(allocator);
+    errdefer newer.deinit(allocator);
+    const separator: []const u8 = if (older.transcript.len > 0 and older.transcript[older.transcript.len - 1] != '\n') "\n" else "";
+    const transcript = try std.mem.concat(allocator, u8, &.{ older.transcript, separator, newer.transcript });
+    errdefer allocator.free(transcript);
+    const title = try allocator.dupe(u8, if (newer.title.len > 0) newer.title else older.title);
+    errdefer allocator.free(title);
+    const prompt = try allocator.dupe(u8, if (older.prompt.len > 0) older.prompt else newer.prompt);
+    errdefer allocator.free(prompt);
+    const result = try allocator.dupe(u8, if (newer.result.len > 0) newer.result else older.result);
+    errdefer allocator.free(result);
+    const identity = try allocator.dupe(u8, newer.identity);
+    errdefer allocator.free(identity);
+    const partial = try allocator.dupe(u8, newer.partial);
+    const newer_status_known = if (newer.status) |status| status != .unknown else false;
+    const status = if (newer_status_known) newer.status else older.status orelse newer.status;
+    newer.deinit(allocator);
+    return .{
+        .identity = identity,
+        .title = title,
+        .prompt = prompt,
+        .result = result,
+        .transcript = transcript,
+        .partial = partial,
+        .status = status,
+    };
 }
 
 /// The task prompt is lifted verbatim from the call's input JSON, so it still
@@ -1935,24 +1976,33 @@ fn captureSubagentSource(
     request: OpenSubagentRequest,
 ) !SubagentSource {
     if (request.tool_call_id) |call_id| {
+        // Merge every card for this call: a background agent resumed in a
+        // later turn streams under its original call id.
+        var merged: ?SubagentSource = null;
+        errdefer if (merged) |source| source.deinit(allocator);
         for (parent.messages.items, 0..) |message, index| {
-            if (message.tool_call_id) |existing| {
-                if (std.mem.eql(u8, existing, call_id)) {
-                    return try subagentSourceFromMessage(allocator, message, index);
-                }
-            }
+            const existing = message.tool_call_id orelse continue;
+            if (!std.mem.eql(u8, existing, call_id)) continue;
+            const source = subagentSourceFromMessage(allocator, message, index) catch |err| switch (err) {
+                error.NotASubagent => continue,
+                else => return err,
+            };
+            merged = try mergeSubagentSource(allocator, merged, source);
         }
         {
             parent.send_state.mutex.lock();
             defer parent.send_state.mutex.unlock();
             for (parent.send_state.pending_events.items, 0..) |event, pending_index| {
-                if (event.tool_call_id) |existing| {
-                    if (std.mem.eql(u8, existing, call_id)) {
-                        return try subagentSourceFromPending(allocator, event, parent.messages.items.len + pending_index);
-                    }
-                }
+                const existing = event.tool_call_id orelse continue;
+                if (!std.mem.eql(u8, existing, call_id)) continue;
+                const source = subagentSourceFromPending(allocator, event, parent.messages.items.len + pending_index) catch |err| switch (err) {
+                    error.NotASubagent => continue,
+                    else => return err,
+                };
+                merged = try mergeSubagentSource(allocator, merged, source);
             }
         }
+        if (merged) |source| return source;
     }
     if (request.message_id) |message_id| {
         for (parent.messages.items, 0..) |message, index| {
@@ -3049,6 +3099,59 @@ test "background chat creation preserves the scrolling viewport" {
     try std.testing.expectEqual(@as(?WorkspacePaneId, focused_pane_id), layout.scroll_leading_pane_id);
     try std.testing.expectEqual(@as(i64, 456), layout.scroll_animation_last_ms);
     try std.testing.expect(layout.scroll_axis_vertical);
+}
+
+test "subagent cards from later turns merge into one live child view" {
+    const allocator = std.testing.allocator;
+    const older: SubagentSource = .{
+        .identity = try allocator.dupe(u8, "agent-1"),
+        .title = try allocator.dupe(u8, "Zero-copy frames"),
+        .prompt = try allocator.dupe(u8, "Import dma-bufs"),
+        .result = try allocator.dupe(u8, ""),
+        .transcript = try allocator.dupe(u8, "{\"type\":\"text\",\"text\":\"Before restart.\"}"),
+        .partial = try allocator.dupe(u8, ""),
+        .status = .cancelled,
+    };
+    const newer: SubagentSource = .{
+        .identity = try allocator.dupe(u8, "agent-1"),
+        .title = try allocator.dupe(u8, ""),
+        .prompt = try allocator.dupe(u8, ""),
+        .result = try allocator.dupe(u8, ""),
+        .transcript = try allocator.dupe(u8, "{\"type\":\"text\",\"text\":\"Resumed.\"}\n"),
+        .partial = try allocator.dupe(u8, "Typing"),
+        .status = .in_progress,
+    };
+    const merged = try mergeSubagentSource(allocator, older, newer);
+    defer merged.deinit(allocator);
+    try std.testing.expectEqualStrings("Zero-copy frames", merged.title);
+    try std.testing.expectEqualStrings("Import dma-bufs", merged.prompt);
+    try std.testing.expectEqualStrings("{\"type\":\"text\",\"text\":\"Before restart.\"}\n{\"type\":\"text\",\"text\":\"Resumed.\"}\n", merged.transcript);
+    try std.testing.expectEqualStrings("Typing", merged.partial);
+    try std.testing.expectEqual(@as(?provider_types.ToolCallStatus, .in_progress), merged.status);
+
+    // A status-less later card keeps the earlier definite status.
+    const unknown: SubagentSource = .{
+        .identity = try allocator.dupe(u8, "agent-1"),
+        .title = try allocator.dupe(u8, ""),
+        .prompt = try allocator.dupe(u8, ""),
+        .result = try allocator.dupe(u8, ""),
+        .transcript = try allocator.dupe(u8, ""),
+        .partial = try allocator.dupe(u8, ""),
+        .status = .unknown,
+    };
+    const first: SubagentSource = .{
+        .identity = try allocator.dupe(u8, "agent-1"),
+        .title = try allocator.dupe(u8, "t"),
+        .prompt = try allocator.dupe(u8, "p"),
+        .result = try allocator.dupe(u8, "done"),
+        .transcript = try allocator.dupe(u8, ""),
+        .partial = try allocator.dupe(u8, ""),
+        .status = .completed,
+    };
+    const kept = try mergeSubagentSource(allocator, first, unknown);
+    defer kept.deinit(allocator);
+    try std.testing.expectEqual(@as(?provider_types.ToolCallStatus, .completed), kept.status);
+    try std.testing.expectEqualStrings("done", kept.result);
 }
 
 test "subagent view rows render streamed child activity as text and tool cards" {

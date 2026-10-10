@@ -310,11 +310,33 @@ function truncateChildText(text) {
 // `nestedAncestorByToolUseId` maps a nested agent's Task tool_use id to the
 // top-level call that owns it, so grandchildren never address a call id the
 // consumers have never seen (which would mint a stray top-level card).
-function emitClaudeChildTranscript(message, subagentByToolUseId, nestedAncestorByToolUseId) {
+// A background agent launched in an earlier turn (or resumed with
+// SendMessage) streams under its original call id, which this turn has no
+// card for. Open a live card so the GUI shows it running instead of an
+// untracked status-less row; the earlier turn's card was already finalized.
+function openResumedClaudeSubagent(callId, subagentByToolUseId, nestedAncestorByToolUseId, backgroundState) {
+  if (!backgroundState || subagentByToolUseId.has(callId) || nestedAncestorByToolUseId.has(callId)) return;
+  subagentByToolUseId.set(callId, "");
+  backgroundState.resumedSubagentIds.add(callId);
+  write({ type: "tool_call_event", call_id: callId, title: "", kind: "subagent", status: "in_progress" });
+}
+
+// Resumed agents have no launch result here, so their notification may name
+// a different call; once the SDK reports no live background work they are done.
+function finishResumedClaudeSubagents(subagentByToolUseId, backgroundState) {
+  for (const callId of backgroundState.resumedSubagentIds) {
+    write({ type: "tool_call_event", call_id: callId, title: subagentByToolUseId.get(callId) ?? "", kind: "subagent", status: "completed" });
+    subagentByToolUseId.delete(callId);
+  }
+  backgroundState.resumedSubagentIds.clear();
+}
+
+function emitClaudeChildTranscript(message, subagentByToolUseId, nestedAncestorByToolUseId, backgroundState) {
   const originId = message?.parent_tool_use_id;
   if (typeof originId !== "string" || originId.length === 0) return false;
   if (message.type !== "assistant" && message.type !== "user") return false;
   const parentId = nestedAncestorByToolUseId.get(originId) ?? originId;
+  openResumedClaudeSubagent(parentId, subagentByToolUseId, nestedAncestorByToolUseId, backgroundState);
   // Entries from a nested agent stay on the ancestor's transcript but carry
   // the nested call they belong to, so the pane can nest them one level down.
   const nestedId = parentId === originId ? null : originId;
@@ -357,13 +379,14 @@ function emitClaudeChildTranscript(message, subagentByToolUseId, nestedAncestorB
 // Token-level child text. `transcript_delta` is ephemeral: consumers show it
 // while the child block streams and drop it once the block's `text` entry
 // lands in `transcript`, so nothing is persisted twice.
-function emitClaudeChildTranscriptDelta(message, subagentByToolUseId, nestedAncestorByToolUseId) {
+function emitClaudeChildTranscriptDelta(message, subagentByToolUseId, nestedAncestorByToolUseId, backgroundState) {
   const delta = claudeChildTextDeltaFromStreamEvent(message);
   if (!delta) return false;
   // A nested agent has no live card of its own: streaming its tokens onto the
   // ancestor would show them as the direct child's reply. They arrive with the
   // block's `text` entry instead, tagged with their `parent`.
   if (nestedAncestorByToolUseId.has(delta.parentId)) return true;
+  openResumedClaudeSubagent(delta.parentId, subagentByToolUseId, nestedAncestorByToolUseId, backgroundState);
   write({
     type: "tool_call_event",
     call_id: delta.parentId,
@@ -596,8 +619,10 @@ function emitClaudeTaskNotification(message, commandByToolUseId, backgroundState
   const toolUseId = message.tool_use_id ?? backgroundState.taskToolUseIds.get(message.task_id);
   backgroundState.taskToolUseIds.delete(message.task_id);
   const subagentTitle = subagentByToolUseId.get(toolUseId);
-  if (subagentTitle && backgroundState.trackedToolUseIds.has(toolUseId)) {
+  const resumed = backgroundState.resumedSubagentIds.has(toolUseId);
+  if ((subagentTitle && backgroundState.trackedToolUseIds.has(toolUseId)) || resumed) {
     backgroundState.trackedToolUseIds.delete(toolUseId);
+    backgroundState.resumedSubagentIds.delete(toolUseId);
     subagentByToolUseId.delete(toolUseId);
     const failed = message.status !== "completed";
     write({
@@ -1329,14 +1354,14 @@ async function handleClaudeSendPrompt(sdk, request) {
     let sessionId = request.thread_id ?? null;
     let reply = "";
     let streamedText = "";
-    const backgroundState = { trackedToolUseIds: new Set(), scheduledToolUseIds: new Set(), pendingBackgrounds: [], taskToolUseIds: new Map(), liveBackgroundTasks: [] };
+    const backgroundState = { trackedToolUseIds: new Set(), scheduledToolUseIds: new Set(), pendingBackgrounds: [], taskToolUseIds: new Map(), liveBackgroundTasks: [], resumedSubagentIds: new Set() };
     for await (const message of query) {
       const rateLimitFailure = claudeRejectedRateLimitMessage(message);
       if (rateLimitFailure) throw new Error(rateLimitFailure);
       const signedOutFailure = claudeSignedOutMessage(message);
       if (signedOutFailure) throw new Error(signedOutFailure);
       if (message?.type === "stream_event") {
-        if (emitClaudeChildTranscriptDelta(message, subagentByToolUseId, nestedAncestorByToolUseId)) continue;
+        if (emitClaudeChildTranscriptDelta(message, subagentByToolUseId, nestedAncestorByToolUseId, backgroundState)) continue;
         const streamedDelta = claudeTextDeltaFromStreamEvent(message);
         if (streamedDelta) {
           streamedText += streamedDelta;
@@ -1353,6 +1378,7 @@ async function handleClaudeSendPrompt(sdk, request) {
       if (message?.type === "system" && message?.subtype === "background_tasks_changed") {
         // SDK membership snapshots also cover agents backgrounded after launch.
         backgroundState.liveBackgroundTasks = message.tasks ?? [];
+        if (backgroundState.liveBackgroundTasks.length === 0) finishResumedClaudeSubagents(subagentByToolUseId, backgroundState);
         continue;
       }
       if (message?.type === "result") {
@@ -1370,7 +1396,7 @@ async function handleClaudeSendPrompt(sdk, request) {
         if (backgroundState.trackedToolUseIds.size === 0 && backgroundState.liveBackgroundTasks.length === 0) finishInput();
         continue;
       }
-      if (emitClaudeChildTranscript(message, subagentByToolUseId, nestedAncestorByToolUseId)) continue;
+      if (emitClaudeChildTranscript(message, subagentByToolUseId, nestedAncestorByToolUseId, backgroundState)) continue;
       // Claude auto-continues after background task notifications. Keep the
       // query open so it can inspect the result and finish the turn itself.
       emitClaudeTaskNotification(message, commandByToolUseId, backgroundState, subagentByToolUseId);
