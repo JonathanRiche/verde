@@ -93,6 +93,7 @@ internal fun WorkspaceDrawer(state: BrowseState, currentTab: String, visible: Bo
     onNewTerminal: (String) -> Unit = {}, onAddWorkspace: () -> Unit = {},
     onWorkspaceSettings: (String) -> Unit = {}, canManageWorkspaces: Boolean = false, onReopen: (String) -> Unit = {},
     canEditThreads: Boolean = false, onThreadAction: (ThreadSummary, String) -> Unit = { _, _ -> },
+    onSettings: (() -> Unit)? = null,
     onChanges: ((String) -> Unit)? = null, onFiles: ((String) -> Unit)? = null) {
     var searching by rememberSaveable { mutableStateOf(false) }
     var query by rememberSaveable { mutableStateOf("") }
@@ -107,7 +108,10 @@ internal fun WorkspaceDrawer(state: BrowseState, currentTab: String, visible: Bo
         if (visible) {
             BackHandler { if (searching) { searching = false; query = "" } else onClose() }
             VerdeTopBar(title = { VerdeWordmark() }, showWorkspaceMenu = false,
-                actions = { IconButton(onClick = onClose) { Icon(Icons.Filled.Close, "Close workspace drawer") } })
+                actions = {
+                    onSettings?.let { open -> IconButton(onClick = open) { Icon(Icons.Filled.Settings, "Settings") } }
+                    IconButton(onClick = onClose) { Icon(Icons.Filled.Close, "Close workspace drawer") }
+                })
             val ready = hasContent(state) && !needsPairing(state)
             if (ready) WorkspaceSwitcher(all, scoped, onScope, onWorkspaceSettings, onAddWorkspace, canManageWorkspaces, onReopen)
             Row(Modifier.fillMaxWidth().padding(start = 12.dp, end = 4.dp, top = 4.dp), verticalAlignment = Alignment.CenterVertically) {

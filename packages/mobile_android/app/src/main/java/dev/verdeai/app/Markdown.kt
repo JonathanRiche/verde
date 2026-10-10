@@ -36,7 +36,7 @@ internal sealed interface MdBlock {
     data class Table(val rows: List<List<AnnotatedString>>) : MdBlock
 }
 
-internal data class MdStyle(val link: Color, val codeBackground: Color)
+internal data class MdStyle(val link: Color, val codeBackground: Color, val codeForeground: Color = link)
 
 /** K-11 `highlight` queries for code blocks; the transcript and the file viewer (D-12) supply one. */
 internal interface HighlightSource {
@@ -97,7 +97,7 @@ private fun AnnotatedString.Builder.appendInline(node: MarkdownNode, style: MdSt
         "emphasis" -> withStyle(SpanStyle(fontStyle = FontStyle.Italic)) { children() }
         "strong" -> withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { children() }
         "strike" -> withStyle(SpanStyle(textDecoration = TextDecoration.LineThrough)) { children() }
-        "code" -> withStyle(SpanStyle(fontFamily = VerdeMono, color = VerdeColors.Heading1, background = style.codeBackground)) { append(node.text ?: "") }
+        "code" -> withStyle(SpanStyle(fontFamily = VerdeMono, color = style.codeForeground, background = style.codeBackground)) { append(node.text ?: "") }
         "line_break" -> append('\n')
         "link" -> {
             val citation = node.citation
@@ -160,15 +160,16 @@ internal fun highlighted(code: String, spans: List<RenderSpan>, color: (String) 
 @Composable
 internal fun tokenStyle(): (String) -> SpanStyle? {
     val c = MaterialTheme.colorScheme
-    return remember(c) {
+    val palette = VerdeColors
+    return remember(c, palette) {
         { kind ->
             when (kind) {
-                "keyword" -> SpanStyle(color = Color(0xFFFBC12D), fontWeight = FontWeight.SemiBold)
-                "string" -> SpanStyle(color = Color(0xFF4EE29E))
-                "number", "constant_name" -> SpanStyle(color = VerdeColors.Heading1)
+                "keyword" -> SpanStyle(color = palette.Heading1, fontWeight = FontWeight.SemiBold)
+                "string" -> SpanStyle(color = palette.DiffAdd)
+                "number", "constant_name" -> SpanStyle(color = palette.Heading1)
                 "comment" -> SpanStyle(color = c.outline, fontStyle = FontStyle.Italic)
                 "type_name" -> SpanStyle(color = c.tertiary)
-                "function_name" -> SpanStyle(color = Color(0xFF5ECB83))
+                "function_name" -> SpanStyle(color = palette.Accent)
                 "property_name" -> SpanStyle(color = c.secondary)
                 "operator", "punctuation" -> SpanStyle(color = c.onSurfaceVariant)
                 else -> null
@@ -197,7 +198,8 @@ internal fun MarkdownText(text: String, model: MarkdownSource, onCitation: (File
     }
     val colors = MaterialTheme.colorScheme
     val callback by rememberUpdatedState(onCitation)
-    val blocks = remember(nodes, colors) { markdownBlocks(nodes, MdStyle(colors.primary, colors.surfaceVariant)) { callback(it) } }
+    val codeForeground = VerdeColors.Heading1
+    val blocks = remember(nodes, colors, codeForeground) { markdownBlocks(nodes, MdStyle(colors.primary, colors.surfaceVariant, codeForeground)) { callback(it) } }
     MarkdownBlocks(blocks, model, modifier.testTag(MARKDOWN_TAG))
 }
 

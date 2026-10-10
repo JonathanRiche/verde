@@ -102,7 +102,7 @@ internal fun HostsScreen(model: HostsModel, onUse: () -> Unit = {}, onSecurity: 
                     }
                 }
             }
-            onSecurity?.let { open -> TextButton(modifier=Modifier.fillMaxWidth(), onClick=open) { Text("App lock & privacy") } }
+            onSecurity?.let { open -> TextButton(modifier=Modifier.fillMaxWidth(), onClick=open) { Text("Settings") } }
         }
     }
     if (adding) AlertDialog(onDismissRequest={ adding=false }, title={ Text("Add host") },

@@ -238,9 +238,10 @@ private fun GitFileRow(model: GitChangesModel, state: GitChangesState, repo: Git
                     if (writable && file.canSelectHunks) Checkbox(selected && (state.selected[key] == null || hunk.index in state.selected[key].orEmpty()),
                         onCheckedChange = { model.toggleHunk(repo.branch.root, file, hunk.index) }, enabled = !state.busy,
                         modifier = Modifier.semantics { contentDescription = "Include hunk ${hunk.index + 1} of ${file.path}" })
-                    Text(remember(hunk.text) { buildAnnotatedString {
+                    val palette = VerdeColors
+                    Text(remember(hunk.text, palette) { buildAnnotatedString {
                         hunk.text.lineSequence().forEach { line ->
-                            val color = when { line.startsWith("+") -> VerdeColors.DiffAdd; line.startsWith("-") -> VerdeColors.Danger; line.startsWith("@@") -> VerdeColors.Subtle; else -> VerdeColors.Text }
+                            val color = when { line.startsWith("+") -> palette.DiffAdd; line.startsWith("-") -> palette.Danger; line.startsWith("@@") -> palette.Subtle; else -> palette.Text }
                             withStyle(SpanStyle(color = color)) { append(line); append('\n') }
                         }
                     } }, Modifier.weight(1f).background(VerdeColors.Background, RoundedCornerShape(7.dp)).horizontalScroll(rememberScrollState()).padding(8.dp),

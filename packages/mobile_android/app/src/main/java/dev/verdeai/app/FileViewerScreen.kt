@@ -301,7 +301,8 @@ private fun AnnotatedString.ifEmpty(other: () -> AnnotatedString) = if (isEmpty(
 private fun MarkdownFile(content: FileContent.Markdown, model: FileViewerModel, onCitation: (FileCitation) -> Unit) {
     val colors = MaterialTheme.colorScheme
     val callback by rememberUpdatedState(onCitation)
-    val blocks = remember(content, colors) { markdownBlocks(content.nodes, MdStyle(colors.primary, colors.surfaceVariant)) { callback(it) } }
+    val codeForeground = VerdeColors.Heading1
+    val blocks = remember(content, colors, codeForeground) { markdownBlocks(content.nodes, MdStyle(colors.primary, colors.surfaceVariant, codeForeground)) { callback(it) } }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp)) {
         MarkdownBlocks(blocks, model, Modifier.testTag(FILE_MARKDOWN_TAG))
     }

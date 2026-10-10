@@ -416,7 +416,7 @@ internal fun WorkspaceIdentityDialog(workspace: Workspace, onDismiss: () -> Unit
     var icon by rememberSaveable(id) { mutableStateOf(if (workspace.icon_custom) workspace.icon_index else null) }
     var color by rememberSaveable(id) { mutableStateOf(if (workspace.color_custom) workspace.color_index else null) }
     val (autoIcon, autoColor) = remember(id) { workspaceAutoIdentity(id) }
-    val tint = workspaceColor(color ?: autoColor)
+    val tint = workspaceColor(color ?: autoColor, VerdeColors.Accent, VerdeColors.dark)
     val changed = icon != (if (workspace.icon_custom) workspace.icon_index else null) ||
         color != (if (workspace.color_custom) workspace.color_index else null)
     AlertDialog(onDismissRequest = onDismiss, title = { Text("Icon and color") },
@@ -449,7 +449,7 @@ internal fun WorkspaceIdentityDialog(workspace: Workspace, onDismiss: () -> Unit
                         val selected = color == k
                         Box(Modifier.weight(1f).aspectRatio(1f).testTag(IDENTITY_COLOR + k)
                             .then(if (selected) Modifier.border(2.dp, MaterialTheme.colorScheme.onSurface, CircleShape) else Modifier)
-                            .padding(4.dp).background(workspaceColor(k), CircleShape)
+                            .padding(4.dp).background(workspaceColor(k, VerdeColors.Accent, VerdeColors.dark), CircleShape)
                             .selectable(selected = selected, role = Role.RadioButton) { color = k }
                             .semantics { contentDescription = "Color ${k + 1}" })
                     }

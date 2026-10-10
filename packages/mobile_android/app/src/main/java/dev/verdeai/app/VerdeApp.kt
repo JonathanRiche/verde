@@ -65,6 +65,7 @@ internal fun VerdeApp(hosts: HostsModel, browse: BrowseModel, clock: UiClock = r
     val gitBinding: GitChangesBinding = viewModel(factory = viewModelFactory { initializer { GitChangesBinding(hosts, browse.state) } })
     val gitClient by gitBinding.client.collectAsState()
     VerdeTheme {
+        AppearanceSystemBars()
         CompositionLocalProvider(LocalUiClock provides clock, LocalAppLockControls provides lock, LocalGitChangesClient provides gitClient,
             LocalPushControls provides push) {
             val app = @Composable { if (hostsState.loading) HostsScreen(hosts) else Shell(hosts, browse, hostsState) }
@@ -135,6 +136,7 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
                 onNewTerminal = { open(Routes.newTerminal(it)) },
                 onAddWorkspace = { open(ManageRoutes.ADD_WORKSPACE) },
                 onWorkspaceSettings = { open(Routes.workspace(it)) },
+                onSettings = LocalAppLockControls.current?.let { { open(Routes.SECURITY) } },
                 onChanges = { open(Routes.changes(it)) }, onFiles = { open(Routes.files(it)) },
                 canManageWorkspaces = manageState.view?.can_manage_workspaces == true,
                 onReopen = { manage.setArchived(it, false) },

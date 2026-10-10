@@ -339,17 +339,19 @@ class TranscriptTest {
         awaitText("please rebase")
         compose.onNodeWithText("Parent agent", useUnmergedTree=true).assertExists()
         assertFalse(exists("verde_parent_message", substring=true))
-        list().performScrollToNode(hasText("child-42"))
+        list().performScrollToNode(hasText("Linked chat"))
         compose.onNodeWithText("Done", useUnmergedTree=true).assertExists()
         assertFalse(exists("Child chat:", substring=true))
         assertFalse(exists("turn-7", substring=true))
         assertFalse(exists("Continue orchestration", substring=true))
-        // Long replies collapse behind a toggle.
+        // Replies start as a summary; tapping the row expands the full result.
         awaitText("Result line 1", substring=true)
         assertFalse(exists("Result line 10", substring=true))
-        compose.onNodeWithText("Show more").performClick()
+        compose.onNodeWithText("Linked chat").performClick()
         awaitText("Result line 10", substring=true)
-        compose.onNodeWithText("Show less").assertExists()
+        compose.onNodeWithText("Linked chat").performClick()
+        assertFalse(exists("Result line 10", substring=true))
+        compose.onNodeWithText("Linked chat").performClick()
         compose.onNodeWithText("Open chat").performClick()
         assertEquals(listOf("child-42"), openedThreads)
     }

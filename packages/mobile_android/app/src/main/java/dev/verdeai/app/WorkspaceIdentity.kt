@@ -66,7 +66,7 @@ internal fun workspaceIcon(index: Int): ImageVector = WORKSPACE_ICONS[index.mod(
  * Spec color slot: the theme accent with hue rotated by `slot * 45°`, saturation clamped
  * to [0.45, 0.85] and lightness to [0.55, 0.72] (dark) or [0.38, 0.50] (light).
  */
-internal fun workspaceColor(slot: Int, accent: Color = VerdeColors.Accent, dark: Boolean = true): Color {
+internal fun workspaceColor(slot: Int, accent: Color = DarkPalette.Accent, dark: Boolean = true): Color {
     val r = accent.red; val g = accent.green; val b = accent.blue
     val max = maxOf(r, g, b); val min = minOf(r, g, b); val d = max - min
     val l = (max + min) / 2f
@@ -85,7 +85,7 @@ internal fun workspaceColor(slot: Int, accent: Color = VerdeColors.Accent, dark:
 /** Identity icon on a square chip tinted with the slot color at 18% alpha. */
 @Composable
 internal fun WorkspaceChip(workspace: Workspace, size: Dp = 18.dp, modifier: Modifier = Modifier) {
-    val color = workspaceColor(workspace.color_index)
+    val color = workspaceColor(workspace.color_index, VerdeColors.Accent, VerdeColors.dark)
     Box(modifier.size(size).background(color.copy(alpha = .18f), RoundedCornerShape(size * .25f)),
         contentAlignment = Alignment.Center) {
         Icon(workspaceIcon(workspace.icon_index), contentDescription = null, tint = color,

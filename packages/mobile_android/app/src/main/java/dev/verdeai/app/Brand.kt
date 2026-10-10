@@ -48,7 +48,10 @@ internal fun ProviderGlyph(provider: String?, modifier: Modifier = Modifier.size
         "muse" -> R.drawable.provider_muse
         else -> null
     }
-    if (asset != null) Image(painterResource(asset), contentDescription = null, modifier = modifier)
+    val subtle = VerdeColors.Subtle
+    val monochrome = provider?.lowercase() in setOf("codex", "openai", "cursor", "grok", "pi", "fx")
+    if (asset != null) Image(painterResource(asset), contentDescription = null, modifier = modifier,
+        colorFilter = if (monochrome) ColorFilter.tint(VerdeColors.Text) else null)
     else Canvas(modifier) {
         val path = Path().apply {
             moveTo(size.width * .25f, size.height * .29f)
@@ -58,7 +61,7 @@ internal fun ProviderGlyph(provider: String?, modifier: Modifier = Modifier.size
             lineTo(size.width * .25f, size.height * .725f)
             close()
         }
-        drawPath(path, VerdeColors.Subtle, style = Stroke(1.3.dp.toPx()))
+        drawPath(path, subtle, style = Stroke(1.3.dp.toPx()))
     }
 }
 

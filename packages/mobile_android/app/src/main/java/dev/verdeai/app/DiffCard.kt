@@ -229,9 +229,10 @@ internal data class DiffPalette(
 @Composable
 internal fun diffPalette(): DiffPalette {
     val c = MaterialTheme.colorScheme
-    return remember(c) {
-        val add = VerdeColors.DiffAdd
-        val delete = VerdeColors.Danger
+    val palette = VerdeColors
+    return remember(c, palette) {
+        val add = palette.DiffAdd
+        val delete = palette.Danger
         DiffPalette(add.copy(alpha = 0.08f), delete.copy(alpha = 0.10f), add.copy(alpha = 0.26f), delete.copy(alpha = 0.32f),
             add, delete, c.outline, c.onSurfaceVariant)
     }

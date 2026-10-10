@@ -80,13 +80,14 @@ internal fun AppLockGate(model: AppLockModel, auth: DeviceAuth, content: @Compos
         properties = DialogProperties(dismissOnBackPress = true, dismissOnClickOutside = false,
             usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
     ) {
-        // The dialog window has its own system bars; keep their icons readable on the dark surface.
+        // The dialog window has its own system bars; keep their icons readable in the selected theme.
         val view = LocalView.current
+        val dark = VerdeColors.dark
         SideEffect {
             (view.parent as? DialogWindowProvider)?.window?.let { window ->
                 WindowCompat.getInsetsController(window, view).apply {
-                    isAppearanceLightStatusBars = false
-                    isAppearanceLightNavigationBars = false
+                    isAppearanceLightStatusBars = !dark
+                    isAppearanceLightNavigationBars = !dark
                 }
             }
         }
@@ -126,10 +127,13 @@ internal fun SecuritySettingsScreen(model: AppLockModel, auth: DeviceAuth, onBac
     val settings = state.settings
     val lockOn = settings.enabled
     Column(Modifier.fillMaxSize()) {
-        VerdeTopBar(title = { Text("App lock & privacy") },
+        VerdeTopBar(title = { Text("Settings") },
             navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back") } })
         Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            AppearanceSettingsSection()
+            HorizontalDivider()
+            VerdeSection("App lock & privacy")
             SettingSwitch("Require unlock",
                 "Ask for your fingerprint, face or screen lock when you open Verde.",
                 checked = lockOn, enabled = state.loaded && !state.authenticating && (lockOn || state.available),

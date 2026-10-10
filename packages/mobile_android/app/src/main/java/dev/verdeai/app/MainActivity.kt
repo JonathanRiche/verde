@@ -7,7 +7,6 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.activity.SystemBarStyle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.lifecycleScope
@@ -25,10 +24,7 @@ class MainActivity : ComponentActivity() {
     private var pushDirectory: HostsPushDirectory? = null
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge(
-            statusBarStyle = SystemBarStyle.dark(0xFF20272A.toInt()),
-            navigationBarStyle = SystemBarStyle.dark(0xFF0D1213.toInt()),
-        )
+        enableEdgeToEdge()
         // Secure until the saved privacy setting loads; D-15's app lock then owns the flag.
         window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
         val app = application as VerdeApplication
