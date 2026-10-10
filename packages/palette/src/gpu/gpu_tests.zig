@@ -154,6 +154,32 @@ test "golden images (1x, 1.25x)" {
     try checkGolden(gpa, &f, 1.25, @embedFile("testdata/scene_1.25x.png"));
 }
 
+test "Metal: precompiled metallib and runtime-compiled MSL render identically" {
+    if (comptime gpu.backend_kind != .metal) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const metal_renderer = gpu.metal.renderer;
+    var bufs: [2][2][]u8 = undefined; // [path][scale]
+    for (0..2) |path| {
+        metal_renderer.force_source_shader = path == 1;
+        defer metal_renderer.force_source_shader = false;
+        var f = try Fixture.init(gpa);
+        defer f.deinit(gpa);
+        const expected: gpu.metal.ShaderLibrary = if (path == 0) .metallib else .source;
+        try std.testing.expectEqual(expected, f.renderer.shader_library);
+        for ([_]f32{ 1.0, 1.25 }, 0..) |scale, si| {
+            const w: usize = @intFromFloat(@round(@as(f32, scene.width) * scale));
+            const h: usize = @intFromFloat(@round(@as(f32, scene.height) * scale));
+            bufs[path][si] = try gpa.alloc(u8, w * h * 4);
+            try renderScene(gpa, &f, scale, bufs[path][si]);
+        }
+    }
+    defer for (bufs) |p| for (p) |b| gpa.free(b);
+    for (0..2) |si| {
+        const diff = gpu.png.compare(bufs[0][si], bufs[1][si], 0);
+        try std.testing.expectEqual(@as(usize, 0), diff.mismatched);
+    }
+}
+
 extern "c" fn mmap(addr: ?*anyopaque, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) ?*anyopaque;
 extern "c" fn munmap(addr: *anyopaque, len: usize) c_int;
 extern "c" fn fcntl(fd: c_int, cmd: c_int, ...) c_int;

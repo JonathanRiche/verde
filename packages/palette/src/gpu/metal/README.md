@@ -6,22 +6,25 @@ stream-region merge. This directory owns the Metal objects. `../root.zig` select
 `core.checkBackend` enforces the same interface (`Context`, `Renderer`, `Offscreen`, `Target`).
 
 There are no build-time dependencies. Metal.framework is dlopened through `../../platform/macos/objc.zig`, and every call
-is an `objc_msgSend` with the selector spelled out. There are no headers, no `.m` files, no Swift and no `xcrun`. The
-shader is MSL source embedded with `@embedFile` and compiled at runtime by `newLibraryWithSource:`, so the whole backend
-cross-compiles from Linux.
+is an `objc_msgSend` with the selector spelled out. There are no headers, no `.m` files, no Swift, and normal builds
+need no `xcrun`, so the whole backend cross-compiles from Linux. The shader ships twice, both embedded with `@embedFile`:
+the precompiled `shader.metallib`, loaded with `newLibraryWithData:`, and the MSL source, compiled at runtime by
+`newLibraryWithSource:` only if the metallib cannot be loaded (see "Shader library" below).
 
 | file | role |
 |---|---|
 | `mtl.zig` | The slice of the Metal API used: enum values and by-value structs (MTLOrigin/Size/Viewport/ScissorRect/ClearColor) from the macOS 14 SDK, `MTLCreateSystemDefaultDevice` via dlsym, texture/buffer/blit helpers |
 | `shader.metal` | MSL port of `src/shaders/ui.{vert,frag}.glsl`. The same maths, kept in lockstep because the goldens are shared, plus `clear_vertex`/`clear_fragment` for partial redraws |
+| `shader.metallib` | `shader.metal` precompiled by `zig build compile-metal` (checked in, like the SPIR-V and DXBC). Regenerate it whenever `shader.metal` changes |
 | `renderer.zig` | `Context` (device, queue, serials, memory stats), `Renderer` (pipelines, atlases, textures, uploads, `streamTexture`, recording and commit) |
 | `targets.zig` | `Offscreen` (texture + CPU readback, BGRA→RGBA) and `LayerTarget` (CAMetalLayer window target) |
 
 ## Design
 
 * **Pipelines.** There are two: the uber-shader (blend ONE / ONE_MINUS_SRC_ALPHA, premultiplied) and a no-blend clear
-  quad. Both target BGRA8Unorm, which is CAMetalLayer's default. The compile options set `mathMode = Safe`
-  (`fastMathEnabled = NO` before macOS 15), so AA ramps match the SPIR-V path.
+  quad. Both target BGRA8Unorm, which is CAMetalLayer's default. The runtime compile options set `mathMode = Safe`
+  (`fastMathEnabled = NO` before macOS 15) and the metallib is built with `-fno-fast-math`, so AA ramps match the
+  SPIR-V path.
 * **Instances.** Each frame slot (2–3 in flight, `Options.frames_in_flight`) has its own shared, write-combined
   `MTLBuffer` ring. On unified memory nothing is copied. The vertex shader reads `instances[[instance_id]]`, and each
   texture run is one `drawPrimitives(triangleStrip, 0, 4, count, baseInstance)`. `instance_id` includes the base, so there
@@ -62,17 +65,45 @@ cross-compiles from Linux.
   changes (damage 0.1%) and 152 µs for an unchanged frame (hash skip, nothing submitted). Damage tracking saves 73% when
   one label changes. The backbuffer→drawable blit is part of every windowed frame. It was not timed separately: there is no
   GPU timestamp query in the bench. It is a single 4 bytes/px copy of the window, ~4 MB at 1280x800.
-* **Startup.** `MTLCreateSystemDefaultDevice` takes ~45 ms. Compiling the MSL takes ~400 ms the first time a given binary
-  runs, then ~2 ms, because Metal's shader cache is keyed per executable. Warm, the first offscreen frame comes ~54 ms after main.
+* **Startup.** `MTLCreateSystemDefaultDevice` takes 30-100 ms. With the metallib, creating the renderer (library +
+  both pipelines) takes 0.9-3.2 ms cold and ~1 ms warm. See "Shader library" for the numbers against the runtime compile.
 * **Idle.** With nothing dirty no command buffer is created and the display link is paused: 0.1–0.2% CPU.
 * **Memory.** At 360x220 the GPU memory is the atlases plus the backbuffer, about 2 MiB (`gpu_mem` in `gpu-offscreen`).
   In the bench window (1280x800) the process `phys_footprint` is 23–35 MiB, against 34–50 MiB for the old SDL renderer
   (`baseline/COMPARISON-macos.md`).
 
+## Shader library
+
+* **Build.** `zig build compile-metal` runs `tools/compile-metal.sh`: `xcrun -sdk macosx metal -c -O
+  -mmacosx-version-min=13.0 -fno-fast-math` then `metallib`, without debug info or source paths (Xcode 16.2, Metal
+  32023.404). On a Mac it runs locally. On other hosts it runs over `ssh $PALETTE_MAC_HOST` (default `mac`): the source
+  goes over stdin, the metallib comes back on stdout, and on the Mac only `$PALETTE_MAC_DIR`
+  (default `~/palette-native-dev/metal-build`) is touched. The output is reproducible (byte-identical across runs
+  and between the local and ssh paths). The step is optional; normal builds use the checked-in file.
+* **Runtime.** `Renderer.init` loads the embedded metallib (`dispatch_data_create` + `newLibraryWithData:error:`). If
+  that or a pipeline fails (an OS below the deployment target, a stale metallib without an entry point), it logs a
+  warning and compiles the embedded MSL instead. `Renderer.shader_library` (`.metallib` / `.source`) records the
+  path, and a debug log line names it. `PALETTE_METAL_SHADER=source` (or `metal.renderer.force_source_shader`) forces
+  the runtime compile for tests and measurements.
+* **Parity.** The test "Metal: precompiled metallib and runtime-compiled MSL render identically" renders the golden
+  scene through both paths at 1x and 1.25x and requires 0 differing pixels. `gpu-offscreen` PNGs are byte-identical
+  for both paths, and both differ from the shared goldens only by the known 1 LSB AA pixels (15906 at 1x, 21826 at 1.25x).
+* **Cold start** (M2, macOS 14.6, ReleaseFast `gpu-offscreen`, 5 runs each). Metal keeps one user-wide cache keyed by
+  shader content (`$(getconf DARWIN_USER_CACHE_DIR)/com.apple.metal`), not one per executable: a copied or renamed
+  binary is warm. So each cold run salts the shader with a unique comment (and, for the metallib, rebuilds it) instead
+  of clearing that shared cache.
+
+  | | renderer init, cold | first frame after main, cold | renderer init, warm | first frame, warm |
+  |---|---|---|---|---|
+  | runtime MSL compile (before) | 68-124 ms (median 83) | 108-167 ms (median 161) | 1.1-2.6 ms | 31-76 ms |
+  | precompiled metallib (after) | 0.9-3.2 ms (median 2.3) | 46-112 ms (median 68) | 0.9-1.1 ms | 41-61 ms |
+
+  The remaining cold time is device creation (30-100 ms, noisy on a shared desktop). The earlier ~400 ms estimate was
+  not reproduced in these ReleaseFast runs; one unsalted cold run reached 1.5 s, which looked like the compiler
+  service starting.
+
 ## Not supported / not done
 
-* **Precompiled `.metallib`.** Building one needs Apple's `metal` toolchain on a Mac. Shipping it would remove the ~400 ms
-  first-run compile.
 * **EDR/HDR and wide-gamut output.** The layer is SDR BGRA8 in sRGB. There is no `wantsExtendedDynamicRangeContent`.
 * **Explicit present timing.** There is no `presentDrawable:atTime:` or `afterMinimumDuration:`, and no frame statistics
   from `MTLDrawable.presentedTime`. Pacing is the display link.

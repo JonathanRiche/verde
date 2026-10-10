@@ -1,5 +1,6 @@
 //! Palette's Metal renderer (macOS): `draw.RenderBatch` -> one instanced pipeline, the same
-//! uber-shader as Vulkan (ported to MSL in `shader.metal`, compiled at runtime).
+//! uber-shader as Vulkan (ported to MSL in `shader.metal`; loaded from the precompiled
+//! `shader.metallib`, with a runtime compile of the MSL as the fallback).
 //!
 //! The backend-neutral work (instances, texture runs, glyph layout + atlas packing, damage,
 //! the skip/full/partial plan, stream-region merging) is `../core.zig`; this file owns the
@@ -48,6 +49,21 @@ const max_stream_slots = core.max_stream_slots;
 pub const target_format = mtl.PixelFormat.bgra8_unorm;
 
 const shader_source = @embedFile("shader.metal");
+/// `shader.metal` compiled by `zig build compile-metal` (macOS 13+, -O, no debug info).
+const shader_metallib = @embedFile("shader.metallib");
+
+/// Where the renderer's shader library came from.
+pub const ShaderLibrary = enum {
+    /// The embedded precompiled `shader.metallib` (`newLibraryWithData:`): no compile.
+    metallib,
+    /// The embedded MSL compiled at runtime (`newLibraryWithSource:`): the fallback when the
+    /// metallib cannot be loaded, about 100 ms on the first run of a new shader.
+    source,
+};
+
+/// Forces the runtime MSL compile for renderers created afterwards (tests, measurements).
+/// The environment variable `PALETTE_METAL_SHADER=source` does the same.
+pub var force_source_shader: bool = false;
 
 // ---- Context ------------------------------------------------------------------------------
 
@@ -250,6 +266,8 @@ pub const Renderer = struct {
     pending_uploads: std.ArrayList(PendingUpload) = .empty,
     texture_generation: u32 = 1,
     last_stats: FrameStats = .{},
+    /// Which shader library the pipelines were built from.
+    shader_library: ShaderLibrary = .source,
 
     pub fn init(gpa: std.mem.Allocator, ctx: *Context, options: Options) !*Renderer {
         const self = try gpa.create(Renderer);
@@ -323,6 +341,66 @@ pub const Renderer = struct {
 
     fn createPipelines(self: *Renderer) !void {
         const dev = self.ctx.device;
+        const forced = force_source_shader or envForcesSource();
+        if (!forced) {
+            if (loadMetallib(dev)) |lib| {
+                defer objc.release(lib);
+                if (self.makePipelines(lib)) {
+                    self.shader_library = .metallib;
+                    log.debug("shaders: precompiled metallib ({d} bytes)", .{shader_metallib.len});
+                    return;
+                } else |err| {
+                    log.warn("shaders: metallib pipelines failed ({s}); compiling the MSL source", .{@errorName(err)});
+                    self.releasePipelines();
+                }
+            }
+        }
+        const lib = try compileSource(dev);
+        defer objc.release(lib);
+        try self.makePipelines(lib);
+        self.shader_library = .source;
+        if (forced) {
+            log.debug("shaders: runtime MSL compile (forced)", .{});
+        } else {
+            log.debug("shaders: runtime MSL compile (fallback)", .{});
+        }
+    }
+
+    fn makePipelines(self: *Renderer, lib: Id) !void {
+        self.pipeline = try makePipeline(self.ctx.device, lib, "ui_vertex", "ui_fragment", true);
+        self.clear_pipeline = try makePipeline(self.ctx.device, lib, "clear_vertex", "clear_fragment", false);
+    }
+
+    fn releasePipelines(self: *Renderer) void {
+        if (self.pipeline) |p| objc.release(p);
+        if (self.clear_pipeline) |p| objc.release(p);
+        self.pipeline = null;
+        self.clear_pipeline = null;
+    }
+
+    fn envForcesSource() bool {
+        const v = std.c.getenv("PALETTE_METAL_SHADER") orelse return false;
+        return std.mem.eql(u8, std.mem.span(v), "source");
+    }
+
+    /// The embedded metallib as an MTLLibrary, or null (logged) if this OS cannot load it.
+    fn loadMetallib(dev: Id) ?Id {
+        const DataCreate = *const fn (?*const anyopaque, usize, ?*anyopaque, ?*const anyopaque) callconv(.c) ?Id;
+        const data_create = objc.cSymbol(DataCreate, "dispatch_data_create") orelse {
+            log.warn("shaders: dispatch_data_create missing; compiling the MSL source", .{});
+            return null;
+        };
+        // Default destructor (null): libdispatch copies the bytes.
+        const data = data_create(shader_metallib.ptr, shader_metallib.len, null, null) orelse return null;
+        defer objc.release(data);
+        var err: ?Id = null;
+        return send(?Id, dev, "newLibraryWithData:error:", .{ data, &err }) orelse {
+            log.warn("shaders: metallib rejected ({s}); compiling the MSL source", .{mtl.errorText(err)});
+            return null;
+        };
+    }
+
+    fn compileSource(dev: Id) !Id {
         const opts = objc.new(objc.class("MTLCompileOptions"));
         defer objc.release(opts);
         // Bit-for-bit parity with the SPIR-V path matters more than the last cycle.
@@ -332,13 +410,10 @@ pub const Renderer = struct {
             send(void, opts, "setFastMathEnabled:", .{objc.NO});
         }
         var err: ?Id = null;
-        const lib = send(?Id, dev, "newLibraryWithSource:options:error:", .{ objc.nsString(shader_source), opts, &err }) orelse {
+        return send(?Id, dev, "newLibraryWithSource:options:error:", .{ objc.nsString(shader_source), opts, &err }) orelse {
             log.err("MSL compile failed: {s}", .{mtl.errorText(err)});
             return error.MetalShaderCompileFailed;
         };
-        defer objc.release(lib);
-        self.pipeline = try makePipeline(dev, lib, "ui_vertex", "ui_fragment", true);
-        self.clear_pipeline = try makePipeline(dev, lib, "clear_vertex", "clear_fragment", false);
     }
 
     fn makePipeline(dev: Id, lib: Id, vs_name: []const u8, fs_name: []const u8, blend: bool) !Id {

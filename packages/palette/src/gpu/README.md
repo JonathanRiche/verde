@@ -25,7 +25,7 @@ Retained-mode `draw.RenderBatch` → pixels, at parity with the old SDL_GPU rend
 | `vulkan/context.zig` | Loader, GPU pick (prefers the compositor's DRM node), queue, caps, memory allocation, serials + deferred destruction |
 | `vulkan/renderer.zig` | Pipeline, atlas images, textures + uploads, command recording/submission (on `core.Encoder`) |
 | `vulkan/targets.zig` | `Offscreen` (readback) and `DmabufTargets` (modifiers, sync_file, FOREIGN queue transfer) |
-| `metal/` | Metal backend (macOS): runtime-compiled MSL uber-shader, offscreen + CAMetalLayer targets. See `metal/README.md` |
+| `metal/` | Metal backend (macOS): precompiled metallib uber-shader (runtime MSL fallback), offscreen + CAMetalLayer targets. See `metal/README.md` |
 | `text.zig` | `GlyphSource` interface, `StubGlyphSource`, `GlyphCache` (atlases), `Layouter` (old-renderer text rules) |
 | `atlas.zig` | Shelf packer with bucketed heights, growth and LRU shelf eviction |
 | `damage.zig` | Tile-hash damage tracker with buffer-age history |
