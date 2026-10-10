@@ -6,7 +6,7 @@ const std = @import("std");
 const draw = @import("../draw.zig");
 const clipboard = @import("../input/clipboard.zig");
 const selection_input = @import("../input/selection.zig");
-const sdl = @import("../sdl.zig");
+const Event = @import("../event.zig").Event;
 const text_layout = @import("../text_layout.zig");
 
 pub const TextConfig = struct {
@@ -119,13 +119,13 @@ pub fn Text(comptime config: TextConfig) type {
             self.emit(.{ .selection_changed = null });
         }
 
-        pub fn update(self: *Component, event: *const sdl.Event) !bool {
-            switch (event.type) {
-                .mouse_button_down => return self.handleInput(.{ .mouse_down = .{ .x = event.button.x, .y = event.button.y } }),
-                .mouse_button_up => return self.handleInput(.{ .mouse_up = .{ .x = event.button.x, .y = event.button.y } }),
-                .mouse_motion => {
-                    if (!self.dragging_selection or !event.motion.state.left) return false;
-                    return self.handleInput(.{ .mouse_drag = .{ .x = event.motion.x, .y = event.motion.y } });
+        pub fn update(self: *Component, event: *const Event) !bool {
+            switch (event.*) {
+                .mouse_button_down => |button| return self.handleInput(.{ .mouse_down = .{ .x = button.x, .y = button.y } }),
+                .mouse_button_up => |button| return self.handleInput(.{ .mouse_up = .{ .x = button.x, .y = button.y } }),
+                .mouse_motion => |motion| {
+                    if (!self.dragging_selection or !motion.state.left) return false;
+                    return self.handleInput(.{ .mouse_drag = .{ .x = motion.x, .y = motion.y } });
                 },
                 else => return false,
             }

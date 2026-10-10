@@ -1,0 +1,5 @@
+repo: palette-decouple-research (palette-native)
+commit: 46dbc1935c64061a3959a7b1b7ffd8da4c066674
+subject: keyboard: credit zsdl (MIT) for the Scancode declaration
+paths: palette-native/src, palette-native/tools/wayland-scanner.zig, protocols/*.xml, protocols/README.md
+refresh: scripts/dev/vendor-palette-native.sh <palette-native repo> <commit>

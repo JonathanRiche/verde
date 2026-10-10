@@ -5,7 +5,7 @@ const std = @import("std");
 const draw = @import("../draw.zig");
 const key_input = @import("../input/key.zig");
 const scroll = @import("../scroll.zig");
-const sdl = @import("../sdl.zig");
+const Event = @import("../event.zig").Event;
 const text_layout = @import("../text_layout.zig");
 
 pub const RowHeightFn = *const fn (context: ?*anyopaque, index: usize) f32;
@@ -188,18 +188,18 @@ pub fn VirtualList(comptime config: VirtualListConfig) type {
             return null;
         }
 
-        pub fn update(self: *Component, event: *const sdl.Event) !bool {
-            switch (event.type) {
-                .key_down => return self.handleInput(.{ .key = Key.fromSdl(event.key) orelse return false }),
-                .mouse_button_down => return self.handleInput(.{ .mouse_down = .{ .x = event.button.x, .y = event.button.y } }),
-                .mouse_button_up => return self.handleInput(.{ .mouse_up = .{ .x = event.button.x, .y = event.button.y } }),
-                .mouse_motion => {
-                    if (self.dragging_scrollbar or event.motion.state.left) {
-                        return self.handleInput(.{ .mouse_drag = .{ .x = event.motion.x, .y = event.motion.y } });
+        pub fn update(self: *Component, event: *const Event) !bool {
+            switch (event.*) {
+                .key_down => |key| return self.handleInput(.{ .key = Key.fromEvent(key) orelse return false }),
+                .mouse_button_down => |button| return self.handleInput(.{ .mouse_down = .{ .x = button.x, .y = button.y } }),
+                .mouse_button_up => |button| return self.handleInput(.{ .mouse_up = .{ .x = button.x, .y = button.y } }),
+                .mouse_motion => |motion| {
+                    if (self.dragging_scrollbar or motion.state.left) {
+                        return self.handleInput(.{ .mouse_drag = .{ .x = motion.x, .y = motion.y } });
                     }
-                    return self.handleInput(.{ .mouse_move = .{ .x = event.motion.x, .y = event.motion.y } });
+                    return self.handleInput(.{ .mouse_move = .{ .x = motion.x, .y = motion.y } });
                 },
-                .mouse_wheel => return self.handleInput(.{ .mouse_wheel = .{ .point = .{ .x = event.wheel.mouse_x, .y = event.wheel.mouse_y }, .y = event.wheel.y } }),
+                .mouse_wheel => |wheel| return self.handleInput(.{ .mouse_wheel = .{ .point = .{ .x = wheel.mouse_x, .y = wheel.mouse_y }, .y = wheel.y } }),
                 else => return false,
             }
         }

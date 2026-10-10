@@ -1,18 +1,16 @@
-//! Public API for the palette SDL_GPU UI package.
+//! Public API for Palette: a dependency-free retained UI package.
 
 const std = @import("std");
 
-pub const atlas = @import("atlas.zig");
 pub const clock = @import("clock.zig");
 pub const draw = @import("draw.zig");
-pub const image_loader = @import("image_loader.zig");
+pub const event = @import("event.zig");
+pub const keyboard = @import("keyboard.zig");
 pub const input_clipboard = @import("input/clipboard.zig");
 pub const input_key = @import("input/key.zig");
 pub const input_selection = @import("input/selection.zig");
 pub const layout = @import("layout.zig");
-pub const renderer = @import("renderer.zig");
 pub const scroll = @import("scroll.zig");
-pub const sdl = @import("sdl.zig");
 pub const button_component = @import("components/button.zig");
 pub const checkbox_component = @import("components/checkbox.zig");
 pub const code_view_component = @import("components/code_view.zig");
@@ -36,14 +34,34 @@ pub const text_stack = @import("text.zig");
 pub const text_layout = @import("text_layout.zig");
 pub const virtual_list_component = @import("components/virtual_list.zig");
 
+// Subsystems (dependency-free: pure Zig + OS interfaces; Vulkan is dlopen'ed at runtime).
+/// Pure-Zig font engine: sfnt/CFF parsing, rasterizer, shaping-lite, fallback, discovery.
+pub const font = @import("font/root.zig");
+/// Pure-Zig PNG codec.
+pub const image_codec = @import("image/root.zig");
+/// Window system layer (pure-Zig Wayland client).
+pub const platform = @import("platform/root.zig");
+/// Vulkan renderer (dlopen), dma-buf targets, damage tracking.
+pub const gpu = @import("gpu/root.zig");
+/// High-level glue: shared GPU/font state + per-window renderer with frame pacing.
+pub const app = @import("app.zig");
+/// Font setup helpers (Verde-like role chains) and the `FontMetrics` adapter.
+pub const fonts = @import("fonts.zig");
+
+pub const Graphics = app.Graphics;
+pub const GraphicsOptions = app.GraphicsOptions;
+pub const WindowRenderer = app.WindowRenderer;
+pub const Surface = app.WindowRenderer;
+pub const RenderOutcome = app.Outcome;
+pub const scaleBatch = app.scaleBatch;
+
+pub const Event = event.Event;
 pub const Color = draw.Color;
 pub const Rect = draw.Rect;
 pub const RenderBatch = draw.RenderBatch;
 pub const TextureId = draw.TextureId;
 pub const TextRun = draw.TextRun;
 pub const FontRole = draw.FontRole;
-pub const Renderer = renderer.Renderer;
-pub const FontAtlas = atlas.FontAtlas;
 pub const ButtonCallbacks = button_component.ButtonCallbacks;
 pub const ButtonConfig = button_component.ButtonConfig;
 pub const ButtonContentAlign = button_component.ButtonContentAlign;
@@ -75,7 +93,6 @@ pub const CascadeMenuSubmenuPlacement = cascade_menu_component.SubmenuPlacement;
 pub const IconButtonConfig = button_component.IconButtonConfig;
 pub const ImageConfig = image_component.ImageConfig;
 pub const ImageFit = image_component.ImageFit;
-pub const LoadedImage = image_loader.LoadedImage;
 pub const ListBoxCallbacks = list_box_component.ListBoxCallbacks;
 pub const ListBoxConfig = list_box_component.ListBoxConfig;
 pub const ListBoxEvent = list_box_component.ListBoxEvent;
@@ -138,7 +155,6 @@ pub const VirtualListItemLabelFn = virtual_list_component.ItemLabelFn;
 pub const VirtualListRowHeightFn = virtual_list_component.RowHeightFn;
 pub const ClipboardCallbacks = input_clipboard;
 pub const Key = input_key;
-pub const ImageLoader = image_loader;
 pub const Layout = layout;
 pub const LayoutAlign = layout.Align;
 pub const LayoutBox = layout.Box;
@@ -279,8 +295,9 @@ pub fn textArea(comptime config: TextAreaConfig) type {
 
 test {
     _ = draw;
+    _ = event;
+    _ = keyboard;
     _ = clock;
-    _ = image_loader;
     _ = input_clipboard;
     _ = input_key;
     _ = input_selection;
@@ -308,4 +325,13 @@ test {
     _ = text_stack;
     _ = text_layout;
     _ = virtual_list_component;
+    _ = app;
+    if (@import("builtin").os.tag == .windows) _ = @import("app_win32.zig");
+    _ = fonts;
+    // Subsystem unit tests run from their own roots (test-font, test-gpu, test-wayland,
+    // test-image) because some need build options; here we only check the exports resolve.
+    _ = font.Collection;
+    _ = image_codec.loadFromMemory;
+    _ = platform.App;
+    _ = gpu.Renderer;
 }

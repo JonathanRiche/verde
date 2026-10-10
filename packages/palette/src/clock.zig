@@ -9,6 +9,12 @@ pub fn monotonicTimestampNs() u64 {
     return @intCast(@max(timestamp.nanoseconds, 0));
 }
 
+/// Blocks the calling thread for `ns` nanoseconds (portable: nanosleep / Win32 waits).
+pub fn sleepNs(ns: u64) void {
+    var threaded = std.Io.Threaded.init_single_threaded;
+    threaded.io().sleep(.{ .nanoseconds = @intCast(ns) }, .awake) catch {};
+}
+
 test "monotonic clock is nondecreasing" {
     const before = monotonicTimestampNs();
     const after = monotonicTimestampNs();

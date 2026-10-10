@@ -8,7 +8,7 @@ const clipboard = @import("../input/clipboard.zig");
 const key_input = @import("../input/key.zig");
 const scroll = @import("../scroll.zig");
 const selection_input = @import("../input/selection.zig");
-const sdl = @import("../sdl.zig");
+const Event = @import("../event.zig").Event;
 const text_layout = @import("../text_layout.zig");
 
 pub const TextAreaConfig = struct {
@@ -117,17 +117,35 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
         font_metrics: ?text_layout.FontMetrics = null,
         z_index: i32 = config.z_index,
         callbacks: TextAreaCallbacks = .{},
+        /// Retained wrap of `buffer` (allocated by `init`; a default-initialised component
+        /// lays out uncached). Updated incrementally on edits, see `text_layout.LineCache`.
+        line_cache: ?*text_layout.LineCache = null,
 
         pub fn init(allocator: std.mem.Allocator, initial: []const u8) !Component {
             var self: Component = .{};
+            errdefer self.buffer.deinit(allocator);
             try self.buffer.appendSlice(allocator, initial);
             self.cursor = self.buffer.items.len;
+            const cache = try allocator.create(text_layout.LineCache);
+            cache.* = text_layout.LineCache.init(allocator);
+            self.line_cache = cache;
             return self;
         }
 
         pub fn deinit(self: *Component, allocator: std.mem.Allocator) void {
             self.buffer.deinit(allocator);
+            if (self.line_cache) |cache| {
+                cache.deinit();
+                allocator.destroy(cache);
+            }
             self.* = undefined;
+        }
+
+        /// Drops the retained wrap. Needed only when the advance callback's results change
+        /// behind an unchanged `FontMetrics` (e.g. `Fonts.setDeviceScale`); `setFontMetrics`
+        /// already invalidates.
+        pub fn invalidateLayout(self: *Component) void {
+            if (self.line_cache) |cache| cache.invalidate();
         }
 
         pub fn text(self: *const Component) []const u8 {
@@ -177,6 +195,7 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
 
         pub fn setFontMetrics(self: *Component, metrics_value: text_layout.FontMetrics) void {
             self.font_metrics = metrics_value;
+            self.invalidateLayout();
             self.setScrollY(self.scroll_y);
         }
 
@@ -217,6 +236,7 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
         }
 
         pub fn contentHeight(self: *const Component) f32 {
+            if (self.lines()) |rows| return @as(f32, @floatFromInt(@max(rows.len, 1))) * self.metrics().line_height;
             return text_layout.contentHeight(self.buffer.items, self.metrics(), self.textRect().w, config.wrap);
         }
 
@@ -229,17 +249,17 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
             try text_layout.appendSelectionRects(allocator, self.layoutOptions(self.buffer.items, config.text_color, self.scroll_y), range, out);
         }
 
-        pub fn update(self: *Component, allocator: std.mem.Allocator, event: *const sdl.Event) !bool {
-            switch (event.type) {
-                .text_input => return try self.handleInput(allocator, .{ .text = std.mem.span(event.text.text) }),
-                .text_editing => return try self.handleInput(allocator, .{ .composition = std.mem.span(event.edit.text) }),
-                .key_down => return try self.handleInput(allocator, .{ .key = Key.fromSdl(event.key) orelse return false }),
-                .mouse_button_down => return try self.handleInput(allocator, .{ .mouse_down = .{ .point = .{ .x = event.button.x, .y = event.button.y }, .clicks = event.button.clicks } }),
-                .mouse_button_up => return try self.handleInput(allocator, .{ .mouse_up = .{ .x = event.button.x, .y = event.button.y } }),
-                .mouse_wheel => return try self.handleInput(allocator, .{ .mouse_wheel = .{ .point = .{ .x = event.wheel.mouse_x, .y = event.wheel.mouse_y }, .y = event.wheel.y } }),
-                .mouse_motion => {
-                    if (!self.focused or (!self.dragging_scrollbar and !event.motion.state.left)) return false;
-                    return try self.handleInput(allocator, .{ .mouse_drag = .{ .x = event.motion.x, .y = event.motion.y } });
+        pub fn update(self: *Component, allocator: std.mem.Allocator, event: *const Event) !bool {
+            switch (event.*) {
+                .text_input => |input_text| return try self.handleInput(allocator, .{ .text = input_text.text }),
+                .text_editing => |edit| return try self.handleInput(allocator, .{ .composition = edit.text }),
+                .key_down => |key| return try self.handleInput(allocator, .{ .key = Key.fromEvent(key) orelse return false }),
+                .mouse_button_down => |button| return try self.handleInput(allocator, .{ .mouse_down = .{ .point = .{ .x = button.x, .y = button.y }, .clicks = button.clicks } }),
+                .mouse_button_up => |button| return try self.handleInput(allocator, .{ .mouse_up = .{ .x = button.x, .y = button.y } }),
+                .mouse_wheel => |wheel| return try self.handleInput(allocator, .{ .mouse_wheel = .{ .point = .{ .x = wheel.mouse_x, .y = wheel.mouse_y }, .y = wheel.y } }),
+                .mouse_motion => |motion| {
+                    if (!self.focused or (!self.dragging_scrollbar and !motion.state.left)) return false;
+                    return try self.handleInput(allocator, .{ .mouse_drag = .{ .x = motion.x, .y = motion.y } });
                 },
                 else => return false,
             }
@@ -624,10 +644,12 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
         }
 
         fn visualCellForOffset(self: *const Component, offset: usize) text_layout.VisualCell {
+            if (self.lines()) |rows| return text_layout.visualCellForOffsetLines(self.buffer.items, rows, offset, self.metrics());
             return text_layout.visualCellForOffset(self.buffer.items, offset, self.metrics(), self.textRect().w, config.wrap);
         }
 
         fn offsetAtVisualCell(self: *const Component, target_row: usize, target_x: f32) usize {
+            if (self.lines()) |rows| return text_layout.offsetAtVisualCellLines(self.buffer.items, rows, target_row, target_x, self.metrics());
             return text_layout.offsetAtVisualCell(self.buffer.items, target_row, target_x, self.metrics(), self.textRect().w, config.wrap);
         }
 
@@ -684,7 +706,14 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
                 .wrap = config.wrap,
                 .scroll = .{ .y = scroll_y },
                 .clip = text_rect,
+                .lines = if (value.ptr == self.buffer.items.ptr and value.len == self.buffer.items.len) self.lines() else null,
             };
+        }
+
+        /// Wrapped rows of `buffer` from the retained cache (null: uncached layout).
+        fn lines(self: *const Component) ?[]const text_layout.Line {
+            const cache = self.line_cache orelse return null;
+            return cache.sync(self.buffer.items, self.metrics(), self.textRect().w, config.wrap);
         }
 
         fn visibleTextHeight(self: *const Component) f32 {
@@ -785,19 +814,7 @@ test "text area ignores hover motion without pressed button" {
     area.focused = true;
     area.cursor = 0;
 
-    var event: sdl.Event = undefined;
-    event.motion = .{
-        .type = .mouse_motion,
-        .reserved = 0,
-        .timestamp = 0,
-        .window_id = .invalid,
-        .which = @enumFromInt(0),
-        .state = .{},
-        .x = 70,
-        .y = 0,
-        .xrel = 0,
-        .yrel = 0,
-    };
+    const event: Event = .{ .mouse_motion = .{ .x = 70, .y = 0 } };
 
     try std.testing.expect(!try area.update(std.testing.allocator, &event));
     try std.testing.expectEqual(@as(usize, 0), area.cursor);

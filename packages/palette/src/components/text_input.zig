@@ -6,7 +6,7 @@ const draw = @import("../draw.zig");
 const clipboard = @import("../input/clipboard.zig");
 const Key = @import("../input/key.zig");
 const selection_input = @import("../input/selection.zig");
-const sdl = @import("../sdl.zig");
+const Event = @import("../event.zig").Event;
 const text_layout = @import("../text_layout.zig");
 
 pub const TextInputConfig = struct {
@@ -186,16 +186,16 @@ pub fn TextInput(comptime config: TextInputConfig) type {
             return self.metrics().fixedAdvance();
         }
 
-        pub fn update(self: *Component, allocator: std.mem.Allocator, event: *const sdl.Event) !bool {
-            switch (event.type) {
-                .text_input => return try self.handleInput(allocator, .{ .text = std.mem.span(event.text.text) }),
-                .text_editing => return try self.handleInput(allocator, .{ .composition = std.mem.span(event.edit.text) }),
-                .key_down => return try self.handleInput(allocator, .{ .key = Key.fromSdl(event.key) orelse return false }),
-                .mouse_button_down => return try self.handleInput(allocator, .{ .mouse_down = .{ .x = event.button.x, .y = event.button.y } }),
-                .mouse_button_up => return try self.handleInput(allocator, .{ .mouse_up = .{ .x = event.button.x, .y = event.button.y } }),
-                .mouse_motion => {
-                    if (!self.dragging_selection or !event.motion.state.left) return false;
-                    return try self.handleInput(allocator, .{ .mouse_drag = .{ .x = event.motion.x, .y = event.motion.y } });
+        pub fn update(self: *Component, allocator: std.mem.Allocator, event: *const Event) !bool {
+            switch (event.*) {
+                .text_input => |input_text| return try self.handleInput(allocator, .{ .text = input_text.text }),
+                .text_editing => |edit| return try self.handleInput(allocator, .{ .composition = edit.text }),
+                .key_down => |key| return try self.handleInput(allocator, .{ .key = Key.fromEvent(key) orelse return false }),
+                .mouse_button_down => |button| return try self.handleInput(allocator, .{ .mouse_down = .{ .x = button.x, .y = button.y } }),
+                .mouse_button_up => |button| return try self.handleInput(allocator, .{ .mouse_up = .{ .x = button.x, .y = button.y } }),
+                .mouse_motion => |motion| {
+                    if (!self.dragging_selection or !motion.state.left) return false;
+                    return try self.handleInput(allocator, .{ .mouse_drag = .{ .x = motion.x, .y = motion.y } });
                 },
                 else => return false,
             }

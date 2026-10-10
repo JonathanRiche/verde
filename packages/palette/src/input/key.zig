@@ -2,7 +2,7 @@
 
 const Self = @This();
 
-const sdl = @import("../sdl.zig");
+const event = @import("../event.zig");
 
 code: Code,
 shift: bool = false,
@@ -30,13 +30,9 @@ pub const Code = enum {
     z,
 };
 
-/// Converts SDL keyboard events into Palette's platform-neutral key model.
-pub fn fromSdl(event: sdl.KeyboardEvent) ?Self {
-    const mod_bits = event.mod;
-    const primary = (mod_bits & (sdl.Keymod.ctrl | sdl.Keymod.gui)) != 0;
-    const shift = (mod_bits & sdl.Keymod.shift) != 0;
-    const alt = (mod_bits & sdl.Keymod.alt) != 0;
-    const code: Code = switch (event.key) {
+/// Converts a platform key event into Palette's component key model.
+pub fn fromEvent(ev: event.KeyEvent) ?Self {
+    const code: Code = switch (ev.key) {
         .left => .left,
         .right => .right,
         .up => .up,
@@ -57,5 +53,5 @@ pub fn fromSdl(event: sdl.KeyboardEvent) ?Self {
         .z => .z,
         else => return null,
     };
-    return .{ .code = code, .shift = shift, .primary = primary, .alt = alt };
+    return .{ .code = code, .shift = ev.mod.shift, .primary = ev.mod.primary(), .alt = ev.mod.alt };
 }

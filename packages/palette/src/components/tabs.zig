@@ -4,7 +4,7 @@ const std = @import("std");
 
 const draw = @import("../draw.zig");
 const key_input = @import("../input/key.zig");
-const sdl = @import("../sdl.zig");
+const Event = @import("../event.zig").Event;
 
 pub const TabsConfig = struct {
     x: f32 = 0.0,
@@ -70,11 +70,11 @@ pub fn Tabs(comptime config: TabsConfig) type {
             self.callbacks = callbacks;
         }
 
-        pub fn update(self: *Component, event: *const sdl.Event) !bool {
-            switch (event.type) {
-                .key_down => return self.handleInput(.{ .key = Key.fromSdl(event.key) orelse return false }),
-                .mouse_motion => return self.handleInput(.{ .mouse_move = .{ .x = event.motion.x, .y = event.motion.y } }),
-                .mouse_button_down => return self.handleInput(.{ .mouse_down = .{ .x = event.button.x, .y = event.button.y } }),
+        pub fn update(self: *Component, event: *const Event) !bool {
+            switch (event.*) {
+                .key_down => |key| return self.handleInput(.{ .key = Key.fromEvent(key) orelse return false }),
+                .mouse_motion => |motion| return self.handleInput(.{ .mouse_move = .{ .x = motion.x, .y = motion.y } }),
+                .mouse_button_down => |button| return self.handleInput(.{ .mouse_down = .{ .x = button.x, .y = button.y } }),
                 else => return false,
             }
         }

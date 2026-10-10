@@ -1,0 +1,69 @@
+// Hand-written keymap exercising two groups, explicit per-group types, level 3,
+// Unicode/hex keysym forms, repeat overrides and interpret-derived virtual modifiers.
+xkb_keymap {
+xkb_keycodes "test" {
+    minimum = 8;
+    maximum = 255;
+    <AE01> = 10;
+    <AD01> = 24;
+    <AC03> = 40;
+    <AC04> = 41;
+    <AC05> = 42;
+    <LFSH> = 50;
+    <CAPS> = 66;
+    <RALT> = 108;
+    alias <ALGR> = <RALT>;
+    indicator 1 = "Caps Lock";
+};
+xkb_types "test" {
+    virtual_modifiers LevelThree;
+    type "ONE_LEVEL" { modifiers= none; level_name[Level1]= "Any"; };
+    type "TWO_LEVEL" { modifiers= Shift; map[Shift]= Level2; level_name[1]= "Base"; level_name[2]= "Shift"; };
+    type "ALPHABETIC" {
+        modifiers= Shift+Lock;
+        map[Shift]= 2;
+        map[Lock]= 2;
+        level_name[1]= "Base";
+        level_name[2]= "Caps";
+    };
+    type "FOUR_LEVEL" {
+        modifiers= Shift+LevelThree;
+        map[Shift]= 2;
+        map[LevelThree]= 3;
+        map[Shift+LevelThree]= 4;
+        level_name[1]= "Base"; level_name[2]= "Shift"; level_name[3]= "AltGr"; level_name[4]= "Shift AltGr";
+    };
+};
+xkb_compatibility "test" {
+    virtual_modifiers LevelThree;
+    interpret.useModMapMods= AnyLevel;
+    interpret.repeat= False;
+    interpret ISO_Level3_Shift+AnyOf(all) {
+        virtualModifier= LevelThree;
+        useModMapMods=level1;
+        action= SetMods(modifiers=LevelThree,clearLocks);
+    };
+    interpret Caps_Lock+AnyOfOrNone(all) { action= LockMods(modifiers=Lock); };
+    interpret Any+AnyOf(all) { action= SetMods(modifiers=modMapMods,clearLocks); };
+    indicator "Caps Lock" { whichModState= locked; modifiers= Lock; };
+};
+xkb_symbols "us+ru" {
+    name[Group1]="English (US)";
+    name[Group2]="Russian";
+    key <AE01> { [ 1, exclam ] };
+    key <AD01> { [ q, Q ], [ Cyrillic_shorti, Cyrillic_SHORTI ] };
+    key <AC03> {
+        type[Group1]= "FOUR_LEVEL",
+        symbols[Group1]= [ d, D, EuroSign, cent ],
+        symbols[Group2]= [ Cyrillic_ve, Cyrillic_VE ]
+    };
+    key <AC04> { symbols[1]= [ f, F ], symbols[2]= [ U0444, U0424 ] };
+    key <AC05> { repeat= No, [ 0xfe50 ] };
+    key <LFSH> { [ Shift_L ] };
+    key <CAPS> { [ Caps_Lock ] };
+    key <RALT> { type= "ONE_LEVEL", symbols[1]= [ ISO_Level3_Shift ], actions[1]= [ SetMods(modifiers=LevelThree) ] };
+    modifier_map Shift { <LFSH> };
+    modifier_map Lock { Caps_Lock };
+    modifier_map Mod5 { <ALGR> };
+};
+};

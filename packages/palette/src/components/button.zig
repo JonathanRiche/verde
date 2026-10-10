@@ -4,7 +4,7 @@ const std = @import("std");
 
 const draw = @import("../draw.zig");
 const key_input = @import("../input/key.zig");
-const sdl = @import("../sdl.zig");
+const Event = @import("../event.zig").Event;
 const text_layout = @import("../text_layout.zig");
 
 pub const ButtonContentAlign = enum {
@@ -163,8 +163,8 @@ pub fn Button(comptime config: ButtonConfig) type {
             };
         }
 
-        pub fn update(self: *Component, event: *const sdl.Event) !bool {
-            return self.handleInput(inputFromSdl(event) orelse return false);
+        pub fn update(self: *Component, event: *const Event) !bool {
+            return self.handleInput(inputFromEvent(event) orelse return false);
         }
 
         pub fn handleInput(self: *Component, input: Input) bool {
@@ -391,8 +391,8 @@ pub fn IconButton(comptime config: IconButtonConfig) type {
             };
         }
 
-        pub fn update(self: *Component, event: *const sdl.Event) !bool {
-            return self.handleInput(inputFromSdl(event) orelse return false);
+        pub fn update(self: *Component, event: *const Event) !bool {
+            return self.handleInput(inputFromEvent(event) orelse return false);
         }
 
         pub fn handleInput(self: *Component, input: Input) bool {
@@ -524,23 +524,23 @@ pub fn IconButton(comptime config: IconButtonConfig) type {
     };
 }
 
-fn inputFromSdl(event: *const sdl.Event) ?Input {
-    switch (event.type) {
-        .mouse_motion => return .{ .mouse_move = .{ .x = event.motion.x, .y = event.motion.y } },
-        .mouse_button_down => {
-            if (event.button.button != 1) return null;
-            return .{ .mouse_down = .{ .x = event.button.x, .y = event.button.y } };
+fn inputFromEvent(event: *const Event) ?Input {
+    switch (event.*) {
+        .mouse_motion => |motion| return .{ .mouse_move = .{ .x = motion.x, .y = motion.y } },
+        .mouse_button_down => |button| {
+            if (button.button != 1) return null;
+            return .{ .mouse_down = .{ .x = button.x, .y = button.y } };
         },
-        .mouse_button_up => {
-            if (event.button.button != 1) return null;
-            return .{ .mouse_up = .{ .x = event.button.x, .y = event.button.y } };
+        .mouse_button_up => |button| {
+            if (button.button != 1) return null;
+            return .{ .mouse_up = .{ .x = button.x, .y = button.y } };
         },
-        .key_down => {
-            if (event.key.repeat) return null;
-            return switch (event.key.key) {
+        .key_down => |key| {
+            if (key.repeat) return null;
+            return switch (key.key) {
                 .@"return", .kp_enter => .{ .activation_key = .enter },
                 .space => .{ .activation_key = .space },
-                else => if (Key.fromSdl(event.key)) |key| .{ .key = key } else null,
+                else => if (Key.fromEvent(key)) |k| .{ .key = k } else null,
             };
         },
         else => return null,
