@@ -2631,18 +2631,33 @@ int verde_browser_linux_reload(struct verde_browser_linux *browser) {
     return 1;
 }
 
+/* libwpe's focused activity state sets both IsFocused and WindowIsActive; WPE Platform
+ * splits them into view focus and the toplevel ACTIVE state. WebKit only shows the caret
+ * and focus ring in an active window, so toggle both together. */
+static void verde_browser_linux_platform_set_active(struct verde_browser_linux *browser, gboolean active) {
+    WPEToplevel *toplevel = wpe_view_get_toplevel(browser->wpe_view);
+    if (toplevel == NULL) return;
+    const WPEToplevelState state = wpe_toplevel_get_state(toplevel);
+    const WPEToplevelState next = active ? (WPEToplevelState)(state | WPE_TOPLEVEL_STATE_ACTIVE) : (WPEToplevelState)(state & ~WPE_TOPLEVEL_STATE_ACTIVE);
+    if (next != state) wpe_toplevel_state_changed(toplevel, next);
+}
+
 int verde_browser_linux_focus(struct verde_browser_linux *browser) {
     if (browser == NULL) return 0;
     verde_browser_linux_mark_active(browser);
-    if (browser->wpe_view != NULL) wpe_view_focus_in(browser->wpe_view);
-    else if (browser->view_backend != NULL) wpe_view_backend_add_activity_state(browser->view_backend, wpe_view_activity_state_focused);
+    if (browser->wpe_view != NULL) {
+        verde_browser_linux_platform_set_active(browser, TRUE);
+        wpe_view_focus_in(browser->wpe_view);
+    } else if (browser->view_backend != NULL) wpe_view_backend_add_activity_state(browser->view_backend, wpe_view_activity_state_focused);
     return 1;
 }
 
 int verde_browser_linux_blur(struct verde_browser_linux *browser) {
     if (browser == NULL) return 0;
-    if (browser->wpe_view != NULL) wpe_view_focus_out(browser->wpe_view);
-    else if (browser->view_backend != NULL) wpe_view_backend_remove_activity_state(browser->view_backend, wpe_view_activity_state_focused);
+    if (browser->wpe_view != NULL) {
+        wpe_view_focus_out(browser->wpe_view);
+        verde_browser_linux_platform_set_active(browser, FALSE);
+    } else if (browser->view_backend != NULL) wpe_view_backend_remove_activity_state(browser->view_backend, wpe_view_activity_state_focused);
     return 1;
 }
 
@@ -2831,7 +2846,10 @@ static void verde_browser_linux_platform_mouse_wheel(struct verde_browser_linux 
      * scroll deltas by 2.5 (VERDE_BROWSER_LINUX_PRECISE_SCROLL_MULTIPLIER, as in WebKitGTK);
      * divide it out so both backends scroll the same distance. */
     const enum wpe_input_axis_event_type source_type = verde_browser_linux_wheel_event_type(delta_x, delta_y);
-    const double delta_scale = verde_browser_linux_wheel_delta_scale(source_type, wheel_multiplier) / VERDE_BROWSER_LINUX_PRECISE_SCROLL_MULTIPLIER;
+    /* WPE Platform deltas are logical px; divide by the device scale to match the fdo
+     * path, where WebKit converts device px deltas to CSS px. */
+    const double device_scale = browser->device_scale > 0.0 ? browser->device_scale : 1.0;
+    const double delta_scale = verde_browser_linux_wheel_delta_scale(source_type, wheel_multiplier) / VERDE_BROWSER_LINUX_PRECISE_SCROLL_MULTIPLIER / device_scale;
     verde_browser_linux_platform_dispatch(browser, wpe_event_scroll_new(browser->wpe_view, WPE_INPUT_SOURCE_MOUSE, verde_browser_linux_now_ms(),
         verde_browser_linux_platform_modifiers(browser, modifiers), delta_x * delta_scale, delta_y * delta_scale, TRUE, FALSE, x, y));
 }
@@ -2849,17 +2867,24 @@ static void verde_browser_linux_platform_key(struct verde_browser_linux *browser
         browser->wpe_view, WPE_INPUT_SOURCE_KEYBOARD, verde_browser_linux_now_ms(), verde_browser_linux_platform_modifiers(browser, modifiers), keycode, keyval));
 }
 
-/* Input arrives in logical px. libwpe (fdo) pointer events are in device px (WebKit divides
- * them by the device scale factor); WPE Platform events are logical. */
+/* Pointer input arrives in device px: the GUI sends physical pane coordinates for scaled
+ * WPE textures (see browserPointerCoordinate) and automation multiplies logical coordinates
+ * by the device scale. libwpe (fdo) pointer events take device px as-is (WebKit divides by
+ * the device scale factor); WPE Platform events are logical, so divide here. */
 static int verde_browser_linux_fdo_coord(const struct verde_browser_linux *browser, double v) {
-    return (int)(v * browser->device_scale + 0.5);
+    (void)browser;
+    return (int)v;
+}
+
+static double verde_browser_linux_platform_coord(const struct verde_browser_linux *browser, double v) {
+    return browser->device_scale > 0.0 ? v / browser->device_scale : v;
 }
 
 int verde_browser_linux_mouse_move(struct verde_browser_linux *browser, double x, double y, unsigned int modifiers) {
     if (browser == NULL) return 0;
     verde_browser_linux_mark_active(browser);
     if (browser->wpe_view != NULL) {
-        verde_browser_linux_platform_mouse_move(browser, x, y, modifiers);
+        verde_browser_linux_platform_mouse_move(browser, verde_browser_linux_platform_coord(browser, x), verde_browser_linux_platform_coord(browser, y), modifiers);
         return 1;
     }
     if (browser->view_backend == NULL) return 0;
@@ -2880,7 +2905,7 @@ int verde_browser_linux_mouse_button(struct verde_browser_linux *browser, double
     if (browser == NULL || button == 0) return 0;
     verde_browser_linux_mark_active(browser);
     if (browser->wpe_view != NULL) {
-        verde_browser_linux_platform_mouse_button(browser, x, y, button, down, modifiers);
+        verde_browser_linux_platform_mouse_button(browser, verde_browser_linux_platform_coord(browser, x), verde_browser_linux_platform_coord(browser, y), button, down, modifiers);
         return 1;
     }
     if (browser->view_backend == NULL) return 0;
@@ -2905,7 +2930,7 @@ int verde_browser_linux_mouse_wheel(struct verde_browser_linux *browser, double 
     if (browser == NULL) return 0;
     verde_browser_linux_mark_active(browser);
     if (browser->wpe_view != NULL) {
-        verde_browser_linux_platform_mouse_wheel(browser, x, y, delta_x, delta_y, wheel_multiplier, modifiers);
+        verde_browser_linux_platform_mouse_wheel(browser, verde_browser_linux_platform_coord(browser, x), verde_browser_linux_platform_coord(browser, y), delta_x, delta_y, wheel_multiplier, modifiers);
         return 1;
     }
     if (browser->view_backend == NULL) return 0;
@@ -2923,9 +2948,10 @@ int verde_browser_linux_mouse_wheel(struct verde_browser_linux *browser, double 
             .value = 0,
             .modifiers = verde_browser_linux_encode_modifiers(modifiers) | browser->pointer_modifiers,
         },
-        /* Device px too: a notch scrolls the same CSS distance at every scale. */
-        .x_axis = delta_x * delta_scale * browser->device_scale,
-        .y_axis = delta_y * delta_scale * browser->device_scale,
+        /* As before the port: WebKit divides these by the device scale, so a notch
+         * scrolls (40 px x multiplier) / scale CSS px. */
+        .x_axis = delta_x * delta_scale,
+        .y_axis = delta_y * delta_scale,
     };
     wpe_view_backend_dispatch_axis_event(browser->view_backend, &event.base);
     return 1;
