@@ -100,6 +100,12 @@ pub const Renderer = struct {
         return self.wr.handleEvent(event);
     }
 
+    /// False while the present loop would refuse a frame (awaiting the frame
+    /// callback, or no free buffer); callers skip building the batch.
+    pub fn ready(self: *Renderer) bool {
+        return self.wr.ready();
+    }
+
     /// Caps the event-wait timeout so a throttled frame is retried when the
     /// present loop can take it.
     pub fn boundWaitNs(self: *const Renderer, timeout_ns: u64, frame_pending: bool) u64 {

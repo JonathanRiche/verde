@@ -532,7 +532,10 @@ fn mainInner(init: std.process.Init) !void {
         if (runtime_needs_render or immediate_send_render or background_tasks_need_render or browser_needs_render or terminal_needs_render or event_needs_render or framebuffer_size_changed or continuous_frame_due or wake_frame_due or state.workspaceSwitchFramePending()) {
             presentation_demand.request();
         }
-        if (!presentation_demand.pending) {
+        // The present loop throttles until the compositor's frame callback (or
+        // its timeout on hidden surfaces); building a frame it would refuse
+        // only burns CPU, so keep the demand pending and wait for `.frame`.
+        if (!presentation_demand.pending or !palette_renderer.ready()) {
             recordSpan(&frame_sample, .sync_cursor, syncMouseCursor, .{ &state, &cursor_state });
             recordFrameWithStallDiagnostic(frame_sample);
             maybeLogFrameProfile(frame_profile_logging, &last_frame_profile_log_ms, &palette_renderer);
@@ -1249,7 +1252,7 @@ fn processEvents(
     var event: palette.Event = undefined;
 
     if (!app.pollEvent(&event)) {
-        const wait_timeout_ms = eventWaitTimeoutMs(state, render_pacer, presentation_demand);
+        const wait_timeout_ms = eventWaitTimeoutMs(state, renderer, render_pacer, presentation_demand);
         wait_trace.requested_timeout_ms = wait_timeout_ms;
         const wait_timeout_ns = renderer.boundWaitNs(
             @as(u64, @intCast(@max(wait_timeout_ms, 0))) * std.time.ns_per_ms,
@@ -1534,10 +1537,16 @@ fn continuousFrameIntervalForActivity(activity: PacingActivity) i64 {
 
 fn eventWaitTimeoutMs(
     state: *AppState,
+    renderer: *palette_frame_renderer.Renderer,
     render_pacer: *const loop_pacing.FramePacer,
     presentation_demand: *const loop_pacing.PresentationDemand,
 ) c_int {
     const base_timeout_ms = eventWaitBaseTimeoutMs(state);
+    // While the present loop is throttled (awaiting the frame callback, or a
+    // free buffer) a due frame cannot be shown yet, and the pacer only counts
+    // presented frames, so its deadlines would read "now" until then. Wait for
+    // the `.frame` event, bounded by the throttle deadline (`boundWaitNs`).
+    if (!renderer.ready()) return base_timeout_ms;
     const paced_timeout_ms = render_pacer.nextWaitTimeoutMs(monotonicMs(), base_timeout_ms, ACTIVE_WAIT_TIMEOUT_MS);
     return presentation_demand.nextWaitTimeoutMs(paced_timeout_ms, ACTIVE_WAIT_TIMEOUT_MS);
 }
