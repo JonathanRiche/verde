@@ -5076,7 +5076,7 @@ test "disabled Companion removes only presentation routing and re-enables exact 
     try std.testing.expect(!ownsEscapeKey(&state));
     try std.testing.expect(!ownsPointerRelease(&state, 1));
     try std.testing.expect(!state.routeCompanionComposerTextInput("blocked"));
-    const key_event: @import("zsdl3").KeyboardEvent = std.mem.zeroes(@import("zsdl3").KeyboardEvent);
+    const key_event: @import("palette").event.KeyEvent = std.mem.zeroes(@import("palette").event.KeyEvent);
     try std.testing.expect(!state.routeCompanionComposerKeyDown(&key_event));
     try std.testing.expect(!state.routeCompanionComposerMouseButton(20.0, 20.0, true, 1));
     try std.testing.expect(!state.routeCompanionComposerMouseMotion(20.0, 20.0, true));

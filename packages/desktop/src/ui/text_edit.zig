@@ -11,7 +11,9 @@
 //! owning view; `offsetAtX` / `lineSpans` help with that.
 
 const std = @import("std");
-const sdl = @import("zsdl3");
+const palette = @import("palette");
+const Mods = palette.event.Mods;
+const host = @import("host.zig");
 
 pub const Range = struct { start: usize, end: usize };
 
@@ -147,14 +149,9 @@ pub const Field = struct {
     }
 
     /// Editing keys. Clipboard keys need the app: see `handleKeyWithClipboard`.
-    pub fn handleKey(self: *Field, allocator: std.mem.Allocator, key: sdl.Keycode, mod: sdl.Keymod) !KeyResult {
-        return self.handleKeyBits(allocator, key, modBits(mod));
-    }
-
-    /// `handleKey` with the modifier bits (`sdl.Keymod.*` masks).
-    pub fn handleKeyBits(self: *Field, allocator: std.mem.Allocator, key: sdl.Keycode, mod: u16) !KeyResult {
-        const primary = (mod & (sdl.Keymod.ctrl | sdl.Keymod.gui)) != 0;
-        const shift = (mod & sdl.Keymod.shift) != 0;
+    pub fn handleKey(self: *Field, allocator: std.mem.Allocator, key: palette.event.Keycode, mod: Mods) !KeyResult {
+        const primary = mod.primary();
+        const shift = mod.shift;
         const text = self.text.items;
         switch (key) {
             .left => {
@@ -219,8 +216,8 @@ pub const Field = struct {
     /// `handleKey` plus Ctrl/Cmd+C/X/V through the app clipboard. `state`
     /// provides `readClipboardTextForPaste() ?[]u8` (freed with
     /// `state.allocator`).
-    pub fn handleKeyWithClipboard(self: *Field, state: anytype, key: sdl.Keycode, mod: sdl.Keymod) !KeyResult {
-        if (isPrimary(mod)) switch (key) {
+    pub fn handleKeyWithClipboard(self: *Field, state: anytype, key: palette.event.Keycode, mod: Mods) !KeyResult {
+        if (mod.primary()) switch (key) {
             .c, .x => {
                 const selected = self.selectedText();
                 if (selected.len == 0) return .moved;
@@ -243,23 +240,8 @@ pub const Field = struct {
 };
 
 pub fn copyText(allocator: std.mem.Allocator, text: []const u8) void {
-    const terminated = allocator.dupeZ(u8, text) catch return;
-    defer allocator.free(terminated);
-    sdl.setClipboardText(terminated) catch {};
-}
-
-/// Modifier bits of an SDL event (`sdl.Keymod` is a field-less enum whose
-/// masks are declarations, so the raw value is read through a pointer).
-pub fn modBits(mod: sdl.Keymod) u16 {
-    return @as(*const u16, @ptrCast(&mod)).*;
-}
-
-pub fn isPrimary(mod: sdl.Keymod) bool {
-    return (modBits(mod) & (sdl.Keymod.ctrl | sdl.Keymod.gui)) != 0;
-}
-
-pub fn isShift(mod: sdl.Keymod) bool {
-    return (modBits(mod) & sdl.Keymod.shift) != 0;
+    _ = allocator;
+    host.setClipboardText(text) catch {};
 }
 
 /// Byte offset in `text` closest to `x`, given a prefix-width measure
@@ -360,9 +342,9 @@ fn utf8ValidPrefix(bytes: []const u8) []const u8 {
 }
 
 const testing = std.testing;
-const no_mod: u16 = 0;
-const shift_mod: u16 = sdl.Keymod.lshift;
-const ctrl_mod: u16 = sdl.Keymod.lctrl;
+const no_mod: Mods = .{};
+const shift_mod: Mods = .{ .shift = true };
+const ctrl_mod: Mods = .{ .ctrl = true };
 
 test "single-line insert strips control characters and replaces the selection" {
     var field: Field = .{};
@@ -380,15 +362,15 @@ test "caret moves by codepoint and word, and shift extends" {
     var field: Field = .{};
     defer field.deinit(testing.allocator);
     _ = try field.insert(testing.allocator, "héllo wörld");
-    _ = try field.handleKeyBits(testing.allocator, .left, no_mod);
+    _ = try field.handleKey(testing.allocator, .left, no_mod);
     try testing.expectEqual(field.value().len - 1, field.cursor);
-    _ = try field.handleKeyBits(testing.allocator, .left, ctrl_mod);
+    _ = try field.handleKey(testing.allocator, .left, ctrl_mod);
     try testing.expectEqual(@as(usize, 7), field.cursor);
-    _ = try field.handleKeyBits(testing.allocator, .home, shift_mod);
+    _ = try field.handleKey(testing.allocator, .home, shift_mod);
     try testing.expectEqualStrings("héllo ", field.selectedText());
-    _ = try field.handleKeyBits(testing.allocator, .backspace, no_mod);
+    _ = try field.handleKey(testing.allocator, .backspace, no_mod);
     try testing.expectEqualStrings("wörld", field.value());
-    _ = try field.handleKeyBits(testing.allocator, .delete, ctrl_mod);
+    _ = try field.handleKey(testing.allocator, .delete, ctrl_mod);
     try testing.expectEqualStrings("", field.value());
 }
 
@@ -397,13 +379,13 @@ test "multi-line fields keep newlines and Shift+Enter inserts one" {
     defer field.deinit(testing.allocator);
     _ = try field.insert(testing.allocator, "one\r\ntwo");
     try testing.expectEqualStrings("one\ntwo", field.value());
-    try testing.expectEqual(KeyResult.changed, try field.handleKeyBits(testing.allocator, .@"return", shift_mod));
-    try testing.expectEqual(KeyResult.submit, try field.handleKeyBits(testing.allocator, .@"return", no_mod));
+    try testing.expectEqual(KeyResult.changed, try field.handleKey(testing.allocator, .@"return", shift_mod));
+    try testing.expectEqual(KeyResult.submit, try field.handleKey(testing.allocator, .@"return", no_mod));
     // Caret at column 0 of the empty third line; Up keeps column 0.
-    _ = try field.handleKeyBits(testing.allocator, .up, no_mod);
+    _ = try field.handleKey(testing.allocator, .up, no_mod);
     try testing.expectEqual(@as(usize, 4), field.cursor);
     field.moveTo(7, false);
-    _ = try field.handleKeyBits(testing.allocator, .up, no_mod);
+    _ = try field.handleKey(testing.allocator, .up, no_mod);
     try testing.expectEqual(@as(usize, 3), field.cursor);
     field.selectLineAt(1);
     try testing.expectEqualStrings("one", field.selectedText());

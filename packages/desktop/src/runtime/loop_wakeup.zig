@@ -1,18 +1,29 @@
-//! Cross-thread wake-up for the SDL event loop.
+//! Cross-thread wake-up for the desktop event loop.
 //!
 //! Background threads (provider send workers, stream callbacks) mutate state
-//! the render loop displays, but the loop sleeps in SDL_WaitEventTimeout and
-//! would otherwise only notice those changes on the next timeout tick. Pushing
-//! a registered SDL user event wakes the loop promptly. An atomic sequence and
-//! pending flag keep that wake coalesced until the main loop covers it with a
-//! frame, so high-rate streams cannot flood the queue or outrun display pacing.
+//! the render loop displays, but the loop sleeps in `App.waitEvent` and would
+//! otherwise only notice those changes on the next timeout tick. Posting the
+//! loop's wake value through the platform's thread-safe wakeup wakes the loop
+//! promptly. An atomic sequence and pending flag keep that wake coalesced until
+//! the main loop covers it with a frame, so high-rate streams cannot flood the
+//! queue or outrun display pacing.
+//!
+//! This module stays free of the UI platform so non-GUI roots can import it:
+//! the GUI registers the platform's wakeup function with `init`.
 
 const std = @import("std");
-const sdl = @import("zsdl3");
 
-extern fn SDL_RegisterEvents(numevents: c_int) u32;
+/// `Event.user` payload that identifies the loop wake.
+pub const wake_value: u64 = 0x7665_7264_6577_616b; // "verdewak"
 
-var wake_event_type: u32 = 0;
+pub const PostFn = *const fn (ctx: *anyopaque, value: u64) void;
+
+const Poster = struct {
+    ctx: *anyopaque,
+    post: PostFn,
+};
+
+var poster: ?Poster = null;
 var wake_pending: std.atomic.Value(bool) = .init(false);
 var wake_sequence: std.atomic.Value(u64) = .init(0);
 
@@ -22,11 +33,17 @@ pub const NotifyResult = enum {
     unavailable,
 };
 
-/// Registers the custom SDL event. Call once on the main thread after
-/// sdl.init and before any background thread can call notify().
-pub fn init() void {
-    std.debug.assert(wake_event_type == 0);
-    wake_event_type = SDL_RegisterEvents(1);
+/// Registers the thread-safe poster (the GUI passes `App.wakeup`). Call once
+/// on the main thread before any background thread can call notify().
+pub fn init(ctx: *anyopaque, post: PostFn) void {
+    std.debug.assert(poster == null);
+    poster = .{ .ctx = ctx, .post = post };
+}
+
+/// Unregisters the poster before the platform app is torn down.
+pub fn deinit() void {
+    poster = null;
+    wake_pending.store(false, .release);
 }
 
 /// Thread-safe. Queues a wake event for the main loop unless one is already
@@ -38,83 +55,99 @@ pub fn notify() void {
 
 /// Thread-safe variant that exposes whether an existing wake covered this update.
 pub fn notifyResult() NotifyResult {
-    if (wake_event_type == 0) return .unavailable;
+    if (poster == null) return .unavailable;
     _ = wake_sequence.fetchAdd(1, .acq_rel);
     return queueWakeEvent();
 }
 
 fn queueWakeEvent() NotifyResult {
+    const active = poster orelse return .unavailable;
     if (wake_pending.swap(true, .acq_rel)) return .coalesced;
-    var event: sdl.Event = std.mem.zeroes(sdl.Event);
-    event.common.type = @enumFromInt(wake_event_type);
-    if (!sdl.pushEvent(&event)) {
-        // Queue full or filtered: clear the flag so a later notify retries.
-        wake_pending.store(false, .release);
-        return .unavailable;
-    }
+    active.post(active.ctx, wake_value);
     return .queued;
 }
 
-/// Returns whether `event` is the registered wake event without consuming it.
-pub fn isWakeEvent(event: *const sdl.Event) bool {
-    return wake_event_type != 0 and @intFromEnum(event.type) == wake_event_type;
+/// Returns whether a `.user` payload is the loop wake without consuming it.
+pub fn isWakeValue(value: u64) bool {
+    return value == wake_value;
 }
 
-/// Returns the latest update sequence when `event` is our wake event. The
+/// Returns the latest update sequence when `value` is our wake. The
 /// coalescing flag stays armed until finish() so updates arriving while the
-/// main loop polls and renders cannot flood the SDL queue.
-pub fn consume(event: *const sdl.Event) ?u64 {
-    if (!isWakeEvent(event)) return null;
+/// main loop polls and renders cannot flood the event queue.
+pub fn consume(value: u64) ?u64 {
+    if (!isWakeValue(value)) return null;
     return wake_sequence.load(.acquire);
 }
 
 /// Releases a consumed wake after the main loop has covered its state. If an
-/// update arrived after consume(), one follow-up event is queued immediately.
+/// update arrived after consume(), one follow-up wake is queued immediately.
 pub fn finish(observed_sequence: u64) void {
     wake_pending.store(false, .release);
     if (wake_sequence.load(.acquire) != observed_sequence) _ = queueWakeEvent();
 }
 
+const TestPoster = struct {
+    posts: usize = 0,
+    last: u64 = 0,
+
+    fn post(ctx: *anyopaque, value: u64) void {
+        const self: *TestPoster = @ptrCast(@alignCast(ctx));
+        self.posts += 1;
+        self.last = value;
+    }
+};
+
 test "wake notifications report unavailable and coalesced states without queueing duplicates" {
-    const previous_type = wake_event_type;
+    const previous_poster = poster;
     const previous_pending = wake_pending.load(.acquire);
     const previous_sequence = wake_sequence.load(.acquire);
     defer {
-        wake_event_type = previous_type;
+        poster = previous_poster;
         wake_pending.store(previous_pending, .release);
         wake_sequence.store(previous_sequence, .release);
     }
 
-    wake_event_type = 0;
+    poster = null;
     wake_pending.store(false, .release);
     wake_sequence.store(0, .release);
     try std.testing.expectEqual(NotifyResult.unavailable, notifyResult());
 
-    wake_event_type = 1;
-    wake_pending.store(true, .release);
+    var sink: TestPoster = .{};
+    poster = .{ .ctx = &sink, .post = TestPoster.post };
+    try std.testing.expectEqual(NotifyResult.queued, notifyResult());
+    try std.testing.expectEqual(@as(usize, 1), sink.posts);
+    try std.testing.expectEqual(wake_value, sink.last);
     try std.testing.expectEqual(NotifyResult.coalesced, notifyResult());
+    try std.testing.expectEqual(@as(usize, 1), sink.posts);
     try std.testing.expect(wake_pending.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 1), wake_sequence.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 2), wake_sequence.load(.acquire));
 }
 
 test "consumed wake stays coalesced until the covered frame finishes" {
-    const previous_type = wake_event_type;
+    const previous_poster = poster;
     const previous_pending = wake_pending.load(.acquire);
     const previous_sequence = wake_sequence.load(.acquire);
     defer {
-        wake_event_type = previous_type;
+        poster = previous_poster;
         wake_pending.store(previous_pending, .release);
         wake_sequence.store(previous_sequence, .release);
     }
 
-    wake_event_type = 1;
+    var sink: TestPoster = .{};
+    poster = .{ .ctx = &sink, .post = TestPoster.post };
     wake_pending.store(true, .release);
     wake_sequence.store(7, .release);
-    var event: sdl.Event = std.mem.zeroes(sdl.Event);
-    event.common.type = @enumFromInt(wake_event_type);
 
-    try std.testing.expectEqual(@as(?u64, 7), consume(&event));
+    try std.testing.expectEqual(@as(?u64, null), consume(1));
+    try std.testing.expectEqual(@as(?u64, 7), consume(wake_value));
     try std.testing.expect(wake_pending.load(.acquire));
     finish(7);
     try std.testing.expect(!wake_pending.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), sink.posts);
+
+    wake_pending.store(true, .release);
+    _ = wake_sequence.fetchAdd(1, .acq_rel);
+    finish(7);
+    try std.testing.expectEqual(@as(usize, 1), sink.posts);
 }

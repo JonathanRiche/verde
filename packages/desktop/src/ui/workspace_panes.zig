@@ -7,7 +7,7 @@
 const std = @import("std");
 
 const palette = @import("palette");
-const sdl = @import("zsdl3");
+const host = @import("host.zig");
 
 const app_config = @import("../app/config.zig");
 const keybinds = @import("../app/keybinds.zig");
@@ -360,13 +360,13 @@ pub fn isPaneStatusAnimating() bool {
 }
 
 /// Handles navigation only while the selected workspace has no open panes.
-pub fn handleEmptyWorkspaceKeyDown(state: *runtime.AppState, event: *const sdl.KeyboardEvent) bool {
+pub fn handleEmptyWorkspaceKeyDown(state: *runtime.AppState, event: *const palette.event.KeyEvent) bool {
     if (!emptyWorkspaceAcceptsKeyboard(state)) {
         empty_workspace_selected_action = 0;
         return false;
     }
-    const modifiers = keymodBits(event.mod);
-    if ((modifiers & (sdl.Keymod.ctrl | sdl.Keymod.gui | sdl.Keymod.alt | sdl.Keymod.shift)) != 0) return false;
+    const modifiers = event.mod;
+    if (modifiers.ctrl or modifiers.super or modifiers.alt or modifiers.shift) return false;
     switch (event.key) {
         .up, .left => {
             empty_workspace_selected_action = emptyWorkspaceSelectionAfterMove(empty_workspace_selected_action, -1);
@@ -1606,7 +1606,7 @@ fn toggleSplitMenu(state: *runtime.AppState, hit: WorkspacePaneHit) void {
 }
 
 /// Returns the system cursor for interactive workspace pane chrome.
-pub fn systemCursorAt(x: f32, y: f32) ?sdl.SystemCursor {
+pub fn systemCursorAt(x: f32, y: f32) ?palette.platform.CursorShape {
     if (resize_drag) |hit| return resizeSystemCursor(hit.axis);
     if (file_viewer.systemCursorAt(x, y)) |cursor| return cursor;
     var i: usize = hit_cache.count;
@@ -1633,7 +1633,7 @@ fn paneIdAt(x: f32, y: f32) ?runtime.WorkspacePaneId {
     return null;
 }
 
-fn resizeSystemCursor(axis: runtime.WorkspaceSplitAxis) sdl.SystemCursor {
+fn resizeSystemCursor(axis: runtime.WorkspaceSplitAxis) palette.platform.CursorShape {
     return if (axis == .vertical) .ew_resize else .ns_resize;
 }
 
@@ -1789,7 +1789,6 @@ fn beginPaneDrag(state: *runtime.AppState, x: f32, y: f32, split_placement: bool
         split_menu_open_for = null;
         resize_drag = null;
         _ = state.focusCurrentProjectWorkspacePane(entry.pane_id);
-        _ = sdl.captureMouse(true);
         return true;
     }
     return false;
@@ -1813,7 +1812,6 @@ fn updatePaneDrag(x: f32, y: f32) void {
 fn finishPaneDrag(state: *runtime.AppState, x: f32, y: f32) bool {
     const drag = pane_drag;
     pane_drag = .{};
-    _ = sdl.captureMouse(false);
     defer last_pane_drop_target = null;
     if (!drag.active) return true;
     const target = paneDragTargetAt(drag.pane_id, x, y, drag.split_placement) orelse last_pane_drop_target orelse return true;
@@ -1828,7 +1826,6 @@ fn finishPaneDrag(state: *runtime.AppState, x: f32, y: f32) bool {
 fn cancelPaneDrag() void {
     pane_drag = .{};
     last_pane_drop_target = null;
-    _ = sdl.captureMouse(false);
 }
 
 fn renderPlacementPreview(state: *runtime.AppState, rect: palette.Rect) void {
@@ -3547,7 +3544,7 @@ pub fn copyTranscriptSelectionToClipboard(state: *runtime.AppState) void {
         return;
     };
     defer state.allocator.free(z);
-    sdl.setClipboardText(z) catch {
+    host.setClipboardText(z) catch {
         state.setSidebarNotice("Failed to copy selection.");
         return;
     };
@@ -3562,10 +3559,6 @@ fn appendHit(hit: WorkspacePaneHit) void {
 
 fn rectContains(rect: palette.Rect, x: f32, y: f32) bool {
     return x >= rect.x and x <= rect.x + rect.w and y >= rect.y and y <= rect.y + rect.h;
-}
-
-fn keymodBits(modifier_state: sdl.Keymod) u16 {
-    return @as(*const u16, @ptrCast(&modifier_state)).*;
 }
 
 fn stableText(state: *runtime.AppState, value: []const u8) []const u8 {

@@ -11,7 +11,6 @@
 
 const std = @import("std");
 const palette = @import("palette");
-const sdl = @import("zsdl3");
 const runtime = @import("runtime.zig");
 const chat_panel = @import("chat_panel.zig");
 const handoff_controller = @import("../state/handoff_controller.zig");
@@ -139,9 +138,9 @@ fn openMenu(state: *runtime.AppState, menu: Menu) void {
 /// Up/Down open the focused select and walk its options; Space toggles it;
 /// Enter inside an open menu applies the highlighted option. Enter with no
 /// menu open is left to the caller, which prepares the draft.
-pub fn handleKeyDown(state: *runtime.AppState, event: *const sdl.KeyboardEvent) bool {
+pub fn handleKeyDown(state: *runtime.AppState, event: *const palette.event.KeyEvent) bool {
     const controller = &state.handoff_controller;
-    const shift = (keymodBits(event.mod) & sdl.Keymod.shift) != 0;
+    const shift = event.mod.shift;
     switch (event.key) {
         .tab => {
             moveFocus(state, if (shift) -1 else 1);
@@ -190,10 +189,6 @@ fn moveFocus(state: *runtime.AppState, delta: i32) void {
     // Moving focus closes an open menu; the next Up/Down reopens on the new field.
     state.setHandoffMenu(null);
     state.markDirty();
-}
-
-fn keymodBits(modifier_state: sdl.Keymod) u16 {
-    return @as(*const u16, @ptrCast(&modifier_state)).*;
 }
 
 /// Applies option `index` of the open select and closes the menu.

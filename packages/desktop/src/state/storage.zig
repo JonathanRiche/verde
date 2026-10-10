@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const sdl = @import("zsdl3");
+const palette = @import("palette");
 const headless = @import("headless");
 const db_client = if (builtin.is_test) @import("desktop_test_root").test_backend.db_client else struct {};
 const db_types = @import("../db/types.zig");
@@ -212,6 +212,29 @@ pub const LoadedThread = struct {
     }
 };
 
+/// The per-user data directory (`~/.local/share/verde/Native/` on Linux),
+/// resolved and created exactly as SDL3's `SDL_GetPrefPath` did so existing
+/// installs keep their data directory. Returned with its trailing separator.
+fn resolvePrefPath(allocator: std.mem.Allocator) ![]u8 {
+    const pref_path = palette.platform.prefPath(allocator, .{}, ORG_NAME, APP_NAME) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.PrefPathUnavailable,
+    };
+    defer allocator.free(pref_path);
+    return allocator.dupe(u8, pref_path);
+}
+
+test "pref path keeps the SDL3 data directory layout" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const xdg = try palette.platform.paths.composePrefPath(allocator, "/data", "/home/u", ORG_NAME, APP_NAME);
+    defer allocator.free(xdg);
+    try std.testing.expectEqualStrings("/data/verde/Native/", xdg);
+    const home = try palette.platform.paths.composePrefPath(allocator, null, "/home/u", ORG_NAME, APP_NAME);
+    defer allocator.free(home);
+    try std.testing.expectEqualStrings("/home/u/.local/share/verde/Native/", home);
+}
+
 pub const Storage = struct {
     allocator: std.mem.Allocator,
     pref_path: []const u8,
@@ -221,15 +244,14 @@ pub const Storage = struct {
     store_session: *StoreSession,
 
     pub fn init(allocator: std.mem.Allocator) !Storage {
-        const pref_path = sdl.getPrefPath(ORG_NAME, APP_NAME) orelse return error.SdlError;
-        const owned_pref_path = try allocator.dupe(u8, pref_path);
+        const owned_pref_path = try resolvePrefPath(allocator);
         errdefer allocator.free(owned_pref_path);
         const effective_dir = try daemon_client.effectiveStoreDirectory(allocator, owned_pref_path);
         errdefer allocator.free(effective_dir.path);
         return initOwnedPaths(allocator, owned_pref_path, effective_dir.path);
     }
 
-    /// Hermetic/test constructor that skips SDL pref-path resolution.
+    /// Hermetic/test constructor that skips platform pref-path resolution.
     pub fn initWithPrefPath(allocator: std.mem.Allocator, pref_path: []const u8) !Storage {
         const owned_pref_path = try allocator.dupe(u8, pref_path);
         errdefer allocator.free(owned_pref_path);

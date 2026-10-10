@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const palette = @import("palette");
-const sdl = @import("zsdl3");
+const host = @import("ui/host.zig");
 const profiler = @import("runtime/profiler.zig");
 const chat_markdown = @import("ui/chat_markdown.zig");
 const chat_handoff = @import("chat/handoff.zig");
@@ -2793,13 +2793,12 @@ fn paletteMousePoint(x: f32, y: f32, ui_scale: f32) palette.draw.Vec2 {
     return .{ .x = x, .y = y };
 }
 
-fn paletteComposerKeyFromSdl(event: *const sdl.KeyboardEvent) ?palette.Key {
-    const mod_bits = keymodBits(event.mod);
-    const keyboard_state = sdl.getKeyboardState();
-    const ctrl_down = keyboard_state[@intFromEnum(sdl.Scancode.lctrl)] or keyboard_state[@intFromEnum(sdl.Scancode.rctrl)];
+fn paletteComposerKeyFromEvent(event: *const palette.event.KeyEvent) ?palette.Key {
+    const mod_bits = event.mod;
+    const ctrl_down = host.isKeyDown(.lctrl) or host.isKeyDown(.rctrl);
     const primary = paletteComposerPrimaryModifier(mod_bits, ctrl_down);
-    const shift = (mod_bits & sdl.Keymod.shift) != 0;
-    const alt = (mod_bits & sdl.Keymod.alt) != 0;
+    const shift = mod_bits.shift;
+    const alt = mod_bits.alt;
     const code: palette.Key.Code = switch (event.key) {
         .left => .left,
         .right => .right,
@@ -2823,12 +2822,8 @@ fn paletteComposerKeyFromSdl(event: *const sdl.KeyboardEvent) ?palette.Key {
     return .{ .code = code, .shift = shift, .primary = primary or (code == .enter and !shift), .alt = alt };
 }
 
-fn paletteComposerPrimaryModifier(mod_bits: u16, ctrl_down: bool) bool {
-    return (mod_bits & (sdl.Keymod.ctrl | sdl.Keymod.gui)) != 0 or ctrl_down;
-}
-
-fn keymodBits(modifier_state: sdl.Keymod) u16 {
-    return @as(*const u16, @ptrCast(&modifier_state)).*;
+fn paletteComposerPrimaryModifier(mod_bits: palette.event.Mods, ctrl_down: bool) bool {
+    return mod_bits.primary() or ctrl_down;
 }
 
 fn appStateFromContext(context: ?*anyopaque) ?*AppState {
@@ -3137,7 +3132,7 @@ fn paletteComposerSetClipboard(context: ?*anyopaque, text: []const u8) bool {
     const state = appStateFromContext(context) orelse return false;
     const terminated = state.allocator.dupeZ(u8, text) catch return false;
     defer state.allocator.free(terminated);
-    sdl.setClipboardText(terminated) catch |err| {
+    host.setClipboardText(terminated) catch |err| {
         log.warn("failed to copy composer selection: {s}", .{@errorName(err)});
         return false;
     };
@@ -9571,25 +9566,23 @@ pub const AppState = struct {
     }
 
     pub fn readClipboardTextForPaste(self: *AppState) ?[]u8 {
-        const clipboard_text = sdl.getClipboardText() catch |err| {
+        const clipboard_text = host.getClipboardText(self.allocator) catch |err| {
             log.warn("failed to read clipboard text: {s}", .{@errorName(err)});
-            runtime_log.trace("palette paste SDL clipboard read failed: {s}", .{@errorName(err)});
+            runtime_log.trace("palette paste platform clipboard read failed: {s}", .{@errorName(err)});
             return utils.captureClipboardText(self.allocator) catch |fallback_err| {
                 log.warn("failed to read fallback clipboard text: {s}", .{@errorName(fallback_err)});
                 runtime_log.trace("palette paste fallback clipboard read failed: {s}", .{@errorName(fallback_err)});
                 return null;
             };
         };
-        defer sdl.free(@ptrCast(clipboard_text));
-        const text = std.mem.span(clipboard_text);
-        if (text.len > 0) {
-            runtime_log.trace("palette paste SDL clipboard text len={d}", .{text.len});
-            return self.allocator.dupe(u8, text) catch |err| {
-                runtime_log.trace("palette paste clipboard dupe failed: {s}", .{@errorName(err)});
-                return null;
-            };
+        if (clipboard_text) |text| {
+            if (text.len > 0) {
+                runtime_log.trace("palette paste platform clipboard text len={d}", .{text.len});
+                return text;
+            }
+            self.allocator.free(text);
         }
-        runtime_log.trace("palette paste SDL clipboard empty; trying fallback", .{});
+        runtime_log.trace("palette paste platform clipboard empty; trying fallback", .{});
         return utils.captureClipboardText(self.allocator) catch |fallback_err| {
             log.warn("failed to read fallback clipboard text: {s}", .{@errorName(fallback_err)});
             runtime_log.trace("palette paste fallback clipboard read failed: {s}", .{@errorName(fallback_err)});
@@ -12559,8 +12552,8 @@ pub const AppState = struct {
         self.terminal_controller.debug_workspace_visible_pane_count = 0;
     }
 
-    pub fn noteTerminalKeyRouting(self: *AppState, event: *const sdl.KeyboardEvent, handled: bool) void {
-        self.terminal_controller.debug_last_scancode = event.scancode;
+    pub fn noteTerminalKeyRouting(self: *AppState, event: *const palette.event.KeyEvent, handled: bool) void {
+        self.terminal_controller.debug_last_scancode = event.hidScancode();
         self.terminal_controller.debug_last_key_handled = handled;
     }
 
@@ -13003,9 +12996,9 @@ pub const AppState = struct {
         return self.companion_composer.handleInput(self.allocator, .{ .text = insert_text }) catch false;
     }
 
-    pub fn routeCompanionComposerKeyDown(self: *AppState, event: *const sdl.KeyboardEvent) bool {
+    pub fn routeCompanionComposerKeyDown(self: *AppState, event: *const palette.event.KeyEvent) bool {
         if (!self.isCompanionEnabled() or self.companion_controller.visibility != .sidecar_open or !self.companion_composer.focused) return false;
-        const key = paletteComposerKeyFromSdl(event) orelse return false;
+        const key = paletteComposerKeyFromEvent(event) orelse return false;
         if (key.primary and key.code == .v) {
             const clipboard = paletteComposerGetClipboard(self, self.allocator) orelse return true;
             defer self.allocator.free(clipboard);
@@ -14516,11 +14509,11 @@ pub const AppState = struct {
         return handled;
     }
 
-    pub fn routePaletteComposerKeyDown(self: *AppState, event: *const sdl.KeyboardEvent) bool {
+    pub fn routePaletteComposerKeyDown(self: *AppState, event: *const palette.event.KeyEvent) bool {
         if (self.project_controller.projects.items.len == 0) return false;
-        // Escape never survives `paletteComposerKeyFromSdl`, so close the
+        // Escape never survives `paletteComposerKeyFromEvent`, so close the
         // composer popovers from the raw SDL event before the conversion.
-        if (event.key == .escape or event.scancode == .escape) {
+        if (event.key == .escape or event.hidScancode() == .escape) {
             if (self.composer_controller.model_picker.isOpen()) {
                 return self.routePaletteModelPickerKey(.{ .code = .escape });
             }
@@ -14539,12 +14532,12 @@ pub const AppState = struct {
         }
         if (self.terminal_controller.focused) return false;
         // Ctrl+1..9 selects the picker's shortcut-chip rows. Digits never
-        // survive `paletteComposerKeyFromSdl`, so read the raw SDL key.
+        // survive `paletteComposerKeyFromEvent`, so read the raw key.
         if (self.composer_controller.model_picker.isOpen()) {
-            const key_value = @intFromEnum(event.key);
-            const ctrl_held = (keymodBits(event.mod) & sdl.Keymod.ctrl) != 0;
-            if (ctrl_held and key_value >= '1' and key_value <= '9') {
-                const handled = self.composer_controller.model_picker.selectVisibleOrdinal(self.allocator, @intCast(key_value - '1')) catch |err| blk: {
+            const key_value: i32 = @as(i32, @intFromEnum(event.key)) - @intFromEnum(palette.event.Keycode.@"1");
+            const ctrl_held = event.mod.ctrl;
+            if (ctrl_held and key_value >= 0 and key_value <= 8) {
+                const handled = self.composer_controller.model_picker.selectVisibleOrdinal(self.allocator, @intCast(key_value)) catch |err| blk: {
                     log.warn("model picker shortcut select failed: {s}", .{@errorName(err)});
                     break :blk false;
                 };
@@ -14552,7 +14545,7 @@ pub const AppState = struct {
                 return true;
             }
         }
-        const palette_key = paletteComposerKeyFromSdl(event) orelse return false;
+        const palette_key = paletteComposerKeyFromEvent(event) orelse return false;
         if (self.composer_controller.directory_picker.isOpen()) {
             return self.routePaletteDirectoryPickerKey(palette_key);
         }
@@ -14630,7 +14623,7 @@ pub const AppState = struct {
         return true;
     }
 
-    pub fn routePaletteComposerMouseButton(self: *AppState, event: *const sdl.MouseButtonEvent, ui_scale: f32) bool {
+    pub fn routePaletteComposerMouseButton(self: *AppState, event: *const palette.event.ButtonEvent, ui_scale: f32) bool {
         if (self.project_controller.projects.items.len == 0) return false;
         if (event.button != 1) return false;
         const point = paletteMousePoint(event.x, event.y, ui_scale);
@@ -14679,10 +14672,10 @@ pub const AppState = struct {
         return false;
     }
 
-    pub fn routePaletteComposerMouseMotion(self: *AppState, event: *const sdl.MouseMotionEvent, ui_scale: f32) bool {
+    pub fn routePaletteComposerMouseMotion(self: *AppState, event: *const palette.event.MotionEvent, ui_scale: f32) bool {
         if (self.project_controller.projects.items.len == 0) return false;
         const point = paletteMousePoint(event.x, event.y, ui_scale);
-        const input: palette.ComposerPromptInput = if (event.state.left != 0)
+        const input: palette.ComposerPromptInput = if (event.state.left)
             .{ .mouse_drag = point }
         else
             .{ .mouse_move = point };
@@ -14697,7 +14690,7 @@ pub const AppState = struct {
         return handled;
     }
 
-    pub fn routePaletteComposerWheel(self: *AppState, event: *const sdl.MouseWheelEvent, ui_scale: f32) bool {
+    pub fn routePaletteComposerWheel(self: *AppState, event: *const palette.event.WheelEvent, ui_scale: f32) bool {
         if (self.project_controller.projects.items.len == 0) return false;
         const handled = self.composer_controller.composer.handleInput(self.allocator, .{
             .mouse_wheel = .{ .point = paletteMousePoint(event.mouse_x, event.mouse_y, ui_scale), .y = event.y },
@@ -14712,7 +14705,7 @@ pub const AppState = struct {
     /// Composer popovers (model picker, run-config panel) render above the
     /// panes at overlay z, so main.zig routes their pointer input ahead of
     /// the pane/transcript handlers via these entry points.
-    pub fn routeComposerPopoverMouseButton(self: *AppState, event: *const sdl.MouseButtonEvent, ui_scale: f32) bool {
+    pub fn routeComposerPopoverMouseButton(self: *AppState, event: *const palette.event.ButtonEvent, ui_scale: f32) bool {
         if (self.project_controller.projects.items.len == 0) return false;
         if (event.button != 1) return false;
         const point = paletteMousePoint(event.x, event.y, ui_scale);
@@ -14722,16 +14715,16 @@ pub const AppState = struct {
         return self.routeRunConfigMouseButton(point, event.down);
     }
 
-    pub fn routeComposerPopoverMouseMotion(self: *AppState, event: *const sdl.MouseMotionEvent, ui_scale: f32) bool {
+    pub fn routeComposerPopoverMouseMotion(self: *AppState, event: *const palette.event.MotionEvent, ui_scale: f32) bool {
         if (self.project_controller.projects.items.len == 0) return false;
         const point = paletteMousePoint(event.x, event.y, ui_scale);
-        if (self.routePaletteModelPickerMouseMove(point, event.state.left != 0)) return true;
-        if (self.routePaletteDirectoryPickerMouseMove(point, event.state.left != 0)) return true;
-        if (self.routePaletteRuntimePickerMouseMove(point, event.state.left != 0)) return true;
+        if (self.routePaletteModelPickerMouseMove(point, event.state.left)) return true;
+        if (self.routePaletteDirectoryPickerMouseMove(point, event.state.left)) return true;
+        if (self.routePaletteRuntimePickerMouseMove(point, event.state.left)) return true;
         return self.routeRunConfigMouseMove(point);
     }
 
-    pub fn routeComposerPopoverWheel(self: *AppState, event: *const sdl.MouseWheelEvent, ui_scale: f32) bool {
+    pub fn routeComposerPopoverWheel(self: *AppState, event: *const palette.event.WheelEvent, ui_scale: f32) bool {
         if (self.project_controller.projects.items.len == 0) return false;
         const point = paletteMousePoint(event.mouse_x, event.mouse_y, ui_scale);
         if (self.routePaletteModelPickerWheel(point, event.y)) return true;
@@ -15205,7 +15198,7 @@ pub const AppState = struct {
         return if (rows.len > 0) 0 else null;
     }
 
-    pub fn handleComposerWheel(self: *AppState, event: *const sdl.MouseWheelEvent) bool {
+    pub fn handleComposerWheel(self: *AppState, event: *const palette.event.WheelEvent) bool {
         if (self.project_controller.projects.items.len == 0) return false;
         if (!self.composer_controller.input_bounds_valid) return false;
         if (event.mouse_x < self.composer_controller.input_min[0] or event.mouse_x > self.composer_controller.input_max[0]) return false;
@@ -17004,7 +16997,7 @@ pub const AppState = struct {
             const payload = self.palette_frame_text.items[hit.payload_offset .. hit.payload_offset + hit.payload_len];
             const z = self.allocator.dupeZ(u8, payload) catch return true;
             defer self.allocator.free(z);
-            sdl.setClipboardText(z) catch |err| {
+            host.setClipboardText(z) catch |err| {
                 log.warn("failed to copy code block to clipboard: {s}", .{@errorName(err)});
                 return true;
             };
@@ -17751,10 +17744,10 @@ test "empty workspace ignores hidden composer and slash input" {
     try std.testing.expectEqual(@as(usize, 0), state.slashCommandPickerRowCount());
     try std.testing.expect(state.slashCommandPickerRow(0) == null);
 
-    var key_event: sdl.KeyboardEvent = undefined;
-    var button_event: sdl.MouseButtonEvent = undefined;
-    var motion_event: sdl.MouseMotionEvent = undefined;
-    var wheel_event: sdl.MouseWheelEvent = undefined;
+    var key_event: palette.event.KeyEvent = undefined;
+    var button_event: palette.event.ButtonEvent = undefined;
+    var motion_event: palette.event.MotionEvent = undefined;
+    var wheel_event: palette.event.WheelEvent = undefined;
     try std.testing.expect(!state.routePaletteComposerTextInput("ignored"));
     try std.testing.expect(!state.routePaletteComposerKeyDown(&key_event));
     try std.testing.expect(!state.routePaletteComposerMouseButton(&button_event, 1.0));

@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const sdl = @import("zsdl3");
+const palette = @import("palette");
+const host = @import("../ui/host.zig");
 const ghostty_vt = @import("engine.zig");
 pub const RenderState = ghostty_vt.RenderState;
 const keybinds = @import("../app/keybinds.zig");
@@ -1409,7 +1410,7 @@ pub const Dock = struct {
         self: *Dock,
         allocator: std.mem.Allocator,
         keyboard: *const keybinds.NativeKeyboardConfig,
-        event: *const sdl.KeyboardEvent,
+        event: *const palette.event.KeyEvent,
     ) bool {
         if (terminalZoomDelta(event)) |delta| {
             self.font_scale = clampf(self.font_scale + delta, MIN_FONT_SCALE, MAX_FONT_SCALE);
@@ -1436,7 +1437,7 @@ pub const Dock = struct {
         return false;
     }
 
-    fn handleTerminalShortcut(_: *Dock, allocator: std.mem.Allocator, session: *Session, event: *const sdl.KeyboardEvent) bool {
+    fn handleTerminalShortcut(_: *Dock, allocator: std.mem.Allocator, session: *Session, event: *const palette.event.KeyEvent) bool {
         if (!event.down) return false;
         if (terminalScrollShortcut(event, session.visibleRows())) |scroll| {
             session.scrollViewport(allocator, scroll) catch |err| {
@@ -2127,7 +2128,7 @@ pub const Dock = struct {
         self: *Dock,
         allocator: std.mem.Allocator,
         keyboard: *const keybinds.NativeKeyboardConfig,
-        event: *const sdl.KeyboardEvent,
+        event: *const palette.event.KeyEvent,
     ) !bool {
         const action = keyboard.terminalActionForEvent(event) orelse return false;
         try self.performWorkspaceAction(allocator, action);
@@ -2953,7 +2954,7 @@ const UnsupportedSession = struct {
         return allocator.dupe(u8, "");
     }
 
-    pub fn handleKeyDown(_: *UnsupportedSession, _: *const sdl.KeyboardEvent) !bool {
+    pub fn handleKeyDown(_: *UnsupportedSession, _: *const palette.event.KeyEvent) !bool {
         return false;
     }
 
@@ -3554,7 +3555,7 @@ const UnixSession = struct {
         return copyableRenderStateText(allocator, &self.render_state);
     }
 
-    pub fn handleKeyDown(self: *UnixSession, event: *const sdl.KeyboardEvent) !bool {
+    pub fn handleKeyDown(self: *UnixSession, event: *const palette.event.KeyEvent) !bool {
         if (!self.running or !event.down) return false;
         if (shouldUseTextInputForTerminalPrintableText(event)) return false;
 
@@ -3562,14 +3563,14 @@ const UnixSession = struct {
         const synthesized_utf8 = synthesizeTerminalUtf8(event, &utf8_buf);
         if (synthesized_utf8.len == 0 and shouldDeferToTextInput(event)) return false;
 
-        const key = mapScancodeToGhostty(event.scancode) orelse return false;
+        const key = mapScancodeToGhostty(event.hidScancode()) orelse return false;
         const key_event: ghostty_vt.input.KeyEvent = .{
             .action = if (event.repeat) .repeat else .press,
             .key = key,
             .mods = modsFromKeyboardEvent(event),
             .consumed_mods = consumedModsFromKeyboardEvent(event, synthesized_utf8),
             .utf8 = synthesized_utf8,
-            .unshifted_codepoint = scancodeCodepoint(event.scancode) orelse 0,
+            .unshifted_codepoint = scancodeCodepoint(event.hidScancode()) orelse 0,
         };
 
         var buffer: [128]u8 = undefined;
@@ -3787,9 +3788,8 @@ const UnixSession = struct {
 
     pub fn pasteClipboard(self: *UnixSession, allocator: std.mem.Allocator) !bool {
         if (!self.running) return false;
-        const clipboard_ptr = sdl.getClipboardText() catch return false;
-        defer sdl.free(clipboard_ptr);
-        const clipboard_text = std.mem.sliceTo(clipboard_ptr, 0);
+        const clipboard_text = (host.getClipboardText(allocator) catch return false) orelse return false;
+        defer allocator.free(clipboard_text);
         return try self.pasteText(allocator, clipboard_text);
     }
 
@@ -3813,9 +3813,7 @@ const UnixSession = struct {
         defer allocator.free(screen_text);
         if (std.mem.trim(u8, screen_text, " \t\r\n").len == 0) return false;
 
-        const clipboard_text = try allocator.dupeZ(u8, screen_text);
-        defer allocator.free(clipboard_text);
-        try sdl.setClipboardText(clipboard_text);
+        try host.setClipboardText(screen_text);
         return true;
     }
 
@@ -4484,7 +4482,7 @@ const UnixSession = struct {
         } else if (write.contents.len > 0) write.contents[0].data else "";
         const text_z = allocator.dupeZ(u8, text) catch return .io_error;
         defer allocator.free(text_z);
-        sdl.setClipboardText(text_z) catch |err| {
+        host.setClipboardText(text_z) catch |err| {
             log.warn("failed to set OSC 52 clipboard text: {s}", .{@errorName(err)});
             return .io_error;
         };
@@ -4551,8 +4549,8 @@ const UnixSession = struct {
     }
 
     fn defaultTerminalPalette() [256]ghostty_vt.color.RGB {
-        var palette = ghostty_vt.color.default;
-        // The palette has no blue/magenta/cyan roles; derive them from the
+        var colors = ghostty_vt.color.default;
+        // The theme palette has no blue/magenta/cyan roles; derive them from the
         // accent so they inherit its contrast against this theme's background.
         const blue = theme.withHue(theme.accent(), 212.0);
         const magenta = theme.withHue(theme.accent(), 300.0);
@@ -4575,8 +4573,8 @@ const UnixSession = struct {
             terminalRgbFromTheme(theme.raise(cyan, 0.12)),
             terminalRgbFromTheme(theme.raise(theme.COLOR_WHITE, 0.04)),
         };
-        @memcpy(palette[0..ansi.len], &ansi);
-        return palette;
+        @memcpy(colors[0..ansi.len], &ansi);
+        return colors;
     }
 
     fn loadGhosttyTheme(allocator: std.mem.Allocator, terminal_theme: *TerminalTheme) !void {
@@ -5285,12 +5283,12 @@ fn selfExePathAlloc(allocator: std.mem.Allocator) ![:0]u8 {
     return platform_runtime.executablePathAlloc(allocator);
 }
 
-fn shouldDeferToTextInput(event: *const sdl.KeyboardEvent) bool {
-    if (modifierPressed(event.mod, sdl.Keymod.ctrl)) return false;
-    if (modifierPressed(event.mod, sdl.Keymod.alt)) return false;
-    if (modifierPressed(event.mod, sdl.Keymod.gui)) return false;
+fn shouldDeferToTextInput(event: *const palette.event.KeyEvent) bool {
+    if (event.mod.ctrl) return false;
+    if (event.mod.alt) return false;
+    if (event.mod.super) return false;
 
-    return switch (event.scancode) {
+    return switch (event.hidScancode()) {
         .a,
         .b,
         .c,
@@ -5344,7 +5342,7 @@ fn shouldDeferToTextInput(event: *const sdl.KeyboardEvent) bool {
     };
 }
 
-fn shouldUseTextInputForTerminalPrintableText(event: *const sdl.KeyboardEvent) bool {
+fn shouldUseTextInputForTerminalPrintableText(event: *const palette.event.KeyEvent) bool {
     if (builtin.os.tag != .macos) return false;
     // macOS can deliver duplicate-looking printable input when we synthesize
     // ASCII from key_down while SDL text input is active. Let SDL's composed
@@ -5361,23 +5359,23 @@ fn isAsciiTerminalText(input_text: []const u8) bool {
     return true;
 }
 
-fn consumedModsFromKeyboardEvent(event: *const sdl.KeyboardEvent, utf8: []const u8) ghostty_vt.input.KeyMods {
+fn consumedModsFromKeyboardEvent(event: *const palette.event.KeyEvent, utf8: []const u8) ghostty_vt.input.KeyMods {
     if (utf8.len == 0) return .{};
     return .{
-        .shift = modifierPressed(event.mod, sdl.Keymod.shift),
+        .shift = event.mod.shift,
     };
 }
 
-fn synthesizeTerminalUtf8(event: *const sdl.KeyboardEvent, buf: *[8]u8) []const u8 {
-    if (modifierPressed(event.mod, sdl.Keymod.ctrl)) return "";
-    if (modifierPressed(event.mod, sdl.Keymod.alt)) return "";
-    if (modifierPressed(event.mod, sdl.Keymod.gui)) return "";
+fn synthesizeTerminalUtf8(event: *const palette.event.KeyEvent, buf: *[8]u8) []const u8 {
+    if (event.mod.ctrl) return "";
+    if (event.mod.alt) return "";
+    if (event.mod.super) return "";
 
-    const shift = modifierPressed(event.mod, sdl.Keymod.shift);
-    const caps = modifierPressed(event.mod, sdl.Keymod.caps);
-    const scancode_value = @intFromEnum(event.scancode);
-    const a_value = @intFromEnum(sdl.Scancode.a);
-    const z_value = @intFromEnum(sdl.Scancode.z);
+    const shift = event.mod.shift;
+    const caps = event.mod.caps_lock;
+    const scancode_value = @intFromEnum(event.hidScancode());
+    const a_value = @intFromEnum(palette.keyboard.Scancode.a);
+    const z_value = @intFromEnum(palette.keyboard.Scancode.z);
     if (scancode_value >= a_value and scancode_value <= z_value) {
         const base = @as(u8, @intCast(scancode_value - a_value)) + 'a';
         const upper = shift != caps;
@@ -5385,7 +5383,7 @@ fn synthesizeTerminalUtf8(event: *const sdl.KeyboardEvent, buf: *[8]u8) []const 
         return buf[0..1];
     }
 
-    const ch: u8 = switch (event.scancode) {
+    const ch: u8 = switch (event.hidScancode()) {
         .@"0" => if (shift) ')' else '0',
         .@"1" => if (shift) '!' else '1',
         .@"2" => if (shift) '@' else '2',
@@ -5414,14 +5412,14 @@ fn synthesizeTerminalUtf8(event: *const sdl.KeyboardEvent, buf: *[8]u8) []const 
     return buf[0..1];
 }
 
-fn modsFromKeyboardEvent(event: *const sdl.KeyboardEvent) ghostty_vt.input.KeyMods {
+fn modsFromKeyboardEvent(event: *const palette.event.KeyEvent) ghostty_vt.input.KeyMods {
     return .{
-        .shift = modifierPressed(event.mod, sdl.Keymod.shift),
-        .ctrl = modifierPressed(event.mod, sdl.Keymod.ctrl),
-        .alt = modifierPressed(event.mod, sdl.Keymod.alt),
-        .super = modifierPressed(event.mod, sdl.Keymod.gui),
-        .caps_lock = modifierPressed(event.mod, sdl.Keymod.caps),
-        .num_lock = modifierPressed(event.mod, sdl.Keymod.num),
+        .shift = event.mod.shift,
+        .ctrl = event.mod.ctrl,
+        .alt = event.mod.alt,
+        .super = event.mod.super,
+        .caps_lock = event.mod.caps_lock,
+        .num_lock = event.mod.num_lock,
     };
 }
 
@@ -5440,16 +5438,11 @@ fn terminalMouseButton(button: u8) ?ghostty_vt.input.MouseButton {
     };
 }
 
-fn modifierPressed(state: sdl.Keymod, mask: u16) bool {
-    const state_bits = @as(*const u16, @ptrCast(&state)).*;
-    return (state_bits & mask) != 0;
-}
-
-fn terminalScrollShortcut(event: *const sdl.KeyboardEvent, rows: u16) ?TerminalScroll {
-    if (modifierPressed(event.mod, sdl.Keymod.alt) or modifierPressed(event.mod, sdl.Keymod.gui)) return null;
-    const shift = modifierPressed(event.mod, sdl.Keymod.shift);
-    const ctrl = modifierPressed(event.mod, sdl.Keymod.ctrl);
-    return switch (event.scancode) {
+fn terminalScrollShortcut(event: *const palette.event.KeyEvent, rows: u16) ?TerminalScroll {
+    if (event.mod.alt or event.mod.super) return null;
+    const shift = event.mod.shift;
+    const ctrl = event.mod.ctrl;
+    return switch (event.hidScancode()) {
         .pageup => if (shift and !ctrl) .{ .delta = -terminalPageScrollLines(rows) } else null,
         .pagedown => if (shift and !ctrl) .{ .delta = terminalPageScrollLines(rows) } else null,
         .up => if (shift and ctrl) .{ .delta = -KEY_SCROLL_LINES } else null,
@@ -5464,31 +5457,31 @@ fn terminalPageScrollLines(rows: u16) isize {
     return @max(@as(isize, @intCast(rows)) - 1, KEY_SCROLL_LINES);
 }
 
-fn terminalPasteShortcut(event: *const sdl.KeyboardEvent) bool {
-    if (event.scancode != .v) return false;
-    if (modifierPressed(event.mod, sdl.Keymod.alt)) return false;
-    const ctrl = modifierPressed(event.mod, sdl.Keymod.ctrl);
-    const gui = modifierPressed(event.mod, sdl.Keymod.gui);
+fn terminalPasteShortcut(event: *const palette.event.KeyEvent) bool {
+    if (event.hidScancode() != .v) return false;
+    if (event.mod.alt) return false;
+    const ctrl = event.mod.ctrl;
+    const gui = event.mod.super;
     // Ctrl+V, Ctrl+Shift+V, Super+V, Super+Shift+V. Note: this steals Ctrl+V
     // from TUIs that bind it (vim insert-mode literal char, etc.) — explicit
     // user request.
     return ctrl != gui;
 }
 
-fn terminalCopyShortcut(event: *const sdl.KeyboardEvent) bool {
-    if (event.scancode != .c) return false;
+fn terminalCopyShortcut(event: *const palette.event.KeyEvent) bool {
+    if (event.hidScancode() != .c) return false;
     // Stricter than the panel-level copy: this path runs when no selection
     // is active and copies the whole screen, so we require shift to make it
     // an explicit gesture (Ctrl+Shift+C / Super+Shift+C). Bare Ctrl+C falls
     // through to the shell as SIGINT.
-    if (modifierPressed(event.mod, sdl.Keymod.alt)) return false;
-    if (!modifierPressed(event.mod, sdl.Keymod.shift)) return false;
-    const ctrl = modifierPressed(event.mod, sdl.Keymod.ctrl);
-    const gui = modifierPressed(event.mod, sdl.Keymod.gui);
+    if (event.mod.alt) return false;
+    if (!event.mod.shift) return false;
+    const ctrl = event.mod.ctrl;
+    const gui = event.mod.super;
     return ctrl != gui;
 }
 
-fn mapScancodeToGhostty(scancode: sdl.Scancode) ?ghostty_vt.input.Key {
+fn mapScancodeToGhostty(scancode: palette.keyboard.Scancode) ?ghostty_vt.input.Key {
     return switch (scancode) {
         .a => .key_a,
         .b => .key_b,
@@ -5598,7 +5591,7 @@ fn mapScancodeToGhostty(scancode: sdl.Scancode) ?ghostty_vt.input.Key {
     };
 }
 
-fn scancodeCodepoint(scancode: sdl.Scancode) ?u21 {
+fn scancodeCodepoint(scancode: palette.keyboard.Scancode) ?u21 {
     return switch (scancode) {
         .a => 'a',
         .b => 'b',
@@ -5652,12 +5645,12 @@ fn scancodeCodepoint(scancode: sdl.Scancode) ?u21 {
     };
 }
 
-fn terminalZoomDelta(event: *const sdl.KeyboardEvent) ?f32 {
+fn terminalZoomDelta(event: *const palette.event.KeyEvent) ?f32 {
     if (!event.down or event.repeat) return null;
-    if (!modifierPressed(event.mod, sdl.Keymod.ctrl)) return null;
-    if (modifierPressed(event.mod, sdl.Keymod.alt) or modifierPressed(event.mod, sdl.Keymod.gui)) return null;
+    if (!event.mod.ctrl) return null;
+    if (event.mod.alt or event.mod.super) return null;
 
-    return switch (event.scancode) {
+    return switch (event.hidScancode()) {
         .minus, .kp_minus => -FONT_SCALE_STEP,
         .equals, .kp_plus, .kp_equals => FONT_SCALE_STEP,
         else => null,

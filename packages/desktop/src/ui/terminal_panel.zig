@@ -3,7 +3,7 @@
 const std = @import("std");
 const ghostty_vt = @import("../terminal/engine.zig");
 const palette = @import("palette");
-const sdl = @import("zsdl3");
+const host = @import("host.zig");
 
 const app_state = @import("../state.zig");
 const colors = @import("colors.zig");
@@ -432,12 +432,12 @@ pub fn renderDockAtForDockWithin(state: *app_state.AppState, rect: palette.Rect,
     }
 }
 
-pub fn handlePaletteKeyDown(state: *app_state.AppState, event: *const sdl.KeyboardEvent) bool {
+pub fn handlePaletteKeyDown(state: *app_state.AppState, event: *const palette.event.KeyEvent) bool {
     if (!terminalCopyShortcut(event) or !selection_state.active) return false;
     return copySelectionToClipboard(state);
 }
 
-pub fn handlePaletteMouseMotion(state: *app_state.AppState, x: f32, y: f32, buttons: sdl.MouseButtonFlags) bool {
+pub fn handlePaletteMouseMotion(state: *app_state.AppState, x: f32, y: f32, buttons: palette.event.ButtonState) bool {
     if (pending_link_click.active and selectionDragDistanceExceededFrom(pending_link_click.start_x, pending_link_click.start_y, x, y)) {
         pending_link_click = .{};
     }
@@ -457,7 +457,7 @@ pub fn mouseShapeAtPoint(state: *const app_state.AppState, x: f32, y: f32) ?ghos
     return dock.mouseShapeForPane(target.pane_id);
 }
 
-fn routeTerminalMouseMotion(state: *app_state.AppState, x: f32, y: f32, buttons: sdl.MouseButtonFlags) bool {
+fn routeTerminalMouseMotion(state: *app_state.AppState, x: f32, y: f32, buttons: palette.event.ButtonState) bool {
     const target = paneAtPoint(x, y) orelse return false;
     var dock = state.currentProjectTerminalDockMutable(target.dock_id) orelse return false;
     return dock.handleMouseMotion(
@@ -470,12 +470,12 @@ fn routeTerminalMouseMotion(state: *app_state.AppState, x: f32, y: f32, buttons:
     );
 }
 
-fn terminalPressedMouseButton(buttons: sdl.MouseButtonFlags) ?u8 {
-    if (buttons.left != 0) return 1;
-    if (buttons.middle != 0) return 2;
-    if (buttons.right != 0) return 3;
-    if (buttons.x1 != 0) return 4;
-    if (buttons.x2 != 0) return 5;
+fn terminalPressedMouseButton(buttons: palette.event.ButtonState) ?u8 {
+    if (buttons.left) return 1;
+    if (buttons.middle) return 2;
+    if (buttons.right) return 3;
+    if (buttons.back) return 4;
+    if (buttons.forward) return 5;
     return null;
 }
 
@@ -1596,7 +1596,7 @@ fn copySelectionToClipboard(state: *app_state.AppState) bool {
 
     const clipboard_text = state.allocator.dupeZ(u8, text) catch return true;
     defer state.allocator.free(clipboard_text);
-    sdl.setClipboardText(clipboard_text) catch |err| {
+    host.setClipboardText(clipboard_text) catch |err| {
         app_state.log.warn("failed to set terminal selection clipboard text: {s}", .{@errorName(err)});
     };
     return true;
@@ -1693,21 +1693,16 @@ fn rectContains(rect: palette.Rect, x: f32, y: f32) bool {
     return x >= rect.x and x <= rect.x + rect.w and y >= rect.y and y <= rect.y + rect.h;
 }
 
-fn terminalCopyShortcut(event: *const sdl.KeyboardEvent) bool {
+fn terminalCopyShortcut(event: *const palette.event.KeyEvent) bool {
     if (!event.down or event.repeat) return false;
-    if (event.scancode != .c and event.key != .c) return false;
-    if (modifierPressed(event.mod, sdl.Keymod.alt)) return false;
-    const ctrl = modifierPressed(event.mod, sdl.Keymod.ctrl);
-    const gui = modifierPressed(event.mod, sdl.Keymod.gui);
+    if (event.hidScancode() != .c and event.key != .c) return false;
+    if (event.mod.alt) return false;
+    const ctrl = event.mod.ctrl;
+    const gui = event.mod.super;
     // Ctrl+C, Ctrl+Shift+C, Super+C, Super+Shift+C. Shift is optional so the
     // copy-if-selection behavior reaches handlePaletteKeyDown before the bare
     // Ctrl+C falls through to the terminal as SIGINT.
     return ctrl != gui; // exactly one of ctrl/gui; reject ctrl+gui chord
-}
-
-fn modifierPressed(state: sdl.Keymod, mask: u16) bool {
-    const state_bits = @as(*const u16, @ptrCast(&state)).*;
-    return (state_bits & mask) != 0;
 }
 
 fn drawCursor(state: *app_state.AppState, render_state: *const ghostty_vt.RenderState, rect: palette.Rect, clip: palette.Rect) void {

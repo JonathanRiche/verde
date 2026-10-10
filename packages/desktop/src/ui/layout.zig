@@ -1,7 +1,7 @@
 //! Root native UI composition and modal routing.
 
 const std = @import("std");
-const sdl = @import("zsdl3");
+const host = @import("host.zig");
 const palette = @import("palette");
 const theme = @import("theme.zig");
 const text_measure = @import("text_measure.zig");
@@ -1755,7 +1755,7 @@ fn copyModalSelection(state: *runtime.AppState) void {
         }
         state.allocator.free(z);
     }
-    sdl.setClipboardText(z) catch |err| {
+    host.setClipboardText(z) catch |err| {
         runtime.log.warn("failed to copy modal selection: {s}", .{@errorName(err)});
     };
 }
@@ -1798,14 +1798,13 @@ fn pasteIntoModal(state: *runtime.AppState) bool {
 }
 
 fn readRuntimeCredentialClipboard(state: *runtime.AppState) ?[]u8 {
-    const clipboard_text = sdl.getClipboardText() catch |err| {
+    const text = (host.getClipboardText(state.allocator) catch |err| {
         runtime.log.warn("failed to read runtime credential clipboard text: {s}", .{@errorName(err)});
         return null;
-    };
-    const text = std.mem.span(clipboard_text);
+    }) orelse return null;
     defer {
-        std.crypto.secureZero(u8, @constCast(text));
-        sdl.free(@ptrCast(clipboard_text));
+        std.crypto.secureZero(u8, text);
+        state.allocator.free(text);
     }
     const max_raw_bytes = state.runtimeCredentialTokenBuffer().len - 1;
     return state.allocator.dupe(u8, text[0..@min(text.len, max_raw_bytes)]) catch null;
@@ -2167,7 +2166,7 @@ pub fn handlePaletteTextInput(state: *runtime.AppState, text: []const u8) bool {
     };
 }
 
-pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const sdl.KeyboardEvent) bool {
+pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const palette.event.KeyEvent) bool {
     const has_modal_open = state.runtimeCredentialModalOpen() or
         state.runtimeTrustProposal() != null or
         state.modal_image_path != null or
@@ -2188,7 +2187,7 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const sdl.Keyboard
     if (runtimeWizardOwnsKeys(state)) {
         switch (event.key) {
             .tab => {
-                state.cycleRuntimeWizardField((keymodBits(event.mod) & sdl.Keymod.shift) != 0);
+                state.cycleRuntimeWizardField(event.mod.shift);
                 state.markDirty();
                 return true;
             },
@@ -2231,8 +2230,8 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const sdl.Keyboard
         if (event.key == .escape) dismissTopModal(state);
         return true;
     }
-    const primary = (keymodBits(event.mod) & (sdl.Keymod.ctrl | sdl.Keymod.gui)) != 0;
-    const shift = (keymodBits(event.mod) & sdl.Keymod.shift) != 0;
+    const primary = event.mod.primary();
+    const shift = event.mod.shift;
     switch (event.key) {
         .escape => {
             dismissTopModal(state);
@@ -2329,7 +2328,7 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const sdl.Keyboard
                 if (primary) {
                     const clipboard_text = state.allocator.dupeZ(u8, text) catch return true;
                     defer state.allocator.free(clipboard_text);
-                    sdl.setClipboardText(clipboard_text) catch |err| {
+                    host.setClipboardText(clipboard_text) catch |err| {
                         runtime.log.warn("failed to set transcript selection clipboard text: {s}", .{@errorName(err)});
                     };
                     return true;
@@ -2425,7 +2424,7 @@ fn commitSheetOwnsKeys(state: *runtime.AppState) bool {
 /// newline in the message, and Up/Down/Home/End follow wrapped lines.
 /// Everything else falls through to the shared modal text editing path. In
 /// the default-branch confirmation Enter creates a branch and continues.
-fn handleCommitSheetKeyDown(state: *runtime.AppState, event: *const sdl.KeyboardEvent) bool {
+fn handleCommitSheetKeyDown(state: *runtime.AppState, event: *const palette.event.KeyEvent) bool {
     const sheet = state.commitSheet() orelse {
         if (state.gitQuickConfirm() == null) return false;
         switch (event.key) {
@@ -2438,8 +2437,8 @@ fn handleCommitSheetKeyDown(state: *runtime.AppState, event: *const sdl.Keyboard
             else => return true,
         }
     };
-    const primary = (keymodBits(event.mod) & (sdl.Keymod.ctrl | sdl.Keymod.gui)) != 0;
-    const shift = (keymodBits(event.mod) & sdl.Keymod.shift) != 0;
+    const primary = event.mod.primary();
+    const shift = event.mod.shift;
     const editing = state.palette_modal_text_focus == .commit_message;
     switch (event.key) {
         .@"return", .kp_enter => {
@@ -2474,10 +2473,6 @@ pub fn updateCommitSheetHover(state: *runtime.AppState, x: f32, y: f32) void {
 pub fn handleCommitSheetWheel(state: *runtime.AppState, width: f32, height: f32, x: f32, y: f32, wheel_y: f32) bool {
     if (!state.commitSheetOpen() or state.settings_controller.modal_visible or state.command_controller.open) return false;
     return commit_sheet.handleWheel(state, width, height, x, y, wheel_y);
-}
-
-fn keymodBits(modifier_state: sdl.Keymod) u16 {
-    return @as(*const u16, @ptrCast(&modifier_state)).*;
 }
 
 fn insertIntoZBuffer(buf: [:0]u8, cursor: *usize, text: []const u8) bool {
@@ -4003,11 +3998,8 @@ test "workspace settings modal owns keyboard and text input while open" {
 
     // Every key-down is consumed while the modal owns the keyboard; Escape
     // additionally closes it through the shared dismiss path.
-    var event: sdl.KeyboardEvent = undefined;
-    @memset(std.mem.asBytes(&event), 0);
-    event.type = .key_down;
-    event.down = true;
-    const consumed_keys: [4]sdl.Keycode = .{ .@"return", .c, .backspace, .q };
+    var event: palette.event.KeyEvent = .{ .key = .unknown, .down = true };
+    const consumed_keys: [4]palette.event.Keycode = .{ .@"return", .c, .backspace, .q };
     for (consumed_keys) |key| {
         event.key = key;
         try std.testing.expect(handlePaletteKeyDown(&state, &event));
@@ -4015,10 +4007,10 @@ test "workspace settings modal owns keyboard and text input while open" {
     }
     // Ctrl+C (copy chord) is likewise consumed, not forwarded.
     event.key = .c;
-    @as(*u16, @ptrCast(&event.mod)).* = sdl.Keymod.ctrl;
+    event.mod = .{ .ctrl = true };
     try std.testing.expect(handlePaletteKeyDown(&state, &event));
     try std.testing.expect(state.workspaceSettingsOpen());
-    @as(*u16, @ptrCast(&event.mod)).* = sdl.Keymod.none;
+    event.mod = .{};
     event.key = .escape;
     try std.testing.expect(handlePaletteKeyDown(&state, &event));
     try std.testing.expect(!state.workspaceSettingsOpen());

@@ -3,7 +3,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const palette = @import("palette");
-const sdl = @import("zsdl3");
+const host = @import("host.zig");
 const app_config = @import("../app/config.zig");
 const provider_cli_version = @import("../providers/cli_version.zig");
 const phone_pairing = @import("../state/phone_pairing.zig");
@@ -1012,7 +1012,7 @@ fn openActionSelectedIndex(state: *const runtime.AppState) usize {
     return 0;
 }
 
-fn handleOpenActionKeyDown(state: *runtime.AppState, key: sdl.Keycode) bool {
+fn handleOpenActionKeyDown(state: *runtime.AppState, key: palette.event.Keycode) bool {
     const count = OPEN_CHOICES.len;
     const current = state.settings_controller.open_action_hover_index orelse openActionSelectedIndex(state);
     const next = switch (key) {
@@ -1283,7 +1283,7 @@ pub fn applyCommitMenuOption(state: *runtime.AppState, option_index: usize) void
     state.markDirty();
 }
 
-fn handleCommitMenuKeyDown(state: *runtime.AppState, menu: settings_controller.CommitMenu, key: sdl.Keycode) bool {
+fn handleCommitMenuKeyDown(state: *runtime.AppState, menu: settings_controller.CommitMenu, key: palette.event.Keycode) bool {
     const count = commitMenuCount(state, menu);
     if (count == 0) return false;
     const current = @min(state.settings_controller.commit_menu_hover_index orelse commitMenuSelectedIndex(state, menu) orelse 0, count - 1);
@@ -2437,7 +2437,7 @@ pub fn applyNewChatReasoningOption(state: *runtime.AppState, option_index: usize
 }
 
 /// Handles navigation while a settings dropdown owns keyboard focus.
-pub fn handleKeyDown(state: *runtime.AppState, key: sdl.Keycode) bool {
+pub fn handleKeyDown(state: *runtime.AppState, key: palette.event.Keycode) bool {
     if (!state.settings_controller.modal_visible) return false;
     if (state.settings_controller.theme_dropdown_open) return handleThemeKeyDown(state, key);
     if (state.settings_controller.companion_character_dropdown_open) return handleCompanionCharacterKeyDown(state, key);
@@ -2451,7 +2451,7 @@ pub fn handleKeyDown(state: *runtime.AppState, key: sdl.Keycode) bool {
     return false;
 }
 
-fn handleThemeKeyDown(state: *runtime.AppState, key: sdl.Keycode) bool {
+fn handleThemeKeyDown(state: *runtime.AppState, key: palette.event.Keycode) bool {
     const count = state.settingsThemeChoiceCount();
     if (count == 0) return false;
     const current = state.settings_controller.theme_hover_index orelse state.settings_controller.draft.theme_choice;
@@ -2478,7 +2478,7 @@ fn handleThemeKeyDown(state: *runtime.AppState, key: sdl.Keycode) bool {
     return true;
 }
 
-fn handleCompanionCharacterKeyDown(state: *runtime.AppState, key: sdl.Keycode) bool {
+fn handleCompanionCharacterKeyDown(state: *runtime.AppState, key: palette.event.Keycode) bool {
     const count = companionCharacterCount();
     if (count == 0) return false;
     const current = state.settings_controller.companion_character_hover_index orelse companionCharacterIndex(state.settings_controller.draft.companion_character);
@@ -2504,7 +2504,7 @@ fn handleCompanionCharacterKeyDown(state: *runtime.AppState, key: sdl.Keycode) b
     return true;
 }
 
-fn handleTitleProviderKeyDown(state: *runtime.AppState, key: sdl.Keycode) bool {
+fn handleTitleProviderKeyDown(state: *runtime.AppState, key: palette.event.Keycode) bool {
     const count = state.settingsChatTitleProviderCount();
     if (count == 0) return false;
     const current = state.settings_controller.title_menu_hover_index orelse state.settingsChatTitleProviderSelectedIndex();
@@ -2530,7 +2530,7 @@ fn handleTitleProviderKeyDown(state: *runtime.AppState, key: sdl.Keycode) bool {
     return true;
 }
 
-fn handleTitleModelKeyDown(state: *runtime.AppState, key: sdl.Keycode) bool {
+fn handleTitleModelKeyDown(state: *runtime.AppState, key: palette.event.Keycode) bool {
     const count = state.settingsChatTitleModelCount();
     if (count == 0) return false;
     const current = @min(state.settings_controller.title_menu_hover_index orelse state.settingsChatTitleModelSelectedIndex() orelse 0, count - 1);
@@ -2581,7 +2581,7 @@ fn ensureTitleModelChoiceVisible(state: *runtime.AppState, option_index: usize) 
     state.settings_controller.title_model_menu_scroll = @min(state.settings_controller.title_model_menu_scroll, titleModelMenuMaxScroll(state));
 }
 
-fn handleNewChatMenuKeyDown(state: *runtime.AppState, key: sdl.Keycode, kind: NewChatMenuKind) bool {
+fn handleNewChatMenuKeyDown(state: *runtime.AppState, key: palette.event.Keycode, kind: NewChatMenuKind) bool {
     const count = newChatMenuCount(state, kind);
     if (count == 0) return false;
     const selected = switch (kind) {
@@ -4822,15 +4822,14 @@ pub fn applyPhoneAction(state: *runtime.AppState, action: usize) void {
             phone.opened = true;
         },
         1 => {
-            const raw = sdl.getClipboardText() catch {
+            const text = (host.getClipboardText(state.allocator) catch null) orelse {
                 phone.notice = "Could not read the clipboard.";
                 state.markDirty();
                 return;
             };
-            const text = std.mem.span(raw);
             defer {
-                std.crypto.secureZero(u8, @constCast(text));
-                sdl.free(@ptrCast(raw));
+                std.crypto.secureZero(u8, text);
+                state.allocator.free(text);
             }
             phone.setHost(text) catch {
                 phone.notice = "Paste an HTTPS host URL without credentials, a path, query, or fragment.";

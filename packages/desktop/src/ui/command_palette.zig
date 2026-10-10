@@ -10,7 +10,6 @@
 
 const std = @import("std");
 const palette = @import("palette");
-const sdl = @import("zsdl3");
 const theme = @import("theme.zig");
 const fuzzy_match = @import("fuzzy_match.zig");
 const runtime = @import("runtime.zig");
@@ -370,9 +369,9 @@ pub fn handleWheel(state: *runtime.AppState, width: f32, height: f32, x: f32, y:
 /// Palette-owned keys: navigation, activation, scope toggle, dismissal.
 /// Returns false for keys the shared modal text-editing path should handle
 /// (cursor movement, clipboard, backspace, character input).
-pub fn handleKeyDown(state: *runtime.AppState, event: *const sdl.KeyboardEvent) bool {
+pub fn handleKeyDown(state: *runtime.AppState, event: *const palette.event.KeyEvent) bool {
     if (!state.command_controller.open) return false;
-    const primary = (keymodBits(event.mod) & (sdl.Keymod.ctrl | sdl.Keymod.gui)) != 0;
+    const primary = event.mod.primary();
     switch (event.key) {
         .escape => {
             if (state.command_controller.action_menu_open) {
@@ -2447,10 +2446,6 @@ fn rectContainsPoint(rect: palette.Rect, x: f32, y: f32) bool {
 
 fn paletteColor(value: [4]f32) palette.Color {
     return .{ .r = value[0], .g = value[1], .b = value[2], .a = value[3] };
-}
-
-fn keymodBits(modifier_state: sdl.Keymod) u16 {
-    return @as(*const u16, @ptrCast(&modifier_state)).*;
 }
 
 fn queueRect(state: *runtime.AppState, rect: palette.Rect, color: palette.Color) void {

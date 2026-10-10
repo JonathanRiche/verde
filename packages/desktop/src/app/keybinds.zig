@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const sdl = @import("zsdl3");
+const palette = @import("palette");
 const shared_config = @import("config.zig");
 
 const log = std.log.scoped(.native_keybinds);
@@ -159,7 +159,7 @@ pub const Keybind = struct {
     meta: bool = false,
     primary: bool = false,
     shift: bool = false,
-    key: sdl.Keycode,
+    key: palette.event.Keycode,
 
     fn eql(self: Keybind, other: Keybind) bool {
         return self.alt == other.alt and
@@ -170,7 +170,7 @@ pub const Keybind = struct {
             self.key == other.key;
     }
 
-    fn matches(self: Keybind, event: *const sdl.KeyboardEvent) bool {
+    fn matches(self: Keybind, event: *const palette.event.KeyEvent) bool {
         if (!event.down or event.repeat or event.key != self.key) {
             return false;
         }
@@ -178,11 +178,11 @@ pub const Keybind = struct {
         return self.matchesWithRepeatPolicy(event, false);
     }
 
-    fn matchesAllowRepeat(self: Keybind, event: *const sdl.KeyboardEvent) bool {
+    fn matchesAllowRepeat(self: Keybind, event: *const palette.event.KeyEvent) bool {
         return self.matchesWithRepeatPolicy(event, true);
     }
 
-    fn matchesWithRepeatPolicy(self: Keybind, event: *const sdl.KeyboardEvent, allow_repeat: bool) bool {
+    fn matchesWithRepeatPolicy(self: Keybind, event: *const palette.event.KeyEvent, allow_repeat: bool) bool {
         if (!event.down or event.key != self.key) {
             return false;
         }
@@ -194,27 +194,27 @@ pub const Keybind = struct {
         const expected_ctrl = self.ctrl or (self.primary and !primary_uses_meta);
         const expected_meta = self.meta or (self.primary and primary_uses_meta);
 
-        return expected_ctrl == hasModifier(event.mod, sdl.Keymod.ctrl) and
-            expected_meta == hasModifier(event.mod, sdl.Keymod.gui) and
-            self.alt == hasModifier(event.mod, sdl.Keymod.alt) and
-            self.shift == hasModifier(event.mod, sdl.Keymod.shift);
+        return expected_ctrl == event.mod.ctrl and
+            expected_meta == event.mod.super and
+            self.alt == event.mod.alt and
+            self.shift == event.mod.shift;
     }
 };
 
 /// Matches the conventional page reload chord reserved for focused browser panes.
-pub fn isBrowserReloadEvent(event: *const sdl.KeyboardEvent) bool {
+pub fn isBrowserReloadEvent(event: *const palette.event.KeyEvent) bool {
     const binding: Keybind = .{ .primary = true, .key = .r };
     return binding.matches(event);
 }
 
 /// Matches the conventional new-tab chord reserved for focused browser panes.
-pub fn isBrowserNewTabEvent(event: *const sdl.KeyboardEvent) bool {
+pub fn isBrowserNewTabEvent(event: *const palette.event.KeyEvent) bool {
     const binding: Keybind = .{ .primary = true, .key = .t };
     return binding.matches(event);
 }
 
 /// Matches the conventional close-tab chord reserved for focused browser panes.
-pub fn isBrowserCloseTabEvent(event: *const sdl.KeyboardEvent) bool {
+pub fn isBrowserCloseTabEvent(event: *const palette.event.KeyEvent) bool {
     const binding: Keybind = .{ .primary = true, .key = .w };
     return binding.matches(event);
 }
@@ -434,7 +434,7 @@ pub const NativeKeyboardConfig = struct {
         self.prefix.deinit(self.allocator);
     }
 
-    pub fn actionForEvent(self: *const NativeKeyboardConfig, event: *const sdl.KeyboardEvent) ?NativeKeyboardAction {
+    pub fn actionForEvent(self: *const NativeKeyboardConfig, event: *const palette.event.KeyEvent) ?NativeKeyboardAction {
         if (matchesAny(self.refresh, event)) {
             return .refresh;
         }
@@ -566,47 +566,47 @@ pub const NativeKeyboardConfig = struct {
     }
 
     /// True when prefix mode is enabled and this key-down is the arming chord.
-    pub fn isPrefixKeyEvent(self: *const NativeKeyboardConfig, event: *const sdl.KeyboardEvent) bool {
+    pub fn isPrefixKeyEvent(self: *const NativeKeyboardConfig, event: *const palette.event.KeyEvent) bool {
         return self.prefix.enabled and matchesAny(self.prefix.keys, event);
     }
 
     /// Resolves the keypress that follows an armed prefix chord.
-    pub fn prefixTargetForEvent(self: *const NativeKeyboardConfig, event: *const sdl.KeyboardEvent) ?PrefixTarget {
+    pub fn prefixTargetForEvent(self: *const NativeKeyboardConfig, event: *const palette.event.KeyEvent) ?PrefixTarget {
         return targetInTable(self.prefix.bindings.items, event);
     }
 
     /// Resolves a keypress while navigate mode is active. Repeats are allowed
     /// so holding an arrow walks workspaces like herdr.
-    pub fn navigateTargetForEvent(self: *const NativeKeyboardConfig, event: *const sdl.KeyboardEvent) ?PrefixTarget {
+    pub fn navigateTargetForEvent(self: *const NativeKeyboardConfig, event: *const palette.event.KeyEvent) ?PrefixTarget {
         for (self.prefix.navigate.items) |binding| {
             if (binding.key.matchesAllowRepeat(event)) return binding.target;
         }
         return null;
     }
 
-    fn targetInTable(table: []const PrefixBinding, event: *const sdl.KeyboardEvent) ?PrefixTarget {
+    fn targetInTable(table: []const PrefixBinding, event: *const palette.event.KeyEvent) ?PrefixTarget {
         for (table) |binding| {
             if (binding.key.matches(event)) return binding.target;
         }
         return null;
     }
 
-    pub fn workspaceFocusPromptForEvent(self: *const NativeKeyboardConfig, event: *const sdl.KeyboardEvent) bool {
+    pub fn workspaceFocusPromptForEvent(self: *const NativeKeyboardConfig, event: *const palette.event.KeyEvent) bool {
         return matchesAny(self.workspace_focus_prompt, event);
     }
 
-    pub fn chatActionForEvent(self: *const NativeKeyboardConfig, event: *const sdl.KeyboardEvent) ?NativeChatAction {
+    pub fn chatActionForEvent(self: *const NativeKeyboardConfig, event: *const palette.event.KeyEvent) ?NativeChatAction {
         if (matchesAny(self.chat_model_picker, event)) return .model_picker;
         if (matchesAny(self.chat_run_config, event)) return .run_config;
         if (matchesAny(self.chat_directory_picker, event)) return .directory_picker;
         return null;
     }
 
-    pub fn workspaceShowAllForEvent(self: *const NativeKeyboardConfig, event: *const sdl.KeyboardEvent) bool {
+    pub fn workspaceShowAllForEvent(self: *const NativeKeyboardConfig, event: *const palette.event.KeyEvent) bool {
         return matchesAny(self.workspace_show_all, event);
     }
 
-    pub fn workspaceSelectIndexForEvent(self: *const NativeKeyboardConfig, event: *const sdl.KeyboardEvent) ?usize {
+    pub fn workspaceSelectIndexForEvent(self: *const NativeKeyboardConfig, event: *const palette.event.KeyEvent) ?usize {
         for (self.workspace_select, 0..) |binding, index| {
             if (binding.matches(event)) {
                 return index;
@@ -615,7 +615,7 @@ pub const NativeKeyboardConfig = struct {
         return null;
     }
 
-    pub fn workspacePaneSelectIndexForEvent(self: *const NativeKeyboardConfig, event: *const sdl.KeyboardEvent) ?usize {
+    pub fn workspacePaneSelectIndexForEvent(self: *const NativeKeyboardConfig, event: *const palette.event.KeyEvent) ?usize {
         for (self.workspace_pane_select, 0..) |binding, index| {
             if (binding.matches(event)) {
                 return index;
@@ -624,14 +624,14 @@ pub const NativeKeyboardConfig = struct {
         return null;
     }
 
-    pub fn workspaceActiveSelectIndexForEvent(self: *const NativeKeyboardConfig, event: *const sdl.KeyboardEvent) ?usize {
+    pub fn workspaceActiveSelectIndexForEvent(self: *const NativeKeyboardConfig, event: *const palette.event.KeyEvent) ?usize {
         for (self.workspace_active_select, 0..) |binding, index| {
             if (binding.matches(event)) return index;
         }
         return null;
     }
 
-    pub fn transcriptScrollActionForEvent(self: *const NativeKeyboardConfig, event: *const sdl.KeyboardEvent) ?NativeKeyboardAction {
+    pub fn transcriptScrollActionForEvent(self: *const NativeKeyboardConfig, event: *const palette.event.KeyEvent) ?NativeKeyboardAction {
         if (matchesAnyAllowRepeat(self.chat_up, event)) {
             return .chat_up;
         }
@@ -648,7 +648,7 @@ pub const NativeKeyboardConfig = struct {
         return null;
     }
 
-    pub fn terminalActionForEvent(self: *const NativeKeyboardConfig, event: *const sdl.KeyboardEvent) ?NativeTerminalAction {
+    pub fn terminalActionForEvent(self: *const NativeKeyboardConfig, event: *const palette.event.KeyEvent) ?NativeTerminalAction {
         if (matchesAny(self.terminal_new_tab, event)) {
             return .new_tab;
         }
@@ -2208,7 +2208,7 @@ pub fn formatKeybind(buf: []u8, binding: Keybind) []const u8 {
     return buf[0..count];
 }
 
-fn keycodeLabel(key: sdl.Keycode) []const u8 {
+fn keycodeLabel(key: palette.event.Keycode) []const u8 {
     return switch (key) {
         .@"return" => "Enter",
         .left => "Left",
@@ -2243,7 +2243,7 @@ fn parseDefaultAccelerator(binding: []const u8) !Keybind {
     return parseAccelerator(binding) orelse error.InvalidDefaultKeybind;
 }
 
-fn matchesAny(bindings: []const Keybind, event: *const sdl.KeyboardEvent) bool {
+fn matchesAny(bindings: []const Keybind, event: *const palette.event.KeyEvent) bool {
     for (bindings) |binding| {
         if (binding.matches(event)) {
             return true;
@@ -2253,7 +2253,7 @@ fn matchesAny(bindings: []const Keybind, event: *const sdl.KeyboardEvent) bool {
     return false;
 }
 
-fn matchesAnyAllowRepeat(bindings: []const Keybind, event: *const sdl.KeyboardEvent) bool {
+fn matchesAnyAllowRepeat(bindings: []const Keybind, event: *const palette.event.KeyEvent) bool {
     for (bindings) |binding| {
         if (binding.matchesAllowRepeat(event)) {
             return true;
@@ -2271,11 +2271,6 @@ fn containsKeybind(bindings: []const Keybind, needle: Keybind) bool {
     }
 
     return false;
-}
-
-fn hasModifier(modifier_state: sdl.Keymod, modifier_mask: u16) bool {
-    const state_bits = @as(*const u16, @ptrCast(&modifier_state)).*;
-    return (state_bits & modifier_mask) != 0;
 }
 
 fn parseAccelerator(binding: []const u8) ?Keybind {
@@ -2335,7 +2330,7 @@ fn parseModifier(token: []const u8, binding: *Keybind) bool {
     return false;
 }
 
-fn parseKeycode(token: []const u8) ?sdl.Keycode {
+fn parseKeycode(token: []const u8) ?palette.event.Keycode {
     if (token.len == 1) {
         return switch (std.ascii.toLower(token[0])) {
             'a' => .a,
@@ -2457,20 +2452,20 @@ fn parseKeycode(token: []const u8) ?sdl.Keycode {
     return null;
 }
 
-/// Primary modifier bits for synthesized key events, mirroring Keybind's
+/// Primary modifier for synthesized key events, mirroring Keybind's
 /// platform mapping (Cmd on macOS, Ctrl elsewhere).
-fn primaryModBits() u16 {
-    return if (builtin.os.tag == .macos) sdl.Keymod.gui else sdl.Keymod.ctrl;
+fn primaryMods() palette.event.Mods {
+    return if (builtin.os.tag == .macos) .{ .super = true } else .{ .ctrl = true };
 }
 
-fn testKeyEvent(key: sdl.Keycode, mod_bits: u16) sdl.KeyboardEvent {
-    var event: sdl.KeyboardEvent = undefined;
-    @memset(std.mem.asBytes(&event), 0);
-    event.type = .key_down;
-    event.down = true;
-    event.key = key;
-    @as(*u16, @ptrCast(&event.mod)).* = mod_bits;
-    return event;
+fn withShift(mods: palette.event.Mods) palette.event.Mods {
+    var shifted = mods;
+    shifted.shift = true;
+    return shifted;
+}
+
+fn testKeyEvent(key: palette.event.Keycode, mods: palette.event.Mods) palette.event.KeyEvent {
+    return .{ .key = key, .mod = mods, .down = true };
 }
 
 test "browser reload reserves plain primary+R while app refresh stays on Shift+R" {
@@ -2478,7 +2473,7 @@ test "browser reload reserves plain primary+R while app refresh stays on Shift+R
     const defaults = try cloneDefaultKeybinds(allocator);
     defer allocator.free(defaults);
 
-    const reload_event = testKeyEvent(.r, primaryModBits());
+    const reload_event = testKeyEvent(.r, primaryMods());
     try std.testing.expect(isBrowserReloadEvent(&reload_event));
 
     // No default app-refresh binding claims the bare chord, so Ctrl+R
@@ -2498,7 +2493,7 @@ test "browser reload reserves plain primary+R while app refresh stays on Shift+R
     try std.testing.expect(saw_f5);
 
     // The shifted chord stays an app refresh and never a tab reload.
-    const refresh_event = testKeyEvent(.r, primaryModBits() | sdl.Keymod.shift);
+    const refresh_event = testKeyEvent(.r, withShift(primaryMods()));
     try std.testing.expect(!isBrowserReloadEvent(&refresh_event));
     var refresh_matched = false;
     for (defaults) |binding| {
@@ -2506,7 +2501,7 @@ test "browser reload reserves plain primary+R while app refresh stays on Shift+R
     }
     try std.testing.expect(refresh_matched);
 
-    var repeat_event = testKeyEvent(.r, primaryModBits());
+    var repeat_event = testKeyEvent(.r, primaryMods());
     repeat_event.repeat = true;
     try std.testing.expect(!isBrowserReloadEvent(&repeat_event));
 }
@@ -2533,7 +2528,7 @@ test "array parsing deduplicates repeated bindings" {
     config.applyOverrides(parsed.value);
 
     try std.testing.expectEqual(@as(usize, 1), config.refresh.len);
-    try std.testing.expectEqual(sdl.Keycode.f5, config.refresh[0].key);
+    try std.testing.expectEqual(palette.event.Keycode.f5, config.refresh[0].key);
 }
 
 test "single accelerator overrides land on their own action" {
@@ -2631,22 +2626,22 @@ test "scrolling workspace keybinds are configurable" {
         try std.testing.expect(bindings[0].alt);
         try std.testing.expect(!bindings[0].ctrl);
     }
-    try std.testing.expectEqual(sdl.Keycode.h, config.workspace_focus_left[0].key);
-    try std.testing.expectEqual(sdl.Keycode.l, config.workspace_focus_right[0].key);
-    try std.testing.expectEqual(sdl.Keycode.k, config.workspace_focus_up[0].key);
-    try std.testing.expectEqual(sdl.Keycode.j, config.workspace_focus_down[0].key);
+    try std.testing.expectEqual(palette.event.Keycode.h, config.workspace_focus_left[0].key);
+    try std.testing.expectEqual(palette.event.Keycode.l, config.workspace_focus_right[0].key);
+    try std.testing.expectEqual(palette.event.Keycode.k, config.workspace_focus_up[0].key);
+    try std.testing.expectEqual(palette.event.Keycode.j, config.workspace_focus_down[0].key);
     try std.testing.expect(config.workspace_move_left[0].shift);
-    try std.testing.expectEqual(sdl.Keycode.h, config.workspace_move_left[0].key);
-    try std.testing.expectEqual(sdl.Keycode.l, config.workspace_move_right[0].key);
-    try std.testing.expectEqual(sdl.Keycode.k, config.workspace_move_up[0].key);
-    try std.testing.expectEqual(sdl.Keycode.j, config.workspace_move_down[0].key);
-    try std.testing.expectEqual(sdl.Keycode.p, config.workspace_pane_previous[0].key);
-    try std.testing.expectEqual(sdl.Keycode.n, config.workspace_pane_next[0].key);
+    try std.testing.expectEqual(palette.event.Keycode.h, config.workspace_move_left[0].key);
+    try std.testing.expectEqual(palette.event.Keycode.l, config.workspace_move_right[0].key);
+    try std.testing.expectEqual(palette.event.Keycode.k, config.workspace_move_up[0].key);
+    try std.testing.expectEqual(palette.event.Keycode.j, config.workspace_move_down[0].key);
+    try std.testing.expectEqual(palette.event.Keycode.p, config.workspace_pane_previous[0].key);
+    try std.testing.expectEqual(palette.event.Keycode.n, config.workspace_pane_next[0].key);
     try std.testing.expectEqual(@as(usize, 2), config.workspace_pane_select.len);
     try std.testing.expect(config.workspace_pane_select[0].alt);
     try std.testing.expect(!config.workspace_pane_select[0].ctrl);
-    try std.testing.expectEqual(sdl.Keycode.@"1", config.workspace_pane_select[0].key);
-    try std.testing.expectEqual(sdl.Keycode.@"2", config.workspace_pane_select[1].key);
+    try std.testing.expectEqual(palette.event.Keycode.@"1", config.workspace_pane_select[0].key);
+    try std.testing.expectEqual(palette.event.Keycode.@"2", config.workspace_pane_select[1].key);
 }
 
 test "GUI chat composer keybinds are configurable and disableable" {
@@ -2667,12 +2662,12 @@ test "GUI chat composer keybinds are configurable and disableable" {
     try std.testing.expectEqual(@as(usize, 1), config.chat_model_picker.len);
     try std.testing.expect(config.chat_model_picker[0].ctrl);
     try std.testing.expect(config.chat_model_picker[0].shift);
-    try std.testing.expectEqual(sdl.Keycode.m, config.chat_model_picker[0].key);
+    try std.testing.expectEqual(palette.event.Keycode.m, config.chat_model_picker[0].key);
     try std.testing.expectEqual(@as(usize, 0), config.chat_run_config.len);
     try std.testing.expectEqual(@as(usize, 1), config.chat_directory_picker.len);
     try std.testing.expect(config.chat_directory_picker[0].ctrl);
     try std.testing.expect(config.chat_directory_picker[0].shift);
-    try std.testing.expectEqual(sdl.Keycode.d, config.chat_directory_picker[0].key);
+    try std.testing.expectEqual(palette.event.Keycode.d, config.chat_directory_picker[0].key);
 }
 
 test "terminal nested keybind overrides accept workspace actions" {
@@ -2693,22 +2688,22 @@ test "terminal nested keybind overrides accept workspace actions" {
 
     try std.testing.expectEqual(@as(usize, 1), config.toggle_terminal.len);
     try std.testing.expect(config.toggle_terminal[0].alt);
-    try std.testing.expectEqual(sdl.Keycode.j, config.toggle_terminal[0].key);
+    try std.testing.expectEqual(palette.event.Keycode.j, config.toggle_terminal[0].key);
 
     try std.testing.expectEqual(@as(usize, 1), config.terminal_new_tab.len);
     try std.testing.expect(config.terminal_new_tab[0].ctrl);
     try std.testing.expect(config.terminal_new_tab[0].alt);
-    try std.testing.expectEqual(sdl.Keycode.t, config.terminal_new_tab[0].key);
+    try std.testing.expectEqual(palette.event.Keycode.t, config.terminal_new_tab[0].key);
 
     try std.testing.expectEqual(@as(usize, 1), config.terminal_split_right.len);
     try std.testing.expect(config.terminal_split_right[0].ctrl);
     try std.testing.expect(config.terminal_split_right[0].alt);
-    try std.testing.expectEqual(sdl.Keycode.l, config.terminal_split_right[0].key);
+    try std.testing.expectEqual(palette.event.Keycode.l, config.terminal_split_right[0].key);
 
     try std.testing.expectEqual(@as(usize, 1), config.terminal_focus_right.len);
     try std.testing.expect(config.terminal_focus_right[0].alt);
     try std.testing.expect(config.terminal_focus_right[0].shift);
-    try std.testing.expectEqual(sdl.Keycode.l, config.terminal_focus_right[0].key);
+    try std.testing.expectEqual(palette.event.Keycode.l, config.terminal_focus_right[0].key);
 }
 
 test "legacy terminal keybind override still maps to terminal toggle" {
@@ -2725,7 +2720,7 @@ test "legacy terminal keybind override still maps to terminal toggle" {
     try std.testing.expectEqual(@as(usize, 1), config.toggle_terminal.len);
     try std.testing.expect(config.toggle_terminal[0].ctrl);
     try std.testing.expect(config.toggle_terminal[0].alt);
-    try std.testing.expectEqual(sdl.Keycode.j, config.toggle_terminal[0].key);
+    try std.testing.expectEqual(palette.event.Keycode.j, config.toggle_terminal[0].key);
 }
 
 test "default prefix table covers every app terminal and chat action" {
@@ -2799,7 +2794,7 @@ test "prefix shorthand bool and string overrides" {
     config.applyOverrides(rekeyed.value);
     try std.testing.expect(config.prefix.enabled);
     try std.testing.expectEqual(@as(usize, 1), config.prefix.keys.len);
-    try std.testing.expectEqual(sdl.Keycode.a, config.prefix.keys[0].key);
+    try std.testing.expectEqual(palette.event.Keycode.a, config.prefix.keys[0].key);
 }
 
 test "prefix object override changes key and merges bindings" {
@@ -2825,7 +2820,7 @@ test "prefix object override changes key and merges bindings" {
 
     try std.testing.expect(config.prefix.enabled);
     try std.testing.expectEqual(@as(usize, 2), config.prefix.keys.len);
-    try std.testing.expectEqual(sdl.Keycode.space, config.prefix.keys[0].key);
+    try std.testing.expectEqual(palette.event.Keycode.space, config.prefix.keys[0].key);
     // x replaced, z removed, g added, Shift+3 replaced, bogus ignored.
     try std.testing.expectEqual(default_count, config.prefix.bindings.items.len);
 
@@ -2876,10 +2871,10 @@ test "prefix action names resolve positional ordinals" {
 }
 
 test "punctuation accelerators parse and format" {
-    try std.testing.expectEqual(sdl.Keycode.grave, parseAccelerator("`").?.key);
-    try std.testing.expectEqual(sdl.Keycode.backslash, parseAccelerator("Shift+Backslash").?.key);
-    try std.testing.expectEqual(sdl.Keycode.leftbracket, parseAccelerator("[").?.key);
-    try std.testing.expectEqual(sdl.Keycode.comma, parseAccelerator("Comma").?.key);
+    try std.testing.expectEqual(palette.event.Keycode.grave, parseAccelerator("`").?.key);
+    try std.testing.expectEqual(palette.event.Keycode.backslash, parseAccelerator("Shift+Backslash").?.key);
+    try std.testing.expectEqual(palette.event.Keycode.leftbracket, parseAccelerator("[").?.key);
+    try std.testing.expectEqual(palette.event.Keycode.comma, parseAccelerator("Comma").?.key);
     var buf: [32]u8 = undefined;
     try std.testing.expectEqualStrings("Shift+[", formatKeybind(&buf, .{ .shift = true, .key = .leftbracket }));
 }

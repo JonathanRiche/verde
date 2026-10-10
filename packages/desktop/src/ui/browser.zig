@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const palette = @import("palette");
-const sdl = @import("zsdl3");
+const host = @import("host.zig");
 
 const app_state = @import("../state.zig");
 const browser_history_controller = @import("../state/browser_history_controller.zig");
@@ -554,7 +554,7 @@ pub fn handlePaletteTextInput(state: *app_state.AppState, text: []const u8) bool
     return true;
 }
 
-pub fn handlePaletteKeyDown(state: *app_state.AppState, event: *const sdl.KeyboardEvent) bool {
+pub fn handlePaletteKeyDown(state: *app_state.AppState, event: *const palette.event.KeyEvent) bool {
     if (state.browser_controller.context_menu_open) return handleBrowserContextMenuKeyDown(state, event);
     if (!state.browser_controller.address_focused) return false;
     if (!event.down) return true;
@@ -598,7 +598,7 @@ pub fn handlePaletteKeyDown(state: *app_state.AppState, event: *const sdl.Keyboa
         },
         .home => moveAddressCursor(state, 0, shift),
         .end => moveAddressCursor(state, address_len, shift),
-        .backspace, .kp_backspace => {
+        .backspace => {
             if (!deleteAddressSelection(state)) deleteAddressBackward(state);
             browser_history_controller.refreshBrowserSuggestions(state);
         },
@@ -634,7 +634,7 @@ pub fn handlePaletteKeyDown(state: *app_state.AppState, event: *const sdl.Keyboa
     return true;
 }
 
-fn handleBrowserContextMenuKeyDown(state: *app_state.AppState, event: *const sdl.KeyboardEvent) bool {
+fn handleBrowserContextMenuKeyDown(state: *app_state.AppState, event: *const palette.event.KeyEvent) bool {
     if (!event.down) return true;
     switch (event.key) {
         .escape => state.dismissBrowserContextMenu(),
@@ -773,7 +773,7 @@ fn copyAddressSelection(state: *app_state.AppState) void {
     if (slice.len == 0) return;
     const z = state.allocator.dupeZ(u8, slice) catch return;
     defer state.allocator.free(z);
-    sdl.setClipboardText(z) catch |err| {
+    host.setClipboardText(z) catch |err| {
         app_state.log.warn("failed to copy URL bar selection: {s}", .{@errorName(err)});
     };
 }
@@ -782,7 +782,7 @@ fn copyCurrentUrl(state: *app_state.AppState) void {
     const url = state.browserState().current_url orelse return;
     const value = state.allocator.dupeZ(u8, url) catch return;
     defer state.allocator.free(value);
-    sdl.setClipboardText(value) catch |err| {
+    host.setClipboardText(value) catch |err| {
         app_state.log.warn("failed to copy current browser URL: {s}", .{@errorName(err)});
     };
 }
@@ -805,9 +805,8 @@ fn pasteIntoAddress(state: *app_state.AppState) void {
     insertAddressText(state, sanitized[0..n]);
 }
 
-fn isShiftPressed(modifier_state: sdl.Keymod) bool {
-    const bits = @as(*const u16, @ptrCast(&modifier_state)).*;
-    return (bits & sdl.Keymod.shift) != 0;
+fn isShiftPressed(modifier_state: palette.event.Mods) bool {
+    return modifier_state.shift;
 }
 
 fn paletteColor(value: [4]f32) palette.Color {
@@ -2040,9 +2039,8 @@ fn deleteAddressForward(state: *app_state.AppState) void {
     state.browser_controller.address_cursor = cursor;
 }
 
-fn isPrimaryModifierPressed(modifier_state: sdl.Keymod) bool {
-    const bits = @as(*const u16, @ptrCast(&modifier_state)).*;
-    return (bits & (sdl.Keymod.ctrl | sdl.Keymod.gui)) != 0;
+fn isPrimaryModifierPressed(modifier_state: palette.event.Mods) bool {
+    return modifier_state.primary();
 }
 
 /// Renders the in-app browser pane canvas or the current scaffold placeholder.

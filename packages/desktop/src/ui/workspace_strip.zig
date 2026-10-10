@@ -4,7 +4,6 @@
 //! the sidebar rail.
 
 const std = @import("std");
-const sdl = @import("zsdl3");
 const palette = @import("palette");
 const app_config = @import("../app/config.zig");
 const keybinds = @import("../app/keybinds.zig");
@@ -433,7 +432,7 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
     state.markDirty();
 }
 
-pub fn systemCursorAt(x: f32, y: f32) ?sdl.SystemCursor {
+pub fn systemCursorAt(x: f32, y: f32) ?palette.platform.CursorShape {
     if (hitSlotAt(x, y) != null) return .pointer;
     return null;
 }
@@ -679,7 +678,7 @@ test "workspace strip hits resolve tabs and the add-tab button" {
     const plus_hit = hitAt(plus.x + plus.w * 0.5, plus.y + plus.h * 0.5) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(HitKind.add_tab, plus_hit.kind);
     try std.testing.expectEqual(@as(?usize, null), hitSlotAt(plus.x + plus.w + 10.0, plus.y));
-    try std.testing.expectEqual(@as(?sdl.SystemCursor, .pointer), systemCursorAt(plus.x + 1.0, plus.y + 1.0));
+    try std.testing.expectEqual(@as(?palette.platform.CursorShape, .pointer), systemCursorAt(plus.x + 1.0, plus.y + 1.0));
 
     // Clicks outside the strip fall through to pane handlers.
     try std.testing.expect(!handlePaletteMouseButton(&state, 10.0, STRIP_HEIGHT_UI + 50.0, true));

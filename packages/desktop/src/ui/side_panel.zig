@@ -13,7 +13,7 @@
 //! panel keyboard focus until another surface takes it.
 
 const std = @import("std");
-const sdl = @import("zsdl3");
+const host = @import("host.zig");
 const palette = @import("palette");
 const runtime = @import("runtime.zig");
 const theme = @import("theme.zig");
@@ -28,8 +28,6 @@ const workspace_layout = @import("../state/workspace_layout.zig");
 
 const SidePanelView = workspace_layout.SidePanelView;
 const WorkspacePaneId = workspace_layout.WorkspacePaneId;
-
-extern fn SDL_GetModState() sdl.Keymod;
 
 const HEADER_H_UI: f32 = 36.0;
 const HEADER_PAD_X_UI: f32 = 10.0;
@@ -518,7 +516,7 @@ pub fn handleWheel(state: *runtime.AppState, x: f32, y: f32, wheel_y: f32) bool 
 
 /// Keys while the panel body owns the keyboard. Escape hands focus back;
 /// the close-pane shortcut closes the panel instead of the focused pane.
-pub fn handleKeyDown(state: *runtime.AppState, event: *const sdl.KeyboardEvent, action: ?keybinds.NativeKeyboardAction) bool {
+pub fn handleKeyDown(state: *runtime.AppState, event: *const palette.event.KeyEvent, action: ?keybinds.NativeKeyboardAction) bool {
     if (!bodyHasKeyboard(state)) return false;
     const view = body_view orelse return false;
     const handled = switch (view) {
@@ -573,7 +571,7 @@ pub fn isResizing() bool {
     return resizing;
 }
 
-pub fn systemCursorAt(state: *runtime.AppState, x: f32, y: f32) ?sdl.SystemCursor {
+pub fn systemCursorAt(state: *runtime.AppState, x: f32, y: f32) ?palette.platform.CursorShape {
     const rect = panel_rect orelse return null;
     if (resizing or rectContains(grip_rect, x, y)) return .ew_resize;
     if (hitAt(x, y) != null) return .pointer;
@@ -661,9 +659,7 @@ fn rectContains(rect: palette.Rect, x: f32, y: f32) bool {
 }
 
 fn isShiftDown() bool {
-    const modifiers = SDL_GetModState();
-    const bits = @as(*const u16, @ptrCast(&modifiers)).*;
-    return (bits & sdl.Keymod.shift) != 0;
+    return host.modState().shift;
 }
 
 fn intersect(a: palette.Rect, b: palette.Rect) palette.Rect {

@@ -2,7 +2,6 @@
 
 const std = @import("std");
 const palette = @import("palette");
-const sdl = @import("zsdl3");
 const theme = @import("theme.zig");
 const colors = @import("colors.zig");
 const context_menu = @import("context_menu.zig");
@@ -329,9 +328,9 @@ pub fn wantsPointerAt(state: *const runtime.AppState, x: f32, y: f32) bool {
 }
 
 /// Captured pane-row drags keep a move/grab cursor until mouse release, even
-/// after the pointer leaves the sidebar. SDL's system cursor set exposes
+/// after the pointer leaves the sidebar. The platform cursor set exposes
 /// `move` as the platform-native grab equivalent.
-pub fn systemCursorAt(x: f32, y: f32) ?sdl.SystemCursor {
+pub fn systemCursorAt(x: f32, y: f32) ?palette.platform.CursorShape {
     _ = x;
     _ = y;
     if (pane_row_drag.pending or pane_row_drag.active) return .move;
@@ -453,7 +452,7 @@ pub fn handlePaletteWheel(x: f32, y: f32, wheel_y: f32) bool {
     return true;
 }
 
-/// SDL mouse button id for right-click (`SDL_BUTTON_RIGHT`).
+/// Platform mouse button id for right-click (`MouseButton.right`).
 pub const palette_mouse_button_secondary: u8 = 3;
 
 pub fn handlePaletteSecondaryMouseButton(state: *runtime.AppState, x: f32, y: f32, down: bool) bool {
@@ -523,9 +522,9 @@ pub fn hasActiveThreadDrag() bool {
     return pane_row_drag.pending or pane_row_drag.active;
 }
 
-pub fn finishThreadDragIfMouseReleased(state: *runtime.AppState, x: f32, y: f32, buttons: sdl.MouseButtonFlags) bool {
+pub fn finishThreadDragIfMouseReleased(state: *runtime.AppState, x: f32, y: f32, buttons: palette.event.ButtonState) bool {
     if (pane_row_drag.pending or pane_row_drag.active) {
-        if (buttons.left != 0) return false;
+        if (buttons.left) return false;
         return finishPaneRowDrag(state, x, y);
     }
     return false;
@@ -637,7 +636,6 @@ fn startPaneRowDrag(state: *runtime.AppState, project_index: usize, pane_id: nat
         .x = x,
         .y = y,
     };
-    _ = sdl.captureMouse(true);
     state.markDirty();
 }
 
@@ -646,7 +644,6 @@ fn finishPaneRowDrag(state: *runtime.AppState, x: f32, y: f32) bool {
     _ = y;
     const drag = pane_row_drag;
     pane_row_drag = .{};
-    _ = sdl.captureMouse(false);
     const move_target = pane_drop_target_project;
     pane_drop_target_project = null;
 

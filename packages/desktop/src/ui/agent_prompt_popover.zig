@@ -25,7 +25,6 @@
 //! - `systemCursorAt` picks the pointer over the card.
 
 const std = @import("std");
-const sdl = @import("zsdl3");
 const palette = @import("palette");
 const runtime = @import("runtime.zig");
 const theme = @import("theme.zig");
@@ -449,12 +448,12 @@ fn caretX() f32 {
 // Input
 // ------------------------------------------------------------------
 
-pub fn handleKeyDown(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+pub fn handleKeyDown(state: *AppState, event: *const palette.event.KeyEvent) bool {
     if (!is_open) return false;
     if (!event.down) return true;
-    const mod = text_edit.modBits(event.mod);
-    const shift = (mod & sdl.Keymod.shift) != 0;
-    const primary = (mod & (sdl.Keymod.ctrl | sdl.Keymod.gui)) != 0;
+    const mod = event.mod;
+    const shift = mod.shift;
+    const primary = mod.primary();
     switch (event.key) {
         .escape => {
             close(state);
@@ -572,7 +571,7 @@ pub fn handleWheel(state: *AppState, x: f32, y: f32, wheel_y: f32) bool {
     return true;
 }
 
-pub fn systemCursorAt(x: f32, y: f32) ?sdl.SystemCursor {
+pub fn systemCursorAt(x: f32, y: f32) ?palette.platform.CursorShape {
     if (!is_open) return null;
     return switch (hitAt(x, y)) {
         .close, .cancel, .send => .pointer,

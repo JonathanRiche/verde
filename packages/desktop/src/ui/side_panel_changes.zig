@@ -23,7 +23,6 @@
 //! for those lines; Escape or a click on empty space clears it.
 
 const std = @import("std");
-const sdl = @import("zsdl3");
 const palette = @import("palette");
 
 const runtime = @import("runtime.zig");
@@ -957,9 +956,9 @@ fn scrollBy(state: *AppState, delta: f32) void {
     state.markDirty();
 }
 
-pub fn handleKey(state: *AppState, event: *const sdl.KeyboardEvent) bool {
-    const mods = keymodBits(event.mod);
-    const primary = (mods & (sdl.Keymod.ctrl | sdl.Keymod.gui)) != 0;
+pub fn handleKey(state: *AppState, event: *const palette.event.KeyEvent) bool {
+    const mods = event.mod;
+    const primary = mods.primary();
     switch (event.key) {
         .escape => {
             if (selection == null) return false;
@@ -978,7 +977,7 @@ pub fn handleKey(state: *AppState, event: *const sdl.KeyboardEvent) bool {
             return true;
         },
         .r => {
-            if (primary or mods & sdl.Keymod.alt != 0) return false;
+            if (primary or mods.alt) return false;
             state.refreshWorkspaceChangesNow();
             return true;
         },
@@ -1004,7 +1003,7 @@ pub fn wantsTextInput(state: *AppState) bool {
     return false;
 }
 
-pub fn systemCursorAt(state: *AppState, x: f32, y: f32) ?sdl.SystemCursor {
+pub fn systemCursorAt(state: *AppState, x: f32, y: f32) ?palette.platform.CursorShape {
     _ = state;
     if (hitAt(x, y) != null) return .pointer;
     if (diffRowAt(x, y)) |hit| {
@@ -1057,10 +1056,6 @@ fn pointIn(rect: palette.Rect) bool {
 
 fn rectContains(rect: palette.Rect, x: f32, y: f32) bool {
     return x >= rect.x and y >= rect.y and x <= rect.x + rect.w and y <= rect.y + rect.h;
-}
-
-fn keymodBits(modifier_state: sdl.Keymod) u16 {
-    return @as(*const u16, @ptrCast(&modifier_state)).*;
 }
 
 fn paletteColor(value: [4]f32) palette.Color {

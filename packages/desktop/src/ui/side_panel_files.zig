@@ -28,7 +28,6 @@
 //! results; Escape clears, then leaves the field.
 
 const std = @import("std");
-const sdl = @import("zsdl3");
 const palette = @import("palette");
 const runtime = @import("runtime.zig");
 const theme = @import("theme.zig");
@@ -612,11 +611,11 @@ pub fn handleWheel(state: *AppState, x: f32, y: f32, wheel_y: f32) bool {
     return true;
 }
 
-pub fn handleKey(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+pub fn handleKey(state: *AppState, event: *const palette.event.KeyEvent) bool {
     if (!event.down) return false;
     const explorer = currentExplorer(state) orelse return false;
-    const mod = text_edit.modBits(event.mod);
-    const primary = (mod & (sdl.Keymod.ctrl | sdl.Keymod.gui)) != 0;
+    const mod = event.mod;
+    const primary = mod.primary();
     if (filter_focused) return handleFilterKey(state, explorer, event);
     if (primary and event.key == .f) {
         filter_focused = true;
@@ -671,7 +670,7 @@ fn moveSelection(explorer: *Explorer, roots: []const file_explorer.Root, start: 
     }
 }
 
-fn handleFilterKey(state: *AppState, explorer: *Explorer, event: *const sdl.KeyboardEvent) bool {
+fn handleFilterKey(state: *AppState, explorer: *Explorer, event: *const palette.event.KeyEvent) bool {
     switch (event.key) {
         .down, .@"return", .kp_enter => {
             // Into the results: select (Enter also opens) the first match.
@@ -701,8 +700,8 @@ fn handleFilterKey(state: *AppState, explorer: *Explorer, event: *const sdl.Keyb
         .unhandled => {
             // Printable keys arrive as text input; swallow them here so app
             // shortcuts on plain letters don't fire while typing.
-            const mod = text_edit.modBits(event.mod);
-            return (mod & (sdl.Keymod.ctrl | sdl.Keymod.gui | sdl.Keymod.alt)) == 0;
+            const mod = event.mod;
+            return !(mod.primary() or mod.alt);
         },
         .changed => state.fileExplorerSetQuery(filter.value()),
         .moved, .submit, .cancel => {},
@@ -729,7 +728,7 @@ pub fn wantsTextInput(state: *AppState) bool {
     return true;
 }
 
-pub fn systemCursorAt(state: *AppState, x: f32, y: f32) ?sdl.SystemCursor {
+pub fn systemCursorAt(state: *AppState, x: f32, y: f32) ?palette.platform.CursorShape {
     if (contains(refresh_rect, x, y)) return .pointer;
     if (clear_rect) |rect| if (contains(rect, x, y)) return .pointer;
     if (contains(filter_rect, x, y)) return .text;

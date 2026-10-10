@@ -29,7 +29,7 @@
 //!   (and harmless after) `main.zig` routes the popover directly.
 
 const std = @import("std");
-const sdl = @import("zsdl3");
+const host = @import("host.zig");
 const palette = @import("palette");
 const runtime = @import("runtime.zig");
 const theme = @import("theme.zig");
@@ -755,7 +755,7 @@ fn activate(state: *runtime.AppState, pane_id: WorkspacePaneId, action: Action) 
     state.markDirty();
 }
 
-pub fn systemCursorAt(x: f32, y: f32) ?sdl.SystemCursor {
+pub fn systemCursorAt(x: f32, y: f32) ?palette.platform.CursorShape {
     if (drag != null) return .pointer;
     const geometry = geometryAt(x, y) orelse return null;
     if (geometry.buttonAt(x, y) != null) return .pointer;
@@ -763,7 +763,7 @@ pub fn systemCursorAt(x: f32, y: f32) ?sdl.SystemCursor {
     return null;
 }
 
-pub fn handleKeyDown(state: *runtime.AppState, event: *const sdl.KeyboardEvent) bool {
+pub fn handleKeyDown(state: *runtime.AppState, event: *const palette.event.KeyEvent) bool {
     // Fallback routing for the ask-agent popover (main.zig routes it first
     // once hooked; then it is closed or has already consumed the key).
     if (agent_prompt_popover.isOpen()) return agent_prompt_popover.handleKeyDown(state, event);
@@ -778,7 +778,7 @@ pub fn handleKeyDown(state: *runtime.AppState, event: *const sdl.KeyboardEvent) 
 
 /// Navigation, selection and copy keys for one drawn file pane. The side
 /// panel calls this for its docked file while its body has the keyboard.
-pub fn handlePaneKeyDown(state: *runtime.AppState, pane_id: WorkspacePaneId, event: *const sdl.KeyboardEvent) bool {
+pub fn handlePaneKeyDown(state: *runtime.AppState, pane_id: WorkspacePaneId, event: *const palette.event.KeyEvent) bool {
     if (!event.down) return false;
     const geometry = geometryFor(pane_id) orelse return false;
     const doc = state.fileViewerDocument(pane_id) orelse return false;
@@ -850,7 +850,7 @@ fn firstVisibleLine(geometry: *const PaneGeometry) u32 {
 fn copyToClipboard(state: *runtime.AppState, text: []const u8) void {
     const terminated = state.allocator.dupeZ(u8, text) catch return;
     defer state.allocator.free(terminated);
-    sdl.setClipboardText(terminated) catch {
+    host.setClipboardText(terminated) catch {
         state.setSidebarNotice("Could not copy the selected lines.");
         return;
     };
@@ -900,14 +900,12 @@ fn isBlank(text: []const u8) bool {
     return true;
 }
 
-fn isPrimaryModifierPressed(modifier_state: sdl.Keymod) bool {
-    const bits = @as(*const u16, @ptrCast(&modifier_state)).*;
-    return (bits & (sdl.Keymod.ctrl | sdl.Keymod.gui)) != 0;
+fn isPrimaryModifierPressed(modifier_state: palette.event.Mods) bool {
+    return modifier_state.primary();
 }
 
-fn isShiftPressed(modifier_state: sdl.Keymod) bool {
-    const bits = @as(*const u16, @ptrCast(&modifier_state)).*;
-    return (bits & sdl.Keymod.shift) != 0;
+fn isShiftPressed(modifier_state: palette.event.Mods) bool {
+    return modifier_state.shift;
 }
 
 fn contains(rect: palette.Rect, x: f32, y: f32) bool {

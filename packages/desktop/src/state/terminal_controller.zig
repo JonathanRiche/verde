@@ -1,7 +1,7 @@
 //! Terminal ownership, focus, input routing, polling, and agent-TUI metadata.
 
 const std = @import("std");
-const sdl = @import("zsdl3");
+const palette = @import("palette");
 const profiler = @import("../runtime/profiler.zig");
 const keybinds = @import("../app/keybinds.zig");
 const platform_runtime = @import("platform_runtime");
@@ -199,7 +199,7 @@ pub const State = struct {
     debug_focus_requested: bool = false,
     debug_last_key_handled: bool = false,
     debug_last_text_handled: bool = false,
-    debug_last_scancode: ?sdl.Scancode = null,
+    debug_last_scancode: ?palette.keyboard.Scancode = null,
     debug_last_text: [32:0]u8 = [_:0]u8{0} ** 32,
     debug_workspace_visible_pane_count: usize = 0,
     last_activity_ms: i64 = 0,
@@ -839,7 +839,7 @@ pub fn drainTerminalDockNotifications(self: anytype, project_index: usize, dock_
 pub fn handleTerminalKeyDown(
     self: anytype,
     keyboard: *const keybinds.NativeKeyboardConfig,
-    event: *const sdl.KeyboardEvent,
+    event: *const palette.event.KeyEvent,
 ) bool {
     if (!canRouteTerminalInput(self)) return false;
     const dock_id = terminalInputDockId(self) orelse return false;
@@ -873,11 +873,11 @@ fn completeInterruptedClaudeTurn(
     self: anytype,
     dock_id: u32,
     provider: ?AgentTuiProvider,
-    event: *const sdl.KeyboardEvent,
+    event: *const palette.event.KeyEvent,
     handled: bool,
 ) void {
     const is_escape_press = event.down and !event.repeat and
-        (event.key == .escape or event.scancode == .escape);
+        (event.key == .escape or event.hidScancode() == .escape);
     if (!isHandledClaudeEscape(provider, handled, is_escape_press)) return;
     const project_index = self.project_controller.selected_index;
     const dock = self.projectTerminalDock(project_index, dock_id) orelse return;
@@ -924,11 +924,11 @@ pub fn handleTerminalAction(self: anytype, action: keybinds.NativeTerminalAction
     return true;
 }
 
-pub fn handleTerminalTextInput(self: anytype, text: [*c]const u8) bool {
+pub fn handleTerminalTextInput(self: anytype, text: []const u8) bool {
     if (!canRouteTerminalInput(self)) return false;
     const dock_id = terminalInputDockId(self) orelse return false;
     var dock = self.currentProjectTerminalDockMutable(dock_id) orelse return false;
-    const handled = dock.handleTextInput(std.mem.sliceTo(text, 0));
+    const handled = dock.handleTextInput(text);
     if (handled) self.noteTerminalInputActivity();
     return handled;
 }
