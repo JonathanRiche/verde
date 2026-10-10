@@ -23,7 +23,6 @@ pub const RuntimeMode = enum {
 /// Describes how browser pixels/input are presented inside the Palette-owned pane.
 pub const PresentationKind = enum {
     native_child_view,
-    native_wayland_surface,
     helper_window,
     snapshot_texture,
     offscreen_texture,
@@ -40,12 +39,6 @@ pub const PaneBounds = struct {
     width: u32 = 1,
     height: u32 = 1,
     scale: f32 = 1.0,
-};
-
-/// Native Wayland handles exported by SDL for app-owned child surfaces.
-pub const LinuxWaylandHost = extern struct {
-    display: ?*anyopaque = null,
-    surface: ?*anyopaque = null,
 };
 
 /// Tracks the host-side lifecycle of the native browser runtime.

@@ -21,16 +21,6 @@ const IPC_LINE_BUFFER_BYTES = 256 * 1024;
 extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern fn unsetenv(name: [*:0]const u8) c_int;
 
-const RawWaylandSubsurface = opaque {};
-const WAYLAND_SUBSURFACE_PROBE_MESSAGE =
-    "Wayland subsurface probe is attached, but WPE WebKit content is not embedded in it yet.";
-
-extern fn verde_wayland_subsurface_create(display: ?*anyopaque, parent_surface: ?*anyopaque) ?*RawWaylandSubsurface;
-extern fn verde_wayland_subsurface_destroy(handle: ?*RawWaylandSubsurface) void;
-extern fn verde_wayland_subsurface_set_bounds(handle: ?*RawWaylandSubsurface, x: i32, y: i32, width: u32, height: u32) c_int;
-extern fn verde_wayland_subsurface_show(handle: ?*RawWaylandSubsurface) c_int;
-extern fn verde_wayland_subsurface_hide(handle: ?*RawWaylandSubsurface) void;
-
 fn monotonicTimestampNs() i128 {
     var ts: std.c.timespec = undefined;
     if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
@@ -62,11 +52,6 @@ pub fn configuredPresentationKind() browser_types.PresentationKind {
 
 pub fn configuredSupportsInspector() bool {
     return true;
-}
-
-fn waylandSubsurfaceEnabled() bool {
-    const value = std.c.getenv("VERDE_BROWSER_LINUX_SUBSURFACE") orelse return false;
-    return std.mem.eql(u8, std.mem.span(value), "1");
 }
 
 const Mutex = struct {
@@ -510,55 +495,6 @@ const SharedFrame = struct {
     }
 };
 
-const WaylandSubsurface = struct {
-    handle: ?*RawWaylandSubsurface = null,
-    display: ?*anyopaque = null,
-    parent_surface: ?*anyopaque = null,
-    x: i32 = 0,
-    y: i32 = 0,
-    width: u32 = 0,
-    height: u32 = 0,
-    visible: bool = false,
-
-    fn attach(self: *WaylandSubsurface, host: *const browser_types.LinuxWaylandHost) !void {
-        const display = host.display orelse return error.WaylandHostUnavailable;
-        const parent_surface = host.surface orelse return error.WaylandHostUnavailable;
-        if (self.handle != null and self.display == display and self.parent_surface == parent_surface) {
-            return;
-        }
-        self.deinit();
-        self.handle = verde_wayland_subsurface_create(display, parent_surface) orelse return error.WaylandSurfaceUnavailable;
-        self.display = display;
-        self.parent_surface = parent_surface;
-    }
-
-    fn setBounds(self: *WaylandSubsurface, x: i32, y: i32, width: u32, height: u32) !void {
-        self.x = x;
-        self.y = y;
-        self.width = @max(width, 1);
-        self.height = @max(height, 1);
-        if (self.handle == null) return;
-        if (verde_wayland_subsurface_set_bounds(self.handle, x, y, self.width, self.height) != 0) return error.WaylandBufferUnavailable;
-    }
-
-    fn show(self: *WaylandSubsurface) !void {
-        self.visible = true;
-        if (self.handle == null) return;
-        if (verde_wayland_subsurface_show(self.handle) != 0) return error.WaylandBufferUnavailable;
-    }
-
-    fn hide(self: *WaylandSubsurface) void {
-        self.visible = false;
-        verde_wayland_subsurface_hide(self.handle);
-    }
-
-    fn deinit(self: *WaylandSubsurface) void {
-        self.hide();
-        verde_wayland_subsurface_destroy(self.handle);
-        self.* = .{};
-    }
-};
-
 /// Owns the Linux browser helper process and translates its stdout into browser events plus pane frames.
 /// Mirrors VERDE_BROWSER_LINUX_HIDDEN_PAINT_GRACE_MS (15 s) in linux_wpe.c,
 /// with a margin so a capture near the boundary still wakes the page.
@@ -589,7 +525,6 @@ pub const Controller = struct {
     paint_ack_token: u64 = 0,
     host_window: u64 = 0,
     current_url: ?[]u8 = null,
-    wayland_subsurface: WaylandSubsurface = .{},
     next_input_serial: u64 = 0,
 
     /// Creates the helper-backed Linux browser controller.
@@ -608,9 +543,7 @@ pub const Controller = struct {
             .frame = frame,
         };
         errdefer controller.frame_buffer.deinit(allocator);
-        if (!waylandSubsurfaceEnabled()) {
-            try controller.spawnHelper();
-        }
+        try controller.spawnHelper();
         return controller;
     }
 
@@ -630,7 +563,6 @@ pub const Controller = struct {
             self.reader_thread = null;
         }
         if (self.current_url) |url| self.allocator.free(url);
-        self.wayland_subsurface.deinit();
         self.frame_buffer.deinit(self.allocator);
         self.queue.deinit(self.allocator);
         self.frame.deinit(self.allocator);
@@ -648,7 +580,7 @@ pub const Controller = struct {
     }
 
     pub fn isRuntimeInitialized(self: *const Controller) bool {
-        return self.child_pid != null or (waylandSubsurfaceEnabled() and self.wayland_subsurface.handle != null);
+        return self.child_pid != null;
     }
 
     pub fn runtimeMode(self: *const Controller) browser_types.RuntimeMode {
@@ -667,7 +599,7 @@ pub const Controller = struct {
     }
 
     pub fn paneSessionId(self: *const Controller) ?browser_types.SessionId {
-        if (self.child_pid == null and !(waylandSubsurfaceEnabled() and self.wayland_subsurface.handle != null)) return null;
+        if (self.child_pid == null) return null;
         return 1;
     }
 
@@ -676,27 +608,16 @@ pub const Controller = struct {
         return null;
     }
 
-    /// Stores the SDL host window handle and initializes the app-owned Wayland subsurface when requested.
+    /// Forwards the host window handle to the helper (diagnostics only on Linux).
     pub fn setHostWindow(self: *Controller, handle: ?*anyopaque) !void {
         self.host_window = if (handle) |value| @intFromPtr(value) else 0;
-        if (waylandSubsurfaceEnabled()) {
-            const host_ptr = handle orelse return error.WaylandHostUnavailable;
-            const host: *const browser_types.LinuxWaylandHost = @ptrCast(@alignCast(host_ptr));
-            try self.wayland_subsurface.attach(host);
-            try self.wayland_subsurface.setBounds(
-                self.pane_screen_x,
-                self.pane_screen_y,
-                self.pane_width,
-                self.pane_height,
-            );
-        }
         try self.sendCommand(.{
             .kind = .set_host_window,
             .host_window = self.host_window,
         });
     }
 
-    /// Reports whether Linux is using Wayland native presentation, the diagnostic helper window, or snapshot fallback.
+    /// Linux always presents helper frames as an offscreen texture.
     pub fn presentationKind(self: *const Controller) browser_types.PresentationKind {
         _ = self;
         return configuredPresentationKind();
@@ -704,12 +625,6 @@ pub const Controller = struct {
 
     /// Requests that the Linux browser helper warm the offscreen browser surface.
     pub fn show(self: *Controller) !void {
-        if (waylandSubsurfaceEnabled()) {
-            try self.wayland_subsurface.show();
-            try self.queue.push(self.allocator, .opened);
-            try self.queue.push(self.allocator, .{ .failed = try self.allocator.dupe(u8, WAYLAND_SUBSURFACE_PROBE_MESSAGE) });
-            return;
-        }
         self.hidden_since_ns = null;
         try self.sendCommand(.{
             .kind = .show,
@@ -723,11 +638,6 @@ pub const Controller = struct {
 
     /// Requests that the Linux browser helper pause its surface updates.
     pub fn hide(self: *Controller) !void {
-        if (waylandSubsurfaceEnabled()) {
-            self.wayland_subsurface.hide();
-            try self.queue.push(self.allocator, .closed);
-            return;
-        }
         try self.sendCommand(.{ .kind = .hide });
         if (self.hidden_since_ns == null) self.hidden_since_ns = monotonicTimestampNsU64();
     }
@@ -755,15 +665,6 @@ pub const Controller = struct {
         self.pane_screen_x = bounds.screen_x;
         self.pane_screen_y = bounds.screen_y;
         self.pane_scale = @max(bounds.scale, 0.05);
-        if (waylandSubsurfaceEnabled()) {
-            try self.wayland_subsurface.setBounds(
-                self.pane_screen_x,
-                self.pane_screen_y,
-                self.pane_width,
-                self.pane_height,
-            );
-            return;
-        }
         try self.sendCommand(.{
             .kind = .set_bounds,
             .screen_x = self.pane_screen_x,
@@ -777,10 +678,6 @@ pub const Controller = struct {
     /// Navigates the Linux browser helper to the requested URL.
     pub fn navigate(self: *Controller, url: []const u8) !void {
         try self.setCurrentUrl(url);
-        if (waylandSubsurfaceEnabled()) {
-            try self.queue.push(self.allocator, .{ .failed = try self.allocator.dupe(u8, WAYLAND_SUBSURFACE_PROBE_MESSAGE) });
-            return;
-        }
         try self.sendCommand(.{
             .kind = .navigate,
             .width = self.pane_width,
@@ -794,29 +691,21 @@ pub const Controller = struct {
 
     /// Evaluates JavaScript inside the Linux browser helper.
     pub fn eval(self: *Controller, js: []const u8) !void {
-        if (waylandSubsurfaceEnabled()) {
-            return;
-        }
         try self.sendCommand(.{ .kind = .eval, .payload = js });
     }
 
     /// Sends a host-originated JSON payload into the Linux browser helper.
     pub fn postJson(self: *Controller, json: []const u8) !void {
-        if (waylandSubsurfaceEnabled()) {
-            return;
-        }
         try self.sendCommand(.{ .kind = .post_json, .payload = json });
     }
 
     /// Navigates backward through the helper using WPE WebKit history.
     pub fn goBack(self: *Controller) !void {
-        if (waylandSubsurfaceEnabled()) return;
         try self.sendCommand(.{ .kind = .go_back });
     }
 
     /// Navigates forward through the helper using WPE WebKit history.
     pub fn goForward(self: *Controller) !void {
-        if (waylandSubsurfaceEnabled()) return;
         try self.sendCommand(.{ .kind = .go_forward });
     }
 
@@ -829,19 +718,16 @@ pub const Controller = struct {
 
     /// Reloads the helper page using WPE WebKit navigation.
     pub fn reload(self: *Controller) !void {
-        if (waylandSubsurfaceEnabled()) return;
         try self.sendCommand(.{ .kind = .reload });
     }
 
     /// Gives the visible helper's WebKit view native focus when that presentation is active.
     pub fn focus(self: *Controller) !void {
-        if (waylandSubsurfaceEnabled()) return;
         try self.sendCommand(.{ .kind = .focus });
     }
 
     /// Clears native focus from the visible helper when that presentation is active.
     pub fn blur(self: *Controller) !void {
-        if (waylandSubsurfaceEnabled()) return;
         try self.sendCommand(.{ .kind = .blur });
     }
 
@@ -946,9 +832,6 @@ pub const Controller = struct {
 
     /// Uploads the latest helper snapshot into the pane texture, if a new frame is ready.
     pub fn uploadFrame(self: *Controller, texture: *browser_texture.PaneTexture) !bool {
-        if (waylandSubsurfaceEnabled()) {
-            return false;
-        }
         try self.flushFrameReleases();
         const uploaded = try self.frame.uploadIntoTexture(self.allocator, &self.frame_buffer, texture);
         try self.flushFrameReleases();
@@ -961,7 +844,7 @@ pub const Controller = struct {
     }
 
     /// Returns a caller-owned copy of the most recent helper frame, or null when
-    /// no frame has been produced yet (e.g. subsurface mode, browser not shown).
+    /// no frame has been produced yet (e.g. browser not shown).
     pub fn copyFramePixels(self: *Controller, allocator: std.mem.Allocator) !?browser_texture.CopiedFrame {
         try self.refreshPausedFrame();
         var frame_width: u32 = 0;
@@ -1423,9 +1306,6 @@ fn execHelperChild(
     // downsamples, causing visibly soft text on scale-1 outputs.
     _ = setenv("GDK_SCALE", "1", 1);
     _ = unsetenv("GDK_DPI_SCALE");
-    if (waylandSubsurfaceEnabled()) {
-        _ = setenv("VERDE_BROWSER_LINUX_SHOW_HELPER", "0", 1);
-    }
     if (frame_fds != null) {
         _ = setenv("VERDE_BROWSER_LINUX_FRAME0_FD", "240", 1);
         _ = setenv("VERDE_BROWSER_LINUX_FRAME1_FD", "241", 1);

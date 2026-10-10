@@ -1,7 +1,8 @@
 //! Browser runtime ownership and deferred-launch controller state.
 
 const std = @import("std");
-const sdl = @import("zsdl3");
+const palette = @import("palette");
+const host = @import("../ui/host.zig");
 const app_config = @import("../app/config.zig");
 const browser_inspector = @import("../browser/inspector.zig");
 const browser_runtime = @import("../browser/mod.zig");
@@ -604,7 +605,7 @@ pub fn applyInitialWorkspaceFocusOnLaunch(self: anytype) void {
 /// tab's side-panel browser shows (address bar focused) or hides.
 pub fn toggleBrowser(self: anytype) void {
     if (!self.browser_textures_enabled) {
-        self.setSidebarNotice("Browser is disabled for the SDL_GPU non-image renderer experiment.");
+        self.setSidebarNotice("Browser is disabled because GPU textures are unavailable.");
         return;
     }
 
@@ -673,7 +674,7 @@ fn openBrowserInWorkspaceWithDirtyPolicy(
     mark_dirty: bool,
 ) !BrowserOpenResult {
     if (!self.browser_textures_enabled) {
-        self.setSidebarNotice("Browser is disabled for the SDL_GPU non-image renderer experiment.");
+        self.setSidebarNotice("Browser is disabled because GPU textures are unavailable.");
         return error.BrowserDisabled;
     }
     if (project_index >= self.project_controller.projects.items.len) return error.WorkspaceNotFound;
@@ -1187,7 +1188,7 @@ pub fn closeBrowser(self: anytype) void {
     self.markDirty();
 }
 
-/// Temporarily hides the native browser surface while the host SDL window is hidden/minimized.
+/// Temporarily hides the native browser surface while the host window is hidden/minimized.
 pub fn suspendBrowserForHostWindowHidden(self: anytype) void {
     if (!self.isBrowserRuntimeActive()) return;
     self.unfocusBrowserPane();
@@ -1210,7 +1211,7 @@ fn browserSurfaceSuspended(self: anytype) bool {
         self.browser_controller.surface_suspended_for_empty_state;
 }
 
-/// Restores a visible browser dock after the host SDL window is shown/restored.
+/// Restores a visible browser dock after the host window is shown/restored.
 pub fn resumeBrowserAfterHostWindowShown(self: anytype) void {
     if (!self.isBrowserRuntimeActive()) return;
     const runtime_project_index = self.browser_controller.runtime_project_index orelse return;
@@ -1497,7 +1498,7 @@ pub fn browserPanelWidth(self: anytype, available_width: f32) f32 {
     return theme.clampf(available_width * 0.5, theme.scaledUi(320.0), available_width * 0.62);
 }
 
-/// Records the latest browser pane bounds plus the helper input size so SDL events can be remapped correctly.
+/// Records the latest browser pane bounds plus the helper input size so platform events can be remapped correctly.
 pub fn noteBrowserPaneRegion(self: anytype, min: [2]f32, max: [2]f32, input_size: [2]f32, hovered: bool) void {
     self.browser_controller.pane_min = min;
     self.browser_controller.pane_max = max;
@@ -1511,7 +1512,7 @@ pub fn noteBrowserPaneRegion(self: anytype, min: [2]f32, max: [2]f32, input_size
 /// Keeps native child surfaces behind Palette while the useful browser empty state is rendered.
 pub fn noteBrowserEmptyStateRendered(self: anytype, is_empty: bool) void {
     const uses_native_surface = switch (self.browser_controller.runtime.controller.presentationKind()) {
-        .native_child_view, .native_wayland_surface, .helper_window => true,
+        .native_child_view, .helper_window => true,
         .snapshot_texture, .offscreen_texture, .stub => false,
     };
     const should_suspend = is_empty and uses_native_surface;
@@ -1599,7 +1600,7 @@ pub fn syncBrowserPaneBoundsToBackend(self: anytype) void {
     const presentation = self.browser_controller.runtime.controller.presentationKind();
     const runtime = self.browser_controller.runtime.controller.runtimeKind();
     const uses_native_surface = switch (presentation) {
-        .native_child_view, .native_wayland_surface, .helper_window => true,
+        .native_child_view, .helper_window => true,
         .snapshot_texture, .offscreen_texture, .stub => false,
     };
     const uses_scaled_wpe_texture = runtime == .native_webview and presentation == .offscreen_texture;
@@ -1607,14 +1608,8 @@ pub fn syncBrowserPaneBoundsToBackend(self: anytype) void {
     const size_scale = if (uses_scaled_wpe_texture) self.browserPaneDeviceScale() else scale;
     const pane_x: i32 = @intFromFloat(@round(self.browser_controller.pane_min[0] / scale));
     const pane_y: i32 = @intFromFloat(@round(self.browser_controller.pane_min[1] / scale));
-    const x = if (presentation == .native_wayland_surface)
-        pane_x
-    else
-        self.browser_controller.app_window_screen_origin[0] + pane_x;
-    const y = if (presentation == .native_wayland_surface)
-        pane_y
-    else
-        self.browser_controller.app_window_screen_origin[1] + pane_y;
+    const x = self.browser_controller.app_window_screen_origin[0] + pane_x;
+    const y = self.browser_controller.app_window_screen_origin[1] + pane_y;
     const width: u32 = @intFromFloat(@max(@round(pane_width / size_scale), 1.0));
     const height: u32 = @intFromFloat(@max(@round(pane_height / size_scale), 1.0));
     self.browser_controller.runtime.controller.setPaneBounds(.{
@@ -1810,11 +1805,11 @@ pub fn isNativeBrowserSurfaceFocused(self: anytype) bool {
 }
 
 /// Reports whether the browser pane is backed by a platform view that receives
-/// keyboard input directly from the OS rather than through SDL forwarding.
+/// keyboard input directly from the OS rather than through Verde forwarding.
 pub fn browserPaneUsesNativeKeyboardSurface(self: anytype) bool {
     if (!self.isBrowserVisible()) return false;
     return switch (self.browser_controller.runtime.controller.presentationKind()) {
-        .native_child_view, .native_wayland_surface, .helper_window => true,
+        .native_child_view, .helper_window => true,
         .snapshot_texture, .offscreen_texture, .stub => false,
     };
 }
@@ -1836,7 +1831,7 @@ pub fn browserCursorShapeAtPoint(self: anytype, x: f32, y: f32) ?browser_runtime
     if (!self.browserPaneContains(x, y)) return null;
     return switch (self.browser_controller.runtime.controller.presentationKind()) {
         .snapshot_texture, .offscreen_texture => self.browser_controller.cursor_shape,
-        .native_child_view, .native_wayland_surface, .helper_window, .stub => null,
+        .native_child_view, .helper_window, .stub => null,
     };
 }
 
@@ -1895,7 +1890,7 @@ pub fn handleBrowserMouse(self: anytype, event: browser_runtime.MouseEvent) bool
     if (handled) return true;
 
     return contains_pointer and is_pointer_event and switch (self.browser_controller.runtime.controller.presentationKind()) {
-        .native_child_view, .native_wayland_surface => true,
+        .native_child_view => true,
         .helper_window, .snapshot_texture, .offscreen_texture, .stub => false,
     };
 }
@@ -2594,10 +2589,10 @@ pub fn isLoopbackAuthority(authority: []const u8) bool {
         return remainder.len == 0 or remainder[0] == ':';
     }
     const host_end = std.mem.indexOfScalar(u8, authority, ':') orelse authority.len;
-    const host = authority[0..host_end];
-    return std.mem.eql(u8, host, "localhost") or
-        std.mem.eql(u8, host, "127.0.0.1") or
-        std.mem.eql(u8, host, "0.0.0.0");
+    const host_name = authority[0..host_end];
+    return std.mem.eql(u8, host_name, "localhost") or
+        std.mem.eql(u8, host_name, "127.0.0.1") or
+        std.mem.eql(u8, host_name, "0.0.0.0");
 }
 
 // Adds an https scheme for bare hostnames so the browser control surface accepts normal typed URLs.
@@ -3741,7 +3736,7 @@ pub fn copyBrowserEvalResultToClipboard(self: anytype, result: []const u8) void 
         return;
     };
     defer self.allocator.free(z);
-    sdl.setClipboardText(z) catch |err| {
+    host.setClipboardText(z) catch |err| {
         log.warn("failed to set browser selection clipboard text: {s}", .{@errorName(err)});
         return;
     };
