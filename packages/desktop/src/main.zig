@@ -3596,7 +3596,7 @@ test "startup frame is submitted before the durable projection load" {
 test "runtime service attaches after AppState reaches stable storage" {
     const source = @embedFile("main.zig");
     const app_state_load = std.mem.indexOf(u8, source, "var state = try AppState.init").?;
-    const runtime_attach = std.mem.indexOf(u8, source, "state.attachRuntimeService(init.io)").?;
+    const runtime_attach = std.mem.indexOf(u8, source, "attachRuntimeService(&state, allocator, init.io)").?;
     const defaults_load = std.mem.indexOf(u8, source, "state.loadWorkspaceRuntimeDefaults()").?;
     try std.testing.expect(app_state_load < runtime_attach);
     try std.testing.expect(runtime_attach < defaults_load);

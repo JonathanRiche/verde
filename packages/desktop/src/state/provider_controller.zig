@@ -1521,14 +1521,43 @@ pub fn cursorModelOptionForRef(self: anytype, model_ref: ?[:0]const u8) ?ModelOp
     return null;
 }
 
+/// Exact match first; otherwise a context-window variant such as
+/// `opus[1m]` resolves to its base alias (`opus`). The live SDK model list
+/// omits the `[1m]` refs that orchestration children and the built-in
+/// default use, and without this fallback those chats lose their reasoning
+/// levels in the run pill and run-config popover.
 pub fn claudeModelOptionForRef(self: anytype, model_ref: ?[:0]const u8) ?ModelOption {
-    const ref = model_ref orelse DEFAULT_CLAUDE_MODEL;
-    for (self.claudeModelOptionsSnapshot()) |opt| {
+    const ref: []const u8 = model_ref orelse DEFAULT_CLAUDE_MODEL;
+    const options = self.claudeModelOptionsSnapshot();
+    if (findModelOptionByValue(options, ref)) |opt| return opt;
+    const base = claudeModelBaseRef(ref);
+    if (base.len == ref.len) return null;
+    return findModelOptionByValue(options, base);
+}
+
+/// `ref` without a trailing `[...]` variant suffix (`opus[1m]` -> `opus`).
+pub fn claudeModelBaseRef(ref: []const u8) []const u8 {
+    if (ref.len == 0 or ref[ref.len - 1] != ']') return ref;
+    const open = std.mem.lastIndexOfScalar(u8, ref, '[') orelse return ref;
+    if (open == 0) return ref;
+    return ref[0..open];
+}
+
+fn findModelOptionByValue(options: []const ModelOption, ref: []const u8) ?ModelOption {
+    for (options) |opt| {
         if (opt.value) |v| {
             if (std.mem.eql(u8, ref, v)) return opt;
         }
     }
     return null;
+}
+
+test "claude model base ref strips context-window suffix" {
+    try std.testing.expectEqualStrings("opus", claudeModelBaseRef("opus[1m]"));
+    try std.testing.expectEqualStrings("fable", claudeModelBaseRef("fable[1m]"));
+    try std.testing.expectEqualStrings("default", claudeModelBaseRef("default"));
+    try std.testing.expectEqualStrings("[1m]", claudeModelBaseRef("[1m]"));
+    try std.testing.expectEqualStrings("", claudeModelBaseRef(""));
 }
 
 pub fn cursorModelParamsJsonAlloc(self: anytype, allocator: std.mem.Allocator, thread: *const ChatThread) !?[]u8 {

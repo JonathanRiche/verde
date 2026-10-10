@@ -87,6 +87,7 @@ pub fn mapPostError(err: anyerror) Error {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.AuthenticationRequired => error.AuthenticationRequired,
+        error.SessionAuthenticationRequired => error.SessionAuthenticationRequired,
         error.RateLimited => error.RateLimited,
         error.RequestTimedOut => error.RequestTimedOut,
         error.RedirectRejected,

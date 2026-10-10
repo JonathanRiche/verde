@@ -121,6 +121,7 @@ pub const FailureReason = enum {
     invalid_protocol_response,
     server_unavailable,
     authentication_required,
+    session_authentication_required,
     device_credential_revoked,
     identity_changed,
     workspace_binding_missing,
@@ -1410,9 +1411,12 @@ pub const Manager = struct {
         // device was revoked.
         if (kind == .mint_access_token and failure == .authentication) {
             entry.device_auth_rejected = true;
+        } else if (failure == .session_authentication) {
+            entry.device_auth_rejected = false;
         }
         const connection_failure: connection.FailureKind = switch (failure) {
             .authentication, .rate_limited => .authentication,
+            .session_authentication => .session_authentication,
             .network => .network,
             .identity => .identity,
             .protocol => .protocol,
@@ -1420,6 +1424,7 @@ pub const Manager = struct {
         };
         const override: Failure = switch (failure) {
             .authentication => if (kind == .pair_exchange) .pairing_rejected else .authentication,
+            .session_authentication => .authentication,
             .rate_limited => .rate_limited,
             .network => .network,
             .identity => .identity,
@@ -1952,6 +1957,7 @@ const AccessTaskKind = enum {
 
 const AccessFailure = enum {
     authentication,
+    session_authentication,
     rate_limited,
     network,
     identity,
@@ -2157,6 +2163,7 @@ fn mapAccessFailure(err: pair_client.Error) AccessFailure {
     return switch (err) {
         error.OutOfMemory => .resource,
         error.AuthenticationRequired => .authentication,
+        error.SessionAuthenticationRequired => .session_authentication,
         error.RateLimited => .rate_limited,
         error.NetworkUnavailable,
         error.RequestTimedOut,
@@ -2556,6 +2563,7 @@ fn mapTransportFailure(err: connection.TransportError) connection.FailureKind {
     return switch (err) {
         error.OutOfMemory => .resource,
         error.AuthenticationRequired => .authentication,
+        error.SessionAuthenticationRequired => .session_authentication,
         error.NetworkUnavailable,
         error.RequestTimedOut,
         error.ConnectionClosed,
@@ -2785,7 +2793,7 @@ fn snapshotEntry(entry: *const Entry) Snapshot {
 
 fn mapConnectionFailure(failure: connection.FailureKind) Failure {
     return switch (failure) {
-        .authentication => .authentication,
+        .authentication, .session_authentication => .authentication,
         .network => .network,
         .server_unavailable => .network,
         .identity => .identity,
@@ -2798,6 +2806,7 @@ fn mapConnectionFailure(failure: connection.FailureKind) Failure {
 fn mapConnectionFailureReason(failure: connection.FailureKind) FailureReason {
     return switch (failure) {
         .authentication => .authentication_required,
+        .session_authentication => .session_authentication_required,
         .network => .transport_offline,
         .server_unavailable => .server_unavailable,
         .identity => .identity_changed,
@@ -4302,4 +4311,24 @@ test "prepared Connect transport retains issuer through worker-owned cloning wit
     try std.testing.expectEqualStrings("https://connect.example", target.connect.control_plane_url);
     try std.testing.expect((@as(TransportTarget, .{ .loopback = 1234 })).httpsUrl() == null);
     try std.testing.expectEqualStrings("https://self.example", (@as(TransportTarget, .{ .direct_https = "https://self.example" })).httpsUrl().?);
+}
+
+test "session authentication during device mint preserves credential and requires sign in" {
+    var configured = try createPairedDirectTestProfile("Session authority");
+    defer configured.deinit(std.testing.allocator);
+    var manager = try Manager.init(std.testing.allocator, std.testing.io, &.{configured}, .{ .durable_credentials = false });
+    defer manager.deinit();
+    try manager.hydrateDeviceCredential(configured.id, TEST_DEVICE_CREDENTIAL);
+    const entry = manager.findEntry(configured.id).?;
+    const generation = try entry.connection_state.enable();
+    entry.device_auth_rejected = true;
+    try manager.failAccess(entry, generation, .mint_access_token, mapAccessFailure(error.SessionAuthenticationRequired), 1000);
+    const snapshot = manager.snapshot(configured.id).?;
+    try std.testing.expectEqual(FailureReason.session_authentication_required, snapshot.failure_reason.?);
+    try std.testing.expectEqual(connection.Phase.failed, snapshot.phase);
+    try std.testing.expect(snapshot.device_credential_held);
+    try std.testing.expect(!entry.device_auth_rejected);
+    try std.testing.expect(!snapshot.automatic_retry_scheduled);
+    try std.testing.expectEqual(connection.FailureKind.session_authentication, mapTransportFailure(error.SessionAuthenticationRequired));
+    try std.testing.expect(!manager.recoverStaleBearer(entry, .session_authentication));
 }

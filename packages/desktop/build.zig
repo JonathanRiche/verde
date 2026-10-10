@@ -11,6 +11,7 @@ pub fn build(b: *std.Build) void {
         @panic("version must start with an ASCII letter or digit and contain only letters, digits, dot, underscore, plus, and dash");
     }
     const version_z: [:0]const u8 = b.allocator.dupeSentinel(u8, version, 0) catch @panic("OOM");
+    const test_filters = testFilters(b);
     const ui_debug = b.option(bool, "ui-debug", "Show the desktop UI debug window") orelse false;
     const dev_trace = b.option(bool, "dev-trace", "Compile GUI flow-trace log lines (frame, RPC, paste, refresh breadcrumbs); dev builds only") orelse false;
     const palette_renderer = b.option(PaletteRendererBackend, "palette-renderer", "Palette frame renderer backend: sdl_gpu") orelse .sdl_gpu;
@@ -441,7 +442,7 @@ pub fn build(b: *std.Build) void {
             }
         } else |_| {}
     }
-    const dev_build_step = b.step("dev-build", "Build and install only the private desktop GUI executable");
+    const dev_build_step = b.step("dev-build", "Build and install the private desktop GUI executable and its browser helper");
     dev_build_step.dependOn(&install_gui.step);
     b.getInstallStep().dependOn(&install_gui.step);
     b.getInstallStep().dependOn(&install_cli.step);
@@ -466,6 +467,9 @@ pub fn build(b: *std.Build) void {
         browser_helper.root_module.linkSystemLibrary("glesv2", .{ .use_pkg_config = .force });
         browser_helper.root_module.linkSystemLibrary("javascriptcoregtk-6.0", .{ .use_pkg_config = .force });
         b.installArtifact(browser_helper);
+        // The GUI and helper speak one stdin/stdout protocol; a GUI-only
+        // dev-build beside a stale helper sends commands it cannot parse.
+        dev_build_step.dependOn(&b.addInstallArtifact(browser_helper, .{}).step);
     }
     const install_fff = b.addInstallBinFile(.{ .cwd_relative = fff_runtime_lib }, fff.fffRuntimeName(target.result.os.tag));
     if (build_fff) |build_step| install_fff.step.dependOn(&build_step.step);
@@ -558,6 +562,7 @@ pub fn build(b: *std.Build) void {
     // Headless package tests are hermetic (std only) and intentionally avoid
     // SDL/Palette/Ghostty/zqlite so they stay a fast focused gate for core.* work.
     const headless_tests = b.addTest(.{
+        .filters = test_filters,
         .root_module = b.createModule(.{
             .root_source_file = b.path("../headless/src/root.zig"),
             .target = target,
@@ -572,6 +577,7 @@ pub fn build(b: *std.Build) void {
     // Remote-runtime infrastructure has its own GUI-free gate so process,
     // transport, profile, and route tests do not depend on the SDL app graph.
     const runtime_tests = b.addTest(.{
+        .filters = test_filters,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/runtime_test_root.zig"),
             .target = target,
@@ -622,6 +628,7 @@ pub fn build(b: *std.Build) void {
         test_compile_step.dependOn(&linux_browser_helper_tests.step);
     }
     const exe_tests = b.addTest(.{
+        .filters = test_filters,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/desktop_test_root.zig"),
             .target = target,
@@ -1059,6 +1066,12 @@ test "build version accepts only resource-safe ASCII" {
     try std.testing.expect(isValidVersion("0.1.27-internal-20260710"));
     try std.testing.expect(!isValidVersion("0.1.27 internal"));
     try std.testing.expect(!isValidVersion("-preview"));
+}
+
+/// `-Dtest-filter=<substring>` (repeatable) compiles only matching tests, so a
+/// focused edit skips analysis and codegen for the rest of the suite.
+pub fn testFilters(b: *std.Build) []const []const u8 {
+    return b.option([]const []const u8, "test-filter", "Compile and run only tests whose name contains this substring (repeatable)") orelse &.{};
 }
 
 fn addTestArtifact(

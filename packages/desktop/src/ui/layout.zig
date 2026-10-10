@@ -2736,9 +2736,12 @@ fn runtimeWizardLayout(state: *const runtime.AppState, width: f32, height: f32) 
             layout.status_y = y;
             y += status_block_h;
             layout.inventory_y = y;
-            for (&layout.inventory) |*rect| {
+            // Advance only past drawn rows: the modal height counts visible
+            // rows, so reserving every slot pushed the notice (including the
+            // empty-inventory explanation) below the modal's clip.
+            for (&layout.inventory, 0..) |*rect, index| {
                 rect.* = .{ .x = x, .y = y, .w = content_w, .h = inventory_row_h };
-                y += inventory_row_h + gap;
+                if (index < inventory_rows) y += inventory_row_h + gap;
             }
             if (rc.connect_runtimes_truncated > 0) y += sub_h;
         },
@@ -2831,7 +2834,8 @@ fn connectSignedIn(phase: runtime_connections.ConnectPhase) bool {
 fn connectPrimaryEnabled(rc: *const runtime_connections.State) bool {
     return switch (rc.connect_phase) {
         .idle, .failed, .discovered => true,
-        .inventory_loaded => rc.connect_selected != null,
+        // An empty inventory offers Refresh rather than a dead button.
+        .inventory_loaded => rc.connect_runtimes.items.len == 0 or rc.connect_selected != null,
         .signed_in => true,
         .discovering, .signing_in, .loading_inventory, .bootstrapping, .bootstrap_ready => false,
     };
@@ -2844,8 +2848,9 @@ fn connectPrimaryLabel(rc: *const runtime_connections.State) []const u8 {
         .discovering => "Checking…",
         .discovered => "Sign in",
         .signing_in => "Waiting for browser…",
-        .signed_in, .loading_inventory => "Loading…",
-        .inventory_loaded => "Use selected runtime",
+        .signed_in => if (rc.connect_failure != null) "Retry" else "Load runtimes",
+        .loading_inventory => "Loading…",
+        .inventory_loaded => if (rc.connect_runtimes.items.len == 0) "Refresh" else "Use selected runtime",
         .bootstrapping => "Creating device…",
         .bootstrap_ready => "Finishing…",
     };
@@ -2965,12 +2970,16 @@ fn renderRuntimeWizardModal(state: *runtime.AppState, width: f32, height: f32) v
                 .discovered => "Ready to sign in.",
                 .signing_in => if (rc.connect_login_open) "Browser opened. Finish sign-in there; this window waits for the loopback redirect." else "Starting sign-in…",
                 .signed_in, .loading_inventory => "Signed in. Loading authorized runtimes…",
-                .inventory_loaded => "Signed in.",
+                .inventory_loaded => if (rc.connect_runtimes.items.len == 0)
+                    "Signed in. No ready runtimes are assigned to this account."
+                else
+                    "Signed in. Select a runtime below.",
                 .bootstrapping => "Creating the runtime-local device credential…",
                 .bootstrap_ready => "Runtime bootstrap complete.",
                 .failed => "Failed.",
             };
-            const status_color = if (rc.connect_failure != null) theme.danger() else if (connectSignedIn(rc.connect_phase)) theme.success() else theme.COLOR_TEXT_MUTED;
+            const empty_inventory = rc.connect_phase == .inventory_loaded and rc.connect_runtimes.items.len == 0;
+            const status_color = if (rc.connect_failure != null) theme.danger() else if (empty_inventory) theme.COLOR_YELLOW else if (connectSignedIn(rc.connect_phase)) theme.success() else theme.COLOR_TEXT_MUTED;
             queuePaletteText(state, .{ .x = modal.x + pad, .y = layout.status_y, .w = layout.content_w, .h = theme.scaledUi(20.0) }, status, paletteColor(status_color), theme.scaledUi(13.0), modal);
             var issuer_buf: [runtime_connections.URL_CAPACITY + 32]u8 = undefined;
             const issuer_line: []const u8 = if (rc.connect_issuer) |issuer|
@@ -3024,6 +3033,13 @@ fn renderRuntimeWizardModal(state: *runtime.AppState, width: f32, height: f32) v
             drawActionButton(state, layout.buttons[0], "Edit", theme.COLOR_PANEL_ALT);
             if (connect_label.len > 0) drawActionButton(state, layout.buttons[1], connect_label, theme.accent());
             drawActionButton(state, layout.buttons[2], "Done", theme.COLOR_PANEL_ALT);
+            if (rc.wizard_profile_id) |profile_id| {
+                const live = switch (state.runtimeProfileStatus(profile_id)) {
+                    .ready, .connecting, .handshaking => true,
+                    else => false,
+                };
+                if (runtime_connections.bootstrapNoticeIsStale(rc.wizardNotice(), live)) return;
+            }
         },
     }
     const notice = rc.wizardNotice();
@@ -3927,6 +3943,29 @@ test "Pair wizard form positions only its two visible fields on separate rows" {
     try std.testing.expect(pair_layout.modal.h < ssh_layout.modal.h);
 }
 
+test "Connect wizard keeps the empty-inventory notice inside the modal and offers Refresh" {
+    var state: runtime.AppState = undefined;
+    state.runtime_connections = .{};
+    const rc = &state.runtime_connections;
+    rc.wizard_step = .connect_setup;
+    rc.wizard_mode = .edit;
+    rc.connect_phase = .inventory_loaded;
+
+    const layout = runtimeWizardLayout(&state, 1200.0, 900.0);
+    // The notice line must clear the inventory area and sit above the buttons.
+    try std.testing.expect(layout.notice_y + theme.scaledUi(20.0) <= layout.buttons[2].y);
+    try std.testing.expect(layout.notice_y >= layout.inventory_y);
+    try std.testing.expect(connectPrimaryEnabled(rc));
+    try std.testing.expectEqualStrings("Refresh", connectPrimaryLabel(rc));
+
+    rc.connect_phase = .signed_in;
+    rc.connect_failure = .not_reachable;
+    try std.testing.expectEqualStrings("Retry", connectPrimaryLabel(rc));
+    rc.connect_phase = .loading_inventory;
+    rc.connect_failure = null;
+    try std.testing.expect(!connectPrimaryEnabled(rc));
+}
+
 test "workspace settings modal owns keyboard and text input while open" {
     const allocator = std.testing.allocator;
     var state: runtime.AppState = undefined;
@@ -3949,6 +3988,9 @@ test "workspace settings modal owns keyboard and text input while open" {
     state.runtime_connections = .{};
     state.command_controller.open = false;
     state.workspace_settings_project_id = null;
+    state.workspace_folders_config = null;
+    state.git_changes = .{};
+    state.cookie_import = .{};
     state.workspace_settings_notice_storage = @splat(0);
     defer state.closeWorkspaceSettings();
 

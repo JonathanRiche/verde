@@ -309,7 +309,23 @@ pub const Storage = struct {
 
     /// Read the current bounded durable projection from the daemon.
     pub fn loadProjection(self: *const Storage, allocator: std.mem.Allocator) !LoadedPersistedState {
+        // Unit tests never reach a live daemon; read the hermetic SQLite
+        // fixture in one RO transaction as the daemon's snapshot does.
+        if (builtin.is_test) return self.loadProjectionFromStore(allocator);
         return self.loadDaemonProjection(allocator);
+    }
+
+    fn loadProjectionFromStore(self: *const Storage, allocator: std.mem.Allocator) !LoadedPersistedState {
+        var client = (try openReadOnlyOptional(allocator, self.projection_store_dir)) orelse {
+            var empty = LoadedPersistedState.init(allocator);
+            empty.store_revision = 0;
+            return empty;
+        };
+        defer client.deinit();
+        if (try client.loadBounded(allocator)) |loaded| return loaded;
+        var empty = LoadedPersistedState.init(allocator);
+        empty.store_revision = try client.storeRevision();
+        return empty;
     }
 
     pub fn loadMessagePage(
@@ -1143,6 +1159,9 @@ pub const Storage = struct {
         self: *const Storage,
         request: headless.store.SurfaceCommitProofClassifyRequest,
     ) !SurfaceCommitProofClassification {
+        // Unit tests never reach a live daemon; classify against the local
+        // projection Store exactly as the daemon's classify handler does.
+        if (builtin.is_test) return self.classifySurfaceCommitProofFromProjection(request);
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         var transport: daemon_client.HeadlessTransport = .{
@@ -1155,6 +1174,29 @@ pub const Storage = struct {
         defer parsed.deinit();
         const result = try client.decodeSurfaceCommitProofClassify(&parsed);
         return std.meta.stringToEnum(SurfaceCommitProofClassification, result.classification) orelse .invalid;
+    }
+
+    fn classifySurfaceCommitProofFromProjection(
+        self: *const Storage,
+        request: headless.store.SurfaceCommitProofClassifyRequest,
+    ) !SurfaceCommitProofClassification {
+        const db_path = try std.fs.path.join(self.allocator, &.{ self.projection_store_dir, db_client.STATE_DB_NAME });
+        defer self.allocator.free(db_path);
+        var store = try test_backend.daemon_store.Store.init(self.allocator, db_path);
+        defer store.deinit();
+        if (!try store.committedReceiptMatches(
+            request.request_key,
+            request.operation,
+            request.fingerprint,
+            request.store_revision,
+        )) return .invalid;
+        const current = if (request.surface) |surface|
+            try store.surfaceStateMatches(surface)
+        else if (request.cleared_session_id) |session_id|
+            try store.surfaceStateAbsent(session_id)
+        else
+            false;
+        return if (current) .current else .superseded;
     }
 
     pub fn isPersistenceAvailable(self: *const Storage) bool {
@@ -1267,6 +1309,20 @@ pub const Storage = struct {
 
     /// Refresh durable revision from daemon.storeStatus.
     pub fn refreshStoreRevision(self: *const Storage) !u64 {
+        // Unit tests never reach a live daemon; pin the revision from the
+        // hermetic SQLite fixture when one exists.
+        if (builtin.is_test) {
+            if (openReadOnlyOptional(self.allocator, self.projection_store_dir)) |maybe_client| {
+                if (maybe_client) |client_owned| {
+                    var client = client_owned;
+                    defer client.deinit();
+                    if (client.storeRevision()) |revision| {
+                        self.noteStoreRevision(revision);
+                        return revision;
+                    } else |_| {}
+                }
+            } else |_| {}
+        }
         try self.ensureDaemon();
         var decode_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer decode_arena.deinit();

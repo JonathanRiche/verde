@@ -135,6 +135,8 @@ pub fn build(b: *std.Build) void {
     daemon_exe_step.dependOn(&install_daemon.step);
 
     const daemon_tests = b.addTest(.{
+        // `-Dtest-filter=<substring>` (repeatable) compiles only matching tests.
+        .filters = b.option([]const []const u8, "test-filter", "Compile and run only tests whose name contains this substring (repeatable)") orelse &.{},
         .root_module = b.createModule(.{
             .root_source_file = b.path("../desktop/src/daemon_main.zig"),
             .target = target,

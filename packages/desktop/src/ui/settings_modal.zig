@@ -498,7 +498,8 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .h = @max(modal.h - header.h, 0.0),
     };
     const content_w = content.w;
-    const phone_h = phoneCard(state, .{ .x = 0, .y = 0, .w = content_w, .h = 0 }, .{ .x = 0, .y = 0, .w = 0, .h = 0 }, false, null);
+    // Only the Connections page shows the phone card; measuring it elsewhere is wasted shaping.
+    const phone_h = if (category == .connections) phoneCard(state, .{ .x = 0, .y = 0, .w = content_w, .h = 0 }, .{ .x = 0, .y = 0, .w = 0, .h = 0 }, false, null) else 0.0;
     const runtimes_w = content_w;
     const runtimes_h = planRuntimeCard(state, 0.0, 0.0, runtimes_w, m).height;
     const integrations_h = m.card_pad * 2.0 + m.title_h + m.row_gap * 2.0 + m.label_h * 4.0 + m.row_h * 8.0 + m.inner_gap * 10.0;
@@ -4651,9 +4652,27 @@ const PhoneLines = struct {
     }
 
     fn fits(self: *const PhoneLines, start: usize, end: usize) bool {
-        return text_measure.textWidth(.ui, theme.scaledUi(NOTES_FONT_SIZE), self.value[start..end]) <= self.width;
+        return phoneTextWidth(self.value[start..end]) <= self.width;
     }
 };
+
+/// Direct-mapped memo of phone-card text widths. The card is wrapped for layout,
+/// hit testing and drawing on every frame, and its "·" lines take the GPU shaping
+/// path, so uncached measurement made the Connections page lag on hover/scroll.
+const PhoneWidthSlot = struct { key: u64 = 0, width: f32 = 0.0 };
+var phone_width_cache: [512]PhoneWidthSlot = [_]PhoneWidthSlot{.{}} ** 512;
+
+fn phoneTextWidth(value: []const u8) f32 {
+    const font_size = theme.scaledUi(NOTES_FONT_SIZE);
+    var hasher = std.hash.Wyhash.init(@as(u32, @bitCast(font_size)));
+    hasher.update(value);
+    const key = hasher.final() | 1;
+    const slot = &phone_width_cache[@intCast(key % phone_width_cache.len)];
+    if (slot.key == key) return slot.width;
+    const width = text_measure.textWidth(.ui, font_size, value);
+    slot.* = .{ .key = key, .width = width };
+    return width;
+}
 
 test "phone card lines wrap at words and split only overlong words" {
     const value = "Source: pair · Last seen: 12s ago https://verdeai.dev/pair?host=https%3A%2F%2Fhost.ts.net";

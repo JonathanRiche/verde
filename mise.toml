@@ -19,6 +19,10 @@ run = "bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && case \"$(uname 
 description = "Builds only the private desktop GUI executable for focused local iteration."
 run = "bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && zig build dev-build --release=safe -Dbrowser-backend=native_webview -Ddev-trace=true'"
 
+[tasks.prune-zig-cache]
+description = "Deletes the repo's .zig-cache directories (Zig never prunes them) when no Zig build is running. Pass --dry-run or --min-gb N."
+run = "bash scripts/dev/prune-zig-cache.sh"
+
 [tasks.build-verify-install]
 description = "Rebuilds the Linux desktop into an isolated prefix and verifies the packaged runtime payload."
 run = "bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && case \"$(uname -s)\" in Linux) scripts/dev/check-native-webview-install.sh --isolated ;; *) echo \"build-verify-install is only supported on Linux\" >&2; exit 1 ;; esac'"

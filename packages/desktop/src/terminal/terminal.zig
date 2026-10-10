@@ -6531,7 +6531,7 @@ test "discontinuous terminal replay drops an orphaned escape suffix" {
     );
     try testing.expectEqualStrings(
         "\x1b[38;5;174mcolored",
-        terminalReplayFromParserBoundary("5;174mgarbage\x1b[38;5;174mcolored"),
+        terminalReplayFromParserBoundary("2;1Hgarbage\x1b[38;5;174mcolored"),
     );
     try testing.expectEqualStrings(
         "plain output",

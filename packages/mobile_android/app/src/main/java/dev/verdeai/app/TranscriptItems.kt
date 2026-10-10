@@ -28,8 +28,8 @@ internal sealed interface TranscriptItem {
     data class Usage(val row: ChatRow, val usage: ChatUsage) : TranscriptItem { override val key get() = "r:" + row.id }
     /** Live "Working · m:ss" footer for the core's active turn. */
     data class Working(val turn: ChatTurn, val waitingApproval: Boolean) : TranscriptItem { override val key get() = "working" }
-    /** A child chat's status report in its parent chat (orchestration), shown as a card. */
-    data class ChildNotice(val row: ChatRow, val notification: ChildNotification) : TranscriptItem { override val key get() = "r:" + row.id }
+    /** Child chat status reports in their parent chat (orchestration): one card each; batched rows carry several. */
+    data class ChildNotice(val row: ChatRow, val notifications: List<ChildNotification>) : TranscriptItem { override val key get() = "r:" + row.id }
     /** Pending tool approval — D-09 replaces the default renderer. */
     data class Approval(val approval: ChatApproval) : TranscriptItem { override val key get() = "approval:${approval.turn_id}:${approval.call_id}" }
 }
@@ -139,7 +139,7 @@ internal fun transcriptItems(view: ChatThreadView): List<TranscriptItem> {
     }
     view.rows.forEachIndexed { index, row ->
         if (row.author == HIDDEN_AUTHOR) return@forEachIndexed
-        childNotification(row.role, row.body)?.let {
+        childNotifications(row.role, row.body)?.let {
             flush()
             out.add(TranscriptItem.ChildNotice(row, it))
             return@forEachIndexed

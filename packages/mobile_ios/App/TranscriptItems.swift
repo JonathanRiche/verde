@@ -16,8 +16,9 @@ enum TranscriptItem: Identifiable {
     case diff(ChatRow)
     /// System notices, including A-09 access-cap notices.
     case notice(ChatRow)
-    /// A linked child chat's status notification, delivered to its parent as a user or system turn.
-    case childNotification(ChatRow, ChildNotification)
+    /// Linked child chats' status notifications, delivered to their parent as a user or system
+    /// turn; a batched delivery carries several (one card each).
+    case childNotification(ChatRow, [ChildNotification])
     /// The latest provider usage summary, parsed by the core.
     case usage(ChatRow, ChatUsage)
     /// Live "Working · m:ss" footer for the core's active turn.
@@ -194,9 +195,9 @@ func transcriptItems(_ view: ChatThreadView) -> [TranscriptItem] {
     }
     for (index, row) in view.rows.enumerated() {
         if row.author == hiddenAuthor { continue }
-        if let notification = childNotification(role: row.role, body: row.body) {
+        if let notifications = childNotifications(role: row.role, body: row.body) {
             flush()
-            out.append(.childNotification(row, notification))
+            out.append(.childNotification(row, notifications))
             continue
         }
         if isCommandRow(row) && !isDiffRow(row) {

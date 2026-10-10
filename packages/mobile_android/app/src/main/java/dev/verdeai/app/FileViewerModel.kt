@@ -101,20 +101,27 @@ internal data class LineTarget(val line: Int, val end: Int? = null) {
 }
 
 internal enum class FileProblem {
-    Offline, Forbidden, NotFound, TooLarge, Unsupported, PreviewUnavailable, Binary, Unresolved,
+    Offline, Timeout, Interrupted, Busy, ServerUnavailable, Unauthorized, Identity,
+    Forbidden, NotFound, TooLarge, Unsupported, PreviewUnavailable, Binary, Unresolved,
     PdfNeedsNewerAndroid, Unreadable, Unavailable, Failed,
 }
 
 /** Maps a `file_open` receipt error code (files.zig) onto a viewer state. */
 internal fun fileProblem(code: String?): FileProblem = when (code) {
-    "offline", "cancelled", "timeout", "busy", "server_unavailable" -> FileProblem.Offline
+    "offline" -> FileProblem.Offline
+    "timeout" -> FileProblem.Timeout
+    "cancelled" -> FileProblem.Interrupted
+    "busy" -> FileProblem.Busy
+    "server_unavailable" -> FileProblem.ServerUnavailable
+    "unauthorized" -> FileProblem.Unauthorized
+    "identity" -> FileProblem.Identity
     "forbidden" -> FileProblem.Forbidden
     "not_found" -> FileProblem.NotFound
     "too_large" -> FileProblem.TooLarge
     "unsupported" -> FileProblem.Unsupported
     "invalid_path" -> FileProblem.Unresolved
     "preview_unavailable" -> FileProblem.PreviewUnavailable
-    "unavailable", "unauthorized" -> FileProblem.Unavailable
+    "unavailable" -> FileProblem.Unavailable
     else -> FileProblem.Failed
 }
 
@@ -341,16 +348,25 @@ internal class FileViewerModel(
 
     /** Returns the body as a [ByteArray], or a failed [FileViewState]. */
     private suspend fun fetchBytes(host: CoreHost, target: String, fetchKind: FileKind, maxBytes: Long): Any {
-        val intent = UUID.randomUUID().toString()
-        host.send { n, w -> EventFileOpen(now_ms = n, wall_time_ms = w, intent_id = intent, path = target,
-            kind = fetchKind, max_bytes = maxBytes) }
-        val op = withTimeoutOrNull(waitMs) {
-            host.operations.map { q -> q?.data?.items?.find { it.intent_id == intent } }.first { it != null && it.state != "pending" }
-        } ?: return FileViewState(loading = false, problem = FileProblem.Offline, retryable = true)
-        if (op.state != "succeeded") {
-            return FileViewState(loading = false, problem = fileProblem(op.error?.code), retryable = op.error?.retryable == true)
-        }
-        return host.takeFile(intent)?.bytes ?: FileViewState(loading = false, problem = FileProblem.Failed, retryable = true)
+        return withTimeoutOrNull(waitMs) {
+            // The document picker backgrounds the process. Its result can be delivered before
+            // ON_START reaches the core; sending now would be rejected as cancelled. Wait for
+            // the core's projection, then let it refresh the bearer before emitting the GET.
+            val ready = host.hosts.map { q -> q?.data?.items?.firstOrNull() }.first {
+                it?.lifecycle == Lifecycle.foreground || it?.auth_state in HostsModel.WIPED
+            }
+            if (ready?.auth_state in HostsModel.WIPED) {
+                return@withTimeoutOrNull FileViewState(loading = false, problem = FileProblem.Unavailable, retryable = true)
+            }
+            val intent = UUID.randomUUID().toString()
+            host.send { n, w -> EventFileOpen(now_ms = n, wall_time_ms = w, intent_id = intent, path = target,
+                kind = fetchKind, max_bytes = maxBytes) }
+            val op = host.operations.map { q -> q?.data?.items?.find { it.intent_id == intent } }
+                .first { it != null && it.state != "pending" }!!
+            if (op.state != "succeeded") {
+                FileViewState(loading = false, problem = fileProblem(op.error?.code), retryable = op.error?.retryable == true)
+            } else host.takeFile(intent)?.bytes ?: FileViewState(loading = false, problem = FileProblem.Failed, retryable = true)
+        } ?: FileViewState(loading = false, problem = FileProblem.Timeout, retryable = true)
     }
 
     private suspend fun fetch(host: CoreHost, target: String): FileViewState {

@@ -2,6 +2,45 @@
 const std = @import("std");
 const zqlite = @import("zqlite");
 
+/// Which parent asked for each delegated task. A side ledger created at store
+/// open (like the access and push tables) rather than a chat_tasks column, so
+/// no schema version bump strands older binaries on the same database.
+/// Tasks without a row (human or recovered turns) notify every linked parent.
+pub const ORIGINS_SQL: [:0]const u8 =
+    \\create table if not exists chat_task_origins (
+    \\ task_id text primary key references chat_tasks(task_id) on delete cascade,
+    \\ parent_thread_id text not null
+    \\);
+;
+
+pub fn initialize(conn: zqlite.Conn) !void {
+    try conn.execNoArgs(ORIGINS_SQL);
+}
+
+/// Record the parent whose message started `task`; only that parent hears
+/// its outcome, so work a shared child does for others stays out of it.
+pub fn setOrigin(conn: zqlite.Conn, task: []const u8, parent: []const u8) !void {
+    try conn.exec("insert or ignore into chat_task_origins(task_id,parent_thread_id) values(?,?)", .{ task, parent });
+}
+
+/// A resumed turn continues the delegated work it was blocked on, so it
+/// reports to whichever parent asked for the thread's previous task.
+pub fn inheritOrigin(conn: zqlite.Conn, task: []const u8, workspace: []const u8, child: []const u8) !void {
+    try conn.exec(
+        \\insert or ignore into chat_task_origins(task_id,parent_thread_id)
+        \\select ?,o.parent_thread_id from chat_tasks k join chat_task_origins o on o.task_id=k.task_id
+        \\where k.workspace_id=? and k.local_thread_id=? and k.task_id<>?
+        \\and k.created_at_ms=(select max(created_at_ms) from chat_tasks where workspace_id=? and local_thread_id=? and task_id<>?)
+        \\limit 1
+    , .{ task, workspace, child, task, workspace, child, task });
+}
+
+/// SQL predicate (aliases `t` task, `l` link): the link's parent may hear
+/// about the task.
+pub const ORIGIN_MATCHES_SQL =
+    "(not exists(select 1 from chat_task_origins o where o.task_id=t.task_id) " ++
+    "or exists(select 1 from chat_task_origins o where o.task_id=t.task_id and o.parent_thread_id=l.parent_thread_id))";
+
 pub fn link(conn: zqlite.Conn, allocator: std.mem.Allocator, workspace: []const u8, parent: []const u8, child: []const u8) !void {
     if (parent.len == 0 or child.len == 0 or std.mem.eql(u8, parent, child)) return error.InvalidParams;
     // Both ends must be durable threads in the same workspace.
@@ -47,7 +86,9 @@ pub fn updateTask(conn: zqlite.Conn, task: []const u8, status: []const u8, summa
             \\insert or ignore into chat_deliveries(task_id,link_id,revision,status,summary)
             \\select t.task_id,l.link_id,t.revision,t.status,t.summary from chat_tasks t
             \\join chat_links l on l.workspace_id=t.workspace_id and l.local_thread_id=t.local_thread_id
-            \\where t.task_id=? and l.delivery_enabled=1
+            \\where t.task_id=? and l.delivery_enabled=1 and
+        ++ ORIGIN_MATCHES_SQL ++
+            \\
             \\and not (t.status='blocked' and exists(select 1 from chat_deliveries d where d.task_id=t.task_id and d.link_id=l.link_id and d.status=t.status and d.summary=t.summary))
             \\and not exists(select 1 from chat_deliveries d join chat_tasks o on o.task_id=d.task_id
             \\ where d.link_id=l.link_id and d.task_id<>t.task_id and d.status=t.status and d.summary=t.summary
@@ -55,6 +96,24 @@ pub fn updateTask(conn: zqlite.Conn, task: []const u8, status: []const u8, summa
         , .{ task, same_run_window_ms });
     }
     try conn.execNoArgs("release chat_task_update");
+}
+
+/// Linked children of `parent` whose latest task is still working (the
+/// writeTask notion: running, awaiting approval, or blocked mid-turn), plus
+/// child results not yet delivered. Zero means the orchestration run settled.
+/// `batch_turn` excludes the deliveries being handed over in that turn.
+pub fn activeChildCount(conn: zqlite.Conn, workspace: []const u8, parent: []const u8, batch_turn: ?[]const u8) !usize {
+    var row = (try conn.row(
+        \\select (select count(*) from chat_links l
+        \\ join chat_tasks k on k.task_id=(select task_id from chat_tasks where workspace_id=l.workspace_id and local_thread_id=l.local_thread_id order by created_at_ms desc,rowid desc limit 1)
+        \\ where l.workspace_id=?1 and l.parent_thread_id=?2 and l.hidden=0 and l.delivery_enabled=1
+        \\ and (k.status in ('running','waiting_approval') or (k.status='blocked' and k.result_json is null)))
+        \\+ (select count(*) from chat_deliveries d join chat_links l on l.link_id=d.link_id
+        \\ where l.workspace_id=?1 and l.parent_thread_id=?2 and l.delivery_enabled=1 and d.delivered=0
+        \\ and (?3 is null or d.parent_turn_id is null or d.parent_turn_id<>?3))
+    , .{ workspace, parent, batch_turn })) orelse return 0;
+    defer row.deinit();
+    return @intCast(@max(0, row.int(0)));
 }
 
 pub fn writeLinks(conn: zqlite.Conn, s: *std.json.Stringify, workspace: []const u8, parent: []const u8, include_hidden: bool) !void {
@@ -184,6 +243,7 @@ test "removing a linked chat stops parent delivery" {
     var conn = try zqlite.open(":memory:", zqlite.OpenFlags.Create | zqlite.OpenFlags.EXResCode);
     defer conn.close();
     try conn.execNoArgs(@import("../db/chat_links_schema.zig").SCHEMA_SQL);
+    try initialize(conn);
     try conn.execNoArgs("insert into chat_links(link_id,workspace_id,parent_thread_id,local_thread_id) values('l','w','p','c')");
     try createTask(conn, "t1", "w", "c", "verde", 1);
     try updateTask(conn, "t1", "completed", "queued", null, null, 2);
@@ -202,6 +262,7 @@ test "turns folded into one child run notify the parent once" {
     var conn = try zqlite.open(":memory:", zqlite.OpenFlags.Create | zqlite.OpenFlags.EXResCode);
     defer conn.close();
     try conn.execNoArgs(@import("../db/chat_links_schema.zig").SCHEMA_SQL);
+    try initialize(conn);
     try conn.execNoArgs("insert into chat_links(link_id,workspace_id,parent_thread_id,local_thread_id) values('l','w','p','c')");
     try createTask(conn, "t1", "w", "c", "verde", 1);
     try createTask(conn, "t2", "w", "c", "verde", 2);
@@ -218,4 +279,52 @@ test "turns folded into one child run notify the parent once" {
     var later = (try conn.row("select count(*) from chat_deliveries where task_id='t4'", .{})).?;
     defer later.deinit();
     try std.testing.expectEqual(@as(i64, 1), later.int(0));
+}
+
+test "delegated work notifies only the parent that asked for it" {
+    var conn = try zqlite.open(":memory:", zqlite.OpenFlags.Create | zqlite.OpenFlags.EXResCode);
+    defer conn.close();
+    try conn.execNoArgs(@import("../db/chat_links_schema.zig").SCHEMA_SQL);
+    try initialize(conn);
+    try conn.execNoArgs("insert into chat_links(link_id,workspace_id,parent_thread_id,local_thread_id) values('l1','w','p1','c'),('l2','w','p2','c')");
+    try createTask(conn, "asked", "w", "c", "mcp", 1);
+    try setOrigin(conn, "asked", "p1");
+    try updateTask(conn, "asked", "completed", "done for p1", null, null, 2);
+    var asked = (try conn.row("select group_concat(link_id) from chat_deliveries where task_id='asked'", .{})).?;
+    try std.testing.expectEqualStrings("l1", asked.text(0));
+    asked.deinit();
+    // A human turn in the shared child has no origin and reaches every parent.
+    try createTask(conn, "human", "w", "c", "verde", 3);
+    try updateTask(conn, "human", "completed", "human asked", null, null, 4);
+    var human = (try conn.row("select count(*) from chat_deliveries where task_id='human'", .{})).?;
+    try std.testing.expectEqual(@as(i64, 2), human.int(0));
+    human.deinit();
+    // A resume continues the previous delegated task, so it inherits its parent.
+    try createTask(conn, "blocked", "w", "c", "mcp", 5);
+    try setOrigin(conn, "blocked", "p2");
+    try createTask(conn, "resume:x", "w", "c", "verde", 6);
+    try inheritOrigin(conn, "resume:x", "w", "c");
+    try updateTask(conn, "resume:x", "completed", "resumed", null, null, 7);
+    var resumed = (try conn.row("select group_concat(link_id) from chat_deliveries where task_id='resume:x'", .{})).?;
+    defer resumed.deinit();
+    try std.testing.expectEqualStrings("l2", resumed.text(0));
+}
+
+test "active child count tracks working children and undelivered results" {
+    var conn = try zqlite.open(":memory:", zqlite.OpenFlags.Create | zqlite.OpenFlags.EXResCode);
+    defer conn.close();
+    try conn.execNoArgs(@import("../db/chat_links_schema.zig").SCHEMA_SQL);
+    try initialize(conn);
+    try conn.execNoArgs("insert into chat_links(link_id,workspace_id,parent_thread_id,local_thread_id) values('l1','w','p','c1'),('l2','w','p','c2')");
+    try createTask(conn, "t1", "w", "c1", "mcp", 1);
+    try createTask(conn, "t2", "w", "c2", "mcp", 1);
+    try std.testing.expectEqual(@as(usize, 2), try activeChildCount(conn, "w", "p", null));
+    try updateTask(conn, "t1", "completed", "one", null, null, 2);
+    // c2 still running, t1's result not yet handed over.
+    try std.testing.expectEqual(@as(usize, 2), try activeChildCount(conn, "w", "p", null));
+    try conn.execNoArgs("update chat_deliveries set parent_turn_id='child-event:batch'");
+    try std.testing.expectEqual(@as(usize, 1), try activeChildCount(conn, "w", "p", "child-event:batch"));
+    try updateTask(conn, "t2", "completed", "two", "{}", "{}", 3);
+    try conn.execNoArgs("update chat_deliveries set delivered=1");
+    try std.testing.expectEqual(@as(usize, 0), try activeChildCount(conn, "w", "p", null));
 }

@@ -364,7 +364,12 @@ private struct TranscriptRow: View {
                 GitCommitNoticeCard(bodyText: row.body)
             } else { NoticeRow(row: row, model: model) }
         case .usage(_, let usage): UsageCard(usage: usage)
-        case .childNotification(let row, let notification): ChildNotificationCard(row: row, notification: notification, model: model)
+        case .childNotification(let row, let notifications):
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(Array(notifications.enumerated()), id: \.offset) { index, notification in
+                    ChildNotificationCard(row: row, index: index, notification: notification, model: model)
+                }
+            }
         case .working(let turn, let waiting): WorkingRow(turn: turn, waitingApproval: waiting)
         case .approval(let approval): ApprovalCard(approval: approval, controller: model.approvals, disclosure: model.disclosure)
         }
@@ -441,6 +446,8 @@ private func childStatusColor(_ status: ChildStatus) -> Color {
 private struct ChildNotificationCard: View {
     @Environment(\.openRoute) private var openRoute
     let row: ChatRow
+    /// Position within a batched delivery; 0 keeps the pre-batching disclosure key.
+    let index: Int
     let notification: ChildNotification
     let model: TranscriptModel
 
@@ -448,7 +455,7 @@ private struct ChildNotificationCard: View {
         let child = model.linkedThread(notification.childID)
         let title = child.map { $0.title.isEmpty ? notification.childID : $0.title } ?? notification.childID
         let preview = childReplyPreview(notification.reply)
-        let key = "\(row.id):child"
+        let key = index == 0 ? "\(row.id):child" : "\(row.id):child:\(index)"
         let expanded = model.disclosure.flag(key)
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {

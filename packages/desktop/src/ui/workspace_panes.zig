@@ -70,9 +70,10 @@ const SCROLLING_EDGE_BUTTON_INSET_CSS: f32 = 6.0;
 const SCROLLING_EDGE_HOVER_PAD_CSS: f32 = 14.0;
 const SCROLLING_EDGE_CONTROL_Z: i32 = 170;
 
-// Font Awesome glyphs bundled in SymbolsNerdFontMono and rendered with Palette's icon role.
-const NF_FA_EXPAND = "\u{F065}";
-const NF_FA_COMPRESS = "\u{F066}";
+// Nerd Font glyphs bundled in SymbolsNerdFontMono and rendered with Palette's icon role.
+// Zoom control: Material Design arrow_expand / arrow_collapse (two diagonal arrows out / in).
+const NF_MD_ARROW_EXPAND = "\u{F0616}";
+const NF_MD_ARROW_COLLAPSE = "\u{F0615}";
 const NF_COD_CHEVRON_DOWN = "\u{EAB4}";
 const NF_COD_CHEVRON_LEFT = "\u{EAB5}";
 const NF_COD_CHEVRON_RIGHT = "\u{EAB6}";
@@ -3265,7 +3266,7 @@ fn renderZoomControl(
     queueIcon(
         state,
         icon_rect,
-        if (maximized) NF_FA_COMPRESS else NF_FA_EXPAND,
+        if (maximized) NF_MD_ARROW_COLLAPSE else NF_MD_ARROW_EXPAND,
         paletteColor(icon_color),
         icon_size,
         pane_rect,
@@ -3808,7 +3809,8 @@ test "sidebar horizontal render preserves visible activation and minimally revea
     const layout = &state.project_controller.projects.items[0].workspace_layout;
 
     // Establish a real strip acknowledgement, maximize its visible pane,
-    // transfer maximize to offscreen C, then restore through production APIs.
+    // focus offscreen C (zoom stays in B's tab), then restore through
+    // production APIs.
     try std.testing.expect(state.toggleWorkspacePaneMaximized(0, second_pane));
     renderAt(&state, narrow);
     try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, second_pane), layout.scroll_revealed_pane_id);
@@ -3816,7 +3818,7 @@ test "sidebar horizontal render preserves visible activation and minimally revea
     const preserved_target_y = layout.scroll_target_y;
     try std.testing.expect(state.toggleWorkspacePaneMaximized(0, second_pane));
     state.focusWorkspaceOpenPaneFromSidebar(0, third_pane);
-    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, third_pane), layout.maximized_pane_id);
+    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, second_pane), layout.maximized_pane_id);
     try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, null), layout.scroll_revealed_pane_id);
     try std.testing.expectEqual(preserved_target_x, layout.scroll_target_x);
     try std.testing.expectEqual(preserved_target_y, layout.scroll_target_y);
@@ -3953,6 +3955,10 @@ test "sidebar vertical render minimally reveals after pre-render resize" {
     try std.testing.expectEqual(visible_target, layout.scroll_target_y);
     try std.testing.expectEqual(@as(f32, 41.0), layout.scroll_target_x);
 
+    // The first render leading-aligns the restored focused pane; scroll back
+    // to 19.5 so the shrink below leaves the third pane partly offscreen.
+    layout.scroll_offset_y = 19.5;
+    layout.scroll_target_y = 19.5;
     state.project_controller.selected_index = 1;
     layout.scroll_pane_extent_ratio_override = 0.45;
     state.focusWorkspaceOpenPaneFromSidebar(0, third_pane);
@@ -4099,8 +4105,8 @@ test "variable scrolling extents keep a uniform strip equivalent" {
     try std.testing.expectApproxEqAbs(scrollingMaxOffset(360.0, 500.0, 12.0, 4), scrollingStripMaxOffset(360.0, &extents, 12.0), 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 1024.0), scrollingPaneOrigin(&extents, 12.0, 2), 0.0001);
     const mixed = [_]f32{ 700.0, 400.0, 500.0 };
-    try std.testing.expectApproxEqAbs(@as(f32, 1112.0), scrollingPaneOrigin(&mixed, 12.0, 2), 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 1112.0), leadingScrollTargetForPane(&mixed, 12.0, 2, 2000.0), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1124.0), scrollingPaneOrigin(&mixed, 12.0, 2), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1124.0), leadingScrollTargetForPane(&mixed, 12.0, 2, 2000.0), 0.0001);
 }
 
 test "menu split keeps the new pane inside the target scrolling tile" {

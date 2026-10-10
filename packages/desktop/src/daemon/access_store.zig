@@ -660,33 +660,40 @@ pub fn authorizeDevice(
     return required_mask;
 }
 
-/// Revoke an unconsumed grant. Returns false when absent or already final.
+/// Revoke an unconsumed grant by deleting it; revoked grants are not retained.
+/// Returns false when absent or already consumed.
 pub fn revokePairingGrant(conn: zqlite.Conn, grant_id: []const u8, now_ms: i64) !bool {
     try access.validateGrantId(grant_id);
     try validateNow(now_ms);
+    try conn.execNoArgs("begin immediate");
+    var transaction_open = true;
+    defer if (transaction_open) conn.rollback();
     try conn.exec(
-        \\update runtime_pairing_grants set revoked_at_ms = ?2
+        \\delete from runtime_pairing_grants
         \\where grant_id = ?1 and consumed_at_ms is null and revoked_at_ms is null
-    , .{ grant_id, now_ms });
-    return conn.changes() == 1;
+    , .{grant_id});
+    const changed = conn.changes();
+    // Foreign keys may be off on this connection; drop the retry row explicitly.
+    if (changed == 1) try conn.exec("delete from runtime_pairing_retries where grant_id = ?1", .{grant_id});
+    try conn.commit();
+    transaction_open = false;
+    return changed == 1;
 }
 
-/// Revoke a device idempotently. No credential material is accepted here.
+/// Revoke a device by deleting its record and credential verifier outright;
+/// revoked devices are not retained. Authentication of an unknown device id
+/// fails closed exactly like a revoked one. Pair replay stays blocked by the
+/// consumed grant; Connect replay by the bootstrap JWT's short expiry.
+/// No credential material is accepted here.
 pub fn revokeDevice(conn: zqlite.Conn, device_id: []const u8, now_ms: i64) !bool {
     try access.validateDeviceId(device_id);
     try validateNow(now_ms);
     try conn.execNoArgs("begin immediate");
     var transaction_open = true;
     defer if (transaction_open) conn.rollback();
-    try conn.exec(
-        "update runtime_devices set revoked_at_ms = ?2 where device_id = ?1 and revoked_at_ms is null",
-        .{ device_id, now_ms },
-    );
+    try conn.exec("delete from runtime_devices where device_id = ?1", .{device_id});
     var changed = conn.changes();
-    try conn.exec(
-        "update runtime_connect_devices set revoked_at_ms = ?2 where device_id = ?1 and revoked_at_ms is null",
-        .{ device_id, now_ms },
-    );
+    try conn.exec("delete from runtime_connect_devices where device_id = ?1", .{device_id});
     changed += conn.changes();
     try conn.commit();
     transaction_open = false;
@@ -889,15 +896,11 @@ fn pruneLockedToLimits(
 ) !PruneResult {
     if (grant_limit < 0 or device_limit < 0) return error.InvalidAccessRetention;
     const cutoff_ms = @max(@as(i64, 0), now_ms -| retention_ms);
-    try conn.exec(
-        \\delete from runtime_devices
-        \\where revoked_at_ms is not null and revoked_at_ms <= ?1
-    , .{cutoff_ms});
+    // Revoked records are never retained, regardless of age. Revocation now
+    // deletes immediately; this also purges rows left by older builds.
+    try conn.execNoArgs("delete from runtime_devices where revoked_at_ms is not null");
     var devices_removed = conn.changes();
-    try conn.exec(
-        \\delete from runtime_connect_devices
-        \\where revoked_at_ms is not null and revoked_at_ms <= ?1
-    , .{cutoff_ms});
+    try conn.execNoArgs("delete from runtime_connect_devices where revoked_at_ms is not null");
     devices_removed += conn.changes();
     var device_excess = @max(@as(i64, 0), try countAllDevices(conn) - device_limit);
     if (device_excess > 0) {
@@ -929,7 +932,7 @@ fn pruneLockedToLimits(
         \\    select 1 from runtime_devices where runtime_devices.grant_id = runtime_pairing_grants.grant_id
         \\) and (
         \\    (consumed_at_ms is not null and consumed_at_ms <= ?1) or
-        \\    (revoked_at_ms is not null and revoked_at_ms <= ?1) or
+        \\    revoked_at_ms is not null or
         \\    (consumed_at_ms is null and revoked_at_ms is null and expires_at_ms <= ?1)
         \\)
     , .{cutoff_ms});
@@ -1380,7 +1383,7 @@ test "two database connections serialize one-time grant exchange" {
     try std.testing.expectEqual(@as(i64, 1), count_row.int(1));
 }
 
-test "pruning retains active records and bounds terminal audit history" {
+test "revocation deletes immediately while pruning bounds terminal audit history" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -1409,6 +1412,7 @@ test "pruning retains active records and bounds terminal audit history" {
     }, 1_100);
     defer device.clear();
     try std.testing.expect(try revokeDevice(conn, device.device_id[0..], 2_000));
+    try std.testing.expectEqual(@as(i64, 0), try countRows(conn, "runtime_devices"));
 
     var revoked = try createPairingGrant(std.testing.io, conn, .{
         .access_protocol_version = access.ACCESS_PROTOCOL_VERSION,
@@ -1417,6 +1421,7 @@ test "pruning retains active records and bounds terminal audit history" {
     }, 1_000);
     defer revoked.clear();
     try std.testing.expect(try revokePairingGrant(conn, revoked.grant_id[0..], 2_000));
+    try std.testing.expectEqual(@as(i64, 1), try countRows(conn, "runtime_pairing_grants"));
 
     var expired = try createPairingGrant(std.testing.io, conn, .{
         .access_protocol_version = access.ACCESS_PROTOCOL_VERSION,
@@ -1425,15 +1430,22 @@ test "pruning retains active records and bounds terminal audit history" {
     }, 1_000);
     defer expired.clear();
 
+    // Legacy builds kept revoked rows; pruning purges them regardless of age.
+    try conn.exec(
+        "insert into runtime_devices (device_id, grant_id, credential_verifier, label, scopes, created_at_ms, last_used_at_ms, revoked_at_ms) values (?1, ?2, zeroblob(32), 'Legacy', 1, 1000, null, 2998)",
+        .{ "30000000000000000000000000000001", consumed.grant_id[0..] },
+    );
+
+    // The consumed grant (now unreferenced) ages out at cutoff 1_999; the expired one does not yet.
     const before_cutoff = try prune(conn, 2_999, 1_000);
-    try std.testing.expectEqual(@as(usize, 0), before_cutoff.devices_removed);
-    try std.testing.expectEqual(@as(usize, 0), before_cutoff.grants_removed);
-    try std.testing.expectEqual(@as(i64, 1), try countRows(conn, "runtime_devices"));
-    try std.testing.expectEqual(@as(i64, 3), try countRows(conn, "runtime_pairing_grants"));
+    try std.testing.expectEqual(@as(usize, 1), before_cutoff.devices_removed);
+    try std.testing.expectEqual(@as(usize, 1), before_cutoff.grants_removed);
+    try std.testing.expectEqual(@as(i64, 0), try countRows(conn, "runtime_devices"));
+    try std.testing.expectEqual(@as(i64, 1), try countRows(conn, "runtime_pairing_grants"));
 
     const at_cutoff = try prune(conn, 3_000, 1_000);
-    try std.testing.expectEqual(@as(usize, 1), at_cutoff.devices_removed);
-    try std.testing.expectEqual(@as(usize, 3), at_cutoff.grants_removed);
+    try std.testing.expectEqual(@as(usize, 0), at_cutoff.devices_removed);
+    try std.testing.expectEqual(@as(usize, 1), at_cutoff.grants_removed);
     try std.testing.expectEqual(@as(i64, 0), try countRows(conn, "runtime_devices"));
     try std.testing.expectEqual(@as(i64, 0), try countRows(conn, "runtime_pairing_grants"));
 
@@ -1534,9 +1546,10 @@ test "count pressure evicts only the oldest eligible terminal records" {
     try conn.execNoArgs("begin immediate");
     const device_trim = try pruneLockedToLimits(conn, 1_000, 10_000, 3, 2);
     try conn.commit();
-    try std.testing.expectEqual(@as(usize, 1), device_trim.devices_removed);
+    // Revoked devices are never retained, so all three go regardless of the limit.
+    try std.testing.expectEqual(@as(usize, 3), device_trim.devices_removed);
     try std.testing.expectEqual(@as(usize, 1), device_trim.grants_removed);
-    try std.testing.expectEqual(@as(i64, 2), try countRows(conn, "runtime_devices"));
+    try std.testing.expectEqual(@as(i64, 0), try countRows(conn, "runtime_devices"));
     try std.testing.expectEqual(@as(i64, 3), try countRows(conn, "runtime_pairing_grants"));
     try std.testing.expect((try conn.row(
         "select 1 from runtime_devices where device_id = ?1",

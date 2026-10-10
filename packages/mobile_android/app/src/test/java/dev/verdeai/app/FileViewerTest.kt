@@ -75,12 +75,12 @@ class FileViewerTest {
     }
 
     private fun open(path: String?, target: LineTarget? = null, decoders: FileDecoders = FakeDecoders,
-                     owner: ViewModelStore = models): FileViewerModel {
+                     owner: ViewModelStore = models, waitMs: Long = FileViewerModel.WAIT_MS): FileViewerModel {
         lateinit var model: FileViewerModel
         compose.runOnUiThread {
             model=ViewModelProvider(owner, object : ViewModelProvider.Factory {
                 @Suppress("UNCHECKED_CAST")
-                override fun <T : ViewModel> create(modelClass: Class<T>): T = FileViewerModel(hosts, "alpha", path, decoders) as T
+                override fun <T : ViewModel> create(modelClass: Class<T>): T = FileViewerModel(hosts, "alpha", path, decoders, waitMs) as T
             })["file-${opened++}", FileViewerModel::class.java]
             current=model to target
         }
@@ -136,10 +136,16 @@ class FileViewerTest {
         start()
         val cases=listOf(
             Triple("too_large", "Too large to preview", "2 MB limit"),
-            Triple("forbidden", "No access", "outside the host's shared workspaces"),
+            Triple("forbidden", "No access", "Check its shared workspaces"),
             Triple("not_found", "File not found", "moved or deleted"),
             Triple("preview_unavailable", "No preview available", "LibreOffice"),
             Triple("offline", "Can't reach the host", "Check your connection"),
+            Triple("timeout", "Host took too long", "Try again"),
+            Triple("cancelled", "Loading interrupted", "Return to Verde"),
+            Triple("busy", "Too many files loading", "Wait for the other files"),
+            Triple("server_unavailable", "Host couldn't serve the file", "check Verde on the host"),
+            Triple("unauthorized", "Phone access refused", "pair this phone again"),
+            Triple("identity", "Host identity not verified", "certificate and trust settings"),
         )
         for ((code, title, detail) in cases) {
             val path="/home/u/$code.txt"
@@ -149,10 +155,12 @@ class FileViewerTest {
             await { exists(title) }
             assertTrue(exists(detail, substring=true))
             // Only transient failures offer Retry; only files that exist offer Download.
-            assertEquals(code == "offline", exists("Retry"))
+            assertEquals(code in setOf("offline", "timeout", "cancelled", "busy", "server_unavailable", "unauthorized"), exists("Retry"))
             assertEquals(code == "too_large" || code == "preview_unavailable", exists("Download file"))
         }
         val path="/home/u/offline.txt"
+        open(path)
+        await { exists("Can't reach the host") }
         failures.remove(path)
         files[path]="back online\n".encodeToByteArray()
         val before=core.events.count { it is EventFileOpen && it.path == path }
@@ -267,6 +275,56 @@ class FileViewerTest {
         await { exists("Needs Android 11") }
     }
 
+    @Test fun repeatedDownloadsWaitForForegroundAfterTheDocumentPickerReturns() {
+        start()
+        for (index in 1..3) {
+            val path="/home/u/image-$index.jpg"
+            val bytes=byteArrayOf(index.toByte(), 2, 3)
+            files[path]=bytes
+            val model=open(path)
+            await { model.state.value.content != null }
+            compose.runOnUiThread { signals.foreground.value=false }
+            await { core.lifecycle == Lifecycle.background }
+            val before=core.events.filterIsInstance<EventFileOpen>().size
+            var saved: ByteArray?=null
+            var discarded=false
+            // Activity results can arrive before ProcessLifecycleOwner reports ON_START.
+            compose.runOnUiThread { model.save({ saved=it }, { discarded=true }) }
+            pump()
+            assertEquals(before, core.events.filterIsInstance<EventFileOpen>().size)
+            assertFalse(discarded)
+            compose.runOnUiThread { signals.foreground.value=true }
+            await { saved != null }
+            assertArrayEquals(bytes, saved)
+            assertFalse(discarded)
+            assertEquals(before + 1, core.events.filterIsInstance<EventFileOpen>().size)
+        }
+    }
+
+    @Test fun waitingSaveDiscardsTheTargetIfForegroundNeverArrivesOrAccessIsWiped() {
+        start()
+        val path="/home/u/image.jpg"
+        files[path]=byteArrayOf(1, 2, 3)
+        val model=open(path, waitMs=1000)
+        await { model.state.value.content != null }
+        compose.runOnUiThread { signals.foreground.value=false }
+        await { core.lifecycle == Lifecycle.background }
+        val before=core.events.filterIsInstance<EventFileOpen>().size
+        val discarded=CopyOnWriteArrayList<Boolean>()
+        compose.runOnUiThread { model.save({ fail("Must not write while backgrounded") }, { discarded.add(true) }) }
+        await { discarded.size == 1 && model.download.value != DownloadStatus.Saving }
+        assertEquals(before, core.events.filterIsInstance<EventFileOpen>().size)
+        compose.runOnUiThread { model.save({ fail("Must not write after sign-out") }, { discarded.add(true) }) }
+        core.auth="signed_out"
+        compose.runOnUiThread { signals.network.value=NetworkState(true, "net-2") }
+        await { discarded.size == 2 }
+        assertEquals(before, core.events.filterIsInstance<EventFileOpen>().size)
+        assertEquals(FileProblem.Timeout, fileProblem("timeout"))
+        for (code in listOf("cancelled", "timeout", "busy", "server_unavailable", "unauthorized", "identity", "unavailable")) {
+            assertFalse(downloadFailureText(fileProblem(code)).contains("Can't reach the host"))
+        }
+    }
+
     @Test fun signingOutDropsTheOpenDocument() {
         start()
         files["/home/u/notes.txt"]="secret notes\n".encodeToByteArray()
@@ -318,9 +376,9 @@ class FileViewerTest {
         assertEquals(FileProblem.TooLarge, fileProblem("too_large"))
         assertEquals(FileProblem.Forbidden, fileProblem("forbidden"))
         assertEquals(FileProblem.NotFound, fileProblem("not_found"))
-        assertEquals(FileProblem.Offline, fileProblem("timeout"))
-        assertEquals(FileProblem.Unavailable, fileProblem("unauthorized"))
-        assertEquals(FileProblem.Failed, fileProblem("identity"))
+        assertEquals(FileProblem.Timeout, fileProblem("timeout"))
+        assertEquals(FileProblem.Unauthorized, fileProblem("unauthorized"))
+        assertEquals(FileProblem.Identity, fileProblem("identity"))
         assertTrue(problemText(FileProblem.TooLarge, MAX_DOCUMENT_BYTES).second.contains("32 MB"))
 
         // The route keeps the whole path in one segment; D-06 ranges survive the trip.
@@ -380,18 +438,21 @@ class FileViewerTest {
         val highlightLanguages=CopyOnWriteArrayList<String>()
         private val operations=ConcurrentHashMap<String, Operation>()
         @Volatile var auth="paired"
+        @Volatile var lifecycle=Lifecycle.foreground
         @Volatile var freed=false
         private var sequence=0
         override fun create(config: ByteArray)=1L
         override fun handle(host: Long, event: ByteArray): ByteArray {
             val decoded=CoreJson.decodeFromString<Event>(event.decodeToString())
             events.add(decoded)
+            if (decoded is EventBackground) lifecycle=Lifecycle.background
+            if (decoded is EventForeground) lifecycle=Lifecycle.foreground
             if (decoded is EventFileOpen) {
-                val failure=failures[decoded.path]
+                val failure=if (lifecycle != Lifecycle.foreground) "cancelled" else failures[decoded.path]
                 val body=files[decoded.path]
                 operations[decoded.intent_id]=when {
                     failure != null -> Operation(decoded.intent_id, "failed",
-                        LocalError(domain="file", code=failure, message="", retryable=failure == "offline"))
+                        LocalError(domain="file", code=failure, message="", retryable=failure in setOf("offline", "timeout", "cancelled", "busy", "server_unavailable", "unauthorized")))
                     body == null -> Operation(decoded.intent_id, "failed", LocalError(domain="file", code="not_found", message=""))
                     else -> { sink.put(decoded.intent_id, FileBody(body, null)); Operation(decoded.intent_id, "succeeded", null) }
                 }
@@ -401,7 +462,7 @@ class FileViewerTest {
         }
         override fun query(host: Long, selector: String): ByteArray = when {
             selector == "hosts" -> CoreJson.encodeToString(HostsQuery(1,"1",HostsView(listOf(HostView(saved.id,saved.label,null,null,null,
-                "ready",Lifecycle.foreground,auth,"ready",emptyList(),emptyList(),null,null,false,null)),operations.values.toList()),null))
+                "ready",lifecycle,auth,"ready",emptyList(),emptyList(),null,null,false,null)),operations.values.toList()),null))
             selector == "operations" -> CoreJson.encodeToString(OperationsQuery(1,"1",OperationsView(operations.values.toList()),null))
             selector.startsWith("{") -> utility(Json.parseToJsonElement(selector).jsonObject)
             else -> """{"api_version":1,"revision":"1","data":null,"error":{"domain":"input","code":"not_found","message":""}}"""

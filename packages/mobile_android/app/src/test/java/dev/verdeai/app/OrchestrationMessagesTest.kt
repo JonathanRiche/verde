@@ -64,16 +64,41 @@ class OrchestrationMessagesTest {
         assertNull(parentSteerBody("user", "<verde_parent_message from_thread=\"p\">no newline"))
     }
 
-    @Test fun longRepliesCollapse() {
-        assertEquals("short" to false, childReplyPreview("\nshort\n"))
-        val lines = (1..10).joinToString("\n") { "line $it with some words" }
-        val (preview, collapsible) = childReplyPreview(lines)
-        assertTrue(collapsible)
-        assertEquals(CHILD_REPLY_COLLAPSED_LINES, preview.lines().size)
-        val long = "x".repeat(CHILD_REPLY_COLLAPSED_CHARS + 100)
-        assertEquals(CHILD_REPLY_COLLAPSED_CHARS, childReplyPreview(long).first.length)
-        // Not worth a toggle for a few trailing characters.
-        assertFalse(childReplyPreview("x".repeat(CHILD_REPLY_COLLAPSED_CHARS + 5)).second)
+    @Test fun summaryStripsLabelAndTakesFirstSentence() {
+        val reply = "**Summary:** The three most recent commits touch the keybinds. Nothing else changed.\n\n" +
+            "**Details for the parent agent:** 0e046633, 6c1569bf, 408ed4fd."
+        assertEquals("The three most recent commits touch the keybinds.", childReplySummary(reply))
+        assertEquals("Tests pass.", childReplySummary("**Summary**: Tests pass. More."))
+        assertEquals("Tests pass", childReplySummary("Summary: Tests pass"))
+        // A label alone on its line yields to the next prose line.
+        assertEquals("Rebased onto master.", childReplySummary("**Summary:**\nRebased onto master."))
+    }
+
+    @Test fun summaryStripsMarkdown() {
+        assertEquals("Done", childReplySummary("\n## Done\nAll tests pass."))
+        assertEquals("Fixed the parser in chat.zig and added tests",
+            childReplySummary("- Fixed the **parser** in `chat.zig` and added [tests](https://x.dev/t)"))
+        assertEquals("Shipped it", childReplySummary("> *Shipped* it"))
+        assertEquals("After the code", childReplySummary("```zig\nconst x = 1;\n```\n---\nAfter the code"))
+        assertEquals("first line", childReplySummary("first line\nsecond line"))
+        assertEquals("version 1.2 is out", childReplySummary("version 1.2 is out"))
+        assertEquals("", childReplySummary(""))
+        assertEquals("", childReplySummary("```\nonly code\n```"))
+        val long = childReplySummary("x".repeat(300))
+        assertEquals(CHILD_SUMMARY_MAX_CHARS + 1, long.length)
+        assertTrue(long.endsWith("\u2026"))
+    }
+
+    @Test fun titleFallbackNeverShowsRawId() {
+        assertEquals("Fix keybinds", childTitle("child-1", "Fix keybinds"))
+        assertEquals("Linked chat", childTitle("child-1", null))
+        assertEquals("Linked chat", childTitle("child-1", "  "))
+        assertEquals("Linked chat", childTitle("child-1", "child-1"))
+    }
+
+    @Test fun humanActionStatusesOpenExpanded() {
+        assertEquals(setOf(ChildStatus.WaitingApproval, ChildStatus.Blocked, ChildStatus.Failed),
+            ChildStatus.entries.filter { it.expandedByDefault }.toSet())
     }
 
     @Test fun projectionTurnsNotificationsIntoCards() {
@@ -85,6 +110,52 @@ class OrchestrationMessagesTest {
         )
         val items = transcriptItems(ChatThreadView(thread, rows, ChatPage(false, null, false), null, null, null, false, null))
         assertEquals(listOf("Message", "ChildNotice", "ChildNotice"), items.map { it::class.simpleName })
-        assertEquals(ChildStatus.Failed, (items[2] as TranscriptItem.ChildNotice).notification.status)
+        assertEquals(ChildStatus.Failed, (items[2] as TranscriptItem.ChildNotice).notifications.single().status)
+    }
+
+    @Test fun batchedNotificationsParseInOrder() {
+        val a = notice("<child_reply>\nfirst\n</child_reply>", child = "child-a")
+        val b = notice("<child_reply>\nsecond\n</child_reply>", status = "failed", child = "child-b")
+        val c = notice("legacy bare", status = "blocked", child = "child-c")
+        val two = childNotifications("system", "$a\n\n$b")!!
+        assertEquals(listOf("child-a" to "first", "child-b" to "second"), two.map { it.childId to it.reply })
+        assertEquals(listOf(ChildStatus.Completed, ChildStatus.Failed), two.map { it.status })
+        val three = childNotifications("user", "$a\n\n$b\n\n$c")!!
+        assertEquals(listOf("child-a", "child-b", "child-c"), three.map { it.childId })
+        assertEquals("legacy bare", three[2].reply)
+        // The single-notification helper only accepts exactly one envelope.
+        assertNull(childNotification("user", "$a\n\n$b"))
+        assertNull(childNotifications("assistant", "$a\n\n$b"))
+    }
+
+    @Test fun batchWithMalformedPieceIsNotACard() {
+        val a = notice("<child_reply>\nfirst\n</child_reply>", child = "child-a")
+        assertNull(childNotifications("user", "$a\n\n" + notice("x", status = "sleeping")))
+        assertNull(childNotifications("user", "$a\n\n" + notice("x", child = "")))
+        // Only exactly "\n\n" joins envelopes; other joins never split (they fall back to the legacy
+        // bare-reply single-envelope reading).
+        assertNotEquals(2, childNotifications("user", "$a\n" + notice("x"))?.size)
+        assertNotEquals(2, childNotifications("user", "$a\n\n\n" + notice("x"))?.size)
+        assertNull(childNotifications("user", "$a\n\ntrailing text"))
+    }
+
+    @Test fun batchedReplyRestoresEscapedCloseTag() {
+        val a = notice("<child_reply>\nsaw <\\/child_reply> here\n</child_reply>", child = "child-a")
+        val b = notice("<child_reply>\nok\n</child_reply>", child = "child-b")
+        val parsed = childNotifications("user", "$a\n\n$b")!!
+        assertEquals(listOf("saw </child_reply> here", "ok"), parsed.map { it.reply })
+    }
+
+    @Test fun singleEnvelopeUnchanged() {
+        val body = notice("<child_reply>\n## Done\n</child_reply>")
+        assertEquals(listOf(childNotification("user", body)!!), childNotifications("user", body))
+        assertEquals("## Done", childNotifications("user", body)!!.single().reply)
+    }
+
+    @Test fun projectionStacksBatchedNotificationsInOneItem() {
+        val thread = ThreadSummary("ws", "parent", "Parent", "claude", null, null, true, false, null, "idle", "today")
+        val body = notice("one", child = "child-a") + "\n\n" + notice("two", child = "child-b")
+        val items = transcriptItems(ChatThreadView(thread, listOf(ChatRow("1", "user", body = body)), ChatPage(false, null, false), null, null, null, false, null))
+        assertEquals(listOf("child-a", "child-b"), (items.single() as TranscriptItem.ChildNotice).notifications.map { it.childId })
     }
 }

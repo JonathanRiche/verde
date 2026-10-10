@@ -52,7 +52,7 @@ internal class TranscriptContext(
     val onCitation: (FileCitation) -> Unit,
     /** The core's active turn start, for running-tool timers; null when idle. */
     val turnStartedAt: Long? = null,
-    /** Workspace chats, to name child chats in orchestration cards. */
+    /** Known chats (this workspace first), to name child chats in orchestration cards. */
     val threads: List<ThreadSummary> = emptyList(),
     /** Opens another chat in this workspace by thread id; null when navigation is unavailable. */
     val onOpenThread: ((String) -> Unit)? = null,
@@ -128,7 +128,10 @@ internal fun ThreadRoute(hosts: HostsModel, browse: BrowseModel, manage: ManageM
     val model: TranscriptModel = viewModel(key = "transcript:$workspaceId:$threadId",
         factory = viewModelFactory { initializer { TranscriptModel(hosts, browse.state, workspaceId, threadId) } })
     val browseState by browse.state.collectAsState()
-    val threads = browseState.workspaces?.items?.find { it.workspace_id == workspaceId }?.threads.orEmpty()
+    val workspaces = browseState.workspaces?.items.orEmpty()
+    val threads = workspaces.find { it.workspace_id == workspaceId }?.threads.orEmpty()
+    // Child chats may live in another workspace; this workspace's threads win the lookup.
+    val knownThreads = threads + workspaces.filter { it.workspace_id != workspaceId }.flatMap { it.threads }
     val title = threads.find { it.thread_id == threadId }?.title
     val manageState by manage.state.collectAsState()
     val gitClient = LocalGitChangesClient.current
@@ -140,7 +143,7 @@ internal fun ThreadRoute(hosts: HostsModel, browse: BrowseModel, manage: ManageM
     LaunchedEffect(model) { PromptHandoff.take(browseState.hostId, workspaceId, threadId)?.let(model.composer::ask) }
     TranscriptScreen(model, title, onBack, onHosts, browse::refresh, onCitation,
         canEditThread = manageState.view?.can_create_threads == true, onThreadAction = onThreadAction,
-        gitChanges = git, threads = threads, onOpenThread = onOpenThread, bottomBar = { m, s -> ChatComposer(m, s) })
+        gitChanges = git, threads = knownThreads, onOpenThread = onOpenThread, bottomBar = { m, s -> ChatComposer(m, s) })
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -496,9 +499,6 @@ internal fun NoticeRow(row: ChatRow, ctx: TranscriptContext) {
     }
 }
 
-internal fun providerLabel(provider: String) =
-    PROVIDERS.firstOrNull { it.first == provider.lowercase() }?.second ?: provider.replaceFirstChar { it.uppercase() }
-
 @Composable
 internal fun childStatusColor(status: ChildStatus): Color = when (status) {
     ChildStatus.Running, ChildStatus.Completed -> MaterialTheme.colorScheme.primary
@@ -507,45 +507,64 @@ internal fun childStatusColor(status: ChildStatus): Color = when (status) {
     ChildStatus.Idle, ChildStatus.Aborted, ChildStatus.Interrupted -> MaterialTheme.colorScheme.outline
 }
 
-/** A child chat's result in its orchestrating parent: neutral card, child identity, reply markdown. */
-@OptIn(ExperimentalFoundationApi::class)
+/**
+ * Child results in their orchestrating parent: compact rows (status dot, child title, status,
+ * chevron, one-line summary) that expand to the full reply. A batched delivery stacks its rows in
+ * one container with thin dividers.
+ */
 @Composable
 internal fun ChildNotificationCard(item: TranscriptItem.ChildNotice, ctx: TranscriptContext) {
+    Column(Modifier.fillMaxWidth()
+        .background(VerdeColors.Panel, RoundedCornerShape(10.dp))
+        .border(1.dp, VerdeColors.Border, RoundedCornerShape(10.dp))) {
+        item.notifications.forEachIndexed { index, notification ->
+            if (index > 0) HorizontalDivider(thickness = 1.dp, color = VerdeColors.Border)
+            ChildResultRow(notification, "${item.key}:child:$index", ctx)
+        }
+    }
+}
+
+/** One child's result: collapsed to a summary line unless the human must act on it. */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun ChildResultRow(notification: ChildNotification, key: String, ctx: TranscriptContext) {
     @Suppress("DEPRECATION") val clipboard = LocalClipboardManager.current
-    val notification = item.notification
     val child = ctx.threads.find { it.thread_id == notification.childId }
-    val title = child?.title?.ifEmpty { null } ?: notification.childId
+    val title = childTitle(notification.childId, child?.title)
     var menu by remember { mutableStateOf(false) }
-    var expanded by rememberSaveable(item.key) { mutableStateOf(false) }
-    val (preview, collapsible) = remember(notification.reply) { childReplyPreview(notification.reply) }
+    // Keyed per message and child index, so the choice survives scrolling for the screen session.
+    var expanded by rememberSaveable(key) { mutableStateOf(notification.status.expandedByDefault) }
+    val summary = remember(notification.reply) { childReplySummary(notification.reply) }
     val colors = MaterialTheme.colorScheme
+    val statusColor = childStatusColor(notification.status)
     val open = ctx.onOpenThread?.let { { it(notification.childId) } }
     Box(Modifier.fillMaxWidth()) {
         Column(Modifier.fillMaxWidth()
-            .background(VerdeColors.Panel, RoundedCornerShape(10.dp))
-            .border(1.dp, VerdeColors.Border, RoundedCornerShape(10.dp))
-            .combinedClickable(onClick = {}, onLongClickLabel = "Copy reply", onLongClick = { menu = true })) {
-            Row(Modifier.fillMaxWidth()
-                .then(if (open != null) Modifier.clickable(onClickLabel = "Open chat", onClick = open) else Modifier)
-                .heightIn(min = 44.dp).padding(start = 12.dp, end = if (open != null) 4.dp else 12.dp),
-                verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                ProviderGlyph(child?.provider, Modifier.size(16.dp))
+            .combinedClickable(onClickLabel = if (expanded) "Collapse" else "Expand", onClick = { expanded = !expanded },
+                onLongClickLabel = "Copy reply", onLongClick = { menu = true })
+            .padding(start = 12.dp, end = 8.dp, top = 8.dp, bottom = if (expanded) 4.dp else 8.dp)) {
+            Row(Modifier.fillMaxWidth().heightIn(min = 28.dp), verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                StatusPip(statusColor, size = 8.dp, active = notification.status == ChildStatus.Running)
                 Text(title, Modifier.weight(1f), style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                child?.provider?.takeIf { it.isNotEmpty() }?.let {
-                    Text(providerLabel(it), style = MaterialTheme.typography.labelMedium, color = colors.onSurfaceVariant, maxLines = 1)
+                Text(notification.status.label, style = MaterialTheme.typography.labelMedium, color = statusColor, maxLines = 1)
+                Icon(Icons.Filled.KeyboardArrowDown, contentDescription = null, tint = colors.onSurfaceVariant,
+                    modifier = Modifier.size(20.dp).rotate(if (expanded) 180f else 0f))
+            }
+            if (!expanded) {
+                Text(summary.ifEmpty { "No reply" }, Modifier.padding(start = 16.dp, end = 4.dp),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (summary.isEmpty()) colors.outline else colors.onSurfaceVariant,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis)
+            } else {
+                Column(Modifier.fillMaxWidth().padding(top = 4.dp, end = 4.dp)) {
+                    val text = notification.reply.trim()
+                    if (text.isNotEmpty()) MarkdownText(text, ctx.model, ctx.onCitation)
+                    else Text("No reply", style = MaterialTheme.typography.bodySmall, color = colors.outline)
                 }
-                Text(notification.status.label, style = MaterialTheme.typography.labelMedium, color = childStatusColor(notification.status), maxLines = 1)
-                if (open != null) TextButton(onClick = open, contentPadding = PaddingValues(horizontal = 8.dp)) {
+                if (open != null) TextButton(onClick = open, Modifier.align(Alignment.End), contentPadding = PaddingValues(horizontal = 8.dp)) {
                     Text("Open chat", style = MaterialTheme.typography.labelMedium)
                 }
-            }
-            Column(Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, bottom = if (collapsible) 0.dp else 10.dp)) {
-                val text = if (expanded || !collapsible) notification.reply.trim() else preview
-                if (text.isNotEmpty()) MarkdownText(text, ctx.model, ctx.onCitation)
-                else Text("No reply", style = MaterialTheme.typography.bodySmall, color = colors.outline)
-            }
-            if (collapsible) TextButton(onClick = { expanded = !expanded }, Modifier.align(Alignment.End).padding(end = 4.dp)) {
-                Text(if (expanded) "Show less" else "Show more", style = MaterialTheme.typography.labelMedium)
             }
         }
         DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {

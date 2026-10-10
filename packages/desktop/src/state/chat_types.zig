@@ -92,6 +92,11 @@ pub const TranscriptLayoutItem = struct {
     // Negative offset from the estimated committed tail.
     top: f32,
     height: f32,
+    /// Nonzero when the row opens with an orchestration summary: the number
+    /// of child notifications folded into it (see chat_panel orchestration runs).
+    orchestration_updates: u32 = 0,
+    /// The summary row stands in for the whole [message_index, group_end) span.
+    orchestration_collapsed: bool = false,
 };
 
 pub const ChatMessage = struct {

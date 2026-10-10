@@ -27,6 +27,7 @@ pub fn build(b: *std.Build) void {
     const webview2_include_dir = b.option([]const u8, "webview2-include-dir", "Directory containing WebView2.h");
     const webview2_loader_lib = b.option([]const u8, "webview2-loader-lib", "Exact WebView2 loader import library");
     const webview2_loader_dll = b.option([]const u8, "webview2-loader-dll", "Path to WebView2Loader.dll to install beside the desktop executable");
+    const test_filters = b.option([]const []const u8, "test-filter", "Compile and run only tests whose name contains this substring (repeatable)") orelse &.{};
 
     const build_cmd = addDesktopCommand(b, optimize, .{
         .subcommand = null,
@@ -90,7 +91,7 @@ pub fn build(b: *std.Build) void {
     const daemon_step = b.step("daemon", "Build and install the GUI-free Verde daemon");
     daemon_step.dependOn(&daemon_cmd.step);
 
-    const daemon_test_cmd = addDaemonCommand(b, optimize, "daemon-test", target, cpu, version, .{ .build_fff = build_fff, .fff_cargo_target = fff_cargo_target, .fff_lib_dir = fff_lib_dir, .fff_import_lib = fff_import_lib, .fff_runtime_lib = fff_runtime_lib });
+    const daemon_test_cmd = addDaemonCommand(b, optimize, "daemon-test", target, cpu, version, .{ .test_filters = test_filters, .build_fff = build_fff, .fff_cargo_target = fff_cargo_target, .fff_lib_dir = fff_lib_dir, .fff_import_lib = fff_import_lib, .fff_runtime_lib = fff_runtime_lib });
     const daemon_test_step = b.step("daemon-test", "Run GUI-free Verde daemon tests");
     daemon_test_step.dependOn(&daemon_test_cmd.step);
 
@@ -137,6 +138,7 @@ pub fn build(b: *std.Build) void {
     const test_cmd = addDesktopCommand(b, test_optimize, .{
         .subcommand = "test",
         .forward_runtime_args = false,
+        .test_filters = test_filters,
         .target = target,
         .version = version,
         .ui_debug = ui_debug,
@@ -166,6 +168,7 @@ pub fn build(b: *std.Build) void {
     const test_compile_cmd = addDesktopCommand(b, test_optimize, .{
         .subcommand = "test-compile",
         .forward_runtime_args = false,
+        .test_filters = test_filters,
         .target = target,
         .version = version,
         .ui_debug = ui_debug,
@@ -212,6 +215,7 @@ pub fn build(b: *std.Build) void {
     const runtime_test_cmd = addDesktopCommand(b, test_optimize, .{
         .subcommand = "runtime-test",
         .forward_runtime_args = false,
+        .test_filters = test_filters,
         .target = target,
         .version = version,
         .ui_debug = ui_debug,
@@ -278,6 +282,7 @@ pub fn build(b: *std.Build) void {
 const DesktopCommandOptions = struct {
     subcommand: ?[]const u8,
     forward_runtime_args: bool,
+    test_filters: []const []const u8 = &.{},
     target: ?[]const u8 = null,
     version: ?[]const u8 = null,
     ui_debug: ?bool = null,
@@ -355,6 +360,7 @@ fn addDesktopCommand(
     appendStringOption(b, &argv, "webview2-include-dir", options.webview2_include_dir);
     appendStringOption(b, &argv, "webview2-loader-lib", options.webview2_loader_lib);
     appendStringOption(b, &argv, "webview2-loader-dll", options.webview2_loader_dll);
+    appendTestFilters(b, &argv, options.test_filters);
     appendInstallArgs(b, &argv);
 
     const cmd = b.addSystemCommand(argv.items);
@@ -370,6 +376,12 @@ fn addDesktopCommand(
     return cmd;
 }
 
+fn appendTestFilters(b: *std.Build, argv: *std.ArrayList([]const u8), filters: []const []const u8) void {
+    for (filters) |filter| {
+        argv.append(b.allocator, b.fmt("-Dtest-filter={s}", .{filter})) catch @panic("OOM");
+    }
+}
+
 fn addDaemonCommand(
     b: *std.Build,
     optimize: std.builtin.OptimizeMode,
@@ -378,6 +390,7 @@ fn addDaemonCommand(
     cpu: ?[]const u8,
     version: ?[]const u8,
     fff: struct {
+        test_filters: []const []const u8 = &.{},
         build_fff: ?bool,
         fff_cargo_target: ?[]const u8,
         fff_lib_dir: ?[]const u8,
@@ -402,6 +415,7 @@ fn addDaemonCommand(
     appendStringOption(b, &argv, "fff-lib-dir", fff.fff_lib_dir);
     appendStringOption(b, &argv, "fff-import-lib", fff.fff_import_lib);
     appendStringOption(b, &argv, "fff-runtime-lib", fff.fff_runtime_lib);
+    appendTestFilters(b, &argv, fff.test_filters);
     appendInstallArgs(b, &argv);
 
     const cmd = b.addSystemCommand(argv.items);

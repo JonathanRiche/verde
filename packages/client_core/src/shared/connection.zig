@@ -30,6 +30,8 @@ pub const Phase = enum {
 /// Stable failure classes for retry policy and machine-readable diagnostics.
 pub const FailureKind = enum {
     authentication,
+    /// The transport session must be re-established; device authority was not rejected.
+    session_authentication,
     network,
     server_unavailable,
     identity,
@@ -76,6 +78,7 @@ pub const IdentityPinAdoption = enum {
 pub const TransportError = error{
     OutOfMemory,
     AuthenticationRequired,
+    SessionAuthenticationRequired,
     NetworkUnavailable,
     RequestTimedOut,
     ConnectionClosed,
@@ -287,6 +290,7 @@ pub fn validateRuntimeStatus(status: headless.StatusResult) !void {
 fn classifyHandshakeError(err: anyerror) FailureKind {
     return switch (err) {
         error.AuthenticationRequired => .authentication,
+        error.SessionAuthenticationRequired => .session_authentication,
         error.NetworkUnavailable,
         error.RequestTimedOut,
         error.ConnectionClosed,
@@ -718,6 +722,7 @@ const ErrorTransport = struct {
         const self: *ErrorTransport = @ptrCast(@alignCast(ctx));
         return switch (self.failure) {
             .authentication => error.AuthenticationRequired,
+            .session_authentication => error.SessionAuthenticationRequired,
             .network => error.NetworkUnavailable,
             .server_unavailable => error.ServerUnavailable,
             .wrong_service => error.WrongService,
@@ -1335,4 +1340,9 @@ test "connection and owned handshake clean up every allocation failure" {
         checkConnectionAllocationFailures,
         .{},
     );
+}
+
+test "session authentication remains distinct and never schedules network retry" {
+    try std.testing.expectEqual(FailureKind.session_authentication, classifyHandshakeError(error.SessionAuthenticationRequired));
+    try std.testing.expect(!FailureKind.session_authentication.retryable());
 }

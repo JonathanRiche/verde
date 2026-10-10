@@ -32,13 +32,34 @@ private const val REPLY_OPEN = "<child_reply>\n"
 private const val REPLY_CLOSE = "\n</child_reply>"
 private const val STEER_OPEN = "<verde_parent_message from_thread=\""
 private const val STEER_CLOSE = "\n</verde_parent_message>"
+private const val BATCH_SEPARATOR = CHILD_SUFFIX + "\n\n" + CHILD_PREFIX
 
 /**
  * Idle parents receive the notification as a user turn; busy parents as a system steering event.
- * Returns null for anything that is not exactly the envelope, so ordinary messages render as-is.
+ * Returns null for anything that is not exactly one envelope, so ordinary messages render as-is.
  */
-internal fun childNotification(role: String, body: String): ChildNotification? {
+internal fun childNotification(role: String, body: String): ChildNotification? =
+    childNotifications(role, body)?.singleOrNull()
+
+/**
+ * The daemon may batch several pending deliveries into one message: complete envelopes joined by
+ * exactly "\n\n". Returns 1..N notifications, or null unless every piece is a valid envelope.
+ */
+internal fun childNotifications(role: String, body: String): List<ChildNotification>? {
     if (role != "user" && role != "system") return null
+    if (!body.startsWith(CHILD_PREFIX)) return null
+    val out = ArrayList<ChildNotification>(1)
+    var start = 0
+    while (true) {
+        val sep = body.indexOf(BATCH_SEPARATOR, start)
+        val end = if (sep >= 0) sep + CHILD_SUFFIX.length else body.length
+        out.add(singleChildNotification(body.substring(start, end)) ?: return null)
+        if (sep < 0) return out
+        start = sep + CHILD_SUFFIX.length + 2
+    }
+}
+
+private fun singleChildNotification(body: String): ChildNotification? {
     if (!body.startsWith(CHILD_PREFIX) || !body.endsWith(CHILD_SUFFIX)) return null
     if (body.length < CHILD_PREFIX.length + CHILD_SUFFIX.length) return null
     var rest = body.substring(CHILD_PREFIX.length, body.length - CHILD_SUFFIX.length)
@@ -75,22 +96,53 @@ internal fun parentSteerBody(role: String, body: String): String? {
     return body.substring(innerStart, innerEnd)
 }
 
-internal const val CHILD_REPLY_COLLAPSED_LINES = 6
-internal const val CHILD_REPLY_COLLAPSED_CHARS = 480
+/** Statuses where the human must act; their result rows open expanded. */
+internal val ChildStatus.expandedByDefault: Boolean
+    get() = this == ChildStatus.WaitingApproval || this == ChildStatus.Blocked || this == ChildStatus.Failed
+
+internal const val CHILD_FALLBACK_TITLE = "Linked chat"
 
 /**
- * Long child replies collapse to a short preview (desktop limits). Returns the preview and whether
- * a toggle is worth showing; a toggle that would reveal only a few trailing characters is skipped.
+ * The child chat's display title from the app's known threads (link state is irrelevant). Never
+ * shows the raw thread id: an unknown or untitled child reads as "Linked chat".
  */
-internal fun childReplyPreview(reply: String): Pair<String, Boolean> {
-    val text = reply.trim()
-    var end = minOf(text.length, CHILD_REPLY_COLLAPSED_CHARS)
-    var lines = 0
-    for (i in 0 until end) {
-        if (text[i] != '\n') continue
-        if (++lines == CHILD_REPLY_COLLAPSED_LINES) { end = i; break }
+internal fun childTitle(childId: String, knownTitle: String?): String =
+    knownTitle?.trim()?.takeIf { it.isNotEmpty() && it != childId } ?: CHILD_FALLBACK_TITLE
+
+internal const val CHILD_SUMMARY_MAX_CHARS = 200
+
+private val FENCE = Regex("""^(```|~~~)""")
+private val RULE = Regex("""^([-*_]\s*){3,}$""")
+private val LINE_MARKERS = Regex("""^(?:>\s*)*(?:#{1,6}\s+|[-*+]\s+|\d{1,3}[.)]\s+)?""")
+private val BOLD_LABEL = Regex("""^(\*\*|__)\s*[^*_\n]{1,48}?\s*(?::\s*\1|\1\s*:)\s*""")
+private val PLAIN_LABEL = Regex("""^(?:summary|tl;dr)\s*:\s*""", RegexOption.IGNORE_CASE)
+private val LINK = Regex("""!?\[([^\]]*)]\([^)]*\)""")
+private val EMPHASIS = Regex("""\*\*|__|\*|~~|`""")
+private val SPACES = Regex("""\s+""")
+private val SENTENCE_END = Regex("""[.!?](?=\s)""")
+
+/**
+ * One plain-language line for a collapsed child result: the first sentence of the first prose
+ * line, with markdown and a leading bold label ("**Summary:**") removed. Code blocks and rules are
+ * skipped. Empty when the reply has no prose.
+ */
+internal fun childReplySummary(reply: String): String {
+    var inFence = false
+    for (raw in reply.lines()) {
+        var line = raw.trim()
+        if (FENCE.containsMatchIn(line)) { inFence = !inFence; continue }
+        if (inFence || line.isEmpty() || RULE.matches(line)) continue
+        line = LINE_MARKERS.replaceFirst(line, "")
+        line = BOLD_LABEL.replaceFirst(line, "")
+        line = LINK.replace(line, "$1")
+        line = EMPHASIS.replace(line, "")
+        line = PLAIN_LABEL.replaceFirst(SPACES.replace(line, " ").trim(), "")
+        if (line.isEmpty()) continue
+        SENTENCE_END.find(line)?.let { line = line.substring(0, it.range.last + 1) }
+        if (line.length <= CHILD_SUMMARY_MAX_CHARS) return line
+        var end = CHILD_SUMMARY_MAX_CHARS
+        if (Character.isLowSurrogate(line[end])) end--
+        return line.substring(0, end).trimEnd() + "\u2026"
     }
-    if (end > 0 && end < text.length && Character.isLowSurrogate(text[end])) end--
-    if (end >= text.length || text.length - end < 16) return text to false
-    return text.substring(0, end).trimEnd() to true
+    return ""
 }

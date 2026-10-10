@@ -229,6 +229,24 @@ class CoreHostTest {
                 assertEquals("text/markdown", body.contentType)
                 assertNull(host.takeFile("intent-ok"))
 
+                // Repeated downloads consume bodies independently while reusing the pinned socket.
+                repeat(3) { index ->
+                    val bytes=ByteArray(2 * 1024 * 1024) { (it + index).toByte() }
+                    fixture.server.enqueue(MockResponse().setHeader("Content-Type", "image/jpeg")
+                        .setBody(okio.Buffer().write(bytes)))
+                    core.effects=listOf(fetch("image-$index", cap=bytes.size.toLong()))
+                    host.send { n,w -> EventForeground(now_ms=n, wall_time_ms=w) }
+                    val completed=core.next<EventHttpResponse>()
+                    assertNull(completed.error)
+                    assertEquals(200, completed.status)
+                    assertNull(completed.body_base64)
+                    assertArrayEquals(bytes, host.takeFile("intent-image-$index")!!.bytes)
+                    assertNull(host.takeFile("intent-image-$index"))
+                    val repeated=fixture.server.takeRequest(2, TimeUnit.SECONDS)!!
+                    assertEquals("Bearer t", repeated.getHeader("Authorization"))
+                    assertEquals(index + 1, repeated.sequenceNumber)
+                }
+
                 fixture.server.enqueue(MockResponse().setResponseCode(403).setBody("{\"error\":\"path_outside_workspace\"}"))
                 core.effects = listOf(fetch("denied"))
                 host.send { n,w -> EventForeground(now_ms=n, wall_time_ms=w) }

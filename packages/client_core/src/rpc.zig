@@ -306,7 +306,7 @@ fn finish(tx: *host.Transaction, call: Call, value: ?V, err: ?host.LocalError) h
 
 pub fn failure(kind: connection.FailureKind, code: []const u8, uncertain: bool) host.LocalError {
     return .{ .domain = switch (kind) {
-        .authentication => "auth",
+        .authentication, .session_authentication => "auth",
         .identity => "identity",
         .protocol, .wrong_service => "protocol",
         .resource => "resource",

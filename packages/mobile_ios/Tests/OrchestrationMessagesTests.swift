@@ -39,6 +39,54 @@ final class OrchestrationMessagesTests: XCTestCase {
         XCTAssertEqual(parsed.status.label, "Failed")
     }
 
+    private func envelope(_ child: String, _ status: String, _ reply: String) -> String {
+        "[Verde child status notification]\nChild chat: \(child)\nTurn: t-1\nStatus: \(status)\n\(reply)" + footer
+    }
+
+    func testBatchedNotificationsParseInOrder() throws {
+        let a = envelope("child-a", "completed", "<child_reply>\nfirst\n</child_reply>")
+        let b = envelope("child-b", "failed", "<child_reply>\nsecond\n</child_reply>")
+        let c = envelope("child-c", "blocked", "legacy bare")
+        let two = try XCTUnwrap(childNotifications(role: "system", body: a + "\n\n" + b))
+        XCTAssertEqual(two.map(\.childID), ["child-a", "child-b"])
+        XCTAssertEqual(two.map(\.reply), ["first", "second"])
+        XCTAssertEqual(two.map(\.status), [.completed, .failed])
+        let three = try XCTUnwrap(childNotifications(role: "user", body: [a, b, c].joined(separator: "\n\n")))
+        XCTAssertEqual(three.map(\.childID), ["child-a", "child-b", "child-c"])
+        XCTAssertEqual(three[2].reply, "legacy bare")
+        // The single-notification helper only accepts exactly one envelope.
+        XCTAssertNil(childNotification(role: "user", body: a + "\n\n" + b))
+        XCTAssertNil(childNotifications(role: "assistant", body: a + "\n\n" + b))
+        XCTAssertEqual(orchestrationDisplayBody(role: "user", body: a + "\n\n" + b), "first\n\nsecond")
+    }
+
+    func testBatchWithMalformedPieceIsNotACard() {
+        let a = envelope("child-a", "completed", "<child_reply>\nfirst\n</child_reply>")
+        XCTAssertNil(childNotifications(role: "user", body: a + "\n\n" + envelope("child-b", "sleeping", "x")))
+        XCTAssertNil(childNotifications(role: "user", body: a + "\n\n" + envelope("", "idle", "x")))
+        // Only exactly "\n\n" joins envelopes; other joins never split (they fall back to the legacy
+        // bare-reply single-envelope reading).
+        XCTAssertNotEqual(childNotifications(role: "user", body: a + "\n" + envelope("child-b", "idle", "x"))?.count, 2)
+        XCTAssertNotEqual(childNotifications(role: "user", body: a + "\n\n\n" + envelope("child-b", "idle", "x"))?.count, 2)
+        XCTAssertNil(childNotifications(role: "user", body: a + "\n\ntrailing text"))
+        let malformed = a + "\n\ntrailing text"
+        XCTAssertEqual(orchestrationDisplayBody(role: "user", body: malformed), malformed)
+    }
+
+    func testBatchedReplyRestoresEscapedCloseTag() throws {
+        let a = envelope("child-a", "completed", "<child_reply>\nsaw <\\/child_reply> here\n</child_reply>")
+        let b = envelope("child-b", "completed", "<child_reply>\nok\n</child_reply>")
+        let parsed = try XCTUnwrap(childNotifications(role: "user", body: a + "\n\n" + b))
+        XCTAssertEqual(parsed.map(\.reply), ["saw </child_reply> here", "ok"])
+    }
+
+    func testSingleEnvelopeUnchanged() throws {
+        let body = notification("completed", "<child_reply>\n## Done\n</child_reply>")
+        let single = try XCTUnwrap(childNotification(role: "user", body: body))
+        XCTAssertEqual(childNotifications(role: "user", body: body), [single])
+        XCTAssertEqual(single.reply, "## Done")
+    }
+
     func testStatusLabels() {
         let labels = ChildStatus.allCases.map(\.label)
         XCTAssertEqual(labels, ["Idle", "Running", "Needs approval", "Blocked", "Done", "Failed", "Stopped", "Interrupted"])
@@ -91,10 +139,14 @@ final class OrchestrationMessagesTests: XCTestCase {
             ChatRow(id: "u", role: "user", body: notification("completed", "<child_reply>\ndone\n</child_reply>")),
             ChatRow(id: "s", role: "system", body: notification("blocked", "stuck")),
             ChatRow(id: "p", role: "user", body: "plain"),
+            ChatRow(id: "b", role: "user", body: envelope("child-a", "idle", "one") + "\n\n" + envelope("child-b", "idle", "two")),
         ]
         view.turn = nil
         view.approval = nil
         view.usage = nil
-        XCTAssertEqual(transcriptItems(view).map(\.kindName), ["ChildNotification", "ChildNotification", "Message"])
+        let items = transcriptItems(view)
+        XCTAssertEqual(items.map(\.kindName), ["ChildNotification", "ChildNotification", "Message", "ChildNotification"])
+        guard case .childNotification(_, let batched) = items[3] else { return XCTFail("expected a child notification") }
+        XCTAssertEqual(batched.map(\.childID), ["child-a", "child-b"])
     }
 }

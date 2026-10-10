@@ -488,6 +488,7 @@ pub const Store = struct {
         }
         access_store.initialize(conn) catch |err| return mapOpenError(err);
         @import("push.zig").initialize(conn) catch |err| return mapOpenError(err);
+        @import("chat_links.zig").initialize(conn) catch |err| return mapOpenError(err);
         if (runtime_identity) |identity| {
             connect_store.initialize(conn, identity.runtime_id, identity.instance_id) catch |err|
                 return mapOpenError(err);
@@ -824,8 +825,15 @@ pub const Store = struct {
         ) catch return error.StoreUnavailable) orelse return false;
         defer row.deinit();
         if (row.int(2) < 0) return false;
+        // Receipts persist the digest form; proofs carry the canonical
+        // encoding the mutation was fingerprinted from.
+        var digest: [FINGERPRINT_LEN]u8 = undefined;
+        const expected_fingerprint: []const u8 = if (isDigestFingerprint(fingerprint)) fingerprint else blk: {
+            digest = fingerprintBytes(fingerprint);
+            break :blk &digest;
+        };
         return std.mem.eql(u8, row.text(0), operation) and
-            std.mem.eql(u8, row.text(1), fingerprint) and
+            std.mem.eql(u8, row.text(1), expected_fingerprint) and
             @as(u64, @intCast(row.int(2))) == store_revision and
             row.int(3) == 0;
     }

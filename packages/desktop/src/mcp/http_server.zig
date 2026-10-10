@@ -121,6 +121,10 @@ fn bindLoopback(io: std.Io, preferred_port: u16) !BoundListener {
 
 fn tryBind(io: std.Io, port: u16) !?std.Io.net.Server {
     const address = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+    // `reuse_address` also sets SO_REUSEPORT, which lets a second listener
+    // share a port that another live daemon (or a test) is accepting on and
+    // silently splits its connections. Never bind over an accepting listener.
+    if (loopbackListenerActive(io, &address)) return null;
     // Provider MCP clients retain this URL across daemon restarts. Reuse the
     // loopback listener immediately instead of drifting to the next port while
     // accepted sockets from the previous daemon remain in TIME_WAIT.
@@ -128,6 +132,15 @@ fn tryBind(io: std.Io, port: u16) !?std.Io.net.Server {
         error.AddressInUse => null,
         else => |other| return other,
     };
+}
+
+fn loopbackListenerActive(io: std.Io, address: *const std.Io.net.IpAddress) bool {
+    var stream = address.connect(io, .{ .mode = .stream }) catch |err| return switch (err) {
+        error.ConnectionRefused => false,
+        else => true,
+    };
+    stream.close(io);
+    return true;
 }
 
 fn acceptLoop(state: *State) void {

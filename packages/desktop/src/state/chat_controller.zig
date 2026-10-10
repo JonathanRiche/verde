@@ -1916,6 +1916,42 @@ pub fn effectiveThreadCwd(project_path: []const u8, thread: *const ChatThread) [
     return if (thread.cwd) |cwd| std.mem.sliceTo(cwd, 0) else project_path;
 }
 
+/// Retained terminals belong to the runtime and CWD that emitted them.
+/// A pinned Local route can use the local daemon even though it cannot use
+/// the legacy send harness. Remote paths must never reach that daemon.
+pub fn codexBackgroundTaskCwd(project_path: []const u8, thread: *const ChatThread, task: *const BackgroundTask) ?[]const u8 {
+    const route = thread.selectedRuntimeRoute();
+    if (!std.mem.eql(u8, route.profile_id, chat_types.LOCAL_RUNTIME_PROFILE_ID)) return null;
+    if (task.cwd) |cwd| {
+        if (cwd.len != 0) return cwd;
+    }
+    if (!std.mem.eql(u8, route.repository_id, chat_types.PRIMARY_REPOSITORY_ID) or route.relative_cwd != null) return null;
+    return effectiveThreadCwd(project_path, thread);
+}
+
+test "Codex background controls route pinned Local tasks by their original CWD" {
+    const allocator = std.testing.allocator;
+    var thread = try ChatThread.init(allocator, "Background controls");
+    defer thread.deinit(allocator);
+    const task: BackgroundTask = .{ .command = "sleep 60", .cwd = "/original/repository", .status = .running };
+    try thread.pinRuntimeRoute(allocator, "0123456789abcdef0123456789abcdef");
+    try std.testing.expect(!mayUseLegacyLocalExecution(&thread));
+    try std.testing.expectEqualStrings("/original/repository", codexBackgroundTaskCwd("/workspace", &thread, &task).?);
+    const legacy_task: BackgroundTask = .{ .command = "sleep 60", .status = .running };
+    try std.testing.expectEqualStrings("/workspace", codexBackgroundTaskCwd("/workspace", &thread, &legacy_task).?);
+
+    var remote = try ChatThread.init(allocator, "Remote background controls");
+    defer remote.deinit(allocator);
+    _ = try remote.selectRuntimeRoute(allocator, .{ .profile_id = "remote-box", .repository_id = "primary" });
+    try std.testing.expect(codexBackgroundTaskCwd("/workspace", &remote, &task) == null);
+
+    var repository = try ChatThread.init(allocator, "Repository background controls");
+    defer repository.deinit(allocator);
+    _ = try repository.selectRuntimeRoute(allocator, .{ .profile_id = chat_types.LOCAL_RUNTIME_PROFILE_ID, .repository_id = "secondary", .relative_cwd = "api" });
+    try std.testing.expectEqualStrings("/original/repository", codexBackgroundTaskCwd("/workspace", &repository, &task).?);
+    try std.testing.expect(codexBackgroundTaskCwd("/workspace", &repository, &legacy_task) == null);
+}
+
 /// The existing provider harness is local-only. Until the runtime connection
 /// manager supplies a verified target, only the exact legacy Local/primary
 /// route may reach it; every explicit runtime/repository route fails closed.
@@ -5423,13 +5459,13 @@ fn startQueuedCodexStopForThread(
         if (task.status != .running or task.provider != .codex) continue;
         if (!task.stop_requested or task.stop_dispatched) continue;
         if (task.provider_thread_id == null or task.process_id == null) continue;
-        const target = self.providerExecutionTargetForProjectThread(project_index, thread, 0) orelse {
+        const cwd = codexBackgroundTaskCwd(self.project_controller.projects.items[project_index].path, thread, task) orelse {
             runtime_log.diagnostic("bg-stop codex stop: no execution target thread={s} process={s}", .{ thread.local_thread_id, task.process_id.? });
             task.stop_requested = false;
             self.setSidebarNotice("Codex could not stop the background task: no execution target for this chat.");
             continue;
         };
-        if (spawnCodexBackgroundPollWorker(self, poll, thread, task, target.cwd(), true)) {
+        if (spawnCodexBackgroundPollWorker(self, poll, thread, task, cwd, true)) {
             task.stop_dispatched = true;
             runtime_log.diagnostic("bg-stop codex stop dispatched thread={s} process={s}", .{ thread.local_thread_id, task.process_id.? });
             return true;
@@ -5455,9 +5491,9 @@ fn startCodexBackgroundPollForThread(
         if (task.provider_thread_id == null or task.process_id == null) continue;
         const poll_interval_ms = codexBackgroundTaskPollIntervalMs(task.poll_failure_count);
         if (task.last_poll_ms != 0 and now_ms - task.last_poll_ms < poll_interval_ms) continue;
-        const target = self.providerExecutionTargetForProjectThread(project_index, thread, 0) orelse return false;
+        const cwd = codexBackgroundTaskCwd(self.project_controller.projects.items[project_index].path, thread, task) orelse return false;
         task.last_poll_ms = now_ms;
-        return spawnCodexBackgroundPollWorker(self, poll, thread, task, target.cwd(), false);
+        return spawnCodexBackgroundPollWorker(self, poll, thread, task, cwd, false);
     }
     return false;
 }

@@ -1,4 +1,7 @@
 //! Aggregate desktop test root kept out of the production GUI source graph.
+//! Provider, daemon store/RPC, and sessionizer tests belong to `daemon-test`
+//! (rooted at daemon_main.zig); registering them here compiled and ran the
+//! same ~650 tests twice.
 
 pub const test_backend = @import("state/test_backend.zig");
 
@@ -31,16 +34,6 @@ test {
     _ = @import("ui/text_edit.zig");
     _ = @import("state/workspace_tabs.zig");
     _ = @import("state/resource_waiters.zig");
-    _ = @import("providers/acp.zig");
-    _ = @import("providers/claude.zig");
-    _ = @import("providers/cursor.zig");
-    _ = @import("providers/diagnostics.zig");
-    _ = @import("providers/fx.zig");
-    _ = @import("providers/grok.zig");
-    _ = @import("providers/muse.zig");
-    _ = @import("providers/opencode.zig");
-    _ = @import("providers/pi.zig");
-    _ = @import("providers/mcp.zig");
     _ = @import("chat/slash_commands.zig");
     _ = @import("theme/coverage_test.zig");
     _ = @import("app/update_installer.zig");
@@ -62,9 +55,4 @@ test {
     _ = @import("ui/chat_panel.zig");
     _ = @import("ui/terminal_panel.zig");
     _ = @import("ui/workspace_panes.zig");
-    _ = @import("compile_tests/windows_conpty.zig");
-    _ = @import("daemon/chat_links.zig");
-    _ = @import("daemon/change_journal.zig");
-    _ = @import("daemon/process_registry.zig");
-    _ = @import("daemon/store.zig");
 }

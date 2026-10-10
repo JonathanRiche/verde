@@ -39,6 +39,7 @@ private let steerOpen = Array("<verde_parent_message from_thread=\"".utf8)
 private let steerHeaderEnd = Array("\">\n".utf8)
 private let steerClose = Array("\n</verde_parent_message>".utf8)
 private let newline = UInt8(ascii: "\n")
+private let batchSeparator = notificationSuffix + Array("\n\n".utf8) + notificationPrefix
 
 private func starts(_ bytes: ArraySlice<UInt8>, _ prefix: [UInt8]) -> Bool { bytes.starts(with: prefix) }
 
@@ -69,14 +70,35 @@ private func findLast(_ bytes: ArraySlice<UInt8>, _ needle: [UInt8]) -> Int? {
 private func text(_ bytes: ArraySlice<UInt8>) -> String { String(decoding: bytes, as: UTF8.self) }
 
 /// A child status notification delivered to the parent chat as a user turn (idle parent) or a
-/// system steering event (busy parent). Anything not matching the exact envelope is nil.
+/// system steering event (busy parent). Anything that is not exactly one envelope is nil.
 func childNotification(role: String, body: String) -> ChildNotification? {
+    guard let notifications = childNotifications(role: role, body: body), notifications.count == 1 else { return nil }
+    return notifications[0]
+}
+
+/// The daemon may batch several pending deliveries into one message: complete envelopes joined
+/// by exactly "\n\n". Returns 1...N notifications, or nil unless every piece is a valid envelope.
+func childNotifications(role: String, body: String) -> [ChildNotification]? {
     guard role == "user" || role == "system" else { return nil }
     // Cheap rejection before copying a possibly large body.
     guard body.utf8.starts(with: notificationPrefix) else { return nil }
     let all = Array(body.utf8)
-    guard all.count >= notificationPrefix.count + notificationSuffix.count, ends(all[...], notificationSuffix) else { return nil }
-    var rest = all[notificationPrefix.count..<(all.count - notificationSuffix.count)]
+    var out: [ChildNotification] = []
+    var start = 0
+    while true {
+        let separator = find(all[...], batchSeparator, from: start)
+        let end = separator.map { $0 + notificationSuffix.count } ?? all.count
+        guard let notification = singleChildNotification(all[start..<end]) else { return nil }
+        out.append(notification)
+        guard let separator else { return out }
+        start = separator + notificationSuffix.count + 2
+    }
+}
+
+private func singleChildNotification(_ all: ArraySlice<UInt8>) -> ChildNotification? {
+    guard starts(all, notificationPrefix), all.count >= notificationPrefix.count + notificationSuffix.count,
+          ends(all, notificationSuffix) else { return nil }
+    var rest = all[(all.startIndex + notificationPrefix.count)..<(all.endIndex - notificationSuffix.count)]
     guard let childEnd = rest.firstIndex(of: newline) else { return nil }
     let childID = rest[rest.startIndex..<childEnd]
     guard !childID.isEmpty else { return nil }
@@ -112,9 +134,12 @@ func parentSteerBody(role: String, body: String) -> String? {
     return text(all[innerStart..<innerEnd])
 }
 
-/// The text a transcript row displays (and copies): the unwrapped reply or steer, else the body.
+/// The text a transcript row displays (and copies): the unwrapped reply (batched replies joined
+/// by blank lines) or steer, else the body.
 func orchestrationDisplayBody(role: String, body: String) -> String {
-    if let notification = childNotification(role: role, body: body) { return notification.reply }
+    if let notifications = childNotifications(role: role, body: body) {
+        return notifications.map(\.reply).joined(separator: "\n\n")
+    }
     return parentSteerBody(role: role, body: body) ?? body
 }
 

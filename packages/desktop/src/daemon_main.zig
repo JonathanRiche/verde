@@ -2060,9 +2060,24 @@ test "signal watcher recognizes only an accepted prepare-shutdown result" {
     try std.testing.expect(!prepareShutdownAccepted(std.testing.allocator, "not json"));
 }
 
-// Include the daemon's RPC/store regression tests in its owning test target.
+// Include the daemon's RPC/store/provider regression tests in its owning test target.
 test {
     _ = sessionizer;
+    _ = @import("compile_tests/windows_conpty.zig");
+    _ = @import("daemon/chat_links.zig");
+    _ = @import("daemon/change_journal.zig");
+    _ = @import("daemon/process_registry.zig");
+    _ = @import("daemon/store.zig");
+    _ = @import("providers/acp.zig");
+    _ = @import("providers/claude.zig");
+    _ = @import("providers/cursor.zig");
+    _ = @import("providers/diagnostics.zig");
+    _ = @import("providers/fx.zig");
+    _ = @import("providers/grok.zig");
+    _ = @import("providers/muse.zig");
+    _ = @import("providers/opencode.zig");
+    _ = @import("providers/pi.zig");
+    _ = @import("providers/mcp.zig");
 }
 
 test "pair create parses presets and rejects ambiguous scope selections" {

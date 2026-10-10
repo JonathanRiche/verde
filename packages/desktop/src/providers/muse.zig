@@ -609,8 +609,11 @@ fn readMuseLine(allocator: std.mem.Allocator, reader: *std.Io.File.Reader) anyer
     return acp.takeLineAlloc(allocator, reader);
 }
 
+/// Fixture hosts answer the probe immediately, so tests skip the live grace period.
+const terminal_probe_delay: std.Io.Duration = if (@import("builtin").is_test) .fromMilliseconds(50) else .fromSeconds(10);
+
 fn waitForTerminalProbe(io: std.Io) std.Io.Cancelable!void {
-    try io.sleep(.fromSeconds(10), .awake);
+    try io.sleep(terminal_probe_delay, .awake);
 }
 
 fn makeTerminalProbeAlloc(allocator: std.mem.Allocator, session_id: []const u8) ![]u8 {

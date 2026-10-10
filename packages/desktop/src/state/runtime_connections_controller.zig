@@ -69,6 +69,25 @@ pub const WizardStep = enum {
     /// Connect: control-plane URL, discovery, sign-in, inventory selection.
     connect_setup,
 };
+/// One-shot bootstrap results. They describe credential custody, not the live
+/// connection, so the status step hides them once the runtime is not ready.
+pub const BOOTSTRAP_SAVED_NOTICE = "Saved. The runtime-local credential is in the secret store; temporary device staging was cleared.";
+pub const BOOTSTRAP_MEMORY_NOTICE = "Saved, but this platform could keep the runtime-local credential only in memory.";
+
+/// True when the wizard notice is a bootstrap custody result that the live
+/// runtime status now contradicts (for example, reconnecting after selection).
+pub fn bootstrapNoticeIsStale(notice: []const u8, live_ready_or_connecting: bool) bool {
+    if (live_ready_or_connecting) return false;
+    return std.mem.eql(u8, notice, BOOTSTRAP_SAVED_NOTICE) or std.mem.eql(u8, notice, BOOTSTRAP_MEMORY_NOTICE);
+}
+
+test "bootstrap custody notice is hidden once live status leaves ready or connecting" {
+    try std.testing.expect(!bootstrapNoticeIsStale(BOOTSTRAP_SAVED_NOTICE, true));
+    try std.testing.expect(bootstrapNoticeIsStale(BOOTSTRAP_SAVED_NOTICE, false));
+    try std.testing.expect(bootstrapNoticeIsStale(BOOTSTRAP_MEMORY_NOTICE, false));
+    try std.testing.expect(!bootstrapNoticeIsStale("Signed out. Local connection authority was cleared.", false));
+}
+
 pub const WizardField = enum { label, host, user, ssh_port, gateway_port, grant_id, pairing_code, device_label, control_plane_url };
 /// Connect sign-in and bootstrap progress mirrored into the connection wizard.
 pub const ConnectPhase = connect_client.Phase;
@@ -452,7 +471,7 @@ pub fn importPairLink(state: *State) !void {
     if (encoded_host.len > host_buffer.len) return error.InvalidPairLink;
     @memcpy(host_buffer[0..encoded_host.len], encoded_host);
     const host = std.Uri.percentDecodeInPlace(host_buffer[0..encoded_host.len]);
-    try profile.validateRuntimeHttpsOrigin(host);
+    profile.validateRuntimeHttpsOrigin(host) catch return error.InvalidPairLink;
     const uri = std.Uri.parse(host) catch return error.InvalidPairLink;
     if (uri.user != null or uri.password != null or uri.query != null or uri.fragment != null) return error.InvalidPairLink;
     const path = switch (uri.path) {
@@ -949,7 +968,10 @@ fn submitConnectSetup(self: anytype) void {
         .signed_in => {
             if (session.loadInventory()) rc.connect_phase = .loading_inventory;
         },
-        .inventory_loaded => adoptSelectedConnectRuntime(self, service),
+        .inventory_loaded => if (rc.connect_runtimes.items.len == 0) {
+            // Refresh: an admin may assign a runtime while this dialog is open.
+            if (session.loadInventory()) rc.connect_phase = .loading_inventory;
+        } else adoptSelectedConnectRuntime(self, service),
         .discovering, .signing_in, .loading_inventory, .bootstrapping, .bootstrap_ready, .idle, .failed => {},
     }
     self.markDirty();
@@ -1166,10 +1188,7 @@ fn pollConnectSession(self: anytype) bool {
             destroyConnectSession(rc, self.allocator);
             invalidateReadiness(self, profile_id);
             rc.wizard_step = .testing;
-            setNotice(&rc.wizard_notice_storage, if (committed.durable)
-                "Connected. The runtime-local credential is in the secret store; temporary device staging was cleared."
-            else
-                "Connected, but this platform could keep the runtime-local credential only in memory.");
+            setNotice(&rc.wizard_notice_storage, if (committed.durable) BOOTSTRAP_SAVED_NOTICE else BOOTSTRAP_MEMORY_NOTICE);
             blurWizardField(self);
             self.syncPaletteRuntimePicker();
             return true;
@@ -1205,7 +1224,7 @@ fn pollConnectSession(self: anytype) bool {
                 setNotice(&rc.wizard_notice_storage, "Signed in. Loading authorized runtimes…");
             },
             .inventory_loaded => setNotice(&rc.wizard_notice_storage, if (rc.connect_runtimes.items.len == 0)
-                "No authorized ready runtimes are available for this account."
+                "Ask a team admin to assign a ready runtime to this account, then choose Refresh."
             else
                 "Select the runtime to use with this profile."),
             .bootstrapping => setNotice(&rc.wizard_notice_storage, "Requesting and consuming the signed Connect bootstrap…"),
@@ -1388,7 +1407,7 @@ pub fn applyRuntimeRowAction(self: anytype, index: usize) void {
         },
         .show_server_setup => self.openRuntimeServerSetupGuide(),
         .copy_diagnostics => {
-            const text = service.redactedDiagnosticsAlloc(self.allocator, profile_id) catch |err| {
+            const text = redactedDiagnosticsAlloc(self, profile_id) catch |err| {
                 log.warn("runtime diagnostics failed: {s}", .{@errorName(err)});
                 setNotice(&rc.card_notice_storage, "Could not build diagnostics.");
                 return;
@@ -1429,6 +1448,33 @@ fn setExpandedProfile(self: anytype, profile_id: ?[]const u8) void {
 // ---------------------------------------------------------------------------
 // Readiness (repository bindings + provider inventory) over existing RPCs
 // ---------------------------------------------------------------------------
+
+/// Include the UI's method-level readiness results without exposing response bodies.
+pub fn redactedDiagnosticsAlloc(self: anytype, profile_id: []const u8) ![]u8 {
+    const service = self.runtime_service orelse return error.RuntimeServiceUnavailable;
+    const base = try service.redactedDiagnosticsAlloc(self.allocator, profile_id);
+    defer self.allocator.free(base);
+    const snapshot = service.snapshot(profile_id) orelse return error.UnknownRuntimeProfile;
+    return appendReadinessDiagnostics(self.allocator, base, &self.runtime_connections, snapshot);
+}
+
+fn appendReadinessDiagnostics(allocator: std.mem.Allocator, base: []const u8, rc: *const State, snapshot: anytype) ![]u8 {
+    const runtime = snapshot.runtime orelse return allocator.dupe(u8, base);
+    // Cached results belong only to the selected profile and currently verified
+    // runtime identity. Identity changes reset the controller generation.
+    if (snapshot.phase != .ready or
+        !std.mem.eql(u8, rc.readiness_profile_id orelse "", snapshot.profile_id) or
+        !std.mem.eql(u8, rc.readiness_runtime_id orelse "", runtime.runtime_id) or
+        !std.mem.eql(u8, rc.readiness_instance_id orelse "", runtime.instance_id)) return allocator.dupe(u8, base);
+    return std.fmt.allocPrint(allocator, "{s}readiness_generation: {d}\nrepository_manifest_state: {s}\nrepository_manifest_failure_reason: {s}\nproviders_state: {s}\nproviders_failure_reason: {s}\n", .{
+        base,
+        rc.readiness_generation,
+        @tagName(rc.manifest_state),
+        if (rc.manifest_failure_reason) |reason| @tagName(reason) else "none",
+        @tagName(rc.providers_state),
+        if (rc.providers_failure_reason) |reason| @tagName(reason) else "none",
+    });
+}
 
 /// Advances readiness for the expanded runtime. Starts RPCs when the runtime
 /// is execution-ready and drains finished tickets. Returns true on change.
@@ -2347,4 +2393,36 @@ test "Pair link rejects query secrets duplicates and non-origin hosts" {
         fillZ(&rc.control_plane_url_storage, value);
         try std.testing.expectError(error.InvalidPairLink, importPairLink(&rc));
     }
+}
+
+test "readiness diagnostics preserve method reasons only for current identity" {
+    const allocator = std.testing.allocator;
+    var rc: State = .{};
+    defer rc.deinit(allocator);
+    rc.readiness_profile_id = try allocator.dupe(u8, "profile");
+    rc.readiness_runtime_id = try allocator.dupe(u8, "runtime");
+    rc.readiness_instance_id = try allocator.dupe(u8, "instance");
+    rc.manifest_state = .failed;
+    rc.manifest_failure_reason = .workspace_binding_missing;
+    rc.providers_state = .failed;
+    rc.providers_failure_reason = .provider_not_authenticated;
+    const Fixture = struct {
+        profile_id: []const u8 = "profile",
+        phase: enum { ready, failed } = .ready,
+        runtime: ?struct { runtime_id: []const u8 = "runtime", instance_id: []const u8 = "instance" } = .{},
+    };
+    var snapshot: Fixture = .{};
+    const text = try appendReadinessDiagnostics(allocator, "credential: <redacted>\n", &rc, snapshot);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "repository_manifest_failure_reason: workspace_binding_missing") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "providers_failure_reason: provider_not_authenticated") != null);
+    snapshot.runtime.?.instance_id = "replacement";
+    const stale = try appendReadinessDiagnostics(allocator, "base\n", &rc, snapshot);
+    defer allocator.free(stale);
+    try std.testing.expectEqualStrings("base\n", stale);
+    snapshot.runtime.?.instance_id = "instance";
+    snapshot.profile_id = "other";
+    const other = try appendReadinessDiagnostics(allocator, "base\n", &rc, snapshot);
+    defer allocator.free(other);
+    try std.testing.expectEqualStrings("base\n", other);
 }

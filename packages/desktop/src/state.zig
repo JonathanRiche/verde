@@ -3607,6 +3607,8 @@ pub const RuntimePickerStatus = enum {
     /// daemon restart/upgrade or a generic unauthorized. Transient and
     /// retryable with the same credential; never offers Re-pair.
     session_auth_failed,
+    /// The control-plane session is missing or expired; the saved device is intact.
+    session_sign_in_required,
     /// Session is open but this workspace has no remote binding.
     workspace_binding_missing,
     /// Session is open but the selected provider is not installed there.
@@ -3651,7 +3653,7 @@ pub fn runtimeStatusRecovery(status: RuntimePickerStatus) RuntimeRecovery {
         .pairing_required, .pairing_rejected, .device_revoked => .repair,
         .trust_required => .review_trust,
         .identity_mismatch, .not_verde_runtime, .unsupported => .edit_endpoint,
-        .runtime_selection_required => .choose_runtime,
+        .runtime_selection_required, .session_sign_in_required => .choose_runtime,
         // The server-side fix stays reachable via the "Show server setup"
         // secondary (`runtimeStatusOffersServerSetup`); the primary must
         // re-probe once that fix has been applied.
@@ -3687,7 +3689,7 @@ pub fn runtimeRecoveryLabel(recovery: RuntimeRecovery, status: RuntimePickerStat
         .repair => "Re-pair device",
         .review_trust => "Review identity",
         .edit_endpoint => "Edit endpoint",
-        .choose_runtime => "Choose runtime",
+        .choose_runtime => if (status == .session_sign_in_required) "Sign in" else "Choose runtime",
         .server_setup => "Show server setup",
     };
 }
@@ -3714,7 +3716,7 @@ pub fn runtimeStatusTone(status: RuntimePickerStatus) RuntimeStatusTone {
     return switch (status) {
         .ready => .success,
         .connecting, .handshaking, .reconnecting, .limited, .trust_required, .credential_required, .offline, .paired_offline, .pairing_required, .rate_limited, .runtime_selection_required => .muted,
-        .workspace_binding_missing, .provider_unavailable, .provider_not_authenticated, .server_unavailable, .session_auth_failed => .warning,
+        .workspace_binding_missing, .provider_unavailable, .provider_not_authenticated, .server_unavailable, .session_auth_failed, .session_sign_in_required => .warning,
         .authentication_failed, .identity_mismatch, .connection_failed, .failed, .unsupported, .unavailable, .pairing_rejected, .not_verde_runtime, .invalid_protocol, .device_revoked, .credential_store_unavailable => .danger,
     };
 }
@@ -3813,6 +3815,7 @@ fn failureReasonStatus(snapshot: RuntimeService.Snapshot, reason: RuntimeService
         .workspace_binding_missing => .workspace_binding_missing,
         .provider_unavailable => .provider_unavailable,
         .provider_not_authenticated => .provider_not_authenticated,
+        .session_authentication_required => if (snapshot.access == .connect) .session_sign_in_required else sessionAuthFailedStatus(snapshot),
         .authentication_required => if (snapshot.failure) |failure| switch (failure) {
             .missing_credential => credentialMissingStatus(snapshot),
             .pairing_rejected => if (snapshot.access == .connect) .runtime_selection_required else .pairing_rejected,
@@ -3887,6 +3890,7 @@ fn runtimeActivationAction(snapshot: RuntimeService.Snapshot) RuntimeActivationA
     if (snapshot.access == .connect and (snapshot.device_id == null or !snapshot.device_credential_held)) return .request_runtime_selection;
     if (snapshot.failure_reason) |reason| switch (reason) {
         .credential_invalid, .device_credential_revoked => return runtimeCredentialRecoveryAction(snapshot),
+        .session_authentication_required => if (snapshot.access == .connect) return .request_runtime_selection,
         // Generic unauthorized with the persistent device credential still
         // held is transient: retry with the same credential. The pair modal
         // is reserved for a truly missing credential or explicit revocation;
@@ -3956,6 +3960,7 @@ pub fn runtimePickerStatusBadge(status: RuntimePickerStatus) []const u8 {
         .server_unavailable => "Server unavailable",
         .device_revoked => "Device revoked",
         .session_auth_failed => "Session expired",
+        .session_sign_in_required => "Sign in required",
         .workspace_binding_missing => "No workspace binding",
         .provider_unavailable => "Provider unavailable",
         .provider_not_authenticated => "Provider not signed in",
@@ -3988,6 +3993,7 @@ pub fn runtimePickerStatusDescription(status: RuntimePickerStatus) []const u8 {
         .server_unavailable => "The runtime is reachable but reports it is unavailable",
         .device_revoked => "The runtime no longer accepts this device; it was revoked or replaced",
         .session_auth_failed => "The session expired (often a daemon restart); reconnect uses the saved device credential",
+        .session_sign_in_required => "Sign in to restore the connection; the saved runtime device credential has not been rejected",
         .workspace_binding_missing => "Connected, but this workspace has no binding on the runtime",
         .provider_unavailable => "Connected, but the selected provider is not available on the runtime",
         .provider_not_authenticated => "Connected, but the selected provider is not signed in on the runtime",
@@ -13200,13 +13206,11 @@ pub const AppState = struct {
         const send_pending = thread.isSendPendingForUi();
         self.composer_controller.composer.setSendState(if (send_pending) .stop else .send);
         self.composer_controller.composer.setStopPulseFactor(if (send_pending) theme.activityPulse(profiler.nowNs()) else 1.0);
-        if (self.composer_controller.composer.model_index) |index| {
-            if (index < model_options.len) {
-                self.composer_controller.composer.setModelLabel(self.allocator, std.mem.sliceTo(model_options[index].label, 0)) catch |err| {
-                    log.warn("failed to sync palette composer model label: {s}", .{@errorName(err)});
-                };
-            }
-        }
+        // Always resync: an unlisted model ref has no index but must still
+        // replace the previous thread's label with its own raw ref.
+        self.composer_controller.composer.setModelLabel(self.allocator, self.currentComposerModelLabel()) catch |err| {
+            log.warn("failed to sync palette composer model label: {s}", .{@errorName(err)});
+        };
         // Sized for a worst-case dynamic reasoning-variant label plus both
         // fixed segments; overflow degrades to a truncated summary.
         var summary_buf: [192]u8 = undefined;
@@ -13766,11 +13770,11 @@ pub const AppState = struct {
     /// Copies the secret-free diagnostics bundle; the notice reports only
     /// success/failure, never the contents.
     pub fn copyRuntimeDiagnosticsToClipboard(self: *AppState, profile_id: []const u8) void {
-        const service = self.runtime_service orelse {
+        if (self.runtime_service == null) {
             self.setSidebarNotice("Runtime service is unavailable.");
             return;
-        };
-        const text = service.redactedDiagnosticsAlloc(self.allocator, profile_id) catch |err| {
+        }
+        const text = runtime_connections_controller.redactedDiagnosticsAlloc(self, profile_id) catch |err| {
             log.warn("runtime diagnostics failed: {s}", .{@errorName(err)});
             self.setSidebarNotice("Could not build runtime diagnostics.");
             return;
@@ -13872,8 +13876,14 @@ pub const AppState = struct {
             self.setSidebarNotice("The remote runtime connection could not start.");
             return;
         }
+        // Describe the action just taken; the snapshot predates it, so a
+        // retry from `reconnecting` is not "already in progress".
         self.setSidebarNotice(if (action == .reconnect)
             "Reconnecting to refresh this runtime's workspace and provider readiness..."
+        else if (action == .retry)
+            "Retrying the remote runtime connection..."
+        else if (action == .enable)
+            "Connecting to the remote runtime..."
         else switch (snapshot.phase) {
             .ready => "Remote runtime is connected.",
             .awaiting_trust => "Verify the remote runtime identity to continue.",
@@ -15150,7 +15160,10 @@ pub const AppState = struct {
                 if (std.mem.eql(u8, active, value)) return index;
             }
         }
-        return if (options.len > 0) 0 else null;
+        // No silent fallback to the first row: an unlisted ref (e.g. a
+        // `opus[1m]` orchestration child) would otherwise be mislabeled as
+        // that row's model. Callers show the raw ref instead.
+        return null;
     }
 
     fn composerReasoningIndexForOptions(options: []const ReasoningOption, value: ?ReasoningEffort) ?usize {
@@ -16688,7 +16701,7 @@ pub const AppState = struct {
                 self.setSidebarNotice("Codex background task is missing its process ID.");
                 return false;
             };
-            if (self.providerExecutionTargetForProjectThread(project_index, thread, 0) == null) {
+            if (chat_controller.codexBackgroundTaskCwd(self.project_controller.projects.items[project_index].path, thread, task) == null) {
                 self.setSidebarNotice("Codex could not stop the background task: no execution target for this chat.");
                 return false;
             }
@@ -18072,6 +18085,11 @@ test "runtime picker status separates paired-offline, non-Verde endpoints, and r
     // paired device: a generic 401 retries rather than reopening selection.
     try std.testing.expectEqual(RuntimePickerStatus.session_auth_failed, runtimePickerStatus(snapshot));
     try std.testing.expectEqual(RuntimeActivationAction.retry, runtimeActivationAction(snapshot));
+    snapshot.failure_reason = .session_authentication_required;
+    try std.testing.expectEqual(RuntimePickerStatus.session_sign_in_required, runtimePickerStatus(snapshot));
+    try std.testing.expectEqual(RuntimeActivationAction.request_runtime_selection, runtimeActivationAction(snapshot));
+    try std.testing.expectEqualStrings("Sign in", runtimeRecoveryLabel(.choose_runtime, .session_sign_in_required));
+    snapshot.failure_reason = .authentication_required;
     snapshot.device_credential_held = false;
     try std.testing.expectEqual(RuntimePickerStatus.runtime_selection_required, runtimePickerStatus(snapshot));
     try std.testing.expectEqual(RuntimeActivationAction.request_runtime_selection, runtimeActivationAction(snapshot));
@@ -18181,6 +18199,10 @@ test "runtime onboarding transitions require credentials and explicit trust" {
     snapshot.access = .connect;
     snapshot.device_id = "0123456789abcdef0123456789abcdef";
     snapshot.device_credential_held = true;
+    // A held runtime device credential makes a generic 401 transient, so
+    // only a missing credential reopens runtime selection.
+    try std.testing.expectEqual(RuntimeActivationAction.enable, runtimeActivationAction(snapshot));
+    snapshot.device_credential_held = false;
     try std.testing.expectEqual(RuntimeActivationAction.request_runtime_selection, runtimeActivationAction(snapshot));
     snapshot.access = .admin_token;
     snapshot.failure = null;
@@ -19163,6 +19185,19 @@ test "sidebar open pane focus keeps the clicked terminal pane maximized" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
     state.allocator = allocator;
+    // Closing the last chat pane spawns a replacement thread through
+    // applyNewChatDefaults, which reads config, model caches, and runtime
+    // defaults.
+    state.app_config = .{};
+    state.opencode_model_options = .empty;
+    state.claude_model_options = .empty;
+    state.pi_model_options = .empty;
+    state.fx_model_options = .empty;
+    state.grok_model_options = .empty;
+    state.muse_model_options = .empty;
+    state.cursor_model_options = .empty;
+    state.runtime_picker_profiles = .empty;
+    state.workspace_runtime_defaults = null;
     state.project_controller.projects = .empty;
     state.surface_controller = .{};
     state.project_controller.selected_index = 0;
@@ -19191,6 +19226,7 @@ test "sidebar open pane focus keeps the clicked terminal pane maximized" {
         state.surface_controller.surfaces.deinit(allocator);
         state.composer_controller.composer.deinit(allocator);
         state.browser_controller.deinit(allocator);
+        state.app_config.deinit(allocator);
     }
 
     var project = try Project.init(allocator, "test", "Test", "/tmp/test", 0);
@@ -19303,6 +19339,9 @@ test "sidebar open pane focus keeps the clicked terminal pane maximized" {
     try std.testing.expect(!state.terminal_controller.focused);
 
     try std.testing.expect(state.closeCurrentProjectWorkspacePane(result.pane_id));
+    // The first terminal pane lives outside the root tree; close it too so
+    // the chat pane really is the last pane and focus has nowhere to go.
+    try std.testing.expect(state.closeCurrentProjectWorkspacePane(first_terminal_pane_id));
     try std.testing.expect(state.closeCurrentProjectWorkspacePane(chat_pane_id));
     try std.testing.expectEqual(@as(usize, 0), layout.visiblePaneCount());
     try std.testing.expect(layout.focused_pane_id == null);

@@ -290,7 +290,8 @@ pub const Session = struct {
 
     pub fn loadInventory(self: *Session) bool {
         if (self.backend) |backend| return backend.load_inventory(backend.context);
-        return self.request(.inventory, .signed_in);
+        // A loaded inventory may be refreshed (e.g. an empty one after an admin assigns a runtime).
+        return self.request(.inventory, .signed_in) or self.request(.inventory, .inventory_loaded);
     }
 
     pub fn bootstrap(self: *Session, index: usize, device_label: []const u8) bool {

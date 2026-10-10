@@ -8718,34 +8718,34 @@ test "browser MCP actions wait for runtime and pending navigation" {
 test "browser MCP navigation confirmation rejects transient blank state" {
     const allocator = std.testing.allocator;
     const opening =
-        \\{\"ok\":true,\"result\":{\"runtime_initialized\":false,\"status\":\"Opening\"}}
+        \\{"ok":true,"result":{"runtime_initialized":false,"status":"Opening"}}
     ;
     const transient_blank =
-        \\{\"ok\":true,\"result\":{\"runtime_initialized\":true,\"status\":\"Ready\",\"url\":\"about:blank\",\"address\":\"about:blank\"}}
+        \\{"ok":true,"result":{"runtime_initialized":true,"status":"Ready","url":"about:blank","address":"about:blank"}}
     ;
     const pending_target =
-        \\{\"ok\":true,\"result\":{\"runtime_initialized\":true,\"status\":\"Ready\",\"url\":\"about:blank\",\"address\":\"https://example.com\"}}
+        \\{"ok":true,"result":{"runtime_initialized":true,"status":"Ready","url":"about:blank","address":"https://example.com"}}
     ;
     const loaded =
-        \\{\"ok\":true,\"result\":{\"runtime_initialized\":true,\"status\":\"Ready\",\"url\":\"https://example.com\",\"address\":\"https://example.com\"}}
+        \\{"ok":true,"result":{"runtime_initialized":true,"status":"Ready","url":"https://example.com","address":"https://example.com"}}
     ;
     const redirected =
-        \\{\"ok\":true,\"result\":{\"runtime_initialized\":true,\"status\":\"Ready\",\"url\":\"https://www.example.com/\",\"address\":\"https://www.example.com/\"}}
+        \\{"ok":true,"result":{"runtime_initialized":true,"status":"Ready","url":"https://www.example.com/","address":"https://www.example.com/"}}
     ;
     const hidden =
-        \\{\"ok\":true,\"result\":{\"runtime_initialized\":false,\"status\":\"Hidden\"}}
+        \\{"ok":true,"result":{"runtime_initialized":false,"status":"Hidden"}}
     ;
     const stale_document =
-        \\{\"verdeAgentBrowserNonce\":\"nonce\",\"ok\":true,\"url\":\"https://old.example/\",\"result\":\"complete\"}
+        \\{"verdeAgentBrowserNonce":"nonce","ok":true,"url":"https://old.example/","result":"complete"}
     ;
     const loaded_document =
-        \\{\"verdeAgentBrowserNonce\":\"nonce\",\"ok\":true,\"url\":\"https://example.com\",\"result\":\"complete\"}
+        \\{"verdeAgentBrowserNonce":"nonce","ok":true,"url":"https://example.com","result":"complete"}
     ;
     const redirected_document =
-        \\{\"verdeAgentBrowserNonce\":\"nonce\",\"ok\":true,\"url\":\"https://www.example.com/\",\"result\":\"interactive\"}
+        \\{"verdeAgentBrowserNonce":"nonce","ok":true,"url":"https://www.example.com/","result":"interactive"}
     ;
     const loading_document =
-        \\{\"verdeAgentBrowserNonce\":\"nonce\",\"ok\":true,\"url\":\"https://example.com\",\"result\":\"loading\"}
+        \\{"verdeAgentBrowserNonce":"nonce","ok":true,"url":"https://example.com","result":"loading"}
     ;
 
     try std.testing.expectEqual(McpBrowserNavigationReadiness.wait, mcpBrowserNavigationReadinessFromStatus(allocator, opening, "example.com", null));
