@@ -8,7 +8,6 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const ui_debug = b.option(bool, "ui-debug", "Show the desktop UI debug window");
     const dev_trace = b.option(bool, "dev-trace", "Compile GUI flow-trace log lines (frame, RPC, paste, refresh breadcrumbs); dev builds only");
-    const palette_renderer = b.option(PaletteRendererBackend, "palette-renderer", "Palette frame renderer backend: sdl_gpu");
     const browser_backend = b.option(BrowserBackendKind, "browser-backend", "Browser backend: native_webview or stub");
     const terminal_backend = b.option(bool, "terminal_backend", "Enable the native terminal backend");
     const local_ipc = b.option(bool, "local_ipc", "Enable the local live-control IPC backend");
@@ -18,12 +17,6 @@ pub fn build(b: *std.Build) void {
     const fff_lib_dir = b.option([]const u8, "fff-lib-dir", "Directory containing the fff-c link library");
     const fff_import_lib = b.option([]const u8, "fff-import-lib", "Exact fff-c import library for Windows builds");
     const fff_runtime_lib = b.option([]const u8, "fff-runtime-lib", "Path to the fff-c runtime library to install");
-    const sdl3_include_dir = b.option([]const u8, "sdl3-include-dir", "Directory containing SDL3 headers");
-    const sdl3_lib_dir = b.option([]const u8, "sdl3-lib-dir", "Directory containing the SDL3 link library");
-    const sdl3_runtime_lib = b.option([]const u8, "sdl3-runtime-lib", "Path to the SDL3 runtime library to install beside the desktop executable");
-    const sdl3_ttf_include_dir = b.option([]const u8, "sdl3-ttf-include-dir", "Directory containing SDL3_ttf headers");
-    const sdl3_ttf_lib_dir = b.option([]const u8, "sdl3-ttf-lib-dir", "Directory containing the SDL3_ttf link library");
-    const sdl3_ttf_runtime_lib = b.option([]const u8, "sdl3-ttf-runtime-lib", "Path to the SDL3_ttf runtime library to install beside the desktop executable");
     const webview2_include_dir = b.option([]const u8, "webview2-include-dir", "Directory containing WebView2.h");
     const webview2_loader_lib = b.option([]const u8, "webview2-loader-lib", "Exact WebView2 loader import library");
     const webview2_loader_dll = b.option([]const u8, "webview2-loader-dll", "Path to WebView2Loader.dll to install beside the desktop executable");
@@ -35,7 +28,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .version = version,
         .ui_debug = ui_debug,
-        .palette_renderer = palette_renderer,
         .browser_backend = browser_backend,
         .terminal_backend = terminal_backend,
         .local_ipc = local_ipc,
@@ -45,12 +37,6 @@ pub fn build(b: *std.Build) void {
         .fff_lib_dir = fff_lib_dir,
         .fff_import_lib = fff_import_lib,
         .fff_runtime_lib = fff_runtime_lib,
-        .sdl3_include_dir = sdl3_include_dir,
-        .sdl3_lib_dir = sdl3_lib_dir,
-        .sdl3_runtime_lib = sdl3_runtime_lib,
-        .sdl3_ttf_include_dir = sdl3_ttf_include_dir,
-        .sdl3_ttf_lib_dir = sdl3_ttf_lib_dir,
-        .sdl3_ttf_runtime_lib = sdl3_ttf_runtime_lib,
         .webview2_include_dir = webview2_include_dir,
         .webview2_loader_lib = webview2_loader_lib,
         .webview2_loader_dll = webview2_loader_dll,
@@ -64,7 +50,6 @@ pub fn build(b: *std.Build) void {
         .version = version,
         .ui_debug = ui_debug,
         .dev_trace = dev_trace,
-        .palette_renderer = palette_renderer,
         .browser_backend = browser_backend,
         .terminal_backend = terminal_backend,
         .local_ipc = local_ipc,
@@ -74,12 +59,6 @@ pub fn build(b: *std.Build) void {
         .fff_lib_dir = fff_lib_dir,
         .fff_import_lib = fff_import_lib,
         .fff_runtime_lib = fff_runtime_lib,
-        .sdl3_include_dir = sdl3_include_dir,
-        .sdl3_lib_dir = sdl3_lib_dir,
-        .sdl3_runtime_lib = sdl3_runtime_lib,
-        .sdl3_ttf_include_dir = sdl3_ttf_include_dir,
-        .sdl3_ttf_lib_dir = sdl3_ttf_lib_dir,
-        .sdl3_ttf_runtime_lib = sdl3_ttf_runtime_lib,
         .webview2_include_dir = webview2_include_dir,
         .webview2_loader_lib = webview2_loader_lib,
         .webview2_loader_dll = webview2_loader_dll,
@@ -109,7 +88,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .version = version,
         .ui_debug = ui_debug,
-        .palette_renderer = palette_renderer,
         .browser_backend = browser_backend,
         .terminal_backend = terminal_backend,
         .local_ipc = local_ipc,
@@ -119,12 +97,6 @@ pub fn build(b: *std.Build) void {
         .fff_lib_dir = fff_lib_dir,
         .fff_import_lib = fff_import_lib,
         .fff_runtime_lib = fff_runtime_lib,
-        .sdl3_include_dir = sdl3_include_dir,
-        .sdl3_lib_dir = sdl3_lib_dir,
-        .sdl3_runtime_lib = sdl3_runtime_lib,
-        .sdl3_ttf_include_dir = sdl3_ttf_include_dir,
-        .sdl3_ttf_lib_dir = sdl3_ttf_lib_dir,
-        .sdl3_ttf_runtime_lib = sdl3_ttf_runtime_lib,
         .webview2_include_dir = webview2_include_dir,
         .webview2_loader_lib = webview2_loader_lib,
         .webview2_loader_dll = webview2_loader_dll,
@@ -142,7 +114,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .version = version,
         .ui_debug = ui_debug,
-        .palette_renderer = palette_renderer,
         .browser_backend = browser_backend,
         .terminal_backend = terminal_backend,
         .local_ipc = local_ipc,
@@ -152,12 +123,6 @@ pub fn build(b: *std.Build) void {
         .fff_lib_dir = fff_lib_dir,
         .fff_import_lib = fff_import_lib,
         .fff_runtime_lib = fff_runtime_lib,
-        .sdl3_include_dir = sdl3_include_dir,
-        .sdl3_lib_dir = sdl3_lib_dir,
-        .sdl3_runtime_lib = sdl3_runtime_lib,
-        .sdl3_ttf_include_dir = sdl3_ttf_include_dir,
-        .sdl3_ttf_lib_dir = sdl3_ttf_lib_dir,
-        .sdl3_ttf_runtime_lib = sdl3_ttf_runtime_lib,
         .webview2_include_dir = webview2_include_dir,
         .webview2_loader_lib = webview2_loader_lib,
         .webview2_loader_dll = webview2_loader_dll,
@@ -172,7 +137,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .version = version,
         .ui_debug = ui_debug,
-        .palette_renderer = palette_renderer,
         .browser_backend = browser_backend,
         .terminal_backend = terminal_backend,
         .local_ipc = local_ipc,
@@ -182,12 +146,6 @@ pub fn build(b: *std.Build) void {
         .fff_lib_dir = fff_lib_dir,
         .fff_import_lib = fff_import_lib,
         .fff_runtime_lib = fff_runtime_lib,
-        .sdl3_include_dir = sdl3_include_dir,
-        .sdl3_lib_dir = sdl3_lib_dir,
-        .sdl3_runtime_lib = sdl3_runtime_lib,
-        .sdl3_ttf_include_dir = sdl3_ttf_include_dir,
-        .sdl3_ttf_lib_dir = sdl3_ttf_lib_dir,
-        .sdl3_ttf_runtime_lib = sdl3_ttf_runtime_lib,
         .webview2_include_dir = webview2_include_dir,
         .webview2_loader_lib = webview2_loader_lib,
         .webview2_loader_dll = webview2_loader_dll,
@@ -197,7 +155,7 @@ pub fn build(b: *std.Build) void {
 
     // Focused hermetic gate for packages/headless (std only; no desktop GUI deps).
     // Runs the standalone package build rather than the desktop graph so the
-    // step stays free of SDL/Palette/Ghostty even when those deps are broken.
+    // step stays free of Palette/Ghostty even when those deps are broken.
     var headless_argv: std.ArrayList([]const u8) = .empty;
     defer headless_argv.deinit(b.allocator);
     headless_argv.appendSlice(b.allocator, &.{ "zig", "build", "headless-test" }) catch @panic("OOM");
@@ -219,7 +177,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .version = version,
         .ui_debug = ui_debug,
-        .palette_renderer = palette_renderer,
         .browser_backend = browser_backend,
         .terminal_backend = terminal_backend,
         .local_ipc = local_ipc,
@@ -229,12 +186,6 @@ pub fn build(b: *std.Build) void {
         .fff_lib_dir = fff_lib_dir,
         .fff_import_lib = fff_import_lib,
         .fff_runtime_lib = fff_runtime_lib,
-        .sdl3_include_dir = sdl3_include_dir,
-        .sdl3_lib_dir = sdl3_lib_dir,
-        .sdl3_runtime_lib = sdl3_runtime_lib,
-        .sdl3_ttf_include_dir = sdl3_ttf_include_dir,
-        .sdl3_ttf_lib_dir = sdl3_ttf_lib_dir,
-        .sdl3_ttf_runtime_lib = sdl3_ttf_runtime_lib,
         .webview2_include_dir = webview2_include_dir,
         .webview2_loader_lib = webview2_loader_lib,
         .webview2_loader_dll = webview2_loader_dll,
@@ -255,7 +206,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .version = version,
         .ui_debug = ui_debug,
-        .palette_renderer = palette_renderer,
         .browser_backend = browser_backend,
         .terminal_backend = terminal_backend,
         .local_ipc = local_ipc,
@@ -265,12 +215,6 @@ pub fn build(b: *std.Build) void {
         .fff_lib_dir = fff_lib_dir,
         .fff_import_lib = fff_import_lib,
         .fff_runtime_lib = fff_runtime_lib,
-        .sdl3_include_dir = sdl3_include_dir,
-        .sdl3_lib_dir = sdl3_lib_dir,
-        .sdl3_runtime_lib = sdl3_runtime_lib,
-        .sdl3_ttf_include_dir = sdl3_ttf_include_dir,
-        .sdl3_ttf_lib_dir = sdl3_ttf_lib_dir,
-        .sdl3_ttf_runtime_lib = sdl3_ttf_runtime_lib,
         .webview2_include_dir = webview2_include_dir,
         .webview2_loader_lib = webview2_loader_lib,
         .webview2_loader_dll = webview2_loader_dll,
@@ -287,7 +231,6 @@ const DesktopCommandOptions = struct {
     version: ?[]const u8 = null,
     ui_debug: ?bool = null,
     dev_trace: ?bool = null,
-    palette_renderer: ?PaletteRendererBackend = null,
     browser_backend: ?BrowserBackendKind = null,
     terminal_backend: ?bool = null,
     local_ipc: ?bool = null,
@@ -297,12 +240,6 @@ const DesktopCommandOptions = struct {
     fff_lib_dir: ?[]const u8 = null,
     fff_import_lib: ?[]const u8 = null,
     fff_runtime_lib: ?[]const u8 = null,
-    sdl3_include_dir: ?[]const u8 = null,
-    sdl3_lib_dir: ?[]const u8 = null,
-    sdl3_runtime_lib: ?[]const u8 = null,
-    sdl3_ttf_include_dir: ?[]const u8 = null,
-    sdl3_ttf_lib_dir: ?[]const u8 = null,
-    sdl3_ttf_runtime_lib: ?[]const u8 = null,
     webview2_include_dir: ?[]const u8 = null,
     webview2_loader_lib: ?[]const u8 = null,
     webview2_loader_dll: ?[]const u8 = null,
@@ -333,9 +270,6 @@ fn addDesktopCommand(
     if (options.dev_trace) |value| {
         argv.append(b.allocator, b.fmt("-Ddev-trace={}", .{value})) catch @panic("OOM");
     }
-    if (options.palette_renderer) |value| {
-        argv.append(b.allocator, b.fmt("-Dpalette-renderer={s}", .{@tagName(value)})) catch @panic("OOM");
-    }
     if (options.browser_backend) |value| {
         argv.append(b.allocator, b.fmt("-Dbrowser-backend={s}", .{@tagName(value)})) catch @panic("OOM");
     }
@@ -349,14 +283,6 @@ fn addDesktopCommand(
     appendStringOption(b, &argv, "fff-lib-dir", options.fff_lib_dir);
     appendStringOption(b, &argv, "fff-import-lib", options.fff_import_lib);
     appendStringOption(b, &argv, "fff-runtime-lib", options.fff_runtime_lib);
-    appendStringOption(b, &argv, "sdl3-include-dir", options.sdl3_include_dir);
-    appendStringOption(b, &argv, "sdl3-lib-dir", options.sdl3_lib_dir);
-    if (options.sdl3_runtime_lib) |value| {
-        argv.append(b.allocator, b.fmt("-Dsdl3-runtime-lib={s}", .{value})) catch @panic("OOM");
-    }
-    appendStringOption(b, &argv, "sdl3-ttf-include-dir", options.sdl3_ttf_include_dir);
-    appendStringOption(b, &argv, "sdl3-ttf-lib-dir", options.sdl3_ttf_lib_dir);
-    appendStringOption(b, &argv, "sdl3-ttf-runtime-lib", options.sdl3_ttf_runtime_lib);
     appendStringOption(b, &argv, "webview2-include-dir", options.webview2_include_dir);
     appendStringOption(b, &argv, "webview2-loader-lib", options.webview2_loader_lib);
     appendStringOption(b, &argv, "webview2-loader-dll", options.webview2_loader_dll);
@@ -505,10 +431,6 @@ fn appendInstallArgs(b: *std.Build, argv: *std.ArrayList([]const u8)) void {
         argv.appendSlice(b.allocator, &.{ "--prefix-include-dir", b.h_dir }) catch @panic("OOM");
     }
 }
-
-const PaletteRendererBackend = enum {
-    sdl_gpu,
-};
 
 const BrowserBackendKind = enum {
     native_webview,

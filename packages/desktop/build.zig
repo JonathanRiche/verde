@@ -14,7 +14,6 @@ pub fn build(b: *std.Build) void {
     const test_filters = testFilters(b);
     const ui_debug = b.option(bool, "ui-debug", "Show the desktop UI debug window") orelse false;
     const dev_trace = b.option(bool, "dev-trace", "Compile GUI flow-trace log lines (frame, RPC, paste, refresh breadcrumbs); dev builds only") orelse false;
-    const palette_renderer = b.option(PaletteRendererBackend, "palette-renderer", "Palette frame renderer backend: sdl_gpu") orelse .sdl_gpu;
     const browser_backend = b.option(BrowserBackendKind, "browser-backend", "Browser backend: native_webview or stub") orelse .native_webview;
     const terminal_backend = b.option(bool, "terminal_backend", "Enable the native terminal backend") orelse true;
     const local_ipc = b.option(bool, "local_ipc", "Enable the local live-control IPC backend") orelse true;
@@ -37,19 +36,6 @@ pub fn build(b: *std.Build) void {
     const fff_runtime_lib = b.option([]const u8, "fff-runtime-lib", "Path to the fff-c runtime library to install") orelse
         b.graph.environ_map.get("VERDE_FFF_RUNTIME_LIB") orelse
         b.pathJoin(&.{ fff_lib_dir, fff.fffRuntimeName(target.result.os.tag) });
-    const sdl3_include_dir = b.option([]const u8, "sdl3-include-dir", "Directory containing SDL3 headers") orelse
-        b.graph.environ_map.get("VERDE_SDL3_INCLUDE_DIR");
-    const sdl3_lib_dir = b.option([]const u8, "sdl3-lib-dir", "Directory containing the SDL3 link library") orelse
-        b.graph.environ_map.get("VERDE_SDL3_LIB_DIR");
-    const sdl3_runtime_lib = b.option([]const u8, "sdl3-runtime-lib", "Path to the SDL3 runtime library to install beside the executable") orelse
-        b.graph.environ_map.get("VERDE_SDL3_RUNTIME_LIB") orelse
-        defaultSystemSdl3Runtime(b, target.result.os.tag);
-    const sdl3_ttf_include_dir = b.option([]const u8, "sdl3-ttf-include-dir", "Directory containing SDL3_ttf headers") orelse
-        b.graph.environ_map.get("VERDE_SDL3_TTF_INCLUDE_DIR");
-    const sdl3_ttf_lib_dir = b.option([]const u8, "sdl3-ttf-lib-dir", "Directory containing the SDL3_ttf link library") orelse
-        b.graph.environ_map.get("VERDE_SDL3_TTF_LIB_DIR");
-    const sdl3_ttf_runtime_lib = b.option([]const u8, "sdl3-ttf-runtime-lib", "Path to the SDL3_ttf runtime library to install beside the executable") orelse
-        b.graph.environ_map.get("VERDE_SDL3_TTF_RUNTIME_LIB");
     const webview2_include_dir = b.option([]const u8, "webview2-include-dir", "Directory containing WebView2.h") orelse
         b.graph.environ_map.get("WEBVIEW2_INCLUDE_DIR");
     const webview2_loader_lib = b.option([]const u8, "webview2-loader-lib", "Exact WebView2 loader import library") orelse
@@ -74,11 +60,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const zsdl = b.dependency("zsdl", .{
-        .target = target,
-        .optimize = optimize,
-        .@"use-prebuilt" = false,
-    });
     const ghostty = b.dependency("ghostty", .{
         .target = target,
         .optimize = optimize,
@@ -92,7 +73,7 @@ pub fn build(b: *std.Build) void {
     });
     const palette_module = palette.module("palette");
     // GUI-free protocol core. Linked into the session daemon for core.* methods;
-    // headless-test runs this package alone with no SDL/Palette/Ghostty deps.
+    // headless-test runs this package alone with no Palette/Ghostty deps.
     const toml_module = b.dependency("toml", .{ .target = target, .optimize = optimize }).module("toml");
     const headless_module = b.createModule(.{
         .root_source_file = b.path("../headless/src/root.zig"),
@@ -129,9 +110,6 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/runtime/loop_wakeup.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{
-            .{ .name = "zsdl3", .module = zsdl.module("zsdl3") },
-        },
     });
     // Opt-in native composition supplied by a separately maintained build.
     // Default artifacts have no external source, payload or system dependency.
@@ -140,7 +118,6 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([:0]const u8, "version", version_z);
     build_options.addOption(bool, "ui_debug", ui_debug);
     build_options.addOption(bool, "dev_trace", dev_trace);
-    build_options.addOption(PaletteRendererBackend, "palette_renderer", palette_renderer);
     build_options.addOption(BrowserBackendKind, "browser_backend", browser_backend);
     build_options.addOption(bool, "terminal_backend", terminal_backend);
     build_options.addOption(bool, "local_ipc", local_ipc);
@@ -225,7 +202,6 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "platform_paths", .module = platform_paths_module },
                 .{ .name = "platform_runtime", .module = platform_runtime_module },
                 .{ .name = "platform_windows_known_folders", .module = platform_windows_known_folders_module },
-                .{ .name = "zsdl3", .module = zsdl.module("zsdl3") },
                 .{ .name = "zqlite", .module = zqlite.module("zqlite") },
             },
         }),
@@ -233,9 +209,10 @@ pub fn build(b: *std.Build) void {
     daemon_exe.build_id = .sha1;
     daemon_exe.each_lib_rpath = false;
     daemon_exe.root_module.link_libc = true;
+    useLibcLinker(daemon_exe);
     if (target.result.os.tag == .linux) {
         // forkpty(3), used by daemon-owned PTY sessions, lives in libutil on
-        // Linux. No SDL, Palette, browser helper, fonts, or desktop entrypoint
+        // Linux. No Palette, browser helper, fonts, or desktop entrypoint
         // participates in this executable.
         daemon_exe.root_module.linkSystemLibrary("util", .{});
     } else if (target.result.os.tag == .windows) {
@@ -266,7 +243,6 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "platform_windows_known_folders", .module = platform_windows_known_folders_module },
                 .{ .name = "zig_dif", .module = zig_dif.module("zig_dif") },
                 .{ .name = "zig_markdown", .module = zig_markdown.module("zig_markdown") },
-                .{ .name = "zsdl3", .module = zsdl.module("zsdl3") },
             },
         }),
     });
@@ -286,6 +262,7 @@ pub fn build(b: *std.Build) void {
         else => {},
     }
     gui_exe.root_module.link_libc = true;
+    useLibcLinker(gui_exe);
     gui_exe.root_module.addIncludePath(b.path("../../vendor"));
     gui_exe.root_module.addIncludePath(b.path("../../vendor/fff/crates/fff-c/include"));
     fff.addFffLink(gui_exe, target.result.os.tag, fff_lib_dir, fff_import_lib);
@@ -295,17 +272,9 @@ pub fn build(b: *std.Build) void {
     });
     switch (target.result.os.tag) {
         .linux => {
-            if (zsdl.builder.lazyDependency("sdl3_prebuilt_x86_64_linux_gnu", .{})) |sdl3_prebuilt| {
-                gui_exe.root_module.addLibraryPath(sdl3_prebuilt.path("lib"));
-            }
-            gui_exe.root_module.addCSourceFile(.{
-                .file = b.path("src/browser/platform/linux_wayland_subsurface.c"),
-                .flags = &.{},
-            });
-            gui_exe.root_module.linkSystemLibrary("SDL3", .{});
-            gui_exe.root_module.linkSystemLibrary("SDL3_ttf", .{});
+            // Palette speaks the Wayland protocol itself and dlopens Vulkan;
+            // only libutil (forkpty) is linked.
             gui_exe.root_module.linkSystemLibrary("util", .{});
-            gui_exe.root_module.linkSystemLibrary("wayland-client", .{ .use_pkg_config = .force });
         },
         .windows => {
             gui_exe.subsystem = .windows;
@@ -321,37 +290,14 @@ pub fn build(b: *std.Build) void {
                 .include_dir = webview2_include_dir,
                 .loader_import_lib = webview2_loader_lib,
             });
-            addWindowsSdlPaths(gui_exe, .{
-                .sdl3_include_dir = sdl3_include_dir,
-                .sdl3_lib_dir = sdl3_lib_dir,
-                .sdl3_ttf_include_dir = sdl3_ttf_include_dir,
-                .sdl3_ttf_lib_dir = sdl3_ttf_lib_dir,
-            });
-            addWindowsSdlIncludes(palette_module, sdl3_include_dir, sdl3_ttf_include_dir);
-            gui_exe.root_module.linkSystemLibrary("SDL3", .{});
-            gui_exe.root_module.linkSystemLibrary("SDL3_ttf", .{});
             addWindowsSystemLibraries(gui_exe);
         },
         .macos => {
-            if (zsdl.builder.lazyDependency("sdl3_prebuilt_macos", .{})) |sdl3_prebuilt| {
-                gui_exe.root_module.addFrameworkPath(sdl3_prebuilt.path("Frameworks"));
-            }
             if (b.graph.environ_map.get("SDKROOT")) |sdkroot| {
                 gui_exe.root_module.addFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdkroot, "System", "Library", "Frameworks" }) });
                 gui_exe.root_module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdkroot, "usr", "include" }) });
             }
-            gui_exe.root_module.addCSourceFile(.{
-                .file = b.path("src/platform/macos_clipboard.m"),
-                .flags = &.{},
-            });
             addMacOSSwiftWebView(b, gui_exe, target.result.cpu.arch);
-            if (macOSHomebrewPrefix(b)) |prefix| {
-                gui_exe.root_module.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "include" }) });
-                gui_exe.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "lib" }) });
-                palette_module.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "include" }) });
-            }
-            gui_exe.root_module.linkSystemLibrary("sdl3", .{ .use_pkg_config = .yes });
-            gui_exe.root_module.linkSystemLibrary("sdl3-ttf", .{ .use_pkg_config = .yes });
             gui_exe.root_module.linkFramework("AppKit", .{});
             gui_exe.root_module.linkFramework("WebKit", .{});
         },
@@ -365,7 +311,7 @@ pub fn build(b: *std.Build) void {
 
     // The stable public command is intentionally a separate compilation
     // boundary. It dispatches CLI commands and launches the sibling private
-    // GUI without pulling SDL, Palette, rendering, or GUI state into its root.
+    // GUI without pulling Palette, rendering, or GUI state into its root.
     const cli_exe = b.addExecutable(.{
         .name = "verde",
         .root_module = b.createModule(.{
@@ -386,7 +332,6 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "platform_windows_known_folders", .module = platform_windows_known_folders_module },
                 .{ .name = "zig_dif", .module = zig_dif.module("zig_dif") },
                 .{ .name = "zig_markdown", .module = zig_markdown.module("zig_markdown") },
-                .{ .name = "zsdl3", .module = zsdl.module("zsdl3") },
                 .{ .name = "zqlite", .module = zqlite.module("zqlite") },
             },
         }),
@@ -394,6 +339,7 @@ pub fn build(b: *std.Build) void {
     cli_exe.build_id = .sha1;
     cli_exe.each_lib_rpath = false;
     cli_exe.root_module.link_libc = true;
+    useLibcLinker(cli_exe);
     switch (target.result.os.tag) {
         .linux => cli_exe.root_module.linkSystemLibrary("util", .{}),
         .windows => {
@@ -457,6 +403,7 @@ pub fn build(b: *std.Build) void {
         });
         browser_helper.build_id = .sha1;
         browser_helper.root_module.link_libc = true;
+        useLibcLinker(browser_helper);
         browser_helper.root_module.addCSourceFile(.{
             .file = b.path("src/browser/platform/linux_wpe.c"),
             .flags = &.{},
@@ -474,31 +421,7 @@ pub fn build(b: *std.Build) void {
     const install_fff = b.addInstallBinFile(.{ .cwd_relative = fff_runtime_lib }, fff.fffRuntimeName(target.result.os.tag));
     if (build_fff) |build_step| install_fff.step.dependOn(&build_step.step);
     b.getInstallStep().dependOn(&install_fff.step);
-    if (target.result.os.tag == .linux) {
-        if (sdl3_runtime_lib) |path| {
-            b.getInstallStep().dependOn(&b.addInstallFileWithDir(
-                .{ .cwd_relative = path },
-                .bin,
-                "libSDL3.so",
-            ).step);
-            b.getInstallStep().dependOn(&b.addInstallFileWithDir(
-                .{ .cwd_relative = path },
-                .bin,
-                "libSDL3.so.0",
-            ).step);
-        } else if (zsdl.builder.lazyDependency("sdl3_prebuilt_x86_64_linux_gnu", .{})) |sdl3_prebuilt| {
-            inline for (.{ "libSDL3.so", "libSDL3.so.0" }) |name| {
-                b.getInstallStep().dependOn(&b.addInstallFileWithDir(
-                    sdl3_prebuilt.path("lib/libSDL3.so"),
-                    .bin,
-                    name,
-                ).step);
-            }
-        }
-    }
     if (target.result.os.tag == .windows) {
-        installWindowsRuntime(b, sdl3_runtime_lib, "SDL3.dll");
-        installWindowsRuntime(b, sdl3_ttf_runtime_lib, "SDL3_ttf.dll");
         if (browser_backend == .native_webview) {
             installWindowsRuntime(b, webview2_loader_dll, "WebView2Loader.dll");
         }
@@ -533,15 +456,6 @@ pub fn build(b: *std.Build) void {
             "verde.png",
         ).step);
     }
-    if (target.result.os.tag == .macos) {
-        if (zsdl.builder.lazyDependency("sdl3_prebuilt_macos", .{})) |sdl3_prebuilt| {
-            b.getInstallStep().dependOn(&b.addInstallDirectory(.{
-                .source_dir = sdl3_prebuilt.path("Frameworks/SDL3.framework"),
-                .install_dir = .bin,
-                .install_subdir = "SDL3.framework",
-            }).step);
-        }
-    }
 
     // Run through the installed public launcher so sibling discovery exercises
     // the same layout used by desktop entries and packaged applications.
@@ -560,7 +474,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     const test_compile_step = b.step("test-compile", "Compile unit tests without running them");
     // Headless package tests are hermetic (std only) and intentionally avoid
-    // SDL/Palette/Ghostty/zqlite so they stay a fast focused gate for core.* work.
+    // Palette/Ghostty/zqlite so they stay a fast focused gate for core.* work.
     const headless_tests = b.addTest(.{
         .filters = test_filters,
         .root_module = b.createModule(.{
@@ -575,7 +489,7 @@ pub fn build(b: *std.Build) void {
     // this artifact on its focused step instead of compiling or running the
     // same tests twice in either aggregate step.
     // Remote-runtime infrastructure has its own GUI-free gate so process,
-    // transport, profile, and route tests do not depend on the SDL app graph.
+    // transport, profile, and route tests do not depend on the GUI app graph.
     const runtime_tests = b.addTest(.{
         .filters = test_filters,
         .root_module = b.createModule(.{
@@ -594,6 +508,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     runtime_tests.root_module.link_libc = true;
+    useLibcLinker(runtime_tests);
     const integration_test_options = b.addOptions();
     integration_test_options.addOption(bool, "enabled", runtime_integration_module != null);
     runtime_tests.root_module.addImport("runtime_integration_test_options", integration_test_options.createModule());
@@ -615,6 +530,7 @@ pub fn build(b: *std.Build) void {
             }),
         });
         linux_browser_helper_tests.root_module.link_libc = true;
+        useLibcLinker(linux_browser_helper_tests);
         linux_browser_helper_tests.root_module.addCSourceFile(.{
             .file = b.path("src/browser/platform/linux_wpe.c"),
             .flags = &.{"-DVERDE_BROWSER_LINUX_TESTING=1"},
@@ -647,7 +563,6 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "platform_windows_known_folders", .module = platform_windows_known_folders_module },
                 .{ .name = "zig_dif", .module = zig_dif.module("zig_dif") },
                 .{ .name = "zig_markdown", .module = zig_markdown.module("zig_markdown") },
-                .{ .name = "zsdl3", .module = zsdl.module("zsdl3") },
                 .{ .name = "zqlite", .module = zqlite.module("zqlite") },
             },
         }),
@@ -668,33 +583,15 @@ pub fn build(b: *std.Build) void {
         .flags = &.{},
     });
     exe_tests.root_module.link_libc = true;
+    useLibcLinker(exe_tests);
     if (target.result.os.tag == .linux) {
-        if (zsdl.builder.lazyDependency("sdl3_prebuilt_x86_64_linux_gnu", .{})) |sdl3_prebuilt| {
-            exe_tests.root_module.addLibraryPath(sdl3_prebuilt.path("lib"));
-        }
-        exe_tests.root_module.addCSourceFile(.{
-            .file = b.path("src/browser/platform/linux_wayland_subsurface.c"),
-            .flags = &.{},
-        });
-        exe_tests.root_module.linkSystemLibrary("SDL3", .{});
-        exe_tests.root_module.linkSystemLibrary("SDL3_ttf", .{});
         exe_tests.root_module.linkSystemLibrary("util", .{});
-        exe_tests.root_module.linkSystemLibrary("wayland-client", .{ .use_pkg_config = .force });
     } else if (target.result.os.tag == .macos) {
-        if (zsdl.builder.lazyDependency("sdl3_prebuilt_macos", .{})) |sdl3_prebuilt| {
-            exe_tests.root_module.addFrameworkPath(sdl3_prebuilt.path("Frameworks"));
-        }
-        exe_tests.root_module.addCSourceFile(.{
-            .file = b.path("src/platform/macos_clipboard.m"),
-            .flags = &.{},
-        });
         if (browser_backend == .native_webview) {
             addMacOSSwiftWebView(b, exe_tests, target.result.cpu.arch);
         } else {
             addMacOSWebViewTestStub(b, exe_tests);
         }
-        exe_tests.root_module.linkSystemLibrary("sdl3", .{ .use_pkg_config = .yes });
-        exe_tests.root_module.linkSystemLibrary("sdl3-ttf", .{ .use_pkg_config = .yes });
         exe_tests.root_module.linkFramework("AppKit", .{});
         exe_tests.root_module.linkFramework("WebKit", .{});
     } else if (target.result.os.tag == .windows) {
@@ -704,14 +601,6 @@ pub fn build(b: *std.Build) void {
             .include_dir = webview2_include_dir,
             .loader_import_lib = webview2_loader_lib,
         });
-        addWindowsSdlPaths(exe_tests, .{
-            .sdl3_include_dir = sdl3_include_dir,
-            .sdl3_lib_dir = sdl3_lib_dir,
-            .sdl3_ttf_include_dir = sdl3_ttf_include_dir,
-            .sdl3_ttf_lib_dir = sdl3_ttf_lib_dir,
-        });
-        exe_tests.root_module.linkSystemLibrary("SDL3", .{});
-        exe_tests.root_module.linkSystemLibrary("SDL3_ttf", .{});
         addWindowsSystemLibraries(exe_tests);
     }
     addTestArtifact(b, test_step, exe_tests, target);
@@ -739,7 +628,6 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "platform_windows_known_folders", .module = platform_windows_known_folders_module },
                 .{ .name = "zig_dif", .module = zig_dif.module("zig_dif") },
                 .{ .name = "zig_markdown", .module = zig_markdown.module("zig_markdown") },
-                .{ .name = "zsdl3", .module = zsdl.module("zsdl3") },
                 .{ .name = "zqlite", .module = zqlite.module("zqlite") },
             },
         }),
@@ -754,33 +642,15 @@ pub fn build(b: *std.Build) void {
         .flags = &.{},
     });
     headless_daemon_it_exe.root_module.link_libc = true;
+    useLibcLinker(headless_daemon_it_exe);
     if (target.result.os.tag == .linux) {
-        if (zsdl.builder.lazyDependency("sdl3_prebuilt_x86_64_linux_gnu", .{})) |sdl3_prebuilt| {
-            headless_daemon_it_exe.root_module.addLibraryPath(sdl3_prebuilt.path("lib"));
-        }
-        headless_daemon_it_exe.root_module.addCSourceFile(.{
-            .file = b.path("src/browser/platform/linux_wayland_subsurface.c"),
-            .flags = &.{},
-        });
-        headless_daemon_it_exe.root_module.linkSystemLibrary("SDL3", .{});
-        headless_daemon_it_exe.root_module.linkSystemLibrary("SDL3_ttf", .{});
         headless_daemon_it_exe.root_module.linkSystemLibrary("util", .{});
-        headless_daemon_it_exe.root_module.linkSystemLibrary("wayland-client", .{ .use_pkg_config = .force });
     } else if (target.result.os.tag == .macos) {
-        if (zsdl.builder.lazyDependency("sdl3_prebuilt_macos", .{})) |sdl3_prebuilt| {
-            headless_daemon_it_exe.root_module.addFrameworkPath(sdl3_prebuilt.path("Frameworks"));
-        }
-        headless_daemon_it_exe.root_module.addCSourceFile(.{
-            .file = b.path("src/platform/macos_clipboard.m"),
-            .flags = &.{},
-        });
         if (browser_backend == .native_webview) {
             addMacOSSwiftWebView(b, headless_daemon_it_exe, target.result.cpu.arch);
         } else {
             addMacOSWebViewTestStub(b, headless_daemon_it_exe);
         }
-        headless_daemon_it_exe.root_module.linkSystemLibrary("sdl3", .{ .use_pkg_config = .yes });
-        headless_daemon_it_exe.root_module.linkSystemLibrary("sdl3-ttf", .{ .use_pkg_config = .yes });
         headless_daemon_it_exe.root_module.linkFramework("AppKit", .{});
         headless_daemon_it_exe.root_module.linkFramework("WebKit", .{});
     } else if (target.result.os.tag == .windows) {
@@ -790,14 +660,6 @@ pub fn build(b: *std.Build) void {
             .include_dir = webview2_include_dir,
             .loader_import_lib = webview2_loader_lib,
         });
-        addWindowsSdlPaths(headless_daemon_it_exe, .{
-            .sdl3_include_dir = sdl3_include_dir,
-            .sdl3_lib_dir = sdl3_lib_dir,
-            .sdl3_ttf_include_dir = sdl3_ttf_include_dir,
-            .sdl3_ttf_lib_dir = sdl3_ttf_lib_dir,
-        });
-        headless_daemon_it_exe.root_module.linkSystemLibrary("SDL3", .{});
-        headless_daemon_it_exe.root_module.linkSystemLibrary("SDL3_ttf", .{});
         addWindowsSystemLibraries(headless_daemon_it_exe);
     }
     const headless_daemon_it_step = b.step("headless-daemon-it", "Hermetic headless client/session-daemon integration test");
@@ -818,37 +680,10 @@ pub fn build(b: *std.Build) void {
     test_compile_step.dependOn(&fmt_check.step);
 }
 
-const PaletteRendererBackend = enum {
-    sdl_gpu,
-};
-
 const BrowserBackendKind = enum {
     native_webview,
     stub,
 };
-
-const WindowsSdlPathOptions = struct {
-    sdl3_include_dir: ?[]const u8 = null,
-    sdl3_lib_dir: ?[]const u8 = null,
-    sdl3_ttf_include_dir: ?[]const u8 = null,
-    sdl3_ttf_lib_dir: ?[]const u8 = null,
-};
-
-fn addWindowsSdlPaths(compile: *std.Build.Step.Compile, options: WindowsSdlPathOptions) void {
-    if (options.sdl3_include_dir) |path| compile.root_module.addIncludePath(.{ .cwd_relative = path });
-    if (options.sdl3_lib_dir) |path| compile.root_module.addLibraryPath(.{ .cwd_relative = path });
-    if (options.sdl3_ttf_include_dir) |path| compile.root_module.addIncludePath(.{ .cwd_relative = path });
-    if (options.sdl3_ttf_lib_dir) |path| compile.root_module.addLibraryPath(.{ .cwd_relative = path });
-}
-
-fn addWindowsSdlIncludes(
-    module: *std.Build.Module,
-    sdl3_include_dir: ?[]const u8,
-    sdl3_ttf_include_dir: ?[]const u8,
-) void {
-    if (sdl3_include_dir) |path| module.addIncludePath(.{ .cwd_relative = path });
-    if (sdl3_ttf_include_dir) |path| module.addIncludePath(.{ .cwd_relative = path });
-}
 
 const WindowsWebView2Options = struct {
     real_webview: bool,
@@ -1074,6 +909,15 @@ pub fn testFilters(b: *std.Build) []const []const u8 {
     return b.option([]const []const u8, "test-filter", "Compile and run only tests whose name contains this substring (repeatable)") orelse &.{};
 }
 
+/// Libc-linked artifacts build with LLVM and link with LLD: Zig 0.16's
+/// self-hosted ELF linker cannot consume the system crt1.o (.sframe
+/// relocations), and the self-hosted x86 backend miscompiles Verde. Mach-O
+/// has no LLD and keeps Zig's own linker.
+fn useLibcLinker(compile: *std.Build.Step.Compile) void {
+    compile.use_llvm = true;
+    compile.use_lld = compile.rootModuleTarget().ofmt != .macho;
+}
+
 fn addTestArtifact(
     b: *std.Build,
     test_step: *std.Build.Step,
@@ -1168,27 +1012,4 @@ fn macOSSDKRoot(b: *std.Build) []const u8 {
         return sdkroot;
     }
     return "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk";
-}
-
-fn defaultSystemSdl3Runtime(b: *std.Build, target_os: std.Target.Os.Tag) ?[]const u8 {
-    if (target_os != .linux or b.graph.host.result.os.tag != .linux) return null;
-    const candidates = [_][]const u8{
-        "/usr/lib/libSDL3.so.0",
-        "/usr/lib/x86_64-linux-gnu/libSDL3.so.0",
-    };
-    for (candidates) |path| {
-        std.Io.Dir.accessAbsolute(b.graph.io, path, .{}) catch continue;
-        return path;
-    }
-    return null;
-}
-
-fn macOSHomebrewPrefix(b: *std.Build) ?[]const u8 {
-    if (b.graph.environ_map.get("HOMEBREW_PREFIX")) |prefix| return prefix;
-    const candidates = [_][]const u8{ "/opt/homebrew", "/usr/local" };
-    for (candidates) |prefix| {
-        std.Io.Dir.accessAbsolute(b.graph.io, b.pathJoin(&.{ prefix, "include", "SDL3_ttf", "SDL_ttf.h" }), .{}) catch continue;
-        return prefix;
-    }
-    return null;
 }
