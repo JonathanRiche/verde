@@ -124,9 +124,21 @@ pub fn deviceRefAlloc(allocator: std.mem.Allocator, profile_id: []const u8) ![]u
     return std.fmt.allocPrint(allocator, "{s}{s}/device", .{ CREDENTIAL_REF_PREFIX, profile_id });
 }
 
+/// Builds the ref for an optional runtime integration's persisted Cloud
+/// session. `scope` names the issuer, so it never collides with a profile's
+/// device credential.
+pub fn cloudSessionRefAlloc(allocator: std.mem.Allocator, scope: []const u8) ![]u8 {
+    const ref = try std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ CREDENTIAL_REF_PREFIX, scope, CLOUD_SESSION_SUFFIX });
+    errdefer allocator.free(ref);
+    try validateRef(ref);
+    return ref;
+}
+
+const CLOUD_SESSION_SUFFIX: []const u8 = "/cloud-session";
+
 pub fn validateRef(ref: []const u8) !void {
     if (!std.mem.startsWith(u8, ref, CREDENTIAL_REF_PREFIX)) return error.InvalidCredentialRef;
-    if (ref.len <= CREDENTIAL_REF_PREFIX.len or ref.len > secret_store.MAX_PROFILE_ID_BYTES + CREDENTIAL_REF_PREFIX.len + "/device".len) {
+    if (ref.len <= CREDENTIAL_REF_PREFIX.len or ref.len > secret_store.MAX_PROFILE_ID_BYTES + CREDENTIAL_REF_PREFIX.len + CLOUD_SESSION_SUFFIX.len) {
         return error.InvalidCredentialRef;
     }
     for (ref) |byte| {
@@ -154,7 +166,8 @@ fn detectBackend() Backend {
 // secret-tool reads the secret from stdin; only non-secret attributes are
 // passed as argv so the credential never appears in process listings.
 fn secretToolStore(allocator: std.mem.Allocator, io: std.Io, ref: []const u8, credential: []const u8) !void {
-    const label = try std.fmt.allocPrint(allocator, "Verde runtime device credential ({s})", .{ref});
+    const kind = if (std.mem.endsWith(u8, ref, CLOUD_SESSION_SUFFIX)) "Verde Cloud session" else "Verde runtime device credential";
+    const label = try std.fmt.allocPrint(allocator, "{s} ({s})", .{ kind, ref });
     defer allocator.free(label);
     const label_arg = try std.fmt.allocPrint(allocator, "--label={s}", .{label});
     defer allocator.free(label_arg);
@@ -242,6 +255,10 @@ test "credential refs are namespaced and shell-safe" {
     try std.testing.expectError(error.InvalidCredentialRef, validateRef("other/abc/device"));
     try std.testing.expectError(error.InvalidCredentialRef, validateRef("verde-runtime/"));
     try std.testing.expectError(error.InvalidCredentialRef, validateRef("verde-runtime/a b/device"));
+    const cloud = try cloudSessionRefAlloc(std.testing.allocator, "cloud.verdeai.dev");
+    defer std.testing.allocator.free(cloud);
+    try std.testing.expectEqualStrings("verde-runtime/cloud.verdeai.dev/cloud-session", cloud);
+    try std.testing.expectError(error.InvalidCredentialRef, cloudSessionRefAlloc(std.testing.allocator, "a b"));
 }
 
 test "memory-only store round trips and forgets without touching the OS" {
