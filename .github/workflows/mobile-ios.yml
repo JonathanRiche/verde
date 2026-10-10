@@ -42,6 +42,9 @@ jobs:
         working-directory: packages/client_core
         run: zig build ios-xcframework --release=safe
 
+      - name: Test on a disposable simulator
+        run: bash packages/mobile_ios/scripts/xcode.sh test
+
       - name: Install signing certificate and profiles
         env:
           DIST_P12_BASE64: ${{ secrets.IOS_DIST_P12_BASE64 }}
