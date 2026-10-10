@@ -19,8 +19,11 @@ pub const CLIPBOARD_IMAGE_MAX_BYTES: usize = 10 * 1024 * 1024;
 pub const PERSISTED_DIFF_MARKER_V1 = "EDITORTS_DIFF_V1\n";
 pub const PERSISTED_DIFF_MARKER = "VERDE_DIFF_V2\n";
 
-extern fn verde_macos_clipboard_copy_image(out_bytes: *?[*]u8, out_len: *usize, out_mime: *?[*:0]const u8) c_int;
-extern fn free(ptr: ?*anyopaque) void;
+/// Native pasteboard image reader, registered by the GUI (palette-native's
+/// `App.getClipboardImage`) so this module stays free of the UI platform.
+/// Returns allocator-owned bytes; `mime` is a static string.
+pub const NativeClipboardImageReader = *const fn (allocator: std.mem.Allocator) anyerror!?ClipboardImageCapture;
+pub var native_clipboard_image_reader: ?NativeClipboardImageReader = null;
 
 pub const PickDirectoryError = std.process.RunError || std.mem.Allocator.Error || error{
     UnsupportedOperatingSystem,
@@ -2288,25 +2291,17 @@ fn captureClipboardImageMacOS(allocator: std.mem.Allocator) !?ClipboardImageCapt
 }
 
 fn captureClipboardImageMacOSNative(allocator: std.mem.Allocator) !?ClipboardImageCapture {
-    var native_bytes: ?[*]u8 = null;
-    var native_len: usize = 0;
-    var native_mime: ?[*:0]const u8 = null;
-
-    const result = verde_macos_clipboard_copy_image(&native_bytes, &native_len, &native_mime);
-    if (result < 0) return error.OutOfMemory;
-    if (result == 0 or native_bytes == null or native_len == 0 or native_mime == null) return null;
-    defer free(native_bytes);
-
-    if (native_len > CLIPBOARD_IMAGE_MAX_BYTES) return error.StreamTooLong;
-
-    const bytes = try allocator.dupe(u8, native_bytes.?[0..native_len]);
-    errdefer allocator.free(bytes);
-    const mime = std.mem.span(native_mime.?);
-
-    return .{
-        .bytes = bytes,
-        .mime = mime,
-    };
+    const reader = native_clipboard_image_reader orelse return null;
+    const capture = try reader(allocator) orelse return null;
+    if (capture.bytes.len == 0) {
+        allocator.free(capture.bytes);
+        return null;
+    }
+    if (capture.bytes.len > CLIPBOARD_IMAGE_MAX_BYTES) {
+        allocator.free(capture.bytes);
+        return error.StreamTooLong;
+    }
+    return capture;
 }
 
 fn selectMacClipboardImageFlavor(info_output: []const u8) ?MacClipboardImageFlavor {
