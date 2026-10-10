@@ -321,7 +321,7 @@ private struct MdBlockView: View {
         case .paragraph(let text):
             Text(text) .font(VerdeTheme.ui(15)).frame(maxWidth: .infinity, alignment: .leading)
         case .heading(let level, let text):
-            Text(text).font(VerdeTheme.ui(level == 1 ? 24 : level == 2 ? 20 : 17, bold: true)).foregroundStyle(level == 1 ? Color(hex: 0xf5c84a) : level == 2 ? Color(hex: 0xf6d27a) : Color(hex: 0x99dcb3))
+            Text(text).font(VerdeTheme.ui(level == 1 ? 24 : level == 2 ? 20 : 17, bold: true)).foregroundStyle(level == 1 ? VerdeTheme.heading1 : level == 2 ? VerdeTheme.heading2 : VerdeTheme.heading3)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .accessibilityAddTraits(.isHeader)
         case .bullets(let ordered, let items):

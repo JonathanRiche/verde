@@ -11,6 +11,9 @@ enum VerdeTheme {
     static var muted: Color { AppearanceSettings.shared.color("text_muted", fallback: 0xb9bbc3, light: 0x46594e) }
     static var subtle: Color { AppearanceSettings.shared.color("text_subtle", fallback: 0x787887, light: 0x607267) }
     static var accent: Color { AppearanceSettings.shared.color("accent", fallback: 0x50c878, light: 0x197d43) }
+    static var heading1: Color { AppearanceSettings.shared.color("heading1", fallback: 0xf5c84a, light: 0x805b00) }
+    static var heading2: Color { AppearanceSettings.shared.color("heading2", fallback: 0xf6d27a, light: 0x86620d) }
+    static var heading3: Color { AppearanceSettings.shared.color("heading3", fallback: 0x99dcb3, light: 0x197d43) }
     static var warning: Color { AppearanceSettings.shared.color("warning", fallback: 0xfbbf24, light: 0xa36800) }
     static var danger: Color { AppearanceSettings.shared.color("diff_remove", fallback: 0xff6464, light: 0xb52828) }
     /// Android's attention badge uses errorContainer/onErrorContainer, rather

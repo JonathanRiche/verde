@@ -1,9 +1,46 @@
 import XCTest
 import UIKit
+import SwiftUI
 @testable import VerdeApp
 
 @MainActor
 final class ThemeTests: XCTestCase {
+    func testAppearanceDefaultsPersistsAndPreservesLegacyDarkChoice() {
+        let name = "ThemeTests." + UUID().uuidString
+        let defaults = UserDefaults(suiteName: name)!
+        defer { defaults.removePersistentDomain(forName: name) }
+        let settings = AppearanceSettings(defaults: defaults)
+        XCTAssertEqual(settings.mode, .system)
+        XCTAssertNil(settings.scheme)
+        for mode in AppearanceMode.allCases {
+            settings.mode = mode
+            XCTAssertEqual(AppearanceSettings(defaults: defaults).mode, mode)
+        }
+        defaults.set("verde", forKey: "ios.appearance")
+        XCTAssertEqual(AppearanceSettings(defaults: defaults).mode, .dark)
+    }
+
+    func testAppearanceResolvesLightDarkAndLiveSystemTraits() {
+        let name = "ThemeTests." + UUID().uuidString
+        let defaults = UserDefaults(suiteName: name)!
+        defer { defaults.removePersistentDomain(forName: name) }
+        let settings = AppearanceSettings(defaults: defaults)
+        func resolved(_ style: UIUserInterfaceStyle) -> UIColor {
+            UIColor(settings.color("background", fallback: 0x0d1213, light: 0xf5f7f6))
+                .resolvedColor(with: UITraitCollection(userInterfaceStyle: style))
+        }
+        settings.mode = .system
+        XCTAssertNotEqual(resolved(.light), resolved(.dark))
+        settings.mode = .light
+        XCTAssertEqual(settings.scheme, .light)
+        XCTAssertEqual(resolved(.light), resolved(.dark))
+        let light = resolved(.dark)
+        settings.mode = .dark
+        XCTAssertEqual(settings.scheme, .dark)
+        XCTAssertEqual(resolved(.light), resolved(.dark))
+        XCTAssertNotEqual(light, resolved(.light))
+    }
+
     func testBundledFontsAreRegisteredUnderTheirRealNames() {
         for name in ["NotoSans-Regular", "NotoSans-Bold", "CalSans-Regular", "JetBrainsMonoNF-Regular"] {
             XCTAssertNotNil(UIFont(name: name, size: 15), "Font missing: \(name)")

@@ -20,8 +20,8 @@ copy, uses the system share sheet, and removes the copy on dismissal. Sign-out
 closes the viewer and removes its copy. Startup removes copies left by a crash.
 The recipient chosen in the share sheet owns any exported copy.
 
-Settings is in the workspace drawer. Appearance offers Verde dark (default),
-host, or system light/dark. Host mode uses authenticated `/api/theme` through a
+Settings is in the workspace drawer. Appearance offers System (default), Light, Dark, or Host theme.
+System follows the phone’s appearance, and the choice is saved on the phone. Host mode uses authenticated `/api/theme` through a
 64 KiB core fetch; native clients never obtain the bearer. Color fields are
 validated hex RGBA values. Missing/invalid themes fall back to Verde dark.
 Reduce Motion suppresses pulse/drawer/transcript jump animations; an optional

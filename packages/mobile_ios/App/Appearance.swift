@@ -1,8 +1,16 @@
 import SwiftUI
 import Observation
 
-enum AppearanceMode: String, CaseIterable { case verde, host, system
-    var label: String { switch self { case .verde: return "Verde dark"; case .host: return "Host theme"; case .system: return "System" } }
+enum AppearanceMode: String, CaseIterable {
+    case system, light, dark = "verde", host
+    var label: String {
+        switch self {
+        case .system: return "System"
+        case .light: return "Light"
+        case .dark: return "Dark"
+        case .host: return "Host theme"
+        }
+    }
 }
 struct HostPalette: Decodable {
     let colors: [String: String]
@@ -32,9 +40,16 @@ struct HostPalette: Decodable {
     private var paletteHost: String?
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        mode = AppearanceMode(rawValue: defaults.string(forKey: "ios.appearance") ?? "") ?? .verde
+        mode = AppearanceMode(rawValue: defaults.string(forKey: "ios.appearance") ?? "") ?? .system
     }
-    var scheme: ColorScheme? { mode == .system ? nil : mode == .host && palette?.dark == false ? .light : .dark }
+    var scheme: ColorScheme? {
+        switch mode {
+        case .system: return nil
+        case .light: return .light
+        case .dark: return .dark
+        case .host: return palette?.dark == false ? .light : .dark
+        }
+    }
     var reducedMotion: Bool { mode == .host && palette?.reduced_motion == true }
     @MainActor func refresh(_ browse: BrowseModel) async {
         let stamp = UUID(); revision = stamp; notice = nil
@@ -59,6 +74,7 @@ struct HostPalette: Decodable {
     }
     func color(_ key: String, fallback: UInt32, light: UInt32? = nil) -> Color {
         if mode == .host, let value = palette?.color(key) { return value }
+        if mode == .light, let light { return Color(hex: light) }
         if mode == .system, let light {
             return Color(uiColor: UIColor { traits in UIColor(Color(hex: traits.userInterfaceStyle == .dark ? fallback : light)) })
         }
@@ -77,6 +93,7 @@ struct AppSettings: View {
             Form {
                 Section("Appearance") {
                     Picker("Theme", selection: $appearance.mode) { ForEach(AppearanceMode.allCases, id: \.self) { Text($0.label).tag($0) } }
+                    Text("System follows your phone’s Light or Dark appearance automatically.").font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted)
                     if appearance.mode == .host {
                         Button("Reload host theme") { Task { await appearance.refresh(browse) } }
                         if let notice = appearance.notice { Text(notice).font(VerdeTheme.ui(13)) }
