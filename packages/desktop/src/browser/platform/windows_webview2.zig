@@ -41,7 +41,7 @@ extern fn verde_windows_webview2_pop_event(handle: ?*anyopaque, kind: *c_int, pa
 extern fn verde_windows_webview2_free_string(value: ?[*:0]u8) void;
 extern fn verde_windows_webview2_test_utf8_roundtrip(value: [*:0]const u8) c_int;
 
-/// Owns a WebView2 controller hosted as a child HWND under the SDL-created window.
+/// Owns a WebView2 controller hosted as a child HWND under the main window.
 pub const Controller = struct {
     allocator: std.mem.Allocator,
     host_window: ?*anyopaque = null,

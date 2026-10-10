@@ -1,4 +1,4 @@
-//! Browser-pane input events translated from SDL before they cross the backend boundary.
+//! Browser-pane input events translated from platform events before they cross the backend boundary.
 
 const std = @import("std");
 

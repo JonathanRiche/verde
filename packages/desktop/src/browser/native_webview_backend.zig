@@ -69,7 +69,7 @@ pub const Backend = struct {
         self.pane_texture.deinit();
     }
 
-    /// Supplies the native SDL host window handle used by platform child-view backends.
+    /// Supplies the native host window handle (NSView / HWND) used by platform child-view backends.
     pub fn setHostWindow(self: *Backend, handle: ?*anyopaque) !void {
         try self.platform.setHostWindow(handle);
     }

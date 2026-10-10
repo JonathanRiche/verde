@@ -45,7 +45,7 @@ pub fn configureForegroundApp() void {
     verde_macos_app_configure_foreground();
 }
 
-/// Owns a WKWebView child view attached to the SDL-created NSWindow.
+/// Owns a WKWebView child view attached to the main window's NSView.
 pub const Controller = struct {
     allocator: std.mem.Allocator,
     host_window: ?*anyopaque = null,

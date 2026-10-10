@@ -136,37 +136,6 @@ jobs:
         shell: bash
         run: bun install --frozen-lockfile --production
 
-      - name: Install SDL3 and SDL3_ttf
-        shell: bash
-        run: |
-          SDL_VERSION=3.2.26
-          curl -fL --retry 5 --retry-delay 2 \
-            "https://www.libsdl.org/release/SDL3-${SDL_VERSION}.tar.gz" \
-            -o SDL3.tar.gz
-          tar -xf SDL3.tar.gz
-          cmake -S "SDL3-${SDL_VERSION}" -B SDL3-build \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_PREFIX=/usr/local \
-            -DSDL_SHARED=ON \
-            -DSDL_STATIC=OFF \
-            -DSDL_TEST_LIBRARY=OFF
-          cmake --build SDL3-build --parallel
-          cmake --install SDL3-build
-          ldconfig
-
-          SDL_TTF_VERSION=3.2.2
-          curl -fL --retry 5 --retry-delay 2 \
-            "https://github.com/libsdl-org/SDL_ttf/releases/download/release-${SDL_TTF_VERSION}/SDL3_ttf-${SDL_TTF_VERSION}.tar.gz" \
-            -o SDL3_ttf.tar.gz
-          tar -xf SDL3_ttf.tar.gz
-          cmake -S "SDL3_ttf-${SDL_TTF_VERSION}" -B SDL3_ttf-build \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_PREFIX=/usr/local \
-            -DSDLTTF_VENDORED=OFF
-          cmake --build SDL3_ttf-build --parallel
-          cmake --install SDL3_ttf-build
-          ldconfig
-
       - name: Compute release version
         shell: bash
         run: |
@@ -295,7 +264,7 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 brew install tree-sitter sdl3_ttf
+          HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 brew install tree-sitter
           echo "HOMEBREW_PREFIX=$(brew --prefix)" >> "$GITHUB_ENV"
 
       - name: Compute release version

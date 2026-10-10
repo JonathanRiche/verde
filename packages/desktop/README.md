@@ -1,11 +1,11 @@
 # `verde` Desktop
 
-This package contains Verde's standalone Zig desktop app. It uses SDL3, SDL_GPU, and [`palette`](../palette), Verde's in-repo Zig GUI framework.
+This package contains Verde's standalone Zig desktop app. It runs on [`palette`](../palette) (palette-native, vendored), which provides the window, input, fonts and GPU renderer: Wayland + Vulkan on Linux, AppKit + Metal on macOS, Win32 + Direct3D 11 on Windows.
 
 ## Prerequisites
 
 - Zig `0.16.0` through the repo-root [`mise.toml`](../../mise.toml)
-- SDL3 development files for your platform
+- Linux: WPE WebKit 2.0 with the WPE Platform API (`wpe-webkit-2.0`, `wpe-platform-2.0`), plus `wpebackend-fdo-1.0`, EGL and GLESv2 for the fdo fallback (`-Dbrowser-linux-fdo=false` drops them); a Vulkan driver at runtime
 - Provider setup for the providers you want to use:
   - Codex: `codex` on your `PATH` and `codex login`
   - Claude Code: Claude Code installed and logged in locally; Verde talks to it through Anthropic's Claude Agent SDK
@@ -36,7 +36,6 @@ Common tasks:
 - `mise run check-mac-webview`: on macOS, rebuilds/installs the WKWebView app and runs automated package/runtime readiness checks, including Swift packaging and native-keyboard ownership guards.
 - `mise run mac-webview-manual-signoff`: on macOS, runs the guided foreground physical-input signoff flow and writes a timestamped evidence run.
 - `mise run check-mac-webview-manual`: on macOS, checks the latest timestamped physical-input evidence run required for final WKWebView signoff.
-- `mise run dev-sdl-gpu`: runs with the SDL_GPU Palette renderer.
 
 ### Hyprland UI Polish Checks
 
@@ -104,7 +103,7 @@ Requests run against the project directory selected in Verde. If prompt sending 
 
 ## State And Config
 
-App state is stored through SDL's pref path in `state.sqlite`. User config is loaded from:
+App state is stored in `state.sqlite` under the per-user data dir (the path SDL's pref path used to resolve to, e.g. `~/.local/share/verde/Native` on Linux). User config is loaded from:
 
 - `$XDG_CONFIG_HOME/verde/verde.json`
 - `~/.config/verde/verde.json`
@@ -229,7 +228,6 @@ Custom actions run through `sh -lc` with the selected project as the working dir
 Third-party Zig dependencies are declared in [`build.zig.zon`](build.zig.zon):
 
 - `palette`
-- `zsdl`
 - `zqlite`
 - `zig_dif`
 - `zig_markdown`
@@ -244,8 +242,7 @@ Main upstream components used by the desktop app:
 - `@anthropic-ai/claude-agent-sdk` for Claude Code provider integration.
 - `fff.nvim` / `fff-c` / `fff-search` for project-scoped file indexing and composer file search, vendored in [`../../vendor/fff`](../../vendor/fff). License: MIT.
 - Ghostty / `libghostty-vt` for terminal emulation and VT parsing. License: MIT.
-- `zsdl` from `zig-gamedev` for Zig bindings to SDL3. License: MIT.
-- SDL3 from libsdl-org for window creation, events, monitor/display integration, and rendering support.
+- palette-native for window creation, events, display integration, fonts and rendering, vendored in [`../palette`](../palette) (see `VENDORED_FROM`).
 - `zqlite` by Karl Seguin for SQLite-backed state and persistence. License: MIT-style.
 - `zig_dif` and `zig_markdown` for chat markdown and code rendering.
 - `stb_image` by Sean Barrett and contributors for image decoding, vendored in [`../../vendor/stb_image.h`](../../vendor/stb_image.h). License: public domain or MIT.

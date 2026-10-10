@@ -34,7 +34,7 @@ Most AI coding tools pick a lane: a chat sidebar, a terminal CLI, or a hosted we
 - **A real tiling workspace.** Split chat, terminal, and browser — or scroll them as a Niri-style strip when you open more panes. Layouts persist.
 - **Local-first.** Verde drives the provider CLIs already on your machine. No Verde-hosted inference, no prompt relay, no telemetry sink.
 - **Keyboard-first.** Command palette (`Ctrl+Shift+P`), pane focus, zoom, and workspace jumps — remappable in one config file.
-- **Native, not Electron.** Zig + SDL3 + [Palette](packages/palette) (our in-tree GUI framework), Ghostty VT for terminals, system webview for the browser pane.
+- **Native, not Electron.** Zig + [Palette](packages/palette) (our in-tree GUI framework, with its own Wayland/AppKit/Win32 platform layer and Vulkan/Metal/Direct3D 11 renderer), Ghostty VT for terminals, system webview for the browser pane.
 
 | | Verde | tmux + CLIs | Hosted agent apps | IDE extension |
 | --- | :---: | :---: | :---: | :---: |
@@ -282,7 +282,6 @@ mise run dev      # build + run (native webview)
 | Dev run | `mise run dev` |
 | Desktop development build | `mise run dev-build` |
 | Full build/install | `mise run build` |
-| SDL_GPU Palette renderer | `mise run dev-sdl-gpu` |
 | Web client (Zig gateway + Solid SPA) | `mise run web-app` / `mise run web-app-run` |
 
 **Do not use bare `zig build`** — the default Debug + WPE path is known to fail. Prefer `mise run dev-build` for desktop development or `mise run dev` to launch, or explicitly:
@@ -293,14 +292,14 @@ zig build dev-build --release=safe -Dbrowser-backend=native_webview
 
 Platform notes (WebView2 SDK, WPE packages, macOS codesign, Windows MSVC): see [Troubleshooting](https://verdeai.dev/docs/troubleshooting) and comments in [`scripts/`](scripts/).
 
-The UI stack is SDL3 (window/events/scale) + SDL_GPU + Palette — not web UI or ImGui. Desktop package overview: [`packages/desktop`](packages/desktop).
+The UI stack is Palette end to end (window, events, scale, fonts and GPU rendering) — not web UI, ImGui or SDL. Desktop package overview: [`packages/desktop`](packages/desktop).
 
 ---
 
 ## Under the hood
 
 - **Zig 0.16** — native executable, no Electron shell
-- **SDL3 + Palette** — windowing, input, and in-tree Zig GUI framework
+- **Palette** — in-tree Zig GUI framework: windowing, input, fonts and GPU rendering
 - **Headless session daemon** — owns chat turns and PTYs; GUI, web gateway, CLI, and MCP are detached clients, so agent work survives window restarts
 - **Ghostty / libghostty-vt** — embedded terminal engine, pinned to upstream (no vendored fork)
 - **Native webview** — WPE WebKit · WKWebView · WebView2 (no bundled Chromium)
@@ -316,7 +315,7 @@ Third-party notices and licenses for vendored components are listed under [Third
 
 | What | Where |
 | --- | --- |
-| App state | SDL pref path → `state.sqlite` |
+| App state | per-user data dir (`~/.local/share/verde/Native` on Linux) → `state.sqlite` |
 | User config | `~/.config/verde/verde.json` (Unix) · `%APPDATA%\Verde\verde.json` (Windows) · override with `VERDE_CONFIG` |
 | Project stack | `verde.toml` in the workspace root |
 | Logs (Linux) | `~/.local/share/verde/Native/logs/verde.stderr.log` |
@@ -333,8 +332,7 @@ Main third-party pieces used by the desktop app:
 - `@anthropic-ai/claude-agent-sdk` — Claude Code provider integration
 - `fff.nvim` / `fff-c` / `fff-search` — file indexing/search ([`vendor/fff`](vendor/fff), MIT)
 - Ghostty / `libghostty-vt` — terminal emulation (MIT)
-- `zsdl` (zig-gamedev) — SDL3 bindings (MIT)
-- SDL3 — windowing, input, display, rendering
+- palette-native — windowing, input, fonts and GPU rendering, vendored in [`packages/palette`](packages/palette) (see `VENDORED_FROM`)
 - `zqlite` — SQLite access (MIT-style)
 - `zig_dif` / `zig_markdown` — chat markdown and code rendering
 - `stb_image` — image decoding ([`vendor/stb_image.h`](vendor/stb_image.h))
