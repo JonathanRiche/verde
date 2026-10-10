@@ -13,6 +13,7 @@ test {
     if (@import("builtin").os.tag == .linux) _ = @import("browser/platform/linux_wpe.zig");
     _ = @import("ipc/server.zig");
     _ = @import("platform/mod.zig");
+    _ = @import("platform/env.zig");
     _ = @import("platform/workspace_identity.zig");
     _ = @import("runtime/gateway_transport.zig");
     _ = @import("runtime/connection.zig");

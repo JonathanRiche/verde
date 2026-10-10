@@ -119,6 +119,12 @@ pub const Git = struct {
             _ = self.env.swapRemove("GIT_INDEX_FILE");
         }
 
+        // Claims can outlive their repo (deleted worktrees); a failed chdir in
+        // the forked child would leave an unreaped zombie per poll.
+        process_env.spawnPreflight(self.executable, cwd) catch |err| {
+            log.warn("git {s} failed to run err={s}", .{ args[0], @errorName(err) });
+            return error.GitUnavailable;
+        };
         var threaded: std.Io.Threaded = .init(self.arena, .{});
         defer threaded.deinit();
         const result = std.process.run(self.arena, threaded.io(), .{

@@ -337,7 +337,11 @@ fn spawnDetached(allocator: std.mem.Allocator, argv: []const []const u8) void {
         log.debug("notification spawn failed: {s}", .{@errorName(err)});
         return;
     };
-    if (builtin.os.tag == .windows) closeDetachedWindowsChild(&child);
+    if (builtin.os.tag == .windows) {
+        closeDetachedWindowsChild(&child);
+    } else if (child.id) |pid| {
+        process_env.reapDetachedChild(pid);
+    }
 }
 
 fn closeDetachedWindowsChild(child: *std.process.Child) void {

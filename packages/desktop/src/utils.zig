@@ -661,6 +661,8 @@ fn spawnDetached(
         std.os.windows.CloseHandle(child.thread_handle);
         if (child.id) |process| std.os.windows.CloseHandle(process);
         child.id = null;
+    } else if (child.id) |pid| {
+        process_env.reapDetachedChild(pid);
     }
 }
 
@@ -670,6 +672,9 @@ fn runChild(
     cwd: ?[]const u8,
     max_output_bytes: usize,
 ) !std.process.RunResult {
+    // A missing tool (e.g. xclip on Wayland-only systems) would otherwise
+    // leave an unreaped child per call; see process_env.spawnPreflight.
+    if (argv.len > 0) try process_env.spawnPreflight(argv[0], cwd);
     var threaded = std.Io.Threaded.init(allocator, .{});
     defer threaded.deinit();
     return std.process.run(allocator, threaded.io(), .{

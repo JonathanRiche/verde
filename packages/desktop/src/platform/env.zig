@@ -146,6 +146,69 @@ fn checkExecutableAccess(allocator: std.mem.Allocator, path: []const u8) !void {
     };
 }
 
+/// Zig 0.16's POSIX spawn reports a failed `chdir`/`execve` in the forked
+/// child as a spawn error *without* reaping that child, so every attempt to
+/// run a missing tool (or in a deleted directory) leaves a `<defunct>` entry
+/// under the caller. Detect those failures before forking. `argv0` is checked
+/// against the process PATH, which is what spawn resolves bare names with
+/// when no environ map is given; callers passing a map pre-resolve argv0.
+pub fn spawnPreflight(argv0: []const u8, cwd: ?[]const u8) error{FileNotFound}!void {
+    if (builtin.os.tag == .windows) return;
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    if (cwd) |dir| {
+        if (!posixPathAccessible(&buffer, &.{dir}, std.c.X_OK)) return error.FileNotFound;
+    }
+    if (argv0.len == 0) return error.FileNotFound;
+    if (std.mem.indexOfScalar(u8, argv0, '/') != null) {
+        // Relative paths resolve against `cwd` in the child; leave them to spawn.
+        if (argv0[0] == '/' and !posixPathAccessible(&buffer, &.{argv0}, std.c.X_OK)) return error.FileNotFound;
+        return;
+    }
+    const path_value = std.c.getenv("PATH") orelse return;
+    var dirs = std.mem.tokenizeScalar(u8, std.mem.sliceTo(path_value, 0), PATH_SEPARATOR);
+    while (dirs.next()) |dir| {
+        if (posixPathAccessible(&buffer, &.{ dir, "/", argv0 }, std.c.X_OK)) return;
+    }
+    return error.FileNotFound;
+}
+
+fn posixPathAccessible(buffer: *[std.Io.Dir.max_path_bytes]u8, parts: []const []const u8, mode: c_uint) bool {
+    var len: usize = 0;
+    for (parts) |part| {
+        if (len + part.len >= buffer.len) return false;
+        @memcpy(buffer[len..][0..part.len], part);
+        len += part.len;
+    }
+    buffer[len] = 0;
+    return std.c.access(@ptrCast(buffer[0..len :0].ptr), mode) == 0;
+}
+
+/// Reaps a fire-and-forget child on a detached thread so it does not linger
+/// as a zombie for the parent's lifetime. Windows has no zombies; its callers
+/// close the handles instead.
+pub fn reapDetachedChild(pid: std.posix.pid_t) void {
+    if (builtin.os.tag == .windows) return;
+    const thread = std.Thread.spawn(.{ .stack_size = 64 * 1024 }, waitDetachedChild, .{pid}) catch return;
+    thread.detach();
+}
+
+fn waitDetachedChild(pid: std.posix.pid_t) void {
+    var status: c_int = 0;
+    while (true) {
+        const rc = std.c.waitpid(pid, &status, 0);
+        if (rc >= 0 or std.posix.errno(rc) != .INTR) return;
+    }
+}
+
+test "spawn preflight rejects missing tools and directories before forking" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    try std.testing.expectError(error.FileNotFound, spawnPreflight("verde-definitely-missing-tool-6c1f", null));
+    try std.testing.expectError(error.FileNotFound, spawnPreflight("/nonexistent/verde/tool", null));
+    try std.testing.expectError(error.FileNotFound, spawnPreflight("sh", "/nonexistent/verde-deleted-worktree"));
+    try spawnPreflight("sh", null);
+    try spawnPreflight("/bin/sh", "/");
+}
+
 /// Returns true when the executable can be found in the augmented PATH.
 pub fn commandExists(executable: []const u8) bool {
     var env_map = buildAugmentedEnvMap(std.heap.page_allocator) catch return false;
