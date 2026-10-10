@@ -6374,8 +6374,14 @@ fn nextUserMessageIndex(messages: []const app_state.ChatMessage, index: usize) ?
     return null;
 }
 
-/// When `boundary` begins the last exchange of a run with two or more
-/// exchanges, returns the folded part before it. The layout builds
+/// Fewest superseded exchanges worth folding: hiding a single exchange
+/// behind a summary row saves nothing and reads like a header for the
+/// visible exchange below it.
+const MIN_FOLDED_ORCHESTRATION_EXCHANGES: usize = 2;
+
+/// When `boundary` begins the last exchange of a run whose superseded part
+/// has at least `MIN_FOLDED_ORCHESTRATION_EXCHANGES` exchanges, returns that
+/// folded part. The layout builds
 /// newest-first, so this is asked once per exchange boundary.
 fn orchestrationRunEndingAt(messages: []const app_state.ChatMessage, boundary: usize) ?OrchestrationRun {
     if (boundary == 0 or boundary >= messages.len) return null;
@@ -6386,17 +6392,20 @@ fn orchestrationRunEndingAt(messages: []const app_state.ChatMessage, boundary: u
     var start = previousUserMessageIndex(messages, boundary) orelse return null;
     var updates = orchestrationNotificationCount(messages[start]);
     if (updates == 0) return null;
+    var exchanges: usize = 1;
     while (previousUserMessageIndex(messages, start)) |previous| {
         const count = orchestrationNotificationCount(messages[previous]);
         if (count == 0) break;
         start = previous;
         updates +|= count;
+        exchanges += 1;
     }
+    if (exchanges < MIN_FOLDED_ORCHESTRATION_EXCHANGES) return null;
     return .{ .start = start, .end = boundary, .updates = updates };
 }
 
-/// When `index` is the first notification of a run with two or more
-/// exchanges, returns that run's folded part (used for the expanded header).
+/// When `index` is the first notification of a run whose folded part meets
+/// `MIN_FOLDED_ORCHESTRATION_EXCHANGES`, returns that run's folded part (used for the expanded header).
 fn orchestrationRunStartingAt(messages: []const app_state.ChatMessage, index: usize) ?OrchestrationRun {
     if (index >= messages.len) return null;
     var updates = orchestrationNotificationCount(messages[index]);
@@ -6405,14 +6414,17 @@ fn orchestrationRunStartingAt(messages: []const app_state.ChatMessage, index: us
         if (orchestrationNotificationCount(messages[previous]) > 0) return null;
     }
     var last = index;
+    var exchanges: usize = 0;
     var run: ?OrchestrationRun = null;
     while (nextUserMessageIndex(messages, last)) |next| {
         const count = orchestrationNotificationCount(messages[next]);
         if (count == 0) break;
+        exchanges += 1;
         run = .{ .start = index, .end = next, .updates = updates };
         updates +|= count;
         last = next;
     }
+    if (exchanges < MIN_FOLDED_ORCHESTRATION_EXCHANGES) return null;
     return run;
 }
 
@@ -6481,19 +6493,24 @@ const ChildNotificationIdentity = struct {
 };
 
 fn childNotificationIdentity(state: *app_state.AppState, child_id: []const u8) ChildNotificationIdentity {
-    const fallback: ChildNotificationIdentity = .{ .title = child_id, .provider = "Unknown provider" };
+    // Never surface the raw thread id; an empty provider is omitted.
+    const fallback: ChildNotificationIdentity = .{ .title = "Linked chat", .provider = "" };
     if (state.project_controller.projects.items.len == 0) return fallback;
     const project = &state.project_controller.projects.items[state.project_controller.selected_index];
-    for (project.threads.items) |thread| {
-        if (std.mem.eql(u8, thread.local_thread_id, child_id)) return .{
-            .title = if (thread.title.len > 0) thread.title else child_id,
-            .provider = runtime.providerLabel(thread.provider),
-        };
+    // Children may live in another workspace, and unlinked children no
+    // longer appear in linked_chats, so search every known thread list.
+    for (state.project_controller.projects.items) |*candidate| {
+        for (candidate.threads.items) |thread| {
+            if (std.mem.eql(u8, thread.local_thread_id, child_id)) return .{
+                .title = if (thread.title.len > 0) thread.title else fallback.title,
+                .provider = runtime.providerLabel(thread.provider),
+            };
+        }
     }
     if (state.linked_chats.find(project.id, state.currentThread().local_thread_id)) |parent| {
         for (parent.entries.items) |entry| {
             if (std.mem.eql(u8, entry.local_thread_id, child_id)) return .{
-                .title = entry.title,
+                .title = if (entry.title.len > 0) entry.title else fallback.title,
                 .provider = if (std.meta.stringToEnum(app_state.Provider, entry.provider)) |provider| runtime.providerLabel(provider) else entry.provider,
             };
         }
@@ -9154,9 +9171,9 @@ fn renderOrchestrationSummaryRow(
     const noun = if (item.orchestration_updates == 1) "update" else "updates";
     const summary = std.fmt.bufPrint(
         &summary_buf,
-        "Orchestration  \u{00B7}  {d} {s} from linked chats",
-        .{ item.orchestration_updates, noun },
-    ) catch "Orchestration updates from linked chats";
+        "{s} {d} earlier {s} from linked chats",
+        .{ if (expanded) "Hide" else "Show", item.orchestration_updates, noun },
+    ) catch "Earlier updates from linked chats";
     const font = theme.scaledUi(13.0);
     queueFixedTextLine(state, .{
         .x = row.x + pad_x,
@@ -9203,7 +9220,7 @@ fn renderChildNotificationCard(
     const status_x = identity_rect.x + identity_rect.w - status_w;
     const provider_w = chromeLabelWidth(meta_font, identity.provider);
     const provider_x = status_x - gap - provider_w;
-    const show_provider = provider_x - gap - header.x >= theme.scaledUi(120.0);
+    const show_provider = identity.provider.len > 0 and provider_x - gap - header.x >= theme.scaledUi(120.0);
     const title_w = @max((if (show_provider) provider_x else status_x) - gap - header.x, 0.0);
     var title_buf: [512]u8 = undefined;
     const title = truncateUiLabel(&title_buf, identity.title, title_w, title_font);
@@ -11424,4 +11441,46 @@ test "orchestration runs fold every exchange but the last" {
     };
     try std.testing.expect(orchestrationRunEndingAt(&steered, 4) == null);
     try std.testing.expect(orchestrationRunStartingAt(&steered, 4) == null);
+}
+
+test "a single superseded orchestration exchange is not folded" {
+    const n1 = comptime testChildEnvelope("c1", "r1");
+    const n2 = comptime testChildEnvelope("c2", "r2");
+    const msg = struct {
+        fn make(role: app_state.ChatRole, body: [:0]const u8) app_state.ChatMessage {
+            return .{ .role = role, .author = "", .body = body };
+        }
+    }.make;
+    const messages = [_]app_state.ChatMessage{
+        msg(.user, "human kickoff"),
+        msg(.assistant, "spawning"),
+        msg(.user, n1),
+        msg(.assistant, "status"),
+        msg(.user, n2),
+        msg(.assistant, "wrap-up"),
+    };
+    try std.testing.expect(orchestrationRunEndingAt(&messages, 4) == null);
+    try std.testing.expect(orchestrationRunStartingAt(&messages, 2) == null);
+}
+
+test "child reply preview is one plain sentence without the summary label" {
+    var buf: [CHILD_PREVIEW_MAX_BYTES]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "The three most recent commits changed Verde's keybindings.",
+        childReplyPreview(&buf, "**Summary:** The three most recent commits changed Verde's keybindings. Details follow.\n\n**Details for the parent agent:**\n1. x"),
+    );
+    try std.testing.expectEqualStrings(
+        "Count: 56 AGENTS.md files found under packages/.",
+        childReplyPreview(&buf, "**Count: 56 AGENTS.md files found under packages/.**\n\n**File paths:**"),
+    );
+    try std.testing.expectEqualStrings("Fixed the parser in main.zig", childReplyPreview(&buf, "- Fixed the parser in `main.zig`"));
+    try std.testing.expectEqualStrings("", childReplyPreview(&buf, "```\ncode\n```\n"));
+}
+
+test "child results that need the human open expanded" {
+    try std.testing.expect(childNotificationDefaultExpanded(.waiting_approval));
+    try std.testing.expect(childNotificationDefaultExpanded(.blocked));
+    try std.testing.expect(childNotificationDefaultExpanded(.failed));
+    try std.testing.expect(!childNotificationDefaultExpanded(.completed));
+    try std.testing.expect(!childNotificationDefaultExpanded(.aborted));
 }

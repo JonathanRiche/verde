@@ -365,11 +365,17 @@ private struct TranscriptRow: View {
             } else { NoticeRow(row: row, model: model) }
         case .usage(_, let usage): UsageCard(usage: usage)
         case .childNotification(let row, let notifications):
-            VStack(alignment: .leading, spacing: 8) {
+            // A batched delivery stacks its rows tightly in one container with thin dividers.
+            VStack(alignment: .leading, spacing: 0) {
                 ForEach(Array(notifications.enumerated()), id: \.offset) { index, notification in
-                    ChildNotificationCard(row: row, index: index, notification: notification, model: model)
+                    if index > 0 { Divider().overlay(VerdeTheme.border) }
+                    ChildResultRow(row: row, index: index, notification: notification, model: model)
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(VerdeTheme.panel, in: RoundedRectangle(cornerRadius: 12))
+            .overlay(RoundedRectangle(cornerRadius: 12).stroke(VerdeTheme.border))
+            .clipShape(RoundedRectangle(cornerRadius: 12))
         case .working(let turn, let waiting): WorkingRow(turn: turn, waitingApproval: waiting)
         case .approval(let approval): ApprovalCard(approval: approval, controller: model.approvals, disclosure: model.disclosure)
         }
@@ -440,53 +446,67 @@ private func childStatusColor(_ status: ChildStatus) -> Color {
     }
 }
 
-/// A linked child chat's result in the parent transcript (desktop parity): a neutral full-width
-/// card with the child's title, provider and status, an Open chat action and the reply as
-/// markdown, collapsed when long. The envelope's turn id and footer stay hidden.
-private struct ChildNotificationCard: View {
+/// A linked child chat's result in the parent transcript: a compact row (status dot, child title,
+/// status, chevron) with a one-line summary, expanding to the full reply and an Open chat action.
+/// Rows the human must act on start expanded. The envelope's turn id and footer stay hidden.
+private struct ChildResultRow: View {
     @Environment(\.openRoute) private var openRoute
     let row: ChatRow
-    /// Position within a batched delivery; 0 keeps the pre-batching disclosure key.
+    /// Position within a batched delivery.
     let index: Int
     let notification: ChildNotification
     let model: TranscriptModel
 
     var body: some View {
         let child = model.linkedThread(notification.childID)
-        let title = child.map { $0.title.isEmpty ? notification.childID : $0.title } ?? notification.childID
-        let preview = childReplyPreview(notification.reply)
-        let key = index == 0 ? "\(row.id):child" : "\(row.id):child:\(index)"
-        let expanded = model.disclosure.flag(key)
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text(title).font(VerdeTheme.ui(15, bold: true)).lineLimit(1).truncationMode(.tail)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                if let provider = child?.provider, !provider.isEmpty {
-                    Text(providerLabel(provider)).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted).lineLimit(1)
+        let title = childTitle(childID: notification.childID, knownTitle: child?.title)
+        // Per message and child, held by the transcript model for this screen session.
+        let key = "\(row.id):child:\(index)"
+        let fallback = notification.status.expandedByDefault
+        let expanded = model.disclosure.flag(key, fallback)
+        let reply = notification.reply.trimmingCharacters(in: .whitespacesAndNewlines)
+        VStack(alignment: .leading, spacing: 6) {
+            Button { model.disclosure.toggle(key, fallback) } label: {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 8) {
+                        StatusDot(color: childStatusColor(notification.status), label: notification.status.label)
+                        Text(title).font(VerdeTheme.ui(15, bold: true)).lineLimit(1).truncationMode(.tail)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        Text(notification.status.label).font(VerdeTheme.ui(12))
+                            .foregroundStyle(childStatusColor(notification.status)).lineLimit(1).fixedSize()
+                        Image(systemName: "chevron.down").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                            .rotationEffect(.degrees(expanded ? 180 : 0))
+                    }
+                    if !expanded {
+                        let summary = childReplySummary(notification.reply)
+                        Text(summary.isEmpty ? "No reply" : summary).font(VerdeTheme.ui(13))
+                            .foregroundStyle(summary.isEmpty ? VerdeTheme.muted : Color.secondary)
+                            .lineLimit(1).truncationMode(.tail).padding(.leading, 17)
+                    }
                 }
-                Text(notification.status.label).font(VerdeTheme.ui(12)).foregroundStyle(childStatusColor(notification.status))
-                    .lineLimit(1).fixedSize()
+                .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
             .accessibilityElement(children: .combine)
-            if !preview.full.isEmpty {
-                MarkdownText(text: expanded ? preview.full : (preview.collapsed ?? preview.full), model: model)
-            }
-            HStack {
-                Button("Open chat") {
-                    openRoute(.thread(workspace: child?.workspace_id ?? model.workspaceID, thread: notification.childID))
+            .accessibilityHint(expanded ? "Collapse" : "Expand")
+            if expanded {
+                if reply.isEmpty {
+                    Text("No reply").font(VerdeTheme.ui(13)).foregroundStyle(VerdeTheme.muted)
+                } else {
+                    MarkdownText(text: reply, model: model)
                 }
-                .accessibilityIdentifier("child-open-chat")
-                Spacer()
-                if preview.collapsed != nil {
-                    Button(expanded ? "Show less" : "Show more") { model.disclosure.toggle(key) }
+                HStack {
+                    Spacer()
+                    Button("Open chat") {
+                        openRoute(.thread(workspace: child?.workspace_id ?? model.workspaceID, thread: notification.childID))
+                    }
+                    .accessibilityIdentifier("child-open-chat")
                 }
+                .font(VerdeTheme.ui(13)).foregroundStyle(VerdeTheme.accent).buttonStyle(.plain)
             }
-            .font(VerdeTheme.ui(13)).foregroundStyle(VerdeTheme.accent).buttonStyle(.plain)
         }
-        .padding(.horizontal, 14).padding(.vertical, 10)
+        .padding(.horizontal, 12).padding(.vertical, 9)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(VerdeTheme.panel, in: RoundedRectangle(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12).stroke(VerdeTheme.border))
         .contextMenu { Button("Copy reply") { UIPasteboard.general.string = notification.reply } }
         .accessibilityIdentifier("child-notification")
     }

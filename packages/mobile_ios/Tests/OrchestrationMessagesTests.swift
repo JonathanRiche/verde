@@ -122,15 +122,49 @@ final class OrchestrationMessagesTests: XCTestCase {
         XCTAssertNil(parentSteerBody(role: "system", body: wrapped))
     }
 
-    func testReplyPreviewCollapsesLongReplies() throws {
-        XCTAssertNil(childReplyPreview("short reply").collapsed)
-        let long = (1...10).map { "line \($0)" }.joined(separator: "\n")
-        let preview = childReplyPreview("\n" + long + "\n")
-        XCTAssertEqual(preview.full, long)
-        XCTAssertEqual(preview.collapsed, (1...6).map { "line \($0)" }.joined(separator: "\n"))
-        // Byte cap never splits a multi-byte scalar.
-        let wide = childReplyPreview("a" + String(repeating: "é", count: 400))
-        XCTAssertEqual(try XCTUnwrap(wide.collapsed).utf8.count, 479)
+    func testSummaryStripsLabelAndTakesFirstSentence() {
+        let reply = "**Summary:** The three most recent commits touch the keybinds. Nothing else changed.\n\n"
+            + "**Details for the parent agent:** 0e046633, 6c1569bf, 408ed4fd."
+        XCTAssertEqual(childReplySummary(reply), "The three most recent commits touch the keybinds.")
+        XCTAssertEqual(childReplySummary("**Summary**: Tests pass. More."), "Tests pass.")
+        XCTAssertEqual(childReplySummary("Summary: Tests pass"), "Tests pass")
+        // A label alone on its line yields to the next prose line.
+        XCTAssertEqual(childReplySummary("**Summary:**\r\nRebased onto master."), "Rebased onto master.")
+    }
+
+    func testSummaryStripsMarkdown() {
+        XCTAssertEqual(childReplySummary("\n## Done\nAll tests pass."), "Done")
+        XCTAssertEqual(childReplySummary("- Fixed the **parser** in `chat.zig` and added [tests](https://x.dev/t)"),
+                       "Fixed the parser in chat.zig and added tests")
+        XCTAssertEqual(childReplySummary("> *Shipped* it"), "Shipped it")
+        XCTAssertEqual(childReplySummary("```zig\nconst x = 1;\n```\n---\nAfter the code"), "After the code")
+        XCTAssertEqual(childReplySummary("first line\nsecond line"), "first line")
+        XCTAssertEqual(childReplySummary("version 1.2 is out"), "version 1.2 is out")
+        XCTAssertEqual(childReplySummary(""), "")
+        XCTAssertEqual(childReplySummary("```\nonly code\n```"), "")
+        let long = childReplySummary(String(repeating: "é", count: 300))
+        XCTAssertEqual(long.count, childSummaryMaxCharacters + 1)
+        XCTAssertTrue(long.hasSuffix("\u{2026}"))
+    }
+
+    func testTitleFallbackNeverShowsRawID() {
+        XCTAssertEqual(childTitle(childID: "child-1", knownTitle: "Fix keybinds"), "Fix keybinds")
+        XCTAssertEqual(childTitle(childID: "child-1", knownTitle: nil), "Linked chat")
+        XCTAssertEqual(childTitle(childID: "child-1", knownTitle: "  "), "Linked chat")
+        XCTAssertEqual(childTitle(childID: "child-1", knownTitle: "child-1"), "Linked chat")
+    }
+
+    func testHumanActionStatusesOpenExpanded() {
+        XCTAssertEqual(Set(ChildStatus.allCases.filter(\.expandedByDefault)), [.waiting_approval, .blocked, .failed])
+    }
+
+    func testBatchSplitsPerChild() throws {
+        let body = envelope("child-a", "completed", "<child_reply>\n**Summary:** One done.\n</child_reply>")
+            + "\n\n" + envelope("child-b", "blocked", "<child_reply>\nNeed a token.\n</child_reply>")
+        let parsed = try XCTUnwrap(childNotifications(role: "user", body: body))
+        XCTAssertEqual(parsed.map(\.childID), ["child-a", "child-b"])
+        XCTAssertEqual(parsed.map { childReplySummary($0.reply) }, ["One done.", "Need a token."])
+        XCTAssertEqual(parsed.map(\.status.expandedByDefault), [false, true])
     }
 
     func testTranscriptItemsClassifyNotificationsAsCards() throws {
