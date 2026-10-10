@@ -1284,7 +1284,7 @@ fn processEvents(
             const logical = window.logicalSize();
             const pixel = window.pixelSize();
             const scale: f32 = if (logical.width == 0) 1 else @as(f32, @floatFromInt(pixel.width)) / @as(f32, @floatFromInt(logical.width));
-            if (!dev_inject.run(script, .{ .context = &injector, .dispatch = Injector.dispatch, .window = window.id, .scale = scale })) return false;
+            if (!dev_inject.run(script, .{ .context = &injector, .dispatch = Injector.dispatch, .window = window.id, .scale = scale, .cursor = @tagName(host.currentCursor()) })) return false;
         }
     }
 

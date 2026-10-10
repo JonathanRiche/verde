@@ -67,12 +67,25 @@ pub fn take(allocator: std.mem.Allocator) ?[]u8 {
     return out.toOwnedSlice(allocator) catch null;
 }
 
+/// Writes `name` to `<script path>.cursor` so a driver can read the shape.
+fn writeCursorReport(name: []const u8) void {
+    const path = scriptPath() orelse return;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const report = std.fmt.bufPrintZ(&buf, "{s}.cursor", .{path}) catch return;
+    const fd = std.c.open(report.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+    if (fd < 0) return;
+    defer _ = std.c.close(fd);
+    _ = std.c.write(fd, name.ptr, name.len);
+}
+
 pub const Sink = struct {
     context: *anyopaque,
     dispatch: *const fn (context: *anyopaque, event: *Event) bool,
     window: palette.event.WindowId,
     /// Framebuffer pixels per logical point.
     scale: f32,
+    /// Name of the pointer shape last requested, reported by the `cursor` verb.
+    cursor: []const u8 = "",
 
     fn send(self: Sink, event: Event) bool {
         var copy = event;
@@ -198,6 +211,12 @@ fn runLine(line: []const u8, sink: Sink) bool {
         return sink.send(.system_theme_changed);
     } else if (eql(verb, "close")) {
         return sink.send(.{ .close_requested = .{ .window = w } });
+    } else if (eql(verb, "hidden")) {
+        return sink.send(.{ .window_hidden = .{ .window = w } });
+    } else if (eql(verb, "shown")) {
+        return sink.send(.{ .window_shown = .{ .window = w } });
+    } else if (eql(verb, "cursor")) {
+        writeCursorReport(sink.cursor);
     }
     return true;
 }
