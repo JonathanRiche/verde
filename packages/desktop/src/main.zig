@@ -97,7 +97,63 @@ const CursorState = struct {
     /// own CSS cursor; the next shape Verde picks must be re-sent even if it
     /// equals the last one Verde set.
     native_browser_owned: bool = false,
+    /// Inputs of the last cursor resolution, so idle loop iterations (stream
+    /// polls, wakeups that build no frame) can skip re-running every hit test.
+    last_sync_ms: i64 = 0,
+    last_mouse_x: f32 = std.math.nan(f32),
+    last_mouse_y: f32 = std.math.nan(f32),
+    last_browser_shape: browser_runtime.CursorShape = .default,
 };
+
+/// Upper bound on how stale an idle-loop cursor may get. Async inputs that
+/// carry no event (native-browser cursor ownership, terminal OSC 22 shapes,
+/// hover targets appearing under a still mouse) settle within this window.
+const CURSOR_IDLE_RESYNC_MS: i64 = 250;
+
+/// Whether a loop iteration that renders no frame must re-resolve the cursor.
+/// Rendered frames always resync; idle iterations only when the pointer
+/// moved, input arrived, the offscreen browser reported a new CSS cursor, or
+/// the safety interval elapsed.
+fn idleCursorSyncDue(
+    cache: *const CursorState,
+    mouse_x: f32,
+    mouse_y: f32,
+    browser_shape: browser_runtime.CursorShape,
+    had_input: bool,
+    now_ms: i64,
+) bool {
+    if (had_input) return true;
+    if (mouse_x != cache.last_mouse_x or mouse_y != cache.last_mouse_y) return true;
+    if (browser_shape != cache.last_browser_shape) return true;
+    return now_ms - cache.last_sync_ms >= CURSOR_IDLE_RESYNC_MS;
+}
+
+fn noteCursorSynced(cache: *CursorState, state: *const AppState, now_ms: i64) void {
+    cache.last_sync_ms = now_ms;
+    cache.last_mouse_x = state.transcript_controller.palette_mouse_x;
+    cache.last_mouse_y = state.transcript_controller.palette_mouse_y;
+    cache.last_browser_shape = state.browser_controller.cursor_shape;
+}
+
+test "idle cursor sync runs only when an input changed or the resync interval elapsed" {
+    var cache: CursorState = .{};
+    // Never synced: NaN positions always compare unequal.
+    try std.testing.expect(idleCursorSyncDue(&cache, 10.0, 20.0, .default, false, 1_000));
+    cache.last_sync_ms = 1_000;
+    cache.last_mouse_x = 10.0;
+    cache.last_mouse_y = 20.0;
+    cache.last_browser_shape = .default;
+    // Stream polls / wakeups with a still mouse skip the hit tests.
+    try std.testing.expect(!idleCursorSyncDue(&cache, 10.0, 20.0, .default, false, 1_001));
+    try std.testing.expect(!idleCursorSyncDue(&cache, 10.0, 20.0, .default, false, 1_000 + CURSOR_IDLE_RESYNC_MS - 1));
+    // Safety resync for event-less async cursor changes.
+    try std.testing.expect(idleCursorSyncDue(&cache, 10.0, 20.0, .default, false, 1_000 + CURSOR_IDLE_RESYNC_MS));
+    // Any motion, input event, or offscreen-browser CSS cursor change resyncs now.
+    try std.testing.expect(idleCursorSyncDue(&cache, 11.0, 20.0, .default, false, 1_001));
+    try std.testing.expect(idleCursorSyncDue(&cache, 10.0, 21.0, .default, false, 1_001));
+    try std.testing.expect(idleCursorSyncDue(&cache, 10.0, 20.0, .default, true, 1_001));
+    try std.testing.expect(idleCursorSyncDue(&cache, 10.0, 20.0, .pointer, false, 1_001));
+}
 
 const CAL_SANS_BYTES = @embedFile("assets/fonts/CalSans-Regular.ttf");
 const NOTO_SANS_REGULAR_BYTES = @embedFile("assets/fonts/NotoSans-Regular.ttf");
@@ -536,7 +592,17 @@ fn mainInner(init: std.process.Init) !void {
         // its timeout on hidden surfaces); building a frame it would refuse
         // only burns CPU, so keep the demand pending and wait for `.frame`.
         if (!presentation_demand.pending or !palette_renderer.ready()) {
-            recordSpan(&frame_sample, .sync_cursor, syncMouseCursor, .{ &state, &cursor_state });
+            if (idleCursorSyncDue(
+                &cursor_state,
+                state.transcript_controller.palette_mouse_x,
+                state.transcript_controller.palette_mouse_y,
+                state.browser_controller.cursor_shape,
+                event_flags.has_mouse_motion or event_flags.has_non_mouse_motion,
+                now_ms,
+            )) {
+                recordSpan(&frame_sample, .sync_cursor, syncMouseCursor, .{ &state, &cursor_state });
+                noteCursorSynced(&cursor_state, &state, now_ms);
+            }
             recordFrameWithStallDiagnostic(frame_sample);
             maybeLogFrameProfile(frame_profile_logging, &last_frame_profile_log_ms, &palette_renderer);
             continue;
@@ -577,6 +643,7 @@ fn mainInner(init: std.process.Init) !void {
             }
         }.run, .{ &state, fb_width, fb_height });
         recordSpan(&frame_sample, .sync_cursor, syncMouseCursor, .{ &state, &cursor_state });
+        noteCursorSynced(&cursor_state, &state, monotonicMs());
         state.noteWorkspaceSwitchStage("render_root_cursor_complete");
         var frame_presented = false;
         recordSpan(&frame_sample, .draw_backend, struct {
