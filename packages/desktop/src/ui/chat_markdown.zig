@@ -2419,6 +2419,16 @@ pub fn hitTestSelectablePaletteBody(
                 const indent = indentWidth(text_block.indent);
                 const start = .{ context_cursor.x + indent, context_cursor.y };
                 const line_width = @max(width - indent, 1.0);
+                // Blocks the pointer is not over only need their extent and
+                // line count; skip building per-glyph selectable lines.
+                const extent = selectableTextBlockExtent(text_block, line_width, options);
+                if (mouse[1] < start[1] or mouse[1] > start[1] + extent.height) {
+                    context_cursor.y += extent.height;
+                    context_cursor.h = @max(context_cursor.h, extent.height);
+                    global_line_index += extent.lines;
+                    previous = block;
+                    continue;
+                }
                 const lines = try buildSelectableTextLines(allocator, text_block, line_width, options);
                 defer deinitSelectableLines(allocator, lines);
 
@@ -2447,6 +2457,15 @@ pub fn hitTestSelectablePaletteBody(
                 const cw = codeCharWidth(options);
                 const height = codeBlockHeight(code_block, line_height, pad_y, tw, cw);
                 const content_start = .{ start[0] + pad_x, start[1] + pad_y };
+                if (mouse[1] < start[1] or mouse[1] > start[1] + height) {
+                    // One selectable line per source line (see
+                    // buildSelectableCodeLinesWithWrap), all inside `height`.
+                    context_cursor.y += height;
+                    context_cursor.h = @max(context_cursor.h, height);
+                    global_line_index += @max(code_block.lines.len, 1);
+                    previous = block;
+                    continue;
+                }
 
                 const lines = try buildSelectableCodeLinesWithWrap(allocator, code_block, options, tw);
                 defer deinitSelectableCodeLines(allocator, lines);
@@ -2495,6 +2514,23 @@ pub fn hitTestSelectablePaletteBody(
     return null;
 }
 
+/// One past the index of the last text block with a linked run, or null when
+/// the body has no links at all.
+fn linkBlocksEnd(view: BodyView) ?usize {
+    var index = view.blocks.len;
+    while (index > 0) {
+        index -= 1;
+        switch (view.blocks[index]) {
+            .text => |text_block| for (text_block.runs) |run| switch (run) {
+                .text => |text_run| if (text_run.href != null) return index + 1,
+                .line_break => {},
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
 /// Hit-tests rendered markdown links in the same coordinate space as
 /// [`PaletteRenderContext.cursor`]. The returned href slice is owned by `view`.
 pub fn hitTestLinkPaletteBody(
@@ -2508,8 +2544,10 @@ pub fn hitTestLinkPaletteBody(
     const width = @max(available_width, 1.0);
     var context_cursor = body_rect;
     var previous: ?BlockView = null;
+    // Only text runs carry hrefs; nothing past the last linked block can hit.
+    const link_blocks_end = linkBlocksEnd(view) orelse return null;
 
-    for (view.blocks) |block| {
+    for (view.blocks[0..link_blocks_end]) |block| {
         if (previous) |prior| {
             if (prior.kind() != .blank and block.kind() != .blank) {
                 const gap_height = if (prior.isCompact() or block.isCompact()) compactBlockGap(options) else blockGap(options);
@@ -2748,6 +2786,47 @@ fn selectionRangeForRawLine(
         .anchor = .{ .line_index = line_index, .column = start_column },
         .focus = .{ .line_index = line_index, .column = end_column },
     };
+}
+
+const SelectableTextBlockExtent = struct {
+    lines: usize,
+    height: f32,
+};
+
+/// Line count and bottom of the lines `buildSelectableTextLines` would build,
+/// computed from the same layout walk without allocating per-glyph chunks.
+fn selectableTextBlockExtent(block: TextBlockView, available_width: f32, options: RenderOptions) SelectableTextBlockExtent {
+    const Counter = struct {
+        lines: usize = 0,
+        bottom: f32 = 0.0,
+        current_y: ?f32 = null,
+        current_height: f32 = 0.0,
+
+        fn finalize(self: *@This()) void {
+            const current_y = self.current_y orelse return;
+            self.lines += 1;
+            self.bottom = @max(self.bottom, current_y + self.current_height);
+            self.current_y = null;
+        }
+
+        fn onStep(self: *@This(), step: TextBlockLayoutStep) void {
+            if (self.current_y) |current_y| {
+                if (step.y != current_y) self.finalize();
+            }
+            if (self.current_y == null) {
+                self.current_y = step.y;
+                self.current_height = step.line_height;
+            }
+            self.current_height = @max(self.current_height, step.line_height);
+        }
+    };
+    var counter: Counter = .{};
+    _ = walkTextBlockLayout(block, available_width, options, &counter, Counter.onStep);
+    counter.finalize();
+    if (counter.lines == 0) {
+        return .{ .lines = 1, .height = lineHeightForSpec(textBlockFontSpecWithOptions(block.style, options), options) };
+    }
+    return .{ .lines = counter.lines, .height = counter.bottom };
 }
 
 fn buildSelectableTextLines(
@@ -4231,4 +4310,39 @@ test "unicode arrows survive markdown flatten for chat prose" {
         .text => |text| try std.testing.expectEqualStrings(source, text.text),
         else => unreachable,
     }
+}
+
+test "selectable text extent matches the selectable lines hit testing builds" {
+    const allocator = std.testing.allocator;
+    var view = try buildBodyView(
+        allocator,
+        "# Heading\n\nA paragraph long enough to wrap across several visual lines with **bold**, `code`, and a [link](https://example.com) inside.\n\n- item one\n- item two that also wraps when the column is narrow enough\n\n> quoted text\n\n",
+    );
+    defer view.deinit(allocator);
+    const options: RenderOptions = .{};
+    for ([_]f32{ 80.0, 240.0, 900.0 }) |width| {
+        for (view.blocks) |block| {
+            const text_block = switch (block) {
+                .text => |value| value,
+                else => continue,
+            };
+            const lines = try buildSelectableTextLines(allocator, text_block, width, options);
+            defer deinitSelectableLines(allocator, lines);
+            var bottom: f32 = 0.0;
+            for (lines) |line| bottom = @max(bottom, line.y + line.height);
+            const extent = selectableTextBlockExtent(text_block, width, options);
+            try std.testing.expectEqual(lines.len, extent.lines);
+            try std.testing.expectApproxEqAbs(bottom, extent.height, 0.001);
+        }
+    }
+}
+
+test "link hit testing stops after the last linked block" {
+    const allocator = std.testing.allocator;
+    var linked = try buildBodyView(allocator, "First [link](https://example.com) here.\n\nPlain trailing paragraph.");
+    defer linked.deinit(allocator);
+    try std.testing.expectEqual(@as(?usize, 1), linkBlocksEnd(linked));
+    var plain = try buildBodyView(allocator, "No links in this body.\n\nNor here.");
+    defer plain.deinit(allocator);
+    try std.testing.expectEqual(@as(?usize, null), linkBlocksEnd(plain));
 }

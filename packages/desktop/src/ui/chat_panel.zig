@@ -510,6 +510,8 @@ pub fn resetTranscriptHitCache() void {
     bang_retry_hit_count = 0;
     transcript_image_hit_count = 0;
     git_commit_hit_count = 0;
+    pending_row_hit_count = 0;
+    releasePendingHitText();
 }
 
 /// Keeps scrolling-strip input geometry inside the same viewport as rendering.
@@ -2190,8 +2192,9 @@ fn buildTranscriptSelectableBodyView(
     };
 }
 
-fn transcriptSelectableBodyHit(
-    state: *app_state.AppState,
+/// One transcript row resolved under the pointer: either a committed message
+/// (from the layout index) or a pending row laid out by the last render.
+const TranscriptBodyTarget = struct {
     column: palette.Rect,
     y: f32,
     height: f32,
@@ -2199,81 +2202,80 @@ fn transcriptSelectableBodyHit(
     author: []const u8,
     body_raw: []const u8,
     muted_body: bool,
-    assistant_plain_layout: bool,
     streaming: bool,
     message_index: usize,
-    mouse_x: f32,
-    mouse_y: f32,
-) ?TranscriptMarkdownHit {
-    if (childNotification(role, body_raw)) |notification| {
-        if (!childNotificationView(state, childNotificationKey(message_index), notification).expanded) return null;
-    }
-    const kind = transcriptSelectableBodyKind(role, author, body_raw, muted_body, assistant_plain_layout) orelse return null;
-    const body_rect = transcriptSelectableBodyRect(column, y, height, role, author, body_raw) orelse return null;
-    if (!rectContains(body_rect, mouse_x, mouse_y)) return null;
+};
 
-    const body_text = std.mem.trim(u8, transcriptDisplayBody(role, body_raw), "\n\r\t ");
-    var view = buildTranscriptSelectableBodyView(state.allocator, kind, body_text, streaming) catch return null;
-    defer view.deinit(state.allocator);
-    const pt = chat_markdown.hitTestSelectablePaletteBody(
-        state.allocator,
-        view,
-        transcriptSelectableOptions(kind),
-        body_rect,
-        body_rect.w,
-        mouse_x,
-        mouse_y,
-    ) catch return null;
-    const p = pt orelse return null;
-    return .{ .message_index = message_index, .point = p };
-}
-
-fn assistantTranscriptMarkdownLinkHit(
-    state: *app_state.AppState,
+/// Selectable pending rows placed by the last `renderPendingTranscriptStream`
+/// pass. Pointer hit tests reuse this render geometry instead of re-measuring
+/// every in-flight event (and the streamed reply) under the send mutex.
+const PendingRowHit = struct {
+    send_state: *const chat_types.SendState,
     column: palette.Rect,
+    turn_started_at_ms: i64,
+    /// Index into `pending_events`; null for the streamed reply bubble.
+    pending_index: ?usize,
+    message_index: usize,
     y: f32,
     height: f32,
-    role: app_state.ChatRole,
-    author: []const u8,
-    body_raw: []const u8,
-    muted_body: bool,
-    assistant_plain_layout: bool,
-    streaming: bool,
-    message_index: usize,
-    mouse_x: f32,
-    mouse_y: f32,
-) ?TranscriptMarkdownLinkHit {
-    if (childNotification(role, body_raw)) |notification| {
-        if (!childNotificationView(state, childNotificationKey(message_index), notification).expanded) return null;
-    }
-    const kind = transcriptSelectableBodyKind(role, author, body_raw, muted_body, assistant_plain_layout) orelse return null;
-    if (kind != .markdown) return null;
-    const body_rect = transcriptSelectableBodyRect(column, y, height, role, author, body_raw) orelse return null;
-    if (!rectContains(body_rect, mouse_x, mouse_y)) return null;
+};
 
-    const body_text = std.mem.trim(u8, transcriptDisplayBody(role, body_raw), "\n\r\t ");
-    var view = (if (streaming)
-        chat_markdown.buildBodyViewStreaming(state.allocator, body_text)
-    else
-        chat_markdown.buildBodyView(state.allocator, body_text)) catch return null;
-    defer view.deinit(state.allocator);
+// Only rows intersecting a transcript column are recorded, so a few dozen
+// cover every visible pane; overflowing rows simply lose text hover.
+const MAX_PENDING_ROW_HITS = 64;
+var pending_row_hit_count: usize = 0;
+var pending_row_hits: [MAX_PENDING_ROW_HITS]PendingRowHit = undefined;
 
-    const hit = chat_markdown.hitTestLinkPaletteBody(
-        view,
-        transcriptMarkdownOptions(),
-        body_rect,
-        body_rect.w,
-        mouse_x,
-        mouse_y,
-    ) orelse return null;
-    return .{ .href = hit.href };
+/// Pending-row text copied out under the send mutex for the latest hit test.
+/// Link hrefs returned to callers borrow it, so it lives until the next hit
+/// test or the per-frame hit-cache reset rather than the call.
+var pending_hit_author: std.ArrayList(u8) = .empty;
+var pending_hit_body: std.ArrayList(u8) = .empty;
+var pending_hit_allocator: ?std.mem.Allocator = null;
+
+fn releasePendingHitText() void {
+    const allocator = pending_hit_allocator orelse return;
+    pending_hit_author.deinit(allocator);
+    pending_hit_body.deinit(allocator);
+    pending_hit_author = .empty;
+    pending_hit_body = .empty;
+    pending_hit_allocator = null;
 }
 
-fn transcriptMarkdownBubbleHit(
-    state: *app_state.AppState,
-    mouse_x: f32,
-    mouse_y: f32,
-) ?TranscriptMarkdownHit {
+fn retainPendingHitText(allocator: std.mem.Allocator, author: []const u8, body: []const u8) !struct { author: []const u8, body: []const u8 } {
+    if (pending_hit_allocator) |previous| {
+        if (previous.ptr != allocator.ptr or previous.vtable != allocator.vtable) releasePendingHitText();
+    }
+    pending_hit_allocator = allocator;
+    pending_hit_author.clearRetainingCapacity();
+    pending_hit_body.clearRetainingCapacity();
+    try pending_hit_author.appendSlice(allocator, author);
+    try pending_hit_body.appendSlice(allocator, body);
+    return .{ .author = pending_hit_author.items, .body = pending_hit_body.items };
+}
+
+fn appendPendingRowHit(hit: PendingRowHit) void {
+    if (pending_row_hit_count >= pending_row_hits.len) return;
+    pending_row_hits[pending_row_hit_count] = hit;
+    pending_row_hit_count += 1;
+}
+
+fn rectEql(a: palette.Rect, b: palette.Rect) bool {
+    return a.x == b.x and a.y == b.y and a.w == b.w and a.h == b.h;
+}
+
+fn pendingRowHitAt(send_state: *const chat_types.SendState, column: palette.Rect, mouse_y: f32) ?PendingRowHit {
+    for (pending_row_hits[0..pending_row_hit_count]) |hit| {
+        if (hit.send_state != send_state or !rectEql(hit.column, column)) continue;
+        if (mouse_y >= hit.y and mouse_y < hit.y + hit.height) return hit;
+    }
+    return null;
+}
+
+/// Resolves the transcript row under the pointer without measuring text:
+/// committed rows come from the layout index, pending rows from the geometry
+/// the last render recorded. The send mutex is held only to copy one row.
+fn resolveTranscriptBodyTarget(state: *app_state.AppState, mouse_x: f32, mouse_y: f32) ?TranscriptBodyTarget {
     const transcript_hit = findTranscriptHit(mouse_x, mouse_y) orelse return null;
     activateTranscriptHitGeometry(state, transcript_hit);
     const column = transcript_hit.column;
@@ -2294,56 +2296,222 @@ fn transcriptMarkdownBubbleHit(
         if (!item.orchestration_collapsed and !commandGroupRendersGrouped(thread.messages.items, item.message_index, item.group_end) and item.message_index < thread.messages.items.len) {
             const message = thread.messages.items[item.message_index];
             const header = orchestrationHeaderOffset(item);
-            const content_y = column.y - scroll_y + estimated_height + item.top + header;
             if (!(message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body))) {
-                if (transcriptSelectableBodyHit(state, column, content_y, item.height - header, message.role, message.author, message.body, false, false, false, item.message_index, mouse_x, mouse_y)) |hit| {
-                    return hit;
-                }
+                return .{
+                    .column = column,
+                    .y = column.y - scroll_y + estimated_height + item.top + header,
+                    .height = item.height - header,
+                    .role = message.role,
+                    .author = message.author,
+                    .body_raw = message.body,
+                    .muted_body = false,
+                    .streaming = false,
+                    .message_index = item.message_index,
+                };
             }
         }
     }
 
     const send_state = thread.send_state;
+    const row = pendingRowHitAt(send_state, column, mouse_y) orelse return null;
     send_state.mutex.lock();
     defer send_state.mutex.unlock();
-    if (send_state.status != .pending) return null;
-
-    const base_idx = thread.messages.items.len;
-    var content_y = column.y - scroll_y + estimatedPartialTranscriptHeight(thread);
-    var pi: usize = 0;
-    while (pi < send_state.pending_events.items.len) {
-        const event = send_state.pending_events.items[pi];
-        if (event.role == .system and shouldSkipPendingTranscriptEvent(thread, event.author, event.body)) {
-            pi += 1;
-            continue;
-        }
-        const group_end = if (shouldGroupCommandRow(event)) toolCallGroupEnd(send_state.pending_events.items, pi) else pi + 1;
-        if (commandGroupRendersGrouped(send_state.pending_events.items, pi, group_end)) {
-            content_y += toolCallGroupHeight(state, send_state.pending_events.items, pi, group_end, base_idx, column.w) + theme.scaledUi(12.0);
-            pi = group_end;
-            continue;
-        }
-        const pending_msg_idx = base_idx + pi;
-        const item_h = transcriptMessageHeight(state, thread.messages.items.len + pi, event.body, event.role, column.w, event.author, false) +
-            transcriptImageBlockHeightFor(event.role, event.images.items.len, column.w);
-        if (event.role == .system and shouldRenderPaletteCommandRow(event.author, event.body)) {
-            content_y += item_h + theme.scaledUi(12.0);
-            pi += 1;
-            continue;
-        }
-        if (transcriptSelectableBodyHit(state, column, content_y, item_h, event.role, event.author, event.body, false, false, false, pending_msg_idx, mouse_x, mouse_y)) |hit| {
-            return hit;
-        }
-        content_y += item_h + theme.scaledUi(12.0);
-        pi += 1;
+    if (send_state.status != .pending or send_state.started_at_ms != row.turn_started_at_ms) return null;
+    if (row.pending_index) |pending_index| {
+        if (pending_index >= send_state.pending_events.items.len) return null;
+        const event = send_state.pending_events.items[pending_index];
+        const copy = retainPendingHitText(state.allocator, event.author, event.body) catch return null;
+        return .{
+            .column = column,
+            .y = row.y,
+            .height = row.height,
+            .role = event.role,
+            .author = copy.author,
+            .body_raw = copy.body,
+            .muted_body = false,
+            .streaming = false,
+            .message_index = row.message_index,
+        };
     }
-
     const stream_text: []const u8 = send_state.streamRevealedText();
-    const body: []const u8 = if (stream_text.len > 0) stream_text else "Waiting for streamed output...";
-    const stream_plain = false; // item 4: stream renders as markdown in place
-    const assistant_h = transcriptMessageHeightStream(null, null, body, .assistant, column.w, "", stream_plain, stream_text.len > 0);
-    const stream_idx = base_idx + send_state.pending_events.items.len;
-    return transcriptSelectableBodyHit(state, column, content_y, assistant_h, .assistant, "", body, stream_text.len == 0, stream_plain, true, stream_idx, mouse_x, mouse_y);
+    const body: []const u8 = if (stream_text.len > 0)
+        (retainPendingHitText(state.allocator, "", stream_text) catch return null).body
+    else
+        "Waiting for streamed output...";
+    return .{
+        .column = column,
+        .y = row.y,
+        .height = row.height,
+        .role = .assistant,
+        .author = "",
+        .body_raw = body,
+        .muted_body = stream_text.len == 0,
+        .streaming = true,
+        .message_index = row.message_index,
+    };
+}
+
+/// The parsed body the renderer already cached for this row, if it matches
+/// `body` exactly. Never creates or evicts entries, so hit tests cannot make
+/// the renderer re-parse.
+fn peekTranscriptBodyEntry(
+    state: *app_state.AppState,
+    kind: TranscriptSelectableBodyKind,
+    body: []const u8,
+    streaming: bool,
+    message_index: usize,
+) ?*app_state.TranscriptMarkdownBody {
+    const thread = state.currentThread();
+    const slot: ?*app_state.TranscriptMarkdownBody = if (streaming)
+        thread.pending_transcript_body
+    else if (message_index < thread.transcript_markdown_entries.items.len)
+        thread.transcript_markdown_entries.items[message_index]
+    else
+        null;
+    const entry = slot orelse return null;
+    const wanted: chat_types.TranscriptBodyKind = switch (kind) {
+        .markdown => if (streaming) .markdown_streaming else .markdown,
+        .plain => .plain,
+    };
+    if (entry.kind != wanted or !std.mem.eql(u8, entry.owned_body, body)) return null;
+    return entry;
+}
+
+const TranscriptBodyHitMode = enum { selection, link, cursor };
+
+const TranscriptBodyHitResult = struct {
+    link: ?TranscriptMarkdownLinkHit = null,
+    point: ?TranscriptMarkdownHit = null,
+};
+
+/// Last hit test against a renderer-cached body. Animation frames (the live
+/// bubble's pulse, spinners) re-run cursor resolution with an unchanged
+/// pointer and body; replaying the answer skips re-wrapping the text above
+/// the pointer. The body hash guards against a recycled entry address, and
+/// link hrefs stay valid because they borrow the still-identical entry.
+const TranscriptBodyHitMemo = struct {
+    entry: *const app_state.TranscriptMarkdownBody,
+    body_ptr: usize,
+    body_len: usize,
+    body_hash: u64,
+    rect: palette.Rect,
+    mouse_x: f32,
+    mouse_y: f32,
+    mode: TranscriptBodyHitMode,
+    message_index: usize,
+    ui_scale: f32,
+    font_generation: u32,
+    result: TranscriptBodyHitResult,
+
+    fn matches(self: *const TranscriptBodyHitMemo, other: *const TranscriptBodyHitMemo) bool {
+        return self.entry == other.entry and self.body_ptr == other.body_ptr and
+            self.body_len == other.body_len and self.body_hash == other.body_hash and
+            rectEql(self.rect, other.rect) and self.mouse_x == other.mouse_x and
+            self.mouse_y == other.mouse_y and self.mode == other.mode and
+            self.message_index == other.message_index and self.ui_scale == other.ui_scale and
+            self.font_generation == other.font_generation;
+    }
+};
+var transcript_body_hit_memo: ?TranscriptBodyHitMemo = null;
+
+fn hitTestTranscriptBodyTarget(
+    state: *app_state.AppState,
+    target: TranscriptBodyTarget,
+    mode: TranscriptBodyHitMode,
+    mouse_x: f32,
+    mouse_y: f32,
+) TranscriptBodyHitResult {
+    if (childNotification(target.role, target.body_raw)) |notification| {
+        if (!childNotificationView(state, childNotificationKey(target.message_index), notification).expanded) return .{};
+    }
+    const kind = transcriptSelectableBodyKind(target.role, target.author, target.body_raw, target.muted_body, false) orelse return .{};
+    if (mode == .link and kind != .markdown) return .{};
+    const body_rect = transcriptSelectableBodyRect(target.column, target.y, target.height, target.role, target.author, target.body_raw) orelse return .{};
+    if (!rectContains(body_rect, mouse_x, mouse_y)) return .{};
+
+    const body_text = std.mem.trim(u8, transcriptDisplayBody(target.role, target.body_raw), "\n\r\t ");
+    const cached_entry = peekTranscriptBodyEntry(state, kind, body_text, target.streaming, target.message_index);
+    var memo_key: ?TranscriptBodyHitMemo = null;
+    if (cached_entry) |entry| {
+        memo_key = .{
+            .entry = entry,
+            .body_ptr = @intFromPtr(entry.owned_body.ptr),
+            .body_len = entry.owned_body.len,
+            .body_hash = std.hash.Wyhash.hash(0, entry.owned_body),
+            .rect = body_rect,
+            .mouse_x = mouse_x,
+            .mouse_y = mouse_y,
+            .mode = mode,
+            .message_index = target.message_index,
+            .ui_scale = theme.scaledUi(1.0),
+            .font_generation = text_measure.fontGeneration(),
+            .result = .{},
+        };
+        if (transcript_body_hit_memo) |*memo| {
+            if (memo.matches(&memo_key.?)) return memo.result;
+        }
+    }
+    var owned_view: ?chat_markdown.BodyView = null;
+    defer if (owned_view) |*view| view.deinit(state.allocator);
+    const view = if (cached_entry) |entry|
+        entry.view
+    else blk: {
+        owned_view = buildTranscriptSelectableBodyView(state.allocator, kind, body_text, target.streaming) catch return .{};
+        break :blk owned_view.?;
+    };
+
+    const result = hitTestTranscriptBodyView(state, view, kind, body_rect, target.message_index, mode, mouse_x, mouse_y);
+    if (memo_key) |key| {
+        var memo = key;
+        memo.result = result;
+        transcript_body_hit_memo = memo;
+    }
+    return result;
+}
+
+fn hitTestTranscriptBodyView(
+    state: *app_state.AppState,
+    view: chat_markdown.BodyView,
+    kind: TranscriptSelectableBodyKind,
+    body_rect: palette.Rect,
+    message_index: usize,
+    mode: TranscriptBodyHitMode,
+    mouse_x: f32,
+    mouse_y: f32,
+) TranscriptBodyHitResult {
+    var result: TranscriptBodyHitResult = .{};
+    if (mode != .selection and kind == .markdown) {
+        if (chat_markdown.hitTestLinkPaletteBody(view, transcriptMarkdownOptions(), body_rect, body_rect.w, mouse_x, mouse_y)) |hit| {
+            result.link = .{ .href = hit.href };
+            if (mode == .cursor) return result;
+        }
+    }
+    if (mode != .link) {
+        const point = chat_markdown.hitTestSelectablePaletteBody(
+            state.allocator,
+            view,
+            transcriptSelectableOptions(kind),
+            body_rect,
+            body_rect.w,
+            mouse_x,
+            mouse_y,
+        ) catch null;
+        if (point) |p| result.point = .{ .message_index = message_index, .point = p };
+    }
+    return result;
+}
+
+fn transcriptBodyHitAt(state: *app_state.AppState, mouse_x: f32, mouse_y: f32, mode: TranscriptBodyHitMode) TranscriptBodyHitResult {
+    const target = resolveTranscriptBodyTarget(state, mouse_x, mouse_y) orelse return .{};
+    return hitTestTranscriptBodyTarget(state, target, mode, mouse_x, mouse_y);
+}
+
+fn transcriptMarkdownBubbleHit(
+    state: *app_state.AppState,
+    mouse_x: f32,
+    mouse_y: f32,
+) ?TranscriptMarkdownHit {
+    return transcriptBodyHitAt(state, mouse_x, mouse_y, .selection).point;
 }
 
 fn transcriptMarkdownBubbleLinkHit(
@@ -2351,67 +2519,18 @@ fn transcriptMarkdownBubbleLinkHit(
     mouse_x: f32,
     mouse_y: f32,
 ) ?TranscriptMarkdownLinkHit {
-    const transcript_hit = findTranscriptHit(mouse_x, mouse_y) orelse return null;
-    activateTranscriptHitGeometry(state, transcript_hit);
-    const column = transcript_hit.column;
-    const clip = transcript_hit.clip;
-    if (column.w <= 0 or !rectContains(clip, mouse_x, mouse_y)) return null;
+    return transcriptBodyHitAt(state, mouse_x, mouse_y, .link).link;
+}
 
-    const thread = state.currentThread();
-    const scroll_y = transcript_hit.scroll_y;
-    const content_offset_y = mouse_y - column.y + scroll_y;
-    const estimated_height = estimatedPartialTranscriptHeight(thread);
-    if (transcriptLayoutItemAtContentY(thread.transcript_layout_items.items, estimated_height, content_offset_y)) |item| {
-        if (!item.orchestration_collapsed and !commandGroupRendersGrouped(thread.messages.items, item.message_index, item.group_end) and item.message_index < thread.messages.items.len) {
-            const message = thread.messages.items[item.message_index];
-            const header = orchestrationHeaderOffset(item);
-            const content_y = column.y - scroll_y + estimated_height + item.top + header;
-            if (!(message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body))) {
-                if (assistantTranscriptMarkdownLinkHit(state, column, content_y, item.height - header, message.role, message.author, message.body, false, false, false, item.message_index, mouse_x, mouse_y)) |hit| {
-                    return hit;
-                }
-            }
-        }
-    }
+pub const TranscriptCursor = enum { none, link, text };
 
-    const send_state = thread.send_state;
-    send_state.mutex.lock();
-    defer send_state.mutex.unlock();
-    if (send_state.status != .pending) return null;
-
-    var content_y = column.y - scroll_y + estimatedPartialTranscriptHeight(thread);
-    var pi: usize = 0;
-    while (pi < send_state.pending_events.items.len) {
-        const event = send_state.pending_events.items[pi];
-        if (event.role == .system and shouldSkipPendingTranscriptEvent(thread, event.author, event.body)) {
-            pi += 1;
-            continue;
-        }
-        const group_end = if (shouldGroupCommandRow(event)) toolCallGroupEnd(send_state.pending_events.items, pi) else pi + 1;
-        if (commandGroupRendersGrouped(send_state.pending_events.items, pi, group_end)) {
-            content_y += toolCallGroupHeight(state, send_state.pending_events.items, pi, group_end, thread.messages.items.len, column.w) + theme.scaledUi(12.0);
-            pi = group_end;
-            continue;
-        }
-        const item_h = transcriptMessageHeight(state, thread.messages.items.len + pi, event.body, event.role, column.w, event.author, false) +
-            transcriptImageBlockHeightFor(event.role, event.images.items.len, column.w);
-        if (event.role == .system and shouldRenderPaletteCommandRow(event.author, event.body)) {
-            content_y += item_h + theme.scaledUi(12.0);
-            pi += 1;
-            continue;
-        }
-        if (assistantTranscriptMarkdownLinkHit(state, column, content_y, item_h, event.role, event.author, event.body, false, false, false, thread.messages.items.len + pi, mouse_x, mouse_y)) |hit| {
-            return hit;
-        }
-        content_y += item_h + theme.scaledUi(12.0);
-        pi += 1;
-    }
-
-    const stream_text: []const u8 = send_state.streamRevealedText();
-    const body: []const u8 = if (stream_text.len > 0) stream_text else "Waiting for streamed output...";
-    const stream_plain = false; // item 4: stream renders as markdown in place
-    const assistant_h = transcriptMessageHeightStream(null, null, body, .assistant, column.w, "", stream_plain, stream_text.len > 0);
-    return assistantTranscriptMarkdownLinkHit(state, column, content_y, assistant_h, .assistant, "", body, stream_text.len == 0, stream_plain, true, thread.messages.items.len + send_state.pending_events.items.len, mouse_x, mouse_y);
+/// Link pointer and text I-beam for the transcript row under the pointer,
+/// resolved in one pass (one row lookup, one parsed view).
+pub fn transcriptCursorAt(state: *app_state.AppState, x: f32, y: f32) TranscriptCursor {
+    const result = transcriptBodyHitAt(state, x, y, .cursor);
+    if (result.link != null) return .link;
+    if (result.point != null) return .text;
+    return .none;
 }
 
 pub const TranscriptLinkKind = enum {
@@ -5151,6 +5270,15 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
                 .system => if (event.author.len > 0) event.author else "System",
             };
             if (y + item_h >= column.y and y <= column.y + column.h) {
+                appendPendingRowHit(.{
+                    .send_state = send_state,
+                    .column = column,
+                    .turn_started_at_ms = send_state.started_at_ms,
+                    .pending_index = pi,
+                    .message_index = msg_idx,
+                    .y = y,
+                    .height = item_h,
+                });
                 renderTranscriptBubbleFromParts(state, column, y, item_h, event.role, role_label, event.body, false, false, clip, msg_idx, false, false);
                 const first_image: ?app_state.ChatImageAttachment = if (event.images.items.len > 0) event.images.items[0] else null;
                 const extra_images: []const app_state.ChatImageAttachment = if (event.images.items.len > 1) event.images.items[1..] else &.{};
@@ -5177,6 +5305,15 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
     const stream_msg_idx = base_message_index + send_state.pending_events.items.len;
     const assistant_h = pendingStreamBodyHeight(state, send_state, stream_msg_idx, column.w, variant_hash);
     if (y + assistant_h >= column.y and y <= column.y + column.h) {
+        appendPendingRowHit(.{
+            .send_state = send_state,
+            .column = column,
+            .turn_started_at_ms = send_state.started_at_ms,
+            .pending_index = null,
+            .message_index = stream_msg_idx,
+            .y = y,
+            .height = assistant_h,
+        });
         renderTranscriptBubbleFromParts(state, column, y, assistant_h, .assistant, working_label, body, stream_text.len == 0, stream_plain, clip, stream_msg_idx, stream_text.len > 0, true);
     }
 }
@@ -11483,4 +11620,199 @@ test "child results that need the human open expanded" {
     try std.testing.expect(childNotificationDefaultExpanded(.failed));
     try std.testing.expect(!childNotificationDefaultExpanded(.completed));
     try std.testing.expect(!childNotificationDefaultExpanded(.aborted));
+}
+
+const CursorBenchFixture = struct {
+    tmp: std.testing.TmpDir,
+    storage: *@import("../state/storage.zig").Storage,
+    state: *app_state.AppState,
+    column: palette.Rect,
+
+    fn init(allocator: std.mem.Allocator, pending_rows: usize, stream_paragraphs: usize) !CursorBenchFixture {
+        const storage_mod = @import("../state/storage.zig");
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+        const storage = try allocator.create(storage_mod.Storage);
+        errdefer allocator.destroy(storage);
+        storage.* = try storage_mod.Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
+        const state = try allocator.create(app_state.AppState);
+        errdefer allocator.destroy(state);
+        state.* = try app_state.AppState.init(allocator, storage, .{}, .{
+            .gl_texture_uploads_enabled = false,
+            .browser_textures_enabled = false,
+        });
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.clearRetainingCapacity();
+        state.lifecycle.clearDirty();
+        var project = try app_state.Project.init(allocator, "cursor-bench", "Cursor Bench", "/tmp/cursor-bench", 0);
+        state.project_controller.projects.append(allocator, project) catch |err| {
+            project.deinit(allocator);
+            return err;
+        };
+        state.project_controller.selected_index = 0;
+
+        const page = std.heap.page_allocator;
+        const send_state = state.currentThreadMutable().send_state;
+        send_state.status = .pending;
+        send_state.started_at_ms = 1;
+        var index: usize = 0;
+        while (index < pending_rows) : (index += 1) {
+            if (index % 2 == 0) {
+                var body: std.ArrayList(u8) = .empty;
+                defer body.deinit(allocator);
+                var p: usize = 0;
+                while (p < 3) : (p += 1) {
+                    try body.print(allocator, "Step {d}.{d}: inspected `src/module_{d}.zig` and the [design notes](https://example.com/notes/{d}) before **rewriting** the parser loop so it no longer re-wraps every row on each frame. ", .{ index, p, index, index });
+                }
+                try send_state.pending_events.append(page, .{
+                    .role = .assistant,
+                    .author = try page.dupe(u8, ""),
+                    .body = try page.dupe(u8, body.items),
+                });
+            } else {
+                try send_state.pending_events.append(page, .{
+                    .role = .system,
+                    .author = try page.dupe(u8, "Ran command"),
+                    .body = try std.fmt.allocPrint(page, "zig build test --summary all # step {d}", .{index}),
+                });
+            }
+        }
+        index = 0;
+        while (index < stream_paragraphs) : (index += 1) {
+            try send_state.partial_text.print(page, "Paragraph {d} of the streamed reply explains the change to [chat_panel.zig](packages/desktop/src/ui/chat_panel.zig) in detail, wrapping across several lines of the transcript column so layout work is realistic.\n\n", .{index});
+        }
+        send_state.reveal_len = send_state.partial_text.items.len;
+
+        resetTranscriptHitCache();
+        const column: palette.Rect = .{ .x = 40.0, .y = 60.0, .w = 720.0, .h = 900.0 };
+        return .{ .tmp = tmp, .storage = storage, .state = state, .column = column };
+    }
+
+    /// Renders the pending region scrolled to its tail, like a following
+    /// transcript pane, so render-owned caches and geometry are warm.
+    fn renderTail(self: *CursorBenchFixture) void {
+        const state = self.state;
+        state.palette_overlay_batch.clear();
+        state.palette_frame_text.clearRetainingCapacity();
+        _ = state.palette_frame_text_arena.reset(.retain_capacity);
+        resetTranscriptHitCache();
+        const thread = state.currentThread();
+        const total = transcriptPendingStreamHeight(state, thread, self.column.w);
+        const scroll_y = @max(0.0, total - self.column.h);
+        appendTranscriptHit(.{
+            .rect = self.column,
+            .column = self.column,
+            .clip = self.column,
+            .scroll_y = scroll_y,
+        });
+        renderPendingTranscriptStream(state, thread, self.column, self.column.y - scroll_y, self.column, thread.messages.items.len);
+    }
+
+    fn deinit(self: *CursorBenchFixture, allocator: std.mem.Allocator) void {
+        resetTranscriptHitCache();
+        self.state.lifecycle.clearDirty();
+        self.state.deinit();
+        allocator.destroy(self.state);
+        self.storage.deinit();
+        allocator.destroy(self.storage);
+        self.tmp.cleanup();
+    }
+};
+
+fn benchTranscriptCursorQueryNs(state: *app_state.AppState, x: f32, y: f32, iterations: usize, cold: bool) u64 {
+    const start = profiler.nowNs();
+    var index: usize = 0;
+    while (index < iterations) : (index += 1) {
+        // Cold: a stream delta replaced the body since the last query.
+        if (cold) transcript_body_hit_memo = null;
+        // Mirrors syncMouseCursor's transcript tail: link pointer, then I-beam.
+        std.mem.doNotOptimizeAway(transcriptCursorAt(state, x, y));
+    }
+    const elapsed = profiler.nowNs() - start;
+    return @intCast(@divTrunc(elapsed, @as(@TypeOf(elapsed), @intCast(iterations))));
+}
+
+test "transcript cursor hit test over a long pending stream (microbenchmark)" {
+    const allocator = std.testing.allocator;
+    var fixture = try CursorBenchFixture.init(allocator, 240, 160);
+    defer fixture.deinit(allocator);
+    fixture.renderTail();
+    const column = fixture.column;
+    // Over the tail of the streamed reply, the common hover target while a
+    // turn streams in the shown chat.
+    const tail_x = column.x + 120.0;
+    const tail_y = column.y + column.h - 60.0;
+    const cold_ns = benchTranscriptCursorQueryNs(fixture.state, tail_x, tail_y, 20, true);
+    const warm_ns = benchTranscriptCursorQueryNs(fixture.state, tail_x, tail_y, 200, false);
+    // Over the bottom gap below the stream (no row): resolution alone.
+    const miss_ns = benchTranscriptCursorQueryNs(fixture.state, tail_x, column.y + column.h - 1.0, 200, true);
+    std.log.scoped(.cursor_bench).warn("pending_rows=240 stream_bytes={d} per-call cold={d}us warm={d}us miss={d}us", .{
+        fixture.state.currentThread().send_state.partial_text.items.len,
+        cold_ns / std.time.ns_per_us,
+        warm_ns / std.time.ns_per_us,
+        miss_ns / std.time.ns_per_us,
+    });
+}
+
+fn firstPendingRowHit(pending_index: ?usize) ?PendingRowHit {
+    for (pending_row_hits[0..pending_row_hit_count]) |hit| {
+        if (std.meta.eql(hit.pending_index, pending_index)) return hit;
+    }
+    return null;
+}
+
+test "transcript cursor resolves pending links and text from render geometry" {
+    const allocator = std.testing.allocator;
+    var fixture = try CursorBenchFixture.init(allocator, 0, 4);
+    defer fixture.deinit(allocator);
+    const page = std.heap.page_allocator;
+    const send_state = fixture.state.currentThreadMutable().send_state;
+    try send_state.pending_events.append(page, .{
+        .role = .assistant,
+        .author = try page.dupe(u8, ""),
+        .body = try page.dupe(u8, "[open the design notes for this change](https://example.com/notes)"),
+    });
+    fixture.renderTail();
+    const state = fixture.state;
+
+    // Only rows the render placed are recorded, each with its render rect.
+    const link_row = firstPendingRowHit(0) orelse return error.TestExpectedEqual;
+    const stream_row = firstPendingRowHit(null) orelse return error.TestExpectedEqual;
+    try std.testing.expect(stream_row.y >= link_row.y + link_row.height);
+
+    const link_body = transcriptSelectableBodyRect(fixture.column, link_row.y, link_row.height, .assistant, "", send_state.pending_events.items[0].body).?;
+    try std.testing.expectEqual(TranscriptCursor.link, transcriptCursorAt(state, link_body.x + 8.0, link_body.y + 8.0));
+    try std.testing.expect(transcriptLinkWantsPointerAt(state, link_body.x + 8.0, link_body.y + 8.0));
+    const href = transcriptMarkdownLinkHrefAt(state, link_body.x + 8.0, link_body.y + 8.0) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("https://example.com/notes", href);
+
+    const stream_body = transcriptSelectableBodyRect(fixture.column, stream_row.y, stream_row.height, .assistant, "", send_state.streamRevealedText()).?;
+    try std.testing.expectEqual(TranscriptCursor.text, transcriptCursorAt(state, stream_body.x + 30.0, stream_body.y + 6.0));
+    const point = transcriptMarkdownBubbleHit(state, stream_body.x + 30.0, stream_body.y + 6.0) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(stream_row.message_index, point.message_index);
+
+    // Bubble chrome above the body (role label) is not selectable text.
+    try std.testing.expectEqual(TranscriptCursor.none, transcriptCursorAt(state, stream_body.x + 30.0, stream_row.y + 2.0));
+
+    // The hit test reuses the renderer's parsed stream body instead of
+    // replacing it, so the next frame can still replay its cache.
+    const cached = state.currentThread().pending_transcript_body orelse return error.TestExpectedEqual;
+    _ = transcriptCursorAt(state, stream_body.x + 30.0, stream_body.y + 6.0);
+    try std.testing.expectEqual(cached, state.currentThread().pending_transcript_body.?);
+
+    // Geometry recorded for an earlier turn never resolves against a new one.
+    send_state.started_at_ms += 1;
+    try std.testing.expectEqual(TranscriptCursor.none, transcriptCursorAt(state, stream_body.x + 30.0, stream_body.y + 6.0));
+    send_state.started_at_ms -= 1;
+
+    // A finished turn drops its pending rows from hit testing immediately.
+    send_state.status = .idle;
+    try std.testing.expectEqual(TranscriptCursor.none, transcriptCursorAt(state, link_body.x + 8.0, link_body.y + 8.0));
+    send_state.status = .pending;
+
+    // The per-frame reset forgets pending geometry until the next render.
+    resetTranscriptHitCache();
+    try std.testing.expectEqual(@as(usize, 0), pending_row_hit_count);
 }

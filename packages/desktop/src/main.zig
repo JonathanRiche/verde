@@ -799,30 +799,35 @@ fn syncMouseCursor(state: *AppState, cache: *CursorState) void {
     // Modal scrims (settings, command palette, importers) intercept clicks
     // before the sidebar and workspace headers in event routing, so any modal
     // hit under the mouse must also suppress their pointer affordance.
-    if (!modalHitAtMouse(state) and
+    const modal_hit = modalHitAtMouse(state);
+    if (!modal_hit and
         (sidebar_ui.wantsPointerAt(state, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y) or
             chat_panel_ui.workspaceHeaderWantsPointerAt(state, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y) or
             chat_panel_ui.approvalActionWantsPointerAt(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y) or
             chat_panel_ui.backgroundTaskPinWantsPointerAt(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y) or
             chat_panel_ui.linkedChatsWantsPointerAt(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y) or
-            chat_panel_ui.transcriptActionWantsPointerAt(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y) or
-            chat_panel_ui.transcriptLinkWantsPointerAt(state, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y)))
+            chat_panel_ui.transcriptActionWantsPointerAt(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y)))
     {
         applySystemCursor(cache, .pointer);
         return;
     }
-    if (!modalHitAtMouse(state) and state.composer_controller.composer.textRect().contains(.{
+    // One transcript pass answers both the link pointer and the text I-beam.
+    const transcript_cursor: chat_panel_ui.TranscriptCursor = if (modal_hit)
+        .none
+    else
+        chat_panel_ui.transcriptCursorAt(state, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
+    if (transcript_cursor == .link) {
+        applySystemCursor(cache, .pointer);
+        return;
+    }
+    if (!modal_hit and state.composer_controller.composer.textRect().contains(.{
         .x = state.transcript_controller.palette_mouse_x,
         .y = state.transcript_controller.palette_mouse_y,
     })) {
         applySystemCursor(cache, .text);
         return;
     }
-    if (!modalHitAtMouse(state) and chat_panel_ui.transcriptTextWantsIBeamAt(
-        state,
-        state.transcript_controller.palette_mouse_x,
-        state.transcript_controller.palette_mouse_y,
-    )) {
+    if (transcript_cursor == .text) {
         applySystemCursor(cache, .text);
         return;
     }
