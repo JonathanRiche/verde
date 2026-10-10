@@ -1,44 +1,33 @@
+//! Text measurement for Verde's layout code, backed by the same palette-native
+//! font collection the GPU renderer draws with.
+//!
+//! Sizes are nominal: like the renderer, measurement evaluates every face at
+//! `font_size * text_scale` (0.86, `palette.fonts.default_text_scale`) so
+//! markdown chunk positions match the glyphs that are actually drawn. Role
+//! chains include the symbol/emoji fallbacks, so arrows and dingbats measure
+//! with the face that draws them. Before `configure` (tests, headless roots)
+//! widths come from a per-character estimate.
+
 const std = @import("std");
 const palette = @import("palette");
 
-const RoleFonts = struct {
-    ui: *palette.sdl.Font,
-    ui_bold: *palette.sdl.Font,
-    prose: *palette.sdl.Font,
-    prose_bold: *palette.sdl.Font,
-    prose_italic: *palette.sdl.Font,
-    prose_bold_italic: *palette.sdl.Font,
-    mono: *palette.sdl.Font,
-    icon: *palette.sdl.Font,
-};
-
-var fonts: ?RoleFonts = null;
-var gpu_renderer: ?*palette.renderer.Renderer = null;
+var fonts: ?*palette.fonts.Fonts = null;
 var prefix_cache: ?PrefixWidthCache = null;
 // Bumped whenever the measuring backend changes so width memos keyed on it
 // (chat_panel chrome labels) drop stale entries instead of serving widths
 // measured against replaced fonts.
 var font_generation: u32 = 0;
 
-// Palette's SDL_GPU text path renders TTF text through the atlas engine at this
-// scale. Keep layout measurement on the same scale so markdown chunk positions
-// match the glyphs that are actually drawn.
-const GPU_TEXT_FONT_SCALE: f32 = 0.86;
+const DEFAULT_TEXT_SCALE: f32 = palette.fonts.default_text_scale;
 
-pub fn configure(role_fonts: RoleFonts) void {
-    fonts = role_fonts;
-    font_generation +%= 1;
-}
-
-pub fn configureRenderer(renderer: ?*palette.renderer.Renderer) void {
-    gpu_renderer = renderer;
+pub fn configure(configured: *palette.fonts.Fonts) void {
+    fonts = configured;
     prefix_cache = null;
     font_generation +%= 1;
 }
 
 pub fn clear() void {
     fonts = null;
-    gpu_renderer = null;
     prefix_cache = null;
     font_generation +%= 1;
 }
@@ -48,42 +37,24 @@ pub fn fontGeneration() u32 {
     return font_generation;
 }
 
+fn textScale() f32 {
+    return if (fonts) |f| f.text_scale else DEFAULT_TEXT_SCALE;
+}
+
 pub fn textWidth(role: palette.FontRole, font_size: f32, text: []const u8) f32 {
     if (text.len == 0) return 0.0;
-    // Non-ASCII may need symbol fallbacks (→ etc. live outside Noto Sans).
-    // The GPU path's sized fonts register those faces, so advances match
-    // the glyphs that are actually drawn. Raw-base-face measurement alone
-    // substitutes .notdef / wrong widths and makes arrows look gappy or
-    // tofu-like next to surrounding prose. ASCII stays on the cheap path
-    // because chat markdown wrap calls this per word.
-    if (textNeedsCoverageMeasure(text)) {
-        if (gpu_renderer) |renderer| {
-            if (renderer.measureTextOffset(text, font_size, text.len, role)) |width| {
-                return width;
-            } else |_| {}
-        }
-    }
-    const render_size = font_size * GPU_TEXT_FONT_SCALE;
-    if (fonts) |configured| {
-        return palette.sdl.ttfMeasureText(fontForRole(configured, role), text, render_size) catch estimatedTextWidth(render_size, text);
+    const render_size = font_size * textScale();
+    if (fonts) |f| {
+        return f.collection.measureText(measureRole(role), render_size, text) catch estimatedTextWidth(render_size, text);
     }
     return estimatedTextWidth(render_size, text);
 }
 
-/// True when `text` may contain codepoints outside the primary UI/prose
-/// faces (arrows, dingbats, emoji, CJK, …) that need SDL_ttf symbol
-/// fallbacks for correct advance widths.
-fn textNeedsCoverageMeasure(text: []const u8) bool {
-    for (text) |byte| {
-        if (byte >= 0x80) return true;
-    }
-    return false;
-}
-
 pub fn fontAscent(role: palette.FontRole, font_size: f32) f32 {
-    const render_size = font_size * GPU_TEXT_FONT_SCALE;
-    if (fonts) |configured| {
-        return palette.sdl.ttfFontAscent(fontForRole(configured, role), render_size) catch fallbackAscent(render_size);
+    const render_size = font_size * textScale();
+    if (fonts) |f| {
+        const ascent = f.collection.lineMetrics(measureRole(role), render_size).ascent;
+        if (ascent > 0) return ascent;
     }
     return fallbackAscent(render_size);
 }
@@ -97,15 +68,15 @@ pub const GlyphOrigin = struct { x: f32, y: f32 };
 
 pub fn centeredGlyphOrigin(role: palette.FontRole, glyph: []const u8, font_size: f32, cx: f32, cy: f32) GlyphOrigin {
     const fallback: GlyphOrigin = .{ .x = cx - font_size * 0.5, .y = cy - font_size * 0.5 };
-    const configured = fonts orelse return fallback;
+    const f = fonts orelse return fallback;
     const view = std.unicode.Utf8View.init(glyph) catch return fallback;
     var it = view.iterator();
     const cp = it.nextCodepoint() orelse return fallback;
-    const render_size = font_size * GPU_TEXT_FONT_SCALE;
-    const font = fontForRole(configured, role);
-    const ink = palette.sdl.ttfGlyphInk(font, cp, render_size) catch return fallback;
+    // Ink box in whole pixels at the drawn size, SDL_ttf `TTF_GetGlyphMetrics` order.
+    const ink = f.glyphInk(role, font_size, cp) orelse return fallback;
     if (ink[1] <= ink[0] or ink[3] <= ink[2]) return fallback;
-    const ascent = palette.sdl.ttfFontAscent(font, render_size) catch return fallback;
+    const ascent = f.collection.lineMetrics(role, font_size * f.text_scale).ascent;
+    if (ascent <= 0) return fallback;
     return .{
         .x = cx - (ink[0] + ink[1]) * 0.5,
         .y = cy - ascent + (ink[2] + ink[3]) * 0.5,
@@ -128,12 +99,9 @@ pub fn textPrefixWidth(role: palette.FontRole, text: []const u8, font_size: f32,
 }
 
 fn measureTextPrefixWidth(role: palette.FontRole, text: []const u8, font_size: f32, end: usize) f32 {
-    if (gpu_renderer) |renderer| {
-        return renderer.measureTextOffset(text, font_size, end, role) catch fallbackTextPrefixWidth(role, font_size, text, end);
-    }
-    const render_size = font_size * GPU_TEXT_FONT_SCALE;
-    if (fonts) |configured| {
-        return palette.sdl.ttfMeasureTextOffset(fontForRole(configured, role), text, render_size, end) catch fallbackTextPrefixWidth(role, font_size, text, end);
+    const render_size = font_size * textScale();
+    if (fonts) |f| {
+        return f.collection.measureTextOffset(measureRole(role), render_size, text, end) catch fallbackTextPrefixWidth(role, font_size, text, end);
     }
     return estimatedTextWidth(render_size, text[0..end]);
 }
@@ -150,12 +118,13 @@ fn fallbackTextPrefixWidth(role: palette.FontRole, font_size: f32, text: []const
 pub fn textGlyphAdvances(role: palette.FontRole, text: []const u8, font_size: f32, advances: []f32) void {
     std.debug.assert(advances.len == text.len);
     if (text.len == 0) return;
-    if (gpu_renderer) |renderer| {
-        if (renderer.measureTextGlyphAdvances(text, font_size, role, advances)) |_| {
+    const render_size = font_size * textScale();
+    if (fonts) |f| {
+        if (f.collection.glyphAdvances(measureRole(role), render_size, text, advances)) |_| {
             return;
         } else |_| {}
     }
-    estimatedGlyphAdvances(font_size * GPU_TEXT_FONT_SCALE, text, advances);
+    estimatedGlyphAdvances(render_size, text, advances);
 }
 
 fn estimatedGlyphAdvances(font_size: f32, text: []const u8, advances: []f32) void {
@@ -175,21 +144,14 @@ pub fn codepointWidth(role: palette.FontRole, cp: u21, font_size: f32) f32 {
     return textWidth(role, font_size, buf[0..len]);
 }
 
-fn fontForRole(role_fonts: RoleFonts, role: palette.FontRole) *palette.sdl.Font {
+fn measureRole(role: palette.FontRole) palette.FontRole {
     return switch (role) {
-        .ui => role_fonts.ui,
-        .ui_bold => role_fonts.ui_bold,
-        .prose => role_fonts.prose,
-        .prose_bold => role_fonts.prose_bold,
-        .prose_italic => role_fonts.prose_italic,
-        .prose_bold_italic => role_fonts.prose_bold_italic,
-        .mono => role_fonts.mono,
-        .icon => role_fonts.icon,
-        // mono_symbols / symbols / symbols_alt / math / emoji are coverage fallbacks
-        // the renderer picks per-glyph; measurement always reports the primary
-        // mono cell width because terminal layout advances by mono cells
-        // regardless of which face ends up drawing each glyph.
-        .mono_symbols, .symbols, .symbols_alt, .math, .emoji => role_fonts.mono,
+        // mono_symbols / symbols / symbols_alt / math / emoji are coverage
+        // fallbacks inside the mono chain; measurement reports the mono chain
+        // because terminal layout advances by mono cells regardless of which
+        // face ends up drawing each glyph.
+        .mono_symbols, .symbols, .symbols_alt, .math, .emoji => .mono,
+        else => role,
     };
 }
 
