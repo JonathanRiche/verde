@@ -30,7 +30,7 @@ root="${VERDE_PALETTE_TRIAL_ROOT:-$HOME/.local/share/verde-palette-trial}"
 real_home="$HOME"
 bin="$repo/zig-out/bin/verde"
 
-if [[ "$root" == "$real_home" || "$root" == "$real_home/.local/share/verde"* ]]; then
+if [[ "$root" == "$real_home" || "$root" == "$real_home/.local/share/verde" || "$root" == "$real_home/.local/share/verde/"* ]]; then
   echo "refusing: trial root $root overlaps the real Verde data" >&2
   exit 1
 fi
