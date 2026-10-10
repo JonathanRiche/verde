@@ -15,6 +15,7 @@ pub fn build(b: *std.Build) void {
     const ui_debug = b.option(bool, "ui-debug", "Show the desktop UI debug window") orelse false;
     const dev_trace = b.option(bool, "dev-trace", "Compile GUI flow-trace log lines (frame, RPC, paste, refresh breadcrumbs); dev builds only") orelse false;
     const browser_backend = b.option(BrowserBackendKind, "browser-backend", "Browser backend: native_webview or stub") orelse .native_webview;
+    const browser_linux_fdo = b.option(bool, "browser-linux-fdo", "Linux browser helper: include the legacy wpebackend-fdo + EGL/GLES backend (VERDE_BROWSER_LINUX_BACKEND=fdo)") orelse true;
     const terminal_backend = b.option(bool, "terminal_backend", "Enable the native terminal backend") orelse true;
     const local_ipc = b.option(bool, "local_ipc", "Enable the local live-control IPC backend") orelse true;
     const windows_integrations = b.option(bool, "windows_integrations", "Enable native Windows shell/clipboard/application integrations") orelse
@@ -402,17 +403,8 @@ pub fn build(b: *std.Build) void {
             }),
         });
         browser_helper.build_id = .sha1;
-        browser_helper.root_module.link_libc = true;
         useLibcLinker(browser_helper);
-        browser_helper.root_module.addCSourceFile(.{
-            .file = b.path("src/browser/platform/linux_wpe.c"),
-            .flags = &.{},
-        });
-        browser_helper.root_module.linkSystemLibrary("wpe-webkit-2.0", .{ .use_pkg_config = .force });
-        browser_helper.root_module.linkSystemLibrary("wpebackend-fdo-1.0", .{ .use_pkg_config = .force });
-        browser_helper.root_module.linkSystemLibrary("egl", .{ .use_pkg_config = .force });
-        browser_helper.root_module.linkSystemLibrary("glesv2", .{ .use_pkg_config = .force });
-        browser_helper.root_module.linkSystemLibrary("javascriptcoregtk-6.0", .{ .use_pkg_config = .force });
+        addLinuxBrowserHelperSources(b, browser_helper.root_module, false, browser_linux_fdo);
         b.installArtifact(browser_helper);
         // The GUI and helper speak one stdin/stdout protocol; a GUI-only
         // dev-build beside a stale helper sends commands it cannot parse.
@@ -529,19 +521,22 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
             }),
         });
-        linux_browser_helper_tests.root_module.link_libc = true;
         useLibcLinker(linux_browser_helper_tests);
-        linux_browser_helper_tests.root_module.addCSourceFile(.{
-            .file = b.path("src/browser/platform/linux_wpe.c"),
-            .flags = &.{"-DVERDE_BROWSER_LINUX_TESTING=1"},
-        });
-        linux_browser_helper_tests.root_module.linkSystemLibrary("wpe-webkit-2.0", .{ .use_pkg_config = .force });
-        linux_browser_helper_tests.root_module.linkSystemLibrary("wpebackend-fdo-1.0", .{ .use_pkg_config = .force });
-        linux_browser_helper_tests.root_module.linkSystemLibrary("egl", .{ .use_pkg_config = .force });
-        linux_browser_helper_tests.root_module.linkSystemLibrary("glesv2", .{ .use_pkg_config = .force });
-        linux_browser_helper_tests.root_module.linkSystemLibrary("javascriptcoregtk-6.0", .{ .use_pkg_config = .force });
+        addLinuxBrowserHelperSources(b, linux_browser_helper_tests.root_module, true, browser_linux_fdo);
         addTestArtifact(b, test_step, linux_browser_helper_tests, target);
         test_compile_step.dependOn(&linux_browser_helper_tests.step);
+        // The GUI's Zig mirror of the frame-socket wire structs must match the C header.
+        const frame_layout_module = b.createModule(.{
+            .root_source_file = b.path("src/browser/platform/layout_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        frame_layout_module.addIncludePath(b.path("src/browser/platform"));
+        const frame_layout_tests = b.addTest(.{ .root_module = frame_layout_module });
+        useLibcLinker(frame_layout_tests);
+        addTestArtifact(b, test_step, frame_layout_tests, target);
+        test_compile_step.dependOn(&frame_layout_tests.step);
     }
     const exe_tests = b.addTest(.{
         .filters = test_filters,
@@ -913,6 +908,26 @@ pub fn testFilters(b: *std.Build) []const []const u8 {
 /// self-hosted ELF linker cannot consume the system crt1.o (.sframe
 /// relocations), and the self-hosted x86 backend miscompiles Verde. Mach-O
 /// has no LLD and keeps Zig's own linker.
+/// The WPE WebKit browser helper: the WPE Platform API display (default) plus,
+/// unless `-Dbrowser-linux-fdo=false`, the legacy wpebackend-fdo + EGL/GLES
+/// backend selected with VERDE_BROWSER_LINUX_BACKEND=fdo.
+fn addLinuxBrowserHelperSources(b: *std.Build, module: *std.Build.Module, testing: bool, fdo: bool) void {
+    module.link_libc = true;
+    const fdo_flag = if (fdo) "-DVERDE_BROWSER_LINUX_WITH_FDO=1" else "-DVERDE_BROWSER_LINUX_WITH_FDO=0";
+    module.addCSourceFiles(.{
+        .root = b.path("src/browser/platform"),
+        .files = &.{ "linux_wpe.c", "linux_wpe_platform.c", "frame_socket.c" },
+        .flags = if (testing) &.{ "-std=gnu11", fdo_flag, "-DVERDE_BROWSER_LINUX_TESTING=1" } else &.{ "-std=gnu11", fdo_flag },
+    });
+    module.addIncludePath(b.path("src/browser/platform"));
+    inline for (.{ "wpe-webkit-2.0", "wpe-platform-2.0", "javascriptcoregtk-6.0" }) |lib| {
+        module.linkSystemLibrary(lib, .{ .use_pkg_config = .force });
+    }
+    if (fdo) inline for (.{ "wpebackend-fdo-1.0", "egl", "glesv2" }) |lib| {
+        module.linkSystemLibrary(lib, .{ .use_pkg_config = .force });
+    };
+}
+
 fn useLibcLinker(compile: *std.Build.Step.Compile) void {
     compile.use_llvm = true;
     compile.use_lld = compile.rootModuleTarget().ofmt != .macho;

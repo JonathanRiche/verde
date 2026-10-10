@@ -1,9 +1,19 @@
+/* VERDE_BROWSER_LINUX_WITH_FDO=0 (zig build -Dfdo=false) leaves out the legacy
+ * wpebackend-fdo + EGL/GLES export path: the helper then needs only WPE WebKit and
+ * wpe-platform (VERDE_BROWSER_LINUX_BACKEND=fdo reports a failure). */
+#ifndef VERDE_BROWSER_LINUX_WITH_FDO
+#define VERDE_BROWSER_LINUX_WITH_FDO 1
+#endif
 #define GL_GLEXT_PROTOTYPES
 
+#if VERDE_BROWSER_LINUX_WITH_FDO
 #include <EGL/egl.h>
+#endif
 #include <gio/gio.h>
+#if VERDE_BROWSER_LINUX_WITH_FDO
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
+#endif
 #include <glib-object.h>
 #include <glib.h>
 #include <jsc/jsc.h>
@@ -15,10 +25,14 @@
 #include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
+#if VERDE_BROWSER_LINUX_WITH_FDO
 #include <wpe/fdo.h>
 #include <wpe/fdo-egl.h>
+#endif
 #include <wpe/webkit.h>
 #include <libsoup/soup.h>
+#include "frame_socket.h"
+#include "linux_wpe_platform.h"
 
 #define VERDE_BROWSER_LINUX_FRAME_SLOT_COUNT 3
 #define VERDE_BROWSER_LINUX_FRAME_BYTES_MAX (4096u * 2160u * 4u)
@@ -30,6 +44,9 @@
 #define VERDE_BROWSER_LINUX_FRAME_INTERVAL_SAMPLE_MAX 256
 #define VERDE_BROWSER_LINUX_ASYNC_OVERFLOW_SCROLLING_FEATURE "AsyncOverflowScrolling"
 #define VERDE_BROWSER_LINUX_PROCESS_SWAP_FEATURE "ProcessSwapOnCrossSiteNavigation"
+/* WPE Platform API: WebKit reports per-frame damage to render_buffer only with this on. */
+#define VERDE_BROWSER_LINUX_DAMAGE_FEATURE "PropagateDamagingInformation"
+#define VERDE_BROWSER_LINUX_PRECISE_SCROLL_MULTIPLIER 2.5
 
 #if WEBKIT_CHECK_VERSION(2, 52, 0)
 #define VERDE_BROWSER_LINUX_HAS_CONTEXT_MENU_DETAILS 1
@@ -108,8 +125,10 @@ struct verde_browser_linux_context_menu_item {
 };
 
 struct verde_browser_linux {
+#if VERDE_BROWSER_LINUX_WITH_FDO
     struct wpe_view_backend_exportable_fdo *exportable;
     struct wpe_view_backend_exportable_fdo_egl_client export_client;
+#endif
     struct wpe_view_backend *view_backend;
     WebKitWebViewBackend *webkit_backend;
     WebKitWebView *web_view;
@@ -124,12 +143,14 @@ struct verde_browser_linux {
     gboolean document_committed;
     gboolean awaiting_load_start;
 
+#if VERDE_BROWSER_LINUX_WITH_FDO
     EGLDisplay egl_display;
     EGLContext egl_context;
     EGLSurface egl_surface;
     GLuint texture;
     GLuint framebuffer;
     PFNGLEGLIMAGETARGETTEXTURE2DOESPROC gl_egl_image_target_texture_2d;
+#endif
     unsigned char *rgba_scratch;
     size_t rgba_scratch_len;
     unsigned char *deferred_bgra;
@@ -188,6 +209,32 @@ struct verde_browser_linux {
     gint target_height;
     gdouble device_scale;
     guint pointer_modifiers;
+
+    /* Zero-copy transport (frame_socket.c); NULL or shm mode = legacy readback. */
+    struct vbf_socket *frame_socket;
+    gboolean dmabuf_frame_dirty;
+    guint64 dmabuf_frame_sequence;
+    gint dmabuf_frame_width;
+    gint dmabuf_frame_height;
+    gint64 dmabuf_frame_exported_at_us;
+    gint64 dmabuf_frame_published_at_us;
+    guint64 metric_dmabuf_frames;
+
+    /* WPE Platform API backend (default). NULL = legacy wpebackend-fdo
+     * (VERDE_BROWSER_LINUX_BACKEND=fdo). */
+    WPEDisplay *wpe_display;
+    WPEView *wpe_view;
+    /* Last frame handed to the GUI: wpe_view_buffer_rendered() is paced through the
+     * frame-complete scheduler (it is what lets WebKit start the next frame). */
+    WPEBuffer *rendered_pending;
+    gboolean rendered_pending_release; /* SHM: copied out, release once rendered */
+    gboolean explicit_sync;
+    double pointer_x;
+    double pointer_y;
+    guint64 metric_damage_frames;
+    guint64 metric_damage_rects;
+    guint64 metric_damage_pixels;
+    guint64 metric_frame_pixels;
 };
 
 int verde_browser_linux_set_bounds(struct verde_browser_linux *browser, int x, int y, int width, int height);
@@ -271,9 +318,23 @@ static void verde_browser_linux_note_frame_production_lead(struct verde_browser_
 }
 
 static void verde_browser_linux_dispatch_frame_complete(struct verde_browser_linux *browser) {
-    if (browser == NULL || browser->exportable == NULL) return;
+    if (browser == NULL) return;
+    if (browser->wpe_view != NULL) {
+        WPEBuffer *buffer = browser->rendered_pending;
+        if (buffer == NULL) return;
+        browser->frame_complete_dispatched_us = g_get_monotonic_time();
+        browser->rendered_pending = NULL;
+        wpe_view_buffer_rendered(browser->wpe_view, buffer);
+        if (browser->rendered_pending_release) wpe_view_buffer_released(browser->wpe_view, buffer);
+        browser->rendered_pending_release = FALSE;
+        g_object_unref(buffer);
+        return;
+    }
+#if VERDE_BROWSER_LINUX_WITH_FDO
+    if (browser->exportable == NULL) return;
     browser->frame_complete_dispatched_us = g_get_monotonic_time();
     wpe_view_backend_exportable_fdo_dispatch_frame_complete(browser->exportable);
+#endif
 }
 
 static gboolean verde_browser_linux_frame_complete_timer(gpointer user_data) {
@@ -319,12 +380,26 @@ static void verde_browser_linux_schedule_frame_complete_at(struct verde_browser_
  * frames are exported until the pane is shown or driven again. */
 #define VERDE_BROWSER_LINUX_HIDDEN_PAINT_GRACE_MS 15000u
 
+static gboolean verde_browser_linux_has_view(struct verde_browser_linux *browser) {
+    return browser->wpe_view != NULL || browser->view_backend != NULL;
+}
+
+/* WebKit-side visibility: hidden views throttle timers/rAF and stop producing frames. */
+static void verde_browser_linux_set_view_visible(struct verde_browser_linux *browser, gboolean visible) {
+    if (browser->wpe_view != NULL) {
+        wpe_view_set_visible(browser->wpe_view, visible);
+    } else if (browser->view_backend != NULL) {
+        if (visible) wpe_view_backend_add_activity_state(browser->view_backend, wpe_view_activity_state_visible | wpe_view_activity_state_in_window);
+        else wpe_view_backend_remove_activity_state(browser->view_backend, wpe_view_activity_state_visible);
+    }
+}
+
 static gboolean verde_browser_linux_hidden_pause_timer(gpointer user_data) {
     struct verde_browser_linux *browser = user_data;
     browser->hidden_pause_timer_id = 0;
-    if (!browser->visible && !browser->painting_paused && browser->view_backend != NULL) {
+    if (!browser->visible && !browser->painting_paused && verde_browser_linux_has_view(browser)) {
         browser->painting_paused = TRUE;
-        wpe_view_backend_remove_activity_state(browser->view_backend, wpe_view_activity_state_visible);
+        verde_browser_linux_set_view_visible(browser, FALSE);
     }
     return G_SOURCE_REMOVE;
 }
@@ -336,9 +411,9 @@ static void verde_browser_linux_schedule_hidden_pause(struct verde_browser_linux
 
 /* Lets a paused hidden page paint again, e.g. when an agent drives it. */
 static void verde_browser_linux_resume_painting(struct verde_browser_linux *browser) {
-    if (browser == NULL || !browser->painting_paused || browser->view_backend == NULL) return;
+    if (browser == NULL || !browser->painting_paused || !verde_browser_linux_has_view(browser)) return;
     browser->painting_paused = FALSE;
-    wpe_view_backend_add_activity_state(browser->view_backend, wpe_view_activity_state_visible);
+    verde_browser_linux_set_view_visible(browser, TRUE);
     if (!browser->visible) verde_browser_linux_schedule_hidden_pause(browser);
 }
 
@@ -977,6 +1052,7 @@ static void verde_browser_linux_unmap_frame_slots(struct verde_browser_linux *br
     }
 }
 
+#if VERDE_BROWSER_LINUX_WITH_FDO
 static gboolean verde_browser_linux_init_egl(struct verde_browser_linux *browser) {
     browser->egl_display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     if (browser->egl_display == EGL_NO_DISPLAY) return FALSE;
@@ -1038,6 +1114,8 @@ static void verde_browser_linux_deinit_egl(struct verde_browser_linux *browser) 
     browser->egl_context = EGL_NO_CONTEXT;
     browser->egl_surface = EGL_NO_SURFACE;
 }
+
+#endif
 
 enum verde_browser_linux_frame_export_result {
     VERDE_BROWSER_LINUX_FRAME_EXPORT_OK,
@@ -1150,6 +1228,7 @@ static gboolean verde_browser_linux_publish_deferred_frame(
     return TRUE;
 }
 
+#if VERDE_BROWSER_LINUX_WITH_FDO
 static enum verde_browser_linux_frame_export_result verde_browser_linux_export_egl_image(
     struct verde_browser_linux *browser,
     struct wpe_fdo_egl_exported_image *image,
@@ -1223,12 +1302,75 @@ static void verde_browser_linux_export_raw_egl_image(void *data, EGLImageKHR ima
     (void)image;
 }
 
+/* The GUI finished sampling a zero-copy frame: WebKit may reuse the buffer. */
+static void verde_browser_linux_release_held_image(void *user, void *held_image, int release_fence) {
+    struct verde_browser_linux *browser = user;
+    if (release_fence >= 0) close(release_fence); /* fdo: never forwarded */
+    if (browser == NULL || browser->exportable == NULL || held_image == NULL) return;
+    wpe_view_backend_exportable_fdo_egl_dispatch_release_exported_image(browser->exportable, held_image);
+    browser->metric_slot_releases += 1;
+}
+
+#endif
+
+static void verde_browser_linux_note_dmabuf_published(struct verde_browser_linux *browser, guint64 sequence, guint32 width, guint32 height, gint64 exported_at_us);
+
+#if VERDE_BROWSER_LINUX_WITH_FDO
+/* Sends the frame's dma-buf to the GUI instead of reading it back. FALSE = use readback. */
+static gboolean verde_browser_linux_export_dmabuf(struct verde_browser_linux *browser, struct wpe_fdo_egl_exported_image *image, gint64 exported_at_us) {
+    if (!vbf_socket_dmabuf_active(browser->frame_socket)) return FALSE;
+    const guint32 width = wpe_fdo_egl_exported_image_get_width(image);
+    const guint32 height = wpe_fdo_egl_exported_image_get_height(image);
+    if (width == 0 || height == 0) return FALSE;
+    const guint64 sequence = browser->frame_next_sequence + 1;
+    if (!vbf_socket_send_frame(browser->frame_socket, wpe_fdo_egl_exported_image_get_egl_image(image), image, width, height,
+            sequence, (uint64_t)MAX(exported_at_us, 0) * 1000u)) return FALSE;
+    verde_browser_linux_note_dmabuf_published(browser, sequence, width, height, exported_at_us);
+    return TRUE;
+}
+
+#endif
+
+static void verde_browser_linux_note_dmabuf_published(struct verde_browser_linux *browser, guint64 sequence, guint32 width, guint32 height, gint64 exported_at_us) {
+    browser->frame_next_sequence = sequence;
+    browser->dmabuf_frame_dirty = TRUE;
+    browser->dmabuf_frame_sequence = sequence;
+    browser->dmabuf_frame_width = (gint)width;
+    browser->dmabuf_frame_height = (gint)height;
+    browser->dmabuf_frame_exported_at_us = exported_at_us;
+    browser->dmabuf_frame_published_at_us = g_get_monotonic_time();
+    browser->last_frame_published_us = browser->dmabuf_frame_published_at_us;
+    browser->frame_published_at_us = browser->dmabuf_frame_published_at_us;
+    browser->metric_published_frames += 1;
+    browser->metric_dmabuf_frames += 1;
+}
+
+#if VERDE_BROWSER_LINUX_WITH_FDO
 static void verde_browser_linux_export_fdo_egl_image(void *data, struct wpe_fdo_egl_exported_image *image) {
     struct verde_browser_linux *browser = data;
     if (browser == NULL || image == NULL) return;
     const gint64 now_us = g_get_monotonic_time();
     verde_browser_linux_note_export(browser, now_us);
     const gint64 min_interval_us = verde_browser_linux_frame_min_interval_us(browser, now_us);
+    if (verde_browser_linux_export_dmabuf(browser, image, now_us)) {
+        /* Zero-copy: the image is held until the GUI's RELEASE; pacing is unchanged. */
+        verde_browser_linux_note_frame_production_lead(browser, browser->frame_published_at_us);
+        verde_browser_linux_schedule_frame_complete_at(browser, verde_browser_linux_completion_deadline_us(
+            browser->last_frame_published_us,
+            now_us,
+            min_interval_us,
+            browser->frame_production_lead_us
+        ));
+        browser->frame_import_failure_reported = FALSE;
+        if (verde_browser_linux_frame_log_enabled()) {
+            fprintf(stderr, "verde-browser-linux WPE frame seq=%" G_GUINT64_FORMAT " dmabuf size=%dx%d held=%u\n",
+                browser->dmabuf_frame_sequence, browser->dmabuf_frame_width, browser->dmabuf_frame_height,
+                vbf_socket_held_count(browser->frame_socket));
+            fflush(stderr);
+        }
+        verde_browser_linux_maybe_log_frame_metrics(browser, now_us);
+        return;
+    }
     // Pace the next frame through completion below, never discard this damage.
     // A static page may not export another frame after an automated mutation.
     const enum verde_browser_linux_frame_export_result result = verde_browser_linux_export_egl_image(browser, image, now_us);
@@ -1275,6 +1417,175 @@ static void verde_browser_linux_export_shm_buffer(void *data, struct wpe_fdo_shm
     wpe_view_backend_exportable_fdo_egl_dispatch_release_shm_exported_buffer(browser->exportable, buffer);
     const gint64 now_us = g_get_monotonic_time();
     verde_browser_linux_schedule_frame_complete_at(browser, now_us + verde_browser_linux_frame_min_interval_us(browser, now_us));
+}
+
+#endif
+
+/* ---- WPE Platform API frames ------------------------------------------------------------ */
+
+/* Copies a CPU frame (BGRA rows, any stride) into a shm slot, or retains it while every
+ * slot is held by the GUI. */
+static enum verde_browser_linux_frame_export_result verde_browser_linux_publish_pixels(
+    struct verde_browser_linux *browser,
+    const guint8 *pixels,
+    gsize stride,
+    guint32 width,
+    guint32 height,
+    gint64 exported_at_us
+) {
+    const size_t row = (size_t)width * 4u;
+    const size_t byte_len = row * (size_t)height;
+    if (pixels == NULL || width == 0 || height == 0 || stride < row || byte_len > VERDE_BROWSER_LINUX_FRAME_BYTES_MAX) return VERDE_BROWSER_LINUX_FRAME_EXPORT_FAILED;
+    const gint frame_slot = verde_browser_linux_acquire_frame_slot(browser, byte_len);
+    if (frame_slot < 0 && frame_slot != -2) return VERDE_BROWSER_LINUX_FRAME_EXPORT_FAILED;
+    unsigned char *bgra = frame_slot == -2 ? verde_browser_linux_prepare_deferred_frame(browser, byte_len) : browser->frame_slots[frame_slot];
+    if (bgra == NULL) return VERDE_BROWSER_LINUX_FRAME_EXPORT_FAILED;
+    if (stride == row) {
+        memcpy(bgra, pixels, byte_len);
+    } else {
+        for (guint32 y = 0; y < height; y += 1) memcpy(bgra + row * y, pixels + stride * y, row);
+    }
+    if (frame_slot == -2) {
+        verde_browser_linux_retain_deferred_frame(browser, width, height, byte_len, exported_at_us);
+        return VERDE_BROWSER_LINUX_FRAME_EXPORT_DEFERRED;
+    }
+    browser->deferred_frame_ready = FALSE;
+    verde_browser_linux_publish_frame_slot(browser, frame_slot, width, height, byte_len, exported_at_us);
+    return VERDE_BROWSER_LINUX_FRAME_EXPORT_OK;
+}
+
+/* The GUI finished with a WPEBufferDMABuf: its release fence goes to WebKit (explicit
+ * sync), which waits on it before writing the buffer again. */
+static void verde_browser_linux_release_platform_buffer(void *user, void *held, int release_fence) {
+    struct verde_browser_linux *browser = user;
+    WPEBuffer *buffer = held;
+    if (buffer == NULL) {
+        if (release_fence >= 0) close(release_fence);
+        return;
+    }
+    if (release_fence >= 0) wpe_buffer_set_release_fence(buffer, release_fence);
+    if (browser != NULL && browser->wpe_view != NULL) wpe_view_buffer_released(browser->wpe_view, buffer);
+    if (browser != NULL) browser->metric_slot_releases += 1;
+    g_object_unref(buffer);
+}
+
+static gboolean verde_browser_linux_send_platform_dmabuf(
+    struct verde_browser_linux *browser,
+    WPEBuffer *buffer,
+    const WPERectangle *damage,
+    guint n_damage,
+    gint64 exported_at_us
+) {
+    if (!WPE_IS_BUFFER_DMA_BUF(buffer) || !vbf_socket_dmabuf_active(browser->frame_socket)) return FALSE;
+    WPEBufferDMABuf *dmabuf = WPE_BUFFER_DMA_BUF(buffer);
+    struct vbf_dmabuf desc = {
+        .width = (uint32_t)wpe_buffer_get_width(buffer),
+        .height = (uint32_t)wpe_buffer_get_height(buffer),
+        .fourcc = wpe_buffer_dma_buf_get_format(dmabuf),
+        .plane_count = wpe_buffer_dma_buf_get_n_planes(dmabuf),
+        .modifier = wpe_buffer_dma_buf_get_modifier(dmabuf),
+    };
+    if (desc.width == 0 || desc.height == 0 || desc.plane_count == 0 || desc.plane_count > VBF_MAX_PLANES) return FALSE;
+    for (guint32 plane = 0; plane < desc.plane_count; plane += 1) {
+        desc.fds[plane] = wpe_buffer_dma_buf_get_fd(dmabuf, plane);
+        desc.offsets[plane] = wpe_buffer_dma_buf_get_offset(dmabuf, plane);
+        desc.strides[plane] = wpe_buffer_dma_buf_get_stride(dmabuf, plane);
+    }
+    struct vbf_rect rects[64];
+    const guint n_rects = MIN(n_damage, G_N_ELEMENTS(rects));
+    for (guint i = 0; i < n_rects; i += 1) rects[i] = (struct vbf_rect){ damage[i].x, damage[i].y, damage[i].width, damage[i].height };
+    /* More rects than we keep: treat as a full frame. */
+    const guint sent_rects = n_damage > G_N_ELEMENTS(rects) ? 0 : n_rects;
+    const int fence = browser->explicit_sync ? wpe_buffer_get_rendering_fence(buffer) : -1;
+    const guint64 sequence = browser->frame_next_sequence + 1;
+    if (!vbf_socket_send_dmabuf(browser->frame_socket, &desc, fence, rects, sent_rects, g_object_ref(buffer),
+            sequence, (uint64_t)MAX(exported_at_us, 0) * 1000u)) {
+        g_object_unref(buffer);
+        return FALSE;
+    }
+    verde_browser_linux_note_dmabuf_published(browser, sequence, desc.width, desc.height, exported_at_us);
+    return TRUE;
+}
+
+static gboolean verde_browser_linux_platform_render_buffer(void *user, WPEView *view, WPEBuffer *buffer, const WPERectangle *damage, guint n_damage) {
+    struct verde_browser_linux *browser = user;
+    (void)view;
+    if (browser == NULL || buffer == NULL) return FALSE;
+    const gint64 now_us = g_get_monotonic_time();
+    verde_browser_linux_note_export(browser, now_us);
+    /* WebKit waits for buffer_rendered before the next frame, so nothing should be pending. */
+    if (browser->rendered_pending != NULL) verde_browser_linux_dispatch_frame_complete(browser);
+    const guint32 width = (guint32)wpe_buffer_get_width(buffer);
+    const guint32 height = (guint32)wpe_buffer_get_height(buffer);
+    browser->metric_frame_pixels += (guint64)width * height;
+    if (n_damage > 0) {
+        browser->metric_damage_frames += 1;
+        browser->metric_damage_rects += n_damage;
+        for (guint i = 0; i < n_damage; i += 1) browser->metric_damage_pixels += (guint64)MAX(damage[i].width, 0) * (guint64)MAX(damage[i].height, 0);
+    } else {
+        browser->metric_damage_pixels += (guint64)width * height;
+    }
+
+    gboolean sent = verde_browser_linux_send_platform_dmabuf(browser, buffer, damage, n_damage, now_us);
+    enum verde_browser_linux_frame_export_result result = VERDE_BROWSER_LINUX_FRAME_EXPORT_OK;
+    if (!sent) {
+        if (WPE_IS_BUFFER_SHM(buffer)) {
+            /* CPU-rendered frame (no DRM device offered: the GUI chose shm). */
+            WPEBufferSHM *shm = WPE_BUFFER_SHM(buffer);
+            GBytes *bytes = wpe_buffer_shm_get_data(shm);
+            gsize size = 0;
+            const guint8 *pixels = bytes != NULL ? g_bytes_get_data(bytes, &size) : NULL;
+            const gsize stride = wpe_buffer_shm_get_stride(shm);
+            result = size >= stride * height && wpe_buffer_shm_get_format(shm) == WPE_PIXEL_FORMAT_ARGB8888
+                ? verde_browser_linux_publish_pixels(browser, pixels, stride, width, height, now_us)
+                : VERDE_BROWSER_LINUX_FRAME_EXPORT_FAILED;
+        } else {
+            /* A dma-buf the GUI cannot take (socket gone or format refused): slow readback. */
+            GError *error = NULL;
+            GBytes *bytes = wpe_buffer_import_to_pixels(buffer, &error);
+            if (bytes != NULL) {
+                gsize size = 0;
+                const guint8 *pixels = g_bytes_get_data(bytes, &size);
+                result = height > 0 && size >= (gsize)width * 4u * height
+                    ? verde_browser_linux_publish_pixels(browser, pixels, size / height, width, height, now_us)
+                    : VERDE_BROWSER_LINUX_FRAME_EXPORT_FAILED;
+                g_bytes_unref(bytes);
+            } else {
+                result = VERDE_BROWSER_LINUX_FRAME_EXPORT_FAILED;
+                g_clear_error(&error);
+            }
+        }
+    }
+    if (result == VERDE_BROWSER_LINUX_FRAME_EXPORT_OK) verde_browser_linux_note_frame_production_lead(browser, browser->frame_published_at_us);
+    if (result == VERDE_BROWSER_LINUX_FRAME_EXPORT_FAILED && !browser->frame_import_failure_reported) {
+        verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_FAILED, "Failed to publish WPE frame.");
+        browser->frame_import_failure_reported = TRUE;
+    } else if (result != VERDE_BROWSER_LINUX_FRAME_EXPORT_FAILED) {
+        browser->frame_import_failure_reported = FALSE;
+    }
+
+    browser->rendered_pending = g_object_ref(buffer);
+    browser->rendered_pending_release = !sent; /* copied out (or failed): WebKit may reuse it */
+    verde_browser_linux_schedule_frame_complete_at(browser, verde_browser_linux_completion_deadline_us(
+        browser->last_frame_published_us,
+        now_us,
+        verde_browser_linux_frame_min_interval_us(browser, now_us),
+        browser->frame_production_lead_us
+    ));
+    if (verde_browser_linux_frame_log_enabled()) {
+        fprintf(stderr, "verde-browser-linux WPE frame seq=%" G_GUINT64_FORMAT " %s size=%ux%u damage=%u",
+            browser->frame_next_sequence, sent ? "dmabuf" : (WPE_IS_BUFFER_SHM(buffer) ? "shm-cpu" : "readback"), width, height, n_damage);
+        for (guint i = 0; i < n_damage && i < 4; i += 1) fprintf(stderr, " [%d,%d %dx%d]", damage[i].x, damage[i].y, damage[i].width, damage[i].height);
+        fprintf(stderr, " held=%u\n", vbf_socket_held_count(browser->frame_socket));
+        fflush(stderr);
+    }
+    verde_browser_linux_maybe_log_frame_metrics(browser, now_us);
+    return TRUE;
+}
+
+static void verde_browser_linux_platform_buffers_changed(void *user, WPEView *view) {
+    (void)user;
+    (void)view;
 }
 
 static char *verde_browser_linux_value_to_json_or_string(JSCValue *value) {
@@ -1677,10 +1988,13 @@ static guint32 verde_browser_linux_key_code_to_hardware(unsigned int key_code) {
     return wpe_unicode_to_key_code(key_code);
 }
 
+#if VERDE_BROWSER_LINUX_WITH_FDO
 static void verde_browser_linux_destroy_exportable(gpointer user_data) {
     struct wpe_view_backend_exportable_fdo *exportable = user_data;
     if (exportable != NULL) wpe_view_backend_exportable_fdo_destroy(exportable);
 }
+
+#endif
 
 /* Every helper process opens the same Verde-owned data directory so browser
  * panes share one login state. WebKit's default session keeps cookies in
@@ -1790,28 +2104,64 @@ void verde_browser_linux_queue_cookies_imported(struct verde_browser_linux *brow
 }
 
 
-struct verde_browser_linux *verde_browser_linux_create(void) {
-    struct verde_browser_linux *browser = g_new0(struct verde_browser_linux, 1);
-    browser->events = g_queue_new();
-    browser->cursor_shape = g_strdup("default");
-    browser->target_width = 1280;
-    browser->target_height = 720;
-    browser->device_scale = 1.0;
-    browser->frame_ready_slot = -1;
-    browser->egl_display = EGL_NO_DISPLAY;
-    browser->egl_context = EGL_NO_CONTEXT;
-    browser->egl_surface = EGL_NO_SURFACE;
-    verde_browser_linux_map_frame_slots(browser);
+/* VERDE_BROWSER_LINUX_BACKEND=fdo selects the legacy wpebackend-fdo + EGL export path
+ * (kept as a fallback); the default is the WPE Platform API. */
+static gboolean verde_browser_linux_use_fdo_backend(void) {
+    const char *value = getenv("VERDE_BROWSER_LINUX_BACKEND");
+    return value != NULL && strcmp(value, "fdo") == 0;
+}
 
-    if (!wpe_loader_init("libWPEBackend-fdo-1.0.so")) {
-        verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_FAILED, "Failed to initialize WPEBackend-fdo.");
-        return browser;
+static gboolean verde_browser_linux_env_disabled(const char *name) {
+    const char *value = getenv(name);
+    return value != NULL && strcmp(value, "0") == 0;
+}
+
+static gboolean verde_browser_linux_init_platform(struct verde_browser_linux *browser) {
+    browser->frame_socket = vbf_socket_open_from_env(NULL, verde_browser_linux_release_platform_buffer, browser);
+    unsigned count = 0;
+    const struct vbf_format *formats = vbf_socket_dmabuf_active(browser->frame_socket) ? vbf_socket_formats(browser->frame_socket, &count) : NULL;
+    browser->explicit_sync = count > 0 && !verde_browser_linux_env_disabled("VERDE_BROWSER_LINUX_EXPLICIT_SYNC");
+    vbf_socket_forward_release_fences(browser->frame_socket, browser->explicit_sync);
+    const struct verde_wpe_sink sink = {
+        .render_buffer = verde_browser_linux_platform_render_buffer,
+        .buffers_changed = verde_browser_linux_platform_buffers_changed,
+        .user = browser,
+    };
+    GError *error = NULL;
+    browser->wpe_display = verde_wpe_display_new(formats, count, browser->explicit_sync, &sink, &error);
+    if (browser->wpe_display == NULL) {
+        char *message = g_strdup_printf("Failed to create the WPE platform display: %s", error != NULL ? error->message : "unknown error");
+        verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_FAILED, message);
+        g_free(message);
+        g_clear_error(&error);
+        return FALSE;
     }
+    const char *node = verde_wpe_display_render_node(browser->wpe_display);
+    if (node == NULL) browser->explicit_sync = FALSE;
+    fprintf(stderr, "verde-browser-linux: WPE Platform API backend, %s rendering%s%s, %s sync\n",
+        node != NULL ? "GPU (dma-buf)" : "CPU (shm)", node != NULL ? " on " : "", node != NULL ? node : "",
+        browser->explicit_sync ? "explicit" : "implicit");
+    fflush(stderr);
+    return TRUE;
+}
+
+static void verde_browser_linux_platform_apply_geometry(struct verde_browser_linux *browser) {
+    if (browser->wpe_view == NULL) return;
+    WPEToplevel *toplevel = wpe_view_get_toplevel(browser->wpe_view);
+    if (toplevel != NULL) {
+        wpe_toplevel_resized(toplevel, browser->target_width, browser->target_height);
+        wpe_toplevel_scale_changed(toplevel, browser->device_scale);
+    }
+    wpe_view_resized(browser->wpe_view, browser->target_width, browser->target_height);
+}
+
+#if VERDE_BROWSER_LINUX_WITH_FDO
+static gboolean verde_browser_linux_init_fdo(struct verde_browser_linux *browser) {
     if (!verde_browser_linux_init_egl(browser)) {
         verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_FAILED, "Failed to initialize WPE EGL rendering.");
-        return browser;
+        return FALSE;
     }
-
+    browser->frame_socket = vbf_socket_open_from_env(browser->egl_display, verde_browser_linux_release_held_image, browser);
     browser->export_client = (struct wpe_view_backend_exportable_fdo_egl_client){
         .export_egl_image = verde_browser_linux_export_raw_egl_image,
         .export_fdo_egl_image = verde_browser_linux_export_fdo_egl_image,
@@ -1820,13 +2170,49 @@ struct verde_browser_linux *verde_browser_linux_create(void) {
     browser->exportable = wpe_view_backend_exportable_fdo_egl_create(&browser->export_client, browser, browser->target_width, browser->target_height);
     if (browser->exportable == NULL) {
         verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_FAILED, "Failed to create WPE exportable backend.");
-        return browser;
+        return FALSE;
     }
     browser->view_backend = wpe_view_backend_exportable_fdo_get_view_backend(browser->exportable);
     wpe_view_backend_dispatch_set_size(browser->view_backend, browser->target_width, browser->target_height);
     wpe_view_backend_dispatch_set_device_scale_factor(browser->view_backend, (float)browser->device_scale);
     wpe_view_backend_set_target_refresh_rate(browser->view_backend, 60000);
     wpe_view_backend_add_activity_state(browser->view_backend, wpe_view_activity_state_visible | wpe_view_activity_state_in_window);
+
+    return TRUE;
+}
+
+#endif
+
+struct verde_browser_linux *verde_browser_linux_create(void) {
+    struct verde_browser_linux *browser = g_new0(struct verde_browser_linux, 1);
+    browser->events = g_queue_new();
+    browser->cursor_shape = g_strdup("default");
+    browser->target_width = 1280;
+    browser->target_height = 720;
+    browser->device_scale = 1.0;
+    browser->frame_ready_slot = -1;
+#if VERDE_BROWSER_LINUX_WITH_FDO
+    browser->egl_display = EGL_NO_DISPLAY;
+    browser->egl_context = EGL_NO_CONTEXT;
+    browser->egl_surface = EGL_NO_SURFACE;
+#endif
+    verde_browser_linux_map_frame_slots(browser);
+
+    const gboolean use_fdo = verde_browser_linux_use_fdo_backend();
+    if (!use_fdo) {
+        if (!verde_browser_linux_init_platform(browser)) return browser;
+    } else {
+#if VERDE_BROWSER_LINUX_WITH_FDO
+        if (!wpe_loader_init("libWPEBackend-fdo-1.0.so")) {
+            verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_FAILED, "Failed to initialize WPEBackend-fdo.");
+            return browser;
+        }
+        if (!verde_browser_linux_init_fdo(browser)) return browser;
+#else
+        verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_FAILED, "This helper was built without the fdo backend (-Dfdo=false).");
+        return browser;
+#endif
+    }
 
     WebKitSettings *settings = webkit_settings_new();
     webkit_settings_set_enable_developer_extras(settings, TRUE);
@@ -1839,15 +2225,38 @@ struct verde_browser_linux *verde_browser_linux_create(void) {
         fflush(stderr);
     }
 
-    browser->webkit_backend = webkit_web_view_backend_new(browser->view_backend, verde_browser_linux_destroy_exportable, browser->exportable);
-    browser->web_view = WEBKIT_WEB_VIEW(g_object_new(
-        WEBKIT_TYPE_WEB_VIEW,
-        "backend", browser->webkit_backend,
-        "web-context", verde_browser_linux_web_context(),
-        "network-session", verde_browser_linux_network_session(),
-        "settings", settings,
-        NULL
-    ));
+    if (!use_fdo && !verde_browser_linux_env_disabled("VERDE_BROWSER_LINUX_DAMAGE") &&
+        !verde_browser_linux_set_feature_enabled(settings, VERDE_BROWSER_LINUX_DAMAGE_FEATURE, TRUE)) {
+        fprintf(stderr, "verde-browser-linux WPE: failed to enable damage propagation; frames are sent whole\n");
+        fflush(stderr);
+    }
+
+#if VERDE_BROWSER_LINUX_WITH_FDO
+    if (use_fdo) {
+        browser->webkit_backend = webkit_web_view_backend_new(browser->view_backend, verde_browser_linux_destroy_exportable, browser->exportable);
+        browser->web_view = WEBKIT_WEB_VIEW(g_object_new(
+            WEBKIT_TYPE_WEB_VIEW,
+            "backend", browser->webkit_backend,
+            "web-context", verde_browser_linux_web_context(),
+            "network-session", verde_browser_linux_network_session(),
+            "settings", settings,
+            NULL
+        ));
+    } else
+#endif
+    {
+        browser->web_view = WEBKIT_WEB_VIEW(g_object_new(
+            WEBKIT_TYPE_WEB_VIEW,
+            "display", browser->wpe_display,
+            "web-context", verde_browser_linux_web_context(),
+            "network-session", verde_browser_linux_network_session(),
+            "settings", settings,
+            NULL
+        ));
+        browser->wpe_view = webkit_web_view_get_wpe_view(browser->web_view);
+        verde_browser_linux_platform_apply_geometry(browser);
+        wpe_view_map(browser->wpe_view);
+    }
     g_object_unref(settings);
     browser->content_manager = webkit_web_view_get_user_content_manager(browser->web_view);
     g_object_ref(browser->content_manager);
@@ -1961,6 +2370,8 @@ struct verde_browser_linux *verde_browser_linux_create(void) {
 
 void verde_browser_linux_destroy(struct verde_browser_linux *browser) {
     if (browser == NULL) return;
+    vbf_socket_close(browser->frame_socket);
+    browser->frame_socket = NULL;
     if (browser->frame_complete_timer_id != 0) {
         g_source_remove(browser->frame_complete_timer_id);
         browser->frame_complete_timer_id = 0;
@@ -1988,12 +2399,20 @@ void verde_browser_linux_destroy(struct verde_browser_linux *browser) {
             g_free(event);
         }
     }
+    if (browser->rendered_pending != NULL) {
+        if (browser->rendered_pending_release && browser->wpe_view != NULL) wpe_view_buffer_released(browser->wpe_view, browser->rendered_pending);
+        g_clear_object(&browser->rendered_pending);
+    }
+    browser->wpe_view = NULL; /* owned by the web view */
     if (browser->web_view != NULL) g_object_unref(browser->web_view);
     if (browser->webkit_backend != NULL) g_object_unref(browser->webkit_backend);
+    g_clear_object(&browser->wpe_display);
     g_free(browser->cursor_shape);
     g_free(browser->rgba_scratch);
     g_free(browser->deferred_bgra);
+#if VERDE_BROWSER_LINUX_WITH_FDO
     verde_browser_linux_deinit_egl(browser);
+#endif
     verde_browser_linux_unmap_frame_slots(browser);
     g_queue_free(browser->events);
     g_free(browser);
@@ -2012,14 +2431,19 @@ int verde_browser_linux_set_device_scale(struct verde_browser_linux *browser, do
     if (diff <= 0.001) return 1;
     browser->device_scale = scale;
     verde_browser_linux_mark_active(browser);
-    if (browser->view_backend != NULL) {
+    if (browser->wpe_view != NULL) {
+        /* Toplevel scale: WebKit renders scale x logical size buffers and reports it as
+         * devicePixelRatio; CSS px stay logical. */
+        WPEToplevel *toplevel = wpe_view_get_toplevel(browser->wpe_view);
+        if (toplevel != NULL) wpe_toplevel_scale_changed(toplevel, browser->device_scale);
+    } else if (browser->view_backend != NULL) {
         wpe_view_backend_dispatch_set_device_scale_factor(browser->view_backend, (float)browser->device_scale);
     }
     return 1;
 }
 
 int verde_browser_linux_show(struct verde_browser_linux *browser, int width, int height, const char *url) {
-    if (browser == NULL) return 0;
+    if (browser == NULL || browser->web_view == NULL) return 0; /* creation failed (reported) */
     verde_browser_linux_mark_active(browser);
     if (width > 0 && height > 0) {
         verde_browser_linux_set_bounds(browser, 0, 0, width, height);
@@ -2031,7 +2455,7 @@ int verde_browser_linux_show(struct verde_browser_linux *browser, int width, int
     browser->painting_paused = FALSE;
     if (!browser->visible) {
         browser->visible = TRUE;
-        wpe_view_backend_add_activity_state(browser->view_backend, wpe_view_activity_state_visible | wpe_view_activity_state_in_window);
+        verde_browser_linux_set_view_visible(browser, TRUE);
         verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_OPENED, NULL);
     }
     if (url != NULL || !browser->document_requested) {
@@ -2076,6 +2500,11 @@ struct verde_browser_linux_paint_ack {
     gint64 quiet_since_us;
 };
 
+/* Newest published frame over either transport (shm slot or dma-buf). */
+static guint64 verde_browser_linux_latest_sequence(struct verde_browser_linux *browser) {
+    return MAX(browser->frame_ready_sequence, browser->dmabuf_frame_sequence);
+}
+
 static gboolean verde_browser_linux_frame_in_flight(struct verde_browser_linux *browser) {
     return browser->deferred_frame_ready || browser->frame_complete_timer_id != 0;
 }
@@ -2084,14 +2513,14 @@ static gboolean verde_browser_linux_paint_ack_poll(gpointer user_data) {
     struct verde_browser_linux_paint_ack *ack = user_data;
     struct verde_browser_linux *browser = ack->browser;
     const gint64 now_us = g_get_monotonic_time();
-    if (verde_browser_linux_frame_in_flight(browser) || browser->frame_ready_sequence != ack->last_seen_sequence) {
-        ack->last_seen_sequence = browser->frame_ready_sequence;
+    if (verde_browser_linux_frame_in_flight(browser) || verde_browser_linux_latest_sequence(browser) != ack->last_seen_sequence) {
+        ack->last_seen_sequence = verde_browser_linux_latest_sequence(browser);
         ack->quiet_since_us = now_us;
         return G_SOURCE_CONTINUE;
     }
     if (now_us - ack->quiet_since_us < VERDE_BROWSER_LINUX_PAINT_ACK_QUIET_US) return G_SOURCE_CONTINUE;
     char payload[64];
-    g_snprintf(payload, sizeof payload, "%" G_GUINT64_FORMAT ":%" G_GUINT64_FORMAT, ack->token, (guint64)browser->frame_ready_sequence);
+    g_snprintf(payload, sizeof payload, "%" G_GUINT64_FORMAT ":%" G_GUINT64_FORMAT, ack->token, (guint64)verde_browser_linux_latest_sequence(browser));
     verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_PAINT_ACK, payload);
     browser->paint_ack_source_id = 0;
     return G_SOURCE_REMOVE;
@@ -2111,7 +2540,7 @@ static void verde_browser_linux_on_paint_ack_script(GObject *object, GAsyncResul
         return;
     }
     ack->browser->paint_ack_pending = NULL;
-    ack->last_seen_sequence = ack->browser->frame_ready_sequence;
+    ack->last_seen_sequence = verde_browser_linux_latest_sequence(ack->browser);
     ack->quiet_since_us = g_get_monotonic_time();
     ack->browser->paint_ack_source_id = g_timeout_add_full(G_PRIORITY_DEFAULT, VERDE_BROWSER_LINUX_PAINT_ACK_POLL_MS, verde_browser_linux_paint_ack_poll, ack, g_free);
 }
@@ -2143,7 +2572,8 @@ int verde_browser_linux_set_bounds(struct verde_browser_linux *browser, int x, i
     verde_browser_linux_mark_active(browser);
     browser->target_width = width;
     browser->target_height = height;
-    wpe_view_backend_dispatch_set_size(browser->view_backend, (uint32_t)width, (uint32_t)height);
+    if (browser->wpe_view != NULL) verde_browser_linux_platform_apply_geometry(browser);
+    else if (browser->view_backend != NULL) wpe_view_backend_dispatch_set_size(browser->view_backend, (uint32_t)width, (uint32_t)height);
     return 1;
 }
 
@@ -2204,13 +2634,15 @@ int verde_browser_linux_reload(struct verde_browser_linux *browser) {
 int verde_browser_linux_focus(struct verde_browser_linux *browser) {
     if (browser == NULL) return 0;
     verde_browser_linux_mark_active(browser);
-    wpe_view_backend_add_activity_state(browser->view_backend, wpe_view_activity_state_focused);
+    if (browser->wpe_view != NULL) wpe_view_focus_in(browser->wpe_view);
+    else if (browser->view_backend != NULL) wpe_view_backend_add_activity_state(browser->view_backend, wpe_view_activity_state_focused);
     return 1;
 }
 
 int verde_browser_linux_blur(struct verde_browser_linux *browser) {
     if (browser == NULL) return 0;
-    wpe_view_backend_remove_activity_state(browser->view_backend, wpe_view_activity_state_focused);
+    if (browser->wpe_view != NULL) wpe_view_focus_out(browser->wpe_view);
+    else if (browser->view_backend != NULL) wpe_view_backend_remove_activity_state(browser->view_backend, wpe_view_activity_state_focused);
     return 1;
 }
 
@@ -2268,7 +2700,21 @@ int verde_browser_linux_poll_frame(
     while (g_main_context_pending(NULL)) {
         g_main_context_iteration(NULL, FALSE);
     }
-    if (!browser->frame_dirty || browser->frame_ready_slot < 0) return 0;
+    const gboolean shm_ready = browser->frame_dirty && browser->frame_ready_slot >= 0;
+    if (browser->dmabuf_frame_dirty && (!shm_ready || browser->dmabuf_frame_sequence < browser->frame_ready_sequence)) {
+        /* Zero-copy frame: pixels and fds went over the frame socket (same sequence). */
+        *path = NULL;
+        *sequence = browser->dmabuf_frame_sequence;
+        *slot = VBF_DMABUF_FRAME_SLOT;
+        *width = browser->dmabuf_frame_width;
+        *height = browser->dmabuf_frame_height;
+        *byte_len = 0;
+        *exported_at_ns = (uint64_t)MAX(browser->dmabuf_frame_exported_at_us, 0) * 1000u;
+        *published_at_ns = (uint64_t)MAX(browser->dmabuf_frame_published_at_us, 0) * 1000u;
+        browser->dmabuf_frame_dirty = FALSE;
+        return 1;
+    }
+    if (!shm_ready) return 0;
     *path = NULL;
     *sequence = (uint64_t)browser->frame_ready_sequence;
     *slot = browser->frame_ready_slot;
@@ -2319,14 +2765,109 @@ int verde_browser_linux_test_deferred_frame_publishes_on_release(void) {
         memcmp(slot_pixels, deferred_pixels, sizeof(slot_pixels)) == 0;
 }
 
+/* ---- WPE Platform API input. Coordinates are logical (CSS) pixels of the view, the
+ * same space as resize/show sizes; WebKit maps them to device pixels with the toplevel
+ * scale. */
+
+static WPEModifiers verde_browser_linux_platform_modifiers(struct verde_browser_linux *browser, unsigned int modifiers) {
+    guint mask = 0;
+    if ((modifiers & VERDE_BROWSER_LINUX_MOD_CTRL) != 0) mask |= WPE_MODIFIER_KEYBOARD_CONTROL;
+    if ((modifiers & VERDE_BROWSER_LINUX_MOD_SHIFT) != 0) mask |= WPE_MODIFIER_KEYBOARD_SHIFT;
+    if ((modifiers & VERDE_BROWSER_LINUX_MOD_ALT) != 0) mask |= WPE_MODIFIER_KEYBOARD_ALT;
+    if ((modifiers & VERDE_BROWSER_LINUX_MOD_SUPER) != 0) mask |= WPE_MODIFIER_KEYBOARD_META;
+    /* pointer_modifiers holds WPE platform button bits on this backend. */
+    return (WPEModifiers)(mask | browser->pointer_modifiers);
+}
+
+static guint verde_browser_linux_platform_button_modifier(guint button) {
+    switch (button) {
+    case WPE_BUTTON_PRIMARY: return WPE_MODIFIER_POINTER_BUTTON1;
+    case WPE_BUTTON_MIDDLE: return WPE_MODIFIER_POINTER_BUTTON2;
+    case WPE_BUTTON_SECONDARY: return WPE_MODIFIER_POINTER_BUTTON3;
+    case 4: return WPE_MODIFIER_POINTER_BUTTON4;
+    case 5: return WPE_MODIFIER_POINTER_BUTTON5;
+    default: return 0;
+    }
+}
+
+static void verde_browser_linux_platform_dispatch(struct verde_browser_linux *browser, WPEEvent *event) {
+    if (event == NULL) return;
+    wpe_view_event(browser->wpe_view, event);
+    wpe_event_unref(event);
+}
+
+static void verde_browser_linux_platform_mouse_move(struct verde_browser_linux *browser, double x, double y, unsigned int modifiers) {
+    const double dx = x - browser->pointer_x;
+    const double dy = y - browser->pointer_y;
+    browser->pointer_x = x;
+    browser->pointer_y = y;
+    verde_browser_linux_platform_dispatch(browser, wpe_event_pointer_move_new(WPE_EVENT_POINTER_MOVE, browser->wpe_view, WPE_INPUT_SOURCE_MOUSE,
+        verde_browser_linux_now_ms(), verde_browser_linux_platform_modifiers(browser, modifiers), x, y, dx, dy));
+}
+
+static void verde_browser_linux_platform_mouse_button(struct verde_browser_linux *browser, double x, double y, unsigned int button, int down, unsigned int modifiers) {
+    /* Protocol buttons follow X11 (1 left, 2 middle, 3 right) like WPE_BUTTON_*; only
+     * libwpe swaps 2 and 3 (protocol_to_wpe_button). */
+    const guint wpe_button = button;
+    const guint32 time = verde_browser_linux_now_ms();
+    const guint button_modifier = verde_browser_linux_platform_button_modifier(wpe_button);
+    browser->pointer_x = x;
+    browser->pointer_y = y;
+    guint press_count = 0; /* only DOWN events carry a press count */
+    if (down != 0) {
+        press_count = wpe_view_compute_press_count(browser->wpe_view, x, y, wpe_button, time);
+        browser->pointer_modifiers |= button_modifier;
+    } else {
+        browser->pointer_modifiers &= ~button_modifier;
+    }
+    verde_browser_linux_platform_dispatch(browser, wpe_event_pointer_button_new(down != 0 ? WPE_EVENT_POINTER_DOWN : WPE_EVENT_POINTER_UP,
+        browser->wpe_view, WPE_INPUT_SOURCE_MOUSE, time, verde_browser_linux_platform_modifiers(browser, modifiers), wpe_button, x, y, press_count));
+}
+
+static void verde_browser_linux_platform_mouse_wheel(struct verde_browser_linux *browser, double x, double y, double delta_x, double delta_y, double wheel_multiplier, unsigned int modifiers) {
+    /* Same distance as the fdo path: integral (notch) deltas move 40 px per notch, fractional
+     * (touchpad) deltas 96 px per unit, both times the user's multiplier. Positive protocol
+     * deltas scroll up/left, as with the libwpe axis events. WebKit multiplies precise
+     * scroll deltas by 2.5 (VERDE_BROWSER_LINUX_PRECISE_SCROLL_MULTIPLIER, as in WebKitGTK);
+     * divide it out so both backends scroll the same distance. */
+    const enum wpe_input_axis_event_type source_type = verde_browser_linux_wheel_event_type(delta_x, delta_y);
+    const double delta_scale = verde_browser_linux_wheel_delta_scale(source_type, wheel_multiplier) / VERDE_BROWSER_LINUX_PRECISE_SCROLL_MULTIPLIER;
+    verde_browser_linux_platform_dispatch(browser, wpe_event_scroll_new(browser->wpe_view, WPE_INPUT_SOURCE_MOUSE, verde_browser_linux_now_ms(),
+        verde_browser_linux_platform_modifiers(browser, modifiers), delta_x * delta_scale, delta_y * delta_scale, TRUE, FALSE, x, y));
+}
+
+static void verde_browser_linux_platform_key(struct verde_browser_linux *browser, unsigned int key_code, int down, unsigned int modifiers) {
+    /* Protocol key codes are X keysyms (>= 0xff00) or Unicode code points. */
+    const guint keyval = key_code >= 0xff00u ? key_code : wpe_unicode_to_keyval(key_code);
+    guint keycode = 0;
+    WPEKeymap *keymap = wpe_display_get_keymap(browser->wpe_display);
+    WPEKeymapEntry *entries = NULL;
+    guint n_entries = 0;
+    if (keymap != NULL && wpe_keymap_get_entries_for_keyval(keymap, keyval, &entries, &n_entries) && n_entries > 0) keycode = entries[0].keycode;
+    g_free(entries);
+    verde_browser_linux_platform_dispatch(browser, wpe_event_keyboard_new(down != 0 ? WPE_EVENT_KEYBOARD_KEY_DOWN : WPE_EVENT_KEYBOARD_KEY_UP,
+        browser->wpe_view, WPE_INPUT_SOURCE_KEYBOARD, verde_browser_linux_now_ms(), verde_browser_linux_platform_modifiers(browser, modifiers), keycode, keyval));
+}
+
+/* Input arrives in logical px. libwpe (fdo) pointer events are in device px (WebKit divides
+ * them by the device scale factor); WPE Platform events are logical. */
+static int verde_browser_linux_fdo_coord(const struct verde_browser_linux *browser, double v) {
+    return (int)(v * browser->device_scale + 0.5);
+}
+
 int verde_browser_linux_mouse_move(struct verde_browser_linux *browser, double x, double y, unsigned int modifiers) {
     if (browser == NULL) return 0;
     verde_browser_linux_mark_active(browser);
+    if (browser->wpe_view != NULL) {
+        verde_browser_linux_platform_mouse_move(browser, x, y, modifiers);
+        return 1;
+    }
+    if (browser->view_backend == NULL) return 0;
     struct wpe_input_pointer_event event = {
         .type = wpe_input_pointer_event_type_motion,
         .time = verde_browser_linux_now_ms(),
-        .x = (int)x,
-        .y = (int)y,
+        .x = verde_browser_linux_fdo_coord(browser, x),
+        .y = verde_browser_linux_fdo_coord(browser, y),
         .button = 0,
         .state = 0,
         .modifiers = verde_browser_linux_encode_modifiers(modifiers) | browser->pointer_modifiers,
@@ -2338,6 +2879,11 @@ int verde_browser_linux_mouse_move(struct verde_browser_linux *browser, double x
 int verde_browser_linux_mouse_button(struct verde_browser_linux *browser, double x, double y, unsigned int button, int down, unsigned int modifiers) {
     if (browser == NULL || button == 0) return 0;
     verde_browser_linux_mark_active(browser);
+    if (browser->wpe_view != NULL) {
+        verde_browser_linux_platform_mouse_button(browser, x, y, button, down, modifiers);
+        return 1;
+    }
+    if (browser->view_backend == NULL) return 0;
     const unsigned int wpe_button = verde_browser_linux_protocol_to_wpe_button(button);
     const guint32 button_modifier = verde_browser_linux_pointer_button_modifier(wpe_button);
     if (down != 0) browser->pointer_modifiers |= button_modifier;
@@ -2345,8 +2891,8 @@ int verde_browser_linux_mouse_button(struct verde_browser_linux *browser, double
     struct wpe_input_pointer_event event = {
         .type = wpe_input_pointer_event_type_button,
         .time = verde_browser_linux_now_ms(),
-        .x = (int)x,
-        .y = (int)y,
+        .x = verde_browser_linux_fdo_coord(browser, x),
+        .y = verde_browser_linux_fdo_coord(browser, y),
         .button = wpe_button,
         .state = down != 0 ? 1u : 0u,
         .modifiers = verde_browser_linux_encode_modifiers(modifiers) | browser->pointer_modifiers,
@@ -2358,6 +2904,11 @@ int verde_browser_linux_mouse_button(struct verde_browser_linux *browser, double
 int verde_browser_linux_mouse_wheel(struct verde_browser_linux *browser, double x, double y, double delta_x, double delta_y, double wheel_multiplier, unsigned int modifiers) {
     if (browser == NULL) return 0;
     verde_browser_linux_mark_active(browser);
+    if (browser->wpe_view != NULL) {
+        verde_browser_linux_platform_mouse_wheel(browser, x, y, delta_x, delta_y, wheel_multiplier, modifiers);
+        return 1;
+    }
+    if (browser->view_backend == NULL) return 0;
     const enum wpe_input_axis_event_type source_type = verde_browser_linux_wheel_event_type(delta_x, delta_y);
     const double delta_scale = verde_browser_linux_wheel_delta_scale(source_type, wheel_multiplier);
     // Smooth 2D events preserve their magnitude in WebKit. Legacy discrete
@@ -2366,14 +2917,15 @@ int verde_browser_linux_mouse_wheel(struct verde_browser_linux *browser, double 
         .base = {
             .type = verde_browser_linux_wheel_dispatch_type(),
             .time = verde_browser_linux_now_ms(),
-            .x = (int)x,
-            .y = (int)y,
+            .x = verde_browser_linux_fdo_coord(browser, x),
+            .y = verde_browser_linux_fdo_coord(browser, y),
             .axis = 0,
             .value = 0,
             .modifiers = verde_browser_linux_encode_modifiers(modifiers) | browser->pointer_modifiers,
         },
-        .x_axis = delta_x * delta_scale,
-        .y_axis = delta_y * delta_scale,
+        /* Device px too: a notch scrolls the same CSS distance at every scale. */
+        .x_axis = delta_x * delta_scale * browser->device_scale,
+        .y_axis = delta_y * delta_scale * browser->device_scale,
     };
     wpe_view_backend_dispatch_axis_event(browser->view_backend, &event.base);
     return 1;
@@ -2382,6 +2934,11 @@ int verde_browser_linux_mouse_wheel(struct verde_browser_linux *browser, double 
 int verde_browser_linux_key_input(struct verde_browser_linux *browser, unsigned int key_code, int down, unsigned int modifiers) {
     if (browser == NULL || key_code == 0) return 0;
     verde_browser_linux_mark_active(browser);
+    if (browser->wpe_view != NULL) {
+        verde_browser_linux_platform_key(browser, key_code, down, modifiers);
+        return 1;
+    }
+    if (browser->view_backend == NULL) return 0;
     struct wpe_input_keyboard_event event = {
         .time = verde_browser_linux_now_ms(),
         .key_code = key_code,
