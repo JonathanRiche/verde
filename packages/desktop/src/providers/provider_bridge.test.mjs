@@ -43,6 +43,33 @@ for (const status of ['completed', 'failed', 'stopped']) {
   });
 }
 
+for (const launch of ['structured', 'text']) {
+  test(`default-backgrounded agent keeps input open and accepts steering (${launch} launch result)`, { timeout: 2000 }, async () => {
+    const { context, events } = bridge();
+    await context.handleClaudeSendPrompt({ async *query({ prompt }) {
+      const input = prompt[Symbol.asyncIterator]();
+      await input.next();
+      // Claude Code backgrounds agents without an explicit run_in_background.
+      yield tool('Agent', { description: 'Zero-copy frames' });
+      yield {
+        type: 'user',
+        message: { content: [{ type: 'tool_result', tool_use_id: 'agent', content: launch === 'text' ? 'Async agent launched successfully.\nagentId: a1' : 'ok' }] },
+        ...(launch === 'structured' ? { tool_use_result: { status: 'async_launched', agentId: 'a1' } } : {}),
+      };
+      yield turn;
+      await new Promise(setImmediate);
+      assert.equal(events.filter(e => e.kind === 'subagent' && e.status !== 'in_progress').length, 0, 'launch ack is not completion');
+      context.handleInputLine(JSON.stringify({ type: 'steer_prompt', request_id: 7, prompt: 'still going?' }));
+      assert.equal(events.find(e => e.type === 'steer_response')?.accepted, true);
+      await input.next();
+      yield { type: 'system', subtype: 'task_notification', tool_use_id: 'agent', status: 'completed', summary: 'done' };
+      yield turn;
+      assert.equal((await input.next()).done, true);
+    } }, { prompt: 'test' });
+    assert.equal(events.find(e => e.kind === 'subagent' && e.status !== 'in_progress').status, 'completed');
+  });
+}
+
 for (const background of [false, true]) {
   test(`agent launch failure closes input (background=${background})`, { timeout: 2000 }, async () => {
     const { context } = bridge();

@@ -672,6 +672,14 @@ function scheduleBackgroundTask(query, toolUseId, command, backgroundState, alre
   backgroundState.pendingBackgrounds.push(task);
 }
 
+// The SDK attaches the structured Agent tool result to the user message; the
+// text prefix covers payloads that arrive without it.
+function claudeSubagentLaunchedAsync(message, resultText) {
+  const status = message?.tool_use_result?.status;
+  if (status === "async_launched" || status === "remote_launched") return true;
+  return typeof resultText === "string" && resultText.trimStart().startsWith("Async agent launched");
+}
+
 function emitClaudeToolEvents(message, commandByToolUseId, mcpByToolUseId, subagentByToolUseId, query, backgroundState) {
   const content = message?.message?.content ?? message?.content;
   if (!Array.isArray(content)) return;
@@ -743,6 +751,9 @@ function emitClaudeToolEvents(message, commandByToolUseId, mcpByToolUseId, subag
         const result = claudeToolResultText(item);
         const failed = item.is_error === true;
         // An async launch acknowledgement is not the agent's completion.
+        // Claude Code backgrounds agents by default, so the launch result,
+        // not an explicit run_in_background input, is the reliable signal.
+        if (!failed && claudeSubagentLaunchedAsync(message, result)) backgroundState.trackedToolUseIds.add(item.tool_use_id);
         if (!failed && backgroundState.trackedToolUseIds.has(item.tool_use_id)) continue;
         backgroundState.trackedToolUseIds.delete(item.tool_use_id);
         write({
