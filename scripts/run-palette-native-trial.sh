@@ -8,8 +8,8 @@
 #   (~/.local/share/verde-palette-trial), so the data dir, daemon socket, live
 #   endpoint and browser profile are separate from the real ones.
 # - By default the app id is palette-test-verde, which Hyprland sends to the hidden
-#   PALETTE-TEST output (workspace 5). The script refuses to start that way unless
-#   workspace 5 is on PALETTE-TEST. --visible uses the normal-looking app id
+#   PALETTE-TEST output (workspace 99). The script refuses to start that way unless
+#   workspace 99 is on PALETTE-TEST. --visible uses the normal-looking app id
 #   verde-palette-trial instead, and the window opens like any other.
 # - Ctrl-C (or the app quitting) stops every process started under the trial root.
 set -euo pipefail
@@ -47,9 +47,9 @@ if [[ $visible == 1 ]]; then
 else
   app_id=palette-test-verde
   if command -v hyprctl >/dev/null; then
-    ws_monitor="$(hyprctl workspaces -j | python3 -c 'import json,sys; print(next((w["monitor"] for w in json.load(sys.stdin) if w["name"]=="5"), ""))')"
-    if [[ -n "$ws_monitor" && "$ws_monitor" != "PALETTE-TEST" ]]; then
-      echo "refusing: workspace 5 is on $ws_monitor, not PALETTE-TEST; use --visible" >&2
+    ws_monitor="$(hyprctl workspaces -j | python3 -c 'import json,sys; print(next((w["monitor"] for w in json.load(sys.stdin) if w["name"]=="99"), ""))')"
+    if [[ "$ws_monitor" != "PALETTE-TEST" ]]; then
+      echo "refusing: workspace 99 is not on PALETTE-TEST (got '${ws_monitor:-none}'); use --visible" >&2
       exit 1
     fi
   fi
@@ -98,4 +98,27 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-"${trial_env[@]}" "$bin" app
+"${trial_env[@]}" "$bin" app &
+app_pid=$!
+
+if [[ $visible == 0 ]] && command -v hyprctl >/dev/null; then
+  # The window must land on workspace 99 without focus; otherwise stop at once.
+  placement=NOWINDOW
+  for _ in $(seq 1 40); do
+    placement="$(hyprctl clients -j | python3 -c '
+import json,sys
+cs=[c for c in json.load(sys.stdin) if c["class"]==sys.argv[1]]
+if not cs: print("NOWINDOW")
+else: print("OK" if all(c["workspace"]["name"]=="99" and c["focusHistoryID"]!=0 for c in cs) else "BAD")' "$app_id")"
+    [[ $placement != NOWINDOW ]] && break
+    kill -0 "$app_pid" 2>/dev/null || break
+    sleep 0.25
+  done
+  if [[ $placement != OK ]]; then
+    echo "window placement check failed ($placement); stopping the trial" >&2
+    exit 1
+  fi
+  echo "window is on hidden workspace 99, unfocused"
+fi
+
+wait "$app_pid"

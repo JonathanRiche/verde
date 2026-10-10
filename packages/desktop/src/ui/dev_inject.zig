@@ -8,7 +8,8 @@
 //! Coordinates are framebuffer pixels (as in offscreen snapshots). Lines:
 //!   key [ctrl+][shift+][alt+][super+]<keycode>   press and release
 //!   down|up <keycode>                            single key edge (mods from held keys)
-//!   text <utf8...>                               committed text
+//!   text <utf8...>                               committed text only
+//!   type <utf8...>                               per character: key down, text, key up
 //!   edit <cursor> <utf8...>                      pre-edit (empty text clears)
 //!   move <x> <y>
 //!   press|release <x> <y> [button] [clicks]
@@ -99,6 +100,21 @@ fn runLine(line: []const u8, sink: Sink) bool {
     const w = sink.window;
     if (eql(verb, "text")) {
         return sink.send(.{ .text_input = .{ .window = w, .text = rest } });
+    } else if (eql(verb, "type")) {
+        var it = (std.unicode.Utf8View.init(rest) catch return true).iterator();
+        while (it.nextCodepointSlice()) |slice| {
+            const typed = typedKey(slice);
+            if (typed.key != .unknown) {
+                if (!sink.send(.{ .key_down = keyEvent(w, typed.key, .{ .shift = typed.shift }) })) return false;
+            }
+            if (!sink.send(.{ .text_input = .{ .window = w, .text = slice } })) return false;
+            if (typed.key != .unknown) {
+                var up = keyEvent(w, typed.key, .{ .shift = typed.shift });
+                up.down = false;
+                if (!sink.send(.{ .key_up = up })) return false;
+            }
+        }
+        return true;
     } else if (eql(verb, "edit")) {
         const cursor_end = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
         const cursor = std.fmt.parseInt(i32, rest[0..cursor_end], 10) catch -1;
@@ -198,6 +214,19 @@ fn keyEvent(w: palette.event.WindowId, key: Keycode, mods: Mods) palette.event.K
         .mod_keys = .{ .lctrl = mods.ctrl, .lshift = mods.shift, .lalt = mods.alt, .lgui = mods.super },
         .down = true,
     };
+}
+
+const shifted_symbols = "~!@#$%^&*()_+{}|:\"<>?";
+const unshifted_symbols = "`1234567890-=[]\\;',./";
+
+/// US-layout key for a typed character (unknown for non-ASCII).
+fn typedKey(slice: []const u8) struct { key: Keycode, shift: bool } {
+    if (slice.len != 1) return .{ .key = .unknown, .shift = false };
+    const ch = slice[0];
+    if (ch >= 'A' and ch <= 'Z') return .{ .key = Keycode.fromAscii(ch), .shift = true };
+    if (std.mem.indexOfScalar(u8, shifted_symbols, ch)) |i| return .{ .key = Keycode.fromAscii(unshifted_symbols[i]), .shift = true };
+    const key = Keycode.fromAscii(ch);
+    return .{ .key = if (key == .character) .unknown else key, .shift = false };
 }
 
 fn keycode(name: []const u8) Keycode {
