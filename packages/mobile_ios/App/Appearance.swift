@@ -2,15 +2,36 @@ import SwiftUI
 import Observation
 
 enum AppearanceMode: String, CaseIterable {
-    case system, light, dark = "verde", host
+    case system, light, dark = "verde"
+    case tokyoNight = "tokyo-night", catppuccin, catppuccinLatte = "catppuccin-latte"
+    case gruvbox, kanagawa, matteBlack = "matte-black", osakaJade = "osaka-jade", ristretto
+    case host
+    var preset: BundledTheme? { BundledTheme.all.first { $0.id == rawValue } }
     var label: String {
         switch self {
         case .system: return "System"
         case .light: return "Light"
         case .dark: return "Dark"
         case .host: return "Host theme"
+        default: return preset?.name ?? rawValue
         }
     }
+}
+struct BundledTheme: Decodable {
+    let id: String
+    let name: String
+    let colors: [String: String]
+    var palette: HostPalette { HostPalette(colors: colors) }
+    // Presets ship offline with both apps from the same website-derived asset.
+    static let all: [BundledTheme] = {
+        guard let url = Bundle.main.url(forResource: "themes", withExtension: "json"),
+              let data = try? Data(contentsOf: url),
+              let themes = try? JSONDecoder().decode([BundledTheme].self, from: data) else {
+            assertionFailure("Bundled themes are missing or invalid")
+            return []
+        }
+        return themes
+    }()
 }
 struct HostPalette: Decodable {
     let colors: [String: String]
@@ -47,9 +68,10 @@ struct HostPalette: Decodable {
         case .system: return nil
         case .light: return .light
         case .dark: return .dark
-        case .host: return palette?.dark == false ? .light : .dark
+        default: return activePalette?.dark == false ? .light : .dark
         }
     }
+    var activePalette: HostPalette? { mode == .host ? palette : mode.preset?.palette }
     var reducedMotion: Bool { mode == .host && palette?.reduced_motion == true }
     @MainActor func refresh(_ browse: BrowseModel) async {
         let stamp = UUID(); revision = stamp; notice = nil
@@ -73,7 +95,11 @@ struct HostPalette: Decodable {
         }
     }
     func color(_ key: String, fallback: UInt32, light: UInt32? = nil) -> Color {
-        if mode == .host, let value = palette?.color(key) { return value }
+        if let palette = activePalette {
+            if let value = palette.color(key) { return value }
+            let role = ["heading1": "warning", "heading2": "warning", "heading3": "accent"][key]
+            if let role, let value = palette.color(role) { return value }
+        }
         if mode == .light, let light { return Color(hex: light) }
         if mode == .system, let light {
             return Color(uiColor: UIColor { traits in UIColor(Color(hex: traits.userInterfaceStyle == .dark ? fallback : light)) })
@@ -92,7 +118,11 @@ struct AppSettings: View {
         NavigationStack {
             Form {
                 Section("Appearance") {
-                    Picker("Theme", selection: $appearance.mode) { ForEach(AppearanceMode.allCases, id: \.self) { Text($0.label).tag($0) } }
+                    Picker("Theme", selection: $appearance.mode) {
+                        ForEach(AppearanceMode.allCases, id: \.self) { mode in
+                            Text(mode.label).tag(mode)
+                        }
+                    }.pickerStyle(.navigationLink)
                     Text("System follows your phone’s Light or Dark appearance automatically.").font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted)
                     if appearance.mode == .host {
                         Button("Reload host theme") { Task { await appearance.refresh(browse) } }

@@ -4,6 +4,10 @@ The SwiftUI app links the shared client core. See [AGENTS.md](AGENTS.md),
 [the mobile task plan](../../docs/mobile-app-tasks.md), and
 [the core iOS toolchain](../client_core/docs/ios-toolchain.md).
 
+Settings → Appearance offers System, Light, Dark, eight [website presets](../../assets/mobile/README.md),
+and the existing Host theme. The choice is saved on the phone; System follows
+the phone’s appearance automatically.
+
 ## Simulator verification
 
 Run from the repository root on the Mac:

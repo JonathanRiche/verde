@@ -119,7 +119,16 @@ private struct InlineStyle {
 private typealias SwiftUIKeys = AttributeScopes.SwiftUIAttributes
 private typealias FoundationKeys = AttributeScopes.FoundationAttributes
 
-let inlineCodeBackground = VerdeTheme.alternate
+var inlineCodeBackground: Color { VerdeTheme.alternate }
+
+/// Cached markdown keeps its content and links while code adopts the current palette.
+func themedInline(_ source: AttributedString, background: Color) -> AttributedString {
+    var result = source
+    for run in source.runs where run[SwiftUIKeys.BackgroundColorAttribute.self] != nil {
+        result[run.range][SwiftUIKeys.BackgroundColorAttribute.self] = background
+    }
+    return result
+}
 
 private func inline(_ nodes: [MarkdownNode]) -> AttributedString {
     var out = AttributedString()
@@ -319,9 +328,9 @@ private struct MdBlockView: View {
     var body: some View {
         switch block {
         case .paragraph(let text):
-            Text(text) .font(VerdeTheme.ui(15)).frame(maxWidth: .infinity, alignment: .leading)
+            Text(themedInline(text, background: VerdeTheme.alternate)) .font(VerdeTheme.ui(15)).frame(maxWidth: .infinity, alignment: .leading)
         case .heading(let level, let text):
-            Text(text).font(VerdeTheme.ui(level == 1 ? 24 : level == 2 ? 20 : 17, bold: true)).foregroundStyle(level == 1 ? VerdeTheme.heading1 : level == 2 ? VerdeTheme.heading2 : VerdeTheme.heading3)
+            Text(themedInline(text, background: VerdeTheme.alternate)).font(VerdeTheme.ui(level == 1 ? 24 : level == 2 ? 20 : 17, bold: true)).foregroundStyle(level == 1 ? VerdeTheme.heading1 : level == 2 ? VerdeTheme.heading2 : VerdeTheme.heading3)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .accessibilityAddTraits(.isHeader)
         case .bullets(let ordered, let items):
@@ -349,7 +358,7 @@ private struct MdBlockView: View {
                     ForEach(Array(rows.enumerated()), id: \.offset) { index, row in
                         HStack(alignment: .top, spacing: 0) {
                             ForEach(Array(row.enumerated()), id: \.offset) { _, cell in
-                                Text(cell).font(index == 0 ? .subheadline.weight(.semibold) : .footnote)
+                                Text(themedInline(cell, background: VerdeTheme.alternate)).font(index == 0 ? .subheadline.weight(.semibold) : .footnote)
                                     .frame(width: 140, alignment: .leading).padding(6)
                             }
                         }

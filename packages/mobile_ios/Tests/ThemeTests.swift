@@ -41,6 +41,45 @@ final class ThemeTests: XCTestCase {
         XCTAssertNotEqual(light, resolved(.light))
     }
 
+    func testBundledPresetsLoadAndOverrideSystemAppearance() throws {
+        let name = "ThemeTests." + UUID().uuidString
+        let defaults = UserDefaults(suiteName: name)!
+        defer { defaults.removePersistentDomain(forName: name) }
+        let settings = AppearanceSettings(defaults: defaults)
+        let expected = Set(["tokyo-night", "catppuccin", "catppuccin-latte", "gruvbox", "kanagawa", "matte-black", "osaka-jade", "ristretto"])
+        XCTAssertEqual(Set(BundledTheme.all.map(\.id)), expected)
+        XCTAssertEqual(BundledTheme.all.count, 8)
+        for preset in BundledTheme.all {
+            settings.mode = try XCTUnwrap(AppearanceMode(rawValue: preset.id))
+            XCTAssertEqual(settings.mode.label, preset.name)
+            XCTAssertEqual(settings.scheme, preset.id == "catppuccin-latte" ? .light : .dark)
+            for key in ["background", "panel", "panel_alt", "panel_muted", "border", "text", "text_muted", "text_subtle", "accent", "warning", "diff_remove", "selection"] {
+                let color = UIColor(settings.color(key, fallback: 0, light: 0xffffff))
+                XCTAssertEqual(color, UIColor(try XCTUnwrap(preset.palette.color(key))))
+                XCTAssertEqual(color.resolvedColor(with: UITraitCollection(userInterfaceStyle: .light)),
+                               color.resolvedColor(with: UITraitCollection(userInterfaceStyle: .dark)))
+            }
+        }
+        XCTAssertEqual(AppearanceMode.tokyoNight.preset?.colors["background"], "#1a1b26")
+        XCTAssertEqual(AppearanceMode.catppuccinLatte.preset?.colors["accent"], "#1e66f5")
+        settings.mode = .system
+        XCTAssertNil(settings.activePalette)
+        XCTAssertNil(settings.scheme)
+    }
+
+    func testCachedInlineCodeAdoptsNewThemeWithoutChangingContentOrLinks() {
+        var code = AttributedString("code")
+        code.backgroundColor = Color.red
+        code.link = URL(string: "https://example.com")
+        let cached = AttributedString("before ") + code
+        let updated = themedInline(cached, background: .blue)
+        XCTAssertEqual(String(updated.characters), String(cached.characters))
+        XCTAssertEqual(updated.runs.last?.backgroundColor, .blue)
+        XCTAssertEqual(updated.runs.last?.link, code.link)
+        XCTAssertNil(updated.runs.first?.backgroundColor)
+        XCTAssertEqual(cached.runs.last?.backgroundColor, .red)
+    }
+
     func testBundledFontsAreRegisteredUnderTheirRealNames() {
         for name in ["NotoSans-Regular", "NotoSans-Bold", "CalSans-Regular", "JetBrainsMonoNF-Regular"] {
             XCTAssertNotNil(UIFont(name: name, size: 15), "Font missing: \(name)")
