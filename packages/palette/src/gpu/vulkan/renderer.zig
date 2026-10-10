@@ -26,6 +26,8 @@ const core = @import("../core.zig");
 const text = @import("../text.zig");
 const damage = @import("../damage.zig");
 const clock = @import("../../clock.zig");
+const present = @import("../../platform/present.zig");
+const import_ = @import("import.zig");
 
 const Context = context.Context;
 
@@ -86,6 +88,16 @@ const Texture = struct {
     ready: bool = false,
     /// Persistent staging ring for `streamTexture` (null for one-shot uploads).
     stream: ?*Stream = null,
+    /// Set when the id is bound to an imported dma-buf; the image/view/set belong to it.
+    external: ?*Import = null,
+    /// Imported frames with producer damage: what changed since the encoder last drew the
+    /// image (texels; 0 rects = the whole image), `damage_base` = generation of the last
+    /// whole-image change. `damage_seen`: a frame was built since the last import, so the
+    /// next import starts a new set instead of accumulating.
+    damage_n: u8 = 0,
+    damage_seen: bool = false,
+    damage_base: u32 = 0,
+    damage: [core.max_texture_damage]TextureRect = undefined,
 };
 
 /// Staging buffers a streamed texture reuses frame after frame. A slot is writable once the
@@ -100,6 +112,50 @@ const Stream = struct {
         serial: u64 = 0,
         pending: bool = false,
     };
+};
+
+/// An imported dma-buf (one producer buffer), cached until the producer drops it.
+const Import = struct {
+    key: u64,
+    image: vk.Image = .null_handle,
+    view: vk.ImageView = .null_handle,
+    memory: vk.DeviceMemory = .null_handle,
+    set: vk.DescriptorSet = .null_handle,
+    pool: vk.DescriptorPool = .null_handle,
+    width: u32,
+    height: u32,
+    fourcc: present.Fourcc,
+    modifier: u64,
+    /// dup of plane 0 (implicit-sync ioctls).
+    fd: c_int = -1,
+    /// Temporary-import wait semaphore for the producer's fence.
+    wait_semaphore: vk.Semaphore = .null_handle,
+    /// Producer fence of the newest frame, not yet waited on by a submission.
+    pending_fence: c_int = -1,
+    /// Last submission that sampled the buffer and its exported completion sync_file.
+    last_serial: u64 = 0,
+    release_fence: c_int = -1,
+    generation: u32 = 0,
+    /// Scratch: referenced by the frame being recorded.
+    in_frame: bool = false,
+};
+
+pub const DmabufImportOptions = struct {
+    /// Producer buffer id, stable for the buffer's lifetime. 0 = derive the key from the
+    /// dma-buf inode (st_dev, st_ino) of plane 0.
+    key: u64 = 0,
+    /// sync_file that signals when the producer finished writing this frame. Ownership moves
+    /// to the renderer (also on error). -1 = take the dma-buf's implicit write fences
+    /// (DMA_BUF_IOCTL_EXPORT_SYNC_FILE), or none when the kernel lacks that ioctl.
+    acquire_fence: c_int = -1,
+    /// The buffer holds a new frame: bumps the texture generation, so the image's rects are
+    /// damaged. False only (re)binds the id (no repaint unless the binding changed).
+    new_frame: bool = true,
+    /// Texels that differ from the frame the id showed before (producer damage, e.g. WPE's
+    /// damage rects); empty = everything. Only these parts of the image's rects are
+    /// repainted. Ignored (whole image) after a size change or with more than
+    /// `core.max_texture_damage` rects.
+    damage: []const TextureRect = &.{},
 };
 
 const max_stream_slots = core.max_stream_slots;
@@ -165,6 +221,13 @@ pub const Renderer = struct {
     dummy_texture: Texture = undefined,
     texture_generation: u32 = 0,
 
+    /// Imported dma-bufs by key, plus dropped ones waiting for their last submission.
+    imports: std.AutoHashMapUnmanaged(u64, *Import) = .empty,
+    dead_imports: std.ArrayList(*Import) = .empty,
+    frame_imports: std.ArrayList(*Import) = .empty,
+    /// Exportable SYNC_FD semaphore signalled by submissions that sample imports.
+    import_signal: vk.Semaphore = .null_handle,
+
     /// Backend-neutral batch encoder: instances, runs, glyph cache, damage.
     enc: core.Encoder,
     last_stats: FrameStats = .{},
@@ -205,6 +268,13 @@ pub const Renderer = struct {
         var it = self.textures.valueIterator();
         while (it.next()) |t| self.destroyTextureNow(t.*);
         self.textures.deinit(self.gpa);
+        var imp_it = self.imports.valueIterator();
+        while (imp_it.next()) |imp| self.destroyImportNow(imp.*);
+        self.imports.deinit(self.gpa);
+        for (self.dead_imports.items) |imp| self.destroyImportNow(imp);
+        self.dead_imports.deinit(self.gpa);
+        self.frame_imports.deinit(self.gpa);
+        if (self.import_signal != .null_handle) vkd.vkDestroySemaphore(dev, self.import_signal, null);
         if (self.dummy_texture.image != .null_handle) self.destroyTextureNow(self.dummy_texture);
         for (&self.atlases) |*a| {
             if (a.view != .null_handle) vkd.vkDestroyImageView(dev, a.view, null);
@@ -544,6 +614,7 @@ pub const Renderer = struct {
     }
 
     fn destroyTextureNow(self: *Renderer, t: Texture) void {
+        if (t.external != null) return;
         if (t.stream) |st| {
             for (st.slots[0..st.count]) |sl| self.ctx.destroyBuffer(sl.buffer);
             self.gpa.destroy(st);
@@ -556,6 +627,7 @@ pub const Renderer = struct {
     }
 
     fn retireTexture(self: *Renderer, t: Texture) void {
+        if (t.external != null) return;
         if (t.stream) |st| {
             for (st.slots[0..st.count]) |sl| self.ctx.retire(.{ .buffer = sl.buffer });
             self.gpa.destroy(st);
@@ -586,7 +658,7 @@ pub const Renderer = struct {
         const gop = try self.textures.getOrPut(self.gpa, id);
         if (gop.found_existing) {
             const old = gop.value_ptr.*;
-            if (old.width == width and old.height == height and old.format == vk_format) {
+            if (old.external == null and old.width == width and old.height == height and old.format == vk_format) {
                 self.texture_generation +%= 1;
                 gop.value_ptr.generation = self.texture_generation;
             } else {
@@ -741,6 +813,385 @@ pub const Renderer = struct {
         self.retireTexture(kv.value);
     }
 
+    // ---- Imported dma-bufs (zero-copy frames from other processes) ---------------------------
+
+    /// Whether this device can import dma-bufs at all (VK_EXT_external_memory_dma_buf +
+    /// vkGetMemoryFdPropertiesKHR). Modifier support is `ctx.caps.drm_format_modifier`.
+    pub fn canImportDmabuf(self: *const Renderer) bool {
+        return self.ctx.caps.dmabuf_export and self.ctx.vkd.vkGetMemoryFdPropertiesKHR != null;
+    }
+
+    /// (fourcc, modifier) pairs a producer may allocate for `importDmabufTexture`.
+    pub fn appendDmabufImportFormats(self: *Renderer, gpa: std.mem.Allocator, out: *std.ArrayList(present.FormatModifier)) !void {
+        if (!self.canImportDmabuf()) return;
+        try import_.appendImportFormats(self.ctx, gpa, out);
+    }
+
+    /// Binds image `id` (== draw.TextureId.value) to the dma-buf `image` without copying it.
+    /// The Vulkan import is cached per buffer (`options.key`, else the dma-buf inode), so a
+    /// producer cycling through a small pool imports each buffer once; plane fds are dup'd,
+    /// the caller keeps its own. Every submission that samples the buffer waits for the
+    /// newest acquire fence and takes queue-family ownership from FOREIGN (released again at
+    /// the end of the submission). Hand the buffer back to the producer with
+    /// `takeDmabufReleaseFence` once `id` shows another buffer.
+    pub fn importDmabufTexture(self: *Renderer, id: u32, image: present.DmabufImage, options: DmabufImportOptions) !void {
+        var acquire = options.acquire_fence;
+        defer if (acquire >= 0) {
+            _ = import_.close(acquire);
+        };
+        if (id == 0) return error.InvalidTextureId;
+        if (!self.canImportDmabuf()) return error.DmabufImportUnsupported;
+        if (image.plane_count == 0 or image.plane_count > present.max_planes) return error.InvalidDmabuf;
+        if (image.width == 0 or image.height == 0 or image.width > self.ctx.caps.max_image_dimension_2d or image.height > self.ctx.caps.max_image_dimension_2d) return error.InvalidTextureSize;
+        const key = if (options.key != 0) options.key else import_.bufferKey(image.planes[0].fd);
+        if (key == 0) return error.InvalidDmabuf;
+
+        var imp: *Import = undefined;
+        var created = false;
+        if (self.imports.get(key)) |existing| {
+            if (existing.width == image.width and existing.height == image.height and existing.fourcc == image.format and existing.modifier == image.modifier) {
+                imp = existing;
+            } else {
+                self.releaseDmabufImport(key);
+                imp = try self.createImport(key, image);
+                created = true;
+            }
+        } else {
+            imp = try self.createImport(key, image);
+            created = true;
+        }
+        if (created) {
+            errdefer self.destroyImportNow(imp);
+            try self.imports.put(self.gpa, key, imp);
+        }
+
+        // Producer fence for this frame (explicit, else the implicit write fences).
+        if (acquire < 0 and options.new_frame) acquire = import_.exportReadFence(imp.fd);
+        if (acquire >= 0) {
+            if (imp.pending_fence >= 0) _ = import_.close(imp.pending_fence);
+            imp.pending_fence = acquire;
+            acquire = -1;
+        }
+
+        // Bind the id.
+        const gop = try self.textures.getOrPut(self.gpa, id);
+        const prev: ?Texture = if (gop.found_existing) gop.value_ptr.* else null;
+        const rebound = !gop.found_existing or gop.value_ptr.external != imp;
+        if (gop.found_existing and gop.value_ptr.external == null) {
+            self.dropPendingUpload(id);
+            self.retireTexture(gop.value_ptr.*);
+        }
+        if (options.new_frame or rebound) {
+            self.texture_generation +%= 1;
+            imp.generation = self.texture_generation;
+        }
+        gop.value_ptr.* = .{
+            .image = imp.image,
+            .view = imp.view,
+            .allocation = .{},
+            .width = imp.width,
+            .height = imp.height,
+            .format = import_.mapFourcc(imp.fourcc).?.format,
+            .mip_levels = 1,
+            .set = imp.set,
+            .pool = imp.pool,
+            .generation = imp.generation,
+            .ready = true,
+            .external = imp,
+        };
+        importDamage(gop.value_ptr, prev, options);
+    }
+
+    /// Damage bookkeeping of a freshly bound import (see `Texture.damage_n`).
+    fn importDamage(tex: *Texture, prev_opt: ?Texture, options: DmabufImportOptions) void {
+        const prev = prev_opt orelse return; // first binding: whole image
+        const same_size = prev.external != null and prev.ready and prev.width == tex.width and prev.height == tex.height;
+        if (!options.new_frame) {
+            if (same_size and tex.generation == prev.generation) {
+                tex.damage_n = prev.damage_n;
+                tex.damage_seen = prev.damage_seen;
+                tex.damage_base = prev.damage_base;
+                tex.damage = prev.damage;
+            }
+            return;
+        }
+        if (!same_size or options.damage.len == 0) return;
+        // Damage accumulates over frames the encoder never drew.
+        var n: usize = 0;
+        var rects: [core.max_texture_damage]TextureRect = undefined;
+        if (!prev.damage_seen) {
+            if (prev.damage_n == 0) return; // an undrawn whole-image change is still pending
+            n = prev.damage_n;
+            rects = prev.damage;
+        }
+        for (options.damage) |r| {
+            const c = core.clampRect(r, tex.width, tex.height) orelse continue;
+            if (n == rects.len) return; // too many: whole image
+            rects[n] = c;
+            n += 1;
+        }
+        if (n == 0) return;
+        tex.damage_n = @intCast(n);
+        tex.damage = rects;
+        tex.damage_seen = false;
+        tex.damage_base = if (prev.damage_n > 0) prev.damage_base else prev.generation;
+    }
+
+    /// Returns a sync_file (owned by the caller) that signals once the GPU finished every
+    /// submission that sampled buffer `key`, or -1 when nothing is pending. Without SYNC_FD
+    /// export this waits on the CPU instead and returns -1. The producer may write the buffer
+    /// again after the fence; the caller must not have it bound to an id that is still drawn.
+    pub fn takeDmabufReleaseFence(self: *Renderer, key: u64) c_int {
+        const imp = self.imports.get(key) orelse return -1;
+        if (imp.release_fence >= 0) {
+            const fd = imp.release_fence;
+            imp.release_fence = -1;
+            self.pollCompleted();
+            if (imp.last_serial <= self.ctx.completed_serial) {
+                _ = import_.close(fd);
+                return -1;
+            }
+            return fd;
+        }
+        if (imp.last_serial > self.ctx.completed_serial) self.waitSerial(imp.last_serial) catch {};
+        return -1;
+    }
+
+    /// Key `importDmabufTexture` derives for a buffer without a producer id.
+    pub fn dmabufKey(fd: c_int) u64 {
+        return import_.bufferKey(fd);
+    }
+
+    /// Whether buffer `key` is imported.
+    pub fn hasDmabufImport(self: *const Renderer, key: u64) bool {
+        return self.imports.contains(key);
+    }
+
+    /// Drops the import of buffer `key` (producer destroyed or resized it). Ids still bound
+    /// to it are released; the Vulkan objects die after the last submission that sampled it.
+    pub fn releaseDmabufImport(self: *Renderer, key: u64) void {
+        const kv = self.imports.fetchRemove(key) orelse return;
+        const imp = kv.value;
+        var it = self.textures.iterator();
+        var ids: [16]u32 = undefined;
+        var n: usize = 0;
+        while (it.next()) |e| {
+            if (e.value_ptr.external == imp and n < ids.len) {
+                ids[n] = e.key_ptr.*;
+                n += 1;
+            }
+        }
+        for (ids[0..n]) |tid| _ = self.textures.remove(tid);
+        if (n > 0) self.texture_generation +%= 1;
+        if (imp.last_serial <= self.ctx.completed_serial) {
+            self.destroyImportNow(imp);
+        } else {
+            self.dead_imports.append(self.gpa, imp) catch {
+                self.waitSerial(imp.last_serial) catch {};
+                self.destroyImportNow(imp);
+            };
+        }
+    }
+
+    fn collectDeadImports(self: *Renderer) void {
+        var i: usize = 0;
+        while (i < self.dead_imports.items.len) {
+            const imp = self.dead_imports.items[i];
+            if (imp.last_serial <= self.ctx.completed_serial) {
+                self.destroyImportNow(imp);
+                _ = self.dead_imports.swapRemove(i);
+            } else i += 1;
+        }
+    }
+
+    fn destroyImportNow(self: *Renderer, imp: *Import) void {
+        const vkd = &self.ctx.vkd;
+        const dev = self.ctx.device;
+        if (imp.set != .null_handle) _ = vkd.vkFreeDescriptorSets(dev, imp.pool, 1, @ptrCast(&imp.set));
+        if (imp.view != .null_handle) vkd.vkDestroyImageView(dev, imp.view, null);
+        if (imp.image != .null_handle) vkd.vkDestroyImage(dev, imp.image, null);
+        if (imp.memory != .null_handle) vkd.vkFreeMemory(dev, imp.memory, null);
+        if (imp.wait_semaphore != .null_handle) vkd.vkDestroySemaphore(dev, imp.wait_semaphore, null);
+        if (imp.pending_fence >= 0) _ = import_.close(imp.pending_fence);
+        if (imp.release_fence >= 0) _ = import_.close(imp.release_fence);
+        if (imp.fd >= 0) _ = import_.close(imp.fd);
+        self.gpa.destroy(imp);
+    }
+
+    fn createImport(self: *Renderer, key: u64, image: present.DmabufImage) !*Import {
+        const ctx = self.ctx;
+        const vkd = &ctx.vkd;
+        const dev = ctx.device;
+        const mapping = import_.mapFourcc(image.format) orelse return error.UnsupportedDmabufFormat;
+        // One allocation per image: planes of a multi-plane modifier (e.g. CCS aux) must live
+        // in the same dma-buf (disjoint images are not supported).
+        for (image.planes[1..image.plane_count]) |p| {
+            if (!import_.sameBuffer(image.planes[0].fd, p.fd)) return error.DisjointDmabufUnsupported;
+        }
+        const use_modifier = ctx.caps.drm_format_modifier;
+        if (!use_modifier and (image.modifier != present.modifier_linear or image.plane_count != 1)) return error.DmabufModifierUnsupported;
+        if (!import_.importSupported(ctx, mapping.format, image.modifier)) return error.DmabufModifierUnsupported;
+
+        const imp = try self.gpa.create(Import);
+        imp.* = .{ .key = key, .width = image.width, .height = image.height, .fourcc = image.format, .modifier = image.modifier };
+        errdefer self.destroyImportNow(imp);
+        imp.fd = import_.dup(image.planes[0].fd);
+        if (imp.fd < 0) return error.InvalidDmabuf;
+
+        var layouts: [present.max_planes]vk.SubresourceLayout = undefined;
+        for (image.planes[0..image.plane_count], 0..) |p, i| {
+            layouts[i] = .{ .offset = p.offset, .size = 0, .rowPitch = p.stride, .arrayPitch = 0, .depthPitch = 0 };
+        }
+        const explicit: vk.ImageDrmFormatModifierExplicitCreateInfoEXT = .{
+            .drmFormatModifier = image.modifier,
+            .drmFormatModifierPlaneCount = image.plane_count,
+            .pPlaneLayouts = &layouts,
+        };
+        const ext_info: vk.ExternalMemoryImageCreateInfo = .{
+            .pNext = if (use_modifier) &explicit else null,
+            .handleTypes = vk.ExternalMemoryHandleTypeFlags.dma_buf_ext,
+        };
+        const info: vk.ImageCreateInfo = .{
+            .pNext = &ext_info,
+            .imageType = .@"2d",
+            .format = mapping.format,
+            .extent = .{ .width = image.width, .height = image.height, .depth = 1 },
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = vk.SampleCountFlags.@"1",
+            .tiling = if (use_modifier) .drm_format_modifier_ext else .linear,
+            .usage = import_.usage,
+            .sharingMode = .exclusive,
+            .initialLayout = .undefined,
+        };
+        try vk.check(vkd.vkCreateImage(dev, &info, null, &imp.image));
+        if (!use_modifier) {
+            // Without explicit plane layouts the LINEAR pitch must match the producer's.
+            const sub: vk.ImageSubresource = .{ .aspectMask = vk.ImageAspectFlags.color };
+            var layout: vk.SubresourceLayout = .{};
+            vkd.vkGetImageSubresourceLayout(dev, imp.image, &sub, &layout);
+            if (layout.rowPitch != image.planes[0].stride or image.planes[0].offset != 0) return error.DmabufLayoutMismatch;
+        }
+
+        // Memory: import a dup of the fd (Vulkan owns it on success).
+        var fd_props: vk.MemoryFdPropertiesKHR = .{};
+        const mem_fd = import_.dup(image.planes[0].fd);
+        if (mem_fd < 0) return error.InvalidDmabuf;
+        var mem_fd_owned = true;
+        defer if (mem_fd_owned) {
+            _ = import_.close(mem_fd);
+        };
+        try vk.check(vkd.vkGetMemoryFdPropertiesKHR.?(dev, vk.ExternalMemoryHandleTypeFlags.dma_buf_ext, mem_fd, &fd_props));
+        var reqs: vk.MemoryRequirements = undefined;
+        vkd.vkGetImageMemoryRequirements(dev, imp.image, &reqs);
+        const bits = reqs.memoryTypeBits & fd_props.memoryTypeBits;
+        const type_index = ctx.findMemoryType(bits, 0, 0) orelse return error.NoSuitableMemoryType;
+        const dedicated: vk.MemoryDedicatedAllocateInfo = .{ .image = imp.image, .buffer = .null_handle };
+        const import_info: vk.ImportMemoryFdInfoKHR = .{ .pNext = &dedicated, .handleType = vk.ExternalMemoryHandleTypeFlags.dma_buf_ext, .fd = mem_fd };
+        const alloc_info: vk.MemoryAllocateInfo = .{ .pNext = &import_info, .allocationSize = reqs.size, .memoryTypeIndex = type_index };
+        try vk.check(vkd.vkAllocateMemory(dev, &alloc_info, null, &imp.memory));
+        mem_fd_owned = false;
+        try vk.check(vkd.vkBindImageMemory(dev, imp.image, imp.memory, 0));
+
+        const one: vk.ComponentSwizzle = if (mapping.alpha_one) .one else .identity;
+        const view_info: vk.ImageViewCreateInfo = .{
+            .image = imp.image,
+            .viewType = .@"2d",
+            .format = mapping.format,
+            .components = .{ .a = one },
+            .subresourceRange = .{ .aspectMask = vk.ImageAspectFlags.color, .levelCount = 1, .layerCount = 1 },
+        };
+        try vk.check(vkd.vkCreateImageView(dev, &view_info, null, &imp.view));
+        const set = try self.allocImageSet();
+        imp.set = set.set;
+        imp.pool = set.pool;
+        const image_info: vk.DescriptorImageInfo = .{ .sampler = self.sampler_linear, .imageView = imp.view, .imageLayout = .shader_read_only_optimal };
+        const write: vk.WriteDescriptorSet = .{
+            .dstSet = imp.set,
+            .dstBinding = 0,
+            .descriptorCount = 1,
+            .descriptorType = .combined_image_sampler,
+            .pImageInfo = @ptrCast(&image_info),
+        };
+        vkd.vkUpdateDescriptorSets(dev, 1, @ptrCast(&write), 0, null);
+        if (ctx.caps.sync_fd_import) {
+            const sem_info: vk.SemaphoreCreateInfo = .{};
+            try vk.check(vkd.vkCreateSemaphore(dev, &sem_info, null, &imp.wait_semaphore));
+        }
+        return imp;
+    }
+
+    fn ensureImportSignal(self: *Renderer) bool {
+        if (self.import_signal != .null_handle) return true;
+        if (!self.ctx.caps.sync_fd_export or self.ctx.vkd.vkGetSemaphoreFdKHR == null) return false;
+        const export_sem: vk.ExportSemaphoreCreateInfo = .{ .handleTypes = vk.ExternalSemaphoreHandleTypeFlags.sync_fd };
+        const info: vk.SemaphoreCreateInfo = .{ .pNext = &export_sem };
+        return self.ctx.vkd.vkCreateSemaphore(self.ctx.device, &info, null, &self.import_signal) == .success;
+    }
+
+    /// Collects the imports sampled by this frame's draw runs (into `frame_imports`).
+    fn gatherFrameImports(self: *Renderer) !void {
+        self.frame_imports.clearRetainingCapacity();
+        if (self.imports.count() == 0) return;
+        for (self.enc.runs.items) |d| {
+            if (d.count == 0 or d.texture == 0) continue;
+            const t = self.textures.getPtr(d.texture) orelse continue;
+            const imp = t.external orelse continue;
+            if (imp.in_frame) continue;
+            imp.in_frame = true;
+            try self.frame_imports.append(self.gpa, imp);
+        }
+        for (self.frame_imports.items) |imp| imp.in_frame = false;
+    }
+
+    fn recordImportBarriers(self: *Renderer, cmd: vk.CommandBuffer, acquire: bool) void {
+        if (self.frame_imports.items.len == 0) return;
+        const foreign = if (self.ctx.caps.queue_family_foreign) vk.queue_family_foreign_ext else vk.queue_family_external;
+        var barriers: [16]vk.ImageMemoryBarrier = undefined;
+        var n: u32 = 0;
+        for (self.frame_imports.items) |imp| {
+            if (n == barriers.len) break;
+            // Ownership round trip per submission (as wlroots does): the producer may
+            // write the buffer again as soon as our release fence signals.
+            barriers[n] = .{
+                .srcAccessMask = if (acquire) 0 else vk.AccessFlags.shader_read,
+                .dstAccessMask = if (acquire) vk.AccessFlags.shader_read else 0,
+                .oldLayout = if (acquire) .general else .shader_read_only_optimal,
+                .newLayout = if (acquire) .shader_read_only_optimal else .general,
+                .srcQueueFamilyIndex = if (acquire) foreign else self.ctx.queue_family,
+                .dstQueueFamilyIndex = if (acquire) self.ctx.queue_family else foreign,
+                .image = imp.image,
+                .subresourceRange = .{ .aspectMask = vk.ImageAspectFlags.color, .levelCount = 1, .layerCount = 1 },
+            };
+            n += 1;
+        }
+        const S = vk.PipelineStageFlags;
+        const src: vk.Flags = if (acquire) S.top_of_pipe else S.fragment_shader;
+        const dst: vk.Flags = if (acquire) S.fragment_shader else S.bottom_of_pipe;
+        self.ctx.vkd.vkCmdPipelineBarrier(cmd, src, dst, 0, 0, null, 0, null, n, &barriers);
+    }
+
+    /// After the submission: export its completion as each sampled buffer's release fence
+    /// (and attach it to the dma-buf for implicit-sync producers).
+    fn finishFrameImports(self: *Renderer, serial: u64, signalled: bool) void {
+        if (self.frame_imports.items.len == 0) return;
+        var fd: c_int = -1;
+        if (signalled) {
+            const get: vk.SemaphoreGetFdInfoKHR = .{ .semaphore = self.import_signal, .handleType = vk.ExternalSemaphoreHandleTypeFlags.sync_fd };
+            if (self.ctx.vkd.vkGetSemaphoreFdKHR.?(self.ctx.device, &get, &fd) != .success) fd = -1;
+        }
+        for (self.frame_imports.items) |imp| {
+            imp.last_serial = serial;
+            if (imp.release_fence >= 0) _ = import_.close(imp.release_fence);
+            imp.release_fence = -1;
+            if (fd >= 0) {
+                _ = import_.attachReadFence(imp.fd, fd);
+                imp.release_fence = import_.dup(fd);
+            }
+        }
+        if (fd >= 0) _ = import_.close(fd);
+    }
+
     // ---- Frame ----------------------------------------------------------------------------
 
     /// Blocks until submission `serial` finished (e.g. before reading back or reusing a
@@ -825,6 +1276,8 @@ pub const Renderer = struct {
         }
         try vk.check(self.ctx.vkd.vkResetFences(self.ctx.device, 1, @ptrCast(&frame.fence)));
         frame.serial = self.ctx.nextSerial();
+        self.collectDeadImports();
+        try self.gatherFrameImports();
 
         // 4. Upload instances and glyphs.
         const t_upload = clock.monotonicTimestampNs();
@@ -841,25 +1294,68 @@ pub const Renderer = struct {
         self.recordTextureUploads(cmd, &stats);
         try self.recordGlyphUploads(cmd, frame, &stats);
         self.updateFrameSet(frame);
+        self.recordImportBarriers(cmd, true);
         self.recordTargetAcquire(cmd, target, partial);
         self.recordPass(cmd, frame, target, options.clear, partial);
         self.recordTargetRelease(cmd, target);
+        self.recordImportBarriers(cmd, false);
         try vk.check(vkd.vkEndCommandBuffer(cmd));
         const t_submit = clock.monotonicTimestampNs();
         stats.encode_ns = t_submit - t_encode;
 
-        // 6. Submit.
-        const wait_stage: vk.Flags = vk.PipelineStageFlags.color_attachment_output | vk.PipelineStageFlags.transfer;
+        // 6. Submit (waits: the target's, plus producer fences of sampled imports).
+        var waits: [17]vk.Semaphore = undefined;
+        var wait_stages: [17]vk.Flags = undefined;
+        var wait_count: u32 = 0;
+        if (target.wait_semaphore != .null_handle) {
+            waits[0] = target.wait_semaphore;
+            wait_stages[0] = vk.PipelineStageFlags.color_attachment_output | vk.PipelineStageFlags.transfer;
+            wait_count = 1;
+        }
+        for (self.frame_imports.items) |imp| {
+            if (imp.pending_fence < 0 or wait_count == waits.len) continue;
+            const fence = imp.pending_fence;
+            imp.pending_fence = -1;
+            if (imp.wait_semaphore == .null_handle) {
+                _ = import_.close(fence);
+                continue;
+            }
+            const import_sem: vk.ImportSemaphoreFdInfoKHR = .{
+                .semaphore = imp.wait_semaphore,
+                .flags = vk.SemaphoreImportFlags.temporary,
+                .handleType = vk.ExternalSemaphoreHandleTypeFlags.sync_fd,
+                .fd = fence,
+            };
+            if (vkd.vkImportSemaphoreFdKHR.?(self.ctx.device, &import_sem) != .success) {
+                _ = import_.close(fence);
+                continue;
+            }
+            waits[wait_count] = imp.wait_semaphore;
+            wait_stages[wait_count] = vk.PipelineStageFlags.fragment_shader;
+            wait_count += 1;
+        }
+        var signals: [2]vk.Semaphore = undefined;
+        var signal_count: u32 = 0;
+        if (target.signal_semaphore != .null_handle) {
+            signals[0] = target.signal_semaphore;
+            signal_count = 1;
+        }
+        const import_signalled = self.frame_imports.items.len > 0 and self.ensureImportSignal();
+        if (import_signalled) {
+            signals[signal_count] = self.import_signal;
+            signal_count += 1;
+        }
         const submit: vk.SubmitInfo = .{
-            .waitSemaphoreCount = @intFromBool(target.wait_semaphore != .null_handle),
-            .pWaitSemaphores = @ptrCast(&target.wait_semaphore),
-            .pWaitDstStageMask = @ptrCast(&wait_stage),
+            .waitSemaphoreCount = wait_count,
+            .pWaitSemaphores = &waits,
+            .pWaitDstStageMask = &wait_stages,
             .commandBufferCount = 1,
             .pCommandBuffers = @ptrCast(&frame.cmd),
-            .signalSemaphoreCount = @intFromBool(target.signal_semaphore != .null_handle),
-            .pSignalSemaphores = @ptrCast(&target.signal_semaphore),
+            .signalSemaphoreCount = signal_count,
+            .pSignalSemaphores = &signals,
         };
         try vk.check(vkd.vkQueueSubmit(self.ctx.queue, 1, @ptrCast(&submit), frame.fence));
+        self.finishFrameImports(frame.serial, import_signalled);
         target.layout = target.final_layout;
         target.last_frame = self.enc.damage_frame;
         target.last_serial = frame.serial;
@@ -877,6 +1373,12 @@ pub const Renderer = struct {
         pub fn textureGeneration(self: TextureGenerations, id: u32) ?u32 {
             const t = self.renderer.textures.getPtr(id) orelse return null;
             return t.generation;
+        }
+        pub fn textureDamage(self: TextureGenerations, id: u32) ?core.TextureDamage {
+            const t = self.renderer.textures.getPtr(id) orelse return null;
+            t.damage_seen = true;
+            if (t.damage_n == 0) return null;
+            return .{ .base = t.damage_base, .width = t.width, .height = t.height, .rects = t.damage[0..t.damage_n] };
         }
     };
 

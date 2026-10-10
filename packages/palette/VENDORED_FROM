@@ -1,5 +1,5 @@
 repo: palette-decouple-research (palette-native)
-commit: 2774bd939aa6004247fcb93c5a9e20ae8a22f9a2
-subject: Metal: ship a precompiled shader.metallib, runtime MSL as fallback
+commit: 32e74583b1031772e427b04d1e00be00c0194a7b
+subject: Merge linux-webview-dmabuf: zero-copy WPE browser frames (Platform API, fences, damage, device scale)
 paths: palette-native/src, palette-native/tools/wayland-scanner.zig, protocols/*.xml, protocols/README.md
 refresh: scripts/dev/vendor-palette-native.sh <palette-native repo> <commit>

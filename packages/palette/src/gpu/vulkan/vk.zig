@@ -834,6 +834,24 @@ pub const MemoryGetFdInfoKHR = extern struct {
     memory: DeviceMemory,
     handleType: Flags = 0,
 };
+pub const ImportMemoryFdInfoKHR = extern struct {
+    sType: StructureType = @enumFromInt(1000074000),
+    pNext: ?*const anyopaque = null,
+    handleType: Flags = 0,
+    fd: c_int,
+};
+pub const MemoryFdPropertiesKHR = extern struct {
+    sType: StructureType = @enumFromInt(1000074001),
+    pNext: ?*anyopaque = null,
+    memoryTypeBits: u32 = 0,
+};
+pub const ImageDrmFormatModifierExplicitCreateInfoEXT = extern struct {
+    sType: StructureType = @enumFromInt(1000158004),
+    pNext: ?*const anyopaque = null,
+    drmFormatModifier: u64 = 0,
+    drmFormatModifierPlaneCount: u32 = 0,
+    pPlaneLayouts: ?[*]const SubresourceLayout = null,
+};
 pub const ImageSubresource = extern struct {
     aspectMask: Flags = 0,
     mipLevel: u32 = 0,
@@ -1419,6 +1437,7 @@ pub const DeviceDispatch = struct {
     vkGetSemaphoreFdKHR: ?*const fn (Device, *const SemaphoreGetFdInfoKHR, *c_int) callconv(.c) Result = null,
     vkImportSemaphoreFdKHR: ?*const fn (Device, *const ImportSemaphoreFdInfoKHR) callconv(.c) Result = null,
     vkGetImageDrmFormatModifierPropertiesEXT: ?*const fn (Device, Image, *ImageDrmFormatModifierPropertiesEXT) callconv(.c) Result = null,
+    vkGetMemoryFdPropertiesKHR: ?*const fn (Device, Flags, c_int, *MemoryFdPropertiesKHR) callconv(.c) Result = null,
 };
 
 /// Fills every function-pointer field of `T` by name. Required (non-optional) entries that
@@ -1529,6 +1548,9 @@ const c_layouts = [_]struct { []const u8, usize, usize }{
     .{ "ExportMemoryAllocateInfo", 24, 8 },
     .{ "MemoryDedicatedAllocateInfo", 32, 8 },
     .{ "MemoryGetFdInfoKHR", 32, 8 },
+    .{ "ImportMemoryFdInfoKHR", 24, 8 },
+    .{ "MemoryFdPropertiesKHR", 24, 8 },
+    .{ "ImageDrmFormatModifierExplicitCreateInfoEXT", 40, 8 },
     .{ "ImageSubresource", 12, 4 },
     .{ "SubresourceLayout", 40, 8 },
     .{ "ImageViewCreateInfo", 80, 8 },

@@ -357,3 +357,170 @@ test "streamed BGRA texture: full, partial, merged and strided updates without r
     _ = try target.render(&batch, .{});
     f.renderer.releaseTexture(id);
 }
+
+/// Renders the reference scene into an exported dma-buf (the producer), imports that buffer
+/// as image `id`, draws it full-size into an offscreen target and checks the golden.
+fn importRoundTrip(gpa: std.mem.Allocator, f: *Fixture, options: gpu.DmabufOptions, label: []const u8) !void {
+    var bufs = try gpu.DmabufTargets.init(f.renderer, scene.width, scene.height, options);
+    defer bufs.deinit();
+    var producer: draw.RenderBatch = .{};
+    defer producer.deinit(gpa);
+    try scene.build(gpa, &producer, 1.0);
+    const t = bufs.acquire().?;
+    _ = try bufs.render(t, &producer, .{ .clear = .{ .r = 0, .g = 0, .b = 0, .a = 1 } });
+    const img = bufs.exported(t);
+
+    const id: u32 = 900;
+    const key = gpu.Renderer.dmabufKey(img.planes[0].fd);
+    try std.testing.expect(key != 0);
+    // Same buffer through another fd -> same key.
+    const other = dup(img.planes[0].fd);
+    defer _ = close(other);
+    try std.testing.expectEqual(key, gpu.Renderer.dmabufKey(other));
+    try f.renderer.importDmabufTexture(id, img, .{});
+    try std.testing.expect(f.renderer.hasDmabufImport(key));
+
+    var target = try gpu.Offscreen.init(f.renderer, scene.width, scene.height);
+    defer target.deinit();
+    var batch: draw.RenderBatch = .{};
+    defer batch.deinit(gpa);
+    const full: draw.Rect = .{ .x = 0, .y = 0, .w = @floatFromInt(scene.width), .h = @floatFromInt(scene.height) };
+    try batch.image(gpa, full, draw.TextureId.init(id), .{ .w = 1, .h = 1 }, draw.Color.white, null);
+    const r1 = try target.render(&batch, .{ .clear = .{ .r = 1, .g = 0, .b = 1, .a = 1 } });
+    try std.testing.expect(!r1.stats.skipped);
+    const out = try gpa.alloc(u8, scene.width * scene.height * 4);
+    defer gpa.free(out);
+    try target.readRgba(out);
+    const ref = try gpu.png.decode(gpa, @embedFile("testdata/scene_1x.png"));
+    defer ref.deinit(gpa);
+    const diff = gpu.png.compare(out, ref.pixels, 3);
+    if (diff.mismatched > ref.pixels.len / 4 / 1000) {
+        std.debug.print("dma-buf import ({s}, modifier 0x{x}): {d} pixels differ (max delta {d})\n", .{ label, img.modifier, diff.mismatched, diff.max_channel_delta });
+        return error.GoldenMismatch;
+    }
+
+    // Same frame, nothing new: skipped. A new frame from the producer: the image is damaged
+    // again, the import is reused (no re-import), overlays drawn later stay on top.
+    const r2 = try target.render(&batch, .{ .clear = .{ .r = 1, .g = 0, .b = 1, .a = 1 } });
+    try std.testing.expect(r2.stats.skipped);
+    bufs.release(t);
+    const fence = f.renderer.takeDmabufReleaseFence(key);
+    if (fence >= 0) _ = close(fence);
+    producer.commands.items[0].color = .{ .r = 0, .g = 1, .b = 0, .a = 1 };
+    _ = try bufs.render(t, &producer, .{ .force_full = true });
+    try f.renderer.importDmabufTexture(id, bufs.exported(t), .{});
+    try batch.rect(gpa, .{ .x = 0, .y = 0, .w = 4, .h = 4 }, .{ .r = 1, .g = 1, .b = 1, .a = 1 });
+    const r3 = try target.render(&batch, .{ .clear = .{ .r = 1, .g = 0, .b = 1, .a = 1 } });
+    try std.testing.expect(!r3.stats.skipped);
+    try target.readRgba(out);
+    try std.testing.expectEqual([4]u8{ 255, 255, 255, 255 }, pixel(out, scene.width, 1, 1));
+    try std.testing.expectEqual([4]u8{ 0, 255, 0, 255 }, pixel(out, scene.width, 5, 100));
+
+    // Producer drops the buffer: the id is unbound, nothing leaks.
+    f.renderer.releaseDmabufImport(key);
+    try std.testing.expect(!f.renderer.hasDmabufImport(key));
+    _ = try target.render(&batch, .{ .clear = .{ .r = 1, .g = 0, .b = 1, .a = 1 } });
+    bufs.release(t);
+    std.log.info("dma-buf import {s}: modifier 0x{x}, {d} plane(s)", .{ label, img.modifier, img.plane_count });
+}
+
+extern "c" fn dup(fd: c_int) c_int;
+extern "c" fn close(fd: c_int) c_int;
+
+test "dma-buf import: own exported buffer (LINEAR and tiled) matches the golden" {
+    const gpa = std.testing.allocator;
+    var f = try Fixture.init(gpa);
+    defer f.deinit(gpa);
+    if (!f.renderer.canImportDmabuf() or !f.ctx.caps.dmabuf_export) return error.SkipZigTest;
+
+    var formats: std.ArrayList(present.FormatModifier) = .empty;
+    defer formats.deinit(gpa);
+    try f.renderer.appendDmabufImportFormats(gpa, &formats);
+    try std.testing.expect(formats.items.len > 0);
+
+    try importRoundTrip(gpa, &f, .{}, "linear");
+    if (f.ctx.caps.drm_format_modifier) {
+        // Offer the producer everything we can import (as the browser handshake does).
+        try importRoundTrip(gpa, &f, .{ .feedback = .{ .formats = formats.items } }, "modifiers");
+    }
+}
+
+test "dma-buf import: producer damage repaints only the damaged texels, accumulated across undrawn frames" {
+    const gpa = std.testing.allocator;
+    var f = try Fixture.init(gpa);
+    defer f.deinit(gpa);
+    if (!f.renderer.canImportDmabuf() or !f.ctx.caps.dmabuf_export) return error.SkipZigTest;
+    const w: u32 = 256;
+    const h: u32 = 128;
+    // The producer gets its own renderer (its own damage history), like the browser process.
+    const prod = try gpu.Renderer.init(gpa, f.ctx, .{ .glyph_source = f.stub.source() });
+    defer prod.deinit();
+    var bufs = try gpu.DmabufTargets.init(prod, w, h, .{});
+    defer bufs.deinit();
+    var producer: draw.RenderBatch = .{};
+    defer producer.deinit(gpa);
+    const Patch = struct { x: f32, y: f32, color: draw.Color };
+    // Producer frame: black with two 8x8 patches.
+    const frame = struct {
+        fn draw_(b: *gpu.DmabufTargets, p: *draw.RenderBatch, a: std.mem.Allocator, t: anytype, patches: [2]Patch) !void {
+            p.clear();
+            for (patches) |q| try p.rect(a, .{ .x = q.x, .y = q.y, .w = 8, .h = 8 }, q.color);
+            _ = try b.render(t, p, .{ .clear = .{ .r = 0, .g = 0, .b = 0, .a = 1 }, .force_full = true });
+        }
+    }.draw_;
+    const red: draw.Color = .{ .r = 1, .g = 0, .b = 0, .a = 1 };
+    const green: draw.Color = .{ .r = 0, .g = 1, .b = 0, .a = 1 };
+    const blue: draw.Color = .{ .r = 0, .g = 0, .b = 1, .a = 1 };
+
+    const id: u32 = 901;
+    var target = try gpu.Offscreen.init(f.renderer, w, h);
+    defer target.deinit();
+    var batch: draw.RenderBatch = .{};
+    defer batch.deinit(gpa);
+    try batch.image(gpa, .{ .x = 0, .y = 0, .w = @floatFromInt(w), .h = @floatFromInt(h) }, draw.TextureId.init(id), .{ .w = 1, .h = 1 }, draw.Color.white, null);
+    const out = try gpa.alloc(u8, w * h * 4);
+    defer gpa.free(out);
+
+    // 1. Buffer A, full frame.
+    const ta = bufs.acquire().?;
+    try frame(&bufs, &producer, gpa, ta, .{ .{ .x = 16, .y = 16, .color = red }, .{ .x = 200, .y = 96, .color = red } });
+    try f.renderer.importDmabufTexture(id, bufs.exported(ta), .{});
+    const r1 = try target.render(&batch, .{});
+    try std.testing.expect(r1.stats.full_redraw);
+
+    // 2. Buffer B: only the first patch changed (green), damage says so.
+    const tb = bufs.acquire().?;
+    try frame(&bufs, &producer, gpa, tb, .{ .{ .x = 16, .y = 16, .color = green }, .{ .x = 200, .y = 96, .color = red } });
+    try f.renderer.importDmabufTexture(id, bufs.exported(tb), .{ .damage = &.{.{ .x = 16, .y = 16, .w = 8, .h = 8 }} });
+    const r2 = try target.render(&batch, .{});
+    try std.testing.expect(!r2.stats.full_redraw and !r2.stats.skipped);
+    try std.testing.expect(r2.stats.damaged_pixels < w * h / 4);
+    try target.readRgba(out);
+    try std.testing.expectEqual([4]u8{ 0, 255, 0, 255 }, pixel(out, w, 20, 20));
+    try std.testing.expectEqual([4]u8{ 255, 0, 0, 255 }, pixel(out, w, 204, 100));
+
+    // 3. Two frames before the next draw: A gets patch 2 blue (damage there), then B gets
+    // patch 1 blue too (damage only at patch 1). Both regions must be repainted.
+    bufs.release(ta);
+    const fa = f.renderer.takeDmabufReleaseFence(gpu.Renderer.dmabufKey(bufs.exported(ta).planes[0].fd));
+    if (fa >= 0) _ = close(fa);
+    try frame(&bufs, &producer, gpa, ta, .{ .{ .x = 16, .y = 16, .color = green }, .{ .x = 200, .y = 96, .color = blue } });
+    try f.renderer.importDmabufTexture(id, bufs.exported(ta), .{ .damage = &.{.{ .x = 200, .y = 96, .w = 8, .h = 8 }} });
+    bufs.release(tb);
+    try f.renderer.waitSerial(r2.serial);
+    try frame(&bufs, &producer, gpa, tb, .{ .{ .x = 16, .y = 16, .color = blue }, .{ .x = 200, .y = 96, .color = blue } });
+    try f.renderer.importDmabufTexture(id, bufs.exported(tb), .{ .damage = &.{.{ .x = 16, .y = 16, .w = 8, .h = 8 }} });
+    const r3 = try target.render(&batch, .{});
+    try std.testing.expect(!r3.stats.full_redraw);
+    try target.readRgba(out);
+    try std.testing.expectEqual([4]u8{ 0, 0, 255, 255 }, pixel(out, w, 20, 20));
+    try std.testing.expectEqual([4]u8{ 0, 0, 255, 255 }, pixel(out, w, 204, 100));
+    try std.testing.expectEqual([4]u8{ 0, 0, 0, 255 }, pixel(out, w, 100, 60));
+
+    // 4. Nothing new: skipped.
+    const r4 = try target.render(&batch, .{});
+    try std.testing.expect(r4.stats.skipped);
+    f.renderer.releaseTexture(id);
+    bufs.release(ta);
+    bufs.release(tb);
+}

@@ -65,6 +65,7 @@ pub const DmabufTargets = if (vk_only) vulkan.DmabufTargets else void;
 pub const DmabufTarget = if (vk_only) vulkan.DmabufTarget else void;
 pub const DmabufOptions = if (vk_only) vulkan.DmabufOptions else void;
 pub const SyncMode = if (vk_only) vulkan.SyncMode else void;
+pub const DmabufImportOptions = if (vk_only) vulkan.DmabufImportOptions else void;
 
 pub const Context = backend.Context;
 pub const ContextOptions = backend.ContextOptions;

@@ -138,6 +138,20 @@ pub const TextureRect = struct {
     h: u32,
 };
 
+/// Most damage rects an image texture carries (`TextureDamage`).
+pub const max_texture_damage = 8;
+
+/// What changed in an image's pixels since the encoder last saw it, in texels: the
+/// texture view may offer it with `fn textureDamage(self, id: u32) ?TextureDamage`. Image
+/// commands then hash `base` (bumped only on whole-image changes) instead of the
+/// generation, and only `rects` (mapped through the command's rect/uv) are damaged.
+pub const TextureDamage = struct {
+    base: u32,
+    width: u32,
+    height: u32,
+    rects: []const TextureRect,
+};
+
 pub const StreamOptions = struct {
     /// Bytes per row of `pixels` (0 = width * 4).
     stride: u32 = 0,
@@ -235,7 +249,10 @@ pub const Encoder = struct {
             self.bbox = .{ std.math.inf(f32), std.math.inf(f32), -std.math.inf(f32), -std.math.inf(f32) };
             try self.buildCommand(command, textures);
             if (track and self.instances.items.len > first) {
-                self.damage_tracker.add(self.bbox[0], self.bbox[1], self.bbox[2], self.bbox[3], hashCommand(c_gen(textures, command), command));
+                const partial = textureDamage(textures, command);
+                const gen = c_gen(textures, command);
+                self.damage_tracker.add(self.bbox[0], self.bbox[1], self.bbox[2], self.bbox[3], hashCommand(if (partial) |d| d.base else gen, command));
+                if (partial) |d| self.addTextureDamage(command, d, gen);
             }
         }
         self.closeRun();
@@ -246,6 +263,32 @@ pub const Encoder = struct {
         if (track) {
             _ = self.damage_tracker.finish();
             self.damage_frame += 1;
+        }
+    }
+
+    /// Marks the device-pixel image of each texel rect of `d` as changed (hash of the
+    /// texture's current generation: stable while it is unchanged), clipped to the command.
+    fn addTextureDamage(self: *Encoder, c: *const draw.Command, d: TextureDamage, generation: u32) void {
+        if (d.width == 0 or d.height == 0 or c.uv.w == 0 or c.uv.h == 0) return;
+        const tw: f32 = @floatFromInt(d.width);
+        const th: f32 = @floatFromInt(d.height);
+        const sx = c.rect.w / (c.uv.w * tw);
+        const sy = c.rect.h / (c.uv.h * th);
+        const ox = c.rect.x - c.uv.x * tw * sx;
+        const oy = c.rect.y - c.uv.y * th * sy;
+        const key = [2]u32{ c.texture.value, generation };
+        const hash = std.hash.Wyhash.hash(0xda3a6e, std.mem.asBytes(&key));
+        for (d.rects) |r| {
+            const ax = ox + @as(f32, @floatFromInt(r.x)) * sx;
+            const bx = ox + @as(f32, @floatFromInt(r.x + r.w)) * sx;
+            const ay = oy + @as(f32, @floatFromInt(r.y)) * sy;
+            const by = oy + @as(f32, @floatFromInt(r.y + r.h)) * sy;
+            // One extra device pixel around the rect: filtering reads neighbouring texels.
+            const x0 = @max(@min(ax, bx) - 1, self.bbox[0]);
+            const y0 = @max(@min(ay, by) - 1, self.bbox[1]);
+            const x1 = @min(@max(ax, bx) + 1, self.bbox[2]);
+            const y1 = @min(@max(ay, by) + 1, self.bbox[3]);
+            self.damage_tracker.add(x0, y0, x1, y1, hash);
         }
     }
 
@@ -424,6 +467,15 @@ pub const Encoder = struct {
         }
     };
 };
+
+/// Partial damage of an image command's texture, when the texture view reports it.
+fn textureDamage(textures: anytype, c: *const draw.Command) ?TextureDamage {
+    if (c.kind != .image) return null;
+    const T = @TypeOf(textures);
+    const S = if (@typeInfo(T) == .pointer) @typeInfo(T).pointer.child else T;
+    if (!@hasDecl(S, "textureDamage")) return null;
+    return textures.textureDamage(c.texture.value);
+}
 
 /// Generation of an image command's texture (0 for other commands or unknown textures).
 fn c_gen(textures: anytype, c: *const draw.Command) u32 {
@@ -729,4 +781,59 @@ test "stream regions: clamp, merge with pending, overflow to full" {
     try std.testing.expect(m.full);
     m = mergeStreamRegions(64, 48, false, null, &.{.{ .x = 70, .y = 0, .w = 1, .h = 1 }});
     try std.testing.expect(m.empty());
+}
+
+const DamagedTextures = struct {
+    generation: u32 = 1,
+    base: u32 = 1,
+    rects: []const TextureRect = &.{},
+    pub fn textureGeneration(self: DamagedTextures, id: u32) ?u32 {
+        return if (id == 9) self.generation else null;
+    }
+    pub fn textureDamage(self: DamagedTextures, id: u32) ?TextureDamage {
+        if (id != 9 or self.rects.len == 0) return null;
+        return .{ .base = self.base, .width = 512, .height = 256, .rects = self.rects };
+    }
+};
+
+test "encoder: texture damage repaints only the changed texels (scaled image)" {
+    const gpa = std.testing.allocator;
+    var enc: Encoder = .init(gpa, .{});
+    defer enc.deinit();
+    var batch: draw.RenderBatch = .{};
+    defer batch.deinit(gpa);
+    // 512x256 texture drawn 1:1 at (0, 0) of a 512x256 target.
+    try batch.image(gpa, .{ .x = 0, .y = 0, .w = 512, .h = 256 }, draw.TextureId.init(9), .{ .w = 1, .h = 1 }, draw.Color.white, null);
+    var tex: DamagedTextures = .{};
+    var stats: FrameStats = .{};
+    try enc.build(&batch, 512, 256, .{ .a = 1 }, tex, &stats);
+    _ = try enc.plan(0, 512, 256, false, false, &stats);
+    const frame1 = enc.damage_frame;
+
+    // New frame, damage = one 10x10 texel rect at (300, 200): one tile repainted.
+    const rects = [_]TextureRect{.{ .x = 300, .y = 200, .w = 10, .h = 10 }};
+    tex = .{ .generation = 2, .base = 1, .rects = &rects };
+    stats = .{};
+    try enc.build(&batch, 512, 256, .{ .a = 1 }, tex, &stats);
+    try std.testing.expectEqual(Plan.partial, try enc.plan(frame1, 512, 256, false, false, &stats));
+    try std.testing.expect(stats.damaged_pixels <= 2 * 32 * 32);
+    var covered = false;
+    for (enc.damage_out.items) |r| {
+        if (r.x <= 300 and r.y <= 200 and r.x + r.w >= 310 and r.y + r.h >= 210) covered = true;
+    }
+    try std.testing.expect(covered);
+    const frame2 = enc.damage_frame;
+
+    // Unchanged texture: nothing to repaint.
+    stats = .{};
+    try enc.build(&batch, 512, 256, .{ .a = 1 }, tex, &stats);
+    try std.testing.expectEqual(Plan.skip, try enc.plan(frame2, 512, 256, false, false, &stats));
+
+    // Whole-image change (no rects): base bumps, the full image is damaged.
+    const frame3 = enc.damage_frame;
+    tex = .{ .generation = 3, .base = 3 };
+    stats = .{};
+    try enc.build(&batch, 512, 256, .{ .a = 1 }, tex, &stats);
+    _ = try enc.plan(frame3, 512, 256, false, false, &stats);
+    try std.testing.expectEqual(@as(u64, 512 * 256), stats.damaged_pixels);
 }

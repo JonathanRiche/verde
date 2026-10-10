@@ -67,6 +67,8 @@ pub const Graphics = struct {
     owns_fonts: bool,
     /// Compositor dma-buf feedback (format/modifier pairs), copied from the app.
     feedback: present.DmabufFeedback = .{},
+    /// Ids handed out by `importDmabufTexture` when the caller passes none.
+    next_import_id: u32 = 0x8000_0000,
 
     /// `app` may be null for offscreen-only use.
     pub fn init(gpa: std.mem.Allocator, app: ?*platform.App, options: GraphicsOptions) !*Graphics {
@@ -124,6 +126,59 @@ pub const Graphics = struct {
     /// and staging memory are reused, optional dirty rectangles. See `gpu.Renderer.streamTexture`.
     pub fn streamTexture(self: *Graphics, id: u32, width: u32, height: u32, format: gpu.TextureFormat, pixels: []const u8, options: gpu.StreamOptions) !void {
         return self.renderer.streamTexture(id, width, height, format, pixels, options);
+    }
+
+    /// A foreign dma-buf frame (browser helper, video decoder) to show as an image.
+    pub const DmabufTextureDesc = struct {
+        /// Image id to bind; `.invalid` = allocate one (returned).
+        id: draw.TextureId = .invalid,
+        /// Plane fds are borrowed (dup'd when first imported).
+        image: present.DmabufImage,
+        /// Producer buffer id; 0 = keyed by the dma-buf inode.
+        key: u64 = 0,
+        /// Producer's render-done sync_file; ownership moves to Palette. -1 = implicit sync.
+        acquire_fence: c_int = -1,
+        /// New contents (damages the image's rects). False = only rebind.
+        new_frame: bool = true,
+        /// Texels that changed since the previous frame of this id (producer damage, e.g.
+        /// WPE's damage rects); empty = all. Only those parts are repainted.
+        damage: []const gpu.TextureRect = &.{},
+    };
+
+    /// Zero-copy: shows `desc.image` through image id `desc.id` (draw it with `batch.image`
+    /// like any texture, so z-order, clips and overlays keep working). Each buffer is
+    /// imported into Vulkan once and cached by key; per frame this only records the fence
+    /// and bumps the texture generation. Once the id shows a different buffer, hand the old
+    /// one back with `dmabufReleaseFence(old_key)`. See `gpu.Renderer.importDmabufTexture`.
+    pub fn importDmabufTexture(self: *Graphics, desc: DmabufTextureDesc) !draw.TextureId {
+        var id = desc.id;
+        if (!id.valid()) {
+            id = draw.TextureId.init(self.next_import_id);
+            self.next_import_id +%= 1;
+            if (self.next_import_id == 0) self.next_import_id = 0x8000_0000;
+        }
+        try self.renderer.importDmabufTexture(id.value, desc.image, .{ .key = desc.key, .acquire_fence = desc.acquire_fence, .new_frame = desc.new_frame, .damage = desc.damage });
+        return id;
+    }
+
+    /// Sync_file (caller owns) that signals when Palette stopped reading buffer `key`, or
+    /// -1 if it is free already (CPU wait fallback without SYNC_FD export).
+    pub fn dmabufReleaseFence(self: *Graphics, key: u64) c_int {
+        return self.renderer.takeDmabufReleaseFence(key);
+    }
+
+    /// Forgets buffer `key` (producer destroyed it); ids bound to it are released.
+    pub fn releaseDmabuf(self: *Graphics, key: u64) void {
+        self.renderer.releaseDmabufImport(key);
+    }
+
+    /// (fourcc, modifier) pairs this GPU can import, for the producer handshake.
+    pub fn dmabufImportFormats(self: *Graphics, gpa: std.mem.Allocator, out: *std.ArrayList(present.FormatModifier)) !void {
+        return self.renderer.appendDmabufImportFormats(gpa, out);
+    }
+
+    pub fn releaseTexture(self: *Graphics, id: u32) void {
+        self.renderer.releaseTexture(id);
     }
 };
 
