@@ -1,0 +1,170 @@
+[
+  {
+    "id": "tokyo-night",
+    "name": "Tokyo Night",
+    "colors": {
+      "background": "#1a1b26",
+      "panel": "#1a1b26",
+      "panel_alt": "#23242f",
+      "panel_muted": "#393a45",
+      "text": "#a9b1d6",
+      "text_muted": "#8f96b6",
+      "text_subtle": "#5f637a",
+      "accent": "#7aa2f7",
+      "accent_dim": "#7aa2f736",
+      "border": "#50679b",
+      "border_muted": "#393a45",
+      "warning": "#e0af68",
+      "diff_add": "#54b76b",
+      "diff_remove": "#e86465",
+      "selection": "#2f3954"
+    }
+  },
+  {
+    "id": "catppuccin",
+    "name": "Catppuccin",
+    "colors": {
+      "background": "#1e1e2e",
+      "panel": "#1e1e2e",
+      "panel_alt": "#272737",
+      "panel_muted": "#3d3d4d",
+      "text": "#cdd6f4",
+      "text_muted": "#aeb5d0",
+      "text_subtle": "#72768d",
+      "accent": "#89b4fa",
+      "accent_dim": "#89b4fa36",
+      "border": "#5a72a0",
+      "border_muted": "#3d3d4d",
+      "warning": "#f9e2af",
+      "diff_add": "#5bbf71",
+      "diff_remove": "#ef6c6b",
+      "selection": "#363f5b"
+    }
+  },
+  {
+    "id": "gruvbox",
+    "name": "Gruvbox",
+    "colors": {
+      "background": "#282828",
+      "panel": "#282828",
+      "panel_alt": "#313131",
+      "panel_muted": "#474747",
+      "text": "#d4be98",
+      "text_muted": "#b5a384",
+      "text_subtle": "#7b705e",
+      "accent": "#7daea3",
+      "accent_dim": "#7daea336",
+      "border": "#58736d",
+      "border_muted": "#474747",
+      "warning": "#d8a657",
+      "diff_add": "#5dba5e",
+      "diff_remove": "#f16759",
+      "selection": "#3b4543"
+    }
+  },
+  {
+    "id": "kanagawa",
+    "name": "Kanagawa",
+    "colors": {
+      "background": "#1f1f28",
+      "panel": "#1f1f28",
+      "panel_alt": "#282831",
+      "panel_muted": "#3e3e47",
+      "text": "#dcd7ba",
+      "text_muted": "#bab6a0",
+      "text_subtle": "#7a776e",
+      "accent": "#7e9cd8",
+      "accent_dim": "#7e9cd836",
+      "border": "#54658b",
+      "border_muted": "#3e3e47",
+      "warning": "#c0a36e",
+      "diff_add": "#5ebf65",
+      "diff_remove": "#f26c60",
+      "selection": "#343b4f"
+    }
+  },
+  {
+    "id": "matte-black",
+    "name": "Matte Black",
+    "colors": {
+      "background": "#121212",
+      "panel": "#121212",
+      "panel_alt": "#1b1b1b",
+      "panel_muted": "#313131",
+      "text": "#bebebe",
+      "text_muted": "#9f9f9f",
+      "text_subtle": "#656565",
+      "accent": "#e68e0d",
+      "accent_dim": "#e68e0d36",
+      "border": "#89570f",
+      "border_muted": "#313131",
+      "warning": "#b91c1c",
+      "diff_add": "#58ba66",
+      "diff_remove": "#ec6760",
+      "selection": "#412d11"
+    }
+  },
+  {
+    "id": "osaka-jade",
+    "name": "Osaka Jade",
+    "colors": {
+      "background": "#111c18",
+      "panel": "#111c18",
+      "panel_alt": "#1a2521",
+      "panel_muted": "#303b37",
+      "text": "#c1c497",
+      "text_muted": "#a1a680",
+      "text_subtle": "#656d55",
+      "accent": "#509475",
+      "accent_dim": "#50947536",
+      "border": "#345f4c",
+      "border_muted": "#303b37",
+      "warning": "#459451",
+      "diff_add": "#59bb5e",
+      "diff_remove": "#ed6859",
+      "selection": "#1f362c"
+    }
+  },
+  {
+    "id": "ristretto",
+    "name": "Ristretto",
+    "colors": {
+      "background": "#2c2525",
+      "panel": "#2c2525",
+      "panel_alt": "#352e2e",
+      "panel_muted": "#4b4444",
+      "text": "#e6d9db",
+      "text_muted": "#c5b9ba",
+      "text_subtle": "#857b7c",
+      "accent": "#f38d70",
+      "accent_dim": "#f38d7036",
+      "border": "#9b5f4f",
+      "border_muted": "#4b4444",
+      "warning": "#f9cc6c",
+      "diff_add": "#60bf6c",
+      "diff_remove": "#f46c66",
+      "selection": "#583c36"
+    }
+  },
+  {
+    "id": "catppuccin-latte",
+    "name": "Catppuccin Latte",
+    "colors": {
+      "background": "#eff1f5",
+      "panel": "#eff1f5",
+      "panel_alt": "#e6e8ec",
+      "panel_muted": "#d0d2d6",
+      "text": "#4c4f69",
+      "text_muted": "#696c82",
+      "text_subtle": "#a1a3b2",
+      "accent": "#1e66f5",
+      "accent_dim": "#1e66f536",
+      "border": "#7aa3f5",
+      "border_muted": "#d0d2d6",
+      "warning": "#df8e1d",
+      "diff_add": "#42a455",
+      "diff_remove": "#d6514f",
+      "selection": "#c1d2f5"
+    }
+  }
+]

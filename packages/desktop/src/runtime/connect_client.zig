@@ -16,6 +16,9 @@ const gateway_transport = @import("gateway_transport.zig");
 const headless = @import("headless");
 const profile = @import("profile.zig");
 const utils = @import("../utils.zig");
+/// OS credential store, shared with optional runtime integrations so their
+/// durable secrets use the same audited keyring path.
+pub const credential_store = @import("credential_store.zig");
 
 const log = std.log.scoped(.native_connect_session);
 

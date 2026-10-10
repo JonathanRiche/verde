@@ -94,6 +94,7 @@ android {
     buildTypes {
         release { signingConfig = signingConfigs.findByName("upload") }
     }
+    sourceSets.getByName("main").assets.srcDir(rootProject.file("../../assets/mobile"))
     sourceSets.getByName("main").jniLibs.srcDir(layout.buildDirectory.dir("generated/jniLibs"))
     buildFeatures {
         compose = true

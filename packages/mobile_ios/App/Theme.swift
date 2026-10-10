@@ -19,7 +19,7 @@ enum VerdeTheme {
     /// Android's attention badge uses errorContainer/onErrorContainer, rather
     /// than bright error text. Host themes tint their own panel and text.
     static var attentionBackground: Color {
-        if AppearanceSettings.shared.mode == .host, AppearanceSettings.shared.palette != nil {
+        if AppearanceSettings.shared.activePalette != nil {
             return danger.opacity(0.18)
         }
         return AppearanceSettings.shared.color("attention_background", fallback: 0x422829, light: 0xf6dddd)

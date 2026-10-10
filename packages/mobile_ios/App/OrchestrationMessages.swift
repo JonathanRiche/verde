@@ -143,41 +143,69 @@ func orchestrationDisplayBody(role: String, body: String) -> String {
     return parentSteerBody(role: role, body: body) ?? body
 }
 
-/// Long child replies collapse to a short preview (desktop: 6 lines or 480 UTF-8 bytes); a
-/// toggle is offered only when it would reveal at least 16 more bytes.
-struct ChildReplyPreview: Equatable {
-    let full: String
-    /// Nil when the reply is short enough to show whole.
-    let collapsed: String?
+extension ChildStatus {
+    /// Statuses where the human must act; their result rows open expanded.
+    var expandedByDefault: Bool { self == .waiting_approval || self == .blocked || self == .failed }
 }
 
-let childReplyCollapsedLines = 6
-let childReplyCollapsedBytes = 480
+let childFallbackTitle = "Linked chat"
 
-func childReplyPreview(_ reply: String) -> ChildReplyPreview {
-    let whitespace: Set<UInt8> = [newline, UInt8(ascii: "\r"), UInt8(ascii: "\t"), UInt8(ascii: " ")]
-    var bytes = Array(reply.utf8)[...]
-    while let first = bytes.first, whitespace.contains(first) { bytes = bytes.dropFirst() }
-    while let last = bytes.last, whitespace.contains(last) { bytes = bytes.dropLast() }
-    let start = bytes.startIndex
-    var end = start + min(bytes.count, childReplyCollapsedBytes)
-    var lines = 0
-    for index in start..<end where bytes[index] == newline {
-        lines += 1
-        if lines == childReplyCollapsedLines { end = index; break }
+/// The child chat's display title from the app's known threads (link state is irrelevant). Never
+/// shows the raw thread id: an unknown or untitled child reads as "Linked chat".
+func childTitle(childID: String, knownTitle: String?) -> String {
+    guard let title = knownTitle?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty, title != childID else {
+        return childFallbackTitle
     }
-    // Back up to a scalar boundary (never split a UTF-8 sequence).
-    while end > start && end < bytes.endIndex && (bytes[end] & 0xC0) == 0x80 { end -= 1 }
-    let full = text(bytes)
-    if end >= bytes.endIndex || bytes.endIndex - end < 16 { return ChildReplyPreview(full: full, collapsed: nil) }
-    var preview = bytes[start..<end]
-    while let last = preview.last, whitespace.contains(last) { preview = preview.dropLast() }
-    return ChildReplyPreview(full: full, collapsed: text(preview))
+    return title
 }
 
-private let providerLabels = ["codex": "Codex", "claude": "Claude", "cursor": "Cursor", "opencode": "OpenCode",
-                              "pi": "Pi", "fx": "FX", "grok": "Grok", "muse": "Muse", "amp": "Amp"]
+let childSummaryMaxCharacters = 200
 
-func providerLabel(_ provider: String) -> String {
-    providerLabels[provider] ?? provider.prefix(1).uppercased() + provider.dropFirst()
+private func pattern(_ source: String, _ options: NSRegularExpression.Options = []) -> NSRegularExpression {
+    // Literal patterns below; a failure is a programming error.
+    try! NSRegularExpression(pattern: source, options: options)
+}
+
+private let summaryFence = pattern(#"^(```|~~~)"#)
+private let summaryRule = pattern(#"^([-*_]\s*){3,}$"#)
+private let summaryLineMarkers = pattern(#"^(?:>\s*)*(?:#{1,6}\s+|[-*+]\s+|\d{1,3}[.)]\s+)?"#)
+private let summaryBoldLabel = pattern(#"^(\*\*|__)\s*[^*_\n]{1,48}?\s*(?::\s*\1|\1\s*:)\s*"#)
+private let summaryPlainLabel = pattern(#"^(?:summary|tl;dr)\s*:\s*"#, .caseInsensitive)
+private let summaryLink = pattern(#"!?\[([^\]]*)\]\([^)]*\)"#)
+private let summaryEmphasis = pattern(#"\*\*|__|\*|~~|`"#)
+private let summarySpaces = pattern(#"\s+"#)
+private let summarySentenceEnd = pattern(#"[.!?](?=\s)"#)
+
+private func matches(_ regex: NSRegularExpression, _ text: String) -> Bool {
+    regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) != nil
+}
+
+private func replacing(_ regex: NSRegularExpression, _ text: String, _ template: String = "") -> String {
+    regex.stringByReplacingMatches(in: text, range: NSRange(text.startIndex..., in: text), withTemplate: template)
+}
+
+/// One plain-language line for a collapsed child result: the first sentence of the first prose
+/// line, with markdown and a leading bold label ("**Summary:**") removed. Code blocks and rules
+/// are skipped. Empty when the reply has no prose.
+func childReplySummary(_ reply: String) -> String {
+    var inFence = false
+    for raw in reply.components(separatedBy: .newlines) {
+        var line = raw.trimmingCharacters(in: .whitespaces)
+        if matches(summaryFence, line) { inFence.toggle(); continue }
+        if inFence || line.isEmpty || matches(summaryRule, line) { continue }
+        line = replacing(summaryLineMarkers, line)
+        line = replacing(summaryBoldLabel, line)
+        line = replacing(summaryLink, line, "$1")
+        line = replacing(summaryEmphasis, line)
+        line = replacing(summaryPlainLabel, replacing(summarySpaces, line, " ").trimmingCharacters(in: .whitespaces))
+        if line.isEmpty { continue }
+        if let end = summarySentenceEnd.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)),
+           let range = Range(end.range, in: line) {
+            line = String(line[..<range.upperBound])
+        }
+        if line.count <= childSummaryMaxCharacters { return line }
+        let cut = String(line.prefix(childSummaryMaxCharacters))
+        return cut.trimmingCharacters(in: .whitespaces) + "\u{2026}"
+    }
+    return ""
 }
