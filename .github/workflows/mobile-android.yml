@@ -50,6 +50,10 @@ jobs:
             ~/.gradle/wrapper
           key: android-zig-${{ env.ZIG_VERSION }}-${{ hashFiles('packages/client_core/build.zig', 'packages/client_core/build.zig.zon', 'packages/mobile_android/gradle/**', 'packages/mobile_android/**/*.gradle.kts') }}
 
+      - name: Test Android app
+        working-directory: packages/mobile_android
+        run: ./gradlew --no-daemon --console=plain testDebugUnitTest
+
       - name: Build release bundle
         working-directory: packages/mobile_android
         env:

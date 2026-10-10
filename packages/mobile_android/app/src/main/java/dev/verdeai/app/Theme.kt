@@ -44,6 +44,8 @@ internal data class VerdePalette(
     val Heading2: Color = Color(0xFFF6D27A),
     val Heading3: Color = Color(0xFF99DCB3),
     val Heading4: Color = Color(0xFFD0D1D6),
+    val WarningPanel: Color = Color(0xFF443B22),
+    val DangerPanel: Color = Color(0xFF422829),
 ) {
     val AccentWash get() = Accent.copy(alpha = .19f)
 }
@@ -58,6 +60,7 @@ internal val LightPalette = VerdePalette(
     UserBubble = Color(0xFFD8EDDF), Assistant = Color.White, DiffAdd = Color(0xFF147849),
     Heading1 = Color(0xFF805B00), Heading2 = Color(0xFF86620D),
     Heading3 = Color(0xFF197D43), Heading4 = Color(0xFF46594E),
+    WarningPanel = Color(0xFFF4E6BE), DangerPanel = Color(0xFFF6DDDD),
 )
 internal val LocalVerdePalette = staticCompositionLocalOf { DarkPalette }
 internal val VerdeColors: VerdePalette @Composable get() = LocalVerdePalette.current
@@ -85,9 +88,9 @@ private fun verdeScheme(p: VerdePalette) = (if (p.dark) darkColorScheme() else l
     secondary = p.AccentHi, onSecondary = if (p.dark) p.Background else Color.White,
     secondaryContainer = p.PanelAlt, onSecondaryContainer = p.Text,
     tertiary = p.Warning, onTertiary = if (p.dark) p.Background else Color.White,
-    tertiaryContainer = if (p.dark) Color(0xFF443B22) else Color(0xFFF4E6BE), onTertiaryContainer = p.Text,
+    tertiaryContainer = p.WarningPanel, onTertiaryContainer = p.Text,
     error = p.Danger, onError = if (p.dark) p.Background else Color.White,
-    errorContainer = if (p.dark) Color(0xFF422829) else Color(0xFFF6DDDD), onErrorContainer = p.Text,
+    errorContainer = p.DangerPanel, onErrorContainer = p.Text,
     background = p.Background, onBackground = p.Text,
     surface = p.Background, onSurface = p.Text,
     surfaceVariant = p.PanelAlt, onSurfaceVariant = p.Muted,
@@ -104,7 +107,7 @@ internal fun VerdeTheme(content: @Composable () -> Unit) {
     val context = LocalContext.current
     val inherited = LocalAppearanceSettings.current
     val settings = inherited ?: remember(context) { AppearanceSettings(context) }
-    val palette = if (settings.mode.isDark(isSystemInDarkTheme())) DarkPalette else LightPalette
+    val palette = settings.palette(isSystemInDarkTheme())
     CompositionLocalProvider(LocalAppearanceSettings provides settings, LocalVerdePalette provides palette) {
         MaterialTheme(colorScheme = verdeScheme(palette), typography = VerdeTypography,
             shapes = Shapes(extraSmall = RoundedCornerShape(7.dp), small = RoundedCornerShape(7.dp),

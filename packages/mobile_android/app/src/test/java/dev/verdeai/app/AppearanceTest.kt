@@ -35,6 +35,29 @@ class AppearanceTest {
         }
     }
 
+    private fun selectTheme(label: String) {
+        compose.onNodeWithTag("appearance-theme-picker").performClick()
+        compose.onNodeWithTag("appearance-theme-list").performScrollToNode(hasText(label))
+        compose.onNodeWithText(label, substring = false).performClick()
+    }
+
+    @Test fun bundledPalettesMatchTheWebsiteAndOverrideSystemAppearance() {
+        val settings = AppearanceSettings(context)
+        val themes = bundledThemes(context)
+        assertEquals(AppearanceMode.entries.mapNotNull { it.themeId }.toSet(), themes.keys)
+        assertEquals(8, themes.size)
+        for (mode in AppearanceMode.entries.filter { it.themeId != null }) {
+            assertEquals(mode.label, themes.getValue(mode.themeId!!).name)
+            settings.select(mode)
+            val palette = settings.palette(false)
+            assertEquals(palette, settings.palette(true))
+            assertEquals(mode != AppearanceMode.CATPPUCCIN_LATTE, palette.dark)
+            assertNotEquals(palette.Background, palette.Text)
+        }
+        assertEquals("#1a1b26", themes.getValue("tokyo-night").colors["background"])
+        assertEquals("#1e66f5", themes.getValue("catppuccin-latte").colors["accent"])
+    }
+
     @Test fun selectionUpdatesCustomAndMaterialColorsAndSystemTracksConfiguration() {
         val settings = AppearanceSettings(context)
         var systemDark by mutableStateOf(false)
@@ -59,16 +82,23 @@ class AppearanceTest {
         }
         compose.runOnIdle { assertEquals(LightPalette, palette); systemDark = true }
         compose.runOnIdle { assertEquals(DarkPalette, palette) }
-        compose.onNodeWithText("Light", substring = false).performClick()
+        selectTheme("Light")
         compose.runOnIdle {
             assertEquals(LightPalette, palette)
             assertEquals(palette.Background, surface)
             assertEquals(AppearanceMode.LIGHT, AppearanceSettings(context).mode)
         }
-        compose.onNodeWithText("Dark", substring = false).performClick()
+        selectTheme("Dark")
         compose.runOnIdle { systemDark = false }
         compose.runOnIdle { assertEquals(DarkPalette, palette); assertEquals(palette.Background, surface) }
-        compose.onNodeWithText("System", substring = false).performClick()
+        selectTheme("Tokyo Night")
+        compose.runOnIdle { assertEquals(settings.palette(false), palette); assertEquals(palette.Background, surface) }
+        selectTheme("Catppuccin Latte")
+        compose.runOnIdle { assertFalse(palette.dark); assertEquals(palette.Background, surface); systemDark = true }
+        compose.runOnIdle { assertFalse(palette.dark) }
+        selectTheme("Ristretto")
+        compose.runOnIdle { assertTrue(palette.dark); assertEquals(settings.palette(false), palette); systemDark = false }
+        selectTheme("System")
         compose.runOnIdle { assertEquals(LightPalette, palette) }
     }
 }

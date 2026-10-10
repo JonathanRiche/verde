@@ -33,7 +33,7 @@ Verify that the pairing screen opens without a native loading crash.
 ## Appearance
 
 `Theme.kt` maps the web client's `web/src/styles.css` tokens to light and dark
-Compose themes. Settings → Appearance offers System (the default), Light, and Dark;
+Compose themes. Settings → Appearance offers System (the default), Light, Dark, and eight website presets;
 the choice is saved on the phone and System follows the phone’s appearance. The phone shell uses a left workspace/chat drawer; Home,
 Workspaces, Hosts, history and management routes remain available. Controls
 keep Android's 48 dp minimum touch targets while using the web's compact
