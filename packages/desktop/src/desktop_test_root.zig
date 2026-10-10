@@ -9,6 +9,8 @@ test {
     _ = @import("main.zig");
     _ = @import("cli/main.zig");
     _ = @import("browser/screenshot.zig");
+    // The GUI side of the Linux helper protocol (shm slots, frame socket).
+    if (@import("builtin").os.tag == .linux) _ = @import("browser/platform/linux_wpe.zig");
     _ = @import("ipc/server.zig");
     _ = @import("platform/mod.zig");
     _ = @import("platform/workspace_identity.zig");

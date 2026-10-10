@@ -52,7 +52,6 @@ const Storage = native_state.Storage;
 const log = native_state.log;
 const UI_THREAD_STALL_LOG_THRESHOLD_NS: u64 = 50 * std.time.ns_per_ms;
 
-
 pub const std_options: std.Options = .{
     .enable_segfault_handler = true,
     .logFn = runtime_log.logFn,
@@ -278,6 +277,8 @@ fn mainInner(init: std.process.Init) !void {
         palette_frame_renderer.Renderer.releasePaneTextureCallback,
     );
     defer browser_texture.configureExternalUploader(null, null, null);
+    browser_texture.configureDmabufImporter(palette_renderer.dmabufImporter());
+    defer browser_texture.configureDmabufImporter(null);
     runtime_log.diagnostic("palette renderer active backend={s}", .{palette_frame_renderer.backend_name});
 
     var ui_scale = currentWindowDisplayScale(window);
@@ -701,7 +702,7 @@ fn syncMouseCursor(state: *AppState, cache: *CursorState) void {
         return;
     }
     // WKWebView and windowed WebView2 apply CSS cursors themselves. Calling
-    // SDL_SetCursor while their child view is hit would overwrite that choice.
+    // Window.setCursor while their child view is hit would overwrite that choice.
     if (!modalHitAtMouse(state) and state.nativeBrowserOwnsCursor()) {
         cache.native_browser_owned = true;
         return;

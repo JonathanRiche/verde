@@ -7,6 +7,7 @@ const browser_queue = @import("../queue.zig");
 const browser_texture = @import("../texture.zig");
 const browser_types = @import("../types.zig");
 const ipc = @import("linux_ipc.zig");
+const fp = @import("frame_protocol.zig");
 const loop_wakeup = @import("loop_wakeup");
 
 const log = std.log.scoped(.linux_wpe);
@@ -15,6 +16,13 @@ const DEFAULT_WIDTH: u32 = 1280;
 const DEFAULT_HEIGHT: u32 = 720;
 const FRAME_FD_BASE: std.posix.fd_t = 240;
 const FRAME_SLOT_COUNT: usize = 3;
+/// The helper's end of the zero-copy frame socket sits right after the shm slots.
+const FRAME_SOCKET_FD: std.posix.fd_t = fp.socket_fd;
+comptime {
+    std.debug.assert(FRAME_SOCKET_FD == FRAME_FD_BASE + FRAME_SLOT_COUNT);
+}
+/// Cached dma-buf imports per helper (WebKit cycles through a few buffers).
+const DMABUF_KEY_CACHE = 16;
 const FRAME_BYTES_MAX: usize = 4096 * 2160 * 4;
 const IPC_LINE_BUFFER_BYTES = 256 * 1024;
 
@@ -261,6 +269,8 @@ const SharedFrame = struct {
     slots: [FRAME_SLOT_COUNT][]align(std.heap.page_size_min) u8 = undefined,
     slot_ready: [FRAME_SLOT_COUNT]bool = [_]bool{false} ** FRAME_SLOT_COUNT,
     current_slot: ?u8 = null,
+    /// The latest frame came over the frame socket (no shm pixels).
+    current_dmabuf: bool = false,
     releases: [FRAME_SLOT_COUNT * 2]FrameRelease = undefined,
     release_count: usize = 0,
     path: ?[]u8 = null,
@@ -318,6 +328,7 @@ const SharedFrame = struct {
         }
         self.path = null;
         self.current_slot = null;
+        self.current_dmabuf = false;
         self.sequence = 0;
         self.width = 0;
         self.height = 0;
@@ -372,7 +383,8 @@ const SharedFrame = struct {
             }
             return false;
         }
-        if (event.frame_path == null) {
+        const dmabuf = event.frame_path == null and event.frame_slot == fp.dmabuf_frame_slot;
+        if (event.frame_path == null and !dmabuf) {
             if (event.frame_slot >= FRAME_SLOT_COUNT) return error.InvalidFrameSlot;
             if (!self.slot_ready[event.frame_slot]) return error.InvalidFrameSlot;
             if (event.byte_len > self.slots[event.frame_slot].len) return error.FrameTooLarge;
@@ -387,8 +399,12 @@ const SharedFrame = struct {
             allocator.free(old_path);
             self.path = null;
         }
+        self.current_dmabuf = dmabuf;
         if (event.frame_path) |path| {
             self.path = try allocator.dupe(u8, path);
+            self.current_slot = null;
+        } else if (dmabuf) {
+            // Pixels arrived over the frame socket; the main thread imports them.
             self.current_slot = null;
         } else {
             self.current_slot = event.frame_slot;
@@ -480,6 +496,35 @@ const SharedFrame = struct {
         return true;
     }
 
+    /// Records that a dma-buf frame up to `sequence` is bound to the pane
+    /// texture, settling the matching `frame_ready` whichever arrived first.
+    fn noteDmabufShown(self: *SharedFrame, sequence: u64, exported_at_ns: u64, imported: bool) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (imported) {
+            self.metrics.upload_completed += 1;
+            self.uploaded_sequence = sequence;
+            self.uploaded_exported_at_ns = exported_at_ns;
+            self.uploaded_input_serial = 0;
+            self.uploaded_input_sent_at_ns = 0;
+        }
+        if (self.current_dmabuf and self.dirty and self.sequence <= sequence) {
+            self.dirty = false;
+            if (self.sequence == self.uploaded_sequence) {
+                self.uploaded_input_serial = self.input_serial;
+                self.uploaded_input_sent_at_ns = self.input_sent_at_ns;
+            }
+        }
+    }
+
+    /// Sequence of the newest frame the helper announced on stdout, and
+    /// whether it was a dma-buf frame.
+    fn latest(self: *SharedFrame) struct { sequence: u64, dmabuf: bool } {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return .{ .sequence = self.sequence, .dmabuf = self.current_dmabuf };
+    }
+
     fn notePresented(self: *SharedFrame, presented_at_ns: u64) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -504,6 +549,21 @@ const HIDDEN_PAINT_RESUME_AFTER_NS: u64 = 13 * std.time.ns_per_s;
 const PAINT_ACK_WAIT_MAX_MS: u32 = 1500;
 const PAINT_ACK_WAIT_STEP_MS: u32 = 5;
 
+/// A FRAME received over the frame socket, not yet bound to the pane texture.
+const PendingDmabuf = struct {
+    msg: fp.Frame,
+    rx: fp.Received,
+};
+
+/// The dma-buf frame the pane texture currently shows.
+const ShownDmabuf = struct {
+    sequence: u64,
+    key: u64,
+    texture_id: c_uint,
+    width: u32,
+    height: u32,
+};
+
 pub const Controller = struct {
     allocator: std.mem.Allocator,
     child_pid: ?std.posix.pid_t = null,
@@ -526,6 +586,19 @@ pub const Controller = struct {
     host_window: u64 = 0,
     current_url: ?[]u8 = null,
     next_input_serial: u64 = 0,
+    /// GUI end of the zero-copy frame socket (null: shm slots only).
+    frame_socket: ?std.posix.fd_t = null,
+    frame_mode: fp.Mode = .shm,
+    dmabuf_pending: ?PendingDmabuf = null,
+    dmabuf_shown: ?ShownDmabuf = null,
+    dmabuf_keys: [DMABUF_KEY_CACHE]u64 = @splat(0),
+    dmabuf_key_count: usize = 0,
+    /// A dma-buf frame was bound outside `uploadFrame` (screenshot); the next
+    /// upload refreshes the pane texture metadata.
+    dmabuf_texture_stale: bool = false,
+    dmabuf_import_failed_logged: bool = false,
+    /// Renderer texture id of the pane, from the last `uploadFrame`.
+    pane_texture_id: c_uint = 0,
 
     /// Creates the helper-backed Linux browser controller.
     pub fn init(allocator: std.mem.Allocator) !Controller {
@@ -562,6 +635,7 @@ pub const Controller = struct {
             thread.join();
             self.reader_thread = null;
         }
+        self.closeFrameSocket();
         if (self.current_url) |url| self.allocator.free(url);
         self.frame_buffer.deinit(self.allocator);
         self.queue.deinit(self.allocator);
@@ -790,7 +864,7 @@ pub const Controller = struct {
         }
         if (event.key_code == 0) return false;
         // WebKit interprets printable keysyms on dispatch and inserts the
-        // character itself, but SDL's text_input event (the `.text` branch
+        // character itself, but the platform text_input event (the `.text` branch
         // above) is the source of truth for typed text — it alone carries
         // shifted and IME-composed characters. Dispatching printable keysyms
         // here as well doubles every typed character, so swallow them and let
@@ -833,7 +907,25 @@ pub const Controller = struct {
     /// Uploads the latest helper snapshot into the pane texture, if a new frame is ready.
     pub fn uploadFrame(self: *Controller, texture: *browser_texture.PaneTexture) !bool {
         try self.flushFrameReleases();
-        const uploaded = try self.frame.uploadIntoTexture(self.allocator, &self.frame_buffer, texture);
+        self.pumpFrameSocket();
+        var uploaded = try self.frame.uploadIntoTexture(self.allocator, &self.frame_buffer, texture);
+        if (uploaded) {
+            // A shm frame replaced the dma-buf one in the same texture.
+            self.retireShownDmabuf(0, texture.width, texture.height);
+        }
+        if (self.dmabuf_pending) |pending| {
+            self.dmabuf_pending = null;
+            if (self.applyDmabuf(pending, texture.texture_id)) uploaded = true;
+        }
+        if (self.dmabuf_shown) |shown| {
+            if (uploaded or self.dmabuf_texture_stale or texture.texture_id != shown.texture_id) {
+                texture.update(shown.texture_id, shown.width, shown.height, true);
+                uploaded = true;
+            }
+            self.dmabuf_texture_stale = false;
+            self.frame.noteDmabufShown(shown.sequence, 0, false);
+        }
+        self.pane_texture_id = texture.texture_id;
         try self.flushFrameReleases();
         return uploaded;
     }
@@ -847,6 +939,23 @@ pub const Controller = struct {
     /// no frame has been produced yet (e.g. browser not shown).
     pub fn copyFramePixels(self: *Controller, allocator: std.mem.Allocator) !?browser_texture.CopiedFrame {
         try self.refreshPausedFrame();
+        if (self.frame.latest().dmabuf) {
+            // The newest frame lives only on the GPU: bind it if needed, then
+            // read the pane texture back.
+            self.pumpFrameSocket();
+            if (self.dmabuf_pending) |pending| {
+                self.dmabuf_pending = null;
+                const texture_id = if (self.dmabuf_shown) |shown| shown.texture_id else self.pane_texture_id;
+                if (self.applyDmabuf(pending, texture_id)) self.dmabuf_texture_stale = true;
+            }
+            self.flushFrameReleases() catch {};
+            const shown = self.dmabuf_shown orelse return null;
+            const importer = browser_texture.dmabufImporter() orelse return null;
+            self.frame.mutex.lock();
+            self.frame.metrics.screenshot_copies += 1;
+            self.frame.mutex.unlock();
+            return try importer.readback(importer.context, allocator, shown.texture_id, shown.width, shown.height);
+        }
         var frame_width: u32 = 0;
         var frame_height: u32 = 0;
         var frame_byte_len: usize = 0;
@@ -897,6 +1006,7 @@ pub const Controller = struct {
             // Hidden panes never upload, so return slots here or the helper
             // can only defer the frame it is waiting to publish.
             self.flushFrameReleases() catch {};
+            self.pumpFrameSocket();
             if (self.frame.paintAckSatisfied(token)) {
                 // The helper restarted its grace at the request; captures
                 // within it see live painting.
@@ -934,6 +1044,17 @@ pub const Controller = struct {
             for (fds) |fd| _ = std.c.close(fd);
             self.frame.deinit(self.allocator);
         };
+        // Zero-copy frames need the shm slots too (the helper falls back to
+        // them per frame), so the socket only comes with them.
+        const frame_socket_pair: ?[2]std.posix.fd_t = if (frame_fds != null) createFrameSocketPair() catch |err| pair: {
+            log.warn("browser frame socket unavailable: {}; using shm frames", .{err});
+            break :pair null;
+        } else null;
+        var frame_socket_to_close = frame_socket_pair;
+        errdefer if (frame_socket_to_close) |pair| {
+            _ = std.c.close(pair[0]);
+            _ = std.c.close(pair[1]);
+        };
 
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
@@ -946,7 +1067,12 @@ pub const Controller = struct {
         const child_pid = std.c.fork();
         if (child_pid < 0) return error.Unexpected;
         if (child_pid == 0) {
-            execHelperChild(helper_dir_z.ptr, helper_path_z.ptr, argv.ptr, stdin_pipe, stdout_pipe, frame_fds);
+            execHelperChild(helper_dir_z.ptr, helper_path_z.ptr, argv.ptr, stdin_pipe, stdout_pipe, frame_fds, if (frame_socket_pair) |pair| pair[1] else null);
+        }
+        if (frame_socket_pair) |pair| {
+            _ = std.c.close(pair[1]);
+            self.frame_socket = pair[0];
+            frame_socket_to_close = null;
         }
 
         if (frame_fds) |fds| {
@@ -973,6 +1099,8 @@ pub const Controller = struct {
         errdefer self.allocator.destroy(context);
 
         self.reader_thread = try std.Thread.spawn(.{}, helperReaderMain, .{context});
+        // The helper waits (bounded) for HELLO while it creates the view.
+        self.sendFrameHello();
     }
 
     // Serializes and sends one JSON-line command to the browser helper.
@@ -1012,6 +1140,194 @@ pub const Controller = struct {
             self.frame.metrics.slot_releases += 1;
             self.frame.mutex.unlock();
         }
+    }
+
+    /// Announces the dma-buf formats the renderer can import. An empty list
+    /// (no importer, or a backend without dma-buf import) selects shm.
+    fn sendFrameHello(self: *Controller) void {
+        const socket = self.frame_socket orelse return;
+        const hello = self.allocator.create(fp.Hello) catch {
+            self.closeFrameSocket();
+            return;
+        };
+        defer self.allocator.destroy(hello);
+        hello.* = .{};
+        if (frameTransportForcedShm()) {
+            log.info("browser frame transport forced to shm", .{});
+        } else if (browser_texture.dmabufImporter()) |importer| {
+            var formats: std.ArrayList(browser_texture.DmabufFormat) = .empty;
+            defer formats.deinit(self.allocator);
+            importer.formats(importer.context, self.allocator, &formats) catch |err| {
+                log.warn("dma-buf import formats unavailable: {}; using shm frames", .{err});
+                formats.clearRetainingCapacity();
+            };
+            for (formats.items) |format| {
+                if (hello.count >= fp.max_formats) break;
+                hello.formats[hello.count] = .{ .fourcc = format.fourcc, .modifier = format.modifier };
+                hello.count += 1;
+            }
+        }
+        fp.send(socket, std.mem.asBytes(hello)[0..hello.wireLen()], &.{}) catch |err| {
+            log.warn("browser frame socket HELLO failed: {}; using shm frames", .{err});
+            self.closeFrameSocket();
+            return;
+        };
+        log.info("browser frame socket: offered {d} dma-buf format(s)", .{hello.count});
+    }
+
+    /// Drains the frame socket: keeps the newest FRAME pending, hands
+    /// superseded ones straight back (their damage carries forward), and
+    /// records the negotiated mode. Main thread only.
+    fn pumpFrameSocket(self: *Controller) void {
+        const socket = self.frame_socket orelse return;
+        var buffer: [@sizeOf(fp.Frame) + 64]u8 align(8) = undefined;
+        while (true) {
+            const received = fp.recv(socket, &buffer) catch |err| {
+                if (err != error.Closed) log.warn("browser frame socket receive failed: {}", .{err});
+                // The helper falls back to shm on hangup; so do we.
+                self.closeFrameSocket();
+                return;
+            } orelse return;
+            var rx = received;
+            if (fp.as(fp.Frame, &buffer, rx.len)) |frame_msg| {
+                var msg = frame_msg.*;
+                if (self.dmabuf_pending) |*older| {
+                    self.releaseHelperFrame(older.msg.sequence, -1);
+                    older.rx.closeFds();
+                    mergeDamage(&msg, &older.msg);
+                }
+                self.dmabuf_pending = .{ .msg = msg, .rx = rx };
+            } else if (fp.as(fp.ModeMsg, &buffer, rx.len)) |mode| {
+                rx.closeFds();
+                self.frame_mode = mode.mode;
+                log.info("browser frame transport: {s}", .{if (mode.mode == .dmabuf) "dmabuf (zero-copy)" else "shm"});
+            } else {
+                rx.closeFds();
+            }
+        }
+    }
+
+    /// Binds a received dma-buf frame to `texture_id` (0 = allocate).
+    /// Releases it right away when it is stale or cannot be imported.
+    fn applyDmabuf(self: *Controller, pending_frame: PendingDmabuf, texture_id: c_uint) bool {
+        var pending = pending_frame;
+        defer pending.rx.closeFds();
+        const msg = &pending.msg;
+        const shown_sequence = if (self.dmabuf_shown) |shown| shown.sequence else 0;
+        const latest = self.frame.latest();
+        // A newer shm frame (per-frame fallback) already superseded this one.
+        const superseded = msg.sequence <= shown_sequence or (!latest.dmabuf and msg.sequence < latest.sequence);
+        const valid = msg.plane_count > 0 and msg.plane_count <= fp.max_planes and
+            pending.rx.fd_count >= msg.plane_count and msg.width > 0 and msg.height > 0;
+        const importer = browser_texture.dmabufImporter();
+        if (superseded or !valid or importer == null) {
+            self.releaseHelperFrame(msg.sequence, -1);
+            return false;
+        }
+
+        var frame: browser_texture.DmabufFrame = .{
+            .width = msg.width,
+            .height = msg.height,
+            .fourcc = msg.fourcc,
+            .modifier = msg.modifier,
+            .plane_count = @intCast(msg.plane_count),
+        };
+        for (0..msg.plane_count) |index| {
+            frame.planes[index] = .{ .fd = pending.rx.fds[index], .offset = msg.planes[index].offset, .stride = msg.planes[index].stride };
+        }
+        // Explicit sync: the render-done fence follows the planes and moves to
+        // the importer. Without it the import waits on implicit fences.
+        if (msg.flags & fp.frame_flag_fence != 0 and pending.rx.fd_count > msg.plane_count) {
+            frame.acquire_fence = pending.rx.fds[msg.plane_count];
+            pending.rx.fds[msg.plane_count] = -1;
+        }
+        var rects: [fp.max_damage]browser_texture.DamageRect = undefined;
+        frame.damage = textureDamage(msg, &rects);
+
+        const result = importer.?.import(importer.?.context, texture_id, frame) catch |err| {
+            if (!self.dmabuf_import_failed_logged) {
+                self.dmabuf_import_failed_logged = true;
+                log.warn("dma-buf import failed: {} (fourcc 0x{x} modifier 0x{x} planes {d})", .{ err, msg.fourcc, msg.modifier, msg.plane_count });
+            }
+            self.releaseHelperFrame(msg.sequence, -1);
+            return false;
+        };
+        if (self.dmabuf_shown == null and frameLogEnabled()) {
+            log.info("dma-buf frame {d}x{d} fourcc 0x{x} modifier 0x{x} planes {d}", .{ msg.width, msg.height, msg.fourcc, msg.modifier, msg.plane_count });
+        }
+        self.retireShownDmabuf(result.key, msg.width, msg.height);
+        if (std.mem.indexOfScalar(u64, self.dmabuf_keys[0..self.dmabuf_key_count], result.key) == null) {
+            if (self.dmabuf_key_count == self.dmabuf_keys.len) {
+                // More distinct buffers than expected: drop the oldest import.
+                importer.?.forget(importer.?.context, self.dmabuf_keys[0]);
+                std.mem.copyForwards(u64, self.dmabuf_keys[0 .. self.dmabuf_keys.len - 1], self.dmabuf_keys[1..]);
+                self.dmabuf_key_count -= 1;
+            }
+            self.dmabuf_keys[self.dmabuf_key_count] = result.key;
+            self.dmabuf_key_count += 1;
+        }
+        self.dmabuf_shown = .{
+            .sequence = msg.sequence,
+            .key = result.key,
+            .texture_id = result.texture_id,
+            .width = msg.width,
+            .height = msg.height,
+        };
+        self.frame.noteDmabufShown(msg.sequence, msg.exported_at_ns, true);
+        return true;
+    }
+
+    /// Hands the shown dma-buf frame back once the texture shows another
+    /// buffer (`new_key`, 0 = shm pixels). The release fence lets WebKit reuse
+    /// the buffer as soon as the GPU stopped sampling it. A size change means
+    /// WebKit reallocated, so every other cached import is dropped.
+    fn retireShownDmabuf(self: *Controller, new_key: u64, width: u32, height: u32) void {
+        const shown = self.dmabuf_shown orelse return;
+        const importer = browser_texture.dmabufImporter();
+        const fence: c_int = if (importer != null and shown.key != new_key) importer.?.release_fence(importer.?.context, shown.key) else -1;
+        self.releaseHelperFrame(shown.sequence, fence);
+        if (width != shown.width or height != shown.height or new_key == 0) {
+            if (importer) |active| {
+                for (self.dmabuf_keys[0..self.dmabuf_key_count]) |key| {
+                    if (key != new_key) active.forget(active.context, key);
+                }
+            }
+            self.dmabuf_key_count = 0;
+        }
+        self.dmabuf_shown = null;
+    }
+
+    /// RELEASE(sequence) with an optional sync_file, which this closes.
+    fn releaseHelperFrame(self: *Controller, sequence: u64, fence: c_int) void {
+        defer if (fence >= 0) {
+            _ = std.c.close(fence);
+        };
+        const socket = self.frame_socket orelse return;
+        const msg: fp.Release = .{ .sequence = sequence, .flags = if (fence >= 0) fp.release_flag_fence else 0 };
+        const fds: []const c_int = if (fence >= 0) &.{fence} else &.{};
+        fp.send(socket, std.mem.asBytes(&msg), fds) catch |err| {
+            log.warn("browser frame release failed: {}", .{err});
+        };
+        self.frame.mutex.lock();
+        self.frame.metrics.slot_releases += 1;
+        self.frame.mutex.unlock();
+    }
+
+    /// Drops every dma-buf import and closes the frame socket.
+    fn closeFrameSocket(self: *Controller) void {
+        if (self.dmabuf_pending) |*pending| {
+            self.releaseHelperFrame(pending.msg.sequence, -1);
+            pending.rx.closeFds();
+            self.dmabuf_pending = null;
+        }
+        if (browser_texture.dmabufImporter()) |importer| {
+            for (self.dmabuf_keys[0..self.dmabuf_key_count]) |key| importer.forget(importer.context, key);
+        }
+        self.dmabuf_key_count = 0;
+        self.dmabuf_shown = null;
+        if (self.frame_socket) |socket| _ = std.c.close(socket);
+        self.frame_socket = null;
+        self.frame_mode = .shm;
     }
 
     // Closes the helper stdin pipe so the helper reader thread can observe EOF and exit cleanly.
@@ -1079,6 +1395,13 @@ test "browser helper protocol pipes close across unrelated execs" {
         try std.testing.expect(flags >= 0);
         try std.testing.expect(flags & std.c.FD_CLOEXEC != 0);
     }
+}
+
+fn createFrameSocketPair() ![2]std.posix.fd_t {
+    var pair: [2]std.posix.fd_t = undefined;
+    const rc = std.os.linux.socketpair(std.os.linux.AF.UNIX, std.os.linux.SOCK.SEQPACKET | std.os.linux.SOCK.CLOEXEC, 0, &pair);
+    if (std.os.linux.errno(rc) != .SUCCESS) return error.SystemResources;
+    return pair;
 }
 
 fn commandWakesFrame(kind: ipc.CommandKind) bool {
@@ -1266,6 +1589,95 @@ test "paint ack requires the acked token and the frame current at the ack" {
     try std.testing.expect(!frame.paintAckSatisfied(8));
 }
 
+/// `VERDE_BROWSER_LINUX_FRAME_TRANSPORT=shm` keeps frames on the shm slots
+/// (the helper honours it too; offering no formats makes it explicit).
+fn frameTransportForcedShm() bool {
+    const value = std.c.getenv("VERDE_BROWSER_LINUX_FRAME_TRANSPORT") orelse return false;
+    return std.mem.eql(u8, std.mem.span(value), "shm");
+}
+
+/// `newer` replaces `older` without `older` ever being shown, so the damage
+/// against the frame on screen is the union of both (0 rects = whole frame;
+/// overflow folds into the last rect's bounding box).
+fn mergeDamage(newer: *fp.Frame, older: *const fp.Frame) void {
+    if (newer.damage_count == 0) return;
+    if (older.damage_count == 0 or older.width != newer.width or older.height != newer.height) {
+        newer.damage_count = 0;
+        return;
+    }
+    for (older.damage[0..@min(older.damage_count, fp.max_damage)]) |rect| {
+        if (newer.damage_count < fp.max_damage) {
+            newer.damage[newer.damage_count] = rect;
+            newer.damage_count += 1;
+        } else {
+            const last = &newer.damage[fp.max_damage - 1];
+            const x0 = @min(last.x, rect.x);
+            const y0 = @min(last.y, rect.y);
+            const x1 = @max(last.x +| last.w, rect.x +| rect.w);
+            const y1 = @max(last.y +| last.h, rect.y +| rect.h);
+            last.* = .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
+        }
+    }
+}
+
+/// Producer damage clamped to the buffer; empty = the whole frame.
+fn textureDamage(msg: *const fp.Frame, out: *[fp.max_damage]browser_texture.DamageRect) []const browser_texture.DamageRect {
+    const width: i32 = @intCast(@min(msg.width, std.math.maxInt(i32)));
+    const height: i32 = @intCast(@min(msg.height, std.math.maxInt(i32)));
+    var count: usize = 0;
+    for (msg.damage[0..@min(msg.damage_count, fp.max_damage)]) |rect| {
+        const x0 = std.math.clamp(rect.x, 0, width);
+        const y0 = std.math.clamp(rect.y, 0, height);
+        const x1 = std.math.clamp(rect.x +| rect.w, 0, width);
+        const y1 = std.math.clamp(rect.y +| rect.h, 0, height);
+        if (x1 <= x0 or y1 <= y0) continue;
+        out[count] = .{ .x = @intCast(x0), .y = @intCast(y0), .w = @intCast(x1 - x0), .h = @intCast(y1 - y0) };
+        count += 1;
+    }
+    return out[0..count];
+}
+
+test "superseded dma-buf frames merge their damage into the next frame" {
+    var older: fp.Frame = .{ .width = 100, .height = 50, .damage_count = 1 };
+    older.damage[0] = .{ .x = 1, .y = 2, .w = 3, .h = 4 };
+    var newer: fp.Frame = .{ .width = 100, .height = 50, .damage_count = 1 };
+    newer.damage[0] = .{ .x = 10, .y = 10, .w = 5, .h = 5 };
+    mergeDamage(&newer, &older);
+    try std.testing.expectEqual(@as(u32, 2), newer.damage_count);
+    try std.testing.expectEqual(@as(i32, 1), newer.damage[1].x);
+
+    // A whole-frame older frame makes the merge whole.
+    older.damage_count = 0;
+    mergeDamage(&newer, &older);
+    try std.testing.expectEqual(@as(u32, 0), newer.damage_count);
+
+    var rects: [fp.max_damage]browser_texture.DamageRect = undefined;
+    var clipped: fp.Frame = .{ .width = 20, .height = 20, .damage_count = 2 };
+    clipped.damage[0] = .{ .x = -5, .y = 15, .w = 10, .h = 10 };
+    clipped.damage[1] = .{ .x = 30, .y = 0, .w = 4, .h = 4 };
+    const damage = textureDamage(&clipped, &rects);
+    try std.testing.expectEqual(@as(usize, 1), damage.len);
+    try std.testing.expectEqual(browser_texture.DamageRect{ .x = 0, .y = 15, .w = 5, .h = 5 }, damage[0]);
+}
+
+test "dma-buf frame_ready events are accepted without a shm slot" {
+    var frame: SharedFrame = .{};
+    defer frame.deinit(std.testing.allocator);
+    const accepted = try frame.update(std.testing.allocator, .{
+        .kind = .frame_ready,
+        .frame_sequence = 3,
+        .frame_slot = fp.dmabuf_frame_slot,
+        .width = 64,
+        .height = 32,
+        .byte_len = 0,
+    });
+    try std.testing.expect(accepted);
+    try std.testing.expect(frame.latest().dmabuf);
+    try std.testing.expectEqual(@as(usize, 0), frame.release_count);
+    frame.noteDmabufShown(3, 0, true);
+    try std.testing.expect(!frame.dirty);
+}
+
 fn execHelperChild(
     helper_dir_z: [*:0]const u8,
     helper_path_z: [*:0]const u8,
@@ -1273,19 +1685,31 @@ fn execHelperChild(
     stdin_pipe: [2]std.posix.fd_t,
     stdout_pipe: [2]std.posix.fd_t,
     frame_fds: ?[FRAME_SLOT_COUNT]std.posix.fd_t,
+    frame_socket: ?std.posix.fd_t,
 ) noreturn {
     _ = std.c.setpgid(0, 0);
     if (std.c.dup2(stdin_pipe[0], std.c.STDIN_FILENO) < 0) std.c._exit(126);
     if (std.c.dup2(stdout_pipe[1], std.c.STDOUT_FILENO) < 0) std.c._exit(126);
+    // Move every inherited fd above the target range first so no dup2 can
+    // clobber a source that already sits at 240..243.
+    const temporary_floor: c_int = FRAME_SOCKET_FD + 1;
     if (frame_fds) |fds| {
         var temporary_fds: [FRAME_SLOT_COUNT]std.posix.fd_t = undefined;
         inline for (fds, 0..) |frame_fd, index| {
-            const temporary_fd = std.c.fcntl(frame_fd, std.c.F.DUPFD, @as(c_int, FRAME_FD_BASE + FRAME_SLOT_COUNT));
+            const temporary_fd = std.c.fcntl(frame_fd, std.c.F.DUPFD, temporary_floor);
             if (temporary_fd < 0) std.c._exit(126);
             temporary_fds[index] = temporary_fd;
         }
+        const temporary_socket: ?std.posix.fd_t = if (frame_socket) |socket| socket: {
+            const temporary_fd = std.c.fcntl(socket, std.c.F.DUPFD, temporary_floor);
+            if (temporary_fd < 0) std.c._exit(126);
+            break :socket temporary_fd;
+        } else null;
         inline for (temporary_fds, 0..) |temporary_fd, index| {
             if (std.c.dup2(temporary_fd, FRAME_FD_BASE + @as(std.posix.fd_t, @intCast(index))) < 0) std.c._exit(126);
+        }
+        if (temporary_socket) |temporary_fd| {
+            if (std.c.dup2(temporary_fd, FRAME_SOCKET_FD) < 0) std.c._exit(126);
         }
     }
 
@@ -1310,7 +1734,9 @@ fn execHelperChild(
         _ = setenv("VERDE_BROWSER_LINUX_FRAME0_FD", "240", 1);
         _ = setenv("VERDE_BROWSER_LINUX_FRAME1_FD", "241", 1);
         _ = setenv("VERDE_BROWSER_LINUX_FRAME2_FD", "242", 1);
+        if (frame_socket != null) _ = setenv(fp.socket_env, std.fmt.comptimePrint("{d}", .{FRAME_SOCKET_FD}), 1);
     }
+    if (frame_fds == null or frame_socket == null) _ = unsetenv(fp.socket_env);
 
     _ = std.c.execve(helper_path_z, argv, std.c.environ);
     std.c._exit(127);
@@ -1321,7 +1747,7 @@ fn closeInheritedFileDescriptors() void {
     const max_fd: usize = @intCast(@min(limits.cur, 4096));
     var fd: usize = 3;
     while (fd < max_fd) : (fd += 1) {
-        if (fd >= FRAME_FD_BASE and fd < FRAME_FD_BASE + FRAME_SLOT_COUNT) continue;
+        if (fd >= FRAME_FD_BASE and fd <= FRAME_SOCKET_FD) continue;
         _ = std.c.close(@intCast(fd));
     }
 }

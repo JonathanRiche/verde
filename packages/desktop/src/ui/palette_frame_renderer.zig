@@ -146,6 +146,108 @@ pub const Renderer = struct {
         pane_texture.update(texture_id, width, height, true);
     }
 
+    /// Zero-copy browser frames need dma-buf import, which only the Vulkan
+    /// backend has.
+    pub const dmabuf_supported = palette.gpu.backend_kind == .vulkan;
+
+    /// The renderer hooks `browser_texture` uses for dma-buf frames, or null
+    /// when the backend cannot import them (frames are then copied).
+    pub fn dmabufImporter(self: *Renderer) ?browser_texture.DmabufImporter {
+        if (comptime !dmabuf_supported) return null;
+        return .{
+            .context = self,
+            .formats = dmabufFormatsCallback,
+            .import = importDmabufCallback,
+            .release_fence = dmabufReleaseFenceCallback,
+            .forget = forgetDmabufCallback,
+            .readback = readbackTextureCallback,
+        };
+    }
+
+    fn fromContext(context: ?*anyopaque) *Renderer {
+        return @ptrCast(@alignCast(context.?));
+    }
+
+    fn dmabufFormatsCallback(context: ?*anyopaque, allocator: std.mem.Allocator, out: *std.ArrayList(browser_texture.DmabufFormat)) anyerror!void {
+        if (comptime !dmabuf_supported) return;
+        const renderer = fromContext(context);
+        var formats: std.ArrayList(palette.platform.present.FormatModifier) = .empty;
+        defer formats.deinit(allocator);
+        try renderer.gfx.dmabufImportFormats(allocator, &formats);
+        try out.ensureUnusedCapacity(allocator, formats.items.len);
+        for (formats.items) |format| {
+            out.appendAssumeCapacity(.{ .fourcc = @intFromEnum(format.format), .modifier = format.modifier });
+        }
+    }
+
+    fn importDmabufCallback(context: ?*anyopaque, texture_id: c_uint, frame: browser_texture.DmabufFrame) anyerror!browser_texture.DmabufImportResult {
+        if (comptime !dmabuf_supported) return error.GpuTextureUnavailable;
+        const renderer = fromContext(context);
+        const present = palette.platform.present;
+        if (frame.plane_count == 0 or frame.plane_count > present.max_planes) return error.InvalidDmabuf;
+        var image: present.DmabufImage = .{
+            .width = frame.width,
+            .height = frame.height,
+            .format = @enumFromInt(frame.fourcc),
+            .modifier = frame.modifier,
+            .plane_count = frame.plane_count,
+            .planes = undefined,
+        };
+        for (0..frame.plane_count) |index| {
+            const plane = frame.planes[index];
+            image.planes[index] = .{ .fd = plane.fd, .offset = plane.offset, .stride = plane.stride };
+        }
+        var rects: [16]palette.gpu.TextureRect = undefined;
+        const count = @min(frame.damage.len, rects.len);
+        for (frame.damage[0..count], 0..) |rect, index| {
+            rects[index] = .{ .x = rect.x, .y = rect.y, .w = rect.w, .h = rect.h };
+        }
+        // More rects than fit: repaint the whole frame.
+        const damage: []const palette.gpu.TextureRect = if (frame.damage.len > rects.len) &.{} else rects[0..count];
+        const key = palette.gpu.Renderer.dmabufKey(frame.planes[0].fd);
+        const id = if (texture_id == 0) renderer.nextTextureId() else texture_id;
+        _ = try renderer.gfx.importDmabufTexture(.{
+            .id = palette.TextureId.init(id),
+            .image = image,
+            .key = key,
+            .acquire_fence = frame.acquire_fence,
+            .damage = damage,
+        });
+        return .{ .texture_id = id, .key = key };
+    }
+
+    fn dmabufReleaseFenceCallback(context: ?*anyopaque, key: u64) c_int {
+        if (comptime !dmabuf_supported) return -1;
+        return fromContext(context).gfx.dmabufReleaseFence(key);
+    }
+
+    fn forgetDmabufCallback(context: ?*anyopaque, key: u64) void {
+        if (comptime !dmabuf_supported) return;
+        fromContext(context).gfx.releaseDmabuf(key);
+    }
+
+    /// Draws `texture_id` 1:1 into an offscreen target and reads it back.
+    fn readbackTextureCallback(context: ?*anyopaque, allocator: std.mem.Allocator, texture_id: c_uint, width: u32, height: u32) anyerror!browser_texture.CopiedFrame {
+        if (comptime !dmabuf_supported) return error.GpuTextureUnavailable;
+        const renderer = fromContext(context);
+        if (width == 0 or height == 0) return error.GpuTextureUnavailable;
+        var offscreen = try palette.gpu.Offscreen.init(renderer.gfx.renderer, width, height);
+        defer offscreen.deinit();
+        var batch: palette.RenderBatch = .{};
+        defer batch.deinit(allocator);
+        const w: f32 = @floatFromInt(width);
+        const h: f32 = @floatFromInt(height);
+        try batch.image(allocator, .{ .x = 0, .y = 0, .w = w, .h = h }, palette.TextureId.init(texture_id), .{ .w = 1, .h = 1 }, palette.Color.white, null);
+        _ = try offscreen.render(&batch, .{ .clear = .{ .r = 0, .g = 0, .b = 0, .a = 1 } });
+        const pixels = try allocator.alloc(u8, @as(usize, width) * height * 4);
+        errdefer allocator.free(pixels);
+        try offscreen.readRgba(pixels);
+        // XR24 frames carry undefined alpha; the page is opaque.
+        var alpha: usize = 3;
+        while (alpha < pixels.len) : (alpha += 4) pixels[alpha] = 255;
+        return .{ .width = width, .height = height, .format = .rgba, .pixels = pixels };
+    }
+
     pub fn releasePaneTextureCallback(context: ?*anyopaque, texture_id: c_uint) void {
         const renderer: *Renderer = @ptrCast(@alignCast(context orelse return));
         renderer.gfx.renderer.releaseTexture(texture_id);

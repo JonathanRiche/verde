@@ -42,6 +42,75 @@ pub fn configureExternalUploader(context: ?*anyopaque, upload_fn: ?ExternalUploa
     external_release_fn = release_fn;
 }
 
+/// One plane of a foreign dma-buf frame. The fd is borrowed for the call.
+pub const DmabufPlane = struct {
+    fd: c_int = -1,
+    offset: u32 = 0,
+    stride: u32 = 0,
+};
+
+/// Changed texels since the producer's previous frame.
+pub const DamageRect = struct {
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+};
+
+/// A (DRM fourcc, modifier) pair the renderer can sample.
+pub const DmabufFormat = struct {
+    fourcc: u32,
+    modifier: u64,
+};
+
+/// A browser frame shared as a dma-buf (Linux zero-copy path).
+pub const DmabufFrame = struct {
+    width: u32,
+    height: u32,
+    fourcc: u32,
+    modifier: u64,
+    plane_count: u8,
+    planes: [4]DmabufPlane = @splat(.{}),
+    /// Producer render-done sync_file; ownership moves to the importer. -1 = implicit sync.
+    acquire_fence: c_int = -1,
+    /// Empty = the whole frame changed.
+    damage: []const DamageRect = &.{},
+};
+
+pub const DmabufImportResult = struct {
+    texture_id: c_uint,
+    /// Import cache key of the buffer; hand it back through `releaseFence` once the
+    /// texture shows a different buffer.
+    key: u64,
+};
+
+/// Renderer hooks for zero-copy browser frames. The GUI registers them when its GPU
+/// backend can import dma-bufs; browser code stays renderer-agnostic.
+pub const DmabufImporter = struct {
+    context: ?*anyopaque,
+    /// Appends the importable (fourcc, modifier) pairs.
+    formats: *const fn (context: ?*anyopaque, allocator: std.mem.Allocator, out: *std.ArrayList(DmabufFormat)) anyerror!void,
+    /// Binds `frame` to `texture_id` (0 = allocate an id).
+    import: *const fn (context: ?*anyopaque, texture_id: c_uint, frame: DmabufFrame) anyerror!DmabufImportResult,
+    /// Sync_file (caller owns) that signals once the GPU stopped sampling `key`, or -1.
+    release_fence: *const fn (context: ?*anyopaque, key: u64) c_int,
+    /// Drops the cached import of `key` (the producer reallocated its buffers).
+    forget: *const fn (context: ?*anyopaque, key: u64) void,
+    /// Reads `texture_id` back to the CPU (screenshots); RGBA, caller-owned.
+    readback: *const fn (context: ?*anyopaque, allocator: std.mem.Allocator, texture_id: c_uint, width: u32, height: u32) anyerror!CopiedFrame,
+};
+
+var dmabuf_importer: ?DmabufImporter = null;
+
+pub fn configureDmabufImporter(importer: ?DmabufImporter) void {
+    dmabuf_importer = importer;
+}
+
+/// The registered zero-copy importer, or null when frames must be copied.
+pub fn dmabufImporter() ?DmabufImporter {
+    return dmabuf_importer;
+}
+
 /// Tracks the renderer texture that backs one browser pane.
 pub const PaneTexture = struct {
     texture_id: c_uint = 0,
