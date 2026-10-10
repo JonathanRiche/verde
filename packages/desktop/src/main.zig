@@ -5,7 +5,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 
 const palette = @import("palette");
-const sdl = @import("zsdl3");
+const host = @import("ui/host.zig");
 
 const app_config = @import("app/config.zig");
 const browser_runtime = @import("browser/mod.zig");
@@ -50,21 +50,8 @@ const AppState = native_state.AppState;
 const Storage = native_state.Storage;
 
 const log = native_state.log;
-const SDL_STALL_LOG_THRESHOLD_NS: u64 = 50 * std.time.ns_per_ms;
+const UI_THREAD_STALL_LOG_THRESHOLD_NS: u64 = 50 * std.time.ns_per_ms;
 
-extern fn SDL_GetWindowSizeInPixels(window: *sdl.Window, w: ?*c_int, h: ?*c_int) bool;
-extern fn SDL_GetWindowProperties(window: *sdl.Window) sdl.PropertiesID;
-extern fn SDL_GetWindowFlags(window: *sdl.Window) sdl.Window.Flags;
-extern fn SDL_GetModState() sdl.Keymod;
-extern fn SDL_SetHint(name: [*:0]const u8, value: [*:0]const u8) bool;
-extern fn SDL_ShowWindow(window: *sdl.Window) bool;
-extern fn SDL_RaiseWindow(window: *sdl.Window) bool;
-extern fn SDL_SetWindowFocusable(window: *sdl.Window, focusable: bool) bool;
-extern fn SDL_SyncWindow(window: *sdl.Window) bool;
-extern fn SDL_WaitEventTimeout(event: *sdl.Event, timeout_ms: c_int) bool;
-extern fn SDL_TextInputActive(window: *sdl.Window) bool;
-/// Returns SDL_SystemTheme: 0 unknown, 1 light, 2 dark. zsdl does not wrap it.
-extern fn SDL_GetSystemTheme() c_int;
 
 pub const std_options: std.Options = .{
     .enable_segfault_handler = true,
@@ -101,80 +88,15 @@ const BACKGROUND_TASK_WAIT_TIMEOUT_MS: c_int = 1000;
 const APP_CONFIG_POLL_INTERVAL_MS: i64 = 250;
 const MOUSE_MOTION_RENDER_INTERVAL_MS: i64 = 33;
 const MACOS_CMD_W_CLOSE_SUPPRESS_MS: i64 = 750;
-// Some Wayland compositors can emit a burst of SDL close requests while a
-// screenshot/portal overlay is being dismissed. Most of the burst lacks focus,
-// but the final event may briefly report focus again; suppress that tail too.
-var linux_wayland_browser_host: browser_runtime.LinuxWaylandHost = .{};
-const SYSTEM_CURSOR_COUNT = @typeInfo(sdl.SystemCursor).@"enum".fields.len;
+/// Wayland app_id / macOS bundle identifier. Matches the desktop file's
+/// StartupWMClass; `VERDE_APP_ID` overrides it for isolated test runs.
+const DEFAULT_APP_ID = "com.verde.native";
 
-const SystemCursorCache = struct {
-    cursors: [SYSTEM_CURSOR_COUNT]?*sdl.Cursor = [_]?*sdl.Cursor{null} ** SYSTEM_CURSOR_COUNT,
-    attempted: [SYSTEM_CURSOR_COUNT]bool = [_]bool{false} ** SYSTEM_CURSOR_COUNT,
+const CursorState = struct {
+    /// A native browser child view (WKWebView, windowed WebView2) applied its
+    /// own CSS cursor; the next shape Verde picks must be re-sent even if it
+    /// equals the last one Verde set.
     native_browser_owned: bool = false,
-
-    fn deinit(self: *SystemCursorCache) void {
-        for (&self.cursors, &self.attempted) |*cursor, *attempted| {
-            if (cursor.*) |value| value.destroy();
-            cursor.* = null;
-            attempted.* = false;
-        }
-        self.native_browser_owned = false;
-    }
-
-    fn get(self: *SystemCursorCache, kind: sdl.SystemCursor) ?*sdl.Cursor {
-        if (kind == .default) return sdl.getDefaultCursor();
-        const index: usize = @intCast(@intFromEnum(kind));
-        if (!self.attempted[index]) {
-            self.attempted[index] = true;
-            self.cursors[index] = sdl.createSystemCursor(kind) catch null;
-        }
-        return self.cursors[index] orelse sdl.getDefaultCursor();
-    }
-};
-
-const PALETTE_GPU_UI_FONT_PATHS = [_][:0]const u8{
-    "src/assets/fonts/CalSans-Regular.ttf",
-    "packages/desktop/src/assets/fonts/CalSans-Regular.ttf",
-};
-const PALETTE_GPU_UI_BOLD_FONT_PATHS = [_][:0]const u8{
-    "src/assets/fonts/NotoSans-Bold.ttf",
-    "packages/desktop/src/assets/fonts/NotoSans-Bold.ttf",
-};
-const PALETTE_GPU_PROSE_FONT_PATHS = [_][:0]const u8{
-    "src/assets/fonts/NotoSans-Regular.ttf",
-    "packages/desktop/src/assets/fonts/NotoSans-Regular.ttf",
-};
-const PALETTE_GPU_PROSE_BOLD_FONT_PATHS = [_][:0]const u8{
-    "src/assets/fonts/NotoSans-Bold.ttf",
-    "packages/desktop/src/assets/fonts/NotoSans-Bold.ttf",
-};
-const PALETTE_GPU_PROSE_ITALIC_FONT_PATHS = [_][:0]const u8{
-    "src/assets/fonts/NotoSans-Italic.ttf",
-    "packages/desktop/src/assets/fonts/NotoSans-Italic.ttf",
-};
-const PALETTE_GPU_PROSE_BOLD_ITALIC_FONT_PATHS = [_][:0]const u8{
-    "src/assets/fonts/NotoSans-BoldItalic.ttf",
-    "packages/desktop/src/assets/fonts/NotoSans-BoldItalic.ttf",
-};
-const PALETTE_GPU_ICON_FONT_PATHS = [_][:0]const u8{
-    "src/assets/fonts/SymbolsNerdFontMono-Regular.ttf",
-    "packages/desktop/src/assets/fonts/SymbolsNerdFontMono-Regular.ttf",
-};
-const PALETTE_GPU_MONO_FONT_PATHS = [_][:0]const u8{
-    "src/assets/fonts/JetBrainsMonoNerdFont-Regular.ttf",
-    "packages/desktop/src/assets/fonts/JetBrainsMonoNerdFont-Regular.ttf",
-};
-const PALETTE_GPU_SYMBOLS_FONT_PATHS = [_][:0]const u8{
-    "src/assets/fonts/NotoSansSymbols2-Regular.ttf",
-    "packages/desktop/src/assets/fonts/NotoSansSymbols2-Regular.ttf",
-};
-const PALETTE_GPU_EMOJI_FONT_PATHS = [_][:0]const u8{
-    "src/assets/fonts/NotoEmoji-Regular.ttf",
-    "packages/desktop/src/assets/fonts/NotoEmoji-Regular.ttf",
-};
-const PALETTE_GPU_SYMBOLS_ALT_FONT_PATHS = [_][:0]const u8{
-    "src/assets/fonts/NotoSansSymbols-Regular.ttf",
-    "packages/desktop/src/assets/fonts/NotoSansSymbols-Regular.ttf",
 };
 
 const CAL_SANS_BYTES = @embedFile("assets/fonts/CalSans-Regular.ttf");
@@ -184,6 +106,10 @@ const NOTO_SANS_ITALIC_BYTES = @embedFile("assets/fonts/NotoSans-Italic.ttf");
 const NOTO_SANS_BOLD_ITALIC_BYTES = @embedFile("assets/fonts/NotoSans-BoldItalic.ttf");
 const CODICON_BYTES = @embedFile("assets/fonts/Codicon.ttf");
 const NERD_SYMBOLS_BYTES = @embedFile("assets/fonts/SymbolsNerdFontMono-Regular.ttf");
+const JETBRAINS_MONO_NERD_BYTES = @embedFile("assets/fonts/JetBrainsMonoNerdFont-Regular.ttf");
+const NOTO_SANS_SYMBOLS2_BYTES = @embedFile("assets/fonts/NotoSansSymbols2-Regular.ttf");
+const NOTO_SANS_SYMBOLS_BYTES = @embedFile("assets/fonts/NotoSansSymbols-Regular.ttf");
+const NOTO_EMOJI_BYTES = @embedFile("assets/fonts/NotoEmoji-Regular.ttf");
 
 var macos_cmd_w_pane_close_until_ms: i64 = 0;
 var macos_launch_close_suppress_until_ms: i64 = 0;
@@ -211,10 +137,10 @@ pub fn main(init: std.process.Init) void {
 
 fn logFatalStartupHint(err: anyerror) void {
     switch (err) {
-        error.SdlGpuCreateDeviceFailed => if (builtin.os.tag == .linux) {
-            runtime_log.diagnostic("startup hint: SDL GPU device creation failed. This usually means Vulkan is unavailable for the active GPU. Install the Vulkan driver for your GPU: Arch Intel `vulkan-intel`, AMD `vulkan-radeon`, software fallback `vulkan-swrast`; Debian/Ubuntu Intel/AMD `mesa-vulkan-drivers`.", .{});
+        error.VulkanLoaderNotFound, error.NoSuitableGpu, error.VulkanIncompatibleDriver, error.VulkanInitializationFailed => if (builtin.os.tag == .linux) {
+            runtime_log.diagnostic("startup hint: GPU device creation failed. This usually means Vulkan is unavailable for the active GPU. Install the Vulkan driver for your GPU: Arch Intel `vulkan-intel`, AMD `vulkan-radeon`, software fallback `vulkan-swrast`; Debian/Ubuntu Intel/AMD `mesa-vulkan-drivers`.", .{});
             std.debug.print(
-                \\startup hint: SDL GPU could not create a Vulkan device.
+                \\startup hint: Verde could not create a Vulkan device.
                 \\Install the Vulkan driver for the active GPU:
                 \\  Arch Intel: sudo pacman -S --needed vulkan-intel
                 \\  Arch AMD:   sudo pacman -S --needed vulkan-radeon
@@ -242,31 +168,20 @@ fn mainInner(init: std.process.Init) !void {
         log.warn("failed to set Windows application identity to {s}", .{windows_integrations.app_user_model_id});
     }
 
-    // SDL's preferred-Wayland probe can fall through to X11's global scale on mixed-scale Wayland sessions.
-    if (builtin.os.tag == .linux) if (std.c.getenv("WAYLAND_DISPLAY")) |display| {
-        if (std.mem.span(display).len != 0) _ = sdl.setHint("SDL_VIDEO_DRIVER", "wayland,x11");
-    };
-    // SDL defaults SDL_VIDEO_ALLOW_SCREENSAVER to "0", which makes it inhibit
-    // the OS idle/screensaver for the whole window lifetime (on Wayland via the
-    // idle-inhibit protocol). Verde is not a media app, so allow the screensaver
-    // so the machine can dim/lock/sleep normally while Verde is open.
-    _ = SDL_SetHint("SDL_VIDEO_ALLOW_SCREENSAVER", "1");
-    if (builtin.os.tag == .macos) {
-        _ = SDL_SetHint("SDL_MAC_BACKGROUND_APP", "0");
-        _ = SDL_SetHint("SDL_WINDOW_ACTIVATE_WHEN_SHOWN", "1");
-        _ = SDL_SetHint("SDL_WINDOW_ACTIVATE_WHEN_RAISED", "1");
-        _ = SDL_SetHint("SDL_QUIT_ON_LAST_WINDOW_CLOSE", "0");
-    }
-    try sdl.setAppMetadata("verde Native", build_options.version, "com.verde.native");
-    try sdl.init(.{ .video = true, .events = true });
-    loop_wakeup.init();
-    defer {
-        if (skipSdlQuitOnProcessExit()) {
-            runtime_log.diagnostic("skipping SDL_Quit on process exit to avoid Linux GPU driver shutdown hang", .{});
-        } else {
-            sdl.quit();
-        }
-    }
+    // Signals are handled by flag, not by palette's signalfd: that blocks
+    // SIGINT/SIGTERM in the thread mask, and a blocked mask survives fork and
+    // exec, so terminals and the daemon would inherit it.
+    installTerminationSignalHandlers();
+    const app = try palette.platform.App.init(allocator, .{
+        .app_id = desktopAppId(),
+        .environ = init.minimal.environ,
+        .handle_signals = builtin.os.tag == .windows,
+    });
+    defer app.deinit();
+    loop_wakeup.init(app, postLoopWakeup);
+    defer loop_wakeup.deinit();
+    if (builtin.os.tag == .macos) utils.native_clipboard_image_reader = readMacosClipboardImage;
+    defer utils.native_clipboard_image_reader = null;
 
     var storage = try Storage.init(allocator);
     defer storage.deinit();
@@ -277,34 +192,29 @@ fn mainInner(init: std.process.Init) !void {
         log.info("runtime stderr redirected to {s}", .{path});
     }
 
-    const requested_renderer_backend = configuredPaletteRendererBackend();
-
-    const initial_window_frame = initialWindowFrame();
-    const window = try sdl.Window.create(
-        "verde",
-        initial_window_frame.w,
-        initial_window_frame.h,
-        .{
-            .resizable = true,
-            .high_pixel_density = true,
-        },
-    );
+    const initial_window_frame = initialWindowFrame(app);
+    const window = try app.createWindow(.{
+        .title = "verde",
+        .width = @intCast(initial_window_frame.w),
+        .height = @intCast(initial_window_frame.h),
+        .resizable = true,
+    });
     defer window.destroy();
-    var cursor_cache: SystemCursorCache = .{};
-    defer cursor_cache.deinit();
-    window.setPosition(initial_window_frame.x, initial_window_frame.y) catch {};
+    host.install(app, window);
+    defer host.uninstall();
+    var cursor_state: CursorState = .{};
+    window.setPosition(initial_window_frame.x, initial_window_frame.y);
     activateMacosHostWindow(window);
     if (builtin.os.tag == .macos) {
         macos_launch_close_suppress_until_ms = currentTimeMillis() + MACOS_LAUNCH_CLOSE_SUPPRESS_MS;
-        verde_macos_host_window_install_close_monitor(nativeBrowserHostWindow(window));
     }
-    defer sdl.stopTextInput(window) catch {};
-    installWindowIcon(window);
-    // Map the native window immediately. Font materialization, GPU setup, and
-    // the large durable projection all happen below; none should postpone the
-    // compositor-visible launch boundary.
-    _ = SDL_ShowWindow(window);
-    _ = SDL_SyncWindow(window);
+    defer window.stopTextInput();
+    // Map the native window immediately. Font loading, GPU setup, and the
+    // large durable projection all happen below; none should postpone the
+    // compositor-visible launch boundary. The icon comes from the desktop
+    // file (Linux), the app bundle (macOS) or the exe resource (Windows).
+    window.show();
+    app.sync() catch {};
 
     const loaded_app_config = app_config.loadAppConfig(allocator) catch |err| blk: {
         log.warn("failed to load app config: {s}", .{@errorName(err)});
@@ -323,152 +233,52 @@ fn mainInner(init: std.process.Init) !void {
         NERD_SYMBOLS_BYTES[0..NERD_SYMBOLS_BYTES.len],
         loaded_app_config.font_size,
     );
-    const palette_gpu_ui_font_path = try paletteGpuFontPath(
-        allocator,
-        storage.pref_path,
-        "CalSans-Regular.ttf",
-        CAL_SANS_BYTES[0..],
-        &PALETTE_GPU_UI_FONT_PATHS,
-    );
-    defer allocator.free(palette_gpu_ui_font_path);
-    const palette_gpu_ui_bold_font_path = try paletteGpuFontPath(
-        allocator,
-        storage.pref_path,
-        "NotoSans-Bold.ttf",
-        NOTO_SANS_BOLD_BYTES[0..],
-        &PALETTE_GPU_UI_BOLD_FONT_PATHS,
-    );
-    defer allocator.free(palette_gpu_ui_bold_font_path);
-    const palette_gpu_prose_font_path = try paletteGpuFontPath(
-        allocator,
-        storage.pref_path,
-        "NotoSans-Regular.ttf",
-        NOTO_SANS_REGULAR_BYTES[0..],
-        &PALETTE_GPU_PROSE_FONT_PATHS,
-    );
-    defer allocator.free(palette_gpu_prose_font_path);
-    const palette_gpu_prose_bold_font_path = try paletteGpuFontPath(
-        allocator,
-        storage.pref_path,
-        "NotoSans-Bold.ttf",
-        NOTO_SANS_BOLD_BYTES[0..],
-        &PALETTE_GPU_PROSE_BOLD_FONT_PATHS,
-    );
-    defer allocator.free(palette_gpu_prose_bold_font_path);
-    const palette_gpu_prose_italic_font_path = try paletteGpuFontPath(
-        allocator,
-        storage.pref_path,
-        "NotoSans-Italic.ttf",
-        NOTO_SANS_ITALIC_BYTES[0..],
-        &PALETTE_GPU_PROSE_ITALIC_FONT_PATHS,
-    );
-    defer allocator.free(palette_gpu_prose_italic_font_path);
-    const palette_gpu_prose_bold_italic_font_path = try paletteGpuFontPath(
-        allocator,
-        storage.pref_path,
-        "NotoSans-BoldItalic.ttf",
-        NOTO_SANS_BOLD_ITALIC_BYTES[0..],
-        &PALETTE_GPU_PROSE_BOLD_ITALIC_FONT_PATHS,
-    );
-    defer allocator.free(palette_gpu_prose_bold_italic_font_path);
-    const palette_gpu_mono_font_path = try ghosttyMonoFontPath(allocator) orelse try paletteGpuFontPath(
-        allocator,
-        storage.pref_path,
-        "JetBrainsMonoNerdFont-Regular.ttf",
-        @embedFile("assets/fonts/JetBrainsMonoNerdFont-Regular.ttf")[0..],
-        &PALETTE_GPU_MONO_FONT_PATHS,
-    );
-    defer allocator.free(palette_gpu_mono_font_path);
-    const palette_gpu_icon_font_path = try paletteGpuFontPath(
-        allocator,
-        storage.pref_path,
-        "SymbolsNerdFontMono-Regular.ttf",
-        NERD_SYMBOLS_BYTES[0..],
-        &PALETTE_GPU_ICON_FONT_PATHS,
-    );
-    defer allocator.free(palette_gpu_icon_font_path);
-    // Always materialize JetBrains Mono Nerd as a coverage fallback for mono,
-    // even when ghosttyMonoFontPath returned a primary (e.g. CaskaydiaMono).
-    // The renderer's per-glyph fallback consults this when the primary mono
-    // lacks a glyph — fixes tofu for common TUI symbols (Vite ➜, Claude
-    // Code's ✻/✽ spinner frames, ●, □, etc.) that user-chosen fonts often
-    // don't carry.
-    const palette_gpu_mono_symbols_font_path = try paletteGpuFontPath(
-        allocator,
-        storage.pref_path,
-        "JetBrainsMonoNerdFont-Regular.ttf",
-        @embedFile("assets/fonts/JetBrainsMonoNerdFont-Regular.ttf")[0..],
-        &PALETTE_GPU_MONO_FONT_PATHS,
-    );
-    defer allocator.free(palette_gpu_mono_symbols_font_path);
-    // Dedicated symbols face (Noto Sans Symbols 2) covering ~145/192 Dingbats
-    // plus broader Misc Symbols ranges that even JetBrains Mono Nerd lacks —
-    // notably Claude Code's ✻/✽/✶ spinner frames, ➤, ✷, and various other
-    // status/bullet glyphs that ship in modern TUIs.
-    const palette_gpu_symbols_font_path = try paletteGpuFontPath(
-        allocator,
-        storage.pref_path,
-        "NotoSansSymbols2-Regular.ttf",
-        @embedFile("assets/fonts/NotoSansSymbols2-Regular.ttf")[0..],
-        &PALETTE_GPU_SYMBOLS_FONT_PATHS,
-    );
-    defer allocator.free(palette_gpu_symbols_font_path);
-    // Secondary symbols face (original Noto Sans Symbols, distinct from
-    // Symbols 2 above). Adds numbered dingbats (❶❷..❿ / ➀➁..➓ at
-    // U+2776..2793) and other blocks Symbols 2 omits.
-    const palette_gpu_symbols_alt_font_path = try paletteGpuFontPath(
-        allocator,
-        storage.pref_path,
-        "NotoSansSymbols-Regular.ttf",
-        @embedFile("assets/fonts/NotoSansSymbols-Regular.ttf")[0..],
-        &PALETTE_GPU_SYMBOLS_ALT_FONT_PATHS,
-    );
-    defer allocator.free(palette_gpu_symbols_alt_font_path);
-    const palette_gpu_math_font_path = try systemMathFontPath(allocator);
-    defer if (palette_gpu_math_font_path) |path| allocator.free(path);
-    // Monochrome emoji face (Noto Emoji) for the emoji-styled Dingbats that
-    // Noto Sans Symbols 2 deliberately excludes — Vite's ✨, ✅/❌, ➕/➖,
-    // ❤, ℹ, ⚡, ⚠ — plus 4-byte emoji (🔥/📦) that modern CLIs use as
-    // status markers.
-    const palette_gpu_emoji_font_path = try paletteGpuFontPath(
-        allocator,
-        storage.pref_path,
-        "NotoEmoji-Regular.ttf",
-        @embedFile("assets/fonts/NotoEmoji-Regular.ttf")[0..],
-        &PALETTE_GPU_EMOJI_FONT_PATHS,
-    );
-    defer allocator.free(palette_gpu_emoji_font_path);
-    var palette_renderer = try palette_frame_renderer.Renderer.init(.{
-        .requested_backend = requested_renderer_backend,
+    // Role faces for the shared font engine. Bundled faces are read straight
+    // from the binary; only the user's Ghostty mono font and the system math
+    // face come from disk (mapped while the collection loads them).
+    const ghostty_mono_font_path = try ghosttyMonoFontPath(allocator);
+    defer if (ghostty_mono_font_path) |path| allocator.free(path);
+    const system_math_font_path = try systemMathFontPath(allocator);
+    defer if (system_math_font_path) |path| allocator.free(path);
+    const font_faces: palette.fonts.FaceSet = .{
+        .ui = .{ .memory = CAL_SANS_BYTES },
+        // ui_bold and prose_bold both resolve to Noto Sans Bold.
+        .bold = .{ .memory = NOTO_SANS_BOLD_BYTES },
+        .prose = .{ .memory = NOTO_SANS_REGULAR_BYTES },
+        .italic = .{ .memory = NOTO_SANS_ITALIC_BYTES },
+        .bold_italic = .{ .memory = NOTO_SANS_BOLD_ITALIC_BYTES },
+        .mono = if (ghostty_mono_font_path) |path| .{ .path = path } else .{ .memory = JETBRAINS_MONO_NERD_BYTES },
+        .icon = .{ .memory = NERD_SYMBOLS_BYTES },
+        // JetBrains Mono Nerd is always the first coverage fallback for mono,
+        // even when Ghostty names another primary (e.g. CaskaydiaMono): it
+        // carries common TUI symbols (Vite ➜, Claude Code's ✻/✽ spinner
+        // frames, ●, □) that user-chosen fonts often lack.
+        .mono_symbols = .{ .memory = JETBRAINS_MONO_NERD_BYTES },
+        // Noto Sans Symbols 2 covers ~145/192 Dingbats plus Misc Symbols
+        // (✻/✽/✶, ➤, ✷) that even JetBrains Mono Nerd lacks.
+        .symbols = .{ .memory = NOTO_SANS_SYMBOLS2_BYTES },
+        // The original Noto Sans Symbols adds numbered dingbats (❶❷..❿ /
+        // ➀➁..➓ at U+2776..2793) and other blocks Symbols 2 omits.
+        .symbols_alt = .{ .memory = NOTO_SANS_SYMBOLS_BYTES },
+        .math = if (system_math_font_path) |path| .{ .path = path } else .none,
+        // Monochrome Noto Emoji for the emoji-styled Dingbats Symbols 2
+        // excludes (✨, ✅/❌, ➕/➖, ❤, ℹ, ⚡, ⚠) and 4-byte emoji (🔥/📦).
+        .emoji = .{ .memory = NOTO_EMOJI_BYTES },
+    };
+    var palette_renderer = try palette_frame_renderer.Renderer.init(allocator, .{
+        .app = app,
         .window = window,
-        .ui_font_path = palette_gpu_ui_font_path,
-        .ui_bold_font_path = palette_gpu_ui_bold_font_path,
-        .prose_font_path = palette_gpu_prose_font_path,
-        .prose_bold_font_path = palette_gpu_prose_bold_font_path,
-        .prose_italic_font_path = palette_gpu_prose_italic_font_path,
-        .prose_bold_italic_font_path = palette_gpu_prose_bold_italic_font_path,
-        .mono_font_path = palette_gpu_mono_font_path,
-        .icon_font_path = palette_gpu_icon_font_path,
-        .mono_symbols_font_path = palette_gpu_mono_symbols_font_path,
-        .symbols_font_path = palette_gpu_symbols_font_path,
-        .symbols_alt_font_path = palette_gpu_symbols_alt_font_path,
-        .math_font_path = palette_gpu_math_font_path,
-        .emoji_font_path = palette_gpu_emoji_font_path,
+        .io = init.io,
+        .faces = font_faces,
     });
-    palette_renderer.configureTextMeasureRenderer();
-    defer palette_renderer.deinit(allocator);
-    if (palette_renderer.usingFallback()) {
-        log.warn("requested SDL_GPU palette renderer, falling back to GL until texture interop is available", .{});
-    }
-    if (palette_renderer.activeBackend() == .sdl_gpu) {
-        browser_texture.configureExternalUploader(
-            &palette_renderer,
-            palette_frame_renderer.Renderer.uploadPaneTextureCallback,
-            palette_frame_renderer.Renderer.releasePaneTextureCallback,
-        );
-    }
+    defer palette_renderer.deinit();
+    browser_texture.configureExternalUploader(
+        &palette_renderer,
+        palette_frame_renderer.Renderer.uploadPaneTextureCallback,
+        palette_frame_renderer.Renderer.releasePaneTextureCallback,
+    );
     defer browser_texture.configureExternalUploader(null, null, null);
-    runtime_log.diagnostic("palette renderer active backend={s}", .{@tagName(palette_renderer.activeBackend())});
+    runtime_log.diagnostic("palette renderer active backend={s}", .{palette_frame_renderer.backend_name});
 
     var ui_scale = currentWindowDisplayScale(window);
     // Apply the global ImGui style after the display scale is known.
@@ -479,15 +289,15 @@ fn mainInner(init: std.process.Init) !void {
     renderStartupFrame(&palette_renderer, allocator, window) catch |err| {
         log.warn("failed to render startup frame: {s}", .{@errorName(err)});
     };
-    _ = SDL_ShowWindow(window);
-    _ = SDL_SyncWindow(window);
+    window.show();
+    app.sync() catch {};
 
     var state = try AppState.init(allocator, &storage, loaded_app_config, .{
         .gl_texture_uploads_enabled = false,
-        .browser_textures_enabled = palette_renderer.activeBackend() == .sdl_gpu,
-        .texture_upload_context = if (palette_renderer.activeBackend() == .sdl_gpu) &palette_renderer else null,
-        .texture_upload_fn = if (palette_renderer.activeBackend() == .sdl_gpu) palette_frame_renderer.Renderer.uploadLoadedTextureCallback else null,
-        .texture_release_fn = if (palette_renderer.activeBackend() == .sdl_gpu) palette_frame_renderer.Renderer.releaseTextureCallback else null,
+        .browser_textures_enabled = true,
+        .texture_upload_context = &palette_renderer,
+        .texture_upload_fn = palette_frame_renderer.Renderer.uploadLoadedTextureCallback,
+        .texture_release_fn = palette_frame_renderer.Renderer.releaseTextureCallback,
     });
     defer state.deinit();
     // AppState.init returns by value, so attach the heap-owned runtime service
@@ -575,9 +385,9 @@ fn mainInner(init: std.process.Init) !void {
             );
         }
         previous_loop_start_ns = loop_start_ns;
-        if (macosHostWindowRequestedClose(window, &state)) {
-            running = false;
-            break;
+        if (consumeTerminationSignal()) {
+            runtime_log.diagnostic("shutdown requested by termination signal", .{});
+            if (closePreflightPassed(&state)) break;
         }
         var frame_sample = profiler.FrameSample{};
         syncWindowTextInput(window, &state);
@@ -589,7 +399,7 @@ fn mainInner(init: std.process.Init) !void {
         var input_fb_h: c_int = 0;
         getWindowSizeInPixels(window, &input_fb_w, &input_fb_h);
         ui_layout.refreshPaletteModalHits(&state, @floatFromInt(input_fb_w), @floatFromInt(input_fb_h));
-        running = processEvents(window, &state, &keyboard, ui_scale, &event_flags, &frame_sample, &loop_wait, &render_pacer, &presentation_demand);
+        running = processEvents(app, window, &palette_renderer, &state, &keyboard, ui_scale, &event_flags, &frame_sample, &loop_wait, &render_pacer, &presentation_demand);
         previous_loop_wait = loop_wait;
         if (!running) break;
         state.noteWorkspaceSwitchStage("event_drain_complete");
@@ -689,14 +499,12 @@ fn mainInner(init: std.process.Init) !void {
         const framebuffer_size_changed = observed_fb_width != last_framebuffer_width or observed_fb_height != last_framebuffer_height;
         if (framebuffer_size_changed) {
             const observed_scale = currentWindowDisplayScale(window);
-            var logical_w: c_int = 0;
-            var logical_h: c_int = 0;
-            window.getSize(&logical_w, &logical_h) catch {};
+            const logical_size = window.logicalSize();
             runtime_log.trace("framebuffer size changed: pixel {d}x{d} logical {d}x{d} scale {d:.3} (prev pixel {d}x{d})", .{
                 observed_fb_width,
                 observed_fb_height,
-                logical_w,
-                logical_h,
+                logical_size.width,
+                logical_size.height,
                 observed_scale,
                 last_framebuffer_width,
                 last_framebuffer_height,
@@ -714,7 +522,7 @@ fn mainInner(init: std.process.Init) !void {
         const continuous_frames = continuous_interval_ms != 0;
         const continuous_frame_due = continuous_frames and render_pacer.continuousFrameDue(now_ms, continuous_interval_ms);
         const wake_frame_due = render_pacer.wakeRenderDue(now_ms, ACTIVE_WAIT_TIMEOUT_MS);
-        const event_needs_render = event_flags.has_non_mouse_motion or
+        const event_needs_render = event_flags.has_non_mouse_motion or event_flags.renderer_redraw or
             shouldRenderMouseMotion(event_flags.has_mouse_motion, continuous_frames, &last_mouse_motion_render_ms);
         // A wake-driven send change is covered by the display-rate wake frame.
         // Non-wake polling changes still render immediately.
@@ -723,7 +531,7 @@ fn mainInner(init: std.process.Init) !void {
             presentation_demand.request();
         }
         if (!presentation_demand.pending) {
-            recordSpan(&frame_sample, .sync_cursor, syncMouseCursor, .{ &state, &cursor_cache });
+            recordSpan(&frame_sample, .sync_cursor, syncMouseCursor, .{ &state, &cursor_state });
             recordFrameWithStallDiagnostic(frame_sample);
             maybeLogFrameProfile(frame_profile_logging, &last_frame_profile_log_ms, &palette_renderer);
             continue;
@@ -733,7 +541,7 @@ fn mainInner(init: std.process.Init) !void {
         var fb_height: c_int = 0;
         recordSpan(&frame_sample, .render_setup, struct {
             fn run(
-                app_window: *sdl.Window,
+                app_window: *palette.platform.Window,
                 framebuffer_width: *c_int,
                 framebuffer_height: *c_int,
                 current_scale: *f32,
@@ -747,10 +555,8 @@ fn mainInner(init: std.process.Init) !void {
                 }
             }
         }.run, .{ window, &fb_width, &fb_height, &ui_scale });
-        var window_screen_x: c_int = 0;
-        var window_screen_y: c_int = 0;
-        window.getPosition(&window_screen_x, &window_screen_y) catch {};
-        state.noteAppWindowFrame(window_screen_x, window_screen_y, ui_scale);
+        const window_screen_position = window.position();
+        state.noteAppWindowFrame(window_screen_position[0], window_screen_position[1], ui_scale);
         state.palette_overlay_batch.clear();
         state.palette_frame_text.clearRetainingCapacity();
         _ = state.palette_frame_text_arena.reset(.retain_capacity);
@@ -765,7 +571,7 @@ fn mainInner(init: std.process.Init) !void {
                 ui_layout.renderRoot(app_state, @floatFromInt(framebuffer_width), @floatFromInt(framebuffer_height));
             }
         }.run, .{ &state, fb_width, fb_height });
-        recordSpan(&frame_sample, .sync_cursor, syncMouseCursor, .{ &state, &cursor_cache });
+        recordSpan(&frame_sample, .sync_cursor, syncMouseCursor, .{ &state, &cursor_state });
         state.noteWorkspaceSwitchStage("render_root_cursor_complete");
         var frame_presented = false;
         recordSpan(&frame_sample, .draw_backend, struct {
@@ -786,12 +592,13 @@ fn mainInner(init: std.process.Init) !void {
                     log.warn("failed to render palette overlay batch: {s}", .{@errorName(err)});
                     return;
                 };
-                presented.* = outcome == .presented;
+                presented.* = palette_frame_renderer.outcomePresented(outcome);
             }
         }.run, .{ &palette_renderer, &state, allocator, fb_width, fb_height, &frame_presented });
-        if (palette_renderer.lastSdlGpuFrameStats()) |stats| {
-            logSlowSdlGpuFrameStages(stats);
-            if (state.pendingWorkspaceSwitchTrace()) |trace| logWorkspaceSwitchSdlGpuFrameStats(trace, stats);
+        {
+            const stats = palette_renderer.lastFrameStats();
+            logSlowGpuFrameStages(stats);
+            if (state.pendingWorkspaceSwitchTrace()) |trace| logWorkspaceSwitchGpuFrameStats(trace, stats);
         }
         presentation_demand.noteAttempt(frame_presented);
         if (frame_presented) {
@@ -825,7 +632,7 @@ fn mainInner(init: std.process.Init) !void {
 fn renderStartupFrame(
     renderer: *palette_frame_renderer.Renderer,
     allocator: std.mem.Allocator,
-    window: *sdl.Window,
+    window: *palette.platform.Window,
 ) !void {
     var width: c_int = 0;
     var height: c_int = 0;
@@ -850,7 +657,7 @@ fn renderStartupFrame(
 
 // Resolves the OS mouse cursor each frame: terminal and browser-reported
 // shapes win, then interactive Palette controls, otherwise the default arrow.
-fn syncMouseCursor(state: *AppState, cache: *SystemCursorCache) void {
+fn syncMouseCursor(state: *AppState, cache: *CursorState) void {
     const mouse_x = state.transcript_controller.palette_mouse_x;
     const mouse_y = state.transcript_controller.palette_mouse_y;
     if (!modalHitAtMouse(state)) {
@@ -950,7 +757,7 @@ fn syncMouseCursor(state: *AppState, cache: *SystemCursorCache) void {
     applySystemCursor(cache, .default);
 }
 
-fn systemCursorForCompanionAction(action: companion_controller.HitAction) sdl.SystemCursor {
+fn systemCursorForCompanionAction(action: companion_controller.HitAction) palette.platform.CursorShape {
     return switch (action) {
         .open, .collapse, .mission_control_open, .mission_control_close, .run_tab, .activity_tab, .approve, .deny, .operation_select, .operation_stop, .operation_follow_log => .pointer,
         .panel, .body => .default,
@@ -961,47 +768,25 @@ fn routeCompanionWheel(state: *AppState, x: f32, y: f32, wheel_y: f32) bool {
     return ui_layout.handleCompanionWheel(state, x, y, wheel_y);
 }
 
-fn applyBrowserCursor(cache: *SystemCursorCache, shape: browser_runtime.CursorShape) void {
-    if (shape == .hidden) {
-        if (sdl.cursorVisible()) sdl.hideCursor() catch {};
-        return;
-    }
+fn applyBrowserCursor(cache: *CursorState, shape: browser_runtime.CursorShape) void {
     applySystemCursor(cache, systemCursorForBrowserShape(shape));
 }
 
-fn applySystemCursor(cache: *SystemCursorCache, kind: sdl.SystemCursor) void {
-    if (!sdl.cursorVisible()) sdl.showCursor() catch {};
-    const cursor = cache.get(kind);
-    const browser_released_cursor = cache.native_browser_owned;
+fn applySystemCursor(cache: *CursorState, kind: palette.platform.CursorShape) void {
+    // A native browser view may have changed the pointer behind Verde's back,
+    // so the first shape after it releases the pointer is always re-sent.
+    if (cache.native_browser_owned) host.invalidateCursor();
     cache.native_browser_owned = false;
-    if (browser_released_cursor or sdl.getCursor() != cursor) sdl.setCursor(cursor) catch {};
+    host.setCursor(kind);
 }
 
-// SDL 3.2 provides the core browser cursor set. Preserve richer browser semantics
-// in app state and use the closest available system shape for the rest.
-fn systemCursorForBrowserShape(shape: browser_runtime.CursorShape) sdl.SystemCursor {
+// Browser cursors are CSS names, as are the platform's shapes (the Wayland
+// cursor-shape protocol, AppKit and Win32 map the rest to their closest
+// cursor). Only `custom` (an image cursor Verde cannot show) falls back.
+fn systemCursorForBrowserShape(shape: browser_runtime.CursorShape) palette.platform.CursorShape {
     return switch (shape) {
-        .default, .context_menu, .help, .custom => .default,
-        .pointer, .alias, .copy, .grab, .grabbing => .pointer,
-        .text, .vertical_text => .text,
-        .crosshair, .cell, .zoom_in, .zoom_out => .crosshair,
-        .wait => .wait,
-        .progress => .progress,
-        .move, .all_scroll => .move,
-        .no_drop, .not_allowed => .not_allowed,
-        .col_resize, .ew_resize => .ew_resize,
-        .row_resize, .ns_resize => .ns_resize,
-        .nwse_resize => .nwse_resize,
-        .nesw_resize => .nesw_resize,
-        .n_resize => .n_resize,
-        .ne_resize => .ne_resize,
-        .e_resize => .e_resize,
-        .se_resize => .se_resize,
-        .s_resize => .s_resize,
-        .sw_resize => .sw_resize,
-        .w_resize => .w_resize,
-        .nw_resize => .nw_resize,
-        .hidden => .default,
+        .custom => .default,
+        inline else => |tag| @field(palette.platform.CursorShape, @tagName(tag)),
     };
 }
 
@@ -1040,34 +825,6 @@ fn modalHitAtMouse(state: *const AppState) bool {
         if (hit.rect.contains(point)) return true;
     }
     return false;
-}
-
-fn configuredPaletteRendererBackend() palette_frame_renderer.Backend {
-    return switch (build_options.palette_renderer) {
-        .sdl_gpu => .sdl_gpu,
-    };
-}
-
-fn skipSdlQuitOnProcessExit() bool {
-    return builtin.os.tag == .linux and build_options.palette_renderer == .sdl_gpu;
-}
-
-fn paletteGpuFontPath(
-    allocator: std.mem.Allocator,
-    pref_path: []const u8,
-    file_name: []const u8,
-    bytes: []const u8,
-    dev_candidates: []const [:0]const u8,
-) ![:0]u8 {
-    var threaded: std.Io.Threaded = .init(allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    for (dev_candidates) |candidate| {
-        std.Io.Dir.cwd().access(io, candidate, .{}) catch continue;
-        return try allocator.dupeZ(u8, candidate);
-    }
-
-    return try installBundledFont(allocator, pref_path, file_name, bytes);
 }
 
 fn ghosttyMonoFontPath(allocator: std.mem.Allocator) !?[:0]u8 {
@@ -1181,32 +938,11 @@ fn unquoteGhosttyValue(raw_value: []const u8) []const u8 {
     return value;
 }
 
-fn installBundledFont(
-    allocator: std.mem.Allocator,
-    pref_path: []const u8,
-    file_name: []const u8,
-    bytes: []const u8,
-) ![:0]u8 {
-    var threaded: std.Io.Threaded = .init(allocator, .{});
-    defer threaded.deinit();
-
-    var pref_dir = try std.Io.Dir.openDirAbsolute(threaded.io(), pref_path, .{});
-    defer pref_dir.close(threaded.io());
-    try pref_dir.createDirPath(threaded.io(), "fonts");
-
-    const path = try std.fs.path.join(allocator, &.{ pref_path, "fonts", file_name });
-    defer allocator.free(path);
-
-    var file = try std.Io.Dir.createFileAbsolute(threaded.io(), path, .{ .truncate = true });
-    defer file.close(threaded.io());
-    try file.writeStreamingAll(threaded.io(), bytes);
-
-    return try allocator.dupeZ(u8, path);
-}
-
 const EventFlags = struct {
     has_mouse_motion: bool = false,
     has_non_mouse_motion: bool = false,
+    /// The window renderer needs a new frame (resize, scale change, re-show).
+    renderer_redraw: bool = false,
     loop_wakeup_sequence: ?u64 = null,
 };
 
@@ -1244,7 +980,7 @@ fn maybeLogFrameProfile(enabled: bool, last_log_ms: *i64, palette_renderer: *con
     runtime_log.trace(
         "frame-profile backend={s} samples={d} avg_ms={d:.2} max_ms={d:.2} slow={d} hitch={d} latest_ms={d:.2} rendered={d} render_root_avg_ms={d:.2} draw_backend_avg_ms={d:.2} poll_send_avg_ms={d:.2} poll_terminals_avg_ms={d:.2} poll_config_avg_ms={d:.2}",
         .{
-            @tagName(palette_renderer.activeBackend()),
+            palette_frame_renderer.backend_name,
             snapshot.count,
             profiler.nsToMs(snapshot.avg_active_ns),
             profiler.nsToMs(snapshot.max_active_ns),
@@ -1259,9 +995,8 @@ fn maybeLogFrameProfile(enabled: bool, last_log_ms: *i64, palette_renderer: *con
             profiler.nsToMs(sections.poll_config_avg_ns),
         },
     );
-    if (palette_renderer.lastSdlGpuFrameStats()) |stats| {
-        if (stats.hasWork()) logSdlGpuFrameStats(stats);
-    }
+    const stats = palette_renderer.lastFrameStats();
+    if (!stats.skipped and stats.commands > 0) logGpuFrameStats(stats, palette_renderer.windowStats(), palette_renderer.gpuMemory());
 }
 
 const SectionStats = struct {
@@ -1308,90 +1043,73 @@ fn recentSectionStats() SectionStats {
     };
 }
 
-fn logSdlGpuFrameStats(stats: palette.renderer.FrameStats) void {
+fn logGpuFrameStats(stats: palette.gpu.FrameStats, window_stats: palette.WindowRenderer.Stats, memory: palette_frame_renderer.GpuMemory) void {
     runtime_log.trace(
-        "sdlgpu-stage text_cache_rotate_ms={d:.2} text_cache_retire_ms={d:.2}/{d} command_buffer_acquire_ms={d:.2} swapchain_texture_acquire_ms={d:.2} batch_build_ms={d:.2} solid_upload_ms={d:.2} image_prepare_ms={d:.2} image_upload_ms={d:.2} browser_upload_ms={d:.2} text_prepare_ms={d:.2} text_upload_ms={d:.2} render_encode_ms={d:.2} submit_present_ms={d:.2} commands={d} text_draws={d} image_draws={d} image_uploads={d}/{d} browser_uploads={d}/{d} visible_texture_uploads={d} deferred_texture_uploads={d}/{d}",
+        "gpu-stage build_ms={d:.2} upload_ms={d:.2} encode_ms={d:.2} submit_ms={d:.2} wait_ms={d:.2} total_ms={d:.2} commands={d} instances={d} draws={d} glyphs_rasterized={d} glyph_uploads={d} texture_uploads={d}/{d} damage_rects={d} damaged_px={d} full_redraw={} presented={d} unchanged={d} throttled={d} no_buffer={d} frame_timeouts={d} gpu_device_bytes={d} gpu_host_bytes={d} window_buffer_bytes={d}",
         .{
-            profiler.nsToMs(stats.text_cache_rotate_ns),
-            profiler.nsToMs(stats.text_cache_retire_ns),
-            stats.text_cache_retired_count,
-            profiler.nsToMs(stats.command_buffer_acquire_ns),
-            profiler.nsToMs(stats.swapchain_texture_acquire_ns),
-            profiler.nsToMs(stats.batch_build_ns),
-            profiler.nsToMs(stats.solid_upload_ns),
-            profiler.nsToMs(stats.image_prepare_ns),
-            profiler.nsToMs(stats.image_upload_ns),
-            profiler.nsToMs(stats.browser_upload_ns),
-            profiler.nsToMs(stats.text_prepare_ns),
-            profiler.nsToMs(stats.text_upload_ns),
-            profiler.nsToMs(stats.render_encode_ns),
-            profiler.nsToMs(stats.submit_present_ns),
-            stats.command_count,
-            stats.text_draw_count,
-            stats.image_draw_count,
-            stats.image_upload_count,
-            stats.image_upload_bytes,
-            stats.browser_upload_count,
-            stats.browser_upload_bytes,
-            stats.visible_texture_upload_count,
-            stats.deferred_texture_upload_count,
-            stats.deferred_texture_upload_bytes,
+            profiler.nsToMs(stats.build_ns),
+            profiler.nsToMs(stats.upload_ns),
+            profiler.nsToMs(stats.encode_ns),
+            profiler.nsToMs(stats.submit_ns),
+            profiler.nsToMs(stats.wait_ns),
+            profiler.nsToMs(stats.total_ns),
+            stats.commands,
+            stats.instances,
+            stats.draws,
+            stats.glyphs_rasterized,
+            stats.glyph_uploads,
+            stats.texture_uploads,
+            stats.texture_upload_bytes,
+            stats.damage_rects,
+            stats.damaged_pixels,
+            stats.full_redraw,
+            window_stats.presented,
+            window_stats.unchanged,
+            window_stats.throttled,
+            window_stats.no_buffer,
+            window_stats.frame_timeouts,
+            memory.device_local_bytes,
+            memory.host_visible_bytes,
+            memory.window_buffer_bytes,
         },
     );
 }
 
-fn logWorkspaceSwitchSdlGpuFrameStats(trace: native_state.WorkspaceSwitchTrace, stats: palette.renderer.FrameStats) void {
+fn logWorkspaceSwitchGpuFrameStats(trace: native_state.WorkspaceSwitchTrace, stats: palette.gpu.FrameStats) void {
     runtime_log.trace(
-        "workspace-switch-trace seq={d} stage=sdlgpu_stages target_index={d} attempt={d} text_cache_rotate_ms={d:.2} text_cache_retire_ms={d:.2}/{d} command_buffer_acquire_ms={d:.2} swapchain_texture_acquire_ms={d:.2} batch_build_ms={d:.2} solid_upload_ms={d:.2} image_prepare_ms={d:.2} image_upload_ms={d:.2} browser_upload_ms={d:.2} text_prepare_ms={d:.2} text_upload_ms={d:.2} render_encode_ms={d:.2} submit_present_ms={d:.2} commands={d} text_draws={d} image_draws={d} visible_texture_uploads={d} deferred_texture_uploads={d}/{d}",
+        "workspace-switch-trace seq={d} stage=gpu_stages target_index={d} attempt={d} build_ms={d:.2} upload_ms={d:.2} encode_ms={d:.2} submit_ms={d:.2} wait_ms={d:.2} total_ms={d:.2} commands={d} draws={d} texture_uploads={d}/{d} skipped={}",
         .{
             trace.sequence,
             trace.target_index,
             trace.render_attempt,
-            profiler.nsToMs(stats.text_cache_rotate_ns),
-            profiler.nsToMs(stats.text_cache_retire_ns),
-            stats.text_cache_retired_count,
-            profiler.nsToMs(stats.command_buffer_acquire_ns),
-            profiler.nsToMs(stats.swapchain_texture_acquire_ns),
-            profiler.nsToMs(stats.batch_build_ns),
-            profiler.nsToMs(stats.solid_upload_ns),
-            profiler.nsToMs(stats.image_prepare_ns),
-            profiler.nsToMs(stats.image_upload_ns),
-            profiler.nsToMs(stats.browser_upload_ns),
-            profiler.nsToMs(stats.text_prepare_ns),
-            profiler.nsToMs(stats.text_upload_ns),
-            profiler.nsToMs(stats.render_encode_ns),
-            profiler.nsToMs(stats.submit_present_ns),
-            stats.command_count,
-            stats.text_draw_count,
-            stats.image_draw_count,
-            stats.visible_texture_upload_count,
-            stats.deferred_texture_upload_count,
-            stats.deferred_texture_upload_bytes,
+            profiler.nsToMs(stats.build_ns),
+            profiler.nsToMs(stats.upload_ns),
+            profiler.nsToMs(stats.encode_ns),
+            profiler.nsToMs(stats.submit_ns),
+            profiler.nsToMs(stats.wait_ns),
+            profiler.nsToMs(stats.total_ns),
+            stats.commands,
+            stats.draws,
+            stats.texture_uploads,
+            stats.texture_upload_bytes,
+            stats.skipped,
         },
     );
 }
 
-fn logSlowSdlGpuFrameStages(stats: palette.renderer.FrameStats) void {
+fn logSlowGpuFrameStages(stats: palette.gpu.FrameStats) void {
     const Stage = struct { name: []const u8, elapsed_ns: u64 };
     const stages = [_]Stage{
-        .{ .name = "text cache rotate", .elapsed_ns = stats.text_cache_rotate_ns },
-        .{ .name = "text cache retire", .elapsed_ns = stats.text_cache_retire_ns },
-        .{ .name = "command buffer acquire", .elapsed_ns = stats.command_buffer_acquire_ns },
-        .{ .name = "swapchain texture acquire", .elapsed_ns = stats.swapchain_texture_acquire_ns },
-        .{ .name = "batch build", .elapsed_ns = stats.batch_build_ns },
-        .{ .name = "solid upload", .elapsed_ns = stats.solid_upload_ns },
-        .{ .name = "image prepare", .elapsed_ns = stats.image_prepare_ns },
-        .{ .name = "image upload", .elapsed_ns = stats.image_upload_ns },
-        .{ .name = "browser upload", .elapsed_ns = stats.browser_upload_ns },
-        .{ .name = "text prepare", .elapsed_ns = stats.text_prepare_ns },
-        .{ .name = "text upload", .elapsed_ns = stats.text_upload_ns },
-        .{ .name = "render encode", .elapsed_ns = stats.render_encode_ns },
-        .{ .name = "submit present", .elapsed_ns = stats.submit_present_ns },
+        .{ .name = "batch build", .elapsed_ns = stats.build_ns },
+        .{ .name = "texture upload", .elapsed_ns = stats.upload_ns },
+        .{ .name = "render encode", .elapsed_ns = stats.encode_ns },
+        .{ .name = "submit present", .elapsed_ns = stats.submit_ns },
+        .{ .name = "frame slot wait", .elapsed_ns = stats.wait_ns },
     };
     for (stages) |stage| {
-        if (stage.elapsed_ns <= SDL_STALL_LOG_THRESHOLD_NS) continue;
+        if (stage.elapsed_ns <= UI_THREAD_STALL_LOG_THRESHOLD_NS) continue;
         runtime_log.diagnostic(
-            "SDL thread stall operation=sdlgpu {s} elapsed_ms={d:.2}",
+            "SDL thread stall operation=gpu {s} elapsed_ms={d:.2}",
             .{ stage.name, profiler.nsToMs(stage.elapsed_ns) },
         );
     }
@@ -1402,7 +1120,7 @@ fn recordSpan(frame_sample: *profiler.FrameSample, section: profiler.Section, co
     @call(.auto, function, args);
     const elapsed_ns = profiler.elapsedNs(start);
     frame_sample.add(section, elapsed_ns);
-    if (elapsed_ns > SDL_STALL_LOG_THRESHOLD_NS) {
+    if (elapsed_ns > UI_THREAD_STALL_LOG_THRESHOLD_NS) {
         runtime_log.diagnostic(
             "SDL thread stall operation={s} elapsed_ms={d:.2}",
             .{ profiler.sectionName(section), profiler.nsToMs(elapsed_ns) },
@@ -1411,7 +1129,7 @@ fn recordSpan(frame_sample: *profiler.FrameSample, section: profiler.Section, co
 }
 
 fn recordFrameWithStallDiagnostic(frame_sample: profiler.FrameSample) void {
-    if (frame_sample.active_ns > SDL_STALL_LOG_THRESHOLD_NS) {
+    if (frame_sample.active_ns > UI_THREAD_STALL_LOG_THRESHOLD_NS) {
         var slowest: profiler.Section = .event_handling;
         var slowest_ns = frame_sample.sectionNs(slowest);
         inline for (@typeInfo(profiler.Section).@"enum".fields) |field| {
@@ -1430,100 +1148,48 @@ fn recordFrameWithStallDiagnostic(frame_sample: profiler.FrameSample) void {
     profiler.recordFrame(frame_sample);
 }
 
-fn installWindowIcon(window: *sdl.Window) void {
-    const loaded = stb_image.loadFromMemory(native_state.VERDE_LOGO_BYTES) catch |err| {
-        log.warn("failed to decode window icon: {s}", .{@errorName(err)});
-        return;
+fn initialWindowFrame(app: *const palette.platform.App) WindowFrame {
+    // Wayland reports no global coordinates (origin 0,0) and positions are a
+    // no-op there; macOS and Windows centre the window in the work area.
+    const usable_bounds = app.usableRect() orelse return .{
+        .x = 0,
+        .y = 0,
+        .w = DEFAULT_WINDOW_WIDTH,
+        .h = DEFAULT_WINDOW_HEIGHT,
     };
-    defer loaded.deinit();
-
-    const pitch = std.math.mul(c_int, loaded.width, loaded.channels) catch {
-        log.warn("failed to compute window icon pitch", .{});
-        return;
-    };
-    const surface = sdl.createSurfaceFrom(
-        loaded.width,
-        loaded.height,
-        .abgr8888,
-        @ptrCast(loaded.pixels),
-        pitch,
-    ) catch {
-        log.warn("failed to create SDL surface for window icon", .{});
-        return;
-    };
-    defer surface.destroy();
-
-    window.setIcon(surface) catch {
-        log.warn("failed to set window icon", .{});
-    };
-}
-
-fn initialWindowFrame() WindowFrame {
-    const display_id = sdl.getPrimaryDisplay();
-    if (display_id == .invalid) {
-        return .{
-            .x = sdl.Window.pos_centered,
-            .y = sdl.Window.pos_centered,
-            .w = DEFAULT_WINDOW_WIDTH,
-            .h = DEFAULT_WINDOW_HEIGHT,
-        };
-    }
-
-    var usable_bounds: sdl.Rect = undefined;
-    sdl.getDisplayUsableBounds(display_id, &usable_bounds) catch {
-        return .{
-            .x = sdl.Window.pos_centered,
-            .y = sdl.Window.pos_centered,
-            .w = DEFAULT_WINDOW_WIDTH,
-            .h = DEFAULT_WINDOW_HEIGHT,
-        };
-    };
-
-    const width = clampInt(@intFromFloat(@as(f32, @floatFromInt(usable_bounds.w)) * 0.72), MIN_WINDOW_WIDTH, @min(MAX_WINDOW_WIDTH, usable_bounds.w - 40));
-    const height = clampInt(@intFromFloat(@as(f32, @floatFromInt(usable_bounds.h)) * 0.74), MIN_WINDOW_HEIGHT, @min(MAX_WINDOW_HEIGHT, usable_bounds.h - 40));
-    const x = usable_bounds.x + @divTrunc(usable_bounds.w - width, 2);
-    const y = usable_bounds.y + @divTrunc(usable_bounds.h - height, 2);
+    const usable_x: c_int = @intFromFloat(usable_bounds.x);
+    const usable_y: c_int = @intFromFloat(usable_bounds.y);
+    const usable_w: c_int = @intFromFloat(usable_bounds.w);
+    const usable_h: c_int = @intFromFloat(usable_bounds.h);
+    const width = clampInt(@intFromFloat(@as(f32, @floatFromInt(usable_w)) * 0.72), MIN_WINDOW_WIDTH, @min(MAX_WINDOW_WIDTH, usable_w - 40));
+    const height = clampInt(@intFromFloat(@as(f32, @floatFromInt(usable_h)) * 0.74), MIN_WINDOW_HEIGHT, @min(MAX_WINDOW_HEIGHT, usable_h - 40));
+    const x = usable_x + @divTrunc(usable_w - width, 2);
+    const y = usable_y + @divTrunc(usable_h - height, 2);
     return .{ .x = x, .y = y, .w = width, .h = height };
 }
 
-fn getWindowSizeInPixels(window: *sdl.Window, w: ?*c_int, h: ?*c_int) void {
-    if (!SDL_GetWindowSizeInPixels(window, w, h)) {
-        window.getSize(w, h) catch {
-            if (w) |width| width.* = DEFAULT_WINDOW_WIDTH;
-            if (h) |height| height.* = DEFAULT_WINDOW_HEIGHT;
-        };
-    }
+fn getWindowSizeInPixels(window: *const palette.platform.Window, w: ?*c_int, h: ?*c_int) void {
+    const size = window.pixelSize();
+    if (w) |width| width.* = if (size.width > 0) @intCast(size.width) else DEFAULT_WINDOW_WIDTH;
+    if (h) |height| height.* = if (size.height > 0) @intCast(size.height) else DEFAULT_WINDOW_HEIGHT;
 }
 
-fn currentWindowDisplayScale(window: *sdl.Window) f32 {
-    const scale = window.getDisplayScale() catch return 1.0;
+fn currentWindowDisplayScale(window: *const palette.platform.Window) f32 {
+    const scale = window.scale();
     if (!std.math.isFinite(scale) or scale <= 0.0) return 1.0;
     return clampf(scale, 1.0, 2.5);
 }
 
-fn nativeBrowserHostWindow(window: *sdl.Window) ?*anyopaque {
-    const property_name: [:0]const u8 = switch (builtin.os.tag) {
-        .macos => "SDL.window.cocoa.window",
-        .windows => "SDL.window.win32.hwnd",
-        .linux => {
-            const properties = SDL_GetWindowProperties(window);
-            const wayland_display = sdl.getPointerProperty(properties, "SDL.window.wayland.display", null);
-            const wayland_surface = sdl.getPointerProperty(properties, "SDL.window.wayland.surface", null);
-            if (wayland_display != null and wayland_surface != null) {
-                linux_wayland_browser_host = .{
-                    .display = wayland_display,
-                    .surface = wayland_surface,
-                };
-                return &linux_wayland_browser_host;
-            }
-            const x11_window = sdl.getNumberProperty(properties, "SDL.window.x11.window", 0);
-            if (x11_window <= 0) return null;
-            return @ptrFromInt(@as(usize, @intCast(x11_window)));
-        },
-        else => return null,
+/// The native parent the platform browser view attaches to: the NSWindow for
+/// WKWebView, the HWND for WebView2. Linux renders WPE frames offscreen into
+/// palette textures and needs no host window.
+fn nativeBrowserHostWindow(window: *const palette.platform.Window) ?*anyopaque {
+    const handles = window.nativeHandles();
+    return switch (builtin.os.tag) {
+        .macos => handles.ns_window,
+        .windows => handles.hwnd,
+        else => null,
     };
-    const properties = SDL_GetWindowProperties(window);
-    return sdl.getPointerProperty(properties, property_name, null);
 }
 
 fn clampInt(value: c_int, min_value: c_int, max_value: c_int) c_int {
@@ -1534,43 +1200,40 @@ fn clampf(value: f32, min_value: f32, max_value: f32) f32 {
     return @max(min_value, @min(value, max_value));
 }
 
-// Keeps SDL mouse coordinates in the same framebuffer space used by the ImGui root layout.
-fn normalizeMouseEventCoordinates(window: *sdl.Window, event: *sdl.Event) void {
-    var logical_width: c_int = 0;
-    var logical_height: c_int = 0;
-    window.getSize(&logical_width, &logical_height) catch return;
+// Platform pointer coordinates are logical; the Palette root lays out in
+// framebuffer pixels, so scale pointer events into that space.
+fn normalizeMouseEventCoordinates(window: *const palette.platform.Window, event: *palette.Event) void {
+    const logical = window.logicalSize();
+    const pixel = window.pixelSize();
+    if (logical.width == 0 or logical.height == 0 or pixel.width == 0 or pixel.height == 0) return;
 
-    var pixel_width: c_int = 0;
-    var pixel_height: c_int = 0;
-    getWindowSizeInPixels(window, &pixel_width, &pixel_height);
-
-    if (logical_width <= 0 or logical_height <= 0 or pixel_width <= 0 or pixel_height <= 0) return;
-
-    const scale_x = @as(f32, @floatFromInt(pixel_width)) / @as(f32, @floatFromInt(logical_width));
-    const scale_y = @as(f32, @floatFromInt(pixel_height)) / @as(f32, @floatFromInt(logical_height));
+    const scale_x = @as(f32, @floatFromInt(pixel.width)) / @as(f32, @floatFromInt(logical.width));
+    const scale_y = @as(f32, @floatFromInt(pixel.height)) / @as(f32, @floatFromInt(logical.height));
     if (@abs(scale_x - 1.0) < 0.01 and @abs(scale_y - 1.0) < 0.01) return;
 
-    switch (event.type) {
-        .mouse_motion => {
-            event.motion.x *= scale_x;
-            event.motion.y *= scale_y;
-            event.motion.xrel *= scale_x;
-            event.motion.yrel *= scale_y;
+    switch (event.*) {
+        .mouse_motion, .mouse_enter => |*motion| {
+            motion.x *= scale_x;
+            motion.y *= scale_y;
+            motion.xrel *= scale_x;
+            motion.yrel *= scale_y;
         },
-        .mouse_button_down, .mouse_button_up => {
-            event.button.x *= scale_x;
-            event.button.y *= scale_y;
+        .mouse_button_down, .mouse_button_up => |*button| {
+            button.x *= scale_x;
+            button.y *= scale_y;
         },
-        .mouse_wheel => {
-            event.wheel.mouse_x *= scale_x;
-            event.wheel.mouse_y *= scale_y;
+        .mouse_wheel => |*wheel| {
+            wheel.mouse_x *= scale_x;
+            wheel.mouse_y *= scale_y;
         },
         else => {},
     }
 }
 
 fn processEvents(
-    window: *sdl.Window,
+    app: *palette.platform.App,
+    window: *palette.platform.Window,
+    renderer: *palette_frame_renderer.Renderer,
     state: *AppState,
     keyboard: *keybinds.NativeKeyboardConfig,
     ui_scale: f32,
@@ -1581,49 +1244,75 @@ fn processEvents(
     presentation_demand: *const loop_pacing.PresentationDemand,
 ) bool {
     event_flags.* = .{};
-    var event: sdl.Event = undefined;
+    var event: palette.Event = undefined;
 
-    if (!sdl.pollEvent(&event)) {
+    if (!app.pollEvent(&event)) {
         const wait_timeout_ms = eventWaitTimeoutMs(state, render_pacer, presentation_demand);
         wait_trace.requested_timeout_ms = wait_timeout_ms;
+        const wait_timeout_ns = renderer.boundWaitNs(
+            @as(u64, @intCast(@max(wait_timeout_ms, 0))) * std.time.ns_per_ms,
+            presentation_demand.pending,
+        );
         const wait_start = profiler.nowNs();
-        if (!SDL_WaitEventTimeout(&event, wait_timeout_ms)) {
+        if (!app.waitEvent(&event, wait_timeout_ns)) {
             wait_trace.waited_ns +|= profiler.elapsedNs(wait_start);
             wait_trace.reason = .wait_timeout;
             return true;
         }
         wait_trace.waited_ns +|= profiler.elapsedNs(wait_start);
         wait_trace.reason = .wait_event;
-        noteEventForRender(&event, event_flags);
-        if (!processOneEvent(window, state, keyboard, ui_scale, &event, frame_sample)) return false;
+        if (!dispatchEvent(window, renderer, state, keyboard, ui_scale, &event, event_flags, frame_sample)) return false;
     } else {
         wait_trace.reason = .event_already_queued;
-        noteEventForRender(&event, event_flags);
-        if (!processOneEvent(window, state, keyboard, ui_scale, &event, frame_sample)) return false;
+        if (!dispatchEvent(window, renderer, state, keyboard, ui_scale, &event, event_flags, frame_sample)) return false;
     }
 
-    while (sdl.pollEvent(&event)) {
-        noteEventForRender(&event, event_flags);
-        if (!processOneEvent(window, state, keyboard, ui_scale, &event, frame_sample)) return false;
+    while (app.pollEvent(&event)) {
+        if (!dispatchEvent(window, renderer, state, keyboard, ui_scale, &event, event_flags, frame_sample)) return false;
     }
 
     return true;
 }
 
-fn noteEventForRender(event: *const sdl.Event, flags: *EventFlags) void {
-    if (loop_wakeup.consume(event)) |sequence| {
-        flags.loop_wakeup_sequence = sequence;
-        return;
-    }
-    if (event.type == .mouse_motion and noMouseButtonsPressed(event.motion.state)) {
-        flags.has_mouse_motion = true;
-        return;
+fn dispatchEvent(
+    window: *palette.platform.Window,
+    renderer: *palette_frame_renderer.Renderer,
+    state: *AppState,
+    keyboard: *keybinds.NativeKeyboardConfig,
+    ui_scale: f32,
+    event: *palette.Event,
+    event_flags: *EventFlags,
+    frame_sample: *profiler.FrameSample,
+) bool {
+    // The window renderer sees every event first (resize, frame pacing,
+    // re-show); held-key tracking likewise.
+    const renderer_needs_redraw = renderer.handleEvent(event.*);
+    host.noteEvent(event.*);
+    if (renderer_needs_redraw) event_flags.renderer_redraw = true;
+    noteEventForRender(event, event_flags);
+    return processOneEvent(window, state, keyboard, ui_scale, event, frame_sample);
+}
+
+fn noteEventForRender(event: *const palette.Event, flags: *EventFlags) void {
+    switch (event.*) {
+        .user => |value| {
+            if (loop_wakeup.consume(value)) |sequence| flags.loop_wakeup_sequence = sequence;
+            return;
+        },
+        // Frame callbacks only lift the presentation throttle: the pending
+        // presentation demand retries on its own, so they are not input.
+        .frame => return,
+        .mouse_motion => |motion| if (noMouseButtonsPressed(motion.state)) {
+            flags.has_mouse_motion = true;
+            return;
+        },
+        else => {},
     }
     flags.has_non_mouse_motion = true;
 }
 
-fn noMouseButtonsPressed(state: sdl.MouseButtonFlags) bool {
-    return state.left == 0 and state.middle == 0 and state.right == 0 and state.x1 == 0 and state.x2 == 0;
+fn noMouseButtonsPressed(state: palette.event.ButtonState) bool {
+    return !state.left and !state.middle and !state.right and !state.back and !state.forward;
 }
 
 fn shouldRenderMouseMotion(has_mouse_motion: bool, continuous_frames: bool, last_render_ms: *i64) bool {
@@ -1635,19 +1324,22 @@ fn shouldRenderMouseMotion(has_mouse_motion: bool, continuous_frames: bool, last
 }
 
 fn processOneEvent(
-    window: *sdl.Window,
+    window: *palette.platform.Window,
     state: *AppState,
     keyboard: *keybinds.NativeKeyboardConfig,
     ui_scale: f32,
-    event: *sdl.Event,
+    event: *palette.Event,
     frame_sample: *profiler.FrameSample,
 ) bool {
-    // Cross-thread wake events carry no payload; noteEventForRender already
-    // captured their update sequence for display-rate coalescing.
-    if (loop_wakeup.isWakeEvent(event)) return true;
+    // Cross-thread wakes carry no payload beyond their sequence, which
+    // noteEventForRender already captured for display-rate coalescing.
+    switch (event.*) {
+        .user, .frame => return true,
+        else => {},
+    }
     const start = profiler.nowNs();
     normalizeMouseEventCoordinates(window, event);
-    switch (event.type) {
+    switch (event.*) {
         .mouse_motion, .mouse_button_down, .mouse_button_up, .mouse_wheel => {
             var input_fb_w: c_int = 0;
             var input_fb_h: c_int = 0;
@@ -1658,7 +1350,7 @@ fn processOneEvent(
     }
     const keep_running = handleEvent(window, state, keyboard, ui_scale, event);
     if (!keep_running) {
-        runtime_log.diagnostic("event requested shutdown type={s}", .{@tagName(event.type)});
+        runtime_log.diagnostic("event requested shutdown type={s}", .{@tagName(event.*)});
     }
     frame_sample.add(.event_handling, profiler.elapsedNs(start));
     return keep_running;
@@ -1851,33 +1543,33 @@ fn eventWaitBaseTimeoutForActivity(activity: PacingActivity) c_int {
     return IDLE_WAIT_TIMEOUT_MS;
 }
 
-fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.NativeKeyboardConfig, ui_scale: f32, event: *sdl.Event) bool {
+fn handleEvent(window: *palette.platform.Window, state: *AppState, keyboard: *keybinds.NativeKeyboardConfig, ui_scale: f32, event: *palette.Event) bool {
     // Deliberate-interaction events stamp input recency (tmux `window-size
     // latest`): terminal size re-assertion only fires near real user input,
     // so a focused-but-idle desktop cannot tug the shared PTY size away from
     // a web/mobile client. Focus gain counts as interaction so returning to
     // the GUI heals a drifted pane without a keypress; passive mouse motion
     // does not.
-    switch (event.type) {
-        .key_down, .text_input, .mouse_button_down, .mouse_wheel, .window_focus_gained => {
+    switch (event.*) {
+        .key_down, .text_input, .mouse_button_down, .mouse_wheel, .focus_gained => {
             state.last_user_input_ms = platform_runtime.unixTimestampMs();
         },
         else => {},
     }
-    switch (event.type) {
+    switch (event.*) {
         .quit => {
-            runtime_log.diagnostic("shutdown requested by SDL quit event", .{});
+            runtime_log.diagnostic("shutdown requested by platform quit event", .{});
             return !closePreflightPassed(state);
         },
-        .window_close_requested => {
+        .close_requested => |close_event| {
             const keep_running = handleWindowCloseRequested(window, state);
-            runtime_log.diagnostic("window close requested keep_running={} window_id={d}", .{ keep_running, @intFromEnum(event.window.window_id) });
+            runtime_log.diagnostic("window close requested keep_running={} window_id={d}", .{ keep_running, @intFromEnum(close_event.window) });
             return keep_running;
         },
-        .window_hidden, .window_minimized => {
+        .window_hidden => {
             state.suspendBrowserForHostWindowHidden();
         },
-        .window_shown, .window_restored => {
+        .window_shown => {
             state.resumeBrowserAfterHostWindowShown();
         },
         .system_theme_changed => {
@@ -1885,13 +1577,13 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             const source = ui_theme.effectiveThemeSource(state.app_config.theme_config.source, state.app_config.omarchy_detected);
             if (syncSystemAppearance() and source == .auto) applyAppConfigRuntime(state);
         },
-        .window_focus_gained => {
+        .focus_gained => {
             state.window_input_focus = true;
             _ = state.acknowledgeFocusedPaneCompletion();
             // Files may have been committed or edited outside Verde.
             state.refreshSelectedWorkspaceGitChanges(false);
         },
-        .window_focus_lost => {
+        .focus_lost => {
             state.window_input_focus = false;
             state.alt_shortcut_hints_visible = false;
             state.ctrl_shortcut_hints_visible = false;
@@ -1902,36 +1594,36 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             ui_layout.blurPaletteModalTextInput(state);
             state.blurCompanionComposer();
         },
-        .key_down => {
+        .key_down => |*key_event| {
             // Any new key-down supersedes a pending text_input swallow; the
             // swallow only ever targets the event immediately following the
             // chord-completing key.
             state.prefix_swallow_text_input = false;
-            if (event.key.scancode == .lalt or event.key.scancode == .ralt) {
+            if (key_event.hidScancode() == .lalt or key_event.hidScancode() == .ralt) {
                 state.alt_shortcut_hints_visible = true;
             }
-            if (event.key.scancode == .lctrl or event.key.scancode == .rctrl) {
+            if (key_event.hidScancode() == .lctrl or key_event.hidScancode() == .rctrl) {
                 state.ctrl_shortcut_hints_visible = true;
             }
-            if (event.key.scancode == .lshift or event.key.scancode == .rshift) {
+            if (key_event.hidScancode() == .lshift or key_event.hidScancode() == .rshift) {
                 state.shift_shortcut_hints_visible = true;
             }
             if (browserInputDebugEnabled()) {
                 log.info(
-                    "browser-input sdl key_down key=0x{x} scancode={} focused={} visible={}",
-                    .{ @intFromEnum(event.key.key), @intFromEnum(event.key.scancode), state.isBrowserPaneFocused(), state.isBrowserVisible() },
+                    "browser-input platform key_down key=0x{x} scancode={} focused={} visible={}",
+                    .{ @intFromEnum(key_event.key), @intFromEnum(key_event.hidScancode()), state.isBrowserPaneFocused(), state.isBrowserVisible() },
                 );
             }
             // Credential and first-contact trust are security boundaries, so
             // they own key-down before terminal selection, prefix chords, and
             // persistent Companion captures can act on the obscured surface.
             if ((state.runtimeCredentialModalOpen() or state.runtimeTrustProposal() != null) and
-                ui_layout.handlePaletteKeyDown(state, &event.key))
+                ui_layout.handlePaletteKeyDown(state, key_event))
             {
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (event.key.key == .escape and ui_layout.companionOwnsEscapeKey(state)) {
+            if (key_event.key == .escape and ui_layout.companionOwnsEscapeKey(state)) {
                 _ = ui_layout.handleCompanionEscapeKey(state, true);
                 syncWindowTextInput(window, state);
                 return true;
@@ -1939,53 +1631,53 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             if (state.isCompanionEnabled() and state.companion_controller.mission_control_open) {
                 // True Palette modals remain above Mission Control. Otherwise
                 // the full-window overlay owns keys before pane/browser input.
-                if (ui_layout.handlePaletteKeyDown(state, &event.key)) {
+                if (ui_layout.handlePaletteKeyDown(state, key_event)) {
                     syncWindowTextInput(window, state);
                     return true;
                 }
-                if (event.key.key == .escape) {
+                if (key_event.key == .escape) {
                     _ = ui_layout.handleCompanionEscapeKey(state, true);
                 } else if (state.companion_composer.focused) {
-                    _ = state.routeCompanionComposerKeyDown(&event.key);
+                    _ = state.routeCompanionComposerKeyDown(key_event);
                 }
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (terminal_panel_ui.handlePaletteKeyDown(state, &event.key)) {
+            if (terminal_panel_ui.handlePaletteKeyDown(state, key_event)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
             // An armed prefix owns the next key outright, even above modals,
             // so a chord never half-completes into a text field.
-            if (state.prefix_armed and handleArmedPrefixKeyDown(state, keyboard, &event.key)) {
+            if (state.prefix_armed and handleArmedPrefixKeyDown(state, keyboard, key_event)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (state.prefix_navigate and handleNavigateKeyDown(state, keyboard, &event.key)) {
+            if (state.prefix_navigate and handleNavigateKeyDown(state, keyboard, key_event)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
-            const raw_action = keyboard.actionForEvent(&event.key);
+            const raw_action = keyboard.actionForEvent(key_event);
             const action = if (raw_action == .companion and !state.isCompanionEnabled()) null else raw_action;
             // True modals own keys before the persistent Companion, while the
             // Companion visibility controls remain global across pane focus.
-            if (ui_layout.handlePaletteKeyDown(state, &event.key)) {
+            if (ui_layout.handlePaletteKeyDown(state, key_event)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
             // The ask-agent popover floats over panes and the side panel, so it
             // owns keys before any pane or panel body routing.
-            if (agent_prompt_popover_ui.handleKeyDown(state, &event.key)) {
+            if (agent_prompt_popover_ui.handleKeyDown(state, key_event)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (event.key.key == .escape and ui_layout.handleCompanionEscapeKey(state, true)) {
+            if (key_event.key == .escape and ui_layout.handleCompanionEscapeKey(state, true)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
             // Arm only after true modals have declined the key so a modal
             // text field keeps its own Ctrl chords.
-            if (keyboard.isPrefixKeyEvent(&event.key)) {
+            if (keyboard.isPrefixKeyEvent(key_event)) {
                 state.prefix_armed = true;
                 state.markDirty();
                 syncWindowTextInput(window, state);
@@ -1996,31 +1688,31 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (state.routeCompanionComposerKeyDown(&event.key)) {
+            if (state.routeCompanionComposerKeyDown(key_event)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (workspace_panes_ui.handleEmptyWorkspaceKeyDown(state, &event.key)) {
+            if (workspace_panes_ui.handleEmptyWorkspaceKeyDown(state, key_event)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
             // A focused side panel body (Changes / Files) owns navigation keys
             // before pane bindings, so Ctrl+W closes the panel, not a pane.
-            if (side_panel_ui.handleKeyDown(state, &event.key, action)) {
+            if (side_panel_ui.handleKeyDown(state, key_event, action)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (file_viewer_ui.handleKeyDown(state, &event.key)) {
+            if (file_viewer_ui.handleKeyDown(state, key_event)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (keyboard.workspaceActiveSelectIndexForEvent(&event.key)) |active_ordinal| {
+            if (keyboard.workspaceActiveSelectIndexForEvent(key_event)) |active_ordinal| {
                 if (sidebar_ui.focusAttentionClusterRowAtIndex(state, active_ordinal)) {
                     syncWindowTextInput(window, state);
                     return true;
                 }
             }
-            if (keyboard.workspacePaneSelectIndexForEvent(&event.key)) |tab_ordinal| {
+            if (keyboard.workspacePaneSelectIndexForEvent(key_event)) |tab_ordinal| {
                 if (sidebar_ui.selectOpenRowAtOrdinal(state, tab_ordinal)) {
                     syncWindowTextInput(window, state);
                     return true;
@@ -2032,21 +1724,21 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             // Codex, which treats it as a redraw/reset input.
             if (action) |resolved_workspace_action| {
                 if (isWorkspacePaneAction(resolved_workspace_action) or isWorkspaceTraversalAction(resolved_workspace_action)) {
-                    noteMacosWorkspaceCloseShortcut(&event.key, resolved_workspace_action);
+                    noteMacosWorkspaceCloseShortcut(key_event, resolved_workspace_action);
                     handleKeyboardAction(state, keyboard, resolved_workspace_action);
                     syncWindowTextInput(window, state);
                     return true;
                 }
             }
-            if (state.terminal_controller.focused and terminalOwnedShortcut(&event.key)) {
-                const terminal_key_handled = state.handleTerminalKeyDown(keyboard, &event.key);
-                state.noteTerminalKeyRouting(&event.key, terminal_key_handled);
+            if (state.terminal_controller.focused and terminalOwnedShortcut(key_event)) {
+                const terminal_key_handled = state.handleTerminalKeyDown(keyboard, key_event);
+                state.noteTerminalKeyRouting(key_event, terminal_key_handled);
                 if (terminal_key_handled) {
                     return true;
                 }
             }
-            const paste_shortcut = shouldPasteClipboardImage(state, &event.key);
-            logPasteShortcutEvent(state, &event.key, paste_shortcut);
+            const paste_shortcut = shouldPasteClipboardImage(state, key_event);
+            logPasteShortcutEvent(state, key_event, paste_shortcut);
             if (paste_shortcut) {
                 // Browser URL bar, modal text inputs, and the model picker's
                 // search field handle their own paste further down the chain.
@@ -2063,13 +1755,13 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             // A focused browser pane reserves the conventional reload chord
             // for its active tab, ahead of any app-refresh override that
             // still binds plain Ctrl+R.
-            if (handleBrowserReloadShortcut(state, &event.key)) {
+            if (handleBrowserReloadShortcut(state, key_event)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
             // Ctrl+T / Ctrl+W open and close browser tabs, only while the
             // browser pane owns focus so terminals and chats keep the chords.
-            if (handleBrowserTabShortcut(state, &event.key)) {
+            if (handleBrowserTabShortcut(state, key_event)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
@@ -2083,42 +1775,42 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                     return true;
                 }
             }
-            if (handleGuiChatShortcut(state, keyboard, &event.key)) {
+            if (handleGuiChatShortcut(state, keyboard, key_event)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (keyboard.workspaceShowAllForEvent(&event.key)) {
+            if (keyboard.workspaceShowAllForEvent(key_event)) {
                 state.showAllWorkspacesInSidebar();
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (keyboard.workspaceSelectIndexForEvent(&event.key)) |workspace_ordinal| {
+            if (keyboard.workspaceSelectIndexForEvent(key_event)) |workspace_ordinal| {
                 if (workspace_ordinal < state.project_controller.projects.items.len) {
-                    state.noteWorkspaceSwitchInput(workspace_ordinal, event.key.timestamp, profiler.nowNs());
+                    state.noteWorkspaceSwitchInput(workspace_ordinal, palette.clock.monotonicTimestampNs(), profiler.nowNs());
                 }
                 if (state.selectProjectScoped(workspace_ordinal)) {
                     syncWindowTextInput(window, state);
                     return true;
                 }
             }
-            if (handleFileSearchAccept(state, &event.key)) {
+            if (handleFileSearchAccept(state, key_event)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (!state.composer_controller.composer.focused and keyboard.workspaceFocusPromptForEvent(&event.key)) {
+            if (!state.composer_controller.composer.focused and keyboard.workspaceFocusPromptForEvent(key_event)) {
                 if (state.focusPromptForFocusedChatWorkspacePane()) {
                     syncWindowTextInput(window, state);
                     return true;
                 }
             }
-            if (handleComposerBlurShortcut(state, &event.key)) {
+            if (handleComposerBlurShortcut(state, key_event)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (handleTranscriptMarkdownCopyShortcut(state, &event.key)) {
+            if (handleTranscriptMarkdownCopyShortcut(state, key_event)) {
                 return true;
             }
-            if (state.routePaletteComposerKeyDown(&event.key)) {
+            if (state.routePaletteComposerKeyDown(key_event)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
@@ -2126,7 +1818,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             // or embedded terminal has keyboard focus.
             if (action) |resolved_workspace_action| {
                 if (isWorkspacePaneAction(resolved_workspace_action) or isWorkspaceTraversalAction(resolved_workspace_action)) {
-                    noteMacosWorkspaceCloseShortcut(&event.key, resolved_workspace_action);
+                    noteMacosWorkspaceCloseShortcut(key_event, resolved_workspace_action);
                     handleKeyboardAction(state, keyboard, resolved_workspace_action);
                     syncWindowTextInput(window, state);
                     return true;
@@ -2136,7 +1828,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             if (native_browser_focused) {
                 state.browser_controller.address_focused = false;
             }
-            if (handleBrowserInspectorEscape(state, &event.key)) {
+            if (handleBrowserInspectorEscape(state, key_event)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
@@ -2144,24 +1836,24 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (!native_browser_focused and browser_ui.handlePaletteKeyDown(state, &event.key)) {
+            if (!native_browser_focused and browser_ui.handlePaletteKeyDown(state, key_event)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (handleBrowserSelectAllShortcut(state, &event.key)) {
+            if (handleBrowserSelectAllShortcut(state, key_event)) {
                 return true;
             }
-            if (handleBrowserCopyCutShortcut(state, &event.key)) {
+            if (handleBrowserCopyCutShortcut(state, key_event)) {
                 return true;
             }
-            if (handleBrowserClipboardShortcut(state, &event.key)) {
+            if (handleBrowserClipboardShortcut(state, key_event)) {
                 return true;
             }
             if (native_browser_focused and !state.composer_controller.composer.focused) {
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (state.isBrowserPaneFocused() and handleBrowserKeyboardEvent(state, &event.key)) {
+            if (state.isBrowserPaneFocused() and handleBrowserKeyboardEvent(state, key_event)) {
                 return true;
             }
             if (action) |resolved_app_action| switch (resolved_app_action) {
@@ -2178,34 +1870,34 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 },
                 else => {},
             };
-            const terminal_key_handled = state.handleTerminalKeyDown(keyboard, &event.key);
-            state.noteTerminalKeyRouting(&event.key, terminal_key_handled);
+            const terminal_key_handled = state.handleTerminalKeyDown(keyboard, key_event);
+            state.noteTerminalKeyRouting(key_event, terminal_key_handled);
             if (terminal_key_handled) {
                 return true;
             }
-            if (handleFontSizeShortcut(state, &event.key)) {
+            if (handleFontSizeShortcut(state, key_event)) {
                 return true;
             }
-            if (handleBrowserKeyboardEvent(state, &event.key)) {
+            if (handleBrowserKeyboardEvent(state, key_event)) {
                 return true;
             }
-            if (handleFileSearchNavigation(state, &event.key)) {
+            if (handleFileSearchNavigation(state, key_event)) {
                 return true;
             }
-            if (handlePendingThreadFollowupShortcut(state, &event.key)) {
+            if (handlePendingThreadFollowupShortcut(state, key_event)) {
                 return true;
             }
-            if (handleWorkspaceContextMenuShortcut(state, &event.key)) {
+            if (handleWorkspaceContextMenuShortcut(state, key_event)) {
                 return true;
             }
-            if (handleComposerFocusShortcut(state, &event.key)) {
+            if (handleComposerFocusShortcut(state, key_event)) {
                 return true;
             }
-            if (handleTranscriptMarkdownSelectAllShortcut(state, &event.key)) {
+            if (handleTranscriptMarkdownSelectAllShortcut(state, key_event)) {
                 return true;
             }
-            if (event.key.repeat) {
-                if (keyboard.transcriptScrollActionForEvent(&event.key)) |repeat_action| {
+            if (key_event.repeat) {
+                if (keyboard.transcriptScrollActionForEvent(key_event)) |repeat_action| {
                     handleKeyboardAction(state, keyboard, repeat_action);
                     return true;
                 }
@@ -2214,23 +1906,23 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 handleKeyboardAction(state, keyboard, resolved_action);
             }
         },
-        .key_up => {
-            if (event.key.scancode == .lalt or event.key.scancode == .ralt) {
+        .key_up => |*key_event| {
+            if (key_event.hidScancode() == .lalt or key_event.hidScancode() == .ralt) {
                 state.alt_shortcut_hints_visible = false;
             }
-            if (event.key.scancode == .lctrl or event.key.scancode == .rctrl) {
+            if (key_event.hidScancode() == .lctrl or key_event.hidScancode() == .rctrl) {
                 state.ctrl_shortcut_hints_visible = false;
             }
-            if (event.key.scancode == .lshift or event.key.scancode == .rshift) {
+            if (key_event.hidScancode() == .lshift or key_event.hidScancode() == .rshift) {
                 state.shift_shortcut_hints_visible = false;
             }
             if (browserInputDebugEnabled()) {
                 log.info(
-                    "browser-input sdl key_up key=0x{x} scancode={} focused={} visible={}",
-                    .{ @intFromEnum(event.key.key), @intFromEnum(event.key.scancode), state.isBrowserPaneFocused(), state.isBrowserVisible() },
+                    "browser-input platform key_up key=0x{x} scancode={} focused={} visible={}",
+                    .{ @intFromEnum(key_event.key), @intFromEnum(key_event.hidScancode()), state.isBrowserPaneFocused(), state.isBrowserVisible() },
                 );
             }
-            if (event.key.key == .escape and ui_layout.handleCompanionEscapeKey(state, false)) {
+            if (key_event.key == .escape and ui_layout.handleCompanionEscapeKey(state, false)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
@@ -2247,23 +1939,23 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (handleBrowserKeyboardEvent(state, &event.key)) {
+            if (handleBrowserKeyboardEvent(state, key_event)) {
                 return true;
             }
         },
-        .text_input => {
+        .text_input => |text_event| {
             if (state.prefix_swallow_text_input) {
                 state.prefix_swallow_text_input = false;
                 return true;
             }
-            const text_input = std.mem.sliceTo(event.text.text, 0);
+            const text_input = text_event.text;
             if (state.prefix_help_search_active) {
                 state.appendPrefixHelpQuery(text_input);
                 state.markDirty();
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (suppressDuplicateMacosTextInput(text_input, event.text.timestamp)) return true;
+            if (suppressDuplicateMacosTextInput(text_input, palette.clock.monotonicTimestampNs())) return true;
             if (ui_layout.handlePaletteTextInput(state, text_input)) {
                 syncWindowTextInput(window, state);
                 return true;
@@ -2305,8 +1997,8 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             }
             if (browserInputDebugEnabled()) {
                 log.info(
-                    "browser-input sdl text_input text_len={d} timestamp={} focused={} native_focused={} visible={}",
-                    .{ text_input.len, event.text.timestamp, state.isBrowserPaneFocused(), native_browser_focused, state.isBrowserVisible() },
+                    "browser-input platform text_input text_len={d} timestamp={} focused={} native_focused={} visible={}",
+                    .{ text_input.len, palette.clock.monotonicTimestampNs(), state.isBrowserPaneFocused(), native_browser_focused, state.isBrowserVisible() },
                 );
             }
             const browser_text_handled = state.handleBrowserKey(.{
@@ -2321,83 +2013,83 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             if (browser_text_handled) {
                 return true;
             }
-            const terminal_text_handled = state.handleTerminalTextInput(event.text.text);
+            const terminal_text_handled = state.handleTerminalTextInput(text_input);
             state.noteTerminalTextRouting(text_input, terminal_text_handled);
             if (terminal_text_handled) {
                 return true;
             }
         },
-        .mouse_motion => {
-            if (sidebar_ui.finishThreadDragIfMouseReleased(state, event.motion.x, event.motion.y, event.motion.state)) {
+        .mouse_motion => |*motion_event| {
+            if (sidebar_ui.finishThreadDragIfMouseReleased(state, motion_event.x, motion_event.y, motion_event.state)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
-            state.notePaletteWorkspaceMouseMotion(event.motion.x, event.motion.y);
-            ui_layout.updateThreadImportModalHover(state, event.motion.x, event.motion.y);
-            ui_layout.updateCookieImportModalHover(state, event.motion.x, event.motion.y);
-            ui_layout.updateCommitSheetHover(state, event.motion.x, event.motion.y);
-            ui_layout.updateSettingsModalHover(state, event.motion.x, event.motion.y);
-            ui_layout.updateCommandPaletteHover(state, event.motion.x, event.motion.y);
-            const modal_owns_motion = ui_layout.handlePaletteMouseMotion(state, event.motion.x, event.motion.y);
+            state.notePaletteWorkspaceMouseMotion(motion_event.x, motion_event.y);
+            ui_layout.updateThreadImportModalHover(state, motion_event.x, motion_event.y);
+            ui_layout.updateCookieImportModalHover(state, motion_event.x, motion_event.y);
+            ui_layout.updateCommitSheetHover(state, motion_event.x, motion_event.y);
+            ui_layout.updateSettingsModalHover(state, motion_event.x, motion_event.y);
+            ui_layout.updateCommandPaletteHover(state, motion_event.x, motion_event.y);
+            const modal_owns_motion = ui_layout.handlePaletteMouseMotion(state, motion_event.x, motion_event.y);
             if (state.palette_modal_pointer_captured or modal_owns_motion) {
                 return true;
             }
-            if (agent_prompt_popover_ui.handleMouseMotion(state, event.motion.x, event.motion.y)) return true;
-            if (ui_layout.handleCompanionMouseMotion(state, event.motion.x, event.motion.y, event.motion.state.left != 0)) {
+            if (agent_prompt_popover_ui.handleMouseMotion(state, motion_event.x, motion_event.y)) return true;
+            if (ui_layout.handleCompanionMouseMotion(state, motion_event.x, motion_event.y, motion_event.state.left)) {
                 return true;
             }
             // Composer popovers (model picker / run config) draw above the
             // panes, so their hover/drag routing must win over transcript and
             // pane motion handlers below.
-            if (state.routeComposerPopoverMouseMotion(&event.motion, ui_scale)) {
+            if (state.routeComposerPopoverMouseMotion(motion_event, ui_scale)) {
                 return true;
             }
             chat_panel_ui.handleTranscriptPaletteMouseMotion(state);
-            if (side_panel_ui.handleMouseMotion(state, event.motion.x, event.motion.y)) {
+            if (side_panel_ui.handleMouseMotion(state, motion_event.x, motion_event.y)) {
                 return true;
             }
-            workspace_strip_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y);
-            const ctrl_down = isCtrlPressed() or isKeymodPressed(SDL_GetModState(), sdl.Keymod.ctrl);
-            if (workspace_panes_ui.hasActivePaneDrag() and workspace_panes_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y, event.motion.xrel, event.motion.yrel, ctrl_down)) {
+            workspace_strip_ui.handlePaletteMouseMotion(state, motion_event.x, motion_event.y);
+            const ctrl_down = isCtrlPressed() or host.modState().ctrl;
+            if (workspace_panes_ui.hasActivePaneDrag() and workspace_panes_ui.handlePaletteMouseMotion(state, motion_event.x, motion_event.y, motion_event.xrel, motion_event.yrel, ctrl_down)) {
                 return true;
             }
             // Focus the workspace leaf before forwarding motion to its content.
             // Mouse-aware TUIs consume motion, which must not prevent hover focus.
-            if (workspace_panes_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y, event.motion.xrel, event.motion.yrel, ctrl_down)) {
+            if (workspace_panes_ui.handlePaletteMouseMotion(state, motion_event.x, motion_event.y, motion_event.xrel, motion_event.yrel, ctrl_down)) {
                 return true;
             }
-            if (terminal_panel_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y, event.motion.state)) {
+            if (terminal_panel_ui.handlePaletteMouseMotion(state, motion_event.x, motion_event.y, motion_event.state)) {
                 return true;
             }
-            browser_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y);
-            sidebar_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y);
-            if (state.routePaletteComposerMouseMotion(&event.motion, ui_scale)) {
+            browser_ui.handlePaletteMouseMotion(state, motion_event.x, motion_event.y);
+            sidebar_ui.handlePaletteMouseMotion(state, motion_event.x, motion_event.y);
+            if (state.routePaletteComposerMouseMotion(motion_event, ui_scale)) {
                 return true;
             }
-            _ = state.handleBrowserMouse(browserMouseMotionEvent(&event.motion));
+            _ = state.handleBrowserMouse(browserMouseMotionEvent(motion_event));
         },
-        .mouse_button_down, .mouse_button_up => {
-            if (!event.button.down and ui_layout.companionOwnsPointerRelease(state, event.button.button)) {
-                _ = ui_layout.handleCompanionMouseButton(state, event.button.x, event.button.y, event.button.button, false, event.button.clicks);
+        .mouse_button_down, .mouse_button_up => |*button_event| {
+            if (!button_event.down and ui_layout.companionOwnsPointerRelease(state, button_event.button)) {
+                _ = ui_layout.handleCompanionMouseButton(state, button_event.x, button_event.y, button_event.button, false, button_event.clicks);
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (event.button.button == 1 and !event.button.down and state.palette_modal_pointer_captured) {
-                _ = ui_layout.handlePaletteMouseButton(state, event.button.x, event.button.y, false, event.button.clicks);
+            if (button_event.button == 1 and !button_event.down and state.palette_modal_pointer_captured) {
+                _ = ui_layout.handlePaletteMouseButton(state, button_event.x, button_event.y, false, button_event.clicks);
                 state.palette_modal_pointer_captured = false;
                 state.modal_text_drag_active = false;
                 state.endImageModalPan();
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (event.button.button == 1 and sidebar_ui.hasActiveThreadDrag()) {
-                if (sidebar_ui.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.down)) {
+            if (button_event.button == 1 and sidebar_ui.hasActiveThreadDrag()) {
+                if (sidebar_ui.handlePaletteMouseButton(state, button_event.x, button_event.y, button_event.down)) {
                     syncWindowTextInput(window, state);
                     return true;
                 }
             }
-            if (event.button.button == 1 and ui_layout.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.down, event.button.clicks)) {
-                if (event.button.down) state.palette_modal_pointer_captured = true;
+            if (button_event.button == 1 and ui_layout.handlePaletteMouseButton(state, button_event.x, button_event.y, button_event.down, button_event.clicks)) {
+                if (button_event.down) state.palette_modal_pointer_captured = true;
                 syncWindowTextInput(window, state);
                 return true;
             }
@@ -2405,18 +2097,18 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (event.button.button == 1 and agent_prompt_popover_ui.handleMouseButton(state, event.button.x, event.button.y, event.button.down, event.button.clicks)) {
+            if (button_event.button == 1 and agent_prompt_popover_ui.handleMouseButton(state, button_event.x, button_event.y, button_event.down, button_event.clicks)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (ui_layout.handleCompanionMouseButton(state, event.button.x, event.button.y, event.button.button, event.button.down, event.button.clicks)) {
+            if (ui_layout.handleCompanionMouseButton(state, button_event.x, button_event.y, button_event.button, button_event.down, button_event.clicks)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (event.button.button == 1 and event.button.down) state.blurCompanionComposer();
+            if (button_event.button == 1 and button_event.down) state.blurCompanionComposer();
             // Composer popovers overlay the panes; clicks on (or dismissing)
             // them must not fall through to workspace/transcript handlers.
-            if (state.routeComposerPopoverMouseButton(&event.button, ui_scale)) {
+            if (state.routeComposerPopoverMouseButton(button_event, ui_scale)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
@@ -2424,105 +2116,105 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             // across workspace panes when the rail is collapsed. Route its
             // clicks, and the right-click that opens it, before pane/browser
             // content so the visual top layer also owns pointer input.
-            if (event.button.button == 1 and event.button.down and state.sidebar_context_menu_open and
-                !sidebar_ui.pointerOverSidebar(event.button.x, event.button.y))
+            if (button_event.button == 1 and button_event.down and state.sidebar_context_menu_open and
+                !sidebar_ui.pointerOverSidebar(button_event.x, button_event.y))
             {
                 state.closeSidebarContextMenu();
             }
-            if (event.button.button == 1 and event.button.down and state.sidebar_context_menu_open and
-                sidebar_ui.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.down))
+            if (button_event.button == 1 and button_event.down and state.sidebar_context_menu_open and
+                sidebar_ui.handlePaletteMouseButton(state, button_event.x, button_event.y, button_event.down))
             {
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (event.button.down and event.button.button == sidebar_ui.palette_mouse_button_secondary and
-                sidebar_ui.handlePaletteSecondaryMouseButton(state, event.button.x, event.button.y, event.button.down))
+            if (button_event.down and button_event.button == sidebar_ui.palette_mouse_button_secondary and
+                sidebar_ui.handlePaletteSecondaryMouseButton(state, button_event.x, button_event.y, button_event.down))
             {
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (event.button.button == 1 and debug_ui.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.down)) {
+            if (button_event.button == 1 and debug_ui.handlePaletteMouseButton(state, button_event.x, button_event.y, button_event.down)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
             // The workspace strip sits above the pane region while the sidebar
             // is collapsed/hidden; it owns its own rows before pane routing.
-            if (event.button.button == 1 and workspace_strip_ui.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.down)) {
+            if (button_event.button == 1 and workspace_strip_ui.handlePaletteMouseButton(state, button_event.x, button_event.y, button_event.down)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
             // The approval card overlays the gap between transcript and
             // composer, so it must receive clicks before pane/browser routing.
-            if (event.button.button == 1 and chat_panel_ui.handleApprovalPaletteMouseButton(state, event.button.x, event.button.y, event.button.down)) {
+            if (button_event.button == 1 and chat_panel_ui.handleApprovalPaletteMouseButton(state, button_event.x, button_event.y, button_event.down)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
             // The git outcome card floats over the bottom of the workspace.
-            if (event.button.button == 1 and ui_layout.handleGitToastMouseButton(state, event.button.x, event.button.y, event.button.down)) {
+            if (button_event.button == 1 and ui_layout.handleGitToastMouseButton(state, button_event.x, button_event.y, button_event.down)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
             // Running background-command cards occupy that same strip so Stop /
             // Output remain reachable after the stream commits.
-            if (event.button.button == 1 and chat_panel_ui.handleBackgroundTaskPinMouseButton(
+            if (button_event.button == 1 and chat_panel_ui.handleBackgroundTaskPinMouseButton(
                 state,
-                event.button.x,
-                event.button.y,
-                event.button.down,
-                event.button.clicks,
+                button_event.x,
+                button_event.y,
+                button_event.down,
+                button_event.clicks,
             )) {
                 syncWindowTextInput(window, state);
                 return true;
             }
             // Side panel chrome (view tabs, actions, resize grip) owns its hits;
             // the browser page and agent rows inside route below.
-            if (event.button.button == 1 and side_panel_ui.handleMouseButton(state, event.button.x, event.button.y, event.button.down, event.button.clicks)) {
+            if (button_event.button == 1 and side_panel_ui.handleMouseButton(state, button_event.x, button_event.y, button_event.down, button_event.clicks)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
             // Linked-chat rows render in the side panel's Agents view.
-            if (event.button.button == 1 and chat_panel_ui.handleLinkedChatsMouseButton(state, event.button.x, event.button.y, event.button.down)) {
+            if (button_event.button == 1 and chat_panel_ui.handleLinkedChatsMouseButton(state, button_event.x, button_event.y, button_event.down)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
             // Pane chrome overlays native browser and terminal content, so its
             // precise hits must be handled before either content surface.
-            if (workspace_panes_ui.handlePaneChromeMouseButton(state, event.button.x, event.button.y, event.button.button, event.button.down)) {
+            if (workspace_panes_ui.handlePaneChromeMouseButton(state, button_event.x, button_event.y, button_event.button, button_event.down)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
-            const ctrl_down = isCtrlPressed() or isKeymodPressed(SDL_GetModState(), sdl.Keymod.ctrl);
-            const shift_down = isKeymodPressed(SDL_GetModState(), sdl.Keymod.shift);
-            if (event.button.button == 1 and (ctrl_down or workspace_panes_ui.hasActivePaneDrag()) and
-                workspace_panes_ui.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.button, event.button.down, ctrl_down, shift_down))
+            const ctrl_down = isCtrlPressed() or host.modState().ctrl;
+            const shift_down = host.modState().shift;
+            if (button_event.button == 1 and (ctrl_down or workspace_panes_ui.hasActivePaneDrag()) and
+                workspace_panes_ui.handlePaletteMouseButton(state, button_event.x, button_event.y, button_event.button, button_event.down, ctrl_down, shift_down))
             {
                 syncWindowTextInput(window, state);
                 return true;
             }
             if (browserInputDebugEnabled()) {
                 log.info(
-                    "browser-input sdl mouse_button down={} button={} x={d:.1} y={d:.1} contains={} focused={}",
+                    "browser-input platform mouse_button down={} button={} x={d:.1} y={d:.1} contains={} focused={}",
                     .{
-                        event.button.down,
-                        event.button.button,
-                        event.button.x,
-                        event.button.y,
-                        state.browserPaneContains(event.button.x, event.button.y),
+                        button_event.down,
+                        button_event.button,
+                        button_event.x,
+                        button_event.y,
+                        state.browserPaneContains(button_event.x, button_event.y),
                         state.isBrowserPaneFocused(),
                     },
                 );
             }
-            if (event.button.button == 1 and browser_ui.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.down, event.button.clicks)) {
+            if (button_event.button == 1 and browser_ui.handlePaletteMouseButton(state, button_event.x, button_event.y, button_event.down, button_event.clicks)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (event.button.down and macosBrowserClickWillFocusNativeSurface(state, event.button.x, event.button.y)) {
-                if (SDL_TextInputActive(window)) {
-                    sdl.stopTextInput(window) catch {};
+            if (button_event.down and macosBrowserClickWillFocusNativeSurface(state, button_event.x, button_event.y)) {
+                if (window.isTextInputActive()) {
+                    window.stopTextInput();
                 }
             }
-            const handled = state.handleBrowserMouse(browserMouseButtonEvent(&event.button));
-            if (!handled and event.button.down) {
+            const handled = state.handleBrowserMouse(browserMouseButtonEvent(button_event));
+            if (!handled and button_event.down) {
                 state.unfocusBrowserPane();
             }
             if (handled) {
@@ -2531,60 +2223,60 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             }
             // Workspace header (Open / Browser) must run before the sidebar rail so hits are never
             // swallowed by expanded sidebar geometry or rail chrome.
-            if (event.button.button == 1 and chat_panel_ui.handleWorkspaceHeaderPaletteMouseButton(
+            if (button_event.button == 1 and chat_panel_ui.handleWorkspaceHeaderPaletteMouseButton(
                 state,
-                event.button.x,
-                event.button.y,
-                event.button.down,
+                button_event.x,
+                button_event.y,
+                button_event.down,
             )) {
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (workspace_panes_ui.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.button, event.button.down, ctrl_down, shift_down)) {
+            if (workspace_panes_ui.handlePaletteMouseButton(state, button_event.x, button_event.y, button_event.button, button_event.down, ctrl_down, shift_down)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (event.button.button == 1 and sidebar_ui.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.down)) {
+            if (button_event.button == 1 and sidebar_ui.handlePaletteMouseButton(state, button_event.x, button_event.y, button_event.down)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (event.button.button == 1 and chat_panel_ui.handleSlashCommandPaletteMouseButton(state, event.button.x, event.button.y, event.button.down)) {
+            if (button_event.button == 1 and chat_panel_ui.handleSlashCommandPaletteMouseButton(state, button_event.x, button_event.y, button_event.down)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (event.button.button == 1 and chat_panel_ui.handleFileSearchPaletteMouseButton(state, event.button.x, event.button.y, event.button.down)) {
+            if (button_event.button == 1 and chat_panel_ui.handleFileSearchPaletteMouseButton(state, button_event.x, button_event.y, button_event.down)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (event.button.button == 1 and chat_panel_ui.handleTranscriptPaletteMouseButton(
+            if (button_event.button == 1 and chat_panel_ui.handleTranscriptPaletteMouseButton(
                 state,
-                event.button.x,
-                event.button.y,
-                event.button.down,
-                event.button.clicks,
+                button_event.x,
+                button_event.y,
+                button_event.down,
+                button_event.clicks,
             )) {
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (event.button.button == 1 and state.handleComposerDraftImageClearMouseButton(event.button.x, event.button.y, event.button.down)) {
+            if (button_event.button == 1 and state.handleComposerDraftImageClearMouseButton(button_event.x, button_event.y, button_event.down)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (event.button.button == 1 and chat_panel_ui.handleFollowupPinMouseButton(state, event.button.x, event.button.y, event.button.down, event.button.clicks)) {
+            if (button_event.button == 1 and chat_panel_ui.handleFollowupPinMouseButton(state, button_event.x, button_event.y, button_event.down, button_event.clicks)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (terminal_panel_ui.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.button, event.button.down)) {
+            if (terminal_panel_ui.handlePaletteMouseButton(state, button_event.x, button_event.y, button_event.button, button_event.down)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (state.routePaletteComposerMouseButton(&event.button, ui_scale)) {
+            if (state.routePaletteComposerMouseButton(button_event, ui_scale)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
             syncWindowTextInput(window, state);
         },
-        .mouse_wheel => {
+        .mouse_wheel => |*wheel_event| {
             var input_fb_w: c_int = 0;
             var input_fb_h: c_int = 0;
             getWindowSizeInPixels(window, &input_fb_w, &input_fb_h);
@@ -2592,9 +2284,9 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 state,
                 @floatFromInt(input_fb_w),
                 @floatFromInt(input_fb_h),
-                event.wheel.mouse_x,
-                event.wheel.mouse_y,
-                event.wheel.y,
+                wheel_event.mouse_x,
+                wheel_event.mouse_y,
+                wheel_event.y,
             )) {
                 return true;
             }
@@ -2602,9 +2294,9 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 state,
                 @floatFromInt(input_fb_w),
                 @floatFromInt(input_fb_h),
-                event.wheel.mouse_x,
-                event.wheel.mouse_y,
-                event.wheel.y,
+                wheel_event.mouse_x,
+                wheel_event.mouse_y,
+                wheel_event.y,
             )) {
                 return true;
             }
@@ -2612,9 +2304,9 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 state,
                 @floatFromInt(input_fb_w),
                 @floatFromInt(input_fb_h),
-                event.wheel.mouse_x,
-                event.wheel.mouse_y,
-                event.wheel.y,
+                wheel_event.mouse_x,
+                wheel_event.mouse_y,
+                wheel_event.y,
             )) {
                 return true;
             }
@@ -2622,9 +2314,9 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 state,
                 @floatFromInt(input_fb_w),
                 @floatFromInt(input_fb_h),
-                event.wheel.mouse_x,
-                event.wheel.mouse_y,
-                event.wheel.y,
+                wheel_event.mouse_x,
+                wheel_event.mouse_y,
+                wheel_event.y,
             )) {
                 return true;
             }
@@ -2632,35 +2324,35 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 state,
                 @floatFromInt(input_fb_w),
                 @floatFromInt(input_fb_h),
-                event.wheel.mouse_x,
-                event.wheel.mouse_y,
-                event.wheel.y,
+                wheel_event.mouse_x,
+                wheel_event.mouse_y,
+                wheel_event.y,
             )) {
                 return true;
             }
             if (ui_layout.hasPaletteModal(state)) return true;
-            if (agent_prompt_popover_ui.handleWheel(state, event.wheel.mouse_x, event.wheel.mouse_y, event.wheel.y)) return true;
-            if (routeCompanionWheel(state, event.wheel.mouse_x, event.wheel.mouse_y, event.wheel.y)) {
+            if (agent_prompt_popover_ui.handleWheel(state, wheel_event.mouse_x, wheel_event.mouse_y, wheel_event.y)) return true;
+            if (routeCompanionWheel(state, wheel_event.mouse_x, wheel_event.mouse_y, wheel_event.y)) {
                 return true;
             }
             // Composer popovers overlay the panes; scrolling their lists must
             // win over sidebar/terminal/transcript wheel handlers below.
-            if (state.routeComposerPopoverWheel(&event.wheel, ui_scale)) {
+            if (state.routeComposerPopoverWheel(wheel_event, ui_scale)) {
                 return true;
             }
-            if (sidebar_ui.handlePaletteWheel(event.wheel.mouse_x, event.wheel.mouse_y, event.wheel.y)) {
+            if (sidebar_ui.handlePaletteWheel(wheel_event.mouse_x, wheel_event.mouse_y, wheel_event.y)) {
                 return true;
             }
-            if (side_panel_ui.handleWheel(state, event.wheel.mouse_x, event.wheel.mouse_y, event.wheel.y)) {
+            if (side_panel_ui.handleWheel(state, wheel_event.mouse_x, wheel_event.mouse_y, wheel_event.y)) {
                 return true;
             }
             if (workspace_panes_ui.handlePaletteWheel(
                 state,
-                event.wheel.mouse_x,
-                event.wheel.mouse_y,
-                event.wheel.x,
-                event.wheel.y,
-                isCtrlPressed() or isKeymodPressed(SDL_GetModState(), sdl.Keymod.ctrl),
+                wheel_event.mouse_x,
+                wheel_event.mouse_y,
+                wheel_event.x,
+                wheel_event.y,
+                isCtrlPressed() or host.modState().ctrl,
             )) {
                 return true;
             }
@@ -2668,25 +2360,25 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             // transcript, and composer hit caches may retain overlapping data
             // from an earlier layout. Let the visible browser claim its region
             // before those pane-local caches consume the wheel event.
-            if (state.handleBrowserMouse(browserMouseWheelEvent(&event.wheel))) {
+            if (state.handleBrowserMouse(browserMouseWheelEvent(wheel_event))) {
                 return true;
             }
-            if (terminal_panel_ui.handlePaletteWheel(state, event.wheel.mouse_x, event.wheel.mouse_y, event.wheel.y)) {
+            if (terminal_panel_ui.handlePaletteWheel(state, wheel_event.mouse_x, wheel_event.mouse_y, wheel_event.y)) {
                 return true;
             }
-            if (chat_panel_ui.handleLinkedChatsWheel(state, event.wheel.mouse_x, event.wheel.mouse_y, event.wheel.y)) {
+            if (chat_panel_ui.handleLinkedChatsWheel(state, wheel_event.mouse_x, wheel_event.mouse_y, wheel_event.y)) {
                 return true;
             }
-            if (chat_panel_ui.handleTranscriptPaletteWheel(state, event.wheel.mouse_x, event.wheel.mouse_y, event.wheel.y)) {
+            if (chat_panel_ui.handleTranscriptPaletteWheel(state, wheel_event.mouse_x, wheel_event.mouse_y, wheel_event.y)) {
                 return true;
             }
-            if (state.routePaletteComposerWheel(&event.wheel, ui_scale)) {
+            if (state.routePaletteComposerWheel(wheel_event, ui_scale)) {
                 return true;
             }
-            if (state.handleComposerWheel(&event.wheel)) {
+            if (state.handleComposerWheel(wheel_event)) {
                 return true;
             }
-            if (chat_panel_ui.handleFocusedTranscriptPaletteWheel(state, event.wheel.y)) {
+            if (chat_panel_ui.handleFocusedTranscriptPaletteWheel(state, wheel_event.y)) {
                 return true;
             }
         },
@@ -2699,14 +2391,12 @@ fn browserInputDebugEnabled() bool {
     return std.c.getenv("VERDE_BROWSER_INPUT_DEBUG") != null;
 }
 
-fn syncWindowTextInput(window: *sdl.Window, state: *AppState) void {
+fn syncWindowTextInput(window: *palette.platform.Window, state: *AppState) void {
     if (macosNativeBrowserShouldOwnKeyboard(state)) {
-        if (SDL_TextInputActive(window)) {
-            sdl.stopTextInput(window) catch {};
-        }
+        if (window.isTextInputActive()) window.stopTextInput();
         return;
     }
-    const needs_sdl_text_input = state.terminal_controller.focused or
+    const needs_text_input = state.terminal_controller.focused or
         state.prefix_help_search_active or
         state.composer_controller.composer.focused or
         (state.isCompanionEnabled() and state.companion_composer.focused) or
@@ -2721,32 +2411,31 @@ fn syncWindowTextInput(window: *sdl.Window, state: *AppState) void {
         agent_prompt_popover_ui.wantsTextInput() or
         file_viewer_ui.wantsTextInput(state) or
         (state.isBrowserPaneFocused() and !macosNativeBrowserShouldOwnKeyboard(state));
-    if (!needs_sdl_text_input) {
-        if (SDL_TextInputActive(window)) {
-            sdl.stopTextInput(window) catch {};
-        }
+    if (!needs_text_input) {
+        if (window.isTextInputActive()) window.stopTextInput();
         return;
     }
-    if (SDL_TextInputActive(window)) return;
-    sdl.startTextInput(window) catch {};
+    if (window.isTextInputActive()) return;
+    // Verde never positioned the IME candidate window under SDL either.
+    window.startTextInput(.{});
     if (browserInputDebugEnabled()) {
-        log.info("browser-input enabled SDL text input for Verde-owned text focus", .{});
+        log.info("browser-input enabled platform text input for Verde-owned text focus", .{});
     }
 }
 
-fn handleBrowserKeyboardEvent(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+fn handleBrowserKeyboardEvent(state: *AppState, event: *const palette.event.KeyEvent) bool {
     const key_code = browserKeyCodeForEvent(event) orelse return false;
     return state.handleBrowserKey(.{
         .key_code = key_code,
         .pressed = event.down,
-        .ctrl = isKeymodPressed(event.mod, sdl.Keymod.ctrl),
-        .shift = isKeymodPressed(event.mod, sdl.Keymod.shift),
-        .alt = isKeymodPressed(event.mod, sdl.Keymod.alt),
-        .super = isKeymodPressed(event.mod, sdl.Keymod.gui),
+        .ctrl = event.mod.ctrl,
+        .shift = event.mod.shift,
+        .alt = event.mod.alt,
+        .super = event.mod.super,
     });
 }
 
-fn handleBrowserReloadShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+fn handleBrowserReloadShortcut(state: *AppState, event: *const palette.event.KeyEvent) bool {
     if (!state.isBrowserVisible()) return false;
     if (!state.isBrowserPaneFocused() and !state.browser_controller.address_focused) return false;
     if (!keybinds.isBrowserReloadEvent(event)) return false;
@@ -2754,7 +2443,7 @@ fn handleBrowserReloadShortcut(state: *AppState, event: *const sdl.KeyboardEvent
     return true;
 }
 
-fn handleBrowserTabShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+fn handleBrowserTabShortcut(state: *AppState, event: *const palette.event.KeyEvent) bool {
     if (!state.isBrowserVisible()) return false;
     if (!state.isBrowserPaneFocused() and !state.browser_controller.address_focused) return false;
     if (keybinds.isBrowserNewTabEvent(event)) {
@@ -2770,22 +2459,22 @@ fn handleBrowserTabShortcut(state: *AppState, event: *const sdl.KeyboardEvent) b
     return false;
 }
 
-fn handleBrowserInspectorEscape(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+fn handleBrowserInspectorEscape(state: *AppState, event: *const palette.event.KeyEvent) bool {
     if (!state.isBrowserPaneFocused() or !state.isBrowserInspectorEnabled()) return false;
     if (!event.down or event.repeat) return false;
-    if (event.key != .escape and event.scancode != .escape) return false;
+    if (event.key != .escape and event.hidScancode() != .escape) return false;
     state.browser_controller.inspector_menu_open = false;
     state.disableBrowserInspector(false);
     return true;
 }
 
-fn handleBrowserClipboardShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+fn handleBrowserClipboardShortcut(state: *AppState, event: *const palette.event.KeyEvent) bool {
     if (state.isNativeBrowserSurfaceFocused()) return false;
     if (!state.isBrowserPaneFocused()) return false;
     if (!event.down or event.repeat) return false;
     if (!isPrimaryModifierPressed(event.mod)) return false;
-    if (isKeymodPressed(event.mod, sdl.Keymod.alt)) return false;
-    if (event.scancode != .v and event.key != .v) return false;
+    if (event.mod.alt) return false;
+    if (event.hidScancode() != .v and event.key != .v) return false;
 
     const text = state.readClipboardTextForPaste() orelse return true;
     defer state.allocator.free(text);
@@ -2794,46 +2483,46 @@ fn handleBrowserClipboardShortcut(state: *AppState, event: *const sdl.KeyboardEv
         .key_code = 0,
         .text = text,
         .pressed = true,
-        .ctrl = isKeymodPressed(event.mod, sdl.Keymod.ctrl),
-        .shift = isKeymodPressed(event.mod, sdl.Keymod.shift),
-        .alt = isKeymodPressed(event.mod, sdl.Keymod.alt),
-        .super = isKeymodPressed(event.mod, sdl.Keymod.gui),
+        .ctrl = event.mod.ctrl,
+        .shift = event.mod.shift,
+        .alt = event.mod.alt,
+        .super = event.mod.super,
     });
     return true;
 }
 
-fn handleBrowserSelectAllShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+fn handleBrowserSelectAllShortcut(state: *AppState, event: *const palette.event.KeyEvent) bool {
     if (state.isNativeBrowserSurfaceFocused()) return false;
     if (!state.isBrowserPaneFocused()) return false;
     if (!event.down or event.repeat) return false;
     if (!isPrimaryModifierPressed(event.mod)) return false;
-    if (isKeymodPressed(event.mod, sdl.Keymod.alt) or isKeymodPressed(event.mod, sdl.Keymod.shift)) return false;
-    if (event.scancode != .a and event.key != .a) return false;
+    if (event.mod.alt or event.mod.shift) return false;
+    if (event.hidScancode() != .a and event.key != .a) return false;
     state.selectAllBrowserFocusedElement();
     return true;
 }
 
-fn handleBrowserCopyCutShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+fn handleBrowserCopyCutShortcut(state: *AppState, event: *const palette.event.KeyEvent) bool {
     if (state.isNativeBrowserSurfaceFocused()) return false;
     if (!state.isBrowserPaneFocused()) return false;
     if (!event.down or event.repeat) return false;
     if (!isPrimaryModifierPressed(event.mod)) return false;
-    if (isKeymodPressed(event.mod, sdl.Keymod.alt) or isKeymodPressed(event.mod, sdl.Keymod.shift)) return false;
-    const copy = event.scancode == .c or event.key == .c;
-    const cut = event.scancode == .x or event.key == .x;
+    if (event.mod.alt or event.mod.shift) return false;
+    const copy = event.hidScancode() == .c or event.key == .c;
+    const cut = event.hidScancode() == .x or event.key == .x;
     if (!copy and !cut) return false;
     state.copyBrowserFocusedSelection(cut);
     return true;
 }
 
-fn browserMouseMotionEvent(event: *const sdl.MouseMotionEvent) browser_runtime.MouseEvent {
+fn browserMouseMotionEvent(event: *const palette.event.MotionEvent) browser_runtime.MouseEvent {
     return .{
         .x = event.x,
         .y = event.y,
     };
 }
 
-fn browserMouseButtonEvent(event: *const sdl.MouseButtonEvent) browser_runtime.MouseEvent {
+fn browserMouseButtonEvent(event: *const palette.event.ButtonEvent) browser_runtime.MouseEvent {
     return .{
         .x = event.x,
         .y = event.y,
@@ -2849,7 +2538,7 @@ fn browserMouseButtonEvent(event: *const sdl.MouseButtonEvent) browser_runtime.M
     };
 }
 
-fn browserMouseWheelEvent(event: *const sdl.MouseWheelEvent) browser_runtime.MouseEvent {
+fn browserMouseWheelEvent(event: *const palette.event.WheelEvent) browser_runtime.MouseEvent {
     return .{
         .x = event.mouse_x,
         .y = event.mouse_y,
@@ -2858,11 +2547,11 @@ fn browserMouseWheelEvent(event: *const sdl.MouseWheelEvent) browser_runtime.Mou
     };
 }
 
-fn browserKeyCodeForEvent(event: *const sdl.KeyboardEvent) ?u32 {
+fn browserKeyCodeForEvent(event: *const palette.event.KeyEvent) ?u32 {
     return switch (event.key) {
         .@"return", .kp_enter => 0xff0d,
-        .backspace, .kp_backspace => 0xff08,
-        .tab, .kp_tab => 0xff09,
+        .backspace => 0xff08,
+        .tab => 0xff09,
         .escape => 0xff1b,
         .delete => 0xffff,
         .home => 0xff50,
@@ -2874,40 +2563,66 @@ fn browserKeyCodeForEvent(event: *const sdl.KeyboardEvent) ?u32 {
         .pagedown => 0xff56,
         .end => 0xff57,
         else => {
-            // Chromium expects raw key down/up around printable text input, while SDL's
+            // Chromium expects raw key down/up around printable text input, while the
             // text_input event still carries the actual composed UTF-8 characters.
-            const key_code = @intFromEnum(event.key);
+            // Key codes keep SDL's values: printable keys report their unshifted
+            // character, other keys their HID usage with bit 30 set.
+            const key_code = legacyKeyCode(event);
             if (key_code > 0 and key_code <= 0x7f) return key_code;
-            const modifiers = keymodBits(event.mod);
-            if ((modifiers & (sdl.Keymod.ctrl | sdl.Keymod.alt | sdl.Keymod.gui)) == 0) return null;
+            if (!event.mod.ctrl and !event.mod.alt and !event.mod.super) return null;
             return key_code;
         },
     };
 }
 
-fn isKeymodPressed(modifier_state: sdl.Keymod, flag: u16) bool {
-    return (keymodBits(modifier_state) & flag) != 0;
+/// The SDL3 `SDL_Keycode` value Verde's browser bridge was written against.
+fn legacyKeyCode(event: *const palette.event.KeyEvent) u32 {
+    if (event.key == .character) {
+        const cp = event.shortcutCodepoint();
+        if (cp != 0) return cp;
+    } else if (printableAsciiForKey(event.key)) |ch| {
+        return ch;
+    }
+    return @as(u32, @intFromEnum(event.hidScancode())) | 0x4000_0000;
 }
 
-fn keymodBits(modifier_state: sdl.Keymod) u16 {
-    return @as(*const u16, @ptrCast(&modifier_state)).*;
+const printable_ascii_by_key = blk: {
+    var table = [_]u8{0} ** (@typeInfo(palette.event.Keycode).@"enum".fields.len);
+    var ch: u8 = 0x20;
+    while (ch <= 0x7e) : (ch += 1) {
+        if (ch >= 'A' and ch <= 'Z') continue;
+        const key = palette.event.Keycode.fromAscii(ch);
+        if (key != .character) table[@intFromEnum(key)] = ch;
+    }
+    break :blk table;
+};
+
+fn printableAsciiForKey(key: palette.event.Keycode) ?u8 {
+    const index = @intFromEnum(key);
+    if (index >= printable_ascii_by_key.len) return null;
+    const ch = printable_ascii_by_key[index];
+    return if (ch == 0) null else ch;
 }
 
-fn shouldPasteClipboardImage(state: *const AppState, event: *const sdl.KeyboardEvent) bool {
+fn keymodBits(modifier_state: palette.event.Mods) u16 {
+    return @bitCast(modifier_state);
+}
+
+fn shouldPasteClipboardImage(state: *const AppState, event: *const palette.event.KeyEvent) bool {
     if (state.isBrowserPaneFocused() or state.browser_controller.address_focused or state.palette_modal_text_focus != .none) return false;
     if (state.terminal_controller.focused) return false;
     if (!event.down or event.repeat) return false;
-    if (event.scancode != .v and event.key != .v) return false;
+    if (event.hidScancode() != .v and event.key != .v) return false;
     return isPrimaryModifierPressed(event.mod);
 }
 
-fn terminalOwnedShortcut(event: *const sdl.KeyboardEvent) bool {
+fn terminalOwnedShortcut(event: *const palette.event.KeyEvent) bool {
     if (!event.down) return false;
-    if (isKeymodPressed(event.mod, sdl.Keymod.alt)) return false;
-    const ctrl = isKeymodPressed(event.mod, sdl.Keymod.ctrl);
-    const shift = isKeymodPressed(event.mod, sdl.Keymod.shift);
-    const gui = isKeymodPressed(event.mod, sdl.Keymod.gui);
-    return switch (event.scancode) {
+    if (event.mod.alt) return false;
+    const ctrl = event.mod.ctrl;
+    const shift = event.mod.shift;
+    const gui = event.mod.super;
+    return switch (event.hidScancode()) {
         // Copy/paste: Ctrl+C / Super+C / Ctrl+V / Super+V (with or without
         // shift). For copy, the panel's selection-aware handler intercepts
         // first; bare Ctrl+C with no selection falls through to the shell
@@ -2921,14 +2636,14 @@ fn terminalOwnedShortcut(event: *const sdl.KeyboardEvent) bool {
     };
 }
 
-fn logPasteShortcutEvent(state: *const AppState, event: *const sdl.KeyboardEvent, matched: bool) void {
-    if (event.scancode != .v and event.key != .v) return;
+fn logPasteShortcutEvent(state: *const AppState, event: *const palette.event.KeyEvent, matched: bool) void {
+    if (event.hidScancode() != .v and event.key != .v) return;
     const mod_bits = keymodBits(event.mod);
     runtime_log.trace(
         "paste key event key={s} scancode={s} down={} repeat={} mod=0x{x} matched={} composer_focused={} palette_composer_focused={} browser_focused={} address_focused={} modal_focus={s}",
         .{
             @tagName(event.key),
-            @tagName(event.scancode),
+            @tagName(event.hidScancode()),
             event.down,
             event.repeat,
             mod_bits,
@@ -2942,46 +2657,46 @@ fn logPasteShortcutEvent(state: *const AppState, event: *const sdl.KeyboardEvent
     );
 }
 
-fn handleFileSearchNavigation(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+fn handleFileSearchNavigation(state: *AppState, event: *const palette.event.KeyEvent) bool {
     if (!state.composer_controller.focused) return false;
     if (!state.hasActiveFileSearch()) return false;
     if (!event.down or event.repeat) return false;
 
-    if (event.scancode == .up or (event.scancode == .p and isCtrlPressed())) {
+    if (event.hidScancode() == .up or (event.hidScancode() == .p and isCtrlPressed())) {
         return state.moveFileSearchSelection(-1);
     }
-    if (event.scancode == .down or (event.scancode == .n and isCtrlPressed())) {
+    if (event.hidScancode() == .down or (event.hidScancode() == .n and isCtrlPressed())) {
         return state.moveFileSearchSelection(1);
     }
     return false;
 }
 
-fn handleFileSearchAccept(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+fn handleFileSearchAccept(state: *AppState, event: *const palette.event.KeyEvent) bool {
     if (!state.composer_controller.focused) return false;
     if (!state.hasActiveFileSearch()) return false;
     if (!event.down or event.repeat) return false;
-    if (isKeymodPressed(event.mod, sdl.Keymod.ctrl) or
-        isKeymodPressed(event.mod, sdl.Keymod.alt) or
-        isKeymodPressed(event.mod, sdl.Keymod.gui) or
-        isKeymodPressed(event.mod, sdl.Keymod.shift))
+    if (event.mod.ctrl or
+        event.mod.alt or
+        event.mod.super or
+        event.mod.shift)
     {
         return false;
     }
-    if (event.scancode != .tab and event.scancode != .@"return" and event.scancode != .kp_enter) return false;
+    if (event.hidScancode() != .tab and event.hidScancode() != .@"return" and event.hidScancode() != .kp_enter) return false;
 
     _ = state.acceptPrimaryFileSearchResult();
     return true;
 }
 
-fn handlePendingThreadFollowupShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+fn handlePendingThreadFollowupShortcut(state: *AppState, event: *const palette.event.KeyEvent) bool {
     if (!state.composer_controller.focused) return false;
     if (!state.hasPendingStream()) return false;
     if (!event.down or event.repeat) return false;
-    if (event.scancode != .tab) return false;
-    if (isKeymodPressed(event.mod, sdl.Keymod.ctrl) or
-        isKeymodPressed(event.mod, sdl.Keymod.alt) or
-        isKeymodPressed(event.mod, sdl.Keymod.gui) or
-        isKeymodPressed(event.mod, sdl.Keymod.shift))
+    if (event.hidScancode() != .tab) return false;
+    if (event.mod.ctrl or
+        event.mod.alt or
+        event.mod.super or
+        event.mod.shift)
     {
         return false;
     }
@@ -2990,15 +2705,15 @@ fn handlePendingThreadFollowupShortcut(state: *AppState, event: *const sdl.Keybo
     return true;
 }
 
-fn handleWorkspaceContextMenuShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
-    if (event.scancode != .application and
-        !(event.scancode == .f10 and isKeymodPressed(event.mod, sdl.Keymod.shift)))
+fn handleWorkspaceContextMenuShortcut(state: *AppState, event: *const palette.event.KeyEvent) bool {
+    if (event.hidScancode() != .application and
+        !(event.hidScancode() == .f10 and event.mod.shift))
     {
         return false;
     }
-    if (isKeymodPressed(event.mod, sdl.Keymod.ctrl) or
-        isKeymodPressed(event.mod, sdl.Keymod.alt) or
-        isKeymodPressed(event.mod, sdl.Keymod.gui))
+    if (event.mod.ctrl or
+        event.mod.alt or
+        event.mod.super)
     {
         return false;
     }
@@ -3008,7 +2723,7 @@ fn handleWorkspaceContextMenuShortcut(state: *AppState, event: *const sdl.Keyboa
 fn handleGuiChatShortcut(
     state: *AppState,
     keyboard: *const keybinds.NativeKeyboardConfig,
-    event: *const sdl.KeyboardEvent,
+    event: *const palette.event.KeyEvent,
 ) bool {
     const action = keyboard.chatActionForEvent(event) orelse return false;
     return handleGuiChatAction(state, action);
@@ -3045,10 +2760,10 @@ fn exitPrefixNavigate(state: *AppState) void {
 fn handleNavigateKeyDown(
     state: *AppState,
     keyboard: *keybinds.NativeKeyboardConfig,
-    event: *const sdl.KeyboardEvent,
+    event: *const palette.event.KeyEvent,
 ) bool {
     if (!event.down) return true;
-    if (isModifierOnlyKey(event.scancode)) return true;
+    if (isModifierOnlyKey(event.hidScancode())) return true;
     if (state.prefix_help_visible and handlePrefixHelpKeyDown(state, keyboard, event)) return true;
     if (event.key == .escape) {
         exitPrefixNavigate(state);
@@ -3067,7 +2782,7 @@ fn handleNavigateKeyDown(
     return true;
 }
 
-fn isModifierOnlyKey(scancode: sdl.Scancode) bool {
+fn isModifierOnlyKey(scancode: palette.keyboard.Scancode) bool {
     return switch (scancode) {
         .lshift, .rshift, .lctrl, .rctrl, .lalt, .ralt, .lgui, .rgui => true,
         else => false,
@@ -3081,11 +2796,11 @@ fn isModifierOnlyKey(scancode: sdl.Scancode) bool {
 fn handleArmedPrefixKeyDown(
     state: *AppState,
     keyboard: *keybinds.NativeKeyboardConfig,
-    event: *const sdl.KeyboardEvent,
+    event: *const palette.event.KeyEvent,
 ) bool {
     if (!event.down) return true;
     // Holding Shift/Ctrl for the second key must not cancel the chord.
-    if (isModifierOnlyKey(event.scancode)) return true;
+    if (isModifierOnlyKey(event.hidScancode())) return true;
     if (state.prefix_help_visible and handlePrefixHelpKeyDown(state, keyboard, event)) return true;
     if (event.repeat) return true;
     disarmPrefix(state);
@@ -3112,12 +2827,12 @@ fn handleArmedPrefixKeyDown(
 fn handlePrefixHelpKeyDown(
     state: *AppState,
     keyboard: *keybinds.NativeKeyboardConfig,
-    event: *const sdl.KeyboardEvent,
+    event: *const palette.event.KeyEvent,
 ) bool {
-    const plain = !isKeymodPressed(event.mod, sdl.Keymod.shift) and
-        !isKeymodPressed(event.mod, sdl.Keymod.ctrl) and
-        !isKeymodPressed(event.mod, sdl.Keymod.alt) and
-        !isKeymodPressed(event.mod, sdl.Keymod.gui);
+    const plain = !event.mod.shift and
+        !event.mod.ctrl and
+        !event.mod.alt and
+        !event.mod.super;
     switch (event.key) {
         .up => ui_layout.movePrefixHelpSelection(state, .up),
         .down => ui_layout.movePrefixHelpSelection(state, .down),
@@ -3194,15 +2909,15 @@ fn dispatchPrefixTarget(state: *AppState, keyboard: *keybinds.NativeKeyboardConf
     }
 }
 
-fn handleComposerFocusShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+fn handleComposerFocusShortcut(state: *AppState, event: *const palette.event.KeyEvent) bool {
     if (state.composer_controller.focused) return false;
     if (!state.isTranscriptFocused()) return false;
     if (!event.down or event.repeat) return false;
-    if (event.scancode != .tab) return false;
-    if (isKeymodPressed(event.mod, sdl.Keymod.ctrl) or
-        isKeymodPressed(event.mod, sdl.Keymod.alt) or
-        isKeymodPressed(event.mod, sdl.Keymod.gui) or
-        isKeymodPressed(event.mod, sdl.Keymod.shift))
+    if (event.hidScancode() != .tab) return false;
+    if (event.mod.ctrl or
+        event.mod.alt or
+        event.mod.super or
+        event.mod.shift)
     {
         return false;
     }
@@ -3211,18 +2926,18 @@ fn handleComposerFocusShortcut(state: *AppState, event: *const sdl.KeyboardEvent
     return true;
 }
 
-fn handleComposerBlurShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+fn handleComposerBlurShortcut(state: *AppState, event: *const palette.event.KeyEvent) bool {
     if (!state.composer_controller.focused) return false;
     if (state.focusedWorkspaceChatPaneId() == null) return false;
     if (state.terminal_controller.focused) return false;
     if (state.isBrowserPaneFocused() or state.browser_controller.address_focused) return false;
     if (state.palette_modal_text_focus != .none) return false;
     if (!event.down or event.repeat) return false;
-    if (event.scancode != .escape and event.key != .escape) return false;
-    if (isKeymodPressed(event.mod, sdl.Keymod.ctrl) or
-        isKeymodPressed(event.mod, sdl.Keymod.alt) or
-        isKeymodPressed(event.mod, sdl.Keymod.gui) or
-        isKeymodPressed(event.mod, sdl.Keymod.shift))
+    if (event.hidScancode() != .escape and event.key != .escape) return false;
+    if (event.mod.ctrl or
+        event.mod.alt or
+        event.mod.super or
+        event.mod.shift)
     {
         return false;
     }
@@ -3232,9 +2947,9 @@ fn handleComposerBlurShortcut(state: *AppState, event: *const sdl.KeyboardEvent)
     return true;
 }
 
-fn handleTranscriptMarkdownSelectAllShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+fn handleTranscriptMarkdownSelectAllShortcut(state: *AppState, event: *const palette.event.KeyEvent) bool {
     if (!event.down or event.repeat) return false;
-    const key_is_a = event.key == .a or event.scancode == .a;
+    const key_is_a = event.key == .a or event.hidScancode() == .a;
     if (!key_is_a) return false;
     if (!isPrimaryModifierPressed(event.mod)) return false;
     if (state.composer_controller.focused) return false;
@@ -3253,11 +2968,11 @@ fn handleTranscriptMarkdownSelectAllShortcut(state: *AppState, event: *const sdl
 /// Ctrl+C copies a highlighted transcript selection. Runs before the
 /// composer key route so a focused-but-selection-less composer does not
 /// swallow the copy; when the composer has its own selection it wins.
-fn handleTranscriptMarkdownCopyShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+fn handleTranscriptMarkdownCopyShortcut(state: *AppState, event: *const palette.event.KeyEvent) bool {
     if (!event.down or event.repeat) return false;
     if (event.key != .c) return false;
     if (!isPrimaryModifierPressed(event.mod)) return false;
-    if (isKeymodPressed(event.mod, sdl.Keymod.shift) or isKeymodPressed(event.mod, sdl.Keymod.alt)) return false;
+    if (event.mod.shift or event.mod.alt) return false;
     if (state.composer_controller.focused and state.composer_controller.composer.selection() != null) return false;
     if (state.terminal_controller.focused) return false;
     if (state.isBrowserPaneFocused()) return false;
@@ -3271,16 +2986,15 @@ fn handleTranscriptMarkdownCopyShortcut(state: *AppState, event: *const sdl.Keyb
 }
 
 fn isCtrlPressed() bool {
-    const keyboard_state = sdl.getKeyboardState();
-    return keyboard_state[@intFromEnum(sdl.Scancode.lctrl)] or keyboard_state[@intFromEnum(sdl.Scancode.rctrl)];
+    return host.isKeyDown(.lctrl) or host.isKeyDown(.rctrl);
 }
 
-fn isPrimaryModifierPressed(modifier_state: sdl.Keymod) bool {
+fn isPrimaryModifierPressed(modifier_state: palette.event.Mods) bool {
     if (builtin.os.tag != .macos) {
-        return isCtrlPressed() or isKeymodPressed(modifier_state, sdl.Keymod.ctrl);
+        return isCtrlPressed() or modifier_state.ctrl;
     }
 
-    return isKeymodPressed(modifier_state, sdl.Keymod.gui);
+    return modifier_state.super;
 }
 
 fn handleKeyboardAction(
@@ -3393,29 +3107,20 @@ fn isWorkspaceTraversalAction(action: keybinds.NativeKeyboardAction) bool {
     };
 }
 
-extern fn SDL_HideWindow(window: *sdl.Window) bool;
-extern fn verde_macos_host_window_install_close_monitor(ns_window: ?*anyopaque) void;
-extern fn verde_macos_host_window_order_out(ns_window: ?*anyopaque) void;
-extern fn verde_macos_host_window_should_close(ns_window: ?*anyopaque) bool;
-
-fn handleWindowCloseRequested(window: *sdl.Window, state: *AppState) bool {
+fn handleWindowCloseRequested(window: *palette.platform.Window, state: *AppState) bool {
     if (builtin.os.tag == .macos) {
         const now_ms = currentTimeMillis();
         if (macos_cmd_w_pane_close_until_ms >= now_ms) {
             macos_cmd_w_pane_close_until_ms = 0;
             return true;
         }
-        if (isKeymodPressed(SDL_GetModState(), sdl.Keymod.gui)) {
+        if (host.modState().super) {
             _ = state.closeFocusedWorkspacePane();
             return true;
         }
         if (macos_launch_close_suppress_until_ms >= now_ms) {
             macos_launch_close_suppress_until_ms = 0;
             runtime_log.diagnostic("ignoring window close request during macOS launch grace", .{});
-            return true;
-        }
-        if (!verde_macos_host_window_should_close(nativeBrowserHostWindow(window))) {
-            runtime_log.diagnostic("ignoring unsolicited macOS window close request", .{});
             return true;
         }
     }
@@ -3425,15 +3130,12 @@ fn handleWindowCloseRequested(window: *sdl.Window, state: *AppState) bool {
             runtime_log.diagnostic("ignoring linux window close request while folder picker is pending", .{});
             return true;
         }
-        const window_flags = SDL_GetWindowFlags(window);
         runtime_log.diagnostic(
-            "linux window close request flags focus={} mouse_focus={} hidden={} minimized={} occluded={} selected_project={d} focused_pane={?}",
+            "linux window close request flags focus={} visible={} suspended={} selected_project={d} focused_pane={?}",
             .{
-                window_flags.input_focus,
-                window_flags.mouse_focus,
-                window_flags.hidden,
-                window_flags.minimized,
-                window_flags.occluded,
+                window.hasKeyboardFocus(),
+                window.isVisible(),
+                window.isSuspended(),
                 state.project_controller.selected_index,
                 if (state.project_controller.projects.items.len > state.project_controller.selected_index) state.currentProject().workspace_layout.focused_pane_id else null,
             },
@@ -3442,38 +3144,30 @@ fn handleWindowCloseRequested(window: *sdl.Window, state: *AppState) bool {
             runtime_log.diagnostic("ignoring linux window close request after external open launch", .{});
             return true;
         }
-        // SDL focus/visibility flags describe compositor presentation, not
+        // Focus/visibility flags describe compositor presentation, not
         // whether a Wayland WM close request is genuine. In particular,
         // address-targeted closes for windows on another workspace arrive
-        // hidden/occluded and often without SDL focus. The explicit picker and
-        // external-launch guards above retain the distinguishable phantom-close
-        // protections; every other WM-delivered close is actionable.
-        std.debug.assert(linuxWindowFlagsPermitWmClose(
-            window_flags.input_focus,
-            window_flags.mouse_focus,
-            window_flags.hidden,
-            window_flags.minimized,
-            window_flags.occluded,
-        ));
+        // hidden or suspended and often without keyboard focus. The explicit
+        // picker and external-launch guards above retain the distinguishable
+        // phantom-close protections; every other WM-delivered close is actionable.
     }
     if (builtin.os.tag == .linux) {
         // The durability handoff can legitimately outlive the compositor's
         // close budget for a very large dirty projection. Remove the window
         // first, but keep all state owners alive until the handoff succeeds.
-        _ = SDL_HideWindow(window);
-        _ = SDL_SyncWindow(window);
+        window.hide();
+        if (host.app()) |app| app.sync() catch {};
     }
     if (!closePreflightPassed(state)) {
         if (builtin.os.tag == .linux) {
-            _ = SDL_ShowWindow(window);
-            _ = SDL_SyncWindow(window);
+            window.show();
+            if (host.app()) |app| app.sync() catch {};
         }
         return true;
     }
     if (builtin.os.tag == .macos) {
         _ = state.browser_controller.runtime.controller.hide() catch {};
-        verde_macos_host_window_order_out(nativeBrowserHostWindow(window));
-        _ = SDL_HideWindow(window);
+        window.hide();
     }
     return false;
 }
@@ -3584,8 +3278,8 @@ test "successful event close preflight skips later frame polls" {
 
 test "startup frame is submitted before the durable projection load" {
     const source = @embedFile("main.zig");
-    const icon_install = std.mem.indexOf(u8, source, "installWindowIcon(window);").?;
-    const early_show = icon_install + std.mem.indexOf(u8, source[icon_install..], "_ = SDL_ShowWindow(window);").?;
+    const window_created = std.mem.indexOf(u8, source, "app.createWindow(").?;
+    const early_show = window_created + std.mem.indexOf(u8, source[window_created..], "window.show();").?;
     const renderer_init = std.mem.indexOf(u8, source, "var palette_renderer = try").?;
     const startup_frame = std.mem.indexOf(u8, source, "renderStartupFrame(&palette_renderer").?;
     const app_state_load = std.mem.indexOf(u8, source, "var state = try AppState.init").?;
@@ -3632,24 +3326,9 @@ test "visual presentation and Linux window removal precede durability work" {
     try std.testing.expect(frame_submit < frame_flush);
 
     const linux_close = std.mem.indexOf(u8, source, "The durability handoff can legitimately outlive").?;
-    const hide_window = linux_close + std.mem.indexOf(u8, source[linux_close..], "_ = SDL_HideWindow(window);").?;
+    const hide_window = linux_close + std.mem.indexOf(u8, source[linux_close..], "window.hide();").?;
     const close_handoff = linux_close + std.mem.indexOf(u8, source[linux_close..], "if (!closePreflightPassed(state))").?;
     try std.testing.expect(hide_window < close_handoff);
-}
-
-fn linuxWindowFlagsPermitWmClose(
-    input_focus: bool,
-    mouse_focus: bool,
-    hidden: bool,
-    minimized: bool,
-    occluded: bool,
-) bool {
-    _ = input_focus;
-    _ = mouse_focus;
-    _ = hidden;
-    _ = minimized;
-    _ = occluded;
-    return true;
 }
 
 test "frame pacing tiers pace status pulses at 30fps and idle background sends" {
@@ -3678,25 +3357,13 @@ test "frame pacing tiers pace status pulses at 30fps and idle background sends" 
     try std.testing.expectEqual(@as(i64, ACTIVE_WAIT_TIMEOUT_MS), continuousFrameIntervalForActivity(.{ .active_continuous = true }));
 }
 
-fn macosHostWindowRequestedClose(window: *sdl.Window, state: *AppState) bool {
-    if (builtin.os.tag != .macos) return false;
-    const host_window = nativeBrowserHostWindow(window);
-    if (!verde_macos_host_window_should_close(host_window)) return false;
-    if (!closePreflightPassed(state)) return false;
-    _ = state.browser_controller.runtime.controller.hide() catch {};
-    verde_macos_host_window_order_out(host_window);
-    _ = SDL_HideWindow(window);
-    runtime_log.diagnostic("shutdown requested by macOS close button monitor", .{});
-    return true;
-}
-
-fn noteMacosWorkspaceCloseShortcut(event: *const sdl.KeyboardEvent, action: keybinds.NativeKeyboardAction) void {
+fn noteMacosWorkspaceCloseShortcut(event: *const palette.event.KeyEvent, action: keybinds.NativeKeyboardAction) void {
     if (builtin.os.tag != .macos or action != .workspace_close) return;
     if (event.key != .w) return;
-    if (!isKeymodPressed(event.mod, sdl.Keymod.gui)) return;
-    if (isKeymodPressed(event.mod, sdl.Keymod.ctrl) or
-        isKeymodPressed(event.mod, sdl.Keymod.alt) or
-        isKeymodPressed(event.mod, sdl.Keymod.shift))
+    if (!event.mod.super) return;
+    if (event.mod.ctrl or
+        event.mod.alt or
+        event.mod.shift)
     {
         return;
     }
@@ -3707,12 +3374,62 @@ fn currentTimeMillis() i64 {
     return platform_runtime.unixTimestampMs();
 }
 
-fn activateMacosHostWindow(window: *sdl.Window) void {
+var termination_signal_requested: std.atomic.Value(bool) = .init(false);
+
+/// SIGINT/SIGTERM request the same graceful, durability-checked exit as a
+/// window close. The platform layer's own handling (signalfd plus a blocked
+/// mask) stays off on POSIX because a blocked mask is inherited by the shells
+/// and the session daemon Verde forks; Windows uses the platform's console
+/// control handler instead.
+fn installTerminationSignalHandlers() void {
+    if (builtin.os.tag == .windows) return;
+    const action: std.posix.Sigaction = .{
+        .handler = .{ .handler = handleTerminationSignal },
+        .mask = std.posix.sigemptyset(),
+        .flags = std.posix.SA.RESTART,
+    };
+    std.posix.sigaction(.INT, &action, null);
+    std.posix.sigaction(.TERM, &action, null);
+}
+
+fn handleTerminationSignal(_: std.posix.SIG) callconv(.c) void {
+    // Async-signal-safe: a single atomic store. The main loop's event wait is
+    // always bounded, so the flag is observed within one idle tick.
+    termination_signal_requested.store(true, .release);
+}
+
+fn consumeTerminationSignal() bool {
+    return termination_signal_requested.swap(false, .acq_rel);
+}
+
+fn desktopAppId() []const u8 {
+    if (std.c.getenv("VERDE_APP_ID")) |value| {
+        const id = std.mem.sliceTo(value, 0);
+        if (id.len > 0) return id;
+    }
+    return DEFAULT_APP_ID;
+}
+
+fn readMacosClipboardImage(allocator: std.mem.Allocator) anyerror!?utils.ClipboardImageCapture {
+    if (builtin.os.tag != .macos) {
+        return null;
+    } else {
+        const app = host.app() orelse return null;
+        const image = try app.getClipboardImage(allocator) orelse return null;
+        return .{ .bytes = image.bytes, .mime = image.mime };
+    }
+}
+
+fn postLoopWakeup(ctx: *anyopaque, value: u64) void {
+    const app: *palette.platform.App = @ptrCast(@alignCast(ctx));
+    app.wakeup(value);
+}
+
+fn activateMacosHostWindow(window: *palette.platform.Window) void {
     if (builtin.os.tag != .macos) return;
-    _ = SDL_SetWindowFocusable(window, true);
-    _ = SDL_ShowWindow(window);
-    _ = SDL_RaiseWindow(window);
-    _ = SDL_SyncWindow(window);
+    window.show();
+    window.activate("");
+    if (host.app()) |app| app.sync() catch {};
 }
 
 fn suppressDuplicateMacosTextInput(text: []const u8, timestamp_ns: u64) bool {
@@ -3752,13 +3469,15 @@ fn macosBrowserClickWillFocusNativeSurface(state: *const AppState, x: f32, y: f3
     return state.browserPaneContains(x, y);
 }
 
-fn handleFontSizeShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+fn handleFontSizeShortcut(state: *AppState, event: *const palette.event.KeyEvent) bool {
     if (!event.down or event.repeat) return false;
     if (state.terminal_controller.focused) return false;
     if (!isPrimaryModifierPressed(event.mod)) return false;
     const delta: f32 = switch (event.key) {
-        .plus, .kp_plus, .equals => 1.0,
+        .kp_plus, .equals => 1.0,
         .minus, .kp_minus => -1.0,
+        // Layouts with an unshifted '+' key (SDLK_PLUS under SDL).
+        .character => if (event.shortcutCodepoint() == '+') 1.0 else return false,
         else => return false,
     };
     const current = state.app_config.font_size;
@@ -3788,7 +3507,10 @@ fn canHandleTranscriptScrollAction(state: *const AppState) bool {
 /// Reads the OS light/dark preference into the theme module. Unknown (for
 /// example no appearance portal on Linux) keeps dark. Returns true on change.
 fn syncSystemAppearance() bool {
-    const appearance: ui_theme.Appearance = if (SDL_GetSystemTheme() == 1) .light else .dark;
+    // Unknown (always the case on Wayland) keeps the dark default, as SDL's
+    // SDL_SYSTEM_THEME_UNKNOWN did.
+    const theme = if (host.app()) |app| app.systemTheme() else .unknown;
+    const appearance: ui_theme.Appearance = if (theme == .light) .light else .dark;
     return ui_theme.setSystemAppearance(appearance);
 }
 

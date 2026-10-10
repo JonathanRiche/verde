@@ -55,4 +55,6 @@ test {
     _ = @import("ui/chat_panel.zig");
     _ = @import("ui/terminal_panel.zig");
     _ = @import("ui/workspace_panes.zig");
+    _ = @import("ui/host.zig");
+    _ = @import("loop_wakeup");
 }
