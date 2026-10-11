@@ -188,7 +188,10 @@ fn posixPathAccessible(buffer: *[std.Io.Dir.max_path_bytes]u8, parts: []const []
 /// close the handles instead.
 pub fn reapDetachedChild(pid: std.posix.pid_t) void {
     if (builtin.os.tag == .windows) return;
-    const thread = std.Thread.spawn(.{ .stack_size = 64 * 1024 }, waitDetachedChild, .{pid}) catch return;
+    // Default stack size on purpose: glibc rejects (EINVAL) stacks smaller than
+    // the process's static TLS, and Zig's pthread backend treats EINVAL from
+    // pthread_create as unreachable, which aborted the GUI on notify-send.
+    const thread = std.Thread.spawn(.{}, waitDetachedChild, .{pid}) catch return;
     thread.detach();
 }
 
@@ -198,6 +201,21 @@ fn waitDetachedChild(pid: std.posix.pid_t) void {
         const rc = std.c.waitpid(pid, &status, 0);
         if (rc >= 0 or std.posix.errno(rc) != .INTR) return;
     }
+}
+
+test "reapDetachedChild reaps a fire-and-forget child without aborting" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const pid = std.c.fork();
+    if (pid == 0) std.c._exit(0);
+    try std.testing.expect(pid > 0);
+    reapDetachedChild(pid);
+    var waited: usize = 0;
+    while (waited < 200) : (waited += 1) {
+        // kill(pid, 0) fails with ESRCH once the reaper thread has collected it.
+        if (std.c.kill(pid, @enumFromInt(0)) != 0) return;
+        _ = std.c.nanosleep(&.{ .sec = 0, .nsec = 10 * std.time.ns_per_ms }, null);
+    }
+    return error.ChildNotReaped;
 }
 
 test "spawn preflight rejects missing tools and directories before forking" {
