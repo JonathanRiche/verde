@@ -49,6 +49,9 @@ pub fn enabled() bool {
 
 /// Reads and removes the pending script, returning its bytes (caller frees).
 pub fn take(allocator: std.mem.Allocator) ?[]u8 {
+    // The hook is POSIX-only (scriptPath is null on Windows); keep libc file
+    // calls out of the Windows build, where std.c.open does not exist.
+    if (comptime builtin.os.tag == .windows) return null;
     const path = scriptPath() orelse return null;
     const fd = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return null;
@@ -69,6 +72,7 @@ pub fn take(allocator: std.mem.Allocator) ?[]u8 {
 
 /// Writes `name` to `<script path>.cursor` so a driver can read the shape.
 fn writeCursorReport(name: []const u8) void {
+    if (comptime builtin.os.tag == .windows) return;
     const path = scriptPath() orelse return;
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const report = std.fmt.bufPrintZ(&buf, "{s}.cursor", .{path}) catch return;
