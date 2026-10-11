@@ -135,6 +135,21 @@ fn noteCursorSynced(cache: *CursorState, state: *const AppState, now_ms: i64) vo
     cache.last_browser_shape = state.browser_controller.cursor_shape;
 }
 
+test "initial window frame stays inside a work area smaller than the preferred minimum" {
+    // 1280x800 at 125% with a 60px taskbar: 1024x592 logical.
+    const small = initialWindowFrameFor(.{ .x = 0, .y = 0, .w = 1024, .h = 592 });
+    try std.testing.expect(small.x >= 0 and small.y >= 0);
+    try std.testing.expect(small.x + small.w <= 1024 and small.y + small.h <= 592);
+    try std.testing.expectEqual(@as(c_int, 552), small.h);
+
+    const large = initialWindowFrameFor(.{ .x = 0, .y = 0, .w = 1920, .h = 1040 });
+    try std.testing.expectEqual(@as(c_int, MIN_WINDOW_HEIGHT) + 89, large.h);
+    try std.testing.expectEqual(@divTrunc(1040 - large.h, 2), large.y);
+
+    try std.testing.expectEqual(@as(c_int, 100), scaleWindowCoordinate(80, 1.25));
+    try std.testing.expectEqual(@as(c_int, 80), scaleWindowCoordinate(80, 0));
+}
+
 test "idle cursor sync runs only when an input changed or the resync interval elapsed" {
     var cache: CursorState = .{};
     // Never synced: NaN positions always compare unequal.
@@ -255,7 +270,10 @@ fn mainInner(init: std.process.Init) !void {
     host.install(app, window);
     defer host.uninstall();
     var cursor_state: CursorState = .{};
-    window.setPosition(initial_window_frame.x, initial_window_frame.y);
+    // `usableRect` is logical on every backend, but Win32 positions windows in
+    // physical pixels, so scale the centred origin by the window's DPI there.
+    const position_scale: f32 = if (builtin.os.tag == .windows) window.scale() else 1.0;
+    window.setPosition(scaleWindowCoordinate(initial_window_frame.x, position_scale), scaleWindowCoordinate(initial_window_frame.y, position_scale));
     activateMacosHostWindow(window);
     if (builtin.os.tag == .macos) {
         macos_launch_close_suppress_until_ms = currentTimeMillis() + MACOS_LAUNCH_CLOSE_SUPPRESS_MS;
@@ -1331,9 +1349,21 @@ fn recordFrameWithStallDiagnostic(frame_sample: profiler.FrameSample) void {
 }
 
 fn initialWindowFrame(app: *const palette.platform.App) WindowFrame {
+    return initialWindowFrameFor(app.usableRect());
+}
+
+fn scaleWindowCoordinate(value: c_int, scale: f32) c_int {
+    if (!std.math.isFinite(scale) or scale <= 0.0) return value;
+    return @intFromFloat(@round(@as(f32, @floatFromInt(value)) * scale));
+}
+
+/// Centres the default window in `usable` (logical units). Small work areas
+/// (1366x768 or 1280x800 at 125%) are below the preferred minimum, so the
+/// work-area bound wins there and the title bar stays on screen.
+fn initialWindowFrameFor(usable: ?palette.platform.Rect) WindowFrame {
     // Wayland reports no global coordinates (origin 0,0) and positions are a
     // no-op there; macOS and Windows centre the window in the work area.
-    const usable_bounds = app.usableRect() orelse return .{
+    const usable_bounds = usable orelse return .{
         .x = 0,
         .y = 0,
         .w = DEFAULT_WINDOW_WIDTH,
@@ -1343,8 +1373,10 @@ fn initialWindowFrame(app: *const palette.platform.App) WindowFrame {
     const usable_y: c_int = @intFromFloat(usable_bounds.y);
     const usable_w: c_int = @intFromFloat(usable_bounds.w);
     const usable_h: c_int = @intFromFloat(usable_bounds.h);
-    const width = clampInt(@intFromFloat(@as(f32, @floatFromInt(usable_w)) * 0.72), MIN_WINDOW_WIDTH, @min(MAX_WINDOW_WIDTH, usable_w - 40));
-    const height = clampInt(@intFromFloat(@as(f32, @floatFromInt(usable_h)) * 0.74), MIN_WINDOW_HEIGHT, @min(MAX_WINDOW_HEIGHT, usable_h - 40));
+    const max_width = @max(1, @min(MAX_WINDOW_WIDTH, usable_w - 40));
+    const max_height = @max(1, @min(MAX_WINDOW_HEIGHT, usable_h - 40));
+    const width = @min(@max(@as(c_int, @intFromFloat(@as(f32, @floatFromInt(usable_w)) * 0.72)), MIN_WINDOW_WIDTH), max_width);
+    const height = @min(@max(@as(c_int, @intFromFloat(@as(f32, @floatFromInt(usable_h)) * 0.74)), MIN_WINDOW_HEIGHT), max_height);
     const x = usable_x + @divTrunc(usable_w - width, 2);
     const y = usable_y + @divTrunc(usable_h - height, 2);
     return .{ .x = x, .y = y, .w = width, .h = height };
@@ -1372,10 +1404,6 @@ fn nativeBrowserHostWindow(window: *const palette.platform.Window) ?*anyopaque {
         .windows => handles.hwnd,
         else => null,
     };
-}
-
-fn clampInt(value: c_int, min_value: c_int, max_value: c_int) c_int {
-    return @max(min_value, @min(value, max_value));
 }
 
 fn clampf(value: f32, min_value: f32, max_value: f32) f32 {
