@@ -7824,6 +7824,7 @@ pub const Daemon = struct {
             return try errorResponseAlloc(self.allocator, id_value, "invalid_state", "provider does not support daemon steering");
         }
         if (turn.status != .running or turn.cancel_requested or turn.pending_approval != null) {
+            log.info("chat turn steer refused turn_id={s} status={s} cancel_requested={} pending_approval={}", .{ turn_id, @tagName(turn.status), turn.cancel_requested, turn.pending_approval != null });
             turn.mutex.unlock();
             self.mutex.unlock();
             return try errorResponseAlloc(self.allocator, id_value, "invalid_state", "turn cannot accept steering now");
@@ -7902,7 +7903,8 @@ pub const Daemon = struct {
             if (steer_invocation_capture) |capture| capture.record(steer_provider, owned_provider_thread_id, owned_provider_turn_id);
             break :blk std.mem.indexOf(u8, prompt, "reject steer") == null;
         } else blk: {
-            var client = harness.connect(self.allocator, steer_config) catch {
+            var client = harness.connect(self.allocator, steer_config) catch |err| {
+                log.warn("chat turn steer not delivered turn_id={s} reason=connect:{s}", .{ turn_id, @errorName(err) });
                 definitely_not_delivered = true;
                 break :blk false;
             };
@@ -7916,6 +7918,9 @@ pub const Daemon = struct {
                 .prompt = prompt,
                 .images = images,
             }) catch |err| {
+                // SteerNotDelivered: the bridge refused (e.g. Claude already
+                // returned its result and closed its prompt channel).
+                log.warn("chat turn steer not accepted turn_id={s} reason={s}", .{ turn_id, @errorName(err) });
                 definitely_not_delivered = err == error.SteerNotDelivered;
                 break :blk false;
             };

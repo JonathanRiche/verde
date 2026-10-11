@@ -38,6 +38,7 @@ const SendResultPayload = chat_types.SendResultPayload;
 const SendState = chat_types.SendState;
 const SendStatus = chat_types.SendStatus;
 const FollowupKind = chat_types.FollowupKind;
+const FollowupState = chat_types.FollowupState;
 const PendingFollowup = chat_types.PendingFollowup;
 const TitleGenerationState = chat_types.TitleGenerationState;
 const TitleGenerationRequest = chat_types.TitleGenerationRequest;
@@ -2575,6 +2576,31 @@ fn copyDraftImagesToFollowup(
     }
 }
 
+const PendingSteerFailureOutcome = enum { queued_next_turn, restored, none };
+
+/// Settles a pending steer the provider did not take. A steer that provably
+/// never reached the provider (it arrived after the turn stopped accepting
+/// input, e.g. while Claude was idle but the turn was still closing) becomes
+/// the next turn, exactly like Enter-to-queue. Any other failure may have been
+/// delivered, so it goes back to the composer rather than risk a duplicate.
+fn resolvePendingSteerFailure(allocator: std.mem.Allocator, thread: *ChatThread, err: anyerror) PendingSteerFailureOutcome {
+    if (err == error.SteerNotDelivered) {
+        const send_state = thread.send_state;
+        send_state.mutex.lock();
+        defer send_state.mutex.unlock();
+        if (send_state.pending_followup) |*pending| {
+            if (pending.kind == .steer) {
+                pending.state = .fallback_next_turn;
+                send_state.pending_followup_signal_sent = false;
+                send_state.ui_revision +%= 1;
+                return .queued_next_turn;
+            }
+        }
+        return .none;
+    }
+    return if (restorePendingSteerToDraft(allocator, thread)) .restored else .none;
+}
+
 fn restorePendingSteerToDraft(allocator: std.mem.Allocator, thread: *ChatThread) bool {
     const send_state = thread.send_state;
     send_state.mutex.lock();
@@ -2800,7 +2826,49 @@ pub fn steerDaemonChatTurn(
         .image_paths = image_paths.items,
     }, 6);
     defer self.allocator.free(response);
-    try ensureJsonRpcOk(self.allocator, response);
+    try classifyDaemonSteerResponse(self.allocator, response);
+}
+
+/// Maps a `chat.turn.steer` reply to an error the caller can act on.
+/// `error.SteerNotDelivered` means the daemon proved the provider never saw
+/// the steer (the turn had already finished its steerable phase), so the
+/// prompt can safely become a queued follow-up. Anything else may have
+/// reached the provider and must not be resent automatically.
+fn classifyDaemonSteerResponse(allocator: std.mem.Allocator, response: []const u8) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidDaemonResponse;
+    const rpc_error = parsed.value.object.get("error") orelse {
+        _ = try jsonRpcResult(parsed.value);
+        return;
+    };
+    const code = if (rpc_error == .object) jsonValueString(rpc_error.object.get("code") orelse .null) orelse "" else "";
+    const message = if (rpc_error == .object) jsonValueString(rpc_error.object.get("message") orelse .null) orelse "" else "";
+    if (daemonSteerRefusalIsUndelivered(code, message)) {
+        log.info("daemon refused steer before delivery code={s} message={s}", .{ code, message });
+        return error.SteerNotDelivered;
+    }
+    log.warn("daemon steer failed code={s} message={s}", .{ code, message });
+    return error.DaemonRequestFailed;
+}
+
+/// Daemon refusals that prove the steer never reached the provider. Keep in
+/// sync with the `steer_can_fallback` list in client_core/src/rpc.zig, which
+/// mobile and web use for the same fallback.
+fn daemonSteerRefusalIsUndelivered(code: []const u8, message: []const u8) bool {
+    // The turn already left the daemon's live set: nothing was delivered.
+    if (std.mem.eql(u8, code, "not_found")) return true;
+    if (!std.mem.eql(u8, code, "invalid_state")) return false;
+    const undelivered = [_][]const u8{
+        "provider does not support daemon steering",
+        "turn cannot accept steering now",
+        "provider thread is not ready",
+        "Codex active turn is not ready",
+    };
+    for (undelivered) |candidate| {
+        if (std.mem.eql(u8, message, candidate)) return true;
+    }
+    return false;
 }
 
 pub const AcceptanceOutcome = enum { accepted, rejected, ambiguous };
@@ -9312,12 +9380,23 @@ pub fn issuePendingProviderSteer(
         steer_failure = error.UnsupportedExecutionTarget;
     }
     if (steer_failure) |err| {
-        const restored = restorePendingSteerToDraft(self.allocator, thread);
-        if (restored) {
-            self.markDirty();
-            if (project_index == self.project_controller.selected_index and thread_index == self.currentProject().selected_thread_index) {
-                self.resetComposerInputWidget();
-            }
+        log.warn("{s} steer failed: {s}", .{ @tagName(provider), @errorName(err) });
+        switch (resolvePendingSteerFailure(self.allocator, thread, err)) {
+            .queued_next_turn => {
+                self.markDirty();
+                self.setSidebarNotice(if (provider == .claude)
+                    "Claude was already finishing this turn, so your message will send next."
+                else
+                    "Codex was already finishing this turn, so your message will send next.");
+                return;
+            },
+            .restored => {
+                self.markDirty();
+                if (project_index == self.project_controller.selected_index and thread_index == self.currentProject().selected_thread_index) {
+                    self.resetComposerInputWidget();
+                }
+            },
+            .none => {},
         }
         self.setSidebarNotice(if (provider == .claude)
             "Claude could not steer this turn. The message was restored to the composer."
@@ -9432,6 +9511,67 @@ test "rejected provider steer restores text and ordered images instead of queuei
     try std.testing.expectEqual(@as(usize, 2), thread.draftImageCount());
     try std.testing.expectEqualStrings("/tmp/first.png", thread.draft_image.?.path);
     try std.testing.expectEqualStrings("/tmp/second.jpg", thread.draft_extra_images.items[0].path);
+}
+
+test "daemon steer refusals that prove non-delivery are distinguished from uncertain failures" {
+    const allocator = std.testing.allocator;
+    try classifyDaemonSteerResponse(allocator,
+        \\{"jsonrpc":"2.0","id":1,"result":{"status":"accepted"}}
+    );
+    // Claude idle while the turn closes: the bridge refuses the steer.
+    try std.testing.expectError(error.SteerNotDelivered, classifyDaemonSteerResponse(allocator,
+        \\{"jsonrpc":"2.0","id":1,"error":{"code":"invalid_state","message":"turn cannot accept steering now"}}
+    ));
+    try std.testing.expectError(error.SteerNotDelivered, classifyDaemonSteerResponse(allocator,
+        \\{"jsonrpc":"2.0","id":1,"error":{"code":"not_found","message":"turn not found"}}
+    ));
+    // A lost acknowledgement may have reached Claude; never resend it.
+    try std.testing.expectError(error.DaemonRequestFailed, classifyDaemonSteerResponse(allocator,
+        \\{"jsonrpc":"2.0","id":1,"error":{"code":"invalid_state","message":"provider could not accept steering for this turn"}}
+    ));
+    try std.testing.expectError(error.DaemonRequestFailed, classifyDaemonSteerResponse(allocator,
+        \\{"jsonrpc":"2.0","id":1,"error":{"code":"invalid_state","message":"steer delivery is unconfirmed"}}
+    ));
+}
+
+test "late steer becomes the next turn instead of restoring the draft" {
+    const allocator = std.testing.allocator;
+    var thread = try ChatThread.init(allocator, "Late steer");
+    defer thread.deinit(allocator);
+    thread.send_state.status = .pending;
+    thread.send_state.pending_followup = .{
+        .kind = .steer,
+        .prompt = try allocator.dupe(u8, "ok hows it going"),
+    };
+    try thread.send_state.pending_followup.?.images.append(
+        allocator,
+        try ChatImageAttachment.init(allocator, "/tmp/shot.png", "image/png", 10),
+    );
+    thread.send_state.pending_followup_signal_sent = true;
+
+    try std.testing.expectEqual(PendingSteerFailureOutcome.queued_next_turn, resolvePendingSteerFailure(allocator, &thread, error.SteerNotDelivered));
+    const pending = thread.send_state.pending_followup.?;
+    try std.testing.expectEqual(FollowupState.fallback_next_turn, pending.state);
+    try std.testing.expectEqualStrings("ok hows it going", pending.prompt);
+    try std.testing.expectEqual(@as(usize, 1), pending.images.items.len);
+    try std.testing.expectEqualStrings("", thread.currentDraft());
+    // Not retried as a steer; dispatched on completion like a queued message.
+    try std.testing.expect(!pendingProviderSteerCanSignal(thread.send_state));
+}
+
+test "uncertain steer failure still restores the draft" {
+    const allocator = std.testing.allocator;
+    var thread = try ChatThread.init(allocator, "Uncertain steer");
+    defer thread.deinit(allocator);
+    thread.send_state.status = .pending;
+    thread.send_state.pending_followup = .{
+        .kind = .steer,
+        .prompt = try allocator.dupe(u8, "maybe delivered"),
+    };
+
+    try std.testing.expectEqual(PendingSteerFailureOutcome.restored, resolvePendingSteerFailure(allocator, &thread, error.DaemonRequestFailed));
+    try std.testing.expect(thread.send_state.pending_followup == null);
+    try std.testing.expectEqualStrings("maybe delivered", thread.currentDraft());
 }
 
 pub fn dispatchPendingFollowup(self: anytype, project_index: usize, thread_index: usize, thread: *ChatThread) void {
