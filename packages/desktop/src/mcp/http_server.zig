@@ -1,6 +1,7 @@
 //! Daemon-owned loopback Streamable HTTP transport for Verde MCP.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const endpoint_mod = @import("endpoint.zig");
 const telemetry = @import("telemetry.zig");
 
@@ -39,13 +40,23 @@ pub const Server = struct {
         const state = self.state;
         const io = state.threaded.io();
         state.stopping.store(true, .release);
-        // Closing a listening fd from another thread does not reliably wake a
-        // blocking accept on Linux. Shutdown is the std.Io cancellation path
-        // for accept, so use it before closing and joining the server thread.
-        const listener_stream: std.Io.net.Stream = .{ .socket = state.listener.socket };
-        listener_stream.shutdown(io, .both) catch {};
-        state.listener.deinit(io);
-        state.thread.join();
+        // Closing an AFD listener under a pending accept completes it with
+        // STATUS_CANCELLED, which std treats as unreachable and panics, so on
+        // Windows wake the accept with a loopback connection before closing.
+        const woke = builtin.os.tag == .windows and
+            wakeAcceptWithConnection(io, state.endpoint.port);
+        if (woke) {
+            state.thread.join();
+            state.listener.deinit(io);
+        } else {
+            // Closing a listening fd from another thread does not reliably wake a
+            // blocking accept on Linux. Shutdown is the std.Io cancellation path
+            // for accept, so use it before closing and joining the server thread.
+            const listener_stream: std.Io.net.Stream = .{ .socket = state.listener.socket };
+            listener_stream.shutdown(io, .both) catch {};
+            state.listener.deinit(io);
+            state.thread.join();
+        }
         state.endpoint.deinit(state.allocator);
         state.allocator.free(state.pref_path);
         state.threaded.deinit();
@@ -121,6 +132,18 @@ fn bindLoopback(io: std.Io, preferred_port: u16) !BoundListener {
 
 fn tryBind(io: std.Io, port: u16) !?std.Io.net.Server {
     const address = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+    if (comptime builtin.os.tag == .windows) {
+        // A refused loopback connect probe surfaces as error.Unexpected after
+        // ~2s of SYN retries, so the probe below would mark every port busy and
+        // fail daemon readiness. Zig binds AFD sockets shareable, so a bind
+        // alone does not refuse a live listener either: consult the TCP table.
+        // Windows does not block rebinding over TIME_WAIT connections.
+        if (windowsLoopbackPortListening(port)) return null;
+        return address.listen(io, .{}) catch |err| switch (err) {
+            error.AddressInUse => null,
+            else => |other| return other,
+        };
+    }
     // `reuse_address` also sets SO_REUSEPORT, which lets a second listener
     // share a port that another live daemon (or a test) is accepting on and
     // silently splits its connections. Never bind over an accepting listener.
@@ -134,11 +157,66 @@ fn tryBind(io: std.Io, port: u16) !?std.Io.net.Server {
     };
 }
 
+/// One `MIB_TCPROW` (iphlpapi); addresses and ports are in network byte order.
+const MibTcpRow = extern struct {
+    state: u32,
+    local_addr: u32,
+    local_port: u32,
+    remote_addr: u32,
+    remote_port: u32,
+};
+
+const MIB_TCP_STATE_LISTEN: u32 = 2;
+const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+
+extern "iphlpapi" fn GetTcpTable(table: ?*anyopaque, size: *u32, order: i32) callconv(.winapi) u32;
+
+fn tcpRowListensOnLoopbackPort(row: MibTcpRow, port: u16) bool {
+    if (row.state != MIB_TCP_STATE_LISTEN) return false;
+    if (std.mem.bigToNative(u16, @truncate(row.local_port)) != port) return false;
+    const addr = std.mem.bigToNative(u32, row.local_addr);
+    return addr == 0x7f000001 or addr == 0;
+}
+
+/// Reports a TCP listener on 127.0.0.1:port or 0.0.0.0:port. When the table
+/// cannot be read the caller falls back to a plain bind.
+fn windowsLoopbackPortListening(port: u16) bool {
+    const allocator = std.heap.page_allocator;
+    var size: u32 = 0;
+    var attempts: usize = 0;
+    while (attempts < 4) : (attempts += 1) {
+        const buffer = allocator.alignedAlloc(u8, .of(u32), @max(size, @sizeOf(u32))) catch return false;
+        defer allocator.free(buffer);
+        switch (GetTcpTable(buffer.ptr, &size, 0)) {
+            0 => {
+                const count = std.mem.readInt(u32, buffer[0..4], .little);
+                const rows_bytes = buffer[@sizeOf(u32)..];
+                const available = rows_bytes.len / @sizeOf(MibTcpRow);
+                const rows: [*]align(1) const MibTcpRow = @ptrCast(rows_bytes.ptr);
+                for (rows[0..@min(count, available)]) |row| {
+                    if (tcpRowListensOnLoopbackPort(row, port)) return true;
+                }
+                return false;
+            },
+            ERROR_INSUFFICIENT_BUFFER => continue,
+            else => return false,
+        }
+    }
+    return false;
+}
+
 fn loopbackListenerActive(io: std.Io, address: *const std.Io.net.IpAddress) bool {
     var stream = address.connect(io, .{ .mode = .stream }) catch |err| return switch (err) {
         error.ConnectionRefused => false,
         else => true,
     };
+    stream.close(io);
+    return true;
+}
+
+fn wakeAcceptWithConnection(io: std.Io, port: u16) bool {
+    const address = std.Io.net.IpAddress.parse("127.0.0.1", port) catch return false;
+    var stream = address.connect(io, .{ .mode = .stream }) catch return false;
     stream.close(io);
     return true;
 }
@@ -155,6 +233,10 @@ fn acceptLoop(state: *State) void {
                 continue;
             },
         };
+        if (state.stopping.load(.acquire)) {
+            stream.close(io);
+            return;
+        }
         group.concurrent(io, handleConnection, .{ state, stream }) catch |err| {
             log.warn("MCP HTTP worker spawn failed: {s}", .{@errorName(err)});
             stream.close(io);
@@ -689,6 +771,40 @@ test "origin policy accepts only the bound loopback origin" {
     try std.testing.expect(originAllowed("http://127.0.0.1:47371", 47_371));
     try std.testing.expect(originAllowed("http://localhost:47371", 47_371));
     try std.testing.expect(!originAllowed("https://attacker.invalid", 47_371));
+}
+
+test "TCP table rows match only loopback or wildcard listeners on the port" {
+    const port: u16 = 47371;
+    const net_port: u32 = std.mem.nativeToBig(u16, port);
+    const loopback = std.mem.nativeToBig(u32, 0x7f000001);
+    try std.testing.expect(tcpRowListensOnLoopbackPort(.{ .state = MIB_TCP_STATE_LISTEN, .local_addr = loopback, .local_port = net_port, .remote_addr = 0, .remote_port = 0 }, port));
+    try std.testing.expect(tcpRowListensOnLoopbackPort(.{ .state = MIB_TCP_STATE_LISTEN, .local_addr = 0, .local_port = net_port, .remote_addr = 0, .remote_port = 0 }, port));
+    // Established connection on the port, a different port, another address.
+    try std.testing.expect(!tcpRowListensOnLoopbackPort(.{ .state = 5, .local_addr = loopback, .local_port = net_port, .remote_addr = loopback, .remote_port = 1 }, port));
+    try std.testing.expect(!tcpRowListensOnLoopbackPort(.{ .state = MIB_TCP_STATE_LISTEN, .local_addr = loopback, .local_port = std.mem.nativeToBig(u16, port + 1), .remote_addr = 0, .remote_port = 0 }, port));
+    try std.testing.expect(!tcpRowListensOnLoopbackPort(.{ .state = MIB_TCP_STATE_LISTEN, .local_addr = std.mem.nativeToBig(u32, 0x0a000001), .local_port = net_port, .remote_addr = 0, .remote_port = 0 }, port));
+}
+
+test "loopback bind skips a port with a live listener" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const first = bindLoopback(io, endpoint_mod.DEFAULT_PORT) catch |err| switch (err) {
+        // The test runner's filesystem sandbox can also deny creating sockets.
+        error.Unexpected => return error.SkipZigTest,
+        else => |other| return other,
+    };
+    var first_listener = first.listener;
+    defer first_listener.socket.close(io);
+    if (try tryBind(io, first.port)) |shared| {
+        // Close the second listener so later tests cannot connect into it.
+        var listener = shared;
+        listener.socket.close(io);
+        return error.TestUnexpectedResult;
+    }
+    var second = try bindLoopback(io, first.port);
+    defer second.listener.socket.close(io);
+    try std.testing.expect(second.port != first.port);
 }
 
 test "daemon HTTP transport accepts a stateless request and keeps its port across restart" {
