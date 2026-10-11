@@ -2079,6 +2079,10 @@ fn renderPaneCanvas(state: *app_state.AppState, pane_rect: palette.Rect) void {
         }
     }
 
+    // A loaded page hidden under a Palette overlay (menus, the address
+    // suggestion list) stays a plain background, not the empty-state card.
+    if (state.browser_controller.surface_suspended_for_palette_overlay) return;
+
     // Fall back to the full pane bounds while the browser frame has not arrived yet.
     renderPanePlaceholder(state, pane_rect);
 }
