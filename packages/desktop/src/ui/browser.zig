@@ -358,6 +358,14 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down
         }
         if (rectContainsPoint(palette_overflow_menu_rect, x, y)) return true;
         state.browser_controller.toolbar_overflow_open = false;
+        // A second click on "..." closes the menu; falling through would
+        // toggle it straight back open.
+        if (findHit(.overflow)) |hit| {
+            if (rectContainsPoint(hit.rect, x, y)) {
+                state.noteInteraction();
+                return true;
+            }
+        }
     }
 
     if (state.browser_controller.context_menu_open) {
