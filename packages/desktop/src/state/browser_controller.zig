@@ -1698,6 +1698,16 @@ pub fn browserBlockedByPaletteOverlay(self: anytype) bool {
         ) or
         self.project_controller.show_creator or
         self.settings_controller.modal_visible or
+        // Centered modals drawn by Palette. A native child view (macOS
+        // WKWebView) sits above the Metal layer, so it would cover them.
+        self.settings_controller.mcp_onboarding_visible or
+        self.settings_controller.provider_onboarding_visible or
+        self.workspaceSettingsOpen() or
+        self.cookie_import.open or
+        self.git_changes.overlayOpen() or
+        self.runtime_connections.wizard_open or
+        self.runtime_credential_profile_id != null or
+        self.runtime_pin_proposal != null or
         self.handoff_controller.sheet_open or
         self.rename_project_index != null or
         self.thread_import_provider != null or
@@ -3925,4 +3935,26 @@ test "host window resume leaves layout-suspended browsers for the layout restore
     restoreBrowserSurfaceForRenderedLayout(&app);
     try std.testing.expectEqual(browser_runtime.Status.opening, app.browser_controller.runtime.status);
     try std.testing.expect(app.drainOpened());
+}
+
+test "native browser surfaces hide under every centered Palette modal" {
+    // macOS embeds WKWebView as a subview above the Metal layer, so any modal
+    // missing here is drawn underneath the page (the MCP onboarding modal was).
+    const source = @embedFile("browser_controller.zig");
+    const start = std.mem.indexOf(u8, source, "pub fn browserBlockedByPaletteOverlay(self: anytype) bool {").?;
+    const end = start + std.mem.indexOf(u8, source[start..], "\n}\n").?;
+    const body = source[start..end];
+    inline for (.{
+        "settings_controller.modal_visible",
+        "settings_controller.mcp_onboarding_visible",
+        "settings_controller.provider_onboarding_visible",
+        "workspaceSettingsOpen()",
+        "cookie_import.open",
+        "git_changes.overlayOpen()",
+        "runtime_connections.wizard_open",
+        "runtime_credential_profile_id != null",
+        "runtime_pin_proposal != null",
+    }) |flag| {
+        try std.testing.expect(std.mem.indexOf(u8, body, flag) != null);
+    }
 }
