@@ -565,12 +565,13 @@ pub fn handlePaletteKeyDown(state: *app_state.AppState, event: *const palette.ev
     switch (event.key) {
         .@"return", .kp_enter => {
             // A highlighted suggestion wins; otherwise the typed text loads.
+            // Accept before blurring: blurAddress hides the dropdown, which
+            // clears the selection, and Enter would then load the raw text.
             const suggestion_taken = browser_history_controller.browserSuggestionsVisible(state) and
-                state.browser_controller.suggestions.selected != null;
+                state.browser_controller.suggestions.selected != null and
+                browser_history_controller.acceptBrowserSuggestion(state);
             blurAddress(state);
-            if (!suggestion_taken or !browser_history_controller.acceptBrowserSuggestion(state)) {
-                state.navigateBrowserFromAddress();
-            }
+            if (!suggestion_taken) state.navigateBrowserFromAddress();
         },
         .escape => {
             if (browser_history_controller.browserSuggestionsVisible(state)) {
@@ -2364,4 +2365,70 @@ test "browser security presentation distinguishes remote local and internal URLs
     try std.testing.expectEqual(BrowserSecurityState.insecure, browserSecurityState("http://example.com"));
     try std.testing.expectEqual(BrowserSecurityState.internal, browserSecurityState("about:blank"));
     try std.testing.expectEqual(BrowserSecurityState.unknown, browserSecurityState(null));
+}
+
+test "Enter in the address bar loads the highlighted suggestion, not the typed text" {
+    const allocator = std.testing.allocator;
+    const browser_controller = @import("../state/browser_controller.zig");
+    var state: app_state.AppState = undefined;
+    state.allocator = allocator;
+    state.app_config = .{};
+    state.project_controller.projects = .empty;
+    state.project_controller.selected_index = 0;
+    state.surface_controller = .{};
+    state.browser_controller = try browser_controller.State.init(allocator);
+    state.browser_textures_enabled = true;
+    state.browser_controller.pane_focused = false;
+    state.browser_controller.address_focused = false;
+    state.terminal_controller.focused = false;
+    state.composer_controller.focused = false;
+    state.composer_controller.composer = app_state.PaletteComposerPrompt.init();
+    state.composer_controller.model_picker = app_state.PaletteModelPicker.init(0);
+    state.composer_controller.popover_restore_focus = false;
+    state.composer_controller.run_config_open = false;
+    state.palette_modal_text_focus = .none;
+    state.lifecycle.dirty = false;
+    state.lifecycle.last_dirty_at_ms = 0;
+    state.lifecycle.last_interaction_at_ms = 0;
+    @memset(&state.sidebar_notice_storage, 0);
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+        state.surface_controller.surfaces.deinit(allocator);
+        state.composer_controller.composer.deinit(allocator);
+        state.browser_controller.deinit(allocator);
+    }
+
+    var project = try app_state.Project.init(allocator, "browser-enter", "Browser enter", "/tmp/browser-enter", 0);
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+    try state.project_controller.projects.items[0].workspace_layout.applyPersistedWorkspaceJson(allocator,
+        \\{"v":2,"next":2,"focused":1,"maximized":null,"panes":[
+        \\{"id":1,"kind":"browser","active_tab":0,"tabs":[{"url":"https://start.example/","title":"Start","history_index":0,"history":["https://start.example/"]}]}],
+        \\"root":{"leaf":1}}
+    );
+
+    var navigation: std.ArrayList(u8) = .empty;
+    defer navigation.deinit(allocator);
+    state.browser_controller.runtime.controller.test_navigation_capture = &navigation;
+    try std.testing.expect(state.restoreWorkspacePaneFocus(0, 1));
+    navigation.clearRetainingCapacity();
+
+    // Typed "m"; history offers a row that is highlighted by default.
+    state.browser_controller.address_focused = true;
+    state.browserState().setAddress("m");
+    state.browser_controller.address_cursor = 1;
+    try state.browser_controller.suggestions.setResults("m", &.{
+        .{ .url = "https://mirage.example/lme/", .title = "LME" },
+    });
+    try std.testing.expectEqual(@as(?usize, 0), state.browser_controller.suggestions.selected);
+
+    const enter: palette.event.KeyEvent = .{ .key = .@"return", .down = true };
+    _ = handlePaletteKeyDown(&state, &enter);
+
+    try std.testing.expectEqualStrings("https://mirage.example/lme/", navigation.items);
+    try std.testing.expect(!state.browser_controller.address_focused);
+    try std.testing.expect(!browser_history_controller.browserSuggestionsVisible(&state));
 }
