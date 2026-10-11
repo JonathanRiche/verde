@@ -337,9 +337,11 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down
         if (!down and rectContainsPoint(palette_suggestion_rect, x, y)) return true;
         if (down) {
             if (suggestionRowAtPoint(x, y)) |row| {
+                // Accept before blurring: blurAddress hides the dropdown,
+                // which clears the selection the click just made.
                 browser_history_controller.selectBrowserSuggestion(state, row);
-                blurAddress(state);
                 _ = browser_history_controller.acceptBrowserSuggestion(state);
+                blurAddress(state);
                 state.noteInteraction();
                 return true;
             }
@@ -2367,68 +2369,106 @@ test "browser security presentation distinguishes remote local and internal URLs
     try std.testing.expectEqual(BrowserSecurityState.unknown, browserSecurityState(null));
 }
 
-test "Enter in the address bar loads the highlighted suggestion, not the typed text" {
-    const allocator = std.testing.allocator;
-    const browser_controller = @import("../state/browser_controller.zig");
-    var state: app_state.AppState = undefined;
-    state.allocator = allocator;
-    state.app_config = .{};
-    state.project_controller.projects = .empty;
-    state.project_controller.selected_index = 0;
-    state.surface_controller = .{};
-    state.browser_controller = try browser_controller.State.init(allocator);
-    state.browser_textures_enabled = true;
-    state.browser_controller.pane_focused = false;
-    state.browser_controller.address_focused = false;
-    state.terminal_controller.focused = false;
-    state.composer_controller.focused = false;
-    state.composer_controller.composer = app_state.PaletteComposerPrompt.init();
-    state.composer_controller.model_picker = app_state.PaletteModelPicker.init(0);
-    state.composer_controller.popover_restore_focus = false;
-    state.composer_controller.run_config_open = false;
-    state.palette_modal_text_focus = .none;
-    state.lifecycle.dirty = false;
-    state.lifecycle.last_dirty_at_ms = 0;
-    state.lifecycle.last_interaction_at_ms = 0;
-    @memset(&state.sidebar_notice_storage, 0);
-    defer {
+const SuggestionTestFixture = struct {
+    state: app_state.AppState,
+    navigation: std.ArrayList(u8),
+
+    /// Restores a one-browser-pane workspace, captures navigations, and opens
+    /// the dropdown for typed "m" with one highlighted history row.
+    fn init(self: *SuggestionTestFixture) !void {
+        const allocator = std.testing.allocator;
+        const browser_controller = @import("../state/browser_controller.zig");
+        const state = &self.state;
+        state.* = undefined;
+        state.allocator = allocator;
+        state.app_config = .{};
+        state.project_controller.projects = .empty;
+        state.project_controller.selected_index = 0;
+        state.surface_controller = .{};
+        state.browser_controller = try browser_controller.State.init(allocator);
+        state.browser_textures_enabled = true;
+        state.browser_controller.pane_focused = false;
+        state.browser_controller.address_focused = false;
+        state.terminal_controller.focused = false;
+        state.composer_controller.focused = false;
+        state.composer_controller.composer = app_state.PaletteComposerPrompt.init();
+        state.composer_controller.model_picker = app_state.PaletteModelPicker.init(0);
+        state.composer_controller.popover_restore_focus = false;
+        state.composer_controller.run_config_open = false;
+        state.palette_modal_text_focus = .none;
+        state.lifecycle.dirty = false;
+        state.lifecycle.last_dirty_at_ms = 0;
+        state.lifecycle.last_interaction_at_ms = 0;
+        @memset(&state.sidebar_notice_storage, 0);
+        self.navigation = .empty;
+        errdefer self.deinit();
+
+        var project = try app_state.Project.init(allocator, "browser-enter", "Browser enter", "/tmp/browser-enter", 0);
+        state.project_controller.projects.append(allocator, project) catch |err| {
+            project.deinit(allocator);
+            return err;
+        };
+        try state.project_controller.projects.items[0].workspace_layout.applyPersistedWorkspaceJson(allocator,
+            \\{"v":2,"next":2,"focused":1,"maximized":null,"panes":[
+            \\{"id":1,"kind":"browser","active_tab":0,"tabs":[{"url":"https://start.example/","title":"Start","history_index":0,"history":["https://start.example/"]}]}],
+            \\"root":{"leaf":1}}
+        );
+        state.browser_controller.runtime.controller.test_navigation_capture = &self.navigation;
+        try std.testing.expect(state.restoreWorkspacePaneFocus(0, 1));
+        self.navigation.clearRetainingCapacity();
+
+        // Typed "m"; history offers a row that is highlighted by default.
+        state.browser_controller.address_focused = true;
+        state.browserState().setAddress("m");
+        state.browser_controller.address_cursor = 1;
+        try state.browser_controller.suggestions.setResults("m", &.{
+            .{ .url = "https://mirage.example/lme/", .title = "LME" },
+        });
+    }
+
+    fn deinit(self: *SuggestionTestFixture) void {
+        const allocator = std.testing.allocator;
+        const state = &self.state;
         for (state.project_controller.projects.items) |*project| project.deinit(allocator);
         state.project_controller.projects.deinit(allocator);
         state.surface_controller.surfaces.deinit(allocator);
         state.composer_controller.composer.deinit(allocator);
         state.browser_controller.deinit(allocator);
+        self.navigation.deinit(allocator);
     }
+};
 
-    var project = try app_state.Project.init(allocator, "browser-enter", "Browser enter", "/tmp/browser-enter", 0);
-    state.project_controller.projects.append(allocator, project) catch |err| {
-        project.deinit(allocator);
-        return err;
-    };
-    try state.project_controller.projects.items[0].workspace_layout.applyPersistedWorkspaceJson(allocator,
-        \\{"v":2,"next":2,"focused":1,"maximized":null,"panes":[
-        \\{"id":1,"kind":"browser","active_tab":0,"tabs":[{"url":"https://start.example/","title":"Start","history_index":0,"history":["https://start.example/"]}]}],
-        \\"root":{"leaf":1}}
-    );
-
-    var navigation: std.ArrayList(u8) = .empty;
-    defer navigation.deinit(allocator);
-    state.browser_controller.runtime.controller.test_navigation_capture = &navigation;
-    try std.testing.expect(state.restoreWorkspacePaneFocus(0, 1));
-    navigation.clearRetainingCapacity();
-
-    // Typed "m"; history offers a row that is highlighted by default.
-    state.browser_controller.address_focused = true;
-    state.browserState().setAddress("m");
-    state.browser_controller.address_cursor = 1;
-    try state.browser_controller.suggestions.setResults("m", &.{
-        .{ .url = "https://mirage.example/lme/", .title = "LME" },
-    });
+test "Enter in the address bar loads the highlighted suggestion, not the typed text" {
+    var fixture: SuggestionTestFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const state = &fixture.state;
     try std.testing.expectEqual(@as(?usize, 0), state.browser_controller.suggestions.selected);
 
     const enter: palette.event.KeyEvent = .{ .key = .@"return", .down = true };
-    _ = handlePaletteKeyDown(&state, &enter);
+    _ = handlePaletteKeyDown(state, &enter);
 
-    try std.testing.expectEqualStrings("https://mirage.example/lme/", navigation.items);
+    try std.testing.expectEqualStrings("https://mirage.example/lme/", fixture.navigation.items);
     try std.testing.expect(!state.browser_controller.address_focused);
-    try std.testing.expect(!browser_history_controller.browserSuggestionsVisible(&state));
+    try std.testing.expect(!browser_history_controller.browserSuggestionsVisible(state));
+}
+
+test "clicking an address suggestion row loads that row" {
+    var fixture: SuggestionTestFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const state = &fixture.state;
+    // Hover moved the highlight off the row before the click lands on it.
+    state.browser_controller.suggestions.selected = null;
+    resetPaletteHitCache();
+    defer resetPaletteHitCache();
+    palette_suggestion_rect = .{ .x = 10.0, .y = 40.0, .w = 320.0, .h = 40.0 };
+    palette_suggestion_hits[0] = .{ .x = 14.0, .y = 44.0, .w = 312.0, .h = 32.0 };
+    palette_suggestion_hit_count = 1;
+
+    try std.testing.expect(handlePaletteMouseButton(state, 50.0, 60.0, true, 1));
+
+    try std.testing.expectEqualStrings("https://mirage.example/lme/", fixture.navigation.items);
+    try std.testing.expect(!state.browser_controller.address_focused);
+    try std.testing.expect(!browser_history_controller.browserSuggestionsVisible(state));
 }
