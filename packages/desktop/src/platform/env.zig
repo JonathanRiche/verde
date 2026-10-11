@@ -290,7 +290,46 @@ fn appendWindowsUserPathDirs(
     path_builder: *std.ArrayList(u8),
     env_map: *const std.process.Environ.Map,
 ) !void {
+    try appendWindowsRegistryPathDirs(allocator, path_builder);
     try appendWindowsUserPathDirsForOs(allocator, path_builder, env_map, .windows);
+}
+
+const win_reg = struct {
+    const HKEY = *opaque {};
+    const HKEY_CURRENT_USER: HKEY = @ptrFromInt(0x80000001);
+    const HKEY_LOCAL_MACHINE: HKEY = @ptrFromInt(0x80000002);
+    /// REG_SZ, with REG_EXPAND_SZ values expanded by the API (no RRF_NOEXPAND).
+    const RRF_RT_REG_SZ: u32 = 0x00000002;
+    extern "advapi32" fn RegGetValueW(HKEY, ?[*:0]const u16, ?[*:0]const u16, u32, ?*u32, ?*anyopaque, ?*u32) callconv(.winapi) i32;
+};
+
+/// Installers (Claude, Codex, Grok, Cursor, npm) add their bin dir to the
+/// persistent user PATH in the registry. A running GUI keeps the PATH it was
+/// started with, so read the live user and machine PATH too; otherwise a CLI
+/// installed from Verde's own terminal stays "not found" until a re-login.
+fn appendWindowsRegistryPathDirs(allocator: std.mem.Allocator, path_builder: *std.ArrayList(u8)) !void {
+    if (builtin.os.tag != .windows) return;
+    const sources = [_]struct { key: win_reg.HKEY, subkey: [*:0]const u16 }{
+        .{ .key = win_reg.HKEY_CURRENT_USER, .subkey = std.unicode.utf8ToUtf16LeStringLiteral("Environment") },
+        .{ .key = win_reg.HKEY_LOCAL_MACHINE, .subkey = std.unicode.utf8ToUtf16LeStringLiteral("SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment") },
+    };
+    const value_name = std.unicode.utf8ToUtf16LeStringLiteral("Path");
+    const buf = try allocator.alloc(u16, 32 * 1024);
+    defer allocator.free(buf);
+    for (sources) |source| {
+        var size: u32 = @intCast(buf.len * 2);
+        if (win_reg.RegGetValueW(source.key, source.subkey, value_name, win_reg.RRF_RT_REG_SZ, null, buf.ptr, &size) != 0) continue;
+        var units = buf[0 .. size / 2];
+        while (units.len > 0 and units[units.len - 1] == 0) units = units[0 .. units.len - 1];
+        const value = std.unicode.utf16LeToUtf8Alloc(allocator, units) catch continue;
+        defer allocator.free(value);
+        var dirs = std.mem.tokenizeScalar(u8, value, ';');
+        while (dirs.next()) |dir| {
+            const trimmed = std.mem.trim(u8, dir, " \t");
+            if (trimmed.len == 0) continue;
+            try appendUniquePathDirForOs(allocator, path_builder, .windows, trimmed);
+        }
+    }
 }
 
 fn appendWindowsUserPathDirsForOs(

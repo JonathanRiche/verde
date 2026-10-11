@@ -1311,8 +1311,18 @@ pub fn selectSettingsNewChatReasoning(self: anytype, option_index: usize) void {
     commitSettingsPreference(self);
 }
 
-fn providerInstallShell(provider: app_config.ChatProvider) []const u8 {
+fn providerInstallShell(provider: app_config.ChatProvider) ?[]const u8 {
+    if (@import("builtin").os.tag == .windows) return headless.provider_install.installShellWindows(providerProtocol(provider));
     return headless.provider_install.installShell(providerProtocol(provider));
+}
+
+/// Install/sign-in commands run in a workspace terminal: bash on Linux and
+/// macOS, PowerShell on Windows.
+pub fn providerTerminalSupported() bool {
+    return switch (@import("builtin").os.tag) {
+        .linux, .macos, .windows => true,
+        else => false,
+    };
 }
 
 fn providerProtocol(provider: app_config.ChatProvider) headless.provider_types.Provider {
@@ -1379,8 +1389,15 @@ pub fn installSettingsProvider(self: anytype, row: usize) void {
         return;
     }
     const custom = if (missing) "" else snapshot.updateShellForProvider(installed);
-    const shell = if (custom.len > 0) custom else providerInstallShell(provider);
-    if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) {
+    const shell = if (custom.len > 0) custom else providerInstallShell(provider) orelse {
+        // No native Windows installer upstream (FX, Muse): point at the guide
+        // rather than offering a bash one-liner PowerShell cannot run.
+        var notice_buf: [160]u8 = undefined;
+        self.setSidebarNotice(std.fmt.bufPrint(&notice_buf, "{s} has no Windows installer yet. See the setup guide.", .{providerDisplayName(provider)}) catch "No Windows installer for this provider yet.");
+        self.markDirty();
+        return;
+    };
+    if (!providerTerminalSupported()) {
         self.setSidebarNotice(if (self.setClipboardText(shell))
             "Install command copied. Run it in a terminal on this machine."
         else
@@ -1395,25 +1412,26 @@ pub fn installSettingsProvider(self: anytype, row: usize) void {
 }
 
 /// First-run checklist button: the same Install / Sign in path as the
-/// Settings > Providers row. Where that path opens a terminal, the checklist
-/// steps aside so the terminal is visible; it reappears on the next readiness
-/// check if no provider is ready yet.
+/// Settings > Providers row. When that opens a terminal, the checklist steps
+/// aside so the terminal is visible; it reappears on the next readiness check
+/// if no provider is ready yet.
 pub fn runProviderOnboardingAction(self: anytype, provider: Provider) void {
     const row = for (PROVIDER_OPTIONS, 0..) |option, index| {
         if (dbProviderForChatProvider(option) == provider) break index;
     } else return;
     const readiness = self.providerReadinessSnapshot().forProvider(provider);
-    const opens_terminal = @import("builtin").os.tag == .linux or @import("builtin").os.tag == .macos;
+    const before = self.settings_controller.provider_install_terminal;
     switch (readiness) {
-        .missing => {
-            if (opens_terminal) self.settings_controller.provider_onboarding_visible = false;
-            installSettingsProvider(self, row);
-        },
-        .signed_out, .unavailable => {
-            if (opens_terminal) self.settings_controller.provider_onboarding_visible = false;
-            loginSettingsProvider(self, row);
-        },
+        .missing => installSettingsProvider(self, row),
+        .signed_out, .unavailable => loginSettingsProvider(self, row),
         .ready, .checking => {},
+    }
+    // Step aside only when a new terminal actually opened (not for a copied
+    // command or a provider with no installer on this OS).
+    const after = self.settings_controller.provider_install_terminal;
+    if (after) |started| {
+        const is_new = if (before) |prior| prior.dock_id != started.dock_id or prior.project_index != started.project_index else true;
+        if (is_new) self.settings_controller.provider_onboarding_visible = false;
     }
     self.markDirty();
 }
@@ -1428,7 +1446,7 @@ pub fn loginSettingsProvider(self: anytype, row: usize) void {
 /// rechecks readiness when the terminal exits.
 pub fn loginProvider(self: anytype, provider: app_config.ChatProvider) void {
     const shell = headless.provider_install.loginShell(providerProtocol(provider));
-    if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) {
+    if (!providerTerminalSupported()) {
         self.setSidebarNotice(if (self.setClipboardText(shell))
             "Sign-in command copied. Run it in a terminal on this machine."
         else
@@ -1450,11 +1468,16 @@ fn startProviderInstallTerminal(self: anytype, provider: app_config.ChatProvider
     errdefer _ = self.project_controller.projects.items[project_index].removeTerminalDockById(self.allocator, dock_id);
     var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return error.NoProjectSelected;
     const project_path = self.project_controller.projects.items[project_index].path;
-    const command = [_][]const u8{ "bash", "-lc", shell };
+    // Windows: -ExecutionPolicy Bypass lets the upstream `irm … | iex`
+    // installers run on a default-policy machine, scoped to this process.
+    const command: []const []const u8 = if (@import("builtin").os.tag == .windows)
+        &.{ "powershell.exe", "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", shell }
+    else
+        &.{ "bash", "-lc", shell };
     try dock.restartWithProfilePersistent(self.allocator, project_path, .{
         .kind = .custom,
         .label = if (login) providerLoginTerminalLabel(provider) else providerInstallTerminalLabel(provider, missing),
-        .command = &command,
+        .command = command,
     }, self.storage.pref_path, dock_id);
 
     var layout = &self.project_controller.projects.items[project_index].workspace_layout;

@@ -21,6 +21,21 @@ pub fn installShell(provider: provider_types.Provider) []const u8 {
     };
 }
 
+/// PowerShell one-liner that installs this provider's CLI on Windows, or null
+/// when upstream publishes no native Windows installer. Each command is the
+/// provider's documented Windows route; OpenCode documents npm.
+pub fn installShellWindows(provider: provider_types.Provider) ?[]const u8 {
+    return switch (provider) {
+        .codex => "irm https://chatgpt.com/codex/install.ps1 | iex",
+        .claude => "irm https://claude.ai/install.ps1 | iex",
+        .cursor => "irm 'https://cursor.com/install?win32=true' | iex",
+        .opencode => "npm install -g opencode-ai",
+        .pi => "irm https://pi.dev/install.ps1 | iex",
+        .grok => "irm https://x.ai/cli/install.ps1 | iex",
+        .fx, .muse => null,
+    };
+}
+
 /// One-element argv whose only item is `installShell`. Safe to store in a
 /// provider-status remediation command. Force the entire backing array to be
 /// comptime so returning its slice never exposes a runtime stack temporary.
@@ -72,6 +87,18 @@ test "provider login shell matches its argv" {
         const joined = try std.mem.join(std.testing.allocator, " ", loginArgv(provider));
         defer std.testing.allocator.free(joined);
         try std.testing.expectEqualStrings(joined, loginShell(provider));
+    }
+}
+
+test "windows installers are single-line commands" {
+    inline for (std.meta.tags(provider_types.Provider)) |provider| {
+        if (installShellWindows(provider)) |shell| {
+            try std.testing.expect(shell.len > 0);
+            try std.testing.expect(std.mem.indexOfAny(u8, shell, "\r\n") == null);
+            // PowerShell has no `bash`; a POSIX pipe target means a copy/paste slip.
+            try std.testing.expect(std.mem.indexOf(u8, shell, "| bash") == null);
+            try std.testing.expect(std.mem.indexOf(u8, shell, "| sh") == null);
+        }
     }
 }
 
