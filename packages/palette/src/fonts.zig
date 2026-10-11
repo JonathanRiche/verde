@@ -11,10 +11,15 @@
 //! | prose | NotoSans-Regular | same as ui |
 //! | prose_italic | NotoSans-Italic | same as ui |
 //! | prose_bold_italic | NotoSans-BoldItalic | same as ui |
-//! | mono | JetBrainsMonoNerdFont-Regular | icon, mono_symbols, symbols, symbols_alt, math, emoji, prose |
-//! | icon | Codicon | (none) |
+//! | mono | JetBrainsMonoNerdFont-Regular | icon, icon_fallback, mono_symbols, symbols, symbols_alt, math, emoji, prose |
+//! | icon | Codicon | icon_fallback, mono_symbols |
 //! | mono_symbols | SymbolsNerdFontMono-Regular | (none) |
 //! | symbols / symbols_alt / math / emoji | NotoSansSymbols2 / NotoSansSymbols / – / NotoEmoji | (none) |
+//!
+//! Icon fonts are partial: Codicon has the newest codicons (e.g. U+EC5E `file-text`) but no
+//! devicons, while Symbols Nerd Font carries devicons/Material Design but only the codicons up to
+//! its release. Apps that pick one as `icon` set the other as `icon_fallback` so every icon
+//! codepoint resolves; `mono_symbols` follows as a last resort before tofu.
 //!
 //! The old renderer registered the symbol faces as SDL_ttf fallbacks for ui/prose and used a
 //! per-glyph fallback for mono; here both become ordinary role chains.
@@ -64,6 +69,8 @@ pub const FaceSet = struct {
     bold_italic: FaceSource = .none,
     mono: FaceSource = .none,
     icon: FaceSource = .none,
+    /// Second icon face, consulted when `icon` lacks a codepoint (see "Icon fonts" above).
+    icon_fallback: FaceSource = .none,
     mono_symbols: FaceSource = .none,
     symbols: FaceSource = .none,
     symbols_alt: FaceSource = .none,
@@ -174,6 +181,7 @@ pub const Fonts = struct {
         const bold_italic = try load(coll, set.bold_italic, opt);
         const mono = try load(coll, set.mono, opt);
         const icon = try load(coll, set.icon, opt);
+        const icon_fallback = try load(coll, set.icon_fallback, opt);
         const mono_symbols = try load(coll, set.mono_symbols, opt);
         const symbols = try load(coll, set.symbols, opt);
         const symbols_alt = try load(coll, set.symbols_alt, opt);
@@ -188,8 +196,8 @@ pub const Fonts = struct {
         try setChain(coll, .prose, prose orelse ui, &text_fallbacks);
         try setChain(coll, .prose_italic, italic orelse prose orelse ui, &text_fallbacks);
         try setChain(coll, .prose_bold_italic, bold_italic orelse bold orelse ui, &text_fallbacks);
-        if (mono) |m| try setChain(coll, .mono, m, &.{ icon, mono_symbols, symbols, symbols_alt, math, emoji, prose });
-        if (icon) |f| try setChain(coll, .icon, f, &.{});
+        if (mono) |m| try setChain(coll, .mono, m, &.{ icon, icon_fallback, mono_symbols, symbols, symbols_alt, math, emoji, prose });
+        if (icon orelse icon_fallback) |f| try setChain(coll, .icon, f, &.{ icon_fallback, mono_symbols });
         if (mono_symbols) |f| try setChain(coll, .mono_symbols, f, &.{});
         if (symbols) |f| try setChain(coll, .symbols, f, &.{});
         if (symbols_alt) |f| try setChain(coll, .symbols_alt, f, &.{});
@@ -203,7 +211,7 @@ pub const Fonts = struct {
         chain[n] = primary;
         n += 1;
         for (rest) |f| if (f) |id| {
-            if (id == primary) continue;
+            if (std.mem.indexOfScalar(font.FaceId, chain[0..n], id) != null) continue;
             chain[n] = id;
             n += 1;
         };
@@ -284,7 +292,8 @@ test "fonts: chains and scaled metrics with the bundled faces" {
     };
     defer f.deinit();
     try std.testing.expect(f.collection.roleChain(.ui).len >= 2);
-    try std.testing.expectEqual(@as(usize, 1), f.collection.roleChain(.icon).len);
+    // Codicon, then Symbols Nerd Font Mono (the bundled set's mono_symbols).
+    try std.testing.expectEqual(@as(usize, 2), f.collection.roleChain(.icon).len);
     const m = f.metrics(.ui, 16, null);
     try std.testing.expectEqual(@as(f32, 16), m.font_size);
     const w = m.measureSlice("Hello");
@@ -300,4 +309,69 @@ test "fonts: chains and scaled metrics with the bundled faces" {
     const dev = f.collection.glyphInk(.ui, 16 * 0.86 * 2, 'A').?;
     for (0..4) |k| try std.testing.expectEqual(dev[k] / 2, ink2[k]);
     try std.testing.expect(f.glyphInk(.ui, 16, ' ') == null);
+}
+
+test "fonts: icon chain falls back across icon faces (Codicon-only and Nerd-only glyphs)" {
+    const io = std.testing.io;
+    const dir = "../assets/fonts";
+    var codicon_buf: [256]u8 = undefined;
+    var nerd_buf: [256]u8 = undefined;
+    var ui_buf: [256]u8 = undefined;
+    const codicon_path = try std.fmt.bufPrint(&codicon_buf, "{s}/{s}", .{ dir, FaceSet.file_names.icon });
+    const nerd_path = try std.fmt.bufPrint(&nerd_buf, "{s}/{s}", .{ dir, FaceSet.file_names.mono_symbols });
+    const ui_path = try std.fmt.bufPrint(&ui_buf, "{s}/{s}", .{ dir, FaceSet.file_names.ui });
+    // U+EC5E (codicon `file-text`) is newer than the codicons Symbols Nerd Font carries;
+    // U+E6B2 (devicon toml) and U+F0615 (Material Design, plane 15, cmap format 12) are not in
+    // Codicon at all.
+    const codicon_only: u21 = 0xEC5E;
+    const nerd_only = [_]u21{ 0xE6B2, 0xF0615 };
+
+    // Verde's desktop layout: Nerd Symbols primary, Codicon as the icon fallback.
+    const desktop = Fonts.init(std.testing.allocator, .{
+        .ui = .{ .path = ui_path },
+        .icon = .{ .path = nerd_path },
+        .icon_fallback = .{ .path = codicon_path },
+    }, .{ .io = io, .optional_missing = false }) catch |err| switch (err) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    defer desktop.deinit();
+    const chain = desktop.collection.roleChain(.icon);
+    try std.testing.expectEqual(@as(usize, 2), chain.len);
+    try std.testing.expectEqual(@as(u32, 0), desktop.collection.sfntFace(chain[0]).?.font.glyphIndex(codicon_only));
+    const r = desktop.collection.resolve(.icon, codicon_only).?;
+    try std.testing.expectEqual(chain[1], r.face);
+    try std.testing.expect(r.glyph != 0);
+    for (nerd_only) |cp| {
+        const e = desktop.collection.resolve(.icon, cp).?;
+        try std.testing.expectEqual(chain[0], e.face);
+        try std.testing.expect(e.glyph != 0);
+    }
+    // Measurement (layout) sees the fallback glyph, not a zero-width miss.
+    try std.testing.expect((try desktop.measure(.icon, 16, "\u{EC5E}")) > 0);
+
+    // The bundled set the other way round (Codicon primary): mono_symbols covers devicons.
+    var buf: [2048]u8 = undefined;
+    const bundled = try Fonts.init(std.testing.allocator, try FaceSet.fromDir(dir, &buf), .{ .io = io });
+    defer bundled.deinit();
+    try std.testing.expect(bundled.collection.resolve(.icon, codicon_only).?.glyph != 0);
+    for (nerd_only) |cp| try std.testing.expect(bundled.collection.resolve(.icon, cp).?.glyph != 0);
+}
+
+test "fonts: icon_fallback alone becomes the icon face; chains skip duplicate faces" {
+    const io = std.testing.io;
+    var ui_buf: [256]u8 = undefined;
+    var codicon_buf: [256]u8 = undefined;
+    const ui_path = try std.fmt.bufPrint(&ui_buf, "../assets/fonts/{s}", .{FaceSet.file_names.ui});
+    const codicon_path = try std.fmt.bufPrint(&codicon_buf, "../assets/fonts/{s}", .{FaceSet.file_names.icon});
+    const f = Fonts.init(std.testing.allocator, .{
+        .ui = .{ .path = ui_path },
+        .icon_fallback = .{ .path = codicon_path },
+    }, .{ .io = io, .optional_missing = false }) catch |err| switch (err) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    defer f.deinit();
+    try std.testing.expectEqual(@as(usize, 1), f.collection.roleChain(.icon).len);
+    try std.testing.expect(f.collection.resolve(.icon, 0xEC5E).?.glyph != 0);
 }

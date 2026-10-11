@@ -43,6 +43,7 @@ test {
     _ = @import("app/update_installer.zig");
     _ = @import("app/updater.zig");
     _ = @import("ui/command_palette.zig");
+    _ = @import("ui/font_faces.zig");
     _ = @import("ui/fuzzy_match.zig");
     _ = @import("ui/companion.zig");
     _ = @import("ui/diff_view_cache.zig");
