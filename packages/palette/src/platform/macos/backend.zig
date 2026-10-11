@@ -434,6 +434,10 @@ pub const App = struct {
         app.run_loop_default = objc.stringConstant("NSDefaultRunLoopMode") orelse objc.retain(objc.nsString("kCFRunLoopDefaultMode"));
         app.run_loop_common = objc.stringConstant("NSRunLoopCommonModes") orelse objc.retain(objc.nsString("kCFRunLoopCommonModes"));
         app.pasteboard_string = objc.stringConstant("NSPasteboardTypeString");
+        var pb_name_buf: [160]u8 = undefined;
+        if (privatePasteboardName(&pb_name_buf, options.app_id)) |name| {
+            private_pasteboard = objc.retain(send(Id, objc.class("NSPasteboard"), "pasteboardWithName:", .{objc.nsString(name)}));
+        }
 
         _ = send(objc.BOOL, ns_app, "setActivationPolicy:", .{@intFromEnum(app.policy)});
         send(void, objc.class("NSWindow"), "setAllowsAutomaticWindowTabbing:", .{objc.NO});
@@ -479,6 +483,11 @@ pub const App = struct {
         if (app.observing_theme) send(void, app.ns_app, "removeObserver:forKeyPath:", .{ app.helper, objc.nsString("effectiveAppearance") });
         if (app.owns_delegate) send(void, app.ns_app, "setDelegate:", .{@as(?Id, null)});
         objc.release(app.helper);
+        if (private_pasteboard) |pb| {
+            send(void, pb, "releaseGlobally", .{});
+            objc.release(pb);
+            private_pasteboard = null;
+        }
         g_app = null;
         app.gpa.destroy(app);
     }
@@ -943,8 +952,19 @@ fn isTestId(id: []const u8) bool {
     return std.mem.startsWith(u8, id, "palette-test");
 }
 
+/// Test apps (`palette-test*` ids) get a private named pasteboard instead of the general one,
+/// so live checks and trial runs never overwrite, or Universal-Clipboard-sync, the user's clipboard.
+var private_pasteboard: ?Id = null;
+
 fn pasteboard() Id {
+    if (private_pasteboard) |pb| return pb;
     return send(Id, objc.class("NSPasteboard"), "generalPasteboard", .{});
+}
+
+/// The private pasteboard name for a test app id, or null for a real app (general pasteboard).
+fn privatePasteboardName(buf: []u8, app_id: []const u8) ?[]const u8 {
+    if (!isTestId(app_id)) return null;
+    return std.fmt.bufPrint(buf, "{s}.pasteboard", .{app_id}) catch "palette-test.pasteboard";
 }
 
 /// MIME type -> pasteboard type (UTI). Unknown strings pass through (callers may give a UTI).
@@ -1784,6 +1804,14 @@ const Helper = struct {
         return objc.NO;
     }
 };
+
+test "test app ids use a private pasteboard" {
+    var buf: [160]u8 = undefined;
+    try std.testing.expectEqualStrings("palette-test-verde.pasteboard", privatePasteboardName(&buf, "palette-test-verde").?);
+    try std.testing.expect(privatePasteboardName(&buf, "dev.verde.Verde") == null);
+    var small: [8]u8 = undefined;
+    try std.testing.expectEqualStrings("palette-test.pasteboard", privatePasteboardName(&small, "palette-test-long-id").?);
+}
 
 test "clipboard MIME types map to UTIs" {
     try std.testing.expectEqualStrings("public.png", utiForMime("image/png"));
