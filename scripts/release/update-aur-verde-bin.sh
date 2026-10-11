@@ -64,7 +64,19 @@ fi
 cp "${PKGBUILD}" "${ORIGINAL_PKGBUILD}"
 cp "${SRCINFO}" "${ORIGINAL_SRCINFO}"
 
-REQUIRED_DEPENDS=(
+# Canonical runtime dependencies. The GUI (Palette) is pure Zig and dlopens
+# Vulkan; the WPE browser helper links WPE WebKit, libsoup, GLib and EGL/GLES;
+# libfff_c links zlib and libgcc_s. The whole depends array is rewritten from
+# this list so dependencies dropped upstream (SDL3, freetype, X11, ...) also
+# disappear from the AUR package.
+DEPENDS=(
+  "gcc-libs"
+  "glibc"
+  "zlib"
+  "vulkan-icd-loader"
+  "glib2"
+  "libglvnd"
+  "libsoup3"
   "libwpe"
   "wpebackend-fdo"
   "wpewebkit"
@@ -73,29 +85,21 @@ REQUIRED_DEPENDS=(
 sed -i -E "s/^pkgver=.*/pkgver=${VERSION}/" "${PKGBUILD}"
 sed -i -E "/^sha256sums=\(/,/^\)/c\\sha256sums=(\\n  '${LINUX_SHA}'\\n  '${LICENSE_SHA}'\\n)" "${PKGBUILD}"
 
-awk '
-  /^depends=\(/ { in_depends = 1 }
-  in_depends && /'\''zenity'\''/ { next }
-  /^\)/ && in_depends {
-    in_depends = 0
+depends_list="$(printf '%s\n' "${DEPENDS[@]}")"
+awk -v deps="${depends_list}" '
+  /^depends=\(/ {
+    print "depends=("
+    n = split(deps, list, "\n")
+    for (i = 1; i <= n; i++) if (list[i] != "") print "  '\''" list[i] "'\''"
+    print ")"
+    skipping = 1
+    next
   }
+  skipping && /^\)/ { skipping = 0; next }
+  skipping { next }
   { print }
 ' "${PKGBUILD}" > "${PKGBUILD}.tmp"
 mv "${PKGBUILD}.tmp" "${PKGBUILD}"
-
-for dep in "${REQUIRED_DEPENDS[@]}"; do
-  if ! grep -Fq "'${dep}'" "${PKGBUILD}"; then
-    awk -v dep="${dep}" '
-      /^\)/ && in_depends {
-        print "  '\''" dep "'\''"
-        in_depends = 0
-      }
-      /^depends=\(/ { in_depends = 1 }
-      { print }
-    ' "${PKGBUILD}" > "${PKGBUILD}.tmp"
-    mv "${PKGBUILD}.tmp" "${PKGBUILD}"
-  fi
-done
 
 if ! grep -Fq "'zenity: native folder picker integration'" "${PKGBUILD}"; then
   awk '
@@ -193,27 +197,23 @@ awk \
   ' "${SRCINFO}" > "${SRCINFO}.tmp"
 mv "${SRCINFO}.tmp" "${SRCINFO}"
 
-awk '
-  $0 == "\tdepends = zenity" { next }
+awk -v deps="${depends_list}" '
+  /^\tdepends = / {
+    if (!inserted) {
+      n = split(deps, list, "\n")
+      for (i = 1; i <= n; i++) if (list[i] != "") print "\tdepends = " list[i]
+      inserted = 1
+    }
+    next
+  }
+  /^\toptdepends = / && !inserted {
+    n = split(deps, list, "\n")
+    for (i = 1; i <= n; i++) if (list[i] != "") print "\tdepends = " list[i]
+    inserted = 1
+  }
   { print }
 ' "${SRCINFO}" > "${SRCINFO}.tmp"
 mv "${SRCINFO}.tmp" "${SRCINFO}"
-
-for dep in "${REQUIRED_DEPENDS[@]}"; do
-  if ! grep -Fq $'\tdepends = '"${dep}" "${SRCINFO}"; then
-    awk -v dep="${dep}" '
-      /^\toptdepends = / && !inserted {
-        print "\tdepends = " dep
-        inserted = 1
-      }
-      { print }
-      END {
-        if (!inserted) print "\tdepends = " dep
-      }
-    ' "${SRCINFO}" > "${SRCINFO}.tmp"
-    mv "${SRCINFO}.tmp" "${SRCINFO}"
-  fi
-done
 
 if ! grep -Fq $'\toptdepends = zenity: native folder picker integration' "${SRCINFO}"; then
   awk '

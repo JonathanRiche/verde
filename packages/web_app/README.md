@@ -2,7 +2,7 @@
 
 The Verde web client is a Solid + Vite SPA with a small Zig HTTP/WebSocket gateway. `verde-web` is a detached client of the GUI-free session daemon; the desktop app does not need to be running.
 
-The desktop remains the native Palette/SDL client. This package owns browser presentation, focus, and rendering. The session daemon owns workspaces, transcripts, turns, and PTYs.
+The desktop remains the native Palette client. This package owns browser presentation, focus, and rendering. The session daemon owns workspaces, transcripts, turns, and PTYs.
 
 ## Layout
 

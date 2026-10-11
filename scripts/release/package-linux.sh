@@ -164,8 +164,6 @@ install -m 755 "$PREFIX_DIR/bin/verde-server" "$PACKAGE_ROOT/bin/verde-server"
 install -m 755 "$PREFIX_DIR/bin/verde-daemon" "$PACKAGE_ROOT/bin/verde-daemon"
 install -m 755 "$PREFIX_DIR/bin/verde-web" "$PACKAGE_ROOT/bin/verde-web"
 install -m 755 "$PREFIX_DIR/bin/libfff_c.so" "$PACKAGE_ROOT/bin/libfff_c.so"
-install -m 755 "$PREFIX_DIR/bin/libSDL3.so" "$PACKAGE_ROOT/bin/libSDL3.so"
-copy_runtime_library "libSDL3_ttf.so" "$PACKAGE_ROOT/bin"
 if [[ -x "$PREFIX_DIR/bin/verde-browser-linux" ]]; then
   install -m 755 "$PREFIX_DIR/bin/verde-browser-linux" "$PACKAGE_ROOT/bin/verde-browser-linux"
 fi
@@ -190,8 +188,6 @@ normalize_fff_dependency \
 
 strip_debug_symbols "$PACKAGE_ROOT/bin/verde"
 strip_debug_symbols "$PACKAGE_ROOT/bin/verde-gui"
-strip_debug_symbols "$PACKAGE_ROOT/bin/libSDL3.so"
-strip_debug_symbols "$PACKAGE_ROOT/bin/libSDL3_ttf.so"
 strip_debug_symbols "$PACKAGE_ROOT/bin/verde-browser-linux"
 strip_debug_symbols "$PACKAGE_ROOT/bin/libfff_c.so"
 

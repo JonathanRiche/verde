@@ -64,14 +64,14 @@ exit 90
             installed = root / 'installed'
             package.mkdir()
             installed.mkdir()
-            (package / 'libSDL3_ttf.so.0').write_bytes(b'new library')
-            target = installed / 'libSDL3_ttf.so.0'
+            (package / 'libexample.so.0').write_bytes(b'new library')
+            target = installed / 'libexample.so.0'
             target.write_bytes(b'old library')
             # An open descriptor retains the inode just as a running loader does.
             with target.open('rb') as running_library:
                 result = subprocess.run(
                     ['bash', '-c', 'copy_glob_if_present() {' + function + '\n}\ncopy_glob_if_present "$1" "$2"',
-                     'test', str(package / 'libSDL3_ttf.so*'), str(installed)],
+                     'test', str(package / 'libexample.so*'), str(installed)],
                     capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(running_library.read(), b'old library')

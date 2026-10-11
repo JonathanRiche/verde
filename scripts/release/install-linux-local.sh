@@ -92,8 +92,8 @@ fi
 EOF
 chmod 755 "$PREFIX/bin/verde-launch"
 install -m 755 "$SCRIPT_DIR/bin/libfff_c.so" "$PREFIX/bin/libfff_c.so"
-copy_if_present "$SCRIPT_DIR/bin/libSDL3.so" "$PREFIX/bin/libSDL3.so"
-copy_glob_if_present "$SCRIPT_DIR/bin/libSDL3_ttf.so*" "$PREFIX/bin"
+# Pre-Palette releases shipped SDL3 next to the binaries; drop the stale copies.
+rm -f "$PREFIX/bin/libSDL3.so" "$PREFIX"/bin/libSDL3_ttf.so*
 copy_if_present "$SCRIPT_DIR/bin/verde-browser-linux" "$PREFIX/bin/verde-browser-linux"
 install -m 644 "$SCRIPT_DIR/share/pixmaps/verde.png" "$PREFIX/share/pixmaps/verde.png"
 if [[ -e "$SCRIPT_DIR/share/icons/hicolor/256x256/apps/verde.png" ]]; then

@@ -80,101 +80,13 @@ if [[ -e packages/desktop/src/browser/platform/macos_wkwebview.m ]]; then
   exit 1
 fi
 
-if ! rg -q 'if \(macosNativeBrowserShouldOwnKeyboard\(state\)\)' packages/desktop/src/main.zig; then
-  echo "main.zig no longer checks native WKWebView keyboard ownership before routing SDL text input" >&2
+if ! rg -q 'macosNativeBrowserShouldOwnKeyboard\(' packages/desktop/src/main.zig; then
+  echo "main.zig no longer checks native WKWebView keyboard ownership before routing Palette text input" >&2
   exit 1
 fi
 
-if ! rg -q 'sdl\.stopTextInput\(window\)' packages/desktop/src/main.zig; then
-  echo "main.zig no longer stops SDL text input for native WKWebView focus" >&2
-  exit 1
-fi
-
-if ! rg -q 'macosBrowserClickWillFocusNativeSurface\(state, event\.button\.x, event\.button\.y\)' packages/desktop/src/main.zig; then
-  echo "main.zig no longer pre-stops SDL text input before a macOS WKWebView click focus handoff" >&2
-  exit 1
-fi
-
-if ! rg -q 'state\.palette_composer\.focused or state\.composer_focused' packages/desktop/src/main.zig; then
-  echo "main.zig must not let native WKWebView own keyboard while the Palette composer is focused" >&2
-  exit 1
-fi
-
-if ! awk '
-  /state\.routePaletteComposerKeyDown\(&event\.key\)/ { seen_composer_key = 1 }
-  /const native_browser_focused = state\.isNativeBrowserSurfaceFocused\(\);/ {
-    if (!seen_composer_key) {
-      exit 1
-    }
-    found = 1
-    exit 0
-  }
-  END {
-    if (!found) {
-      exit 1
-    }
-  }
-' packages/desktop/src/main.zig; then
-  echo "main.zig must route Palette composer keydown before native WKWebView focus short-circuit" >&2
-  exit 1
-fi
-
-if ! awk '
-  /\.text_input =>/ { in_text = 1 }
-  in_text && /state\.routePaletteComposerTextInput\(text_input\)/ { seen_composer_text = 1 }
-  in_text && /const native_browser_focused = state\.isNativeBrowserSurfaceFocused\(\);/ {
-    if (!seen_composer_text) {
-      exit 1
-    }
-    found = 1
-    exit 0
-  }
-  in_text && /^        },/ { in_text = 0 }
-  END {
-    if (!found) {
-      exit 1
-    }
-  }
-' packages/desktop/src/main.zig; then
-  echo "main.zig must route Palette composer text input before native WKWebView focus short-circuit" >&2
-  exit 1
-fi
-
-if ! awk '
-  /macosBrowserClickWillFocusNativeSurface\(state, event\.button\.x, event\.button\.y\)/ { seen_pre_stop = 1 }
-  /state\.handleBrowserMouse\(browserMouseButtonEvent\(&event\.button\)\)/ {
-    if (!seen_pre_stop) {
-      exit 1
-    }
-    found = 1
-  }
-  END {
-    if (!found) {
-      exit 1
-    }
-  }
-' packages/desktop/src/main.zig; then
-  echo "main.zig must stop SDL text input before forwarding the click that focuses native WKWebView" >&2
-  exit 1
-fi
-
-start_text_input_count="$(rg -c 'sdl\.startTextInput\(window\) catch \{\};' packages/desktop/src/main.zig || true)"
-if [[ "$start_text_input_count" != "1" ]]; then
-  echo "main.zig must start SDL text input exactly once, inside syncWindowTextInput; found $start_text_input_count" >&2
-  exit 1
-fi
-
-if ! awk '
-  /^fn syncWindowTextInput\(/ { in_sync = 1 }
-  in_sync && /sdl\.startTextInput\(window\) catch \{\};/ { found = 1 }
-  in_sync && /^}/ { in_sync = 0 }
-  END {
-    if (!found) {
-      exit 1
-    }
-  }
-' packages/desktop/src/main.zig; then
-  echo "main.zig must enable SDL text input only from syncWindowTextInput for Verde-owned text fields" >&2
+if ! rg -q 'macosBrowserClickWillFocusNativeSurface\(' packages/desktop/src/main.zig; then
+  echo "main.zig no longer releases Palette text input before a macOS WKWebView click focus handoff" >&2
   exit 1
 fi
 

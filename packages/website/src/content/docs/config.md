@@ -429,7 +429,7 @@ Verde Legacy, including wallpapers.
 
 ## State files
 
-App state is saved through SDL's pref path in `state.sqlite`. Discover the
+App state is saved in `state.sqlite` under Verde's per-user data directory. Discover the
 exact path on your machine with:
 
 ```bash
@@ -449,7 +449,7 @@ See [CLI reference](/docs/cli) for the full state command surface.
 
 ## Logs
 
-Verde writes runtime logs under SDL's platform pref path. Discover the exact
+Verde writes runtime logs under its per-user data directory. Discover the exact
 directory on your machine with `verde state path --json`. On Linux, the usual
 paths are:
 
@@ -467,8 +467,7 @@ Main third-party components used by the desktop app:
 - `@anthropic-ai/claude-agent-sdk` for Claude Code provider integration.
 - `fff.nvim` / `fff-c` / `fff-search` for fast file indexing and search, vendored in [`vendor/fff`](https://github.com/JonathanRiche/verde/tree/master/vendor/fff). License: MIT.
 - Ghostty / `libghostty-vt` for terminal emulation and VT parsing. License: MIT.
-- `zsdl` from `zig-gamedev` for Zig bindings to SDL3. License: MIT.
-- SDL3 from libsdl-org for windowing, input, display integration, and rendering support.
+- Palette, Verde's in-repo Zig UI toolkit, for windowing, input, display integration, fonts, and GPU rendering, vendored in [`packages/palette`](https://github.com/JonathanRiche/verde/tree/master/packages/palette).
 - `zqlite` by Karl Seguin for SQLite access. License: MIT-style.
 - `zig_dif` and `zig_markdown` for chat markdown and code rendering.
 - `stb_image` by Sean Barrett and contributors for image decoding, vendored in [`vendor/stb_image.h`](https://github.com/JonathanRiche/verde/blob/master/vendor/stb_image.h). License: public domain or MIT.

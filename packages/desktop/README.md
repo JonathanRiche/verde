@@ -103,7 +103,7 @@ Requests run against the project directory selected in Verde. If prompt sending 
 
 ## State And Config
 
-App state is stored in `state.sqlite` under the per-user data dir (the path SDL's pref path used to resolve to, e.g. `~/.local/share/verde/Native` on Linux). User config is loaded from:
+App state is stored in `state.sqlite` under the per-user data dir (e.g. `~/.local/share/verde/Native` on Linux). User config is loaded from:
 
 - `$XDG_CONFIG_HOME/verde/verde.json`
 - `~/.config/verde/verde.json`

@@ -40,45 +40,23 @@ jobs:
         shell: bash
         run: |
           apt-get update
+          # Palette (the GUI toolkit) is pure Zig: it speaks Wayland/Win32/AppKit
+          # directly and dlopens Vulkan, so only the WPE browser helper and the
+          # fff bindgen step need system development packages.
           apt-get install -y \
             build-essential \
             ca-certificates \
             clang \
-            cmake \
             curl \
             g++ \
             git \
-            libasound2-dev \
-            libatk1.0-dev \
-            libatspi2.0-dev \
-            libcairo2-dev \
-            libcups2-dev \
-            libdbus-1-dev \
-            libdrm-dev \
+            libclang-dev \
             libegl-dev \
-            libfreetype-dev \
-            libgbm-dev \
-            libgl1-mesa-dev \
             libgles-dev \
             libglib2.0-dev \
-            libharfbuzz-dev \
             libjavascriptcoregtk-6.0-dev \
-            libnspr4-dev \
-            libnss3-dev \
-            libtree-sitter-dev \
-            libwayland-dev \
             libwpebackend-fdo-1.0-dev \
             libwpewebkit-2.0-dev \
-            libxcomposite-dev \
-            libxdamage-dev \
-            libxext-dev \
-            libxfixes-dev \
-            libxi-dev \
-            libxkbcommon-dev \
-            libxrandr-dev \
-            libxrender-dev \
-            libclang-dev \
-            ninja-build \
             patchelf \
             pkg-config \
             python3 \
@@ -259,13 +237,6 @@ jobs:
       - name: Install Node runtime dependencies
         shell: bash
         run: bun install --frozen-lockfile --production
-
-      - name: Install macOS dependencies
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 brew install tree-sitter
-          echo "HOMEBREW_PREFIX=$(brew --prefix)" >> "$GITHUB_ENV"
 
       - name: Compute release version
         shell: bash

@@ -176,7 +176,7 @@ a visible monitor the absolute numbers will be higher for both.
 - `measureText` is advance-based. No IME candidate rect is sent to the compositor.
 - On Wayland the system theme is unknown, so Verde falls back to dark.
 - Intermediate commits don't build on their own; the branch head does.
-- CI may need a `wpe-platform-2.0` package. Windows bootstrap scripts still fetch SDL.
+- CI may need a `wpe-platform-2.0` package. Release CI and packaging no longer install or bundle SDL3/SDL3_ttf/freetype/harfbuzz.
 - The helper sources keep their upstream SDL comments so re-syncs stay byte-identical.
 - Hidden or background browser runtimes don't drain the frame socket. The helper holds up to 8
   frames, then falls back to shm.

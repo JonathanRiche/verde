@@ -1,7 +1,7 @@
 # Native UI
 
-- SDL3 owns windows, events, logical size, drawable pixels, and display scale; SDL_GPU renders; Palette owns layout and batches. This is not HTML/CSS or ImGui.
-- `main.zig` coordinates sizing/events; `palette_frame_renderer.zig` owns rendering/fonts. Inspect `window.getSize`,  `SDL_GetWindowSizeInPixels`, and `SDL_GetWindowDisplayScale` before adding scale factors. Layout, commands, and renderer must share a coordinate space; render against drawable pixels.
+- Palette owns everything: windows, events, logical size, drawable pixels, and display scale (Wayland/Win32/AppKit backends), GPU rendering (Vulkan/D3D11/Metal), layout, and batches. This is not HTML/CSS, ImGui, or SDL.
+- `main.zig` coordinates sizing/events; `palette_frame_renderer.zig` owns rendering/fonts. Inspect `window.logicalSize()`, `window.pixelSize()`, and `window.scale()` before adding scale factors. Layout, commands, and renderer must share a coordinate space; render against drawable pixels.
 - Use explicit `palette.Rect`s, shared spacing, measured text, and clamped ratios. Name unusual geometry tokens. Never guess character widths for truncation or caret placement.
 - Borders, rings, and dividers follow [Palette's crisp-chrome rules](../../../palette/AGENTS.md): whole-pixel strokes, edge-snapped rects, one `panel` command per bordered surface.
 - Start render methods with a short region comment; explain non-obvious geometry. For major changes check wide, laptop, short-height, and differing-scale layouts in the real app with screenshots, subject to root session-safety rules.

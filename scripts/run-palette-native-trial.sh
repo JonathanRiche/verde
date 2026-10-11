@@ -71,7 +71,7 @@ if [[ $real_data == 1 ]]; then
   ls -1t "$backup_dir"/state.sqlite.* 2>/dev/null | tail -n +3 | xargs -r rm -f --
   # Drop terminal-inherited Verde env (surface ids, endpoints of the closed GUI).
   unset_vars=()
-  while IFS= read -r name; do unset_vars+=(-u "$name"); done < <(env | sed -n 's/^\(VERDE_[A-Z0-9_]*\|HERDR_[A-Z0-9_]*\|SDL_[A-Z0-9_]*\)=.*/\1/p')
+  while IFS= read -r name; do unset_vars+=(-u "$name"); done < <(env | sed -n 's/^\(VERDE_[A-Z0-9_]*\|HERDR_[A-Z0-9_]*\)=.*/\1/p')
   echo "data dir:      $real_pref (real Verde data, shared with the running daemon)"
   echo "app id:        verde-palette-trial"
   # No process-group cleanup here: HOME is the real one. Only the GUI is ours.
@@ -119,7 +119,7 @@ unset_vars=()
 while IFS= read -r name; do
   case "$name" in VERDE_PALETTE_INJECT|VERDE_PALETTE_SNAPSHOT|VERDE_PALETTE_STATS|VERDE_SESSION_DAEMON_CHAT_STUB) continue ;; esac
   unset_vars+=(-u "$name")
-done < <(env | sed -n 's/^\(VERDE_[A-Z0-9_]*\|HERDR_[A-Z0-9_]*\|SDL_[A-Z0-9_]*\)=.*/\1/p')
+done < <(env | sed -n 's/^\(VERDE_[A-Z0-9_]*\|HERDR_[A-Z0-9_]*\)=.*/\1/p')
 
 echo "trial root:    $root"
 echo "data dir:      $data"

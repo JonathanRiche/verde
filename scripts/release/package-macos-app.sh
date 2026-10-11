@@ -126,7 +126,6 @@ install -m 755 "$PREFIX_DIR/bin/verde-server" "$APP_DIR/Contents/MacOS/verde-ser
 install -m 755 "$PREFIX_DIR/bin/verde-daemon" "$APP_DIR/Contents/MacOS/verde-daemon"
 install -m 755 "$PREFIX_DIR/bin/verde-web" "$APP_DIR/Contents/MacOS/verde-web"
 install -m 755 "$PREFIX_DIR/bin/libfff_c.dylib" "$APP_DIR/Contents/MacOS/libfff_c.dylib"
-ditto "$PREFIX_DIR/bin/SDL3.framework" "$APP_DIR/Contents/MacOS/SDL3.framework"
 install -m 644 "$PREFIX_DIR/share/verde/provider_bridge.mjs" "$APP_DIR/Contents/Resources/provider_bridge.mjs"
 install -m 644 "$PREFIX_DIR/share/verde/provider_bridge.mjs" "$APP_DIR/Contents/share/verde/provider_bridge.mjs"
 cp -a "$PREFIX_DIR/share/verde/web" "$APP_DIR/Contents/share/verde/web"

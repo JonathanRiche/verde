@@ -9,7 +9,7 @@ slug: cli
 ## Overview
 
 `verde` is both the desktop launcher and a CLI for reading persisted state and
-controlling a running app. CLI-only commands run before SDL startup, so you can
+controlling a running app. CLI-only commands run before any window opens, so you can
 use them from scripts without opening a window.
 
 ```bash
@@ -134,7 +134,7 @@ verde state threads --project <id|index|path|current> [--json]
 verde state transcript --project <id|index|path|current> --thread <index|provider-id> [--json]
 ```
 
-- `path` prints the SDL pref path and `state.sqlite` location.
+- `path` prints the per-user data directory and `state.sqlite` location.
 - `workspaces` lists imported projects and the selected workspace. `projects`
   remains an alias for compatibility.
 - `panes` prints the saved workspace layout and terminal dock state for a project.

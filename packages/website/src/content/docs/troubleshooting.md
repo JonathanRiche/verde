@@ -123,8 +123,8 @@ open until the installer finishes. You can also use the install command on the
 
 ## Source-build errors
 
-Source builds require Zig `0.16.0` and SDL3 development files for your
-platform. The default browser backend uses the host platform webview instead
+Source builds require Zig `0.16.0`; the UI toolkit is pure Zig, so no
+windowing or font libraries are needed. The default browser backend uses the host platform webview instead
 of bundled Chromium. Linux builds also require WPE WebKit development
 packages. The supported invocation from the repo root is:
 
@@ -151,7 +151,7 @@ bash ./scripts/release/install-linux-local.sh
 
 ## Reading the runtime logs
 
-Verde writes runtime logs under SDL's platform pref path. On Linux, the usual
+Verde writes runtime logs under its per-user data directory. On Linux, the usual
 paths are:
 
 - `~/.local/share/verde/Native/logs/verde.stderr.log`
