@@ -4737,6 +4737,8 @@ test "Mission Control routes independent and narrow direct scroll without sideca
 
     var state: runtime.AppState = undefined;
     state.allocator = std.testing.allocator;
+    // handleWheel gates on the config; leaving it undefined read stale stack bytes.
+    state.app_config = .{ .companion_enabled = true };
     state.lifecycle = .{};
     state.companion_controller = controller.init();
     state.companion_composer = @TypeOf(state.companion_composer).init();
