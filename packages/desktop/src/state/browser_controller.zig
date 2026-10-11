@@ -243,6 +243,8 @@ pub const State = struct {
     address_selection_anchor: ?usize = null,
     address_drag_active: bool = false,
     inspector_menu_open: bool = false,
+    /// The toolbar's "..." menu, drawn over the top of the page.
+    toolbar_overflow_open: bool = false,
     context_menu_open: bool = false,
     context_menu_is_option: bool = false,
     context_menu_anchor_x: f32 = 0.0,
@@ -1724,6 +1726,7 @@ pub fn browserBlockedByPaletteOverlay(self: anytype) bool {
         self.transcript_controller.selection_text != null or
         self.palette_modal_text_focus != .none or
         self.browser_controller.inspector_menu_open or
+        self.browser_controller.toolbar_overflow_open or
         addressSuggestionsBlockBrowser(self) or
         self.workspace_header_open_menu_open or
         self.sidebar_context_menu_open or
@@ -3984,6 +3987,7 @@ test "native browser surfaces hide under every centered Palette modal" {
         "runtime_connections.wizard_open",
         "runtime_credential_profile_id != null",
         "runtime_pin_proposal != null",
+        "browser_controller.toolbar_overflow_open",
     }) |flag| {
         try std.testing.expect(std.mem.indexOf(u8, body, flag) != null);
     }

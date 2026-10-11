@@ -105,7 +105,6 @@ var tab_drag_source: ?usize = null;
 var tab_drag_target: ?usize = null;
 var tab_drag_start_x: f32 = 0.0;
 var tab_drag_active = false;
-var toolbar_overflow_open = false;
 var palette_overflow_menu_rect: palette.Rect = .{};
 
 const BrowserOverflowAction = union(enum) {
@@ -254,7 +253,7 @@ pub fn wantsPointerAt(state: *app_state.AppState, x: f32, y: f32) bool {
     if (!state.isBrowserVisible()) return false;
 
     if (browser_history_controller.browserSuggestionsVisible(state) and suggestionRowAtPoint(x, y) != null) return true;
-    if (toolbar_overflow_open and rectContainsPoint(palette_overflow_menu_rect, x, y)) return true;
+    if (state.browser_controller.toolbar_overflow_open and rectContainsPoint(palette_overflow_menu_rect, x, y)) return true;
 
     var index = palette_hit_count;
     while (index > 0) {
@@ -349,16 +348,16 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down
         }
     }
 
-    if (toolbar_overflow_open) {
+    if (state.browser_controller.toolbar_overflow_open) {
         if (!down) return rectContainsPoint(palette_overflow_menu_rect, x, y) or rectContainsPoint(palette_toolbar_rect, x, y);
         if (overflowActionAtPoint(x, y)) |hit| {
             if (hit.enabled) activateOverflowAction(state, hit.action);
-            toolbar_overflow_open = false;
+            state.browser_controller.toolbar_overflow_open = false;
             state.noteInteraction();
             return true;
         }
         if (rectContainsPoint(palette_overflow_menu_rect, x, y)) return true;
-        toolbar_overflow_open = false;
+        state.browser_controller.toolbar_overflow_open = false;
     }
 
     if (state.browser_controller.context_menu_open) {
@@ -494,7 +493,7 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down
             .copy_url => copyCurrentUrl(state),
             .open_external => state.openCurrentBrowserUrlExternally(),
             .overflow => {
-                toolbar_overflow_open = !toolbar_overflow_open;
+                state.browser_controller.toolbar_overflow_open = !state.browser_controller.toolbar_overflow_open;
                 state.browser_controller.inspector_menu_open = false;
             },
             .security_info => state.setSidebarNotice(browserSecurityNotice(state.browserState().current_url)),
@@ -1088,7 +1087,7 @@ fn renderToolbar(state: *app_state.AppState, dock_rect: palette.Rect, right_rese
         .w = button_size,
         .h = button_size,
     };
-    renderCompactIconButton(state, overflow_rect, NF_COD_ELLIPSIS, rectHovered(overflow_rect) or toolbar_overflow_open, false);
+    renderCompactIconButton(state, overflow_rect, NF_COD_ELLIPSIS, rectHovered(overflow_rect) or state.browser_controller.toolbar_overflow_open, false);
     addPaletteHit(overflow_rect, .overflow);
 
     const tabs_x = new_tab_rect.x + new_tab_rect.w + gap;
@@ -1229,7 +1228,7 @@ fn renderToolbar(state: *app_state.AppState, dock_rect: palette.Rect, right_rese
     } else {
         state.browser_controller.inspector_menu_open = false;
     }
-    if (toolbar_overflow_open) renderToolbarOverflowMenu(state, overflow_rect, show_copy, show_external, show_inspector);
+    if (state.browser_controller.toolbar_overflow_open) renderToolbarOverflowMenu(state, overflow_rect, show_copy, show_external, show_inspector);
 }
 
 /// Draws a tab title ellipsized to `rect.w` and clipped to `rect`, so long
@@ -1425,7 +1424,7 @@ fn activateOverflowAction(state: *app_state.AppState, action: BrowserOverflowAct
 }
 
 fn renderToolbarTooltip(state: *app_state.AppState) void {
-    if (toolbar_overflow_open or state.browser_controller.inspector_menu_open or state.browser_controller.context_menu_open) return;
+    if (state.browser_controller.toolbar_overflow_open or state.browser_controller.inspector_menu_open or state.browser_controller.context_menu_open) return;
     var index = palette_hit_count;
     while (index > 0) {
         index -= 1;
