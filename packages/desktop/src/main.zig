@@ -248,7 +248,7 @@ fn mainInner(init: std.process.Init) !void {
         log.info("runtime stderr redirected to {s}", .{path});
     }
 
-    const initial_window_frame = initialWindowFrame(app);
+    const initial_window_frame = windowFrameOverrideFromEnv() orelse initialWindowFrame(app);
     const window = try app.createWindow(.{
         .title = "verde",
         .width = @intCast(initial_window_frame.w),
@@ -3851,4 +3851,40 @@ fn attachRuntimeService(app: *AppState, allocator: std.mem.Allocator, io: std.Io
         null;
     errdefer if (integration) |value| value.release_owner(value.context);
     try app.attachRuntimeServiceWithIntegration(io, integration);
+}
+
+/// Dev hook for isolated trials on a shared desktop (e.g. a Mac with a person
+/// at the console): `VERDE_PALETTE_WINDOW=WxH[+X+Y]` opens a small window at a
+/// fixed spot instead of one sized to the work area.
+fn windowFrameOverrideFromEnv() ?WindowFrame {
+    const value = std.c.getenv("VERDE_PALETTE_WINDOW") orelse return null;
+    return parseWindowFrameOverride(std.mem.sliceTo(value, 0));
+}
+
+/// Parses `WxH` or `WxH+X+Y` (logical units). Null when malformed.
+fn parseWindowFrameOverride(spec: []const u8) ?WindowFrame {
+    var parts = std.mem.splitScalar(u8, spec, '+');
+    const size = parts.next() orelse return null;
+    const x_index = std.mem.indexOfScalar(u8, size, 'x') orelse return null;
+    const w = std.fmt.parseInt(c_int, size[0..x_index], 10) catch return null;
+    const h = std.fmt.parseInt(c_int, size[x_index + 1 ..], 10) catch return null;
+    if (w < 200 or h < 150) return null;
+    const x = if (parts.next()) |text| std.fmt.parseInt(c_int, text, 10) catch return null else 0;
+    const y = if (parts.next()) |text| std.fmt.parseInt(c_int, text, 10) catch return null else 0;
+    if (parts.next() != null) return null;
+    return .{ .x = x, .y = y, .w = w, .h = h };
+}
+
+test "window frame override parses size and optional position" {
+    const sized = parseWindowFrameOverride("900x600").?;
+    try std.testing.expectEqual(@as(c_int, 900), sized.w);
+    try std.testing.expectEqual(@as(c_int, 600), sized.h);
+    try std.testing.expectEqual(@as(c_int, 0), sized.x);
+    const placed = parseWindowFrameOverride("960x640+40+60").?;
+    try std.testing.expectEqual(@as(c_int, 40), placed.x);
+    try std.testing.expectEqual(@as(c_int, 60), placed.y);
+    try std.testing.expect(parseWindowFrameOverride("") == null);
+    try std.testing.expect(parseWindowFrameOverride("900") == null);
+    try std.testing.expect(parseWindowFrameOverride("10x10") == null);
+    try std.testing.expect(parseWindowFrameOverride("900x600+1+2+3") == null);
 }
