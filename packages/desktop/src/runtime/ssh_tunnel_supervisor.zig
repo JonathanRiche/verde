@@ -388,11 +388,14 @@ fn runSystem(
     while (!control.stopRequested()) {
         var select_buffer: [2]AcceptResult = undefined;
         var select = std.Io.Select(AcceptResult).init(io, &select_buffer);
-        select.async(.connection, std.Io.net.Server.accept, .{ &listener, io });
-        select.async(.stop, waitForListenerStop, .{ io, control });
         // accept can return an owned Stream, so cancellation must inspect and
         // close a raced result instead of discarding it.
         defer cancelAcceptSelect(&select, io);
+        // `concurrent`, not `async`: when the pool is at its async limit
+        // (CPU count - 1), `async` runs the task inline, and an inline
+        // accept/stop-poll never returns to this loop.
+        select.concurrent(.connection, std.Io.net.Server.accept, .{ &listener, io }) catch return .{ .failed = .wait };
+        select.concurrent(.stop, waitForListenerStop, .{ io, control }) catch return .{ .failed = .wait };
 
         const selected = select.await() catch return .{ .failed = .wait };
         switch (selected) {
@@ -610,24 +613,28 @@ fn pumpRelayStreams(
     };
     var select_buffer: [4]RelayResult = undefined;
     var select = std.Io.Select(RelayResult).init(io, &select_buffer);
-    select.async(.request, streamBounded, .{
+    var select_active = true;
+    defer if (select_active) select.cancelDiscard();
+    // Every arm blocks, so each needs its own unit of concurrency. `async`
+    // degrades to an inline call once the pool reaches its async limit
+    // (CPU count - 1, i.e. 3 on a 4-core machine), and an inline stop poll
+    // spins until the tunnel is stopped.
+    try select.concurrent(.request, streamBounded, .{
         request_reader,
         request_writer,
         RELAY_DIRECTION_MAX_BYTES,
     });
-    select.async(.response, streamBounded, .{
+    try select.concurrent(.response, streamBounded, .{
         response_reader,
         response_writer,
         RELAY_DIRECTION_MAX_BYTES,
     });
-    select.async(.timeout, std.Io.sleep, .{
+    try select.concurrent(.timeout, std.Io.sleep, .{
         io,
         std.Io.Duration.fromMilliseconds(timeout_ms),
         .awake,
     });
-    select.async(.stop, waitForStopRequested, .{ io, control });
-    var select_active = true;
-    defer if (select_active) select.cancelDiscard();
+    try select.concurrent(.stop, waitForStopRequested, .{ io, control });
 
     while (true) {
         const selected = try select.await();
@@ -975,13 +982,17 @@ test "response completion cancels a client request that keeps its write side ope
 }
 
 fn expectPumpCanceledBy(stop_immediately: bool) !void {
+    try expectPumpCanceledByOn(std.testing.io, stop_immediately);
+}
+
+fn expectPumpCanceledByOn(io: std.Io, stop_immediately: bool) !void {
     var shared = testShared();
     if (stop_immediately) shared.stop_requested.store(true, .release);
     const control: Control = .{ .shared = &shared };
     var request_reader: BlockingReader = .{};
-    request_reader.init(std.testing.io);
+    request_reader.init(io);
     var response_reader: BlockingReader = .{};
-    response_reader.init(std.testing.io);
+    response_reader.init(io);
     var request_buffer: [8]u8 = undefined;
     var response_buffer: [8]u8 = undefined;
     var request_writer: std.Io.Writer.Discarding = .init(&request_buffer);
@@ -989,7 +1000,7 @@ fn expectPumpCanceledBy(stop_immediately: bool) !void {
     var request_completed: std.atomic.Value(bool) = .init(false);
 
     const result = pumpRelayStreams(
-        std.testing.io,
+        io,
         &request_reader.interface,
         &request_writer.writer,
         &response_reader.interface,
@@ -1010,6 +1021,14 @@ fn expectPumpCanceledBy(stop_immediately: bool) !void {
 
 test "relay timeout cancels both stream operations before cleanup" {
     try expectPumpCanceledBy(false);
+}
+
+test "relay timeout fires when the pool has no async capacity left" {
+    // Regression: with `Select.async`, a saturated pool ran each arm inline,
+    // so the stop poll spun forever (hung on a 4-core Windows VM).
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{ .async_limit = .nothing });
+    defer threaded.deinit();
+    try expectPumpCanceledByOn(threaded.io(), false);
 }
 
 test "relay stop cancels both stream operations before cleanup" {
