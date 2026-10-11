@@ -1845,12 +1845,12 @@ fn renderAddressSuggestions(state: *app_state.AppState) void {
     const row_h = theme.scaledUi(context_menu.ROW_HEIGHT_UI);
     const pad = theme.scaledUi(context_menu.PAD_UI);
     const anchor = address_hit.rect;
-    const panel = context_menu.queuePanel(state, .{
-        .x = anchor.x,
-        .y = anchor.y + anchor.h + theme.scaledUi(4.0),
-        .w = @max(anchor.w, theme.scaledUi(320.0)),
-        .h = pad * 2.0 + row_h * @as(f32, @floatFromInt(row_count)),
-    });
+    const panel = context_menu.queuePanel(state, suggestionPanelRect(
+        anchor,
+        state.browser_controller.pane_min[0],
+        state.browser_controller.pane_max[0],
+        pad * 2.0 + row_h * @as(f32, @floatFromInt(row_count)),
+    ));
     palette_suggestion_rect = panel;
 
     const font_size = theme.scaledUi(context_menu.FONT_SIZE_UI);
@@ -1878,6 +1878,19 @@ fn renderAddressSuggestions(state: *app_state.AppState) void {
         }
         y += row_h;
     }
+}
+
+/// Places the dropdown under the address field, at least 320 wide but kept
+/// inside the browser pane: a narrow pane at the window's right edge would
+/// otherwise push the URLs past the window.
+fn suggestionPanelRect(anchor: palette.Rect, pane_left: f32, pane_right: f32, height: f32) palette.Rect {
+    const y = anchor.y + anchor.h + theme.scaledUi(4.0);
+    const desired_w = @max(anchor.w, theme.scaledUi(320.0));
+    if (pane_right <= pane_left) return .{ .x = anchor.x, .y = y, .w = desired_w, .h = height };
+    const edge = theme.scaledUi(4.0);
+    const w = @min(desired_w, @max(anchor.w, pane_right - pane_left - edge * 2.0));
+    const x = theme.clampf(anchor.x, pane_left + edge, @max(pane_left + edge, pane_right - edge - w));
+    return .{ .x = x, .y = y, .w = w, .h = height };
 }
 
 fn suggestionRowAtPoint(x: f32, y: f32) ?usize {
@@ -2471,4 +2484,26 @@ test "clicking an address suggestion row loads that row" {
     try std.testing.expectEqualStrings("https://mirage.example/lme/", fixture.navigation.items);
     try std.testing.expect(!state.browser_controller.address_focused);
     try std.testing.expect(!browser_history_controller.browserSuggestionsVisible(state));
+}
+
+test "address suggestion dropdown stays inside a narrow browser pane" {
+    const anchor: palette.Rect = .{ .x = 743.0, .y = 80.0, .w = 175.0, .h = 30.0 };
+    const scale = theme.scaledUi(1.0);
+    // 293-wide pane flush with a 960 window: the panel narrows to the pane.
+    const narrow = suggestionPanelRect(anchor, 667.0, 960.0, 100.0);
+    try std.testing.expect(narrow.x >= 667.0);
+    try std.testing.expect(narrow.x + narrow.w <= 960.0);
+    try std.testing.expect(narrow.w >= anchor.w);
+    try std.testing.expectEqual(anchor.y + anchor.h + 4.0 * scale, narrow.y);
+    // A wide pane keeps the 320 minimum, shifted left only as far as needed.
+    const wide = suggestionPanelRect(anchor, 400.0, 960.0, 100.0);
+    try std.testing.expectEqual(320.0 * scale, wide.w);
+    try std.testing.expect(wide.x + wide.w <= 960.0);
+    try std.testing.expect(wide.x <= anchor.x);
+    // Plenty of room: anchored exactly at the field.
+    const roomy = suggestionPanelRect(.{ .x = 100.0, .y = 80.0, .w = 175.0, .h = 30.0 }, 0.0, 960.0, 100.0);
+    try std.testing.expectEqual(@as(f32, 100.0), roomy.x);
+    // No recorded pane: unchanged legacy placement.
+    const unknown = suggestionPanelRect(anchor, 0.0, 0.0, 100.0);
+    try std.testing.expectEqual(anchor.x, unknown.x);
 }
