@@ -1,6 +1,7 @@
 //! Browser runtime ownership and deferred-launch controller state.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const palette = @import("palette");
 const host = @import("../ui/host.zig");
 const app_config = @import("../app/config.zig");
@@ -1574,6 +1575,14 @@ pub fn noteAppWindowFrame(self: anytype, screen_x: i32, screen_y: i32, display_s
     self.syncBrowserPaneBoundsToBackend();
 }
 
+/// Divisor from pane framebuffer pixels to the units a native browser surface is
+/// placed in. AppKit positions in points (pixels / backing scale); Win32 child
+/// windows and the client-origin from `Window.position()` are physical pixels.
+fn nativeSurfaceUnitScale(os_tag: std.Target.Os.Tag, display_scale: f32) f32 {
+    if (os_tag == .windows) return 1.0;
+    return @max(display_scale, 0.001);
+}
+
 /// Returns the device scale used by WPE when it renders logical browser pixels into a high-density frame.
 pub fn browserPaneDeviceScale(self: anytype) f32 {
     const presentation = self.browser_controller.runtime.controller.presentationKind();
@@ -1608,7 +1617,7 @@ pub fn syncBrowserPaneBoundsToBackend(self: anytype) void {
         .snapshot_texture, .offscreen_texture, .stub => false,
     };
     const uses_scaled_wpe_texture = runtime == .native_webview and presentation == .offscreen_texture;
-    const scale = if (uses_native_surface) @max(self.browser_controller.app_window_display_scale, 0.001) else 1.0;
+    const scale = if (uses_native_surface) nativeSurfaceUnitScale(builtin.os.tag, self.browser_controller.app_window_display_scale) else 1.0;
     const size_scale = if (uses_scaled_wpe_texture) self.browserPaneDeviceScale() else scale;
     const pane_x: i32 = @intFromFloat(@round(self.browser_controller.pane_min[0] / scale));
     const pane_y: i32 = @intFromFloat(@round(self.browser_controller.pane_min[1] / scale));
@@ -3813,6 +3822,12 @@ pub fn isInspectorPromptSubmittedMessage(message: []const u8) bool {
 
 pub fn isInspectorPromptChangedMessage(message: []const u8) bool {
     return std.mem.indexOf(u8, message, "\"type\":\"prompt:changed\"") != null;
+}
+
+test "native browser surfaces use physical pixels on Windows and points on macOS" {
+    try std.testing.expectEqual(@as(f32, 1.0), nativeSurfaceUnitScale(.windows, 1.25));
+    try std.testing.expectEqual(@as(f32, 2.0), nativeSurfaceUnitScale(.macos, 2.0));
+    try std.testing.expectEqual(@as(f32, 0.001), nativeSurfaceUnitScale(.macos, 0));
 }
 
 test "scaled WPE pointer coordinates stay in physical pane space" {
