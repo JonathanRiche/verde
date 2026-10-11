@@ -1443,7 +1443,9 @@ fn processEvents(
         if (!app.waitEvent(&event, wait_timeout_ns)) {
             wait_trace.waited_ns +|= profiler.elapsedNs(wait_start);
             wait_trace.reason = .wait_timeout;
-            return true;
+            // An idle window may get no events at all (macOS has no frame
+            // callbacks), so the dev hooks must also run on the timeout path.
+            return pollDevHooks(window, renderer, state, keyboard, ui_scale, event_flags, frame_sample);
         }
         wait_trace.waited_ns +|= profiler.elapsedNs(wait_start);
         wait_trace.reason = .wait_event;
@@ -1457,6 +1459,20 @@ fn processEvents(
         if (!dispatchEvent(window, renderer, state, keyboard, ui_scale, &event, event_flags, frame_sample)) return false;
     }
 
+    return pollDevHooks(window, renderer, state, keyboard, ui_scale, event_flags, frame_sample);
+}
+
+/// VERDE_PALETTE_SNAPSHOT / VERDE_PALETTE_INJECT requests. Returns false when an
+/// injected script quits the app.
+fn pollDevHooks(
+    window: *palette.platform.Window,
+    renderer: *palette_frame_renderer.Renderer,
+    state: *AppState,
+    keyboard: *keybinds.NativeKeyboardConfig,
+    ui_scale: f32,
+    event_flags: *EventFlags,
+    frame_sample: *profiler.FrameSample,
+) bool {
     if (palette_frame_renderer.snapshotRequested()) event_flags.renderer_redraw = true;
     if (dev_inject.enabled()) {
         if (dev_inject.take(state.allocator)) |script| {
@@ -1468,7 +1484,6 @@ fn processEvents(
             if (!dev_inject.run(script, .{ .context = &injector, .dispatch = Injector.dispatch, .window = window.id, .scale = scale, .cursor = @tagName(host.currentCursor()) })) return false;
         }
     }
-
     return true;
 }
 
@@ -3887,4 +3902,13 @@ test "window frame override parses size and optional position" {
     try std.testing.expect(parseWindowFrameOverride("900") == null);
     try std.testing.expect(parseWindowFrameOverride("10x10") == null);
     try std.testing.expect(parseWindowFrameOverride("900x600+1+2+3") == null);
+}
+
+test "idle wait timeouts still poll the snapshot and inject dev hooks" {
+    // macOS delivers no events to an idle window, so returning early on a wait
+    // timeout left VERDE_PALETTE_SNAPSHOT / VERDE_PALETTE_INJECT requests unread.
+    const source = @embedFile("main.zig");
+    const timeout = std.mem.indexOf(u8, source, "wait_trace.reason = .wait_timeout;").?;
+    const branch_end = std.mem.indexOfScalar(u8, source[timeout..], '}').?;
+    try std.testing.expect(std.mem.indexOf(u8, source[timeout..][0..branch_end], "return pollDevHooks(") != null);
 }
