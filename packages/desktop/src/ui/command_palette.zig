@@ -2358,7 +2358,7 @@ fn renderFooter(state: *runtime.AppState) void {
         .y = y,
         .w = modal_rect.w - theme.scaledUi(PAD_CSS) * 2.0,
         .h = font_size * 1.4,
-    }, "Enter New Pane    Ctrl+Enter Replace    Tab Actions    Esc Close", paletteColor(theme.COLOR_TEXT_SUBTLE), font_size, modal_rect);
+    }, "Enter New Pane    " ++ keybinds.PRIMARY_MODIFIER_LABEL ++ "+Enter Replace    Tab Actions    Esc Close", paletteColor(theme.COLOR_TEXT_SUBTLE), font_size, modal_rect);
 }
 
 // ---------------------------------------------------------------------------
@@ -2631,7 +2631,7 @@ test "thread matching searches descriptions and multi-word bodies" {
 test "formatKeybind renders modifiers and uppercases single letters" {
     var buf: [32]u8 = undefined;
     const rendered = formatKeybind(&buf, .{ .primary = true, .shift = true, .key = .p });
-    try std.testing.expectEqualStrings("Ctrl+Shift+P", rendered);
+    try std.testing.expectEqualStrings(keybinds.PRIMARY_MODIFIER_LABEL ++ "+Shift+P", rendered);
     const plain = formatKeybind(&buf, .{ .alt = true, .key = .left });
     try std.testing.expectEqualStrings("Alt+Left", plain);
 }

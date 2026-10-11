@@ -2196,10 +2196,28 @@ pub fn formatCtrlShiftKeyTipAt(buf: []u8, bindings: []const Keybind, index: usiz
 }
 
 /// Formats a keybind for compact UI shortcut hints.
+/// Label for the `primary` modifier (`CommandOrControl`): Cmd on macOS.
+pub const PRIMARY_MODIFIER_LABEL = primaryModifierLabelForOs(builtin.os.tag);
+
+fn primaryModifierLabelForOs(os_tag: std.Target.Os.Tag) []const u8 {
+    return if (os_tag == .macos) "Cmd" else "Ctrl";
+}
+
 pub fn formatKeybind(buf: []u8, binding: Keybind) []const u8 {
+    return formatKeybindForOs(buf, binding, builtin.os.tag);
+}
+
+/// macOS matches `primary` against Command (see `matchesWithRepeatPolicy`), so
+/// hints must say Cmd there; printing Ctrl pointed users at a different chord.
+fn formatKeybindForOs(buf: []u8, binding: Keybind, os_tag: std.Target.Os.Tag) []const u8 {
     var count: usize = 0;
-    if (binding.primary or binding.ctrl) count += copyInto(buf[count..], "Ctrl+");
-    if (binding.meta) count += copyInto(buf[count..], "Meta+");
+    if (os_tag == .macos) {
+        if (binding.primary or binding.meta) count += copyInto(buf[count..], "Cmd+");
+        if (binding.ctrl) count += copyInto(buf[count..], "Ctrl+");
+    } else {
+        if (binding.primary or binding.ctrl) count += copyInto(buf[count..], "Ctrl+");
+        if (binding.meta) count += copyInto(buf[count..], "Meta+");
+    }
     if (binding.alt) count += copyInto(buf[count..], "Alt+");
     if (binding.shift) count += copyInto(buf[count..], "Shift+");
     const name = keycodeLabel(binding.key);
@@ -2948,4 +2966,16 @@ test "navigate table overrides merge like the prefix table" {
     }
     try std.testing.expect(saw_g);
     try std.testing.expect(parsePrefixActionName("prefix.navigate").? == .navigate);
+}
+
+test "keybind hints name Cmd for the primary modifier on macOS" {
+    var buf: [32]u8 = undefined;
+    const palette_chord: Keybind = .{ .primary = true, .shift = true, .key = .p };
+    try std.testing.expectEqualStrings("Ctrl+Shift+P", formatKeybindForOs(&buf, palette_chord, .linux));
+    try std.testing.expectEqualStrings("Cmd+Shift+P", formatKeybindForOs(&buf, palette_chord, .macos));
+    try std.testing.expectEqualStrings("Ctrl+Shift+Space", formatKeybindForOs(&buf, .{ .ctrl = true, .shift = true, .key = .space }, .macos));
+    try std.testing.expectEqualStrings("Cmd+K", formatKeybindForOs(&buf, .{ .meta = true, .key = .k }, .macos));
+    try std.testing.expectEqualStrings("Meta+K", formatKeybindForOs(&buf, .{ .meta = true, .key = .k }, .linux));
+    try std.testing.expectEqualStrings("Cmd", primaryModifierLabelForOs(.macos));
+    try std.testing.expectEqualStrings("Ctrl", primaryModifierLabelForOs(.windows));
 }
