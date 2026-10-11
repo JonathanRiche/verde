@@ -1880,6 +1880,8 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             .provider_onboarding_close => state.dismissProviderOnboarding(),
             .provider_onboarding_recheck => state.recheckProviderReadiness(),
             .provider_onboarding_open_guide => state.openProviderSetupGuide(),
+            .provider_onboarding_action => if (hit.index < PROVIDER_ONBOARDING_PROVIDERS.len)
+                state.runProviderOnboardingAction(PROVIDER_ONBOARDING_PROVIDERS[hit.index]),
             .image_close => state.closeImageModal(),
             .image_zoom_out => state.adjustImageModalZoom(-1),
             .image_zoom_in => state.adjustImageModalZoom(1),
@@ -2166,6 +2168,26 @@ pub fn handlePaletteTextInput(state: *runtime.AppState, text: []const u8) bool {
     };
 }
 
+// Arrow/Page/Home/End/Space scroll the provider checklist, bounded by the
+// max scroll recorded on the last draw.
+fn handleProviderOnboardingKeyDown(state: *runtime.AppState, event: *const palette.event.KeyEvent) bool {
+    const step = theme.scaledUi(48.0);
+    const page = theme.scaledUi(240.0);
+    const sc = &state.settings_controller;
+    const delta: f32 = switch (event.key) {
+        .down => step,
+        .up => -step,
+        .pagedown, .space => page,
+        .pageup => -page,
+        .end => sc.provider_onboarding_max_scroll_y,
+        .home => -sc.provider_onboarding_scroll_y,
+        else => return false,
+    };
+    sc.provider_onboarding_scroll_y = theme.clampf(sc.provider_onboarding_scroll_y + delta, 0.0, sc.provider_onboarding_max_scroll_y);
+    state.markDirty();
+    return true;
+}
+
 pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const palette.event.KeyEvent) bool {
     const has_modal_open = state.runtimeCredentialModalOpen() or
         state.runtimeTrustProposal() != null or
@@ -2230,6 +2252,7 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const palette.even
         if (event.key == .escape) dismissTopModal(state);
         return true;
     }
+    if (state.settings_controller.provider_onboarding_visible and handleProviderOnboardingKeyDown(state, event)) return true;
     const primary = event.mod.primary();
     const shift = event.mod.shift;
     switch (event.key) {
@@ -3212,6 +3235,80 @@ fn providerOnboardingRect(width: f32, height: f32) palette.Rect {
     return .{ .x = (width - modal_w) * 0.5, .y = (height - modal_h) * 0.5, .w = modal_w, .h = modal_h };
 }
 
+const PROVIDER_ONBOARDING_PROVIDERS = [_]runtime.Provider{ .codex, .opencode, .claude, .cursor, .pi, .fx, .grok };
+
+const ProviderOnboardingLayout = struct {
+    modal: palette.Rect,
+    /// Visible band for the provider rows; rows scroll inside it.
+    list: palette.Rect,
+    row_h: f32,
+    row_gap: f32,
+    max_scroll_y: f32,
+    button_y: f32,
+    button_h: f32,
+};
+
+// Fixed-height rows in a clipped, scrollable band between the intro and the
+// buttons, so a short window (or a VM at 1080p) never draws rows behind them.
+fn providerOnboardingLayout(width: f32, height: f32) ProviderOnboardingLayout {
+    const modal = providerOnboardingRect(width, height);
+    const pad = theme.scaledUi(22.0);
+    const button_h = theme.scaledUi(36.0);
+    const button_y = modal.y + modal.h - pad - button_h;
+    const list_top = modal.y + pad + theme.scaledUi(34.0) + theme.scaledUi(52.0);
+    const list_bottom = button_y - theme.scaledUi(14.0);
+    const row_h = theme.scaledUi(58.0);
+    const row_gap = theme.scaledUi(8.0);
+    const count: f32 = @floatFromInt(PROVIDER_ONBOARDING_PROVIDERS.len);
+    const content_h = row_h * count + row_gap * (count - 1.0);
+    const list: palette.Rect = .{ .x = modal.x + pad, .y = list_top, .w = modal.w - pad * 2.0, .h = @max(list_bottom - list_top, 0.0) };
+    return .{
+        .modal = modal,
+        .list = list,
+        .row_h = row_h,
+        .row_gap = row_gap,
+        .max_scroll_y = @max(content_h - list.h, 0.0),
+        .button_y = button_y,
+        .button_h = button_h,
+    };
+}
+
+fn providerOnboardingRowRect(layout: ProviderOnboardingLayout, index: usize, scroll_y: f32) palette.Rect {
+    const offset = @as(f32, @floatFromInt(index)) * (layout.row_h + layout.row_gap);
+    return .{ .x = layout.list.x, .y = layout.list.y - scroll_y + offset, .w = layout.list.w, .h = layout.row_h };
+}
+
+fn providerOnboardingActionRect(row: palette.Rect) palette.Rect {
+    const w = theme.scaledUi(92.0);
+    const h = theme.scaledUi(30.0);
+    return .{ .x = row.x + row.w - w - theme.scaledUi(12.0), .y = row.y + (row.h - h) * 0.5, .w = w, .h = h };
+}
+
+/// Same verbs as Settings > Providers: a missing CLI installs, an installed
+/// but signed-out (or unverifiable) one signs in.
+fn providerOnboardingActionLabel(readiness: runtime.ProviderReadiness) ?[]const u8 {
+    return switch (readiness) {
+        .missing => "Install",
+        .signed_out, .unavailable => "Sign in",
+        .ready, .checking => null,
+    };
+}
+
+/// Scrolls the provider checklist; the modal swallows the wheel everywhere.
+pub fn handleProviderOnboardingWheel(state: *runtime.AppState, width: f32, height: f32, x: f32, y: f32, wheel_y: f32) bool {
+    if (!state.settings_controller.provider_onboarding_visible) return false;
+    _ = x;
+    _ = y;
+    const layout = providerOnboardingLayout(width, height);
+    state.settings_controller.provider_onboarding_scroll_y = theme.clampf(
+        state.settings_controller.provider_onboarding_scroll_y - wheel_y * theme.scaledUi(48.0),
+        0.0,
+        layout.max_scroll_y,
+    );
+    state.markDirty();
+    return true;
+}
+
 fn registerProviderOnboardingHits(state: *runtime.AppState, width: f32, height: f32) void {
     if (!state.settings_controller.provider_onboarding_visible) return;
     const modal = providerOnboardingRect(width, height);
@@ -3224,6 +3321,18 @@ fn registerProviderOnboardingHits(state: *runtime.AppState, width: f32, height: 
     const check_w = theme.scaledUi(126.0);
     const button_y = modal.y + modal.h - pad - button_h;
     queueModalHit(state, .{ .x = modal.x + pad, .y = button_y, .w = close_w, .h = button_h }, .provider_onboarding_close, 0);
+    const layout = providerOnboardingLayout(width, height);
+    const snapshot = state.providerReadinessSnapshot();
+    const scroll_y = theme.clampf(state.settings_controller.provider_onboarding_scroll_y, 0.0, layout.max_scroll_y);
+    for (PROVIDER_ONBOARDING_PROVIDERS, 0..) |provider, index| {
+        if (providerOnboardingActionLabel(snapshot.forProvider(provider)) == null) continue;
+        const row = providerOnboardingRowRect(layout, index, scroll_y);
+        // Clipped to the list band so a half-hidden button can't be clicked
+        // through the intro text or the footer buttons.
+        const clipped = rectIntersection(providerOnboardingActionRect(row), layout.list);
+        if (clipped.h <= 0.0) continue;
+        queueModalHit(state, clipped, .provider_onboarding_action, index);
+    }
     queueModalHit(state, .{ .x = modal.x + modal.w - pad - check_w, .y = button_y, .w = check_w, .h = button_h }, .provider_onboarding_recheck, 0);
     queueModalHit(state, .{ .x = modal.x + modal.w - pad - check_w - gap - guide_w, .y = button_y, .w = guide_w, .h = button_h }, .provider_onboarding_open_guide, 0);
 }
@@ -3387,24 +3496,23 @@ fn renderProviderOnboardingModal(state: *runtime.AppState, width: f32, height: f
 
     queuePaletteText(state, .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(28.0) }, "Connect an AI provider", paletteColor(theme.COLOR_WHITE), theme.scaledUi(22.0), clip);
     y += theme.scaledUi(34.0);
-    queuePaletteText(state, .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(42.0) }, "Verde uses coding-agent accounts already installed on this computer. Set up any one provider to start chatting; Verde does not require its own subscription.", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.5), clip);
+    queuePaletteText(state, .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(20.0) }, "Verde uses coding-agent accounts already installed on this computer.", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.5), clip);
+    queuePaletteText(state, .{ .x = modal.x + pad, .y = y + theme.scaledUi(20.0), .w = modal.w - pad * 2.0, .h = theme.scaledUi(20.0) }, "Set up any one provider to start chatting. No Verde subscription needed.", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.5), clip);
     y += theme.scaledUi(52.0);
 
     const snapshot = state.providerReadinessSnapshot();
-    const providers = [_]runtime.Provider{ .codex, .opencode, .claude, .cursor, .pi, .fx, .grok };
-    const button_h = theme.scaledUi(36.0);
-    const button_y = modal.y + modal.h - pad - button_h;
-    const rows_bottom = button_y - theme.scaledUi(18.0);
-    const row_gap = theme.scaledUi(8.0);
-    // Divide the available space across every provider row so new providers
-    // cannot silently overflow past the modal buttons.
-    const row_count: f32 = @floatFromInt(providers.len);
-    const row_h = @max((rows_bottom - y - row_gap * (row_count - 1.0)) / row_count, theme.scaledUi(58.0));
-    for (providers) |provider| {
-        const row: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = row_h };
-        renderProviderReadinessRow(state, row, provider, snapshot.forProvider(provider), clip);
-        y += row_h + row_gap;
+    const layout = providerOnboardingLayout(width, height);
+    const button_h = layout.button_h;
+    const button_y = layout.button_y;
+    const scroll_y = theme.clampf(state.settings_controller.provider_onboarding_scroll_y, 0.0, layout.max_scroll_y);
+    state.settings_controller.provider_onboarding_scroll_y = scroll_y;
+    state.settings_controller.provider_onboarding_max_scroll_y = layout.max_scroll_y;
+    for (PROVIDER_ONBOARDING_PROVIDERS, 0..) |provider, index| {
+        const row = providerOnboardingRowRect(layout, index, scroll_y);
+        if (row.y + row.h <= layout.list.y or row.y >= layout.list.y + layout.list.h) continue;
+        renderProviderReadinessRow(state, row, provider, snapshot.forProvider(provider), layout.list);
     }
+    if (layout.max_scroll_y > 0.0) renderProviderOnboardingScrollbar(state, layout, scroll_y);
 
     const gap = theme.scaledUi(10.0);
     const close_w = theme.scaledUi(104.0);
@@ -3416,10 +3524,23 @@ fn renderProviderOnboardingModal(state: *runtime.AppState, width: f32, height: f
     drawActionButton(state, .{ .x = modal.x + modal.w - pad - check_w, .y = button_y, .w = check_w, .h = button_h }, if (checking) "Checking..." else "Check again", theme.accent());
 }
 
+// Thin thumb on the list's right edge so it reads as scrollable.
+fn renderProviderOnboardingScrollbar(state: *runtime.AppState, layout: ProviderOnboardingLayout, scroll_y: f32) void {
+    const track_h = layout.list.h;
+    const content_h = track_h + layout.max_scroll_y;
+    const thumb_h = @max(track_h * track_h / content_h, theme.scaledUi(24.0));
+    const thumb_y = layout.list.y + (track_h - thumb_h) * (scroll_y / layout.max_scroll_y);
+    const w = theme.scaledUi(4.0);
+    queuePaletteRoundedRect(state, .{ .x = layout.list.x + layout.list.w + theme.scaledUi(7.0), .y = thumb_y, .w = w, .h = thumb_h }, paletteColor(theme.withAlpha(theme.COLOR_TEXT_SUBTLE, 120)), w * 0.5);
+}
+
 // Renders one provider's executable/auth status and its shortest recovery step.
 fn renderProviderReadinessRow(state: *runtime.AppState, rect: palette.Rect, provider: runtime.Provider, readiness: runtime.ProviderReadiness, clip: palette.Rect) void {
-    queuePaletteRoundedRect(state, rect, paletteColor(theme.sink(theme.COLOR_PANEL_ALT, 0.025)), theme.scaledUi(9.0));
-    queuePaletteBorder(state, rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 190)), theme.scaledUi(9.0), theme.scaledUi(1.0));
+    // `clip` is the scrolling list band: backgrounds are intersected with it
+    // and the border/dot (no clip support) only draw when fully inside.
+    const fully_visible = rect.y >= clip.y and rect.y + rect.h <= clip.y + clip.h;
+    queuePaletteRoundedRect(state, rectIntersection(rect, clip), paletteColor(theme.sink(theme.COLOR_PANEL_ALT, 0.025)), theme.scaledUi(9.0));
+    if (fully_visible) queuePaletteBorder(state, rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 190)), theme.scaledUi(9.0), theme.scaledUi(1.0));
 
     const dot_color = switch (readiness) {
         .ready => theme.success(),
@@ -3429,7 +3550,8 @@ fn renderProviderReadinessRow(state: *runtime.AppState, rect: palette.Rect, prov
         .unavailable => theme.COLOR_YELLOW,
     };
     const dot = theme.scaledUi(8.0);
-    queuePaletteRoundedRect(state, .{ .x = rect.x + theme.scaledUi(14.0), .y = rect.y + theme.scaledUi(16.0), .w = dot, .h = dot }, paletteColor(dot_color), dot * 0.5);
+    const dot_rect: palette.Rect = .{ .x = rect.x + theme.scaledUi(14.0), .y = rect.y + theme.scaledUi(16.0), .w = dot, .h = dot };
+    if (dot_rect.y >= clip.y and dot_rect.y + dot_rect.h <= clip.y + clip.h) queuePaletteRoundedRect(state, dot_rect, paletteColor(dot_color), dot * 0.5);
 
     const title = switch (provider) {
         .codex => "Codex",
@@ -3451,9 +3573,19 @@ fn renderProviderReadinessRow(state: *runtime.AppState, rect: palette.Rect, prov
     const step = providerReadinessStep(provider, readiness);
     const text_x = rect.x + theme.scaledUi(34.0);
     const status_w = theme.scaledUi(116.0);
-    queuePaletteText(state, .{ .x = text_x, .y = rect.y + theme.scaledUi(8.0), .w = rect.w - status_w - theme.scaledUi(48.0), .h = theme.scaledUi(20.0) }, title, paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.5), clip);
-    queuePaletteText(state, .{ .x = rect.x + rect.w - status_w - theme.scaledUi(12.0), .y = rect.y + theme.scaledUi(9.0), .w = status_w, .h = theme.scaledUi(18.0) }, status, paletteColor(dot_color), theme.scaledUi(12.0), clip);
-    queuePaletteText(state, .{ .x = text_x, .y = rect.y + theme.scaledUi(31.0), .w = rect.w - theme.scaledUi(48.0), .h = @max(rect.h - theme.scaledUi(36.0), theme.scaledUi(18.0)) }, step, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), clip);
+    const action_label = providerOnboardingActionLabel(readiness);
+    const action_rect = providerOnboardingActionRect(rect);
+    // Status and step text stop short of the action button when one shows.
+    const right_edge = if (action_label != null) action_rect.x - theme.scaledUi(10.0) else rect.x + rect.w - theme.scaledUi(12.0);
+    queuePaletteText(state, .{ .x = text_x, .y = rect.y + theme.scaledUi(8.0), .w = @max(right_edge - status_w - text_x, 0.0), .h = theme.scaledUi(20.0) }, title, paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.5), clip);
+    queuePaletteText(state, .{ .x = right_edge - status_w, .y = rect.y + theme.scaledUi(9.0), .w = status_w, .h = theme.scaledUi(18.0) }, status, paletteColor(dot_color), theme.scaledUi(12.0), clip);
+    queuePaletteText(state, .{ .x = text_x, .y = rect.y + theme.scaledUi(31.0), .w = @max(right_edge - text_x, 0.0), .h = @max(rect.h - theme.scaledUi(36.0), theme.scaledUi(18.0)) }, step, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), clip);
+    // drawActionButton has no clip, so only draw it fully inside the band.
+    if (action_label) |label| {
+        if (action_rect.y >= clip.y and action_rect.y + action_rect.h <= clip.y + clip.h) {
+            drawActionButton(state, action_rect, label, if (readiness == .missing) theme.COLOR_PANEL_MUTED else theme.accent());
+        }
+    }
 }
 
 fn providerReadinessStep(provider: runtime.Provider, readiness: runtime.ProviderReadiness) []const u8 {

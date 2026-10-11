@@ -243,6 +243,8 @@ fn mainInner(init: std.process.Init) !void {
         .app_id = desktopAppId(),
         .environ = init.minimal.environ,
         .handle_signals = builtin.os.tag == .windows,
+        // VERDE_ICON in src/platform/windows/verde.rc.
+        .icon_resource_id = 101,
     });
     defer app.deinit();
     loop_wakeup.init(app, postLoopWakeup);
@@ -2594,6 +2596,16 @@ fn handleEvent(window: *palette.platform.Window, state: *AppState, keyboard: *ke
                 return true;
             }
             if (ui_layout.handleCookieImportWheel(
+                state,
+                @floatFromInt(input_fb_w),
+                @floatFromInt(input_fb_h),
+                wheel_event.mouse_x,
+                wheel_event.mouse_y,
+                wheel_event.y,
+            )) {
+                return true;
+            }
+            if (ui_layout.handleProviderOnboardingWheel(
                 state,
                 @floatFromInt(input_fb_w),
                 @floatFromInt(input_fb_h),

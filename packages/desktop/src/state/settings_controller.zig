@@ -250,6 +250,10 @@ pub const State = struct {
     mcp_onboarding_visible: bool = false,
     provider_onboarding_visible: bool = false,
     provider_onboarding_dismissed: bool = false,
+    /// Scroll offset of the onboarding provider list (clamped when drawn).
+    provider_onboarding_scroll_y: f32 = 0.0,
+    /// Max scroll for that list from the last draw; bounds keyboard scrolling.
+    provider_onboarding_max_scroll_y: f32 = 0.0,
     modal_visible: bool = false,
     active_category: Category = .appearance,
     /// Tests set this false so preference commits stay in-memory.
@@ -1388,6 +1392,30 @@ pub fn installSettingsProvider(self: anytype, row: usize) void {
         self.setSidebarNotice("Could not open a terminal for the provider installer.");
         self.markDirty();
     };
+}
+
+/// First-run checklist button: the same Install / Sign in path as the
+/// Settings > Providers row. Where that path opens a terminal, the checklist
+/// steps aside so the terminal is visible; it reappears on the next readiness
+/// check if no provider is ready yet.
+pub fn runProviderOnboardingAction(self: anytype, provider: Provider) void {
+    const row = for (PROVIDER_OPTIONS, 0..) |option, index| {
+        if (dbProviderForChatProvider(option) == provider) break index;
+    } else return;
+    const readiness = self.providerReadinessSnapshot().forProvider(provider);
+    const opens_terminal = @import("builtin").os.tag == .linux or @import("builtin").os.tag == .macos;
+    switch (readiness) {
+        .missing => {
+            if (opens_terminal) self.settings_controller.provider_onboarding_visible = false;
+            installSettingsProvider(self, row);
+        },
+        .signed_out, .unavailable => {
+            if (opens_terminal) self.settings_controller.provider_onboarding_visible = false;
+            loginSettingsProvider(self, row);
+        },
+        .ready, .checking => {},
+    }
+    self.markDirty();
 }
 
 pub fn loginSettingsProvider(self: anytype, row: usize) void {

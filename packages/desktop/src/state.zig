@@ -2253,6 +2253,8 @@ pub const PaletteModalAction = enum {
     provider_onboarding_close,
     provider_onboarding_recheck,
     provider_onboarding_open_guide,
+    /// Index into the onboarding provider list: Install or Sign in.
+    provider_onboarding_action,
     image_close,
     image_zoom_out,
     image_zoom_in,
@@ -8535,6 +8537,7 @@ pub const AppState = struct {
     pub const toggleSettingsProviderEnabled = settings_controller.toggleSettingsProviderEnabled;
     pub const installSettingsProvider = settings_controller.installSettingsProvider;
     pub const loginSettingsProvider = settings_controller.loginSettingsProvider;
+    pub const runProviderOnboardingAction = settings_controller.runProviderOnboardingAction;
 
     /// Opens `provider`'s sign-in command in a workspace terminal.
     pub fn loginChatProvider(self: *AppState, provider: Provider) void {
@@ -14231,6 +14234,7 @@ pub const AppState = struct {
                 .provider_onboarding_close,
                 .provider_onboarding_recheck,
                 .provider_onboarding_open_guide,
+                .provider_onboarding_action,
                 .image_close,
                 .image_zoom_out,
                 .image_zoom_in,
