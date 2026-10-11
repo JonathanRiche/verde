@@ -305,6 +305,8 @@ fn mainInner(init: std.process.Init) !void {
         .bold_italic = .{ .memory = NOTO_SANS_BOLD_ITALIC_BYTES },
         .mono = if (ghostty_mono_font_path) |path| .{ .path = path } else .{ .memory = JETBRAINS_MONO_NERD_BYTES },
         .icon = .{ .memory = NERD_SYMBOLS_BYTES },
+        // Codicon backs Nerd Symbols for newer codicons (U+EC5E .txt icon).
+        .icon_fallback = .{ .memory = CODICON_BYTES },
         // JetBrains Mono Nerd is always the first coverage fallback for mono,
         // even when Ghostty names another primary (e.g. CaskaydiaMono): it
         // carries common TUI symbols (Vite ➜, Claude Code's ✻/✽ spinner
