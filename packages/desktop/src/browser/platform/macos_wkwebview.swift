@@ -122,12 +122,15 @@ private final class VerdeMacBrowser: NSObject, WKScriptMessageHandler, WKNavigat
 
     func setBounds(x: Int32, y: Int32, width: Int32, height: Int32) {
         guard width > 0, height > 0, let window, let contentView = window.contentView else { return }
-        let scale = window.backingScaleFactor > 0 ? window.backingScaleFactor : 1.0
-        let pointWidth = max(CGFloat(width) / scale, 1.0)
-        let pointHeight = max(CGFloat(height) / scale, 1.0)
-        let screen = window.screen ?? NSScreen.main
-        let screenTop = screen?.frame.maxY ?? 0
-        let targetScreenRect = NSRect(x: CGFloat(x) / scale, y: screenTop - (CGFloat(y) / scale) - pointHeight, width: pointWidth, height: pointHeight)
+        // Verde passes points: the content area's top-left in global top-left-origin
+        // coordinates (palette Window.position) plus the pane offset, both already divided
+        // by the backing scale. Dividing again halved the view on Retina screens. Global
+        // top-left coordinates are relative to the primary screen (screens[0]), not the
+        // window's own screen.
+        let pointWidth = max(CGFloat(width), 1.0)
+        let pointHeight = max(CGFloat(height), 1.0)
+        let screenTop = NSScreen.screens.first?.frame.maxY ?? (window.screen ?? NSScreen.main)?.frame.maxY ?? 0
+        let targetScreenRect = NSRect(x: CGFloat(x), y: screenTop - CGFloat(y) - pointHeight, width: pointWidth, height: pointHeight)
         let contentWindowRect = contentView.convert(contentView.bounds, to: nil)
         let contentScreenRect = window.convertToScreen(contentWindowRect)
 
