@@ -1724,6 +1724,7 @@ pub fn browserBlockedByPaletteOverlay(self: anytype) bool {
         self.transcript_controller.selection_text != null or
         self.palette_modal_text_focus != .none or
         self.browser_controller.inspector_menu_open or
+        addressSuggestionsBlockBrowser(self) or
         self.workspace_header_open_menu_open or
         self.sidebar_context_menu_open or
         self.composer_controller.locked_model_picker_open or
@@ -1732,6 +1733,20 @@ pub fn browserBlockedByPaletteOverlay(self: anytype) bool {
         self.composer_controller.directory_picker.isOpen() or
         self.composer_controller.runtime_picker.isOpen() or
         self.composer_controller.run_config_open;
+}
+
+/// The address-bar suggestion dropdown hangs below the toolbar, over the
+/// page. A native child surface (WebView2 HWND, WKWebView) stacks above the
+/// Palette swapchain and would cut it off, so hide the page while it is open.
+/// Texture-composited browsers (Linux WPE) draw under Palette already.
+fn addressSuggestionsBlockBrowser(self: anytype) bool {
+    if (!self.browser_controller.address_focused) return false;
+    const suggestions = &self.browser_controller.suggestions;
+    if (!suggestions.visible or suggestions.items.len == 0) return false;
+    return switch (self.browser_controller.runtime.controller.presentationKind()) {
+        .native_child_view, .helper_window => true,
+        .snapshot_texture, .offscreen_texture, .stub => false,
+    };
 }
 
 fn companionSidecarBlocksBrowser(companion_enabled: bool, sidecar_open: bool) bool {
