@@ -169,10 +169,6 @@ const NOTO_EMOJI_BYTES = @embedFile("assets/fonts/NotoEmoji-Regular.ttf");
 
 var macos_cmd_w_pane_close_until_ms: i64 = 0;
 var macos_launch_close_suppress_until_ms: i64 = 0;
-var macos_last_text_input_timestamp_ns: u64 = 0;
-var macos_last_text_input_len: usize = 0;
-var macos_last_text_input: [64]u8 = std.mem.zeroes([64]u8);
-const MACOS_DUPLICATE_TEXT_INPUT_SUPPRESS_NS: u64 = 30 * std.time.ns_per_ms;
 const MACOS_LAUNCH_CLOSE_SUPPRESS_MS: i64 = 650;
 
 const WindowFrame = struct {
@@ -2225,7 +2221,6 @@ fn handleEvent(window: *palette.platform.Window, state: *AppState, keyboard: *ke
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (suppressDuplicateMacosTextInput(text_input, palette.clock.monotonicTimestampNs())) return true;
             if (ui_layout.handlePaletteTextInput(state, text_input)) {
                 syncWindowTextInput(window, state);
                 return true;
@@ -3703,26 +3698,6 @@ fn activateMacosHostWindow(window: *palette.platform.Window) void {
     if (host.app()) |app| app.sync() catch {};
 }
 
-fn suppressDuplicateMacosTextInput(text: []const u8, timestamp_ns: u64) bool {
-    if (builtin.os.tag != .macos) return false;
-    const previous = macos_last_text_input[0..macos_last_text_input_len];
-    const duplicate = text.len == previous.len and
-        timestamp_ns != 0 and
-        macos_last_text_input_timestamp_ns != 0 and
-        timestamp_ns >= macos_last_text_input_timestamp_ns and
-        timestamp_ns - macos_last_text_input_timestamp_ns <= MACOS_DUPLICATE_TEXT_INPUT_SUPPRESS_NS and
-        std.mem.eql(u8, text, previous);
-
-    macos_last_text_input_timestamp_ns = timestamp_ns;
-    macos_last_text_input_len = @min(text.len, macos_last_text_input.len);
-    @memcpy(macos_last_text_input[0..macos_last_text_input_len], text[0..macos_last_text_input_len]);
-
-    if (duplicate) {
-        runtime_log.trace("suppressed duplicate macOS text_input text_len={d} timestamp={}", .{ text.len, timestamp_ns });
-    }
-    return duplicate;
-}
-
 fn macosNativeBrowserShouldOwnKeyboard(state: *AppState) bool {
     if (builtin.os.tag != .macos) return false;
     if (!state.isBrowserVisible() or !state.isBrowserPaneFocused()) return false;
@@ -3911,4 +3886,14 @@ test "idle wait timeouts still poll the snapshot and inject dev hooks" {
     const timeout = std.mem.indexOf(u8, source, "wait_trace.reason = .wait_timeout;").?;
     const branch_end = std.mem.indexOfScalar(u8, source[timeout..], '}').?;
     try std.testing.expect(std.mem.indexOf(u8, source[timeout..][0..branch_end], "return pollDevHooks(") != null);
+}
+
+test "macOS text input is not deduplicated by arrival time" {
+    // The palette AppKit backend emits one text_input per keyDown (via
+    // NSTextInputClient). The SDL-era 30 ms duplicate filter dropped real
+    // keystrokes: "ll" handled in one loop iteration, or key repeat at the
+    // fastest macOS rate, lost every second character.
+    const source = @embedFile("main.zig");
+    const needle = "suppressDuplicate" ++ "MacosTextInput";
+    try std.testing.expect(std.mem.indexOf(u8, source, needle) == null);
 }
