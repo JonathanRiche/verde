@@ -388,22 +388,15 @@ pub fn processIdIsAlive(pid: u32) bool {
 pub fn terminateProcessIdTree(pid: u32) !void {
     if (pid == 0) return error.InvalidProcessId;
     if (builtin.os.tag == .windows) {
-        var pid_buffer: [16]u8 = undefined;
-        const pid_text = std.fmt.bufPrint(&pid_buffer, "{d}", .{pid}) catch return error.InvalidProcessId;
-        var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        defer threaded.deinit();
-        var child = try spawn(std.heap.page_allocator, threaded.io(), .{
-            .argv = &.{ "taskkill.exe", "/PID", pid_text, "/T" },
-            .stdin = .ignore,
-            .stdout = .ignore,
-            .stderr = .ignore,
-            .own_process_tree = false,
-        });
-        const term = try child.wait(threaded.io());
-        switch (term) {
-            .exited => |code| if (code != 0) return error.TerminationFailed,
-            else => return error.TerminationFailed,
-        }
+        // taskkill exits 128 both for a missing PID and for a refused request,
+        // so probe first to report ProcessNotFound like the POSIX path.
+        if (!processIdIsAlive(pid)) return error.ProcessNotFound;
+        if (try runTaskkill(pid, false)) return;
+        // A graceful taskkill only posts WM_CLOSE, which windowless console
+        // processes (the usual detached command) cannot receive; Windows has
+        // no SIGTERM equivalent for them, so fall back to a forced tree kill.
+        if (!processIdIsAlive(pid)) return;
+        if (!try runTaskkill(pid, true)) return error.TerminationFailed;
         return;
     }
     if (builtin.os.tag == .wasi) return error.UnsupportedPlatform;
@@ -411,6 +404,29 @@ pub fn terminateProcessIdTree(pid: u32) !void {
     std.posix.kill(-native_pid, .TERM) catch |err| switch (err) {
         error.ProcessNotFound => try std.posix.kill(native_pid, .TERM),
         else => return err,
+    };
+}
+
+/// Runs `taskkill /PID <pid> /T [/F]`; true when it exited 0.
+fn runTaskkill(pid: u32, force: bool) !bool {
+    comptime std.debug.assert(builtin.os.tag == .windows);
+    var pid_buffer: [16]u8 = undefined;
+    const pid_text = std.fmt.bufPrint(&pid_buffer, "{d}", .{pid}) catch return error.InvalidProcessId;
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const graceful = [_][]const u8{ "taskkill.exe", "/PID", pid_text, "/T" };
+    const forced = graceful ++ [_][]const u8{"/F"};
+    var child = try spawn(std.heap.page_allocator, threaded.io(), .{
+        .argv = if (force) &forced else &graceful,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .own_process_tree = false,
+    });
+    const term = try child.wait(threaded.io());
+    return switch (term) {
+        .exited => |code| code == 0,
+        else => false,
     };
 }
 
@@ -505,6 +521,27 @@ fn assignWindowsJob(job: windows.HANDLE, child: windows.HANDLE) !void {
     if (win32.AssignProcessToJobObject(job, child) == .FALSE) {
         return windows.unexpectedError(windows.GetLastError());
     }
+}
+
+test "terminateProcessIdTree stops a windowless console tree and reports a missing PID" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    // ping has no window, so a graceful taskkill is refused; the forced
+    // fallback must still end it, and a second request sees no process.
+    var child = try spawn(std.testing.allocator, std.testing.io, .{
+        .argv = &.{ "cmd.exe", "/c", "ping.exe -n 120 127.0.0.1 >NUL" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .own_process_tree = false,
+    });
+    defer if (child.child.id != null) child.kill(std.testing.io);
+    const pid = win32.GetProcessId(child.child.id.?);
+    try std.testing.expect(processIdIsAlive(pid));
+    try terminateProcessIdTree(pid);
+    _ = try child.wait(std.testing.io);
+    try std.testing.expect(!processIdIsAlive(pid));
+    try std.testing.expectError(error.ProcessNotFound, terminateProcessIdTree(pid));
 }
 
 test "owned child kill does not orphan TERM-ignoring descendants" {
