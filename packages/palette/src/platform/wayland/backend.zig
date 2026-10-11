@@ -63,6 +63,9 @@ pub const AppOptions = struct {
     /// spawning threads so they inherit the mask; threads created earlier still receive the
     /// default disposition.
     handle_signals: bool = false,
+    /// Windows: ICON resource id in the executable used for the title bar,
+    /// Alt+Tab and taskbar window icon (0 = none). Ignored elsewhere.
+    icon_resource_id: u16 = 0,
 };
 
 pub const SystemTheme = enum { unknown, light, dark };

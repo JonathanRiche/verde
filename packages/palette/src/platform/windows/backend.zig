@@ -58,6 +58,9 @@ pub const AppOptions = struct {
     /// Turn Ctrl+C / Ctrl+Break / console close into `Event.quit` (SetConsoleCtrlHandler),
     /// like SDL. Only one App per process may enable it.
     handle_signals: bool = false,
+    /// Windows: ICON resource id in the executable used for the title bar,
+    /// Alt+Tab and taskbar window icon (0 = none). Ignored elsewhere.
+    icon_resource_id: u16 = 0,
 };
 
 pub const SystemTheme = enum { unknown, light, dark };
@@ -290,6 +293,12 @@ pub const App = struct {
     modal_ctx: ?*anyopaque = null,
     in_modal_callback: bool = false,
 
+    fn loadAppIcon(hinstance: w.HINSTANCE, id: u16, metric_x: i32, metric_y: i32) ?w.HICON {
+        if (id == 0) return null;
+        const handle = w.LoadImageW(hinstance, w.makeIntResource(id), w.IMAGE_ICON, w.GetSystemMetrics(metric_x), w.GetSystemMetrics(metric_y), w.LR_SHARED) orelse return null;
+        return @ptrCast(handle);
+    }
+
     pub fn init(gpa: std.mem.Allocator, options: AppOptions) !*App {
         // Fails with ERROR_ACCESS_DENIED when a manifest already set the awareness: fine.
         _ = w.SetProcessDpiAwarenessContext(w.DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -309,6 +318,11 @@ pub const App = struct {
             .lpfnWndProc = wndProc,
             .hInstance = app.hinstance,
             .hCursor = w.LoadCursorW(null, w.makeIntResource(w.IDC_ARROW)),
+            // Without these the frame shows a blank icon even though the exe
+            // (and so the taskbar/Explorer) carries one. Shared icons from the
+            // module need no DestroyIcon.
+            .hIcon = loadAppIcon(app.hinstance, options.icon_resource_id, w.SM_CXICON, w.SM_CYICON),
+            .hIconSm = loadAppIcon(app.hinstance, options.icon_resource_id, w.SM_CXSMICON, w.SM_CYSMICON),
             .lpszClassName = &app.class_name,
         };
         if (w.RegisterClassExW(&wc) == 0) return error.RegisterClassFailed;

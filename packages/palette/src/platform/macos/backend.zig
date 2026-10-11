@@ -74,6 +74,9 @@ pub const AppOptions = struct {
     /// Activate the app (bring it to the front) when the first window is shown. Unbundled
     /// executables are not activated by the system on launch, so a GUI app wants this.
     activate: bool = true,
+    /// Windows: ICON resource id in the executable used for the title bar,
+    /// Alt+Tab and taskbar window icon (0 = none). Ignored elsewhere.
+    icon_resource_id: u16 = 0,
 };
 
 pub const SystemTheme = enum { unknown, light, dark };
