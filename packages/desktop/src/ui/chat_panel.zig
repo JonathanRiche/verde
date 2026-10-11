@@ -5762,6 +5762,24 @@ fn pendingEventsTerminateBackgroundTask(events: []const chat_types.PendingTimeli
     return false;
 }
 
+fn pendingBackgroundCommandEventForTask(events: []const chat_types.PendingTimelineEvent, task: *const app_state.BackgroundTask) ?usize {
+    var index = events.len;
+    while (index > 0) {
+        index -= 1;
+        const event = events[index];
+        if (event.role != .system or !chat_types.ChatThread.isBackgroundCommandEvent(event.author)) continue;
+        if (task.matchesEventBody(event.body)) return index;
+    }
+    return null;
+}
+
+fn pinnedBackgroundCommandTaskRowExists(rows: []const PinnedBackgroundCommand, count: usize, task_index: usize) bool {
+    for (rows[0..count]) |row| {
+        if (row.task_index == task_index) return true;
+    }
+    return false;
+}
+
 fn collectPinnedBackgroundCommands(
     thread: *const app_state.ChatThread,
     rows: *[MAX_PINNED_BACKGROUND_COMMANDS]PinnedBackgroundCommand,
@@ -5781,7 +5799,21 @@ fn collectPinnedBackgroundCommands(
         if (task.status != .running) continue;
         if (pendingEventsTerminateBackgroundTask(pending_events, task)) continue;
         if (count >= rows.len) break;
-        const row = pinnedRowForRunningTask(mutable_thread, task, task_index);
+        var row = pinnedRowForRunningTask(mutable_thread, task, task_index);
+        // Mid-turn the task's own "Background command" event is still pending,
+        // not in `messages`; adopt it so the task renders once with its full
+        // body instead of a command-only fallback beside the pending card.
+        if (!chat_types.ChatThread.isBackgroundCommandEvent(row.author) or row.message_index == std.math.maxInt(usize)) {
+            if (pendingBackgroundCommandEventForTask(pending_events, task)) |pending_index| {
+                const event = pending_events[pending_index];
+                row = .{
+                    .message_index = thread.messages.items.len + pending_index,
+                    .task_index = task_index,
+                    .author = event.author,
+                    .body = event.body,
+                };
+            }
+        }
         if (pinnedBackgroundCommandRowDuplicate(rows, count, row.body)) continue;
         rows[count] = row;
         count += 1;
@@ -5802,6 +5834,9 @@ fn collectPinnedBackgroundCommands(
             (@intFromPtr(task) - @intFromPtr(mutable_thread.background_tasks.items.ptr)) / @sizeOf(app_state.BackgroundTask)
         else
             null;
+        if (task_index) |index| {
+            if (pinnedBackgroundCommandTaskRowExists(rows, count, index)) continue;
+        }
         rows[count] = .{
             .message_index = base + pending_index,
             .task_index = task_index,
@@ -6039,6 +6074,44 @@ test "running background tasks pin even without a transcript row" {
     try std.testing.expectEqual(@as(?usize, 0), rows[0].task_index);
     try std.testing.expectEqualStrings("Background command", rows[0].author);
     try std.testing.expectEqualStrings("bun run dev", rows[0].body);
+}
+
+test "a running task with a pending detached event pins one card" {
+    const allocator = std.testing.allocator;
+    const page = std.heap.page_allocator;
+    var thread = try app_state.ChatThread.init(allocator, "Detached background pin");
+    defer thread.deinit(allocator);
+    const command = "for i in $(seq 1 40); do echo $i; sleep 0.3; done";
+    const body = command ++ "\n\nVerde task ID: vbgtest01\nOutput log: /tmp/verde-claude-bg-vbgtest01.log\nPID file: /tmp/verde-claude-bg-vbgtest01.pid";
+    try thread.messages.append(allocator, .{
+        .role = .user,
+        .author = try allocator.dupeZ(u8, "You"),
+        .body = try allocator.dupeZ(u8, "go"),
+    });
+    try thread.background_tasks.append(allocator, .{
+        .command = try allocator.dupeZ(u8, command),
+        .task_id = try allocator.dupeZ(u8, "vbgtest01"),
+        .status = .running,
+    });
+    thread.send_state.status = .pending;
+    try thread.send_state.pending_events.append(page, .{
+        .role = .system,
+        .author = try page.dupe(u8, "Ran command"),
+        .body = try page.dupe(u8, command),
+    });
+    try thread.send_state.pending_events.append(page, .{
+        .role = .system,
+        .author = try page.dupe(u8, "Background command"),
+        .body = try page.dupe(u8, body),
+    });
+
+    var rows: [MAX_PINNED_BACKGROUND_COMMANDS]PinnedBackgroundCommand = undefined;
+    const count = collectPinnedBackgroundCommands(&thread, &rows);
+    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expectEqual(@as(usize, 2), rows[0].message_index);
+    try std.testing.expectEqual(@as(?usize, 0), rows[0].task_index);
+    try std.testing.expectEqualStrings("Background command", rows[0].author);
+    try std.testing.expectEqualStrings(body, rows[0].body);
 }
 
 test "background-task pin hits survive rendering another chat pane" {
