@@ -285,6 +285,24 @@ test "collection: shape cache hits and text_layout adapter" {
     try testing.expect(fm.line_height > 0);
 }
 
+test "collection: shape cache rotation never stores empty glyph runs" {
+    const c = try Collection.create(testing.allocator, .{ .io = testing.io, .shape_cache_bytes = 4096 });
+    defer c.destroy();
+    var buf: [1024]u8 = undefined;
+    const sans = try c.addFace(.{ .path = assetPath(&buf, "NotoSans-Regular.ttf") });
+    try c.setRoleChain(.ui, &.{sans});
+    var text_buf: [64]u8 = undefined;
+    var i: usize = 0;
+    while (i < 200) : (i += 1) {
+        const text = try std.fmt.bufPrint(&text_buf, "can you fix some of the file icnos {d}", .{i});
+        const first = try c.shapeCached(.ui, 16, text);
+        try testing.expect(first.len > 0);
+        // A second lookup is served from the cache (possibly the other generation).
+        const again = try c.shapeCached(.ui, 16, text);
+        try testing.expectEqual(first.len, again.len);
+    }
+}
+
 test "collection: rasterize via GlyphKey" {
     const t = try TestSet.init();
     defer t.deinit();

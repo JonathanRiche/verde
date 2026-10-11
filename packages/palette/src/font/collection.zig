@@ -458,9 +458,15 @@ pub const Collection = struct {
         if (cur.bytes() > self.options.shape_cache_bytes / 2) {
             self.cur_gen = 1 - self.cur_gen;
             cur = &self.gens[self.cur_gen];
-            // `glyphs` may point into the generation we are about to recycle: copy first.
-            self.tmp_out.clearRetainingCapacity();
-            if (glyphs.ptr != self.tmp_out.items.ptr) try self.tmp_out.appendSlice(gpa, glyphs);
+            // `glyphs` may point into the generation we are about to recycle: copy
+            // it into `tmp_out` first. When `glyphs` already *is* `tmp_out` (a fresh
+            // shape on a miss), clearing it would drop the glyphs and cache the text
+            // with zero glyphs, so it would neither draw nor measure until the next
+            // rotation (composer text vanished after a keystroke).
+            if (glyphs.ptr != self.tmp_out.items.ptr) {
+                self.tmp_out.clearRetainingCapacity();
+                try self.tmp_out.appendSlice(gpa, glyphs);
+            }
             cur.reset();
             return self.insertInto(cur, key, text, self.tmp_out.items);
         }
