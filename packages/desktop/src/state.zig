@@ -9646,7 +9646,9 @@ pub const AppState = struct {
             return true;
         }
         if (insert_text.len < text.len) self.setSidebarNotice("Pasted text was truncated to fit the prompt");
-        const handled = self.composer_controller.composer.handleInput(self.allocator, .{ .text = insert_text }) catch |err| {
+        // Not a `.text` input event: those carry typed characters and drop line
+        // breaks, which would flatten multi-line pastes.
+        const handled = self.composer_controller.composer.insertPastedText(self.allocator, insert_text) catch |err| {
             log.warn("palette composer paste failed: {s}", .{@errorName(err)});
             return false;
         };

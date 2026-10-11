@@ -626,6 +626,16 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             self.emit(.{ .text_changed = self.buffer.items });
         }
 
+        /// Inserts clipboard text at the caret (replacing any selection). Unlike
+        /// a `.text` input event, which carries typed characters and drops line
+        /// breaks, pasted text keeps its newlines (CR and other controls are
+        /// still stripped). Returns false when the prompt is not focused.
+        pub fn insertPastedText(self: *Component, allocator: std.mem.Allocator, value: []const u8) !bool {
+            if (!self.focused) return false;
+            try self.insertText(allocator, value);
+            return true;
+        }
+
         pub fn text(self: *const Component) []const u8 {
             return self.buffer.items;
         }
@@ -2330,6 +2340,17 @@ test "composer prompt drops text-input control and replacement glyphs" {
     try std.testing.expectEqualStrings("abcd\n", prompt.text());
     try prompt.setText(std.testing.allocator, "one\xef\xbf\xbd\ntwo\rthree");
     try std.testing.expectEqualStrings("one\ntwothree", prompt.text());
+}
+
+test "composer prompt keeps newlines in pasted text" {
+    const Prompt = ComposerPrompt(.{});
+    var prompt = Prompt.init();
+    defer prompt.deinit(std.testing.allocator);
+
+    try std.testing.expect(!try prompt.insertPastedText(std.testing.allocator, "ignored"));
+    try std.testing.expect(try prompt.handleInput(std.testing.allocator, .{ .mouse_down = .{ .x = prompt.textRect().x + 2, .y = prompt.textRect().y + 2 } }));
+    try std.testing.expect(try prompt.insertPastedText(std.testing.allocator, "one\r\ntwo\x07\nthree"));
+    try std.testing.expectEqualStrings("one\ntwo\nthree", prompt.text());
 }
 
 fn proportionalAdvance(_: ?*anyopaque, text: []const u8, byte_offset: usize, _: f32) text_layout.Advance {
