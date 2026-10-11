@@ -17,10 +17,8 @@ import zipfile
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 APP_USER_MODEL_ID = "Verde.Desktop"
-RUNTIME_DLLS = ("fff_c.dll", "SDL3.dll", "SDL3_ttf.dll", "WebView2Loader.dll")
+RUNTIME_DLLS = ("fff_c.dll", "WebView2Loader.dll")
 DEPENDENCY_LICENSES = (
-    "SDL3-LICENSE.txt",
-    "SDL3_ttf-LICENSE.txt",
     "WebView2-LICENSE.txt",
     "WebView2-NOTICE.txt",
 )
@@ -190,7 +188,7 @@ def verify_executable(
             f"{expected_version}"
         )
     if (expected_version.encode("ascii") + b"\0") not in data:
-        raise RuntimeError(f"{path} does not embed CLI/SDL build version {expected_version}")
+        raise RuntimeError(f"{path} does not embed CLI/GUI build version {expected_version}")
     if fixed_version_info_bytes(expected_version) not in data:
         numeric = ".".join(str(value) for value in windows_numeric_version(expected_version))
         raise RuntimeError(f"{path} does not contain numeric VERSIONINFO {numeric}")

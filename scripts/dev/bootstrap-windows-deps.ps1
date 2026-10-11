@@ -36,12 +36,6 @@ if (-not (Test-Path -LiteralPath $DependencyRoot -PathType Container)) {
   throw "Windows dependency bootstrap did not produce a normalized dependency root: $DependencyRoot"
 }
 
-$env:VERDE_SDL3_INCLUDE_DIR = Join-Path $DependencyRoot "include"
-$env:VERDE_SDL3_LIB_DIR = Join-Path $DependencyRoot "lib"
-$env:VERDE_SDL3_RUNTIME_LIB = Join-Path $DependencyRoot "bin\SDL3.dll"
-$env:VERDE_SDL3_TTF_INCLUDE_DIR = Join-Path $DependencyRoot "include"
-$env:VERDE_SDL3_TTF_LIB_DIR = Join-Path $DependencyRoot "lib"
-$env:VERDE_SDL3_TTF_RUNTIME_LIB = Join-Path $DependencyRoot "bin\SDL3_ttf.dll"
 $env:WEBVIEW2_INCLUDE_DIR = Join-Path $DependencyRoot "include"
 $LoaderImportRelativePath = if ($Toolchain -eq "gnu") { "lib\libWebView2Loader.a" } else { "lib\WebView2Loader.lib" }
 $env:WEBVIEW2_LOADER_LIB = Join-Path $DependencyRoot $LoaderImportRelativePath
@@ -53,12 +47,6 @@ function Quote-PowerShellLiteral([string]$Value) {
 
 $EnvironmentFile = Join-Path $DependencyRoot "env.ps1"
 $EnvironmentLines = @(
-  "`$env:VERDE_SDL3_INCLUDE_DIR = $(Quote-PowerShellLiteral $env:VERDE_SDL3_INCLUDE_DIR)",
-  "`$env:VERDE_SDL3_LIB_DIR = $(Quote-PowerShellLiteral $env:VERDE_SDL3_LIB_DIR)",
-  "`$env:VERDE_SDL3_RUNTIME_LIB = $(Quote-PowerShellLiteral $env:VERDE_SDL3_RUNTIME_LIB)",
-  "`$env:VERDE_SDL3_TTF_INCLUDE_DIR = $(Quote-PowerShellLiteral $env:VERDE_SDL3_TTF_INCLUDE_DIR)",
-  "`$env:VERDE_SDL3_TTF_LIB_DIR = $(Quote-PowerShellLiteral $env:VERDE_SDL3_TTF_LIB_DIR)",
-  "`$env:VERDE_SDL3_TTF_RUNTIME_LIB = $(Quote-PowerShellLiteral $env:VERDE_SDL3_TTF_RUNTIME_LIB)",
   "`$env:WEBVIEW2_INCLUDE_DIR = $(Quote-PowerShellLiteral $env:WEBVIEW2_INCLUDE_DIR)",
   "`$env:WEBVIEW2_LOADER_LIB = $(Quote-PowerShellLiteral $env:WEBVIEW2_LOADER_LIB)",
   "`$env:WEBVIEW2_LOADER_DLL = $(Quote-PowerShellLiteral $env:WEBVIEW2_LOADER_DLL)"

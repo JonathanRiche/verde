@@ -86,40 +86,12 @@ def copy_file(source: Path, destination: Path) -> None:
 def source_artifacts(lock: dict, toolchain: str) -> list[tuple[str, dict]]:
     packages = lock["packages"]
     return [
-        ("sdl3", packages["sdl3"][toolchain]),
-        ("sdl3_ttf", packages["sdl3_ttf"][toolchain]),
         ("webview2", packages["webview2"]),
         ("event_token", packages["event_token"]),
     ]
 
 
 def normalize(lock: dict, toolchain: str, extracted: dict[str, Path], output: Path) -> None:
-    sdl_version = lock["packages"]["sdl3"]["version"]
-    ttf_version = lock["packages"]["sdl3_ttf"]["version"]
-    sdl_outer = extracted["sdl3"] / f"SDL3-{sdl_version}"
-    ttf_outer = extracted["sdl3_ttf"] / f"SDL3_ttf-{ttf_version}"
-
-    if toolchain == "gnu":
-        sdl_root = sdl_outer / "x86_64-w64-mingw32"
-        ttf_root = ttf_outer / "x86_64-w64-mingw32"
-        copy_tree(sdl_root / "include" / "SDL3", output / "include" / "SDL3")
-        copy_tree(ttf_root / "include" / "SDL3_ttf", output / "include" / "SDL3_ttf")
-        copy_file(sdl_root / "lib" / "libSDL3.dll.a", output / "lib" / "libSDL3.dll.a")
-        copy_file(ttf_root / "lib" / "libSDL3_ttf.dll.a", output / "lib" / "libSDL3_ttf.dll.a")
-        # Zig's Windows GNU system-library lookup searches libNAME.a, while SDL's
-        # MinGW archives use the more explicit libNAME.dll.a convention.
-        copy_file(sdl_root / "lib" / "libSDL3.dll.a", output / "lib" / "libSDL3.a")
-        copy_file(ttf_root / "lib" / "libSDL3_ttf.dll.a", output / "lib" / "libSDL3_ttf.a")
-        copy_file(sdl_root / "bin" / "SDL3.dll", output / "bin" / "SDL3.dll")
-        copy_file(ttf_root / "bin" / "SDL3_ttf.dll", output / "bin" / "SDL3_ttf.dll")
-    else:
-        copy_tree(sdl_outer / "include" / "SDL3", output / "include" / "SDL3")
-        copy_tree(ttf_outer / "include" / "SDL3_ttf", output / "include" / "SDL3_ttf")
-        copy_file(sdl_outer / "lib" / "x64" / "SDL3.lib", output / "lib" / "SDL3.lib")
-        copy_file(ttf_outer / "lib" / "x64" / "SDL3_ttf.lib", output / "lib" / "SDL3_ttf.lib")
-        copy_file(sdl_outer / "lib" / "x64" / "SDL3.dll", output / "bin" / "SDL3.dll")
-        copy_file(ttf_outer / "lib" / "x64" / "SDL3_ttf.dll", output / "bin" / "SDL3_ttf.dll")
-
     webview_root = extracted["webview2"]
     copy_tree(webview_root / "build" / "native" / "include", output / "include")
     # WebView2 imports this Windows SDK header, but Zig's bundled MinGW headers
@@ -130,32 +102,16 @@ def normalize(lock: dict, toolchain: str, extracted: dict[str, Path], output: Pa
     copy_file(loader_root / "WebView2Loader.dll.lib", output / "lib" / loader_name)
     copy_file(loader_root / "WebView2Loader.dll", output / "bin" / "WebView2Loader.dll")
 
-    copy_file(sdl_outer / "LICENSE.txt", output / "licenses" / "SDL3-LICENSE.txt")
-    copy_file(ttf_outer / "LICENSE.txt", output / "licenses" / "SDL3_ttf-LICENSE.txt")
     copy_file(webview_root / "LICENSE.txt", output / "licenses" / "WebView2-LICENSE.txt")
     copy_file(webview_root / "NOTICE.txt", output / "licenses" / "WebView2-NOTICE.txt")
 
 
 def required_paths(toolchain: str) -> list[str]:
-    libraries = (
-        [
-            "lib/libSDL3.dll.a",
-            "lib/libSDL3_ttf.dll.a",
-            "lib/libSDL3.a",
-            "lib/libSDL3_ttf.a",
-            "lib/libWebView2Loader.a",
-        ]
-        if toolchain == "gnu"
-        else ["lib/SDL3.lib", "lib/SDL3_ttf.lib", "lib/WebView2Loader.lib"]
-    )
+    libraries = ["lib/libWebView2Loader.a"] if toolchain == "gnu" else ["lib/WebView2Loader.lib"]
     return [
-        "include/SDL3/SDL.h",
-        "include/SDL3_ttf/SDL_ttf.h",
         "include/WebView2.h",
         "include/EventToken.h",
         *libraries,
-        "bin/SDL3.dll",
-        "bin/SDL3_ttf.dll",
         "bin/WebView2Loader.dll",
     ]
 

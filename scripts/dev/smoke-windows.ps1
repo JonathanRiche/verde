@@ -42,8 +42,6 @@ $RequiredFiles = @(
   "bin\verde.exe",
   "bin\verde-daemon.exe",
   "bin\fff_c.dll",
-  "bin\SDL3.dll",
-  "bin\SDL3_ttf.dll",
   "bin\WebView2Loader.dll",
   "share\verde\provider_bridge.mjs"
 )

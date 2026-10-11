@@ -339,12 +339,8 @@ $ExpectedAppUserModelId = "Verde.Desktop"
 $IdentityExecutables = @("app/Verde.exe", "bin/verde.exe")
 $ExpectedDlls = @(
   "app/fff_c.dll",
-  "app/SDL3.dll",
-  "app/SDL3_ttf.dll",
   "app/WebView2Loader.dll",
   "bin/fff_c.dll",
-  "bin/SDL3.dll",
-  "bin/SDL3_ttf.dll",
   "bin/WebView2Loader.dll"
 )
 $ActualExecutables = @(Get-ChildItem -LiteralPath $PackageRoot -Filter "*.exe" -File -Recurse | ForEach-Object { Get-RelativePath $_.FullName })
@@ -359,7 +355,7 @@ foreach ($Directory in @("app", "bin")) {
     throw "refusing to verify temporary fff stub: $FffPath"
   }
 }
-foreach ($RuntimeName in @("fff_c.dll", "SDL3.dll", "SDL3_ttf.dll", "WebView2Loader.dll")) {
+foreach ($RuntimeName in @("fff_c.dll", "WebView2Loader.dll")) {
   $AppHash = (Get-FileHash -LiteralPath (Join-Path $PackageRoot "app\$RuntimeName") -Algorithm SHA256).Hash
   $CliHash = (Get-FileHash -LiteralPath (Join-Path $PackageRoot "bin\$RuntimeName") -Algorithm SHA256).Hash
   if ($AppHash -ne $CliHash) {
@@ -438,7 +434,7 @@ foreach ($RelativePath in $ExpectedExecutables) {
   }
   $BuildVersionBytes = [Text.Encoding]::ASCII.GetBytes($ExpectedVersion + [char]0)
   if (-not (Test-BinaryContainsBytes $Path $BuildVersionBytes)) {
-    throw "$RelativePath does not embed CLI/SDL build version $ExpectedVersion"
+    throw "$RelativePath does not embed CLI/GUI build version $ExpectedVersion"
   }
   if (-not (Test-BinaryContainsBytes $Path (Get-FixedVersionInfoBytes $NumericVersion))) {
     throw "$RelativePath does not contain numeric VERSIONINFO $NumericVersionText"

@@ -30,7 +30,7 @@ if ([string]::IsNullOrWhiteSpace($PrefixDir)) {
 }
 
 & (Join-Path $RepoRoot "scripts\dev\bootstrap-windows-deps.ps1") -Toolchain msvc | Out-Host
-$DependencyRoot = Split-Path -Parent $env:VERDE_SDL3_INCLUDE_DIR
+$DependencyRoot = Split-Path -Parent $env:WEBVIEW2_INCLUDE_DIR
 
 if (-not $SkipBuild) {
   Remove-Item -LiteralPath $PrefixDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -72,8 +72,6 @@ function Copy-RequiredFile([string]$Source, [string]$Destination) {
 
 $RequiredRuntimeFiles = @(
   "fff_c.dll",
-  "SDL3.dll",
-  "SDL3_ttf.dll",
   "WebView2Loader.dll"
 )
 Copy-RequiredFile (Join-Path $PrefixDir "bin\verde-gui.exe") (Join-Path $PackageRoot "app\Verde.exe")
@@ -229,14 +227,10 @@ $ExtractedRoot = Join-Path $ExtractionRoot $PackageName
 foreach ($RelativePath in @(
   "app\Verde.exe",
   "app\fff_c.dll",
-  "app\SDL3.dll",
-  "app\SDL3_ttf.dll",
   "app\WebView2Loader.dll",
   "bin\verde.exe",
   "bin\verde-daemon.exe",
   "bin\fff_c.dll",
-  "bin\SDL3.dll",
-  "bin\SDL3_ttf.dll",
   "bin\WebView2Loader.dll",
   "share\verde\provider_bridge.mjs",
   "share\verde\windows-package-verification.json",
