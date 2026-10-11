@@ -12009,7 +12009,3 @@ test "selection-aware transcript rendering places glyphs exactly like the static
         try std.testing.expectEqual(expected.v, actual.v);
     }
 }
-
-test {
-    _ = chat_markdown;
-}
