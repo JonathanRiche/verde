@@ -565,7 +565,26 @@ fn spawnWindowsDaemon(allocator: std.mem.Allocator, daemon_exe: []const u8) !voi
         null,
         &startup_info,
         &process_info,
-    ).toBool()) return windows.unexpectedError(windows.GetLastError());
+    ).toBool()) {
+        const last_error = windows.GetLastError();
+        log.warn("CreateProcessW for the session daemon failed: win32 error {d} ({s}), env block {d} units; retrying with the inherited environment", .{ @intFromEnum(last_error), @tagName(last_error), environment.slice.len });
+        if (!windows.kernel32.CreateProcessW(
+            application_w.ptr,
+            command_line_w.ptr,
+            null,
+            null,
+            .FALSE,
+            creation_flags,
+            null,
+            null,
+            &startup_info,
+            &process_info,
+        ).toBool()) {
+            const retry_error = windows.GetLastError();
+            log.warn("CreateProcessW retry failed: win32 error {d} ({s})", .{ @intFromEnum(retry_error), @tagName(retry_error) });
+            return windows.unexpectedError(retry_error);
+        }
+    }
     windows.CloseHandle(process_info.hThread);
     windows.CloseHandle(process_info.hProcess);
 }

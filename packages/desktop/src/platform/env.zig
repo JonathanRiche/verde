@@ -319,14 +319,18 @@ fn appendWindowsRegistryPathDirs(allocator: std.mem.Allocator, path_builder: *st
     for (sources) |source| {
         var size: u32 = @intCast(buf.len * 2);
         if (win_reg.RegGetValueW(source.key, source.subkey, value_name, win_reg.RRF_RT_REG_SZ, null, buf.ptr, &size) != 0) continue;
-        var units = buf[0 .. size / 2];
-        while (units.len > 0 and units[units.len - 1] == 0) units = units[0 .. units.len - 1];
+        // With REG_EXPAND_SZ expansion the reported size can exceed the
+        // string, leaving a NUL plus stale buffer bytes inside it. An
+        // embedded NUL in PATH corrupts the CreateProcessW environment block
+        // (ERROR_INVALID_PARAMETER), so cut at the first NUL.
+        const reported = buf[0..@min(size / 2, buf.len)];
+        const units = reported[0 .. std.mem.indexOfScalar(u16, reported, 0) orelse reported.len];
         const value = std.unicode.utf16LeToUtf8Alloc(allocator, units) catch continue;
         defer allocator.free(value);
         var dirs = std.mem.tokenizeScalar(u8, value, ';');
         while (dirs.next()) |dir| {
             const trimmed = std.mem.trim(u8, dir, " \t");
-            if (trimmed.len == 0) continue;
+            if (trimmed.len == 0 or std.mem.indexOfScalar(u8, trimmed, 0) != null) continue;
             try appendUniquePathDirForOs(allocator, path_builder, .windows, trimmed);
         }
     }
