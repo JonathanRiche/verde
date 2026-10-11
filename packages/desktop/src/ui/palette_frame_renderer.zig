@@ -59,10 +59,195 @@ pub fn snapshotRequested() bool {
     return std.c.access(request.ptr, 0) == 0;
 }
 
+var stats_path_state: enum { unknown, unset, set } = .unknown;
+var stats_path_value: [:0]const u8 = "";
+
+fn statsPath() ?[:0]const u8 {
+    if (stats_path_state == .unknown) {
+        stats_path_state = .unset;
+        if (std.c.getenv("VERDE_PALETTE_STATS")) |value| {
+            stats_path_value = std.mem.span(value);
+            if (stats_path_value.len > 0) stats_path_state = .set;
+        }
+    }
+    return if (stats_path_state == .set) stats_path_value else null;
+}
+
+/// Frames the main loop handed to the renderer, by path.
+pub const FrameCounters = struct {
+    /// Full UI rebuild (renderRoot) frames that settled.
+    full: u64 = 0,
+    /// Browser-texture-only frames: the previous batch replayed with new
+    /// browser contents, no UI layout.
+    texture_only: u64 = 0,
+};
+
+/// The last laid-out frame, kept while a browser pane is visible so that a
+/// frame whose only change is new browser texture contents can be presented
+/// by replaying it: no UI layout, text measurement or batch building. The
+/// browser image samples the pane texture by id, so the replay picks up the
+/// newly bound dma-buf (or streamed) frame, and the renderer's damage
+/// tracking repaints and presents only the browser rect (plus anything drawn
+/// above it, so overlays stay composited).
+///
+/// The batch is a deep copy (texts live in `text`), so state changes after
+/// the layout cannot leave it pointing at freed strings.
+pub const RetainedFrame = struct {
+    batch: palette.RenderBatch = .{},
+    text: std.heap.ArenaAllocator,
+    valid: bool = false,
+    framebuffer_width: c_int = 0,
+    framebuffer_height: c_int = 0,
+    ui_scale: f32 = 0,
+    /// Pane texture the batch's browser image samples.
+    browser_texture_id: u32 = 0,
+    /// The browser image's visible rect, inset by `pointer_inset`; null when
+    /// something is drawn above any part of it (menus, tooltips, toasts), so
+    /// pointer motion there may change Verde UI.
+    pointer_rect: ?palette.Rect = null,
+    /// Pointer position the batch was laid out for.
+    mouse_x: f32 = 0,
+    mouse_y: f32 = 0,
+    built_ms: i64 = 0,
+    /// `loop_wakeup.layoutSequence()` sampled before the layout.
+    layout_sequence: u64 = 0,
+
+    /// Pane borders and focus rings straddle the image edge; ignore them.
+    const pointer_inset: f32 = 4.0;
+    /// Replays stop after this long, so state that changed without
+    /// requesting a frame still reaches the screen promptly.
+    pub const max_age_ms: i64 = 1000;
+
+    pub const Layout = struct {
+        framebuffer_width: c_int,
+        framebuffer_height: c_int,
+        ui_scale: f32,
+        browser_texture_id: u32,
+        mouse_x: f32,
+        mouse_y: f32,
+        now_ms: i64,
+        layout_sequence: u64,
+    };
+
+    pub fn init(allocator: std.mem.Allocator) RetainedFrame {
+        return .{ .text = std.heap.ArenaAllocator.init(allocator) };
+    }
+
+    pub fn deinit(self: *RetainedFrame, allocator: std.mem.Allocator) void {
+        self.batch.deinit(allocator);
+        self.text.deinit();
+        self.* = undefined;
+    }
+
+    pub fn invalidate(self: *RetainedFrame) void {
+        self.valid = false;
+    }
+
+    /// Copies `source` (the frame just presented). Stays invalid when the
+    /// batch does not draw `layout.browser_texture_id`.
+    pub fn capture(self: *RetainedFrame, allocator: std.mem.Allocator, source: *const palette.RenderBatch, layout: Layout) void {
+        self.valid = false;
+        if (layout.browser_texture_id == 0) return;
+        const image_index = findImage(source, layout.browser_texture_id) orelse return;
+        self.batch.clear();
+        _ = self.text.reset(.retain_capacity);
+        self.batch.appendStableBatch(allocator, self.text.allocator(), source) catch return;
+        self.pointer_rect = pointerRect(source, image_index);
+        self.framebuffer_width = layout.framebuffer_width;
+        self.framebuffer_height = layout.framebuffer_height;
+        self.ui_scale = layout.ui_scale;
+        self.browser_texture_id = layout.browser_texture_id;
+        self.mouse_x = layout.mouse_x;
+        self.mouse_y = layout.mouse_y;
+        self.built_ms = layout.now_ms;
+        self.layout_sequence = layout.layout_sequence;
+        self.valid = true;
+    }
+
+    /// Whether the retained batch still shows what a rebuild would draw,
+    /// apart from the browser texture contents.
+    pub fn canReplay(self: *const RetainedFrame, current: Layout) bool {
+        if (!self.valid) return false;
+        if (current.framebuffer_width != self.framebuffer_width or current.framebuffer_height != self.framebuffer_height) return false;
+        if (@abs(current.ui_scale - self.ui_scale) > 0.001) return false;
+        if (current.browser_texture_id == 0 or current.browser_texture_id != self.browser_texture_id) return false;
+        if (current.layout_sequence != self.layout_sequence) return false;
+        if (current.now_ms < self.built_ms or current.now_ms - self.built_ms >= max_age_ms) return false;
+        return true;
+    }
+
+    /// True when both the laid-out and the current pointer position are over
+    /// the browser page with nothing drawn above it: pointer input there only
+    /// reaches the page (WebKit), not Verde's hover state.
+    pub fn pointerStaysInBrowser(self: *const RetainedFrame, mouse_x: f32, mouse_y: f32) bool {
+        if (!self.valid) return false;
+        const r = self.pointer_rect orelse return false;
+        return rectContains(r, self.mouse_x, self.mouse_y) and rectContains(r, mouse_x, mouse_y);
+    }
+
+    fn findImage(batch: *const palette.RenderBatch, texture_id: u32) ?usize {
+        for (batch.commands.items, 0..) |command, index| {
+            if (command.kind == .image and command.texture.value == texture_id) return index;
+        }
+        return null;
+    }
+
+    fn pointerRect(batch: *const palette.RenderBatch, image_index: usize) ?palette.Rect {
+        const image = batch.commands.items[image_index];
+        const visible = visibleRect(image) orelse return null;
+        const inset: palette.Rect = .{
+            .x = visible.x + pointer_inset,
+            .y = visible.y + pointer_inset,
+            .w = visible.w - pointer_inset * 2,
+            .h = visible.h - pointer_inset * 2,
+        };
+        if (inset.w <= 0 or inset.h <= 0) return null;
+        // Commands are z-sorted: everything after the image draws above it.
+        for (batch.commands.items[image_index + 1 ..]) |command| {
+            const above = visibleRect(command) orelse continue;
+            if (intersects(above, inset)) return null;
+        }
+        return inset;
+    }
+
+    fn visibleRect(command: palette.draw.Command) ?palette.Rect {
+        var r = command.rect;
+        if (command.kind == .triangle) {
+            const min_x = @min(command.p0.x, @min(command.p1.x, command.p2.x));
+            const min_y = @min(command.p0.y, @min(command.p1.y, command.p2.y));
+            const max_x = @max(command.p0.x, @max(command.p1.x, command.p2.x));
+            const max_y = @max(command.p0.y, @max(command.p1.y, command.p2.y));
+            r = .{ .x = min_x, .y = min_y, .w = max_x - min_x, .h = max_y - min_y };
+        }
+        if (command.clip) |clip| r = intersection(r, clip) orelse return null;
+        if (r.w <= 0 or r.h <= 0) return null;
+        return r;
+    }
+
+    fn intersection(a: palette.Rect, b: palette.Rect) ?palette.Rect {
+        const x0 = @max(a.x, b.x);
+        const y0 = @max(a.y, b.y);
+        const x1 = @min(a.x + a.w, b.x + b.w);
+        const y1 = @min(a.y + a.h, b.y + b.h);
+        if (x1 <= x0 or y1 <= y0) return null;
+        return .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
+    }
+
+    fn intersects(a: palette.Rect, b: palette.Rect) bool {
+        return intersection(a, b) != null;
+    }
+
+    fn rectContains(r: palette.Rect, x: f32, y: f32) bool {
+        return x >= r.x and y >= r.y and x < r.x + r.w and y < r.y + r.h;
+    }
+};
+
 pub const Renderer = struct {
     gfx: *palette.Graphics,
     wr: palette.WindowRenderer,
     next_texture_id: u32 = 1,
+    counters: FrameCounters = .{},
+    last_stats_write_ns: u64 = 0,
 
     pub const InitOptions = struct {
         app: *palette.platform.App,
@@ -156,6 +341,36 @@ pub const Renderer = struct {
             if (n <= 0) return;
             written += @intCast(n);
         }
+    }
+
+    /// Dev hook for perf trials: with `VERDE_PALETTE_STATS=/path`, appends one
+    /// line per second with the present loop counters, frames by path and the
+    /// renderer's GPU memory, so a driver can compute frames/s on hidden outputs.
+    pub fn maybeWriteDevStats(self: *Renderer, now_ns: u64) void {
+        if (comptime @import("builtin").os.tag == .windows) return;
+        const path = statsPath() orelse return;
+        if (self.last_stats_write_ns != 0 and now_ns -% self.last_stats_write_ns < std.time.ns_per_s) return;
+        self.last_stats_write_ns = now_ns;
+        const ws = self.wr.stats;
+        const memory = self.gpuMemory();
+        var line_buffer: [512]u8 = undefined;
+        const line = std.fmt.bufPrint(&line_buffer, "t_ms={d} presented={d} unchanged={d} throttled={d} no_buffer={d} frame_timeouts={d} full={d} texture_only={d} gpu_device_bytes={d} gpu_host_bytes={d} window_buffer_bytes={d}\n", .{
+            now_ns / std.time.ns_per_ms,
+            ws.presented,
+            ws.unchanged,
+            ws.throttled,
+            ws.no_buffer,
+            ws.frame_timeouts,
+            self.counters.full,
+            self.counters.texture_only,
+            memory.device_local_bytes,
+            memory.host_visible_bytes,
+            memory.window_buffer_bytes,
+        }) catch return;
+        const fd = std.c.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, @as(std.c.mode_t, 0o600));
+        if (fd < 0) return;
+        defer _ = std.c.close(fd);
+        _ = std.c.write(fd, line.ptr, line.len);
     }
 
     pub fn lastFrameStats(self: *const Renderer) palette.gpu.FrameStats {
@@ -324,3 +539,82 @@ pub const Renderer = struct {
         return id;
     }
 };
+
+fn testLayout(texture_id: u32, now_ms: i64) RetainedFrame.Layout {
+    return .{
+        .framebuffer_width = 800,
+        .framebuffer_height = 600,
+        .ui_scale = 1.25,
+        .browser_texture_id = texture_id,
+        .mouse_x = 500,
+        .mouse_y = 300,
+        .now_ms = now_ms,
+        .layout_sequence = 7,
+    };
+}
+
+test "retained frame replays only while the layout inputs are unchanged" {
+    const allocator = std.testing.allocator;
+    var source: palette.RenderBatch = .{};
+    defer source.deinit(allocator);
+    const white: palette.Color = .{ .r = 1, .g = 1, .b = 1, .a = 1 };
+    var label = [_]u8{ 'h', 'i' };
+    try source.rect(allocator, .{ .x = 0, .y = 0, .w = 800, .h = 600 }, white);
+    try source.text(allocator, .{ .x = 10, .y = 10, .w = 100, .h = 20 }, &label, white, 14, null);
+    try source.image(allocator, .{ .x = 400, .y = 100, .w = 300, .h = 400 }, palette.TextureId.init(9), .{ .w = 1, .h = 1 }, white, null);
+
+    var retained = RetainedFrame.init(allocator);
+    defer retained.deinit(allocator);
+    retained.capture(allocator, &source, testLayout(9, 1000));
+    try std.testing.expect(retained.valid);
+    // Texts are deep copies: later edits to frame-owned strings do not leak in.
+    label[0] = 'X';
+    try std.testing.expectEqualStrings("hi", retained.batch.commands.items[1].text);
+
+    try std.testing.expect(retained.canReplay(testLayout(9, 1500)));
+    try std.testing.expect(!retained.canReplay(testLayout(9, 1000 + RetainedFrame.max_age_ms)));
+    try std.testing.expect(!retained.canReplay(testLayout(10, 1500)));
+    var resized = testLayout(9, 1500);
+    resized.framebuffer_width = 801;
+    try std.testing.expect(!retained.canReplay(resized));
+    var rescaled = testLayout(9, 1500);
+    rescaled.ui_scale = 1.5;
+    try std.testing.expect(!retained.canReplay(rescaled));
+    var newer_state = testLayout(9, 1500);
+    newer_state.layout_sequence = 8;
+    try std.testing.expect(!retained.canReplay(newer_state));
+
+    // Pointer over the page, laid out there too: no Verde UI changes.
+    try std.testing.expect(retained.pointerStaysInBrowser(600, 200));
+    // Leaving the page (or onto its border) needs a layout.
+    try std.testing.expect(!retained.pointerStaysInBrowser(390, 200));
+    try std.testing.expect(!retained.pointerStaysInBrowser(402, 200));
+
+    retained.invalidate();
+    try std.testing.expect(!retained.canReplay(testLayout(9, 1500)));
+}
+
+test "retained frame treats anything drawn above the browser as live UI" {
+    const allocator = std.testing.allocator;
+    var source: palette.RenderBatch = .{};
+    defer source.deinit(allocator);
+    const white: palette.Color = .{ .r = 1, .g = 1, .b = 1, .a = 1 };
+    try source.image(allocator, .{ .x = 400, .y = 100, .w = 300, .h = 400 }, palette.TextureId.init(9), .{ .w = 1, .h = 1 }, white, null);
+    // A tooltip clipped away from the page does not count; one over it does.
+    try source.rect(allocator, .{ .x = 450, .y = 150, .w = 50, .h = 20 }, white);
+    source.commands.items[1].clip = .{ .x = 0, .y = 0, .w = 100, .h = 100 };
+
+    var retained = RetainedFrame.init(allocator);
+    defer retained.deinit(allocator);
+    retained.capture(allocator, &source, testLayout(9, 1000));
+    try std.testing.expect(retained.pointerStaysInBrowser(600, 200));
+
+    try source.rect(allocator, .{ .x = 450, .y = 150, .w = 50, .h = 20 }, white);
+    retained.capture(allocator, &source, testLayout(9, 1000));
+    try std.testing.expect(retained.valid);
+    try std.testing.expect(!retained.pointerStaysInBrowser(600, 200));
+
+    // A frame without the browser image is never retained.
+    retained.capture(allocator, &source, testLayout(11, 1000));
+    try std.testing.expect(!retained.valid);
+}

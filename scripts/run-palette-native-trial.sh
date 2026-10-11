@@ -38,7 +38,7 @@ done
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 root="${VERDE_PALETTE_TRIAL_ROOT:-$HOME/.local/share/verde-palette-trial}"
 real_home="$HOME"
-bin="$repo/zig-out/bin/verde"
+bin="${VERDE_PALETTE_TRIAL_BIN:-$repo/zig-out/bin/verde}"
 
 if [[ $real_data == 1 ]]; then
   real_pref="$real_home/.local/share/verde/Native"
@@ -113,8 +113,13 @@ wayland="${WAYLAND_DISPLAY:-wayland-0}"
 [[ "$wayland" == /* ]] || wayland="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/$wayland"
 
 # Drop everything that would point the trial at the user's Verde or herdr.
+# The env-gated dev hooks (VERDE_PALETTE_INJECT/SNAPSHOT/STATS) and the chat
+# stub (VERDE_SESSION_DAEMON_CHAT_STUB) pass through so perf runs can be driven.
 unset_vars=()
-while IFS= read -r name; do unset_vars+=(-u "$name"); done < <(env | sed -n 's/^\(VERDE_[A-Z0-9_]*\|HERDR_[A-Z0-9_]*\|SDL_[A-Z0-9_]*\)=.*/\1/p')
+while IFS= read -r name; do
+  case "$name" in VERDE_PALETTE_INJECT|VERDE_PALETTE_SNAPSHOT|VERDE_PALETTE_STATS|VERDE_SESSION_DAEMON_CHAT_STUB) continue ;; esac
+  unset_vars+=(-u "$name")
+done < <(env | sed -n 's/^\(VERDE_[A-Z0-9_]*\|HERDR_[A-Z0-9_]*\|SDL_[A-Z0-9_]*\)=.*/\1/p')
 
 echo "trial root:    $root"
 echo "data dir:      $data"

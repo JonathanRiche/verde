@@ -1527,7 +1527,8 @@ fn helperReaderMain(context: *ReaderContext) !void {
 
         if (parsed.value.kind == .frame_ready) {
             _ = try context.frame.update(context.allocator, parsed.value);
-            const wake_result = loop_wakeup.notifyResult();
+            // Only the pane texture changes; pollBrowser reports anything else.
+            const wake_result = loop_wakeup.notifyTextureFrameResult();
             context.frame.noteWake(wake_result);
             continue;
         }

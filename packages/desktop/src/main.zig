@@ -429,6 +429,13 @@ fn mainInner(init: std.process.Init) !void {
     var pending_wake_sequence: ?u64 = null;
     var previous_loop_start_ns = profiler.nowNs();
     var previous_loop_wait: LoopWaitTrace = .{};
+    // Browser-frame-only fast path: see `palette_frame_renderer.RetainedFrame`.
+    var retained_frame = palette_frame_renderer.RetainedFrame.init(allocator);
+    defer retained_frame.deinit(allocator);
+    // `loop_wakeup.layoutSequence()` covered by the last presented layout.
+    var layout_sequence_covered: u64 = 0;
+    // Pointer input since the last layout that may have changed Verde UI.
+    var motion_needs_layout = false;
     while (running) {
         const loop_start_ns = profiler.nowNs();
         const loop_gap_ns = profiler.elapsedNs(previous_loop_start_ns);
@@ -582,14 +589,27 @@ fn mainInner(init: std.process.Init) !void {
         const continuous_frames = continuous_interval_ms != 0;
         const continuous_frame_due = continuous_frames and render_pacer.continuousFrameDue(now_ms, continuous_interval_ms);
         const wake_frame_due = render_pacer.wakeRenderDue(now_ms, ACTIVE_WAIT_TIMEOUT_MS);
-        const event_needs_render = event_flags.has_non_mouse_motion or event_flags.renderer_redraw or
-            shouldRenderMouseMotion(event_flags.has_mouse_motion, continuous_frames, &last_mouse_motion_render_ms);
+        // Wakes that only announce a new browser frame leave the layout
+        // sequence alone; those frames need no UI rebuild.
+        const wake_needs_layout = wake_frame_due and loop_wakeup.layoutSequence() != layout_sequence_covered;
+        // Pointer motion and forwarded wheel over an unobstructed browser page
+        // only reach WebKit; the page answers with new frames.
+        const pointer_in_browser = retained_frame.pointerStaysInBrowser(
+            state.transcript_controller.palette_mouse_x,
+            state.transcript_controller.palette_mouse_y,
+        );
+        const layout_mouse_motion = event_flags.has_mouse_motion and !pointer_in_browser;
+        const layout_browser_wheel = event_flags.has_browser_wheel and !pointer_in_browser;
+        if (layout_mouse_motion or layout_browser_wheel) motion_needs_layout = true;
+        const event_needs_render = event_flags.has_non_mouse_motion or event_flags.renderer_redraw or layout_browser_wheel or
+            shouldRenderMouseMotion(layout_mouse_motion, continuous_frames, &last_mouse_motion_render_ms);
         // A wake-driven send change is covered by the display-rate wake frame.
         // Non-wake polling changes still render immediately.
         const immediate_send_render = send_needs_render and event_flags.loop_wakeup_sequence == null;
-        if (runtime_needs_render or immediate_send_render or background_tasks_need_render or browser_needs_render or terminal_needs_render or event_needs_render or framebuffer_size_changed or continuous_frame_due or wake_frame_due or state.workspaceSwitchFramePending()) {
+        if (runtime_needs_render or immediate_send_render or background_tasks_need_render or browser_needs_render or terminal_needs_render or event_needs_render or framebuffer_size_changed or continuous_frame_due or wake_needs_layout or state.workspaceSwitchFramePending()) {
             presentation_demand.request();
         }
+        if (state.takeBrowserTextureFrame() or wake_frame_due) presentation_demand.requestTextureOnly();
         // The present loop throttles until the compositor's frame callback (or
         // its timeout on hidden surfaces); building a frame it would refuse
         // only burns CPU, so keep the demand pending and wait for `.frame`.
@@ -607,6 +627,74 @@ fn mainInner(init: std.process.Init) !void {
             }
             recordFrameWithStallDiagnostic(frame_sample);
             maybeLogFrameProfile(frame_profile_logging, &last_frame_profile_log_ms, &palette_renderer);
+            palette_renderer.maybeWriteDevStats(monotonicNsU64());
+            continue;
+        }
+
+        if (presentation_demand.textureOnly() and !motion_needs_layout and
+            state.pendingWorkspaceSwitchTrace() == null and !state.workspaceSwitchFramePending())
+        texture_only: {
+            var replay_width: c_int = 0;
+            var replay_height: c_int = 0;
+            getWindowSizeInPixels(window, &replay_width, &replay_height);
+            if (!retained_frame.canReplay(retainedFrameLayout(&state, replay_width, replay_height, currentWindowDisplayScale(window), now_ms))) break :texture_only;
+            var replay_presented = false;
+            recordSpan(&frame_sample, .draw_backend, struct {
+                fn run(
+                    palette_command_renderer: *palette_frame_renderer.Renderer,
+                    retained: *palette_frame_renderer.RetainedFrame,
+                    allocator_arg: std.mem.Allocator,
+                    framebuffer_width: c_int,
+                    framebuffer_height: c_int,
+                    presented: *bool,
+                ) void {
+                    const outcome = palette_command_renderer.renderBatch(
+                        allocator_arg,
+                        &retained.batch,
+                        @floatFromInt(framebuffer_width),
+                        @floatFromInt(framebuffer_height),
+                    ) catch |err| {
+                        log.warn("failed to replay retained palette batch: {s}", .{@errorName(err)});
+                        retained.invalidate();
+                        return;
+                    };
+                    presented.* = palette_frame_renderer.outcomePresented(outcome);
+                }
+            }.run, .{ &palette_renderer, &retained_frame, allocator, replay_width, replay_height, &replay_presented });
+            logSlowGpuFrameStages(palette_renderer.lastFrameStats());
+            if (!retained_frame.valid) break :texture_only;
+            presentation_demand.noteAttempt(replay_presented);
+            if (replay_presented) {
+                palette_renderer.counters.texture_only += 1;
+                state.noteBrowserFramePresented();
+                render_pacer.noteRendered(monotonicMs());
+                recordSpan(&frame_sample, .flush_dirty, struct {
+                    fn run(app_state: *AppState) void {
+                        app_state.pollFlushWorker();
+                        app_state.flushIfDirty();
+                    }
+                }.run, .{&state});
+                if (pending_wake_sequence) |sequence| {
+                    loop_wakeup.finish(sequence);
+                    pending_wake_sequence = null;
+                    render_pacer.clearWakeRender();
+                }
+            }
+            if (idleCursorSyncDue(
+                &cursor_state,
+                state.transcript_controller.palette_mouse_x,
+                state.transcript_controller.palette_mouse_y,
+                state.browser_controller.cursor_shape,
+                event_flags.has_mouse_motion or event_flags.has_non_mouse_motion or event_flags.has_browser_wheel,
+                now_ms,
+            )) {
+                recordSpan(&frame_sample, .sync_cursor, syncMouseCursor, .{ &state, &cursor_state });
+                noteCursorSynced(&cursor_state, &state, now_ms);
+            }
+            frame_sample.rendered = replay_presented;
+            recordFrameWithStallDiagnostic(frame_sample);
+            maybeLogFrameProfile(frame_profile_logging, &last_frame_profile_log_ms, &palette_renderer);
+            palette_renderer.maybeWriteDevStats(monotonicNsU64());
             continue;
         }
 
@@ -639,6 +727,8 @@ fn mainInner(init: std.process.Init) !void {
         chat_panel_ui.resetRuntimeBannerHits();
 
         state.noteWorkspaceSwitchRenderStarted();
+        const build_layout_sequence = loop_wakeup.layoutSequence();
+        const build_now_ms = monotonicMs();
         recordSpan(&frame_sample, .render_root, struct {
             fn run(app_state: *AppState, framebuffer_width: c_int, framebuffer_height: c_int) void {
                 ui_layout.renderRoot(app_state, @floatFromInt(framebuffer_width), @floatFromInt(framebuffer_height));
@@ -676,6 +766,16 @@ fn mainInner(init: std.process.Init) !void {
         }
         presentation_demand.noteAttempt(frame_presented);
         if (frame_presented) {
+            palette_renderer.counters.full += 1;
+            layout_sequence_covered = build_layout_sequence;
+            motion_needs_layout = false;
+            var layout = retainedFrameLayout(&state, fb_width, fb_height, ui_scale, build_now_ms);
+            layout.layout_sequence = build_layout_sequence;
+            if (layout.browser_texture_id != 0) {
+                retained_frame.capture(allocator, &state.palette_overlay_batch, layout);
+            } else {
+                retained_frame.invalidate();
+            }
             state.noteBrowserFramePresented();
             render_pacer.noteRendered(monotonicMs());
             state.noteWorkspaceSwitchPresented();
@@ -700,6 +800,7 @@ fn mainInner(init: std.process.Init) !void {
         frame_sample.rendered = frame_presented;
         recordFrameWithStallDiagnostic(frame_sample);
         maybeLogFrameProfile(frame_profile_logging, &last_frame_profile_log_ms, &palette_renderer);
+        palette_renderer.maybeWriteDevStats(monotonicNsU64());
     }
 }
 
@@ -1019,6 +1120,8 @@ fn unquoteGhosttyValue(raw_value: []const u8) []const u8 {
 
 const EventFlags = struct {
     has_mouse_motion: bool = false,
+    /// A wheel event the visible browser page consumed.
+    has_browser_wheel: bool = false,
     has_non_mouse_motion: bool = false,
     /// The window renderer needs a new frame (resize, scale change, re-show).
     renderer_redraw: bool = false,
@@ -1041,6 +1144,10 @@ const LoopWaitTrace = struct {
 
 fn frameProfileLoggingEnabled() bool {
     return std.c.getenv("VERDE_FRAME_PROFILE_LOG") != null;
+}
+
+fn monotonicNsU64() u64 {
+    return @intCast(@max(profiler.nowNs(), 0));
 }
 
 fn monotonicMs() i64 {
@@ -1396,8 +1503,39 @@ fn dispatchEvent(
     const renderer_needs_redraw = renderer.handleEvent(event.*);
     host.noteEvent(event.*);
     if (renderer_needs_redraw) event_flags.renderer_redraw = true;
+    browser_wheel_forwarded = false;
+    const keep_running = processOneEvent(window, state, keyboard, ui_scale, event, frame_sample);
     noteEventForRender(event, event_flags);
-    return processOneEvent(window, state, keyboard, ui_scale, event, frame_sample);
+    return keep_running;
+}
+
+/// Set while dispatching a wheel event that the browser page consumed.
+var browser_wheel_forwarded = false;
+
+/// Layout inputs a retained frame must match to be replayed.
+fn retainedFrameLayout(
+    state: *AppState,
+    framebuffer_width: c_int,
+    framebuffer_height: c_int,
+    scale: f32,
+    now_ms: i64,
+) palette_frame_renderer.RetainedFrame.Layout {
+    var texture_id: u32 = 0;
+    if (state.browser_textures_enabled and state.isBrowserVisible()) {
+        if (state.browserState().controller.paneTexture()) |pane_texture| {
+            if (pane_texture.isReady()) texture_id = @intCast(pane_texture.texture_id);
+        }
+    }
+    return .{
+        .framebuffer_width = framebuffer_width,
+        .framebuffer_height = framebuffer_height,
+        .ui_scale = scale,
+        .browser_texture_id = texture_id,
+        .mouse_x = state.transcript_controller.palette_mouse_x,
+        .mouse_y = state.transcript_controller.palette_mouse_y,
+        .now_ms = now_ms,
+        .layout_sequence = loop_wakeup.layoutSequence(),
+    };
 }
 
 fn noteEventForRender(event: *const palette.Event, flags: *EventFlags) void {
@@ -1411,6 +1549,10 @@ fn noteEventForRender(event: *const palette.Event, flags: *EventFlags) void {
         .frame => return,
         .mouse_motion => |motion| if (noMouseButtonsPressed(motion.state)) {
             flags.has_mouse_motion = true;
+            return;
+        },
+        .mouse_wheel => if (browser_wheel_forwarded) {
+            flags.has_browser_wheel = true;
             return;
         },
         else => {},
@@ -2474,6 +2616,7 @@ fn handleEvent(window: *palette.platform.Window, state: *AppState, keyboard: *ke
             // from an earlier layout. Let the visible browser claim its region
             // before those pane-local caches consume the wheel event.
             if (state.handleBrowserMouse(browserMouseWheelEvent(wheel_event))) {
+                browser_wheel_forwarded = true;
                 return true;
             }
             if (terminal_panel_ui.handlePaletteWheel(state, wheel_event.mouse_x, wheel_event.mouse_y, wheel_event.y)) {

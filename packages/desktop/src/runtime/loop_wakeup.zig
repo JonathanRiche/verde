@@ -26,6 +26,10 @@ const Poster = struct {
 var poster: ?Poster = null;
 var wake_pending: std.atomic.Value(bool) = .init(false);
 var wake_sequence: std.atomic.Value(u64) = .init(0);
+/// Bumped by every wake except `notifyTextureFrameResult`: the main loop
+/// compares it across frames to tell "only a browser texture changed" from
+/// "state the UI lays out changed".
+var layout_sequence: std.atomic.Value(u64) = .init(0);
 
 pub const NotifyResult = enum {
     queued,
@@ -56,8 +60,24 @@ pub fn notify() void {
 /// Thread-safe variant that exposes whether an existing wake covered this update.
 pub fn notifyResult() NotifyResult {
     if (poster == null) return .unavailable;
+    _ = layout_sequence.fetchAdd(1, .acq_rel);
     _ = wake_sequence.fetchAdd(1, .acq_rel);
     return queueWakeEvent();
+}
+
+/// Thread-safe. Like `notifyResult`, for updates that only replace the pixels
+/// of an already laid-out texture (a new browser frame): the wake does not
+/// bump `layoutSequence`, so the main loop may present it without rebuilding
+/// the UI.
+pub fn notifyTextureFrameResult() NotifyResult {
+    if (poster == null) return .unavailable;
+    _ = wake_sequence.fetchAdd(1, .acq_rel);
+    return queueWakeEvent();
+}
+
+/// Count of layout-relevant wakes so far (every wake but texture frames).
+pub fn layoutSequence() u64 {
+    return layout_sequence.load(.acquire);
 }
 
 fn queueWakeEvent() NotifyResult {
@@ -150,4 +170,27 @@ test "consumed wake stays coalesced until the covered frame finishes" {
     _ = wake_sequence.fetchAdd(1, .acq_rel);
     finish(7);
     try std.testing.expectEqual(@as(usize, 1), sink.posts);
+}
+
+test "texture frame wakes leave the layout sequence alone" {
+    const previous_poster = poster;
+    const previous_pending = wake_pending.load(.acquire);
+    const previous_sequence = wake_sequence.load(.acquire);
+    const previous_layout = layout_sequence.load(.acquire);
+    defer {
+        poster = previous_poster;
+        wake_pending.store(previous_pending, .release);
+        wake_sequence.store(previous_sequence, .release);
+        layout_sequence.store(previous_layout, .release);
+    }
+
+    var sink: TestPoster = .{};
+    poster = .{ .ctx = &sink, .post = TestPoster.post };
+    wake_pending.store(false, .release);
+    const layout_before = layoutSequence();
+    try std.testing.expectEqual(NotifyResult.queued, notifyTextureFrameResult());
+    try std.testing.expectEqual(@as(usize, 1), sink.posts);
+    try std.testing.expectEqual(layout_before, layoutSequence());
+    try std.testing.expectEqual(NotifyResult.coalesced, notifyResult());
+    try std.testing.expectEqual(layout_before + 1, layoutSequence());
 }

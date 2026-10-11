@@ -532,8 +532,7 @@ pub fn selectionRangeForClickCount(
                 global_line_index += 1;
             },
             .text => |text_block| {
-                const indent = indentWidth(text_block.indent);
-                const line_width = @max(width - indent, 1.0);
+                const line_width = textBlockFrame(text_block, width, options).width;
                 const lines = buildSelectableTextLines(allocator, text_block, line_width, options) catch return null;
                 defer deinitSelectableLines(allocator, lines);
 
@@ -1304,40 +1303,60 @@ fn renderPaletteBlankBlock(context: *PaletteRenderContext, options: RenderOption
 }
 
 fn renderPaletteTextBlock(context: *PaletteRenderContext, block: TextBlockView, available_width: f32, options: RenderOptions) void {
-    const indent = indentWidth(block.indent);
-    const start = .{ context.cursor.x + indent, context.cursor.y };
-    const width = @max(available_width - indent, 1.0);
-
-    // Blockquote chrome: left accent bar + slight bg tint. Drawn behind text
-    // by queuing rects before the layout pass appends its text runs.
+    const frame = textBlockFrame(block, available_width, options);
     if (block.style == .quote) {
-        const bar_width: f32 = @max(theme.scaledUi(MarkdownMetrics.quote_bar_thickness), MarkdownMetrics.quote_bar_thickness_min);
-        const left_pad = quoteChromeLeftPad(options);
-        const right_pad = quoteChromeRightPad(options);
-        const v_pad = quoteChromeVerticalPad(options);
         const measured = measureTextBlockHeight(block, available_width, options);
-        queuePaletteRect(context, .{
-            .x = start[0],
-            .y = start[1],
-            .w = width,
-            .h = measured,
-        }, paletteColor(theme.md.quote_bg));
-        queuePaletteRect(context, .{
-            .x = start[0],
-            .y = start[1],
-            .w = bar_width,
-            .h = measured,
-        }, paletteColor(theme.md.quote_accent));
-        const inner_x = start[0] + left_pad;
-        const inner_width = @max(width - left_pad - right_pad, 1.0);
-        _ = renderPaletteTextBlockLayout(context, .{ inner_x, start[1] + v_pad * 0.5 }, block, inner_width, options);
+        queueQuoteChrome(context, block, available_width, measured);
+        _ = renderPaletteTextBlockLayout(context, frame.origin(context), block, frame.width, options, &.{});
         advancePaletteCursor(context, measured);
         return;
     }
 
-    const height = renderPaletteTextBlockLayout(context, .{ start[0], start[1] }, block, width, options);
+    const height = renderPaletteTextBlockLayout(context, frame.origin(context), block, frame.width, options, &.{});
 
     advancePaletteCursor(context, height);
+}
+
+/// Where a text block's lines sit inside its slot. The static renderer, the
+/// selection-aware renderer and transcript hit testing all lay lines out in
+/// this frame, so starting a selection never moves or rewraps text
+/// (blockquotes inset their lines inside the accent-bar chrome).
+const TextBlockFrame = struct {
+    offset_x: f32,
+    offset_y: f32,
+    width: f32,
+    /// Height the block occupies beyond its laid-out lines.
+    extra_height: f32,
+
+    fn origin(self: TextBlockFrame, context: *const PaletteRenderContext) [2]f32 {
+        return .{ context.cursor.x + self.offset_x, context.cursor.y + self.offset_y };
+    }
+};
+
+fn textBlockFrame(block: TextBlockView, available_width: f32, options: RenderOptions) TextBlockFrame {
+    const indent = indentWidth(block.indent);
+    const width = @max(available_width - indent, 1.0);
+    if (block.style != .quote) return .{ .offset_x = indent, .offset_y = 0.0, .width = width, .extra_height = 0.0 };
+    const left_pad = quoteChromeLeftPad(options);
+    const v_pad = quoteChromeVerticalPad(options);
+    return .{
+        .offset_x = indent + left_pad,
+        .offset_y = v_pad * 0.5,
+        .width = @max(width - left_pad - quoteChromeRightPad(options), 1.0),
+        .extra_height = v_pad,
+    };
+}
+
+/// Blockquote chrome: left accent bar + slight bg tint, queued before the
+/// block's text so it draws behind it.
+fn queueQuoteChrome(context: *PaletteRenderContext, block: TextBlockView, available_width: f32, height: f32) void {
+    const indent = indentWidth(block.indent);
+    const x = context.cursor.x + indent;
+    const y = context.cursor.y;
+    const width = @max(available_width - indent, 1.0);
+    const bar_width: f32 = @max(theme.scaledUi(MarkdownMetrics.quote_bar_thickness), MarkdownMetrics.quote_bar_thickness_min);
+    queuePaletteRect(context, .{ .x = x, .y = y, .w = width, .h = height }, paletteColor(theme.md.quote_bg));
+    queuePaletteRect(context, .{ .x = x, .y = y, .w = bar_width, .h = height }, paletteColor(theme.md.quote_accent));
 }
 
 fn renderPaletteFencedCodeBlock(context: *PaletteRenderContext, block: FencedCodeView, available_width: f32, options: RenderOptions) void {
@@ -2047,6 +2066,8 @@ fn renderPaletteTextBlockLayout(
     block: TextBlockView,
     available_width: f32,
     options: RenderOptions,
+    /// Selection highlights; queued above inline-code pills, below glyphs.
+    selection_rects: []const palette.Rect,
 ) f32 {
     var underlines: std.ArrayList(MarkdownUnderlineSpec) = .empty;
     defer underlines.deinit(context.allocator);
@@ -2152,6 +2173,13 @@ fn renderPaletteTextBlockLayout(
         const pill_radius = @max(theme.scaledUi(3.0), 2.0);
         for (code_pills.items) |rect| {
             queuePaletteRoundedRect(context, rect, pill_color, pill_radius);
+        }
+    }
+
+    if (selection_rects.len > 0) {
+        const selection_color = paletteColor(theme.md.selection_fill);
+        for (selection_rects) |rect| {
+            queuePaletteRoundedRect(context, rect, selection_color, 2.0);
         }
     }
 
@@ -2309,8 +2337,7 @@ pub fn lastSelectablePointInBody(
                 global_line_index += 1;
             },
             .text => |text_block| {
-                const indent = indentWidth(text_block.indent);
-                const lines = try buildSelectableTextLines(allocator, text_block, @max(width - indent, 1.0), options);
+                const lines = try buildSelectableTextLines(allocator, text_block, textBlockFrame(text_block, width, options).width, options);
                 defer deinitSelectableLines(allocator, lines);
                 for (lines) |line| {
                     last = .{ .line_index = global_line_index, .column = line.total_columns };
@@ -2416,15 +2443,15 @@ pub fn hitTestSelectablePaletteBody(
                 global_line_index += 1;
             },
             .text => |text_block| {
-                const indent = indentWidth(text_block.indent);
-                const start = .{ context_cursor.x + indent, context_cursor.y };
-                const line_width = @max(width - indent, 1.0);
+                const frame = textBlockFrame(text_block, width, options);
+                const start = .{ context_cursor.x + frame.offset_x, context_cursor.y + frame.offset_y };
+                const line_width = frame.width;
                 // Blocks the pointer is not over only need their extent and
                 // line count; skip building per-glyph selectable lines.
                 const extent = selectableTextBlockExtent(text_block, line_width, options);
                 if (mouse[1] < start[1] or mouse[1] > start[1] + extent.height) {
-                    context_cursor.y += extent.height;
-                    context_cursor.h = @max(context_cursor.h, extent.height);
+                    context_cursor.y += extent.height + frame.extra_height;
+                    context_cursor.h = @max(context_cursor.h, extent.height + frame.extra_height);
                     global_line_index += extent.lines;
                     previous = block;
                     continue;
@@ -2442,6 +2469,7 @@ pub fn hitTestSelectablePaletteBody(
                     }
                     height = @max(height, line.y + line.height);
                 }
+                height += frame.extra_height;
                 context_cursor.y += height;
                 context_cursor.h = @max(context_cursor.h, height);
                 global_line_index += lines.len;
@@ -2970,11 +2998,10 @@ fn renderSelectableLine(
     copied_any_line: *bool,
     mouse_pos: [2]f32,
     hovered: bool,
-    context: *PaletteRenderContext,
     start: [2]f32,
     line_index: usize,
     line: SelectableLine,
-    options: RenderOptions,
+    selection_rects: *std.ArrayList(palette.Rect),
 ) void {
     noteSelectableLineBounds(output, line_index, line.total_columns);
 
@@ -2990,7 +3017,6 @@ fn renderSelectableLine(
     if (selection) |ordered| {
         if (selectionColumnsForLine(ordered, line_index, line.total_columns)) |columns| {
             if (columns.start != columns.end) {
-                const selection_col = paletteColor(theme.md.selection_fill);
                 for (line.chunks) |chunk| {
                     const chunk_start = @max(columns.start, chunk.start_column);
                     const chunk_end = @min(columns.end, chunk.end_column);
@@ -2999,7 +3025,7 @@ fn renderSelectableLine(
                     const x0 = start[0] + chunk.x + textWidthForColumns(chunk.font_size, chunk.font_role, chunk.text, chunk_start - chunk.start_column);
                     const x1 = start[0] + chunk.x + textWidthForColumns(chunk.font_size, chunk.font_role, chunk.text, chunk_end - chunk.start_column);
                     if (x1 > x0) {
-                        queuePaletteRoundedRect(context, .{ .x = x0, .y = top, .w = x1 - x0, .h = bottom - top }, selection_col, 2.0);
+                        selection_rects.append(allocator, .{ .x = x0, .y = top, .w = x1 - x0, .h = bottom - top }) catch {};
                     }
                 }
             }
@@ -3018,20 +3044,6 @@ fn renderSelectableLine(
                 }
             }
         }
-    }
-
-    for (line.chunks) |chunk| {
-        renderPaletteStyledChunk(
-            options,
-            context,
-            .{ start[0] + chunk.x, top },
-            chunk.text,
-            chunk.block_style,
-            chunk.inline_style,
-            chunk.font_spec,
-            chunk.width,
-            chunk.line_height,
-        );
     }
 }
 
@@ -3082,11 +3094,12 @@ fn renderSelectableTextBlock(
     available_width: f32,
     options: RenderOptions,
 ) !void {
-    const indent = indentWidth(block.indent);
-    const start = .{ context.cursor.x + indent, context.cursor.y };
-    const width = @max(available_width - indent, 1.0);
-    const lines = try buildSelectableTextLines(allocator, block, width, options);
+    const frame = textBlockFrame(block, available_width, options);
+    const start = frame.origin(context);
+    const lines = try buildSelectableTextLines(allocator, block, frame.width, options);
     defer deinitSelectableLines(allocator, lines);
+    var selection_rects: std.ArrayList(palette.Rect) = .empty;
+    defer selection_rects.deinit(allocator);
 
     var height: f32 = 0.0;
     for (lines, 0..) |line, index| {
@@ -3099,13 +3112,25 @@ fn renderSelectableTextBlock(
             copied_any_line,
             mouse_pos,
             hovered,
-            context,
             start,
             global_line_index.* + index,
             line,
-            options,
+            &selection_rects,
         );
         height = @max(height, line.y + line.height);
+    }
+    height += frame.extra_height;
+
+    // Glyphs, inline-code pills and underlines come from the same text-run
+    // pass as the static render. Drawing each line chunk separately (mono
+    // chunks on fixed cells) placed glyphs from a second measurement, so text
+    // jumped whenever a drag-selection reached the message.
+    if (block.style == .quote) queueQuoteChrome(context, block, available_width, height);
+    _ = renderPaletteTextBlockLayout(context, start, block, frame.width, options, selection_rects.items);
+    if (lines.len > 0 and lines[lines.len - 1].chunks.len > 0) {
+        const last_line = lines[lines.len - 1];
+        const last_chunk = last_line.chunks[last_line.chunks.len - 1];
+        context.text_tail = .{ .x = start[0] + last_chunk.x + last_chunk.width, .y = start[1] + last_line.y, .h = last_chunk.line_height };
     }
 
     advancePaletteCursor(context, height);
@@ -3488,51 +3513,6 @@ fn renderSelectableTableBlock(
 
     advancePaletteCursor(context, total_h);
     global_line_index.* += total_rows;
-}
-
-fn renderPaletteStyledChunk(
-    options: RenderOptions,
-    context: *PaletteRenderContext,
-    position: [2]f32,
-    text: []const u8,
-    block_style: TextStyle,
-    inline_style: InlineStyle,
-    font_spec: FontSpec,
-    width: f32,
-    line_height: f32,
-) void {
-    const base_color = options.text_color orelse textBlockColor(block_style);
-    const color = inlineTextColor(base_color, inline_style);
-    const draw_font_size = fontSizeForSpecWithOptions(font_spec, options);
-    const role = markdownFontRole(block_style, inline_style);
-    const y = position[1] + inlineBaselineYOffset(block_style, role, draw_font_size, options);
-
-    queuePaletteRoleText(context, .{
-        .x = position[0],
-        .y = y,
-        .w = width,
-        .h = line_height,
-    }, text, paletteColor(color), draw_font_size, role, context.clip);
-    context.text_tail = .{ .x = position[0] + width, .y = position[1], .h = line_height };
-
-    if (inline_style.link or inline_style.emphasis) {
-        const underline_color = if (inline_style.link) paletteColor(theme.md.link) else paletteColor(color);
-        queuePaletteRect(context, .{
-            .x = position[0],
-            .y = y + line_height - 2.0,
-            .w = width,
-            .h = if (inline_style.link) 1.5 else 1.0,
-        }, underline_color);
-    }
-
-    if (inline_style.strike) {
-        queuePaletteRect(context, .{
-            .x = position[0],
-            .y = y + line_height * 0.55,
-            .w = width,
-            .h = @max(line_height * 0.06, 1.0),
-        }, paletteColor(color));
-    }
 }
 
 /// Soft-wraps a code line so long tokens don't bleed past `layout.max_x`.

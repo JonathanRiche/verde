@@ -211,6 +211,10 @@ pub const State = struct {
     last_evict_check_ms: i64 = 0,
     /// Frame-local: the bound pane drew this frame.
     bound_pane_rendered: bool = false,
+    /// pollBrowser bound new contents to the same, ready pane texture the
+    /// last laid-out frame drew; consumed by the main loop, which may then
+    /// present by replaying that frame instead of rebuilding the UI.
+    texture_frame_pending: bool = false,
     /// Frame-local: a rendered browser pane that is not the bound one.
     present_request_pane_id: ?WorkspacePaneId = null,
     /// Request carried to the next poll, where the runtime is rebound.
@@ -2278,7 +2282,17 @@ pub fn pollBrowser(self: anytype) bool {
             return pollBackgroundBrowserRuntime(self, &self.browser_controller.runtime, project_index, self.browser_controller.runtime_pane_id) or needs_render;
         }
     }
-    needs_render = self.browser_controller.runtime.controller.uploadFrame() or needs_render;
+    const texture_before = self.browser_controller.runtime.controller.paneTexture();
+    if (self.browser_controller.runtime.controller.uploadFrame()) {
+        // Same texture id and size: the laid-out batch already samples it, so
+        // only its pixels changed. A new id, size or first frame relayouts.
+        const texture_after = self.browser_controller.runtime.controller.paneTexture();
+        if (paneTextureContentOnly(texture_before, texture_after)) {
+            self.browser_controller.texture_frame_pending = true;
+        } else {
+            needs_render = true;
+        }
+    }
     while (self.browser_controller.runtime.controller.pollEvent()) |event| {
         defer event.deinit(self.allocator);
         needs_render = true;
@@ -2398,6 +2412,23 @@ pub fn pollBrowser(self: anytype) bool {
         needs_render = true;
     }
     return needs_render;
+}
+
+fn paneTextureContentOnly(before: ?browser_runtime.PaneTexture, after: ?browser_runtime.PaneTexture) bool {
+    const old_texture = before orelse return false;
+    const new_texture = after orelse return false;
+    return old_texture.isReady() and new_texture.isReady() and
+        old_texture.texture_id == new_texture.texture_id and
+        old_texture.width == new_texture.width and
+        old_texture.height == new_texture.height;
+}
+
+/// True once per new browser frame that only changed the pane texture's
+/// pixels (see `texture_frame_pending`).
+pub fn takeBrowserTextureFrame(self: anytype) bool {
+    const pending = self.browser_controller.texture_frame_pending;
+    self.browser_controller.texture_frame_pending = false;
+    return pending;
 }
 
 /// Drains retained sessions independently of the currently presented backend.

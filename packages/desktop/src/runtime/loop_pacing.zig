@@ -46,15 +46,34 @@ pub const FramePacer = struct {
 
 pub const PresentationDemand = struct {
     pending: bool = false,
+    /// The pending frame needs a UI rebuild. False while the only pending
+    /// change is new browser texture contents, which can be presented by
+    /// replaying the previous frame's batch.
+    layout: bool = false,
 
     /// Records state that has not yet reached a swapchain presentation.
     pub fn request(self: *PresentationDemand) void {
         self.pending = true;
+        self.layout = true;
+    }
+
+    /// Records new contents of a texture the last laid-out frame already
+    /// shows (browser frames). Coalesces with, never downgrades, `request`.
+    pub fn requestTextureOnly(self: *PresentationDemand) void {
+        self.pending = true;
+    }
+
+    /// True when the pending frame may skip the UI rebuild.
+    pub fn textureOnly(self: PresentationDemand) bool {
+        return self.pending and !self.layout;
     }
 
     /// Records completion of a render attempt.
     pub fn noteAttempt(self: *PresentationDemand, presented: bool) void {
-        if (presented) self.pending = false;
+        if (presented) {
+            self.pending = false;
+            self.layout = false;
+        }
     }
 
     /// A pending presentation retries without depending on an unrelated SDL wakeup.
@@ -107,6 +126,23 @@ test "rapid switch keeps the final frame scheduled when swapchain acquisition is
 
     demand.noteAttempt(true);
     try std.testing.expect(!demand.pending);
+}
+
+test "texture-only demand never downgrades a pending layout frame" {
+    var demand: PresentationDemand = .{};
+    demand.requestTextureOnly();
+    try std.testing.expect(demand.textureOnly());
+    demand.request();
+    demand.requestTextureOnly();
+    try std.testing.expect(demand.pending);
+    try std.testing.expect(!demand.textureOnly());
+    // A deferred attempt keeps the layout requirement.
+    demand.noteAttempt(false);
+    try std.testing.expect(!demand.textureOnly());
+    demand.noteAttempt(true);
+    try std.testing.expect(!demand.pending);
+    demand.requestTextureOnly();
+    try std.testing.expect(demand.textureOnly());
 }
 
 test "poll cadence runs immediately and recovers from clock rollback" {

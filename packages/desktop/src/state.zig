@@ -11216,6 +11216,7 @@ pub const AppState = struct {
     pub const toggleBrowserInspector = browser_controller.toggleBrowserInspector;
     pub const setBrowserInspectorMode = browser_controller.setBrowserInspectorMode;
     pub const pollBrowser = browser_controller.pollBrowser;
+    pub const takeBrowserTextureFrame = browser_controller.takeBrowserTextureFrame;
     pub const noteBrowserFramePresented = browser_controller.noteBrowserFramePresented;
     pub const pollPendingBrowserDevServer = browser_controller.pollPendingBrowserDevServer;
     pub const clearPendingBrowserDevServer = browser_controller.clearPendingBrowserDevServer;

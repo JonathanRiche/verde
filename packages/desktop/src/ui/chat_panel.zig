@@ -11889,3 +11889,127 @@ test "transcript cursor resolves pending links and text from render geometry" {
     resetTranscriptHitCache();
     try std.testing.expectEqual(@as(usize, 0), pending_row_hit_count);
 }
+
+const TranscriptGlyphRecorder = struct {
+    allocator: std.mem.Allocator,
+    quads: std.ArrayList(palette.gpu.text.GlyphQuad) = .empty,
+
+    pub fn glyph(self: *@This(), quad: palette.gpu.text.GlyphQuad) !void {
+        try self.quads.append(self.allocator, quad);
+    }
+};
+
+fn recordTranscriptBatchGlyphs(
+    allocator: std.mem.Allocator,
+    collection: *palette.font.Collection,
+    batch: *const palette.RenderBatch,
+) !std.ArrayList(palette.gpu.text.GlyphQuad) {
+    var cache = palette.gpu.text.GlyphCache.init(allocator, .{});
+    defer cache.deinit();
+    var layouter: palette.gpu.text.Layouter = .{
+        .gpa = allocator,
+        .source = palette.gpu.text.GlyphSource.adapt(palette.font.Collection, collection),
+        .cache = &cache,
+    };
+    defer layouter.deinit();
+    var recorder: TranscriptGlyphRecorder = .{ .allocator = allocator };
+    errdefer recorder.quads.deinit(allocator);
+    for (batch.commands.items) |*command| {
+        if (command.kind != .text) continue;
+        try layouter.drawCommand(&recorder, command);
+    }
+    return recorder.quads;
+}
+
+const TranscriptTestTarget = struct {
+    batch: palette.RenderBatch = .{},
+    text: std.ArrayList(u8) = .empty,
+    arena: std.heap.ArenaAllocator,
+
+    fn init(allocator: std.mem.Allocator) TranscriptTestTarget {
+        return .{ .arena = std.heap.ArenaAllocator.init(allocator) };
+    }
+
+    fn deinit(self: *TranscriptTestTarget, allocator: std.mem.Allocator) void {
+        self.batch.deinit(allocator);
+        self.text.deinit(allocator);
+        self.arena.deinit();
+    }
+
+    fn context(self: *TranscriptTestTarget, allocator: std.mem.Allocator, width: f32) chat_markdown.PaletteRenderContext {
+        return .{
+            .allocator = allocator,
+            .batch = &self.batch,
+            .frame_text = &self.text,
+            .text_arena = &self.arena,
+            .cursor = .{ .x = 0.0, .y = 0.0, .w = width, .h = 2000.0 },
+            .available_width = width,
+        };
+    }
+};
+
+test "selection-aware transcript rendering places glyphs exactly like the static render" {
+    // Selecting text in a transcript message swaps its cached static render
+    // (renderPaletteBody) for renderSelectablePaletteBody. Any glyph that lands
+    // somewhere else in the second path visibly jumps the moment a drag-select
+    // touches the message, so both must draw identical glyphs at identical spots.
+    const allocator = std.testing.allocator;
+    const fonts = try palette.fonts.Fonts.init(allocator, @import("font_faces.zig").bundled(null, null), .{ .optional_missing = false });
+    defer fonts.deinit();
+    text_measure.configure(fonts);
+    defer text_measure.clear();
+
+    var body = try chat_markdown.buildBodyView(
+        allocator,
+        "**Master:** `collectPinnedBackgroundCommands` in `/home/rtg/development/verde` (`7fd48fd9`) is byte-identical to this branch's pre-fix version.\n\n" ++
+            "- That command failed: it passes a shell `-c` script that runs rm (`sh -lc '…'`) via `/tmp/pnperf/fill_chat.sh`.\n" ++
+            "- Second item with *emphasis*, a [link](https://example.com) and `code`.\n\n" ++
+            // Inline code whose glyphs are not all one mono cell wide.
+            "Status `ok 🙂 → done` shown inline.\n\n" ++
+            "> A quoted note with `quoted_code` that wraps once the column gets narrow enough to need it.\n\n" ++
+            "Trailing paragraph after the quote.\n",
+    );
+    defer body.deinit(allocator);
+
+    const width: f32 = 900.0;
+    // 18pt transcript text at the 28pt UI zoom (28/24) the regression was
+    // recorded with: fractional sizes are where cell and shaped advances part.
+    const options = markdownOptions(18.0 * 28.0 / 24.0);
+
+    var static_target = TranscriptTestTarget.init(allocator);
+    defer static_target.deinit(allocator);
+    var static_context = static_target.context(allocator, width);
+    chat_markdown.renderPaletteBody(&static_context, body, options);
+
+    var selectable_target = TranscriptTestTarget.init(allocator);
+    defer selectable_target.deinit(allocator);
+    var selectable_context = selectable_target.context(allocator, width);
+    var output = chat_markdown.renderSelectablePaletteBody(
+        &selectable_context,
+        allocator,
+        body,
+        options,
+        .{ .anchor = .{ .line_index = 0, .column = 3 }, .focus = .{ .line_index = 40, .column = 0 } },
+        false,
+    );
+    defer output.deinit(allocator);
+
+    var static_quads = try recordTranscriptBatchGlyphs(allocator, fonts.collection, &static_target.batch);
+    defer static_quads.deinit(allocator);
+    var selectable_quads = try recordTranscriptBatchGlyphs(allocator, fonts.collection, &selectable_target.batch);
+    defer selectable_quads.deinit(allocator);
+
+    try std.testing.expectApproxEqAbs(static_context.cursor.y, selectable_context.cursor.y, 0.001);
+    try std.testing.expect(static_quads.items.len > 100);
+    try std.testing.expectEqual(static_quads.items.len, selectable_quads.items.len);
+    for (static_quads.items, selectable_quads.items) |expected, actual| {
+        try std.testing.expectEqual(expected.x, actual.x);
+        try std.testing.expectEqual(expected.y, actual.y);
+        try std.testing.expectEqual(expected.u, actual.u);
+        try std.testing.expectEqual(expected.v, actual.v);
+    }
+}
+
+test {
+    _ = chat_markdown;
+}
