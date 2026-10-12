@@ -4,6 +4,7 @@ const std = @import("std");
 const platform_paths = @import("platform_paths");
 const provider_models = @import("../state/provider_models.zig");
 const theme = @import("../ui/theme.zig");
+pub const custom_acp_agents = @import("custom_acp_agents.zig");
 
 const log = std.log.scoped(.native_config);
 pub const MIN_FONT_SIZE: f32 = 10.0;
@@ -37,6 +38,7 @@ pub const ChatProvider = enum {
     fx,
     grok,
     muse,
+    custom_acp,
 
     pub fn parse(value: []const u8) ?ChatProvider {
         inline for (std.meta.fields(ChatProvider)) |field| {
@@ -411,6 +413,8 @@ pub const AppConfig = struct {
     disabled_providers: [std.meta.fields(ChatProvider).len]bool = @splat(false),
     remembered_models: [std.meta.fields(ChatProvider).len]?RememberedModel = @splat(null),
     favorite_models: []FavoriteModel = &.{},
+    /// User-defined ACP agents (`chat.custom_acp_agents`); see custom_acp_agents.zig.
+    custom_acp_agents: []custom_acp_agents.Agent = &.{},
     new_chat_pane_behavior: NewChatPaneBehavior = .new_pane,
     check_for_updates_automatically: bool = true,
     // User-scoped provider registration is opt-in because it updates each
@@ -430,6 +434,8 @@ pub const AppConfig = struct {
         for (&self.remembered_models) |*entry| if (entry.*) |*value| value.deinit(allocator);
         for (self.favorite_models) |*favorite| favorite.deinit(allocator);
         allocator.free(self.favorite_models);
+        custom_acp_agents.freeAgents(allocator, self.custom_acp_agents);
+        self.custom_acp_agents = &.{};
         for (self.installed_themes) |*installed| installed.deinit(allocator);
         allocator.free(self.installed_themes);
         self.default_open_action.deinit(allocator);
@@ -921,6 +927,11 @@ fn writeChatSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, c
         try favorites.append(.{ .object = favorite_object });
     }
     try chat_object.put(allocator, "favorite_models", .{ .array = favorites });
+    if (config.custom_acp_agents.len > 0) {
+        try chat_object.put(allocator, custom_acp_agents.CONFIG_KEY, try custom_acp_agents.toJsonValue(allocator, config.custom_acp_agents));
+    } else {
+        _ = chat_object.swapRemove(custom_acp_agents.CONFIG_KEY);
+    }
     try chat_object.put(allocator, "new_pane_behavior", .{ .string = @tagName(config.new_chat_pane_behavior) });
 }
 
@@ -1079,6 +1090,14 @@ fn applyChatOverrides(allocator: std.mem.Allocator, config: *AppConfig, chat_val
     }
     if (chat_value.object.get("last_provider")) |provider| {
         if (provider == .string) config.last_chat_provider = ChatProvider.parse(provider.string);
+    }
+    if (chat_value.object.get(custom_acp_agents.CONFIG_KEY)) |agents_value| {
+        if (custom_acp_agents.parseListAlloc(allocator, agents_value)) |agents| {
+            custom_acp_agents.freeAgents(allocator, config.custom_acp_agents);
+            config.custom_acp_agents = agents;
+        } else |err| {
+            log.warn("could not load chat.custom_acp_agents: {s}", .{@errorName(err)});
+        }
     }
     if (chat_value.object.get("disabled_providers")) |disabled| {
         if (disabled == .array) {

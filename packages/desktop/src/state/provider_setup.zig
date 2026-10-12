@@ -42,7 +42,7 @@ pub const Setup = struct {
     /// Setup terminals whose command was still running when closed; kept
     /// until their session ends so the process is never orphaned mid-teardown.
     closing: std.ArrayList(*terminal.Dock) = .empty,
-    notes: [8]RowNote = @splat(.none),
+    notes: [std.meta.fields(Provider).len]RowNote = @splat(.none),
     /// When the current "Copied" note clears; 0 when none is showing.
     copied_until_ms: i64 = 0,
     last_recheck_ms: i64 = 0,
@@ -87,6 +87,7 @@ fn protocolProvider(provider: Provider) headless.provider_types.Provider {
         .fx => .fx,
         .grok => .grok,
         .muse => .muse,
+        .custom_acp => .custom_acp,
     };
 }
 

@@ -4315,6 +4315,7 @@ fn streamAuthorLabel(provider: app_state.Provider) []const u8 {
         .fx => "FX",
         .grok => "Grok",
         .muse => "Muse",
+        .custom_acp => "Agent",
     };
 }
 
@@ -4610,6 +4611,7 @@ test "Herdr live handlers reject every retired remote parameter by presence" {
     var state: app_state.AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     for (cases) |params_json| {
@@ -4712,6 +4714,7 @@ test "terminal lifecycle reaches workspace processes with the exact final wait i
     var state: app_state.AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -4809,6 +4812,7 @@ test "stopped unconfirmed terminal remains waitable through disappearance grace"
     var state: app_state.AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -4922,6 +4926,7 @@ test "terminal lifecycle preserves an observed signal in workspace processes" {
     var state: app_state.AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -4991,6 +4996,7 @@ test "terminal duplicate generations remain unambiguous and unknown exits never 
     var state: app_state.AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -5214,6 +5220,7 @@ test "terminal key command routes to a runnable target without changing focus" {
     var state: app_state.AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -5298,6 +5305,7 @@ test "terminal key command rejects non-terminal targets and invalid keys" {
     var state: app_state.AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -5364,6 +5372,8 @@ test "pane close response matches the next durable projection" {
     // Fields read by modal key/text routing and new-chat defaults.
 
     state.folder_browser = .{};
+
+    state.custom_agent_form = .{};
 
     state.settings_controller.provider_setup = .{};
 

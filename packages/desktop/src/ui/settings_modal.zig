@@ -337,6 +337,14 @@ const SettingsLayout = struct {
     providers_hint_y: f32,
     providers_update_hint_y: f32,
     providers_recheck: palette.Rect,
+    custom_agents_card: palette.Rect,
+    custom_agents_subtitle_y: f32,
+    custom_agent_rows: [MAX_CUSTOM_AGENT_ROWS]palette.Rect,
+    custom_agent_edits: [MAX_CUSTOM_AGENT_ROWS]palette.Rect,
+    custom_agent_removes: [MAX_CUSTOM_AGENT_ROWS]palette.Rect,
+    custom_agent_count: usize,
+    custom_agents_empty_y: f32,
+    custom_agents_add: palette.Rect,
 };
 
 const log = std.log.scoped(.native_ui_settings);
@@ -511,6 +519,8 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
 
     const provider_rows_h = @as(f32, @floatFromInt(PROVIDER_ROW_COUNT)) * providerRowHeight();
     const providers_h = m.card_pad * 2.0 + m.title_h + m.row_gap + provider_rows_h + m.label_h * 2.0 + m.row_gap + m.row_h;
+    const custom_agent_count = @min(state.app_config.custom_acp_agents.len, MAX_CUSTOM_AGENT_ROWS);
+    const custom_agents_h = customAgentsCardHeight(custom_agent_count, m);
     const appearance_page_h = appearance_h;
     const chat_page_h = transcript_h + m.card_gap + chat_h + m.card_gap + commit_h;
     const workspace_page_h = workspace_h;
@@ -519,7 +529,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .appearance => appearance_page_h,
         .workspace => workspace_page_h,
         .chat => chat_page_h,
-        .providers => providers_h,
+        .providers => providers_h + m.card_gap + custom_agents_h,
         .terminal => terminal_h,
         .browser => browser_h,
         .connections => phone_h + m.card_gap + runtimes_h,
@@ -698,6 +708,32 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .x = providers_card.x + m.card_pad,
         .y = providers_update_hint_y + m.label_h + m.row_gap,
         .w = buttonWidth(PROVIDERS_RECHECK_LABEL),
+        .h = m.row_h,
+    };
+
+    const custom_agents_card: palette.Rect = .{ .x = content_x, .y = providers_card.y + providers_h + m.card_gap, .w = content_w, .h = custom_agents_h };
+    const custom_agents_subtitle_y = custom_agents_card.y + m.card_pad + m.title_h + m.inner_gap;
+    var custom_agent_rows: [MAX_CUSTOM_AGENT_ROWS]palette.Rect = @splat(.{});
+    var custom_agent_edits: [MAX_CUSTOM_AGENT_ROWS]palette.Rect = @splat(.{});
+    var custom_agent_removes: [MAX_CUSTOM_AGENT_ROWS]palette.Rect = @splat(.{});
+    var custom_agent_y = custom_agents_subtitle_y + m.label_h + m.row_gap;
+    const custom_agents_empty_y = custom_agent_y;
+    const custom_agent_button_h = theme.scaledUi(26.0);
+    const custom_agent_remove_w = buttonWidth("Remove");
+    const custom_agent_edit_w = buttonWidth("Edit");
+    for (0..custom_agent_count) |index| {
+        const row: palette.Rect = .{ .x = custom_agents_card.x + m.card_pad, .y = custom_agent_y, .w = content_w - m.card_pad * 2.0, .h = customAgentRowHeight() };
+        custom_agent_rows[index] = row;
+        const button_y = row.y + (row.h - custom_agent_button_h) * 0.5;
+        custom_agent_removes[index] = .{ .x = row.x + row.w - custom_agent_remove_w, .y = button_y, .w = custom_agent_remove_w, .h = custom_agent_button_h };
+        custom_agent_edits[index] = .{ .x = custom_agent_removes[index].x - m.inner_gap - custom_agent_edit_w, .y = button_y, .w = custom_agent_edit_w, .h = custom_agent_button_h };
+        custom_agent_y += customAgentRowHeight();
+    }
+    if (custom_agent_count == 0) custom_agent_y += m.label_h + m.inner_gap;
+    const custom_agents_add: palette.Rect = .{
+        .x = custom_agents_card.x + m.card_pad,
+        .y = custom_agent_y + m.row_gap,
+        .w = buttonWidth(CUSTOM_AGENTS_ADD_LABEL),
         .h = m.row_h,
     };
 
@@ -989,6 +1025,14 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .providers_hint_y = providers_hint_y,
         .providers_update_hint_y = providers_update_hint_y,
         .providers_recheck = providers_recheck,
+        .custom_agents_card = custom_agents_card,
+        .custom_agents_subtitle_y = custom_agents_subtitle_y,
+        .custom_agent_rows = custom_agent_rows,
+        .custom_agent_edits = custom_agent_edits,
+        .custom_agent_removes = custom_agent_removes,
+        .custom_agent_count = custom_agent_count,
+        .custom_agents_empty_y = custom_agents_empty_y,
+        .custom_agents_add = custom_agents_add,
     };
 }
 
@@ -1552,6 +1596,11 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
             }
         }
         queueControlHit(state, layout.providers_recheck, layout.body_clip, .providers_recheck, queue_hit);
+        for (0..layout.custom_agent_count) |index| {
+            if (intersectRect(layout.custom_agent_edits[index], layout.body_clip)) |rect| queue_hit(state, rect, .settings_custom_agent_edit, index);
+            if (intersectRect(layout.custom_agent_removes[index], layout.body_clip)) |rect| queue_hit(state, rect, .settings_custom_agent_remove, index);
+        }
+        if (intersectRect(layout.custom_agents_add, layout.body_clip)) |rect| queue_hit(state, rect, .settings_custom_agent_add, 0);
     }
     if (category == .agents) {
         queueControlHit(state, layout.mcp_tools, layout.body_clip, .mcp_tools, queue_hit);
@@ -1777,6 +1826,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         drawBrowserScrollSpeedSlider(state, layout.browser_scroll_speed, state.settings_controller.draft.browser_scroll_speed, isControlHovered(state, .browser_scroll_speed), layout.body_clip);
     } else if (category == .providers) {
         drawProvidersCard(state, layout, m);
+        drawCustomAgentsCard(state, layout, m);
     } else if (category == .connections) {
         drawCard(state, layout.phone_card, layout.body_clip);
         _ = phoneCard(state, layout.phone_card, layout.body_clip, true, null);
@@ -2876,6 +2926,79 @@ fn drawProvidersCard(state: *runtime.AppState, layout: SettingsLayout, m: Metric
         .h = m.label_h,
     }, PROVIDERS_UPDATE_HINT, paletteColor(textHint()), theme.scaledUi(12.0), clip);
     drawActionButton(state, layout.providers_recheck, PROVIDERS_RECHECK_LABEL, .secondary, isControlHovered(state, .providers_recheck), clip);
+}
+
+// ---------------------------------------------------------------------------
+// Custom ACP agents card
+// ---------------------------------------------------------------------------
+
+const MAX_CUSTOM_AGENT_ROWS = app_config.custom_acp_agents.MAX_AGENTS;
+const CUSTOM_AGENTS_ADD_LABEL = "Add custom agent";
+const CUSTOM_AGENTS_SUBTITLE = "Any agent that speaks the Agent Client Protocol over stdio. Each one appears in the model picker under Custom ACP.";
+
+fn customAgentRowHeight() f32 {
+    return theme.scaledUi(44.0);
+}
+
+fn customAgentsCardHeight(count: usize, m: Metrics) f32 {
+    const rows_h = if (count == 0) m.label_h + m.inner_gap else @as(f32, @floatFromInt(count)) * customAgentRowHeight();
+    return m.card_pad * 2.0 + m.title_h + m.inner_gap + m.label_h + m.row_gap + rows_h + m.row_gap + m.row_h;
+}
+
+fn drawCustomAgentsCard(state: *runtime.AppState, layout: SettingsLayout, m: Metrics) void {
+    const clip = layout.body_clip;
+    const card = layout.custom_agents_card;
+    drawCard(state, card, clip);
+    drawCardTitle(state, card, "Custom ACP agents", clip);
+    queueText(state, .{
+        .x = card.x + m.card_pad,
+        .y = layout.custom_agents_subtitle_y,
+        .w = card.w - m.card_pad * 2.0,
+        .h = m.label_h,
+    }, CUSTOM_AGENTS_SUBTITLE, paletteColor(textHint()), theme.scaledUi(12.0), clip);
+
+    const agents = state.app_config.custom_acp_agents;
+    if (layout.custom_agent_count == 0) {
+        queueText(state, .{
+            .x = card.x + m.card_pad,
+            .y = layout.custom_agents_empty_y,
+            .w = card.w - m.card_pad * 2.0,
+            .h = m.label_h,
+        }, "No custom agents yet. Add one with the command that starts its ACP server.", paletteColor(textLabel()), theme.scaledUi(12.5), clip);
+    }
+    const mouse_x = state.transcript_controller.palette_mouse_x;
+    const mouse_y = state.transcript_controller.palette_mouse_y;
+    for (0..layout.custom_agent_count) |index| {
+        const agent = agents[index];
+        const row = layout.custom_agent_rows[index];
+        const text_w = @max(layout.custom_agent_edits[index].x - m.inner_gap - row.x, 0.0);
+        queueText(state, .{ .x = row.x, .y = row.y + theme.scaledUi(5.0), .w = text_w, .h = theme.scaledUi(16.0) }, agent.name, paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.0), clip);
+        var command_buf: [256]u8 = undefined;
+        queueText(state, .{ .x = row.x, .y = row.y + theme.scaledUi(23.0), .w = text_w, .h = theme.scaledUi(14.0) }, commandSummary(&command_buf, agent), paletteColor(textHint()), theme.scaledUi(11.0), clip);
+        const edit = layout.custom_agent_edits[index];
+        const remove = layout.custom_agent_removes[index];
+        drawActionButton(state, edit, "Edit", .secondary, pointInRect(mouse_x, mouse_y, edit), clip);
+        drawActionButton(state, remove, "Remove", .secondary, pointInRect(mouse_x, mouse_y, remove), clip);
+    }
+    drawActionButton(state, layout.custom_agents_add, CUSTOM_AGENTS_ADD_LABEL, .primary, pointInRect(mouse_x, mouse_y, layout.custom_agents_add), clip);
+}
+
+/// `command arg1 arg2 …` truncated to the buffer; env values are never shown.
+fn commandSummary(buf: []u8, agent: app_config.custom_acp_agents.Agent) []const u8 {
+    var writer: std.Io.Writer = .fixed(buf);
+    writer.writeAll(agent.command) catch return buf[0..writer.end];
+    for (agent.args) |arg| {
+        writer.writeByte(' ') catch break;
+        writer.writeAll(arg) catch break;
+    }
+    if (agent.env.len > 0) {
+        writer.print("  ·  {d} env var{s}", .{ agent.env.len, if (agent.env.len == 1) "" else "s" }) catch {};
+    }
+    return buf[0..writer.end];
+}
+
+fn pointInRect(x: f32, y: f32, rect: palette.Rect) bool {
+    return x >= rect.x and y >= rect.y and x <= rect.x + rect.w and y <= rect.y + rect.h;
 }
 
 fn drawCategoryNav(state: *runtime.AppState, layout: SettingsLayout) void {
@@ -4273,6 +4396,7 @@ fn testSettingsState(allocator: std.mem.Allocator) runtime.AppState {
     var state: runtime.AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;

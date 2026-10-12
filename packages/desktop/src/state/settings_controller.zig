@@ -110,6 +110,7 @@ fn dbProviderForChatProvider(provider: app_config.ChatProvider) Provider {
         .fx => .fx,
         .grok => .grok,
         .muse => .muse,
+        .custom_acp => .custom_acp,
     };
 }
 
@@ -179,7 +180,8 @@ pub const Draft = struct {
     automatic_chat_titles_enabled: bool = true,
     chat_title_provider: app_config.ChatTitleProvider = .codex,
     new_chat_provider: app_config.ChatProvider = .codex,
-    disabled_providers: [PROVIDER_OPTIONS.len]bool = @splat(false),
+    /// Indexed by `app_config.ChatProvider`, like `AppConfig.disabled_providers`.
+    disabled_providers: [std.meta.fields(app_config.ChatProvider).len]bool = @splat(false),
     new_chat_reasoning: app_config.ChatReasoning = .medium,
     new_chat_pane_behavior: app_config.NewChatPaneBehavior = .new_pane,
     check_for_updates_automatically: bool = true,
@@ -919,6 +921,7 @@ fn settingsChatTitleModelOptions(self: anytype) []const ModelOption {
         self.fxModelOptionsSnapshot(),
         self.grokModelOptionsSnapshot(),
         self.museModelOptionsSnapshot(),
+        self.customAcpModelOptionsSnapshot(),
     );
 }
 
@@ -926,7 +929,7 @@ fn defaultChatTitleModelRef(self: anytype, provider: app_config.ChatTitleProvide
     if (provider == .codex) return app_config.DEFAULT_CHAT_TITLE_MODEL;
     return switch (dbProviderForChatTitleProvider(provider)) {
         // ChatTitleProvider deliberately excludes pi, fx, and grok.
-        .codex, .pi, .fx, .grok, .muse => unreachable,
+        .codex, .pi, .fx, .grok, .muse, .custom_acp => unreachable,
         .opencode => self.cachedDefaultModelRefForProvider(.opencode),
         // Titles use the fast tier, matching the daemon's fallback.
         .claude => app_config.DEFAULT_CLAUDE_FAST_MODEL,
@@ -983,6 +986,7 @@ fn settingsCommitModelOptions(self: anytype) []const ModelOption {
         self.fxModelOptionsSnapshot(),
         self.grokModelOptionsSnapshot(),
         self.museModelOptionsSnapshot(),
+        self.customAcpModelOptionsSnapshot(),
     );
 }
 
@@ -1074,6 +1078,7 @@ pub fn settingsNewChatProviderLabel(self: anytype, option_index: usize) []const 
         .fx => "FX",
         .grok => "Grok",
         .muse => "Muse",
+        .custom_acp => "Custom ACP agent",
     };
 }
 
@@ -1089,6 +1094,7 @@ fn settingsNewChatModelOptions(self: anytype) []const ModelOption {
         self.fxModelOptionsSnapshot(),
         self.grokModelOptionsSnapshot(),
         self.museModelOptionsSnapshot(),
+        self.customAcpModelOptionsSnapshot(),
     );
 }
 
@@ -1102,6 +1108,7 @@ fn defaultNewChatModelRef(self: anytype, provider: app_config.ChatProvider) []co
         .fx => provider_models.DEFAULT_FX_MODEL,
         .grok => provider_models.DEFAULT_GROK_MODEL,
         .muse => provider_models.DEFAULT_MUSE_MODEL,
+        .custom_acp => if (self.customAcpModelOptionsSnapshot().len > 0) self.customAcpModelOptionsSnapshot()[0].value orelse "default" else "default",
     };
 }
 
@@ -1182,6 +1189,7 @@ fn settingsNewChatReasoningSupported(self: anytype, reasoning: app_config.ChatRe
         // grok accepts Verde effort tags up to xhigh (no max tier).
         .grok => reasoning.configValue().len > 0 and provider_models.parseReasoningEffort(reasoning.configValue()) != null and provider_models.parseReasoningEffort(reasoning.configValue()) != .max,
         .muse => provider_models.parseReasoningEffort(reasoning.configValue()) != null,
+        .custom_acp => false,
         .opencode => blk: {
             if (!option.reasoning_supported) break :blk false;
             const values = option.reasoning_variant_keys orelse break :blk false;
@@ -1252,8 +1260,8 @@ pub fn toggleSettingsProviderEnabled(self: anytype, row: usize) void {
     const slot = &draft.disabled_providers[@intFromEnum(PROVIDER_OPTIONS[row])];
     if (!slot.*) {
         var enabled_count: usize = 0;
-        for (draft.disabled_providers) |disabled| {
-            if (!disabled) enabled_count += 1;
+        for (PROVIDER_OPTIONS) |candidate| {
+            if (!draft.disabled_providers[@intFromEnum(candidate)]) enabled_count += 1;
         }
         if (enabled_count <= 1) {
             self.setSidebarNotice("At least one provider must stay enabled.");
@@ -1285,6 +1293,7 @@ pub fn selectSettingsNewChatProvider(self: anytype, option_index: usize) void {
             .fx => self.startFxModelOptionsRefresh(),
             .grok => self.startGrokModelOptionsRefresh(),
             .muse => self.startMuseModelOptionsRefresh(),
+            .custom_acp => {},
             .claude => self.startClaudeModelOptionsRefresh(),
             .cursor => self.startCursorModelOptionsRefresh(),
             .opencode => self.startOpencodeModelOptionsRefresh(),
@@ -1341,6 +1350,7 @@ fn providerProtocol(provider: app_config.ChatProvider) headless.provider_types.P
         .fx => .fx,
         .grok => .grok,
         .muse => .muse,
+        .custom_acp => .custom_acp,
     };
 }
 
@@ -1354,6 +1364,7 @@ fn providerLoginTerminalLabel(provider: app_config.ChatProvider) []const u8 {
         .fx => "Sign in to FX",
         .grok => "Sign in to Grok",
         .muse => "Sign in to Muse",
+        .custom_acp => "Sign in to custom ACP agents",
     };
 }
 
@@ -1367,6 +1378,7 @@ fn providerInstallTerminalLabel(provider: app_config.ChatProvider, missing: bool
         .fx => "Install FX",
         .grok => "Install Grok",
         .muse => "Install Muse",
+        .custom_acp => "Install custom ACP agents",
     };
     return switch (provider) {
         .codex => "Update Codex",
@@ -1377,6 +1389,7 @@ fn providerInstallTerminalLabel(provider: app_config.ChatProvider, missing: bool
         .fx => "Update FX",
         .grok => "Update Grok",
         .muse => "Update Muse",
+        .custom_acp => "Update custom ACP agents",
     };
 }
 
@@ -1754,6 +1767,7 @@ fn providerDisplayName(provider: app_config.ChatProvider) []const u8 {
         .fx => "FX",
         .grok => "Grok",
         .muse => "Muse",
+        .custom_acp => "Custom ACP agents",
     };
 }
 

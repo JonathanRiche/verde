@@ -112,6 +112,7 @@ pub const Provider = enum(u8) {
     fx = 5,
     grok = 6,
     muse = 7,
+    custom_acp = 8,
 };
 
 /// Provider identity attached to terminal surface activity. This stays

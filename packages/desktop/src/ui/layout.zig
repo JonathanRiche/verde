@@ -17,6 +17,8 @@ const settings_modal = @import("settings_modal.zig");
 const runtime_connections = @import("../state/runtime_connections_controller.zig");
 const command_palette = @import("command_palette.zig");
 const folder_browser = @import("folder_browser.zig");
+const custom_agent_form_ui = @import("custom_agent_form.zig");
+const custom_agent_form_state = @import("../state/custom_agent_form.zig");
 const provider_setup = runtime.provider_setup;
 const terminal_panel = @import("terminal_panel.zig");
 const agent_prompt_popover = @import("agent_prompt_popover.zig");
@@ -99,6 +101,8 @@ pub fn refreshPaletteModalHits(state: *runtime.AppState, width: f32, height: f32
     command_palette.registerHits(state, width, height, queueModalHit);
     // Above the Add Workspace / settings modals that open it.
     folder_browser.registerHits(state, width, height, queueModalHit);
+    // Opened from Settings > Providers; sits above the settings modal.
+    custom_agent_form_ui.registerHits(state, width, height, queueModalHit);
     registerRuntimeCredentialModalHits(state, width, height);
     registerRuntimeTrustModalHits(state, width, height);
 }
@@ -238,6 +242,7 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     renderRuntimeWizardModal(state, width, height);
     command_palette.render(state, width, height);
     folder_browser.render(state, width, height);
+    custom_agent_form_ui.render(state, width, height);
     renderRuntimeCredentialModal(state, width, height);
     renderRuntimeTrustModal(state, width, height);
     debug_window.render(state, width, height);
@@ -1629,6 +1634,9 @@ fn focusedCursorReadOnly(state: *runtime.AppState) usize {
         .runtime_wizard_control_plane_url => state.runtime_connections.control_plane_url_cursor,
         .command_palette => state.command_controller.cursor,
         .folder_browser => state.folder_browser.cursor,
+        .custom_agent_name => state.custom_agent_form.name_cursor,
+        .custom_agent_command => state.custom_agent_form.command_cursor,
+        .custom_agent_env => state.custom_agent_form.env_cursor,
         .none => 0,
     };
 }
@@ -1728,6 +1736,9 @@ fn focusedValue(state: *runtime.AppState) []const u8 {
         .runtime_wizard_control_plane_url => state.runtime_connections.fieldValue(.control_plane_url),
         .command_palette => state.commandPaletteQuery(),
         .folder_browser => state.folder_browser.query(),
+        .custom_agent_name => state.custom_agent_form.value(.name),
+        .custom_agent_command => state.custom_agent_form.value(.command),
+        .custom_agent_env => state.custom_agent_form.value(.env),
         .none => &[_]u8{},
     };
 }
@@ -2051,6 +2062,12 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             .command_palette_action_row => command_palette.runActionRow(state, hit.index),
             .command_palette_row_settings => command_palette.openRowWorkspaceSettings(state, hit.index),
             .folder_browser_input => focusModalInput(state, .folder_browser, hit.rect, x, clicks),
+            .custom_agent_input => focusModalInput(state, custom_agent_form_ui.focusForInput(hit.index), hit.rect, x, clicks),
+            .custom_agent_block => {},
+            .custom_agent_cancel, .custom_agent_save => custom_agent_form_ui.handleClick(state, hit.action),
+            .settings_custom_agent_add => custom_agent_form_state.openAdd(state),
+            .settings_custom_agent_edit => custom_agent_form_state.openEdit(state, hit.index),
+            .settings_custom_agent_remove => custom_agent_form_state.remove(state, hit.index),
             .folder_browser_block,
             .folder_browser_row,
             .folder_browser_place,
@@ -2211,6 +2228,29 @@ pub fn handlePaletteTextInput(state: *runtime.AppState, text: []const u8) bool {
             state.markDirty();
             break :blk inserted;
         },
+        .custom_agent_name, .custom_agent_command, .custom_agent_env => blk: {
+            // Single-line fields: pasted newlines become spaces (env pairs
+            // and command words are whitespace-separated).
+            const field = custom_agent_form_state.focusedField(state.palette_modal_text_focus).?;
+            var sanitized: [1024]u8 = undefined;
+            var len: usize = 0;
+            for (text) |byte| {
+                if (len == sanitized.len) break;
+                if (byte == '\n' or byte == '\r' or byte == '\t') {
+                    sanitized[len] = ' ';
+                } else if (byte < 0x20 or byte == 0x7f) {
+                    continue;
+                } else {
+                    sanitized[len] = byte;
+                }
+                len += 1;
+            }
+            const form = &state.custom_agent_form;
+            form.notice = "";
+            const inserted = insertIntoZBuffer(form.buffer(field), form.cursor(field), sanitized[0..len]);
+            state.markDirty();
+            break :blk inserted;
+        },
         .none => false,
     };
 }
@@ -2252,8 +2292,13 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const palette.even
         state.workspaceSettingsOpen() or
         state.runtime_connections.wizard_open or
         state.command_controller.open or
-        state.folder_browser.open;
+        state.folder_browser.open or
+        state.custom_agent_form.open;
     if (!has_modal_open) return false;
+    // The custom agent form sits above the settings modal that opened it.
+    if (state.custom_agent_form.open) {
+        if (custom_agent_form_ui.handleKeyDown(state, event)) return true;
+    }
     // The folder browser sits above the modal that opened it.
     if (state.folder_browser.open and
         !state.runtimeCredentialModalOpen() and
@@ -2449,6 +2494,10 @@ fn dismissTopModal(state: *runtime.AppState) void {
         state.finishFolderBrowser(null);
         return;
     }
+    if (state.custom_agent_form.open) {
+        custom_agent_form_state.close(state);
+        return;
+    }
     if (state.runtime_connections.wizard_open) {
         state.cancelRuntimeConnectionWizard();
         return;
@@ -2634,6 +2683,9 @@ fn focusedCursor(state: *runtime.AppState) ?*usize {
         .runtime_wizard_control_plane_url => &state.runtime_connections.control_plane_url_cursor,
         .command_palette => &state.command_controller.cursor,
         .folder_browser => &state.folder_browser.cursor,
+        .custom_agent_name => &state.custom_agent_form.name_cursor,
+        .custom_agent_command => &state.custom_agent_form.command_cursor,
+        .custom_agent_env => &state.custom_agent_form.env_cursor,
         .none => null,
     };
 }
@@ -2658,6 +2710,9 @@ fn focusedBuffer(state: *runtime.AppState) ?[:0]u8 {
         .runtime_wizard_control_plane_url => state.runtime_connections.fieldBuffer(.control_plane_url),
         .command_palette => state.commandPaletteQueryBuffer(),
         .folder_browser => state.folder_browser.queryBuffer(),
+        .custom_agent_name => state.custom_agent_form.buffer(.name),
+        .custom_agent_command => state.custom_agent_form.buffer(.command),
+        .custom_agent_env => state.custom_agent_form.buffer(.env),
         .none => null,
     };
 }
@@ -2682,6 +2737,9 @@ fn focusedTextLen(state: *runtime.AppState) usize {
         .runtime_wizard_control_plane_url => state.runtime_connections.fieldValue(.control_plane_url).len,
         .command_palette => state.commandPaletteQuery().len,
         .folder_browser => state.folder_browser.query().len,
+        .custom_agent_name => state.custom_agent_form.value(.name).len,
+        .custom_agent_command => state.custom_agent_form.value(.command).len,
+        .custom_agent_env => state.custom_agent_form.value(.env).len,
         .none => 0,
     };
 }
@@ -3675,6 +3733,7 @@ fn providerOnboardingName(provider: runtime.Provider) []const u8 {
         .fx => "FX",
         .grok => "Grok",
         .muse => "Muse",
+        .custom_acp => "Custom ACP agents",
     };
 }
 
@@ -4059,6 +4118,7 @@ fn threadImportHeading(provider: runtime.Provider) []const u8 {
         .fx => "Import FX thread",
         .grok => "Import Grok thread",
         .muse => "Import Muse thread",
+        .custom_acp => "Import agent thread",
     };
 }
 
@@ -4072,6 +4132,7 @@ fn threadImportDescription(provider: runtime.Provider) []const u8 {
         .fx => "Import loads the existing FX transcript into this workspace and binds future turns to the same thread.",
         .grok => "Import loads the existing Grok transcript into this workspace and binds future turns to the same thread.",
         .muse => "Import loads the existing Muse transcript into this workspace and binds future turns to the same session.",
+        .custom_acp => "Custom ACP agents do not support thread import.",
     };
 }
 
@@ -4085,6 +4146,7 @@ fn threadImportHint(provider: runtime.Provider) [:0]const u8 {
         .fx => "Paste an FX session ID",
         .grok => "Paste a Grok session ID",
         .muse => "Paste a Muse session ID",
+        .custom_acp => "Paste an agent session ID",
     };
 }
 
@@ -4098,6 +4160,7 @@ fn emptyThreadImportListNotice(provider: runtime.Provider) []const u8 {
         .fx => "No cached FX threads to show.",
         .grok => "No cached Grok threads to show.",
         .muse => "No cached Muse sessions to show.",
+        .custom_acp => "No cached agent sessions to show.",
     };
 }
 
@@ -4141,6 +4204,7 @@ test "runtime credential input filters edits and wipes removed bytes" {
     var state: runtime.AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     // Zero the sentinel too: `[0..]` on a sentinel-terminated array stops
@@ -4189,6 +4253,7 @@ test "runtime credential input honors selection navigation pointer and blur cont
     var state: runtime.AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     // Zero the sentinel too: `[0..]` on a sentinel-terminated array stops
@@ -4247,6 +4312,7 @@ test "Pair wizard form positions only its two visible fields on separate rows" {
     var state: runtime.AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.runtime_connections = .{};
@@ -4274,6 +4340,7 @@ test "Connect wizard keeps the empty-inventory notice inside the modal and offer
     var state: runtime.AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.runtime_connections = .{};
@@ -4302,6 +4369,7 @@ test "workspace settings modal owns keyboard and text input while open" {
     var state: runtime.AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -4370,6 +4438,8 @@ test "workspace settings layout clamps the option list at short heights" {
     // Fields read by modal key/text routing and new-chat defaults.
 
     state.folder_browser = .{};
+
+    state.custom_agent_form = .{};
 
     state.settings_controller.provider_setup = .{};
 
@@ -4440,6 +4510,7 @@ test "runtime wizard fields honor the modal text-input contract and port filteri
     var state: runtime.AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.runtime_connections = .{};

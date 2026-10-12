@@ -2074,6 +2074,8 @@ test {
     _ = @import("providers/diagnostics.zig");
     _ = @import("providers/fx.zig");
     _ = @import("providers/grok.zig");
+    _ = @import("providers/custom_acp.zig");
+    _ = @import("app/custom_acp_agents.zig");
     _ = @import("providers/muse.zig");
     _ = @import("providers/opencode.zig");
     _ = @import("providers/pi.zig");

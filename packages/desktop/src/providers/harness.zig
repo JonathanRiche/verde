@@ -10,6 +10,7 @@ const pi = @import("pi.zig");
 const fx = @import("fx.zig");
 const grok = @import("grok.zig");
 const muse = @import("muse.zig");
+const custom_acp = @import("custom_acp.zig");
 const runtime_log = @import("../runtime/log.zig");
 
 pub const Provider = types.Provider;
@@ -53,6 +54,7 @@ pub const ProviderConfig = union(Provider) {
     fx: fx.Config,
     grok: grok.Config,
     muse: muse.Config,
+    custom_acp: custom_acp.Config,
 };
 
 pub const ProviderClient = union(Provider) {
@@ -64,6 +66,7 @@ pub const ProviderClient = union(Provider) {
     fx: fx.Client,
     grok: grok.Client,
     muse: muse.Client,
+    custom_acp: custom_acp.Client,
 
     pub fn deinit(self: *ProviderClient) void {
         switch (self.*) {
@@ -75,6 +78,7 @@ pub const ProviderClient = union(Provider) {
             .fx => |*client| client.deinit(),
             .grok => |*client| client.deinit(),
             .muse => |*client| client.deinit(),
+            .custom_acp => |*client| client.deinit(),
         }
     }
 
@@ -88,6 +92,7 @@ pub const ProviderClient = union(Provider) {
             .fx => |*client| client.authState(),
             .grok => |*client| client.authState(),
             .muse => |*client| client.authState(),
+            .custom_acp => |*client| client.authState(),
         };
     }
 
@@ -101,6 +106,7 @@ pub const ProviderClient = union(Provider) {
             .fx => |*client| client.listThreads(allocator),
             .grok => |*client| client.listThreads(allocator),
             .muse => |*client| client.listThreads(allocator),
+            .custom_acp => |*client| client.listThreads(allocator),
         };
     }
 
@@ -114,6 +120,7 @@ pub const ProviderClient = union(Provider) {
             .fx => |*client| client.listModels(allocator),
             .grok => |*client| client.listModels(allocator),
             .muse => |*client| client.listModels(allocator),
+            .custom_acp => |*client| client.listModels(allocator),
         };
     }
 
@@ -127,6 +134,7 @@ pub const ProviderClient = union(Provider) {
             .fx => |*client| client.readThread(allocator, thread_id),
             .grok => |*client| client.readThread(allocator, thread_id),
             .muse => |*client| client.readThread(allocator, thread_id),
+            .custom_acp => |*client| client.readThread(allocator, thread_id),
         };
     }
 
@@ -140,6 +148,7 @@ pub const ProviderClient = union(Provider) {
             .fx => |*client| client.sendPrompt(allocator, request),
             .grok => |*client| client.sendPrompt(allocator, request),
             .muse => |*client| client.sendPrompt(allocator, request),
+            .custom_acp => |*client| client.sendPrompt(allocator, request),
         };
     }
 
@@ -153,6 +162,7 @@ pub const ProviderClient = union(Provider) {
             .fx => |*client| client.slashCommands(),
             .grok => |*client| client.slashCommands(),
             .muse => |*client| client.slashCommands(),
+            .custom_acp => |*client| client.slashCommands(),
         };
     }
 
@@ -166,6 +176,7 @@ pub const ProviderClient = union(Provider) {
             .fx => |*client| client.runSlashCommand(allocator, request),
             .grok => |*client| client.runSlashCommand(allocator, request),
             .muse => |*client| client.runSlashCommand(allocator, request),
+            .custom_acp => |*client| client.runSlashCommand(allocator, request),
         };
     }
 
@@ -179,6 +190,7 @@ pub const ProviderClient = union(Provider) {
             .fx => |*client| client.interruptThread(request),
             .grok => |*client| client.interruptThread(request),
             .muse => |*client| client.interruptThread(request),
+            .custom_acp => |*client| client.interruptThread(request),
         };
     }
 
@@ -206,6 +218,7 @@ pub const ProviderClient = union(Provider) {
             .fx => |*client| client.steerThread(request),
             .grok => |*client| client.steerThread(request),
             .muse => |*client| client.steerThread(request),
+            .custom_acp => |*client| client.steerThread(request),
         };
     }
 };
@@ -220,6 +233,7 @@ pub fn slashCommandsForProvider(provider: Provider) []const ProviderSlashCommand
         .fx => fx.providerSlashCommands(),
         .grok => grok.providerSlashCommands(),
         .muse => muse.providerSlashCommands(),
+        .custom_acp => custom_acp.providerSlashCommands(),
     };
 }
 
@@ -236,6 +250,7 @@ pub fn connect(
         .fx => |config| .{ .fx = try fx.Client.init(allocator, config) },
         .grok => |config| .{ .grok = try grok.Client.init(allocator, config) },
         .muse => |config| .{ .muse = try muse.Client.init(allocator, config) },
+        .custom_acp => |config| .{ .custom_acp = try custom_acp.Client.init(allocator, config) },
     };
 }
 
@@ -263,6 +278,9 @@ pub fn shutdownOwnedProviderProcesses() void {
     runtime_log.diagnostic("provider shutdown begin muse", .{});
     muse.shutdownOwnedServer();
     runtime_log.diagnostic("provider shutdown done muse", .{});
+    runtime_log.diagnostic("provider shutdown begin custom_acp", .{});
+    custom_acp.shutdownOwnedServer();
+    runtime_log.diagnostic("provider shutdown done custom_acp", .{});
 }
 
 /// Stops a Codex app-server launched by this process so a durable send can

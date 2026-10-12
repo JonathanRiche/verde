@@ -114,6 +114,7 @@ fn composerModelOptions(self: anytype, provider: Provider) []const ModelOption {
         self.fxModelOptionsSnapshot(),
         self.grokModelOptionsSnapshot(),
         self.museModelOptionsSnapshot(),
+        self.customAcpModelOptionsSnapshot(),
     );
 }
 
@@ -127,6 +128,7 @@ fn composerDefaultModelRef(self: anytype, provider: Provider) [:0]const u8 {
         .fx => DEFAULT_FX_MODEL,
         .grok => DEFAULT_GROK_MODEL,
         .muse => DEFAULT_MUSE_MODEL,
+        .custom_acp => if (self.customAcpModelOptionsSnapshot().len > 0) self.customAcpModelOptionsSnapshot()[0].value orelse "default" else "default",
     };
 }
 
@@ -2124,6 +2126,7 @@ pub fn resolveChatCreationSettings(self: anytype, request: OpenChatRequest, mode
             // grok reasoning efforts stop at xhigh.
             .grok => effort != .max,
             .muse => true,
+            .custom_acp => false,
         };
         if (!supported) return error.UnsupportedReasoningEffort;
     }
@@ -2135,7 +2138,7 @@ pub fn resolveChatCreationSettings(self: anytype, request: OpenChatRequest, mode
         const values = switch (request.provider) {
             .opencode => option.reasoning_variant_keys,
             .cursor => option.cursor_reasoning_values,
-            .codex, .claude, .pi, .fx, .grok, .muse => null,
+            .codex, .claude, .pi, .fx, .grok, .muse, .custom_acp => null,
         } orelse return error.UnsupportedReasoningVariant;
         var supported = false;
         for (values) |value| {
@@ -2151,7 +2154,7 @@ pub fn resolveChatCreationSettings(self: anytype, request: OpenChatRequest, mode
         const supported = switch (request.provider) {
             .codex => true,
             .cursor => if (self.modelOptionForProvider(.cursor, model_ref)) |option| option.cursor_fast_supported else false,
-            .opencode, .claude, .pi, .fx, .grok, .muse => false,
+            .opencode, .claude, .pi, .fx, .grok, .muse, .custom_acp => false,
         };
         if (!supported) return error.UnsupportedFastMode;
     }
@@ -2660,6 +2663,8 @@ pub fn tuiResumeCommand(self: anytype, provider: Provider, thread_id: []const u8
         .fx => std.fmt.allocPrint(self.allocator, "fx --resume {s}\n", .{thread_id}),
         .grok => std.fmt.allocPrint(self.allocator, "grok --resume {s}\n", .{thread_id}),
         .muse => std.fmt.allocPrint(self.allocator, "muse resume {s}\n", .{thread_id}),
+        // Custom agents have no known TUI resume command.
+        .custom_acp => error.UnsupportedOperation,
     };
 }
 

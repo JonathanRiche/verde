@@ -11,6 +11,8 @@ pub const Provider = enum(u8) {
     fx,
     grok,
     muse,
+    /// User-defined ACP agent; the thread model ref names which one.
+    custom_acp,
 };
 
 pub const ProviderSlashCommandId = enum(u8) {

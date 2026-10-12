@@ -80,6 +80,7 @@ pub fn run(allocator: std.mem.Allocator, request: Request, sink: Sink) !Result {
         .fx => harness.ProviderConfig{ .fx = .{ .cwd = request_cwd, .model = request.model_ref } },
         .grok => harness.ProviderConfig{ .grok = .{ .cwd = request_cwd, .model = request.model_ref } },
         .muse => harness.ProviderConfig{ .muse = .{ .cwd = request_cwd, .model = request.model_ref } },
+        .custom_acp => harness.ProviderConfig{ .custom_acp = .{ .cwd = request_cwd, .model = request.model_ref } },
     };
 
     log.info("send starting provider={s} cwd={s} model_len={d} thread_id_len={d} prompt_len={d}", .{
@@ -149,6 +150,7 @@ pub fn listModels(
         .fx => harness.ProviderConfig{ .fx = .{ .cwd = project_path } },
         .grok => harness.ProviderConfig{ .grok = .{ .cwd = project_path } },
         .muse => harness.ProviderConfig{ .muse = .{ .cwd = project_path } },
+        .custom_acp => harness.ProviderConfig{ .custom_acp = .{ .cwd = project_path } },
     };
     var client = try harness.connect(allocator, provider_config);
     defer client.deinit();
@@ -183,6 +185,7 @@ pub fn connectProvider(
         .fx => .{ .fx = .{ .cwd = cwd } },
         .grok => .{ .grok = .{ .cwd = cwd } },
         .muse => .{ .muse = .{ .cwd = cwd } },
+        .custom_acp => .{ .custom_acp = .{ .cwd = cwd } },
     };
     return harness.connect(allocator, provider_config);
 }

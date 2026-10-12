@@ -130,7 +130,7 @@ pub fn writeLinks(conn: zqlite.Conn, s: *std.json.Stringify, workspace: []const 
     try s.beginObject();
     try s.objectField("links");
     try s.beginArray();
-    const providers = [_][]const u8{ "opencode", "codex", "cursor", "claude", "pi", "fx", "grok", "muse" };
+    const providers = [_][]const u8{ "opencode", "codex", "cursor", "claude", "pi", "fx", "grok", "muse", "custom_acp" };
     while (rows.next()) |row| {
         const provider: usize = @intCast(@max(0, row.int(3)));
         try s.write(.{ .link_id = row.text(0), .workspace_id = workspace, .parent_thread_id = parent, .local_thread_id = row.text(1), .title = row.text(2), .provider = if (provider < providers.len) providers[provider] else "unknown", .status = row.text(4), .summary = row.text(5), .turn_id = row.nullableText(6), .updated_at_ms = row.int(7), .hidden = row.int(8) != 0 });

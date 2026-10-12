@@ -49,6 +49,7 @@ const chat_types = @import("state/chat_types.zig");
 const state_sync = @import("state/sync.zig");
 const state_ui_types = @import("state/ui_types.zig");
 pub const folder_browser = @import("state/folder_browser.zig");
+pub const custom_agent_form = @import("state/custom_agent_form.zig");
 pub const provider_setup = @import("state/provider_setup.zig");
 const herdr_types = @import("state/herdr_types.zig");
 const project_state = @import("state/project.zig");
@@ -2367,6 +2368,15 @@ pub const PaletteModalAction = enum {
     folder_browser_managed,
     provider_onboarding_copy,
     provider_setup_back,
+    /// Custom ACP agent form (state/custom_agent_form.zig); index is the field.
+    custom_agent_block,
+    custom_agent_input,
+    custom_agent_cancel,
+    custom_agent_save,
+    /// Settings > Providers custom agent rows; index is the agent.
+    settings_custom_agent_add,
+    settings_custom_agent_edit,
+    settings_custom_agent_remove,
 };
 
 pub const SettingsOpenAction = settings_controller.OpenAction;
@@ -2451,6 +2461,9 @@ pub const PaletteModalTextFocus = enum {
     runtime_wizard_control_plane_url,
     command_palette,
     folder_browser,
+    custom_agent_name,
+    custom_agent_command,
+    custom_agent_env,
 };
 
 /// Composer body text size (CSS units, scaled by `setUiScale`). Public because
@@ -2686,7 +2699,8 @@ const COMPOSER_MODEL_PICKER_WIDTH: f32 = 430.0;
 const COMPOSER_MODEL_PICKER_RAIL_WIDTH: f32 = 52.0;
 const COMPOSER_MODEL_PICKER_Z: i32 = 1400;
 pub const COMPOSER_RUN_CONFIG_Z: i32 = 1400;
-const COMPOSER_PROVIDER_OPTIONS = [_]Provider{ .codex, .claude, .cursor, .opencode, .pi, .fx, .grok, .muse };
+/// `custom_acp` lists one row per configured agent and none when there are none.
+const COMPOSER_PROVIDER_OPTIONS = [_]Provider{ .codex, .claude, .cursor, .opencode, .pi, .fx, .grok, .muse, .custom_acp };
 
 fn paletteEstimatedFontAdvance(_: ?*anyopaque, text: []const u8, byte_offset: usize, font_size: f32) palette.FontAdvance {
     if (byte_offset >= text.len) return .{ .byte_len = 0, .width = 0.0 };
@@ -2868,6 +2882,7 @@ fn composerModelOptions(state: *const AppState, provider: Provider) []const Mode
         state.fxModelOptionsSnapshot(),
         state.grokModelOptionsSnapshot(),
         state.museModelOptionsSnapshot(),
+        state.customAcpModelOptionsSnapshot(),
     );
 }
 
@@ -2891,7 +2906,15 @@ fn composerDefaultModelRef(state: *const AppState, provider: Provider) [:0]const
         .fx => DEFAULT_FX_MODEL,
         .grok => DEFAULT_GROK_MODEL,
         .muse => DEFAULT_MUSE_MODEL,
+        .custom_acp => customAcpDefaultModelRef(state.customAcpModelOptionsSnapshot()),
     };
+}
+
+/// First configured custom agent's id; "default" (resolved to the first agent
+/// by the daemon) before the picker rows are built.
+pub fn customAcpDefaultModelRef(options: []const ModelOption) [:0]const u8 {
+    if (options.len > 0) if (options[0].value) |value| return value;
+    return "default";
 }
 
 fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromptEvent) void {
@@ -3311,6 +3334,7 @@ fn configChatProvider(provider: Provider) app_config.ChatProvider {
         .fx => .fx,
         .grok => .grok,
         .muse => .muse,
+        .custom_acp => .custom_acp,
     };
 }
 
@@ -3324,6 +3348,7 @@ fn providerFromConfig(provider: app_config.ChatProvider) Provider {
         .fx => .fx,
         .grok => .grok,
         .muse => .muse,
+        .custom_acp => .custom_acp,
     };
 }
 
@@ -3392,6 +3417,7 @@ fn drawModelPickerProviderLetter(
         .fx => "F",
         .grok => "G",
         .muse => "M",
+        .custom_acp => "A",
     };
     const font_size = @min(slot.h, theme.scaledUi(13.0));
     batch.text(allocator, .{
@@ -4988,6 +5014,7 @@ pub const AppState = struct {
     project_directory_picker_adds_workspace: bool,
     picker_state: PickerState,
     folder_browser: folder_browser.FolderBrowser,
+    custom_agent_form: custom_agent_form.Form = .{},
     slash_command_state: SlashCommandState,
     provider_controller: provider_controller.State,
     file_search_controller: file_search_controller.State,
@@ -6221,6 +6248,8 @@ pub const AppState = struct {
     pub const fxModelOptionsSnapshot = provider_controller.fxModelOptionsSnapshot;
     pub const grokModelOptionsSnapshot = provider_controller.grokModelOptionsSnapshot;
     pub const museModelOptionsSnapshot = provider_controller.museModelOptionsSnapshot;
+    pub const customAcpModelOptionsSnapshot = provider_controller.customAcpModelOptionsSnapshot;
+    pub const syncCustomAcpModelOptions = provider_controller.syncCustomAcpModelOptions;
     pub const cachedDefaultModelRefForProvider = provider_controller.cachedDefaultModelRefForProvider;
     pub const startOpencodeModelOptionsRefresh = provider_controller.startOpencodeModelOptionsRefresh;
     pub const startCursorModelOptionsRefresh = provider_controller.startCursorModelOptionsRefresh;
@@ -8346,6 +8375,8 @@ pub const AppState = struct {
                 .muse => if (parseReasoningEffort(raw)) |effort| {
                     reasoning_effort = effort;
                 },
+                // Custom agents expose no Verde-managed effort control.
+                .custom_acp => {},
             }
         }
         const owned_variant = if (variant_value) |value| try self.allocator.dupeZ(u8, value) else null;
@@ -10219,6 +10250,8 @@ pub const AppState = struct {
             .fx => self.fx_logo_texture,
             .grok => self.grok_logo_texture,
             .muse => self.muse_logo_texture,
+            // No bundled logo; pickers fall back to a letter badge.
+            .custom_acp => null,
         };
     }
 
@@ -10331,7 +10364,7 @@ pub const AppState = struct {
                 return .{ .index = index, .count = values.len + 1 };
             },
             // fx exposes no reasoning levels.
-            .fx => return null,
+            .fx, .custom_acp => return null,
             // grok efforts stop at xhigh; rows mirror GROK_REASONING_OPTIONS.
             .grok => return .{
                 .index = composerReasoningIndexForOptions(GROK_REASONING_OPTIONS[0..], thread.reasoning_effort) orelse 0,
@@ -14427,9 +14460,16 @@ pub const AppState = struct {
                 .folder_browser_managed,
                 .provider_onboarding_copy,
                 .provider_setup_back,
+                .custom_agent_cancel,
+                .custom_agent_save,
+                .settings_custom_agent_add,
+                .settings_custom_agent_edit,
+                .settings_custom_agent_remove,
                 => true,
                 .folder_browser_block,
                 .folder_browser_input,
+                .custom_agent_block,
+                .custom_agent_input,
                 .modal_dismiss,
                 .modal_block,
                 .project_rename_input,
@@ -15709,6 +15749,7 @@ pub const AppState = struct {
         self.fx_model_options.deinit(self.allocator);
         self.grok_model_options.deinit(self.allocator);
         self.muse_model_options.deinit(self.allocator);
+        provider_controller.deinitCustomAcpModelOptions(&self.provider_controller, self.allocator);
         if (self.settings_controller.chat_title_model) |model| self.allocator.free(model);
         if (self.settings_controller.new_chat_model) |model| self.allocator.free(model);
         self.app_config.deinit(self.allocator);
@@ -17190,6 +17231,7 @@ fn testTranscriptHydrationState(allocator: std.mem.Allocator) !AppState {
     var state: AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -17569,6 +17611,12 @@ fn importThreadFailureMessage(provider: Provider, err: anyerror) []const u8 {
             error.MuseSignedOut => "Muse is not authenticated. Run `muse login`.",
             else => "Failed to load Muse threads.",
         },
+        .custom_acp => switch (err) {
+            error.CustomAcpAgentNotConfigured => "That custom ACP agent is no longer configured in Settings.",
+            error.CustomAcpCommandNotFound => "The custom ACP agent command was not found.",
+            error.UnsupportedOperation => "Custom ACP agents do not support thread import or sync.",
+            else => "Failed to load agent threads.",
+        },
     };
 }
 
@@ -17630,6 +17678,12 @@ fn readThreadFailureMessage(provider: Provider, err: anyerror) []const u8 {
             error.FileNotFound => "The muse executable was not found on PATH.",
             error.MuseSignedOut => "Muse is not authenticated. Run `muse login`.",
             else => "Failed to import the selected Muse thread.",
+        },
+        .custom_acp => switch (err) {
+            error.CustomAcpAgentNotConfigured => "That custom ACP agent is no longer configured in Settings.",
+            error.CustomAcpCommandNotFound => "The custom ACP agent command was not found.",
+            error.UnsupportedOperation => "Custom ACP agents do not support thread import or sync.",
+            else => "Failed to import the selected agent thread.",
         },
     };
 }
@@ -17739,6 +17793,12 @@ fn syncThreadFailureMessage(provider: Provider, err: anyerror) []const u8 {
             error.MuseSignedOut => "Muse is not authenticated. Run `muse login`.",
             else => "Failed to sync the Muse thread.",
         },
+        .custom_acp => switch (err) {
+            error.CustomAcpAgentNotConfigured => "That custom ACP agent is no longer configured in Settings.",
+            error.CustomAcpCommandNotFound => "The custom ACP agent command was not found.",
+            error.UnsupportedOperation => "Custom ACP agents do not support thread import or sync.",
+            else => "Failed to sync the agent thread.",
+        },
     };
 }
 
@@ -17752,6 +17812,7 @@ fn failedToStoreThreadListNotice(provider: Provider) []const u8 {
         .fx => "Failed to store FX thread list.",
         .grok => "Failed to store Grok thread list.",
         .muse => "Failed to store Muse thread list.",
+        .custom_acp => "Failed to store agent thread list.",
     };
 }
 
@@ -17765,6 +17826,7 @@ fn noRecentThreadsNotice(provider: Provider) []const u8 {
         .fx => "No recent FX threads found.",
         .grok => "No recent Grok threads found.",
         .muse => "No recent Muse threads found.",
+        .custom_acp => "No recent agent threads found.",
     };
 }
 
@@ -17778,6 +17840,7 @@ fn selectThreadNotice(provider: Provider) []const u8 {
         .fx => "Select an FX thread or paste a thread ID.",
         .grok => "Select a Grok thread or paste a thread ID.",
         .muse => "Select a Muse thread or paste a thread ID.",
+        .custom_acp => "Select a agent thread or paste a thread ID.",
     };
 }
 
@@ -17791,6 +17854,7 @@ fn emptyThreadImportIdNotice(provider: Provider) []const u8 {
         .fx => "Enter an FX thread ID or select one from the list.",
         .grok => "Enter a Grok thread ID or select one from the list.",
         .muse => "Enter a Muse thread ID or select one from the list.",
+        .custom_acp => "Enter a agent thread ID or select one from the list.",
     };
 }
 
@@ -17804,6 +17868,7 @@ fn duplicateThreadNotice(provider: Provider) []const u8 {
         .fx => "FX thread already exists in this workspace.",
         .grok => "Grok thread already exists in this workspace.",
         .muse => "Muse thread already exists in this workspace.",
+        .custom_acp => "agent thread already exists in this workspace.",
     };
 }
 
@@ -17817,6 +17882,7 @@ fn failedCreateImportedThreadNotice(provider: Provider) []const u8 {
         .fx => "Failed to create the imported thread.",
         .grok => "Failed to create the imported thread.",
         .muse => "Failed to create the imported thread.",
+        .custom_acp => "Failed to create the imported thread.",
     };
 }
 
@@ -17830,6 +17896,7 @@ fn failedAddImportedThreadNotice(provider: Provider) []const u8 {
         .fx => "Failed to add the imported thread.",
         .grok => "Failed to add the imported thread.",
         .muse => "Failed to add the imported thread.",
+        .custom_acp => "Failed to add the imported thread.",
     };
 }
 
@@ -17843,6 +17910,7 @@ fn threadImportedNotice(provider: Provider) []const u8 {
         .fx => "FX thread imported.",
         .grok => "Grok thread imported.",
         .muse => "Muse thread imported.",
+        .custom_acp => "agent thread imported.",
     };
 }
 
@@ -17856,6 +17924,7 @@ fn threadSyncedNotice(provider: Provider) []const u8 {
         .fx => "Thread synced from FX.",
         .grok => "Thread synced from Grok.",
         .muse => "Thread synced from Muse.",
+        .custom_acp => "Thread synced from the agent.",
     };
 }
 
@@ -17872,6 +17941,7 @@ test "empty workspace ignores hidden composer and slash input" {
     var state: AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.project_controller.projects = .empty;
@@ -17924,6 +17994,7 @@ test "shared browser runtime routes state through its workspace owner" {
     var state: AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -17971,6 +18042,7 @@ test "browser runtime remains needed until the final workspace browser pane clos
     var state: AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -18017,6 +18089,8 @@ test "completed OpenCode model refresh tolerates zero workspaces" {
     // Fields read by modal key/text routing and new-chat defaults.
 
     state.folder_browser = .{};
+
+    state.custom_agent_form = .{};
 
     state.settings_controller.provider_setup = .{};
 
@@ -18416,6 +18490,7 @@ test "runtime credential UI storage is fully wiped" {
     var state: AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     @memset(state.runtime_credential_token_storage[0..], 0xa5);
@@ -18439,6 +18514,7 @@ test "GUI new-chat defaults apply configured provider model and reasoning" {
     var state: AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -18572,6 +18648,8 @@ test "workspace settings modal stays bound by id and marks the effective default
 
     state.folder_browser = .{};
 
+    state.custom_agent_form = .{};
+
     state.settings_controller.provider_setup = .{};
 
     state.provider_controller = .{};
@@ -18672,6 +18750,8 @@ test "workspace runtime default affects future drafts while each thread can over
     // Fields read by modal key/text routing and new-chat defaults.
 
     state.folder_browser = .{};
+
+    state.custom_agent_form = .{};
 
     state.settings_controller.provider_setup = .{};
 
@@ -18855,6 +18935,7 @@ test "provider-aware chat creation scopes mutation and rejects invalid models" {
     var state: AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -19028,6 +19109,7 @@ test "durable projected chat presentation is idempotent and never mints identity
     var state: AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -19103,6 +19185,7 @@ test "web client chats tile once in the background" {
     var state: AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -19206,6 +19289,7 @@ test "activating a thread already visible focuses its pane without changing spli
     var state: AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -19372,6 +19456,7 @@ test "sidebar open pane focus keeps the clicked terminal pane maximized" {
     var state: AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -19544,6 +19629,7 @@ test "sidebar pane selection restores a sibling browser URL snapshot" {
     var state: AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -19607,6 +19693,7 @@ test "configured chat web links focus and reveal the Verde browser pane" {
     var state: AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -19664,6 +19751,7 @@ test "sidebar and pane cycling preserve zoom while rebinding a browser runtime" 
     var state: AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -19718,6 +19806,7 @@ test "workspace selection restores focused pane keyboard ownership" {
     var state: AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -20013,6 +20102,7 @@ test "ordinary browser focus and deletion preserve exact pane runtime ownership"
     var state: AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -20172,6 +20262,7 @@ test "opening Companion is lazy and leaves workspace ownership and persistence u
     var state: AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -20240,6 +20331,7 @@ test "Companion shared draft follows exact workspace owner without lazy stale te
     var state: AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -20331,6 +20423,7 @@ test "Companion frame projects transcript pending streaming lifecycle errors and
     var state: AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -20487,6 +20580,7 @@ test "Companion projection scopes global failure posture to the current turn" {
     var state: AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -20587,6 +20681,7 @@ test "Companion production projection rejects lossy identities and preserves own
     var state: AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -20697,6 +20792,7 @@ test "Companion operation snapshots expose only exact live owner actions" {
     var state: AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -21062,6 +21158,7 @@ test "visible chat is not treated as focused when a sibling pane owns focus" {
     var state: AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -21138,6 +21235,8 @@ test "initial send snapshot restores retryable draft and attachment" {
 
     state.folder_browser = .{};
 
+    state.custom_agent_form = .{};
+
     state.settings_controller.provider_setup = .{};
 
     state.provider_controller = .{};
@@ -21199,6 +21298,7 @@ test "workspace leases reject conflicts, renew, expire, and enforce ownership" {
     var state: AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -21236,6 +21336,7 @@ test "terminal teardown releases leases for only the exact session owner" {
     var state: AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -21274,6 +21375,7 @@ test "terminal teardown prefers the revived live session owner" {
     var state: AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -21327,6 +21429,7 @@ test "active TUI replacement retains teardown ownership until confirmed exit" {
     var state: AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -21382,6 +21485,7 @@ test "pending teardown retries outcome retention before releasing its exact-owne
     var state: AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -21452,6 +21556,7 @@ test "daemon teardown failures retain exact-owner leases at the state boundary" 
     var state: AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -21546,6 +21651,7 @@ test "workspace archive retains active terminal teardown until archived polling 
     var state: AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -23124,6 +23230,7 @@ test "M5-P4 stalled daemon worker cannot block frame-side bridge drain" {
     var state: AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.storage = &storage;

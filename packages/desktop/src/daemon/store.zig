@@ -5441,6 +5441,7 @@ fn providerCode(value: []const u8) !i64 {
     if (std.mem.eql(u8, value, "fx")) return 5;
     if (std.mem.eql(u8, value, "grok")) return 6;
     if (std.mem.eql(u8, value, "muse")) return 7;
+    if (std.mem.eql(u8, value, "custom_acp")) return 8;
     return error.InvalidParams;
 }
 

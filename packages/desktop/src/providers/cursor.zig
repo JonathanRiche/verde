@@ -297,11 +297,6 @@ pub const Client = struct {
         defer state.deinit(allocator);
 
         try proc.writeLine(try acp.makeInitializeRequestAlloc(allocator, 1));
-        if (request.thread_id) |thread_id| {
-            try proc.writeLine(try acp.makeSessionLoadRequestWithHttpMcpAlloc(allocator, 2, thread_id, cwd, mcp_http));
-        } else {
-            try proc.writeLine(try acp.makeSessionNewRequestWithHttpMcpAlloc(allocator, 2, cwd, mcp_http));
-        }
 
         var read_buffer: [16 * 1024]u8 = undefined;
         var reader = proc.process.child.stdout.?.reader(proc.threaded.io(), &read_buffer);
@@ -312,6 +307,11 @@ pub const Client = struct {
             const action = try acp.handleSendPromptLine(allocator, ACP_HARNESS, line, request, &state, proc.process.child.stdin);
             switch (action) {
                 .continue_reading => {},
+                .initialized => try proc.writeLine(try acp.makeTurnSessionRequestAlloc(allocator, 2, state.capabilities, .{
+                    .cwd = cwd,
+                    .session_id = request.thread_id,
+                    .mcp_http = mcp_http,
+                })),
                 .session_ready => {
                     if (state.session_id) |session_id| {
                         active_process_state.register(&proc.process, proc.process.child.stdin, session_id);

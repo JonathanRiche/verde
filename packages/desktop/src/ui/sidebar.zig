@@ -831,6 +831,7 @@ fn openTuiLabel(provider: Provider) []const u8 {
         .fx => "Open in TUI: FX",
         .grok => "Open in TUI: Grok",
         .muse => "Open in TUI: Muse",
+        .custom_acp => "Open in TUI",
     };
 }
 
@@ -2729,6 +2730,7 @@ const TerminalAgentProvider = enum {
     pi,
     fx,
     muse,
+    custom_acp,
 };
 
 fn terminalAgentProviderFromChatProvider(provider: Provider) TerminalAgentProvider {
@@ -2741,6 +2743,7 @@ fn terminalAgentProviderFromChatProvider(provider: Provider) TerminalAgentProvid
         .fx => .fx,
         .grok => .grok,
         .muse => .muse,
+        .custom_acp => .custom_acp,
     };
 }
 
@@ -2783,6 +2786,7 @@ fn queuePaletteProviderGlyphInRect(state: *runtime.AppState, provider: TerminalA
         .pi => state.pi_logo_texture,
         .fx => state.fx_logo_texture,
         .muse => state.muse_logo_texture,
+        .custom_acp => null,
     };
     if (texture) |cached| {
         const r = utils.snapImageRectToPixels(utils.imageRectContain(cached.width, cached.height, box.x, box.y, box.w, box.h));
@@ -2800,6 +2804,7 @@ fn queuePaletteProviderGlyphInRect(state: *runtime.AppState, provider: TerminalA
         .pi => "P",
         .fx => "F",
         .muse => "M",
+        .custom_acp => "Ag",
     };
     const font_size = @min(theme.scaledUi(11.0), box.h);
     const color = if (provider == .amp) theme.COLOR_YELLOW else theme.COLOR_TEXT_SUBTLE;
@@ -2986,6 +2991,7 @@ test "ACTIVE collection sees every restored chat pane and deduplicates one threa
     var state: runtime.AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -3027,6 +3033,7 @@ test "OPEN interleaves All Workspaces newest-activity first and keeps layout ord
     var state: runtime.AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -3067,6 +3074,7 @@ test "All Workspaces keyboard order follows the displayed OPEN rows" {
     var state: runtime.AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;

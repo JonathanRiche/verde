@@ -21,6 +21,7 @@ fn defaultModelRef(self: anytype, provider: Provider) [:0]const u8 {
         .fx => provider_models.DEFAULT_FX_MODEL,
         .grok => provider_models.DEFAULT_GROK_MODEL,
         .muse => provider_models.DEFAULT_MUSE_MODEL,
+        .custom_acp => if (self.customAcpModelOptionsSnapshot().len > 0) self.customAcpModelOptionsSnapshot()[0].value orelse "default" else "default",
     };
 }
 
@@ -373,7 +374,7 @@ fn prepareTuiHandoffTarget(self: anytype, preview: []const u8) !WorkspacePaneId 
         .claude => .claude,
         .cursor => .cursor,
         // Pi and FX have no agent-TUI stack profile yet; the caller reports the error.
-        .pi, .fx => return error.UnsupportedOperation,
+        .pi, .fx, .custom_acp => return error.UnsupportedOperation,
         .grok => .grok,
         .muse => .muse,
     };

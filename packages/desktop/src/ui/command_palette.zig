@@ -2540,6 +2540,7 @@ test "workspace open settings command routes to the palette target workspace" {
     var state: runtime.AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;

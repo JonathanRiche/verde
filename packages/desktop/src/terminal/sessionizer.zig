@@ -13,6 +13,7 @@ const headless = @import("headless");
 const session_protocol = headless.session_protocol;
 const push = @import("../daemon/push.zig");
 const app_config = @import("../app/config.zig");
+const custom_acp_agents = @import("../app/custom_acp_agents.zig");
 const chat_threads = @import("../chat/threads.zig");
 const db_types = @import("../db/types.zig");
 const process_registry = @import("../daemon/process_registry.zig");
@@ -2176,6 +2177,7 @@ fn nativeProviderLabel(provider: provider_models.Provider) []const u8 {
         .fx => "FX",
         .grok => "Grok",
         .muse => "Muse",
+        .custom_acp => "Custom ACP",
     };
 }
 
@@ -2193,7 +2195,19 @@ fn nativeProviderInstalled(provider: provider_models.Provider) bool {
         .fx => process_env.commandExists("fx"),
         .grok => process_env.commandExists("grok"),
         .muse => process_env.commandExists("muse"),
+        .custom_acp => customAcpAgentInstalled(),
     };
+}
+
+/// True when any agent in `chat.custom_acp_agents` has a resolvable command.
+fn customAcpAgentInstalled() bool {
+    const allocator = std.heap.page_allocator;
+    const agents = custom_acp_agents.loadFromConfigFileAlloc(allocator) catch return false;
+    defer custom_acp_agents.freeAgents(allocator, agents);
+    for (agents) |agent| {
+        if (process_env.commandExists(agent.command)) return true;
+    }
+    return false;
 }
 
 fn nativeProviderFromHarness(provider: harness.Provider) provider_models.Provider {
@@ -2206,6 +2220,7 @@ fn nativeProviderFromHarness(provider: harness.Provider) provider_models.Provide
         .fx => .fx,
         .grok => .grok,
         .muse => .muse,
+        .custom_acp => .custom_acp,
     };
 }
 
@@ -2219,6 +2234,7 @@ fn protocolProvider(provider: provider_models.Provider) headless.provider_types.
         .fx => .fx,
         .grok => .grok,
         .muse => .muse,
+        .custom_acp => .custom_acp,
     };
 }
 
@@ -2232,6 +2248,8 @@ fn nativeProviderVersionExecutable(provider: provider_models.Provider) ?[]const 
         .fx => if (process_env.commandExists("fx")) "fx" else null,
         .grok => if (process_env.commandExists("grok")) "grok" else null,
         .muse => if (process_env.commandExists("muse")) "muse" else null,
+        // Each custom agent has its own command; there is no one version.
+        .custom_acp => null,
     };
 }
 
@@ -9092,7 +9110,7 @@ pub const Daemon = struct {
         const request = parsed.value;
         switch (request.provider) {
             .codex, .claude, .cursor, .opencode => {},
-            .pi, .fx, .grok, .muse => return try providerTitleFailureResponse(self.allocator, id_value, "UnsupportedTitleProvider"),
+            .pi, .fx, .grok, .muse, .custom_acp => return try providerTitleFailureResponse(self.allocator, id_value, "UnsupportedTitleProvider"),
         }
         const user_text = if (std.mem.trim(u8, request.user_text, &std.ascii.whitespace).len > 0)
             boundedTitleUtf8Prefix(request.user_text, 4096)
@@ -11959,6 +11977,7 @@ fn providerNameFromCode(code: i64) []const u8 {
         5 => "fx",
         6 => "grok",
         7 => "muse",
+        8 => "custom_acp",
         else => "opencode",
     };
 }

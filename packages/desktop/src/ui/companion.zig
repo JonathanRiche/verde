@@ -2670,6 +2670,7 @@ test "production collapsed and expanded overlays stay inside the window" {
         var state: runtime.AppState = undefined;
         // Fields read by modal key/text routing and new-chat defaults.
         state.folder_browser = .{};
+        state.custom_agent_form = .{};
         state.settings_controller.provider_setup = .{};
         state.provider_controller = .{};
         state.allocator = allocator;
@@ -2746,6 +2747,8 @@ test "captured scale public render emits a visible complete Companion composer" 
     // Fields read by modal key/text routing and new-chat defaults.
 
     state.folder_browser = .{};
+
+    state.custom_agent_form = .{};
 
     state.settings_controller.provider_setup = .{};
 
@@ -2902,6 +2905,7 @@ test "public Companion render retains Frame-backed Run and Activity text" {
     var state: runtime.AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -2998,6 +3002,7 @@ test "public Companion render bounds raw multiline Run and Activity dumps" {
     var state: runtime.AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -3066,6 +3071,7 @@ test "public Companion render surfaces streaming final empty and failed Sprout a
     var state: runtime.AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -3154,6 +3160,7 @@ test "public Companion Result heading follows the active character" {
     var state: runtime.AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -3211,6 +3218,7 @@ test "public Companion render leads with the answer and suppresses metadata-only
     var state: runtime.AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -3283,6 +3291,7 @@ test "public Companion render clears stale failure posture while failed evidence
     var state: runtime.AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -3470,6 +3479,8 @@ test "public Companion render repaints active chrome without reconstructing stat
     // Fields read by modal key/text routing and new-chat defaults.
 
     state.folder_browser = .{};
+
+    state.custom_agent_form = .{};
 
     state.settings_controller.provider_setup = .{};
 
@@ -3850,6 +3861,7 @@ test "production hit refresh follows one approval projection snapshot" {
     var state: runtime.AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -3908,6 +3920,7 @@ test "production hit refresh clears cross-owner approval under contention and re
     var state: runtime.AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -3998,6 +4011,7 @@ test "companion chrome draws no border-only commands outside the shared composer
         var state: runtime.AppState = undefined;
         // Fields read by modal key/text routing and new-chat defaults.
         state.folder_browser = .{};
+        state.custom_agent_form = .{};
         state.settings_controller.provider_setup = .{};
         state.provider_controller = .{};
         state.allocator = allocator;
@@ -4072,6 +4086,7 @@ test "expanded sidecar chrome snaps to device pixels at a fractional scale" {
     var state: runtime.AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -4134,6 +4149,7 @@ test "companion characters produce distinct collapsed and expanded batches at 1.
         var state: runtime.AppState = undefined;
         // Fields read by modal key/text routing and new-chat defaults.
         state.folder_browser = .{};
+        state.custom_agent_form = .{};
         state.settings_controller.provider_setup = .{};
         state.provider_controller = .{};
         state.allocator = allocator;
@@ -4206,6 +4222,7 @@ test "moss and vireo apply approval paused and failed semantic treatments" {
         var state: runtime.AppState = undefined;
         // Fields read by modal key/text routing and new-chat defaults.
         state.folder_browser = .{};
+        state.custom_agent_form = .{};
         state.settings_controller.provider_setup = .{};
         state.provider_controller = .{};
         state.allocator = allocator;
@@ -4386,6 +4403,7 @@ test "selected inspector renders exact output and omits empty process output" {
         var state: runtime.AppState = undefined;
         // Fields read by modal key/text routing and new-chat defaults.
         state.folder_browser = .{};
+        state.custom_agent_form = .{};
         state.settings_controller.provider_setup = .{};
         state.provider_controller = .{};
         state.allocator = allocator;
@@ -4651,6 +4669,7 @@ test "Mission Control render and hits share one bounded Frame and exact referenc
     var state: runtime.AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -4817,6 +4836,8 @@ test "Mission Control routes independent and narrow direct scroll without sideca
 
     state.folder_browser = .{};
 
+    state.custom_agent_form = .{};
+
     state.settings_controller.provider_setup = .{};
 
     state.provider_controller = .{};
@@ -4873,6 +4894,7 @@ test "public Mission Control entry preserves workspace state and stale actions r
     var state: runtime.AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
+    state.custom_agent_form = .{};
     state.settings_controller.provider_setup = .{};
     state.provider_controller = .{};
     state.allocator = allocator;
@@ -5031,6 +5053,8 @@ test "Vireo render emits arched brow strokes and viewer-left pupil at fractional
 
     state.folder_browser = .{};
 
+    state.custom_agent_form = .{};
+
     state.settings_controller.provider_setup = .{};
 
     state.provider_controller = .{};
@@ -5104,6 +5128,8 @@ test "disabled Companion removes only presentation routing and re-enables exact 
     // Fields read by modal key/text routing and new-chat defaults.
 
     state.folder_browser = .{};
+
+    state.custom_agent_form = .{};
 
     state.settings_controller.provider_setup = .{};
 

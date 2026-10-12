@@ -164,6 +164,12 @@ pub const Capabilities = struct {
     image: bool = false,
     load_session: bool = false,
     list_sessions: bool = false,
+    /// `sessionCapabilities.resume`: restore a session without replaying its
+    /// history, which `session/load` streams back on every turn.
+    resume_session: bool = false,
+    /// `mcpCapabilities.http`: clients may only pass HTTP MCP servers to
+    /// agents that advertise it.
+    mcp_http: bool = false,
 };
 
 pub const ListThreadsState = struct {
@@ -206,6 +212,9 @@ pub const SendPromptState = struct {
     thinking: bool = false,
     /// Count of thought segments seen this turn; keys the transient row ids.
     thought_segments: u32 = 0,
+    /// Hash of the last plan published this turn. Agents resend the whole
+    /// plan on every change, so identical resends are not repeated as cards.
+    last_plan_hash: ?u64 = null,
 
     pub fn deinit(self: *SendPromptState, allocator: std.mem.Allocator) void {
         if (self.session_id) |session_id| allocator.free(session_id);
@@ -216,6 +225,9 @@ pub const SendPromptState = struct {
 
 pub const SendLineAction = enum {
     continue_reading,
+    /// The initialize response arrived and `state.capabilities` is set; the
+    /// caller now sends session/new, session/load, or session/resume.
+    initialized,
     session_ready,
     prompt_done,
 };
@@ -277,7 +289,8 @@ pub fn handleReadThreadLine(
 }
 
 /// Handles one line of a sendPrompt exchange. Expects request id 1 =
-/// initialize, id 2 = session/new or session/load, id 3 = session/prompt.
+/// initialize, id 2 = session/new, session/load, or session/resume, id 3 =
+/// session/prompt.
 pub fn handleSendPromptLine(
     allocator: std.mem.Allocator,
     harness: Harness,
@@ -311,10 +324,22 @@ pub fn handleSendPromptLine(
         }
     }
 
+    // Any other agent-to-client request (fs/terminal/elicitation, vendor
+    // extensions) is unsupported; answer it so the agent does not wait on a
+    // reply that never comes.
+    if (serverRequestId(parsed.value)) |server_id| {
+        if (stdin) |file| {
+            const response = try makeMethodNotFoundResponseAlloc(allocator, server_id);
+            defer allocator.free(response);
+            try writeJsonLineToFile(allocator, file, response);
+        }
+        return .continue_reading;
+    }
+
     if (responseId(parsed.value)) |id| {
         if (id == 1) {
             state.capabilities = parseCapabilities(parsed.value);
-            return .continue_reading;
+            return .initialized;
         }
         if (id == 2) {
             if (state.prompt_submitted) return .continue_reading;
@@ -420,12 +445,12 @@ const McpServer = union(enum) {
 
 pub fn makeSessionNewRequestAlloc(allocator: std.mem.Allocator, id: i64, cwd: []const u8, mcp_executable: ?[]const u8) ![]u8 {
     const server: ?McpServer = if (mcp_executable) |executable| .{ .stdio = executable } else null;
-    return makeSessionSetupRequestAlloc(allocator, id, "session/new", null, cwd, server);
+    return makeSessionSetupRequestAlloc(allocator, id, "session/new", null, cwd, server, null);
 }
 
 pub fn makeSessionLoadRequestAlloc(allocator: std.mem.Allocator, id: i64, session_id: []const u8, cwd: []const u8, mcp_executable: ?[]const u8) ![]u8 {
     const server: ?McpServer = if (mcp_executable) |executable| .{ .stdio = executable } else null;
-    return makeSessionSetupRequestAlloc(allocator, id, "session/load", session_id, cwd, server);
+    return makeSessionSetupRequestAlloc(allocator, id, "session/load", session_id, cwd, server, null);
 }
 
 pub fn makeSessionNewRequestWithHttpMcpAlloc(
@@ -434,7 +459,7 @@ pub fn makeSessionNewRequestWithHttpMcpAlloc(
     cwd: []const u8,
     server: ?McpHttpServer,
 ) ![]u8 {
-    return makeSessionSetupRequestAlloc(allocator, id, "session/new", null, cwd, if (server) |value| .{ .http = value } else null);
+    return makeSessionSetupRequestAlloc(allocator, id, "session/new", null, cwd, if (server) |value| .{ .http = value } else null, null);
 }
 
 pub fn makeSessionLoadRequestWithHttpMcpAlloc(
@@ -444,7 +469,38 @@ pub fn makeSessionLoadRequestWithHttpMcpAlloc(
     cwd: []const u8,
     server: ?McpHttpServer,
 ) ![]u8 {
-    return makeSessionSetupRequestAlloc(allocator, id, "session/load", session_id, cwd, if (server) |value| .{ .http = value } else null);
+    return makeSessionSetupRequestAlloc(allocator, id, "session/load", session_id, cwd, if (server) |value| .{ .http = value } else null, null);
+}
+
+/// Writes the value of a session request's `_meta` field (an object).
+pub const SessionMetaWriter = *const fn (*std.json.Stringify) std.json.Stringify.Error!void;
+
+pub const SessionSetup = struct {
+    cwd: []const u8,
+    /// Continue this session; null starts a new one.
+    session_id: ?[]const u8 = null,
+    /// Dropped unless the agent advertised `mcpCapabilities.http`.
+    mcp_http: ?McpHttpServer = null,
+    meta: ?SessionMetaWriter = null,
+};
+
+/// Builds the session request for a prompt turn once the initialize response
+/// is known: session/new without a session id, otherwise session/resume when
+/// advertised (no history replay) and session/load as the fallback.
+pub fn makeTurnSessionRequestAlloc(
+    allocator: std.mem.Allocator,
+    id: i64,
+    capabilities: Capabilities,
+    setup: SessionSetup,
+) ![]u8 {
+    const server: ?McpServer = if (capabilities.mcp_http) (if (setup.mcp_http) |value| McpServer{ .http = value } else null) else null;
+    const method = if (setup.session_id == null)
+        "session/new"
+    else if (capabilities.resume_session)
+        "session/resume"
+    else
+        "session/load";
+    return makeSessionSetupRequestAlloc(allocator, id, method, setup.session_id, setup.cwd, server, setup.meta);
 }
 
 pub fn makePromptRequestAlloc(
@@ -527,6 +583,27 @@ pub fn makePermissionResponseAlloc(allocator: std.mem.Allocator, id: std.json.Va
     return writer.toOwnedSlice();
 }
 
+/// JSON-RPC -32601 reply for an agent request Verde does not implement.
+pub fn makeMethodNotFoundResponseAlloc(allocator: std.mem.Allocator, id: std.json.Value) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var stringify: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try stringify.beginObject();
+    try stringify.objectField("jsonrpc");
+    try stringify.write("2.0");
+    try stringify.objectField("id");
+    try stringify.write(id);
+    try stringify.objectField("error");
+    try stringify.beginObject();
+    try stringify.objectField("code");
+    try stringify.write(-32601);
+    try stringify.objectField("message");
+    try stringify.write("Method not supported by Verde");
+    try stringify.endObject();
+    try stringify.endObject();
+    return writer.toOwnedSlice();
+}
+
 pub fn writeJsonLineToFile(allocator: std.mem.Allocator, file: std.Io.File, line: []const u8) !void {
     var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
@@ -576,10 +653,24 @@ pub fn parseCapabilities(value: std.json.Value) Capabilities {
     const agent = getObjectField(result, "agentCapabilities") orelse return .{};
     const prompt = getObjectField(agent, "promptCapabilities");
     const sessions = getObjectField(agent, "sessionCapabilities");
+    const mcp = getObjectField(agent, "mcpCapabilities");
     return .{
         .image = if (prompt) |p| getOptionalObjectBool(p, "image") orelse false else false,
         .load_session = getOptionalObjectBool(agent, "loadSession") orelse false,
-        .list_sessions = if (sessions) |s| getObjectField(s, "list") != null else false,
+        .list_sessions = if (sessions) |s| sessionCapabilityPresent(s, "list") else false,
+        .resume_session = if (sessions) |s| sessionCapabilityPresent(s, "resume") else false,
+        .mcp_http = if (mcp) |m| getOptionalObjectBool(m, "http") orelse false else false,
+    };
+}
+
+// Session capabilities are objects (`{}`) when supported; null or false
+// means unsupported.
+fn sessionCapabilityPresent(sessions: std.json.Value, key: []const u8) bool {
+    const field = getObjectField(sessions, key) orelse return false;
+    return switch (field) {
+        .null => false,
+        .bool => |enabled| enabled,
+        else => true,
     };
 }
 
@@ -725,6 +816,10 @@ fn handleLiveSessionUpdate(
         }
         return;
     }
+    if (std.mem.eql(u8, kind, "plan")) {
+        try emitPlanUpdate(allocator, update, request, state);
+        return;
+    }
     if (std.mem.eql(u8, kind, "tool_call") or std.mem.eql(u8, kind, "tool_call_update")) {
         finishThinking(request, state);
         const event = (try toolEventAlloc(allocator, update)) orelse return;
@@ -744,6 +839,55 @@ fn handleLiveSessionUpdate(
             emitDiffUpdate(allocator, update, event.output, request.stream_context, on_stream_event);
         }
     }
+}
+
+/// ACP `plan` updates carry the complete entry list each time. Publish it as
+/// the "Todos" task list the transcript renders as a plan card.
+fn emitPlanUpdate(
+    allocator: std.mem.Allocator,
+    update: std.json.Value,
+    request: provider_types.SendPromptRequest,
+    state: *SendPromptState,
+) !void {
+    const on_stream_event = request.on_stream_event orelse return;
+    const body = (try planBodyAlloc(allocator, update)) orelse return;
+    defer allocator.free(body);
+    const hash = std.hash.Wyhash.hash(0, body);
+    if (state.last_plan_hash == hash) return;
+    state.last_plan_hash = hash;
+    finishThinking(request, state);
+    on_stream_event(request.stream_context, .{ .message = .{
+        .title = "Todos",
+        .body = body,
+    } });
+}
+
+fn planBodyAlloc(allocator: std.mem.Allocator, update: std.json.Value) !?[]u8 {
+    const entries = getObjectField(update, "entries") orelse return null;
+    if (entries != .array) return null;
+    var body: std.Io.Writer.Allocating = .init(allocator);
+    errdefer body.deinit();
+    for (entries.array.items) |entry| {
+        const raw_content = getOptionalObjectString(entry, "content") orelse continue;
+        const content = std.mem.trim(u8, raw_content, " \t\r\n");
+        if (content.len == 0) continue;
+        const status = getOptionalObjectString(entry, "status") orelse "pending";
+        const marker = if (std.mem.eql(u8, status, "completed"))
+            "x"
+        else if (std.mem.eql(u8, status, "in_progress"))
+            ">"
+        else
+            " ";
+        // Keep each entry on one line; the card parses line by line.
+        try body.writer.print("- [{s}] ", .{marker});
+        for (content) |byte| try body.writer.writeByte(if (byte == '\n' or byte == '\r') ' ' else byte);
+        try body.writer.writeByte('\n');
+    }
+    if (body.written().len == 0) {
+        body.deinit();
+        return null;
+    }
+    return try body.toOwnedSlice();
 }
 
 /// Opens a content-less `think` row so the GUI shows "Thinking" while an
@@ -1374,6 +1518,7 @@ fn makeSessionSetupRequestAlloc(
     session_id: ?[]const u8,
     cwd: []const u8,
     mcp_server: ?McpServer,
+    meta: ?SessionMetaWriter,
 ) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer writer.deinit();
@@ -1423,6 +1568,10 @@ fn makeSessionSetupRequestAlloc(
         try stringify.endObject();
     }
     try stringify.endArray();
+    if (meta) |write_meta| {
+        try stringify.objectField("_meta");
+        try write_meta(&stringify);
+    }
     try stringify.endObject();
     try stringify.endObject();
     return writer.toOwnedSlice();
@@ -2210,4 +2359,119 @@ test "ACP prompts preserve multiple images and reject unsupported attachments" {
     const text_blocks = getObjectField(getObjectField(parsed_text.value, "params").?, "prompt").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), text_blocks.len);
     try std.testing.expectEqualStrings("text", getOptionalObjectString(text_blocks[0], "type").?);
+}
+
+test "parseCapabilities reads resume and HTTP MCP support" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"loadSession":true,
+        \\"mcpCapabilities":{"http":true,"sse":false},
+        \\"sessionCapabilities":{"list":{},"resume":{},"close":null}}}}
+    , .{});
+    defer parsed.deinit();
+    const capabilities = parseCapabilities(parsed.value);
+    try std.testing.expect(capabilities.load_session);
+    try std.testing.expect(capabilities.list_sessions);
+    try std.testing.expect(capabilities.resume_session);
+    try std.testing.expect(capabilities.mcp_http);
+
+    var bare = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"sessionCapabilities":{"resume":null}}}}
+    , .{});
+    defer bare.deinit();
+    const none = parseCapabilities(bare.value);
+    try std.testing.expect(!none.resume_session);
+    try std.testing.expect(!none.mcp_http);
+}
+
+fn testWriteMeta(stringify: *std.json.Stringify) std.json.Stringify.Error!void {
+    try stringify.write(.{ .fx = .{ .profileMcpServers = true } });
+}
+
+test "makeTurnSessionRequestAlloc picks new, resume, or load and gates HTTP MCP" {
+    const allocator = std.testing.allocator;
+    const mcp: McpHttpServer = .{ .url = "http://127.0.0.1:9/mcp", .authorization = "Bearer t", .client_name = "test" };
+
+    const fresh = try makeTurnSessionRequestAlloc(allocator, 2, .{ .mcp_http = true }, .{ .cwd = "/w", .mcp_http = mcp, .meta = testWriteMeta });
+    defer allocator.free(fresh);
+    try std.testing.expect(std.mem.indexOf(u8, fresh, "\"method\":\"session/new\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fresh, "\"sessionId\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, fresh, "\"type\":\"http\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fresh, "\"_meta\":{\"fx\":{\"profileMcpServers\":true}}") != null);
+
+    const resumed = try makeTurnSessionRequestAlloc(allocator, 2, .{ .resume_session = true }, .{ .cwd = "/w", .session_id = "s-1", .mcp_http = mcp });
+    defer allocator.free(resumed);
+    try std.testing.expect(std.mem.indexOf(u8, resumed, "\"method\":\"session/resume\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resumed, "\"sessionId\":\"s-1\"") != null);
+    // No mcpCapabilities.http: the server must not be sent.
+    try std.testing.expect(std.mem.indexOf(u8, resumed, "\"mcpServers\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resumed, "_meta") == null);
+
+    const loaded = try makeTurnSessionRequestAlloc(allocator, 2, .{}, .{ .cwd = "/w", .session_id = "s-1" });
+    defer allocator.free(loaded);
+    try std.testing.expect(std.mem.indexOf(u8, loaded, "\"method\":\"session/load\"") != null);
+}
+
+test "handleSendPromptLine reports initialize and answers unknown agent requests" {
+    var state: SendPromptState = .{};
+    defer state.deinit(std.testing.allocator);
+    const request = provider_types.SendPromptRequest{ .prompt = "hi" };
+    try std.testing.expectEqual(SendLineAction.initialized, try handleSendPromptLine(
+        std.testing.allocator,
+        TEST_HARNESS,
+        \\{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"sessionCapabilities":{"resume":{}}}}}
+    ,
+        request,
+        &state,
+        null,
+    ));
+    try std.testing.expect(state.capabilities.resume_session);
+
+    const response = try makeMethodNotFoundResponseAlloc(std.testing.allocator, .{ .string = "req-7" });
+    defer std.testing.allocator.free(response);
+    try std.testing.expectEqualStrings(
+        \\{"jsonrpc":"2.0","id":"req-7","error":{"code":-32601,"message":"Method not supported by Verde"}}
+    , response);
+}
+
+test "ACP plan updates publish one Todos card per distinct plan" {
+    const Capture = struct {
+        count: usize = 0,
+        title: [16]u8 = undefined,
+        title_len: usize = 0,
+        body: [256]u8 = undefined,
+        body_len: usize = 0,
+
+        fn onEvent(context: ?*anyopaque, event: provider_types.StreamEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            switch (event) {
+                .message => |message| {
+                    self.count += 1;
+                    @memcpy(self.title[0..message.title.len], message.title);
+                    self.title_len = message.title.len;
+                    @memcpy(self.body[0..message.body.len], message.body);
+                    self.body_len = message.body.len;
+                },
+                else => {},
+            }
+        }
+    };
+    var capture: Capture = .{};
+    var state: SendPromptState = .{ .prompt_submitted = true };
+    defer state.deinit(std.testing.allocator);
+    const request = provider_types.SendPromptRequest{
+        .prompt = "plan",
+        .stream_context = &capture,
+        .on_stream_event = Capture.onEvent,
+    };
+    const plan =
+        \\{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"plan","entries":[
+        \\{"content":"Read code","priority":"high","status":"completed"},
+        \\{"content":"Write\nfix","priority":"medium","status":"in_progress"},
+        \\{"content":"Test","priority":"low","status":"pending"}]}}}
+    ;
+    _ = try handleSendPromptLine(std.testing.allocator, TEST_HARNESS, plan, request, &state, null);
+    _ = try handleSendPromptLine(std.testing.allocator, TEST_HARNESS, plan, request, &state, null);
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqualStrings("Todos", capture.title[0..capture.title_len]);
+    try std.testing.expectEqualStrings("- [x] Read code\n- [>] Write fix\n- [ ] Test\n", capture.body[0..capture.body_len]);
 }

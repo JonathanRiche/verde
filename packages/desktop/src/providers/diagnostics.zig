@@ -12,6 +12,7 @@ pub const ErrorCategory = enum {
     cursor_acp,
     fx_acp,
     grok_acp,
+    custom_acp,
     claude_bridge,
     pi_rpc,
 };

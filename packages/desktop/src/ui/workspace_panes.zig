@@ -1302,6 +1302,7 @@ fn welcomeProviderName(provider: runtime.Provider) []const u8 {
         .fx => "FX",
         .grok => "Grok",
         .muse => "Muse",
+        .custom_acp => "Custom ACP agent",
     };
 }
 

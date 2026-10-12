@@ -404,11 +404,12 @@ pub const Client = struct {
         var reader = proc.process.child.stdout.?.reader(proc.threaded.io(), &read_buffer);
         const capabilities = try authenticate(&proc, &reader);
         state.capabilities = capabilities;
-        if (request.thread_id) |thread_id| {
-            try proc.writeLine(try acp.makeSessionLoadRequestAlloc(allocator, 2, thread_id, cwd, null));
-        } else {
-            try proc.writeLine(try acp.makeSessionNewRequestAlloc(allocator, 2, cwd, null));
-        }
+        // grok already registers Verde's MCP server from its own global
+        // config, so no client-supplied server; resume skips history replay.
+        try proc.writeLine(try acp.makeTurnSessionRequestAlloc(allocator, 2, capabilities, .{
+            .cwd = cwd,
+            .session_id = request.thread_id,
+        }));
 
         while (try acp.takeLineAlloc(allocator, &reader)) |raw_line| {
             defer allocator.free(raw_line);
@@ -421,7 +422,8 @@ pub const Client = struct {
             }
             const action = try acp.handleSendPromptLine(allocator, ACP_HARNESS, line, request, &state, proc.process.child.stdin);
             switch (action) {
-                .continue_reading => {},
+                // authenticate() already consumed the initialize response.
+                .continue_reading, .initialized => {},
                 .session_ready => {
                     if (state.session_id) |session_id| {
                         active_process_state.register(&proc.process, proc.process.child.stdin, session_id);
@@ -630,7 +632,8 @@ fn makeAuthenticateRequestAlloc(allocator: std.mem.Allocator, id: i64, method: [
 }
 
 // grok's session/set_model accepts an extension `reasoningEffort` alongside
-// the standard `modelId`; there is no set_config_option surface for effort.
+// the standard `modelId`. grok also exposes `model`/`reasoning_effort` as ACP
+// configOptions, but set_model applies both in one request.
 fn makeSetModelRequestAlloc(
     allocator: std.mem.Allocator,
     id: i64,

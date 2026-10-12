@@ -192,6 +192,7 @@ fn providerProtocolTag(provider: Provider) provider_types.Provider {
         .fx => .fx,
         .grok => .grok,
         .muse => .muse,
+        .custom_acp => .custom_acp,
     };
 }
 
@@ -233,6 +234,10 @@ fn formatSlashCommandError(allocator: std.mem.Allocator, provider: Provider, err
         .muse => switch (err) {
             error.UnsupportedOperation => "Muse does not support this slash command yet.",
             else => "Muse slash command failed.",
+        },
+        .custom_acp => switch (err) {
+            error.UnsupportedOperation => "Custom ACP agents do not support Verde slash commands yet; send the command as a message.",
+            else => "Agent slash command failed.",
         },
     };
     return allocator.dupe(u8, message);

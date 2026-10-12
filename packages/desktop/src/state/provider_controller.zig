@@ -17,6 +17,8 @@ const runtime_log = @import("../runtime/log.zig");
 const log = std.log.scoped(.native_shell);
 const provider_types = headless.provider_types;
 const Provider = provider_models.Provider;
+/// Sizes per-provider arrays indexed by `@intFromEnum(provider)`.
+pub const PROVIDER_COUNT = std.meta.fields(Provider).len;
 const ModelOption = provider_models.ModelOption;
 const ChatThread = chat_types.ChatThread;
 const Mutex = state_sync.Mutex;
@@ -170,15 +172,17 @@ pub const ProviderReadinessSnapshot = struct {
     fx: ProviderReadiness = .checking,
     grok: ProviderReadiness = .checking,
     muse: ProviderReadiness = .checking,
+    /// Ready when at least one `chat.custom_acp_agents` command resolves.
+    custom_acp: ProviderReadiness = .checking,
     /// Indexed by `Provider`'s enum value. Empty when the daemon reported no version.
-    versions: [8]ProviderHarnessVersion = @splat(.{}),
+    versions: [PROVIDER_COUNT]ProviderHarnessVersion = @splat(.{}),
     /// Indexed by `Provider`'s enum value. `available` is the only state that offers Update.
-    releases: [8]ProviderRelease = @splat(.unknown),
+    releases: [PROVIDER_COUNT]ProviderRelease = @splat(.unknown),
     /// Indexed by `Provider`'s enum value. True when the PATH binary is owned by
     /// mise, Homebrew, or npm, so Update must not run the official installer.
-    package_managed: [8]bool = @splat(false),
+    package_managed: [PROVIDER_COUNT]bool = @splat(false),
     /// Indexed by `Provider`'s enum value. Empty uses the official installer.
-    update_shells: [8]ProviderUpdateShell = @splat(.{}),
+    update_shells: [PROVIDER_COUNT]ProviderUpdateShell = @splat(.{}),
 
     pub fn forProvider(self: ProviderReadinessSnapshot, provider: Provider) ProviderReadiness {
         return switch (provider) {
@@ -190,6 +194,7 @@ pub const ProviderReadinessSnapshot = struct {
             .fx => self.fx,
             .grok => self.grok,
             .muse => self.muse,
+            .custom_acp => self.custom_acp,
         };
     }
 
@@ -210,7 +215,7 @@ pub const ProviderReadinessSnapshot = struct {
     }
 
     pub fn hasReadyProvider(self: ProviderReadinessSnapshot) bool {
-        return self.codex == .ready or self.opencode == .ready or self.claude == .ready or self.cursor == .ready or self.pi == .ready or self.fx == .ready or self.grok == .ready or self.muse == .ready;
+        return self.codex == .ready or self.opencode == .ready or self.claude == .ready or self.cursor == .ready or self.pi == .ready or self.fx == .ready or self.grok == .ready or self.muse == .ready or self.custom_acp == .ready;
     }
 };
 
@@ -300,6 +305,10 @@ pub const State = struct {
     fx_model_cache: FxModelCacheState = .{},
     grok_model_cache: GrokModelCacheState = .{},
     muse_model_cache: MuseModelCacheState = .{},
+    /// Picker rows for `chat.custom_acp_agents`, one per agent; rebuilt when
+    /// the configured list changes (see `syncCustomAcpModelOptions`).
+    custom_acp_model_options: std.ArrayList(ModelOption) = .empty,
+    custom_acp_options_hash: ?u64 = null,
     readiness: ProviderReadinessState = .{},
     thread_operation: ProviderThreadOperationState = .{},
 };
@@ -324,6 +333,7 @@ fn providerProtocolTag(provider: Provider) provider_types.Provider {
         .fx => .fx,
         .grok => .grok,
         .muse => .muse,
+        .custom_acp => .custom_acp,
     };
 }
 
@@ -337,6 +347,7 @@ fn providerDisplayName(provider: Provider) []const u8 {
         .fx => "fx",
         .grok => "grok",
         .muse => "Muse",
+        .custom_acp => "Custom ACP",
     };
 }
 
@@ -577,6 +588,7 @@ fn publishProviderReadiness(state: *ProviderReadinessState, provider: Provider, 
         .fx => state.snapshot.fx = fetched.readiness,
         .grok => state.snapshot.grok = fetched.readiness,
         .muse => state.snapshot.muse = fetched.readiness,
+        .custom_acp => state.snapshot.custom_acp = fetched.readiness,
     }
     const index = @intFromEnum(provider);
     state.snapshot.versions[index] = fetched.version;
@@ -673,7 +685,7 @@ fn runProviderReadinessJob(job: ReadinessJob) void {
 
 pub fn providerReadinessWorker(state: *ProviderReadinessState, request: ProviderReadinessWorkerRequest) void {
     defer request.deinit();
-    const providers = [_]Provider{ .codex, .opencode, .claude, .cursor, .pi, .fx, .grok, .muse };
+    const providers = [_]Provider{ .codex, .opencode, .claude, .cursor, .pi, .fx, .grok, .muse, .custom_acp };
     var threads: [providers.len]?std.Thread = @splat(null);
     for (providers, 0..) |provider, index| {
         const job: ReadinessJob = .{
@@ -741,6 +753,62 @@ pub fn grokModelOptionsSnapshot(self: anytype) []const ModelOption {
         GROK_MODEL_OPTIONS[0..];
 }
 
+/// One row per configured custom ACP agent; empty when none are configured.
+pub fn customAcpModelOptionsSnapshot(self: anytype) []const ModelOption {
+    return self.provider_controller.custom_acp_model_options.items;
+}
+
+/// Rebuilds the custom agent picker rows when `chat.custom_acp_agents`
+/// changed. Cheap to call every poll: it only hashes ids and names.
+pub fn syncCustomAcpModelOptions(self: anytype) void {
+    const agents = self.app_config.custom_acp_agents;
+    var hasher = std.hash.Wyhash.init(0);
+    for (agents) |agent| {
+        hasher.update(agent.id);
+        hasher.update(&.{0});
+        hasher.update(agent.name);
+        hasher.update(&.{0});
+    }
+    const hash = hasher.final();
+    const controller = &self.provider_controller;
+    if (controller.custom_acp_options_hash == hash) return;
+    clearCustomAcpModelOptions(controller, self.allocator);
+    for (agents) |agent| {
+        const label = self.allocator.dupeZ(u8, agent.name) catch break;
+        const value = self.allocator.dupeZ(u8, agent.id) catch {
+            self.allocator.free(label);
+            break;
+        };
+        controller.custom_acp_model_options.append(self.allocator, .{
+            .label = label,
+            .value = value,
+            .description = "Custom ACP agent",
+            .reasoning_supported = false,
+        }) catch {
+            self.allocator.free(label);
+            self.allocator.free(value);
+            break;
+        };
+    }
+    controller.custom_acp_options_hash = hash;
+    self.composer_controller.model_picker.invalidateItems();
+    self.markDirty();
+}
+
+pub fn clearCustomAcpModelOptions(controller: *State, allocator: std.mem.Allocator) void {
+    for (controller.custom_acp_model_options.items) |option| {
+        allocator.free(option.label);
+        if (option.value) |value| allocator.free(value);
+    }
+    controller.custom_acp_model_options.clearRetainingCapacity();
+    controller.custom_acp_options_hash = null;
+}
+
+pub fn deinitCustomAcpModelOptions(controller: *State, allocator: std.mem.Allocator) void {
+    clearCustomAcpModelOptions(controller, allocator);
+    controller.custom_acp_model_options.deinit(allocator);
+}
+
 pub fn museModelOptionsSnapshot(self: anytype) []const ModelOption {
     return if (self.muse_model_options.items.len > 0)
         self.muse_model_options.items
@@ -764,6 +832,10 @@ pub fn cachedDefaultModelRefForProvider(self: anytype, provider: Provider) [:0]c
         .fx => DEFAULT_FX_MODEL,
         .grok => DEFAULT_GROK_MODEL,
         .muse => DEFAULT_MUSE_MODEL,
+        .custom_acp => if (self.provider_controller.custom_acp_model_options.items.len > 0)
+            self.provider_controller.custom_acp_model_options.items[0].value orelse "default"
+        else
+            "default",
         .opencode => blk: {
             for (self.opencodeModelOptionsSnapshot()) |option| {
                 if (option.value) |value| break :blk value;
@@ -885,6 +957,7 @@ pub fn completeMcpOnboarding(self: anytype, enable: bool) void {
 }
 
 pub fn pollProviderReadiness(self: anytype) void {
+    syncCustomAcpModelOptions(self);
     provider_setup.poll(self, platform_runtime.unixTimestampMs());
     self.pollProviderThreadOperation();
     self.pollProviderSlashCatalog();

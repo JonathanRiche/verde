@@ -10371,6 +10371,7 @@ fn renderInactiveComposerProviderIcon(state: *app_state.AppState, pill: palette.
             .fx => "F",
             .grok => "G",
             .muse => "M",
+            .custom_acp => "Ag",
         };
         queueText(state, icon_slot, fallback_label, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 175)), theme.scaledUi(13.0), pill);
     }

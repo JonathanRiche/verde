@@ -164,6 +164,7 @@ fn harnessProviderForDbProvider(provider: Provider) provider_types.Provider {
         .fx => .fx,
         .grok => .grok,
         .muse => .muse,
+        .custom_acp => .custom_acp,
     };
 }
 
@@ -2514,6 +2515,7 @@ pub fn queueOrSteerDraftDuringSend(self: anytype) void {
         .fx => .queue,
         .grok => .queue,
         .muse => .queue,
+        .custom_acp => .queue,
     };
     self.storeDraftDuringSend(kind);
 }
@@ -2532,7 +2534,7 @@ pub fn storeThreadFollowupPrompt(self: anytype, project_index: usize, thread_ind
 
     const kind: FollowupKind = switch (thread.provider) {
         .codex, .claude, .pi => .steer,
-        .opencode, .cursor, .fx, .grok, .muse => .queue,
+        .opencode, .cursor, .fx, .grok, .muse, .custom_acp => .queue,
     };
     const send_state = thread.send_state;
     send_state.mutex.lock();
@@ -2755,6 +2757,7 @@ pub fn pendingFollowupHint(self: anytype) ?[:0]const u8 {
         .fx => "Tab to queue",
         .grok => "Tab to queue",
         .muse => "Tab to queue",
+        .custom_acp => "Tab to queue",
     };
 }
 
@@ -4164,7 +4167,7 @@ fn daemonChatTurnExistsRaw(allocator: std.mem.Allocator, pref_path: []const u8, 
 fn daemonReasoningVariant(provider: Provider, variant: ?[:0]const u8) ?[:0]const u8 {
     return switch (provider) {
         .opencode, .cursor => variant,
-        .codex, .claude, .pi, .fx, .grok, .muse => null,
+        .codex, .claude, .pi, .fx, .grok, .muse, .custom_acp => null,
     };
 }
 
@@ -5399,6 +5402,7 @@ pub fn currentThreadPendingSlashCommandLabel(self: anytype) ?[]const u8 {
         .fx => "Running FX command...",
         .grok => "Running Grok command...",
         .muse => "Running Muse command...",
+        .custom_acp => "Running agent command...",
     };
 }
 
@@ -8746,7 +8750,7 @@ pub fn noteChatCompletion(self: anytype, project_index: usize, thread_index: usi
         .pi => .{ .key = "pi", .png_bytes = PI_LOGO_BYTES },
         .fx => .{ .key = "fx", .png_bytes = FX_LOGO_BYTES },
         .grok => .{ .key = "grok", .png_bytes = GROK_LOGO_BYTES },
-        .muse => null,
+        .muse, .custom_acp => null,
     };
     notifier.notifyAgentDone(self.allocator, title, body, icon);
 }
@@ -9300,7 +9304,7 @@ pub fn issuePendingProviderSteer(
             const resolved_turn_id: ?[]const u8 = switch (provider) {
                 .codex => send_state.active_turn_id,
                 .claude, .pi => if (send_state.active_turn_id) |active| active else "",
-                .opencode, .cursor, .fx, .grok, .muse => null,
+                .opencode, .cursor, .fx, .grok, .muse, .custom_acp => null,
             };
             if (resolved_turn_id) |active_turn_id| {
                 thread_id = self.allocator.dupe(u8, resolved_thread_id) catch null;

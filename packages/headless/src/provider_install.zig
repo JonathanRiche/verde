@@ -6,6 +6,10 @@
 const std = @import("std");
 const provider_types = @import("provider_types.zig");
 
+/// Custom ACP agents are configured in Settings, not installed or signed in
+/// by Verde; their remediation commands only print where to do that.
+const CUSTOM_ACP_HINT = "Add or fix custom ACP agents in Verde Settings, Providers";
+
 /// Single shell command that installs or updates this provider's CLI.
 /// Each arm is one string literal so the returned slice has static lifetime.
 pub fn installShell(provider: provider_types.Provider) []const u8 {
@@ -18,6 +22,8 @@ pub fn installShell(provider: provider_types.Provider) []const u8 {
         .fx => "curl -fsSL https://fx.sh/setup.sh | bash",
         .grok => "curl -fsSL https://x.ai/cli/install.sh | bash",
         .muse => "curl -fsSL https://dev.meta.ai/install.sh | sh",
+        // User-defined agents bring their own command; nothing to install.
+        .custom_acp => "echo " ++ CUSTOM_ACP_HINT,
     };
 }
 
@@ -32,7 +38,7 @@ pub fn installShellWindows(provider: provider_types.Provider) ?[]const u8 {
         .opencode => "npm install -g opencode-ai",
         .pi => "irm https://pi.dev/install.ps1 | iex",
         .grok => "irm https://x.ai/cli/install.ps1 | iex",
-        .fx, .muse => null,
+        .fx, .muse, .custom_acp => null,
     };
 }
 
@@ -49,6 +55,7 @@ pub fn installArgv(provider: provider_types.Provider) []const []const u8 {
         .fx => comptime &.{installShell(.fx)},
         .grok => comptime &.{installShell(.grok)},
         .muse => comptime &.{installShell(.muse)},
+        .custom_acp => comptime &.{installShell(.custom_acp)},
     };
 }
 
@@ -65,6 +72,7 @@ pub fn loginArgv(provider: provider_types.Provider) []const []const u8 {
         .fx => comptime &.{ "fx", "login" },
         .grok => comptime &.{ "grok", "login" },
         .muse => comptime &.{ "muse", "login" },
+        .custom_acp => comptime &.{ "echo", CUSTOM_ACP_HINT },
     };
 }
 
@@ -79,6 +87,7 @@ pub fn loginShell(provider: provider_types.Provider) []const u8 {
         .fx => "fx login",
         .grok => "grok login",
         .muse => "muse login",
+        .custom_acp => "echo " ++ CUSTOM_ACP_HINT,
     };
 }
 
