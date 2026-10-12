@@ -25,6 +25,7 @@ const terminal_panel = @import("terminal_panel.zig");
 const theme = @import("theme.zig");
 const sidebar_ui = @import("sidebar.zig");
 const side_panel = @import("side_panel.zig");
+const workspace_suggestions = @import("../state/workspace_suggestions.zig");
 const workspace_strip = @import("workspace_strip.zig");
 const utils = @import("../utils.zig");
 
@@ -81,6 +82,9 @@ const NF_COD_CHEVRON_UP = "\u{EAB7}";
 const NF_COD_EDIT = "\u{EA73}";
 const NF_COD_HISTORY = "\u{EA82}";
 const NF_COD_TERMINAL = "\u{EA85}";
+const NF_COD_ADD = "\u{EA60}";
+const NF_COD_GEAR = "\u{EB51}";
+const NF_COD_FOLDER_OPENED = "\u{EAF7}";
 
 fn nowMs() i64 {
     return @intCast(@divTrunc(profiler.nowNs(), std.time.ns_per_ms));
@@ -101,6 +105,10 @@ const WorkspacePaneAction = enum {
     new_chat_thread,
     open_chat_history,
     open_terminal,
+    add_workspace,
+    open_suggested_workspace,
+    open_provider_setup,
+    open_settings,
     refresh_chat_thread,
     split_chat_left,
     split_chat_right,
@@ -158,6 +166,11 @@ var hit_cache: WorkspacePaneHitCache = .{};
 var resize_drag: ?WorkspacePaneHit = null;
 const EMPTY_WORKSPACE_ACTION_COUNT: usize = 3;
 var empty_workspace_selected_action: usize = 0;
+var no_workspaces_selected_action: usize = 0;
+/// Selection rings appear only after arrow-key navigation, not on first paint.
+var no_workspaces_keyboard_active = false;
+var no_workspaces_suggestions: [workspace_suggestions.MAX_SUGGESTIONS]workspace_suggestions.Suggestion = undefined;
+var no_workspaces_suggestion_count: usize = 0;
 const QuickPaneDragKind = enum { move, resize };
 const QuickPaneDrag = struct {
     kind: QuickPaneDragKind,
@@ -361,6 +374,7 @@ pub fn isPaneStatusAnimating() bool {
 
 /// Handles navigation only while the selected workspace has no open panes.
 pub fn handleEmptyWorkspaceKeyDown(state: *runtime.AppState, event: *const palette.event.KeyEvent) bool {
+    if (state.project_controller.projects.items.len == 0) return handleNoWorkspacesKeyDown(state, event);
     if (!emptyWorkspaceAcceptsKeyboard(state)) {
         empty_workspace_selected_action = 0;
         return false;
@@ -387,6 +401,74 @@ pub fn handleEmptyWorkspaceKeyDown(state: *runtime.AppState, event: *const palet
             return true;
         },
         else => return false,
+    }
+}
+
+// Arrow/Enter navigation for the first-run screen shown before any workspace exists.
+fn handleNoWorkspacesKeyDown(state: *runtime.AppState, event: *const palette.event.KeyEvent) bool {
+    if (state.project_controller.show_creator or
+        state.settings_controller.modal_visible or
+        state.settings_controller.provider_onboarding_visible or
+        state.settings_controller.mcp_onboarding_visible) return false;
+    const modifiers = event.mod;
+    if (modifiers.ctrl or modifiers.super or modifiers.alt or modifiers.shift) return false;
+    switch (event.key) {
+        .up, .left => {
+            no_workspaces_keyboard_active = true;
+            no_workspaces_selected_action = if (no_workspaces_selected_action == 0) noWorkspacesActionCount() - 1 else no_workspaces_selected_action - 1;
+            return true;
+        },
+        .down, .right => {
+            no_workspaces_keyboard_active = true;
+            no_workspaces_selected_action = (no_workspaces_selected_action + 1) % noWorkspacesActionCount();
+            return true;
+        },
+        .@"return", .kp_enter => {
+            const selected = no_workspaces_selected_action;
+            if (selected == 0) {
+                activateNoWorkspacesAction(state, .add_workspace, 0);
+            } else if (selected <= no_workspaces_suggestion_count) {
+                activateNoWorkspacesAction(state, .open_suggested_workspace, selected - 1);
+            } else if (selected == no_workspaces_suggestion_count + 1) {
+                activateNoWorkspacesAction(state, .open_provider_setup, 0);
+            } else {
+                activateNoWorkspacesAction(state, .open_settings, 0);
+            }
+            return true;
+        },
+        else => return false,
+    }
+}
+
+fn noWorkspacesSelected(index: usize) bool {
+    return no_workspaces_keyboard_active and no_workspaces_selected_action == index;
+}
+
+// Add, each suggestion, the provider panel, and Settings.
+fn noWorkspacesActionCount() usize {
+    return no_workspaces_suggestion_count + 3;
+}
+
+fn activateNoWorkspacesAction(state: *runtime.AppState, action: WorkspacePaneAction, index: usize) void {
+    switch (action) {
+        .add_workspace => state.openWorkspaceCreator(true),
+        .open_suggested_workspace => {
+            if (index >= no_workspaces_suggestion_count) return;
+            const path = no_workspaces_suggestions[index].path();
+            _ = state.createProjectFromPath(path) catch |err| {
+                state.setSidebarNotice(switch (err) {
+                    error.FileNotFound => "That folder no longer exists.",
+                    error.ProjectAlreadyExists => "That folder is already a workspace.",
+                    else => "Could not add that folder as a workspace.",
+                });
+                state.markDirty();
+                return;
+            };
+            no_workspaces_selected_action = 0;
+        },
+        .open_provider_setup => state.recheckProviderReadiness(),
+        .open_settings => state.openSettingsModal(),
+        else => {},
     }
 }
 
@@ -1061,6 +1143,8 @@ pub fn renderAtWithTranscriptLayoutWidth(state: *runtime.AppState, workspace_rec
         }
     } else if (state.project_controller.projects.items.len > 0) {
         renderEmptyWorkspace(state, rect);
+    } else if (state.project_controller.projects.items.len == 0) {
+        renderNoWorkspaces(state, rect);
     } else {
         empty_workspace_selected_action = 0;
         chat_panel.renderWorkspaceAtWithTranscriptLayoutWidth(state, rect, target_workspace_width);
@@ -1113,6 +1197,200 @@ fn renderEmptyWorkspace(state: *runtime.AppState, rect: palette.Rect) void {
     renderEmptyWorkspaceAction(state, .{ .x = button_x, .y = y, .w = button_w, .h = button_h }, NF_COD_TERMINAL, "Open terminal pane", terminal_hint, .open_terminal, false, empty_workspace_selected_action == 2);
 }
 
+// First-run welcome shown until the user adds a workspace folder: the add
+// action, folders the user already works in, provider status, and settings.
+fn renderNoWorkspaces(state: *runtime.AppState, rect: palette.Rect) void {
+    queueRect(state, rect, paletteColor(theme.background()));
+    workspace_suggestions.ensureStarted();
+    no_workspaces_suggestion_count = workspace_suggestions.snapshot(&no_workspaces_suggestions);
+    if (no_workspaces_selected_action >= noWorkspacesActionCount()) no_workspaces_selected_action = 0;
+
+    const providers = installedWelcomeProviders(state);
+    const content_w = @max(1.0, @min(rect.w - theme.scaledUi(32.0), theme.scaledUi(460.0)));
+    const title_size = theme.scaledUi(28.0);
+    const body_size = theme.scaledUi(14.0);
+    const button_h = theme.scaledUi(38.0);
+    const section_gap = theme.scaledUi(26.0);
+    const header_h = theme.scaledUi(24.0);
+    const suggestion_h = theme.scaledUi(WELCOME_SUGGESTION_ROW_H);
+    const provider_rows: usize = @max(1, (providers.count + 1) / 2);
+    const provider_panel_h = theme.scaledUi(WELCOME_PROVIDER_CELL_H) * @as(f32, @floatFromInt(provider_rows)) + theme.scaledUi(16.0);
+
+    var content_h = theme.scaledUi(42.0) + body_size * 1.5 + theme.scaledUi(22.0) + button_h;
+    if (no_workspaces_suggestion_count > 0) {
+        content_h += section_gap + header_h + (suggestion_h + theme.scaledUi(6.0)) * @as(f32, @floatFromInt(no_workspaces_suggestion_count));
+    }
+    content_h += section_gap + header_h + provider_panel_h + theme.scaledUi(16.0) + button_h;
+
+    const x = rect.x + (rect.w - content_w) * 0.5;
+    var y = rect.y + @max(theme.scaledUi(24.0), (rect.h - content_h) * 0.5);
+
+    const title = "Welcome to Verde";
+    const title_w = runtime.paletteUiTextPrefixWidth(title, title_size, title.len);
+    queueText(state, .{ .x = x + @max(0.0, (content_w - title_w) * 0.5), .y = y, .w = @min(content_w, title_w), .h = title_size * 1.3 }, title, paletteColor(theme.COLOR_WHITE), title_size, rect);
+    y += theme.scaledUi(42.0);
+    const body = "Open a project folder as a workspace to start chatting with your agents.";
+    const body_w = runtime.paletteUiTextPrefixWidth(body, body_size, body.len);
+    queueText(state, .{ .x = x + @max(0.0, (content_w - body_w) * 0.5), .y = y, .w = @min(content_w, body_w), .h = body_size * 1.4 }, body, paletteColor(theme.COLOR_TEXT_MUTED), body_size, rect);
+    y += body_size * 1.5 + theme.scaledUi(22.0);
+
+    renderEmptyWorkspaceAction(state, .{ .x = x, .y = y, .w = content_w, .h = button_h }, NF_COD_ADD, "Add workspace folder", "", .add_workspace, true, noWorkspacesSelected(0));
+    y += button_h;
+
+    if (no_workspaces_suggestion_count > 0) {
+        y += section_gap;
+        renderWelcomeSectionHeader(state, .{ .x = x, .y = y, .w = content_w, .h = header_h }, "SUGGESTED FOLDERS", null);
+        y += header_h;
+        for (no_workspaces_suggestions[0..no_workspaces_suggestion_count], 0..) |*suggestion, index| {
+            renderWelcomeSuggestion(state, .{ .x = x, .y = y, .w = content_w, .h = suggestion_h }, suggestion, index, noWorkspacesSelected(index + 1));
+            y += suggestion_h + theme.scaledUi(6.0);
+        }
+        y -= theme.scaledUi(6.0);
+    }
+
+    y += section_gap;
+    renderWelcomeSectionHeader(state, .{ .x = x, .y = y, .w = content_w, .h = header_h }, "AI PROVIDERS", "Manage");
+    y += header_h;
+    renderWelcomeProviders(state, .{ .x = x, .y = y, .w = content_w, .h = provider_panel_h }, providers, noWorkspacesSelected(no_workspaces_suggestion_count + 1));
+    y += provider_panel_h + theme.scaledUi(16.0);
+
+    var settings_hint_buf: [32]u8 = undefined;
+    const settings_hint = if (state.command_controller.keyboard_config) |loaded| firstKeybindHint(&settings_hint_buf, loaded.settings) else "";
+    renderEmptyWorkspaceAction(state, .{ .x = x, .y = y, .w = content_w, .h = button_h }, NF_COD_GEAR, "Settings", settings_hint, .open_settings, false, noWorkspacesSelected(no_workspaces_suggestion_count + 2));
+}
+
+const WELCOME_SUGGESTION_ROW_H: f32 = 48.0;
+const WELCOME_PROVIDER_CELL_H: f32 = 28.0;
+const WELCOME_PROVIDERS = [_]runtime.Provider{ .claude, .codex, .opencode, .cursor, .pi, .fx, .grok, .muse };
+
+const WelcomeProviders = struct {
+    items: [WELCOME_PROVIDERS.len]runtime.Provider = undefined,
+    readiness: [WELCOME_PROVIDERS.len]runtime.ProviderReadiness = undefined,
+    count: usize = 0,
+    checking: bool = false,
+};
+
+// Providers worth listing: anything installed, or still being probed.
+fn installedWelcomeProviders(state: *runtime.AppState) WelcomeProviders {
+    const snapshot = state.providerReadinessSnapshot();
+    var result: WelcomeProviders = .{};
+    for (WELCOME_PROVIDERS) |provider| {
+        const readiness = snapshot.forProvider(provider);
+        if (readiness == .checking) result.checking = true;
+        if (readiness == .missing or readiness == .checking) continue;
+        result.items[result.count] = provider;
+        result.readiness[result.count] = readiness;
+        result.count += 1;
+    }
+    return result;
+}
+
+fn welcomeProviderName(provider: runtime.Provider) []const u8 {
+    return switch (provider) {
+        .codex => "Codex",
+        .opencode => "OpenCode",
+        .claude => "Claude Code",
+        .cursor => "Cursor",
+        .pi => "Pi",
+        .fx => "FX",
+        .grok => "Grok",
+        .muse => "Muse",
+    };
+}
+
+// Small caps section label with an optional right-aligned link to the provider dialog.
+fn renderWelcomeSectionHeader(state: *runtime.AppState, rect: palette.Rect, label: []const u8, link: ?[]const u8) void {
+    const size = theme.scaledUi(11.0);
+    const text_y = rect.y + rect.h - size * 1.25 - theme.scaledUi(6.0);
+    const label_w = runtime.paletteUiTextPrefixWidth(label, size, label.len);
+    queueText(state, .{ .x = rect.x + theme.scaledUi(2.0), .y = text_y, .w = label_w, .h = size * 1.25 }, label, paletteColor(theme.COLOR_TEXT_SUBTLE), size, rect);
+    const text = link orelse return;
+    const link_size = theme.scaledUi(12.0);
+    const link_w = runtime.paletteUiTextPrefixWidth(text, link_size, text.len);
+    const link_rect: palette.Rect = .{ .x = rect.x + rect.w - link_w - theme.scaledUi(2.0), .y = rect.y + rect.h - link_size * 1.25 - theme.scaledUi(6.0), .w = link_w, .h = link_size * 1.25 };
+    const hovered = state.transcript_controller.palette_mouse_in_workspace and
+        rectContains(link_rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
+    queueText(state, link_rect, text, paletteColor(if (hovered) theme.raise(theme.accent(), 0.12) else theme.accent()), link_size, rect);
+    appendHit(.{ .action = .open_provider_setup, .rect = link_rect });
+}
+
+// One suggested folder: name, home-abbreviated parent path, and where it was found.
+fn renderWelcomeSuggestion(state: *runtime.AppState, rect: palette.Rect, suggestion: *const workspace_suggestions.Suggestion, index: usize, selected: bool) void {
+    const hovered = state.transcript_controller.palette_mouse_in_workspace and
+        rectContains(rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
+    const fill = if (hovered or selected) theme.raise(theme.COLOR_PANEL_ALT, 0.08) else theme.COLOR_PANEL_ALT;
+    queuePanel(state, rect, fill, if (selected) theme.accent() else theme.borderMuted(), theme.scaledUi(7.0), selected);
+
+    const icon_size = theme.scaledUi(15.0);
+    const left = rect.x + theme.scaledUi(13.0);
+    queueIcon(state, .{ .x = left, .y = rect.y + (rect.h - icon_size) * 0.5, .w = icon_size, .h = icon_size }, NF_COD_FOLDER_OPENED, paletteColor(theme.accent()), icon_size, rect);
+
+    const source = suggestion.source.label();
+    const source_size = theme.scaledUi(11.0);
+    const source_w = runtime.paletteUiTextPrefixWidth(source, source_size, source.len);
+    const source_x = rect.x + rect.w - theme.scaledUi(13.0) - source_w;
+    queueText(state, .{ .x = source_x, .y = rect.y + (rect.h - source_size * 1.25) * 0.5, .w = source_w, .h = source_size * 1.25 }, source, paletteColor(theme.COLOR_TEXT_SUBTLE), source_size, rect);
+
+    const text_x = left + theme.scaledUi(26.0);
+    const text_clip: palette.Rect = .{ .x = text_x, .y = rect.y, .w = @max(0.0, source_x - theme.scaledUi(12.0) - text_x), .h = rect.h };
+    const name_size = theme.scaledUi(14.0);
+    const path_size = theme.scaledUi(11.5);
+    const name = suggestion.name();
+    queueText(state, .{ .x = text_x, .y = rect.y + theme.scaledUi(6.0), .w = text_clip.w, .h = name_size * 1.25 }, name, paletteColor(theme.COLOR_WHITE), name_size, text_clip);
+    var path_buf: [256]u8 = undefined;
+    const parent = suggestion.displayParent(&path_buf);
+    queueText(state, .{ .x = text_x, .y = rect.y + theme.scaledUi(6.0) + name_size * 1.3, .w = text_clip.w, .h = path_size * 1.25 }, parent, paletteColor(theme.COLOR_TEXT_MUTED), path_size, text_clip);
+    appendHit(.{ .action = .open_suggested_workspace, .rect = rect, .pane_index = index });
+}
+
+// Two-column provider status grid; the whole panel opens the provider dialog.
+fn renderWelcomeProviders(state: *runtime.AppState, rect: palette.Rect, providers: WelcomeProviders, selected: bool) void {
+    const hovered = state.transcript_controller.palette_mouse_in_workspace and
+        rectContains(rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
+    const fill = if (hovered or selected) theme.raise(theme.COLOR_PANEL_ALT, 0.05) else theme.COLOR_PANEL_ALT;
+    queuePanel(state, rect, fill, if (selected) theme.accent() else theme.borderMuted(), theme.scaledUi(7.0), selected);
+    appendHit(.{ .action = .open_provider_setup, .rect = rect });
+
+    const pad = theme.scaledUi(8.0);
+    const cell_h = theme.scaledUi(WELCOME_PROVIDER_CELL_H);
+    const font_size = theme.scaledUi(13.0);
+    const status_size = theme.scaledUi(11.5);
+    if (providers.count == 0) {
+        const message = if (providers.checking) "Checking installed coding agents..." else "No coding agents found. Install one, then check again.";
+        const message_w = runtime.paletteUiTextPrefixWidth(message, font_size, message.len);
+        queueText(state, .{ .x = rect.x + theme.scaledUi(14.0), .y = rect.y + (rect.h - font_size * 1.25) * 0.5, .w = @min(message_w, rect.w - theme.scaledUi(28.0)), .h = font_size * 1.25 }, message, paletteColor(theme.COLOR_TEXT_MUTED), font_size, rect);
+        return;
+    }
+    const cell_w = (rect.w - pad * 2.0) * 0.5;
+    for (0..providers.count) |index| {
+        const column: f32 = @floatFromInt(index % 2);
+        const row: f32 = @floatFromInt(index / 2);
+        const cell: palette.Rect = .{ .x = rect.x + pad + column * cell_w, .y = rect.y + pad + row * cell_h, .w = cell_w, .h = cell_h };
+        const readiness = providers.readiness[index];
+        const status_color = switch (readiness) {
+            .ready => theme.success(),
+            .signed_out, .unavailable => theme.COLOR_YELLOW,
+            .missing => theme.COLOR_DIFF_REMOVE,
+            .checking => theme.COLOR_TEXT_MUTED,
+        };
+        const status = switch (readiness) {
+            .ready => "Ready",
+            .signed_out => "Sign in",
+            .unavailable => "Unverified",
+            .missing => "Missing",
+            .checking => "Checking",
+        };
+        const dot = theme.scaledUi(7.0);
+        queueRounded(state, .{ .x = cell.x + theme.scaledUi(8.0), .y = cell.y + (cell.h - dot) * 0.5, .w = dot, .h = dot }, paletteColor(status_color), dot * 0.5);
+        const status_w = runtime.paletteUiTextPrefixWidth(status, status_size, status.len);
+        const status_x = cell.x + cell.w - theme.scaledUi(10.0) - status_w;
+        queueText(state, .{ .x = status_x, .y = cell.y + (cell.h - status_size * 1.25) * 0.5, .w = status_w, .h = status_size * 1.25 }, status, paletteColor(status_color), status_size, rect);
+        const name = welcomeProviderName(providers.items[index]);
+        const name_x = cell.x + theme.scaledUi(22.0);
+        queueText(state, .{ .x = name_x, .y = cell.y + (cell.h - font_size * 1.25) * 0.5, .w = @max(0.0, status_x - theme.scaledUi(8.0) - name_x), .h = font_size * 1.25 }, name, paletteColor(theme.COLOR_WHITE), font_size, rect);
+    }
+}
+
 fn firstKeybindHint(buf: []u8, bindings: []const keybinds.Keybind) []const u8 {
     if (bindings.len == 0) return "";
     return keybinds.formatKeybind(buf, bindings[0]);
@@ -1133,25 +1411,29 @@ fn renderEmptyWorkspaceAction(
         rectContains(rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
     const base_color = if (primary) theme.accent() else theme.COLOR_PANEL_ALT;
     const button_color = if (hovered or selected) theme.raise(base_color, 0.08) else base_color;
-    queueRounded(state, rect, paletteColor(button_color), theme.scaledUi(7.0));
+    // A primary button's resting edge is its own fill, so it reads borderless.
     const border_color = if (selected and primary)
-        theme.COLOR_WHITE
+        theme.foregroundOn(button_color)
     else if (selected)
         theme.accent()
+    else if (primary)
+        button_color
     else
         theme.borderMuted();
-    if (!primary or selected) queueBorder(state, rect, paletteColor(border_color), theme.scaledUi(7.0), theme.scaledUi(if (selected) 2.0 else 1.0));
+    queuePanel(state, rect, button_color, border_color, theme.scaledUi(7.0), selected);
 
+    // The accent fill can be light; pick whichever theme pole reads on it.
+    const foreground = if (primary) theme.foregroundOn(button_color) else theme.COLOR_WHITE;
     const font_size = theme.scaledUi(14.0);
     const icon_size = theme.scaledUi(15.0);
     const left = rect.x + theme.scaledUi(13.0);
-    queueIcon(state, .{ .x = left, .y = rect.y + (rect.h - icon_size) * 0.5, .w = icon_size, .h = icon_size }, icon, paletteColor(theme.COLOR_WHITE), icon_size, rect);
+    queueIcon(state, .{ .x = left, .y = rect.y + (rect.h - icon_size) * 0.5, .w = icon_size, .h = icon_size }, icon, paletteColor(foreground), icon_size, rect);
     const label_w = runtime.paletteUiTextPrefixWidth(label, font_size, label.len);
-    queueText(state, .{ .x = left + theme.scaledUi(24.0), .y = rect.y + (rect.h - font_size * 1.25) * 0.5, .w = @min(label_w, rect.w * 0.58), .h = font_size * 1.25 }, label, paletteColor(theme.COLOR_WHITE), font_size, rect);
+    queueText(state, .{ .x = left + theme.scaledUi(24.0), .y = rect.y + (rect.h - font_size * 1.25) * 0.5, .w = @min(label_w, rect.w * 0.58), .h = font_size * 1.25 }, label, paletteColor(foreground), font_size, rect);
     if (shortcut.len > 0) {
         const hint_size = theme.scaledUi(11.0);
         const hint_w = runtime.paletteUiTextPrefixWidth(shortcut, hint_size, shortcut.len);
-        queueText(state, .{ .x = rect.x + rect.w - theme.scaledUi(13.0) - hint_w, .y = rect.y + (rect.h - hint_size * 1.25) * 0.5, .w = hint_w, .h = hint_size * 1.25 }, shortcut, paletteColor(if (primary) theme.withAlpha(theme.COLOR_WHITE, 190) else theme.COLOR_TEXT_SUBTLE), hint_size, rect);
+        queueText(state, .{ .x = rect.x + rect.w - theme.scaledUi(13.0) - hint_w, .y = rect.y + (rect.h - hint_size * 1.25) * 0.5, .w = hint_w, .h = hint_size * 1.25 }, shortcut, paletteColor(if (primary) theme.withAlpha(foreground, 190) else theme.COLOR_TEXT_SUBTLE), hint_size, rect);
     }
     appendHit(.{ .action = action, .rect = rect });
 }
@@ -1309,6 +1591,10 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button
             },
             .open_terminal => {
                 activateEmptyWorkspaceAction(state, hit.action);
+                split_menu_open_for = null;
+            },
+            .add_workspace, .open_suggested_workspace, .open_provider_setup, .open_settings => {
+                activateNoWorkspacesAction(state, hit.action, hit.pane_index);
                 split_menu_open_for = null;
             },
             .refresh_chat_thread => {
@@ -3573,6 +3859,15 @@ fn queueRounded(state: *runtime.AppState, rect: palette.Rect, color: palette.Col
     state.palette_overlay_batch.roundedRect(state.allocator, rect, color, radius) catch {};
 }
 
+/// One bordered surface per Palette's crisp-chrome rules: a single `panel`
+/// command on pixel-snapped edges with a whole-pixel stroke (2px when selected).
+fn queuePanel(state: *runtime.AppState, rect: palette.Rect, fill: [4]f32, border: [4]f32, radius: f32, emphasized: bool) void {
+    const left = @round(rect.x);
+    const top = @round(rect.y);
+    const snapped: palette.Rect = .{ .x = left, .y = top, .w = @round(rect.x + rect.w) - left, .h = @round(rect.y + rect.h) - top };
+    const stroke = @max(@round(theme.scaledUi(if (emphasized) 2.0 else 1.0)), 1.0);
+    state.palette_overlay_batch.panel(state.allocator, snapped, paletteColor(fill), paletteColor(border), radius, stroke) catch {};
+}
 fn queueBorder(state: *runtime.AppState, rect: palette.Rect, color: palette.Color, radius: f32, width: f32) void {
     state.palette_overlay_batch.rectBorder(state.allocator, rect, color, radius, width) catch {};
 }
