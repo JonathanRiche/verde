@@ -989,6 +989,10 @@ fn systemCursorForBrowserShape(shape: browser_runtime.CursorShape) palette.platf
 test "production Companion wheel routing preserves direct ownership" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.app_config = .{ .companion_enabled = true };
     state.companion_controller = companion_controller.init();

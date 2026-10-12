@@ -2538,6 +2538,10 @@ test "workspace open settings command routes to the palette target workspace" {
     // palette session must not override the selection.
     const allocator = std.testing.allocator;
     var state: runtime.AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.lifecycle = .{};
     state.sidebar_context_menu_open = false;

@@ -4608,6 +4608,10 @@ test "Herdr live handlers reject every retired remote parameter by presence" {
         \\{"session":"default","herdr_workspace":"local","profile":null}
     };
     var state: app_state.AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     for (cases) |params_json| {
         var params = try std.json.parseFromSlice(std.json.Value, allocator, params_json, .{});
         defer params.deinit();
@@ -4706,6 +4710,10 @@ test "terminal lifecycle reaches workspace processes with the exact final wait i
     const allocator = std.testing.allocator;
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
     var state: app_state.AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.project_controller.projects = .empty;
     state.project_controller.selected_index = 0;
@@ -4799,6 +4807,10 @@ test "stopped unconfirmed terminal remains waitable through disappearance grace"
     const allocator = std.testing.allocator;
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
     var state: app_state.AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.project_controller.projects = .empty;
     state.project_controller.selected_index = 0;
@@ -4908,6 +4920,10 @@ test "terminal lifecycle preserves an observed signal in workspace processes" {
     const allocator = std.testing.allocator;
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
     var state: app_state.AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.project_controller.projects = .empty;
     state.project_controller.selected_index = 0;
@@ -4973,6 +4989,10 @@ test "terminal duplicate generations remain unambiguous and unknown exits never 
     const allocator = std.testing.allocator;
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
     var state: app_state.AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.project_controller.projects = .empty;
     state.project_controller.selected_index = 0;
@@ -5192,6 +5212,10 @@ test "terminal key command routes to a runnable target without changing focus" {
 
     const allocator = std.testing.allocator;
     var state: app_state.AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.project_controller.projects = .empty;
     state.project_controller.selected_index = 0;
@@ -5272,6 +5296,10 @@ test "terminal key command routes to a runnable target without changing focus" {
 test "terminal key command rejects non-terminal targets and invalid keys" {
     const allocator = std.testing.allocator;
     var state: app_state.AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.project_controller.projects = .empty;
     state.project_controller.selected_index = 0;
@@ -5332,6 +5360,14 @@ test "pane close response matches the next durable projection" {
     const persistence = @import("../state/persistence.zig");
 
     var state: app_state.AppState = undefined;
+
+    // Fields read by modal key/text routing and new-chat defaults.
+
+    state.folder_browser = .{};
+
+    state.settings_controller.provider_setup = .{};
+
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.project_controller.projects = .empty;
     state.project_controller.selected_index = 1;

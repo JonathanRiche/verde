@@ -2984,6 +2984,10 @@ test "sidebar tile miniature follows nested split rows" {
 test "ACTIVE collection sees every restored chat pane and deduplicates one thread owner" {
     const allocator = std.testing.allocator;
     var state: runtime.AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.project_controller.projects = .empty;
     // Scoped to a different workspace: ACTIVE is global and must still see
@@ -3021,6 +3025,10 @@ test "ACTIVE collection sees every restored chat pane and deduplicates one threa
 test "OPEN interleaves All Workspaces newest-activity first and keeps layout order when scoped" {
     const allocator = std.testing.allocator;
     var state: runtime.AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
     defer state.palette_frame_text_arena.deinit();
@@ -3057,6 +3065,10 @@ test "OPEN interleaves All Workspaces newest-activity first and keeps layout ord
 test "All Workspaces keyboard order follows the displayed OPEN rows" {
     const allocator = std.testing.allocator;
     var state: runtime.AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
     defer state.palette_frame_text_arena.deinit();

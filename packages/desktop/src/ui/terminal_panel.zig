@@ -432,6 +432,19 @@ pub fn renderDockAtForDockWithin(state: *app_state.AppState, rect: palette.Rect,
     }
 }
 
+/// Draws a terminal that belongs to no workspace (the provider dialog's
+/// setup terminal) into `rect`. Input reaches it through its owner, not the
+/// workspace pane hit cache, so no dock id is recorded here.
+pub fn renderStandaloneDock(state: *app_state.AppState, rect: palette.Rect, dock: *terminal.Dock) void {
+    const dock_bg = if (dock.activeRenderState()) |render_state| rgbPaletteColor(render_state.colors.background, 1.0) else paletteColor(theme.background());
+    queueRounded(state, rect, dock_bg, theme.scaledUi(8.0));
+    if (dock.activeTab()) |tab| {
+        renderPaneNode(state, dock, tab.root, rect, rect);
+    } else {
+        renderStatus(state, rect, "Starting...");
+    }
+}
+
 pub fn handlePaletteKeyDown(state: *app_state.AppState, event: *const palette.event.KeyEvent) bool {
     if (!terminalCopyShortcut(event) or !selection_state.active) return false;
     return copySelectionToClipboard(state);

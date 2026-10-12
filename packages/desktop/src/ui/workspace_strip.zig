@@ -513,6 +513,10 @@ fn paletteColor(value: [4]f32) palette.Color {
 
 fn testState(projects: *std.ArrayList(runtime.Project)) runtime.AppState {
     var state: runtime.AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.sidebar_collapsed = false;
     state.sidebar_hidden = false;
     state.app_config.workspace_tabs = .automatic;

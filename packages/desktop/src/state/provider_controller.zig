@@ -10,6 +10,8 @@ const chat_types = @import("chat_types.zig");
 const provider_cli_version = @import("../providers/cli_version.zig");
 const provider_models = @import("provider_models.zig");
 const state_sync = @import("sync.zig");
+const provider_setup = @import("provider_setup.zig");
+const platform_runtime = @import("platform_runtime");
 const runtime_log = @import("../runtime/log.zig");
 
 const log = std.log.scoped(.native_shell);
@@ -883,6 +885,7 @@ pub fn completeMcpOnboarding(self: anytype, enable: bool) void {
 }
 
 pub fn pollProviderReadiness(self: anytype) void {
+    provider_setup.poll(self, platform_runtime.unixTimestampMs());
     self.pollProviderThreadOperation();
     self.pollProviderSlashCatalog();
     const revision = self.provider_controller.readiness.revision.load(.acquire);
@@ -903,8 +906,21 @@ pub fn pollProviderReadiness(self: anytype) void {
     if (!completed) return;
 
     self.finishProviderReadinessThread();
+    // Sign-in/install from the dialog worked: close the whole dialog and say
+    // so, rather than leaving the user to click Back and then Not now.
+    const setup = &self.settings_controller.provider_setup;
+    if (self.settings_controller.provider_onboarding_visible and setup.visible() and snapshot.forProvider(setup.provider) == .ready) {
+        const provider = setup.provider;
+        self.dismissProviderOnboarding();
+        var notice_buf: [128]u8 = undefined;
+        const notice = std.fmt.bufPrint(&notice_buf, "{s} is ready. Pick it from the model menu in any chat.", .{providerDisplayName(provider)}) catch "Provider is ready.";
+        self.setSidebarNotice(notice);
+    }
     if (snapshot.hasReadyProvider()) {
-        self.settings_controller.provider_onboarding_visible = false;
+        // Opened on purpose, or mid sign-in: let the user see the result.
+        if (!self.settings_controller.provider_onboarding_pinned and !self.settings_controller.provider_setup.visible()) {
+            self.settings_controller.provider_onboarding_visible = false;
+        }
         self.settings_controller.provider_onboarding_dismissed = false;
     } else if (!self.settings_controller.provider_onboarding_dismissed) {
         self.settings_controller.provider_onboarding_visible = true;
@@ -921,12 +937,16 @@ pub fn providerReadinessSnapshot(self: anytype) ProviderReadinessSnapshot {
 }
 
 pub fn dismissProviderOnboarding(self: anytype) void {
+    provider_setup.close(self);
+    self.settings_controller.provider_onboarding_pinned = false;
     self.settings_controller.provider_onboarding_visible = false;
     self.settings_controller.provider_onboarding_dismissed = true;
     self.markDirty();
 }
 
 pub fn recheckProviderReadiness(self: anytype) void {
+    self.settings_controller.provider_onboarding_pinned = true;
+    self.settings_controller.provider_setup.last_recheck_ms = platform_runtime.unixTimestampMs();
     self.settings_controller.provider_onboarding_visible = true;
     self.settings_controller.provider_onboarding_dismissed = false;
     self.startProviderReadinessCheck();

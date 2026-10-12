@@ -14,6 +14,7 @@ const theme = @import("../ui/theme.zig");
 const utils = @import("../utils.zig");
 const provider_cli_version = @import("../providers/cli_version.zig");
 const provider_models = @import("provider_models.zig");
+const provider_setup = @import("provider_setup.zig");
 
 const ModelOption = provider_models.ModelOption;
 const Provider = provider_models.Provider;
@@ -311,6 +312,11 @@ pub const State = struct {
     package_update_check_failed: bool = false,
     update_installer_terminal: ?UpdateInstallerTerminal = null,
     provider_install_terminal: ?ProviderInstallTerminal = null,
+    /// Inline sign-in / install terminal of the provider dialog.
+    provider_setup: provider_setup.Setup = .{},
+    /// The provider dialog was opened on purpose (Manage, model picker, Check
+    /// again), so a ready provider must not auto-dismiss it.
+    provider_onboarding_pinned: bool = false,
     update_exit_requested: bool = false,
 };
 
@@ -1419,19 +1425,12 @@ pub fn runProviderOnboardingAction(self: anytype, provider: Provider) void {
     const row = for (PROVIDER_OPTIONS, 0..) |option, index| {
         if (dbProviderForChatProvider(option) == provider) break index;
     } else return;
-    const readiness = self.providerReadinessSnapshot().forProvider(provider);
-    const before = self.settings_controller.provider_install_terminal;
-    switch (readiness) {
-        .missing => installSettingsProvider(self, row),
-        .signed_out, .unavailable => loginSettingsProvider(self, row),
+    _ = row;
+    // The dialog runs the command in its own inline terminal, so this works
+    // before any workspace exists and the user never leaves the checklist.
+    switch (self.providerReadinessSnapshot().forProvider(provider)) {
+        .missing, .signed_out, .unavailable => provider_setup.start(self, provider),
         .ready, .checking => {},
-    }
-    // Step aside only when a new terminal actually opened (not for a copied
-    // command or a provider with no installer on this OS).
-    const after = self.settings_controller.provider_install_terminal;
-    if (after) |started| {
-        const is_new = if (before) |prior| prior.dock_id != started.dock_id or prior.project_index != started.project_index else true;
-        if (is_new) self.settings_controller.provider_onboarding_visible = false;
     }
     self.markDirty();
 }

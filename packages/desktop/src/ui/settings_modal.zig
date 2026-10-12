@@ -4271,6 +4271,10 @@ fn paletteColor(value: [4]f32) palette.Color {
 
 fn testSettingsState(allocator: std.mem.Allocator) runtime.AppState {
     var state: runtime.AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.app_config = .{};
     state.settings_controller = .{};

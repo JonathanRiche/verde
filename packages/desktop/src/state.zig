@@ -49,6 +49,7 @@ const chat_types = @import("state/chat_types.zig");
 const state_sync = @import("state/sync.zig");
 const state_ui_types = @import("state/ui_types.zig");
 pub const folder_browser = @import("state/folder_browser.zig");
+pub const provider_setup = @import("state/provider_setup.zig");
 const herdr_types = @import("state/herdr_types.zig");
 const project_state = @import("state/project.zig");
 const state_storage = @import("state/storage.zig");
@@ -2364,6 +2365,8 @@ pub const PaletteModalAction = enum {
     folder_browser_cancel,
     folder_browser_select,
     folder_browser_managed,
+    provider_onboarding_copy,
+    provider_setup_back,
 };
 
 pub const SettingsOpenAction = settings_controller.OpenAction;
@@ -3193,10 +3196,23 @@ fn paletteModelPickerDescription(context: ?*anyopaque, index: usize) []const u8 
 fn paletteModelPickerBadge(context: ?*anyopaque, index: usize) []const u8 {
     const state = appStateFromContext(context) orelse return "";
     const entry = modelPickerEntryAt(state, index) orelse return "";
+    // Unconnected providers say what they need instead of "Default".
+    switch (state.providerReadinessSnapshot().forProvider(entry.provider)) {
+        .missing => return "Install",
+        .signed_out, .unavailable => return "Sign in",
+        .ready, .checking => {},
+    }
     const option = modelPickerOptionAt(state, index) orelse return "";
     const value = option.value orelse return "";
     if (std.mem.eql(u8, value, composerDefaultModelRef(state, entry.provider))) return "Default";
     return "";
+}
+
+/// Rows of providers that are not installed or signed in read as unavailable.
+fn paletteModelPickerMuted(context: ?*anyopaque, index: usize) bool {
+    const state = appStateFromContext(context) orelse return false;
+    const entry = modelPickerEntryAt(state, index) orelse return false;
+    return !state.providerUsable(entry.provider);
 }
 
 fn paletteModelPickerGroup(context: ?*anyopaque, index: usize) []const u8 {
@@ -3346,12 +3362,14 @@ fn drawModelPickerProviderLogo(
     };
     const c = utils.snapImageRectToPixels(utils.imageRectContain(tex.width, tex.height, square.x, square.y, square.w, square.h));
     const tint = theme.providerLogoTint(@tagName(provider));
+    // Unconnected providers keep their logo but fade it back.
+    const alpha = if (state.providerUsable(provider)) tint[3] else tint[3] * 0.35;
     batch.image(allocator, .{ .x = c.x, .y = c.y, .w = c.w, .h = c.h }, palette.TextureId.init(tex.texture_id), .{
         .x = 0.0,
         .y = 0.0,
         .w = 1.0,
         .h = 1.0,
-    }, .{ .r = tint[0], .g = tint[1], .b = tint[2], .a = tint[3] }, clip) catch {};
+    }, .{ .r = tint[0], .g = tint[1], .b = tint[2], .a = alpha }, clip) catch {};
 }
 
 // Letter stand-in for providers without a bundled logo texture (Pi, FX), so
@@ -3470,6 +3488,7 @@ pub const PaletteModelPicker = palette.richPicker(.{
     .item_action_icon = "\u{EA6A}",
     .item_action_active_icon = "\u{EB59}",
     .item_action_active = paletteModelPickerFavorite,
+    .item_muted = paletteModelPickerMuted,
     .item_group = paletteModelPickerGroup,
     // Provider rail on the left; the star entry filters to favorite models.
     .rail_enabled = true,
@@ -4111,6 +4130,13 @@ fn paletteModelPickerEvent(context: ?*anyopaque, event: palette.RichPickerEvent)
         .selected => |index| {
             const entry = modelPickerEntryAt(state, index) orelse return;
             const option = modelPickerOptionAt(state, index) orelse return;
+            // A model from an unconnected provider cannot run; open the
+            // provider dialog with its Sign in / Install action instead.
+            if (!state.providerUsable(entry.provider)) {
+                state.closePaletteModelPicker();
+                state.recheckProviderReadiness();
+                return;
+            }
             if (entry.provider != state.currentThread().provider) {
                 state.setCurrentThreadProvider(entry.provider);
                 if (state.currentThread().provider != entry.provider) return;
@@ -8234,9 +8260,30 @@ pub const AppState = struct {
             if (!self.app_config.isProviderEnabled(last)) last_provider = null;
         }
         // Settings keeps the configured default enabled whenever it disables a provider.
-        const provider = last_provider orelse self.app_config.new_chat_provider;
-        try self.applyProviderModelDefaults(thread, providerFromConfig(provider), last_provider == null);
+        const preferred = providerFromConfig(last_provider orelse self.app_config.new_chat_provider);
+        // A new chat should not land on a provider the user cannot run yet.
+        const fallback = if (self.providerUsable(preferred)) null else self.firstReadyChatProvider();
+        try self.applyProviderModelDefaults(thread, fallback orelse preferred, fallback == null and last_provider == null);
         _ = try self.applyWorkspaceRuntimeDefaultToThread(project.id, thread);
+    }
+
+    /// True unless the last readiness check found the provider missing or not
+    /// signed in. Still-checking providers count as usable to avoid flicker.
+    pub fn providerUsable(self: *AppState, provider: Provider) bool {
+        return switch (self.providerReadinessSnapshot().forProvider(provider)) {
+            .ready, .checking => true,
+            .missing, .signed_out, .unavailable => false,
+        };
+    }
+
+    /// First enabled provider the last readiness check confirmed signed in.
+    fn firstReadyChatProvider(self: *AppState) ?Provider {
+        const snapshot = self.providerReadinessSnapshot();
+        for (COMPOSER_PROVIDER_OPTIONS) |candidate| {
+            if (!self.app_config.isProviderEnabled(configChatProvider(candidate))) continue;
+            if (snapshot.forProvider(candidate) == .ready) return candidate;
+        }
+        return null;
     }
 
     fn applyProviderModelDefaults(self: *AppState, thread: *ChatThread, provider: Provider, use_configured: bool) !void {
@@ -13363,10 +13410,14 @@ pub const AppState = struct {
         defer self.allocator.free(previous);
         self.composer_controller.model_picker_entries.clearRetainingCapacity();
         if (self.currentThreadAllowsProviderChoice()) {
-            for (COMPOSER_PROVIDER_OPTIONS) |candidate| {
-                // The thread's own provider stays listed so its current model remains selectable.
-                if (!self.app_config.isProviderEnabled(configChatProvider(candidate)) and candidate != self.currentThread().provider) continue;
-                try self.appendModelPickerEntries(candidate);
+            // Connected providers list first; the rest follow, dimmed.
+            for ([_]bool{ true, false }) |usable_pass| {
+                for (COMPOSER_PROVIDER_OPTIONS) |candidate| {
+                    if (self.providerUsable(candidate) != usable_pass) continue;
+                    // The thread's own provider stays listed so its current model remains selectable.
+                    if (!self.app_config.isProviderEnabled(configChatProvider(candidate)) and candidate != self.currentThread().provider) continue;
+                    try self.appendModelPickerEntries(candidate);
+                }
             }
         } else {
             try self.appendModelPickerEntries(self.currentThread().provider);
@@ -14374,6 +14425,8 @@ pub const AppState = struct {
                 .folder_browser_select,
                 .folder_browser_cancel,
                 .folder_browser_managed,
+                .provider_onboarding_copy,
+                .provider_setup_back,
                 => true,
                 .folder_browser_block,
                 .folder_browser_input,
@@ -15509,6 +15562,7 @@ pub const AppState = struct {
     pub fn deinit(self: *AppState) void {
         runtime_log.diagnostic("AppState.deinit begin", .{});
         self.folder_browser.deinit(self.allocator);
+        self.settings_controller.provider_setup.deinit(self.allocator);
         self.clearPaletteHistory();
         self.clearTiledWebThreads();
         self.clearPendingMovedThreadTiles();
@@ -17134,6 +17188,10 @@ test "lazy transcript hydration trims a durable page overlap by message identity
 /// pollTranscriptHydration's guard and commit run without worker threads.
 fn testTranscriptHydrationState(allocator: std.mem.Allocator) !AppState {
     var state: AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.project_controller.projects = .empty;
     state.project_controller.selected_index = 0;
@@ -17812,6 +17870,10 @@ fn projectEditorOpenedNotice(target: ProjectEditorTarget) []const u8 {
 
 test "empty workspace ignores hidden composer and slash input" {
     var state: AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.project_controller.projects = .empty;
     state.project_controller.selected_index = 0;
 
@@ -17860,6 +17922,10 @@ test "browser origin comparison preserves same-site runtime only" {
 test "shared browser runtime routes state through its workspace owner" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.app_config = .{};
     state.project_controller.projects = .empty;
@@ -17903,6 +17969,10 @@ test "shared browser runtime routes state through its workspace owner" {
 test "browser runtime remains needed until the final workspace browser pane closes" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.project_controller.projects = .empty;
     defer {
@@ -17943,6 +18013,14 @@ test "completed OpenCode model refresh tolerates zero workspaces" {
     };
 
     var state: AppState = undefined;
+
+    // Fields read by modal key/text routing and new-chat defaults.
+
+    state.folder_browser = .{};
+
+    state.settings_controller.provider_setup = .{};
+
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.project_controller.projects = .empty;
     state.project_controller.selected_index = 0;
@@ -18336,6 +18414,10 @@ test "runtime onboarding transitions require credentials and explicit trust" {
 
 test "runtime credential UI storage is fully wiped" {
     var state: AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     @memset(state.runtime_credential_token_storage[0..], 0xa5);
     state.runtime_credential_token_cursor = 37;
     state.palette_modal_text_focus = .runtime_credential;
@@ -18355,6 +18437,10 @@ test "runtime credential UI storage is fully wiped" {
 test "GUI new-chat defaults apply configured provider model and reasoning" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.app_config = .{
         .new_chat_provider = .codex,
@@ -18481,6 +18567,14 @@ test "workspace settings modal stays bound by id and marks the effective default
     const remote_profile_id = "profile-0123456789abcdef0123456789abcdef";
 
     var state: AppState = undefined;
+
+    // Fields read by modal key/text routing and new-chat defaults.
+
+    state.folder_browser = .{};
+
+    state.settings_controller.provider_setup = .{};
+
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.lifecycle = .{};
     state.sidebar_context_menu_open = false;
@@ -18574,6 +18668,14 @@ test "workspace runtime default affects future drafts while each thread can over
     const workspace_id = "workspace-defaults";
 
     var state: AppState = undefined;
+
+    // Fields read by modal key/text routing and new-chat defaults.
+
+    state.folder_browser = .{};
+
+    state.settings_controller.provider_setup = .{};
+
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.app_config = .{};
     state.project_controller.projects = .empty;
@@ -18751,6 +18853,10 @@ test "background task stop hits keep sibling anonymous commands distinct" {
 test "provider-aware chat creation scopes mutation and rejects invalid models" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.project_controller.projects = .empty;
     state.project_controller.selected_index = 0;
@@ -18920,6 +19026,10 @@ test "provider-aware chat creation scopes mutation and rejects invalid models" {
 test "durable projected chat presentation is idempotent and never mints identity" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.project_controller.projects = .empty;
     state.project_controller.selected_index = 0;
@@ -18991,6 +19101,10 @@ test "durable projected chat presentation is idempotent and never mints identity
 test "web client chats tile once in the background" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.project_controller.projects = .empty;
     state.project_controller.selected_index = 0;
@@ -19090,6 +19204,10 @@ test "published forced refresh failure cannot poison a newer requested floor" {
 test "activating a thread already visible focuses its pane without changing split geometry" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.app_config = .{ .workspace_scroll_mode = .disabled };
     state.project_controller.projects = .empty;
@@ -19252,6 +19370,10 @@ test "focused chat creation transfers zoom to the new pane" {
 test "sidebar open pane focus keeps the clicked terminal pane maximized" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     // Closing the last chat pane spawns a replacement thread through
     // applyNewChatDefaults, which reads config, model caches, and runtime
@@ -19420,6 +19542,10 @@ test "sidebar open pane focus keeps the clicked terminal pane maximized" {
 test "sidebar pane selection restores a sibling browser URL snapshot" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.project_controller.projects = .empty;
     state.surface_controller = .{};
@@ -19479,6 +19605,10 @@ test "sidebar pane selection restores a sibling browser URL snapshot" {
 test "configured chat web links focus and reveal the Verde browser pane" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.app_config = .{};
     state.project_controller.projects = .empty;
@@ -19532,6 +19662,10 @@ test "configured chat web links focus and reveal the Verde browser pane" {
 test "sidebar and pane cycling preserve zoom while rebinding a browser runtime" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.project_controller.projects = .empty;
     state.surface_controller = .{};
@@ -19582,6 +19716,10 @@ test "sidebar and pane cycling preserve zoom while rebinding a browser runtime" 
 test "workspace selection restores focused pane keyboard ownership" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.app_config = .{};
     state.project_controller.projects = .empty;
@@ -19873,6 +20011,10 @@ test "workspace selection restores focused pane keyboard ownership" {
 test "ordinary browser focus and deletion preserve exact pane runtime ownership" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.app_config = .{};
     state.project_controller.projects = .empty;
@@ -20028,6 +20170,10 @@ test "ordinary browser focus and deletion preserve exact pane runtime ownership"
 test "opening Companion is lazy and leaves workspace ownership and persistence untouched" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.app_config = .{ .companion_enabled = true };
     state.project_controller.projects = .empty;
@@ -20092,6 +20238,10 @@ test "opening Companion is lazy and leaves workspace ownership and persistence u
 test "Companion shared draft follows exact workspace owner without lazy stale text" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.project_controller.projects = .empty;
     state.project_controller.selected_index = 0;
@@ -20179,6 +20329,10 @@ test "Companion shared draft follows exact workspace owner without lazy stale te
 test "Companion frame projects transcript pending streaming lifecycle errors and process owner eviction" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.project_controller.projects = .empty;
     state.project_controller.selected_index = 0;
@@ -20331,6 +20485,10 @@ test "Companion frame projects transcript pending streaming lifecycle errors and
 test "Companion projection scopes global failure posture to the current turn" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.project_controller.projects = .empty;
     state.project_controller.selected_index = 0;
@@ -20427,6 +20585,10 @@ test "Companion projection scopes global failure posture to the current turn" {
 test "Companion production projection rejects lossy identities and preserves owner hierarchy" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.project_controller.projects = .empty;
     state.project_controller.selected_index = 0;
@@ -20533,6 +20695,10 @@ test "Companion production projection rejects lossy identities and preserves own
 test "Companion operation snapshots expose only exact live owner actions" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.project_controller.projects = .empty;
     state.project_controller.selected_index = 0;
@@ -20894,6 +21060,10 @@ test "Companion post-send draft projection rejects a replaced workspace owner" {
 test "visible chat is not treated as focused when a sibling pane owns focus" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.project_controller.projects = .empty;
     state.project_controller.selected_index = 0;
@@ -20963,6 +21133,14 @@ test "initial send snapshot restores retryable draft and attachment" {
     try thread.setDraftImage(allocator, "/tmp/retry.png", "image/png", 42);
 
     var state: AppState = undefined;
+
+    // Fields read by modal key/text routing and new-chat defaults.
+
+    state.folder_browser = .{};
+
+    state.settings_controller.provider_setup = .{};
+
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.image_texture_cache = std.StringHashMap(CachedImageTexture).init(allocator);
     defer state.image_texture_cache.deinit();
@@ -21019,6 +21197,10 @@ test "workspace commands classify conservatively and infer shared resources" {
 test "workspace leases reject conflicts, renew, expire, and enforce ownership" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.project_controller.projects = .empty;
     defer {
@@ -21052,6 +21234,10 @@ test "workspace leases reject conflicts, renew, expire, and enforce ownership" {
 test "terminal teardown releases leases for only the exact session owner" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.project_controller.projects = .empty;
     defer {
@@ -21086,6 +21272,10 @@ test "terminal teardown releases leases for only the exact session owner" {
 test "terminal teardown prefers the revived live session owner" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.project_controller.projects = .empty;
     defer {
@@ -21135,6 +21325,10 @@ test "active TUI replacement retains teardown ownership until confirmed exit" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.project_controller.projects = .empty;
     state.project_controller.selected_index = 0;
@@ -21186,6 +21380,10 @@ test "pending teardown retries outcome retention before releasing its exact-owne
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.project_controller.projects = .empty;
     state.project_controller.selected_index = 0;
@@ -21252,6 +21450,10 @@ test "daemon teardown failures retain exact-owner leases at the state boundary" 
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.project_controller.projects = .empty;
     state.project_controller.selected_index = 0;
@@ -21342,6 +21544,10 @@ test "workspace archive retains active terminal teardown until archived polling 
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.project_controller.projects = .empty;
     state.project_controller.archived_projects = .empty;
@@ -22916,6 +23122,10 @@ test "M5-P4 stalled daemon worker cannot block frame-side bridge drain" {
     }
     if (!server.request_started.load(.acquire)) return error.StallRequestNotStarted;
     var state: AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.storage = &storage;
     state.change_cursor_loop = .{};
     state.daemon_projection_has_saved_state = false;

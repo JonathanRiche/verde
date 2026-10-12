@@ -95,6 +95,10 @@ pub const RichPickerConfig = struct {
     item_action_icon: []const u8 = "",
     item_action_active_icon: []const u8 = "",
     item_action_active: ?ItemBoolFn = null,
+    /// Rows that stay selectable but read as unavailable (for example a
+    /// provider that is not signed in): the label draws in the description
+    /// color.
+    item_muted: ?ItemBoolFn = null,
     /// Group header text per item; consecutive items sharing the same text
     /// render under one header row. Null/empty disables grouping.
     item_group: ?ItemTextFn = null,
@@ -1404,7 +1408,7 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
                 .y = top,
                 .w = label_area_w,
                 .h = label_metrics.line_height,
-            }, label, self.style.text_color, label_metrics.font_size, config.font_role, config.font_id, .{
+            }, label, if (config.item_muted != null and config.item_muted.?(context, row.item)) self.style.description_color else self.style.text_color, label_metrics.font_size, config.font_role, config.font_id, .{
                 .x = x,
                 .y = clip.y,
                 .w = label_area_w,

@@ -2668,6 +2668,10 @@ test "production collapsed and expanded overlays stay inside the window" {
     }) |fixture| {
         theme.applyTheme(fixture[2]);
         var state: runtime.AppState = undefined;
+        // Fields read by modal key/text routing and new-chat defaults.
+        state.folder_browser = .{};
+        state.settings_controller.provider_setup = .{};
+        state.provider_controller = .{};
         state.allocator = allocator;
         state.app_config = .{ .companion_enabled = true };
         state.project_controller = .{};
@@ -2738,6 +2742,14 @@ test "captured scale public render emits a visible complete Companion composer" 
     theme.COLOR_PANEL_MUTED = extreme;
 
     var state: runtime.AppState = undefined;
+
+    // Fields read by modal key/text routing and new-chat defaults.
+
+    state.folder_browser = .{};
+
+    state.settings_controller.provider_setup = .{};
+
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.app_config = .{ .companion_enabled = true };
     state.project_controller = .{};
@@ -2888,6 +2900,10 @@ test "public Companion render retains Frame-backed Run and Activity text" {
     defer theme.applyTheme(1.0);
     theme.applyTheme(1.0);
     var state: runtime.AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.app_config = .{ .companion_enabled = true };
     state.project_controller = .{};
@@ -2980,6 +2996,10 @@ test "public Companion render bounds raw multiline Run and Activity dumps" {
     defer theme.applyTheme(1.0);
     theme.applyTheme(1.0);
     var state: runtime.AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.app_config = .{ .companion_enabled = true };
     state.project_controller = .{};
@@ -3044,6 +3064,10 @@ test "public Companion render surfaces streaming final empty and failed Sprout a
     defer theme.applyTheme(1.0);
     theme.applyTheme(1.0);
     var state: runtime.AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.app_config = .{ .companion_enabled = true };
     state.project_controller = .{};
@@ -3128,6 +3152,10 @@ test "public Companion Result heading follows the active character" {
     defer theme.applyTheme(1.0);
     theme.applyTheme(1.0);
     var state: runtime.AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.app_config = .{ .companion_enabled = true };
     state.project_controller = .{};
@@ -3181,6 +3209,10 @@ test "public Companion render leads with the answer and suppresses metadata-only
     defer theme.applyTheme(1.0);
     theme.applyTheme(1.0);
     var state: runtime.AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.app_config = .{ .companion_enabled = true };
     state.project_controller = .{};
@@ -3249,6 +3281,10 @@ test "public Companion render clears stale failure posture while failed evidence
     defer theme.applyTheme(1.0);
     theme.applyTheme(1.0);
     var state: runtime.AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.app_config = .{ .companion_enabled = true };
     state.project_controller = .{};
@@ -3430,6 +3466,14 @@ test "public Companion render repaints active chrome without reconstructing stat
     second.diff_remove = second.accent;
 
     var state: runtime.AppState = undefined;
+
+    // Fields read by modal key/text routing and new-chat defaults.
+
+    state.folder_browser = .{};
+
+    state.settings_controller.provider_setup = .{};
+
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.app_config = .{ .companion_enabled = true };
     state.project_controller = .{};
@@ -3804,6 +3848,10 @@ test "dedicated hits include Sprout overflow and preserve outside pass through" 
 test "production hit refresh follows one approval projection snapshot" {
     const allocator = std.testing.allocator;
     var state: runtime.AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.app_config = .{ .companion_enabled = true };
     state.project_controller.projects = .empty;
@@ -3858,6 +3906,10 @@ test "production hit refresh follows one approval projection snapshot" {
 test "production hit refresh clears cross-owner approval under contention and retains same owner frame" {
     const allocator = std.testing.allocator;
     var state: runtime.AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.app_config = .{ .companion_enabled = true };
     state.project_controller.projects = .empty;
@@ -3944,6 +3996,10 @@ test "companion chrome draws no border-only commands outside the shared composer
     inline for (.{ @as(f32, 1.0), @as(f32, 1.25) }) |scale| {
         theme.applyTheme(scale);
         var state: runtime.AppState = undefined;
+        // Fields read by modal key/text routing and new-chat defaults.
+        state.folder_browser = .{};
+        state.settings_controller.provider_setup = .{};
+        state.provider_controller = .{};
         state.allocator = allocator;
         state.app_config = .{ .companion_enabled = true };
         state.project_controller = .{};
@@ -4014,6 +4070,10 @@ test "expanded sidecar chrome snaps to device pixels at a fractional scale" {
     defer theme.applyTheme(1.0);
     theme.applyTheme(1.25);
     var state: runtime.AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.app_config = .{ .companion_enabled = true };
     state.project_controller = .{};
@@ -4072,6 +4132,10 @@ test "companion characters produce distinct collapsed and expanded batches at 1.
     inline for (.{ @as(f32, 1.0), @as(f32, 1.25) }) |scale| {
         theme.applyTheme(scale);
         var state: runtime.AppState = undefined;
+        // Fields read by modal key/text routing and new-chat defaults.
+        state.folder_browser = .{};
+        state.settings_controller.provider_setup = .{};
+        state.provider_controller = .{};
         state.allocator = allocator;
         state.app_config = .{ .companion_enabled = true };
         state.project_controller = .{};
@@ -4140,6 +4204,10 @@ test "moss and vireo apply approval paused and failed semantic treatments" {
 
     inline for (.{ app_config.CompanionCharacter.moss, .vireo }) |character| {
         var state: runtime.AppState = undefined;
+        // Fields read by modal key/text routing and new-chat defaults.
+        state.folder_browser = .{};
+        state.settings_controller.provider_setup = .{};
+        state.provider_controller = .{};
         state.allocator = allocator;
         state.app_config = .{ .companion_enabled = true, .companion_character = character };
         state.project_controller = .{};
@@ -4316,6 +4384,10 @@ test "selected inspector renders exact output and omits empty process output" {
     inline for (.{ @as(f32, 1.0), @as(f32, 1.25) }) |scale| {
         theme.applyTheme(scale);
         var state: runtime.AppState = undefined;
+        // Fields read by modal key/text routing and new-chat defaults.
+        state.folder_browser = .{};
+        state.settings_controller.provider_setup = .{};
+        state.provider_controller = .{};
         state.allocator = allocator;
         state.app_config = .{ .companion_enabled = true };
         state.project_controller = .{};
@@ -4577,6 +4649,10 @@ test "Mission Control render and hits share one bounded Frame and exact referenc
     defer theme.applyTheme(1.0);
     theme.applyTheme(1.0);
     var state: runtime.AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.app_config = .{ .companion_enabled = true, .companion_character = .moss };
     state.project_controller = .{};
@@ -4736,6 +4812,14 @@ test "Mission Control routes independent and narrow direct scroll without sideca
     frame.sortOperations();
 
     var state: runtime.AppState = undefined;
+
+    // Fields read by modal key/text routing and new-chat defaults.
+
+    state.folder_browser = .{};
+
+    state.settings_controller.provider_setup = .{};
+
+    state.provider_controller = .{};
     state.allocator = std.testing.allocator;
     // handleWheel gates on the config; leaving it undefined read stale stack bytes.
     state.app_config = .{ .companion_enabled = true };
@@ -4787,6 +4871,10 @@ test "public Mission Control entry preserves workspace state and stale actions r
     defer theme.applyTheme(1.0);
     theme.applyTheme(1.0);
     var state: runtime.AppState = undefined;
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.app_config = .{ .companion_enabled = true, .companion_character = .vireo };
     state.project_controller = .{};
@@ -4938,6 +5026,14 @@ test "Vireo render emits arched brow strokes and viewer-left pupil at fractional
     theme.current_colors = theme.default_colors;
 
     var state: runtime.AppState = undefined;
+
+    // Fields read by modal key/text routing and new-chat defaults.
+
+    state.folder_browser = .{};
+
+    state.settings_controller.provider_setup = .{};
+
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.app_config = .{ .companion_enabled = true, .companion_character = .vireo };
     state.project_controller = .{};
@@ -5004,6 +5100,14 @@ test "disabled Companion removes only presentation routing and re-enables exact 
     theme.applyTheme(1.0);
 
     var state: runtime.AppState = undefined;
+
+    // Fields read by modal key/text routing and new-chat defaults.
+
+    state.folder_browser = .{};
+
+    state.settings_controller.provider_setup = .{};
+
+    state.provider_controller = .{};
     state.allocator = allocator;
     state.app_config = .{ .companion_enabled = false, .companion_character = .moss };
     state.project_controller = .{};
