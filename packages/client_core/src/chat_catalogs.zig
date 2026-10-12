@@ -78,7 +78,7 @@ fn fallback(provider: []const u8) []const []const u8 {
     if (eq(provider, "claude")) return &.{ "fable[1m]", "default", "opus[1m]", "sonnet", "haiku" };
     if (eq(provider, "opencode")) return &.{ "opencode/gpt-5.5", "opencode/gpt-5.4", "opencode/claude-opus-4-7", "opencode/claude-opus-4-6", "opencode/claude-sonnet-4-5", "opencode/gemini-3.1-pro" };
     if (eq(provider, "grok")) return &.{ "default", "grok-4.7", "grok-4.6", "grok-4.5" };
-    if (eq(provider, "muse")) return &.{ "muse-spark-1.3", "muse-spark-1.3-contributor", "muse-spark-1.2", "muse-spark-1.2-contributor" };
+    if (eq(provider, "muse")) return &.{ "muse-wonder-1.0", "muse-spark-1.3", "muse-spark-1.3-contributor", "muse-spark-1.2", "muse-spark-1.2-contributor" };
     if (eq(provider, "pi")) return &.{"default"};
     if (eq(provider, "fx")) return &.{ "default", "openai/gpt-5.2", "openai/gpt-5.4-mini", "openai/gpt-5.1-codex", "anthropic/claude-sonnet-5" };
     if (eq(provider, "cursor")) return &.{ "auto", "grok-4.7-medium", "composer-2.5", "cursor-grok-4.5-high", "claude-opus-4-8-thinking-high", "gpt-5.6-sol-medium", "gpt-5.5-medium", "claude-fable-5-thinking-high", "claude-sonnet-5-thinking-high", "gpt-5.6-terra-medium", "gpt-5.6-luna-medium", "gpt-5.4-medium", "gemini-3.1-pro", "gemini-3.5-flash", "kimi-k3", "glm-5.2-high" };
@@ -160,6 +160,7 @@ fn choiceLabel(id: []const u8) []const u8 {
     if (eq(id, "grok-4.7")) return "Grok 4.7";
     if (eq(id, "grok-4.6")) return "Grok 4.6";
     if (eq(id, "grok-4.5")) return "Grok 4.5";
+    if (eq(id, "muse-wonder-1.0")) return "muse-wonder-1.0";
     if (eq(id, "muse-spark-1.3")) return "muse-spark-1.3";
     if (eq(id, "muse-spark-1.2")) return "muse-spark-1.2";
     if (eq(id, "auto")) return "Auto";

@@ -18,7 +18,7 @@ pub const DEFAULT_CURSOR_MODEL: [:0]const u8 = "grok-4.7-medium";
 pub const DEFAULT_PI_MODEL: [:0]const u8 = "default";
 pub const DEFAULT_FX_MODEL: [:0]const u8 = "default";
 pub const DEFAULT_GROK_MODEL: [:0]const u8 = "grok-4.7";
-pub const DEFAULT_MUSE_MODEL: [:0]const u8 = "muse-spark-1.3-contributor";
+pub const DEFAULT_MUSE_MODEL: [:0]const u8 = "muse-wonder-1.0";
 
 pub const ModelOption = struct {
     label: [:0]const u8,
@@ -228,10 +228,11 @@ const MUSE_CONTRIBUTOR_DESCRIPTION: [:0]const u8 = "Your content, including inte
 /// Static fallback until Muse's `model/list` MSP response is available.
 /// Labels match the TUI catalog (`displayLabel` / `modelId`).
 pub const MUSE_MODEL_OPTIONS = [_]ModelOption{
+    .{ .label = "muse-wonder-1.0", .value = DEFAULT_MUSE_MODEL, .reasoning_supported = true },
     .{ .label = "muse-spark-1.3", .value = "muse-spark-1.3", .reasoning_supported = true },
     .{
         .label = "muse-spark-1.3-contributor",
-        .value = DEFAULT_MUSE_MODEL,
+        .value = "muse-spark-1.3-contributor",
         .description = MUSE_CONTRIBUTOR_DESCRIPTION,
         .reasoning_supported = true,
     },

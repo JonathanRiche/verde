@@ -211,6 +211,7 @@ const MUSE_CONTRIBUTOR_DESCRIPTION =
   'Your content, including inter-session messages, may be used for product improvement.'
 
 const MUSE_MODELS: ModelOption[] = [
+  { label: 'muse-wonder-1.0', value: 'muse-wonder-1.0', efforts: MUSE_EFFORTS },
   { label: 'muse-spark-1.3', value: 'muse-spark-1.3', efforts: MUSE_EFFORTS },
   {
     label: 'muse-spark-1.3-contributor',
