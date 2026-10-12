@@ -16,6 +16,7 @@ const debug_window = @import("debug.zig");
 const settings_modal = @import("settings_modal.zig");
 const runtime_connections = @import("../state/runtime_connections_controller.zig");
 const command_palette = @import("command_palette.zig");
+const folder_browser = @import("folder_browser.zig");
 const agent_prompt_popover = @import("agent_prompt_popover.zig");
 const companion = @import("companion.zig");
 const handoff_sheet = @import("handoff_sheet.zig");
@@ -94,6 +95,8 @@ pub fn refreshPaletteModalHits(state: *runtime.AppState, width: f32, height: f32
     registerWorkspaceSettingsModalHits(state, width, height);
     registerRuntimeWizardModalHits(state, width, height);
     command_palette.registerHits(state, width, height, queueModalHit);
+    // Above the Add Workspace / settings modals that open it.
+    folder_browser.registerHits(state, width, height, queueModalHit);
     registerRuntimeCredentialModalHits(state, width, height);
     registerRuntimeTrustModalHits(state, width, height);
 }
@@ -101,10 +104,12 @@ pub fn refreshPaletteModalHits(state: *runtime.AppState, width: f32, height: f32
 /// Updates command-palette row hover using hits from `refreshPaletteModalHits`.
 pub fn updateCommandPaletteHover(state: *runtime.AppState, x: f32, y: f32) void {
     command_palette.updateHover(state, x, y);
+    folder_browser.updateHover(state, x, y);
 }
 
 /// Routes wheel input to the command palette result list when it is open.
 pub fn handleCommandPaletteWheel(state: *runtime.AppState, width: f32, height: f32, x: f32, y: f32, wheel_y: f32) bool {
+    if (folder_browser.handleWheel(state, x, y, wheel_y)) return true;
     return command_palette.handleWheel(state, width, height, x, y, wheel_y);
 }
 
@@ -230,6 +235,7 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     renderWorkspaceSettingsModal(state, width, height);
     renderRuntimeWizardModal(state, width, height);
     command_palette.render(state, width, height);
+    folder_browser.render(state, width, height);
     renderRuntimeCredentialModal(state, width, height);
     renderRuntimeTrustModal(state, width, height);
     debug_window.render(state, width, height);
@@ -1620,6 +1626,7 @@ fn focusedCursorReadOnly(state: *runtime.AppState) usize {
         .runtime_wizard_device_label => state.runtime_connections.device_label_cursor,
         .runtime_wizard_control_plane_url => state.runtime_connections.control_plane_url_cursor,
         .command_palette => state.command_controller.cursor,
+        .folder_browser => state.folder_browser.cursor,
         .none => 0,
     };
 }
@@ -1718,6 +1725,7 @@ fn focusedValue(state: *runtime.AppState) []const u8 {
         .runtime_wizard_device_label => state.runtime_connections.fieldValue(.device_label),
         .runtime_wizard_control_plane_url => state.runtime_connections.fieldValue(.control_plane_url),
         .command_palette => state.commandPaletteQuery(),
+        .folder_browser => state.folder_browser.query(),
         .none => &[_]u8{},
     };
 }
@@ -2031,6 +2039,17 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             .command_palette_row => command_palette.activateRow(state, hit.index, false),
             .command_palette_action_row => command_palette.runActionRow(state, hit.index),
             .command_palette_row_settings => command_palette.openRowWorkspaceSettings(state, hit.index),
+            .folder_browser_input => focusModalInput(state, .folder_browser, hit.rect, x, clicks),
+            .folder_browser_block,
+            .folder_browser_row,
+            .folder_browser_place,
+            .folder_browser_crumb,
+            .folder_browser_up,
+            .folder_browser_hidden,
+            .folder_browser_cancel,
+            .folder_browser_select,
+            .folder_browser_managed,
+            => folder_browser.handleClick(state, hit.action, hit.index, clicks),
         }
         return true;
     }
@@ -2164,6 +2183,20 @@ pub fn handlePaletteTextInput(state: *runtime.AppState, text: []const u8) bool {
             state.markDirty();
             break :blk inserted;
         },
+        .folder_browser => blk: {
+            // Single-line path/filter: drop control characters from pastes.
+            var sanitized: [256]u8 = undefined;
+            var len: usize = 0;
+            for (text) |byte| {
+                if (byte < 0x20 or byte == 0x7f) continue;
+                if (len == sanitized.len) break;
+                sanitized[len] = byte;
+                len += 1;
+            }
+            const inserted = insertIntoZBuffer(state.folder_browser.queryBuffer(), &state.folder_browser.cursor, sanitized[0..len]);
+            state.markDirty();
+            break :blk inserted;
+        },
         .none => false,
     };
 }
@@ -2204,8 +2237,16 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const palette.even
         state.settings_controller.modal_visible or
         state.workspaceSettingsOpen() or
         state.runtime_connections.wizard_open or
-        state.command_controller.open;
+        state.command_controller.open or
+        state.folder_browser.open;
     if (!has_modal_open) return false;
+    // The folder browser sits above the modal that opened it.
+    if (state.folder_browser.open and
+        !state.runtimeCredentialModalOpen() and
+        state.runtimeTrustProposal() == null)
+    {
+        if (folder_browser.handleKeyDown(state, event)) return true;
+    }
     if (runtimeWizardOwnsKeys(state)) {
         switch (event.key) {
             .tab => {
@@ -2385,6 +2426,10 @@ fn dismissTopModal(state: *runtime.AppState) void {
     }
     if (state.runtimeTrustProposal() != null) {
         state.cancelRuntimeTrust();
+        return;
+    }
+    if (state.folder_browser.open) {
+        state.finishFolderBrowser(null);
         return;
     }
     if (state.runtime_connections.wizard_open) {
@@ -2571,6 +2616,7 @@ fn focusedCursor(state: *runtime.AppState) ?*usize {
         .runtime_wizard_device_label => &state.runtime_connections.device_label_cursor,
         .runtime_wizard_control_plane_url => &state.runtime_connections.control_plane_url_cursor,
         .command_palette => &state.command_controller.cursor,
+        .folder_browser => &state.folder_browser.cursor,
         .none => null,
     };
 }
@@ -2594,6 +2640,7 @@ fn focusedBuffer(state: *runtime.AppState) ?[:0]u8 {
         .runtime_wizard_device_label => state.runtime_connections.fieldBuffer(.device_label),
         .runtime_wizard_control_plane_url => state.runtime_connections.fieldBuffer(.control_plane_url),
         .command_palette => state.commandPaletteQueryBuffer(),
+        .folder_browser => state.folder_browser.queryBuffer(),
         .none => null,
     };
 }
@@ -2617,6 +2664,7 @@ fn focusedTextLen(state: *runtime.AppState) usize {
         .runtime_wizard_device_label => state.runtime_connections.fieldValue(.device_label).len,
         .runtime_wizard_control_plane_url => state.runtime_connections.fieldValue(.control_plane_url).len,
         .command_palette => state.commandPaletteQuery().len,
+        .folder_browser => state.folder_browser.query().len,
         .none => 0,
     };
 }

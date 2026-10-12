@@ -48,6 +48,7 @@ const provider_models = @import("state/provider_models.zig");
 const chat_types = @import("state/chat_types.zig");
 const state_sync = @import("state/sync.zig");
 const state_ui_types = @import("state/ui_types.zig");
+pub const folder_browser = @import("state/folder_browser.zig");
 const herdr_types = @import("state/herdr_types.zig");
 const project_state = @import("state/project.zig");
 const state_storage = @import("state/storage.zig");
@@ -2353,6 +2354,16 @@ pub const PaletteModalAction = enum {
     command_palette_action_row,
     /// Gear on a workspace-switcher row: opens that workspace's settings.
     command_palette_row_settings,
+    folder_browser_block,
+    folder_browser_input,
+    folder_browser_row,
+    folder_browser_place,
+    folder_browser_crumb,
+    folder_browser_up,
+    folder_browser_hidden,
+    folder_browser_cancel,
+    folder_browser_select,
+    folder_browser_managed,
 };
 
 pub const SettingsOpenAction = settings_controller.OpenAction;
@@ -2436,6 +2447,7 @@ pub const PaletteModalTextFocus = enum {
     runtime_wizard_device_label,
     runtime_wizard_control_plane_url,
     command_palette,
+    folder_browser,
 };
 
 /// Composer body text size (CSS units, scaled by `setUiScale`). Public because
@@ -4338,7 +4350,6 @@ const freePendingDiffFilesLocked = utils.freePendingDiffFilesLocked;
 const freePendingTimelineEvents = utils.freePendingTimelineEvents;
 const freePendingTimelineEventsLocked = utils.freePendingTimelineEventsLocked;
 const pendingTimelineEventsContainAssistant = utils.pendingTimelineEventsContainAssistant;
-const pickerWorker = utils.pickerWorker;
 const upsertPendingToolCallEvent = utils.upsertPendingToolCallEvent;
 const uploadTexture = utils.uploadTexture;
 
@@ -4946,7 +4957,11 @@ pub const AppState = struct {
     project_directory_browse_requested: bool,
     project_directory_picker_create_parent: bool,
     project_directory_picker_start_home: bool,
+    /// The folder browser is the Add Workspace flow itself (no creator modal):
+    /// a pick imports directly and it offers a Verde-managed folder.
+    project_directory_picker_adds_workspace: bool,
     picker_state: PickerState,
+    folder_browser: folder_browser.FolderBrowser,
     slash_command_state: SlashCommandState,
     provider_controller: provider_controller.State,
     file_search_controller: file_search_controller.State,
@@ -5170,7 +5185,9 @@ pub const AppState = struct {
             .project_directory_browse_requested = false,
             .project_directory_picker_create_parent = false,
             .project_directory_picker_start_home = false,
+            .project_directory_picker_adds_workspace = false,
             .picker_state = .{},
+            .folder_browser = .{},
             .slash_command_state = .{},
             .provider_controller = .{},
             .file_search_controller = .{},
@@ -6467,7 +6484,10 @@ pub const AppState = struct {
             break :blk created_path.?;
         } else project_path;
 
-        _ = self.createProjectFromPathWithLabel(effective_path, label) catch |err| switch (err) {
+        // An existing folder with no typed name keeps its own folder name;
+        // only Verde-managed workspaces take the numbered default.
+        const project_label: ?[]const u8 = if (entered_label.len > 0 or managed_workspace) label else null;
+        _ = self.createProjectFromPathWithLabel(effective_path, project_label) catch |err| switch (err) {
             error.FileNotFound => {
                 self.setSidebarNotice("Directory not found. Use New folder..., then type a folder name.");
                 self.markDirty();
@@ -6520,41 +6540,74 @@ pub const AppState = struct {
         self.startDirectoryPickerWorker(target_path);
     }
 
-    /// Spawns the shared native folder dialog worker starting at
-    /// `target_path`; `pollPicker` consumes the result on the frame loop.
+    /// Opens the in-app folder browser at `target_path` for every directory
+    /// flow. The choice lands in `picker_state` exactly as the old external
+    /// dialog worker reported it, so `pollPicker` routes it unchanged.
     fn startDirectoryPickerWorker(self: *AppState, target_path: []const u8) void {
-        const page_alloc = std.heap.page_allocator;
-        const owned_target = page_alloc.dupe(u8, target_path) catch {
-            self.setSidebarNotice("Failed to start folder picker.");
-            return;
-        };
-
         self.picker_state.mutex.lock();
         defer self.picker_state.mutex.unlock();
 
         if (self.picker_state.status == .pending) {
-            runtime_log.trace("browseForWorkspaceDirectory ignored: picker already pending", .{});
-            log.info("browseForWorkspaceDirectory ignored: picker already pending", .{});
-            page_alloc.free(owned_target);
-            self.project_directory_picker_create_parent = false;
-            self.setSidebarNotice("Folder picker already open.");
+            log.info("browseForWorkspaceDirectory ignored: picker already open", .{});
             return;
         }
-
         self.picker_state.status = .pending;
         self.picker_state.selected_path = null;
-        self.picker_state.worker = std.Thread.spawn(.{}, pickerWorker, .{ &self.picker_state, owned_target }) catch {
-            page_alloc.free(owned_target);
-            self.picker_state.status = .failed;
-            self.project_directory_picker_create_parent = false;
-            runtime_log.trace("browseForWorkspaceDirectory failed to spawn picker worker", .{});
-            log.warn("browseForWorkspaceDirectory failed to spawn picker worker", .{});
-            self.setSidebarNotice("Failed to start folder picker.");
-            return;
+        const home = platform_paths.userHome(self.allocator) catch self.allocator.dupe(u8, "/") catch return;
+        defer self.allocator.free(home);
+        self.folder_browser.openAt(self.allocator, target_path, home);
+        self.palette_modal_text_focus = .folder_browser;
+        self.modal_text_selection_anchor = null;
+        self.setSidebarNotice("");
+        self.markDirty();
+    }
+
+    /// True when the browser was opened to add a workspace, so it can offer a
+    /// Verde-managed folder instead of a picked one.
+    pub fn folderBrowserOffersManagedWorkspace(self: *const AppState) bool {
+        return self.folder_browser.open and
+            self.project_directory_picker_adds_workspace and
+            !self.project_directory_picker_create_parent and
+            !self.composer_controller.browse_for_chat_directory and
+            self.workspace_folder_picker_id == null;
+    }
+
+    /// Skips picking: closes the browser and adds a workspace in a new
+    /// Verde-managed directory, as a blank folder path in the creator does.
+    pub fn createManagedWorkspaceFromFolderBrowser(self: *AppState) void {
+        if (!self.folderBrowserOffersManagedWorkspace()) return;
+        self.picker_state.mutex.lock();
+        self.picker_state.status = .idle;
+        self.picker_state.mutex.unlock();
+        self.folder_browser.close(self.allocator);
+        self.project_directory_picker_adds_workspace = false;
+        self.modal_text_selection_anchor = null;
+        self.clearImportPath();
+        self.project_import_cursor = 0;
+        self.importProjectFromInput() catch |err| {
+            log.warn("failed to create managed workspace: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Could not create a workspace directory.");
         };
-        runtime_log.trace("browseForWorkspaceDirectory spawned picker worker", .{});
-        log.info("browseForWorkspaceDirectory spawned picker worker", .{});
-        self.setSidebarNotice("Waiting for folder selection...");
+        self.markDirty();
+    }
+
+    /// Completes the folder browser with `path` (null cancels).
+    pub fn finishFolderBrowser(self: *AppState, path: ?[]const u8) void {
+        if (!self.folder_browser.open) return;
+        const owned: ?[]u8 = if (path) |value| std.heap.page_allocator.dupe(u8, value) catch null else null;
+        self.picker_state.mutex.lock();
+        if (owned) |value| {
+            self.picker_state.selected_path = value;
+            self.picker_state.status = .selected;
+        } else {
+            self.picker_state.status = if (path == null) .cancelled else .failed;
+        }
+        self.picker_state.mutex.unlock();
+        self.folder_browser.close(self.allocator);
+        // Return typing to the Add Workspace field the browser was opened from.
+        self.palette_modal_text_focus = if (self.project_controller.show_creator) .project_import else .none;
+        self.modal_text_selection_anchor = null;
+        self.markDirty();
     }
 
     pub fn requestBrowseForProjectDirectory(self: *AppState) void {
@@ -6565,15 +6618,18 @@ pub const AppState = struct {
         self.markDirty();
     }
 
-    /// Add Workspace entry that goes straight to the directory picker: opens the
-    /// creator modal exactly like `openWorkspaceCreator` and queues the same
-    /// browse request the modal's Browse button uses. The picked folder then
-    /// imports through the normal modal path; nothing is created until the user
-    /// actually selects a directory, so cancelling leaves workspaces untouched.
-    /// With an empty draft the picker starts at the user's home directory.
-    pub fn openWorkspaceCreatorWithPicker(self: *AppState, expand_sidebar: bool) void {
-        self.openWorkspaceCreator(expand_sidebar);
+    /// Add Workspace: opens the in-app folder browser at home. Picking a folder
+    /// imports it under its own name, "Let Verde create one" makes a managed
+    /// numbered workspace, and cancelling changes nothing.
+    pub fn openAddWorkspace(self: *AppState, expand_sidebar: bool) void {
+        if (self.project_controller.show_creator) self.cancelProjectImport();
+        if (expand_sidebar) self.setSidebarCollapsed(false);
+        self.clearImportProjectName();
+        self.clearImportPath();
+        self.project_import_name_cursor = 0;
+        self.project_import_cursor = 0;
         self.project_directory_picker_start_home = true;
+        self.project_directory_picker_adds_workspace = true;
         self.requestBrowseForProjectDirectory();
     }
 
@@ -14310,7 +14366,17 @@ pub const AppState = struct {
                 .commit_sheet_file_toggle,
                 .commit_sheet_file_expand,
                 .commit_sheet_hunk_toggle,
+                .folder_browser_row,
+                .folder_browser_place,
+                .folder_browser_crumb,
+                .folder_browser_up,
+                .folder_browser_hidden,
+                .folder_browser_select,
+                .folder_browser_cancel,
+                .folder_browser_managed,
                 => true,
+                .folder_browser_block,
+                .folder_browser_input,
                 .modal_dismiss,
                 .modal_block,
                 .project_rename_input,
@@ -15442,6 +15508,7 @@ pub const AppState = struct {
 
     pub fn deinit(self: *AppState) void {
         runtime_log.diagnostic("AppState.deinit begin", .{});
+        self.folder_browser.deinit(self.allocator);
         self.clearPaletteHistory();
         self.clearTiledWebThreads();
         self.clearPendingMovedThreadTiles();
@@ -15680,6 +15747,7 @@ pub const AppState = struct {
         const create_parent = self.project_directory_picker_create_parent;
         const browse_for_chat_directory = self.composer_controller.browse_for_chat_directory;
         if (next_status != .idle) {
+            self.project_directory_picker_adds_workspace = false;
             self.project_directory_picker_create_parent = false;
             self.composer_controller.browse_for_chat_directory = false;
         }
@@ -15720,9 +15788,9 @@ pub const AppState = struct {
                     }
                 }
             },
-            .cancelled => self.setSidebarNotice("Folder selection cancelled."),
-            .unavailable => self.setSidebarNotice("No supported folder picker found. Install zenity or paste a directory path manually."),
-            .failed => self.setSidebarNotice("Folder picker failed."),
+            .cancelled => self.setSidebarNotice(""),
+            .unavailable => self.setSidebarNotice("Directory browser unavailable."),
+            .failed => self.setSidebarNotice("Directory picker failed."),
             else => {},
         }
     }

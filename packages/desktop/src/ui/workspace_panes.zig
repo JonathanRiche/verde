@@ -451,15 +451,15 @@ fn noWorkspacesActionCount() usize {
 
 fn activateNoWorkspacesAction(state: *runtime.AppState, action: WorkspacePaneAction, index: usize) void {
     switch (action) {
-        .add_workspace => state.openWorkspaceCreator(true),
+        .add_workspace => state.openAddWorkspace(true),
         .open_suggested_workspace => {
             if (index >= no_workspaces_suggestion_count) return;
             const path = no_workspaces_suggestions[index].path();
             _ = state.createProjectFromPath(path) catch |err| {
                 state.setSidebarNotice(switch (err) {
-                    error.FileNotFound => "That folder no longer exists.",
-                    error.ProjectAlreadyExists => "That folder is already a workspace.",
-                    else => "Could not add that folder as a workspace.",
+                    error.FileNotFound => "That directory no longer exists.",
+                    error.ProjectAlreadyExists => "That directory is already a workspace.",
+                    else => "Could not add that directory as a workspace.",
                 });
                 state.markDirty();
                 return;
@@ -1216,7 +1216,12 @@ fn renderNoWorkspaces(state: *runtime.AppState, rect: palette.Rect) void {
     const provider_rows: usize = @max(1, (providers.count + 1) / 2);
     const provider_panel_h = theme.scaledUi(WELCOME_PROVIDER_CELL_H) * @as(f32, @floatFromInt(provider_rows)) + theme.scaledUi(16.0);
 
-    var content_h = theme.scaledUi(42.0) + body_size * 1.5 + theme.scaledUi(22.0) + button_h;
+    const body_lines = [_][]const u8{
+        "A workspace is a project directory your agents work in.",
+        "Its chats, terminals, and browser panes stay together,",
+        "so you can pick up right where you left off.",
+    };
+    var content_h = theme.scaledUi(42.0) + body_size * 1.5 * @as(f32, @floatFromInt(body_lines.len)) + theme.scaledUi(22.0) + button_h;
     if (no_workspaces_suggestion_count > 0) {
         content_h += section_gap + header_h + (suggestion_h + theme.scaledUi(6.0)) * @as(f32, @floatFromInt(no_workspaces_suggestion_count));
     }
@@ -1229,17 +1234,19 @@ fn renderNoWorkspaces(state: *runtime.AppState, rect: palette.Rect) void {
     const title_w = runtime.paletteUiTextPrefixWidth(title, title_size, title.len);
     queueText(state, .{ .x = x + @max(0.0, (content_w - title_w) * 0.5), .y = y, .w = @min(content_w, title_w), .h = title_size * 1.3 }, title, paletteColor(theme.COLOR_WHITE), title_size, rect);
     y += theme.scaledUi(42.0);
-    const body = "Open a project folder as a workspace to start chatting with your agents.";
-    const body_w = runtime.paletteUiTextPrefixWidth(body, body_size, body.len);
-    queueText(state, .{ .x = x + @max(0.0, (content_w - body_w) * 0.5), .y = y, .w = @min(content_w, body_w), .h = body_size * 1.4 }, body, paletteColor(theme.COLOR_TEXT_MUTED), body_size, rect);
-    y += body_size * 1.5 + theme.scaledUi(22.0);
+    for (body_lines) |line| {
+        const line_w = runtime.paletteUiTextPrefixWidth(line, body_size, line.len);
+        queueText(state, .{ .x = x + @max(0.0, (content_w - line_w) * 0.5), .y = y, .w = @min(content_w, line_w), .h = body_size * 1.4 }, line, paletteColor(theme.COLOR_TEXT_MUTED), body_size, rect);
+        y += body_size * 1.5;
+    }
+    y += theme.scaledUi(22.0);
 
-    renderEmptyWorkspaceAction(state, .{ .x = x, .y = y, .w = content_w, .h = button_h }, NF_COD_ADD, "Add workspace folder", "", .add_workspace, true, noWorkspacesSelected(0));
+    renderEmptyWorkspaceAction(state, .{ .x = x, .y = y, .w = content_w, .h = button_h }, NF_COD_ADD, "Create your first workspace", "", .add_workspace, true, noWorkspacesSelected(0));
     y += button_h;
 
     if (no_workspaces_suggestion_count > 0) {
         y += section_gap;
-        renderWelcomeSectionHeader(state, .{ .x = x, .y = y, .w = content_w, .h = header_h }, "SUGGESTED FOLDERS", null);
+        renderWelcomeSectionHeader(state, .{ .x = x, .y = y, .w = content_w, .h = header_h }, "SUGGESTED DIRECTORIES", null);
         y += header_h;
         for (no_workspaces_suggestions[0..no_workspaces_suggestion_count], 0..) |*suggestion, index| {
             renderWelcomeSuggestion(state, .{ .x = x, .y = y, .w = content_w, .h = suggestion_h }, suggestion, index, noWorkspacesSelected(index + 1));
@@ -1375,8 +1382,8 @@ fn renderWelcomeProviders(state: *runtime.AppState, rect: palette.Rect, provider
         };
         const status = switch (readiness) {
             .ready => "Ready",
-            .signed_out => "Sign in",
-            .unavailable => "Unverified",
+            // An unconfirmed login has the same next step as a missing one.
+            .signed_out, .unavailable => "Sign in",
             .missing => "Missing",
             .checking => "Checking",
         };

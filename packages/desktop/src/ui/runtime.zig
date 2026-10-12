@@ -14,6 +14,7 @@ pub const PaletteModalAction = native_state.PaletteModalAction;
 pub const PaletteModalHit = native_state.PaletteModalHit;
 pub const PaletteModalTextFocus = native_state.PaletteModalTextFocus;
 pub const Provider = native_state.Provider;
+pub const FolderBrowser = native_state.folder_browser.FolderBrowser;
 pub const RuntimePickerStatus = native_state.RuntimePickerStatus;
 pub const runtimePickerStatusBadge = native_state.runtimePickerStatusBadge;
 pub const runtimePickerStatusDescription = native_state.runtimePickerStatusDescription;

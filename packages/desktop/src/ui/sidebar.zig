@@ -414,7 +414,7 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             // A hover-revealed rail is hidden: the toggle pins it open.
             .collapse => state.toggleSidebarHidden(),
             .workspace_switcher => state.openWorkspaceSwitcher(),
-            .add_workspace => state.openWorkspaceCreator(true),
+            .add_workspace => state.openAddWorkspace(true),
             .new_thread => {
                 if (state.project_controller.projects.items.len > 0) state.createThreadForProject(@min(hit.project_index, state.project_controller.projects.items.len - 1));
             },

@@ -3313,7 +3313,7 @@ fn handleKeyboardAction(
         .open_default => state.openCurrentProjectEditor(.configured),
         .open_editor => state.openCurrentProjectEditor(.configured),
         .new_thread => _ = openHotkeyWorkspaceChatThread(state),
-        .add_workspace => state.openWorkspaceCreator(true),
+        .add_workspace => state.openAddWorkspace(true),
         .add_workspace_tab => state.addWorkspaceTab(state.project_controller.selected_index, null),
         .add_workspace_tab_terminal => state.addWorkspaceTab(state.project_controller.selected_index, .terminal),
         .command_palette => {

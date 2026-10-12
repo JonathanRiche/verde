@@ -492,7 +492,7 @@ pub fn activateRow(state: *runtime.AppState, row_index: usize, replace: bool) vo
         },
         .new_workspace => {
             state.closeCommandPalette();
-            state.openWorkspaceCreator(false);
+            state.openAddWorkspace(false);
         },
     }
 }
@@ -1720,7 +1720,7 @@ fn runUseLocalRuntimeDefault(state: *runtime.AppState) void {
 }
 
 fn runAddWorkspace(state: *runtime.AppState) void {
-    state.openWorkspaceCreator(true);
+    state.openAddWorkspace(true);
 }
 
 fn runRenameWorkspace(state: *runtime.AppState) void {
