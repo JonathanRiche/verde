@@ -89,6 +89,8 @@ struct CompanionBubbleLayer: View {
     let model: CompanionModel
     /// Hold-to-talk: the transcript is handed to the sheet (`pendingPrompt`), which sends it.
     let voice: CompanionVoice
+    /// Live conversation: double-tap starts it, a tap ends it.
+    let live: LiveVoice
     /// The sheet is open: hide the bubble and poll faster.
     let sheetOpen: Bool
     /// Hidden on the companion's own chat screen, the drawer, etc. (polling continues).
@@ -110,6 +112,8 @@ struct CompanionBubbleLayer: View {
     @State private var pressStart = Date()
     @State private var holdTask: Task<Void, Never>?
     @State private var cancelArmed = false
+    /// A first tap waiting to see whether a second one makes it a double-tap.
+    @State private var tapTask: Task<Void, Never>?
 
     private var edge: BubbleEdge { BubbleEdge(rawValue: edgeRaw) ?? .trailing }
     private var pollKey: String { [model.browse.hostID ?? "", String(scenePhase == .active), String(sheetOpen), String(hidden)].joined(separator: "/") }
@@ -156,15 +160,16 @@ struct CompanionBubbleLayer: View {
             pressStart = Date()
             cancelArmed = false
             holdTask?.cancel()
-            holdTask = Task { @MainActor in
+            // Push-to-talk is off while a live conversation runs.
+            if !live.active { holdTask = Task { @MainActor in
                 try? await Task.sleep(for: .milliseconds(Int(PressRules.holdDelay * 1000)))
                 guard !Task.isCancelled, press == .undecided else { return }
                 startTalking()
-            }
+            } }
         }
         let current = press ?? .undecided
         let next = classifyPress(current, elapsed: Date().timeIntervalSince(pressStart), distance: distance(value))
-        if current == .undecided && next == .talk { startTalking() }
+        if current == .undecided && next == .talk && !live.active { startTalking() }
         if current == .undecided && next == .reposition { press = .reposition; holdTask?.cancel(); chip = nil }
         switch press {
         case .reposition?: drag = clamped(value.location, layout)
@@ -210,7 +215,31 @@ struct CompanionBubbleLayer: View {
                 }
             }
         case .undecided:
-            if distance(value) <= PressRules.slop { open() }
+            guard distance(value) <= PressRules.slop else { return }
+            tapped()
+        }
+    }
+
+    /// Tap opens the sheet, double-tap starts Live; while Live, a tap ends it.
+    private func tapped() {
+        if live.active {
+            tapTask?.cancel(); tapTask = nil
+            live.end()
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            return
+        }
+        if let pending = tapTask {
+            pending.cancel()
+            tapTask = nil
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            Task { await live.start() }
+            return
+        }
+        tapTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(Int(PressRules.doubleTapWindow * 1000)))
+            guard !Task.isCancelled else { return }
+            tapTask = nil
+            open()
         }
     }
 
@@ -243,7 +272,16 @@ struct CompanionBubbleLayer: View {
         let badge = model.badgeCount
         let running = model.crew.contains { $0.attention == .running } || presence.pose == .working
         let d = layout.diameter
+        let liveOn = live.active
+        let liveLevel = max(live.inputLevel, live.outputLevel)
+        let still = reduceMotion || AppearanceSettings.shared.reducedMotion
         return ZStack {
+            if liveOn {
+                // Level ring while Live.
+                Circle().stroke(VerdeTheme.accent.opacity(0.35 + 0.5 * liveLevel), lineWidth: 4)
+                    .scaleEffect(still ? 1.12 : 1.08 + 0.25 * liveLevel)
+                    .animation(still ? nil : .easeOut(duration: 0.12), value: liveLevel)
+            }
             Circle().fill(VerdeTheme.panel)
                 .shadow(color: .black.opacity(0.28), radius: 6, y: 3)
             Circle().stroke(running ? VerdeTheme.accent : VerdeTheme.border, lineWidth: running ? 2 : 1)
@@ -259,6 +297,16 @@ struct CompanionBubbleLayer: View {
                     .background(VerdeTheme.danger, in: Capsule())
                     .overlay(Capsule().stroke(VerdeTheme.background, lineWidth: 1.5))
                     .offset(x: 4, y: -4)
+            }
+        }
+        .overlay(alignment: .bottom) {
+            if liveOn {
+                Text(live.phase == .connecting ? "…" : "Live")
+                    .font(VerdeTheme.ui(10, bold: true)).foregroundStyle(VerdeTheme.background)
+                    .padding(.horizontal, 6).padding(.vertical, 1)
+                    .background(VerdeTheme.accent, in: Capsule())
+                    .offset(y: 8)
+                    .allowsHitTesting(false)
             }
         }
         .overlay(alignment: edge == .leading ? .leading : .trailing) {
@@ -294,10 +342,11 @@ struct CompanionBubbleLayer: View {
         .contentShape(Circle())
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(bubbleAccessibilityLabel(name: active.name, count: badge))
-        .accessibilityValue(voice.listening ? "Listening" : voice.speaking ? "Speaking" : presence.status)
-        .accessibilityHint("Opens your companion. Touch and hold to talk; the mic is also in the companion sheet.")
+        .accessibilityValue(liveOn ? "Live conversation" : voice.listening ? "Listening" : voice.speaking ? "Speaking" : presence.status)
+        .accessibilityHint(liveOn ? "Ends the live conversation." : "Opens your companion. Touch and hold to talk, or use the Talk live action.")
         .accessibilityAddTraits(.isButton)
-        .accessibilityAction { open() }
+        .accessibilityAction { if liveOn { live.end() } else { open() } }
+        .accessibilityAction(named: liveOn ? "End live conversation" : "Talk live") { live.toggle() }
         .accessibilityAction(named: "Settings") { settings() }
         .accessibilityAction(named: "Hide bubble") { hidden = true }
         .accessibilityIdentifier("companion-bubble")

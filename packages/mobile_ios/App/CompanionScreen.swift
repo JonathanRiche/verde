@@ -8,6 +8,7 @@ struct CompanionSheet: View {
     let model: CompanionModel
     let browse: BrowseModel
     let voice: CompanionVoice
+    let live: LiveVoice
     let open: (BrowseRoute) -> Void
     let onHosts: () -> Void
     @State private var settings = false
@@ -35,7 +36,13 @@ struct CompanionSheet: View {
 
     private func content(_ active: RosterEntry) -> some View {
         VStack(spacing: 0) {
-            CompanionHeader(model: model, entry: active, presence: model.presence) { settings = true }
+            CompanionHeader(model: model, live: live, entry: active, presence: model.presence) { settings = true }
+            if live.active {
+                LiveVoicePanel(live: live)
+            } else if let failure = live.failure {
+                Text(failure).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.warning)
+                    .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16).padding(.bottom, 6)
+            }
             CompanionBoard(needsYou: model.needsYou, crew: model.crew, open: open)
             Divider().overlay(VerdeTheme.border)
             if let conversation = model.conversation {
@@ -58,6 +65,7 @@ struct CompanionSheet: View {
 /// Compact header: avatar, name, status, companion switcher and settings.
 private struct CompanionHeader: View {
     let model: CompanionModel
+    let live: LiveVoice
     let entry: RosterEntry
     let presence: CompanionPresence
     let openSettings: () -> Void
@@ -77,6 +85,12 @@ private struct CompanionHeader: View {
             .accessibilityElement(children: .combine)
             Spacer(minLength: 4)
             let companions = model.roster?.companions ?? []
+            Button { live.toggle() } label: {
+                Image(systemName: live.active ? "waveform.circle.fill" : "waveform").frame(width: 44, height: 44)
+            }
+            .accessibilityLabel(live.active ? "End live conversation" : "Talk live")
+            .accessibilityHint(live.active ? "" : "Starts a real-time voice conversation with \(entry.name).")
+            .accessibilityIdentifier("companion-live")
             if companions.count > 1 {
                 Menu {
                     ForEach(companions) { other in
@@ -365,6 +379,7 @@ struct CompanionSettings: View {
                 }
                 brain
                 CompanionVoiceSettings()
+                LiveVoiceSettings(browse: browse)
                 roster
                 Section {
                     Toggle("Show the floating bubble", isOn: Binding(get: { !bubbleHidden }, set: { bubbleHidden = !$0 }))

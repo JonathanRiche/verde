@@ -24,6 +24,8 @@ final class CompanionVoice {
     var notice: String?
     /// A transcript from the bubble, sent by the sheet's composer once it opens.
     var pendingPrompt: String?
+    /// Live voice owns audio: no reading aloud meanwhile.
+    @ObservationIgnored var suspended = false
 
     var listening: Bool { phase == .starting || phase == .listening }
 
@@ -58,6 +60,7 @@ final class CompanionVoice {
     @discardableResult
     func start() async -> Bool {
         guard phase == .idle else { return phase == .listening || phase == .starting }
+        guard !suspended else { notice = "End the live conversation to use the mic."; return false }
         stopSpeaking() // Barge-in.
         notice = nil
         partial = ""
@@ -220,7 +223,7 @@ final class CompanionVoice {
     // MARK: Speaking
 
     func speak(_ sentence: String) {
-        guard !sentence.isEmpty, !listening else { return }
+        guard !sentence.isEmpty, !listening, !suspended else { return }
         if !audioActive { try? activateAudio(recording: false) }
         let utterance = AVSpeechUtterance(string: sentence)
         let stored = UserDefaults.standard.object(forKey: CompanionVoiceStore.rateKey) as? Double ?? 1
@@ -263,6 +266,7 @@ final class CompanionVoice {
     /// Speaks new assistant text in the companion chat, sentence by sentence as it streams.
     /// The first look only records where the conversation is, so history is never read.
     func observe(rows: [ChatRow], turnActive: Bool, policy: ReadAloud) {
+        guard !suspended else { primed = false; return }
         let last = rows.last { $0.role == "assistant" && $0.kind == "message" }
         guard primed else { primed = true; baseline = last?.id; return }
         guard let last, last.id != baseline, !muted.contains(last.id) else { return }

@@ -134,6 +134,8 @@ enum PressRules {
     static let slop: CGFloat = 10
     /// Dragging this far from where a talk began cancels it on release.
     static let cancelDistance: CGFloat = 80
+    /// A second tap within this window makes a double-tap (starts Live on the bubble).
+    static let doubleTapWindow: TimeInterval = 0.28
 }
 
 func classifyPress(_ current: PressIntent, elapsed: TimeInterval, distance: CGFloat) -> PressIntent {

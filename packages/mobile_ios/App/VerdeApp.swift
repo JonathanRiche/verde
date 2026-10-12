@@ -14,7 +14,9 @@ struct VerdeApp: App {
     @State private var push: PushRegistry
     @State private var companion: CompanionModel
     /// Companion voice (speech-to-text and spoken replies), shared by the bubble and the sheet.
-    @State private var companionVoice = CompanionVoice()
+    @State private var companionVoice: CompanionVoice
+    /// Real-time voice conversation with the Companion.
+    @State private var live: LiveVoice
 
     init() {
         SharedFile.cleanup()
@@ -35,12 +37,16 @@ struct VerdeApp: App {
         _hosts = State(initialValue: hosts)
         let browse = BrowseModel(hosts: hosts, cache: hosts.cache)
         _browse = State(initialValue: browse)
-        _companion = State(initialValue: CompanionModel(browse: browse))
+        let companion = CompanionModel(browse: browse)
+        let voice = CompanionVoice()
+        _companion = State(initialValue: companion)
+        _companionVoice = State(initialValue: voice)
+        _live = State(initialValue: LiveVoice(companion: companion, speech: voice))
         _push = State(initialValue: push)
     }
 
     var body: some Scene {
-        WindowGroup { RootView(hosts: hosts, browse: browse, push: push, companion: companion, companionVoice: companionVoice) }
+        WindowGroup { RootView(hosts: hosts, browse: browse, push: push, companion: companion, companionVoice: companionVoice, live: live) }
     }
 }
 
@@ -56,6 +62,7 @@ struct RootView: View {
     let push: PushRegistry
     let companion: CompanionModel
     let companionVoice: CompanionVoice
+    let live: LiveVoice
     @State private var inbox = PushInbox.shared
     /// A notification's chat, opened once the host switch has cleared the old routes.
     @State private var routeAfterSwitch: BrowseRoute?
@@ -100,11 +107,11 @@ struct RootView: View {
                     .transition(.move(edge: .leading))
                 }
                 if companion.available {
-                    CompanionBubbleLayer(model: companion, voice: companionVoice, sheetOpen: companionSheet, visible: bubbleVisible,
+                    CompanionBubbleLayer(model: companion, voice: companionVoice, live: live, sheetOpen: companionSheet, visible: bubbleVisible,
                                          open: { companionSheet = true }, settings: { companionSettings = true })
                         .zIndex(3)
                         .sheet(isPresented: $companionSheet) {
-                            CompanionSheet(model: companion, browse: browse, voice: companionVoice, open: { route in
+                            CompanionSheet(model: companion, browse: browse, voice: companionVoice, live: live, open: { route in
                                 companionSheet = false
                                 if tab == .hosts { tab = .home }
                                 drawer = false
@@ -158,6 +165,7 @@ struct RootView: View {
             hosts.foreground(false)
             companionVoice.cancel()
             companionVoice.stopSpeaking()
+            live.end()
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
             lock.phase(.active)
@@ -166,6 +174,7 @@ struct RootView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in lock.inactive = true }
         .onChange(of: hosts.active) { _, _ in
+            live.end()
             // Routes belong to the previous host's projections.
             path = routeAfterSwitch.map { [$0] } ?? []
             routeAfterSwitch = nil

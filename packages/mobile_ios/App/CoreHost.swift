@@ -171,6 +171,30 @@ actor CoreHost {
 
     /// The actor stamps time at delivery, including user intents and async completions.
     func send(_ event: Event) throws {
+        var shutdown = false
+        if case .shutdown = event { shutdown = true }
+        try deliver(recoverable: Self.recoverable(event), shutdown: shutdown) {
+            let encoded = try JSONEncoder().encode(event)
+            guard case .object(let object) = try JSONDecoder().decode(JSONValue.self, from: encoded) else {
+                throw CoreBridgeError.invalidOutput
+            }
+            return object
+        }
+    }
+
+    /// A user intent this build's generated models don't describe yet: `type` plus its fields
+    /// (e.g. live voice). Like every user intent, a core rejection is recoverable, which includes
+    /// an older core that doesn't know `type`.
+    func sendIntent(_ type: String, _ fields: [String: JSONValue]) throws {
+        try deliver(recoverable: true, shutdown: false) {
+            var object = fields
+            object["type"] = .string(type)
+            if object["api_version"] == nil { object["api_version"] = .integer(1) }
+            return object
+        }
+    }
+
+    private func deliver(recoverable: Bool, shutdown: Bool, _ build: () throws -> [String: JSONValue]) throws {
         guard !stopped else { throw CoreBridgeError.closed }
         if pump == nil {
             let events = self.events
@@ -179,22 +203,19 @@ actor CoreHost {
             }
         }
         do {
-            let encoded = try JSONEncoder().encode(event)
-            guard case .object(var object) = try JSONDecoder().decode(JSONValue.self, from: encoded) else {
-                throw CoreBridgeError.invalidOutput
-            }
+            var object = try build()
             object["now_ms"] = .integer(Int64(ProcessInfo.processInfo.systemUptime * 1000))
             object["wall_time_ms"] = .integer(Int64(Date().timeIntervalSince1970 * 1000))
             let output: Data
             do { output = try core.handle(JSONEncoder().encode(JSONValue.object(object))) }
-            catch CoreBridgeError.status(let status) where Self.recoverable(event) && (status == 1 || status == 4 || status == 5) {
+            catch CoreBridgeError.status(let status) where recoverable && (status == 1 || status == 4 || status == 5) {
                 // Transactional input/lifecycle/resource rejection returns no
                 // effects and leaves the handle usable (e.g. a malformed link).
                 throw RejectedEvent(status: status)
             }
             let batch = try JSONDecoder().decode(EffectList.self, from: output)
             try dispatch(batch.effects)
-            if case .shutdown = event { finish() }
+            if shutdown { finish() }
         } catch let rejected as RejectedEvent {
             throw CoreBridgeError.rejected(rejected.status)
         } catch {
