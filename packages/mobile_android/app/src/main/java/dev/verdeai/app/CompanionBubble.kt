@@ -162,7 +162,7 @@ internal class BubblePrefs private constructor(context: Context) {
         preferences.getFloat("fraction", DEFAULT_BUBBLE_FRACTION).coerceIn(0f, 1f)))
         private set
 
-    fun setHidden(value: Boolean) {
+    fun updateHidden(value: Boolean) {
         hidden = value
         preferences.edit().putBoolean("hidden", value).apply()
     }
@@ -188,7 +188,7 @@ internal fun CompanionBubbleSetting() {
     val context = LocalContext.current
     val prefs = remember(context) { BubblePrefs.of(context) }
     VerdeSection("Companion")
-    Row(Modifier.fillMaxWidth().toggleable(!prefs.hidden, role = Role.Switch) { prefs.setHidden(!it) }
+    Row(Modifier.fillMaxWidth().toggleable(!prefs.hidden, role = Role.Switch) { prefs.updateHidden(!it) }
         .padding(vertical = 12.dp).testTag("companion-bubble-setting"), verticalAlignment = Alignment.CenterVertically) {
         Column(Modifier.weight(1f).padding(end = 16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text("Show companion bubble", style = MaterialTheme.typography.bodyLarge)
@@ -239,7 +239,7 @@ internal fun CompanionBubbleLayer(
     LaunchedEffect(shown) { if (!shown) popup = null }
     if (!shown) return
     CompanionBubble(prefs, name, character, pose, needKeys.size, running, popup?.second,
-        onOpen = { popup = null; onOpen() }, onHide = { popup = null; prefs.setHidden(true) }, onSettings = onSettings)
+        onOpen = { popup = null; onOpen() }, onHide = { popup = null; prefs.updateHidden(true) }, onSettings = onSettings)
 }
 
 @OptIn(ExperimentalFoundationApi::class, ExperimentalMaterial3Api::class)
