@@ -1248,6 +1248,42 @@ data class EventCompanionSave(
 ) : Event()
 
 @Serializable
+@SerialName("voice_providers_refresh")
+data class EventVoiceProvidersRefresh(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+) : Event()
+
+@Serializable
+@SerialName("voice_provider_configure")
+data class EventVoiceProviderConfigure(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `provider`: String,
+    val `api_key`: String? = null,
+    val `model`: String? = null,
+    val `voice`: String? = null,
+    val `make_default`: Boolean? = null,
+) : Event()
+
+@Serializable
+@SerialName("voice_session_create")
+data class EventVoiceSessionCreate(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `provider`: String? = null,
+    val `model`: String? = null,
+    val `voice`: String? = null,
+    val `companion_id`: String? = null,
+) : Event()
+
+@Serializable
 @SerialName("companion_crew_refresh")
 data class EventCompanionCrewRefresh(
     val `api_version`: Long = 1,
@@ -2381,5 +2417,70 @@ data class CompanionQuery(
     val `api_version`: Long,
     val `revision`: String,
     val `data`: CompanionView?,
+    val `error`: LocalError?,
+)
+
+@Serializable
+data class VoiceProvider(
+    val `id`: String = "",
+    val `label`: String = "",
+    val `protocol`: String = "",
+    val `configured`: Boolean = false,
+    val `key_source`: String = "none",
+    val `model`: String = "",
+    val `voice`: String = "",
+    val `voices`: List<String> = emptyList(),
+)
+
+@Serializable
+data class VoiceTool(
+    val `name`: String = "",
+    val `description`: String = "",
+    val `parameters`: String = "{}",
+)
+
+@Serializable
+data class VoiceSessionCompanion(
+    val `id`: String = "",
+    val `name`: String = "",
+    val `home_workspace_id`: String = "",
+    val `thread_id`: String = "",
+)
+
+@Serializable
+data class VoiceSession(
+    val `intent_id`: String,
+    val `status`: String = "pending",
+    val `error_code`: String? = null,
+    val `provider`: String = "",
+    val `protocol`: String = "",
+    val `model`: String = "",
+    val `voice`: String = "",
+    val `token`: String = "",
+    val `expires_at_ms`: Long = 0,
+    val `websocket_url`: String = "",
+    val `auth`: String = "",
+    val `instructions`: String = "",
+    val `tools`: List<VoiceTool> = emptyList(),
+    val `companion`: VoiceSessionCompanion,
+)
+
+@Serializable
+data class VoiceView(
+    val `loaded`: Boolean = false,
+    val `loading`: Boolean = false,
+    val `configuring`: Boolean = false,
+    val `supported`: Boolean = true,
+    val `default_provider`: String? = null,
+    val `providers`: List<VoiceProvider> = emptyList(),
+    val `session`: VoiceSession? = null,
+    val `error`: LocalError? = null,
+)
+
+@Serializable
+data class VoiceQuery(
+    val `api_version`: Long,
+    val `revision`: String,
+    val `data`: VoiceView?,
     val `error`: LocalError?,
 )

@@ -9,6 +9,8 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- Companion voice: asked on the first hold-to-talk, used only while the user is talking. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Live voice: communication mode and speaker routing while a live conversation runs. -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
     <!-- Android 11+ package visibility for the speech recognizer and text-to-speech services. -->
     <queries>

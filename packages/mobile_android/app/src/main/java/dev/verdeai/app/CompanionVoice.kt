@@ -492,6 +492,9 @@ internal class CompanionVoice(private val context: Context) : ViewModel() {
     private var borrowed: TranscriptModel? = null
 
     val policy: ReadAloud get() = effectiveReadAloud(prefs.readAloud, talkBackOn(context))
+    /** Live voice is talking: replies are never read aloud on top of it. */
+    var suppressed = false
+        set(value) { field = value; if (value) stopSpeaking() }
 
     /** Starts listening for [model]'s chat. [liveDraft] writes partials into its composer (sheet mic). */
     fun press(model: TranscriptModel, liveDraft: Boolean) {
@@ -582,7 +585,7 @@ internal class CompanionVoice(private val context: Context) : ViewModel() {
                 if (current == ReadAloud.Always && !tracker.armed && turnActive && !turnWasActive) tracker.armAtTurn(rows, now)
                 turnWasActive = turnActive
                 val sentences = tracker.next(rows, turnActive, now)
-                if (sentences.isNotEmpty() && shouldReadReply(current, tracker.voiceTurn, doNotDisturb(context))) {
+                if (sentences.isNotEmpty() && !suppressed && shouldReadReply(current, tracker.voiceTurn, doNotDisturb(context))) {
                     output.configure(prefs.rate, prefs.voiceName)
                     sentences.forEach(output::speak)
                 }

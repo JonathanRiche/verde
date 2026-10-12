@@ -12,6 +12,7 @@ import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.awaitTouchSlopOrCancellation
 import androidx.compose.foundation.gestures.drag
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
@@ -225,6 +226,9 @@ internal class BubbleTalk(
     val clearError: () -> Unit,
 )
 
+/** Live (real-time) voice hooks for the bubble: double-tap starts, tap ends. */
+internal class BubbleLive(val active: Boolean, val level: Float, val caption: String?, val toggle: () -> Unit)
+
 /** What the speech chip says while talking: live words, cancel hint, or sending. */
 internal fun talkChip(state: TalkState): String? = when (state) {
     TalkState.Idle -> null
@@ -252,6 +256,7 @@ internal fun CompanionBubbleLayer(
     replyAt: Long?,
     replyText: () -> String?,
     talk: BubbleTalk?,
+    live: BubbleLive? = null,
     onOpen: () -> Unit,
 ) {
     val context = LocalContext.current
@@ -275,9 +280,18 @@ internal fun CompanionBubbleLayer(
     val talkError = talk?.error
     LaunchedEffect(talkError) { if (talkError != null) { delay(BUBBLE_POPUP_MS); talk?.clearError() } }
     if (!shown) return
-    val chip = talk?.let { talkChip(it.state) } ?: talkError ?: popup?.second
-    CompanionBubble(prefs, name, character, pose, needKeys.size, running, chip, talk,
-        onOpen = { popup = null; talk?.stopSpeaking(); onOpen() }, onHide = { popup = null; prefs.updateHidden(true) })
+    val liveOn = live?.takeIf { it.active }
+    val chip = if (liveOn != null) "Live" + (liveOn.caption?.takeIf { it.isNotBlank() }?.let { " \u00b7 $it" } ?: "")
+        else talk?.let { talkChip(it.state) } ?: talkError ?: popup?.second
+    CompanionBubble(prefs, name, character, pose, needKeys.size, running, chip, talk, live,
+        // While Live, a tap ends it; otherwise it opens the sheet.
+        onOpen = {
+            popup = null
+            talk?.stopSpeaking()
+            val ending = live?.takeIf { it.active }
+            if (ending != null) ending.toggle() else onOpen()
+        },
+        onHide = { popup = null; prefs.updateHidden(true) })
 }
 
 private enum class BubbleGesture { Tap, Drag, Hold }
@@ -285,12 +299,13 @@ private enum class BubbleGesture { Tap, Drag, Hold }
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun CompanionBubble(prefs: BubblePrefs, name: String, character: CompanionCharacter, pose: CompanionPose, count: Int,
-    running: Boolean, chip: String?, talk: BubbleTalk?, onOpen: () -> Unit, onHide: () -> Unit) {
+    running: Boolean, chip: String?, talk: BubbleTalk?, live: BubbleLive?, onOpen: () -> Unit, onHide: () -> Unit) {
     val context = LocalContext.current
     val reduced = remember(context) { reducedMotion(context) }
     val haptics = LocalHapticFeedback.current
     val currentTalk by rememberUpdatedState(talk)
     val currentOpen by rememberUpdatedState(onOpen)
+    val currentLive by rememberUpdatedState(live)
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val density = LocalDensity.current
         val direction = LocalLayoutDirection.current
@@ -346,7 +361,16 @@ private fun CompanionBubble(prefs: BubblePrefs, name: String, character: Compani
                             if (slop == null) BubbleGesture.Tap else { moved = slop; BubbleGesture.Drag }
                         } ?: BubbleGesture.Hold
                         when (gesture) {
-                            BubbleGesture.Tap -> currentOpen()
+                            BubbleGesture.Tap -> {
+                                // Double-tap toggles Live; a single tap (or any tap while Live) opens / ends.
+                                val liveHooks = currentLive
+                                if (liveHooks == null || liveHooks.active) currentOpen()
+                                else {
+                                    val second = withTimeoutOrNull(viewConfiguration.doubleTapTimeoutMillis) { awaitFirstDown() }
+                                    if (second == null) currentOpen()
+                                    else { second.consume(); waitForUpOrCancellation(); liveHooks.toggle() }
+                                }
+                            }
                             BubbleGesture.Drag -> {
                                 dragging = true
                                 moved?.let { first -> val delta = first.positionChange(); scope.launch { position.snapTo(position.value + delta) } }
@@ -386,11 +410,13 @@ private fun CompanionBubble(prefs: BubblePrefs, name: String, character: Compani
                             true
                         })
                         if (talk?.speaking == true) add(CustomAccessibilityAction("Stop speaking") { talk?.stopSpeaking(); true })
+                        if (live != null) add(CustomAccessibilityAction(if (live.active) "End live voice" else "Start live voice") { live.toggle(); true })
                         add(CustomAccessibilityAction("Hide bubble") { onHide(); true })
                     }
                 }
                 .testTag(COMPANION_BUBBLE)) {
-                if (running || talking) RunningRing(reduced)
+                val liveOn = live?.active == true
+                if (liveOn) LiveRing(live?.level ?: 0f) else if (running || talking) RunningRing(reduced)
                 Box(Modifier.align(Alignment.Center).size(50.dp)
                     .background(if (talking) VerdeColors.AccentWash else VerdeColors.Panel, CircleShape)
                     .border(1.dp, if (talking) VerdeColors.Accent else if (count > 0) VerdeColors.Warning else VerdeColors.Border, CircleShape),
@@ -405,6 +431,13 @@ private fun CompanionBubble(prefs: BubblePrefs, name: String, character: Compani
             }
         }
     }
+}
+
+/** Live: an accent ring that swells with the conversation's loudness. */
+@Composable
+private fun BoxScope.LiveRing(level: Float) {
+    val width by androidx.compose.animation.core.animateDpAsState((2f + 4f * level.coerceIn(0f, 1f)).dp, label = "Live ring")
+    Box(Modifier.matchParentSize().border(width, VerdeColors.Accent, CircleShape))
 }
 
 /** Microphone level as four small bars. */

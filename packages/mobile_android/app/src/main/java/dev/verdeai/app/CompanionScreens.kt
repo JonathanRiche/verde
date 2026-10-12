@@ -105,6 +105,9 @@ internal fun CompanionSheet(
     transcript: TranscriptModel? = null,
     voice: CompanionVoice? = null,
     onHideBubble: () -> Unit = {},
+    /** Real-time voice; [onLive] starts or ends it (the shell checks the mic permission). */
+    live: LiveVoice? = null,
+    onLive: () -> Unit = {},
     onDismiss: () -> Unit,
 ) {
     val state by companion.state.collectAsState()
@@ -119,6 +122,8 @@ internal fun CompanionSheet(
     val workspaces = browseState.workspaces?.items.orEmpty()
     val online = browseState.host?.phase == "ready" && browseState.networkAvailable
     val thread = active?.thread_id?.takeIf { it.isNotEmpty() }
+    val liveUi = live?.ui?.collectAsState()?.value
+    val liveSupported = live?.voice?.collectAsState()?.value?.supported != false
     val transcriptState = transcript?.state?.collectAsState()?.value
     val working = transcriptState?.turn != null || snapshot.pulse.running > 0
     val pose = companionPose(online, snapshot.needKeys.isNotEmpty() || transcriptState?.thread?.approval != null, working)
@@ -131,12 +136,15 @@ internal fun CompanionSheet(
                 return@Column
             }
             CompanionHeader(active, state.roster, pose, companionStatusLine(snapshot.pulse.copy(needsYou = snapshot.needKeys.size)), enabled = state.view?.can_edit == true && !state.saving,
-                onSwitch = companion::switchTo, onSettings = { settings = true }, onActivity = onActivity, onHideBubble = onHideBubble)
+                onSwitch = companion::switchTo, onSettings = { settings = true }, onActivity = onActivity, onHideBubble = onHideBubble,
+                liveActive = liveUi?.active == true, onLive = if (live != null && liveSupported) onLive else null)
             if (snapshot.needs.isNotEmpty()) NeedsYou(snapshot.needs, workspaces, onOpenPane, onActivity)
             if (snapshot.crew.isNotEmpty()) Crew(snapshot.crew, workspaces) { onOpenChat(it.workspace_id, it.local_thread_id) }
             HorizontalDivider(color = VerdeColors.Border)
             Box(Modifier.weight(1f).fillMaxWidth()) {
                 when {
+                    live != null && liveUi != null && (liveUi.active || liveUi.phase == LivePhase.Failed) ->
+                        LivePanel(live, active.name.ifBlank { "your companion" })
                     transcript != null && transcriptState != null -> {
                         val knownThreads = workspaces.find { it.workspace_id == active.home_workspace_id }?.threads.orEmpty() +
                             workspaces.filter { it.workspace_id != active.home_workspace_id }.flatMap { it.threads }
@@ -156,7 +164,7 @@ internal fun CompanionSheet(
             }
         }
     }
-    if (settings && active != null) CompanionSettingsSheet(companion, manage, browseState, voice) { settings = false }
+    if (settings && active != null) CompanionSettingsSheet(companion, manage, browseState, voice, live) { settings = false }
 }
 
 @Composable
@@ -179,7 +187,8 @@ private fun CompanionPlaceholder(state: CompanionUiState, hasWorkspace: Boolean)
 
 @Composable
 private fun CompanionHeader(active: CompanionEntry, roster: CompanionRoster?, pose: CompanionPose, status: String, enabled: Boolean,
-    onSwitch: (String) -> Unit, onSettings: () -> Unit, onActivity: () -> Unit, onHideBubble: () -> Unit) {
+    onSwitch: (String) -> Unit, onSettings: () -> Unit, onActivity: () -> Unit, onHideBubble: () -> Unit,
+    liveActive: Boolean = false, onLive: (() -> Unit)? = null) {
     val character = CompanionCharacter.of(active.character)
     Row(Modifier.fillMaxWidth().padding(start = 12.dp, end = 4.dp, bottom = 4.dp),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -193,6 +202,7 @@ private fun CompanionHeader(active: CompanionEntry, roster: CompanionRoster?, po
             })
         }
         TextButton(onClick = onActivity) { Text("All activity") }
+        onLive?.let { LiveButton(liveActive, it) }
         IconButton(onClick = onSettings) { Icon(Icons.Filled.Settings, contentDescription = "Companion settings") }
         Box {
             var menu by remember { mutableStateOf(false) }
@@ -436,7 +446,8 @@ private fun Suggestions(name: String, onPick: (String) -> Unit) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-internal fun CompanionSettingsSheet(companion: CompanionModel, manage: ManageModel, browse: BrowseState, voice: CompanionVoice? = null, onDismiss: () -> Unit) {
+internal fun CompanionSettingsSheet(companion: CompanionModel, manage: ManageModel, browse: BrowseState, voice: CompanionVoice? = null,
+    live: LiveVoice? = null, onDismiss: () -> Unit) {
     val state by companion.state.collectAsState()
     val roster = state.roster ?: return
     val active = activeCompanion(roster) ?: return
@@ -465,6 +476,10 @@ internal fun CompanionSettingsSheet(companion: CompanionModel, manage: ManageMod
             if (voice != null) {
                 HorizontalDivider(Modifier.padding(vertical = 8.dp), color = VerdeColors.Border)
                 VoiceSettings(voice)
+            }
+            if (live != null) {
+                HorizontalDivider(Modifier.padding(vertical = 8.dp), color = VerdeColors.Border)
+                LiveVoiceSettings(live)
             }
         }
     }

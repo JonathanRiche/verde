@@ -148,14 +148,37 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
             factory = viewModelFactory { initializer { TranscriptModel(hosts, browse.state, a.home_workspace_id, a.thread_id) } })
     }
     LaunchedEffect(voice, companionTranscript) { voice.attach(companionTranscript) }
+    // Real-time voice (phase 2): provider WebSocket from the phone, token minted by the desktop.
+    val live: LiveVoice = viewModel(key = "companion-live", factory = viewModelFactory { initializer { LiveVoice(voiceContext, hosts, browse.state, companion) } })
+    val liveUi by live.ui.collectAsState()
+    val liveLevel by live.outputLevel.collectAsState()
+    val liveInput by live.inputLevel.collectAsState()
+    val liveView by live.voice.collectAsState()
+    SideEffect {
+        live.companionTranscript = companionTranscript
+        live.snapshot = { companionSnapshot(companion.state.value, browse.state.value) }
+        live.workspaceLabel = { ws -> browse.state.value.workspaces?.items?.find { it.workspace_id == ws }?.label }
+    }
+    LaunchedEffect(liveUi.active) { voice.suppressed = liveUi.active }
     val voiceActive by voice.active.collectAsState()
-    LaunchedEffect(voice, companionTranscript, voiceActive, companionOpen) { voice.holdFocus(companionTranscript, voiceActive, companionOpen) }
+    LaunchedEffect(voice, companionTranscript, voiceActive, liveUi.active, companionOpen) {
+        voice.holdFocus(companionTranscript, voiceActive || liveUi.active, companionOpen)
+    }
     // Opening another chat stops a reply being read aloud.
     val openThread = entry?.arguments?.getString("thread")
     LaunchedEffect(route, openThread) { if (route == Routes.THREAD && !onCompanionThread) voice.stopSpeaking() }
     val shellLifecycle by androidx.lifecycle.compose.LocalLifecycleOwner.current.lifecycle.currentStateFlow.collectAsState()
-    LaunchedEffect(shellLifecycle) { if (!shellLifecycle.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) voice.pause() }
     val mic = rememberMicPermission()
+    LaunchedEffect(shellLifecycle) {
+        if (!shellLifecycle.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) { voice.pause(); live.stop() }
+    }
+    fun toggleLive() {
+        when {
+            live.ui.value.active -> live.stop()
+            !mic.granted() -> mic.request()
+            else -> { voice.pause(); live.start() }
+        }
+    }
     val talkState by voice.talk.collectAsState()
     val talkLevel by voice.level.collectAsState()
     val talkSpeaking by voice.speaking.collectAsState()
@@ -220,7 +243,9 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
             needKeys = companionNow.needKeys, running = companionNow.crewRunning,
             replyAt = thread?.takeIf { !activeTurn(it.status) }?.last_activity_at_ms,
             replyText = { companionActive?.let { companion.latestReply(it.home_workspace_id, it.thread_id) } },
-            talk = if (!voice.available) null else BubbleTalk(talkState, talkLevel, talkSpeaking, talkError,
+            live = if (liveView?.supported == false) null else BubbleLive(liveUi.active, maxOf(liveLevel, liveInput),
+                liveUi.captions.lastOrNull()?.text, ::toggleLive),
+            talk = if (!voice.available || liveUi.active) null else BubbleTalk(talkState, talkLevel, talkSpeaking, talkError,
                 start = {
                     val model = companionTranscript
                     when {
@@ -249,6 +274,7 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
             settingsRequested = companionSettings,
             transcript = companionTranscript, voice = voice,
             onHideBubble = { bubblePrefs.updateHidden(true) },
+            live = live, onLive = ::toggleLive,
             onDismiss = { companionOpen = false; companionSettings = false })
     }
 }
