@@ -47,15 +47,39 @@ pub const Client = struct {
         return providerSlashCommands();
     }
 
+    // Commands come only from the agent's own `available_commands_update`
+    // list, and ACP agents resolve `/name args` prompt text themselves, so
+    // each one is a prompt turn whose reply becomes the transcript row.
     pub fn runSlashCommand(
         self: *Client,
         allocator: std.mem.Allocator,
         request: provider_types.RunSlashCommandRequest,
     ) !provider_types.RunSlashCommandResult {
-        _ = self;
-        _ = allocator;
-        _ = request;
-        return error.UnsupportedOperation;
+        const command_name = acp.slashCommandRoot(request.raw_text) orelse return error.UnsupportedOperation;
+        const prompt = std.mem.trim(u8, request.raw_text, " \t\r\n");
+
+        const reply = try self.sendPrompt(allocator, .{
+            .thread_id = request.thread_id,
+            .prompt = prompt,
+            .cwd = request.cwd,
+        });
+        errdefer allocator.free(reply.thread_id);
+        defer allocator.free(reply.reply_text);
+
+        const body = std.mem.trim(u8, reply.reply_text, " \t\r\n");
+        const transcript_body = try allocator.dupe(u8, if (body.len == 0) "Done." else body);
+        errdefer allocator.free(transcript_body);
+        const transcript_title = try allocator.dupe(u8, command_name);
+        errdefer allocator.free(transcript_title);
+        const notice = try std.fmt.allocPrint(allocator, "Agent ran {s}.", .{command_name});
+
+        return .{
+            .handled = true,
+            .thread_id = reply.thread_id,
+            .notice = notice,
+            .transcript_title = transcript_title,
+            .transcript_body = transcript_body,
+        };
     }
 
     /// Ready when at least one agent is configured and its command resolves.

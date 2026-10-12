@@ -8698,6 +8698,12 @@ test "M5-P4 amendment 2: retry pump backs off, reaches archived threads, and giv
 // focused clients clear it, unfocused clients only set the in-memory flag so
 // the next focus/poll path can clear via the existing storage clear.
 pub fn noteChatCompletion(self: anytype, project_index: usize, thread_index: usize, thread: *ChatThread, daemon_owned_completion: bool) void {
+    // ACP agents advertise their slash commands during session setup; the
+    // daemon now knows this provider's latest list, so refetch it next time.
+    switch (thread.provider) {
+        .cursor, .fx, .grok, .custom_acp => self.invalidateProviderSlashCatalog(),
+        .codex, .opencode, .claude, .pi, .muse => {},
+    }
     if (self.isChatThreadFocused(project_index, thread_index)) {
         // Focused-clear: storage clear drops the daemon-written row (or a
         // legacy GUI row) within one poll cycle. The daemon-owned path never

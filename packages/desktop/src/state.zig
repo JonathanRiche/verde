@@ -8744,6 +8744,7 @@ pub const AppState = struct {
     pub const commandPaletteQuery = command_controller.commandPaletteQuery;
     pub const commandPaletteQueryBuffer = command_controller.commandPaletteQueryBuffer;
     pub const pollProviderSlashCatalog = command_controller.pollProviderSlashCatalog;
+    pub const invalidateProviderSlashCatalog = command_controller.invalidateProviderSlashCatalog;
     pub const beginCookieImport = cookie_import_controller.beginCookieImport;
     pub const cancelCookieImport = cookie_import_controller.cancelCookieImport;
     pub const cookieImportOpen = cookie_import_controller.cookieImportOpen;
@@ -12388,15 +12389,21 @@ pub const AppState = struct {
                 return true;
             },
             .unknown => |unknown| {
-                // Claude and Grok resolve `/name` themselves (SDK commands,
-                // ACP available_commands incl. installed skills), so unknown
-                // names are forwarded rather than rejected.
-                if (thread.provider == .claude or thread.provider == .grok) {
+                // Claude and the ACP agents (Grok, Cursor, custom) resolve
+                // `/name` themselves (SDK commands, advertised commands and
+                // installed skills), so unknown names are forwarded rather
+                // than rejected.
+                if (thread.provider == .claude or thread.provider == .grok or thread.provider == .cursor or thread.provider == .custom_acp) {
                     const provider_label = utils.providerLabel(thread.provider);
                     const command: provider_types.ProviderSlashCommand = .{
                         .id = .custom,
                         .name = unknown.name,
-                        .summary = if (thread.provider == .grok) "Grok agent slash command." else "Claude SDK slash command.",
+                        .summary = switch (thread.provider) {
+                            .grok => "Grok agent slash command.",
+                            .cursor => "Cursor agent slash command.",
+                            .custom_acp => "Agent slash command.",
+                            else => "Claude SDK slash command.",
+                        },
                         .usage = unknown.name,
                         .requires_thread = false,
                     };

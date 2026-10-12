@@ -263,7 +263,7 @@ pub const Client = struct {
         allocator: std.mem.Allocator,
         request: provider_types.RunSlashCommandRequest,
     ) !provider_types.RunSlashCommandResult {
-        const command_name = slashCommandRoot(request.raw_text) orelse return error.UnsupportedOperation;
+        const command_name = acp.slashCommandRoot(request.raw_text) orelse return error.UnsupportedOperation;
         const prompt = std.mem.trim(u8, request.raw_text, " \t\r\n");
 
         const reply = try self.sendPrompt(allocator, .{
@@ -616,21 +616,6 @@ pub fn shutdownOwnedServer() void {
 
 /// Maps provider-neutral ACP errors to Grok error names so user-facing error
 /// messaging can address grok specifically (e.g. suggest `grok login`).
-fn slashCommandRoot(raw_text: []const u8) ?[]const u8 {
-    const text = std.mem.trim(u8, raw_text, " \t\r\n");
-    if (!std.mem.startsWith(u8, text, "/")) return null;
-    const root_end = std.mem.indexOfAny(u8, text, " \t\r\n") orelse text.len;
-    if (root_end <= 1) return null;
-    return text[0..root_end];
-}
-
-test "grok slash commands parse the command root" {
-    try std.testing.expectEqualStrings("/context", slashCommandRoot("  /context \n").?);
-    try std.testing.expectEqualStrings("/loop", slashCommandRoot("/loop 5m run tests").?);
-    try std.testing.expect(slashCommandRoot("plain text") == null);
-    try std.testing.expect(slashCommandRoot("/") == null);
-}
-
 fn mapAcpError(err: anyerror) anyerror {
     return switch (err) {
         error.AcpFailed => error.GrokAcpFailed,
@@ -693,11 +678,12 @@ fn authenticate(proc: *acp.Process, reader: anytype) !acp.Capabilities {
         const id = acp.responseId(parsed.value) orelse continue;
         if (id == 1 and !auth_sent) {
             capabilities = acp.parseCapabilities(parsed.value);
-            // Also refresh the per-model effort cache; a missing catalog is
-            // not an authentication failure.
+            // Also refresh the per-model effort cache and the live slash
+            // command list; a missing catalog is not an authentication failure.
             if (parseAvailableModelsAlloc(allocator, parsed.value)) |models| {
                 provider_types.freeModelInfos(allocator, models);
             } else |_| {}
+            acp.rememberAvailableCommandsFromInitialize(ACP_HARNESS.diagnostics_category, parsed.value);
             const key = proc.env_map.get("XAI_API_KEY") orelse "";
             const method = try selectAuthMethod(parsed.value, key.len > 0);
             try proc.writeLine(try makeAuthenticateRequestAlloc(allocator, AUTHENTICATE_REQUEST_ID, method));

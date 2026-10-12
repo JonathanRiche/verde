@@ -91,6 +91,161 @@ pub const ActiveProcessState = struct {
     }
 };
 
+/// A slash command an agent advertised at runtime (`available_commands_update`
+/// after session setup, or grok's initialize `_meta.availableCommands`).
+pub const LiveCommand = struct {
+    name: []u8,
+    description: []u8,
+    hint: []u8,
+};
+
+const LiveCommandSlot = struct { commands: []LiveCommand = &.{} };
+const LIVE_COMMAND_SLOTS = std.meta.fields(provider_diagnostics.ErrorCategory).len;
+/// Latest advertised list per harness (keyed by diagnostics category), kept
+/// for the daemon's lifetime so `provider.slash.list` can merge it with the
+/// static catalog. Refilled by the next session setup after a restart.
+var live_commands: [LIVE_COMMAND_SLOTS]LiveCommandSlot = @splat(.{});
+var live_commands_mutex: Mutex = .{};
+/// Picker summaries stay short; Cursor skill descriptions run to paragraphs.
+const LIVE_COMMAND_SUMMARY_BYTES = 200;
+
+/// Replaces the remembered list for `category` with the `availableCommands`
+/// array (`[{name, description?, input?: {hint}}]`). Non-arrays are ignored.
+pub fn rememberAvailableCommands(category: provider_diagnostics.ErrorCategory, commands: std.json.Value) void {
+    if (commands != .array) return;
+    const allocator = std.heap.page_allocator;
+    var list: std.ArrayList(LiveCommand) = .empty;
+    for (commands.array.items) |entry| {
+        const raw_name = std.mem.trim(u8, getOptionalObjectString(entry, "name") orelse continue, " \t\r\n/");
+        if (raw_name.len == 0 or raw_name.len > 64 or std.mem.indexOfAny(u8, raw_name, " \t\r\n") != null) continue;
+        const raw_description = std.mem.trim(u8, getOptionalObjectString(entry, "description") orelse "", " \t\r\n");
+        const raw_hint = if (getObjectField(entry, "input")) |input| std.mem.trim(u8, getOptionalObjectString(input, "hint") orelse "", " \t\r\n") else "";
+        const name = allocator.dupe(u8, raw_name) catch continue;
+        const description = allocator.dupe(u8, truncateUtf8(raw_description, LIVE_COMMAND_SUMMARY_BYTES)) catch {
+            allocator.free(name);
+            continue;
+        };
+        const hint = allocator.dupe(u8, truncateUtf8(raw_hint, 120)) catch {
+            allocator.free(name);
+            allocator.free(description);
+            continue;
+        };
+        list.append(allocator, .{ .name = name, .description = description, .hint = hint }) catch {
+            allocator.free(name);
+            allocator.free(description);
+            allocator.free(hint);
+            continue;
+        };
+    }
+    const owned = list.toOwnedSlice(allocator) catch {
+        freeLiveCommands(allocator, list.items);
+        list.deinit(allocator);
+        return;
+    };
+    live_commands_mutex.lock();
+    defer live_commands_mutex.unlock();
+    const slot = &live_commands[@intFromEnum(category)];
+    freeLiveCommands(allocator, slot.commands);
+    slot.commands = owned;
+}
+
+/// grok lists its commands in the initialize response (`result._meta.availableCommands`).
+pub fn rememberAvailableCommandsFromInitialize(category: provider_diagnostics.ErrorCategory, value: std.json.Value) void {
+    const result = getObjectField(value, "result") orelse return;
+    const meta = getObjectField(result, "_meta") orelse return;
+    rememberAvailableCommands(category, getObjectField(meta, "availableCommands") orelse return);
+}
+
+fn freeLiveCommands(allocator: std.mem.Allocator, commands: []LiveCommand) void {
+    for (commands) |command| {
+        allocator.free(command.name);
+        allocator.free(command.description);
+        allocator.free(command.hint);
+    }
+    if (commands.len > 0) allocator.free(commands);
+}
+
+fn truncateUtf8(text: []const u8, max_bytes: usize) []const u8 {
+    if (text.len <= max_bytes) return text;
+    var end = max_bytes;
+    while (end > 0 and (text[end] & 0xC0) == 0x80) end -= 1;
+    return text[0..end];
+}
+
+/// The static catalog followed by live commands it does not already list,
+/// every string owned by `allocator` (free with freeSlashCommandList).
+pub fn slashCommandsWithLiveAlloc(
+    allocator: std.mem.Allocator,
+    category: ?provider_diagnostics.ErrorCategory,
+    static: []const provider_types.ProviderSlashCommand,
+) ![]provider_types.ProviderSlashCommand {
+    var out: std.ArrayList(provider_types.ProviderSlashCommand) = .empty;
+    errdefer {
+        freeSlashCommandStrings(allocator, out.items);
+        out.deinit(allocator);
+    }
+    for (static) |command| {
+        var copy = command;
+        copy.name = try allocator.dupe(u8, command.name);
+        errdefer allocator.free(copy.name);
+        copy.summary = try allocator.dupe(u8, command.summary);
+        errdefer allocator.free(copy.summary);
+        copy.usage = try allocator.dupe(u8, command.usage);
+        errdefer allocator.free(copy.usage);
+        try out.append(allocator, copy);
+    }
+    const slot_index = @intFromEnum(category orelse return out.toOwnedSlice(allocator));
+    live_commands_mutex.lock();
+    defer live_commands_mutex.unlock();
+    for (live_commands[slot_index].commands) |live| {
+        var known = false;
+        for (static) |command| {
+            if (command.name.len == live.name.len + 1 and command.name[0] == '/' and std.mem.eql(u8, command.name[1..], live.name)) known = true;
+        }
+        if (known) continue;
+        const name = try std.fmt.allocPrint(allocator, "/{s}", .{live.name});
+        errdefer allocator.free(name);
+        const summary = try allocator.dupe(u8, if (live.description.len > 0) live.description else "Agent slash command.");
+        errdefer allocator.free(summary);
+        const usage = if (live.hint.len > 0)
+            try std.fmt.allocPrint(allocator, "/{s} {s}", .{ live.name, live.hint })
+        else
+            try std.fmt.allocPrint(allocator, "/{s}", .{live.name});
+        errdefer allocator.free(usage);
+        try out.append(allocator, .{
+            .id = .custom,
+            .name = name,
+            .summary = summary,
+            .usage = usage,
+            .requires_thread = false,
+        });
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn freeSlashCommandStrings(allocator: std.mem.Allocator, commands: []const provider_types.ProviderSlashCommand) void {
+    for (commands) |command| {
+        allocator.free(command.name);
+        allocator.free(command.summary);
+        allocator.free(command.usage);
+    }
+}
+
+pub fn freeSlashCommandList(allocator: std.mem.Allocator, commands: []const provider_types.ProviderSlashCommand) void {
+    freeSlashCommandStrings(allocator, commands);
+    allocator.free(commands);
+}
+
+/// `/name` of a slash prompt (`/review --pr 7` -> `/review`); null for
+/// ordinary text or a bare `/`.
+pub fn slashCommandRoot(raw_text: []const u8) ?[]const u8 {
+    const text = std.mem.trim(u8, raw_text, " \t\r\n");
+    if (!std.mem.startsWith(u8, text, "/")) return null;
+    const root_end = std.mem.indexOfAny(u8, text, " \t\r\n") orelse text.len;
+    if (root_end <= 1) return null;
+    return text[0..root_end];
+}
+
 /// A spawned ACP server child plus the resources needed to speak
 /// newline-delimited JSON-RPC with it. Providers construct this from their
 /// own argv/env logic; the transport methods are shared.
@@ -404,6 +559,16 @@ pub fn handleSendPromptLine(
     }
 
     if (isMethod(parsed.value, "session/update")) {
+        // Command lists arrive right after session setup, before the prompt,
+        // so they are kept regardless of replay state.
+        if (sessionUpdateObject(parsed.value)) |update| {
+            if (getOptionalObjectString(update, "sessionUpdate")) |kind| {
+                if (std.mem.eql(u8, kind, "available_commands_update")) {
+                    rememberAvailableCommands(harness.diagnostics_category, getObjectField(update, "availableCommands") orelse .null);
+                    return .continue_reading;
+                }
+            }
+        }
         // ACP servers replay session history while loading an existing
         // session. Only updates emitted after this turn's prompt was
         // submitted are live.
@@ -2671,4 +2836,71 @@ test "usage_update and prompt token counts publish one Usage row per turn" {
     ;
     _ = try handleSendPromptLine(std.testing.allocator, TEST_HARNESS, plain_done, quiet_request, &quiet_state, null);
     try std.testing.expectEqual(@as(usize, 0), quiet_capture.count);
+}
+
+test "available_commands_update feeds the live slash catalog merged with static rows" {
+    var state: SendPromptState = .{};
+    defer state.deinit(std.testing.allocator);
+    const request = provider_types.SendPromptRequest{ .prompt = "hi" };
+    const update =
+        \\{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"available_commands_update","availableCommands":[
+        \\{"name":"compact","description":"Compress history"},
+        \\{"name":"simplify","description":"Find low-info comments. (global)"},
+        \\{"name":"deep-research","description":"Research","input":{"hint":"<query>"}},
+        \\{"name":"bad name","description":"rejected"},{"description":"no name"}]}}}
+    ;
+    // Before the prompt is submitted the update is still recorded.
+    try std.testing.expectEqual(SendLineAction.continue_reading, try handleSendPromptLine(std.testing.allocator, .{
+        .diagnostics_category = .fx_acp,
+        .assistant_author = "FX",
+        .permission_default_title = "Permission",
+    }, update, request, &state, null));
+
+    const static_rows = [_]provider_types.ProviderSlashCommand{.{
+        .id = .compact,
+        .name = "/compact",
+        .summary = "Static compact.",
+        .usage = "/compact",
+        .requires_thread = true,
+    }};
+    const merged = try slashCommandsWithLiveAlloc(std.testing.allocator, .fx_acp, static_rows[0..]);
+    defer freeSlashCommandList(std.testing.allocator, merged);
+    try std.testing.expectEqual(@as(usize, 3), merged.len);
+    try std.testing.expectEqualStrings("/compact", merged[0].name);
+    try std.testing.expectEqualStrings("Static compact.", merged[0].summary);
+    try std.testing.expectEqualStrings("/simplify", merged[1].name);
+    try std.testing.expectEqual(provider_types.ProviderSlashCommandId.custom, merged[1].id);
+    try std.testing.expectEqualStrings("Find low-info comments. (global)", merged[1].summary);
+    try std.testing.expectEqualStrings("/simplify", merged[1].usage);
+    try std.testing.expectEqualStrings("/deep-research <query>", merged[2].usage);
+
+    // Other harnesses are unaffected; providers without a live list keep
+    // their static rows.
+    const other = try slashCommandsWithLiveAlloc(std.testing.allocator, .custom_acp, static_rows[0..]);
+    defer freeSlashCommandList(std.testing.allocator, other);
+    try std.testing.expectEqual(@as(usize, 1), other.len);
+    const plain = try slashCommandsWithLiveAlloc(std.testing.allocator, null, static_rows[0..]);
+    defer freeSlashCommandList(std.testing.allocator, plain);
+    try std.testing.expectEqual(@as(usize, 1), plain.len);
+
+    // A later update replaces the list.
+    var replaced = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\[{"name":"loop","description":"Run on an interval"}]
+    , .{});
+    defer replaced.deinit();
+    rememberAvailableCommands(.fx_acp, replaced.value);
+    const latest = try slashCommandsWithLiveAlloc(std.testing.allocator, .fx_acp, &.{});
+    defer freeSlashCommandList(std.testing.allocator, latest);
+    try std.testing.expectEqual(@as(usize, 1), latest.len);
+    try std.testing.expectEqualStrings("/loop", latest[0].name);
+    var cleared = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "[]", .{});
+    defer cleared.deinit();
+    rememberAvailableCommands(.fx_acp, cleared.value);
+}
+
+test "slashCommandRoot parses the command root" {
+    try std.testing.expectEqualStrings("/context", slashCommandRoot("  /context \n").?);
+    try std.testing.expectEqualStrings("/loop", slashCommandRoot("/loop 5m run tests").?);
+    try std.testing.expect(slashCommandRoot("plain text") == null);
+    try std.testing.expect(slashCommandRoot("/") == null);
 }

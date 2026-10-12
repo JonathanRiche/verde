@@ -236,7 +236,7 @@ fn formatSlashCommandError(allocator: std.mem.Allocator, provider: Provider, err
             else => "Muse slash command failed.",
         },
         .custom_acp => switch (err) {
-            error.UnsupportedOperation => "Custom ACP agents do not support Verde slash commands yet; send the command as a message.",
+            error.UnsupportedOperation => "This agent does not support that slash command.",
             else => "Agent slash command failed.",
         },
     };
@@ -336,6 +336,19 @@ pub fn pollProviderSlashCatalog(self: anytype) void {
         freeProviderSlashCommands(commands);
     }
     request.deinit();
+}
+
+/// Drops the cached catalog so the next slash input refetches it. ACP agents
+/// advertise their command lists during session setup, so a finished turn
+/// may have taught the daemon new commands.
+pub fn invalidateProviderSlashCatalog(self: anytype) void {
+    const catalog = &self.command_controller.provider_slash_catalog;
+    if (catalog.cached_provider == null) return;
+    freeProviderSlashCommands(catalog.commands);
+    if (catalog.cached_project_path) |path| std.heap.page_allocator.free(path);
+    catalog.commands = &.{};
+    catalog.cached_project_path = null;
+    catalog.cached_provider = null;
 }
 
 pub fn ensureProviderSlashCatalog(self: anytype) bool {

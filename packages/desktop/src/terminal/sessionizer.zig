@@ -8794,12 +8794,14 @@ pub const Daemon = struct {
         return try providerThreadControlResponse(self.allocator, id_value, .accepted);
     }
 
-    // Static slash metadata is provider-owned but requires no process startup.
+    // Slash metadata is provider-owned and requires no process startup: the
+    // static catalog plus whatever an ACP agent advertised in its last session.
     fn providerSlashListResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
         var parsed = parseDaemonParams(headless.providers_protocol.SlashListRequest, self.allocator, params) catch
             return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid provider slash-list request");
         defer parsed.deinit();
-        const commands = harness.slashCommandsForProvider(parsed.value.provider);
+        const commands = try harness.slashCommandsForProviderAlloc(self.allocator, parsed.value.provider);
+        defer harness.freeSlashCommandList(self.allocator, commands);
         return try okValueResponse(self.allocator, id_value, headless.providers_protocol.SlashListResult{
             .provider = parsed.value.provider,
             .commands = commands,

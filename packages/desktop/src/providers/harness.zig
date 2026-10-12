@@ -11,6 +11,7 @@ const fx = @import("fx.zig");
 const grok = @import("grok.zig");
 const muse = @import("muse.zig");
 const custom_acp = @import("custom_acp.zig");
+const acp = @import("acp.zig");
 const runtime_log = @import("../runtime/log.zig");
 
 pub const Provider = types.Provider;
@@ -236,6 +237,21 @@ pub fn slashCommandsForProvider(provider: Provider) []const ProviderSlashCommand
         .custom_acp => custom_acp.providerSlashCommands(),
     };
 }
+
+/// Static catalog plus the commands an ACP agent advertised live (captured
+/// during its last session setup); free with `freeSlashCommandList`.
+pub fn slashCommandsForProviderAlloc(allocator: std.mem.Allocator, provider: Provider) ![]ProviderSlashCommand {
+    const category: ?@import("diagnostics.zig").ErrorCategory = switch (provider) {
+        .cursor => .cursor_acp,
+        .fx => .fx_acp,
+        .grok => .grok_acp,
+        .custom_acp => .custom_acp,
+        .opencode, .codex, .claude, .pi, .muse => null,
+    };
+    return acp.slashCommandsWithLiveAlloc(allocator, category, slashCommandsForProvider(provider));
+}
+
+pub const freeSlashCommandList = acp.freeSlashCommandList;
 
 pub fn connect(
     allocator: std.mem.Allocator,
