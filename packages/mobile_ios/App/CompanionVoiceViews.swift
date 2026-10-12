@@ -20,51 +20,36 @@ struct LevelMeter: View {
     }
 }
 
-/// The sheet's voice row above the composer: live transcript and meter while listening, a stop
-/// control while a reply is read aloud, and the mic (tap to start, tap to send; hold also works).
-struct CompanionVoiceBar: View {
+/// The composer's mic (tap to start, tap to send; hold also works). While a reply is read aloud
+/// it becomes a stop-speaking button.
+struct CompanionMicButton: View {
     let voice: CompanionVoice
     let name: String
     let send: (String) -> Void
     @State private var press: (start: Date, startedByPress: Bool)?
 
     var body: some View {
-        HStack(spacing: 10) {
-            if voice.listening {
-                LevelMeter(level: voice.level)
-                Text(voice.partial.isEmpty ? "Listening…" : voice.partial)
-                    .font(VerdeTheme.ui(14)).lineLimit(3).frame(maxWidth: .infinity, alignment: .leading)
-                    .accessibilityLabel(voice.partial.isEmpty ? "Listening" : voice.partial)
-                Button { voice.cancel() } label: { Image(systemName: "xmark").frame(width: 44, height: 44) }
-                    .accessibilityLabel("Cancel voice message")
-            } else if voice.speaking {
-                Image(systemName: "speaker.wave.2.fill").foregroundStyle(VerdeTheme.accent).accessibilityHidden(true)
-                Text("\(name) is speaking").font(VerdeTheme.ui(13)).foregroundStyle(VerdeTheme.muted)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                Button("Stop") { voice.stopSpeaking() }.font(VerdeTheme.ui(13, bold: true))
-                    .frame(minHeight: 44)
-                    .accessibilityHint("Stops reading the reply aloud.")
-            } else {
-                Text(voice.notice ?? "Hold or tap the mic to talk to \(name).")
-                    .font(VerdeTheme.ui(12)).foregroundStyle(voice.notice == nil ? VerdeTheme.subtle : VerdeTheme.warning)
-                    .lineLimit(2).frame(maxWidth: .infinity, alignment: .leading)
+        if voice.speaking && !voice.listening {
+            Button { voice.stopSpeaking() } label: {
+                Image(systemName: "speaker.slash.fill").font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(VerdeTheme.accent).frame(width: 44, height: 44)
             }
+            .accessibilityLabel("Stop reading aloud")
+        } else {
             mic
         }
-        .padding(.horizontal, 12).padding(.vertical, 4)
     }
 
     private var mic: some View {
         let active = voice.listening
         return ZStack {
-            Circle().fill(active ? VerdeTheme.accent : VerdeTheme.panel)
-            Circle().stroke(active ? VerdeTheme.accent : VerdeTheme.border)
+            Circle().fill(active ? VerdeTheme.accent : Color.clear).frame(width: 32, height: 32)
             Image(systemName: active ? "arrow.up" : "mic.fill")
-                .font(.system(size: 18, weight: .semibold))
+                .font(.system(size: 15, weight: .semibold))
                 .foregroundStyle(active ? VerdeTheme.background : VerdeTheme.text)
         }
         .frame(width: 44, height: 44)
-        .contentShape(Circle())
+        .contentShape(Rectangle())
         .gesture(DragGesture(minimumDistance: 0)
             .onChanged { _ in
                 guard press == nil else { return }

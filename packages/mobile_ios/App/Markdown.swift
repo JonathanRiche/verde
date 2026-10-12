@@ -275,6 +275,7 @@ func highlighted(_ code: String, _ spans: [RenderSpan]) -> AttributedString {
 struct MarkdownText: View {
     let text: String
     let model: TranscriptModel
+    @Environment(\.compactChat) private var compact
     @State private var result: RenderResult<[MdBlock]>?
     @State private var requested: String?
     @State private var rendering: Task<Void, Never>?
@@ -288,7 +289,7 @@ struct MarkdownText: View {
                 MarkdownBlocks(blocks: blocks, source: model).accessibilityIdentifier("markdown")
             } else {
                 // Pending (first frame) or unrenderable: the source text, never re-parsed in Swift.
-                Text(text) .font(VerdeTheme.ui(15)).textSelection(.enabled).accessibilityIdentifier("plain-text")
+                Text(text) .font(VerdeTheme.ui(compact ? 14 : 15)).textSelection(.enabled).accessibilityIdentifier("plain-text")
             }
         }
         .onAppear { schedule() }
@@ -324,20 +325,21 @@ struct MarkdownBlocks: View {
 private struct MdBlockView: View {
     let block: MdBlock
     let source: HighlightSource
+    @Environment(\.compactChat) private var compact
 
     var body: some View {
         switch block {
         case .paragraph(let text):
-            Text(themedInline(text, background: VerdeTheme.alternate)) .font(VerdeTheme.ui(15)).frame(maxWidth: .infinity, alignment: .leading)
+            Text(themedInline(text, background: VerdeTheme.alternate)) .font(VerdeTheme.ui(compact ? 14 : 15)).frame(maxWidth: .infinity, alignment: .leading)
         case .heading(let level, let text):
-            Text(themedInline(text, background: VerdeTheme.alternate)).font(VerdeTheme.ui(level == 1 ? 24 : level == 2 ? 20 : 17, bold: true)).foregroundStyle(level == 1 ? VerdeTheme.heading1 : level == 2 ? VerdeTheme.heading2 : VerdeTheme.heading3)
+            Text(themedInline(text, background: VerdeTheme.alternate)).font(VerdeTheme.ui(compact ? (level == 1 ? 18 : level == 2 ? 16 : 15) : (level == 1 ? 24 : level == 2 ? 20 : 17), bold: true)).foregroundStyle(level == 1 ? VerdeTheme.heading1 : level == 2 ? VerdeTheme.heading2 : VerdeTheme.heading3)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .accessibilityAddTraits(.isHeader)
         case .bullets(let ordered, let items):
             VStack(alignment: .leading, spacing: 4) {
                 ForEach(Array(items.enumerated()), id: \.offset) { index, item in
                     HStack(alignment: .firstTextBaseline, spacing: 4) {
-                        Text(ordered ? "\(index + 1)." : "•") .font(VerdeTheme.ui(15)).frame(minWidth: 20, alignment: .leading)
+                        Text(ordered ? "\(index + 1)." : "•") .font(VerdeTheme.ui(compact ? 14 : 15)).frame(minWidth: 20, alignment: .leading)
                         MarkdownBlocks(blocks: item, source: source)
                     }
                 }

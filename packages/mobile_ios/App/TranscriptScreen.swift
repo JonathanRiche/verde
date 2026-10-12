@@ -93,14 +93,26 @@ extension TranscriptScreen {
     }
 }
 
-/// Banner, transcript and composer for one thread; also the Companion home's conversation.
+private struct CompactChatKey: EnvironmentKey { static let defaultValue = false }
+
+extension EnvironmentValues {
+    /// Denser transcript rows (smaller type, tighter spacing, flat tool rows) for the Companion sheet.
+    var compactChat: Bool {
+        get { self[CompactChatKey.self] }
+        set { self[CompactChatKey.self] = newValue }
+    }
+}
+
+/// Banner, transcript and composer for one thread; also the Companion sheet's conversation.
 struct TranscriptBody: View {
     @State private var file: ViewerRequest?
     let model: TranscriptModel
     let browse: BrowseModel
     let onHosts: () -> Void
-    /// Shown just above the composer (the Companion's voice bar).
+    /// Shown just above the composer.
     var accessory: AnyView? = nil
+    /// The Companion sheet's single-row composer.
+    var compactComposer: CompactComposer? = nil
 
     var body: some View {
         GeometryReader { geometry in
@@ -122,7 +134,7 @@ struct TranscriptBody: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 if let accessory { accessory }
-                ChatComposer(model: model.input, availableHeight: geometry.size.height)
+                ChatComposer(model: model.input, availableHeight: geometry.size.height, compact: compactComposer)
             }
         }
         .environment(\.openURL, OpenURLAction { url in
@@ -202,6 +214,7 @@ private struct TranscriptList: View {
     @State private var viewport: CGFloat = 0
     @State private var cardVisible = false
     @State private var settled = false
+    @Environment(\.compactChat) private var compact
 
     /// Changes whenever the bottom of the transcript grows (new row, streaming delta, turn state).
     private func tailKey(_ items: [TranscriptItem]) -> String {
@@ -219,7 +232,7 @@ private struct TranscriptList: View {
                 let items = model.items
                 ZStack(alignment: .top) {
                     ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 8) {
+                        LazyVStack(alignment: .leading, spacing: compact ? 4 : 8) {
                             PageHeader(page: page, loadOlder: { model.loadOlder(force: true) }).id(headerID)
                             ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
                                 TranscriptRow(item: item, model: model, turnStartedAt: turn?.started_at_ms)
@@ -236,7 +249,7 @@ private struct TranscriptList: View {
                                 })
                         }
                         .scrollTargetLayout()
-                        .padding(.horizontal, 12).padding(.vertical, 8)
+                        .padding(.horizontal, compact ? 10 : 12).padding(.vertical, compact ? 6 : 8)
                     }
                     .coordinateSpace(name: "transcript")
                     .scrollPosition(id: $position)
@@ -389,12 +402,21 @@ private struct TranscriptRow: View {
 private struct MessageRow: View {
     let row: ChatRow
     let model: TranscriptModel
+    @Environment(\.compactChat) private var compact
 
     var body: some View {
         let mine = row.role == "user"
         // A parent agent's steer shows only its words, labelled apart from the human's turns.
         let steer = parentSteerBody(role: row.role, body: row.body)
         let shown = steer ?? row.body
+        if compact && steer == nil {
+            CompactMessageRow(row: row, model: model, mine: mine, shown: shown)
+        } else {
+            regular(mine: mine, steer: steer, shown: shown)
+        }
+    }
+
+    private func regular(mine: Bool, steer: String?, shown: String) -> some View {
         HStack {
 
             VStack(alignment: .leading, spacing: 4) {
@@ -437,6 +459,44 @@ private struct MessageRow: View {
             }
             .contextMenu { Button("Copy message") { UIPasteboard.general.string = shown } }
         }
+        .accessibilityIdentifier("message-row")
+    }
+}
+
+/// Companion sheet: your messages as compact right-aligned bubbles, replies as plain text.
+private struct CompactMessageRow: View {
+    let row: ChatRow
+    let model: TranscriptModel
+    let mine: Bool
+    let shown: String
+
+    var body: some View {
+        let delivery = deliveryLabel(row.delivery)
+        HStack(alignment: .bottom, spacing: 0) {
+            if mine { Spacer(minLength: 56) }
+            VStack(alignment: mine ? .trailing : .leading, spacing: 2) {
+                if !row.attachments.isEmpty {
+                    Text(row.attachments.map { basename($0.name) }.joined(separator: ", "))
+                        .font(VerdeTheme.ui(11)).foregroundStyle(.secondary).lineLimit(1)
+                }
+                if !shown.isEmpty {
+                    if mine {
+                        Text(shown).font(VerdeTheme.ui(14)).textSelection(.enabled)
+                            .padding(.horizontal, 10).padding(.vertical, 8)
+                            .background(VerdeTheme.user, in: RoundedRectangle(cornerRadius: 12))
+                    } else {
+                        MarkdownText(text: streamTail(row), model: model)
+                    }
+                }
+                if let delivery {
+                    Text(delivery).font(VerdeTheme.ui(10)).foregroundStyle(row.delivery == "failed" ? Color.red : Color.secondary)
+                }
+            }
+            .frame(maxWidth: mine ? nil : .infinity, alignment: mine ? .trailing : .leading)
+            .contextMenu { Button("Copy message") { UIPasteboard.general.string = shown } }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel((mine ? "You: " : (row.author.isEmpty ? "Reply: " : row.author + ": ")) + shown)
         .accessibilityIdentifier("message-row")
     }
 }
@@ -532,6 +592,7 @@ private struct ToolCard: View {
     let row: ChatRow
     let child: Bool
     let disclosure: DisclosureStore
+    @Environment(\.compactChat) private var compact
 
     var body: some View {
         let key = "\(row.id):tool"
@@ -546,7 +607,9 @@ private struct ToolCard: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                     Text(expanded ? "▾" : "▸").foregroundStyle(.secondary)
                 }
-                .padding(.horizontal, 12).padding(.vertical, 10)
+                .font(compact ? VerdeTheme.ui(12) : nil)
+                .padding(.horizontal, compact ? 2 : 12).padding(.vertical, compact ? 4 : 10)
+                .frame(minHeight: compact ? 44 : nil)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -566,9 +629,11 @@ private struct ToolCard: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(child ? VerdeTheme.background : VerdeTheme.assistant,
+        .background(compact ? Color.clear : child ? VerdeTheme.background : VerdeTheme.assistant,
                     in: RoundedRectangle(cornerRadius: 10))
-        .overlay(RoundedRectangle(cornerRadius: 10).stroke(commandRunning(row) ? Color.accentColor : VerdeTheme.border))
+        .overlay {
+            if !compact { RoundedRectangle(cornerRadius: 10).stroke(commandRunning(row) ? Color.accentColor : VerdeTheme.border) }
+        }
     }
 }
 
@@ -578,6 +643,7 @@ private struct ToolGroupCard: View {
     let subagent: Bool
     let turnStartedAt: Int64?
     let disclosure: DisclosureStore
+    @Environment(\.compactChat) private var compact
 
     var body: some View {
         let counts = toolCounts(rows)
@@ -596,7 +662,8 @@ private struct ToolGroupCard: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     Text(expanded ? "▾" : "▸").foregroundStyle(.secondary)
                 }
-                .padding(12)
+                .padding(.horizontal, compact ? 2 : 12).padding(.vertical, compact ? 4 : 12)
+                .frame(minHeight: compact ? 44 : nil)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -605,12 +672,14 @@ private struct ToolGroupCard: View {
                 VStack(spacing: 6) {
                     ForEach(rows, id: \.id) { ToolCard(row: $0, child: true, disclosure: disclosure) }
                 }
-                .padding(.horizontal, 8).padding(.bottom, 8)
+                .padding(.horizontal, compact ? 0 : 8).padding(.leading, compact ? 12 : 0).padding(.bottom, compact ? 2 : 8)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(VerdeTheme.assistant, in: RoundedRectangle(cornerRadius: 10))
-        .overlay(RoundedRectangle(cornerRadius: 10).stroke(counts.running > 0 && counts.failed == 0 ? Color.accentColor : VerdeTheme.border))
+        .background(compact ? Color.clear : VerdeTheme.assistant, in: RoundedRectangle(cornerRadius: 10))
+        .overlay {
+            if !compact { RoundedRectangle(cornerRadius: 10).stroke(counts.running > 0 && counts.failed == 0 ? Color.accentColor : VerdeTheme.border) }
+        }
     }
 }
 

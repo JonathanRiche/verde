@@ -8,9 +8,26 @@ func composerChoiceLabel(_ choices: [ChatChoice], value: String?) -> String {
         ?? value.flatMap { $0.isEmpty ? nil : $0 } ?? "Default"
 }
 
+/// The Companion sheet's single-row composer: placeholder, a live voice transcript shown in place
+/// of the field, a voice notice, and trailing controls (the mic).
+struct CompactComposer {
+    var placeholder: String
+    var transcript: String?
+    var level: Double = 0
+    var notice: String?
+    var trailing: AnyView?
+}
+
+/// "Haiku 5.5 · Low": the model and effort as one chip label.
+func composerChipLabel(model: String, effort: String?) -> String {
+    guard let effort, !effort.isEmpty, effort != "Default" else { return model }
+    return model + " · " + effort
+}
+
 struct ChatComposer: View {
     let model: ComposerModel
     let availableHeight: CGFloat
+    var compact: CompactComposer? = nil
     @Environment(\.scenePhase) private var scenePhase
     @State private var picker: ComposerPicker?
     @State private var photo: PhotosPickerItem?
@@ -21,7 +38,55 @@ struct ChatComposer: View {
     @State private var dragStart: CGFloat?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        Group {
+            if let compact { compactBody(compact) } else { fullBody }
+        }
+        .onChange(of: scenePhase) { _, phase in if phase != .active { model.flushNow() } }
+        .onDisappear { model.flushNow() }
+        .sheet(item: $picker) { kind in
+            NavigationStack {
+                List(choices(kind).sorted { $0.favorite && !$1.favorite }, id: \.id) { choice in
+                    Button { model.select(kind, choice.id); picker = nil } label: {
+                        HStack { pickerGlyph(kind, value: choice.id); Text(choice.label); if choice.favorite { Image(systemName: "star.fill") }; Spacer(); if let reason = choice.reason { Text(reason) .font(VerdeTheme.ui(12)) } }
+                    }.disabled(!choice.enabled)
+                }.navigationTitle(kind.rawValue.capitalized).toolbar { Button("Done") { picker = nil } }
+            }.presentationDetents([.medium, .large])
+        }
+        .sheet(isPresented: $camera) { ComposerCamera { image in camera = false; if let image { prepare(image) } } }
+        .sheet(isPresented: Binding(get: { model.view?.shell_confirmation != nil }, set: { shown in
+            if !shown, let confirmation = model.view?.shell_confirmation { model.confirmShell(confirmation, accept: false) }
+        })) {
+            if let confirmation = model.view?.shell_confirmation {
+                NavigationStack {
+                    VStack(alignment: .leading, spacing: 20) {
+                        Text("Run this command on the host?") .font(VerdeTheme.ui(15, bold: true))
+                        Text(confirmation.command).font(.system(.body, design: .monospaced)).textSelection(.enabled)
+                        Text(confirmation.cwd) .font(VerdeTheme.ui(12))
+                        HStack { Button("Cancel") { model.confirmShell(confirmation, accept: false) }; Spacer(); Button("Run") { model.confirmShell(confirmation, accept: true) }.buttonStyle(.borderedProminent) }
+                    }.padding().disabled(model.busy)
+                }.presentationDetents([.medium])
+            }
+        }
+        .onChange(of: photo) { _, item in
+            Task {
+                guard let item else { return }
+                defer { photo = nil }
+                guard let data = try? await item.loadTransferable(type: Data.self), data.count <= 24 * 1024 * 1024, let image = UIImage(data: data) else { model.notice = "This image couldn't be opened."; return }
+                prepare(image)
+            }
+        }
+        .fileImporter(isPresented: $files, allowedContentTypes: [.item]) { result in
+            guard case .success(let url) = result else { return }
+            let access = url.startAccessingSecurityScopedResource()
+            defer { if access { url.stopAccessingSecurityScopedResource() } }
+            guard let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize, size <= 24 * 1024 * 1024,
+                  let data = try? Data(contentsOf: url), let image = UIImage(data: data) else { model.notice = "Only images can be attached from the phone."; return }
+            prepare(image)
+        }
+    }
+
+    /// Follow-up, notice, slash/mention suggestions and attachments (both layouts).
+    @ViewBuilder private var extras: some View {
             if let followup = model.view?.followup, visibleFollowup(followup) {
                 VStack(alignment: .leading) {
                     Text("\(followup.kind.capitalized) · \(followup.state)").font(.caption.bold())
@@ -65,6 +130,11 @@ struct ChatComposer: View {
                     }
                 }
             }
+    }
+
+    private var fullBody: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            extras
             Capsule().fill(VerdeTheme.border).frame(width: 40, height: 4)
                 .frame(maxWidth: .infinity).frame(height: 24).contentShape(Rectangle())
                 .gesture(DragGesture(minimumDistance: 2).onChanged { value in
@@ -119,48 +189,120 @@ struct ChatComposer: View {
         .background(VerdeTheme.panel, in: RoundedRectangle(cornerRadius: 14))
         .overlay(RoundedRectangle(cornerRadius: 14).stroke(focused ? VerdeTheme.accent : VerdeTheme.mutedPanel, lineWidth: focused ? 1.5 : 1))
         .padding(8)
-        .onChange(of: scenePhase) { _, phase in if phase != .active { model.flushNow() } }
-        .onDisappear { model.flushNow() }
-        .sheet(item: $picker) { kind in
-            NavigationStack {
-                List(choices(kind).sorted { $0.favorite && !$1.favorite }, id: \.id) { choice in
-                    Button { model.select(kind, choice.id); picker = nil } label: {
-                        HStack { pickerGlyph(kind, value: choice.id); Text(choice.label); if choice.favorite { Image(systemName: "star.fill") }; Spacer(); if let reason = choice.reason { Text(reason) .font(VerdeTheme.ui(12)) } }
-                    }.disabled(!choice.enabled)
-                }.navigationTitle(kind.rawValue.capitalized).toolbar { Button("Done") { picker = nil } }
-            }.presentationDetents([.medium, .large])
+    }
+
+    /// One row: "+" menu, a growing field (or the live voice transcript), the mic, stop and send;
+    /// below it a single model · effort chip.
+    private func compactBody(_ compact: CompactComposer) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            extras
+            if let notice = compact.notice {
+                Text(notice).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.warning).lineLimit(2)
+            }
+            HStack(alignment: .bottom, spacing: 2) {
+                plusMenu
+                compactField(compact)
+                if let trailing = compact.trailing { trailing }
+                if model.chat.state.turn != nil {
+                    Button(action: model.chat.stopTurn) {
+                        Image(systemName: "stop.fill").font(.system(size: 10)).foregroundStyle(VerdeTheme.background)
+                            .frame(width: 32, height: 32).background(VerdeTheme.warning, in: Circle())
+                            .frame(width: 44, height: 44).contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain).disabled(!model.chat.state.canStop).accessibilityLabel("Stop")
+                }
+                Button(action: model.submit) {
+                    Image(systemName: "arrow.up").font(.system(size: 15, weight: .bold)).foregroundStyle(VerdeTheme.background)
+                        .frame(width: 32, height: 32).background(VerdeTheme.accent, in: Circle()).opacity(model.canSubmit ? 1 : 0.35)
+                        .frame(width: 44, height: 44).contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(!model.canSubmit).accessibilityLabel(sendLabel).accessibilityIdentifier("composer-send")
+            }
+            if model.view != nil { settingsChip }
         }
-        .sheet(isPresented: $camera) { ComposerCamera { image in camera = false; if let image { prepare(image) } } }
-        .sheet(isPresented: Binding(get: { model.view?.shell_confirmation != nil }, set: { shown in
-            if !shown, let confirmation = model.view?.shell_confirmation { model.confirmShell(confirmation, accept: false) }
-        })) {
-            if let confirmation = model.view?.shell_confirmation {
-                NavigationStack {
-                    VStack(alignment: .leading, spacing: 20) {
-                        Text("Run this command on the host?") .font(VerdeTheme.ui(15, bold: true))
-                        Text(confirmation.command).font(.system(.body, design: .monospaced)).textSelection(.enabled)
-                        Text(confirmation.cwd) .font(VerdeTheme.ui(12))
-                        HStack { Button("Cancel") { model.confirmShell(confirmation, accept: false) }; Spacer(); Button("Run") { model.confirmShell(confirmation, accept: true) }.buttonStyle(.borderedProminent) }
-                    }.padding().disabled(model.busy)
-                }.presentationDetents([.medium])
+        .padding(.horizontal, 6).padding(.vertical, 4)
+        .background(VerdeTheme.panel)
+        .overlay(alignment: .top) { Divider().overlay(VerdeTheme.border) }
+    }
+
+    @ViewBuilder private func compactField(_ compact: CompactComposer) -> some View {
+        Group {
+            if let transcript = compact.transcript {
+                HStack(spacing: 8) {
+                    LevelMeter(level: compact.level)
+                    Text(transcript.isEmpty ? "Listening…" : transcript)
+                        .font(VerdeTheme.ui(15)).foregroundStyle(transcript.isEmpty ? VerdeTheme.subtle : VerdeTheme.text)
+                        .lineLimit(4).frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel(transcript.isEmpty ? "Listening" : "Heard: " + transcript)
+            } else {
+                TextField(model.chat.state.turn != nil ? sendLabel + " a follow-up…" : compact.placeholder,
+                          text: Binding(get: { model.text }, set: { value in
+                              model.edit(value, selection: NSRange(location: (value as NSString).length, length: 0))
+                          }), axis: .vertical)
+                    .lineLimit(1...4)
+                    .font(VerdeTheme.ui(15))
+                    .disabled(model.pending)
+                    .accessibilityLabel("Message")
+                    .accessibilityIdentifier("composer-field")
             }
         }
-        .onChange(of: photo) { _, item in
-            Task {
-                guard let item else { return }
-                defer { photo = nil }
-                guard let data = try? await item.loadTransferable(type: Data.self), data.count <= 24 * 1024 * 1024, let image = UIImage(data: data) else { model.notice = "This image couldn't be opened."; return }
-                prepare(image)
+        .padding(.horizontal, 12).padding(.vertical, 8)
+        .frame(minHeight: 40)
+        .background(VerdeTheme.alternate, in: RoundedRectangle(cornerRadius: 20))
+        .padding(.vertical, 2)
+    }
+
+    /// Attach, plus the rarely changed pickers (provider on a fresh chat, access, speed).
+    private var plusMenu: some View {
+        Menu {
+            Section {
+                PhotosPicker(selection: $photo, matching: .images) { Label("Photos", systemImage: "photo") }
+                Button("Camera", systemImage: "camera") { openCamera() }
+                Button("Files", systemImage: "folder") { files = true }
+            }
+            Section {
+                ForEach(visiblePickers.filter { $0 != .model && $0 != .effort }) { kind in
+                    Button { picker = kind } label: { Text("\(kind.rawValue.capitalized): \(selectionLabel(kind))") }
+                }
+            }
+        } label: {
+            Image(systemName: "plus").font(.system(size: 17, weight: .semibold)).frame(width: 44, height: 44)
+        }
+        .disabled(model.busy || model.pending)
+        .accessibilityLabel("More options")
+        .accessibilityHint("Attach an image or change access.")
+        .accessibilityIdentifier("composer-more")
+    }
+
+    /// "Haiku 5.5 · Low": opens the existing model and effort pickers.
+    @ViewBuilder private var settingsChip: some View {
+        let label = composerChipLabel(model: selectionLabel(.model), effort: visiblePickers.contains(.effort) ? selectionLabel(.effort) : nil)
+        let chip = HStack(spacing: 5) {
+            ProviderGlyph(provider: model.displayedSelection?.provider).scaleEffect(0.8)
+            Text(label).font(VerdeTheme.ui(12)).lineLimit(1).truncationMode(.tail)
+            Image(systemName: "chevron.down").font(.system(size: 9, weight: .semibold)).foregroundStyle(VerdeTheme.subtle)
+        }
+        .padding(.horizontal, 10).padding(.vertical, 5)
+        .background(VerdeTheme.alternate, in: Capsule())
+        .frame(minHeight: 44, alignment: .leading)
+        .contentShape(Rectangle())
+        Group {
+            if visiblePickers.contains(.effort) {
+                Menu {
+                    Button("Model: \(selectionLabel(.model))") { picker = .model }
+                    Button("Effort: \(selectionLabel(.effort))") { picker = .effort }
+                } label: { chip }
+            } else {
+                Button { picker = .model } label: { chip }.buttonStyle(.plain)
             }
         }
-        .fileImporter(isPresented: $files, allowedContentTypes: [.item]) { result in
-            guard case .success(let url) = result else { return }
-            let access = url.startAccessingSecurityScopedResource()
-            defer { if access { url.stopAccessingSecurityScopedResource() } }
-            guard let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize, size <= 24 * 1024 * 1024,
-                  let data = try? Data(contentsOf: url), let image = UIImage(data: data) else { model.notice = "Only images can be attached from the phone."; return }
-            prepare(image)
-        }
+        .padding(.leading, 6)
+        .disabled(model.busy || model.pending)
+        .accessibilityLabel("Model and effort: \(label). Change")
+        .accessibilityIdentifier("composer-setting-model")
     }
 
     private var sendLabel: String {

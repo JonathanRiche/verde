@@ -544,3 +544,33 @@ struct CompanionClient {
         throw CompanionRPCError.conflict
     }
 }
+
+// MARK: - Sheet summary
+
+enum SummaryTone: Equatable { case attention, busy, failure, quiet }
+
+/// The header's short status suffix ("· 3 need you").
+func companionStatusSuffix(needsYou: Int, crewRunning: Int, working: Bool, failed: Bool, connected: Bool) -> (text: String, tone: SummaryTone) {
+    if !connected { return ("offline", .quiet) }
+    if needsYou > 0 { return ("\(needsYou) need you", .attention) }
+    if failed { return ("needs a look", .failure) }
+    if working { return ("working", .busy) }
+    if crewRunning > 0 { return ("\(crewRunning) running", .busy) }
+    return ("ready", .quiet)
+}
+
+/// The "needs you" capsule; nil hides it.
+func needsSummary(_ count: Int) -> String? { count > 0 ? "\(count) need you" : nil }
+
+/// The crew capsule ("2 running · 1 done"); nil when there is no crew.
+func crewSummary(_ crew: [CrewLink]) -> String? {
+    guard !crew.isEmpty else { return nil }
+    func count(_ match: (CrewAttention) -> Bool) -> Int { crew.filter { match($0.attention) }.count }
+    let parts = [
+        (count { $0 == .running }, "running"),
+        (count { $0.needsYou }, "waiting"),
+        (count { $0 == .failed }, "failed"),
+        (count { $0 == .done }, "done"),
+    ].filter { $0.0 > 0 }.map { "\($0.0) \($0.1)" }
+    return parts.isEmpty ? "\(crew.count) idle" : parts.joined(separator: " · ")
+}

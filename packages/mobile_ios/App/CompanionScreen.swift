@@ -1,15 +1,18 @@
 import SwiftUI
 import UIKit
 
-/// The Companion sheet opened from the floating bubble: who it is and how it's doing, what needs
-/// the user across every workspace, its crew, and its conversation (the ordinary chat transcript
-/// and composer on its thread). Rows open their chat in the main navigation via `open`.
+/// The Companion sheet opened from the floating bubble: a one-row header, a summary strip of
+/// what needs the user and what the crew is doing (expanding to compact lists), and the companion
+/// conversation with a dense transcript and single-row composer. Rows open their chat in the main
+/// navigation via `open`.
 struct CompanionSheet: View {
     let model: CompanionModel
     let browse: BrowseModel
     let voice: CompanionVoice
     let live: LiveVoice
     let open: (BrowseRoute) -> Void
+    /// Closes the sheet and shows Home (all activity).
+    let showHome: () -> Void
     let onHosts: () -> Void
     @State private var settings = false
     /// A prompt typed or picked before the companion's chat existed; sent once it opens.
@@ -36,14 +39,18 @@ struct CompanionSheet: View {
 
     private func content(_ active: RosterEntry) -> some View {
         VStack(spacing: 0) {
-            CompanionHeader(model: model, live: live, entry: active, presence: model.presence) { settings = true }
+            CompanionHeader(model: model, live: live, entry: active, showHome: showHome) { settings = true }
+            if let notice = model.notice {
+                Text(notice).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.warning)
+                    .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16).padding(.bottom, 4)
+            }
             if live.active {
                 LiveVoicePanel(live: live)
             } else if let failure = live.failure {
                 Text(failure).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.warning)
-                    .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16).padding(.bottom, 6)
+                    .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16).padding(.bottom, 4)
             }
-            CompanionBoard(needsYou: model.needsYou, crew: model.crew, open: open)
+            CompanionSummary(model: model, open: open)
             Divider().overlay(VerdeTheme.border)
             if let conversation = model.conversation {
                 CompanionConversation(browse: browse, voice: voice, name: active.name, workspaceID: conversation.workspace,
@@ -62,112 +69,176 @@ struct CompanionSheet: View {
     }
 }
 
-/// Compact header: avatar, name, status, companion switcher and settings.
+func summaryColor(_ tone: SummaryTone) -> Color {
+    switch tone {
+    case .attention: return VerdeTheme.warning
+    case .busy: return VerdeTheme.accent
+    case .failure: return VerdeTheme.danger
+    case .quiet: return VerdeTheme.subtle
+    }
+}
+
+/// One ~44pt row: avatar, name with a colored status suffix, Live, and a menu.
 private struct CompanionHeader: View {
     let model: CompanionModel
     let live: LiveVoice
     let entry: RosterEntry
-    let presence: CompanionPresence
+    let showHome: () -> Void
     let openSettings: () -> Void
     @AppStorage(CompanionBubbleStore.hiddenKey) private var bubbleHidden = false
 
     var body: some View {
-        HStack(alignment: .center, spacing: 10) {
-            CompanionAvatar(character: entry.character, pose: presence.pose, failure: presence.failure, width: 36)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(entry.name).font(VerdeTheme.ui(16, bold: true)).lineLimit(1)
-                HStack(spacing: 6) {
-                    StatusPip(active: presence.pose == .working, attention: presence.pose == .approval, failed: presence.failure)
-                    Text(presence.status).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted).lineLimit(1)
-                }
-                if let notice = model.notice { Text(notice).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.warning).lineLimit(2) }
-            }
-            .accessibilityElement(children: .combine)
-            Spacer(minLength: 4)
-            let companions = model.roster?.companions ?? []
+        let presence = model.presence
+        let suffix = companionStatusSuffix(needsYou: model.badgeCount,
+                                           crewRunning: model.crew.filter { $0.attention == .running }.count,
+                                           working: presence.pose == .working && model.crew.allSatisfy { $0.attention != .running },
+                                           failed: presence.failure, connected: presence.pose != .paused)
+        let companions = model.roster?.companions ?? []
+        HStack(spacing: 8) {
+            CompanionAvatar(character: entry.character, pose: presence.pose, failure: presence.failure, width: 28)
+            (Text(entry.name).font(VerdeTheme.ui(16, bold: true))
+                + Text(" · " + suffix.text).font(VerdeTheme.ui(12)).foregroundStyle(summaryColor(suffix.tone)))
+                .lineLimit(1)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityLabel("\(entry.name), \(presence.status)")
+                .accessibilityAddTraits(.isHeader)
             Button { live.toggle() } label: {
-                Image(systemName: live.active ? "waveform.circle.fill" : "waveform").frame(width: 44, height: 44)
+                Image(systemName: live.active ? "waveform.circle.fill" : "waveform")
+                    .font(.system(size: 17, weight: .semibold)).frame(width: 44, height: 44)
             }
             .accessibilityLabel(live.active ? "End live conversation" : "Talk live")
             .accessibilityHint(live.active ? "" : "Starts a real-time voice conversation with \(entry.name).")
             .accessibilityIdentifier("companion-live")
-            if companions.count > 1 {
-                Menu {
-                    ForEach(companions) { other in
-                        Button { Task { await model.select(other.id) } } label: {
-                            if other.id == entry.id { Label(other.name, systemImage: "checkmark") } else { Text(other.name) }
-                        }
-                    }
-                } label: { Image(systemName: "person.2").frame(width: 44, height: 44) }
-                .disabled(model.saving)
-                .accessibilityLabel("Switch companion")
-            }
             Menu {
+                Button(action: showHome) { Label("All activity", systemImage: "list.bullet.rectangle") }
+                if companions.count > 1 {
+                    Menu {
+                        ForEach(companions) { other in
+                            Button { Task { await model.select(other.id) } } label: {
+                                if other.id == entry.id { Label(other.name, systemImage: "checkmark") } else { Text(other.name) }
+                            }
+                        }
+                    } label: { Label("Switch companion", systemImage: "person.2") }
+                    .disabled(model.saving)
+                }
                 Button(action: openSettings) { Label("Settings", systemImage: "slider.horizontal.3") }
                 if bubbleHidden {
                     Button { bubbleHidden = false } label: { Label("Show bubble", systemImage: "eye") }
                 } else {
                     Button(role: .destructive) { bubbleHidden = true } label: { Label("Hide bubble", systemImage: "eye.slash") }
                 }
-            } label: { Image(systemName: "ellipsis.circle").frame(width: 44, height: 44) }
-                .accessibilityLabel("Companion options")
-                .accessibilityIdentifier("companion-settings")
+            } label: {
+                Image(systemName: "ellipsis.circle").font(.system(size: 17, weight: .semibold)).frame(width: 44, height: 44)
+            }
+            .accessibilityLabel("Companion options")
+            .accessibilityIdentifier("companion-settings")
         }
-        .padding(.leading, 16).padding(.trailing, 8).padding(.top, 14).padding(.bottom, 6)
+        .padding(.leading, 14).padding(.trailing, 4).padding(.top, 10)
+        .frame(minHeight: 44)
     }
 }
 
-/// "Needs you" and "Crew", kept short so the conversation keeps most of the screen.
-private struct CompanionBoard: View {
-    static let visibleNeeds = 3
-    let needsYou: [NeedsYouItem]
-    let crew: [CrewLink]
+/// Two capsules ("3 need you", "2 running · 1 done"), each expanding to a compact list.
+private struct CompanionSummary: View {
+    enum Panel: Equatable { case needs, crew }
+    let model: CompanionModel
     let open: (BrowseRoute) -> Void
+    @State private var expanded: Panel?
 
     var body: some View {
-        if !needsYou.isEmpty || !crew.isEmpty {
-            VStack(alignment: .leading, spacing: 8) {
-                if !needsYou.isEmpty {
-                    BoardTitle(text: "Needs you", count: needsYou.count)
-                    ForEach(needsYou.prefix(Self.visibleNeeds)) { item in
-                        Button { open(.thread(workspace: item.workspaceID, thread: item.threadID)) } label: {
-                            HStack(spacing: 10) {
-                                Circle().fill(VerdeTheme.warning).frame(width: 6, height: 6)
-                                VStack(alignment: .leading, spacing: 0) {
-                                    Text(item.title).font(VerdeTheme.ui(14)).lineLimit(1)
-                                    Text([item.reason, item.workspaceLabel].compactMap { $0 }.joined(separator: " · "))
-                                        .font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted).lineLimit(1)
-                                }
-                                Spacer(minLength: 0)
-                                Image(systemName: "chevron.right").font(.system(size: 11, weight: .semibold)).foregroundStyle(VerdeTheme.subtle)
-                            }
-                            .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
+        let needs = model.needsYou
+        let crew = model.crew
+        let needsText = needsSummary(needs.count)
+        let crewText = crewSummary(crew)
+        if needsText != nil || crewText != nil {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 8) {
+                    if let needsText {
+                        capsule(.needs, icon: "exclamationmark.triangle.fill", text: needsText, color: VerdeTheme.warning)
                     }
-                    if needsYou.count > Self.visibleNeeds {
-                        Text("\(needsYou.count - Self.visibleNeeds) more on Home").font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted)
+                    if let crewText {
+                        capsule(.crew, icon: "circle.fill", text: crewText,
+                                color: crew.contains { $0.attention == .running } ? VerdeTheme.accent : VerdeTheme.subtle)
                     }
+                    Spacer(minLength: 0)
                 }
-                if !crew.isEmpty {
-                    BoardTitle(text: "Crew", count: crew.count)
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 8) { ForEach(crew) { link in CrewChip(link: link) { open(.thread(workspace: link.workspace_id, thread: link.local_thread_id)) } } }
-                    }
+                if expanded == .needs && !needs.isEmpty {
+                    list(needs.map { item in
+                        SummaryRow(id: item.id, color: VerdeTheme.warning, title: item.title,
+                                   detail: item.workspaceLabel ?? item.reason, label: item.reason,
+                                   route: .thread(workspace: item.workspaceID, thread: item.threadID))
+                    })
+                } else if expanded == .crew && !crew.isEmpty {
+                    let labels = Dictionary((model.browse.state.workspaces?.items ?? []).map { ($0.workspace_id, $0.label) },
+                                            uniquingKeysWith: { a, _ in a })
+                    list(crew.map { link in
+                        SummaryRow(id: link.id, color: crewColor(link.attention), title: link.displayTitle,
+                                   detail: labels[link.workspace_id] ?? link.attention.label, label: link.attention.label,
+                                   route: .thread(workspace: link.workspace_id, thread: link.local_thread_id))
+                    })
                 }
             }
-            .padding(.horizontal, 16).padding(.bottom, 10)
+            .padding(.horizontal, 12).padding(.bottom, 6)
+            .onChange(of: needsText == nil) { _, hidden in if hidden && expanded == .needs { expanded = nil } }
+            .onChange(of: crewText == nil) { _, hidden in if hidden && expanded == .crew { expanded = nil } }
         }
+    }
+
+    private func capsule(_ section: Panel, icon: String, text: String, color: Color) -> some View {
+        let isOpen = expanded == section
+        return Button {
+            withAnimation(AppearanceSettings.shared.reducedMotion ? nil : .easeOut(duration: 0.15)) { expanded = isOpen ? nil : section }
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: icon).font(.system(size: section == .crew ? 7 : 10)).foregroundStyle(color)
+                Text(text).font(VerdeTheme.ui(12, bold: true)).lineLimit(1)
+                Image(systemName: isOpen ? "chevron.up" : "chevron.down").font(.system(size: 8, weight: .bold)).foregroundStyle(VerdeTheme.subtle)
+            }
+            .padding(.horizontal, 10).padding(.vertical, 6)
+            .background(color.opacity(0.14), in: Capsule())
+            .frame(minHeight: 44)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(text)
+        .accessibilityHint(isOpen ? "Hides the list." : "Shows the list.")
+        .accessibilityValue(isOpen ? "Expanded" : "Collapsed")
+    }
+
+    /// About four rows tall, then scrolls.
+    private func list(_ rows: [SummaryRow]) -> some View {
+        ScrollView {
+            LazyVStack(spacing: 0) {
+                ForEach(rows) { row in
+                    Button { open(row.route) } label: {
+                        HStack(spacing: 8) {
+                            Circle().fill(row.color).frame(width: 6, height: 6)
+                            Text(row.title).font(VerdeTheme.ui(14)).lineLimit(1).truncationMode(.tail)
+                            Spacer(minLength: 6)
+                            Text(row.detail).font(VerdeTheme.ui(11)).foregroundStyle(VerdeTheme.subtle).lineLimit(1)
+                                .layoutPriority(-1)
+                        }
+                        .frame(minHeight: 44)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("\(row.title), \(row.label)\(row.detail == row.label ? "" : ", " + row.detail)")
+                    .accessibilityHint("Opens this chat.")
+                }
+            }
+        }
+        .frame(maxHeight: 180)
+        .scrollBounceBehavior(.basedOnSize)
     }
 }
 
-private struct BoardTitle: View {
-    let text: String
-    let count: Int
-    var body: some View {
-        Text("\(text.uppercased()) · \(count)").font(VerdeTheme.ui(11, bold: true)).foregroundStyle(VerdeTheme.subtle)
-            .accessibilityAddTraits(.isHeader)
-    }
+private struct SummaryRow: Identifiable {
+    let id: String
+    let color: Color
+    let title: String
+    let detail: String
+    let label: String
+    let route: BrowseRoute
 }
 
 func crewColor(_ attention: CrewAttention) -> Color {
@@ -179,48 +250,17 @@ func crewColor(_ attention: CrewAttention) -> Color {
     }
 }
 
-private struct CrewChip: View {
-    let link: CrewLink
-    let open: () -> Void
-    var body: some View {
-        let attention = link.attention
-        Button(action: open) {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 6) {
-                    ProviderGlyph(provider: link.provider.isEmpty ? nil : link.provider)
-                    Text(link.displayTitle).font(VerdeTheme.ui(13, bold: true)).lineLimit(1)
-                }
-                Text(attention.label).font(VerdeTheme.ui(11, bold: true))
-                    .padding(.horizontal, 7).padding(.vertical, 2)
-                    .foregroundStyle(crewColor(attention))
-                    .background(crewColor(attention).opacity(0.16), in: Capsule())
-                    .modifier(Pulse(active: attention == .running, minimum: 0.6))
-                if let detail = link.detail {
-                    Text(detail).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted).lineLimit(1)
-                }
-            }
-            .frame(width: 180, alignment: .leading)
-            .padding(10)
-            .background(VerdeTheme.panel, in: RoundedRectangle(cornerRadius: 12))
-            .overlay(RoundedRectangle(cornerRadius: 12).stroke(attention.needsYou ? VerdeTheme.warning : VerdeTheme.border))
-        }
-        .buttonStyle(.plain)
-        .accessibilityElement(children: .combine)
-    }
-}
-
 private struct SuggestionList: View {
     let enabled: Bool
     let pick: (String) -> Void
     var body: some View {
-        VStack(spacing: 8) {
+        VStack(spacing: 6) {
             ForEach(companionSuggestions, id: \.self) { suggestion in
                 Button { pick(suggestion) } label: {
                     Text(suggestion).font(VerdeTheme.ui(14)).multilineTextAlignment(.leading)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 14).padding(.vertical, 10)
+                        .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                        .padding(.horizontal, 12)
                         .background(VerdeTheme.panel, in: RoundedRectangle(cornerRadius: 12))
-                        .overlay(RoundedRectangle(cornerRadius: 12).stroke(VerdeTheme.border))
                 }
                 .buttonStyle(.plain)
                 .disabled(!enabled)
@@ -229,8 +269,8 @@ private struct SuggestionList: View {
     }
 }
 
-/// Before the companion's chat exists: suggestions and a plain prompt field. Sending creates the
-/// chat in the companion's home workspace and hands the prompt to the real composer.
+/// Before the companion's chat exists: suggestions and the same single-row composer shape.
+/// Sending creates the chat in the companion's home workspace and hands the prompt over.
 private struct CompanionStarter: View {
     let busy: Bool
     let name: String
@@ -240,40 +280,65 @@ private struct CompanionStarter: View {
     @State private var text = ""
 
     var body: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: 0) {
             ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
+                VStack(alignment: .leading, spacing: 10) {
                     Text("Ask \(name) to run or check anything across your workspaces.")
                         .font(VerdeTheme.ui(14)).foregroundStyle(VerdeTheme.muted)
                     SuggestionList(enabled: !busy) { send($0) }
-                }.padding(16)
+                }.padding(14)
             }
-            CompanionVoiceBar(voice: voice, name: name, send: sendVoice).disabled(busy)
-            HStack(spacing: 8) {
-                TextField("Message \(name)", text: $text, axis: .vertical)
-                    .lineLimit(1...5)
-                    .padding(.horizontal, 12).padding(.vertical, 10)
-                    .background(VerdeTheme.panel, in: RoundedRectangle(cornerRadius: 14))
-                    .overlay(RoundedRectangle(cornerRadius: 14).stroke(VerdeTheme.border))
-                    .accessibilityIdentifier("companion-starter-input")
+            if let notice = voice.notice, !voice.listening {
+                Text(notice).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.warning)
+                    .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 14)
+            }
+            HStack(alignment: .bottom, spacing: 2) {
+                Group {
+                    if voice.listening {
+                        HStack(spacing: 8) {
+                            LevelMeter(level: voice.level)
+                            Text(voice.partial.isEmpty ? "Listening…" : voice.partial).font(VerdeTheme.ui(15)).lineLimit(4)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    } else {
+                        TextField("Message \(name)", text: $text, axis: .vertical)
+                            .lineLimit(1...4)
+                            .font(VerdeTheme.ui(15))
+                            .accessibilityIdentifier("companion-starter-input")
+                    }
+                }
+                .padding(.horizontal, 12).padding(.vertical, 8)
+                .frame(minHeight: 40)
+                .background(VerdeTheme.alternate, in: RoundedRectangle(cornerRadius: 20))
+                .padding(.vertical, 2)
+                CompanionMicButton(voice: voice, name: name, send: sendVoice).disabled(busy)
                 Button {
                     let prompt = text.trimmingCharacters(in: .whitespacesAndNewlines)
                     guard !prompt.isEmpty else { return }
                     text = ""
                     send(prompt)
                 } label: {
-                    if busy { ProgressView().frame(width: 40, height: 40) }
-                    else { Image(systemName: "arrow.up.circle.fill").font(.system(size: 30)).frame(width: 40, height: 40) }
+                    Group {
+                        if busy { ProgressView() }
+                        else {
+                            Image(systemName: "arrow.up").font(.system(size: 15, weight: .bold)).foregroundStyle(VerdeTheme.background)
+                                .frame(width: 32, height: 32).background(VerdeTheme.accent, in: Circle())
+                        }
+                    }
+                    .frame(width: 44, height: 44)
                 }
+                .buttonStyle(.plain)
                 .disabled(busy || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 .accessibilityLabel("Send")
             }
-            .padding(.horizontal, 12).padding(.bottom, 8)
+            .padding(.horizontal, 8).padding(.vertical, 6)
+            .background(VerdeTheme.panel)
+            .overlay(alignment: .top) { Divider().overlay(VerdeTheme.border) }
         }
     }
 }
 
-/// The companion's chat: the regular transcript, approvals and composer, with empty-state suggestions.
+/// The companion's chat: the regular transcript (dense) and the single-row composer with the mic.
 private struct CompanionConversation: View {
     let browse: BrowseModel
     let voice: CompanionVoice
@@ -288,11 +353,11 @@ private struct CompanionConversation: View {
     var body: some View {
         VStack(spacing: 0) {
             if let model {
-                TranscriptBody(model: model, browse: browse, onHosts: onHosts,
-                               accessory: AnyView(CompanionVoiceBar(voice: voice, name: name) { sendVoice($0, model) }))
+                TranscriptBody(model: model, browse: browse, onHosts: onHosts, compactComposer: composer(model))
+                    .environment(\.compactChat, true)
                     .overlay(alignment: .top) {
                         if let thread = model.thread, thread.rows.isEmpty, !thread.page.loading, thread.error == nil {
-                            SuggestionList(enabled: true) { model.input.ask($0) }.padding(16)
+                            SuggestionList(enabled: true) { model.input.ask($0) }.padding(14)
                         }
                     }
                     // Reads new replies aloud per the read-aloud setting, sentence by sentence.
@@ -324,6 +389,15 @@ private struct CompanionConversation: View {
             voice.cancel()
             voice.leave()
         }
+    }
+
+    /// The live transcript replaces the field while listening; the mic sits next to send.
+    private func composer(_ model: TranscriptModel) -> CompactComposer {
+        CompactComposer(placeholder: "Message \(name)",
+                        transcript: voice.listening ? voice.partial : nil,
+                        level: voice.level,
+                        notice: voice.listening ? nil : voice.notice,
+                        trailing: AnyView(CompanionMicButton(voice: voice, name: name) { sendVoice($0, model) }))
     }
 
     /// A transcript handed over from the bubble (or the starter) goes out as a voice turn.

@@ -116,6 +116,11 @@ struct RootView: View {
                                 if tab == .hosts { tab = .home }
                                 drawer = false
                                 path.append(route)
+                            }, showHome: {
+                                companionSheet = false
+                                drawer = false
+                                tab = .home
+                                path = []
                             }, onHosts: { companionSheet = false; tab = .hosts })
                             .presentationDetents([.medium, .large])
                             .presentationDragIndicator(.visible)
