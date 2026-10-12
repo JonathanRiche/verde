@@ -15,7 +15,29 @@ pub const ORIGINS_SQL: [:0]const u8 =
 
 pub fn initialize(conn: zqlite.Conn) !void {
     try conn.execNoArgs(ORIGINS_SQL);
+    try ensureParentWorkspaceColumn(conn);
 }
+
+/// Cross-workspace parents (the machine Companion delegating into any
+/// workspace) record their own workspace here. Additive and nullable: NULL
+/// means "same workspace as the child", which is every row older binaries
+/// write, so no schema version bump is needed.
+fn ensureParentWorkspaceColumn(conn: zqlite.Conn) !void {
+    var rows = try conn.rows("pragma table_info(chat_links)", .{});
+    defer rows.deinit();
+    var exists = false;
+    var any = false;
+    while (rows.next()) |row| {
+        any = true;
+        if (std.mem.eql(u8, row.text(1), "parent_workspace_id")) exists = true;
+    }
+    if (rows.err) |err| return err;
+    if (!any or exists) return;
+    try conn.execNoArgs("alter table chat_links add column parent_workspace_id text");
+}
+
+/// SQL expression (alias `l`) for the workspace that owns a link's parent.
+pub const PARENT_WORKSPACE_SQL = "coalesce(l.parent_workspace_id,l.workspace_id)";
 
 /// Record the parent whose message started `task`; only that parent hears
 /// its outcome, so work a shared child does for others stays out of it.
@@ -42,27 +64,83 @@ pub const ORIGIN_MATCHES_SQL =
     "or exists(select 1 from chat_task_origins o where o.task_id=t.task_id and o.parent_thread_id=l.parent_thread_id))";
 
 pub fn link(conn: zqlite.Conn, allocator: std.mem.Allocator, workspace: []const u8, parent: []const u8, child: []const u8) !void {
-    if (parent.len == 0 or child.len == 0 or std.mem.eql(u8, parent, child)) return error.InvalidParams;
-    // Both ends must be durable threads in the same workspace.
-    var count = (try conn.row("select count(*) from threads t join workspaces w on w.id=t.workspace_id where w.workspace_id=? and t.local_thread_id in (?,?)", .{ workspace, parent, child })) orelse return error.InvalidParams;
-    defer count.deinit();
-    if (count.int(0) != 2) return error.InvalidParams;
-    // Refuse cycles, including indirect cycles, before accepting delegation.
+    return linkAcross(conn, allocator, workspace, parent, workspace, child);
+}
+
+/// Links `child` (in `child_workspace`) under `parent` (in `parent_workspace`).
+/// Same-workspace links keep the original NULL parent workspace so older
+/// binaries read them unchanged.
+pub fn linkAcross(conn: zqlite.Conn, allocator: std.mem.Allocator, parent_workspace: []const u8, parent: []const u8, child_workspace: []const u8, child: []const u8) !void {
+    const same_workspace = std.mem.eql(u8, parent_workspace, child_workspace);
+    if (parent.len == 0 or child.len == 0 or parent_workspace.len == 0 or child_workspace.len == 0) return error.InvalidParams;
+    if (same_workspace and std.mem.eql(u8, parent, child)) return error.InvalidParams;
+    // Both ends must be durable threads.
+    const thread_sql = "select count(*) from threads t join workspaces w on w.id=t.workspace_id where w.workspace_id=? and t.local_thread_id=?";
+    inline for (.{ .{ parent_workspace, parent }, .{ child_workspace, child } }) |end| {
+        var count = (try conn.row(thread_sql, .{ end[0], end[1] })) orelse return error.InvalidParams;
+        defer count.deinit();
+        if (count.int(0) != 1) return error.InvalidParams;
+    }
+    // Refuse cycles, including indirect and cross-workspace ones, before
+    // accepting delegation: the parent must not already descend from the child.
     var cycle = (try conn.row(
-        \\with recursive descendants(id) as (
-        \\ select local_thread_id from chat_links where workspace_id=? and parent_thread_id=?
-        \\ union select l.local_thread_id from chat_links l join descendants d on l.parent_thread_id=d.id where l.workspace_id=?
-        \\) select count(*) from descendants where id=?
-    , .{ workspace, child, workspace, parent })).?;
+        \\with recursive descendants(ws,id) as (
+        \\ select l.workspace_id,l.local_thread_id from chat_links l where
+    ++ " " ++ PARENT_WORKSPACE_SQL ++
+        \\=? and l.parent_thread_id=?
+        \\ union select l.workspace_id,l.local_thread_id from chat_links l join descendants d on
+    ++ " " ++ PARENT_WORKSPACE_SQL ++
+        \\=d.ws and l.parent_thread_id=d.id
+        \\) select count(*) from descendants where ws=? and id=?
+    , .{ child_workspace, child, parent_workspace, parent })).?;
     defer cycle.deinit();
     if (cycle.int(0) != 0) return error.InvalidParams;
-    const identity = try std.json.Stringify.valueAlloc(allocator, .{ workspace, parent, child }, .{});
+    const identity = if (same_workspace)
+        try std.json.Stringify.valueAlloc(allocator, .{ child_workspace, parent, child }, .{})
+    else
+        try std.json.Stringify.valueAlloc(allocator, .{ child_workspace, parent, child, parent_workspace }, .{});
     defer allocator.free(identity);
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(identity, &digest, .{});
     const id = try std.fmt.allocPrint(allocator, "link:{s}", .{std.fmt.bytesToHex(digest, .lower)});
     defer allocator.free(id);
-    try conn.exec("insert into chat_links(link_id,workspace_id,parent_thread_id,local_thread_id) values(?,?,?,?) on conflict(workspace_id,parent_thread_id,local_thread_id) do update set hidden=0,delivery_enabled=1", .{ id, workspace, parent, child });
+    const parent_workspace_value: ?[]const u8 = if (same_workspace) null else parent_workspace;
+    try conn.exec("insert into chat_links(link_id,workspace_id,parent_thread_id,local_thread_id,parent_workspace_id) values(?,?,?,?,?) on conflict(workspace_id,parent_thread_id,local_thread_id) do update set hidden=0,delivery_enabled=1,parent_workspace_id=excluded.parent_workspace_id", .{ id, child_workspace, parent, child, parent_workspace_value });
+}
+
+/// Finds the workspace holding `parent`: the hinted (child's) workspace when
+/// the parent lives there, otherwise the single workspace that owns that
+/// thread id. Lets a machine-wide parent such as the Companion delegate into
+/// any workspace without callers naming its home.
+pub fn resolveParentWorkspace(conn: zqlite.Conn, allocator: std.mem.Allocator, hint_workspace: []const u8, parent: []const u8) !?[]u8 {
+    const in_hint = blk: {
+        var row = (try conn.row("select 1 from threads t join workspaces w on w.id=t.workspace_id where w.workspace_id=? and t.local_thread_id=?", .{ hint_workspace, parent })) orelse break :blk false;
+        row.deinit();
+        break :blk true;
+    };
+    if (in_hint) return try allocator.dupe(u8, hint_workspace);
+    var rows = try conn.rows("select w.workspace_id from threads t join workspaces w on w.id=t.workspace_id where t.local_thread_id=? and w.archived=0 limit 2", .{parent});
+    defer rows.deinit();
+    var found: ?[]u8 = null;
+    errdefer if (found) |value| allocator.free(value);
+    var count: usize = 0;
+    while (rows.next()) |row| {
+        count += 1;
+        if (count == 1) found = try allocator.dupe(u8, row.text(0));
+    }
+    if (rows.err) |err| return err;
+    if (count != 1) {
+        if (found) |value| allocator.free(value);
+        return null;
+    }
+    return found;
+}
+
+/// The link id joining `parent` and `child`, if linked.
+pub fn linkId(conn: zqlite.Conn, allocator: std.mem.Allocator, parent_workspace: []const u8, parent: []const u8, child_workspace: []const u8, child: []const u8) !?[]u8 {
+    var row = (try conn.row("select link_id from chat_links l where l.workspace_id=? and l.parent_thread_id=? and l.local_thread_id=? and " ++ PARENT_WORKSPACE_SQL ++ "=?", .{ child_workspace, parent, child, parent_workspace })) orelse return null;
+    defer row.deinit();
+    return try allocator.dupe(u8, row.text(0));
 }
 
 pub fn createTask(conn: zqlite.Conn, task: []const u8, workspace: []const u8, child: []const u8, owner: []const u8, now: i64) !void {
@@ -106,10 +184,10 @@ pub fn activeChildCount(conn: zqlite.Conn, workspace: []const u8, parent: []cons
     var row = (try conn.row(
         \\select (select count(*) from chat_links l
         \\ join chat_tasks k on k.task_id=(select task_id from chat_tasks where workspace_id=l.workspace_id and local_thread_id=l.local_thread_id order by created_at_ms desc,rowid desc limit 1)
-        \\ where l.workspace_id=?1 and l.parent_thread_id=?2 and l.hidden=0 and l.delivery_enabled=1
+        \\ where coalesce(l.parent_workspace_id,l.workspace_id)=?1 and l.parent_thread_id=?2 and l.hidden=0 and l.delivery_enabled=1
         \\ and (k.status in ('running','waiting_approval') or (k.status='blocked' and k.result_json is null)))
         \\+ (select count(*) from chat_deliveries d join chat_links l on l.link_id=d.link_id
-        \\ where l.workspace_id=?1 and l.parent_thread_id=?2 and l.delivery_enabled=1 and d.delivered=0
+        \\ where coalesce(l.parent_workspace_id,l.workspace_id)=?1 and l.parent_thread_id=?2 and l.delivery_enabled=1 and d.delivered=0
         \\ and (?3 is null or d.parent_turn_id is null or d.parent_turn_id<>?3))
     , .{ workspace, parent, batch_turn })) orelse return 0;
     defer row.deinit();
@@ -119,11 +197,11 @@ pub fn activeChildCount(conn: zqlite.Conn, workspace: []const u8, parent: []cons
 pub fn writeLinks(conn: zqlite.Conn, s: *std.json.Stringify, workspace: []const u8, parent: []const u8, include_hidden: bool) !void {
     var rows = try conn.rows(
         \\select l.link_id,l.local_thread_id,coalesce(t.title,l.local_thread_id),coalesce(t.provider,0),
-        \\ coalesce(k.status,'idle'),coalesce(k.summary,''),k.task_id,coalesce(k.updated_at_ms,0),l.hidden
+        \\ coalesce(k.status,'idle'),coalesce(k.summary,''),k.task_id,coalesce(k.updated_at_ms,0),l.hidden,l.workspace_id
         \\from chat_links l join workspaces w on w.workspace_id=l.workspace_id
         \\left join threads t on t.workspace_id=w.id and t.local_thread_id=l.local_thread_id
         \\left join chat_tasks k on k.task_id=(select task_id from chat_tasks where workspace_id=l.workspace_id and local_thread_id=l.local_thread_id order by created_at_ms desc,rowid desc limit 1)
-        \\where l.workspace_id=? and l.parent_thread_id=? and (? or l.hidden=0)
+        \\where coalesce(l.parent_workspace_id,l.workspace_id)=? and l.parent_thread_id=? and (? or l.hidden=0)
         \\order by coalesce(k.updated_at_ms,0) desc,l.link_id
     , .{ workspace, parent, include_hidden });
     defer rows.deinit();
@@ -133,7 +211,7 @@ pub fn writeLinks(conn: zqlite.Conn, s: *std.json.Stringify, workspace: []const 
     const providers = [_][]const u8{ "opencode", "codex", "cursor", "claude", "pi", "fx", "grok", "muse", "custom_acp" };
     while (rows.next()) |row| {
         const provider: usize = @intCast(@max(0, row.int(3)));
-        try s.write(.{ .link_id = row.text(0), .workspace_id = workspace, .parent_thread_id = parent, .local_thread_id = row.text(1), .title = row.text(2), .provider = if (provider < providers.len) providers[provider] else "unknown", .status = row.text(4), .summary = row.text(5), .turn_id = row.nullableText(6), .updated_at_ms = row.int(7), .hidden = row.int(8) != 0 });
+        try s.write(.{ .link_id = row.text(0), .workspace_id = row.text(9), .parent_workspace_id = workspace, .parent_thread_id = parent, .local_thread_id = row.text(1), .title = row.text(2), .provider = if (provider < providers.len) providers[provider] else "unknown", .status = row.text(4), .summary = row.text(5), .turn_id = row.nullableText(6), .updated_at_ms = row.int(7), .hidden = row.int(8) != 0 });
     }
     if (rows.err) |err| return err;
     try s.endArray();
@@ -141,15 +219,15 @@ pub fn writeLinks(conn: zqlite.Conn, s: *std.json.Stringify, workspace: []const 
     try s.objectField("parents");
     try s.beginArray();
     var parents = try conn.rows(
-        \\select l.link_id,l.parent_thread_id,coalesce(t.title,l.parent_thread_id),coalesce(t.provider,0)
-        \\from chat_links l join workspaces w on w.workspace_id=l.workspace_id
+        \\select l.link_id,l.parent_thread_id,coalesce(t.title,l.parent_thread_id),coalesce(t.provider,0),coalesce(l.parent_workspace_id,l.workspace_id)
+        \\from chat_links l join workspaces w on w.workspace_id=coalesce(l.parent_workspace_id,l.workspace_id)
         \\left join threads t on t.workspace_id=w.id and t.local_thread_id=l.parent_thread_id
         \\where l.workspace_id=? and l.local_thread_id=? order by l.parent_thread_id
     , .{ workspace, parent });
     defer parents.deinit();
     while (parents.next()) |row| {
         const provider: usize = @intCast(@max(0, row.int(3)));
-        try s.write(.{ .link_id = row.text(0), .local_thread_id = row.text(1), .title = row.text(2), .provider = if (provider < providers.len) providers[provider] else "unknown" });
+        try s.write(.{ .link_id = row.text(0), .workspace_id = row.text(4), .local_thread_id = row.text(1), .title = row.text(2), .provider = if (provider < providers.len) providers[provider] else "unknown" });
     }
     if (parents.err) |err| return err;
     try s.endArray();
@@ -158,12 +236,12 @@ pub fn writeLinks(conn: zqlite.Conn, s: *std.json.Stringify, workspace: []const 
 
 pub fn clear(conn: zqlite.Conn, workspace: []const u8, parent: []const u8, link_id: ?[]const u8, completed_only: bool) !void {
     try conn.exec(
-        \\update chat_links set hidden=1,delivery_enabled=0 where workspace_id=? and parent_thread_id=? and (? is null or link_id=?)
+        \\update chat_links set hidden=1,delivery_enabled=0 where coalesce(parent_workspace_id,workspace_id)=? and parent_thread_id=? and (? is null or link_id=?)
         \\and (not ? or (select status from chat_tasks where workspace_id=chat_links.workspace_id and local_thread_id=chat_links.local_thread_id order by created_at_ms desc,rowid desc limit 1) in ('completed','failed','aborted','interrupted'))
     , .{ workspace, parent, link_id, link_id, completed_only });
     // Removing a child from the panel unlinks it: queued results are dropped
     // and it stops notifying the parent until the parent delegates to it again.
-    try conn.exec("update chat_deliveries set delivered=1 where delivered=0 and link_id in (select link_id from chat_links where workspace_id=? and parent_thread_id=? and hidden=1)", .{ workspace, parent });
+    try conn.exec("update chat_deliveries set delivered=1 where delivered=0 and link_id in (select link_id from chat_links where coalesce(parent_workspace_id,workspace_id)=? and parent_thread_id=? and hidden=1)", .{ workspace, parent });
 }
 
 /// Write the MCP task representation from durable state, including its result.
@@ -243,6 +321,7 @@ test "removing a linked chat stops parent delivery" {
     var conn = try zqlite.open(":memory:", zqlite.OpenFlags.Create | zqlite.OpenFlags.EXResCode);
     defer conn.close();
     try conn.execNoArgs(@import("../db/chat_links_schema.zig").SCHEMA_SQL);
+    try ensureParentWorkspaceColumn(conn);
     try initialize(conn);
     try conn.execNoArgs("insert into chat_links(link_id,workspace_id,parent_thread_id,local_thread_id) values('l','w','p','c')");
     try createTask(conn, "t1", "w", "c", "verde", 1);
@@ -262,6 +341,7 @@ test "turns folded into one child run notify the parent once" {
     var conn = try zqlite.open(":memory:", zqlite.OpenFlags.Create | zqlite.OpenFlags.EXResCode);
     defer conn.close();
     try conn.execNoArgs(@import("../db/chat_links_schema.zig").SCHEMA_SQL);
+    try ensureParentWorkspaceColumn(conn);
     try initialize(conn);
     try conn.execNoArgs("insert into chat_links(link_id,workspace_id,parent_thread_id,local_thread_id) values('l','w','p','c')");
     try createTask(conn, "t1", "w", "c", "verde", 1);
@@ -285,6 +365,7 @@ test "delegated work notifies only the parent that asked for it" {
     var conn = try zqlite.open(":memory:", zqlite.OpenFlags.Create | zqlite.OpenFlags.EXResCode);
     defer conn.close();
     try conn.execNoArgs(@import("../db/chat_links_schema.zig").SCHEMA_SQL);
+    try ensureParentWorkspaceColumn(conn);
     try initialize(conn);
     try conn.execNoArgs("insert into chat_links(link_id,workspace_id,parent_thread_id,local_thread_id) values('l1','w','p1','c'),('l2','w','p2','c')");
     try createTask(conn, "asked", "w", "c", "mcp", 1);
@@ -314,6 +395,7 @@ test "active child count tracks working children and undelivered results" {
     var conn = try zqlite.open(":memory:", zqlite.OpenFlags.Create | zqlite.OpenFlags.EXResCode);
     defer conn.close();
     try conn.execNoArgs(@import("../db/chat_links_schema.zig").SCHEMA_SQL);
+    try ensureParentWorkspaceColumn(conn);
     try initialize(conn);
     try conn.execNoArgs("insert into chat_links(link_id,workspace_id,parent_thread_id,local_thread_id) values('l1','w','p','c1'),('l2','w','p','c2')");
     try createTask(conn, "t1", "w", "c1", "mcp", 1);
@@ -327,4 +409,24 @@ test "active child count tracks working children and undelivered results" {
     try updateTask(conn, "t2", "completed", "two", "{}", "{}", 3);
     try conn.execNoArgs("update chat_deliveries set delivered=1");
     try std.testing.expectEqual(@as(usize, 0), try activeChildCount(conn, "w", "p", null));
+}
+
+test "cross-workspace links count, deliver, and clear under the parent's workspace" {
+    var conn = try zqlite.open(":memory:", zqlite.OpenFlags.Create | zqlite.OpenFlags.EXResCode);
+    defer conn.close();
+    try conn.execNoArgs(@import("../db/chat_links_schema.zig").SCHEMA_SQL);
+    try initialize(conn);
+    try initialize(conn); // idempotent column add
+    try conn.execNoArgs("insert into chat_links(link_id,workspace_id,parent_thread_id,local_thread_id,parent_workspace_id) values('l','child-ws','companion','c','home-ws')");
+    try createTask(conn, "t1", "child-ws", "c", "verde", 1);
+    try std.testing.expectEqual(@as(usize, 1), try activeChildCount(conn, "home-ws", "companion", null));
+    try std.testing.expectEqual(@as(usize, 0), try activeChildCount(conn, "child-ws", "companion", null));
+    try updateTask(conn, "t1", "completed", "done", null, null, 2);
+    var delivered = (try conn.row("select count(*) from chat_deliveries d join chat_links l on l.link_id=d.link_id where " ++ PARENT_WORKSPACE_SQL ++ "='home-ws'", .{})).?;
+    try std.testing.expectEqual(@as(i64, 1), delivered.int(0));
+    delivered.deinit();
+    try clear(conn, "home-ws", "companion", null, false);
+    var hidden = (try conn.row("select hidden from chat_links where link_id='l'", .{})).?;
+    defer hidden.deinit();
+    try std.testing.expectEqual(@as(i64, 1), hidden.int(0));
 }

@@ -1503,7 +1503,9 @@ fn renderLinkedChatRow(
         }, NF_COD_CLOSE, paletteColor(if (close_hover) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), icon, clip);
     }
     if (visible.w <= 0.0 or visible.h <= 0.0) return;
-    appendLinkedChatHit(pane_id, visible, .open, workspace_id, parent_id, entry.link_id, entry.local_thread_id);
+    // Linked chats may live in another workspace (machine Companion crew).
+    const child_workspace_id = if (entry.workspace_id.len > 0) entry.workspace_id else workspace_id;
+    appendLinkedChatHit(pane_id, visible, .open, child_workspace_id, parent_id, entry.link_id, entry.local_thread_id);
     const close_visible = intersectRect(close_rect, clip);
     if (!entry.is_parent and close_visible.w > 0.0 and close_visible.h > 0.0) {
         appendLinkedChatHit(pane_id, close_visible, .hide, workspace_id, parent_id, entry.link_id, entry.local_thread_id);

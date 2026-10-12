@@ -2903,6 +2903,9 @@ const AcceptanceLegacyTurnStartParams = struct {
     /// `project_path` when null.
     cwd: ?[]const u8 = null,
     message_id: []const u8,
+    /// Hidden provider-only context appended by the daemon (the machine
+    /// Companion's orchestrator persona); never shown in the transcript.
+    orchestration_note: ?[]const u8 = null,
 };
 
 const AcceptanceRepositoryTurnStartParams = struct {
@@ -2929,6 +2932,8 @@ const AcceptanceRepositoryTurnStartParams = struct {
     /// Opaque runtime-scoped staged attachment IDs (chat.attachments.v1),
     /// filled only after every upload commits. Never desktop paths.
     attachments: []const []const u8 = &.{},
+    /// See AcceptanceLegacyTurnStartParams.orchestration_note.
+    orchestration_note: ?[]const u8 = null,
 };
 
 const AcceptanceTurnStartParams = union(enum) {
@@ -3598,6 +3603,9 @@ pub fn dispatchDaemonAcceptance(
     const model_ref = if (thread.model_ref) |model_ref_value| try arena.dupe(u8, model_ref_value) else null;
     const reasoning_effort: ?[]const u8 = if (thread.reasoning_effort) |effort| @tagName(effort) else null;
     const reasoning_variant = if (daemonReasoningVariant(thread.provider, thread.opencode_reasoning_variant)) |variant| try arena.dupe(u8, variant) else null;
+    // The daemon appends the machine Companion's persona itself, so every
+    // client gets it; the GUI sends no extra orchestration context.
+    const orchestration_note: ?[]const u8 = null;
 
     switch (execution_route) {
         .legacy_local => {
@@ -3637,6 +3645,7 @@ pub fn dispatchDaemonAcceptance(
                 .access_mode = @tagName(thread.access_mode),
                 .cwd = if (thread.cwd) |cwd| try arena.dupe(u8, cwd) else null,
                 .message_id = message_id,
+                .orchestration_note = orchestration_note,
             } };
         },
         .repository_local, .remote => {
@@ -3658,6 +3667,7 @@ pub fn dispatchDaemonAcceptance(
                 .fast_mode = thread.fast_mode == .on,
                 .access_mode = @tagName(thread.access_mode),
                 .message_id = message_id,
+                .orchestration_note = orchestration_note,
                 .require_provider_ready = switch (execution_route) {
                     .remote => true,
                     .legacy_local, .repository_local => false,
@@ -8736,9 +8746,11 @@ pub fn noteChatCompletion(self: anytype, project_index: usize, thread_index: usi
 
     // The pane-less Companion thread cannot be revealed by focusing a chat
     // pane, so its completion copy must name the next action explicitly.
-    const is_companion = project.isCompanionThread(thread);
-    const title = if (is_companion)
-        "Sprout"
+    const companion_name: ?[]const u8 = if (comptime @hasDecl(@TypeOf(self.*), "companionNameForThread"))
+        self.companionNameForThread(project, thread)
+    else if (project.isCompanionThread(thread)) "Companion" else null;
+    const title = if (companion_name) |name|
+        name
     else if (thread.title.len > 0)
         thread.title
     else
@@ -8746,7 +8758,7 @@ pub fn noteChatCompletion(self: anytype, project_index: usize, thread_index: usi
 
     const dir = if (project.path.len > 0) std.fs.path.basename(project.path) else "";
     var body_buf: [256]u8 = undefined;
-    const body = completionNoticeBody(is_companion, dir, &body_buf);
+    const body = completionNoticeBody(companion_name, dir, &body_buf);
 
     const icon: ?notifier.Icon = switch (thread.provider) {
         .codex => .{ .key = "codex", .png_bytes = CODEX_LOGO_BYTES },
@@ -8784,32 +8796,33 @@ test "focused daemon completion receives a suppression timestamp" {
     try std.testing.expectEqual(@as(i64, 100), projected.completed_at_ms);
 }
 
-/// Completion toast copy. Companion completions direct the user to the Sprout
-/// panel because no chat pane exists to focus; ordinary threads keep the
-/// established "Reply ready" wording.
-pub fn completionNoticeBody(is_companion: bool, dir: []const u8, buf: []u8) []const u8 {
-    if (is_companion) {
+/// Completion toast copy. Companion completions name the companion and point
+/// at its panel because no chat pane exists to focus; ordinary threads keep
+/// the established "Reply ready" wording.
+pub fn completionNoticeBody(companion_name: ?[]const u8, dir: []const u8, buf: []u8) []const u8 {
+    if (companion_name) |name| {
         if (dir.len > 0) {
-            return std.fmt.bufPrint(buf, "Sprout finished in {s}. Open the Sprout panel to review the result.", .{dir}) catch
-                "Sprout finished. Open the Sprout panel to review the result.";
+            return std.fmt.bufPrint(buf, "{s} has an update from {s}. Open the companion to review.", .{ name, dir }) catch
+                "Your companion has an update. Open the companion to review.";
         }
-        return "Sprout finished. Open the Sprout panel to review the result.";
+        return std.fmt.bufPrint(buf, "{s} has an update. Open the companion to review.", .{name}) catch
+            "Your companion has an update. Open the companion to review.";
     }
     if (dir.len > 0) return std.fmt.bufPrint(buf, "Reply ready in {s}", .{dir}) catch "Reply ready";
     return "Reply ready";
 }
 
-test "completion notice directs Companion completions to the Sprout panel" {
+test "completion notice names the companion and points at its panel" {
     var buf: [256]u8 = undefined;
-    try std.testing.expectEqualStrings("Reply ready in verde", completionNoticeBody(false, "verde", &buf));
-    try std.testing.expectEqualStrings("Reply ready", completionNoticeBody(false, "", &buf));
+    try std.testing.expectEqualStrings("Reply ready in verde", completionNoticeBody(null, "verde", &buf));
+    try std.testing.expectEqualStrings("Reply ready", completionNoticeBody(null, "", &buf));
     try std.testing.expectEqualStrings(
-        "Sprout finished in verde. Open the Sprout panel to review the result.",
-        completionNoticeBody(true, "verde", &buf),
+        "Juniper has an update from verde. Open the companion to review.",
+        completionNoticeBody("Juniper", "verde", &buf),
     );
     try std.testing.expectEqualStrings(
-        "Sprout finished. Open the Sprout panel to review the result.",
-        completionNoticeBody(true, "", &buf),
+        "Juniper has an update. Open the companion to review.",
+        completionNoticeBody("Juniper", "", &buf),
     );
 }
 

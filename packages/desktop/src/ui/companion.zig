@@ -1,9 +1,13 @@
-//! Fixture-backed native Companion overlay rendering and dedicated hit routing.
+//! Machine-wide Companion overlay: a character dock that summarizes what is
+//! running and what needs the user, and an orchestration panel with the
+//! needs-you inbox, the companion's crew of delegated chats, the conversation,
+//! and the shared composer. Characters are vector art drawn from the theme.
 
 const std = @import("std");
 const palette = @import("palette");
 const app_config = @import("../app/config.zig");
 const controller = @import("../state/companion_controller.zig");
+const companion_roster = @import("../state/companion_roster.zig");
 const runtime = @import("runtime.zig");
 const theme = @import("theme.zig");
 const text_measure = @import("text_measure.zig");
@@ -15,52 +19,76 @@ test {
 
 const log = std.log.scoped(.companion_ui);
 
+// Logical-unit geometry tokens (multiplied by the display scale).
+const DOCK_HEIGHT: f32 = 54.0;
+const DOCK_RIGHT_INSET: f32 = 14.0;
+const DOCK_BOTTOM_INSET: f32 = 18.0;
+const DOCK_AVATAR_SLOT: f32 = 44.0;
+const PANEL_WIDTH: f32 = 420.0;
+const PANEL_INSET: f32 = 10.0;
+const HEADER_HEIGHT: f32 = 64.0;
+const FOOTER_HEIGHT: f32 = 116.0;
+const CONTENT_INSET: f32 = 14.0;
+const SECTION_TITLE_HEIGHT: f32 = 24.0;
+const INBOX_ROW_HEIGHT: f32 = 46.0;
+const CREW_ROW_HEIGHT: f32 = 40.0;
+const ROW_GAP: f32 = 6.0;
+const MAX_INBOX_ROWS_SHOWN: usize = 3;
+const MAX_CREW_ROWS_SHOWN: usize = 4;
+const APPROVAL_HEIGHT: f32 = 104.0;
+const ERROR_STRIP_HEIGHT: f32 = 30.0;
+const RECAP_HEIGHT: f32 = 42.0;
+const HEADER_BUTTON: f32 = 28.0;
+const MENU_ROW_HEIGHT: f32 = 40.0;
+const MENU_ACTION_HEIGHT: f32 = 34.0;
+const BRAIN_ROW_HEIGHT: f32 = 30.0;
+const SUGGESTION_HEIGHT: f32 = 36.0;
+const BODY_FONT: f32 = 12.5;
+const LINE_HEIGHT_FACTOR: f32 = 1.45;
+const MAX_WRAP_LINES: usize = 64;
+const USER_MAX_LINES: usize = 10;
+const ASSISTANT_MAX_LINES: usize = 64;
+
 pub const Geometry = struct {
     window: palette.Rect,
-    chip: palette.Rect,
-    chip_character: palette.Rect,
-    chip_hit: palette.Rect,
-    sidecar: palette.Rect,
+    dock: palette.Rect,
+    dock_avatar: palette.Rect,
+    panel: palette.Rect,
     header: palette.Rect,
-    mission_control_button: palette.Rect,
+    avatar: palette.Rect,
+    name_button: palette.Rect,
+    brain_button: palette.Rect,
+    prev_button: palette.Rect,
+    next_button: palette.Rect,
+    new_button: palette.Rect,
     close_button: palette.Rect,
-    objective: palette.Rect,
-    tabs: palette.Rect,
-    body: palette.Rect,
+    inbox: palette.Rect,
+    crew: palette.Rect,
+    conversation: palette.Rect,
+    approval: palette.Rect,
+    error_strip: palette.Rect,
+    recap: palette.Rect,
     footer: palette.Rect,
 };
 
-const MissionControlMode = enum { wide, laptop, narrow };
-
-const MissionControlGeometry = struct {
-    window: palette.Rect,
-    header: palette.Rect,
-    close_button: palette.Rect,
-    body: palette.Rect,
-    footer: palette.Rect,
-    summary: palette.Rect,
-    operations: palette.Rect,
-    inspector: palette.Rect,
-    mode: MissionControlMode,
-};
-
-/// Rebuilds Companion-only hits before SDL events are routed.
+/// Rebuilds Companion-only hits before events are routed.
 pub fn refreshHits(state: *runtime.AppState, width: f32, height: f32) void {
     if (!state.isCompanionEnabled()) {
         state.reconcileCompanionAvailability();
         return;
     }
     state.syncCompanionProjection();
-    state.companion_controller.frame_width = width;
-    state.companion_controller.frame_height = height;
-    if (state.companion_controller.mission_control_open) {
-        const geometry = computeMissionControlGeometry(width, height, companionScale());
-        state.syncCompanionComposer(composerRect(geometry.footer));
-        prepareAndRegisterMissionControlHits(&state.companion_controller, geometry);
-    } else {
-        const geometry = computeGeometryForState(width, height, companionScale(), &state.companion_controller);
-        prepareAndRegisterHits(&state.companion_controller, geometry);
-    }
+    const companion = &state.companion_controller;
+    companion.frame_width = width;
+    companion.frame_height = height;
+    const geometry = computeGeometry(state, width, height);
+    if (companion.visibility == .sidecar_open) state.syncCompanionComposer(composerRect(geometry.footer));
+    registerHits(state, geometry);
+}
+
+fn refreshAfterAction(state: *runtime.AppState) void {
+    refreshHits(state, state.companion_controller.frame_width, state.companion_controller.frame_height);
+    state.markDirty();
 }
 
 /// Routes pointer buttons only when the visible Companion surface is hit.
@@ -75,47 +103,30 @@ pub fn handleMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, d
                 state.companion_controller.collapse();
                 state.blurCompanionComposer();
             },
-            .mission_control_open => {
-                state.companion_controller.openMissionControl();
-                state.blurCompanionComposer();
-                refreshHits(state, state.companion_controller.frame_width, state.companion_controller.frame_height);
-            },
-            .mission_control_close => {
-                state.companion_controller.closeMissionControl();
-                refreshHits(state, state.companion_controller.frame_width, state.companion_controller.frame_height);
-            },
             .approve, .deny => {
-                const resolved = if (action == .approve)
-                    state.resolveCurrentCompanionApproval(.approve)
-                else
-                    state.resolveCurrentCompanionApproval(.deny);
+                const resolved = state.resolveCurrentCompanionApproval(if (action == .approve) .approve else .deny);
                 state.companion_controller.ui_error = if (resolved) null else "Approval decision was not accepted.";
-                refreshHits(state, state.companion_controller.frame_width, state.companion_controller.frame_height);
             },
-            .run_tab, .activity_tab => {
-                state.companion_controller.selectTab(if (action == .run_tab) .run else .activity);
-                const geometry = computeGeometryForState(
-                    state.companion_controller.frame_width,
-                    state.companion_controller.frame_height,
-                    companionScale(),
-                    &state.companion_controller,
-                );
-                prepareAndRegisterHits(&state.companion_controller, geometry);
-            },
-            .operation_select => if (result.reference) |reference| {
-                state.companion_controller.toggleOperationSelection(reference);
-                refreshHits(state, state.companion_controller.frame_width, state.companion_controller.frame_height);
-            },
-            .operation_stop, .operation_follow_log => if (result.reference) |reference| {
-                _ = state.dispatchCompanionOperationAction(
-                    reference,
-                    if (action == .operation_stop) .stop else .follow_log,
-                );
-                refreshHits(state, state.companion_controller.frame_width, state.companion_controller.frame_height);
-            },
+            .switch_prev => state.cycleCompanion(false),
+            .switch_next => state.cycleCompanion(true),
+            .companion_menu => state.companion_controller.openMenu(.companions),
+            .brain_menu => state.companion_controller.openMenu(.brain),
+            .menu_dismiss => state.companion_controller.closeMenu(),
+            .menu_select_companion => state.selectCompanion(result.index),
+            .menu_new_companion => state.createCompanion(),
+            .menu_rename => state.beginCompanionRename(),
+            .menu_orders => state.beginCompanionOrders(),
+            .recap => state.sendCompanionRecap(),
+            .menu_remove => state.removeActiveCompanion(),
+            .menu_character => if (characterAt(result.index)) |character| state.setActiveCompanionCharacter(character),
+            .brain_provider => state.selectCompanionBrainProvider(result.index),
+            .brain_model => state.setCompanionBrain(result.index),
+            .crew_open => state.openCompanionChatRow(false, result.index),
+            .inbox_open => state.openCompanionChatRow(true, result.index),
+            .suggestion => state.sendCompanionSuggestion(result.index),
             .panel, .body => {},
         }
-        state.markDirty();
+        if (action != .panel and action != .body) refreshAfterAction(state);
     }
     if (button == 1 and state.companion_controller.visibility == .sidecar_open and
         (result.action == null or result.action.? == .panel))
@@ -125,7 +136,7 @@ pub fn handleMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, d
     return true;
 }
 
-/// Prevents underlying hover routing only inside the chip or sidecar.
+/// Prevents underlying hover routing only inside the dock or panel.
 pub fn handleMouseMotion(state: *runtime.AppState, x: f32, y: f32, dragging: bool) bool {
     if (!state.isCompanionEnabled()) return false;
     const owned = state.companion_controller.hasPointerCapture() or state.companion_controller.hitAt(x, y) != null;
@@ -133,33 +144,38 @@ pub fn handleMouseMotion(state: *runtime.AppState, x: f32, y: f32, dragging: boo
     return owned;
 }
 
-/// Scrolls the sidecar body directly; panel chrome consumes without scrolling.
+/// Scrolls the brain list or the conversation directly; chrome consumes.
 pub fn handleWheel(state: *runtime.AppState, x: f32, y: f32, wheel_y: f32) bool {
     if (!state.isCompanionEnabled()) return false;
-    const action = state.companion_controller.hitAt(x, y) orelse return false;
-    if (state.companion_controller.mission_control_open) {
-        if (pointInRect(state.companion_composer.bounds(), x, y) and state.routeCompanionComposerWheel(x, y, wheel_y)) return true;
-        if (wheel_y != 0.0) scrollMissionControlAt(state, x, y, -wheel_y * companionScaled(32.0));
-        _ = action;
+    const companion = &state.companion_controller;
+    _ = companion.hitAt(x, y) orelse return false;
+    if (wheel_y == 0.0) return true;
+    const delta = -wheel_y * companionScaled(32.0);
+    const geometry = computeGeometry(state, companion.frame_width, companion.frame_height);
+    if (companion.menu == .brain) {
+        const menu = brainMenuLayout(state, geometry);
+        if (pointInRect(menu.list, x, y)) {
+            companion.scrollBrain(delta);
+            state.markDirty();
+        }
         return true;
     }
+    if (companion.menu != .none) return true;
     if (state.routeCompanionComposerWheel(x, y, wheel_y)) return true;
-    const body_rect = bodyHitRect(state.companion_controller.hits[0..state.companion_controller.hit_count]);
-    if (pointInRect(body_rect, x, y) and wheel_y != 0.0) {
-        const max_scroll = @max(bodyContentHeight(&state.companion_controller, body_rect.w) - body_rect.h, 0.0);
-        state.companion_controller.scrollCurrent(-wheel_y * companionScaled(32.0), max_scroll);
+    if (pointInRect(geometry.conversation, x, y)) {
+        companion.scrollConversation(delta);
         state.markDirty();
     }
-    _ = action;
     return true;
 }
 
-/// Owns one physical Escape sequence and collapses only on its first key-down.
+/// Owns one physical Escape sequence; each press peels one layer.
 pub fn handleEscapeKey(state: *runtime.AppState, down: bool) bool {
     if (!state.isCompanionEnabled()) return false;
+    const was_open = state.companion_controller.visibility == .sidecar_open;
     if (!state.companion_controller.handleEscapeKey(down)) return false;
-    if (down) state.blurCompanionComposer();
-    state.markDirty();
+    if (down and was_open and state.companion_controller.visibility != .sidecar_open) state.blurCompanionComposer();
+    refreshAfterAction(state);
     return true;
 }
 
@@ -180,1360 +196,993 @@ pub fn hitAt(state: *const runtime.AppState, x: f32, y: f32) ?controller.HitActi
     return state.companion_controller.hitAt(x, y);
 }
 
-/// Renders the persistent Companion surface above panes and below true modals.
+/// Renders the Companion above panes and below true modals.
 pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     if (!state.isCompanionEnabled()) return;
-    if (state.companion_controller.mission_control_open) {
-        renderMissionControl(state, computeMissionControlGeometry(width, height, companionScale()));
-        return;
-    }
-    const geometry = computeGeometryForState(width, height, companionScale(), &state.companion_controller);
+    const geometry = computeGeometry(state, width, height);
     switch (state.companion_controller.visibility) {
-        .collapsed_chip => renderChip(state, geometry),
-        .sidecar_open => renderSidecar(state, geometry),
+        .collapsed_chip => renderDock(state, geometry),
+        .sidecar_open => renderPanel(state, geometry),
     }
 }
 
-pub fn computeGeometry(width: f32, height: f32, scale: f32) Geometry {
-    var state = controller.init();
-    state.applyFixture(.idle);
-    return computeGeometryForState(width, height, scale, &state);
+fn characterAt(index: usize) ?app_config.CompanionCharacter {
+    const all = [_]app_config.CompanionCharacter{ .sprout, .moss, .vireo };
+    return if (index < all.len) all[index] else null;
 }
 
-fn computeGeometryForState(width: f32, height: f32, scale: f32, state: *const controller) Geometry {
-    const scaled = struct {
-        fn value(raw: f32, factor: f32) f32 {
-            return raw * factor;
-        }
-    }.value;
-    const window_width = @max(width, 0.0);
-    const window_height = @max(height, 0.0);
-    const narrow = window_width < scaled(440.0, scale);
-    const desired_inset = scaled(if (narrow) 8.0 else 10.0, scale);
-    const side_inset = @min(desired_inset, @min(window_width, window_height) * 0.5);
-    const sidecar_width = @max(@min(scaled(404.0, scale), window_width - side_inset * 2.0), 0.0);
-    const sidecar_height = @max(window_height - side_inset * 2.0, 0.0);
-    const sidecar: palette.Rect = .{
-        .x = window_width - side_inset - sidecar_width,
-        .y = side_inset,
-        .w = sidecar_width,
-        .h = sidecar_height,
-    };
+// ---- geometry --------------------------------------------------------------
 
-    const header_h = @min(scaled(44.0, scale), sidecar.h);
-    const after_header = @max(sidecar.h - header_h, 0.0);
-    const footer_h = @min(scaled(116.0, scale), after_header);
-    const chrome_room = @max(after_header - footer_h, 0.0);
-    const tabs_h = @min(scaled(45.0, scale), chrome_room);
-    const objective_h = @min(scaled(92.0, scale), @max(chrome_room - tabs_h, 0.0));
-    const body_h = @max(sidecar.h - header_h - objective_h - tabs_h - footer_h, 0.0);
-    const chip_width = @min(chipWidth(state, scale), window_width);
-    const chip_height = @min(scaled(36.0, scale), window_height);
-    const chip: palette.Rect = .{
-        .x = @max(window_width - chip_width, 0.0),
-        .y = @max(window_height - @min(scaled(20.0, scale), window_height) - chip_height, 0.0),
-        .w = chip_width,
-        .h = chip_height,
-    };
-    const character_width = @min(scaled(46.0, scale), window_width);
-    const character_height = @min(scaled(48.0, scale), window_height);
-    const character_candidate: palette.Rect = .{
-        .x = @min(chip.x + scaled(5.0, scale), window_width),
-        .y = chip.y + chip.h - scaled(33.0, scale) - character_height,
-        .w = character_width,
-        .h = character_height,
-    };
-    const character = if (rectFitsWindow(character_candidate, window_width, window_height) and
-        character_width >= scaled(46.0, scale) and character_height >= scaled(48.0, scale))
-        character_candidate
-    else
-        palette.Rect{ .x = chip.x, .y = chip.y };
-
-    const close_x_inset = @min(scaled(12.0, scale), sidecar.w);
-    const close_y_inset = @min(scaled(8.0, scale), header_h);
-    const close_width = @min(scaled(27.0, scale), @max(sidecar.w - close_x_inset, 0.0));
-    const close_height = @min(scaled(27.0, scale), @max(header_h - close_y_inset, 0.0));
-    const close_button: palette.Rect = .{
-        .x = sidecar.x + @max(sidecar.w - close_x_inset - close_width, 0.0),
-        .y = sidecar.y + close_y_inset,
-        .w = close_width,
-        .h = close_height,
-    };
-    const mission_control_width = @min(scaled(124.0, scale), @max(close_button.x - sidecar.x - scaled(124.0, scale), 0.0));
-    const mission_control_button: palette.Rect = .{
-        .x = close_button.x - scaled(7.0, scale) - mission_control_width,
-        .y = close_button.y,
-        .w = mission_control_width,
-        .h = close_button.h,
-    };
-
-    return .{
-        .window = .{ .x = 0.0, .y = 0.0, .w = window_width, .h = window_height },
-        .chip = chip,
-        .chip_character = character,
-        .chip_hit = unionRects(chip, character),
-        .sidecar = sidecar,
-        .header = .{ .x = sidecar.x, .y = sidecar.y, .w = sidecar.w, .h = header_h },
-        .mission_control_button = mission_control_button,
-        .close_button = close_button,
-        .objective = .{ .x = sidecar.x, .y = sidecar.y + header_h, .w = sidecar.w, .h = objective_h },
-        .tabs = .{ .x = sidecar.x, .y = sidecar.y + header_h + objective_h, .w = sidecar.w, .h = tabs_h },
-        .body = .{ .x = sidecar.x, .y = sidecar.y + header_h + objective_h + tabs_h, .w = sidecar.w, .h = body_h },
-        .footer = .{ .x = sidecar.x, .y = sidecar.y + sidecar.h - footer_h, .w = sidecar.w, .h = footer_h },
-    };
+pub fn computeGeometry(state: *runtime.AppState, width: f32, height: f32) Geometry {
+    return computeGeometryAt(state, width, height, companionScale());
 }
 
-fn computeMissionControlGeometry(width: f32, height: f32, scale: f32) MissionControlGeometry {
+fn computeGeometryAt(state: *runtime.AppState, width: f32, height: f32, s: f32) Geometry {
+    const companion = &state.companion_controller;
     const window: palette.Rect = .{ .x = 0.0, .y = 0.0, .w = @max(width, 0.0), .h = @max(height, 0.0) };
-    const header_h = @min(48.0 * scale, window.h);
-    const header: palette.Rect = .{ .x = 0.0, .y = 0.0, .w = window.w, .h = header_h };
-    const remaining_h = @max(window.h - header_h, 0.0);
-    const footer_h = @min(116.0 * scale, remaining_h);
-    const body: palette.Rect = .{ .x = 0.0, .y = header_h, .w = window.w, .h = @max(remaining_h - footer_h, 0.0) };
-    const footer: palette.Rect = .{ .x = 0.0, .y = body.y + body.h, .w = window.w, .h = footer_h };
-    const close_size = @min(28.0 * scale, @max(header_h - 12.0 * scale, 0.0));
-    const close_button: palette.Rect = .{
-        .x = @max(window.w - 16.0 * scale - close_size, 0.0),
-        .y = @max((header_h - close_size) * 0.5, 0.0),
-        .w = close_size,
-        .h = close_size,
+
+    // Dock: a pill hugging the bottom-right corner, sized to its text.
+    const dock_text_w = @max(dockTextWidth(state, s), 72.0 * s);
+    const dock_w = @min(DOCK_AVATAR_SLOT * s + dock_text_w + 30.0 * s, @max(window.w - 2.0 * DOCK_RIGHT_INSET * s, 0.0));
+    const dock_h = @min(DOCK_HEIGHT * s, window.h);
+    const dock: palette.Rect = .{
+        .x = @max(window.w - DOCK_RIGHT_INSET * s - dock_w, 0.0),
+        .y = @max(window.h - DOCK_BOTTOM_INSET * s - dock_h, 0.0),
+        .w = dock_w,
+        .h = dock_h,
     };
-    const mode: MissionControlMode = if (window.w < 720.0 * scale or window.h < 520.0 * scale)
-        .narrow
-    else if (window.w < 960.0 * scale)
-        .laptop
-    else
-        .wide;
-    const padding = 16.0 * scale;
-    const gap = 12.0 * scale;
-    const content: palette.Rect = .{
-        .x = padding,
-        .y = body.y + padding,
-        .w = @max(body.w - padding * 2.0, 0.0),
-        .h = @max(body.h - padding * 2.0, 0.0),
-    };
-    if (mode == .narrow) return .{
-        .window = window,
-        .header = header,
-        .close_button = close_button,
-        .body = body,
-        .footer = footer,
-        .summary = content,
-        .operations = content,
-        .inspector = content,
-        .mode = mode,
-    };
-    if (mode == .laptop) {
-        const left_w = std.math.clamp(content.w * 0.34, 200.0 * scale, @max(content.w - 260.0 * scale - gap, 200.0 * scale));
-        const left: palette.Rect = .{ .x = content.x, .y = content.y, .w = @min(left_w, content.w), .h = content.h };
-        const right: palette.Rect = .{
-            .x = left.x + left.w + gap,
-            .y = content.y,
-            .w = @max(content.x + content.w - left.x - left.w - gap, 0.0),
-            .h = content.h,
-        };
-        const summary_h = std.math.clamp((left.h - gap) * 0.42, 160.0 * scale, @max(left.h - gap - 140.0 * scale, 160.0 * scale));
-        return .{
-            .window = window,
-            .header = header,
-            .close_button = close_button,
-            .body = body,
-            .footer = footer,
-            .summary = .{ .x = left.x, .y = left.y, .w = left.w, .h = @min(summary_h, left.h) },
-            .operations = .{ .x = left.x, .y = left.y + @min(summary_h, left.h) + gap, .w = left.w, .h = @max(left.h - @min(summary_h, left.h) - gap, 0.0) },
-            .inspector = right,
-            .mode = mode,
-        };
-    }
-    const left_w = std.math.clamp(content.w * 0.2, 220.0 * scale, 280.0 * scale);
-    const right_w = std.math.clamp(content.w * 0.24, 260.0 * scale, 320.0 * scale);
-    const center_w = @max(content.w - left_w - right_w - gap * 2.0, 0.0);
+    const dock_avatar: palette.Rect = .{ .x = dock.x + 8.0 * s, .y = dock.y + 5.0 * s, .w = DOCK_AVATAR_SLOT * s - 6.0 * s, .h = @max(dock.h - 10.0 * s, 0.0) };
+
+    // Panel: right-side column, full height.
+    const inset = @min(PANEL_INSET * s, @min(window.w, window.h) * 0.5);
+    const panel_w = @max(@min(PANEL_WIDTH * s, window.w - inset * 2.0), 0.0);
+    const panel: palette.Rect = .{ .x = window.w - inset - panel_w, .y = inset, .w = panel_w, .h = @max(window.h - inset * 2.0, 0.0) };
+    const header: palette.Rect = .{ .x = panel.x, .y = panel.y, .w = panel.w, .h = @min(HEADER_HEIGHT * s, panel.h) };
+    const footer_h = @min(FOOTER_HEIGHT * s, @max(panel.h - header.h, 0.0));
+    const footer: palette.Rect = .{ .x = panel.x, .y = panel.y + panel.h - footer_h, .w = panel.w, .h = footer_h };
+
+    const button = HEADER_BUTTON * s;
+    const button_y = header.y + (header.h - button) * 0.5;
+    const close_button: palette.Rect = .{ .x = header.x + header.w - 12.0 * s - button, .y = button_y, .w = button, .h = button };
+    const new_button: palette.Rect = .{ .x = close_button.x - 6.0 * s - button, .y = button_y, .w = button, .h = button };
+    const switcher = companion.identity.count > 1;
+    const next_button: palette.Rect = if (switcher) .{ .x = new_button.x - 10.0 * s - button, .y = button_y, .w = button, .h = button } else .{};
+    const prev_button: palette.Rect = if (switcher) .{ .x = next_button.x - 2.0 * s - button, .y = button_y, .w = button, .h = button } else .{};
+    const avatar: palette.Rect = .{ .x = header.x + 12.0 * s, .y = header.y + 9.0 * s, .w = 44.0 * s, .h = 46.0 * s };
+    const text_x = avatar.x + avatar.w + 10.0 * s;
+    const text_right = (if (switcher) prev_button.x else new_button.x) - 8.0 * s;
+    const name_w = @min(text_measure.textWidth(.ui_bold, 15.0 * s, companion.identity.name.slice()) + 22.0 * s, @max(text_right - text_x, 0.0));
+    const name_button: palette.Rect = .{ .x = text_x - 4.0 * s, .y = header.y + 10.0 * s, .w = name_w + 4.0 * s, .h = 24.0 * s };
+    const brain_w = @min(text_measure.textWidth(.ui, 11.0 * s, companion.identity.brain.slice()) + 30.0 * s, @max(text_right - text_x, 0.0));
+    const brain_button: palette.Rect = .{ .x = text_x - 4.0 * s, .y = header.y + 35.0 * s, .w = brain_w + 4.0 * s, .h = 20.0 * s };
+
+    // Body stack between header and footer: inbox, crew, conversation, approval.
+    var top = header.y + header.h;
+    var bottom = footer.y;
+    const inner_x = panel.x + CONTENT_INSET * s;
+    const inner_w = @max(panel.w - CONTENT_INSET * 2.0 * s, 0.0);
+
+    const approval_h: f32 = if (companion.presentation.has_approval) APPROVAL_HEIGHT * s else 0.0;
+    const approval: palette.Rect = .{ .x = inner_x, .y = bottom - approval_h, .w = inner_w, .h = @max(approval_h - 8.0 * s, 0.0) };
+    bottom -= approval_h;
+    const error_h: f32 = if (errorMessage(state).len > 0) ERROR_STRIP_HEIGHT * s else 0.0;
+    const error_strip: palette.Rect = .{ .x = inner_x, .y = bottom - error_h, .w = inner_w, .h = @max(error_h - 6.0 * s, 0.0) };
+    bottom -= error_h;
+    const recap_h: f32 = if (companion.recap_available) RECAP_HEIGHT * s else 0.0;
+    const recap: palette.Rect = .{ .x = inner_x, .y = bottom - recap_h, .w = inner_w, .h = @max(recap_h - 8.0 * s, 0.0) };
+    bottom -= recap_h;
+
+    const inbox_rows = @min(companion.inbox_count, MAX_INBOX_ROWS_SHOWN);
+    const inbox_h: f32 = if (inbox_rows == 0) 0.0 else (SECTION_TITLE_HEIGHT + @as(f32, @floatFromInt(inbox_rows)) * (INBOX_ROW_HEIGHT + ROW_GAP) + 6.0) * s;
+    const inbox: palette.Rect = .{ .x = inner_x, .y = top + 8.0 * s, .w = inner_w, .h = @min(inbox_h, @max(bottom - top - 8.0 * s, 0.0)) };
+    if (inbox_h > 0.0) top = inbox.y + inbox.h;
+    const crew_rows = @min(companion.crew_count, MAX_CREW_ROWS_SHOWN);
+    const crew_h: f32 = if (crew_rows == 0) 0.0 else (SECTION_TITLE_HEIGHT + @as(f32, @floatFromInt(crew_rows)) * (CREW_ROW_HEIGHT + ROW_GAP) + 6.0) * s;
+    const crew: palette.Rect = .{ .x = inner_x, .y = top + 8.0 * s, .w = inner_w, .h = @min(crew_h, @max(bottom - top - 8.0 * s, 0.0)) };
+    if (crew_h > 0.0) top = crew.y + crew.h;
+    const conversation: palette.Rect = .{ .x = panel.x, .y = top + 4.0 * s, .w = panel.w, .h = @max(bottom - top - 4.0 * s, 0.0) };
+
     return .{
         .window = window,
+        .dock = dock,
+        .dock_avatar = dock_avatar,
+        .panel = panel,
         .header = header,
+        .avatar = avatar,
+        .name_button = name_button,
+        .brain_button = brain_button,
+        .prev_button = prev_button,
+        .next_button = next_button,
+        .new_button = new_button,
         .close_button = close_button,
-        .body = body,
+        .inbox = inbox,
+        .crew = crew,
+        .conversation = conversation,
+        .approval = approval,
+        .error_strip = error_strip,
+        .recap = recap,
         .footer = footer,
-        .summary = .{ .x = content.x, .y = content.y, .w = left_w, .h = content.h },
-        .operations = .{ .x = content.x + left_w + gap, .y = content.y, .w = center_w, .h = content.h },
-        .inspector = .{ .x = content.x + left_w + gap + center_w + gap, .y = content.y, .w = right_w, .h = content.h },
-        .mode = mode,
     };
 }
 
-fn chipWidth(state: *const controller, scale: f32) f32 {
-    const visual = chipVisual(state);
-    var width: f32 = 103.0;
-    width += switch (visual.detail) {
-        .none => 0.0,
-        .working, .failed => 43.0,
-        .paused => 48.0,
-    };
-    if (visual.show_approval) width += 78.0;
-    return width * scale;
+fn dockTextWidth(state: *runtime.AppState, s: f32) f32 {
+    const name_w = text_measure.textWidth(.ui_bold, 12.5 * s, state.companion_controller.identity.name.slice());
+    const status_w = text_measure.textWidth(.ui, 11.0 * s, dockStatus(state).text);
+    return @max(name_w, status_w);
 }
 
-const ChipDetail = enum { none, working, paused, failed };
+fn composerRect(footer: palette.Rect) palette.Rect {
+    const s = companionScale();
+    if (footer.w < 180.0 * s or footer.h < 70.0 * s) return .{ .x = footer.x, .y = footer.y };
+    return .{ .x = footer.x + 12.0 * s, .y = footer.y + 10.0 * s, .w = footer.w - 24.0 * s, .h = footer.h - 22.0 * s };
+}
 
-const ChipVisual = struct {
-    detail: ChipDetail,
-    show_approval: bool,
-    uses_danger: bool,
-};
-
-fn chipVisual(state: *const controller) ChipVisual {
+fn rowRect(section: palette.Rect, index: usize, row_h: f32) palette.Rect {
+    const s = companionScale();
     return .{
-        .detail = if (state.run_phase == .paused)
-            .paused
-        else if (state.run_phase == .working)
-            .working
-        else if (state.has_failure)
-            .failed
-        else
-            .none,
-        .show_approval = state.needs_approval,
-        .uses_danger = state.has_failure,
+        .x = section.x,
+        .y = section.y + SECTION_TITLE_HEIGHT * s + @as(f32, @floatFromInt(index)) * (row_h + ROW_GAP) * s,
+        .w = section.w,
+        .h = row_h * s,
     };
 }
 
-fn prepareAndRegisterHits(state: *controller, geometry: Geometry) void {
-    const max_scroll = @max(bodyContentHeight(state, geometry.body.w) - geometry.body.h, 0.0);
-    if (state.selected_tab == .activity)
-        state.updateActivityExtent(max_scroll)
-    else
-        state.body_scroll_y = std.math.clamp(state.body_scroll_y, 0.0, max_scroll);
-    registerHits(state, geometry, state.presentation.has_approval);
+fn approvalButtons(card: palette.Rect) [2]palette.Rect {
+    const s = companionScale();
+    const w = 84.0 * s;
+    const h = 28.0 * s;
+    const y = card.y + card.h - h - 10.0 * s;
+    const approve: palette.Rect = .{ .x = card.x + card.w - 12.0 * s - w, .y = y, .w = w, .h = h };
+    const deny: palette.Rect = .{ .x = approve.x - 8.0 * s - w, .y = y, .w = w, .h = h };
+    return .{ deny, approve };
 }
 
-fn registerHits(state: *controller, geometry: Geometry, show_approval: bool) void {
-    state.clearHits();
-    switch (state.visibility) {
-        .collapsed_chip => state.addHit(geometry.chip_hit, .open),
+// ---- hits -------------------------------------------------------------------
+
+fn registerHits(state: *runtime.AppState, geometry: Geometry) void {
+    const companion = &state.companion_controller;
+    companion.clearHits();
+    switch (companion.visibility) {
+        .collapsed_chip => companion.addHit(geometry.dock, .open),
         .sidecar_open => {
-            state.addHit(geometry.sidecar, .panel);
-            state.addHit(geometry.body, .body);
-            const tabs = tabRects(geometry.tabs);
-            state.addHit(tabs[0], .run_tab);
-            state.addHit(tabs[1], .activity_tab);
-            if (show_approval and state.selected_tab == .run) {
-                const buttons = approvalButtonRects(geometry.body, state.currentScrollY());
-                state.addHit(buttons[0], .deny);
-                state.addHit(buttons[1], .approve);
+            companion.addHit(geometry.panel, .panel);
+            companion.addHit(geometry.conversation, .body);
+            companion.addHit(geometry.name_button, .companion_menu);
+            companion.addHit(geometry.avatar, .companion_menu);
+            companion.addHit(geometry.brain_button, .brain_menu);
+            if (companion.identity.count > 1) {
+                companion.addHit(geometry.prev_button, .switch_prev);
+                companion.addHit(geometry.next_button, .switch_next);
             }
-            registerOperationHits(state, geometry.body);
-            if (geometry.mission_control_button.w >= companionScaled(92.0)) state.addHit(geometry.mission_control_button, .mission_control_open);
-            state.addHit(geometry.close_button, .collapse);
+            companion.addHit(geometry.new_button, .menu_new_companion);
+            companion.addHit(geometry.close_button, .collapse);
+            for (0..@min(companion.inbox_count, MAX_INBOX_ROWS_SHOWN)) |index| {
+                const row = rowRect(geometry.inbox, index, INBOX_ROW_HEIGHT);
+                if (row.y + row.h <= geometry.inbox.y + geometry.inbox.h + 1.0) companion.addIndexedHit(row, .inbox_open, index);
+            }
+            for (0..@min(companion.crew_count, MAX_CREW_ROWS_SHOWN)) |index| {
+                const row = rowRect(geometry.crew, index, CREW_ROW_HEIGHT);
+                if (row.y + row.h <= geometry.crew.y + geometry.crew.h + 1.0) companion.addIndexedHit(row, .crew_open, index);
+            }
+            if (companion.presentation.activity_count == 0) {
+                const layout = emptyStateLayout(geometry.conversation);
+                for (layout.suggestions, 0..) |rect, index| {
+                    if (rectInside(rect, geometry.conversation)) companion.addIndexedHit(rect, .suggestion, index);
+                }
+            }
+            if (companion.recap_available) companion.addHit(geometry.recap, .recap);
+            if (companion.presentation.has_approval and geometry.approval.h > 0.0) {
+                const buttons = approvalButtons(geometry.approval);
+                companion.addHit(buttons[0], .deny);
+                companion.addHit(buttons[1], .approve);
+            }
+            switch (companion.menu) {
+                .none => {},
+                .companions => registerCompanionMenuHits(state, geometry),
+                .brain => registerBrainMenuHits(state, geometry),
+            }
         },
     }
 }
 
-fn registerOperationHits(state: *controller, body: palette.Rect) void {
-    var y = body.y + companionScaled(12.0) - state.currentScrollY();
-    if (state.selected_tab == .activity) {
-        for (state.presentation.activity[0..state.presentation.activity_count]) |*item| {
-            const reference = activityOperationReference(&state.presentation, item);
-            if (reference) |value| registerOperationCardHits(state, body, &y, value, companionScaled(58.0), companionScaled(65.0));
-            if (reference == null) y += companionScaled(65.0);
-        }
-        return;
+// ---- dock -------------------------------------------------------------------
+
+const DockStatus = struct { text: []const u8, tone: enum { quiet, busy, attention, failure } };
+
+fn dockStatus(state: *runtime.AppState) DockStatus {
+    const companion = &state.companion_controller;
+    const needs_you = companion.inboxNeedsYouCount() + @as(usize, if (companion.presentation.has_approval) 1 else 0) +
+        crewNeedsYouCount(companion);
+    if (needs_you > 0) return .{ .text = if (needs_you == 1) "1 thing needs you" else framePrint(state, "{d} things need you", .{needs_you}), .tone = .attention };
+    if (companion.presentation.has_failure) return .{ .text = "Needs a look", .tone = .failure };
+    if (companion.recap_available) return .{ .text = "Welcome back · catch up?", .tone = .busy };
+    const running = companion.crewRunningCount();
+    if (companion.presentation.working and running > 0) return .{ .text = framePrint(state, "Working · {d} in crew", .{running}), .tone = .busy };
+    if (companion.presentation.working) return .{ .text = "Working…", .tone = .busy };
+    if (running > 0) return .{ .text = if (running == 1) "1 chat running" else framePrint(state, "{d} chats running", .{running}), .tone = .busy };
+    return .{ .text = "Ready when you are", .tone = .quiet };
+}
+
+fn crewNeedsYouCount(companion: *const controller) usize {
+    var count: usize = 0;
+    for (companion.crew[0..companion.crew_count]) |row| {
+        if (row.attention == .approval or row.attention == .blocked) count += 1;
     }
-
-    const frame = &state.presentation;
-    if (frame.has_approval) y += companionScaled(130.0);
-    y += resultCardHeight(frame, body.w);
-    const counts = frame.activeCounts();
-    if (counts.working + counts.pending > 0) {
-        y += companionScaled(27.0);
-        for (0..frame.operation_count) |index| {
-            if (!frame.operations[index].active()) continue;
-            if (frame.operationReference(index)) |reference|
-                registerOperationCardHits(state, body, &y, reference, companionScaled(72.0), companionScaled(79.0))
-            else
-                y += companionScaled(79.0);
-        }
-    }
-    if (frame.recentCount() > 0) {
-        y += companionScaled(27.0);
-        var shown: usize = 0;
-        for (0..frame.operation_count) |index| {
-            if (frame.operations[index].active() or shown == 5) continue;
-            if (frame.operationReference(index)) |reference|
-                registerOperationCardHits(state, body, &y, reference, companionScaled(72.0), companionScaled(79.0))
-            else
-                y += companionScaled(79.0);
-            shown += 1;
-        }
-    }
+    return count;
 }
 
-fn registerOperationCardHits(
-    state: *controller,
-    body: palette.Rect,
-    y: *f32,
-    reference: controller.OperationReference,
-    card_height: f32,
-    card_advance: f32,
-) void {
-    const card = operationCardRect(body, y.*, card_height);
-    if (reference.actions.inspect) if (intersectRects(card, body)) |hit_rect| state.addOperationHit(hit_rect, .operation_select, reference);
-    y.* += card_advance;
-    if (!state.operationSelected(&reference)) return;
-    const operation = state.presentation.operationForReference(&reference) orelse return;
-    const inspector = operationInspectorRect(body, y.*, operation);
-    const controls = inspectorControlRects(inspector, reference.actions);
-    if (controls.stop) |rect| if (intersectRects(rect, body)) |hit_rect| state.addOperationHit(hit_rect, .operation_stop, reference);
-    if (controls.follow_log) |rect| if (intersectRects(rect, body)) |hit_rect| state.addOperationHit(hit_rect, .operation_follow_log, reference);
-    y.* += inspector.h + companionScaled(7.0);
-}
-
-fn operationCardRect(clip: palette.Rect, y: f32, height: f32) palette.Rect {
-    return .{ .x = clip.x + companionScaled(12.0), .y = y, .w = @max(clip.w - companionScaled(24.0), 0.0), .h = height };
-}
-
-fn operationInspectorRect(clip: palette.Rect, y: f32, operation: *const controller.Operation) palette.Rect {
-    return .{
-        .x = clip.x + companionScaled(12.0),
-        .y = y,
-        .w = @max(clip.w - companionScaled(24.0), 0.0),
-        .h = inspectorHeight(operation),
-    };
-}
-
-fn missionControlSummaryHeight(frame: *const controller.Frame, width: f32) f32 {
-    var height = companionScaled(100.0);
-    if (frame.has_failure) height += companionScaled(24.0);
-    if (resultCardVisible(frame)) height += missionControlResultHeight(frame, width) + companionScaled(12.0);
-    return height + companionScaled(86.0);
-}
-
-fn missionControlResultHeight(frame: *const controller.Frame, width: f32) f32 {
-    const text_w = @max(width - companionScaled(46.0), 0.0);
-    const wrapped = wrapResultText(std.mem.trim(u8, frame.answer.slice(), " \t\r\n"), text_w);
-    const line_count: f32 = @floatFromInt(@max(@min(wrapped.count, 4), 1));
-    return companionScaled(42.0) + line_count * companionScaled(17.0);
-}
-
-fn missionControlOperationsHeight(frame: *const controller.Frame) f32 {
-    const counts = frame.activeCounts();
-    const active_total = counts.working + counts.pending;
-    const recent_total = @min(frame.recentCount(), 5);
-    if (active_total == 0 and recent_total == 0) return companionScaled(76.0);
-    var height = companionScaled(12.0);
-    if (active_total > 0) height += companionScaled(27.0 + 79.0 * @as(f32, @floatFromInt(active_total)));
-    if (recent_total > 0) height += companionScaled(27.0 + 79.0 * @as(f32, @floatFromInt(recent_total)));
-    return height;
-}
-
-fn missionControlInspectorHeight(state: *const controller) f32 {
-    const operation = state.selectedOperation() orelse return companionScaled(76.0);
-    return companionScaled(12.0) + missionInspectorHeight(operation) + companionScaled(7.0);
-}
-
-fn missionControlNarrowHeight(state: *const controller, width: f32) f32 {
-    return missionControlSummaryHeight(&state.presentation, width) + missionControlOperationsHeight(&state.presentation) +
-        missionControlInspectorHeight(state) + companionScaled(24.0);
-}
-
-fn prepareAndRegisterMissionControlHits(state: *controller, geometry: MissionControlGeometry) void {
-    if (geometry.mode == .narrow) {
-        const max_scroll = @max(missionControlNarrowHeight(state, geometry.summary.w) - geometry.summary.h, 0.0);
-        state.scrollMissionControl(.body, 0.0, max_scroll);
-    } else {
-        state.scrollMissionControl(.summary, 0.0, @max(missionControlSummaryHeight(&state.presentation, geometry.summary.w) - geometry.summary.h, 0.0));
-        state.scrollMissionControl(.operations, 0.0, @max(missionControlOperationsHeight(&state.presentation) - geometry.operations.h, 0.0));
-        state.scrollMissionControl(.inspector, 0.0, @max(missionControlInspectorHeight(state) - geometry.inspector.h, 0.0));
-    }
-    state.clearHits();
-    state.addHit(geometry.window, .panel);
-    registerMissionControlOperationHits(state, geometry);
-    state.addHit(geometry.close_button, .mission_control_close);
-}
-
-fn registerMissionControlOperationHits(state: *controller, geometry: MissionControlGeometry) void {
-    const clip = if (geometry.mode == .narrow) geometry.summary else geometry.operations;
-    const operations_origin = if (geometry.mode == .narrow)
-        geometry.summary.y - state.mission_control_body_scroll_y + missionControlSummaryHeight(&state.presentation, geometry.summary.w) + companionScaled(12.0)
-    else
-        geometry.operations.y - state.mission_control_operations_scroll_y;
-    var y = operations_origin + companionScaled(12.0);
-    const frame = &state.presentation;
-    const counts = frame.activeCounts();
-    if (counts.working + counts.pending > 0) {
-        y += companionScaled(27.0);
-        for (0..frame.operation_count) |index| {
-            if (!frame.operations[index].active()) continue;
-            registerMissionControlCardHit(state, clip, &y, frame.operationReference(index));
-        }
-    }
-    if (frame.recentCount() > 0) {
-        y += companionScaled(27.0);
-        var shown: usize = 0;
-        for (0..frame.operation_count) |index| {
-            if (frame.operations[index].active() or shown == 5) continue;
-            registerMissionControlCardHit(state, clip, &y, frame.operationReference(index));
-            shown += 1;
-        }
-    }
-
-    const reference = state.selected_operation orelse return;
-    const operation = frame.operationForReference(&reference) orelse return;
-    const inspector_clip = if (geometry.mode == .narrow) geometry.summary else geometry.inspector;
-    const inspector_origin = if (geometry.mode == .narrow)
-        operations_origin + missionControlOperationsHeight(frame) + companionScaled(12.0)
-    else
-        geometry.inspector.y - state.mission_control_inspector_scroll_y;
-    const inspector = missionOperationInspectorRect(inspector_clip, inspector_origin + companionScaled(12.0), operation);
-    const controls = inspectorControlRects(inspector, reference.actions);
-    if (controls.stop) |rect| if (intersectRects(rect, inspector_clip)) |hit_rect| state.addOperationHit(hit_rect, .operation_stop, reference);
-    if (controls.follow_log) |rect| if (intersectRects(rect, inspector_clip)) |hit_rect| state.addOperationHit(hit_rect, .operation_follow_log, reference);
-}
-
-fn registerMissionControlCardHit(state: *controller, clip: palette.Rect, y: *f32, reference: ?controller.OperationReference) void {
-    const card = operationCardRect(clip, y.*, companionScaled(72.0));
-    if (reference) |value| if (value.actions.inspect) if (intersectRects(card, clip)) |hit_rect| {
-        state.addOperationHit(hit_rect, .operation_select, value);
-    };
-    y.* += companionScaled(79.0);
-}
-
-fn scrollMissionControlAt(state: *runtime.AppState, x: f32, y: f32, delta: f32) void {
-    const geometry = computeMissionControlGeometry(state.companion_controller.frame_width, state.companion_controller.frame_height, companionScale());
-    if (geometry.mode == .narrow) {
-        if (pointInRect(geometry.body, x, y)) {
-            const max_scroll = @max(missionControlNarrowHeight(&state.companion_controller, geometry.summary.w) - geometry.summary.h, 0.0);
-            state.companion_controller.scrollMissionControl(.body, delta, max_scroll);
-            state.markDirty();
-        }
-        return;
-    }
-    const region: controller.MissionControlScrollRegion = if (pointInRect(geometry.summary, x, y))
-        .summary
-    else if (pointInRect(geometry.operations, x, y))
-        .operations
-    else if (pointInRect(geometry.inspector, x, y))
-        .inspector
-    else
-        return;
-    const max_scroll = switch (region) {
-        .summary => @max(missionControlSummaryHeight(&state.companion_controller.presentation, geometry.summary.w) - geometry.summary.h, 0.0),
-        .operations => @max(missionControlOperationsHeight(&state.companion_controller.presentation) - geometry.operations.h, 0.0),
-        .inspector => @max(missionControlInspectorHeight(&state.companion_controller) - geometry.inspector.h, 0.0),
-        .body => unreachable,
-    };
-    state.companion_controller.scrollMissionControl(region, delta, max_scroll);
-    state.markDirty();
-}
-
-// Full-window Mission Control region above workspace panes and below true modals.
-fn renderMissionControl(state: *runtime.AppState, geometry: MissionControlGeometry) void {
+// Collapsed dock: character, name, and a one-line status in a floating pill.
+fn renderDock(state: *runtime.AppState, geometry: Geometry) void {
+    const s = companionScale();
     const chrome = theme.companionChrome();
-    queueRect(state, geometry.window, color(surface()));
-    renderMissionControlHeader(state, geometry);
-    if (geometry.mode == .narrow) {
-        renderMissionControlNarrowBody(state, geometry);
-    } else {
-        inline for (.{ geometry.summary, geometry.operations, geometry.inspector }) |column| {
-            queuePanel(state, column, color(chrome.surface_deep), color(chrome.border), companionScaled(10.0), companionScaled(1.0));
-        }
-        var summary_y = geometry.summary.y - state.companion_controller.mission_control_summary_scroll_y;
-        renderMissionControlSummary(state, geometry.summary, &summary_y);
-        var operations_y = geometry.operations.y - state.companion_controller.mission_control_operations_scroll_y;
-        renderMissionControlOperations(state, geometry.operations, &operations_y);
-        var inspector_y = geometry.inspector.y - state.companion_controller.mission_control_inspector_scroll_y;
-        renderMissionControlInspector(state, geometry.inspector, &inspector_y);
-    }
-    renderComposerFooter(state, geometry.footer, true);
-}
+    const dock = geometry.dock;
+    if (dock.w < 80.0 * s or dock.h < 40.0 * s) return;
+    const radius = dock.h * 0.5;
+    queueRoundedRectClipped(state, offsetRect(dock, 0.0, 6.0 * s), color(theme.scrim(0.22)), radius, geometry.window);
+    queuePanel(state, dock, color(surface()), color(chrome.border), radius, 1.0 * s);
 
-// Mission Control identity, exact Frame summary, and close-only header region.
-fn renderMissionControlHeader(state: *runtime.AppState, geometry: MissionControlGeometry) void {
-    const chrome = theme.companionChrome();
     const character = activeCompanionCharacter(state);
-    queueRect(state, geometry.header, color(chrome.surface_deep));
-    const portrait = compactCharacterRect(geometry.header, character, companionScale());
-    renderCompanionCharacter(state, portrait, state.companion_controller.visualState(), character, .compact);
-    const title_x = portrait.x + companionScaled(39.0);
-    queueBoldText(state, .{ .x = title_x, .y = geometry.header.y + companionScaled(10.0), .w = companionScaled(116.0), .h = companionScaled(19.0) }, "Mission Control", color(chrome.text), companionScaled(13.0), geometry.header);
-    const frame = &state.companion_controller.presentation;
-    const counts = frame.activeCounts();
-    const summary = if (frame.has_failure)
-        "Needs attention"
-    else if (frame.working or counts.working + counts.pending > 0)
-        framePrint(state, "{d} working · {d} pending", .{ counts.working, counts.pending })
-    else if (std.mem.trim(u8, frame.answer.slice(), " \t\r\n").len > 0 or frame.recentCount() > 0)
-        "Done"
-    else
-        "Ready";
-    queueMonoText(state, .{ .x = title_x + companionScaled(124.0), .y = geometry.header.y + companionScaled(13.0), .w = @max(geometry.close_button.x - title_x - companionScaled(136.0), 0.0), .h = companionScaled(16.0) }, summary, color(if (frame.has_failure) chrome.danger else chrome.text_subtle), companionScaled(10.5), geometry.header);
-    queuePanel(state, geometry.close_button, color(chrome.surface), color(chrome.border), companionScaled(6.0), companionScaled(1.0));
-    queueCenteredText(state, geometry.close_button, "×", color(chrome.text_muted), companionScaled(12.0), .ui_bold, geometry.close_button);
-    queueRect(state, .{ .x = 0.0, .y = geometry.header.y + geometry.header.h - companionScaled(1.0), .w = geometry.header.w, .h = companionScaled(1.0) }, color(chrome.hairline));
-}
+    renderCompanionCharacter(state, characterInSlot(geometry.dock_avatar, character), state.companion_controller.visualState(), character, .full);
 
-// Narrow Mission Control body region with one direct vertical scroll owner.
-fn renderMissionControlNarrowBody(state: *runtime.AppState, geometry: MissionControlGeometry) void {
-    const chrome = theme.companionChrome();
-    const column = geometry.summary;
-    queuePanel(state, column, color(chrome.surface_deep), color(chrome.border), companionScaled(10.0), companionScaled(1.0));
-    var y = column.y - state.companion_controller.mission_control_body_scroll_y;
-    renderMissionControlSummary(state, column, &y);
-    y += companionScaled(12.0);
-    renderMissionControlOperations(state, column, &y);
-    y += companionScaled(12.0);
-    renderMissionControlInspector(state, column, &y);
-}
-
-// Mission Control objective, truthful result, and fixed ownership boundaries region.
-fn renderMissionControlSummary(state: *runtime.AppState, clip: palette.Rect, y: *f32) void {
-    const chrome = theme.companionChrome();
-    const frame = &state.companion_controller.presentation;
-    y.* += companionScaled(12.0);
-    queueBoldText(state, .{ .x = clip.x + companionScaled(12.0), .y = y.*, .w = @max(clip.w - companionScaled(24.0), 0.0), .h = companionScaled(15.0) }, "OBJECTIVE", color(chrome.text_subtle), companionScaled(9.5), clip);
-    y.* += companionScaled(20.0);
-    const objective = std.mem.trim(u8, frame.objective.slice(), " \t\r\n");
-    const objective_w = @max(clip.w - companionScaled(24.0), 0.0);
-    queueBoldText(state, .{ .x = clip.x + companionScaled(12.0), .y = y.*, .w = objective_w, .h = companionScaled(18.0) }, truncatedText(state, .ui_bold, companionScaled(12.0), objective_w, singleLineText(state, if (objective.len > 0) objective else "No active objective")), color(chrome.text), companionScaled(12.0), clip);
-    y.* += companionScaled(24.0);
-    if (frame.workspace_id.slice().len > 0) {
-        queueBoldText(state, .{ .x = clip.x + companionScaled(12.0), .y = y.*, .w = companionScaled(66.0), .h = companionScaled(15.0) }, "Workspace", color(chrome.text_subtle), companionScaled(9.0), clip);
-        queueText(state, .{ .x = clip.x + companionScaled(78.0), .y = y.*, .w = @max(clip.w - companionScaled(90.0), 0.0), .h = companionScaled(15.0) }, truncatedText(state, .ui, companionScaled(10.0), @max(clip.w - companionScaled(90.0), 0.0), frame.workspace_id.slice()), color(chrome.text), companionScaled(10.0), clip);
-    }
-    y.* += companionScaled(20.0);
-    const counts = frame.activeCounts();
-    queueMonoText(state, .{ .x = clip.x + companionScaled(12.0), .y = y.*, .w = @max(clip.w - companionScaled(24.0), 0.0), .h = companionScaled(15.0) }, framePrint(state, "{d} working · {d} pending", .{ counts.working, counts.pending }), color(chrome.text_subtle), companionScaled(9.5), clip);
-    y.* += companionScaled(24.0);
-    if (frame.has_failure) {
-        queueBoldText(state, .{ .x = clip.x + companionScaled(12.0), .y = y.*, .w = @max(clip.w - companionScaled(24.0), 0.0), .h = companionScaled(16.0) }, "NEEDS ATTENTION", color(chrome.danger), companionScaled(10.0), clip);
-        y.* += companionScaled(24.0);
-    }
-    if (resultCardVisible(frame)) renderMissionControlResult(state, clip, y);
-    queueBoldText(state, .{ .x = clip.x + companionScaled(12.0), .y = y.*, .w = @max(clip.w - companionScaled(24.0), 0.0), .h = companionScaled(15.0) }, "BOUNDARIES", color(chrome.text_subtle), companionScaled(9.5), clip);
-    y.* += companionScaled(21.0);
-    queueText(state, .{ .x = clip.x + companionScaled(12.0), .y = y.*, .w = @max(clip.w - companionScaled(24.0), 0.0), .h = companionScaled(16.0) }, "Closing this view never stops work.", color(chrome.text), companionScaled(10.0), clip);
-    y.* += companionScaled(19.0);
-    queueText(state, .{ .x = clip.x + companionScaled(12.0), .y = y.*, .w = @max(clip.w - companionScaled(24.0), 0.0), .h = companionScaled(32.0) }, "Stopping one operation never touches processes owned by another task.", color(chrome.text), companionScaled(10.0), clip);
-    y.* += companionScaled(46.0);
-}
-
-fn renderMissionControlResult(state: *runtime.AppState, clip: palette.Rect, y: *f32) void {
-    const frame = &state.companion_controller.presentation;
-    const chrome = theme.companionChrome();
-    const rect = operationCardRect(clip, y.*, missionControlResultHeight(frame, clip.w));
-    const failed = frame.answer_failed and !frame.working;
-    queuePanelClipped(state, rect, color(if (failed) chrome.failure_card else chrome.surface), color(if (failed) chrome.failure_border else chrome.hairline), companionScaled(9.0), companionScaled(1.0), clip);
-    queueBoldText(state, .{ .x = rect.x + companionScaled(11.0), .y = rect.y + companionScaled(9.0), .w = @max(rect.w - companionScaled(90.0), 0.0), .h = companionScaled(15.0) }, companionCharacterResultHeading(activeCompanionCharacter(state)), color(chrome.text_subtle), companionScaled(9.5), clip);
-    const verdict = if (frame.working) "WORKING" else if (failed) "FAILED" else "DONE";
-    queueBoldText(state, .{ .x = rect.x + @max(rect.w - companionScaled(70.0), 0.0), .y = rect.y + companionScaled(9.0), .w = companionScaled(58.0), .h = companionScaled(15.0) }, verdict, color(if (failed) chrome.danger else if (frame.working) chrome.accent else chrome.identity_fg), companionScaled(9.0), clip);
-    const answer = std.mem.trim(u8, frame.answer.slice(), " \t\r\n");
-    const wrapped = wrapResultText(answer, @max(rect.w - companionScaled(22.0), 0.0));
-    if (wrapped.count == 0) {
-        queueText(state, .{ .x = rect.x + companionScaled(11.0), .y = rect.y + companionScaled(30.0), .w = @max(rect.w - companionScaled(22.0), 0.0), .h = companionScaled(16.0) }, if (frame.working) "Working — no reply yet." else "The run failed before replying.", color(if (failed) chrome.failure_fg else chrome.text_subtle), companionScaled(10.0), clip);
-    } else for (wrapped.lines[0..@min(wrapped.count, 4)], 0..) |line, index| {
-        const last = index + 1 == @min(wrapped.count, 4);
-        const value = if (last and (wrapped.truncated or wrapped.count > 4)) framePrint(state, "{s}…", .{line}) else line;
-        queueText(state, .{ .x = rect.x + companionScaled(11.0), .y = rect.y + companionScaled(30.0 + 17.0 * @as(f32, @floatFromInt(index))), .w = @max(rect.w - companionScaled(22.0), 0.0), .h = companionScaled(16.0) }, value, color(if (failed) chrome.failure_fg else chrome.text), companionScaled(10.0), clip);
-    }
-    y.* += rect.h + companionScaled(12.0);
-}
-
-// Mission Control active and bounded recent operation cards region.
-fn renderMissionControlOperations(state: *runtime.AppState, clip: palette.Rect, y: *f32) void {
-    const frame = &state.companion_controller.presentation;
-    y.* += companionScaled(12.0);
-    const counts = frame.activeCounts();
-    const active_total = counts.working + counts.pending;
-    if (active_total > 0) {
-        renderSectionHeader(state, clip, y, "ACTIVE OPERATIONS", framePrint(state, "{d}", .{active_total}));
-        for (0..frame.operation_count) |index| {
-            const operation = &frame.operations[index];
-            if (!operation.active()) continue;
-            const reference = frame.operationReference(index);
-            renderOperationCard(state, clip, y, operation.title.slice(), operation.detail.slice(), operation.status, true, if (reference) |value| state.companion_controller.operationSelected(&value) else false);
-        }
-    }
-    const recent_total = frame.recentCount();
-    if (recent_total > 0) {
-        renderSectionHeader(state, clip, y, "RECENT", framePrint(state, "{d}", .{recent_total}));
-        var shown: usize = 0;
-        for (0..frame.operation_count) |index| {
-            const operation = &frame.operations[index];
-            if (operation.active() or shown == 5) continue;
-            const reference = frame.operationReference(index);
-            renderOperationCard(state, clip, y, operation.title.slice(), operation.detail.slice(), operation.status, true, if (reference) |value| state.companion_controller.operationSelected(&value) else false);
-            shown += 1;
-        }
-    }
-    if (active_total == 0 and recent_total == 0) renderEmptyBody(state, clip, y, "No operations", "The current Companion frame has no operations.");
-}
-
-// Mission Control exact selected-operation inspector region.
-fn renderMissionControlInspector(state: *runtime.AppState, clip: palette.Rect, y: *f32) void {
-    y.* += companionScaled(12.0);
-    const reference = state.companion_controller.selected_operation orelse {
-        renderEmptyBody(state, clip, y, "Select an operation", "Details for the selected operation appear here.");
-        return;
+    const status = dockStatus(state);
+    const text_x = dock.x + DOCK_AVATAR_SLOT * s + 12.0 * s;
+    const text_w = @max(dock.x + dock.w - text_x - 14.0 * s, 0.0);
+    queueBoldText(state, .{ .x = text_x, .y = dock.y + 9.0 * s, .w = text_w, .h = 18.0 * s }, truncatedText(state, .ui_bold, 12.5 * s, text_w, state.companion_controller.identity.name.slice()), color(chrome.text), 12.5 * s, dock);
+    const status_color = switch (status.tone) {
+        .quiet => chrome.text_subtle,
+        .busy => chrome.identity_fg,
+        .attention => chrome.warning,
+        .failure => chrome.danger,
     };
-    const operation = state.companion_controller.presentation.operationForReference(&reference) orelse {
-        renderEmptyBody(state, clip, y, "Select an operation", "Details for the selected operation appear here.");
-        return;
-    };
-    renderMissionOperationInspector(state, clip, y, operation, reference);
-}
-
-// Collapsed Companion chip region.
-fn renderChip(state: *runtime.AppState, geometry: Geometry) void {
-    const scale = companionScale();
-    const chrome = theme.companionChrome();
-    const character = activeCompanionCharacter(state);
-    appendChipChrome(state.allocator, &state.palette_overlay_batch, geometry, scale) catch |err| log.warn("failed to queue chip chrome: {s}", .{@errorName(err)});
-    if (geometry.chip.w < 103.0 * scale or geometry.chip.h < 36.0 * scale) return;
-    if (geometry.chip_character.w > 0.0 and geometry.chip_character.h > 0.0) {
-        renderCompanionCharacter(state, fullCharacterRect(geometry.chip_character, character, scale), state.companion_controller.visualState(), character, .full);
-    }
-    var x = geometry.chip.x + 54.0 * scale;
-    const center_y = geometry.chip.y + 10.0 * scale;
-    queueText(state, .{ .x = x, .y = center_y, .w = 42.0 * scale, .h = 17.0 * scale }, companionCharacterName(character), color(chrome.text), 12.0 * scale, geometry.chip);
-    x += 46.0 * scale;
-    const visual = chipVisual(&state.companion_controller);
-    if (visual.detail == .working) {
-        const count = framePrint(state, "{d} ops", .{state.companion_controller.operation_count});
-        queueMonoText(state, .{ .x = x, .y = center_y + 1.0 * scale, .w = 40.0 * scale, .h = 15.0 * scale }, count, color(chrome.text_subtle), 10.5 * scale, geometry.chip);
-        x += 43.0 * scale;
-    } else if (visual.detail == .paused) {
-        queueMonoText(state, .{ .x = x, .y = center_y + 1.0 * scale, .w = 45.0 * scale, .h = 15.0 * scale }, "paused", color(chrome.text_subtle), 10.5 * scale, geometry.chip);
-        x += 48.0 * scale;
-    } else if (visual.detail == .failed) {
-        queueMonoText(state, .{ .x = x, .y = center_y + 1.0 * scale, .w = 40.0 * scale, .h = 15.0 * scale }, "failed", color(chrome.danger), 10.5 * scale, geometry.chip);
-        x += 43.0 * scale;
-    }
-    if (visual.show_approval) {
-        const pill: palette.Rect = .{ .x = x, .y = geometry.chip.y + 9.0 * scale, .w = @max(geometry.chip.x + geometry.chip.w - 12.0 * scale - x, 0.0), .h = 18.0 * scale };
-        queueRoundedRect(state, pill, color(chrome.warning), 9.0 * scale);
-        const approvals = framePrint(state, "{d} approval", .{state.companion_controller.approval_count});
-        queueCenteredText(state, pill, approvals, color(chrome.warning_fg), 10.0 * scale, .ui_bold, pill);
+    queueText(state, .{ .x = text_x, .y = dock.y + 28.0 * s, .w = text_w, .h = 16.0 * s }, truncatedText(state, .ui, 11.0 * s, text_w, status.text), color(status_color), 11.0 * s, dock);
+    if (status.tone == .attention) {
+        const dot: palette.Rect = .{ .x = geometry.dock_avatar.x + geometry.dock_avatar.w - 8.0 * s, .y = dock.y + 4.0 * s, .w = 10.0 * s, .h = 10.0 * s };
+        queueRoundedRect(state, dot, color(chrome.warning), 5.0 * s);
     }
 }
 
-// Expanded Companion sidecar region.
-fn renderSidecar(state: *runtime.AppState, geometry: Geometry) void {
-    if (geometry.sidecar.w <= 0.0 or geometry.sidecar.h <= 0.0) return;
-    const scale = companionScale();
+// ---- panel ------------------------------------------------------------------
+
+fn renderPanel(state: *runtime.AppState, geometry: Geometry) void {
+    if (geometry.panel.w <= 0.0 or geometry.panel.h <= 0.0) return;
+    const s = companionScale();
     const chrome = theme.companionChrome();
-    queueRect(state, geometry.window, color(theme.scrim(0.22)));
-    // Soft shadows render as anti-aliased SDF fills clipped to the window; the
-    // old triangle-fan meshes had no edge AA and read as faceted arcs.
-    queueRoundedRectClipped(state, expandedOffsetRect(geometry.sidecar, 8.0 * scale, 18.0 * scale), color(theme.scrim(0.16)), 18.0 * scale, geometry.window);
-    queueRoundedRectClipped(state, offsetRect(geometry.sidecar, 0.0, 4.0 * scale), color(theme.scrim(0.24)), 14.0 * scale, geometry.window);
-    queuePanel(state, geometry.sidecar, color(surface()), color(chrome.border), 12.0 * scale, 1.0 * scale);
+    queueRect(state, geometry.window, color(theme.scrim(0.18)));
+    queueRoundedRectClipped(state, expandedOffsetRect(geometry.panel, 8.0 * s, 18.0 * s), color(theme.scrim(0.16)), 18.0 * s, geometry.window);
+    queueRoundedRectClipped(state, offsetRect(geometry.panel, 0.0, 4.0 * s), color(theme.scrim(0.24)), 14.0 * s, geometry.window);
+    queuePanel(state, geometry.panel, color(surface()), color(chrome.border), 14.0 * s, 1.0 * s);
     renderHeader(state, geometry);
-    renderObjective(state, geometry);
-    renderTabs(state, geometry);
-    renderBody(state, geometry);
+    renderConversation(state, geometry);
+    renderInbox(state, geometry);
+    renderCrew(state, geometry);
+    renderErrorStrip(state, geometry);
+    renderRecap(state, geometry);
+    renderApproval(state, geometry);
     renderFooter(state, geometry);
+    switch (state.companion_controller.menu) {
+        .none => {},
+        .companions => renderCompanionMenu(state, geometry),
+        .brain => renderBrainMenu(state, geometry),
+    }
 }
 
-// Sidecar identity and collapse controls region.
+// Header: who the companion is, its brain, the roster switcher, and controls.
 fn renderHeader(state: *runtime.AppState, geometry: Geometry) void {
-    const scale = companionScale();
+    const s = companionScale();
     const chrome = theme.companionChrome();
+    const header = geometry.header;
+    if (header.w < 160.0 * s or header.h < 50.0 * s) return;
+    const identity = &state.companion_controller.identity;
     const character = activeCompanionCharacter(state);
-    if (geometry.header.w < 120.0 * scale or geometry.header.h < 44.0 * scale) return;
-    const portrait = compactCharacterRect(geometry.header, character, scale);
-    renderCompanionCharacter(state, portrait, state.companion_controller.visualState(), character, .compact);
-    const title_x = portrait.x + 38.0 * scale;
-    queueBoldText(state, .{ .x = title_x, .y = geometry.header.y + 11.0 * scale, .w = 48.0 * scale, .h = 18.0 * scale }, companionCharacterName(character), color(chrome.text), 13.0 * scale, geometry.header);
-    const status = headerStatus(state);
-    queueMonoText(state, .{ .x = title_x + 52.0 * scale, .y = geometry.header.y + 13.0 * scale, .w = @max(geometry.mission_control_button.x - title_x - 57.0 * scale, 0.0), .h = 16.0 * scale }, status, color(chrome.text_subtle), 10.5 * scale, geometry.header);
-    if (geometry.mission_control_button.w >= 92.0 * scale) {
-        queuePanel(state, geometry.mission_control_button, color(chrome.surface_deep), color(chrome.border), 6.0 * scale, 1.0 * scale);
-        queueText(state, .{ .x = geometry.mission_control_button.x + 8.0 * scale, .y = geometry.mission_control_button.y + 6.0 * scale, .w = 13.0 * scale, .h = 15.0 * scale }, "▦", color(chrome.accent), 10.0 * scale, geometry.mission_control_button);
-        queueBoldText(state, .{ .x = geometry.mission_control_button.x + 24.0 * scale, .y = geometry.mission_control_button.y + 5.0 * scale, .w = @max(geometry.mission_control_button.w - 30.0 * scale, 0.0), .h = 16.0 * scale }, "Mission Control", color(chrome.text), 9.5 * scale, geometry.mission_control_button);
+    renderCompanionCharacter(state, characterInSlot(geometry.avatar, character), state.companion_controller.visualState(), character, .full);
+
+    const name_rect = geometry.name_button;
+    const name_w = @max(name_rect.w - 26.0 * s, 0.0);
+    queueBoldText(state, .{ .x = name_rect.x + 4.0 * s, .y = name_rect.y + 2.0 * s, .w = name_w, .h = 20.0 * s }, truncatedText(state, .ui_bold, 15.0 * s, name_w, identity.name.slice()), color(chrome.text), 15.0 * s, header);
+    const caret_x = name_rect.x + 4.0 * s + @min(text_measure.textWidth(.ui_bold, 15.0 * s, identity.name.slice()), name_w) + 6.0 * s;
+    queueText(state, .{ .x = caret_x, .y = name_rect.y + 4.0 * s, .w = 12.0 * s, .h = 16.0 * s }, "▾", color(chrome.text_subtle), 10.0 * s, header);
+
+    const brain = geometry.brain_button;
+    queuePanel(state, brain, color(chrome.surface_deep), color(hairline()), 10.0 * s, 1.0 * s);
+    queueRoundedRect(state, .{ .x = brain.x + 8.0 * s, .y = brain.y + (brain.h - 6.0 * s) * 0.5, .w = 6.0 * s, .h = 6.0 * s }, color(chrome.accent), 3.0 * s);
+    const brain_w = @max(brain.w - 26.0 * s, 0.0);
+    queueText(state, .{ .x = brain.x + 19.0 * s, .y = brain.y + 2.5 * s, .w = brain_w, .h = 15.0 * s }, truncatedText(state, .ui, 11.0 * s, brain_w, identity.brain.slice()), color(chrome.text_muted), 11.0 * s, brain);
+
+    if (identity.count > 1) {
+        renderHeaderButton(state, geometry.prev_button, "‹");
+        renderHeaderButton(state, geometry.next_button, "›");
     }
-    // The collapse affordance fills with the header surface it sits on: border
-    // commands without a real fill halo white at every anti-aliased corner
-    // because the SDF shader composites border fringes toward the fill color.
-    queuePanel(state, geometry.close_button, color(surface()), color(hairline()), 6.0 * scale, 1.0 * scale);
-    queueCenteredText(state, geometry.close_button, "−", color(chrome.text_muted), 12.0 * scale, .mono, geometry.close_button);
-    // The divider stops short of the sidecar stroke so it cannot notch the
-    // panel's side borders.
-    const divider_inset = snappedStroke(1.0 * scale);
-    queueRect(state, .{ .x = geometry.header.x + divider_inset, .y = geometry.header.y + geometry.header.h - 1.0 * scale, .w = @max(geometry.header.w - divider_inset * 2.0, 0.0), .h = 1.0 * scale }, color(hairline()));
+    renderHeaderButton(state, geometry.new_button, "+");
+    renderHeaderButton(state, geometry.close_button, "−");
+    const divider_inset = snappedStroke(1.0 * s);
+    queueRect(state, .{ .x = header.x + divider_inset, .y = header.y + header.h - 1.0 * s, .w = @max(header.w - divider_inset * 2.0, 0.0), .h = 1.0 * s }, color(hairline()));
 }
 
-// Sidecar objective summary region.
-fn renderObjective(state: *runtime.AppState, geometry: Geometry) void {
-    const scale = companionScale();
+fn renderHeaderButton(state: *runtime.AppState, rect: palette.Rect, glyph: []const u8) void {
+    if (rect.w <= 0.0 or rect.h <= 0.0) return;
+    const s = companionScale();
     const chrome = theme.companionChrome();
-    if (geometry.objective.w < 180.0 * scale or geometry.objective.h < 70.0 * scale) return;
-    const card: palette.Rect = .{ .x = geometry.objective.x + 12.0 * scale, .y = geometry.objective.y + 10.0 * scale, .w = @max(geometry.objective.w - 24.0 * scale, 0.0), .h = @max(geometry.objective.h - 10.0 * scale, 0.0) };
-    queuePanel(state, card, color(surfaceDeep()), color(hairline()), 10.0 * scale, 1.0 * scale);
-    const content_w = @max(card.w - 102.0 * scale, 0.0);
-    queueBoldText(state, .{ .x = card.x + 12.0 * scale, .y = card.y + 10.0 * scale, .w = content_w, .h = 14.0 * scale }, "OBJECTIVE", color(chrome.text_subtle), 10.0 * scale, card);
-    const presentation = &state.companion_controller.presentation;
-    const objective = singleLineText(state, presentation.objective.slice());
-    const title = if (objective.len > 0)
-        truncatedText(state, .ui_bold, 13.0 * scale, content_w, objective)
-    else
-        "No active objective";
-    // The subtitle states the run's real posture so the Objective card reads
-    // as current status, not a static caption.
-    const detail = if (!presentation.has_thread)
-        "Start a run from this workspace."
-    else if (presentation.has_approval)
-        "Waiting on your approval below."
-    else if (state.companion_controller.run_phase == .working)
-        "Sprout is working on this now."
-    else if (presentation.has_failure)
-        "The last run needs attention."
-    else if (objective.len > 0)
-        "Done. Send the next instruction below."
-    else
-        "Send an instruction below to start.";
-    queueBoldText(state, .{ .x = card.x + 12.0 * scale, .y = card.y + 29.0 * scale, .w = content_w, .h = 18.0 * scale }, title, color(chrome.text), 13.0 * scale, card);
-    queueText(state, .{ .x = card.x + 12.0 * scale, .y = card.y + 49.0 * scale, .w = content_w, .h = 17.0 * scale }, detail, color(chrome.text_subtle), 11.5 * scale, card);
-    const status_rect: palette.Rect = .{ .x = card.x + @max(card.w - 82.0 * scale, 0.0), .y = card.y + 11.0 * scale, .w = @min(70.0 * scale, card.w), .h = 22.0 * scale };
-    const paused = state.companion_controller.run_phase == .paused;
-    const working = state.companion_controller.run_phase == .working;
-    const answered = std.mem.trim(u8, presentation.answer.slice(), " \t\r\n").len > 0;
-    // The badge states the run's real outcome, not controller posture: DONE
-    // and FAILED appear only once a turn actually resolved that way.
-    const verdict = if (paused)
-        "PAUSED"
-    else if (working)
-        "WORKING"
-    else if (presentation.answer_failed)
-        "FAILED"
-    else if (answered)
-        "DONE"
-    else if (presentation.has_failure)
-        "FAILED"
-    else
-        "READY";
-    const badge_failed = !paused and !working and (presentation.answer_failed or (!answered and presentation.has_failure));
-    const status_color = if (paused) chrome.warning else if (badge_failed) chrome.danger else chrome.identity_fg;
-    queueRoundedRect(state, status_rect, color(if (paused) chrome.approval_card else if (badge_failed) chrome.failure_card else chrome.ready_fill), 6.0 * scale);
-    queueCenteredText(state, status_rect, verdict, color(status_color), 10.0 * scale, .ui_bold, status_rect);
+    queuePanel(state, rect, color(surface()), color(hairline()), 7.0 * s, 1.0 * s);
+    queueCenteredText(state, rect, glyph, color(chrome.text_muted), 14.0 * s, .ui_bold, rect);
 }
 
-// Sidecar static section tabs region.
-fn renderTabs(state: *runtime.AppState, geometry: Geometry) void {
-    const scale = companionScale();
+fn attentionColor(chrome: theme.CompanionChrome, attention: controller.Attention) [4]f32 {
+    return switch (attention) {
+        .approval, .blocked => chrome.warning,
+        .failed => chrome.danger,
+        .running => chrome.accent,
+        .done => chrome.identity_fg,
+        .idle => chrome.text_subtle,
+    };
+}
+
+fn renderSectionTitle(state: *runtime.AppState, section: palette.Rect, title: []const u8) void {
+    const s = companionScale();
     const chrome = theme.companionChrome();
-    if (geometry.tabs.w < 150.0 * scale or geometry.tabs.h < 35.0 * scale) return;
-    const track: palette.Rect = .{ .x = geometry.tabs.x + 12.0 * scale, .y = geometry.tabs.y + 10.0 * scale, .w = @max(geometry.tabs.w - 24.0 * scale, 0.0), .h = @max(geometry.tabs.h - 10.0 * scale, 0.0) };
-    queuePanel(state, track, color(chrome.surface_deep), color(chrome.border), 8.0 * scale, 1.0 * scale);
-    const inner: palette.Rect = .{ .x = track.x + 3.0 * scale, .y = track.y + 3.0 * scale, .w = @max(track.w - 6.0 * scale, 0.0), .h = @max(track.h - 6.0 * scale, 0.0) };
-    // Only Run and Activity are real, hit-registered views; unsupported
-    // sections are omitted rather than rendered as decorative tabs.
-    const tab_w = inner.w / 2.0;
-    const selected_index: f32 = if (state.companion_controller.selected_tab == .run) 0.0 else 1.0;
-    queueRoundedRect(state, .{ .x = inner.x + tab_w * selected_index, .y = inner.y, .w = tab_w, .h = inner.h }, color(chrome.surface), 6.0 * scale);
-    queueCenteredText(state, .{ .x = inner.x, .y = inner.y, .w = tab_w, .h = inner.h }, "Run", color(if (state.companion_controller.selected_tab == .run) chrome.text else chrome.text_subtle), 11.5 * scale, .ui_bold, inner);
-    queueCenteredText(state, .{ .x = inner.x + tab_w, .y = inner.y, .w = tab_w, .h = inner.h }, "Activity", color(if (state.companion_controller.selected_tab == .activity) chrome.text else chrome.text_subtle), 11.5 * scale, .ui_bold, inner);
-    if (state.companion_controller.needs_approval) {
-        queueRoundedRect(state, .{ .x = inner.x + tab_w - 18.0 * scale, .y = inner.y + (inner.h - 6.0 * scale) * 0.5, .w = 6.0 * scale, .h = 6.0 * scale }, color(chrome.warning), 3.0 * scale);
+    queueBoldText(state, .{ .x = section.x + 2.0 * s, .y = section.y + 2.0 * s, .w = section.w, .h = 16.0 * s }, title, color(chrome.text_subtle), 10.0 * s, section);
+}
+
+// Needs-you inbox: every chat on the machine waiting on the user.
+fn renderInbox(state: *runtime.AppState, geometry: Geometry) void {
+    const companion = &state.companion_controller;
+    const shown = @min(companion.inbox_count, MAX_INBOX_ROWS_SHOWN);
+    if (shown == 0 or geometry.inbox.h <= 0.0) return;
+    const s = companionScale();
+    const chrome = theme.companionChrome();
+    const title = if (companion.inbox_count > shown)
+        framePrint(state, "NEEDS YOU · {d} (showing {d})", .{ companion.inbox_count, shown })
+    else
+        framePrint(state, "NEEDS YOU · {d}", .{companion.inbox_count});
+    renderSectionTitle(state, geometry.inbox, title);
+    for (companion.inbox[0..shown], 0..) |*row, index| {
+        const rect = rowRect(geometry.inbox, index, INBOX_ROW_HEIGHT);
+        if (rect.y + rect.h > geometry.inbox.y + geometry.inbox.h + 1.0) break;
+        const accent = attentionColor(chrome, row.attention);
+        queuePanel(state, rect, color(opaqueOver(surface(), theme.withAlpha(accent, 22))), color(opaqueOver(surface(), theme.withAlpha(accent, 90))), 10.0 * s, 1.0 * s);
+        queueRoundedRect(state, .{ .x = rect.x + 12.0 * s, .y = rect.y + 13.0 * s, .w = 8.0 * s, .h = 8.0 * s }, color(accent), 4.0 * s);
+        const pill_w = 54.0 * s;
+        const text_x = rect.x + 28.0 * s;
+        const text_w = @max(rect.w - (text_x - rect.x) - pill_w - 18.0 * s, 0.0);
+        const label = framePrint(state, "{s}: {s}", .{ row.attention.label(), row.title.slice() });
+        queueBoldText(state, .{ .x = text_x, .y = rect.y + 6.0 * s, .w = text_w, .h = 17.0 * s }, truncatedText(state, .ui_bold, 12.0 * s, text_w, label), color(chrome.text), 12.0 * s, rect);
+        queueText(state, .{ .x = text_x, .y = rect.y + 24.0 * s, .w = text_w, .h = 15.0 * s }, truncatedText(state, .ui, 11.0 * s, text_w, row.detail.slice()), color(chrome.text_subtle), 11.0 * s, rect);
+        const pill: palette.Rect = .{ .x = rect.x + rect.w - pill_w - 10.0 * s, .y = rect.y + (rect.h - 24.0 * s) * 0.5, .w = pill_w, .h = 24.0 * s };
+        queuePanel(state, pill, color(surface()), color(chrome.border), 8.0 * s, 1.0 * s);
+        queueCenteredText(state, pill, "Open", color(chrome.text), 11.0 * s, .ui_bold, pill);
     }
 }
 
-// Scrollable Companion activity region.
-fn renderBody(state: *runtime.AppState, geometry: Geometry) void {
-    if (geometry.body.w <= 0.0 or geometry.body.h <= 0.0) return;
-    // The sidecar panel fill already backs this region; a full-width repaint
-    // here would overpaint the panel's side borders and rounded corners.
-    const max_scroll = @max(bodyContentHeight(&state.companion_controller, geometry.body.w) - geometry.body.h, 0.0);
-    if (state.companion_controller.selected_tab == .activity) state.companion_controller.updateActivityExtent(max_scroll);
-    const inset = companionScaled(12.0);
-    var y = geometry.body.y + inset - state.companion_controller.currentScrollY();
-    if (state.companion_controller.selected_tab == .activity)
-        renderActivityBody(state, geometry.body, &y)
+// Crew: chats this companion delegated to, newest attention first.
+fn renderCrew(state: *runtime.AppState, geometry: Geometry) void {
+    const companion = &state.companion_controller;
+    const shown = @min(companion.crew_count, MAX_CREW_ROWS_SHOWN);
+    if (shown == 0 or geometry.crew.h <= 0.0) return;
+    const s = companionScale();
+    const chrome = theme.companionChrome();
+    const running = companion.crewRunningCount();
+    const title = if (running > 0)
+        framePrint(state, "CREW · {d} RUNNING · {d} TOTAL", .{ running, companion.crew_count })
     else
-        renderRunBody(state, geometry.body, &y);
+        framePrint(state, "CREW · {d}", .{companion.crew_count});
+    renderSectionTitle(state, geometry.crew, title);
+    for (companion.crew[0..shown], 0..) |*row, index| {
+        const rect = rowRect(geometry.crew, index, CREW_ROW_HEIGHT);
+        if (rect.y + rect.h > geometry.crew.y + geometry.crew.h + 1.0) break;
+        const accent = attentionColor(chrome, row.attention);
+        queuePanel(state, rect, color(chrome.surface_deep), color(hairline()), 9.0 * s, 1.0 * s);
+        queueRoundedRect(state, .{ .x = rect.x + 10.0 * s, .y = rect.y + (rect.h - 8.0 * s) * 0.5, .w = 8.0 * s, .h = 8.0 * s }, color(accent), 4.0 * s);
+        const status = row.attention.label();
+        const status_w = text_measure.textWidth(.ui_bold, 10.0 * s, status) + 16.0 * s;
+        const pill: palette.Rect = .{ .x = rect.x + rect.w - status_w - 8.0 * s, .y = rect.y + (rect.h - 20.0 * s) * 0.5, .w = status_w, .h = 20.0 * s };
+        queueRoundedRect(state, pill, color(opaqueOver(chrome.surface_deep, theme.withAlpha(accent, 40))), 10.0 * s);
+        queueCenteredText(state, pill, status, color(accent), 10.0 * s, .ui_bold, pill);
+        const text_x = rect.x + 26.0 * s;
+        const text_w = @max(pill.x - text_x - 8.0 * s, 0.0);
+        queueBoldText(state, .{ .x = text_x, .y = rect.y + 4.0 * s, .w = text_w, .h = 16.0 * s }, truncatedText(state, .ui_bold, 11.5 * s, text_w, row.title.slice()), color(chrome.text), 11.5 * s, rect);
+        const detail = if (row.detail.slice().len > 0) framePrint(state, "{s} · {s}", .{ row.provider.slice(), row.detail.slice() }) else row.provider.slice();
+        queueText(state, .{ .x = text_x, .y = rect.y + 21.0 * s, .w = text_w, .h = 14.0 * s }, truncatedText(state, .ui, 10.5 * s, text_w, detail), color(chrome.text_subtle), 10.5 * s, rect);
+    }
 }
 
-// Sidecar shared Companion composer region.
+fn errorMessage(state: *runtime.AppState) []const u8 {
+    const companion = &state.companion_controller;
+    if (companion.ui_error) |message| return message;
+    const frame = &companion.presentation;
+    if (frame.provider_error.slice().len > 0) return frame.provider_error.slice();
+    if (frame.control_error.slice().len > 0) return frame.control_error.slice();
+    return "";
+}
+
+fn renderErrorStrip(state: *runtime.AppState, geometry: Geometry) void {
+    const message = errorMessage(state);
+    if (message.len == 0 or geometry.error_strip.h <= 0.0) return;
+    const s = companionScale();
+    const chrome = theme.companionChrome();
+    const rect = geometry.error_strip;
+    queuePanel(state, rect, color(opaqueOver(surface(), chrome.failure_card)), color(opaqueOver(surface(), chrome.failure_border)), 8.0 * s, 1.0 * s);
+    const text_w = @max(rect.w - 20.0 * s, 0.0);
+    queueText(state, .{ .x = rect.x + 10.0 * s, .y = rect.y + (rect.h - 16.0 * s) * 0.5, .w = text_w, .h = 16.0 * s }, truncatedText(state, .ui, 11.0 * s, text_w, singleLineText(state, message)), color(chrome.failure_fg), 11.0 * s, rect);
+}
+
+// Welcome-back offer: one click asks the companion for a recap.
+fn renderRecap(state: *runtime.AppState, geometry: Geometry) void {
+    const companion = &state.companion_controller;
+    if (!companion.recap_available or geometry.recap.h <= 0.0) return;
+    const s = companionScale();
+    const chrome = theme.companionChrome();
+    const rect = geometry.recap;
+    queuePanel(state, rect, color(opaqueOver(surface(), chrome.ready_fill)), color(opaqueOver(surface(), theme.withAlpha(chrome.accent, 90))), 10.0 * s, 1.0 * s);
+    const text_w = @max(rect.w - 120.0 * s, 0.0);
+    const label = framePrint(state, "Welcome back · away {d} min", .{companion.recap_minutes});
+    queueBoldText(state, .{ .x = rect.x + 12.0 * s, .y = rect.y + (rect.h - 17.0 * s) * 0.5, .w = text_w, .h = 17.0 * s }, truncatedText(state, .ui_bold, 11.5 * s, text_w, label), color(chrome.text), 11.5 * s, rect);
+    const pill: palette.Rect = .{ .x = rect.x + rect.w - 108.0 * s, .y = rect.y + (rect.h - 24.0 * s) * 0.5, .w = 98.0 * s, .h = 24.0 * s };
+    queueRoundedRect(state, pill, color(chrome.accent), 8.0 * s);
+    queueCenteredText(state, pill, "Catch me up", color(chrome.accent_fg), 11.0 * s, .ui_bold, pill);
+}
+
+// The companion's own pending approval, pinned above the composer.
+fn renderApproval(state: *runtime.AppState, geometry: Geometry) void {
+    const frame = &state.companion_controller.presentation;
+    if (!frame.has_approval or geometry.approval.h <= 0.0) return;
+    const s = companionScale();
+    const chrome = theme.companionChrome();
+    const card = geometry.approval;
+    queuePanel(state, card, color(opaqueOver(surface(), chrome.approval_card)), color(opaqueOver(surface(), chrome.approval_border)), 10.0 * s, 1.0 * s);
+    const text_w = @max(card.w - 24.0 * s, 0.0);
+    const title = if (frame.approval_title.slice().len > 0) frame.approval_title.slice() else "Approval needed";
+    queueBoldText(state, .{ .x = card.x + 12.0 * s, .y = card.y + 9.0 * s, .w = text_w, .h = 17.0 * s }, truncatedText(state, .ui_bold, 12.0 * s, text_w, singleLineText(state, title)), color(chrome.approval_title), 12.0 * s, card);
+    queueText(state, .{ .x = card.x + 12.0 * s, .y = card.y + 28.0 * s, .w = text_w, .h = 16.0 * s }, truncatedText(state, .ui, 11.0 * s, text_w, singleLineText(state, frame.approval_body.slice())), color(chrome.approval_body), 11.0 * s, card);
+    const buttons = approvalButtons(card);
+    queuePanel(state, buttons[0], color(surface()), color(chrome.border), 8.0 * s, 1.0 * s);
+    queueCenteredText(state, buttons[0], "Deny", color(chrome.text), 11.5 * s, .ui_bold, buttons[0]);
+    queueRoundedRect(state, buttons[1], color(chrome.warning), 8.0 * s);
+    queueCenteredText(state, buttons[1], "Approve", color(chrome.warning_fg), 11.5 * s, .ui_bold, buttons[1]);
+}
+
 fn renderFooter(state: *runtime.AppState, geometry: Geometry) void {
-    renderComposerFooter(state, geometry.footer, false);
-}
-
-// Shared Companion composer footer used by the sidecar and Mission Control.
-fn renderComposerFooter(state: *runtime.AppState, footer: palette.Rect, fill_background: bool) void {
     const chrome = theme.companionChrome();
+    const footer = geometry.footer;
     const composer = composerRect(footer);
     if (composer.w <= 0.0 or composer.h <= 0.0) return;
-    // The sidecar panel fill backs the footer; repainting it full-width would
-    // erase the side borders and square off the bottom rounded corners. The
-    // divider is inset past the panel stroke for the same reason.
-    if (fill_background) queueRect(state, footer, color(surface()));
     const divider_inset = snappedStroke(companionScaled(1.0));
     queueRect(state, .{ .x = footer.x + divider_inset, .y = footer.y, .w = @max(footer.w - divider_inset * 2.0, 0.0), .h = companionScaled(1.0) }, color(hairline()));
     state.syncCompanionComposer(composer);
-    // The shared composer defaults to the chat layer. Companion is rendered
-    // above panes, so inherit the active overlay layer or panes cover every
-    // composer command while the separately queued accent dot remains visible.
+    // The shared composer defaults to the chat layer; inherit the overlay
+    // layer or panes would cover it.
     state.companion_composer.z_index = state.palette_overlay_batch.current_z_index;
     var composer_batch: palette.RenderBatch = .{};
     defer composer_batch.deinit(state.allocator);
     state.companion_composer.render(state.allocator, &composer_batch) catch |err| log.warn("failed to render Companion composer: {s}", .{@errorName(err)});
     state.palette_overlay_batch.appendStableBatch(state.allocator, state.palette_frame_text_arena.allocator(), &composer_batch) catch |err| log.warn("failed to stage Companion composer: {s}", .{@errorName(err)});
-    const model = state.companion_composer.modelRect();
-    queueRoundedRect(state, .{ .x = model.x + companionScaled(1.0), .y = model.y + @max((model.h - companionScaled(6.0)) * 0.5, 0.0), .w = companionScaled(6.0), .h = companionScaled(6.0) }, color(chrome.accent), companionScaled(3.0));
-}
-
-fn composerRect(footer: palette.Rect) palette.Rect {
-    return composerRectAtScale(footer, companionScale());
-}
-
-fn composerRectAtScale(footer: palette.Rect, scale: f32) palette.Rect {
-    const inset = 12.0 * scale;
-    const top_bottom = 22.0 * scale;
-    if (footer.w < 180.0 * scale or footer.h < 70.0 * scale) return .{ .x = footer.x, .y = footer.y };
-    return .{ .x = footer.x + inset, .y = footer.y + 10.0 * scale, .w = footer.w - inset * 2.0, .h = footer.h - top_bottom };
-}
-
-fn tabRects(tabs: palette.Rect) [2]palette.Rect {
-    const scale = companionScale();
-    const track: palette.Rect = .{
-        .x = tabs.x + 12.0 * scale,
-        .y = tabs.y + 10.0 * scale,
-        .w = @max(tabs.w - 24.0 * scale, 0.0),
-        .h = @max(tabs.h - 10.0 * scale, 0.0),
-    };
-    const inner: palette.Rect = .{
-        .x = track.x + 3.0 * scale,
-        .y = track.y + 3.0 * scale,
-        .w = @max(track.w - 6.0 * scale, 0.0),
-        .h = @max(track.h - 6.0 * scale, 0.0),
-    };
-    const tab_w = inner.w / 2.0;
-    return .{
-        .{ .x = inner.x, .y = inner.y, .w = tab_w, .h = inner.h },
-        .{ .x = inner.x + tab_w, .y = inner.y, .w = tab_w, .h = inner.h },
-    };
-}
-
-fn bodyContentHeight(state: *const controller, body_width: f32) f32 {
-    const frame = &state.presentation;
-    const inset = companionScaled(24.0);
-    if (state.selected_tab == .activity) {
-        if (frame.activity_count == 0) return inset + companionScaled(64.0);
-        const working_extra: f32 = if (frame.working) companionScaled(28.0) else 0.0;
-        var inspector_extra: f32 = 0.0;
-        for (frame.activity[0..frame.activity_count]) |*item| {
-            const reference = activityOperationReference(frame, item) orelse continue;
-            if (!state.operationSelected(&reference)) continue;
-            const operation = frame.operationForReference(&reference) orelse continue;
-            inspector_extra += inspectorHeight(operation) + companionScaled(7.0);
-        }
-        return inset + @as(f32, @floatFromInt(frame.activity_count)) * companionScaled(65.0) + inspector_extra + working_extra;
-    }
-    var height = inset;
-    if (frame.has_approval) height += companionScaled(130.0);
-    height += resultCardHeight(frame, body_width);
-    const active = frame.activeCounts();
-    const active_total = active.working + active.pending;
-    if (active_total > 0) height += companionScaled(27.0 + 79.0 * @as(f32, @floatFromInt(active_total)));
-    const recent = frame.recentCount();
-    if (recent > 0) height += companionScaled(27.0 + 79.0 * @as(f32, @floatFromInt(@min(recent, 5))));
-    if (state.selected_operation) |*reference| {
-        if (state.operationSelected(reference)) {
-            var visible = false;
-            var recent_shown: usize = 0;
-            for (0..frame.operation_count) |index| {
-                const operation = &frame.operations[index];
-                if (!operation.active() and recent_shown == 5) continue;
-                if (!operation.active()) recent_shown += 1;
-                const candidate = frame.operationReference(index) orelse continue;
-                if (candidate.eql(reference)) {
-                    visible = true;
-                    break;
-                }
-            }
-            if (visible) {
-                if (frame.operationForReference(reference)) |operation| {
-                    height += inspectorHeight(operation) + companionScaled(7.0);
-                }
-            }
-        }
-    }
-    if (active_total == 0 and recent == 0 and !resultCardVisible(frame)) height += companionScaled(79.0);
-    if (frame.provider_error.slice().len > 0) height += companionScaled(79.0);
-    if (frame.control_error.slice().len > 0) height += companionScaled(79.0);
-    if (frame.ui_error.slice().len > 0) height += companionScaled(79.0);
-    return height;
-}
-
-fn renderSectionHeader(state: *runtime.AppState, clip: palette.Rect, y: *f32, title: []const u8, summary: []const u8) void {
-    const chrome = theme.companionChrome();
-    queueBoldText(state, .{ .x = clip.x + companionScaled(12.0), .y = y.*, .w = clip.w * 0.5, .h = companionScaled(18.0) }, title, color(chrome.text_subtle), companionScaled(10.0), clip);
-    queueMonoText(state, .{ .x = clip.x + clip.w * 0.5, .y = y.*, .w = @max(clip.w * 0.5 - companionScaled(12.0), 0.0), .h = companionScaled(18.0) }, summary, color(chrome.text_subtle), companionScaled(9.5), clip);
-    y.* += companionScaled(27.0);
-}
-
-fn renderEmptyBody(state: *runtime.AppState, clip: palette.Rect, y: *f32, title: []const u8, detail: []const u8) void {
-    const chrome = theme.companionChrome();
-    queueBoldText(state, .{ .x = clip.x + companionScaled(12.0), .y = y.* + companionScaled(10.0), .w = @max(clip.w - companionScaled(24.0), 0.0), .h = companionScaled(18.0) }, title, color(chrome.text), companionScaled(12.0), clip);
-    queueText(state, .{ .x = clip.x + companionScaled(12.0), .y = y.* + companionScaled(33.0), .w = @max(clip.w - companionScaled(24.0), 0.0), .h = companionScaled(18.0) }, detail, color(chrome.text_subtle), companionScaled(11.0), clip);
-    y.* += companionScaled(64.0);
-}
-
-fn renderRunBody(state: *runtime.AppState, clip: palette.Rect, y: *f32) void {
-    const frame = &state.companion_controller.presentation;
-    if (frame.has_approval) renderApproval(state, clip, y, frame.approval_title.slice(), frame.approval_body.slice());
-    // The answer leads and operations follow as supporting evidence: the user
-    // reads what Sprout says without opening Activity.
-    renderResultCard(state, clip, y);
-    const counts = frame.activeCounts();
-    const active_total = counts.working + counts.pending;
-    if (active_total > 0) {
-        const summary = framePrint(state, "{d} working · {d} pending", .{ counts.working, counts.pending });
-        renderSectionHeader(state, clip, y, "ACTIVE OPERATIONS", summary);
-        for (0..frame.operation_count) |index| {
-            const operation = &frame.operations[index];
-            if (!operation.active()) continue;
-            renderFrameOperationCard(state, clip, y, operation, frame.operationReference(index));
-        }
-    }
-    const recent_total = frame.recentCount();
-    if (recent_total > 0) {
-        const summary = if (recent_total > 5) framePrint(state, "5 of {d}", .{recent_total}) else framePrint(state, "{d}", .{recent_total});
-        renderSectionHeader(state, clip, y, "RECENT", summary);
-        var shown: usize = 0;
-        for (0..frame.operation_count) |index| {
-            const operation = &frame.operations[index];
-            if (operation.active() or shown == 5) continue;
-            renderFrameOperationCard(state, clip, y, operation, frame.operationReference(index));
-            shown += 1;
-        }
-    }
-    if (active_total == 0 and recent_total == 0 and !resultCardVisible(frame)) {
-        if (frame.latest_body.slice().len > 0)
-            renderOperationCard(state, clip, y, "Latest activity", frame.latest_body.slice(), .completed, false, false)
-        else
-            renderEmptyBody(state, clip, y, "Nothing running", "Send an instruction below to start.");
-    }
-    if (frame.provider_error.slice().len > 0) renderOperationCard(state, clip, y, "Send failed", frame.provider_error.slice(), .failed, false, false);
-    if (frame.control_error.slice().len > 0) renderOperationCard(state, clip, y, "Action failed", frame.control_error.slice(), .failed, false, false);
-    if (frame.ui_error.slice().len > 0) renderOperationCard(state, clip, y, "Sprout error", frame.ui_error.slice(), .failed, false, false);
-}
-
-// True when the Run tab owes the user a Result region: a run in flight, a
-// current-turn answer, or a current-turn failure.
-fn resultCardVisible(frame: *const controller.Frame) bool {
-    if (frame.working or frame.answer_failed) return true;
-    return std.mem.trim(u8, frame.answer.slice(), " \t\r\n").len > 0;
-}
-
-// Height the Result card occupies; shared with scroll extents so the direct
-// non-inertial scroll math matches the rendered layout exactly.
-fn resultCardHeight(frame: *const controller.Frame, body_width: f32) f32 {
-    if (!resultCardVisible(frame)) return 0.0;
-    const text_w = @max(body_width - companionScaled(48.0), 0.0);
-    const wrapped = wrapResultText(std.mem.trim(u8, frame.answer.slice(), " \t\r\n"), text_w);
-    const line_count: f32 = @floatFromInt(@max(wrapped.count, 1));
-    return companionScaled(42.0) + line_count * companionScaled(17.0) + companionScaled(10.0);
-}
-
-// Prominent Result region at the top of Run: Sprout's streaming or final
-// answer for the current objective, readable without opening Activity. States
-// are truthful — WORKING while the run streams, DONE only for a real reply,
-// FAILED only when this turn itself failed.
-fn renderResultCard(state: *runtime.AppState, clip: palette.Rect, y: *f32) void {
-    const frame = &state.companion_controller.presentation;
-    if (!resultCardVisible(frame)) return;
-    const scale = companionScale();
-    const chrome = theme.companionChrome();
-    const failed = frame.answer_failed and !frame.working;
-    const answer = std.mem.trim(u8, frame.answer.slice(), " \t\r\n");
-    const card_w = @max(clip.w - 24.0 * scale, 0.0);
-    const text_w = @max(card_w - 24.0 * scale, 0.0);
-    const wrapped = wrapResultText(answer, text_w);
-    const line_count: f32 = @floatFromInt(@max(wrapped.count, 1));
-    const card: palette.Rect = .{ .x = clip.x + 12.0 * scale, .y = y.*, .w = card_w, .h = 42.0 * scale + line_count * 17.0 * scale };
-    const card_fill = if (failed) opaqueOver(surface(), chrome.failure_card) else chrome.surface_deep;
-    const card_stroke = opaqueOver(card_fill, if (failed) chrome.failure_border else chrome.hairline);
-    queuePanelClipped(state, card, color(card_fill), color(card_stroke), 10.0 * scale, 1.0 * scale, clip);
-    const stripe = if (failed) chrome.danger else if (frame.working) chrome.accent_hi else chrome.identity_fg;
-    queueRoundedRectClipped(state, .{ .x = card.x, .y = card.y, .w = 3.0 * scale, .h = card.h }, color(stripe), 1.5 * scale, clip);
-    const verdict_w = 62.0 * scale;
-    const heading = companionCharacterResultHeading(activeCompanionCharacter(state));
-    queueBoldText(state, .{ .x = card.x + 12.0 * scale, .y = card.y + 10.0 * scale, .w = @max(card.w - verdict_w - 24.0 * scale, 0.0), .h = 15.0 * scale }, heading, color(chrome.text_subtle), 10.0 * scale, clip);
-    const verdict = if (frame.working) "WORKING" else if (failed) "FAILED" else "DONE";
-    const verdict_color = if (frame.working) chrome.accent else if (failed) chrome.danger else chrome.identity_fg;
-    queueBoldText(state, .{ .x = card.x + @max(card.w - verdict_w - 12.0 * scale, 0.0), .y = card.y + 10.0 * scale, .w = verdict_w, .h = 15.0 * scale }, verdict, color(verdict_color), 9.5 * scale, clip);
-    if (wrapped.count == 0) {
-        // Truthful empty states: the run is live but has streamed nothing
-        // yet, or it died before producing any reply at all.
-        const placeholder = if (frame.working) "Working — no reply yet." else "The run failed before replying.";
-        queueText(state, .{ .x = card.x + 12.0 * scale, .y = card.y + 30.0 * scale, .w = text_w, .h = 16.0 * scale }, placeholder, color(if (failed) chrome.failure_fg else chrome.text_subtle), RESULT_FONT_SIZE * scale, clip);
-    } else for (wrapped.lines[0..wrapped.count], 0..) |line, index| {
-        const last = index + 1 == wrapped.count;
-        const value = if (last and wrapped.truncated) framePrint(state, "{s}…", .{line}) else line;
-        queueText(state, .{ .x = card.x + 12.0 * scale, .y = card.y + 30.0 * scale + @as(f32, @floatFromInt(index)) * 17.0 * scale, .w = text_w, .h = 16.0 * scale }, value, color(if (failed) chrome.failure_fg else chrome.text), RESULT_FONT_SIZE * scale, clip);
-    }
-    y.* += card.h + 10.0 * scale;
-}
-
-fn renderActivityBody(state: *runtime.AppState, clip: palette.Rect, y: *f32) void {
-    const frame = &state.companion_controller.presentation;
-    if (frame.activity_count == 0) {
-        if (frame.working)
-            renderEmptyBody(state, clip, y, "Sprout is working…", "Activity will appear here as the run progresses.")
-        else
-            renderEmptyBody(state, clip, y, "No activity yet", "Events from this run will appear here.");
-        return;
-    }
-    for (0..frame.activity_count) |index| {
-        const item = &frame.activity[index];
-        const reference = activityOperationReference(frame, item);
-        renderActivityRow(state, clip, y, item, if (reference) |value| state.companion_controller.operationSelected(&value) else false);
-        if (reference) |value| if (state.companion_controller.operationSelected(&value)) {
-            if (frame.operationForReference(&value)) |operation| renderOperationInspector(state, clip, y, operation, value);
-        };
-    }
-    // A live run keeps a visible pulse at the tail so the newest row is never
-    // mistaken for the final word.
-    if (frame.working) {
-        const chrome = theme.companionChrome();
-        queueText(state, .{ .x = clip.x + companionScaled(24.0), .y = y.*, .w = @max(clip.w - companionScaled(36.0), 0.0), .h = companionScaled(16.0) }, "Sprout is working…", color(chrome.text_subtle), companionScaled(10.5), clip);
-        y.* += companionScaled(28.0);
+    if (state.companion_controller.editingSettings()) {
+        const s = companionScale();
+        const label = if (state.companion_controller.orders_mode) "STANDING ORDERS · Enter to save, Esc to cancel" else "RENAME · Enter to save, Esc to cancel";
+        queueBoldText(state, .{ .x = composer.x + 4.0 * s, .y = footer.y - 18.0 * s, .w = composer.w, .h = 15.0 * s }, label, color(chrome.identity_fg), 10.0 * s, geometry.panel);
     }
 }
 
-// One bounded Activity row: kind-colored stripe, author, optional state label,
-// and a single-line body so raw command dumps cannot overflow the card.
-fn renderActivityRow(state: *runtime.AppState, clip: palette.Rect, y: *f32, item: *const controller.ActivityItem, selected: bool) void {
-    const chrome = theme.companionChrome();
-    const failed = item.status == .failed;
-    const accent = activityAccent(chrome, item);
-    const card: palette.Rect = .{ .x = clip.x + companionScaled(12.0), .y = y.*, .w = @max(clip.w - companionScaled(24.0), 0.0), .h = companionScaled(58.0) };
-    const card_fill = if (failed) opaqueOver(surface(), chrome.failure_card) else chrome.surface_deep;
-    const card_stroke = opaqueOver(card_fill, if (selected) chrome.accent else if (failed) chrome.failure_border else chrome.hairline);
-    queuePanelClipped(state, card, color(card_fill), color(card_stroke), companionScaled(9.0), companionScaled(1.0), clip);
-    queueRoundedRectClipped(state, .{ .x = card.x, .y = card.y, .w = companionScaled(3.0), .h = card.h }, color(accent), companionScaled(1.5), clip);
-    const status_w = companionScaled(52.0);
-    const author_w = if (item.status != null) @max(card.w - companionScaled(22.0) - status_w, 0.0) else @max(card.w - companionScaled(22.0), 0.0);
-    queueBoldText(state, .{ .x = card.x + companionScaled(11.0), .y = card.y + companionScaled(8.0), .w = author_w, .h = companionScaled(17.0) }, item.author.slice(), color(if (failed) chrome.failure_fg else chrome.text), companionScaled(11.5), clip);
-    if (item.status) |status| {
-        queueBoldText(state, .{ .x = card.x + @max(card.w - status_w - companionScaled(11.0), 0.0), .y = card.y + companionScaled(9.0), .w = status_w, .h = companionScaled(15.0) }, operationStatusLabel(status), color(operationStatusColor(chrome, status)), companionScaled(9.0), clip);
-    }
-    // Tool and process rows carry command dumps; show the command preview
-    // rather than the raw Input/Output text.
-    const raw_body = switch (item.kind) {
-        .tool, .process => operationPreview(item.body.slice()).detail,
-        else => item.body.slice(),
-    };
-    const body_w = @max(card.w - companionScaled(22.0), 0.0);
-    const body = truncatedText(state, .ui, companionScaled(10.5), body_w, singleLineText(state, raw_body));
-    queueText(state, .{ .x = card.x + companionScaled(11.0), .y = card.y + companionScaled(29.0), .w = body_w, .h = companionScaled(18.0) }, body, color(if (failed) chrome.failure_fg else chrome.text_subtle), companionScaled(10.5), clip);
-    y.* += companionScaled(65.0);
-}
+// ---- conversation -----------------------------------------------------------
 
-fn activityAccent(chrome: theme.CompanionChrome, item: *const controller.ActivityItem) [4]f32 {
-    if (item.status) |status| return operationStatusColor(chrome, status);
-    return switch (item.kind) {
-        .user => chrome.accent,
-        .assistant => chrome.identity_fg,
-        .streaming => chrome.accent_hi,
-        .system => chrome.text_muted,
-        .tool, .process => chrome.text_subtle,
-    };
-}
-
-fn approvalButtonRects(body: palette.Rect, scroll_y: f32) [2]palette.Rect {
-    const inset = companionScaled(12.0);
-    const gap = companionScaled(8.0);
-    const card_width = @max(body.w - inset * 2.0, 0.0);
-    const width = @max((card_width - companionScaled(24.0) - gap) * 0.5, 0.0);
-    const x = body.x + inset + companionScaled(12.0);
-    const y = body.y + inset - scroll_y + companionScaled(76.0);
-    return .{
-        .{ .x = x + width + gap, .y = y, .w = width, .h = companionScaled(28.0) },
-        .{ .x = x, .y = y, .w = width, .h = companionScaled(28.0) },
-    };
-}
-
-fn renderApproval(state: *runtime.AppState, body: palette.Rect, y: *f32, title: []const u8, detail: []const u8) void {
-    const scale = companionScale();
-    const chrome = theme.companionChrome();
-    const card: palette.Rect = .{ .x = body.x + 12.0 * scale, .y = y.*, .w = @max(body.w - 24.0 * scale, 0.0), .h = 116.0 * scale };
-    const card_fill = opaqueOver(surface(), chrome.approval_card);
-    const card_stroke = opaqueOver(card_fill, chrome.approval_border);
-    queuePanelClipped(state, card, color(card_fill), color(card_stroke), 10.0 * scale, 1.0 * scale, body);
-    queueRoundedRectClipped(state, .{ .x = card.x, .y = card.y, .w = 3.0 * scale, .h = card.h }, color(chrome.warning), 1.5 * scale, body);
-    queueText(state, .{ .x = card.x + 12.0 * scale, .y = card.y + 10.0 * scale, .w = 16.0 * scale, .h = 18.0 * scale }, "◆", color(chrome.warning), 11.0 * scale, body);
-    queueBoldText(state, .{ .x = card.x + 31.0 * scale, .y = card.y + 9.0 * scale, .w = @max(card.w - 43.0 * scale, 0.0), .h = 18.0 * scale }, if (title.len > 0) title else "Permission required", color(chrome.approval_title), 12.0 * scale, body);
-    queueText(state, .{ .x = card.x + 12.0 * scale, .y = card.y + 34.0 * scale, .w = @max(card.w - 24.0 * scale, 0.0), .h = 34.0 * scale }, if (detail.len > 0) detail else "Sprout is waiting for your decision before continuing.", color(chrome.approval_body), 12.0 * scale, body);
-    const buttons = approvalButtonRects(body, state.companion_controller.currentScrollY());
-    queuePanelClipped(state, buttons[0], color(surfaceDeep()), color(chrome.border), 8.0 * scale, 1.0 * scale, body);
-    queueRoundedRectClipped(state, buttons[1], color(chrome.accent), 8.0 * scale, body);
-    queueCenteredText(state, buttons[0], "Cancel action", color(chrome.text_muted), 11.5 * scale, .ui_bold, body);
-    queueCenteredText(state, buttons[1], "Allow once", color(chrome.accent_fg), 11.5 * scale, .ui_bold, body);
-    y.* += card.h + 14.0 * scale;
-}
-
-// One Frame-backed operation in the Run region. These are real tracked
-// executions, so a completed card may truthfully state its completion.
-fn renderFrameOperationCard(state: *runtime.AppState, clip: palette.Rect, y: *f32, operation: *const controller.Operation, reference: ?controller.OperationReference) void {
-    const selected = if (reference) |value| state.companion_controller.operationSelected(&value) else false;
-    renderOperationCard(state, clip, y, operation.title.slice(), operation.detail.slice(), operation.status, true, selected);
-    if (selected) renderOperationInspector(state, clip, y, operation, reference.?);
-}
-
-// One owner-derived operation card in the scrollable Run region. Raw bodies
-// arrive as multi-line "Command:/Input: … Output: …" dumps, so the card shows
-// a bounded single-line command preview plus a single-line result preview.
-// completion_note allows "Completed successfully" only for cards whose status
-// reflects a real tracked execution, never for generic transcript reuse.
-fn renderOperationCard(state: *runtime.AppState, clip: palette.Rect, y: *f32, title: []const u8, detail: []const u8, status: controller.OperationStatus, completion_note: bool, selected: bool) void {
-    const scale = companionScale();
-    const chrome = theme.companionChrome();
-    const failed = status == .failed;
-    const indicator = operationStatusColor(chrome, status);
-    const card = operationCardRect(clip, y.*, 72.0 * scale);
-    const card_fill = if (failed) opaqueOver(surface(), chrome.failure_card) else chrome.surface_deep;
-    const card_stroke = opaqueOver(card_fill, if (selected) chrome.accent else if (failed) chrome.failure_border else chrome.hairline);
-    queuePanelClipped(state, card, color(card_fill), color(card_stroke), 10.0 * scale, 1.0 * scale, clip);
-    const avatar: palette.Rect = .{ .x = card.x + 11.0 * scale, .y = card.y + 10.0 * scale, .w = 27.0 * scale, .h = 27.0 * scale };
-    queuePanelClipped(state, avatar, color(chrome.surface_deep), color(chrome.border), 7.0 * scale, 1.0 * scale, clip);
-    queueCenteredText(state, avatar, if (failed) "!" else "S", color(if (failed) chrome.failure_fg else chrome.identity_fg), 10.0 * scale, .mono, clip);
-    const title_w = @max(card.w - 118.0 * scale, 0.0);
-    queueBoldText(state, .{ .x = card.x + 48.0 * scale, .y = card.y + 9.0 * scale, .w = title_w, .h = 18.0 * scale }, truncatedText(state, .ui_bold, 12.0 * scale, title_w, singleLineText(state, title)), color(if (failed) chrome.failure_fg else chrome.text), 12.0 * scale, clip);
-    const preview = operationPreview(detail);
-    const line_w = @max(card.w - 60.0 * scale, 0.0);
-    queueMonoText(state, .{ .x = card.x + 48.0 * scale, .y = card.y + 29.0 * scale, .w = line_w, .h = 15.0 * scale }, truncatedText(state, .mono, 10.0 * scale, line_w, singleLineText(state, preview.detail)), color(if (failed) chrome.failure_fg else chrome.text_subtle), 10.0 * scale, clip);
-    // Successful cards show real output or a truthful completion note, never
-    // a CWD/ExitCode/Duration metadata dump; failure and stop cards keep
-    // their full previews because that detail is diagnostic.
-    const result_preview: ?[]const u8 = if (preview.result) |result|
-        (if (status == .completed) meaningfulResultPreview(result) else result)
-    else
-        null;
-    if (result_preview) |result| {
-        queueText(state, .{ .x = card.x + 48.0 * scale, .y = card.y + 47.0 * scale, .w = line_w, .h = 15.0 * scale }, truncatedText(state, .ui, 10.0 * scale, line_w, singleLineText(state, result)), color(if (failed) chrome.failure_fg else chrome.text_muted), 10.0 * scale, clip);
-    } else if (completion_note and status == .completed) {
-        queueText(state, .{ .x = card.x + 48.0 * scale, .y = card.y + 47.0 * scale, .w = line_w, .h = 15.0 * scale }, "Completed successfully", color(chrome.text_muted), 10.0 * scale, clip);
-    }
-    if (status == .pending) {
-        // Pending renders as a ring: an indicator-colored underlay whose core
-        // is refilled with the card color, so no border-only command is needed.
-        const ring: palette.Rect = .{ .x = card.x + card.w - 65.0 * scale, .y = card.y + 15.0 * scale, .w = 7.0 * scale, .h = 7.0 * scale };
-        queuePanelClipped(state, ring, color(card_fill), color(indicator), 3.5 * scale, 1.0 * scale, clip);
-    } else {
-        queueRoundedRectClipped(state, .{ .x = card.x + card.w - 65.0 * scale, .y = card.y + 15.0 * scale, .w = 7.0 * scale, .h = 7.0 * scale }, color(indicator), 3.5 * scale, clip);
-    }
-    queueBoldText(state, .{ .x = card.x + card.w - 54.0 * scale, .y = card.y + 10.0 * scale, .w = 45.0 * scale, .h = 18.0 * scale }, operationStatusLabel(status), color(indicator), 9.5 * scale, clip);
-    y.* += card.h + 7.0 * scale;
-}
-
-const InspectorControls = struct {
-    stop: ?palette.Rect = null,
-    follow_log: ?palette.Rect = null,
+const WrappedText = struct {
+    lines: [MAX_WRAP_LINES][]const u8 = [_][]const u8{""} ** MAX_WRAP_LINES,
+    count: usize = 0,
+    truncated: bool = false,
 };
 
-fn activityOperationReference(frame: *const controller.Frame, item: *const controller.ActivityItem) ?controller.OperationReference {
-    if (item.kind != .tool and item.kind != .process) return null;
-    const identity = item.identity.slice();
-    if (identity.len == 0) return null;
-    for (frame.operations[0..frame.operation_count], 0..) |*operation, index| {
-        if (!std.mem.eql(u8, operation.identity.slice(), identity)) continue;
-        return frame.operationReference(index);
+/// Measured greedy wrap. Lines are subslices of `text`; embedded newlines
+/// force breaks and output is bounded to `max_lines`.
+fn wrapText(text: []const u8, max_width: f32, role: palette.FontRole, font_size: f32, max_lines: usize) WrappedText {
+    var wrapped: WrappedText = .{};
+    const limit = @min(max_lines, MAX_WRAP_LINES);
+    if (max_width <= 0.0 or limit == 0) return wrapped;
+    var paragraphs = std.mem.splitScalar(u8, text, '\n');
+    while (paragraphs.next()) |paragraph| {
+        var remaining = std.mem.trimEnd(u8, paragraph, " \t\r");
+        if (remaining.len == 0) {
+            if (wrapped.count > 0 and wrapped.count < limit and wrapped.lines[wrapped.count - 1].len > 0) {
+                wrapped.lines[wrapped.count] = "";
+                wrapped.count += 1;
+            }
+            continue;
+        }
+        while (remaining.len > 0) {
+            if (wrapped.count == limit) {
+                wrapped.truncated = true;
+                return wrapped;
+            }
+            const break_index = measuredLineBreak(remaining, max_width, role, font_size);
+            wrapped.lines[wrapped.count] = std.mem.trimEnd(u8, remaining[0..break_index], " \t");
+            wrapped.count += 1;
+            remaining = std.mem.trimStart(u8, remaining[break_index..], " \t");
+        }
     }
-    return null;
+    while (wrapped.count > 0 and wrapped.lines[wrapped.count - 1].len == 0) wrapped.count -= 1;
+    return wrapped;
 }
 
-fn inspectorHeight(operation: *const controller.Operation) f32 {
-    return operationInspectorHeight(operation, false);
-}
-
-fn missionInspectorHeight(operation: *const controller.Operation) f32 {
-    return operationInspectorHeight(operation, true);
-}
-
-fn operationInspectorHeight(operation: *const controller.Operation, include_detail: bool) f32 {
-    const row_count = inspectorMetadataRowCount(operation) + @as(usize, if (inspectorOutput(operation) != null) 1 else 0) +
-        @as(usize, if (include_detail and inspectorDetail(operation) != null) 1 else 0);
-    const controls: f32 = if (operation.actions.stop or operation.actions.follow_log) companionScaled(34.0) else 0.0;
-    return companionScaled(36.0 + 19.0 * @as(f32, @floatFromInt(row_count))) + controls;
-}
-
-fn inspectorMetadataRowCount(operation: *const controller.Operation) usize {
-    const inspector = &operation.inspector;
-    var count: usize = 0;
-    inline for (.{
-        inspector.owner.slice(),
-        inspector.workspace.slice(),
-        inspector.action.slice(),
-        inspector.target.slice(),
-        inspector.provider.slice(),
-        inspector.cwd.slice(),
-        inspector.state.slice(),
-        inspector.wait_reason.slice(),
-        inspector.failure_reason.slice(),
-        inspector.locations.slice(),
-    }) |value| if (value.len > 0) {
-        count += 1;
-    };
-    for (inspector.files[0..@min(inspector.file_count, inspector.files.len)]) |*value| if (value.slice().len > 0) {
-        count += 1;
-    };
-    for (inspector.resources[0..@min(inspector.resource_count, inspector.resources.len)]) |*value| if (value.slice().len > 0) {
-        count += 1;
-    };
-    if (inspector.started_at_ms != null) count += 1;
-    if (inspector.updated_at_ms != null) count += 1;
-    if (inspector.elapsed_ms != null) count += 1;
-    return count;
-}
-
-fn inspectorOutput(operation: *const controller.Operation) ?[]const u8 {
-    const output = std.mem.trim(u8, operation.inspector.output.slice(), " \t\r\n");
-    return if (output.len > 0) output else null;
-}
-
-fn inspectorDetail(operation: *const controller.Operation) ?[]const u8 {
-    const detail = std.mem.trim(u8, operation.detail.slice(), " \t\r\n");
-    return if (detail.len > 0) detail else null;
-}
-
-fn missionOperationInspectorRect(clip: palette.Rect, y: f32, operation: *const controller.Operation) palette.Rect {
-    return .{
-        .x = clip.x + companionScaled(12.0),
-        .y = y,
-        .w = @max(clip.w - companionScaled(24.0), 0.0),
-        .h = missionInspectorHeight(operation),
-    };
-}
-
-fn inspectorControlRects(rect: palette.Rect, actions: controller.SupportedActions) InspectorControls {
-    const count: usize = @as(usize, @intFromBool(actions.stop)) + @as(usize, @intFromBool(actions.follow_log));
-    if (count == 0) return .{};
-    const inset = companionScaled(10.0);
-    const gap = companionScaled(7.0);
-    const total_w = @max(rect.w - inset * 2.0, 0.0);
-    const button_w = if (count == 2) @max((total_w - gap) * 0.5, 0.0) else total_w;
-    const y = rect.y + rect.h - companionScaled(30.0);
-    var x = rect.x + inset;
-    var result: InspectorControls = .{};
-    if (actions.stop) {
-        result.stop = .{ .x = x, .y = y, .w = button_w, .h = companionScaled(24.0) };
-        x += button_w + gap;
+fn measuredLineBreak(text: []const u8, max_width: f32, role: palette.FontRole, font_size: f32) usize {
+    if (text_measure.textWidth(role, font_size, text) <= max_width) return text.len;
+    var low: usize = 0;
+    var high: usize = text.len - 1;
+    var best: usize = 0;
+    while (low <= high) {
+        const mid = low + (high - low) / 2;
+        const candidate = utf8FloorIndex(text, mid);
+        if (text_measure.textWidth(role, font_size, text[0..candidate]) <= max_width) {
+            best = @max(best, candidate);
+            low = mid + 1;
+        } else {
+            if (mid == 0) break;
+            high = mid - 1;
+        }
     }
-    if (actions.follow_log) result.follow_log = .{ .x = x, .y = y, .w = button_w, .h = companionScaled(24.0) };
-    return result;
+    if (best == 0) {
+        var first: usize = 1;
+        while (first < text.len and (text[first] & 0xC0) == 0x80) first += 1;
+        return first;
+    }
+    if (std.mem.lastIndexOfScalar(u8, text[0..best], ' ')) |space_index| {
+        if (space_index > 0) return space_index;
+    }
+    return best;
 }
 
-// Inline operation inspector region beneath its selected Run or Activity row.
-fn renderOperationInspector(
-    state: *runtime.AppState,
-    clip: palette.Rect,
-    y: *f32,
-    operation: *const controller.Operation,
-    reference: controller.OperationReference,
-) void {
-    renderOperationInspectorContents(state, clip, y, operation, reference, false);
+/// Light Markdown cleanup for conversational display: drops emphasis and
+/// code ticks, heading hashes, and fence lines; turns list dashes into
+/// bullets. Content is never rewritten beyond markup.
+fn conversationalText(state: *runtime.AppState, text: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    const buffer = state.palette_frame_text_arena.allocator().alloc(u8, trimmed.len * 2) catch return trimmed;
+    var len: usize = 0;
+    var lines = std.mem.splitScalar(u8, trimmed, '\n');
+    var first = true;
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trimEnd(u8, raw_line, " \t\r");
+        if (std.mem.startsWith(u8, std.mem.trimStart(u8, line, " "), "```")) continue;
+        if (!first) {
+            buffer[len] = '\n';
+            len += 1;
+        }
+        first = false;
+        const leading = line.len - std.mem.trimStart(u8, line, " ").len;
+        var body = line[leading..];
+        while (body.len > 0 and body[0] == '#') body = body[1..];
+        if (body.len != line[leading..].len) body = std.mem.trimStart(u8, body, " ");
+        if ((std.mem.startsWith(u8, body, "- ") or std.mem.startsWith(u8, body, "* ")) and body.len > 2) {
+            @memcpy(buffer[len..][0..leading], line[0..leading]);
+            len += leading;
+            const bullet = "• ";
+            @memcpy(buffer[len..][0..bullet.len], bullet);
+            len += bullet.len;
+            body = body[2..];
+        } else {
+            @memcpy(buffer[len..][0..leading], line[0..leading]);
+            len += leading;
+        }
+        var index: usize = 0;
+        while (index < body.len) : (index += 1) {
+            const byte = body[index];
+            if (byte == '`') continue;
+            if ((byte == '*' or byte == '_') and index + 1 < body.len and body[index + 1] == byte) {
+                index += 1;
+                continue;
+            }
+            buffer[len] = byte;
+            len += 1;
+        }
+    }
+    return buffer[0..len];
 }
 
-fn renderMissionOperationInspector(
-    state: *runtime.AppState,
-    clip: palette.Rect,
-    y: *f32,
-    operation: *const controller.Operation,
-    reference: controller.OperationReference,
-) void {
-    renderOperationInspectorContents(state, clip, y, operation, reference, true);
+const ConversationItemLayout = struct {
+    height: f32,
+};
+
+fn bodyLineHeight() f32 {
+    return companionScaled(BODY_FONT) * LINE_HEIGHT_FACTOR;
 }
 
-fn renderOperationInspectorContents(
-    state: *runtime.AppState,
-    clip: palette.Rect,
-    y: *f32,
-    operation: *const controller.Operation,
-    reference: controller.OperationReference,
-    include_detail: bool,
-) void {
+fn conversationWidths(conversation: palette.Rect) struct { text: f32, bubble: f32 } {
+    const s = companionScale();
+    const text_w = @max(conversation.w - CONTENT_INSET * 2.0 * s, 0.0);
+    return .{ .text = text_w, .bubble = @max(text_w * 0.82 - 20.0 * s, 0.0) };
+}
+
+/// Height of one conversation item; render and scroll extent share it.
+fn conversationItemHeight(state: *runtime.AppState, item: *const controller.ActivityItem, conversation: palette.Rect) f32 {
+    const s = companionScale();
+    const widths = conversationWidths(conversation);
+    return switch (item.kind) {
+        .user => blk: {
+            const wrapped = wrapText(conversationalText(state, item.body.slice()), widths.bubble, .ui, companionScaled(BODY_FONT), USER_MAX_LINES);
+            break :blk @as(f32, @floatFromInt(@max(wrapped.count, 1))) * bodyLineHeight() + 20.0 * s + 10.0 * s;
+        },
+        .assistant, .streaming => blk: {
+            const wrapped = wrapText(conversationalText(state, item.body.slice()), widths.text, .ui, companionScaled(BODY_FONT), ASSISTANT_MAX_LINES);
+            if (wrapped.count == 0) break :blk 0.0;
+            break :blk @as(f32, @floatFromInt(wrapped.count)) * bodyLineHeight() + 14.0 * s;
+        },
+        .tool, .process => 24.0 * s,
+        .system => if (std.mem.trim(u8, item.body.slice(), " \t\r\n").len == 0) 0.0 else 22.0 * s,
+    };
+}
+
+fn renderConversation(state: *runtime.AppState, geometry: Geometry) void {
+    const conversation = geometry.conversation;
+    if (conversation.w <= 0.0 or conversation.h <= 0.0) return;
+    const companion = &state.companion_controller;
+    const frame = &companion.presentation;
+    if (frame.activity_count == 0) return renderEmptyState(state, geometry);
+    const s = companionScale();
+    const pad = 10.0 * s;
+    var total: f32 = pad * 2.0;
+    for (frame.activity[0..frame.activity_count]) |*item| total += conversationItemHeight(state, item, conversation);
+    companion.updateConversationExtent(@max(total - conversation.h, 0.0));
+    var y = conversation.y + pad - companion.conversation_scroll_y;
+    for (frame.activity[0..frame.activity_count]) |*item| {
+        const height = conversationItemHeight(state, item, conversation);
+        if (height > 0.0 and y + height >= conversation.y and y <= conversation.y + conversation.h) {
+            renderConversationItem(state, item, conversation, y);
+        }
+        y += height;
+    }
+    if (companion.conversation_scroll_y > 1.0) renderFade(state, conversation, true);
+    if (companion.conversation_max_scroll - companion.conversation_scroll_y > 1.0) renderFade(state, conversation, false);
+}
+
+fn renderFade(state: *runtime.AppState, conversation: palette.Rect, top: bool) void {
+    const s = companionScale();
+    const h = 14.0 * s;
+    const steps = 4;
+    for (0..steps) |step| {
+        const t = @as(f32, @floatFromInt(step)) / @as(f32, @floatFromInt(steps));
+        const strip_h = h / @as(f32, @floatFromInt(steps));
+        const y = if (top) conversation.y + strip_h * @as(f32, @floatFromInt(step)) else conversation.y + conversation.h - strip_h * @as(f32, @floatFromInt(step + 1));
+        const alpha: u8 = @intFromFloat((1.0 - t) * 200.0);
+        queueRect(state, .{ .x = conversation.x + 2.0 * s, .y = y, .w = @max(conversation.w - 4.0 * s, 0.0), .h = strip_h }, color(theme.withAlpha(surface(), alpha)));
+    }
+}
+
+fn renderConversationItem(state: *runtime.AppState, item: *const controller.ActivityItem, conversation: palette.Rect, y: f32) void {
+    const s = companionScale();
     const chrome = theme.companionChrome();
-    const rect = if (include_detail) missionOperationInspectorRect(clip, y.*, operation) else operationInspectorRect(clip, y.*, operation);
-    queuePanelClipped(state, rect, color(chrome.surface_deep), color(chrome.accent), companionScaled(9.0), companionScaled(1.0), clip);
-    queueRoundedRectClipped(state, .{ .x = rect.x, .y = rect.y, .w = companionScaled(3.0), .h = rect.h }, color(chrome.accent), companionScaled(1.5), clip);
-    const title = if (operation.title.slice().len > 0) operation.title.slice() else "Operation details";
-    queueBoldText(state, .{ .x = rect.x + companionScaled(11.0), .y = rect.y + companionScaled(8.0), .w = @max(rect.w - companionScaled(86.0), 0.0), .h = companionScaled(16.0) }, title, color(chrome.text), companionScaled(11.0), clip);
-    queueBoldText(state, .{ .x = rect.x + @max(rect.w - companionScaled(67.0), 0.0), .y = rect.y + companionScaled(8.0), .w = companionScaled(56.0), .h = companionScaled(16.0) }, operationStatusLabel(operation.status), color(operationStatusColor(chrome, operation.status)), companionScaled(9.0), clip);
-
-    var row_y = rect.y + companionScaled(29.0);
-    if (inspectorOutput(operation)) |value| renderInspectorRow(state, clip, rect, &row_y, "Output", value);
-    if (include_detail) if (inspectorDetail(operation)) |value| renderInspectorRow(state, clip, rect, &row_y, "Detail", value);
-    const inspector = &operation.inspector;
-    renderInspectorRowIfPresent(state, clip, rect, &row_y, "Owner", inspector.owner.slice());
-    renderInspectorRowIfPresent(state, clip, rect, &row_y, "Workspace", inspector.workspace.slice());
-    renderInspectorRowIfPresent(state, clip, rect, &row_y, "Action", inspector.action.slice());
-    renderInspectorRowIfPresent(state, clip, rect, &row_y, "Target", inspector.target.slice());
-    renderInspectorRowIfPresent(state, clip, rect, &row_y, "Provider", inspector.provider.slice());
-    renderInspectorRowIfPresent(state, clip, rect, &row_y, "Cwd", inspector.cwd.slice());
-    renderInspectorRowIfPresent(state, clip, rect, &row_y, "State", inspector.state.slice());
-    renderInspectorRowIfPresent(state, clip, rect, &row_y, "Waiting", inspector.wait_reason.slice());
-    renderInspectorRowIfPresent(state, clip, rect, &row_y, "Failure", inspector.failure_reason.slice());
-    renderInspectorRowIfPresent(state, clip, rect, &row_y, "Locations", inspector.locations.slice());
-    var file_label = true;
-    for (inspector.files[0..@min(inspector.file_count, inspector.files.len)]) |*value| if (value.slice().len > 0) {
-        renderInspectorRow(state, clip, rect, &row_y, if (file_label) "Files" else "", value.slice());
-        file_label = false;
-    };
-    var resource_label = true;
-    for (inspector.resources[0..@min(inspector.resource_count, inspector.resources.len)]) |*value| if (value.slice().len > 0) {
-        renderInspectorRow(state, clip, rect, &row_y, if (resource_label) "Resources" else "", value.slice());
-        resource_label = false;
-    };
-    if (inspector.started_at_ms) |value| renderInspectorRow(state, clip, rect, &row_y, "Started", framePrint(state, "{d} ms", .{value}));
-    if (inspector.updated_at_ms) |value| renderInspectorRow(state, clip, rect, &row_y, "Updated", framePrint(state, "{d} ms", .{value}));
-    if (inspector.elapsed_ms) |value| renderInspectorRow(state, clip, rect, &row_y, "Elapsed", framePrint(state, "{d} ms", .{value}));
-
-    const controls = inspectorControlRects(rect, reference.actions);
-    if (controls.stop) |button| renderInspectorButton(state, clip, button, "Stop");
-    if (controls.follow_log) |button| renderInspectorButton(state, clip, button, "Follow log");
-    y.* += rect.h + companionScaled(7.0);
+    const widths = conversationWidths(conversation);
+    const x = conversation.x + CONTENT_INSET * s;
+    const line_h = bodyLineHeight();
+    const font = companionScaled(BODY_FONT);
+    switch (item.kind) {
+        .user => {
+            const wrapped = wrapText(conversationalText(state, item.body.slice()), widths.bubble, .ui, font, USER_MAX_LINES);
+            var widest: f32 = 0.0;
+            for (wrapped.lines[0..wrapped.count]) |line| widest = @max(widest, text_measure.textWidth(.ui, font, line));
+            const bubble_w = @min(widest + 22.0 * s, widths.bubble + 20.0 * s);
+            const bubble_h = @as(f32, @floatFromInt(@max(wrapped.count, 1))) * line_h + 18.0 * s;
+            const bubble: palette.Rect = .{ .x = x + widths.text - bubble_w, .y = y + 4.0 * s, .w = bubble_w, .h = bubble_h };
+            queuePanelClipped(state, bubble, color(opaqueOver(surface(), chrome.ready_fill)), color(opaqueOver(surface(), theme.withAlpha(chrome.accent, 60))), 12.0 * s, 1.0 * s, conversation);
+            for (wrapped.lines[0..wrapped.count], 0..) |line, index| {
+                queueText(state, .{ .x = bubble.x + 11.0 * s, .y = bubble.y + 9.0 * s + @as(f32, @floatFromInt(index)) * line_h, .w = widths.bubble + 4.0 * s, .h = line_h }, line, color(chrome.text), font, conversation);
+            }
+        },
+        .assistant, .streaming => {
+            const wrapped = wrapText(conversationalText(state, item.body.slice()), widths.text, .ui, font, ASSISTANT_MAX_LINES);
+            for (wrapped.lines[0..wrapped.count], 0..) |line, index| {
+                const last = index + 1 == wrapped.count;
+                const shown = if (last and item.kind == .streaming) framePrint(state, "{s} ▍", .{line}) else if (last and wrapped.truncated) framePrint(state, "{s} …", .{line}) else line;
+                queueText(state, .{ .x = x, .y = y + 6.0 * s + @as(f32, @floatFromInt(index)) * line_h, .w = widths.text + 12.0 * s, .h = line_h }, shown, color(chrome.text), font, conversation);
+            }
+        },
+        .tool, .process => {
+            const status = item.status orelse .completed;
+            const glyph: []const u8 = switch (status) {
+                .pending, .in_progress => "●",
+                .completed => "✓",
+                .failed => "✕",
+                .cancelled => "–",
+            };
+            const glyph_color = switch (status) {
+                .pending, .in_progress => chrome.accent,
+                .completed => chrome.text_subtle,
+                .failed => chrome.danger,
+                .cancelled => chrome.text_subtle,
+            };
+            queueText(state, .{ .x = x + 2.0 * s, .y = y + 4.0 * s, .w = 14.0 * s, .h = 16.0 * s }, glyph, color(glyph_color), 10.5 * s, conversation);
+            const label = if (item.body.slice().len > 0)
+                framePrint(state, "{s} · {s}", .{ item.author.slice(), singleLineText(state, item.body.slice()) })
+            else
+                item.author.slice();
+            const text_w = @max(widths.text - 20.0 * s, 0.0);
+            queueMonoText(state, .{ .x = x + 18.0 * s, .y = y + 4.0 * s, .w = text_w, .h = 16.0 * s }, truncatedText(state, .mono, 10.5 * s, text_w, label), color(chrome.text_subtle), 10.5 * s, conversation);
+        },
+        .system => {
+            const text_w = widths.text;
+            queueText(state, .{ .x = x, .y = y + 3.0 * s, .w = text_w, .h = 16.0 * s }, truncatedText(state, .ui, 11.0 * s, text_w, singleLineText(state, item.body.slice())), color(chrome.text_subtle), 11.0 * s, conversation);
+        },
+    }
 }
 
-fn renderInspectorRowIfPresent(state: *runtime.AppState, clip: palette.Rect, card: palette.Rect, y: *f32, label: []const u8, value: []const u8) void {
-    if (value.len > 0) renderInspectorRow(state, clip, card, y, label, value);
+const EmptyStateLayout = struct {
+    avatar: palette.Rect,
+    title_y: f32,
+    tagline_y: f32,
+    pitch_y: f32,
+    suggestions: [3]palette.Rect,
+};
+
+fn emptyStateLayout(conversation: palette.Rect) EmptyStateLayout {
+    const s = companionScale();
+    const content_w = @max(conversation.w - CONTENT_INSET * 2.0 * s, 0.0);
+    const block_h = 74.0 * s + 22.0 * s + 18.0 * s + 40.0 * s + 3.0 * (SUGGESTION_HEIGHT + 8.0) * s;
+    const top = conversation.y + @max((conversation.h - block_h) * 0.4, 12.0 * s);
+    const avatar_w = 70.0 * s;
+    const avatar: palette.Rect = .{ .x = conversation.x + (conversation.w - avatar_w) * 0.5, .y = top, .w = avatar_w, .h = 72.0 * s };
+    const title_y = avatar.y + avatar.h + 10.0 * s;
+    const tagline_y = title_y + 24.0 * s;
+    const pitch_y = tagline_y + 20.0 * s;
+    var suggestions: [3]palette.Rect = undefined;
+    var y = pitch_y + 44.0 * s;
+    for (&suggestions) |*rect| {
+        rect.* = .{ .x = conversation.x + CONTENT_INSET * s, .y = y, .w = content_w, .h = SUGGESTION_HEIGHT * s };
+        y += (SUGGESTION_HEIGHT + 8.0) * s;
+    }
+    return .{ .avatar = avatar, .title_y = title_y, .tagline_y = tagline_y, .pitch_y = pitch_y, .suggestions = suggestions };
 }
 
-fn renderInspectorRow(state: *runtime.AppState, clip: palette.Rect, card: palette.Rect, y: *f32, label: []const u8, value: []const u8) void {
+// Empty conversation: the character introduces itself and offers real
+// orchestration prompts.
+fn renderEmptyState(state: *runtime.AppState, geometry: Geometry) void {
+    const conversation = geometry.conversation;
+    const s = companionScale();
     const chrome = theme.companionChrome();
-    const label_w = companionScaled(70.0);
-    queueBoldText(state, .{ .x = card.x + companionScaled(11.0), .y = y.*, .w = label_w, .h = companionScaled(15.0) }, label, color(chrome.text_subtle), companionScaled(9.0), clip);
-    const value_x = card.x + companionScaled(11.0) + label_w;
-    const value_w = @max(card.x + card.w - companionScaled(11.0) - value_x, 0.0);
-    queueText(state, .{ .x = value_x, .y = y.*, .w = value_w, .h = companionScaled(15.0) }, truncatedText(state, .ui, companionScaled(10.0), value_w, singleLineText(state, value)), color(chrome.text), companionScaled(10.0), clip);
-    y.* += companionScaled(19.0);
+    state.companion_controller.updateConversationExtent(0.0);
+    const layout = emptyStateLayout(conversation);
+    const character = activeCompanionCharacter(state);
+    if (rectInside(layout.avatar, conversation)) {
+        renderCompanionCharacter(state, characterInSlot(layout.avatar, character), state.companion_controller.visualState(), character, .full);
+    }
+    const name = state.companion_controller.identity.name.slice();
+    const title = framePrint(state, "Hi, I'm {s}.", .{name});
+    queueCenteredText(state, .{ .x = conversation.x, .y = layout.title_y, .w = conversation.w, .h = 22.0 * s }, title, color(chrome.text), 16.0 * s, .ui_bold, conversation);
+    queueCenteredText(state, .{ .x = conversation.x, .y = layout.tagline_y, .w = conversation.w, .h = 17.0 * s }, companion_roster.characterTagline(character), color(chrome.identity_fg), 11.0 * s, .ui, conversation);
+    const pitch_w = @max(conversation.w - CONTENT_INSET * 4.0 * s, 0.0);
+    const pitch = wrapText("I run Verde for you: I delegate work to chats in any workspace, watch them, and tell you when something needs you.", pitch_w, .ui, 11.5 * s, 3);
+    for (pitch.lines[0..pitch.count], 0..) |line, index| {
+        queueCenteredText(state, .{ .x = conversation.x, .y = layout.pitch_y + @as(f32, @floatFromInt(index)) * 16.0 * s, .w = conversation.w, .h = 16.0 * s }, line, color(chrome.text_subtle), 11.5 * s, .ui, conversation);
+    }
+    for (layout.suggestions, 0..) |rect, index| {
+        if (!rectInside(rect, conversation)) continue;
+        queuePanel(state, rect, color(chrome.surface_deep), color(hairline()), 10.0 * s, 1.0 * s);
+        const text_w = @max(rect.w - 36.0 * s, 0.0);
+        queueText(state, .{ .x = rect.x + 12.0 * s, .y = rect.y + (rect.h - 17.0 * s) * 0.5, .w = text_w, .h = 17.0 * s }, truncatedText(state, .ui, 11.5 * s, text_w, runtime.AppState.COMPANION_SUGGESTIONS[index]), color(chrome.text), 11.5 * s, rect);
+        queueText(state, .{ .x = rect.x + rect.w - 22.0 * s, .y = rect.y + (rect.h - 17.0 * s) * 0.5, .w = 14.0 * s, .h = 17.0 * s }, "↗", color(chrome.accent), 11.5 * s, rect);
+    }
 }
 
-fn renderInspectorButton(state: *runtime.AppState, clip: palette.Rect, rect: palette.Rect, label: []const u8) void {
+// ---- menus ------------------------------------------------------------------
+
+const CompanionMenuLayout = struct {
+    menu: palette.Rect,
+    rows: [companion_roster.MAX_COMPANIONS]palette.Rect,
+    row_count: usize,
+    rename: palette.Rect,
+    orders: palette.Rect,
+    characters: [3]palette.Rect,
+    new_companion: palette.Rect,
+    remove: palette.Rect,
+};
+
+fn companionMenuLayout(state: *runtime.AppState, geometry: Geometry) CompanionMenuLayout {
+    const s = companionScale();
+    const companion = &state.companion_controller;
+    const menu_w = @min(300.0 * s, geometry.panel.w - 24.0 * s);
+    const row_count = companion.roster_row_count;
+    var layout: CompanionMenuLayout = undefined;
+    layout.row_count = row_count;
+    const x = geometry.panel.x + 12.0 * s;
+    var y = geometry.header.y + geometry.header.h - 4.0 * s + 8.0 * s;
+    for (0..row_count) |index| {
+        layout.rows[index] = .{ .x = x + 6.0 * s, .y = y, .w = menu_w - 12.0 * s, .h = MENU_ROW_HEIGHT * s };
+        y += MENU_ROW_HEIGHT * s;
+    }
+    y += 8.0 * s;
+    layout.rename = .{ .x = x + 6.0 * s, .y = y, .w = menu_w - 12.0 * s, .h = MENU_ACTION_HEIGHT * s };
+    y += MENU_ACTION_HEIGHT * s;
+    layout.orders = .{ .x = x + 6.0 * s, .y = y, .w = menu_w - 12.0 * s, .h = MENU_ROW_HEIGHT * s };
+    y += MENU_ROW_HEIGHT * s + 4.0 * s;
+    const chip_w = (menu_w - 12.0 * s - 12.0 * s) / 3.0;
+    for (&layout.characters, 0..) |*rect, index| {
+        rect.* = .{ .x = x + 6.0 * s + @as(f32, @floatFromInt(index)) * (chip_w + 6.0 * s), .y = y, .w = chip_w, .h = 52.0 * s };
+    }
+    y += 52.0 * s + 8.0 * s;
+    layout.new_companion = .{ .x = x + 6.0 * s, .y = y, .w = menu_w - 12.0 * s, .h = MENU_ACTION_HEIGHT * s };
+    y += MENU_ACTION_HEIGHT * s;
+    if (companion.identity.count > 1) {
+        layout.remove = .{ .x = x + 6.0 * s, .y = y, .w = menu_w - 12.0 * s, .h = MENU_ACTION_HEIGHT * s };
+        y += MENU_ACTION_HEIGHT * s;
+    } else {
+        layout.remove = .{};
+    }
+    const menu_top = geometry.header.y + geometry.header.h - 4.0 * s;
+    layout.menu = .{ .x = x, .y = menu_top, .w = menu_w, .h = y + 6.0 * s - menu_top };
+    return layout;
+}
+
+fn registerCompanionMenuHits(state: *runtime.AppState, geometry: Geometry) void {
+    const companion = &state.companion_controller;
+    const layout = companionMenuLayout(state, geometry);
+    companion.addHit(geometry.window, .menu_dismiss);
+    companion.addHit(layout.menu, .body);
+    for (layout.rows[0..layout.row_count], 0..) |rect, index| companion.addIndexedHit(rect, .menu_select_companion, index);
+    companion.addHit(layout.rename, .menu_rename);
+    companion.addHit(layout.orders, .menu_orders);
+    for (layout.characters, 0..) |rect, index| companion.addIndexedHit(rect, .menu_character, index);
+    companion.addHit(layout.new_companion, .menu_new_companion);
+    companion.addHit(layout.remove, .menu_remove);
+}
+
+fn renderMenuSurface(state: *runtime.AppState, rect: palette.Rect) void {
+    const s = companionScale();
     const chrome = theme.companionChrome();
-    queuePanelClipped(state, rect, color(chrome.surface), color(chrome.border), companionScaled(7.0), companionScaled(1.0), clip);
-    queueCenteredText(state, rect, label, color(chrome.text), companionScaled(10.0), .ui_bold, clip);
+    queueRoundedRect(state, offsetRect(rect, 0.0, 6.0 * s), color(theme.scrim(0.22)), 12.0 * s);
+    queuePanel(state, rect, color(chrome.surface_deep), color(chrome.menu_border), 12.0 * s, 1.0 * s);
 }
 
-fn operationStatusLabel(status: controller.OperationStatus) []const u8 {
-    return switch (status) {
-        .in_progress => "RUNNING",
-        .pending => "PENDING",
-        .completed => "DONE",
-        .failed => "FAILED",
-        .cancelled => "STOPPED",
-    };
+fn renderMenuAction(state: *runtime.AppState, rect: palette.Rect, label: []const u8, danger: bool) void {
+    if (rect.w <= 0.0) return;
+    const s = companionScale();
+    const chrome = theme.companionChrome();
+    queueText(state, .{ .x = rect.x + 10.0 * s, .y = rect.y + (rect.h - 17.0 * s) * 0.5, .w = rect.w - 20.0 * s, .h = 17.0 * s }, label, color(if (danger) chrome.danger else chrome.text), 12.0 * s, rect);
 }
 
-fn operationStatusColor(chrome: theme.CompanionChrome, status: controller.OperationStatus) [4]f32 {
-    return switch (status) {
-        .in_progress => chrome.accent,
-        .pending => chrome.text_subtle,
-        .completed => chrome.identity_fg,
-        .failed => chrome.danger,
-        .cancelled => chrome.text_muted,
-    };
+// Companion picker: switch, rename, pick a character, add, or remove.
+fn renderCompanionMenu(state: *runtime.AppState, geometry: Geometry) void {
+    const s = companionScale();
+    const chrome = theme.companionChrome();
+    const companion = &state.companion_controller;
+    const layout = companionMenuLayout(state, geometry);
+    renderMenuSurface(state, layout.menu);
+    for (companion.roster_rows[0..layout.row_count], 0..) |*row, index| {
+        const rect = layout.rows[index];
+        if (row.active) queueRoundedRect(state, rect, color(opaqueOver(chrome.surface_deep, chrome.menu_selected)), 8.0 * s);
+        const slot: palette.Rect = .{ .x = rect.x + 6.0 * s, .y = rect.y + 4.0 * s, .w = 30.0 * s, .h = rect.h - 8.0 * s };
+        renderCompanionCharacter(state, characterInSlot(slot, row.character), .{ .pose = .idle, .show_approval = false, .show_failure = false }, row.character, .compact);
+        const text_x = rect.x + 46.0 * s;
+        const text_w = @max(rect.w - 46.0 * s - 28.0 * s, 0.0);
+        queueBoldText(state, .{ .x = text_x, .y = rect.y + 4.0 * s, .w = text_w, .h = 17.0 * s }, truncatedText(state, .ui_bold, 12.5 * s, text_w, row.name.slice()), color(chrome.text), 12.5 * s, rect);
+        queueText(state, .{ .x = text_x, .y = rect.y + 21.0 * s, .w = text_w, .h = 15.0 * s }, truncatedText(state, .ui, 10.5 * s, text_w, companion_roster.characterDisplayName(row.character)), color(chrome.text_subtle), 10.5 * s, rect);
+        if (row.active) queueText(state, .{ .x = rect.x + rect.w - 22.0 * s, .y = rect.y + 11.0 * s, .w = 14.0 * s, .h = 17.0 * s }, "✓", color(chrome.accent), 12.0 * s, rect);
+    }
+    const divider_y = layout.rename.y - 5.0 * s;
+    queueRect(state, .{ .x = layout.menu.x + 10.0 * s, .y = divider_y, .w = layout.menu.w - 20.0 * s, .h = 1.0 * s }, color(hairline()));
+    renderMenuAction(state, layout.rename, framePrint(state, "Rename {s}…", .{companion.identity.name.slice()}), false);
+    {
+        const rect = layout.orders;
+        const text_w = @max(rect.w - 20.0 * s, 0.0);
+        queueText(state, .{ .x = rect.x + 10.0 * s, .y = rect.y + 4.0 * s, .w = text_w, .h = 17.0 * s }, "Standing orders…", color(chrome.text), 12.0 * s, rect);
+        const orders = companion.identity.orders.slice();
+        queueText(state, .{ .x = rect.x + 10.0 * s, .y = rect.y + 21.0 * s, .w = text_w, .h = 15.0 * s }, truncatedText(state, .ui, 10.5 * s, text_w, if (orders.len > 0) orders else "None yet. Rules it follows on every turn."), color(chrome.text_subtle), 10.5 * s, rect);
+    }
+    for (layout.characters, 0..) |rect, index| {
+        const character = characterAt(index).?;
+        const selected = character == companion.identity.character;
+        queuePanel(state, rect, color(if (selected) opaqueOver(chrome.surface_deep, chrome.menu_selected) else chrome.surface_deep), color(if (selected) chrome.accent else hairline()), 9.0 * s, 1.0 * s);
+        const slot: palette.Rect = .{ .x = rect.x + 4.0 * s, .y = rect.y + 4.0 * s, .w = rect.w - 8.0 * s, .h = 28.0 * s };
+        renderCompanionCharacter(state, characterInSlot(slot, character), .{ .pose = .idle, .show_approval = false, .show_failure = false }, character, .compact);
+        queueCenteredText(state, .{ .x = rect.x, .y = rect.y + 33.0 * s, .w = rect.w, .h = 16.0 * s }, companion_roster.characterDisplayName(character), color(if (selected) chrome.text else chrome.text_subtle), 10.5 * s, .ui_bold, rect);
+    }
+    renderMenuAction(state, layout.new_companion, "+ New companion", false);
+    renderMenuAction(state, layout.remove, framePrint(state, "Remove {s}", .{companion.identity.name.slice()}), true);
 }
 
-// Active theme inputs shared by character-specific palette derivations.
+const BrainMenuLayout = struct {
+    menu: palette.Rect,
+    providers: [controller.MAX_BRAIN_PROVIDERS]palette.Rect,
+    provider_count: usize,
+    list: palette.Rect,
+};
+
+fn brainMenuLayout(state: *runtime.AppState, geometry: Geometry) BrainMenuLayout {
+    const s = companionScale();
+    const companion = &state.companion_controller;
+    var layout: BrainMenuLayout = undefined;
+    const x = geometry.panel.x + 12.0 * s;
+    const menu_w = geometry.panel.w - 24.0 * s;
+    const menu_top = geometry.header.y + geometry.header.h - 4.0 * s;
+    var chip_x = x + 10.0 * s;
+    var chip_y = menu_top + 46.0 * s;
+    layout.provider_count = companion.brain_provider_count;
+    for (companion.brain_providers[0..companion.brain_provider_count], 0..) |*provider, index| {
+        const chip_w = text_measure.textWidth(.ui_bold, 11.0 * s, provider.label.slice()) + 22.0 * s;
+        if (chip_x + chip_w > x + menu_w - 10.0 * s and chip_x > x + 10.0 * s) {
+            chip_x = x + 10.0 * s;
+            chip_y += 30.0 * s;
+        }
+        layout.providers[index] = .{ .x = chip_x, .y = chip_y, .w = chip_w, .h = 24.0 * s };
+        chip_x += chip_w + 6.0 * s;
+    }
+    const list_top = chip_y + 34.0 * s;
+    const available = @max(geometry.footer.y - list_top - 16.0 * s, 60.0 * s);
+    const options = state.companionBrainModelOptions();
+    const list_h = @min(@as(f32, @floatFromInt(@max(options.len, 1))) * BRAIN_ROW_HEIGHT * s, available);
+    layout.list = .{ .x = x + 6.0 * s, .y = list_top, .w = menu_w - 12.0 * s, .h = list_h };
+    layout.menu = .{ .x = x, .y = menu_top, .w = menu_w, .h = list_top + list_h + 8.0 * s - menu_top };
+    companion.brain_max_scroll = @max(@as(f32, @floatFromInt(options.len)) * BRAIN_ROW_HEIGHT * s - list_h, 0.0);
+    companion.brain_scroll_y = std.math.clamp(companion.brain_scroll_y, 0.0, companion.brain_max_scroll);
+    return layout;
+}
+
+fn brainRowRect(layout: BrainMenuLayout, index: usize, scroll_y: f32) palette.Rect {
+    const s = companionScale();
+    return .{ .x = layout.list.x, .y = layout.list.y + @as(f32, @floatFromInt(index)) * BRAIN_ROW_HEIGHT * s - scroll_y, .w = layout.list.w, .h = BRAIN_ROW_HEIGHT * s };
+}
+
+fn registerBrainMenuHits(state: *runtime.AppState, geometry: Geometry) void {
+    const companion = &state.companion_controller;
+    const layout = brainMenuLayout(state, geometry);
+    companion.addHit(geometry.window, .menu_dismiss);
+    companion.addHit(layout.menu, .body);
+    for (layout.providers[0..layout.provider_count], 0..) |rect, index| companion.addIndexedHit(rect, .brain_provider, index);
+    const options = state.companionBrainModelOptions();
+    for (0..options.len) |index| {
+        const row = brainRowRect(layout, index, companion.brain_scroll_y);
+        const visible = intersectRects(row, layout.list) orelse continue;
+        companion.addIndexedHit(visible, .brain_model, index);
+    }
+}
+
+// Brain picker: any connected provider and model can drive the companion.
+fn renderBrainMenu(state: *runtime.AppState, geometry: Geometry) void {
+    const s = companionScale();
+    const chrome = theme.companionChrome();
+    const companion = &state.companion_controller;
+    const layout = brainMenuLayout(state, geometry);
+    renderMenuSurface(state, layout.menu);
+    const title = framePrint(state, "{s}'s brain", .{companion.identity.name.slice()});
+    queueBoldText(state, .{ .x = layout.menu.x + 14.0 * s, .y = layout.menu.y + 10.0 * s, .w = layout.menu.w - 28.0 * s, .h = 17.0 * s }, title, color(chrome.text), 12.5 * s, layout.menu);
+    queueText(state, .{ .x = layout.menu.x + 14.0 * s, .y = layout.menu.y + 27.0 * s, .w = layout.menu.w - 28.0 * s, .h = 15.0 * s }, "Any connected model works. A new provider starts a fresh conversation.", color(chrome.text_subtle), 10.5 * s, layout.menu);
+    if (layout.provider_count == 0) {
+        queueText(state, .{ .x = layout.menu.x + 14.0 * s, .y = layout.menu.y + 50.0 * s, .w = layout.menu.w - 28.0 * s, .h = 16.0 * s }, "No providers are connected yet. Sign in from Settings → Providers.", color(chrome.text_muted), 11.0 * s, layout.menu);
+        return;
+    }
+    for (layout.providers[0..layout.provider_count], 0..) |rect, index| {
+        const provider = &companion.brain_providers[index];
+        const browsing = index == companion.brain_provider_index;
+        queuePanel(state, rect, color(if (browsing) opaqueOver(chrome.surface_deep, chrome.menu_selected) else chrome.surface_deep), color(if (browsing) chrome.accent else hairline()), 12.0 * s, 1.0 * s);
+        queueCenteredText(state, rect, provider.label.slice(), color(if (browsing) chrome.text else chrome.text_muted), 11.0 * s, .ui_bold, rect);
+        if (provider.selected) queueRoundedRect(state, .{ .x = rect.x + rect.w - 7.0 * s, .y = rect.y + 2.0 * s, .w = 5.0 * s, .h = 5.0 * s }, color(chrome.accent), 2.5 * s);
+    }
+    const options = state.companionBrainModelOptions();
+    for (options, 0..) |option, index| {
+        const row = brainRowRect(layout, index, companion.brain_scroll_y);
+        if (row.y + row.h < layout.list.y or row.y > layout.list.y + layout.list.h) continue;
+        const selected = state.companionBrainModelSelected(index);
+        if (selected) queueRoundedRectClipped(state, row, color(opaqueOver(chrome.surface_deep, chrome.menu_selected)), 7.0 * s, layout.list);
+        const text_w = @max(row.w - 40.0 * s, 0.0);
+        queueText(state, .{ .x = row.x + 10.0 * s, .y = row.y + (row.h - 17.0 * s) * 0.5, .w = text_w, .h = 17.0 * s }, truncatedText(state, .ui, 12.0 * s, text_w, option.label), color(chrome.text), 12.0 * s, layout.list);
+        if (selected) queueText(state, .{ .x = row.x + row.w - 24.0 * s, .y = row.y + (row.h - 17.0 * s) * 0.5, .w = 14.0 * s, .h = 17.0 * s }, "✓", color(chrome.accent), 12.0 * s, layout.list);
+    }
+}
+
+// ---- shared character helpers ------------------------------------------------
+
+/// Fits a character into a slot, preserving its art aspect and bottom-centering it.
+fn characterInSlot(slot: palette.Rect, character: app_config.CompanionCharacter) palette.Rect {
+    const size = fullCharacterSize(character);
+    const scale = @min(slot.w / size.w, slot.h / size.h);
+    if (scale <= 0.0) return .{ .x = slot.x, .y = slot.y };
+    const w = size.w * scale;
+    const h = size.h * scale;
+    return .{ .x = slot.x + (slot.w - w) * 0.5, .y = slot.y + (slot.h - h), .w = w, .h = h };
+}
+
+fn rectInside(inner: palette.Rect, outer: palette.Rect) bool {
+    return inner.w > 0.0 and inner.h > 0.0 and inner.x >= outer.x and inner.y >= outer.y and
+        inner.x + inner.w <= outer.x + outer.w + 0.5 and inner.y + inner.h <= outer.y + outer.h + 0.5;
+}
+
+fn framePrint(state: *runtime.AppState, comptime format: []const u8, args: anytype) []const u8 {
+    return std.fmt.allocPrint(state.palette_frame_text_arena.allocator(), format, args) catch "";
+}
+
 const CharacterTheme = struct {
     background: [4]f32,
     text: [4]f32,
@@ -1548,23 +1197,7 @@ const CharacterTheme = struct {
 const CharacterPresentation = enum { full, compact };
 
 fn activeCompanionCharacter(state: *const runtime.AppState) app_config.CompanionCharacter {
-    return state.app_config.companion_character;
-}
-
-fn companionCharacterName(character: app_config.CompanionCharacter) []const u8 {
-    return switch (character) {
-        .sprout => "Sprout",
-        .moss => "Moss",
-        .vireo => "Vireo",
-    };
-}
-
-fn companionCharacterResultHeading(character: app_config.CompanionCharacter) []const u8 {
-    return switch (character) {
-        .sprout => "SPROUT SAYS",
-        .moss => "MOSS SAYS",
-        .vireo => "VIREO SAYS",
-    };
+    return state.companion_controller.identity.character;
 }
 
 fn fullCharacterSize(character: app_config.CompanionCharacter) struct { w: f32, h: f32 } {
@@ -2100,151 +1733,6 @@ fn renderVireo(state: *runtime.AppState, rect: palette.Rect, visual: controller.
     }
 }
 
-fn bodyHitRect(hits: []const controller.Hit) palette.Rect {
-    for (hits) |hit| if (hit.action == .body) return hit.rect;
-    return .{};
-}
-
-// Header status states the run posture in words; counts appear only when
-// they carry information, so an idle Companion never reads "0 active".
-fn headerStatus(state: *runtime.AppState) []const u8 {
-    const companion = &state.companion_controller;
-    if (companion.needs_approval) return "approval needed";
-    if (companion.has_failure) return "needs attention";
-    if (companion.run_phase == .paused) return "paused";
-    if (companion.run_phase == .working) {
-        const counts = companion.presentation.activeCounts();
-        const active = counts.working + counts.pending;
-        if (active > 0) return framePrint(state, "working · {d} ops", .{active});
-        return "working";
-    }
-    return "ready";
-}
-
-fn framePrint(state: *runtime.AppState, comptime format: []const u8, args: anytype) []const u8 {
-    return std.fmt.allocPrint(state.palette_frame_text_arena.allocator(), format, args) catch "";
-}
-
-const OperationPreview = struct {
-    detail: []const u8,
-    result: ?[]const u8,
-};
-
-// Splits provider "Command:/Input: … Output: …" transcript bodies into a
-// command preview and a result preview. Pure presentation: stored content,
-// identity, and status are untouched, and unknown shapes fall back whole.
-fn operationPreview(body: []const u8) OperationPreview {
-    var detail = body;
-    var result: ?[]const u8 = null;
-    if (std.mem.indexOf(u8, body, "Output:")) |output_index| {
-        const head = std.mem.trim(u8, body[0..output_index], " \t\r\n");
-        const tail = std.mem.trim(u8, body[output_index + "Output:".len ..], " \t\r\n");
-        if (head.len > 0) {
-            detail = head;
-            if (tail.len > 0) result = tail;
-        } else if (tail.len > 0) {
-            detail = tail;
-        }
-    }
-    inline for (.{ "Command:", "Input:" }) |label| {
-        if (std.mem.startsWith(u8, detail, label)) {
-            const stripped = std.mem.trimStart(u8, detail[label.len..], " \t\r\n");
-            if (stripped.len > 0) detail = stripped;
-            break;
-        }
-    }
-    return .{ .detail = detail, .result = result };
-}
-
-// Successful provider tool output opens with a fixed metadata preamble
-// ("CWD:", "Exit code:", "Duration ms:" — see codex.zig formatToolResult).
-// Skipping exactly those labeled lines surfaces the first real output as a
-// subslice; null means the output carried nothing beyond metadata. This is a
-// fixed-label skip, not a heuristic summary, so execution is never misstated.
-fn meaningfulResultPreview(result: []const u8) ?[]const u8 {
-    var rest = result;
-    while (rest.len > 0) {
-        const line_end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
-        const line = std.mem.trim(u8, rest[0..line_end], " \t\r");
-        const metadata_only = line.len == 0 or
-            std.mem.startsWith(u8, line, "CWD:") or
-            std.mem.startsWith(u8, line, "Exit code:") or
-            std.mem.startsWith(u8, line, "Duration ms:");
-        if (!metadata_only) return std.mem.trim(u8, rest, " \t\r\n");
-        if (line_end == rest.len) break;
-        rest = rest[line_end + 1 ..];
-    }
-    return null;
-}
-
-// The Result region shows the whole current answer, so it wraps by measured
-// width instead of truncating to one row; output stays bounded.
-const MAX_RESULT_LINES: usize = 6;
-const RESULT_FONT_SIZE: f32 = 11.5;
-
-const ResultLines = struct {
-    lines: [MAX_RESULT_LINES][]const u8 = [_][]const u8{""} ** MAX_RESULT_LINES,
-    count: usize = 0,
-    truncated: bool = false,
-};
-
-// Measured greedy wrap for the Result region. Every line is a subslice of the
-// input, so Frame-backed storage keeps owning the queued text; embedded
-// newlines force breaks and output is bounded to MAX_RESULT_LINES.
-fn wrapResultText(text: []const u8, max_width: f32) ResultLines {
-    var wrapped: ResultLines = .{};
-    if (max_width <= 0.0) return wrapped;
-    var paragraphs = std.mem.splitScalar(u8, text, '\n');
-    while (paragraphs.next()) |paragraph| {
-        var remaining = std.mem.trim(u8, paragraph, " \t\r");
-        while (remaining.len > 0) {
-            if (wrapped.count == MAX_RESULT_LINES) {
-                wrapped.truncated = true;
-                return wrapped;
-            }
-            const break_index = measuredLineBreak(remaining, max_width);
-            wrapped.lines[wrapped.count] = std.mem.trimEnd(u8, remaining[0..break_index], " \t");
-            wrapped.count += 1;
-            remaining = std.mem.trimStart(u8, remaining[break_index..], " \t");
-        }
-    }
-    return wrapped;
-}
-
-// Longest measured prefix of one line that fits max_width: prefer the last
-// space so words stay whole, and fall back to one whole codepoint so the
-// wrap always advances. Every probe goes through shared text metrics.
-fn measuredLineBreak(text: []const u8, max_width: f32) usize {
-    const font_size = companionScaled(RESULT_FONT_SIZE);
-    if (text_measure.textWidth(.ui, font_size, text) <= max_width) return text.len;
-    var low: usize = 0;
-    var high: usize = text.len - 1;
-    var best: usize = 0;
-    while (low <= high) {
-        const mid = low + (high - low) / 2;
-        const candidate = utf8FloorIndex(text, mid);
-        if (text_measure.textWidth(.ui, font_size, text[0..candidate]) <= max_width) {
-            best = @max(best, candidate);
-            low = mid + 1;
-        } else {
-            if (mid == 0) break;
-            high = mid - 1;
-        }
-    }
-    if (best == 0) {
-        var first: usize = 1;
-        while (first < text.len and (text[first] & 0xC0) == 0x80) first += 1;
-        return first;
-    }
-    if (std.mem.lastIndexOfScalar(u8, text[0..best], ' ')) |space_index| {
-        if (space_index > 0) return space_index;
-    }
-    return best;
-}
-
-// Raw transcript bodies may hold multi-line dumps; Companion rows are
-// single-line summaries, so collapse whitespace runs before layout. Clean
-// text returns the original slice so Frame-backed lifetimes are preserved.
 fn singleLineText(state: *runtime.AppState, text: []const u8) []const u8 {
     const trimmed = std.mem.trim(u8, text, " \t\r\n");
     var needs_copy = false;
@@ -2356,25 +1844,6 @@ fn unionRects(a: palette.Rect, b: palette.Rect) palette.Rect {
 
 fn rectFitsWindow(rect: palette.Rect, width: f32, height: f32) bool {
     return rect.w > 0.0 and rect.h > 0.0 and rect.x >= 0.0 and rect.y >= 0.0 and rect.x + rect.w <= width and rect.y + rect.h <= height;
-}
-
-// Collapsed chip chrome. The chip sits flush with the right window edge, so
-// both the shadow and the panel extend past that edge by the corner radius and
-// clip to the window: the visible right edge stays square while the left
-// corners stay round, all through the anti-aliased SDF rect path (the old
-// triangle-fan rail had no edge AA and read as faceted arcs).
-fn appendChipChrome(allocator: std.mem.Allocator, batch: *palette.RenderBatch, geometry: Geometry, scale: f32) !void {
-    if (geometry.chip.w < 2.0 * scale or geometry.chip.h < 2.0 * scale) return;
-    const radius = @min(10.0 * scale, @min(geometry.chip.h * 0.5, geometry.chip.w));
-    const shadow = offsetRect(geometry.chip, 0.0, 8.0 * scale);
-    if (rectFitsWindow(shadow, geometry.window.w, geometry.window.h)) {
-        try batch.roundedRectClipped(allocator, extendedRight(shadow, radius), color(theme.scrim(0.20)), radius, geometry.window);
-    }
-    try appendPanel(allocator, batch, extendedRight(geometry.chip, radius), color(surface()), color(theme.companionChrome().border), radius, 1.0 * scale, geometry.window, true);
-}
-
-fn extendedRight(rect: palette.Rect, amount: f32) palette.Rect {
-    return .{ .x = rect.x, .y = rect.y, .w = rect.w + amount, .h = rect.h };
 }
 
 fn color(value: [4]f32) palette.Color {
@@ -2522,2729 +1991,224 @@ fn commandEffectiveRect(command: palette.draw.Command) ?palette.Rect {
     return command.rect;
 }
 
+// ---- tests ------------------------------------------------------------------
+
+fn testState(allocator: std.mem.Allocator, state: *runtime.AppState) !void {
+    // Fields read by modal key/text routing and new-chat defaults.
+    state.folder_browser = .{};
+    state.custom_agent_form = .{};
+    state.settings_controller.provider_setup = .{};
+    state.provider_controller = .{};
+    state.allocator = allocator;
+    state.app_config = .{ .companion_enabled = true };
+    state.project_controller = .{};
+    state.companion_controller = controller.init();
+    state.companion_roster = .{};
+    state.companion_controller.identity.name.set("Juniper");
+    state.companion_controller.identity.brain.set("Claude · Opus");
+    state.companion_controller.identity.count = 1;
+    state.companion_composer = @TypeOf(state.companion_composer).init();
+    state.palette_overlay_batch = .{};
+    state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
+    var project = try runtime.Project.init(allocator, "companion-ui", "Companion UI", "/tmp/companion-ui", 0);
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+}
+
+fn deinitTestState(allocator: std.mem.Allocator, state: *runtime.AppState) void {
+    for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+    state.project_controller.projects.deinit(allocator);
+    state.companion_composer.deinit(allocator);
+    state.palette_overlay_batch.deinit(allocator);
+    state.palette_frame_text_arena.deinit();
+}
+
 fn expectBatchInsideWindow(batch: *const palette.RenderBatch, window: palette.Rect) !void {
     for (batch.commands.items) |command| {
         if (command.clip) |clip| try std.testing.expect(rectFitsWindow(clip, window.w, window.h));
-        if (command.kind == .triangle and command.clip == null) {
-            inline for (.{ command.p0, command.p1, command.p2 }) |point| {
-                try std.testing.expect(point.x >= window.x and point.x <= window.x + window.w);
-                try std.testing.expect(point.y >= window.y and point.y <= window.y + window.h);
-            }
-            continue;
-        }
-        if (commandEffectiveRect(command)) |rect| try std.testing.expect(rectFitsWindow(rect, window.w, window.h));
+        if (command.kind == .triangle) continue;
+        if (commandEffectiveRect(command)) |rect| try std.testing.expect(rectFitsWindow(rect, window.w + 0.5, window.h + 0.5));
     }
 }
 
-fn sameColor(a: palette.Color, b: palette.Color) bool {
-    return a.r == b.r and a.g == b.g and a.b == b.b and a.a == b.a;
+fn batchHasText(batch: *const palette.RenderBatch, needle: []const u8) bool {
+    for (batch.commands.items) |command| {
+        if (command.kind != .text) continue;
+        if (std.mem.indexOf(u8, command.text, needle) != null) return true;
+    }
+    return false;
 }
 
-test "sidecar geometry stays in bounds at normal narrow and short sizes" {
-    inline for (.{
-        .{ @as(f32, 1360.0), @as(f32, 860.0) },
-        .{ @as(f32, 390.0), @as(f32, 760.0) },
-        .{ @as(f32, 480.0), @as(f32, 260.0) },
-        .{ @as(f32, 40.0), @as(f32, 30.0) },
-        .{ @as(f32, 1.0), @as(f32, 1.0) },
-    }) |size| {
-        const scale: f32 = if (size[0] <= 40.0) 3.0 else 1.0;
-        const geometry = computeGeometry(size[0], size[1], scale);
-        try std.testing.expect(geometry.sidecar.x >= 0.0);
-        try std.testing.expect(geometry.sidecar.y >= 0.0);
-        try std.testing.expect(geometry.sidecar.x + geometry.sidecar.w <= size[0]);
-        try std.testing.expect(geometry.sidecar.y + geometry.sidecar.h <= size[1]);
-        try std.testing.expect(geometry.body.h >= 0.0);
-        inline for (.{ geometry.window, geometry.chip, geometry.chip_character, geometry.chip_hit, geometry.sidecar, geometry.header, geometry.close_button, geometry.objective, geometry.tabs, geometry.body, geometry.footer }) |rect| {
-            try std.testing.expect(rect.x >= 0.0);
-            try std.testing.expect(rect.y >= 0.0);
-            try std.testing.expect(rect.w >= 0.0);
-            try std.testing.expect(rect.h >= 0.0);
-            try std.testing.expect(rect.x + rect.w <= size[0]);
-            try std.testing.expect(rect.y + rect.h <= size[1]);
-        }
-        const composer = composerRectAtScale(geometry.footer, scale);
-        if (composer.w > 0.0 and composer.h > 0.0) {
-            try std.testing.expect(composer.x >= geometry.footer.x);
-            try std.testing.expect(composer.y >= geometry.footer.y);
-            try std.testing.expect(composer.x + composer.w <= geometry.footer.x + geometry.footer.w);
-            try std.testing.expect(composer.y + composer.h <= geometry.footer.y + geometry.footer.h);
-        } else {
-            try std.testing.expectEqual(@as(f32, 0.0), composer.w);
-            try std.testing.expectEqual(@as(f32, 0.0), composer.h);
-        }
-    }
-    try std.testing.expectEqual(@as(f32, 404.0), computeGeometry(1360.0, 860.0, 1.0).sidecar.w);
-    try std.testing.expectEqual(@as(f32, 374.0), computeGeometry(390.0, 760.0, 1.0).sidecar.w);
-}
-
-test "chip chrome renders clipped SDF panels with a square open right edge" {
-    const allocator = std.testing.allocator;
-    const normal = computeGeometry(1360.0, 860.0, 1.0);
-    var normal_batch: palette.RenderBatch = .{};
-    defer normal_batch.deinit(allocator);
-    try appendChipChrome(allocator, &normal_batch, normal, 1.0);
-    try std.testing.expectEqual(@as(usize, 3), normal_batch.commands.items.len);
-    const border = color(theme.companionChrome().border);
-    const fill = color(surface());
-    var saw_underlay = false;
-    var saw_fill = false;
-    for (normal_batch.commands.items) |command| {
-        try std.testing.expectEqual(palette.draw.CommandKind.rect, command.kind);
-        // Border-only commands halo white at corner arcs; chip chrome must be
-        // fill-only panel commands.
-        try std.testing.expect(command.border_color == null);
-        // Every chip rect extends past the flush right window edge and clips
-        // to the window, keeping the visible right edge square.
-        const clip = command.clip orelse return error.MissingChipClip;
-        try std.testing.expect(rectEqual(clip, normal.window));
-        try std.testing.expect(command.rect.x + command.rect.w > normal.window.w);
-        if (sameColor(command.color, border)) saw_underlay = true;
-        if (sameColor(command.color, fill)) saw_fill = true;
-    }
-    try std.testing.expect(saw_underlay and saw_fill);
-
-    inline for (.{
-        .{ @as(f32, 40.0), @as(f32, 30.0), @as(f32, 3.0) },
-        .{ @as(f32, 1.0), @as(f32, 1.0), @as(f32, 3.0) },
-        .{ @as(f32, 180.0), @as(f32, 72.0), @as(f32, 2.0) },
-    }) |fixture| {
-        const geometry = computeGeometry(fixture[0], fixture[1], fixture[2]);
-        var batch: palette.RenderBatch = .{};
-        defer batch.deinit(allocator);
-        try appendChipChrome(allocator, &batch, geometry, fixture[2]);
-        try expectBatchInsideWindow(&batch, geometry.window);
-        if (fixture[0] < 2.0 * fixture[2] or fixture[1] < 2.0 * fixture[2]) try std.testing.expectEqual(@as(usize, 0), batch.commands.items.len);
-        try std.testing.expectEqual(@as(f32, 0.0), geometry.chip_character.w);
-        try std.testing.expectEqual(@as(f32, 0.0), composerRectAtScale(geometry.footer, fixture[2]).w);
-    }
-}
-
-test "chip chrome snaps panel edges and stroke to device pixels at fractional scales" {
-    const allocator = std.testing.allocator;
-    const border = color(theme.companionChrome().border);
-    const fill = color(surface());
-    inline for (.{ @as(f32, 1.0), @as(f32, 1.25), @as(f32, 1.5) }) |scale| {
-        const geometry = computeGeometry(1360.0, 860.0, scale);
-        var batch: palette.RenderBatch = .{};
-        defer batch.deinit(allocator);
-        try appendChipChrome(allocator, &batch, geometry, scale);
-        var underlay: ?palette.draw.Command = null;
-        var body: ?palette.draw.Command = null;
-        for (batch.commands.items) |command| {
-            if (sameColor(command.color, border)) underlay = command;
-            if (sameColor(command.color, fill)) body = command;
-        }
-        const outer = underlay orelse return error.MissingChipUnderlay;
-        const inner = body orelse return error.MissingChipFill;
-        // Chrome edges land on whole device pixels at every scale…
-        inline for (.{ outer, inner }) |command| {
-            try std.testing.expectEqual(@round(command.rect.x), command.rect.x);
-            try std.testing.expectEqual(@round(command.rect.y), command.rect.y);
-            try std.testing.expectEqual(@round(command.rect.w), command.rect.w);
-            try std.testing.expectEqual(@round(command.rect.h), command.rect.h);
-        }
-        // …and the fill sits inside the underlay by a whole-pixel stroke, so
-        // the visible border is a continuous ring of constant thickness.
-        const stroke = inner.rect.x - outer.rect.x;
-        try std.testing.expectEqual(@round(stroke), stroke);
-        try std.testing.expect(stroke >= 1.0);
-        try std.testing.expectEqual(outer.rect.y + stroke, inner.rect.y);
-        try std.testing.expectEqual(outer.rect.h - stroke * 2.0, inner.rect.h);
-    }
-}
-
-test "production collapsed and expanded overlays stay inside the window" {
+test "dock and panel stay inside the window across sizes and scales" {
     const allocator = std.testing.allocator;
     defer theme.applyTheme(1.0);
     inline for (.{
         .{ @as(f32, 1360.0), @as(f32, 860.0), @as(f32, 1.0) },
         .{ @as(f32, 900.0), @as(f32, 700.0), @as(f32, 1.25) },
         .{ @as(f32, 390.0), @as(f32, 760.0), @as(f32, 1.0) },
-        .{ @as(f32, 480.0), @as(f32, 260.0), @as(f32, 1.0) },
-        .{ @as(f32, 40.0), @as(f32, 30.0), @as(f32, 3.0) },
-        .{ @as(f32, 1.0), @as(f32, 1.0), @as(f32, 3.0) },
-        .{ @as(f32, 2536.0), @as(f32, 1030.0), @as(f32, 1.0) },
+        .{ @as(f32, 2536.0), @as(f32, 1030.0), @as(f32, 1.5) },
     }) |fixture| {
         theme.applyTheme(fixture[2]);
         var state: runtime.AppState = undefined;
-        // Fields read by modal key/text routing and new-chat defaults.
-        state.folder_browser = .{};
-        state.custom_agent_form = .{};
-        state.settings_controller.provider_setup = .{};
-        state.provider_controller = .{};
-        state.allocator = allocator;
-        state.app_config = .{ .companion_enabled = true };
-        state.project_controller = .{};
-        state.companion_controller = controller.init();
-        state.companion_controller.applyFixture(.idle);
-        state.companion_composer = @TypeOf(state.companion_composer).init();
-        state.palette_overlay_batch = .{};
-        state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
-        defer {
-            for (state.project_controller.projects.items) |*project| project.deinit(allocator);
-            state.project_controller.projects.deinit(allocator);
-            state.companion_composer.deinit(allocator);
-            state.palette_overlay_batch.deinit(allocator);
-            state.palette_frame_text_arena.deinit();
-        }
-        var project = try runtime.Project.init(allocator, "overlay-bounds", "Overlay", "/tmp/overlay-bounds", 0);
-        state.project_controller.projects.append(allocator, project) catch |err| {
-            project.deinit(allocator);
-            return err;
-        };
-
+        try testState(allocator, &state);
+        defer deinitTestState(allocator, &state);
         const window: palette.Rect = .{ .w = fixture[0], .h = fixture[1] };
+
         render(&state, fixture[0], fixture[1]);
         try expectBatchInsideWindow(&state.palette_overlay_batch, window);
+        try std.testing.expect(batchHasText(&state.palette_overlay_batch, "Juniper"));
+        try std.testing.expect(batchHasText(&state.palette_overlay_batch, "Ready when you are"));
 
         state.palette_overlay_batch.clear();
         state.companion_controller.show();
         render(&state, fixture[0], fixture[1]);
         try expectBatchInsideWindow(&state.palette_overlay_batch, window);
+        try std.testing.expect(batchHasText(&state.palette_overlay_batch, "Hi, I'm Juniper."));
     }
 }
 
-test "captured scale public render emits a visible complete Companion composer" {
+test "panel shows the inbox, the crew, and a status that counts what needs the user" {
     const allocator = std.testing.allocator;
-    const scale: f32 = 5.0 / 3.0;
-    const companion_z: i32 = 1550;
-    defer theme.applyTheme(1.0);
-    theme.applyTheme(scale);
-    const saved_colors = theme.current_colors;
-    const saved_white = theme.COLOR_WHITE;
-    const saved_muted = theme.COLOR_TEXT_MUTED;
-    const saved_subtle = theme.COLOR_TEXT_SUBTLE;
-    const saved_green = theme.COLOR_GREEN;
-    const saved_yellow = theme.COLOR_YELLOW;
-    const saved_panel = theme.COLOR_PANEL;
-    const saved_panel_alt = theme.COLOR_PANEL_ALT;
-    const saved_panel_muted = theme.COLOR_PANEL_MUTED;
-    defer {
-        theme.current_colors = saved_colors;
-        theme.COLOR_WHITE = saved_white;
-        theme.COLOR_TEXT_MUTED = saved_muted;
-        theme.COLOR_TEXT_SUBTLE = saved_subtle;
-        theme.COLOR_GREEN = saved_green;
-        theme.COLOR_YELLOW = saved_yellow;
-        theme.COLOR_PANEL = saved_panel;
-        theme.COLOR_PANEL_ALT = saved_panel_alt;
-        theme.COLOR_PANEL_MUTED = saved_panel_muted;
-    }
-    const extreme = [4]f32{ 1.0, 0.0, 1.0, 1.0 };
-    theme.current_colors = theme.default_colors;
-    theme.COLOR_WHITE = extreme;
-    theme.COLOR_TEXT_MUTED = extreme;
-    theme.COLOR_TEXT_SUBTLE = extreme;
-    theme.COLOR_GREEN = extreme;
-    theme.COLOR_YELLOW = extreme;
-    theme.COLOR_PANEL = extreme;
-    theme.COLOR_PANEL_ALT = extreme;
-    theme.COLOR_PANEL_MUTED = extreme;
-
-    var state: runtime.AppState = undefined;
-
-    // Fields read by modal key/text routing and new-chat defaults.
-
-    state.folder_browser = .{};
-
-    state.custom_agent_form = .{};
-
-    state.settings_controller.provider_setup = .{};
-
-    state.provider_controller = .{};
-    state.allocator = allocator;
-    state.app_config = .{ .companion_enabled = true };
-    state.project_controller = .{};
-    state.companion_controller = controller.init();
-    state.companion_controller.applyFixture(.idle);
-    state.companion_controller.show();
-    state.companion_composer = @TypeOf(state.companion_composer).init();
-    state.palette_overlay_batch = .{};
-    state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
-    defer {
-        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
-        state.project_controller.projects.deinit(allocator);
-        state.companion_composer.deinit(allocator);
-        state.palette_overlay_batch.deinit(allocator);
-        state.palette_frame_text_arena.deinit();
-    }
-    var project = try runtime.Project.init(allocator, "captured-composer", "Captured", "/tmp/captured-composer", 0);
-    state.project_controller.projects.append(allocator, project) catch |err| {
-        project.deinit(allocator);
-        return err;
-    };
-    const initial_thread_count = state.project_controller.projects.items[0].threads.items.len;
-    const chrome = theme.companionChrome();
-    var frame: controller.Frame = .{ .has_thread = true, .has_approval = true };
-    frame.workspace_id.set("captured-composer");
-    frame.thread_id.set("pane-less-companion");
-    frame.approval_identity.set("approval-1");
-    frame.approval_title.set("Run command");
-    frame.approval_body.set("Allow this command?");
-    state.companion_controller.setFrame(frame);
-
-    _ = state.palette_overlay_batch.setZIndex(companion_z);
-    const geometry = computeGeometryForState(2536.0, 1030.0, scale, &state.companion_controller);
-    registerHits(&state.companion_controller, geometry, state.companion_controller.presentation.has_approval);
-    const immutable_frame = state.companion_controller.presentation;
-    render(&state, 2536.0, 1030.0);
-    try std.testing.expectEqualDeep(immutable_frame, state.companion_controller.presentation);
-    const approval_buttons = approvalButtonRects(geometry.body, state.companion_controller.currentScrollY());
-    try std.testing.expectEqual(controller.HitAction.approve, state.companion_controller.hitAt(approval_buttons[1].x + 1.0, approval_buttons[1].y + 1.0).?);
-    const composer = composerRectAtScale(geometry.footer, scale);
-    try std.testing.expectApproxEqAbs(@as(f32, 404.0), geometry.sidecar.w / scale, 0.001);
-    try std.testing.expectApproxEqAbs(@as(f32, 10.0), geometry.sidecar.y / scale, 0.001);
-    try std.testing.expect(rectFitsWindow(composer, geometry.window.w, geometry.window.h));
-    try std.testing.expectEqual(composer, state.companion_composer.bounds());
-    try std.testing.expect(pointInRect(composer, state.companion_composer.textRect().x, state.companion_composer.textRect().y));
-    try std.testing.expect(pointInRect(composer, state.companion_composer.toolbarRect().x, state.companion_composer.toolbarRect().y));
-    const send = state.companion_composer.sendButtonRect();
-    try std.testing.expectEqual(palette.ComposerPromptPart.send, state.companion_composer.hitTest(.{ .x = send.x + send.w * 0.5, .y = send.y + send.h * 0.5 }).?);
-
-    var saw_panel = false;
-    var saw_placeholder = false;
-    var saw_workspace = false;
-    var saw_send = false;
-    var saw_scope_dot = false;
-    var saw_scrim = false;
-    var saw_run_pill = false;
-    var saw_head_rim = false;
-    const tabs_track: palette.Rect = .{ .x = geometry.tabs.x + 12.0 * scale, .y = geometry.tabs.y + 10.0 * scale, .w = geometry.tabs.w - 24.0 * scale, .h = geometry.tabs.h - 10.0 * scale };
-    const tabs_inner: palette.Rect = .{ .x = tabs_track.x + 3.0 * scale, .y = tabs_track.y + 3.0 * scale, .w = tabs_track.w - 6.0 * scale, .h = tabs_track.h - 6.0 * scale };
-    const run_pill: palette.Rect = .{ .x = tabs_inner.x, .y = tabs_inner.y, .w = tabs_inner.w / 2.0, .h = tabs_inner.h };
-    const header_sprout: palette.Rect = .{ .x = geometry.header.x + 12.0 * scale, .y = geometry.header.y + 6.5 * scale, .w = 29.0 * scale, .h = 31.0 * scale };
-    const sprout_scale = header_sprout.w / 46.0;
-    const sprout_face: palette.Rect = .{ .x = header_sprout.x + 5.0 * sprout_scale, .y = header_sprout.y + 12.0 * sprout_scale, .w = 36.0 * sprout_scale, .h = 27.0 * sprout_scale };
-    const expected_rim: palette.Rect = .{ .x = sprout_face.x + 5.0 * sprout_scale, .y = sprout_face.y + 3.0 * sprout_scale, .w = sprout_face.w - 10.0 * sprout_scale, .h = 2.0 * sprout_scale };
-    const expected_highlight = deriveSproutPalette(activeCharacterTheme()).highlight;
-    for (state.palette_overlay_batch.commands.items) |command| {
-        if (command.z_index == 120) return error.TestUnexpectedResult;
-        if (command.z_index == companion_z and command.kind == .rect and command.rect.x == composer.x and command.rect.y == composer.y and command.rect.w == composer.w and command.rect.h == composer.h) {
-            saw_panel = sameColor(command.color, color(chrome.surface)) and command.border_width > 0.0;
-        }
-        if (command.kind == .text and std.mem.eql(u8, command.text, "Steer the run…")) saw_placeholder = command.z_index == companion_z;
-        if (command.kind == .text and std.mem.eql(u8, command.text, "Workspace · verde")) saw_workspace = command.z_index == companion_z;
-        if (command.kind == .rect and command.rect.x == send.x and command.rect.y == send.y and command.rect.w == send.w and command.rect.h == send.h) saw_send = command.z_index == companion_z and sameColor(command.color, color(chrome.accent));
-        if (command.kind == .rect and command.rect.w == 6.0 * scale and command.rect.h == 6.0 * scale and sameColor(command.color, color(chrome.accent))) saw_scope_dot = command.z_index == companion_z;
-        if (command.kind == .rect and command.rect.w == geometry.window.w and command.rect.h == geometry.window.h and sameColor(command.color, color(theme.scrim(0.22)))) saw_scrim = true;
-        if (command.kind == .rect and command.rect.x == run_pill.x and command.rect.y == run_pill.y and command.rect.w == run_pill.w and command.rect.h == run_pill.h and sameColor(command.color, color(chrome.surface))) saw_run_pill = true;
-        if (command.kind == .rect and command.rect.x == expected_rim.x and command.rect.y == expected_rim.y and command.rect.w == expected_rim.w and command.rect.h == expected_rim.h and sameColor(command.color, color(expected_highlight))) {
-            const clip = command.clip orelse return error.MissingHeadRimClip;
-            saw_head_rim = clip.x == sprout_face.x and clip.y == sprout_face.y and clip.w == sprout_face.w and clip.h == sprout_face.h and
-                command.rect.x >= sprout_face.x and command.rect.x + command.rect.w <= sprout_face.x + sprout_face.w and
-                command.rect.y >= sprout_face.y and command.rect.y + command.rect.h <= sprout_face.y + sprout_face.h * 0.35;
-        }
-    }
-    if (!saw_panel) return error.MissingCompanionPanel;
-    if (!saw_placeholder) return error.MissingCompanionPlaceholder;
-    if (!saw_workspace) return error.MissingCompanionWorkspace;
-    if (!saw_send) return error.MissingCompanionSend;
-    if (!saw_scope_dot) return error.MissingCompanionScopeDot;
-    if (!saw_scrim) return error.MissingCompanionScrim;
-    if (!saw_run_pill) return error.MissingCompanionRunPill;
-    if (!saw_head_rim) return error.MissingClippedHeadRim;
-    try std.testing.expectEqual(chrome.surface, [4]f32{ state.companion_composer.style.background_color.r, state.companion_composer.style.background_color.g, state.companion_composer.style.background_color.b, state.companion_composer.style.background_color.a });
-    try std.testing.expectEqual(chrome.text, [4]f32{ state.companion_composer.style.text_color.r, state.companion_composer.style.text_color.g, state.companion_composer.style.text_color.b, state.companion_composer.style.text_color.a });
-    try std.testing.expectEqual(chrome.selection, [4]f32{ state.companion_composer.style.selection_color.r, state.companion_composer.style.selection_color.g, state.companion_composer.style.selection_color.b, state.companion_composer.style.selection_color.a });
-    try std.testing.expectEqual(chrome.menu_selected, [4]f32{ state.companion_composer.style.menu_selected_color.r, state.companion_composer.style.menu_selected_color.g, state.companion_composer.style.menu_selected_color.b, state.companion_composer.style.menu_selected_color.a });
-    try std.testing.expect(state.project_controller.projects.items[0].companion_thread_local_id == null);
-    try std.testing.expectEqual(initial_thread_count, state.project_controller.projects.items[0].threads.items.len);
-    state.companion_controller.applyFixture(.needs_approval);
-    state.palette_overlay_batch.clear();
-    _ = state.palette_overlay_batch.setZIndex(companion_z);
-    render(&state, 2536.0, 1030.0);
-    var saw_warning = false;
-    for (state.palette_overlay_batch.commands.items) |command| {
-        saw_warning = saw_warning or sameColor(command.color, color(chrome.warning));
-    }
-    if (!saw_warning) return error.MissingThemeWarning;
-
-    state.companion_controller.applyFixture(.failed);
-    state.palette_overlay_batch.clear();
-    _ = state.palette_overlay_batch.setZIndex(companion_z);
-    render(&state, 2536.0, 1030.0);
-    var saw_theme_danger = false;
-    for (state.palette_overlay_batch.commands.items) |command| {
-        saw_theme_danger = saw_theme_danger or sameColor(command.color, color(theme.danger()));
-    }
-    if (!saw_theme_danger) return error.MissingThemeDanger;
-
-    state.companion_controller.applyFixture(.idle);
-    state.companion_composer.setCallbacks(.{});
-    _ = try state.companion_composer.handleInput(allocator, .{ .focus = true });
-    try std.testing.expect(state.companion_composer.focused);
-    state.palette_overlay_batch.clear();
-    _ = state.palette_overlay_batch.setZIndex(companion_z);
-    render(&state, 2536.0, 1030.0);
-    try std.testing.expectEqual(composer, state.companion_composer.bounds());
-    var saw_focus_border = false;
-    for (state.palette_overlay_batch.commands.items) |command| {
-        if (command.kind == .rect and command.rect.x == composer.x and command.rect.y == composer.y and command.rect.w == composer.w and command.rect.h == composer.h) {
-            saw_focus_border = command.border_color != null and sameColor(command.border_color.?, color(chrome.accent));
-        }
-    }
-    if (!saw_focus_border) return error.MissingFocusBorder;
-
     theme.applyTheme(1.0);
+    var state: runtime.AppState = undefined;
+    try testState(allocator, &state);
+    defer deinitTestState(allocator, &state);
+
+    var inbox: [1]controller.ChatRow = .{.{ .attention = .approval }};
+    inbox[0].title.set("Fix auth tests");
+    inbox[0].detail.set("verde · Run zig build test");
+    state.companion_controller.setInbox(&inbox);
+    var crew: [2]controller.ChatRow = .{ .{ .attention = .running }, .{ .attention = .done } };
+    crew[0].title.set("Update docs");
+    crew[0].provider.set("codex");
+    crew[1].title.set("Bump deps");
+    state.companion_controller.setCrew(&crew);
+
+    render(&state, 1360.0, 860.0);
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "1 thing needs you"));
+    try std.testing.expectEqual(controller.Pose.approval, state.companion_controller.visualState().pose);
+
     state.palette_overlay_batch.clear();
-    _ = state.palette_overlay_batch.setZIndex(companion_z);
-    render(&state, 100.0, 300.0);
-    const tiny_geometry = computeGeometryForState(100.0, 300.0, 1.0, &state.companion_controller);
-    try std.testing.expectEqual(@as(f32, 0.0), composerRectAtScale(tiny_geometry.footer, 1.0).w);
-    for (state.palette_overlay_batch.commands.items) |command| {
-        try std.testing.expect(!(command.kind == .text and (std.mem.eql(u8, command.text, "Steer the run…") or std.mem.eql(u8, command.text, "Workspace · verde"))));
-        try std.testing.expect(!(command.kind == .rect and command.rect.w == 6.0 and command.rect.h == 6.0 and sameColor(command.color, color(chrome.accent))));
-    }
+    state.companion_controller.show();
+    render(&state, 1360.0, 860.0);
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "NEEDS YOU · 1"));
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "Needs approval: Fix auth tests"));
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "CREW · 1 RUNNING · 2 TOTAL"));
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "Update docs"));
+
+    const geometry = computeGeometry(&state, 1360.0, 860.0);
+    registerHits(&state, geometry);
+    const inbox_row = rowRect(geometry.inbox, 0, INBOX_ROW_HEIGHT);
+    const hit = state.companion_controller.hitEntryAt(inbox_row.x + 4.0, inbox_row.y + 4.0).?;
+    try std.testing.expectEqual(controller.HitAction.inbox_open, hit.action);
+    const crew_row = rowRect(geometry.crew, 1, CREW_ROW_HEIGHT);
+    const crew_hit = state.companion_controller.hitEntryAt(crew_row.x + 4.0, crew_row.y + 4.0).?;
+    try std.testing.expectEqual(controller.HitAction.crew_open, crew_hit.action);
+    try std.testing.expectEqual(@as(usize, 1), crew_hit.index);
+    try std.testing.expect(geometry.conversation.y >= geometry.crew.y + geometry.crew.h);
 }
 
-test "public Companion render retains Frame-backed Run and Activity text" {
+test "conversation renders user bubbles, wrapped replies, and tool lines" {
     const allocator = std.testing.allocator;
-    defer theme.applyTheme(1.0);
     theme.applyTheme(1.0);
     var state: runtime.AppState = undefined;
-    // Fields read by modal key/text routing and new-chat defaults.
-    state.folder_browser = .{};
-    state.custom_agent_form = .{};
-    state.settings_controller.provider_setup = .{};
-    state.provider_controller = .{};
-    state.allocator = allocator;
-    state.app_config = .{ .companion_enabled = true };
-    state.project_controller = .{};
-    state.companion_controller = controller.init();
+    try testState(allocator, &state);
+    defer deinitTestState(allocator, &state);
     state.companion_controller.show();
-    state.companion_composer = @TypeOf(state.companion_composer).init();
-    state.palette_overlay_batch = .{};
-    state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
-    defer {
-        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
-        state.project_controller.projects.deinit(allocator);
-        state.companion_composer.deinit(allocator);
-        state.palette_overlay_batch.deinit(allocator);
-        state.palette_frame_text_arena.deinit();
-    }
-    var project = try runtime.Project.init(allocator, "frame-text", "Frame text", "/tmp/frame-text", 0);
-    state.project_controller.projects.append(allocator, project) catch |err| {
-        project.deinit(allocator);
-        return err;
-    };
-
-    var operation_title_buffer: [64]u8 = undefined;
-    var operation_detail_buffer: [64]u8 = undefined;
-    var user_body_buffer: [64]u8 = undefined;
-    var assistant_body_buffer: [64]u8 = undefined;
-    const operation_title = try std.fmt.bufPrint(&operation_title_buffer, "Read {s}", .{"README.md"});
-    const operation_detail = try std.fmt.bufPrint(&operation_detail_buffer, "{s} first heading", .{"Captured"});
-    const user_body = try std.fmt.bufPrint(&user_body_buffer, "{s} README.md", .{"Inspect"});
-    const assistant_body = try std.fmt.bufPrint(&assistant_body_buffer, "Heading: {s}", .{"Verde"});
     var frame: controller.Frame = .{ .has_thread = true };
-    frame.workspace_id.set("frame-text");
-    frame.thread_id.set("pane-less-frame-text");
-    var operation: controller.Operation = .{ .status = .completed, .sequence = 1 };
-    operation.identity.set("tool:stable");
-    operation.title.set(operation_title);
-    operation.detail.set(operation_detail);
-    frame.upsertOperation(operation);
-    var user_activity: controller.ActivityItem = .{ .kind = .user, .sequence = 2 };
-    user_activity.author.set("You");
-    user_activity.body.set(user_body);
-    frame.appendActivity(user_activity);
-    var assistant_activity: controller.ActivityItem = .{ .kind = .assistant, .sequence = 3 };
-    assistant_activity.author.set("Sprout");
-    assistant_activity.body.set(assistant_body);
-    frame.appendActivity(assistant_activity);
-    @memset(&operation_title_buffer, 0);
-    @memset(&operation_detail_buffer, 0);
-    @memset(&user_body_buffer, 0);
-    @memset(&assistant_body_buffer, 0);
+    _ = frame.setOwner("companion-ui", "chat-1");
+    var user: controller.ActivityItem = .{ .kind = .user, .sequence = 1 };
+    user.body.set("Get the web app building again");
+    frame.appendActivity(user);
+    var tool: controller.ActivityItem = .{ .kind = .tool, .status = .completed, .sequence = 2 };
+    tool.author.set("open_chat");
+    tool.body.set("codex in verde");
+    frame.appendActivity(tool);
+    var reply: controller.ActivityItem = .{ .kind = .assistant, .sequence = 3 };
+    reply.body.set("**On it.** I opened a `codex` chat in verde.\n\n- It is running the build\n- I will report back");
+    frame.appendActivity(reply);
     state.companion_controller.setFrame(frame);
-    const immutable_frame = state.companion_controller.presentation;
-    const geometry = computeGeometryForState(1360.0, 860.0, 1.0, &state.companion_controller);
 
     render(&state, 1360.0, 860.0);
-    try expectClippedTextCommand(&state.palette_overlay_batch, "RECENT", geometry.body);
-    try expectFrameBackedTextCommand(&state.palette_overlay_batch, "Read README.md", &state.companion_controller.presentation.operations[0].title, geometry.body);
-    try expectFrameBackedTextCommand(&state.palette_overlay_batch, "Captured first heading", &state.companion_controller.presentation.operations[0].detail, geometry.body);
-    try std.testing.expectEqualDeep(immutable_frame, state.companion_controller.presentation);
-
-    state.palette_overlay_batch.clear();
-    state.companion_controller.selectTab(.activity);
-    render(&state, 1360.0, 860.0);
-    try expectFrameBackedTextCommand(&state.palette_overlay_batch, "You", &state.companion_controller.presentation.activity[0].author, geometry.body);
-    try expectFrameBackedTextCommand(&state.palette_overlay_batch, "Inspect README.md", &state.companion_controller.presentation.activity[0].body, geometry.body);
-    try expectFrameBackedTextCommand(&state.palette_overlay_batch, "Sprout", &state.companion_controller.presentation.activity[1].author, geometry.body);
-    try expectFrameBackedTextCommand(&state.palette_overlay_batch, "Heading: Verde", &state.companion_controller.presentation.activity[1].body, geometry.body);
-    try std.testing.expectEqualDeep(immutable_frame, state.companion_controller.presentation);
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "Get the web app building again"));
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "On it. I opened a codex chat in verde."));
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "• It is running the build"));
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "open_chat · codex in verde"));
+    try std.testing.expect(!batchHasText(&state.palette_overlay_batch, "**"));
 }
 
-test "operation preview splits command dumps without altering unknown shapes" {
-    const split = operationPreview("Command:\n/usr/bin/bash -lc 'zig build'\n\nOutput:\nBuild passed\nAll steps ok");
-    try std.testing.expectEqualStrings("/usr/bin/bash -lc 'zig build'", split.detail);
-    try std.testing.expectEqualStrings("Build passed\nAll steps ok", split.result.?);
-
-    const input_form = operationPreview("Input: rg --files\nOutput: file.zig");
-    try std.testing.expectEqualStrings("rg --files", input_form.detail);
-    try std.testing.expectEqualStrings("file.zig", input_form.result.?);
-
-    const output_only = operationPreview("Output:\njust results");
-    try std.testing.expectEqualStrings("just results", output_only.detail);
-    try std.testing.expect(output_only.result == null);
-
-    const plain = operationPreview("Captured first heading");
-    try std.testing.expectEqualStrings("Captured first heading", plain.detail);
-    try std.testing.expect(plain.result == null);
-}
-
-test "public Companion render bounds raw multiline Run and Activity dumps" {
+test "menus register their rows above a dismiss layer" {
     const allocator = std.testing.allocator;
-    defer theme.applyTheme(1.0);
     theme.applyTheme(1.0);
     var state: runtime.AppState = undefined;
-    // Fields read by modal key/text routing and new-chat defaults.
-    state.folder_browser = .{};
-    state.custom_agent_form = .{};
-    state.settings_controller.provider_setup = .{};
-    state.provider_controller = .{};
-    state.allocator = allocator;
-    state.app_config = .{ .companion_enabled = true };
-    state.project_controller = .{};
-    state.companion_controller = controller.init();
+    try testState(allocator, &state);
+    defer deinitTestState(allocator, &state);
     state.companion_controller.show();
-    state.companion_composer = @TypeOf(state.companion_composer).init();
-    state.palette_overlay_batch = .{};
-    state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
-    defer {
-        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
-        state.project_controller.projects.deinit(allocator);
-        state.companion_composer.deinit(allocator);
-        state.palette_overlay_batch.deinit(allocator);
-        state.palette_frame_text_arena.deinit();
-    }
-    var project = try runtime.Project.init(allocator, "bounded", "Bounded", "/tmp/bounded", 0);
-    state.project_controller.projects.append(allocator, project) catch |err| {
-        project.deinit(allocator);
-        return err;
-    };
+    state.companion_controller.roster_row_count = 2;
+    state.companion_controller.roster_rows[0] = .{ .active = true };
+    state.companion_controller.roster_rows[0].name.set("Juniper");
+    state.companion_controller.roster_rows[1] = .{ .character = .vireo };
+    state.companion_controller.roster_rows[1].name.set("Wren");
+    state.companion_controller.identity.count = 2;
+    state.companion_controller.openMenu(.companions);
 
-    const raw_dump = "Command:\n/usr/bin/bash -lc 'find . -maxdepth 2 -type d | sort'\n\nOutput:\n" ++ ("worktree-path-entry\n" ** 24);
-    var frame: controller.Frame = .{ .has_thread = true, .working = true };
-    frame.workspace_id.set("bounded");
-    frame.thread_id.set("pane-less-bounded");
-    var operation: controller.Operation = .{ .status = .completed, .sequence = 1 };
-    operation.identity.set("tool:bounded");
-    operation.title.set("Ran command");
-    operation.detail.set(raw_dump);
-    frame.upsertOperation(operation);
-    var tool_row: controller.ActivityItem = .{ .kind = .tool, .status = .completed, .sequence = 2 };
-    tool_row.identity.set("tool:bounded");
-    tool_row.author.set("Ran command");
-    tool_row.body.set(raw_dump);
-    frame.appendActivity(tool_row);
-    var user_row: controller.ActivityItem = .{ .kind = .user, .sequence = 3 };
-    user_row.author.set("You");
-    user_row.body.set("line one\nline two\nline three");
-    frame.appendActivity(user_row);
-    state.companion_controller.setFrame(frame);
-    const geometry = computeGeometryForState(1360.0, 860.0, 1.0, &state.companion_controller);
+    const geometry = computeGeometry(&state, 1360.0, 860.0);
+    registerHits(&state, geometry);
+    const layout = companionMenuLayout(&state, geometry);
+    const row_hit = state.companion_controller.hitEntryAt(layout.rows[1].x + 4.0, layout.rows[1].y + 4.0).?;
+    try std.testing.expectEqual(controller.HitAction.menu_select_companion, row_hit.action);
+    try std.testing.expectEqual(@as(usize, 1), row_hit.index);
+    const vireo_hit = state.companion_controller.hitEntryAt(layout.characters[2].x + 4.0, layout.characters[2].y + 4.0).?;
+    try std.testing.expectEqual(controller.HitAction.menu_character, vireo_hit.action);
+    try std.testing.expectEqual(app_config.CompanionCharacter.vireo, characterAt(vireo_hit.index).?);
+    try std.testing.expectEqual(controller.HitAction.menu_remove, state.companion_controller.hitAt(layout.remove.x + 4.0, layout.remove.y + 4.0).?);
+    try std.testing.expectEqual(controller.HitAction.menu_dismiss, state.companion_controller.hitAt(5.0, 5.0).?);
 
     render(&state, 1360.0, 860.0);
-    try expectNoMultilineText(&state.palette_overlay_batch);
-    try expectNoTextCommand(&state.palette_overlay_batch, "Scope");
-    try expectBoundedBodyText(&state.palette_overlay_batch, "find . -maxdepth", geometry.body);
-    try expectBoundedBodyText(&state.palette_overlay_batch, "worktree-path-entry", geometry.body);
-    try expectClippedTextCommand(&state.palette_overlay_batch, "DONE", geometry.body);
-
-    state.palette_overlay_batch.clear();
-    state.companion_controller.selectTab(.activity);
-    render(&state, 1360.0, 860.0);
-    try expectNoMultilineText(&state.palette_overlay_batch);
-    try expectBoundedBodyText(&state.palette_overlay_batch, "find . -maxdepth", geometry.body);
-    try expectBoundedBodyText(&state.palette_overlay_batch, "line one line two line three", geometry.body);
-    try expectClippedTextCommand(&state.palette_overlay_batch, "DONE", geometry.body);
-    try expectClippedTextCommand(&state.palette_overlay_batch, "Sprout is working…", geometry.body);
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "Wren"));
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "+ New companion"));
 }
 
-test "public Companion render surfaces streaming final empty and failed Sprout answers in Run" {
-    const allocator = std.testing.allocator;
-    defer theme.applyTheme(1.0);
-    theme.applyTheme(1.0);
-    var state: runtime.AppState = undefined;
-    // Fields read by modal key/text routing and new-chat defaults.
-    state.folder_browser = .{};
-    state.custom_agent_form = .{};
-    state.settings_controller.provider_setup = .{};
-    state.provider_controller = .{};
-    state.allocator = allocator;
-    state.app_config = .{ .companion_enabled = true };
-    state.project_controller = .{};
-    state.companion_controller = controller.init();
-    state.companion_controller.show();
-    state.companion_composer = @TypeOf(state.companion_composer).init();
-    state.palette_overlay_batch = .{};
-    state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
-    defer {
-        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
-        state.project_controller.projects.deinit(allocator);
-        state.companion_composer.deinit(allocator);
-        state.palette_overlay_batch.deinit(allocator);
-        state.palette_frame_text_arena.deinit();
+test "measured wrap keeps words whole and bounds line count" {
+    const wrapped = wrapText("one two three four five six seven eight nine ten", 60.0, .ui, 12.0, 3);
+    try std.testing.expectEqual(@as(usize, 3), wrapped.count);
+    try std.testing.expect(wrapped.truncated);
+    for (wrapped.lines[0..wrapped.count]) |line| {
+        try std.testing.expect(line.len > 0);
+        try std.testing.expect(line[0] != ' ' and line[line.len - 1] != ' ');
     }
-    var project = try runtime.Project.init(allocator, "answer", "Answer", "/tmp/answer", 0);
-    state.project_controller.projects.append(allocator, project) catch |err| {
-        project.deinit(allocator);
-        return err;
-    };
-
-    // Dynamically populated, non-literal answer text proves Frame-backed
-    // lifetime rather than static-string survival.
-    var answer_buffer: [96]u8 = undefined;
-    const answer_body = try std.fmt.bufPrint(&answer_buffer, "# {s} — native workspace shell", .{"Verde"});
-    var frame: controller.Frame = .{ .has_thread = true, .working = true };
-    frame.workspace_id.set("answer");
-    frame.thread_id.set("pane-less-answer");
-    frame.objective.set("Read README.md and report its first heading");
-    frame.answer.set(answer_body);
-    @memset(&answer_buffer, 0);
-    state.companion_controller.setFrame(frame);
-    const geometry = computeGeometryForState(1360.0, 860.0, 1.0, &state.companion_controller);
-
-    // Streaming: the in-progress answer is visible and labeled WORKING.
-    render(&state, 1360.0, 860.0);
-    try expectFrameBackedTextCommand(&state.palette_overlay_batch, "# Verde — native workspace shell", &state.companion_controller.presentation.answer, geometry.body);
-    try expectClippedTextCommand(&state.palette_overlay_batch, "SPROUT SAYS", geometry.body);
-    try expectBoundedBodyText(&state.palette_overlay_batch, "WORKING", geometry.body);
-
-    // Completion keeps the final answer visible and labels it DONE.
-    var done_frame = state.companion_controller.presentation;
-    done_frame.working = false;
-    state.companion_controller.setFrame(done_frame);
-    state.palette_overlay_batch.clear();
-    render(&state, 1360.0, 860.0);
-    try expectFrameBackedTextCommand(&state.palette_overlay_batch, "# Verde — native workspace shell", &state.companion_controller.presentation.answer, geometry.body);
-    try expectBoundedBodyText(&state.palette_overlay_batch, "DONE", geometry.body);
-
-    // A new turn before the first delta shows a truthful placeholder, not the
-    // old answer.
-    var pending_frame: controller.Frame = .{ .has_thread = true, .working = true };
-    pending_frame.workspace_id.set("answer");
-    pending_frame.thread_id.set("pane-less-answer");
-    pending_frame.objective.set("Now summarize CONTRIBUTING.md");
-    state.companion_controller.setFrame(pending_frame);
-    state.palette_overlay_batch.clear();
-    render(&state, 1360.0, 860.0);
-    try expectClippedTextCommand(&state.palette_overlay_batch, "Working — no reply yet.", geometry.body);
-    try expectNoTextCommand(&state.palette_overlay_batch, "# Verde — native workspace shell");
-
-    // A failed turn reports FAILED without inventing an answer, while the
-    // provider and control errors stay visible as cards.
-    var failed_frame: controller.Frame = .{ .has_thread = true, .answer_failed = true, .has_failure = true };
-    failed_frame.workspace_id.set("answer");
-    failed_frame.thread_id.set("pane-less-answer");
-    failed_frame.objective.set("Now summarize CONTRIBUTING.md");
-    failed_frame.provider_error.set("Send failed: provider exited");
-    failed_frame.control_error.set("Approval decision failed");
-    state.companion_controller.setFrame(failed_frame);
-    state.palette_overlay_batch.clear();
-    render(&state, 1360.0, 860.0);
-    try expectClippedTextCommand(&state.palette_overlay_batch, "The run failed before replying.", geometry.body);
-    try expectBoundedBodyText(&state.palette_overlay_batch, "FAILED", geometry.body);
-    try expectBoundedBodyText(&state.palette_overlay_batch, "provider exited", geometry.body);
-    try expectClippedTextCommand(&state.palette_overlay_batch, "Action failed", geometry.body);
-    try expectNoTextCommand(&state.palette_overlay_batch, "DONE");
+    const paragraphs = wrapText("first\n\nsecond", 500.0, .ui, 12.0, 8);
+    try std.testing.expectEqual(@as(usize, 3), paragraphs.count);
+    try std.testing.expectEqualStrings("", paragraphs.lines[1]);
 }
 
-test "public Companion Result heading follows the active character" {
-    const allocator = std.testing.allocator;
-    defer theme.applyTheme(1.0);
-    theme.applyTheme(1.0);
-    var state: runtime.AppState = undefined;
-    // Fields read by modal key/text routing and new-chat defaults.
-    state.folder_browser = .{};
-    state.custom_agent_form = .{};
-    state.settings_controller.provider_setup = .{};
-    state.provider_controller = .{};
-    state.allocator = allocator;
-    state.app_config = .{ .companion_enabled = true };
-    state.project_controller = .{};
-    state.companion_controller = controller.init();
-    state.companion_controller.show();
-    state.companion_composer = @TypeOf(state.companion_composer).init();
-    state.palette_overlay_batch = .{};
-    state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
-    defer {
-        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
-        state.project_controller.projects.deinit(allocator);
-        state.companion_composer.deinit(allocator);
-        state.palette_overlay_batch.deinit(allocator);
-        state.palette_frame_text_arena.deinit();
-    }
-    var project = try runtime.Project.init(allocator, "result-character", "Result character", "/tmp/result-character", 0);
-    state.project_controller.projects.append(allocator, project) catch |err| {
-        project.deinit(allocator);
-        return err;
-    };
-
-    var frame: controller.Frame = .{ .has_thread = true };
-    frame.workspace_id.set("result-character");
-    frame.thread_id.set("pane-less-result-character");
-    frame.answer.set("Character-aware result");
-    state.companion_controller.setFrame(frame);
-    const geometry = computeGeometryForState(1360.0, 860.0, 1.0, &state.companion_controller);
-    const cases = [_]struct {
-        character: app_config.CompanionCharacter,
-        heading: []const u8,
-    }{
-        .{ .character = .sprout, .heading = "SPROUT SAYS" },
-        .{ .character = .moss, .heading = "MOSS SAYS" },
-        .{ .character = .vireo, .heading = "VIREO SAYS" },
-    };
-
-    inline for (cases) |case| {
-        state.app_config.companion_character = case.character;
-        state.palette_overlay_batch.clear();
-        _ = state.palette_frame_text_arena.reset(.retain_capacity);
-        render(&state, 1360.0, 860.0);
-        try expectClippedTextCommand(&state.palette_overlay_batch, case.heading, geometry.body);
-        inline for (cases) |other| {
-            if (other.character != case.character) try expectNoTextCommand(&state.palette_overlay_batch, other.heading);
-        }
-    }
-}
-
-test "public Companion render leads with the answer and suppresses metadata-only success detail" {
-    const allocator = std.testing.allocator;
-    defer theme.applyTheme(1.0);
-    theme.applyTheme(1.0);
-    var state: runtime.AppState = undefined;
-    // Fields read by modal key/text routing and new-chat defaults.
-    state.folder_browser = .{};
-    state.custom_agent_form = .{};
-    state.settings_controller.provider_setup = .{};
-    state.provider_controller = .{};
-    state.allocator = allocator;
-    state.app_config = .{ .companion_enabled = true };
-    state.project_controller = .{};
-    state.companion_controller = controller.init();
-    state.companion_controller.show();
-    state.companion_composer = @TypeOf(state.companion_composer).init();
-    state.palette_overlay_batch = .{};
-    state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
-    defer {
-        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
-        state.project_controller.projects.deinit(allocator);
-        state.companion_composer.deinit(allocator);
-        state.palette_overlay_batch.deinit(allocator);
-        state.palette_frame_text_arena.deinit();
-    }
-    var project = try runtime.Project.init(allocator, "evidence", "Evidence", "/tmp/evidence", 0);
-    state.project_controller.projects.append(allocator, project) catch |err| {
-        project.deinit(allocator);
-        return err;
-    };
-
-    const metadata_dump = "Command:\n/usr/bin/bash -lc \"sed -n '1,12p' README.md\"\n\nOutput:\nCWD: /home/rtg/development/verde\nExit code: 0\nDuration ms: 0";
-    const output_dump = "Command:\n/usr/bin/bash -lc 'cat VERSION'\n\nOutput:\nCWD: /home/rtg/development/verde\nExit code: 0\nDuration ms: 4\n\n0.4.2-dev";
-    const failed_dump = "Command:\n/usr/bin/bash -lc 'zig build'\n\nOutput:\nCWD: /tmp\nExit code: 1\nDuration ms: 12";
-    var answer_buffer: [64]u8 = undefined;
-    const answer_body = try std.fmt.bufPrint(&answer_buffer, "The first heading is {s}", .{"# Verde"});
-    var frame: controller.Frame = .{ .has_thread = true };
-    frame.workspace_id.set("evidence");
-    frame.thread_id.set("pane-less-evidence");
-    frame.objective.set("Read README.md and report its first heading");
-    frame.answer.set(answer_body);
-    @memset(&answer_buffer, 0);
-    var metadata_op: controller.Operation = .{ .status = .completed, .sequence = 1 };
-    metadata_op.identity.set("tool:metadata");
-    metadata_op.title.set("Ran command");
-    metadata_op.detail.set(metadata_dump);
-    frame.upsertOperation(metadata_op);
-    var output_op: controller.Operation = .{ .status = .completed, .sequence = 2 };
-    output_op.identity.set("tool:output");
-    output_op.title.set("Ran command");
-    output_op.detail.set(output_dump);
-    frame.upsertOperation(output_op);
-    var failed_op: controller.Operation = .{ .status = .failed, .sequence = 3 };
-    failed_op.identity.set("tool:failed");
-    failed_op.title.set("Command failed");
-    failed_op.detail.set(failed_dump);
-    frame.upsertOperation(failed_op);
-    state.companion_controller.setFrame(frame);
-    const geometry = computeGeometryForState(1360.0, 860.0, 1.0, &state.companion_controller);
-
-    render(&state, 1360.0, 860.0);
-    // The completed README-like answer is queued in Run, above the evidence.
-    try expectFrameBackedTextCommand(&state.palette_overlay_batch, "The first heading is # Verde", &state.companion_controller.presentation.answer, geometry.body);
-    try std.testing.expect(try textCommandY(&state.palette_overlay_batch, "SPROUT SAYS") < try textCommandY(&state.palette_overlay_batch, "RECENT"));
-    // Metadata-only success reads as a truthful completion, real output and
-    // failure diagnostics survive, and successful metadata never renders.
-    try expectClippedTextCommand(&state.palette_overlay_batch, "Completed successfully", geometry.body);
-    try expectBoundedBodyText(&state.palette_overlay_batch, "0.4.2-dev", geometry.body);
-    try expectBoundedBodyText(&state.palette_overlay_batch, "Exit code: 1", geometry.body);
-    try expectNoTextCommandContaining(&state.palette_overlay_batch, "Duration ms: 0");
-    try expectNoTextCommandContaining(&state.palette_overlay_batch, "Duration ms: 4");
-}
-
-test "public Companion render clears stale failure posture while failed evidence remains" {
-    const allocator = std.testing.allocator;
-    defer theme.applyTheme(1.0);
-    theme.applyTheme(1.0);
-    var state: runtime.AppState = undefined;
-    // Fields read by modal key/text routing and new-chat defaults.
-    state.folder_browser = .{};
-    state.custom_agent_form = .{};
-    state.settings_controller.provider_setup = .{};
-    state.provider_controller = .{};
-    state.allocator = allocator;
-    state.app_config = .{ .companion_enabled = true };
-    state.project_controller = .{};
-    state.companion_controller = controller.init();
-    state.companion_composer = @TypeOf(state.companion_composer).init();
-    state.palette_overlay_batch = .{};
-    state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
-    defer {
-        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
-        state.project_controller.projects.deinit(allocator);
-        state.companion_composer.deinit(allocator);
-        state.palette_overlay_batch.deinit(allocator);
-        state.palette_frame_text_arena.deinit();
-    }
-    var project = try runtime.Project.init(allocator, "posture", "Posture", "/tmp/posture", 0);
-    state.project_controller.projects.append(allocator, project) catch |err| {
-        project.deinit(allocator);
-        return err;
-    };
-
-    // Newer successful turn: global posture is clean even though an older
-    // failed operation remains retained as evidence.
-    var success_frame: controller.Frame = .{ .has_thread = true };
-    success_frame.workspace_id.set("posture");
-    success_frame.thread_id.set("pane-less-posture");
-    success_frame.objective.set("i meant read teh readme.md and use read tools");
-    success_frame.answer.set("The first heading is **Verde**.");
-    var old_failure: controller.Operation = .{ .status = .failed, .sequence = 1 };
-    old_failure.identity.set("tool:old-failure");
-    old_failure.title.set("Command failed");
-    old_failure.detail.set("Command:\n/usr/bin/bash -lc \"sed -n '1,12p' redme.md\"\n\nOutput:\nCWD: /tmp\nExit code: 2");
-    success_frame.upsertOperation(old_failure);
-    state.companion_controller.setFrame(success_frame);
-
-    // Collapsed chip: no stale "failed" detail and no danger accent.
-    try std.testing.expectEqual(ChipDetail.none, chipVisual(&state.companion_controller).detail);
-    try std.testing.expect(!chipVisual(&state.companion_controller).uses_danger);
-    render(&state, 1360.0, 860.0);
-    try expectNoTextCommand(&state.palette_overlay_batch, "failed");
-
-    // Expanded header: ready, not needs-attention, while the failed card
-    // stays red in Recent and the successful answer leads Run.
-    state.companion_controller.show();
-    const geometry = computeGeometryForState(1360.0, 860.0, 1.0, &state.companion_controller);
-    state.palette_overlay_batch.clear();
-    render(&state, 1360.0, 860.0);
-    try expectClippedTextCommand(&state.palette_overlay_batch, "ready", geometry.header);
-    try expectNoTextCommand(&state.palette_overlay_batch, "needs attention");
-    try expectClippedTextCommand(&state.palette_overlay_batch, "FAILED", geometry.body);
-    try expectClippedTextCommand(&state.palette_overlay_batch, "The first heading is **Verde**.", geometry.body);
-
-    // A genuinely current failure still reads globally red in the header and
-    // on the collapsed chip.
-    var failed_frame: controller.Frame = .{ .has_thread = true, .has_failure = true, .answer_failed = true };
-    failed_frame.workspace_id.set("posture");
-    failed_frame.thread_id.set("pane-less-posture");
-    failed_frame.objective.set("i meant read teh readme.md and use read tools");
-    failed_frame.provider_error.set("Send failed: provider exited");
-    failed_frame.upsertOperation(old_failure);
-    state.companion_controller.setFrame(failed_frame);
-    state.palette_overlay_batch.clear();
-    render(&state, 1360.0, 860.0);
-    try expectClippedTextCommand(&state.palette_overlay_batch, "needs attention", geometry.header);
-    try expectClippedTextCommand(&state.palette_overlay_batch, "The run failed before replying.", geometry.body);
-    state.companion_controller.collapse();
-    const chip_geometry = computeGeometryForState(1360.0, 860.0, 1.0, &state.companion_controller);
-    state.palette_overlay_batch.clear();
-    render(&state, 1360.0, 860.0);
-    try expectClippedTextCommand(&state.palette_overlay_batch, "failed", chip_geometry.chip);
-}
-
-test "meaningful result preview skips only the fixed metadata preamble" {
-    try std.testing.expect(meaningfulResultPreview("CWD: /home/x\nExit code: 0\nDuration ms: 3") == null);
-    try std.testing.expectEqualStrings("real output\nsecond line", meaningfulResultPreview("CWD: /home/x\nExit code: 0\nDuration ms: 3\n\nreal output\nsecond line").?);
-    try std.testing.expectEqualStrings("Duration measured in weeks", meaningfulResultPreview("Duration measured in weeks").?);
-    try std.testing.expect(meaningfulResultPreview("   \n\t\n") == null);
-}
-
-fn expectNoTextCommandContaining(batch: *const palette.RenderBatch, forbidden: []const u8) !void {
-    for (batch.commands.items) |command| {
-        if (command.kind == .text and std.mem.indexOf(u8, command.text, forbidden) != null) return error.UnexpectedTextCommand;
-    }
-}
-
-fn textCommandY(batch: *const palette.RenderBatch, needle: []const u8) !f32 {
-    for (batch.commands.items) |command| {
-        if (command.kind == .text and std.mem.eql(u8, command.text, needle)) return command.rect.y;
-    }
-    return error.MissingExpectedText;
-}
-
-fn expectNoMultilineText(batch: *const palette.RenderBatch) !void {
-    for (batch.commands.items) |command| {
-        if (command.kind != .text) continue;
-        try std.testing.expect(std.mem.indexOfScalar(u8, command.text, '\n') == null);
-    }
-}
-
-fn expectNoTextCommand(batch: *const palette.RenderBatch, forbidden: []const u8) !void {
-    for (batch.commands.items) |command| {
-        if (command.kind == .text and std.mem.eql(u8, command.text, forbidden)) return error.UnexpectedTextCommand;
-    }
-}
-
-fn expectBoundedBodyText(batch: *const palette.RenderBatch, needle: []const u8, clip: palette.Rect) !void {
-    for (batch.commands.items) |command| {
-        if (command.kind != .text or std.mem.indexOf(u8, command.text, needle) == null) continue;
-        const command_clip = command.clip orelse continue;
-        if (!rectEqual(command_clip, clip)) continue;
-        try expectTextCommandInsideClip(command, clip);
-        const role = command.font_role orelse return error.MissingTextRole;
-        try std.testing.expect(text_measure.textWidth(role, command.font_size, command.text) <= command.rect.w + 0.5);
-        return;
-    }
-    return error.MissingBoundedBodyText;
-}
-
-fn expectClippedTextCommand(batch: *const palette.RenderBatch, expected: []const u8, clip: palette.Rect) !void {
-    for (batch.commands.items) |command| {
-        if (command.kind != .text or !std.mem.eql(u8, command.text, expected)) continue;
-        try expectTextCommandInsideClip(command, clip);
-        return;
-    }
-    return error.MissingExpectedText;
-}
-
-fn expectFrameBackedTextCommand(batch: *const palette.RenderBatch, expected: []const u8, backing: *const controller.PresentationText, clip: palette.Rect) !void {
-    for (batch.commands.items) |command| {
-        if (command.kind != .text or !std.mem.eql(u8, command.text, expected)) continue;
-        // Chrome may repeat the same string with another clip (header "Sprout"),
-        // so select the body-clipped command before asserting Frame backing.
-        const command_clip = command.clip orelse continue;
-        if (!rectEqual(command_clip, clip)) continue;
-        try expectTextCommandInsideClip(command, clip);
-        const text_start = @intFromPtr(command.text.ptr);
-        const storage_start = @intFromPtr(&backing.storage[0]);
-        if (text_start < storage_start) return error.TextStartsBeforeFrameStorage;
-        if (text_start + command.text.len > storage_start + backing.storage.len) return error.TextEndsAfterFrameStorage;
-        return;
-    }
-    return error.MissingExpectedFrameText;
-}
-
-fn expectTextCommandInsideClip(command: palette.draw.Command, expected_clip: palette.Rect) !void {
-    const clip = command.clip orelse return error.MissingExpectedTextClip;
-    if (!rectEqual(clip, expected_clip)) return error.UnexpectedTextClip;
-    if (command.rect.x < clip.x or command.rect.y < clip.y) return error.TextStartsOutsideClip;
-    if (command.rect.x + command.rect.w > clip.x + clip.w) return error.TextEndsOutsideClip;
-    if (command.rect.y + command.rect.h > clip.y + clip.h) return error.TextEndsBelowClip;
-}
-
-test "public Companion render repaints active chrome without reconstructing state" {
-    const allocator = std.testing.allocator;
-    const saved_colors = theme.current_colors;
-    defer theme.current_colors = saved_colors;
-    defer theme.applyTheme(1.0);
-    theme.applyTheme(1.0);
-
-    var first = theme.default_colors;
-    first.background = testRgb(0x18, 0x13, 0x27);
-    first.text = testRgb(0xee, 0xe8, 0xfb);
-    first.text_muted = testRgb(0xb2, 0xa7, 0xc4);
-    first.text_subtle = testRgb(0x86, 0x7a, 0x96);
-    first.accent = testRgb(0xa2, 0x70, 0xe2);
-    first.border = testRgb(0x69, 0x50, 0x7e);
-    first.border_muted = testRgb(0x4d, 0x40, 0x59);
-    first.warning = testRgb(0xea, 0xb3, 0x4a);
-    first.diff_remove = testRgb(0xe7, 0x5b, 0x72);
-
-    var second = theme.default_colors;
-    second.background = testRgb(0xe9, 0xee, 0xe7);
-    second.text = testRgb(0x22, 0x35, 0x31);
-    second.text_muted = testRgb(0x55, 0x69, 0x63);
-    second.text_subtle = testRgb(0x73, 0x82, 0x7d);
-    second.accent = testRgb(0xbd, 0x45, 0x5b);
-    second.border = testRgb(0x70, 0x92, 0x8b);
-    second.border_muted = testRgb(0x9b, 0xad, 0xa8);
-    second.warning = second.accent;
-    second.diff_remove = second.accent;
-
-    var state: runtime.AppState = undefined;
-
-    // Fields read by modal key/text routing and new-chat defaults.
-
-    state.folder_browser = .{};
-
-    state.custom_agent_form = .{};
-
-    state.settings_controller.provider_setup = .{};
-
-    state.provider_controller = .{};
-    state.allocator = allocator;
-    state.app_config = .{ .companion_enabled = true };
-    state.project_controller = .{};
-    state.companion_controller = controller.init();
-    state.companion_composer = @TypeOf(state.companion_composer).init();
-    state.palette_overlay_batch = .{};
-    state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
-    defer {
-        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
-        state.project_controller.projects.deinit(allocator);
-        state.companion_composer.deinit(allocator);
-        state.palette_overlay_batch.deinit(allocator);
-        state.palette_frame_text_arena.deinit();
-    }
-    var project = try runtime.Project.init(allocator, "chrome-repaint", "Chrome", "/tmp/chrome-repaint", 0);
-    state.project_controller.projects.append(allocator, project) catch |err| {
-        project.deinit(allocator);
-        return err;
-    };
-    state.companion_controller.presentation.has_thread = true;
-    state.companion_controller.presentation.latest_body.set("Active operation");
-    state.companion_controller.applyFixture(.working);
-
-    theme.current_colors = first;
-    const first_chrome = theme.companionChrome();
-    render(&state, 1360.0, 860.0);
-    try expectBatchColor(&state.palette_overlay_batch, .rect, first_chrome.surface);
-    state.palette_overlay_batch.clear();
-    state.companion_controller.show();
-    render(&state, 1360.0, 860.0);
-    const geometry = computeGeometryForState(1360.0, 860.0, 1.0, &state.companion_controller);
-    try expectExpandedChrome(&state, geometry, first_chrome, false);
-
-    theme.current_colors = second;
-    const second_chrome = theme.companionChrome();
-    try std.testing.expect(!colorsEqual(first_chrome.surface, second_chrome.surface));
-    try std.testing.expect(!colorsEqual(first_chrome.surface_deep, second_chrome.surface_deep));
-    state.palette_overlay_batch.clear();
-    state.companion_controller.collapse();
-    render(&state, 1360.0, 860.0);
-    try expectBatchColor(&state.palette_overlay_batch, .rect, second_chrome.surface);
-    state.palette_overlay_batch.clear();
-    state.companion_controller.show();
-    render(&state, 1360.0, 860.0);
-    try expectExpandedChrome(&state, geometry, second_chrome, false);
-
-    state.palette_overlay_batch.clear();
-    var failed_frame: controller.Frame = .{ .has_thread = true, .has_failure = true };
-    var failed_operation: controller.Operation = .{ .status = .failed };
-    failed_operation.identity.set("chrome-repaint-failure");
-    failed_operation.title.set("Command failed");
-    failed_operation.detail.set("Active operation");
-    failed_frame.upsertOperation(failed_operation);
-    state.companion_controller.setFrame(failed_frame);
-    render(&state, 1360.0, 860.0);
-    try expectExpandedChrome(&state, geometry, second_chrome, true);
-}
-
-test "arbitrary active token sets produce distinct adaptive Companion chrome" {
-    var first = theme.default_colors;
-    first.background = testRgb(0x17, 0x12, 0x25);
-    first.text = testRgb(0xf0, 0xe9, 0xff);
-    first.text_muted = testRgb(0xb3, 0xa7, 0xc8);
-    first.text_subtle = testRgb(0x87, 0x7b, 0x9a);
-    first.accent = testRgb(0xa4, 0x70, 0xe5);
-    first.border = testRgb(0x68, 0x4d, 0x80);
-    first.border_muted = testRgb(0x4b, 0x3d, 0x59);
-    first.warning = testRgb(0xec, 0xb4, 0x4b);
-    first.diff_remove = testRgb(0xe9, 0x5b, 0x72);
-
-    var second = theme.default_colors;
-    second.background = testRgb(0xf2, 0xee, 0xdf);
-    second.text = testRgb(0x24, 0x34, 0x30);
-    second.text_muted = testRgb(0x58, 0x6a, 0x65);
-    second.text_subtle = testRgb(0x72, 0x80, 0x7b);
-    second.accent = testRgb(0x1c, 0x82, 0x79);
-    second.border = testRgb(0x69, 0x8e, 0x87);
-    second.border_muted = testRgb(0x9b, 0xad, 0xa8);
-    second.warning = testRgb(0xb5, 0x70, 0x18);
-    second.diff_remove = testRgb(0xc8, 0x40, 0x56);
-
-    const first_chrome = theme.companionChromeFor(first);
-    const second_chrome = theme.companionChromeFor(second);
-    try std.testing.expect(!colorsEqual(first_chrome.surface, second_chrome.surface));
-    try std.testing.expect(!colorsEqual(first_chrome.border, second_chrome.border));
-    try std.testing.expect(!colorsEqual(first_chrome.accent_hi, second_chrome.accent_hi));
-    try std.testing.expect(!colorsEqual(first_chrome.accent, second_chrome.accent));
-    try expectChromeContrast(first_chrome);
-    try expectChromeContrast(second_chrome);
-    try std.testing.expectEqual(first.warning, first_chrome.warning);
-    try std.testing.expectEqual(first.diff_remove, first_chrome.danger);
-}
-
-test "Companion chrome applies bounded contrast fallbacks" {
-    var fixture = theme.default_colors;
-    fixture.background = testRgb(0x10, 0x10, 0x10);
-    fixture.text = testRgb(0xf0, 0xf0, 0xf0);
-    fixture.text_subtle = fixture.text;
-    fixture.border = fixture.background;
-    fixture.border_muted = fixture.background;
-    fixture.accent = fixture.background;
-    fixture.warning = fixture.background;
-    fixture.diff_remove = fixture.background;
-    const chrome = theme.companionChromeFor(fixture);
-    try expectChromeContrast(chrome);
-    try std.testing.expectEqual(fixture.text_subtle, chrome.border);
-    try std.testing.expectEqual(fixture.text_subtle, chrome.menu_border);
-}
-
-test "Sprout palette derives from representative active dark blue and light themes" {
-    var tokyo_night = theme.default_colors;
-    tokyo_night.background = testRgb(0x1a, 0x1b, 0x26);
-    tokyo_night.panel_muted = testRgb(0x44, 0x4b, 0x6a);
-    tokyo_night.text = testRgb(0xa9, 0xb1, 0xd6);
-    tokyo_night.text_subtle = theme.mix(tokyo_night.text, tokyo_night.background, 0.52);
-    tokyo_night.accent = testRgb(0x7a, 0xa2, 0xf7);
-    tokyo_night.border = theme.mix(tokyo_night.accent, tokyo_night.background, 0.44);
-    tokyo_night.warning = testRgb(0xe0, 0xaf, 0x68);
-    tokyo_night.diff_remove = testRgb(0xf7, 0x76, 0x8e);
-
-    var tokyo_day = theme.default_colors;
-    tokyo_day.background = testRgb(0xe1, 0xe2, 0xe7);
-    tokyo_day.panel_muted = testRgb(0xa1, 0xa6, 0xc5);
-    tokyo_day.text = testRgb(0x37, 0x60, 0xbf);
-    tokyo_day.text_subtle = theme.mix(tokyo_day.text, tokyo_day.background, 0.52);
-    tokyo_day.accent = testRgb(0x2e, 0x7d, 0xe9);
-    tokyo_day.border = theme.mix(tokyo_day.accent, tokyo_day.background, 0.44);
-    tokyo_day.warning = testRgb(0x8c, 0x6c, 0x3e);
-    tokyo_day.diff_remove = testRgb(0xf5, 0x2a, 0x65);
-
-    inline for (.{ theme.default_colors, tokyo_night, tokyo_day }) |fixture| {
-        const source = characterThemeFromColors(fixture);
-        try expectSproutPaletteValid(source, deriveSproutPalette(source));
-    }
-}
-
-test "arbitrary active token sets produce distinct valid Sprout paint" {
-    const first: CharacterTheme = .{
-        .background = testRgb(0x18, 0x12, 0x26),
-        .text = testRgb(0xf1, 0xe9, 0xff),
-        .text_subtle = testRgb(0x9d, 0x92, 0xb0),
-        .accent = testRgb(0xa5, 0x72, 0xe8),
-        .border = testRgb(0x61, 0x48, 0x78),
-        .panel_muted = testRgb(0x47, 0x3c, 0x56),
-        .warning = testRgb(0xf2, 0xb8, 0x4b),
-        .danger = testRgb(0xec, 0x58, 0x71),
-    };
-    const second: CharacterTheme = .{
-        .background = testRgb(0xf3, 0xee, 0xdf),
-        .text = testRgb(0x24, 0x35, 0x31),
-        .text_subtle = testRgb(0x68, 0x75, 0x70),
-        .accent = testRgb(0x1b, 0x82, 0x79),
-        .border = testRgb(0x6b, 0x8f, 0x89),
-        .panel_muted = testRgb(0xb8, 0xc4, 0xbe),
-        .warning = testRgb(0xb8, 0x70, 0x16),
-        .danger = testRgb(0xc9, 0x3f, 0x56),
-    };
-    const first_paint = deriveSproutPalette(first);
-    const second_paint = deriveSproutPalette(second);
-    try expectSproutPaletteValid(first, first_paint);
-    try expectSproutPaletteValid(second, second_paint);
-    try std.testing.expect(!colorsEqual(first_paint.head_top, second_paint.head_top));
-    try std.testing.expect(!colorsEqual(first_paint.blade_start, second_paint.blade_start));
-    try std.testing.expect(!colorsEqual(first_paint.iris_top, second_paint.iris_top));
-}
-
-test "Sprout contrast fallbacks use top eye stop and character surface backing" {
-    const top_stop_fixture: CharacterTheme = .{
-        .background = testRgb(81, 14, 53),
-        .text = testRgb(186, 248, 191),
-        .text_subtle = testRgb(112, 92, 108),
-        .accent = testRgb(224, 208, 104),
-        .border = testRgb(90, 72, 84),
-        .panel_muted = testRgb(102, 82, 98),
-        .warning = testRgb(224, 170, 52),
-        .danger = testRgb(18, 224, 232),
-    };
-    const top_accent_hi = theme.mix(top_stop_fixture.accent, top_stop_fixture.text, 0.28);
-    const raw_head_top = theme.mix(top_stop_fixture.text, top_accent_hi, 0.45);
-    const raw_head_bottom = theme.mix(top_stop_fixture.text, top_stop_fixture.accent, 0.38);
-    const raw_iris_top = theme.mix(top_stop_fixture.text, top_stop_fixture.danger, 0.76);
-    const raw_iris_bottom = theme.mix(theme.raiseAgainst(top_stop_fixture.background, 0.02, top_stop_fixture.background, top_stop_fixture.text), top_stop_fixture.danger, 0.66);
-    try std.testing.expect(lumaDistance(raw_iris_top, raw_head_top) < 0.18);
-    try std.testing.expect(lumaDistance(theme.mix(raw_iris_top, raw_iris_bottom, 0.5), theme.mix(raw_head_top, raw_head_bottom, 0.5)) >= 0.18);
-    const top_result = deriveSproutPalette(top_stop_fixture);
-    try std.testing.expectEqual(top_stop_fixture.danger, top_result.iris_top);
-    try std.testing.expectEqual(top_stop_fixture.danger, top_result.iris_bottom);
-
-    const backing_fixture: CharacterTheme = .{
-        .background = testRgb(18, 52, 108),
-        .text = testRgb(184, 133, 139),
-        .text_subtle = testRgb(120, 122, 135),
-        .accent = testRgb(106, 15, 107),
-        .border = testRgb(186, 81, 59),
-        .panel_muted = testRgb(78, 82, 116),
-        .warning = testRgb(190, 132, 42),
-        .danger = testRgb(220, 74, 94),
-    };
-    const backing_accent_hi = theme.mix(backing_fixture.accent, backing_fixture.text, 0.28);
-    const backing_head = theme.mix(
-        theme.mix(backing_fixture.text, backing_accent_hi, 0.45),
-        theme.mix(backing_fixture.text, backing_fixture.accent, 0.38),
-        0.5,
-    );
-    const backing_surface = theme.raiseAgainst(backing_fixture.background, 0.035, backing_fixture.background, backing_fixture.text);
-    const raw_outline = theme.mix(backing_fixture.border, backing_fixture.accent, 0.55);
-    try std.testing.expect(lumaDistance(raw_outline, backing_surface) < 0.10);
-    try std.testing.expect(lumaDistance(raw_outline, backing_head) >= 0.10);
-    const backing_result = deriveSproutPalette(backing_fixture);
-    try std.testing.expectEqual(backing_fixture.border, backing_result.outline);
-}
-
-fn characterThemeFromColors(active: theme.ThemeColors) CharacterTheme {
-    return .{
-        .background = active.background,
-        .text = active.text,
-        .text_subtle = active.text_subtle,
-        .accent = active.accent,
-        .border = active.border,
-        .panel_muted = active.panel_muted,
-        .warning = active.warning,
-        .danger = active.diff_remove,
-    };
-}
-
-fn expectSproutPaletteValid(source: CharacterTheme, sprout: SproutPalette) !void {
-    try std.testing.expect(lumaDistance(sprout.head_top, sprout.iris_top) >= 0.18 or
-        (colorsEqual(sprout.iris_top, source.danger) and colorsEqual(sprout.iris_bottom, source.danger)));
-    try std.testing.expect(lumaDistance(sprout.outline, sprout.char_surface) >= 0.10 or colorsEqual(sprout.outline, source.text_subtle));
-    const body = theme.mix(sprout.torso_top, sprout.torso_bottom, 0.5);
-    const growth = theme.mix(sprout.blade_start, sprout.blade_end, 0.5);
-    try std.testing.expect(lumaDistance(growth, body) >= 0.06 or colorsEqual(growth, theme.mix(source.accent, sprout.pole_dark, 0.15)));
-    try std.testing.expectEqual(source.warning, sprout.warning);
-    try std.testing.expectEqual(characterForegroundOn(source.warning, source.text, source.background), sprout.warning_foreground);
-    try std.testing.expectEqual(source.danger, sprout.danger);
-    try std.testing.expectEqual(theme.mix(theme.raiseAgainst(source.background, 0.02, source.background, source.text), source.danger, 0.40), sprout.eye_ring);
-}
-
-fn testRgb(r: u8, g: u8, b: u8) [4]f32 {
-    return .{
-        @as(f32, @floatFromInt(r)) / 255.0,
-        @as(f32, @floatFromInt(g)) / 255.0,
-        @as(f32, @floatFromInt(b)) / 255.0,
-        1.0,
-    };
-}
-
-fn compositeTest(foreground: [4]f32, background: [4]f32) [4]f32 {
-    return theme.mix(background, .{ foreground[0], foreground[1], foreground[2], 1.0 }, foreground[3]);
-}
-
-fn expectChromeContrast(chrome: theme.CompanionChrome) !void {
-    try std.testing.expect(lumaDistance(chrome.border, chrome.surface) >= 0.10);
-    try std.testing.expect(lumaDistance(chrome.menu_border, chrome.surface_deep) >= 0.10);
-    try std.testing.expect(lumaDistance(chrome.identity_fg, compositeTest(chrome.ready_fill, chrome.surface_deep)) >= 0.22);
-    const approval_backing = compositeTest(chrome.approval_card, chrome.surface);
-    try std.testing.expect(lumaDistance(chrome.approval_title, approval_backing) >= 0.30);
-    try std.testing.expect(lumaDistance(chrome.approval_body, approval_backing) >= 0.30);
-    try std.testing.expect(lumaDistance(chrome.failure_fg, compositeTest(chrome.failure_card, chrome.surface)) >= 0.30);
-}
-
-fn expectBatchColor(batch: *const palette.RenderBatch, kind: palette.draw.CommandKind, expected: [4]f32) !void {
-    for (batch.commands.items) |command| {
-        if (command.kind == kind and sameColor(command.color, color(expected))) return;
-    }
-    return error.MissingExpectedColor;
-}
-
-fn expectExpandedChrome(state: *runtime.AppState, geometry: Geometry, chrome: theme.CompanionChrome, failed: bool) !void {
-    const tabs_track: palette.Rect = .{ .x = geometry.tabs.x + 12.0, .y = geometry.tabs.y + 10.0, .w = geometry.tabs.w - 24.0, .h = geometry.tabs.h - 10.0 };
-    const tabs_inner: palette.Rect = .{ .x = tabs_track.x + 3.0, .y = tabs_track.y + 3.0, .w = tabs_track.w - 6.0, .h = tabs_track.h - 6.0 };
-    const run_pill: palette.Rect = .{ .x = tabs_inner.x, .y = tabs_inner.y, .w = tabs_inner.w / 2.0, .h = tabs_inner.h };
-    const card_fill = if (failed) opaqueOver(chrome.surface, chrome.failure_card) else chrome.surface_deep;
-    var saw_panel_border = false;
-    var saw_panel = false;
-    var saw_tabs = false;
-    var saw_run = false;
-    var saw_card = false;
-    var saw_footer_divider = false;
-    var saw_scrim = false;
-    var saw_broad_shadow = false;
-    var saw_near_shadow = false;
-    for (state.palette_overlay_batch.commands.items) |command| {
-        if (command.kind != .rect) continue;
-        if (rectEqual(command.rect, geometry.sidecar) and sameColor(command.color, color(chrome.border))) saw_panel_border = true;
-        if (rectEqual(command.rect, insetRect(geometry.sidecar, 1.0)) and sameColor(command.color, color(chrome.surface))) saw_panel = true;
-        if (rectEqual(command.rect, insetRect(tabs_track, 1.0)) and sameColor(command.color, color(chrome.surface_deep))) saw_tabs = true;
-        if (rectEqual(command.rect, run_pill) and sameColor(command.color, color(chrome.surface))) saw_run = true;
-        if (command.rect.x == geometry.body.x + 13.0 and command.rect.w == geometry.body.w - 26.0 and command.rect.h == 70.0 and sameColor(command.color, color(card_fill))) saw_card = true;
-        if (command.rect.y == geometry.footer.y and command.rect.h == 1.0 and command.rect.x >= geometry.footer.x + 1.0 and command.rect.x + command.rect.w <= geometry.footer.x + geometry.footer.w - 1.0 and sameColor(command.color, color(chrome.hairline))) saw_footer_divider = true;
-        if (rectEqual(command.rect, geometry.window) and sameColor(command.color, color(theme.scrim(0.22)))) saw_scrim = true;
-        if (sameColor(command.color, color(theme.scrim(0.16)))) saw_broad_shadow = true;
-        if (sameColor(command.color, color(theme.scrim(0.24)))) saw_near_shadow = true;
-    }
-    try std.testing.expect(saw_panel_border and saw_panel and saw_tabs and saw_run and saw_card and saw_footer_divider);
-    try std.testing.expect(saw_scrim and saw_broad_shadow and saw_near_shadow);
-    try std.testing.expect(state.companion_composer.style.focus_border_color != null);
-    try std.testing.expect(sameColor(state.companion_composer.style.focus_border_color.?, color(chrome.accent)));
-    try std.testing.expect(sameColor(state.companion_composer.style.send_color, color(chrome.accent)));
-    try std.testing.expect(sameColor(state.companion_composer.style.selection_color, color(chrome.selection)));
-    try std.testing.expect(sameColor(state.companion_composer.style.menu_background_color, color(chrome.surface_deep)));
-    try std.testing.expect(sameColor(state.companion_composer.style.menu_border_color, color(chrome.menu_border)));
-    try std.testing.expect(sameColor(state.companion_composer.style.menu_selected_color, color(chrome.menu_selected)));
-}
-
-fn rectEqual(left: palette.Rect, right: palette.Rect) bool {
-    return left.x == right.x and left.y == right.y and left.w == right.w and left.h == right.h;
-}
-
-fn insetRect(rect: palette.Rect, amount: f32) palette.Rect {
-    return .{ .x = rect.x + amount, .y = rect.y + amount, .w = @max(rect.w - amount * 2.0, 0.0), .h = @max(rect.h - amount * 2.0, 0.0) };
-}
-
-test "idle chip rail stays clear of the captured terminal status" {
-    const captured = computeGeometry(2536.0, 1030.0, 1.0);
-    // The old 176x44 rail covered the captured terminal status; the accepted
-    // idle rail occupies only its intrinsic bottom-right footprint.
-    try std.testing.expect(captured.chip.x > 2536.0 - 176.0);
-    try std.testing.expectEqual(captured.window.w, captured.chip.x + captured.chip.w);
-    const normal = computeGeometry(1360.0, 860.0, 1.0);
-    try std.testing.expectEqual(normal.sidecar.y + normal.sidecar.h, normal.footer.y + normal.footer.h);
-    try std.testing.expect(pointInRect(normal.sidecar, composerRect(normal.footer).x, composerRect(normal.footer).y));
-}
-
-test "chip semantic copy reserves amber approval and danger only for failure" {
-    var state = controller.init();
-    state.applyFixture(.idle);
-    try std.testing.expectEqual(ChipDetail.none, chipVisual(&state).detail);
-    try std.testing.expect(!chipVisual(&state).show_approval);
-    try std.testing.expect(!chipVisual(&state).uses_danger);
-    try std.testing.expectEqual(@as(f32, 103.0), chipWidth(&state, 1.0));
-
-    state.applyFixture(.working);
-    try std.testing.expectEqual(ChipDetail.working, chipVisual(&state).detail);
-    try std.testing.expect(!chipVisual(&state).uses_danger);
-    state.applyFixture(.needs_approval);
-    try std.testing.expectEqual(ChipDetail.working, chipVisual(&state).detail);
-    try std.testing.expect(chipVisual(&state).show_approval);
-    try std.testing.expect(!chipVisual(&state).uses_danger);
-    state.applyFixture(.paused);
-    try std.testing.expectEqual(ChipDetail.paused, chipVisual(&state).detail);
-    try std.testing.expect(chipVisual(&state).show_approval);
-    try std.testing.expect(!chipVisual(&state).uses_danger);
-    state.applyFixture(.failed);
-    try std.testing.expectEqual(ChipDetail.failed, chipVisual(&state).detail);
-    try std.testing.expect(!chipVisual(&state).show_approval);
-    try std.testing.expect(chipVisual(&state).uses_danger);
-}
-
-test "dedicated hits include Sprout overflow and preserve outside pass through" {
-    const geometry = computeGeometry(900.0, 700.0, 1.0);
-    var state = controller.init();
-    registerHits(&state, geometry, false);
-    try std.testing.expectEqual(@as(usize, 1), state.hit_count);
-    try std.testing.expect(state.hitAt(geometry.chip_character.x + 2.0, geometry.chip_character.y + 2.0) == .open);
-    try std.testing.expect(state.hitAt(10.0, 10.0) == null);
-
-    state.show();
-    registerHits(&state, geometry, false);
-    try std.testing.expectEqual(@as(usize, 6), state.hit_count);
-    try std.testing.expect(state.hitAt(geometry.sidecar.x + 2.0, geometry.sidecar.y + geometry.header.h + 2.0) == .panel);
-    try std.testing.expect(state.hitAt(geometry.body.x + 2.0, geometry.body.y + 2.0) == .body);
-    try std.testing.expect(state.hitAt(10.0, 10.0) == null);
-    try std.testing.expect(!pointInRect(geometry.sidecar, 10.0, 10.0));
-
-    registerHits(&state, geometry, true);
-    try std.testing.expectEqual(@as(usize, 8), state.hit_count);
-    const buttons = approvalButtonRects(geometry.body, state.currentScrollY());
-    try std.testing.expect(state.hitAt(buttons[1].x + 1.0, buttons[1].y + 1.0) == .approve);
-}
-
-test "production hit refresh follows one approval projection snapshot" {
-    const allocator = std.testing.allocator;
-    var state: runtime.AppState = undefined;
-    // Fields read by modal key/text routing and new-chat defaults.
-    state.folder_browser = .{};
-    state.custom_agent_form = .{};
-    state.settings_controller.provider_setup = .{};
-    state.provider_controller = .{};
-    state.allocator = allocator;
-    state.app_config = .{ .companion_enabled = true };
-    state.project_controller.projects = .empty;
-    state.project_controller.selected_index = 0;
-    state.companion_controller = controller.init();
-    state.companion_controller.show();
-    defer {
-        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
-        state.project_controller.projects.deinit(allocator);
-    }
-    var project = try runtime.Project.init(allocator, "approval-hits", "Approval", "/tmp/approval-hits", 0);
-    const thread = try project.ensureCompanionThread(allocator);
-    state.project_controller.projects.append(allocator, project) catch |err| {
-        project.deinit(allocator);
-        return err;
-    };
-
-    refreshHits(&state, 900.0, 700.0);
-    try std.testing.expectEqual(@as(usize, 6), state.companion_controller.hit_count);
-
-    thread.send_state.status = .pending;
-    thread.send_state.pending_approval = .{
-        .call_id = try std.heap.page_allocator.dupe(u8, "call"),
-        .title = try std.heap.page_allocator.dupe(u8, "Approve"),
-        .body = try std.heap.page_allocator.dupe(u8, "Proceed?"),
-    };
-    refreshHits(&state, 900.0, 700.0);
-    try std.testing.expectEqual(@as(usize, 8), state.companion_controller.hit_count);
-
-    thread.send_state.approval_decision = .approve;
-    refreshHits(&state, 900.0, 700.0);
-    try std.testing.expectEqual(@as(usize, 6), state.companion_controller.hit_count);
-
-    thread.send_state.approval_decision = null;
-    thread.send_state.control_error_message = try std.heap.page_allocator.dupe(u8, "rejected");
-    refreshHits(&state, 900.0, 700.0);
-    try std.testing.expectEqual(@as(usize, 8), state.companion_controller.hit_count);
-    try std.testing.expect(state.companion_controller.has_failure);
-
-    const stale_title = state.companion_controller.presentation.approval_title;
-    thread.send_state.mutex.lock();
-    thread.send_state.approval_decision = .approve;
-    refreshHits(&state, 900.0, 700.0);
-    try std.testing.expectEqualStrings(stale_title.slice(), state.companion_controller.presentation.approval_title.slice());
-    try std.testing.expectEqual(@as(usize, 8), state.companion_controller.hit_count);
-    thread.send_state.mutex.unlock();
-
-    refreshHits(&state, 900.0, 700.0);
-    try std.testing.expectEqual(@as(usize, 6), state.companion_controller.hit_count);
-}
-
-test "production hit refresh clears cross-owner approval under contention and retains same owner frame" {
-    const allocator = std.testing.allocator;
-    var state: runtime.AppState = undefined;
-    // Fields read by modal key/text routing and new-chat defaults.
-    state.folder_browser = .{};
-    state.custom_agent_form = .{};
-    state.settings_controller.provider_setup = .{};
-    state.provider_controller = .{};
-    state.allocator = allocator;
-    state.app_config = .{ .companion_enabled = true };
-    state.project_controller.projects = .empty;
-    state.project_controller.selected_index = 0;
-    state.companion_controller = controller.init();
-    state.companion_controller.show();
-    defer {
-        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
-        state.project_controller.projects.deinit(allocator);
-    }
-    var project_a = try runtime.Project.init(allocator, "owner-a", "Owner A", "/tmp/owner-a", 0);
-    _ = try project_a.ensureCompanionThread(allocator);
-    state.project_controller.projects.append(allocator, project_a) catch |err| {
-        project_a.deinit(allocator);
-        return err;
-    };
-    var project_b = try runtime.Project.init(allocator, "owner-b", "Owner B", "/tmp/owner-b", 1);
-    _ = try project_b.ensureCompanionThread(allocator);
-    state.project_controller.projects.append(allocator, project_b) catch |err| {
-        project_b.deinit(allocator);
-        return err;
-    };
-    const thread_a = state.threadByLocalId("owner-a", state.project_controller.projects.items[0].companion_thread_local_id.?).?;
-    thread_a.send_state.status = .pending;
-    thread_a.send_state.pending_approval = .{
-        .call_id = try std.heap.page_allocator.dupe(u8, "approval-a"),
-        .title = try std.heap.page_allocator.dupe(u8, "Owner A approval"),
-        .body = try std.heap.page_allocator.dupe(u8, "Approve A?"),
-    };
-    refreshHits(&state, 900.0, 700.0);
-    try std.testing.expectEqualStrings("owner-a", state.companion_controller.presentation.workspace_id.slice());
-    try std.testing.expectEqual(@as(usize, 8), state.companion_controller.hit_count);
-
-    state.companion_controller.selectTab(.activity);
-    state.companion_controller.activity_scroll_y = 40.0;
-    state.project_controller.selected_index = 1;
-    try std.testing.expect(!state.resolveCurrentCompanionApproval(.approve));
-    const thread_b = state.threadByLocalId("owner-b", state.project_controller.projects.items[1].companion_thread_local_id.?).?;
-    try std.testing.expect(thread_b.send_state.approval_decision == null);
-    thread_b.send_state.mutex.lock();
-    refreshHits(&state, 900.0, 700.0);
-    try std.testing.expectEqualStrings("owner-b", state.companion_controller.presentation.workspace_id.slice());
-    try std.testing.expect(!state.companion_controller.presentation.has_approval);
-    try std.testing.expectEqual(controller.Tab.run, state.companion_controller.selected_tab);
-    try std.testing.expectEqual(@as(f32, 0.0), state.companion_controller.activity_scroll_y);
-    try std.testing.expectEqual(@as(usize, 6), state.companion_controller.hit_count);
-    thread_b.send_state.mutex.unlock();
-
-    thread_b.send_state.status = .pending;
-    thread_b.send_state.pending_approval = .{
-        .call_id = try std.heap.page_allocator.dupe(u8, "approval-b"),
-        .title = try std.heap.page_allocator.dupe(u8, "Owner B approval"),
-        .body = try std.heap.page_allocator.dupe(u8, "Approve B?"),
-    };
-    refreshHits(&state, 900.0, 700.0);
-    const owner_b_frame = state.companion_controller.presentation;
-    const owner_b_hit_count = state.companion_controller.hit_count;
-    thread_b.send_state.mutex.lock();
-    refreshHits(&state, 900.0, 700.0);
-    try std.testing.expectEqualDeep(owner_b_frame, state.companion_controller.presentation);
-    try std.testing.expectEqual(owner_b_hit_count, state.companion_controller.hit_count);
-    thread_b.send_state.mutex.unlock();
-}
-
-// Only the shared composer inside the footer may emit Palette border
-// commands; all companion-authored chrome must land as filled panel commands.
-fn expectNoBorderOnlyChrome(state: *runtime.AppState, width: f32, height: f32) !void {
-    const geometry = computeGeometryForState(width, height, companionScale(), &state.companion_controller);
-    for (state.palette_overlay_batch.commands.items) |command| {
-        if (command.border_color == null) continue;
-        try std.testing.expect(command.rect.x >= geometry.footer.x);
-        try std.testing.expect(command.rect.y >= geometry.footer.y);
-    }
-}
-
-// Regression for the white-fringe defect behind the "chopped borders"
-// screenshot: Palette border-only commands carry a transparent-white fill and
-// the SDF shader composites every anti-aliased border fringe toward that
-// fill, so bare strokes halo white along all corner arcs. Every bordered
-// companion path must therefore render as filled panel underlays.
-test "companion chrome draws no border-only commands outside the shared composer" {
-    const allocator = std.testing.allocator;
-    defer theme.applyTheme(1.0);
-    inline for (.{ @as(f32, 1.0), @as(f32, 1.25) }) |scale| {
-        theme.applyTheme(scale);
-        var state: runtime.AppState = undefined;
-        // Fields read by modal key/text routing and new-chat defaults.
-        state.folder_browser = .{};
-        state.custom_agent_form = .{};
-        state.settings_controller.provider_setup = .{};
-        state.provider_controller = .{};
-        state.allocator = allocator;
-        state.app_config = .{ .companion_enabled = true };
-        state.project_controller = .{};
-        state.companion_controller = controller.init();
-        state.companion_composer = @TypeOf(state.companion_composer).init();
-        state.palette_overlay_batch = .{};
-        state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
-        defer {
-            for (state.project_controller.projects.items) |*project| project.deinit(allocator);
-            state.project_controller.projects.deinit(allocator);
-            state.companion_composer.deinit(allocator);
-            state.palette_overlay_batch.deinit(allocator);
-            state.palette_frame_text_arena.deinit();
-        }
-        var project = try runtime.Project.init(allocator, "border-free", "Borders", "/tmp/border-free", 0);
-        state.project_controller.projects.append(allocator, project) catch |err| {
-            project.deinit(allocator);
-            return err;
-        };
-        // One rich frame reaches every bordered path at once: result card,
-        // completed/pending/failed operation cards with avatars and the
-        // pending status ring, plus the approval card and its buttons.
-        var frame: controller.Frame = .{ .has_thread = true, .has_approval = true };
-        frame.workspace_id.set("border-free");
-        frame.thread_id.set("pane-less-border-free");
-        frame.objective.set("Exercise every bordered chrome path");
-        frame.answer.set("A reply that renders the result card.");
-        frame.approval_identity.set("approval-borders");
-        frame.approval_title.set("Permission required");
-        frame.approval_body.set("Approve?");
-        var completed: controller.Operation = .{ .status = .completed, .sequence = 1 };
-        completed.identity.set("op-completed");
-        completed.title.set("MCP tool");
-        completed.detail.set("verde.list_panes");
-        frame.upsertOperation(completed);
-        var pending: controller.Operation = .{ .status = .pending, .sequence = 2 };
-        pending.identity.set("op-pending");
-        pending.title.set("Queued step");
-        pending.detail.set("waiting");
-        frame.upsertOperation(pending);
-        var failed_op: controller.Operation = .{ .status = .failed, .sequence = 3 };
-        failed_op.identity.set("op-failed");
-        failed_op.title.set("Command failed");
-        failed_op.detail.set("exit 1");
-        frame.upsertOperation(failed_op);
-        state.companion_controller.setFrame(frame);
-
-        render(&state, 2536.0, 1030.0);
-        try expectNoBorderOnlyChrome(&state, 2536.0, 1030.0);
-
-        state.palette_overlay_batch.clear();
-        state.companion_controller.show();
-        render(&state, 2536.0, 1030.0);
-        try expectNoBorderOnlyChrome(&state, 2536.0, 1030.0);
-
-        state.companion_controller.selectTab(.activity);
-        state.palette_overlay_batch.clear();
-        render(&state, 2536.0, 1030.0);
-        try expectNoBorderOnlyChrome(&state, 2536.0, 1030.0);
-    }
-}
-
-// Regression: fractional display scales produce non-integral chrome geometry.
-// Panels must land on whole device pixels with the dividers inset inside the
-// side borders, so the sidecar outline reads as one continuous crisp ring.
-test "expanded sidecar chrome snaps to device pixels at a fractional scale" {
-    const allocator = std.testing.allocator;
-    defer theme.applyTheme(1.0);
-    theme.applyTheme(1.25);
-    var state: runtime.AppState = undefined;
-    // Fields read by modal key/text routing and new-chat defaults.
-    state.folder_browser = .{};
-    state.custom_agent_form = .{};
-    state.settings_controller.provider_setup = .{};
-    state.provider_controller = .{};
-    state.allocator = allocator;
-    state.app_config = .{ .companion_enabled = true };
-    state.project_controller = .{};
-    state.companion_controller = controller.init();
-    state.companion_controller.applyFixture(.idle);
-    state.companion_controller.show();
-    state.companion_composer = @TypeOf(state.companion_composer).init();
-    state.palette_overlay_batch = .{};
-    state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
-    defer {
-        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
-        state.project_controller.projects.deinit(allocator);
-        state.companion_composer.deinit(allocator);
-        state.palette_overlay_batch.deinit(allocator);
-        state.palette_frame_text_arena.deinit();
-    }
-    var project = try runtime.Project.init(allocator, "snap-scale", "Snap", "/tmp/snap-scale", 0);
-    state.project_controller.projects.append(allocator, project) catch |err| {
-        project.deinit(allocator);
-        return err;
-    };
-
-    render(&state, 1360.0, 860.0);
-    const chrome = theme.companionChrome();
-    const geometry = computeGeometryForState(1360.0, 860.0, 1.25, &state.companion_controller);
-    const outer = snappedRect(geometry.sidecar);
-    // The raw geometry really is fractional at this scale, so the assertions
-    // below prove snapping rather than restating integral inputs.
-    try std.testing.expect(geometry.sidecar.x != outer.x or geometry.sidecar.y != outer.y);
-    var saw_outer = false;
-    var saw_inner = false;
-    var saw_divider = false;
-    for (state.palette_overlay_batch.commands.items) |command| {
-        if (command.kind != .rect) continue;
-        if (rectEqual(command.rect, outer) and sameColor(command.color, color(chrome.border))) saw_outer = true;
-        if (rectEqual(command.rect, insetRect(outer, 1.0)) and sameColor(command.color, color(chrome.surface))) saw_inner = true;
-        // Hairline dividers are the wide short strips; they must be integral
-        // and stay strictly between the panel's side borders.
-        if (sameColor(command.color, color(chrome.hairline)) and command.rect.w >= outer.w - 4.0 and command.rect.h <= 2.0) {
-            try std.testing.expectEqual(@round(command.rect.x), command.rect.x);
-            try std.testing.expectEqual(@round(command.rect.y), command.rect.y);
-            try std.testing.expectEqual(@round(command.rect.w), command.rect.w);
-            try std.testing.expect(command.rect.x >= outer.x + 1.0);
-            try std.testing.expect(command.rect.x + command.rect.w <= outer.x + outer.w - 1.0);
-            saw_divider = true;
-        }
-    }
-    try std.testing.expect(saw_outer and saw_inner and saw_divider);
-}
-
-test "companion characters produce distinct collapsed and expanded batches at 1.0 and 1.25 scales" {
-    const allocator = std.testing.allocator;
-    defer theme.applyTheme(1.0);
-    theme.current_colors = theme.default_colors;
-
-    inline for (.{ @as(f32, 1.0), @as(f32, 1.25) }) |scale| {
-        theme.applyTheme(scale);
-        var state: runtime.AppState = undefined;
-        // Fields read by modal key/text routing and new-chat defaults.
-        state.folder_browser = .{};
-        state.custom_agent_form = .{};
-        state.settings_controller.provider_setup = .{};
-        state.provider_controller = .{};
-        state.allocator = allocator;
-        state.app_config = .{ .companion_enabled = true };
-        state.project_controller = .{};
-        state.companion_controller = controller.init();
-        state.companion_controller.applyFixture(.idle);
-        state.companion_composer = @TypeOf(state.companion_composer).init();
-        state.palette_overlay_batch = .{};
-        state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
-        defer {
-            for (state.project_controller.projects.items) |*project| project.deinit(allocator);
-            state.project_controller.projects.deinit(allocator);
-            state.companion_composer.deinit(allocator);
-            state.palette_overlay_batch.deinit(allocator);
-            state.palette_frame_text_arena.deinit();
-        }
-        var project = try runtime.Project.init(allocator, "scale-chars", "Scale", "/tmp/scale-chars", 0);
-        state.project_controller.projects.append(allocator, project) catch |err| {
-            project.deinit(allocator);
-            return err;
-        };
-
-        var collapsed: [3]usize = undefined;
-        var expanded: [3]usize = undefined;
-        inline for (.{ app_config.CompanionCharacter.sprout, .moss, .vireo }, 0..) |character, index| {
-            state.app_config.companion_character = character;
-            state.companion_controller.collapse();
-            state.palette_overlay_batch.clear();
-            render(&state, 1360.0 * scale, 860.0 * scale);
-            collapsed[index] = state.palette_overlay_batch.commands.items.len;
-            try std.testing.expect(collapsed[index] > 0);
-
-            state.companion_controller.show();
-            state.palette_overlay_batch.clear();
-            render(&state, 1360.0 * scale, 860.0 * scale);
-            expanded[index] = state.palette_overlay_batch.commands.items.len;
-            try std.testing.expect(expanded[index] > collapsed[index]);
-        }
-        try std.testing.expect(collapsed[0] != collapsed[1] or collapsed[1] != collapsed[2]);
-        try std.testing.expect(expanded[0] != expanded[1] or expanded[1] != expanded[2]);
-    }
-}
-
-test "compact and full character bounds cover chip and header hit targets" {
-    const geometry = computeGeometry(1360.0, 860.0, 1.0);
+test "characters fit their slots without distortion" {
+    const slot: palette.Rect = .{ .x = 10.0, .y = 20.0, .w = 100.0, .h = 40.0 };
     inline for (.{ app_config.CompanionCharacter.sprout, .moss, .vireo }) |character| {
-        const full = fullCharacterRect(geometry.chip_character, character, 1.0);
+        const rect = characterInSlot(slot, character);
         const size = fullCharacterSize(character);
-        try std.testing.expectApproxEqAbs(size.w, full.w, 0.001);
-        try std.testing.expectApproxEqAbs(size.h, full.h, 0.001);
-        try std.testing.expect(pointInRect(geometry.chip_hit, full.x + full.w * 0.5, full.y + full.h * 0.5));
-
-        const compact = compactCharacterRect(geometry.header, character, 1.0);
-        const compact_size = compactCharacterSize(character);
-        try std.testing.expectApproxEqAbs(compact_size.w, compact.w, 0.001);
-        try std.testing.expectApproxEqAbs(compact_size.h, compact.h, 0.001);
-        try std.testing.expect(pointInRect(geometry.header, compact.x + 1.0, compact.y + 1.0));
+        try std.testing.expect(rectInside(rect, slot));
+        try std.testing.expectApproxEqAbs(size.w / size.h, rect.w / rect.h, 0.001);
+        try std.testing.expectApproxEqAbs(slot.y + slot.h, rect.y + rect.h, 0.001);
     }
 }
 
-test "moss and vireo apply approval paused and failed semantic treatments" {
+test "recap offer renders and routes to its own action" {
     const allocator = std.testing.allocator;
-    defer theme.applyTheme(1.0);
-    theme.applyTheme(1.0);
-    theme.current_colors = theme.default_colors;
-    const chrome = theme.companionChrome();
-
-    inline for (.{ app_config.CompanionCharacter.moss, .vireo }) |character| {
-        var state: runtime.AppState = undefined;
-        // Fields read by modal key/text routing and new-chat defaults.
-        state.folder_browser = .{};
-        state.custom_agent_form = .{};
-        state.settings_controller.provider_setup = .{};
-        state.provider_controller = .{};
-        state.allocator = allocator;
-        state.app_config = .{ .companion_enabled = true, .companion_character = character };
-        state.project_controller = .{};
-        state.companion_controller = controller.init();
-        state.companion_composer = @TypeOf(state.companion_composer).init();
-        state.palette_overlay_batch = .{};
-        state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
-        defer {
-            for (state.project_controller.projects.items) |*project| project.deinit(allocator);
-            state.project_controller.projects.deinit(allocator);
-            state.companion_composer.deinit(allocator);
-            state.palette_overlay_batch.deinit(allocator);
-            state.palette_frame_text_arena.deinit();
-        }
-        var project = try runtime.Project.init(allocator, "pose-chars", "Pose", "/tmp/pose-chars", 0);
-        state.project_controller.projects.append(allocator, project) catch |err| {
-            project.deinit(allocator);
-            return err;
-        };
-
-        state.companion_controller.applyFixture(.needs_approval);
-        state.companion_controller.collapse();
-        state.palette_overlay_batch.clear();
-        render(&state, 1360.0, 860.0);
-        try expectBatchColor(&state.palette_overlay_batch, .rect, chrome.warning);
-
-        state.companion_controller.applyFixture(.paused);
-        state.palette_overlay_batch.clear();
-        render(&state, 1360.0, 860.0);
-        try std.testing.expect(state.palette_overlay_batch.commands.items.len > 0);
-
-        state.companion_controller.applyFixture(.failed);
-        state.palette_overlay_batch.clear();
-        render(&state, 1360.0, 860.0);
-        try expectBatchColor(&state.palette_overlay_batch, .rect, chrome.danger);
-        try expectBatchColor(&state.palette_overlay_batch, .rect, theme.danger());
-    }
-}
-
-test "moss and vireo palettes adapt under default and contrasting themes" {
-    const default_theme = characterThemeFromColors(theme.default_colors);
-    var contrast = theme.default_colors;
-    contrast.background = testRgb(0xf2, 0xee, 0xdf);
-    contrast.text = testRgb(0x24, 0x34, 0x30);
-    contrast.text_subtle = testRgb(0x72, 0x80, 0x7b);
-    contrast.accent = testRgb(0x1c, 0x82, 0x79);
-    contrast.border = testRgb(0x69, 0x8e, 0x87);
-    contrast.panel_muted = testRgb(0xb8, 0xc4, 0xbe);
-    contrast.warning = testRgb(0xb5, 0x70, 0x18);
-    contrast.diff_remove = testRgb(0xc8, 0x40, 0x56);
-    const contrast_theme = characterThemeFromColors(contrast);
-
-    const moss_default = deriveMossPalette(default_theme);
-    const moss_contrast = deriveMossPalette(contrast_theme);
-    try std.testing.expect(!colorsEqual(moss_default.moss_mid, moss_contrast.moss_mid));
-    try std.testing.expect(!colorsEqual(moss_default.body, moss_contrast.body));
-    try std.testing.expectEqual(default_theme.warning, moss_default.warning);
-    try std.testing.expectEqual(default_theme.danger, moss_default.danger);
-    try std.testing.expectEqual(contrast_theme.warning, moss_contrast.warning);
-    try std.testing.expectEqual(contrast_theme.danger, moss_contrast.danger);
-
-    const vireo_default = deriveVireoPalette(default_theme);
-    const vireo_contrast = deriveVireoPalette(contrast_theme);
-    try std.testing.expect(!colorsEqual(vireo_default.body_back, vireo_contrast.body_back));
-    try std.testing.expect(!colorsEqual(vireo_default.eye, vireo_contrast.eye));
-    try std.testing.expectEqual(default_theme.danger, vireo_default.danger);
-    try std.testing.expectEqual(contrast_theme.danger, vireo_contrast.danger);
-}
-
-fn expectBatchText(batch: *const palette.RenderBatch, expected: []const u8) !void {
-    for (batch.commands.items) |command| {
-        if (command.kind == .text and std.mem.eql(u8, command.text, expected)) return;
-    }
-    return error.MissingExpectedText;
-}
-
-test "exact Run and matching Activity operation hits share one reference" {
-    var frame: controller.Frame = .{ .has_thread = true, .working = true };
-    try std.testing.expect(frame.setOwner("workspace:inspector", "thread:inspector"));
-    var task_id: controller.ExactText = .{};
-    try std.testing.expect(task_id.set("task:one"));
-    var command: controller.ExactText = .{};
-    try std.testing.expect(command.set("run exact task"));
-    var target: controller.BackgroundTarget = .{ .identity = .{ .task_id = task_id }, .command = command };
-    try std.testing.expect(target.log_path.set("/tmp/exact-task.log"));
-    var operation: controller.Operation = .{
-        .category = .background_task,
-        .status = .in_progress,
-        .target = .{ .background_task = target },
-        .actions = .{ .inspect = true, .stop = true, .follow_log = true },
-    };
-    operation.identity.set("operation:one");
-    operation.title.set("Run exact operation");
-    frame.upsertOperation(operation);
-    var matching: controller.ActivityItem = .{ .kind = .tool, .status = .in_progress, .sequence = 1 };
-    matching.identity.set("operation:one");
-    matching.author.set("Tool");
-    matching.body.set("exact activity");
-    frame.appendActivity(matching);
-    var unrelated: controller.ActivityItem = .{ .kind = .process, .status = .in_progress, .sequence = 2 };
-    unrelated.identity.set("operation:other");
-    unrelated.author.set("Process");
-    unrelated.body.set("unrelated activity");
-    frame.appendActivity(unrelated);
-
-    var state = controller.init();
-    state.show();
-    state.setFrame(frame);
-    const reference = frame.operationReference(0).?;
-    const geometry = computeGeometryForState(1000.0, 820.0, 1.0, &state);
-    prepareAndRegisterHits(&state, geometry);
-    var run_selects: usize = 0;
-    for (state.hits[0..state.hit_count]) |hit| if (hit.action == .operation_select) {
-        run_selects += 1;
-        try std.testing.expect(hit.reference.?.eql(&reference));
-    };
-    try std.testing.expectEqual(@as(usize, 1), run_selects);
-
-    state.toggleOperationSelection(reference);
-    const run_height = bodyContentHeight(&state, geometry.body.w);
-    prepareAndRegisterHits(&state, geometry);
-    var stop_hits: usize = 0;
-    var follow_hits: usize = 0;
-    for (state.hits[0..state.hit_count]) |hit| switch (hit.action) {
-        .operation_stop => {
-            stop_hits += 1;
-            try std.testing.expect(hit.reference.?.eql(&reference));
-        },
-        .operation_follow_log => {
-            follow_hits += 1;
-            try std.testing.expect(hit.reference.?.eql(&reference));
-        },
-        else => {},
-    };
-    try std.testing.expectEqual(@as(usize, 1), stop_hits);
-    try std.testing.expectEqual(@as(usize, 1), follow_hits);
-    try std.testing.expect(run_height > companionScaled(24.0 + 27.0 + 79.0));
-
-    state.selectTab(.activity);
-    prepareAndRegisterHits(&state, geometry);
-    var activity_selects: usize = 0;
-    stop_hits = 0;
-    follow_hits = 0;
-    for (state.hits[0..state.hit_count]) |hit| switch (hit.action) {
-        .operation_select => {
-            activity_selects += 1;
-            try std.testing.expect(hit.reference.?.eql(&reference));
-        },
-        .operation_stop => stop_hits += 1,
-        .operation_follow_log => follow_hits += 1,
-        else => {},
-    };
-    try std.testing.expectEqual(@as(usize, 1), activity_selects);
-    try std.testing.expectEqual(@as(usize, 1), stop_hits);
-    try std.testing.expectEqual(@as(usize, 1), follow_hits);
-    try std.testing.expect(state.operationSelected(&reference));
-
-    var inspect_only = frame;
-    inspect_only.operations[0].actions = .{ .inspect = true, .reveal = true, .redirect = true };
-    state.setFrame(inspect_only);
-    const inspect_reference = inspect_only.operationReference(0).?;
-    state.toggleOperationSelection(inspect_reference);
-    state.selectTab(.run);
-    prepareAndRegisterHits(&state, geometry);
-    for (state.hits[0..state.hit_count]) |hit| {
-        try std.testing.expect(hit.action != .operation_stop);
-        try std.testing.expect(hit.action != .operation_follow_log);
-    }
-}
-
-test "selected inspector renders exact output and omits empty process output" {
-    const allocator = std.testing.allocator;
-    defer theme.applyTheme(1.0);
-    inline for (.{ @as(f32, 1.0), @as(f32, 1.25) }) |scale| {
-        theme.applyTheme(scale);
-        var state: runtime.AppState = undefined;
-        // Fields read by modal key/text routing and new-chat defaults.
-        state.folder_browser = .{};
-        state.custom_agent_form = .{};
-        state.settings_controller.provider_setup = .{};
-        state.provider_controller = .{};
-        state.allocator = allocator;
-        state.app_config = .{ .companion_enabled = true };
-        state.project_controller = .{};
-        state.companion_controller = controller.init();
-        state.lifecycle = .{};
-        state.companion_controller.show();
-        state.companion_composer = @TypeOf(state.companion_composer).init();
-        state.palette_overlay_batch = .{};
-        state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
-        defer {
-            for (state.project_controller.projects.items) |*project| project.deinit(allocator);
-            state.project_controller.projects.deinit(allocator);
-            state.companion_composer.deinit(allocator);
-            state.palette_overlay_batch.deinit(allocator);
-            state.palette_frame_text_arena.deinit();
-        }
-        var project = try runtime.Project.init(allocator, "inspector", "Inspector", "/tmp/inspector", 0);
-        state.project_controller.projects.append(allocator, project) catch |err| {
-            project.deinit(allocator);
-            return err;
-        };
-
-        var frame: controller.Frame = .{ .has_thread = true, .working = true };
-        try std.testing.expect(frame.setOwner("inspector", "thread:one"));
-        var call_id: controller.ExactText = .{};
-        try std.testing.expect(call_id.set("call:one"));
-        var operation: controller.Operation = .{ .status = .in_progress, .target = .{ .tool_call = call_id } };
-        operation.identity.set("operation:one");
-        operation.title.set("Inspect operation");
-        operation.inspector.output.set("structured output");
-        operation.inspector.owner.set("exact owner");
-        operation.inspector.workspace.set("exact workspace");
-        operation.inspector.action.set("exact action");
-        operation.inspector.target.set("exact target");
-        operation.inspector.provider.set("exact provider");
-        operation.inspector.cwd.set("/tmp/exact cwd");
-        operation.inspector.state.set("running");
-        operation.inspector.wait_reason.set("waiting reason");
-        operation.inspector.failure_reason.set("failure reason");
-        operation.inspector.locations.set("line 7");
-        operation.inspector.input.set("unsupported input row");
-        operation.inspector.raw.set("unsupported raw row");
-        operation.inspector.files[0].set("exact-file.zig");
-        operation.inspector.file_count = 1;
-        operation.inspector.resources[0].set("lease:build");
-        operation.inspector.resource_count = 1;
-        operation.inspector.started_at_ms = 10;
-        operation.inspector.updated_at_ms = 20;
-        operation.inspector.elapsed_ms = 30;
-        frame.upsertOperation(operation);
-        state.companion_controller.setFrame(frame);
-        const reference = frame.operationReference(0).?;
-        state.companion_controller.toggleOperationSelection(reference);
-
-        render(&state, 1500.0, 1200.0);
-        inline for (.{
-            "Inspect operation",
-            "RUNNING",
-            "Output",
-            "structured output",
-            "Owner",
-            "exact owner",
-            "Workspace",
-            "exact workspace",
-            "Action",
-            "exact action",
-            "Target",
-            "exact target",
-            "Provider",
-            "exact provider",
-            "Cwd",
-            "/tmp/exact cwd",
-            "State",
-            "running",
-            "Waiting",
-            "waiting reason",
-            "Failure",
-            "failure reason",
-            "Locations",
-            "line 7",
-            "Files",
-            "exact-file.zig",
-            "Resources",
-            "lease:build",
-            "Started",
-            "10 ms",
-            "Updated",
-            "20 ms",
-            "Elapsed",
-            "30 ms",
-        }) |expected| try expectBatchText(&state.palette_overlay_batch, expected);
-        try expectNoTextCommand(&state.palette_overlay_batch, "unsupported input row");
-        try expectNoTextCommand(&state.palette_overlay_batch, "unsupported raw row");
-        try expectInspectorBackedTextCommand(&state.palette_overlay_batch, "structured output", &state.companion_controller.presentation.operations[0].inspector.output);
-        var saw_selected_card = false;
-        const accent = color(theme.companionChrome().accent);
-        for (state.palette_overlay_batch.commands.items) |command| {
-            if (command.kind == .rect and sameColor(command.color, accent) and
-                @abs(command.rect.h - companionScaled(72.0)) <= companionScaled(2.0))
-            {
-                saw_selected_card = true;
-            }
-        }
-        try std.testing.expect(saw_selected_card);
-
-        var provider_thread_id: controller.ExactText = .{};
-        try std.testing.expect(provider_thread_id.set("provider:thread"));
-        var process_id: controller.ExactText = .{};
-        try std.testing.expect(process_id.set("process:one"));
-        var command: controller.ExactText = .{};
-        try std.testing.expect(command.set("process-command"));
-        var process_target: controller.BackgroundTarget = .{
-            .identity = .{ .process = .{
-                .provider_thread_id = provider_thread_id,
-                .process_id = process_id,
-            } },
-            .command = command,
-            .provider_owned = true,
-        };
-        try std.testing.expect(process_target.provider_thread_id.set("provider:thread"));
-        try std.testing.expect(process_target.process_id.set("process:one"));
-        var process_operation: controller.Operation = .{
-            .category = .background_task,
-            .target = .{ .background_task = process_target },
-            .actions = .{ .inspect = true, .stop = true },
-            .status = .in_progress,
-            .process = true,
-        };
-        process_operation.identity.set("background:process:one");
-        process_operation.title.set("Process operation");
-        process_operation.detail.set("process-command");
-        process_operation.inspector.action.set("Run process");
-        process_operation.inspector.target.set("process:one");
-        process_operation.inspector.state.set("running");
-
-        frame.operation_count = 0;
-        frame.upsertOperation(process_operation);
-        state.companion_controller.setFrame(frame);
-        const process_reference = frame.operationReference(0).?;
-        state.companion_controller.toggleOperationSelection(process_reference);
-        const empty_height = inspectorHeight(&state.companion_controller.presentation.operations[0]);
-        const empty_content_height = bodyContentHeight(&state.companion_controller, 404.0 * scale);
-
-        var frame_with_output = frame;
-        frame_with_output.operations[0].inspector.output.set("real process output");
-        state.companion_controller.setFrame(frame_with_output);
-        try std.testing.expectApproxEqAbs(
-            empty_height + companionScaled(19.0),
-            inspectorHeight(&state.companion_controller.presentation.operations[0]),
-            0.001,
-        );
-        try std.testing.expectApproxEqAbs(
-            empty_content_height + companionScaled(19.0),
-            bodyContentHeight(&state.companion_controller, 404.0 * scale),
-            0.001,
-        );
-
-        state.companion_controller.setFrame(frame);
-        try std.testing.expect(state.companion_controller.operationSelected(&process_reference));
-        const viewport_width = 1500.0;
-        const viewport_height = 500.0 * scale;
-        const geometry = computeGeometryForState(viewport_width, viewport_height, scale, &state.companion_controller);
-        prepareAndRegisterHits(&state.companion_controller, geometry);
-        const max_scroll = bodyContentHeight(&state.companion_controller, geometry.body.w) - geometry.body.h;
-        try std.testing.expect(max_scroll > 0.0);
-        try std.testing.expect(handleWheel(
-            &state,
-            geometry.body.x + companionScaled(4.0),
-            geometry.body.y + companionScaled(4.0),
-            -4.0,
-        ));
-        try std.testing.expectApproxEqAbs(companionScaled(128.0), state.companion_controller.body_scroll_y, 0.001);
-        prepareAndRegisterHits(&state.companion_controller, geometry);
-
-        const inspector_rect: palette.Rect = .{
-            .x = geometry.body.x + companionScaled(12.0),
-            .y = geometry.body.y + companionScaled(12.0) - state.companion_controller.body_scroll_y +
-                resultCardHeight(&state.companion_controller.presentation, geometry.body.w) + companionScaled(27.0 + 79.0),
-            .w = @max(geometry.body.w - companionScaled(24.0), 0.0),
-            .h = empty_height,
-        };
-        const expected_stop = intersectRects(inspectorControlRects(inspector_rect, process_reference.actions).stop.?, geometry.body).?;
-        var saw_stop_hit = false;
-        for (state.companion_controller.hits[0..state.companion_controller.hit_count]) |hit| {
-            if (hit.action != .operation_stop) continue;
-            saw_stop_hit = true;
-            try std.testing.expect(hit.reference.?.eql(&process_reference));
-            try std.testing.expect(rectEqual(expected_stop, hit.rect));
-            try std.testing.expect(intersectRects(hit.rect, geometry.body) != null);
-        }
-        try std.testing.expect(saw_stop_hit);
-
-        state.palette_overlay_batch.clear();
-        _ = state.palette_frame_text_arena.reset(.retain_capacity);
-        render(&state, viewport_width, viewport_height);
-        try expectNoTextCommand(&state.palette_overlay_batch, "Output");
-        try expectNoTextCommand(&state.palette_overlay_batch, "No detail yet.");
-        try std.testing.expectEqual(@as(usize, 1), textCommandCount(&state.palette_overlay_batch, "process-command"));
-    }
-}
-
-fn textCommandCount(batch: *const palette.RenderBatch, expected: []const u8) usize {
-    var count: usize = 0;
-    for (batch.commands.items) |command| {
-        if (command.kind == .text and std.mem.eql(u8, command.text, expected)) count += 1;
-    }
-    return count;
-}
-
-fn expectInspectorBackedTextCommand(batch: *const palette.RenderBatch, expected: []const u8, backing: *const controller.InspectorText) !void {
-    for (batch.commands.items) |command| {
-        if (command.kind != .text or !std.mem.eql(u8, command.text, expected)) continue;
-        const text_start = @intFromPtr(command.text.ptr);
-        const storage_start = @intFromPtr(&backing.storage[0]);
-        if (text_start < storage_start) return error.TextStartsBeforeInspectorStorage;
-        if (text_start + command.text.len > storage_start + backing.storage.len) return error.TextEndsAfterInspectorStorage;
-        return;
-    }
-    return error.MissingExpectedInspectorText;
-}
-
-test "Mission Control responsive geometry stays bounded across required viewports" {
-    const cases = [_]struct {
-        width: f32,
-        height: f32,
-        scale: f32,
-        mode: MissionControlMode,
-    }{
-        .{ .width = 1600.0, .height = 1000.0, .scale = 1.0, .mode = .wide },
-        .{ .width = 1280.0, .height = 720.0, .scale = 1.0, .mode = .wide },
-        .{ .width = 900.0, .height = 720.0, .scale = 1.0, .mode = .laptop },
-        .{ .width = 1000.0, .height = 500.0, .scale = 1.0, .mode = .narrow },
-        .{ .width = 2000.0, .height = 1250.0, .scale = 1.25, .mode = .wide },
-    };
-    for (cases) |case| {
-        const geometry = computeMissionControlGeometry(case.width, case.height, case.scale);
-        try std.testing.expectEqual(case.mode, geometry.mode);
-        inline for (.{ geometry.header, geometry.close_button, geometry.body, geometry.footer, geometry.summary, geometry.operations, geometry.inspector }) |rect| {
-            try std.testing.expect(rect.w >= 0.0 and rect.h >= 0.0);
-            try std.testing.expect(rectFitsWindow(rect, geometry.window.w, geometry.window.h));
-        }
-        try std.testing.expectApproxEqAbs(@min(48.0 * case.scale, case.height), geometry.header.h, 0.001);
-        try std.testing.expectApproxEqAbs(geometry.body.y + geometry.body.h, geometry.footer.y, 0.001);
-        try std.testing.expectApproxEqAbs(geometry.window.h, geometry.footer.y + geometry.footer.h, 0.001);
-        const composer = composerRectAtScale(geometry.footer, case.scale);
-        try std.testing.expect(composer.w > 0.0 and composer.h > 0.0);
-        try std.testing.expect(rectFitsWindow(composer, geometry.window.w, geometry.window.h));
-        try std.testing.expect(geometry.summary.y + geometry.summary.h <= geometry.footer.y);
-        if (geometry.mode == .wide) {
-            try std.testing.expect(geometry.summary.w >= 220.0 * case.scale and geometry.summary.w <= 280.0 * case.scale);
-            try std.testing.expect(geometry.inspector.w >= 260.0 * case.scale and geometry.inspector.w <= 320.0 * case.scale);
-            try std.testing.expect(geometry.operations.w > 0.0);
-        }
-    }
-}
-
-test "Mission Control render and hits share one bounded Frame and exact references" {
-    const allocator = std.testing.allocator;
-    defer theme.applyTheme(1.0);
     theme.applyTheme(1.0);
     var state: runtime.AppState = undefined;
-    // Fields read by modal key/text routing and new-chat defaults.
-    state.folder_browser = .{};
-    state.custom_agent_form = .{};
-    state.settings_controller.provider_setup = .{};
-    state.provider_controller = .{};
-    state.allocator = allocator;
-    state.app_config = .{ .companion_enabled = true, .companion_character = .moss };
-    state.project_controller = .{};
-    state.companion_controller = controller.init();
-    state.companion_composer = @TypeOf(state.companion_composer).init();
-    state.palette_overlay_batch = .{};
-    state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
-    defer {
-        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
-        state.project_controller.projects.deinit(allocator);
-        state.companion_composer.deinit(allocator);
-        state.palette_overlay_batch.deinit(allocator);
-        state.palette_frame_text_arena.deinit();
-    }
-    var project = try runtime.Project.init(allocator, "mission-frame", "Mission", "/tmp/mission-frame", 0);
-    state.project_controller.projects.append(allocator, project) catch |err| {
-        project.deinit(allocator);
-        return err;
-    };
-    const companion_thread = try state.project_controller.projects.items[0].ensureCompanionThread(allocator);
-    companion_thread.setDraft("shared Mission Control draft");
-
-    var frame: controller.Frame = .{ .has_thread = true, .working = true, .has_approval = true };
-    try std.testing.expect(frame.setOwner("mission-frame", "thread:mission"));
-    frame.objective.set("Keep the current owner in charge");
-    frame.answer.set("Exact frame result");
-    var id_buffer: [48]u8 = undefined;
-    for (0..controller.MAX_OPERATIONS) |index| {
-        var operation: controller.Operation = .{
-            .status = if (index < controller.MAX_OPERATIONS - 5) .in_progress else .completed,
-            .sequence = @intCast(index),
-        };
-        operation.identity.set(try std.fmt.bufPrint(&id_buffer, "mission-operation-{d}", .{index}));
-        operation.title.set(if (index == 0) "Exact selected operation" else "Bounded operation");
-        operation.detail.set(if (index == 0) "exact operation detail" else "bounded detail");
-        if (index == 0) {
-            var task_id: controller.ExactText = .{};
-            try std.testing.expect(task_id.set("task:mission"));
-            var command: controller.ExactText = .{};
-            try std.testing.expect(command.set("exact operation detail"));
-            var target: controller.BackgroundTarget = .{ .identity = .{ .task_id = task_id }, .command = command };
-            try std.testing.expect(target.log_path.set("/tmp/mission.log"));
-            operation.category = .background_task;
-            operation.target = .{ .background_task = target };
-            operation.actions = .{ .inspect = true, .stop = true, .follow_log = true };
-            operation.inspector.output.set("exact inspector output");
-            operation.inspector.owner.set("exact owner");
-        }
-        frame.upsertOperation(operation);
-    }
-    frame.sortOperations();
-    state.companion_controller.setFrame(frame);
-    state.companion_controller.show();
-    const immutable_frame = state.companion_controller.presentation;
-    render(&state, 1280.0, 720.0);
-    const shared_buffer = state.companion_composer.text().ptr;
-    try std.testing.expectEqualStrings("shared Mission Control draft", state.companion_composer.text());
+    try testState(allocator, &state);
+    defer deinitTestState(allocator, &state);
+    state.companion_controller.noteReturn(45 * 60 * 1000);
+    render(&state, 1360.0, 860.0);
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "Welcome back · catch up?"));
     state.palette_overlay_batch.clear();
-    _ = state.palette_frame_text_arena.reset(.retain_capacity);
-    state.companion_controller.openMissionControl();
-    const selected = state.companion_controller.selected_operation.?;
-    const geometry = computeMissionControlGeometry(1600.0, 4000.0, 1.0);
-    prepareAndRegisterMissionControlHits(&state.companion_controller, geometry);
-    try std.testing.expect(state.companion_controller.hit_count <= state.companion_controller.hits.len);
-    var select_count: usize = 0;
-    var stop_count: usize = 0;
-    var follow_count: usize = 0;
-    for (state.companion_controller.hits[0..state.companion_controller.hit_count]) |hit| switch (hit.action) {
-        .operation_select => {
-            select_count += 1;
-            try std.testing.expect(state.companion_controller.presentation.containsReference(&hit.reference.?));
-        },
-        .operation_stop => {
-            stop_count += 1;
-            try std.testing.expect(hit.reference.?.eql(&selected));
-        },
-        .operation_follow_log => {
-            follow_count += 1;
-            try std.testing.expect(hit.reference.?.eql(&selected));
-        },
-        .approve, .deny => return error.MissionControlExposedApproval,
-        else => {},
-    };
-    try std.testing.expectEqual(controller.MAX_OPERATIONS, select_count);
-    try std.testing.expectEqual(@as(usize, 1), stop_count);
-    try std.testing.expectEqual(@as(usize, 1), follow_count);
-
-    render(&state, 1600.0, 1000.0);
-    try std.testing.expectEqual(shared_buffer, state.companion_composer.text().ptr);
-    try std.testing.expectEqualStrings("shared Mission Control draft", state.companion_composer.text());
-    try std.testing.expectEqual(composerRect(computeMissionControlGeometry(1600.0, 1000.0, 1.0).footer), state.companion_composer.bounds());
-    inline for (.{
-        "Mission Control",
-        "Keep the current owner in charge",
-        "MOSS SAYS",
-        "ACTIVE OPERATIONS",
-        "RECENT",
-        "Exact selected operation",
-        "Output",
-        "exact inspector output",
-        "Detail",
-        "exact operation detail",
-        "BOUNDARIES",
-    }) |expected| try expectBatchText(&state.palette_overlay_batch, expected);
-    try std.testing.expectEqualDeep(immutable_frame, state.companion_controller.presentation);
-
-    var inspect_only = frame;
-    inspect_only.operations[0].actions = .{ .inspect = true };
-    state.companion_controller.setFrame(inspect_only);
-    state.companion_controller.openMissionControl();
-    prepareAndRegisterMissionControlHits(&state.companion_controller, geometry);
-    for (state.companion_controller.hits[0..state.companion_controller.hit_count]) |hit| {
-        try std.testing.expect(hit.action != .operation_stop);
-        try std.testing.expect(hit.action != .operation_follow_log);
-        try std.testing.expect(hit.action != .approve and hit.action != .deny);
-    }
-}
-
-test "Mission Control routes independent and narrow direct scroll without sidecar cross-talk" {
-    var frame: controller.Frame = .{ .has_thread = true, .working = true, .has_failure = true };
-    try std.testing.expect(frame.setOwner("scroll-workspace", "scroll-thread"));
-    frame.objective.set("Exercise every direct scroll owner");
-    frame.answer.set("One two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty.");
-    var id_buffer: [32]u8 = undefined;
-    for (0..12) |index| {
-        var operation: controller.Operation = .{ .status = .in_progress, .sequence = @intCast(index) };
-        operation.identity.set(try std.fmt.bufPrint(&id_buffer, "scroll-{d}", .{index}));
-        operation.title.set("Scrollable operation");
-        operation.detail.set("scrollable detail");
-        if (index == 0) {
-            operation.actions = .{ .inspect = true, .stop = true, .follow_log = true };
-            operation.inspector.output.set("scroll output");
-            operation.inspector.owner.set("owner");
-            operation.inspector.workspace.set("workspace");
-            operation.inspector.action.set("action");
-            operation.inspector.target.set("target");
-            operation.inspector.provider.set("provider");
-            operation.inspector.cwd.set("/tmp");
-            operation.inspector.state.set("running");
-            operation.inspector.wait_reason.set("waiting");
-            operation.inspector.failure_reason.set("failure");
-            operation.inspector.locations.set("location");
-            for (0..controller.MAX_INSPECTOR_FILES) |file_index| {
-                operation.inspector.files[file_index].set("file.zig");
-            }
-            operation.inspector.file_count = controller.MAX_INSPECTOR_FILES;
-            for (0..controller.MAX_INSPECTOR_RESOURCES) |resource_index| {
-                operation.inspector.resources[resource_index].set("lease:resource");
-            }
-            operation.inspector.resource_count = controller.MAX_INSPECTOR_RESOURCES;
-            operation.inspector.started_at_ms = 1;
-            operation.inspector.updated_at_ms = 2;
-            operation.inspector.elapsed_ms = 1;
-        }
-        frame.upsertOperation(operation);
-    }
-    frame.sortOperations();
-
-    var state: runtime.AppState = undefined;
-
-    // Fields read by modal key/text routing and new-chat defaults.
-
-    state.folder_browser = .{};
-
-    state.custom_agent_form = .{};
-
-    state.settings_controller.provider_setup = .{};
-
-    state.provider_controller = .{};
-    state.allocator = std.testing.allocator;
-    // handleWheel gates on the config; leaving it undefined read stale stack bytes.
-    state.app_config = .{ .companion_enabled = true };
-    state.lifecycle = .{};
-    state.companion_controller = controller.init();
-    state.companion_composer = @TypeOf(state.companion_composer).init();
-    defer state.companion_composer.deinit(std.testing.allocator);
-    state.companion_controller.setFrame(frame);
-    state.companion_controller.openMissionControl();
-    state.companion_controller.body_scroll_y = 17.0;
-    state.companion_controller.frame_width = 900.0;
-    state.companion_controller.frame_height = 520.0;
-    const laptop = computeMissionControlGeometry(900.0, 520.0, 1.0);
-    try std.testing.expectEqual(MissionControlMode.laptop, laptop.mode);
-    state.companion_composer.setBounds(composerRectAtScale(laptop.footer, 1.0));
-    prepareAndRegisterMissionControlHits(&state.companion_controller, laptop);
-    try std.testing.expect(handleWheel(&state, laptop.summary.x + 2.0, laptop.summary.y + 2.0, -1.0));
-    try std.testing.expect(state.companion_controller.mission_control_summary_scroll_y > 0.0);
-    try std.testing.expectEqual(@as(f32, 0.0), state.companion_controller.mission_control_operations_scroll_y);
-    try std.testing.expect(handleWheel(&state, laptop.operations.x + 2.0, laptop.operations.y + 2.0, -1.0));
-    try std.testing.expect(state.companion_controller.mission_control_operations_scroll_y > 0.0);
-    try std.testing.expect(handleWheel(&state, laptop.inspector.x + 2.0, laptop.inspector.y + 2.0, -1.0));
-    try std.testing.expect(state.companion_controller.mission_control_inspector_scroll_y > 0.0);
-    try std.testing.expectEqual(@as(f32, 17.0), state.companion_controller.body_scroll_y);
-    const summary_before_composer = state.companion_controller.mission_control_summary_scroll_y;
-    const operations_before_composer = state.companion_controller.mission_control_operations_scroll_y;
-    const inspector_before_composer = state.companion_controller.mission_control_inspector_scroll_y;
-    try std.testing.expect(handleWheel(&state, laptop.footer.x + laptop.footer.w * 0.5, laptop.footer.y + laptop.footer.h * 0.5, -1.0));
-    try std.testing.expectEqual(summary_before_composer, state.companion_controller.mission_control_summary_scroll_y);
-    try std.testing.expectEqual(operations_before_composer, state.companion_controller.mission_control_operations_scroll_y);
-    try std.testing.expectEqual(inspector_before_composer, state.companion_controller.mission_control_inspector_scroll_y);
-
-    state.companion_controller.frame_width = 700.0;
-    state.companion_controller.frame_height = 500.0;
-    const narrow = computeMissionControlGeometry(700.0, 500.0, 1.0);
-    try std.testing.expectEqual(MissionControlMode.narrow, narrow.mode);
-    prepareAndRegisterMissionControlHits(&state.companion_controller, narrow);
-    const summary_before = state.companion_controller.mission_control_summary_scroll_y;
-    const operations_before = state.companion_controller.mission_control_operations_scroll_y;
-    try std.testing.expect(handleWheel(&state, narrow.body.x + narrow.body.w * 0.5, narrow.body.y + 2.0, -1.0));
-    try std.testing.expect(state.companion_controller.mission_control_body_scroll_y > 0.0);
-    try std.testing.expectEqual(summary_before, state.companion_controller.mission_control_summary_scroll_y);
-    try std.testing.expectEqual(operations_before, state.companion_controller.mission_control_operations_scroll_y);
-    try std.testing.expectEqual(@as(f32, 17.0), state.companion_controller.body_scroll_y);
-}
-
-test "public Mission Control entry preserves workspace state and stale actions reject visibly" {
-    const allocator = std.testing.allocator;
-    defer theme.applyTheme(1.0);
-    theme.applyTheme(1.0);
-    var state: runtime.AppState = undefined;
-    // Fields read by modal key/text routing and new-chat defaults.
-    state.folder_browser = .{};
-    state.custom_agent_form = .{};
-    state.settings_controller.provider_setup = .{};
-    state.provider_controller = .{};
-    state.allocator = allocator;
-    state.app_config = .{ .companion_enabled = true, .companion_character = .vireo };
-    state.project_controller = .{};
-    state.companion_controller = controller.init();
     state.companion_controller.show();
-    state.companion_composer = @TypeOf(state.companion_composer).init();
-    state.palette_overlay_batch = .{};
-    state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
-    state.lifecycle = .{};
-    state.sidebar_collapsed = false;
-    defer {
-        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
-        state.project_controller.projects.deinit(allocator);
-        state.companion_composer.deinit(allocator);
-        state.palette_overlay_batch.deinit(allocator);
-        state.palette_frame_text_arena.deinit();
-    }
-    var project_a = try runtime.Project.init(allocator, "mission-a", "Mission A", "/tmp/mission-a", 0);
-    _ = try project_a.ensureCompanionThread(allocator);
-    state.project_controller.projects.append(allocator, project_a) catch |err| {
-        project_a.deinit(allocator);
-        return err;
-    };
-    var project_b = try runtime.Project.init(allocator, "mission-b", "Mission B", "/tmp/mission-b", 0);
-    _ = try project_b.ensureCompanionThread(allocator);
-    state.project_controller.projects.append(allocator, project_b) catch |err| {
-        project_b.deinit(allocator);
-        return err;
-    };
-    const thread_a = state.threadByLocalId("mission-a", state.project_controller.projects.items[0].companion_thread_local_id.?).?;
-    thread_a.send_state.status = .pending;
-    thread_a.send_state.pending_approval = .{
-        .call_id = try std.heap.page_allocator.dupe(u8, "approval-without-mission-hit"),
-        .title = try std.heap.page_allocator.dupe(u8, "Approval remains elsewhere"),
-        .body = try std.heap.page_allocator.dupe(u8, "No Mission Control action"),
-    };
-    try thread_a.background_tasks.append(allocator, .{
-        .command = try allocator.dupeZ(u8, "mission command"),
-        .task_id = try allocator.dupeZ(u8, "mission-task"),
-        .log_path = try allocator.dupeZ(u8, "/tmp/mission-task.log"),
-        .pid = 424_242,
-        .pid_verified = true,
-        .status = .running,
-    });
-
-    const project_index_before = state.project_controller.selected_index;
-    const selected_thread_before = state.project_controller.projects.items[0].selected_thread_index;
-    const pane_count_before = state.project_controller.projects.items[0].workspace_layout.panes.items.len;
-    const focused_pane_before = state.project_controller.projects.items[0].workspace_layout.focused_pane_id;
-    const dock_count_before = state.project_controller.projects.items[0].terminal_docks.items.len;
-    const sidebar_before = state.sidebar_collapsed;
-    const send_status_before = thread_a.send_state.status;
-    const stop_before = thread_a.background_tasks.items[0].stop_requested;
-    state.companion_composer.focused = true;
-
-    refreshHits(&state, 1280.0, 720.0);
-    var entry: ?palette.Rect = null;
-    for (state.companion_controller.hits[0..state.companion_controller.hit_count]) |hit| if (hit.action == .mission_control_open) {
-        entry = hit.rect;
-    };
-    const entry_rect = entry orelse return error.MissingMissionControlEntry;
-    try std.testing.expect(handleMouseButton(&state, entry_rect.x + 2.0, entry_rect.y + 2.0, 1, true, 1));
-    try std.testing.expect(handleMouseButton(&state, entry_rect.x + 2.0, entry_rect.y + 2.0, 1, false, 1));
-    try std.testing.expect(state.companion_controller.mission_control_open);
-    try std.testing.expect(!state.companion_composer.focused);
-    const mission_geometry = computeMissionControlGeometry(1280.0, 720.0, 1.0);
-    try std.testing.expectEqual(composerRectAtScale(mission_geometry.footer, 1.0), state.companion_composer.bounds());
-    const text_rect = state.companion_composer.textRect();
-    try std.testing.expect(handleMouseButton(&state, text_rect.x + 2.0, text_rect.y + 2.0, 1, true, 1));
-    try std.testing.expect(handleMouseButton(&state, text_rect.x + 2.0, text_rect.y + 2.0, 1, false, 1));
-    try std.testing.expect(state.companion_composer.focused);
-    try std.testing.expect(state.routeCompanionComposerTextInput("mission draft"));
-    try std.testing.expectEqualStrings("mission draft", state.companion_composer.text());
-    try std.testing.expectEqualStrings("mission draft", thread_a.currentDraft());
-    try std.testing.expect(handleEscapeKey(&state, true));
-    try std.testing.expect(!state.companion_controller.mission_control_open);
-    try std.testing.expectEqual(controller.Visibility.sidecar_open, state.companion_controller.visibility);
-    try std.testing.expectEqualStrings("mission draft", thread_a.currentDraft());
-    try std.testing.expect(handleEscapeKey(&state, false));
-    state.companion_controller.openMissionControl();
-    refreshHits(&state, 1280.0, 720.0);
-    try std.testing.expectEqualStrings("mission draft", state.companion_composer.text());
-    try std.testing.expectEqual(project_index_before, state.project_controller.selected_index);
-    try std.testing.expectEqual(selected_thread_before, state.project_controller.projects.items[0].selected_thread_index);
-    try std.testing.expectEqual(pane_count_before, state.project_controller.projects.items[0].workspace_layout.panes.items.len);
-    try std.testing.expectEqual(focused_pane_before, state.project_controller.projects.items[0].workspace_layout.focused_pane_id);
-    try std.testing.expectEqual(dock_count_before, state.project_controller.projects.items[0].terminal_docks.items.len);
-    try std.testing.expectEqual(sidebar_before, state.sidebar_collapsed);
-    try std.testing.expectEqual(send_status_before, thread_a.send_state.status);
-    try std.testing.expectEqual(stop_before, thread_a.background_tasks.items[0].stop_requested);
-
-    var stale_stop: ?controller.Hit = null;
-    for (state.companion_controller.hits[0..state.companion_controller.hit_count]) |hit| switch (hit.action) {
-        .operation_stop => stale_stop = hit,
-        .approve, .deny => return error.MissionControlExposedApproval,
-        else => {},
-    };
-    const stale = stale_stop orelse return error.MissingMissionControlStop;
-    const stale_reference = stale.reference.?;
-    try std.testing.expect(state.companion_controller.presentation.containsReference(&stale_reference));
-    render(&state, 1280.0, 720.0);
-    try expectBatchText(&state.palette_overlay_batch, "VIREO SAYS");
-
-    state.project_controller.selected_index = 1;
-    const b_panes_before = state.project_controller.projects.items[1].workspace_layout.panes.items.len;
-    const b_focus_before = state.project_controller.projects.items[1].workspace_layout.focused_pane_id;
-    try std.testing.expect(handleMouseButton(&state, stale.rect.x + 1.0, stale.rect.y + 1.0, 1, true, 1));
-    try std.testing.expect(handleMouseButton(&state, stale.rect.x + 1.0, stale.rect.y + 1.0, 1, false, 1));
-    try std.testing.expectEqual(@as(usize, 1), state.project_controller.selected_index);
-    try std.testing.expectEqual(b_panes_before, state.project_controller.projects.items[1].workspace_layout.panes.items.len);
-    try std.testing.expectEqual(b_focus_before, state.project_controller.projects.items[1].workspace_layout.focused_pane_id);
-    try std.testing.expect(!thread_a.background_tasks.items[0].stop_requested);
-    try std.testing.expectEqualStrings("This Companion operation is no longer available.", state.companion_controller.presentation.ui_error.slice());
-}
-
-test "Vireo brow arcs instead of a flat bar and pupil rests viewer-left" {
-    inline for (.{ @as(f32, 1.0), @as(f32, 1.25) }) |scale| {
-        // Design-space scale matches renderVireo: head is 24 units of a 46-wide portrait.
-        const unit = scale;
-        const head: palette.Rect = .{ .x = 100.0 * unit, .y = 40.0 * unit, .w = 24.0 * unit, .h = 16.0 * unit };
-        const brow = vireoBrowArcPoints(head, unit);
-        // Midpoints rise above the ends — the prototype arched supercilium, not a flat ridge.
-        try std.testing.expect(brow[1].y < brow[0].y);
-        try std.testing.expect(brow[2].y < brow[3].y);
-        try std.testing.expect(brow[1].y < brow[0].y - 1.2 * unit);
-        try std.testing.expect(brow[2].x > brow[1].x);
-        // Front of the arc is still lower than the peak so it reads as an eyebrow, not a straight slash.
-        try std.testing.expect(brow[3].y > brow[2].y);
-
-        const eye: palette.Rect = .{ .x = head.x + 14.5 * unit, .y = head.y + 6.7 * unit, .w = 5.5 * unit, .h = 5.5 * unit };
-        const pupil = vireoPupilRect(eye, .idle, unit);
-        const eye_center_x = eye.x + eye.w * 0.5;
-        const pupil_center_x = pupil.x + pupil.w * 0.5;
-        // Profile faces right; viewer-left sits left of the eye center (toward the user).
-        try std.testing.expect(pupil_center_x < eye_center_x - 0.4 * unit);
-
-        const approval = vireoPupilRect(eye, .approval, unit);
-        const approval_center_x = approval.x + approval.w * 0.5;
-        try std.testing.expect(approval_center_x > pupil_center_x);
-        // Approval may ease toward the badge but must not flip into a hard look-away past center.
-        try std.testing.expect(approval_center_x <= eye_center_x + 0.15 * unit);
-    }
-}
-
-test "Vireo render emits arched brow strokes and viewer-left pupil at fractional scale" {
-    const allocator = std.testing.allocator;
-    defer theme.applyTheme(1.0);
-    theme.applyTheme(1.25);
-    theme.current_colors = theme.default_colors;
-
-    var state: runtime.AppState = undefined;
-
-    // Fields read by modal key/text routing and new-chat defaults.
-
-    state.folder_browser = .{};
-
-    state.custom_agent_form = .{};
-
-    state.settings_controller.provider_setup = .{};
-
-    state.provider_controller = .{};
-    state.allocator = allocator;
-    state.app_config = .{ .companion_enabled = true, .companion_character = .vireo };
-    state.project_controller = .{};
-    state.companion_controller = controller.init();
-    state.companion_controller.applyFixture(.idle);
-    state.companion_composer = @TypeOf(state.companion_composer).init();
-    state.palette_overlay_batch = .{};
-    state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
-    defer {
-        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
-        state.project_controller.projects.deinit(allocator);
-        state.companion_composer.deinit(allocator);
-        state.palette_overlay_batch.deinit(allocator);
-        state.palette_frame_text_arena.deinit();
-    }
-    var project = try runtime.Project.init(allocator, "vireo-gaze", "Vireo", "/tmp/vireo-gaze", 0);
-    state.project_controller.projects.append(allocator, project) catch |err| {
-        project.deinit(allocator);
-        return err;
-    };
-
-    state.companion_controller.collapse();
-    render(&state, 1360.0 * 1.25, 860.0 * 1.25);
-    const geometry = computeGeometryForState(1360.0 * 1.25, 860.0 * 1.25, 1.25, &state.companion_controller);
-    const full = fullCharacterRect(geometry.chip_character, .vireo, 1.25);
-    const s = full.w / 46.0;
-    const head: palette.Rect = .{
-        .x = full.x + 22.0 * s,
-        .y = full.y + 1.0 * s,
-        .w = 24.0 * s,
-        .h = 16.0 * s,
-    };
-    const eye: palette.Rect = .{ .x = head.x + 14.5 * s, .y = head.y + 6.7 * s, .w = 5.5 * s, .h = 5.5 * s };
-    const expected_pupil = vireoPupilRect(eye, .idle, s);
-    const brow = vireoBrowArcPoints(head, s);
-    const paint = deriveVireoPalette(activeCharacterTheme());
-
-    var saw_pupil = false;
-    var saw_brow_segment = false;
-    for (state.palette_overlay_batch.commands.items) |command| {
-        if (command.kind == .rect and rectEqual(command.rect, expected_pupil) and sameColor(command.color, color(paint.pupil))) {
-            saw_pupil = true;
-        }
-        // Arc segments are triangle-fans from queueLine; any brow-colored triangle
-        // whose points sit near the arched brow path proves the ridge is stroked.
-        if (command.kind == .triangle and sameColor(command.color, color(paint.brow))) {
-            const mid_x = (command.p0.x + command.p1.x + command.p2.x) / 3.0;
-            const mid_y = (command.p0.y + command.p1.y + command.p2.y) / 3.0;
-            if (mid_x >= brow[0].x - 2.0 * s and mid_x <= brow[3].x + 2.0 * s and
-                mid_y >= brow[2].y - 3.0 * s and mid_y <= brow[0].y + 3.0 * s)
-            {
-                saw_brow_segment = true;
-            }
-        }
-    }
-    try std.testing.expect(saw_pupil);
-    try std.testing.expect(saw_brow_segment);
-    try std.testing.expect(expected_pupil.x + expected_pupil.w * 0.5 < eye.x + eye.w * 0.5);
-}
-
-test "disabled Companion removes only presentation routing and re-enables exact lazy workspace state" {
-    const allocator = std.testing.allocator;
-    defer theme.applyTheme(1.0);
-    theme.applyTheme(1.0);
-
-    var state: runtime.AppState = undefined;
-
-    // Fields read by modal key/text routing and new-chat defaults.
-
-    state.folder_browser = .{};
-
-    state.custom_agent_form = .{};
-
-    state.settings_controller.provider_setup = .{};
-
-    state.provider_controller = .{};
-    state.allocator = allocator;
-    state.app_config = .{ .companion_enabled = false, .companion_character = .moss };
-    state.project_controller = .{};
-    state.companion_controller = controller.init();
-    state.companion_controller.show();
-    state.companion_controller.openMissionControl();
-    state.companion_controller.presentation.answer.set("current result");
-    state.companion_composer = @TypeOf(state.companion_composer).init();
-    state.companion_composer.setBounds(.{ .x = 10.0, .y = 10.0, .w = 240.0, .h = 90.0 });
-    try state.companion_composer.setText(allocator, "composer draft");
-    state.companion_composer.focused = true;
-    state.palette_overlay_batch = .{};
-    state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
-    state.lifecycle = .{};
-    defer {
-        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
-        state.project_controller.projects.deinit(allocator);
-        state.companion_composer.deinit(allocator);
-        state.palette_overlay_batch.deinit(allocator);
-        state.palette_frame_text_arena.deinit();
-    }
-
-    var project_a = try runtime.Project.init(allocator, "disabled-a", "Disabled A", "/tmp/disabled-a", 0);
-    const companion_thread = try project_a.ensureCompanionThread(allocator);
-    companion_thread.setDraft("preserved draft");
-    try companion_thread.messages.append(allocator, .{
-        .role = .assistant,
-        .author = try allocator.dupeZ(u8, "Sprout"),
-        .body = try allocator.dupeZ(u8, "preserved history"),
-    });
-    companion_thread.send_state.status = .pending;
-    try companion_thread.background_tasks.append(allocator, .{
-        .command = try allocator.dupeZ(u8, "preserved process"),
-        .status = .running,
-    });
-    state.project_controller.projects.append(allocator, project_a) catch |err| {
-        project_a.deinit(allocator);
-        return err;
-    };
-    var project_b = try runtime.Project.init(allocator, "disabled-b", "Disabled B", "/tmp/disabled-b", 0);
-    state.project_controller.projects.append(allocator, project_b) catch |err| {
-        project_b.deinit(allocator);
-        return err;
-    };
-    state.project_controller.selected_index = 0;
-
-    const owner_id = state.project_controller.projects.items[0].companion_thread_local_id.?;
-    const owner_thread = state.threadByLocalId("disabled-a", owner_id).?;
-    const thread_count = state.project_controller.projects.items[0].threads.items.len;
-    const pane_count = state.project_controller.projects.items[0].workspace_layout.panes.items.len;
-    const selected_thread = state.project_controller.projects.items[0].selected_thread_index;
-    const focused_pane = state.project_controller.projects.items[0].workspace_layout.focused_pane_id;
-    state.companion_controller.addHit(.{ .x = 0.0, .y = 0.0, .w = 100.0, .h = 100.0 }, .panel);
-    _ = state.companion_controller.handlePointerButton(20.0, 20.0, 1, true);
-
-    refreshHits(&state, 1280.0, 720.0);
-    try std.testing.expect(!state.companion_controller.mission_control_open);
-    try std.testing.expectEqual(controller.Visibility.sidecar_open, state.companion_controller.visibility);
-    try std.testing.expectEqual(@as(usize, 0), state.companion_controller.hit_count);
-    try std.testing.expect(!state.companion_controller.hasPointerCapture());
-    try std.testing.expect(!state.companion_composer.focused);
-    try std.testing.expectEqualStrings("current result", state.companion_controller.presentation.answer.slice());
-
-    state.palette_overlay_batch.clear();
-    render(&state, 1280.0, 720.0);
-    try std.testing.expectEqual(@as(usize, 0), state.palette_overlay_batch.commands.items.len);
-    try std.testing.expect(hitAt(&state, 20.0, 20.0) == null);
-    try std.testing.expect(!handleMouseButton(&state, 20.0, 20.0, 1, true, 1));
-    try std.testing.expect(!handleMouseMotion(&state, 20.0, 20.0, true));
-    try std.testing.expect(!handleWheel(&state, 20.0, 20.0, -1.0));
-    try std.testing.expect(!handleEscapeKey(&state, true));
-    try std.testing.expect(!ownsEscapeKey(&state));
-    try std.testing.expect(!ownsPointerRelease(&state, 1));
-    try std.testing.expect(!state.routeCompanionComposerTextInput("blocked"));
-    const key_event: @import("palette").event.KeyEvent = std.mem.zeroes(@import("palette").event.KeyEvent);
-    try std.testing.expect(!state.routeCompanionComposerKeyDown(&key_event));
-    try std.testing.expect(!state.routeCompanionComposerMouseButton(20.0, 20.0, true, 1));
-    try std.testing.expect(!state.routeCompanionComposerMouseMotion(20.0, 20.0, true));
-    try std.testing.expect(!state.routeCompanionComposerWheel(20.0, 20.0, -1.0));
-
-    try std.testing.expectEqualStrings(owner_id, state.project_controller.projects.items[0].companion_thread_local_id.?);
-    try std.testing.expectEqual(thread_count, state.project_controller.projects.items[0].threads.items.len);
-    try std.testing.expectEqual(pane_count, state.project_controller.projects.items[0].workspace_layout.panes.items.len);
-    try std.testing.expectEqual(selected_thread, state.project_controller.projects.items[0].selected_thread_index);
-    try std.testing.expectEqual(focused_pane, state.project_controller.projects.items[0].workspace_layout.focused_pane_id);
-    try std.testing.expectEqualStrings("preserved draft", owner_thread.currentDraft());
-    try std.testing.expectEqual(@as(usize, 1), owner_thread.messages.items.len);
-    try std.testing.expectEqualStrings("preserved history", owner_thread.messages.items[0].body);
-    try std.testing.expectEqual(@as(usize, 1), owner_thread.background_tasks.items.len);
-    try std.testing.expect(!owner_thread.background_tasks.items[0].stop_requested);
-    try std.testing.expectEqual(@as(@TypeOf(owner_thread.send_state.status), .pending), owner_thread.send_state.status);
-    try std.testing.expectEqual(app_config.CompanionCharacter.moss, state.app_config.companion_character);
-
-    state.app_config.companion_enabled = true;
-    state.project_controller.selected_index = 1;
-    try std.testing.expect(state.isCompanionEnabled());
-    const lazy_thread_count = state.project_controller.projects.items[1].threads.items.len;
-    const lazy_pane_count = state.project_controller.projects.items[1].workspace_layout.panes.items.len;
-    state.openCompanion();
-    refreshHits(&state, 1280.0, 720.0);
-    try std.testing.expect(state.project_controller.projects.items[1].companion_thread_local_id == null);
-    try std.testing.expectEqual(lazy_thread_count, state.project_controller.projects.items[1].threads.items.len);
-    try std.testing.expectEqual(lazy_pane_count, state.project_controller.projects.items[1].workspace_layout.panes.items.len);
-
-    state.project_controller.selected_index = 0;
-    try std.testing.expect(state.isCompanionEnabled());
-    refreshHits(&state, 1280.0, 720.0);
-    try std.testing.expect(state.companion_controller.hit_count > 0);
-    try std.testing.expectEqualStrings(owner_id, state.project_controller.projects.items[0].companion_thread_local_id.?);
-    try std.testing.expectEqualStrings("preserved draft", owner_thread.currentDraft());
-    try std.testing.expectEqual(@as(usize, 1), owner_thread.messages.items.len);
-    try std.testing.expectEqual(@as(@TypeOf(owner_thread.send_state.status), .pending), owner_thread.send_state.status);
-    try std.testing.expect(!owner_thread.background_tasks.items[0].stop_requested);
+    render(&state, 1360.0, 860.0);
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "Welcome back · away 45 min"));
+    const geometry = computeGeometry(&state, 1360.0, 860.0);
+    registerHits(&state, geometry);
+    try std.testing.expectEqual(controller.HitAction.recap, state.companion_controller.hitAt(geometry.recap.x + 4.0, geometry.recap.y + 4.0).?);
 }

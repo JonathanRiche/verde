@@ -50,6 +50,10 @@ test {
     _ = @import("ui/font_faces.zig");
     _ = @import("ui/fuzzy_match.zig");
     _ = @import("ui/companion.zig");
+    _ = @import("state/companion_controller.zig");
+    _ = @import("state/companion_roster.zig");
+    _ = @import("state/companion_persona.zig");
+    _ = @import("state/companion_sync.zig");
     _ = @import("ui/diff_view_cache.zig");
     _ = @import("ui/diff_render.zig");
     _ = @import("ui/side_panel_changes.zig");

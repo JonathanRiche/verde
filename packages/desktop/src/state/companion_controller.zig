@@ -1,7 +1,10 @@
-//! Bounded presentation state for the pane-less Companion thread.
+//! Bounded presentation state for the machine-wide Companion overlay: the
+//! avatar dock, the orchestration panel (needs-you inbox, crew, and the
+//! conversation), and the companion/brain menus.
 
 const std = @import("std");
 const palette = @import("palette");
+const app_config = @import("../app/config.zig");
 
 const Self = @This();
 
@@ -40,34 +43,47 @@ pub const VisualState = struct {
 pub const HitAction = enum {
     open,
     collapse,
-    mission_control_open,
-    mission_control_close,
     panel,
     body,
-    run_tab,
-    activity_tab,
     approve,
     deny,
-    operation_select,
-    operation_stop,
-    operation_follow_log,
+    switch_prev,
+    switch_next,
+    companion_menu,
+    brain_menu,
+    menu_dismiss,
+    menu_select_companion,
+    menu_new_companion,
+    menu_rename,
+    menu_orders,
+    menu_remove,
+    menu_character,
+    brain_provider,
+    brain_model,
+    crew_open,
+    inbox_open,
+    suggestion,
+    recap,
 };
 
 pub const Hit = struct {
     rect: palette.Rect,
     action: HitAction,
-    reference: ?OperationReference = null,
+    /// Row index for list actions (companion, provider, model, crew, inbox,
+    /// suggestion, character tag); zero otherwise.
+    index: usize = 0,
 };
 
 pub const PointerButtonResult = struct {
     consumed: bool = false,
     action: ?HitAction = null,
-    reference: ?OperationReference = null,
+    index: usize = 0,
 };
 
 const PRESENTATION_TEXT_CAPACITY = 512;
+const BODY_TEXT_CAPACITY = 2048;
 const INSPECTOR_TEXT_CAPACITY = 160;
-pub const MAX_OPERATIONS: usize = 32;
+pub const MAX_OPERATIONS: usize = 12;
 pub const MAX_ACTIVITY: usize = 64;
 pub const MAX_INSPECTOR_FILES: usize = 4;
 pub const MAX_INSPECTOR_RESOURCES: usize = 4;
@@ -133,6 +149,23 @@ pub const PresentationText = struct {
             remaining /= 10;
         }
         std.debug.assert(remaining == 0);
+    }
+};
+
+/// Conversation-sized presentation text. Companion replies are read in the
+/// panel, so they keep far more than a one-line summary.
+pub const BodyText = struct {
+    storage: [BODY_TEXT_CAPACITY:0]u8 = std.mem.zeroes([BODY_TEXT_CAPACITY:0]u8),
+
+    pub fn set(self: *BodyText, value: []const u8) void {
+        var len = @min(value.len, self.storage.len - 1);
+        while (len > 0 and len < value.len and (value[len] & 0xC0) == 0x80) len -= 1;
+        @memcpy(self.storage[0..len], value[0..len]);
+        self.storage[len] = 0;
+    }
+
+    pub fn slice(self: *const BodyText) []const u8 {
+        return std.mem.sliceTo(self.storage[0..], 0);
     }
 };
 
@@ -337,7 +370,7 @@ pub const ActivityKind = enum {
 pub const ActivityItem = struct {
     identity: PresentationText = .{},
     author: PresentationText = .{},
-    body: PresentationText = .{},
+    body: BodyText = .{},
     kind: ActivityKind = .system,
     status: ?OperationStatus = null,
     sequence: i64 = 0,
@@ -507,40 +540,128 @@ pub const Frame = struct {
 
 pub const Presentation = Frame;
 
-pub const Tab = enum { run, activity };
+pub const Menu = enum { none, companions, brain };
 
-pub const MissionControlScrollRegion = enum {
-    summary,
-    operations,
-    inspector,
-    body,
+pub const MAX_CREW: usize = 8;
+pub const MAX_INBOX: usize = 8;
+pub const MAX_ROSTER_ROWS: usize = 8;
+pub const MAX_BRAIN_PROVIDERS: usize = 8;
+
+pub const ShortText = struct {
+    storage: [160:0]u8 = std.mem.zeroes([160:0]u8),
+
+    pub fn set(self: *ShortText, value: []const u8) void {
+        var len = @min(value.len, self.storage.len - 1);
+        while (len > 0 and len < value.len and (value[len] & 0xC0) == 0x80) len -= 1;
+        @memcpy(self.storage[0..len], value[0..len]);
+        self.storage[len] = 0;
+    }
+
+    pub fn slice(self: *const ShortText) []const u8 {
+        return std.mem.sliceTo(self.storage[0..], 0);
+    }
+};
+
+/// Which way a crew or inbox row is leaning; drives its accent and sort.
+pub const Attention = enum {
+    approval,
+    blocked,
+    failed,
+    running,
+    done,
+    idle,
+
+    pub fn rank(self: Attention) u8 {
+        return switch (self) {
+            .approval, .blocked => 0,
+            .failed => 1,
+            .running => 2,
+            .done => 3,
+            .idle => 4,
+        };
+    }
+
+    pub fn label(self: Attention) []const u8 {
+        return switch (self) {
+            .approval => "Needs approval",
+            .blocked => "Needs input",
+            .failed => "Failed",
+            .running => "Running",
+            .done => "Done",
+            .idle => "Idle",
+        };
+    }
+};
+
+/// One chat the companion delegated to (a daemon-linked child) or one chat
+/// anywhere on the machine that needs the user. Routing identity is exact so a
+/// click can never open the wrong thread.
+pub const ChatRow = struct {
+    workspace_id: ExactText = .{},
+    thread_id: ExactText = .{},
+    title: ShortText = .{},
+    detail: ShortText = .{},
+    provider: ShortText = .{},
+    attention: Attention = .idle,
+};
+
+/// The active companion's identity as the panel and dock present it.
+pub const Identity = struct {
+    name: ShortText = .{},
+    /// First line of the standing orders, for the menu subtitle.
+    orders: ShortText = .{},
+    character: app_config.CompanionCharacter = .sprout,
+    brain: ShortText = .{},
+    index: usize = 0,
+    count: usize = 0,
+};
+
+pub const RosterRow = struct {
+    name: ShortText = .{},
+    character: app_config.CompanionCharacter = .sprout,
+    active: bool = false,
+};
+
+pub const BrainProvider = struct {
+    label: ShortText = .{},
+    selected: bool = false,
 };
 
 visibility: Visibility = .collapsed_chip,
-run_phase: RunPhase = .working,
-needs_approval: bool = true,
+run_phase: RunPhase = .idle,
+needs_approval: bool = false,
 has_failure: bool = false,
-status_text: []const u8 = "Approval needed",
-operation_count: usize = 3,
-approval_count: usize = 1,
 ui_error: ?[]const u8 = null,
 presentation: Presentation = .{},
-selected_operation: ?OperationReference = null,
-selected_tab: Tab = .run,
-mission_control_open: bool = false,
+identity: Identity = .{},
+crew: [MAX_CREW]ChatRow = [_]ChatRow{.{}} ** MAX_CREW,
+crew_count: usize = 0,
+inbox: [MAX_INBOX]ChatRow = [_]ChatRow{.{}} ** MAX_INBOX,
+inbox_count: usize = 0,
+roster_rows: [MAX_ROSTER_ROWS]RosterRow = [_]RosterRow{.{}} ** MAX_ROSTER_ROWS,
+roster_row_count: usize = 0,
+brain_providers: [MAX_BRAIN_PROVIDERS]BrainProvider = [_]BrainProvider{.{}} ** MAX_BRAIN_PROVIDERS,
+brain_provider_count: usize = 0,
+/// Provider tab the brain menu is browsing (index into `brain_providers`).
+brain_provider_index: usize = 0,
+brain_scroll_y: f32 = 0.0,
+brain_max_scroll: f32 = 0.0,
+menu: Menu = .none,
+/// While set, the composer edits the companion's name instead of sending.
+rename_mode: bool = false,
+/// While set, the composer edits the companion's standing orders.
+orders_mode: bool = false,
+/// Set when the user comes back after a while; offers a "catch me up".
+recap_available: bool = false,
+recap_minutes: u32 = 0,
 frame_width: f32 = 0.0,
 frame_height: f32 = 0.0,
-hits: [80]Hit = undefined,
+hits: [160]Hit = undefined,
 hit_count: usize = 0,
-body_scroll_y: f32 = 0.0,
-activity_scroll_y: f32 = 0.0,
-activity_max_scroll: f32 = 0.0,
-activity_content_count: usize = 0,
-activity_follow_tail: bool = true,
-mission_control_summary_scroll_y: f32 = 0.0,
-mission_control_operations_scroll_y: f32 = 0.0,
-mission_control_inspector_scroll_y: f32 = 0.0,
-mission_control_body_scroll_y: f32 = 0.0,
+conversation_scroll_y: f32 = 0.0,
+conversation_max_scroll: f32 = 0.0,
+conversation_follow_tail: bool = true,
+conversation_content_count: usize = 0,
 pointer_captured_buttons: [256]bool = [_]bool{false} ** 256,
 escape_key_captured: bool = false,
 
@@ -560,21 +681,23 @@ pub fn show(self: *Self) void {
 }
 
 pub fn collapse(self: *Self) void {
-    self.mission_control_open = false;
+    self.menu = .none;
+    self.rename_mode = false;
+    self.orders_mode = false;
     self.visibility = .collapsed_chip;
 }
 
-pub fn openMissionControl(self: *Self) void {
-    self.visibility = .sidecar_open;
-    self.mission_control_open = true;
-    if (self.selected_operation == null) self.selectMissionControlDefault();
+pub fn openMenu(self: *Self, menu: Menu) void {
+    self.menu = if (self.menu == menu) .none else menu;
+    if (self.menu == .brain) self.brain_scroll_y = 0.0;
 }
 
-pub fn closeMissionControl(self: *Self) void {
-    self.mission_control_open = false;
-    self.visibility = .sidecar_open;
+pub fn closeMenu(self: *Self) void {
+    self.menu = .none;
 }
 
+/// Escape peels one layer: menu, then rename, then the panel itself. The
+/// whole physical key press (down, repeats, up) stays Companion-owned.
 pub fn handleEscapeKey(self: *Self, down: bool) bool {
     if (!down) {
         if (!self.escape_key_captured) return false;
@@ -582,14 +705,16 @@ pub fn handleEscapeKey(self: *Self, down: bool) bool {
         return true;
     }
     if (self.escape_key_captured) return true;
-    if (self.mission_control_open) {
-        self.escape_key_captured = true;
-        self.closeMissionControl();
-        return true;
-    }
     if (self.visibility != .sidecar_open) return false;
     self.escape_key_captured = true;
-    self.collapse();
+    if (self.menu != .none) {
+        self.menu = .none;
+    } else if (self.rename_mode or self.orders_mode) {
+        self.rename_mode = false;
+        self.orders_mode = false;
+    } else {
+        self.collapse();
+    }
     return true;
 }
 
@@ -612,7 +737,7 @@ pub fn handlePointerButton(self: *Self, x: f32, y: f32, button: u8, down: bool) 
     return .{
         .consumed = true,
         .action = if (button == 1) hit.action else null,
-        .reference = if (button == 1) hit.reference else null,
+        .index = if (button == 1) hit.index else 0,
     };
 }
 
@@ -634,6 +759,8 @@ pub fn resetInputCaptures(self: *Self) void {
     self.escape_key_captured = false;
 }
 
+/// Character pose from real state only: approval outranks work, and nothing
+/// animates as busy unless a turn or delegated chat is actually running.
 pub fn visualState(self: *const Self) VisualState {
     const pose: Pose = if (self.run_phase == .paused)
         .paused
@@ -651,157 +778,135 @@ pub fn visualState(self: *const Self) VisualState {
     };
 }
 
-pub fn applyFixture(self: *Self, fixture: FixtureState) void {
-    switch (fixture) {
-        .idle => self.setSemantic(.idle, false, false, "Ready", 0, 0),
-        .working => self.setSemantic(.working, false, false, "Working", 3, 0),
-        .needs_approval => self.setSemantic(.working, true, false, "Approval needed", 3, 1),
-        .paused => self.setSemantic(.paused, true, false, "Paused", 3, 1),
-        .failed => self.setSemantic(.idle, false, true, "Needs attention", 3, 0),
-    }
-}
-
-pub fn applyActivity(self: *Self, activity: enum { idle, working, waiting, failed }) void {
-    switch (activity) {
-        .idle => self.setSemantic(.idle, false, false, "Ready", 0, 0),
-        .working => self.setSemantic(.working, false, false, "Working", 1, 0),
-        .waiting => self.setSemantic(.working, true, false, "Approval needed", 1, 1),
-        .failed => self.setSemantic(.idle, false, true, "Needs attention", 0, 0),
-    }
-}
-
-pub fn applyProjection(self: *Self, phase: RunPhase, needs_approval: bool, has_failure: bool) void {
-    self.setSemantic(
-        phase,
-        needs_approval,
-        has_failure,
-        if (has_failure) "Needs attention" else if (needs_approval) "Approval needed" else if (phase == .working) "Working" else "Ready",
-        if (phase == .idle) 0 else 1,
-        if (needs_approval) 1 else 0,
-    );
-}
-
 pub fn setFrame(self: *Self, frame: Frame) void {
-    const exact_owner_changed = self.presentation.owner.valid != frame.owner.valid or
-        (self.presentation.owner.valid and !self.presentation.owner.eql(&frame.owner));
-    const identity_changed = exact_owner_changed or
+    const identity_changed = self.presentation.owner.valid != frame.owner.valid or
+        (self.presentation.owner.valid and !self.presentation.owner.eql(&frame.owner)) or
         !std.mem.eql(u8, self.presentation.workspace_id.slice(), frame.workspace_id.slice()) or
         !std.mem.eql(u8, self.presentation.thread_id.slice(), frame.thread_id.slice());
     if (identity_changed) {
-        self.selected_tab = .run;
-        self.body_scroll_y = 0.0;
-        self.activity_scroll_y = 0.0;
-        self.activity_max_scroll = 0.0;
-        self.activity_content_count = 0;
-        self.activity_follow_tail = true;
-        self.selected_operation = null;
-        self.resetMissionControlScroll();
+        self.conversation_scroll_y = 0.0;
+        self.conversation_max_scroll = 0.0;
+        self.conversation_follow_tail = true;
+        self.conversation_content_count = 0;
     }
     self.presentation = frame;
-    if (self.selected_operation) |*reference| {
-        if (!self.presentation.containsReference(reference)) {
-            self.selected_operation = null;
-            self.mission_control_inspector_scroll_y = 0.0;
-        }
-    }
-    self.applyProjection(
-        if (frame.working) .working else .idle,
-        frame.has_approval,
-        frame.has_failure,
-    );
-    self.operation_count = frame.activeCounts().working + frame.activeCounts().pending;
+    self.refreshPosture();
 }
 
-pub fn selectTab(self: *Self, tab: Tab) void {
-    self.selected_tab = tab;
-}
-
-pub fn toggleOperationSelection(self: *Self, reference: OperationReference) void {
-    if (!reference.actions.inspect or !self.presentation.containsReference(&reference)) return;
-    if (self.selected_operation) |*selected| {
-        if (selected.eql(&reference)) {
-            self.selected_operation = null;
-            self.mission_control_inspector_scroll_y = 0.0;
-            return;
-        }
-    }
-    self.selected_operation = reference;
-    self.mission_control_inspector_scroll_y = 0.0;
-}
-
-pub fn selectedOperation(self: *const Self) ?*const Operation {
-    if (self.selected_operation) |*reference| return self.presentation.operationForReference(reference);
-    return null;
-}
-
-pub fn operationSelected(self: *const Self, reference: *const OperationReference) bool {
-    if (self.selected_operation) |*selected| {
-        return selected.eql(reference) and self.presentation.containsReference(selected);
-    }
-    return false;
-}
-
-pub fn currentScrollY(self: *const Self) f32 {
-    return if (self.selected_tab == .activity) self.activity_scroll_y else self.body_scroll_y;
-}
-
-pub fn scrollCurrent(self: *Self, delta: f32, max_scroll: f32) void {
-    if (self.selected_tab == .activity) {
-        self.activity_scroll_y = std.math.clamp(self.activity_scroll_y + delta, 0.0, max_scroll);
-        self.activity_max_scroll = max_scroll;
-        self.activity_follow_tail = max_scroll - self.activity_scroll_y <= 2.0;
-    } else {
-        self.body_scroll_y = std.math.clamp(self.body_scroll_y + delta, 0.0, max_scroll);
-    }
-}
-
-pub fn updateActivityExtent(self: *Self, max_scroll: f32) void {
-    const grew = self.presentation.activity_count > self.activity_content_count;
-    const was_at_tail = self.activity_follow_tail or self.activity_max_scroll - self.activity_scroll_y <= 2.0;
-    if (grew and was_at_tail) {
-        self.activity_scroll_y = max_scroll;
-    } else {
-        self.activity_scroll_y = std.math.clamp(self.activity_scroll_y, 0.0, max_scroll);
-    }
-    self.activity_follow_tail = was_at_tail and max_scroll - self.activity_scroll_y <= 2.0;
-    self.activity_max_scroll = max_scroll;
-    self.activity_content_count = self.presentation.activity_count;
-}
-
-pub fn scrollMissionControl(self: *Self, region: MissionControlScrollRegion, delta: f32, max_scroll: f32) void {
-    const offset = switch (region) {
-        .summary => &self.mission_control_summary_scroll_y,
-        .operations => &self.mission_control_operations_scroll_y,
-        .inspector => &self.mission_control_inspector_scroll_y,
-        .body => &self.mission_control_body_scroll_y,
+/// Crew and inbox state feeds the pose too: a companion whose delegated chat
+/// needs approval should look like it needs you even while its own turn idles.
+pub fn refreshPosture(self: *Self) void {
+    var crew_running = false;
+    var crew_needs_you = false;
+    for (self.crew[0..self.crew_count]) |row| switch (row.attention) {
+        .running => crew_running = true,
+        .approval, .blocked => crew_needs_you = true,
+        else => {},
     };
-    offset.* = std.math.clamp(offset.* + delta, 0.0, @max(max_scroll, 0.0));
+    self.run_phase = if (self.presentation.working or crew_running) .working else .idle;
+    self.needs_approval = self.presentation.has_approval or crew_needs_you or self.inboxNeedsYouCount() > 0;
+    self.has_failure = self.presentation.has_failure;
+}
+
+/// One-word posture used by tests and accessibility text.
+pub fn statusText(self: *const Self) []const u8 {
+    if (self.has_failure) return "Needs attention";
+    if (self.needs_approval) return "Approval needed";
+    if (self.run_phase == .working) return "Working";
+    return "Ready";
+}
+
+/// True while the composer edits companion settings instead of messaging.
+pub fn editingSettings(self: *const Self) bool {
+    return self.rename_mode or self.orders_mode;
+}
+
+/// Offers a recap when the user returns after `away_ms` of inactivity.
+pub fn noteReturn(self: *Self, away_ms: i64) void {
+    const threshold_ms: i64 = 15 * 60 * 1000;
+    if (away_ms < threshold_ms) return;
+    self.recap_available = true;
+    self.recap_minutes = @intCast(@min(@divFloor(away_ms, 60 * 1000), 24 * 60 * 7));
+}
+
+pub fn inboxNeedsYouCount(self: *const Self) usize {
+    var count: usize = 0;
+    for (self.inbox[0..self.inbox_count]) |row| {
+        if (row.attention == .approval or row.attention == .blocked) count += 1;
+    }
+    return count;
+}
+
+pub fn crewRunningCount(self: *const Self) usize {
+    var count: usize = 0;
+    for (self.crew[0..self.crew_count]) |row| {
+        if (row.attention == .running) count += 1;
+    }
+    return count;
+}
+
+/// Replaces a bounded row list, keeping what needs the user first.
+pub fn setRows(rows: []ChatRow, count: *usize, next: []const ChatRow) void {
+    const n = @min(rows.len, next.len);
+    @memcpy(rows[0..n], next[0..n]);
+    count.* = n;
+    var index: usize = 1;
+    while (index < n) : (index += 1) {
+        const value = rows[index];
+        var insertion = index;
+        while (insertion > 0 and value.attention.rank() < rows[insertion - 1].attention.rank()) : (insertion -= 1) {
+            rows[insertion] = rows[insertion - 1];
+        }
+        rows[insertion] = value;
+    }
+}
+
+pub fn setCrew(self: *Self, next: []const ChatRow) void {
+    setRows(&self.crew, &self.crew_count, next);
+    self.refreshPosture();
+}
+
+pub fn setInbox(self: *Self, next: []const ChatRow) void {
+    setRows(&self.inbox, &self.inbox_count, next);
+    self.refreshPosture();
+}
+
+pub fn scrollConversation(self: *Self, delta: f32) void {
+    self.conversation_scroll_y = std.math.clamp(self.conversation_scroll_y + delta, 0.0, self.conversation_max_scroll);
+    self.conversation_follow_tail = self.conversation_max_scroll - self.conversation_scroll_y <= 2.0;
+}
+
+/// Pins the conversation to its newest line while the user has not scrolled
+/// away; a manual offset survives growth until they return to the tail.
+pub fn updateConversationExtent(self: *Self, max_scroll: f32) void {
+    const grew = self.presentation.activity_count != self.conversation_content_count or max_scroll > self.conversation_max_scroll;
+    const was_at_tail = self.conversation_follow_tail or self.conversation_max_scroll - self.conversation_scroll_y <= 2.0;
+    if (grew and was_at_tail) {
+        self.conversation_scroll_y = max_scroll;
+    } else {
+        self.conversation_scroll_y = std.math.clamp(self.conversation_scroll_y, 0.0, max_scroll);
+    }
+    self.conversation_follow_tail = was_at_tail and max_scroll - self.conversation_scroll_y <= 2.0;
+    self.conversation_max_scroll = max_scroll;
+    self.conversation_content_count = self.presentation.activity_count;
+}
+
+pub fn scrollBrain(self: *Self, delta: f32) void {
+    self.brain_scroll_y = std.math.clamp(self.brain_scroll_y + delta, 0.0, self.brain_max_scroll);
 }
 
 pub fn clearHits(self: *Self) void {
     self.hit_count = 0;
 }
 
-pub fn clearApprovalHits(self: *Self) void {
-    var write_index: usize = 0;
-    for (self.hits[0..self.hit_count]) |hit| {
-        if (hit.action == .approve or hit.action == .deny) continue;
-        self.hits[write_index] = hit;
-        write_index += 1;
-    }
-    self.hit_count = write_index;
-}
-
 pub fn addHit(self: *Self, rect: palette.Rect, action: HitAction) void {
-    std.debug.assert(self.hit_count < self.hits.len);
-    self.hits[self.hit_count] = .{ .rect = rect, .action = action };
-    self.hit_count += 1;
+    self.addIndexedHit(rect, action, 0);
 }
 
-pub fn addOperationHit(self: *Self, rect: palette.Rect, action: HitAction, reference: OperationReference) void {
-    std.debug.assert(action == .operation_select or action == .operation_stop or action == .operation_follow_log);
-    std.debug.assert(self.hit_count < self.hits.len);
-    self.hits[self.hit_count] = .{ .rect = rect, .action = action, .reference = reference };
+pub fn addIndexedHit(self: *Self, rect: palette.Rect, action: HitAction, index: usize) void {
+    if (self.hit_count >= self.hits.len) return;
+    if (rect.w <= 0.0 or rect.h <= 0.0) return;
+    self.hits[self.hit_count] = .{ .rect = rect, .action = action, .index = index };
     self.hit_count += 1;
 }
 
@@ -810,7 +915,7 @@ pub fn hitAt(self: *const Self, x: f32, y: f32) ?HitAction {
     return hit.action;
 }
 
-fn hitEntryAt(self: *const Self, x: f32, y: f32) ?Hit {
+pub fn hitEntryAt(self: *const Self, x: f32, y: f32) ?Hit {
     var index = self.hit_count;
     while (index > 0) {
         index -= 1;
@@ -818,51 +923,6 @@ fn hitEntryAt(self: *const Self, x: f32, y: f32) ?Hit {
         if (pointInRect(hit.rect, x, y)) return hit;
     }
     return null;
-}
-
-fn setSemantic(
-    self: *Self,
-    phase: RunPhase,
-    needs_approval: bool,
-    has_failure: bool,
-    status_text: []const u8,
-    operation_count: usize,
-    approval_count: usize,
-) void {
-    self.run_phase = phase;
-    self.needs_approval = needs_approval;
-    self.has_failure = has_failure;
-    self.status_text = status_text;
-    self.operation_count = operation_count;
-    self.approval_count = approval_count;
-}
-
-fn selectMissionControlDefault(self: *Self) void {
-    for (0..self.presentation.operation_count) |index| {
-        const operation = &self.presentation.operations[index];
-        if (!operation.active()) continue;
-        const reference = self.presentation.operationReference(index) orelse continue;
-        if (!reference.actions.inspect) continue;
-        self.selected_operation = reference;
-        self.mission_control_inspector_scroll_y = 0.0;
-        return;
-    }
-    for (0..self.presentation.operation_count) |index| {
-        const operation = &self.presentation.operations[index];
-        if (operation.active()) continue;
-        const reference = self.presentation.operationReference(index) orelse continue;
-        if (!reference.actions.inspect) continue;
-        self.selected_operation = reference;
-        self.mission_control_inspector_scroll_y = 0.0;
-        return;
-    }
-}
-
-fn resetMissionControlScroll(self: *Self) void {
-    self.mission_control_summary_scroll_y = 0.0;
-    self.mission_control_operations_scroll_y = 0.0;
-    self.mission_control_inspector_scroll_y = 0.0;
-    self.mission_control_body_scroll_y = 0.0;
 }
 
 fn pointInRect(rect: palette.Rect, x: f32, y: f32) bool {
@@ -881,331 +941,149 @@ fn operationBefore(left: Operation, right: Operation) bool {
         else => 2,
     };
     if (left_rank != right_rank) return left_rank < right_rank;
-    return if (left_rank < 2) left.sequence < right.sequence else left.sequence > right.sequence;
+    return left.sequence > right.sequence;
 }
 
-fn testOperation(identity: []const u8, status: OperationStatus, sequence: i64) Operation {
-    var operation: Operation = .{ .status = status, .sequence = sequence };
-    operation.identity.set(identity);
-    operation.title.set("Ran command");
-    operation.detail.set("echo test");
-    return operation;
-}
-
-test "operation identity upserts across lifecycle and moves from Active to Recent" {
+test "operation identity upserts across lifecycle" {
     var frame: Frame = .{};
-    frame.upsertOperation(testOperation("call-1", .pending, 10));
-    frame.upsertOperation(testOperation("call-1", .in_progress, 20));
-    try std.testing.expectEqual(@as(usize, 1), frame.operation_count);
-    try std.testing.expectEqual(OperationStatus.in_progress, frame.operations[0].status);
-    try std.testing.expectEqual(@as(i64, 10), frame.operations[0].sequence);
-
-    frame.upsertOperation(testOperation("call-1", .completed, 30));
-    frame.sortOperations();
+    var operation: Operation = .{ .status = .in_progress, .sequence = 1 };
+    operation.identity.set("call-1");
+    frame.upsertOperation(operation);
+    operation.status = .completed;
+    operation.sequence = 9;
+    frame.upsertOperation(operation);
     try std.testing.expectEqual(@as(usize, 1), frame.operation_count);
     try std.testing.expectEqual(OperationStatus.completed, frame.operations[0].status);
-    try std.testing.expectEqual(@as(usize, 0), frame.activeCounts().working + frame.activeCounts().pending);
-    try std.testing.expectEqual(@as(usize, 1), frame.recentCount());
+    try std.testing.expectEqual(@as(i64, 1), frame.operations[0].sequence);
 }
 
 test "exact routing text rejects empty NUL and overflow without truncating" {
-    var exact: ExactText = .{};
-    try std.testing.expect(exact.set("owner:thread:with:colons"));
-    const preserved = exact;
-    try std.testing.expect(!exact.set(""));
-    try std.testing.expect(exact.eql(&preserved));
-    const nul = [_]u8{ 'a', 0, 'b' };
-    try std.testing.expect(!exact.set(&nul));
-    try std.testing.expect(exact.eql(&preserved));
-    const overflow = [_]u8{'x'} ** PRESENTATION_TEXT_CAPACITY;
-    try std.testing.expect(!exact.set(&overflow));
-    try std.testing.expect(exact.eql(&preserved));
-
-    const long = [_]u8{'l'} ** (PRESENTATION_TEXT_CAPACITY - 1);
-    try std.testing.expect(exact.set(&long));
-    try std.testing.expectEqualSlices(u8, &long, exact.slice());
+    var text: ExactText = .{};
+    try std.testing.expect(text.set("thread-1"));
+    try std.testing.expect(!text.set(""));
+    try std.testing.expect(!text.set("bad\x00id"));
+    const long = [_]u8{'x'} ** (PRESENTATION_TEXT_CAPACITY + 4);
+    try std.testing.expect(!text.set(&long));
+    try std.testing.expectEqualStrings("thread-1", text.slice());
 }
 
-test "evicted operation references cannot match a later bounded frame" {
-    var frame: Frame = .{};
-    try std.testing.expect(frame.setOwner("workspace", "thread"));
-    frame.upsertOperation(testOperation("oldest", .completed, 0));
-    const oldest = frame.operationReference(0).?;
-    var id_buffer: [32]u8 = undefined;
-    for (1..MAX_OPERATIONS + 2) |index| {
-        const identity = std.fmt.bufPrint(&id_buffer, "new-{d}", .{index}) catch unreachable;
-        frame.upsertOperation(testOperation(identity, .completed, @intCast(index)));
-    }
-    try std.testing.expect(!frame.containsReference(&oldest));
+test "body text keeps long replies and never splits a codepoint" {
+    var body: BodyText = .{};
+    body.set("hello");
+    try std.testing.expectEqualStrings("hello", body.slice());
+    var long: [BODY_TEXT_CAPACITY + 8]u8 = undefined;
+    @memset(&long, 'a');
+    // A two-byte codepoint straddling the capacity boundary is dropped whole.
+    long[BODY_TEXT_CAPACITY - 2] = 0xC3;
+    long[BODY_TEXT_CAPACITY - 1] = 0xA9;
+    body.set(&long);
+    try std.testing.expectEqual(@as(usize, BODY_TEXT_CAPACITY - 2), body.slice().len);
 }
 
-test "operation selection toggles exactly and survives only matching frame ownership" {
+test "escape peels menu, then rename, then the panel, as one owned key press" {
+    var companion = Self.init();
+    try std.testing.expect(!companion.handleEscapeKey(true));
+    companion.show();
+    companion.openMenu(.brain);
+    companion.rename_mode = true;
+    try std.testing.expect(companion.handleEscapeKey(true));
+    try std.testing.expectEqual(Menu.none, companion.menu);
+    try std.testing.expect(companion.rename_mode);
+    try std.testing.expect(companion.handleEscapeKey(true)); // repeat stays owned, no extra effect
+    try std.testing.expect(companion.rename_mode);
+    try std.testing.expect(companion.handleEscapeKey(false));
+    try std.testing.expect(companion.handleEscapeKey(true));
+    try std.testing.expect(!companion.rename_mode);
+    try std.testing.expect(companion.handleEscapeKey(false));
+    try std.testing.expect(companion.handleEscapeKey(true));
+    try std.testing.expectEqual(Visibility.collapsed_chip, companion.visibility);
+    try std.testing.expect(companion.handleEscapeKey(false));
+    try std.testing.expect(!companion.handleEscapeKey(false));
+}
+
+test "menus toggle and collapse clears transient modes" {
+    var companion = Self.init();
+    companion.show();
+    companion.openMenu(.companions);
+    try std.testing.expectEqual(Menu.companions, companion.menu);
+    companion.openMenu(.companions);
+    try std.testing.expectEqual(Menu.none, companion.menu);
+    companion.openMenu(.brain);
+    companion.rename_mode = true;
+    companion.collapse();
+    try std.testing.expectEqual(Menu.none, companion.menu);
+    try std.testing.expect(!companion.rename_mode);
+}
+
+test "rows sort what needs the user first and drive the pose" {
+    var companion = Self.init();
+    var rows: [3]ChatRow = .{ .{ .attention = .done }, .{ .attention = .running }, .{ .attention = .approval } };
+    rows[2].title.set("needs me");
+    companion.setCrew(&rows);
+    try std.testing.expectEqual(@as(usize, 3), companion.crew_count);
+    try std.testing.expectEqualStrings("needs me", companion.crew[0].title.slice());
+    try std.testing.expectEqual(Attention.done, companion.crew[2].attention);
+    try std.testing.expectEqual(@as(usize, 1), companion.crewRunningCount());
+    try std.testing.expectEqual(Pose.approval, companion.visualState().pose);
+
+    companion.setCrew(&.{});
+    try std.testing.expectEqual(Pose.idle, companion.visualState().pose);
+    var inbox: [1]ChatRow = .{.{ .attention = .blocked }};
+    companion.setInbox(&inbox);
+    try std.testing.expectEqual(@as(usize, 1), companion.inboxNeedsYouCount());
+    try std.testing.expect(companion.visualState().show_approval);
+}
+
+test "conversation follows the tail until the user scrolls away" {
+    var companion = Self.init();
+    companion.presentation.activity_count = 2;
+    companion.updateConversationExtent(100.0);
+    try std.testing.expectEqual(@as(f32, 100.0), companion.conversation_scroll_y);
+    companion.scrollConversation(-40.0);
+    try std.testing.expect(!companion.conversation_follow_tail);
+    companion.presentation.activity_count = 3;
+    companion.updateConversationExtent(150.0);
+    try std.testing.expectEqual(@as(f32, 60.0), companion.conversation_scroll_y);
+    companion.scrollConversation(1000.0);
+    try std.testing.expect(companion.conversation_follow_tail);
+    companion.presentation.activity_count = 4;
+    companion.updateConversationExtent(200.0);
+    try std.testing.expectEqual(@as(f32, 200.0), companion.conversation_scroll_y);
+}
+
+test "owner change resets conversation scroll" {
+    var companion = Self.init();
     var frame: Frame = .{ .has_thread = true };
-    try std.testing.expect(frame.setOwner("workspace:one", "thread:one"));
-    var call_id: ExactText = .{};
-    try std.testing.expect(call_id.set("call:with:colons"));
-    var operation = testOperation("operation:one", .in_progress, 1);
-    operation.target = .{ .tool_call = call_id };
-    operation.actions = .{ .inspect = true, .stop = true };
-    frame.upsertOperation(operation);
-
-    var state = Self.init();
-    state.setFrame(frame);
-    const reference = frame.operationReference(0).?;
-    state.toggleOperationSelection(reference);
-    try std.testing.expect(state.operationSelected(&reference));
-    state.selectTab(.activity);
-    state.collapse();
-    state.show();
-    state.setFrame(frame);
-    try std.testing.expect(state.operationSelected(&reference));
-    try std.testing.expectEqual(Tab.activity, state.selected_tab);
-
-    state.toggleOperationSelection(reference);
-    try std.testing.expect(state.selected_operation == null);
-    state.toggleOperationSelection(reference);
-    frame.operations[0].inspector.output.set("new display-only output");
-    state.setFrame(frame);
-    try std.testing.expect(state.operationSelected(&reference));
-
-    frame.operations[0].actions.follow_log = true;
-    state.setFrame(frame);
-    try std.testing.expect(state.selected_operation == null);
-    const changed_actions = frame.operationReference(0).?;
-    state.toggleOperationSelection(changed_actions);
-    frame.operations[0].target = .none;
-    state.setFrame(frame);
-    try std.testing.expect(state.selected_operation == null);
-
-    frame.operations[0].target = .{ .tool_call = call_id };
-    state.setFrame(frame);
-    const restored = frame.operationReference(0).?;
-    state.toggleOperationSelection(restored);
-    var evicted = frame;
-    evicted.operation_count = 0;
-    state.setFrame(evicted);
-    try std.testing.expect(state.selected_operation == null);
-
-    state.setFrame(frame);
-    state.toggleOperationSelection(restored);
-    var replacement: Frame = .{ .has_thread = true };
-    try std.testing.expect(replacement.setOwner("workspace:two", "thread:two"));
-    replacement.upsertOperation(frame.operations[0]);
-    state.setFrame(replacement);
-    try std.testing.expect(state.selected_operation == null);
-    try std.testing.expectEqual(Tab.run, state.selected_tab);
+    _ = frame.setOwner("ws-a", "chat-1");
+    companion.setFrame(frame);
+    companion.conversation_max_scroll = 50.0;
+    companion.conversation_scroll_y = 10.0;
+    companion.conversation_follow_tail = false;
+    _ = frame.setOwner("ws-a", "chat-2");
+    companion.setFrame(frame);
+    try std.testing.expectEqual(@as(f32, 0.0), companion.conversation_scroll_y);
+    try std.testing.expect(companion.conversation_follow_tail);
 }
 
-test "Mission Control lifecycle preserves work and valid owner-local view state" {
-    var frame: Frame = .{ .has_thread = true, .working = true };
-    try std.testing.expect(frame.setOwner("workspace", "thread"));
-    frame.upsertOperation(testOperation("recent", .completed, 1));
-    frame.upsertOperation(testOperation("active", .in_progress, 2));
-    frame.sortOperations();
-
-    var state = Self.init();
-    state.setFrame(frame);
-    const presentation_before = state.presentation;
-    state.show();
-    state.openMissionControl();
-    try std.testing.expect(state.mission_control_open);
-    try std.testing.expectEqual(Visibility.sidecar_open, state.visibility);
-    try std.testing.expectEqualStrings("active", state.selected_operation.?.identity.slice());
-    try std.testing.expectEqualDeep(presentation_before, state.presentation);
-
-    state.mission_control_summary_scroll_y = 11.0;
-    state.mission_control_operations_scroll_y = 22.0;
-    state.mission_control_inspector_scroll_y = 33.0;
-    state.closeMissionControl();
-    state.openMissionControl();
-    try std.testing.expectEqual(@as(f32, 11.0), state.mission_control_summary_scroll_y);
-    try std.testing.expectEqual(@as(f32, 22.0), state.mission_control_operations_scroll_y);
-    try std.testing.expectEqual(@as(f32, 33.0), state.mission_control_inspector_scroll_y);
-    try std.testing.expectEqualStrings("active", state.selected_operation.?.identity.slice());
-
-    try std.testing.expect(state.handleEscapeKey(true));
-    try std.testing.expect(!state.mission_control_open);
-    try std.testing.expectEqual(Visibility.sidecar_open, state.visibility);
-    try std.testing.expect(state.handleEscapeKey(false));
-    state.openMissionControl();
-    state.collapse();
-    try std.testing.expect(!state.mission_control_open);
-    try std.testing.expectEqual(Visibility.collapsed_chip, state.visibility);
-    try std.testing.expectEqualDeep(presentation_before, state.presentation);
+test "pointer buttons capture through release and report indexed hits" {
+    var companion = Self.init();
+    companion.addIndexedHit(.{ .x = 0.0, .y = 0.0, .w = 10.0, .h = 10.0 }, .crew_open, 3);
+    const down = companion.handlePointerButton(5.0, 5.0, 1, true);
+    try std.testing.expect(down.consumed);
+    try std.testing.expectEqual(HitAction.crew_open, down.action.?);
+    try std.testing.expectEqual(@as(usize, 3), down.index);
+    companion.clearHits();
+    try std.testing.expect(companion.ownsPointerRelease(1));
+    try std.testing.expect(companion.handlePointerButton(50.0, 50.0, 1, false).consumed);
+    try std.testing.expect(!companion.ownsPointerRelease(1));
+    try std.testing.expect(!companion.handlePointerButton(50.0, 50.0, 1, false).consumed);
 }
 
-test "Mission Control selection and scroll reset only at exact invalidation boundaries" {
-    var frame: Frame = .{ .has_thread = true };
-    try std.testing.expect(frame.setOwner("workspace-a", "thread-a"));
-    var operation = testOperation("operation", .in_progress, 1);
-    operation.actions = .{ .inspect = true, .stop = true };
-    frame.upsertOperation(operation);
-
-    var state = Self.init();
-    state.setFrame(frame);
-    state.openMissionControl();
-    const reference = frame.operationReference(0).?;
-    state.mission_control_summary_scroll_y = 10.0;
-    state.mission_control_operations_scroll_y = 20.0;
-    state.mission_control_inspector_scroll_y = 30.0;
-    state.mission_control_body_scroll_y = 40.0;
-
-    state.toggleOperationSelection(reference);
-    try std.testing.expect(state.selected_operation == null);
-    try std.testing.expectEqual(@as(f32, 0.0), state.mission_control_inspector_scroll_y);
-    try std.testing.expectEqual(@as(f32, 10.0), state.mission_control_summary_scroll_y);
-    try std.testing.expectEqual(@as(f32, 20.0), state.mission_control_operations_scroll_y);
-    try std.testing.expectEqual(@as(f32, 40.0), state.mission_control_body_scroll_y);
-
-    state.toggleOperationSelection(reference);
-    state.mission_control_inspector_scroll_y = 18.0;
-    var evicted = frame;
-    evicted.operation_count = 0;
-    state.setFrame(evicted);
-    try std.testing.expect(state.selected_operation == null);
-    try std.testing.expectEqual(@as(f32, 0.0), state.mission_control_inspector_scroll_y);
-    try std.testing.expectEqual(@as(f32, 10.0), state.mission_control_summary_scroll_y);
-
-    var replacement = frame;
-    try std.testing.expect(replacement.setOwner("workspace-b", "thread-b"));
-    state.setFrame(replacement);
-    try std.testing.expectEqual(@as(f32, 0.0), state.mission_control_summary_scroll_y);
-    try std.testing.expectEqual(@as(f32, 0.0), state.mission_control_operations_scroll_y);
-    try std.testing.expectEqual(@as(f32, 0.0), state.mission_control_body_scroll_y);
-}
-
-test "bounded operations prioritize active and activity retains newest chronology" {
-    var frame: Frame = .{};
-    var id_buffer: [32]u8 = undefined;
-    for (0..40) |index| {
-        const identity = std.fmt.bufPrint(&id_buffer, "recent-{d}", .{index}) catch unreachable;
-        frame.upsertOperation(testOperation(identity, .completed, @intCast(index)));
-    }
-    for (0..4) |index| {
-        const identity = std.fmt.bufPrint(&id_buffer, "active-{d}", .{index}) catch unreachable;
-        frame.upsertOperation(testOperation(identity, if (index % 2 == 0) .in_progress else .pending, @intCast(100 + index)));
-    }
-    frame.sortOperations();
-    try std.testing.expectEqual(MAX_OPERATIONS, frame.operation_count);
-    try std.testing.expectEqual(@as(usize, 2), frame.activeCounts().working);
-    try std.testing.expectEqual(@as(usize, 2), frame.activeCounts().pending);
-    try std.testing.expectEqual(OperationStatus.in_progress, frame.operations[0].status);
-
-    for (0..70) |index| {
-        var item: ActivityItem = .{ .sequence = @intCast(index) };
-        const identity = std.fmt.bufPrint(&id_buffer, "event-{d}", .{index}) catch unreachable;
-        item.identity.set(identity);
-        frame.appendActivity(item);
-    }
-    frame.sortActivity();
-    try std.testing.expectEqual(MAX_ACTIVITY, frame.activity_count);
-    try std.testing.expectEqual(@as(i64, 6), frame.activity[0].sequence);
-    try std.testing.expectEqual(@as(i64, 69), frame.activity[MAX_ACTIVITY - 1].sequence);
-}
-
-test "activity tail follows once preserves manual offset and rearms within threshold" {
-    var state = Self.init();
-    var frame: Frame = .{ .has_thread = true, .activity_count = 1 };
-    frame.workspace_id.set("workspace");
-    frame.thread_id.set("thread");
-    state.setFrame(frame);
-    state.selectTab(.activity);
-    state.updateActivityExtent(100.0);
-    try std.testing.expectEqual(@as(f32, 100.0), state.activity_scroll_y);
-
-    frame.activity_count = 2;
-    state.setFrame(frame);
-    state.updateActivityExtent(200.0);
-    try std.testing.expectEqual(@as(f32, 200.0), state.activity_scroll_y);
-    state.scrollCurrent(-50.0, 200.0);
-    try std.testing.expectEqual(@as(f32, 150.0), state.activity_scroll_y);
-    try std.testing.expect(!state.activity_follow_tail);
-
-    frame.activity_count = 3;
-    state.setFrame(frame);
-    state.updateActivityExtent(300.0);
-    try std.testing.expectEqual(@as(f32, 150.0), state.activity_scroll_y);
-    state.scrollCurrent(149.0, 300.0);
-    try std.testing.expect(state.activity_follow_tail);
-    frame.activity_count = 4;
-    state.setFrame(frame);
-    state.updateActivityExtent(400.0);
-    try std.testing.expectEqual(@as(f32, 400.0), state.activity_scroll_y);
-}
-
-test "tab and scroll memory survive hide while owner identity replacement resets" {
-    var state = Self.init();
-    var frame: Frame = .{ .has_thread = true };
-    frame.workspace_id.set("workspace-a");
-    frame.thread_id.set("thread-a");
-    state.setFrame(frame);
-    state.selectTab(.activity);
-    state.activity_scroll_y = 42.0;
-    state.collapse();
-    state.show();
-    state.setFrame(frame);
-    try std.testing.expectEqual(Tab.activity, state.selected_tab);
-    try std.testing.expectEqual(@as(f32, 42.0), state.activity_scroll_y);
-
-    frame.thread_id.set("thread-b");
-    state.setFrame(frame);
-    try std.testing.expectEqual(Tab.run, state.selected_tab);
-    try std.testing.expectEqual(@as(f32, 0.0), state.activity_scroll_y);
-    try std.testing.expect(state.activity_follow_tail);
-}
-
-test "Escape down repeat and up remain one Companion-owned action" {
-    var state = Self.init();
-    try std.testing.expect(!state.handleEscapeKey(true));
-    state.show();
-    try std.testing.expect(state.handleEscapeKey(true));
-    try std.testing.expectEqual(Visibility.collapsed_chip, state.visibility);
-    try std.testing.expect(state.ownsEscapeKey());
-    try std.testing.expect(state.handleEscapeKey(true));
-    try std.testing.expectEqual(Visibility.collapsed_chip, state.visibility);
-    try std.testing.expect(state.handleEscapeKey(false));
-    try std.testing.expect(!state.ownsEscapeKey());
-    try std.testing.expect(!state.handleEscapeKey(true));
-}
-
-test "overlapping pointer buttons independently own releases after collapse" {
-    var state = Self.init();
-    state.show();
-    state.addHit(.{ .x = 80.0, .y = 80.0, .w = 20.0, .h = 20.0 }, .collapse);
-
-    const right_down = state.handlePointerButton(90.0, 90.0, 3, true);
-    try std.testing.expect(right_down.consumed);
-    try std.testing.expect(right_down.action == null);
-    const left_down = state.handlePointerButton(90.0, 90.0, 1, true);
-    try std.testing.expect(left_down.consumed);
-    try std.testing.expectEqual(HitAction.collapse, left_down.action.?);
-    try std.testing.expect(state.ownsPointerButton(1));
-    try std.testing.expect(state.ownsPointerButton(3));
-
-    state.collapse();
-    state.clearHits();
-    try std.testing.expect(state.ownsPointerRelease(1));
-    try std.testing.expect(state.ownsPointerRelease(3));
-    try std.testing.expect(state.handlePointerButton(5.0, 5.0, 1, false).consumed);
-    try std.testing.expect(!state.ownsPointerButton(1));
-    try std.testing.expect(state.ownsPointerButton(3));
-    try std.testing.expect(state.ownsPointerRelease(3));
-    try std.testing.expect(state.handlePointerButton(5.0, 5.0, 3, false).consumed);
-    try std.testing.expect(!state.ownsPointerRelease(1));
-    try std.testing.expect(!state.ownsPointerRelease(3));
-}
-
-test "nonmatching release preserves exact capture and focus loss resets all" {
-    var state = Self.init();
-    state.addHit(.{ .x = 80.0, .y = 80.0, .w = 20.0, .h = 20.0 }, .open);
-    try std.testing.expect(state.handlePointerButton(90.0, 90.0, 3, true).consumed);
-    state.clearHits();
-
-    try std.testing.expect(state.ownsPointerRelease(3));
-    try std.testing.expect(!state.ownsPointerRelease(1));
-    try std.testing.expect(!state.handlePointerButton(5.0, 5.0, 1, false).consumed);
-    try std.testing.expect(state.ownsPointerButton(3));
-    state.resetInputCaptures();
-    try std.testing.expect(!state.ownsPointerRelease(3));
-    try std.testing.expect(!state.handlePointerButton(5.0, 5.0, 3, false).consumed);
+test "returning after a long absence offers a recap" {
+    var companion = Self.init();
+    companion.noteReturn(5 * 60 * 1000);
+    try std.testing.expect(!companion.recap_available);
+    companion.noteReturn(90 * 60 * 1000);
+    try std.testing.expect(companion.recap_available);
+    try std.testing.expectEqual(@as(u32, 90), companion.recap_minutes);
 }

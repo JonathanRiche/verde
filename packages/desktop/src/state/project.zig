@@ -334,6 +334,37 @@ pub const TerminalProcessOutcome = struct {
     }
 };
 
+/// Bounded, value-owned set of extra Companion thread ids for one project.
+pub const CompanionExtraIds = struct {
+    const CAPACITY = 8;
+    const ID_CAPACITY = 160;
+    ids: [CAPACITY][ID_CAPACITY]u8 = undefined,
+    lens: [CAPACITY]usize = [_]usize{0} ** CAPACITY,
+    count: usize = 0,
+
+    pub fn append(self: *CompanionExtraIds, id: []const u8) void {
+        if (self.count >= CAPACITY or id.len == 0 or id.len > ID_CAPACITY or self.contains(id)) return;
+        @memcpy(self.ids[self.count][0..id.len], id);
+        self.lens[self.count] = id.len;
+        self.count += 1;
+    }
+
+    pub fn contains(self: *const CompanionExtraIds, id: []const u8) bool {
+        for (0..self.count) |index| {
+            if (std.mem.eql(u8, self.ids[index][0..self.lens[index]], id)) return true;
+        }
+        return false;
+    }
+
+    pub fn eql(self: *const CompanionExtraIds, other: *const CompanionExtraIds) bool {
+        if (self.count != other.count) return false;
+        for (0..self.count) |index| {
+            if (!other.contains(self.ids[index][0..self.lens[index]])) return false;
+        }
+        return true;
+    }
+};
+
 pub const Project = struct {
     id: [:0]const u8,
     label: [:0]const u8,
@@ -362,6 +393,11 @@ pub const Project = struct {
     threads: std.ArrayList(ChatThread),
     archived_threads: std.ArrayList(ChatThread),
     companion_thread_local_id: ?[:0]const u8 = null,
+    /// GUI-only designations for additional machine Companions homed in this
+    /// workspace. The first Companion keeps the durable
+    /// `companion_thread_local_id`; the roster re-applies these every frame
+    /// because projection refreshes rebuild projects.
+    companion_extra_ids: CompanionExtraIds = .{},
     selected_thread_index: usize = 0,
     /// Last chat or terminal workspace pane the user focused; used to default
     /// the inspector design-mode "Send to" target (not persisted).
@@ -494,8 +530,19 @@ pub const Project = struct {
     }
 
     pub fn isCompanionThread(self: *const Project, thread: *const ChatThread) bool {
+        if (self.companion_extra_ids.contains(thread.local_thread_id)) return true;
         const local_id = self.companion_thread_local_id orelse return false;
         return std.mem.eql(u8, local_id, thread.local_thread_id);
+    }
+
+    /// Replaces the extra Companion designations; marks the sidebar cache
+    /// dirty only when the set actually changed.
+    pub fn setCompanionExtraIds(self: *Project, ids: []const []const u8) void {
+        var next: CompanionExtraIds = .{};
+        for (ids) |id| next.append(id);
+        if (next.eql(&self.companion_extra_ids)) return;
+        self.companion_extra_ids = next;
+        self.sidebar_thread_cache_dirty = true;
     }
 
     pub fn isSubagentThread(_: *const Project, thread: *const ChatThread) bool {

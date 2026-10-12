@@ -2065,6 +2065,8 @@ test {
     _ = sessionizer;
     _ = @import("compile_tests/windows_conpty.zig");
     _ = @import("daemon/chat_links.zig");
+    _ = @import("daemon/companions.zig");
+    _ = @import("daemon/voice.zig");
     _ = @import("daemon/change_journal.zig");
     _ = @import("daemon/process_registry.zig");
     _ = @import("daemon/store.zig");

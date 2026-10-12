@@ -33,6 +33,9 @@ const connect_keys = @import("../daemon/connect_keys.zig");
 const connect_lifecycle = @import("../daemon/connect_lifecycle.zig");
 const connect_store = @import("../daemon/connect_store.zig");
 const chat_links = @import("../daemon/chat_links.zig");
+const companions = @import("../daemon/companions.zig");
+const voice = @import("../daemon/voice.zig");
+const companion_roster = @import("../state/companion_roster.zig");
 const browser_history = @import("../daemon/browser_history.zig");
 const daemon_store = @import("../daemon/store.zig");
 const daemon_runtime_identity = @import("../daemon/runtime_identity.zig");
@@ -2966,6 +2969,8 @@ pub const Daemon = struct {
         // accepting_mutations and pins in_flight under lockDaemon itself.
         if (!std.mem.startsWith(u8, method, "chat.links.") and !std.mem.startsWith(u8, method, "chat.tasks.") and
             !std.mem.startsWith(u8, method, "browser.history.") and
+            !std.mem.startsWith(u8, method, "companion.roster.") and
+            !std.mem.startsWith(u8, method, "voice.") and
             !std.mem.eql(u8, method, "chat.turn.start") and
             !std.mem.eql(u8, method, "chat.turn.steer") and
             !std.mem.eql(u8, method, "chat.followup") and
@@ -2996,6 +3001,8 @@ pub const Daemon = struct {
         if (std.mem.eql(u8, method, "session.cleanup")) return try self.cleanupResponse(id_value);
         if (std.mem.startsWith(u8, method, "chat.links.") or std.mem.startsWith(u8, method, "chat.tasks.")) return try self.chatOrchestrationResponse(id_value, method, params);
         if (std.mem.startsWith(u8, method, "browser.history.")) return try browserHistoryResponse(self, id_value, method, params);
+        if (std.mem.startsWith(u8, method, "companion.roster.")) return try companionRosterResponse(self, id_value, method, params);
+        if (std.mem.startsWith(u8, method, "voice.")) return try voiceResponse(self, id_value, method, params);
         if (std.mem.eql(u8, method, "chat.turn.start")) return try self.chatTurnStartResponse(id_value, params);
         if (std.mem.eql(u8, method, "chat.turn.list")) return try self.chatTurnListResponse(id_value, params);
         if (std.mem.eql(u8, method, "chat.turn.tail")) return try self.chatTurnTailResponse(id_value, params);
@@ -7054,7 +7061,10 @@ pub const Daemon = struct {
                     } else if (std.mem.eql(u8, method, "chat.links.create")) {
                         if (!accepting) return error.InvalidState;
                         const child = jsonString(params.object.get("local_thread_id") orelse .null) orelse return error.InvalidParams;
-                        try chat_links.link(svc.store.conn, self.allocator, workspace, parent, child);
+                        const parent_workspace = (try chat_links.resolveParentWorkspace(svc.store.conn, self.allocator, jsonString(params.object.get("parent_workspace_id") orelse .null) orelse workspace, parent)) orelse
+                            (try chat_links.resolveParentWorkspace(svc.store.conn, self.allocator, workspace, parent)) orelse return error.InvalidParams;
+                        defer self.allocator.free(parent_workspace);
+                        try chat_links.linkAcross(svc.store.conn, self.allocator, parent_workspace, parent, workspace, child);
                         try s.write(.{ .linked = true });
                     } else return error.InvalidParams;
                 } else if (std.mem.eql(u8, method, "chat.tasks.get")) {
@@ -7280,10 +7290,9 @@ pub const Daemon = struct {
             workspace_row.deinit();
             if (archived) return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_WORKSPACE_ARCHIVED, "workspace is archived; reopen it before starting chats");
             const thread_sql = "select 1 from threads t join workspaces w on w.id=t.workspace_id where w.workspace_id=? and t.local_thread_id=?";
-            const parent_row = (conn.row(thread_sql, .{ workspace_id, parent_thread_id }) catch
+            const parent_workspace_id = (chat_links.resolveParentWorkspace(conn, arena, workspace_id, parent_thread_id) catch
                 return try storeErrorResponse(self.allocator, id_value, error.StoreUnavailable)) orelse
                 return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_RESOURCE_NOT_FOUND, "parent thread not found");
-            parent_row.deinit();
             const child_row = conn.row(thread_sql, .{ workspace_id, child_id }) catch
                 return try storeErrorResponse(self.allocator, id_value, error.StoreUnavailable);
             if (child_row) |row| {
@@ -7309,16 +7318,14 @@ pub const Daemon = struct {
                 store_revision = write.store_revision;
                 created = true;
             }
-            chat_links.link(conn, self.allocator, workspace_id, parent_thread_id, child_id) catch |err| switch (err) {
+            chat_links.linkAcross(conn, self.allocator, parent_workspace_id, parent_thread_id, workspace_id, child_id) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.InvalidParams => return try invalid(self.allocator, id_value, "child cannot be linked under this parent"),
                 else => return try storeErrorResponse(self.allocator, id_value, error.StoreUnavailable),
             };
-            const link_row = (conn.row("select link_id from chat_links where workspace_id=? and parent_thread_id=? and local_thread_id=?", .{ workspace_id, parent_thread_id, child_id }) catch
+            link_id = (chat_links.linkId(conn, arena, parent_workspace_id, parent_thread_id, workspace_id, child_id) catch
                 return try storeErrorResponse(self.allocator, id_value, error.StoreUnavailable)) orelse
                 return try storeErrorResponse(self.allocator, id_value, error.Internal);
-            link_id = try arena.dupe(u8, link_row.text(0));
-            link_row.deinit();
         }
 
         var turn_id: ?[]const u8 = null;
@@ -7578,7 +7585,13 @@ pub const Daemon = struct {
             defer _ = svc.in_flight.fetchSub(1, .monotonic);
             lockStoreService(svc);
             defer svc.mutex.unlock();
-            if (turn.parent_thread_id) |parent| try chat_links.link(svc.store.conn, self.allocator, turn.workspace_id, parent, turn.local_thread_id);
+            if (turn.parent_thread_id) |parent| {
+                // The parent may live in another workspace (the machine
+                // Companion); resolve its home so the child reports there.
+                const parent_workspace = (try chat_links.resolveParentWorkspace(svc.store.conn, self.allocator, turn.workspace_id, parent)) orelse return error.InvalidParams;
+                defer self.allocator.free(parent_workspace);
+                try chat_links.linkAcross(svc.store.conn, self.allocator, parent_workspace, parent, turn.workspace_id, turn.local_thread_id);
+            }
             try chat_links.createTask(svc.store.conn, turn.turn_id, turn.workspace_id, turn.local_thread_id, owner, turn.started_at_ms);
             if (turn.parent_thread_id) |parent| try chat_links.setOrigin(svc.store.conn, turn.turn_id, parent);
         }
@@ -10848,7 +10861,7 @@ fn stageAcceptedChatTurn(daemon: *Daemon, turn: *ChatTurn) !AcceptanceOwnership 
 
     if (std.mem.startsWith(u8, turn_id, "child-event:")) try svc.store.conn.exec("update chat_deliveries set delivered=1 where delivered=0 and (parent_turn_id=?1 or 'child-event:' || task_id || ':' || (select parent_thread_id from chat_links where link_id=chat_deliveries.link_id) || ':' || revision = ?1)", .{turn_id});
 
-    if (!std.mem.startsWith(u8, turn_id, "child-event:")) try svc.store.conn.exec("update chat_links set delivery_enabled=1 where workspace_id=? and parent_thread_id=? and hidden=0", .{ workspace_id, local_thread_id });
+    if (!std.mem.startsWith(u8, turn_id, "child-event:")) try svc.store.conn.exec("update chat_links set delivery_enabled=1 where coalesce(parent_workspace_id,workspace_id)=? and parent_thread_id=? and hidden=0", .{ workspace_id, local_thread_id });
     // A parent's automatic reply to a child notification is not delegated
     // work; reporting it upward would cascade one child turn through every
     // ancestor as a chain of child-event turns.
@@ -11134,8 +11147,8 @@ fn commitChatTurnDurable(daemon: *Daemon, turn: *ChatTurn) !void {
     if (status == .aborted and !followup_pending) {
         // The user stopped this parent: drop queued child results with the
         // link so a later re-enable does not replay them as a burst of turns.
-        try service.store.conn.exec("update chat_deliveries set delivered=1 where delivered=0 and link_id in (select link_id from chat_links where workspace_id=? and parent_thread_id=?)", .{ workspace_id, local_thread_id });
-        try service.store.conn.exec("update chat_links set delivery_enabled=0 where workspace_id=? and parent_thread_id=?", .{ workspace_id, local_thread_id });
+        try service.store.conn.exec("update chat_deliveries set delivered=1 where delivered=0 and link_id in (select link_id from chat_links where coalesce(parent_workspace_id,workspace_id)=? and parent_thread_id=?)", .{ workspace_id, local_thread_id });
+        try service.store.conn.exec("update chat_links set delivery_enabled=0 where coalesce(parent_workspace_id,workspace_id)=? and parent_thread_id=?", .{ workspace_id, local_thread_id });
     }
 
     // 4. Publish revision on the turn after the receipt. The store service
@@ -13274,6 +13287,11 @@ fn methodRunsUnlocked(method: []const u8) bool {
         // Browser history is per-keystroke SQLite work under the store mutex
         // only; it pins in_flight and checks the drain flag itself.
         std.mem.startsWith(u8, method, "browser.history.") or
+        // Companion roster is one small store row; it pins in_flight and
+        // checks the drain flag itself.
+        std.mem.startsWith(u8, method, "companion.roster.") or
+        // Voice session minting waits on a provider HTTPS call with no lock held.
+        std.mem.startsWith(u8, method, "voice.") or
         std.mem.eql(u8, method, "chat.turn.start") or
         std.mem.eql(u8, method, "chat.turn.tail") or
         std.mem.eql(u8, method, "chat.turn.steer") or
@@ -14767,6 +14785,213 @@ fn resolveChatExecutionRoute(
 /// the GUI address-bar suggestions. Serves unlocked; SQLite work runs under
 /// the store mutex with `in_flight` pinned so shutdown drains it like
 /// chat.links, and mutations respect the drain flag.
+/// `companion.roster.get` → {revision, roster}; `companion.roster.put`
+/// {roster, expected_revision?} → {revision}. A stale expected revision
+/// answers `conflict` so concurrent editors re-read instead of overwriting.
+fn companionRosterResponse(daemon: *Daemon, id_value: std.json.Value, method: []const u8, params: std.json.Value) ![]u8 {
+    const allocator = daemon.allocator;
+    const is_get = std.mem.eql(u8, method, companions.METHOD_GET);
+    const is_put = std.mem.eql(u8, method, companions.METHOD_PUT);
+    if (!is_get and !is_put) return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_UNKNOWN_METHOD, "unknown companion method");
+    lockDaemon(daemon);
+    const service = daemon.store_service;
+    if (service) |svc| _ = svc.in_flight.fetchAdd(1, .monotonic);
+    const accepting = daemon.accepting_mutations;
+    daemon.mutex.unlock();
+    const svc = service orelse return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_STORE_UNAVAILABLE, "store is unavailable");
+    defer _ = svc.in_flight.fetchSub(1, .monotonic);
+    if (is_put and !accepting) return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_STATE, "daemon is preparing shutdown and is not accepting mutations");
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer };
+    if (is_get) {
+        const snapshot = blk: {
+            lockStoreService(svc);
+            defer svc.mutex.unlock();
+            break :blk companions.get(svc.store.conn, arena) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return try storeErrorResponse(allocator, id_value, error.StoreUnavailable),
+            };
+        };
+        const roster = std.json.parseFromSliceLeaky(std.json.Value, arena, snapshot.json, .{}) catch
+            return try storeErrorResponse(allocator, id_value, error.Internal);
+        try beginOk(&s, id_value);
+        try s.objectField("result");
+        try s.write(.{ .revision = snapshot.revision, .roster = roster });
+        try s.endObject();
+        return writer.toOwnedSlice();
+    }
+    if (params != .object) return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "companion.roster.put params must be an object");
+    const roster_value = params.object.get("roster") orelse return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "companion.roster.put requires roster");
+    const roster_json = try std.json.Stringify.valueAlloc(arena, roster_value, .{});
+    const expected = jsonI64(params.object.get("expected_revision") orelse .null);
+    const revision = blk: {
+        lockStoreService(svc);
+        defer svc.mutex.unlock();
+        break :blk companions.put(svc.store.conn, arena, roster_json, expected) catch |err| switch (err) {
+            error.InvalidParams => return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid companion roster"),
+            error.Conflict => return try errorResponseAlloc(allocator, id_value, "conflict", "companion roster changed; re-read and retry"),
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return try storeErrorResponse(allocator, id_value, error.StoreUnavailable),
+        };
+    };
+    try beginOk(&s, id_value);
+    try s.objectField("result");
+    try s.write(.{ .revision = revision });
+    try s.endObject();
+    return writer.toOwnedSlice();
+}
+
+/// Real-time voice: provider list, key configuration, and session minting.
+/// Keys never leave the daemon; phones get a short-lived provider token.
+fn voiceResponse(daemon: *Daemon, id_value: std.json.Value, method: []const u8, params: std.json.Value) ![]u8 {
+    const allocator = daemon.allocator;
+    const is_providers = std.mem.eql(u8, method, voice.METHOD_PROVIDERS);
+    const is_configure = std.mem.eql(u8, method, voice.METHOD_PROVIDER_CONFIGURE);
+    const is_session = std.mem.eql(u8, method, voice.METHOD_SESSION_CREATE);
+    if (!is_providers and !is_configure and !is_session) return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_UNKNOWN_METHOD, "unknown voice method");
+    const object: ?std.json.ObjectMap = if (params == .object) params.object else null;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    lockDaemon(daemon);
+    const accepting = daemon.accepting_mutations;
+    const pref_path = try arena.dupe(u8, daemon.pref_path);
+    daemon.mutex.unlock();
+
+    if (is_configure) {
+        if (!accepting) return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_STATE, "daemon is preparing shutdown and is not accepting mutations");
+        const fields = object orelse return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "voice.provider.configure params must be an object");
+        const provider = std.meta.stringToEnum(voice.ProviderId, jsonString(fields.get("provider") orelse .null) orelse "") orelse
+            return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "unknown voice provider");
+        voice.configure(arena, pref_path, .{
+            .provider = provider,
+            .api_key = jsonString(fields.get("api_key") orelse .null),
+            .model = jsonString(fields.get("model") orelse .null),
+            .voice = jsonString(fields.get("voice") orelse .null),
+            .make_default = jsonBool(fields.get("make_default") orelse .null) orelse false,
+        }) catch |err| switch (err) {
+            error.InvalidParams => return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid voice provider settings"),
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return try storeErrorResponse(allocator, id_value, error.StoreUnavailable),
+        };
+    }
+
+    var config = voice.load(arena, pref_path, voice.processEnv);
+    defer config.deinit();
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer };
+    if (!is_session) {
+        try beginOk(&s, id_value);
+        try s.objectField("result");
+        try voice.writeProviders(&s, &config);
+        try s.endObject();
+        return writer.toOwnedSlice();
+    }
+
+    const fields: std.json.ObjectMap = object orelse .empty;
+    const provider = if (jsonString(fields.get("provider") orelse .null)) |text|
+        std.meta.stringToEnum(voice.ProviderId, text) orelse return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "unknown voice provider")
+    else
+        config.pick() orelse return try errorResponseAlloc(allocator, id_value, "voice_not_configured", "add an xAI, OpenAI, or Gemini API key for voice");
+
+    // The voice front speaks as the active (or requested) companion.
+    var name: []const u8 = "your companion";
+    var tagline: []const u8 = "";
+    var orders: []const u8 = "";
+    var companion_id: []const u8 = "";
+    var home_workspace_id: []const u8 = "";
+    var thread_id: []const u8 = "";
+    {
+        lockDaemon(daemon);
+        const service = daemon.store_service;
+        if (service) |svc| _ = svc.in_flight.fetchAdd(1, .monotonic);
+        daemon.mutex.unlock();
+        if (service) |svc| {
+            defer _ = svc.in_flight.fetchSub(1, .monotonic);
+            const snapshot = blk: {
+                lockStoreService(svc);
+                defer svc.mutex.unlock();
+                break :blk companions.get(svc.store.conn, arena) catch null;
+            };
+            if (snapshot) |snap| {
+                var roster = companion_roster.init();
+                if (roster.parse(arena, snap.json)) |_| {
+                    const wanted = jsonString(fields.get("companion_id") orelse .null);
+                    var chosen: ?*const companion_roster.Companion = roster.activeConst();
+                    if (wanted) |id| for (roster.items()) |*entry| {
+                        if (entry.id.eql(id)) chosen = entry;
+                    };
+                    if (chosen) |entry| {
+                        name = try arena.dupe(u8, entry.name.slice());
+                        tagline = companion_roster.characterTagline(entry.character);
+                        orders = try arena.dupe(u8, entry.orders.slice());
+                        companion_id = try arena.dupe(u8, entry.id.slice());
+                        home_workspace_id = try arena.dupe(u8, entry.home_workspace_id.slice());
+                        thread_id = try arena.dupe(u8, entry.thread_id.slice());
+                    }
+                } else |_| {}
+            }
+        }
+    }
+
+    const session = voice.createSession(
+        arena,
+        &config,
+        provider,
+        jsonString(fields.get("model") orelse .null),
+        jsonString(fields.get("voice") orelse .null),
+        nowMs(),
+        voice.httpPost,
+    ) catch |err| switch (err) {
+        error.ProviderNotConfigured => return try errorResponseAlloc(allocator, id_value, "voice_not_configured", "this voice provider has no API key on the desktop"),
+        error.ProviderRejectedKey => return try errorResponseAlloc(allocator, id_value, "voice_key_rejected", "the voice provider rejected the API key"),
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return try errorResponseAlloc(allocator, id_value, "voice_provider_unavailable", "could not reach the voice provider"),
+    };
+    const instructions = try voice.instructionsAlloc(arena, name, tagline, orders);
+    const tools = try std.json.parseFromSliceLeaky(std.json.Value, arena, voice.TOOLS_JSON, .{});
+    try beginOk(&s, id_value);
+    try s.objectField("result");
+    try s.write(.{
+        .provider = @tagName(session.provider),
+        .protocol = session.provider.protocol(),
+        .model = session.model,
+        .voice = session.voice,
+        .token = session.token,
+        .expires_at_ms = session.expires_at_ms,
+        .websocket_url = session.websocket_url,
+        .auth = session.auth,
+        .instructions = instructions,
+        .tools = tools,
+        .companion = .{ .id = companion_id, .name = name, .home_workspace_id = home_workspace_id, .thread_id = thread_id },
+    });
+    try s.endObject();
+    return writer.toOwnedSlice();
+}
+
+/// Persona note when `turn` runs on a machine Companion thread.
+fn companionNoteForTurnAlloc(daemon: *Daemon, allocator: std.mem.Allocator, turn: *ChatTurn) ?[]u8 {
+    lockDaemon(daemon);
+    const service = daemon.store_service;
+    if (service) |svc| _ = svc.in_flight.fetchAdd(1, .monotonic);
+    daemon.mutex.unlock();
+    const svc = service orelse return null;
+    defer _ = svc.in_flight.fetchSub(1, .monotonic);
+    lockStoreService(svc);
+    defer svc.mutex.unlock();
+    return companions.noteForThread(svc.store.conn, allocator, turn.workspace_id, turn.local_thread_id) catch |err| {
+        log.warn("companion persona lookup failed: {s}", .{@errorName(err)});
+        return null;
+    };
+}
+
 fn browserHistoryResponse(daemon: *Daemon, id_value: std.json.Value, method: []const u8, params: std.json.Value) ![]u8 {
     const allocator = daemon.allocator;
     if (params != .object) {
@@ -18233,7 +18458,14 @@ fn chatTurnThread(daemon: *Daemon, turn: *ChatTurn) void {
         defer if (delegated_prompt) |text| allocator.free(text);
         const noted_prompt = if (turn.orchestration_note) |note| std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ turn.request.prompt, note }) catch null else null;
         defer if (noted_prompt) |text| allocator.free(text);
-        const user_prompt = delegated_prompt orelse noted_prompt orelse turn.request.prompt;
+        const base_prompt = delegated_prompt orelse noted_prompt orelse turn.request.prompt;
+        // Companion threads carry their orchestrator persona on every turn,
+        // whichever client (desktop, web, phone, child delivery) started it.
+        const companion_note = companionNoteForTurnAlloc(daemon, allocator, turn);
+        defer if (companion_note) |text| allocator.free(text);
+        const companion_prompt = if (companion_note) |note| std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ base_prompt, note }) catch null else null;
+        defer if (companion_prompt) |text| allocator.free(text);
+        const user_prompt = companion_prompt orelse base_prompt;
         const contextual_prompt = std.fmt.allocPrint(allocator, "{s}\n\n<verde_orchestration>\nYour Verde workspace_id is {s}; this chat's thread id is {s}; your current turn_id is {s}. When you delegate with open_chat or send_chat_message, pass this chat's thread id as parent_thread_id so the child links back here. Verde delivers child completion and input-needed status automatically; no timed wait loop is necessary. Once you no longer need a child's updates, call clear_linked_chats with its link_id to unlink it. If blocked on a missing decision or dependency, call report_chat_blocked with your turn_id and the precise reason, then yield.\n</verde_orchestration>", .{ user_prompt, turn.workspace_id, turn.local_thread_id, turn.turn_id }) catch null;
         defer if (contextual_prompt) |text| allocator.free(text);
         var provider_request = turn.request;
@@ -18514,7 +18746,7 @@ fn dispatchParentDeliveriesOnce(daemon: *Daemon) !void {
         lockStoreService(svc);
         defer svc.mutex.unlock();
         var rows = try svc.store.conn.rows(
-            \\select d.task_id,d.link_id,d.revision,l.workspace_id,l.parent_thread_id,l.local_thread_id,d.status,d.summary
+            \\select d.task_id,d.link_id,d.revision,coalesce(l.parent_workspace_id,l.workspace_id),l.parent_thread_id,l.local_thread_id,d.status,d.summary
             \\from chat_deliveries d join chat_links l on l.link_id=d.link_id
             \\where d.delivered=0 and l.delivery_enabled=1 order by d.rowid
         , .{});
@@ -18872,7 +19104,8 @@ fn captureChildToolValue(daemon: *Daemon, turn: *ChatTurn, value: std.json.Value
                 if (!std.mem.eql(u8, tool, "open_chat") and !std.mem.eql(u8, tool, "send_chat_message")) return;
                 const workspace = jsonString(object.get("workspace_id") orelse .null) orelse return;
                 const child = jsonString(object.get("local_thread_id") orelse .null) orelse return;
-                if (!std.mem.eql(u8, workspace, turn.workspace_id)) return;
+                // Children may live in any workspace: a machine-wide parent
+                // (the Companion) delegates across the whole machine.
                 lockDaemon(daemon);
                 const service = daemon.store_service;
                 if (service) |svc| _ = svc.in_flight.fetchAdd(1, .monotonic);
@@ -18881,7 +19114,7 @@ fn captureChildToolValue(daemon: *Daemon, turn: *ChatTurn, value: std.json.Value
                 defer _ = svc.in_flight.fetchSub(1, .monotonic);
                 lockStoreService(svc);
                 defer svc.mutex.unlock();
-                try chat_links.link(svc.store.conn, daemon.allocator, workspace, turn.local_thread_id, child);
+                try chat_links.linkAcross(svc.store.conn, daemon.allocator, turn.workspace_id, turn.local_thread_id, workspace, child);
                 // A very short child may have completed before its tool result
                 // reached the parent. Backfill the durable notification once,
                 // only for work started during this parent turn: messaging an
@@ -18890,12 +19123,12 @@ fn captureChildToolValue(daemon: *Daemon, turn: *ChatTurn, value: std.json.Value
                     \\insert or ignore into chat_deliveries(task_id,link_id,revision,status,summary)
                     \\select t.task_id,l.link_id,t.revision,t.status,t.summary from chat_tasks t
                     \\join chat_links l on l.workspace_id=t.workspace_id and l.local_thread_id=t.local_thread_id
-                    \\where l.workspace_id=? and l.parent_thread_id=? and l.local_thread_id=? and t.status<>'running'
+                    \\where l.workspace_id=? and l.parent_thread_id=? and l.local_thread_id=? and coalesce(l.parent_workspace_id,l.workspace_id)=? and t.status<>'running'
                     \\and t.created_at_ms>=? and
                 ++ chat_links.ORIGIN_MATCHES_SQL ++
                     \\
                     \\and not exists(select 1 from chat_deliveries d where d.task_id=t.task_id and d.link_id=l.link_id and d.status=t.status and d.summary=t.summary)
-                , .{ workspace, turn.local_thread_id, child, turn.started_at_ms });
+                , .{ workspace, turn.local_thread_id, child, turn.workspace_id, turn.started_at_ms });
                 return;
             }
             var it = object.iterator();

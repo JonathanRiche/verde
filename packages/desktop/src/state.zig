@@ -60,6 +60,8 @@ const command_controller = @import("state/command_controller.zig");
 const acknowledgement_controller = @import("state/acknowledgement_controller.zig");
 const composer_controller = @import("state/composer_controller.zig");
 const companion_controller = @import("state/companion_controller.zig");
+const companion_roster_mod = @import("state/companion_roster.zig");
+const companion_sync_mod = @import("state/companion_sync.zig");
 const linked_chats_controller = @import("state/linked_chats_controller.zig");
 pub const resource_waiters_controller = @import("state/resource_waiters.zig");
 const browser_controller = @import("state/browser_controller.zig");
@@ -3042,22 +3044,35 @@ fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromp
 
 fn companionComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromptEvent) void {
     const state = appStateFromContext(context) orelse return;
-    const project = state.currentProjectMutable();
     switch (event) {
         .text_changed => |text| {
+            // Rename and standing-order edits live only in the composer until submitted.
+            if (state.companion_controller.editingSettings()) return;
             canonicalizeCompanionTextChange(state, text) catch |err| {
                 log.err("failed to create Companion thread for draft: {s}", .{@errorName(err)});
-                state.companion_controller.ui_error = "Could not save Companion draft.";
+                state.companion_controller.ui_error = "Could not save the companion draft.";
             };
         },
-        .submitted => |text| submitCompanionPrompt(state, project, text),
+        .submitted => |text| {
+            if (state.companion_controller.rename_mode) return state.finishCompanionRename(text);
+            if (state.companion_controller.orders_mode) return state.finishCompanionOrders(text);
+            submitCompanionPrompt(state, text);
+        },
         .send_clicked => {
-            const local_id = project.companion_thread_local_id orelse return;
-            const thread = state.threadByLocalId(project.id, local_id) orelse return;
+            if (state.companion_controller.rename_mode) return state.finishCompanionRename(state.companion_composer.text());
+            if (state.companion_controller.orders_mode) return state.finishCompanionOrders(state.companion_composer.text());
+            const location = state.activeCompanionThreadLocation() orelse return;
+            const project = &state.project_controller.projects.items[location.project_index];
+            const thread = &project.threads.items[location.thread_index];
             if (thread.isSendPendingForUi()) {
-                const stopped = state.abortThreadByLocalId(project.id, local_id);
-                state.companion_controller.ui_error = if (stopped) null else "Companion thread is no longer available.";
+                const stopped = state.abortThreadByLocalId(project.id, thread.local_thread_id);
+                state.companion_controller.ui_error = if (stopped) null else "The companion's turn could not be stopped.";
             }
+        },
+        // The composer's model pill is the companion's brain picker.
+        .model_clicked => {
+            state.companion_controller.openMenu(.brain);
+            state.markDirty();
         },
         .focus_changed => |focused| {
             if (focused) {
@@ -3070,57 +3085,43 @@ fn companionComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPro
     }
 }
 
+/// Mirrors composer text into the active companion's durable draft. Empty
+/// text never creates a thread, so opening the panel stays side-effect free.
 fn canonicalizeCompanionTextChange(state: anytype, text: []const u8) !void {
-    const project = state.currentProjectMutable();
     const thread = existing: {
-        if (project.companion_thread_local_id) |local_id| {
-            if (state.threadByLocalId(project.id, local_id)) |value| break :existing value;
-        }
+        if (state.activeCompanionThread()) |value| break :existing value;
         if (text.len == 0) return;
-        break :existing try state.ensureCurrentCompanionThread();
+        const created = try state.ensureActiveCompanionThread();
+        break :existing created.thread;
     };
     thread.setDraft(text);
     state.markDirty();
 }
 
-fn submitCompanionPrompt(state: anytype, project: *Project, text: []const u8) void {
-    var temporary_thread: ?ChatThread = null;
-    defer if (temporary_thread) |*thread| thread.deinit(state.allocator);
-    const preflight_thread = existing: {
-        if (project.companion_thread_local_id) |local_id| {
-            if (state.threadByLocalId(project.id, local_id)) |thread| break :existing thread;
-        }
-        temporary_thread = ChatThread.init(state.allocator, "Companion") catch |err| {
-            log.err("failed to prepare Companion send: {s}", .{@errorName(err)});
-            return;
-        };
-        break :existing &temporary_thread.?;
+/// Sends to the active machine companion. Its thread lives in its home
+/// workspace, which need not be the workspace on screen.
+fn submitCompanionPrompt(state: anytype, text: []const u8) void {
+    if (std.mem.trim(u8, text, &std.ascii.whitespace).len == 0) return;
+    const location = state.ensureActiveCompanionThread() catch |err| {
+        log.err("failed to create Companion thread for send: {s}", .{@errorName(err)});
+        state.companion_controller.ui_error = "Could not start the companion's conversation.";
+        return;
     };
-    const preflight_ok = state.preflightThreadPrompt(
-        state.project_controller.selected_index,
-        preflight_thread,
-        text,
-        &.{},
-    ) catch |err| {
+    const preflight_ok = state.preflightThreadPrompt(location.project_index, location.thread, text, &.{}) catch |err| {
         log.err("Companion send preflight failed: {s}", .{@errorName(err)});
-        state.companion_controller.ui_error = "Companion provider is not ready.";
+        state.companion_controller.ui_error = "The companion's brain is not ready. Pick another in the brain menu.";
         return;
     };
     if (!preflight_ok) return;
-    const thread = state.ensureCurrentCompanionThread() catch |err| {
-        log.err("failed to create Companion thread for send: {s}", .{@errorName(err)});
-        state.companion_controller.ui_error = "Could not create Companion thread.";
-        return;
-    };
-    const workspace_id = state.allocator.dupe(u8, state.currentProject().id) catch |err| {
+    const workspace_id = state.allocator.dupe(u8, state.project_controller.projects.items[location.project_index].id) catch |err| {
         log.err("failed to capture Companion workspace identity: {s}", .{@errorName(err)});
-        state.companion_controller.ui_error = "Could not send Companion prompt.";
+        state.companion_controller.ui_error = "Could not send to the companion.";
         return;
     };
     defer state.allocator.free(workspace_id);
-    const local_thread_id = state.allocator.dupe(u8, thread.local_thread_id) catch |err| {
+    const local_thread_id = state.allocator.dupe(u8, location.thread.local_thread_id) catch |err| {
         log.err("failed to capture Companion thread identity: {s}", .{@errorName(err)});
-        state.companion_controller.ui_error = "Could not send Companion prompt.";
+        state.companion_controller.ui_error = "Could not send to the companion.";
         return;
     };
     defer state.allocator.free(local_thread_id);
@@ -3128,30 +3129,25 @@ fn submitCompanionPrompt(state: anytype, project: *Project, text: []const u8) vo
 
     const sent = sendCompanionThreadDraft(state, workspace_id, local_thread_id, text) catch |err| {
         log.err("failed to send Companion prompt: {s}", .{@errorName(err)});
-        state.companion_controller.ui_error = "Could not send Companion prompt.";
+        state.companion_controller.ui_error = "Could not send to the companion.";
         return;
     };
-    state.companion_controller.ui_error = if (sent) null else "Companion thread is no longer available.";
+    state.companion_controller.ui_error = if (sent) null else "The companion's conversation is no longer available.";
 }
 
 fn sendCompanionThreadDraft(state: anytype, workspace_id: []const u8, local_thread_id: []const u8, text: []const u8) !bool {
     const resolved = state.projectThreadIndexByLocalId(workspace_id, local_thread_id) orelse return false;
-    if (resolved.project_index != state.project_controller.selected_index) return false;
-    const project = state.currentProject();
-    const current_local_id = project.companion_thread_local_id orelse return false;
-    if (!std.mem.eql(u8, project.id, workspace_id) or !std.mem.eql(u8, current_local_id, local_thread_id)) return false;
+    if (!state.isActiveCompanionThread(workspace_id, local_thread_id)) return false;
     const thread = state.threadByLocalId(workspace_id, local_thread_id) orelse return false;
     thread.setDraft(text);
     state.markDirty();
     return state.sendThreadDraftWithUiPolicy(resolved.project_index, resolved.thread_index, false);
 }
 
+/// After a send, shows the owner's canonical (normally cleared) draft — but
+/// only if that companion is still the active one.
 fn projectCompanionDraftForOwner(state: anytype, workspace_id: []const u8, local_thread_id: []const u8) void {
-    const resolved = state.projectThreadIndexByLocalId(workspace_id, local_thread_id) orelse return;
-    if (resolved.project_index != state.project_controller.selected_index) return;
-    const project = state.currentProject();
-    const current_local_id = project.companion_thread_local_id orelse return;
-    if (!std.mem.eql(u8, project.id, workspace_id) or !std.mem.eql(u8, current_local_id, local_thread_id)) return;
+    if (!state.isActiveCompanionThread(workspace_id, local_thread_id)) return;
     const thread = state.threadByLocalId(workspace_id, local_thread_id) orelse return;
     if (std.mem.eql(u8, state.companion_composer.text(), thread.currentDraft())) return;
     const callbacks = state.companion_composer.callbacks;
@@ -4890,6 +4886,10 @@ pub const AppState = struct {
     prefix_help_selected: usize,
     composer_controller: ComposerControllerState,
     companion_controller: companion_controller,
+    /// Machine-wide Companion roster (names, characters, brains, threads).
+    companion_roster: companion_roster_mod = .{},
+    /// Background sync with the daemon-owned roster.
+    companion_sync: companion_sync_mod = .{},
     /// Daemon-linked child chats shown in the parent pane drawer.
     linked_chats: linked_chats_controller = .{},
     /// Chats blocked on workspace resources, resumed when they free up.
@@ -5157,6 +5157,8 @@ pub const AppState = struct {
             .prefix_help_selected = 0,
             .composer_controller = ComposerControllerState.init(),
             .companion_controller = companion_controller.init(),
+            .companion_roster = companion_roster_mod.init(),
+            .companion_sync = .{},
             .linked_chats = linked_chats_controller.init(),
             .companion_composer = CompanionComposerPrompt.init(),
             .palette_overlay_batch = .{},
@@ -13048,17 +13050,311 @@ pub const AppState = struct {
         self.companion_controller.clearHits();
     }
 
+    pub const CompanionThreadLocation = struct { project_index: usize, thread_index: usize };
+    pub const CompanionThreadRef = struct { project_index: usize, thread: *ChatThread };
+
+    /// Prompts offered on an empty conversation. Each is a real orchestration
+    /// request the companion can act on with Verde's MCP tools.
+    pub const COMPANION_SUGGESTIONS = [_][]const u8{
+        "What's running across my workspaces right now?",
+        "Check every workspace for chats that need me.",
+        "Start the dev servers for this workspace and watch them.",
+    };
+
+    /// Keeps the roster in step with the daemon, adopts the legacy
+    /// per-workspace Companion once, and guarantees at least one companion
+    /// exists once the daemon roster has arrived.
+    pub fn ensureCompanionRoster(self: *AppState) void {
+        self.pollCompanionSync();
+        const roster = &self.companion_roster;
+        if (!roster.loaded) return;
+        if (roster.needs_legacy_adoption and self.project_controller.projects.items.len > 0) {
+            roster.needs_legacy_adoption = false;
+            self.adoptLegacyCompanions();
+        }
+        if (roster.count == 0) _ = roster.add(self.app_config.companion_character, null, unixTimestampMs());
+        self.pollCompanionSync();
+    }
+
+    /// Applies a daemon roster snapshot. The first one decides migration: a
+    /// never-stored daemon roster imports the desktop's legacy file, or flags
+    /// the legacy per-workspace threads for adoption.
+    fn applyCompanionSnapshot(self: *AppState, revision: i64, json: []const u8) void {
+        const roster = &self.companion_roster;
+        if (!roster.loaded) {
+            roster.loaded = true;
+            roster.revision = revision;
+            if (revision == 0) {
+                if (roster.loadLegacyFile(self.allocator, self.storage.pref_path)) {
+                    roster.dirty = true;
+                } else {
+                    roster.needs_legacy_adoption = true;
+                }
+                return;
+            }
+        } else if (revision <= roster.revision or roster.dirty) {
+            return;
+        }
+        var next = companion_roster_mod.init();
+        next.parse(self.allocator, json) catch |err| {
+            log.warn("ignoring unreadable daemon companion roster: {s}", .{@errorName(err)});
+            return;
+        };
+        next.loaded = true;
+        next.revision = revision;
+        next.id_counter = roster.id_counter;
+        roster.* = next;
+        self.markDirty();
+    }
+
+    /// Collects finished roster requests, pushes local edits, and refreshes
+    /// periodically so edits from a phone or the web show up here.
+    fn pollCompanionSync(self: *AppState) void {
+        const roster = &self.companion_roster;
+        const now = unixTimestampMs();
+        switch (self.companion_sync.poll(self.allocator)) {
+            .none => {},
+            .fetched => |fetched| {
+                defer self.allocator.free(fetched.json);
+                self.applyCompanionSnapshot(fetched.revision, fetched.json);
+            },
+            .stored => |revision| roster.revision = revision,
+            .conflict => {
+                // Another client won; take its roster rather than clobbering it.
+                roster.dirty = false;
+                self.companion_sync.requestGet(self.storage.pref_path, now);
+            },
+            .failed => {},
+        }
+        if (self.companion_sync.busy()) return;
+        if (roster.loaded and roster.dirty) {
+            const encoded = roster.encodeAlloc(self.allocator) catch return;
+            defer self.allocator.free(encoded);
+            if (self.companion_sync.requestPut(self.storage.pref_path, encoded, roster.revision)) roster.dirty = false;
+            return;
+        }
+        if (!roster.loaded or now - self.companion_sync.last_fetch_started_ms >= companion_sync_mod.REFRESH_MS) {
+            self.companion_sync.requestGet(self.storage.pref_path, now);
+        }
+    }
+
+    /// Used only when the user acts before the first background fetch landed.
+    fn loadCompanionRosterBlocking(self: *AppState) void {
+        if (self.companion_roster.loaded) return;
+        const response = daemon_client.requestAllocWithTimeout(self.allocator, self.storage.pref_path, companion_sync_mod.METHOD_GET, .{}, 1, 3_000) catch |err| {
+            log.warn("companion roster fetch failed: {s}", .{@errorName(err)});
+            return;
+        };
+        defer self.allocator.free(response);
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, response, .{}) catch return;
+        defer parsed.deinit();
+        if (parsed.value != .object) return;
+        const result = parsed.value.object.get("result") orelse return;
+        if (result != .object) return;
+        const revision: i64 = switch (result.object.get("revision") orelse .null) {
+            .integer => |value| value,
+            else => 0,
+        };
+        const roster_json = std.json.Stringify.valueAlloc(self.allocator, result.object.get("roster") orelse return, .{}) catch return;
+        defer self.allocator.free(roster_json);
+        self.applyCompanionSnapshot(revision, roster_json);
+        self.ensureCompanionRoster();
+    }
+
+    /// Folds the old one-Companion-per-workspace threads into the machine
+    /// roster: the most recently active one with history becomes the first
+    /// companion's conversation; the rest return to their workspace history.
+    fn adoptLegacyCompanions(self: *AppState) void {
+        const Best = struct { project_index: usize, thread_index: usize, activity: i64 };
+        var best: ?Best = null;
+        for (self.project_controller.projects.items, 0..) |*project, project_index| {
+            const local_id = project.companion_thread_local_id orelse continue;
+            for (project.threads.items, 0..) |*thread, thread_index| {
+                if (!std.mem.eql(u8, thread.local_thread_id, local_id) or !thread.committed) continue;
+                if (best == null or thread.last_activity_at > best.?.activity) {
+                    best = .{ .project_index = project_index, .thread_index = thread_index, .activity = thread.last_activity_at };
+                }
+            }
+        }
+        const roster = &self.companion_roster;
+        if (best) |found| {
+            const target = for (roster.entries[0..roster.count], 0..) |*entry, index| {
+                if (entry.thread_id.isEmpty()) break index;
+            } else blk: {
+                _ = roster.add(self.app_config.companion_character, null, unixTimestampMs()) orelse return;
+                break :blk roster.count - 1;
+            };
+            const project = &self.project_controller.projects.items[found.project_index];
+            roster.bindThread(target, project.id, project.threads.items[found.thread_index].local_thread_id);
+        }
+        var released = false;
+        for (self.project_controller.projects.items, 0..) |*project, project_index| {
+            const local_id = project.companion_thread_local_id orelse continue;
+            if (best) |found| if (found.project_index == project_index) continue;
+            self.allocator.free(local_id);
+            project.companion_thread_local_id = null;
+            project.sidebar_thread_cache_dirty = true;
+            released = true;
+        }
+        if (released) self.markDirty();
+    }
+
+    pub fn activeCompanionThreadLocation(self: *AppState) ?CompanionThreadLocation {
+        const companion = self.companion_roster.activeConst() orelse return null;
+        if (companion.thread_id.isEmpty()) return null;
+        const resolved = self.projectThreadIndexByLocalId(companion.home_workspace_id.slice(), companion.thread_id.slice()) orelse return null;
+        return .{ .project_index = resolved.project_index, .thread_index = resolved.thread_index };
+    }
+
+    pub fn activeCompanionThread(self: *AppState) ?*ChatThread {
+        const location = self.activeCompanionThreadLocation() orelse return null;
+        return &self.project_controller.projects.items[location.project_index].threads.items[location.thread_index];
+    }
+
+    pub fn isActiveCompanionThread(self: *AppState, workspace_id: []const u8, local_thread_id: []const u8) bool {
+        const companion = self.companion_roster.activeConst() orelse return false;
+        return companion.hasThread(workspace_id, local_thread_id);
+    }
+
+    fn projectIndexByWorkspaceId(self: *const AppState, workspace_id: []const u8) ?usize {
+        if (workspace_id.len == 0) return null;
+        for (self.project_controller.projects.items, 0..) |*project, index| {
+            if (std.mem.eql(u8, project.id, workspace_id)) return index;
+        }
+        return null;
+    }
+
+    /// Resolves or creates the active companion's thread. A new thread lands
+    /// in the companion's previous home when that workspace still exists, else
+    /// in the workspace on screen; it never changes panes or selection.
+    pub fn ensureActiveCompanionThread(self: *AppState) !CompanionThreadRef {
+        self.loadCompanionRosterBlocking();
+        self.ensureCompanionRoster();
+        if (!self.companion_roster.loaded) return error.DaemonUnavailable;
+        if (self.activeCompanionThreadLocation()) |location| {
+            return .{
+                .project_index = location.project_index,
+                .thread = &self.project_controller.projects.items[location.project_index].threads.items[location.thread_index],
+            };
+        }
+        if (self.project_controller.projects.items.len == 0) return error.WorkspaceNotFound;
+        const roster_index = self.companion_roster.active_index;
+        const companion = self.companion_roster.active() orelse return error.WorkspaceNotFound;
+        const project_index = self.projectIndexByWorkspaceId(companion.home_workspace_id.slice()) orelse self.project_controller.selected_index;
+        const project = &self.project_controller.projects.items[project_index];
+        {
+            var thread = try ChatThread.init(self.allocator, companion.name.slice());
+            self.project_controller.projects.items[project_index].threads.append(self.allocator, thread) catch |err| {
+                thread.deinit(self.allocator);
+                return err;
+            };
+        }
+        const thread_index = project.threads.items.len - 1;
+        self.applyNewChatDefaults(project_index, thread_index) catch |err| {
+            log.warn("failed to apply companion chat defaults: {s}", .{@errorName(err)});
+        };
+        const thread = &project.threads.items[thread_index];
+        self.applyCompanionBrainPreference(thread, companion);
+        if (project.companion_thread_local_id == null) {
+            project.companion_thread_local_id = try self.allocator.dupeZ(u8, thread.local_thread_id);
+        }
+        self.companion_roster.bindThread(roster_index, project.id, thread.local_thread_id);
+        self.applyCompanionDesignations();
+        self.pollCompanionSync();
+        self.markDirty();
+        self.flushDirtyBlocking();
+        return .{ .project_index = project_index, .thread = &self.project_controller.projects.items[project_index].threads.items[thread_index] };
+    }
+
+    /// Applies a companion's saved brain to a brand-new thread.
+    fn applyCompanionBrainPreference(self: *AppState, thread: *ChatThread, companion: *const companion_roster_mod.Companion) void {
+        const provider = std.meta.stringToEnum(Provider, companion.provider.slice()) orelse return;
+        if (thread.provider != provider) {
+            self.applyProviderModelDefaults(thread, provider, false) catch |err| {
+                log.warn("failed to apply companion brain: {s}", .{@errorName(err)});
+                return;
+            };
+        }
+        if (companion.model.isEmpty() or !self.providerSupportsModel(provider, companion.model.slice())) return;
+        const model = self.allocator.dupeZ(u8, companion.model.slice()) catch return;
+        defer self.allocator.free(model);
+        self.setThreadModelRef(thread, model);
+    }
+
+    /// Re-applies which threads are companions so every workspace's thread
+    /// list hides them. Cheap: the roster holds at most eight companions.
+    fn applyCompanionDesignations(self: *AppState) void {
+        for (self.project_controller.projects.items) |*project| {
+            var ids: [companion_roster_mod.MAX_COMPANIONS][]const u8 = undefined;
+            var count: usize = 0;
+            for (self.companion_roster.items()) |*companion| {
+                if (companion.thread_id.isEmpty() or !companion.home_workspace_id.eql(project.id)) continue;
+                if (project.companion_thread_local_id) |primary| {
+                    if (companion.thread_id.eql(primary)) continue;
+                }
+                ids[count] = companion.thread_id.slice();
+                count += 1;
+            }
+            project.setCompanionExtraIds(ids[0..count]);
+        }
+    }
+
+    /// Releases the active companion's conversation back to its workspace
+    /// history (used when a brain switch must start fresh, or on removal).
+    fn releaseCompanionThreadAt(self: *AppState, roster_index: usize) void {
+        if (roster_index >= self.companion_roster.count) return;
+        const companion = &self.companion_roster.entries[roster_index];
+        if (companion.thread_id.isEmpty()) return;
+        if (self.projectIndexByWorkspaceId(companion.home_workspace_id.slice())) |project_index| {
+            const project = &self.project_controller.projects.items[project_index];
+            if (project.companion_thread_local_id) |primary| {
+                if (companion.thread_id.eql(primary)) {
+                    self.allocator.free(primary);
+                    project.companion_thread_local_id = null;
+                }
+            }
+            project.sidebar_thread_cache_dirty = true;
+        }
+        self.companion_roster.clearThread(roster_index);
+        self.applyCompanionDesignations();
+        self.markDirty();
+    }
+
+    /// Display name for completion notices; null for ordinary chats.
+    pub fn companionNameForThread(self: *AppState, project: *const Project, thread: *const ChatThread) ?[]const u8 {
+        if (self.isCompanionEnabled()) {
+            if (self.companion_roster.indexForThread(project.id, thread.local_thread_id)) |index| {
+                return self.companion_roster.entries[index].name.slice();
+            }
+        }
+        return if (project.isCompanionThread(thread)) "Companion" else null;
+    }
+
     pub fn syncCompanionProjection(self: *AppState) void {
         if (self.project_controller.projects.items.len == 0) return self.resetCompanionNoThreadPresentation();
+        self.ensureCompanionRoster();
+        self.applyCompanionDesignations();
+        self.syncCompanionIdentity();
+        self.syncCompanionCrew();
+        self.syncCompanionInbox();
+        const location = self.activeCompanionThreadLocation() orelse return self.resetCompanionNoThreadPresentation();
+        const project = &self.project_controller.projects.items[location.project_index];
+        self.syncCompanionFrameForThread(project, &project.threads.items[location.thread_index]);
+    }
+
+    /// Test seam for frame projection: projects the current workspace's
+    /// durable Companion marker without the roster.
+    fn syncCompanionMarkerProjectionForTest(self: *AppState) void {
+        if (self.project_controller.projects.items.len == 0) return self.resetCompanionNoThreadPresentation();
         const project = self.currentProjectMutable();
-        const local_id = project.companion_thread_local_id orelse {
-            self.resetCompanionNoThreadPresentation();
-            return;
-        };
-        const thread = self.threadByLocalId(project.id, local_id) orelse {
-            self.resetCompanionNoThreadPresentation();
-            return;
-        };
+        const local_id = project.companion_thread_local_id orelse return self.resetCompanionNoThreadPresentation();
+        const thread = self.threadByLocalId(project.id, local_id) orelse return self.resetCompanionNoThreadPresentation();
+        self.syncCompanionFrameForThread(project, thread);
+    }
+
+    /// Projects one companion thread's transcript, pending turn, approval,
+    /// and background processes into the bounded panel frame.
+    fn syncCompanionFrameForThread(self: *AppState, project: *const Project, thread: *const ChatThread) void {
         const owner_changed = !std.mem.eql(u8, self.companion_controller.presentation.workspace_id.slice(), project.id) or
             !std.mem.eql(u8, self.companion_controller.presentation.thread_id.slice(), thread.local_thread_id);
         if (owner_changed) {
@@ -13095,6 +13391,175 @@ pub const AppState = struct {
         self.companion_controller.setFrame(frame);
     }
 
+    fn companionBrainProviders(self: *AppState, out: *[companion_controller.MAX_BRAIN_PROVIDERS]Provider) usize {
+        var count: usize = 0;
+        for (COMPOSER_PROVIDER_OPTIONS) |candidate| {
+            if (count == out.len) break;
+            if (!self.app_config.isProviderEnabled(configChatProvider(candidate))) continue;
+            if (!self.providerUsable(candidate)) continue;
+            out[count] = candidate;
+            count += 1;
+        }
+        return count;
+    }
+
+    /// Model rows for the provider tab the brain menu is browsing.
+    pub fn companionBrainModelOptions(self: *AppState) []const ModelOption {
+        var providers: [companion_controller.MAX_BRAIN_PROVIDERS]Provider = undefined;
+        const count = self.companionBrainProviders(&providers);
+        const index = self.companion_controller.brain_provider_index;
+        if (index >= count) return &.{};
+        return composerModelOptions(self, providers[index]);
+    }
+
+    /// True when `model_index` is the active companion's current model.
+    pub fn companionBrainModelSelected(self: *AppState, model_index: usize) bool {
+        var providers: [companion_controller.MAX_BRAIN_PROVIDERS]Provider = undefined;
+        const count = self.companionBrainProviders(&providers);
+        const index = self.companion_controller.brain_provider_index;
+        if (index >= count) return false;
+        const thread = self.activeCompanionThread() orelse return false;
+        if (thread.provider != providers[index]) return false;
+        const current = self.composerModelIndex(thread.provider, thread.model_ref) orelse return false;
+        return current == model_index;
+    }
+
+    fn companionBrainLabel(self: *AppState, buffer: []u8) []const u8 {
+        const thread = self.activeCompanionThread() orelse {
+            const companion = self.companion_roster.activeConst() orelse return "New-chat default";
+            const provider = std.meta.stringToEnum(Provider, companion.provider.slice()) orelse return "New-chat default";
+            if (companion.model.isEmpty()) return utils.providerLabel(provider);
+            return std.fmt.bufPrint(buffer, "{s} · {s}", .{ utils.providerLabel(provider), companion.model.slice() }) catch utils.providerLabel(provider);
+        };
+        const options = composerModelOptions(self, thread.provider);
+        const model_label: []const u8 = if (self.composerModelIndex(thread.provider, thread.model_ref)) |index|
+            options[index].label
+        else if (thread.model_ref) |ref|
+            ref
+        else
+            "default";
+        return std.fmt.bufPrint(buffer, "{s} · {s}", .{ utils.providerLabel(thread.provider), model_label }) catch utils.providerLabel(thread.provider);
+    }
+
+    fn syncCompanionIdentity(self: *AppState) void {
+        const panel = &self.companion_controller;
+        var identity: companion_controller.Identity = .{};
+        const roster = &self.companion_roster;
+        if (roster.activeConst()) |companion| {
+            identity.name.set(companion.name.slice());
+            identity.orders.set(firstLine(companion.orders.slice()));
+            identity.character = companion.character;
+            identity.index = roster.active_index;
+            identity.count = roster.count;
+            var buffer: [256]u8 = undefined;
+            identity.brain.set(self.companionBrainLabel(&buffer));
+        } else {
+            identity.name.set(companion_roster_mod.characterDisplayName(self.app_config.companion_character));
+            identity.character = self.app_config.companion_character;
+        }
+        panel.identity = identity;
+
+        panel.roster_row_count = 0;
+        for (roster.items(), 0..) |*companion, index| {
+            if (panel.roster_row_count == panel.roster_rows.len) break;
+            var row: companion_controller.RosterRow = .{ .character = companion.character, .active = index == roster.active_index };
+            row.name.set(companion.name.slice());
+            panel.roster_rows[panel.roster_row_count] = row;
+            panel.roster_row_count += 1;
+        }
+
+        var providers: [companion_controller.MAX_BRAIN_PROVIDERS]Provider = undefined;
+        const provider_count = self.companionBrainProviders(&providers);
+        const current_provider: ?Provider = if (self.activeCompanionThread()) |thread| thread.provider else null;
+        panel.brain_provider_count = provider_count;
+        for (providers[0..provider_count], 0..) |provider, index| {
+            var entry: companion_controller.BrainProvider = .{ .selected = current_provider != null and current_provider.? == provider };
+            entry.label.set(utils.providerLabel(provider));
+            panel.brain_providers[index] = entry;
+        }
+        if (panel.brain_provider_index >= provider_count) panel.brain_provider_index = 0;
+    }
+
+    fn companionAttentionForLink(status: linked_chats_controller.Status) companion_controller.Attention {
+        return switch (status) {
+            .waiting_approval => .approval,
+            .blocked => .blocked,
+            .running => .running,
+            .failed, .aborted, .interrupted => .failed,
+            .completed => .done,
+            .idle, .unknown => .idle,
+        };
+    }
+
+    /// Chats the companion delegated to, from the daemon's orchestration
+    /// links. Asking for them here keeps the link list polled while shown.
+    fn syncCompanionCrew(self: *AppState) void {
+        var rows: [companion_controller.MAX_CREW]companion_controller.ChatRow = undefined;
+        var count: usize = 0;
+        if (self.activeCompanionThreadLocation()) |location| {
+            const project = &self.project_controller.projects.items[location.project_index];
+            const thread = &project.threads.items[location.thread_index];
+            if (self.linked_chats.markWanted(self.allocator, project.id, thread.local_thread_id, unixTimestampMs())) |parent| {
+                for (parent.entries.items) |entry| {
+                    if (entry.is_parent) continue;
+                    if (count == rows.len) break;
+                    var row: companion_controller.ChatRow = .{ .attention = companionAttentionForLink(entry.status) };
+                    const child_workspace = if (entry.workspace_id.len > 0) entry.workspace_id else project.id;
+                    if (!row.workspace_id.set(child_workspace) or !row.thread_id.set(entry.local_thread_id)) continue;
+                    row.title.set(if (entry.title.len > 0) entry.title else "Untitled chat");
+                    row.provider.set(entry.provider);
+                    row.detail.set(firstLine(entry.summary));
+                    rows[count] = row;
+                    count += 1;
+                }
+            }
+        }
+        self.companion_controller.setCrew(rows[0..count]);
+    }
+
+    /// Every chat on the machine that is waiting on the user, so the
+    /// companion can surface it no matter which workspace is on screen.
+    fn syncCompanionInbox(self: *AppState) void {
+        var rows: [companion_controller.MAX_INBOX]companion_controller.ChatRow = undefined;
+        var count: usize = 0;
+        for (self.project_controller.projects.items) |*project| {
+            for (project.threads.items) |*thread| {
+                if (count == rows.len) break;
+                if (project.isCompanionThread(thread)) continue;
+                var attention: ?companion_controller.Attention = null;
+                var detail: []const u8 = "";
+                const send_state = thread.send_state;
+                if (send_state.mutex.tryLock()) {
+                    defer send_state.mutex.unlock();
+                    if (send_state.status == .pending and send_state.pending_approval != null and send_state.approval_decision == null) {
+                        attention = .approval;
+                        detail = send_state.pending_approval.?.title;
+                    } else if (send_state.status == .failed and thread.completion_pending) {
+                        attention = .failed;
+                    }
+                    if (attention != null) {
+                        var row: companion_controller.ChatRow = .{ .attention = attention.? };
+                        if (row.workspace_id.set(project.id) and row.thread_id.set(thread.local_thread_id)) {
+                            row.title.set(if (thread.title.len > 0) thread.title else utils.providerLabel(thread.provider));
+                            var buffer: [192]u8 = undefined;
+                            row.detail.set(std.fmt.bufPrint(&buffer, "{s}{s}{s}", .{ project.label, if (detail.len > 0) " · " else "", firstLine(detail) }) catch project.label);
+                            row.provider.set(utils.providerLabel(thread.provider));
+                            rows[count] = row;
+                            count += 1;
+                        }
+                    }
+                }
+            }
+        }
+        self.companion_controller.setInbox(rows[0..count]);
+    }
+
+    fn firstLine(text: []const u8) []const u8 {
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        const end = std.mem.indexOfScalar(u8, trimmed, '\n') orelse trimmed.len;
+        return std.mem.trim(u8, trimmed[0..end], " \t\r");
+    }
+
     pub fn isCompanionEnabled(self: *const AppState) bool {
         return self.app_config.companion_enabled;
     }
@@ -13103,7 +13568,9 @@ pub const AppState = struct {
     /// thread and all provider/process state remain owned by their normal seams.
     pub fn reconcileCompanionAvailability(self: *AppState) void {
         if (self.isCompanionEnabled()) return;
-        if (self.companion_controller.mission_control_open) self.companion_controller.closeMissionControl();
+        self.companion_controller.closeMenu();
+        self.companion_controller.rename_mode = false;
+        self.companion_controller.orders_mode = false;
         self.companion_controller.clearHits();
         self.companion_controller.resetInputCaptures();
         self.blurCompanionComposer();
@@ -13111,14 +13578,16 @@ pub const AppState = struct {
 
     pub fn syncCompanionComposer(self: *AppState, rect: palette.Rect) void {
         if (self.project_controller.projects.items.len == 0) return;
-        const project = self.currentProjectMutable();
-        const thread = if (project.companion_thread_local_id) |local_id| self.threadByLocalId(project.id, local_id) else null;
-        const canonical_draft = if (thread) |value| value.currentDraft() else "";
-        if (!std.mem.eql(u8, self.companion_composer.text(), canonical_draft)) {
-            const callbacks = self.companion_composer.callbacks;
-            self.companion_composer.setCallbacks(.{});
-            self.companion_composer.setText(self.allocator, canonical_draft) catch {};
-            self.companion_composer.setCallbacks(callbacks);
+        const rename = self.companion_controller.editingSettings();
+        const thread = self.activeCompanionThread();
+        if (!rename) {
+            const canonical_draft = if (thread) |value| value.currentDraft() else "";
+            if (!std.mem.eql(u8, self.companion_composer.text(), canonical_draft)) {
+                const callbacks = self.companion_composer.callbacks;
+                self.companion_composer.setCallbacks(.{});
+                self.companion_composer.setText(self.allocator, canonical_draft) catch {};
+                self.companion_composer.setCallbacks(callbacks);
+            }
         }
         self.companion_composer.setCallbacks(.{
             .context = self,
@@ -13138,9 +13607,17 @@ pub const AppState = struct {
         self.companion_composer.setShowReasoningToggle(false);
         self.companion_composer.setShowFastToggle(false);
         self.companion_composer.setShowAccessToggle(false);
-        self.companion_composer.setModelLabel(self.allocator, "Workspace · verde") catch {};
-        self.companion_composer.setSendState(if (thread) |value| if (value.isSendPendingForUi()) .stop else .send else .send);
-        self.companion_composer.setPlaceholder(self.allocator, "Steer the run…") catch {};
+        self.companion_composer.setModelLabel(self.allocator, self.companion_controller.identity.brain.slice()) catch {};
+        const pending = if (thread) |value| value.isSendPendingForUi() else false;
+        self.companion_composer.setSendState(if (!rename and pending) .stop else .send);
+        var placeholder_buffer: [128]u8 = undefined;
+        const placeholder = if (self.companion_controller.orders_mode)
+            "Standing orders, e.g. \"Run tests before calling work done. Never push to main.\""
+        else if (rename)
+            "Type a new name, then press Enter"
+        else
+            std.fmt.bufPrint(&placeholder_buffer, "Ask {s} to run something across Verde…", .{self.companion_controller.identity.name.slice()}) catch "Ask your companion…";
+        self.companion_composer.setPlaceholder(self.allocator, placeholder) catch {};
     }
 
     pub fn routeCompanionComposerTextInput(self: *AppState, text: []const u8) bool {
@@ -13203,31 +13680,208 @@ pub const AppState = struct {
     }
 
     pub fn resolveCurrentCompanionApproval(self: *AppState, decision: provider_types.ApprovalDecision) bool {
-        if (self.project_controller.projects.items.len == 0) return false;
-        const project = self.currentProject();
-        const local_id = project.companion_thread_local_id orelse return false;
+        const location = self.activeCompanionThreadLocation() orelse return false;
+        const project = &self.project_controller.projects.items[location.project_index];
+        const thread = &project.threads.items[location.thread_index];
         const frame = &self.companion_controller.presentation;
         if (!frame.has_approval or !std.mem.eql(u8, frame.workspace_id.slice(), project.id) or
-            !std.mem.eql(u8, frame.thread_id.slice(), local_id)) return false;
-        return self.resolveThreadApprovalByLocalId(project.id, local_id, decision);
+            !std.mem.eql(u8, frame.thread_id.slice(), thread.local_thread_id)) return false;
+        return self.resolveThreadApprovalByLocalId(project.id, thread.local_thread_id, decision);
     }
 
-    pub fn ensureCurrentCompanionThread(self: *AppState) !*ChatThread {
-        if (self.project_controller.projects.items.len == 0) return error.WorkspaceNotFound;
-        const project = self.currentProjectMutable();
-        const had_valid_identity = valid: {
-            const local_id = project.companion_thread_local_id orelse break :valid false;
-            for (project.threads.items) |*candidate| {
-                if (std.mem.eql(u8, candidate.local_thread_id, local_id)) break :valid true;
-            }
-            break :valid false;
-        };
-        const thread = try project.ensureCompanionThread(self.allocator);
-        if (!had_valid_identity) {
-            self.markDirty();
-            self.flushDirtyBlocking();
+    fn afterCompanionRosterChange(self: *AppState) void {
+        self.companion_controller.closeMenu();
+        self.companion_controller.ui_error = null;
+        self.pollCompanionSync();
+        self.applyCompanionDesignations();
+        self.markDirty();
+    }
+
+    pub fn selectCompanion(self: *AppState, index: usize) void {
+        self.companion_controller.rename_mode = false;
+        self.companion_controller.orders_mode = false;
+        _ = self.companion_roster.select(index);
+        self.afterCompanionRosterChange();
+    }
+
+    pub fn cycleCompanion(self: *AppState, forward: bool) void {
+        self.companion_controller.rename_mode = false;
+        self.companion_controller.orders_mode = false;
+        _ = self.companion_roster.cycle(forward);
+        self.afterCompanionRosterChange();
+    }
+
+    /// Adds a companion with the first character not yet on the roster, then
+    /// asks for its name right away.
+    pub fn createCompanion(self: *AppState) void {
+        self.ensureCompanionRoster();
+        if (self.companion_roster.isFull()) {
+            self.companion_controller.ui_error = "You already have eight companions.";
+            return;
         }
-        return thread;
+        var character = self.app_config.companion_character;
+        for ([_]app_config.CompanionCharacter{ .sprout, .moss, .vireo }) |candidate| {
+            const used = for (self.companion_roster.items()) |*companion| {
+                if (companion.character == candidate) break true;
+            } else false;
+            if (!used) {
+                character = candidate;
+                break;
+            }
+        }
+        _ = self.companion_roster.add(character, null, unixTimestampMs()) orelse return;
+        self.afterCompanionRosterChange();
+        self.beginCompanionRename();
+    }
+
+    /// Removes the active companion. Its conversation stays in its home
+    /// workspace's history; the last companion cannot be removed.
+    pub fn removeActiveCompanion(self: *AppState) void {
+        if (self.companion_roster.count <= 1) {
+            self.companion_controller.ui_error = "Keep at least one companion.";
+            return;
+        }
+        const index = self.companion_roster.active_index;
+        self.releaseCompanionThreadAt(index);
+        _ = self.companion_roster.remove(index);
+        self.afterCompanionRosterChange();
+    }
+
+    pub fn setActiveCompanionCharacter(self: *AppState, character: app_config.CompanionCharacter) void {
+        _ = self.companion_roster.setCharacter(self.companion_roster.active_index, character);
+        self.afterCompanionRosterChange();
+    }
+
+    /// Puts the composer into rename mode, prefilled with the current name.
+    pub fn beginCompanionRename(self: *AppState) void {
+        const companion = self.companion_roster.activeConst() orelse return;
+        self.companion_controller.closeMenu();
+        self.companion_controller.rename_mode = true;
+        const callbacks = self.companion_composer.callbacks;
+        self.companion_composer.setCallbacks(.{});
+        self.companion_composer.setText(self.allocator, companion.name.slice()) catch {};
+        self.companion_composer.setCallbacks(callbacks);
+        _ = self.companion_composer.handleInput(self.allocator, .{ .focus = true }) catch {};
+        self.markDirty();
+    }
+
+    /// Puts the composer into standing-orders mode, prefilled with the
+    /// current orders.
+    pub fn beginCompanionOrders(self: *AppState) void {
+        const companion = self.companion_roster.activeConst() orelse return;
+        self.companion_controller.closeMenu();
+        self.companion_controller.rename_mode = false;
+        self.companion_controller.orders_mode = true;
+        const callbacks = self.companion_composer.callbacks;
+        self.companion_composer.setCallbacks(.{});
+        self.companion_composer.setText(self.allocator, companion.orders.slice()) catch {};
+        self.companion_composer.setCallbacks(callbacks);
+        _ = self.companion_composer.handleInput(self.allocator, .{ .focus = true }) catch {};
+        self.markDirty();
+    }
+
+    pub fn finishCompanionOrders(self: *AppState, text: []const u8) void {
+        self.companion_roster.setOrders(self.companion_roster.active_index, text);
+        self.companion_controller.orders_mode = false;
+        self.afterCompanionRosterChange();
+    }
+
+    /// Called when the window regains focus; offers a recap after a long absence.
+    pub fn noteCompanionReturn(self: *AppState) void {
+        if (!self.isCompanionEnabled()) return;
+        if (self.lifecycle.last_interaction_at_ms == 0) return;
+        const away = unixTimestampMs() - self.lifecycle.last_interaction_at_ms;
+        self.companion_controller.noteReturn(away);
+    }
+
+    pub fn sendCompanionRecap(self: *AppState) void {
+        const minutes = self.companion_controller.recap_minutes;
+        self.companion_controller.recap_available = false;
+        var buffer: [160]u8 = undefined;
+        const prompt = std.fmt.bufPrint(&buffer, "Catch me up: I was away for about {d} minutes. What finished, what is still running, and what needs me?", .{minutes}) catch
+            "Catch me up on what happened while I was away.";
+        submitCompanionPrompt(self, prompt);
+        self.markDirty();
+    }
+
+    pub fn finishCompanionRename(self: *AppState, text: []const u8) void {
+        if (!self.companion_roster.rename(self.companion_roster.active_index, text)) {
+            self.companion_controller.ui_error = "Names can't be blank.";
+            return;
+        }
+        self.companion_controller.rename_mode = false;
+        self.afterCompanionRosterChange();
+    }
+
+    pub fn selectCompanionBrainProvider(self: *AppState, index: usize) void {
+        if (index >= self.companion_controller.brain_provider_count) return;
+        self.companion_controller.brain_provider_index = index;
+        self.companion_controller.brain_scroll_y = 0.0;
+        self.markDirty();
+    }
+
+    /// Switches the active companion's brain. Same-provider model changes
+    /// apply in place; a committed conversation keeps its provider, so a new
+    /// provider starts a fresh conversation and the old one returns to its
+    /// workspace history.
+    pub fn setCompanionBrain(self: *AppState, model_index: usize) void {
+        var providers: [companion_controller.MAX_BRAIN_PROVIDERS]Provider = undefined;
+        const count = self.companionBrainProviders(&providers);
+        const provider_index = self.companion_controller.brain_provider_index;
+        if (provider_index >= count) return;
+        const provider = providers[provider_index];
+        const options = composerModelOptions(self, provider);
+        if (model_index >= options.len) return;
+        const value = options[model_index].value;
+        const roster_index = self.companion_roster.active_index;
+        if (self.activeCompanionThread()) |thread| {
+            if (thread.isSendPendingForUi()) {
+                self.companion_controller.ui_error = "Wait for the current turn to finish before switching brains.";
+                return;
+            }
+        }
+        self.companion_roster.setBrain(roster_index, @tagName(provider), value);
+        if (self.activeCompanionThread()) |thread| {
+            if (thread.provider != provider and !threadAllowsInPlaceProviderChoice(thread)) {
+                self.releaseCompanionThreadAt(roster_index);
+                self.companion_roster.setBrain(roster_index, @tagName(provider), value);
+                _ = self.ensureActiveCompanionThread() catch |err| {
+                    log.err("failed to start companion conversation with new brain: {s}", .{@errorName(err)});
+                    self.companion_controller.ui_error = "Could not switch the companion's brain.";
+                };
+            } else {
+                if (thread.provider != provider) {
+                    self.applyProviderModelDefaults(thread, provider, false) catch |err| {
+                        log.warn("failed to switch companion provider: {s}", .{@errorName(err)});
+                    };
+                }
+                self.setThreadModelRef(thread, value);
+            }
+        }
+        self.afterCompanionRosterChange();
+    }
+
+    /// Opens a crew or inbox chat in a pane and gets the companion out of the way.
+    pub fn openCompanionChatRow(self: *AppState, from_inbox: bool, index: usize) void {
+        const rows = if (from_inbox)
+            self.companion_controller.inbox[0..self.companion_controller.inbox_count]
+        else
+            self.companion_controller.crew[0..self.companion_controller.crew_count];
+        if (index >= rows.len) return;
+        const row = rows[index];
+        const resolved = self.projectThreadIndexByLocalId(row.workspace_id.slice(), row.thread_id.slice()) orelse {
+            self.companion_controller.ui_error = "That chat is no longer available.";
+            return;
+        };
+        self.selectThreadForProject(resolved.project_index, resolved.thread_index);
+        self.companion_controller.collapse();
+        self.blurCompanionComposer();
+    }
+
+    pub fn sendCompanionSuggestion(self: *AppState, index: usize) void {
+        if (index >= COMPANION_SUGGESTIONS.len) return;
+        submitCompanionPrompt(self, COMPANION_SUGGESTIONS[index]);
+        self.markDirty();
     }
 
     pub fn openCompanion(self: *AppState) void {
@@ -15289,7 +15943,10 @@ pub const AppState = struct {
     }
 
     fn setCurrentThreadModelRef(self: *AppState, value: ?[:0]const u8) void {
-        const thread = self.currentThreadMutable();
+        self.setThreadModelRef(self.currentThreadMutable(), value);
+    }
+
+    fn setThreadModelRef(self: *AppState, thread: *ChatThread, value: ?[:0]const u8) void {
         if (thread.model_ref) |existing| {
             if (value) |next| {
                 if (std.mem.eql(u8, existing, next)) return;
@@ -15639,6 +16296,7 @@ pub const AppState = struct {
         startShutdownWatchdog();
         // Join linked-chat fetch workers before any owner they read from goes away.
         self.linked_chats.deinit(self.allocator);
+        self.companion_sync.deinit();
         self.resource_waiters.deinit(self.allocator);
         // Flag the cursor loop first so an in-flight long-poll (bounded by
         // the 4s wait budget + 5s transport timeout) drains concurrently with
@@ -20269,167 +20927,6 @@ test "ordinary browser focus and deletion preserve exact pane runtime ownership"
     try std.testing.expect(!state.lifecycle.dirty);
 }
 
-test "opening Companion is lazy and leaves workspace ownership and persistence untouched" {
-    const allocator = std.testing.allocator;
-    var state: AppState = undefined;
-    // Fields read by modal key/text routing and new-chat defaults.
-    state.folder_browser = .{};
-    state.custom_agent_form = .{};
-    state.settings_controller.provider_setup = .{};
-    state.provider_controller = .{};
-    state.allocator = allocator;
-    state.app_config = .{ .companion_enabled = true };
-    state.project_controller.projects = .empty;
-    state.project_controller.selected_index = 0;
-    state.companion_controller = companion_controller.init();
-    state.companion_composer = CompanionComposerPrompt.init();
-    state.lifecycle.dirty = false;
-    defer {
-        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
-        state.project_controller.projects.deinit(allocator);
-        state.companion_composer.deinit(allocator);
-    }
-    var project = try Project.init(allocator, "lazy-companion", "Lazy", "/tmp/lazy-companion", 0);
-    state.project_controller.projects.append(allocator, project) catch |err| {
-        project.deinit(allocator);
-        return err;
-    };
-    const thread_count = state.currentProject().threads.items.len;
-    const pane_count = state.currentProject().workspace_layout.panes.items.len;
-    const selected_thread = state.currentProject().selected_thread_index;
-    const focused_pane = state.currentProject().workspace_layout.focused_pane_id;
-
-    state.openCompanion();
-    try std.testing.expectEqual(companion_controller.Visibility.sidecar_open, state.companion_controller.visibility);
-    try std.testing.expect(state.currentProject().companion_thread_local_id == null);
-    try std.testing.expectEqual(thread_count, state.currentProject().threads.items.len);
-    try std.testing.expectEqual(pane_count, state.currentProject().workspace_layout.panes.items.len);
-    try std.testing.expectEqual(selected_thread, state.currentProject().selected_thread_index);
-    try std.testing.expectEqual(focused_pane, state.currentProject().workspace_layout.focused_pane_id);
-    try std.testing.expect(!state.lifecycle.dirty);
-
-    state.companion_controller.collapse();
-    state.toggleCompanion();
-    try std.testing.expect(state.currentProject().companion_thread_local_id == null);
-    try std.testing.expectEqual(thread_count, state.currentProject().threads.items.len);
-    try std.testing.expect(!state.lifecycle.dirty);
-
-    state.companion_controller.ui_error = "stale";
-    state.companion_controller.presentation.control_error.set("stale action");
-    state.syncCompanionProjection();
-    try std.testing.expect(state.companion_controller.ui_error == null);
-    try std.testing.expect(!state.companion_controller.presentation.has_thread);
-    try std.testing.expectEqual(@as(usize, 0), state.companion_controller.presentation.control_error.slice().len);
-    try std.testing.expectEqualStrings("Ready", state.companion_controller.status_text);
-
-    state.currentProjectMutable().companion_thread_local_id = try allocator.dupeZ(u8, "stale-companion");
-    state.companion_controller.ui_error = "old UI error";
-    state.companion_controller.presentation.provider_error.set("old provider error");
-    state.syncCompanionProjection();
-    try std.testing.expect(state.companion_controller.ui_error == null);
-    try std.testing.expectEqual(@as(usize, 0), state.companion_controller.presentation.provider_error.slice().len);
-    try std.testing.expectEqualStrings("Ready", state.companion_controller.status_text);
-
-    _ = try state.currentProjectMutable().ensureCompanionThread(allocator);
-    state.syncCompanionProjection();
-    try std.testing.expect(state.companion_controller.ui_error == null);
-    try std.testing.expect(state.companion_controller.presentation.has_thread);
-    try std.testing.expectEqual(@as(usize, 0), state.companion_controller.presentation.provider_error.slice().len);
-    try std.testing.expectEqual(@as(usize, 0), state.companion_controller.presentation.control_error.slice().len);
-}
-
-test "Companion shared draft follows exact workspace owner without lazy stale text" {
-    const allocator = std.testing.allocator;
-    var state: AppState = undefined;
-    // Fields read by modal key/text routing and new-chat defaults.
-    state.folder_browser = .{};
-    state.custom_agent_form = .{};
-    state.settings_controller.provider_setup = .{};
-    state.provider_controller = .{};
-    state.allocator = allocator;
-    state.project_controller.projects = .empty;
-    state.project_controller.selected_index = 0;
-    state.companion_controller = companion_controller.init();
-    state.companion_controller.show();
-    state.companion_composer = CompanionComposerPrompt.init();
-    defer {
-        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
-        state.project_controller.projects.deinit(allocator);
-        state.companion_composer.deinit(allocator);
-    }
-    var project_a = try Project.init(allocator, "draft-a", "Draft A", "/tmp/draft-a", 0);
-    const a_thread = try project_a.ensureCompanionThread(allocator);
-    a_thread.setDraft("workspace A draft");
-    state.project_controller.projects.append(allocator, project_a) catch |err| {
-        project_a.deinit(allocator);
-        return err;
-    };
-    var project_b = try Project.init(allocator, "draft-b", "Draft B", "/tmp/draft-b", 0);
-    state.project_controller.projects.append(allocator, project_b) catch |err| {
-        project_b.deinit(allocator);
-        return err;
-    };
-    const b_thread_count = state.project_controller.projects.items[1].threads.items.len;
-    const b_pane_count = state.project_controller.projects.items[1].workspace_layout.panes.items.len;
-    const b_selection = state.project_controller.projects.items[1].selected_thread_index;
-
-    state.syncCompanionComposer(.{ .x = 10.0, .y = 20.0, .w = 320.0, .h = 92.0 });
-    try std.testing.expectEqualStrings("workspace A draft", state.companion_composer.text());
-    state.project_controller.selected_index = 1;
-    state.syncCompanionComposer(.{ .x = 10.0, .y = 20.0, .w = 320.0, .h = 92.0 });
-    try std.testing.expectEqualStrings("", state.companion_composer.text());
-    try std.testing.expect(state.currentProject().companion_thread_local_id == null);
-    try std.testing.expectEqual(b_thread_count, state.currentProject().threads.items.len);
-    try std.testing.expectEqual(b_pane_count, state.currentProject().workspace_layout.panes.items.len);
-    try std.testing.expectEqual(b_selection, state.currentProject().selected_thread_index);
-
-    const DraftState = struct {
-        allocator: std.mem.Allocator,
-        project: *Project,
-        project_controller: struct { selected_index: usize = 1 } = .{},
-        ensure_calls: usize = 0,
-        dirty_calls: usize = 0,
-
-        pub fn currentProjectMutable(self: *@This()) *Project {
-            return self.project;
-        }
-
-        pub fn threadByLocalId(self: *@This(), workspace_id: []const u8, local_id: []const u8) ?*ChatThread {
-            if (!std.mem.eql(u8, self.project.id, workspace_id)) return null;
-            for (self.project.threads.items) |*thread| if (std.mem.eql(u8, thread.local_thread_id, local_id)) return thread;
-            return null;
-        }
-
-        pub fn ensureCurrentCompanionThread(self: *@This()) !*ChatThread {
-            self.ensure_calls += 1;
-            return self.project.ensureCompanionThread(self.allocator);
-        }
-
-        pub fn markDirty(self: *@This()) void {
-            self.dirty_calls += 1;
-        }
-    };
-    var draft_state: DraftState = .{ .allocator = allocator, .project = &state.project_controller.projects.items[1] };
-    try canonicalizeCompanionTextChange(&draft_state, "");
-    try std.testing.expectEqual(@as(usize, 0), draft_state.ensure_calls);
-    try canonicalizeCompanionTextChange(&draft_state, "workspace B draft");
-    try std.testing.expectEqual(@as(usize, 1), draft_state.ensure_calls);
-    try std.testing.expectEqual(@as(usize, 1), draft_state.dirty_calls);
-    try std.testing.expectEqualStrings("workspace B draft", draft_state.project.threads.items[b_thread_count].currentDraft());
-    try std.testing.expectEqual(b_pane_count, draft_state.project.workspace_layout.panes.items.len);
-    try std.testing.expectEqual(b_selection, draft_state.project.selected_thread_index);
-
-    state.syncCompanionComposer(.{ .x = 10.0, .y = 20.0, .w = 320.0, .h = 92.0 });
-    try std.testing.expectEqualStrings("workspace B draft", state.companion_composer.text());
-    state.project_controller.selected_index = 0;
-    state.syncCompanionComposer(.{ .x = 10.0, .y = 20.0, .w = 320.0, .h = 92.0 });
-    try std.testing.expectEqualStrings("workspace A draft", state.companion_composer.text());
-    try std.testing.expectEqualStrings("workspace A draft", state.threadByLocalId(
-        state.project_controller.projects.items[0].id,
-        state.project_controller.projects.items[0].companion_thread_local_id.?,
-    ).?.currentDraft());
-}
-
 test "Companion frame projects transcript pending streaming lifecycle errors and process owner eviction" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
@@ -20496,7 +20993,7 @@ test "Companion frame projects transcript pending streaming lifecycle errors and
     };
     send_state.control_error_message = try std.heap.page_allocator.dupe(u8, "Control failed");
 
-    state.syncCompanionProjection();
+    state.syncCompanionMarkerProjectionForTest();
     var frame = &state.companion_controller.presentation;
     // Latest meaningful user prompt wins; whitespace-only prompts never clobber.
     try std.testing.expectEqualStrings("Then verify the release build", frame.objective.slice());
@@ -20520,7 +21017,7 @@ test "Companion frame projects transcript pending streaming lifecycle errors and
         .body = try std.heap.page_allocator.dupe(u8, "Actually, ship the hotfix first"),
     });
     send_state.pending_events.items[0].tool_call_status = .completed;
-    state.syncCompanionProjection();
+    state.syncCompanionMarkerProjectionForTest();
     frame = &state.companion_controller.presentation;
     try std.testing.expectEqual(@as(usize, 1), frame.operation_count);
     try std.testing.expectEqual(companion_controller.OperationStatus.completed, frame.operations[0].status);
@@ -20534,14 +21031,14 @@ test "Companion frame projects transcript pending streaming lifecycle errors and
         .author = try std.heap.page_allocator.dupe(u8, "Sprout"),
         .body = try std.heap.page_allocator.dupe(u8, "First heading: # Verde"),
     });
-    state.syncCompanionProjection();
+    state.syncCompanionMarkerProjectionForTest();
     frame = &state.companion_controller.presentation;
     // The assistant reply to the current objective becomes the visible answer.
     try std.testing.expectEqualStrings("First heading: # Verde", frame.answer.slice());
     try std.testing.expect(!frame.answer_failed);
 
     send_state.pending_events.items[0].tool_call_status = .failed;
-    state.syncCompanionProjection();
+    state.syncCompanionMarkerProjectionForTest();
     frame = &state.companion_controller.presentation;
     try std.testing.expectEqual(companion_controller.OperationStatus.failed, frame.operations[0].status);
     try std.testing.expectEqualStrings("Command failed", frame.operations[0].title.slice());
@@ -20553,18 +21050,18 @@ test "Companion frame projects transcript pending streaming lifecycle errors and
         .started_at_ms = 50,
         .updated_at_ms = 50,
     });
-    state.syncCompanionProjection();
+    state.syncCompanionMarkerProjectionForTest();
     try std.testing.expectEqual(@as(usize, 2), state.companion_controller.presentation.operation_count);
     var removed = thread.background_tasks.orderedRemove(0);
     removed.deinit(allocator);
-    state.syncCompanionProjection();
+    state.syncCompanionMarkerProjectionForTest();
     try std.testing.expectEqual(@as(usize, 1), state.companion_controller.presentation.operation_count);
 
     // A failed turn reports answer_failed while keeping whatever partial
     // answer already streamed; nothing is fabricated.
     send_state.status = .failed;
     send_state.error_message = try std.heap.page_allocator.dupe(u8, "Send failed: provider exited");
-    state.syncCompanionProjection();
+    state.syncCompanionMarkerProjectionForTest();
     frame = &state.companion_controller.presentation;
     try std.testing.expect(frame.answer_failed);
     try std.testing.expect(frame.has_failure);
@@ -20580,7 +21077,7 @@ test "Companion frame projects transcript pending streaming lifecycle errors and
         .author = try allocator.dupeZ(u8, "Sprout"),
         .body = try allocator.dupeZ(u8, "Committed: hotfix shipped"),
     });
-    state.syncCompanionProjection();
+    state.syncCompanionMarkerProjectionForTest();
     frame = &state.companion_controller.presentation;
     try std.testing.expectEqualStrings("Committed: hotfix shipped", frame.answer.slice());
     try std.testing.expect(!frame.answer_failed);
@@ -20625,11 +21122,11 @@ test "Companion projection scopes global failure posture to the current turn" {
     const send_state = thread.send_state;
 
     // Latest turn failed and no newer objective exists: posture stays red.
-    state.syncCompanionProjection();
+    state.syncCompanionMarkerProjectionForTest();
     var frame = &state.companion_controller.presentation;
     try std.testing.expect(frame.has_failure);
     try std.testing.expect(state.companion_controller.has_failure);
-    try std.testing.expectEqualStrings("Needs attention", state.companion_controller.status_text);
+    try std.testing.expectEqualStrings("Needs attention", state.companion_controller.statusText());
     try std.testing.expectEqual(companion_controller.OperationStatus.failed, frame.operations[0].status);
 
     // A newer meaningful objective clears the stale posture to working
@@ -20640,12 +21137,12 @@ test "Companion projection scopes global failure posture to the current turn" {
         .author = try std.heap.page_allocator.dupe(u8, "You"),
         .body = try std.heap.page_allocator.dupe(u8, "i meant read teh readme.md and use read tools"),
     });
-    state.syncCompanionProjection();
+    state.syncCompanionMarkerProjectionForTest();
     frame = &state.companion_controller.presentation;
     try std.testing.expect(!frame.has_failure);
     try std.testing.expect(!state.companion_controller.has_failure);
     try std.testing.expect(frame.working);
-    try std.testing.expectEqualStrings("Working", state.companion_controller.status_text);
+    try std.testing.expectEqualStrings("Working", state.companion_controller.statusText());
     // The failed operation remains as red evidence in the same snapshot.
     try std.testing.expectEqual(companion_controller.OperationStatus.failed, frame.operations[0].status);
 
@@ -20663,25 +21160,25 @@ test "Companion projection scopes global failure posture to the current turn" {
         .author = try allocator.dupeZ(u8, "Sprout"),
         .body = try allocator.dupeZ(u8, "The first heading is **Verde**."),
     });
-    state.syncCompanionProjection();
+    state.syncCompanionMarkerProjectionForTest();
     frame = &state.companion_controller.presentation;
     try std.testing.expect(!frame.has_failure);
     try std.testing.expect(!state.companion_controller.has_failure);
     try std.testing.expect(!frame.answer_failed);
-    try std.testing.expectEqualStrings("Ready", state.companion_controller.status_text);
+    try std.testing.expectEqualStrings("Ready", state.companion_controller.statusText());
     try std.testing.expectEqualStrings("The first heading is **Verde**.", frame.answer.slice());
     try std.testing.expectEqual(companion_controller.OperationStatus.failed, frame.operations[0].status);
     try std.testing.expectEqual(@as(usize, 1), frame.recentCount());
 
     // Current control and send failures still turn the posture red.
     send_state.control_error_message = try std.heap.page_allocator.dupe(u8, "Approval decision failed");
-    state.syncCompanionProjection();
+    state.syncCompanionMarkerProjectionForTest();
     try std.testing.expect(state.companion_controller.presentation.has_failure);
-    try std.testing.expectEqualStrings("Needs attention", state.companion_controller.status_text);
+    try std.testing.expectEqualStrings("Needs attention", state.companion_controller.statusText());
     send_state.control_error_message = null;
     send_state.status = .failed;
     send_state.error_message = try std.heap.page_allocator.dupe(u8, "Send failed: provider exited");
-    state.syncCompanionProjection();
+    state.syncCompanionMarkerProjectionForTest();
     frame = &state.companion_controller.presentation;
     try std.testing.expect(frame.has_failure);
     try std.testing.expect(frame.answer_failed);
@@ -20757,7 +21254,7 @@ test "Companion production projection rejects lossy identities and preserves own
     try thread.background_tasks.append(allocator, .{ .command = try allocator.dupeZ(u8, "legacy-first"), .status = .running });
     try thread.background_tasks.append(allocator, .{ .command = try allocator.dupeZ(u8, "legacy-survivor"), .status = .running });
 
-    state.syncCompanionProjection();
+    state.syncCompanionMarkerProjectionForTest();
     const frame = &state.companion_controller.presentation;
     try std.testing.expectEqual(@as(usize, 9), frame.operation_count);
     try std.testing.expectEqual(@as(usize, 9), frame.activity_count);
@@ -20791,7 +21288,7 @@ test "Companion production projection rejects lossy identities and preserves own
 
     var removed = thread.background_tasks.orderedRemove(6);
     removed.deinit(allocator);
-    state.syncCompanionProjection();
+    state.syncCompanionMarkerProjectionForTest();
     var shifted_survivor: ?companion_controller.PresentationText = null;
     for (state.companion_controller.presentation.operations[0..state.companion_controller.presentation.operation_count]) |operation| {
         if (std.mem.eql(u8, operation.detail.slice(), "legacy-survivor")) shifted_survivor = operation.identity;
@@ -20871,7 +21368,7 @@ test "Companion operation snapshots expose only exact live owner actions" {
     try thread.background_tasks.append(allocator, .{ .command = try allocator.dupeZ(u8, "duplicate command"), .status = .running });
     try thread.background_tasks.append(allocator, .{ .command = try allocator.dupeZ(u8, "duplicate command"), .status = .running });
 
-    state.syncCompanionProjection();
+    state.syncCompanionMarkerProjectionForTest();
     const frame = &state.companion_controller.presentation;
     try std.testing.expect(frame.owner.valid);
     var historical_index: ?usize = null;
@@ -20940,229 +21437,6 @@ test "Companion operation snapshots expose only exact live owner actions" {
     const focused_after = if (state.project_controller.projects.items[1].workspace_layout.focusedPane()) |pane| pane.id else null;
     try std.testing.expectEqual(focused_before, focused_after);
     try std.testing.expect(state.companion_controller.presentation.ui_error.slice().len > 0);
-}
-
-test "Companion submitted seam preflights before first persistence and reuses identity" {
-    const allocator = std.testing.allocator;
-    const Outcome = enum { reject, started, persistence_failure, ambiguous_failure };
-    const FakeState = struct {
-        allocator: std.mem.Allocator,
-        project: *Project,
-        project_controller: struct { selected_index: usize = 0 } = .{},
-        companion_controller: @TypeOf(companion_controller.init()) = companion_controller.init(),
-        companion_composer: CompanionComposerPrompt = CompanionComposerPrompt.init(),
-        preflight_outcome: Outcome = .reject,
-        send_outcome: Outcome = .started,
-        preflight_calls: usize = 0,
-        ensure_calls: usize = 0,
-        persistence_writes: usize = 0,
-        send_calls: usize = 0,
-        user_sends: usize = 0,
-        dirty_calls: usize = 0,
-        first_preflight_had_identity: bool = false,
-
-        pub fn currentProject(self: *const @This()) *const Project {
-            return self.project;
-        }
-
-        pub fn threadByLocalId(self: *@This(), workspace_id: []const u8, local_id: []const u8) ?*ChatThread {
-            if (!std.mem.eql(u8, self.project.id, workspace_id)) return null;
-            for (self.project.threads.items) |*thread| {
-                if (std.mem.eql(u8, thread.local_thread_id, local_id)) return thread;
-            }
-            return null;
-        }
-
-        pub fn preflightThreadPrompt(self: *@This(), _: usize, _: *const ChatThread, _: []const u8, _: []const ChatImageAttachment) !bool {
-            if (self.preflight_calls == 0) self.first_preflight_had_identity = self.project.companion_thread_local_id != null;
-            self.preflight_calls += 1;
-            if (self.project.companion_thread_local_id) |local_id| {
-                if (self.threadByLocalId(self.project.id, local_id)) |thread| if (thread.isSendPendingForUi()) return false;
-            }
-            return switch (self.preflight_outcome) {
-                .reject => false,
-                else => true,
-            };
-        }
-
-        pub fn ensureCurrentCompanionThread(self: *@This()) !*ChatThread {
-            self.ensure_calls += 1;
-            const had_identity = self.project.companion_thread_local_id != null;
-            const thread = try self.project.ensureCompanionThread(self.allocator);
-            if (!had_identity) self.persistence_writes += 1;
-            return thread;
-        }
-
-        pub fn projectThreadIndexByLocalId(self: *@This(), workspace_id: []const u8, local_id: []const u8) ?chat_controller.ProjectThreadIndex {
-            if (!std.mem.eql(u8, self.project.id, workspace_id)) return null;
-            for (self.project.threads.items, 0..) |*thread, index| {
-                if (std.mem.eql(u8, thread.local_thread_id, local_id)) return .{ .project_index = 0, .thread_index = index };
-            }
-            return null;
-        }
-
-        pub fn markDirty(self: *@This()) void {
-            self.dirty_calls += 1;
-        }
-
-        pub fn sendThreadDraftWithUiPolicy(self: *@This(), project_index: usize, thread_index: usize, update_selected_ui: bool) !bool {
-            try std.testing.expectEqual(@as(usize, 0), project_index);
-            try std.testing.expect(!update_selected_ui);
-            self.send_calls += 1;
-            const thread = &self.project.threads.items[thread_index];
-            return switch (self.send_outcome) {
-                .reject => false,
-                .started => accepted: {
-                    self.user_sends += 1;
-                    thread.clearDraft();
-                    thread.send_state.status = .pending;
-                    break :accepted true;
-                },
-                .persistence_failure => error.Busy,
-                .ambiguous_failure => ambiguous: {
-                    self.user_sends += 1;
-                    thread.clearDraft();
-                    break :ambiguous error.DaemonUnavailable;
-                },
-            };
-        }
-    };
-
-    var project = try Project.init(allocator, "submitted-seam", "Submitted", "/tmp/submitted-seam", 0);
-    defer project.deinit(allocator);
-    const initial_threads = project.threads.items.len;
-    const initial_panes = project.workspace_layout.panes.items.len;
-    const initial_selection = project.selected_thread_index;
-    var fake: FakeState = .{ .allocator = allocator, .project = &project };
-    defer fake.companion_composer.deinit(allocator);
-
-    submitCompanionPrompt(&fake, &project, "   \n");
-    try std.testing.expect(project.companion_thread_local_id == null);
-    try std.testing.expectEqual(initial_threads, project.threads.items.len);
-    try std.testing.expectEqual(@as(usize, 0), fake.ensure_calls);
-    try std.testing.expect(!fake.first_preflight_had_identity);
-
-    fake.preflight_outcome = .reject;
-    submitCompanionPrompt(&fake, &project, "valid");
-    try std.testing.expect(project.companion_thread_local_id == null);
-    try std.testing.expectEqual(@as(usize, 0), fake.persistence_writes);
-
-    fake.preflight_outcome = .started;
-    fake.send_outcome = .started;
-    try fake.companion_composer.setText(allocator, "first real send");
-    fake.companion_composer.focused = true;
-    submitCompanionPrompt(&fake, &project, "first real send");
-    const companion_id = try allocator.dupe(u8, project.companion_thread_local_id.?);
-    defer allocator.free(companion_id);
-    try std.testing.expectEqual(initial_threads + 1, project.threads.items.len);
-    try std.testing.expectEqual(@as(usize, 1), fake.persistence_writes);
-    try std.testing.expectEqual(initial_panes, project.workspace_layout.panes.items.len);
-    try std.testing.expectEqual(initial_selection, project.selected_thread_index);
-    const companion_thread = fake.threadByLocalId(project.id, companion_id).?;
-    try std.testing.expectEqualStrings("", companion_thread.currentDraft());
-    try std.testing.expectEqualStrings("", fake.companion_composer.text());
-    try std.testing.expect(fake.companion_composer.focused);
-    try std.testing.expectEqual(@as(usize, 1), fake.user_sends);
-
-    submitCompanionPrompt(&fake, &project, "repeat send");
-    try std.testing.expectEqualStrings(companion_id, project.companion_thread_local_id.?);
-    try std.testing.expectEqual(initial_threads + 1, project.threads.items.len);
-    try std.testing.expectEqual(@as(usize, 1), fake.persistence_writes);
-    try std.testing.expectEqual(@as(usize, 1), fake.user_sends);
-
-    companion_thread.send_state.status = .idle;
-    fake.send_outcome = .reject;
-    try fake.companion_composer.setText(allocator, "post-persist failure");
-    submitCompanionPrompt(&fake, &project, "post-persist failure");
-    try std.testing.expectEqualStrings(companion_id, project.companion_thread_local_id.?);
-    try std.testing.expectEqual(initial_threads + 1, project.threads.items.len);
-    try std.testing.expect(fake.companion_controller.ui_error != null);
-    try std.testing.expectEqualStrings("post-persist failure", companion_thread.currentDraft());
-    try std.testing.expectEqualStrings("post-persist failure", fake.companion_composer.text());
-    try std.testing.expect(fake.companion_composer.focused);
-
-    fake.send_outcome = .persistence_failure;
-    try fake.companion_composer.setText(allocator, "retry after persistence");
-    try std.testing.expectError(error.Busy, sendCompanionThreadDraft(&fake, project.id, companion_id, "retry after persistence"));
-    projectCompanionDraftForOwner(&fake, project.id, companion_id);
-    try std.testing.expectEqualStrings("retry after persistence", companion_thread.currentDraft());
-    try std.testing.expectEqualStrings("retry after persistence", fake.companion_composer.text());
-
-    fake.send_outcome = .ambiguous_failure;
-    try fake.companion_composer.setText(allocator, "ambiguously accepted");
-    try std.testing.expectError(error.DaemonUnavailable, sendCompanionThreadDraft(&fake, project.id, companion_id, "ambiguously accepted"));
-    projectCompanionDraftForOwner(&fake, project.id, companion_id);
-    try std.testing.expectEqualStrings("", companion_thread.currentDraft());
-    try std.testing.expectEqualStrings("", fake.companion_composer.text());
-    try std.testing.expectEqual(@as(usize, 2), fake.user_sends);
-}
-
-test "Companion post-send draft projection rejects a replaced workspace owner" {
-    const allocator = std.testing.allocator;
-    const FakeState = struct {
-        allocator: std.mem.Allocator,
-        projects: [2]*Project,
-        project_controller: struct { selected_index: usize = 0 } = .{},
-        companion_composer: CompanionComposerPrompt = CompanionComposerPrompt.init(),
-        addressed_sends: usize = 0,
-
-        pub fn currentProject(self: *const @This()) *const Project {
-            return self.projects[self.project_controller.selected_index];
-        }
-
-        pub fn threadByLocalId(self: *@This(), workspace_id: []const u8, local_id: []const u8) ?*ChatThread {
-            for (self.projects) |project| {
-                if (!std.mem.eql(u8, project.id, workspace_id)) continue;
-                for (project.threads.items) |*thread| if (std.mem.eql(u8, thread.local_thread_id, local_id)) return thread;
-            }
-            return null;
-        }
-
-        pub fn projectThreadIndexByLocalId(self: *@This(), workspace_id: []const u8, local_id: []const u8) ?chat_controller.ProjectThreadIndex {
-            for (self.projects, 0..) |project, project_index| {
-                if (!std.mem.eql(u8, project.id, workspace_id)) continue;
-                for (project.threads.items, 0..) |*thread, thread_index| {
-                    if (std.mem.eql(u8, thread.local_thread_id, local_id)) return .{ .project_index = project_index, .thread_index = thread_index };
-                }
-            }
-            return null;
-        }
-
-        pub fn markDirty(_: *@This()) void {}
-
-        pub fn sendThreadDraftWithUiPolicy(self: *@This(), project_index: usize, thread_index: usize, update_selected_ui: bool) !bool {
-            try std.testing.expectEqual(@as(usize, 0), project_index);
-            try std.testing.expect(!update_selected_ui);
-            self.addressed_sends += 1;
-            self.projects[project_index].threads.items[thread_index].clearDraft();
-            self.project_controller.selected_index = 1;
-            return true;
-        }
-    };
-
-    var owner = try Project.init(allocator, "draft-owner", "Owner", "/tmp/draft-owner", 0);
-    defer owner.deinit(allocator);
-    const owner_thread = try owner.ensureCompanionThread(allocator);
-    var replacement = try Project.init(allocator, "draft-replacement", "Replacement", "/tmp/draft-replacement", 0);
-    defer replacement.deinit(allocator);
-    const replacement_thread = try replacement.ensureCompanionThread(allocator);
-    replacement_thread.setDraft("replacement draft");
-
-    var fake: FakeState = .{ .allocator = allocator, .projects = .{ &owner, &replacement } };
-    defer fake.companion_composer.deinit(allocator);
-    try fake.companion_composer.setText(allocator, "owner prompt");
-    const workspace_id = try allocator.dupe(u8, owner.id);
-    defer allocator.free(workspace_id);
-    const local_thread_id = try allocator.dupe(u8, owner_thread.local_thread_id);
-    defer allocator.free(local_thread_id);
-
-    try std.testing.expect(try sendCompanionThreadDraft(&fake, workspace_id, local_thread_id, "owner prompt"));
-    projectCompanionDraftForOwner(&fake, workspace_id, local_thread_id);
-    try std.testing.expectEqual(@as(usize, 1), fake.addressed_sends);
-    try std.testing.expectEqual(@as(usize, 1), fake.project_controller.selected_index);
-    try std.testing.expectEqualStrings("", owner_thread.currentDraft());
-    try std.testing.expectEqualStrings("replacement draft", replacement_thread.currentDraft());
-    try std.testing.expectEqualStrings("owner prompt", fake.companion_composer.text());
 }
 
 test "visible chat is not treated as focused when a sibling pane owns focus" {

@@ -955,8 +955,8 @@ fn syncMouseCursor(state: *AppState, cache: *CursorState) void {
 
 fn systemCursorForCompanionAction(action: companion_controller.HitAction) palette.platform.CursorShape {
     return switch (action) {
-        .open, .collapse, .mission_control_open, .mission_control_close, .run_tab, .activity_tab, .approve, .deny, .operation_select, .operation_stop, .operation_follow_log => .pointer,
-        .panel, .body => .default,
+        .panel, .body, .menu_dismiss => .default,
+        else => .pointer,
     };
 }
 
@@ -996,26 +996,30 @@ test "production Companion wheel routing preserves direct ownership" {
     state.provider_controller = .{};
     state.allocator = allocator;
     state.app_config = .{ .companion_enabled = true };
+    state.project_controller = .{};
     state.companion_controller = companion_controller.init();
     state.companion_controller.show();
+    state.companion_roster = .{};
     state.companion_composer = native_state.CompanionComposerPrompt.init();
-    state.companion_composer.setBounds(.{ .x = 200.0, .y = 200.0, .w = 100.0, .h = 100.0 });
+    state.companion_composer.setBounds(.{ .x = 2000.0, .y = 2000.0, .w = 100.0, .h = 100.0 });
     state.lifecycle = .{};
+    state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
+    defer state.palette_frame_text_arena.deinit();
     defer state.companion_composer.deinit(allocator);
-    var frame: companion_controller.Frame = .{};
-    frame.activity_count = 10;
-    state.companion_controller.setFrame(frame);
-    state.companion_controller.selectTab(.activity);
-    state.companion_controller.addHit(.{ .x = 0.0, .y = 0.0, .w = 100.0, .h = 100.0 }, .panel);
-    state.companion_controller.addHit(.{ .x = 0.0, .y = 0.0, .w = 100.0, .h = 100.0 }, .body);
+    state.companion_controller.frame_width = 1360.0;
+    state.companion_controller.frame_height = 860.0;
+    state.companion_controller.conversation_max_scroll = 574.0;
+    state.companion_controller.conversation_scroll_y = 574.0;
+    state.companion_controller.addHit(.{ .x = 900.0, .y = 0.0, .w = 460.0, .h = 860.0 }, .panel);
 
-    try std.testing.expect(routeCompanionWheel(&state, 50.0, 50.0, -1.0));
-    try std.testing.expectEqual(@as(f32, 32.0), state.companion_controller.activity_scroll_y);
-    try std.testing.expectEqual(@as(f32, 574.0), state.companion_controller.activity_max_scroll);
-    try std.testing.expect(!state.companion_controller.activity_follow_tail);
-    const unchanged_offset = state.companion_controller.activity_scroll_y;
-    try std.testing.expect(!routeCompanionWheel(&state, 150.0, 150.0, -1.0));
-    try std.testing.expectEqual(unchanged_offset, state.companion_controller.activity_scroll_y);
+    // Wheel over the conversation scrolls it directly; outside the panel the
+    // Companion does not claim the event.
+    try std.testing.expect(routeCompanionWheel(&state, 1100.0, 300.0, 1.0));
+    try std.testing.expect(state.companion_controller.conversation_scroll_y < 574.0);
+    try std.testing.expect(!state.companion_controller.conversation_follow_tail);
+    const unchanged_offset = state.companion_controller.conversation_scroll_y;
+    try std.testing.expect(!routeCompanionWheel(&state, 100.0, 300.0, 1.0));
+    try std.testing.expectEqual(unchanged_offset, state.companion_controller.conversation_scroll_y);
 }
 
 // True when any retained modal hit rect (scrim or control) covers the current
@@ -1880,6 +1884,7 @@ fn handleEvent(window: *palette.platform.Window, state: *AppState, keyboard: *ke
         },
         .focus_gained => {
             state.window_input_focus = true;
+            state.noteCompanionReturn();
             _ = state.acknowledgeFocusedPaneCompletion();
             // Files may have been committed or edited outside Verde.
             state.refreshSelectedWorkspaceGitChanges(false);
@@ -1929,9 +1934,9 @@ fn handleEvent(window: *palette.platform.Window, state: *AppState, keyboard: *ke
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (state.isCompanionEnabled() and state.companion_controller.mission_control_open) {
-                // True Palette modals remain above Mission Control. Otherwise
-                // the full-window overlay owns keys before pane/browser input.
+            if (state.isCompanionEnabled() and state.companion_controller.menu != .none) {
+                // True Palette modals remain above an open Companion menu.
+                // Otherwise the menu owns keys before pane/browser input.
                 if (ui_layout.handlePaletteKeyDown(state, key_event)) {
                     syncWindowTextInput(window, state);
                     return true;
@@ -2227,7 +2232,7 @@ fn handleEvent(window: *palette.platform.Window, state: *AppState, keyboard: *ke
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (state.isCompanionEnabled() and state.companion_controller.mission_control_open) {
+            if (state.isCompanionEnabled() and state.companion_controller.menu != .none) {
                 syncWindowTextInput(window, state);
                 return true;
             }
@@ -2264,7 +2269,7 @@ fn handleEvent(window: *palette.platform.Window, state: *AppState, keyboard: *ke
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (state.isCompanionEnabled() and state.companion_controller.mission_control_open) {
+            if (state.isCompanionEnabled() and state.companion_controller.menu != .none) {
                 if (state.companion_composer.focused) _ = state.routeCompanionComposerTextInput(text_input);
                 syncWindowTextInput(window, state);
                 return true;

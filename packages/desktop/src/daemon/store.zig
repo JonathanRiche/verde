@@ -489,6 +489,7 @@ pub const Store = struct {
         access_store.initialize(conn) catch |err| return mapOpenError(err);
         @import("push.zig").initialize(conn) catch |err| return mapOpenError(err);
         @import("chat_links.zig").initialize(conn) catch |err| return mapOpenError(err);
+        @import("companions.zig").initialize(conn) catch |err| return mapOpenError(err);
         if (runtime_identity) |identity| {
             connect_store.initialize(conn, identity.runtime_id, identity.instance_id) catch |err|
                 return mapOpenError(err);
@@ -3424,7 +3425,7 @@ pub const Store = struct {
         };
         for (text_keyed) |sql| try self.conn.exec(sql, .{ request.target_workspace_id, request.workspace_id, request.local_thread_id });
         try self.conn.exec(
-            "delete from chat_links where workspace_id = ?1 and (local_thread_id = ?2 or parent_thread_id = ?2)",
+            "delete from chat_links where (workspace_id = ?1 and local_thread_id = ?2) or (coalesce(parent_workspace_id, workspace_id) = ?1 and parent_thread_id = ?2)",
             .{ request.workspace_id, request.local_thread_id },
         );
         try self.dropClosedThreadPanes(source_row_id, request.local_thread_id, before.items);

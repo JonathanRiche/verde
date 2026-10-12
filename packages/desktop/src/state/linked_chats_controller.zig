@@ -87,8 +87,12 @@ pub const Entry = struct {
     status_raw: []u8,
     summary: []u8,
     updated_at_ms: i64,
+    /// Workspace of the linked chat; empty when it shares the parent's
+    /// workspace (older daemons). Machine Companions link across workspaces.
+    workspace_id: []u8 = &.{},
 
     fn deinit(self: Entry, allocator: std.mem.Allocator) void {
+        if (self.workspace_id.len > 0) allocator.free(self.workspace_id);
         allocator.free(self.link_id);
         allocator.free(self.local_thread_id);
         allocator.free(self.title);
@@ -124,6 +128,7 @@ const ClearCompletedParams = struct {
 
 const WireLink = struct {
     link_id: []const u8,
+    workspace_id: []const u8 = "",
     local_thread_id: []const u8,
     title: []const u8 = "",
     provider: []const u8 = "",
@@ -439,7 +444,9 @@ fn dupeEntry(allocator: std.mem.Allocator, link: WireLink) !Entry {
     errdefer allocator.free(status_raw);
     const summary = try allocator.dupe(u8, firstLine(link.summary));
     errdefer allocator.free(summary);
+    const workspace_id: []u8 = if (link.workspace_id.len > 0) try allocator.dupe(u8, link.workspace_id) else &.{};
     return .{
+        .workspace_id = workspace_id,
         .link_id = link_id,
         .local_thread_id = local_thread_id,
         .title = title,
@@ -472,6 +479,7 @@ fn entriesEqual(left: []const Entry, right: []const Entry) bool {
     for (left, right) |a, b| {
         if (a.is_parent != b.is_parent or a.status != b.status or a.updated_at_ms != b.updated_at_ms) return false;
         if (!std.mem.eql(u8, a.link_id, b.link_id)) return false;
+        if (!std.mem.eql(u8, a.workspace_id, b.workspace_id)) return false;
         if (!std.mem.eql(u8, a.local_thread_id, b.local_thread_id)) return false;
         if (!std.mem.eql(u8, a.title, b.title)) return false;
         if (!std.mem.eql(u8, a.provider, b.provider)) return false;
