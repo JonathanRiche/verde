@@ -835,7 +835,10 @@ fn validateIntent(a: A, tag: []const u8, event: V) ApiError!void {
         if (eq(tag, "composer_select")) {
             _ = try decode(struct { provider: ?[]const u8, model: ?[]const u8, effort: ?[]const u8, access: ?[]const u8, speed: ?[]const u8 }, a, event);
         }
-        if (eq(tag, "send") or eq(tag, "followup_submit")) _ = try counter(try string(event, "draft_revision"));
+        if (eq(tag, "send") or eq(tag, "followup_submit")) {
+            _ = try counter(try string(event, "draft_revision"));
+            _ = try decode(struct { voice: bool = false }, a, event);
+        }
         if (eq(tag, "followup_submit")) {
             _ = try decode(struct { kind: enum { queue, steer } }, a, event);
         }
@@ -897,9 +900,9 @@ fn receiptField(context: []const u8, key: []const u8, top: bool) bool {
         if (eq(context, "history_load_more")) break :blk "";
         if (eq(context, "draft_set")) break :blk "workspace_id thread_id text attachments";
         if (eq(context, "composer_select")) break :blk "workspace_id thread_id provider model effort access speed";
-        if (eq(context, "send")) break :blk "workspace_id thread_id draft_revision";
+        if (eq(context, "send")) break :blk "workspace_id thread_id draft_revision voice";
         if (eq(context, "turn_cancel")) break :blk "workspace_id thread_id turn_id";
-        if (eq(context, "followup_submit")) break :blk "workspace_id thread_id draft_revision kind";
+        if (eq(context, "followup_submit")) break :blk "workspace_id thread_id draft_revision kind voice";
         if (eq(context, "approval_decide")) break :blk "workspace_id thread_id turn_id call_id decision";
         if (eq(context, "shell_prepare")) break :blk "workspace_id thread_id command";
         if (eq(context, "shell_confirm")) break :blk "confirmation_id accept";

@@ -148,6 +148,7 @@ data class ChatFollowup(
     val `next_turn_id`: String,
     val `text`: String,
     val `attachments`: List<ChatAttachment> = emptyList(),
+    val `voice`: Boolean = false,
     val `paused`: Boolean = false,
     val `can_retry`: Boolean = false,
     val `can_pull_back`: Boolean = true,
@@ -723,6 +724,7 @@ data class EventSend(
     val `workspace_id`: String,
     val `thread_id`: String,
     val `draft_revision`: String,
+    val `voice`: Boolean = false,
 ) : Event()
 
 @Serializable
@@ -754,6 +756,7 @@ data class EventFollowupSubmit(
     val `thread_id`: String,
     val `draft_revision`: String,
     val `kind`: EventFollowupSubmitKind,
+    val `voice`: Boolean = false,
 ) : Event()
 
 @Serializable

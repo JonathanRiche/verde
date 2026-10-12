@@ -237,9 +237,9 @@ Optional values below may be null. These are new local names, not RPC names.
 | `history_search` / `history_load_more` | `query,workspace_id` / no extra fields; results live in `workspaces.history`, new query invalidates previous cursor. |
 | `draft_set` | `workspace_id,thread_id,text,attachments:[AttachmentInput]`; replace and persist local draft. |
 | `composer_select` | `workspace_id,thread_id,provider,model,effort,access,speed`; validate against available catalogs. |
-| `send` | `workspace_id,thread_id,draft_revision`; snapshot draft/settings into a stable operation, reject stale revision or unsupported scope. |
+| `send` | `workspace_id,thread_id,draft_revision,voice?:bool` (default false); snapshot draft/settings into a stable operation, reject stale revision or unsupported scope. `voice:true` marks a spoken message: its `chat.turn.start` carries `orchestration_note` with the fixed `<voice_turn>…</voice_turn>` text (`chat.VOICE_NOTE`), which the daemon appends to the provider prompt but never shows in the transcript. |
 | `turn_cancel` | `workspace_id,thread_id,turn_id`; cancellation is pending until daemon state confirms. |
-| `followup_submit` | `workspace_id,thread_id,draft_revision,kind:queue|steer`; stable receipt before dispatch. |
+| `followup_submit` | `workspace_id,thread_id,draft_revision,kind:queue|steer,voice?:bool`; stable receipt before dispatch. `voice` is persisted on the follow-up (`Followup.voice`) and adds the voice note when it starts a new turn (`queue`, or a steer that falls back to the next turn); `chat.turn.steer` has no note parameter, so an inline steer is sent without it. |
 | `followup_retry` / `followup_pull_back` / `followup_cancel` | `workspace_id,thread_id,followup_id`; enforce delivery state, not just UI button state. |
 | `approval_decide` | `workspace_id,thread_id,turn_id,call_id,decision:approve|deny`; explicit current approval only. |
 | `shell_prepare` / `shell_confirm` | `workspace_id,thread_id,command` / `confirmation_id,accept`; confirmation is bound to exact command, cwd, host and thread. |

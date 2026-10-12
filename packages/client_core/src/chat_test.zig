@@ -760,3 +760,42 @@ test "git system transcript row and future row kind do not break paging" {
     try expect(f.host.state.chat.threads[0].rows.len == 5);
     try eql("system", f.host.state.chat.threads[0].rows[0].role);
 }
+
+test "voice send adds the spoken-reply orchestration note; typed send does not" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.open();
+    try f.draft("what's running?");
+    _ = try f.intent("send", .{ .draft_revision = "1", .voice = true });
+    try f.reply("daemon.client.register", .{ .client_id = "fixture-client" });
+    try f.reply("chat.thread.upsert", .{ .store_revision = 100 });
+    const start = try f.params("chat.turn.start");
+    try eql("what's running?", p.s(start, "prompt"));
+    try eql(chat.VOICE_NOTE, p.s(start, "orchestration_note"));
+    try f.reply("chat.turn.start", .{ .turn_id = p.s(start, "turn_id") });
+
+    var g = try Fixture.init();
+    defer g.deinit();
+    try g.open();
+    try g.draft("typed");
+    _ = try g.intent("send", .{ .draft_revision = "1" });
+    try g.reply("daemon.client.register", .{ .client_id = "fixture-client" });
+    try g.reply("chat.thread.upsert", .{ .store_revision = 100 });
+    try expect(p.get(try g.params("chat.turn.start"), "orchestration_note") == .null);
+}
+
+test "voice on a queued follow-up survives its durable receipt and reaches the next turn start" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.open();
+    try f.seedTurn();
+    try f.draft("queue");
+    _ = try f.intent("followup_submit", .{ .draft_revision = "1", .kind = "queue", .voice = true });
+    try expect(f.host.state.chat.threads[0].saved.followup.?.voice);
+    while (f.host.state.chat.threads[0].storage_id != null) _ = try f.storage(null, false);
+    try f.tail(.{ .status = "completed", .events = .{} });
+    while (f.host.state.chat.threads[0].storage_id != null) _ = try f.storage(null, false);
+    try f.reply("daemon.client.register", .{ .client_id = "fixture-client" });
+    try f.reply("chat.thread.upsert", .{ .store_revision = 100 });
+    try eql(chat.VOICE_NOTE, p.s(try f.params("chat.turn.start"), "orchestration_note"));
+}

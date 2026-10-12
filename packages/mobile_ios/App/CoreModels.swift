@@ -571,6 +571,7 @@ struct ChatFollowup: Codable {
     var `next_turn_id`: String
     var `text`: String
     var `attachments`: [ChatAttachment] = []
+    var `voice`: Bool = false
     var `paused`: Bool = false
     var `can_retry`: Bool = false
     var `can_pull_back`: Bool = true
@@ -588,6 +589,7 @@ extension ChatFollowup {
         case `next_turn_id`
         case `text`
         case `attachments`
+        case `voice`
         case `paused`
         case `can_retry`
         case `can_pull_back`
@@ -609,6 +611,9 @@ extension ChatFollowup {
         self.`text` = try c.decode(String.self, forKey: .`text`)
         if !c.contains(.`attachments`) { self.`attachments` = [] } else {
         self.`attachments` = try c.decode([ChatAttachment].self, forKey: .`attachments`)
+        }
+        if !c.contains(.`voice`) { self.`voice` = false } else {
+        self.`voice` = try c.decode(Bool.self, forKey: .`voice`)
         }
         if !c.contains(.`paused`) { self.`paused` = false } else {
         self.`paused` = try c.decode(Bool.self, forKey: .`paused`)
@@ -634,6 +639,7 @@ extension ChatFollowup {
         try c.encode(self.`next_turn_id`, forKey: .`next_turn_id`)
         try c.encode(self.`text`, forKey: .`text`)
         try c.encode(self.`attachments`, forKey: .`attachments`)
+        try c.encode(self.`voice`, forKey: .`voice`)
         try c.encode(self.`paused`, forKey: .`paused`)
         try c.encode(self.`can_retry`, forKey: .`can_retry`)
         try c.encode(self.`can_pull_back`, forKey: .`can_pull_back`)
@@ -2931,6 +2937,7 @@ struct EventSend: Codable {
     var `workspace_id`: String
     var `thread_id`: String
     var `draft_revision`: String
+    var `voice`: Bool = false
 }
 
 extension EventSend {
@@ -2942,6 +2949,7 @@ extension EventSend {
         case `workspace_id`
         case `thread_id`
         case `draft_revision`
+        case `voice`
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -2954,6 +2962,9 @@ extension EventSend {
         self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
         self.`thread_id` = try c.decode(String.self, forKey: .`thread_id`)
         self.`draft_revision` = try c.decode(String.self, forKey: .`draft_revision`)
+        if !c.contains(.`voice`) { self.`voice` = false } else {
+        self.`voice` = try c.decode(Bool.self, forKey: .`voice`)
+        }
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -2964,6 +2975,7 @@ extension EventSend {
         try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
         try c.encode(self.`thread_id`, forKey: .`thread_id`)
         try c.encode(self.`draft_revision`, forKey: .`draft_revision`)
+        try c.encode(self.`voice`, forKey: .`voice`)
         var tag = encoder.container(keyedBy: ModelDiscriminator.self)
         try tag.encode("send", forKey: .type)
     }
@@ -3029,6 +3041,7 @@ struct EventFollowupSubmit: Codable {
     var `thread_id`: String
     var `draft_revision`: String
     var `kind`: EventFollowupSubmitKind
+    var `voice`: Bool = false
 }
 
 extension EventFollowupSubmit {
@@ -3041,6 +3054,7 @@ extension EventFollowupSubmit {
         case `thread_id`
         case `draft_revision`
         case `kind`
+        case `voice`
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -3054,6 +3068,9 @@ extension EventFollowupSubmit {
         self.`thread_id` = try c.decode(String.self, forKey: .`thread_id`)
         self.`draft_revision` = try c.decode(String.self, forKey: .`draft_revision`)
         self.`kind` = try c.decode(EventFollowupSubmitKind.self, forKey: .`kind`)
+        if !c.contains(.`voice`) { self.`voice` = false } else {
+        self.`voice` = try c.decode(Bool.self, forKey: .`voice`)
+        }
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -3065,6 +3082,7 @@ extension EventFollowupSubmit {
         try c.encode(self.`thread_id`, forKey: .`thread_id`)
         try c.encode(self.`draft_revision`, forKey: .`draft_revision`)
         try c.encode(self.`kind`, forKey: .`kind`)
+        try c.encode(self.`voice`, forKey: .`voice`)
         var tag = encoder.container(keyedBy: ModelDiscriminator.self)
         try tag.encode("followup_submit", forKey: .type)
     }

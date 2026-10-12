@@ -16,7 +16,10 @@ const add = c.append;
 const A = std.mem.Allocator;
 const Kind = enum { page, legacy, tail, register, upsert, create, append, commit, start, cancel, approve, steer, shell, slash_list, slash_run, model_list, mentions, history };
 const Request = struct { id: u64, thread: usize, kind: Kind, intent: []const u8 = "", cursor: ?[]const u8 = null, reconcile: bool = false, epoch: u64 = 0 };
-const Send = struct { intent: []const u8, revision: u64, text: []const u8, inputs: []const wire.AttachmentInput, settings: store.Thread, turn_id: []const u8, message_id: []const u8, attachments: []const m.Attachment = &.{}, index: usize = 0, offset: usize = 0, chunk: usize = 0, sent_bytes: usize = 0, followup: bool = false };
+/// `orchestration_note` for a `send`/queued follow-up with `voice: true` (exact text is a
+/// cross-platform contract; the daemon appends it to the provider prompt only).
+pub const VOICE_NOTE = "<voice_turn>The user spoke this message aloud from their phone and will hear your reply read aloud. Start with one short spoken acknowledgement sentence before using tools. Keep the reply brief and conversational: plain sentences, no markdown, no code blocks, no tables, no lists of file paths; say numbers and names naturally. Put anything long in a follow-up chat instead of reading it out.</voice_turn>";
+const Send = struct { intent: []const u8, revision: u64, text: []const u8, inputs: []const wire.AttachmentInput, settings: store.Thread, turn_id: []const u8, message_id: []const u8, attachments: []const m.Attachment = &.{}, index: usize = 0, offset: usize = 0, chunk: usize = 0, sent_bytes: usize = 0, followup: bool = false, voice: bool = false };
 const Saved = struct { version: u32 = 1, revision: u64 = 0, text: []const u8 = "", inputs: []const wire.AttachmentInput = &.{}, selection: m.Selection = .{}, selection_base: ?m.Selection = null, followup: ?m.Followup = null, followup_inputs: []const wire.AttachmentInput = &.{}, followup_settings: ?store.Thread = null, route: []const u8 = "" };
 pub const Thread = struct {
     workspace_id: []const u8,
@@ -264,12 +267,12 @@ fn upsert(tx: *h.Transaction, i: usize) E!void {
     }
     try call(tx, i, .upsert, "chat.thread.upsert", .{ .workspace_id = t.workspace_id, .thread = send.settings, .mutation = .{ .client_id = tx.state.chat.client_id.?, .request_key = send.turn_id } }, true, send.intent);
 }
-fn beginSend(tx: *h.Transaction, i: usize, intent_id: []const u8, followup: bool) E!void {
+fn beginSend(tx: *h.Transaction, i: usize, intent_id: []const u8, followup: bool, voice: bool) E!void {
     const t = &tx.state.chat.threads[i];
     const a = tx.allocator();
     const turn_id = if (followup) t.saved.followup.?.next_turn_id else try std.fmt.allocPrint(a, "mobile:{s}:{d}", .{ tx.state.config.session_nonce, tx.state.next_id });
     const message_id = try std.fmt.allocPrint(a, "{s}:user", .{turn_id});
-    t.send = .{ .intent = intent_id, .revision = t.saved.revision, .text = if (followup) t.saved.followup.?.text else if (std.mem.startsWith(u8, t.saved.text, "!!")) t.saved.text[1..] else t.saved.text, .inputs = if (followup) t.saved.followup_inputs else t.saved.inputs, .settings = if (followup) t.saved.followup_settings.? else metadata(t), .turn_id = turn_id, .message_id = message_id, .followup = followup };
+    t.send = .{ .intent = intent_id, .revision = t.saved.revision, .text = if (followup) t.saved.followup.?.text else if (std.mem.startsWith(u8, t.saved.text, "!!")) t.saved.text[1..] else t.saved.text, .inputs = if (followup) t.saved.followup_inputs else t.saved.inputs, .settings = if (followup) t.saved.followup_settings.? else metadata(t), .turn_id = turn_id, .message_id = message_id, .followup = followup, .voice = voice };
     t.send_intent = intent_id;
     t.overlay = &.{};
     try add(m.Row, a, &t.overlay, .{ .id = message_id, .role = "user", .body = t.send.?.text, .delivery = "optimistic", .created_at_ms = tx.state.wall_time_ms, .attachments = try attachments(a, t.send.?.inputs) });
@@ -288,6 +291,8 @@ fn uploadNext(tx: *h.Transaction, i: usize) E!void {
         const meta = send.settings;
         var params = try value(tx.allocator(), .{ .turn_id = send.turn_id, .workspace_id = t.workspace_id, .local_thread_id = t.id, .message_id = send.message_id, .prompt = send.text, .thread_title = meta.title, .provider = meta.provider, .harness = meta.harness, .provider_thread_id = meta.provider_thread_id, .model_ref = meta.model_ref, .reasoning_effort = meta.reasoning_effort, .opencode_reasoning_variant = meta.reasoning_variant, .fast_mode = eq(meta.fast_mode orelse "off", "on"), .access_mode = meta.access_mode, .attachments = ids });
         try addRoute(tx.allocator(), t, &params);
+        // Spoken turns ask the agent for a short, speakable reply; the daemon hides the note.
+        if (send.voice) try params.object.put(tx.allocator(), "orchestration_note", .{ .string = VOICE_NOTE });
         try call(tx, i, .start, "chat.turn.start", params, true, send.intent);
     }
 }
@@ -482,14 +487,14 @@ pub fn intent(tx: *h.Transaction, tag: []const u8, event: V) E!bool {
                 reject(tx, id, "turn_active");
                 return true;
             }
-            try beginSend(tx, i, id, false);
+            try beginSend(tx, i, id, false, p.yes(p.get(event, "voice")));
         } else {
             if (!active(t) or t.saved.followup != null) {
                 reject(tx, id, "followup_unavailable");
                 return true;
             }
             const fid = try std.fmt.allocPrint(tx.allocator(), "mobile-followup:{s}:{d}", .{ tx.state.config.session_nonce, tx.state.next_id });
-            t.saved.followup = .{ .id = fid, .kind = if (t.saved.inputs.len > 0) "queue" else p.s(event, "kind"), .turn_id = t.turn.?.turn_id, .steer_id = fid, .next_turn_id = try std.fmt.allocPrint(tx.allocator(), "{s}:next", .{fid}), .text = t.saved.text, .attachments = try attachments(tx.allocator(), t.saved.inputs) };
+            t.saved.followup = .{ .id = fid, .kind = if (t.saved.inputs.len > 0) "queue" else p.s(event, "kind"), .turn_id = t.turn.?.turn_id, .steer_id = fid, .next_turn_id = try std.fmt.allocPrint(tx.allocator(), "{s}:next", .{fid}), .text = t.saved.text, .attachments = try attachments(tx.allocator(), t.saved.inputs), .voice = p.yes(p.get(event, "voice")) };
             t.saved.followup_inputs = t.saved.inputs;
             t.saved.followup_settings = metadata(t);
             t.saved.route = try route(tx.allocator(), t);
@@ -670,7 +675,7 @@ pub fn complete(tx: *h.Transaction, pending: h.Pending, event: V) E!bool {
                         t.followup_dispatch = false;
                         if (eq(f.kind, "steer") and eq(f.state, "pending")) {
                             try call(tx, i, .steer, "chat.turn.steer", .{ .turn_id = f.turn_id, .steer_id = f.steer_id, .prompt = f.text, .image_paths = [_][]const u8{} }, true, t.followup_intent);
-                        } else try beginSend(tx, i, t.followup_intent, true);
+                        } else try beginSend(tx, i, t.followup_intent, true, t.saved.followup.?.voice);
                     }
                 }
             }
