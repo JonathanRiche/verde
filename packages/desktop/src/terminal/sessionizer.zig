@@ -47,6 +47,7 @@ const workspace_files = @import("../daemon/workspace_files.zig");
 const workspace_files_protocol = headless.workspace_files_protocol;
 const process_env = @import("../platform/env.zig");
 const provider_cli_version = @import("../providers/cli_version.zig");
+const provider_offline_auth = @import("../providers/offline_auth.zig");
 const provider_hooks = @import("../providers/hooks.zig");
 const provider_mcp = @import("../providers/mcp.zig");
 const provider_models = @import("../state/provider_models.zig");
@@ -8565,6 +8566,20 @@ pub const Daemon = struct {
                 defer provider_client.deinit();
                 auth_state = provider_client.authState() catch .unknown;
             } else |_| {}
+            // Codex and OpenCode answer only through a running server, which
+            // readiness probes never start; ask their CLIs' local login record.
+            if (auth_state == .unknown) {
+                const offline: provider_offline_auth.State = switch (provider) {
+                    .codex => provider_offline_auth.codex(self.allocator),
+                    .opencode => provider_offline_auth.opencode(self.allocator),
+                    else => .unknown,
+                };
+                auth_state = switch (offline) {
+                    .signed_in => .signed_in,
+                    .signed_out => .signed_out,
+                    .unknown => .unknown,
+                };
+            }
         }
         return try okValueResponse(self.allocator, id_value, headless.providers_protocol.AuthStatusResult{
             .provider = request.provider,
