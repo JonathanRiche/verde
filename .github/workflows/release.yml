@@ -18,7 +18,9 @@ jobs:
     timeout-minutes: 180
     runs-on: ubuntu-24.04
     container:
-      image: node:24-trixie
+      # Debian forky: trixie's WPE WebKit is built without the WPE Platform
+      # API (wpe-platform-2.0), which the Linux browser helper requires.
+      image: debian:forky
     env:
       ZIG_VERSION: 0.16.0
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.cache/zig-global
@@ -60,6 +62,7 @@ jobs:
             patchelf \
             pkg-config \
             python3 \
+            unzip \
             xz-utils
 
       - name: Install Zig

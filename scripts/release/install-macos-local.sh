@@ -66,27 +66,6 @@ if [[ -n "${SDKROOT:-}" ]]; then
   export SDKROOT
 fi
 
-compile_palette_metallib() {
-  local shader="$1"
-  local air="$WORK_DIR/$(basename "$shader" .msl).air"
-  local metallib="${shader%.msl}.metallib"
-  if ! xcrun -sdk macosx -find metal >/dev/null 2>&1; then
-    if [[ -f "$metallib" ]]; then
-      echo "warning: xcrun metal unavailable; using existing $(basename "$metallib")" >&2
-      return 0
-    fi
-    echo "missing required command: xcrun metal" >&2
-    exit 1
-  fi
-  xcrun -sdk macosx metal -x metal -c "$shader" -o "$air"
-  xcrun -sdk macosx metallib "$air" -o "$metallib"
-}
-
-compile_palette_metallib "$REPO_ROOT/packages/palette/src/shaders/ui.vert.msl"
-compile_palette_metallib "$REPO_ROOT/packages/palette/src/shaders/ui.solid.frag.msl"
-compile_palette_metallib "$REPO_ROOT/packages/palette/src/shaders/ui.text.frag.msl"
-compile_palette_metallib "$REPO_ROOT/packages/palette/src/shaders/ui.image.frag.msl"
-
 BUILD_ARGS=(zig build --release=safe -p "$PREFIX_DIR" -Dbrowser-backend=native_webview -Dversion="$VERSION")
 "${BUILD_ARGS[@]}"
 
