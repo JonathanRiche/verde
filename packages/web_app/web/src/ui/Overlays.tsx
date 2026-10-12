@@ -16,7 +16,7 @@ import { modelOptionsFor } from '../lib/models'
 
 
 /** Keep keyboard focus in the visible sheet and return it to its opener. */
-function containModalFocus(open: () => boolean, panel: () => HTMLElement | undefined, initial?: () => HTMLElement | undefined) {
+export function containModalFocus(open: () => boolean, panel: () => HTMLElement | undefined, initial?: () => HTMLElement | undefined) {
   createEffect(() => {
     if (!open()) return
     const restore = document.activeElement instanceof HTMLElement ? document.activeElement : null

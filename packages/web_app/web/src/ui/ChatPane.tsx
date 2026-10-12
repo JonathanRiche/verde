@@ -954,7 +954,7 @@ function MarkdownBody(props: { html: string; highlight: boolean }) {
 
 // ---- Rows ------------------------------------------------------------------
 
-function TranscriptRow(props: { message: Message; pane: LivePane }) {
+export function TranscriptRow(props: { message: Message; pane: LivePane }) {
   if (props.message.message_id.endsWith('-stream')) {
     return <WorkingRow message={props.message} pane={props.pane} />
   }
@@ -1127,7 +1127,7 @@ function attachmentLabel(attachment: Attachment): string {
 /// The streaming assistant bubble: author slot carries the desktop's ticking
 /// Pending tool approval, pinned between transcript and composer so the
 /// decision is reachable without scrolling; long bodies scroll inside the card.
-function ApprovalCard(props: { pane: LivePane }) {
+export function ApprovalCard(props: { pane: LivePane }) {
   const approval = () => store.pendingApproval(props.pane)
   // Busy is keyed to the call so a follow-up approval starts enabled.
   const callKey = () => {

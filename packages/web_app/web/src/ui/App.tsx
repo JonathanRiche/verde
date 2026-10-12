@@ -8,6 +8,7 @@ import { History, historyOpen } from './History'
 import { Icon } from './Icons'
 import { Palette, Settings, WorkspaceDialog } from './Overlays'
 import { ActionDialog } from './ActionDialog'
+import { CompanionDock, CompanionHost } from './Companion'
 import { PrefixBar } from './PrefixBar'
 import { PaneActionsButton, Sidebar } from './Sidebar'
 import { WorkspaceCanvas } from './WorkspaceCanvas'
@@ -91,6 +92,7 @@ export function App() {
             {(pane) => <GitChangesChip pane={pane} />}
           </Show>
           <SidePanelSheetButton />
+          <CompanionDock variant="icon" />
           <Show
             when={(focused()?.kind === 'chat' || focused()?.kind === 'terminal') ? focused() : undefined}
             keyed
@@ -111,6 +113,7 @@ export function App() {
           >
             <Icon name="expand" class="h-4 w-4" />
           </button>
+          <CompanionDock variant="floating" />
         </Show>
         <SidePanelSheet />
       </div>
@@ -126,6 +129,7 @@ export function App() {
       <WorkspaceFileViewer />
       <DesktopViewer />
       <GitChangesLayer />
+      <CompanionHost />
       <NoticeToast />
     </div>
   )

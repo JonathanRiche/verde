@@ -1826,11 +1826,17 @@ export function createAppStore() {
   }
 
   const archivedHistoryThreads = new Map<string, number>()
+  /// Companion threads are pane-less (desktop parity): the Companion panel
+  /// renders them, so the canvas skips them unless a desktop layout pins one.
+  const companionThreads = new Set<string>()
 
   const publishPanes = (list: Workspace[]) => {
     const panes = projectPanes(workspacesWithThreads(list), lastSessions, lastTurns(), localThreadIds, liveLayouts)
     for (const [id, rows] of Object.entries(panes)) {
-      panes[id] = rows.filter((pane) => !pane.thread_id || !archivedHistoryThreads.has(`${id}\u0000${pane.thread_id}`))
+      panes[id] = rows.filter((pane) => !pane.thread_id || (
+        !archivedHistoryThreads.has(`${id}\u0000${pane.thread_id}`) &&
+        (pane.native_pane_id != null || !companionThreads.has(`${id}\u0000${pane.thread_id}`))
+      ))
     }
     setPanesByWorkspace((prev) => (sameJson(prev, panes) ? prev : panes))
     const restored = pendingLastChatPane
@@ -2950,6 +2956,7 @@ export function createAppStore() {
     // Focused/followup history is needed immediately; other panes request
     // their first page when they approach the viewport.
     consider(focusedPane())
+    consider(companionPane())
     for (const pane of followups.panes()) consider(pane)
     const eager = new Set(seen)
     for (const pane of openPanes()) {
@@ -4665,6 +4672,148 @@ export function createAppStore() {
     }
   }
 
+  // ---- Companion ----------------------------------------------------------
+  // The roster itself lives in lib/companion.ts; the store only projects the
+  // active companion's thread as an off-canvas pane (so the regular send,
+  // tail, transcript, and approval paths drive it) and summarizes machine
+  // attention from the snapshot turns it already polls.
+
+  const [companionTarget, setCompanionTargetSignal] = createSignal<{ workspace_id: string; thread_id: string } | null>(
+    null, { equals: sameJson },
+  )
+  const companionCatalogRequested = new Set<string>()
+
+  /// Hides every roster thread from the canvas. Call with all companions.
+  const setCompanionThreads = (threads: ReadonlyArray<{ workspace_id: string; thread_id: string }>) => {
+    const next = new Set(threads.filter((row) => row.workspace_id && row.thread_id)
+      .map((row) => `${row.workspace_id}\u0000${row.thread_id}`))
+    if (next.size === companionThreads.size && [...next].every((key) => companionThreads.has(key))) return
+    companionThreads.clear()
+    for (const key of next) companionThreads.add(key)
+    publishPanes(workspaces())
+  }
+
+  /// The thread the Companion panel shows; null while the panel is closed so
+  /// transcript polling stops with it.
+  const setCompanionTarget = (target: { workspace_id: string; thread_id: string } | null) => {
+    setCompanionTargetSignal(target && target.workspace_id && target.thread_id ? target : null)
+    if (!target?.workspace_id || !target.thread_id) return
+    const known = threadsByWorkspace()[target.workspace_id]?.some((row) => row.local_thread_id === target.thread_id)
+    const key = `${target.workspace_id}\u0000${target.thread_id}`
+    if (known || companionCatalogRequested.has(key)) return
+    // Background workspaces' catalogs refresh on the slower full sweep; load
+    // the home workspace now so the conversation appears without waiting.
+    companionCatalogRequested.add(key)
+    void refreshProjection({ workspace_id: target.workspace_id })
+  }
+
+  const companionPane = createMemo<LivePane | null>(() => {
+    const target = companionTarget()
+    if (!target) return null
+    const ws = workspaces().find((row) => row.workspace_id === target.workspace_id)
+    const thread = threadsByWorkspace()[target.workspace_id]?.find((row) => row.local_thread_id === target.thread_id)
+    if (!ws || !thread || thread.archived) return null
+    return chatPane(ws, thread, lastTurns())
+  }, null, { equals: sameJson })
+
+  /// Creates the companion's durable thread. Companions orchestrate this
+  /// machine, so the thread always routes to the local daemon.
+  const createCompanionThread = async (
+    workspace_id: string,
+    options: { title: string; provider: string; model?: string | null },
+  ): Promise<string | null> => {
+    const current = workspaces().find((row) => row.workspace_id === workspace_id)
+    if (!current) return null
+    const client_id = await ensureClientId()
+    const local_thread_id = mintId('web-thread-')
+    const thread: Thread = {
+      local_thread_id,
+      title: options.title,
+      committed: false,
+      profile_id: 'local',
+      repository_id: 'primary',
+      provider: options.provider,
+      harness: 'local_cli',
+      ...(options.model ? { model_ref: options.model } : {}),
+      access_mode: 'full_access',
+      last_activity_at: Date.now(),
+    }
+    const opened = await requestNewThread(interactiveCall, async () => ({
+      request_key: `web:chat.open:${local_thread_id}`,
+      client_id,
+    }), current, thread)
+    if (opened.error || opened.ok === false) {
+      setNotice(opened.error?.message ?? 'could not start the companion chat')
+      return null
+    }
+    companionThreads.add(`${workspace_id}\u0000${local_thread_id}`)
+    // Retained like any web-opened chat until its first turn commits it.
+    localThreadIds.add(local_thread_id)
+    setThreadsByWorkspace((prev) => ({ ...prev, [workspace_id]: [thread, ...(prev[workspace_id] ?? [])] }))
+    publishPanes(workspaces())
+    return local_thread_id
+  }
+
+  /// Newest turn per chat across every workspace on the machine.
+  const latestTurnPerChat = createMemo(() => {
+    const latest = new Map<string, SnapshotTurn>()
+    for (const turn of lastTurns()) {
+      if (!turn.workspace_id || !turn.local_thread_id || !turn.turn_id) continue
+      latest.set(`${turn.workspace_id}\u0000${turn.local_thread_id}`, turn)
+    }
+    return [...latest.values()]
+  })
+
+  const chatTitle = (workspace_id: string, thread_id: string): string =>
+    threadsByWorkspace()[workspace_id]?.find((row) => row.local_thread_id === thread_id)?.title ||
+    workspaces().find((row) => row.workspace_id === workspace_id)?.threads?.find((row) => row.local_thread_id === thread_id)?.title ||
+    'Chat'
+
+  /// Chats anywhere on the machine waiting on an approval from the user.
+  const needsYou = createMemo(() => latestTurnPerChat().flatMap((turn) => {
+    if (!turnIsActive(turn.status) || isSubagentThreadId(turn.local_thread_id)) return []
+    const approval = approvalFromTurn(turn)
+    if (approval && approvalTracker.isSubmitted(approval)) return []
+    if (!approval && turn.status !== 'waiting_approval') return []
+    const workspace_id = turn.workspace_id!
+    const local_thread_id = turn.local_thread_id!
+    return [{
+      workspace_id,
+      local_thread_id,
+      workspace_label: workspaces().find((row) => row.workspace_id === workspace_id)?.label ?? workspace_id,
+      title: chatTitle(workspace_id, local_thread_id),
+      approval_title: approval?.title ?? 'Waiting for approval',
+    }]
+  }))
+
+  /// Live chats that are working (not blocked on the user).
+  const runningChatCount = createMemo(() => latestTurnPerChat().filter((turn) =>
+    turnIsActive(turn.status) && turn.status !== 'waiting_approval' && !approvalFromTurn(turn)).length)
+
+  /// Focus any chat on the machine in the canvas, projecting it first when
+  /// it is not open in the web layout yet.
+  const openChat = async (workspace_id: string, thread_id: string): Promise<boolean> => {
+    const find = () => (panesByWorkspace()[workspace_id] ?? []).find((pane) => pane.kind === 'chat' && pane.thread_id === thread_id)
+    let pane = find()
+    const added = !localThreadIds.has(thread_id)
+    if (!pane) {
+      localThreadIds.add(thread_id)
+      if (!threadsByWorkspace()[workspace_id]?.some((row) => row.local_thread_id === thread_id)) {
+        await refreshProjection({ workspace_id })
+      }
+      publishPanes(workspaces())
+      pane = find()
+    }
+    if (!pane) {
+      if (added) localThreadIds.delete(thread_id)
+      setNotice('That chat is not available in the web client yet.')
+      return false
+    }
+    focusPane(pane)
+    ensureTranscript(pane)
+    return true
+  }
+
   /// The web canvas lays panes out itself, so a split opens the new pane
   /// next to the focused one in the strip.
   const splitFocusedPane = async (kind: 'chat' | 'terminal', _axis: 'vertical' | 'horizontal') => {
@@ -5370,6 +5519,13 @@ export function createAppStore() {
     start,
     paneTitle,
     openSubagent,
+    companionPane,
+    setCompanionTarget,
+    setCompanionThreads,
+    createCompanionThread,
+    needsYou,
+    runningChatCount,
+    openChat,
   }
 }
 

@@ -9,6 +9,7 @@ import { ChatRouting } from './ChatRouting'
 import { GitChangesDot } from './GitChanges'
 import { openDesktopViewer } from './DesktopViewer'
 import { openHistory } from './History'
+import { CompanionDock } from './Companion'
 import { sidebarMenuAvailability } from '../lib/commands'
 import { themeTone } from '../lib/theme'
 import { WORKSPACE_COLOR_SLOTS, WORKSPACE_ICONS, workspaceIdentity, workspaceSlotColor } from '../lib/workspace_identity'
@@ -254,6 +255,9 @@ export function Sidebar(props: { drawer?: boolean }) {
           </Show>
         </div>
 
+        <div class="shrink-0 px-4 pb-2">
+          <CompanionDock variant="sidebar" />
+        </div>
         <div class="flex h-14 shrink-0 items-center justify-end border-t border-[var(--border-muted)] px-4">
           <div class="mr-auto truncate text-[11px] text-[var(--text-subtle)]">
             {store.connected() ? store.source() : 'reconnecting'}

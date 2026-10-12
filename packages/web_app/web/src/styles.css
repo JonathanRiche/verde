@@ -174,6 +174,11 @@ button { transition-property: background-color, color, border-color, opacity, bo
 @keyframes side-sheet-in { from { transform: translateX(100%); } }
 @keyframes side-sheet-out { to { transform: translateX(100%); } }
 
+/* Companion character: a gentle bob only while real work is running. */
+.companion-avatar[data-pose='working'] .companion-figure { animation: companion-bob 1.6s ease-in-out infinite; }
+@keyframes companion-bob { 50% { transform: translateY(-1.5px); } }
+:root[data-reduce-motion-status-pulse] .companion-figure { animation: none !important; }
+
 /* Desktop rail collapse/expand. */
 .sidebar-rail { transition: width 200ms var(--ease-out); overflow: hidden; }
 
