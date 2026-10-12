@@ -208,11 +208,44 @@ verde live panes --project current --json
 
 ## Experimental companion
 
-**Settings → Experimental features** can enable the Companion sidecar (Sprout,
-Moss, or Vireo — pick the default under Appearance). Toggle it with
-`Ctrl+Shift+Space`. The companion is a pane-less overlay for orchestration:
-durable conversation, run/activity views, operation inspection, and **Mission
-Control** for multi-step goals. It stays experimental and is off by default.
+**Settings → Experimental features** enables the Companion. Toggle it with
+`Ctrl+Shift+Space`. There is one companion roster per machine, not per
+workspace: your companion orchestrates all of Verde from any workspace.
+
+- **The dock.** A small character sits in the bottom-right corner. Its pose
+  and status line show real state only: "Ready when you are", how many chats
+  are running, or how many things need you.
+- **The panel.** Click the dock to open a side panel with a **Needs you**
+  inbox (every chat on the machine waiting on an approval), the companion's
+  **Crew** (chats it delegated to, with live status), and the conversation.
+  Click any inbox or crew row to jump to that chat.
+- **Characters and names.** Click the companion's name to rename it, switch
+  between Sprout, Moss, and Vireo, add more companions, or remove one.
+  Characters also set temperament: Sprout checks in before big moves, Moss
+  acts and then summarizes, and Vireo runs ahead and only pings you when it
+  matters.
+- **Brain.** Click the model chip (in the header or the composer) to choose
+  any connected provider and model. Changing provider on an existing
+  conversation starts a fresh one; the old one stays in its workspace's
+  history.
+
+- **Standing orders.** Open the companion menu → **Standing orders…** and write
+  rules it follows on every turn ("Run tests before calling work done. Never
+  push to main.").
+- **Welcome back.** Return to Verde after 15 minutes or more away and the
+  companion offers **Catch me up**, a recap of what finished, what is still
+  running, and what needs you.
+
+The companion delegates with Verde's MCP tools (`open_chat`,
+`send_chat_message`, `list_processes`, leases, and so on). Chats it opens in
+**any** workspace join its crew and report back automatically; when one
+finishes, the companion reviews it and gives a one-line verdict. Its own
+conversation lives in a home workspace only for its working directory.
+
+The roster lives in the session daemon, so the same companions (names,
+characters, models, standing orders) show up in the desktop app, the web
+client, and the mobile apps, and a message sent from your phone gets the same
+orchestrator. The feature stays experimental and is off by default.
 
 ## Command palette and slash commands
 

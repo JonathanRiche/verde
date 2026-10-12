@@ -159,9 +159,9 @@ One Raycast-style launcher ranks threads, open panes, workspaces, and commands. 
 
 Tile a native webview next to your agent. Point at an element or draw a region, describe the change, and route visual context into a chat or terminal TUI — without leaving the workspace.
 
-### Experimental companion + Mission Control
+### Experimental companion
 
-Opt-in under **Settings → Experimental**: a pane-less orchestration sidecar (Sprout, Moss, or Vireo) with durable threads, operation inspection, and Mission Control for multi-step goals. Still experimental — APIs and UI may change.
+Opt-in under **Settings → Experimental**: a named character (Sprout, Moss, or Vireo — you pick and name it) that orchestrates all of Verde across every workspace. It delegates work to chats, shows its crew's live status, collects everything that needs your approval in one inbox, and runs on whichever connected model you choose. Still experimental — APIs and UI may change.
 
 ### Project-scoped terminal dock
 
