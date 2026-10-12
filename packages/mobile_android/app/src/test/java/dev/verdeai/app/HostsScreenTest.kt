@@ -41,7 +41,7 @@ class HostsScreenTest {
         for (id in listOf("alpha","beta")) for (record in listOf("credential","profile"))
             store.values["vc/1/$id/$record"]="Zml4dHVyZQ=="
     }
-    private fun launch(waitReady: Boolean = true) {
+    private fun launch(waitReady: Boolean = true, content: (@androidx.compose.runtime.Composable () -> Unit)? = null) {
         compose.runOnUiThread {
             model=ViewModelProvider(models, object : ViewModelProvider.Factory {
                 @Suppress("UNCHECKED_CAST")
@@ -53,7 +53,7 @@ class HostsScreenTest {
             })[HostsModel::class.java]
             model.foreground(true)
         }
-        compose.setContent { HostsScreen(model, onUse={ used++ }) }
+        compose.setContent { content?.invoke() ?: HostsScreen(model, onUse={ used++ }) }
         if (waitReady) await { !model.state.value.loading && model.state.value.rows.all { it.view?.lifecycle == Lifecycle.foreground } }
     }
     private fun row(id: String) = model.state.value.rows.single { it.saved.id == id }
@@ -222,6 +222,29 @@ class HostsScreenTest {
         assertEquals("alpha", model.state.value.active)
         compose.onNodeWithContentDescription("Actions for Alpha").assertExists()
         compose.onNodeWithContentDescription("Actions for Beta").assertExists()
+    }
+    @Test fun topBarSwitcherListsHostsSwitchesAndAddsHost() {
+        seed()
+        var pairingOpened = 0
+        launch { HostSwitcher(model, onSwitched={ used++ }, onPairing={ pairingOpened++ }) }
+        compose.onNodeWithContentDescription("Switch host").performClick()
+        compose.onNodeWithText("Beta",useUnmergedTree=true).assertExists()
+        compose.onNodeWithText("Add new host").assertExists()
+        compose.onAllNodesWithContentDescription("Active host",useUnmergedTree=true).assertCountEquals(1)
+        compose.onNodeWithText("Beta",useUnmergedTree=true).performClick()
+        await { model.state.value.active == "beta" && !model.state.value.busy }
+        assertEquals(1,used)
+        assertEquals("beta",CoreJson.decodeFromString<HostCatalog>(store.values[HostsModel.CATALOG_KEY]!!).active)
+        compose.onNodeWithText("Beta",useUnmergedTree=true).assertExists()
+        compose.onNodeWithContentDescription("Switch host").performClick()
+        compose.onNodeWithText("Add new host").performClick()
+        compose.onNodeWithText("Host name").performTextReplacement("Studio")
+        compose.onNodeWithText("Continue").performClick()
+        await { model.state.value.rows.size == 3 && !model.state.value.busy }
+        val added=model.state.value.rows.last().saved
+        assertEquals("Studio",added.label)
+        assertEquals(added.id,model.state.value.pairing)
+        assertEquals(1,pairingOpened)
     }
     private class MemoryStore : SecureStore {
         val values=ConcurrentHashMap<String,String>()

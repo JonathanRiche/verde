@@ -154,10 +154,10 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
                         navigationIcon = { IconButton(onClick = { scope.launch { drawer.open() } }) {
                             Icon(Icons.Filled.Menu, contentDescription = "Open workspace drawer")
                         } }, actions = {
-                            Text(hostsState.rows.find { it.saved.id == hostsState.active }?.saved?.label.orEmpty(),
-                                style = MaterialTheme.typography.labelMedium, color = VerdeColors.Muted,
-                                maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
-                                modifier = Modifier.widthIn(max = 160.dp))
+                            HostSwitcher(hosts,
+                                // Hosts lists the machines; after a switch, land on the new host's Home.
+                                onSwitched = { if (nav.currentDestination?.route == Routes.HOSTS) nav.tab(Routes.HOME) },
+                                onPairing = { nav.tab(Routes.HOSTS) })
                         })
                 }
             },

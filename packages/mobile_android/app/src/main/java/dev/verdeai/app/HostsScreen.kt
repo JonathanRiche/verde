@@ -26,7 +26,6 @@ import androidx.compose.ui.unit.dp
 internal fun HostsScreen(model: HostsModel, onUse: () -> Unit = {}, onSecurity: (() -> Unit)? = null) {
     val state by model.state.collectAsState()
     var adding by rememberSaveable { mutableStateOf(false) }
-    var label by rememberSaveable { mutableStateOf("") }
     var confirmation by remember { mutableStateOf<Pair<String, Boolean>?>(null) }
     var renaming by rememberSaveable { mutableStateOf<String?>(null) }
     var renameLabel by rememberSaveable { mutableStateOf("") }
@@ -105,10 +104,7 @@ internal fun HostsScreen(model: HostsModel, onUse: () -> Unit = {}, onSecurity: 
             onSecurity?.let { open -> TextButton(modifier=Modifier.fillMaxWidth(), onClick=open) { Text("Settings") } }
         }
     }
-    if (adding) AlertDialog(onDismissRequest={ adding=false }, title={ Text("Add host") },
-        text={ OutlinedTextField(label, { label=it.take(128) }, label={ Text("Host name") }, singleLine=true) },
-        confirmButton={ TextButton(onClick={ model.add(label); label=""; adding=false }) { Text("Continue") } },
-        dismissButton={ TextButton(onClick={ adding=false }) { Text("Cancel") } })
+    if (adding) AddHostDialog(onAdd={ model.add(it) }, onDismiss={ adding=false })
     renaming?.let { id ->
         AlertDialog(onDismissRequest={ if (!state.busy) renaming=null }, title={ Text("Rename machine") },
             text={ Column(verticalArrangement=Arrangement.spacedBy(12.dp)) {
@@ -131,6 +127,16 @@ internal fun HostsScreen(model: HostsModel, onUse: () -> Unit = {}, onSecurity: 
             confirmButton={ TextButton(onClick={ confirmation=null; model.signOut(id, forget) }) { Text(if (forget) "Remove anyway" else "Sign out") } },
             dismissButton={ TextButton(onClick={ confirmation=null }) { Text("Cancel") } })
     }
+}
+
+/** Names a new host; [onAdd] saves it and opens its pairing flow. Shared by Hosts and the top-bar switcher. */
+@Composable
+internal fun AddHostDialog(onAdd: (String) -> Unit, onDismiss: () -> Unit) {
+    var label by rememberSaveable { mutableStateOf("") }
+    AlertDialog(onDismissRequest=onDismiss, title={ Text("Add host") },
+        text={ OutlinedTextField(label, { label=it.take(128) }, label={ Text("Host name") }, singleLine=true) },
+        confirmButton={ TextButton(onClick={ onAdd(label); onDismiss() }) { Text("Continue") } },
+        dismissButton={ TextButton(onClick=onDismiss) { Text("Cancel") } })
 }
 
 @Composable
