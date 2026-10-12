@@ -164,22 +164,25 @@ pub fn connectProvider(
     project_path: []const u8,
     launch_if_missing: bool,
 ) !harness.ProviderClient {
+    // No open workspace sends "". A child cannot spawn in an empty directory,
+    // so inherit the daemon's cwd instead of failing every readiness probe.
+    const cwd: ?[]const u8 = if (project_path.len == 0) null else project_path;
     const provider_config: harness.ProviderConfig = switch (provider) {
         .opencode => .{ .opencode = .{
             .allocator = allocator,
-            .working_directory = project_path,
+            .working_directory = cwd,
             .launch_if_missing = launch_if_missing,
         } },
         .codex => .{ .codex = .{
-            .cwd = project_path,
+            .cwd = cwd,
             .launch_on_connect = launch_if_missing,
         } },
-        .claude => .{ .claude = .{ .cwd = project_path } },
-        .cursor => .{ .cursor = .{ .cwd = project_path } },
-        .pi => .{ .pi = .{ .cwd = project_path } },
-        .fx => .{ .fx = .{ .cwd = project_path } },
-        .grok => .{ .grok = .{ .cwd = project_path } },
-        .muse => .{ .muse = .{ .cwd = project_path } },
+        .claude => .{ .claude = .{ .cwd = cwd } },
+        .cursor => .{ .cursor = .{ .cwd = cwd } },
+        .pi => .{ .pi = .{ .cwd = cwd } },
+        .fx => .{ .fx = .{ .cwd = cwd } },
+        .grok => .{ .grok = .{ .cwd = cwd } },
+        .muse => .{ .muse = .{ .cwd = cwd } },
     };
     return harness.connect(allocator, provider_config);
 }
