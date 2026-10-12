@@ -278,7 +278,7 @@ mise run dev      # build + run (native webview)
 
 | Task | Command |
 | --- | --- |
-| Dependency check | `mise run setup` |
+| Install + check dependencies (Linux uses sudo for WPE WebKit packages) | `mise run setup` |
 | Dev run | `mise run dev` |
 | Desktop development build | `mise run dev-build` |
 | Full build/install | `mise run build` |

@@ -1,6 +1,7 @@
 [tools]
 zig = "0.16.0"
 zls = "0.16.0"
+rust = "stable"
 # zls = "0.15.2"
 
 [tasks.tail]
@@ -8,8 +9,8 @@ description = "Tails the desktop app log file."
 run = "tail -f -n 80 ${HOME}/.local/share/verde/Native/logs/verde.stderr.log"
 
 [tasks.setup]
-description = "Checks desktop build dependencies."
-run = "bash -lc 'bash scripts/dev/check-desktop-build-deps.sh'"
+description = "Installs and checks desktop build dependencies (Linux: WPE WebKit dev packages via pacman/apt/dnf)."
+run = "bash -lc 'bash scripts/dev/setup-desktop-build-deps.sh'"
 
 [tasks.build]
 description = "Builds the desktop app."

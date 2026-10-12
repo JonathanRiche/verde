@@ -10,12 +10,16 @@ need_cmd() {
       bun)
         echo "install Bun first: https://bun.sh/docs/installation" >&2
         ;;
+      cargo)
+        echo "run: mise install (installs the Rust toolchain pinned in mise.toml)" >&2
+        ;;
     esac
     exit 1
   fi
 }
 
 need_cmd bun
+need_cmd cargo
 
 if [[ ! -d "$REPO_ROOT/node_modules/@anthropic-ai/claude-agent-sdk" ]]; then
   echo "missing provider bridge build dependencies in node_modules" >&2
