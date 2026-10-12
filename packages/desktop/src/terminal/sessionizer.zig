@@ -15518,8 +15518,10 @@ fn gitChangesReviewResponse(daemon: *Daemon, id_value: std.json.Value, params: s
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // Repositories: every one with claims in this workspace, plus the chat's
-    // own checkout so unassigned edits show before anything was attributed.
+    // Repositories: every one with claims in this workspace, plus those the
+    // chat's route reaches (its checkout, workspace folders, or checkouts
+    // directly under a non-repository folder) so unassigned edits show before
+    // anything was attributed.
     var roots: std.ArrayList([]const u8) = .empty;
     {
         daemon.git_changes.mutex.lock();
@@ -15532,7 +15534,7 @@ fn gitChangesReviewResponse(daemon: *Daemon, id_value: std.json.Value, params: s
             else => return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "git is not available"),
         };
         defer git.deinit();
-        if (try git_changes.repoToplevel(&git, route_root)) |top| {
+        for (try git_changes.reachableRepos(&git, try gitChangesTurnPaths(arena, route_root, null))) |top| {
             const seen = for (roots.items) |root| {
                 if (std.mem.eql(u8, root, top)) break true;
             } else false;
@@ -16230,8 +16232,7 @@ fn gitChangesWorkspaceRoots(daemon: *Daemon, arena: std.mem.Allocator, git: *git
     }
     const route = git_changes_protocol.StatusRequest{ .workspace_id = workspace_id, .local_thread_id = "" };
     const project_root = gitChangesRouteRoot(daemon, arena, route) orelse return roots.items;
-    for (try gitChangesTurnPaths(arena, project_root, null)) |path| {
-        const top = (try git_changes.repoToplevel(git, path)) orelse continue;
+    for (try git_changes.reachableRepos(git, try gitChangesTurnPaths(arena, project_root, null))) |top| {
         const seen = for (roots.items) |root| {
             if (std.mem.eql(u8, root, top)) break true;
         } else false;
@@ -16400,7 +16401,7 @@ fn gitChangesStatusResponse(daemon: *Daemon, id_value: std.json.Value, params: s
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // The chat's claimed repositories plus its own route repository.
+    // The chat's claimed repositories plus every repository its route reaches.
     var roots: std.ArrayList([]const u8) = .empty;
     {
         daemon.git_changes.mutex.lock();
@@ -16413,7 +16414,7 @@ fn gitChangesStatusResponse(daemon: *Daemon, id_value: std.json.Value, params: s
     };
     defer git.deinit();
     if (gitChangesRouteRoot(daemon, arena, request)) |route_root| {
-        if (try git_changes.repoToplevel(&git, route_root)) |top| {
+        for (try git_changes.reachableRepos(&git, try gitChangesTurnPaths(arena, route_root, null))) |top| {
             const seen = for (roots.items) |root| {
                 if (std.mem.eql(u8, root, top)) break true;
             } else false;

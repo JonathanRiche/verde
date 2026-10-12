@@ -164,6 +164,60 @@ pub fn repoToplevel(git: *Git, path: []const u8) Error!?[]const u8 {
     return top;
 }
 
+/// Checkouts examined directly beneath one non-repository directory.
+pub const MAX_NESTED_REPOS: usize = 8;
+
+/// Distinct repository roots reachable from `paths`: each path's own
+/// repository, or, for a path outside any repository (a workspace folder that
+/// only holds sibling checkouts), the repositories directly beneath it.
+pub fn reachableRepos(git: *Git, paths: []const []const u8) Error![]const []const u8 {
+    var roots: std.ArrayList([]const u8) = .empty;
+    for (paths) |path| {
+        if (try repoToplevel(git, path)) |top| {
+            try appendUniqueRoot(git.arena, &roots, top);
+            continue;
+        }
+        for (try nestedRepoDirs(git.arena, path)) |child| {
+            const top = (try repoToplevel(git, child)) orelse continue;
+            try appendUniqueRoot(git.arena, &roots, top);
+        }
+    }
+    return roots.items;
+}
+
+fn appendUniqueRoot(arena: std.mem.Allocator, roots: *std.ArrayList([]const u8), root: []const u8) Error!void {
+    for (roots.items) |existing| if (std.mem.eql(u8, existing, root)) return;
+    roots.append(arena, root) catch return error.OutOfMemory;
+}
+
+/// Non-hidden child directories of `path` holding a `.git` directory or file
+/// (worktrees), sorted by name and capped at MAX_NESTED_REPOS.
+fn nestedRepoDirs(arena: std.mem.Allocator, path: []const u8) Error![]const []const u8 {
+    var threaded: std.Io.Threaded = .init(arena, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return &.{};
+    defer dir.close(io);
+    var names: std.ArrayList([]const u8) = .empty;
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .directory and entry.kind != .sym_link) continue;
+        if (entry.name.len == 0 or entry.name[0] == '.') continue;
+        const git_path = std.fs.path.join(arena, &.{ entry.name, ".git" }) catch return error.OutOfMemory;
+        dir.access(io, git_path, .{}) catch continue;
+        names.append(arena, arena.dupe(u8, entry.name) catch return error.OutOfMemory) catch return error.OutOfMemory;
+    }
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lessThan);
+    const kept = names.items[0..@min(names.items.len, MAX_NESTED_REPOS)];
+    const dirs = arena.alloc([]const u8, kept.len) catch return error.OutOfMemory;
+    for (kept, dirs) |name, *slot| slot.* = std.fs.path.join(arena, &.{ path, name }) catch return error.OutOfMemory;
+    return dirs;
+}
+
 /// HEAD commit id, or null for an unborn branch.
 pub fn headOid(git: *Git, repo: []const u8) Error!?[]const u8 {
     const result = try git.run(repo, &.{ "rev-parse", "-q", "--verify", "HEAD^{commit}" }, .{});
@@ -324,8 +378,8 @@ pub const TurnSnapshot = struct {
     }
 };
 
-/// Snapshot every distinct git repository that contains one of `paths`.
-/// Non-repository paths are skipped silently.
+/// Snapshot every distinct git repository reachable from `paths` (see
+/// `reachableRepos`). Paths reaching no repository are skipped silently.
 pub fn captureSnapshot(gpa: std.mem.Allocator, paths: []const []const u8) Error!TurnSnapshot {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     errdefer arena_state.deinit();
@@ -337,13 +391,7 @@ pub fn captureSnapshot(gpa: std.mem.Allocator, paths: []const []const u8) Error!
     var hash_ctx: HashContext = .{ .scratch = gpa, .io = threaded.io() };
 
     var repos: std.ArrayList(RepoSnapshot) = .empty;
-    for (paths) |path| {
-        const top = (try repoToplevel(&git, path)) orelse continue;
-        var seen = false;
-        for (repos.items) |repo| if (std.mem.eql(u8, repo.root, top)) {
-            seen = true;
-        };
-        if (seen) continue;
+    for (try reachableRepos(&git, paths)) |top| {
         var repo: RepoSnapshot = .{ .root = arena.dupe(u8, top) catch return error.OutOfMemory };
         const entries = dirtyPaths(&git, top) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -2736,6 +2784,38 @@ test "turn snapshots claim only files changed inside the turn" {
         try testing.expect(!claim.unclear);
         try testing.expect(!std.mem.eql(u8, claim.path, "b.txt"));
     }
+}
+
+test "a non-repository folder reaches the checkouts directly beneath it" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var threaded: std.Io.Threaded = .init(arena, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const home = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    var git = Git.init(arena) catch return error.SkipZigTest;
+    defer git.deinit();
+    // The temporary directory lives inside this checkout; stop discovery there.
+    try git.env.put("GIT_CEILING_DIRECTORIES", std.fs.path.dirname(home) orelse return error.SkipZigTest);
+
+    for ([_][]const u8{ "beta", "alpha", ".hidden", "plain" }) |name| try tmp.dir.createDirPath(io, name);
+    for ([_][]const u8{ "beta", "alpha", ".hidden" }) |name| {
+        const child = try std.fs.path.join(arena, &.{ home, name });
+        if (!(try git.run(child, &.{ "init", "-q" }, .{ .read_only = false })).ok()) return error.SkipZigTest;
+    }
+
+    const roots = try reachableRepos(&git, &.{ home, home });
+    try testing.expectEqual(@as(usize, 2), roots.len);
+    try testing.expect(std.mem.endsWith(u8, roots[0], "/alpha"));
+    try testing.expect(std.mem.endsWith(u8, roots[1], "/beta"));
+
+    // A path inside a repository reaches only that repository.
+    const inside = try reachableRepos(&git, &.{try std.fs.path.join(arena, &.{ home, "beta" })});
+    try testing.expectEqual(@as(usize, 1), inside.len);
+    try testing.expectEqualStrings(roots[1], inside[0]);
 }
 
 test "overlapping turns mark unhinted files unclear" {
