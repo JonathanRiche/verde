@@ -63,6 +63,8 @@ targets:
         UIAppFonts: [cal_sans.ttf, jetbrains_mono.ttf, noto_sans_bold.ttf, noto_sans_regular.ttf]
         NSFaceIDUsageDescription: Unlock Verde to access your chats and paired hosts.
         NSCameraUsageDescription: Scan a Verde pairing QR code or attach a photo to a chat.
+        NSMicrophoneUsageDescription: Talk to your Verde companion. The microphone is only on while you're talking to it.
+        NSSpeechRecognitionUsageDescription: Turn what you say to your Verde companion into a message. Speech is recognized on this iPhone unless you allow server recognition in Companion settings.
         CFBundleURLTypes:
           - CFBundleURLName: dev.verdeai.app.pair
             CFBundleURLSchemes: [verde]

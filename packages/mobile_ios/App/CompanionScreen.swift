@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// The Companion sheet opened from the floating bubble: who it is and how it's doing, what needs
 /// the user across every workspace, its crew, and its conversation (the ordinary chat transcript
@@ -6,6 +7,7 @@ import SwiftUI
 struct CompanionSheet: View {
     let model: CompanionModel
     let browse: BrowseModel
+    let voice: CompanionVoice
     let open: (BrowseRoute) -> Void
     let onHosts: () -> Void
     @State private var settings = false
@@ -37,14 +39,17 @@ struct CompanionSheet: View {
             CompanionBoard(needsYou: model.needsYou, crew: model.crew, open: open)
             Divider().overlay(VerdeTheme.border)
             if let conversation = model.conversation {
-                CompanionConversation(browse: browse, workspaceID: conversation.workspace, threadID: conversation.thread,
-                                      pendingPrompt: $pendingPrompt, onHosts: onHosts)
+                CompanionConversation(browse: browse, voice: voice, name: active.name, workspaceID: conversation.workspace,
+                                      threadID: conversation.thread, pendingPrompt: $pendingPrompt, onHosts: onHosts)
                     .id(conversation.workspace + "/" + conversation.thread)
             } else {
-                CompanionStarter(busy: model.creatingThread, name: active.name) { prompt in
+                CompanionStarter(busy: model.creatingThread, name: active.name, voice: voice, send: { prompt in
                     pendingPrompt = prompt
                     Task { if await model.ensureConversation() == nil { pendingPrompt = nil } }
-                }
+                }, sendVoice: { transcript in
+                    voice.pendingPrompt = transcript
+                    Task { if await model.ensureConversation() == nil { voice.pendingPrompt = nil } }
+                })
             }
         }
     }
@@ -56,6 +61,7 @@ private struct CompanionHeader: View {
     let entry: RosterEntry
     let presence: CompanionPresence
     let openSettings: () -> Void
+    @AppStorage(CompanionBubbleStore.hiddenKey) private var bubbleHidden = false
 
     var body: some View {
         HStack(alignment: .center, spacing: 10) {
@@ -82,8 +88,15 @@ private struct CompanionHeader: View {
                 .disabled(model.saving)
                 .accessibilityLabel("Switch companion")
             }
-            Button(action: openSettings) { Image(systemName: "slider.horizontal.3").frame(width: 44, height: 44) }
-                .accessibilityLabel("Companion settings")
+            Menu {
+                Button(action: openSettings) { Label("Settings", systemImage: "slider.horizontal.3") }
+                if bubbleHidden {
+                    Button { bubbleHidden = false } label: { Label("Show bubble", systemImage: "eye") }
+                } else {
+                    Button(role: .destructive) { bubbleHidden = true } label: { Label("Hide bubble", systemImage: "eye.slash") }
+                }
+            } label: { Image(systemName: "ellipsis.circle").frame(width: 44, height: 44) }
+                .accessibilityLabel("Companion options")
                 .accessibilityIdentifier("companion-settings")
         }
         .padding(.leading, 16).padding(.trailing, 8).padding(.top, 14).padding(.bottom, 6)
@@ -207,7 +220,9 @@ private struct SuggestionList: View {
 private struct CompanionStarter: View {
     let busy: Bool
     let name: String
+    let voice: CompanionVoice
     let send: (String) -> Void
+    let sendVoice: (String) -> Void
     @State private var text = ""
 
     var body: some View {
@@ -219,6 +234,7 @@ private struct CompanionStarter: View {
                     SuggestionList(enabled: !busy) { send($0) }
                 }.padding(16)
             }
+            CompanionVoiceBar(voice: voice, name: name, send: sendVoice).disabled(busy)
             HStack(spacing: 8) {
                 TextField("Message \(name)", text: $text, axis: .vertical)
                     .lineLimit(1...5)
@@ -246,21 +262,31 @@ private struct CompanionStarter: View {
 /// The companion's chat: the regular transcript, approvals and composer, with empty-state suggestions.
 private struct CompanionConversation: View {
     let browse: BrowseModel
+    let voice: CompanionVoice
+    let name: String
     let workspaceID: String
     let threadID: String
     @Binding var pendingPrompt: String?
     let onHosts: () -> Void
     @State private var model: TranscriptModel?
+    @AppStorage(CompanionVoiceStore.readAloudKey) private var readAloud = ""
 
     var body: some View {
         VStack(spacing: 0) {
             if let model {
-                TranscriptBody(model: model, browse: browse, onHosts: onHosts)
+                TranscriptBody(model: model, browse: browse, onHosts: onHosts,
+                               accessory: AnyView(CompanionVoiceBar(voice: voice, name: name) { sendVoice($0, model) }))
                     .overlay(alignment: .top) {
                         if let thread = model.thread, thread.rows.isEmpty, !thread.page.loading, thread.error == nil {
                             SuggestionList(enabled: true) { model.input.ask($0) }.padding(16)
                         }
                     }
+                    // Reads new replies aloud per the read-aloud setting, sentence by sentence.
+                    .onChange(of: readKey(model), initial: true) { _, _ in
+                        voice.observe(rows: model.thread?.rows ?? [], turnActive: model.state.turn != nil,
+                                      policy: effectiveReadAloud(stored: readAloud, voiceOverRunning: UIAccessibility.isVoiceOverRunning))
+                    }
+                    .onChange(of: voice.pendingPrompt, initial: true) { _, _ in takeVoicePrompt() }
             } else {
                 Spacer()
             }
@@ -276,8 +302,31 @@ private struct CompanionConversation: View {
                 pendingPrompt = nil
                 model?.input.ask(prompt)
             }
+            takeVoicePrompt()
         }
-        .onDisappear { model?.setVisible(false) }
+        .onDisappear {
+            model?.setVisible(false)
+            // Leaving the companion stops listening and speaking.
+            voice.cancel()
+            voice.leave()
+        }
+    }
+
+    /// A transcript handed over from the bubble (or the starter) goes out as a voice turn.
+    private func takeVoicePrompt() {
+        guard let model, let prompt = voice.pendingPrompt else { return }
+        voice.pendingPrompt = nil
+        sendVoice(prompt, model)
+    }
+
+    private func sendVoice(_ text: String, _ model: TranscriptModel) {
+        voice.noteVoiceSend()
+        model.input.ask(text, voice: true)
+    }
+
+    private func readKey(_ model: TranscriptModel) -> String {
+        let last = model.thread?.rows.last { $0.role == "assistant" && $0.kind == "message" }
+        return (last?.id ?? "") + "#" + String(last?.body.utf16.count ?? 0) + "#" + String(model.state.turn != nil)
     }
 }
 
@@ -315,6 +364,7 @@ struct CompanionSettings: View {
                     Text("Sent with every turn, e.g. \u{201C}Always run the tests before calling work done.\u{201D}")
                 }
                 brain
+                CompanionVoiceSettings()
                 roster
                 Section {
                     Toggle("Show the floating bubble", isOn: Binding(get: { !bubbleHidden }, set: { bubbleHidden = !$0 }))

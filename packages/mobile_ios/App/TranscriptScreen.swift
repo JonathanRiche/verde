@@ -99,6 +99,8 @@ struct TranscriptBody: View {
     let model: TranscriptModel
     let browse: BrowseModel
     let onHosts: () -> Void
+    /// Shown just above the composer (the Companion's voice bar).
+    var accessory: AnyView? = nil
 
     var body: some View {
         GeometryReader { geometry in
@@ -119,6 +121,7 @@ struct TranscriptBody: View {
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                if let accessory { accessory }
                 ChatComposer(model: model.input, availableHeight: geometry.size.height)
             }
         }

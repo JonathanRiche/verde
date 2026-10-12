@@ -111,7 +111,8 @@ final class ComposerModel {
     /// Ask-agent hand-off from the file/diff viewers: once the chat and its draft load, sends
     /// `prompt` (as a follow-up when a turn is running). An unsent draft is never replaced: the
     /// text is appended to it instead, for the user to send.
-    func ask(_ prompt: String, wait: Duration = ComposerModel.askWait) {
+    /// `voice` marks a spoken Companion turn (see `chatSendEvent`).
+    func ask(_ prompt: String, wait: Duration = ComposerModel.askWait, voice: Bool = false) {
         Task { [weak self] in
             let deadline = ContinuousClock.now.advanced(by: wait)
             while let self, self.view == nil || self.chat.thread == nil, ContinuousClock.now < deadline {
@@ -122,7 +123,7 @@ final class ComposerModel {
             if ready, let draft = view?.draft, draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, draft.attachments.isEmpty,
                generation == savedGeneration, text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 edit(prompt, selection: NSRange(location: (prompt as NSString).length, length: 0))
-                submit()
+                submit(voice: voice)
                 return
             }
             let before = text
@@ -200,7 +201,9 @@ final class ComposerModel {
         }
     }
 
-    func submit() {
+    func submit() { submit(voice: false) }
+
+    func submit(voice: Bool) {
         guard canSubmit else { return }
         action { [self] in
             guard await flush(), let view else { return }
@@ -218,9 +221,9 @@ final class ComposerModel {
             if original.hasPrefix("//") { guard await setDraft(String(original.dropFirst()), references()) else { return } }
             guard let current = self.view else { return }
             if chat.state.turn != nil && !(original.hasPrefix("!") && !original.hasPrefix("!!")) {
-                _ = await dispatch { id in .followup_submit(EventFollowupSubmit(now_ms: 0, wall_time_ms: 0, intent_id: id, workspace_id: chat.workspaceID, thread_id: chat.threadID, draft_revision: current.draft.revision, kind: composerFollowupKind(provider: current.selection.provider, images: !current.draft.attachments.isEmpty))) }
+                _ = await dispatch { id in .followup_submit(EventFollowupSubmit(now_ms: 0, wall_time_ms: 0, intent_id: id, workspace_id: chat.workspaceID, thread_id: chat.threadID, draft_revision: current.draft.revision, kind: composerFollowupKind(provider: current.selection.provider, images: !current.draft.attachments.isEmpty), voice: voice)) }
             } else {
-                _ = await dispatch { id in .send(EventSend(now_ms: 0, wall_time_ms: 0, intent_id: id, workspace_id: chat.workspaceID, thread_id: chat.threadID, draft_revision: current.draft.revision)) }
+                _ = await dispatch { id in chatSendEvent(intentID: id, workspaceID: chat.workspaceID, threadID: chat.threadID, draftRevision: current.draft.revision, voice: voice) }
             }
         }
     }
@@ -314,6 +317,13 @@ final class ComposerModel {
             }
         }
     }
+}
+
+/// The `send` intent. `voice` asks the core to tell the companion the user spoke and will hear the
+/// reply (short, spoken-friendly answers).
+func chatSendEvent(intentID: String, workspaceID: String, threadID: String, draftRevision: String, voice: Bool) -> Event {
+    .send(EventSend(now_ms: 0, wall_time_ms: 0, intent_id: intentID, workspace_id: workspaceID, thread_id: threadID,
+                    draft_revision: draftRevision, voice: voice))
 }
 
 /// A confirmed inline steer is retained by core as a receipt, not pending UI.

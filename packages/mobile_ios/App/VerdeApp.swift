@@ -13,6 +13,8 @@ struct VerdeApp: App {
     @State private var browse: BrowseModel
     @State private var push: PushRegistry
     @State private var companion: CompanionModel
+    /// Companion voice (speech-to-text and spoken replies), shared by the bubble and the sheet.
+    @State private var companionVoice = CompanionVoice()
 
     init() {
         SharedFile.cleanup()
@@ -38,7 +40,7 @@ struct VerdeApp: App {
     }
 
     var body: some Scene {
-        WindowGroup { RootView(hosts: hosts, browse: browse, push: push, companion: companion) }
+        WindowGroup { RootView(hosts: hosts, browse: browse, push: push, companion: companion, companionVoice: companionVoice) }
     }
 }
 
@@ -53,6 +55,7 @@ struct RootView: View {
     let browse: BrowseModel
     let push: PushRegistry
     let companion: CompanionModel
+    let companionVoice: CompanionVoice
     @State private var inbox = PushInbox.shared
     /// A notification's chat, opened once the host switch has cleared the old routes.
     @State private var routeAfterSwitch: BrowseRoute?
@@ -97,11 +100,11 @@ struct RootView: View {
                     .transition(.move(edge: .leading))
                 }
                 if companion.available {
-                    CompanionBubbleLayer(model: companion, sheetOpen: companionSheet, visible: bubbleVisible,
+                    CompanionBubbleLayer(model: companion, voice: companionVoice, sheetOpen: companionSheet, visible: bubbleVisible,
                                          open: { companionSheet = true }, settings: { companionSettings = true })
                         .zIndex(3)
                         .sheet(isPresented: $companionSheet) {
-                            CompanionSheet(model: companion, browse: browse, open: { route in
+                            CompanionSheet(model: companion, browse: browse, voice: companionVoice, open: { route in
                                 companionSheet = false
                                 if tab == .hosts { tab = .home }
                                 drawer = false
@@ -153,6 +156,8 @@ struct RootView: View {
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
             lock.phase(.background)
             hosts.foreground(false)
+            companionVoice.cancel()
+            companionVoice.stopSpeaking()
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
             lock.phase(.active)

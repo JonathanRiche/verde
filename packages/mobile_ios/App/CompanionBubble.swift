@@ -87,6 +87,8 @@ struct BubblePopupTracker {
 /// The overlay layer: place it above the main navigation in the root view.
 struct CompanionBubbleLayer: View {
     let model: CompanionModel
+    /// Hold-to-talk: the transcript is handed to the sheet (`pendingPrompt`), which sends it.
+    let voice: CompanionVoice
     /// The sheet is open: hide the bubble and poll faster.
     let sheetOpen: Bool
     /// Hidden on the companion's own chat screen, the drawer, etc. (polling continues).
@@ -103,6 +105,11 @@ struct CompanionBubbleLayer: View {
     @State private var tracker = BubblePopupTracker()
     @State private var chip: String?
     @State private var chipTask: Task<Void, Never>?
+    /// The current press on the bubble: tap, hold-to-talk or reposition.
+    @State private var press: PressIntent?
+    @State private var pressStart = Date()
+    @State private var holdTask: Task<Void, Never>?
+    @State private var cancelArmed = false
 
     private var edge: BubbleEdge { BubbleEdge(rawValue: edgeRaw) ?? .trailing }
     private var pollKey: String { [model.browse.hostID ?? "", String(scenePhase == .active), String(sheetOpen), String(hidden)].joined(separator: "/") }
@@ -116,14 +123,10 @@ struct CompanionBubbleLayer: View {
                 let point = drag ?? rest
                 bubble(active, layout: layout)
                     .position(point)
-                    .gesture(DragGesture(minimumDistance: 6, coordinateSpace: NamedCoordinateSpace.named("companion-bubble"))
-                        .onChanged { value in chip = nil; drag = clamped(value.location, layout) }
-                        .onEnded { value in
-                            let snapped = layout.snap(value.location)
-                            edgeRaw = snapped.edge.rawValue
-                            fraction = snapped.fraction
-                            withAnimation(animation) { drag = nil }
-                        })
+                    // One gesture: a still hold talks, early movement repositions, a quick release taps.
+                    .gesture(DragGesture(minimumDistance: 0, coordinateSpace: NamedCoordinateSpace.named("companion-bubble"))
+                        .onChanged { value in pressChanged(value, layout) }
+                        .onEnded { value in pressEnded(value, layout) })
                     .transition(.scale.combined(with: .opacity))
             }
         }
@@ -143,6 +146,74 @@ struct CompanionBubbleLayer: View {
                 y: min(max(point.y, layout.minY), layout.maxY))
     }
 
+    private func distance(_ value: DragGesture.Value) -> CGFloat {
+        (value.translation.width * value.translation.width + value.translation.height * value.translation.height).squareRoot()
+    }
+
+    private func pressChanged(_ value: DragGesture.Value, _ layout: BubbleLayout) {
+        if press == nil {
+            press = .undecided
+            pressStart = Date()
+            cancelArmed = false
+            holdTask?.cancel()
+            holdTask = Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(Int(PressRules.holdDelay * 1000)))
+                guard !Task.isCancelled, press == .undecided else { return }
+                startTalking()
+            }
+        }
+        let current = press ?? .undecided
+        let next = classifyPress(current, elapsed: Date().timeIntervalSince(pressStart), distance: distance(value))
+        if current == .undecided && next == .talk { startTalking() }
+        if current == .undecided && next == .reposition { press = .reposition; holdTask?.cancel(); chip = nil }
+        switch press {
+        case .reposition?: drag = clamped(value.location, layout)
+        case .talk?: cancelArmed = talkCancelled(distance: distance(value))
+        default: break
+        }
+    }
+
+    private func startTalking() {
+        holdTask?.cancel()
+        press = .talk
+        chip = nil
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        Task { @MainActor in
+            if !(await voice.start()) { UINotificationFeedbackGenerator().notificationOccurred(.error) }
+        }
+    }
+
+    private func pressEnded(_ value: DragGesture.Value, _ layout: BubbleLayout) {
+        holdTask?.cancel()
+        let intent = press ?? .undecided
+        let cancelled = cancelArmed || talkCancelled(distance: distance(value))
+        press = nil
+        cancelArmed = false
+        switch intent {
+        case .reposition:
+            let snapped = layout.snap(value.location)
+            edgeRaw = snapped.edge.rawValue
+            fraction = snapped.fraction
+            withAnimation(animation) { drag = nil }
+        case .talk:
+            if cancelled {
+                voice.cancel()
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                return
+            }
+            Task { @MainActor in
+                if let text = await voice.finish() {
+                    voice.pendingPrompt = text
+                    open()
+                } else if let notice = voice.notice {
+                    showChip(notice)
+                }
+            }
+        case .undecided:
+            if distance(value) <= PressRules.slop { open() }
+        }
+    }
+
     private var popupSignature: String {
         model.needsYou.map(\.id).joined(separator: "|") + "#" + (model.replyKey ?? "")
     }
@@ -151,7 +222,11 @@ struct CompanionBubbleLayer: View {
         guard let active = model.active else { return }
         let text = tracker.update(needs: model.needsYou.map(\.id), reply: model.replyKey, name: active.name,
                                   badge: model.badgeCount, collapsed: !sheetOpen && visible && !hidden)
-        guard let text else { return }
+        guard let text, press == nil else { return }
+        showChip(text)
+    }
+
+    private func showChip(_ text: String) {
         chipTask?.cancel()
         withAnimation(animation) { chip = text }
         // The bubble is one accessibility element; speak the chip instead of showing it silently.
@@ -187,7 +262,21 @@ struct CompanionBubbleLayer: View {
             }
         }
         .overlay(alignment: edge == .leading ? .leading : .trailing) {
-            if let chip {
+            if press == .talk {
+                // Live transcript while holding.
+                HStack(spacing: 8) {
+                    LevelMeter(level: voice.level, color: cancelArmed ? VerdeTheme.danger : VerdeTheme.accent)
+                    Text(cancelArmed ? "Release to cancel" : voice.notice ?? (voice.partial.isEmpty ? "Listening…" : voice.partial))
+                        .font(VerdeTheme.ui(13)).lineLimit(3).multilineTextAlignment(.leading)
+                }
+                .padding(.horizontal, 12).padding(.vertical, 8)
+                .background(VerdeTheme.panel, in: RoundedRectangle(cornerRadius: 14))
+                .overlay(RoundedRectangle(cornerRadius: 14).stroke(cancelArmed ? VerdeTheme.danger : VerdeTheme.accent))
+                .shadow(color: .black.opacity(0.2), radius: 4, y: 2)
+                .frame(width: 240, alignment: edge == .leading ? .leading : .trailing)
+                .offset(x: edge == .leading ? d + 8 : -(d + 8))
+                .allowsHitTesting(false)
+            } else if let chip {
                 Button(action: open) {
                     Text(chip).font(VerdeTheme.ui(13)).lineLimit(2).multilineTextAlignment(.leading)
                         .padding(.horizontal, 12).padding(.vertical, 8)
@@ -203,15 +292,10 @@ struct CompanionBubbleLayer: View {
             }
         }
         .contentShape(Circle())
-        .onTapGesture(perform: open)
-        .contextMenu {
-            Button { open() } label: { Label("Open \(active.name)", systemImage: "bubble.left.and.bubble.right") }
-            Button(action: settings) { Label("Settings", systemImage: "slider.horizontal.3") }
-            Button(role: .destructive) { hidden = true } label: { Label("Hide bubble", systemImage: "eye.slash") }
-        }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(bubbleAccessibilityLabel(name: active.name, count: badge))
-        .accessibilityValue(presence.status)
+        .accessibilityValue(voice.listening ? "Listening" : voice.speaking ? "Speaking" : presence.status)
+        .accessibilityHint("Opens your companion. Touch and hold to talk; the mic is also in the companion sheet.")
         .accessibilityAddTraits(.isButton)
         .accessibilityAction { open() }
         .accessibilityAction(named: "Settings") { settings() }
