@@ -215,11 +215,41 @@ pub const SendPromptState = struct {
     /// Hash of the last plan published this turn. Agents resend the whole
     /// plan on every change, so identical resends are not repeated as cards.
     last_plan_hash: ?u64 = null,
+    /// Context/cost figures gathered this turn; published as one "Usage"
+    /// row when the prompt completes.
+    usage: TurnUsage = .{},
 
     pub fn deinit(self: *SendPromptState, allocator: std.mem.Allocator) void {
         if (self.session_id) |session_id| allocator.free(session_id);
         self.reply.deinit(allocator);
         self.cursor.deinit(allocator);
+    }
+};
+
+/// Figures from ACP `usage_update` notifications (context tokens in use,
+/// context window size, cumulative session cost) plus the prompt response's
+/// own token counts (`usage` per the spec, `_meta` for grok).
+pub const TurnUsage = struct {
+    context_used: ?u64 = null,
+    context_size: ?u64 = null,
+    cost_amount: ?f64 = null,
+    cost_currency: [8]u8 = @splat(0),
+    cost_currency_len: u8 = 0,
+    input_tokens: ?u64 = null,
+    output_tokens: ?u64 = null,
+
+    fn currency(self: *const TurnUsage) []const u8 {
+        return self.cost_currency[0..self.cost_currency_len];
+    }
+
+    fn setCurrency(self: *TurnUsage, text: []const u8) void {
+        const len: u8 = @intCast(@min(text.len, self.cost_currency.len));
+        @memcpy(self.cost_currency[0..len], text[0..len]);
+        self.cost_currency_len = len;
+    }
+
+    fn isEmpty(self: *const TurnUsage) bool {
+        return self.context_used == null and self.cost_amount == null and self.input_tokens == null and self.output_tokens == null;
     }
 };
 
@@ -366,7 +396,9 @@ pub fn handleSendPromptLine(
                         return error.AcpRefused;
                     }
                 }
+                recordPromptUsage(result, &state.usage);
             }
+            emitUsageSummary(allocator, request, state) catch {};
             return .prompt_done;
         }
     }
@@ -820,6 +852,10 @@ fn handleLiveSessionUpdate(
         try emitPlanUpdate(allocator, update, request, state);
         return;
     }
+    if (std.mem.eql(u8, kind, "usage_update")) {
+        recordUsageUpdate(update, &state.usage);
+        return;
+    }
     if (std.mem.eql(u8, kind, "tool_call") or std.mem.eql(u8, kind, "tool_call_update")) {
         finishThinking(request, state);
         const event = (try toolEventAlloc(allocator, update)) orelse return;
@@ -839,6 +875,101 @@ fn handleLiveSessionUpdate(
             emitDiffUpdate(allocator, update, event.output, request.stream_context, on_stream_event);
         }
     }
+}
+
+// `usage_update`: {used, size, cost?: {amount, currency}}; cumulative, so the
+// latest one wins.
+fn recordUsageUpdate(update: std.json.Value, usage: *TurnUsage) void {
+    if (jsonUnsigned(getObjectField(update, "used"))) |used| usage.context_used = used;
+    if (jsonUnsigned(getObjectField(update, "size"))) |size| usage.context_size = size;
+    const cost = getObjectField(update, "cost") orelse return;
+    if (cost != .object) return;
+    if (jsonFloat(getObjectField(cost, "amount"))) |amount| {
+        usage.cost_amount = amount;
+        usage.setCurrency(getOptionalObjectString(cost, "currency") orelse "USD");
+    }
+}
+
+// Prompt response token counts: `result.usage` per the ACP spec; grok puts
+// the same figures under `result._meta`.
+fn recordPromptUsage(result: std.json.Value, usage: *TurnUsage) void {
+    const sources = [_]?std.json.Value{ getObjectField(result, "usage"), getObjectField(result, "_meta") };
+    for (sources) |maybe_source| {
+        const source = maybe_source orelse continue;
+        if (source != .object) continue;
+        if (jsonUnsigned(getObjectField(source, "inputTokens"))) |tokens| usage.input_tokens = tokens;
+        if (jsonUnsigned(getObjectField(source, "outputTokens"))) |tokens| usage.output_tokens = tokens;
+    }
+}
+
+/// One compact "Usage" system row per turn, e.g.
+/// `Context: 61,234 of 500,000 tokens (12%) · Session cost: $0.12 · Last turn: 1,200 in / 340 out`.
+fn emitUsageSummary(allocator: std.mem.Allocator, request: provider_types.SendPromptRequest, state: *SendPromptState) !void {
+    const on_stream_event = request.on_stream_event orelse return;
+    const usage = &state.usage;
+    if (usage.isEmpty()) return;
+    var body: std.Io.Writer.Allocating = .init(allocator);
+    defer body.deinit();
+    const w = &body.writer;
+    var parts: usize = 0;
+    if (usage.context_used) |used| {
+        try w.writeAll("Context: ");
+        try writeGrouped(w, used);
+        if (usage.context_size) |size| {
+            try w.writeAll(" of ");
+            try writeGrouped(w, size);
+            try w.writeAll(" tokens");
+            if (size > 0) try w.print(" ({d}%)", .{@min(used * 100 / size, 100)});
+        } else {
+            try w.writeAll(" tokens");
+        }
+        parts += 1;
+    }
+    if (usage.cost_amount) |amount| {
+        if (parts > 0) try w.writeAll(" · ");
+        if (std.mem.eql(u8, usage.currency(), "USD")) {
+            try w.print("Session cost: ${d:.2}", .{amount});
+        } else {
+            try w.print("Session cost: {d:.2} {s}", .{ amount, usage.currency() });
+        }
+        parts += 1;
+    }
+    if (usage.input_tokens != null or usage.output_tokens != null) {
+        if (parts > 0) try w.writeAll(" · ");
+        try w.writeAll("Last turn: ");
+        try writeGrouped(w, usage.input_tokens orelse 0);
+        try w.writeAll(" in / ");
+        try writeGrouped(w, usage.output_tokens orelse 0);
+        try w.writeAll(" out");
+    }
+    on_stream_event(request.stream_context, .{ .message = .{ .title = "Usage", .body = body.written() } });
+}
+
+fn writeGrouped(w: *std.Io.Writer, value: u64) !void {
+    var digits: [20]u8 = undefined;
+    const text = std.fmt.bufPrint(&digits, "{d}", .{value}) catch unreachable;
+    for (text, 0..) |digit, index| {
+        if (index > 0 and (text.len - index) % 3 == 0) try w.writeByte(',');
+        try w.writeByte(digit);
+    }
+}
+
+fn jsonUnsigned(value: ?std.json.Value) ?u64 {
+    const v = value orelse return null;
+    return switch (v) {
+        .integer => |n| if (n >= 0) @intCast(n) else null,
+        .float => |f| if (f >= 0) @intFromFloat(@floor(f)) else null,
+        else => null,
+    };
+}
+
+fn jsonFloat(value: ?std.json.Value) ?f64 {
+    const v = value orelse return null;
+    return switch (v) {
+        .integer => |n| @floatFromInt(n),
+        .float => |f| f,
+        else => null,
+    };
 }
 
 /// ACP `plan` updates carry the complete entry list each time. Publish it as
@@ -2474,4 +2605,70 @@ test "ACP plan updates publish one Todos card per distinct plan" {
     try std.testing.expectEqual(@as(usize, 1), capture.count);
     try std.testing.expectEqualStrings("Todos", capture.title[0..capture.title_len]);
     try std.testing.expectEqualStrings("- [x] Read code\n- [>] Write fix\n- [ ] Test\n", capture.body[0..capture.body_len]);
+}
+
+test "usage_update and prompt token counts publish one Usage row per turn" {
+    const Capture = struct {
+        count: usize = 0,
+        title: [16]u8 = undefined,
+        title_len: usize = 0,
+        body: [256]u8 = undefined,
+        body_len: usize = 0,
+
+        fn onEvent(context: ?*anyopaque, event: provider_types.StreamEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            switch (event) {
+                .message => |message| {
+                    self.count += 1;
+                    @memcpy(self.title[0..message.title.len], message.title);
+                    self.title_len = message.title.len;
+                    @memcpy(self.body[0..message.body.len], message.body);
+                    self.body_len = message.body.len;
+                },
+                else => {},
+            }
+        }
+    };
+    var capture: Capture = .{};
+    var state: SendPromptState = .{ .prompt_submitted = true };
+    defer state.deinit(std.testing.allocator);
+    const request = provider_types.SendPromptRequest{
+        .prompt = "usage",
+        .stream_context = &capture,
+        .on_stream_event = Capture.onEvent,
+    };
+    const stale =
+        \\{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"usage_update","used":100,"size":500000}}}
+    ;
+    const latest =
+        \\{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"usage_update","used":61234,"size":500000,"cost":{"amount":0.123,"currency":"USD"}}}}
+    ;
+    const done =
+        \\{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn","_meta":{"inputTokens":1200,"outputTokens":340,"reasoningTokens":5}}}
+    ;
+    _ = try handleSendPromptLine(std.testing.allocator, TEST_HARNESS, stale, request, &state, null);
+    _ = try handleSendPromptLine(std.testing.allocator, TEST_HARNESS, latest, request, &state, null);
+    try std.testing.expectEqual(@as(usize, 0), capture.count);
+    try std.testing.expectEqual(SendLineAction.prompt_done, try handleSendPromptLine(std.testing.allocator, TEST_HARNESS, done, request, &state, null));
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqualStrings("Usage", capture.title[0..capture.title_len]);
+    try std.testing.expectEqualStrings(
+        "Context: 61,234 of 500,000 tokens (12%) · Session cost: $0.12 · Last turn: 1,200 in / 340 out",
+        capture.body[0..capture.body_len],
+    );
+
+    // Turns without any figures publish nothing.
+    var quiet_capture: Capture = .{};
+    var quiet_state: SendPromptState = .{ .prompt_submitted = true };
+    defer quiet_state.deinit(std.testing.allocator);
+    const quiet_request = provider_types.SendPromptRequest{
+        .prompt = "usage",
+        .stream_context = &quiet_capture,
+        .on_stream_event = Capture.onEvent,
+    };
+    const plain_done =
+        \\{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}
+    ;
+    _ = try handleSendPromptLine(std.testing.allocator, TEST_HARNESS, plain_done, quiet_request, &quiet_state, null);
+    try std.testing.expectEqual(@as(usize, 0), quiet_capture.count);
 }
