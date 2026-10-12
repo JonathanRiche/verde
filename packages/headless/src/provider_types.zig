@@ -90,6 +90,9 @@ pub const ModelInfo = struct {
     cursor_reasoning_values: ?[][:0]const u8 = null,
     cursor_reasoning_requires_thinking: bool = false,
     claude_effort_values: ?[]const [:0]const u8 = null,
+    /// grok catalog `_meta.reasoningEfforts` values for this model (e.g. no
+    /// `xhigh` on grok-4.5). Null when the catalog lists none.
+    grok_effort_values: ?[][:0]const u8 = null,
 
     pub fn deinit(self: ModelInfo, allocator: anytype) void {
         allocator.free(self.provider_id);
@@ -107,6 +110,10 @@ pub const ModelInfo = struct {
             allocator.free(values);
         }
         if (self.claude_effort_values) |values| {
+            for (values) |value| allocator.free(value);
+            allocator.free(values);
+        }
+        if (self.grok_effort_values) |values| {
             for (values) |value| allocator.free(value);
             allocator.free(values);
         }

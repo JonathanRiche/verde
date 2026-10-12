@@ -35,6 +35,92 @@ const ACP_HARNESS: acp.Harness = .{
 
 var active_process_state: acp.ActiveProcessState = .{};
 
+const ReasoningEffort = provider_types.ReasoningEffort;
+const EffortSet = std.EnumSet(ReasoningEffort);
+
+/// Reasoning efforts grok advertised per model (`_meta.reasoningEfforts` in
+/// the initialize catalog), kept for the daemon's lifetime. Every handshake
+/// refreshes it so a later turn can clamp `--reasoning-effort` before the
+/// spawn; grok-4.5, for example, lists no xhigh tier.
+const EffortCache = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    entries: std.ArrayList(EffortCacheEntry) = .empty,
+    /// grok's own current model (`modelState.currentModelId`), used when a
+    /// thread defers to grok's selection.
+    current_model: ?[]u8 = null,
+};
+const EffortCacheEntry = struct { model_id: []u8, efforts: EffortSet };
+var effort_cache: EffortCache = .{};
+
+fn parseEffort(value: []const u8) ?ReasoningEffort {
+    if (std.mem.eql(u8, value, "low")) return .low;
+    if (std.mem.eql(u8, value, "medium")) return .medium;
+    if (std.mem.eql(u8, value, "high")) return .high;
+    if (std.mem.eql(u8, value, "xhigh")) return .xhigh;
+    if (std.mem.eql(u8, value, "max")) return .max;
+    return null;
+}
+
+fn rememberModelEfforts(models: []const provider_types.ModelInfo, current_model: ?[]const u8) void {
+    const allocator = std.heap.page_allocator;
+    while (!effort_cache.mutex.tryLock()) std.atomic.spinLoopHint();
+    defer effort_cache.mutex.unlock();
+    for (models) |model| {
+        const values = model.grok_effort_values orelse continue;
+        var set: EffortSet = .initEmpty();
+        for (values) |value| {
+            if (parseEffort(value)) |effort| set.insert(effort);
+        }
+        var found = false;
+        for (effort_cache.entries.items) |*entry| {
+            if (std.mem.eql(u8, entry.model_id, model.model_id)) {
+                entry.efforts = set;
+                found = true;
+                break;
+            }
+        }
+        if (found) continue;
+        const id = allocator.dupe(u8, model.model_id) catch continue;
+        effort_cache.entries.append(allocator, .{ .model_id = id, .efforts = set }) catch allocator.free(id);
+    }
+    if (current_model) |id| {
+        const copy = allocator.dupe(u8, id) catch return;
+        if (effort_cache.current_model) |old| allocator.free(old);
+        effort_cache.current_model = copy;
+    }
+}
+
+/// Efforts the catalog listed for `model_id` (null: grok's current model);
+/// null until a handshake has reported that model.
+fn cachedModelEfforts(model_id: ?[]const u8) ?EffortSet {
+    while (!effort_cache.mutex.tryLock()) std.atomic.spinLoopHint();
+    defer effort_cache.mutex.unlock();
+    const id = model_id orelse effort_cache.current_model orelse return null;
+    for (effort_cache.entries.items) |entry| {
+        if (std.mem.eql(u8, entry.model_id, id)) return entry.efforts;
+    }
+    return null;
+}
+
+/// Nearest tier the model supports: the request itself, else the highest
+/// supported tier below it, else the lowest supported one. Unknown models
+/// keep the request (`max` still becomes xhigh in reasoningEffortArg).
+fn clampEffortForModel(efforts: ?EffortSet, requested: ReasoningEffort) ReasoningEffort {
+    const set = efforts orelse return requested;
+    if (set.count() == 0 or set.contains(requested)) return requested;
+    const tiers = [_]ReasoningEffort{ .low, .medium, .high, .xhigh, .max };
+    var best: ?ReasoningEffort = null;
+    for (tiers) |tier| {
+        if (@intFromEnum(tier) > @intFromEnum(requested)) break;
+        if (set.contains(tier)) best = tier;
+    }
+    if (best) |tier| return tier;
+    for (tiers) |tier| {
+        if (set.contains(tier)) return tier;
+    }
+    return requested;
+}
+
 // grok resolves `/name args` prompt text itself and streams the outcome as a
 // normal turn, so this list only seeds the picker with its built-in commands
 // (captured from `available_commands_update`); any other advertised command or
@@ -387,7 +473,11 @@ pub const Client = struct {
             (if (std.mem.eql(u8, model, "default")) null else model)
         else
             null;
-        const effort_arg = if (request.reasoning_effort) |effort| reasoningEffortArg(effort) else null;
+        // Clamp the effort to what the last handshake said this model
+        // supports; the handshake below re-checks and corrects via
+        // session/set_model when the cache was cold or stale.
+        const spawn_effort = if (request.reasoning_effort) |effort| clampEffortForModel(cachedModelEfforts(model_arg), effort) else null;
+        const effort_arg = if (spawn_effort) |effort| reasoningEffortArg(effort) else null;
 
         var proc = try self.spawnAcp(allocator, model_arg, effort_arg);
         defer proc.deinit();
@@ -397,8 +487,10 @@ pub const Client = struct {
 
         var state: acp.SendPromptState = .{};
         errdefer state.deinit(allocator);
-        var resumed_model: ?[]u8 = null;
-        defer if (resumed_model) |model| allocator.free(model);
+        // Model grok reports for the session (restored for loads, its own
+        // default for new sessions when no -m override was given).
+        var session_model: ?[]u8 = null;
+        defer if (session_model) |model| allocator.free(model);
 
         var read_buffer: [16 * 1024]u8 = undefined;
         var reader = proc.process.child.stdout.?.reader(proc.threaded.io(), &read_buffer);
@@ -415,10 +507,10 @@ pub const Client = struct {
             defer allocator.free(raw_line);
             const line = std.mem.trim(u8, raw_line, " \t\r");
             if (line.len == 0) continue;
-            // A loaded session reports the model it restored; keep it so an
-            // effort-only override can still be applied via session/set_model.
-            if (request.thread_id != null and state.session_id == null and resumed_model == null) {
-                resumed_model = try currentModelIdFromSessionResponseAlloc(allocator, line);
+            // The session response reports the model in use; keep it so an
+            // effort-only override or clamp can be applied via session/set_model.
+            if (state.session_id == null and session_model == null) {
+                session_model = try currentModelIdFromSessionResponseAlloc(allocator, line);
             }
             const action = try acp.handleSendPromptLine(allocator, ACP_HARNESS, line, request, &state, proc.process.child.stdin);
             switch (action) {
@@ -429,9 +521,18 @@ pub const Client = struct {
                         active_process_state.register(&proc.process, proc.process.child.stdin, session_id);
                         if (request.on_thread_id) |on_thread_id| on_thread_id(request.stream_context, session_id);
                         if (request.on_turn_id) |on_turn_id| on_turn_id(request.stream_context, session_id);
-                        if (request.thread_id != null and (model_arg != null or effort_arg != null)) {
-                            if (model_arg orelse resumed_model) |model| {
-                                try proc.writeLine(try makeSetModelRequestAlloc(allocator, SET_MODEL_REQUEST_ID, session_id, model, effort_arg));
+                        // Loaded sessions restore their persisted model, so
+                        // overrides are re-applied; any session gets a
+                        // corrected effort when the fresh catalog shows the
+                        // command-line tier is not one this model offers.
+                        const session_model_id: ?[]const u8 = model_arg orelse session_model;
+                        const settled_effort = if (request.reasoning_effort) |effort| clampEffortForModel(cachedModelEfforts(session_model_id), effort) else null;
+                        const settled_effort_arg = if (settled_effort) |effort| reasoningEffortArg(effort) else null;
+                        const effort_corrected = effort_arg != null and settled_effort_arg != null and !std.mem.eql(u8, effort_arg.?, settled_effort_arg.?);
+                        const reapply_overrides = request.thread_id != null and (model_arg != null or effort_arg != null);
+                        if (reapply_overrides or effort_corrected) {
+                            if (session_model_id) |model| {
+                                try proc.writeLine(try makeSetModelRequestAlloc(allocator, SET_MODEL_REQUEST_ID, session_id, model, settled_effort_arg));
                             }
                         }
                         try proc.writeLine(try acp.makePromptRequestAlloc(allocator, 3, session_id, request, GROK_ACCEPTS_IMAGES));
@@ -592,6 +693,11 @@ fn authenticate(proc: *acp.Process, reader: anytype) !acp.Capabilities {
         const id = acp.responseId(parsed.value) orelse continue;
         if (id == 1 and !auth_sent) {
             capabilities = acp.parseCapabilities(parsed.value);
+            // Also refresh the per-model effort cache; a missing catalog is
+            // not an authentication failure.
+            if (parseAvailableModelsAlloc(allocator, parsed.value)) |models| {
+                provider_types.freeModelInfos(allocator, models);
+            } else |_| {}
             const key = proc.env_map.get("XAI_API_KEY") orelse "";
             const method = try selectAuthMethod(parsed.value, key.len > 0);
             try proc.writeLine(try makeAuthenticateRequestAlloc(allocator, AUTHENTICATE_REQUEST_ID, method));
@@ -704,15 +810,45 @@ fn parseAvailableModelsAlloc(allocator: std.mem.Allocator, value: std.json.Value
         if (entry != .object) continue;
         const id = acp.getOptionalObjectString(entry, "modelId") orelse continue;
         const name = acp.getOptionalObjectString(entry, "name") orelse id;
+        const efforts = try parseModelEffortsAlloc(allocator, entry);
+        errdefer if (efforts) |values| {
+            for (values) |effort_value| allocator.free(effort_value);
+            allocator.free(values);
+        };
         try models.append(allocator, .{
             .provider_id = try allocator.dupe(u8, "grok"),
             .provider_name = try allocator.dupe(u8, "Grok"),
             .model_id = try allocator.dupe(u8, id),
             .model_name = try allocator.dupe(u8, name),
+            .grok_effort_values = efforts,
         });
     }
     if (models.items.len == 0) return error.AcpFailed;
+    rememberModelEfforts(models.items, acp.getOptionalObjectString(model_state, "currentModelId"));
     return models.toOwnedSlice(allocator);
+}
+
+// `_meta.reasoningEfforts` is a list of {id, value, label, default} rows in
+// grok's own order (highest first); the GUI orders them itself.
+fn parseModelEffortsAlloc(allocator: std.mem.Allocator, entry: std.json.Value) !?[][:0]const u8 {
+    const meta = acp.getObjectField(entry, "_meta") orelse return null;
+    const efforts = acp.getObjectField(meta, "reasoningEfforts") orelse return null;
+    if (efforts != .array or efforts.array.items.len == 0) return null;
+    var values: std.ArrayList([:0]const u8) = .empty;
+    errdefer {
+        for (values.items) |value| allocator.free(value);
+        values.deinit(allocator);
+    }
+    for (efforts.array.items) |effort| {
+        const value = acp.getOptionalObjectString(effort, "value") orelse acp.getOptionalObjectString(effort, "id") orelse continue;
+        if (parseEffort(value) == null) continue;
+        try values.append(allocator, try allocator.dupeZ(u8, value));
+    }
+    if (values.items.len == 0) {
+        values.deinit(allocator);
+        return null;
+    }
+    return try values.toOwnedSlice(allocator);
 }
 
 fn resolveGrokExecutableAlloc(
@@ -819,6 +955,7 @@ test "parseAvailableModelsAlloc reads initialize and session/new catalogs" {
     try std.testing.expectEqualStrings("grok-4.6", models[0].model_id);
     try std.testing.expectEqualStrings("Grok 4.6", models[0].model_name);
     try std.testing.expectEqualStrings("grok-4.5", models[1].model_id);
+    try std.testing.expectEqual(@as(?[][:0]const u8, null), models[0].grok_effort_values);
 
     var session_new = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
         \\{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s-1","models":{"currentModelId":"grok-4.5","availableModels":[{"modelId":"grok-4.5","name":"Grok 4.5"}]}}}
@@ -939,4 +1076,41 @@ test "Grok authentication negotiates advertised methods with API key preference"
     defer key_only.deinit();
     try std.testing.expectError(error.AcpSignedOut, selectAuthMethod(key_only.value, false));
     try std.testing.expectEqualStrings("xai.api_key", try selectAuthMethod(key_only.value, true));
+}
+
+test "parseAvailableModelsAlloc keeps per-model reasoning efforts and clamps requests" {
+    const payload =
+        \\{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"_meta":{"modelState":{"currentModelId":"grok-4.5","availableModels":[
+        \\{"modelId":"grok-4.6","name":"Grok 4.6","_meta":{"supportsReasoningEffort":true,"reasoningEfforts":[
+        \\{"id":"xhigh","value":"xhigh","label":"Extra High Effort","default":false},{"id":"high","value":"high","default":true},
+        \\{"id":"medium","value":"medium"},{"id":"low","value":"low"}]}},
+        \\{"modelId":"grok-4.5","name":"Grok 4.5","_meta":{"reasoningEfforts":[{"id":"high","value":"high"},{"id":"medium","value":"medium"},{"id":"low","value":"low"}]}},
+        \\{"modelId":"grok-mini","name":"Grok Mini"}]}}}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    const models = try parseAvailableModelsAlloc(std.testing.allocator, parsed.value);
+    defer provider_types.freeModelInfos(std.testing.allocator, models);
+    try std.testing.expectEqual(@as(usize, 3), models.len);
+    try std.testing.expectEqual(@as(usize, 4), models[0].grok_effort_values.?.len);
+    try std.testing.expectEqualStrings("xhigh", models[0].grok_effort_values.?[0]);
+    try std.testing.expectEqual(@as(usize, 3), models[1].grok_effort_values.?.len);
+    try std.testing.expect(models[2].grok_effort_values == null);
+
+    // The parse refreshed the daemon-wide cache.
+    try std.testing.expect(cachedModelEfforts("grok-4.6").?.contains(.xhigh));
+    try std.testing.expect(!cachedModelEfforts("grok-4.5").?.contains(.xhigh));
+    // null model = grok's current model (grok-4.5 here).
+    try std.testing.expect(!cachedModelEfforts(null).?.contains(.xhigh));
+    try std.testing.expect(cachedModelEfforts("grok-mini") == null);
+
+    try std.testing.expectEqual(ReasoningEffort.high, clampEffortForModel(cachedModelEfforts("grok-4.5"), .xhigh));
+    try std.testing.expectEqual(ReasoningEffort.high, clampEffortForModel(cachedModelEfforts("grok-4.5"), .max));
+    try std.testing.expectEqual(ReasoningEffort.xhigh, clampEffortForModel(cachedModelEfforts("grok-4.6"), .max));
+    try std.testing.expectEqual(ReasoningEffort.low, clampEffortForModel(cachedModelEfforts("grok-4.6"), .low));
+    // Unknown models keep the request.
+    try std.testing.expectEqual(ReasoningEffort.xhigh, clampEffortForModel(cachedModelEfforts("grok-mini"), .xhigh));
+    var high_only: EffortSet = .initEmpty();
+    high_only.insert(.high);
+    try std.testing.expectEqual(ReasoningEffort.high, clampEffortForModel(high_only, .low));
 }

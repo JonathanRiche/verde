@@ -1398,7 +1398,8 @@ pub fn populateFxModelOptions(self: anytype, models: []const provider_types.Mode
 
 /// Rebuilds the grok picker from the initialize `modelState` catalog. The
 /// "Default (grok config)" row stays first so users can keep deferring to
-/// grok's own persisted selection; every grok model supports reasoning effort.
+/// grok's own persisted selection; every grok model supports reasoning
+/// effort, with the catalog's per-model tiers kept on the row.
 pub fn populateGrokModelOptions(self: anytype, models: []const provider_types.ModelInfo) !void {
     try appendDefaultModelOption(self, &self.grok_model_options, GROK_MODEL_OPTIONS[0]);
     for (models) |model| {
@@ -1408,10 +1409,16 @@ pub fn populateGrokModelOptions(self: anytype, models: []const provider_types.Mo
         errdefer self.allocator.free(label);
         const value = try self.allocator.dupeZ(u8, model.model_id);
         errdefer self.allocator.free(value);
+        const effort_values = try duplicateReasoningVariantKeys(self.allocator, model.grok_effort_values);
+        errdefer if (effort_values) |values| {
+            for (values) |effort_value| self.allocator.free(effort_value);
+            self.allocator.free(values);
+        };
         try self.grok_model_options.append(self.allocator, .{
             .label = label,
             .value = value,
             .reasoning_supported = true,
+            .grok_effort_values = effort_values,
         });
     }
 }
@@ -1520,7 +1527,7 @@ pub fn refreshOpencodeReasoningMenu(self: anytype, thread: *const ChatThread) !v
     if (thread.provider == .cursor) return self.refreshCursorReasoningMenu(thread);
     if (thread.provider == .claude) return self.refreshClaudeReasoningMenu(thread);
     if (thread.provider == .pi) return self.refreshPiReasoningMenu();
-    if (thread.provider == .grok) return self.refreshGrokReasoningMenu();
+    if (thread.provider == .grok) return self.refreshGrokReasoningMenu(thread);
     if (thread.provider == .muse) return self.refreshMuseReasoningMenu();
     if (thread.provider != .opencode) return;
     const opt = self.opencodeModelOptionForRef(thread.model_ref) orelse return;
@@ -1566,10 +1573,16 @@ pub fn refreshPiReasoningMenu(self: anytype) !void {
     }
 }
 
-/// grok efforts stop at xhigh; the menu mirrors GROK_REASONING_OPTIONS with
-/// effort tag names as row variants (parsed back by the shared handler).
-pub fn refreshGrokReasoningMenu(self: anytype) !void {
+/// grok efforts stop at xhigh and vary per model (the catalog lists each
+/// model's tiers); rows mirror GROK_REASONING_OPTIONS filtered to the selected
+/// model, with effort tag names as row variants (parsed back by the shared
+/// handler).
+pub fn refreshGrokReasoningMenu(self: anytype, thread: *const ChatThread) !void {
+    const values: ?[]const [:0]const u8 = if (self.grokModelOptionForRef(thread.model_ref)) |opt| opt.grok_effort_values else null;
     for (provider_models.GROK_REASONING_OPTIONS) |option| {
+        if (option.value) |effort| {
+            if (!provider_models.grokEffortSupported(values, effort)) continue;
+        }
         const label = try self.allocator.dupeZ(u8, option.label);
         errdefer self.allocator.free(label);
         const variant: ?[:0]u8 = if (option.value) |value| try self.allocator.dupeZ(u8, @tagName(value)) else null;
@@ -1619,6 +1632,13 @@ pub fn cursorModelOptionForRef(self: anytype, model_ref: ?[:0]const u8) ?ModelOp
 /// omits the `[1m]` refs that orchestration children and the built-in
 /// default use, and without this fallback those chats lose their reasoning
 /// levels in the run pill and run-config popover.
+/// grok picker row for a thread's model ref; "default" and unknown refs map
+/// to no row, which keeps the static effort tiers.
+pub fn grokModelOptionForRef(self: anytype, model_ref: ?[:0]const u8) ?ModelOption {
+    const ref: []const u8 = model_ref orelse return null;
+    return findModelOptionByValue(self.grokModelOptionsSnapshot(), ref);
+}
+
 pub fn claudeModelOptionForRef(self: anytype, model_ref: ?[:0]const u8) ?ModelOption {
     const ref: []const u8 = model_ref orelse DEFAULT_CLAUDE_MODEL;
     const options = self.claudeModelOptionsSnapshot();
@@ -1825,6 +1845,10 @@ pub fn clearDynamicGrokModelOptions(self: anytype) void {
         self.allocator.free(option.label);
         if (option.value) |value| self.allocator.free(value);
         if (option.description) |description| self.allocator.free(description);
+        if (option.grok_effort_values) |values| {
+            for (values) |value| self.allocator.free(value);
+            self.allocator.free(values);
+        }
     }
     self.grok_model_options.clearRetainingCapacity();
 }

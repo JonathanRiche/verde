@@ -34,6 +34,9 @@ pub const ModelOption = struct {
     cursor_reasoning_values: ?[]const [:0]const u8 = null,
     cursor_reasoning_requires_thinking: bool = false,
     claude_effort_values: ?[]const [:0]const u8 = null,
+    /// grok catalog efforts for this model; null falls back to every tier
+    /// below `max` (static rows and the "Default (grok config)" row).
+    grok_effort_values: ?[]const [:0]const u8 = null,
 };
 
 pub const OpencodeReasoningMenuRow = struct {
@@ -259,6 +262,45 @@ pub const GROK_REASONING_OPTIONS = [_]ReasoningOption{
     .{ .label = "High", .value = .high },
     .{ .label = "Xhigh", .value = .xhigh },
 };
+
+/// True when a grok model accepts `effort`: the catalog list when the model
+/// reported one, otherwise every tier up to xhigh (grok has no max tier).
+pub fn grokEffortSupported(values: ?[]const [:0]const u8, effort: ReasoningEffort) bool {
+    const list = values orelse return effort != .max;
+    for (list) |value| {
+        if (parseReasoningEffort(value) == effort) return true;
+    }
+    return false;
+}
+
+/// Selected-row index and row count for the grok reasoning gauge: the
+/// "Default" row plus each GROK_REASONING_OPTIONS tier the model supports.
+pub fn grokReasoningGauge(values: ?[]const [:0]const u8, selected: ?ReasoningEffort) struct { index: usize, count: usize } {
+    var index: usize = 0;
+    var count: usize = 0;
+    for (GROK_REASONING_OPTIONS) |option| {
+        if (option.value) |effort| {
+            if (!grokEffortSupported(values, effort)) continue;
+            if (selected != null and selected.? == effort) index = count;
+        }
+        count += 1;
+    }
+    return .{ .index = index, .count = count };
+}
+
+test "grok effort support follows the per-model catalog" {
+    try std.testing.expect(grokEffortSupported(null, .xhigh));
+    try std.testing.expect(!grokEffortSupported(null, .max));
+    const grok_45 = [_][:0]const u8{ "high", "medium", "low" };
+    try std.testing.expect(grokEffortSupported(grok_45[0..], .high));
+    try std.testing.expect(!grokEffortSupported(grok_45[0..], .xhigh));
+    const gauge = grokReasoningGauge(grok_45[0..], .high);
+    try std.testing.expectEqual(@as(usize, 4), gauge.count);
+    try std.testing.expectEqual(@as(usize, 3), gauge.index);
+    const unset = grokReasoningGauge(null, null);
+    try std.testing.expectEqual(@as(usize, GROK_REASONING_OPTIONS.len), unset.count);
+    try std.testing.expectEqual(@as(usize, 0), unset.index);
+}
 
 /// Muse calls its highest protocol tier `ultra`; Verde persists the existing
 /// `max` enum value and the Muse transport maps that value to `ultra`.

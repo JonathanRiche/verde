@@ -6294,6 +6294,7 @@ pub const AppState = struct {
     pub const refreshMuseReasoningMenu = provider_controller.refreshMuseReasoningMenu;
     pub const cursorModelOptionForRef = provider_controller.cursorModelOptionForRef;
     pub const claudeModelOptionForRef = provider_controller.claudeModelOptionForRef;
+    pub const grokModelOptionForRef = provider_controller.grokModelOptionForRef;
     pub const cursorModelParamsJsonAlloc = provider_controller.cursorModelParamsJsonAlloc;
     pub const normalizeOpencodeReasoningVariant = provider_controller.normalizeOpencodeReasoningVariant;
     pub const clearDynamicOpencodeModelOptions = provider_controller.clearDynamicOpencodeModelOptions;
@@ -8368,9 +8369,11 @@ pub const AppState = struct {
                 },
                 // fx exposes no reasoning-effort control.
                 .fx => {},
-                // grok efforts share Verde's tag names (max clamps to xhigh at send).
+                // grok efforts share Verde's tag names; the catalog decides
+                // which tiers the chosen model offers.
                 .grok => if (parseReasoningEffort(raw)) |effort| {
-                    reasoning_effort = effort;
+                    const values: ?[]const [:0]const u8 = if (self.grokModelOptionForRef(owned_model)) |option| option.grok_effort_values else null;
+                    if (provider_models.grokEffortSupported(values, effort)) reasoning_effort = effort;
                 },
                 .muse => if (parseReasoningEffort(raw)) |effort| {
                     reasoning_effort = effort;
@@ -10365,10 +10368,12 @@ pub const AppState = struct {
             },
             // fx exposes no reasoning levels.
             .fx, .custom_acp => return null,
-            // grok efforts stop at xhigh; rows mirror GROK_REASONING_OPTIONS.
-            .grok => return .{
-                .index = composerReasoningIndexForOptions(GROK_REASONING_OPTIONS[0..], thread.reasoning_effort) orelse 0,
-                .count = GROK_REASONING_OPTIONS.len,
+            // grok efforts stop at xhigh and vary per model; rows mirror
+            // GROK_REASONING_OPTIONS filtered to the model's catalog tiers.
+            .grok => {
+                const values: ?[]const [:0]const u8 = if (self.grokModelOptionForRef(thread.model_ref)) |opt| opt.grok_effort_values else null;
+                const gauge = provider_models.grokReasoningGauge(values, thread.reasoning_effort);
+                return .{ .index = gauge.index, .count = gauge.count };
             },
             .muse => return .{
                 .index = composerReasoningIndexForOptions(MUSE_REASONING_OPTIONS[0..], thread.reasoning_effort) orelse 0,

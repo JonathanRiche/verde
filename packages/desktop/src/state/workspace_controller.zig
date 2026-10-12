@@ -35,6 +35,7 @@ const GROK_MODEL_OPTIONS = provider_models.GROK_MODEL_OPTIONS;
 const DEFAULT_GROK_MODEL = provider_models.DEFAULT_GROK_MODEL;
 const DEFAULT_MUSE_MODEL = provider_models.DEFAULT_MUSE_MODEL;
 const CLAUDE_STANDARD_EFFORT_VALUES = provider_models.CLAUDE_STANDARD_EFFORT_VALUES;
+const grokEffortSupported = provider_models.grokEffortSupported;
 const parseReasoningEffort = provider_models.parseReasoningEffort;
 const WorkspacePaneId = workspace_layout.WorkspacePaneId;
 const WorkspacePaneKind = workspace_layout.WorkspacePaneKind;
@@ -2123,8 +2124,11 @@ pub fn resolveChatCreationSettings(self: anytype, request: OpenChatRequest, mode
             // Pi accepts every Verde effort tag as a thinking level.
             .pi => true,
             .opencode, .cursor, .fx => false,
-            // grok reasoning efforts stop at xhigh.
-            .grok => effort != .max,
+            // grok reasoning efforts stop at xhigh and follow the model's catalog.
+            .grok => blk: {
+                const values: ?[]const [:0]const u8 = if (self.modelOptionForProvider(.grok, model_ref)) |option| option.grok_effort_values else null;
+                break :blk grokEffortSupported(values, effort);
+            },
             .muse => true,
             .custom_acp => false,
         };

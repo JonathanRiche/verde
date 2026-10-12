@@ -1186,8 +1186,12 @@ fn settingsNewChatReasoningSupported(self: anytype, reasoning: app_config.ChatRe
         .pi => provider_models.parseReasoningEffort(reasoning.configValue()) != null,
         // fx exposes no reasoning-effort control.
         .fx => false,
-        // grok accepts Verde effort tags up to xhigh (no max tier).
-        .grok => reasoning.configValue().len > 0 and provider_models.parseReasoningEffort(reasoning.configValue()) != null and provider_models.parseReasoningEffort(reasoning.configValue()) != .max,
+        // grok accepts Verde effort tags up to xhigh (no max tier), narrowed
+        // to the tiers the selected model's catalog lists.
+        .grok => blk: {
+            const effort = provider_models.parseReasoningEffort(reasoning.configValue()) orelse break :blk false;
+            break :blk provider_models.grokEffortSupported(option.grok_effort_values, effort);
+        },
         .muse => provider_models.parseReasoningEffort(reasoning.configValue()) != null,
         .custom_acp => false,
         .opencode => blk: {
