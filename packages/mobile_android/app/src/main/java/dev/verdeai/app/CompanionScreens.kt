@@ -30,10 +30,10 @@ import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import dev.verdeai.core.*
 
-internal const val COMPANION_HOME = "companion-home"
+internal const val COMPANION_SHEET = "companion-sheet"
 internal const val COMPANION_SETTINGS = "companion-settings"
 
-/** Tells [companion] whether its home is resumed on screen (polling and first-run setup). */
+/** Tells [companion] whether Verde is resumed in the foreground (roster and crew polling). */
 @Composable
 internal fun CompanionVisibility(companion: CompanionModel) {
     val lifecycle by LocalLifecycleOwner.current.lifecycle.currentStateFlow.collectAsState()
@@ -44,12 +44,37 @@ internal fun CompanionVisibility(companion: CompanionModel) {
     }
 }
 
+/** What the companion shows and counts, shared by the bubble and the sheet. */
+internal data class CompanionSnapshot(
+    val active: CompanionEntry?,
+    val needs: List<Pane>,
+    val crew: List<CompanionLink>,
+    val pulse: CompanionPulse,
+    /** Keys of everything that needs the user; its size is the badge count. */
+    val needKeys: Set<String>,
+    val crewRunning: Boolean,
+    val companionThread: ThreadSummary?,
+)
+
+internal fun companionSnapshot(state: CompanionUiState, browse: BrowseState): CompanionSnapshot {
+    val active = state.active
+    val panes = browse.home?.items.orEmpty()
+    val needs = panes.filter { it.attention || it.status == "waiting_approval" }
+    val crew = visibleCrew(state.view?.crew?.takeIf { active != null && it.workspace_id == active.home_workspace_id && it.thread_id == active.thread_id })
+    val thread = active?.takeIf { it.thread_id.isNotEmpty() }?.let { a ->
+        browse.workspaces?.items?.find { it.workspace_id == a.home_workspace_id }?.threads?.find { it.thread_id == a.thread_id }
+    }
+    return CompanionSnapshot(active, needs, crew, companionPulse(panes, crew),
+        bubbleNeedKeys(needs, crew, thread), crew.any { crewStatus(it).running } || (thread != null && activeTurn(thread.status)), thread)
+}
+
 /**
- * The phone's home: the active companion, what needs the user across every workspace, its crew of
- * delegated chats, and its conversation with the shared transcript and composer.
+ * The companion, opened from its bubble: compact header with switcher, what needs the user across
+ * every workspace, its crew, and its conversation with the shared transcript and composer.
  */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-internal fun CompanionHome(
+internal fun CompanionSheet(
     hosts: HostsModel,
     browse: BrowseModel,
     manage: ManageModel,
@@ -58,50 +83,57 @@ internal fun CompanionHome(
     onOpenChat: (workspaceId: String, threadId: String) -> Unit,
     onActivity: () -> Unit,
     onCitation: (workspaceId: String, citation: FileCitation) -> Unit,
+    settingsRequested: Boolean = false,
+    onDismiss: () -> Unit,
 ) {
     val state by companion.state.collectAsState()
     val browseState by browse.state.collectAsState()
-    var settings by rememberSaveable { mutableStateOf(false) }
-    val active = state.active
+    var settings by rememberSaveable { mutableStateOf(settingsRequested) }
+    DisposableEffect(companion) {
+        companion.setSheetOpen(true)
+        onDispose { companion.setSheetOpen(false) }
+    }
+    val snapshot = companionSnapshot(state, browseState)
+    val active = snapshot.active
     val workspaces = browseState.workspaces?.items.orEmpty()
-    val panes = browseState.home?.items.orEmpty()
-    val needs = panes.filter { it.attention || it.status == "waiting_approval" }
-    val crew = visibleCrew(state.view?.crew?.takeIf { active != null && it.workspace_id == active.home_workspace_id && it.thread_id == active.thread_id })
-    val pulse = companionPulse(panes, crew)
     val online = browseState.host?.phase == "ready" && browseState.networkAvailable
     val thread = active?.thread_id?.takeIf { it.isNotEmpty() }
     val transcript: TranscriptModel? = if (active != null && thread != null) viewModel<TranscriptModel>(key = "companion:${browseState.hostId}:${active.home_workspace_id}:$thread",
         factory = viewModelFactory { initializer { TranscriptModel(hosts, browse.state, active.home_workspace_id, thread) } }) else null
     val transcriptState = transcript?.state?.collectAsState()?.value
-    val working = transcriptState?.turn != null || pulse.running > 0
-    val pose = companionPose(online, pulse.needsYou > 0 || transcriptState?.thread?.approval != null, working)
+    val working = transcriptState?.turn != null || snapshot.pulse.running > 0
+    val pose = companionPose(online, snapshot.needKeys.isNotEmpty() || transcriptState?.thread?.approval != null, working)
 
-    Column(Modifier.fillMaxSize().testTag(COMPANION_HOME)) {
-        if (active == null) {
-            CompanionPlaceholder(state, workspaces.any { it.open })
-            return@Column
-        }
-        CompanionHeader(active, pose, companionStatusLine(pulse), onSettings = { settings = true }, onActivity = onActivity)
-        if (needs.isNotEmpty()) NeedsYou(needs, workspaces, onOpenPane, onActivity)
-        if (crew.isNotEmpty()) Crew(crew, workspaces) { onOpenChat(it.workspace_id, it.local_thread_id) }
-        HorizontalDivider(color = VerdeColors.Border)
-        Box(Modifier.weight(1f).fillMaxWidth()) {
-            when {
-                transcript != null && transcriptState != null -> {
-                    val knownThreads = workspaces.find { it.workspace_id == active.home_workspace_id }?.threads.orEmpty() +
-                        workspaces.filter { it.workspace_id != active.home_workspace_id }.flatMap { it.threads }
-                    CompanionConversation(transcript, transcriptState, active, knownThreads,
-                        onCitation = { onCitation(active.home_workspace_id, it) },
-                        onOpenThread = { onOpenChat(active.home_workspace_id, it) },
-                        onReset = { companion.resetConversation(active.id, thread.orEmpty()) })
+    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = VerdeColors.Background,
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), modifier = Modifier.testTag(COMPANION_SHEET)) {
+        Column(Modifier.fillMaxWidth().fillMaxHeight(.92f)) {
+            if (active == null) {
+                CompanionPlaceholder(state, workspaces.any { it.open })
+                return@Column
+            }
+            CompanionHeader(active, state.roster, pose, companionStatusLine(snapshot.pulse.copy(needsYou = snapshot.needKeys.size)), enabled = state.view?.can_edit == true && !state.saving,
+                onSwitch = companion::switchTo, onSettings = { settings = true }, onActivity = onActivity)
+            if (snapshot.needs.isNotEmpty()) NeedsYou(snapshot.needs, workspaces, onOpenPane, onActivity)
+            if (snapshot.crew.isNotEmpty()) Crew(snapshot.crew, workspaces) { onOpenChat(it.workspace_id, it.local_thread_id) }
+            HorizontalDivider(color = VerdeColors.Border)
+            Box(Modifier.weight(1f).fillMaxWidth()) {
+                when {
+                    transcript != null && transcriptState != null -> {
+                        val knownThreads = workspaces.find { it.workspace_id == active.home_workspace_id }?.threads.orEmpty() +
+                            workspaces.filter { it.workspace_id != active.home_workspace_id }.flatMap { it.threads }
+                        CompanionConversation(transcript, transcriptState, active, knownThreads,
+                            onCitation = { onCitation(active.home_workspace_id, it) },
+                            onOpenThread = { onOpenChat(active.home_workspace_id, it) },
+                            onReset = { companion.resetConversation(active.id, thread.orEmpty()) })
+                    }
+                    state.settingUp -> Centered { CircularProgressIndicator(); Text("Setting up ${active.name}'s conversation…") }
+                    state.setupError != null -> Centered {
+                        Text(state.setupError.orEmpty(), color = MaterialTheme.colorScheme.error)
+                        Button(onClick = companion::retrySetup, shape = MaterialTheme.shapes.small) { Text("Try again") }
+                    }
+                    state.view?.can_edit != true -> Centered { Text("${active.name} will be ready when the host is reachable.") }
+                    else -> Centered { CircularProgressIndicator(); Text("Waking ${active.name}…") }
                 }
-                state.settingUp -> Centered { CircularProgressIndicator(); Text("Setting up ${active.name}'s conversation…") }
-                state.setupError != null -> Centered {
-                    Text(state.setupError.orEmpty(), color = MaterialTheme.colorScheme.error)
-                    Button(onClick = companion::retrySetup, shape = MaterialTheme.shapes.small) { Text("Try again") }
-                }
-                state.view?.can_edit != true -> Centered { Text("${active.name} will be ready when the host is reachable.") }
-                else -> Centered { CircularProgressIndicator(); Text("Waking ${active.name}…") }
             }
         }
     }
@@ -127,21 +159,34 @@ private fun CompanionPlaceholder(state: CompanionUiState, hasWorkspace: Boolean)
 }
 
 @Composable
-private fun CompanionHeader(active: CompanionEntry, pose: CompanionPose, status: String, onSettings: () -> Unit, onActivity: () -> Unit) {
+private fun CompanionHeader(active: CompanionEntry, roster: CompanionRoster?, pose: CompanionPose, status: String, enabled: Boolean,
+    onSwitch: (String) -> Unit, onSettings: () -> Unit, onActivity: () -> Unit) {
     val character = CompanionCharacter.of(active.character)
-    Row(Modifier.fillMaxWidth().padding(start = 12.dp, end = 4.dp, top = 8.dp, bottom = 4.dp),
-        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-        CompanionAvatar(character, pose, size = 72.dp, description = "${active.name}, ${character.label}")
-        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-            Text(active.name.ifBlank { character.label }, style = MaterialTheme.typography.headlineSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text(status, style = MaterialTheme.typography.bodyMedium, color = when (pose) {
+    Row(Modifier.fillMaxWidth().padding(start = 12.dp, end = 4.dp, bottom = 4.dp),
+        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        CompanionAvatar(character, pose, size = 48.dp, description = "${active.name}, ${character.label}")
+        Column(Modifier.weight(1f)) {
+            Text(active.name.ifBlank { character.label }, style = MaterialTheme.typography.titleLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(status, style = MaterialTheme.typography.bodySmall, maxLines = 1, color = when (pose) {
                 CompanionPose.Approval -> VerdeColors.Warning
                 CompanionPose.Working -> VerdeColors.Accent
                 else -> VerdeColors.Muted
             })
-            TextButton(onClick = onActivity, contentPadding = PaddingValues(0.dp)) { Text("All activity") }
         }
+        TextButton(onClick = onActivity) { Text("All activity") }
         IconButton(onClick = onSettings) { Icon(Icons.Filled.Settings, contentDescription = "Companion settings") }
+    }
+    // Switcher: the other companions, one tap away.
+    val others = roster?.companions.orEmpty().filter { it.id != active.id }
+    if (others.isNotEmpty()) Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        others.forEach { entry ->
+            val look = CompanionCharacter.of(entry.character)
+            AssistChip(onClick = { onSwitch(entry.id) }, enabled = enabled,
+                label = { Text(entry.name.ifBlank { look.label }, maxLines = 1) },
+                leadingIcon = { CompanionAvatar(look, CompanionPose.Idle, size = 20.dp) },
+                modifier = Modifier.semantics { contentDescription = "Switch to ${entry.name.ifBlank { look.label }}" })
+        }
     }
 }
 

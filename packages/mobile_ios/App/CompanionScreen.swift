@@ -1,41 +1,44 @@
 import SwiftUI
 
-/// The Companion home: who it is and how it's doing, what needs the user across every workspace,
-/// its crew, and its conversation (the ordinary chat transcript and composer on its thread).
-/// Until the roster has loaded (or with no workspace to home it in) the classic Home is shown.
-struct CompanionHome: View {
+/// The Companion sheet opened from the floating bubble: who it is and how it's doing, what needs
+/// the user across every workspace, its crew, and its conversation (the ordinary chat transcript
+/// and composer on its thread). Rows open their chat in the main navigation via `open`.
+struct CompanionSheet: View {
     let model: CompanionModel
     let browse: BrowseModel
-    let actions: BrowseActions
-    @Environment(\.scenePhase) private var scenePhase
+    let open: (BrowseRoute) -> Void
+    let onHosts: () -> Void
     @State private var settings = false
-    @State private var addingHost = false
     /// A prompt typed or picked before the companion's chat existed; sent once it opens.
     @State private var pendingPrompt: String?
-
-    private var pollKey: String { (browse.hostID ?? "") + "/" + String(scenePhase == .active) }
 
     var body: some View {
         Group {
             if let active = model.active {
                 content(active)
             } else {
-                HomeScreen(model: browse, actions: actions)
+                VStack(spacing: 12) {
+                    if let notice = model.notice { Text(notice).foregroundStyle(VerdeTheme.warning) }
+                    else { ProgressView("Loading your companion…") }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        // Polls the roster and crew only while this screen is visible and the app is active.
-        .task(id: pollKey) { if scenePhase == .active { await model.poll() } }
+        .background(VerdeTheme.background)
+        .tint(VerdeTheme.accent)
+        .foregroundStyle(VerdeTheme.text)
+        .font(VerdeTheme.ui())
+        .sheet(isPresented: $settings) { CompanionSettings(model: model, browse: browse) }
     }
 
     private func content(_ active: RosterEntry) -> some View {
-        let presence = model.presence
-        return VStack(spacing: 0) {
-            CompanionHeader(entry: active, presence: presence, notice: model.notice) { settings = true }
-            CompanionBoard(needsYou: model.needsYou, crew: model.crew)
+        VStack(spacing: 0) {
+            CompanionHeader(model: model, entry: active, presence: model.presence) { settings = true }
+            CompanionBoard(needsYou: model.needsYou, crew: model.crew, open: open)
             Divider().overlay(VerdeTheme.border)
             if let conversation = model.conversation {
                 CompanionConversation(browse: browse, workspaceID: conversation.workspace, threadID: conversation.thread,
-                                      pendingPrompt: $pendingPrompt, onHosts: actions.hosts)
+                                      pendingPrompt: $pendingPrompt, onHosts: onHosts)
                     .id(conversation.workspace + "/" + conversation.thread)
             } else {
                 CompanionStarter(busy: model.creatingThread, name: active.name) { prompt in
@@ -44,44 +47,46 @@ struct CompanionHome: View {
                 }
             }
         }
-        .background(VerdeTheme.background)
-        .navigationTitle(active.name)
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                NavigationLink(value: BrowseRoute.activity) { Image(systemName: "list.bullet.rectangle") }
-                    .accessibilityLabel("All activity")
-            }
-            ToolbarItem(placement: .topBarTrailing) { HostMenu(model: browse.hosts) { addingHost = true } }
-        }
-        .modifier(AddHostAlert(model: browse.hosts, isPresented: $addingHost))
-        .sheet(isPresented: $settings) { CompanionSettings(model: model, browse: browse) }
     }
 }
 
+/// Compact header: avatar, name, status, companion switcher and settings.
 private struct CompanionHeader: View {
+    let model: CompanionModel
     let entry: RosterEntry
     let presence: CompanionPresence
-    let notice: String?
     let openSettings: () -> Void
 
     var body: some View {
-        HStack(alignment: .center, spacing: 12) {
-            CompanionAvatar(character: entry.character, pose: presence.pose, failure: presence.failure, width: 52)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(entry.name).font(VerdeTheme.display(22)).lineLimit(1)
+        HStack(alignment: .center, spacing: 10) {
+            CompanionAvatar(character: entry.character, pose: presence.pose, failure: presence.failure, width: 36)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(entry.name).font(VerdeTheme.ui(16, bold: true)).lineLimit(1)
                 HStack(spacing: 6) {
                     StatusPip(active: presence.pose == .working, attention: presence.pose == .approval, failed: presence.failure)
-                    Text(presence.status).font(VerdeTheme.ui(13)).foregroundStyle(VerdeTheme.muted).lineLimit(1)
+                    Text(presence.status).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted).lineLimit(1)
                 }
-                if let notice { Text(notice).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.warning).lineLimit(2) }
+                if let notice = model.notice { Text(notice).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.warning).lineLimit(2) }
             }
             .accessibilityElement(children: .combine)
             Spacer(minLength: 4)
-            Button(action: openSettings) { Image(systemName: "slider.horizontal.3").frame(width: 36, height: 36) }
+            let companions = model.roster?.companions ?? []
+            if companions.count > 1 {
+                Menu {
+                    ForEach(companions) { other in
+                        Button { Task { await model.select(other.id) } } label: {
+                            if other.id == entry.id { Label(other.name, systemImage: "checkmark") } else { Text(other.name) }
+                        }
+                    }
+                } label: { Image(systemName: "person.2").frame(width: 44, height: 44) }
+                .disabled(model.saving)
+                .accessibilityLabel("Switch companion")
+            }
+            Button(action: openSettings) { Image(systemName: "slider.horizontal.3").frame(width: 44, height: 44) }
                 .accessibilityLabel("Companion settings")
                 .accessibilityIdentifier("companion-settings")
         }
-        .padding(.horizontal, 16).padding(.vertical, 10)
+        .padding(.leading, 16).padding(.trailing, 8).padding(.top, 14).padding(.bottom, 6)
     }
 }
 
@@ -90,6 +95,7 @@ private struct CompanionBoard: View {
     static let visibleNeeds = 3
     let needsYou: [NeedsYouItem]
     let crew: [CrewLink]
+    let open: (BrowseRoute) -> Void
 
     var body: some View {
         if !needsYou.isEmpty || !crew.isEmpty {
@@ -97,7 +103,7 @@ private struct CompanionBoard: View {
                 if !needsYou.isEmpty {
                     BoardTitle(text: "Needs you", count: needsYou.count)
                     ForEach(needsYou.prefix(Self.visibleNeeds)) { item in
-                        NavigationLink(value: BrowseRoute.thread(workspace: item.workspaceID, thread: item.threadID)) {
+                        Button { open(.thread(workspace: item.workspaceID, thread: item.threadID)) } label: {
                             HStack(spacing: 10) {
                                 Circle().fill(VerdeTheme.warning).frame(width: 6, height: 6)
                                 VStack(alignment: .leading, spacing: 0) {
@@ -113,14 +119,13 @@ private struct CompanionBoard: View {
                         .buttonStyle(.plain)
                     }
                     if needsYou.count > Self.visibleNeeds {
-                        NavigationLink("\(needsYou.count - Self.visibleNeeds) more", value: BrowseRoute.activity)
-                            .font(VerdeTheme.ui(13, bold: true))
+                        Text("\(needsYou.count - Self.visibleNeeds) more on Home").font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted)
                     }
                 }
                 if !crew.isEmpty {
                     BoardTitle(text: "Crew", count: crew.count)
                     ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 8) { ForEach(crew) { CrewChip(link: $0) } }
+                        HStack(spacing: 8) { ForEach(crew) { link in CrewChip(link: link) { open(.thread(workspace: link.workspace_id, thread: link.local_thread_id)) } } }
                     }
                 }
             }
@@ -149,9 +154,10 @@ func crewColor(_ attention: CrewAttention) -> Color {
 
 private struct CrewChip: View {
     let link: CrewLink
+    let open: () -> Void
     var body: some View {
         let attention = link.attention
-        NavigationLink(value: BrowseRoute.thread(workspace: link.workspace_id, thread: link.local_thread_id)) {
+        Button(action: open) {
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 6) {
                     ProviderGlyph(provider: link.provider.isEmpty ? nil : link.provider)
@@ -287,6 +293,7 @@ struct CompanionSettings: View {
     @State private var orders = ""
     @State private var provider = ""
     @State private var brainModel = ""
+    @AppStorage(CompanionBubbleStore.hiddenKey) private var bubbleHidden = false
 
     private var dirty: Bool {
         guard let active = model.active, active.id == editingID else { return false }
@@ -309,6 +316,9 @@ struct CompanionSettings: View {
                 }
                 brain
                 roster
+                Section {
+                    Toggle("Show the floating bubble", isOn: Binding(get: { !bubbleHidden }, set: { bubbleHidden = !$0 }))
+                } footer: { Text("Long-press the bubble to hide it; turn it back on here or in Settings.") }
             }
             .scrollContentBackground(.hidden)
             .background(VerdeTheme.background)

@@ -1,5 +1,6 @@
 package dev.verdeai.app
 
+import androidx.compose.ui.geometry.Offset
 import dev.verdeai.core.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -140,6 +141,77 @@ class CompanionTest {
         assertEquals("a", companionFor(roster, "ws", "t1")?.id)
         CompanionThreads.update("host", null)
         assertNull(CompanionThreads.name("host", "ws", "t1"))
+    }
+
+    // ---- Bubble ----
+
+    private val area = bubbleArea(width = 400f, height = 800f, size = 56f, insetLeft = 0f, insetTop = 24f, insetRight = 0f,
+        insetBottom = 48f, reserveTop = 56f, reserveBottom = 88f, margin = 8f)
+
+    @Test fun bubbleAreaExcludesInsetsTopBarAndComposerRegion() {
+        assertEquals(BubbleArea(left = 8f, top = 88f, right = 392f, bottom = 656f), area)
+        // A tall keyboard gives up the composer reserve first, but never the safe insets.
+        val typing = bubbleArea(400f, 800f, 56f, 0f, 24f, 0f, insetBottom = 600f, reserveTop = 56f, reserveBottom = 88f, margin = 8f)
+        assertEquals(192f, typing.bottom)
+        assertTrue(typing.bottom - typing.top >= 56f)
+        assertTrue(typing.top >= 32f)
+    }
+
+    @Test fun droppedBubbleSnapsToTheNearerEdgeWithClampedHeight() {
+        assertEquals(BubblePlacement(BubbleEdge.Left, 0f), snapBubble(Offset(100f, -50f), area, 56f))
+        assertEquals(BubblePlacement(BubbleEdge.Right, 1f), snapBubble(Offset(250f, 2000f), area, 56f))
+        val middle = snapBubble(Offset(300f, 88f + 256f), area, 56f)
+        assertEquals(BubbleEdge.Right, middle.edge)
+        assertEquals(.5f, middle.fraction, 1e-4f)
+        // Placement maps back inside the area, flush with the chosen side.
+        assertEquals(Offset(8f, 88f), bubbleOffset(BubblePlacement(BubbleEdge.Left, 0f), area, 56f))
+        assertEquals(Offset(336f, 600f), bubbleOffset(BubblePlacement(BubbleEdge.Right, 1f), area, 56f))
+        assertEquals(Offset(336f, 600f), bubbleOffset(BubblePlacement(BubbleEdge.Right, 7f), area, 56f))
+        val round = bubbleOffset(middle, area, 56f)
+        assertEquals(middle, snapBubble(round, area, 56f))
+    }
+
+    @Test fun badgeCountsEachChatThatNeedsYouOnce() {
+        fun pane(id: String, thread: String?, ws: String = "w") = Pane(id = id, workspace_id = ws, kind = if (thread == null) "terminal" else "chat",
+            title = id, thread_id = thread, status = "waiting_approval", attention = true)
+        val needs = listOf(pane("p1", "a"), pane("p2", null))
+        val crew = listOf(link("a", "waiting_approval"), link("b", "blocked"), link("c", "running"), link("d", "failed", ws = "x"))
+        val companion = ThreadSummary("home", "t", "Moss", "codex", null, null, true, false, 1, "waiting_approval", "today")
+        val keys = bubbleNeedKeys(needs, crew, companion)
+        assertEquals(5, keys.size)
+        assertEquals(4, bubbleNeedKeys(needs, crew, companion.copy(status = "idle")).size)
+        assertEquals("99+", badgeLabel(120))
+        assertEquals("Moss, 2 things need you", bubbleDescription("Moss", 2))
+        assertEquals("Moss, 1 thing needs you", bubbleDescription("Moss", 1))
+        assertEquals("Moss, nothing needs you", bubbleDescription("Moss", 0))
+    }
+
+    @Test fun popupOnlyForNewNeedsOrNewerRepliesWhileCollapsed() {
+        // The first snapshot primes without announcing what was already there.
+        var step = bubbleStep(BubbleSeen(), setOf("a"), 10, collapsed = true)
+        assertNull(step.popup)
+        step = bubbleStep(step.seen, setOf("a"), 10, collapsed = true)
+        assertNull(step.popup)
+        step = bubbleStep(step.seen, setOf("a", "b"), 10, collapsed = true)
+        assertEquals(BubblePopup.NeedsYou(2), step.popup)
+        // A need that left and came back is new again; one that just stays is not.
+        step = bubbleStep(step.seen, setOf("b"), 10, collapsed = true)
+        assertNull(step.popup)
+        step = bubbleStep(step.seen, setOf("b"), 20, collapsed = true)
+        assertEquals(BubblePopup.Reply, step.popup)
+        step = bubbleStep(step.seen, setOf("b"), 20, collapsed = true)
+        assertNull(step.popup)
+        // An open sheet (or hidden bubble) marks things seen silently.
+        step = bubbleStep(step.seen, setOf("b", "c"), 30, collapsed = false)
+        assertNull(step.popup)
+        step = bubbleStep(step.seen, setOf("b", "c"), 30, collapsed = true)
+        assertNull(step.popup)
+        // A missing reply time (turn running) never pops or rewinds.
+        step = bubbleStep(step.seen, setOf("b", "c"), null, collapsed = true)
+        assertNull(step.popup)
+        assertEquals(30L, step.seen.replyAt)
+        assertEquals("Done: tests pass.", replyPreview("**Summary:** Done: tests pass. More detail\nsecond line"))
+        assertEquals(80, replyPreview("x".repeat(200)).length)
     }
 
     // ---- Session over a fake core ----

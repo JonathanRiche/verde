@@ -28,7 +28,7 @@ private let unsupportedCodes: Set<String> = ["method_not_found", "unknown_method
 
 /// Maps one settled companion intent and the `companion` view onto a `CompanionRPC` reply.
 /// `crew` is the requested (workspace, thread); another companion's crew is never returned.
-func companionReply(_ method: CompanionMethod, operation: Operation, view: CompanionView?,
+func companionReply(_ method: CompanionMethod, operation: CoreOperation, view: CompanionView?,
                     crew: (workspace: String, thread: String)? = nil) throws -> Data {
     if operation.state != "succeeded" {
         let code = operation.error?.rpc_code ?? operation.error?.code ?? "failed"
@@ -91,7 +91,7 @@ final class CoreCompanionRPC: CompanionRPC {
         catch { throw CompanionRPCError.remote(code: "unavailable") }
 
         let deadline = ContinuousClock.now.advanced(by: Self.timeout)
-        var operation: Operation?
+        var operation: CoreOperation?
         var view: CompanionView?
         repeat {
             if operation == nil || operation?.state == "pending" {

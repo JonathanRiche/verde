@@ -341,7 +341,7 @@ internal data class CompanionUiState(
 ) {
     val roster get() = view?.takeIf { it.loaded }?.roster
     val active get() = activeCompanion(roster)
-    /** The companion home replaces the classic Home once the host's roster has loaded. */
+    /** The bubble appears once the host's roster has loaded (older hosts never show it). */
     val available get() = view?.loaded == true && view.supported
 }
 
@@ -353,12 +353,15 @@ internal class CompanionModel(
     private val hosts: HostsModel,
     private val browse: StateFlow<BrowseState>,
     private val pollMs: Long = POLL_MS,
+    private val openPollMs: Long = OPEN_POLL_MS,
 ) : ViewModel() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val mutableState = MutableStateFlow(CompanionUiState())
     val state = mutableState.asStateFlow()
     private val visible = MutableStateFlow(false)
+    private val sheetOpen = MutableStateFlow(false)
     private var session: CompanionSession? = null
+    private var core: CoreHost? = null
     /** Companions whose conversation setup ran this session; a retry is explicit. */
     private val attempted = mutableSetOf<String>()
     private var seeded = false
@@ -369,6 +372,7 @@ internal class CompanionModel(
 
     private suspend fun observe(id: String?) = coroutineScope {
         session = null
+        core = null
         attempted.clear()
         seeded = false
         mutableState.value = CompanionUiState(hostId = id)
@@ -377,6 +381,7 @@ internal class CompanionModel(
         if (host == null) { mutableState.update { it.copy(fatal = true) }; return@coroutineScope }
         val current = CompanionSession(HostCompanionCore(host), this)
         session = current
+        core = host
         launch {
             current.view.collect { view ->
                 mutableState.update { it.copy(view = view) }
@@ -384,20 +389,22 @@ internal class CompanionModel(
             }
         }
         launch { host.failed.collect { failed -> if (failed) mutableState.update { it.copy(fatal = true) } } }
-        // Poll roster and crew only while the companion is on screen and the host is ready.
+        // Poll roster and crew only while Verde is in the foreground and the host is ready:
+        // slowly behind the bubble, faster while the companion sheet is open.
         launch {
-            combine(visible, browse.map { ready(it) }.distinctUntilChanged()) { shown, ready -> shown && ready }
-                .distinctUntilChanged()
-                .collectLatest { active ->
-                    while (active) {
-                        poll(current)
-                        delay(pollMs)
-                    }
+            combine(visible, sheetOpen, browse.map { ready(it) }.distinctUntilChanged()) { shown, open, ready ->
+                if (shown && ready) (if (open) openPollMs else pollMs) else 0L
+            }.distinctUntilChanged().collectLatest { interval ->
+                while (interval > 0) {
+                    poll(current)
+                    delay(interval)
                 }
+            }
         }
+        // First-run setup writes to the host, so it runs only once the user opens the companion.
         launch {
-            combine(current.view, visible, browse) { view, shown, b -> Triple(view, shown, b) }.collect { (view, shown, b) ->
-                if (view != null && shown) setup(current, view, b)
+            combine(current.view, sheetOpen, browse) { view, open, b -> Triple(view, open, b) }.collect { (view, open, b) ->
+                if (view != null && open) setup(current, view, b)
             }
         }
     }
@@ -448,8 +455,21 @@ internal class CompanionModel(
         startThread(current, active, home)
     }
 
-    /** The companion home is on screen: poll and run first-time setup. */
+    /** Verde is in the foreground: keep the roster and crew fresh for the bubble. */
     fun setVisible(shown: Boolean) { visible.value = shown }
+
+    /** The companion sheet is open: poll faster and run first-time setup. */
+    fun setSheetOpen(open: Boolean) { sheetOpen.value = open }
+
+    /**
+     * First line of the companion's latest reply, when the core still holds that thread's
+     * transcript (it is read, never fetched, so the thread's unread state is untouched).
+     */
+    fun latestReply(workspaceId: String, threadId: String): String? {
+        val raw = core?.views?.value?.get(chatSelector("thread", workspaceId, threadId)) ?: return null
+        val thread = try { CoreJson.decodeFromJsonElement<ThreadQuery>(raw).data } catch (_: Exception) { null } ?: return null
+        return thread.rows.lastOrNull { it.role == "assistant" && it.kind == "message" && it.body.isNotBlank() }?.body?.let(::replyPreview)
+    }
 
     fun refresh() {
         val current = session ?: return
@@ -500,5 +520,8 @@ internal class CompanionModel(
 
     override fun onCleared() { scope.cancel() }
 
-    companion object { const val POLL_MS = 4_000L }
+    companion object {
+        const val POLL_MS = 8_000L
+        const val OPEN_POLL_MS = 4_000L
+    }
 }

@@ -114,6 +114,7 @@ struct AppSettings: View {
     let push: PushRegistry
     @Environment(\.dismiss) private var dismiss
     @State private var appearance = AppearanceSettings.shared
+    @AppStorage(CompanionBubbleStore.hiddenKey) private var companionBubbleHidden = false
     var body: some View {
         NavigationStack {
             Form {
@@ -129,6 +130,11 @@ struct AppSettings: View {
                         if let notice = appearance.notice { Text(notice).font(VerdeTheme.ui(13)) }
                     }
                     Text("Animations follow Reduce Motion in iOS Accessibility settings and the host theme when supplied.").font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted)
+                }
+                Section {
+                    Toggle("Companion bubble", isOn: Binding(get: { !companionBubbleHidden }, set: { companionBubbleHidden = !$0 }))
+                } header: { Text("Companion") } footer: {
+                    Text("A floating shortcut to your companion on every screen, on hosts that support it.")
                 }
                 CommitSettingsSection(browse: browse)
                 NotificationSettingsSection(registry: push)

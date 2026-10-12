@@ -67,6 +67,8 @@ struct RootView: View {
     @State private var lock = AppLock()
     @State private var appearance = AppearanceSettings.shared
     @State private var settings = false
+    @State private var companionSheet = false
+    @State private var companionSettings = false
 
     @ViewBuilder private var shell: some View {
         let actions = BrowseActions(hosts: { tab = .hosts }, pair: {
@@ -79,10 +81,7 @@ struct RootView: View {
                     if tab == .hosts { HostsScreen(model: hosts) { tab = .home; path = [] } }
                     else {
                         BrowseStack(model: browse, actions: actions, path: $path) {
-                            if tab == .home {
-                                if companion.available { CompanionHome(model: companion, browse: browse, actions: actions) }
-                                else { HomeScreen(model: browse, actions: actions) }
-                            }
+                            if tab == .home { HomeScreen(model: browse, actions: actions) }
                             else { WorkspacesScreen(model: browse, actions: actions) }
                         }
                     }
@@ -96,6 +95,25 @@ struct RootView: View {
                     .allowsHitTesting(true).disabled(false).zIndex(2)
                     .frame(width: min(380, geometry.size.width * 0.92))
                     .transition(.move(edge: .leading))
+                }
+                if companion.available {
+                    CompanionBubbleLayer(model: companion, sheetOpen: companionSheet, visible: bubbleVisible,
+                                         open: { companionSheet = true }, settings: { companionSettings = true })
+                        .zIndex(3)
+                        .sheet(isPresented: $companionSheet) {
+                            CompanionSheet(model: companion, browse: browse, open: { route in
+                                companionSheet = false
+                                if tab == .hosts { tab = .home }
+                                drawer = false
+                                path.append(route)
+                            }, onHosts: { companionSheet = false; tab = .hosts })
+                            .presentationDetents([.medium, .large])
+                            .presentationDragIndicator(.visible)
+                            .preferredColorScheme(appearance.scheme)
+                        }
+                        .sheet(isPresented: $companionSettings) {
+                            CompanionSettings(model: companion, browse: browse).preferredColorScheme(appearance.scheme)
+                        }
                 }
             }
             .animation(reducedMotion || appearance.reducedMotion ? nil : .easeOut(duration: 0.2), value: drawer)
@@ -160,11 +178,20 @@ struct RootView: View {
 
     /// The chat on screen (`host/workspace/thread`) for foreground notification suppression.
     private var visibleThread: String? {
-        guard tab != .hosts, !drawer, !settings, let host = hosts.active else { return nil }
-        // The Companion home shows its own chat.
-        if tab == .home, path.isEmpty, companion.available { return companion.visibleKey() }
-        guard case .thread(let workspace, let thread)? = path.last else { return nil }
+        // The Companion sheet shows the companion's own chat.
+        if companionSheet { return companion.visibleKey() }
+        guard tab != .hosts, !drawer, !settings, let host = hosts.active,
+              case .thread(let workspace, let thread)? = path.last else { return nil }
         return [host, workspace, thread].joined(separator: "/")
+    }
+
+    /// The bubble stays out of the drawer and off the companion's own chat screen.
+    private var bubbleVisible: Bool {
+        guard !drawer, !settings, !companionSettings else { return false }
+        if let conversation = companion.conversation, tab != .hosts,
+           case .thread(let workspace, let thread)? = path.last,
+           workspace == conversation.workspace, thread == conversation.thread { return false }
+        return true
     }
 
     /// A tapped notification or action: switch to its host and open the chat, handing any
@@ -183,6 +210,8 @@ struct RootView: View {
         }
         settings = false
         drawer = false
+        companionSheet = false
+        companionSettings = false
         if tab == .hosts { tab = .home }
         if hosts.active != target.hostID {
             routeAfterSwitch = route

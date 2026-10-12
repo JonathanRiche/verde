@@ -3,8 +3,6 @@ import UIKit
 
 enum BrowseRoute: Hashable {
     case workspace(String)
-    /// The classic Home (running panes, recent chats) when the Companion is the home screen.
-    case activity
     case history
     case newChat(String?)
     case addWorkspace
@@ -366,7 +364,6 @@ struct BrowseStack<Root: View>: View {
         NavigationStack(path: $path) {
             root().modifier(VerdeNavigation()).navigationDestination(for: BrowseRoute.self) { route in
                 Group { switch route {
-                case .activity: HomeScreen(model: model, actions: actions)
                 case .history: ManageContainer(browse: model) { manage in HistoryScreen(browse: model, manage: manage) }
                 case .newChat(let id): ManageContainer(browse: model) { manage in NewChatScreen(browse: model, manage: manage, initialWorkspace: id) }
                 case .addWorkspace: ManageContainer(browse: model) { manage in AddWorkspaceScreen(manage: manage) }

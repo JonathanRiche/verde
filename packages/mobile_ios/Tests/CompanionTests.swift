@@ -336,3 +336,54 @@ final class CompanionModelTests: XCTestCase {
         await harness.close()
     }
 }
+
+final class CompanionBubbleTests: XCTestCase {
+    private let layout = BubbleLayout(size: CGSize(width: 390, height: 700))
+
+    func testRestingCenterSitsOnTheSavedEdgeInsideTheReserves() {
+        let top = layout.center(edge: .leading, fraction: 0)
+        XCTAssertEqual(top.x, BubbleLayout.margin + BubbleLayout.diameter / 2)
+        XCTAssertEqual(top.y, BubbleLayout.topReserve + BubbleLayout.margin + BubbleLayout.diameter / 2)
+        let bottom = layout.center(edge: .trailing, fraction: 1)
+        XCTAssertEqual(bottom.x, 390 - BubbleLayout.margin - BubbleLayout.diameter / 2)
+        XCTAssertEqual(bottom.y, 700 - BubbleLayout.bottomReserve - BubbleLayout.margin - BubbleLayout.diameter / 2)
+        XCTAssertEqual(layout.center(edge: .trailing, fraction: 7).y, bottom.y, "fractions are clamped")
+        XCTAssertEqual(layout.center(edge: .trailing, fraction: .nan).y, bottom.y)
+    }
+
+    func testDropSnapsToTheNearestEdgeAndClamps() {
+        let left = layout.snap(CGPoint(x: 100, y: layout.minY + (layout.maxY - layout.minY) / 2))
+        XCTAssertEqual(left.edge, .leading)
+        XCTAssertEqual(left.fraction, 0.5, accuracy: 0.0001)
+        let right = layout.snap(CGPoint(x: 300, y: -500))
+        XCTAssertEqual(right.edge, .trailing)
+        XCTAssertEqual(right.fraction, 0)
+        XCTAssertEqual(layout.snap(CGPoint(x: 300, y: 5000)).fraction, 1)
+    }
+
+    func testKeyboardSqueezedLayoutNeverInverts() {
+        let squeezed = BubbleLayout(size: CGSize(width: 390, height: 150))
+        XCTAssertEqual(squeezed.maxY, squeezed.minY)
+        XCTAssertEqual(squeezed.snap(CGPoint(x: 10, y: 400)).fraction, 0)
+        XCTAssertEqual(squeezed.center(edge: .leading, fraction: 1).y, squeezed.minY)
+    }
+
+    func testBadgeCountAndLabel() {
+        XCTAssertEqual(companionBadgeCount(needsYou: 2, ownApproval: true), 3)
+        XCTAssertEqual(companionBadgeCount(needsYou: 0, ownApproval: false), 0)
+        XCTAssertEqual(bubbleAccessibilityLabel(name: "Moss", count: 1), "Moss, 1 thing needs you")
+        XCTAssertEqual(bubbleAccessibilityLabel(name: "Moss", count: 3), "Moss, 3 things need you")
+    }
+
+    func testPopupOnlyForNewItemsOrReplies() {
+        var tracker = BubblePopupTracker()
+        XCTAssertNil(tracker.update(needs: ["a"], reply: "r1", name: "Moss", badge: 1, collapsed: true), "first look only primes")
+        XCTAssertNil(tracker.update(needs: ["a"], reply: "r1", name: "Moss", badge: 1, collapsed: true), "already seen")
+        XCTAssertEqual(tracker.update(needs: ["a", "b"], reply: "r1", name: "Moss", badge: 2, collapsed: true), "Moss: 2 things need you")
+        XCTAssertNil(tracker.update(needs: ["b"], reply: "r1", name: "Moss", badge: 1, collapsed: true), "an item going away is not news")
+        XCTAssertEqual(tracker.update(needs: ["b"], reply: "r2", name: "Moss", badge: 1, collapsed: true), "Moss replied")
+        XCTAssertNil(tracker.update(needs: ["b", "c"], reply: "r3", name: "Moss", badge: 2, collapsed: false), "seen while the sheet is open")
+        XCTAssertNil(tracker.update(needs: ["b", "c"], reply: "r3", name: "Moss", badge: 2, collapsed: true))
+        XCTAssertEqual(tracker.update(needs: ["a"], reply: nil, name: "Moss", badge: 1, collapsed: true), "Moss: 1 thing needs you", "a cleared item that returns is new again")
+    }
+}

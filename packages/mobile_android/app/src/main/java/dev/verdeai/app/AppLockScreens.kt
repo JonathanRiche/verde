@@ -133,6 +133,8 @@ internal fun SecuritySettingsScreen(model: AppLockModel, auth: DeviceAuth, onBac
             verticalArrangement = Arrangement.spacedBy(8.dp)) {
             AppearanceSettingsSection()
             HorizontalDivider()
+            CompanionBubbleSetting()
+            HorizontalDivider()
             VerdeSection("App lock & privacy")
             SettingSwitch("Require unlock",
                 "Ask for your fingerprint, face or screen lock when you open Verde.",

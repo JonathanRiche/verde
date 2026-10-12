@@ -38,8 +38,8 @@ final class CompanionModel {
         return made
     }
 
-    /// The Companion replaces Home only when this host can serve the roster; older hosts (the
-    /// core reports `supported: false`, or a call answered "unknown method") keep the classic Home.
+    /// The bubble and sheet appear only when this host can serve the roster; older hosts (the core
+    /// reports `supported: false`, or a call answered "unknown method") show no Companion.
     var available: Bool {
         guard let id = browse.hostID else { return false }
         return unsupportedHost != id && coreSupported(id) && rpc(id) != nil
@@ -74,16 +74,27 @@ final class CompanionModel {
         needsYouItems(home: browse.state.home, workspaces: browse.state.workspaces, crew: crew, companion: conversation)
     }
 
-    private var threadStatus: String? {
+    private var threadSummary: ThreadSummary? {
         guard let conversation else { return nil }
         return browse.state.workspaces?.items.first { $0.workspace_id == conversation.workspace }?
-            .threads.first { $0.thread_id == conversation.thread }?.status
+            .threads.first { $0.thread_id == conversation.thread }
+    }
+    private var threadStatus: String? { threadSummary?.status }
+
+    /// The bubble badge: everything in "Needs you" plus the companion's own pending approval.
+    var badgeCount: Int { companionBadgeCount(needsYou: needsYou.count, ownApproval: threadStatus == "waiting_approval") }
+
+    /// Changes when the companion finishes a turn (its chat went quiet with newer activity); the
+    /// bubble pops "<Name> replied" for a change it hasn't seen.
+    var replyKey: String? {
+        guard let summary = threadSummary, !activeTurn(summary.status), let at = summary.last_activity_at_ms else { return nil }
+        return summary.thread_id + "@" + String(at)
     }
 
     var presence: CompanionPresence {
         let status = threadStatus
         let host = browse.state.host
-        return companionPresence(needsYou: needsYou.count + (status == "waiting_approval" ? 1 : 0),
+        return companionPresence(needsYou: badgeCount,
                                  crewRunning: crew.filter { $0.attention == .running }.count,
                                  working: status.map(activeTurn) ?? false, failed: status == "failed",
                                  connected: browse.state.networkAvailable && host?.phase == "ready")
@@ -130,11 +141,11 @@ final class CompanionModel {
         } catch { failed(error, host: host) }
     }
 
-    /// Refreshes every `pollInterval` until cancelled (the screen left or the scene went inactive).
-    func poll() async {
+    /// Refreshes every `interval` until cancelled (sheet state changed or the scene went inactive).
+    func poll(every interval: Duration = CompanionModel.pollInterval) async {
         while !Task.isCancelled {
             await refresh()
-            try? await Task.sleep(for: Self.pollInterval)
+            try? await Task.sleep(for: interval)
         }
     }
 

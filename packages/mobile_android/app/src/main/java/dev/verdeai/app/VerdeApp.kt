@@ -7,6 +7,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.material.icons.Icons
 import androidx.compose.ui.unit.dp
 import androidx.compose.material.icons.filled.Menu
@@ -27,8 +28,6 @@ import dev.verdeai.core.ThreadSummary
 
 internal object Routes {
     const val HOME = "home"
-    /** The classic Home dashboard; the companion replaces it as Home once a roster loads. */
-    const val ACTIVITY = "activity"
     const val WORKSPACES = "workspaces"
     const val HOSTS = "hosts"
     const val WORKSPACE = "workspace/{ws}"
@@ -57,7 +56,7 @@ internal object Routes {
         "file/${Uri.encode(ws)}/${citation.line ?: 0UL}/${citation.end_line ?: 0UL}/${Uri.encode(citation.path)}"
 }
 
-private val TABS = listOf(Routes.HOME, Routes.ACTIVITY, Routes.WORKSPACES, Routes.HOSTS)
+private val TABS = listOf(Routes.HOME, Routes.WORKSPACES, Routes.HOSTS)
 
 /** App shell: workspace drawer over one NavHost. Every browse screen reads only the selected host's core. */
 @Composable
@@ -126,6 +125,21 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
         val ids = browseState.workspaces?.items?.map { it.workspace_id } ?: return@LaunchedEffect
         if (workspaceScope != null && workspaceScope !in ids) workspaceScope = null
     }
+    // Machine Companion: a draggable bubble over every main screen, opening a sheet.
+    CompanionVisibility(companion)
+    val companionState by companion.state.collectAsState()
+    // Reset per host; survives rotation.
+    var companionOpen by rememberSaveable(browseState.hostId) { mutableStateOf(false) }
+    var companionSettings by rememberSaveable(browseState.hostId) { mutableStateOf(false) }
+    val companionNow = companionSnapshot(companionState, browseState)
+    val companionActive = companionNow.active
+    val onCompanionThread = route == Routes.THREAD && companionActive != null && companionActive.thread_id.isNotEmpty() &&
+        entry?.arguments?.getString("thread") == companionActive.thread_id && entry?.arguments?.getString("ws") == companionActive.home_workspace_id
+    val drawerOpen = drawer.isOpen || drawer.targetValue == DrawerValue.Open
+    val bubbleContext = LocalContext.current
+    val bubblePrefs = remember(bubbleContext) { BubblePrefs.of(bubbleContext) }
+    fun leaveCompanion(route: String, tab: Boolean = false) { companionOpen = false; open(route, tab) }
+    Box(Modifier.fillMaxSize()) {
     ModalNavigationDrawer(drawerState = drawer, gesturesEnabled = !pairing && !immersive,
         drawerContent = {
             WorkspaceDrawer(browseState, currentTab, visible = drawer.isOpen || drawer.targetValue == DrawerValue.Open, onClose = { scope.launch { drawer.close() } },
@@ -167,10 +181,41 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
         ) { padding ->
             Box(Modifier.padding(padding).consumeWindowInsets(padding)) {
                 CompositionLocalProvider(LocalWorkspaceMenu provides { scope.launch { drawer.open() }; Unit }) {
-                    Graph(nav, start, hosts, browse, manage, companion) { thread, action -> threadAction = thread to action }
+                    Graph(nav, start, hosts, browse, manage) { thread, action -> threadAction = thread to action }
                 }
             }
         }
+    }
+    if (companionState.available) {
+        val character = CompanionCharacter.of(companionActive?.character)
+        val name = companionActive?.name?.ifBlank { null } ?: character.label
+        val online = browseState.host?.phase == "ready" && browseState.networkAvailable
+        val thread = companionNow.companionThread
+        CompanionBubbleLayer(
+            shown = !companionOpen && !onCompanionThread && !pairing && !immersive && !drawerOpen && !hostsState.loading &&
+                !bubblePrefs.hidden,
+            hostId = browseState.hostId, name = name, character = character,
+            pose = companionPose(online, companionNow.needKeys.isNotEmpty(), companionNow.crewRunning),
+            needKeys = companionNow.needKeys, running = companionNow.crewRunning,
+            replyAt = thread?.takeIf { !activeTurn(it.status) }?.last_activity_at_ms,
+            replyText = { companionActive?.let { companion.latestReply(it.home_workspace_id, it.thread_id) } },
+            onOpen = { companionSettings = false; companionOpen = true },
+            onSettings = { companionSettings = true; companionOpen = true })
+    }
+    }
+    if (companionOpen && companionState.available) {
+        CompanionSheet(hosts, browse, manage, companion,
+            onOpenPane = { pane ->
+                val paneThread = pane.thread_id
+                val terminal = pane.terminal_id
+                if (pane.kind == "chat" && paneThread != null) leaveCompanion(Routes.thread(pane.workspace_id, paneThread))
+                else if (pane.kind == "terminal" && terminal != null) leaveCompanion(Routes.terminal(pane.workspace_id, terminal))
+            },
+            onOpenChat = { ws, chat -> leaveCompanion(Routes.thread(ws, chat)) },
+            onActivity = { leaveCompanion(Routes.HOME, tab = true) },
+            onCitation = { ws, citation -> leaveCompanion(Routes.file(ws, citation)) },
+            settingsRequested = companionSettings,
+            onDismiss = { companionOpen = false; companionSettings = false })
     }
 }
 
@@ -183,7 +228,7 @@ private fun NavHostController.tab(route: String) = navigate(route) {
 
 @Composable
 private fun Graph(nav: NavHostController, start: String, hosts: HostsModel, browse: BrowseModel, manage: ManageModel,
-    companion: CompanionModel, onThreadAction: (ThreadSummary, String) -> Unit) {
+    onThreadAction: (ThreadSummary, String) -> Unit) {
     val openPane: (Pane) -> Unit = { pane ->
         val thread = pane.thread_id
         val terminal = pane.terminal_id
@@ -200,21 +245,10 @@ private fun Graph(nav: NavHostController, start: String, hosts: HostsModel, brow
         nav.tab(Routes.HOSTS)
     }
     NavHost(nav, startDestination = start) {
-        val dashboard = @Composable {
+        composable(Routes.HOME) {
             HomeScreen(browse, openPane, openThread, openWorkspace, showHosts, pair,
                 onNewChat = { nav.navigate(ManageRoutes.newChat(null)) }, onHistory = { nav.navigate(ManageRoutes.HISTORY) })
         }
-        composable(Routes.HOME) {
-            // Polls the roster while Home is on screen; older hosts keep the classic dashboard.
-            CompanionVisibility(companion)
-            val companionState by companion.state.collectAsState()
-            if (companionState.available) CompanionHome(hosts, browse, manage, companion, openPane,
-                onOpenChat = { ws, thread -> nav.navigate(Routes.thread(ws, thread)) },
-                onActivity = { nav.navigate(Routes.ACTIVITY) { launchSingleTop = true } },
-                onCitation = openFile)
-            else dashboard()
-        }
-        composable(Routes.ACTIVITY) { dashboard() }
         composable(Routes.WORKSPACES) { WorkspacesScreen(browse, openWorkspace, showHosts, pair) { nav.navigate(ManageRoutes.ADD_WORKSPACE) } }
         composable(Routes.HOSTS) {
             val security = LocalAppLockControls.current?.let { { nav.navigate(Routes.SECURITY) } }
