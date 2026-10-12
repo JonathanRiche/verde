@@ -12,6 +12,7 @@ const git = @import("git_changes.zig");
 const files = @import("files.zig");
 const explorer = @import("workspace_explorer.zig");
 const companion = @import("companion.zig");
+const voice = @import("voice.zig");
 pub const types = .{
     .{ "TerminalConfig", terminal.Config },
     .{ "TerminalCursorShape", terminal.CursorShape },
@@ -151,4 +152,10 @@ pub const types = .{
     .{ "CompanionCrew", companion.Crew },
     .{ "CompanionView", companion.View },
     .{ "CompanionQuery", wire.Query(companion.View) },
+    .{ "VoiceProvider", voice.Provider },
+    .{ "VoiceTool", voice.Tool },
+    .{ "VoiceSessionCompanion", voice.SessionCompanion },
+    .{ "VoiceSession", voice.Session },
+    .{ "VoiceView", voice.View },
+    .{ "VoiceQuery", wire.Query(voice.View) },
 };
