@@ -780,6 +780,25 @@ pub fn makePermissionResponseAlloc(allocator: std.mem.Allocator, id: std.json.Va
     return writer.toOwnedSlice();
 }
 
+/// Standard ACP `session/set_model`; agents accept only ids from their own
+/// catalog (`models.availableModels` in the session response).
+pub fn makeSetModelRequestAlloc(allocator: std.mem.Allocator, id: i64, session_id: []const u8, model_id: []const u8) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var stringify: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try stringify.beginObject();
+    try writeJsonRpcHead(&stringify, id, "session/set_model");
+    try stringify.objectField("params");
+    try stringify.beginObject();
+    try stringify.objectField("sessionId");
+    try stringify.write(session_id);
+    try stringify.objectField("modelId");
+    try stringify.write(model_id);
+    try stringify.endObject();
+    try stringify.endObject();
+    return writer.toOwnedSlice();
+}
+
 /// JSON-RPC -32601 reply for an agent request Verde does not implement.
 pub fn makeMethodNotFoundResponseAlloc(allocator: std.mem.Allocator, id: std.json.Value) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(allocator);
@@ -1019,6 +1038,16 @@ fn handleLiveSessionUpdate(
     }
     if (std.mem.eql(u8, kind, "usage_update")) {
         recordUsageUpdate(update, &state.usage);
+        return;
+    }
+    if (std.mem.eql(u8, kind, "current_mode_update")) {
+        // Agents switch modes themselves (Cursor enters Plan from its
+        // create_plan flow); say so in the transcript.
+        const mode = getOptionalObjectString(update, "currentModeId") orelse return;
+        const on_stream_event = request.on_stream_event orelse return;
+        const body = try std.fmt.allocPrint(allocator, "{s} switched to {s} mode.", .{ harness.assistant_author, mode });
+        defer allocator.free(body);
+        on_stream_event(request.stream_context, .{ .message = .{ .title = "Mode", .body = body } });
         return;
     }
     if (std.mem.eql(u8, kind, "tool_call") or std.mem.eql(u8, kind, "tool_call_update")) {
@@ -2903,4 +2932,12 @@ test "slashCommandRoot parses the command root" {
     try std.testing.expectEqualStrings("/loop", slashCommandRoot("/loop 5m run tests").?);
     try std.testing.expect(slashCommandRoot("plain text") == null);
     try std.testing.expect(slashCommandRoot("/") == null);
+}
+
+test "makeSetModelRequestAlloc writes the standard session/set_model request" {
+    const line = try makeSetModelRequestAlloc(std.testing.allocator, 12, "s-1", "composer-2.5[fast=true]");
+    defer std.testing.allocator.free(line);
+    try std.testing.expectEqualStrings(
+        \\{"jsonrpc":"2.0","id":12,"method":"session/set_model","params":{"sessionId":"s-1","modelId":"composer-2.5[fast=true]"}}
+    , line);
 }

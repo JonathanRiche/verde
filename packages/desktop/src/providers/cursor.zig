@@ -16,6 +16,9 @@ const runtime_log = @import("../runtime/log.zig");
 const DEFAULT_EXECUTABLE = "cursor-agent";
 const FALLBACK_EXECUTABLE = "agent";
 const DEFAULT_MODEL = "composer-2.5";
+/// `session/set_model` for loaded sessions; outside the shared 1/2/3 ids so
+/// its response passes through `acp.handleSendPromptLine`.
+const SET_MODEL_REQUEST_ID: i64 = 12;
 const MAX_CURSOR_OUTPUT_BYTES = 8 * 1024 * 1024;
 const RESOURCE_EXHAUSTED_MESSAGE =
     \\**Cursor model temporarily unavailable**
@@ -319,6 +322,12 @@ pub const Client = struct {
 
         var state: acp.SendPromptState = .{};
         defer state.deinit(allocator);
+        // `--model` only shapes new sessions; a loaded session keeps the
+        // model it was created with, so a thread whose model changed in the
+        // picker is switched explicitly once the session is up.
+        const requested_model = request.model orelse self.config.model;
+        var switch_model: ?[]u8 = null;
+        defer if (switch_model) |model| allocator.free(model);
 
         try proc.writeLine(try acp.makeInitializeRequestAlloc(allocator, 1));
 
@@ -328,6 +337,9 @@ pub const Client = struct {
             defer allocator.free(raw_line);
             const line = std.mem.trim(u8, raw_line, " \t\r");
             if (line.len == 0) continue;
+            if (request.thread_id != null and state.session_id == null and switch_model == null) {
+                if (requested_model) |model| switch_model = try loadedSessionModelSwitchAlloc(allocator, line, model);
+            }
             const action = try acp.handleSendPromptLine(allocator, ACP_HARNESS, line, request, &state, proc.process.child.stdin);
             switch (action) {
                 .continue_reading => {},
@@ -341,6 +353,9 @@ pub const Client = struct {
                         active_process_state.register(&proc.process, proc.process.child.stdin, session_id);
                         if (request.on_thread_id) |on_thread_id| on_thread_id(request.stream_context, session_id);
                         if (request.on_turn_id) |on_turn_id| on_turn_id(request.stream_context, session_id);
+                        if (switch_model) |model| {
+                            try proc.writeLine(try acp.makeSetModelRequestAlloc(allocator, SET_MODEL_REQUEST_ID, session_id, model));
+                        }
                         try proc.writeLine(try acp.makePromptRequestAlloc(allocator, 3, session_id, request, state.capabilities.image));
                         state.prompt_submitted = true;
                     }
@@ -758,6 +773,53 @@ fn cursorModelArgAlloc(allocator: std.mem.Allocator, model: []const u8, params_j
     return try out.toOwnedSlice(allocator);
 }
 
+/// Verde's cursor refs carry effort/fast/thinking suffixes
+/// (`claude-opus-4-8-thinking-high-fast`); the ACP catalog keys models by
+/// base id with bracketed parameters (`claude-opus-4-8[thinking=true,...]`).
+fn cursorBaseModelId(id: []const u8) []const u8 {
+    var base = stripFastSuffix(id) orelse id;
+    if (stripReasoningSuffix(base)) |suffix| base = suffix.base_id;
+    if (std.mem.endsWith(u8, base, "-thinking")) base = base[0 .. base.len - "-thinking".len];
+    return base;
+}
+
+fn catalogBaseId(model_id: []const u8) []const u8 {
+    const open = std.mem.indexOfScalar(u8, model_id, '[') orelse return model_id;
+    return model_id[0..open];
+}
+
+/// For the id-2 session/load response: the catalog model id to switch a
+/// loaded session to so it runs `requested`, or null when the session is
+/// already on that base model, the line is not the session response, or the
+/// catalog has no such model (the session then keeps its persisted model).
+/// Cursor's set_model accepts only exact catalog ids, so the request's
+/// effort/fast parameters cannot be carried over; the catalog defaults apply.
+fn loadedSessionModelSwitchAlloc(allocator: std.mem.Allocator, line: []const u8, requested: []const u8) !?[]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+    defer parsed.deinit();
+    if ((acp.responseId(parsed.value) orelse return null) != 2) return null;
+    const result = acp.getObjectField(parsed.value, "result") orelse return null;
+    const models = acp.getObjectField(result, "models") orelse return null;
+    const base = cursorBaseModelId(requested);
+    const wanted_name: []const u8 = if (std.mem.eql(u8, base, "auto") or std.mem.eql(u8, base, "default")) "Auto" else base;
+    if (acp.getOptionalObjectString(models, "currentModelId")) |current| {
+        if (std.mem.eql(u8, catalogBaseId(current), base)) return null;
+    }
+    const entries = acp.getObjectField(models, "availableModels") orelse return null;
+    if (entries != .array) return null;
+    for (entries.array.items) |entry| {
+        const id = acp.getOptionalObjectString(entry, "modelId") orelse continue;
+        const name = acp.getOptionalObjectString(entry, "name") orelse "";
+        if (std.mem.eql(u8, catalogBaseId(id), base) or std.mem.eql(u8, name, wanted_name)) {
+            if (acp.getOptionalObjectString(models, "currentModelId")) |current| {
+                if (std.mem.eql(u8, current, id)) return null;
+            }
+            return try allocator.dupe(u8, id);
+        }
+    }
+    return null;
+}
+
 fn resolveCursorExecutableAlloc(
     allocator: std.mem.Allocator,
     env_map: *const std.process.Environ.Map,
@@ -943,4 +1005,54 @@ test "parseModelsTextAlloc groups Grok effort rows without an unsuffixed model" 
     try std.testing.expectEqualStrings("low", models[0].cursor_reasoning_values.?[0]);
     try std.testing.expectEqualStrings("medium", models[0].cursor_reasoning_values.?[1]);
     try std.testing.expectEqualStrings("high", models[0].cursor_reasoning_values.?[2]);
+}
+
+test "loaded sessions switch to the catalog model behind a Verde model ref" {
+    const allocator = std.testing.allocator;
+    const load_line =
+        \\{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s-1","modes":{"currentModeId":"agent","availableModes":[]},
+        \\"models":{"currentModelId":"composer-2.5[fast=true]","availableModels":[
+        \\{"modelId":"default[]","name":"Auto"},
+        \\{"modelId":"grok-4.7[context=256k,reasoning_effort=high,fast=true]","name":"grok-4.7"},
+        \\{"modelId":"composer-2.5[fast=true]","name":"composer-2.5"},
+        \\{"modelId":"claude-opus-4-8[thinking=true,context=300k,effort=high,fast=false]","name":"claude-opus-4-8"},
+        \\{"modelId":"gpt-5.4[context=272k,reasoning=medium,fast=false]","name":"gpt-5.4"}]}}}
+    ;
+    const to_gpt = (try loadedSessionModelSwitchAlloc(allocator, load_line, "gpt-5.4-low")).?;
+    defer allocator.free(to_gpt);
+    try std.testing.expectEqualStrings("gpt-5.4[context=272k,reasoning=medium,fast=false]", to_gpt);
+
+    const to_opus = (try loadedSessionModelSwitchAlloc(allocator, load_line, "claude-opus-4-8-thinking-high-fast")).?;
+    defer allocator.free(to_opus);
+    try std.testing.expectEqualStrings("claude-opus-4-8[thinking=true,context=300k,effort=high,fast=false]", to_opus);
+
+    const to_grok = (try loadedSessionModelSwitchAlloc(allocator, load_line, "grok-4.7-medium")).?;
+    defer allocator.free(to_grok);
+    try std.testing.expectEqualStrings("grok-4.7[context=256k,reasoning_effort=high,fast=true]", to_grok);
+
+    const to_auto = (try loadedSessionModelSwitchAlloc(allocator, load_line, "auto")).?;
+    defer allocator.free(to_auto);
+    try std.testing.expectEqualStrings("default[]", to_auto);
+
+    // Already on that base model (parameters cannot be switched): no request.
+    try std.testing.expectEqual(@as(?[]u8, null), try loadedSessionModelSwitchAlloc(allocator, load_line, "composer-2.5-fast"));
+    // Unknown to the catalog: keep the persisted model.
+    try std.testing.expectEqual(@as(?[]u8, null), try loadedSessionModelSwitchAlloc(allocator, load_line, "cursor-grok-4.5-high"));
+    // Only the id-2 session response carries the catalog.
+    const update_line =
+        \\{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hi"}}}}
+    ;
+    try std.testing.expectEqual(@as(?[]u8, null), try loadedSessionModelSwitchAlloc(allocator, update_line, "gpt-5.4-low"));
+    const init_line =
+        \\{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}
+    ;
+    try std.testing.expectEqual(@as(?[]u8, null), try loadedSessionModelSwitchAlloc(allocator, init_line, "gpt-5.4-low"));
+}
+
+test "cursorBaseModelId strips Verde's fast, effort, and thinking suffixes" {
+    try std.testing.expectEqualStrings("gpt-5.4", cursorBaseModelId("gpt-5.4-low"));
+    try std.testing.expectEqualStrings("claude-opus-4-8", cursorBaseModelId("claude-opus-4-8-thinking-high-fast"));
+    try std.testing.expectEqualStrings("gpt-5.5", cursorBaseModelId("gpt-5.5-extra-high"));
+    try std.testing.expectEqualStrings("composer-2.5", cursorBaseModelId("composer-2.5"));
+    try std.testing.expectEqualStrings("composer-2.5", cursorBaseModelId("composer-2.5-fast"));
 }
