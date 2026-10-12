@@ -133,8 +133,6 @@ internal fun SecuritySettingsScreen(model: AppLockModel, auth: DeviceAuth, onBac
             verticalArrangement = Arrangement.spacedBy(8.dp)) {
             AppearanceSettingsSection()
             HorizontalDivider()
-            CompanionBubbleSetting()
-            HorizontalDivider()
             VerdeSection("App lock & privacy")
             SettingSwitch("Require unlock",
                 "Ask for your fingerprint, face or screen lock when you open Verde.",
@@ -170,6 +168,8 @@ internal fun SecuritySettingsScreen(model: AppLockModel, auth: DeviceAuth, onBac
                         " On this Android version app lock keeps this on." else "",
                 checked = settings.secure_screen, enabled = state.loaded) { model.setSecureScreen(it) }
             state.saveError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+            HorizontalDivider()
+            CompanionBubbleSetting()
             NotificationSettingsSection()
             LocalGitChangesClient.current?.let { client ->
                 val git by client.snapshot.collectAsState()
