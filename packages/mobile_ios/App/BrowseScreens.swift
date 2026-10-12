@@ -169,6 +169,7 @@ private struct BrowseFrame<Content: View>: View {
     var ticking = false
     var large = true
     @ViewBuilder let content: (BrowseState, Int64) -> Content
+    @State private var addingHost = false
 
     var body: some View {
         let state = model.state
@@ -203,7 +204,11 @@ private struct BrowseFrame<Content: View>: View {
             .refreshable { await model.refresh() }
         }
         .navigationTitle(title)
-        .toolbar { if title == "Home" { ToolbarItem(placement: .principal) { VerdeWordmark() } } }
+        .toolbar {
+            if title == "Home" { ToolbarItem(placement: .principal) { VerdeWordmark() } }
+            ToolbarItem(placement: .topBarTrailing) { HostMenu(model: model.hosts) { addingHost = true } }
+        }
+        .modifier(AddHostAlert(model: model.hosts, isPresented: $addingHost))
         .navigationBarTitleDisplayMode(.inline)
         .listStyle(.plain)
         .scrollContentBackground(.hidden)

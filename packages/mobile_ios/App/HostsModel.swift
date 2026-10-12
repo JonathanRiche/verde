@@ -168,6 +168,16 @@ final class HostsModel {
         return saved
     }
 
+    /// Host-menu switch: selects the host (browse state, routes and caches follow
+    /// `onActiveChange`) and opens its pairing sheet when it can't browse until paired or re-trusted.
+    func choose(_ id: String) {
+        guard let row = row(id), !row.fatal, !row.busy, row.view?.auth_state != "signing_out" else { return }
+        if catalog.active != id { guard select(id) else { return } }
+        if let view = row.view, ["unpaired", "repair_required", "signed_out"].contains(view.auth_state) || view.trust_proposal != nil {
+            pairing = id
+        }
+    }
+
     /// Local nickname only; existing core handles, endpoints and credentials stay intact.
     @discardableResult
     func rename(_ id: String, label: String) -> Bool {

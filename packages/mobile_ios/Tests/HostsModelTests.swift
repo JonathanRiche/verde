@@ -159,6 +159,23 @@ final class HostsModelTests: XCTestCase {
         XCTAssertEqual(restored.rows.count, 2)
     }
 
+    func testHostMenuChoiceSwitchesAndOpensPairingOnlyWhenNeeded() async throws {
+        try seed()
+        let model = try await launch()
+        model.choose("beta")
+        XCTAssertEqual(model.active, "beta")
+        XCTAssertEqual(try catalog().active, "beta")
+        XCTAssertNil(model.pairing)
+        model.choose("missing")
+        XCTAssertEqual(model.active, "beta")
+        await model.close()
+        revoked = true
+        let repair = try await launch()
+        repair.choose("alpha")
+        XCTAssertEqual(repair.active, "alpha")
+        XCTAssertEqual(repair.pairing, "alpha")
+    }
+
     func testSignalsReachEachCoreInOrderAndDeduplicate() async throws {
         try seed()
         let model = try await launch()
