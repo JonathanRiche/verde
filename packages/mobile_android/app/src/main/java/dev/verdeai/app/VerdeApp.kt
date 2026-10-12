@@ -139,6 +139,27 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
     val bubbleContext = LocalContext.current
     val bubblePrefs = remember(bubbleContext) { BubblePrefs.of(bubbleContext) }
     fun leaveCompanion(route: String, tab: Boolean = false) { companionOpen = false; open(route, tab) }
+    // Companion voice: one recognizer/TTS for the activity, and the companion chat's model shared
+    // by the bubble's hold-to-talk and the sheet.
+    val voiceContext = bubbleContext.applicationContext
+    val voice: CompanionVoice = viewModel(key = "companion-voice", factory = viewModelFactory { initializer { CompanionVoice(voiceContext) } })
+    val companionTranscript: TranscriptModel? = companionActive?.takeIf { companionState.available && it.thread_id.isNotEmpty() }?.let { a ->
+        viewModel<TranscriptModel>(key = "companion:${browseState.hostId}:${a.home_workspace_id}:${a.thread_id}",
+            factory = viewModelFactory { initializer { TranscriptModel(hosts, browse.state, a.home_workspace_id, a.thread_id) } })
+    }
+    LaunchedEffect(voice, companionTranscript) { voice.attach(companionTranscript) }
+    val voiceActive by voice.active.collectAsState()
+    LaunchedEffect(voice, companionTranscript, voiceActive, companionOpen) { voice.holdFocus(companionTranscript, voiceActive, companionOpen) }
+    // Opening another chat stops a reply being read aloud.
+    val openThread = entry?.arguments?.getString("thread")
+    LaunchedEffect(route, openThread) { if (route == Routes.THREAD && !onCompanionThread) voice.stopSpeaking() }
+    val shellLifecycle by androidx.lifecycle.compose.LocalLifecycleOwner.current.lifecycle.currentStateFlow.collectAsState()
+    LaunchedEffect(shellLifecycle) { if (!shellLifecycle.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) voice.pause() }
+    val mic = rememberMicPermission()
+    val talkState by voice.talk.collectAsState()
+    val talkLevel by voice.level.collectAsState()
+    val talkSpeaking by voice.speaking.collectAsState()
+    val talkError by voice.error.collectAsState()
     Box(Modifier.fillMaxSize()) {
     ModalNavigationDrawer(drawerState = drawer, gesturesEnabled = !pairing && !immersive,
         drawerContent = {
@@ -199,8 +220,19 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
             needKeys = companionNow.needKeys, running = companionNow.crewRunning,
             replyAt = thread?.takeIf { !activeTurn(it.status) }?.last_activity_at_ms,
             replyText = { companionActive?.let { companion.latestReply(it.home_workspace_id, it.thread_id) } },
-            onOpen = { companionSettings = false; companionOpen = true },
-            onSettings = { companionSettings = true; companionOpen = true })
+            talk = if (!voice.available) null else BubbleTalk(talkState, talkLevel, talkSpeaking, talkError,
+                start = {
+                    val model = companionTranscript
+                    when {
+                        // No conversation yet: the sheet sets one up first.
+                        model == null -> { companionSettings = false; companionOpen = true; false }
+                        !mic.granted() -> { mic.request(); false }
+                        else -> { voice.press(model, liveDraft = false); true }
+                    }
+                },
+                move = voice::move, release = voice::release, cancel = voice::cancel,
+                stopSpeaking = voice::stopSpeaking, clearError = voice::clearError),
+            onOpen = { companionSettings = false; companionOpen = true })
     }
     }
     if (companionOpen && companionState.available) {
@@ -215,6 +247,8 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
             onActivity = { leaveCompanion(Routes.HOME, tab = true) },
             onCitation = { ws, citation -> leaveCompanion(Routes.file(ws, citation)) },
             settingsRequested = companionSettings,
+            transcript = companionTranscript, voice = voice,
+            onHideBubble = { bubblePrefs.updateHidden(true) },
             onDismiss = { companionOpen = false; companionSettings = false })
     }
 }

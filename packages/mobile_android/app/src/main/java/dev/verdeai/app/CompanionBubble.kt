@@ -8,7 +8,10 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.awaitTouchSlopOrCancellation
+import androidx.compose.foundation.gestures.drag
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
@@ -19,7 +22,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChange
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.layout.layout
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -29,6 +36,8 @@ import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.customActions
+import androidx.compose.ui.semantics.onClick
+import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
@@ -201,6 +210,32 @@ internal fun CompanionBubbleSetting() {
 
 // ---- Overlay ----
 
+/** Hold-to-talk hooks for the bubble; null when this phone has no speech recognizer. */
+internal class BubbleTalk(
+    val state: TalkState,
+    val level: Float,
+    val speaking: Boolean,
+    val error: String?,
+    /** Starts listening; false when it could not (no permission yet, no conversation). */
+    val start: () -> Boolean,
+    val move: (outside: Boolean) -> Unit,
+    val release: () -> Unit,
+    val cancel: () -> Unit,
+    val stopSpeaking: () -> Unit,
+    val clearError: () -> Unit,
+)
+
+/** What the speech chip says while talking: live words, cancel hint, or sending. */
+internal fun talkChip(state: TalkState): String? = when (state) {
+    TalkState.Idle -> null
+    is TalkState.Listening -> when {
+        state.cancelArmed -> "Release to cancel"
+        state.partial.isNotBlank() -> state.partial
+        else -> "Listening…"
+    }
+    is TalkState.Finishing -> state.partial.ifBlank { "Sending…" }
+}
+
 /**
  * Full-window overlay holding the bubble. It never consumes touches outside the bubble and its
  * speech chip. While [shown] is false nothing is drawn, but needs/replies are still marked seen.
@@ -216,8 +251,8 @@ internal fun CompanionBubbleLayer(
     running: Boolean,
     replyAt: Long?,
     replyText: () -> String?,
+    talk: BubbleTalk?,
     onOpen: () -> Unit,
-    onSettings: () -> Unit,
 ) {
     val context = LocalContext.current
     val prefs = remember(context) { BubblePrefs.of(context) }
@@ -237,17 +272,25 @@ internal fun CompanionBubbleLayer(
         if (popup != null) { delay(BUBBLE_POPUP_MS); popup = null }
     }
     LaunchedEffect(shown) { if (!shown) popup = null }
+    val talkError = talk?.error
+    LaunchedEffect(talkError) { if (talkError != null) { delay(BUBBLE_POPUP_MS); talk?.clearError() } }
     if (!shown) return
-    CompanionBubble(prefs, name, character, pose, needKeys.size, running, popup?.second,
-        onOpen = { popup = null; onOpen() }, onHide = { popup = null; prefs.updateHidden(true) }, onSettings = onSettings)
+    val chip = talk?.let { talkChip(it.state) } ?: talkError ?: popup?.second
+    CompanionBubble(prefs, name, character, pose, needKeys.size, running, chip, talk,
+        onOpen = { popup = null; talk?.stopSpeaking(); onOpen() }, onHide = { popup = null; prefs.updateHidden(true) })
 }
 
-@OptIn(ExperimentalFoundationApi::class, ExperimentalMaterial3Api::class)
+private enum class BubbleGesture { Tap, Drag, Hold }
+
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun CompanionBubble(prefs: BubblePrefs, name: String, character: CompanionCharacter, pose: CompanionPose, count: Int,
-    running: Boolean, popup: String?, onOpen: () -> Unit, onHide: () -> Unit, onSettings: () -> Unit) {
+    running: Boolean, chip: String?, talk: BubbleTalk?, onOpen: () -> Unit, onHide: () -> Unit) {
     val context = LocalContext.current
     val reduced = remember(context) { reducedMotion(context) }
+    val haptics = LocalHapticFeedback.current
+    val currentTalk by rememberUpdatedState(talk)
+    val currentOpen by rememberUpdatedState(onOpen)
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val density = LocalDensity.current
         val direction = LocalLayoutDirection.current
@@ -269,9 +312,11 @@ private fun CompanionBubble(prefs: BubblePrefs, name: String, character: Compani
         }
         val gap = with(density) { 8.dp.toPx() }
         val onLeft = position.value.x + size / 2f < (area.left + area.right) / 2f
-        popup?.let { text ->
-            Surface(onClick = onOpen, shape = RoundedCornerShape(14.dp), color = VerdeColors.Panel, shadowElevation = 6.dp,
-                border = androidx.compose.foundation.BorderStroke(1.dp, VerdeColors.Border),
+        val talking = talk != null && talk.state !is TalkState.Idle
+        chip?.let { text ->
+            Surface(onClick = { if (!talking) onOpen() }, shape = RoundedCornerShape(14.dp),
+                color = if (talk?.state.let { it is TalkState.Listening && it.cancelArmed }) VerdeColors.DangerPanel else VerdeColors.Panel,
+                shadowElevation = 6.dp, border = androidx.compose.foundation.BorderStroke(1.dp, VerdeColors.Border),
                 modifier = Modifier.layout { measurable, constraints ->
                     val maxWidth = max(0, (constraints.maxWidth * .7f).roundToInt())
                     val placeable = measurable.measure(constraints.copy(minWidth = 0, minHeight = 0, maxWidth = maxWidth))
@@ -282,44 +327,75 @@ private fun CompanionBubble(prefs: BubblePrefs, name: String, character: Compani
                         placeable.place(x.roundToInt(), y.roundToInt())
                     }
                 }.testTag(COMPANION_BUBBLE_POPUP)) {
-                Text(text, Modifier.padding(horizontal = 12.dp, vertical = 8.dp), style = MaterialTheme.typography.bodySmall,
-                    maxLines = 2, overflow = TextOverflow.Ellipsis)
+                Row(Modifier.padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (talk != null && talk.state is TalkState.Listening) LevelBars(talk.level)
+                    Text(text, style = MaterialTheme.typography.bodySmall, maxLines = 3, overflow = TextOverflow.Ellipsis)
+                }
             }
         }
-        var menu by remember { mutableStateOf(false) }
         Box(Modifier.offset { IntOffset(position.value.x.roundToInt(), position.value.y.roundToInt()) }.size(BUBBLE_SIZE)) {
             Box(Modifier.fillMaxSize()
                 .pointerInput(Unit) {
-                    detectDragGestures(
-                        onDragStart = { dragging = true },
-                        onDragEnd = {
-                            prefs.place(snapBubble(position.value, currentArea, size))
-                            dragging = false
-                        },
-                        onDragCancel = {
-                            prefs.place(snapBubble(position.value, currentArea, size))
-                            dragging = false
-                        },
-                        onDrag = { change, amount ->
-                            change.consume()
-                            scope.launch { position.snapTo(position.value + amount) }
-                        })
+                    awaitEachGesture {
+                        val down = awaitFirstDown()
+                        var moved: PointerInputChange? = null
+                        // Tap opens, an early drag moves the bubble, holding still talks.
+                        val gesture = withTimeoutOrNull(viewConfiguration.longPressTimeoutMillis) {
+                            val slop = awaitTouchSlopOrCancellation(down.id) { change, _ -> change.consume() }
+                            if (slop == null) BubbleGesture.Tap else { moved = slop; BubbleGesture.Drag }
+                        } ?: BubbleGesture.Hold
+                        when (gesture) {
+                            BubbleGesture.Tap -> currentOpen()
+                            BubbleGesture.Drag -> {
+                                dragging = true
+                                moved?.let { first -> val delta = first.positionChange(); scope.launch { position.snapTo(position.value + delta) } }
+                                drag(down.id) { change ->
+                                    val delta = change.positionChange()
+                                    change.consume()
+                                    scope.launch { position.snapTo(position.value + delta) }
+                                }
+                                prefs.place(snapBubble(position.value, currentArea, size))
+                                dragging = false
+                            }
+                            BubbleGesture.Hold -> {
+                                val hooks = currentTalk
+                                if (hooks == null) { currentOpen(); return@awaitEachGesture }
+                                if (!hooks.start()) return@awaitEachGesture
+                                haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                                val center = Offset(size / 2f, size / 2f)
+                                while (true) {
+                                    val change = awaitPointerEvent().changes.firstOrNull { it.id == down.id }
+                                    if (change == null) { hooks.cancel(); break }
+                                    if (!change.pressed) { change.consume(); hooks.release(); break }
+                                    change.consume()
+                                    // Dragging well off the bubble arms cancel; coming back disarms it.
+                                    hooks.move((change.position - center).getDistance() > size * 1.25f)
+                                }
+                            }
+                        }
+                    }
                 }
-                .combinedClickable(onClickLabel = "Open $name", onLongClickLabel = "Bubble options",
-                    onClick = onOpen, onLongClick = { menu = true })
                 .semantics {
+                    role = Role.Button
                     contentDescription = bubbleDescription(name, count)
-                    customActions = listOf(
-                        CustomAccessibilityAction("Open $name") { onOpen(); true },
-                        CustomAccessibilityAction("Hide bubble") { onHide(); true },
-                    )
+                    onClick(label = "Open $name") { onOpen(); true }
+                    customActions = buildList {
+                        if (talk != null) add(CustomAccessibilityAction(if (talking) "Stop and send" else "Talk to $name") {
+                            if (talking) talk.release() else talk.start()
+                            true
+                        })
+                        if (talk?.speaking == true) add(CustomAccessibilityAction("Stop speaking") { talk?.stopSpeaking(); true })
+                        add(CustomAccessibilityAction("Hide bubble") { onHide(); true })
+                    }
                 }
                 .testTag(COMPANION_BUBBLE)) {
-                if (running) RunningRing(reduced)
-                Box(Modifier.align(Alignment.Center).size(50.dp).background(VerdeColors.Panel, CircleShape)
-                    .border(1.dp, if (count > 0) VerdeColors.Warning else VerdeColors.Border, CircleShape),
+                if (running || talking) RunningRing(reduced)
+                Box(Modifier.align(Alignment.Center).size(50.dp)
+                    .background(if (talking) VerdeColors.AccentWash else VerdeColors.Panel, CircleShape)
+                    .border(1.dp, if (talking) VerdeColors.Accent else if (count > 0) VerdeColors.Warning else VerdeColors.Border, CircleShape),
                     contentAlignment = Alignment.Center) {
-                    CompanionAvatar(character, pose, size = 42.dp)
+                    CompanionAvatar(character, if (talking) CompanionPose.Working else pose, size = 42.dp)
                 }
                 if (count > 0) Box(Modifier.align(Alignment.TopEnd).defaultMinSize(minWidth = 18.dp, minHeight = 18.dp)
                     .background(VerdeColors.Danger, CircleShape).border(1.5.dp, VerdeColors.Background, CircleShape)
@@ -327,10 +403,18 @@ private fun CompanionBubble(prefs: BubblePrefs, name: String, character: Compani
                     Text(badgeLabel(count), color = VerdeColors.Background, style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, lineHeight = 12.sp))
                 }
             }
-            DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                DropdownMenuItem(text = { Text("Hide bubble") }, onClick = { menu = false; onHide() })
-                DropdownMenuItem(text = { Text("Settings") }, onClick = { menu = false; onSettings() })
-            }
+        }
+    }
+}
+
+/** Microphone level as four small bars. */
+@Composable
+internal fun LevelBars(level: Float, modifier: Modifier = Modifier) {
+    Row(modifier.height(16.dp).semantics { contentDescription = "Microphone level" }, verticalAlignment = Alignment.Bottom,
+        horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+        listOf(.45f, .8f, 1f, .6f).forEach { weight ->
+            val fraction = (.2f + .8f * (level * weight).coerceIn(0f, 1f))
+            Box(Modifier.width(3.dp).fillMaxHeight(fraction).background(VerdeColors.Accent, RoundedCornerShape(1.5.dp)))
         }
     }
 }

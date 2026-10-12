@@ -3,6 +3,7 @@ package dev.verdeai.app
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.TextFieldValue
 import dev.verdeai.core.*
@@ -312,34 +313,59 @@ internal class ComposerModel(
     }
 
     /** Send, steer/queue, `!` shell confirmation or `/command`, depending on the draft and turn. */
-    fun submit() = action {
+    fun submit() = submitDraft(voice = false)
+
+    /**
+     * Sends a finished voice transcript as a spoken turn (`voice = true`, so the agent answers
+     * briefly for read-aloud). [replace] swaps the whole draft (the mic already wrote partials
+     * into it); otherwise the words are appended to any unsent draft.
+     */
+    fun sendSpoken(text: String, replace: Boolean = false) {
+        val words = text.trim()
+        if (words.isEmpty()) return
+        scope.launch {
+            val ready = withTimeoutOrNull(ASK_WAIT_MS) { chat.state.first { it.composer != null && it.thread != null } }
+            val before = if (replace) "" else field.text.trimEnd()
+            val next = if (before.isEmpty()) words else before + "\n\n" + words
+            edit(TextFieldValue(next, TextRange(next.length)))
+            if (ready == null) { notice = "Couldn't reach this chat yet. What you said is in the draft."; return@launch }
+            // A send already on its way: wait for it so these words are not dropped by `busy`.
+            withTimeoutOrNull(ASK_WAIT_MS) { snapshotFlow { busy }.first { !it } }
+            submitDraft(voice = true)
+        }
+    }
+
+    /** Restores the draft text the mic replaced with live partials, after a cancelled recording. */
+    fun restoreDraft(text: String) { if (field.text != text) edit(TextFieldValue(text, TextRange(text.length))) }
+
+    private fun submitDraft(voice: Boolean) = action {
         saveJob?.cancel()
         if (!flush()) return@action
         val composer = chat.latestComposer() ?: return@action
         val text = composer.draft.text
         if (text.isBlank() && composer.draft.attachments.isEmpty()) return@action
         when (val parsed = composerAction(text)) {
-            ComposerAction.Shell -> fail(send(composer.draft.revision))
+            ComposerAction.Shell -> fail(send(composer.draft.revision, voice = false))
             is ComposerAction.Slash -> runSlash(parsed, text)
             is ComposerAction.Literal -> {
                 val op = setDraft(parsed.text, references())
                 if (op?.state == "failed") return@action fail(op)
                 adopt(chat.latestComposer()?.draft)
-                chat.latestComposer()?.let { fail(sendOrFollow(it)) }
+                chat.latestComposer()?.let { fail(sendOrFollow(it, voice)) }
             }
-            ComposerAction.Prompt -> fail(sendOrFollow(composer))
+            ComposerAction.Prompt -> fail(sendOrFollow(composer, voice))
         }
     }
 
-    private suspend fun send(revision: String) =
-        chat.dispatch { id, n, w -> EventSend(now_ms=n, wall_time_ms=w, intent_id=id, workspace_id=workspaceId, thread_id=threadId, draft_revision=revision) }
+    private suspend fun send(revision: String, voice: Boolean) =
+        chat.dispatch { id, n, w -> EventSend(now_ms=n, wall_time_ms=w, intent_id=id, workspace_id=workspaceId, thread_id=threadId, draft_revision=revision, voice=voice) }
 
-    private suspend fun sendOrFollow(composer: ChatComposerView): Operation? {
+    private suspend fun sendOrFollow(composer: ChatComposerView, voice: Boolean): Operation? {
         val state = chat.state.value
-        if (state.turn == null) return send(composer.draft.revision)
+        if (state.turn == null) return send(composer.draft.revision, voice)
         val kind = followupKind(composer.selection.provider ?: state.thread?.thread?.provider, composer.draft.attachments.isNotEmpty())
         return chat.dispatch { id, n, w -> EventFollowupSubmit(now_ms=n, wall_time_ms=w, intent_id=id, workspace_id=workspaceId, thread_id=threadId,
-            draft_revision=composer.draft.revision, kind=kind) }
+            draft_revision=composer.draft.revision, kind=kind, voice=voice) }
     }
 
     private fun fail(op: Operation?) {

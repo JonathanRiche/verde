@@ -2,6 +2,13 @@ package dev.verdeai.app
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
+import androidx.compose.foundation.selection.toggleable
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
@@ -10,13 +17,22 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.semantics.onClick
+import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.selected
@@ -29,6 +45,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import dev.verdeai.core.*
+import kotlin.math.roundToInt
 
 internal const val COMPANION_SHEET = "companion-sheet"
 internal const val COMPANION_SETTINGS = "companion-settings"
@@ -84,6 +101,10 @@ internal fun CompanionSheet(
     onActivity: () -> Unit,
     onCitation: (workspaceId: String, citation: FileCitation) -> Unit,
     settingsRequested: Boolean = false,
+    /** The companion chat's model, shared with the bubble's voice session (null before setup). */
+    transcript: TranscriptModel? = null,
+    voice: CompanionVoice? = null,
+    onHideBubble: () -> Unit = {},
     onDismiss: () -> Unit,
 ) {
     val state by companion.state.collectAsState()
@@ -98,8 +119,6 @@ internal fun CompanionSheet(
     val workspaces = browseState.workspaces?.items.orEmpty()
     val online = browseState.host?.phase == "ready" && browseState.networkAvailable
     val thread = active?.thread_id?.takeIf { it.isNotEmpty() }
-    val transcript: TranscriptModel? = if (active != null && thread != null) viewModel<TranscriptModel>(key = "companion:${browseState.hostId}:${active.home_workspace_id}:$thread",
-        factory = viewModelFactory { initializer { TranscriptModel(hosts, browse.state, active.home_workspace_id, thread) } }) else null
     val transcriptState = transcript?.state?.collectAsState()?.value
     val working = transcriptState?.turn != null || snapshot.pulse.running > 0
     val pose = companionPose(online, snapshot.needKeys.isNotEmpty() || transcriptState?.thread?.approval != null, working)
@@ -112,7 +131,7 @@ internal fun CompanionSheet(
                 return@Column
             }
             CompanionHeader(active, state.roster, pose, companionStatusLine(snapshot.pulse.copy(needsYou = snapshot.needKeys.size)), enabled = state.view?.can_edit == true && !state.saving,
-                onSwitch = companion::switchTo, onSettings = { settings = true }, onActivity = onActivity)
+                onSwitch = companion::switchTo, onSettings = { settings = true }, onActivity = onActivity, onHideBubble = onHideBubble)
             if (snapshot.needs.isNotEmpty()) NeedsYou(snapshot.needs, workspaces, onOpenPane, onActivity)
             if (snapshot.crew.isNotEmpty()) Crew(snapshot.crew, workspaces) { onOpenChat(it.workspace_id, it.local_thread_id) }
             HorizontalDivider(color = VerdeColors.Border)
@@ -121,7 +140,7 @@ internal fun CompanionSheet(
                     transcript != null && transcriptState != null -> {
                         val knownThreads = workspaces.find { it.workspace_id == active.home_workspace_id }?.threads.orEmpty() +
                             workspaces.filter { it.workspace_id != active.home_workspace_id }.flatMap { it.threads }
-                        CompanionConversation(transcript, transcriptState, active, knownThreads,
+                        CompanionConversation(transcript, transcriptState, active, knownThreads, voice,
                             onCitation = { onCitation(active.home_workspace_id, it) },
                             onOpenThread = { onOpenChat(active.home_workspace_id, it) },
                             onReset = { companion.resetConversation(active.id, thread.orEmpty()) })
@@ -137,7 +156,7 @@ internal fun CompanionSheet(
             }
         }
     }
-    if (settings && active != null) CompanionSettingsSheet(companion, manage, browseState) { settings = false }
+    if (settings && active != null) CompanionSettingsSheet(companion, manage, browseState, voice) { settings = false }
 }
 
 @Composable
@@ -160,7 +179,7 @@ private fun CompanionPlaceholder(state: CompanionUiState, hasWorkspace: Boolean)
 
 @Composable
 private fun CompanionHeader(active: CompanionEntry, roster: CompanionRoster?, pose: CompanionPose, status: String, enabled: Boolean,
-    onSwitch: (String) -> Unit, onSettings: () -> Unit, onActivity: () -> Unit) {
+    onSwitch: (String) -> Unit, onSettings: () -> Unit, onActivity: () -> Unit, onHideBubble: () -> Unit) {
     val character = CompanionCharacter.of(active.character)
     Row(Modifier.fillMaxWidth().padding(start = 12.dp, end = 4.dp, bottom = 4.dp),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -175,6 +194,14 @@ private fun CompanionHeader(active: CompanionEntry, roster: CompanionRoster?, po
         }
         TextButton(onClick = onActivity) { Text("All activity") }
         IconButton(onClick = onSettings) { Icon(Icons.Filled.Settings, contentDescription = "Companion settings") }
+        Box {
+            var menu by remember { mutableStateOf(false) }
+            IconButton(onClick = { menu = true }) { Icon(Icons.Filled.MoreVert, contentDescription = "More companion options") }
+            DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                DropdownMenuItem(text = { Text("Hide bubble") }, onClick = { menu = false; onHideBubble() })
+                DropdownMenuItem(text = { Text("Settings") }, onClick = { menu = false; onSettings() })
+            }
+        }
     }
     // Switcher: the other companions, one tap away.
     val others = roster?.companions.orEmpty().filter { it.id != active.id }
@@ -244,7 +271,7 @@ private fun Crew(crew: List<CompanionLink>, workspaces: List<Workspace>, onOpen:
 
 @Composable
 private fun CompanionConversation(model: TranscriptModel, state: TranscriptState, active: CompanionEntry, threads: List<ThreadSummary>,
-    onCitation: (FileCitation) -> Unit, onOpenThread: (String) -> Unit, onReset: () -> Unit) {
+    voice: CompanionVoice?, onCitation: (FileCitation) -> Unit, onOpenThread: (String) -> Unit, onReset: () -> Unit) {
     DisposableEffect(model) {
         model.setVisible(true)
         onDispose { model.setVisible(false) }
@@ -269,9 +296,126 @@ private fun CompanionConversation(model: TranscriptModel, state: TranscriptState
                 }
             }
         }
+        if (voice != null && voice.available) VoiceBar(voice, model, active.name.ifBlank { "your companion" })
         ChatComposer(model, state)
     }
 }
+
+/** Mic for the companion sheet: tap to start and again to send, or hold and release; live words go in the draft. */
+@Composable
+private fun VoiceBar(voice: CompanionVoice, model: TranscriptModel, name: String) {
+    val talk by voice.talk.collectAsState()
+    val level by voice.level.collectAsState()
+    val speaking by voice.speaking.collectAsState()
+    val error by voice.error.collectAsState()
+    val mic = rememberMicPermission()
+    val haptics = LocalHapticFeedback.current
+    val currentTalk by rememberUpdatedState(talk)
+    val listening = talk !is TalkState.Idle
+    Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Box(Modifier.size(48.dp)
+            .background(if (listening) VerdeColors.Accent else VerdeColors.PanelAlt, CircleShape)
+            .pointerInput(model) {
+                awaitEachGesture {
+                    val down = awaitFirstDown()
+                    val wasIdle = currentTalk is TalkState.Idle
+                    if (wasIdle) {
+                        if (!mic.granted()) { mic.request(); waitForUpOrCancellation(); return@awaitEachGesture }
+                        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                        voice.press(model, liveDraft = true)
+                    }
+                    val up = waitForUpOrCancellation()
+                    when {
+                        !wasIdle -> if (up != null) voice.release()
+                        up == null -> voice.cancel()
+                        up.uptimeMillis - down.uptimeMillis >= HOLD_TO_TALK_MS -> voice.release()
+                        // A quick tap keeps listening until the next tap.
+                        else -> Unit
+                    }
+                }
+            }
+            .semantics {
+                role = Role.Button
+                contentDescription = micLabel(talk, name)
+                onClick(label = if (listening) "Stop and send" else "Talk") {
+                    if (listening) voice.release() else if (mic.granted()) voice.press(model, liveDraft = true) else mic.request()
+                    true
+                }
+            }, contentAlignment = Alignment.Center) {
+            Icon(painterResource(R.drawable.ic_mic), contentDescription = null,
+                tint = if (listening) VerdeColors.Background else VerdeColors.Text, modifier = Modifier.size(22.dp))
+        }
+        when {
+            talk is TalkState.Listening -> {
+                LevelBars(level)
+                Text(if ((talk as TalkState.Listening).cancelArmed) "Release to cancel" else "Listening\u2026 tap to send",
+                    Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, color = VerdeColors.Muted)
+                IconButton(onClick = voice::cancel) { Icon(Icons.Filled.Close, contentDescription = "Cancel recording") }
+            }
+            talk is TalkState.Finishing -> Text("Sending\u2026", Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, color = VerdeColors.Muted)
+            speaking -> {
+                Text("Speaking", Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, color = VerdeColors.Accent)
+                TextButton(onClick = voice::stopSpeaking) { Text("Stop") }
+            }
+            error != null -> Text(error.orEmpty(), Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+            else -> Text("Hold or tap to talk", Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, color = VerdeColors.Subtle)
+        }
+    }
+}
+
+/** A press longer than this on the mic is hold-to-talk (release sends); shorter is tap-to-toggle. */
+internal const val HOLD_TO_TALK_MS = 400L
+
+/** Device-local voice settings: when to read replies aloud, speed, voice and recognizer. */
+@Composable
+private fun VoiceSettings(voice: CompanionVoice) {
+    val prefs = voice.prefs
+    val context = LocalContext.current
+    val policy = effectiveReadAloud(prefs.readAloud, talkBackOn(context))
+    VerdeSection("Voice on this phone")
+    Column(Modifier.padding(horizontal = 16.dp).selectableGroup()) {
+        Text("Read replies aloud", style = MaterialTheme.typography.titleSmall)
+        ReadAloud.entries.forEach { option ->
+            Row(Modifier.fillMaxWidth().selectable(selected = policy == option, role = Role.RadioButton) { prefs.chooseReadAloud(option) }
+                .padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                RadioButton(selected = policy == option, onClick = null)
+                Text(option.label, Modifier.padding(start = 12.dp))
+            }
+        }
+    }
+    Column(Modifier.padding(horizontal = 16.dp)) {
+        Text("Speaking rate: ${"%.1f".format(prefs.rate)}\u00d7", style = MaterialTheme.typography.titleSmall)
+        Slider(value = prefs.rate, onValueChange = { prefs.chooseRate((it * 10).roundToInt() / 10f) },
+            valueRange = VoicePrefs.MIN_RATE..VoicePrefs.MAX_RATE, modifier = Modifier.semantics { contentDescription = "Speaking rate" })
+    }
+    // Text-to-speech starts asynchronously; poll briefly for its voice list.
+    val voices by produceState(emptyList<android.speech.tts.Voice>(), voice) {
+        repeat(6) {
+            value = voice.voices()
+            if (value.isNotEmpty()) return@produceState
+            kotlinx.coroutines.delay(500)
+        }
+    }
+    if (voices.isNotEmpty()) {
+        val choices = listOf(ChatChoice("", "System default")) + voices.map { ChatChoice(it.name, voiceLabel(it.name, it.locale)) }
+        Picker("Voice", choices.find { it.id == prefs.voiceName.orEmpty() }?.label ?: "System default", choices, enabled = true) {
+            prefs.chooseVoice(it.ifEmpty { null })
+        }
+    }
+    Row(Modifier.fillMaxWidth().toggleable(prefs.preferOnDevice, role = Role.Switch) { prefs.choosePreferOnDevice(it) }
+        .padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f).padding(end = 16.dp)) {
+            Text("Prefer on-device recognition", style = MaterialTheme.typography.bodyLarge)
+            Text("Keep speech on this phone when it supports your language.", style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        Switch(checked = prefs.preferOnDevice, onCheckedChange = null)
+    }
+}
+
+/** "English (United States) · en-us-x-sfg-local" style label for a TTS voice. */
+internal fun voiceLabel(name: String, locale: java.util.Locale): String = "${locale.displayName} \u00b7 $name"
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -292,7 +436,7 @@ private fun Suggestions(name: String, onPick: (String) -> Unit) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-internal fun CompanionSettingsSheet(companion: CompanionModel, manage: ManageModel, browse: BrowseState, onDismiss: () -> Unit) {
+internal fun CompanionSettingsSheet(companion: CompanionModel, manage: ManageModel, browse: BrowseState, voice: CompanionVoice? = null, onDismiss: () -> Unit) {
     val state by companion.state.collectAsState()
     val roster = state.roster ?: return
     val active = activeCompanion(roster) ?: return
@@ -318,6 +462,10 @@ internal fun CompanionSettingsSheet(companion: CompanionModel, manage: ManageMod
             }
             if (adding) AddCompanion(companion, state, roster) { adding = false }
             else key(active.id) { EditCompanion(companion, manage, state, browse, roster, active, onRemove = { confirmRemove = true }, onDone = onDismiss) }
+            if (voice != null) {
+                HorizontalDivider(Modifier.padding(vertical = 8.dp), color = VerdeColors.Border)
+                VoiceSettings(voice)
+            }
         }
     }
     if (confirmRemove) AlertDialog(onDismissRequest = { confirmRemove = false },

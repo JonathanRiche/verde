@@ -187,6 +187,16 @@ internal class TranscriptModel(
         visible.value = shown
     }
 
+    /**
+     * Takes the core's focus back after another surface borrowed it while this screen stayed
+     * visible (the companion's voice session focuses its own chat to follow the spoken reply).
+     */
+    fun refocusIfVisible() {
+        val host = core ?: return
+        if (!visible.value || FocusClaim.owner === this) return
+        scope.launch { sendFocus(host) }
+    }
+
     /** Explicit user retry: re-focus reloads the newest page and restarts the live tail. */
     fun retry() {
         val host = core ?: return
