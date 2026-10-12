@@ -1225,6 +1225,37 @@ data class EventFileOpen(
 ) : Event()
 
 @Serializable
+@SerialName("companion_refresh")
+data class EventCompanionRefresh(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+) : Event()
+
+@Serializable
+@SerialName("companion_save")
+data class EventCompanionSave(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `roster`: CompanionRoster,
+    val `expected_revision`: String,
+) : Event()
+
+@Serializable
+@SerialName("companion_crew_refresh")
+data class EventCompanionCrewRefresh(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `workspace_id`: String,
+    val `thread_id`: String,
+) : Event()
+
+@Serializable
 @SerialName("push_received")
 data class EventPushReceived(
     val `api_version`: Long = 1,
@@ -2283,5 +2314,69 @@ data class ExplorerFileQuery(
     val `api_version`: Long,
     val `revision`: String,
     val `data`: ExplorerFileView?,
+    val `error`: LocalError?,
+)
+
+@Serializable
+data class CompanionEntry(
+    val `id`: String,
+    val `name`: String,
+    val `character`: String = "sprout",
+    val `home_workspace_id`: String = "",
+    val `thread_id`: String = "",
+    val `provider`: String = "",
+    val `model`: String = "",
+    val `orders`: String = "",
+)
+
+@Serializable
+data class CompanionRoster(
+    val `version`: Long = 1,
+    val `active_id`: String = "",
+    val `companions`: List<CompanionEntry> = emptyList(),
+)
+
+@Serializable
+data class CompanionLink(
+    val `link_id`: String = "",
+    val `workspace_id`: String = "",
+    val `parent_workspace_id`: String = "",
+    val `local_thread_id`: String = "",
+    val `title`: String = "",
+    val `provider`: String = "",
+    val `status`: String = "idle",
+    val `summary`: String = "",
+    val `updated_at_ms`: Long = 0,
+    val `hidden`: Boolean = false,
+)
+
+@Serializable
+data class CompanionCrew(
+    val `workspace_id`: String = "",
+    val `thread_id`: String = "",
+    val `links`: List<CompanionLink> = emptyList(),
+    val `loaded`: Boolean = false,
+    val `loading`: Boolean = false,
+    val `error`: LocalError? = null,
+)
+
+@Serializable
+data class CompanionView(
+    val `loaded`: Boolean = false,
+    val `loading`: Boolean = false,
+    val `saving`: Boolean = false,
+    val `supported`: Boolean = true,
+    val `can_edit`: Boolean = false,
+    val `revision`: String = "0",
+    val `roster`: CompanionRoster,
+    val `crew`: CompanionCrew,
+    val `error`: LocalError? = null,
+)
+
+@Serializable
+data class CompanionQuery(
+    val `api_version`: Long,
+    val `revision`: String,
+    val `data`: CompanionView?,
     val `error`: LocalError?,
 )

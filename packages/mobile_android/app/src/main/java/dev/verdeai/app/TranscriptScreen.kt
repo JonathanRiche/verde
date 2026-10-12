@@ -264,7 +264,7 @@ private fun Placeholder(kind: TranscriptPlaceholder, model: TranscriptModel) {
 private const val PREFETCH_ITEMS = 5
 
 @Composable
-private fun TranscriptList(items: List<TranscriptItem>, state: TranscriptState, ctx: TranscriptContext, renderers: TranscriptRenderers) {
+internal fun TranscriptList(items: List<TranscriptItem>, state: TranscriptState, ctx: TranscriptContext, renderers: TranscriptRenderers) {
     // Newest first + reverseLayout: index 0 sits at the bottom, so growth of the streaming row
     // and older pages prepended at the top both leave the reading position alone.
     val reversed = remember(items) { items.asReversed() }

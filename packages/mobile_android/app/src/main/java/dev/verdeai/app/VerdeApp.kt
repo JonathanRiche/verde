@@ -27,6 +27,8 @@ import dev.verdeai.core.ThreadSummary
 
 internal object Routes {
     const val HOME = "home"
+    /** The classic Home dashboard; the companion replaces it as Home once a roster loads. */
+    const val ACTIVITY = "activity"
     const val WORKSPACES = "workspaces"
     const val HOSTS = "hosts"
     const val WORKSPACE = "workspace/{ws}"
@@ -55,7 +57,7 @@ internal object Routes {
         "file/${Uri.encode(ws)}/${citation.line ?: 0UL}/${citation.end_line ?: 0UL}/${Uri.encode(citation.path)}"
 }
 
-private val TABS = listOf(Routes.HOME, Routes.WORKSPACES, Routes.HOSTS)
+private val TABS = listOf(Routes.HOME, Routes.ACTIVITY, Routes.WORKSPACES, Routes.HOSTS)
 
 /** App shell: workspace drawer over one NavHost. Every browse screen reads only the selected host's core. */
 @Composable
@@ -90,6 +92,7 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
     val browseState by browse.state.collectAsState()
     val manage: ManageModel = viewModel(key = "manage", factory = viewModelFactory { initializer { ManageModel(hosts, browse.state) } })
     val manageState by manage.state.collectAsState()
+    val companion: CompanionModel = viewModel(key = "companion", factory = viewModelFactory { initializer { CompanionModel(hosts, browse.state) } })
     var threadAction by remember { mutableStateOf<Pair<ThreadSummary, String>?>(null) }
     fun open(route: String, tab: Boolean = false) {
         if (tab) nav.tab(route) else nav.navigate(route) { launchSingleTop = true }
@@ -164,7 +167,7 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
         ) { padding ->
             Box(Modifier.padding(padding).consumeWindowInsets(padding)) {
                 CompositionLocalProvider(LocalWorkspaceMenu provides { scope.launch { drawer.open() }; Unit }) {
-                    Graph(nav, start, hosts, browse, manage) { thread, action -> threadAction = thread to action }
+                    Graph(nav, start, hosts, browse, manage, companion) { thread, action -> threadAction = thread to action }
                 }
             }
         }
@@ -180,7 +183,7 @@ private fun NavHostController.tab(route: String) = navigate(route) {
 
 @Composable
 private fun Graph(nav: NavHostController, start: String, hosts: HostsModel, browse: BrowseModel, manage: ManageModel,
-    onThreadAction: (ThreadSummary, String) -> Unit) {
+    companion: CompanionModel, onThreadAction: (ThreadSummary, String) -> Unit) {
     val openPane: (Pane) -> Unit = { pane ->
         val thread = pane.thread_id
         val terminal = pane.terminal_id
@@ -197,10 +200,21 @@ private fun Graph(nav: NavHostController, start: String, hosts: HostsModel, brow
         nav.tab(Routes.HOSTS)
     }
     NavHost(nav, startDestination = start) {
-        composable(Routes.HOME) {
+        val dashboard = @Composable {
             HomeScreen(browse, openPane, openThread, openWorkspace, showHosts, pair,
                 onNewChat = { nav.navigate(ManageRoutes.newChat(null)) }, onHistory = { nav.navigate(ManageRoutes.HISTORY) })
         }
+        composable(Routes.HOME) {
+            // Polls the roster while Home is on screen; older hosts keep the classic dashboard.
+            CompanionVisibility(companion)
+            val companionState by companion.state.collectAsState()
+            if (companionState.available) CompanionHome(hosts, browse, manage, companion, openPane,
+                onOpenChat = { ws, thread -> nav.navigate(Routes.thread(ws, thread)) },
+                onActivity = { nav.navigate(Routes.ACTIVITY) { launchSingleTop = true } },
+                onCitation = openFile)
+            else dashboard()
+        }
+        composable(Routes.ACTIVITY) { dashboard() }
         composable(Routes.WORKSPACES) { WorkspacesScreen(browse, openWorkspace, showHosts, pair) { nav.navigate(ManageRoutes.ADD_WORKSPACE) } }
         composable(Routes.HOSTS) {
             val security = LocalAppLockControls.current?.let { { nav.navigate(Routes.SECURITY) } }

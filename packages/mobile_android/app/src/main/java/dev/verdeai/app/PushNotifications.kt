@@ -156,7 +156,9 @@ internal class PushNotifier(private val context: Context) {
     fun build(model: PushNotification, hideContent: Boolean): Notification {
         val tag = NotificationTags.of(model)
         val id = NotificationTags.PUSH_ID
-        val title = if (hideContent || !model.opened) "Verde" else model.title
+        // A companion's chat is titled with its name ("Juniper: …") when this process knows the roster.
+        val title = if (hideContent || !model.opened) "Verde"
+            else companionNotificationTitle(CompanionThreads.name(model.host_id, model.workspace_id, model.thread_id), model.title)
         val body = when {
             model.update_required -> "Update Verde to read this notification."
             hideContent && model.opened -> pushLabel(model.kind)
@@ -212,7 +214,7 @@ internal class PushNotifier(private val context: Context) {
             null, tag, NotificationTags.RUNNING_ID)
         val builder = NotificationCompat.Builder(context, PushChannels.RUNNING)
             .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle(if (hideContent) "Verde" else pane.title.ifBlank { "Chat" })
+            .setContentTitle(if (hideContent) "Verde" else companionNotificationTitle(CompanionThreads.name(hostId, pane.workspace_id, thread), pane.title.ifBlank { "Chat" }))
             .setContentText("Agent is working")
             .setCategory(NotificationCompat.CATEGORY_PROGRESS)
             .setPriority(NotificationCompat.PRIORITY_LOW)

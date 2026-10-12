@@ -1,0 +1,383 @@
+package dev.verdeai.app
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.lifecycle.viewmodel.initializer
+import androidx.lifecycle.viewmodel.viewModelFactory
+import dev.verdeai.core.*
+
+internal const val COMPANION_HOME = "companion-home"
+internal const val COMPANION_SETTINGS = "companion-settings"
+
+/** Tells [companion] whether its home is resumed on screen (polling and first-run setup). */
+@Composable
+internal fun CompanionVisibility(companion: CompanionModel) {
+    val lifecycle by LocalLifecycleOwner.current.lifecycle.currentStateFlow.collectAsState()
+    val resumed = lifecycle.isAtLeast(Lifecycle.State.RESUMED)
+    DisposableEffect(companion, resumed) {
+        companion.setVisible(resumed)
+        onDispose { companion.setVisible(false) }
+    }
+}
+
+/**
+ * The phone's home: the active companion, what needs the user across every workspace, its crew of
+ * delegated chats, and its conversation with the shared transcript and composer.
+ */
+@Composable
+internal fun CompanionHome(
+    hosts: HostsModel,
+    browse: BrowseModel,
+    manage: ManageModel,
+    companion: CompanionModel,
+    onOpenPane: (Pane) -> Unit,
+    onOpenChat: (workspaceId: String, threadId: String) -> Unit,
+    onActivity: () -> Unit,
+    onCitation: (workspaceId: String, citation: FileCitation) -> Unit,
+) {
+    val state by companion.state.collectAsState()
+    val browseState by browse.state.collectAsState()
+    var settings by rememberSaveable { mutableStateOf(false) }
+    val active = state.active
+    val workspaces = browseState.workspaces?.items.orEmpty()
+    val panes = browseState.home?.items.orEmpty()
+    val needs = panes.filter { it.attention || it.status == "waiting_approval" }
+    val crew = visibleCrew(state.view?.crew?.takeIf { active != null && it.workspace_id == active.home_workspace_id && it.thread_id == active.thread_id })
+    val pulse = companionPulse(panes, crew)
+    val online = browseState.host?.phase == "ready" && browseState.networkAvailable
+    val thread = active?.thread_id?.takeIf { it.isNotEmpty() }
+    val transcript: TranscriptModel? = if (active != null && thread != null) viewModel<TranscriptModel>(key = "companion:${browseState.hostId}:${active.home_workspace_id}:$thread",
+        factory = viewModelFactory { initializer { TranscriptModel(hosts, browse.state, active.home_workspace_id, thread) } }) else null
+    val transcriptState = transcript?.state?.collectAsState()?.value
+    val working = transcriptState?.turn != null || pulse.running > 0
+    val pose = companionPose(online, pulse.needsYou > 0 || transcriptState?.thread?.approval != null, working)
+
+    Column(Modifier.fillMaxSize().testTag(COMPANION_HOME)) {
+        if (active == null) {
+            CompanionPlaceholder(state, workspaces.any { it.open })
+            return@Column
+        }
+        CompanionHeader(active, pose, companionStatusLine(pulse), onSettings = { settings = true }, onActivity = onActivity)
+        if (needs.isNotEmpty()) NeedsYou(needs, workspaces, onOpenPane, onActivity)
+        if (crew.isNotEmpty()) Crew(crew, workspaces) { onOpenChat(it.workspace_id, it.local_thread_id) }
+        HorizontalDivider(color = VerdeColors.Border)
+        Box(Modifier.weight(1f).fillMaxWidth()) {
+            when {
+                transcript != null && transcriptState != null -> {
+                    val knownThreads = workspaces.find { it.workspace_id == active.home_workspace_id }?.threads.orEmpty() +
+                        workspaces.filter { it.workspace_id != active.home_workspace_id }.flatMap { it.threads }
+                    CompanionConversation(transcript, transcriptState, active, knownThreads,
+                        onCitation = { onCitation(active.home_workspace_id, it) },
+                        onOpenThread = { onOpenChat(active.home_workspace_id, it) },
+                        onReset = { companion.resetConversation(active.id, thread.orEmpty()) })
+                }
+                state.settingUp -> Centered { CircularProgressIndicator(); Text("Setting up ${active.name}'s conversation…") }
+                state.setupError != null -> Centered {
+                    Text(state.setupError.orEmpty(), color = MaterialTheme.colorScheme.error)
+                    Button(onClick = companion::retrySetup, shape = MaterialTheme.shapes.small) { Text("Try again") }
+                }
+                state.view?.can_edit != true -> Centered { Text("${active.name} will be ready when the host is reachable.") }
+                else -> Centered { CircularProgressIndicator(); Text("Waking ${active.name}…") }
+            }
+        }
+    }
+    if (settings && active != null) CompanionSettingsSheet(companion, manage, browseState) { settings = false }
+}
+
+@Composable
+private fun Centered(content: @Composable ColumnScope.() -> Unit) {
+    Column(Modifier.fillMaxSize().padding(32.dp), horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(12.dp, Alignment.CenterVertically), content = content)
+}
+
+@Composable
+private fun CompanionPlaceholder(state: CompanionUiState, hasWorkspace: Boolean) {
+    Centered {
+        CompanionAvatar(CompanionCharacter.Sprout, CompanionPose.Idle, size = 96.dp)
+        when {
+            !hasWorkspace -> Text("Add a workspace to meet your companion.")
+            state.view?.can_edit != true -> Text("Your companion will appear when the host is reachable.")
+            else -> { CircularProgressIndicator(); Text("Meeting your companion…") }
+        }
+    }
+}
+
+@Composable
+private fun CompanionHeader(active: CompanionEntry, pose: CompanionPose, status: String, onSettings: () -> Unit, onActivity: () -> Unit) {
+    val character = CompanionCharacter.of(active.character)
+    Row(Modifier.fillMaxWidth().padding(start = 12.dp, end = 4.dp, top = 8.dp, bottom = 4.dp),
+        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        CompanionAvatar(character, pose, size = 72.dp, description = "${active.name}, ${character.label}")
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text(active.name.ifBlank { character.label }, style = MaterialTheme.typography.headlineSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(status, style = MaterialTheme.typography.bodyMedium, color = when (pose) {
+                CompanionPose.Approval -> VerdeColors.Warning
+                CompanionPose.Working -> VerdeColors.Accent
+                else -> VerdeColors.Muted
+            })
+            TextButton(onClick = onActivity, contentPadding = PaddingValues(0.dp)) { Text("All activity") }
+        }
+        IconButton(onClick = onSettings) { Icon(Icons.Filled.Settings, contentDescription = "Companion settings") }
+    }
+}
+
+private const val NEEDS_YOU_ROWS = 3
+
+@Composable
+private fun NeedsYou(needs: List<Pane>, workspaces: List<Workspace>, onOpen: (Pane) -> Unit, onMore: () -> Unit) {
+    VerdeSection("Needs you")
+    needs.take(NEEDS_YOU_ROWS).forEach { pane ->
+        val where = workspaces.find { it.workspace_id == pane.workspace_id }?.label
+        VerdeListRow(
+            headlineContent = { Text(pane.title.ifBlank { "Chat" }, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+            supportingContent = { Text(listOfNotNull(where, attentionLabel(pane.attention_kind) ?: statusLabel(pane.status)).joinToString(" · "), maxLines = 1) },
+            leadingContent = { StatusPip(statusColor(pane.status, true), statusLabel(pane.status), size = 8.dp) },
+            modifier = Modifier.fillMaxWidth().clickable(enabled = openable(pane), onClickLabel = "Open") { onOpen(pane) },
+        )
+    }
+    if (needs.size > NEEDS_YOU_ROWS) TextButton(onClick = onMore, modifier = Modifier.padding(horizontal = 8.dp)) {
+        Text("${needs.size - NEEDS_YOU_ROWS} more")
+    }
+}
+
+@Composable
+private fun Crew(crew: List<CompanionLink>, workspaces: List<Workspace>, onOpen: (CompanionLink) -> Unit) {
+    VerdeSection("Crew")
+    Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 4.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        crew.forEach { link ->
+            val status = crewStatus(link)
+            val title = childTitle(link.local_thread_id, link.title)
+            val where = workspaces.find { it.workspace_id == link.workspace_id }?.label
+            val color = when {
+                status == ChildStatus.Failed -> MaterialTheme.colorScheme.error
+                status.needsYou -> VerdeColors.Warning
+                status.running -> VerdeColors.Accent
+                else -> VerdeColors.Subtle
+            }
+            Row(Modifier.widthIn(max = 240.dp).background(VerdeColors.Panel, RoundedCornerShape(16.dp))
+                .border(1.dp, if (status.needsYou) VerdeColors.Warning else VerdeColors.Border, RoundedCornerShape(16.dp))
+                .clickable(onClickLabel = "Open chat", role = Role.Button) { onOpen(link) }
+                .padding(horizontal = 10.dp, vertical = 6.dp)
+                .semantics { contentDescription = "$title, ${status.label}" },
+                verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                ProviderGlyph(link.provider.ifEmpty { null }, Modifier.size(14.dp))
+                StatusPip(color, null, active = status.running, size = 8.dp)
+                Column {
+                    Text(title, style = MaterialTheme.typography.labelLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text(listOfNotNull(status.label, where).joinToString(" · "), style = MaterialTheme.typography.labelSmall,
+                        color = VerdeColors.Muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CompanionConversation(model: TranscriptModel, state: TranscriptState, active: CompanionEntry, threads: List<ThreadSummary>,
+    onCitation: (FileCitation) -> Unit, onOpenThread: (String) -> Unit, onReset: () -> Unit) {
+    DisposableEffect(model) {
+        model.setVisible(true)
+        onDispose { model.setVisible(false) }
+    }
+    val items = remember(state.thread) { state.thread?.let(::transcriptItems).orEmpty() }
+    val now = rememberNow(state.turn?.started_at_ms != null)
+    val context = TranscriptContext(model, now, onCitation, state.turn?.started_at_ms, threads, onOpenThread)
+    Column(Modifier.fillMaxSize()) {
+        Box(Modifier.weight(1f).fillMaxWidth()) {
+            when (transcriptPlaceholder(state)) {
+                null -> TranscriptList(items, state, context, TranscriptRenderers.Default)
+                TranscriptPlaceholder.Empty -> Suggestions(active.name) { model.composer.ask(it) }
+                TranscriptPlaceholder.Loading -> Centered { CircularProgressIndicator() }
+                TranscriptPlaceholder.Missing -> Centered {
+                    Text("${active.name}'s conversation is no longer on the host.")
+                    Button(onClick = onReset, shape = MaterialTheme.shapes.small) { Text("Start a new conversation") }
+                }
+                TranscriptPlaceholder.Offline -> Centered { Text("This conversation will load when the host is reachable.") }
+                TranscriptPlaceholder.Error -> Centered {
+                    Text("Couldn't load this conversation.")
+                    Button(onClick = model::retry, shape = MaterialTheme.shapes.small) { Text("Retry loading") }
+                }
+            }
+        }
+        ChatComposer(model, state)
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun Suggestions(name: String, onPick: (String) -> Unit) {
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp, Alignment.Bottom)) {
+        Text("Ask ${name.ifBlank { "your companion" }} to dispatch and watch work across every workspace.",
+            style = MaterialTheme.typography.bodyMedium, color = VerdeColors.Muted)
+        COMPANION_SUGGESTIONS.forEach { text ->
+            OutlinedCard(onClick = { onPick(text) }, modifier = Modifier.fillMaxWidth()) {
+                Text(text, Modifier.padding(12.dp), style = MaterialTheme.typography.bodyMedium)
+            }
+        }
+    }
+}
+
+// ---- Settings ----
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+internal fun CompanionSettingsSheet(companion: CompanionModel, manage: ManageModel, browse: BrowseState, onDismiss: () -> Unit) {
+    val state by companion.state.collectAsState()
+    val roster = state.roster ?: return
+    val active = activeCompanion(roster) ?: return
+    var adding by rememberSaveable { mutableStateOf(false) }
+    var confirmRemove by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) { companion.clearSaveError() }
+    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = VerdeColors.Panel,
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), modifier = Modifier.testTag(COMPANION_SETTINGS)) {
+        Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(bottom = 24.dp)) {
+            VerdeSection("Companions")
+            Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                roster.companions.forEach { entry ->
+                    val selected = entry.id == active.id && !adding
+                    FilterChip(selected = selected, onClick = { adding = false; if (entry.id != active.id) companion.switchTo(entry.id) },
+                        enabled = !state.saving && state.view?.can_edit == true,
+                        label = { Text(entry.name.ifBlank { CompanionCharacter.of(entry.character).label }, maxLines = 1) },
+                        leadingIcon = { CompanionAvatar(CompanionCharacter.of(entry.character), CompanionPose.Idle, size = 24.dp) })
+                }
+                if (roster.companions.size < MAX_COMPANIONS) FilterChip(selected = adding, onClick = { adding = true },
+                    enabled = !state.saving && state.view?.can_edit == true, label = { Text("Add") },
+                    leadingIcon = { Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(18.dp)) })
+            }
+            if (adding) AddCompanion(companion, state, roster) { adding = false }
+            else key(active.id) { EditCompanion(companion, manage, state, browse, roster, active, onRemove = { confirmRemove = true }, onDone = onDismiss) }
+        }
+    }
+    if (confirmRemove) AlertDialog(onDismissRequest = { confirmRemove = false },
+        title = { Text("Remove ${active.name}?") },
+        text = { Text("${active.name}'s conversation stays on the host. You can't undo this here.") },
+        confirmButton = { TextButton(onClick = { confirmRemove = false; companion.remove(active.id) }) { Text("Remove", color = MaterialTheme.colorScheme.error) } },
+        dismissButton = { TextButton(onClick = { confirmRemove = false }) { Text("Cancel") } })
+}
+
+@Composable
+private fun CharacterPicker(selected: CompanionCharacter, enabled: Boolean, onPick: (CompanionCharacter) -> Unit) {
+    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        CompanionCharacter.entries.forEach { character ->
+            val on = character == selected
+            Column(Modifier.weight(1f).background(if (on) VerdeColors.AccentWash else VerdeColors.PanelAlt, RoundedCornerShape(10.dp))
+                .border(1.dp, if (on) VerdeColors.Accent else VerdeColors.Border, RoundedCornerShape(10.dp))
+                .clickable(enabled = enabled, role = Role.RadioButton) { onPick(character) }
+                .semantics { this.selected = on }
+                .padding(8.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                CompanionAvatar(character, CompanionPose.Idle, size = 56.dp)
+                Text(character.label, style = MaterialTheme.typography.labelLarge)
+            }
+        }
+    }
+}
+
+@Composable
+private fun AddCompanion(companion: CompanionModel, state: CompanionUiState, roster: CompanionRoster, onDone: () -> Unit) {
+    var character by rememberSaveable { mutableStateOf(CompanionCharacter.Moss) }
+    var name by rememberSaveable { mutableStateOf(suggestedName(roster, CompanionCharacter.Moss)) }
+    var edited by rememberSaveable { mutableStateOf(false) }
+    val enabled = !state.saving && state.view?.can_edit == true
+    VerdeSection("New companion")
+    CharacterPicker(character, enabled) {
+        character = it
+        if (!edited) name = suggestedName(roster, it)
+    }
+    OutlinedTextField(name, onValueChange = { name = clipUtf8(it.replace('\n', ' '), MAX_COMPANION_NAME_BYTES); edited = true },
+        label = { Text("Name") }, singleLine = true, enabled = enabled,
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp))
+    state.saveError?.let { Text(it, Modifier.padding(horizontal = 16.dp), color = MaterialTheme.colorScheme.error) }
+    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp), horizontalArrangement = Arrangement.End) {
+        TextButton(onClick = onDone) { Text("Cancel") }
+        Button(onClick = { companion.add(character, name, onSaved = onDone) }, enabled = enabled && cleanCompanionName(name).isNotEmpty(),
+            shape = MaterialTheme.shapes.small) { Text(if (state.saving) "Adding…" else "Add companion") }
+    }
+}
+
+@Composable
+private fun EditCompanion(companion: CompanionModel, manage: ManageModel, state: CompanionUiState, browse: BrowseState,
+    roster: CompanionRoster, active: CompanionEntry, onRemove: () -> Unit, onDone: () -> Unit) {
+    var name by rememberSaveable { mutableStateOf(active.name) }
+    var character by rememberSaveable { mutableStateOf(CompanionCharacter.of(active.character)) }
+    var orders by rememberSaveable { mutableStateOf(active.orders) }
+    var provider by rememberSaveable { mutableStateOf(active.provider) }
+    var model by rememberSaveable { mutableStateOf(active.model) }
+    val enabled = !state.saving && state.view?.can_edit == true
+    val workspace = browse.workspaces?.items?.find { it.workspace_id == active.home_workspace_id }
+
+    VerdeSection("Name")
+    OutlinedTextField(name, onValueChange = { name = clipUtf8(it.replace('\n', ' '), MAX_COMPANION_NAME_BYTES) },
+        singleLine = true, enabled = enabled, modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp).testTag("companion-name"))
+    VerdeSection("Character")
+    CharacterPicker(character, enabled) { character = it }
+    VerdeSection("Standing orders")
+    OutlinedTextField(orders, onValueChange = { orders = clipUtf8(it, MAX_COMPANION_ORDERS_BYTES) }, enabled = enabled,
+        minLines = 3, maxLines = 8, placeholder = { Text("Always run the tests before calling work done.") },
+        supportingText = { Text("Sent with every message to ${cleanCompanionName(name).ifEmpty { "your companion" }}.") },
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp))
+    VerdeSection("Brain")
+    Brain(manage, active.home_workspace_id, provider, model, enabled,
+        onProvider = { provider = it; model = "" }, onModel = { model = it })
+    Text("Used when ${cleanCompanionName(name).ifEmpty { "your companion" }} starts a conversation. Change the current one from its composer.",
+        Modifier.padding(horizontal = 16.dp, vertical = 4.dp), style = MaterialTheme.typography.bodySmall, color = VerdeColors.Muted)
+    workspace?.let {
+        Text("Lives in ${it.label}", Modifier.padding(horizontal = 16.dp, vertical = 8.dp), style = MaterialTheme.typography.bodySmall, color = VerdeColors.Subtle)
+    }
+    state.saveError?.let { Text(it, Modifier.padding(horizontal = 16.dp), color = MaterialTheme.colorScheme.error) }
+    if (state.view?.can_edit != true) Text("Connect to the host to change companions.", Modifier.padding(horizontal = 16.dp), color = VerdeColors.Muted)
+    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+        if (roster.companions.size > 1) TextButton(onClick = onRemove, enabled = enabled) {
+            Text("Remove", color = MaterialTheme.colorScheme.error)
+        }
+        Spacer(Modifier.weight(1f))
+        Button(onClick = {
+            companion.update(active.copy(name = cleanCompanionName(name), character = character.id, orders = cleanOrders(orders),
+                provider = provider, model = model), onSaved = onDone)
+        }, enabled = enabled && cleanCompanionName(name).isNotEmpty(), shape = MaterialTheme.shapes.small) {
+            Text(if (state.saving) "Saving…" else "Save")
+        }
+    }
+}
+
+/** Provider and model from the same catalog as New chat (the core's `manage` new-chat view). */
+@Composable
+private fun Brain(manage: ManageModel, workspaceId: String, provider: String, model: String, enabled: Boolean,
+    onProvider: (String) -> Unit, onModel: (String) -> Unit) {
+    val manageState by manage.state.collectAsState()
+    LaunchedEffect(workspaceId, provider, manageState.hostId, manageState.view != null) {
+        if (workspaceId.isNotEmpty() && manageState.view != null) manage.select(workspaceId, ChatSelection(provider = provider.ifEmpty { null }))
+    }
+    val chat = manageState.view?.new_chat?.takeIf { it.workspace_id == workspaceId }
+    val providers = listOf(ChatChoice("", "Workspace default")) + chat?.providers.orEmpty()
+    val models = if (provider.isNotEmpty() && chat?.selection?.provider == provider) listOf(ChatChoice("", "Default")) + chat?.catalogs?.models.orEmpty() else emptyList()
+    Picker("Provider", providers.find { it.id == provider }?.label ?: provider.ifEmpty { "Workspace default" }, providers, enabled && chat != null, providerIcons = true, onPick = onProvider)
+    if (provider.isNotEmpty()) Picker("Model", models.find { it.id == model }?.label ?: model.ifEmpty { "Default" }, models,
+        enabled && chat?.loading == false, onPick = onModel)
+}

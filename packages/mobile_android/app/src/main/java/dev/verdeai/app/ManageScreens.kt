@@ -177,7 +177,7 @@ internal fun HistoryScreen(browse: BrowseModel, manage: ManageModel, onOpenThrea
 // ---- New chat ----
 
 @Composable
-private fun Picker(label: String, value: String, choices: List<ChatChoice>, enabled: Boolean, providerIcons: Boolean = false, onPick: (String) -> Unit) {
+internal fun Picker(label: String, value: String, choices: List<ChatChoice>, enabled: Boolean, providerIcons: Boolean = false, onPick: (String) -> Unit) {
     var open by remember { mutableStateOf(false) }
     Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)) {
         Text(label, style = MaterialTheme.typography.labelMedium)
