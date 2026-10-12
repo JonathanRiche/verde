@@ -1511,6 +1511,9 @@ enum Event: Codable {
     case `workspace_changes_close`(EventWorkspaceChangesClose)
     case `workspace_file_patch`(EventWorkspaceFilePatch)
     case `file_open`(EventFileOpen)
+    case `companion_refresh`(EventCompanionRefresh)
+    case `companion_save`(EventCompanionSave)
+    case `companion_crew_refresh`(EventCompanionCrewRefresh)
     case `push_received`(EventPushReceived)
     case `terminal_input`(EventTerminalInput)
     init(from decoder: Decoder) throws {
@@ -1589,6 +1592,9 @@ enum Event: Codable {
         case "workspace_changes_close": self = .`workspace_changes_close`(try EventWorkspaceChangesClose(from: decoder))
         case "workspace_file_patch": self = .`workspace_file_patch`(try EventWorkspaceFilePatch(from: decoder))
         case "file_open": self = .`file_open`(try EventFileOpen(from: decoder))
+        case "companion_refresh": self = .`companion_refresh`(try EventCompanionRefresh(from: decoder))
+        case "companion_save": self = .`companion_save`(try EventCompanionSave(from: decoder))
+        case "companion_crew_refresh": self = .`companion_crew_refresh`(try EventCompanionCrewRefresh(from: decoder))
         case "push_received": self = .`push_received`(try EventPushReceived(from: decoder))
         case "terminal_input": self = .`terminal_input`(try EventTerminalInput(from: decoder))
         default: throw DecodingError.dataCorruptedError(forKey: .type, in: c, debugDescription: "Unknown model tag")
@@ -1668,6 +1674,9 @@ enum Event: Codable {
         case .`workspace_changes_close`(let value): try value.encode(to: encoder)
         case .`workspace_file_patch`(let value): try value.encode(to: encoder)
         case .`file_open`(let value): try value.encode(to: encoder)
+        case .`companion_refresh`(let value): try value.encode(to: encoder)
+        case .`companion_save`(let value): try value.encode(to: encoder)
+        case .`companion_crew_refresh`(let value): try value.encode(to: encoder)
         case .`push_received`(let value): try value.encode(to: encoder)
         case .`terminal_input`(let value): try value.encode(to: encoder)
         }
@@ -4877,6 +4886,124 @@ extension EventFileOpen {
         try c.encode(self.`max_bytes`, forKey: .`max_bytes`)
         var tag = encoder.container(keyedBy: ModelDiscriminator.self)
         try tag.encode("file_open", forKey: .type)
+    }
+}
+
+struct EventCompanionRefresh: Codable {
+    var `api_version`: UInt32 = 1
+    var `now_ms`: Int64
+    var `wall_time_ms`: Int64
+    var `intent_id`: String
+}
+
+extension EventCompanionRefresh {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `now_ms`
+        case `wall_time_ms`
+        case `intent_id`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`now_ms` = try c.decode(Int64.self, forKey: .`now_ms`)
+        self.`wall_time_ms` = try c.decode(Int64.self, forKey: .`wall_time_ms`)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`now_ms`, forKey: .`now_ms`)
+        try c.encode(self.`wall_time_ms`, forKey: .`wall_time_ms`)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        var tag = encoder.container(keyedBy: ModelDiscriminator.self)
+        try tag.encode("companion_refresh", forKey: .type)
+    }
+}
+
+struct EventCompanionSave: Codable {
+    var `api_version`: UInt32 = 1
+    var `now_ms`: Int64
+    var `wall_time_ms`: Int64
+    var `intent_id`: String
+    var `roster`: CompanionRoster
+    var `expected_revision`: String
+}
+
+extension EventCompanionSave {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `now_ms`
+        case `wall_time_ms`
+        case `intent_id`
+        case `roster`
+        case `expected_revision`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`now_ms` = try c.decode(Int64.self, forKey: .`now_ms`)
+        self.`wall_time_ms` = try c.decode(Int64.self, forKey: .`wall_time_ms`)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+        self.`roster` = try c.decode(CompanionRoster.self, forKey: .`roster`)
+        self.`expected_revision` = try c.decode(String.self, forKey: .`expected_revision`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`now_ms`, forKey: .`now_ms`)
+        try c.encode(self.`wall_time_ms`, forKey: .`wall_time_ms`)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        try c.encode(self.`roster`, forKey: .`roster`)
+        try c.encode(self.`expected_revision`, forKey: .`expected_revision`)
+        var tag = encoder.container(keyedBy: ModelDiscriminator.self)
+        try tag.encode("companion_save", forKey: .type)
+    }
+}
+
+struct EventCompanionCrewRefresh: Codable {
+    var `api_version`: UInt32 = 1
+    var `now_ms`: Int64
+    var `wall_time_ms`: Int64
+    var `intent_id`: String
+    var `workspace_id`: String
+    var `thread_id`: String
+}
+
+extension EventCompanionCrewRefresh {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `now_ms`
+        case `wall_time_ms`
+        case `intent_id`
+        case `workspace_id`
+        case `thread_id`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`now_ms` = try c.decode(Int64.self, forKey: .`now_ms`)
+        self.`wall_time_ms` = try c.decode(Int64.self, forKey: .`wall_time_ms`)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        self.`thread_id` = try c.decode(String.self, forKey: .`thread_id`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`now_ms`, forKey: .`now_ms`)
+        try c.encode(self.`wall_time_ms`, forKey: .`wall_time_ms`)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`thread_id`, forKey: .`thread_id`)
+        var tag = encoder.container(keyedBy: ModelDiscriminator.self)
+        try tag.encode("companion_crew_refresh", forKey: .type)
     }
 }
 
@@ -9197,6 +9324,314 @@ extension ExplorerFileQuery {
         self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
         self.`revision` = try c.decode(String.self, forKey: .`revision`)
         self.`data` = try c.decodeIfPresent(ExplorerFileView.self, forKey: .`data`)
+        self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`revision`, forKey: .`revision`)
+        try c.encode(self.`data`, forKey: .`data`)
+        try c.encode(self.`error`, forKey: .`error`)
+    }
+}
+
+struct CompanionEntry: Codable {
+    var `id`: String
+    var `name`: String
+    var `character`: String = "sprout"
+    var `home_workspace_id`: String = ""
+    var `thread_id`: String = ""
+    var `provider`: String = ""
+    var `model`: String = ""
+    var `orders`: String = ""
+}
+
+extension CompanionEntry {
+    private enum CodingKeys: String, CodingKey {
+        case `id`
+        case `name`
+        case `character`
+        case `home_workspace_id`
+        case `thread_id`
+        case `provider`
+        case `model`
+        case `orders`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`id` = try c.decode(String.self, forKey: .`id`)
+        self.`name` = try c.decode(String.self, forKey: .`name`)
+        if !c.contains(.`character`) { self.`character` = "sprout" } else {
+        self.`character` = try c.decode(String.self, forKey: .`character`)
+        }
+        if !c.contains(.`home_workspace_id`) { self.`home_workspace_id` = "" } else {
+        self.`home_workspace_id` = try c.decode(String.self, forKey: .`home_workspace_id`)
+        }
+        if !c.contains(.`thread_id`) { self.`thread_id` = "" } else {
+        self.`thread_id` = try c.decode(String.self, forKey: .`thread_id`)
+        }
+        if !c.contains(.`provider`) { self.`provider` = "" } else {
+        self.`provider` = try c.decode(String.self, forKey: .`provider`)
+        }
+        if !c.contains(.`model`) { self.`model` = "" } else {
+        self.`model` = try c.decode(String.self, forKey: .`model`)
+        }
+        if !c.contains(.`orders`) { self.`orders` = "" } else {
+        self.`orders` = try c.decode(String.self, forKey: .`orders`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`id`, forKey: .`id`)
+        try c.encode(self.`name`, forKey: .`name`)
+        try c.encode(self.`character`, forKey: .`character`)
+        try c.encode(self.`home_workspace_id`, forKey: .`home_workspace_id`)
+        try c.encode(self.`thread_id`, forKey: .`thread_id`)
+        try c.encode(self.`provider`, forKey: .`provider`)
+        try c.encode(self.`model`, forKey: .`model`)
+        try c.encode(self.`orders`, forKey: .`orders`)
+    }
+}
+
+struct CompanionRoster: Codable {
+    var `version`: UInt32 = 1
+    var `active_id`: String = ""
+    var `companions`: [CompanionEntry] = []
+}
+
+extension CompanionRoster {
+    private enum CodingKeys: String, CodingKey {
+        case `version`
+        case `active_id`
+        case `companions`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`version`) { self.`version` = 1 } else {
+        self.`version` = try c.decode(UInt32.self, forKey: .`version`)
+        }
+        if !c.contains(.`active_id`) { self.`active_id` = "" } else {
+        self.`active_id` = try c.decode(String.self, forKey: .`active_id`)
+        }
+        if !c.contains(.`companions`) { self.`companions` = [] } else {
+        self.`companions` = try c.decode([CompanionEntry].self, forKey: .`companions`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`version`, forKey: .`version`)
+        try c.encode(self.`active_id`, forKey: .`active_id`)
+        try c.encode(self.`companions`, forKey: .`companions`)
+    }
+}
+
+struct CompanionLink: Codable {
+    var `link_id`: String = ""
+    var `workspace_id`: String = ""
+    var `parent_workspace_id`: String = ""
+    var `local_thread_id`: String = ""
+    var `title`: String = ""
+    var `provider`: String = ""
+    var `status`: String = "idle"
+    var `summary`: String = ""
+    var `updated_at_ms`: Int64 = 0
+    var `hidden`: Bool = false
+}
+
+extension CompanionLink {
+    private enum CodingKeys: String, CodingKey {
+        case `link_id`
+        case `workspace_id`
+        case `parent_workspace_id`
+        case `local_thread_id`
+        case `title`
+        case `provider`
+        case `status`
+        case `summary`
+        case `updated_at_ms`
+        case `hidden`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`link_id`) { self.`link_id` = "" } else {
+        self.`link_id` = try c.decode(String.self, forKey: .`link_id`)
+        }
+        if !c.contains(.`workspace_id`) { self.`workspace_id` = "" } else {
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        }
+        if !c.contains(.`parent_workspace_id`) { self.`parent_workspace_id` = "" } else {
+        self.`parent_workspace_id` = try c.decode(String.self, forKey: .`parent_workspace_id`)
+        }
+        if !c.contains(.`local_thread_id`) { self.`local_thread_id` = "" } else {
+        self.`local_thread_id` = try c.decode(String.self, forKey: .`local_thread_id`)
+        }
+        if !c.contains(.`title`) { self.`title` = "" } else {
+        self.`title` = try c.decode(String.self, forKey: .`title`)
+        }
+        if !c.contains(.`provider`) { self.`provider` = "" } else {
+        self.`provider` = try c.decode(String.self, forKey: .`provider`)
+        }
+        if !c.contains(.`status`) { self.`status` = "idle" } else {
+        self.`status` = try c.decode(String.self, forKey: .`status`)
+        }
+        if !c.contains(.`summary`) { self.`summary` = "" } else {
+        self.`summary` = try c.decode(String.self, forKey: .`summary`)
+        }
+        if !c.contains(.`updated_at_ms`) { self.`updated_at_ms` = 0 } else {
+        self.`updated_at_ms` = try c.decode(Int64.self, forKey: .`updated_at_ms`)
+        }
+        if !c.contains(.`hidden`) { self.`hidden` = false } else {
+        self.`hidden` = try c.decode(Bool.self, forKey: .`hidden`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`link_id`, forKey: .`link_id`)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`parent_workspace_id`, forKey: .`parent_workspace_id`)
+        try c.encode(self.`local_thread_id`, forKey: .`local_thread_id`)
+        try c.encode(self.`title`, forKey: .`title`)
+        try c.encode(self.`provider`, forKey: .`provider`)
+        try c.encode(self.`status`, forKey: .`status`)
+        try c.encode(self.`summary`, forKey: .`summary`)
+        try c.encode(self.`updated_at_ms`, forKey: .`updated_at_ms`)
+        try c.encode(self.`hidden`, forKey: .`hidden`)
+    }
+}
+
+struct CompanionCrew: Codable {
+    var `workspace_id`: String = ""
+    var `thread_id`: String = ""
+    var `links`: [CompanionLink] = []
+    var `loaded`: Bool = false
+    var `loading`: Bool = false
+    var `error`: LocalError? = nil
+}
+
+extension CompanionCrew {
+    private enum CodingKeys: String, CodingKey {
+        case `workspace_id`
+        case `thread_id`
+        case `links`
+        case `loaded`
+        case `loading`
+        case `error`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`workspace_id`) { self.`workspace_id` = "" } else {
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        }
+        if !c.contains(.`thread_id`) { self.`thread_id` = "" } else {
+        self.`thread_id` = try c.decode(String.self, forKey: .`thread_id`)
+        }
+        if !c.contains(.`links`) { self.`links` = [] } else {
+        self.`links` = try c.decode([CompanionLink].self, forKey: .`links`)
+        }
+        if !c.contains(.`loaded`) { self.`loaded` = false } else {
+        self.`loaded` = try c.decode(Bool.self, forKey: .`loaded`)
+        }
+        if !c.contains(.`loading`) { self.`loading` = false } else {
+        self.`loading` = try c.decode(Bool.self, forKey: .`loading`)
+        }
+        if !c.contains(.`error`) { self.`error` = nil } else {
+        self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`thread_id`, forKey: .`thread_id`)
+        try c.encode(self.`links`, forKey: .`links`)
+        try c.encode(self.`loaded`, forKey: .`loaded`)
+        try c.encode(self.`loading`, forKey: .`loading`)
+        try c.encode(self.`error`, forKey: .`error`)
+    }
+}
+
+struct CompanionView: Codable {
+    var `loaded`: Bool = false
+    var `loading`: Bool = false
+    var `saving`: Bool = false
+    var `supported`: Bool = true
+    var `can_edit`: Bool = false
+    var `revision`: String = "0"
+    var `roster`: CompanionRoster
+    var `crew`: CompanionCrew
+    var `error`: LocalError? = nil
+}
+
+extension CompanionView {
+    private enum CodingKeys: String, CodingKey {
+        case `loaded`
+        case `loading`
+        case `saving`
+        case `supported`
+        case `can_edit`
+        case `revision`
+        case `roster`
+        case `crew`
+        case `error`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`loaded`) { self.`loaded` = false } else {
+        self.`loaded` = try c.decode(Bool.self, forKey: .`loaded`)
+        }
+        if !c.contains(.`loading`) { self.`loading` = false } else {
+        self.`loading` = try c.decode(Bool.self, forKey: .`loading`)
+        }
+        if !c.contains(.`saving`) { self.`saving` = false } else {
+        self.`saving` = try c.decode(Bool.self, forKey: .`saving`)
+        }
+        if !c.contains(.`supported`) { self.`supported` = true } else {
+        self.`supported` = try c.decode(Bool.self, forKey: .`supported`)
+        }
+        if !c.contains(.`can_edit`) { self.`can_edit` = false } else {
+        self.`can_edit` = try c.decode(Bool.self, forKey: .`can_edit`)
+        }
+        if !c.contains(.`revision`) { self.`revision` = "0" } else {
+        self.`revision` = try c.decode(String.self, forKey: .`revision`)
+        }
+        self.`roster` = try c.decode(CompanionRoster.self, forKey: .`roster`)
+        self.`crew` = try c.decode(CompanionCrew.self, forKey: .`crew`)
+        if !c.contains(.`error`) { self.`error` = nil } else {
+        self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`loaded`, forKey: .`loaded`)
+        try c.encode(self.`loading`, forKey: .`loading`)
+        try c.encode(self.`saving`, forKey: .`saving`)
+        try c.encode(self.`supported`, forKey: .`supported`)
+        try c.encode(self.`can_edit`, forKey: .`can_edit`)
+        try c.encode(self.`revision`, forKey: .`revision`)
+        try c.encode(self.`roster`, forKey: .`roster`)
+        try c.encode(self.`crew`, forKey: .`crew`)
+        try c.encode(self.`error`, forKey: .`error`)
+    }
+}
+
+struct CompanionQuery: Codable {
+    var `api_version`: UInt32
+    var `revision`: String
+    var `data`: CompanionView?
+    var `error`: LocalError?
+}
+
+extension CompanionQuery {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `revision`
+        case `data`
+        case `error`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        self.`revision` = try c.decode(String.self, forKey: .`revision`)
+        self.`data` = try c.decodeIfPresent(CompanionView.self, forKey: .`data`)
         self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
     }
     func encode(to encoder: Encoder) throws {

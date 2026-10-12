@@ -93,7 +93,8 @@ extension TranscriptScreen {
     }
 }
 
-private struct TranscriptBody: View {
+/// Banner, transcript and composer for one thread; also the Companion home's conversation.
+struct TranscriptBody: View {
     @State private var file: ViewerRequest?
     let model: TranscriptModel
     let browse: BrowseModel

@@ -228,7 +228,9 @@ actor CoreHost {
              .terminal_create, .terminal_attach, .terminal_detach, .terminal_kill,
              .terminal_resize, .terminal_input, .terminal_reply,
              // Push (I-10): e.g. registration while offline, or a forwarded push before start.
-             .push_register, .push_received: return true
+             .push_register, .push_received,
+             // Companion roster/crew: e.g. a malformed roster or an out-of-budget refresh.
+             .companion_refresh, .companion_save, .companion_crew_refresh: return true
         default: return false
         }
     }

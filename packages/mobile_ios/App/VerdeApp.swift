@@ -12,6 +12,7 @@ struct VerdeApp: App {
     @State private var hosts: HostsModel
     @State private var browse: BrowseModel
     @State private var push: PushRegistry
+    @State private var companion: CompanionModel
 
     init() {
         SharedFile.cleanup()
@@ -30,12 +31,14 @@ struct VerdeApp: App {
             }
         }
         _hosts = State(initialValue: hosts)
-        _browse = State(initialValue: BrowseModel(hosts: hosts, cache: hosts.cache))
+        let browse = BrowseModel(hosts: hosts, cache: hosts.cache)
+        _browse = State(initialValue: browse)
+        _companion = State(initialValue: CompanionModel(browse: browse))
         _push = State(initialValue: push)
     }
 
     var body: some Scene {
-        WindowGroup { RootView(hosts: hosts, browse: browse, push: push) }
+        WindowGroup { RootView(hosts: hosts, browse: browse, push: push, companion: companion) }
     }
 }
 
@@ -49,6 +52,7 @@ struct RootView: View {
     let hosts: HostsModel
     let browse: BrowseModel
     let push: PushRegistry
+    let companion: CompanionModel
     @State private var inbox = PushInbox.shared
     /// A notification's chat, opened once the host switch has cleared the old routes.
     @State private var routeAfterSwitch: BrowseRoute?
@@ -75,7 +79,10 @@ struct RootView: View {
                     if tab == .hosts { HostsScreen(model: hosts) { tab = .home; path = [] } }
                     else {
                         BrowseStack(model: browse, actions: actions, path: $path) {
-                            if tab == .home { HomeScreen(model: browse, actions: actions) }
+                            if tab == .home {
+                                if companion.available { CompanionHome(model: companion, browse: browse, actions: actions) }
+                                else { HomeScreen(model: browse, actions: actions) }
+                            }
                             else { WorkspacesScreen(model: browse, actions: actions) }
                         }
                     }
@@ -153,8 +160,10 @@ struct RootView: View {
 
     /// The chat on screen (`host/workspace/thread`) for foreground notification suppression.
     private var visibleThread: String? {
-        guard tab != .hosts, !drawer, !settings, let host = hosts.active,
-              case .thread(let workspace, let thread)? = path.last else { return nil }
+        guard tab != .hosts, !drawer, !settings, let host = hosts.active else { return nil }
+        // The Companion home shows its own chat.
+        if tab == .home, path.isEmpty, companion.available { return companion.visibleKey() }
+        guard case .thread(let workspace, let thread)? = path.last else { return nil }
         return [host, workspace, thread].joined(separator: "/")
     }
 
