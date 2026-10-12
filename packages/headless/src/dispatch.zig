@@ -14,6 +14,7 @@ const attachment_protocol = @import("attachment_protocol.zig");
 /// Full store mutation surface (S3). daemon.storeStatus is a read, not a mutator.
 const MUTATING_METHODS = [_][]const u8{
     // Sessionizer-owned mutations.
+    "companion.roster.put",
     "device.push.register",
     "device.push.unregister",
     "device.push.test",

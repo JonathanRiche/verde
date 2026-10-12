@@ -294,6 +294,9 @@ pub const PAIRED_RPC_METHODS = [_]PairedRpcMethod{
     .{ .method = "chat.thread.list", .scope_mask = CHAT_READ },
     .{ .method = "chat.message.list", .scope_mask = CHAT_READ },
     .{ .method = "chat.links.list", .scope_mask = CHAT_READ },
+    // The machine Companion roster: who the user's companions are, their
+    // brains, standing orders, and which thread each one talks through.
+    .{ .method = "companion.roster.get", .scope_mask = CHAT_READ },
     .{ .method = "chat.tasks.get", .scope_mask = CHAT_READ },
     .{ .method = "chat.tasks.watch", .scope_mask = CHAT_READ },
     .{ .method = "chat.turn.list", .scope_mask = CHAT_READ },
@@ -309,6 +312,7 @@ pub const PAIRED_RPC_METHODS = [_]PairedRpcMethod{
     // advertised chat.attachments.v1 capability and this allowlist cannot
     // drift apart silently (see the protocol.zig reachability test).
     .{ .method = "chat.links.create", .scope_mask = CHAT_WRITE },
+    .{ .method = "companion.roster.put", .scope_mask = CHAT_WRITE },
     .{ .method = "chat.subagent.open", .scope_mask = CHAT_WRITE },
     .{ .method = "chat.links.clear", .scope_mask = CHAT_WRITE },
     .{ .method = "chat.tasks.blocked", .scope_mask = CHAT_WRITE },

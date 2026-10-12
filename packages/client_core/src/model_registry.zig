@@ -11,6 +11,7 @@ const manage = @import("manage.zig");
 const git = @import("git_changes.zig");
 const files = @import("files.zig");
 const explorer = @import("workspace_explorer.zig");
+const companion = @import("companion.zig");
 pub const types = .{
     .{ "TerminalConfig", terminal.Config },
     .{ "TerminalCursorShape", terminal.CursorShape },
@@ -144,4 +145,10 @@ pub const types = .{
     .{ "ExplorerChangesQuery", wire.Query(explorer.ChangesView) },
     .{ "ExplorerPatchQuery", wire.Query(explorer.PatchView) },
     .{ "ExplorerFileQuery", wire.Query(explorer.FileView) },
+    .{ "CompanionEntry", companion.Companion },
+    .{ "CompanionRoster", companion.Roster },
+    .{ "CompanionLink", companion.Link },
+    .{ "CompanionCrew", companion.Crew },
+    .{ "CompanionView", companion.View },
+    .{ "CompanionQuery", wire.Query(companion.View) },
 };

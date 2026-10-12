@@ -86,6 +86,9 @@ pub const Event = union(enum) {
     workspace_changes_close: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, workspace_id: []const u8 },
     workspace_file_patch: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, workspace_id: []const u8, root: []const u8, path: []const u8, context_lines: ?u32 = null },
     file_open: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, path: []const u8, kind: files.Kind, max_bytes: u32 },
+    companion_refresh: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8 },
+    companion_save: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, roster: @import("companion.zig").Roster, expected_revision: []const u8 },
+    companion_crew_refresh: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, workspace_id: []const u8, thread_id: []const u8 },
     push_received: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, workspace_id: []const u8, thread_id: []const u8, turn_id: []const u8, kind: []const u8 },
     terminal_input: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, terminal_id: []const u8, vt_modes: VtModes, input: struct { kind: enum { text, key, paste }, text: ?[]const u8 = null, key: ?[]const u8 = null, ctrl: bool, alt: bool, shift: bool } },
 };
