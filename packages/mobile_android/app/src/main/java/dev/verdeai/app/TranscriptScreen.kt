@@ -32,6 +32,7 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -264,7 +265,8 @@ private fun Placeholder(kind: TranscriptPlaceholder, model: TranscriptModel) {
 private const val PREFETCH_ITEMS = 5
 
 @Composable
-internal fun TranscriptList(items: List<TranscriptItem>, state: TranscriptState, ctx: TranscriptContext, renderers: TranscriptRenderers) {
+internal fun TranscriptList(items: List<TranscriptItem>, state: TranscriptState, ctx: TranscriptContext, renderers: TranscriptRenderers,
+    spacing: Dp = 8.dp, contentPadding: PaddingValues = PaddingValues(horizontal = 12.dp, vertical = 8.dp)) {
     // Newest first + reverseLayout: index 0 sits at the bottom, so growth of the streaming row
     // and older pages prepended at the top both leave the reading position alone.
     val reversed = remember(items) { items.asReversed() }
@@ -291,7 +293,7 @@ internal fun TranscriptList(items: List<TranscriptItem>, state: TranscriptState,
     }
     Box(Modifier.fillMaxSize()) {
         LazyColumn(Modifier.fillMaxSize().testTag(TRANSCRIPT_LIST), state = list, reverseLayout = true,
-            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp, Alignment.Bottom)) {
+            contentPadding = contentPadding, verticalArrangement = Arrangement.spacedBy(spacing, Alignment.Bottom)) {
             items(reversed, key = { it.key }, contentType = { it::class }) { item -> renderers.Render(item, ctx) }
             item(key = "page-header", contentType = "header") { PageHeader(page, ctx.model) }
         }

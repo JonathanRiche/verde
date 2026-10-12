@@ -37,7 +37,9 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -135,11 +137,10 @@ internal fun CompanionSheet(
                 CompanionPlaceholder(state, workspaces.any { it.open })
                 return@Column
             }
-            CompanionHeader(active, state.roster, pose, companionStatusLine(snapshot.pulse.copy(needsYou = snapshot.needKeys.size)), enabled = state.view?.can_edit == true && !state.saving,
+            CompanionHeader(active, state.roster, pose, companionHeaderSuffix(snapshot.needKeys.size, snapshot.pulse.running), enabled = state.view?.can_edit == true && !state.saving,
                 onSwitch = companion::switchTo, onSettings = { settings = true }, onActivity = onActivity, onHideBubble = onHideBubble,
                 liveActive = liveUi?.active == true, onLive = if (live != null && liveSupported) onLive else null)
-            if (snapshot.needs.isNotEmpty()) NeedsYou(snapshot.needs, workspaces, onOpenPane, onActivity)
-            if (snapshot.crew.isNotEmpty()) Crew(snapshot.crew, workspaces) { onOpenChat(it.workspace_id, it.local_thread_id) }
+            SummaryStrip(snapshot, workspaces, onOpenPane, onOpenChat)
             HorizontalDivider(color = VerdeColors.Border)
             Box(Modifier.weight(1f).fillMaxWidth()) {
                 when {
@@ -186,96 +187,120 @@ private fun CompanionPlaceholder(state: CompanionUiState, hasWorkspace: Boolean)
 }
 
 @Composable
-private fun CompanionHeader(active: CompanionEntry, roster: CompanionRoster?, pose: CompanionPose, status: String, enabled: Boolean,
+private fun CompanionHeader(active: CompanionEntry, roster: CompanionRoster?, pose: CompanionPose, suffix: String?, enabled: Boolean,
     onSwitch: (String) -> Unit, onSettings: () -> Unit, onActivity: () -> Unit, onHideBubble: () -> Unit,
     liveActive: Boolean = false, onLive: (() -> Unit)? = null) {
     val character = CompanionCharacter.of(active.character)
-    Row(Modifier.fillMaxWidth().padding(start = 12.dp, end = 4.dp, bottom = 4.dp),
-        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-        CompanionAvatar(character, pose, size = 48.dp, description = "${active.name}, ${character.label}")
-        Column(Modifier.weight(1f)) {
-            Text(active.name.ifBlank { character.label }, style = MaterialTheme.typography.titleLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text(status, style = MaterialTheme.typography.bodySmall, maxLines = 1, color = when (pose) {
-                CompanionPose.Approval -> VerdeColors.Warning
-                CompanionPose.Working -> VerdeColors.Accent
-                else -> VerdeColors.Muted
-            })
-        }
-        TextButton(onClick = onActivity) { Text("All activity") }
+    val name = active.name.ifBlank { character.label }
+    val suffixColor = when (pose) {
+        CompanionPose.Approval -> VerdeColors.Warning
+        CompanionPose.Working -> VerdeColors.Accent
+        else -> VerdeColors.Muted
+    }
+    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).padding(start = 12.dp),
+        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        CompanionAvatar(character, pose, size = 28.dp, description = "$name, ${character.label}")
+        Text(buildAnnotatedString {
+            withStyle(MaterialTheme.typography.titleMedium.toSpanStyle()) { append(name) }
+            if (suffix != null) withStyle(MaterialTheme.typography.bodySmall.toSpanStyle().copy(color = suffixColor)) { append("  · $suffix") }
+        }, Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
         onLive?.let { LiveButton(liveActive, it) }
-        IconButton(onClick = onSettings) { Icon(Icons.Filled.Settings, contentDescription = "Companion settings") }
         Box {
             var menu by remember { mutableStateOf(false) }
-            IconButton(onClick = { menu = true }) { Icon(Icons.Filled.MoreVert, contentDescription = "More companion options") }
+            IconButton(onClick = { menu = true }) { Icon(Icons.Filled.MoreVert, contentDescription = "Companion menu") }
             DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                DropdownMenuItem(text = { Text("Hide bubble") }, onClick = { menu = false; onHideBubble() })
-                DropdownMenuItem(text = { Text("Settings") }, onClick = { menu = false; onSettings() })
-            }
-        }
-    }
-    // Switcher: the other companions, one tap away.
-    val others = roster?.companions.orEmpty().filter { it.id != active.id }
-    if (others.isNotEmpty()) Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp),
-        horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        others.forEach { entry ->
-            val look = CompanionCharacter.of(entry.character)
-            AssistChip(onClick = { onSwitch(entry.id) }, enabled = enabled,
-                label = { Text(entry.name.ifBlank { look.label }, maxLines = 1) },
-                leadingIcon = { CompanionAvatar(look, CompanionPose.Idle, size = 20.dp) },
-                modifier = Modifier.semantics { contentDescription = "Switch to ${entry.name.ifBlank { look.label }}" })
-        }
-    }
-}
-
-private const val NEEDS_YOU_ROWS = 3
-
-@Composable
-private fun NeedsYou(needs: List<Pane>, workspaces: List<Workspace>, onOpen: (Pane) -> Unit, onMore: () -> Unit) {
-    VerdeSection("Needs you")
-    needs.take(NEEDS_YOU_ROWS).forEach { pane ->
-        val where = workspaces.find { it.workspace_id == pane.workspace_id }?.label
-        VerdeListRow(
-            headlineContent = { Text(pane.title.ifBlank { "Chat" }, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-            supportingContent = { Text(listOfNotNull(where, attentionLabel(pane.attention_kind) ?: statusLabel(pane.status)).joinToString(" · "), maxLines = 1) },
-            leadingContent = { StatusPip(statusColor(pane.status, true), statusLabel(pane.status), size = 8.dp) },
-            modifier = Modifier.fillMaxWidth().clickable(enabled = openable(pane), onClickLabel = "Open") { onOpen(pane) },
-        )
-    }
-    if (needs.size > NEEDS_YOU_ROWS) TextButton(onClick = onMore, modifier = Modifier.padding(horizontal = 8.dp)) {
-        Text("${needs.size - NEEDS_YOU_ROWS} more")
-    }
-}
-
-@Composable
-private fun Crew(crew: List<CompanionLink>, workspaces: List<Workspace>, onOpen: (CompanionLink) -> Unit) {
-    VerdeSection("Crew")
-    Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 4.dp),
-        horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        crew.forEach { link ->
-            val status = crewStatus(link)
-            val title = childTitle(link.local_thread_id, link.title)
-            val where = workspaces.find { it.workspace_id == link.workspace_id }?.label
-            val color = when {
-                status == ChildStatus.Failed -> MaterialTheme.colorScheme.error
-                status.needsYou -> VerdeColors.Warning
-                status.running -> VerdeColors.Accent
-                else -> VerdeColors.Subtle
-            }
-            Row(Modifier.widthIn(max = 240.dp).background(VerdeColors.Panel, RoundedCornerShape(16.dp))
-                .border(1.dp, if (status.needsYou) VerdeColors.Warning else VerdeColors.Border, RoundedCornerShape(16.dp))
-                .clickable(onClickLabel = "Open chat", role = Role.Button) { onOpen(link) }
-                .padding(horizontal = 10.dp, vertical = 6.dp)
-                .semantics { contentDescription = "$title, ${status.label}" },
-                verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                ProviderGlyph(link.provider.ifEmpty { null }, Modifier.size(14.dp))
-                StatusPip(color, null, active = status.running, size = 8.dp)
-                Column {
-                    Text(title, style = MaterialTheme.typography.labelLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    Text(listOfNotNull(status.label, where).joinToString(" · "), style = MaterialTheme.typography.labelSmall,
-                        color = VerdeColors.Muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                DropdownMenuItem(text = { Text("All activity") }, onClick = { menu = false; onActivity() })
+                roster?.companions.orEmpty().filter { it.id != active.id }.forEach { entry ->
+                    val look = CompanionCharacter.of(entry.character)
+                    DropdownMenuItem(text = { Text("Switch to ${entry.name.ifBlank { look.label }}") }, enabled = enabled,
+                        leadingIcon = { CompanionAvatar(look, CompanionPose.Idle, size = 20.dp) },
+                        onClick = { menu = false; onSwitch(entry.id) })
                 }
+                DropdownMenuItem(text = { Text("Settings") }, onClick = { menu = false; onSettings() })
+                DropdownMenuItem(text = { Text("Hide bubble") }, onClick = { menu = false; onHideBubble() })
             }
         }
+    }
+}
+
+private enum class StripPanel { Needs, Crew }
+
+/** One line of the summary strip's expanded list. */
+private data class StripRow(val key: String, val title: String, val where: String?, val tone: StripTone, val open: () -> Unit)
+private enum class StripTone { Attention, Failed, Running, Quiet }
+
+/**
+ * Two small pills under the header ("3 need you", "2 running · 1 done"); tapping one expands a
+ * compact, scrollable list in the layout (never over the conversation). Collapsed by default.
+ */
+@Composable
+private fun SummaryStrip(snapshot: CompanionSnapshot, workspaces: List<Workspace>, onOpenPane: (Pane) -> Unit,
+    onOpenChat: (String, String) -> Unit) {
+    var open by rememberSaveable { mutableStateOf<StripPanel?>(null) }
+    val needsCount = snapshot.needKeys.size
+    val crewLabel = crewSummary(snapshot.crew)
+    if (needsCount == 0 && crewLabel == null) return
+    fun label(ws: String) = workspaces.find { it.workspace_id == ws }?.label
+    Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalAlignment = Alignment.CenterVertically) {
+        if (needsCount > 0) StripPill(needsLabel(needsCount), VerdeColors.Warning, open == StripPanel.Needs) {
+            open = if (open == StripPanel.Needs) null else StripPanel.Needs
+        }
+        if (crewLabel != null) StripPill(crewLabel, if (snapshot.crewRunning) VerdeColors.Accent else VerdeColors.Subtle, open == StripPanel.Crew) {
+            open = if (open == StripPanel.Crew) null else StripPanel.Crew
+        }
+    }
+    val rows: List<StripRow> = when (open) {
+        StripPanel.Needs -> snapshot.needs.map { pane ->
+            StripRow("p:" + pane.id, pane.title.ifBlank { "Chat" }, label(pane.workspace_id),
+                if (pane.status == "failed" || pane.attention_kind == "failed") StripTone.Failed else StripTone.Attention) { onOpenPane(pane) }
+        } + snapshot.crew.filter { crewStatus(it).needsYou && snapshot.needs.none { p -> p.thread_id == it.local_thread_id && p.workspace_id == it.workspace_id } }
+            .map { link -> StripRow("l:" + link.link_id, childTitle(link.local_thread_id, link.title), label(link.workspace_id),
+                if (crewStatus(link) == ChildStatus.Failed) StripTone.Failed else StripTone.Attention) { onOpenChat(link.workspace_id, link.local_thread_id) } }
+        StripPanel.Crew -> snapshot.crew.map { link ->
+            val status = crewStatus(link)
+            StripRow("l:" + link.link_id, childTitle(link.local_thread_id, link.title), label(link.workspace_id), when {
+                status == ChildStatus.Failed -> StripTone.Failed
+                status.needsYou -> StripTone.Attention
+                status.running -> StripTone.Running
+                else -> StripTone.Quiet
+            }) { onOpenChat(link.workspace_id, link.local_thread_id) }
+        }
+        null -> emptyList()
+    }
+    if (rows.isNotEmpty()) Column(Modifier.fillMaxWidth().heightIn(max = 196.dp).verticalScroll(rememberScrollState())) {
+        rows.forEach { row -> key(row.key) { StripItem(row) } }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun StripPill(text: String, dot: androidx.compose.ui.graphics.Color, selected: Boolean, onClick: () -> Unit) {
+    Surface(onClick = onClick, shape = RoundedCornerShape(12.dp), color = if (selected) VerdeColors.PanelAlt else VerdeColors.Panel,
+        border = androidx.compose.foundation.BorderStroke(1.dp, if (selected) dot else VerdeColors.Border),
+        modifier = Modifier.semantics { contentDescription = "$text. ${if (selected) "Collapse" else "Show"} list"; this.selected = selected }) {
+        Row(Modifier.padding(horizontal = 10.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Box(Modifier.size(7.dp).background(dot, CircleShape))
+            Text(text, style = MaterialTheme.typography.labelMedium, maxLines = 1)
+        }
+    }
+}
+
+@Composable
+private fun StripItem(row: StripRow) {
+    val color = when (row.tone) {
+        StripTone.Attention -> VerdeColors.Warning
+        StripTone.Failed -> MaterialTheme.colorScheme.error
+        StripTone.Running -> VerdeColors.Accent
+        StripTone.Quiet -> VerdeColors.Subtle
+    }
+    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable(onClickLabel = "Open chat", onClick = row.open).padding(horizontal = 16.dp),
+        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        StatusPip(color, null, active = row.tone == StripTone.Running, size = 7.dp)
+        Text(row.title, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        row.where?.let { Text(it, style = MaterialTheme.typography.labelSmall, color = VerdeColors.Subtle, maxLines = 1,
+            overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 120.dp)) }
     }
 }
 
@@ -289,10 +314,12 @@ private fun CompanionConversation(model: TranscriptModel, state: TranscriptState
     val items = remember(state.thread) { state.thread?.let(::transcriptItems).orEmpty() }
     val now = rememberNow(state.turn?.started_at_ms != null)
     val context = TranscriptContext(model, now, onCitation, state.turn?.started_at_ms, threads, onOpenThread)
+    val name = active.name.ifBlank { "your companion" }
     Column(Modifier.fillMaxSize()) {
         Box(Modifier.weight(1f).fillMaxWidth()) {
             when (transcriptPlaceholder(state)) {
-                null -> TranscriptList(items, state, context, TranscriptRenderers.Default)
+                null -> TranscriptList(items, state, context, CompactTranscriptRenderers, spacing = 4.dp,
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp))
                 TranscriptPlaceholder.Empty -> Suggestions(active.name) { model.composer.ask(it) }
                 TranscriptPlaceholder.Loading -> Centered { CircularProgressIndicator() }
                 TranscriptPlaceholder.Missing -> Centered {
@@ -306,14 +333,17 @@ private fun CompanionConversation(model: TranscriptModel, state: TranscriptState
                 }
             }
         }
-        if (voice != null && voice.available) VoiceBar(voice, model, active.name.ifBlank { "your companion" })
-        ChatComposer(model, state)
+        val mic: (@Composable () -> Unit)? = if (voice != null && voice.available) ({ MicButton(voice, model, name) }) else null
+        ChatComposer(model, state, compact = true, inlineAction = mic)
     }
 }
 
-/** Mic for the companion sheet: tap to start and again to send, or hold and release; live words go in the draft. */
+/**
+ * The composer's mic: tap to start and again to send, or hold and release; live words go in the
+ * draft. While listening a cancel button sits beside it; while a reply is read aloud a tap stops it.
+ */
 @Composable
-private fun VoiceBar(voice: CompanionVoice, model: TranscriptModel, name: String) {
+private fun MicButton(voice: CompanionVoice, model: TranscriptModel, name: String) {
     val talk by voice.talk.collectAsState()
     val level by voice.level.collectAsState()
     val speaking by voice.speaking.collectAsState()
@@ -321,55 +351,54 @@ private fun VoiceBar(voice: CompanionVoice, model: TranscriptModel, name: String
     val mic = rememberMicPermission()
     val haptics = LocalHapticFeedback.current
     val currentTalk by rememberUpdatedState(talk)
+    val currentSpeaking by rememberUpdatedState(speaking)
     val listening = talk !is TalkState.Idle
-    Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        Box(Modifier.size(48.dp)
-            .background(if (listening) VerdeColors.Accent else VerdeColors.PanelAlt, CircleShape)
-            .pointerInput(model) {
-                awaitEachGesture {
-                    val down = awaitFirstDown()
-                    val wasIdle = currentTalk is TalkState.Idle
-                    if (wasIdle) {
-                        if (!mic.granted()) { mic.request(); waitForUpOrCancellation(); return@awaitEachGesture }
-                        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                        voice.press(model, liveDraft = true)
-                    }
-                    val up = waitForUpOrCancellation()
-                    when {
-                        !wasIdle -> if (up != null) voice.release()
-                        up == null -> voice.cancel()
-                        up.uptimeMillis - down.uptimeMillis >= HOLD_TO_TALK_MS -> voice.release()
-                        // A quick tap keeps listening until the next tap.
-                        else -> Unit
-                    }
+    // Recognition problems surface where the user is looking: the composer's notice line.
+    LaunchedEffect(error) { error?.let { model.composer.showNotice(it); voice.clearError() } }
+    if (talk is TalkState.Listening) IconButton(onClick = voice::cancel) {
+        Icon(Icons.Filled.Close, contentDescription = "Cancel recording", tint = VerdeColors.Muted)
+    }
+    val ring = (2f + 4f * level.coerceIn(0f, 1f)).dp
+    Box(Modifier.size(48.dp)
+        .pointerInput(model) {
+            awaitEachGesture {
+                val down = awaitFirstDown()
+                val wasIdle = currentTalk is TalkState.Idle
+                if (wasIdle && currentSpeaking) { waitForUpOrCancellation(); voice.stopSpeaking(); return@awaitEachGesture }
+                if (wasIdle) {
+                    if (!mic.granted()) { mic.request(); waitForUpOrCancellation(); return@awaitEachGesture }
+                    haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                    voice.press(model, liveDraft = true)
+                }
+                val up = waitForUpOrCancellation()
+                when {
+                    !wasIdle -> if (up != null) voice.release()
+                    up == null -> voice.cancel()
+                    up.uptimeMillis - down.uptimeMillis >= HOLD_TO_TALK_MS -> voice.release()
+                    // A quick tap keeps listening until the next tap.
+                    else -> Unit
                 }
             }
-            .semantics {
-                role = Role.Button
-                contentDescription = micLabel(talk, name)
-                onClick(label = if (listening) "Stop and send" else "Talk") {
-                    if (listening) voice.release() else if (mic.granted()) voice.press(model, liveDraft = true) else mic.request()
-                    true
-                }
-            }, contentAlignment = Alignment.Center) {
-            Icon(painterResource(R.drawable.ic_mic), contentDescription = null,
-                tint = if (listening) VerdeColors.Background else VerdeColors.Text, modifier = Modifier.size(22.dp))
         }
-        when {
-            talk is TalkState.Listening -> {
-                LevelBars(level)
-                Text(if ((talk as TalkState.Listening).cancelArmed) "Release to cancel" else "Listening\u2026 tap to send",
-                    Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, color = VerdeColors.Muted)
-                IconButton(onClick = voice::cancel) { Icon(Icons.Filled.Close, contentDescription = "Cancel recording") }
+        .semantics {
+            role = Role.Button
+            contentDescription = if (speaking && !listening) "Stop reading the reply aloud" else micLabel(talk, name)
+            onClick(label = when { listening -> "Stop and send"; speaking -> "Stop speaking"; else -> "Talk" }) {
+                when {
+                    listening -> voice.release()
+                    speaking -> voice.stopSpeaking()
+                    mic.granted() -> voice.press(model, liveDraft = true)
+                    else -> mic.request()
+                }
+                true
             }
-            talk is TalkState.Finishing -> Text("Sending\u2026", Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, color = VerdeColors.Muted)
-            speaking -> {
-                Text("Speaking", Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, color = VerdeColors.Accent)
-                TextButton(onClick = voice::stopSpeaking) { Text("Stop") }
-            }
-            error != null -> Text(error.orEmpty(), Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
-            else -> Text("Hold or tap to talk", Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, color = VerdeColors.Subtle)
+        }, contentAlignment = Alignment.Center) {
+        Box(Modifier.size(36.dp)
+            .background(if (listening) VerdeColors.Accent else VerdeColors.PanelAlt, CircleShape)
+            .then(if (listening) Modifier.border(ring, VerdeColors.AccentWash, CircleShape) else Modifier),
+            contentAlignment = Alignment.Center) {
+            Icon(painterResource(if (speaking && !listening) R.drawable.ic_waveform else R.drawable.ic_mic), contentDescription = null,
+                tint = if (listening) VerdeColors.Background else if (speaking) VerdeColors.Accent else VerdeColors.Text, modifier = Modifier.size(18.dp))
         }
     }
 }

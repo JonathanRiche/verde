@@ -120,6 +120,26 @@ class CompanionTest {
         assertEquals("Ready when you are", companionStatusLine(CompanionPulse(0, 0)))
     }
 
+    @Test fun compactSheetLabels() {
+        assertEquals("1 needs you", needsLabel(1))
+        assertEquals("3 need you", needsLabel(3))
+        assertNull(crewSummary(emptyList()))
+        assertEquals("2 running \u00b7 1 waiting \u00b7 1 done", crewSummary(listOf(link("a", "running"), link("b", "running"),
+            link("c", "blocked"), link("d", "completed"), link("e", "aborted"))))
+        assertEquals("1 in crew", crewSummary(listOf(link("x", "idle"))))
+        assertEquals("2 in crew", crewSummary(listOf(link("x", "idle"), link("y", "interrupted"))))
+        assertEquals("3 need you", companionHeaderSuffix(3, 2))
+        assertEquals("2 running", companionHeaderSuffix(0, 2))
+        assertNull(companionHeaderSuffix(0, 0))
+        val models = listOf(ChatChoice("haiku", "Haiku 5.5"), ChatChoice("opus", "Opus 5.5"))
+        val efforts = listOf(ChatChoice("", "Default"), ChatChoice("low", "Low"))
+        assertEquals("Haiku 5.5 \u00b7 Low", compactSettingsLabel(models, efforts, ChatSelection(model = "haiku", effort = "low")))
+        assertEquals("Haiku 5.5 \u00b7 Default", compactSettingsLabel(models, efforts, ChatSelection()))
+        assertEquals("Opus 5.5", compactSettingsLabel(models, emptyList(), ChatSelection(model = "opus")))
+        assertEquals("custom-model", compactSettingsLabel(models, emptyList(), ChatSelection(model = "custom-model")))
+        assertEquals("Model", compactSettingsLabel(emptyList(), emptyList(), ChatSelection()))
+    }
+
     @Test fun poseFollowsRealStateWithApprovalOutrankingWork() {
         assertEquals(CompanionPose.Paused, companionPose(online = false, approval = true, working = true))
         assertEquals(CompanionPose.Approval, companionPose(online = true, approval = true, working = true))

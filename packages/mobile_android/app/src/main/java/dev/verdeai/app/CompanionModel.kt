@@ -133,6 +133,28 @@ internal fun companionPulse(panes: List<Pane>, crew: List<CompanionLink>): Compa
     return CompanionPulse(needs, running)
 }
 
+/** "1 needs you" / "3 need you". */
+internal fun needsLabel(count: Int): String = if (count == 1) "1 needs you" else "$count need you"
+
+/** The crew pill: "2 running · 1 waiting · 1 done"; null when there is no crew. */
+internal fun crewSummary(crew: List<CompanionLink>): String? {
+    if (crew.isEmpty()) return null
+    val statuses = crew.map(::crewStatus)
+    val running = statuses.count { it.running }
+    val waiting = statuses.count { it.needsYou }
+    val done = statuses.count { it == ChildStatus.Completed }
+    val parts = listOfNotNull(running.takeIf { it > 0 }?.let { "$it running" }, waiting.takeIf { it > 0 }?.let { "$it waiting" },
+        done.takeIf { it > 0 }?.let { "$it done" })
+    return parts.joinToString(" \u00b7 ").ifEmpty { if (crew.size == 1) "1 in crew" else "${crew.size} in crew" }
+}
+
+/** The sheet header's small status suffix: needs first, then running; nothing when idle. */
+internal fun companionHeaderSuffix(needs: Int, running: Int): String? = when {
+    needs > 0 -> needsLabel(needs)
+    running > 0 -> "$running running"
+    else -> null
+}
+
 internal fun companionStatusLine(pulse: CompanionPulse): String = when {
     pulse.needsYou == 1 -> "1 thing needs you"
     pulse.needsYou > 1 -> "${pulse.needsYou} things need you"

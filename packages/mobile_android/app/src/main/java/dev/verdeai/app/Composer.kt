@@ -102,7 +102,9 @@ private fun attachmentSize(bytes: Long) = if (bytes < 1024 * 1024) "${(bytes + 1
 /** D-08: the chat composer in the transcript's bottom bar. */
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
-internal fun ChatComposer(model: TranscriptModel, state: TranscriptState) {
+internal fun ChatComposer(model: TranscriptModel, state: TranscriptState,
+    /** Companion sheet: one row (settings chip, growing input, [inlineAction], send); no resize handle or toolbars. */
+    compact: Boolean = false, inlineAction: (@Composable () -> Unit)? = null) {
     val composer = model.composer
     val view = state.composer?.let { current ->
         composer.pendingSelection?.let { current.copy(selection = it) } ?: current
@@ -180,6 +182,48 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState) {
             }
             Suggestions(composer, view)
             if (attachments.isNotEmpty()) Attachments(attachments, sendPending || composer.busy, composer)
+            val placeholder = when {
+                view == null -> "Loading…"
+                !ready -> "Offline. Your draft is kept."
+                running -> followupHint(null, kind)
+                else -> "Ask anything, or use / for commands and @ to search files."
+            }
+            val attach = view != null && !sendPending && !composer.busy
+            val onPhotos = { photos.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) }
+            val onCamera = {
+                if (context.checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) startCamera()
+                else permission.launch(Manifest.permission.CAMERA)
+            }
+            val onFiles = { files.launch(arrayOf("image/*")) }
+            if (compact) {
+                Row(Modifier.fillMaxWidth().testTag("composer-actions"), verticalAlignment = Alignment.Bottom,
+                    horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                    if (view != null) CompactSettings(view, state, provider, attach, onPicker = { picker = it },
+                        onPhotos = onPhotos, onCamera = onCamera, onFiles = onFiles)
+                    BasicTextField(
+                        value = composer.field,
+                        onValueChange = { if (!sendPending) composer.edit(it) },
+                        modifier = Modifier.weight(1f).heightIn(min = 48.dp).focusRequester(fieldFocus).testTag(COMPOSER_FIELD),
+                        readOnly = sendPending,
+                        decorationBox = { innerTextField ->
+                            Box(Modifier.fillMaxWidth().padding(vertical = 12.dp), contentAlignment = Alignment.CenterStart) {
+                                // The steer/queue hint appears here only, never repeated below.
+                                if (text.isEmpty()) Text(placeholder, color = VerdeColors.Subtle, style = MaterialTheme.typography.bodyMedium,
+                                    maxLines = 2, overflow = TextOverflow.Ellipsis)
+                                innerTextField()
+                            }
+                        },
+                        cursorBrush = SolidColor(VerdeColors.Accent),
+                        textStyle = MaterialTheme.typography.bodyMedium.copy(color = VerdeColors.Text),
+                        minLines = 1, maxLines = 4,
+                        keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
+                    )
+                    inlineAction?.invoke()
+                    if (running) StopControl(state.stopping, state.canStop, model::stop, Modifier.testTag(COMPOSER_STOP))
+                    SendControl(label = if (sendPending || composer.busy) "Sending…" else sendLabel(text, running, kind),
+                        enabled = canSubmit, onClick = composer::submit, modifier = Modifier.testTag(COMPOSER_SEND))
+                }
+            } else {
             Box(Modifier.fillMaxWidth().height(24.dp).testTag("composer-resize")
                 .semantics {
                     contentDescription = "Drag to resize the prompt box"
@@ -210,12 +254,7 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState) {
                 readOnly = sendPending,
                 decorationBox = { innerTextField ->
                     Box(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
-                        if (text.isEmpty()) Text(when {
-                            view == null -> "Loading…"
-                            !ready -> "Offline. Your draft is kept."
-                            running -> followupHint(null, kind)
-                            else -> "Ask anything, or use / for commands and @ to search files."
-                        }, color = VerdeColors.Subtle, style = MaterialTheme.typography.bodyLarge,
+                        if (text.isEmpty()) Text(placeholder, color = VerdeColors.Subtle, style = MaterialTheme.typography.bodyLarge,
                             maxLines = 3, overflow = TextOverflow.Ellipsis)
                         innerTextField()
                     }
@@ -232,13 +271,7 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState) {
             Row(Modifier.fillMaxWidth().testTag("composer-actions"),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                AttachButton(enabled = view != null && !sendPending && !composer.busy,
-                    onPhotos = { photos.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) },
-                    onCamera = {
-                        if (context.checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) startCamera()
-                        else permission.launch(Manifest.permission.CAMERA)
-                    },
-                    onFiles = { files.launch(arrayOf("image/*")) })
+                AttachButton(enabled = attach, onPhotos = onPhotos, onCamera = onCamera, onFiles = onFiles)
                 Spacer(Modifier.weight(1f))
                 if (running) {
                     StopControl(state.stopping, state.canStop, model::stop, Modifier.testTag(COMPOSER_STOP))
@@ -249,6 +282,7 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState) {
             if (running && view?.followup == null) Text(followupHint(null, kind),
                 color = VerdeColors.Subtle, style = MaterialTheme.typography.bodySmall,
                 modifier = Modifier.testTag("composer-action-hint"))
+            }
         }
     }
 
@@ -257,6 +291,53 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState) {
         PickerSheet(open, view, provider, onDismiss = { picker = null }) { id -> picker = null; composer.select(open, id) }
     }
     view?.shell_confirmation?.let { ShellSheet(it, composer) }
+}
+
+/** The compact composer's settings chip label: model, then effort ("Haiku 5.5 · Low"). */
+internal fun compactSettingsLabel(models: List<ChatChoice>, efforts: List<ChatChoice>, selection: ChatSelection): String {
+    val model = composerChoiceLabel(models, selection.model ?: models.firstOrNull()?.id) ?: "Model"
+    if (efforts.isEmpty()) return model
+    return "$model \u00b7 ${composerChoiceLabel(efforts, selection.effort) ?: "Default"}"
+}
+
+internal const val COMPOSER_SETTINGS = "composer-settings"
+
+/** One chip for model + effort; its menu holds every picker plus attachments (compact composer). */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun CompactSettings(view: ChatComposerView, state: TranscriptState, provider: String?, attach: Boolean,
+    onPicker: (ComposerPicker) -> Unit, onPhotos: () -> Unit, onCamera: () -> Unit, onFiles: () -> Unit) {
+    val c = view.catalogs
+    val s = view.selection
+    val fresh = state.thread?.rows?.isEmpty() == true && state.turn == null
+    val label = compactSettingsLabel(c.models, c.efforts, s)
+    var menu by remember { mutableStateOf(false) }
+    Box {
+        Surface(onClick = { menu = true }, shape = RoundedCornerShape(12.dp), color = VerdeColors.PanelAlt,
+            modifier = Modifier.widthIn(max = 136.dp).testTag(COMPOSER_SETTINGS)
+                .semantics { contentDescription = "Model and options: $label. Change" }) {
+            Row(Modifier.padding(horizontal = 8.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                ProviderGlyph(provider, Modifier.size(14.dp))
+                Text(label, style = MaterialTheme.typography.labelSmall, color = VerdeColors.Muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+        }
+        DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+            val pickers = buildList {
+                if (fresh) add("Provider: ${PROVIDERS.find { it.first == provider }?.second ?: provider ?: "Provider"}" to ComposerPicker.Provider)
+                add("Model: ${composerChoiceLabel(c.models, s.model ?: c.models.firstOrNull()?.id) ?: "Model"}" to ComposerPicker.Model)
+                if (c.efforts.isNotEmpty()) add("Effort: ${composerChoiceLabel(c.efforts, s.effort) ?: "Default"}" to ComposerPicker.Effort)
+                if (c.speeds.size > 1) add("Speed: ${composerChoiceLabel(c.speeds, s.speed ?: "off") ?: "Standard"}" to ComposerPicker.Speed)
+                if (c.access.isNotEmpty()) add("Access: ${composerChoiceLabel(c.access, s.access) ?: "Access"}" to ComposerPicker.Access)
+            }
+            pickers.forEach { (text, picker) -> DropdownMenuItem(text = { Text(text) }, onClick = { menu = false; onPicker(picker) }) }
+            HorizontalDivider()
+            DropdownMenuItem(text = { Text("Attach photos") }, enabled = attach, onClick = { menu = false; onPhotos() },
+                modifier = Modifier.testTag(COMPOSER_ATTACH))
+            DropdownMenuItem(text = { Text("Take a photo") }, enabled = attach, onClick = { menu = false; onCamera() })
+            DropdownMenuItem(text = { Text("Image files") }, enabled = attach, onClick = { menu = false; onFiles() })
+        }
+    }
 }
 
 @Composable
