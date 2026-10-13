@@ -35,6 +35,7 @@ const connect_store = @import("../daemon/connect_store.zig");
 const chat_links = @import("../daemon/chat_links.zig");
 const companions = @import("../daemon/companions.zig");
 const voice = @import("../daemon/voice.zig");
+const attachment_store = @import("../daemon/attachment_store.zig");
 const companion_roster = @import("../state/companion_roster.zig");
 const browser_history = @import("../daemon/browser_history.zig");
 const daemon_store = @import("../daemon/store.zig");
@@ -2970,6 +2971,7 @@ pub const Daemon = struct {
         if (!std.mem.startsWith(u8, method, "chat.links.") and !std.mem.startsWith(u8, method, "chat.tasks.") and
             !std.mem.startsWith(u8, method, "browser.history.") and
             !std.mem.startsWith(u8, method, "companion.") and
+            !std.mem.eql(u8, method, "chat.attachment.read") and
             !std.mem.startsWith(u8, method, "voice.") and
             !std.mem.eql(u8, method, "chat.turn.start") and
             !std.mem.eql(u8, method, "chat.turn.steer") and
@@ -3002,6 +3004,7 @@ pub const Daemon = struct {
         if (std.mem.startsWith(u8, method, "chat.links.") or std.mem.startsWith(u8, method, "chat.tasks.")) return try self.chatOrchestrationResponse(id_value, method, params);
         if (std.mem.startsWith(u8, method, "browser.history.")) return try browserHistoryResponse(self, id_value, method, params);
         if (std.mem.eql(u8, method, "companion.brain.switch")) return try companionBrainSwitchResponse(self, id_value, params);
+        if (std.mem.eql(u8, method, attachment_store.METHOD_READ)) return try chatAttachmentReadResponse(self, id_value, params);
         if (std.mem.startsWith(u8, method, "companion.roster.")) return try companionRosterResponse(self, id_value, method, params);
         if (std.mem.startsWith(u8, method, "voice.")) return try voiceResponse(self, id_value, method, params);
         if (std.mem.eql(u8, method, "chat.turn.start")) return try self.chatTurnStartResponse(id_value, params);
@@ -7539,6 +7542,13 @@ pub const Daemon = struct {
             claim.deinit(self.allocator);
         };
         const claimed_ptr: ?*const ClaimedAttachments = if (claimed_attachments) |*claim| claim else null;
+        // Staging is scratch space wiped at daemon start; keep claimed images
+        // so phones and the web can still preview them later.
+        if (claimed_ptr) |claim| {
+            for (claim.ids, 0..) |id, index| {
+                if (index < claim.image_paths.len) attachment_store.persistClaimed(self.allocator, self.pref_path, id, claim.image_paths[index]);
+            }
+        }
         const turn = try createChatTurnFromParams(self.allocator, params, route_ptr, claimed_ptr);
         errdefer turn.deinit(self.allocator);
         // Web and mobile clients may omit model_ref for fresh chats. Pin the
@@ -10263,6 +10273,7 @@ fn sessionizerServerReady(raw_context: *anyopaque) !void {
     // Staged chat attachments never survive a daemon generation: their IDs
     // live only in this process, so leftovers are unclaimable garbage.
     wipeStagedChatAttachmentDirectory(context.daemon);
+    attachment_store.prune(context.daemon.allocator, context.daemon.pref_path, nowMs());
     if (context.mcp_handler) |handler| {
         context.mcp_server = mcp_http.start(context.daemon.allocator, context.pref_path, handler) catch |err| {
             log.err("daemon MCP HTTP transport failed to start: {s}", .{@errorName(err)});
@@ -13291,6 +13302,8 @@ fn methodRunsUnlocked(method: []const u8) bool {
         // Companion roster is one small store row; it pins in_flight and
         // checks the drain flag itself.
         std.mem.startsWith(u8, method, "companion.") or
+        // Image reads are file I/O after one short store lookup.
+        std.mem.eql(u8, method, "chat.attachment.read") or
         // Voice session minting waits on a provider HTTPS call with no lock held.
         std.mem.startsWith(u8, method, "voice.") or
         std.mem.eql(u8, method, "chat.turn.start") or
@@ -14975,6 +14988,51 @@ fn voiceResponse(daemon: *Daemon, id_value: std.json.Value, method: []const u8, 
     });
     try s.endObject();
     return writer.toOwnedSlice();
+}
+
+/// `chat.attachment.read` {workspace_id, local_thread_id, message_id, index?,
+/// offset?, length?} → {mime, total_bytes, offset, data (base64)}. Serves only
+/// images a message in that thread actually carries.
+fn chatAttachmentReadResponse(daemon: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+    const allocator = daemon.allocator;
+    if (params != .object) return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "params must be an object");
+    const fields = params.object;
+    const workspace_id = jsonString(fields.get("workspace_id") orelse .null) orelse return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "workspace_id is required");
+    const thread_id = jsonString(fields.get("local_thread_id") orelse fields.get("thread_id") orelse .null) orelse return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "local_thread_id is required");
+    const message_id = jsonString(fields.get("message_id") orelse .null) orelse return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "message_id is required");
+    const index: usize = @intCast(@max(0, jsonI64(fields.get("index") orelse .null) orelse 0));
+    const offset: usize = @intCast(@max(0, jsonI64(fields.get("offset") orelse .null) orelse 0));
+    const length: usize = @intCast(@max(1, jsonI64(fields.get("length") orelse .null) orelse @as(i64, attachment_store.MAX_CHUNK_BYTES)));
+    lockDaemon(daemon);
+    const service = daemon.store_service;
+    if (service) |svc| _ = svc.in_flight.fetchAdd(1, .monotonic);
+    const pref_path = allocator.dupe(u8, daemon.pref_path) catch {
+        daemon.mutex.unlock();
+        if (service) |svc| _ = svc.in_flight.fetchSub(1, .monotonic);
+        return error.OutOfMemory;
+    };
+    daemon.mutex.unlock();
+    defer allocator.free(pref_path);
+    const svc = service orelse return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_STORE_UNAVAILABLE, "store is unavailable");
+    defer _ = svc.in_flight.fetchSub(1, .monotonic);
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const resolved = blk: {
+        lockStoreService(svc);
+        defer svc.mutex.unlock();
+        break :blk attachment_store.resolveForMessage(svc.store.conn, arena, pref_path, workspace_id, thread_id, message_id, index) catch
+            return try storeErrorResponse(allocator, id_value, error.StoreUnavailable);
+    } orelse return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_RESOURCE_NOT_FOUND, "image not found");
+    const chunk = attachment_store.readChunk(arena, resolved.path, offset, length) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidParams => return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "offset is past the end of the image"),
+        else => return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_RESOURCE_NOT_FOUND, "image is no longer available"),
+    };
+    const encoder = std.base64.standard.Encoder;
+    const encoded = try arena.alloc(u8, encoder.calcSize(chunk.data.len));
+    _ = encoder.encode(encoded, chunk.data);
+    return try okValueResponse(allocator, id_value, .{ .mime = resolved.mime, .total_bytes = chunk.total, .offset = offset, .data = encoded });
 }
 
 // ---- companion brain switch ---------------------------------------------------

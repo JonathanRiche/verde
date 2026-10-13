@@ -294,6 +294,8 @@ pub const PAIRED_RPC_METHODS = [_]PairedRpcMethod{
     .{ .method = "chat.thread.list", .scope_mask = CHAT_READ },
     .{ .method = "chat.message.list", .scope_mask = CHAT_READ },
     .{ .method = "chat.links.list", .scope_mask = CHAT_READ },
+    // Image previews: only images a message in the named thread carries.
+    .{ .method = "chat.attachment.read", .scope_mask = CHAT_READ },
     // The machine Companion roster: who the user's companions are, their
     // brains, standing orders, and which thread each one talks through.
     .{ .method = "companion.roster.get", .scope_mask = CHAT_READ },
