@@ -472,6 +472,7 @@ private struct CompactMessageRow: View {
 
     var body: some View {
         let delivery = deliveryLabel(row.delivery)
+        let voice = isVoiceAuthor(row.author)
         HStack(alignment: .bottom, spacing: 0) {
             if mine { Spacer(minLength: 56) }
             VStack(alignment: mine ? .trailing : .leading, spacing: 2) {
@@ -481,9 +482,18 @@ private struct CompactMessageRow: View {
                 }
                 if !shown.isEmpty {
                     if mine {
-                        Text(shown).font(VerdeTheme.ui(14)).textSelection(.enabled)
-                            .padding(.horizontal, 10).padding(.vertical, 8)
-                            .background(VerdeTheme.user, in: RoundedRectangle(cornerRadius: 12))
+                        HStack(alignment: .firstTextBaseline, spacing: 5) {
+                            if voice { Image(systemName: "mic.fill").font(.system(size: 10)).foregroundStyle(.secondary).accessibilityHidden(true) }
+                            Text(shown).font(VerdeTheme.ui(14)).textSelection(.enabled)
+                        }
+                        .padding(.horizontal, 10).padding(.vertical, 8)
+                        .background(VerdeTheme.user, in: RoundedRectangle(cornerRadius: 12))
+                    } else if voice {
+                        // A spoken reply from a live conversation: plain text with a small mic.
+                        HStack(alignment: .firstTextBaseline, spacing: 5) {
+                            Image(systemName: "mic.fill").font(.system(size: 10)).foregroundStyle(.secondary).accessibilityHidden(true)
+                            Text(shown).font(VerdeTheme.ui(14)).textSelection(.enabled)
+                        }
                     } else {
                         MarkdownText(text: streamTail(row), model: model)
                     }
@@ -496,7 +506,7 @@ private struct CompactMessageRow: View {
             .contextMenu { Button("Copy message") { UIPasteboard.general.string = shown } }
         }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel((mine ? "You: " : (row.author.isEmpty ? "Reply: " : row.author + ": ")) + shown)
+        .accessibilityLabel((mine ? (voice ? "You, by voice: " : "You: ") : (row.author.isEmpty ? "Reply: " : row.author + ": ")) + shown)
         .accessibilityIdentifier("message-row")
     }
 }
@@ -713,8 +723,24 @@ private struct ThinkCard: View {
 private struct NoticeRow: View {
     let row: ChatRow
     let model: TranscriptModel
+    @Environment(\.compactChat) private var compact
 
     var body: some View {
+        if compact && isVoiceAuthor(row.author) {
+            // Live conversation markers ("🎙 Live voice · …", "→ Asked Moss: …") as one quiet line.
+            HStack(alignment: .firstTextBaseline, spacing: 5) {
+                Image(systemName: "waveform").font(.system(size: 10)).foregroundStyle(VerdeTheme.subtle).accessibilityHidden(true)
+                Text(row.body).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted).lineLimit(3)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 2)
+            .accessibilityElement(children: .combine)
+        } else {
+            regular
+        }
+    }
+
+    private var regular: some View {
         VStack(alignment: .leading, spacing: 2) {
             if !row.author.isEmpty { Text(row.author) .font(VerdeTheme.ui(10)).foregroundStyle(.secondary) }
             MarkdownText(text: row.body, model: model)

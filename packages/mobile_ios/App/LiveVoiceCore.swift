@@ -159,6 +159,7 @@ enum LiveVoiceIntent {
     static let refresh = "voice_providers_refresh"
     static let configure = "voice_provider_configure"
     static let session = "voice_session_create"
+    static let transcriptSave = "companion_transcript_save"
 
     static func refreshFields(intentID: String) -> [String: JSONValue] { ["intent_id": .string(intentID)] }
 
@@ -171,6 +172,17 @@ enum LiveVoiceIntent {
         if let voice, !voice.isEmpty { fields["voice"] = .string(voice) }
         if let makeDefault { fields["make_default"] = .bool(makeDefault) }
         return fields
+    }
+
+    /// One `companion_transcript_save` event (callers batch to `LiveTranscript.batchLimit`).
+    static func transcriptFields(intentID: String, workspaceID: String, threadID: String, sessionID: String,
+                                 lines: [LiveTranscriptLine]) -> [String: JSONValue] {
+        ["intent_id": .string(intentID), "workspace_id": .string(workspaceID), "thread_id": .string(threadID),
+         "session_id": .string(sessionID),
+         "messages": .array(lines.map { line -> JSONValue in
+             JSONValue.object(["key": .string(line.key), "role": .string(line.role), "author": .string(line.author),
+                      "body": .string(line.body), "created_at_ms": .integer(line.createdAtMs)])
+         })]
     }
 
     static func sessionFields(intentID: String, provider: String?, model: String?, voice: String?, companionID: String?) -> [String: JSONValue] {
@@ -246,6 +258,14 @@ struct LiveVoiceClient {
             return code == "voice_key_rejected" ? liveVoiceMessage(code) : "The desktop couldn't save this (\(code))."
         } catch LiveVoiceError.failed(let code) { return liveVoiceMessage(code) }
         catch { return liveVoiceMessage(nil) }
+    }
+
+    /// Saves live conversation lines into the companion's chat; returns whether the desktop took them.
+    func saveTranscript(workspaceID: String, threadID: String, sessionID: String, lines: [LiveTranscriptLine]) async -> Bool {
+        let fields = LiveVoiceIntent.transcriptFields(intentID: UUID().uuidString, workspaceID: workspaceID, threadID: threadID,
+                                                      sessionID: sessionID, lines: lines)
+        guard let sent = try? await send(LiveVoiceIntent.transcriptSave, fields) else { return false }
+        return (try? await settle(sent.0, sent.1)) == .some(nil)
     }
 
     /// Mints a session (provider token, URL, instructions and tools) on the desktop.

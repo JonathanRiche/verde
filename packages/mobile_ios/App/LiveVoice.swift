@@ -74,6 +74,11 @@ final class LiveVoice {
     @ObservationIgnored private var reconnects = 0
     @ObservationIgnored private var lastActivity = Date()
     @ObservationIgnored private var observers: [NSObjectProtocol] = []
+    /// The conversation as text, saved into the companion chat (never audio).
+    @ObservationIgnored private var record: LiveTranscript?
+    @ObservationIgnored private var lastSaved = Date()
+    @ObservationIgnored private var saving = false
+    static let saveInterval: TimeInterval = 120
 
     init(companion: CompanionModel, speech: CompanionVoice) {
         self.companion = companion
@@ -101,6 +106,8 @@ final class LiveVoice {
         phase = .connecting
         userCaption = ""; assistantCaption = ""; notice = nil; setMuted(false)
         reconnects = 0
+        record = nil
+        lastSaved = Date()
         generation += 1
         let current = generation
         guard await AVAudioApplication.requestRecordPermission() else {
@@ -119,13 +126,50 @@ final class LiveVoice {
 
     /// Ends the conversation (Stop, background, interruption or two minutes of silence).
     func end() {
+        flushTranscript(final: true)
         teardown()
         phase = .idle
     }
 
     private func fail(_ message: String) {
+        flushTranscript(final: true)
         teardown()
         phase = .failed(message)
+    }
+
+    // MARK: Transcript
+
+    private var now: Int64 { Int64(Date().timeIntervalSince1970 * 1000) }
+
+    private func note(_ text: String) { record?.system(text, at: now) }
+
+    /// Saves finished, unsaved lines into the companion chat. During the session this waits while a
+    /// companion turn is streaming there; at the end everything goes. Saves are idempotent by key.
+    private func flushTranscript(final: Bool) {
+        guard var current = record else { return }
+        if final {
+            current.finish()
+            record = current
+        } else if companion.conversationBusy || saving {
+            return
+        }
+        let lines = current.unsaved
+        guard !lines.isEmpty else { return }
+        lastSaved = Date()
+        saving = true
+        let sessionID = current.sessionID
+        let companion = self.companion
+        Task { [weak self] in
+            if let conversation = await companion.ensureConversation() {
+                let client = LiveVoiceClient(browse: companion.browse)
+                for batch in transcriptBatches(lines) {
+                    guard await client.saveTranscript(workspaceID: conversation.workspace, threadID: conversation.thread,
+                                                      sessionID: sessionID, lines: batch) else { break }
+                    if let key = batch.last?.key, self?.record?.sessionID == sessionID { self?.record?.markSaved(through: key) }
+                }
+            }
+            self?.saving = false
+        }
     }
 
     private func teardown() {
@@ -155,6 +199,10 @@ final class LiveVoice {
         let providerLabel = LiveVoiceClient(browse: companion.browse).view?.providers.first { $0.id == session.provider }?.label
             ?? session.provider.capitalized
         label = [providerLabel, session.voice].filter { !$0.isEmpty }.joined(separator: " · ")
+        if record == nil {
+            record = LiveTranscript(sessionID: UUID().uuidString, companionName: companion.active?.name ?? "Companion",
+                                    providerLabel: providerLabel)
+        }
         uplink.attach(socket, proto, ready: !proto.waitsForSetup)
         send(proto.setup(instructions: session.instructions, model: session.model, voice: session.voice, tools: session.tools))
         if audio == nil {
@@ -198,6 +246,7 @@ final class LiveVoice {
                 try? await Task.sleep(for: .seconds(5))
                 guard let self, current == self.generation else { return }
                 if Date().timeIntervalSince(self.lastActivity) > Self.silenceLimit { self.end(); return }
+                if Date().timeIntervalSince(self.lastSaved) > Self.saveInterval { self.flushTranscript(final: false) }
             }
         }
     }
@@ -240,14 +289,25 @@ final class LiveVoice {
             lastActivity = Date()
         case .assistantText(let delta):
             assistantCaption = String((assistantCaption + delta).suffix(Self.captionLimit))
+            record?.assistant(delta, at: now)
             lastActivity = Date()
         case .userText(let text):
-            userCaption = String(text.suffix(Self.captionLimit))
+            record?.user(text, final: true, cumulative: true, at: now)
+            userCaption = String((record?.currentUserText ?? text).suffix(Self.captionLimit))
+            lastActivity = Date()
+        case .userTextPartial(let text, let cumulative):
+            record?.user(text, final: false, cumulative: cumulative, at: now)
+            userCaption = String((record?.currentUserText ?? text).suffix(Self.captionLimit))
             lastActivity = Date()
         case .speechStarted, .interrupted:
             audio?.flush()
             outputLevel = 0
-            if event == .speechStarted { assistantCaption = "" }
+            if event == .speechStarted {
+                assistantCaption = ""
+                record?.speechStarted()
+            } else {
+                record?.endResponse()
+            }
             lastActivity = Date()
         case .toolCall(let id, let name, let arguments):
             let task = Task { [weak self] in
@@ -259,6 +319,7 @@ final class LiveVoice {
             watchers.append(task)
         case .turnComplete:
             outputLevel = 0
+            record?.endResponse(newTurn: proto?.kind == .geminiLive)
         case .goAway:
             Task { [weak self] in await self?.reconnect(current) }
         case .error(let message):
@@ -283,6 +344,7 @@ final class LiveVoice {
             let model = companionTranscript(conversation)
             let baseline = lastAssistant(model)?.id
             model.input.ask(request, voice: true)
+            note("→ Asked \(companion.active?.name ?? "the companion"): \(request)")
             watchers.append(Task { [weak self] in await self?.relayReply(model, after: baseline, generation: current) })
             return jsonString(["accepted": true])
         case LiveToolName.companionStatus:
@@ -300,6 +362,7 @@ final class LiveVoice {
                 model.setVisible(true)
                 let sent = await model.decideFromNotification(.init(decision: approve ? .approve : .deny, turnID: nil), wait: .seconds(10))
                 model.setVisible(false)
+                if sent { note((approve ? "✓ Approved " : "✕ Denied ") + item.title) }
                 return sent ? jsonString(["ok": true, "chat": item.title, "decision": approve ? "approved" : "denied"]) : toolError("not_pending")
             }
         default:
@@ -332,6 +395,7 @@ final class LiveVoice {
             let elapsed = ContinuousClock.now - start
             if !running, let reply = lastAssistant(model), reply.id != baseline, started || elapsed > .seconds(3) {
                 if let proto { proto.inject(companionUpdateText(reply.body)).forEach(send) }
+                note("← \(companion.active?.name ?? "Companion") replied")
                 return
             }
             // The turn never started (e.g. the send was refused).

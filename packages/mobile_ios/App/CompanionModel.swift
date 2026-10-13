@@ -81,6 +81,9 @@ final class CompanionModel {
     }
     private var threadStatus: String? { threadSummary?.status }
 
+    /// A companion turn is running in its chat (live transcript saves wait for it).
+    var conversationBusy: Bool { threadStatus.map(activeTurn) ?? false }
+
     /// The bubble badge: everything in "Needs you" plus the companion's own pending approval.
     var badgeCount: Int { companionBadgeCount(needsYou: needsYou.count, ownApproval: threadStatus == "waiting_approval") }
 
