@@ -29,6 +29,17 @@ const MAX_REF_BYTES = 160;
 
 /// One companion. `character` is `sprout`, `moss` or `vireo`; empty strings
 /// mean "not set" (no thread yet, new-chat default brain, no orders).
+/// A companion's earlier conversation (newest first in `history`); the thread stays in the home workspace.
+pub const PastConversation = struct {
+    thread_id: []const u8,
+    title: []const u8 = "",
+    provider: []const u8 = "",
+    model: []const u8 = "",
+    ended_at_ms: i64 = 0,
+};
+pub const MAX_HISTORY = 12;
+const MAX_TITLE_BYTES = 256;
+
 pub const Companion = struct {
     id: []const u8,
     name: []const u8,
@@ -38,6 +49,18 @@ pub const Companion = struct {
     provider: []const u8 = "",
     model: []const u8 = "",
     orders: []const u8 = "",
+    history: []const PastConversation = &.{},
+};
+
+/// The latest `companion_brain_switch`: `pending` until the daemon answers, then `briefing`
+/// (the outgoing brain writes a handoff brief) or `switched`, or `failed` with `error_code`.
+/// `from`/`to` are the daemon's brain labels ("Claude · opus").
+pub const BrainSwitch = struct {
+    intent_id: []const u8,
+    status: []const u8 = "pending",
+    error_code: ?[]const u8 = null,
+    from: []const u8 = "",
+    to: []const u8 = "",
 };
 pub const Roster = struct {
     version: u32 = 1,
@@ -76,6 +99,7 @@ pub const View = struct {
     revision: []const u8 = "0",
     roster: Roster,
     crew: Crew,
+    brain_switch: ?BrainSwitch = null,
     @"error": ?h.LocalError = null,
 };
 
@@ -109,9 +133,13 @@ pub const State = struct {
     put_roster: ?Roster = null,
     crew_id: ?u64 = null,
     crew_intent: []const u8 = "",
+    brain_id: ?u64 = null,
+    /// The switch's companion and target provider, to notice when it has taken effect.
+    brain_companion: []const u8 = "",
+    brain_provider: []const u8 = "",
 };
 
-const tags = [_][]const u8{ "companion_refresh", "companion_save", "companion_crew_refresh", "companion_transcript_save" };
+const tags = [_][]const u8{ "companion_refresh", "companion_save", "companion_crew_refresh", "companion_transcript_save", "companion_brain_switch" };
 const read: rpc.Options = .{ .mutation = false, .intent_id = "@companion" };
 
 pub fn owns(tag: []const u8) bool {
@@ -124,7 +152,9 @@ pub fn receiptFields(context: []const u8) ?[]const u8 {
     if (eq(context, "companion_save")) return "roster expected_revision";
     if (eq(context, "companion_crew_refresh")) return "workspace_id thread_id";
     if (eq(context, "roster")) return "version active_id companions";
-    if (eq(context, "companions")) return "id name character home_workspace_id thread_id provider model orders";
+    if (eq(context, "companions")) return "id name character home_workspace_id thread_id provider model orders history";
+    if (eq(context, "history")) return "thread_id title provider model ended_at_ms";
+    if (eq(context, "companion_brain_switch")) return "companion_id provider model brief";
     if (eq(context, "companion_transcript_save")) return "workspace_id thread_id session_id messages";
     if (eq(context, "messages")) return "key role author body created_at_ms";
     return null;
@@ -137,8 +167,12 @@ pub fn validate(a: A, tag: []const u8, event: V) E!void {
         _ = try h.decode(struct { workspace_id: []const u8, thread_id: []const u8 }, a, event);
     } else if (eq(tag, "companion_transcript_save")) {
         _ = try h.decode(TranscriptSave, a, event);
+    } else if (eq(tag, "companion_brain_switch")) {
+        _ = try h.decode(BrainSwitchRequest, a, event);
     }
 }
+
+const BrainSwitchRequest = struct { companion_id: ?[]const u8 = null, provider: []const u8, model: ?[]const u8 = null, brief: ?bool = null };
 
 const TranscriptSave = struct { workspace_id: []const u8, thread_id: []const u8, session_id: []const u8, messages: []const TranscriptMessage };
 
@@ -154,6 +188,7 @@ pub fn intent(tx: *h.Transaction, tag: []const u8, event: V) E!void {
         return requestRoster(tx, id);
     }
     if (eq(tag, "companion_transcript_save")) return transcriptSave(tx, id, event);
+    if (eq(tag, "companion_brain_switch")) return brainSwitch(tx, id, event);
     if (eq(tag, "companion_crew_refresh")) {
         if (!scoped(&tx.state, "chat:read")) return receipt(tx, id, "failed", failure("insufficient_scope", "This phone can't read chats on this host."));
         const r = try h.decode(struct { workspace_id: []const u8, thread_id: []const u8 }, tx.allocator(), event);
@@ -208,8 +243,11 @@ pub fn pump(tx: *h.Transaction) E!void {
             try crewListed(tx, result);
         } else if (s.saves.len > 0 and s.saves[0].rpc_id != null and s.saves[0].rpc_id.? == result.id) {
             try transcriptStep(tx, result);
+        } else if (s.brain_id != null and s.brain_id.? == result.id) {
+            brainSwitched(tx, result);
         }
     }
+    settleBrainSwitch(tx);
 }
 
 /// Signing out or forgetting the host drops the roster, crew and queued transcript saves.
@@ -233,6 +271,75 @@ pub fn scopes(a: A, before: *const h.State, after: *const h.State, host_changed:
     _ = a;
     if (host_changed or !clone.equal(View, before.companion.view, after.companion.view)) return &.{"companion"};
     return &.{};
+}
+
+/// Asks the daemon to move a companion to another brain on the same conversation.
+fn brainSwitch(tx: *h.Transaction, id: []const u8, event: V) E!void {
+    const s = &tx.state.companion;
+    const a = tx.allocator();
+    if (!scoped(&tx.state, "chat:write")) return receipt(tx, id, "failed", failure("insufficient_scope", "This phone can't change companions on this host."));
+    const r = try h.decode(BrainSwitchRequest, a, event);
+    if (r.provider.len == 0 or r.provider.len > 24) return receipt(tx, id, "failed", failure("invalid_provider", "Choose a provider."));
+    if (r.model) |model| if (model.len > MAX_REF_BYTES) return receipt(tx, id, "failed", failure("invalid_model", "That model name is too long."));
+    if (s.brain_id != null) return receipt(tx, id, "failed", failure("busy", "Still switching brains."));
+    const active = activeOf(s.view.roster);
+    const companion_id = r.companion_id orelse if (active) |c| c.id else "";
+    var params: std.json.ObjectMap = .empty;
+    if (r.companion_id) |value| try params.put(a, "companion_id", .{ .string = value });
+    try params.put(a, "provider", .{ .string = r.provider });
+    if (r.model) |model| try params.put(a, "model", .{ .string = model });
+    if (r.brief) |brief| try params.put(a, "brief", .{ .bool = brief });
+    s.view.brain_switch = .{ .intent_id = id };
+    s.brain_companion = companion_id;
+    s.brain_provider = r.provider;
+    s.brain_id = try rpc.request(tx, "companion.brain.switch", V{ .object = params }, .{ .intent_id = "@companion" });
+    tx.changed = true;
+    receipt(tx, id, "pending", null);
+}
+
+fn brainSwitched(tx: *h.Transaction, result: rpc.Result) void {
+    const s = &tx.state.companion;
+    s.brain_id = null;
+    const current = s.view.brain_switch orelse return;
+    if (result.@"error") |e| {
+        const err = named(e);
+        s.view.brain_switch = .{ .intent_id = current.intent_id, .status = "failed", .error_code = err.code };
+        return receipt(tx, current.intent_id, "failed", err);
+    }
+    const v = result.value orelse .null;
+    const status = p.s(v, "status");
+    s.view.brain_switch = .{ .intent_id = current.intent_id, .status = if (eq(status, "briefing")) "briefing" else "switched", .from = p.s(v, "from"), .to = p.s(v, "to") };
+    receipt(tx, current.intent_id, "succeeded", null);
+}
+
+/// Clears a finished switch once the open companion thread runs on the new provider.
+fn settleBrainSwitch(tx: *h.Transaction) void {
+    const s = &tx.state.companion;
+    const current = s.view.brain_switch orelse return;
+    if (!(eq(current.status, "briefing") or eq(current.status, "switched"))) return;
+    for (s.view.roster.companions) |c| if (eq(c.id, s.brain_companion) and c.thread_id.len > 0) {
+        for (tx.state.chat.threads) |t| if (eq(t.id, c.thread_id) and eq(t.workspace_id, c.home_workspace_id) and eq(t.metadata.provider, s.brain_provider)) {
+            return clearBrain(tx);
+        };
+    };
+}
+
+/// After a roster read: a finished switch whose companion now has the new provider is done.
+fn settleFromRoster(tx: *h.Transaction) void {
+    const s = &tx.state.companion;
+    const current = s.view.brain_switch orelse return;
+    if (!(eq(current.status, "briefing") or eq(current.status, "switched"))) return;
+    for (s.view.roster.companions) |c| if (eq(c.id, s.brain_companion) and eq(c.provider, s.brain_provider)) return clearBrain(tx);
+}
+
+fn clearBrain(tx: *h.Transaction) void {
+    tx.state.companion.view.brain_switch = null;
+    tx.changed = true;
+}
+
+fn activeOf(roster: Roster) ?Companion {
+    for (roster.companions) |c| if (eq(c.id, roster.active_id)) return c;
+    return if (roster.companions.len > 0) roster.companions[0] else null;
 }
 
 /// Validates, bounds and queues a live voice transcript for `chat.message.append`.
@@ -369,6 +476,7 @@ fn rosterRead(tx: *h.Transaction, result: rpc.Result) E!void {
     s.view.loaded = true;
     s.view.supported = true;
     s.view.@"error" = null;
+    settleFromRoster(tx);
     receipt(tx, id, "succeeded", null);
 }
 
@@ -444,9 +552,21 @@ pub fn parseRoster(a: A, v: V) ?Roster {
             .provider = p.s(row, "provider"),
             .model = p.s(row, "model"),
             .orders = p.s(row, "orders"),
+            .history = parseHistory(a, p.get(row, "history")) catch return null,
         }) catch return null;
     }
     out.companions = list;
+    return out;
+}
+
+fn parseHistory(a: A, v: V) E![]const PastConversation {
+    var out: []const PastConversation = &.{};
+    for (p.rows(v)) |row| {
+        if (out.len >= MAX_HISTORY) break;
+        const thread = p.s(row, "thread_id");
+        if (thread.len == 0) continue;
+        try add(PastConversation, a, &out, .{ .thread_id = thread, .title = p.s(row, "title"), .provider = p.s(row, "provider"), .model = p.s(row, "model"), .ended_at_ms = p.num(p.get(row, "ended_at_ms")) orelse 0 });
+    }
     return out;
 }
 
@@ -462,6 +582,11 @@ fn invalid(roster: Roster) ?h.LocalError {
         if (c.home_workspace_id.len > MAX_REF_BYTES or c.thread_id.len > MAX_REF_BYTES or c.provider.len > 24 or c.model.len > MAX_REF_BYTES)
             return failure("invalid_companion", "This companion can't be saved.");
         for (roster.companions[0..i]) |other| if (eq(other.id, c.id)) return failure("invalid_companion", "Two companions share an id.");
+        if (c.history.len > MAX_HISTORY) return failure("invalid_history", "Keep at most 12 earlier conversations.");
+        for (c.history) |past| {
+            if (past.thread_id.len == 0 or past.thread_id.len > MAX_REF_BYTES or past.title.len > MAX_TITLE_BYTES or past.provider.len > 24 or past.model.len > MAX_REF_BYTES)
+                return failure("invalid_history", "An earlier conversation can't be saved.");
+        }
     }
     return null;
 }

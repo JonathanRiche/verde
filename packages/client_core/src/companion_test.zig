@@ -293,3 +293,64 @@ test "transcript save rejects bad input locally and a failed append moves on to 
     const denied = try r.intent("companion_transcript_save", .{ .workspace_id = "ws", .thread_id = "t1", .session_id = "s", .messages = [_]Line{.{ .key = "0", .role = "user", .body = "hi" }} });
     try eql("insufficient_scope", (try r.receipt(denied)).@"error".?.code);
 }
+
+const history_roster =
+    \\{"revision":4,"roster":{"active_id":"a","companions":[{"id":"a","name":"Moss","character":"moss","home_workspace_id":"ws","thread_id":"t2","provider":"claude","model":"opus",
+    \\ "history":[{"thread_id":"t1","title":"Fix CI","provider":"codex","model":"gpt","ended_at_ms":7},{"title":"no thread"}]}]}}
+;
+
+test "history round-trips through read, validation and save" {
+    var f = try Fixture.init(all_scopes);
+    defer f.deinit();
+    _ = try f.intent("companion_refresh", .{});
+    _ = try f.reply("companion.roster.get", history_roster);
+    const entry = p.rows(p.get(p.get(try f.view(), "roster"), "companions"))[0];
+    const history = p.rows(p.get(entry, "history"));
+    try expect(history.len == 1);
+    try eql("Fix CI", p.s(history[0], "title"));
+    try expect(p.num(p.get(history[0], "ended_at_ms")).? == 7);
+    const past = [_]companion.PastConversation{ .{ .thread_id = "t2", .title = "Now", .provider = "claude", .ended_at_ms = 9 }, .{ .thread_id = "t1", .title = "Fix CI" } };
+    const roster = companion.Roster{ .active_id = "a", .companions = &.{.{ .id = "a", .name = "Moss", .history = &past }} };
+    _ = try f.intent("companion_save", .{ .roster = roster, .expected_revision = "4" });
+    const sent = p.rows(p.get(p.rows(p.get(p.get(try f.params("companion.roster.put"), "roster"), "companions"))[0], "history"));
+    try expect(sent.len == 2);
+    try eql("t2", p.s(sent[0], "thread_id"));
+    _ = try f.reply("companion.roster.put", "{\"revision\":5}");
+    var many: [companion.MAX_HISTORY + 1]companion.PastConversation = undefined;
+    for (&many) |*m| m.* = .{ .thread_id = "x" };
+    const bad = try f.intent("companion_save", .{ .roster = companion.Roster{ .companions = &.{.{ .id = "a", .name = "Moss", .history = &many }} }, .expected_revision = "5" });
+    try eql("invalid_history", (try f.receipt(bad)).@"error".?.code);
+}
+
+test "brain switch reports briefing, then clears when the roster shows the new provider" {
+    var f = try Fixture.init(all_scopes);
+    defer f.deinit();
+    _ = try f.intent("companion_refresh", .{});
+    _ = try f.reply("companion.roster.get", history_roster);
+    const id = try f.intent("companion_brain_switch", .{ .provider = "codex", .model = "gpt-5", .brief = true });
+    var sw = p.get(try f.view(), "brain_switch");
+    try eql("pending", p.s(sw, "status"));
+    const sent = try f.params("companion.brain.switch");
+    try eql("codex", p.s(sent, "provider"));
+    try expect(p.yes(p.get(sent, "brief")));
+    try expect(p.get(sent, "companion_id") == .null);
+    const busy = try f.intent("companion_brain_switch", .{ .provider = "pi" });
+    try eql("busy", (try f.receipt(busy)).@"error".?.code);
+    _ = try f.reply("companion.brain.switch", "{\"status\":\"briefing\",\"briefing\":true,\"from\":\"Claude \\u00b7 opus\",\"to\":\"Codex \\u00b7 gpt-5\"}");
+    try eql("succeeded", (try f.receipt(id)).state);
+    sw = p.get(try f.view(), "brain_switch");
+    try eql("briefing", p.s(sw, "status"));
+    try eql("Codex · gpt-5", p.s(sw, "to"));
+    // Still the old brain on the next read: keep showing the handoff.
+    _ = try f.intent("companion_refresh", .{});
+    _ = try f.reply("companion.roster.get", history_roster);
+    try expect(p.get(try f.view(), "brain_switch") != .null);
+    _ = try f.intent("companion_refresh", .{});
+    _ = try f.reply("companion.roster.get", "{\"revision\":6,\"roster\":{\"active_id\":\"a\",\"companions\":[{\"id\":\"a\",\"name\":\"Moss\",\"thread_id\":\"t2\",\"home_workspace_id\":\"ws\",\"provider\":\"codex\",\"model\":\"gpt-5\"}]}}");
+    try expect(p.get(try f.view(), "brain_switch") == .null);
+
+    const failed = try f.intent("companion_brain_switch", .{ .provider = "claude" });
+    _ = try f.reject("companion.brain.switch", "companion_busy");
+    try eql("failed", (try f.receipt(failed)).state);
+    try eql("companion_busy", p.s(p.get(try f.view(), "brain_switch"), "error_code"));
+}

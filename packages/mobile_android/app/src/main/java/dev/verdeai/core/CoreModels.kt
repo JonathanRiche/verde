@@ -1297,6 +1297,19 @@ data class EventCompanionTranscriptSave(
 ) : Event()
 
 @Serializable
+@SerialName("companion_brain_switch")
+data class EventCompanionBrainSwitch(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `companion_id`: String? = null,
+    val `provider`: String,
+    val `model`: String? = null,
+    val `brief`: Boolean? = null,
+) : Event()
+
+@Serializable
 @SerialName("companion_crew_refresh")
 data class EventCompanionCrewRefresh(
     val `api_version`: Long = 1,
@@ -2370,6 +2383,15 @@ data class ExplorerFileQuery(
 )
 
 @Serializable
+data class CompanionPastConversation(
+    val `thread_id`: String,
+    val `title`: String = "",
+    val `provider`: String = "",
+    val `model`: String = "",
+    val `ended_at_ms`: Long = 0,
+)
+
+@Serializable
 data class CompanionEntry(
     val `id`: String,
     val `name`: String,
@@ -2379,6 +2401,16 @@ data class CompanionEntry(
     val `provider`: String = "",
     val `model`: String = "",
     val `orders`: String = "",
+    val `history`: List<CompanionPastConversation> = emptyList(),
+)
+
+@Serializable
+data class CompanionBrainSwitch(
+    val `intent_id`: String,
+    val `status`: String = "pending",
+    val `error_code`: String? = null,
+    val `from`: String = "",
+    val `to`: String = "",
 )
 
 @Serializable
@@ -2422,6 +2454,7 @@ data class CompanionView(
     val `revision`: String = "0",
     val `roster`: CompanionRoster,
     val `crew`: CompanionCrew,
+    val `brain_switch`: CompanionBrainSwitch? = null,
     val `error`: LocalError? = null,
 )
 

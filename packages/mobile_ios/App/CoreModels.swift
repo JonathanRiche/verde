@@ -1523,6 +1523,7 @@ enum Event: Codable {
     case `voice_provider_configure`(EventVoiceProviderConfigure)
     case `voice_session_create`(EventVoiceSessionCreate)
     case `companion_transcript_save`(EventCompanionTranscriptSave)
+    case `companion_brain_switch`(EventCompanionBrainSwitch)
     case `companion_crew_refresh`(EventCompanionCrewRefresh)
     case `push_received`(EventPushReceived)
     case `terminal_input`(EventTerminalInput)
@@ -1608,6 +1609,7 @@ enum Event: Codable {
         case "voice_provider_configure": self = .`voice_provider_configure`(try EventVoiceProviderConfigure(from: decoder))
         case "voice_session_create": self = .`voice_session_create`(try EventVoiceSessionCreate(from: decoder))
         case "companion_transcript_save": self = .`companion_transcript_save`(try EventCompanionTranscriptSave(from: decoder))
+        case "companion_brain_switch": self = .`companion_brain_switch`(try EventCompanionBrainSwitch(from: decoder))
         case "companion_crew_refresh": self = .`companion_crew_refresh`(try EventCompanionCrewRefresh(from: decoder))
         case "push_received": self = .`push_received`(try EventPushReceived(from: decoder))
         case "terminal_input": self = .`terminal_input`(try EventTerminalInput(from: decoder))
@@ -1694,6 +1696,7 @@ enum Event: Codable {
         case .`voice_provider_configure`(let value): try value.encode(to: encoder)
         case .`voice_session_create`(let value): try value.encode(to: encoder)
         case .`companion_transcript_save`(let value): try value.encode(to: encoder)
+        case .`companion_brain_switch`(let value): try value.encode(to: encoder)
         case .`companion_crew_refresh`(let value): try value.encode(to: encoder)
         case .`push_received`(let value): try value.encode(to: encoder)
         case .`terminal_input`(let value): try value.encode(to: encoder)
@@ -5196,6 +5199,62 @@ extension EventCompanionTranscriptSave {
         try c.encode(self.`messages`, forKey: .`messages`)
         var tag = encoder.container(keyedBy: ModelDiscriminator.self)
         try tag.encode("companion_transcript_save", forKey: .type)
+    }
+}
+
+struct EventCompanionBrainSwitch: Codable {
+    var `api_version`: UInt32 = 1
+    var `now_ms`: Int64
+    var `wall_time_ms`: Int64
+    var `intent_id`: String
+    var `companion_id`: String? = nil
+    var `provider`: String
+    var `model`: String? = nil
+    var `brief`: Bool? = nil
+}
+
+extension EventCompanionBrainSwitch {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `now_ms`
+        case `wall_time_ms`
+        case `intent_id`
+        case `companion_id`
+        case `provider`
+        case `model`
+        case `brief`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`now_ms` = try c.decode(Int64.self, forKey: .`now_ms`)
+        self.`wall_time_ms` = try c.decode(Int64.self, forKey: .`wall_time_ms`)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+        if !c.contains(.`companion_id`) { self.`companion_id` = nil } else {
+        self.`companion_id` = try c.decodeIfPresent(String.self, forKey: .`companion_id`)
+        }
+        self.`provider` = try c.decode(String.self, forKey: .`provider`)
+        if !c.contains(.`model`) { self.`model` = nil } else {
+        self.`model` = try c.decodeIfPresent(String.self, forKey: .`model`)
+        }
+        if !c.contains(.`brief`) { self.`brief` = nil } else {
+        self.`brief` = try c.decodeIfPresent(Bool.self, forKey: .`brief`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`now_ms`, forKey: .`now_ms`)
+        try c.encode(self.`wall_time_ms`, forKey: .`wall_time_ms`)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        try c.encode(self.`companion_id`, forKey: .`companion_id`)
+        try c.encode(self.`provider`, forKey: .`provider`)
+        try c.encode(self.`model`, forKey: .`model`)
+        try c.encode(self.`brief`, forKey: .`brief`)
+        var tag = encoder.container(keyedBy: ModelDiscriminator.self)
+        try tag.encode("companion_brain_switch", forKey: .type)
     }
 }
 
@@ -9569,6 +9628,48 @@ extension ExplorerFileQuery {
     }
 }
 
+struct CompanionPastConversation: Codable {
+    var `thread_id`: String
+    var `title`: String = ""
+    var `provider`: String = ""
+    var `model`: String = ""
+    var `ended_at_ms`: Int64 = 0
+}
+
+extension CompanionPastConversation {
+    private enum CodingKeys: String, CodingKey {
+        case `thread_id`
+        case `title`
+        case `provider`
+        case `model`
+        case `ended_at_ms`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`thread_id` = try c.decode(String.self, forKey: .`thread_id`)
+        if !c.contains(.`title`) { self.`title` = "" } else {
+        self.`title` = try c.decode(String.self, forKey: .`title`)
+        }
+        if !c.contains(.`provider`) { self.`provider` = "" } else {
+        self.`provider` = try c.decode(String.self, forKey: .`provider`)
+        }
+        if !c.contains(.`model`) { self.`model` = "" } else {
+        self.`model` = try c.decode(String.self, forKey: .`model`)
+        }
+        if !c.contains(.`ended_at_ms`) { self.`ended_at_ms` = 0 } else {
+        self.`ended_at_ms` = try c.decode(Int64.self, forKey: .`ended_at_ms`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`thread_id`, forKey: .`thread_id`)
+        try c.encode(self.`title`, forKey: .`title`)
+        try c.encode(self.`provider`, forKey: .`provider`)
+        try c.encode(self.`model`, forKey: .`model`)
+        try c.encode(self.`ended_at_ms`, forKey: .`ended_at_ms`)
+    }
+}
+
 struct CompanionEntry: Codable {
     var `id`: String
     var `name`: String
@@ -9578,6 +9679,7 @@ struct CompanionEntry: Codable {
     var `provider`: String = ""
     var `model`: String = ""
     var `orders`: String = ""
+    var `history`: [CompanionPastConversation] = []
 }
 
 extension CompanionEntry {
@@ -9590,6 +9692,7 @@ extension CompanionEntry {
         case `provider`
         case `model`
         case `orders`
+        case `history`
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -9613,6 +9716,9 @@ extension CompanionEntry {
         if !c.contains(.`orders`) { self.`orders` = "" } else {
         self.`orders` = try c.decode(String.self, forKey: .`orders`)
         }
+        if !c.contains(.`history`) { self.`history` = [] } else {
+        self.`history` = try c.decode([CompanionPastConversation].self, forKey: .`history`)
+        }
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -9624,6 +9730,49 @@ extension CompanionEntry {
         try c.encode(self.`provider`, forKey: .`provider`)
         try c.encode(self.`model`, forKey: .`model`)
         try c.encode(self.`orders`, forKey: .`orders`)
+        try c.encode(self.`history`, forKey: .`history`)
+    }
+}
+
+struct CompanionBrainSwitch: Codable {
+    var `intent_id`: String
+    var `status`: String = "pending"
+    var `error_code`: String? = nil
+    var `from`: String = ""
+    var `to`: String = ""
+}
+
+extension CompanionBrainSwitch {
+    private enum CodingKeys: String, CodingKey {
+        case `intent_id`
+        case `status`
+        case `error_code`
+        case `from`
+        case `to`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+        if !c.contains(.`status`) { self.`status` = "pending" } else {
+        self.`status` = try c.decode(String.self, forKey: .`status`)
+        }
+        if !c.contains(.`error_code`) { self.`error_code` = nil } else {
+        self.`error_code` = try c.decodeIfPresent(String.self, forKey: .`error_code`)
+        }
+        if !c.contains(.`from`) { self.`from` = "" } else {
+        self.`from` = try c.decode(String.self, forKey: .`from`)
+        }
+        if !c.contains(.`to`) { self.`to` = "" } else {
+        self.`to` = try c.decode(String.self, forKey: .`to`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        try c.encode(self.`status`, forKey: .`status`)
+        try c.encode(self.`error_code`, forKey: .`error_code`)
+        try c.encode(self.`from`, forKey: .`from`)
+        try c.encode(self.`to`, forKey: .`to`)
     }
 }
 
@@ -9792,6 +9941,7 @@ struct CompanionView: Codable {
     var `revision`: String = "0"
     var `roster`: CompanionRoster
     var `crew`: CompanionCrew
+    var `brain_switch`: CompanionBrainSwitch? = nil
     var `error`: LocalError? = nil
 }
 
@@ -9805,6 +9955,7 @@ extension CompanionView {
         case `revision`
         case `roster`
         case `crew`
+        case `brain_switch`
         case `error`
     }
     init(from decoder: Decoder) throws {
@@ -9829,6 +9980,9 @@ extension CompanionView {
         }
         self.`roster` = try c.decode(CompanionRoster.self, forKey: .`roster`)
         self.`crew` = try c.decode(CompanionCrew.self, forKey: .`crew`)
+        if !c.contains(.`brain_switch`) { self.`brain_switch` = nil } else {
+        self.`brain_switch` = try c.decodeIfPresent(CompanionBrainSwitch.self, forKey: .`brain_switch`)
+        }
         if !c.contains(.`error`) { self.`error` = nil } else {
         self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
         }
@@ -9843,6 +9997,7 @@ extension CompanionView {
         try c.encode(self.`revision`, forKey: .`revision`)
         try c.encode(self.`roster`, forKey: .`roster`)
         try c.encode(self.`crew`, forKey: .`crew`)
+        try c.encode(self.`brain_switch`, forKey: .`brain_switch`)
         try c.encode(self.`error`, forKey: .`error`)
     }
 }
