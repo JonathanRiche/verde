@@ -170,6 +170,118 @@ internal fun companionPose(online: Boolean, approval: Boolean, working: Boolean)
     else -> CompanionPose.Idle
 }
 
+// ---- Brain (pure, unit tested) ----
+
+/** How a brain change is applied to the companion's conversation. */
+internal enum class BrainChange {
+    /** Nothing changed. */
+    None,
+    /** Same provider, an empty thread, or no thread yet: change the selection in place. */
+    InPlace,
+    /** A different provider on a conversation that already has history: the daemon hands it off (same thread). */
+    HandOff,
+}
+
+/**
+ * [threadProvider] is the companion thread's current provider (null when unknown), [threadEmpty]
+ * true when it has no messages and no running turn. A provider can't switch under a live
+ * provider session, so only that case is handed off by the daemon (`companion_brain_switch`).
+ */
+internal fun classifyBrainChange(threadId: String, threadProvider: String?, threadEmpty: Boolean, current: ChatSelection, target: ChatSelection): BrainChange {
+    if (target.provider == current.provider && target.model == current.model && target.effort == current.effort && target.speed == current.speed) return BrainChange.None
+    if (threadId.isEmpty() || threadEmpty) return BrainChange.InPlace
+    return if (threadProvider == null || target.provider == threadProvider) BrainChange.InPlace else BrainChange.HandOff
+}
+
+/** The roster entry with the new brain; effort and speed live on the thread, not the roster. */
+internal fun withBrain(entry: CompanionEntry, brain: ChatSelection): CompanionEntry =
+    entry.copy(provider = brain.provider.orEmpty(), model = brain.model.orEmpty())
+
+/** "Claude · Opus 5.5 · High"; parts that are unknown are left out. */
+internal fun brainLabel(provider: String?, model: String?, effort: String?): String =
+    listOf(provider, model, effort).mapNotNull { it?.trim()?.takeIf { part -> part.isNotEmpty() } }.joinToString(" \u00b7 ").ifEmpty { "Default brain" }
+
+/** The new-chat selection with [model]/[effort]/[speed] applied where the provider's catalog offers them. */
+internal fun brainSelection(chat: ManageNewChat, model: String?, effort: String?, speed: String?): ChatSelection {
+    val c = chat.catalogs
+    var next = chat.selection
+    if (model != null && c.models.any { it.id == model && it.enabled }) next = next.copy(model = model)
+    if (effort != null && c.efforts.any { it.id == effort && it.enabled }) next = next.copy(effort = effort)
+    if (speed != null && c.speeds.any { it.id == speed && it.enabled }) next = next.copy(speed = speed)
+    return next
+}
+
+// ---- Conversations (pure, unit tested) ----
+
+internal const val MAX_CONVERSATION_HISTORY = 12
+
+/** Puts [past] first, dropping an older entry for the same thread, keeping at most 12. */
+internal fun pushHistory(history: List<CompanionPastConversation>, past: CompanionPastConversation): List<CompanionPastConversation> =
+    (listOf(past) + history.filter { it.thread_id != past.thread_id }).take(MAX_CONVERSATION_HISTORY)
+
+/** A history title: the chat's own title, unless it's generic, else the first thing the user said. */
+internal fun conversationTitle(threadTitle: String?, companionName: String, firstUserLine: String?): String {
+    val title = threadTitle?.trim().orEmpty()
+    if (title.isNotEmpty() && title != "New Chat" && title != companionName.trim()) return clipUtf8(title, 96)
+    val said = firstUserLine?.lineSequence()?.map { it.trim() }?.firstOrNull { it.isNotEmpty() }
+    return clipUtf8(said ?: title.ifEmpty { "Conversation" }, 96)
+}
+
+private fun archived(entry: CompanionEntry, title: String, nowMs: Long) =
+    CompanionPastConversation(thread_id = entry.thread_id, title = title, provider = entry.provider, model = entry.model, ended_at_ms = nowMs)
+
+/** New conversation: the current one goes to the front of history and the next one starts fresh. */
+internal fun rosterWithNewConversation(roster: CompanionRoster, companionId: String, title: String, nowMs: Long): CompanionRoster? {
+    val entry = roster.companions.firstOrNull { it.id == companionId } ?: return null
+    if (entry.thread_id.isEmpty()) return null
+    return roster.replacing(entry.copy(thread_id = "", history = pushHistory(entry.history, archived(entry, title, nowMs))))
+}
+
+/** Resume [threadId] from history; the current conversation takes its place there. Its brain comes back too. */
+internal fun rosterResuming(roster: CompanionRoster, companionId: String, threadId: String, currentTitle: String, nowMs: Long): CompanionRoster? {
+    val entry = roster.companions.firstOrNull { it.id == companionId } ?: return null
+    val past = entry.history.firstOrNull { it.thread_id == threadId } ?: return null
+    var history = entry.history.filter { it.thread_id != threadId }
+    if (entry.thread_id.isNotEmpty() && entry.thread_id != threadId) history = pushHistory(history, archived(entry, currentTitle, nowMs))
+    return roster.replacing(entry.copy(thread_id = past.thread_id, provider = past.provider.ifEmpty { entry.provider },
+        model = if (past.provider.isNotEmpty()) past.model else entry.model, history = history))
+}
+
+/** Drops [threadId] from the list only; the chat itself stays in the workspace. */
+internal fun rosterForgetting(roster: CompanionRoster, companionId: String, threadId: String): CompanionRoster? {
+    val entry = roster.companions.firstOrNull { it.id == companionId } ?: return null
+    if (entry.history.none { it.thread_id == threadId }) return null
+    return roster.replacing(entry.copy(history = entry.history.filter { it.thread_id != threadId }))
+}
+
+// ---- Brain switch (pure, unit tested) ----
+
+/** The provider part of a daemon brain label ("Codex · gpt-5" → "Codex"). */
+internal fun brainProviderOf(label: String): String = label.substringBefore(" \u00b7 ").trim()
+
+/** Header status while the companion changes brains; null when nothing is in progress. */
+internal fun handoffStatus(switch: CompanionBrainSwitch?): String? = when (switch?.status) {
+    null -> null
+    "pending" -> "Switching brain\u2026"
+    "briefing" -> "Handing off to ${brainProviderOf((switch?.to ?: "")).ifEmpty { "the new brain" }}\u2026"
+    "switched" -> "Switched to ${brainProviderOf((switch?.to ?: "")).ifEmpty { "the new brain" }}"
+    else -> null
+}
+
+/** Confirm dialog for switching an ongoing conversation's provider: title and body. */
+internal fun brainSwitchDialog(name: String, from: String?, to: String): Pair<String, String> {
+    val outgoing = from?.takeIf { it.isNotBlank() } ?: "The current brain"
+    return "Switch $name to $to?" to "$name keeps this conversation. $outgoing will write a quick handoff brief first, then $to takes over with the brief and recent history."
+}
+
+internal fun brainSwitchError(code: String?, name: String): String = when (code) {
+    "companion_busy" -> "$name is still working. Wait for the current turn to finish, then switch."
+    "busy" -> "Still switching brains."
+    "offline", "unavailable" -> "Connect to the host first."
+    "unknown_method", "method_not_found", "unsupported" -> "Update Verde on the computer to switch brains."
+    else -> "Couldn't switch $name's brain. Try again."
+}
+
 /** Notification title for a companion's chat: "Juniper: <title>". */
 internal fun companionNotificationTitle(name: String?, title: String): String {
     val who = name?.trim().orEmpty()
@@ -313,14 +425,17 @@ internal class CompanionSession(private val core: CompanionCore, scope: Coroutin
      * Creates [companion]'s conversation in [workspaceId] with its preferred brain (falling back to
      * the workspace defaults) and records the new thread in the roster.
      */
-    suspend fun createThread(companion: CompanionEntry, workspaceId: String): CompanionSave {
-        val provider = companion.provider.ifEmpty { null }
-        val picked = (provider != null && select(workspaceId, ChatSelection(provider = provider))) || select(workspaceId, ChatSelection())
+    /**
+     * [brain]: a brain switch (Settings → Brain) — its provider/model/effort/speed win over the
+     * roster's, the roster gets the new provider/model, and the new thread replaces [replacing].
+     */
+    suspend fun createThread(companion: CompanionEntry, workspaceId: String, brain: ChatSelection? = null, replacing: String? = null): CompanionSave {
+        val provider = (brain?.provider ?: companion.provider).ifEmpty { null }
+        val picked = (provider != null && select(workspaceId, ChatSelection(provider = provider))) || (brain == null && select(workspaceId, ChatSelection()))
         if (!picked) return CompanionSave.Failed("Couldn't load the models for ${companion.name}'s conversation.", "invalid_selection")
         var chat = newChat(workspaceId) ?: return CompanionSave.Failed("The host didn't load its models. Try again.", "timeout")
-        val model = companion.model.ifEmpty { null }
-        if (model != null && chat.catalogs.models.any { it.id == model && it.enabled } && chat.selection.model != model &&
-            select(workspaceId, chat.selection.copy(model = model))) chat = newChat(workspaceId) ?: chat
+        val desired = brainSelection(chat, brain?.model ?: companion.model.ifEmpty { null }, brain?.effort, brain?.speed)
+        if (desired != chat.selection && select(workspaceId, desired)) chat = newChat(workspaceId) ?: chat
         if (!chat.can_create) return CompanionSave.Failed("This phone can't start chats on this host.", "insufficient_scope")
         val selection = chat.selection
         val id = dispatch { n, w, id -> EventThreadCreate(now_ms = n, wall_time_ms = w, intent_id = id, workspace_id = workspaceId,
@@ -332,12 +447,31 @@ internal class CompanionSession(private val core: CompanionCore, scope: Coroutin
         val thread = job?.thread_id ?: return CompanionSave.Failed("The host didn't return the new chat.", "invalid_thread")
         val saved = update { roster ->
             val current = roster.companions.firstOrNull { it.id == companion.id } ?: return@update null
-            if (current.thread_id.isNotEmpty()) null else roster.replacing(current.copy(thread_id = thread, home_workspace_id = workspaceId))
+            when {
+                brain != null -> if (replacing != null && current.thread_id != replacing) null
+                    else roster.replacing(current.copy(thread_id = thread, home_workspace_id = workspaceId,
+                        provider = selection.provider.orEmpty(), model = selection.model.orEmpty()))
+                current.thread_id.isNotEmpty() -> null
+                else -> roster.replacing(current.copy(thread_id = thread, home_workspace_id = workspaceId))
+            }
         }
         // Best effort: list the conversation under the companion's name instead of "New Chat".
         if (saved == CompanionSave.Saved) dispatch { n, w, rid -> EventThreadRename(now_ms = n, wall_time_ms = w, intent_id = rid,
             workspace_id = workspaceId, thread_id = thread, title = cleanCompanionName(companion.name).ifEmpty { "Companion" }) }
         return saved
+    }
+
+    /** `companion_brain_switch`; null on success (switched or briefing), else the daemon's error code. */
+    suspend fun brainSwitch(companionId: String, provider: String, model: String?, brief: Boolean): String? {
+        val id = dispatch { n, w, id -> EventCompanionBrainSwitch(now_ms = n, wall_time_ms = w, intent_id = id, companion_id = companionId,
+            provider = provider, model = model, brief = brief) } ?: return "rejected"
+        val op = settled(id, SAVE_TIMEOUT_MS) ?: return "timeout"
+        return if (op.state == "succeeded") null else op.error?.code ?: "failed"
+    }
+
+    /** Saves the brain on the roster entry (provider/model); the live thread is changed separately. */
+    suspend fun saveBrain(companionId: String, brain: ChatSelection): CompanionSave = update { roster ->
+        roster.companions.firstOrNull { it.id == companionId }?.let { roster.replacing(withBrain(it, brain)) }
     }
 
     companion object {
@@ -513,8 +647,10 @@ internal class CompanionModel(
 
     fun update(entry: CompanionEntry, onSaved: () -> Unit = {}) = save({ roster ->
         roster.companions.firstOrNull { it.id == entry.id }?.let { old ->
-            // Thread identity is owned by setup; a stale sheet must not clear it.
-            roster.replacing(entry.copy(thread_id = old.thread_id.ifEmpty { entry.thread_id }, home_workspace_id = old.home_workspace_id.ifEmpty { entry.home_workspace_id }))
+            // Settings edit the name, character and orders only. Thread, brain and history are owned by
+            // setup, the Brain page and Conversations; a stale sheet must not overwrite them.
+            roster.replacing(entry.copy(thread_id = old.thread_id, home_workspace_id = old.home_workspace_id.ifEmpty { entry.home_workspace_id },
+                provider = old.provider, model = old.model, history = old.history))
         }
     }, onSaved)
 
@@ -530,6 +666,94 @@ internal class CompanionModel(
 
     fun remove(id: String, onSaved: () -> Unit = {}) = save({ it.removing(id) }, onSaved)
 
+    /**
+     * Settings → Brain. [change] comes from [classifyBrainChange]: in place re-selects the live
+     * thread's model (and, on an empty thread, its provider) through `composer_select`; a provider
+     * switch on a conversation with history starts a fresh thread. Either way the roster keeps the
+     * provider/model so later threads use them. [onDone] gets null on success, else a message.
+     */
+    fun applyBrain(entry: CompanionEntry, target: ChatSelection, change: BrainChange, transcript: TranscriptModel?, brief: Boolean = true,
+        onDone: (String?) -> Unit) {
+        val current = session ?: return onDone("Connect to the host first.")
+        if (change == BrainChange.None) return onDone(null)
+        mutableState.update { it.copy(saving = true, saveError = null) }
+        scope.launch {
+            val error = try {
+                when (change) {
+                    BrainChange.HandOff -> switchCompanionProvider(target.provider.orEmpty(), target.model, brief)
+                    else -> {
+                        val live = transcript?.takeIf { entry.thread_id.isNotEmpty() && it.threadId == entry.thread_id && it.workspaceId == entry.home_workspace_id }
+                        val selected = if (live == null) null else selectOnThread(live, target)
+                        selected ?: (current.saveBrain(entry.id, target) as? CompanionSave.Failed)?.message
+                    }
+                }
+            } catch (e: CancellationException) { throw e } catch (_: Exception) { "Couldn't reach the host. Try again." }
+            mutableState.update { it.copy(saving = false, saveError = error) }
+            onDone(error)
+        }
+    }
+
+    /**
+     * Moves the active companion's conversation (one with history) to another [provider]/[model].
+     * Returns null on success, else a message for the user.
+     *
+     * Context-preserving: `companion_brain_switch` keeps the same thread. With [brief] the outgoing
+     * brain first writes a handoff brief; the daemon then switches the thread, replays the brief and
+     * recent history to the new brain (hidden), and updates the roster. Progress shows through
+     * `companion.brain_switch` ([handoffStatus]).
+     */
+    suspend fun switchCompanionProvider(provider: String, model: String?, brief: Boolean = true): String? {
+        if (provider.isEmpty()) return "Choose a provider."
+        val current = session ?: return "Connect to the host first."
+        val entry = state.value.active ?: return "Companions haven't loaded yet."
+        // The daemon keeps the same thread: the outgoing brain writes a brief, then the new one takes over.
+        val error = current.brainSwitch(entry.id, provider, model?.ifEmpty { null }, brief) ?: return null
+        return brainSwitchError(error, entry.name.ifBlank { "Your companion" })
+    }
+
+    /** Starts a fresh conversation; the current one moves to the companion's history. */
+    fun newConversation(title: String, onSaved: () -> Unit = {}) {
+        val active = state.value.active ?: return
+        attempted.remove(active.id)
+        save({ rosterWithNewConversation(it, active.id, title, System.currentTimeMillis()) }, onSaved)
+    }
+
+    /** Resumes an earlier conversation from history. */
+    fun resumeConversation(threadId: String, currentTitle: String, onSaved: () -> Unit = {}) {
+        val active = state.value.active ?: return
+        save({ rosterResuming(it, active.id, threadId, currentTitle, System.currentTimeMillis()) }, onSaved)
+    }
+
+    /** Removes an earlier conversation from the list (the chat stays on the host). */
+    fun forgetConversation(threadId: String) {
+        val active = state.value.active ?: return
+        save({ rosterForgetting(it, active.id, threadId) })
+    }
+
+    /** `composer_select` on the companion thread; a provider change on an empty thread goes provider first. */
+    private suspend fun selectOnThread(model: TranscriptModel, target: ChatSelection): String? {
+        val now = model.state.value.composer?.selection
+        suspend fun choose(selection: ChatSelection): Operation? {
+            val op = model.dispatch { id, n, w -> EventComposerSelect(now_ms = n, wall_time_ms = w, intent_id = id, workspace_id = model.workspaceId,
+                thread_id = model.threadId, provider = selection.provider, model = selection.model, effort = selection.effort,
+                access = selection.access, speed = selection.speed) } ?: return null
+            if (op.state != "pending") return op
+            return withTimeoutOrNull(BRAIN_WAIT_MS) {
+                model.operations.mapNotNull { list -> list.find { it.intent_id == op.intent_id }?.takeIf { it.state != "pending" } }.first()
+            }
+        }
+        val access = now?.access
+        if (now?.provider != target.provider) {
+            val switched = choose(ChatSelection(provider = target.provider, access = access))
+            if (switched?.state != "succeeded") return composerError(switched?.error) ?: "Couldn't switch the provider."
+            // The new provider's models load before the model can be chosen.
+            withTimeoutOrNull(BRAIN_WAIT_MS) { model.state.first { it.composer?.selection?.provider == target.provider && it.composer?.catalogs?.models?.isNotEmpty() == true } }
+        }
+        var op = choose(target.copy(access = access))
+        if (op?.state == "failed" && op.error?.code == "invalid_selection") op = choose(target.copy(effort = null, speed = null, access = access))
+        return if (op?.state == "succeeded") null else composerError(op?.error) ?: "Couldn't change the model."
+    }
+
     /** The companion's chat is gone from the host: forget it so setup starts a new one. */
     fun resetConversation(id: String, threadId: String) {
         attempted.remove(id)
@@ -544,6 +768,7 @@ internal class CompanionModel(
 
     companion object {
         const val POLL_MS = 8_000L
+        const val BRAIN_WAIT_MS = 20_000L
         const val OPEN_POLL_MS = 4_000L
     }
 }

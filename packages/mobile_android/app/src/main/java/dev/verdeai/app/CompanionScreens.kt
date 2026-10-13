@@ -10,6 +10,7 @@ import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -115,6 +116,9 @@ internal fun CompanionSheet(
     val state by companion.state.collectAsState()
     val browseState by browse.state.collectAsState()
     var settings by rememberSaveable { mutableStateOf(settingsRequested) }
+    var brainOnly by rememberSaveable { mutableStateOf(false) }
+    var confirmNew by rememberSaveable { mutableStateOf(false) }
+    var conversations by rememberSaveable { mutableStateOf(false) }
     DisposableEffect(companion) {
         companion.setSheetOpen(true)
         onDispose { companion.setSheetOpen(false) }
@@ -137,7 +141,9 @@ internal fun CompanionSheet(
                 CompanionPlaceholder(state, workspaces.any { it.open })
                 return@Column
             }
-            CompanionHeader(active, state.roster, pose, companionHeaderSuffix(snapshot.needKeys.size, snapshot.pulse.running), enabled = state.view?.can_edit == true && !state.saving,
+            CompanionHeader(active, state.roster, pose, handoffStatus(state.view?.brain_switch) ?: companionHeaderSuffix(snapshot.needKeys.size, snapshot.pulse.running),
+                enabled = state.view?.can_edit == true && !state.saving,
+                onNewConversation = { confirmNew = true }, onConversations = { conversations = true },
                 onSwitch = companion::switchTo, onSettings = { settings = true }, onActivity = onActivity, onHideBubble = onHideBubble,
                 liveActive = liveUi?.active == true, onLive = if (live != null && liveSupported) onLive else null)
             SummaryStrip(snapshot, workspaces, onOpenPane, onOpenChat)
@@ -149,7 +155,7 @@ internal fun CompanionSheet(
                     transcript != null && transcriptState != null -> {
                         val knownThreads = workspaces.find { it.workspace_id == active.home_workspace_id }?.threads.orEmpty() +
                             workspaces.filter { it.workspace_id != active.home_workspace_id }.flatMap { it.threads }
-                        CompanionConversation(transcript, transcriptState, active, knownThreads, voice,
+                        CompanionConversation(transcript, transcriptState, active, knownThreads, voice, onBrain = { brainOnly = true },
                             onCitation = { onCitation(active.home_workspace_id, it) },
                             onOpenThread = { onOpenChat(active.home_workspace_id, it) },
                             onReset = { companion.resetConversation(active.id, thread.orEmpty()) })
@@ -165,7 +171,20 @@ internal fun CompanionSheet(
             }
         }
     }
-    if (settings && active != null) CompanionSettingsSheet(companion, manage, browseState, voice, live) { settings = false }
+    if (settings && active != null) CompanionSettingsSheet(companion, manage, browseState, voice, live, transcript) { settings = false }
+    // The current conversation's history title: its own title unless generic, else the first thing the user said.
+    val currentTitle = active?.let { a ->
+        val summary = workspaces.find { it.workspace_id == a.home_workspace_id }?.threads?.find { it.thread_id == a.thread_id }
+        conversationTitle(transcriptState?.thread?.thread?.title ?: summary?.title, a.name,
+            transcriptState?.thread?.rows?.firstOrNull { it.role == "user" }?.body)
+    } ?: "Conversation"
+    if (confirmNew && active != null) AlertDialog(onDismissRequest = { confirmNew = false },
+        title = { Text("Start a new conversation?") },
+        text = { Text("${active.name.ifBlank { "Your companion" }} starts fresh. This one stays in Conversations, so you can go back to it.") },
+        confirmButton = { TextButton(onClick = { confirmNew = false; companion.newConversation(currentTitle) }) { Text("New conversation") } },
+        dismissButton = { TextButton(onClick = { confirmNew = false }) { Text("Cancel") } })
+    if (conversations && active != null) ConversationsSheet(active, currentTitle, companion) { conversations = false }
+    if (brainOnly && active != null) CompanionSettingsSheet(companion, manage, browseState, voice, live, transcript, startOnBrain = true) { brainOnly = false }
 }
 
 @Composable
@@ -189,7 +208,7 @@ private fun CompanionPlaceholder(state: CompanionUiState, hasWorkspace: Boolean)
 @Composable
 private fun CompanionHeader(active: CompanionEntry, roster: CompanionRoster?, pose: CompanionPose, suffix: String?, enabled: Boolean,
     onSwitch: (String) -> Unit, onSettings: () -> Unit, onActivity: () -> Unit, onHideBubble: () -> Unit,
-    liveActive: Boolean = false, onLive: (() -> Unit)? = null) {
+    liveActive: Boolean = false, onLive: (() -> Unit)? = null, onNewConversation: () -> Unit = {}, onConversations: () -> Unit = {}) {
     val character = CompanionCharacter.of(active.character)
     val name = active.name.ifBlank { character.label }
     val suffixColor = when (pose) {
@@ -209,6 +228,9 @@ private fun CompanionHeader(active: CompanionEntry, roster: CompanionRoster?, po
             var menu by remember { mutableStateOf(false) }
             IconButton(onClick = { menu = true }) { Icon(Icons.Filled.MoreVert, contentDescription = "Companion menu") }
             DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                DropdownMenuItem(text = { Text("New conversation") }, enabled = enabled && active.thread_id.isNotEmpty(),
+                    onClick = { menu = false; onNewConversation() })
+                DropdownMenuItem(text = { Text("Conversations\u2026") }, onClick = { menu = false; onConversations() })
                 DropdownMenuItem(text = { Text("All activity") }, onClick = { menu = false; onActivity() })
                 roster?.companions.orEmpty().filter { it.id != active.id }.forEach { entry ->
                     val look = CompanionCharacter.of(entry.character)
@@ -306,7 +328,7 @@ private fun StripItem(row: StripRow) {
 
 @Composable
 private fun CompanionConversation(model: TranscriptModel, state: TranscriptState, active: CompanionEntry, threads: List<ThreadSummary>,
-    voice: CompanionVoice?, onCitation: (FileCitation) -> Unit, onOpenThread: (String) -> Unit, onReset: () -> Unit) {
+    voice: CompanionVoice?, onBrain: () -> Unit, onCitation: (FileCitation) -> Unit, onOpenThread: (String) -> Unit, onReset: () -> Unit) {
     DisposableEffect(model) {
         model.setVisible(true)
         onDispose { model.setVisible(false) }
@@ -334,7 +356,7 @@ private fun CompanionConversation(model: TranscriptModel, state: TranscriptState
             }
         }
         val mic: (@Composable () -> Unit)? = if (voice != null && voice.available) ({ MicButton(voice, model, name) }) else null
-        ChatComposer(model, state, compact = true, inlineAction = mic)
+        ChatComposer(model, state, compact = true, inlineAction = mic, onBrain = onBrain)
     }
 }
 
@@ -476,7 +498,12 @@ private fun Suggestions(name: String, onPick: (String) -> Unit) {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun CompanionSettingsSheet(companion: CompanionModel, manage: ManageModel, browse: BrowseState, voice: CompanionVoice? = null,
-    live: LiveVoice? = null, onDismiss: () -> Unit) {
+    live: LiveVoice? = null, transcript: TranscriptModel? = null, startOnBrain: Boolean = false, onDismiss: () -> Unit) {
+    var brain by remember { mutableStateOf(startOnBrain) }
+    if (brain) {
+        CompanionBrainSheet(companion, manage, browse, transcript) { brain = false; if (startOnBrain) onDismiss() }
+        return
+    }
     val state by companion.state.collectAsState()
     val roster = state.roster ?: return
     val active = activeCompanion(roster) ?: return
@@ -501,7 +528,8 @@ internal fun CompanionSettingsSheet(companion: CompanionModel, manage: ManageMod
                     leadingIcon = { Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(18.dp)) })
             }
             if (adding) AddCompanion(companion, state, roster) { adding = false }
-            else key(active.id) { EditCompanion(companion, manage, state, browse, roster, active, onRemove = { confirmRemove = true }, onDone = onDismiss) }
+            else key(active.id) { EditCompanion(companion, manage, state, browse, roster, active, onRemove = { confirmRemove = true }, onDone = onDismiss,
+                onBrain = { brain = true }) }
             if (voice != null) {
                 HorizontalDivider(Modifier.padding(vertical = 8.dp), color = VerdeColors.Border)
                 VoiceSettings(voice)
@@ -560,12 +588,10 @@ private fun AddCompanion(companion: CompanionModel, state: CompanionUiState, ros
 
 @Composable
 private fun EditCompanion(companion: CompanionModel, manage: ManageModel, state: CompanionUiState, browse: BrowseState,
-    roster: CompanionRoster, active: CompanionEntry, onRemove: () -> Unit, onDone: () -> Unit) {
+    roster: CompanionRoster, active: CompanionEntry, onRemove: () -> Unit, onDone: () -> Unit, onBrain: () -> Unit) {
     var name by rememberSaveable { mutableStateOf(active.name) }
     var character by rememberSaveable { mutableStateOf(CompanionCharacter.of(active.character)) }
     var orders by rememberSaveable { mutableStateOf(active.orders) }
-    var provider by rememberSaveable { mutableStateOf(active.provider) }
-    var model by rememberSaveable { mutableStateOf(active.model) }
     val enabled = !state.saving && state.view?.can_edit == true
     val workspace = browse.workspaces?.items?.find { it.workspace_id == active.home_workspace_id }
 
@@ -580,10 +606,16 @@ private fun EditCompanion(companion: CompanionModel, manage: ManageModel, state:
         supportingText = { Text("Sent with every message to ${cleanCompanionName(name).ifEmpty { "your companion" }}.") },
         modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp))
     VerdeSection("Brain")
-    Brain(manage, active.home_workspace_id, provider, model, enabled,
-        onProvider = { provider = it; model = "" }, onModel = { model = it })
-    Text("Used when ${cleanCompanionName(name).ifEmpty { "your companion" }} starts a conversation. Change the current one from its composer.",
-        Modifier.padding(horizontal = 16.dp, vertical = 4.dp), style = MaterialTheme.typography.bodySmall, color = VerdeColors.Muted)
+    // Hermes-style: the brain has its own page; here, its summary.
+    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable(onClickLabel = "Change brain", onClick = onBrain)
+        .padding(horizontal = 16.dp, vertical = 8.dp).testTag("companion-brain-row"), verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        ProviderGlyph(active.provider.ifEmpty { null })
+        Text(brainLabel(PROVIDERS.find { it.first == active.provider }?.second ?: active.provider.ifEmpty { "Workspace default" },
+            active.model.ifEmpty { null }, null), Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium, maxLines = 1,
+            overflow = TextOverflow.Ellipsis)
+        Text("\u203a", style = MaterialTheme.typography.titleMedium, color = VerdeColors.Subtle)
+    }
     workspace?.let {
         Text("Lives in ${it.label}", Modifier.padding(horizontal = 16.dp, vertical = 8.dp), style = MaterialTheme.typography.bodySmall, color = VerdeColors.Subtle)
     }
@@ -595,26 +627,65 @@ private fun EditCompanion(companion: CompanionModel, manage: ManageModel, state:
         }
         Spacer(Modifier.weight(1f))
         Button(onClick = {
-            companion.update(active.copy(name = cleanCompanionName(name), character = character.id, orders = cleanOrders(orders),
-                provider = provider, model = model), onSaved = onDone)
+            companion.update(active.copy(name = cleanCompanionName(name), character = character.id, orders = cleanOrders(orders)), onSaved = onDone)
         }, enabled = enabled && cleanCompanionName(name).isNotEmpty(), shape = MaterialTheme.shapes.small) {
             Text(if (state.saving) "Saving…" else "Save")
         }
     }
 }
 
-/** Provider and model from the same catalog as New chat (the core's `manage` new-chat view). */
+
+/** The companion's conversations: the current one, then earlier ones (tap to resume, long-press to remove from the list). */
+@OptIn(ExperimentalMaterial3Api::class, androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
-private fun Brain(manage: ManageModel, workspaceId: String, provider: String, model: String, enabled: Boolean,
-    onProvider: (String) -> Unit, onModel: (String) -> Unit) {
-    val manageState by manage.state.collectAsState()
-    LaunchedEffect(workspaceId, provider, manageState.hostId, manageState.view != null) {
-        if (workspaceId.isNotEmpty() && manageState.view != null) manage.select(workspaceId, ChatSelection(provider = provider.ifEmpty { null }))
+private fun ConversationsSheet(active: CompanionEntry, currentTitle: String, companion: CompanionModel, onDismiss: () -> Unit) {
+    val state by companion.state.collectAsState()
+    val now = rememberNow(false)
+    val enabled = state.view?.can_edit == true && !state.saving
+    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = VerdeColors.Panel,
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), modifier = Modifier.testTag(COMPANION_CONVERSATIONS)) {
+        Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(bottom = 24.dp)) {
+            Text("Conversations", Modifier.padding(horizontal = 16.dp), style = MaterialTheme.typography.titleLarge)
+            if (active.thread_id.isNotEmpty()) ConversationRow(currentTitle, brainLabel(providerName(active.provider), active.model.ifEmpty { null }, null),
+                "Current", current = true, enabled = false, onOpen = {}, onRemove = null)
+            if (active.history.isEmpty()) Text("Earlier conversations appear here when you start a new one.",
+                Modifier.padding(16.dp), style = MaterialTheme.typography.bodySmall, color = VerdeColors.Muted)
+            active.history.forEach { past ->
+                key(past.thread_id) {
+                    ConversationRow(past.title.ifBlank { "Conversation" }, brainLabel(providerName(past.provider), past.model.ifEmpty { null }, null),
+                        past.ended_at_ms.takeIf { it > 0 }?.let { agoLabel(it, now) }, current = false, enabled = enabled,
+                        onOpen = { companion.resumeConversation(past.thread_id, currentTitle, onSaved = onDismiss) },
+                        onRemove = { companion.forgetConversation(past.thread_id) })
+                }
+            }
+            state.saveError?.let { Text(it, Modifier.padding(horizontal = 16.dp), color = MaterialTheme.colorScheme.error) }
+        }
     }
-    val chat = manageState.view?.new_chat?.takeIf { it.workspace_id == workspaceId }
-    val providers = listOf(ChatChoice("", "Workspace default")) + chat?.providers.orEmpty()
-    val models = if (provider.isNotEmpty() && chat?.selection?.provider == provider) listOf(ChatChoice("", "Default")) + chat?.catalogs?.models.orEmpty() else emptyList()
-    Picker("Provider", providers.find { it.id == provider }?.label ?: provider.ifEmpty { "Workspace default" }, providers, enabled && chat != null, providerIcons = true, onPick = onProvider)
-    if (provider.isNotEmpty()) Picker("Model", models.find { it.id == model }?.label ?: model.ifEmpty { "Default" }, models,
-        enabled && chat?.loading == false, onPick = onModel)
+}
+
+internal const val COMPANION_CONVERSATIONS = "companion-conversations"
+
+private fun providerName(id: String): String? = id.takeIf { it.isNotEmpty() }?.let { p -> PROVIDERS.find { it.first == p }?.second ?: p }
+
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+@Composable
+private fun ConversationRow(title: String, brain: String, detail: String?, current: Boolean, enabled: Boolean, onOpen: () -> Unit, onRemove: (() -> Unit)?) {
+    var menu by remember { mutableStateOf(false) }
+    Box {
+        Row(Modifier.fillMaxWidth().heightIn(min = 56.dp)
+            .combinedClickable(enabled = enabled || onRemove != null, onClickLabel = "Resume", onLongClickLabel = "More",
+                onClick = { if (enabled) onOpen() }, onLongClick = { if (onRemove != null) menu = true })
+            .padding(horizontal = 16.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Column(Modifier.weight(1f)) {
+                Text(title, style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    color = if (current) VerdeColors.Accent else VerdeColors.Text)
+                Text(listOfNotNull(brain, detail).joinToString(" \u00b7 "), style = MaterialTheme.typography.labelSmall,
+                    color = VerdeColors.Subtle, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+        }
+        if (onRemove != null) DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+            DropdownMenuItem(text = { Text("Remove from list") }, onClick = { menu = false; onRemove() })
+        }
+    }
 }

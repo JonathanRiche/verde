@@ -104,7 +104,9 @@ private fun attachmentSize(bytes: Long) = if (bytes < 1024 * 1024) "${(bytes + 1
 @Composable
 internal fun ChatComposer(model: TranscriptModel, state: TranscriptState,
     /** Companion sheet: one row (settings chip, growing input, [inlineAction], send); no resize handle or toolbars. */
-    compact: Boolean = false, inlineAction: (@Composable () -> Unit)? = null) {
+    compact: Boolean = false, inlineAction: (@Composable () -> Unit)? = null,
+    /** Compact only: the model chip becomes a read-only label that calls this (e.g. Settings → Brain). */
+    onBrain: (() -> Unit)? = null) {
     val composer = model.composer
     val view = state.composer?.let { current ->
         composer.pendingSelection?.let { current.copy(selection = it) } ?: current
@@ -199,7 +201,7 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState,
                 Row(Modifier.fillMaxWidth().testTag("composer-actions"), verticalAlignment = Alignment.Bottom,
                     horizontalArrangement = Arrangement.spacedBy(2.dp)) {
                     if (view != null) CompactSettings(view, state, provider, attach, onPicker = { picker = it },
-                        onPhotos = onPhotos, onCamera = onCamera, onFiles = onFiles)
+                        onPhotos = onPhotos, onCamera = onCamera, onFiles = onFiles, onBrain = onBrain)
                     BasicTextField(
                         value = composer.field,
                         onValueChange = { if (!sendPending) composer.edit(it) },
@@ -306,12 +308,37 @@ internal const val COMPOSER_SETTINGS = "composer-settings"
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun CompactSettings(view: ChatComposerView, state: TranscriptState, provider: String?, attach: Boolean,
-    onPicker: (ComposerPicker) -> Unit, onPhotos: () -> Unit, onCamera: () -> Unit, onFiles: () -> Unit) {
+    onPicker: (ComposerPicker) -> Unit, onPhotos: () -> Unit, onCamera: () -> Unit, onFiles: () -> Unit, onBrain: (() -> Unit)? = null) {
     val c = view.catalogs
     val s = view.selection
     val fresh = state.thread?.rows?.isEmpty() == true && state.turn == null
     val label = compactSettingsLabel(c.models, c.efforts, s)
     var menu by remember { mutableStateOf(false) }
+    if (onBrain != null) {
+        // The brain is chosen in settings; here: a "+" for access and attachments, and a read-only label.
+        Box {
+            IconButton(onClick = { menu = true }, modifier = Modifier.testTag(COMPOSER_ATTACH)) {
+                Icon(Icons.Filled.Add, contentDescription = "Attach or change access", tint = VerdeColors.Muted)
+            }
+            DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                if (c.access.isNotEmpty()) DropdownMenuItem(text = { Text("Access: ${composerChoiceLabel(c.access, s.access) ?: "Access"}") },
+                    onClick = { menu = false; onPicker(ComposerPicker.Access) })
+                DropdownMenuItem(text = { Text("Attach photos") }, enabled = attach, onClick = { menu = false; onPhotos() })
+                DropdownMenuItem(text = { Text("Take a photo") }, enabled = attach, onClick = { menu = false; onCamera() })
+                DropdownMenuItem(text = { Text("Image files") }, enabled = attach, onClick = { menu = false; onFiles() })
+            }
+        }
+        Surface(onClick = onBrain, shape = RoundedCornerShape(12.dp), color = VerdeColors.PanelAlt,
+            modifier = Modifier.widthIn(max = 112.dp).testTag(COMPOSER_SETTINGS)
+                .semantics { contentDescription = "Brain: $label. Open brain settings" }) {
+            Row(Modifier.padding(horizontal = 8.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                ProviderGlyph(provider, Modifier.size(14.dp))
+                Text(label, style = MaterialTheme.typography.labelSmall, color = VerdeColors.Muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+        }
+        return
+    }
     Box {
         Surface(onClick = { menu = true }, shape = RoundedCornerShape(12.dp), color = VerdeColors.PanelAlt,
             modifier = Modifier.widthIn(max = 136.dp).testTag(COMPOSER_SETTINGS)

@@ -140,6 +140,98 @@ class CompanionTest {
         assertEquals("Model", compactSettingsLabel(emptyList(), emptyList(), ChatSelection()))
     }
 
+    @Test fun brainChangesApplyInPlaceUnlessAnOngoingConversationChangesProvider() {
+        val now = ChatSelection(provider = "claude", model = "opus", effort = "high")
+        assertEquals(BrainChange.None, classifyBrainChange("t1", "claude", false, now, now.copy(access = "full_access")))
+        assertEquals(BrainChange.InPlace, classifyBrainChange("t1", "claude", false, now, now.copy(model = "haiku")))
+        assertEquals(BrainChange.InPlace, classifyBrainChange("t1", "claude", false, now, now.copy(effort = "low")))
+        assertEquals(BrainChange.InPlace, classifyBrainChange("t1", "claude", false, now, now.copy(speed = "on")))
+        assertEquals(BrainChange.HandOff, classifyBrainChange("t1", "claude", false, now, ChatSelection(provider = "codex", model = "gpt")))
+        // An empty (uncommitted) thread or no thread at all switches provider in place.
+        assertEquals(BrainChange.InPlace, classifyBrainChange("t1", "claude", true, now, ChatSelection(provider = "codex")))
+        assertEquals(BrainChange.InPlace, classifyBrainChange("", null, false, now, ChatSelection(provider = "codex")))
+        // Unknown thread provider: trust the roster and change in place.
+        assertEquals(BrainChange.InPlace, classifyBrainChange("t1", null, false, now, ChatSelection(provider = "codex")))
+    }
+
+    @Test fun brainRosterPayloadAndLabels() {
+        val entry = CompanionEntry(id = "a", name = "Moss", character = "moss", home_workspace_id = "ws", thread_id = "t1", orders = "Test first.")
+        val next = withBrain(entry, ChatSelection(provider = "codex", model = "gpt-5", effort = "high", speed = "on"))
+        assertEquals("codex", next.provider)
+        assertEquals("gpt-5", next.model)
+        assertEquals(entry.copy(provider = "codex", model = "gpt-5"), next)
+        assertEquals("", withBrain(entry, ChatSelection()).model)
+        val roster = seededRoster("ws", id = "a").replacing(next)
+        assertEquals("codex", activeCompanion(roster)?.provider)
+        assertEquals("Claude \u00b7 Opus 5.5 \u00b7 High", brainLabel("Claude", "Opus 5.5", "High"))
+        assertEquals("Claude \u00b7 Opus 5.5", brainLabel("Claude", "Opus 5.5", null))
+        assertEquals("Codex", brainLabel("Codex", " ", ""))
+        assertEquals("Default brain", brainLabel(null, null, null))
+        val chat = ManageNewChat(workspace_id = "ws", selection = ChatSelection(provider = "claude", model = "sonnet"),
+            catalogs = ChatCatalogs(models = listOf(ChatChoice("sonnet", "Sonnet"), ChatChoice("opus", "Opus"), ChatChoice("old", "Old", enabled = false)),
+                efforts = listOf(ChatChoice("", "Default"), ChatChoice("high", "High"))))
+        assertEquals(ChatSelection(provider = "claude", model = "opus", effort = "high"), brainSelection(chat, "opus", "high", "on"))
+        assertEquals(chat.selection, brainSelection(chat, "old", "extreme", null))
+        val (title, body) = brainSwitchDialog("Moss", "Claude", "Codex")
+        assertEquals("Switch Moss to Codex?", title)
+        assertEquals("Moss keeps this conversation. Claude will write a quick handoff brief first, then Codex takes over with the brief and recent history.", body)
+        assertTrue(brainSwitchDialog("Moss", null, "Codex").second.contains("The current brain will write"))
+    }
+
+    private fun past(thread: String, title: String = thread, ended: Long = 1) = CompanionPastConversation(thread_id = thread, title = title, ended_at_ms = ended)
+
+    @Test fun historyPushDedupesAndCapsAtTwelve() {
+        var history = emptyList<CompanionPastConversation>()
+        (1..14).forEach { history = pushHistory(history, past("t$it")) }
+        assertEquals(MAX_CONVERSATION_HISTORY, history.size)
+        assertEquals("t14", history.first().thread_id)
+        assertEquals("t3", history.last().thread_id)
+        history = pushHistory(history, past("t10", title = "again"))
+        assertEquals(listOf("t10", "t14", "t13"), history.take(3).map { it.thread_id })
+        assertEquals(1, history.count { it.thread_id == "t10" })
+        assertEquals("again", history.first().title)
+    }
+
+    @Test fun newConversationResumeAndForgetUpdateTheRoster() {
+        val entry = CompanionEntry(id = "a", name = "Moss", home_workspace_id = "ws", thread_id = "t2", provider = "codex", model = "gpt-5",
+            history = listOf(past("t1", "Fix CI").copy(provider = "claude", model = "opus")))
+        val roster = CompanionRoster(active_id = "a", companions = listOf(entry))
+        val fresh = activeCompanion(rosterWithNewConversation(roster, "a", "Deploy", 50))!!
+        assertEquals("", fresh.thread_id)
+        assertEquals(listOf("t2", "t1"), fresh.history.map { it.thread_id })
+        assertEquals(CompanionPastConversation("t2", "Deploy", "codex", "gpt-5", 50), fresh.history.first())
+        // Nothing to archive without a current conversation.
+        assertNull(rosterWithNewConversation(roster.replacing(fresh), "a", "x", 60))
+        val resumed = activeCompanion(rosterResuming(roster, "a", "t1", "Deploy", 70))!!
+        assertEquals("t1", resumed.thread_id)
+        assertEquals("claude", resumed.provider)
+        assertEquals("opus", resumed.model)
+        assertEquals(listOf("t2"), resumed.history.map { it.thread_id })
+        assertEquals(70L, resumed.history.single().ended_at_ms)
+        // Resuming from an empty current conversation archives nothing.
+        val fromFresh = activeCompanion(rosterResuming(roster.replacing(fresh), "a", "t1", "x", 80))!!
+        assertEquals(listOf("t2"), fromFresh.history.map { it.thread_id })
+        assertNull(rosterResuming(roster, "a", "missing", "x", 1))
+        val forgotten = activeCompanion(rosterForgetting(roster, "a", "t1"))!!
+        assertTrue(forgotten.history.isEmpty())
+        assertEquals("t2", forgotten.thread_id)
+        assertNull(rosterForgetting(roster, "a", "nope"))
+    }
+
+    @Test fun conversationTitlesAndBrainSwitchStatus() {
+        assertEquals("Fix CI", conversationTitle("Fix CI", "Moss", "hello"))
+        assertEquals("check the build", conversationTitle("Moss", "Moss", "\ncheck the build\nmore"))
+        assertEquals("deploy", conversationTitle("New Chat", "Moss", "deploy"))
+        assertEquals("Conversation", conversationTitle(null, "Moss", null))
+        assertNull(handoffStatus(null))
+        assertEquals("Switching brain\u2026", handoffStatus(CompanionBrainSwitch("i")))
+        assertEquals("Handing off to Codex\u2026", handoffStatus(CompanionBrainSwitch("i", "briefing", from = "Claude \u00b7 opus", to = "Codex \u00b7 gpt-5")))
+        assertEquals("Switched to Codex", handoffStatus(CompanionBrainSwitch("i", "switched", to = "Codex")))
+        assertNull(handoffStatus(CompanionBrainSwitch("i", "failed", error_code = "companion_busy")))
+        assertEquals("Moss is still working. Wait for the current turn to finish, then switch.", brainSwitchError("companion_busy", "Moss"))
+        assertEquals("Codex", brainProviderOf("Codex \u00b7 gpt-5"))
+    }
+
     @Test fun poseFollowsRealStateWithApprovalOutrankingWork() {
         assertEquals(CompanionPose.Paused, companionPose(online = false, approval = true, working = true))
         assertEquals(CompanionPose.Approval, companionPose(online = true, approval = true, working = true))
