@@ -16,6 +16,9 @@ struct CompactComposer {
     var level: Double = 0
     var notice: String?
     var trailing: AnyView?
+    /// Set for the Companion: the brain chip is a read-only label that opens its settings, and
+    /// the "+" menu keeps only attach and access.
+    var openBrain: (() -> Void)? = nil
 }
 
 /// "Haiku 5.5 · Low": the model and effort as one chip label.
@@ -200,7 +203,7 @@ struct ChatComposer: View {
                 Text(notice).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.warning).lineLimit(2)
             }
             HStack(alignment: .bottom, spacing: 2) {
-                plusMenu
+                plusMenu(brainLocked: compact.openBrain != nil)
                 compactField(compact)
                 if let trailing = compact.trailing { trailing }
                 if model.chat.state.turn != nil {
@@ -219,7 +222,9 @@ struct ChatComposer: View {
                 .buttonStyle(.plain)
                 .disabled(!model.canSubmit).accessibilityLabel(sendLabel).accessibilityIdentifier("composer-send")
             }
-            if model.view != nil { settingsChip }
+            if model.view != nil {
+                if let openBrain = compact.openBrain { brainLabelChip(openBrain) } else { settingsChip }
+            }
         }
         .padding(.horizontal, 6).padding(.vertical, 4)
         .background(VerdeTheme.panel)
@@ -256,7 +261,7 @@ struct ChatComposer: View {
     }
 
     /// Attach, plus the rarely changed pickers (provider on a fresh chat, access, speed).
-    private var plusMenu: some View {
+    private func plusMenu(brainLocked: Bool) -> some View {
         Menu {
             Section {
                 PhotosPicker(selection: $photo, matching: .images) { Label("Photos", systemImage: "photo") }
@@ -264,7 +269,7 @@ struct ChatComposer: View {
                 Button("Files", systemImage: "folder") { files = true }
             }
             Section {
-                ForEach(visiblePickers.filter { $0 != .model && $0 != .effort }) { kind in
+                ForEach(visiblePickers.filter { brainLocked ? $0 == .access : ($0 != .model && $0 != .effort) }) { kind in
                     Button { picker = kind } label: { Text("\(kind.rawValue.capitalized): \(selectionLabel(kind))") }
                 }
             }
@@ -275,6 +280,25 @@ struct ChatComposer: View {
         .accessibilityLabel("More options")
         .accessibilityHint("Attach an image or change access.")
         .accessibilityIdentifier("composer-more")
+    }
+
+    /// The Companion's brain, read-only here: changing it lives in Settings → Brain.
+    private func brainLabelChip(_ open: @escaping () -> Void) -> some View {
+        let label = composerChipLabel(model: selectionLabel(.model), effort: visiblePickers.contains(.effort) ? selectionLabel(.effort) : nil)
+        return Button(action: open) {
+            HStack(spacing: 5) {
+                ProviderGlyph(provider: model.displayedSelection?.provider).scaleEffect(0.8)
+                Text(label).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted).lineLimit(1).truncationMode(.tail)
+            }
+            .padding(.horizontal, 10).padding(.vertical, 5)
+            .frame(minHeight: 44, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .padding(.leading, 6)
+        .accessibilityLabel("Brain: \(label)")
+        .accessibilityHint("Opens companion settings to change the brain.")
+        .accessibilityIdentifier("composer-brain")
     }
 
     /// "Haiku 5.5 · Low": opens the existing model and effort pickers.

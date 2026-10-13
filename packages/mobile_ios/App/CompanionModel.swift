@@ -207,6 +207,75 @@ final class CompanionModel {
         return conversation
     }
 
+    // MARK: Brain switch and conversations
+
+    /// The brain switch this phone asked for (its failures are shown; others' are not).
+    @ObservationIgnored private var switchIntent: String?
+
+    /// The host's latest brain switch.
+    var brainSwitch: BrainSwitchState? { snapshot?.brainSwitch }
+
+    /// "Handing off to Codex…" while a switch runs; this phone's failure afterwards.
+    var brainSwitchText: String? {
+        guard let state = brainSwitch else { return nil }
+        if state.status == "failed" && state.intent_id != switchIntent { return nil }
+        return brainSwitchStatusText(state, name: active?.name ?? "Your companion")
+    }
+
+    /// Switches the active companion's provider on the same conversation. Returns an error message.
+    func switchBrain(provider: String, model modelID: String?, brief: Bool) async -> String? {
+        let name = active?.name ?? "Your companion"
+        guard let host = browse.hostID, let rpc = rpc(host), let id = active?.id else { return brainSwitchErrorText(nil, name: name) }
+        if conversationBusy { return brainSwitchErrorText("companion_busy", name: name) }
+        do {
+            let state = try await CompanionClient(rpc: rpc).switchBrain(companionID: id, provider: provider, model: modelID, brief: brief)
+            guard browse.hostID == host else { return nil }
+            switchIntent = state?.intent_id
+            if let state, var current = snapshot { current.brainSwitch = state; snapshot = current }
+            if state?.status == "failed" { return brainSwitchErrorText(state?.error_code, name: name) }
+            await refresh()
+            return nil
+        } catch CompanionRPCError.remote(let code) {
+            return brainSwitchErrorText(code, name: name)
+        } catch {
+            failed(error, host: host)
+            return brainSwitchErrorText(nil, name: name)
+        }
+    }
+
+    /// The current conversation's title for the history list.
+    var conversationTitle: String {
+        let title = threadSummary?.title.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return title.isEmpty ? "Conversation" : title
+    }
+
+    private var nowMs: Int64 { Int64(Date().timeIntervalSince1970 * 1000) }
+
+    /// "New conversation": the current chat goes to the history; the next message starts a fresh
+    /// chat with the companion's brain.
+    @discardableResult
+    func newConversation() async -> Bool {
+        guard let id = active?.id else { return false }
+        let title = conversationTitle, now = nowMs
+        crewLinks = []
+        return await update { $0.startNewConversation(id, title: title, at: now) }
+    }
+
+    /// Goes back to an earlier conversation from the history.
+    @discardableResult
+    func resumeConversation(_ threadID: String) async -> Bool {
+        guard let id = active?.id else { return false }
+        let title = conversationTitle, now = nowMs
+        crewLinks = []
+        return await update { $0.resumeConversation(id, threadID: threadID, currentTitle: title, at: now) }
+    }
+
+    /// Drops a past conversation from the list (the chat itself stays).
+    func removeConversation(_ threadID: String) async {
+        guard let id = active?.id else { return }
+        await update { $0.removeHistory(id, threadID: threadID) }
+    }
+
     /// `host/workspace/thread` of the companion chat while it is on screen (notification suppression).
     func visibleKey() -> String? {
         guard let host = browse.hostID, let conversation else { return nil }

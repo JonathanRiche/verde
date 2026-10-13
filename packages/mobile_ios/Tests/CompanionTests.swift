@@ -239,7 +239,7 @@ final class CompanionCrewTests: XCTestCase {
 
 /// The core adapter's mapping from a settled companion intent + `companion` view to RPC replies.
 final class CompanionCoreReplyTests: XCTestCase {
-    private func view(_ json: String) throws -> CompanionView { try JSONDecoder().decode(CompanionView.self, from: Data(json.utf8)) }
+    private func view(_ json: String) throws -> CompanionViewState { try JSONDecoder().decode(CompanionViewState.self, from: Data(json.utf8)) }
     private func op(_ state: String, code: String? = nil, rpc: String? = nil) -> CoreOperation {
         CoreOperation(intent_id: "i", state: state, error: code.map { LocalError(domain: "companion", code: $0, message: "m", rpc_code: rpc) })
     }

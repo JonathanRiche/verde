@@ -15,6 +15,10 @@ struct CompanionSheet: View {
     let showHome: () -> Void
     let onHosts: () -> Void
     @State private var settings = false
+    /// Settings open on the Brain page.
+    @State private var settingsBrain = false
+    @State private var confirmNew = false
+    @State private var conversations = false
     /// A prompt typed or picked before the companion's chat existed; sent once it opens.
     @State private var pendingPrompt: String?
 
@@ -34,12 +38,34 @@ struct CompanionSheet: View {
         .tint(VerdeTheme.accent)
         .foregroundStyle(VerdeTheme.text)
         .font(VerdeTheme.ui())
-        .sheet(isPresented: $settings) { CompanionSettings(model: model, browse: browse) }
+        .sheet(isPresented: $settings) { CompanionSettings(model: model, browse: browse, startAtBrain: settingsBrain) }
+        .sheet(isPresented: $conversations) {
+            CompanionConversations(model: model, browse: browse)
+                .presentationDetents([.medium, .large])
+        }
+        .alert("Start a new conversation?", isPresented: $confirmNew) {
+            Button("New conversation") { Task { await model.newConversation() } }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(newConversationMessage(name: model.active?.name ?? "Your companion"))
+        }
     }
 
     private func content(_ active: RosterEntry) -> some View {
         VStack(spacing: 0) {
-            CompanionHeader(model: model, live: live, entry: active, showHome: showHome) { settings = true }
+            CompanionHeader(model: model, live: live, entry: active, showHome: showHome,
+                            newConversation: { confirmNew = true }, showConversations: { conversations = true }) {
+                settingsBrain = false; settings = true
+            }
+            if let handoff = model.brainSwitchText {
+                HStack(spacing: 8) {
+                    if model.brainSwitch?.inProgress == true { ProgressView().controlSize(.small) }
+                    Text(handoff).font(VerdeTheme.ui(12))
+                        .foregroundStyle(model.brainSwitch?.status == "failed" ? VerdeTheme.warning : VerdeTheme.accent)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16).padding(.bottom, 4)
+                .accessibilityElement(children: .combine)
+            }
             if let notice = model.notice {
                 Text(notice).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.warning)
                     .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16).padding(.bottom, 4)
@@ -54,7 +80,8 @@ struct CompanionSheet: View {
             Divider().overlay(VerdeTheme.border)
             if let conversation = model.conversation {
                 CompanionConversation(browse: browse, voice: voice, name: active.name, workspaceID: conversation.workspace,
-                                      threadID: conversation.thread, pendingPrompt: $pendingPrompt, onHosts: onHosts)
+                                      threadID: conversation.thread, pendingPrompt: $pendingPrompt, onHosts: onHosts,
+                                      openBrain: { settingsBrain = true; settings = true })
                     .id(conversation.workspace + "/" + conversation.thread)
             } else {
                 CompanionStarter(busy: model.creatingThread, name: active.name, voice: voice, send: { prompt in
@@ -84,6 +111,8 @@ private struct CompanionHeader: View {
     let live: LiveVoice
     let entry: RosterEntry
     let showHome: () -> Void
+    let newConversation: () -> Void
+    let showConversations: () -> Void
     let openSettings: () -> Void
     @AppStorage(CompanionBubbleStore.hiddenKey) private var bubbleHidden = false
 
@@ -110,6 +139,9 @@ private struct CompanionHeader: View {
             .accessibilityHint(live.active ? "" : "Starts a real-time voice conversation with \(entry.name).")
             .accessibilityIdentifier("companion-live")
             Menu {
+                Button(action: newConversation) { Label("New conversation", systemImage: "square.and.pencil") }
+                    .disabled(model.conversation == nil || model.saving)
+                Button(action: showConversations) { Label("Conversations…", systemImage: "clock.arrow.circlepath") }
                 Button(action: showHome) { Label("All activity", systemImage: "list.bullet.rectangle") }
                 if companions.count > 1 {
                     Menu {
@@ -347,6 +379,8 @@ private struct CompanionConversation: View {
     let threadID: String
     @Binding var pendingPrompt: String?
     let onHosts: () -> Void
+    /// The composer's brain label opens Settings → Brain.
+    let openBrain: () -> Void
     @State private var model: TranscriptModel?
     @AppStorage(CompanionVoiceStore.readAloudKey) private var readAloud = ""
 
@@ -397,7 +431,8 @@ private struct CompanionConversation: View {
                         transcript: voice.listening ? voice.partial : nil,
                         level: voice.level,
                         notice: voice.listening ? nil : voice.notice,
-                        trailing: AnyView(CompanionMicButton(voice: voice, name: name) { sendVoice($0, model) }))
+                        trailing: AnyView(CompanionMicButton(voice: voice, name: name) { sendVoice($0, model) }),
+                        openBrain: openBrain)
     }
 
     /// A transcript handed over from the bubble (or the starter) goes out as a voice turn.
@@ -418,18 +453,95 @@ private struct CompanionConversation: View {
     }
 }
 
+/// The active companion's conversations: the current one, then earlier ones (newest first).
+/// Tap to go back to one; "Remove from list" only drops it from the list.
+private struct CompanionConversations: View {
+    let model: CompanionModel
+    let browse: BrowseModel
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        let entry = model.active
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        NavigationStack {
+            List {
+                if let entry, !entry.thread_id.isEmpty {
+                    Section("Current") {
+                        row(title: model.conversationTitle, provider: entry.provider, modelID: entry.model, detail: "Now", current: true)
+                    }
+                }
+                Section {
+                    if entry?.history.isEmpty != false {
+                        Text("Earlier conversations appear here after you start a new one.")
+                            .font(VerdeTheme.ui(13)).foregroundStyle(VerdeTheme.muted)
+                    }
+                    ForEach(entry?.history ?? []) { item in
+                        Button {
+                            Task { if await model.resumeConversation(item.thread_id) { dismiss() } }
+                        } label: {
+                            row(title: item.title, provider: item.provider, modelID: item.model,
+                                detail: item.ended_at_ms > 0 ? agoLabel(item.ended_at_ms, now) : "", current: false)
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(model.saving)
+                        .accessibilityHint("Goes back to this conversation.")
+                        .swipeActions {
+                            Button(role: .destructive) { Task { await model.removeConversation(item.thread_id) } } label: {
+                                Label("Remove from list", systemImage: "minus.circle")
+                            }
+                        }
+                        .contextMenu {
+                            Button(role: .destructive) { Task { await model.removeConversation(item.thread_id) } } label: {
+                                Label("Remove from list", systemImage: "minus.circle")
+                            }
+                        }
+                    }
+                } header: { Text("Earlier") } footer: {
+                    Text("Removing only takes a conversation off this list; the chat stays in your history.")
+                }
+            }
+            .scrollContentBackground(.hidden)
+            .background(VerdeTheme.background)
+            .navigationTitle("Conversations")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+        }
+        .tint(VerdeTheme.accent)
+    }
+
+    private func row(title: String, provider: String, modelID: String, detail: String, current: Bool) -> some View {
+        HStack(spacing: 10) {
+            ProviderGlyph(provider: provider.isEmpty ? nil : provider)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title).font(VerdeTheme.ui(14)).lineLimit(1)
+                Text(brainLabel(provider: providerDisplayName(provider), model: modelID, effort: nil))
+                    .font(VerdeTheme.ui(11)).foregroundStyle(VerdeTheme.subtle).lineLimit(1)
+            }
+            Spacer(minLength: 6)
+            if current { Image(systemName: "checkmark").foregroundStyle(VerdeTheme.accent) }
+            else if !detail.isEmpty { Text(detail).font(VerdeTheme.ui(11)).foregroundStyle(VerdeTheme.subtle) }
+        }
+        .frame(minHeight: 44)
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
+    }
+}
+
 // MARK: - Settings
+
+enum CompanionSettingsPage: Hashable { case brain }
 
 struct CompanionSettings: View {
     let model: CompanionModel
     let browse: BrowseModel
+    /// Opens straight on Brain (from the sheet composer's brain label).
+    var startAtBrain = false
     @Environment(\.dismiss) private var dismiss
+    @State private var path: [CompanionSettingsPage] = []
     @State private var editingID = ""
     @State private var name = ""
     @State private var character = CompanionCharacter.sprout
     @State private var orders = ""
-    @State private var provider = ""
-    @State private var brainModel = ""
     @AppStorage(CompanionBubbleStore.hiddenKey) private var bubbleHidden = false
 
     private var dirty: Bool {
@@ -437,11 +549,11 @@ struct CompanionSettings: View {
         let cleaned = cleanCompanionName(name)
         let renamed = !cleaned.isEmpty && cleaned != active.name
         let changed = character != active.character || orders != active.orders
-        return renamed || changed || provider != active.provider || brainModel != active.model
+        return renamed || changed
     }
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
             Form {
                 if let notice = model.notice { Text(notice).foregroundStyle(VerdeTheme.warning) }
                 identity
@@ -469,7 +581,15 @@ struct CompanionSettings: View {
                     Button("Done") { Task { if await save() { dismiss() } } }.disabled(model.saving)
                 }
             }
-            .onAppear(perform: load)
+            .navigationDestination(for: CompanionSettingsPage.self) { page in
+                switch page {
+                case .brain: CompanionBrainScreen(model: model, browse: browse)
+                }
+            }
+            .onAppear {
+                load()
+                if startAtBrain && path.isEmpty { path = [.brain] }
+            }
             .onChange(of: name) { _, value in let clipped = utf8Prefix(value, RosterEntry.nameLimit); if clipped != value { name = clipped } }
             .onChange(of: orders) { _, value in let clipped = utf8Prefix(value, RosterEntry.ordersLimit); if clipped != value { orders = clipped } }
         }
@@ -498,15 +618,17 @@ struct CompanionSettings: View {
         }
     }
 
-    @ViewBuilder private var brain: some View {
-        if let home = model.active?.home_workspace_id, !home.isEmpty {
-            Section {
-                ManageContainer(browse: browse) { manage in
-                    BrainPicker(manage: manage, home: home, provider: $provider, model: $brainModel)
-                }
-            } header: { Text("Brain") } footer: {
-                Text("Used when \(name.isEmpty ? "your companion" : name) starts a new chat; an existing chat keeps its model.")
+    /// Brain: provider, model, effort and speed on their own page.
+    private var brain: some View {
+        let active = model.active
+        let label = brainLabel(provider: providerDisplayName(active?.provider ?? ""), model: active?.model, effort: nil)
+        return Section {
+            NavigationLink(value: CompanionSettingsPage.brain) {
+                LabeledContent("Brain", value: active?.provider.isEmpty == false ? label : "Default brain")
             }
+            .accessibilityIdentifier("companion-brain")
+        } header: { Text("Brain") } footer: {
+            Text("Choose the provider and model that do \(name.isEmpty ? "your companion" : name)'s work.")
         }
     }
 
@@ -551,22 +673,19 @@ struct CompanionSettings: View {
         name = active.name
         character = active.character
         orders = active.orders
-        provider = active.provider
-        brainModel = active.model
     }
 
     /// Saves pending identity, orders and brain edits for the companion being edited.
     private func save() async -> Bool {
         guard dirty else { return true }
-        let id = editingID, newName = name, newCharacter = character, newOrders = orders, newProvider = provider, newModel = brainModel
+        // The brain is saved by its own page; only identity and orders here.
+        let id = editingID, newName = name, newCharacter = character, newOrders = orders
         return await model.update { roster in
             guard roster.companions.contains(where: { $0.id == id }) else { return false }
             if !cleanCompanionName(newName).isEmpty { roster.rename(id, to: newName) }
             roster.edit(id) { entry in
                 entry.character = newCharacter
                 entry.orders = newOrders
-                entry.provider = newProvider
-                entry.model = newModel
             }
             return true
         }
@@ -582,43 +701,5 @@ struct CompanionSettings: View {
         guard await save(), let home = model.defaultHome else { return }
         await model.update { $0.add(character, home: home) != nil }
         load()
-    }
-}
-
-/// Provider and model menus from the host's new-chat catalog for the companion's home workspace.
-private struct BrainPicker: View {
-    let manage: ManageModel
-    let home: String
-    @Binding var provider: String
-    @Binding var model: String
-
-    var body: some View {
-        let chat = manage.view?.new_chat
-        let ready = chat?.workspace_id == home
-        Group {
-            menu("Provider", value: provider, choices: ready ? chat?.providers ?? [] : []) { value in
-                provider = value
-                model = ""
-                Task { await manage.select(home, ChatSelection(provider: value.isEmpty ? nil : value)) }
-            }
-            menu("Model", value: model, choices: ready ? chat?.catalogs.models ?? [] : []) { value in model = value }
-            if chat?.loading == true || !ready { ProgressView("Loading models…") }
-            if ready, let error = chat?.error { Text(newChatModelMessage(error)).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.warning) }
-        }
-        .task(id: home) {
-            await manage.select(home, ChatSelection(provider: provider.isEmpty ? nil : provider, model: model.isEmpty ? nil : model))
-        }
-    }
-
-    @ViewBuilder private func menu(_ label: String, value: String, choices: [ChatChoice], pick: @escaping (String) -> Void) -> some View {
-        Menu {
-            Button("Default") { pick("") }
-            ForEach(choices, id: \.id) { item in
-                Button(item.label + (item.favorite ? " ★" : "")) { pick(item.id) }.disabled(!item.enabled)
-            }
-        } label: {
-            LabeledContent(label, value: value.isEmpty ? "Default" : choices.first { $0.id == value }?.label ?? value)
-        }
-        .disabled(manage.busy)
     }
 }

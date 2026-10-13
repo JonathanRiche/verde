@@ -51,9 +51,41 @@ private func encodeExtras(_ extras: [String: JSONValue], _ encoder: Encoder, kno
     for (key, value) in extras where !known.contains(key) { try container.encode(value, forKey: AnyKey(key)) }
 }
 
+/// A past companion conversation ("Conversations…"), newest first in `RosterEntry.history`.
+struct CompanionHistoryItem: Codable, Equatable, Identifiable {
+    var thread_id: String
+    var title: String
+    var provider: String
+    var model: String
+    var ended_at_ms: Int64
+    var id: String { thread_id }
+
+    init(thread_id: String, title: String, provider: String = "", model: String = "", ended_at_ms: Int64) {
+        self.thread_id = thread_id; self.title = title; self.provider = provider; self.model = model; self.ended_at_ms = ended_at_ms
+    }
+    private enum Keys: String, CodingKey { case thread_id, title, provider, model, ended_at_ms }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: Keys.self)
+        thread_id = try c.decodeIfPresent(String.self, forKey: .thread_id) ?? ""
+        title = try c.decodeIfPresent(String.self, forKey: .title) ?? ""
+        provider = try c.decodeIfPresent(String.self, forKey: .provider) ?? ""
+        model = try c.decodeIfPresent(String.self, forKey: .model) ?? ""
+        ended_at_ms = try c.decodeIfPresent(Int64.self, forKey: .ended_at_ms) ?? 0
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: Keys.self)
+        try c.encode(thread_id, forKey: .thread_id)
+        try c.encode(title, forKey: .title)
+        try c.encode(provider, forKey: .provider)
+        try c.encode(model, forKey: .model)
+        try c.encode(ended_at_ms, forKey: .ended_at_ms)
+    }
+}
+
 struct RosterEntry: Codable, Identifiable, Equatable {
     static let nameLimit = 32
     static let ordersLimit = 1024
+    static let historyLimit = 12
 
     var id: String
     var name: String
@@ -65,6 +97,8 @@ struct RosterEntry: Codable, Identifiable, Equatable {
     var provider: String
     var model: String
     var orders: String
+    /// Earlier conversations, newest first (at most `historyLimit`); kept on every save.
+    var history: [CompanionHistoryItem] = []
     var extras: [String: JSONValue] = [:]
 
     var character: CompanionCharacter {
@@ -85,7 +119,7 @@ struct RosterEntry: Codable, Identifiable, Equatable {
     }
 
     private enum Keys: String, CodingKey, CaseIterable {
-        case id, name, character, home_workspace_id, thread_id, provider, model, orders
+        case id, name, character, home_workspace_id, thread_id, provider, model, orders, history
     }
     private static let known = Set(Keys.allCases.map(\.rawValue))
 
@@ -99,6 +133,7 @@ struct RosterEntry: Codable, Identifiable, Equatable {
         provider = try c.decodeIfPresent(String.self, forKey: .provider) ?? ""
         model = try c.decodeIfPresent(String.self, forKey: .model) ?? ""
         orders = try c.decodeIfPresent(String.self, forKey: .orders) ?? ""
+        history = (try? c.decodeIfPresent([CompanionHistoryItem].self, forKey: .history)) ?? []
         extras = try decodeExtras(decoder, known: Self.known)
     }
 
@@ -112,6 +147,7 @@ struct RosterEntry: Codable, Identifiable, Equatable {
         try c.encode(provider, forKey: .provider)
         try c.encode(model, forKey: .model)
         try c.encode(orders, forKey: .orders)
+        try c.encode(history, forKey: .history)
         try encodeExtras(extras, encoder, known: Self.known)
     }
 
@@ -119,7 +155,7 @@ struct RosterEntry: Codable, Identifiable, Equatable {
     static func == (a: RosterEntry, b: RosterEntry) -> Bool {
         a.id == b.id && a.name == b.name && a.characterRaw == b.characterRaw && a.home_workspace_id == b.home_workspace_id &&
             a.thread_id == b.thread_id && a.provider == b.provider && a.model == b.model && a.orders == b.orders &&
-            Set(a.extras.keys) == Set(b.extras.keys)
+            a.history == b.history && Set(a.extras.keys) == Set(b.extras.keys)
     }
 }
 
@@ -228,6 +264,65 @@ struct Roster: Codable, Equatable {
         companions[index].orders = utf8Prefix(companions[index].orders, RosterEntry.ordersLimit)
     }
 
+    /// Saves the companion's brain; with `thread`, also moves it to a fresh conversation (a provider
+    /// switch). Returns false when the companion is gone or nothing changed.
+    @discardableResult
+    mutating func setBrain(_ id: String, provider: String, model: String, thread: (workspace: String, thread: String)? = nil) -> Bool {
+        guard let index = companions.firstIndex(where: { $0.id == id }) else { return false }
+        var entry = companions[index]
+        entry.provider = provider
+        entry.model = model
+        if let thread {
+            entry.home_workspace_id = thread.workspace
+            entry.thread_id = thread.thread
+        }
+        guard entry != companions[index] else { return false }
+        companions[index] = entry
+        return true
+    }
+
+    /// "New conversation": the current chat moves to the front of the history (deduplicated,
+    /// capped) and the companion starts fresh; its next message creates a new chat with its brain.
+    @discardableResult
+    mutating func startNewConversation(_ id: String, title: String, at now: Int64) -> Bool {
+        guard let index = companions.firstIndex(where: { $0.id == id }), !companions[index].thread_id.isEmpty else { return false }
+        Self.pushHistory(&companions[index], title: title, at: now)
+        companions[index].thread_id = ""
+        return true
+    }
+
+    /// Goes back to an earlier conversation: it leaves the history, the current one joins it, and
+    /// the companion takes the earlier chat's brain when the entry recorded one.
+    @discardableResult
+    mutating func resumeConversation(_ id: String, threadID: String, currentTitle: String, at now: Int64) -> Bool {
+        guard let index = companions.firstIndex(where: { $0.id == id }),
+              let item = companions[index].history.first(where: { $0.thread_id == threadID }),
+              companions[index].thread_id != threadID else { return false }
+        companions[index].history.removeAll { $0.thread_id == threadID }
+        if !companions[index].thread_id.isEmpty { Self.pushHistory(&companions[index], title: currentTitle, at: now) }
+        companions[index].thread_id = item.thread_id
+        if !item.provider.isEmpty { companions[index].provider = item.provider }
+        if !item.model.isEmpty { companions[index].model = item.model }
+        return true
+    }
+
+    /// "Remove from list": drops a past conversation from the history only (the chat stays).
+    @discardableResult
+    mutating func removeHistory(_ id: String, threadID: String) -> Bool {
+        guard let index = companions.firstIndex(where: { $0.id == id }),
+              companions[index].history.contains(where: { $0.thread_id == threadID }) else { return false }
+        companions[index].history.removeAll { $0.thread_id == threadID }
+        return true
+    }
+
+    private static func pushHistory(_ entry: inout RosterEntry, title: String, at now: Int64) {
+        let item = CompanionHistoryItem(thread_id: entry.thread_id, title: title.isEmpty ? "Conversation" : title,
+                                        provider: entry.provider, model: entry.model, ended_at_ms: now)
+        entry.history.removeAll { $0.thread_id == item.thread_id }
+        entry.history.insert(item, at: 0)
+        if entry.history.count > RosterEntry.historyLimit { entry.history.removeLast(entry.history.count - RosterEntry.historyLimit) }
+    }
+
     /// Records a newly created thread only if no other client bound one meanwhile.
     @discardableResult
     mutating func bindThread(_ id: String, workspace: String, thread: String) -> Bool {
@@ -280,12 +375,46 @@ struct RosterSnapshot: Equatable {
     /// 0 = never saved.
     var revision: Int
     var roster: Roster
+    /// The latest brain switch the host reported.
+    var brainSwitch: BrainSwitchState? = nil
+}
+
+/// `companion.brain_switch`: a provider switch that keeps the conversation (brief, then switch).
+struct BrainSwitchState: Codable, Equatable {
+    var intent_id: String
+    /// `pending`, `briefing`, `switched` or `failed`.
+    var status: String
+    var error_code: String?
+    var from: String
+    var to: String
+
+    init(intent_id: String, status: String, error_code: String? = nil, from: String, to: String) {
+        self.intent_id = intent_id; self.status = status; self.error_code = error_code; self.from = from; self.to = to
+    }
+    private enum Keys: String, CodingKey { case intent_id, status, error_code, from, to }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: Keys.self)
+        intent_id = try c.decodeIfPresent(String.self, forKey: .intent_id) ?? ""
+        status = try c.decodeIfPresent(String.self, forKey: .status) ?? "pending"
+        error_code = try c.decodeIfPresent(String.self, forKey: .error_code)
+        from = try c.decodeIfPresent(String.self, forKey: .from) ?? ""
+        to = try c.decodeIfPresent(String.self, forKey: .to) ?? ""
+    }
+    var inProgress: Bool { status == "pending" || status == "briefing" }
 }
 
 private struct RosterGetResponse: Decodable {
     var revision: Int?
     var roster: Roster?
+    var brain_switch: BrainSwitchState?
 }
+private struct BrainSwitchRequest: Encodable {
+    var companion_id: String
+    var provider: String
+    var model: String?
+    var brief: Bool
+}
+private struct BrainSwitchResponse: Decodable { var brain_switch: BrainSwitchState? }
 private struct RosterPutRequest: Encodable {
     var roster: Roster
     var expected_revision: Int
@@ -480,6 +609,7 @@ enum CompanionMethod: String {
     case rosterGet = "companion.roster.get"
     case rosterPut = "companion.roster.put"
     case linksList = "chat.links.list"
+    case brainSwitch = "companion.brain.switch"
 }
 
 enum CompanionRPCError: Error, Equatable {
@@ -505,7 +635,7 @@ struct CompanionClient {
     func roster() async throws -> RosterSnapshot {
         let data = try await rpc.call(.rosterGet, params: Data("{}".utf8))
         guard let response = try? JSONDecoder().decode(RosterGetResponse.self, from: data) else { throw CompanionRPCError.invalidResponse }
-        return RosterSnapshot(revision: response.revision ?? 0, roster: response.roster ?? Roster())
+        return RosterSnapshot(revision: response.revision ?? 0, roster: response.roster ?? Roster(), brainSwitch: response.brain_switch)
     }
 
     func put(_ roster: Roster, expected: Int) async throws -> Int {
@@ -513,6 +643,15 @@ struct CompanionClient {
         let data = try await rpc.call(.rosterPut, params: params)
         guard let response = try? JSONDecoder().decode(RosterPutResponse.self, from: data) else { throw CompanionRPCError.invalidResponse }
         return response.revision
+    }
+
+    /// Switches the companion's provider on the same conversation (`brief`: the outgoing brain
+    /// writes a handoff brief first). Returns the switch as the host reports it.
+    func switchBrain(companionID: String, provider: String, model: String?, brief: Bool) async throws -> BrainSwitchState? {
+        let params = try JSONEncoder().encode(BrainSwitchRequest(companion_id: companionID, provider: provider,
+                                                                 model: model?.isEmpty == false ? model : nil, brief: brief))
+        let data = try await rpc.call(.brainSwitch, params: params)
+        return (try? JSONDecoder().decode(BrainSwitchResponse.self, from: data))?.brain_switch
     }
 
     func crew(workspace: String, thread: String) async throws -> [CrewLink] {
@@ -573,4 +712,79 @@ func crewSummary(_ crew: [CrewLink]) -> String? {
         (count { $0 == .done }, "done"),
     ].filter { $0.0 > 0 }.map { "\($0.0) \($0.1)" }
     return parts.isEmpty ? "\(crew.count) idle" : parts.joined(separator: " · ")
+}
+
+// MARK: - Brain
+
+/// The companion's chat as far as a brain change is concerned.
+enum BrainThreadState: Equatable {
+    /// No chat yet: only the roster changes (the first chat uses it).
+    case noChat
+    /// A chat that never sent anything: even the provider can change in place.
+    case empty
+    case committed
+}
+
+enum BrainChange: Equatable {
+    /// Save to the roster only (the first chat uses it).
+    case rosterOnly
+    /// Same provider: change the current chat's settings through the composer.
+    case inPlace
+    /// A new provider on a chat with nothing to hand off: the host switches at once.
+    case switchNow
+    /// A new provider mid-conversation: confirm, then the outgoing brain briefs its successor on
+    /// the same chat.
+    case handoff
+}
+
+func classifyBrainChange(currentProvider: String, newProvider: String, thread: BrainThreadState) -> BrainChange {
+    if thread == .noChat { return .rosterOnly }
+    if newProvider.isEmpty || newProvider == currentProvider { return .inPlace }
+    return thread == .empty ? .switchNow : .handoff
+}
+
+/// "Claude · Opus 5.5 · High"; defaults are left out.
+func brainLabel(provider: String, model: String?, effort: String?) -> String {
+    let parts = [provider, model ?? "", effort ?? ""].filter { !$0.isEmpty && $0 != "Default" }
+    return parts.isEmpty ? "Default brain" : parts.joined(separator: " · ")
+}
+
+/// A provider id as people know it, preferring the host's own label.
+func providerDisplayName(_ id: String, choices: [ChatChoice] = []) -> String {
+    if let label = choices.first(where: { $0.id == id })?.label, !label.isEmpty { return label }
+    switch id {
+    case "": return ""
+    case "codex": return "Codex"
+    case "opencode": return "OpenCode"
+    case "fx": return "FX"
+    default: return id.prefix(1).uppercased() + id.dropFirst()
+    }
+}
+
+func brainSwitchTitle(name: String, provider: String) -> String { "Switch \(name) to \(provider)?" }
+
+func brainSwitchMessage(name: String, from: String, to: String) -> String {
+    "\(name) keeps this conversation. \(from) will write a quick handoff brief first, then \(to) takes over with the brief and recent history."
+}
+
+/// The sheet's progress line for a brain switch; nil once it's done.
+func brainSwitchStatusText(_ state: BrainSwitchState?, name: String, providerName: (String) -> String = { providerDisplayName($0) }) -> String? {
+    guard let state else { return nil }
+    switch state.status {
+    case "pending", "briefing": return "Handing off to \(providerName(state.to))…"
+    case "failed": return brainSwitchErrorText(state.error_code, name: name)
+    default: return nil
+    }
+}
+
+func brainSwitchErrorText(_ code: String?, name: String) -> String {
+    switch code {
+    case "companion_busy"?: return "\(name) is working right now. Switch when the current turn finishes."
+    case "provider_unavailable"?: return "That provider isn't available on the computer right now."
+    default: return "Couldn't switch \(name)'s brain."
+    }
+}
+
+func newConversationMessage(name: String) -> String {
+    "\(name) starts fresh with its current brain. This conversation moves to Conversations… so you can go back to it."
 }
