@@ -51,7 +51,7 @@ final class CompanionRosterTests: XCTestCase {
         XCTAssertEqual(companions[1]["character"] as? String, "vireo")
         XCTAssertEqual(companions[0]["thread_id"] as? String, "")
         XCTAssertNotNil(companions[1]["mood"])
-        XCTAssertEqual(Set(companions[0].keys), ["id", "name", "character", "home_workspace_id", "thread_id", "provider", "model", "orders"])
+        XCTAssertEqual(Set(companions[0].keys), ["id", "name", "character", "home_workspace_id", "thread_id", "provider", "model", "orders", "history"])
     }
 
     func testUnknownCharacterDrawsAsSproutButRoundTrips() throws {
