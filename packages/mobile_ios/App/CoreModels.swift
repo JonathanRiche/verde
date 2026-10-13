@@ -1522,6 +1522,7 @@ enum Event: Codable {
     case `voice_providers_refresh`(EventVoiceProvidersRefresh)
     case `voice_provider_configure`(EventVoiceProviderConfigure)
     case `voice_session_create`(EventVoiceSessionCreate)
+    case `companion_transcript_save`(EventCompanionTranscriptSave)
     case `companion_crew_refresh`(EventCompanionCrewRefresh)
     case `push_received`(EventPushReceived)
     case `terminal_input`(EventTerminalInput)
@@ -1606,6 +1607,7 @@ enum Event: Codable {
         case "voice_providers_refresh": self = .`voice_providers_refresh`(try EventVoiceProvidersRefresh(from: decoder))
         case "voice_provider_configure": self = .`voice_provider_configure`(try EventVoiceProviderConfigure(from: decoder))
         case "voice_session_create": self = .`voice_session_create`(try EventVoiceSessionCreate(from: decoder))
+        case "companion_transcript_save": self = .`companion_transcript_save`(try EventCompanionTranscriptSave(from: decoder))
         case "companion_crew_refresh": self = .`companion_crew_refresh`(try EventCompanionCrewRefresh(from: decoder))
         case "push_received": self = .`push_received`(try EventPushReceived(from: decoder))
         case "terminal_input": self = .`terminal_input`(try EventTerminalInput(from: decoder))
@@ -1691,6 +1693,7 @@ enum Event: Codable {
         case .`voice_providers_refresh`(let value): try value.encode(to: encoder)
         case .`voice_provider_configure`(let value): try value.encode(to: encoder)
         case .`voice_session_create`(let value): try value.encode(to: encoder)
+        case .`companion_transcript_save`(let value): try value.encode(to: encoder)
         case .`companion_crew_refresh`(let value): try value.encode(to: encoder)
         case .`push_received`(let value): try value.encode(to: encoder)
         case .`terminal_input`(let value): try value.encode(to: encoder)
@@ -5143,6 +5146,56 @@ extension EventVoiceSessionCreate {
         try c.encode(self.`companion_id`, forKey: .`companion_id`)
         var tag = encoder.container(keyedBy: ModelDiscriminator.self)
         try tag.encode("voice_session_create", forKey: .type)
+    }
+}
+
+struct EventCompanionTranscriptSave: Codable {
+    var `api_version`: UInt32 = 1
+    var `now_ms`: Int64
+    var `wall_time_ms`: Int64
+    var `intent_id`: String
+    var `workspace_id`: String
+    var `thread_id`: String
+    var `session_id`: String
+    var `messages`: [CompanionTranscriptMessage]
+}
+
+extension EventCompanionTranscriptSave {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `now_ms`
+        case `wall_time_ms`
+        case `intent_id`
+        case `workspace_id`
+        case `thread_id`
+        case `session_id`
+        case `messages`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`now_ms` = try c.decode(Int64.self, forKey: .`now_ms`)
+        self.`wall_time_ms` = try c.decode(Int64.self, forKey: .`wall_time_ms`)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        self.`thread_id` = try c.decode(String.self, forKey: .`thread_id`)
+        self.`session_id` = try c.decode(String.self, forKey: .`session_id`)
+        self.`messages` = try c.decode([CompanionTranscriptMessage].self, forKey: .`messages`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`now_ms`, forKey: .`now_ms`)
+        try c.encode(self.`wall_time_ms`, forKey: .`wall_time_ms`)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`thread_id`, forKey: .`thread_id`)
+        try c.encode(self.`session_id`, forKey: .`session_id`)
+        try c.encode(self.`messages`, forKey: .`messages`)
+        var tag = encoder.container(keyedBy: ModelDiscriminator.self)
+        try tag.encode("companion_transcript_save", forKey: .type)
     }
 }
 
@@ -9821,6 +9874,44 @@ extension CompanionQuery {
         try c.encode(self.`revision`, forKey: .`revision`)
         try c.encode(self.`data`, forKey: .`data`)
         try c.encode(self.`error`, forKey: .`error`)
+    }
+}
+
+struct CompanionTranscriptMessage: Codable {
+    var `key`: String
+    var `role`: String
+    var `author`: String = ""
+    var `body`: String
+    var `created_at_ms`: Int64 = 0
+}
+
+extension CompanionTranscriptMessage {
+    private enum CodingKeys: String, CodingKey {
+        case `key`
+        case `role`
+        case `author`
+        case `body`
+        case `created_at_ms`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`key` = try c.decode(String.self, forKey: .`key`)
+        self.`role` = try c.decode(String.self, forKey: .`role`)
+        if !c.contains(.`author`) { self.`author` = "" } else {
+        self.`author` = try c.decode(String.self, forKey: .`author`)
+        }
+        self.`body` = try c.decode(String.self, forKey: .`body`)
+        if !c.contains(.`created_at_ms`) { self.`created_at_ms` = 0 } else {
+        self.`created_at_ms` = try c.decode(Int64.self, forKey: .`created_at_ms`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`key`, forKey: .`key`)
+        try c.encode(self.`role`, forKey: .`role`)
+        try c.encode(self.`author`, forKey: .`author`)
+        try c.encode(self.`body`, forKey: .`body`)
+        try c.encode(self.`created_at_ms`, forKey: .`created_at_ms`)
     }
 }
 

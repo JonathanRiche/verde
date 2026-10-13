@@ -152,6 +152,7 @@ pub const types = .{
     .{ "CompanionCrew", companion.Crew },
     .{ "CompanionView", companion.View },
     .{ "CompanionQuery", wire.Query(companion.View) },
+    .{ "CompanionTranscriptMessage", companion.TranscriptMessage },
     .{ "VoiceProvider", voice.Provider },
     .{ "VoiceTool", voice.Tool },
     .{ "VoiceSessionCompanion", voice.SessionCompanion },

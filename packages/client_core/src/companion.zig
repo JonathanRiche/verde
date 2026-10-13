@@ -20,6 +20,11 @@ pub const MAX_COMPANIONS = 8;
 pub const MAX_NAME_BYTES = 32;
 pub const MAX_ORDERS_BYTES = 1024;
 pub const MAX_LINKS = 256;
+/// `companion_transcript_save` bounds: messages per event and bytes per body.
+pub const MAX_TRANSCRIPT_MESSAGES = 200;
+pub const MAX_TRANSCRIPT_BODY = 8192;
+const MAX_TRANSCRIPT_REF = 128;
+const MAX_SAVE_JOBS = 8;
 const MAX_REF_BYTES = 160;
 
 /// One companion. `character` is `sprout`, `moss` or `vireo`; empty strings
@@ -74,7 +79,28 @@ pub const View = struct {
     @"error": ?h.LocalError = null,
 };
 
+/// One saved line of a live voice session; `key` is stable per line within the session.
+pub const TranscriptMessage = struct {
+    key: []const u8,
+    role: []const u8,
+    author: []const u8 = "",
+    body: []const u8,
+    created_at_ms: i64 = 0,
+};
+/// A queued `companion_transcript_save`, appended one message at a time.
+const SaveJob = struct {
+    intent_id: []const u8,
+    workspace_id: []const u8,
+    thread_id: []const u8,
+    session_id: []const u8,
+    messages: []const TranscriptMessage,
+    index: usize = 0,
+    rpc_id: ?u64 = null,
+    registering: bool = false,
+};
+
 pub const State = struct {
+    saves: []const SaveJob = &.{},
     view: View = .{ .roster = .{}, .crew = .{} },
     get_id: ?u64 = null,
     get_intent: []const u8 = "",
@@ -85,7 +111,7 @@ pub const State = struct {
     crew_intent: []const u8 = "",
 };
 
-const tags = [_][]const u8{ "companion_refresh", "companion_save", "companion_crew_refresh" };
+const tags = [_][]const u8{ "companion_refresh", "companion_save", "companion_crew_refresh", "companion_transcript_save" };
 const read: rpc.Options = .{ .mutation = false, .intent_id = "@companion" };
 
 pub fn owns(tag: []const u8) bool {
@@ -99,6 +125,8 @@ pub fn receiptFields(context: []const u8) ?[]const u8 {
     if (eq(context, "companion_crew_refresh")) return "workspace_id thread_id";
     if (eq(context, "roster")) return "version active_id companions";
     if (eq(context, "companions")) return "id name character home_workspace_id thread_id provider model orders";
+    if (eq(context, "companion_transcript_save")) return "workspace_id thread_id session_id messages";
+    if (eq(context, "messages")) return "key role author body created_at_ms";
     return null;
 }
 
@@ -107,8 +135,12 @@ pub fn validate(a: A, tag: []const u8, event: V) E!void {
         _ = try h.decode(struct { roster: Roster, expected_revision: []const u8 }, a, event);
     } else if (eq(tag, "companion_crew_refresh")) {
         _ = try h.decode(struct { workspace_id: []const u8, thread_id: []const u8 }, a, event);
+    } else if (eq(tag, "companion_transcript_save")) {
+        _ = try h.decode(TranscriptSave, a, event);
     }
 }
+
+const TranscriptSave = struct { workspace_id: []const u8, thread_id: []const u8, session_id: []const u8, messages: []const TranscriptMessage };
 
 pub fn intent(tx: *h.Transaction, tag: []const u8, event: V) E!void {
     if (!owns(tag)) return;
@@ -121,6 +153,7 @@ pub fn intent(tx: *h.Transaction, tag: []const u8, event: V) E!void {
         if (s.get_id != null) return receipt(tx, id, "succeeded", null);
         return requestRoster(tx, id);
     }
+    if (eq(tag, "companion_transcript_save")) return transcriptSave(tx, id, event);
     if (eq(tag, "companion_crew_refresh")) {
         if (!scoped(&tx.state, "chat:read")) return receipt(tx, id, "failed", failure("insufficient_scope", "This phone can't read chats on this host."));
         const r = try h.decode(struct { workspace_id: []const u8, thread_id: []const u8 }, tx.allocator(), event);
@@ -173,15 +206,17 @@ pub fn pump(tx: *h.Transaction) E!void {
             try rosterWritten(tx, result);
         } else if (s.crew_id != null and s.crew_id.? == result.id) {
             try crewListed(tx, result);
+        } else if (s.saves.len > 0 and s.saves[0].rpc_id != null and s.saves[0].rpc_id.? == result.id) {
+            try transcriptStep(tx, result);
         }
     }
 }
 
-/// Signing out or forgetting the host drops the roster and crew.
+/// Signing out or forgetting the host drops the roster, crew and queued transcript saves.
 pub fn observe(tx: *h.Transaction) void {
     if (tx.state.auth.credential != null) return;
     const s = &tx.state.companion;
-    if (s.view.loaded or s.view.crew.links.len > 0 or s.get_id != null or s.put_id != null or s.crew_id != null) {
+    if (s.view.loaded or s.view.crew.links.len > 0 or s.get_id != null or s.put_id != null or s.crew_id != null or s.saves.len > 0) {
         tx.state.companion = .{};
         tx.changed = true;
     }
@@ -198,6 +233,104 @@ pub fn scopes(a: A, before: *const h.State, after: *const h.State, host_changed:
     _ = a;
     if (host_changed or !clone.equal(View, before.companion.view, after.companion.view)) return &.{"companion"};
     return &.{};
+}
+
+/// Validates, bounds and queues a live voice transcript for `chat.message.append`.
+fn transcriptSave(tx: *h.Transaction, id: []const u8, event: V) E!void {
+    const a = tx.allocator();
+    const s = &tx.state.companion;
+    if (!scoped(&tx.state, "chat:write")) return receipt(tx, id, "failed", failure("insufficient_scope", "This phone can't write to chats on this host."));
+    const r = try h.decode(TranscriptSave, a, event);
+    if (!ref(r.workspace_id) or !ref(r.thread_id) or !ref(r.session_id) or r.session_id.len > MAX_TRANSCRIPT_REF)
+        return receipt(tx, id, "failed", failure("invalid_thread", "This companion has no conversation yet."));
+    if (r.messages.len > MAX_TRANSCRIPT_MESSAGES) return receipt(tx, id, "failed", failure("too_many", "Save at most 200 lines at a time."));
+    var messages: []const TranscriptMessage = &.{};
+    for (r.messages) |m| {
+        if (!ref(m.key) or m.key.len > MAX_TRANSCRIPT_REF) return receipt(tx, id, "failed", failure("invalid_message", "A transcript line has no key."));
+        if (!(eq(m.role, "user") or eq(m.role, "assistant") or eq(m.role, "system"))) return receipt(tx, id, "failed", failure("invalid_role", "A transcript line has an unknown role."));
+        if (std.mem.trim(u8, m.body, " \t\r\n").len == 0) continue;
+        try add(TranscriptMessage, a, &messages, .{ .key = m.key, .role = m.role, .author = m.author, .body = try clip(a, m.body, MAX_TRANSCRIPT_BODY), .created_at_ms = m.created_at_ms });
+    }
+    if (messages.len == 0) return receipt(tx, id, "succeeded", null);
+    if (s.saves.len >= MAX_SAVE_JOBS) return receipt(tx, id, "failed", failure("busy", "Still saving earlier transcripts. Try again shortly."));
+    try add(SaveJob, a, &s.saves, .{ .intent_id = id, .workspace_id = r.workspace_id, .thread_id = r.thread_id, .session_id = r.session_id, .messages = messages });
+    receipt(tx, id, "pending", null);
+    if (s.saves.len == 1) try advanceSave(tx);
+}
+
+/// Issues the next request of the oldest queued save: register a client first, then one append per line.
+fn advanceSave(tx: *h.Transaction) E!void {
+    const s = &tx.state.companion;
+    while (s.saves.len > 0) {
+        const job = @constCast(&s.saves[0]);
+        if (!online(&tx.state)) {
+            const id = job.intent_id;
+            dropSave(tx);
+            receipt(tx, id, "failed", failure("offline", "Connect to the host to save the voice transcript."));
+            continue;
+        }
+        const client = tx.state.chat.client_id orelse {
+            job.registering = true;
+            job.rpc_id = try rpc.request(tx, "daemon.client.register", .{ .persistent = false }, .{ .intent_id = "@companion" });
+            return;
+        };
+        const m = job.messages[job.index];
+        const a = tx.allocator();
+        const message_id = try std.fmt.allocPrint(a, "live:{s}:{s}", .{ job.session_id, m.key });
+        job.registering = false;
+        job.rpc_id = try rpc.request(tx, "chat.message.append", .{
+            .mutation = .{ .request_key = message_id, .client_id = client },
+            .workspace_id = job.workspace_id,
+            .thread_id = job.thread_id,
+            .message = .{ .message_id = message_id, .role = m.role, .author = m.author, .body = m.body, .created_at_ms = m.created_at_ms, .updated_at_ms = m.created_at_ms },
+        }, .{ .intent_id = "@companion" });
+        return;
+    }
+}
+
+fn transcriptStep(tx: *h.Transaction, result: rpc.Result) E!void {
+    const s = &tx.state.companion;
+    const job = @constCast(&s.saves[0]);
+    job.rpc_id = null;
+    if (result.@"error") |e| {
+        const id = job.intent_id;
+        dropSave(tx);
+        receipt(tx, id, "failed", named(e));
+        return advanceSave(tx);
+    }
+    if (job.registering) {
+        const client = p.s(result.value orelse .null, "client_id");
+        if (client.len == 0) {
+            const id = job.intent_id;
+            dropSave(tx);
+            receipt(tx, id, "failed", failure("invalid_client", "The host did not register this device."));
+            return advanceSave(tx);
+        }
+        tx.state.chat.client_id = client;
+        return advanceSave(tx);
+    }
+    job.index += 1;
+    if (job.index >= job.messages.len) {
+        const id = job.intent_id;
+        dropSave(tx);
+        receipt(tx, id, "succeeded", null);
+    }
+    try advanceSave(tx);
+}
+
+fn dropSave(tx: *h.Transaction) void {
+    const s = &tx.state.companion;
+    s.saves = s.saves[1..];
+    tx.changed = true;
+}
+
+/// At most `max` bytes, cut on a UTF-8 boundary and ending with an ellipsis when clipped.
+pub fn clip(a: A, body: []const u8, max: usize) E![]const u8 {
+    if (body.len <= max) return body;
+    const ellipsis = "\u{2026}";
+    var end = max - ellipsis.len;
+    while (end > 0 and (body[end] & 0xC0) == 0x80) end -= 1;
+    return std.fmt.allocPrint(a, "{s}{s}", .{ body[0..end], ellipsis });
 }
 
 fn requestRoster(tx: *h.Transaction, intent_id: []const u8) E!void {

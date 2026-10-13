@@ -225,3 +225,71 @@ test "crew lists the companion thread's links and resets when the companion chan
     try expect(p.rows(p.get(crew, "links")).len == 0 and p.yes(p.get(crew, "loading")));
     try eql("t2", p.s(crew, "thread_id"));
 }
+
+const Line = companion.TranscriptMessage;
+
+test "transcript save registers once, appends each line with a stable request key and clips long bodies" {
+    var f = try Fixture.init(all_scopes);
+    defer f.deinit();
+    const long = try f.a().alloc(u8, companion.MAX_TRANSCRIPT_BODY + 100);
+    @memset(long, 'x');
+    const lines = [_]Line{
+        .{ .key = "0", .role = "system", .author = "Live", .body = "Live voice · xAI Grok", .created_at_ms = 10 },
+        .{ .key = "1", .role = "user", .author = "You (voice)", .body = "  ", .created_at_ms = 11 },
+        .{ .key = "2", .role = "assistant", .author = "Moss (voice)", .body = long, .created_at_ms = 12 },
+    };
+    const id = try f.intent("companion_transcript_save", .{ .workspace_id = "ws", .thread_id = "t1", .session_id = "s1", .messages = lines });
+    try eql("pending", (try f.receipt(id)).state);
+    _ = try f.reply("daemon.client.register", "{\"client_id\":\"phone\"}");
+    var sent = try f.params("chat.message.append");
+    try eql("live:s1:0", p.s(p.get(sent, "mutation"), "request_key"));
+    try eql("phone", p.s(p.get(sent, "mutation"), "client_id"));
+    try eql("t1", p.s(sent, "thread_id"));
+    try eql("live:s1:0", p.s(p.get(sent, "message"), "message_id"));
+    try eql("system", p.s(p.get(sent, "message"), "role"));
+    try expect(p.num(p.get(p.get(sent, "message"), "updated_at_ms")).? == 10);
+    _ = try f.reply("chat.message.append", "{\"store_revision\":5,\"applied\":true}");
+    // The blank line is skipped; the long one is clipped with an ellipsis.
+    sent = try f.params("chat.message.append");
+    try eql("live:s1:2", p.s(p.get(sent, "message"), "message_id"));
+    const body = p.s(p.get(sent, "message"), "body");
+    try expect(body.len <= companion.MAX_TRANSCRIPT_BODY);
+    try expect(std.mem.endsWith(u8, body, "\u{2026}"));
+    try expect(f.pending("chat.message.append") == 1);
+    _ = try f.reply("chat.message.append", "{\"store_revision\":6,\"applied\":true}");
+    try eql("succeeded", (try f.receipt(id)).state);
+    try expect(f.host.state.companion.saves.len == 0);
+    // A retry of the same lines reuses the same request keys (the daemon deduplicates), without re-registering.
+    _ = try f.intent("companion_transcript_save", .{ .workspace_id = "ws", .thread_id = "t1", .session_id = "s1", .messages = lines[0..1] });
+    try expect(f.pending("daemon.client.register") == 0);
+    try eql("live:s1:0", p.s(p.get(try f.params("chat.message.append"), "mutation"), "request_key"));
+}
+
+test "transcript save rejects bad input locally and a failed append moves on to the next save" {
+    var f = try Fixture.init(all_scopes);
+    defer f.deinit();
+    f.host.state.chat.client_id = "phone";
+    const bad = try f.intent("companion_transcript_save", .{ .workspace_id = "ws", .thread_id = "t1", .session_id = "s", .messages = [_]Line{.{ .key = "0", .role = "tool", .body = "x" }} });
+    try eql("invalid_role", (try f.receipt(bad)).@"error".?.code);
+    const many = try f.a().alloc(Line, companion.MAX_TRANSCRIPT_MESSAGES + 1);
+    for (many) |*m| m.* = .{ .key = "k", .role = "user", .body = "x" };
+    const too_many = try f.intent("companion_transcript_save", .{ .workspace_id = "ws", .thread_id = "t1", .session_id = "s", .messages = many });
+    try eql("too_many", (try f.receipt(too_many)).@"error".?.code);
+    const empty = try f.intent("companion_transcript_save", .{ .workspace_id = "ws", .thread_id = "t1", .session_id = "s", .messages = [_]Line{} });
+    try eql("succeeded", (try f.receipt(empty)).state);
+    try expect(f.pending("chat.message.append") == 0);
+
+    const first = try f.intent("companion_transcript_save", .{ .workspace_id = "ws", .thread_id = "gone", .session_id = "a", .messages = [_]Line{.{ .key = "0", .role = "user", .body = "hi" }} });
+    const second = try f.intent("companion_transcript_save", .{ .workspace_id = "ws", .thread_id = "t1", .session_id = "b", .messages = [_]Line{.{ .key = "0", .role = "assistant", .body = "hello" }} });
+    try expect(f.pending("chat.message.append") == 1);
+    _ = try f.reject("chat.message.append", "resource_not_found");
+    try eql("failed", (try f.receipt(first)).state);
+    try eql("live:b:0", p.s(p.get(try f.params("chat.message.append"), "mutation"), "request_key"));
+    _ = try f.reply("chat.message.append", "{\"store_revision\":2,\"applied\":true}");
+    try eql("succeeded", (try f.receipt(second)).state);
+
+    var r = try Fixture.init(&.{"chat:read"});
+    defer r.deinit();
+    const denied = try r.intent("companion_transcript_save", .{ .workspace_id = "ws", .thread_id = "t1", .session_id = "s", .messages = [_]Line{.{ .key = "0", .role = "user", .body = "hi" }} });
+    try eql("insufficient_scope", (try r.receipt(denied)).@"error".?.code);
+}

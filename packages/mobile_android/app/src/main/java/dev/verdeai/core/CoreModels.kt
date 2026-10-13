@@ -1284,6 +1284,19 @@ data class EventVoiceSessionCreate(
 ) : Event()
 
 @Serializable
+@SerialName("companion_transcript_save")
+data class EventCompanionTranscriptSave(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `workspace_id`: String,
+    val `thread_id`: String,
+    val `session_id`: String,
+    val `messages`: List<CompanionTranscriptMessage>,
+) : Event()
+
+@Serializable
 @SerialName("companion_crew_refresh")
 data class EventCompanionCrewRefresh(
     val `api_version`: Long = 1,
@@ -2418,6 +2431,15 @@ data class CompanionQuery(
     val `revision`: String,
     val `data`: CompanionView?,
     val `error`: LocalError?,
+)
+
+@Serializable
+data class CompanionTranscriptMessage(
+    val `key`: String,
+    val `role`: String,
+    val `author`: String = "",
+    val `body`: String,
+    val `created_at_ms`: Long = 0,
 )
 
 @Serializable

@@ -91,6 +91,7 @@ pub const Event = union(enum) {
     voice_providers_refresh: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8 },
     voice_provider_configure: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, provider: []const u8, api_key: ?[]const u8 = null, model: ?[]const u8 = null, voice: ?[]const u8 = null, make_default: ?bool = null },
     voice_session_create: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, provider: ?[]const u8 = null, model: ?[]const u8 = null, voice: ?[]const u8 = null, companion_id: ?[]const u8 = null },
+    companion_transcript_save: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, workspace_id: []const u8, thread_id: []const u8, session_id: []const u8, messages: []const @import("companion.zig").TranscriptMessage },
     companion_crew_refresh: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, workspace_id: []const u8, thread_id: []const u8 },
     push_received: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, workspace_id: []const u8, thread_id: []const u8, turn_id: []const u8, kind: []const u8 },
     terminal_input: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, terminal_id: []const u8, vt_modes: VtModes, input: struct { kind: enum { text, key, paste }, text: ?[]const u8 = null, key: ?[]const u8 = null, ctrl: bool, alt: bool, shift: bool } },
