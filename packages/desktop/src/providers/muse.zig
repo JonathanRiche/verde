@@ -825,8 +825,31 @@ fn parseModelListAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]p
             else
                 null,
         });
+        if (std.mem.eql(u8, model_id, WONDER_MODEL_ID) and !hasModelId(entries.array.items, WONDER_FULL_MODEL_ID)) {
+            try models.append(allocator, .{
+                .provider_id = try allocator.dupe(u8, "muse"),
+                .provider_name = try allocator.dupe(u8, "Muse"),
+                .model_id = try allocator.dupe(u8, WONDER_FULL_MODEL_ID),
+                .model_name = try allocator.dupe(u8, WONDER_FULL_MODEL_ID),
+                .description = try allocator.dupe(u8, WONDER_FULL_DESCRIPTION),
+            });
+        }
     }
     return models.toOwnedSlice(allocator);
+}
+
+// Muse 1.4.6 `model/list` omits Wonder Full even for entitled accounts, yet
+// the backend serves it, so list it beside Wonder.
+const WONDER_MODEL_ID = "muse-wonder-1.0";
+const WONDER_FULL_MODEL_ID = "muse-wonder-full-1.0";
+const WONDER_FULL_DESCRIPTION = "Requires a Muse Code Power or Maximum subscription.";
+
+fn hasModelId(entries: []const std.json.Value, model_id: []const u8) bool {
+    for (entries) |entry| {
+        const id = acp.getOptionalObjectString(entry, "modelId") orelse continue;
+        if (std.mem.eql(u8, id, model_id)) return true;
+    }
+    return false;
 }
 
 fn parseReadThreadAlloc(
@@ -1583,6 +1606,20 @@ test "Muse model list parser preserves catalog ids and labels" {
         models[0].description.?,
     );
     try std.testing.expect(models[1].description == null);
+}
+
+test "Muse model list parser lists Wonder Full beside Wonder" {
+    const payload =
+        \\{"jsonrpc":"2.0","id":2,"result":{"models":[{"modelId":"muse-wonder-1.0","displayLabel":"muse-wonder-1.0","isDefault":true},{"modelId":"muse-spark-1.3","displayLabel":"muse-spark-1.3"}]}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    const models = try parseModelListAlloc(std.testing.allocator, parsed.value);
+    defer provider_types.freeModelInfos(std.testing.allocator, models);
+    try std.testing.expectEqual(@as(usize, 3), models.len);
+    try std.testing.expectEqualStrings("muse-wonder-1.0", models[0].model_id);
+    try std.testing.expectEqualStrings("muse-wonder-full-1.0", models[1].model_id);
+    try std.testing.expectEqualStrings("muse-spark-1.3", models[2].model_id);
 }
 
 test "Muse approval choice prefers once and reads object-shaped decisions" {
