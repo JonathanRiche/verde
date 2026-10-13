@@ -212,6 +212,12 @@ const MUSE_CONTRIBUTOR_DESCRIPTION =
 
 const MUSE_MODELS: ModelOption[] = [
   { label: 'muse-wonder-1.0', value: 'muse-wonder-1.0', efforts: MUSE_EFFORTS },
+  {
+    label: 'muse-wonder-full-1.0',
+    value: 'muse-wonder-full-1.0',
+    description: 'Requires a Muse Code Power or Maximum subscription.',
+    efforts: MUSE_EFFORTS,
+  },
   { label: 'muse-spark-1.3', value: 'muse-spark-1.3', efforts: MUSE_EFFORTS },
   {
     label: 'muse-spark-1.3-contributor',

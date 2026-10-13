@@ -224,11 +224,18 @@ pub const GROK_MODEL_OPTIONS = [_]ModelOption{
 };
 
 const MUSE_CONTRIBUTOR_DESCRIPTION: [:0]const u8 = "Your content, including inter-session messages, may be used for product improvement.";
+const MUSE_SUBSCRIPTION_DESCRIPTION: [:0]const u8 = "Requires a Muse Code Power or Maximum subscription.";
 
 /// Static fallback until Muse's `model/list` MSP response is available.
 /// Labels match the TUI catalog (`displayLabel` / `modelId`).
 pub const MUSE_MODEL_OPTIONS = [_]ModelOption{
     .{ .label = "muse-wonder-1.0", .value = DEFAULT_MUSE_MODEL, .reasoning_supported = true },
+    .{
+        .label = "muse-wonder-full-1.0",
+        .value = "muse-wonder-full-1.0",
+        .description = MUSE_SUBSCRIPTION_DESCRIPTION,
+        .reasoning_supported = true,
+    },
     .{ .label = "muse-spark-1.3", .value = "muse-spark-1.3", .reasoning_supported = true },
     .{
         .label = "muse-spark-1.3-contributor",
