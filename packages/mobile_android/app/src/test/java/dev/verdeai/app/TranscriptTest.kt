@@ -54,8 +54,10 @@ class TranscriptTest {
 
     /** Advances the paused main looper's clock too, so Main-dispatcher delays (unfocus debounce) run. */
     private fun pump() = shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(20))
-    private fun await(condition: () -> Boolean) = compose.waitUntil(5000) { pump(); condition() }
-    private fun awaitText(text: String, substring: Boolean = false) = compose.waitUntil(5000) {
+    // Generous: the first wait of a test also pays for a cold Robolectric sandbox and Compose start,
+    // which can exceed 5 s on a loaded CI runner. Conditions are polled, so passing tests stay fast.
+    private fun await(condition: () -> Boolean) = compose.waitUntil(AWAIT_MS) { pump(); condition() }
+    private fun awaitText(text: String, substring: Boolean = false) = compose.waitUntil(AWAIT_MS) {
         pump()
         compose.onAllNodesWithText(text, substring=substring, useUnmergedTree=true).fetchSemanticsNodes().isNotEmpty()
     }
@@ -541,6 +543,7 @@ class TranscriptTest {
     }
 
     companion object {
+        const val AWAIT_MS = 20_000L
         const val WS="chat-fixture-ws"
         const val THREAD="chat-fixture-thread"
         /** Fixture turn started at 1790363190811; the UI clock sits 65 s later. */
