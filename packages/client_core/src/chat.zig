@@ -494,7 +494,9 @@ pub fn intent(tx: *h.Transaction, tag: []const u8, event: V) E!bool {
                 return true;
             }
             const fid = try std.fmt.allocPrint(tx.allocator(), "mobile-followup:{s}:{d}", .{ tx.state.config.session_nonce, tx.state.next_id });
-            t.saved.followup = .{ .id = fid, .kind = if (t.saved.inputs.len > 0) "queue" else p.s(event, "kind"), .turn_id = t.turn.?.turn_id, .steer_id = fid, .next_turn_id = try std.fmt.allocPrint(tx.allocator(), "{s}:next", .{fid}), .text = t.saved.text, .attachments = try attachments(tx.allocator(), t.saved.inputs), .voice = p.yes(p.get(event, "voice")) };
+            // Images can't ride a native steer; interrupt carries them into the next turn.
+            const requested = p.s(event, "kind");
+            t.saved.followup = .{ .id = fid, .kind = if (t.saved.inputs.len > 0 and eq(requested, "steer")) "queue" else requested, .turn_id = t.turn.?.turn_id, .steer_id = fid, .next_turn_id = try std.fmt.allocPrint(tx.allocator(), "{s}:next", .{fid}), .text = t.saved.text, .attachments = try attachments(tx.allocator(), t.saved.inputs), .voice = p.yes(p.get(event, "voice")) };
             t.saved.followup_inputs = t.saved.inputs;
             t.saved.followup_settings = metadata(t);
             t.saved.route = try route(tx.allocator(), t);
@@ -503,6 +505,12 @@ pub fn intent(tx: *h.Transaction, tag: []const u8, event: V) E!bool {
             // Receipt owns the draft; actual clearing waits for its durable acknowledgement.
             try persist(tx, i);
             operation(tx, id, "pending", null);
+            // Interrupt: stop the running turn now (a stop with a pending follow-up is not a user
+            // stop); the follow-up starts the next turn as soon as this one is terminal.
+            if (eq(t.saved.followup.?.kind, "interrupt") and !t.turn.?.stop_pending) {
+                t.turn.?.stop_pending = true;
+                try call(tx, i, .cancel, "chat.turn.cancel", .{ .turn_id = t.turn.?.turn_id, .followup_pending = true }, true, "");
+            }
         }
     } else if (eq(tag, "turn_cancel")) {
         if (!active(t) or !eq(t.turn.?.turn_id, p.s(event, "turn_id")) or t.turn.?.stop_pending) {
@@ -849,6 +857,10 @@ fn receiveTail(tx: *h.Transaction, i: usize, result: V) E!void {
                 t.saved.followup = null;
                 t.saved.followup_inputs = &.{};
                 try persist(tx, i);
+            } else if (eq(f.kind, "interrupt") and !f.paused and eq(f.delivery, "unsent")) {
+                // Interrupted (or finished first): continue with the follow-up exactly like a queue.
+                t.followup_dispatch = true;
+                try persist(tx, i);
             } else if (!eq(status, "completed")) {
                 f.paused = true;
                 try persist(tx, i);
@@ -905,7 +917,15 @@ fn failed(tx: *h.Transaction, request: Request, failure: h.LocalError, fallback:
         t.retry_at = 0;
     } else if (request.kind == .cancel) {
         // Uncertain cancellation remains pending until tail confirms terminal state.
-        if (!eq(failure.delivery orelse "", "uncertain") and t.turn != null) t.turn.?.stop_pending = false;
+        if (!eq(failure.delivery orelse "", "uncertain") and t.turn != null) {
+            t.turn.?.stop_pending = false;
+            // An interrupt that couldn't stop the turn waits for it instead (queue semantics).
+            if (t.saved.followup) |*f| if (eq(f.kind, "interrupt") and eq(f.delivery, "unsent")) {
+                f.kind = "queue";
+                t.@"error" = null;
+                try persist(tx, request.thread);
+            };
+        }
     } else if (request.kind == .steer) {
         if (t.saved.followup) |*f| {
             if (fallback and !f.paused) {
@@ -1201,7 +1221,8 @@ pub fn pump(tx: *h.Transaction) E!void {
         }
         if (t.followup_dispatch and t.storage_id == null and t.loaded and t.saved.followup != null) {
             const f = &t.saved.followup.?;
-            const eligible = (eq(f.kind, "steer") and eq(f.state, "pending") and active(t)) or (!active(t) and t.turn != null and eq(t.turn.?.status, "completed"));
+            const eligible = (eq(f.kind, "steer") and eq(f.state, "pending") and active(t)) or
+                (!active(t) and t.turn != null and (eq(t.turn.?.status, "completed") or (eq(f.kind, "interrupt") and terminal(t.turn.?.status))));
             if (eligible and !f.paused and eq(f.delivery, "unsent") and eq(t.saved.route, try route(tx.allocator(), t))) {
                 f.delivery = "sending";
                 f.can_pull_back = false;
@@ -1329,7 +1350,7 @@ fn validMention(path: []const u8) bool {
 
 fn validFollowup(f: m.Followup) bool {
     return f.id.len > 0 and f.turn_id.len > 0 and f.steer_id.len > 0 and f.next_turn_id.len > 0 and
-        (eq(f.kind, "queue") or eq(f.kind, "steer")) and
+        (eq(f.kind, "queue") or eq(f.kind, "steer") or eq(f.kind, "interrupt")) and
         (eq(f.state, "pending") or eq(f.state, "sent_inline") or eq(f.state, "fallback_next_turn")) and
         (eq(f.delivery, "unsent") or eq(f.delivery, "sending") or eq(f.delivery, "uncertain") or eq(f.delivery, "accepted"));
 }

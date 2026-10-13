@@ -799,3 +799,53 @@ test "voice on a queued follow-up survives its durable receipt and reaches the n
     try f.reply("chat.thread.upsert", .{ .store_revision = 100 });
     try eql(chat.VOICE_NOTE, p.s(try f.params("chat.turn.start"), "orchestration_note"));
 }
+
+test "interrupt follow-up stops the turn with followup_pending and starts the next turn once it is terminal" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.open();
+    try f.seedTurn();
+    try f.draft("do this instead");
+    _ = try f.intent("followup_submit", .{ .draft_revision = "1", .kind = "interrupt" });
+    const cancel = try f.params("chat.turn.cancel");
+    try eql("fixture-turn", p.s(cancel, "turn_id"));
+    try expect(p.yes(p.get(cancel, "followup_pending")));
+    try eql("interrupt", f.host.state.chat.threads[0].saved.followup.?.kind);
+    while (f.host.state.chat.threads[0].storage_id != null) _ = try f.storage(null, false);
+    try f.reply("chat.turn.cancel", .{ .cancelled = true });
+    try std.testing.expectError(error.MissingRequest, f.find("daemon.client.register"));
+    // The stopped turn is not a user stop: the follow-up continues right away.
+    try f.tail(.{ .status = "aborted", .events = .{} });
+    while (f.host.state.chat.threads[0].storage_id != null) _ = try f.storage(null, false);
+    _ = try f.find("daemon.client.register");
+}
+
+test "interrupt that cannot stop the turn falls back to queue semantics" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.open();
+    try f.seedTurn();
+    try f.draft("later");
+    _ = try f.intent("followup_submit", .{ .draft_revision = "1", .kind = "interrupt" });
+    while (f.host.state.chat.threads[0].storage_id != null) _ = try f.storage(null, false);
+    _ = try f.response("chat.turn.cancel", .null, .{ .code = "invalid_state", .message = "turn cannot be cancelled" });
+    try eql("queue", f.host.state.chat.threads[0].saved.followup.?.kind);
+    try expect(!f.host.state.chat.threads[0].turn.?.stop_pending);
+    while (f.host.state.chat.threads[0].storage_id != null) _ = try f.storage(null, false);
+    try std.testing.expectError(error.MissingRequest, f.find("daemon.client.register"));
+    try f.tail(.{ .status = "completed", .events = .{} });
+    while (f.host.state.chat.threads[0].storage_id != null) _ = try f.storage(null, false);
+    _ = try f.find("daemon.client.register");
+}
+
+test "images may interrupt but never steer" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.open();
+    try f.seedTurn();
+    _ = try f.intent("draft_set", .{ .text = "look", .attachments = .{.{ .local_id = "image", .name = "a.png", .mime = "image/png", .byte_size = "6", .bytes_base64 = "YWJjZGVm" }} });
+    _ = try f.storage(null, false);
+    const revision = p.s(p.get(p.get(try f.query("composer"), "data"), "draft"), "revision");
+    _ = try f.intent("followup_submit", .{ .draft_revision = revision, .kind = "interrupt" });
+    try eql("interrupt", f.host.state.chat.threads[0].saved.followup.?.kind);
+}

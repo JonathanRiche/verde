@@ -45,7 +45,7 @@ pub const Event = union(enum) {
     composer_select: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, workspace_id: []const u8, thread_id: []const u8, provider: ?[]const u8, model: ?[]const u8, effort: ?[]const u8, access: ?[]const u8, speed: ?[]const u8 },
     send: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, workspace_id: []const u8, thread_id: []const u8, draft_revision: []const u8, voice: bool = false },
     turn_cancel: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, workspace_id: []const u8, thread_id: []const u8, turn_id: []const u8 },
-    followup_submit: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, workspace_id: []const u8, thread_id: []const u8, draft_revision: []const u8, kind: enum { queue, steer }, voice: bool = false },
+    followup_submit: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, workspace_id: []const u8, thread_id: []const u8, draft_revision: []const u8, kind: enum { queue, steer, interrupt }, voice: bool = false },
     followup_retry: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, workspace_id: []const u8, thread_id: []const u8, followup_id: []const u8 },
     followup_pull_back: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, workspace_id: []const u8, thread_id: []const u8, followup_id: []const u8 },
     followup_cancel: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, workspace_id: []const u8, thread_id: []const u8, followup_id: []const u8 },

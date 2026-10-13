@@ -3045,6 +3045,7 @@ extension EventTurnCancel {
 enum EventFollowupSubmitKind: String, Codable {
     case `queue`
     case `steer`
+    case `interrupt`
 }
 
 struct EventFollowupSubmit: Codable {

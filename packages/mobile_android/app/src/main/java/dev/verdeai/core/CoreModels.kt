@@ -743,6 +743,7 @@ data class EventTurnCancel(
 enum class EventFollowupSubmitKind {
     `queue`,
     `steer`,
+    `interrupt`,
 }
 
 @Serializable

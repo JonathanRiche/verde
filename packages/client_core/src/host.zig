@@ -849,7 +849,7 @@ fn validateIntent(a: A, tag: []const u8, event: V) ApiError!void {
             _ = try decode(struct { voice: bool = false }, a, event);
         }
         if (eq(tag, "followup_submit")) {
-            _ = try decode(struct { kind: enum { queue, steer } }, a, event);
+            _ = try decode(struct { kind: enum { queue, steer, interrupt } }, a, event);
         }
         if (eq(tag, "turn_cancel") or eq(tag, "approval_decide")) _ = try string(event, "turn_id");
         if (eq(tag, "approval_decide")) {
