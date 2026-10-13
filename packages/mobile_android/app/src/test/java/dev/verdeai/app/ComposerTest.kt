@@ -182,9 +182,10 @@ class ComposerTest {
         val send = send().assertIsDisplayed().fetchSemanticsNode().boundsInRoot
         val stop = compose.onNodeWithTag(COMPOSER_STOP).assertIsDisplayed().fetchSemanticsNode().boundsInRoot
         val attach = compose.onNodeWithTag(COMPOSER_ATTACH).assertIsDisplayed().fetchSemanticsNode().boundsInRoot
-        // IconButton semantics exclude its 4dp minimum-touch-target inset.
+        // IconButton semantics exclude its 4dp minimum-touch-target inset; while a
+        // turn runs, Send is a long-pressable 48dp target that fills its slot.
         val inset = with(compose.density) { 4.dp.toPx() }
-        assertEquals(actions.right - inset, send.right, 1f)
+        assertEquals(actions.right, send.right, 1f)
         assertEquals(actions.left + inset, attach.left, 1f)
         assertEquals(send.center.y, stop.center.y, 1f)
         assertEquals(send.center.y, attach.center.y, 1f)
