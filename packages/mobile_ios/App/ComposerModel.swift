@@ -356,7 +356,11 @@ final class ComposerModel {
             guard existing.count < Self.maxImages else { notice = "Up to four images per message."; return }
             guard bytes.count <= Self.maxImageBytes, existing.reduce(bytes.count, { $0 + (Int($1.byte_size) ?? 0) }) <= Self.maxTotalBytes else { notice = "These images are too large together. Send some first."; return }
             let id = "img-" + UUID().uuidString
-            if await setDraft(text, existing + [AttachmentInput(local_id: id, name: "Photo.jpg", mime: "image/jpeg", byte_size: String(bytes.count), bytes_base64: bytes.base64EncodedString())]) { previews[id] = bytes }
+            if await setDraft(text, existing + [AttachmentInput(local_id: id, name: "Photo.jpg", mime: "image/jpeg", byte_size: String(bytes.count), bytes_base64: bytes.base64EncodedString())]) {
+                previews[id] = bytes
+                // The sent row shows these bytes right away (keyed by the draft's local id).
+                LocalAttachmentPreviews.shared.put(id, bytes)
+            }
         }
     }
 

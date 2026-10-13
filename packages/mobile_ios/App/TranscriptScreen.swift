@@ -433,16 +433,7 @@ private struct MessageRow: View {
                     }
                 }
                 if !row.attachments.isEmpty {
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 6) {
-                            // Host images need an authenticated fetch the core doesn't offer yet; name only.
-                            ForEach(row.attachments, id: \.local_id) { attachment in
-                                Text((attachment.mime.hasPrefix("image/") ? "Image · " : "") + basename(attachment.name))
-                                     .font(VerdeTheme.ui(12)).lineLimit(1).padding(.horizontal, 8).padding(.vertical, 4)
-                                    .background(VerdeTheme.alternate, in: Capsule())
-                            }
-                        }
-                    }
+                    AttachmentStrip(browse: model.browse, workspaceID: model.workspaceID, threadID: model.threadID, row: row, longest: 160)
                 }
                 if !shown.isEmpty {
                     // User text is verbatim (web parity); assistant output goes through the core AST.
@@ -477,8 +468,8 @@ private struct CompactMessageRow: View {
             if mine { Spacer(minLength: 56) }
             VStack(alignment: mine ? .trailing : .leading, spacing: 2) {
                 if !row.attachments.isEmpty {
-                    Text(row.attachments.map { basename($0.name) }.joined(separator: ", "))
-                        .font(VerdeTheme.ui(11)).foregroundStyle(.secondary).lineLimit(1)
+                    AttachmentStrip(browse: model.browse, workspaceID: model.workspaceID, threadID: model.threadID, row: row,
+                                    longest: 120, alignment: mine ? .trailing : .leading)
                 }
                 if !shown.isEmpty {
                     if mine {

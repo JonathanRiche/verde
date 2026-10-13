@@ -139,7 +139,7 @@ final class TranscriptModel: DiffRenderSource {
     let disclosure = DisclosureStore()
     @ObservationIgnored lazy var input = ComposerModel(chat: self)
 
-    @ObservationIgnored private let browse: BrowseModel
+    @ObservationIgnored let browse: BrowseModel
     @ObservationIgnored private let unfocusDelay: TimeInterval
     @ObservationIgnored private(set) var host: CoreHost?
     @ObservationIgnored private var boundHostID: String?

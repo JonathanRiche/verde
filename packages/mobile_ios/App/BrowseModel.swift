@@ -88,6 +88,8 @@ final class BrowseModel {
         if let auth = session?.row?.auth_state, HostsModel.wiped.contains(auth) {
             // HostsModel already cleared the file; drop the copy and any queued save.
             cached = nil
+            // Signed out or forgotten: cached chat images go too (they can be fetched again).
+            AttachmentImageCache.shared.clear()
             pendingSave?.cancel()
             pendingSave = nil
             savedRevision = nil
