@@ -180,6 +180,7 @@ test {
     _ = @import("workspace_explorer_test.zig");
     _ = @import("companion_test.zig");
     _ = @import("voice_test.zig");
+    _ = @import("attachments_test.zig");
     _ = @import("files_test.zig");
     _ = @import("model_contract_test.zig");
     _ = @import("auth_harness.zig");

@@ -13,6 +13,7 @@ const files = @import("files.zig");
 const explorer = @import("workspace_explorer.zig");
 const companion = @import("companion.zig");
 const voice = @import("voice.zig");
+const attachments = @import("attachments.zig");
 pub const types = .{
     .{ "TerminalConfig", terminal.Config },
     .{ "TerminalCursorShape", terminal.CursorShape },
@@ -161,4 +162,7 @@ pub const types = .{
     .{ "VoiceSession", voice.Session },
     .{ "VoiceView", voice.View },
     .{ "VoiceQuery", wire.Query(voice.View) },
+    .{ "AttachmentItem", attachments.Item },
+    .{ "AttachmentsView", attachments.View },
+    .{ "AttachmentsQuery", wire.Query(attachments.View) },
 };

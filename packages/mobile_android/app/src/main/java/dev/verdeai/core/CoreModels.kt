@@ -95,6 +95,7 @@ data class ChatAttachment(
     val `uploaded_bytes`: String = "0",
     val `status`: String = "local",
     val `error`: LocalError? = null,
+    val `index`: Long? = null,
 )
 
 @Serializable
@@ -115,6 +116,7 @@ data class ChatRow(
     val `delivery`: String = "committed",
     val `attachments`: List<ChatAttachment> = emptyList(),
     val `tool`: ChatTool? = null,
+    val `message_id`: String? = null,
 )
 
 @Serializable
@@ -1308,6 +1310,29 @@ data class EventCompanionBrainSwitch(
     val `provider`: String,
     val `model`: String? = null,
     val `brief`: Boolean? = null,
+) : Event()
+
+@Serializable
+@SerialName("attachment_fetch")
+data class EventAttachmentFetch(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `workspace_id`: String,
+    val `thread_id`: String,
+    val `message_id`: String,
+    val `index`: Long,
+) : Event()
+
+@Serializable
+@SerialName("attachment_release")
+data class EventAttachmentRelease(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `key`: String,
 ) : Event()
 
 @Serializable
@@ -2538,5 +2563,28 @@ data class VoiceQuery(
     val `api_version`: Long,
     val `revision`: String,
     val `data`: VoiceView?,
+    val `error`: LocalError?,
+)
+
+@Serializable
+data class AttachmentItem(
+    val `key`: String,
+    val `status`: String = "loading",
+    val `mime`: String = "",
+    val `total_bytes`: ULong = 0uL,
+    val `data_base64`: String? = null,
+    val `error_code`: String? = null,
+)
+
+@Serializable
+data class AttachmentsView(
+    val `items`: List<AttachmentItem> = emptyList(),
+)
+
+@Serializable
+data class AttachmentsQuery(
+    val `api_version`: Long,
+    val `revision`: String,
+    val `data`: AttachmentsView?,
     val `error`: LocalError?,
 )

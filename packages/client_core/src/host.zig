@@ -14,6 +14,7 @@ pub const files = @import("files.zig");
 pub const explorer = @import("workspace_explorer.zig");
 pub const companion = @import("companion.zig");
 pub const voice = @import("voice.zig");
+pub const attachments = @import("attachments.zig");
 const chat_index = @import("chat_index.zig");
 const profile = @import("verde_remote").profile;
 const state_clone = @import("state_clone.zig");
@@ -85,6 +86,7 @@ pub const State = struct {
     explorer: explorer.State = .{},
     companion: companion.State = .{},
     voice: voice.State = .{},
+    attachments: attachments.State = .{},
     chat_index: chat_index.State = .{},
     lifecycle: Lifecycle = .created,
     revision: u64 = 0,
@@ -105,6 +107,8 @@ pub const Host = struct {
     allocator: A,
     arena: std.heap.ArenaAllocator,
     state: State,
+    /// Attachment image bytes by key, outside the cloned state (see attachments.zig).
+    blobs: std.StringHashMapUnmanaged([]u8) = .empty,
 
     pub fn init(allocator: A, input: []const u8) ApiError!Host {
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -121,6 +125,8 @@ pub const Host = struct {
     }
 
     pub fn deinit(self: *Host) void {
+        clearBlobs(self);
+        self.blobs.deinit(self.allocator);
         self.arena.deinit();
     }
 
@@ -143,6 +149,8 @@ pub const Host = struct {
         try companion.pump(&tx);
         voice.observe(&tx);
         try voice.pump(&tx);
+        try attachments.observe(&tx);
+        try attachments.pump(&tx);
         try push.pump(&tx);
         try chat_index.pump(&tx);
         try attention.pump(&tx);
@@ -179,6 +187,8 @@ pub const Host = struct {
             data = companion_view;
         } else if (try voice.query(a, s, selector)) |voice_view| {
             data = voice_view;
+        } else if (try attachments.query(a, s, &self.blobs, selector)) |attachments_view| {
+            data = attachments_view;
         } else if (eq(selector, "manage")) {
             data = try manage.query(a, s);
         } else if (try attention.query(a, s, selector)) |attention_view| {
@@ -202,8 +212,14 @@ pub const Transaction = struct {
     arena: std.heap.ArenaAllocator,
     state: State,
     effects: std.ArrayList(V) = .empty,
+    /// Blob changes, applied to `Host.blobs` only when this transaction commits.
+    blob_ops: std.ArrayList(attachments.BlobOp) = .empty,
     changed: bool = false,
     completion_matched: bool = false,
+
+    pub fn blob(self: *Transaction, op: attachments.BlobOp) ApiError!void {
+        try self.blob_ops.append(self.allocator(), op);
+    }
 
     pub fn init(host: *const Host) ApiError!Transaction {
         var arena = std.heap.ArenaAllocator.init(host.allocator);
@@ -376,6 +392,7 @@ pub const Transaction = struct {
             try explorer.intent(self, tag, event);
             try companion.intent(self, tag, event);
             try voice.intent(self, tag, event);
+            try attachments.intent(self, tag, event);
             _ = try push.intent(self, tag, event);
             try attention.intent(self, tag, event);
             try sync.intent(self, tag, event);
@@ -542,12 +559,51 @@ pub const Transaction = struct {
         errdefer retained.deinit();
         const next = try state_clone.clone(State, retained.allocator(), self.state);
         const output = try encode(output_allocator, .{ .api_version = 1, .revision = try decimal(self.allocator(), self.state.revision), .effects = self.effects.items });
+        errdefer output_allocator.free(output);
+        try applyBlobs(host, self.blob_ops.items);
         host.arena.deinit();
         host.arena = retained;
         host.state = next;
         return output;
     }
 };
+
+fn clearBlobs(host: *Host) void {
+    var it = host.blobs.iterator();
+    while (it.next()) |entry| {
+        host.allocator.free(entry.key_ptr.*);
+        host.allocator.free(entry.value_ptr.*);
+    }
+    host.blobs.clearRetainingCapacity();
+}
+
+fn applyBlobs(host: *Host, ops: []const attachments.BlobOp) ApiError!void {
+    for (ops) |op| switch (op) {
+        .append => |chunk| {
+            const slot = try host.blobs.getOrPut(host.allocator, chunk.key);
+            if (!slot.found_existing) {
+                slot.key_ptr.* = host.allocator.dupe(u8, chunk.key) catch |e| {
+                    host.blobs.removeByPtr(slot.key_ptr);
+                    return e;
+                };
+                slot.value_ptr.* = host.allocator.alloc(u8, 0) catch |e| {
+                    host.allocator.free(slot.key_ptr.*);
+                    host.blobs.removeByPtr(slot.key_ptr);
+                    return e;
+                };
+            }
+            const old = slot.value_ptr.*;
+            const grown = try host.allocator.realloc(old, old.len + chunk.bytes.len);
+            @memcpy(grown[old.len..], chunk.bytes);
+            slot.value_ptr.* = grown;
+        },
+        .drop => |k| if (host.blobs.fetchRemove(k)) |gone| {
+            host.allocator.free(gone.key);
+            host.allocator.free(gone.value);
+        },
+        .clear => clearBlobs(host),
+    };
+}
 
 /// Unresolved outcomes, and receipts an engine will still update, are in flight.
 fn inFlight(s: *const State, r: Receipt) bool {
@@ -695,7 +751,7 @@ fn changedScopes(tx: *Transaction, before: *const State) ApiError![]const []cons
     // Terminal receipts/output invalidate terminals and operations, not every
     // cached transcript and workspace. Querying those on each key overwhelms
     // the platform's serial core executor even when network RTT is tiny.
-    const git_scopes = try std.mem.concat(a, []const u8, &.{ try git.scopes(a, before, &tx.state), try explorer.scopes(a, before, &tx.state), try companion.scopes(a, before, &tx.state, host_changed), voice.scopes(before, &tx.state) });
+    const git_scopes = try std.mem.concat(a, []const u8, &.{ try git.scopes(a, before, &tx.state), try explorer.scopes(a, before, &tx.state), try companion.scopes(a, before, &tx.state, host_changed), voice.scopes(before, &tx.state), attachments.scopes(before, &tx.state) });
     if (!otherViewsChanged(before, &tx.state, host_changed)) return std.mem.concat(a, []const u8, &.{ own, git_scopes });
     const shared: []const []const u8 = if (sharedViewsChanged(before, &tx.state, host_changed)) &.{ "home", "workspaces", "attention", "manage" } else &.{};
     return std.mem.concat(a, []const u8, &.{ own, try chat.scopes(tx, before, host_changed), shared, git_scopes });
@@ -792,7 +848,7 @@ fn append(comptime T: type, a: A, slice: *[]const T, item: T) ApiError!void {
     next[slice.len] = item;
     slice.* = next;
 }
-const intents = [_][]const u8{ "git_status_refresh", "git_push", "git_retry", "git_summary_refresh", "git_review_open", "git_message_generate", "git_commit", "git_pull_push", "git_config_set", "sign_out", "forget_host", "pair", "trust_decision", "retry_connection", "focus", "thread_open", "thread_load_older", "history_search", "history_load_more", "draft_set", "composer_select", "send", "turn_cancel", "followup_submit", "followup_retry", "followup_pull_back", "followup_cancel", "approval_decide", "shell_prepare", "shell_confirm", "slash_search", "slash_run", "mention_search", "terminal_create", "terminal_attach", "terminal_detach", "terminal_input", "terminal_resize", "terminal_kill", "push_register", "thread_rename", "thread_close", "thread_sync", "thread_create", "new_chat_select", "workspace_create", "workspace_rename", "workspace_identity", "workspace_archive", "workspace_close", "directory_list", "file_open", "workspace_files_list", "workspace_file_read", "workspace_preview_close", "workspace_changes_open", "workspace_changes_close", "workspace_file_patch", "companion_refresh", "companion_save", "companion_crew_refresh", "companion_transcript_save", "companion_brain_switch", "voice_providers_refresh", "voice_provider_configure", "voice_session_create" };
+const intents = [_][]const u8{ "git_status_refresh", "git_push", "git_retry", "git_summary_refresh", "git_review_open", "git_message_generate", "git_commit", "git_pull_push", "git_config_set", "sign_out", "forget_host", "pair", "trust_decision", "retry_connection", "focus", "thread_open", "thread_load_older", "history_search", "history_load_more", "draft_set", "composer_select", "send", "turn_cancel", "followup_submit", "followup_retry", "followup_pull_back", "followup_cancel", "approval_decide", "shell_prepare", "shell_confirm", "slash_search", "slash_run", "mention_search", "terminal_create", "terminal_attach", "terminal_detach", "terminal_input", "terminal_resize", "terminal_kill", "push_register", "thread_rename", "thread_close", "thread_sync", "thread_create", "new_chat_select", "workspace_create", "workspace_rename", "workspace_identity", "workspace_archive", "workspace_close", "directory_list", "file_open", "workspace_files_list", "workspace_file_read", "workspace_preview_close", "workspace_changes_open", "workspace_changes_close", "workspace_file_patch", "companion_refresh", "companion_save", "companion_crew_refresh", "companion_transcript_save", "companion_brain_switch", "voice_providers_refresh", "voice_provider_configure", "voice_session_create", "attachment_fetch", "attachment_release" };
 fn isIntent(tag: []const u8) bool {
     for (intents) |intent| if (eq(tag, intent)) return true;
     return false;
@@ -823,6 +879,8 @@ fn validateIntent(a: A, tag: []const u8, event: V) ApiError!void {
         try companion.validate(a, tag, event);
     } else if (voice.owns(tag)) {
         try voice.validate(a, tag, event);
+    } else if (attachments.owns(tag)) {
+        try attachments.validate(a, tag, event);
     } else if (eq(tag, "file_open")) {
         try files.validate(a, event);
     } else if (eq(tag, "terminal_create")) {
@@ -936,6 +994,7 @@ fn receiptField(context: []const u8, key: []const u8, top: bool) bool {
         if (explorer.receiptFields(context)) |fields| break :blk fields;
         if (companion.receiptFields(context)) |fields| break :blk fields;
         if (voice.receiptFields(context)) |fields| break :blk fields;
+        if (attachments.receiptFields(context)) |fields| break :blk fields;
         if (eq(context, "file_open")) break :blk "path kind max_bytes";
         break :blk "";
     };

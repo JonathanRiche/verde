@@ -700,11 +700,12 @@ fn summary(a: A, t: *const Thread, wall: i64) E!p.ThreadSummary {
 }
 fn messageRow(a: A, message: store.Message, fallback: []const u8, delivery: []const u8) E!m.Row {
     var images: []const m.Attachment = &.{};
-    for (message.images) |image| try add(m.Attachment, a, &images, .{ .local_id = image.path, .name = image.path, .mime = image.mime, .byte_size = try decimal(a, image.byte_size), .reference = image.path, .status = "committed" });
+    // `index` follows the daemon's order for `chat.attachment.read`: image_path first, then the extra images.
+    for (message.images, 0..) |image, index| try add(m.Attachment, a, &images, .{ .local_id = image.path, .name = image.path, .mime = image.mime, .byte_size = try decimal(a, image.byte_size), .reference = image.path, .status = "committed", .index = @intCast(index) });
     if (message.image) |image| if (images.len == 0) {
-        try add(m.Attachment, a, &images, .{ .local_id = image.path, .name = image.path, .mime = image.mime, .byte_size = try decimal(a, image.byte_size), .reference = image.path, .status = "committed" });
+        try add(m.Attachment, a, &images, .{ .local_id = image.path, .name = image.path, .mime = image.mime, .byte_size = try decimal(a, image.byte_size), .reference = image.path, .status = "committed", .index = 0 });
     };
-    return .{ .id = if (message.message_id.len > 0) message.message_id else fallback, .role = message.role, .author = message.author, .body = message.body, .delivery = delivery, .created_at_ms = message.created_at_ms, .attachments = images, .kind = if (message.tool_call_id != null) "tool" else "message", .tool = if (message.tool_call_id) |id| .{ .id = id, .kind = message.tool_call_kind orelse "unknown", .status = message.tool_call_status orelse "unknown" } else null };
+    return .{ .message_id = if (message.message_id.len > 0) message.message_id else null, .id = if (message.message_id.len > 0) message.message_id else fallback, .role = message.role, .author = message.author, .body = message.body, .delivery = delivery, .created_at_ms = message.created_at_ms, .attachments = images, .kind = if (message.tool_call_id != null) "tool" else "message", .tool = if (message.tool_call_id) |id| .{ .id = id, .kind = message.tool_call_kind orelse "unknown", .status = message.tool_call_status orelse "unknown" } else null };
 }
 fn receivePage(tx: *h.Transaction, request: Request, result: V) E!void {
     const t = &tx.state.chat.threads[request.thread];

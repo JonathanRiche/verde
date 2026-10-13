@@ -335,6 +335,7 @@ struct ChatAttachment: Codable {
     var `uploaded_bytes`: String = "0"
     var `status`: String = "local"
     var `error`: LocalError? = nil
+    var `index`: UInt32? = nil
 }
 
 extension ChatAttachment {
@@ -348,6 +349,7 @@ extension ChatAttachment {
         case `uploaded_bytes`
         case `status`
         case `error`
+        case `index`
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -370,6 +372,9 @@ extension ChatAttachment {
         if !c.contains(.`error`) { self.`error` = nil } else {
         self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
         }
+        if !c.contains(.`index`) { self.`index` = nil } else {
+        self.`index` = try c.decodeIfPresent(UInt32.self, forKey: .`index`)
+        }
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -382,6 +387,7 @@ extension ChatAttachment {
         try c.encode(self.`uploaded_bytes`, forKey: .`uploaded_bytes`)
         try c.encode(self.`status`, forKey: .`status`)
         try c.encode(self.`error`, forKey: .`error`)
+        try c.encode(self.`index`, forKey: .`index`)
     }
 }
 
@@ -421,6 +427,7 @@ struct ChatRow: Codable {
     var `delivery`: String = "committed"
     var `attachments`: [ChatAttachment] = []
     var `tool`: ChatTool? = nil
+    var `message_id`: String? = nil
 }
 
 extension ChatRow {
@@ -434,6 +441,7 @@ extension ChatRow {
         case `delivery`
         case `attachments`
         case `tool`
+        case `message_id`
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -458,6 +466,9 @@ extension ChatRow {
         if !c.contains(.`tool`) { self.`tool` = nil } else {
         self.`tool` = try c.decodeIfPresent(ChatTool.self, forKey: .`tool`)
         }
+        if !c.contains(.`message_id`) { self.`message_id` = nil } else {
+        self.`message_id` = try c.decodeIfPresent(String.self, forKey: .`message_id`)
+        }
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -470,6 +481,7 @@ extension ChatRow {
         try c.encode(self.`delivery`, forKey: .`delivery`)
         try c.encode(self.`attachments`, forKey: .`attachments`)
         try c.encode(self.`tool`, forKey: .`tool`)
+        try c.encode(self.`message_id`, forKey: .`message_id`)
     }
 }
 
@@ -1524,6 +1536,8 @@ enum Event: Codable {
     case `voice_session_create`(EventVoiceSessionCreate)
     case `companion_transcript_save`(EventCompanionTranscriptSave)
     case `companion_brain_switch`(EventCompanionBrainSwitch)
+    case `attachment_fetch`(EventAttachmentFetch)
+    case `attachment_release`(EventAttachmentRelease)
     case `companion_crew_refresh`(EventCompanionCrewRefresh)
     case `push_received`(EventPushReceived)
     case `terminal_input`(EventTerminalInput)
@@ -1610,6 +1624,8 @@ enum Event: Codable {
         case "voice_session_create": self = .`voice_session_create`(try EventVoiceSessionCreate(from: decoder))
         case "companion_transcript_save": self = .`companion_transcript_save`(try EventCompanionTranscriptSave(from: decoder))
         case "companion_brain_switch": self = .`companion_brain_switch`(try EventCompanionBrainSwitch(from: decoder))
+        case "attachment_fetch": self = .`attachment_fetch`(try EventAttachmentFetch(from: decoder))
+        case "attachment_release": self = .`attachment_release`(try EventAttachmentRelease(from: decoder))
         case "companion_crew_refresh": self = .`companion_crew_refresh`(try EventCompanionCrewRefresh(from: decoder))
         case "push_received": self = .`push_received`(try EventPushReceived(from: decoder))
         case "terminal_input": self = .`terminal_input`(try EventTerminalInput(from: decoder))
@@ -1697,6 +1713,8 @@ enum Event: Codable {
         case .`voice_session_create`(let value): try value.encode(to: encoder)
         case .`companion_transcript_save`(let value): try value.encode(to: encoder)
         case .`companion_brain_switch`(let value): try value.encode(to: encoder)
+        case .`attachment_fetch`(let value): try value.encode(to: encoder)
+        case .`attachment_release`(let value): try value.encode(to: encoder)
         case .`companion_crew_refresh`(let value): try value.encode(to: encoder)
         case .`push_received`(let value): try value.encode(to: encoder)
         case .`terminal_input`(let value): try value.encode(to: encoder)
@@ -5256,6 +5274,94 @@ extension EventCompanionBrainSwitch {
         try c.encode(self.`brief`, forKey: .`brief`)
         var tag = encoder.container(keyedBy: ModelDiscriminator.self)
         try tag.encode("companion_brain_switch", forKey: .type)
+    }
+}
+
+struct EventAttachmentFetch: Codable {
+    var `api_version`: UInt32 = 1
+    var `now_ms`: Int64
+    var `wall_time_ms`: Int64
+    var `intent_id`: String
+    var `workspace_id`: String
+    var `thread_id`: String
+    var `message_id`: String
+    var `index`: UInt32
+}
+
+extension EventAttachmentFetch {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `now_ms`
+        case `wall_time_ms`
+        case `intent_id`
+        case `workspace_id`
+        case `thread_id`
+        case `message_id`
+        case `index`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`now_ms` = try c.decode(Int64.self, forKey: .`now_ms`)
+        self.`wall_time_ms` = try c.decode(Int64.self, forKey: .`wall_time_ms`)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        self.`thread_id` = try c.decode(String.self, forKey: .`thread_id`)
+        self.`message_id` = try c.decode(String.self, forKey: .`message_id`)
+        self.`index` = try c.decode(UInt32.self, forKey: .`index`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`now_ms`, forKey: .`now_ms`)
+        try c.encode(self.`wall_time_ms`, forKey: .`wall_time_ms`)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`thread_id`, forKey: .`thread_id`)
+        try c.encode(self.`message_id`, forKey: .`message_id`)
+        try c.encode(self.`index`, forKey: .`index`)
+        var tag = encoder.container(keyedBy: ModelDiscriminator.self)
+        try tag.encode("attachment_fetch", forKey: .type)
+    }
+}
+
+struct EventAttachmentRelease: Codable {
+    var `api_version`: UInt32 = 1
+    var `now_ms`: Int64
+    var `wall_time_ms`: Int64
+    var `intent_id`: String
+    var `key`: String
+}
+
+extension EventAttachmentRelease {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `now_ms`
+        case `wall_time_ms`
+        case `intent_id`
+        case `key`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`now_ms` = try c.decode(Int64.self, forKey: .`now_ms`)
+        self.`wall_time_ms` = try c.decode(Int64.self, forKey: .`wall_time_ms`)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+        self.`key` = try c.decode(String.self, forKey: .`key`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`now_ms`, forKey: .`now_ms`)
+        try c.encode(self.`wall_time_ms`, forKey: .`wall_time_ms`)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        try c.encode(self.`key`, forKey: .`key`)
+        var tag = encoder.container(keyedBy: ModelDiscriminator.self)
+        try tag.encode("attachment_release", forKey: .type)
     }
 }
 
@@ -10378,6 +10484,104 @@ extension VoiceQuery {
         self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
         self.`revision` = try c.decode(String.self, forKey: .`revision`)
         self.`data` = try c.decodeIfPresent(VoiceView.self, forKey: .`data`)
+        self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`revision`, forKey: .`revision`)
+        try c.encode(self.`data`, forKey: .`data`)
+        try c.encode(self.`error`, forKey: .`error`)
+    }
+}
+
+struct AttachmentItem: Codable {
+    var `key`: String
+    var `status`: String = "loading"
+    var `mime`: String = ""
+    var `total_bytes`: UInt64 = 0
+    var `data_base64`: String? = nil
+    var `error_code`: String? = nil
+}
+
+extension AttachmentItem {
+    private enum CodingKeys: String, CodingKey {
+        case `key`
+        case `status`
+        case `mime`
+        case `total_bytes`
+        case `data_base64`
+        case `error_code`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`key` = try c.decode(String.self, forKey: .`key`)
+        if !c.contains(.`status`) { self.`status` = "loading" } else {
+        self.`status` = try c.decode(String.self, forKey: .`status`)
+        }
+        if !c.contains(.`mime`) { self.`mime` = "" } else {
+        self.`mime` = try c.decode(String.self, forKey: .`mime`)
+        }
+        if !c.contains(.`total_bytes`) { self.`total_bytes` = 0 } else {
+        self.`total_bytes` = try c.decode(UInt64.self, forKey: .`total_bytes`)
+        }
+        if !c.contains(.`data_base64`) { self.`data_base64` = nil } else {
+        self.`data_base64` = try c.decodeIfPresent(String.self, forKey: .`data_base64`)
+        }
+        if !c.contains(.`error_code`) { self.`error_code` = nil } else {
+        self.`error_code` = try c.decodeIfPresent(String.self, forKey: .`error_code`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`key`, forKey: .`key`)
+        try c.encode(self.`status`, forKey: .`status`)
+        try c.encode(self.`mime`, forKey: .`mime`)
+        try c.encode(self.`total_bytes`, forKey: .`total_bytes`)
+        try c.encode(self.`data_base64`, forKey: .`data_base64`)
+        try c.encode(self.`error_code`, forKey: .`error_code`)
+    }
+}
+
+struct AttachmentsView: Codable {
+    var `items`: [AttachmentItem] = []
+}
+
+extension AttachmentsView {
+    private enum CodingKeys: String, CodingKey {
+        case `items`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`items`) { self.`items` = [] } else {
+        self.`items` = try c.decode([AttachmentItem].self, forKey: .`items`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`items`, forKey: .`items`)
+    }
+}
+
+struct AttachmentsQuery: Codable {
+    var `api_version`: UInt32
+    var `revision`: String
+    var `data`: AttachmentsView?
+    var `error`: LocalError?
+}
+
+extension AttachmentsQuery {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `revision`
+        case `data`
+        case `error`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        self.`revision` = try c.decode(String.self, forKey: .`revision`)
+        self.`data` = try c.decodeIfPresent(AttachmentsView.self, forKey: .`data`)
         self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
     }
     func encode(to encoder: Encoder) throws {
