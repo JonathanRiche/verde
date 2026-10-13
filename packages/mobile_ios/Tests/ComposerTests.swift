@@ -116,10 +116,38 @@ final class ComposerTests: XCTestCase {
         XCTAssertEqual(composerToken("/help", caret: 3)?.query, "he")
     }
 
-    func testImagesQueueAndUnsupportedProvidersDoNotSteer() {
-        XCTAssertEqual(composerFollowupKind(provider: "codex", images: false), .steer)
-        XCTAssertEqual(composerFollowupKind(provider: "claude", images: true), .queue)
-        XCTAssertEqual(composerFollowupKind(provider: "cursor", images: false), .queue)
+    func testFollowupKindMatrix() {
+        for provider in ["codex", "claude", "pi"] {
+            XCTAssertEqual(composerFollowupKind(provider: provider, images: false, interruptAvailable: true), .steer, provider)
+            XCTAssertEqual(composerFollowupKind(provider: provider, images: true, interruptAvailable: true), .interrupt,
+                           "images can't steer natively: \(provider)")
+        }
+        for provider in ["cursor", "opencode", "grok", "fx", "muse", "amp"] {
+            XCTAssertEqual(composerFollowupKind(provider: provider, images: false, interruptAvailable: true), .interrupt, provider)
+            XCTAssertEqual(composerFollowupKind(provider: provider, images: true, interruptAvailable: true), .interrupt, provider)
+        }
+        XCTAssertEqual(composerFollowupKind(provider: nil, images: false, interruptAvailable: true), .interrupt)
+        // Before the models know `interrupt`, nothing promises it.
+        XCTAssertEqual(composerFollowupKind(provider: "cursor", images: false, interruptAvailable: false), .queue)
+        XCTAssertEqual(composerFollowupKind(provider: "codex", images: false, interruptAvailable: false), .steer)
+        XCTAssertEqual(followupWireKind(.queue), .queue)
+        XCTAssertEqual(followupWireKind(.steer), .steer)
+        XCTAssertEqual(followupWireKind(.interrupt).rawValue, followupInterruptAvailable ? "interrupt" : "queue")
+    }
+
+    func testFollowupLabelsAndAlternatives() {
+        XCTAssertEqual(FollowupKind.steer.label, "Steer")
+        XCTAssertEqual(FollowupKind.interrupt.label, "Interrupt & steer")
+        XCTAssertEqual(FollowupKind.queue.label, "Queue")
+        XCTAssertEqual(FollowupKind.steer.hint, "Steer the current reply")
+        XCTAssertEqual(FollowupKind.interrupt.hint, "Interrupts and continues with this")
+        XCTAssertEqual(FollowupKind.queue.hint, "Queue after the current reply")
+        XCTAssertEqual(FollowupKind.queue.insteadLabel, "Queue instead")
+        XCTAssertEqual(followupAlternatives(provider: "claude", images: false, interruptAvailable: true), [.interrupt, .queue])
+        XCTAssertEqual(followupAlternatives(provider: "claude", images: true, interruptAvailable: true), [.queue])
+        XCTAssertEqual(followupAlternatives(provider: "cursor", images: false, interruptAvailable: true), [.queue])
+        XCTAssertEqual(followupAlternatives(provider: "cursor", images: false, interruptAvailable: false), [])
+        XCTAssertEqual(followupAlternatives(provider: "codex", images: false, interruptAvailable: false), [.queue])
     }
 
     func testImageEncodingIsBoundedJPEG() throws {

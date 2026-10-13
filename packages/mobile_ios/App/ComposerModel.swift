@@ -19,8 +19,64 @@ func composerToken(_ text: String, caret: Int) -> ComposerToken? {
     return ComposerToken(range: NSRange(location: start, length: caret - start), query: String(word.dropFirst()), marker: String(marker))
 }
 
-func composerFollowupKind(provider: String?, images: Bool) -> EventFollowupSubmitKind {
-    !images && ["codex", "claude", "pi"].contains(provider ?? "") ? .steer : .queue
+/// How a message sent while a turn runs reaches the agent.
+enum FollowupKind: String, CaseIterable, Equatable {
+    /// Native daemon steering into the running reply (codex, claude, pi; text only).
+    case steer
+    /// The core stops the running turn and sends this as the next turn in the same session
+    /// (any provider, images allowed).
+    case interrupt
+    /// After the current reply finishes.
+    case queue
+
+    var label: String {
+        switch self {
+        case .steer: return "Steer"
+        case .interrupt: return "Interrupt & steer"
+        case .queue: return "Queue"
+        }
+    }
+    var hint: String {
+        switch self {
+        case .steer: return "Steer the current reply"
+        case .interrupt: return "Interrupts and continues with this"
+        case .queue: return "Queue after the current reply"
+        }
+    }
+    /// The Send button's long-press alternative.
+    var insteadLabel: String { label + " instead" }
+}
+
+/// Providers whose daemon bridge steers a running reply natively.
+private let nativeSteerProviders: Set<String> = ["codex", "claude", "pi"]
+
+/// Whether this build's core models carry the `interrupt` follow-up (true once regenerated).
+let followupInterruptAvailable = EventFollowupSubmitKind(rawValue: FollowupKind.interrupt.rawValue) != nil
+
+/// Steer by default: native steering where the provider has it (text only), otherwise interrupt
+/// and continue; queue only when this build can't interrupt.
+func composerFollowupKind(provider: String?, images: Bool, interruptAvailable: Bool = followupInterruptAvailable) -> FollowupKind {
+    if !images && nativeSteerProviders.contains(provider ?? "") { return .steer }
+    return interruptAvailable ? .interrupt : .queue
+}
+
+/// The other ways to send while a turn runs (long-press on Send), in a stable order.
+func followupAlternatives(provider: String?, images: Bool, interruptAvailable: Bool = followupInterruptAvailable) -> [FollowupKind] {
+    let preferred = composerFollowupKind(provider: provider, images: images, interruptAvailable: interruptAvailable)
+    return FollowupKind.allCases.filter { kind in
+        guard kind != preferred else { return false }
+        switch kind {
+        case .steer: return !images && nativeSteerProviders.contains(provider ?? "")
+        case .interrupt: return interruptAvailable
+        case .queue: return true
+        }
+    }
+}
+
+/// The one place a follow-up kind becomes the core's wire value. Until CoreModels.swift is
+/// regenerated with `interrupt`, it falls back to `queue` (and the UI never offers interrupt).
+func followupWireKind(_ kind: FollowupKind) -> EventFollowupSubmitKind {
+    EventFollowupSubmitKind(rawValue: kind.rawValue) ?? .queue
 }
 
 enum ComposerPicker: String, CaseIterable, Identifiable {
@@ -203,7 +259,8 @@ final class ComposerModel {
 
     func submit() { submit(voice: false) }
 
-    func submit(voice: Bool) {
+    /// `followup` overrides how a message sent during a running turn is delivered.
+    func submit(voice: Bool, followup: FollowupKind? = nil) {
         guard canSubmit else { return }
         action { [self] in
             guard await flush(), let view else { return }
@@ -221,7 +278,7 @@ final class ComposerModel {
             if original.hasPrefix("//") { guard await setDraft(String(original.dropFirst()), references()) else { return } }
             guard let current = self.view else { return }
             if chat.state.turn != nil && !(original.hasPrefix("!") && !original.hasPrefix("!!")) {
-                _ = await dispatch { id in .followup_submit(EventFollowupSubmit(now_ms: 0, wall_time_ms: 0, intent_id: id, workspace_id: chat.workspaceID, thread_id: chat.threadID, draft_revision: current.draft.revision, kind: composerFollowupKind(provider: current.selection.provider, images: !current.draft.attachments.isEmpty), voice: voice)) }
+                _ = await dispatch { id in .followup_submit(EventFollowupSubmit(now_ms: 0, wall_time_ms: 0, intent_id: id, workspace_id: chat.workspaceID, thread_id: chat.threadID, draft_revision: current.draft.revision, kind: followupWireKind(followup ?? composerFollowupKind(provider: current.selection.provider, images: !current.draft.attachments.isEmpty)), voice: voice)) }
             } else {
                 _ = await dispatch { id in chatSendEvent(intentID: id, workspaceID: chat.workspaceID, threadID: chat.threadID, draftRevision: current.draft.revision, voice: voice) }
             }

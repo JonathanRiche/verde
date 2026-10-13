@@ -184,9 +184,11 @@ struct ChatComposer: View {
                 Button(action: model.submit) {
                     Image(systemName: "arrow.up").font(.system(size: 18, weight: .bold)).foregroundStyle(VerdeTheme.background).frame(width: 44, height: 44).background(VerdeTheme.accent, in: Circle()).opacity(model.canSubmit ? 1 : 0.35)
                 }.buttonStyle(.plain)
-                    .disabled(!model.canSubmit).accessibilityLabel(sendLabel).accessibilityIdentifier("composer-send")
+                    .disabled(!model.canSubmit).accessibilityLabel(sendLabel).accessibilityHint(sendHint)
+                    .accessibilityIdentifier("composer-send")
+                    .contextMenu { sendAlternatives }
             }
-            if model.chat.state.turn != nil { Text(sendLabel + " a follow-up while the agent works.") .font(VerdeTheme.ui(12)).foregroundStyle(.secondary) }
+            if let kind = followupKind { Text(kind.hint + ". Long-press Send for other options.") .font(VerdeTheme.ui(12)).foregroundStyle(.secondary) }
         }
         .padding(12)
         .background(VerdeTheme.panel, in: RoundedRectangle(cornerRadius: 14))
@@ -194,17 +196,24 @@ struct ChatComposer: View {
         .padding(8)
     }
 
-    /// One row: "+" menu, a growing field (or the live voice transcript), the mic, stop and send;
-    /// below it a single model · effort chip.
+    /// The input on its own full-width row, then one compact row: "+", the brain chip, the mic,
+    /// stop (while running) and send.
     private func compactBody(_ compact: CompactComposer) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 2) {
             extras
             if let notice = compact.notice {
                 Text(notice).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.warning).lineLimit(2)
             }
-            HStack(alignment: .bottom, spacing: 2) {
+            compactField(compact)
+            HStack(alignment: .center, spacing: 2) {
                 plusMenu(brainLocked: compact.openBrain != nil)
-                compactField(compact)
+                if model.view != nil {
+                    Group {
+                        if let openBrain = compact.openBrain { brainLabelChip(openBrain) } else { settingsChip }
+                    }
+                    .frame(maxWidth: 160, alignment: .leading)
+                }
+                Spacer(minLength: 4)
                 if let trailing = compact.trailing { trailing }
                 if model.chat.state.turn != nil {
                     Button(action: model.chat.stopTurn) {
@@ -220,13 +229,12 @@ struct ChatComposer: View {
                         .frame(width: 44, height: 44).contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .disabled(!model.canSubmit).accessibilityLabel(sendLabel).accessibilityIdentifier("composer-send")
-            }
-            if model.view != nil {
-                if let openBrain = compact.openBrain { brainLabelChip(openBrain) } else { settingsChip }
+                .disabled(!model.canSubmit).accessibilityLabel(sendLabel).accessibilityHint(sendHint)
+                .accessibilityIdentifier("composer-send")
+                .contextMenu { sendAlternatives }
             }
         }
-        .padding(.horizontal, 6).padding(.vertical, 4)
+        .padding(.horizontal, 8).padding(.top, 6).padding(.bottom, 2)
         .background(VerdeTheme.panel)
         .overlay(alignment: .top) { Divider().overlay(VerdeTheme.border) }
     }
@@ -238,26 +246,25 @@ struct ChatComposer: View {
                     LevelMeter(level: compact.level)
                     Text(transcript.isEmpty ? "Listening…" : transcript)
                         .font(VerdeTheme.ui(15)).foregroundStyle(transcript.isEmpty ? VerdeTheme.subtle : VerdeTheme.text)
-                        .lineLimit(4).frame(maxWidth: .infinity, alignment: .leading)
+                        .lineLimit(6).frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .accessibilityElement(children: .combine)
                 .accessibilityLabel(transcript.isEmpty ? "Listening" : "Heard: " + transcript)
             } else {
-                TextField(model.chat.state.turn != nil ? sendLabel + " a follow-up…" : compact.placeholder,
+                TextField(followupKind.map { $0.hint + "…" } ?? compact.placeholder,
                           text: Binding(get: { model.text }, set: { value in
                               model.edit(value, selection: NSRange(location: (value as NSString).length, length: 0))
                           }), axis: .vertical)
-                    .lineLimit(1...4)
+                    .lineLimit(1...6)
                     .font(VerdeTheme.ui(15))
                     .disabled(model.pending)
                     .accessibilityLabel("Message")
                     .accessibilityIdentifier("composer-field")
             }
         }
-        .padding(.horizontal, 12).padding(.vertical, 8)
-        .frame(minHeight: 40)
-        .background(VerdeTheme.alternate, in: RoundedRectangle(cornerRadius: 20))
-        .padding(.vertical, 2)
+        .padding(.horizontal, 14).padding(.vertical, 10)
+        .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+        .background(VerdeTheme.alternate, in: RoundedRectangle(cornerRadius: 18))
     }
 
     /// Attach, plus the rarely changed pickers (provider on a fresh chat, access, speed).
@@ -295,7 +302,6 @@ struct ChatComposer: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .padding(.leading, 6)
         .accessibilityLabel("Brain: \(label)")
         .accessibilityHint("Opens companion settings to change the brain.")
         .accessibilityIdentifier("composer-brain")
@@ -329,9 +335,31 @@ struct ChatComposer: View {
         .accessibilityIdentifier("composer-setting-model")
     }
 
-    private var sendLabel: String {
-        guard model.chat.state.turn != nil else { return "Send" }
-        return composerFollowupKind(provider: model.displayedSelection?.provider, images: model.view?.draft.attachments.isEmpty == false) == .steer ? "Steer" : "Queue"
+    private var hasImages: Bool { model.view?.draft.attachments.isEmpty == false }
+    /// How Send delivers while a turn runs (nil when nothing is running).
+    private var followupKind: FollowupKind? {
+        guard model.chat.state.turn != nil else { return nil }
+        return composerFollowupKind(provider: model.displayedSelection?.provider, images: hasImages)
+    }
+    private var sendLabel: String { followupKind?.label ?? "Send" }
+    private var sendHint: String { followupKind?.hint ?? "Sends your message." }
+
+    /// Long-press on Send while a turn runs: the other ways to deliver this message.
+    @ViewBuilder private var sendAlternatives: some View {
+        if model.chat.state.turn != nil {
+            ForEach(followupAlternatives(provider: model.displayedSelection?.provider, images: hasImages), id: \.self) { kind in
+                Button { model.submit(voice: false, followup: kind) } label: { Label(kind.insteadLabel, systemImage: followupIcon(kind)) }
+                    .disabled(!model.canSubmit)
+            }
+        }
+    }
+
+    private func followupIcon(_ kind: FollowupKind) -> String {
+        switch kind {
+        case .steer: return "arrow.turn.down.right"
+        case .interrupt: return "bolt"
+        case .queue: return "text.line.last.and.arrowtriangle.forward"
+        }
     }
     private var promptHeight: CGFloat { composerPromptHeight(resizedHeight ?? 56, available: availableHeight) }
     private func resizePrompt(_ delta: CGFloat) { resizedHeight = composerPromptHeight(promptHeight + delta, available: availableHeight) }

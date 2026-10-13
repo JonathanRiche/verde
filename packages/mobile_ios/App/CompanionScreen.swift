@@ -324,46 +324,48 @@ private struct CompanionStarter: View {
                 Text(notice).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.warning)
                     .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 14)
             }
-            HStack(alignment: .bottom, spacing: 2) {
+            VStack(spacing: 2) {
                 Group {
                     if voice.listening {
                         HStack(spacing: 8) {
                             LevelMeter(level: voice.level)
-                            Text(voice.partial.isEmpty ? "Listening…" : voice.partial).font(VerdeTheme.ui(15)).lineLimit(4)
+                            Text(voice.partial.isEmpty ? "Listening…" : voice.partial).font(VerdeTheme.ui(15)).lineLimit(6)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
                     } else {
-                        TextField("Message \(name)", text: $text, axis: .vertical)
-                            .lineLimit(1...4)
+                        TextField("Message \(name)…", text: $text, axis: .vertical)
+                            .lineLimit(1...6)
                             .font(VerdeTheme.ui(15))
                             .accessibilityIdentifier("companion-starter-input")
                     }
                 }
-                .padding(.horizontal, 12).padding(.vertical, 8)
-                .frame(minHeight: 40)
-                .background(VerdeTheme.alternate, in: RoundedRectangle(cornerRadius: 20))
-                .padding(.vertical, 2)
-                CompanionMicButton(voice: voice, name: name, send: sendVoice).disabled(busy)
-                Button {
-                    let prompt = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !prompt.isEmpty else { return }
-                    text = ""
-                    send(prompt)
-                } label: {
-                    Group {
-                        if busy { ProgressView() }
-                        else {
-                            Image(systemName: "arrow.up").font(.system(size: 15, weight: .bold)).foregroundStyle(VerdeTheme.background)
-                                .frame(width: 32, height: 32).background(VerdeTheme.accent, in: Circle())
+                .padding(.horizontal, 14).padding(.vertical, 10)
+                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                .background(VerdeTheme.alternate, in: RoundedRectangle(cornerRadius: 18))
+                HStack(spacing: 2) {
+                    Spacer(minLength: 4)
+                    CompanionMicButton(voice: voice, name: name, send: sendVoice).disabled(busy)
+                    Button {
+                        let prompt = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !prompt.isEmpty else { return }
+                        text = ""
+                        send(prompt)
+                    } label: {
+                        Group {
+                            if busy { ProgressView() }
+                            else {
+                                Image(systemName: "arrow.up").font(.system(size: 15, weight: .bold)).foregroundStyle(VerdeTheme.background)
+                                    .frame(width: 32, height: 32).background(VerdeTheme.accent, in: Circle())
+                            }
                         }
+                        .frame(width: 44, height: 44)
                     }
-                    .frame(width: 44, height: 44)
+                    .buttonStyle(.plain)
+                    .disabled(busy || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .accessibilityLabel("Send")
                 }
-                .buttonStyle(.plain)
-                .disabled(busy || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                .accessibilityLabel("Send")
             }
-            .padding(.horizontal, 8).padding(.vertical, 6)
+            .padding(.horizontal, 8).padding(.top, 6).padding(.bottom, 2)
             .background(VerdeTheme.panel)
             .overlay(alignment: .top) { Divider().overlay(VerdeTheme.border) }
         }
@@ -427,7 +429,7 @@ private struct CompanionConversation: View {
 
     /// The live transcript replaces the field while listening; the mic sits next to send.
     private func composer(_ model: TranscriptModel) -> CompactComposer {
-        CompactComposer(placeholder: "Message \(name)",
+        CompactComposer(placeholder: "Message \(name)…",
                         transcript: voice.listening ? voice.partial : nil,
                         level: voice.level,
                         notice: voice.listening ? nil : voice.notice,
