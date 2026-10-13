@@ -54,6 +54,8 @@ pub const HitAction = enum {
     menu_dismiss,
     menu_select_companion,
     menu_new_companion,
+    menu_new_conversation,
+    menu_resume_conversation,
     menu_rename,
     menu_orders,
     menu_remove,
@@ -622,6 +624,13 @@ pub const RosterRow = struct {
     active: bool = false,
 };
 
+pub const ConversationRow = struct {
+    title: ShortText = .{},
+    detail: ShortText = .{},
+};
+
+pub const MAX_CONVERSATION_ROWS: usize = 5;
+
 pub const BrainProvider = struct {
     label: ShortText = .{},
     selected: bool = false,
@@ -640,6 +649,9 @@ inbox: [MAX_INBOX]ChatRow = [_]ChatRow{.{}} ** MAX_INBOX,
 inbox_count: usize = 0,
 roster_rows: [MAX_ROSTER_ROWS]RosterRow = [_]RosterRow{.{}} ** MAX_ROSTER_ROWS,
 roster_row_count: usize = 0,
+/// Remembered conversations of the active companion, newest first.
+conversation_rows: [MAX_CONVERSATION_ROWS]ConversationRow = [_]ConversationRow{.{}} ** MAX_CONVERSATION_ROWS,
+conversation_row_count: usize = 0,
 brain_providers: [MAX_BRAIN_PROVIDERS]BrainProvider = [_]BrainProvider{.{}} ** MAX_BRAIN_PROVIDERS,
 brain_provider_count: usize = 0,
 /// Provider tab the brain menu is browsing (index into `brain_providers`).

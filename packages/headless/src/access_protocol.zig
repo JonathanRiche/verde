@@ -316,6 +316,8 @@ pub const PAIRED_RPC_METHODS = [_]PairedRpcMethod{
     // drift apart silently (see the protocol.zig reachability test).
     .{ .method = "chat.links.create", .scope_mask = CHAT_WRITE },
     .{ .method = "companion.roster.put", .scope_mask = CHAT_WRITE },
+    // Moves a companion's conversation to another provider with a handoff.
+    .{ .method = "companion.brain.switch", .scope_mask = CHAT_WRITE },
     .{ .method = "voice.session.create", .scope_mask = CHAT_WRITE },
     .{ .method = "voice.provider.configure", .scope_mask = CHAT_WRITE },
     .{ .method = "chat.subagent.open", .scope_mask = CHAT_WRITE },

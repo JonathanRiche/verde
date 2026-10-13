@@ -19,6 +19,9 @@ const REF_CAPACITY: usize = 160;
 const PROVIDER_CAPACITY: usize = 24;
 const MODEL_CAPACITY: usize = 160;
 pub const ORDERS_CAPACITY: usize = 1024;
+/// Past conversations kept per companion (newest first).
+pub const MAX_HISTORY: usize = 12;
+const TITLE_CAPACITY: usize = 96;
 const MAX_FILE_BYTES: usize = 64 * 1024;
 
 /// Fixed-capacity, value-owned text so roster entries copy freely and never
@@ -51,6 +54,14 @@ pub fn Text(comptime capacity: usize) type {
 
 pub const Name = Text(NAME_CAPACITY);
 
+pub const PastConversation = struct {
+    thread_id: Text(REF_CAPACITY) = .{},
+    title: Text(TITLE_CAPACITY) = .{},
+    provider: Text(PROVIDER_CAPACITY) = .{},
+    model: Text(MODEL_CAPACITY) = .{},
+    ended_at_ms: i64 = 0,
+};
+
 pub const Companion = struct {
     id: Text(ID_CAPACITY) = .{},
     name: Name = .{},
@@ -68,6 +79,44 @@ pub const Companion = struct {
     /// Standing orders the user wrote for this companion; included in every
     /// turn's persona ("always run tests before calling work done").
     orders: Text(ORDERS_CAPACITY) = .{},
+    /// Earlier conversations with this companion, newest first. Threads stay
+    /// in their home workspace; the roster just remembers them.
+    history: [MAX_HISTORY]PastConversation = [_]PastConversation{.{}} ** MAX_HISTORY,
+    history_count: usize = 0,
+
+    pub fn pastConversations(self: *const Companion) []const PastConversation {
+        return self.history[0..@min(self.history_count, MAX_HISTORY)];
+    }
+
+    /// True for the current or any remembered conversation of this companion.
+    pub fn ownsThread(self: *const Companion, workspace_id: []const u8, thread_id: []const u8) bool {
+        if (self.hasThread(workspace_id, thread_id)) return true;
+        if (!self.home_workspace_id.eql(workspace_id)) return false;
+        for (self.pastConversations()) |*past| if (past.thread_id.eql(thread_id)) return true;
+        return false;
+    }
+
+    fn pushHistory(self: *Companion, past: PastConversation) void {
+        if (past.thread_id.isEmpty()) return;
+        var index: usize = 0;
+        while (index < self.history_count) {
+            if (self.history[index].thread_id.eql(past.thread_id.slice())) {
+                self.removeHistoryAt(index);
+            } else index += 1;
+        }
+        var cursor = @min(self.history_count, MAX_HISTORY - 1);
+        while (cursor > 0) : (cursor -= 1) self.history[cursor] = self.history[cursor - 1];
+        self.history[0] = past;
+        self.history_count = @min(self.history_count + 1, MAX_HISTORY);
+    }
+
+    fn removeHistoryAt(self: *Companion, index: usize) void {
+        if (index >= self.history_count) return;
+        var cursor = index;
+        while (cursor + 1 < self.history_count) : (cursor += 1) self.history[cursor] = self.history[cursor + 1];
+        self.history_count -= 1;
+        self.history[self.history_count] = .{};
+    }
 
     pub fn hasThread(self: *const Companion, workspace_id: []const u8, thread_id: []const u8) bool {
         return !self.thread_id.isEmpty() and self.home_workspace_id.eql(workspace_id) and self.thread_id.eql(thread_id);
@@ -192,6 +241,58 @@ pub fn clearThread(self: *Self, index: usize) void {
     self.dirty = true;
 }
 
+/// Archives the current conversation into history and clears the current
+/// thread, so the next draft or send starts a fresh conversation.
+pub fn startNewConversation(self: *Self, index: usize, title: []const u8, now_ms: i64) bool {
+    if (index >= self.count) return false;
+    const entry = &self.entries[index];
+    if (entry.thread_id.isEmpty()) return false;
+    var past: PastConversation = .{ .ended_at_ms = now_ms };
+    past.thread_id.set(entry.thread_id.slice());
+    past.title.set(title);
+    past.provider.set(entry.provider.slice());
+    past.model.set(entry.model.slice());
+    entry.pushHistory(past);
+    entry.thread_id.set("");
+    self.dirty = true;
+    return true;
+}
+
+/// Makes a remembered conversation current again; the conversation it
+/// replaces moves into history. Brain follows the resumed conversation.
+pub fn resumeConversation(self: *Self, index: usize, thread_id: []const u8, current_title: []const u8, now_ms: i64) bool {
+    if (index >= self.count) return false;
+    const entry = &self.entries[index];
+    const found = for (entry.pastConversations(), 0..) |*past, position| {
+        if (past.thread_id.eql(thread_id)) break position;
+    } else return false;
+    const resumed = entry.history[found];
+    entry.removeHistoryAt(found);
+    if (!entry.thread_id.isEmpty()) {
+        var past: PastConversation = .{ .ended_at_ms = now_ms };
+        past.thread_id.set(entry.thread_id.slice());
+        past.title.set(current_title);
+        past.provider.set(entry.provider.slice());
+        past.model.set(entry.model.slice());
+        entry.pushHistory(past);
+    }
+    entry.thread_id.set(resumed.thread_id.slice());
+    if (!resumed.provider.isEmpty()) {
+        entry.provider.set(resumed.provider.slice());
+        entry.model.set(resumed.model.slice());
+    }
+    self.dirty = true;
+    return true;
+}
+
+/// Index of the companion owning this thread as current or past conversation.
+pub fn indexOwningThread(self: *const Self, workspace_id: []const u8, thread_id: []const u8) ?usize {
+    for (self.items(), 0..) |*entry, index| {
+        if (entry.ownsThread(workspace_id, thread_id)) return index;
+    }
+    return null;
+}
+
 /// Replaces standing orders; whitespace-only text clears them.
 pub fn setOrders(self: *Self, index: usize, orders: []const u8) void {
     if (index >= self.count) return;
@@ -226,6 +327,15 @@ const WireCompanion = struct {
     provider: []const u8 = "",
     model: []const u8 = "",
     orders: []const u8 = "",
+    history: []const WirePast = &.{},
+};
+
+const WirePast = struct {
+    thread_id: []const u8 = "",
+    title: []const u8 = "",
+    provider: []const u8 = "",
+    model: []const u8 = "",
+    ended_at_ms: i64 = 0,
 };
 
 const WireRoster = struct {
@@ -272,6 +382,17 @@ pub fn parse(self: *Self, allocator: std.mem.Allocator, bytes: []const u8) !void
         entry.provider.set(wire.provider);
         entry.model.set(wire.model);
         entry.orders.set(wire.orders);
+        for (wire.history) |past_wire| {
+            if (entry.history_count >= MAX_HISTORY) break;
+            if (past_wire.thread_id.len == 0) continue;
+            var past: PastConversation = .{ .ended_at_ms = past_wire.ended_at_ms };
+            past.thread_id.set(past_wire.thread_id);
+            past.title.set(past_wire.title);
+            past.provider.set(past_wire.provider);
+            past.model.set(past_wire.model);
+            entry.history[entry.history_count] = past;
+            entry.history_count += 1;
+        }
         if (entry.id.isEmpty()) {
             var id_buffer: [ID_CAPACITY]u8 = undefined;
             entry.id.set(std.fmt.bufPrint(&id_buffer, "cmp-restored-{d}", .{self.count}) catch "cmp");
@@ -284,7 +405,17 @@ pub fn parse(self: *Self, allocator: std.mem.Allocator, bytes: []const u8) !void
 
 pub fn encodeAlloc(self: *const Self, allocator: std.mem.Allocator) ![]u8 {
     var wires: [MAX_COMPANIONS]WireCompanion = undefined;
+    var pasts: [MAX_COMPANIONS][MAX_HISTORY]WirePast = undefined;
     for (self.entries[0..self.count], 0..) |*entry, index| {
+        for (entry.pastConversations(), 0..) |*past, position| {
+            pasts[index][position] = .{
+                .thread_id = past.thread_id.slice(),
+                .title = past.title.slice(),
+                .provider = past.provider.slice(),
+                .model = past.model.slice(),
+                .ended_at_ms = past.ended_at_ms,
+            };
+        }
         wires[index] = .{
             .id = entry.id.slice(),
             .name = entry.name.slice(),
@@ -294,6 +425,7 @@ pub fn encodeAlloc(self: *const Self, allocator: std.mem.Allocator) ![]u8 {
             .provider = entry.provider.slice(),
             .model = entry.model.slice(),
             .orders = entry.orders.slice(),
+            .history = pasts[index][0..entry.pastConversations().len],
         };
     }
     const wire: WireRoster = .{
@@ -463,4 +595,45 @@ test "legacy roster file migrates and a missing file reports absent" {
     var restored = Self.init();
     try std.testing.expect(restored.loadLegacyFile(allocator, dir_path));
     try std.testing.expectEqualStrings("Fern", restored.active().?.name.slice());
+}
+
+test "conversations archive, resume, and keep the brain they ran on" {
+    const allocator = std.testing.allocator;
+    var roster = Self.init();
+    _ = roster.add(.moss, "Moss", 1);
+    roster.bindThread(0, "ws", "chat-1");
+    roster.setBrain(0, "claude", "haiku");
+    try std.testing.expect(roster.startNewConversation(0, "ACP review", 10));
+    try std.testing.expect(roster.entries[0].thread_id.isEmpty());
+    roster.bindThread(0, "ws", "chat-2");
+    roster.setBrain(0, "codex", "gpt-5.5");
+    try std.testing.expect(roster.entries[0].ownsThread("ws", "chat-1"));
+    try std.testing.expectEqual(@as(?usize, 0), roster.indexOwningThread("ws", "chat-1"));
+
+    try std.testing.expect(roster.resumeConversation(0, "chat-1", "Codex work", 20));
+    try std.testing.expectEqualStrings("chat-1", roster.entries[0].thread_id.slice());
+    try std.testing.expectEqualStrings("claude", roster.entries[0].provider.slice());
+    try std.testing.expectEqual(@as(usize, 1), roster.entries[0].history_count);
+    try std.testing.expectEqualStrings("chat-2", roster.entries[0].history[0].thread_id.slice());
+    try std.testing.expectEqualStrings("codex", roster.entries[0].history[0].provider.slice());
+    try std.testing.expect(!roster.resumeConversation(0, "missing", "", 30));
+
+    const encoded = try roster.encodeAlloc(allocator);
+    defer allocator.free(encoded);
+    var restored = Self.init();
+    try restored.parse(allocator, encoded);
+    try std.testing.expectEqualStrings("Codex work", restored.entries[0].history[0].title.slice());
+    try std.testing.expectEqual(@as(i64, 20), restored.entries[0].history[0].ended_at_ms);
+}
+
+test "history is bounded and de-duplicated" {
+    var roster = Self.init();
+    _ = roster.add(.sprout, null, 1);
+    var buffer: [32]u8 = undefined;
+    for (0..MAX_HISTORY + 4) |n| {
+        roster.bindThread(0, "ws", std.fmt.bufPrint(&buffer, "chat-{d}", .{n}) catch unreachable);
+        _ = roster.startNewConversation(0, "t", @intCast(n));
+    }
+    try std.testing.expectEqual(MAX_HISTORY, roster.entries[0].history_count);
+    try std.testing.expectEqualStrings("chat-15", roster.entries[0].history[0].thread_id.slice());
 }

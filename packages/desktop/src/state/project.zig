@@ -336,7 +336,8 @@ pub const TerminalProcessOutcome = struct {
 
 /// Bounded, value-owned set of extra Companion thread ids for one project.
 pub const CompanionExtraIds = struct {
-    const CAPACITY = 8;
+    /// Companions (8) × their current plus remembered conversations.
+    const CAPACITY = 64;
     const ID_CAPACITY = 160;
     ids: [CAPACITY][ID_CAPACITY]u8 = undefined,
     lens: [CAPACITY]usize = [_]usize{0} ** CAPACITY,

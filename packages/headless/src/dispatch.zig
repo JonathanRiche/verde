@@ -15,6 +15,7 @@ const attachment_protocol = @import("attachment_protocol.zig");
 const MUTATING_METHODS = [_][]const u8{
     // Sessionizer-owned mutations.
     "companion.roster.put",
+    "companion.brain.switch",
     "voice.provider.configure",
     "device.push.register",
     "device.push.unregister",

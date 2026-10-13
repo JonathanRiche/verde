@@ -118,6 +118,8 @@ pub fn handleMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, d
             .menu_orders => state.beginCompanionOrders(),
             .recap => state.sendCompanionRecap(),
             .menu_remove => state.removeActiveCompanion(),
+            .menu_new_conversation => state.startNewCompanionConversation(),
+            .menu_resume_conversation => state.resumeCompanionConversation(result.index),
             .menu_character => if (characterAt(result.index)) |character| state.setActiveCompanionCharacter(character),
             .brain_provider => state.selectCompanionBrainProvider(result.index),
             .brain_model => state.setCompanionBrain(result.index),
@@ -968,6 +970,9 @@ const CompanionMenuLayout = struct {
     characters: [3]palette.Rect,
     new_companion: palette.Rect,
     remove: palette.Rect,
+    new_conversation: palette.Rect,
+    conversations: [controller.MAX_CONVERSATION_ROWS]palette.Rect,
+    conversation_count: usize,
 };
 
 fn companionMenuLayout(state: *runtime.AppState, geometry: Geometry) CompanionMenuLayout {
@@ -1001,6 +1006,14 @@ fn companionMenuLayout(state: *runtime.AppState, geometry: Geometry) CompanionMe
     } else {
         layout.remove = .{};
     }
+    y += 6.0 * s;
+    layout.new_conversation = .{ .x = x + 6.0 * s, .y = y, .w = menu_w - 12.0 * s, .h = MENU_ACTION_HEIGHT * s };
+    y += MENU_ACTION_HEIGHT * s;
+    layout.conversation_count = companion.conversation_row_count;
+    for (0..layout.conversation_count) |index| {
+        layout.conversations[index] = .{ .x = x + 6.0 * s, .y = y, .w = menu_w - 12.0 * s, .h = MENU_ROW_HEIGHT * s };
+        y += MENU_ROW_HEIGHT * s;
+    }
     const menu_top = geometry.header.y + geometry.header.h - 4.0 * s;
     layout.menu = .{ .x = x, .y = menu_top, .w = menu_w, .h = y + 6.0 * s - menu_top };
     return layout;
@@ -1017,6 +1030,8 @@ fn registerCompanionMenuHits(state: *runtime.AppState, geometry: Geometry) void 
     for (layout.characters, 0..) |rect, index| companion.addIndexedHit(rect, .menu_character, index);
     companion.addHit(layout.new_companion, .menu_new_companion);
     companion.addHit(layout.remove, .menu_remove);
+    companion.addHit(layout.new_conversation, .menu_new_conversation);
+    for (layout.conversations[0..layout.conversation_count], 0..) |rect, index| companion.addIndexedHit(rect, .menu_resume_conversation, index);
 }
 
 fn renderMenuSurface(state: *runtime.AppState, rect: palette.Rect) void {
@@ -1071,6 +1086,14 @@ fn renderCompanionMenu(state: *runtime.AppState, geometry: Geometry) void {
     }
     renderMenuAction(state, layout.new_companion, "+ New companion", false);
     renderMenuAction(state, layout.remove, framePrint(state, "Remove {s}", .{companion.identity.name.slice()}), true);
+    queueRect(state, .{ .x = layout.menu.x + 10.0 * s, .y = layout.new_conversation.y - 4.0 * s, .w = layout.menu.w - 20.0 * s, .h = 1.0 * s }, color(hairline()));
+    renderMenuAction(state, layout.new_conversation, "✎ New conversation", false);
+    for (companion.conversation_rows[0..layout.conversation_count], 0..) |*row, index| {
+        const rect = layout.conversations[index];
+        const text_w = @max(rect.w - 20.0 * s, 0.0);
+        queueText(state, .{ .x = rect.x + 10.0 * s, .y = rect.y + 4.0 * s, .w = text_w, .h = 17.0 * s }, truncatedText(state, .ui, 12.0 * s, text_w, row.title.slice()), color(chrome.text_muted), 12.0 * s, rect);
+        queueText(state, .{ .x = rect.x + 10.0 * s, .y = rect.y + 21.0 * s, .w = text_w, .h = 15.0 * s }, truncatedText(state, .ui, 10.5 * s, text_w, row.detail.slice()), color(chrome.text_subtle), 10.5 * s, rect);
+    }
 }
 
 const BrainMenuLayout = struct {
@@ -2169,6 +2192,33 @@ test "menus register their rows above a dismiss layer" {
     render(&state, 1360.0, 860.0);
     try std.testing.expect(batchHasText(&state.palette_overlay_batch, "Wren"));
     try std.testing.expect(batchHasText(&state.palette_overlay_batch, "+ New companion"));
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "✎ New conversation"));
+}
+
+test "companion menu lists remembered conversations and routes resume" {
+    const allocator = std.testing.allocator;
+    theme.applyTheme(1.0);
+    var state: runtime.AppState = undefined;
+    try testState(allocator, &state);
+    defer deinitTestState(allocator, &state);
+    state.companion_controller.show();
+    state.companion_controller.roster_row_count = 1;
+    state.companion_controller.roster_rows[0] = .{ .active = true };
+    state.companion_controller.roster_rows[0].name.set("Juniper");
+    state.companion_controller.conversation_row_count = 2;
+    state.companion_controller.conversation_rows[0].title.set("ACP review");
+    state.companion_controller.conversation_rows[0].detail.set("claude · haiku");
+    state.companion_controller.conversation_rows[1].title.set("Muse rollout");
+    state.companion_controller.openMenu(.companions);
+    const geometry = computeGeometry(&state, 1360.0, 860.0);
+    registerHits(&state, geometry);
+    const layout = companionMenuLayout(&state, geometry);
+    const hit = state.companion_controller.hitEntryAt(layout.conversations[1].x + 4.0, layout.conversations[1].y + 4.0).?;
+    try std.testing.expectEqual(controller.HitAction.menu_resume_conversation, hit.action);
+    try std.testing.expectEqual(@as(usize, 1), hit.index);
+    try std.testing.expectEqual(controller.HitAction.menu_new_conversation, state.companion_controller.hitAt(layout.new_conversation.x + 4.0, layout.new_conversation.y + 4.0).?);
+    render(&state, 1360.0, 860.0);
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "ACP review"));
 }
 
 test "measured wrap keeps words whole and bounds line count" {

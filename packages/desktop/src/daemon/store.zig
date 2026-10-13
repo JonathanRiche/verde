@@ -3952,6 +3952,40 @@ pub const Store = struct {
         return next_revision;
     }
 
+    /// Moves a thread to another provider/model in place for a companion
+    /// brain switch: the transcript stays, the old provider's session id is
+    /// cleared so the new provider starts fresh (with a handoff note), and
+    /// effort/variant reset to the new provider's defaults.
+    pub fn setThreadBrain(
+        self: *Self,
+        workspace_id: []const u8,
+        local_thread_id: []const u8,
+        provider: []const u8,
+        model_ref: ?[]const u8,
+    ) StoreError!u64 {
+        const code = providerCode(provider) catch return error.InvalidParams;
+        self.conn.execNoArgs("begin immediate") catch |err| return mapStoreError(err);
+        var transaction_open = true;
+        defer if (transaction_open) self.conn.rollback();
+        const owner = self.conn.row(
+            "select 1 from threads t join workspaces w on w.id = t.workspace_id where w.workspace_id = ?1 and t.local_thread_id = ?2",
+            .{ workspace_id, local_thread_id },
+        ) catch |err| return mapStoreError(err);
+        const found = owner orelse return error.ResourceNotFound;
+        found.deinit();
+        self.conn.exec(
+            "update threads set provider = ?1, model_ref = ?2, provider_thread_id = null, reasoning_effort = null, reasoning_variant = null, committed = 1 where workspace_id = (select id from workspaces where workspace_id = ?3) and local_thread_id = ?4",
+            .{ code, model_ref, workspace_id, local_thread_id },
+        ) catch |err| return mapStoreError(err);
+        const revision = self.readStoreRevision() catch |err| return mapStoreError(err);
+        const next_revision = std.math.add(u64, revision, 1) catch return error.StoreUnavailable;
+        const next_revision_sql: i64 = std.math.cast(i64, next_revision) orelse return error.StoreUnavailable;
+        self.conn.exec("update store_state set store_revision = ?1 where id = 1", .{next_revision_sql}) catch |err| return mapStoreError(err);
+        self.conn.commit() catch |err| return mapStoreError(err);
+        transaction_open = false;
+        return next_revision;
+    }
+
     /// Rewrites the body of one daemon-authored system transcript row in
     /// place (same `message_id` and position) and advances store_revision.
     /// The row's idempotency key fingerprint is refreshed to match. Returns

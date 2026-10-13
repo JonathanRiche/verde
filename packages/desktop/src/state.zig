@@ -13285,10 +13285,18 @@ pub const AppState = struct {
     /// list hides them. Cheap: the roster holds at most eight companions.
     fn applyCompanionDesignations(self: *AppState) void {
         for (self.project_controller.projects.items) |*project| {
-            var ids: [companion_roster_mod.MAX_COMPANIONS][]const u8 = undefined;
+            var ids: [64][]const u8 = undefined;
             var count: usize = 0;
             for (self.companion_roster.items()) |*companion| {
-                if (companion.thread_id.isEmpty() or !companion.home_workspace_id.eql(project.id)) continue;
+                if (!companion.home_workspace_id.eql(project.id)) continue;
+                // Remembered conversations stay out of normal thread lists too;
+                // they are reached through the companion's conversation list.
+                for (companion.pastConversations()) |*past| {
+                    if (count == ids.len) break;
+                    ids[count] = past.thread_id.slice();
+                    count += 1;
+                }
+                if (companion.thread_id.isEmpty() or count == ids.len) continue;
                 if (project.companion_thread_local_id) |primary| {
                     if (companion.thread_id.eql(primary)) continue;
                 }
@@ -13466,6 +13474,20 @@ pub const AppState = struct {
             row.name.set(companion.name.slice());
             panel.roster_rows[panel.roster_row_count] = row;
             panel.roster_row_count += 1;
+        }
+
+        panel.conversation_row_count = 0;
+        if (roster.activeConst()) |companion| {
+            for (companion.pastConversations()) |*past| {
+                if (panel.conversation_row_count == panel.conversation_rows.len) break;
+                var row: companion_controller.ConversationRow = .{};
+                row.title.set(if (past.title.isEmpty()) "Conversation" else past.title.slice());
+                var detail_buffer: [160]u8 = undefined;
+                const detail = if (past.provider.isEmpty()) "" else if (past.model.isEmpty()) past.provider.slice() else std.fmt.bufPrint(&detail_buffer, "{s} · {s}", .{ past.provider.slice(), past.model.slice() }) catch past.provider.slice();
+                row.detail.set(detail);
+                panel.conversation_rows[panel.conversation_row_count] = row;
+                panel.conversation_row_count += 1;
+            }
         }
 
         var providers: [companion_controller.MAX_BRAIN_PROVIDERS]Provider = undefined;
@@ -13840,16 +13862,19 @@ pub const AppState = struct {
                 return;
             }
         }
-        self.companion_roster.setBrain(roster_index, @tagName(provider), value);
         if (self.activeCompanionThread()) |thread| {
             if (thread.provider != provider and !threadAllowsInPlaceProviderChoice(thread)) {
-                self.releaseCompanionThreadAt(roster_index);
-                self.companion_roster.setBrain(roster_index, @tagName(provider), value);
-                _ = self.ensureActiveCompanionThread() catch |err| {
-                    log.err("failed to start companion conversation with new brain: {s}", .{@errorName(err)});
-                    self.companion_controller.ui_error = "Could not switch the companion's brain.";
-                };
-            } else {
+                // Same conversation, new provider: the daemon has the outgoing
+                // brain write a handoff brief, switches the thread, and replays
+                // the brief plus recent history to the new brain.
+                self.requestCompanionBrainSwitch(provider, value);
+                self.afterCompanionRosterChange();
+                return;
+            }
+        }
+        self.companion_roster.setBrain(roster_index, @tagName(provider), value);
+        if (self.activeCompanionThread()) |thread| {
+            {
                 if (thread.provider != provider) {
                     self.applyProviderModelDefaults(thread, provider, false) catch |err| {
                         log.warn("failed to switch companion provider: {s}", .{@errorName(err)});
@@ -13858,6 +13883,66 @@ pub const AppState = struct {
                 self.setThreadModelRef(thread, value);
             }
         }
+        self.afterCompanionRosterChange();
+    }
+
+    fn requestCompanionBrainSwitch(self: *AppState, provider: Provider, model: ?[:0]const u8) void {
+        const companion = self.companion_roster.activeConst() orelse return;
+        const response = daemon_client.requestAllocWithTimeout(self.allocator, self.storage.pref_path, "companion.brain.switch", .{
+            .companion_id = companion.id.slice(),
+            .provider = @tagName(provider),
+            .model = model,
+            .brief = true,
+        }, 1, 5_000) catch |err| {
+            log.warn("companion brain switch request failed: {s}", .{@errorName(err)});
+            self.companion_controller.ui_error = "Could not reach the daemon to switch brains.";
+            return;
+        };
+        defer self.allocator.free(response);
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, response, .{}) catch return;
+        defer parsed.deinit();
+        if (parsed.value == .object) {
+            if (parsed.value.object.get("error")) |err_value| {
+                const code = if (err_value == .object) (if (err_value.object.get("code")) |c| (if (c == .string) c.string else "") else "") else "";
+                self.companion_controller.ui_error = if (std.mem.eql(u8, code, "companion_busy"))
+                    "Wait for the current turn to finish before switching brains."
+                else
+                    "Could not switch the companion's brain.";
+                return;
+            }
+        }
+        self.companion_controller.ui_error = null;
+        // Pick up the roster brain the daemon writes once the switch lands.
+        self.companion_sync.last_fetch_started_ms = 0;
+    }
+
+    /// Starts a fresh conversation with the active companion; the current one
+    /// is remembered in its conversation list.
+    pub fn startNewCompanionConversation(self: *AppState) void {
+        const index = self.companion_roster.active_index;
+        if (self.activeCompanionThread()) |thread| {
+            if (thread.isSendPendingForUi()) {
+                self.companion_controller.ui_error = "Wait for the current turn to finish first.";
+                return;
+            }
+            _ = self.companion_roster.startNewConversation(index, thread.title, unixTimestampMs());
+        } else {
+            _ = self.companion_roster.startNewConversation(index, "Conversation", unixTimestampMs());
+        }
+        self.afterCompanionRosterChange();
+    }
+
+    /// Returns to a remembered conversation.
+    pub fn resumeCompanionConversation(self: *AppState, history_index: usize) void {
+        const index = self.companion_roster.active_index;
+        const companion = self.companion_roster.activeConst() orelse return;
+        const pasts = companion.pastConversations();
+        if (history_index >= pasts.len) return;
+        var thread_id_buffer: [160]u8 = undefined;
+        const thread_id = thread_id_buffer[0..pasts[history_index].thread_id.slice().len];
+        @memcpy(thread_id, pasts[history_index].thread_id.slice());
+        const title = if (self.activeCompanionThread()) |thread| thread.title else "Conversation";
+        _ = self.companion_roster.resumeConversation(index, thread_id, title, unixTimestampMs());
         self.afterCompanionRosterChange();
     }
 

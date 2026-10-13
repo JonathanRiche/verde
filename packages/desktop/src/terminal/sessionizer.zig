@@ -2969,7 +2969,7 @@ pub const Daemon = struct {
         // accepting_mutations and pins in_flight under lockDaemon itself.
         if (!std.mem.startsWith(u8, method, "chat.links.") and !std.mem.startsWith(u8, method, "chat.tasks.") and
             !std.mem.startsWith(u8, method, "browser.history.") and
-            !std.mem.startsWith(u8, method, "companion.roster.") and
+            !std.mem.startsWith(u8, method, "companion.") and
             !std.mem.startsWith(u8, method, "voice.") and
             !std.mem.eql(u8, method, "chat.turn.start") and
             !std.mem.eql(u8, method, "chat.turn.steer") and
@@ -3001,6 +3001,7 @@ pub const Daemon = struct {
         if (std.mem.eql(u8, method, "session.cleanup")) return try self.cleanupResponse(id_value);
         if (std.mem.startsWith(u8, method, "chat.links.") or std.mem.startsWith(u8, method, "chat.tasks.")) return try self.chatOrchestrationResponse(id_value, method, params);
         if (std.mem.startsWith(u8, method, "browser.history.")) return try browserHistoryResponse(self, id_value, method, params);
+        if (std.mem.eql(u8, method, "companion.brain.switch")) return try companionBrainSwitchResponse(self, id_value, params);
         if (std.mem.startsWith(u8, method, "companion.roster.")) return try companionRosterResponse(self, id_value, method, params);
         if (std.mem.startsWith(u8, method, "voice.")) return try voiceResponse(self, id_value, method, params);
         if (std.mem.eql(u8, method, "chat.turn.start")) return try self.chatTurnStartResponse(id_value, params);
@@ -13289,7 +13290,7 @@ fn methodRunsUnlocked(method: []const u8) bool {
         std.mem.startsWith(u8, method, "browser.history.") or
         // Companion roster is one small store row; it pins in_flight and
         // checks the drain flag itself.
-        std.mem.startsWith(u8, method, "companion.roster.") or
+        std.mem.startsWith(u8, method, "companion.") or
         // Voice session minting waits on a provider HTTPS call with no lock held.
         std.mem.startsWith(u8, method, "voice.") or
         std.mem.eql(u8, method, "chat.turn.start") or
@@ -14972,6 +14973,275 @@ fn voiceResponse(daemon: *Daemon, id_value: std.json.Value, method: []const u8, 
         .tools = tools,
         .companion = .{ .id = companion_id, .name = name, .home_workspace_id = home_workspace_id, .thread_id = thread_id },
     });
+    try s.endObject();
+    return writer.toOwnedSlice();
+}
+
+// ---- companion brain switch ---------------------------------------------------
+
+const BrainSwitchJob = struct {
+    daemon: *Daemon,
+    workspace_id: []u8,
+    thread_id: []u8,
+    companion_id: []u8,
+    name: []u8,
+    provider: []u8,
+    model: ?[]u8,
+    from_brain: []u8,
+    to_brain: []u8,
+    brief: bool,
+
+    fn destroy(self: *BrainSwitchJob) void {
+        const a = std.heap.page_allocator;
+        a.free(self.workspace_id);
+        a.free(self.thread_id);
+        a.free(self.companion_id);
+        a.free(self.name);
+        a.free(self.provider);
+        if (self.model) |value| a.free(value);
+        a.free(self.from_brain);
+        a.free(self.to_brain);
+        a.destroy(self);
+    }
+};
+
+fn brainLabelAlloc(arena: std.mem.Allocator, provider: []const u8, model: ?[]const u8) ![]u8 {
+    const labels = .{ .{ "opencode", "OpenCode" }, .{ "codex", "Codex" }, .{ "cursor", "Cursor" }, .{ "claude", "Claude" }, .{ "pi", "Pi" }, .{ "fx", "FX" }, .{ "grok", "Grok" }, .{ "muse", "Muse" }, .{ "custom_acp", "Custom ACP" } };
+    var pretty: []const u8 = provider;
+    inline for (labels) |pair| if (std.mem.eql(u8, provider, pair[0])) {
+        pretty = pair[1];
+    };
+    if (model) |value| if (value.len > 0) return std.fmt.allocPrint(arena, "{s} · {s}", .{ pretty, value });
+    return arena.dupe(u8, pretty);
+}
+
+fn threadTurnBusy(daemon: *Daemon, workspace_id: []const u8, thread_id: []const u8) bool {
+    lockDaemon(daemon);
+    defer daemon.mutex.unlock();
+    for (daemon.chat_turns.items) |turn| {
+        if (!std.mem.eql(u8, turn.workspace_id, workspace_id) or !std.mem.eql(u8, turn.local_thread_id, thread_id) or turn.consumed) continue;
+        lockTurn(turn);
+        defer turn.mutex.unlock();
+        if (!turn.worker_done or turn.durability_pending) return true;
+    }
+    return false;
+}
+
+/// Runs on its own thread: optional outgoing-brain brief, then the switch.
+fn brainSwitchWorker(job: *BrainSwitchJob) void {
+    defer job.destroy();
+    const daemon = job.daemon;
+    lockDaemon(daemon);
+    const service = daemon.store_service;
+    if (service) |svc| _ = svc.in_flight.fetchAdd(1, .monotonic);
+    daemon.mutex.unlock();
+    const svc = service orelse return;
+    defer _ = svc.in_flight.fetchSub(1, .monotonic);
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var brief_text: []const u8 = "";
+    if (job.brief) brief: {
+        const identity = std.fmt.allocPrint(arena, "brief:{s}:{d}", .{ job.thread_id, nowMs() }) catch break :brief;
+        const prompt = companions.briefPromptAlloc(arena, job.name, job.to_brain) catch break :brief;
+        const outcome = deliverThreadPrompt(daemon, arena, svc, job.workspace_id, job.thread_id, identity, prompt, null) catch break :brief;
+        if (outcome != .started) break :brief;
+        const deadline = nowMs() + 180_000;
+        while (nowMs() < deadline) {
+            std.Io.sleep(io, .fromMilliseconds(1000), .awake) catch {};
+            const status = blk: {
+                lockStoreService(svc);
+                defer svc.mutex.unlock();
+                var row = (svc.store.conn.row("select status from chat_turns where turn_id=?", .{identity}) catch break :blk null) orelse break :blk null;
+                defer row.deinit();
+                break :blk arena.dupe(u8, row.text(0)) catch null;
+            };
+            const value = status orelse continue;
+            if (std.mem.eql(u8, value, "running") or std.mem.eql(u8, value, "waiting_approval")) continue;
+            if (!std.mem.eql(u8, value, "completed")) break :brief;
+            // The brief is the newest assistant row the briefing turn wrote.
+            brief_text = blk: {
+                lockStoreService(svc);
+                defer svc.mutex.unlock();
+                var row = (svc.store.conn.row(
+                    "select m.body from messages m join threads t on t.id=m.thread_id join workspaces w on w.id=t.workspace_id where w.workspace_id=? and t.local_thread_id=? and m.role=1 and m.tool_call_id is null order by m.sort_index desc limit 1",
+                    .{ job.workspace_id, job.thread_id },
+                ) catch break :blk "") orelse break :blk "";
+                defer row.deinit();
+                break :blk arena.dupe(u8, row.text(0)) catch "";
+            };
+            break;
+        }
+        // Never switch under a still-running briefing turn.
+        while (threadTurnBusy(daemon, job.workspace_id, job.thread_id) and nowMs() < deadline + 30_000) {
+            std.Io.sleep(io, .fromMilliseconds(500), .awake) catch {};
+        }
+    }
+    performBrainSwitch(daemon, svc, arena, job, brief_text) catch |err| {
+        log.warn("companion brain switch failed: {s}", .{@errorName(err)});
+    };
+}
+
+fn performBrainSwitch(daemon: *Daemon, svc: *StoreService, arena: std.mem.Allocator, job: *const BrainSwitchJob, brief: []const u8) !void {
+    const now = nowMs();
+    var revision: u64 = 0;
+    {
+        lockStoreService(svc);
+        defer svc.mutex.unlock();
+        revision = try svc.store.setThreadBrain(job.workspace_id, job.thread_id, job.provider, job.model);
+        try companions.recordHandoff(svc.store.conn, job.workspace_id, job.thread_id, job.from_brain, job.to_brain, brief, now);
+        const body = try std.fmt.allocPrint(arena, "🧠 Brain switched: {s} → {s}. {s} keeps this conversation; recent history{s} carries over.", .{
+            job.from_brain, job.to_brain, job.name, if (brief.len > 0) " and the handoff brief" else "",
+        });
+        const message_id = try std.fmt.allocPrint(arena, "brain-switch:{s}:{d}", .{ job.thread_id, now });
+        const write = try svc.store.appendMessage(.{
+            .mutation = .{ .request_key = message_id, .client_id = "daemon" },
+            .workspace_id = job.workspace_id,
+            .thread_id = job.thread_id,
+            .message = .{ .message_id = message_id, .role = "system", .author = "Verde", .body = body, .created_at_ms = now, .updated_at_ms = now },
+        });
+        revision = @max(revision, write.store_revision);
+        // Keep the roster's brain in step so new conversations use it.
+        if (companions.get(svc.store.conn, arena)) |snapshot| {
+            var roster = companion_roster.init();
+            if (roster.parse(arena, snapshot.json)) |_| {
+                for (roster.items(), 0..) |*entry, index| {
+                    if (!entry.id.eql(job.companion_id)) continue;
+                    roster.setBrain(index, job.provider, job.model);
+                    const encoded = try roster.encodeAlloc(arena);
+                    _ = companions.put(svc.store.conn, arena, encoded, null) catch {};
+                }
+            } else |_| {}
+        } else |_| {}
+    }
+    daemon.appendJournalEntry(.chat_thread, job.thread_id, job.workspace_id, .{ .store = revision });
+}
+
+/// `companion.brain.switch` {companion_id?, provider, model?, brief?}:
+/// moves the companion's current conversation to another provider without
+/// losing context. With `brief` (default true) the outgoing brain first
+/// writes a successor brief; the switch then completes in the background.
+fn companionBrainSwitchResponse(daemon: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+    const allocator = daemon.allocator;
+    if (params != .object) return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "params must be an object");
+    const fields = params.object;
+    const provider = jsonString(fields.get("provider") orelse .null) orelse return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "provider is required");
+    if (parseEnum(harness.Provider, provider) == null) return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid provider");
+    const model = jsonString(fields.get("model") orelse .null);
+    const want_brief = jsonBool(fields.get("brief") orelse .null) orelse true;
+    lockDaemon(daemon);
+    const service = daemon.store_service;
+    if (service) |svc| _ = svc.in_flight.fetchAdd(1, .monotonic);
+    const accepting = daemon.accepting_mutations;
+    daemon.mutex.unlock();
+    const svc = service orelse return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_STORE_UNAVAILABLE, "store is unavailable");
+    defer _ = svc.in_flight.fetchSub(1, .monotonic);
+    if (!accepting) return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_STATE, "daemon is preparing shutdown");
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var roster = companion_roster.init();
+    {
+        lockStoreService(svc);
+        defer svc.mutex.unlock();
+        const snapshot = companions.get(svc.store.conn, arena) catch return try storeErrorResponse(allocator, id_value, error.StoreUnavailable);
+        roster.parse(arena, snapshot.json) catch return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_STATE, "companion roster is unreadable");
+    }
+    const wanted = jsonString(fields.get("companion_id") orelse .null);
+    var chosen: ?*const companion_roster.Companion = roster.activeConst();
+    if (wanted) |id| {
+        chosen = null;
+        for (roster.items()) |*entry| if (entry.id.eql(id)) {
+            chosen = entry;
+        };
+    }
+    const companion = chosen orelse return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_RESOURCE_NOT_FOUND, "companion not found");
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer };
+
+    // No conversation yet: the roster brain is all there is to change.
+    if (companion.thread_id.isEmpty()) {
+        lockStoreService(svc);
+        defer svc.mutex.unlock();
+        for (roster.items(), 0..) |*entry, index| if (entry.id.eql(companion.id.slice())) roster.setBrain(index, provider, model);
+        const encoded = try roster.encodeAlloc(arena);
+        _ = companions.put(svc.store.conn, arena, encoded, null) catch return try storeErrorResponse(allocator, id_value, error.StoreUnavailable);
+        try beginOk(&s, id_value);
+        try s.objectField("result");
+        try s.write(.{ .status = "switched", .briefing = false });
+        try s.endObject();
+        return writer.toOwnedSlice();
+    }
+
+    const workspace_id = companion.home_workspace_id.slice();
+    const thread_id = companion.thread_id.slice();
+    if (threadTurnBusy(daemon, workspace_id, thread_id)) return try errorResponseAlloc(allocator, id_value, "companion_busy", "wait for the companion's current turn to finish");
+    const current = blk: {
+        lockStoreService(svc);
+        defer svc.mutex.unlock();
+        var row = (svc.store.conn.row(
+            "select t.provider, t.model_ref, (select count(*) from messages m where m.thread_id=t.id) from threads t join workspaces w on w.id=t.workspace_id where w.workspace_id=? and t.local_thread_id=?",
+            .{ workspace_id, thread_id },
+        ) catch return try storeErrorResponse(allocator, id_value, error.StoreUnavailable)) orelse return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_RESOURCE_NOT_FOUND, "companion conversation not found");
+        defer row.deinit();
+        const names = [_][]const u8{ "opencode", "codex", "cursor", "claude", "pi", "fx", "grok", "muse", "custom_acp" };
+        const code: usize = @intCast(@max(0, row.int(0)));
+        break :blk .{
+            .provider = try arena.dupe(u8, if (code < names.len) names[code] else "unknown"),
+            .model = if (row.nullableText(1)) |value| try arena.dupe(u8, value) else null,
+            .messages = row.int(2),
+        };
+    };
+    const from_brain = try brainLabelAlloc(arena, current.provider, current.model);
+    const to_brain = try brainLabelAlloc(arena, provider, model);
+
+    const page = std.heap.page_allocator;
+    const job = try page.create(BrainSwitchJob);
+    job.* = .{
+        .daemon = daemon,
+        .workspace_id = try page.dupe(u8, workspace_id),
+        .thread_id = try page.dupe(u8, thread_id),
+        .companion_id = try page.dupe(u8, companion.id.slice()),
+        .name = try page.dupe(u8, companion.name.slice()),
+        .provider = try page.dupe(u8, provider),
+        .model = if (model) |value| try page.dupe(u8, value) else null,
+        .from_brain = try page.dupe(u8, from_brain),
+        .to_brain = try page.dupe(u8, to_brain),
+        // A brief from an empty conversation has nothing to say.
+        .brief = want_brief and current.messages > 0,
+    };
+    const briefing = job.brief;
+    if (!briefing) {
+        defer job.destroy();
+        performBrainSwitch(daemon, svc, arena, job, "") catch |err| {
+            log.warn("companion brain switch failed: {s}", .{@errorName(err)});
+            return try storeErrorResponse(allocator, id_value, error.StoreUnavailable);
+        };
+    } else {
+        const worker = std.Thread.spawn(.{}, brainSwitchWorker, .{job}) catch {
+            defer job.destroy();
+            performBrainSwitch(daemon, svc, arena, job, "") catch |err| {
+                log.warn("companion brain switch failed: {s}", .{@errorName(err)});
+                return try storeErrorResponse(allocator, id_value, error.StoreUnavailable);
+            };
+            try beginOk(&s, id_value);
+            try s.objectField("result");
+            try s.write(.{ .status = "switched", .briefing = false, .from = from_brain, .to = to_brain });
+            try s.endObject();
+            return writer.toOwnedSlice();
+        };
+        worker.detach();
+    }
+    try beginOk(&s, id_value);
+    try s.objectField("result");
+    try s.write(.{ .status = if (briefing) "briefing" else "switched", .briefing = briefing, .from = from_brain, .to = to_brain });
     try s.endObject();
     return writer.toOwnedSlice();
 }
