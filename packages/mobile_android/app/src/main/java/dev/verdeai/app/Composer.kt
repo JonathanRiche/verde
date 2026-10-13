@@ -80,9 +80,9 @@ internal fun followupHint(pending: ChatFollowup?, kind: EventFollowupSubmitKind)
     pending?.delivery == "sending" -> "Sending follow-up…"
     pending?.state == "sent_inline" -> "Steer applied to the current reply."
     pending != null && pending.paused && pending.delivery == "unsent" -> "Paused after a reconnect. Retry to send it."
+    pending != null && pending.kind == "interrupt" -> "Stopping the current reply to continue with this\u2026"
     pending != null -> if (pending.state == "fallback_next_turn") "Steering unavailable. Queued for the next turn." else "Queued. Sends after the current reply."
-    kind == EventFollowupSubmitKind.steer -> "Send to steer the current reply."
-    else -> "Send to queue after the current reply."
+    else -> followupKindHint(kind)
 }
 
 internal fun followupTitle(f: ChatFollowup) = when {
@@ -94,7 +94,18 @@ internal fun followupTitle(f: ChatFollowup) = when {
 /** The send button's verb for this draft and turn. */
 internal fun sendLabel(text: String, running: Boolean, kind: EventFollowupSubmitKind) = when (composerAction(text)) {
     ComposerAction.Shell, is ComposerAction.Slash -> "Run"
-    else -> if (!running) "Send" else if (kind == EventFollowupSubmitKind.steer) "Steer" else "Queue"
+    else -> if (!running) "Send" else when (kind) {
+        EventFollowupSubmitKind.steer -> "Steer"
+        EventFollowupSubmitKind.interrupt -> "Interrupt"
+        EventFollowupSubmitKind.queue -> "Queue"
+    }
+}
+
+/** What sending now does while a turn runs (placeholder / hint, shown once). */
+internal fun followupKindHint(kind: EventFollowupSubmitKind): String = when (kind) {
+    EventFollowupSubmitKind.steer -> "Steer the current reply"
+    EventFollowupSubmitKind.interrupt -> "Interrupts and continues with this"
+    EventFollowupSubmitKind.queue -> "Queue after the current reply"
 }
 
 private fun attachmentSize(bytes: Long) = if (bytes < 1024 * 1024) "${(bytes + 1023) / 1024} KB" else "%.1f MB".format(bytes / (1024.0 * 1024.0))
@@ -106,7 +117,9 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState,
     /** Companion sheet: one row (settings chip, growing input, [inlineAction], send); no resize handle or toolbars. */
     compact: Boolean = false, inlineAction: (@Composable () -> Unit)? = null,
     /** Compact only: the model chip becomes a read-only label that calls this (e.g. Settings → Brain). */
-    onBrain: (() -> Unit)? = null) {
+    onBrain: (() -> Unit)? = null,
+    /** Compact only: the idle placeholder ("Message Moss…"). */
+    placeholderText: String? = null) {
     val composer = model.composer
     val view = state.composer?.let { current ->
         composer.pendingSelection?.let { current.copy(selection = it) } ?: current
@@ -149,6 +162,22 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState,
     val provider = view?.selection?.provider ?: state.thread?.thread?.provider
     val attachments = view?.draft?.attachments.orEmpty()
     val kind = followupKind(provider, attachments.isNotEmpty())
+    val alternatives = followupAlternatives(provider, attachments.isNotEmpty())
+    var sendMenu by remember { mutableStateOf(false) }
+    // Send; while a turn runs a long-press offers steer / interrupt / queue.
+    val sendButton = @Composable { canSend: Boolean ->
+        val label = if (view?.send_operation?.state == "pending" || composer.busy) "Sending…" else sendLabel(composer.field.text, state.turn != null, kind)
+        val followup = state.turn != null && composerAction(composer.field.text).let { it == ComposerAction.Prompt || it is ComposerAction.Literal }
+        Box {
+            SendControl(label = label, enabled = canSend, onClick = composer::submit, modifier = Modifier.testTag(COMPOSER_SEND),
+                onLongClick = if (followup) ({ sendMenu = true }) else null)
+            DropdownMenu(expanded = sendMenu, onDismissRequest = { sendMenu = false }) {
+                alternatives.forEach { option ->
+                    DropdownMenuItem(text = { Text(followupChoiceLabel(option)) }, onClick = { sendMenu = false; composer.submitAs(option) })
+                }
+            }
+        }
+    }
     val sendPending = view?.send_operation?.state == "pending"
     val text = composer.field.text
     val action = composerAction(text)
@@ -175,7 +204,8 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState,
             if (composerFocused) VerdeColors.Accent else VerdeColors.PanelMuted),
         modifier = Modifier.fillMaxWidth().imePadding().padding(horizontal = 8.dp, vertical = 6.dp).testTag(COMPOSER)
             .onFocusChanged { composerFocused = it.hasFocus }.focusGroup()) {
-        Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Column(Modifier.fillMaxWidth().padding(horizontal = if (compact) 8.dp else 12.dp, vertical = if (compact) 2.dp else 6.dp),
+            verticalArrangement = Arrangement.spacedBy(if (compact) 0.dp else 6.dp)) {
             view?.followup?.let { FollowupCard(it, composer, kind) }
             val notice = composer.notice ?: composerError(view?.error)
             if (notice != null) {
@@ -188,6 +218,7 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState,
                 view == null -> "Loading…"
                 !ready -> "Offline. Your draft is kept."
                 running -> followupHint(null, kind)
+                compact && placeholderText != null -> placeholderText
                 else -> "Ask anything, or use / for commands and @ to search files."
             }
             val attach = view != null && !sendPending && !composer.busy
@@ -198,32 +229,33 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState,
             }
             val onFiles = { files.launch(arrayOf("image/*")) }
             if (compact) {
-                Row(Modifier.fillMaxWidth().testTag("composer-actions"), verticalAlignment = Alignment.Bottom,
+                // The input gets the full width; controls sit on one compact row below it.
+                BasicTextField(
+                    value = composer.field,
+                    onValueChange = { if (!sendPending) composer.edit(it) },
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).focusRequester(fieldFocus).testTag(COMPOSER_FIELD),
+                    readOnly = sendPending,
+                    decorationBox = { innerTextField ->
+                        Box(Modifier.fillMaxWidth().padding(vertical = 12.dp), contentAlignment = Alignment.CenterStart) {
+                            // The steer/interrupt/queue hint appears here only, never repeated below.
+                            if (text.isEmpty()) Text(placeholder, color = VerdeColors.Subtle, style = MaterialTheme.typography.bodyMedium,
+                                maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            innerTextField()
+                        }
+                    },
+                    cursorBrush = SolidColor(VerdeColors.Accent),
+                    textStyle = MaterialTheme.typography.bodyMedium.copy(color = VerdeColors.Text),
+                    minLines = 1, maxLines = 6,
+                    keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
+                )
+                Row(Modifier.fillMaxWidth().testTag("composer-actions"), verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(2.dp)) {
                     if (view != null) CompactSettings(view, state, provider, attach, onPicker = { picker = it },
                         onPhotos = onPhotos, onCamera = onCamera, onFiles = onFiles, onBrain = onBrain)
-                    BasicTextField(
-                        value = composer.field,
-                        onValueChange = { if (!sendPending) composer.edit(it) },
-                        modifier = Modifier.weight(1f).heightIn(min = 48.dp).focusRequester(fieldFocus).testTag(COMPOSER_FIELD),
-                        readOnly = sendPending,
-                        decorationBox = { innerTextField ->
-                            Box(Modifier.fillMaxWidth().padding(vertical = 12.dp), contentAlignment = Alignment.CenterStart) {
-                                // The steer/queue hint appears here only, never repeated below.
-                                if (text.isEmpty()) Text(placeholder, color = VerdeColors.Subtle, style = MaterialTheme.typography.bodyMedium,
-                                    maxLines = 2, overflow = TextOverflow.Ellipsis)
-                                innerTextField()
-                            }
-                        },
-                        cursorBrush = SolidColor(VerdeColors.Accent),
-                        textStyle = MaterialTheme.typography.bodyMedium.copy(color = VerdeColors.Text),
-                        minLines = 1, maxLines = 4,
-                        keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
-                    )
+                    Spacer(Modifier.weight(1f))
                     inlineAction?.invoke()
                     if (running) StopControl(state.stopping, state.canStop, model::stop, Modifier.testTag(COMPOSER_STOP))
-                    SendControl(label = if (sendPending || composer.busy) "Sending…" else sendLabel(text, running, kind),
-                        enabled = canSubmit, onClick = composer::submit, modifier = Modifier.testTag(COMPOSER_SEND))
+                    sendButton(canSubmit)
                 }
             } else {
             Box(Modifier.fillMaxWidth().height(24.dp).testTag("composer-resize")
@@ -278,8 +310,7 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState,
                 if (running) {
                     StopControl(state.stopping, state.canStop, model::stop, Modifier.testTag(COMPOSER_STOP))
                 }
-                SendControl(label = if (sendPending || composer.busy) "Sending…" else sendLabel(text, running, kind),
-                    enabled = canSubmit, onClick = composer::submit, modifier = Modifier.testTag(COMPOSER_SEND))
+                sendButton(canSubmit)
             }
             if (running && view?.followup == null) Text(followupHint(null, kind),
                 color = VerdeColors.Subtle, style = MaterialTheme.typography.bodySmall,
@@ -329,7 +360,7 @@ private fun CompactSettings(view: ChatComposerView, state: TranscriptState, prov
             }
         }
         Surface(onClick = onBrain, shape = RoundedCornerShape(12.dp), color = VerdeColors.PanelAlt,
-            modifier = Modifier.widthIn(max = 112.dp).testTag(COMPOSER_SETTINGS)
+            modifier = Modifier.widthIn(max = 160.dp).testTag(COMPOSER_SETTINGS)
                 .semantics { contentDescription = "Brain: $label. Open brain settings" }) {
             Row(Modifier.padding(horizontal = 8.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(4.dp)) {

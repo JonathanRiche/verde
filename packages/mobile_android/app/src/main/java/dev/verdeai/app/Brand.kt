@@ -4,6 +4,7 @@ import androidx.compose.animation.core.*
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -11,12 +12,14 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.text
@@ -100,13 +103,23 @@ internal fun StopControl(stopping: Boolean, enabled: Boolean, onClick: () -> Uni
 
 /** Web's mobile send circle, with a 48dp Android touch target. */
 @Composable
-internal fun SendControl(label: String, enabled: Boolean, onClick: () -> Unit, modifier: Modifier = Modifier) {
-    IconButton(onClick = onClick, enabled = enabled,
-        modifier = modifier.semantics { contentDescription = label }) {
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+internal fun SendControl(label: String, enabled: Boolean, onClick: () -> Unit, modifier: Modifier = Modifier,
+    /** While a turn runs: other ways to send (steer / interrupt / queue). */
+    onLongClick: (() -> Unit)? = null) {
+    val face = @Composable {
         Box(Modifier.size(44.dp).graphicsLayer { alpha = if (enabled) 1f else .35f }
             .background(VerdeColors.Accent, CircleShape), contentAlignment = Alignment.Center) {
             Icon(painterResource(R.drawable.composer_send), contentDescription = null,
                 tint = Color(0xFF06210F), modifier = Modifier.size(16.dp))
         }
     }
+    if (onLongClick == null) {
+        IconButton(onClick = onClick, enabled = enabled, modifier = modifier.semantics { contentDescription = label }) { face() }
+        return
+    }
+    Box(modifier.size(48.dp).clip(CircleShape)
+        .combinedClickable(enabled = enabled, role = Role.Button, onClickLabel = label, onLongClickLabel = "More ways to send",
+            onClick = onClick, onLongClick = onLongClick)
+        .semantics { contentDescription = label }, contentAlignment = Alignment.Center) { face() }
 }

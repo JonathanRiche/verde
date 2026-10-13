@@ -356,7 +356,7 @@ private fun CompanionConversation(model: TranscriptModel, state: TranscriptState
             }
         }
         val mic: (@Composable () -> Unit)? = if (voice != null && voice.available) ({ MicButton(voice, model, name) }) else null
-        ChatComposer(model, state, compact = true, inlineAction = mic, onBrain = onBrain)
+        ChatComposer(model, state, compact = true, inlineAction = mic, onBrain = onBrain, placeholderText = "Message $name\u2026")
     }
 }
 

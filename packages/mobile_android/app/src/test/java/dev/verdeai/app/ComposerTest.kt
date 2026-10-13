@@ -64,8 +64,23 @@ class ComposerParsingTest {
         assertEquals(ComposerAction.Literal("/path is literal"), composerAction("//path is literal"))
         assertEquals(ComposerAction.Prompt, composerAction("hello /there"))
         assertEquals(EventFollowupSubmitKind.steer, followupKind("claude", images=false))
-        assertEquals(EventFollowupSubmitKind.queue, followupKind("claude", images=true))
-        assertEquals(EventFollowupSubmitKind.queue, followupKind("cursor", images=false))
+        // Native steer only for codex/claude/pi without images; everything else interrupts and continues.
+        assertEquals(EventFollowupSubmitKind.steer, followupKind("codex", images=false))
+        assertEquals(EventFollowupSubmitKind.steer, followupKind("pi", images=false))
+        assertEquals(EventFollowupSubmitKind.interrupt, followupKind("claude", images=true))
+        assertEquals(EventFollowupSubmitKind.interrupt, followupKind("cursor", images=false))
+        assertEquals(EventFollowupSubmitKind.interrupt, followupKind("opencode", images=true))
+        assertEquals(EventFollowupSubmitKind.interrupt, followupKind(null, images=false))
+        assertEquals(listOf(EventFollowupSubmitKind.interrupt, EventFollowupSubmitKind.queue), followupAlternatives("claude", images=false))
+        assertEquals(listOf(EventFollowupSubmitKind.queue), followupAlternatives("claude", images=true))
+        assertEquals(listOf(EventFollowupSubmitKind.queue), followupAlternatives("grok", images=false))
+        assertEquals("Interrupt", sendLabel("hi", running=true, EventFollowupSubmitKind.interrupt))
+        assertEquals("Steer", sendLabel("hi", running=true, EventFollowupSubmitKind.steer))
+        assertEquals("Send", sendLabel("hi", running=false, EventFollowupSubmitKind.interrupt))
+        assertEquals("Steer the current reply", followupKindHint(EventFollowupSubmitKind.steer))
+        assertEquals("Interrupts and continues with this", followupKindHint(EventFollowupSubmitKind.interrupt))
+        assertEquals("Queue after the current reply", followupKindHint(EventFollowupSubmitKind.queue))
+        assertEquals("Queue instead", followupChoiceLabel(EventFollowupSubmitKind.queue))
         assertEquals("Queue", sendLabel("hi", running=true, EventFollowupSubmitKind.queue))
         assertEquals("Run", sendLabel("/compact", running=true, EventFollowupSubmitKind.steer))
     }
@@ -226,7 +241,7 @@ class ComposerTest {
     @Test fun askWhileRunningGoesInAsAFollowup() {
         setup={ it.running() }
         launch()
-        awaitText("Send to steer the current reply.")
+        awaitText("Steer the current reply")
         compose.runOnUiThread { transcript.composer.ask("In `a.kt` line 2:\n```kotlin\ny\n```\nAlso this") }
         await { sent<EventFollowupSubmit>().isNotEmpty() }
         assertTrue(sent<EventSend>().isEmpty())
@@ -254,7 +269,7 @@ class ComposerTest {
     @Test fun whileRunningItSteersAndTheFollowupCanBePulledBackOrRemoved() {
         setup={ it.running() }
         launch()
-        awaitText("Send to steer the current reply.")
+        awaitText("Steer the current reply")
         type("also add tests")
         send().assertContentDescriptionEquals("Steer").performClick()
         await { sent<EventFollowupSubmit>().isNotEmpty() }

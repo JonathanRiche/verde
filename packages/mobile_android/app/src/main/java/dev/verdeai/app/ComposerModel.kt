@@ -79,9 +79,32 @@ internal fun composerAction(draft: String): ComposerAction {
     return ComposerAction.Slash(name, args)
 }
 
-/** Web `followupKind`: providers with daemon steering steer; images always queue (the core forces it too). */
+/** Providers the daemon can steer natively mid-turn (`chat.turn.steer`). */
+internal val NATIVE_STEER_PROVIDERS = setOf("codex", "claude", "pi")
+
+/**
+ * Default for a message sent while a turn runs: a native steer where the provider supports it
+ * (never with images), otherwise interrupt — stop the reply and continue with this message.
+ */
 internal fun followupKind(provider: String?, images: Boolean): EventFollowupSubmitKind =
-    if (!images && provider in setOf("codex", "claude", "pi")) EventFollowupSubmitKind.steer else EventFollowupSubmitKind.queue
+    if (!images && provider in NATIVE_STEER_PROVIDERS) EventFollowupSubmitKind.steer else EventFollowupSubmitKind.interrupt
+
+/** The other ways to send while a turn runs (long-press Send), default excluded. */
+internal fun followupAlternatives(provider: String?, images: Boolean): List<EventFollowupSubmitKind> {
+    val default = followupKind(provider, images)
+    return buildList {
+        if (default != EventFollowupSubmitKind.steer && !images && provider in NATIVE_STEER_PROVIDERS) add(EventFollowupSubmitKind.steer)
+        if (default != EventFollowupSubmitKind.interrupt) add(EventFollowupSubmitKind.interrupt)
+        add(EventFollowupSubmitKind.queue)
+    }
+}
+
+/** Menu label for a send alternative. */
+internal fun followupChoiceLabel(kind: EventFollowupSubmitKind): String = when (kind) {
+    EventFollowupSubmitKind.steer -> "Steer the current reply"
+    EventFollowupSubmitKind.interrupt -> "Interrupt and continue with this"
+    EventFollowupSubmitKind.queue -> "Queue instead"
+}
 
 internal enum class ComposerPicker { Provider, Model, Effort, Access, Speed }
 
@@ -312,8 +335,17 @@ internal class ComposerModel(
         scope.launch { try { block() } finally { busy = false } }
     }
 
-    /** Send, steer/queue, `!` shell confirmation or `/command`, depending on the draft and turn. */
+    /** Send, steer/interrupt/queue, `!` shell confirmation or `/command`, depending on the draft and turn. */
     fun submit() = submitDraft(voice = false)
+
+    /** One send with a chosen follow-up kind (long-press Send while a turn runs). */
+    fun submitAs(kind: EventFollowupSubmitKind) {
+        followupOverride = kind
+        submitDraft(voice = false)
+    }
+
+    /** A kind chosen for the next follow-up only; cleared once it is sent. */
+    private var followupOverride: EventFollowupSubmitKind? = null
 
     /**
      * Sends a finished voice transcript as a spoken turn (`voice = true`, so the agent answers
@@ -363,7 +395,9 @@ internal class ComposerModel(
     private suspend fun sendOrFollow(composer: ChatComposerView, voice: Boolean): Operation? {
         val state = chat.state.value
         if (state.turn == null) return send(composer.draft.revision, voice)
-        val kind = followupKind(composer.selection.provider ?: state.thread?.thread?.provider, composer.draft.attachments.isNotEmpty())
+        val chosen = followupOverride
+        followupOverride = null
+        val kind = chosen ?: followupKind(composer.selection.provider ?: state.thread?.thread?.provider, composer.draft.attachments.isNotEmpty())
         return chat.dispatch { id, n, w -> EventFollowupSubmit(now_ms=n, wall_time_ms=w, intent_id=id, workspace_id=workspaceId, thread_id=threadId,
             draft_revision=composer.draft.revision, kind=kind, voice=voice) }
     }
