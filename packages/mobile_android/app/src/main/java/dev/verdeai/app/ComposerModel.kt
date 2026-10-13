@@ -151,6 +151,7 @@ internal class ComposerModel(
     var focusRequest by mutableStateOf(0)
         private set
     var imagePreviews by mutableStateOf<Map<String, ByteArray>>(emptyMap())
+        private set
     /** Bytes of images just sent, so their pending rows show them before the host's copy is fetched. */
     private val sentPreviews = object : LinkedHashMap<String, ByteArray>(16, .75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ByteArray>?) = size > MAX_SENT_PREVIEWS
@@ -158,7 +159,6 @@ internal class ComposerModel(
 
     /** Local bytes for an attachment this phone attached (draft or just sent), if it still has them. */
     fun previewFor(localId: String): ByteArray? = imagePreviews[localId] ?: sentPreviews[localId]
-        private set
     var field by mutableStateOf(TextFieldValue(""))
         private set
     /** A local message (rejected intent, oversized image, …); cleared on the next action. */
