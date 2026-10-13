@@ -332,8 +332,11 @@ internal class LiveVoice(
         lastActivity = System.currentTimeMillis()
         val silence = viewModelScope.launch {
             while (isActive) {
-                delay(5_000)
-                if (System.currentTimeMillis() - lastActivity > LIVE_SILENCE_MS) channel.trySend(Signal.Silence)
+                delay(1_000)
+                val now = System.currentTimeMillis()
+                // A pause ends the user's utterance even if the provider never sends a final transcript.
+                transcript?.let { record -> record.tick(now); mutableUi.update { it.copy(captions = record.captions()) } }
+                if (now - lastActivity > LIVE_SILENCE_MS) channel.trySend(Signal.Silence)
             }
         }
         route.acquire()
@@ -361,29 +364,16 @@ internal class LiveVoice(
                 is Signal.Text -> for (event in proto.parse(signal.text)) when (event) {
                     LiveEvent.Ready -> goLive()
                     is LiveEvent.Audio -> { speaker.play(event.pcm); lastActivity = System.currentTimeMillis() }
-                    is LiveEvent.AssistantText -> {
-                        transcript?.assistantDelta(event.delta, System.currentTimeMillis())
-                        mutableUi.update { it.copy(captions = liveCaptions(it.captions, event)) }
-                    }
-                    LiveEvent.TurnDone -> {
-                        transcript?.turnDone()
-                        mutableUi.update { it.copy(captions = liveCaptions(it.captions, event)) }
-                    }
-                    is LiveEvent.UserText -> {
+                    // Transcript events: merged per utterance/response in the record; captions show the same lines.
+                    is LiveEvent.AssistantText, LiveEvent.TurnDone, LiveEvent.ResponseStarted -> transcribe(event)
+                    is LiveEvent.UserText, is LiveEvent.UserPartial -> {
                         lastActivity = System.currentTimeMillis()
-                        transcript?.userFinal(event.text, lastActivity)
-                        mutableUi.update { it.copy(captions = liveCaptions(it.captions, event)) }
-                    }
-                    is LiveEvent.UserPartial -> {
-                        lastActivity = System.currentTimeMillis()
-                        transcript?.userPartial(event.text, event.cumulative, lastActivity)
-                        mutableUi.update { it.copy(captions = liveCaptions(it.captions, event)) }
+                        transcribe(event)
                     }
                     LiveEvent.Interrupted -> {
-                        transcript?.assistantDone()
                         speaker.flush()
                         lastActivity = System.currentTimeMillis()
-                        mutableUi.update { it.copy(captions = liveCaptions(it.captions, event)) }
+                        transcribe(event)
                     }
                     is LiveEvent.ToolCall -> viewModelScope.launch {
                         val output = try { runTool(event.name, event.arguments) } catch (e: CancellationException) { throw e }
@@ -415,6 +405,13 @@ internal class LiveVoice(
             mutableOutput.value = 0f
             channel.close()
         }
+    }
+
+    private fun transcribe(event: LiveEvent) {
+        val record = transcript
+        if (record == null) { mutableUi.update { it.copy(captions = liveCaptions(it.captions, event)) }; return }
+        record.feed(event, System.currentTimeMillis())
+        mutableUi.update { it.copy(captions = record.captions()) }
     }
 
     /** Sends a text update into the live conversation (e.g. the companion's finished reply). */

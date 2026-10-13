@@ -21,9 +21,11 @@ internal sealed interface LiveEvent {
     class Audio(val pcm: ByteArray) : LiveEvent
     data class AssistantText(val delta: String) : LiveEvent
     /** The user's finished utterance. */
-    data class UserText(val text: String) : LiveEvent
+    data class UserText(val text: String, val itemId: String? = null) : LiveEvent
     /** The user's utterance so far: [cumulative] replaces the open line (xAI), otherwise it appends (deltas). */
-    data class UserPartial(val text: String, val cumulative: Boolean) : LiveEvent
+    data class UserPartial(val text: String, val cumulative: Boolean, val itemId: String? = null) : LiveEvent
+    /** The model began a response: whatever the user was saying is over. */
+    data object ResponseStarted : LiveEvent
     /** The user started talking: stop playback now (barge-in). */
     data object Interrupted : LiveEvent
     data object TurnDone : LiveEvent
@@ -127,10 +129,12 @@ internal class OpenAiRealtime(private val ga: Boolean) : LiveProtocol {
             "response.output_audio.delta", "response.audio.delta" ->
                 message["delta"].str()?.let(::unb64)?.let { LiveEvent.Audio(it) } ?: LiveEvent.Ignored(type)
             "response.output_audio_transcript.delta", "response.audio_transcript.delta" -> LiveEvent.AssistantText(message["delta"].str().orEmpty())
-            "conversation.item.input_audio_transcription.completed" -> LiveEvent.UserText(message["transcript"].str().orEmpty())
+            "conversation.item.input_audio_transcription.completed" -> LiveEvent.UserText(message["transcript"].str().orEmpty(), message["item_id"].str())
             "conversation.item.input_audio_transcription.updated" ->
-                LiveEvent.UserPartial((message["transcript"] ?: message["text"]).str().orEmpty(), cumulative = true)
-            "conversation.item.input_audio_transcription.delta" -> LiveEvent.UserPartial(message["delta"].str().orEmpty(), cumulative = false)
+                LiveEvent.UserPartial((message["transcript"] ?: message["text"]).str().orEmpty(), cumulative = true, itemId = message["item_id"].str())
+            "conversation.item.input_audio_transcription.delta" ->
+                LiveEvent.UserPartial(message["delta"].str().orEmpty(), cumulative = false, itemId = message["item_id"].str())
+            "response.created" -> LiveEvent.ResponseStarted
             "input_audio_buffer.speech_started" -> LiveEvent.Interrupted
             "response.done" -> LiveEvent.TurnDone
             "response.function_call_arguments.done" -> LiveEvent.ToolCall(message["call_id"].str().orEmpty(),

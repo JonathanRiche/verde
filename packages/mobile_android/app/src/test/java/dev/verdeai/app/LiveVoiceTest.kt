@@ -90,7 +90,7 @@ class LiveVoiceTest {
         assertEquals("grok-transcribe", s.o("audio").o("input").o("transcription").s("model"))
         assertEquals("pcm16", s.s("input_audio_format"))
         val proto = OpenAiRealtime(ga = false)
-        assertEquals(LiveEvent.UserPartial("start the dev", cumulative = true),
+        assertEquals(LiveEvent.UserPartial("start the dev", cumulative = true, itemId = "i1"),
             proto.parse("""{"type":"conversation.item.input_audio_transcription.updated","item_id":"i1","transcript":"start the dev"}""").single())
         assertEquals(LiveEvent.UserPartial("start", cumulative = false),
             proto.parse("""{"type":"conversation.item.input_audio_transcription.delta","delta":"start"}""").single())
@@ -253,5 +253,85 @@ class LiveVoiceTest {
         assertEquals(listOf("10"), wire.map { it.key })
         assertEquals(2L, wire.single().created_at_ms)
         assertEquals(listOf(200, 200, 50), saveBatches(List(450) { LiveLine("$it", "user", "", "x", 0, false) }).map { it.size })
+    }
+
+    // ---- xAI cumulative user transcripts (regression: every snapshot was saved as its own line) ----
+
+    private fun upd(item: String, text: String) = LiveEvent.UserPartial(text, cumulative = true, itemId = item)
+    private fun done(item: String, text: String) = LiveEvent.UserText(text, itemId = item)
+    private fun reply(text: String) = listOf(LiveEvent.ResponseStarted, LiveEvent.AssistantText(text), LiveEvent.TurnDone)
+
+    @Test fun cumulativeXaiSnapshotsBecomeOneLinePerUtterance() {
+        val yeah = "Yeah, that sounds like the vibe. So, can you repeat what you suggest that I do for the rest of the day?"
+        val alright = "Alright, okay. Let's get back to work. Thanks."
+        val events = buildList {
+            add(upd("u1", "Let me")); add(upd("u1", "Let me.")); add(upd("u1", "Let me.")); add(done("u1", "Let me."))
+            addAll(reply("Sure."))
+            add(upd("u2", "Yeah.")); add(upd("u2", "Yeah.")); add(upd("u2", "Yeah, that's")); add(upd("u2", "Yeah, that sounds like the vibe."))
+            // A new item whose cumulative text spans the previous one.
+            add(upd("u3", "Yeah, that sounds like the vibe, so")); add(upd("u3", "Yeah, that sounds like the vibe, so"))
+            add(upd("u3", "Yeah, that sounds like the vibe. So,")); add(upd("u3", "Yeah, that sounds like the vibe. So, can you repeat what you suggest?"))
+            add(upd("u3", "Yeah, that sounds like the vibe. So, can you repeat what you suggest that I do for the"))
+            add(upd("u3", "Yeah, that sounds like the vibe. So, can you repeat what you suggest that I do for the rest of the"))
+            add(upd("u3", yeah)); add(upd("u3", yeah)); add(done("u3", yeah))
+            addAll(reply("Here's the plan."))
+            add(upd("u4", "Like a")); add(upd("u4", "Like a"))
+            addAll(reply("Like a what?"))
+            add(upd("u5", "Alright.")); add(upd("u6", "Alright.")); add(upd("u6", "Alright, okay.")); add(upd("u6", "Alright, okay. Let's get"))
+            repeat(3) { add(upd("u6", alright)) }
+            add(done("u6", alright))
+            // Cumulative across utterances, with a punctuation rewrite of the committed part.
+            add(upd("u7", "$alright Okay."))
+            repeat(2) { add(upd("u7", "Alright, okay. Let's get back to work, thanks. Okay so here's a bug.")) }
+            add(upd("u7", "Alright, okay. Let's get back to work, thanks. Okay so here's a bug. It repeats"))
+            add(upd("u7", "Alright, okay. Let's get back to work, thanks. Okay so here's a bug. It repeats what you say."))
+            repeat(3) { add(upd("u7", "Alright, okay. Let's get back to work, thanks. Okay so here's a bug. It repeats what you say two times.")) }
+            add(done("u7", "Alright, okay. Let's get back to work, thanks. Okay so here's a bug. It repeats what you say two times."))
+            addAll(reply("Got it."))
+        }
+        val t = record()
+        events.forEachIndexed { i, event -> t.feed(event, i.toLong()) }
+        val saved = t.pending(final = true)
+        assertEquals(listOf(
+            "user" to "Let me.", "assistant" to "Sure.",
+            "user" to yeah, "assistant" to "Here's the plan.",
+            "user" to "Like a", "assistant" to "Like a what?",
+            "user" to alright,
+            "user" to "Okay so here's a bug. It repeats what you say two times.", "assistant" to "Got it.",
+        ), saved.map { it.role to it.body })
+        // Captions show the same merged lines.
+        assertEquals("Okay so here's a bug. It repeats what you say two times.", t.captions().first { it.user && it.text.startsWith("Okay") }.text)
+        assertEquals(1, t.captions(20).count { it.text == "Like a" })
+    }
+
+    @Test fun periodicSavesNeverIncludeAnUtteranceStillBeingSpoken() {
+        val t = record()
+        t.feed(upd("a", "Check the build"), 0)
+        t.feed(done("a", "Check the build."), 1)
+        t.feed(upd("b", "and then"), 2)
+        t.feed(upd("b", "and then deploy"), 3)
+        assertEquals(listOf("Check the build."), t.pending(final = false).map { it.body })
+        // A pause closes the line, but it isn't final until the transcript or a reply confirms it.
+        t.tick(3 + USER_LINE_IDLE_MS)
+        assertEquals(listOf("Check the build."), t.pending(final = false).map { it.body })
+        t.feed(LiveEvent.ResponseStarted, 5_000)
+        assertEquals(listOf("Check the build.", "and then deploy"), t.pending(final = false).map { it.body })
+    }
+
+    @Test fun speechNormalizationAndRemainders() {
+        assertEquals("alright okay lets get back to work thanks", normalizeSpeech("Alright, okay.  Let's get back to work. Thanks."))
+        assertTrue(extendsSpeech("like a dog", "like a"))
+        assertFalse(extendsSpeech("like apples", "like a"))
+        assertTrue(extendsSpeech("like a", "like a"))
+        val prefix = normalizeSpeech("Alright, okay. Let's get back to work. Thanks.")
+        assertEquals("Okay so here's a bug.", speechRemainder("Alright, okay. Let's get back to work, thanks. Okay so here's a bug.", prefix.length))
+        assertEquals("", speechRemainder("Alright, okay. Let's get back to work. Thanks.", prefix.length))
+        assertEquals("Hello", speechRemainder(" Hello ", 0))
+        // OpenAI: deltas append; the final transcript replaces.
+        val t = record()
+        t.feed(LiveEvent.UserPartial("deploy ", cumulative = false, itemId = "x"), 0)
+        t.feed(LiveEvent.UserPartial("stag", cumulative = false, itemId = "x"), 1)
+        t.feed(LiveEvent.UserText("Deploy staging.", itemId = "x"), 2)
+        assertEquals(listOf("Deploy staging."), t.pending(final = false).map { it.body })
     }
 }
