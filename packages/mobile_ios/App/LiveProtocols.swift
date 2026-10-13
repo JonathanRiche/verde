@@ -10,10 +10,11 @@ enum RealtimeEvent: Equatable {
     case ready
     case audio(Data)
     case assistantText(String)
-    /// The user's finished utterance (whole transcript).
-    case userText(String)
-    /// A transcript in progress: `cumulative` carries the whole utterance so far (xAI), otherwise a delta.
-    case userTextPartial(String, cumulative: Bool)
+    /// The user's finished utterance (whole transcript) for transcription `item`.
+    case userText(String, item: String?)
+    /// A transcript in progress: `cumulative` carries the whole transcript so far (xAI, which keeps
+    /// growing across utterances), otherwise a delta.
+    case userTextPartial(String, cumulative: Bool, item: String?)
     /// The user started talking: stop and flush playback (barge-in).
     case speechStarted
     /// The server cut its own reply short.
@@ -160,12 +161,12 @@ struct RealtimeProtocol: Equatable {
         case "response.output_audio_transcript.delta", "response.audio_transcript.delta":
             return (m["delta"] as? String).map { [.assistantText($0)] } ?? []
         case "conversation.item.input_audio_transcription.completed":
-            return (m["transcript"] as? String).map { [.userText($0)] } ?? []
+            return (m["transcript"] as? String).map { [.userText($0, item: m["item_id"] as? String)] } ?? []
         case "conversation.item.input_audio_transcription.delta":
-            return (m["delta"] as? String).map { [.userTextPartial($0, cumulative: false)] } ?? []
+            return (m["delta"] as? String).map { [.userTextPartial($0, cumulative: false, item: m["item_id"] as? String)] } ?? []
         case "conversation.item.input_audio_transcription.updated":
             // xAI: the whole transcript so far, not a delta.
-            return ((m["transcript"] ?? m["delta"]) as? String).map { [.userTextPartial($0, cumulative: true)] } ?? []
+            return ((m["transcript"] ?? m["delta"]) as? String).map { [.userTextPartial($0, cumulative: true, item: m["item_id"] as? String)] } ?? []
         case "input_audio_buffer.speech_started": return [.speechStarted]
         case "response.function_call_arguments.done":
             guard let id = m["call_id"] as? String, let name = m["name"] as? String else { return [] }
@@ -184,7 +185,7 @@ struct RealtimeProtocol: Equatable {
         if let content = m["serverContent"] as? [String: Any] {
             if content["interrupted"] as? Bool == true { events.append(.interrupted) }
             if let input = (content["inputTranscription"] as? [String: Any])?["text"] as? String {
-                events.append(.userTextPartial(input, cumulative: false))
+                events.append(.userTextPartial(input, cumulative: false, item: nil))
             }
             if let output = (content["outputTranscription"] as? [String: Any])?["text"] as? String { events.append(.assistantText(output)) }
             let parts = (content["modelTurn"] as? [String: Any])?["parts"] as? [[String: Any]] ?? []

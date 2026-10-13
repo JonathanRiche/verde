@@ -52,10 +52,13 @@ final class LiveTranscriptTests: XCTestCase {
         var record = make()
         record.user("check ", final: false, cumulative: false, at: 1)
         record.user("the build", final: false, cumulative: false, at: 2)
-        record.assistant("On it.", at: 3)
-        XCTAssertEqual(record.unsaved.count, 1, "the utterance is still open")
+        record.user(" now", final: false, cumulative: false, at: 3)
+        record.assistant("On it.", at: 4)
+        record.user(" please", final: false, cumulative: false, at: 5) // Gemini's input pieces can lag the reply.
+        XCTAssertEqual(record.unsaved.map(\.body), ["🎙 Live voice · xAI Grok · 9:41", "check the build now please"],
+                       "the reply starting closes the utterance; the open reply waits")
         record.endResponse(newTurn: true)
-        XCTAssertEqual(record.unsaved.dropFirst().map(\.body), ["check the build", "On it."])
+        XCTAssertEqual(record.unsaved.dropFirst().map(\.body), ["check the build now please", "On it."])
     }
 
     func testToolLinesAndSavingByKey() {
@@ -90,5 +93,85 @@ final class LiveTranscriptTests: XCTestCase {
         XCTAssertTrue(isVoiceAuthor("Moss (voice)"))
         XCTAssertTrue(isVoiceAuthor("Live"))
         XCTAssertFalse(isVoiceAuthor("Moss"))
+    }
+
+    /// The reported xAI run: cumulative `.updated` snapshots that keep growing across utterances,
+    /// repeats, and a punctuation rewrite ("work. Thanks." → "work, thanks.").
+    func testXAICumulativeTranscriptSavesEachUtteranceOnce() {
+        var record = make()
+        var at: Int64 = 0
+        func update(_ text: String, _ item: String) {
+            at += 100
+            record.user(text, final: false, cumulative: true, item: item, at: at)
+        }
+        record.speechStarted()
+        for text in ["Alright.", "Alright.", "Alright, okay.", "Alright, okay. Let's get",
+                     "Alright, okay. Let's get back to work. Thanks.", "Alright, okay. Let's get back to work. Thanks.",
+                     "Alright, okay. Let's get back to work. Thanks."] { update(text, "item_1") }
+        XCTAssertEqual(record.currentUserText, "Alright, okay. Let's get back to work. Thanks.", "captions follow the open line")
+        record.assistant("Sure.", at: at + 50)
+        record.endResponse()
+        record.speechStarted()
+        for text in ["Alright, okay. Let's get back to work. Thanks. Okay.",
+                     "Alright, okay. Let's get back to work, thanks. Okay so here's a bug.",
+                     "Alright, okay. Let's get back to work, thanks. Okay so here's a bug.",
+                     "Alright, okay. Let's get back to work, thanks. Okay so here's a bug. It repeats",
+                     "Alright, okay. Let's get back to work, thanks. Okay so here's a bug. It repeats what you say.",
+                     "Alright, okay. Let's get back to work, thanks. Okay so here's a bug. It repeats what you say two times.",
+                     "Alright, okay. Let's get back to work, thanks. Okay so here's a bug. It repeats what you say two times."] {
+            update(text, "item_2")
+        }
+        // The same item again after a pause adds nothing new.
+        record.tick(now: at + LiveTranscript.userIdleMs)
+        update("Alright, okay. Let's get back to work, thanks. Okay so here's a bug. It repeats what you say two times.", "item_2")
+        record.finish()
+        XCTAssertEqual(record.unsaved.filter { $0.role == "user" }.map(\.body),
+                       ["Alright, okay. Let's get back to work. Thanks.", "Okay so here's a bug. It repeats what you say two times."])
+    }
+
+    func testNewItemIDClosesTheOpenLineAndRepeatsStayOne() {
+        var record = make()
+        record.user("Like a", final: false, cumulative: true, item: "a", at: 1)
+        record.user("Like a", final: false, cumulative: true, item: "a", at: 2)
+        record.user("Like a dog", final: false, cumulative: true, item: "b", at: 3) // a new item closes "Like a"
+        record.tick(now: 3 + LiveTranscript.userIdleMs)
+        XCTAssertEqual(record.unsaved.filter { $0.role == "user" }.map(\.body), ["Like a", "dog"])
+    }
+
+    func testClosedRepeatIsDropped() {
+        var record = make()
+        record.user("Okay.", final: true, cumulative: true, at: 1)
+        record.speechStarted()
+        record.user("okay", final: true, cumulative: true, at: 2)
+        XCTAssertEqual(record.unsaved.filter { $0.role == "user" }.map(\.body), ["Okay."])
+    }
+
+    func testPeriodicSaveMidUtteranceSavesNoOpenLine() {
+        var record = make()
+        record.user("Can you check", final: false, cumulative: true, item: "x", at: 1)
+        XCTAssertTrue(record.unsaved.filter { $0.role == "user" }.isEmpty, "an open line is never saved")
+        record.tick(now: 1 + LiveTranscript.userIdleMs - 1)
+        XCTAssertTrue(record.unsaved.filter { $0.role == "user" }.isEmpty)
+        record.tick(now: 1 + LiveTranscript.userIdleMs)
+        XCTAssertEqual(record.unsaved.filter { $0.role == "user" }.map(\.body), ["Can you check"])
+    }
+
+    func testOpenAICompletedReplacesItsItemsLine() {
+        var record = make()
+        record.speechStarted()
+        record.user("what's", final: false, cumulative: false, item: "i1", at: 1)
+        record.user(" up", final: false, cumulative: false, item: "i1", at: 2)
+        record.assistant("Not much.", at: 3)
+        record.user("What's up?", final: true, cumulative: true, item: "i1", at: 4)
+        record.endResponse()
+        XCTAssertEqual(record.unsaved.dropFirst().map(\.body), ["What's up?", "Not much."])
+    }
+
+    func testSpeechMatching() {
+        XCTAssertEqual(normalizedSpeech("Alright, okay. Let's  get back to work!"), "alright okay lets get back to work")
+        XCTAssertEqual(remainderAfter(prefix: "Thanks. Okay.", in: "thanks. Okay so here's a bug."), "so here's a bug.")
+        XCTAssertEqual(remainderAfter(prefix: "Like a", in: "Like a"), "")
+        XCTAssertNil(remainderAfter(prefix: "work", in: "workers unite"), "word boundaries only")
+        XCTAssertNil(remainderAfter(prefix: "Hello", in: "Goodbye"))
     }
 }

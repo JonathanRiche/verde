@@ -40,7 +40,9 @@ final class LiveProtocolTests: XCTestCase {
         XCTAssertNil(classic["tools"])
         XCTAssertEqual(dict(dict(dict(classic["audio"])["input"])["transcription"])["model"] as? String, "grok-transcribe")
         XCTAssertEqual(proto.parse(#"{"type":"conversation.item.input_audio_transcription.updated","transcript":"turn on the"}"#),
-                       [.userTextPartial("turn on the", cumulative: true)])
+                       [.userTextPartial("turn on the", cumulative: true, item: nil)])
+        XCTAssertEqual(proto.parse(#"{"type":"conversation.item.input_audio_transcription.updated","item_id":"item_7","transcript":"Hi"}"#),
+                       [.userTextPartial("Hi", cumulative: true, item: "item_7")])
         let append = object(proto.audio(Data([1, 2, 3])))
         XCTAssertEqual(append["type"] as? String, "input_audio_buffer.append")
         XCTAssertEqual(append["audio"] as? String, Data([1, 2, 3]).base64EncodedString())
@@ -73,9 +75,9 @@ final class LiveProtocolTests: XCTestCase {
         XCTAssertEqual(proto.parse(#"{"type":"response.audio.delta","delta":"\#(pcm)"}"#), [.audio(Data([0, 1, 2, 3]))])
         XCTAssertEqual(proto.parse(#"{"type":"response.audio_transcript.delta","delta":"Hel"}"#), [.assistantText("Hel")])
         XCTAssertEqual(proto.parse(#"{"type":"response.output_audio_transcript.delta","delta":"lo"}"#), [.assistantText("lo")])
-        XCTAssertEqual(proto.parse(#"{"type":"conversation.item.input_audio_transcription.completed","transcript":"hey"}"#), [.userText("hey")])
+        XCTAssertEqual(proto.parse(#"{"type":"conversation.item.input_audio_transcription.completed","transcript":"hey"}"#), [.userText("hey", item: nil)])
         XCTAssertEqual(proto.parse(#"{"type":"conversation.item.input_audio_transcription.delta","delta":"he"}"#),
-                       [.userTextPartial("he", cumulative: false)])
+                       [.userTextPartial("he", cumulative: false, item: nil)])
         XCTAssertEqual(proto.parse(#"{"type":"input_audio_buffer.speech_started"}"#), [.speechStarted])
         XCTAssertEqual(proto.parse(#"{"type":"response.function_call_arguments.done","call_id":"c1","name":"companion_status","arguments":"{}"}"#),
                        [.toolCall(id: "c1", name: "companion_status", arguments: "{}")])

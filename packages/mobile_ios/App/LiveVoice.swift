@@ -246,6 +246,7 @@ final class LiveVoice {
                 try? await Task.sleep(for: .seconds(5))
                 guard let self, current == self.generation else { return }
                 if Date().timeIntervalSince(self.lastActivity) > Self.silenceLimit { self.end(); return }
+                self.record?.tick(now: self.now)
                 if Date().timeIntervalSince(self.lastSaved) > Self.saveInterval { self.flushTranscript(final: false) }
             }
         }
@@ -277,6 +278,7 @@ final class LiveVoice {
     }
 
     private func handle(_ event: RealtimeEvent, generation current: Int) {
+        record?.tick(now: now)
         switch event {
         case .ready:
             uplink.markReady()
@@ -291,13 +293,13 @@ final class LiveVoice {
             assistantCaption = String((assistantCaption + delta).suffix(Self.captionLimit))
             record?.assistant(delta, at: now)
             lastActivity = Date()
-        case .userText(let text):
-            record?.user(text, final: true, cumulative: true, at: now)
-            userCaption = String((record?.currentUserText ?? text).suffix(Self.captionLimit))
+        case .userText(let text, let item):
+            record?.user(text, final: true, cumulative: true, item: item, at: now)
+            userCaption = String((record?.currentUserText ?? "").suffix(Self.captionLimit))
             lastActivity = Date()
-        case .userTextPartial(let text, let cumulative):
-            record?.user(text, final: false, cumulative: cumulative, at: now)
-            userCaption = String((record?.currentUserText ?? text).suffix(Self.captionLimit))
+        case .userTextPartial(let text, let cumulative, let item):
+            record?.user(text, final: false, cumulative: cumulative, item: item, at: now)
+            userCaption = String((record?.currentUserText ?? "").suffix(Self.captionLimit))
             lastActivity = Date()
         case .speechStarted, .interrupted:
             audio?.flush()
