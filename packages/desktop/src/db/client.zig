@@ -8,7 +8,6 @@ const schema = @import("schema.zig");
 const db_types = @import("types.zig");
 const migration_fixture = @import("migration_fixture.zig");
 const provider_types = @import("../providers/types.zig");
-const thread_binding = @import("../runtime/thread_binding.zig");
 
 const LoadedState = db_types.LoadedState;
 const PersistedChatCompletion = db_types.PersistedChatCompletion;
@@ -19,38 +18,6 @@ const PersistedProject = db_types.PersistedProject;
 const PersistedState = db_types.PersistedState;
 const PersistedSurfaceState = db_types.PersistedSurfaceState;
 const PersistedThread = db_types.PersistedThread;
-
-const LEGACY_LOCAL_PROFILE_ID = "local";
-const LEGACY_PRIMARY_REPOSITORY_ID = "primary";
-
-const PersistedThreadRoute = struct {
-    profile_id: ?[]const u8,
-    runtime_id: ?[]const u8,
-    repository_id: ?[]const u8,
-    repository_cwd: ?[]const u8,
-
-    fn fromThread(thread: PersistedThread) PersistedThreadRoute {
-        return .{
-            .profile_id = thread.profile_id,
-            .runtime_id = thread.runtime_id,
-            .repository_id = thread.repository_id,
-            .repository_cwd = thread.repository_cwd,
-        };
-    }
-
-    fn isAbsent(self: PersistedThreadRoute) bool {
-        return self.profile_id == null and self.runtime_id == null and
-            self.repository_id == null and self.repository_cwd == null;
-    }
-
-    fn isLegacyLocalEquivalent(self: PersistedThreadRoute) bool {
-        if (self.isAbsent()) return true;
-        return optionalTextEqual(self.profile_id, LEGACY_LOCAL_PROFILE_ID) and
-            self.runtime_id == null and
-            optionalTextEqual(self.repository_id, LEGACY_PRIMARY_REPOSITORY_ID) and
-            self.repository_cwd == null;
-    }
-};
 
 /// Compare every field in the canonical durable surface representation.
 pub fn surfaceStatesEqual(a: PersistedSurfaceState, b: PersistedSurfaceState) bool {
@@ -68,24 +35,6 @@ pub fn surfaceStatesEqual(a: PersistedSurfaceState, b: PersistedSurfaceState) bo
         optionalTextEqual(a.last_event_title, b.last_event_title) and
         optionalTextEqual(a.last_event_body, b.last_event_body);
 }
-
-// Full-state autosaves use a detached connection while focused saves and
-// completion ledgers use the UI-owned connection. SQLite serializes writers,
-// so serialize Verde's in-process owners before entering SQLite rather than
-// allowing a legitimate send to exhaust the busy timeout behind an autosave.
-const InProcessWriteMutex = struct {
-    inner: std.atomic.Mutex = .unlocked,
-
-    fn lock(self: *InProcessWriteMutex) void {
-        while (!self.inner.tryLock()) std.atomic.spinLoopHint();
-    }
-
-    fn unlock(self: *InProcessWriteMutex) void {
-        self.inner.unlock();
-    }
-};
-
-var in_process_write_mutex: InProcessWriteMutex = .{};
 
 pub const STATE_DB_NAME = "state.sqlite";
 pub const TRANSCRIPT_MESSAGE_PAGE_SIZE: usize = 256;
@@ -122,24 +71,6 @@ pub const Client = struct {
 
     pub fn pathForPrefPath(allocator: std.mem.Allocator, pref_path: []const u8) ![:0]u8 {
         return std.fs.path.joinZ(allocator, &.{ pref_path, STATE_DB_NAME });
-    }
-
-    pub fn init(allocator: std.mem.Allocator, pref_path: []const u8) !Self {
-        const path = try pathForPrefPath(allocator, pref_path);
-        errdefer allocator.free(path);
-
-        const flags = zqlite.OpenFlags.Create | zqlite.OpenFlags.EXResCode;
-        const conn = try zqlite.open(path, flags);
-        errdefer conn.close();
-
-        in_process_write_mutex.lock();
-        defer in_process_write_mutex.unlock();
-        try schema.initialize(conn);
-        return .{
-            .allocator = allocator,
-            .path = path,
-            .conn = conn,
-        };
     }
 
     /// Open an existing database without write capability or schema changes.
@@ -400,154 +331,6 @@ pub const Client = struct {
             row.int(1) == completed_at_ms;
     }
 
-    pub fn upsertSurfaceState(self: *const Self, surface: PersistedSurfaceState) !void {
-        in_process_write_mutex.lock();
-        defer in_process_write_mutex.unlock();
-        try self.conn.exec(
-            "insert into surface_completions (session_id, workspace_id, workspace_path, dock_id, pane_id, provider, provider_thread_id, title, status, status_changed_at_ms, completed_at_ms, last_event_title, last_event_body) " ++
-                "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) " ++
-                "on conflict(session_id) do update set workspace_id = excluded.workspace_id, workspace_path = excluded.workspace_path, dock_id = excluded.dock_id, " ++
-                "pane_id = excluded.pane_id, provider = excluded.provider, provider_thread_id = excluded.provider_thread_id, title = excluded.title, " ++
-                "status = excluded.status, status_changed_at_ms = excluded.status_changed_at_ms, completed_at_ms = excluded.completed_at_ms, " ++
-                "last_event_title = excluded.last_event_title, last_event_body = excluded.last_event_body",
-            .{
-                surface.session_id,
-                surface.workspace_id,
-                surface.workspace_path,
-                @as(i64, @intCast(surface.dock_id)),
-                if (surface.pane_id) |pane_id| @as(i64, @intCast(pane_id)) else null,
-                encodeOptionalEnum(surface.provider),
-                surface.provider_thread_id,
-                surface.title,
-                @as(i64, @intFromEnum(surface.status)),
-                surface.status_changed_at_ms,
-                surface.completed_at_ms,
-                surface.last_event_title,
-                surface.last_event_body,
-            },
-        );
-    }
-
-    pub fn clearSurfaceState(self: *const Self, session_id: []const u8) !bool {
-        in_process_write_mutex.lock();
-        defer in_process_write_mutex.unlock();
-        try self.conn.exec("delete from surface_completions where session_id = ?1", .{session_id});
-        return self.conn.changes() > 0;
-    }
-
-    pub fn upsertChatCompletion(self: *const Self, completion: PersistedChatCompletion) !void {
-        in_process_write_mutex.lock();
-        defer in_process_write_mutex.unlock();
-        try self.conn.exec(
-            "insert into chat_completions (workspace_id, local_thread_id, completed_at_ms) values (?1, ?2, ?3) " ++
-                "on conflict(workspace_id, local_thread_id) do update set completed_at_ms = excluded.completed_at_ms",
-            .{ completion.workspace_id, completion.local_thread_id, completion.completed_at_ms },
-        );
-    }
-
-    pub fn clearChatCompletion(self: *const Self, workspace_id: []const u8, local_thread_id: []const u8) !bool {
-        in_process_write_mutex.lock();
-        defer in_process_write_mutex.unlock();
-        try self.conn.exec(
-            "delete from chat_completions where workspace_id = ?1 and local_thread_id = ?2",
-            .{ workspace_id, local_thread_id },
-        );
-        return self.conn.changes() > 0;
-    }
-
-    pub fn save(self: *const Self, state: PersistedState) !void {
-        in_process_write_mutex.lock();
-        defer in_process_write_mutex.unlock();
-        try self.conn.transaction();
-        errdefer self.conn.rollback();
-
-        // Full-state compatibility saves replace every thread row. Compare
-        // stable thread identities before those deletes so a committed remote
-        // route cannot be rewritten as legacy Local by an omitted field.
-        try self.guardPersistedThreadRoutes(state);
-
-        try self.conn.execNoArgs(
-            \\delete from messages;
-            \\delete from threads;
-            \\delete from app_state;
-            \\delete from workspaces;
-        );
-
-        try self.conn.exec(
-            "insert into app_state (id, selected_workspace_index, sidebar_collapsed) values (1, ?1, ?2)",
-            .{
-                @as(i64, @intCast(state.selected_project_index)),
-                boolToInt(state.sidebar_collapsed),
-            },
-        );
-
-        for (state.projects, 0..) |project, project_index| {
-            const herdr_link = project.herdr_link;
-            try self.conn.exec(
-                "insert into workspaces (workspace_id, sort_index, label, path, archived, unread_count, collapsed, thread_list_expanded, terminal_height, terminal_layout_json, terminal_docks_json, workspace_layout_json, selected_thread_index, companion_thread_local_id, " ++
-                    "herdr_remote_alias, herdr_session_name, herdr_workspace_id, herdr_local_dir, herdr_remote_cwd, herdr_last_pane_id, herdr_attach_dock_id, herdr_attach_pane_id, herdr_pane_links_json, herdr_updated_at_ms, icon_index, color_index) " ++
-                    "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
-                .{
-                    project.id orelse project.path,
-                    @as(i64, @intCast(project_index)),
-                    project.label,
-                    project.path,
-                    boolToInt(project.archived),
-                    @as(i64, @intCast(project.unread_count)),
-                    boolToInt(project.collapsed orelse false),
-                    boolToInt(project.thread_list_expanded orelse false),
-                    project.terminal_height,
-                    project.terminal_layout_json,
-                    project.terminal_docks_json,
-                    project.workspace_layout_json,
-                    @as(i64, @intCast(project.selected_thread_index)),
-                    project.companion_thread_local_id,
-                    if (herdr_link) |link| link.remote_alias else null,
-                    if (herdr_link) |link| link.session_name else null,
-                    if (herdr_link) |link| link.workspace_id else null,
-                    if (herdr_link) |link| link.local_dir else null,
-                    if (herdr_link) |link| link.remote_cwd else null,
-                    if (herdr_link) |link| link.last_pane_id else null,
-                    if (herdr_link) |link| if (link.attach_dock_id) |dock_id| @as(i64, @intCast(dock_id)) else null else null,
-                    if (herdr_link) |link| if (link.attach_pane_id) |pane_id| @as(i64, @intCast(pane_id)) else null else null,
-                    if (herdr_link) |link| link.pane_links_json else null,
-                    if (herdr_link) |link| link.updated_at_ms else null,
-                    if (project.icon_index) |value| @as(i64, value) else null,
-                    if (project.color_index) |value| @as(i64, value) else null,
-                },
-            );
-            const workspace_row_id = self.conn.lastInsertedRowId();
-            try self.saveWorkspaceThreads(workspace_row_id, state, project, project_index);
-        }
-
-        try self.conn.commit();
-    }
-
-    /// Persist one chat thread without rewriting unrelated transcript history.
-    pub fn saveThread(self: *const Self, workspace_id: []const u8, thread_index: usize, thread: PersistedThread) !void {
-        in_process_write_mutex.lock();
-        defer in_process_write_mutex.unlock();
-        try self.conn.transaction();
-        errdefer self.conn.rollback();
-        const workspace_row_id = blk: {
-            var workspace_row = (try self.conn.row(
-                "select id from workspaces where workspace_id = ?1",
-                .{workspace_id},
-            )) orelse return error.WorkspaceNotFound;
-            defer workspace_row.deinit();
-            break :blk workspace_row.int(0);
-        };
-        // This writer deletes and reinserts its target row, so the schema's
-        // UPDATE trigger alone cannot protect the immutable route.
-        try self.guardPersistedThreadRoute(workspace_row_id, thread_index, thread);
-        try self.conn.exec(
-            "delete from threads where workspace_id = ?1 and sort_index = ?2",
-            .{ workspace_row_id, @as(i64, @intCast(thread_index)) },
-        );
-        try self.saveThreadAtIndex(workspace_row_id, thread_index, thread);
-        try self.conn.commit();
-    }
-
     fn loadSurfaceStates(self: *const Self, allocator: std.mem.Allocator) ![]const PersistedSurfaceState {
         var surfaces: std.ArrayList(PersistedSurfaceState) = .empty;
         defer surfaces.deinit(allocator);
@@ -635,148 +418,6 @@ pub const Client = struct {
             .message_id = self.hasColumn("messages", "message_id"),
             .message_extra_images = self.hasColumn("messages", "extra_images_json"),
         };
-    }
-
-    fn guardPersistedThreadRoutes(self: *const Self, state: PersistedState) !void {
-        const has_route_columns = self.hasThreadRouteColumns();
-        for (state.projects, 0..) |project, project_index| {
-            const workspace_row_id = if (has_route_columns)
-                try self.fullSaveWorkspaceRowId(state, project, project_index)
-            else
-                null;
-
-            if (project.threads) |threads| {
-                for (threads, 0..) |thread, thread_index| {
-                    try self.validatePersistedThreadRouteForSchema(thread, has_route_columns);
-                    if (workspace_row_id) |row_id| {
-                        try self.guardFullSaveCommittedThreadRoute(row_id, project, thread_index, thread);
-                    }
-                }
-            } else {
-                const thread = synthesizedProjectThread(state, project, project_index);
-                try self.validatePersistedThreadRouteForSchema(thread, has_route_columns);
-                if (workspace_row_id) |row_id| {
-                    try self.guardFullSaveCommittedThreadRoute(row_id, project, 0, thread);
-                }
-            }
-        }
-    }
-
-    fn guardPersistedThreadRoute(
-        self: *const Self,
-        workspace_row_id: i64,
-        thread_index: usize,
-        thread: PersistedThread,
-    ) !void {
-        const has_route_columns = self.hasThreadRouteColumns();
-        try self.validatePersistedThreadRouteForSchema(thread, has_route_columns);
-        if (!has_route_columns) return;
-        try self.guardFocusedSaveCommittedThreadRoute(workspace_row_id, thread_index, thread);
-    }
-
-    fn validatePersistedThreadRouteForSchema(
-        _: *const Self,
-        thread: PersistedThread,
-        has_route_columns: bool,
-    ) !void {
-        const route = PersistedThreadRoute.fromThread(thread);
-        try validatePersistedThreadRoute(route);
-        if (thread.committed and route.profile_id != null and
-            !std.mem.eql(u8, route.profile_id.?, LEGACY_LOCAL_PROFILE_ID) and
-            route.runtime_id == null)
-        {
-            return error.InvalidPersistedThreadRoute;
-        }
-        if (thread.committed and !route.isAbsent()) {
-            const local_thread_id = thread.local_thread_id orelse
-                return error.InvalidPersistedThreadRoute;
-            if (local_thread_id.len == 0) return error.InvalidPersistedThreadRoute;
-        }
-        if (!has_route_columns and !route.isLegacyLocalEquivalent()) {
-            return error.ThreadRouteSchemaUnavailable;
-        }
-    }
-
-    fn fullSaveWorkspaceRowId(
-        self: *const Self,
-        state: PersistedState,
-        project: PersistedProject,
-        project_index: usize,
-    ) !?i64 {
-        const workspace_key = project.id orelse project.path;
-        if (try self.conn.row(
-            "select id from workspaces where workspace_id = ?1",
-            .{workspace_key},
-        )) |row| {
-            defer row.deinit();
-            return row.int(0);
-        }
-
-        // An unmatched row at this position is a replacement candidate, not
-        // automatically a new workspace. If its stable identity exists
-        // elsewhere in the incoming snapshot it is merely being reordered.
-        const row = (try self.conn.row(
-            "select w.id, w.workspace_id, exists(" ++
-                "select 1 from threads t where t.workspace_id = w.id and t.committed != 0" ++
-                ") from workspaces w where w.sort_index = ?1",
-            .{@as(i64, @intCast(project_index))},
-        )) orelse return null;
-        defer row.deinit();
-        if (stateContainsWorkspaceId(state, row.text(1))) return null;
-        if (row.int(2) != 0) return error.CommittedWorkspaceIdentityImmutable;
-        return row.int(0);
-    }
-
-    fn guardFullSaveCommittedThreadRoute(
-        self: *const Self,
-        workspace_row_id: i64,
-        project: PersistedProject,
-        thread_index: usize,
-        thread: PersistedThread,
-    ) !void {
-        var maybe_row = if (thread.local_thread_id) |local_thread_id|
-            try self.conn.row(
-                "select committed, profile_id, runtime_id, repository_id, repository_cwd " ++
-                    "from threads where workspace_id = ?1 and local_thread_id = ?2",
-                .{ workspace_row_id, local_thread_id },
-            )
-        else
-            null;
-        if (maybe_row == null) {
-            maybe_row = try self.conn.row(
-                "select committed, profile_id, runtime_id, repository_id, repository_cwd, local_thread_id " ++
-                    "from threads where workspace_id = ?1 and sort_index = ?2",
-                .{ workspace_row_id, @as(i64, @intCast(thread_index)) },
-            );
-            if (maybe_row) |row| {
-                if (row.nullableText(5)) |old_local_thread_id| {
-                    if (projectContainsThreadId(project, old_local_thread_id)) {
-                        row.deinit();
-                        return;
-                    }
-                }
-                try guardCommittedThreadIdentity(row, thread);
-            }
-        }
-        const row = maybe_row orelse return;
-        defer row.deinit();
-        try guardCommittedRouteRow(row, thread);
-    }
-
-    fn guardFocusedSaveCommittedThreadRoute(
-        self: *const Self,
-        workspace_row_id: i64,
-        thread_index: usize,
-        thread: PersistedThread,
-    ) !void {
-        const row = (try self.conn.row(
-            "select committed, profile_id, runtime_id, repository_id, repository_cwd, local_thread_id " ++
-                "from threads where workspace_id = ?1 and sort_index = ?2",
-            .{ workspace_row_id, @as(i64, @intCast(thread_index)) },
-        )) orelse return;
-        defer row.deinit();
-        try guardCommittedThreadIdentity(row, thread);
-        try guardCommittedRouteRow(row, thread);
     }
 
     fn loadThreadsForProjects(
@@ -988,225 +629,7 @@ pub const Client = struct {
 
         return .{ .offset = offset, .messages = try messages.toOwnedSlice(allocator) };
     }
-
-    fn saveWorkspaceThreads(
-        self: *const Self,
-        project_id: i64,
-        state: PersistedState,
-        project: PersistedProject,
-        project_index: usize,
-    ) !void {
-        if (project.threads) |threads| {
-            return self.saveThreads(project_id, threads);
-        }
-
-        const synthesized = synthesizedProjectThread(state, project, project_index);
-        return self.saveThreads(project_id, &.{synthesized});
-    }
-
-    fn saveThreads(self: *const Self, project_id: i64, threads: []const PersistedThread) !void {
-        for (threads, 0..) |thread, thread_index| {
-            try self.saveThreadAtIndex(project_id, thread_index, thread);
-        }
-    }
-
-    fn saveThreadAtIndex(self: *const Self, project_id: i64, thread_index: usize, thread: PersistedThread) !void {
-        const draft_image = thread.draft_image;
-        const base_values = .{
-            project_id,
-            @as(i64, @intCast(thread_index)),
-            thread.title,
-            boolToInt(thread.archived),
-            boolToInt(thread.committed),
-            thread.local_thread_id,
-            thread.last_activity_at,
-            thread.provider_thread_id,
-            thread.model_ref,
-            encodeOptionalEnum(thread.reasoning_effort),
-            thread.reasoning_variant,
-            encodeOptionalEnum(thread.fast_mode),
-            encodeOptionalEnum(thread.access_mode),
-            @as(i64, @intFromEnum(thread.provider)),
-            @as(i64, @intFromEnum(thread.harness)),
-            if (thread.tui_dock_id) |dock_id| @as(i64, @intCast(dock_id)) else null,
-            thread.draft,
-            if (draft_image) |image| image.path else null,
-            if (draft_image) |image| image.mime else null,
-            if (draft_image) |image| @as(i64, @intCast(image.byte_size)) else null,
-        };
-        // The v1 writer only carries `cwd` once the daemon has migrated the
-        // file to v6; binding a 21st value against a 20-placeholder statement
-        // is a range error, so the two shapes stay separate statements.
-        if (self.hasThreadRouteColumns()) {
-            try self.conn.exec(
-                "insert into threads (workspace_id, sort_index, title, archived, committed, local_thread_id, last_activity_at, provider_thread_id, model_ref, reasoning_effort, reasoning_variant, fast_mode, access_mode, provider, harness, tui_dock_id, draft, draft_image_path, draft_image_mime, draft_image_byte_size, cwd, profile_id, runtime_id, repository_id, repository_cwd) " ++
-                    "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
-                base_values ++ .{ thread.cwd, thread.profile_id, thread.runtime_id, thread.repository_id, thread.repository_cwd },
-            );
-        } else if (self.hasColumn("threads", "cwd")) {
-            try self.conn.exec(
-                "insert into threads (workspace_id, sort_index, title, archived, committed, local_thread_id, last_activity_at, provider_thread_id, model_ref, reasoning_effort, reasoning_variant, fast_mode, access_mode, provider, harness, tui_dock_id, draft, draft_image_path, draft_image_mime, draft_image_byte_size, cwd) " ++
-                    "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
-                base_values ++ .{thread.cwd},
-            );
-        } else {
-            try self.conn.exec(
-                "insert into threads (workspace_id, sort_index, title, archived, committed, local_thread_id, last_activity_at, provider_thread_id, model_ref, reasoning_effort, reasoning_variant, fast_mode, access_mode, provider, harness, tui_dock_id, draft, draft_image_path, draft_image_mime, draft_image_byte_size) " ++
-                    "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
-                base_values,
-            );
-        }
-        const thread_row_id = self.conn.lastInsertedRowId();
-        try self.saveMessages(thread_row_id, thread.messages);
-    }
-
-    fn saveMessages(self: *const Self, thread_id: i64, messages: []const PersistedMessage) !void {
-        for (messages, 0..) |message, message_index| {
-            const image = message.image;
-            try self.conn.exec(
-                "insert into messages (thread_id, sort_index, role, author, body, image_path, image_mime, image_byte_size, tool_call_id, tool_call_kind, tool_call_status) " ++
-                    "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                .{
-                    thread_id,
-                    @as(i64, @intCast(message_index)),
-                    encodeChatRole(message.role),
-                    message.author,
-                    message.body,
-                    if (image) |attachment| attachment.path else null,
-                    if (image) |attachment| attachment.mime else null,
-                    if (image) |attachment| @as(i64, @intCast(attachment.byte_size)) else null,
-                    message.tool_call_id,
-                    encodeOptionalEnum(message.tool_call_kind),
-                    encodeOptionalEnum(message.tool_call_status),
-                },
-            );
-        }
-    }
 };
-
-fn synthesizedProjectThread(
-    state: PersistedState,
-    project: PersistedProject,
-    project_index: usize,
-) PersistedThread {
-    var thread: PersistedThread = .{
-        .title = "New thread",
-        .archived = project.archived,
-        .committed = project.messages.len > 0,
-        .last_activity_at = if (project.messages.len > 0) 0 else null,
-        .provider = project.provider,
-        .harness = project.harness,
-        .draft = project.draft,
-        .messages = project.messages,
-    };
-    if (project_index == 0 and project.messages.len == 0 and state.messages != null) {
-        thread.provider = state.provider orelse thread.provider;
-        thread.harness = state.harness orelse thread.harness;
-        thread.draft = state.draft orelse thread.draft;
-        thread.messages = state.messages.?;
-    }
-    return thread;
-}
-
-fn validatePersistedThreadRoute(route: PersistedThreadRoute) !void {
-    if (route.isAbsent()) return;
-    const profile_id = route.profile_id orelse return error.InvalidPersistedThreadRoute;
-    const repository_id = route.repository_id orelse return error.InvalidPersistedThreadRoute;
-    thread_binding.validateSelection(.{
-        .profile_id = profile_id,
-        .repository_id = repository_id,
-        .relative_cwd = route.repository_cwd,
-    }) catch return error.InvalidPersistedThreadRoute;
-    if (route.runtime_id) |runtime_id| {
-        thread_binding.validateRuntimeId(runtime_id) catch return error.InvalidPersistedThreadRoute;
-    }
-}
-
-fn stateContainsWorkspaceId(state: PersistedState, workspace_id: []const u8) bool {
-    for (state.projects) |project| {
-        if (std.mem.eql(u8, project.id orelse project.path, workspace_id)) return true;
-    }
-    return false;
-}
-
-fn projectContainsThreadId(project: PersistedProject, local_thread_id: []const u8) bool {
-    const threads = project.threads orelse return false;
-    for (threads) |thread| {
-        const candidate = thread.local_thread_id orelse continue;
-        if (std.mem.eql(u8, candidate, local_thread_id)) return true;
-    }
-    return false;
-}
-
-fn guardCommittedThreadIdentity(row: zqlite.Row, thread: PersistedThread) !void {
-    if (row.int(0) == 0) return;
-    const old_local_thread_id = row.nullableText(5);
-    if (old_local_thread_id == null or old_local_thread_id.?.len == 0) {
-        const old_route: PersistedThreadRoute = .{
-            .profile_id = row.nullableText(1),
-            .runtime_id = row.nullableText(2),
-            .repository_id = row.nullableText(3),
-            .repository_cwd = row.nullableText(4),
-        };
-        // Only an exact pre-v7 Local row may learn its first stable thread
-        // identity. An explicit/partial route without one is opaque: assigning
-        // an identity during delete/reinsert would silently legitimize it.
-        if (!old_route.isAbsent()) return error.CommittedThreadIdentityImmutable;
-        return;
-    }
-    const incoming_local_thread_id = thread.local_thread_id orelse
-        return error.CommittedThreadIdentityImmutable;
-    if (incoming_local_thread_id.len == 0 or
-        !std.mem.eql(u8, old_local_thread_id.?, incoming_local_thread_id))
-    {
-        return error.CommittedThreadIdentityImmutable;
-    }
-}
-
-fn guardCommittedRouteRow(row: zqlite.Row, thread: PersistedThread) !void {
-    if (row.int(0) == 0) return;
-    if (!thread.committed) return error.CommittedThreadCannotBecomeDraft;
-    const old_route: PersistedThreadRoute = .{
-        .profile_id = row.nullableText(1),
-        .runtime_id = row.nullableText(2),
-        .repository_id = row.nullableText(3),
-        .repository_cwd = row.nullableText(4),
-    };
-    if (!committedRouteRewriteAllowed(old_route, PersistedThreadRoute.fromThread(thread))) {
-        return error.CommittedThreadRouteImmutable;
-    }
-}
-
-fn committedRouteRewriteAllowed(old: PersistedThreadRoute, incoming: PersistedThreadRoute) bool {
-    // Only the wholly absent pre-v7 shape has Local + primary semantics. A
-    // partial/corrupt old row remains opaque and cannot be normalized into an
-    // executable route by a compatibility save.
-    if (!old.isAbsent() and (old.profile_id == null or old.repository_id == null)) return false;
-    if (!incoming.isAbsent() and (incoming.profile_id == null or incoming.repository_id == null)) return false;
-    if (old.profile_id) |profile_id| {
-        if (!std.mem.eql(u8, profile_id, LEGACY_LOCAL_PROFILE_ID) and old.runtime_id == null) return false;
-    }
-
-    const old_profile = old.profile_id orelse LEGACY_LOCAL_PROFILE_ID;
-    const incoming_profile = incoming.profile_id orelse LEGACY_LOCAL_PROFILE_ID;
-    const old_repository = old.repository_id orelse LEGACY_PRIMARY_REPOSITORY_ID;
-    const incoming_repository = incoming.repository_id orelse LEGACY_PRIMARY_REPOSITORY_ID;
-    if (!std.mem.eql(u8, old_profile, incoming_profile) or
-        !std.mem.eql(u8, old_repository, incoming_repository) or
-        !optionalTextEqual(old.repository_cwd, incoming.repository_cwd))
-    {
-        return false;
-    }
-
-    // A migrated committed row may not know its runtime identity yet. The
-    // first verified identity is the sole allowed change; once known it may
-    // neither change nor be cleared.
-    if (old.runtime_id) |old_runtime_id| {
-        const incoming_runtime_id = incoming.runtime_id orelse return false;
-        return std.mem.eql(u8, old_runtime_id, incoming_runtime_id);
-    }
-    return true;
-}
 
 /// Decode the additive `*_images_json` column (attachments past the primary)
 /// into persisted attachments. Malformed JSON degrades to "no extras" rather
@@ -1291,30 +714,14 @@ test "projection load bounds transcript tails and pages older rows" {
     const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
     defer testing.allocator.free(pref_path);
 
-    const messages = try testing.allocator.alloc(PersistedMessage, TRANSCRIPT_MESSAGE_PAGE_SIZE + 8);
-    defer testing.allocator.free(messages);
-    for (messages, 0..) |*message, index| {
-        message.* = .{
-            .role = if (index % 2 == 0) .user else .assistant,
-            .author = if (index % 2 == 0) "You" else "Assistant",
-            .body = if (index < 8) "older" else "tail",
-        };
-    }
-    const threads = [_]PersistedThread{.{
-        .title = "Paged",
-        .local_thread_id = "paged-thread",
-        .messages = messages,
-    }};
-    const projects = [_]PersistedProject{.{
-        .id = "paged-workspace",
-        .label = "Paged",
-        .path = "/tmp/paged",
-        .threads = &threads,
-    }};
     {
-        var writer = try Client.init(testing.allocator, pref_path);
+        var writer = try testInitMigrated(testing.allocator, pref_path);
         defer writer.deinit();
-        try writer.save(.{ .projects = &projects });
+        try testSeedThread(writer.conn, "paged-workspace", "Paged", "/tmp/paged", "paged-thread", "Paged");
+        for (0..TRANSCRIPT_MESSAGE_PAGE_SIZE + 8) |index| {
+            const user = index % 2 == 0;
+            try testSeedMessage(writer.conn, "paged-thread", index, if (user) 0 else 1, if (user) "You" else "Assistant", if (index < 8) "older" else "tail");
+        }
     }
 
     var reader = try Client.initReadOnly(testing.allocator, pref_path);
@@ -1367,23 +774,6 @@ fn dupeOptionalText(allocator: std.mem.Allocator, value: ?[]const u8) !?[]const 
     return try allocator.dupe(u8, text);
 }
 
-fn boolToInt(value: bool) i64 {
-    return if (value) 1 else 0;
-}
-
-fn encodeChatRole(role: db_types.ChatRole) i64 {
-    return switch (role) {
-        .user => 0,
-        .assistant => 1,
-        .system => 2,
-    };
-}
-
-fn encodeOptionalEnum(value: anytype) ?i64 {
-    const enum_value = value orelse return null;
-    return @as(i64, @intFromEnum(enum_value));
-}
-
 fn decodeOptionalEnum(comptime Enum: type, raw: ?i64) ?Enum {
     const value = raw orelse return null;
     const enum_value: u8 = @intCast(value);
@@ -1417,6 +807,57 @@ fn testDirPathAlloc(dir: std.Io.Dir, allocator: std.mem.Allocator) ![]u8 {
     return allocator.dupe(u8, buffer[0..len]);
 }
 
+/// Open a writable connection migrated to the v1 projection schema. Tests
+/// stage fixtures through it; production writes go through the daemon store.
+fn testInitMigrated(allocator: std.mem.Allocator, pref_path: []const u8) !Client {
+    const path = try Client.pathForPrefPath(allocator, pref_path);
+    errdefer allocator.free(path);
+    const conn = try zqlite.open(path, zqlite.OpenFlags.Create | zqlite.OpenFlags.EXResCode);
+    errdefer conn.close();
+    try schema.initialize(conn);
+    return .{ .allocator = allocator, .path = path, .conn = conn };
+}
+
+/// Insert the singleton app state row (if absent) and append one workspace.
+fn testSeedWorkspace(conn: zqlite.Conn, workspace_id: []const u8, label: []const u8, path: []const u8) !void {
+    try conn.execNoArgs("insert or ignore into app_state (id, selected_workspace_index, sidebar_collapsed) values (1, 0, 0)");
+    try conn.exec(
+        "insert into workspaces (workspace_id, sort_index, label, path) values (?1, (select coalesce(max(sort_index) + 1, 0) from workspaces), ?2, ?3)",
+        .{ workspace_id, label, path },
+    );
+}
+
+fn testSeedThread(
+    conn: zqlite.Conn,
+    workspace_id: []const u8,
+    workspace_label: []const u8,
+    workspace_path: []const u8,
+    local_thread_id: []const u8,
+    title: []const u8,
+) !void {
+    try testSeedWorkspace(conn, workspace_id, workspace_label, workspace_path);
+    try conn.exec(
+        "insert into threads (workspace_id, sort_index, title, local_thread_id, provider, harness) " ++
+            "select id, 0, ?2, ?3, ?4, ?5 from workspaces where workspace_id = ?1",
+        .{
+            workspace_id,
+            title,
+            local_thread_id,
+            @as(i64, @intFromEnum(db_types.Provider.opencode)),
+            @as(i64, @intFromEnum(db_types.Harness.local_cli)),
+        },
+    );
+}
+
+/// `role` is the raw on-disk code so fixtures can reproduce historical rows.
+fn testSeedMessage(conn: zqlite.Conn, local_thread_id: []const u8, sort_index: usize, role: i64, author: []const u8, body: []const u8) !void {
+    try conn.exec(
+        "insert into messages (thread_id, sort_index, role, author, body) " ++
+            "select id, ?2, ?3, ?4, ?5 from threads where local_thread_id = ?1",
+        .{ local_thread_id, @as(i64, @intCast(sort_index)), role, author, body },
+    );
+}
+
 fn testOpenDatabase(allocator: std.mem.Allocator, pref_path: []const u8) !zqlite.Conn {
     const path = try Client.pathForPrefPath(allocator, pref_path);
     defer allocator.free(path);
@@ -1425,19 +866,10 @@ fn testOpenDatabase(allocator: std.mem.Allocator, pref_path: []const u8) !zqlite
 }
 
 test "chat roles preserve the shipped store codec" {
-    try testing.expectEqual(@as(i64, 0), encodeChatRole(.user));
-    try testing.expectEqual(@as(i64, 1), encodeChatRole(.assistant));
-    try testing.expectEqual(@as(i64, 2), encodeChatRole(.system));
-
-    inline for (.{ db_types.ChatRole.user, db_types.ChatRole.assistant, db_types.ChatRole.system }) |role| {
-        const author: []const u8 = switch (role) {
-            .user => "You",
-            .assistant => "Assistant",
-            .system => "System",
-        };
-        try testing.expectEqual(@as(i64, @intFromEnum(role)), encodeChatRole(role));
-        try testing.expectEqual(role, db_types.decodeStoredChatRole(encodeChatRole(role), author));
-    }
+    // The shipped on-disk codes are user=0, assistant=1, system=2.
+    try testing.expectEqual(db_types.ChatRole.user, db_types.decodeStoredChatRole(0, "You"));
+    try testing.expectEqual(db_types.ChatRole.assistant, db_types.decodeStoredChatRole(1, "Assistant"));
+    try testing.expectEqual(db_types.ChatRole.system, db_types.decodeStoredChatRole(2, "System"));
 }
 
 fn testCreateLegacyFixture(pref_path: []const u8) !void {
@@ -1670,7 +1102,7 @@ test "fresh database initializes at the current schema version" {
     const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
     defer testing.allocator.free(pref_path);
 
-    var client = try Client.init(testing.allocator, pref_path);
+    var client = try testInitMigrated(testing.allocator, pref_path);
     defer client.deinit();
     try testing.expectEqual(schema.CURRENT_VERSION, try testUserVersion(client.conn));
     try testing.expect(try schema.testHasColumn(client.conn, "threads", "reasoning_variant"));
@@ -1703,9 +1135,9 @@ test "read-only open loads a current database" {
     defer testing.allocator.free(pref_path);
 
     {
-        var writer = try Client.init(testing.allocator, pref_path);
+        var writer = try testInitMigrated(testing.allocator, pref_path);
         defer writer.deinit();
-        try writer.save(.{ .sidebar_collapsed = true });
+        try writer.conn.execNoArgs("insert into app_state (id, selected_workspace_index, sidebar_collapsed) values (1, 0, 1)");
     }
 
     var reader = try Client.initReadOnly(testing.allocator, pref_path);
@@ -1726,45 +1158,25 @@ test "read-only load repairs mixed historical daemon chat roles without mutation
     defer testing.allocator.free(pref_path);
 
     {
-        var writer = try Client.init(testing.allocator, pref_path);
+        var writer = try testInitMigrated(testing.allocator, pref_path);
         defer writer.deinit();
-        try writer.save(.{ .projects = &.{.{
-            .id = "mixed-workspace",
-            .label = "Mixed roles",
-            .path = "/tmp/mixed",
-            .threads = &.{.{
-                .title = "Mixed roles",
-                .local_thread_id = "mixed-thread",
-                .provider = .codex,
-                .messages = &.{
-                    .{ .role = .user, .author = "You", .body = "canonical user" },
-                    .{ .role = .assistant, .author = "Assistant", .body = "canonical assistant" },
-                    .{ .role = .system, .author = "System", .body = "canonical system" },
-                    .{
-                        .role = .system,
-                        .author = "Ran command",
-                        .body = "legacy system",
-                        .tool_call_id = "legacy-call",
-                        .tool_call_kind = .execute,
-                        .tool_call_status = .completed,
-                    },
-                    .{ .role = .user, .author = "You", .body = "legacy user" },
-                    .{ .role = .assistant, .author = "Codex", .body = "legacy assistant" },
-                    .{ .role = .assistant, .author = "Codex", .body = "desktop assistant" },
-                    .{ .role = .system, .author = "Changed files", .body = "desktop system" },
-                    .{ .role = .user, .author = "You", .body = "desktop user" },
-                },
-            }},
-        }} });
-        // Reproduce the historical daemon's overlapping role integers.
-        try writer.conn.execNoArgs(
-            \\update messages set role = 0 where body = 'legacy system';
-            \\update messages set role = 1 where body = 'legacy user';
-            \\update messages set role = 2 where body = 'legacy assistant';
-            \\update messages set role = 0 where body = 'desktop assistant';
-            \\update messages set role = 1 where body = 'desktop system';
-            \\update messages set role = 2 where body = 'desktop user';
+        try testSeedThread(writer.conn, "mixed-workspace", "Mixed roles", "/tmp/mixed", "mixed-thread", "Mixed roles");
+        try writer.conn.exec("update threads set provider = ?1", .{@as(i64, @intFromEnum(db_types.Provider.codex))});
+        // Canonical rows first, then the historical daemon's overlapping role
+        // integers that the read path must repair from the author.
+        try testSeedMessage(writer.conn, "mixed-thread", 0, 0, "You", "canonical user");
+        try testSeedMessage(writer.conn, "mixed-thread", 1, 1, "Assistant", "canonical assistant");
+        try testSeedMessage(writer.conn, "mixed-thread", 2, 2, "System", "canonical system");
+        try testSeedMessage(writer.conn, "mixed-thread", 3, 0, "Ran command", "legacy system");
+        try writer.conn.exec(
+            "update messages set tool_call_id = 'legacy-call', tool_call_kind = ?1, tool_call_status = ?2 where body = 'legacy system'",
+            .{ @as(i64, @intFromEnum(provider_types.ToolCallKind.execute)), @as(i64, @intFromEnum(provider_types.ToolCallStatus.completed)) },
         );
+        try testSeedMessage(writer.conn, "mixed-thread", 4, 1, "You", "legacy user");
+        try testSeedMessage(writer.conn, "mixed-thread", 5, 2, "Codex", "legacy assistant");
+        try testSeedMessage(writer.conn, "mixed-thread", 6, 0, "Codex", "desktop assistant");
+        try testSeedMessage(writer.conn, "mixed-thread", 7, 1, "Changed files", "desktop system");
+        try testSeedMessage(writer.conn, "mixed-thread", 8, 2, "You", "desktop user");
     }
 
     var reader = try Client.initReadOnly(testing.allocator, pref_path);
@@ -1799,16 +1211,9 @@ test "load holds one WAL snapshot across all reads" {
     const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
     defer testing.allocator.free(pref_path);
 
-    var writer = try Client.init(testing.allocator, pref_path);
+    var writer = try testInitMigrated(testing.allocator, pref_path);
     defer writer.deinit();
-    try writer.save(.{
-        .selected_project_index = 0,
-        .projects = &.{.{
-            .id = "workspace-1",
-            .label = "before",
-            .path = "/tmp/workspace",
-        }},
-    });
+    try testSeedWorkspace(writer.conn, "workspace-1", "before", "/tmp/workspace");
 
     var reader = try Client.initReadOnly(testing.allocator, pref_path);
     defer reader.deinit();
@@ -1844,7 +1249,7 @@ test "pre-versioning fixture migrates without transcript or ledger loss" {
     defer testing.allocator.free(pref_path);
     try testCreateLegacyFixture(pref_path);
 
-    var client = try Client.init(testing.allocator, pref_path);
+    var client = try testInitMigrated(testing.allocator, pref_path);
     defer client.deinit();
     try testing.expectEqual(schema.CURRENT_VERSION, try testUserVersion(client.conn));
     try testing.expect(try schema.testHasColumn(client.conn, "threads", "reasoning_variant"));
@@ -1889,7 +1294,7 @@ test "WAL pre-versioning fixture migrates and reopens with sidecars present" {
     _ = try tmp.dir.statFile(testing.io, STATE_DB_NAME ++ "-shm", .{});
 
     {
-        var migrated = try Client.init(testing.allocator, pref_path);
+        var migrated = try testInitMigrated(testing.allocator, pref_path);
         defer migrated.deinit();
         try testing.expectEqual(schema.CURRENT_VERSION, try testUserVersion(migrated.conn));
         try testing.expect(try schema.testHasColumn(migrated.conn, "threads", "reasoning_variant"));
@@ -1902,7 +1307,7 @@ test "WAL pre-versioning fixture migrates and reopens with sidecars present" {
     legacy.close();
     legacy_open = false;
 
-    var reopened = try Client.init(testing.allocator, pref_path);
+    var reopened = try testInitMigrated(testing.allocator, pref_path);
     defer reopened.deinit();
     try testing.expectEqual(schema.CURRENT_VERSION, try testUserVersion(reopened.conn));
     try testing.expect(try schema.testHasColumn(reopened.conn, "threads", "reasoning_variant"));
@@ -1913,7 +1318,7 @@ test "WAL pre-versioning fixture migrates and reopens with sidecars present" {
     try testExpectDatabaseChecks(reopened.conn);
 }
 
-test "schema migration is idempotent across repeated client initialization" {
+test "schema migration is idempotent across repeated v1 initialization" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
@@ -1929,12 +1334,12 @@ test "schema migration is idempotent across repeated client initialization" {
     }
 
     {
-        var first = try Client.init(testing.allocator, pref_path);
+        var first = try testInitMigrated(testing.allocator, pref_path);
         defer first.deinit();
         try testing.expectEqual(schema.CURRENT_VERSION, try testUserVersion(first.conn));
     }
     {
-        var second = try Client.init(testing.allocator, pref_path);
+        var second = try testInitMigrated(testing.allocator, pref_path);
         defer second.deinit();
         try testing.expectEqual(schema.CURRENT_VERSION, try testUserVersion(second.conn));
         var columns = try second.conn.rows("pragma table_info(threads)", .{});
@@ -1976,7 +1381,7 @@ test "newer schema version is rejected without touching the database" {
     defer testing.allocator.free(before);
 
     try testing.expectError(error.DatabaseSchemaTooNew, Client.initReadOnly(testing.allocator, pref_path));
-    try testing.expectError(error.DatabaseSchemaTooNew, Client.init(testing.allocator, pref_path));
+    try testing.expectError(error.DatabaseSchemaTooNew, testInitMigrated(testing.allocator, pref_path));
 
     const after = try tmp.dir.readFileAlloc(testing.io, STATE_DB_NAME, testing.allocator, .unlimited);
     defer testing.allocator.free(after);
@@ -2013,7 +1418,7 @@ test "newer WAL schema rejection leaves WAL state untouched" {
     const wal_before = try tmp.dir.readFileAlloc(testing.io, STATE_DB_NAME ++ "-wal", testing.allocator, .unlimited);
     defer testing.allocator.free(wal_before);
     try testing.expectError(error.DatabaseSchemaTooNew, Client.initReadOnly(testing.allocator, pref_path));
-    try testing.expectError(error.DatabaseSchemaTooNew, Client.init(testing.allocator, pref_path));
+    try testing.expectError(error.DatabaseSchemaTooNew, testInitMigrated(testing.allocator, pref_path));
 
     const main_after = try tmp.dir.readFileAlloc(testing.io, STATE_DB_NAME, testing.allocator, .unlimited);
     defer testing.allocator.free(main_after);
@@ -2032,763 +1437,74 @@ test "newer WAL schema rejection leaves WAL state untouched" {
     try testing.expect(!try schema.testHasColumn(future, "future_marker", "reasoning_variant"));
 }
 
-test "terminal surface states survive state saves and clear explicitly" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
-    defer testing.allocator.free(pref_path);
-
-    var client = try Client.init(testing.allocator, pref_path);
-    defer client.deinit();
-
-    try client.save(.{});
-    try client.upsertSurfaceState(.{
-        .session_id = "session-later",
-        .workspace_id = "workspace-2",
-        .workspace_path = "/tmp/two",
-        .dock_id = 2,
-        .pane_id = 12,
-        .provider = .cursor,
-        .title = "Later",
-        .status = .working,
-        .status_changed_at_ms = 200,
-    });
-    try client.upsertSurfaceState(.{
-        .session_id = "session-first",
-        .workspace_id = "workspace-1",
-        .workspace_path = "/tmp/one",
-        .dock_id = 1,
-        .pane_id = 11,
-        .provider = .codex,
-        .title = "First",
-        .status = .done,
-        .status_changed_at_ms = 100,
-        .completed_at_ms = 100,
-    });
-
-    // Ordinary app-state snapshots must not erase the independent surface
-    // ledger, including when another process writes it between saves.
-    try client.save(.{ .sidebar_collapsed = true });
-
-    var loaded = (try client.load(testing.allocator)).?;
-    defer loaded.deinit();
-    try testing.expectEqual(@as(usize, 2), loaded.value.surface_states.len);
-    try testing.expectEqualStrings("session-first", loaded.value.surface_states[0].session_id);
-    try testing.expectEqual(db_types.SurfaceStatus.done, loaded.value.surface_states[0].status);
-    try testing.expectEqualStrings("session-later", loaded.value.surface_states[1].session_id);
-    try testing.expectEqual(db_types.SurfaceStatus.working, loaded.value.surface_states[1].status);
-    try testing.expect(try client.clearSurfaceState("session-first"));
-    try testing.expect(!try client.clearSurfaceState("session-first"));
-}
-
-test "chat completions survive state saves and clear explicitly" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
-    defer testing.allocator.free(pref_path);
-
-    var client = try Client.init(testing.allocator, pref_path);
-    defer client.deinit();
-
-    try client.save(.{});
-    try client.upsertChatCompletion(.{
-        .workspace_id = "workspace-2",
-        .local_thread_id = "chat-later",
-        .completed_at_ms = 200,
-    });
-    try client.upsertChatCompletion(.{
-        .workspace_id = "workspace-1",
-        .local_thread_id = "chat-first",
-        .completed_at_ms = 100,
-    });
-
-    try client.save(.{ .sidebar_collapsed = true });
-
-    var loaded = (try client.load(testing.allocator)).?;
-    defer loaded.deinit();
-    try testing.expectEqual(@as(usize, 2), loaded.value.chat_completions.len);
-    try testing.expectEqualStrings("chat-first", loaded.value.chat_completions[0].local_thread_id);
-    try testing.expectEqualStrings("chat-later", loaded.value.chat_completions[1].local_thread_id);
-    try testing.expect(try client.clearChatCompletion("workspace-1", "chat-first"));
-    try testing.expect(!try client.clearChatCompletion("workspace-1", "chat-first"));
-}
-
-test "single-thread save preserves unrelated transcript history" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
-    defer testing.allocator.free(pref_path);
-
-    var client = try Client.init(testing.allocator, pref_path);
-    defer client.deinit();
-
-    try client.save(.{ .projects = &.{.{
-        .id = "workspace-1",
-        .label = "Workspace",
-        .path = "/tmp/workspace",
-        .threads = &.{
-            .{
-                .title = "Unrelated",
-                .local_thread_id = "thread-1",
-                .provider = .codex,
-                .messages = &.{.{ .role = .user, .author = "You", .body = "keep me" }},
-            },
-            .{
-                .title = "Target",
-                .local_thread_id = "thread-2",
-                .provider = .codex,
-                .messages = &.{.{ .role = .user, .author = "You", .body = "old" }},
-            },
-        },
-    }} });
-
-    try client.saveThread("workspace-1", 1, .{
-        .title = "Target updated",
-        .local_thread_id = "thread-2",
-        .provider = .codex,
-        .messages = &.{
-            .{ .role = .user, .author = "You", .body = "old" },
-            .{ .role = .user, .author = "You", .body = "new prompt" },
-        },
-    });
-
-    var loaded = (try client.load(testing.allocator)).?;
-    defer loaded.deinit();
-    const threads = loaded.value.projects[0].threads.?;
-    try testing.expectEqual(@as(usize, 2), threads.len);
-    try testing.expectEqualStrings("keep me", threads[0].messages[0].body);
-    try testing.expectEqualStrings("Target updated", threads[1].title);
-    try testing.expectEqual(@as(usize, 2), threads[1].messages.len);
-    try testing.expectEqualStrings("new prompt", threads[1].messages[1].body);
-}
-
-test "full save pins but never replaces a committed thread route" {
+test "load preserves archived workspaces, archived threads, and the companion thread" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
     defer testing.allocator.free(pref_path);
-
-    var client = try Client.init(testing.allocator, pref_path);
-    defer client.deinit();
-    try schema.initializeToVersion(client.conn, 7);
-
-    const initial: PersistedThread = .{
-        .title = "Remote route",
-        .committed = false,
-        .local_thread_id = "full-route-thread",
-        .profile_id = "remote-box",
-        .repository_id = "repo-api",
-        .repository_cwd = "services/api",
-    };
-    try client.save(.{ .projects = &.{.{
-        .id = "route-workspace",
-        .label = "Route workspace",
-        .path = "/tmp/route-workspace",
-        .threads = &.{initial},
-    }} });
-
-    var pinned = initial;
-    pinned.title = "Pinned route";
-    pinned.committed = true;
-    pinned.runtime_id = "0123456789abcdef0123456789abcdef";
-    try client.save(.{ .projects = &.{.{
-        .id = "route-workspace",
-        .label = "Route workspace",
-        .path = "/tmp/route-workspace",
-        .threads = &.{pinned},
-    }} });
-
-    var profile_drift = pinned;
-    profile_drift.profile_id = LEGACY_LOCAL_PROFILE_ID;
-    try testing.expectError(error.CommittedThreadRouteImmutable, client.save(.{ .projects = &.{.{
-        .id = "route-workspace",
-        .label = "Route workspace",
-        .path = "/tmp/route-workspace",
-        .threads = &.{profile_drift},
-    }} }));
-
-    var runtime_drift = pinned;
-    runtime_drift.runtime_id = "fedcba9876543210fedcba9876543210";
-    try testing.expectError(error.CommittedThreadRouteImmutable, client.save(.{ .projects = &.{.{
-        .id = "route-workspace",
-        .label = "Route workspace",
-        .path = "/tmp/route-workspace",
-        .threads = &.{runtime_drift},
-    }} }));
-
-    var identity_drift = pinned;
-    identity_drift.local_thread_id = "full-route-thread-replaced";
-    try testing.expectError(error.CommittedThreadIdentityImmutable, client.save(.{ .projects = &.{.{
-        .id = "route-workspace",
-        .label = "Route workspace",
-        .path = "/tmp/route-workspace",
-        .threads = &.{identity_drift},
-    }} }));
-    try testing.expectError(error.CommittedWorkspaceIdentityImmutable, client.save(.{ .projects = &.{.{
-        .id = "route-workspace-replaced",
-        .label = "Route workspace",
-        .path = "/tmp/route-workspace",
-        .threads = &.{pinned},
-    }} }));
-    var unlocked = pinned;
-    unlocked.committed = false;
-    try testing.expectError(error.CommittedThreadCannotBecomeDraft, client.save(.{ .projects = &.{.{
-        .id = "route-workspace",
-        .label = "Route workspace",
-        .path = "/tmp/route-workspace",
-        .threads = &.{unlocked},
-    }} }));
 
     {
-        const row = (try client.conn.row(
-            "select title, profile_id, runtime_id, repository_id, repository_cwd " ++
-                "from threads where local_thread_id = 'full-route-thread'",
-            .{},
-        )).?;
-        defer row.deinit();
-        try testing.expectEqualStrings("Pinned route", row.text(0));
-        try testing.expectEqualStrings("remote-box", row.text(1));
-        try testing.expectEqualStrings("0123456789abcdef0123456789abcdef", row.text(2));
-        try testing.expectEqualStrings("repo-api", row.text(3));
-        try testing.expectEqualStrings("services/api", row.text(4));
+        var writer = try testInitMigrated(testing.allocator, pref_path);
+        defer writer.deinit();
+        try testSeedThread(writer.conn, "project-active", "Active Workspace", "/tmp/project-active", "visible-local", "Visible thread");
+        try writer.conn.exec(
+            "insert into threads (workspace_id, sort_index, title, local_thread_id, provider, harness) " ++
+                "select id, 1, 'Companion', 'companion-local', ?1, ?2 from workspaces where workspace_id = 'project-active'",
+            .{ @as(i64, @intFromEnum(db_types.Provider.codex)), @as(i64, @intFromEnum(db_types.Harness.local_cli)) },
+        );
+        try writer.conn.execNoArgs("update workspaces set companion_thread_local_id = 'companion-local' where workspace_id = 'project-active'");
+        try testSeedThread(writer.conn, "project-archived", "Archived Workspace", "/tmp/project-archived", "archived-local", "Archived project thread");
+        try writer.conn.execNoArgs(
+            \\update workspaces set archived = 1 where workspace_id = 'project-archived';
+            \\update threads set archived = 1 where local_thread_id = 'archived-local';
+        );
+        try testSeedMessage(writer.conn, "visible-local", 0, 0, "You", "active");
+        try testSeedMessage(writer.conn, "companion-local", 0, 0, "You", "companion-thread");
+        try testSeedMessage(writer.conn, "archived-local", 0, 0, "You", "archived-project");
     }
 
-    var loaded = (try client.load(testing.allocator)).?;
+    var reader = try Client.initReadOnly(testing.allocator, pref_path);
+    defer reader.deinit();
+    var loaded = (try reader.load(testing.allocator)).?;
     defer loaded.deinit();
-    const loaded_thread = loaded.value.projects[0].threads.?[0];
-    try testing.expectEqualStrings("remote-box", loaded_thread.profile_id.?);
-    try testing.expectEqualStrings("0123456789abcdef0123456789abcdef", loaded_thread.runtime_id.?);
-    try testing.expectEqualStrings("repo-api", loaded_thread.repository_id.?);
-    try testing.expectEqualStrings("services/api", loaded_thread.repository_cwd.?);
+    const projects = loaded.value.projects;
+    try testing.expectEqual(@as(usize, 2), projects.len);
+    try testing.expect(!projects[0].archived);
+    try testing.expectEqual(@as(usize, 2), projects[0].threads.?.len);
+    try testing.expect(!projects[0].threads.?[0].archived);
+    try testing.expectEqualStrings("companion-local", projects[0].companion_thread_local_id.?);
+    try testing.expectEqualStrings("companion-local", projects[0].threads.?[1].local_thread_id.?);
+    try testing.expectEqualStrings("companion-thread", projects[0].threads.?[1].messages[0].body);
+    try testing.expect(projects[1].archived);
+    try testing.expectEqual(@as(usize, 1), projects[1].threads.?.len);
+    try testing.expect(projects[1].threads.?[0].archived);
 }
 
-test "single-thread save pins but never replaces a committed thread route" {
+test "load preserves Herdr workspace links" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
     defer testing.allocator.free(pref_path);
 
-    var client = try Client.init(testing.allocator, pref_path);
-    defer client.deinit();
-    try schema.initializeToVersion(client.conn, 7);
-
-    const initial: PersistedThread = .{
-        .title = "Remote route",
-        .committed = false,
-        .local_thread_id = "focused-route-thread",
-        .profile_id = "remote-box",
-        .repository_id = "repo-api",
-        .repository_cwd = "services/api",
-    };
-    try client.save(.{ .projects = &.{.{
-        .id = "route-workspace",
-        .label = "Route workspace",
-        .path = "/tmp/route-workspace",
-        .threads = &.{initial},
-    }} });
-
-    var pinned = initial;
-    pinned.title = "Pinned route";
-    pinned.committed = true;
-    pinned.runtime_id = "0123456789abcdef0123456789abcdef";
-    try client.saveThread("route-workspace", 0, pinned);
-
-    var repository_drift = pinned;
-    repository_drift.repository_id = "repo-web";
-    try testing.expectError(
-        error.CommittedThreadRouteImmutable,
-        client.saveThread("route-workspace", 0, repository_drift),
-    );
-
-    var cwd_drift = pinned;
-    cwd_drift.repository_cwd = "services/worker";
-    try testing.expectError(
-        error.CommittedThreadRouteImmutable,
-        client.saveThread("route-workspace", 0, cwd_drift),
-    );
-
-    var identity_drift = pinned;
-    identity_drift.local_thread_id = "focused-route-thread-replaced";
-    try testing.expectError(
-        error.CommittedThreadIdentityImmutable,
-        client.saveThread("route-workspace", 0, identity_drift),
-    );
-    var unlocked = pinned;
-    unlocked.committed = false;
-    try testing.expectError(
-        error.CommittedThreadCannotBecomeDraft,
-        client.saveThread("route-workspace", 0, unlocked),
-    );
-
-    const row = (try client.conn.row(
-        "select title, runtime_id, repository_id, repository_cwd " ++
-            "from threads where local_thread_id = 'focused-route-thread'",
-        .{},
-    )).?;
-    defer row.deinit();
-    try testing.expectEqualStrings("Pinned route", row.text(0));
-    try testing.expectEqualStrings("0123456789abcdef0123456789abcdef", row.text(1));
-    try testing.expectEqualStrings("repo-api", row.text(2));
-    try testing.expectEqualStrings("services/api", row.text(3));
-}
-
-test "compatibility saves never normalize a corrupt committed route to local" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
-    defer testing.allocator.free(pref_path);
-
-    var client = try Client.init(testing.allocator, pref_path);
-    defer client.deinit();
-    try schema.initializeToVersion(client.conn, 7);
-    const seed: PersistedThread = .{
-        .title = "Opaque route",
-        .committed = false,
-        .local_thread_id = "opaque-route-thread",
-    };
-    try client.save(.{ .projects = &.{.{
-        .id = "route-workspace",
-        .label = "Route workspace",
-        .path = "/tmp/route-workspace",
-        .threads = &.{seed},
-    }} });
-
-    // Simulate a damaged external writer without asking the production API to
-    // manufacture invalid route state. The seed is still a draft, so the
-    // immutability trigger permits the corruption fixture to be manufactured;
-    // commit it before exercising either compatibility replacement path.
-    try client.conn.execNoArgs(
-        \\update threads set profile_id = 'remote-box', runtime_id = 'bad-runtime',
-        \\    repository_id = null, repository_cwd = null
-        \\where local_thread_id = 'opaque-route-thread';
-        \\update threads set committed = 1 where local_thread_id = 'opaque-route-thread';
-    );
-
-    var legacy = seed;
-    legacy.committed = true;
-
-    try testing.expectError(error.CommittedThreadRouteImmutable, client.save(.{ .projects = &.{.{
-        .id = "route-workspace",
-        .label = "Route workspace",
-        .path = "/tmp/route-workspace",
-        .threads = &.{legacy},
-    }} }));
-    try testing.expectError(
-        error.CommittedThreadRouteImmutable,
-        client.saveThread("route-workspace", 0, legacy),
-    );
-
-    const row = (try client.conn.row(
-        "select profile_id, runtime_id, repository_id from threads " ++
-            "where local_thread_id = 'opaque-route-thread'",
-        .{},
-    )).?;
-    defer row.deinit();
-    try testing.expectEqualStrings("remote-box", row.text(0));
-    try testing.expectEqualStrings("bad-runtime", row.text(1));
-    try testing.expect(row.nullableText(2) == null);
-}
-
-test "compatibility saves quarantine an unaddressable committed remote route" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
-    defer testing.allocator.free(pref_path);
-
-    var client = try Client.init(testing.allocator, pref_path);
-    defer client.deinit();
-    try schema.initializeToVersion(client.conn, 7);
-    const seed: PersistedThread = .{
-        .title = "Opaque route",
-        .committed = false,
-    };
-    try client.save(.{ .projects = &.{.{
-        .id = "route-workspace",
-        .label = "Route workspace",
-        .path = "/tmp/route-workspace",
-        .threads = &.{seed},
-    }} });
-
-    try client.conn.execNoArgs(
-        \\update threads set profile_id = 'remote-box',
-        \\    runtime_id = '0123456789abcdef0123456789abcdef',
-        \\    repository_id = 'repo-api', repository_cwd = 'services/api', committed = 1;
-    );
-    const adoption: PersistedThread = .{
-        .title = "Opaque route",
-        .committed = true,
-        .local_thread_id = "newly-assigned-id",
-        .profile_id = "remote-box",
-        .runtime_id = "0123456789abcdef0123456789abcdef",
-        .repository_id = "repo-api",
-        .repository_cwd = "services/api",
-    };
-    try testing.expectError(error.CommittedThreadIdentityImmutable, client.save(.{ .projects = &.{.{
-        .id = "route-workspace",
-        .label = "Route workspace",
-        .path = "/tmp/route-workspace",
-        .threads = &.{adoption},
-    }} }));
-    try testing.expectError(
-        error.CommittedThreadIdentityImmutable,
-        client.saveThread("route-workspace", 0, adoption),
-    );
-
-    const row = (try client.conn.row(
-        "select local_thread_id, profile_id, runtime_id, repository_id, repository_cwd from threads",
-        .{},
-    )).?;
-    defer row.deinit();
-    try testing.expect(row.nullableText(0) == null);
-    try testing.expectEqualStrings("remote-box", row.text(1));
-    try testing.expectEqualStrings("0123456789abcdef0123456789abcdef", row.text(2));
-    try testing.expectEqualStrings("repo-api", row.text(3));
-    try testing.expectEqualStrings("services/api", row.text(4));
-}
-
-test "compatibility saves reject creation of an unaddressable committed remote route" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
-    defer testing.allocator.free(pref_path);
-
-    var client = try Client.init(testing.allocator, pref_path);
-    defer client.deinit();
-    try schema.initializeToVersion(client.conn, 7);
-    const unaddressable: PersistedThread = .{
-        .title = "Unaddressable route",
-        .committed = true,
-        .profile_id = "remote-box",
-        .runtime_id = "0123456789abcdef0123456789abcdef",
-        .repository_id = "repo-api",
-        .repository_cwd = "services/api",
-    };
-    try testing.expectError(error.InvalidPersistedThreadRoute, client.save(.{ .projects = &.{.{
-        .id = "route-workspace",
-        .label = "Route workspace",
-        .path = "/tmp/route-workspace",
-        .threads = &.{unaddressable},
-    }} }));
-
-    const draft: PersistedThread = .{
-        .title = "Addressed draft",
-        .committed = false,
-        .local_thread_id = "addressed-draft",
-    };
-    try client.save(.{ .projects = &.{.{
-        .id = "route-workspace",
-        .label = "Route workspace",
-        .path = "/tmp/route-workspace",
-        .threads = &.{draft},
-    }} });
-    try testing.expectError(
-        error.InvalidPersistedThreadRoute,
-        client.saveThread("route-workspace", 1, unaddressable),
-    );
-
-    const row = (try client.conn.row("select count(*) from threads", .{})).?;
-    defer row.deinit();
-    try testing.expectEqual(@as(i64, 1), row.int(0));
-}
-
-test "compatibility saves require runtime pin for committed non-local routes" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
-    defer testing.allocator.free(pref_path);
-
-    var client = try Client.init(testing.allocator, pref_path);
-    defer client.deinit();
-    try schema.initializeToVersion(client.conn, 7);
-    const unpinned_remote: PersistedThread = .{
-        .title = "Unpinned remote",
-        .committed = true,
-        .local_thread_id = "unpinned-remote",
-        .profile_id = "remote-box",
-        .repository_id = "repo-api",
-    };
-    try testing.expectError(error.InvalidPersistedThreadRoute, client.save(.{ .projects = &.{.{
-        .id = "route-workspace",
-        .label = "Route workspace",
-        .path = "/tmp/route-workspace",
-        .threads = &.{unpinned_remote},
-    }} }));
-
-    const explicit_local: PersistedThread = .{
-        .title = "Explicit local",
-        .committed = true,
-        .local_thread_id = "explicit-local",
-        .profile_id = LEGACY_LOCAL_PROFILE_ID,
-        .repository_id = LEGACY_PRIMARY_REPOSITORY_ID,
-    };
-    const remote_draft: PersistedThread = .{
-        .title = "Remote draft",
-        .committed = false,
-        .local_thread_id = "remote-draft",
-        .profile_id = "remote-box",
-        .repository_id = "repo-api",
-    };
-    try client.save(.{ .projects = &.{.{
-        .id = "route-workspace",
-        .label = "Route workspace",
-        .path = "/tmp/route-workspace",
-        .threads = &.{ explicit_local, remote_draft },
-    }} });
-
-    var focused_unpinned = remote_draft;
-    focused_unpinned.committed = true;
-    try testing.expectError(
-        error.InvalidPersistedThreadRoute,
-        client.saveThread("route-workspace", 1, focused_unpinned),
-    );
+    const pane_links_json = "[{\"verde_pane_id\":3,\"herdr_pane_id\":\"w1:p1\",\"provider\":\"codex\",\"presentation\":\"gui_chat\"}]";
     {
-        const row = (try client.conn.row(
-            "select committed, runtime_id from threads where local_thread_id = 'remote-draft'",
-            .{},
-        )).?;
-        defer row.deinit();
-        try testing.expectEqual(@as(i64, 0), row.int(0));
-        try testing.expect(row.nullableText(1) == null);
+        var writer = try testInitMigrated(testing.allocator, pref_path);
+        defer writer.deinit();
+        try testSeedWorkspace(writer.conn, "project-herdr", "Herdr Workspace", "/tmp/herdr-shadow");
+        try writer.conn.exec(
+            "update workspaces set herdr_remote_alias = 'zod.example.ts.net', herdr_session_name = 'default', herdr_workspace_id = 'w1', " ++
+                "herdr_local_dir = '/tmp/herdr-shadow', herdr_remote_cwd = '/home/rtg/project', herdr_last_pane_id = 'w1:p1', " ++
+                "herdr_attach_dock_id = 7, herdr_attach_pane_id = 3, herdr_pane_links_json = ?1, herdr_updated_at_ms = 1234 " ++
+                "where workspace_id = 'project-herdr'",
+            .{pane_links_json},
+        );
     }
 
-    // A pre-fix writer could have committed this now-invalid shape. Neither
-    // compatibility transaction may legitimize it by attaching whichever
-    // runtime the profile happens to reach today.
-    try client.conn.execNoArgs(
-        "update threads set committed = 1 where local_thread_id = 'remote-draft'",
-    );
-    var attempted_pin = focused_unpinned;
-    attempted_pin.runtime_id = "0123456789abcdef0123456789abcdef";
-    try testing.expectError(error.CommittedThreadRouteImmutable, client.save(.{ .projects = &.{.{
-        .id = "route-workspace",
-        .label = "Route workspace",
-        .path = "/tmp/route-workspace",
-        .threads = &.{ explicit_local, attempted_pin },
-    }} }));
-    try testing.expectError(
-        error.CommittedThreadRouteImmutable,
-        client.saveThread("route-workspace", 1, attempted_pin),
-    );
-}
-
-test "save clears orphaned threads left behind by manual db edits" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
-    defer testing.allocator.free(pref_path);
-
-    var client = try Client.init(testing.allocator, pref_path);
-    defer client.deinit();
-
-    const initial_state = PersistedState{
-        .selected_project_index = 0,
-        .projects = &.{.{
-            .id = "project-1",
-            .label = "Workspace",
-            .path = "/tmp/project",
-            .selected_thread_index = 0,
-            .threads = &.{.{
-                .title = "Original thread",
-                .committed = true,
-                .provider = .codex,
-                .draft = "",
-                .messages = &.{.{
-                    .role = .user,
-                    .author = "You",
-                    .body = "hello",
-                }},
-            }},
-        }},
-    };
-    try client.save(initial_state);
-
-    try client.conn.execNoArgs(
-        \\pragma foreign_keys = off;
-        \\delete from messages;
-        \\delete from threads;
-        \\delete from app_state;
-        \\delete from workspaces;
-        \\insert into threads (
-        \\    workspace_id,
-        \\    sort_index,
-        \\    title,
-        \\    committed,
-        \\    provider,
-        \\    harness,
-        \\    draft
-        \\) values (
-        \\    1,
-        \\    0,
-        \\    'orphaned thread',
-        \\    1,
-        \\    1,
-        \\    0,
-        \\    ''
-        \\);
-        \\pragma foreign_keys = on;
-    );
-
-    const recovered_state = PersistedState{
-        .selected_project_index = 0,
-        .projects = &.{.{
-            .id = "project-1",
-            .label = "Workspace",
-            .path = "/tmp/project",
-            .selected_thread_index = 0,
-            .threads = &.{.{
-                .title = "Recovered thread",
-                .committed = true,
-                .provider = .codex,
-                .draft = "",
-                .messages = &.{.{
-                    .role = .user,
-                    .author = "You",
-                    .body = "fixed",
-                }},
-            }},
-        }},
-    };
-    try client.save(recovered_state);
-
-    var loaded = try client.load(testing.allocator);
-    defer if (loaded) |*state| state.deinit();
-
-    try testing.expect(loaded != null);
-    try testing.expectEqual(@as(usize, 1), loaded.?.value.projects.len);
-    try testing.expectEqual(@as(usize, 1), loaded.?.value.projects[0].threads.?.len);
-    try testing.expectEqualStrings("Recovered thread", loaded.?.value.projects[0].threads.?[0].title);
-    try testing.expectEqualStrings("fixed", loaded.?.value.projects[0].threads.?[0].messages[0].body);
-}
-
-test "save and load preserve archived projects and threads" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
-    defer testing.allocator.free(pref_path);
-
-    var client = try Client.init(testing.allocator, pref_path);
-    defer client.deinit();
-
-    const archived_state = PersistedState{
-        .selected_project_index = 0,
-        .projects = &.{
-            .{
-                .id = "project-active",
-                .label = "Active Workspace",
-                .path = "/tmp/project-active",
-                .selected_thread_index = 0,
-                .companion_thread_local_id = "companion-local",
-                .threads = &.{
-                    .{
-                        .title = "Visible thread",
-                        .committed = true,
-                        .provider = .codex,
-                        .draft = "",
-                        .messages = &.{.{
-                            .role = .user,
-                            .author = "You",
-                            .body = "active",
-                        }},
-                    },
-                    .{
-                        .title = "Companion",
-                        .committed = true,
-                        .local_thread_id = "companion-local",
-                        .provider = .codex,
-                        .draft = "",
-                        .messages = &.{.{
-                            .role = .user,
-                            .author = "You",
-                            .body = "companion-thread",
-                        }},
-                    },
-                },
-            },
-            .{
-                .id = "project-archived",
-                .label = "Archived Workspace",
-                .path = "/tmp/project-archived",
-                .archived = true,
-                .selected_thread_index = 0,
-                .threads = &.{.{
-                    .title = "Archived project thread",
-                    .archived = true,
-                    .committed = true,
-                    .provider = .opencode,
-                    .draft = "",
-                    .messages = &.{.{
-                        .role = .user,
-                        .author = "You",
-                        .body = "archived-project",
-                    }},
-                }},
-            },
-        },
-    };
-    try client.save(archived_state);
-
-    var loaded = try client.load(testing.allocator);
-    defer if (loaded) |*state| state.deinit();
-
-    try testing.expect(loaded != null);
-    try testing.expectEqual(@as(usize, 2), loaded.?.value.projects.len);
-    try testing.expect(!loaded.?.value.projects[0].archived);
-    try testing.expectEqual(@as(usize, 2), loaded.?.value.projects[0].threads.?.len);
-    try testing.expect(!loaded.?.value.projects[0].threads.?[0].archived);
-    try testing.expectEqualStrings("companion-local", loaded.?.value.projects[0].companion_thread_local_id.?);
-    try testing.expectEqualStrings("companion-local", loaded.?.value.projects[0].threads.?[1].local_thread_id.?);
-    try testing.expect(loaded.?.value.projects[1].archived);
-    try testing.expectEqual(@as(usize, 1), loaded.?.value.projects[1].threads.?.len);
-    try testing.expect(loaded.?.value.projects[1].threads.?[0].archived);
-}
-
-test "save and load preserve Herdr workspace links" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
-    defer testing.allocator.free(pref_path);
-
-    var client = try Client.init(testing.allocator, pref_path);
-    defer client.deinit();
-
-    const state = PersistedState{
-        .selected_project_index = 0,
-        .projects = &.{.{
-            .id = "project-herdr",
-            .label = "Herdr Workspace",
-            .path = "/tmp/herdr-shadow",
-            .herdr_link = .{
-                .remote_alias = "zod.example.ts.net",
-                .session_name = "default",
-                .workspace_id = "w1",
-                .local_dir = "/tmp/herdr-shadow",
-                .remote_cwd = "/home/rtg/project",
-                .last_pane_id = "w1:p1",
-                .attach_dock_id = 7,
-                .attach_pane_id = 3,
-                .pane_links_json = "[{\"verde_pane_id\":3,\"herdr_pane_id\":\"w1:p1\",\"provider\":\"codex\",\"presentation\":\"gui_chat\"}]",
-                .updated_at_ms = 1234,
-            },
-            .threads = &.{.{
-                .title = "New thread",
-                .committed = false,
-                .draft = "",
-            }},
-        }},
-    };
-    try client.save(state);
-
-    var loaded = try client.load(testing.allocator);
-    defer if (loaded) |*value| value.deinit();
-
-    try testing.expect(loaded != null);
-    const link = loaded.?.value.projects[0].herdr_link orelse return error.TestExpectedEqual;
+    var reader = try Client.initReadOnly(testing.allocator, pref_path);
+    defer reader.deinit();
+    var loaded = (try reader.load(testing.allocator)).?;
+    defer loaded.deinit();
+    const link = loaded.value.projects[0].herdr_link orelse return error.TestExpectedEqual;
     try testing.expectEqualStrings("zod.example.ts.net", link.remote_alias);
     try testing.expectEqualStrings("default", link.session_name);
     try testing.expectEqualStrings("w1", link.workspace_id);
@@ -2797,6 +1513,6 @@ test "save and load preserve Herdr workspace links" {
     try testing.expectEqualStrings("w1:p1", link.last_pane_id.?);
     try testing.expectEqual(@as(?u32, 7), link.attach_dock_id);
     try testing.expectEqual(@as(?u32, 3), link.attach_pane_id);
-    try testing.expectEqualStrings("[{\"verde_pane_id\":3,\"herdr_pane_id\":\"w1:p1\",\"provider\":\"codex\",\"presentation\":\"gui_chat\"}]", link.pane_links_json.?);
+    try testing.expectEqualStrings(pane_links_json, link.pane_links_json.?);
     try testing.expectEqual(@as(i64, 1234), link.updated_at_ms);
 }

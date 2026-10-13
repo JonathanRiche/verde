@@ -2031,31 +2031,22 @@ test "projection load uses an independent coherent RO transaction" {
     const pref_path = path_buf[0..path_len];
     const db_path = try std.fs.path.join(std.testing.allocator, &.{ pref_path, db_client.STATE_DB_NAME });
     defer std.testing.allocator.free(db_path);
-    const projects = [_]db_types.PersistedProject{.{
-        .id = "large-state-workspace",
-        .label = "Loaded without daemon JSON",
-        .path = "/tmp/large-state-workspace",
-    }};
-    {
-        var writer = try db_client.Client.init(std.testing.allocator, pref_path);
-        defer writer.deinit();
-        try writer.save(.{ .projects = &projects });
-    }
     {
         var writer = try test_backend.daemon_store.Store.init(std.testing.allocator, db_path);
         defer writer.deinit();
-        const result = try writer.applyMutation(.{
-            .workspace_upsert = .{
-                .mutation = .{
-                    .request_key = "projection-load-revision",
-                    .client_id = "test-client",
-                },
-                .workspace = .{
-                    .workspace_id = "large-state-workspace",
-                    .label = "Loaded without daemon JSON",
-                    .path = "/tmp/large-state-workspace",
-                },
+        // A full snapshot replace writes the app_state row the projection
+        // reader requires; a bare workspace upsert does not.
+        const result = try writer.replaceSnapshot(.{
+            .mutation = .{
+                .request_key = "projection-load-revision",
+                .client_id = "test-client",
+                .expected_store_revision = 0,
             },
+            .snapshot = .{ .workspaces = &.{.{
+                .workspace_id = "large-state-workspace",
+                .label = "Loaded without daemon JSON",
+                .path = "/tmp/large-state-workspace",
+            }} },
         });
         try std.testing.expectEqual(@as(u64, 1), result.store_revision);
     }
@@ -2096,23 +2087,15 @@ test "effective projection store is independent from pref artifacts" {
         .completed_at_ms = 11,
     };
     var surface_revision: u64 = 0;
-    const projects = [_]db_types.PersistedProject{.{
-        .id = "override-workspace",
-        .label = "Override",
-        .path = "/override",
-    }};
-    {
-        var writer = try db_client.Client.init(allocator, store_dir);
-        defer writer.deinit();
-        try writer.save(.{ .projects = &projects });
-    }
     {
         var writer = try test_backend.daemon_store.Store.init(allocator, db_path);
         defer writer.deinit();
-        _ = try writer.applyMutation(.{ .workspace_upsert = .{
-            .mutation = .{ .request_key = "override-workspace", .client_id = "test-client" },
-            .workspace = .{ .workspace_id = "override-workspace", .label = "Override", .path = "/override" },
-        } });
+        // A full snapshot replace writes the app_state row the projection
+        // reader requires; a bare workspace upsert does not.
+        _ = try writer.replaceSnapshot(.{
+            .mutation = .{ .request_key = "override-workspace", .expected_store_revision = 0, .client_id = "test-client" },
+            .snapshot = .{ .workspaces = &.{.{ .workspace_id = "override-workspace", .label = "Override", .path = "/override" }} },
+        });
         const result = try writer.applyMutation(.{ .surface_upsert = .{
             .mutation = .{ .request_key = "override-surface", .expected_store_revision = 1, .client_id = "test-client" },
             .surface = surface,

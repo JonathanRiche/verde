@@ -18,6 +18,7 @@ const process_env = @import("../platform/env.zig");
 const provider_hooks = @import("../providers/hooks.zig");
 const spec = @import("spec.zig");
 const db_client = @import("../db/client.zig");
+const test_backend = if (builtin.is_test) @import("desktop_test_root").test_backend else struct {};
 const db_types = @import("../db/types.zig");
 const daemon_client = @import("../daemon/client.zig");
 const terminal = @import("../terminal/terminal.zig");
@@ -8403,6 +8404,37 @@ const CliTestProcessEnv = struct {
     }
 };
 
+/// Seed a one-workspace projection through the daemon store, the sole
+/// production writer. A full snapshot replace also writes the `app_state` row
+/// that `Client.load` requires; a bare workspace upsert does not.
+fn seedCliTestWorkspace(
+    allocator: std.mem.Allocator,
+    store_dir: []const u8,
+    workspace_id: []const u8,
+    label: []const u8,
+    path: []const u8,
+    terminal_layout_json: []const u8,
+) !void {
+    const db_path = try db_client.Client.pathForPrefPath(allocator, store_dir);
+    defer allocator.free(db_path);
+    var store = try test_backend.daemon_store.Store.init(allocator, db_path);
+    defer store.deinit();
+    const write = try store.replaceSnapshot(.{
+        .mutation = .{
+            .request_key = workspace_id,
+            .client_id = "cli-test",
+            .expected_store_revision = 0,
+        },
+        .snapshot = .{ .workspaces = &.{.{
+            .workspace_id = workspace_id,
+            .label = label,
+            .path = path,
+            .terminal_layout_json = terminal_layout_json,
+        }} },
+    });
+    try std.testing.expect(write.applied);
+}
+
 test "CLI production state readers honor session daemon store override" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -8416,30 +8448,12 @@ test "CLI production state readers honor session daemon store override" {
     const override_dir = try std.fs.path.join(allocator, &.{ root_buf[0..root_len], "override" });
     defer allocator.free(override_dir);
 
-    {
-        var writer = try db_client.Client.init(allocator, pref_dir);
-        defer writer.deinit();
-        try writer.save(.{ .projects = &.{.{
-            .id = "fallback-workspace",
-            .label = "Fallback",
-            .path = "/fallback",
-            .terminal_layout_json =
-            \\{"tabs":[{"title":"Fallback","nodes":[{"kind":"leaf","pane_id":42,"session_id":"fallback-session"}]}]}
-            ,
-        }} });
-    }
-    {
-        var writer = try db_client.Client.init(allocator, override_dir);
-        defer writer.deinit();
-        try writer.save(.{ .projects = &.{.{
-            .id = "override-workspace",
-            .label = "Override",
-            .path = "/override",
-            .terminal_layout_json =
-            \\{"tabs":[{"title":"Override","nodes":[{"kind":"leaf","pane_id":42,"session_id":"override-session"}]}]}
-            ,
-        }} });
-    }
+    try seedCliTestWorkspace(allocator, pref_dir, "fallback-workspace", "Fallback", "/fallback",
+        \\{"tabs":[{"title":"Fallback","nodes":[{"kind":"leaf","pane_id":42,"session_id":"fallback-session"}]}]}
+    );
+    try seedCliTestWorkspace(allocator, override_dir, "override-workspace", "Override", "/override",
+        \\{"tabs":[{"title":"Override","nodes":[{"kind":"leaf","pane_id":42,"session_id":"override-session"}]}]}
+    );
 
     const env_name = daemon_client.SESSION_DAEMON_STORE_DIR_ENV_NAME;
     // The configured Zig test runner is serial; still restore the process-wide
