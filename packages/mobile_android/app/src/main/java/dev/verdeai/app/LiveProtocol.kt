@@ -20,7 +20,10 @@ internal sealed interface LiveEvent {
     /** PCM16 mono at [LiveProtocol.outputRate]. */
     class Audio(val pcm: ByteArray) : LiveEvent
     data class AssistantText(val delta: String) : LiveEvent
+    /** The user's finished utterance. */
     data class UserText(val text: String) : LiveEvent
+    /** The user's utterance so far: [cumulative] replaces the open line (xAI), otherwise it appends (deltas). */
+    data class UserPartial(val text: String, val cumulative: Boolean) : LiveEvent
     /** The user started talking: stop playback now (barge-in). */
     data object Interrupted : LiveEvent
     data object TurnDone : LiveEvent
@@ -105,6 +108,8 @@ internal class OpenAiRealtime(private val ga: Boolean) : LiveProtocol {
                     put("input_audio_format", "pcm16")
                     put("output_audio_format", "pcm16")
                     putJsonObject("turn_detection") { put("type", "server_vad") }
+                    // xAI: the user's words come back as cumulative `input_audio_transcription.updated` events.
+                    putJsonObject("audio") { putJsonObject("input") { putJsonObject("transcription") { put("model", "grok-transcribe") } } }
                 }
                 put("tools", tools)
             }
@@ -123,6 +128,9 @@ internal class OpenAiRealtime(private val ga: Boolean) : LiveProtocol {
                 message["delta"].str()?.let(::unb64)?.let { LiveEvent.Audio(it) } ?: LiveEvent.Ignored(type)
             "response.output_audio_transcript.delta", "response.audio_transcript.delta" -> LiveEvent.AssistantText(message["delta"].str().orEmpty())
             "conversation.item.input_audio_transcription.completed" -> LiveEvent.UserText(message["transcript"].str().orEmpty())
+            "conversation.item.input_audio_transcription.updated" ->
+                LiveEvent.UserPartial((message["transcript"] ?: message["text"]).str().orEmpty(), cumulative = true)
+            "conversation.item.input_audio_transcription.delta" -> LiveEvent.UserPartial(message["delta"].str().orEmpty(), cumulative = false)
             "input_audio_buffer.speech_started" -> LiveEvent.Interrupted
             "response.done" -> LiveEvent.TurnDone
             "response.function_call_arguments.done" -> LiveEvent.ToolCall(message["call_id"].str().orEmpty(),
@@ -196,7 +204,8 @@ internal class GeminiLive : LiveProtocol {
         if (message.containsKey("setupComplete")) out += LiveEvent.Ready
         message.obj("serverContent")?.let { content ->
             if ((content["interrupted"] as? JsonPrimitive)?.booleanOrNull == true) out += LiveEvent.Interrupted
-            content.obj("inputTranscription")?.get("text").str()?.takeIf { it.isNotBlank() }?.let { out += LiveEvent.UserText(it) }
+            // Gemini streams the user's words in pieces; the line closes when the model answers.
+            content.obj("inputTranscription")?.get("text").str()?.takeIf { it.isNotEmpty() }?.let { out += LiveEvent.UserPartial(it, cumulative = false) }
             content.obj("outputTranscription")?.get("text").str()?.let { out += LiveEvent.AssistantText(it) }
             (content.obj("modelTurn")?.get("parts") as? JsonArray)?.forEach { part ->
                 (part as? JsonObject)?.obj("inlineData")?.get("data").str()?.let(::unb64)?.let { out += LiveEvent.Audio(it) }

@@ -85,6 +85,23 @@ class LiveVoiceTest {
         assertEquals(LiveEvent.Ignored("unreadable"), proto.parse("not json").single())
     }
 
+    @Test fun xaiEnablesGrokTranscriptionAndCumulativeUserTranscripts() {
+        val s = obj(liveProtocol(session("xai", "openai_realtime"))!!.setup(session("xai", "openai_realtime")).single()).o("session")
+        assertEquals("grok-transcribe", s.o("audio").o("input").o("transcription").s("model"))
+        assertEquals("pcm16", s.s("input_audio_format"))
+        val proto = OpenAiRealtime(ga = false)
+        assertEquals(LiveEvent.UserPartial("start the dev", cumulative = true),
+            proto.parse("""{"type":"conversation.item.input_audio_transcription.updated","item_id":"i1","transcript":"start the dev"}""").single())
+        assertEquals(LiveEvent.UserPartial("start", cumulative = false),
+            proto.parse("""{"type":"conversation.item.input_audio_transcription.delta","delta":"start"}""").single())
+        var c = liveCaptions(emptyList(), LiveEvent.UserPartial("start", cumulative = true))
+        c = liveCaptions(c, LiveEvent.UserPartial("start the dev servers", cumulative = true))
+        assertEquals(listOf(LiveCaption(true, "start the dev servers", open = true)), c)
+        c = liveCaptions(c, LiveEvent.UserText("Start the dev servers."))
+        assertEquals(listOf(LiveCaption(true, "Start the dev servers.")), c)
+        assertEquals(listOf(LiveEvent.UserPartial("hel", cumulative = false)), GeminiLive().parse("""{"serverContent":{"inputTranscription":{"text":"hel"}}}"""))
+    }
+
     // ---- Gemini Live protocol ----
 
     @Test fun geminiSetupAudioAndToolResponses() {
@@ -191,5 +208,50 @@ class LiveVoiceTest {
         repeat(20) { c = liveCaptions(c, LiveEvent.UserText("u$it")) }
         assertEquals(LIVE_CAPTIONS, c.size)
         assertEquals("Add an API key for live voice in companion settings.", liveError("voice_not_configured"))
+    }
+
+    // ---- Saved transcript ----
+
+    private fun record() = LiveTranscript(sessionId = "s1", assistantAuthor = liveAssistantAuthor("Moss"))
+
+    @Test fun transcriptMergesStreamingIntoOneLinePerUtteranceAndReply() {
+        val t = record()
+        t.header("Live voice", 0)
+        t.userPartial("check", cumulative = true, now = 1)
+        t.userPartial("check the CI", cumulative = true, now = 2)
+        t.userFinal("Check the CI.", now = 3)
+        t.assistantDelta("On ", 4)
+        t.assistantDelta("it.", 5)
+        assertEquals(listOf("0", "1"), t.pending(final = false).map { it.key })
+        t.system("\u2192 Asked Moss: check CI", 6)
+        t.assistantDone()
+        t.userPartial("and ", cumulative = false, now = 7)
+        t.userPartial("deploy", cumulative = false, now = 8)
+        val lines = t.pending(final = false)
+        assertEquals(listOf("Live voice", "Check the CI.", "On it.", "\u2192 Asked Moss: check CI"), lines.map { it.body })
+        assertEquals(listOf("system", "user", "assistant", "system"), lines.map { it.role })
+        assertEquals(listOf(LIVE_SYSTEM_AUTHOR, LIVE_USER_AUTHOR, "Moss (voice)", LIVE_SYSTEM_AUTHOR), lines.map { it.author })
+        // Saved lines are never sent again; the open utterance follows once it ends.
+        t.markSaved(lines.size)
+        assertTrue(t.pending(final = false).isEmpty())
+        assertEquals(listOf("and deploy"), t.pending(final = true).map { it.body })
+        assertTrue(isVoiceAuthor("Moss (voice)") && isVoiceAuthor("Live") && !isVoiceAuthor("Moss"))
+    }
+
+    @Test fun lateFinalTranscriptReplacesTheStreamedLineAndEmptySessionsSaveNothing() {
+        val t = record()
+        t.header("Live voice", 0)
+        t.system("\u2713 Approved Fix CI", 1)
+        assertTrue(t.pending(final = true).isEmpty())
+        t.userPartial("deploy stag", cumulative = false, now = 2)
+        t.assistantDelta("Deploying.", 3)
+        t.userFinal("Deploy staging.", now = 4)
+        t.turnDone()
+        assertEquals(listOf("Live voice", "\u2713 Approved Fix CI", "Deploy staging.", "Deploying."), t.pending(final = false).map { it.body })
+        val blank = listOf(LiveLine("9", "user", LIVE_USER_AUTHOR, "  ", 1, open = false), LiveLine("10", "assistant", "Moss (voice)", "Hi", 2, open = false))
+        val wire = transcriptMessages(blank)
+        assertEquals(listOf("10"), wire.map { it.key })
+        assertEquals(2L, wire.single().created_at_ms)
+        assertEquals(listOf(200, 200, 50), saveBatches(List(450) { LiveLine("$it", "user", "", "x", 0, false) }).map { it.size })
     }
 }

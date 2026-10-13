@@ -46,7 +46,19 @@ internal const val LIVE_SILENCE_MS = 120_000L
 /** Captions after one provider event (pure, unit tested): assistant deltas grow one open caption. */
 internal fun liveCaptions(captions: List<LiveCaption>, event: LiveEvent): List<LiveCaption> {
     val next = when (event) {
-        is LiveEvent.UserText -> if (event.text.isBlank()) captions else captions.map { it.copy(open = false) } + LiveCaption(true, event.text.trim())
+        is LiveEvent.UserText -> {
+            val open = captions.indexOfLast { it.user && it.open }
+            when {
+                open >= 0 -> captions.mapIndexed { i, c -> if (i == open) c.copy(text = event.text.trim().ifEmpty { c.text }, open = false) else c }
+                event.text.isBlank() -> captions
+                else -> captions + LiveCaption(true, event.text.trim())
+            }
+        }
+        is LiveEvent.UserPartial -> {
+            val open = captions.indexOfLast { it.user && it.open }
+            if (open >= 0) captions.mapIndexed { i, c -> if (i == open) c.copy(text = if (event.cumulative) event.text else c.text + event.text) else c }
+            else if (event.text.isBlank()) captions else captions + LiveCaption(true, event.text.trimStart(), open = true)
+        }
         is LiveEvent.AssistantText -> {
             val last = captions.lastOrNull()
             if (last != null && !last.user && last.open) captions.dropLast(1) + last.copy(text = last.text + event.delta)
@@ -116,8 +128,18 @@ internal class LiveVoice(
     private var protocol: LiveProtocol? = null
     private var mic: LiveMic? = null
     @Volatile private var lastActivity = 0L
+    private var transcript: LiveTranscript? = null
+    /** Ended sessions with lines not yet stored (offline, host gone); retried when the host is ready. */
+    private val unsaved = ArrayList<LiveTranscript>()
+    private val saveLock = kotlinx.coroutines.sync.Mutex()
 
     init {
+        // Saved transcripts that failed (offline, background) go out once the host is ready again.
+        viewModelScope.launch {
+            browse.map { it.host?.phase == "ready" && it.networkAvailable }.distinctUntilChanged().collect { ready ->
+                if (ready && unsaved.isNotEmpty()) flushUnsaved()
+            }
+        }
         viewModelScope.launch {
             browse.map { it.hostId }.distinctUntilChanged().collectLatest { id ->
                 stop()
@@ -168,17 +190,34 @@ internal class LiveVoice(
     fun start() {
         if (ui.value.active) return
         mutableUi.value = LiveUi(phase = LivePhase.Connecting)
+        val name = companion.state.value.active?.name.orEmpty()
+        val record = LiveTranscript(assistantAuthor = liveAssistantAuthor(name))
+        transcript = record
         job = viewModelScope.launch {
+            // Long sessions save as they go; every ending (End, background, silence, error) saves the rest.
+            val ticker = launch { while (isActive) { delay(LIVE_SAVE_INTERVAL_MS); saveActive() } }
+            try { converseLoop(record) } finally {
+                ticker.cancel()
+                finishTranscript(record)
+            }
+        }
+    }
+
+    private suspend fun converseLoop(record: LiveTranscript) {
+        run {
             var attempts = 0
-            while (isActive) {
-                val session = createSession() ?: return@launch
-                val proto = liveProtocol(session) ?: return@launch fail("protocol")
+            while (currentCoroutineContext().isActive) {
+                val session = createSession() ?: return
+                val proto = liveProtocol(session) ?: return fail("protocol")
                 mutableUi.update { it.copy(provider = session.provider, voice = session.voice) }
+                val now = System.currentTimeMillis()
+                record.header("\uD83C\uDF99 Live voice \u00b7 ${providerLabel(session.provider)} \u00b7 " +
+                    java.text.DateFormat.getTimeInstance(java.text.DateFormat.SHORT).format(java.util.Date(now)), now)
                 when (converse(session, proto)) {
-                    Ending.Stopped -> { mutableUi.value = LiveUi(); return@launch }
-                    Ending.Failed -> return@launch
+                    Ending.Stopped -> { mutableUi.value = LiveUi(); return }
+                    Ending.Failed -> return
                     Ending.Reconnect -> {
-                        if (++attempts > MAX_RECONNECTS) return@launch fail("dropped")
+                        if (++attempts > MAX_RECONNECTS) return fail("dropped")
                         mutableUi.update { it.copy(phase = LivePhase.Reconnecting) }
                         delay(500L * attempts)
                     }
@@ -186,6 +225,58 @@ internal class LiveVoice(
             }
         }
     }
+
+    // ---- Saving the conversation as text ----
+
+
+    /** The companion thread transcripts are saved to. */
+    private fun saveTarget(): Pair<String, String>? = companion.state.value.active
+        ?.takeIf { it.thread_id.isNotEmpty() && it.home_workspace_id.isNotEmpty() }?.let { it.home_workspace_id to it.thread_id }
+
+    /** A companion turn is streaming in that thread: periodic saves wait so lines don't land mid-reply. */
+    private fun companionTurnRunning(target: Pair<String, String>): Boolean {
+        if (companionTranscript?.state?.value?.turn != null) return true
+        val thread = browse.value.workspaces?.items?.find { it.workspace_id == target.first }?.threads?.find { it.thread_id == target.second }
+        return thread != null && activeTurn(thread.status)
+    }
+
+    private suspend fun saveActive() {
+        val record = transcript ?: return
+        val target = saveTarget() ?: return
+        if (companionTurnRunning(target)) return
+        saveLock.withLockSafe { save(record, target, final = false) }
+    }
+
+    private fun finishTranscript(record: LiveTranscript) {
+        if (transcript === record) transcript = null
+        if (record.pending(final = true).isEmpty()) return
+        unsaved += record
+        viewModelScope.launch { flushUnsaved() }
+    }
+
+    /** Saves every ended session's remaining lines; anything that fails stays queued for the next try. */
+    private suspend fun flushUnsaved() = saveLock.withLockSafe {
+        val target = saveTarget() ?: return@withLockSafe
+        val done = unsaved.filter { save(it, target, final = true) }
+        unsaved.removeAll(done.toSet())
+    }
+
+    /** Sends the record's pending lines in batches; true when nothing is left to save. */
+    private suspend fun save(record: LiveTranscript, target: Pair<String, String>, final: Boolean): Boolean {
+        for (batch in saveBatches(record.pending(final))) {
+            val messages = transcriptMessages(batch)
+            if (messages.isEmpty()) { record.markSaved(batch.size); continue }
+            val sent = dispatch { n, w, id -> EventCompanionTranscriptSave(now_ms = n, wall_time_ms = w, intent_id = id,
+                workspace_id = target.first, thread_id = target.second, session_id = record.sessionId, messages = messages) } ?: return false
+            val op = withTimeoutOrNull(SAVE_WAIT_MS) { awaitOperation(sent.first, sent.second) }
+            if (op?.state != "succeeded") return false
+            record.markSaved(batch.size)
+        }
+        return record.pending(final).isEmpty()
+    }
+
+    private suspend inline fun <T> kotlinx.coroutines.sync.Mutex.withLockSafe(block: () -> T): T? =
+        if (tryLock()) try { block() } finally { unlock() } else null
 
     /** Ends Live now; cancelling the conversation releases the socket, mic, speaker and audio route. */
     fun stop() {
@@ -270,9 +361,26 @@ internal class LiveVoice(
                 is Signal.Text -> for (event in proto.parse(signal.text)) when (event) {
                     LiveEvent.Ready -> goLive()
                     is LiveEvent.Audio -> { speaker.play(event.pcm); lastActivity = System.currentTimeMillis() }
-                    is LiveEvent.AssistantText, LiveEvent.TurnDone -> mutableUi.update { it.copy(captions = liveCaptions(it.captions, event)) }
-                    is LiveEvent.UserText -> { lastActivity = System.currentTimeMillis(); mutableUi.update { it.copy(captions = liveCaptions(it.captions, event)) } }
+                    is LiveEvent.AssistantText -> {
+                        transcript?.assistantDelta(event.delta, System.currentTimeMillis())
+                        mutableUi.update { it.copy(captions = liveCaptions(it.captions, event)) }
+                    }
+                    LiveEvent.TurnDone -> {
+                        transcript?.turnDone()
+                        mutableUi.update { it.copy(captions = liveCaptions(it.captions, event)) }
+                    }
+                    is LiveEvent.UserText -> {
+                        lastActivity = System.currentTimeMillis()
+                        transcript?.userFinal(event.text, lastActivity)
+                        mutableUi.update { it.copy(captions = liveCaptions(it.captions, event)) }
+                    }
+                    is LiveEvent.UserPartial -> {
+                        lastActivity = System.currentTimeMillis()
+                        transcript?.userPartial(event.text, event.cumulative, lastActivity)
+                        mutableUi.update { it.copy(captions = liveCaptions(it.captions, event)) }
+                    }
                     LiveEvent.Interrupted -> {
+                        transcript?.assistantDone()
                         speaker.flush()
                         lastActivity = System.currentTimeMillis()
                         mutableUi.update { it.copy(captions = liveCaptions(it.captions, event)) }
@@ -333,6 +441,8 @@ internal class LiveVoice(
             return buildJsonObject { put("accepted", false); put("error", "companion_not_ready") }
         }
         val before = model.state.value.thread?.rows.orEmpty().map { it.id }.toSet()
+        val name = companion.state.value.active?.name?.ifBlank { null } ?: "Companion"
+        transcript?.system("\u2192 Asked $name: ${request.trim()}", System.currentTimeMillis())
         model.composer.sendSpoken(request)
         viewModelScope.launch {
             var started = false
@@ -343,7 +453,10 @@ internal class LiveVoice(
                 }
             } ?: return@launch
             val reply = finished.thread?.rows.orEmpty().lastOrNull { it.id !in before && it.role == "assistant" && it.kind == "message" }?.body
-            if (!reply.isNullOrBlank() && ui.value.phase == LivePhase.Live) inject(companionUpdate(reply))
+            if (!reply.isNullOrBlank() && ui.value.phase == LivePhase.Live) {
+                transcript?.system("\u2190 $name replied", System.currentTimeMillis())
+                inject(companionUpdate(reply))
+            }
         }
         return buildJsonObject { put("accepted", true) }
     }
@@ -372,7 +485,10 @@ internal class LiveVoice(
         return buildJsonObject {
             put("chat", target.title)
             when {
-                op?.state == "succeeded" -> { put("ok", true); put("decision", if (approve) "approved" else "denied") }
+                op?.state == "succeeded" -> {
+                    put("ok", true); put("decision", if (approve) "approved" else "denied")
+                    transcript?.system((if (approve) "\u2713 Approved " else "\u2717 Denied ") + target.title, System.currentTimeMillis())
+                }
                 staleApprovalError(op?.error) -> put("error", "already_answered")
                 else -> put("error", "failed")
             }
@@ -390,6 +506,7 @@ internal class LiveVoice(
         const val SESSION_WAIT_MS = 50_000L
         const val APPROVAL_WAIT_MS = 15_000L
         const val ASK_WAIT_MS = 30 * 60_000L
+        const val SAVE_WAIT_MS = 60_000L
         /** Mic level that counts as the user talking for the silence timeout. */
         const val SPEECH_LEVEL = .08f
     }

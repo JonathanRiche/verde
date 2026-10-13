@@ -12,6 +12,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -28,12 +29,28 @@ internal val CompactTranscriptRenderers = TranscriptRenderers.Default.copy(
     tool = { item, _ -> CompactToolRow(item.row) },
     toolGroup = { item, ctx -> CompactToolGroupRow(item, ctx) },
     working = { item, ctx -> CompactWorkingRow(item, ctx) },
+    notice = { item, ctx -> if (isVoiceAuthor(item.row.author)) VoiceLine(item.row) else NoticeRow(item.row, ctx) },
 )
+
+/** A saved live-voice line: a small mic, then the words; hand-off notes are muted. */
+@Composable
+private fun VoiceLine(row: ChatRow) {
+    val user = row.role == "user"
+    val system = row.role == "system"
+    Row(Modifier.fillMaxWidth().padding(horizontal = 2.dp, vertical = 2.dp), verticalAlignment = Alignment.Top,
+        horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        Icon(painterResource(R.drawable.ic_mic), contentDescription = if (user) "You said" else if (system) "Live voice" else "${row.author} said",
+            tint = if (user) VerdeColors.Subtle else VerdeColors.Accent, modifier = Modifier.padding(top = 2.dp).size(12.dp))
+        Text(row.body, Modifier.weight(1f), style = if (system) MaterialTheme.typography.labelSmall else MaterialTheme.typography.bodySmall,
+            color = when { system -> VerdeColors.Subtle; user -> VerdeColors.Muted; else -> VerdeColors.Text })
+    }
+}
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun CompactMessageRow(row: ChatRow, ctx: TranscriptContext) {
     // Attachments and parent-agent steers keep the full renderer (rare in the companion chat).
+    if (isVoiceAuthor(row.author)) return VoiceLine(row)
     if (row.attachments.isNotEmpty() || parentSteerBody(row.role, row.body) != null) return MessageRow(row, ctx)
     @Suppress("DEPRECATION") val clipboard = LocalClipboardManager.current
     var menu by remember { mutableStateOf(false) }
