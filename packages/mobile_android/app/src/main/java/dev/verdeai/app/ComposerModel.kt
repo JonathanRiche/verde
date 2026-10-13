@@ -151,6 +151,13 @@ internal class ComposerModel(
     var focusRequest by mutableStateOf(0)
         private set
     var imagePreviews by mutableStateOf<Map<String, ByteArray>>(emptyMap())
+    /** Bytes of images just sent, so their pending rows show them before the host's copy is fetched. */
+    private val sentPreviews = object : LinkedHashMap<String, ByteArray>(16, .75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ByteArray>?) = size > MAX_SENT_PREVIEWS
+    }
+
+    /** Local bytes for an attachment this phone attached (draft or just sent), if it still has them. */
+    fun previewFor(localId: String): ByteArray? = imagePreviews[localId] ?: sentPreviews[localId]
         private set
     var field by mutableStateOf(TextFieldValue(""))
         private set
@@ -372,6 +379,7 @@ internal class ComposerModel(
 
     private fun submitDraft(voice: Boolean) = action {
         saveJob?.cancel()
+        sentPreviews.putAll(imagePreviews)
         if (!flush()) return@action
         val composer = chat.latestComposer() ?: return@action
         val text = composer.draft.text
@@ -541,6 +549,7 @@ internal class ComposerModel(
         const val ASK_WAIT_MS = 15_000L
         const val OUTCOME_WAIT_MS = 30_000L
         const val MAX_IMAGES = 4
+        const val MAX_SENT_PREVIEWS = 8
         /** Per image after re-encoding; the core also enforces the daemon's own attachment limit. */
         const val MAX_IMAGE_BYTES = 160 * 1024
         /** Base64 in the core's 512 KiB draft record, with room for the text. */

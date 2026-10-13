@@ -232,6 +232,9 @@ internal class TranscriptModel(
         }
     }
 
+    /** Image previews for this chat's attachments (fetched through the core, cached on disk). */
+    internal val images by lazy { AttachmentImages(scope, { core }, { browse.value.hostId }) }
+
     // ---- D-08 composer hooks ----
 
     /** The composer in the transcript's bottom bar; shares this model's scope, core and lifetime. */

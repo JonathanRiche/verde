@@ -351,7 +351,7 @@ internal fun MessageRow(row: ChatRow, ctx: TranscriptContext) {
                     Text(it, style = MaterialTheme.typography.labelSmall, color = if (row.delivery == "failed") colors.error else colors.outline)
                 }
             }
-            if (row.attachments.isNotEmpty()) Attachments(row.attachments)
+            if (row.attachments.isNotEmpty()) AttachmentStrip(row, ctx)
             if (body.isNotEmpty()) {
                 // User text is shown verbatim (web parity); assistant output goes through the core AST.
                 if (mine) Text(body, style = MaterialTheme.typography.bodyLarge)
@@ -376,21 +376,6 @@ internal fun streamTail(row: ChatRow, max: Int = 16_000): String {
     if (row.delivery != "streaming" || row.body.length <= max) return row.body
     val cut = row.body.indexOf('\n', row.body.length - max)
     return if (cut >= 0) row.body.substring(cut + 1) else row.body.takeLast(max)
-}
-
-@Composable
-private fun Attachments(attachments: List<ChatAttachment>) {
-    Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-        attachments.forEach { a ->
-            // This projection has metadata only; do not advertise a nonfunctional tap action.
-            Surface(color = VerdeColors.PanelAlt, shape = RoundedCornerShape(7.dp)) {
-                Column(Modifier.padding(8.dp)) {
-                    Text((if (a.mime.startsWith("image/")) "Image · " else "") + basename(a.name), style = MaterialTheme.typography.labelMedium)
-                    Text("Preview unavailable", style = MaterialTheme.typography.labelSmall, color = VerdeColors.Subtle)
-                }
-            }
-        }
-    }
 }
 
 @Composable
