@@ -1530,6 +1530,8 @@ const PtySession = struct {
     registry_workspace_id: ?[]u8 = null,
     /// Prevent duplicate terminal outcomes when kill, polling, and cleanup overlap.
     registry_finished: bool = false,
+    /// The exit was journaled once, so polling does not re-publish it every tick.
+    exit_published: bool = false,
     /// Optional registered daemon client that owns this session for retention
     /// and client-scoped stop. The desktop omits this field.
     owner_client_id: ?[]u8 = null,
@@ -2591,6 +2593,10 @@ pub const Daemon = struct {
         for (self.sessions.items) |session| {
             session.poll(self.allocator) catch {};
             if (!session.running) {
+                if (!session.exit_published) {
+                    session.exit_published = true;
+                    self.publishSessionChange(session);
+                }
                 if (isManagedSessionId(session.session_id))
                     self.noteManagedSessionExit(session, now)
                 else
@@ -2882,7 +2888,21 @@ pub const Daemon = struct {
 
     fn removeAt(self: *Daemon, index: usize) void {
         const session = self.sessions.orderedRemove(index);
+        self.publishSessionChange(session);
         session.deinit(self.allocator);
+    }
+
+    /// Journal a `session.list` change so `core.changes` clients (phone, web)
+    /// re-read the sessions scope; otherwise a new or exited terminal only
+    /// appears after a full resnapshot. Caller holds lockDaemon.
+    fn publishSessionChange(self: *Daemon, session: *PtySession) void {
+        const workspace_id: ?[]const u8 = if (session.registry_workspace_id) |id|
+            id
+        else if (session.project_id.len > 0)
+            session.project_id
+        else
+            null;
+        self.bumpRegistryRevision(.{ .topic = .session, .resource_id = session.session_id, .workspace_id = workspace_id });
     }
 
     fn handleRequest(self: *Daemon, request_json: []const u8) ![]u8 {
@@ -6741,6 +6761,7 @@ pub const Daemon = struct {
         });
         errdefer session.deinit(self.allocator);
         try self.sessions.append(self.allocator, session);
+        self.publishSessionChange(session);
         const command_line = std.mem.join(self.allocator, " ", command) catch |err| {
             log.warn("registry command join failed id_len={d} err={s}", .{ session.session_id.len, @errorName(err) });
             return try okSessionResponse(self.allocator, id_value, session, true);
@@ -10360,6 +10381,7 @@ fn journalTopicFromBumpTopic(topic: process_registry.BumpTopic) ?change_journal.
         .lease => .lease,
         .notification => .notification,
         .chat_turn => .chat_turn,
+        .session => .session,
     };
 }
 
@@ -12417,8 +12439,9 @@ test "registry bump topics map onto the frozen journal topic set" {
     try std.testing.expectEqual(change_journal.Topic.lease, journalTopicFromBumpTopic(.lease).?);
     try std.testing.expectEqual(change_journal.Topic.notification, journalTopicFromBumpTopic(.notification).?);
     try std.testing.expectEqual(change_journal.Topic.chat_turn, journalTopicFromBumpTopic(.chat_turn).?);
+    try std.testing.expectEqual(change_journal.Topic.session, journalTopicFromBumpTopic(.session).?);
     // Every mapped topic accepts the registry revision family (Q10).
-    inline for (.{ change_journal.Topic.workspace, change_journal.Topic.process, change_journal.Topic.lease, change_journal.Topic.notification, change_journal.Topic.chat_turn }) |topic| {
+    inline for (.{ change_journal.Topic.workspace, change_journal.Topic.process, change_journal.Topic.lease, change_journal.Topic.notification, change_journal.Topic.chat_turn, change_journal.Topic.session }) |topic| {
         try std.testing.expect(change_journal.revisionPolicy(topic) != .store_only);
     }
 }

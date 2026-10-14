@@ -980,6 +980,8 @@ pub const BumpTopic = enum {
     lease,
     notification,
     chat_turn,
+    /// Daemon PTY session created, exited, or removed (`session.list` rows).
+    session,
 };
 
 /// Identity of the state that a revision bump invalidated. `resource_id` is
