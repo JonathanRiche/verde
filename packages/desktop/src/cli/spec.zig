@@ -343,6 +343,7 @@ pub const all_flags = [_][]const u8{
     "--herdr-workspace",
     "--project",
     "--thread",
+    "--parent-thread-id",
     "--pane",
     "--focused",
     "--no-focus",
@@ -450,6 +451,7 @@ pub const chat_open_flags = [_][]const u8{
     "--pane",
     "--axis",
     "--no-focus",
+    "--parent-thread-id",
     "--json",
 };
 pub const chat_draft_flags = [_][]const u8{ "--workspace", "--pane", "--focused", "--thread", "--text", "--json" };

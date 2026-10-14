@@ -1614,7 +1614,7 @@ fn liveFlagAllowed(argv: []const []const u8, flag: []const u8) bool {
         return false;
     }
     if (std.mem.eql(u8, command, "chat")) {
-        if (std.mem.eql(u8, subcommand, "open")) return flagIn(flag, &.{ "--workspace", "--project", "--provider", "--model", "--reasoning", "--reasoning-variant", "--fast", "--no-fast", "--pane", "--axis", "--no-focus" });
+        if (std.mem.eql(u8, subcommand, "open")) return flagIn(flag, &.{ "--workspace", "--project", "--provider", "--model", "--reasoning", "--reasoning-variant", "--fast", "--no-fast", "--pane", "--axis", "--no-focus", "--parent-thread-id" });
         if (std.mem.eql(u8, subcommand, "draft")) {
             if (std.mem.eql(u8, draft_command, "get")) return flagIn(flag, &.{ "--workspace", "--project", "--pane", "--focused", "--thread" });
             if (std.mem.eql(u8, draft_command, "set") or std.mem.eql(u8, draft_command, "append")) return flagIn(flag, &.{ "--workspace", "--project", "--pane", "--focused", "--thread", "--text" });
@@ -2759,7 +2759,7 @@ fn handleLiveChat(allocator: std.mem.Allocator, out: output.Output, io: std.Io, 
             }
             std.process.exit(2);
         };
-        try sendLiveRequest(allocator, out, io, "chat.open", .{
+        const open_params = .{
             .workspace_id = workspace_id,
             .provider = provider,
             .model = args.optionValue(argv, "--model"),
@@ -2769,7 +2769,26 @@ fn handleLiveChat(allocator: std.mem.Allocator, out: output.Output, io: std.Io, 
             .target_pane_id = target_pane_id,
             .axis = args.optionValue(argv, "--axis") orelse "horizontal",
             .focus = !args.hasFlag(argv, "--no-focus"),
-        }, json);
+        };
+        // A parent (e.g. a Companion delegating from its own chat) links the
+        // new chat into that parent's crew, exactly like MCP open_chat does.
+        const parent_thread_id = args.optionValue(argv, "--parent-thread-id");
+        if (parent_thread_id == null) {
+            try sendLiveRequest(allocator, out, io, "chat.open", open_params, json);
+            return;
+        }
+        const response = sendLiveRequestAlloc(allocator, io, "chat.open", open_params, 1) catch |err| {
+            liveUnavailable(out, err);
+        };
+        defer allocator.free(response);
+        mcpLinkOpenedChat(allocator, io, response, parent_thread_id) catch |err| {
+            try out.stderr("warning: chat opened but could not link it to parent {s}: {s}\n", .{ parent_thread_id.?, @errorName(err) });
+        };
+        if (json) {
+            try out.stdout("{s}\n", .{response});
+        } else {
+            try printLiveResponse(out, response);
+        }
         return;
     }
     if (std.mem.eql(u8, subcommand, "draft")) {

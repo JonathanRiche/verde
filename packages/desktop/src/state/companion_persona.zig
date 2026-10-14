@@ -34,6 +34,7 @@ pub fn noteAlloc(
     name: []const u8,
     character: app_config.CompanionCharacter,
     home_workspace_id: []const u8,
+    thread_id: []const u8,
     workspace_label: []const u8,
     orders: []const u8,
 ) ![]u8 {
@@ -51,9 +52,11 @@ pub fn noteAlloc(
         \\all of Verde across every workspace, not just the folder your shell starts in ({s}, workspace_id {s}).
         \\Your job is to run work, not to do it all yourself:
         \\- Use the Verde MCP tools. Start with list_workspaces / list_panes / list_processes to see the machine.
-        \\- Delegate real coding to chats with open_chat in whichever workspace fits (pick the provider and model that fit
-        \\  the task) and steer them with send_chat_message or queue_chat_followup. Always pass your thread id as
-        \\  parent_thread_id: chats in any workspace then join your crew and report back to you automatically.
+        \\- Your own thread id is {s}. Delegate real coding to chats with open_chat in whichever workspace fits (pick
+        \\  the provider and model that fit the task) and steer them with send_chat_message or queue_chat_followup.
+        \\  Always pass parent_thread_id "{s}" to open_chat (or `--parent-thread-id {s}` to `verde live chat open`):
+        \\  chats in any workspace then join your crew and report back to you automatically. Prefer the MCP tools
+        \\  over the CLI when both are available.
         \\- When a crew chat reports back, review it before telling the user it is done: read what changed, run the
         \\  workspace's check if it is cheap, and give a one-line verdict (ship it / needs another pass / needs you).
         \\- Keep dev servers healthy with start_process / restart_process / tail_process_logs, and take leases
@@ -64,16 +67,18 @@ pub fn noteAlloc(
         \\- Keep replies short and conversational: what you did, what is running, what needs the user.
         \\{s}{s}
         \\</verde_companion>
-    , .{ name, workspace_label, home_workspace_id, autonomyClause(character), orders_block });
+    , .{ name, workspace_label, home_workspace_id, thread_id, thread_id, thread_id, autonomyClause(character), orders_block });
 }
 
 test "persona note names the companion and its machine-wide role" {
     const allocator = std.testing.allocator;
-    const note = try noteAlloc(allocator, "Juniper", .moss, "ws-1", "verde", "");
+    const note = try noteAlloc(allocator, "Juniper", .moss, "ws-1", "chat-9", "verde", "");
     defer allocator.free(note);
     try std.testing.expect(std.mem.indexOf(u8, note, "You are Juniper") != null);
     try std.testing.expect(std.mem.indexOf(u8, note, "all of Verde across every workspace") != null);
     try std.testing.expect(std.mem.indexOf(u8, note, "workspace_id ws-1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, note, "Your own thread id is chat-9.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, note, "--parent-thread-id chat-9") != null);
     try std.testing.expect(std.mem.indexOf(u8, note, "Temperament: steady") != null);
     try std.testing.expect(std.mem.startsWith(u8, note, "<verde_companion>"));
 }
@@ -81,7 +86,7 @@ test "persona note names the companion and its machine-wide role" {
 test "persona temperament follows the character" {
     const allocator = std.testing.allocator;
     inline for (.{ .{ .sprout, "careful" }, .{ .vireo, "quick and autonomous" } }) |case| {
-        const note = try noteAlloc(allocator, "X", case[0], "ws", "w", "");
+        const note = try noteAlloc(allocator, "X", case[0], "ws", "t", "w", "");
         defer allocator.free(note);
         try std.testing.expect(std.mem.indexOf(u8, note, case[1]) != null);
     }
@@ -89,10 +94,10 @@ test "persona temperament follows the character" {
 
 test "persona includes standing orders only when the user wrote some" {
     const allocator = std.testing.allocator;
-    const without = try noteAlloc(allocator, "X", .sprout, "ws", "w", "   ");
+    const without = try noteAlloc(allocator, "X", .sprout, "ws", "t", "w", "   ");
     defer allocator.free(without);
     try std.testing.expect(std.mem.indexOf(u8, without, "Standing orders") == null);
-    const with = try noteAlloc(allocator, "X", .sprout, "ws", "w", "Never push to main.");
+    const with = try noteAlloc(allocator, "X", .sprout, "ws", "t", "w", "Never push to main.");
     defer allocator.free(with);
     try std.testing.expect(std.mem.indexOf(u8, with, "Standing orders from the user (always follow these):\nNever push to main.") != null);
 }

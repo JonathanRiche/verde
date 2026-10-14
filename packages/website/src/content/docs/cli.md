@@ -223,7 +223,7 @@ Chat commands resolve the target workspace pane to a chat thread and drive it
 through the same composer / send path as the UI.
 
 ```bash
-verde live chat open --workspace <id> --provider codex [--model <id>] [--reasoning low|medium|high|xhigh] [--fast|--no-fast] [--json]
+verde live chat open --workspace <id> --provider codex [--model <id>] [--reasoning low|medium|high|xhigh] [--fast|--no-fast] [--parent-thread-id <id>] [--json]
 verde live chat status --pane <pane-id> [--json]
 verde live chat transcript --pane <pane-id> [--json]
 verde live chat draft set --pane <pane-id> --text "Reply with exactly: ok" [--json]
@@ -237,6 +237,9 @@ verde live chat approve --pane <pane-id> --decision approve|deny [--call <id>] [
 - `open` validates provider/model reasoning and Fast settings before creating
   the pane. Its response and subsequent `status` responses report the effective
   reasoning effort, reasoning variant, Fast mode, and service tier.
+- `open --parent-thread-id <id>` links the new chat to an existing chat (for
+  example a Companion delegating work), so it shows in that chat's crew and
+  reports back to it, the same as MCP `open_chat` with `parent_thread_id`.
 - `status` returns the current draft, send state, and pending approval status.
 - `transcript` returns persisted messages for the pane's thread.
 - `draft set` replaces the current draft; `draft append` appends to it.

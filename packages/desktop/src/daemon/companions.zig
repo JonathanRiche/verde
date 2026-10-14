@@ -194,7 +194,7 @@ pub fn noteForThread(conn: zqlite.Conn, allocator: std.mem.Allocator, workspace_
         break :blk try allocator.dupe(u8, row.text(0));
     };
     defer allocator.free(label);
-    const note = try persona.noteAlloc(allocator, companion.name.slice(), companion.character, workspace_id, label, companion.orders.slice());
+    const note = try persona.noteAlloc(allocator, companion.name.slice(), companion.character, workspace_id, local_thread_id, label, companion.orders.slice());
     const text = handoff orelse return note;
     defer allocator.free(note);
     return try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ note, text });
