@@ -139,8 +139,10 @@ private struct ThreadItem: View {
 
 private struct WorkspaceItem: View {
     let workspace: Workspace
+    /// Companion chats, left out of the counts.
+    var hidden: Set<String> = []
     var body: some View {
-        let info = workspaceSummary(workspace)
+        let info = workspaceSummary(workspace, hidden: hidden)
         MenuRow(content: RowContent(title: workspace.label,
                                     detail: [info.summary, workspace.path].filter { !$0.isEmpty }.joined(separator: "\n"),
                                     dot: Dot(color: info.active > 0 ? VerdeTheme.accent : VerdeTheme.subtle, label: info.active > 0 ? "Active" : "Idle"),
@@ -243,7 +245,8 @@ struct HomeScreen: View {
     let model: BrowseModel
     let actions: BrowseActions
     var body: some View {
-        let panes = model.state.home?.items ?? []
+        let hidden = model.companionThreads
+        let panes = visiblePanes(model.state.home?.items ?? [], hidden: hidden)
         BrowseFrame(title: "Home", model: model, actions: actions,
                     ticking: panes.contains { $0.can_stop && $0.started_at_ms != nil }) { state, now in
             let attention = panes.filter(\.attention)
@@ -257,7 +260,7 @@ struct HomeScreen: View {
             if panes.isEmpty { Section { Text("Nothing is running or waiting on you.") } }
             let workspaces = state.workspaces?.items ?? []
             let labels = Dictionary(workspaces.map { ($0.workspace_id, $0.label) }, uniquingKeysWith: { a, _ in a })
-            let recent = recentThreads(state.workspaces)
+            let recent = recentThreads(state.workspaces, hidden: hidden)
             if !recent.isEmpty {
                 Section("Recent chats") {
                     ForEach(recent, id: \.thread_id) { ThreadItem(browse: model, thread: $0, now: now, workspaceLabel: labels[$0.workspace_id]) }
@@ -265,7 +268,7 @@ struct HomeScreen: View {
             }
             let open = workspaces.filter(\.open)
             if !open.isEmpty {
-                Section("Workspaces") { ForEach(open, id: \.workspace_id) { WorkspaceItem(workspace: $0) } }
+                Section("Workspaces") { ForEach(open, id: \.workspace_id) { WorkspaceItem(workspace: $0, hidden: hidden) } }
             } else if state.workspaces != nil {
                 Section { NavigationLink("Add a workspace", value: BrowseRoute.addWorkspace) }
             }
@@ -291,6 +294,7 @@ struct WorkspacesScreen: View {
     let model: BrowseModel
     let actions: BrowseActions
     var body: some View {
+        let hidden = model.companionThreads
         BrowseFrame(title: "Workspaces", model: model, actions: actions) { state, _ in
             let all = state.workspaces?.items ?? []
             if all.isEmpty {
@@ -300,10 +304,10 @@ struct WorkspacesScreen: View {
                     NavigationLink("Add workspace", value: BrowseRoute.addWorkspace)
                     NavigationLink("New chat", value: BrowseRoute.newChat(nil))
                     NavigationLink("History", value: BrowseRoute.history)
-                    ForEach(all.filter(\.open), id: \.workspace_id) { WorkspaceItem(workspace: $0) } }
+                    ForEach(all.filter(\.open), id: \.workspace_id) { WorkspaceItem(workspace: $0, hidden: hidden) } }
                 let closed = all.filter { !$0.open }
                 if !closed.isEmpty {
-                    Section("Closed") { ForEach(closed, id: \.workspace_id) { WorkspaceItem(workspace: $0) } }
+                    Section("Closed") { ForEach(closed, id: \.workspace_id) { WorkspaceItem(workspace: $0, hidden: hidden) } }
                 }
             }
         }
@@ -318,6 +322,7 @@ struct WorkspaceScreen: View {
     @Environment(\.openRoute) private var openRoute
     var body: some View {
         let workspace = model.state.workspaces?.items.first { $0.workspace_id == workspaceID }
+        let hidden = model.companionThreads
         BrowseFrame(title: workspace?.label ?? "Workspace", model: model, actions: actions,
                     ticking: workspace?.panes.contains { $0.can_stop && $0.started_at_ms != nil } ?? false,
                     large: false) { _, now in
@@ -326,15 +331,16 @@ struct WorkspaceScreen: View {
                 if !workspace.path.isEmpty { Text(workspace.path) .font(VerdeTheme.ui(13)).foregroundStyle(.secondary) }
                 ExplorerLinks(onChanges: { openRoute(.changes(workspaceID)) }, onFiles: { openRoute(.files(workspaceID)) })
                 Section("Panes") {
-                    if workspace.panes.isEmpty { Text("No open panes.") }
-                    ForEach(workspace.panes, id: \.id) { PaneItem(browse: model, pane: $0, now: now) }
+                    let panes = visiblePanes(workspace.panes, hidden: hidden)
+                    if panes.isEmpty { Text("No open panes.") }
+                    ForEach(panes, id: \.id) { PaneItem(browse: model, pane: $0, now: now) }
                     if canWrite(model.state.host) && !workspace.path.isEmpty {
                         NavigationLink(value: BrowseRoute.newTerminal(workspace: workspaceID, request: UUID())) {
                             Label("New terminal", systemImage: "plus.rectangle.on.rectangle")
                         }
                     }
                 }
-                let threads = workspaceThreads(workspace).filter(listed)
+                let threads = workspaceThreads(workspace, hidden: hidden).filter(listed)
                 let current = threads.filter { !$0.archived }
                 let archived = threads.filter(\.archived)
                 Section("Chats") {

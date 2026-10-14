@@ -574,6 +574,58 @@ func needsYouItems(home: HomeView?, workspaces: WorkspacesView?, crew: [CrewLink
     return items
 }
 
+/// One row of the sheet's activity panel: a crew chat or another chat running on the machine.
+struct ActivityItem: Equatable, Identifiable {
+    var workspaceID: String
+    var threadID: String
+    var title: String
+    var attention: CrewAttention
+    /// Linked to the companion's chat (`chat.links.list`), not just running elsewhere.
+    var crew: Bool
+    var id: String { workspaceID + "/" + threadID }
+}
+
+/// The activity panel: the companion's crew first (in `crewRows` order), then every other chat
+/// running on the machine (Home chat panes and workspace thread statuses), deduplicated by
+/// workspace + thread. Chats waiting on the user belong to "Needs you"; the companion's own chat
+/// shows as "working" in the header instead, and other companion chats (`hidden` thread ids) stay
+/// behind the bubble.
+func activityItems(crew: [CrewLink], home: HomeView?, workspaces: WorkspacesView?,
+                   companion: (workspace: String, thread: String)?, hidden: Set<String> = []) -> [ActivityItem] {
+    var seen = Set<String>()
+    var items: [ActivityItem] = []
+    func add(_ workspace: String, _ thread: String, _ title: String, _ attention: CrewAttention, crew: Bool) {
+        if let companion, companion.workspace == workspace, companion.thread == thread { return }
+        guard !thread.isEmpty, !hidden.contains(thread), seen.insert(workspace + "/" + thread).inserted else { return }
+        let clean = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        items.append(ActivityItem(workspaceID: workspace, threadID: thread, title: clean.isEmpty ? "Untitled chat" : clean,
+                                  attention: attention, crew: crew))
+    }
+    for link in crew { add(link.workspace_id, link.local_thread_id, link.displayTitle, link.attention, crew: true) }
+    for pane in home?.items ?? [] where pane.kind == "chat" && pane.attention_kind == nil && pane.status != "waiting_approval" {
+        guard let thread = pane.thread_id, pane.can_stop || activeTurn(pane.status) else { continue }
+        add(pane.workspace_id, thread, pane.title, .running, crew: false)
+    }
+    for workspace in workspaces?.items ?? [] {
+        for thread in workspace.threads where activeTurn(thread.status) && thread.status != "waiting_approval"
+            && !thread.archived && !isSubagent(thread) {
+            add(thread.workspace_id, thread.thread_id, thread.title, .running, crew: false)
+        }
+    }
+    return items
+}
+
+/// Every chat a roster companion owns: each companion's current chat and its past conversations.
+/// Sidebar and workspace lists hide them; the bubble and sheet are their way in.
+func companionThreadIDs(_ roster: Roster?) -> Set<String> {
+    var ids = Set<String>()
+    for entry in roster?.companions ?? [] {
+        if !entry.thread_id.isEmpty { ids.insert(entry.thread_id) }
+        for past in entry.history where !past.thread_id.isEmpty { ids.insert(past.thread_id) }
+    }
+    return ids
+}
+
 enum CompanionPose: Equatable { case idle, working, approval, paused }
 
 struct CompanionPresence: Equatable {
@@ -590,7 +642,7 @@ func companionPresence(needsYou: Int, crewRunning: Int, working: Bool, failed: B
     if !connected { status = "Waiting for the host" }
     else if needsYou > 0 { status = needsYou == 1 ? "1 thing needs you" : "\(needsYou) things need you" }
     else if failed { status = "Needs a look" }
-    else if working && crewRunning > 0 { status = "Working · \(crewRunning) in crew" }
+    else if working && crewRunning > 0 { status = "Working · \(crewRunning) running" }
     else if working { status = "Working…" }
     else if crewRunning > 0 { status = crewRunning == 1 ? "1 chat running" : "\(crewRunning) chats running" }
     else { status = "Ready when you are" }
@@ -698,20 +750,37 @@ func companionStatusSuffix(needsYou: Int, crewRunning: Int, working: Bool, faile
     return ("ready", .quiet)
 }
 
+/// The summary strip's expandable panels.
+enum CompanionPanel: Equatable { case needs, activity }
+
+/// The panel the header's count opens; nil when the suffix shows no count. Mirrors
+/// `companionStatusSuffix`, so every count in the header has a capsule to expand.
+func companionHeaderPanel(needsYou: Int, running: Int, working: Bool, failed: Bool, connected: Bool) -> CompanionPanel? {
+    if !connected { return nil }
+    if needsYou > 0 { return .needs }
+    if failed || working { return nil }
+    return running > 0 ? .activity : nil
+}
+
 /// The "needs you" capsule; nil hides it.
 func needsSummary(_ count: Int) -> String? { count > 0 ? "\(count) need you" : nil }
 
 /// The crew capsule ("2 running · 1 done"); nil when there is no crew.
-func crewSummary(_ crew: [CrewLink]) -> String? {
-    guard !crew.isEmpty else { return nil }
-    func count(_ match: (CrewAttention) -> Bool) -> Int { crew.filter { match($0.attention) }.count }
+func crewSummary(_ crew: [CrewLink]) -> String? { attentionSummary(crew.map(\.attention)) }
+
+/// The activity capsule (crew plus other running chats); nil when nothing is listed.
+func activitySummary(_ items: [ActivityItem]) -> String? { attentionSummary(items.map(\.attention)) }
+
+private func attentionSummary(_ list: [CrewAttention]) -> String? {
+    guard !list.isEmpty else { return nil }
+    func count(_ match: (CrewAttention) -> Bool) -> Int { list.filter(match).count }
     let parts = [
         (count { $0 == .running }, "running"),
         (count { $0.needsYou }, "waiting"),
         (count { $0 == .failed }, "failed"),
         (count { $0 == .done }, "done"),
     ].filter { $0.0 > 0 }.map { "\($0.0) \($0.1)" }
-    return parts.isEmpty ? "\(crew.count) idle" : parts.joined(separator: " · ")
+    return parts.isEmpty ? "\(list.count) idle" : parts.joined(separator: " · ")
 }
 
 // MARK: - Brain

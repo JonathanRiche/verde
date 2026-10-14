@@ -123,6 +123,13 @@ final class ThemeTests: XCTestCase {
         XCTAssertEqual(scoped.open.map { $0.workspace.workspace_id }, ["b"])
         XCTAssertTrue(drawerItems(items, scope: "a").open.isEmpty)
         XCTAssertEqual(drawerItems(items, scope: nil).open.map { $0.workspace.workspace_id }, ["b"])
+        // Companion chats stay out of both lists; the bubble opens them.
+        let hidden: Set<String> = ["a-t", "b-t"]
+        XCTAssertTrue(drawerItems(items, scope: nil, hidden: hidden).active.isEmpty)
+        XCTAssertTrue(drawerItems(items, scope: nil, hidden: hidden).open.isEmpty)
+        XCTAssertTrue(drawerThreads(items[0], hidden: hidden).isEmpty)
+        XCTAssertEqual(workspaceSummary(items[0], hidden: hidden).active, 0)
+        XCTAssertTrue(workspaceSummary(items[0], hidden: hidden).summary.hasPrefix("0 chats"))
     }
     func testDrawerAllWorkspacesOpenInterleavesNewestActivityFirst() {
         func t(_ ws: String, _ id: String, _ at: Int64?) -> ThreadSummary {

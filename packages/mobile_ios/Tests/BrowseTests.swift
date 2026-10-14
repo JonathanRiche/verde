@@ -130,6 +130,8 @@ final class BrowseTests: XCTestCase {
         XCTAssertEqual(recentThreads(view).map(\.thread_id), ids)
         XCTAssertTrue(recentThreads(nil).isEmpty)
         XCTAssertTrue(recentThreads(view, limit: 0).isEmpty)
+        // Companion chats are hidden by thread id in every workspace.
+        XCTAssertEqual(recentThreads(view, hidden: ["tie", "unknown"]).map(\.thread_id), ["newest", "older", "draft-running"])
     }
 
     private var storage = MemoryStorage()

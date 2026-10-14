@@ -74,6 +74,16 @@ final class CompanionModel {
         needsYouItems(home: browse.state.home, workspaces: browse.state.workspaces, crew: crew, companion: conversation)
     }
 
+    /// The sheet's activity panel: crew plus every other chat running on the machine.
+    var activity: [ActivityItem] {
+        let state = browse.state
+        return activityItems(crew: crew, home: state.home, workspaces: state.workspaces, companion: conversation,
+                             hidden: browse.companionThreads)
+    }
+
+    /// Chats running machine-wide (crew included, the companion's own turn not).
+    var runningCount: Int { activity.filter { $0.attention == .running }.count }
+
     private var threadSummary: ThreadSummary? {
         guard let conversation else { return nil }
         return browse.state.workspaces?.items.first { $0.workspace_id == conversation.workspace }?
@@ -98,7 +108,7 @@ final class CompanionModel {
         let status = threadStatus
         let host = browse.state.host
         return companionPresence(needsYou: badgeCount,
-                                 crewRunning: crew.filter { $0.attention == .running }.count,
+                                 crewRunning: runningCount,
                                  working: status.map(activeTurn) ?? false, failed: status == "failed",
                                  connected: browse.state.networkAvailable && host?.phase == "ready")
     }

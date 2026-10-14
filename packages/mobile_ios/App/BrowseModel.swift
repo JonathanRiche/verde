@@ -49,6 +49,10 @@ final class BrowseModel {
     var hostID: String? { hosts.active }
     var session: PairingModel? { hosts.session(hostID) }
 
+    /// Every roster companion's chat (current and past) from the core `companion` view. The
+    /// sidebar and workspace lists hide them; the companion bubble and sheet open them.
+    var companionThreads: Set<String> { companionThreadIDs(decodeCompanionView(session?.store.snapshots["companion"])?.roster) }
+
     var state: BrowseState {
         let row = hostID.flatMap { hosts.row($0) }
         var state = BrowseState(hostID: hostID, row: row, refreshing: refreshing,
@@ -221,9 +225,9 @@ func isSubagent(_ thread: ThreadSummary) -> Bool { thread.thread_id.hasPrefix("s
 func listed(_ thread: ThreadSummary) -> Bool { !isSubagent(thread) && (thread.committed || activeTurn(thread.status)) }
 
 /// History is independently filtered and paged; Home uses the live workspace catalog.
-func recentThreads(_ workspaces: WorkspacesView?, limit: Int = 8) -> [ThreadSummary] {
+func recentThreads(_ workspaces: WorkspacesView?, limit: Int = 8, hidden: Set<String> = []) -> [ThreadSummary] {
     Array((workspaces?.items ?? []).flatMap(\.threads)
-        .filter { !$0.archived && listed($0) }
+        .filter { !$0.archived && listed($0) && !hidden.contains($0.thread_id) }
         .sorted {
             let a = $0.last_activity_at_ms ?? 0, b = $1.last_activity_at_ms ?? 0
             if a != b { return a > b }
@@ -232,11 +236,17 @@ func recentThreads(_ workspaces: WorkspacesView?, limit: Int = 8) -> [ThreadSumm
         }.prefix(max(0, limit)))
 }
 
-func workspaceThreads(_ workspace: Workspace) -> [ThreadSummary] {
-    workspace.threads.filter { !isSubagent($0) }.sorted {
+/// `hidden` drops companion chats (`BrowseModel.companionThreads`) from the lists.
+func workspaceThreads(_ workspace: Workspace, hidden: Set<String> = []) -> [ThreadSummary] {
+    workspace.threads.filter { !isSubagent($0) && !hidden.contains($0.thread_id) }.sorted {
         let a = $0.last_activity_at_ms ?? 0, b = $1.last_activity_at_ms ?? 0
         return a != b ? a > b : $0.thread_id < $1.thread_id
     }
+}
+
+/// Panes minus companion chats (`hidden` thread ids).
+func visiblePanes(_ panes: [Pane], hidden: Set<String>) -> [Pane] {
+    hidden.isEmpty ? panes : panes.filter { pane in pane.thread_id.map { !hidden.contains($0) } ?? true }
 }
 
 func openable(_ pane: Pane) -> Bool {
@@ -248,11 +258,12 @@ func openable(_ pane: Pane) -> Bool {
 }
 
 /// Counts shown on a workspace row: "N chats · N terminals · N active · closed" plus a K-17 badge.
-func workspaceSummary(_ workspace: Workspace) -> (summary: String, active: Int, badge: String?) {
-    let chats = workspace.threads.filter { listed($0) && !$0.archived }.count
-    let terminals = workspace.panes.filter { $0.kind == "terminal" && $0.terminal_id != nil }.count
-    let active = workspace.panes.filter { $0.attention || $0.can_stop || $0.status == "working" }.count
-    let flagged = workspace.panes.filter { $0.attention_kind != nil }.count
+func workspaceSummary(_ workspace: Workspace, hidden: Set<String> = []) -> (summary: String, active: Int, badge: String?) {
+    let chats = workspace.threads.filter { listed($0) && !$0.archived && !hidden.contains($0.thread_id) }.count
+    let panes = visiblePanes(workspace.panes, hidden: hidden)
+    let terminals = panes.filter { $0.kind == "terminal" && $0.terminal_id != nil }.count
+    let active = panes.filter { $0.attention || $0.can_stop || $0.status == "working" }.count
+    let flagged = panes.filter { $0.attention_kind != nil }.count
     var parts = ["\(chats) chat\(chats == 1 ? "" : "s")"]
     if terminals > 0 { parts.append("\(terminals) terminal\(terminals == 1 ? "" : "s")") }
     if active > 0 { parts.append("\(active) active") }

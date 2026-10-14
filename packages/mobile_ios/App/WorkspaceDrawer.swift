@@ -1,8 +1,8 @@
 import SwiftUI
 
-func drawerThreads(_ workspace: Workspace) -> [ThreadSummary] {
+func drawerThreads(_ workspace: Workspace, hidden: Set<String> = []) -> [ThreadSummary] {
     let open = Set(workspace.panes.compactMap(\.thread_id))
-    return workspaceThreads(workspace).filter { !$0.archived && open.contains($0.thread_id) }
+    return workspaceThreads(workspace, hidden: hidden).filter { !$0.archived && open.contains($0.thread_id) }
 }
 
 /// Switcher order: the core's recency rank (focus/activity newest first, closed untimed last).
@@ -41,10 +41,10 @@ struct DrawerItem: Identifiable {
 /// Flat Active/Open rows by workspace recency. Active always spans every open workspace;
 /// Open follows the scope (nil = All Workspaces). Under All Workspaces Open interleaves
 /// every workspace newest activity first (untimed last; ties keep workspace then layout
-/// order), matching the desktop sidebar.
-func drawerItems(_ items: [Workspace], scope: String?) -> (active: [DrawerItem], open: [DrawerItem]) {
+/// order), matching the desktop sidebar. Companion chats (`hidden`) never appear; the bubble opens them.
+func drawerItems(_ items: [Workspace], scope: String?, hidden: Set<String> = []) -> (active: [DrawerItem], open: [DrawerItem]) {
     let rows = switcherWorkspaces(items).filter(\.open).flatMap { ws -> [DrawerItem] in
-        let chats: [DrawerItem] = drawerThreads(ws).map { thread in DrawerItem(workspace: ws, thread: thread, pane: ws.panes.first { $0.thread_id == thread.thread_id }) }
+        let chats: [DrawerItem] = drawerThreads(ws, hidden: hidden).map { thread in DrawerItem(workspace: ws, thread: thread, pane: ws.panes.first { $0.thread_id == thread.thread_id }) }
         return chats + ws.panes.filter { $0.kind == "terminal" && $0.terminal_id != nil }.map { DrawerItem(workspace: ws, thread: nil, pane: $0) }
     }
     let open = rows.filter { !$0.active && (scope == nil || $0.workspace.workspace_id == scope) }
@@ -112,7 +112,7 @@ struct WorkspaceDrawer: View {
                     if let scoped, !scoped.open {
                         Text("\(scoped.label) is closed.").font(VerdeTheme.ui(13)).foregroundStyle(VerdeTheme.muted).padding(16)
                     }
-                    let sections = drawerItems(all, scope: scope)
+                    let sections = drawerItems(all, scope: scope, hidden: browse.companionThreads)
                     // Active is global, so its rows always name their workspace.
                     rows("Active", sections.active, chip: true)
                     rows("Open", sections.open, chip: scope == nil)

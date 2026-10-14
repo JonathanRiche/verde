@@ -21,6 +21,8 @@ struct CompanionSheet: View {
     @State private var conversations = false
     /// A prompt typed or picked before the companion's chat existed; sent once it opens.
     @State private var pendingPrompt: String?
+    /// The summary strip's open panel; the header's count toggles it too.
+    @State private var panel: CompanionPanel?
 
     var body: some View {
         Group {
@@ -53,7 +55,7 @@ struct CompanionSheet: View {
 
     private func content(_ active: RosterEntry) -> some View {
         VStack(spacing: 0) {
-            CompanionHeader(model: model, live: live, entry: active, showHome: showHome,
+            CompanionHeader(model: model, live: live, entry: active, panel: $panel, showHome: showHome,
                             newConversation: { confirmNew = true }, showConversations: { conversations = true }) {
                 settingsBrain = false; settings = true
             }
@@ -76,7 +78,7 @@ struct CompanionSheet: View {
                 Text(failure).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.warning)
                     .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16).padding(.bottom, 4)
             }
-            CompanionSummary(model: model, open: open)
+            CompanionSummary(model: model, open: open, expanded: $panel)
             Divider().overlay(VerdeTheme.border)
             if let conversation = model.conversation {
                 CompanionConversation(browse: browse, voice: voice, name: active.name, workspaceID: conversation.workspace,
@@ -110,6 +112,7 @@ private struct CompanionHeader: View {
     let model: CompanionModel
     let live: LiveVoice
     let entry: RosterEntry
+    @Binding var panel: CompanionPanel?
     let showHome: () -> Void
     let newConversation: () -> Void
     let showConversations: () -> Void
@@ -118,19 +121,50 @@ private struct CompanionHeader: View {
 
     var body: some View {
         let presence = model.presence
-        let suffix = companionStatusSuffix(needsYou: model.badgeCount,
-                                           crewRunning: model.crew.filter { $0.attention == .running }.count,
-                                           working: presence.pose == .working && model.crew.allSatisfy { $0.attention != .running },
-                                           failed: presence.failure, connected: presence.pose != .paused)
+        // Counts match the strip's capsules (needs list, machine-wide activity), so every count
+        // in the header has a panel to open.
+        let needs = model.needsYou.count
+        let running = model.runningCount
+        let working = presence.pose == .working && running == 0
+        let connected = presence.pose != .paused
+        // The companion's own approval shows inline in the conversation below, so it gets no count.
+        let ownApproval = connected && needs == 0 && model.badgeCount > 0
+        let suffix = ownApproval ? (text: "waiting on you", tone: SummaryTone.attention)
+            : companionStatusSuffix(needsYou: needs, crewRunning: running, working: working,
+                                    failed: presence.failure, connected: connected)
+        let target: CompanionPanel? = ownApproval ? nil : companionHeaderPanel(needsYou: needs, running: running, working: working,
+                                                                               failed: presence.failure, connected: connected)
         let companions = model.roster?.companions ?? []
         HStack(spacing: 8) {
             CompanionAvatar(character: entry.character, pose: presence.pose, failure: presence.failure, width: 28)
-            (Text(entry.name).font(VerdeTheme.ui(16, bold: true))
-                + Text(" · " + suffix.text).font(VerdeTheme.ui(12)).foregroundStyle(summaryColor(suffix.tone)))
-                .lineLimit(1)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .accessibilityLabel("\(entry.name), \(presence.status)")
-                .accessibilityAddTraits(.isHeader)
+            HStack(spacing: 0) {
+                Text(entry.name).font(VerdeTheme.ui(16, bold: true)).lineLimit(1)
+                    .accessibilityLabel("\(entry.name), \(presence.status)")
+                    .accessibilityAddTraits(.isHeader)
+                if let target {
+                    let isOpen = panel == target
+                    Button {
+                        withAnimation(AppearanceSettings.shared.reducedMotion ? nil : .easeOut(duration: 0.15)) { panel = isOpen ? nil : target }
+                    } label: {
+                        HStack(spacing: 3) {
+                            Text(" · " + suffix.text).font(VerdeTheme.ui(12)).foregroundStyle(summaryColor(suffix.tone)).lineLimit(1)
+                            Image(systemName: isOpen ? "chevron.up" : "chevron.down").font(.system(size: 8, weight: .bold))
+                                .foregroundStyle(VerdeTheme.subtle)
+                        }
+                        .frame(minHeight: 44)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(suffix.text)
+                    .accessibilityHint(isOpen ? "Hides the list." : "Shows the list.")
+                    .accessibilityValue(isOpen ? "Expanded" : "Collapsed")
+                    .accessibilityIdentifier("companion-header-status")
+                } else {
+                    Text(" · " + suffix.text).font(VerdeTheme.ui(12)).foregroundStyle(summaryColor(suffix.tone)).lineLimit(1)
+                        .accessibilityHidden(true)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
             Button { live.toggle() } label: {
                 Image(systemName: live.active ? "waveform.circle.fill" : "waveform")
                     .font(.system(size: 17, weight: .semibold)).frame(width: 44, height: 44)
@@ -170,59 +204,62 @@ private struct CompanionHeader: View {
     }
 }
 
-/// Two capsules ("3 need you", "2 running · 1 done"), each expanding to a compact list.
+/// Two capsules ("3 need you", "2 running · 1 done"), each expanding to a compact list. The
+/// activity capsule lists the companion's crew plus every other chat running on the machine.
 private struct CompanionSummary: View {
-    enum Panel: Equatable { case needs, crew }
     let model: CompanionModel
     let open: (BrowseRoute) -> Void
-    @State private var expanded: Panel?
+    @Binding var expanded: CompanionPanel?
 
     var body: some View {
         let needs = model.needsYou
-        let crew = model.crew
+        let activity = model.activity
         let needsText = needsSummary(needs.count)
-        let crewText = crewSummary(crew)
-        if needsText != nil || crewText != nil {
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 8) {
-                    if let needsText {
-                        capsule(.needs, icon: "exclamationmark.triangle.fill", text: needsText, color: VerdeTheme.warning)
+        let activityText = activitySummary(activity)
+        Group {
+            if needsText != nil || activityText != nil {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 8) {
+                        if let needsText {
+                            capsule(.needs, icon: "exclamationmark.triangle.fill", text: needsText, color: VerdeTheme.warning)
+                        }
+                        if let activityText {
+                            capsule(.activity, icon: "circle.fill", text: activityText,
+                                    color: activity.contains { $0.attention == .running } ? VerdeTheme.accent : VerdeTheme.subtle)
+                        }
+                        Spacer(minLength: 0)
                     }
-                    if let crewText {
-                        capsule(.crew, icon: "circle.fill", text: crewText,
-                                color: crew.contains { $0.attention == .running } ? VerdeTheme.accent : VerdeTheme.subtle)
+                    if expanded == .needs && !needs.isEmpty {
+                        list(needs.map { item in
+                            SummaryRow(id: item.id, color: VerdeTheme.warning, title: item.title,
+                                       detail: item.workspaceLabel ?? item.reason, label: item.reason,
+                                       route: .thread(workspace: item.workspaceID, thread: item.threadID))
+                        })
+                    } else if expanded == .activity && !activity.isEmpty {
+                        let labels = Dictionary((model.browse.state.workspaces?.items ?? []).map { ($0.workspace_id, $0.label) },
+                                                uniquingKeysWith: { a, _ in a })
+                        list(activity.map { item in
+                            SummaryRow(id: item.id, color: crewColor(item.attention), title: item.title,
+                                       detail: labels[item.workspaceID] ?? item.attention.label, label: item.attention.label,
+                                       route: .thread(workspace: item.workspaceID, thread: item.threadID))
+                        })
                     }
-                    Spacer(minLength: 0)
                 }
-                if expanded == .needs && !needs.isEmpty {
-                    list(needs.map { item in
-                        SummaryRow(id: item.id, color: VerdeTheme.warning, title: item.title,
-                                   detail: item.workspaceLabel ?? item.reason, label: item.reason,
-                                   route: .thread(workspace: item.workspaceID, thread: item.threadID))
-                    })
-                } else if expanded == .crew && !crew.isEmpty {
-                    let labels = Dictionary((model.browse.state.workspaces?.items ?? []).map { ($0.workspace_id, $0.label) },
-                                            uniquingKeysWith: { a, _ in a })
-                    list(crew.map { link in
-                        SummaryRow(id: link.id, color: crewColor(link.attention), title: link.displayTitle,
-                                   detail: labels[link.workspace_id] ?? link.attention.label, label: link.attention.label,
-                                   route: .thread(workspace: link.workspace_id, thread: link.local_thread_id))
-                    })
-                }
+                .padding(.horizontal, 12).padding(.bottom, 6)
             }
-            .padding(.horizontal, 12).padding(.bottom, 6)
-            .onChange(of: needsText == nil) { _, hidden in if hidden && expanded == .needs { expanded = nil } }
-            .onChange(of: crewText == nil) { _, hidden in if hidden && expanded == .crew { expanded = nil } }
         }
+        // Outside the `if` so a panel whose capsule vanished closes even while the strip is gone.
+        .onChange(of: needsText == nil) { _, hidden in if hidden && expanded == .needs { expanded = nil } }
+        .onChange(of: activityText == nil) { _, hidden in if hidden && expanded == .activity { expanded = nil } }
     }
 
-    private func capsule(_ section: Panel, icon: String, text: String, color: Color) -> some View {
+    private func capsule(_ section: CompanionPanel, icon: String, text: String, color: Color) -> some View {
         let isOpen = expanded == section
         return Button {
             withAnimation(AppearanceSettings.shared.reducedMotion ? nil : .easeOut(duration: 0.15)) { expanded = isOpen ? nil : section }
         } label: {
             HStack(spacing: 5) {
-                Image(systemName: icon).font(.system(size: section == .crew ? 7 : 10)).foregroundStyle(color)
+                Image(systemName: icon).font(.system(size: section == .activity ? 7 : 10)).foregroundStyle(color)
                 Text(text).font(VerdeTheme.ui(12, bold: true)).lineLimit(1)
                 Image(systemName: isOpen ? "chevron.up" : "chevron.down").font(.system(size: 8, weight: .bold)).foregroundStyle(VerdeTheme.subtle)
             }
