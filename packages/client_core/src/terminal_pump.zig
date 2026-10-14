@@ -34,6 +34,13 @@ const Row = struct {
     waiting: bool = false,
     interactive_until_ms: i64 = 0,
     refresh_pending: bool = false,
+    /// Set by `terminal_create`: the first replay is live output that no
+    /// other client has answered yet, so its device replies must go out.
+    fresh: bool = false,
+    /// The staged output replays history. Queries in it were answered when
+    /// they first ran; answering again types stale bytes into whatever
+    /// program is in the foreground now (e.g. OSC 4 colors into an editor).
+    mute_replies: bool = false,
 };
 pub const State = struct { rows: []Row = &.{} };
 fn append(comptime T: type, a: A, list: *[]const T, item: T) !void {
@@ -119,6 +126,7 @@ pub fn intent(tx: *h.Transaction, tag: []const u8, event: V) h.ApiError!bool {
         r.view.rows = rows;
         r.view.session_status = "starting";
         r.view.attached = true;
+        r.fresh = true;
         try queue(tx, r, "session.create", .{ .id = terminal_id, .workspace_id = r.view.workspace_id, .cwd = cwd, .cols = cols, .rows = rows }, id, true);
         return true;
     }
@@ -132,6 +140,7 @@ pub fn intent(tx: *h.Transaction, tag: []const u8, event: V) h.ApiError!bool {
         r.view.attached = eq(tag, "terminal_attach");
         // Every attach may bind a recreated VT. It must start with a full replay.
         r.offset = null;
+        r.fresh = false;
         r.view.next_offset = null;
         r.view.stale = true;
         operation(tx, id, "succeeded", null);
@@ -170,6 +179,7 @@ pub fn reply(tx: *h.Transaction, event: V) h.ApiError!void {
     std.base64.standard.Decoder.decode(bytes, encoded) catch return error.InvalidArgument;
     if (bytes.len > 65536) return error.ResourceLimit;
     if (!std.unicode.utf8ValidateSlice(bytes)) return error.InvalidArgument;
+    if (r.mute_replies) return;
     try queue(tx, r, "session.write", .{ .id = r.view.terminal_id, .text = bytes }, null, true);
 }
 fn cancelCall(tx: *h.Transaction, id: ?u64) !void {
@@ -372,6 +382,8 @@ fn tail(tx: *h.Transaction, r: *Row, value: V) !void {
     const gap = if (r.offset) |offset| next < offset or (p.uint(p.get(value, "offset")) orelse offset) > offset else false;
     const reset = r.offset == null or gap or p.yes(p.get(value, "truncated"));
     const bytes = if (reset) alignPtyStream(text.string) else text.string;
+    r.mute_replies = reset and !r.fresh;
+    r.fresh = false;
     r.view.session_status = if (p.yes(p.get(value, "running"))) "running" else "exited";
     r.delay = if (text.string.len > 0 or (tx.state.now_ms orelse 0) < r.interactive_until_ms) 160 else 1000;
     r.staged_offset = next;

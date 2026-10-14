@@ -219,6 +219,30 @@ test "pump failed apply resets replay, ring gaps reset, background ignores stale
     try event(&tx, "terminal_detach", .{ .intent_id = "detach", .terminal_id = "k12-fixture" });
     try expect(tx.state.rpc.calls.len == 0);
 }
+test "pump drops device replies produced by history replays" {
+    var host = try h.Host.init(A, config);
+    defer host.deinit();
+    var tx = try h.Transaction.init(&host);
+    defer tx.deinit();
+    try ready(&tx);
+    try attach(&tx);
+    try fixture(&tx, "session.tail", @embedFile("fixtures/terminal/tail.json"));
+    const replay = try output(&tx);
+    try expect(p.yes(p.get(replay, "reset")));
+    // A query in replayed history was answered when it first ran.
+    try event(&tx, "terminal_reply", .{ .terminal_id = "k12-fixture", .bytes_base64 = "G1swbg==" });
+    try expect(tx.state.terminal.rows[0].actions.len == 0);
+    try ack(&tx, replay, false);
+    tx.state.now_ms = 1000;
+    try fire(&tx, try timer(&tx));
+    const offset = tx.state.terminal.rows[0].offset.?;
+    try response(&tx, try findCall(&tx, "session.tail"), try h.parse(tx.allocator(), try h.encode(tx.allocator(), .{ .text = "x", .running = true, .next_offset = offset + 1 })));
+    const live = try output(&tx);
+    try expect(!p.yes(p.get(live, "reset")));
+    // Live output answers its queries.
+    try event(&tx, "terminal_reply", .{ .terminal_id = "k12-fixture", .bytes_base64 = "G1swbg==" });
+    try expect(tx.state.terminal.rows[0].actions.len == 1 or tx.state.terminal.rows[0].action_id != null);
+}
 test "pump create resize kill and raw replies use only targeted session methods" {
     var host = try h.Host.init(A, config);
     defer host.deinit();
