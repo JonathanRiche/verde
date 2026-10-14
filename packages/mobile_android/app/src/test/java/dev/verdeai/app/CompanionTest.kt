@@ -120,6 +120,63 @@ class CompanionTest {
         assertEquals("Ready when you are", companionStatusLine(CompanionPulse(0, 0)))
     }
 
+    @Test fun activityListsCrewPlusOtherRunningChatsDedupedAndMatchesTheHeaderCount() {
+        fun pane(id: String, status: String, ws: String = "w", attention: Boolean = false, kind: String = "chat") =
+            Pane(id = "p-$id", workspace_id = ws, kind = kind, title = "Title $id", thread_id = id, status = status, attention = attention)
+        // Three chats running from the CLI, none linked to the companion; one terminal; one idle chat.
+        val panes = listOf(pane("cli1", "working"), pane("cli2", "running", ws = "x"), pane("cli3", "waiting"),
+            pane("term", "working", kind = "terminal"), pane("idle", "idle"), pane("mine", "working"))
+        val hidden = setOf("mine")
+        val bare = companionActivity(panes, emptyList(), hidden)
+        assertEquals(listOf("cli1", "cli2", "cli3"), bare.map { it.threadId }.sorted())
+        assertTrue(bare.all { it.status == ChildStatus.Running && it.linkId == null })
+        assertEquals("Title cli2", bare.single { it.threadId == "cli2" }.title)
+        val pulse = companionPulse(panes, emptyList(), hidden)
+        assertEquals(3, pulse.running)
+        // The header's "3 running" has a pill: the activity summary is never empty when running > 0.
+        assertEquals("3 running", companionHeaderSuffix(0, pulse.running))
+        assertEquals("3 running", activitySummary(bare.map { it.status }))
+
+        // A crew link for a running chat appears once; an idle link whose chat is running reads as running.
+        val crew = listOf(link("cli1", "idle"), link("done", "completed"), link("ask", "waiting_approval", ws = "x"))
+        val mixed = companionActivity(panes, crew, hidden)
+        assertEquals(5, mixed.size)
+        assertEquals(mixed.size, mixed.map { it.workspaceId to it.threadId }.toSet().size)
+        assertEquals("ask", mixed.first().threadId)
+        assertEquals(ChildStatus.Running, mixed.single { it.threadId == "cli1" }.status)
+        assertEquals("l:cli1", mixed.single { it.threadId == "cli1" }.key)
+        assertEquals(companionPulse(panes, crew, hidden).running, mixed.count { it.status.running })
+        assertEquals("3 running \u00b7 1 waiting \u00b7 1 done", activitySummary(mixed.map { it.status }))
+        // The companion's own conversation never shows as activity.
+        assertTrue(companionActivity(panes, listOf(link("mine", "running")), hidden).none { it.threadId == "mine" })
+    }
+
+    @Test fun headerCountAlwaysHasAPanelToToggle() {
+        fun snapshot(panes: List<Pane>, crew: List<CompanionLink> = emptyList()): CompanionSnapshot {
+            val needs = panes.filter { it.attention || it.status == "waiting_approval" }
+            return CompanionSnapshot(null, needs, crew, companionPulse(panes, crew), bubbleNeedKeys(needs, crew, null), false, null,
+                companionActivity(panes, crew))
+        }
+        val running = snapshot(listOf(Pane(id = "p", workspace_id = "w", kind = "chat", title = "t", thread_id = "t", status = "working")))
+        assertEquals(StripPanel.Crew, headerPanel(running))
+        assertEquals(StripPanel.Crew, shownPanel(StripPanel.Crew, running))
+        assertNull(shownPanel(StripPanel.Needs, running))
+        val asking = snapshot(listOf(Pane(id = "p", workspace_id = "w", kind = "chat", title = "t", thread_id = "t", status = "waiting_approval", attention = true)))
+        assertEquals(StripPanel.Needs, headerPanel(asking))
+        val idle = snapshot(emptyList())
+        assertNull(companionHeaderSuffix(idle.needKeys.size, idle.pulse.running))
+        assertNull(headerPanel(idle))
+        assertNull(shownPanel(StripPanel.Crew, idle))
+    }
+
+    @Test fun companionThreadIdsCoverCurrentAndPastConversations() {
+        val roster = CompanionRoster(version = 1, active_id = "a", companions = listOf(
+            CompanionEntry(id = "a", name = "Moss", thread_id = "now", history = listOf(CompanionPastConversation("old1"), CompanionPastConversation("old2"))),
+            CompanionEntry(id = "b", name = "Wren", history = listOf(CompanionPastConversation("old3")))))
+        assertEquals(setOf("now", "old1", "old2", "old3"), companionThreadIds(roster))
+        assertTrue(companionThreadIds(null).isEmpty())
+    }
+
     @Test fun compactSheetLabels() {
         assertEquals("1 needs you", needsLabel(1))
         assertEquals("3 need you", needsLabel(3))

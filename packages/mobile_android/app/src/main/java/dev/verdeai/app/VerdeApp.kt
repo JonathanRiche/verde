@@ -183,6 +183,9 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
     val talkLevel by voice.level.collectAsState()
     val talkSpeaking by voice.speaking.collectAsState()
     val talkError by voice.error.collectAsState()
+    // Companion conversations stay behind the bubble: chat lists leave them out.
+    val companionThreads = remember(companionState.roster) { companionThreadIds(companionState.roster) }
+    CompositionLocalProvider(LocalHiddenThreads provides companionThreads) {
     Box(Modifier.fillMaxSize()) {
     ModalNavigationDrawer(drawerState = drawer, gesturesEnabled = !pairing && !immersive,
         drawerContent = {
@@ -258,6 +261,7 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
                 move = voice::move, release = voice::release, cancel = voice::cancel,
                 stopSpeaking = voice::stopSpeaking, clearError = voice::clearError),
             onOpen = { companionSettings = false; companionOpen = true })
+    }
     }
     }
     if (companionOpen && companionState.available) {

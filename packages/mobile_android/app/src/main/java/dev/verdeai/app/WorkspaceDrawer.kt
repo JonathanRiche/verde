@@ -35,9 +35,10 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.verdeai.core.*
 
-internal fun drawerThreads(workspace: Workspace): List<ThreadSummary> {
+/** Open chats, leaving out [hidden] (the companions' conversations, see [LocalHiddenThreads]). */
+internal fun drawerThreads(workspace: Workspace, hidden: Set<String> = emptySet()): List<ThreadSummary> {
     val open = workspace.panes.mapNotNull { it.thread_id }.toSet()
-    return workspaceThreads(workspace).filter { !it.archived && it.thread_id in open }
+    return workspaceThreads(workspace).filter { !it.archived && it.thread_id in open && it.thread_id !in hidden }
 }
 
 /** Switcher order: the core's recency rank (focus/activity newest first, closed untimed last). */
@@ -72,10 +73,10 @@ internal data class DrawerItem(val workspace: Workspace, val thread: ThreadSumma
  * every workspace newest activity first (untimed last; the stable sort keeps workspace
  * then layout order for ties), matching the desktop sidebar.
  */
-internal fun drawerItems(items: List<Workspace>, scope: String?): Pair<List<DrawerItem>, List<DrawerItem>> {
+internal fun drawerItems(items: List<Workspace>, scope: String?, hidden: Set<String> = emptySet()): Pair<List<DrawerItem>, List<DrawerItem>> {
     val rows = switcherWorkspaces(items).filter { it.open }.flatMap { ws ->
         val panes = ws.panes.associateBy { it.thread_id }
-        drawerThreads(ws).map { DrawerItem(ws, it, panes[it.thread_id]) } +
+        drawerThreads(ws, hidden).map { DrawerItem(ws, it, panes[it.thread_id]) } +
             ws.panes.filter { it.kind == "terminal" && it.terminal_id != null }.map { DrawerItem(ws, null, it) }
     }
     val (active, open) = rows.partition { it.active }
@@ -98,6 +99,7 @@ internal fun WorkspaceDrawer(state: BrowseState, currentTab: String, visible: Bo
     var searching by rememberSaveable { mutableStateOf(false) }
     var query by rememberSaveable { mutableStateOf("") }
     val all = state.workspaces?.items.orEmpty()
+    val hidden = LocalHiddenThreads.current
     val scoped = all.find { it.workspace_id == scope }
     // Under All Workspaces new work goes to the most recently used workspace.
     val target = scoped?.takeIf { it.open } ?: mostRecentOpenWorkspace(all)
@@ -140,7 +142,7 @@ internal fun WorkspaceDrawer(state: BrowseState, currentTab: String, visible: Bo
             LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(bottom = 12.dp)) {
                 if (ready) {
                     if (scoped != null && !scoped.open) item { Text("${scoped.label} is closed.", Modifier.padding(16.dp), color = VerdeColors.Muted) }
-                    val (active, open) = drawerItems(all, scope)
+                    val (active, open) = drawerItems(all, scope, hidden)
                     fun section(title: String, rows: List<DrawerItem>, chip: Boolean) {
                         val shown = rows.filter { matches(it.title) || matches(it.workspace.label) }
                         if (shown.isEmpty()) return

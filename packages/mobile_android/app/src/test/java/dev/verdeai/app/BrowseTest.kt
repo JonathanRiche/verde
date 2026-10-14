@@ -211,6 +211,22 @@ class BrowseTest {
         assertEquals(listOf("idle"), drawerItems(items, null).second.map { it.thread?.thread_id })
     }
 
+    @Test fun companionConversationsStayOutOfTheSidebarAndRecentChats() {
+        fun t(ws: String, id: String, status: String) = ThreadSummary(ws, id, id, "codex", null, null, true, false, 1L, status, "Today")
+        val threads = listOf(t("a", "moss", "working"), t("a", "old-moss", "idle"), t("a", "work", "working"), t("a", "chat", "idle"))
+        val ws = Workspace("a", "a", "/a", true, threads.map { Pane("p-${it.thread_id}", "a", "chat", it.title, thread_id = it.thread_id) }, threads)
+        val hidden = setOf("moss", "old-moss")
+        val (active, open) = drawerItems(listOf(ws), null, hidden)
+        assertEquals(listOf("work"), active.map { it.thread?.thread_id })
+        assertEquals(listOf("chat"), open.map { it.thread?.thread_id })
+        assertEquals(setOf("work", "chat"), recentThreads(K09.workspaces.data!!.copy(items = listOf(ws)), hidden = hidden)
+            .map { it.thread_id }.toSet())
+        assertTrue(hiddenPane(ws.panes.first(), hidden))
+        assertFalse(hiddenPane(ws.panes.last(), hidden))
+        // Without a roster nothing is hidden.
+        assertEquals(2, drawerItems(listOf(ws), null).first.size)
+    }
+
     @Test fun drawerAllWorkspacesOpenInterleavesNewestActivityFirst() {
         fun t(ws: String, id: String, at: Long?) = ThreadSummary(ws, id, id, "codex", null, null, true, false, at, "idle", "Today")
         fun w(id: String, rank: Long, vararg threads: ThreadSummary) = Workspace(id, id, "/$id", true,

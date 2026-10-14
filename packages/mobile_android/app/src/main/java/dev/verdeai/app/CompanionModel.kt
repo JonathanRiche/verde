@@ -120,32 +120,71 @@ internal fun visibleCrew(crew: CompanionCrew?): List<CompanionLink> =
 internal data class CompanionPulse(val needsYou: Int, val running: Int)
 
 /**
- * Counts across every workspace: Home panes flagged for attention plus crew links needing the
- * user (deduplicated by chat), and running chats plus running crew.
+ * Every companion conversation's thread id: each companion's current one and its past ones.
+ * They live behind the companion bubble, so chat lists hide them. History entries carry no
+ * workspace, so threads are matched by id alone.
  */
-internal fun companionPulse(panes: List<Pane>, crew: List<CompanionLink>): CompanionPulse {
+internal fun companionThreadIds(roster: CompanionRoster?): Set<String> =
+    roster?.companions.orEmpty().flatMap { c -> listOf(c.thread_id) + c.history.map { it.thread_id } }.filter { it.isNotEmpty() }.toSet()
+
+/** One row of the sheet's activity panel: a crew link, or another chat running anywhere on the machine. */
+internal data class CompanionActivity(val workspaceId: String, val threadId: String, val title: String, val status: ChildStatus,
+    val linkId: String? = null) {
+    val key get() = linkId?.let { "l:$it" } ?: "c:$workspaceId\u001f$threadId"
+}
+
+private fun runningChatPane(pane: Pane) = pane.kind == "chat" && !pane.attention && pane.thread_id != null && activeStatus(pane.status)
+
+/**
+ * The activity panel: the companion's crew plus every other chat running machine-wide (chats
+ * started elsewhere, e.g. from the CLI, are not linked to the companion), deduplicated by
+ * workspace and thread. A crew link whose chat is running reads as running unless it needs the
+ * user. [hidden] (companion conversations) never appear. Needs-you first, then running.
+ */
+internal fun companionActivity(panes: List<Pane>, crew: List<CompanionLink>, hidden: Set<String> = emptySet()): List<CompanionActivity> {
+    val running = panes.filter(::runningChatPane).associateBy { it.workspace_id to it.thread_id!! }
+    val seen = HashSet<Pair<String, String>>()
+    val rows = ArrayList<CompanionActivity>()
+    crew.forEach { link ->
+        val chat = link.workspace_id to link.local_thread_id
+        if (link.local_thread_id in hidden || !seen.add(chat)) return@forEach
+        val status = crewStatus(link).let { if (!it.needsYou && chat in running) ChildStatus.Running else it }
+        rows += CompanionActivity(link.workspace_id, link.local_thread_id, childTitle(link.local_thread_id, link.title), status, link.link_id)
+    }
+    running.forEach { (chat, pane) ->
+        if (chat.second in hidden || !seen.add(chat)) return@forEach
+        rows += CompanionActivity(chat.first, chat.second, pane.title.ifBlank { "Chat" }, ChildStatus.Running)
+    }
+    return rows.sortedWith(compareByDescending<CompanionActivity> { it.status.needsYou }.thenByDescending { it.status.running })
+}
+
+/**
+ * Counts across every workspace: Home panes flagged for attention plus crew links needing the
+ * user (deduplicated by chat), and the running rows of [companionActivity], so the header's
+ * running count always matches the activity panel.
+ */
+internal fun companionPulse(panes: List<Pane>, crew: List<CompanionLink>, hidden: Set<String> = emptySet()): CompanionPulse {
     val flagged = panes.filter { it.attention || it.status == "waiting_approval" }
     val flaggedChats = flagged.mapNotNull { p -> p.thread_id?.let { p.workspace_id to it } }.toSet()
     val needs = flagged.size + crew.count { crewStatus(it).needsYou && (it.workspace_id to it.local_thread_id) !in flaggedChats }
-    val runningChats = panes.filter { it.kind == "chat" && !it.attention && activeStatus(it.status) }
-        .mapNotNull { p -> p.thread_id?.let { p.workspace_id to it } }.toSet()
-    val running = runningChats.size + crew.count { crewStatus(it).running && (it.workspace_id to it.local_thread_id) !in runningChats }
-    return CompanionPulse(needs, running)
+    return CompanionPulse(needs, companionActivity(panes, crew, hidden).count { it.status.running })
 }
 
 /** "1 needs you" / "3 need you". */
 internal fun needsLabel(count: Int): String = if (count == 1) "1 needs you" else "$count need you"
 
 /** The crew pill: "2 running · 1 waiting · 1 done"; null when there is no crew. */
-internal fun crewSummary(crew: List<CompanionLink>): String? {
-    if (crew.isEmpty()) return null
-    val statuses = crew.map(::crewStatus)
+internal fun crewSummary(crew: List<CompanionLink>): String? = activitySummary(crew.map(::crewStatus))
+
+/** The activity pill: "2 running · 1 waiting · 1 done"; null when there is nothing to show. */
+internal fun activitySummary(statuses: List<ChildStatus>): String? {
+    if (statuses.isEmpty()) return null
     val running = statuses.count { it.running }
     val waiting = statuses.count { it.needsYou }
     val done = statuses.count { it == ChildStatus.Completed }
     val parts = listOfNotNull(running.takeIf { it > 0 }?.let { "$it running" }, waiting.takeIf { it > 0 }?.let { "$it waiting" },
         done.takeIf { it > 0 }?.let { "$it done" })
-    return parts.joinToString(" \u00b7 ").ifEmpty { if (crew.size == 1) "1 in crew" else "${crew.size} in crew" }
+    return parts.joinToString(" \u00b7 ").ifEmpty { if (statuses.size == 1) "1 in crew" else "${statuses.size} in crew" }
 }
 
 /** The sheet header's small status suffix: needs first, then running; nothing when idle. */

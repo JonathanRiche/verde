@@ -99,10 +99,19 @@ internal fun subagent(thread: ThreadSummary) = thread.thread_id.startsWith("suba
 /** Chat lists match the desktop sidebar: a draft that never sent a message stays hidden unless a turn is live. */
 internal fun listed(thread: ThreadSummary) = !subagent(thread) && (thread.committed || activeTurn(thread.status))
 
+/**
+ * Thread ids the chat lists leave out: the companions' conversations ([companionThreadIds]),
+ * reached through the companion bubble instead. Provided by the app shell.
+ */
+internal val LocalHiddenThreads = compositionLocalOf { emptySet<String>() }
+
+/** A chat pane for one of [hidden]'s threads. */
+internal fun hiddenPane(pane: Pane, hidden: Set<String>) = pane.kind == "chat" && pane.thread_id != null && pane.thread_id in hidden
+
 /** Use the live catalog: history belongs to the independently filtered, paged search screen. */
-internal fun recentThreads(workspaces: WorkspacesView?, limit: Int = 8): List<ThreadSummary> =
+internal fun recentThreads(workspaces: WorkspacesView?, limit: Int = 8, hidden: Set<String> = emptySet()): List<ThreadSummary> =
     workspaces?.items.orEmpty().flatMap { it.threads }
-        .filter { !it.archived && listed(it) }
+        .filter { !it.archived && listed(it) && it.thread_id !in hidden }
         .sortedWith(compareByDescending<ThreadSummary> { it.last_activity_at_ms ?: 0L }
             .thenBy { it.workspace_id }.thenBy { it.thread_id })
         .take(limit)
@@ -349,13 +358,14 @@ internal fun HomeScreen(
     onHistory: (() -> Unit)? = null,
 ) {
     val state by model.state.collectAsState()
+    val hidden = LocalHiddenThreads.current
     val panes = state.home?.items.orEmpty()
     val now = rememberNow(panes.any { it.can_stop && it.started_at_ms != null })
     Box(Modifier.fillMaxSize()) {
         BrowseFrame("Home", state, now, model::refresh, onHosts) {
             if (!gate(state, onPair)) return@BrowseFrame
             val attention = panes.filter { it.attention }
-            val running = panes.filterNot { it.attention }
+            val running = panes.filterNot { it.attention || hiddenPane(it, hidden) }
             if (attention.isNotEmpty()) {
                 header("Needs attention")
                 items(attention, key = { "attention:" + it.id }) { PaneItem(it, now, onOpenPane, paneProvider(state, it)) }
@@ -366,7 +376,7 @@ internal fun HomeScreen(
             }
             if (panes.isEmpty()) note("idle", "Nothing is running or waiting on you.")
             val labels = state.workspaces?.items.orEmpty().associate { it.workspace_id to it.label }
-            val recent = recentThreads(state.workspaces)
+            val recent = recentThreads(state.workspaces, hidden = hidden)
             if (recent.isNotEmpty()) {
                 header("Recent chats")
                 items(recent, key = { "recent:${it.workspace_id}:${it.thread_id}" }) { ThreadItem(it, now, labels[it.workspace_id], onOpenThread) }
@@ -446,6 +456,7 @@ internal fun WorkspaceScreen(
 ) {
     val state by model.state.collectAsState()
     val workspace = state.workspaces?.items?.find { it.workspace_id == workspaceId }
+    val hidden = LocalHiddenThreads.current
     val now = rememberNow(workspace?.panes.orEmpty().any { it.can_stop && it.started_at_ms != null })
     var showArchived by rememberSaveable(workspaceId) { mutableStateOf(false) }
     BrowseFrame(workspace?.label ?: "Workspace", state, now, model::refresh, onHosts, onBack) {
@@ -454,12 +465,13 @@ internal fun WorkspaceScreen(
         if (workspace.path.isNotEmpty()) note("path", workspace.path)
         if (actions != null) item(key = "actions") { actions(workspace) }
         header("Panes")
-        if (workspace.panes.isEmpty()) note("nopanes", "No open panes.")
-        items(workspace.panes, key = { "pane:" + it.id }) { PaneItem(it, now, onOpenPane, paneProvider(state, it)) }
+        val panes = workspace.panes.filterNot { hiddenPane(it, hidden) }
+        if (panes.isEmpty()) note("nopanes", "No open panes.")
+        items(panes, key = { "pane:" + it.id }) { PaneItem(it, now, onOpenPane, paneProvider(state, it)) }
         if (onNewTerminal != null && canWrite(state.host) && workspace.path.isNotEmpty()) item(key = "new-terminal") {
             TextButton(onClick = onNewTerminal, modifier = Modifier.padding(horizontal = 8.dp)) { Text("New terminal") }
         }
-        val threads = workspaceThreads(workspace).filter(::listed)
+        val threads = workspaceThreads(workspace).filter { listed(it) && it.thread_id !in hidden }
         val (archived, current) = threads.partition { it.archived }
         header("Chats")
         if (current.isEmpty()) note("nochats", "No chats in this workspace yet.")

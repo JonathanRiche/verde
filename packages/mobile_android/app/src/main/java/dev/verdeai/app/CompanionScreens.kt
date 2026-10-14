@@ -38,9 +38,7 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -74,6 +72,8 @@ internal data class CompanionSnapshot(
     val needKeys: Set<String>,
     val crewRunning: Boolean,
     val companionThread: ThreadSummary?,
+    /** The activity panel: crew plus other chats running machine-wide (see [companionActivity]). */
+    val activity: List<CompanionActivity> = emptyList(),
 )
 
 internal fun companionSnapshot(state: CompanionUiState, browse: BrowseState): CompanionSnapshot {
@@ -84,8 +84,10 @@ internal fun companionSnapshot(state: CompanionUiState, browse: BrowseState): Co
     val thread = active?.takeIf { it.thread_id.isNotEmpty() }?.let { a ->
         browse.workspaces?.items?.find { it.workspace_id == a.home_workspace_id }?.threads?.find { it.thread_id == a.thread_id }
     }
-    return CompanionSnapshot(active, needs, crew, companionPulse(panes, crew),
-        bubbleNeedKeys(needs, crew, thread), crew.any { crewStatus(it).running } || (thread != null && activeTurn(thread.status)), thread)
+    val hidden = companionThreadIds(state.roster)
+    return CompanionSnapshot(active, needs, crew, companionPulse(panes, crew, hidden),
+        bubbleNeedKeys(needs, crew, thread), crew.any { crewStatus(it).running } || (thread != null && activeTurn(thread.status)), thread,
+        companionActivity(panes, crew, hidden))
 }
 
 /**
@@ -119,6 +121,7 @@ internal fun CompanionSheet(
     var brainOnly by rememberSaveable { mutableStateOf(false) }
     var confirmNew by rememberSaveable { mutableStateOf(false) }
     var conversations by rememberSaveable { mutableStateOf(false) }
+    var strip by rememberSaveable { mutableStateOf<StripPanel?>(null) }
     DisposableEffect(companion) {
         companion.setSheetOpen(true)
         onDispose { companion.setSheetOpen(false) }
@@ -141,12 +144,17 @@ internal fun CompanionSheet(
                 CompanionPlaceholder(state, workspaces.any { it.open })
                 return@Column
             }
-            CompanionHeader(active, state.roster, pose, handoffStatus(state.view?.brain_switch) ?: companionHeaderSuffix(snapshot.needKeys.size, snapshot.pulse.running),
+            val handoff = handoffStatus(state.view?.brain_switch)
+            val shownStrip = shownPanel(strip, snapshot)
+            CompanionHeader(active, state.roster, pose, handoff ?: companionHeaderSuffix(snapshot.needKeys.size, snapshot.pulse.running),
                 enabled = state.view?.can_edit == true && !state.saving,
+                // The status count toggles the panel it summarizes.
+                onSuffix = if (handoff == null) headerPanel(snapshot)?.let { panel -> { strip = if (shownStrip != null) null else panel } } else null,
+                suffixExpanded = shownStrip != null,
                 onNewConversation = { confirmNew = true }, onConversations = { conversations = true },
                 onSwitch = companion::switchTo, onSettings = { settings = true }, onActivity = onActivity, onHideBubble = onHideBubble,
                 liveActive = liveUi?.active == true, onLive = if (live != null && liveSupported) onLive else null)
-            SummaryStrip(snapshot, workspaces, onOpenPane, onOpenChat)
+            SummaryStrip(snapshot, workspaces, shownStrip, { strip = it }, onOpenPane, onOpenChat)
             HorizontalDivider(color = VerdeColors.Border)
             Box(Modifier.weight(1f).fillMaxWidth()) {
                 when {
@@ -208,7 +216,8 @@ private fun CompanionPlaceholder(state: CompanionUiState, hasWorkspace: Boolean)
 @Composable
 private fun CompanionHeader(active: CompanionEntry, roster: CompanionRoster?, pose: CompanionPose, suffix: String?, enabled: Boolean,
     onSwitch: (String) -> Unit, onSettings: () -> Unit, onActivity: () -> Unit, onHideBubble: () -> Unit,
-    liveActive: Boolean = false, onLive: (() -> Unit)? = null, onNewConversation: () -> Unit = {}, onConversations: () -> Unit = {}) {
+    liveActive: Boolean = false, onLive: (() -> Unit)? = null, onNewConversation: () -> Unit = {}, onConversations: () -> Unit = {},
+    onSuffix: (() -> Unit)? = null, suffixExpanded: Boolean = false) {
     val character = CompanionCharacter.of(active.character)
     val name = active.name.ifBlank { character.label }
     val suffixColor = when (pose) {
@@ -219,10 +228,14 @@ private fun CompanionHeader(active: CompanionEntry, roster: CompanionRoster?, po
     Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).padding(start = 12.dp),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         CompanionAvatar(character, pose, size = 28.dp, description = "$name, ${character.label}")
-        Text(buildAnnotatedString {
-            withStyle(MaterialTheme.typography.titleMedium.toSpanStyle()) { append(name) }
-            if (suffix != null) withStyle(MaterialTheme.typography.bodySmall.toSpanStyle().copy(color = suffixColor)) { append("  · $suffix") }
-        }, Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
+            Text(name, Modifier.weight(1f, fill = false), style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            if (suffix != null) Text("  \u00b7 $suffix",
+                (if (onSuffix != null) Modifier.heightIn(min = 48.dp).clickable(onClickLabel = if (suffixExpanded) "Hide activity" else "Show activity",
+                    role = Role.Button, onClick = onSuffix).wrapContentHeight(Alignment.CenterVertically).padding(end = 8.dp) else Modifier)
+                    .semantics { if (onSuffix != null) this.selected = suffixExpanded },
+                style = MaterialTheme.typography.bodySmall, color = suffixColor, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
         onLive?.let { LiveButton(liveActive, it) }
         Box {
             var menu by remember { mutableStateOf(false) }
@@ -245,31 +258,47 @@ private fun CompanionHeader(active: CompanionEntry, roster: CompanionRoster?, po
     }
 }
 
-private enum class StripPanel { Needs, Crew }
+internal enum class StripPanel { Needs, Crew }
+
+/** The panel the header's status count stands for: needs first, then running; null when idle. */
+internal fun headerPanel(snapshot: CompanionSnapshot): StripPanel? = when {
+    snapshot.needKeys.isNotEmpty() -> StripPanel.Needs
+    snapshot.pulse.running > 0 -> StripPanel.Crew
+    else -> null
+}
+
+/** [open] while its pill still exists; a panel whose pill went away reads as closed. */
+internal fun shownPanel(open: StripPanel?, snapshot: CompanionSnapshot): StripPanel? = when (open) {
+    StripPanel.Needs -> open.takeIf { snapshot.needKeys.isNotEmpty() }
+    StripPanel.Crew -> open.takeIf { snapshot.activity.isNotEmpty() }
+    null -> null
+}
 
 /** One line of the summary strip's expanded list. */
 private data class StripRow(val key: String, val title: String, val where: String?, val tone: StripTone, val open: () -> Unit)
 private enum class StripTone { Attention, Failed, Running, Quiet }
 
 /**
- * Two small pills under the header ("3 need you", "2 running · 1 done"); tapping one expands a
- * compact, scrollable list in the layout (never over the conversation). Collapsed by default.
+ * Two small pills under the header ("3 need you", "2 running · 1 done"); tapping one (or the
+ * header's status count) expands a compact, scrollable list in the layout (never over the
+ * conversation). Collapsed by default. The activity pill covers the crew and every other chat
+ * running on the machine, so any count the header shows has a pill to expand.
  */
 @Composable
-private fun SummaryStrip(snapshot: CompanionSnapshot, workspaces: List<Workspace>, onOpenPane: (Pane) -> Unit,
-    onOpenChat: (String, String) -> Unit) {
-    var open by rememberSaveable { mutableStateOf<StripPanel?>(null) }
+private fun SummaryStrip(snapshot: CompanionSnapshot, workspaces: List<Workspace>, open: StripPanel?, onToggle: (StripPanel?) -> Unit,
+    onOpenPane: (Pane) -> Unit, onOpenChat: (String, String) -> Unit) {
     val needsCount = snapshot.needKeys.size
-    val crewLabel = crewSummary(snapshot.crew)
+    val crewLabel = activitySummary(snapshot.activity.map { it.status })
     if (needsCount == 0 && crewLabel == null) return
     fun label(ws: String) = workspaces.find { it.workspace_id == ws }?.label
     Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp),
         verticalAlignment = Alignment.CenterVertically) {
         if (needsCount > 0) StripPill(needsLabel(needsCount), VerdeColors.Warning, open == StripPanel.Needs) {
-            open = if (open == StripPanel.Needs) null else StripPanel.Needs
+            onToggle(if (open == StripPanel.Needs) null else StripPanel.Needs)
         }
-        if (crewLabel != null) StripPill(crewLabel, if (snapshot.crewRunning) VerdeColors.Accent else VerdeColors.Subtle, open == StripPanel.Crew) {
-            open = if (open == StripPanel.Crew) null else StripPanel.Crew
+        if (crewLabel != null) StripPill(crewLabel, if (snapshot.activity.any { it.status.running }) VerdeColors.Accent else VerdeColors.Subtle,
+            open == StripPanel.Crew) {
+            onToggle(if (open == StripPanel.Crew) null else StripPanel.Crew)
         }
     }
     val rows: List<StripRow> = when (open) {
@@ -278,15 +307,21 @@ private fun SummaryStrip(snapshot: CompanionSnapshot, workspaces: List<Workspace
                 if (pane.status == "failed" || pane.attention_kind == "failed") StripTone.Failed else StripTone.Attention) { onOpenPane(pane) }
         } + snapshot.crew.filter { crewStatus(it).needsYou && snapshot.needs.none { p -> p.thread_id == it.local_thread_id && p.workspace_id == it.workspace_id } }
             .map { link -> StripRow("l:" + link.link_id, childTitle(link.local_thread_id, link.title), label(link.workspace_id),
-                if (crewStatus(link) == ChildStatus.Failed) StripTone.Failed else StripTone.Attention) { onOpenChat(link.workspace_id, link.local_thread_id) } }
-        StripPanel.Crew -> snapshot.crew.map { link ->
-            val status = crewStatus(link)
-            StripRow("l:" + link.link_id, childTitle(link.local_thread_id, link.title), label(link.workspace_id), when {
+                if (crewStatus(link) == ChildStatus.Failed) StripTone.Failed else StripTone.Attention) { onOpenChat(link.workspace_id, link.local_thread_id) } } +
+            // The companion's own pending approval counts too (see [bubbleNeedKeys]).
+            listOfNotNull(snapshot.companionThread?.takeIf { t -> t.status == "waiting_approval" &&
+                snapshot.needs.none { p -> p.thread_id == t.thread_id && p.workspace_id == t.workspace_id } }?.let { t ->
+                StripRow("c:" + t.thread_id, t.title.ifBlank { snapshot.active?.name ?: "Companion" }, label(t.workspace_id), StripTone.Attention) {
+                    onOpenChat(t.workspace_id, t.thread_id)
+                } })
+        StripPanel.Crew -> snapshot.activity.map { item ->
+            val status = item.status
+            StripRow(item.key, item.title, label(item.workspaceId), when {
                 status == ChildStatus.Failed -> StripTone.Failed
                 status.needsYou -> StripTone.Attention
                 status.running -> StripTone.Running
                 else -> StripTone.Quiet
-            }) { onOpenChat(link.workspace_id, link.local_thread_id) }
+            }) { onOpenChat(item.workspaceId, item.threadId) }
         }
         null -> emptyList()
     }
