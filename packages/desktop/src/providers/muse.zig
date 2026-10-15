@@ -22,6 +22,9 @@ const ActiveProcesses = struct {
         child: *platform_process.OwnedChild,
         stdin: ?std.Io.File,
         session_id: []const u8,
+        /// The answer was published; the process is only waiting on Muse's
+        /// reminder/EOT housekeeping, which can hold the session for minutes.
+        draining: bool = false,
         next: ?*Entry = null,
     };
 
@@ -59,6 +62,25 @@ const ActiveProcesses = struct {
         }
     }
 
+    fn markDraining(self: *ActiveProcesses, entry: *Entry) void {
+        self.lock();
+        defer self.unlock();
+        entry.draining = true;
+    }
+
+    /// Stops processes that still hold `session_id` only for post-answer
+    /// housekeeping, so a follow-up send can resume the session. Muse allows
+    /// one host per session and rejects the resume with `sessionInUse`.
+    fn preemptDraining(self: *ActiveProcesses, session_id: []const u8) void {
+        self.lock();
+        defer self.unlock();
+        var current = self.head;
+        while (current) |entry| : (current = entry.next) {
+            if (!entry.draining or !std.mem.eql(u8, entry.session_id, session_id)) continue;
+            entry.child.terminateTree();
+        }
+    }
+
     // Caller holds the registry lock while using the borrowed entry.
     fn findLocked(self: *ActiveProcesses, session_id: []const u8) ?*Entry {
         var current = self.head;
@@ -68,6 +90,12 @@ const ActiveProcesses = struct {
         return null;
     }
 };
+
+const SESSION_IN_USE_NOTICE =
+    "Muse is still finishing the previous turn in this session. Send the message again in a moment.";
+/// A preempted host flushes its session log before releasing the lock.
+const session_in_use_retry_delay: std.Io.Duration = if (@import("builtin").is_test) .fromMilliseconds(20) else .fromMilliseconds(250);
+const session_in_use_max_attempts: usize = 40;
 
 const OPAQUE_HISTORY_NOTICE =
     "Muse could not replay this thread's private reasoning history. Starting a fresh Muse session.";
@@ -227,13 +255,43 @@ pub const Client = struct {
         allocator: std.mem.Allocator,
         request: provider_types.SendPromptRequest,
     ) !provider_types.SendPromptResult {
-        return sendPromptOnce(self, allocator, request) catch |err| {
+        return sendPromptResuming(self, allocator, request) catch |err| {
             if (err != error.MuseOpaqueHistory or request.thread_id == null) return err;
             if (request.on_failure) |callback| callback(request.stream_context, OPAQUE_HISTORY_NOTICE);
             var retry = request;
             retry.thread_id = null;
             return sendPromptOnce(self, allocator, retry);
         };
+    }
+
+    /// Verde publishes a Muse answer before the host finishes reminder
+    /// children, so the previous send's `muse serve` may still own the session
+    /// when the next prompt arrives. Stop that housekeeping-only host and retry
+    /// the resume until Muse releases the session lock.
+    fn sendPromptResuming(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        request: provider_types.SendPromptRequest,
+    ) !provider_types.SendPromptResult {
+        const thread_id = request.thread_id orelse return sendPromptOnce(self, allocator, request);
+        active_processes.preemptDraining(thread_id);
+        var threaded: std.Io.Threaded = .init(allocator, .{});
+        defer threaded.deinit();
+        var attempt: usize = 1;
+        while (true) : (attempt += 1) {
+            return sendPromptOnce(self, allocator, request) catch |err| {
+                if (err != error.MuseSessionInUse) return err;
+                if (attempt >= session_in_use_max_attempts) {
+                    if (request.on_failure) |callback| callback(request.stream_context, SESSION_IN_USE_NOTICE);
+                    return err;
+                }
+                // The previous send may have published its answer after the
+                // first preemption check.
+                active_processes.preemptDraining(thread_id);
+                try threaded.io().sleep(session_in_use_retry_delay, .awake);
+                continue;
+            };
+        }
     }
 
     fn sendPromptOnce(
@@ -505,6 +563,7 @@ pub const Client = struct {
             }
 
             publishAnswerIfReady(request, reply.items, agent_message_completed, foreground_work.count(), &published_answer);
+            if (published_answer and !active.draining) active_processes.markDraining(&active);
 
             if (!cancel_sent) {
                 if (request.on_should_stop) |should_stop| {
@@ -745,10 +804,20 @@ fn waitForSessionSetupAlloc(allocator: std.mem.Allocator, reader: anytype, exist
 fn failIfRpcError(value: std.json.Value) !void {
     const error_value = acp.getObjectField(value, "error") orelse return;
     const message = acp.getOptionalObjectString(error_value, "message") orelse "";
+    if (isSessionInUse(error_value)) return error.MuseSessionInUse;
     if (containsAuthHint(message)) return error.MuseSignedOut;
     if (isApprovalModeRejected(message)) return error.MuseApprovalModeRejected;
     if (isOpaqueReasoningHistory(message)) return error.MuseOpaqueHistory;
     return error.MuseProtocolFailed;
+}
+
+const SESSION_IN_USE_CODE: i64 = -32021;
+
+fn isSessionInUse(error_value: std.json.Value) bool {
+    if (acp.getObjectField(error_value, "data")) |data| {
+        if (std.mem.eql(u8, acp.getOptionalObjectString(data, "kind") orelse "", "sessionInUse")) return true;
+    }
+    return (acp.getOptionalObjectInteger(error_value, "code") orelse 0) == SESSION_IN_USE_CODE;
 }
 
 fn isOpaqueReasoningHistory(message: []const u8) bool {
@@ -1873,4 +1942,98 @@ test "Muse recovers a missing failure push from the saved view without hanging" 
         .on_failure = Sink.failure,
     }));
     try std.testing.expect(sink.saw_quota);
+}
+
+test "Muse maps sessionInUse RPC errors to a distinct error" {
+    const allocator = std.testing.allocator;
+    var by_kind = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"id":2,"error":{"code":-32021,"data":{"kind":"sessionInUse","retryable":false},"message":"session s is already in use"}}
+    , .{});
+    defer by_kind.deinit();
+    try std.testing.expectError(error.MuseSessionInUse, failIfRpcError(by_kind.value));
+    var by_code = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"id":2,"error":{"code":-32021,"message":"busy"}}
+    , .{});
+    defer by_code.deinit();
+    try std.testing.expectError(error.MuseSessionInUse, failIfRpcError(by_code.value));
+    var other = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"id":2,"error":{"code":-32602,"data":{"kind":"invalidParams"},"message":"bad"}}
+    , .{});
+    defer other.deinit();
+    try std.testing.expectError(error.MuseProtocolFailed, failIfRpcError(other.value));
+}
+
+test "Muse follow-up send preempts a host still draining the same session" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Like `muse serve`, one host owns a session: a second resume fails with
+    // sessionInUse until the first exits. After answering, the host keeps
+    // running (reminder housekeeping) until stdin closes or it is terminated.
+    const script =
+        \\#!/bin/bash
+        \\owned=0
+        \\release() { [ "$owned" = 1 ] && rmdir session.lock 2>/dev/null; exit 0; }
+        \\trap release TERM
+        \\while IFS= read -r -t 20 line; do
+        \\  case "$line" in
+        \\    *'"method":"initialize"'*) echo '{"jsonrpc":"2.0","id":1,"result":{}}' ;;
+        \\    *'"method":"session/resume"'*)
+        \\      if mkdir session.lock 2>/dev/null; then owned=1; echo '{"jsonrpc":"2.0","id":2,"result":{"session":{"sessionId":"held"}}}';
+        \\      else echo '{"jsonrpc":"2.0","id":2,"error":{"code":-32021,"data":{"kind":"sessionInUse","retryable":false},"message":"session held is already in use"}}'; fi ;;
+        \\    *'"method":"turn/start"'*)
+        \\      echo '{"jsonrpc":"2.0","id":5,"result":{"turnId":"t"}}'
+        \\      echo '{"jsonrpc":"2.0","method":"item/completed","params":{"item":{"itemId":"a","kind":"agentMessage","text":"hi","turnId":"t"}}}'
+        \\      [[ "$line" == *'"text":"second"'* ]] && echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"turnId":"t","terminal":"completed"}}' ;;
+        \\  esac
+        \\done
+        \\release
+    ;
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "fake-muse", .{ .permissions = .fromMode(0o700) });
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, script);
+    }
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buffer);
+    const executable = try std.fs.path.join(allocator, &.{ path_buffer[0..path_len], "fake-muse" });
+    defer allocator.free(executable);
+    var client = try Client.init(allocator, .{ .executable = executable, .cwd = path_buffer[0..path_len] });
+    defer client.deinit();
+
+    const First = struct {
+        answered: std.atomic.Value(bool) = .init(false),
+        result: anyerror!void = {},
+        fn answerReady(context: ?*anyopaque, _: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.answered.store(true, .release);
+        }
+        fn run(self: *@This(), c: *Client) void {
+            const sent = c.sendPrompt(std.testing.allocator, .{
+                .prompt = "first",
+                .thread_id = "held",
+                .stream_context = self,
+                .on_answer_ready = answerReady,
+            }) catch |err| {
+                self.result = err;
+                return;
+            };
+            std.testing.allocator.free(sent.reply_text);
+            std.testing.allocator.free(sent.thread_id);
+        }
+    };
+    var first: First = .{};
+    const thread = try std.Thread.spawn(.{}, First.run, .{ &first, &client });
+    var waited: usize = 0;
+    while (!first.answered.load(.acquire)) : (waited += 1) {
+        if (waited > 500) return error.FixtureTimedOut;
+        try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+    }
+    const second = try client.sendPrompt(allocator, .{ .prompt = "second", .thread_id = "held" });
+    defer allocator.free(second.reply_text);
+    defer allocator.free(second.thread_id);
+    try std.testing.expectEqualStrings("hi", second.reply_text);
+    thread.join();
+    try first.result;
 }
