@@ -12,3 +12,5 @@ __pycache__/
 .tmp_video_review/
 tmp/
 notes/mac-webview-smoke/manual-evidence/
+.verde/WORKSPACE.md
+.verde/tmp.md
