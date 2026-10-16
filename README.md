@@ -6,35 +6,40 @@
 
 <p align="center">
   <strong>Every coding agent. One tiling window.</strong><br />
-  Local · native · keyboard-first
+  Run Codex, Claude Code, Cursor, OpenCode, Grok Build and more side by side.<br />
+  Native. Local-first. Free and open source.
 </p>
 
 <p align="center">
-  <a href="https://verdeai.dev/">Website</a> ·
-  <a href="https://verdeai.dev/docs/quickstart">Docs</a> ·
-  <a href="https://github.com/JonathanRiche/verde/releases">Releases</a> ·
+  <a href="https://verdeai.dev/"><strong>Website</strong></a> ·
+  <a href="https://verdeai.dev/docs/quickstart">Quickstart</a> ·
+  <a href="https://verdeai.dev/docs">Docs</a> ·
+  <a href="https://github.com/JonathanRiche/verde/releases">Download</a> ·
   <a href="LICENSE">MIT</a>
 </p>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/JonathanRiche/verde/master/assets/themes/verde.png" alt="Verde tiling workspace — Codex GUI chat, Claude Code TUI, Amp, Grok Build, and shell in one window" width="100%" />
+  <img src="https://raw.githubusercontent.com/JonathanRiche/verde/master/assets/readme/verde-desktop.webp" alt="Verde desktop: a Codex chat, a Claude Code TUI and a shell tiled in one window, with approval and mid-turn steering" width="100%" />
 </p>
 
 <p align="center">
-  <em>Codex GUI + Claude Code TUI + Amp + Grok Build — tiled or scrolled with shell. Every agent local, no hosted relay.</em>
+  <code>curl -fsSL https://verdeai.dev/install.sh | sh</code><br />
+  <sub>Linux · macOS · Windows: <a href="#install">all install options</a></sub>
 </p>
 
 ---
 
 ## Why Verde
 
-Most AI coding tools pick a lane: a chat sidebar, a terminal CLI, or a hosted web app. Verde is the **workstation** for the agents you already run locally.
+You already pay for Claude, ChatGPT, or Cursor. Verde puts every agent you run into one fast, keyboard-driven workspace. No new subscription, no API keys, and no hosted relay sitting between you and your code.
 
-- **One window for every agent.** Codex, Claude Code, OpenCode, Cursor, Pi, FX, and Grok Build as native chat *or* TUI panes; Amp as a terminal TUI.
-- **A real tiling workspace.** Split chat, terminal, and browser — or scroll them as a Niri-style strip when you open more panes. Layouts persist.
-- **Local-first.** Verde drives the provider CLIs already on your machine. No Verde-hosted inference, no prompt relay, no telemetry sink.
-- **Keyboard-first.** Command palette (`Ctrl+Shift+P`), pane focus, zoom, and workspace jumps — remappable in one config file.
-- **Native, not Electron.** Zig + [Palette](packages/palette) (our in-tree GUI framework, with its own Wayland/AppKit/Win32 platform layer and Vulkan/Metal/Direct3D 11 renderer), Ghostty VT for terminals, system webview for the browser pane.
+- **Every agent, side by side.** Codex, Claude Code, OpenCode, Cursor, Pi, FX and Grok Build run as native GUI chats *or* their own TUIs. Amp runs as a TUI.
+- **Uses the plans you already have.** Verde drives the provider CLIs on your machine. It does not host models or proxy prompts, and it has no telemetry sink.
+- **Approve and steer in place.** Allow a command, redirect a running turn, or queue a follow-up without breaking the agent's flow.
+- **A real tiling workspace.** Tile chats, terminals and a browser together, or scroll them as a Niri-style strip. Layouts persist.
+- **Point at it, and the agent fixes it.** The built-in browser has Design Mode: click an element or draw a region, and the visual context goes straight to your agent.
+- **Agents keep working when you close the window.** A headless session daemon owns every turn and terminal, so work survives restarts and upgrades.
+- **Native, not Electron.** Built in Zig on our own GPU UI framework. Idle cost is low, prompt acceptance takes under a millisecond, and long transcripts stream smoothly.
 
 | | Verde | tmux + CLIs | Hosted agent apps | IDE extension |
 | --- | :---: | :---: | :---: | :---: |
@@ -42,11 +47,31 @@ Most AI coding tools pick a lane: a chat sidebar, a terminal CLI, or a hosted we
 | Native GUI chat + TUI | ✓ | – | ~ | – |
 | Embedded browser + Design Mode | ✓ | – | ~ | – |
 | Local-only (no relay) | ✓ | ✓ | – | ~ |
+| Phone approval + steering | ✓ | – | ~ | – |
 | Scriptable live control | ✓ | ~ | – | – |
 
 ✓ full · ~ partial · – not really
 
-### Supported agents
+---
+
+## Start at your desk. Finish anywhere.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/JonathanRiche/verde/master/assets/readme/verde-mobile.webp" alt="Verde mobile: a Claude chat on a phone. Approve an edit, steer the turn, review the diff and push." width="100%" />
+</p>
+
+Your agents run on your machines, and the companion apps keep you in the loop when you're away from the desk.
+
+- **Your agent needs you? Approve it in one tap.** Approval requests and finished turns reach your phone.
+- **Steer it mid-turn.** It's the same chat with the same context, continued from your pocket.
+- **A real terminal and a real diff.** Review changes and push from your phone.
+- **Every machine in one app.** Pair your desktop, a home server, or a cloud box, and switch between them in one tap.
+
+The iOS and Android apps are in beta. A browser-based web client is also available. To pair them, see [Serve, Pair, and Connect](docs/serve-pair-connect.md).
+
+---
+
+## Supported agents
 
 | Agent | GUI chat | Terminal TUI | How Verde talks to it |
 | --- | :---: | :---: | --- |
@@ -58,8 +83,6 @@ Most AI coding tools pick a lane: a chat sidebar, a terminal CLI, or a hosted we
 | **FX** | ✓ | ✓ | Local `fx` CLI ACP (`fx acp`) + embedded TUI |
 | **Grok Build** | ✓ | ✓ | Local `grok` CLI ACP (`grok agent stdio`) + embedded TUI |
 | **Amp** | – | ✓ | Local `amp` CLI in an embedded Ghostty pane |
-
-Verde does not host models or relay prompts. Install the provider CLIs you care about; Verde drives them on your machine.
 
 → Setup notes: [Provider docs](https://verdeai.dev/docs/providers)
 
@@ -88,11 +111,12 @@ Or grab a package from [GitHub Releases](https://github.com/JonathanRiche/verde/
 | Windows x64 | `verde-v*-windows-x86_64.zip` → verify `.sha256`, run packaged `install.ps1` |
 | Arch Linux | [`verde-bin`](https://aur.archlinux.org/packages/verde-bin) (`yay -S verde-bin`) |
 
-Windows installs per-user (no admin), adds a Start Menu shortcut, and needs the [WebView2 Evergreen Runtime](https://developer.microsoft.com/microsoft-edge/webview2/). Linux browser support uses system WPE WebKit — the installer warns if packages are missing; set `VERDE_INSTALL_BROWSER_DEPS=1` to install them.
+Windows installs per user (no admin rights needed), adds a Start Menu shortcut, and needs the [WebView2 Evergreen Runtime](https://developer.microsoft.com/microsoft-edge/webview2/). On Linux, the browser pane uses the system's WPE WebKit. The installer warns if those packages are missing; set `VERDE_INSTALL_BROWSER_DEPS=1` to have it install them.
 
 Full install variants and platform notes: [verdeai.dev/#install](https://verdeai.dev/#install) · [Troubleshooting](https://verdeai.dev/docs/troubleshooting)
 
-### macOS legacy database repair
+<details>
+<summary><strong>macOS: legacy database repair</strong></summary>
 
 If Verde bounces once in the Dock and does not open with a `DatabaseSchemaTooOld` startup error, quit Verde and run:
 
@@ -102,11 +126,13 @@ curl -fsSL https://raw.githubusercontent.com/JonathanRiche/verde/master/scripts/
 
 The repair only updates legacy schema-version-0 databases. It creates a timestamped backup beside `state.sqlite` before using Verde's supported session-daemon migration path; already-migrated databases are left unchanged.
 
+</details>
+
 ---
 
 ## First five minutes
 
-Verde does **not** ship a model. Install and authenticate at least one provider CLI first:
+Verde does **not** ship a model. Install and sign in to at least one provider CLI first:
 
 | Provider | Setup |
 | --- | --- |
@@ -114,24 +140,20 @@ Verde does **not** ship a model. Install and authenticate at least one provider 
 | **Claude Code** | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) + Node on `PATH` → log in |
 | **OpenCode** | [OpenCode](https://github.com/anomalyco/opencode) on `PATH` |
 | **Cursor** | [Cursor CLI](https://cursor.com/docs/cli/installation) → `agent login` (or `CURSOR_API_KEY`) |
-| **Pi** | [pi](https://pi.dev) on `PATH` · GUI chat + terminal TUI |
-| **FX** | [fx](https://fx.sh) → `fx login` · GUI chat + terminal TUI |
-| **Grok Build** | [Grok Build](https://docs.x.ai/build/overview#install) → `grok login` · GUI chat + terminal TUI |
-| **Amp** | [Amp](https://ampcode.com) on `PATH` · terminal TUI |
+| **Pi** | [pi](https://pi.dev) on `PATH` |
+| **FX** | [fx](https://fx.sh) → `fx login` |
+| **Grok Build** | [Grok Build](https://docs.x.ai/build/overview#install) → `grok login` |
+| **Amp** | [Amp](https://ampcode.com) on `PATH` (terminal TUI) |
 
-Then:
+Then run `verde`:
 
-```bash
-verde
-```
+1. **Import a project.** Use the sidebar `+`, or right-click the rail. Threads and agents run against that workspace root.
+2. **Start a chat.** Click the workspace pencil, or turn on prefix mode and press `Ctrl+B`, then `c`. Pick a provider, a model and run permissions, then send a prompt.
+3. **Tile a browser.** Press `Ctrl+Shift+B` to open the native webview (WPE / WKWebView / WebView2).
+4. **Open a terminal.** In prefix mode, `Ctrl+B`, then `t` opens a terminal tab, and `Shift+T` opens a standalone pane. Launch the Codex, Claude or Grok TUIs from the palette or with `verde live agent open`.
+5. **Jump anywhere.** `Ctrl+Shift+P` opens the command palette, which finds threads, panes, workspaces and app commands.
 
-1. **Import a project** — sidebar `+` or right-click the rail. Threads and agents run against that workspace root.
-2. **New chat** — click the workspace pencil, or enable prefix mode and press `Ctrl+B`, then `c`. Pick provider + model, set run permissions, send a prompt.
-3. **Tile a browser** — `Ctrl+Shift+B` (native webview: WPE / WKWebView / WebView2).
-4. **New terminal tab** — with prefix mode enabled, press `Ctrl+B`, then `t`. `Shift+T` still opens a standalone terminal pane beside the focused one. Open Codex/Claude/Grok TUIs from the palette or `verde live agent open`.
-5. **Command palette** — `Ctrl+Shift+P` jumps to threads, panes, workspaces, and app commands.
-
-If no GUI provider is ready, Verde shows a **Connect an AI provider** screen so you can finish setup without guessing.
+If no GUI provider is ready yet, Verde shows a **Connect an AI provider** screen that walks you through setup.
 
 → Full walkthrough: [Quickstart](https://verdeai.dev/docs/quickstart)
 
@@ -140,36 +162,32 @@ If no GUI provider is ready, Verde shows a **Connect an AI provider** screen so 
 ## Features
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/JonathanRiche/verde/master/assets/themes/ristretto.png" alt="Same multi-agent layout under the Ristretto theme" width="100%" />
+  <img src="https://raw.githubusercontent.com/JonathanRiche/verde/master/assets/themes/verde.png" alt="Verde tiling workspace: Codex GUI chat, Claude Code TUI, Amp, Grok Build and a shell in one window" width="100%" />
 </p>
 
 ### Tiling workspace, not a chat box
 
-Every pane is first-class. Split a chat beside a browser, drop a terminal next to it, zoom with `Alt+Z`, and rearrange with `Ctrl+Shift+H/J/K/L`. Layouts and per-terminal zoom persist across launches.
+Every pane is first-class. Split a chat beside a browser and drop a terminal next to it. Zoom with `Alt+Z` and rearrange with `Ctrl+Shift+H/J/K/L`. Layouts and per-terminal zoom persist across launches.
 
 ### Scrolling pane layout (Niri-style)
 
-With two or more tiled panes, Verde can switch to a horizontal or vertical strip — free-form wheel/touchpad panning, resizable columns, sidebar reorder, and hover-edge navigation. **Settings → Workspace** (or the command palette) chooses Automatic / Always / Disabled, per-workspace overrides, direction, and panes-per-view.
+With two or more tiled panes, Verde can switch to a horizontal or vertical strip. The strip supports free-form wheel and touchpad panning, resizable columns, sidebar reordering and hover-edge navigation. In **Settings → Workspace** or the command palette, choose Automatic, Always or Disabled. You can also set per-workspace overrides, the direction, and how many panes fit in view.
 
 ### Command palette (`Ctrl+Shift+P`)
 
-One Raycast-style launcher ranks threads, open panes, workspaces, and commands. `Ctrl+Enter` opens a result in a new pane. Slash commands like `/stack` and `/process` run from the composer.
+One Raycast-style launcher ranks threads, open panes, workspaces and commands. `Ctrl+Enter` opens a result in a new pane. Slash commands such as `/stack` and `/process` run from the composer.
 
 ### Browser + Design Mode
 
-Tile a native webview next to your agent. Point at an element or draw a region, describe the change, and route visual context into a chat or terminal TUI — without leaving the workspace.
-
-### Experimental companion
-
-Opt-in under **Settings → Experimental**: a named character (Sprout, Moss, or Vireo — you pick and name it) that orchestrates all of Verde across every workspace. It delegates work to chats, shows its crew's live status, collects everything that needs your approval in one inbox, and runs on whichever connected model you choose. Still experimental — APIs and UI may change.
+Tile a native webview next to your agent. Point at an element or draw a region, describe the change, and send the visual context to a chat or a terminal TUI without leaving the workspace.
 
 ### Project-scoped terminal dock
 
-Ghostty-powered terminals under every workspace. Shell tabs, agent launch profiles, OSC titles, and zoom that stick with the layout.
+Every workspace has its own Ghostty-powered terminals, with shell tabs, agent launch profiles, OSC titles, and zoom that stays with the layout.
 
 ### Managed processes (`verde.toml`)
 
-Declare dev servers and agents once; start/stop/restart from chat or CLI:
+Declare dev servers and agents once, then start, stop or restart them from chat or the CLI:
 
 ```toml
 [processes.web]
@@ -185,22 +203,26 @@ hooks = true
 
 ### Headless session daemon
 
-Chat turns and terminal sessions live in a **session daemon**, not the window. The GUI, CLI, MCP bridge, and the experimental web client all attach as detached clients — agent turns keep running and land durably if the window closes, and the daemon drains and upgrades itself when a new Verde version starts. Drafts, image attachments, and transcripts persist across restarts.
+Chat turns and terminal sessions live in a **session daemon**, not in the window. The GUI, CLI, MCP bridge, web client and mobile apps all attach to it as clients. If you close the window, agent turns keep running and their results are saved. When a new Verde version starts, the daemon finishes its current work and upgrades itself. Drafts, image attachments and transcripts persist across restarts.
+
+### Experimental companion
+
+Turn it on in **Settings → Experimental**. The companion is a named character (Sprout, Moss or Vireo; you pick it and name it) that orchestrates Verde across every workspace. It hands work off to chats, shows its crew's live status, and gathers everything that needs your approval into one inbox. It runs on whichever connected model you choose, and it follows you to the web and mobile clients.
 
 ### Scriptable from your shell
 
-Every running instance exposes local IPC (`verde live`). Inspect panes, open chats, send prompts, steer a running turn, write to terminals, open the browser — from hooks, dotfiles, or automation:
+Every running instance exposes local IPC through `verde live`. From hooks, dotfiles or automation, you can inspect panes, open chats, send prompts, steer a running turn, write to terminals and open the browser:
 
 ```bash
 verde live status --json
-verde live chat open --workspace $WS --provider codex --model gpt-5.6-sol --reasoning high
+verde live chat open --workspace $WS --provider codex --model gpt-6.1-sol --reasoning high
 verde live chat send --pane $PANE --prompt "run the tests and fix failures"
 verde live chat followup --pane $PANE --prompt "also update the changelog"  # steer the running turn
 verde live terminal write --focused --text $'cargo test\r'
 verde open http://localhost:3000
 ```
 
-The same chat surface is exposed to agents over MCP (`verde mcp`): open panes, send prompts, read transcripts, and queue mid-turn follow-ups — daemon-direct, without stealing focus or touching your composer.
+Agents get the same chat surface over MCP (`verde mcp`). They can open panes, send prompts, read transcripts and queue follow-ups mid-turn. These calls go straight to the daemon, so they never steal focus or touch your composer.
 
 → Full surface: [CLI reference](https://verdeai.dev/docs/cli)
 
@@ -220,11 +242,11 @@ verde theme import https://verdeai.dev/themes/tokyo-night.json
 <p align="center">
   <img src="https://raw.githubusercontent.com/JonathanRiche/verde/master/assets/themes/kanagawa.png" alt="Kanagawa" width="32%" />
   <img src="https://raw.githubusercontent.com/JonathanRiche/verde/master/assets/themes/osaka-jade.png" alt="Osaka Jade" width="32%" />
-  <img src="https://raw.githubusercontent.com/JonathanRiche/verde/master/assets/themes/matte-black.png" alt="Matte Black" width="32%" />
+  <img src="https://raw.githubusercontent.com/JonathanRiche/verde/master/assets/themes/ristretto.png" alt="Ristretto" width="32%" />
 </p>
 
 <p align="center">
-  <em>Same workspace, different skins — try them live on <a href="https://verdeai.dev/">verdeai.dev</a> (also Catppuccin Latte, Ristretto, Verde default).</em>
+  <em>Same workspace, different skins. Try them live on <a href="https://verdeai.dev/">verdeai.dev</a>, along with Catppuccin Latte, Matte Black and the Verde default.</em>
 </p>
 
 ---
@@ -259,59 +281,12 @@ verde theme import https://verdeai.dev/themes/tokyo-night.json
 | Design Mode | [docs/design-mode](https://verdeai.dev/docs/design-mode) |
 | CLI (`verde live`, state, browser) | [docs/cli](https://verdeai.dev/docs/cli) |
 | Config, themes, `verde.toml` | [docs/config](https://verdeai.dev/docs/config) |
+| Pairing remote machines + mobile | [Serve, Pair, and Connect](docs/serve-pair-connect.md) |
 | Troubleshooting | [docs/troubleshooting](https://verdeai.dev/docs/troubleshooting) |
 
 Agent-friendly crawl: [llms.txt](https://verdeai.dev/llms.txt) · [llms-full.txt](https://verdeai.dev/llms-full.txt) · any page as `/docs/<slug>.md`
 
----
-
-## Development
-
-Source builds live in [`packages/desktop/`](packages/desktop). Use [`mise`](https://mise.jdx.dev/) from the repo root (Zig `0.16.0` is pinned in [`mise.toml`](mise.toml)):
-
-```bash
-mise install
-mise run setup
-mise run dev-build # routine desktop development build
-mise run dev      # build + run (native webview)
-```
-
-| Task | Command |
-| --- | --- |
-| Install + check dependencies (Linux uses sudo for WPE WebKit packages) | `mise run setup` |
-| Dev run | `mise run dev` |
-| Desktop development build | `mise run dev-build` |
-| Full build/install | `mise run build` |
-| Web client (Zig gateway + Solid SPA) | `mise run web-app` / `mise run web-app-run` |
-
-**Do not use bare `zig build`** — the default Debug + WPE path is known to fail. Prefer `mise run dev-build` for desktop development or `mise run dev` to launch, or explicitly:
-
-```bash
-zig build dev-build --release=safe -Dbrowser-backend=native_webview
-```
-
-Platform notes (WebView2 SDK, WPE packages, macOS codesign, Windows MSVC): see [Troubleshooting](https://verdeai.dev/docs/troubleshooting) and comments in [`scripts/`](scripts/).
-
-The UI stack is Palette end to end (window, events, scale, fonts and GPU rendering) — not web UI, ImGui or SDL. Desktop package overview: [`packages/desktop`](packages/desktop).
-
----
-
-## Under the hood
-
-- **Zig 0.16** — native executable, no Electron shell
-- **Palette** — in-tree Zig GUI framework: windowing, input, fonts and GPU rendering
-- **Headless session daemon** — owns chat turns and PTYs; GUI, web gateway, CLI, and MCP are detached clients, so agent work survives window restarts
-- **Ghostty / libghostty-vt** — embedded terminal engine, pinned to upstream (no vendored fork)
-- **Native webview** — WPE WebKit · WKWebView · WebView2 (no bundled Chromium)
-- **SQLite** — local projects, threads, transcripts, drafts, and image attachments
-
-The render loop is tuned for low idle cost: prompt acceptance is sub-millisecond even on long threads, daemon round-trips run off the render thread, and streaming large transcripts stays O(delta) per update.
-
-Third-party notices and licenses for vendored components are listed under [Third-party components](#third-party-components) below when redistributing.
-
----
-
-## Config cheat sheet
+### Config cheat sheet
 
 | What | Where |
 | --- | --- |
@@ -325,18 +300,59 @@ Example stack and full `verde.json` schema: [Configuration & state](https://verd
 
 ---
 
+## Under the hood
+
+- **Zig 0.16**: a native executable with no Electron shell.
+- **[Palette](packages/palette)**: our in-tree Zig GUI framework. It handles windowing, input, fonts and GPU rendering, with its own Wayland/AppKit/Win32 platform layer and a Vulkan/Metal/Direct3D 11 renderer.
+- **Headless session daemon**: owns chat turns and PTYs. The GUI, web gateway, mobile apps, CLI and MCP are all clients, so agent work survives window restarts.
+- **Ghostty / libghostty-vt**: the embedded terminal engine, pinned to upstream rather than a vendored fork.
+- **Native webview**: WPE WebKit, WKWebView or WebView2, with no bundled Chromium.
+- **SQLite**: stores local projects, threads, transcripts, drafts and image attachments.
+
+---
+
+## Development
+
+Source builds live in [`packages/desktop/`](packages/desktop). Use [`mise`](https://mise.jdx.dev/) from the repo root (Zig `0.16.0` is pinned in [`mise.toml`](mise.toml)):
+
+```bash
+mise install
+mise run setup      # install + check build dependencies (Linux uses sudo for WPE WebKit packages)
+mise run dev-build  # routine desktop development build
+mise run dev        # build + run (native webview)
+```
+
+| Task | Command |
+| --- | --- |
+| Desktop development build | `mise run dev-build` |
+| Dev run | `mise run dev` |
+| Full build/install | `mise run build` |
+| Web client (Zig gateway + Solid SPA) | `mise run web-app` / `mise run web-app-run` |
+
+**Do not use bare `zig build`**: the default Debug + WPE path is known to fail. Use the `mise` tasks above, or pass the flags explicitly:
+
+```bash
+zig build dev-build --release=safe -Dbrowser-backend=native_webview
+```
+
+For platform notes (WebView2 SDK, WPE packages, macOS codesigning, Windows MSVC), see [Troubleshooting](https://verdeai.dev/docs/troubleshooting) and the comments in [`scripts/`](scripts/). The mobile apps live in [`packages/mobile_ios`](packages/mobile_ios) and [`packages/mobile_android`](packages/mobile_android), and they share [`packages/client_core`](packages/client_core).
+
+---
+
 ## Third-party components
 
 Main third-party pieces used by the desktop app:
 
-- `@anthropic-ai/claude-agent-sdk` — Claude Code provider integration
-- `fff.nvim` / `fff-c` / `fff-search` — file indexing/search ([`vendor/fff`](vendor/fff), MIT)
-- Ghostty / `libghostty-vt` — terminal emulation (MIT)
-- palette-native — windowing, input, fonts and GPU rendering, vendored in [`packages/palette`](packages/palette) (see `VENDORED_FROM`)
-- `zqlite` — SQLite access (MIT-style)
-- `zig_dif` / `zig_markdown` — chat markdown and code rendering
-- `stb_image` — image decoding ([`vendor/stb_image.h`](vendor/stb_image.h))
-- Font assets (Codicon, Nerd Fonts, Noto Sans, JetBrains Mono Nerd Font, Cal Sans) — see [`packages/desktop/src/assets/fonts`](packages/desktop/src/assets/fonts)
+- `@anthropic-ai/claude-agent-sdk`: Claude Code provider integration
+- Ghostty / `libghostty-vt`: terminal emulation (MIT)
+- palette-native: windowing, input, fonts and GPU rendering, vendored in [`packages/palette`](packages/palette) (see `VENDORED_FROM`)
+- `fff.nvim` / `fff-c` / `fff-search`: file indexing and search ([`vendor/fff`](vendor/fff), MIT)
+- `zqlite`: SQLite access (MIT-style)
+- `z-toml`: `verde.toml` parsing
+- tree-sitter: syntax highlighting, via [`packages/zig_treesitter`](packages/zig_treesitter)
+- `zig_dif` / `zig_markdown`: chat markdown, diff and code rendering
+- `stb_image`: image decoding ([`vendor/stb_image.h`](vendor/stb_image.h))
+- Fonts: Noto Sans, Noto Sans Symbols, Noto Emoji, JetBrains Mono Nerd Font, Symbols Nerd Font, Codicon and Cal Sans. Licenses are in [`packages/desktop/src/assets/fonts`](packages/desktop/src/assets/fonts).
 
 If you redistribute Verde, keep the relevant upstream notices with the distributed app and vendored source.
 
