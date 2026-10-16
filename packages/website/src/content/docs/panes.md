@@ -219,7 +219,8 @@ workspace: your companion orchestrates all of Verde from any workspace.
 - **The panel.** Click the dock to open a side panel with a **Needs you**
   inbox (every chat on the machine waiting on an approval), the companion's
   **Crew** (chats it delegated to, with live status), and the conversation.
-  Click any inbox or crew row to jump to that chat.
+  Click any inbox or crew row to jump to that chat. The panel slides in and
+  out; turn on **Companion** under Settings → Reduce motion to make it snap.
 - **Characters and names.** Click the companion's name to rename it, switch
   between Sprout, Moss, and Vireo, add more companions, or remove one.
   Characters also set temperament: Sprout checks in before big moves, Moss

@@ -286,6 +286,8 @@ pub const ReducedMotion = struct {
     chat: bool = false,
     /// Sidebar slide/reorder and the settings modal fade.
     chrome: bool = false,
+    /// Companion panel open/close slide and dock crossfade.
+    companion: bool = false,
 
     pub const Part = std.meta.FieldEnum(ReducedMotion);
 

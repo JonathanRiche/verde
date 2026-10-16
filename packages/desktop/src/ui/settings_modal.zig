@@ -41,6 +41,7 @@ pub const Control = enum(u8) {
     reduced_motion_status_pulse,
     reduced_motion_chat,
     reduced_motion_chrome,
+    reduced_motion_companion,
     workspace_tabs_automatic,
     workspace_tabs_always,
     workspace_tabs_disabled,
@@ -2239,6 +2240,7 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
         .reduced_motion_status_pulse,
         .reduced_motion_chat,
         .reduced_motion_chrome,
+        .reduced_motion_companion,
         => {
             const motion = &state.settings_controller.draft.reduced_motion;
             for (REDUCED_MOTION_PARTS) |part| {
@@ -3972,6 +3974,7 @@ const REDUCED_MOTION_PARTS = [_]ReducedMotionRow{
     .{ .part = .status_pulse, .control = .reduced_motion_status_pulse, .label = "Status pulses" },
     .{ .part = .chat, .control = .reduced_motion_chat, .label = "Chat animations" },
     .{ .part = .chrome, .control = .reduced_motion_chrome, .label = "Sidebar & dialogs" },
+    .{ .part = .companion, .control = .reduced_motion_companion, .label = "Companion" },
 };
 
 fn reducedMotionPart(motion: app_config.ReducedMotion, part: app_config.ReducedMotion.Part) bool {

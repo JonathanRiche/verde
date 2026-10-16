@@ -11,6 +11,7 @@ const companion_roster = @import("../state/companion_roster.zig");
 const runtime = @import("runtime.zig");
 const theme = @import("theme.zig");
 const text_measure = @import("text_measure.zig");
+const profiler = @import("../runtime/profiler.zig");
 
 // Keep settings_modal tests on the registered root suite without editing main.zig.
 test {
@@ -30,6 +31,11 @@ const DOCK_TEXT_PAD: f32 = 14.0;
 const DOCK_TEXT_MAX: f32 = 220.0;
 /// Room kept between the bubble and the window edge for its badge and shadow.
 const DOCK_EDGE_MARGIN: f32 = 6.0;
+/// Open/close transition: the panel slides this far in from the right while
+/// it fades; the dock crossfades the other way.
+const PANEL_SLIDE: f32 = 28.0;
+const OPEN_MS: i64 = 220;
+const CLOSE_MS: i64 = 160;
 const PANEL_WIDTH: f32 = 420.0;
 const PANEL_INSET: f32 = 10.0;
 const HEADER_HEIGHT: f32 = 64.0;
@@ -224,13 +230,65 @@ pub fn hitAt(state: *const runtime.AppState, x: f32, y: f32) ?controller.HitActi
     return state.companion_controller.hitAt(x, y);
 }
 
-/// Renders the Companion above panes and below true modals.
+/// Renders the Companion above panes and below true modals. Opening slides
+/// the panel in and fades the dock out; closing reverses it. Reduced motion
+/// ("Companion" under Settings → Reduce motion) snaps instead.
 pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     if (!state.isCompanionEnabled()) return;
+    const companion = &state.companion_controller;
+    const opening = companion.visibility == .sidecar_open;
+    const duration: i64 = if (state.app_config.reduced_motion.companion) 0 else if (opening) OPEN_MS else CLOSE_MS;
+    companion.stepTransition(@intCast(@divTrunc(profiler.nowNs(), std.time.ns_per_ms)), duration);
     const geometry = computeGeometry(state, width, height);
-    switch (state.companion_controller.visibility) {
-        .collapsed_chip => renderDock(state, geometry),
-        .sidecar_open => renderPanel(state, geometry),
+    // Ease out in both directions so each starts quickly and lands softly.
+    const progress = companion.panel_progress;
+    const shown = if (opening) theme.easeOutCubic(progress) else 1.0 - theme.easeOutCubic(1.0 - progress);
+    if (shown < 1.0) {
+        const start = transformMark(state);
+        renderDock(state, geometry);
+        if (shown > 0.0) transformSince(state, start, 1.0 - shown, 0.0, 6.0 * companionScale() * shown, null);
+    }
+    if (shown > 0.0) {
+        const start = transformMark(state);
+        renderPanel(state, geometry);
+        if (shown < 1.0) transformSince(state, start, shown, PANEL_SLIDE * companionScale() * (1.0 - shown), 0.0, geometry.window);
+    }
+}
+
+const TransformMark = struct { commands: usize, runs: usize };
+
+fn transformMark(state: *runtime.AppState) TransformMark {
+    return .{ .commands = state.palette_overlay_batch.commands.items.len, .runs = state.palette_overlay_batch.text_runs.items.len };
+}
+
+/// Fades and shifts everything queued since `mark` (shapes, text, and their
+/// clips) so one surface can animate as a unit.
+/// Commands covering `pinned` (the window scrim) fade but stay in place.
+fn transformSince(state: *runtime.AppState, mark: TransformMark, alpha: f32, dx: f32, dy: f32, pinned: ?palette.Rect) void {
+    const batch = &state.palette_overlay_batch;
+    for (batch.commands.items[mark.commands..]) |*command| {
+        command.color.a *= alpha;
+        if (command.border_color) |*border| border.a *= alpha;
+        if (pinned) |rect| if (command.rect.x <= rect.x and command.rect.w >= rect.w) continue;
+        command.rect.x += dx;
+        command.rect.y += dy;
+        inline for (.{ "p0", "p1", "p2" }) |name| {
+            @field(command, name).x += dx;
+            @field(command, name).y += dy;
+        }
+        if (command.clip) |*clip| {
+            clip.x += dx;
+            clip.y += dy;
+        }
+    }
+    for (batch.text_runs.items[mark.runs..]) |*run| {
+        run.color.a *= alpha;
+        run.x += dx;
+        run.y += dy;
+        if (run.clip) |*clip| {
+            clip.x += dx;
+            clip.y += dy;
+        }
     }
 }
 
@@ -2218,6 +2276,7 @@ test "dock and panel stay inside the window across sizes and scales" {
 
         state.palette_overlay_batch.clear();
         state.companion_controller.show();
+        state.companion_controller.settleTransition();
         render(&state, fixture[0], fixture[1]);
         try expectBatchInsideWindow(&state.palette_overlay_batch, window);
         try std.testing.expect(batchHasText(&state.palette_overlay_batch, "Hi, I'm Juniper."));
@@ -2247,6 +2306,7 @@ test "panel shows the inbox, the crew, and a status that counts what needs the u
 
     state.palette_overlay_batch.clear();
     state.companion_controller.show();
+    state.companion_controller.settleTransition();
     render(&state, 1360.0, 860.0);
     try std.testing.expect(batchHasText(&state.palette_overlay_batch, "NEEDS YOU · 1"));
     try std.testing.expect(batchHasText(&state.palette_overlay_batch, "Needs approval: Fix auth tests"));
@@ -2272,6 +2332,7 @@ test "conversation renders user bubbles, wrapped replies, and tool lines" {
     try testState(allocator, &state);
     defer deinitTestState(allocator, &state);
     state.companion_controller.show();
+    state.companion_controller.settleTransition();
     var frame: controller.Frame = .{ .has_thread = true };
     _ = frame.setOwner("companion-ui", "chat-1");
     var user: controller.ActivityItem = .{ .kind = .user, .sequence = 1 };
@@ -2301,6 +2362,7 @@ test "menus register their rows above a dismiss layer" {
     try testState(allocator, &state);
     defer deinitTestState(allocator, &state);
     state.companion_controller.show();
+    state.companion_controller.settleTransition();
     state.companion_controller.roster_row_count = 2;
     state.companion_controller.roster_rows[0] = .{ .active = true };
     state.companion_controller.roster_rows[0].name.set("Juniper");
@@ -2334,6 +2396,7 @@ test "companion menu lists remembered conversations and routes resume" {
     try testState(allocator, &state);
     defer deinitTestState(allocator, &state);
     state.companion_controller.show();
+    state.companion_controller.settleTransition();
     state.companion_controller.roster_row_count = 1;
     state.companion_controller.roster_rows[0] = .{ .active = true };
     state.companion_controller.roster_rows[0].name.set("Juniper");
@@ -2389,6 +2452,7 @@ test "recap offer renders and routes to its own action" {
     try std.testing.expect(!batchHasText(&state.palette_overlay_batch, "Welcome back · catch up?"));
     state.palette_overlay_batch.clear();
     state.companion_controller.show();
+    state.companion_controller.settleTransition();
     render(&state, 1360.0, 860.0);
     try std.testing.expect(batchHasText(&state.palette_overlay_batch, "Welcome back · away 45 min"));
     const geometry = computeGeometry(&state, 1360.0, 860.0);

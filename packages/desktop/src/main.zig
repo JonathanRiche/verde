@@ -1735,6 +1735,8 @@ fn activeContinuousFrames(state: *AppState) bool {
         state.runConfigStepperAnimating() or
         // Settings modal fades in/out for ~160ms.
         state.settingsModalAnimating() or
+        // Companion panel slides open/closed for ~220ms.
+        state.companionTransitionAnimating() or
         // Notice toast slides in / fades out (~400ms total per notice).
         state.noticeToastAnimating();
 }

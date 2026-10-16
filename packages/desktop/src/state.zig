@@ -13206,6 +13206,11 @@ pub const AppState = struct {
         return .{ .project_index = resolved.project_index, .thread_index = resolved.thread_index };
     }
 
+    /// True while the Companion panel slides open or closed.
+    pub fn companionTransitionAnimating(self: *const AppState) bool {
+        return self.isCompanionEnabled() and self.companion_controller.transitionAnimating();
+    }
+
     pub fn activeCompanionThread(self: *AppState) ?*ChatThread {
         const location = self.activeCompanionThreadLocation() orelse return null;
         return &self.project_controller.projects.items[location.project_index].threads.items[location.thread_index];

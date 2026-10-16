@@ -684,6 +684,10 @@ dock_bottom: f32 = DOCK_DEFAULT_BOTTOM,
 /// Set while button 1 is held on the bubble: a release without movement
 /// opens the panel, movement past the threshold drags the bubble instead.
 dock_press: ?DockPress = null,
+/// Open/close transition: 0 = dock only, 1 = panel fully shown. Visibility
+/// flips immediately for input; this only drives what is drawn.
+panel_progress: f32 = 0.0,
+transition_last_ms: i64 = 0,
 
 /// Defaults sit the bubble 14 x 18 logical units from the corner once the
 /// UI's edge margin is added.
@@ -705,6 +709,34 @@ pub const DockBounds = struct { max_right: f32, max_bottom: f32 };
 
 pub fn init() Self {
     return .{};
+}
+
+/// Advances the open/close transition toward the current visibility.
+/// `duration_ms <= 0` (reduced motion) snaps.
+pub fn stepTransition(self: *Self, now_ms: i64, duration_ms: i64) void {
+    const target: f32 = if (self.visibility == .sidecar_open) 1.0 else 0.0;
+    if (self.panel_progress == target) {
+        self.transition_last_ms = 0;
+        return;
+    }
+    if (duration_ms <= 0) return self.settleTransition();
+    const last = self.transition_last_ms;
+    self.transition_last_ms = now_ms;
+    // The first frame starts the clock; a stalled frame advances at most 50ms.
+    if (last == 0 or now_ms <= last) return;
+    const step = @as(f32, @floatFromInt(@min(now_ms - last, 50))) / @as(f32, @floatFromInt(duration_ms));
+    self.panel_progress = if (target > self.panel_progress) @min(self.panel_progress + step, 1.0) else @max(self.panel_progress - step, 0.0);
+    if (self.panel_progress == target) self.transition_last_ms = 0;
+}
+
+pub fn settleTransition(self: *Self) void {
+    self.panel_progress = if (self.visibility == .sidecar_open) 1.0 else 0.0;
+    self.transition_last_ms = 0;
+}
+
+pub fn transitionAnimating(self: *const Self) bool {
+    const target: f32 = if (self.visibility == .sidecar_open) 1.0 else 0.0;
+    return self.panel_progress != target;
 }
 
 pub fn beginDockPress(self: *Self, x: f32, y: f32) void {
@@ -1171,4 +1203,25 @@ test "bubble press opens on a click and drags past the threshold" {
     try std.testing.expectEqual(@as(f32, 0.0), companion.dock_bottom);
     try std.testing.expect(companion.dragDock(100.0, 100.0, 1.0, bounds));
     try std.testing.expectEqual(@as(?bool, false), companion.endDockPress());
+}
+
+test "open and close transitions step toward visibility and snap under reduced motion" {
+    var companion = Self.init();
+    companion.show();
+    companion.stepTransition(1000, 200);
+    try std.testing.expectEqual(@as(f32, 0.0), companion.panel_progress);
+    try std.testing.expect(companion.transitionAnimating());
+    companion.stepTransition(1040, 200);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.2), companion.panel_progress, 0.001);
+    // A long stall advances at most 50ms.
+    companion.stepTransition(5000, 200);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.45), companion.panel_progress, 0.001);
+    for (0..10) |i| companion.stepTransition(5000 + @as(i64, @intCast(i + 1)) * 40, 200);
+    try std.testing.expectEqual(@as(f32, 1.0), companion.panel_progress);
+    try std.testing.expect(!companion.transitionAnimating());
+
+    companion.collapse();
+    companion.stepTransition(9000, 0);
+    try std.testing.expectEqual(@as(f32, 0.0), companion.panel_progress);
+    try std.testing.expect(!companion.transitionAnimating());
 }
