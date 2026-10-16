@@ -29,6 +29,38 @@ https://github.com/user-attachments/assets/eeb122f2-b175-47f1-8c99-f2553eb651ba
 
 </details>
 
+<table>
+  <tr>
+    <td width="33%" valign="top">
+      <a href="assets/readme/shots/1-tiling.webp"><img src="assets/readme/shots/1-tiling.webp" alt="A Claude chat and a Codex chat side by side, each working on its own task in the same repo" /></a>
+      <br /><sub><b>Claude and Codex, side by side.</b> Each chat works on its own task in the same repo.</sub>
+    </td>
+    <td width="33%" valign="top">
+      <a href="assets/readme/shots/2-browser.webp"><img src="assets/readme/shots/2-browser.webp" alt="A chat next to the built-in browser showing the app's dev server, with Design Mode highlighting an element" /></a>
+      <br /><sub><b>Built-in browser.</b> Preview your dev server and point at elements with Design Mode.</sub>
+    </td>
+    <td width="33%" valign="top">
+      <a href="assets/readme/shots/3-changes.webp"><img src="assets/readme/shots/3-changes.webp" alt="The Changes panel listing changed files with line counts and which chat made each change" /></a>
+      <br /><sub><b>Changes, per chat.</b> See every changed file and which agent touched it, then commit.</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="33%" valign="top">
+      <a href="assets/readme/shots/4-agents.webp"><img src="assets/readme/shots/4-agents.webp" alt="The Agents panel showing two helper chats a Claude chat handed work to, both running" /></a>
+      <br /><sub><b>Agents that delegate.</b> A chat hands subtasks to helper agents and tracks them live.</sub>
+    </td>
+    <td width="33%" valign="top">
+      <a href="assets/readme/shots/5-terminal-agent.webp"><img src="assets/readme/shots/5-terminal-agent.webp" alt="A Claude chat next to Claude Code running in a terminal pane" /></a>
+      <br /><sub><b>CLI agents too.</b> Run Claude Code, Codex and other CLIs in real terminal panes.</sub>
+    </td>
+    <td width="33%" valign="top">
+      <a href="assets/readme/shots/6-files.webp"><img src="assets/readme/shots/6-files.webp" alt="A chat next to the Files panel showing the project tree" /></a>
+      <br /><sub><b>Files at hand.</b> Browse the project tree without leaving the chat.</sub>
+    </td>
+  </tr>
+</table>
+<p align="center"><sub>Shown in Tokyo Night, Catppuccin Latte, Gruvbox, Rosé Pine, Osaka Jade and Nord. Verde can follow your Omarchy theme.</sub></p>
+
 <p align="center">
   <code>curl -fsSL https://verdeai.dev/install.sh | sh</code><br />
   <sub>Linux · macOS · Windows: <a href="#install">all install options</a></sub>
