@@ -639,7 +639,10 @@ pub fn loadAppConfig(allocator: std.mem.Allocator) !AppConfig {
 pub fn readRootValue(allocator: std.mem.Allocator) !?std.json.Parsed(std.json.Value) {
     const config_path = try resolveConfigPath(allocator);
     defer allocator.free(config_path);
+    return readRootValueAtPath(allocator, config_path);
+}
 
+fn readRootValueAtPath(allocator: std.mem.Allocator, config_path: []const u8) !?std.json.Parsed(std.json.Value) {
     const raw_bytes = readConfigFile(allocator, config_path) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
@@ -671,11 +674,14 @@ pub fn configFileMtime(allocator: std.mem.Allocator) !i128 {
 pub fn saveAppConfig(allocator: std.mem.Allocator, config: *const AppConfig) !void {
     const config_path = try resolveConfigPath(allocator);
     defer allocator.free(config_path);
+    return saveAppConfigAtPath(allocator, config, config_path);
+}
 
+fn saveAppConfigAtPath(allocator: std.mem.Allocator, config: *const AppConfig, config_path: []const u8) !void {
     var fallback_arena = std.heap.ArenaAllocator.init(allocator);
     defer fallback_arena.deinit();
 
-    var parsed = try readRootValue(allocator);
+    var parsed = try readRootValueAtPath(allocator, config_path);
     defer if (parsed) |*value| value.deinit();
 
     const tree_allocator = if (parsed) |*value| value.arena.allocator() else fallback_arena.allocator();
@@ -2272,6 +2278,37 @@ test "app config loads and selects installed themes" {
     try std.testing.expect(config.active_theme == null);
     try std.testing.expectEqual(theme.ThemeSource.omarchy, config.theme_config.source);
     try std.testing.expect(config.theme_config.colors.background == null);
+}
+
+test "app config saves an installed theme through a symlinked config directory" {
+    // Dotfile managers symlink ~/.config/verde; saving must write through the
+    // link instead of failing with NotDir or replacing it.
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "real");
+    try tmp.dir.writeFile(io, .{ .sub_path = "real/verde.json", .data = "{\"custom\":{\"keep\":true}}" });
+    try tmp.dir.symLink(io, "real", "link", .{ .is_directory = true });
+    const root_path = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root_path);
+    const config_path = try std.fs.path.join(a, &.{ root_path, "link", "verde.json" });
+    defer a.free(config_path);
+
+    var config: AppConfig = .{};
+    defer config.deinit(a);
+    const installed_index = try config.installTheme(a, "Forest", .{ .source = .verde_legacy }, null, null);
+    try config.selectThemeChoice(a, config.builtinThemeChoices().len + installed_index);
+    try saveAppConfigAtPath(a, &config, config_path);
+
+    const link_stat = try tmp.dir.statFile(io, "link", .{ .follow_symlinks = false });
+    try std.testing.expectEqual(std.Io.File.Kind.sym_link, link_stat.kind);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "real/verde.json.tmp", .{}));
+
+    var saved = (try readRootValueAtPath(a, config_path)).?;
+    defer saved.deinit();
+    try std.testing.expect(saved.value.object.get("custom").?.object.get("keep").?.bool);
+    try std.testing.expectEqualStrings("Forest", saved.value.object.get("theme").?.object.get("active").?.string);
 }
 
 test "theme dropdown hides Omarchy without an install and shows a saved omarchy as Auto" {
