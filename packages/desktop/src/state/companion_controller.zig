@@ -62,6 +62,7 @@ pub const HitAction = enum {
     menu_character,
     brain_provider,
     brain_model,
+    brain_reasoning,
     crew_open,
     inbox_open,
     suggestion,

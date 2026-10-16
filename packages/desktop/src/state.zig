@@ -13420,6 +13420,16 @@ pub const AppState = struct {
         return composerModelOptions(self, providers[index]);
     }
 
+    /// True when the brain menu's provider tab is the one the companion runs on.
+    pub fn companionBrowsingCurrentProvider(self: *AppState) bool {
+        var providers: [companion_controller.MAX_BRAIN_PROVIDERS]Provider = undefined;
+        const count = self.companionBrainProviders(&providers);
+        const index = self.companion_controller.brain_provider_index;
+        if (index >= count) return false;
+        const thread = self.activeCompanionThread() orelse return false;
+        return thread.provider == providers[index];
+    }
+
     /// True when `model_index` is the active companion's current model.
     pub fn companionBrainModelSelected(self: *AppState, model_index: usize) bool {
         var providers: [companion_controller.MAX_BRAIN_PROVIDERS]Provider = undefined;
@@ -13430,6 +13440,107 @@ pub const AppState = struct {
         if (thread.provider != providers[index]) return false;
         const current = self.composerModelIndex(thread.provider, thread.model_ref) orelse return false;
         return current == model_index;
+    }
+
+    pub const CompanionReasoningLevel = struct {
+        label: []const u8,
+        /// Effort tag for codex/claude/pi/grok/muse; null with a null
+        /// variant selects the provider default.
+        effort: ?ReasoningEffort = null,
+        /// Model-specific variant for opencode/cursor.
+        variant: ?[]const u8 = null,
+    };
+    pub const MAX_COMPANION_REASONING_LEVELS: usize = 12;
+
+    /// Reasoning levels the companion's current provider/model offers, in the
+    /// same order and with the same labels as the chat composer's picker.
+    pub fn companionReasoningLevels(self: *AppState, out: *[MAX_COMPANION_REASONING_LEVELS]CompanionReasoningLevel) usize {
+        const thread = self.activeCompanionThread() orelse return 0;
+        var count: usize = 0;
+        const Add = struct {
+            fn level(buffer: *[MAX_COMPANION_REASONING_LEVELS]CompanionReasoningLevel, n: *usize, value: CompanionReasoningLevel) void {
+                if (n.* >= buffer.len) return;
+                buffer[n.*] = value;
+                n.* += 1;
+            }
+        };
+        switch (thread.provider) {
+            .codex => for (codexReasoningOptions(thread.model_ref)) |option| Add.level(out, &count, .{ .label = option.label, .effort = option.value }),
+            .pi => for (PI_REASONING_OPTIONS) |option| Add.level(out, &count, .{ .label = option.label, .effort = option.value }),
+            .muse => for (MUSE_REASONING_OPTIONS) |option| Add.level(out, &count, .{ .label = option.label, .effort = option.value }),
+            .grok => {
+                const values: ?[]const [:0]const u8 = if (self.grokModelOptionForRef(thread.model_ref)) |opt| opt.grok_effort_values else null;
+                for (GROK_REASONING_OPTIONS) |option| {
+                    if (option.value) |effort| if (!provider_models.grokEffortSupported(values, effort)) continue;
+                    Add.level(out, &count, .{ .label = option.label, .effort = option.value });
+                }
+            },
+            .claude => {
+                const opt = self.claudeModelOptionForRef(thread.model_ref) orelse return 0;
+                if (!opt.reasoning_supported) return 0;
+                const values = opt.claude_effort_values orelse CLAUDE_STANDARD_EFFORT_VALUES[0..];
+                Add.level(out, &count, .{ .label = "Default" });
+                for (values) |value| {
+                    const effort = parseReasoningEffort(value) orelse continue;
+                    Add.level(out, &count, .{ .label = claudeEffortValueLabel(value), .effort = effort });
+                }
+            },
+            .opencode => {
+                const opt = self.opencodeModelOptionForRef(thread.model_ref) orelse return 0;
+                if (!opt.reasoning_supported) return 0;
+                const keys = opt.reasoning_variant_keys orelse return 0;
+                Add.level(out, &count, .{ .label = "Default" });
+                for (keys) |key| Add.level(out, &count, .{ .label = key, .variant = key });
+            },
+            .cursor => {
+                const opt = self.cursorModelOptionForRef(thread.model_ref) orelse return 0;
+                const values = opt.cursor_reasoning_values orelse return 0;
+                Add.level(out, &count, .{ .label = "Default" });
+                for (values) |value| Add.level(out, &count, .{ .label = cursorReasoningValueLabel(value), .variant = value });
+            },
+            .fx, .custom_acp => {},
+        }
+        return if (count <= 1) 0 else count;
+    }
+
+    fn companionReasoningMatches(thread: *const ChatThread, level: CompanionReasoningLevel) bool {
+        if (level.variant) |variant| {
+            const current = thread.opencode_reasoning_variant orelse return false;
+            return std.mem.eql(u8, std.mem.sliceTo(current, 0), variant);
+        }
+        if (level.effort) |effort| return thread.reasoning_effort != null and thread.reasoning_effort.? == effort;
+        return thread.reasoning_effort == null and thread.opencode_reasoning_variant == null;
+    }
+
+    /// Index of the companion's current reasoning level, if it has levels.
+    pub fn companionReasoningSelectedIndex(self: *AppState) ?usize {
+        var levels: [MAX_COMPANION_REASONING_LEVELS]CompanionReasoningLevel = undefined;
+        const count = self.companionReasoningLevels(&levels);
+        const thread = self.activeCompanionThread() orelse return null;
+        for (levels[0..count], 0..) |level, index| if (companionReasoningMatches(thread, level)) return index;
+        return if (count > 0) 0 else null;
+    }
+
+    /// Sets how hard the companion thinks; applies from its next turn.
+    pub fn setCompanionReasoning(self: *AppState, index: usize) void {
+        var levels: [MAX_COMPANION_REASONING_LEVELS]CompanionReasoningLevel = undefined;
+        const count = self.companionReasoningLevels(&levels);
+        if (index >= count) return;
+        const thread = self.activeCompanionThread() orelse return;
+        const level = levels[index];
+        if (companionReasoningMatches(thread, level)) return;
+        if (level.variant) |variant| {
+            const owned = self.allocator.dupeZ(u8, variant) catch return;
+            if (thread.opencode_reasoning_variant) |old| self.allocator.free(old);
+            thread.opencode_reasoning_variant = owned;
+        } else {
+            thread.reasoning_effort = level.effort;
+            if (thread.opencode_reasoning_variant) |old| {
+                self.allocator.free(old);
+                thread.opencode_reasoning_variant = null;
+            }
+        }
+        self.afterCompanionRosterChange();
     }
 
     fn companionBrainLabel(self: *AppState, buffer: []u8) []const u8 {
@@ -13446,6 +13557,13 @@ pub const AppState = struct {
             ref
         else
             "default";
+        var levels: [MAX_COMPANION_REASONING_LEVELS]CompanionReasoningLevel = undefined;
+        const level_count = self.companionReasoningLevels(&levels);
+        if (self.companionReasoningSelectedIndex()) |index| {
+            if (index > 0 and index < level_count) {
+                return std.fmt.bufPrint(buffer, "{s} · {s} · {s}", .{ utils.providerLabel(thread.provider), model_label, levels[index].label }) catch utils.providerLabel(thread.provider);
+            }
+        }
         return std.fmt.bufPrint(buffer, "{s} · {s}", .{ utils.providerLabel(thread.provider), model_label }) catch utils.providerLabel(thread.provider);
     }
 

@@ -226,9 +226,10 @@ workspace: your companion orchestrates all of Verde from any workspace.
   acts and then summarizes, and Vireo runs ahead and only pings you when it
   matters.
 - **Brain.** Click the model chip (in the header or the composer) to choose
-  any connected provider and model. Changing provider on an existing
-  conversation starts a fresh one; the old one stays in its workspace's
-  history.
+  any connected provider and model, and under **Reasoning** how hard it
+  thinks (the same levels the chat composer offers for that model). Changing
+  provider keeps the conversation: the outgoing brain writes a handoff brief
+  for the new one.
 
 - **Standing orders.** Open the companion menu → **Standing orders…** and write
   rules it follows on every turn ("Run tests before calling work done. Never

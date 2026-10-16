@@ -142,6 +142,7 @@ pub fn handleMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, d
             .menu_character => if (characterAt(result.index)) |character| state.setActiveCompanionCharacter(character),
             .brain_provider => state.selectCompanionBrainProvider(result.index),
             .brain_model => state.setCompanionBrain(result.index),
+            .brain_reasoning => state.setCompanionReasoning(result.index),
             .crew_open => state.openCompanionChatRow(false, result.index),
             .inbox_open => state.openCompanionChatRow(true, result.index),
             .suggestion => state.sendCompanionSuggestion(result.index),
@@ -1188,6 +1189,11 @@ const BrainMenuLayout = struct {
     providers: [controller.MAX_BRAIN_PROVIDERS]palette.Rect,
     provider_count: usize,
     list: palette.Rect,
+    /// "Reasoning" caption and level chips; empty when the companion's
+    /// current model has no levels or another provider tab is browsed.
+    reasoning_title: palette.Rect,
+    reasoning: [runtime.AppState.MAX_COMPANION_REASONING_LEVELS]palette.Rect,
+    reasoning_count: usize,
 };
 
 fn brainMenuLayout(state: *runtime.AppState, geometry: Geometry) BrainMenuLayout {
@@ -1210,11 +1216,35 @@ fn brainMenuLayout(state: *runtime.AppState, geometry: Geometry) BrainMenuLayout
         chip_x += chip_w + 6.0 * s;
     }
     const list_top = chip_y + 34.0 * s;
-    const available = @max(geometry.footer.y - list_top - 16.0 * s, 60.0 * s);
+
+    // Reasoning chips sit under the model list, for the model in use.
+    var levels: [runtime.AppState.MAX_COMPANION_REASONING_LEVELS]runtime.AppState.CompanionReasoningLevel = undefined;
+    layout.reasoning_count = if (state.companionBrowsingCurrentProvider()) state.companionReasoningLevels(&levels) else 0;
+    var reasoning_h: f32 = 0.0;
+    if (layout.reasoning_count > 0) {
+        var rx = x + 10.0 * s;
+        var rows: f32 = 1.0;
+        for (levels[0..layout.reasoning_count], 0..) |level, index| {
+            const w = text_measure.textWidth(.ui_bold, 11.0 * s, level.label) + 20.0 * s;
+            if (rx + w > x + menu_w - 10.0 * s and rx > x + 10.0 * s) {
+                rx = x + 10.0 * s;
+                rows += 1.0;
+            }
+            // y is relative here; shifted below once the list height is known.
+            layout.reasoning[index] = .{ .x = rx, .y = (rows - 1.0) * 30.0 * s, .w = w, .h = 24.0 * s };
+            rx += w + 6.0 * s;
+        }
+        reasoning_h = 10.0 * s + 20.0 * s + rows * 30.0 * s;
+    }
+
+    const available = @max(geometry.footer.y - list_top - 16.0 * s - reasoning_h, 60.0 * s);
     const options = state.companionBrainModelOptions();
     const list_h = @min(@as(f32, @floatFromInt(@max(options.len, 1))) * BRAIN_ROW_HEIGHT * s, available);
     layout.list = .{ .x = x + 6.0 * s, .y = list_top, .w = menu_w - 12.0 * s, .h = list_h };
-    layout.menu = .{ .x = x, .y = menu_top, .w = menu_w, .h = list_top + list_h + 8.0 * s - menu_top };
+    const reasoning_top = list_top + list_h + 10.0 * s;
+    layout.reasoning_title = if (layout.reasoning_count > 0) .{ .x = x + 14.0 * s, .y = reasoning_top, .w = menu_w - 28.0 * s, .h = 16.0 * s } else .{ .x = x, .y = reasoning_top };
+    for (layout.reasoning[0..layout.reasoning_count]) |*chip| chip.y += reasoning_top + 20.0 * s;
+    layout.menu = .{ .x = x, .y = menu_top, .w = menu_w, .h = list_top + list_h + reasoning_h + 8.0 * s - menu_top };
     companion.brain_max_scroll = @max(@as(f32, @floatFromInt(options.len)) * BRAIN_ROW_HEIGHT * s - list_h, 0.0);
     companion.brain_scroll_y = std.math.clamp(companion.brain_scroll_y, 0.0, companion.brain_max_scroll);
     return layout;
@@ -1237,6 +1267,7 @@ fn registerBrainMenuHits(state: *runtime.AppState, geometry: Geometry) void {
         const visible = intersectRects(row, layout.list) orelse continue;
         companion.addIndexedHit(visible, .brain_model, index);
     }
+    for (layout.reasoning[0..layout.reasoning_count], 0..) |rect, index| companion.addIndexedHit(rect, .brain_reasoning, index);
 }
 
 // Brain picker: any connected provider and model can drive the companion.
@@ -1248,7 +1279,7 @@ fn renderBrainMenu(state: *runtime.AppState, geometry: Geometry) void {
     renderMenuSurface(state, layout.menu);
     const title = framePrint(state, "{s}'s brain", .{companion.identity.name.slice()});
     queueBoldText(state, .{ .x = layout.menu.x + 14.0 * s, .y = layout.menu.y + 10.0 * s, .w = layout.menu.w - 28.0 * s, .h = 17.0 * s }, title, color(chrome.text), 12.5 * s, layout.menu);
-    queueText(state, .{ .x = layout.menu.x + 14.0 * s, .y = layout.menu.y + 27.0 * s, .w = layout.menu.w - 28.0 * s, .h = 15.0 * s }, "Any connected model works. A new provider starts a fresh conversation.", color(chrome.text_subtle), 10.5 * s, layout.menu);
+    queueText(state, .{ .x = layout.menu.x + 14.0 * s, .y = layout.menu.y + 27.0 * s, .w = layout.menu.w - 28.0 * s, .h = 15.0 * s }, "Any connected model works. Switching provider keeps the conversation.", color(chrome.text_subtle), 10.5 * s, layout.menu);
     if (layout.provider_count == 0) {
         queueText(state, .{ .x = layout.menu.x + 14.0 * s, .y = layout.menu.y + 50.0 * s, .w = layout.menu.w - 28.0 * s, .h = 16.0 * s }, "No providers are connected yet. Sign in from Settings → Providers.", color(chrome.text_muted), 11.0 * s, layout.menu);
         return;
@@ -1269,6 +1300,19 @@ fn renderBrainMenu(state: *runtime.AppState, geometry: Geometry) void {
         const text_w = @max(row.w - 40.0 * s, 0.0);
         queueText(state, .{ .x = row.x + 10.0 * s, .y = row.y + (row.h - 17.0 * s) * 0.5, .w = text_w, .h = 17.0 * s }, truncatedText(state, .ui, 12.0 * s, text_w, option.label), color(chrome.text), 12.0 * s, layout.list);
         if (selected) queueText(state, .{ .x = row.x + row.w - 24.0 * s, .y = row.y + (row.h - 17.0 * s) * 0.5, .w = 14.0 * s, .h = 17.0 * s }, "✓", color(chrome.accent), 12.0 * s, layout.list);
+    }
+    if (layout.reasoning_count > 0) {
+        queueBoldText(state, layout.reasoning_title, "REASONING", color(chrome.text_subtle), 10.0 * s, layout.menu);
+        var levels: [runtime.AppState.MAX_COMPANION_REASONING_LEVELS]runtime.AppState.CompanionReasoningLevel = undefined;
+        const count = @min(state.companionReasoningLevels(&levels), layout.reasoning_count);
+        const selected_index = state.companionReasoningSelectedIndex();
+        for (levels[0..count], layout.reasoning[0..count], 0..) |level, chip, index| {
+            const selected = selected_index != null and selected_index.? == index;
+            const fill = if (selected) chrome.accent else chrome.surface_deep;
+            queuePanel(state, chip, color(fill), color(if (selected) chrome.accent else chrome.border), chip.h * 0.5, 1.0 * s);
+            const label_w = text_measure.textWidth(.ui_bold, 11.0 * s, level.label);
+            queueBoldText(state, .{ .x = chip.x + (chip.w - label_w) * 0.5, .y = chip.y + (chip.h - 15.0 * s) * 0.5, .w = label_w + 1.0, .h = 15.0 * s }, level.label, color(if (selected) surface() else chrome.text), 11.0 * s, layout.menu);
+        }
     }
 }
 
