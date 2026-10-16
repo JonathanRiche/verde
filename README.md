@@ -22,6 +22,13 @@
   <img src="https://raw.githubusercontent.com/JonathanRiche/verde/master/assets/readme/verde-desktop.webp" alt="Verde desktop: a Codex chat, a Claude Code TUI and a shell tiled in one window, with approval and mid-turn steering" width="100%" />
 </p>
 
+<details>
+<summary><strong>▶ Watch the 30-second desktop tour (with sound)</strong></summary>
+
+https://github.com/user-attachments/assets/eeb122f2-b175-47f1-8c99-f2553eb651ba
+
+</details>
+
 <p align="center">
   <code>curl -fsSL https://verdeai.dev/install.sh | sh</code><br />
   <sub>Linux · macOS · Windows: <a href="#install">all install options</a></sub>
@@ -59,6 +66,13 @@ You already pay for Claude, ChatGPT, or Cursor. Verde puts every agent you run i
 <p align="center">
   <img src="https://raw.githubusercontent.com/JonathanRiche/verde/master/assets/readme/verde-mobile.webp" alt="Verde mobile: a Claude chat on a phone. Approve an edit, steer the turn, review the diff and push." width="100%" />
 </p>
+
+<details>
+<summary><strong>▶ Watch the 30-second mobile tour (with sound)</strong></summary>
+
+https://github.com/user-attachments/assets/6faba933-3e4c-43f5-b733-d6cfa47d423b
+
+</details>
 
 Your agents run on your machines, and the companion apps keep you in the loop when you're away from the desk.
 
