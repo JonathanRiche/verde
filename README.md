@@ -96,7 +96,7 @@ The iOS and Android apps are in beta. A browser-based web client is also availab
 | **Pi** | ✓ | ✓ | Local `pi` CLI in RPC mode (`pi --mode rpc`) + embedded TUI |
 | **FX** | ✓ | ✓ | Local `fx` CLI ACP (`fx acp`) + embedded TUI |
 | **Grok Build** | ✓ | ✓ | Local `grok` CLI ACP (`grok agent stdio`) + embedded TUI |
-| **Amp** | – | ✓ | Local `amp` CLI in an embedded Ghostty pane |
+| **Amp** | – | ✓ | Local `amp` CLI in an embedded [Ghostty](https://ghostty.org) pane |
 
 → Setup notes: [Provider docs](https://verdeai.dev/docs/providers)
 
@@ -197,7 +197,7 @@ Tile a native webview next to your agent. Point at an element or draw a region, 
 
 ### Project-scoped terminal dock
 
-Every workspace has its own Ghostty-powered terminals, with shell tabs, agent launch profiles, OSC titles, and zoom that stays with the layout.
+Every workspace has its own [Ghostty](https://github.com/ghostty-org/ghostty)-powered terminals, with shell tabs, agent launch profiles, OSC titles, and zoom that stays with the layout.
 
 ### Managed processes (`verde.toml`)
 
@@ -319,7 +319,7 @@ Example stack and full `verde.json` schema: [Configuration & state](https://verd
 - **Zig 0.16**: a native executable with no Electron shell.
 - **[Palette](packages/palette)**: our in-tree Zig GUI framework. It handles windowing, input, fonts and GPU rendering, with its own Wayland/AppKit/Win32 platform layer and a Vulkan/Metal/Direct3D 11 renderer.
 - **Headless session daemon**: owns chat turns and PTYs. The GUI, web gateway, mobile apps, CLI and MCP are all clients, so agent work survives window restarts.
-- **Ghostty / libghostty-vt**: the embedded terminal engine, pinned to upstream rather than a vendored fork.
+- **[Ghostty](https://github.com/ghostty-org/ghostty) / libghostty-vt**: the embedded terminal engine, pinned to upstream rather than a vendored fork.
 - **Native webview**: WPE WebKit, WKWebView or WebView2, with no bundled Chromium.
 - **SQLite**: stores local projects, threads, transcripts, drafts and image attachments.
 
@@ -355,18 +355,25 @@ For platform notes (WebView2 SDK, WPE packages, macOS codesigning, Windows MSVC)
 
 ## Third-party components
 
-Main third-party pieces used by the desktop app:
+Verde is built on the shoulders of these projects. Thank you to their authors and contributors.
 
-- `@anthropic-ai/claude-agent-sdk`: Claude Code provider integration
-- Ghostty / `libghostty-vt`: terminal emulation (MIT)
-- palette-native: windowing, input, fonts and GPU rendering, vendored in [`packages/palette`](packages/palette) (see `VENDORED_FROM`)
-- `fff.nvim` / `fff-c` / `fff-search`: file indexing and search ([`vendor/fff`](vendor/fff), MIT)
-- `zqlite`: SQLite access (MIT-style)
-- `z-toml`: `verde.toml` parsing
-- tree-sitter: syntax highlighting, via [`packages/zig_treesitter`](packages/zig_treesitter)
-- `zig_dif` / `zig_markdown`: chat markdown, diff and code rendering
-- `stb_image`: image decoding ([`vendor/stb_image.h`](vendor/stb_image.h))
-- Fonts: Noto Sans, Noto Sans Symbols, Noto Emoji, JetBrains Mono Nerd Font, Symbols Nerd Font, Codicon and Cal Sans. Licenses are in [`packages/desktop/src/assets/fonts`](packages/desktop/src/assets/fonts).
+| Component | Used for | Upstream | License |
+| --- | --- | --- | --- |
+| **[Ghostty](https://ghostty.org)** / `libghostty-vt` | The terminal engine behind every terminal pane and agent TUI | [ghostty-org/ghostty](https://github.com/ghostty-org/ghostty) | MIT |
+| Claude Agent SDK (`@anthropic-ai/claude-agent-sdk`) | Claude Code provider integration | [anthropics/claude-agent-sdk-typescript](https://github.com/anthropics/claude-agent-sdk-typescript) | [Anthropic terms](https://github.com/anthropics/claude-agent-sdk-typescript/blob/main/LICENSE.md) |
+| fff (`fff-c` / `fff-search`) | File indexing and fuzzy search, vendored in [`vendor/fff`](vendor/fff) | [dmtrKovalenko/fff.nvim](https://github.com/dmtrKovalenko/fff.nvim) | MIT |
+| zqlite | SQLite bindings for Zig | [karlseguin/zqlite.zig](https://github.com/karlseguin/zqlite.zig) | MIT |
+| SQLite | Local state, threads and transcripts | [sqlite.org](https://sqlite.org) | Public domain |
+| z-toml | `verde.toml` parsing | [eneskemalergin/z-toml](https://github.com/eneskemalergin/z-toml) | MIT |
+| Tree-sitter + JavaScript, TypeScript and JSON grammars | Syntax highlighting, vendored in [`packages/zig_treesitter/vendor`](packages/zig_treesitter/vendor) | [tree-sitter/tree-sitter](https://github.com/tree-sitter/tree-sitter) · [javascript](https://github.com/tree-sitter/tree-sitter-javascript) · [typescript](https://github.com/tree-sitter/tree-sitter-typescript) · [json](https://github.com/tree-sitter/tree-sitter-json) | MIT |
+| stb_image | Decoding chat images and browser screenshots ([`vendor/stb_image.h`](vendor/stb_image.h)) | [nothings/stb](https://github.com/nothings/stb) | MIT / public domain |
+| Noto Sans, Noto Sans Symbols, Noto Emoji | UI text, symbol and emoji fonts | [notofonts/latin-greek-cyrillic](https://github.com/notofonts/latin-greek-cyrillic) · [notofonts/symbols](https://github.com/notofonts/symbols) · [googlefonts/noto-emoji](https://github.com/googlefonts/noto-emoji) | OFL 1.1 |
+| JetBrains Mono | Code and terminal font | [JetBrains/JetBrainsMono](https://github.com/JetBrains/JetBrainsMono) | OFL 1.1 |
+| Nerd Fonts (JetBrains Mono Nerd Font, Symbols Nerd Font) | Terminal glyphs and icons | [ryanoasis/nerd-fonts](https://github.com/ryanoasis/nerd-fonts) | MIT (glyph sets keep their own licenses) |
+| Codicons | UI icon font | [microsoft/vscode-codicons](https://github.com/microsoft/vscode-codicons) | CC BY 4.0 |
+| Cal Sans | Display font | [calcom/font](https://github.com/calcom/font) | OFL 1.1 |
+
+The font license texts ship in [`packages/desktop/src/assets/fonts`](packages/desktop/src/assets/fonts). Palette ([`packages/palette`](packages/palette)), `zig_dif`, `zig_markdown` and `zig_treesitter` are Verde's own in-tree packages.
 
 If you redistribute Verde, keep the relevant upstream notices with the distributed app and vendored source.
 
