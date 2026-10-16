@@ -212,9 +212,10 @@ verde live panes --project current --json
 `Ctrl+Shift+Space`. There is one companion roster per machine, not per
 workspace: your companion orchestrates all of Verde from any workspace.
 
-- **The dock.** A small character sits in the bottom-right corner. Its pose
-  and status line show real state only: "Ready when you are", how many chats
-  are running, or how many things need you.
+- **The dock.** A small character bubble sits in the bottom-right corner;
+  drag it anywhere in the window. It stays a plain bubble with a badge (a dot
+  while work runs, a count when things need you) and only shows a line of
+  text, such as "2 things need you", when something needs you.
 - **The panel.** Click the dock to open a side panel with a **Needs you**
   inbox (every chat on the machine waiting on an approval), the companion's
   **Crew** (chats it delegated to, with live status), and the conversation.

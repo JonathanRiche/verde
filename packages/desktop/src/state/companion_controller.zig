@@ -676,9 +676,60 @@ conversation_follow_tail: bool = true,
 conversation_content_count: usize = 0,
 pointer_captured_buttons: [256]bool = [_]bool{false} ** 256,
 escape_key_captured: bool = false,
+/// Collapsed bubble position as logical-unit distances from the window's
+/// right and bottom edges, so it follows that corner when the window resizes.
+dock_right: f32 = DOCK_DEFAULT_RIGHT,
+dock_bottom: f32 = DOCK_DEFAULT_BOTTOM,
+/// Set while button 1 is held on the bubble: a release without movement
+/// opens the panel, movement past the threshold drags the bubble instead.
+dock_press: ?DockPress = null,
+
+/// Defaults sit the bubble 14 x 18 logical units from the corner once the
+/// UI's edge margin is added.
+pub const DOCK_DEFAULT_RIGHT: f32 = 8.0;
+pub const DOCK_DEFAULT_BOTTOM: f32 = 12.0;
+/// Logical units the pointer must travel before a press becomes a drag.
+pub const DOCK_DRAG_THRESHOLD: f32 = 4.0;
+
+pub const DockPress = struct {
+    x: f32,
+    y: f32,
+    right: f32,
+    bottom: f32,
+    dragged: bool = false,
+};
+
+/// Allowed range for `dock_right` / `dock_bottom` in logical units.
+pub const DockBounds = struct { max_right: f32, max_bottom: f32 };
 
 pub fn init() Self {
     return .{};
+}
+
+pub fn beginDockPress(self: *Self, x: f32, y: f32) void {
+    self.dock_press = .{ .x = x, .y = y, .right = self.dock_right, .bottom = self.dock_bottom };
+}
+
+/// Moves the bubble with the pointer once the drag threshold is crossed.
+/// `scale` converts pixel deltas to logical units. Returns true on movement.
+pub fn dragDock(self: *Self, x: f32, y: f32, scale: f32, bounds: DockBounds) bool {
+    const press = &(self.dock_press orelse return false);
+    const s = @max(scale, 0.01);
+    const dx = (x - press.x) / s;
+    const dy = (y - press.y) / s;
+    if (!press.dragged and @abs(dx) < DOCK_DRAG_THRESHOLD and @abs(dy) < DOCK_DRAG_THRESHOLD) return false;
+    press.dragged = true;
+    self.dock_right = std.math.clamp(press.right - dx, 0.0, @max(bounds.max_right, 0.0));
+    self.dock_bottom = std.math.clamp(press.bottom - dy, 0.0, @max(bounds.max_bottom, 0.0));
+    return true;
+}
+
+/// Ends a bubble press; true when it was a click (no drag), null when no
+/// press was active.
+pub fn endDockPress(self: *Self) ?bool {
+    const press = self.dock_press orelse return null;
+    self.dock_press = null;
+    return !press.dragged;
 }
 
 pub fn toggle(self: *Self) void {
@@ -768,6 +819,7 @@ pub fn ownsPointerRelease(self: *const Self, button: u8) bool {
 
 pub fn resetInputCaptures(self: *Self) void {
     self.pointer_captured_buttons = [_]bool{false} ** 256;
+    self.dock_press = null;
     self.escape_key_captured = false;
 }
 
@@ -1098,4 +1150,24 @@ test "returning after a long absence offers a recap" {
     companion.noteReturn(90 * 60 * 1000);
     try std.testing.expect(companion.recap_available);
     try std.testing.expectEqual(@as(u32, 90), companion.recap_minutes);
+}
+
+test "bubble press opens on a click and drags past the threshold" {
+    var companion = Self.init();
+    const bounds: DockBounds = .{ .max_right = 500.0, .max_bottom = 300.0 };
+    companion.beginDockPress(100.0, 100.0);
+    try std.testing.expect(!companion.dragDock(102.0, 101.0, 1.0, bounds));
+    try std.testing.expectEqual(@as(?bool, true), companion.endDockPress());
+    try std.testing.expectEqual(@as(?bool, null), companion.endDockPress());
+
+    companion.beginDockPress(100.0, 100.0);
+    try std.testing.expect(companion.dragDock(60.0, 40.0, 2.0, bounds));
+    try std.testing.expectApproxEqAbs(DOCK_DEFAULT_RIGHT + 20.0, companion.dock_right, 0.001);
+    try std.testing.expectApproxEqAbs(DOCK_DEFAULT_BOTTOM + 30.0, companion.dock_bottom, 0.001);
+    // Clamped to the window, and back within the threshold still counts as a drag.
+    try std.testing.expect(companion.dragDock(5000.0, 5000.0, 1.0, bounds));
+    try std.testing.expectEqual(@as(f32, 0.0), companion.dock_right);
+    try std.testing.expectEqual(@as(f32, 0.0), companion.dock_bottom);
+    try std.testing.expect(companion.dragDock(100.0, 100.0, 1.0, bounds));
+    try std.testing.expectEqual(@as(?bool, false), companion.endDockPress());
 }

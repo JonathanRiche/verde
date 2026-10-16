@@ -20,10 +20,16 @@ test {
 const log = std.log.scoped(.companion_ui);
 
 // Logical-unit geometry tokens (multiplied by the display scale).
-const DOCK_HEIGHT: f32 = 54.0;
-const DOCK_RIGHT_INSET: f32 = 14.0;
-const DOCK_BOTTOM_INSET: f32 = 18.0;
-const DOCK_AVATAR_SLOT: f32 = 44.0;
+/// Collapsed bubble diameter; the pill that carries a notification is as tall.
+const DOCK_BUBBLE: f32 = 44.0;
+/// Inset of the character inside the bubble so it sits inside the ring.
+const DOCK_AVATAR_INSET: f32 = 6.0;
+/// Notification text in the pill, beside the bubble.
+const DOCK_TEXT_FONT: f32 = 11.5;
+const DOCK_TEXT_PAD: f32 = 14.0;
+const DOCK_TEXT_MAX: f32 = 220.0;
+/// Room kept between the bubble and the window edge for its badge and shadow.
+const DOCK_EDGE_MARGIN: f32 = 6.0;
 const PANEL_WIDTH: f32 = 420.0;
 const PANEL_INSET: f32 = 10.0;
 const HEADER_HEIGHT: f32 = 64.0;
@@ -51,8 +57,13 @@ const ASSISTANT_MAX_LINES: usize = 64;
 
 pub const Geometry = struct {
     window: palette.Rect,
+    /// Bubble alone, or the pill (bubble + notification text) when one shows.
     dock: palette.Rect,
+    /// The round bubble that holds the character.
+    dock_bubble: palette.Rect,
     dock_avatar: palette.Rect,
+    /// Notification text area; zero-sized when the bubble shows no text.
+    dock_text: palette.Rect,
     panel: palette.Rect,
     header: palette.Rect,
     avatar: palette.Rect,
@@ -95,10 +106,18 @@ fn refreshAfterAction(state: *runtime.AppState) void {
 pub fn handleMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, down: bool, clicks: u8) bool {
     if (!state.isCompanionEnabled()) return false;
     const result = state.companion_controller.handlePointerButton(x, y, button, down);
+    if (button == 1 and !down) {
+        if (state.companion_controller.endDockPress()) |was_click| {
+            if (was_click) state.openCompanion();
+            refreshAfterAction(state);
+            return true;
+        }
+    }
     if (!result.consumed) return false;
     if (result.action) |action| {
         switch (action) {
-            .open => state.openCompanion(),
+            // A bubble press opens on release, unless it turns into a drag.
+            .open => if (down) state.companion_controller.beginDockPress(x, y),
             .collapse => {
                 state.companion_controller.collapse();
                 state.blurCompanionComposer();
@@ -141,6 +160,12 @@ pub fn handleMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, d
 /// Prevents underlying hover routing only inside the dock or panel.
 pub fn handleMouseMotion(state: *runtime.AppState, x: f32, y: f32, dragging: bool) bool {
     if (!state.isCompanionEnabled()) return false;
+    const companion = &state.companion_controller;
+    if (companion.dock_press != null) {
+        const bounds = dockBoundsAt(companion.frame_width, companion.frame_height, companionScale());
+        if (companion.dragDock(x, y, companionScale(), bounds)) refreshAfterAction(state);
+        return true;
+    }
     const owned = state.companion_controller.hasPointerCapture() or state.companion_controller.hitAt(x, y) != null;
     if (owned) _ = state.routeCompanionComposerMouseMotion(x, y, dragging);
     return owned;
@@ -223,17 +248,38 @@ fn computeGeometryAt(state: *runtime.AppState, width: f32, height: f32, s: f32) 
     const companion = &state.companion_controller;
     const window: palette.Rect = .{ .x = 0.0, .y = 0.0, .w = @max(width, 0.0), .h = @max(height, 0.0) };
 
-    // Dock: a pill hugging the bottom-right corner, sized to its text.
-    const dock_text_w = @max(dockTextWidth(state, s), 72.0 * s);
-    const dock_w = @min(DOCK_AVATAR_SLOT * s + dock_text_w + 30.0 * s, @max(window.w - 2.0 * DOCK_RIGHT_INSET * s, 0.0));
-    const dock_h = @min(DOCK_HEIGHT * s, window.h);
-    const dock: palette.Rect = .{
-        .x = @max(window.w - DOCK_RIGHT_INSET * s - dock_w, 0.0),
-        .y = @max(window.h - DOCK_BOTTOM_INSET * s - dock_h, 0.0),
-        .w = dock_w,
-        .h = dock_h,
+    // Dock: a draggable character bubble. It grows into a pill with one line
+    // of text only when something needs the user, extending toward the
+    // window's middle so the bubble itself never jumps.
+    const bubble_size = @min(DOCK_BUBBLE * s, @min(window.w, window.h));
+    const bounds = dockBoundsAt(window.w, window.h, s);
+    const dock_bubble: palette.Rect = .{
+        .x = @max(window.w - (DOCK_EDGE_MARGIN + std.math.clamp(companion.dock_right, 0.0, bounds.max_right)) * s - bubble_size, 0.0),
+        .y = @max(window.h - (DOCK_EDGE_MARGIN + std.math.clamp(companion.dock_bottom, 0.0, bounds.max_bottom)) * s - bubble_size, 0.0),
+        .w = bubble_size,
+        .h = bubble_size,
     };
-    const dock_avatar: palette.Rect = .{ .x = dock.x + 8.0 * s, .y = dock.y + 5.0 * s, .w = DOCK_AVATAR_SLOT * s - 6.0 * s, .h = @max(dock.h - 10.0 * s, 0.0) };
+    const text_w: f32 = if (dockShowsText(state))
+        @min(@min(text_measure.textWidth(.ui_bold, DOCK_TEXT_FONT * s, dockStatus(state).text), DOCK_TEXT_MAX * s), @max(window.w - bubble_size - DOCK_TEXT_PAD * 2.0 * s, 0.0))
+    else
+        0.0;
+    var dock = dock_bubble;
+    var dock_text: palette.Rect = .{ .x = dock_bubble.x, .y = dock_bubble.y };
+    if (text_w > 0.0) {
+        const pill_w = bubble_size + text_w + DOCK_TEXT_PAD * 1.5 * s;
+        const extend_left = dock_bubble.x + bubble_size * 0.5 > window.w * 0.5;
+        dock.w = pill_w;
+        dock.x = if (extend_left) dock_bubble.x + bubble_size - pill_w else dock_bubble.x;
+        dock.x = std.math.clamp(dock.x, 0.0, @max(window.w - pill_w, 0.0));
+        dock_text = .{
+            .x = if (extend_left) dock.x + DOCK_TEXT_PAD * s else dock_bubble.x + bubble_size + DOCK_TEXT_PAD * 0.5 * s,
+            .y = dock.y,
+            .w = text_w,
+            .h = dock.h,
+        };
+    }
+    const avatar_inset = DOCK_AVATAR_INSET * s;
+    const dock_avatar: palette.Rect = .{ .x = dock_bubble.x + avatar_inset, .y = dock_bubble.y + avatar_inset, .w = @max(bubble_size - avatar_inset * 2.0, 0.0), .h = @max(bubble_size - avatar_inset * 2.0, 0.0) };
 
     // Panel: right-side column, full height.
     const inset = @min(PANEL_INSET * s, @min(window.w, window.h) * 0.5);
@@ -287,7 +333,9 @@ fn computeGeometryAt(state: *runtime.AppState, width: f32, height: f32, s: f32) 
     return .{
         .window = window,
         .dock = dock,
+        .dock_bubble = dock_bubble,
         .dock_avatar = dock_avatar,
+        .dock_text = dock_text,
         .panel = panel,
         .header = header,
         .avatar = avatar,
@@ -307,10 +355,22 @@ fn computeGeometryAt(state: *runtime.AppState, width: f32, height: f32, s: f32) 
     };
 }
 
-fn dockTextWidth(state: *runtime.AppState, s: f32) f32 {
-    const name_w = text_measure.textWidth(.ui_bold, 12.5 * s, state.companion_controller.identity.name.slice());
-    const status_w = text_measure.textWidth(.ui, 11.0 * s, dockStatus(state).text);
-    return @max(name_w, status_w);
+/// How far (logical units) the bubble may sit from the right/bottom edges.
+fn dockBoundsAt(width: f32, height: f32, s: f32) controller.DockBounds {
+    const scale = @max(s, 0.01);
+    return .{
+        .max_right = @max(width / scale - DOCK_BUBBLE - DOCK_EDGE_MARGIN * 2.0, 0.0),
+        .max_bottom = @max(height / scale - DOCK_BUBBLE - DOCK_EDGE_MARGIN * 2.0, 0.0),
+    };
+}
+
+/// Text rides along only for things the user must act on; everything else
+/// is a quiet badge on the bubble.
+fn dockShowsText(state: *runtime.AppState) bool {
+    return switch (dockStatus(state).tone) {
+        .attention, .failure => true,
+        .quiet, .busy => false,
+    };
 }
 
 fn composerRect(footer: palette.Rect) palette.Rect {
@@ -393,8 +453,7 @@ const DockStatus = struct { text: []const u8, tone: enum { quiet, busy, attentio
 
 fn dockStatus(state: *runtime.AppState) DockStatus {
     const companion = &state.companion_controller;
-    const needs_you = companion.inboxNeedsYouCount() + @as(usize, if (companion.presentation.has_approval) 1 else 0) +
-        crewNeedsYouCount(companion);
+    const needs_you = dockNeedsYouCount(state);
     if (needs_you > 0) return .{ .text = if (needs_you == 1) "1 thing needs you" else framePrint(state, "{d} things need you", .{needs_you}), .tone = .attention };
     if (companion.presentation.has_failure) return .{ .text = "Needs a look", .tone = .failure };
     if (companion.recap_available) return .{ .text = "Welcome back · catch up?", .tone = .busy };
@@ -413,34 +472,62 @@ fn crewNeedsYouCount(companion: *const controller) usize {
     return count;
 }
 
-// Collapsed dock: character, name, and a one-line status in a floating pill.
+// Collapsed dock: a round character bubble with a badge; a one-line
+// notification rides beside it only when something needs the user.
 fn renderDock(state: *runtime.AppState, geometry: Geometry) void {
     const s = companionScale();
     const chrome = theme.companionChrome();
     const dock = geometry.dock;
-    if (dock.w < 80.0 * s or dock.h < 40.0 * s) return;
+    const bubble = geometry.dock_bubble;
+    if (bubble.w < 24.0 * s or bubble.h < 24.0 * s) return;
     const radius = dock.h * 0.5;
-    queueRoundedRectClipped(state, offsetRect(dock, 0.0, 6.0 * s), color(theme.scrim(0.22)), radius, geometry.window);
-    queuePanel(state, dock, color(surface()), color(chrome.border), radius, 1.0 * s);
-
-    const character = activeCompanionCharacter(state);
-    renderCompanionCharacter(state, characterInSlot(geometry.dock_avatar, character), state.companion_controller.visualState(), character, .full);
-
+    const dragging = if (state.companion_controller.dock_press) |press| press.dragged else false;
+    queueRoundedRectClipped(state, offsetRect(dock, 0.0, @as(f32, if (dragging) 8.0 else 4.0) * s), color(theme.scrim(@as(f32, if (dragging) 0.3 else 0.2))), radius, geometry.window);
     const status = dockStatus(state);
-    const text_x = dock.x + DOCK_AVATAR_SLOT * s + 12.0 * s;
-    const text_w = @max(dock.x + dock.w - text_x - 14.0 * s, 0.0);
-    queueBoldText(state, .{ .x = text_x, .y = dock.y + 9.0 * s, .w = text_w, .h = 18.0 * s }, truncatedText(state, .ui_bold, 12.5 * s, text_w, state.companion_controller.identity.name.slice()), color(chrome.text), 12.5 * s, dock);
     const status_color = switch (status.tone) {
         .quiet => chrome.text_subtle,
         .busy => chrome.identity_fg,
         .attention => chrome.warning,
         .failure => chrome.danger,
     };
-    queueText(state, .{ .x = text_x, .y = dock.y + 28.0 * s, .w = text_w, .h = 16.0 * s }, truncatedText(state, .ui, 11.0 * s, text_w, status.text), color(status_color), 11.0 * s, dock);
-    if (status.tone == .attention) {
-        const dot: palette.Rect = .{ .x = geometry.dock_avatar.x + geometry.dock_avatar.w - 8.0 * s, .y = dock.y + 4.0 * s, .w = 10.0 * s, .h = 10.0 * s };
-        queueRoundedRect(state, dot, color(chrome.warning), 5.0 * s);
+    const ring = switch (status.tone) {
+        .attention, .failure => status_color,
+        else => chrome.border,
+    };
+    queuePanel(state, dock, color(surface()), color(ring), radius, 1.0 * s);
+
+    const character = activeCompanionCharacter(state);
+    renderCompanionCharacter(state, characterInSlot(geometry.dock_avatar, character), state.companion_controller.visualState(), character, .full);
+
+    if (geometry.dock_text.w > 0.0) {
+        const font = DOCK_TEXT_FONT * s;
+        const line_h = font * 1.4;
+        const text_rect: palette.Rect = .{ .x = geometry.dock_text.x, .y = dock.y + (dock.h - line_h) * 0.5, .w = geometry.dock_text.w, .h = line_h };
+        queueBoldText(state, text_rect, truncatedText(state, .ui_bold, font, geometry.dock_text.w, status.text), color(status_color), font, dock);
     }
+
+    // Badge on the bubble's top-right: a count when things need the user,
+    // a dot while work runs or a recap is waiting.
+    const count = dockNeedsYouCount(state);
+    if (count > 0) {
+        const label = if (count > 9) "9+" else framePrint(state, "{d}", .{count});
+        const badge_font = 9.5 * s;
+        const badge_h = 16.0 * s;
+        const badge_w = @max(badge_h, text_measure.textWidth(.ui_bold, badge_font, label) + 8.0 * s);
+        const badge: palette.Rect = .{ .x = bubble.x + bubble.w - badge_w + 3.0 * s, .y = bubble.y - 3.0 * s, .w = badge_w, .h = badge_h };
+        queuePanel(state, badge, color(chrome.warning), color(surface()), badge_h * 0.5, 1.0 * s);
+        const label_w = text_measure.textWidth(.ui_bold, badge_font, label);
+        queueBoldText(state, .{ .x = badge.x + (badge.w - label_w) * 0.5, .y = badge.y + (badge_h - badge_font * 1.3) * 0.5, .w = label_w + 1.0, .h = badge_font * 1.3 }, label, color(surface()), badge_font, geometry.window);
+    } else if (status.tone == .busy or status.tone == .failure) {
+        const dot_size = 10.0 * s;
+        const dot: palette.Rect = .{ .x = bubble.x + bubble.w - dot_size + 1.0 * s, .y = bubble.y - 1.0 * s, .w = dot_size, .h = dot_size };
+        queuePanel(state, dot, color(status_color), color(surface()), dot_size * 0.5, 1.0 * s);
+    }
+}
+
+fn dockNeedsYouCount(state: *runtime.AppState) usize {
+    const companion = &state.companion_controller;
+    return companion.inboxNeedsYouCount() + @as(usize, if (companion.presentation.has_approval) 1 else 0) + crewNeedsYouCount(companion);
 }
 
 // ---- panel ------------------------------------------------------------------
@@ -2081,8 +2168,9 @@ test "dock and panel stay inside the window across sizes and scales" {
 
         render(&state, fixture[0], fixture[1]);
         try expectBatchInsideWindow(&state.palette_overlay_batch, window);
-        try std.testing.expect(batchHasText(&state.palette_overlay_batch, "Juniper"));
-        try std.testing.expect(batchHasText(&state.palette_overlay_batch, "Ready when you are"));
+        // A quiet bubble carries no text at all.
+        try std.testing.expect(!batchHasText(&state.palette_overlay_batch, "Juniper"));
+        try std.testing.expect(!batchHasText(&state.palette_overlay_batch, "Ready when you are"));
 
         state.palette_overlay_batch.clear();
         state.companion_controller.show();
@@ -2253,7 +2341,8 @@ test "recap offer renders and routes to its own action" {
     defer deinitTestState(allocator, &state);
     state.companion_controller.noteReturn(45 * 60 * 1000);
     render(&state, 1360.0, 860.0);
-    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "Welcome back · catch up?"));
+    // The collapsed bubble only badges a recap; the panel offers it.
+    try std.testing.expect(!batchHasText(&state.palette_overlay_batch, "Welcome back · catch up?"));
     state.palette_overlay_batch.clear();
     state.companion_controller.show();
     render(&state, 1360.0, 860.0);
@@ -2261,4 +2350,48 @@ test "recap offer renders and routes to its own action" {
     const geometry = computeGeometry(&state, 1360.0, 860.0);
     registerHits(&state, geometry);
     try std.testing.expectEqual(controller.HitAction.recap, state.companion_controller.hitAt(geometry.recap.x + 4.0, geometry.recap.y + 4.0).?);
+}
+
+test "bubble stays compact, grows a pill only for notifications, and drags inside the window" {
+    const allocator = std.testing.allocator;
+    theme.applyTheme(1.0);
+    var state: runtime.AppState = undefined;
+    try testState(allocator, &state);
+    defer deinitTestState(allocator, &state);
+    const window: palette.Rect = .{ .w = 1360.0, .h = 860.0 };
+
+    var geometry = computeGeometry(&state, window.w, window.h);
+    try std.testing.expectEqual(geometry.dock_bubble.w, geometry.dock.w);
+    try std.testing.expectEqual(@as(f32, 0.0), geometry.dock_text.w);
+    try std.testing.expect(rectInside(geometry.dock_avatar, geometry.dock_bubble));
+
+    var inbox: [1]controller.ChatRow = .{.{ .attention = .approval }};
+    inbox[0].title.set("Fix auth tests");
+    state.companion_controller.setInbox(&inbox);
+    geometry = computeGeometry(&state, window.w, window.h);
+    try std.testing.expect(geometry.dock.w > geometry.dock_bubble.w);
+    // Bottom-right bubble: the pill grows leftward and the bubble stays put.
+    try std.testing.expectApproxEqAbs(geometry.dock.x + geometry.dock.w, geometry.dock_bubble.x + geometry.dock_bubble.w, 0.01);
+    render(&state, window.w, window.h);
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "1 thing needs you"));
+    try expectBatchInsideWindow(&state.palette_overlay_batch, window);
+
+    // Drag to the top-left corner: a press that moves past the threshold.
+    const companion = &state.companion_controller;
+    companion.beginDockPress(geometry.dock_bubble.x + 10.0, geometry.dock_bubble.y + 10.0);
+    try std.testing.expect(companion.dragDock(-5000.0, -5000.0, 1.0, dockBoundsAt(window.w, window.h, 1.0)));
+    try std.testing.expectEqual(@as(?bool, false), companion.endDockPress());
+    try std.testing.expectEqual(controller.Visibility.collapsed_chip, companion.visibility);
+    geometry = computeGeometry(&state, window.w, window.h);
+    try std.testing.expectApproxEqAbs(DOCK_EDGE_MARGIN, geometry.dock_bubble.x, 0.01);
+    try std.testing.expectApproxEqAbs(DOCK_EDGE_MARGIN, geometry.dock_bubble.y, 0.01);
+    // Left-side bubble: the pill grows rightward.
+    try std.testing.expectApproxEqAbs(geometry.dock.x, geometry.dock_bubble.x, 0.01);
+    state.palette_overlay_batch.clear();
+    render(&state, window.w, window.h);
+    try expectBatchInsideWindow(&state.palette_overlay_batch, window);
+
+    // The bubble's hit still routes to the open action.
+    registerHits(&state, geometry);
+    try std.testing.expectEqual(controller.HitAction.open, companion.hitAt(geometry.dock_bubble.x + 10.0, geometry.dock_bubble.y + 10.0).?);
 }
