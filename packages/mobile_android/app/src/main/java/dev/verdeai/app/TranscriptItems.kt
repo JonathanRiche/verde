@@ -30,6 +30,13 @@ internal sealed interface TranscriptItem {
     data class Working(val turn: ChatTurn, val waitingApproval: Boolean) : TranscriptItem { override val key get() = "working" }
     /** Child chat status reports in their parent chat (orchestration): one card each; batched rows carry several. */
     data class ChildNotice(val row: ChatRow, val notifications: List<ChildNotification>) : TranscriptItem { override val key get() = "r:" + row.id }
+    /**
+     * Consecutive saved live-voice lines from one speaker, shown as one block: [body] is the merged
+     * text (user fragments de-duplicated by [mergeSpeech]); [speaker] is "You" or the companion's name.
+     */
+    data class Voice(val rows: List<ChatRow>, val user: Boolean, val speaker: String, val body: String) : TranscriptItem {
+        override val key get() = "v:" + rows.first().id
+    }
     /** Pending tool approval — D-09 replaces the default renderer. */
     data class Approval(val approval: ChatApproval) : TranscriptItem { override val key get() = "approval:${approval.turn_id}:${approval.call_id}" }
 }
@@ -161,8 +168,41 @@ internal fun transcriptItems(view: ChatThreadView): List<TranscriptItem> {
         })
     }
     flush()
+    groupVoice(out).let { out.clear(); out.addAll(it) }
     view.approval?.let { out.add(TranscriptItem.Approval(it)) }
     view.turn?.takeIf { activeTurn(it.status) }?.let { out.add(TranscriptItem.Working(it, it.status == "waiting_approval" || view.approval != null)) }
+    return out
+}
+
+/** A user or companion line saved by a live voice session ("Live" hand-off notes stay notices). */
+internal fun isVoiceSpeech(row: ChatRow) = (row.role == "user" || row.role == "assistant") && isVoiceAuthor(row.author)
+
+/** "Moss (voice)" → "Moss". */
+internal fun voiceSpeaker(author: String) = author.removeSuffix(" (voice)").trim().ifEmpty { "Companion" }
+
+/**
+ * Merges runs of consecutive voice messages from the same speaker into [TranscriptItem.Voice]
+ * blocks. User runs are joined by [mergeSpeech], which also folds already-saved fragments and
+ * superseding snapshots; companion runs are joined as paragraphs. Everything else is untouched.
+ */
+internal fun groupVoice(items: List<TranscriptItem>): List<TranscriptItem> {
+    val out = ArrayList<TranscriptItem>(items.size)
+    var run = ArrayList<ChatRow>()
+    fun flush() {
+        if (run.isEmpty()) return
+        val user = run.first().role == "user"
+        val body = if (user) mergeSpeech(run.map { it.body }) else run.map { it.body.trim() }.filter { it.isNotEmpty() }.joinToString("\n\n")
+        out.add(TranscriptItem.Voice(run, user, if (user) "You" else voiceSpeaker(run.first().author), body))
+        run = ArrayList()
+    }
+    for (item in items) {
+        val row = (item as? TranscriptItem.Message)?.row
+        if (row == null || !isVoiceSpeech(row)) { flush(); out.add(item); continue }
+        val first = run.firstOrNull()
+        if (first != null && (first.role != row.role || first.author != row.author)) flush()
+        run.add(row)
+    }
+    flush()
     return out
 }
 

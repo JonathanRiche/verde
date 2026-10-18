@@ -75,6 +75,7 @@ internal data class TranscriptRenderers(
     val working: @Composable (TranscriptItem.Working, TranscriptContext) -> Unit = { item, ctx -> WorkingRow(item, ctx) },
     val approval: @Composable (TranscriptItem.Approval, TranscriptContext) -> Unit = ApprovalRenderer,
     val childNotice: @Composable (TranscriptItem.ChildNotice, TranscriptContext) -> Unit = { item, ctx -> ChildNotificationCard(item, ctx) },
+    val voice: @Composable (TranscriptItem.Voice, TranscriptContext) -> Unit = { item, ctx -> VoiceBlock(item, ctx, compact = false) },
 ) {
     @Composable
     fun Render(item: TranscriptItem, ctx: TranscriptContext) = when (item) {
@@ -88,6 +89,7 @@ internal data class TranscriptRenderers(
         is TranscriptItem.Working -> working(item, ctx)
         is TranscriptItem.Approval -> approval(item, ctx)
         is TranscriptItem.ChildNotice -> childNotice(item, ctx)
+        is TranscriptItem.Voice -> voice(item, ctx)
     }
 
     companion object { val Default = TranscriptRenderers() }
@@ -476,6 +478,10 @@ internal fun ThinkCard(row: ChatRow, ctx: TranscriptContext) {
 internal fun NoticeRow(row: ChatRow, ctx: TranscriptContext) {
     if (isGitCommitRow(row)) {
         GitCommitNotice(row.body, ctx.git)
+        return
+    }
+    if (isVoiceAuthor(row.author)) {
+        VoiceNote(row)
         return
     }
     val colors = MaterialTheme.colorScheme

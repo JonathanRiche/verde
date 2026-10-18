@@ -5,8 +5,9 @@ import java.util.UUID
 
 /*
  * The text record of a live voice session, saved into the companion's chat (core
- * `companion_transcript_save`). One line per user utterance and per spoken reply (streaming
- * pieces merged), plus short system lines for tool hand-offs. Never audio. Pure and unit tested.
+ * `companion_transcript_save`). One line per user turn (everything said between replies or system
+ * lines, merged by [mergeSpeechPieces]) and per spoken reply (streaming pieces merged), plus short
+ * system lines for tool hand-offs. Never audio. Pure and unit tested.
  */
 
 internal const val LIVE_USER_AUTHOR = "You (voice)"
@@ -59,6 +60,38 @@ internal fun speechRemainder(text: String, prefixLength: Int): String {
     return ""
 }
 
+private fun speechWordCount(norm: String) = if (norm.isEmpty()) 0 else norm.count { it == ' ' } + 1
+
+/**
+ * Folds the utterance [next] into one user turn's [pieces] (oldest first). [next] is a superseding
+ * snapshot, replacing every earlier piece, when its normalized words contain or continue all of
+ * their joined words, or continue the joined words of a leading run of them that holds more than
+ * half of their words (a re-transcription whose tail the provider corrected, e.g. "It finished"
+ * re-heard as "And finish"). Otherwise it is appended. Blank text changes nothing.
+ */
+internal fun mergeSpeechPieces(pieces: List<String>, next: String): List<String> {
+    val text = next.trim()
+    if (text.isEmpty()) return pieces
+    val words = normalizeSpeech(text)
+    val norms = pieces.map { normalizeSpeech(it) }
+    val all = norms.filter { it.isNotEmpty() }.joinToString(" ")
+    if (words.isEmpty() || all.isEmpty()) return pieces + text
+    if (extendsSpeech(words, all) || " $words ".contains(" $all ")) return listOf(text)
+    var joined = ""
+    var covered = 0
+    for (norm in norms) {
+        if (norm.isEmpty()) continue
+        joined = if (joined.isEmpty()) norm else "$joined $norm"
+        if (!extendsSpeech(words, joined)) break
+        covered += speechWordCount(norm)
+    }
+    return if (covered * 2 > norms.sumOf { speechWordCount(it) }) listOf(text) else pieces + text
+}
+
+/** One user turn's utterances as a single line: [mergeSpeechPieces] over [lines], joined by single spaces. */
+internal fun mergeSpeech(lines: List<String>): String =
+    lines.fold(emptyList<String>()) { pieces, line -> mergeSpeechPieces(pieces, line) }.joinToString(" ")
+
 internal const val USER_LINE_IDLE_MS = 3_000L
 
 internal class LiveTranscript(
@@ -66,6 +99,8 @@ internal class LiveTranscript(
     private val assistantAuthor: String,
 ) {
     private val lines = ArrayList<LiveLine>()
+    /** The utterances merged into a user turn line, by line key (lines that absorbed another). */
+    private val pieces = HashMap<String, List<String>>()
     private var next = 0
     private var openUser: String? = null
     private var openItem: String? = null
@@ -158,7 +193,7 @@ internal class LiveTranscript(
         val late = unconfirmedUser
         unconfirmedUser = null
         if (late != null && index(late) >= saved) {
-            if (body.isNotBlank()) update(late) { it.copy(body = body) }
+            if (body.isNotBlank()) correctLastUtterance(late, body)
             return
         }
         if (body.isBlank() || normalizeSpeech(body) == lastClosedUserNorm) return
@@ -175,8 +210,7 @@ internal class LiveTranscript(
 
     /** The model began answering: the user's utterance is done. */
     fun assistantStarted() {
-        val user = openUser
-        closeUser(commit = true)
+        val user = closeUser(commit = true)
         if (user != null && index(user) >= 0) unconfirmedUser = user
         tentative?.let { commit(it, stream = false) }
         tentative = null; tentativeItem = null
@@ -198,21 +232,22 @@ internal class LiveTranscript(
     /** End of the model's turn; the user's line is left to its own signals (they may already be talking). */
     fun turnDone() = assistantDone()
 
-    private fun closeUser(commit: Boolean) {
-        val key = openUser ?: return
+    /** Closes the open utterance; when [commit]ted, returns the key of the line now holding it. */
+    private fun closeUser(commit: Boolean): String? {
+        val key = openUser ?: return null
         val item = openItem
         openUser = null; openItem = null
-        val line = lines.getOrNull(index(key)) ?: return
+        val line = lines.getOrNull(index(key)) ?: return null
         val body = line.body.trim()
         val words = normalizeSpeech(body)
         // An exact repeat of the previous utterance is the same utterance reported twice.
-        if (words.isEmpty() || words == lastClosedUserNorm) { drop(key); return }
+        if (words.isEmpty() || words == lastClosedUserNorm) { drop(key); return null }
         update(key) { it.copy(body = body, open = false, committed = false) }
         lastClosedUserNorm = words
-        if (commit) commit(key, stream = true) else {
-            tentative?.let { commit(it, stream = false) }
-            tentative = key; tentativeItem = item
-        }
+        if (commit) return commit(key, stream = true)
+        tentative?.let { commit(it, stream = false) }
+        tentative = key; tentativeItem = item
+        return null
     }
 
     /** A new utterance [start]s: a tentative line it merely extends is dropped, otherwise it is committed. */
@@ -224,14 +259,42 @@ internal class LiveTranscript(
         else commit(key, stream = false)
     }
 
-    private fun commit(key: String?, stream: Boolean) {
-        val line = lines.getOrNull(index(key)) ?: return
+    /** Commits a line; a user utterance then joins its turn's line. Returns the key now holding it. */
+    private fun commit(key: String?, stream: Boolean): String? {
+        val line = lines.getOrNull(index(key)) ?: return null
         update(key) { it.copy(open = false, committed = true) }
-        if (stream && cumulativeStream && line.role == "user") {
+        if (line.role != "user") return line.key
+        if (stream && cumulativeStream) {
             val words = normalizeSpeech(line.body)
             streamNorm = if (streamNorm.isEmpty()) words else "$streamNorm $words"
             lastCommittedNorm = words
         }
+        return joinTurn(line.key)
+    }
+
+    /**
+     * One line per user turn: a committed utterance directly after the turn's committed, unsaved
+     * user line folds into it ([mergeSpeechPieces]) instead of standing alone.
+     */
+    private fun joinTurn(key: String): String {
+        val i = index(key)
+        val prev = lines.getOrNull(i - 1)
+        if (i - 1 < saved || prev == null || prev.role != "user" || prev.open || !prev.committed) return key
+        val merged = mergeSpeechPieces(pieces[prev.key] ?: listOf(prev.body), lines[i].body)
+        pieces[prev.key] = merged
+        lines[i - 1] = prev.copy(body = merged.joinToString(" "))
+        lines.removeAt(i)
+        pieces.remove(key)
+        return prev.key
+    }
+
+    /** A late final transcript corrects the turn line's latest utterance (the last merged piece). */
+    private fun correctLastUtterance(key: String, body: String) {
+        val merged = pieces[key]
+        if (merged == null) { update(key) { it.copy(body = body) }; return }
+        val corrected = mergeSpeechPieces(merged.dropLast(1), body)
+        pieces[key] = corrected
+        update(key) { it.copy(body = corrected.joinToString(" ")) }
     }
 
     fun system(text: String, now: Long) { add("system", LIVE_SYSTEM_AUTHOR, text, now, open = false) }
@@ -242,8 +305,9 @@ internal class LiveTranscript(
 
     /**
      * Lines ready to save, in order: committed lines after the last save, stopping at the first line
-     * still being spoken or not yet committed. [final] closes and commits everything (the session
-     * ended). Empty sessions save nothing.
+     * still being spoken or not yet committed, or at the current turn's user line (it may still
+     * absorb more speech until a reply or system line follows). [final] closes and commits
+     * everything (the session ended). Empty sessions save nothing.
      */
     fun pending(final: Boolean): List<LiveLine> {
         if (final) {
@@ -257,6 +321,7 @@ internal class LiveTranscript(
         for (i in saved until lines.size) {
             val line = lines[i]
             if (line.open || !line.committed) break
+            if (!final && line.role == "user" && (i + 1 until lines.size).all { lines[it].role == "user" }) break
             out += line
         }
         return out

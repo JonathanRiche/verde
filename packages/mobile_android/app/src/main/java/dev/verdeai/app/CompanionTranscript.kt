@@ -2,6 +2,7 @@ package dev.verdeai.app
 
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
@@ -21,7 +22,8 @@ import dev.verdeai.core.ChatRow
 /*
  * Dense transcript rows for the companion sheet only; the full chat screen keeps its cards.
  * User messages are compact bubbles, tool calls single muted lines that expand on tap, and the
- * working indicator a small inline row.
+ * working indicator a small inline row. Saved live-voice blocks ([VoiceBlock]) and "Live" notes
+ * ([VoiceNote]) are shared with the full chat screen.
  */
 
 internal val CompactTranscriptRenderers = TranscriptRenderers.Default.copy(
@@ -29,20 +31,77 @@ internal val CompactTranscriptRenderers = TranscriptRenderers.Default.copy(
     tool = { item, _ -> CompactToolRow(item.row) },
     toolGroup = { item, ctx -> CompactToolGroupRow(item, ctx) },
     working = { item, ctx -> CompactWorkingRow(item, ctx) },
-    notice = { item, ctx -> if (isVoiceAuthor(item.row.author)) VoiceLine(item.row) else NoticeRow(item.row, ctx) },
+    voice = { item, ctx -> VoiceBlock(item, ctx, compact = true) },
 )
 
-/** A saved live-voice line: a small mic, then the words; hand-off notes are muted. */
+/**
+ * Consecutive saved live-voice lines from one speaker: the user's speech as their own right-aligned
+ * bubble, the companion's as assistant text on the left, each labelled with a small mic and
+ * "<speaker> · voice". Long-press copies the merged text.
+ */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun VoiceLine(row: ChatRow) {
-    val user = row.role == "user"
-    val system = row.role == "system"
-    Row(Modifier.fillMaxWidth().padding(horizontal = 2.dp, vertical = 2.dp), verticalAlignment = Alignment.Top,
-        horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-        Icon(painterResource(R.drawable.ic_mic), contentDescription = if (user) "You said" else if (system) "Live voice" else "${row.author} said",
-            tint = if (user) VerdeColors.Subtle else VerdeColors.Accent, modifier = Modifier.padding(top = 2.dp).size(12.dp))
-        Text(row.body, Modifier.weight(1f), style = if (system) MaterialTheme.typography.labelSmall else MaterialTheme.typography.bodySmall,
-            color = when { system -> VerdeColors.Subtle; user -> VerdeColors.Muted; else -> VerdeColors.Text })
+internal fun VoiceBlock(item: TranscriptItem.Voice, ctx: TranscriptContext, compact: Boolean) {
+    @Suppress("DEPRECATION") val clipboard = LocalClipboardManager.current
+    var menu by remember { mutableStateOf(false) }
+    val label = "${item.speaker} · voice"
+    if (item.user) {
+        BoxWithConstraints(Modifier.fillMaxWidth()) {
+            Column(Modifier.align(Alignment.CenterEnd).widthIn(max = maxWidth * (if (compact) .8f else .9f))
+                .background(VerdeColors.UserBubble, RoundedCornerShape(if (compact) 12.dp else 10.dp))
+                .combinedClickable(onClick = {}, onLongClickLabel = "Copy message", onLongClick = { menu = true })
+                .padding(horizontal = if (compact) 10.dp else 12.dp, vertical = if (compact) 8.dp else 10.dp),
+                horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                VoiceLabel(label, user = true)
+                Text(item.body, style = if (compact) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.bodyLarge)
+            }
+            DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                DropdownMenuItem(text = { Text("Copy message") }, onClick = { menu = false; clipboard.setText(AnnotatedString(item.body)) })
+            }
+        }
+        return
+    }
+    Box(Modifier.fillMaxWidth()) {
+        val card = if (compact) Modifier.padding(horizontal = 2.dp, vertical = 2.dp)
+            else Modifier.background(VerdeColors.Assistant, RoundedCornerShape(10.dp)).border(1.dp, VerdeColors.Border, RoundedCornerShape(10.dp))
+        Column(Modifier.fillMaxWidth().then(card)
+            .combinedClickable(onClick = {}, onLongClickLabel = "Copy message", onLongClick = { menu = true })
+            .then(if (compact) Modifier else Modifier.padding(horizontal = 12.dp, vertical = 10.dp)),
+            verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            VoiceLabel(label, user = false)
+            if (item.body.isNotEmpty()) MarkdownText(item.body, ctx.model, ctx.onCitation)
+        }
+        DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+            DropdownMenuItem(text = { Text("Copy message") }, onClick = { menu = false; clipboard.setText(AnnotatedString(item.body)) })
+        }
+    }
+}
+
+@Composable
+private fun VoiceLabel(label: String, user: Boolean) {
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+        Icon(painterResource(R.drawable.ic_mic), contentDescription = null, tint = if (user) VerdeColors.Muted else VerdeColors.Accent,
+            modifier = Modifier.size(12.dp))
+        Text(label, style = MaterialTheme.typography.labelSmall, color = if (user) VerdeColors.Muted else VerdeColors.Subtle)
+    }
+}
+
+/** A "Live" system line (session header, hand-off notes): one quiet muted line; long-press copies it. */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+internal fun VoiceNote(row: ChatRow) {
+    @Suppress("DEPRECATION") val clipboard = LocalClipboardManager.current
+    var menu by remember { mutableStateOf(false) }
+    Box(Modifier.fillMaxWidth()) {
+        Row(Modifier.fillMaxWidth().combinedClickable(onClick = {}, onLongClickLabel = "Copy message", onLongClick = { menu = true })
+            .padding(horizontal = 2.dp, vertical = 2.dp), verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Icon(painterResource(R.drawable.ic_mic), contentDescription = "Live voice", tint = VerdeColors.Subtle,
+                modifier = Modifier.padding(top = 2.dp).size(12.dp))
+            Text(row.body, Modifier.weight(1f), style = MaterialTheme.typography.labelSmall, color = VerdeColors.Subtle)
+        }
+        DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+            DropdownMenuItem(text = { Text("Copy message") }, onClick = { menu = false; clipboard.setText(AnnotatedString(row.body)) })
+        }
     }
 }
 
@@ -50,7 +109,6 @@ private fun VoiceLine(row: ChatRow) {
 @Composable
 private fun CompactMessageRow(row: ChatRow, ctx: TranscriptContext) {
     // Attachments and parent-agent steers keep the full renderer (rare in the companion chat).
-    if (isVoiceAuthor(row.author)) return VoiceLine(row)
     if (row.attachments.isNotEmpty() || parentSteerBody(row.role, row.body) != null) return MessageRow(row, ctx)
     @Suppress("DEPRECATION") val clipboard = LocalClipboardManager.current
     var menu by remember { mutableStateOf(false) }

@@ -108,11 +108,45 @@ class LiveVoiceTest {
             "user" to "Let me.", "assistant" to "Sure.",
             "user" to yeah, "assistant" to "Here's the plan.",
             "user" to "Like a", "assistant" to "Like a what?",
-            "user" to alright,
-            "user" to "Okay so here's a bug. It repeats what you say two times.", "assistant" to "Got it.",
+            // u6 and u7 are one user turn (no reply between them): one line.
+            "user" to "$alright Okay so here's a bug. It repeats what you say two times.", "assistant" to "Got it.",
         ), saved.map { it.role to it.body })
         // Captions show the same merged lines.
-        assertEquals("Okay so here's a bug. It repeats what you say two times.", t.captions().first { it.user && it.text.startsWith("Okay") }.text)
+        assertEquals("$alright Okay so here's a bug. It repeats what you say two times.", t.captions().first { it.user && it.text.startsWith("Alright") }.text)
         assertEquals(1, t.captions(20).count { it.text == "Like a" })
+    }
+
+    // ---- One line per user turn (regression: each fragment was saved as its own line) ----
+
+    private val fragments = listOf("The companion", "to run a longer", "test.", "with the", "Muse wonderful", "model.", "It finished the basic test.",
+        "The companion to run a longer test with the Muse wonderful model. And finish the basic test. I want one",
+        "thread", "where you test", "multiple", "prompts, summary.", "prompt, summary, prompt.")
+    private val mergedTurn = "The companion to run a longer test with the Muse wonderful model. And finish the basic test. " +
+        "I want one thread where you test multiple prompts, summary. prompt, summary, prompt."
+
+    @Test fun fragmentsAndASupersedingSnapshotMergeIntoOneTurn() {
+        assertEquals(mergedTurn, mergeSpeech(fragments))
+        // Containment supersedes too; unrelated words append.
+        assertEquals(listOf("so yes run it"), mergeSpeechPieces(listOf("yes", "run"), "so yes run it"))
+        assertEquals(listOf("yes", "no"), mergeSpeechPieces(listOf("yes"), "no"))
+        assertEquals(listOf("yes"), mergeSpeechPieces(listOf("yes"), "  "))
+    }
+
+    @Test fun eachFragmentOfAUserTurnFoldsIntoOneSavedLine() {
+        val t = record()
+        var now = 0L
+        t.header("🎙 Live voice · xAI Grok · 14:31", now)
+        // One transcription item and final per fragment, then the cumulative snapshot in its own item.
+        fragments.forEachIndexed { i, text -> t.feed(upd("f$i", text), ++now); t.feed(done("f$i", text), ++now) }
+        // Mid-turn saves hold the user line back: it may still absorb more speech.
+        assertEquals(listOf("system"), t.pending(final = false).map { it.role })
+        reply("On it — kicking off that multi-prompt test thread now.").forEach { t.feed(it, ++now) }
+        t.system("→ Asked Moss: Run a longer test.", ++now)
+        reply("The companion accepted it.").forEach { t.feed(it, ++now) }
+        val saved = t.pending(final = false)
+        assertEquals(listOf("system", "user", "assistant", "system", "assistant"), saved.map { it.role })
+        assertEquals(mergedTurn, saved[1].body)
+        assertEquals(LIVE_USER_AUTHOR, saved[1].author)
+        assertEquals(1, t.all.count { it.role == "user" })
     }
 }
