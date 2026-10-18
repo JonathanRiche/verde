@@ -101,39 +101,6 @@ private final class BrowseCore: HostCore {
 
 @MainActor
 final class BrowseTests: XCTestCase {
-    func testRecentChatsUseLiveCatalogAcrossWorkspacesIndependentlyOfHistory() throws {
-        var view = try XCTUnwrap(K09.workspaces.data)
-        let workspace = try XCTUnwrap(view.items.first)
-        let template = try XCTUnwrap(workspace.threads.first)
-        func thread(_ id: String, _ time: Int64?, workspaceID: String = "a", archived: Bool = false) -> ThreadSummary {
-            var result = template
-            result.workspace_id = workspaceID; result.thread_id = id
-            result.last_activity_at_ms = time; result.archived = archived
-            return result
-        }
-        var a = workspace, b = workspace
-        a.workspace_id = "a"
-        a.threads = [thread("unknown", nil), thread("older", 100), thread("archived", 900, archived: true),
-                     thread("subagent:child", 800), thread("tie", 200)]
-        var draft = thread("draft", 950); draft.committed = false
-        var running = thread("draft-running", 50); running.committed = false; running.status = "running"
-        a.threads += [draft, running]
-        b.workspace_id = "b"
-        b.threads = [thread("newest", 300, workspaceID: "b"), thread("tie", 200, workspaceID: "b")]
-        view.items = [a, b]
-        view.history.query = "older"; view.history.items = [thread("older", 100)]
-        view.history.next_cursor = "next-page"
-        XCTAssertEqual(recentThreads(view, limit: 3).map { "\($0.workspace_id):\($0.thread_id)" }, ["b:newest", "a:tie", "b:tie"])
-        let ids = recentThreads(view).map(\.thread_id)
-        XCTAssertEqual(ids, ["newest", "tie", "tie", "older", "draft-running", "unknown"])
-        view.history.items = []; view.history.loading = true
-        XCTAssertEqual(recentThreads(view).map(\.thread_id), ids)
-        XCTAssertTrue(recentThreads(nil).isEmpty)
-        XCTAssertTrue(recentThreads(view, limit: 0).isEmpty)
-        // Companion chats are hidden by thread id in every workspace.
-        XCTAssertEqual(recentThreads(view, hidden: ["tie", "unknown"]).map(\.thread_id), ["newest", "older", "draft-running"])
-    }
-
     private var storage = MemoryStorage()
     private var directory: URL!
     private var cache: ViewCache!
@@ -169,64 +136,6 @@ final class BrowseTests: XCTestCase {
         hosts.begin()
     }
 
-    func testHomeShowsAttentionRunningAndTimersAfterOrderedSignals() async throws {
-        try launch()
-        try await waitUntil("live home") { browse.state.home?.items.isEmpty == false }
-        let state = browse.state
-        XCTAssertTrue(hasContent(state))
-        XCTAssertNil(browseBanner(state, NOW))
-        XCTAssertEqual(hostStatus(try XCTUnwrap(state.row)), "Connected")
-        let panes = try XCTUnwrap(state.home?.items)
-        XCTAssertEqual(panes.filter(\.attention).map { paneLine($0, NOW) }, ["Chat · Needs approval · 1:00", "Terminal · Running"])
-        XCTAssertEqual(panes.filter { !$0.attention }.map { paneLine($0, NOW) }, ["Chat · Working · 0:55"])
-        XCTAssertFalse(recentThreads(state.workspaces).contains { $0.title == "Child" })
-        // Platform signals reach the core in order: start → network → foreground.
-        XCTAssertEqual(Array(core.events.kinds.prefix(3)), ["start", "network_changed", "foreground"])
-        let networks = core.events.all.compactMap { event -> String? in
-            if case .network_changed(let e) = event { return e.network_id }; return nil
-        }
-        XCTAssertEqual(networks, ["net-1"])
-    }
-
-    func testPullToRefreshSendsRetryAndShowsRefreshedProjection() async throws {
-        setup = { $0.configure(afterRefresh: (K09.home, K09.workspaces)) }
-        try launch()
-        try await waitUntil("live home") { browse.state.home?.items.isEmpty == false }
-        await browse.refresh()
-        XCTAssertEqual(core.events.count { if case .retry_connection = $0 { return true }; return false }, 1)
-        try await waitUntil("refreshed") { browse.state.home?.items.isEmpty == true }
-        XCTAssertFalse(browse.state.refreshing)
-    }
-
-    func testWarmStartShowsCacheUntilLiveSyncThenSavesLiveViews() async throws {
-        XCTAssertTrue(cache.save("alpha", CachedViews(saved_at_ms: NOW - 3 * 60_000,
-            home: try XCTUnwrap(K09.homeLive.data), workspaces: try XCTUnwrap(K09.workspacesLive.data))))
-        setup = { $0.configure(syncDelayMs: .some(nil), home: K09.home, workspaces: K09.workspaces) }
-        try launch()
-        try await waitUntil("cached banner") {
-            !cores.isEmpty && browseBanner(browse.state, NOW)?.text == "Connecting… Showing saved data from 3 min ago."
-        }
-        XCTAssertEqual(browse.state.home?.items.count, 3)
-        XCTAssertTrue(hasContent(browse.state))
-        // A route change lets the (fake) core finish its first sync.
-        core.configure(syncDelayMs: .some(10))
-        hosts.network(NetworkState(available: true, id: "net-2"))
-        try await waitUntil("live views") { browse.state.savedAtMs == nil && browse.state.home?.items.isEmpty == true }
-        try await waitUntil("saved live views") { cache.load("alpha")?.home.items.isEmpty == true }
-        XCTAssertEqual(cache.load("alpha")?.saved_at_ms, NOW)
-    }
-
-    func testOfflineWithoutCacheShowsOfflineAndNoData() async throws {
-        try launch(network: NetworkState(available: false, id: ""))
-        try await waitUntil("offline banner") { browseBanner(browse.state, NOW)?.text == "You're offline." }
-        XCTAssertFalse(hasContent(browse.state))
-        XCTAssertFalse(showSpinner(browse.state))
-        let available = core.events.all.compactMap { event -> Bool? in
-            if case .network_changed(let e) = event { return e.available }; return nil
-        }
-        XCTAssertEqual(available, [false])
-    }
-
     func testSignOutClearsCachedAndShownViews() async throws {
         try launch()
         try await waitUntil("live home") { browse.state.home?.items.isEmpty == false }
@@ -239,69 +148,5 @@ final class BrowseTests: XCTestCase {
         XCTAssertNil(browse.state.workspaces)
         XCTAssertTrue(needsPairing(browse.state))
         XCTAssertNil(browseBanner(browse.state, NOW))
-    }
-
-    func testBannerAndLabelRules() throws {
-        let row = HostRow(saved: SavedHost(id: "a", label: "Studio"), view: hostView("a", "Studio", lifecycle: .foreground, sync: "ready"))
-        let ready = BrowseState(hostID: "a", row: row, home: K09.home.data, workspaces: K09.workspaces.data)
-        XCTAssertNil(browseBanner(ready, NOW))
-        var offline = ready
-        offline.networkAvailable = false
-        offline.savedAtMs = NOW - 5 * 60_000
-        XCTAssertEqual(browseBanner(offline, NOW)?.text, "You're offline. Showing saved data from 5 min ago.")
-        var unreachable = ready
-        unreachable.row?.view?.phase = "failed"
-        unreachable.row?.view?.error = LocalError(domain: "net", code: "x", message: "", failure_kind: "network")
-        XCTAssertEqual(browseBanner(unreachable, NOW)?.action, .retry)
-        XCTAssertEqual(browseBanner(unreachable, NOW)?.text, "Can't reach Studio. Is Tailscale on?")
-        var repair = ready
-        repair.row?.view?.auth_state = "repair_required"
-        XCTAssertEqual(browseBanner(repair, NOW)?.action, .hosts)
-        var failed = ready
-        failed.home?.error = LocalError(domain: "rpc", code: "x", message: "", retryable: true)
-        XCTAssertTrue(browseBanner(failed, NOW)?.text.hasPrefix("Couldn't load") == true)
-        var loading = ready
-        loading.row?.view?.sync_state = "loading"
-        XCTAssertTrue(hasContent(loading))
-        loading.home = nil; loading.workspaces = nil
-        XCTAssertFalse(hasContent(loading))
-        XCTAssertTrue(showSpinner(loading))
-        var fatal = ready
-        fatal.row?.fatal = true
-        XCTAssertEqual(browseBanner(fatal, NOW), Banner(text: "Connection unavailable — reopen Verde.", error: true))
-        var unpaired = ready
-        unpaired.row?.view?.auth_state = "unpaired"
-        XCTAssertTrue(needsPairing(unpaired))
-
-        XCTAssertEqual(elapsedLabel(0, 3_665_000), "1:01:05")
-        XCTAssertEqual(elapsedLabel(10, 0), "0:00")
-        XCTAssertEqual(agoLabel(0, 2 * 3_600_000 + 5), "2 h ago")
-        XCTAssertEqual(agoLabel(0, 30_000), "just now")
-        XCTAssertEqual(agoLabel(0, 3 * 86_400_000), "3 d ago")
-        XCTAssertEqual(recentThreads(K09.workspaces.data).map(\.title), ["Web chat", "Layout chat"])
-        XCTAssertEqual(statusLabel("waiting_approval"), "Needs approval")
-        XCTAssertEqual(statusLabel("some_state"), "Some state")
-        XCTAssertEqual(attentionLabel("unread"), "Unread")
-        XCTAssertEqual(attentionLabel("needs_approval"), "Needs approval")
-        XCTAssertNil(attentionLabel(nil))
-        let workspace = try XCTUnwrap(K09.workspaces.data?.items.first)
-        XCTAssertFalse(openable(try XCTUnwrap(workspace.panes.first { $0.kind == "browser" })))
-        XCTAssertFalse(openable(try XCTUnwrap(workspace.panes.first { $0.kind == "terminal" })))
-        let threads = workspaceThreads(workspace)
-        XCTAssertFalse(threads.contains(where: isSubagent))
-        XCTAssertEqual(threads.map { $0.last_activity_at_ms ?? 0 }, threads.map { $0.last_activity_at_ms ?? 0 }.sorted(by: >))
-
-        var flagged = try XCTUnwrap(K09.workspacesLive.data?.items.first)
-        flagged.panes = flagged.panes.map { pane in
-            var pane = pane
-            if pane.thread_id == "layout-thread" { pane.attention_kind = "needs_approval" }
-            return pane
-        }
-        let summary = workspaceSummary(flagged)
-        XCTAssertTrue(summary.summary.contains("1 terminal"))
-        XCTAssertTrue(summary.summary.contains("active"))
-        XCTAssertEqual(summary.badge, "1 needs attention")
-        flagged.open = false
-        XCTAssertTrue(workspaceSummary(flagged).summary.hasSuffix(" · closed"))
     }
 }

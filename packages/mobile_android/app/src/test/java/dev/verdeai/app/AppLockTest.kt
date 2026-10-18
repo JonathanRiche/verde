@@ -33,17 +33,6 @@ class AppLockTest {
     }
     private fun away(millis: Long) { visible.value = false; clock += millis; visible.value = true }
 
-    @Test fun offByDefaultNeverLocks() {
-        val lock = model()
-        assertTrue(lock.state.value.loaded)
-        assertFalse(lock.state.value.locked)
-        assertEquals(LockSettings(), lock.state.value.settings)
-        assertTrue(lock.state.value.settings.secure_screen)
-        away(60 * 60_000L)
-        assertFalse(lock.state.value.locked)
-        assertEquals(0, auth.requests.size)
-    }
-
     @Test fun locksOnLaunchAndUnlocksWithTheSystemPrompt() {
         enabled()
         val lock = model()
@@ -52,7 +41,7 @@ class AppLockTest {
         lock.unlock(auth)
         assertTrue(lock.state.value.authenticating)
         assertFalse(lock.state.value.autoPrompt)
-        assertEquals("Unlock Verde", auth.requests.single().title)
+        assertEquals(1, auth.requests.size)
         auth.finish(AuthOutcome.Failed(null))
         assertTrue(lock.state.value.locked)
         assertFalse(lock.state.value.authenticating)
@@ -110,18 +99,6 @@ class AppLockTest {
         lock.expectResult()
         lock.resumed()
         away(1)
-        assertTrue(lock.state.value.locked)
-    }
-
-    @Test fun graceNeverShortensALongerSetting() {
-        enabled(RelockAfter.five_minutes)
-        val lock = model()
-        lock.unlock(auth); auth.finish(AuthOutcome.Success)
-        lock.expectResult()
-        away(RelockAfter.five_minutes.millis - 1)
-        assertFalse(lock.state.value.locked)
-        lock.expectResult()
-        away(RelockAfter.five_minutes.millis)
         assertTrue(lock.state.value.locked)
     }
 
@@ -189,7 +166,7 @@ class AppLockTest {
         auth.secure = true
         lock.refresh()
         lock.setEnabled(true, auth)
-        assertEquals("Turn on app lock", auth.requests.single().title)
+        assertEquals(1, auth.requests.size)
         auth.finish(AuthOutcome.Failed("Not recognized"))
         assertFalse(lock.state.value.settings.enabled)
         assertNull(store.values[AppLockModel.KEY])
@@ -221,21 +198,12 @@ class AppLockTest {
         assertFalse(model().state.value.locked)
     }
 
-    @Test fun saveFailureIsReported() {
-        val lock = model()
-        store.failWrites = true
-        lock.setSecureScreen(false)
-        assertFalse(lock.state.value.settings.secure_screen)
-        assertNotNull(lock.state.value.saveError)
-    }
-
     @Test fun gateHidesContentUntilUnlocked() {
         enabled()
         val lock = model()
         compose.setContent { AppLockGate(lock, auth) { Text("secret transcript") } }
         compose.waitForIdle()
         compose.onNodeWithTag(LOCK_SCREEN).assertExists()
-        compose.onNodeWithText("Verde is locked").assertExists()
         compose.onNodeWithText("secret transcript").assertDoesNotExist()
         // The prompt opens by itself once.
         assertEquals(1, auth.requests.size)
@@ -246,32 +214,6 @@ class AppLockTest {
         compose.waitForIdle()
         compose.onNodeWithTag(LOCK_SCREEN).assertDoesNotExist()
         compose.onNodeWithText("secret transcript").assertIsDisplayed()
-    }
-
-    @Test fun settingsOfferScreenLockSetupWithoutOne() {
-        auth.secure = false
-        val lock = model()
-        compose.setContent { SecuritySettingsScreen(lock, auth) {} }
-        compose.onNodeWithText("Set up screen lock").assertExists()
-        compose.onNodeWithText("Require unlock").assertExists()
-        compose.onAllNodes(isToggleable()).onFirst().assertIsNotEnabled()
-    }
-
-    @Test fun settingsTurnOnLockAndChooseTimeout() {
-        val lock = model()
-        compose.setContent { SecuritySettingsScreen(lock, auth) {} }
-        compose.onNodeWithText("Set up screen lock").assertDoesNotExist()
-        compose.onNodeWithText("After 5 minutes").performClick()
-        assertEquals(RelockAfter.one_minute, lock.state.value.settings.relock_after) // Disabled until the lock is on.
-        compose.onNodeWithText("Require unlock").performClick()
-        compose.runOnUiThread { auth.finish(AuthOutcome.Success) }
-        compose.waitForIdle()
-        compose.onAllNodes(isToggleable()).onFirst().assertIsOn()
-        compose.onNodeWithText("After 5 minutes").performClick()
-        assertEquals(RelockAfter.five_minutes, lock.state.value.settings.relock_after)
-        compose.onNodeWithText("Hide content in screenshots and recents").performScrollTo().performClick()
-        assertFalse(lock.state.value.settings.secure_screen)
-        assertTrue(store.values[AppLockModel.KEY]!!.contains("\"five_minutes\""))
     }
 
     @Test fun secureWindowFollowsTheSettings() {

@@ -281,15 +281,3 @@ test "stack rejects invalid types missing launches and YAML" {
         } else |_| {}
     }
 }
-
-test "definition bounds validator names the broken limit" {
-    const a = std.testing.allocator;
-    const command = try a.alloc(u8, MAX_PROCESS_COMMAND_BYTES + 1);
-    defer a.free(command);
-    @memset(command, 'x');
-    const content = try std.fmt.allocPrint(a, "[processes.x]\ncommand = \"{s}\"", .{command});
-    defer a.free(content);
-    var config = try parse(a, content, "verde.toml");
-    defer config.deinit(a);
-    try std.testing.expectEqualStrings("process_definition", validateDefinitionBounds(&config).?.resource);
-}

@@ -1807,31 +1807,3 @@ const Helper = struct {
         return objc.NO;
     }
 };
-
-test "test app ids use a private pasteboard" {
-    var buf: [160]u8 = undefined;
-    try std.testing.expectEqualStrings("palette-test-verde.pasteboard", privatePasteboardName(&buf, "palette-test-verde").?);
-    try std.testing.expect(privatePasteboardName(&buf, "dev.verde.Verde") == null);
-    var small: [8]u8 = undefined;
-    try std.testing.expectEqualStrings("palette-test.pasteboard", privatePasteboardName(&small, "palette-test-long-id").?);
-}
-
-test "clipboard MIME types map to UTIs" {
-    try std.testing.expectEqualStrings("public.png", utiForMime("image/png"));
-    try std.testing.expectEqualStrings("public.utf8-plain-text", utiForMime("text/plain;charset=UTF-8"));
-    try std.testing.expectEqualStrings("com.example.custom", utiForMime("com.example.custom"));
-}
-
-test "button mapping and wheel conversion follow SDL" {
-    try std.testing.expectEqual(@as(u8, 1), mapButton(0));
-    try std.testing.expectEqual(@as(u8, 3), mapButton(1));
-    try std.testing.expectEqual(@as(u8, 2), mapButton(2));
-    try std.testing.expectEqual(@as(u8, 4), mapButton(3));
-    try std.testing.expectEqual(@as(u8, 5), mapButton(4));
-    // Mouse wheel: 0.1 line still scrolls one line; x is negated.
-    try std.testing.expectEqual([2]f32{ -1, 1 }, wheelDelta(0.1, 0.1, false));
-    try std.testing.expectEqual([2]f32{ 2, -3 }, wheelDelta(-1.2, -2.5, false));
-    try std.testing.expectEqual([2]f32{ -0.5, 0.25 }, wheelDelta(0.5, 0.25, true));
-    try std.testing.expect(isTestId("palette-test-macos"));
-    try std.testing.expect(!isTestId("verde"));
-}

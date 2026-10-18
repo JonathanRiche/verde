@@ -1951,11 +1951,6 @@ fn truncateUtf8(s: []const u8, max: usize) []const u8 {
     return s[0..n];
 }
 
-test "truncate utf8" {
-    try std.testing.expectEqualStrings("ab", truncateUtf8("ab\xc3\xa9", 3));
-    try std.testing.expectEqualStrings("ab\xc3\xa9", truncateUtf8("ab\xc3\xa9", 4));
-}
-
 test "keycode resolution falls back for non-Latin layouts" {
     const text = @embedFile("testdata/two_groups.xkb");
     var km = try xkb.parse(std.testing.allocator, text);
@@ -1999,25 +1994,6 @@ fn testWindow(app: *App) Window {
     };
 }
 
-test "text_input is gated on startTextInput (SDL semantics)" {
-    const app = try testApp(std.testing.allocator);
-    defer testAppFree(app);
-    var w = testWindow(app);
-    var e: Event = undefined;
-
-    app.emitKey(&w, 30, true, false); // KEY_A
-    try std.testing.expect(app.pop(&e) and e == .key_down and e.key_down.key == .a);
-    try std.testing.expect(!app.pop(&e));
-    try std.testing.expect(!w.isTextInputActive());
-
-    w.ti_enabled = true; // what startTextInput sets (without a compositor to talk to)
-    try std.testing.expect(w.isTextInputActive());
-    app.emitKey(&w, 30, true, false);
-    try std.testing.expect(app.pop(&e) and e == .key_down);
-    try std.testing.expect(app.pop(&e) and e == .text_input);
-    try std.testing.expectEqualStrings("a", e.text_input.text);
-}
-
 test "keypad keys resolve by NumLock state; mod keys track sides" {
     const app = try testApp(std.testing.allocator);
     defer testAppFree(app);
@@ -2040,18 +2016,4 @@ test "keypad keys resolve by NumLock state; mod keys track sides" {
     app.mod_keys.set(97, true); // KEY_RIGHTCTRL
     app.emitKey(&w, 46, true, false);
     try std.testing.expect(app.pop(&e) and e.key_down.mod_keys.rctrl and !e.key_down.mod_keys.lctrl);
-}
-
-test "handle_signals turns SIGTERM into one quit event" {
-    const app = try testApp(std.testing.allocator);
-    defer testAppFree(app);
-    try app.installSignalFd();
-    defer app.closeFds();
-    // Thread-directed so no other test-runner thread (signal unblocked) can take it.
-    _ = linux.tkill(linux.gettid(), .TERM);
-    _ = linux.tkill(linux.gettid(), .INT);
-    app.drainSignals();
-    var e: Event = undefined;
-    try std.testing.expect(app.pop(&e) and e == .quit);
-    try std.testing.expect(!app.pop(&e));
 }

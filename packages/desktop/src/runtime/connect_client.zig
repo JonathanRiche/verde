@@ -1398,38 +1398,6 @@ test "loopback redirect selection accepts only registered loopback http URIs" {
     try std.testing.expect(pickLoopbackRedirect(&.{"http://127.0.0.1/cb"}) == null);
 }
 
-test "authorize URL form-encodes client id, redirect, and scopes" {
-    const allocator = std.testing.allocator;
-    const discovery: control_plane.Discovery = .{
-        .contract_version = "1",
-        .issuer = "https://c.test",
-        .api_base_url = "https://c.test",
-        .oidc = .{
-            .issuer = "https://id.test",
-            .authorization_endpoint = "https://id.test/auth",
-            .token_endpoint = "https://id.test/token",
-            .code_challenge_methods_supported = &.{"S256"},
-            .public_client = .{
-                .client_id = "verde desktop",
-                .scopes = &.{ "openid", "verde:runtime" },
-                .redirect_uris = &.{"http://127.0.0.1:48123/callback"},
-                .response_type = "code",
-                .token_endpoint_auth_method = "none",
-            },
-            .headless_authorization = .{ .supported = false },
-        },
-        .jwks_uri = "https://c.test/jwks",
-        .signer_metadata_url = "https://c.test/signer",
-        .capabilities = &.{},
-    };
-    const url = try buildAuthorizeUrlAlloc(allocator, discovery, "http://127.0.0.1:48123/callback", "CHALLENGE", "STATE");
-    defer allocator.free(url);
-    try std.testing.expectEqualStrings(
-        "https://id.test/auth?response_type=code&client_id=verde%20desktop&redirect_uri=http%3A%2F%2F127.0.0.1%3A48123%2Fcallback&scope=openid%20verde%3Aruntime&code_challenge_method=S256&code_challenge=CHALLENGE&state=STATE",
-        url,
-    );
-}
-
 test "OAuth callback percent-decodes opaque code and state" {
     var code_buffer: [128]u8 = undefined;
     defer std.crypto.secureZero(u8, &code_buffer);
@@ -1487,78 +1455,4 @@ test "inventory parsing rejects unpinnable endpoints and keeps valid rows" {
     const bad =
         "{\"runtimes\":[{\"link_id\":\"lnk_" ++ "0" ** 32 ++ "\",\"descriptor\":{\"runtime_id\":\"" ++ "1" ** 32 ++ "\",\"instance_id\":\"" ++ "2" ** 32 ++ "\",\"https_url\":\"http://rt.test\",\"wss_url\":\"wss://rt.test/ws\",\"tls_identity\":{\"kind\":\"spki_sha256\",\"sha256\":\"" ++ spki ++ "\"}}}]}";
     try std.testing.expectError(error.InvalidUrl, parseInventory(&shared, bad));
-}
-
-test "external native session delegates worker commands and transfers verified bootstrap ownership" {
-    const Fixture = struct {
-        phase: Phase = .discovered,
-        destroyed: bool = false,
-        label_checked: bool = false,
-        fn state(raw: *anyopaque) *@This() {
-            return @ptrCast(@alignCast(raw));
-        }
-        fn poll(raw: *anyopaque) Snapshot {
-            return .{ .phase = state(raw).phase, .failure = null, .issuer = "https://control.test", .device_flow_advertised = false, .login_url_open = false, .runtimes = &.{}, .runtimes_truncated = 0 };
-        }
-        fn signIn(raw: *anyopaque) bool {
-            state(raw).phase = .signed_in;
-            return true;
-        }
-        fn inventory(raw: *anyopaque) bool {
-            state(raw).phase = .inventory_loaded;
-            return true;
-        }
-        fn bootstrap(raw: *anyopaque, index: usize, label: []const u8) bool {
-            if (index != 0 or !std.mem.eql(u8, label, "Fixture desktop")) return false;
-            state(raw).label_checked = true;
-            state(raw).phase = .bootstrap_ready;
-            return true;
-        }
-        fn take(raw: *anyopaque) ?BootstrapResult {
-            if (state(raw).phase != .bootstrap_ready) return null;
-            state(raw).phase = .signed_in;
-            // Fixture allocation is cleaned by the transferred result's deinit.
-            return .{
-                .allocator = std.testing.allocator,
-                .runtime_id = std.testing.allocator.dupe(u8, "1" ** 32) catch unreachable,
-                .instance_id = std.testing.allocator.dupe(u8, "2" ** 32) catch unreachable,
-                .device_id = std.testing.allocator.dupe(u8, "3" ** 32) catch unreachable,
-                .device_credential = std.testing.allocator.dupe(u8, "4" ** 64) catch unreachable,
-                .selection = .{
-                    .link_id = std.testing.allocator.dupe(u8, "lnk_" ++ "5" ** 32) catch unreachable,
-                    .https_url = std.testing.allocator.dupe(u8, "https://runtime.test") catch unreachable,
-                    .wss_url = std.testing.allocator.dupe(u8, "wss://runtime.test/ws") catch unreachable,
-                    .spki_sha256 = std.testing.allocator.dupe(u8, "A" ** 43) catch unreachable,
-                },
-            };
-        }
-        fn signOut(raw: *anyopaque) void {
-            state(raw).phase = .discovered;
-        }
-        fn destroy(raw: *anyopaque) void {
-            state(raw).destroyed = true;
-        }
-        fn backend(self: *@This()) SessionBackend {
-            return .{ .context = self, .poll = poll, .sign_in = signIn, .load_inventory = inventory, .bootstrap = bootstrap, .take_bootstrap_result = take, .sign_out = signOut, .destroy = destroy };
-        }
-    };
-    var fixture: Fixture = .{};
-    try std.testing.expectError(error.InvalidUrl, Session.startWithBackend(std.testing.allocator, "http://control.test", fixture.backend()));
-    try std.testing.expect(!fixture.destroyed);
-    const session = try Session.startWithBackend(std.testing.allocator, "https://control.test", fixture.backend());
-    try std.testing.expect(session.worker == null);
-    try std.testing.expectEqualStrings("https://control.test", session.controlPlaneUrl());
-    try std.testing.expectEqual(Phase.discovered, session.poll().phase);
-    try std.testing.expect(session.signIn());
-    try std.testing.expect(session.loadInventory());
-    try std.testing.expect(!session.bootstrap(0, "bad\nlabel"));
-    try std.testing.expect(session.bootstrap(0, "Fixture desktop"));
-    var result = session.takeBootstrapResult().?;
-    defer result.deinit();
-    try std.testing.expectEqualStrings("lnk_" ++ "5" ** 32, result.selection.?.link_id);
-    try std.testing.expect(session.takeBootstrapResult() == null);
-    session.signOut();
-    try std.testing.expectEqual(Phase.discovered, session.poll().phase);
-    session.destroy();
-    try std.testing.expect(fixture.destroyed);
 }

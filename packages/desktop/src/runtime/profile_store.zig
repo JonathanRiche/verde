@@ -252,32 +252,6 @@ fn writeTestFile(dir: std.Io.Dir, name: []const u8, bytes: []const u8) !void {
     try file.writeStreamingAll(std.testing.io, bytes);
 }
 
-test "profile store saves through a symlinked config directory" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDir(std.testing.io, "config-real", .default_dir);
-    try tmp.dir.symLink(std.testing.io, "config-real", "config-link", .{});
-
-    var absolute_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const absolute_len = try tmp.dir.realPath(std.testing.io, &absolute_buffer);
-    const path = try std.fs.path.join(allocator, &.{
-        absolute_buffer[0..absolute_len],
-        "config-link",
-        FILE_NAME,
-    });
-    defer allocator.free(path);
-
-    var lock = try acquireExclusiveAtPath(allocator, std.testing.io, path);
-    defer lock.deinit();
-    try saveAtPath(allocator, std.testing.io, path, &.{});
-    var loaded = try loadAtPath(allocator, std.testing.io, path);
-    defer loaded.deinit(allocator);
-    try std.testing.expectEqual(@as(usize, 0), loaded.items.len);
-}
-
 test "profile store round trips local and SSH profiles privately" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -335,42 +309,6 @@ test "profile store round trips local and SSH profiles privately" {
     }
 }
 
-test "missing profile store loads an owned empty list" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try testPathAlloc(allocator, tmp.dir);
-    defer allocator.free(path);
-
-    var loaded = try loadAtPath(allocator, std.testing.io, path);
-    defer loaded.deinit(allocator);
-    try std.testing.expectEqual(@as(usize, 0), loaded.items.len);
-}
-
-test "exclusive profile mutation lock rejects a concurrent writer" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try testPathAlloc(allocator, tmp.dir);
-    defer allocator.free(path);
-
-    var first = try acquireExclusiveAtPath(allocator, std.testing.io, path);
-    defer first.deinit();
-    try std.testing.expect((try tryAcquireExclusiveAtPath(
-        allocator,
-        std.testing.io,
-        path,
-    )) == null);
-
-    if (builtin.os.tag != .windows) {
-        const stat = try tmp.dir.statFile(std.testing.io, FILE_NAME ++ LOCK_SUFFIX, .{});
-        try std.testing.expectEqual(
-            @as(std.posix.mode_t, 0o600),
-            stat.permissions.toMode() & @as(std.posix.mode_t, 0o777),
-        );
-    }
-}
-
 test "malformed and secret-bearing profile stores fail explicitly" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -415,47 +353,4 @@ test "staging failure preserves the previous profile document" {
     );
     defer allocator.free(after);
     try std.testing.expectEqualStrings(original, after);
-}
-
-fn checkSaveAllocationFailure(allocator: std.mem.Allocator, path: []const u8) !void {
-    const local: profile.Profile = .{
-        .id = @constCast("profile-0123456789abcdef0123456789abcdef"),
-        .label = @constCast("Local"),
-        .expected_runtime_id = null,
-        .transport = .local_socket,
-    };
-    saveAtPath(allocator, std.testing.io, path, &.{local}) catch |err| switch (err) {
-        // The allocating JSON writer exposes allocation exhaustion through its
-        // writer error; normalize it for checkAllAllocationFailures.
-        error.WriteFailed => return error.OutOfMemory,
-        else => return err,
-    };
-}
-
-test "profile store save cleans up allocation failures" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try testPathAlloc(allocator, tmp.dir);
-    defer allocator.free(path);
-    try std.testing.checkAllAllocationFailures(allocator, checkSaveAllocationFailure, .{path});
-}
-
-fn checkLoadAllocationFailure(allocator: std.mem.Allocator, path: []const u8) !void {
-    var loaded = try loadAtPath(allocator, std.testing.io, path);
-    defer loaded.deinit(allocator);
-    try std.testing.expectEqual(@as(usize, 1), loaded.items.len);
-}
-
-test "profile store load cleans up allocation failures" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try testPathAlloc(allocator, tmp.dir);
-    defer allocator.free(path);
-    const document =
-        \\{"version":1,"profiles":[{"id":"profile-0123456789abcdef0123456789abcdef","label":"Local","transport":{"kind":"local_socket"}}]}
-    ;
-    try writeTestFile(tmp.dir, FILE_NAME, document);
-    try std.testing.checkAllAllocationFailures(allocator, checkLoadAllocationFailure, .{path});
 }

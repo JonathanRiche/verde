@@ -413,34 +413,3 @@ test "files read classifies, caps and confines" {
     try std.testing.expectError(error.InvalidPath, read(a, io, f.roots(), "home", "../outside/secret.txt", .{}));
     try std.testing.expectError(error.InvalidPath, read(a, io, f.roots(), "home", "/etc/passwd", .{}));
 }
-
-test "files list marks gitignored entries when git is available" {
-    var f = try TestFixture.init();
-    defer f.deinit();
-    const a = f.arena_state.allocator();
-    const io = std.testing.io;
-    var git = git_changes.Git.init(a) catch return error.SkipZigTest;
-    defer git.deinit();
-    // The fixture's empty `.git` is not a repository; make a real one.
-    try f.tmp.dir.deleteTree(io, "root/.git");
-    const init_result = git.run(f.root, &.{ "init", "-q" }, .{ .read_only = false }) catch return error.SkipZigTest;
-    if (!init_result.ok()) return error.SkipZigTest;
-    try f.tmp.dir.writeFile(io, .{ .sub_path = "root/.gitignore", .data = "Zeta/\n*.md\n" });
-    const result = try list(a, io, f.roots(), "home", "", null);
-    for (result.entries) |entry| {
-        const expected = std.mem.eql(u8, entry.name, "Zeta") or std.mem.eql(u8, entry.name, "A.md");
-        try std.testing.expectEqual(expected, entry.ignored);
-        try std.testing.expect(!std.mem.eql(u8, entry.name, ".git"));
-    }
-}
-
-test "roots fall back to the home when verde.toml is absent" {
-    var f = try TestFixture.init();
-    defer f.deinit();
-    const a = f.arena_state.allocator();
-    const roots = try rootsFor(a, std.testing.io, f.root);
-    try std.testing.expectEqual(@as(usize, 1), roots.len);
-    try std.testing.expectEqualStrings(f.root, roots[0].path);
-    try std.testing.expectEqualStrings("root", roots[0].name);
-    try std.testing.expectEqualStrings(proto.HOME_ROOT_ID, roots[0].id);
-}

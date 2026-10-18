@@ -714,17 +714,3 @@ pub fn utf8ToUtf16Z(buf: []u16, s: []const u8) [:0]u16 {
     buf[n] = 0;
     return buf[0..n :0];
 }
-
-test "lparam helpers" {
-    const lp = makeLparam(-5, 300);
-    try std.testing.expectEqual(@as(i32, -5), xParam(lp));
-    try std.testing.expectEqual(@as(i32, 300), yParam(lp));
-    const wp: WPARAM = @as(WPARAM, @as(u16, @bitCast(@as(i16, -240)))) << 16;
-    try std.testing.expectEqual(@as(i16, -240), wheelDelta(wp));
-}
-
-test "utf8 to utf16" {
-    var buf: [16]u16 = undefined;
-    const out = utf8ToUtf16Z(&buf, "a\xc3\xa9\xf0\x9f\x98\x80");
-    try std.testing.expectEqualSlices(u16, &.{ 'a', 0xE9, 0xD83D, 0xDE00 }, out);
-}

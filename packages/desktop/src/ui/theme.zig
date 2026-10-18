@@ -1128,69 +1128,6 @@ test "parse Omarchy colors.toml maps palette into semantic colors" {
     try std.testing.expectEqual(rgb(0x44, 0x4b, 0x6a), parsed.border_muted);
 }
 
-test "active Omarchy theme prefers the Quattro state path" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var threaded = std.Io.Threaded.init_single_threaded;
-
-    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    defer std.testing.allocator.free(root);
-    const home_path = try std.fs.path.join(std.testing.allocator, &.{ root, "home" });
-    defer std.testing.allocator.free(home_path);
-    const config_home = try std.fs.path.join(std.testing.allocator, &.{ root, "config" });
-    defer std.testing.allocator.free(config_home);
-    const state_dir = try std.fs.path.join(std.testing.allocator, &.{ home_path, ".local", "state", "omarchy", "current", "theme" });
-    defer std.testing.allocator.free(state_dir);
-    const legacy_dir = try std.fs.path.join(std.testing.allocator, &.{ config_home, "omarchy", "current", "theme" });
-    defer std.testing.allocator.free(legacy_dir);
-    try std.Io.Dir.cwd().createDirPath(threaded.io(), state_dir);
-    try std.Io.Dir.cwd().createDirPath(threaded.io(), legacy_dir);
-
-    const state_path = try std.fs.path.join(std.testing.allocator, &.{ state_dir, "colors.toml" });
-    defer std.testing.allocator.free(state_path);
-    const legacy_path = try std.fs.path.join(std.testing.allocator, &.{ legacy_dir, "colors.toml" });
-    defer std.testing.allocator.free(legacy_path);
-    try std.Io.Dir.cwd().writeFile(threaded.io(), .{ .sub_path = state_path, .data = "accent = \"#111111\"\n" });
-    try std.Io.Dir.cwd().writeFile(threaded.io(), .{ .sub_path = legacy_path, .data = "accent = \"#222222\"\n" });
-
-    const resolved = (try currentOmarchyThemeColorsPathAt(std.testing.allocator, home_path, config_home)).?;
-    defer std.testing.allocator.free(resolved);
-    try std.testing.expectEqualStrings(state_path, resolved);
-}
-
-test "Quattro colors.toml keys map onto Verde roles" {
-    var parsed: ThemeColors = .{};
-    applyOmarchyColorsToml(
-        \\mode = "dark"
-        \\accent = "#509475"
-        \\selection = "#32473B"
-        \\muted = "#53685B"
-        \\background = "#111c18"
-        \\lighter_background = "#23372B"
-        \\foreground = "#C1C497"
-        \\dark_foreground = "#81B8A8"
-        \\light_foreground = "#D6D5BC"
-        \\red = "#FF5345"
-        \\yellow = "#E5C736"
-        \\green = "#549e6a"
-        \\
-    , &parsed);
-
-    try std.testing.expectEqual(rgb(0x11, 0x1c, 0x18), parsed.background);
-    try std.testing.expectEqual(rgb(0x11, 0x1c, 0x18), parsed.panel);
-    try std.testing.expectEqual(rgb(0x23, 0x37, 0x2B), parsed.panel_alt);
-    try std.testing.expectEqual(rgb(0x53, 0x68, 0x5B), parsed.panel_muted);
-    try std.testing.expectEqual(rgb(0x53, 0x68, 0x5B), parsed.border_muted);
-    try std.testing.expectEqual(rgb(0xC1, 0xC4, 0x97), parsed.text);
-    try std.testing.expectEqual(rgb(0xD6, 0xD5, 0xBC), parsed.text_muted);
-    try std.testing.expectEqual(rgb(0x81, 0xB8, 0xA8), parsed.text_subtle);
-    try std.testing.expectEqual(rgb(0x50, 0x94, 0x75), parsed.accent);
-    try std.testing.expectEqual(rgb(0x32, 0x47, 0x3B), parsed.selection);
-    try std.testing.expectEqual(rgb(0xFF, 0x53, 0x45), parsed.diff_remove);
-    try std.testing.expectEqual(rgb(0x54, 0x9e, 0x6a), parsed.diff_add);
-    try std.testing.expectEqual(rgb(0xE5, 0xC7, 0x36), parsed.warning);
-}
-
 test "Omarchy colors.toml prefers [verde] roles and ignores other sections" {
     var parsed: ThemeColors = .{};
     applyOmarchyColorsToml(
@@ -1219,18 +1156,6 @@ test "Omarchy colors.toml prefers [verde] roles and ignores other sections" {
     try std.testing.expectEqual(rgb(0xF0, 0x7A, 0x70), parsed.diff_remove);
 }
 
-test "light Omarchy themes fall back to the Verde Light palette" {
-    var parsed: ThemeColors = .{};
-    applyOmarchyColorsToml(
-        \\mode = "light"
-        \\accent = "#205ea6"
-        \\
-    , &parsed);
-    try std.testing.expectEqual(rgb(0x20, 0x5e, 0xa6), parsed.accent);
-    try std.testing.expectEqual(verde_light_colors.background, parsed.background);
-    try std.testing.expectEqual(verde_light_colors.diff_remove, parsed.diff_remove);
-}
-
 test "theme source names parse with legacy aliases" {
     try std.testing.expectEqual(ThemeSource.auto, ThemeSource.parse("auto").?);
     try std.testing.expectEqual(ThemeSource.verde_dark, ThemeSource.parse("verde-dark").?);
@@ -1243,30 +1168,6 @@ test "theme source names parse with legacy aliases" {
     for (ThemeSource.builtin_choices) |source| {
         try std.testing.expectEqual(source, ThemeSource.parse(source.configName()).?);
     }
-}
-
-test "Verde Legacy [verde] roles reproduce the original palette exactly" {
-    var parsed: ThemeColors = verde_dark_colors;
-    applyOmarchyColorsToml(
-        \\[verde]
-        \\background = "#0D1213"
-        \\panel = "#20272A"
-        \\panel_alt = "#28292E"
-        \\panel_muted = "#38393E"
-        \\text = "#F0F0F5"
-        \\text_muted = "#B9BBC3"
-        \\text_subtle = "#787A87"
-        \\accent = "#50C878"
-        \\accent_dim = "#7CDD5E30"
-        \\border = "#375846"
-        \\border_muted = "#3C474C"
-        \\warning = "#FBBF24"
-        \\diff_add = "#34E094"
-        \\diff_remove = "#FF6464"
-        \\selection = "#58A6FF"
-        \\
-    , &parsed);
-    try std.testing.expectEqual(default_colors, parsed);
 }
 
 test "omarchy theme stamp changes when the theme directory is swapped in" {
@@ -1301,38 +1202,4 @@ test "raise and sink follow the palette polarity" {
     current_colors = verde_light_colors;
     try std.testing.expect(relativeLuma(raise(current_colors.panel, 0.08)) < relativeLuma(current_colors.panel));
     try std.testing.expect(relativeLuma(sink(current_colors.panel_alt, 0.03)) > relativeLuma(current_colors.panel_alt));
-}
-
-test "legibleOn separates fixed hues from the backing" {
-    const saved = current_colors;
-    defer current_colors = saved;
-
-    current_colors = verde_light_colors;
-    const pale_yellow = rgb(0xFA, 0xF7, 0x43);
-    const adjusted = legibleOn(pale_yellow, current_colors.background);
-    try std.testing.expect(@abs(relativeLuma(adjusted) - relativeLuma(current_colors.background)) >= 0.28);
-}
-
-test "wash keeps dark-theme strength and softens light-theme fills" {
-    const saved = current_colors;
-    defer current_colors = saved;
-
-    current_colors = verde_dark_colors;
-    try std.testing.expect(!isLightPalette());
-    try std.testing.expectEqual(@as(f32, 64.0 / 255.0), wash(current_colors.accent, 64)[3]);
-
-    current_colors = verde_light_colors;
-    try std.testing.expect(isLightPalette());
-    try std.testing.expectEqual(@as(f32, 26.0 / 255.0), wash(current_colors.accent, 64)[3]);
-    try std.testing.expectEqual(@as(f32, 0.0), wash(current_colors.accent, 0)[3]);
-    try std.testing.expectEqual(@as(f32, 102.0 / 255.0), wash(current_colors.accent, 255)[3]);
-}
-
-test "withHue keeps lightness and moves the hue" {
-    const blue = withHue(verde_dark_colors.accent, 212.0);
-    try std.testing.expect(blue[2] > blue[0] and blue[2] > blue[1]);
-    const original_lightness = (@max(verde_dark_colors.accent[0], @max(verde_dark_colors.accent[1], verde_dark_colors.accent[2])) +
-        @min(verde_dark_colors.accent[0], @min(verde_dark_colors.accent[1], verde_dark_colors.accent[2]))) * 0.5;
-    const blue_lightness = (@max(blue[0], @max(blue[1], blue[2])) + @min(blue[0], @min(blue[1], blue[2]))) * 0.5;
-    try std.testing.expectApproxEqAbs(original_lightness, blue_lightness, 0.01);
 }

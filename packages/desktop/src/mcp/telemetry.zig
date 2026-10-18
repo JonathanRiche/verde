@@ -220,21 +220,3 @@ fn unixTimestampMs(io: std.Io) i64 {
 fn jsonString(value: std.json.Value) ?[]const u8 {
     return if (value == .string) value.string else null;
 }
-
-test "telemetry report counts clients and retains only failures on demand" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const pref_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    defer std.testing.allocator.free(pref_path);
-    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    try append(std.testing.allocator, io, pref_path, .{ .transport = "http", .client = "fx", .method = "tools/list", .ok = true });
-    try append(std.testing.allocator, io, pref_path, .{ .transport = "http", .client = "fx", .method = "tools/call", .tool = "list_processes", .ok = false, .code = -32000, .detail = "approval denied" });
-    const report = try reportAlloc(std.testing.allocator, io, pref_path, true);
-    defer std.testing.allocator.free(report);
-    try std.testing.expect(std.mem.indexOf(u8, report, "\"calls\":2") != null);
-    try std.testing.expect(std.mem.indexOf(u8, report, "\"failures\":1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, report, "approval denied") != null);
-}

@@ -14,17 +14,13 @@ Captured with the core's own chat harness (`packages/client_core/src/chat_test.z
 
 | File | Core state |
 | --- | --- |
-| `thread-loading.json` | first focus, page request in flight (no rows yet) |
 | `thread-open.json` | first page: 40 rows, `has_older`, cursor `b:5` |
 | `thread-loading-older.json` | `thread_load_older` in flight |
 | `thread-older.json` | after the older page: 45 rows, no more history |
 | `thread-running.json` | recorded send, turn `fixture-turn` running, optimistic prompt overlay |
 | `thread-streaming.json` | recorded tail seq 1 (`stub-ok`) applied, still running |
 | `thread-stopping.json` | `turn_cancel` accepted, `stop_pending` |
-| `thread-completed-overlay.json` | terminal tail event, reconcile page pending |
-| `thread-committed.json` | reconciled page incl. the A-09 `access-cap:fixture` notice |
-| `thread-error.json` | page rejected by the runtime (`remote_error`) |
-| `composer-*.json` | composer projection at idle / running / stopping / committed |
+| `composer-*.json` | composer projection at idle / stopping |
 
 **Derived (not K-10 recordings):**
 

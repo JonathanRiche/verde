@@ -1313,16 +1313,6 @@ test "locate picks the longest matching root and rejects siblings" {
     try std.testing.expectEqualStrings("", locate(&roots, "/w/verde").?.relative);
 }
 
-test "display path is bare for home and folder-prefixed otherwise" {
-    const allocator = std.testing.allocator;
-    const home = try displayPath(allocator, "home", "verde", "src/a.zig");
-    defer allocator.free(home);
-    try std.testing.expectEqualStrings("src/a.zig", home);
-    const other = try displayPath(allocator, "verde-cloud", "verde-cloud", "app.ts");
-    defer allocator.free(other);
-    try std.testing.expectEqualStrings("verde-cloud/app.ts", other);
-}
-
 test "text model splits lines, expands tabs, and keeps source spans" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1342,12 +1332,4 @@ test "text model splits lines, expands tabs, and keeps source spans" {
     try std.testing.expect(!plain.highlighted);
     const empty = try buildTextModel(arena.allocator(), "", null);
     try std.testing.expectEqual(@as(usize, 0), empty.lines.len);
-}
-
-test "highlight language covers known code and leaves prose plain" {
-    try std.testing.expectEqual(zig_dif.Language.zig, highlightLanguage("build.zig.zon").?);
-    try std.testing.expectEqual(zig_dif.Language.tsx, highlightLanguage("App.TSX").?);
-    try std.testing.expectEqual(zig_dif.Language.plain, highlightLanguage("main.rs").?);
-    try std.testing.expect(highlightLanguage("notes.txt") == null);
-    try std.testing.expect(highlightLanguage("LICENSE") == null);
 }

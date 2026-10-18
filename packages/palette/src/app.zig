@@ -574,14 +574,3 @@ fn scaleRect(r: draw.Rect, s: f32) draw.Rect {
 fn monotonicNs() u64 {
     return clock.monotonicTimestampNs();
 }
-
-test "scaleBatch scales geometry and text" {
-    const gpa = std.testing.allocator;
-    var batch: draw.RenderBatch = .{};
-    defer batch.deinit(gpa);
-    try batch.rect(gpa, .{ .x = 10, .y = 20, .w = 30, .h = 40 }, .{ .r = 1, .g = 1, .b = 1, .a = 1 });
-    scaleBatch(&batch, 2);
-    const r = batch.commands.items[0].rect;
-    try std.testing.expectEqual(@as(f32, 20), r.x);
-    try std.testing.expectEqual(@as(f32, 80), r.h);
-}

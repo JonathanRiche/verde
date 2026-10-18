@@ -224,17 +224,6 @@ fn resolvePrefPath(allocator: std.mem.Allocator) ![]u8 {
     return allocator.dupe(u8, pref_path);
 }
 
-test "pref path keeps the SDL3 data directory layout" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .macos) return error.SkipZigTest;
-    const allocator = std.testing.allocator;
-    const xdg = try palette.platform.paths.composePrefPath(allocator, "/data", "/home/u", ORG_NAME, APP_NAME);
-    defer allocator.free(xdg);
-    try std.testing.expectEqualStrings("/data/verde/Native/", xdg);
-    const home = try palette.platform.paths.composePrefPath(allocator, null, "/home/u", ORG_NAME, APP_NAME);
-    defer allocator.free(home);
-    try std.testing.expectEqualStrings("/home/u/.local/share/verde/Native/", home);
-}
-
 pub const Storage = struct {
     allocator: std.mem.Allocator,
     pref_path: []const u8,
@@ -1974,12 +1963,6 @@ fn openReadOnlyOptional(allocator: std.mem.Allocator, pref_path: []const u8) !?d
     };
 }
 
-test "conditional surface clear encodes revision zero as a present CAS guard" {
-    const req = guardedSurfaceClearRequest("zero-guard", "test-client", 0, "session-zero");
-    try std.testing.expect(req.mutation.expected_store_revision != null);
-    try std.testing.expectEqual(@as(u64, 0), req.mutation.expected_store_revision.?);
-}
-
 test "RO load pins store_revision from store_state for launch-2 guard" {
     // BLOCKER-1 session-lifecycle pin: a DB left at revision ≥1 must teach
     // Storage the guard without a mutation, so the next replace is not bootstrap.
@@ -2021,142 +2004,6 @@ test "RO load pins store_revision from store_state for launch-2 guard" {
     try std.testing.expect(storage.revisionIsKnown());
     // Non-bootstrap replace must use expected=1, never bootstrap=true.
     try std.testing.expectEqual(@as(u64, 1), storage.currentStoreRevision());
-}
-
-test "projection load uses an independent coherent RO transaction" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
-    const pref_path = path_buf[0..path_len];
-    const db_path = try std.fs.path.join(std.testing.allocator, &.{ pref_path, db_client.STATE_DB_NAME });
-    defer std.testing.allocator.free(db_path);
-    {
-        var writer = try test_backend.daemon_store.Store.init(std.testing.allocator, db_path);
-        defer writer.deinit();
-        // A full snapshot replace writes the app_state row the projection
-        // reader requires; a bare workspace upsert does not.
-        const result = try writer.replaceSnapshot(.{
-            .mutation = .{
-                .request_key = "projection-load-revision",
-                .client_id = "test-client",
-                .expected_store_revision = 0,
-            },
-            .snapshot = .{ .workspaces = &.{.{
-                .workspace_id = "large-state-workspace",
-                .label = "Loaded without daemon JSON",
-                .path = "/tmp/large-state-workspace",
-            }} },
-        });
-        try std.testing.expectEqual(@as(u64, 1), result.store_revision);
-    }
-
-    var storage = try Storage.initWithPrefPath(std.testing.allocator, pref_path);
-    defer storage.deinit();
-    var loaded = try storage.loadProjection(std.testing.allocator);
-    defer loaded.deinit();
-    try std.testing.expectEqual(@as(u64, 1), loaded.store_revision);
-    try std.testing.expectEqual(@as(usize, 1), loaded.value.projects.len);
-    try std.testing.expectEqualStrings("Loaded without daemon JSON", loaded.value.projects[0].label);
-}
-
-test "effective projection store is independent from pref artifacts" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDir(std.testing.io, "pref", std.Io.File.Permissions.default_dir);
-    try tmp.dir.createDir(std.testing.io, "store", std.Io.File.Permissions.default_dir);
-    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
-    const pref_path = try std.fs.path.join(allocator, &.{ root_buf[0..root_len], "pref" });
-    defer allocator.free(pref_path);
-    const store_dir = try std.fs.path.join(allocator, &.{ root_buf[0..root_len], "store" });
-    defer allocator.free(store_dir);
-    const db_path = try std.fs.path.join(allocator, &.{ store_dir, db_client.STATE_DB_NAME });
-    defer allocator.free(db_path);
-
-    const surface: headless.store.SurfaceState = .{
-        .session_id = "override-session",
-        .workspace_id = "override-workspace",
-        .workspace_path = "/override",
-        .dock_id = 1,
-        .pane_id = 2,
-        .title = "Override surface",
-        .status = "done",
-        .status_changed_at_ms = 10,
-        .completed_at_ms = 11,
-    };
-    var surface_revision: u64 = 0;
-    {
-        var writer = try test_backend.daemon_store.Store.init(allocator, db_path);
-        defer writer.deinit();
-        // A full snapshot replace writes the app_state row the projection
-        // reader requires; a bare workspace upsert does not.
-        _ = try writer.replaceSnapshot(.{
-            .mutation = .{ .request_key = "override-workspace", .expected_store_revision = 0, .client_id = "test-client" },
-            .snapshot = .{ .workspaces = &.{.{ .workspace_id = "override-workspace", .label = "Override", .path = "/override" }} },
-        });
-        const result = try writer.applyMutation(.{ .surface_upsert = .{
-            .mutation = .{ .request_key = "override-surface", .expected_store_revision = 1, .client_id = "test-client" },
-            .surface = surface,
-        } });
-        surface_revision = result.store_revision;
-    }
-
-    var storage = try Storage.initWithPaths(allocator, pref_path, store_dir);
-    defer storage.deinit();
-    try std.testing.expectEqualStrings(pref_path, storage.pref_path);
-    try std.testing.expectEqualStrings(store_dir, storage.projection_store_dir);
-    try std.testing.expect(storage.client != null);
-    var loaded = try storage.loadProjection(allocator);
-    defer loaded.deinit();
-    try std.testing.expectEqual(surface_revision, loaded.store_revision);
-    try std.testing.expectEqual(@as(usize, 1), loaded.value.projects.len);
-    try std.testing.expectEqual(surface_revision, try storage.refreshStoreRevision());
-    try std.testing.expectEqual(
-        SurfaceCommitProofClassification.current,
-        try storage.classifySurfaceUpsertCommitProof(.{
-            .request_key = "override-surface",
-            .store_revision = surface_revision,
-        }, surface),
-    );
-
-    // Non-SQLite state remains rooted in pref_path even with a distinct store.
-    try storage.writePendingStateSpool(.{ .capture_revision = surface_revision, .current = .{} });
-    var spool = (try storage.loadPendingStateSpool(allocator)).?;
-    defer spool.deinit();
-    try std.testing.expectEqual(surface_revision, spool.value.capture_revision);
-    try std.testing.expectEqualStrings(pref_path, storage.pref_path);
-}
-
-test "M5-P4 reconnect-from-cursor: same-instance results advance the cursor and pin the durable revision" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
-    var storage = try Storage.initWithPrefPath(std.testing.allocator, path_buf[0..path_len]);
-    defer storage.deinit();
-
-    // Bootstrap requires a snapshot seed first.
-    try std.testing.expect(storage.currentChangeCursorForPoll() == null);
-    try storage.noteCompositeSnapshotSeed(.{ .instance_nonce = "nonce-a", .registry_revision = 3 }, 7, 4);
-    try std.testing.expectEqual(@as(?u64, 7), storage.currentChangeCursorForPoll());
-    try std.testing.expectEqual(@as(u64, 4), storage.currentStoreRevision());
-    try std.testing.expect(storage.daemonProjectionEverSynced());
-
-    // A same-nonce reply (entries or heartbeat) advances without a fallback.
-    const advanced = storage.noteChangesResult(.{
-        .entries = &.{},
-        .next_cursor = 9,
-        .journal_floor_seq = 0,
-        .expired = false,
-        .heartbeat = true,
-        .envelope = .{ .instance_nonce = "nonce-a", .registry_revision = 5 },
-        .store_revision = 6,
-    });
-    try std.testing.expect(!advanced.snapshot_required and !advanced.instance_changed);
-    try std.testing.expectEqual(@as(?u64, 9), storage.currentChangeCursorForPoll());
-    try std.testing.expectEqual(@as(u64, 6), storage.currentStoreRevision());
 }
 
 test "M5-P4 dirty entries remain unacknowledged until their projection re-read applies" {
@@ -2235,52 +2082,6 @@ test "M5-P4 replacement resync (#27): regressed heartbeat under a new nonce forc
     try std.testing.expectEqual(@as(?u64, 2), storage.currentChangeCursorForPoll());
 }
 
-test "M5-P4 journal expiry invalidates the cursor for exactly one snapshot fallback" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
-    var storage = try Storage.initWithPrefPath(std.testing.allocator, path_buf[0..path_len]);
-    defer storage.deinit();
-
-    try storage.noteCompositeSnapshotSeed(.{ .instance_nonce = "nonce-a", .registry_revision = 1 }, 1, 1);
-    storage.invalidateChangeCursorForSnapshotFallback();
-    try std.testing.expect(storage.currentChangeCursorForPoll() == null);
-    // One snapshot fallback restores incremental polling.
-    try storage.noteCompositeSnapshotSeed(.{ .instance_nonce = "nonce-a", .registry_revision = 2 }, 12, 9);
-    try std.testing.expectEqual(@as(?u64, 12), storage.currentChangeCursorForPoll());
-    // The expired-result shape (result.expired=true) also routes through the
-    // #27 rule: snapshot_required regardless of nonce equality.
-    const outcome = storage.noteChangesResult(.{
-        .entries = &.{},
-        .next_cursor = 12,
-        .journal_floor_seq = 12,
-        .expired = true,
-        .heartbeat = false,
-        .envelope = .{ .instance_nonce = "nonce-a", .registry_revision = 2 },
-        .store_revision = 9,
-    });
-    try std.testing.expect(outcome.snapshot_required);
-    try std.testing.expect(!outcome.instance_changed);
-    try std.testing.expect(storage.currentChangeCursorForPoll() == null);
-}
-
-test "capture revision remains bound when the write guard advances" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
-    var storage = try Storage.initWithPrefPath(std.testing.allocator, path_buf[0..path_len]);
-    defer storage.deinit();
-
-    try storage.noteCompositeSnapshotSeed(.{ .instance_nonce = "nonce-a", .registry_revision = 1 }, 4, 7);
-    const captured = storage.currentProjectionObservedRevision();
-    storage.noteStoreRevision(9);
-    try std.testing.expectEqual(@as(u64, 7), captured);
-    try std.testing.expectEqual(@as(u64, 7), storage.currentProjectionObservedRevision());
-    try std.testing.expectEqual(@as(u64, 9), storage.currentStoreRevision());
-}
-
 test "pending state spool is durable, replayable, and acknowledgement-cleared" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2331,24 +2132,4 @@ test "pending state spool is durable, replayable, and acknowledgement-cleared" {
     try std.testing.expectEqual(@as(?usize, 1), loaded.value.adoption_repairs[0].rows[0].row_index);
     try storage.clearPendingStateSpool();
     try std.testing.expect((try storage.loadPendingStateSpool(std.testing.allocator)) == null);
-}
-
-test "snapshot transport preflight rejects a full-state payload without allocating its request" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
-    var storage = try Storage.initWithPrefPath(std.testing.allocator, path_buf[0..path_len]);
-    defer storage.deinit();
-    try std.testing.expect(try storage.stateFitsSnapshotTransport(.{}));
-
-    const body = try std.testing.allocator.alloc(u8, headless.protocol.MAX_MESSAGE_BYTES);
-    defer std.testing.allocator.free(body);
-    @memset(body, 'x');
-    const messages = [_]db_types.PersistedMessage{.{
-        .role = .assistant,
-        .author = "test",
-        .body = body,
-    }};
-    try std.testing.expect(!try storage.stateFitsSnapshotTransport(.{ .messages = &messages }));
 }

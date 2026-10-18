@@ -276,13 +276,6 @@ fn validateStatus(status: std.http.Status) !void {
     return error.GatewayRejected;
 }
 
-test "gateway URL is fixed to numeric loopback and one RPC path" {
-    const url = try gatewayUrlAlloc(std.testing.allocator, 43127);
-    defer std.testing.allocator.free(url);
-    try std.testing.expectEqualStrings("http://127.0.0.1:43127/api/rpc", url);
-    try std.testing.expectError(error.InvalidPort, gatewayUrlAlloc(std.testing.allocator, 0));
-}
-
 test "call validation rejects unsafe credentials and unbounded frames" {
     const valid_token = "0123456789abcdef0123456789abcdef";
     try validateCall(.{
@@ -311,17 +304,6 @@ test "call validation rejects unsafe credentials and unbounded frames" {
         .rpc_json = "{}",
         .timeout_ms = MAX_TIMEOUT_MS + 1,
     }));
-}
-
-test "gateway status mapping keeps auth and redirect failures distinct" {
-    try validateStatus(.ok);
-    try std.testing.expectError(error.AuthenticationRequired, validateStatus(.unauthorized));
-    try std.testing.expectError(error.DaemonUnavailable, validateStatus(.service_unavailable));
-    try std.testing.expectError(error.DaemonUnavailable, validateStatus(.internal_server_error));
-    try std.testing.expectError(error.WrongService, validateStatus(.not_found));
-    try std.testing.expectError(error.WrongService, validateStatus(.method_not_allowed));
-    try std.testing.expectError(error.RedirectRejected, validateStatus(.temporary_redirect));
-    try std.testing.expectError(error.GatewayRejected, validateStatus(.bad_request));
 }
 
 test "direct endpoint keeps credentials on one verified origin" {

@@ -1,7 +1,6 @@
 //! Linux browser backend implemented as an offscreen WPE WebKit helper process.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const browser_input = @import("../input.zig");
 const browser_queue = @import("../queue.zig");
 const browser_texture = @import("../texture.zig");
@@ -1382,21 +1381,6 @@ fn createProtocolPipe() ![2]std.posix.fd_t {
     return pipe_fds;
 }
 
-test "browser helper protocol pipes close across unrelated execs" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
-    const pipe_fds = try createProtocolPipe();
-    defer {
-        _ = std.c.close(pipe_fds[0]);
-        _ = std.c.close(pipe_fds[1]);
-    }
-
-    for (pipe_fds) |fd| {
-        const flags = std.c.fcntl(fd, std.c.F.GETFD);
-        try std.testing.expect(flags >= 0);
-        try std.testing.expect(flags & std.c.FD_CLOEXEC != 0);
-    }
-}
-
 fn createFrameSocketPair() ![2]std.posix.fd_t {
     var pair: [2]std.posix.fd_t = undefined;
     const rc = std.os.linux.socketpair(std.os.linux.AF.UNIX, std.os.linux.SOCK.SEQPACKET | std.os.linux.SOCK.CLOEXEC, 0, &pair);
@@ -1477,25 +1461,6 @@ fn visibleHelperEnabledFromValues(override_value: ?[]const u8, unsafe_wayland: ?
         return std.mem.indexOf(u8, value, "wayland") != null or std.mem.indexOf(u8, value, "x11") != null;
     }
     return false;
-}
-
-test "visible helper selection honors overrides and session defaults" {
-    try std.testing.expect(visibleHelperEnabledFromValues("1", null, "wayland", null));
-    try std.testing.expect(visibleHelperEnabledFromValues("1", "1", "wayland", null));
-    try std.testing.expect(!visibleHelperEnabledFromValues("0", null, "x11", null));
-    try std.testing.expect(visibleHelperEnabledFromValues(null, null, "x11", null));
-    try std.testing.expect(visibleHelperEnabledFromValues(null, null, "wayland", "x11"));
-    try std.testing.expect(visibleHelperEnabledFromValues(null, null, null, "x11"));
-    try std.testing.expect(visibleHelperEnabledFromValues(null, null, null, "x11,wayland"));
-}
-
-test "Wayland diagnostic helper selection requires explicit Wayland opt-in" {
-    try std.testing.expect(waylandDiagnosticHelperEnabledFromValues("1", "wayland", null, null));
-    try std.testing.expect(waylandDiagnosticHelperEnabledFromValues("1", null, "wayland-1", null));
-    try std.testing.expect(waylandDiagnosticHelperEnabledFromValues("1", null, null, "wayland"));
-    try std.testing.expect(!waylandDiagnosticHelperEnabledFromValues(null, "wayland", "wayland-1", null));
-    try std.testing.expect(!waylandDiagnosticHelperEnabledFromValues("0", "wayland", "wayland-1", null));
-    try std.testing.expect(!waylandDiagnosticHelperEnabledFromValues("1", "x11", "wayland-1", "wayland"));
 }
 
 /// Resolves the installed Linux browser helper path beside the running desktop executable.

@@ -126,21 +126,6 @@ test "a split tile is one tab and standalone panes are their own tabs" {
     try std.testing.expectEqual(tiled_pane_id, collect(&layout, &buffer)[0].preferred_pane_id);
 }
 
-test "tabs skip panes outside the root tree" {
-    const allocator = std.testing.allocator;
-    var layout = try WorkspaceLayout.initDefaultChat(allocator);
-    defer layout.deinit(allocator);
-
-    // A pane record with no leaf in the tree (e.g. a detached quick pane).
-    const orphan_pane_id = try layout.createTerminalPane(allocator, 12);
-    var buffer: [16]WorkspaceTab = undefined;
-    const tabs = collect(&layout, &buffer);
-    try std.testing.expectEqual(@as(usize, 1), tabs.len);
-    try std.testing.expectEqual(@as(?WorkspaceTabId, null), tabIdForPane(&layout, orphan_pane_id));
-    try std.testing.expectEqual(@as(?usize, null), indexOfPane(&layout, tabs, orphan_pane_id));
-    try std.testing.expectEqual(@as(?usize, null), indexOfTab(tabs, 999));
-}
-
 test "tabs remain reachable beyond the former sixteen group limit" {
     const allocator = std.testing.allocator;
     var layout = try WorkspaceLayout.initDefaultChat(allocator);

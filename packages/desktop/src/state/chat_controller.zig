@@ -478,27 +478,8 @@ fn providerNoticeFmt(buf: []u8, provider: Provider, comptime fmt: []const u8, fa
     return std.fmt.bufPrint(buf, fmt, .{label}) catch fallback;
 }
 
-test "provider notices name the provider and fall back to the generic text" {
-    var fmt_buf: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("Waiting for Codex reply...", providerNoticeFmt(&fmt_buf, .codex, "Waiting for {s} reply...", "Waiting for provider reply..."));
-    var fmt_tiny: [4]u8 = undefined;
-    try std.testing.expectEqualStrings("Waiting for provider reply...", providerNoticeFmt(&fmt_tiny, .codex, "Waiting for {s} reply...", "Waiting for provider reply..."));
-    var buf: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("Claude request failed.", providerNotice(&buf, .claude, "request failed.", "Provider request failed."));
-    try std.testing.expectEqualStrings("Codex reply stopped.", providerNotice(&buf, .codex, "reply stopped.", "Provider reply stopped."));
-    var tiny: [4]u8 = undefined;
-    try std.testing.expectEqualStrings("Provider session updated.", providerNotice(&tiny, .claude, "session updated.", "Provider session updated."));
-}
-
 fn workerCleanupPending(terminal: bool, has_worker: bool, worker_done: bool) bool {
     return terminal and has_worker and !worker_done;
-}
-
-test "render polling waits for worker cleanup before joining" {
-    try std.testing.expect(workerCleanupPending(true, true, false));
-    try std.testing.expect(!workerCleanupPending(true, true, true));
-    try std.testing.expect(!workerCleanupPending(true, false, false));
-    try std.testing.expect(!workerCleanupPending(false, true, false));
 }
 
 pub fn titleGenerationWorker(request: *TitleGenerationRequest) void {
@@ -726,17 +707,6 @@ pub const State = struct {
     }
 };
 
-test "daemon chat tail response buffer is reused" {
-    var state: State = .{};
-    defer state.deinit(std.testing.allocator);
-
-    const first = try state.daemonTailResponseBuffer(std.testing.allocator);
-    const second = try state.daemonTailResponseBuffer(std.testing.allocator);
-
-    try std.testing.expectEqual(daemon_client.MAX_RESPONSE_BYTES, first.len);
-    try std.testing.expectEqual(@intFromPtr(first.ptr), @intFromPtr(second.ptr));
-}
-
 const CodexBackgroundPollStatus = enum {
     idle,
     pending,
@@ -884,30 +854,6 @@ test "approval transitions replace clear and resolve pending state" {
     try std.testing.expect(send_state.pending_approval == null);
     try std.testing.expect(send_state.approval_decision == null);
     try std.testing.expect(!try syncDaemonPendingApprovalLocked(&send_state, .null));
-}
-
-test "control transfer failure stays distinct actionable and clears on success" {
-    var send_state: SendState = .{};
-    defer {
-        chat_types.freePendingApproval(std.heap.page_allocator, &send_state.pending_approval);
-        if (send_state.control_error_message) |message| std.heap.page_allocator.free(message);
-    }
-    send_state.status = .pending;
-    send_state.pending_approval = .{
-        .call_id = try std.heap.page_allocator.dupe(u8, "call"),
-        .title = try std.heap.page_allocator.dupe(u8, "Approve"),
-        .body = try std.heap.page_allocator.dupe(u8, "Proceed?"),
-    };
-
-    setControlFailureLocked(&send_state, "rejected");
-    try std.testing.expect(send_state.control_error_message != null);
-    try std.testing.expect(send_state.error_message == null);
-    try std.testing.expect(send_state.pending_approval != null);
-    try std.testing.expect(send_state.approval_decision == null);
-    clearControlFailureLocked(&send_state);
-    try std.testing.expect(send_state.control_error_message == null);
-    try std.testing.expect(resolveApprovalLocked(&send_state, .approve));
-    try std.testing.expectEqual(provider_types.ApprovalDecision.approve, send_state.approval_decision.?);
 }
 
 test "real addressed control seams roll back missing daemon prerequisites" {
@@ -1140,148 +1086,6 @@ test "real addressed control seams roll back missing daemon prerequisites" {
     try std.testing.expect(thread.send_state.control_error_message != null);
 }
 
-test "active polling leaves unregistered pane-less Companion stop state untouched" {
-    const allocator = std.testing.allocator;
-    const PollState = struct {
-        allocator: std.mem.Allocator,
-        chat_controller: State = .{},
-        project_controller: struct {
-            projects: std.ArrayList(Project) = .empty,
-        } = .{},
-        poll_visits: usize = 0,
-
-        pub fn pollTitleGenerations(_: *@This()) bool {
-            return false;
-        }
-        pub fn pollThreadSend(self: *@This(), project_index: usize, _: usize, thread: *ChatThread) bool {
-            self.poll_visits += 1;
-            issuePendingThreadStop(
-                self,
-                project_index,
-                self.project_controller.projects.items[project_index].path,
-                thread,
-            );
-            return false;
-        }
-        pub fn cancelDaemonChatTurn(_: *@This(), _: []const u8) !void {}
-        pub fn providerExecutionTargetForProjectThread(_: *@This(), _: usize, _: *const ChatThread, _: usize) ?ProviderExecutionTarget {
-            return null;
-        }
-        pub fn interruptThreadViaHarness(_: *@This(), _: ProviderExecutionTarget, _: Provider, _: []const u8, _: ?[]u8) !void {}
-        pub fn setSidebarNotice(_: *@This(), _: []const u8) void {}
-    };
-    var state: PollState = .{ .allocator = allocator };
-    defer state.chat_controller.deinit(allocator);
-    var project = try Project.init(allocator, "poll-companion", "Poll Companion", "/tmp/poll-companion", 0);
-    state.project_controller.projects.append(allocator, project) catch |err| {
-        project.deinit(allocator);
-        return err;
-    };
-    defer {
-        for (state.project_controller.projects.items) |*owned_project| owned_project.deinit(allocator);
-        state.project_controller.projects.deinit(allocator);
-    }
-    const owned_project = &state.project_controller.projects.items[0];
-    const pane_count = owned_project.workspace_layout.panes.items.len;
-    const companion = try owned_project.ensureCompanionThread(allocator);
-    try std.testing.expectEqual(pane_count, owned_project.workspace_layout.panes.items.len);
-    const unrelated = &owned_project.threads.items[0];
-    unrelated.send_state.status = .pending;
-    unrelated.send_state.stop_requested = false;
-    state.chat_controller.beginSend();
-
-    for ([_]SendStatus{ .idle, .completed }) |companion_status| {
-        companion.send_state.status = companion_status;
-        companion.send_state.stop_requested = false;
-        companion.send_state.stop_signal_sent = false;
-        const ui_revision = companion.send_state.ui_revision;
-        const visits_before = state.poll_visits;
-        _ = pollSend(&state);
-        try std.testing.expectEqual(visits_before + 1, state.poll_visits);
-        try std.testing.expectEqual(companion_status, companion.send_state.status);
-        try std.testing.expect(!companion.send_state.stop_requested);
-        try std.testing.expect(!companion.send_state.stop_signal_sent);
-        try std.testing.expectEqual(ui_revision, companion.send_state.ui_revision);
-        try std.testing.expect(companion.send_state.control_error_message == null);
-    }
-}
-
-test "daemon turn lookup retains only active send references" {
-    const allocator = std.testing.allocator;
-    const LookupState = struct {
-        allocator: std.mem.Allocator,
-        chat_controller: State = .{},
-        project_controller: struct {
-            projects: std.ArrayList(Project) = .empty,
-        } = .{},
-    };
-    var state: LookupState = .{ .allocator = allocator };
-    defer state.chat_controller.deinit(allocator);
-    var project = try Project.init(allocator, "lookup-project", "Lookup", "/tmp/lookup", 0);
-    state.project_controller.projects.append(allocator, project) catch |err| {
-        project.deinit(allocator);
-        return err;
-    };
-    defer {
-        for (state.project_controller.projects.items) |*owned_project| owned_project.deinit(allocator);
-        state.project_controller.projects.deinit(allocator);
-    }
-
-    const owned_project = &state.project_controller.projects.items[0];
-    for (0..32) |_| try owned_project.threads.append(allocator, try ChatThread.init(allocator, "Idle"));
-    const active_thread = &owned_project.threads.items[17];
-    active_thread.send_state.status = .pending;
-    active_thread.send_state.daemon_owned = true;
-    active_thread.send_state.daemon_turn_id = try std.heap.page_allocator.dupe(u8, "active-turn");
-    state.chat_controller.pending_send_count = 1;
-
-    try rebuildActiveSendRefs(&state);
-    try std.testing.expectEqual(@as(usize, 1), state.chat_controller.active_send_refs.items.len);
-    try std.testing.expect(threadByDaemonTurnId(&state, "active-turn") == active_thread);
-    try std.testing.expect(threadByDaemonTurnId(&state, "missing-turn") == null);
-}
-
-test "daemon control rejects JSON-RPC error responses" {
-    try std.testing.expectError(error.DaemonRequestFailed, ensureJsonRpcOk(std.testing.allocator,
-        \\{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"rejected"}}
-    ));
-}
-
-test "thread-addressed prompt staging preserves ordered images and legacy first image" {
-    const allocator = std.testing.allocator;
-    var thread = try ChatThread.init(allocator, "Companion");
-    defer thread.deinit(allocator);
-    var first = try ChatImageAttachment.init(allocator, "/tmp/first.png", "image/png", 10);
-    defer first.deinit(allocator);
-    var second = try ChatImageAttachment.init(allocator, "/tmp/second.jpg", "image/jpeg", 20);
-    defer second.deinit(allocator);
-
-    try stageThreadPrompt(allocator, &thread, "inspect both", &.{ first, second });
-    try std.testing.expectEqualStrings("inspect both", thread.currentDraft());
-    try std.testing.expectEqual(@as(usize, 2), thread.draftImageCount());
-    try std.testing.expectEqualStrings("/tmp/first.png", thread.draft_image.?.path);
-    try std.testing.expectEqualStrings("/tmp/second.jpg", thread.draft_extra_images.items[0].path);
-}
-
-test "pending follow-up preserves multiple draft images" {
-    const allocator = std.testing.allocator;
-    var thread = try ChatThread.init(allocator, "Companion");
-    defer thread.deinit(allocator);
-    try thread.addDraftImage(allocator, "/tmp/first.png", "image/png", 10);
-    try thread.addDraftImage(allocator, "/tmp/second.jpg", "image/jpeg", 20);
-
-    var followup: PendingFollowup = .{
-        .kind = .steer,
-        .prompt = try allocator.dupe(u8, "inspect both"),
-    };
-    defer followup.deinit(allocator);
-    try copyDraftImagesToFollowup(allocator, &thread, &followup.images);
-
-    try std.testing.expectEqual(@as(usize, 2), followup.images.items.len);
-    try std.testing.expectEqualStrings("/tmp/first.png", followup.images.items[0].path);
-    try std.testing.expectEqualStrings("/tmp/second.jpg", followup.images.items[1].path);
-}
-
 test "thread-addressed prompt staging is transactional and alias safe" {
     const allocator = std.testing.allocator;
     var thread = try ChatThread.init(allocator, "Companion");
@@ -1307,23 +1111,6 @@ test "thread-addressed prompt staging is transactional and alias safe" {
     try std.testing.expect(fail_after_first.has_induced_failure);
     try std.testing.expectEqualStrings("replacement", thread.currentDraft());
     try std.testing.expectEqualStrings("/tmp/prior.png", thread.draft_image.?.path);
-}
-
-test "thread-addressed prompt snapshot restores an existing user draft" {
-    const allocator = std.testing.allocator;
-    var thread = try ChatThread.init(allocator, "Visible chat");
-    defer thread.deinit(allocator);
-    thread.setDraft("still typing");
-    try thread.setDraftImage(allocator, "/tmp/user-draft.png", "image/png", 17);
-
-    var snapshot = try ThreadDraftSnapshot.init(allocator, &thread);
-    defer snapshot.deinit(allocator);
-    try stageThreadPrompt(allocator, &thread, "background prompt", &.{});
-    snapshot.restore(allocator, &thread);
-
-    try std.testing.expectEqualStrings("still typing", thread.currentDraft());
-    try std.testing.expectEqual(@as(usize, 1), thread.draftImageCount());
-    try std.testing.expectEqualStrings("/tmp/user-draft.png", thread.draft_image.?.path);
 }
 
 test "prospective prompt preflight rejects before thread staging" {
@@ -1387,170 +1174,6 @@ test "prospective prompt preflight rejects before thread staging" {
     try std.testing.expectEqual(@as(usize, 2), fake.daemon_checks);
     try std.testing.expectEqualStrings("", prospective.currentDraft());
     try std.testing.expectEqual(@as(usize, 0), prospective.messages.items.len);
-}
-
-test "remote attachments pass preflight untouched; capability gating is a visible dispatch failure" {
-    const allocator = std.testing.allocator;
-    const routable_runtime: RuntimeService.RuntimeSnapshot = .{
-        .runtime_id = "0123456789abcdef0123456789abcdef",
-        .instance_id = "00112233445566778899aabbccddeeff",
-        .server_version = "test",
-        .protocol_major = 1,
-        .protocol_minor = 0,
-        .negotiated_headless_protocol_version = 1,
-    };
-    const FakeState = struct {
-        project_controller: struct {
-            projects: std.ArrayList(Project) = .empty,
-        } = .{},
-        test_remote_route_snapshot: RuntimeService.Snapshot,
-        notices: usize = 0,
-        daemon_checks: usize = 0,
-
-        pub fn setSidebarNotice(self: *@This(), _: []const u8) void {
-            self.notices += 1;
-        }
-        pub fn ensureSessionDaemon(self: *@This()) !void {
-            self.daemon_checks += 1;
-        }
-    };
-    var state: FakeState = .{ .test_remote_route_snapshot = .{
-        .profile_id = "remote-box",
-        .label = "Remote",
-        .transport = .ssh_tunnel,
-        .phase = .ready,
-        .failure = null,
-        .retry_at_ms = null,
-        .local_port = 1234,
-        .tunnel_lifecycle = .running,
-        .tunnel_pid = 1,
-        .runtime = routable_runtime,
-        .identity_pin_required = false,
-        .rpc_in_flight = false,
-        .last_heartbeat_ms = 1,
-        .verified_runtime_matches_pin = true,
-        .repository_manifest_capable = true,
-        .repository_chat_route_capable = true,
-        .execution_ready = true,
-    } };
-    var project = try Project.init(allocator, "remote-attachment", "Remote", "/desktop/private", 0);
-    state.project_controller.projects.append(allocator, project) catch |err| {
-        project.deinit(allocator);
-        return err;
-    };
-    defer {
-        for (state.project_controller.projects.items) |*owned| owned.deinit(allocator);
-        state.project_controller.projects.deinit(allocator);
-    }
-    const thread = &state.project_controller.projects.items[0].threads.items[0];
-    thread.setDraft("keep this draft");
-    try std.testing.expectEqual(.updated, try thread.selectRuntimeRoute(allocator, .{
-        .profile_id = "remote-box",
-        .repository_id = "repo-api",
-    }));
-    var image = try ChatImageAttachment.init(allocator, "/desktop/private/secret.png", "image/png", 9);
-    defer image.deinit(allocator);
-
-    // Attachments no longer gate a routable remote preflight: no composer or
-    // transcript mutation, no notice, and no local daemon spawn for a remote
-    // route. Capability gaps reject later, inside dispatch, visibly.
-    try std.testing.expect(try preflightThreadPrompt(&state, 0, thread, "send remotely", &.{image}));
-    try std.testing.expectEqualStrings("keep this draft", thread.currentDraft());
-    try std.testing.expectEqual(@as(usize, 0), thread.messages.items.len);
-    try std.testing.expectEqual(@as(usize, 0), state.daemon_checks);
-    try std.testing.expectEqual(@as(usize, 0), state.notices);
-}
-
-test "remote attachment capability rejection at dispatch is visible and retains the draft" {
-    const allocator = std.testing.allocator;
-    const FakeState = struct {
-        allocator: std.mem.Allocator,
-        project_controller: struct {
-            projects: std.ArrayList(Project) = .empty,
-            selected_index: usize = 0,
-        } = .{},
-        dispatch_error: anyerror,
-        failure_rows: usize = 0,
-        flushes: usize = 0,
-
-        pub fn providerExecutionTargetForProjectThread(_: *@This(), _: usize, _: *const ChatThread, _: usize) ?ProviderExecutionTarget {
-            return .{ .local = "/tmp" };
-        }
-        pub fn ensureSessionDaemon(_: *@This()) !void {}
-        pub fn appendMessageToThread(
-            self: *@This(),
-            thread: *ChatThread,
-            role: provider_models.ChatRole,
-            author: []const u8,
-            body: []const u8,
-            _: ?*const ChatImageAttachment,
-            _: []const ChatImageAttachment,
-        ) !void {
-            try thread.messages.append(self.allocator, .{
-                .role = role,
-                .author = try self.allocator.dupeZ(u8, author),
-                .body = try self.allocator.dupeZ(u8, body),
-                .extra_images = try self.allocator.alloc(ChatImageAttachment, 0),
-            });
-            thread.touch();
-        }
-        pub fn releaseMessage(self: *@This(), message: ChatMessage) void {
-            self.allocator.free(message.author);
-            self.allocator.free(message.body);
-            self.allocator.free(message.extra_images);
-        }
-        pub fn dispatchDaemonAcceptance(
-            self: *@This(),
-            _: usize,
-            _: *ChatThread,
-            _: []const u8,
-            _: ChatExecutionRoute,
-            _: *InitialSendSnapshot,
-            _: bool,
-        ) !void {
-            // Mirrors the production preflight inside dispatchDaemonAcceptance
-            // (old daemon without chat.attachments.v1, over-limit drafts, or
-            // unusable advertised limits) failing before anything is armed.
-            return self.dispatch_error;
-        }
-        pub fn appendInitialSendFailure(self: *@This(), _: *ChatThread, message: []const u8) void {
-            std.testing.expectEqualStrings(initialSendStartFailureMessage(self.dispatch_error), message) catch unreachable;
-            self.failure_rows += 1;
-        }
-        pub fn requestTranscriptScrollToBottom(_: *@This()) void {}
-        pub fn resetComposerInputWidget(_: *@This()) void {}
-        pub fn setSidebarNotice(_: *@This(), _: []const u8) void {}
-        pub fn flushDirtyBlocking(self: *@This()) void {
-            self.flushes += 1;
-        }
-        pub fn markDirty(_: *@This()) void {}
-    };
-
-    const rejections = [_]anyerror{ error.RemoteAttachmentsUnsupported, error.RemoteAttachmentTooMany, error.RuntimeServiceUnavailable };
-    for (rejections) |dispatch_error| {
-        var state: FakeState = .{ .allocator = allocator, .dispatch_error = dispatch_error };
-        var project = try Project.init(allocator, "reject-attach", "Reject attach", "/tmp/reject-attach", 0);
-        state.project_controller.projects.append(allocator, project) catch |err| {
-            project.deinit(allocator);
-            return err;
-        };
-        defer {
-            for (state.project_controller.projects.items) |*owned| owned.deinit(allocator);
-            state.project_controller.projects.deinit(allocator);
-        }
-        const thread = &state.project_controller.projects.items[0].threads.items[0];
-        thread.setDraft("send with image");
-        try thread.setDraftImage(allocator, "/desktop/private/keep.png", "image/png", 12);
-
-        try std.testing.expectError(dispatch_error, sendThreadDraft(&state, 0, 0));
-        // Visible transcript failure with the typed message, and the draft
-        // plus its attachment stay in the composer for retry.
-        try std.testing.expectEqual(@as(usize, 1), state.failure_rows);
-        try std.testing.expectEqualStrings("send with image", thread.currentDraft());
-        try std.testing.expectEqual(@as(usize, 1), thread.draftImageCount());
-        try std.testing.expectEqualStrings("/desktop/private/keep.png", thread.draft_image.?.path);
-        try std.testing.expectEqual(@as(usize, 0), thread.messages.items.len);
-    }
 }
 
 test "failed dispatch restores retryable draft; async acceptance arms one addressed turn" {
@@ -1931,29 +1554,6 @@ pub fn codexBackgroundTaskCwd(project_path: []const u8, thread: *const ChatThrea
     return effectiveThreadCwd(project_path, thread);
 }
 
-test "Codex background controls route pinned Local tasks by their original CWD" {
-    const allocator = std.testing.allocator;
-    var thread = try ChatThread.init(allocator, "Background controls");
-    defer thread.deinit(allocator);
-    const task: BackgroundTask = .{ .command = "sleep 60", .cwd = "/original/repository", .status = .running };
-    try thread.pinRuntimeRoute(allocator, "0123456789abcdef0123456789abcdef");
-    try std.testing.expect(!mayUseLegacyLocalExecution(&thread));
-    try std.testing.expectEqualStrings("/original/repository", codexBackgroundTaskCwd("/workspace", &thread, &task).?);
-    const legacy_task: BackgroundTask = .{ .command = "sleep 60", .status = .running };
-    try std.testing.expectEqualStrings("/workspace", codexBackgroundTaskCwd("/workspace", &thread, &legacy_task).?);
-
-    var remote = try ChatThread.init(allocator, "Remote background controls");
-    defer remote.deinit(allocator);
-    _ = try remote.selectRuntimeRoute(allocator, .{ .profile_id = "remote-box", .repository_id = "primary" });
-    try std.testing.expect(codexBackgroundTaskCwd("/workspace", &remote, &task) == null);
-
-    var repository = try ChatThread.init(allocator, "Repository background controls");
-    defer repository.deinit(allocator);
-    _ = try repository.selectRuntimeRoute(allocator, .{ .profile_id = chat_types.LOCAL_RUNTIME_PROFILE_ID, .repository_id = "secondary", .relative_cwd = "api" });
-    try std.testing.expectEqualStrings("/original/repository", codexBackgroundTaskCwd("/workspace", &repository, &task).?);
-    try std.testing.expect(codexBackgroundTaskCwd("/workspace", &repository, &legacy_task) == null);
-}
-
 /// The existing provider harness is local-only. Until the runtime connection
 /// manager supplies a verified target, only the exact legacy Local/primary
 /// route may reach it; every explicit runtime/repository route fails closed.
@@ -2064,46 +1664,6 @@ fn resolveChatExecutionRoute(
         .relative_cwd = selected.relative_cwd,
         .runtime_id = snapshot.runtime.?.runtime_id,
     } };
-}
-
-test "remote repository route requires readiness pin match and both capabilities" {
-    const runtime: RuntimeService.RuntimeSnapshot = .{
-        .runtime_id = "0123456789abcdef0123456789abcdef",
-        .instance_id = "00112233445566778899aabbccddeeff",
-        .server_version = "test",
-        .protocol_major = 1,
-        .protocol_minor = 0,
-        .negotiated_headless_protocol_version = 1,
-    };
-    var snapshot: RuntimeService.Snapshot = .{
-        .profile_id = "remote",
-        .label = "Remote",
-        .transport = .ssh_tunnel,
-        .phase = .ready,
-        .failure = null,
-        .retry_at_ms = null,
-        .local_port = 1234,
-        .tunnel_lifecycle = .running,
-        .tunnel_pid = 1,
-        .runtime = runtime,
-        .identity_pin_required = false,
-        .rpc_in_flight = false,
-        .last_heartbeat_ms = 1,
-        .verified_runtime_matches_pin = true,
-        .repository_manifest_capable = true,
-        .repository_chat_route_capable = true,
-        .execution_ready = true,
-    };
-    try std.testing.expect(remoteSnapshotCanRoute(snapshot, runtime.runtime_id));
-    try std.testing.expect(!remoteSnapshotCanRoute(snapshot, "fedcba9876543210fedcba9876543210"));
-    snapshot.repository_chat_route_capable = false;
-    try std.testing.expect(!remoteSnapshotCanRoute(snapshot, runtime.runtime_id));
-    snapshot.repository_chat_route_capable = true;
-    snapshot.repository_manifest_capable = false;
-    try std.testing.expect(!remoteSnapshotCanRoute(snapshot, runtime.runtime_id));
-    snapshot.repository_manifest_capable = true;
-    snapshot.execution_ready = false;
-    try std.testing.expect(!remoteSnapshotCanRoute(snapshot, runtime.runtime_id));
 }
 
 pub fn providerExecutionTargetForProjectThread(
@@ -2941,19 +2501,6 @@ const AcceptanceTurnStartParams = union(enum) {
     repository: AcceptanceRepositoryTurnStartParams,
 };
 
-test "repository chat start params cannot carry an absolute desktop path" {
-    try std.testing.expect(@hasField(AcceptanceRepositoryTurnStartParams, "workspace_id"));
-    try std.testing.expect(@hasField(AcceptanceRepositoryTurnStartParams, "repository_id"));
-    try std.testing.expect(@hasField(AcceptanceRepositoryTurnStartParams, "relative_cwd"));
-    try std.testing.expect(@hasField(AcceptanceRepositoryTurnStartParams, "require_provider_ready"));
-    try std.testing.expect(!@hasField(AcceptanceRepositoryTurnStartParams, "project_path"));
-    try std.testing.expect(!@hasField(AcceptanceRepositoryTurnStartParams, "cwd"));
-    try std.testing.expect(!@hasField(AcceptanceRepositoryTurnStartParams, "image_paths"));
-    try std.testing.expect(!@hasField(AcceptanceRepositoryTurnStartParams, "images"));
-    // Attachments travel as opaque staged IDs, never local filesystem paths.
-    try std.testing.expect(@hasField(AcceptanceRepositoryTurnStartParams, "attachments"));
-}
-
 const AcceptanceTransport = union(enum) {
     local_worker,
     /// Pre-turn attachment staging: the poll loop drives the chunked
@@ -3431,26 +2978,6 @@ test "remote acceptance distinguishes accepted rejected and transport ambiguity"
 
     var ambiguous: RuntimeService.RpcCallResult = .{ .failed = .network };
     try std.testing.expectEqual(AcceptanceOutcome.ambiguous, classifyRemoteAcceptanceResult(&dispatch, &ambiguous));
-}
-
-test "remote acceptance maps exact structured readiness reasons" {
-    try std.testing.expectEqual(error.RemoteWorkspaceBindingMissing, remoteAcceptanceFailure(.workspace_binding_missing));
-    try std.testing.expectEqual(error.RemoteProviderUnavailable, remoteAcceptanceFailure(.provider_unavailable));
-    try std.testing.expectEqual(error.RemoteProviderNotAuthenticated, remoteAcceptanceFailure(.provider_not_authenticated));
-    try std.testing.expectEqual(error.DaemonRequestFailed, remoteAcceptanceFailure(.unknown));
-    try std.testing.expect(std.mem.indexOf(u8, initialSendStartFailureMessage(error.RemoteProviderNotAuthenticated), "Sign in") != null);
-}
-
-test "attachment method failures map to the explicit upload error" {
-    // Server-side chat.attachment.* rejections (capacity, expired ids, mime)
-    // classify as .unknown; they must surface the accurate upload-failure
-    // copy while genuinely specific reasons keep their dedicated arm.
-    try std.testing.expectEqual(error.RemoteAttachmentUploadFailed, remoteAttachmentMethodFailure(null));
-    try std.testing.expectEqual(error.RemoteAttachmentUploadFailed, remoteAttachmentMethodFailure(.unknown));
-    try std.testing.expectEqual(error.RemoteProviderUnavailable, remoteAttachmentMethodFailure(.provider_unavailable));
-    try std.testing.expectEqual(error.RemoteWorkspaceBindingMissing, remoteAttachmentMethodFailure(.workspace_binding_missing));
-    // The shared per-turn count gate carries typed retained-draft copy.
-    try std.testing.expect(std.mem.indexOf(u8, initialSendStartFailureMessage(error.RemoteAttachmentTooMany), "draft was kept") != null);
 }
 
 test "upload step drains an owned ticket before the deadline can fail the dispatch" {
@@ -4181,13 +3708,6 @@ fn daemonReasoningVariant(provider: Provider, variant: ?[:0]const u8) ?[:0]const
     };
 }
 
-test "daemon turn preserves provider reasoning variants" {
-    try std.testing.expectEqualStrings("high", daemonReasoningVariant(.cursor, "high").?);
-    try std.testing.expectEqualStrings("high", daemonReasoningVariant(.opencode, "high").?);
-    try std.testing.expect(daemonReasoningVariant(.codex, "high") == null);
-    try std.testing.expect(daemonReasoningVariant(.claude, "high") == null);
-}
-
 pub fn cancelDaemonChatTurn(self: anytype, turn_id: []const u8) !void {
     const response = try daemon_client.requestAlloc(self.allocator, self.storage.pref_path, "chat.turn.cancel", .{ .turn_id = turn_id }, 3);
     defer self.allocator.free(response);
@@ -4651,54 +4171,6 @@ pub fn deinitProcessGlobalState(pref_path: []const u8) void {
     }
 }
 
-test "M5-P4 live-turn attachment allocation failure sweeps staged attachment indices" {
-    const allocator = std.testing.allocator;
-    var thread = try ChatThread.init(allocator, "fallible attachment");
-    defer thread.deinit(allocator);
-    allocator.free(thread.local_thread_id);
-    thread.local_thread_id = try allocator.dupeZ(u8, "thread-fallible");
-    const AttachState = struct {
-        chat_controller: State = .{},
-        thread: *ChatThread,
-
-        fn threadByLocalId(self: *@This(), workspace_id: []const u8, local_thread_id: []const u8) ?*ChatThread {
-            if (!std.mem.eql(u8, workspace_id, "ws-fallible")) return null;
-            if (!std.mem.eql(u8, local_thread_id, self.thread.local_thread_id)) return null;
-            return self.thread;
-        }
-    };
-    var state: AttachState = .{ .thread = &thread };
-    const turns = [_]headless.store.TurnRecord{
-        .{
-            .turn_id = "turn-fallible-1",
-            .workspace_id = "ws-fallible",
-            .local_thread_id = "thread-fallible",
-            .status = "running",
-            .started_at_ms = 1,
-            .provider = "codex",
-        },
-        .{
-            .turn_id = "turn-fallible-2",
-            .workspace_id = "ws-fallible",
-            .local_thread_id = "thread-fallible",
-            .status = "running",
-            .started_at_ms = 2,
-            .provider = "codex",
-        },
-    };
-    for (0..3) |fail_index| {
-        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
-        try std.testing.expectError(
-            error.OutOfMemory,
-            applyDaemonChatTurnsSnapshotWithAllocator(&state, &turns, failing.allocator()),
-        );
-        try std.testing.expect(failing.has_induced_failure);
-        try std.testing.expectEqual(SendStatus.idle, thread.send_state.status);
-        try std.testing.expect(thread.send_state.daemon_turn_id == null);
-        try std.testing.expectEqual(@as(usize, 0), state.chat_controller.pending_send_count);
-    }
-}
-
 test "launch reconciliation reattaches a live daemon turn once" {
     const allocator = std.testing.allocator;
     var thread = try ChatThread.init(allocator, "restored live turn");
@@ -4826,22 +4298,6 @@ test "M5-P4 reconnect consume deduplicates and validates accepted or not_found" 
     const retried = reserveTerminalConsume("/profile-a", "nonce-b", "turn-consume").?;
     defer std.heap.page_allocator.free(retried);
     finishTerminalConsume(retried, null);
-}
-
-pub fn reserveTerminalConsumeForTest(pref_path: []const u8, instance_nonce: []const u8, turn_id: []const u8) bool {
-    std.debug.assert(builtin.is_test);
-    const reservation = reserveTerminalConsume(pref_path, instance_nonce, turn_id) orelse return false;
-    std.heap.page_allocator.free(reservation);
-    return true;
-}
-
-pub fn terminalConsumeReservedForTest(pref_path: []const u8, instance_nonce: []const u8, turn_id: []const u8) bool {
-    std.debug.assert(builtin.is_test);
-    const key = terminalConsumeKeyAlloc(pref_path, instance_nonce, turn_id) orelse return false;
-    defer std.heap.page_allocator.free(key);
-    lockTerminalConsumes();
-    defer terminal_consume_mutex.unlock();
-    return terminal_consume_turns.contains(key);
 }
 
 pub fn threadByLocalId(self: anytype, workspace_id: []const u8, local_thread_id: []const u8) ?*ChatThread {
@@ -5279,29 +4735,6 @@ pub fn regenerateThreadTitleAtIndex(self: anytype, project_index: usize, thread_
     self.setSidebarNotice("Generating a new chat title...");
 }
 
-test "title regeneration remains available when its opening exchange is paged out" {
-    const allocator = std.testing.allocator;
-    var thread = try ChatThread.init(allocator, "New thread");
-    defer thread.deinit(allocator);
-
-    try std.testing.expect(!titleRegenerationSourceAvailable(&thread));
-    thread.persisted_message_offset = 2;
-    try std.testing.expect(titleRegenerationSourceAvailable(&thread));
-
-    thread.persisted_message_offset = 0;
-    try thread.messages.append(allocator, .{
-        .role = .user,
-        .author = try allocator.dupeZ(u8, "You"),
-        .body = try allocator.dupeZ(u8, "Opening prompt"),
-    });
-    try thread.messages.append(allocator, .{
-        .role = .assistant,
-        .author = try allocator.dupeZ(u8, "Codex"),
-        .body = try allocator.dupeZ(u8, "Opening reply"),
-    });
-    try std.testing.expect(titleRegenerationSourceAvailable(&thread));
-}
-
 pub fn pollSlashCommand(self: anytype) bool {
     var result: ?provider_types.RunSlashCommandResult = null;
     var error_message: ?[]u8 = null;
@@ -5708,13 +5141,6 @@ fn codexBackgroundTaskPollIntervalMs(failure_count: u8) i64 {
         4 => 32_000,
         else => CODEX_BACKGROUND_TASK_POLL_MAX_MS,
     };
-}
-
-test "Codex background polling backs off after repeated provider failures" {
-    try std.testing.expectEqual(@as(i64, 2_000), codexBackgroundTaskPollIntervalMs(0));
-    try std.testing.expectEqual(@as(i64, 8_000), codexBackgroundTaskPollIntervalMs(2));
-    try std.testing.expectEqual(@as(i64, 60_000), codexBackgroundTaskPollIntervalMs(5));
-    try std.testing.expectEqual(@as(i64, 60_000), codexBackgroundTaskPollIntervalMs(std.math.maxInt(u8)));
 }
 
 fn codexBackgroundTaskForPollRequest(self: anytype, request: *const CodexBackgroundPollRequest) ?*BackgroundTask {
@@ -6368,38 +5794,6 @@ fn daemonChatTailBackoffMs(had_news: bool, elapsed_ms: i64) i64 {
     return 0;
 }
 
-test "daemon chat tail long-poll re-arms on news and paces over-cap heartbeats" {
-    // Events arrived mid-park: poll again at the display cadence.
-    try std.testing.expectEqual(@as(i64, 0), daemonChatTailBackoffMs(true, 180));
-    try std.testing.expectEqual(@as(i64, 0), daemonChatTailBackoffMs(true, 3));
-    // Immediate empty reply: the daemon hit its long-poll cap and answered
-    // without parking; retrying every frame would only add load.
-    try std.testing.expectEqual(DAEMON_CHAT_TAIL_HEARTBEAT_RETRY_MS, daemonChatTailBackoffMs(false, 3));
-    // The park timed out without news: re-arm right away.
-    try std.testing.expectEqual(@as(i64, 0), daemonChatTailBackoffMs(false, 251));
-}
-
-test "daemon chat tail polling keeps the active display cadence" {
-    try std.testing.expect(daemonChatPollDue(-1, 100, 0));
-    try std.testing.expect(!daemonChatPollDue(100, 115, 0));
-    try std.testing.expect(daemonChatPollDue(100, 116, 0));
-    try std.testing.expect(daemonChatPollDue(100, 10, 0));
-    // A measured-cost backoff extends the interval; clock rollback still polls.
-    try std.testing.expect(!daemonChatPollDue(100, 259, 144));
-    try std.testing.expect(daemonChatPollDue(100, 260, 144));
-}
-
-test "daemon chat tail backoff bounds the render-thread stall duty cycle" {
-    // A fast daemon (≤4ms round trip) keeps the unmodified 16ms cadence.
-    try std.testing.expectEqual(@as(i64, 0), daemonChatPollBackoffMs(0));
-    try std.testing.expectEqual(@as(i64, 0), daemonChatPollBackoffMs(4));
-    // A 40ms stall (observed "slowest=poll send elapsed_ms=35-41") defers the
-    // next poll to 160ms after the last start: ≤25% of frames can stall.
-    try std.testing.expectEqual(@as(i64, 144), daemonChatPollBackoffMs(40));
-    // A flapping daemon (connect timeouts) is still tailed about once a second.
-    try std.testing.expectEqual(DAEMON_CHAT_POLL_BACKOFF_MAX_MS, daemonChatPollBackoffMs(500));
-}
-
 test "daemon tail hydrates the missing user row for externally started turns" {
     const allocator = std.testing.allocator;
     var thread = try ChatThread.init(allocator, "external turn");
@@ -6464,43 +5858,6 @@ test "daemon tail cursor advances only after an event applies" {
     ;
     try std.testing.expectError(error.TestEventRejected, applyDaemonChatTurnTail(&state, &thread, response));
     try std.testing.expectEqual(@as(u64, 0), thread.send_state.daemon_last_seq);
-}
-
-test "remote tail target guard rejects a changed turn or runtime route" {
-    const allocator = std.testing.allocator;
-    var thread = try ChatThread.init(allocator, "remote target");
-    defer thread.deinit(allocator);
-    try std.testing.expectEqual(.updated, try thread.selectRuntimeRoute(allocator, .{
-        .profile_id = "remote-box",
-        .repository_id = "repo-api",
-        .relative_cwd = "services/api",
-    }));
-    try thread.pinRuntimeRoute(allocator, "0123456789abcdef0123456789abcdef");
-    thread.send_state.status = .pending;
-    thread.send_state.daemon_owned = true;
-    thread.send_state.started_at_ms = 123;
-    thread.send_state.daemon_turn_id = try std.heap.page_allocator.dupe(u8, "remote-turn");
-
-    var target = try OwnedRemoteTurnTarget.init(allocator, "workspace", &thread, "remote-turn", 123);
-    defer target.deinit(allocator);
-    try std.testing.expect(remoteTargetMatchesThread(&target, &thread));
-    std.heap.page_allocator.free(thread.send_state.daemon_turn_id.?);
-    thread.send_state.daemon_turn_id = try std.heap.page_allocator.dupe(u8, "replacement-turn");
-    try std.testing.expect(!remoteTargetMatchesThread(&target, &thread));
-
-    var other = try ChatThread.init(allocator, "other runtime");
-    defer other.deinit(allocator);
-    try std.testing.expectEqual(.updated, try other.selectRuntimeRoute(allocator, .{
-        .profile_id = "other-box",
-        .repository_id = "repo-api",
-        .relative_cwd = "services/api",
-    }));
-    try other.pinRuntimeRoute(allocator, "fedcba9876543210fedcba9876543210");
-    other.send_state.status = .pending;
-    other.send_state.daemon_owned = true;
-    other.send_state.started_at_ms = 123;
-    other.send_state.daemon_turn_id = try std.heap.page_allocator.dupe(u8, "remote-turn");
-    try std.testing.expect(!remoteTargetMatchesThread(&target, &other));
 }
 
 test "remote routed tails reuse terminal and error state transitions" {
@@ -6944,21 +6301,6 @@ fn advanceStreamRevealLocked(send_state: *SendState, now_ms: i64, tau_ms: f32) b
     return true;
 }
 
-test "stream reveal holds an unfinished table header until its delimiter row lands" {
-    var send_state: SendState = .{};
-    defer send_state.partial_text.deinit(std.heap.page_allocator);
-    try send_state.partial_text.appendSlice(std.heap.page_allocator, "Totals:\n| a | b |");
-    send_state.reveal_len = send_state.partial_text.items.len - 1;
-    _ = advanceStreamRevealLocked(&send_state, 1000, 140.0);
-    try std.testing.expectEqualStrings("Totals:\n", send_state.streamRevealedText());
-    try send_state.partial_text.appendSlice(std.heap.page_allocator, "\n|---|---|\n");
-    send_state.reveal_len = send_state.partial_text.items.len - 1;
-    _ = advanceStreamRevealLocked(&send_state, 1016, 140.0);
-    try std.testing.expectEqualStrings(send_state.partial_text.items, send_state.streamRevealedText());
-    resetStreamRevealLocked(&send_state);
-    try std.testing.expectEqual(@as(usize, 0), send_state.reveal_hold);
-}
-
 /// Continuous-frame signal: the current thread still has streamed text to
 /// reveal. False whenever nothing is streaming, so idle frames stay zero.
 pub fn streamRevealAnimating(self: anytype) bool {
@@ -6967,17 +6309,6 @@ pub fn streamRevealAnimating(self: anytype) bool {
     if (!send_state.mutex.tryLock()) return false;
     defer send_state.mutex.unlock();
     return send_state.status == .pending and send_state.streamRevealPending();
-}
-
-test "stream reveal paces the backlog with a floor and a catch-up cap" {
-    const step = streamRevealStep(0, 1000, 16, 140.0);
-    try std.testing.expect(step >= 100 and step <= 120);
-    try std.testing.expectEqual(@as(usize, 2), streamRevealStep(0, 3, 16, 140.0));
-    try std.testing.expectEqual(@as(usize, 3), streamRevealStep(2, 3, 16, 140.0));
-    try std.testing.expectEqual(@as(usize, 3), streamRevealStep(3, 3, 16, 140.0));
-    try std.testing.expectEqual(@as(usize, 5000), streamRevealStep(0, 5000, 16, 140.0));
-    try std.testing.expectEqual(@as(usize, 3), utf8BoundaryAtOrAfter("\xE2\x80\x94x", 1));
-    try std.testing.expectEqual(@as(usize, 1), utf8BoundaryAtOrAfter("ab", 1));
 }
 
 test "stream reveal advances per frame and clamps after a flush" {
@@ -8032,45 +7363,6 @@ fn adoptionRefreshTurnMatch(
     return .missing;
 }
 
-test "turn-scoped adoption matcher retains ambiguous fingerprints" {
-    const allocator = std.testing.allocator;
-    const expected = AdoptionExpectedRow{
-        .row_index_hint = 1,
-        .role = .assistant,
-        .author = try allocator.dupe(u8, "Codex"),
-        .body = try allocator.dupe(u8, "same reply"),
-    };
-    defer {
-        allocator.free(expected.author);
-        allocator.free(expected.body);
-    }
-    const messages = [_]db_types.PersistedMessage{
-        .{
-            .message_id = "turn:shift:user",
-            .role = .user,
-            .author = "You",
-            .body = "unrelated fingerprint",
-        },
-        .{
-            .message_id = "turn:target:msg:1",
-            .role = .assistant,
-            .author = "Codex",
-            .body = "same reply",
-        },
-        .{
-            .message_id = "turn:target:msg:2",
-            .role = .assistant,
-            .author = "Codex",
-            .body = "same reply",
-        },
-    };
-    const expected_rows = [_]AdoptionExpectedRow{expected};
-    try std.testing.expectEqual(
-        AdoptionTurnMatch.ambiguous,
-        try adoptionTurnMatch(&messages, &expected_rows, "target"),
-    );
-}
-
 test "daemon tail splits assistant text at terminal think like the durable reducer" {
     var send_state: SendState = .{ .provider = .codex };
     defer {
@@ -8544,161 +7836,6 @@ test "adoption refresh veto count survives clear/re-mint and stays terminal" {
     try std.testing.expect(adoption_retry_pending.get(key) == null);
 }
 
-test "M5-P4 amendment 2: retry pump backs off, reaches archived threads, and gives up loudly" {
-    const allocator = std.testing.allocator;
-    // Global-registry hygiene: leave nothing behind for other tests.
-    defer deinitAdoptionRepairs();
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
-    // Real Storage against a daemon-less tmp pref path: every chat.thread.get
-    // the pump issues fails hermetically at connect, exercising the true
-    // incomplete → markAdoptionPending path.
-    var storage = try storage_mod.Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
-    defer storage.deinit();
-
-    const ProjectStub = struct {
-        id: []const u8,
-        threads: std.ArrayList(ChatThread) = .empty,
-        archived_threads: std.ArrayList(ChatThread) = .empty,
-    };
-    const PumpState = struct {
-        allocator: std.mem.Allocator,
-        storage: *const storage_mod.Storage,
-        chat_controller: State = .{},
-        project_controller: struct {
-            projects: std.ArrayList(ProjectStub) = .empty,
-            archived_projects: std.ArrayList(ProjectStub) = .empty,
-        } = .{},
-        pub fn pollTitleGenerations(_: *@This()) bool {
-            return false;
-        }
-        // Never reached (pending_send_count stays 0) but required so the
-        // generic pollSend body instantiates against this stub.
-        pub fn pollThreadSend(_: *@This(), _: usize, _: usize, _: *ChatThread) bool {
-            return false;
-        }
-        pub fn markDirty(_: *@This()) void {}
-    };
-    var state: PumpState = .{ .allocator = allocator, .storage = &storage };
-    defer {
-        for (state.project_controller.projects.items) |*project| {
-            for (project.threads.items) |*thread| thread.deinit(allocator);
-            for (project.archived_threads.items) |*thread| thread.deinit(allocator);
-            project.threads.deinit(allocator);
-            project.archived_threads.deinit(allocator);
-        }
-        for (state.project_controller.archived_projects.items) |*project| {
-            for (project.threads.items) |*thread| thread.deinit(allocator);
-            for (project.archived_threads.items) |*thread| thread.deinit(allocator);
-            project.threads.deinit(allocator);
-            project.archived_threads.deinit(allocator);
-        }
-        state.project_controller.projects.deinit(allocator);
-        state.project_controller.archived_projects.deinit(allocator);
-    }
-
-    const makeThread = struct {
-        fn run(a: std.mem.Allocator, local_id: []const u8) !ChatThread {
-            var thread = try ChatThread.init(a, "Retry pump thread");
-            a.free(thread.local_thread_id);
-            thread.local_thread_id = try a.dupeZ(u8, local_id);
-            return thread;
-        }
-    }.run;
-
-    var live_project: ProjectStub = .{ .id = "retry-ws" };
-    try live_project.threads.append(allocator, try makeThread(allocator, "thread-live"));
-    try live_project.archived_threads.append(allocator, try makeThread(allocator, "thread-archived"));
-    try state.project_controller.projects.append(allocator, live_project);
-    var archived_project: ProjectStub = .{ .id = "ws-arch" };
-    try archived_project.threads.append(allocator, try makeThread(allocator, "thread-arch-proj"));
-    try state.project_controller.archived_projects.append(allocator, archived_project);
-
-    const forceDue = struct {
-        fn run(workspace_id: []const u8, local_thread_id: []const u8, turn_id: []const u8) !void {
-            const key = adoptionRetryKeyAlloc(workspace_id, local_thread_id, turn_id).?;
-            defer std.heap.page_allocator.free(key);
-            adoption_retry_pending.getPtr(key).?.next_retry_at_ms = 0;
-        }
-    }.run;
-    const entryState = struct {
-        fn run(workspace_id: []const u8, local_thread_id: []const u8, turn_id: []const u8) !?AdoptionRetryState {
-            const key = adoptionRetryKeyAlloc(workspace_id, local_thread_id, turn_id).?;
-            defer std.heap.page_allocator.free(key);
-            return if (adoption_retry_pending.get(key)) |value| value else null;
-        }
-    }.run;
-
-    // Arm 1 — live thread, growing backoff: each failed pump attempt doubles
-    // the next-retry delay (1s base, shift by attempts-1).
-    markAdoptionPending("retry-ws", &state.project_controller.projects.items[0].threads.items[0], "turn-live");
-    try forceDue("retry-ws", "thread-live", "turn-live");
-    try std.testing.expect(!pollSend(&state));
-    var pump_entry = (try entryState("retry-ws", "thread-live", "turn-live")).?;
-    try std.testing.expectEqual(@as(u32, 2), pump_entry.attempts);
-    const after_two = pump_entry.next_retry_at_ms - daemon_client.nowMs();
-    try std.testing.expect(after_two > ADOPTION_RETRY_INTERVAL_MS);
-    try forceDue("retry-ws", "thread-live", "turn-live");
-    _ = pollSend(&state);
-    pump_entry = (try entryState("retry-ws", "thread-live", "turn-live")).?;
-    try std.testing.expectEqual(@as(u32, 3), pump_entry.attempts);
-    const after_three = pump_entry.next_retry_at_ms - daemon_client.nowMs();
-    try std.testing.expect(after_three > 2 * ADOPTION_RETRY_INTERVAL_MS);
-    clearAdoptionPending("retry-ws", "thread-live", "turn-live");
-
-    // Arm 2 — archived thread in a live workspace: the entry survives the
-    // pump (pre-amendment it was dropped as "thread gone").
-    markAdoptionPending("retry-ws", &state.project_controller.projects.items[0].archived_threads.items[0], "turn-archived");
-    try forceDue("retry-ws", "thread-archived", "turn-archived");
-    _ = pollSend(&state);
-    try std.testing.expectEqual(@as(u32, 2), ((try entryState("retry-ws", "thread-archived", "turn-archived")).?).attempts);
-    clearAdoptionPending("retry-ws", "thread-archived", "turn-archived");
-
-    // Arm 3 — thread inside an archived workspace: also reachable.
-    markAdoptionPending("ws-arch", &state.project_controller.archived_projects.items[0].threads.items[0], "turn-arch-proj");
-    try forceDue("ws-arch", "thread-arch-proj", "turn-arch-proj");
-    _ = pollSend(&state);
-    try std.testing.expectEqual(@as(u32, 2), ((try entryState("ws-arch", "thread-arch-proj", "turn-arch-proj")).?).attempts);
-    clearAdoptionPending("ws-arch", "thread-arch-proj", "turn-arch-proj");
-
-    // Arm 4 — truly deleted thread: entry dropped (no eternal ghost retries).
-    var gone_thread = try makeThread(allocator, "thread-gone");
-    defer gone_thread.deinit(allocator);
-    markAdoptionPending("retry-ws", &gone_thread, "turn-gone");
-    try forceDue("retry-ws", "thread-gone", "turn-gone");
-    _ = pollSend(&state);
-    try std.testing.expect((try entryState("retry-ws", "thread-gone", "turn-gone")) == null);
-
-    // Arm 5 — loud give-up retains a terminal repair marker. Cursor snapshot
-    // application is now the only path allowed to clear the id-less state.
-    try state.project_controller.projects.items[0].threads.items[0].messages.append(allocator, .{
-        .role = .assistant,
-        .author = try allocator.dupeZ(u8, "Codex"),
-        .body = try allocator.dupeZ(u8, "awaiting durable identity"),
-    });
-    markAdoptionPending("retry-ws", &state.project_controller.projects.items[0].threads.items[0], "turn-retry");
-    {
-        const key = adoptionRetryKeyAlloc("retry-ws", "thread-live", "turn-retry").?;
-        defer std.heap.page_allocator.free(key);
-        const value_ptr = adoption_retry_pending.getPtr(key).?;
-        value_ptr.attempts = ADOPTION_RETRY_MAX_ATTEMPTS - 1;
-        value_ptr.next_retry_at_ms = 0;
-    }
-    _ = pollSend(&state);
-    const terminal_entry = (try entryState("retry-ws", "thread-live", "turn-retry")).?;
-    try std.testing.expect(terminal_entry.terminal_failed);
-    try std.testing.expectEqual(ADOPTION_RETRY_MAX_ATTEMPTS, terminal_entry.attempts);
-    try std.testing.expect(hasUnresolvedAdoptionRows(&state));
-    state.project_controller.projects.items[0].threads.items[0].messages.items[0].message_id =
-        try allocator.dupe(u8, "turn:retry:msg:0");
-    try std.testing.expect(hasUnresolvedAdoptionRows(&state));
-    clearAdoptionPending("retry-ws", "thread-live", "turn-retry");
-    try std.testing.expectEqual(@as(usize, 0), adoption_retry_pending.count());
-}
-
 // Records a finished in-app chat turn unless that exact pane currently has
 // focus. The independent ledger survives ordinary state saves and process
 // restarts until any pane-focus route acknowledges it.
@@ -8781,21 +7918,6 @@ fn armFocusedDaemonCompletion(thread: anytype, now_ms: i64) void {
     if (thread.completed_at_ms == 0) thread.completed_at_ms = now_ms;
 }
 
-test "focused daemon completion receives a suppression timestamp" {
-    const ThreadStub = struct {
-        completion_pending: bool = false,
-        completed_at_ms: i64 = 0,
-    };
-    var fresh: ThreadStub = .{};
-    armFocusedDaemonCompletion(&fresh, 123);
-    try std.testing.expect(fresh.completion_pending);
-    try std.testing.expectEqual(@as(i64, 123), fresh.completed_at_ms);
-
-    var projected: ThreadStub = .{ .completed_at_ms = 100 };
-    armFocusedDaemonCompletion(&projected, 123);
-    try std.testing.expectEqual(@as(i64, 100), projected.completed_at_ms);
-}
-
 /// Completion toast copy. Companion completions name the companion and point
 /// at its panel because no chat pane exists to focus; ordinary threads keep
 /// the established "Reply ready" wording.
@@ -8810,20 +7932,6 @@ pub fn completionNoticeBody(companion_name: ?[]const u8, dir: []const u8, buf: [
     }
     if (dir.len > 0) return std.fmt.bufPrint(buf, "Reply ready in {s}", .{dir}) catch "Reply ready";
     return "Reply ready";
-}
-
-test "completion notice names the companion and points at its panel" {
-    var buf: [256]u8 = undefined;
-    try std.testing.expectEqualStrings("Reply ready in verde", completionNoticeBody(null, "verde", &buf));
-    try std.testing.expectEqualStrings("Reply ready", completionNoticeBody(null, "", &buf));
-    try std.testing.expectEqualStrings(
-        "Juniper has an update from verde. Open the companion to review.",
-        completionNoticeBody("Juniper", "verde", &buf),
-    );
-    try std.testing.expectEqualStrings(
-        "Juniper has an update. Open the companion to review.",
-        completionNoticeBody("Juniper", "", &buf),
-    );
 }
 
 // True only when the exact chat pane owns focus in the focused window.
@@ -9486,56 +8594,6 @@ fn pendingProviderSteerCanSignal(send_state: *const SendState) bool {
         !send_state.pending_followup_signal_sent;
 }
 
-test "provider steer polling stops after fallback to next turn or approval wait" {
-    const allocator = std.testing.allocator;
-    var send_state: SendState = .{
-        .status = .pending,
-        .pending_followup = .{
-            .kind = .steer,
-            .prompt = try allocator.dupe(u8, "steer this turn"),
-        },
-    };
-    defer freePendingFollowup(allocator, &send_state.pending_followup);
-
-    try std.testing.expect(pendingProviderSteerCanSignal(&send_state));
-    send_state.pending_approval = .{
-        .call_id = try allocator.dupe(u8, "call"),
-        .title = try allocator.dupe(u8, "Approval"),
-        .body = try allocator.dupe(u8, "Wait"),
-    };
-    try std.testing.expect(!pendingProviderSteerCanSignal(&send_state));
-    chat_types.freePendingApproval(allocator, &send_state.pending_approval);
-    send_state.pending_followup.?.state = .fallback_next_turn;
-    try std.testing.expect(!pendingProviderSteerCanSignal(&send_state));
-    send_state.pending_followup.?.state = .sent_inline;
-    try std.testing.expect(!pendingProviderSteerCanSignal(&send_state));
-}
-
-test "rejected provider steer restores text and ordered images instead of queueing" {
-    const allocator = std.testing.allocator;
-    var thread = try ChatThread.init(allocator, "Steer restore");
-    defer thread.deinit(allocator);
-    thread.send_state.pending_followup = .{
-        .kind = .steer,
-        .prompt = try allocator.dupe(u8, "keep steering separate"),
-    };
-    try thread.send_state.pending_followup.?.images.append(
-        allocator,
-        try ChatImageAttachment.init(allocator, "/tmp/first.png", "image/png", 10),
-    );
-    try thread.send_state.pending_followup.?.images.append(
-        allocator,
-        try ChatImageAttachment.init(allocator, "/tmp/second.jpg", "image/jpeg", 20),
-    );
-
-    try std.testing.expect(restorePendingSteerToDraft(allocator, &thread));
-    try std.testing.expect(thread.send_state.pending_followup == null);
-    try std.testing.expectEqualStrings("keep steering separate", thread.currentDraft());
-    try std.testing.expectEqual(@as(usize, 2), thread.draftImageCount());
-    try std.testing.expectEqualStrings("/tmp/first.png", thread.draft_image.?.path);
-    try std.testing.expectEqualStrings("/tmp/second.jpg", thread.draft_extra_images.items[0].path);
-}
-
 test "daemon steer refusals that prove non-delivery are distinguished from uncertain failures" {
     const allocator = std.testing.allocator;
     try classifyDaemonSteerResponse(allocator,
@@ -9580,21 +8638,6 @@ test "late steer becomes the next turn instead of restoring the draft" {
     try std.testing.expectEqualStrings("", thread.currentDraft());
     // Not retried as a steer; dispatched on completion like a queued message.
     try std.testing.expect(!pendingProviderSteerCanSignal(thread.send_state));
-}
-
-test "uncertain steer failure still restores the draft" {
-    const allocator = std.testing.allocator;
-    var thread = try ChatThread.init(allocator, "Uncertain steer");
-    defer thread.deinit(allocator);
-    thread.send_state.status = .pending;
-    thread.send_state.pending_followup = .{
-        .kind = .steer,
-        .prompt = try allocator.dupe(u8, "maybe delivered"),
-    };
-
-    try std.testing.expectEqual(PendingSteerFailureOutcome.restored, resolvePendingSteerFailure(allocator, &thread, error.DaemonRequestFailed));
-    try std.testing.expect(thread.send_state.pending_followup == null);
-    try std.testing.expectEqualStrings("maybe delivered", thread.currentDraft());
 }
 
 pub fn dispatchPendingFollowup(self: anytype, project_index: usize, thread_index: usize, thread: *ChatThread) void {

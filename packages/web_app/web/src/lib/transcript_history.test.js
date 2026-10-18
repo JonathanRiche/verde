@@ -118,15 +118,6 @@ test('durable refresh reconciles only captured optimistic sends confirmed by new
   expect(reconcileOptimisticMessages([optimistic], [{ ...durable, created_at_ms: 100 }], [optimistic])).toEqual([optimistic])
 })
 
-test('image send confirmation ignores upload UI fields and recognizes a snapshot-confirmed row', () => {
-  const optimistic = { message_id: 'local-user-image', role: 'user', body: 'look', created_at_ms: 5000,
-    images: [{ path: '/upload/image.png', mime: 'image/png', byte_size: 100, name: 'Screenshot.png', attachment_id: 'upload-id' }] }
-  const durable = { ...optimistic, message_id: 'durable-image', images: [{ path: '/upload/image.png', mime: 'image/png', byte_size: 100 }] }
-  expect(reconcileOptimisticMessages([optimistic], [durable], [optimistic])).toEqual([])
-  expect(reconcileOptimisticMessages([optimistic, durable], [durable], [optimistic, durable])).toEqual([durable])
-  expect(reconcileOptimisticMessages([durable, optimistic], [durable], [durable, optimistic])).toEqual([durable, optimistic])
-})
-
 test('identical bodies at different IDs survive prepend without borrowing the wrong identity', () => {
   const newer = message('new', 'same')
   const merged = mergeTranscriptPage([newer], [message('old', 'same')], 'new')

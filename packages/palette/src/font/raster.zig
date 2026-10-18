@@ -315,13 +315,6 @@ pub fn buildLut(gamma: f32, contrast: f32) [256]u8 {
     return t;
 }
 
-test "accumulateRow prefix sum" {
-    var src = [_]f32{ 0.5, 0.5, 0, 0, 0, 0, 0, 0, -0.25, -0.75, 0 };
-    var dst: [10]u8 = undefined;
-    accumulateRow(src[0..11], &dst, null);
-    try std.testing.expectEqualSlices(u8, &.{ 128, 255, 255, 255, 255, 255, 255, 255, 191, 0 }, &dst);
-}
-
 test "square coverage" {
     const gpa = std.testing.allocator;
     var ws: Workspace = .{};

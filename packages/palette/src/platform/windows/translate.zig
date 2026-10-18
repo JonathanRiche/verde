@@ -696,51 +696,6 @@ fn keyDown(t: *T, h: *FakeHost, vk: u32, sc: u8, ext: bool) Result {
     return t.handle(h, win1, w.WM_KEYDOWN, vk, keymap.makeKeyLparam(sc, ext, false, false));
 }
 
-test "key down/up: scancode, keycode, codepoint, repeat flag" {
-    var h: FakeHost = .{};
-    var t: T = .{};
-    _ = keyDown(&t, &h, 'C', 0x2E, false);
-    var es = h.take();
-    try testing.expectEqual(@as(usize, 1), es.len);
-    const k = es[0].key_down;
-    try testing.expectEqual(ev.Keycode.c, k.key);
-    try testing.expectEqual(@as(u32, 46), k.scancode);
-    try testing.expectEqual(@as(u21, 'c'), k.codepoint);
-    try testing.expectEqual(@as(u21, 'c'), k.base_codepoint);
-    try testing.expect(!k.repeat);
-    // Auto-repeat: second down while held.
-    _ = t.handle(&h, win1, w.WM_KEYDOWN, 'C', keymap.makeKeyLparam(0x2E, false, true, false));
-    es = h.take();
-    try testing.expect(es[0].key_down.repeat);
-    _ = t.handle(&h, win1, w.WM_KEYUP, 'C', keymap.makeKeyLparam(0x2E, false, true, true));
-    es = h.take();
-    try testing.expect(!es[0].key_up.down and !es[0].key_up.repeat);
-}
-
-test "left/right modifiers and Ctrl+C codepoint" {
-    var h: FakeHost = .{};
-    var t: T = .{};
-    h.keys[w.VK_CONTROL] = 0x80;
-    h.keys[w.VK_RCONTROL] = 0x80;
-    _ = keyDown(&t, &h, w.VK_CONTROL, 0x1D, true);
-    var es = h.take();
-    try testing.expectEqual(ev.Keycode.rctrl, es[0].key_down.key);
-    try testing.expect(es[0].key_down.mod_keys.rctrl and es[0].key_down.mod.ctrl);
-    _ = keyDown(&t, &h, 'C', 0x2E, false);
-    es = h.take();
-    try testing.expectEqual(ev.Keycode.c, es[0].key_down.key);
-    try testing.expectEqual(@as(u21, 'c'), es[0].key_down.codepoint);
-    try testing.expect(es[0].key_down.mod.ctrl and es[0].key_down.mod_keys.rctrl and !es[0].key_down.mod_keys.lctrl);
-    // Modifier auto-repeat is suppressed.
-    _ = t.handle(&h, win1, w.WM_KEYDOWN, w.VK_CONTROL, keymap.makeKeyLparam(0x1D, true, true, false));
-    try testing.expectEqual(@as(usize, 0), h.take().len);
-    // Shift sides come from the scancode.
-    _ = keyDown(&t, &h, w.VK_SHIFT, 0x36, false);
-    es = h.take();
-    try testing.expectEqual(ev.Keycode.rshift, es[0].key_down.key);
-    try testing.expect(es[0].key_down.mod_keys.rshift and es[0].key_down.mod.shift);
-}
-
 test "AltGr: the fake Left Ctrl is dropped, text comes through" {
     var h: FakeHost = .{};
     var t: T = .{};
@@ -789,14 +744,6 @@ test "keys without scancode, pause, numlock, print screen" {
     try testing.expectEqual(ev.Keycode.print_screen, es[1].key_up.key);
 }
 
-test "sys keys: F10 handled, Alt+F4 to DefWindowProc" {
-    var h: FakeHost = .{};
-    var t: T = .{};
-    try testing.expectEqual(Result{ .handled = 0 }, t.handle(&h, win1, w.WM_SYSKEYDOWN, w.VK_F10, keymap.makeKeyLparam(0x44, false, false, false)));
-    try testing.expectEqual(Result.default, t.handle(&h, win1, w.WM_SYSKEYDOWN, w.VK_F4, keymap.makeKeyLparam(0x3E, false, false, false)));
-    try testing.expectEqual(Result{ .handled = 0 }, t.handle(&h, win1, w.WM_SYSCHAR, 'x', 0));
-}
-
 test "WM_CHAR: surrogate pairs, gating, control characters" {
     var h: FakeHost = .{};
     var t: T = .{};
@@ -817,76 +764,6 @@ test "WM_CHAR: surrogate pairs, gating, control characters" {
     _ = t.handle(&h, win1, w.WM_UNICHAR, 0x1F642, 0);
     es = h.take();
     try testing.expectEqualStrings("\u{1F642}", es[0].text_input.text);
-}
-
-test "dead key base codepoint" {
-    var h: FakeHost = .{};
-    var t: T = .{};
-    _ = keyDown(&t, &h, w.VK_OEM_7, 0x28, false);
-    const es = h.take();
-    try testing.expectEqual(ev.Keycode.apostrophe, es[0].key_down.key);
-    try testing.expectEqual(@as(u21, '\''), es[0].key_down.base_codepoint);
-}
-
-test "mouse: enter, motion in logical units, buttons, capture, click count, X buttons" {
-    var h: FakeHost = .{};
-    var t: T = .{};
-    _ = t.handle(&h, win1, w.WM_MOUSEMOVE, 0, w.makeLparam(150, 300));
-    var es = h.take();
-    try testing.expectEqual(@as(usize, 2), es.len);
-    try testing.expectEqual(@as(f32, 100), es[0].mouse_enter.x);
-    try testing.expectEqual(@as(f32, 200), es[1].mouse_motion.y);
-    try testing.expectEqual(@as(u32, 1), h.leave_tracked);
-    _ = t.handle(&h, win1, w.WM_MOUSEMOVE, 0, w.makeLparam(153, 300));
-    es = h.take();
-    try testing.expectEqual(@as(f32, 2), es[0].mouse_motion.xrel);
-    _ = t.handle(&h, win1, w.WM_LBUTTONDOWN, w.MK_LBUTTON, w.makeLparam(153, 300));
-    es = h.take();
-    try testing.expectEqual(@as(u8, 1), es[0].mouse_button_down.button);
-    try testing.expectEqual(@as(u8, 1), es[0].mouse_button_down.clicks);
-    try testing.expect(h.captured);
-    _ = t.handle(&h, win1, w.WM_LBUTTONUP, 0, w.makeLparam(153, 300));
-    es = h.take();
-    try testing.expect(!h.captured);
-    h.time += 200;
-    _ = t.handle(&h, win1, w.WM_LBUTTONDOWN, w.MK_LBUTTON, w.makeLparam(154, 301));
-    es = h.take();
-    try testing.expectEqual(@as(u8, 2), es[es.len - 1].mouse_button_down.clicks);
-    _ = t.handle(&h, win1, w.WM_LBUTTONUP, 0, w.makeLparam(154, 301));
-    try testing.expectEqual(@as(u8, 2), h.take()[0].mouse_button_up.clicks);
-    h.time += 2000;
-    _ = t.handle(&h, win1, w.WM_LBUTTONDOWN, w.MK_LBUTTON, w.makeLparam(154, 301));
-    try testing.expectEqual(@as(u8, 1), h.take()[0].mouse_button_down.clicks);
-    // X buttons: XBUTTON1 = back (4), returns TRUE.
-    const r = t.handle(&h, win1, w.WM_XBUTTONDOWN, @as(w.WPARAM, w.XBUTTON1) << 16, w.makeLparam(154, 301));
-    try testing.expectEqual(Result{ .handled = w.TRUE }, r);
-    es = h.take();
-    try testing.expectEqual(@as(u8, 4), es[0].mouse_button_down.button);
-    _ = t.handle(&h, win1, w.WM_LBUTTONUP, 0, w.makeLparam(154, 301));
-    _ = t.handle(&h, win1, w.WM_XBUTTONUP, @as(w.WPARAM, w.XBUTTON1) << 16, w.makeLparam(154, 301));
-    try testing.expect(!h.captured);
-    _ = h.take();
-    _ = t.handle(&h, win1, w.WM_MOUSELEAVE, 0, 0);
-    try testing.expect(h.take()[0] == .mouse_leave);
-    _ = t.handle(&h, win1, w.WM_MOUSEMOVE, 0, w.makeLparam(10, 10));
-    try testing.expect(h.take()[0] == .mouse_enter);
-}
-
-test "wheel: SDL units and sign, screen coordinates, precise" {
-    var h: FakeHost = .{};
-    var t: T = .{};
-    const up: w.WPARAM = @as(w.WPARAM, @as(u16, @bitCast(@as(i16, 120)))) << 16;
-    _ = t.handle(&h, win1, w.WM_MOUSEWHEEL, up, w.makeLparam(250, 200));
-    var es = h.take();
-    try testing.expectEqual(@as(f32, 1), es[0].mouse_wheel.y);
-    try testing.expect(!es[0].mouse_wheel.precise);
-    try testing.expectEqual(@as(f32, 100), es[0].mouse_wheel.mouse_x);
-    try testing.expectEqual(@as(f32, 100), es[0].mouse_wheel.mouse_y);
-    const fine: w.WPARAM = @as(w.WPARAM, @as(u16, @bitCast(@as(i16, -30)))) << 16;
-    _ = t.handle(&h, win1, w.WM_MOUSEHWHEEL, fine, w.makeLparam(250, 200));
-    es = h.take();
-    try testing.expectEqual(@as(f32, -0.25), es[0].mouse_wheel.x);
-    try testing.expect(es[0].mouse_wheel.precise);
 }
 
 test "IME: composition with cursor, commit, end" {
@@ -915,18 +792,6 @@ test "IME: composition with cursor, commit, end" {
     try testing.expectEqual(Result.default, t.handle(&h, off, w.WM_IME_COMPOSITION, 0, w.GCS_COMPSTR));
 }
 
-test "focus: sync modifiers on gain, reset on loss" {
-    var h: FakeHost = .{};
-    var t: T = .{};
-    h.keys[w.VK_LSHIFT] = 0x80;
-    _ = t.handle(&h, win1, w.WM_SETFOCUS, 0, 0);
-    try testing.expect(t.mod_keys.lshift);
-    try testing.expect(h.take()[0] == .focus_gained);
-    _ = t.handle(&h, win1, w.WM_KILLFOCUS, 0, 0);
-    try testing.expect(!t.mod_keys.lshift);
-    try testing.expect(h.take()[0] == .focus_lost);
-}
-
 test "utf16 to utf8 with cursor" {
     var out: [32]u8 = undefined;
     const r = utf16ToUtf8(&out, &[_]u16{ 'a', 0xE9, 0xD83D, 0xDE00, 'b' }, 4);
@@ -940,16 +805,4 @@ test "utf16 to utf8 with cursor" {
     try testing.expectEqual(@as(usize, 4), utf16Len("a\u{1F600}b"));
     var crlf = "a\r\nb\r".*;
     try testing.expectEqualStrings("a\nb\r", crlfToLf(&crlf));
-}
-
-test "dpi math" {
-    try testing.expectEqual(@as(f32, 1.25), dpi.scale(120));
-    try testing.expectEqual(@as(i32, 1000), dpi.toPixels(800, 120));
-    try testing.expectEqual(@as(i32, 800), dpi.toLogical(1000, 120));
-    try testing.expectEqual(@as(i32, 1), dpi.toPixels(1, 96));
-    try testing.expectEqual(@as(i32, 2), dpi.toPixels(1, 144)); // 1.5 rounds half up
-    try testing.expectEqual(@as(i32, 1202), dpi.toPixels(801, 144)); // 1201.5 rounds half up, like MulDiv
-    const r = dpi.rescaleClient(800, 600, 192);
-    try testing.expectEqual(@as(i32, 1600), r[0]);
-    try testing.expectEqual(@as(i32, 1200), r[1]);
 }

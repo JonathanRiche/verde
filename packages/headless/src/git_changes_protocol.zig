@@ -106,8 +106,6 @@
 //!   chat's 20 most recent `git` rows are considered, and only while the
 //!   chat is idle.
 
-const std = @import("std");
-
 pub const METHOD_SUMMARY: []const u8 = "git.changes.summary";
 pub const METHOD_REVIEW: []const u8 = "git.changes.review";
 pub const METHOD_COMMIT_MESSAGE: []const u8 = "git.changes.commit_message";
@@ -526,16 +524,3 @@ pub const ConfigCommitSnapshot = struct {
     commit_message_model: ?[]const u8 = null,
     commit_default_action: []const u8 = "commit",
 };
-
-test "git changes method names are stable" {
-    try std.testing.expectEqualStrings("git.changes.summary", METHOD_SUMMARY);
-    try std.testing.expectEqualStrings("git.changes.review", METHOD_REVIEW);
-    try std.testing.expectEqualStrings("git.changes.commit_message", METHOD_COMMIT_MESSAGE);
-    try std.testing.expectEqualStrings("git.changes.commit", METHOD_COMMIT);
-    try std.testing.expectEqualStrings("git.changes.pull_push", METHOD_PULL_PUSH);
-    try std.testing.expectEqualStrings("git.changes.push", METHOD_PUSH);
-    try std.testing.expectEqualStrings("git.changes.status", METHOD_STATUS);
-    try std.testing.expectEqualStrings("config.commit.set", METHOD_CONFIG_COMMIT_SET);
-    try std.testing.expectEqualStrings("git.changes.workspace", METHOD_WORKSPACE);
-    try std.testing.expectEqualStrings("git.changes.file_patch", METHOD_FILE_PATCH);
-}

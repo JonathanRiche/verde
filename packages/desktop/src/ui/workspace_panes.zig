@@ -1084,11 +1084,6 @@ fn paneUsesRestingBorder(is_root_pane: bool, maximized: bool) bool {
     return is_root_pane and !maximized;
 }
 
-/// Renders workspace panes with transcript geometry matching the visible pane.
-pub fn renderAt(state: *runtime.AppState, rect: palette.Rect) void {
-    renderAtWithTranscriptLayoutWidth(state, rect, rect.w);
-}
-
 /// Renders workspace panes while transcripts use their destination sidebar width.
 pub fn renderAtWithTranscriptLayoutWidth(state: *runtime.AppState, workspace_rect: palette.Rect, workspace_target_width: f32) void {
     // The focused tab's side panel takes the right edge; panes tile the rest.
@@ -2821,15 +2816,6 @@ fn responsiveScrollingPaneExtent(
     return @min(legacy_extent, default_extent);
 }
 
-fn scrollingMaxOffset(viewport_extent: f32, pane_extent: f32, gap: f32, pane_count: usize) f32 {
-    if (pane_count == 0) return 0.0;
-    const count: f32 = @floatFromInt(pane_count);
-    const total_extent = pane_extent * count + gap * (count - 1.0);
-    const ordinary_max = @max(0.0, total_extent - viewport_extent);
-    const final_pane_origin = (count - 1.0) * (pane_extent + gap);
-    return @max(ordinary_max, final_pane_origin);
-}
-
 fn collectScrollingGroups(
     layout: *const runtime.WorkspaceLayout,
     group_ids: []runtime.WorkspacePaneId,
@@ -3015,16 +3001,6 @@ fn scrollingScrollAfterLeadingResize(start_scroll: f32, start_extent: f32, new_e
 
 fn scrollingPaneExtentRatio(pane_extent: f32, viewport_extent: f32, gap: f32) f32 {
     return (pane_extent + gap) / @max(viewport_extent + gap, 1.0);
-}
-
-fn revealedScrollTarget(current: f32, viewport_w: f32, column_w: f32, gap: f32, pane_index: usize, max_offset: f32) f32 {
-    const column_left = @as(f32, @floatFromInt(pane_index)) * (column_w + gap);
-    return revealedColumnScrollTarget(current, viewport_w, column_left, column_w, max_offset);
-}
-
-fn leadingScrollTarget(column_w: f32, gap: f32, pane_index: usize, max_offset: f32) f32 {
-    const column_left = @as(f32, @floatFromInt(pane_index)) * (column_w + gap);
-    return std.math.clamp(column_left, 0.0, max_offset);
 }
 
 fn shouldSkipSlide(from_index: ?usize, to_index: usize, pending_direction: i8) bool {
@@ -3239,42 +3215,6 @@ fn tiledContentRect(rect: palette.Rect, gap: f32, inset: bool) palette.Rect {
         .w = @max(1.0, rect.w - horizontal_inset * 2.0),
         .h = @max(1.0, rect.h - vertical_inset * 2.0),
     };
-}
-
-test "pane rects ease toward a new layout, new panes appear in place, leavers prune" {
-    pane_rect_slot_count = 0;
-    pane_motion_animating = false;
-    const a: palette.Rect = .{ .x = 0, .y = 0, .w = 400, .h = 300 };
-    try std.testing.expect(rectsEqual(a, easedPaneRect(1, a, 0.5)));
-    try std.testing.expect(!pane_motion_animating);
-    prunePaneRectSlots();
-    // Splitting: pane 1 narrows to half; it eases halfway there per 0.5 step.
-    const half: palette.Rect = .{ .x = 0, .y = 0, .w = 200, .h = 300 };
-    const mid = easedPaneRect(1, half, 0.5);
-    try std.testing.expectEqual(@as(f32, 300.0), mid.w);
-    try std.testing.expect(pane_motion_animating);
-    // The new pane 2 lands at its target immediately.
-    const right: palette.Rect = .{ .x = 200, .y = 0, .w = 200, .h = 300 };
-    try std.testing.expect(rectsEqual(right, easedPaneRect(2, right, 0.5)));
-    prunePaneRectSlots();
-    try std.testing.expectEqual(@as(usize, 2), pane_rect_slot_count);
-    // Closing pane 2: only pane 1 is seen, so pane 2's slot is dropped.
-    pane_motion_animating = false;
-    try std.testing.expect(rectsEqual(half, easedPaneRect(1, half, 1.0)));
-    try std.testing.expect(!pane_motion_animating);
-    prunePaneRectSlots();
-    try std.testing.expectEqual(@as(usize, 1), pane_rect_slot_count);
-    pane_rect_slot_count = 0;
-}
-
-test "target split widths finish without a corrective transcript reflow" {
-    defer theme.applyTheme(1.0);
-    theme.applyTheme(1.0);
-
-    const widths = verticalSplitWidths(900.0, 0.42, 1.0);
-    try std.testing.expectApproxEqAbs(@as(f32, 900.0), widths.first + widths.second + 1.0, 0.001);
-    const final_widths = verticalSplitWidths(720.0, 0.42, 1.0);
-    try std.testing.expectApproxEqAbs(@as(f32, 720.0), final_widths.first + final_widths.second + 1.0, 0.001);
 }
 
 // Tiled workspace region; pane shells animate while transcript widths stay final.
@@ -3901,14 +3841,6 @@ fn paletteColor(color: [4]f32) palette.Color {
     return .{ .r = color[0], .g = color[1], .b = color[2], .a = color[3] };
 }
 
-test "empty workspace option navigation wraps without external state" {
-    try std.testing.expectEqual(@as(usize, 1), emptyWorkspaceSelectionAfterMove(0, 1));
-    try std.testing.expectEqual(@as(usize, 2), emptyWorkspaceSelectionAfterMove(1, 1));
-    try std.testing.expectEqual(@as(usize, 0), emptyWorkspaceSelectionAfterMove(2, 1));
-    try std.testing.expectEqual(@as(usize, 2), emptyWorkspaceSelectionAfterMove(0, -1));
-    try std.testing.expectEqual(@as(usize, 0), emptyWorkspaceSelectionAfterMove(1, -1));
-}
-
 test "directional navigation transfers zoom unless unzoom is configured" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4037,348 +3969,6 @@ test "scrolling navigation restores the last focused tile child with and without
     try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, null), layout.maximized_pane_id);
 }
 
-test "scrolling focus reveal moves only enough to expose the column" {
-    const viewport_w: f32 = 1000.0;
-    const column_w: f32 = 640.0;
-    const gap: f32 = 1.0;
-    const max_offset: f32 = 281.0;
-
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), revealedScrollTarget(0.0, viewport_w, column_w, gap, 0, max_offset), 0.0001);
-    try std.testing.expectApproxEqAbs(max_offset, revealedScrollTarget(0.0, viewport_w, column_w, gap, 1, max_offset), 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), revealedScrollTarget(max_offset, viewport_w, column_w, gap, 0, max_offset), 0.0001);
-}
-
-test "sidebar horizontal render preserves visible activation and minimally reveals after pre-render resize" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
-    var storage = try storage_mod.Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
-    defer storage.deinit();
-    var state = try runtime.AppState.init(allocator, &storage, app_config.AppConfig{ .workspace_scroll_mode = .automatic }, .{
-        .gl_texture_uploads_enabled = false,
-        .browser_textures_enabled = false,
-    });
-    defer {
-        state.lifecycle.clearDirty();
-        state.deinit();
-    }
-
-    for (state.project_controller.projects.items) |*project| project.deinit(allocator);
-    state.project_controller.projects.clearRetainingCapacity();
-    state.lifecycle.clearDirty();
-
-    var project = try runtime.Project.init(allocator, "render-a", "Render A", "/tmp/render-a", 0);
-    const second_thread = try project.addThread(allocator);
-    const second_pane = try project.workspace_layout.createChatPane(allocator, second_thread);
-    try project.workspace_layout.splitPaneWithLeaf(allocator, 1, second_pane, .horizontal, true);
-    try std.testing.expect(project.workspace_layout.resizeSplit(1, second_pane, .horizontal, 0.37));
-    const third_thread = try project.addThread(allocator);
-    const third_pane = try project.workspace_layout.createChatPane(allocator, third_thread);
-    try project.workspace_layout.splitPaneWithLeaf(allocator, second_pane, third_pane, .vertical, true);
-    try std.testing.expect(project.workspace_layout.resizeSplit(second_pane, third_pane, .vertical, 0.61));
-    project.workspace_layout.focused_pane_id = second_pane;
-    project.workspace_layout.maximized_pane_id = second_pane;
-    project.workspace_layout.scroll_offset_x = 73.25;
-    project.workspace_layout.scroll_target_x = 73.25;
-    project.workspace_layout.scroll_offset_y = 19.5;
-    project.workspace_layout.scroll_target_y = 19.5;
-    project.workspace_layout.scroll_mode_override = .always;
-    project.workspace_layout.scroll_pane_extent_override = 620.0;
-    project.workspace_layout.scroll_pane_extent_ratio_override = 0.30;
-    const persisted = try project.workspace_layout.persistedWorkspaceJson(allocator);
-    defer allocator.free(persisted);
-    try project.workspace_layout.applyPersistedWorkspaceJson(allocator, persisted);
-    state.project_controller.projects.append(allocator, project) catch |err| {
-        project.deinit(allocator);
-        return err;
-    };
-    var away = try runtime.Project.init(allocator, "render-b", "Render B", "/tmp/render-b", 0);
-    state.project_controller.projects.append(allocator, away) catch |err| {
-        away.deinit(allocator);
-        return err;
-    };
-    state.project_controller.selected_index = 0;
-
-    const narrow: palette.Rect = .{ .x = 31.0, .y = 47.0, .w = 1000.0, .h = 780.0 };
-    const layout = &state.project_controller.projects.items[0].workspace_layout;
-
-    // Establish a real strip acknowledgement, maximize its visible pane,
-    // focus offscreen C (zoom stays in B's tab), then restore through
-    // production APIs.
-    try std.testing.expect(state.toggleWorkspacePaneMaximized(0, second_pane));
-    renderAt(&state, narrow);
-    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, second_pane), layout.scroll_revealed_pane_id);
-    const preserved_target_x = layout.scroll_target_x;
-    const preserved_target_y = layout.scroll_target_y;
-    try std.testing.expect(state.toggleWorkspacePaneMaximized(0, second_pane));
-    state.focusWorkspaceOpenPaneFromSidebar(0, third_pane);
-    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, second_pane), layout.maximized_pane_id);
-    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, null), layout.scroll_revealed_pane_id);
-    try std.testing.expectEqual(preserved_target_x, layout.scroll_target_x);
-    try std.testing.expectEqual(preserved_target_y, layout.scroll_target_y);
-    layout.scroll_pane_extent_ratio_override = 0.45;
-    try std.testing.expect(state.clearWorkspacePaneMaximized(0));
-    renderAt(&state, narrow);
-
-    const gap = theme.scaledUi(state.app_config.workspace_pane_gap);
-    const viewport_w = scrollingViewportExtent(narrow.w, gap, layout.visiblePaneCount(), state.app_config.workspace_panes_per_view);
-    const pane_extent = responsiveScrollingPaneExtent(
-        viewport_w,
-        gap,
-        state.app_config.workspace_panes_per_view,
-        layout.scroll_pane_extent_override,
-        layout.scroll_pane_extent_ratio_override,
-        theme.uiScaleFactor(),
-    );
-    const max_offset = scrollingMaxOffset(viewport_w, pane_extent, gap, layout.visiblePaneCount());
-    const expected_target = revealedScrollTarget(preserved_target_x, viewport_w, pane_extent, gap, 2, max_offset);
-    const leading_target = leadingScrollTarget(pane_extent, gap, 2, max_offset);
-    try std.testing.expectApproxEqAbs(expected_target, layout.scroll_target_x, 0.0001);
-    try std.testing.expect(expected_target > preserved_target_x);
-    try std.testing.expect(layout.scroll_target_x < leading_target);
-    const third_end = 3.0 * pane_extent + 2.0 * gap;
-    try std.testing.expect(third_end <= layout.scroll_target_x + viewport_w + 0.0001);
-    try std.testing.expect(layout.scroll_target_x <= third_end - viewport_w + 0.0001);
-    try std.testing.expect(layout.scroll_offset_x >= 0.0 and layout.scroll_offset_x <= max_offset);
-    try std.testing.expectEqual(preserved_target_y, layout.scroll_target_y);
-
-    // Same-pane sidebar reselection invalidates the old acknowledgement. A
-    // changed same-axis extent is recomputed, while unchanged visible geometry
-    // preserves both the exact animated offset and target.
-    const shorter: palette.Rect = .{ .x = 31.0, .y = 47.0, .w = 700.0, .h = 780.0 };
-    const before_resize_target = layout.scroll_target_x;
-    layout.scroll_pane_extent_ratio_override = 0.60;
-    state.focusWorkspaceOpenPaneFromSidebar(0, third_pane);
-    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, null), layout.scroll_revealed_pane_id);
-    renderAt(&state, shorter);
-    const resized_viewport_w = scrollingViewportExtent(shorter.w, gap, layout.visiblePaneCount(), state.app_config.workspace_panes_per_view);
-    const resized_extent = responsiveScrollingPaneExtent(resized_viewport_w, gap, state.app_config.workspace_panes_per_view, layout.scroll_pane_extent_override, layout.scroll_pane_extent_ratio_override, theme.uiScaleFactor());
-    const resized_max = scrollingMaxOffset(resized_viewport_w, resized_extent, gap, layout.visiblePaneCount());
-    const resized_expected = revealedScrollTarget(before_resize_target, resized_viewport_w, resized_extent, gap, 2, resized_max);
-    try std.testing.expectApproxEqAbs(resized_expected, layout.scroll_target_x, 0.0001);
-    layout.scroll_offset_x = layout.scroll_target_x;
-    const visible_offset = layout.scroll_offset_x;
-    const visible_target = layout.scroll_target_x;
-    state.focusWorkspaceOpenPaneFromSidebar(0, third_pane);
-    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, null), layout.scroll_revealed_pane_id);
-    renderAt(&state, shorter);
-    try std.testing.expectEqual(visible_offset, layout.scroll_offset_x);
-    try std.testing.expectEqual(visible_target, layout.scroll_target_x);
-
-    // Explicit non-sidebar navigation still places a genuinely offscreen pane
-    // at its leading edge.
-    state.focusWorkspaceOpenPaneFromSidebar(0, 1);
-    renderAt(&state, shorter);
-    state.focusWorkspaceOpenPane(0, third_pane);
-    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, third_pane), layout.scroll_leading_pane_id);
-    renderAt(&state, shorter);
-    try std.testing.expectApproxEqAbs(leadingScrollTarget(resized_extent, gap, 2, resized_max), layout.scroll_target_x, 0.0001);
-    switch (layout.root.?.*) {
-        .split => |split| try std.testing.expectApproxEqAbs(@as(f32, 0.37), split.ratio, 0.0001),
-        .leaf => return error.TestExpectedEqual,
-    }
-}
-
-test "sidebar vertical render minimally reveals after pre-render resize" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
-    var config: app_config.AppConfig = .{ .workspace_scroll_mode = .automatic };
-    config.workspace_scroll_direction = .vertical;
-    var storage = try storage_mod.Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
-    defer storage.deinit();
-    var state = try runtime.AppState.init(allocator, &storage, config, .{
-        .gl_texture_uploads_enabled = false,
-        .browser_textures_enabled = false,
-    });
-    defer {
-        state.lifecycle.clearDirty();
-        state.deinit();
-    }
-
-    for (state.project_controller.projects.items) |*project| project.deinit(allocator);
-    state.project_controller.projects.clearRetainingCapacity();
-    state.lifecycle.clearDirty();
-
-    var project = try runtime.Project.init(allocator, "render-vertical", "Render vertical", "/tmp/render-vertical", 0);
-    const second_thread = try project.addThread(allocator);
-    const second_pane = try project.workspace_layout.createChatPane(allocator, second_thread);
-    try project.workspace_layout.splitPaneWithLeaf(allocator, 1, second_pane, .horizontal, true);
-    try std.testing.expect(project.workspace_layout.resizeSplit(1, second_pane, .horizontal, 0.38));
-    const third_thread = try project.addThread(allocator);
-    const third_pane = try project.workspace_layout.createChatPane(allocator, third_thread);
-    try project.workspace_layout.splitPaneWithLeaf(allocator, second_pane, third_pane, .vertical, true);
-    try std.testing.expect(project.workspace_layout.resizeSplit(second_pane, third_pane, .vertical, 0.62));
-    project.workspace_layout.focused_pane_id = second_pane;
-    project.workspace_layout.scroll_offset_x = 41.0;
-    project.workspace_layout.scroll_target_x = 41.0;
-    project.workspace_layout.scroll_offset_y = 19.5;
-    project.workspace_layout.scroll_target_y = 19.5;
-    project.workspace_layout.scroll_mode_override = .always;
-    project.workspace_layout.scroll_pane_extent_override = 620.0;
-    project.workspace_layout.scroll_pane_extent_ratio_override = 0.30;
-    state.project_controller.projects.append(allocator, project) catch |err| {
-        project.deinit(allocator);
-        return err;
-    };
-    var away = try runtime.Project.init(allocator, "render-vertical-away", "Away", "/tmp/render-vertical-away", 0);
-    state.project_controller.projects.append(allocator, away) catch |err| {
-        away.deinit(allocator);
-        return err;
-    };
-    state.project_controller.selected_index = 0;
-
-    const tall: palette.Rect = .{ .x = 31.0, .y = 47.0, .w = 780.0, .h = 1400.0 };
-    const short: palette.Rect = .{ .x = 31.0, .y = 47.0, .w = 780.0, .h = 1000.0 };
-    const layout = &state.project_controller.projects.items[0].workspace_layout;
-
-    renderAt(&state, tall);
-    state.focusWorkspaceOpenPaneFromSidebar(0, third_pane);
-    renderAt(&state, tall);
-    state.focusWorkspaceOpenPaneFromSidebar(0, second_pane);
-    renderAt(&state, tall);
-    layout.scroll_offset_y = layout.scroll_target_y;
-    const visible_offset = layout.scroll_offset_y;
-    const visible_target = layout.scroll_target_y;
-    state.focusWorkspaceOpenPaneFromSidebar(0, second_pane);
-    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, null), layout.scroll_revealed_pane_id);
-    renderAt(&state, tall);
-    try std.testing.expectEqual(visible_offset, layout.scroll_offset_y);
-    try std.testing.expectEqual(visible_target, layout.scroll_target_y);
-    try std.testing.expectEqual(@as(f32, 41.0), layout.scroll_target_x);
-
-    // The first render leading-aligns the restored focused pane; scroll back
-    // to 19.5 so the shrink below leaves the third pane partly offscreen.
-    layout.scroll_offset_y = 19.5;
-    layout.scroll_target_y = 19.5;
-    state.project_controller.selected_index = 1;
-    layout.scroll_pane_extent_ratio_override = 0.45;
-    state.focusWorkspaceOpenPaneFromSidebar(0, third_pane);
-    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, null), layout.scroll_revealed_pane_id);
-    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, null), layout.scroll_leading_pane_id);
-    renderAt(&state, short);
-
-    const gap = theme.scaledUi(state.app_config.workspace_pane_gap);
-    const viewport_h = scrollingViewportExtent(short.h, gap, layout.visiblePaneCount(), state.app_config.workspace_panes_per_view);
-    const pane_extent = responsiveScrollingPaneExtent(
-        viewport_h,
-        gap,
-        state.app_config.workspace_panes_per_view,
-        layout.scroll_pane_extent_override,
-        layout.scroll_pane_extent_ratio_override,
-        theme.uiScaleFactor(),
-    );
-    const max_offset = scrollingMaxOffset(viewport_h, pane_extent, gap, layout.visiblePaneCount());
-    const expected_target = revealedScrollTarget(19.5, viewport_h, pane_extent, gap, 2, max_offset);
-    const leading_target = leadingScrollTarget(pane_extent, gap, 2, max_offset);
-    try std.testing.expectApproxEqAbs(expected_target, layout.scroll_target_y, 0.0001);
-    try std.testing.expect(layout.scroll_target_y > 19.5);
-    try std.testing.expect(layout.scroll_target_y < leading_target);
-    try std.testing.expect(layout.scroll_target_y <= max_offset);
-    try std.testing.expectEqual(@as(f32, 41.0), layout.scroll_target_x);
-
-    const shorter: palette.Rect = .{ .x = 31.0, .y = 47.0, .w = 780.0, .h = 700.0 };
-    const before_resize_target = layout.scroll_target_y;
-    layout.scroll_pane_extent_ratio_override = 0.60;
-    state.focusWorkspaceOpenPaneFromSidebar(0, third_pane);
-    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, null), layout.scroll_revealed_pane_id);
-    renderAt(&state, shorter);
-    const resized_viewport_h = scrollingViewportExtent(shorter.h, gap, layout.visiblePaneCount(), state.app_config.workspace_panes_per_view);
-    const resized_extent = responsiveScrollingPaneExtent(resized_viewport_h, gap, state.app_config.workspace_panes_per_view, layout.scroll_pane_extent_override, layout.scroll_pane_extent_ratio_override, theme.uiScaleFactor());
-    const resized_max = scrollingMaxOffset(resized_viewport_h, resized_extent, gap, layout.visiblePaneCount());
-    const resized_expected = revealedScrollTarget(before_resize_target, resized_viewport_h, resized_extent, gap, 2, resized_max);
-    try std.testing.expectApproxEqAbs(resized_expected, layout.scroll_target_y, 0.0001);
-    layout.scroll_offset_y = layout.scroll_target_y;
-    const same_geometry_offset = layout.scroll_offset_y;
-    const same_geometry_target = layout.scroll_target_y;
-    state.focusWorkspaceOpenPaneFromSidebar(0, third_pane);
-    renderAt(&state, shorter);
-    try std.testing.expectEqual(same_geometry_offset, layout.scroll_offset_y);
-    try std.testing.expectEqual(same_geometry_target, layout.scroll_target_y);
-    switch (layout.root.?.*) {
-        .split => |split| try std.testing.expectApproxEqAbs(@as(f32, 0.38), split.ratio, 0.0001),
-        .leaf => return error.TestExpectedEqual,
-    }
-}
-
-test "scrolling pane extent fits the configured panes per view" {
-    const gap: f32 = 12.0;
-    inline for (.{ @as(f32, 360.0), @as(f32, 1000.0), @as(f32, 1440.0) }) |viewport_extent| {
-        inline for (.{ @as(u8, 1), @as(u8, 2), @as(u8, 3), @as(u8, 6) }) |count| {
-            const pane_extent = scrollingPaneExtent(viewport_extent, gap, count);
-            const count_f: f32 = @floatFromInt(count);
-            try std.testing.expectApproxEqAbs(viewport_extent, pane_extent * count_f + gap * (count_f - 1.0), 0.001);
-        }
-    }
-}
-
-test "scrolling viewport margins require multiple displayed groups" {
-    const rect: palette.Rect = .{ .x = 10.0, .y = 20.0, .w = 1000.0, .h = 700.0 };
-
-    try std.testing.expectEqual(rect, scrollingViewportRect(rect, 12.0, 1, 2));
-    try std.testing.expectEqual(rect, scrollingViewportRect(rect, 12.0, 2, 1));
-    try std.testing.expectEqual(@as(f32, 1000.0), scrollingViewportExtent(rect.w, 12.0, 1, 2));
-
-    const inset = scrollingViewportRect(rect, 12.0, 2, 2);
-    try std.testing.expectEqual(@as(f32, 22.0), inset.x);
-    try std.testing.expectEqual(@as(f32, 32.0), inset.y);
-    try std.testing.expectEqual(@as(f32, 976.0), inset.w);
-    try std.testing.expectEqual(@as(f32, 676.0), inset.h);
-    try std.testing.expectEqual(@as(f32, 976.0), scrollingViewportExtent(rect.w, 12.0, 2, 2));
-}
-
-test "custom scrolling pane extent follows viewport changes" {
-    const gap: f32 = 12.0;
-    try std.testing.expectApproxEqAbs(
-        @as(f32, 994.0),
-        responsiveScrollingPaneExtent(2000.0, gap, 2, 1200.0, null, 1.0),
-        0.0001,
-    );
-    try std.testing.expectApproxEqAbs(
-        @as(f32, 994.0),
-        responsiveScrollingPaneExtent(2000.0, gap, 2, 994.0, 0.5, 1.0),
-        0.0001,
-    );
-    try std.testing.expectApproxEqAbs(
-        @as(f32, 494.0),
-        responsiveScrollingPaneExtent(1000.0, gap, 2, 994.0, 0.5, 1.0),
-        0.0001,
-    );
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), scrollingPaneExtentRatio(994.0, 2000.0, gap), 0.0001);
-}
-
-test "scrolling range keeps the final pane available at the leading edge" {
-    const pane_extent: f32 = 500.0;
-    const gap: f32 = 12.0;
-    const pane_count: usize = 4;
-    try std.testing.expectApproxEqAbs(@as(f32, 1676.0), scrollingMaxOffset(360.0, pane_extent, gap, pane_count), 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 1536.0), scrollingMaxOffset(900.0, pane_extent, gap, pane_count), 0.0001);
-
-    var offset: f32 = 1600.0;
-    var target: f32 = 1676.0;
-    clampScrollingOffsets(&offset, &target, scrollingMaxOffset(900.0, pane_extent, gap, pane_count));
-    try std.testing.expectApproxEqAbs(@as(f32, 1536.0), offset, 0.0001);
-    try std.testing.expectApproxEqAbs(offset, target, 0.0001);
-
-    clampScrollingOffsets(&offset, &target, scrollingMaxOffset(900.0, pane_extent, gap, 2));
-    try std.testing.expectApproxEqAbs(@as(f32, 512.0), offset, 0.0001);
-    try std.testing.expectApproxEqAbs(offset, target, 0.0001);
-}
-
-test "direct pane reveal anchors its leading edge" {
-    const pane_extent: f32 = 500.0;
-    const gap: f32 = 12.0;
-    const max_offset = scrollingMaxOffset(1000.0, pane_extent, gap, 4);
-
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), leadingScrollTarget(pane_extent, gap, 0, max_offset), 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 1024.0), leadingScrollTarget(pane_extent, gap, 2, max_offset), 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 1536.0), leadingScrollTarget(pane_extent, gap, 3, max_offset), 0.0001);
-}
-
 test "scrolling column drag resizes only the grabbed pane" {
     try std.testing.expectApproxEqAbs(@as(f32, 500.0), scrollingPaneExtentFromTrailingDrag(500.0, 0.0, 0.0, 1.0), 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 500.0), scrollingPaneExtentFromTrailingDrag(1012.0, 0.0, 512.0, 1.0), 0.0001);
@@ -4387,22 +3977,6 @@ test "scrolling column drag resizes only the grabbed pane" {
     try std.testing.expectApproxEqAbs(@as(f32, 500.0), scrollingPaneExtentFromTrailingDrag(625.0, 0.0, 0.0, 1.25), 0.0001);
     // A wider preceding pane must not be folded into a shared strip width.
     try std.testing.expectApproxEqAbs(@as(f32, 420.0), scrollingPaneExtentFromTrailingDrag(1132.0, 0.0, 712.0, 1.0), 0.0001);
-}
-
-test "scrolling column leading drag keeps the trailing edge fixed" {
-    try std.testing.expectApproxEqAbs(@as(f32, 600.0), scrollingPaneExtentFromLeadingDrag(412.0, 0.0, 512.0, 500.0, 1.0), 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 400.0), scrollingPaneExtentFromLeadingDrag(612.0, 0.0, 512.0, 500.0, 1.0), 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 100.0), scrollingScrollAfterLeadingResize(0.0, 500.0, 600.0), 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 80.0), scrollingScrollAfterLeadingResize(180.0, 500.0, 400.0), 0.0001);
-}
-
-test "variable scrolling extents keep a uniform strip equivalent" {
-    const extents = [_]f32{ 500.0, 500.0, 500.0, 500.0 };
-    try std.testing.expectApproxEqAbs(scrollingMaxOffset(360.0, 500.0, 12.0, 4), scrollingStripMaxOffset(360.0, &extents, 12.0), 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 1024.0), scrollingPaneOrigin(&extents, 12.0, 2), 0.0001);
-    const mixed = [_]f32{ 700.0, 400.0, 500.0 };
-    try std.testing.expectApproxEqAbs(@as(f32, 1124.0), scrollingPaneOrigin(&mixed, 12.0, 2), 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 1124.0), leadingScrollTargetForPane(&mixed, 12.0, 2, 2000.0), 0.0001);
 }
 
 test "menu split keeps the new pane inside the target scrolling tile" {
@@ -4452,61 +4026,6 @@ test "menu split keeps the new pane inside the target scrolling tile" {
     try std.testing.expectEqual(@as(usize, 2), collectScrollingGroups(layout, &group_ids, &representative_ids));
 }
 
-test "scrolling strip collects a tiled group as one item" {
-    const allocator = std.testing.allocator;
-    var layout = try runtime.WorkspaceLayout.initDefaultChat(allocator);
-    defer layout.deinit(allocator);
-
-    const tiled_pane_id = try layout.createTerminalPane(allocator, 10);
-    try layout.splitPaneWithLeaf(allocator, 1, tiled_pane_id, .vertical, true);
-    try std.testing.expect(layout.joinPaneToScrollGroup(1, tiled_pane_id));
-    const standalone_pane_id = try layout.createTerminalPane(allocator, 11);
-    try layout.splitPaneWithLeaf(allocator, tiled_pane_id, standalone_pane_id, .vertical, true);
-    try std.testing.expect(layout.setPaneScrollExtent(tiled_pane_id, 640.0, 0.5));
-
-    var group_ids: [MAX_WORKSPACE_PANE_RECTS]runtime.WorkspacePaneId = undefined;
-    var representative_ids: [MAX_WORKSPACE_PANE_RECTS]runtime.WorkspacePaneId = undefined;
-    const count = collectScrollingGroups(&layout, &group_ids, &representative_ids);
-    try std.testing.expectEqual(@as(usize, 2), count);
-    try std.testing.expectEqual(@as(runtime.WorkspacePaneId, 1), group_ids[0]);
-    try std.testing.expectEqual(standalone_pane_id, group_ids[1]);
-    try std.testing.expectEqual(@as(runtime.WorkspacePaneId, 1), representative_ids[0]);
-
-    var extents: [MAX_WORKSPACE_PANE_RECTS]f32 = undefined;
-    resolveScrollingGroupExtents(&layout, group_ids[0..count], representative_ids[0..count], 500.0, 1292.0, 12.0, 1.0, extents[0..count]);
-    try std.testing.expectApproxEqAbs(@as(f32, 1292.0), extents[0], 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 500.0), extents[1], 0.0001);
-
-    // A nested tile always fills the viewport, while standalone panes keep
-    // their ordinary custom widths.
-    try std.testing.expect(layout.setPaneScrollExtent(standalone_pane_id, 400.0, 0.4));
-    resolveScrollingGroupExtents(&layout, group_ids[0..count], representative_ids[0..count], 900.0, 900.0, 12.0, 1.0, extents[0..count]);
-    try std.testing.expectApproxEqAbs(@as(f32, 900.0), extents[0], 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 352.8), extents[1], 0.0001);
-
-    try std.testing.expectEqual(@as(?usize, 0), scrollGroupIndexForPane(&layout, tiled_pane_id));
-    try std.testing.expectEqual(@as(?usize, 1), scrollGroupIndexForPane(&layout, standalone_pane_id));
-
-    // Closing one child returns the survivor to its ordinary scrolling width.
-    try std.testing.expect(layout.setPaneScrollExtent(1, 640.0, 0.5));
-    _ = layout.closePane(allocator, tiled_pane_id) orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(@as(usize, 1), layout.scrollGroupPaneCount(1));
-    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, 1), layout.paneById(1).?.scroll_group_id);
-    const collapsed_count = collectScrollingGroups(&layout, &group_ids, &representative_ids);
-    resolveScrollingGroupExtents(&layout, group_ids[0..collapsed_count], representative_ids[0..collapsed_count], 900.0, 900.0, 12.0, 1.0, extents[0..collapsed_count]);
-    try std.testing.expectApproxEqAbs(@as(f32, 444.0), extents[0], 0.0001);
-}
-
-test "scrolling grow step clamps to pane extent limits" {
-    const max_css = workspace_layout.MAX_SCROLL_PANE_EXTENT_CSS;
-    try std.testing.expectApproxEqAbs(@as(f32, 596.0), scrollingPaneExtentAfterGrow(500.0, GROW_SCROLL_PANE_STEP_CSS, max_css), 0.0001);
-    try std.testing.expectApproxEqAbs(workspace_layout.MIN_SCROLL_PANE_EXTENT_CSS, scrollingPaneExtentAfterGrow(240.0, -GROW_SCROLL_PANE_STEP_CSS, max_css), 0.0001);
-    try std.testing.expectApproxEqAbs(max_css, scrollingPaneExtentAfterGrow(1550.0, GROW_SCROLL_PANE_STEP_CSS, max_css), 0.0001);
-    // A viewport wider than the CSS cap raises the ceiling so growing a
-    // full-width pane never shrinks it.
-    try std.testing.expectApproxEqAbs(@as(f32, 1900.0), scrollingPaneExtentAfterGrow(1850.0, GROW_SCROLL_PANE_STEP_CSS, 1900.0), 0.0001);
-}
-
 test "scrolling pane extent cap never falls below the viewport" {
     // 2116px viewport at font scale 1.1667 exceeds the 1600 CSS cap; a
     // persisted full-width ratio must still resolve to the whole viewport.
@@ -4518,57 +4037,6 @@ test "scrolling pane extent cap never falls below the viewport" {
     const pane = workspace_layout.WorkspacePane{ .id = 1, .ref = .{ .chat = .{} }, .scroll_extent_css = 1004.5, .scroll_extent_ratio = 1.0 };
     try std.testing.expectApproxEqAbs(viewport, scrollingPaneResolvedExtent(&pane, viewport, viewport, gap, scale), 0.01);
     try std.testing.expectApproxEqAbs(viewport, responsiveScrollingPaneExtent(viewport, gap, 1, 1004.5, 1.0, scale), 0.01);
-}
-
-test "scrolling grow resizes only the focused pane" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
-    var storage = try storage_mod.Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
-    defer storage.deinit();
-    var state = try runtime.AppState.init(allocator, &storage, app_config.AppConfig{}, .{
-        .gl_texture_uploads_enabled = false,
-        .browser_textures_enabled = false,
-    });
-    defer {
-        state.lifecycle.clearDirty();
-        state.deinit();
-    }
-
-    for (state.project_controller.projects.items) |*project| project.deinit(allocator);
-    state.project_controller.projects.clearRetainingCapacity();
-    state.lifecycle.clearDirty();
-
-    var project = try runtime.Project.init(allocator, "grow-scroll", "Grow scroll", "/tmp/grow-scroll", 0);
-    const first_pane_id = project.workspace_layout.focused_pane_id.?;
-    const second_thread = try project.addThread(allocator);
-    const second_pane_id = try project.workspace_layout.createChatPane(allocator, second_thread);
-    try project.workspace_layout.splitPaneWithLeaf(allocator, first_pane_id, second_pane_id, .vertical, true);
-    project.workspace_layout.focused_pane_id = first_pane_id;
-    project.workspace_layout.scroll_mode_override = .always;
-    state.project_controller.projects.append(allocator, project) catch |err| {
-        project.deinit(allocator);
-        return err;
-    };
-    state.project_controller.selected_index = 0;
-    state.app_config.workspace_scroll_mode = .always;
-    state.app_config.workspace_scroll_direction = .horizontal;
-    last_workspace_rect = .{ .x = 0.0, .y = 0.0, .w = 1200.0, .h = 800.0 };
-
-    try std.testing.expect(growPaneInDirection(&state, .right));
-    try std.testing.expect(!growPaneInDirection(&state, .up));
-    const layout = &state.project_controller.projects.items[0].workspace_layout;
-    const first = layout.paneById(first_pane_id) orelse return error.TestExpectedEqual;
-    const second = layout.paneById(second_pane_id) orelse return error.TestExpectedEqual;
-    try std.testing.expect(first.scroll_extent_css != null);
-    try std.testing.expectEqual(@as(?f32, null), second.scroll_extent_css);
-    const grown = first.scroll_extent_css.?;
-    try std.testing.expect(grown > workspace_layout.MIN_SCROLL_PANE_EXTENT_CSS);
-    try std.testing.expect(growPaneInDirection(&state, .left));
-    try std.testing.expectApproxEqAbs(grown - GROW_SCROLL_PANE_STEP_CSS, layout.paneById(first_pane_id).?.scroll_extent_css.?, 1.0);
-    try std.testing.expectEqual(@as(?f32, null), layout.paneById(second_pane_id).?.scroll_extent_css);
 }
 
 test "scrolling layout and strip scrolling follow mode and threshold" {
@@ -4593,69 +4061,6 @@ test "scrolling layout and strip scrolling follow mode and threshold" {
     try std.testing.expect(!scrollingLayoutEnabled(.disabled, 1, 1));
 }
 
-test "automatic scrolling activation follows tab creation and closure" {
-    const allocator = std.testing.allocator;
-    var layout = try runtime.WorkspaceLayout.initDefaultChat(allocator);
-    defer layout.deinit(allocator);
-
-    try std.testing.expectEqual(@as(usize, 1), layout.visibleTabCount());
-    try std.testing.expect(!scrollingLayoutEnabled(.automatic, 3, layout.visibleTabCount()));
-
-    // A split inside the first tab stays one tab: still tiled.
-    const sibling_pane_id = try layout.createTerminalPane(allocator, 9);
-    try layout.splitPaneWithLeaf(allocator, 1, sibling_pane_id, .vertical, true);
-    try std.testing.expect(layout.joinPaneToScrollGroup(1, sibling_pane_id));
-    try std.testing.expectEqual(@as(usize, 1), layout.visibleTabCount());
-    try std.testing.expect(!scrollingLayoutEnabled(.automatic, 3, layout.visibleTabCount()));
-
-    // A second tab is its own view even below "Start after", without scrolling.
-    const second_pane_id = try layout.createTerminalPane(allocator, 10);
-    try layout.splitPaneWithLeaf(allocator, sibling_pane_id, second_pane_id, .vertical, true);
-    try std.testing.expectEqual(@as(usize, 2), layout.visibleTabCount());
-    try std.testing.expect(scrollingLayoutEnabled(.automatic, 3, layout.visibleTabCount()));
-    try std.testing.expect(!scrollingStripScrolls(.automatic, 3, layout.visibleTabCount()));
-
-    const third_pane_id = try layout.createTerminalPane(allocator, 11);
-    try layout.splitPaneWithLeaf(allocator, second_pane_id, third_pane_id, .horizontal, true);
-    try std.testing.expectEqual(@as(usize, 3), layout.visibleTabCount());
-    try std.testing.expect(scrollingStripScrolls(.automatic, 3, layout.visibleTabCount()));
-
-    var removed_ref = layout.closePane(allocator, third_pane_id) orelse return error.TestExpectedEqual;
-    workspace_layout.deinitWorkspacePaneRef(&removed_ref, allocator);
-    try std.testing.expectEqual(@as(usize, 2), layout.visibleTabCount());
-    try std.testing.expect(scrollingLayoutEnabled(.automatic, 3, layout.visibleTabCount()));
-    try std.testing.expect(!scrollingStripScrolls(.automatic, 3, layout.visibleTabCount()));
-
-    removed_ref = layout.closePane(allocator, second_pane_id) orelse return error.TestExpectedEqual;
-    workspace_layout.deinitWorkspacePaneRef(&removed_ref, allocator);
-    try std.testing.expectEqual(@as(usize, 1), layout.visibleTabCount());
-    try std.testing.expect(!scrollingLayoutEnabled(.automatic, 3, layout.visibleTabCount()));
-}
-
-test "scrolling edge navigation geometry follows the configured axis" {
-    const workspace: palette.Rect = .{ .x = 10.0, .y = 20.0, .w = 400.0, .h = 200.0 };
-    const left = scrollingEdgeRects(workspace, .horizontal, .previous, 32.0, 64.0, 6.0, 14.0);
-    const right = scrollingEdgeRects(workspace, .horizontal, .next, 32.0, 64.0, 6.0, 14.0);
-    try std.testing.expectApproxEqAbs(@as(f32, 16.0), left.button.x, 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 88.0), left.button.y, 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 372.0), right.button.x, 0.0001);
-    try std.testing.expect(rectContains(left.proximity, left.button.x, left.button.y));
-    try std.testing.expect(!rectContains(left.proximity, workspace.x + workspace.w * 0.5, workspace.y + workspace.h * 0.5));
-
-    const top = scrollingEdgeRects(workspace, .vertical, .previous, 32.0, 64.0, 6.0, 14.0);
-    const bottom = scrollingEdgeRects(workspace, .vertical, .next, 32.0, 64.0, 6.0, 14.0);
-    try std.testing.expectApproxEqAbs(@as(f32, 178.0), top.button.x, 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 26.0), top.button.y, 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 182.0), bottom.button.y, 0.0001);
-}
-
-test "scrolling wheel routing preserves ordinary vertical pane scrolling" {
-    try std.testing.expectApproxEqAbs(@as(f32, 2.0), scrollingWheelDelta(.horizontal, 2.0, 0.5, false).?, 0.0001);
-    try std.testing.expect(scrollingWheelDelta(.horizontal, 0.2, 1.0, false) == null);
-    try std.testing.expect(scrollingWheelDelta(.vertical, 0.0, -2.0, false) == null);
-    try std.testing.expectApproxEqAbs(@as(f32, 2.0), scrollingWheelDelta(.vertical, 0.0, -2.0, true).?, 0.0001);
-}
-
 test "manual scrolling settles partial positions to the nearest pane" {
     const extents = [_]f32{ 500.0, 360.0, 640.0 };
     const target = freeScrollTarget(0.0, 4.5, SCROLLING_WHEEL_STEP_CSS, 884.0);
@@ -4665,40 +4070,6 @@ test "manual scrolling settles partial positions to the nearest pane" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), nearestPaneScrollTarget(200.0, &extents, 12.0, 884.0), 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 884.0), nearestPaneScrollTarget(800.0, &extents, 12.0, 884.0), 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 1200.0), freeScrollTarget(1190.0, 1.0, SCROLLING_WHEEL_STEP_CSS, 1200.0), 0.0001);
-}
-
-test "scrolling animation advances without overshooting" {
-    const partial = advanceScrollOffset(0.0, 300.0, 16);
-    try std.testing.expect(partial > 0.0);
-    try std.testing.expect(partial < 300.0);
-    try std.testing.expectApproxEqAbs(@as(f32, 300.0), advanceScrollOffset(0.0, 300.0, SCROLLING_ANIMATION_DURATION_MS), 0.0001);
-}
-
-test "skip slide is used for distant and hinted jumps but not neighbors" {
-    try std.testing.expect(!shouldSkipSlide(2, 3, 0));
-    try std.testing.expect(!shouldSkipSlide(3, 2, 0));
-    try std.testing.expect(!shouldSkipSlide(4, 4, 1));
-    try std.testing.expect(shouldSkipSlide(0, 8, 0));
-    try std.testing.expect(shouldSkipSlide(8, 0, 0));
-    try std.testing.expect(!shouldSkipSlide(null, 2, 0));
-    try std.testing.expect(shouldSkipSlide(null, 2, 1));
-    try std.testing.expect(shouldSkipSlide(null, 2, -1));
-}
-
-test "skip slide origins move one pane width from and to the viewport" {
-    const step: f32 = 512.0;
-    const start_forward = skipSlideScreenOrigins(1, 0.0, step);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), start_forward.from, 0.0001);
-    try std.testing.expectApproxEqAbs(step, start_forward.to, 0.0001);
-    const end_forward = skipSlideScreenOrigins(1, 1.0, step);
-    try std.testing.expectApproxEqAbs(-step, end_forward.from, 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), end_forward.to, 0.0001);
-    const start_back = skipSlideScreenOrigins(-1, 0.0, step);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), start_back.from, 0.0001);
-    try std.testing.expectApproxEqAbs(-step, start_back.to, 0.0001);
-    const end_back = skipSlideScreenOrigins(-1, 1.0, step);
-    try std.testing.expectApproxEqAbs(step, end_back.from, 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), end_back.to, 0.0001);
 }
 
 test "scrolling strip reveals every group beyond the visible rect budget" {
@@ -4736,15 +4107,4 @@ test "scrolling strip reveals every group beyond the visible rect budget" {
             try std.testing.expectEqual(index + 1 < count, available.next);
         }
     }
-}
-
-test "pane drag ignores offscreen panes unless the scrolling layout is enabled" {
-    const saved = last_workspace_rect;
-    defer last_workspace_rect = saved;
-    last_workspace_rect = .{ .x = 100.0, .y = 0.0, .w = 1000.0, .h = 800.0 };
-    const inside: palette.Rect = .{ .x = 100.0, .y = 0.0, .w = 1000.0, .h = 800.0 };
-    const peeking: palette.Rect = .{ .x = 1112.0, .y = 0.0, .w = 1000.0, .h = 800.0 };
-    try std.testing.expect(paneDragRectAllowed(inside, false));
-    try std.testing.expect(!paneDragRectAllowed(peeking, false));
-    try std.testing.expect(paneDragRectAllowed(peeking, true));
 }

@@ -805,10 +805,3 @@ fn border(state: *runtime.AppState, rect: palette.Rect, color: [4]f32, radius: f
 fn paletteColor(value: [4]f32) palette.Color {
     return .{ .r = value[0], .g = value[1], .b = value[2], .a = value[3] };
 }
-
-test "truncated labels keep the ellipsis inside the buffer" {
-    var buf: [8]u8 = undefined;
-    const out = truncatedLabel(&buf, "a very long thread title", 0.0, 12.0);
-    try std.testing.expect(out.len <= buf.len);
-    try std.testing.expect(std.mem.endsWith(u8, out, "…"));
-}

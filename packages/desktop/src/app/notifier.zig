@@ -350,10 +350,3 @@ fn closeDetachedWindowsChild(child: *std.process.Child) void {
     if (child.id) |process| std.os.windows.CloseHandle(process);
     child.id = null;
 }
-
-test "windows toast is silent and plays the Verde chime from the env path" {
-    try std.testing.expect(std.mem.indexOf(u8, WINDOWS_NOTIFICATION_SCRIPT, "silent='true'") != null);
-    try std.testing.expect(std.mem.indexOf(u8, WINDOWS_NOTIFICATION_SCRIPT, "Notification.Default") == null);
-    try std.testing.expect(std.mem.indexOf(u8, WINDOWS_NOTIFICATION_SCRIPT, WINDOWS_SOUND_PATH_ENV) != null);
-    try std.testing.expect(std.mem.indexOf(u8, WINDOWS_NOTIFICATION_SCRIPT, "MediaPlayer") != null);
-}

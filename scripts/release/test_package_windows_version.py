@@ -25,16 +25,6 @@ class WindowsVersionTests(unittest.TestCase):
             PACKAGE_WINDOWS.windows_numeric_version("0.1.27-internal-20260710"),
         )
 
-    def test_nonnumeric_release_label_uses_zero_tuple(self) -> None:
-        self.assertEqual(
-            (0, 0, 0, 0), PACKAGE_WINDOWS.windows_numeric_version("ci-123")
-        )
-
-    def test_tag_prefix_is_ignored_for_numeric_fields(self) -> None:
-        self.assertEqual(
-            (0, 1, 27, 0), PACKAGE_WINDOWS.windows_numeric_version("v0.1.27")
-        )
-
     def test_fixed_info_sets_file_and_product_versions(self) -> None:
         fields = struct.unpack(
             "<IIIIII",

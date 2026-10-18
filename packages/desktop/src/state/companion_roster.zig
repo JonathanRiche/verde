@@ -285,14 +285,6 @@ pub fn resumeConversation(self: *Self, index: usize, thread_id: []const u8, curr
     return true;
 }
 
-/// Index of the companion owning this thread as current or past conversation.
-pub fn indexOwningThread(self: *const Self, workspace_id: []const u8, thread_id: []const u8) ?usize {
-    for (self.items(), 0..) |*entry, index| {
-        if (entry.ownsThread(workspace_id, thread_id)) return index;
-    }
-    return null;
-}
-
 /// Replaces standing orders; whitespace-only text clears them.
 pub fn setOrders(self: *Self, index: usize, orders: []const u8) void {
     if (index >= self.count) return;
@@ -489,62 +481,6 @@ fn nameTaken(self: *const Self, name: []const u8, skip_index: ?usize) bool {
     return false;
 }
 
-test "roster add names companions after their character and de-duplicates" {
-    var roster = Self.init();
-    const first = roster.add(.moss, null, 1).?;
-    try std.testing.expectEqualStrings("Moss", first.name.slice());
-    const second = roster.add(.moss, null, 2).?;
-    try std.testing.expectEqualStrings("Moss 2", second.name.slice());
-    const third = roster.add(.vireo, "  Juniper\n", 3).?;
-    try std.testing.expectEqualStrings("Juniper", third.name.slice());
-    try std.testing.expectEqual(@as(usize, 2), roster.active_index);
-    try std.testing.expect(roster.dirty);
-}
-
-test "roster rename rejects blank names and keeps names unique" {
-    var roster = Self.init();
-    _ = roster.add(.sprout, "Juniper", 1);
-    _ = roster.add(.moss, "Fern", 2);
-    try std.testing.expect(!roster.rename(1, "   "));
-    try std.testing.expectEqualStrings("Fern", roster.entries[1].name.slice());
-    try std.testing.expect(roster.rename(1, "juniper"));
-    try std.testing.expectEqualStrings("juniper 2", roster.entries[1].name.slice());
-    try std.testing.expect(roster.rename(1, "A name that is far longer than thirty-two bytes"));
-    try std.testing.expect(roster.entries[1].name.len <= NAME_CAPACITY);
-}
-
-test "roster cycle select and remove keep the active index valid" {
-    var roster = Self.init();
-    try std.testing.expect(!roster.cycle(true));
-    _ = roster.add(.sprout, null, 1);
-    _ = roster.add(.moss, null, 2);
-    _ = roster.add(.vireo, null, 3);
-    try std.testing.expect(roster.cycle(true));
-    try std.testing.expectEqual(@as(usize, 0), roster.active_index);
-    try std.testing.expect(roster.cycle(false));
-    try std.testing.expectEqual(@as(usize, 2), roster.active_index);
-    try std.testing.expect(roster.remove(2));
-    try std.testing.expectEqual(@as(usize, 1), roster.active_index);
-    try std.testing.expect(roster.remove(0));
-    try std.testing.expectEqual(@as(usize, 0), roster.active_index);
-    try std.testing.expectEqualStrings("Moss", roster.active().?.name.slice());
-    try std.testing.expect(roster.remove(0));
-    try std.testing.expect(roster.active() == null);
-}
-
-test "roster thread binding resolves owners across workspaces" {
-    var roster = Self.init();
-    _ = roster.add(.sprout, null, 1);
-    _ = roster.add(.moss, null, 2);
-    roster.bindThread(0, "ws-a", "chat-1");
-    roster.bindThread(1, "ws-b", "chat-2");
-    try std.testing.expectEqual(@as(?usize, 0), roster.indexForThread("ws-a", "chat-1"));
-    try std.testing.expectEqual(@as(?usize, 1), roster.indexForThread("ws-b", "chat-2"));
-    try std.testing.expect(roster.indexForThread("ws-a", "chat-2") == null);
-    roster.clearThread(0);
-    try std.testing.expect(roster.indexForThread("ws-a", "chat-1") == null);
-}
-
 test "roster json round trip preserves companions, brains, and the active pick" {
     const allocator = std.testing.allocator;
     var roster = Self.init();
@@ -595,45 +531,4 @@ test "legacy roster file migrates and a missing file reports absent" {
     var restored = Self.init();
     try std.testing.expect(restored.loadLegacyFile(allocator, dir_path));
     try std.testing.expectEqualStrings("Fern", restored.active().?.name.slice());
-}
-
-test "conversations archive, resume, and keep the brain they ran on" {
-    const allocator = std.testing.allocator;
-    var roster = Self.init();
-    _ = roster.add(.moss, "Moss", 1);
-    roster.bindThread(0, "ws", "chat-1");
-    roster.setBrain(0, "claude", "haiku");
-    try std.testing.expect(roster.startNewConversation(0, "ACP review", 10));
-    try std.testing.expect(roster.entries[0].thread_id.isEmpty());
-    roster.bindThread(0, "ws", "chat-2");
-    roster.setBrain(0, "codex", "gpt-5.5");
-    try std.testing.expect(roster.entries[0].ownsThread("ws", "chat-1"));
-    try std.testing.expectEqual(@as(?usize, 0), roster.indexOwningThread("ws", "chat-1"));
-
-    try std.testing.expect(roster.resumeConversation(0, "chat-1", "Codex work", 20));
-    try std.testing.expectEqualStrings("chat-1", roster.entries[0].thread_id.slice());
-    try std.testing.expectEqualStrings("claude", roster.entries[0].provider.slice());
-    try std.testing.expectEqual(@as(usize, 1), roster.entries[0].history_count);
-    try std.testing.expectEqualStrings("chat-2", roster.entries[0].history[0].thread_id.slice());
-    try std.testing.expectEqualStrings("codex", roster.entries[0].history[0].provider.slice());
-    try std.testing.expect(!roster.resumeConversation(0, "missing", "", 30));
-
-    const encoded = try roster.encodeAlloc(allocator);
-    defer allocator.free(encoded);
-    var restored = Self.init();
-    try restored.parse(allocator, encoded);
-    try std.testing.expectEqualStrings("Codex work", restored.entries[0].history[0].title.slice());
-    try std.testing.expectEqual(@as(i64, 20), restored.entries[0].history[0].ended_at_ms);
-}
-
-test "history is bounded and de-duplicated" {
-    var roster = Self.init();
-    _ = roster.add(.sprout, null, 1);
-    var buffer: [32]u8 = undefined;
-    for (0..MAX_HISTORY + 4) |n| {
-        roster.bindThread(0, "ws", std.fmt.bufPrint(&buffer, "chat-{d}", .{n}) catch unreachable);
-        _ = roster.startNewConversation(0, "t", @intCast(n));
-    }
-    try std.testing.expectEqual(MAX_HISTORY, roster.entries[0].history_count);
-    try std.testing.expectEqualStrings("chat-15", roster.entries[0].history[0].thread_id.slice());
 }

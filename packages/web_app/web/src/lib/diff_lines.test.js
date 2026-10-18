@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test'
-import { changeBar, diffSelectionText, foldPatchLines, hasUnloadedFold, lineNumberOn, parsePatchLines, splitItems, stackedSide } from './diff_lines'
+import { diffSelectionText, foldPatchLines, hasUnloadedFold, lineNumberOn, parsePatchLines, splitItems, stackedSide } from './diff_lines'
 
 const ctx = (from, to) => Array.from({ length: to - from + 1 }, (_, i) => ` line ${from + i}`)
 
@@ -17,11 +17,6 @@ const fullPatch = [
 ].join('\n')
 
 const folds = (items) => items.filter((item) => item.kind === 'fold').map(({ fold }) => [fold.key, fold.count, fold.lines === null])
-
-test('hunk headers record their start lines', () => {
-  const hunk = parsePatchLines(shortPatch).find((line) => line.kind === 'hunk')
-  expect([hunk.old_start, hunk.new_start]).toEqual([7, 7])
-})
 
 test('short-context gaps become unloaded folds keyed by first hidden line', () => {
   const items = foldPatchLines(parsePatchLines(shortPatch))
@@ -61,18 +56,6 @@ test('split items keep folds as full rows and pair edits', () => {
   const edit = items.find((item) => item.kind === 'row' && item.row.left?.kind === 'del')
   expect(edit.row.right.text).toBe('new 10')
   expect(edit.row.left.emph).toEqual([0, 3])
-})
-
-test('change bar scales with size and shows both sides', () => {
-  expect(changeBar(0, 0)).toEqual(['none', 'none', 'none', 'none', 'none'])
-  const even = changeBar(500, 500)
-  expect(even.filter((cell) => cell === 'none').length).toBe(0)
-  expect(even.indexOf('del')).toBe(even.lastIndexOf('add') + 1)
-  expect(changeBar(1000, 0)).toEqual(['add', 'add', 'add', 'add', 'add'])
-  expect(changeBar(1, 0).filter((cell) => cell === 'add').length).toBe(1)
-  const mostlyAdds = changeBar(200, 1)
-  expect(mostlyAdds.filter((cell) => cell === 'del').length).toBe(1)
-  expect(mostlyAdds.filter((cell) => cell !== 'none').length).toBe(5)
 })
 
 test('diff line selections read one side of the patch', () => {

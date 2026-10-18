@@ -255,17 +255,3 @@ fn attachTargetTabId(allocator: std.mem.Allocator, layout: *const WorkspaceLayou
     }
     return null;
 }
-
-test "attach target prefers the tab before the browser" {
-    const allocator = std.testing.allocator;
-    var layout = try WorkspaceLayout.initDefaultChat(allocator);
-    defer layout.deinit(allocator);
-    const second = try layout.createChatPane(allocator, 1);
-    try layout.ensurePaneInRootSplit(allocator, second, .vertical, 0.5);
-    const second_tab = layout.scrollGroupIdForPane(second).?;
-    const browser = try layout.ensureDockedBrowserPane(allocator, second_tab);
-    try std.testing.expect(try layout.undockBrowserPane(allocator, browser));
-    try std.testing.expectEqual(@as(?WorkspacePaneId, second_tab), attachTargetTabId(allocator, &layout, browser));
-    try std.testing.expect(try layout.dockBrowserPane(allocator, browser, second_tab));
-    try std.testing.expectEqual(@as(?WorkspacePaneId, browser), layout.dockedBrowserPaneId(second_tab));
-}

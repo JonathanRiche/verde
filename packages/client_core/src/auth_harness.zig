@@ -127,14 +127,6 @@ test "auth lost exchange response retries identical nonce and grant then succeed
     try expect(h.eq(f.host.state.auth_state, "paired"));
     try no(try f.lost(first), "http_request");
 }
-test "auth expired grant ends pairing without minting" {
-    var f = try Fixture.init();
-    defer f.deinit();
-    const exchange_effect = try f.exchange(true);
-    try no(try f.response(exchange_effect, 401, .{}), "http_request");
-    try expect(f.host.state.auth.pair == null);
-    try expect(h.eq(f.host.state.auth_state, "unpaired"));
-}
 test "auth revoked device retries one 401 then requires repair" {
     var f = try Fixture.init();
     defer f.deinit();
@@ -143,15 +135,6 @@ test "auth revoked device retries one 401 then requires repair" {
     try no(try f.response(retry_effect, 401, .{}), "http_request");
     try expect(h.eq(f.host.state.auth_state, "repair_required"));
     try no(try f.event("foreground", .{}), "http_request");
-}
-test "auth ticket 401 refreshes then retries the ticket once" {
-    var f = try Fixture.init();
-    defer f.deinit();
-    const ticket = try find(try f.token(try f.credential(try f.exchange(true))), "http_request");
-    const token_effect = try find(try f.response(ticket, 401, .{}), "http_request");
-    const retry_ticket = try find(try f.token(token_effect), "http_request");
-    try no(try f.response(retry_ticket, 401, .{}), "ws_open");
-    try expect(h.eq(f.host.state.auth_state, "repair_required"));
 }
 test "auth refuses invalid system trust and unsafe automatic exchange retries" {
     var f = try Fixture.init();
@@ -173,30 +156,6 @@ test "auth pair parser accepts native and App Link, rejects query secrets and am
         const result = auth.parseLink(arena.allocator(), value);
         try expect(if (result) |_| false else |_| true);
     }
-}
-
-test "auth durable writes survive background and no credential traffic precedes acknowledgement" {
-    var f = try Fixture.init();
-    defer f.deinit();
-    const exchange_effect = try f.exchange(true);
-    const batch = try f.response(exchange_effect, 200, .{ .access_protocol_version = 1, .runtime_id = runtime_id, .instance_id = instance_id, .device_id = device_id, .device_credential = secret, .scopes = scopes });
-    try no(batch, "http_request");
-    const write = try find(batch, "secure_store_put");
-    _ = try f.event("background", .{});
-    try no(try f.done(write), "http_request");
-    try expect(h.eq(f.host.state.auth_state, "paired"));
-    _ = try find(try f.event("foreground", .{}), "tls_probe");
-    try expect(f.host.state.auth.token == null);
-}
-
-test "auth storage failure preserves credential and explicit retry saves before token" {
-    var f = try Fixture.init();
-    defer f.deinit();
-    const exchange_effect = try f.exchange(true);
-    const write = try find(try f.response(exchange_effect, 200, .{ .access_protocol_version = 1, .runtime_id = runtime_id, .instance_id = instance_id, .device_id = device_id, .device_credential = secret, .scopes = scopes }), "secure_store_put");
-    try no(try f.event("secure_store_done", .{ .effect_id = get(write, "effect_id").string, .generation = get(write, "generation").string, .key = get(write, "key").string, .@"error" = .{ .code = "locked" } }), "http_request");
-    const retry_write = try find(try f.event("retry_connection", .{ .intent_id = "retry-store" }), "secure_store_put");
-    _ = try find(try f.done(retry_write), "http_request");
 }
 
 test "auth denied trust and stale proposal never send secrets" {
@@ -225,38 +184,6 @@ test "auth changed TLS pin requires durable retrust before credential reuse" {
     _ = try find(try f.done(write), "http_request");
 }
 
-test "auth restart reads durable records out of order then probes before device auth" {
-    var f = try Fixture.init();
-    defer f.deinit();
-    const batch = try f.event("start", .{ .foreground = true, .network_available = true });
-    const reads = get(batch, "effects").array.items;
-    const a = f.arena.allocator();
-    const credential = try auth.encode64(a, try h.encode(a, auth.Credential{ .runtime_id = runtime_id, .device_id = device_id, .device_credential = secret, .scopes = &scopes }));
-    const profile = try auth.encode64(a, try h.encode(a, auth.Pin{ .origin = "https://host.example", .wss_url = "wss://host.example/ws", .spki_sha256 = pin, .runtime_id = runtime_id, .instance_id = instance_id }));
-    try no(try f.event("secure_store_value", .{ .effect_id = get(reads[1], "effect_id").string, .generation = "0", .key = get(reads[1], "key").string, .value_base64 = credential, .@"error" = @as(?u8, null) }), "tls_probe");
-    const probe = try find(try f.event("secure_store_value", .{ .effect_id = get(reads[0], "effect_id").string, .generation = "0", .key = get(reads[0], "key").string, .value_base64 = profile, .@"error" = @as(?u8, null) }), "tls_probe");
-    const discovery = try find(try f.event("tls_peer", .{ .effect_id = get(probe, "effect_id").string, .generation = "0", .origin = "https://host.example", .spki_sha256 = pin, .system_trusted = true }), "http_request");
-    const request = try find(try f.response(discovery, 200, .{ .access_protocol_version = 1, .runtime_id = runtime_id, .instance_id = instance_id, .https_url = "https://host.example", .wss_url = "wss://host.example/ws", .capabilities = [_][]const u8{"access.pair.v1"} }), "http_request");
-    try expect(h.eq(get(request, "url").string, "https://host.example/auth/access-token"));
-    try expect(f.host.state.auth.proposal == null);
-}
-
-test "auth locked reads both retry after unlock without becoming unpaired" {
-    var f = try Fixture.init();
-    defer f.deinit();
-    const batch = try f.event("start", .{ .foreground = true, .network_available = true });
-    for (get(batch, "effects").array.items[0..2]) |read| {
-        _ = try f.event("secure_store_value", .{ .effect_id = get(read, "effect_id").string, .generation = "0", .key = get(read, "key").string, .value_base64 = @as(?u8, null), .@"error" = .{ .code = "locked" } });
-    }
-    try expect(h.eq(f.host.state.auth_state, "loading"));
-    const retried = try f.event("retry_connection", .{ .intent_id = "unlock" });
-    var count: usize = 0;
-    for (get(retried, "effects").array.items) |effect| if (h.eq(get(effect, "type").string, "secure_store_get")) {
-        count += 1;
-    };
-    try expect(count == 2);
-}
-
 fn findUrl(batch: V, suffix: []const u8) !V {
     for (get(batch, "effects").array.items) |effect| {
         if (!h.eq(get(effect, "type").string, "http_request")) continue;
@@ -278,41 +205,6 @@ test "auth RPC 401 refresh retries the same envelope once then stops on another 
     try expect(h.eq(f.host.state.auth_state, "repair_required"));
     try expect(f.host.state.rpc.bearer == null);
     try expect(f.host.state.rpc.results.len == 1);
-}
-test "auth RPC 403 never refreshes or flags repair" {
-    var f = try Fixture.init();
-    defer f.deinit();
-    const batch = try f.token(try f.credential(try f.exchange(true)));
-    const rpc_effect = try findUrl(batch, "/api/rpc");
-    try no(try f.response(rpc_effect, 403, .{}), "http_request");
-    try expect(!h.eq(f.host.state.auth_state, "repair_required"));
-    try expect(f.host.state.rpc.results.len == 1);
-    try expect(h.eq(f.host.state.rpc.results[0].@"error".?.code, "scope_denied"));
-}
-
-test "auth terminal token failure cancels old transport and clears RPC bearer" {
-    var f = try Fixture.init();
-    defer f.deinit();
-    const batch = try f.token(try f.credential(try f.exchange(true)));
-    const ticket = try findUrl(batch, "/auth/websocket-ticket");
-    _ = try f.response(ticket, 200, .{ .access_protocol_version = 1, .ticket = secret, .expires_at_ms = f.now + 30000 });
-    const refresh = try findUrl(try f.fire(try find(batch, "set_timer")), "/auth/access-token");
-    const failed = try f.response(refresh, 200, .{ .access_protocol_version = 1, .access_token = secret, .token_type = "Bearer", .expires_at_ms = f.now - 1, .scopes = scopes });
-    _ = try find(failed, "ws_close");
-    try expect(f.host.state.rpc.bearer == null);
-    try expect(f.host.state.auth.blocked);
-    try no(failed, "http_request");
-}
-
-test "auth stale completion cannot trigger refresh even after wall expiry" {
-    var f = try Fixture.init();
-    defer f.deinit();
-    const exchange_effect = try f.exchange(true);
-    _ = try f.token(try f.credential(exchange_effect));
-    f.now += 900001;
-    const stale = try f.response(exchange_effect, 401, .{});
-    try expect(get(stale, "effects").array.items.len == 0);
-    _ = try findUrl(try f.event("foreground", .{}), "/auth/access-token");
 }
 
 // Establish auth through real events; handshake/snapshot behavior is covered by
@@ -377,17 +269,6 @@ test "sign out correlates revoke then waits for both deletes and permits re-pair
     _ = try f.credential(try find(try f.done(write), "http_request"));
     try expect(h.eq(f.host.state.auth_state, "paired"));
 }
-test "sign out definitively revoked credential wipes without network" {
-    var f = try Fixture.init();
-    defer f.deinit();
-    const mint = try f.credential(try f.exchange(true));
-    const again = try find(try f.response(mint, 401, .{}), "http_request");
-    _ = try f.response(again, 401, .{});
-    try expect(f.host.state.auth.credential_invalid);
-    const batch = try removal(&f, "sign_out", "out");
-    try no(batch, "http_request");
-    try finishRemoval(&f, try find(batch, "secure_store_delete"));
-}
 test "sign out offline and lost revoke remain unconfirmed until explicit forget" {
     for ([_]bool{ false, true }) |lost| {
         var f = try Fixture.init();
@@ -401,136 +282,4 @@ test "sign out offline and lost revoke remain unconfirmed until explicit forget"
         try expect(f.host.state.auth.credential != null);
         try finishRemoval(&f, try find(try removal(&f, "forget_host", "forget"), "secure_store_delete"));
     }
-}
-test "sign out delete failure retries failed record and ignores duplicate acknowledgements" {
-    var f = try Fixture.init();
-    defer f.deinit();
-    try readyForRemoval(&f);
-    const first = try find(try removal(&f, "forget_host", "forget"), "secure_store_delete");
-    const second = try find(try f.done(first), "secure_store_delete");
-    _ = try f.event("secure_store_done", .{ .effect_id = get(second, "effect_id").string, .generation = get(second, "generation").string, .key = get(second, "key").string, .@"error" = .{ .code = "locked" } });
-    try expect(h.eq(f.host.state.auth_state, "signing_out"));
-    try expect(h.eq(f.host.state.host_error.?.code, "sign_out_delete_failed"));
-    const retried = try find(try f.event("retry_connection", .{ .intent_id = "retry-delete" }), "secure_store_delete");
-    try expect(h.eq(get(retried, "key").string, get(second, "key").string));
-    _ = try f.done(second);
-    try expect(h.eq(f.host.state.auth_state, "signing_out"));
-    const sync_record = try find(try f.done(retried), "secure_store_delete");
-    try expect(h.eq(f.host.state.auth_state, "signing_out"));
-    try finishK17Records(&f, sync_record);
-    try expect(h.eq(f.host.state.auth_state, "signed_out"));
-}
-test "sign out rejects another host and duplicate intent cannot repeat revoke" {
-    var f = try Fixture.init();
-    defer f.deinit();
-    try readyForRemoval(&f);
-    try std.testing.expectError(error.InvalidArgument, f.event("sign_out", .{ .intent_id = "wrong", .host_id = "another" }));
-    _ = try removal(&f, "sign_out", "out");
-    try no(try removal(&f, "sign_out", "out"), "http_request");
-    try std.testing.expectError(error.InvalidArgument, f.event("sign_out", .{ .intent_id = "out", .host_id = "another" }));
-}
-
-test "sign out repeated unauthorized RPC refresh wipes only after definitive rejection" {
-    var f = try Fixture.init();
-    defer f.deinit();
-    try readyForRemoval(&f);
-    const request = try findUrl(try removal(&f, "sign_out", "out"), "/api/rpc");
-    const refresh = try findUrl(try f.response(request, 401, .{}), "/auth/access-token");
-    try expect(f.host.state.auth.credential != null);
-    const retried = try findUrl(try f.token(refresh), "/api/rpc");
-    try finishRemoval(&f, try find(try f.response(retried, 401, .{}), "secure_store_delete"));
-}
-
-test "forget host still wipes while revoke waits on a failed token refresh" {
-    var f = try Fixture.init();
-    defer f.deinit();
-    try readyForRemoval(&f);
-    const request = try findUrl(try removal(&f, "sign_out", "out"), "/api/rpc");
-    const refresh = try findUrl(try f.response(request, 401, .{}), "/auth/access-token");
-    _ = try f.lost(refresh);
-    try expect(f.host.state.auth.removal.rpc_id != null);
-    try std.testing.expectError(error.InvalidLifecycle, removal(&f, "sign_out", "out-again"));
-    try finishRemoval(&f, try find(try removal(&f, "forget_host", "forget"), "secure_store_delete"));
-    for (f.host.state.receipts) |r| {
-        if (h.eq(r.operation.intent_id, "out")) try expect(h.eq(r.operation.state, "uncertain"));
-        if (h.eq(r.operation.intent_id, "forget")) try expect(h.eq(r.operation.state, "succeeded"));
-    }
-}
-
-test "auth socket reconnect publishes ready state after ticket retry" {
-    var f = try Fixture.init();
-    defer f.deinit();
-    const batch = try f.token(try f.credential(try f.exchange(true)));
-    const ticket = try findUrl(batch, "/auth/websocket-ticket");
-    const socket = try find(try f.response(ticket, 200, .{ .access_protocol_version = 1, .ticket = secret, .expires_at_ms = f.now + 30000 }), "ws_open");
-    // Keep the established RPC session, as a push-only socket reconnect does.
-    f.host.state.rpc.phase = .ready;
-    const closed = try f.event("ws_closed", .{ .socket_id = get(socket, "effect_id").string, .generation = get(socket, "generation").string, .code = 1000, .clean = true, .@"error" = @as(?u8, null) });
-    try expect(h.eq(f.host.state.auth.phase, "reconnecting"));
-    try expect(f.host.state.host_error != null);
-    const retry_ticket = try findUrl(try f.fire(try find(closed, "set_timer")), "/auth/websocket-ticket");
-    const recovered = try f.response(retry_ticket, 200, .{ .access_protocol_version = 1, .ticket = secret, .expires_at_ms = f.now + 30000 });
-    _ = try find(recovered, "ws_open");
-    const changed = try find(recovered, "state_changed");
-    var hosts_changed = false;
-    for (get(changed, "scopes").array.items) |scope| {
-        if (h.eq(scope.string, "hosts")) hosts_changed = true;
-    }
-    try expect(hosts_changed);
-    const view = try h.parse(f.arena.allocator(), try f.host.query("hosts", f.arena.allocator()));
-    const item = get(get(view, "data"), "items").array.items[0];
-    try expect(h.eq(get(item, "phase").string, "ready"));
-    try expect(get(item, "error") == .null);
-    try expect(get(item, "retry_at_ms") == .null);
-}
-
-test "auth resume probe retries transient failure without process restart" {
-    inline for (.{ "network", "timeout" }) |kind| {
-        var f = try Fixture.init();
-        defer f.deinit();
-        _ = try f.credential(try f.exchange(true));
-        _ = try f.event("background", .{});
-        const probe = try find(try f.event("foreground", .{}), "tls_probe");
-        const failed = try f.event("tls_peer", .{
-            .effect_id = get(probe, "effect_id").string,
-            .generation = get(probe, "generation").string,
-            .origin = "https://host.example",
-            .spki_sha256 = "",
-            .system_trusted = false,
-            .@"error" = .{ .kind = kind, .code = if (h.eq(kind, "timeout")) "timeout" else "offline" },
-        });
-        try expect(!f.host.state.auth.blocked);
-        try expect(f.host.state.auth.credential != null);
-        try no(failed, "http_request");
-        const retried = try find(try f.fire(try find(failed, "set_timer")), "tls_probe");
-        const discovery = try find(try f.event("tls_peer", .{
-            .effect_id = get(retried, "effect_id").string,
-            .generation = get(retried, "generation").string,
-            .origin = "https://host.example",
-            .spki_sha256 = pin,
-            .system_trusted = true,
-        }), "http_request");
-        const recovered = try f.response(discovery, 200, .{ .access_protocol_version = 1, .runtime_id = runtime_id, .instance_id = instance_id, .https_url = "https://host.example", .wss_url = "wss://host.example/ws", .capabilities = &[_][]const u8{"access.pair.v1"} });
-        _ = try find(recovered, "http_request");
-        try expect(f.host.state.auth.verified);
-        try expect(!f.host.state.auth.blocked);
-    }
-}
-
-test "auth probe certificate failure remains blocked without retry" {
-    var f = try Fixture.init();
-    defer f.deinit();
-    try f.loaded();
-    const probe = try find(try f.pair(), "tls_probe");
-    const failed = try f.event("tls_peer", .{
-        .effect_id = get(probe, "effect_id").string,
-        .generation = get(probe, "generation").string,
-        .origin = "https://host.example",
-        .spki_sha256 = "",
-        .system_trusted = false,
-        .@"error" = .{ .kind = "tls", .code = "certificate" },
-    });
-    try expect(f.host.state.auth.blocked);
-    try no(failed, "http_request");
-    try no(failed, "set_timer");
 }

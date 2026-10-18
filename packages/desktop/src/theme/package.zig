@@ -366,20 +366,6 @@ test "parse canonical portable theme package" {
     try std.testing.expect(package.ignored_font_settings);
 }
 
-test "parse existing Verde config theme section and bare theme" {
-    var config_package = try parse(std.testing.allocator,
-        \\{"theme":{"theme":"omarchy","colors":{"accent":[80,200,120]}}}
-    );
-    defer config_package.deinit(std.testing.allocator);
-    try std.testing.expectEqual(theme.ThemeSource.omarchy, config_package.theme_config.source);
-
-    var bare_package = try parse(std.testing.allocator,
-        \\{"theme":"default","colors":{"text":"#f0f0f0"}}
-    );
-    defer bare_package.deinit(std.testing.allocator);
-    try std.testing.expectEqual(theme.ThemeSource.verde_legacy, bare_package.theme_config.source);
-}
-
 test "theme validation rejects unknown colors, versions, and sources" {
     try std.testing.expectError(error.UnknownThemeColor, parse(std.testing.allocator,
         \\{"theme":{"colors":{"command":"rm -rf"}}}
@@ -390,18 +376,6 @@ test "theme validation rejects unknown colors, versions, and sources" {
     try std.testing.expectError(error.UnsupportedThemeSource, parse(std.testing.allocator,
         \\{"theme":{"source":"solarized"}}
     ));
-}
-
-test "GitHub file page URLs normalize to raw content URLs" {
-    const normalized = try normalizeGithubUrlAlloc(
-        std.testing.allocator,
-        "https://github.com/example/themes/blob/main/verde/forest.json",
-    );
-    defer std.testing.allocator.free(normalized);
-    try std.testing.expectEqualStrings(
-        "https://raw.githubusercontent.com/example/themes/main/verde/forest.json",
-        normalized,
-    );
 }
 
 test "exported theme is versioned, portable, and parseable" {

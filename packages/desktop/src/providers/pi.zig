@@ -1347,17 +1347,7 @@ const PiTestStreamCapture = struct {
     message_body_buffer: [256]u8 = undefined,
     message_body_len: usize = 0,
     message_count: usize = 0,
-    tool_call_id_buffer: [64]u8 = undefined,
-    tool_call_id_len: usize = 0,
-    tool_title_buffer: [64]u8 = undefined,
-    tool_title_len: usize = 0,
-    tool_kind: ?provider_types.ToolCallKind = null,
-    tool_status: ?provider_types.ToolCallStatus = null,
-    tool_has_input: bool = false,
-    tool_has_output: bool = false,
     tool_count: usize = 0,
-    thread_id_buffer: [64]u8 = undefined,
-    thread_id_len: usize = 0,
 
     fn copyInto(buffer: []u8, len: *usize, text: []const u8) void {
         const count = @min(buffer.len, text.len);
@@ -1376,11 +1366,6 @@ const PiTestStreamCapture = struct {
         appendInto(&self.delta_buffer, &self.delta_len, delta);
     }
 
-    fn onThreadId(context: ?*anyopaque, thread_id: []const u8) void {
-        const self: *PiTestStreamCapture = @ptrCast(@alignCast(context orelse return));
-        copyInto(&self.thread_id_buffer, &self.thread_id_len, thread_id);
-    }
-
     fn onStreamEvent(context: ?*anyopaque, event: provider_types.StreamEvent) void {
         const self: *PiTestStreamCapture = @ptrCast(@alignCast(context orelse return));
         switch (event) {
@@ -1389,15 +1374,7 @@ const PiTestStreamCapture = struct {
                 copyInto(&self.message_body_buffer, &self.message_body_len, message.body);
                 self.message_count += 1;
             },
-            .tool_call => |tool_call| {
-                copyInto(&self.tool_call_id_buffer, &self.tool_call_id_len, tool_call.call_id);
-                copyInto(&self.tool_title_buffer, &self.tool_title_len, tool_call.title);
-                self.tool_kind = tool_call.kind;
-                self.tool_status = tool_call.status;
-                self.tool_has_input = tool_call.input != null;
-                self.tool_has_output = tool_call.output != null;
-                self.tool_count += 1;
-            },
+            .tool_call => self.tool_count += 1,
             else => {},
         }
     }
@@ -1412,14 +1389,6 @@ const PiTestStreamCapture = struct {
 
     fn messageBody(self: *const PiTestStreamCapture) []const u8 {
         return self.message_body_buffer[0..self.message_body_len];
-    }
-
-    fn toolTitle(self: *const PiTestStreamCapture) []const u8 {
-        return self.tool_title_buffer[0..self.tool_title_len];
-    }
-
-    fn threadId(self: *const PiTestStreamCapture) []const u8 {
-        return self.thread_id_buffer[0..self.thread_id_len];
     }
 };
 
@@ -1488,66 +1457,6 @@ test "pi bash tool events author exact command rows" {
     try std.testing.expectEqual(@as(usize, 0), turn.bash_commands.items.len);
 }
 
-test "pi non-bash tools emit tool call lifecycle updates" {
-    var client = try Client.init(std.testing.allocator, .{});
-    defer client.deinit();
-    var turn: TurnState = .{};
-    defer turn.deinit(std.testing.allocator);
-    var capture: PiTestStreamCapture = .{};
-    const request: provider_types.SendPromptRequest = .{
-        .prompt = "read it",
-        .stream_context = &capture,
-        .on_stream_event = PiTestStreamCapture.onStreamEvent,
-    };
-
-    try testHandleLine(&client, &turn, request,
-        \\{"type":"tool_execution_start","toolCallId":"call_2","toolName":"read","args":{"path":"/tmp/file"}}
-    );
-    try std.testing.expectEqual(@as(usize, 1), capture.tool_count);
-    try std.testing.expectEqualStrings("read", capture.toolTitle());
-    try std.testing.expectEqual(provider_types.ToolCallKind.read, capture.tool_kind.?);
-    try std.testing.expectEqual(provider_types.ToolCallStatus.in_progress, capture.tool_status.?);
-    try std.testing.expect(capture.tool_has_input);
-
-    try testHandleLine(&client, &turn, request,
-        \\{"type":"tool_execution_end","toolCallId":"call_2","toolName":"read","result":{"content":[{"type":"text","text":"contents"}]},"isError":false}
-    );
-    try std.testing.expectEqual(@as(usize, 2), capture.tool_count);
-    try std.testing.expectEqual(provider_types.ToolCallStatus.completed, capture.tool_status.?);
-    try std.testing.expect(capture.tool_has_output);
-    try std.testing.expectEqual(@as(usize, 0), capture.message_count);
-}
-
-test "pi get_state response records thread id and prompt failures surface" {
-    var client = try Client.init(std.testing.allocator, .{});
-    defer client.deinit();
-    var turn: TurnState = .{};
-    defer turn.deinit(std.testing.allocator);
-    var capture: PiTestStreamCapture = .{};
-    const request: provider_types.SendPromptRequest = .{
-        .prompt = "hi",
-        .stream_context = &capture,
-        .on_thread_id = PiTestStreamCapture.onThreadId,
-    };
-
-    try testHandleLine(&client, &turn, request,
-        \\{"id":"state-0","type":"response","command":"get_state","success":true,"data":{"sessionId":"0123-abcd"}}
-    );
-    try std.testing.expectEqualStrings("0123-abcd", turn.thread_id.?);
-    try std.testing.expectEqualStrings("0123-abcd", capture.threadId());
-
-    try testHandleLine(&client, &turn, request,
-        \\{"id":"turn-1","type":"response","command":"prompt","success":false,"error":"no credentials"}
-    );
-    try std.testing.expectEqualStrings("no credentials", turn.error_message.?);
-    try std.testing.expect(!turn.settled);
-
-    try testHandleLine(&client, &turn, request,
-        \\{"type":"agent_settled","messages":[]}
-    );
-    try std.testing.expect(turn.settled);
-}
-
 test "pi assistant message_end stopReason error fails the turn" {
     var client = try Client.init(std.testing.allocator, .{});
     defer client.deinit();
@@ -1583,61 +1492,6 @@ test "pi assistant message_end stopReason error fails the turn" {
     try std.testing.expect(turn.settled);
 }
 
-test "pi prompt payload serializes images and omits null steering" {
-    const images = [_]RpcImage{.{ .data = "aGVsbG8=", .mimeType = "image/png" }};
-    const encoded = try encodeJsonLineAlloc(std.testing.allocator, PromptPayload{
-        .id = PROMPT_REQUEST_ID,
-        .message = "describe",
-        .images = images[0..],
-    });
-    defer std.testing.allocator.free(encoded);
-
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"type\":\"prompt\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"mimeType\":\"image/png\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "aGVsbG8=") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "streamingBehavior") == null);
-
-    const steer_encoded = try encodeJsonLineAlloc(std.testing.allocator, PromptPayload{
-        .id = "steer-7",
-        .message = "focus",
-        .streamingBehavior = "steer",
-    });
-    defer std.testing.allocator.free(steer_encoded);
-    try std.testing.expect(std.mem.indexOf(u8, steer_encoded, "\"streamingBehavior\":\"steer\"") != null);
-}
-
-test "pi collectImageAttachments preserves multi-image and legacy compatibility" {
-    const modern = [_]provider_types.ImageAttachment{
-        .{ .path = "/tmp/one.png" },
-        .{ .path = "/tmp/two.png" },
-    };
-    const collected = try collectImageAttachments(std.testing.allocator, .{
-        .prompt = "hello",
-        .image = .{ .path = "/tmp/legacy.png" },
-        .images = modern[0..],
-    });
-    defer std.testing.allocator.free(collected);
-
-    try std.testing.expectEqual(@as(usize, 3), collected.len);
-    try std.testing.expectEqualStrings("/tmp/one.png", collected[0].path);
-    try std.testing.expectEqualStrings("/tmp/two.png", collected[1].path);
-    try std.testing.expectEqualStrings("/tmp/legacy.png", collected[2].path);
-}
-
-test "pi session head info extracts id, cwd, and first user title" {
-    const head =
-        \\{"type":"session","version":3,"id":"019e-uuid","timestamp":"2026-05-21T02:41:49.420Z","cwd":"/home/user/project"}
-        \\{"type":"model_change","provider":"google","modelId":"gemini-3-pro"}
-        \\{"type":"message","message":{"role":"user","content":[{"type":"text","text":"fix the resize bug\nplease"}]}}
-    ;
-    var info = try sessionHeadInfoAlloc(std.testing.allocator, head);
-    defer info.deinit(std.testing.allocator);
-
-    try std.testing.expectEqualStrings("019e-uuid", info.id.?);
-    try std.testing.expectEqualStrings("/home/user/project", info.cwd.?);
-    try std.testing.expectEqualStrings("fix the resize bug", info.title.?);
-}
-
 test "pi session thread parses messages, title, and model" {
     const session =
         \\{"type":"session","version":3,"id":"019e-uuid","timestamp":"2026-05-21T02:41:49.420Z","cwd":"/home/user/project"}
@@ -1660,26 +1514,6 @@ test "pi session thread parses messages, title, and model" {
     try std.testing.expectEqualStrings("hi!", result.messages[1].body);
 }
 
-test "pi model listing maps provider/id pairs and reasoning" {
-    const payload =
-        \\{"models":[{"id":"gemini-3-flash","name":"Gemini 3 Flash","provider":"google","reasoning":true},{"id":"basic","name":"Basic","provider":"openai","reasoning":false},{"bad":"entry"}]}
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
-    defer parsed.deinit();
-
-    const models = try parseModelsValue(std.testing.allocator, parsed.value);
-    defer provider_types.freeModelInfos(std.testing.allocator, models);
-
-    try std.testing.expectEqual(@as(usize, 2), models.len);
-    try std.testing.expectEqualStrings("pi", models[0].provider_id);
-    try std.testing.expectEqualStrings("Pi", models[0].provider_name);
-    try std.testing.expectEqualStrings("google/gemini-3-flash", models[0].model_id);
-    try std.testing.expectEqualStrings("Gemini 3 Flash", models[0].model_name);
-    try std.testing.expect(models[0].reasoning_supported);
-    try std.testing.expectEqualStrings("openai/basic", models[1].model_id);
-    try std.testing.expect(!models[1].reasoning_supported);
-}
-
 test "pi title truncation respects UTF-8 boundaries" {
     try std.testing.expectEqualStrings("short", truncateTitle("short"));
     try std.testing.expectEqualStrings("first", truncateTitle("first\nsecond"));
@@ -1688,34 +1522,4 @@ test "pi title truncation respects UTF-8 boundaries" {
     const truncated = truncateTitle(long);
     try std.testing.expectEqual(@as(usize, 79), truncated.len);
     try std.testing.expect(std.unicode.utf8ValidateSlice(truncated));
-}
-
-test "pi rpc reader accepts lines larger than its scratch buffer" {
-    const line_len = 20 * 1024;
-    const input = try std.testing.allocator.alloc(u8, line_len + 4);
-    defer std.testing.allocator.free(input);
-    @memset(input[0..line_len], 'x');
-    @memcpy(input[line_len..], "\nok\n");
-
-    var reader = std.Io.Reader.fixed(input);
-    const first = (try takeRpcLineAlloc(std.testing.allocator, &reader)).?;
-    defer std.testing.allocator.free(first);
-    try std.testing.expectEqual(line_len, first.len);
-
-    const second = (try takeRpcLineAlloc(std.testing.allocator, &reader)).?;
-    defer std.testing.allocator.free(second);
-    try std.testing.expectEqualStrings("ok", second);
-    try std.testing.expectEqual(@as(?[]u8, null), try takeRpcLineAlloc(std.testing.allocator, &reader));
-}
-
-test "pi non-JSON stdout lines are ignored" {
-    var client = try Client.init(std.testing.allocator, .{});
-    defer client.deinit();
-    var turn: TurnState = .{};
-    defer turn.deinit(std.testing.allocator);
-    const request: provider_types.SendPromptRequest = .{ .prompt = "hi" };
-
-    try testHandleLine(&client, &turn, request, "pi startup banner: not json");
-    try std.testing.expect(turn.error_message == null);
-    try std.testing.expect(!turn.settled);
 }

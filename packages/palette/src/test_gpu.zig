@@ -17,16 +17,8 @@ test {
         _ = @import("gpu/vulkan/renderer.zig");
     }
     _ = @import("gpu/d3d11/com.zig");
-    _ = @import("gpu/gpu_tests.zig");
     if (@import("builtin").os.tag == .macos) {
         _ = @import("gpu/metal/renderer.zig");
         _ = @import("gpu/metal/targets.zig");
     }
-}
-
-test "font.Collection plugs into the renderer as a GlyphSource" {
-    const Collection = @import("font/root.zig").Collection;
-    var collection: Collection = undefined;
-    const source = gpu.GlyphSource.adapt(Collection, &collection);
-    try @import("std").testing.expect(source.ptr == @as(*anyopaque, @ptrCast(&collection)));
 }

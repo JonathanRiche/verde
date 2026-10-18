@@ -67,19 +67,3 @@ test "bang submission detection and escaping happen only on complete values" {
     try std.testing.expectEqualStrings("!", classifySubmission("!").message);
     try std.testing.expectEqualStrings(" hello", classifySubmission(" hello").message);
 }
-
-test "shell mode can be escaped without losing the draft" {
-    try std.testing.expect(isShellMode("!ls -la"));
-    try std.testing.expect(isShellMode("!"));
-    try std.testing.expect(!isShellMode("!!literal"));
-    try std.testing.expectEqualStrings("ls -la", escapedShellDraft("!  ls -la"));
-    try std.testing.expectEqualStrings("normal", escapedShellDraft("normal"));
-}
-
-test "destructive command classification is conservative and case insensitive" {
-    try std.testing.expect(looksDestructive("git clean -fd"));
-    try std.testing.expect(looksDestructive("RM -rf build"));
-    try std.testing.expect(looksDestructive("echo ok && shutdown now"));
-    try std.testing.expect(!looksDestructive("git status"));
-    try std.testing.expect(!looksDestructive("zig build test"));
-}

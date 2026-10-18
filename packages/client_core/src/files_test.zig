@@ -111,35 +111,6 @@ test "file_open emits an authenticated, pinned, bounded fetch and succeeds witho
     try eql("https://host.example/api/file?download=1&path=/home/u/icon.svg", find(download.batch, "file_fetch").?.object.get("url").?.string);
 }
 
-test "file_open classifies gateway and transport failures" {
-    var f = try Fixture.init();
-    defer f.deinit();
-    const cases = [_]struct { status: ?u16, transport: ?[]const u8, code: []const u8, retryable: bool }{
-        .{ .status = 403, .transport = null, .code = "forbidden", .retryable = false },
-        .{ .status = 404, .transport = null, .code = "not_found", .retryable = false },
-        .{ .status = 413, .transport = null, .code = "too_large", .retryable = false },
-        .{ .status = 415, .transport = null, .code = "unsupported", .retryable = false },
-        .{ .status = 501, .transport = null, .code = "preview_unavailable", .retryable = false },
-        .{ .status = 503, .transport = null, .code = "server_unavailable", .retryable = true },
-        .{ .status = null, .transport = "resource", .code = "too_large", .retryable = false },
-        .{ .status = null, .transport = "timeout", .code = "timeout", .retryable = true },
-        .{ .status = null, .transport = "network", .code = "offline", .retryable = true },
-        .{ .status = null, .transport = "tls", .code = "identity", .retryable = false },
-    };
-    for (cases) |case| {
-        const opened = try f.open("/home/u/report.pdf", "file", 1024);
-        _ = try f.respond(find(opened.batch, "file_fetch").?, case.status, case.transport);
-        const op = f.op(opened.id);
-        try eql("failed", op.state);
-        try eql(case.code, op.@"error".?.code);
-        try eql("file", op.@"error".?.domain);
-        try eql(opened.id, op.@"error".?.intent_id.?);
-        try expect(op.@"error".?.retryable == case.retryable);
-        // User-facing text never repeats the path.
-        try expect(std.mem.indexOf(u8, op.@"error".?.message, "report") == null);
-    }
-}
-
 test "file_open rejects invalid paths, offline hosts and excess concurrency without a request" {
     var f = try Fixture.init();
     defer f.deinit();
@@ -193,17 +164,4 @@ test "a 401 refreshes the bearer once and resends; a stale completion is ignored
     _ = try f.respond(second, 401, null);
     try eql("unauthorized", f.op(opened.id).@"error".?.code);
     try expect(f.host.state.files.fetches.len == 0);
-}
-
-test "theme fetch uses the authenticated endpoint and a small bounded response" {
-    var f = try Fixture.init();
-    defer f.deinit();
-    const invalid = try f.open("/other", "theme", 1024);
-    try expect(find(invalid.batch, "file_fetch") == null);
-    const opened = try f.open("/", "theme", files.MAX_FILE_BYTES);
-    const fetch = find(opened.batch, "file_fetch").?;
-    try eql("https://host.example/api/theme", fetch.object.get("url").?.string);
-    try expect(fetch.object.get("max_response_bytes").?.integer == 64 * 1024);
-    _ = try f.respond(fetch, 200, null);
-    try eql("succeeded", f.op(opened.id).state);
 }

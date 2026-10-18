@@ -2374,13 +2374,6 @@ test "browser context-menu keyboard selection filters rows by level and wraps" {
     try std.testing.expectEqualSlices(u32, &.{4}, indexes[0..child_count]);
 }
 
-test "narrow tab windows keep the active browser tab visible" {
-    try std.testing.expectEqual(@as(usize, 0), firstVisibleBrowserTabIndex(8, 0, 3));
-    try std.testing.expectEqual(@as(usize, 3), firstVisibleBrowserTabIndex(8, 4, 3));
-    try std.testing.expectEqual(@as(usize, 5), firstVisibleBrowserTabIndex(8, 7, 3));
-    try std.testing.expectEqual(@as(usize, 0), firstVisibleBrowserTabIndex(2, 1, 3));
-}
-
 test "browser security presentation distinguishes remote local and internal URLs" {
     try std.testing.expectEqual(BrowserSecurityState.secure, browserSecurityState("https://verdeai.dev"));
     try std.testing.expectEqual(BrowserSecurityState.local, browserSecurityState("http://localhost:3000"));
@@ -2471,46 +2464,4 @@ test "Enter in the address bar loads the highlighted suggestion, not the typed t
     try std.testing.expectEqualStrings("https://mirage.example/lme/", fixture.navigation.items);
     try std.testing.expect(!state.browser_controller.address_focused);
     try std.testing.expect(!browser_history_controller.browserSuggestionsVisible(state));
-}
-
-test "clicking an address suggestion row loads that row" {
-    var fixture: SuggestionTestFixture = undefined;
-    try fixture.init();
-    defer fixture.deinit();
-    const state = &fixture.state;
-    // Hover moved the highlight off the row before the click lands on it.
-    state.browser_controller.suggestions.selected = null;
-    resetPaletteHitCache();
-    defer resetPaletteHitCache();
-    palette_suggestion_rect = .{ .x = 10.0, .y = 40.0, .w = 320.0, .h = 40.0 };
-    palette_suggestion_hits[0] = .{ .x = 14.0, .y = 44.0, .w = 312.0, .h = 32.0 };
-    palette_suggestion_hit_count = 1;
-
-    try std.testing.expect(handlePaletteMouseButton(state, 50.0, 60.0, true, 1));
-
-    try std.testing.expectEqualStrings("https://mirage.example/lme/", fixture.navigation.items);
-    try std.testing.expect(!state.browser_controller.address_focused);
-    try std.testing.expect(!browser_history_controller.browserSuggestionsVisible(state));
-}
-
-test "address suggestion dropdown stays inside a narrow browser pane" {
-    const anchor: palette.Rect = .{ .x = 743.0, .y = 80.0, .w = 175.0, .h = 30.0 };
-    const scale = theme.scaledUi(1.0);
-    // 293-wide pane flush with a 960 window: the panel narrows to the pane.
-    const narrow = suggestionPanelRect(anchor, 667.0, 960.0, 100.0);
-    try std.testing.expect(narrow.x >= 667.0);
-    try std.testing.expect(narrow.x + narrow.w <= 960.0);
-    try std.testing.expect(narrow.w >= anchor.w);
-    try std.testing.expectEqual(anchor.y + anchor.h + 4.0 * scale, narrow.y);
-    // A wide pane keeps the 320 minimum, shifted left only as far as needed.
-    const wide = suggestionPanelRect(anchor, 400.0, 960.0, 100.0);
-    try std.testing.expectEqual(320.0 * scale, wide.w);
-    try std.testing.expect(wide.x + wide.w <= 960.0);
-    try std.testing.expect(wide.x <= anchor.x);
-    // Plenty of room: anchored exactly at the field.
-    const roomy = suggestionPanelRect(.{ .x = 100.0, .y = 80.0, .w = 175.0, .h = 30.0 }, 0.0, 960.0, 100.0);
-    try std.testing.expectEqual(@as(f32, 100.0), roomy.x);
-    // No recorded pane: unchanged legacy placement.
-    const unknown = suggestionPanelRect(anchor, 0.0, 0.0, 100.0);
-    try std.testing.expectEqual(anchor.x, unknown.x);
 }

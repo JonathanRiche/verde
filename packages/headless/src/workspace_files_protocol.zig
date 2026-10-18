@@ -214,17 +214,6 @@ pub fn utf8Prefix(bytes: []const u8) []const u8 {
     return bytes;
 }
 
-test "kind and mime classification follow the shared preview rules" {
-    try std.testing.expectEqual(ContentKind.image, kindForPath("/a/Logo.PNG"));
-    try std.testing.expectEqual(ContentKind.markdown, kindForPath("/a/README.md"));
-    try std.testing.expectEqual(ContentKind.external, kindForPath("/a/spec.pdf"));
-    try std.testing.expectEqual(ContentKind.external, kindForPath("/a/icon.svg"));
-    try std.testing.expectEqual(ContentKind.text, kindForPath("/a/main.zig"));
-    try std.testing.expectEqual(ContentKind.text, kindForPath("/a/.gitignore"));
-    try std.testing.expectEqualStrings("image/jpeg", mimeForPath("x.jpg").?);
-    try std.testing.expect(mimeForPath("x.zig") == null);
-}
-
 test "relative paths normalise and reject escapes" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();

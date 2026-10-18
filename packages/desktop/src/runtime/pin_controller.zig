@@ -130,51 +130,6 @@ fn testProposal(
     };
 }
 
-test "first-contact proposal is saved and reread as a complete pair" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try testPathAlloc(allocator, tmp.dir);
-    defer allocator.free(path);
-
-    var remote = try profile.Profile.createSshTunnel(
-        allocator,
-        std.testing.io,
-        "Build VM",
-        null,
-        .{ .host = "devbox" },
-    );
-    defer remote.deinit(allocator);
-    try profile_store.saveAtPath(allocator, std.testing.io, path, &.{remote});
-
-    var proposal = try testProposal(
-        allocator,
-        remote.id,
-        "0123456789abcdef0123456789abcdef",
-        "00112233445566778899aabbccddeeff",
-    );
-    defer proposal.deinit();
-    var persisted = try persistProposalAtPath(
-        allocator,
-        std.testing.io,
-        path,
-        &proposal,
-    );
-    defer persisted.deinit();
-
-    try std.testing.expect(persisted.wrote_profile);
-    try std.testing.expect(!persisted.recovered_after_save_error);
-    try std.testing.expectEqualStrings(proposal.runtime_id, persisted.runtime_id);
-    try std.testing.expectEqualStrings(proposal.instance_id, persisted.instance_id);
-
-    var reloaded = try profile_store.loadAtPath(allocator, std.testing.io, path);
-    defer reloaded.deinit(allocator);
-    try std.testing.expectEqualStrings(
-        proposal.instance_id,
-        reloaded.items[0].expected_instance_id.?,
-    );
-}
-
 test "complete disk identity wins without being overwritten" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

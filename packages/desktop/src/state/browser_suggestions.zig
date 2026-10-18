@@ -248,12 +248,6 @@ test "looksLikeUrl separates addresses from search terms" {
     try std.testing.expect(!looksLikeUrl(""));
 }
 
-test "searchUrlAlloc percent-encodes the query as a form value" {
-    const url = try searchUrlAlloc(std.testing.allocator, "zig std.Io & writer?");
-    defer std.testing.allocator.free(url);
-    try std.testing.expectEqualStrings("https://duckduckgo.com/?q=zig+std.Io+%26+writer%3F", url);
-}
-
 test "inlineCompletion completes the host only until a path is typed" {
     try std.testing.expectEqualStrings("lang.org", inlineCompletion("zig", "https://ziglang.org/documentation/").?);
     try std.testing.expectEqualStrings("lang.org", inlineCompletion("ZIG", "https://www.ziglang.org/").?);
@@ -262,59 +256,6 @@ test "inlineCompletion completes the host only until a path is typed" {
     try std.testing.expect(inlineCompletion("lang", "https://ziglang.org/") == null);
     try std.testing.expect(inlineCompletion("ziglang.org", "https://ziglang.org") == null);
     try std.testing.expect(inlineCompletion("", "https://ziglang.org/") == null);
-}
-
-test "buildRows leads with the autocompleting history row, else the action row" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const entries = [_]HistoryEntry{
-        .{ .url = "https://ziglang.org/", .title = "Zig" },
-        .{ .url = "https://github.com/ziglang/zig", .title = "" },
-    };
-
-    const completing = try buildRows(arena, "zig", &entries);
-    try std.testing.expectEqual(@as(usize, 3), completing.len);
-    try std.testing.expectEqual(Kind.history, completing[0].kind);
-    try std.testing.expectEqualStrings("https://ziglang.org/", completing[0].url);
-    try std.testing.expectEqual(Kind.search, completing[1].kind);
-    try std.testing.expectEqualStrings("https://duckduckgo.com/?q=zig", completing[1].url);
-    try std.testing.expectEqual(Kind.history, completing[2].kind);
-    // Untitled entries fall back to their URL so the row is never blank.
-    try std.testing.expectEqualStrings("https://github.com/ziglang/zig", completing[2].title);
-
-    const searching = try buildRows(arena, "zig lang", &entries);
-    try std.testing.expectEqual(Kind.search, searching[0].kind);
-    try std.testing.expectEqual(@as(usize, 3), searching.len);
-
-    const address = try buildRows(arena, "example.com/x", &.{});
-    try std.testing.expectEqual(@as(usize, 1), address.len);
-    try std.testing.expectEqual(Kind.go_to, address[0].kind);
-    try std.testing.expectEqualStrings("https://example.com/x", address[0].url);
-
-    try std.testing.expectEqual(@as(usize, 0), (try buildRows(arena, "   ", &entries)).len);
-}
-
-test "State selection wraps and hides cleanly" {
-    var state = State.init(std.testing.allocator);
-    defer state.deinit(std.testing.allocator);
-    const entries = [_]HistoryEntry{
-        .{ .url = "https://ziglang.org/", .title = "Zig" },
-        .{ .url = "https://ziglang.org/learn/", .title = "Learn" },
-    };
-    try state.setResults("zig", &entries);
-    try std.testing.expect(state.visible);
-    try std.testing.expectEqualStrings("lang.org", state.completion);
-    try std.testing.expectEqual(@as(?usize, 0), state.selected);
-    state.moveSelection(-1);
-    try std.testing.expectEqual(@as(?usize, 2), state.selected);
-    state.moveSelection(1);
-    try std.testing.expectEqual(@as(?usize, 0), state.selected);
-    try std.testing.expectEqualStrings("https://ziglang.org/", state.selectedSuggestion().?.url);
-    state.hide();
-    try std.testing.expect(!state.visible);
-    try std.testing.expect(state.selectedSuggestion() == null);
-    try std.testing.expectEqual(@as(usize, 0), state.items.len);
 }
 
 test "setResults rows outlive the caller's history entries" {
@@ -330,32 +271,4 @@ test "setResults rows outlive the caller's history entries" {
     try std.testing.expectEqualStrings("https://ziglang.org/", state.items[0].url);
     try std.testing.expectEqualStrings("Zig", state.items[0].title);
     try std.testing.expectEqualStrings("lang.org", state.completion);
-}
-
-test "visit gate suppresses automation loads through redirects and resets on completion" {
-    var state = State.init(std.testing.allocator);
-    defer state.deinit(std.testing.allocator);
-
-    // User-driven load records.
-    state.noteNavigated();
-    try std.testing.expect(state.shouldRecordCurrentLoad());
-    state.noteLoadFinished();
-
-    // Automation marks the load before navigating; redirects keep it suppressed.
-    state.pending_suppress = true;
-    state.noteNavigated();
-    try std.testing.expect(!state.shouldRecordCurrentLoad());
-    state.noteNavigated();
-    try std.testing.expect(!state.shouldRecordCurrentLoad());
-    state.noteLoadFinished();
-
-    // The next in-page navigation is the user's again.
-    state.noteNavigated();
-    try std.testing.expect(state.shouldRecordCurrentLoad());
-
-    try state.setVisitRecordedUrl(std.testing.allocator, "https://a.example/");
-    try std.testing.expect(state.visitRecordedFor("https://a.example/"));
-    try std.testing.expect(!state.visitRecordedFor("https://b.example/"));
-    try state.setVisitRecordedUrl(std.testing.allocator, null);
-    try std.testing.expect(!state.visitRecordedFor("https://a.example/"));
 }

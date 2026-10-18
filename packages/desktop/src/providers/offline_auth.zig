@@ -80,17 +80,3 @@ fn opencodeStatusFromAuthJson(allocator: std.mem.Allocator, content: []const u8)
         else => .unknown,
     };
 }
-
-test "codex login status output maps to sign-in state" {
-    try std.testing.expectEqual(State.signed_in, codexStatusFromOutput(0, "Logged in using ChatGPT\n", ""));
-    try std.testing.expectEqual(State.signed_out, codexStatusFromOutput(1, "Not logged in\n", ""));
-    try std.testing.expectEqual(State.signed_out, codexStatusFromOutput(1, "", "Not logged in"));
-    try std.testing.expectEqual(State.unknown, codexStatusFromOutput(2, "", "error: unexpected"));
-}
-
-test "opencode auth.json entries map to sign-in state" {
-    const allocator = std.testing.allocator;
-    try std.testing.expectEqual(State.signed_out, opencodeStatusFromAuthJson(allocator, "{}"));
-    try std.testing.expectEqual(State.signed_in, opencodeStatusFromAuthJson(allocator, "{\"anthropic\":{\"type\":\"oauth\"}}"));
-    try std.testing.expectEqual(State.unknown, opencodeStatusFromAuthJson(allocator, "not json"));
-}

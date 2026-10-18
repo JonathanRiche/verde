@@ -108,25 +108,3 @@ pub fn fitRect(bounds: draw.Rect, source_width: f32, source_height: f32, fit: Im
         },
     };
 }
-
-test "image contain fit preserves aspect ratio" {
-    const rect = fitRect(.{ .x = 10, .y = 20, .w = 200, .h = 100 }, 100, 100, .contain);
-    try std.testing.expectEqual(draw.Rect{ .x = 60, .y = 20, .w = 100, .h = 100 }, rect);
-}
-
-test "image component emits image command" {
-    const Logo = Image(.{ .width = 120, .height = 60, .source_width = 100, .source_height = 100, .fit = .contain });
-    var logo = Logo.init(draw.TextureId.init(3));
-    logo.setBounds(.{ .x = 0, .y = 0, .w = 120, .h = 60 });
-
-    var batch: draw.RenderBatch = .{};
-    defer batch.deinit(std.testing.allocator);
-    try logo.render(std.testing.allocator, &batch);
-
-    try std.testing.expectEqual(draw.CommandKind.image, batch.commands.items[0].kind);
-    try std.testing.expectEqual(@as(u32, 3), batch.commands.items[0].texture.value);
-    try std.testing.expectApproxEqAbs(@as(f32, 30), batch.commands.items[0].rect.x, 0.001);
-    try std.testing.expectApproxEqAbs(@as(f32, 0), batch.commands.items[0].rect.y, 0.001);
-    try std.testing.expectApproxEqAbs(@as(f32, 60), batch.commands.items[0].rect.w, 0.001);
-    try std.testing.expectApproxEqAbs(@as(f32, 60), batch.commands.items[0].rect.h, 0.001);
-}

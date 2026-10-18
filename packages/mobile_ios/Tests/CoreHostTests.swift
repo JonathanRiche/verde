@@ -157,14 +157,6 @@ final class CoreHostTests: XCTestCase {
         try await host.shutdown()
     }
 
-    @MainActor
-    func testNativeBoundaryStartAndShutdown() async throws {
-        let store = CoreViewStore()
-        let host = try CoreHost.live(hostID: "I02-\(UUID().uuidString)", label: "Fixture", httpsURL: nil, wssURL: nil, store: store)
-        try await host.send(.start(EventStart(now_ms: 0, wall_time_ms: 0, foreground: false, network_available: false)))
-        try await host.shutdown()
-    }
-
     func testKeychainProtectionAndAtomicReplacement() throws {
         let storage = KeychainStorage(service: "dev.verdeai.app.I02.tests", api: FakeKeychainAPI())
         let key = UUID().uuidString

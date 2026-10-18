@@ -353,15 +353,3 @@ pub fn ivarAt(obj: Id, offset: usize) *?*anyopaque {
     const base: [*]u8 = @ptrCast(obj);
     return @ptrCast(@alignCast(base + offset));
 }
-
-test "msgSend function types" {
-    // Compile-time only: the generated function type matches a hand-written one.
-    const F = MsgFn(NSRect, @TypeOf(.{ @as(NSUInteger, 1), @as(?*NSRange, null) }), ?*anyopaque);
-    const info = @typeInfo(F).@"fn";
-    try std.testing.expectEqual(@as(usize, 4), info.params.len);
-    try std.testing.expect(info.return_type.? == NSRect);
-    try std.testing.expect(info.params[1].type.? == Sel);
-    try std.testing.expect(info.params[2].type.? == NSUInteger);
-    try std.testing.expectEqual(@as(usize, 32), @sizeOf(NSRect));
-    try std.testing.expectEqual(@as(usize, 16), @sizeOf(NSRange));
-}

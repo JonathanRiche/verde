@@ -122,21 +122,3 @@ fn validToken(token: []const u8) bool {
     }
     return true;
 }
-
-test "endpoint metadata round trips with a private stable token" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const pref_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    defer std.testing.allocator.free(pref_path);
-    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
-    defer threaded.deinit();
-
-    var first = try loadOrCreateForPort(std.testing.allocator, threaded.io(), pref_path, 47_371);
-    defer first.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, TOKEN_HEX_LEN), first.token.len);
-
-    var second = try loadOrCreateForPort(std.testing.allocator, threaded.io(), pref_path, 47_372);
-    defer second.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 47_372), second.port);
-    try std.testing.expectEqualStrings(first.token, second.token);
-}

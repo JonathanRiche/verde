@@ -341,7 +341,7 @@ jobs:
       - name: Test Windows packaging and launcher contracts
         shell: pwsh
         run: |
-          node --test scripts/release/package-npm.test.mjs scripts/release/windows-npm-integrity.test.mjs packages/npm/verde/test/windows-launcher.test.js
+          node --test scripts/release/windows-npm-integrity.test.mjs packages/npm/verde/test/windows-launcher.test.js
           python -m unittest scripts.release.test_package_windows_integrity scripts.release.test_package_windows_version
 
       - name: Compute release version

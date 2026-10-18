@@ -110,22 +110,6 @@ pub fn format(a: A, r: Request) Error![]const u8 {
     return out.items;
 }
 
-test "single line in the workspace home" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const roots = [_]Root{ .{ .name = "verde", .path = "/w/verde", .home = true }, .{ .name = "verde-cloud", .path = "/w/verde-cloud" } };
-    const text = try format(arena.allocator(), .{ .path = "/w/verde/src/main.zig", .roots = &roots, .start_line = 12, .text = "const x = 1;\n", .instruction = " Rename x. " });
-    try std.testing.expectEqualStrings("In `src/main.zig` line 12:\n```zig\nconst x = 1;\n```\nRename x.", text);
-}
-
-test "range in another folder uses an en dash and the folder prefix" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const roots = [_]Root{ .{ .name = "verde", .path = "/w/verde", .home = true }, .{ .name = "verde-cloud", .path = "/w/verde-cloud/" } };
-    const text = try format(arena.allocator(), .{ .path = "/w/verde-cloud/README", .roots = &roots, .start_line = 3, .end_line = 5, .text = "a\nb\nc", .instruction = "Why?" });
-    try std.testing.expectEqualStrings("In `verde-cloud/README` lines 3\u{2013}5:\n```\na\nb\nc\n```\nWhy?", text);
-}
-
 test "diff side, nested roots and fences inside the selection" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

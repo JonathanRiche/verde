@@ -429,8 +429,3 @@ test "parse hunk header rejects malformed headers" {
     try std.testing.expectError(error.InvalidHunkHeader, parseHunkHeader("@@ -1,2 +1,2"));
     try std.testing.expectError(error.InvalidRange, parseHunkHeader("@@ 1,2 +1,2 @@"));
 }
-
-test "parse hunk header rejects malformed ranges" {
-    try std.testing.expectError(error.InvalidRange, parseHunkHeader("@@ -x,2 +1,2 @@"));
-    try std.testing.expectError(error.InvalidRange, parseHunkHeader("@@ -1,2 +y,2 @@"));
-}

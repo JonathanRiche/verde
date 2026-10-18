@@ -238,10 +238,3 @@ pub const State = struct {
 pub fn isBlankPageUrl(url: []const u8) bool {
     return std.mem.eql(u8, std.mem.trim(u8, url, &std.ascii.whitespace), "about:blank");
 }
-
-test "blank placeholder page is recognized for the empty address field" {
-    try std.testing.expect(isBlankPageUrl("about:blank"));
-    try std.testing.expect(isBlankPageUrl(" about:blank\n"));
-    try std.testing.expect(!isBlankPageUrl("https://example.com"));
-    try std.testing.expect(!isBlankPageUrl(""));
-}

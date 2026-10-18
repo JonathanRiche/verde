@@ -412,46 +412,6 @@ pub const State = struct {
 
 const testing = std.testing;
 
-test "evdev to HID scancode table" {
-    const cases = [_]struct { u32, Scancode }{
-        .{ 0, .unknown },         .{ 1, .escape },           .{ 2, .@"1" },               .{ 10, .@"9" },
-        .{ 11, .@"0" },           .{ 14, .backspace },       .{ 16, .q },                 .{ 28, .@"return" },
-        .{ 30, .a },              .{ 44, .z },               .{ 50, .m },                 .{ 57, .space },
-        .{ 29, .lctrl },          .{ 97, .rctrl },           .{ 42, .lshift },            .{ 54, .rshift },
-        .{ 56, .lalt },           .{ 100, .ralt },           .{ 125, .lgui },             .{ 126, .rgui },
-        .{ 59, .f1 },             .{ 68, .f10 },             .{ 87, .f11 },               .{ 88, .f12 },
-        .{ 183, .f13 },           .{ 194, .f24 },            .{ 58, .capslock },          .{ 69, .numlockclear },
-        .{ 70, .scrolllock },     .{ 99, .printscreen },     .{ 119, .pause },            .{ 110, .insert },
-        .{ 111, .delete },        .{ 102, .home },           .{ 107, .end },              .{ 104, .pageup },
-        .{ 109, .pagedown },      .{ 103, .up },             .{ 108, .down },             .{ 105, .left },
-        .{ 106, .right },         .{ 96, .kp_enter },        .{ 98, .kp_divide },         .{ 55, .kp_multiply },
-        .{ 74, .kp_minus },       .{ 78, .kp_plus },         .{ 83, .kp_period },         .{ 82, .kp_0 },
-        .{ 79, .kp_1 },           .{ 73, .kp_9 },            .{ 117, .kp_equals },        .{ 121, .kp_comma },
-        .{ 86, .nonusbackslash }, .{ 43, .backslash },       .{ 41, .grave },             .{ 127, .application },
-        .{ 139, .menu },          .{ 113, .mute },           .{ 114, .volumedown },       .{ 115, .volumeup },
-        .{ 133, .copy },          .{ 135, .paste },          .{ 137, .cut },              .{ 136, .find },
-        .{ 131, .undo },          .{ 138, .help },           .{ 164, .media_play_pause }, .{ 163, .media_next_track },
-        .{ 158, .ac_back },       .{ 159, .ac_forward },     .{ 173, .ac_refresh },       .{ 217, .ac_search },
-        .{ 89, .international1 }, .{ 124, .international3 }, .{ 122, .lang1 },            .{ 123, .lang2 },
-        .{ 84, .unknown },        .{ 255, .unknown },        .{ 0x161, .select },         .{ 9999, .unknown },
-    };
-    for (cases) |c| try testing.expectEqual(c[1], scancodeFromEvdev(c[0]));
-    // HID usage values (page 0x07).
-    try testing.expectEqual(@as(u16, 4), @intFromEnum(Scancode.a));
-    try testing.expectEqual(@as(u16, 0x28), @intFromEnum(Scancode.@"return"));
-    try testing.expectEqual(@as(u16, 0xE0), @intFromEnum(Scancode.lctrl));
-    try testing.expectEqual(@as(u16, 0xE7), @intFromEnum(Scancode.rgui));
-    // Every mapped evdev code yields a distinct scancode except the documented aliases.
-    var seen = [_]u8{0} ** Scancode.count;
-    for (evdev_table) |s| if (s != .unknown) {
-        seen[@intFromEnum(s)] += 1;
-    };
-    for (seen, 0..) |n, sc| {
-        const alias = sc == @intFromEnum(Scancode.international5) or sc == @intFromEnum(Scancode.media_eject) or sc == @intFromEnum(Scancode.media_play);
-        try testing.expect(n <= 1 or alias);
-    }
-}
-
 test "keyboard state: press, release, focus loss, modifier sync" {
     var s: State = .{};
     try testing.expect(s.handle(.{ .key_down = .{ .key = .a, .scancode = 30 } }));

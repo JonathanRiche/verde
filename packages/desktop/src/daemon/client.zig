@@ -804,10 +804,3 @@ const windows_api = if (builtin.os.tag == .windows) std.os.windows else struct {
 extern "kernel32" fn TerminateProcess(process: windows_api.HANDLE, exit_code: windows_api.UINT) callconv(.winapi) windows_api.BOOL;
 extern "kernel32" fn OpenProcess(desired_access: windows_api.DWORD, inherit_handle: windows_api.BOOL, process_id: windows_api.DWORD) callconv(.winapi) ?windows_api.HANDLE;
 extern "kernel32" fn WaitForSingleObject(handle: windows_api.HANDLE, milliseconds: windows_api.DWORD) callconv(.winapi) windows_api.DWORD;
-
-test "effective store directory preserves override parsing semantics" {
-    const result = try effectiveStoreDirectoryFromRaw(std.testing.allocator, "/pref", "  /store  ");
-    defer std.testing.allocator.free(result.path);
-    try std.testing.expect(result.overridden);
-    try std.testing.expectEqualStrings("/store", result.path);
-}

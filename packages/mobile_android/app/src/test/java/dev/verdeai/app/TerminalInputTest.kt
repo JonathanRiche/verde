@@ -1,8 +1,10 @@
 package dev.verdeai.app
 
+import android.view.KeyEvent
 import android.view.inputmethod.EditorInfo
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -47,5 +49,17 @@ class TerminalInputTest {
         connection.finishComposingText()
         connection.deleteSurroundingText(1, 1)
         assertEquals(listOf(TermInput.Text("ls"), TermInput.Key("Backspace"), TermInput.Key("Delete")), inputs)
+    }
+
+    @Test fun hardwareKeysMapToCoreKeyNames() {
+        fun down(code: Int, meta: Int = 0) = hardwareKey(KeyEvent(0, 0, KeyEvent.ACTION_DOWN, code, 0, meta))
+        assertEquals(TermInput.Key("Enter"), down(KeyEvent.KEYCODE_ENTER))
+        assertEquals(TermInput.Key("Tab", shift=true), down(KeyEvent.KEYCODE_TAB, KeyEvent.META_SHIFT_ON))
+        assertEquals(TermInput.Key("PageDown"), down(KeyEvent.KEYCODE_PAGE_DOWN))
+        assertEquals(TermInput.Key("Escape"), down(KeyEvent.KEYCODE_ESCAPE))
+        assertEquals(TermInput.Text("a"), down(KeyEvent.KEYCODE_A))
+        assertEquals(TermInput.Text("A"), down(KeyEvent.KEYCODE_A, KeyEvent.META_SHIFT_ON))
+        assertEquals(TermInput.Key("x", alt=true), down(KeyEvent.KEYCODE_X, KeyEvent.META_ALT_ON))
+        assertNull(down(KeyEvent.KEYCODE_SHIFT_LEFT))
     }
 }

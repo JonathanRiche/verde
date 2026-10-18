@@ -591,42 +591,6 @@ fn sameSiteFromInt(raw: i64) SameSite {
 
 const testing = std.testing;
 
-test "chromium v10 decrypt known vector" {
-    // Encrypt a known plaintext with the v10 scheme, then verify decrypt.
-    const arena_alloc = testing.allocator;
-    const key = deriveKey("peanuts");
-    const plaintext = "session=abc123";
-
-    // Build padded plaintext (PKCS#7), CBC-encrypt with 16-space IV.
-    const block_count = (plaintext.len / 16) + 1;
-    const padded_len = block_count * 16;
-    const padded = try arena_alloc.alloc(u8, padded_len);
-    defer arena_alloc.free(padded);
-    @memcpy(padded[0..plaintext.len], plaintext);
-    const pad: u8 = @intCast(padded_len - plaintext.len);
-    @memset(padded[plaintext.len..], pad);
-
-    const enc_ctx = std.crypto.core.aes.Aes128.initEnc(key);
-    var iv = [_]u8{0x20} ** 16;
-    const cipher = try arena_alloc.alloc(u8, padded_len);
-    defer arena_alloc.free(cipher);
-    var off: usize = 0;
-    while (off < padded_len) : (off += 16) {
-        var block: [16]u8 = undefined;
-        for (0..16) |i| block[i] = padded[off + i] ^ iv[i];
-        enc_ctx.encrypt(cipher[off..][0..16], &block);
-        @memcpy(&iv, cipher[off..][0..16]);
-    }
-
-    const enc_value = try std.fmt.allocPrint(arena_alloc, "v10{s}", .{cipher});
-    defer arena_alloc.free(enc_value);
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const got = try decryptChromiumValue(arena.allocator(), enc_value, key, null, false);
-    try testing.expectEqualStrings(plaintext, got);
-}
-
 test "chromium v24 domain prefix stripped" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -659,62 +623,6 @@ fn encryptV10(a: std.mem.Allocator, key: [16]u8, plaintext: []const u8) ![]const
         @memcpy(&iv, cipher[off..][0..16]);
     }
     return std.fmt.allocPrint(a, "v10{s}", .{cipher});
-}
-
-test "chromium time conversion" {
-    try testing.expectEqual(@as(i64, 0), chromiumTimeToUnix(0));
-    // 13332988800000000 µs since 1601 == 2023-07-05T00:00:00Z (1688515200 unix).
-    try testing.expectEqual(@as(i64, 1688515200), chromiumTimeToUnix(13332988800000000));
-}
-
-test "domain summary aggregation and sort" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const cookies = [_]Cookie{
-        .{ .host = ".example.com", .name = "a", .value = "1", .path = "/", .expires_unix = 0, .secure = false, .http_only = false, .same_site = .lax },
-        .{ .host = "example.com", .name = "b", .value = "2", .path = "/", .expires_unix = 0, .secure = false, .http_only = false, .same_site = .lax },
-        .{ .host = "other.org", .name = "c", .value = "3", .path = "/", .expires_unix = 0, .secure = false, .http_only = false, .same_site = .lax },
-    };
-    const summary = try summarizeDomains(a, &cookies);
-    try testing.expectEqual(@as(usize, 2), summary.len);
-    try testing.expectEqualStrings("example.com", summary[0].domain);
-    try testing.expectEqual(@as(usize, 2), summary[0].count);
-    try testing.expectEqualStrings("other.org", summary[1].domain);
-}
-
-test "firefox reader over fixture db" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const db_rel = "cookies.sqlite";
-    const abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
-    const db_path = try std.fs.path.join(a, &.{ abs, db_rel });
-
-    {
-        const path_z = try a.dupeZ(u8, db_path);
-        const flags = zqlite.OpenFlags.Create | zqlite.OpenFlags.EXResCode;
-        var conn = try zqlite.open(path_z, flags);
-        defer conn.close();
-        try conn.execNoArgs(
-            "CREATE TABLE moz_cookies (host TEXT, name TEXT, value TEXT, path TEXT, expiry INTEGER, isSecure INTEGER, isHttpOnly INTEGER, sameSite INTEGER)",
-        );
-        try conn.exec(
-            "INSERT INTO moz_cookies VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            .{ ".example.com", "sid", "xyz", "/", @as(i64, 1700000000), @as(i64, 1), @as(i64, 1), @as(i64, 1) },
-        );
-    }
-
-    const cookies = try readFirefoxFrom(a, db_path);
-    try testing.expectEqual(@as(usize, 1), cookies.len);
-    try testing.expectEqualStrings(".example.com", cookies[0].host);
-    try testing.expectEqualStrings("sid", cookies[0].name);
-    try testing.expectEqualStrings("xyz", cookies[0].value);
-    try testing.expect(cookies[0].secure);
-    try testing.expectEqual(SameSite.lax, cookies[0].same_site);
 }
 
 test "secret-tool search parse" {

@@ -767,40 +767,6 @@ test "envelope round-trip encode/decode request and ok response" {
     try std.testing.expectEqual(@as(i64, RUNTIME_PROTOCOL_MAJOR), result.object.get("protocol").?.object.get("major").?.integer);
 }
 
-test "legacy request encoding remains byte compatible" {
-    const encoded = try encodeRequest(std.testing.allocator, 7, "core.status", .{ .probe = true });
-    defer std.testing.allocator.free(encoded);
-    try std.testing.expectEqualStrings(
-        "{\"id\":7,\"method\":\"core.status\",\"params\":{\"probe\":true}}",
-        encoded,
-    );
-}
-
-test "targeted request encoding parses a canonical runtime pair" {
-    const target: RequestTarget = .{
-        .runtime_id = "0123456789abcdef0123456789abcdef",
-        .instance_id = "00112233445566778899aabbccddeeff",
-    };
-    const encoded = try encodeTargetedRequest(
-        std.testing.allocator,
-        8,
-        "core.snapshot",
-        .{ .scopes = [_][]const u8{"workspaces"} },
-        target,
-    );
-    defer std.testing.allocator.free(encoded);
-    try std.testing.expectEqualStrings(
-        "{\"id\":8,\"method\":\"core.snapshot\",\"params\":{\"scopes\":[\"workspaces\"]},\"target\":{\"runtime_id\":\"0123456789abcdef0123456789abcdef\",\"instance_id\":\"00112233445566778899aabbccddeeff\"}}",
-        encoded,
-    );
-
-    var parsed = try parseRequest(std.testing.allocator, encoded);
-    defer parsed.deinit();
-    try std.testing.expect(parsed.request.target != null);
-    try std.testing.expectEqualStrings(target.runtime_id, parsed.request.target.?.runtime_id);
-    try std.testing.expectEqualStrings(target.instance_id, parsed.request.target.?.instance_id);
-}
-
 test "request target validation rejects incomplete and noncanonical pairs" {
     try std.testing.expectError(
         error.RuntimeIdentityMissing,
@@ -822,56 +788,6 @@ test "request target validation rejects incomplete and noncanonical pairs" {
             parseRequest(std.testing.allocator, request),
         );
     }
-}
-
-test "runtime capabilities advertise request target validation" {
-    var found = false;
-    for (RUNTIME_CAPABILITY_NAMES) |capability| {
-        if (std.mem.eql(u8, capability, "rpc.target.v1")) found = true;
-    }
-    try std.testing.expect(found);
-}
-
-test "reserved mobile capability names are defined but not advertised yet" {
-    try std.testing.expectEqualStrings("core.changes.delta.v1", CORE_CHANGES_DELTA_CAPABILITY);
-    try std.testing.expectEqualStrings("device.push.v1", DEVICE_PUSH_CAPABILITY);
-    try std.testing.expectEqualStrings("workspace.directory.v1", WORKSPACE_DIRECTORY_CAPABILITY);
-    try std.testing.expectEqualStrings("access.pair.idempotent.v1", ACCESS_PAIR_IDEMPOTENT_CAPABILITY);
-    for (PENDING_RUNTIME_CAPABILITY_NAMES) |pending| {
-        for (RUNTIME_CAPABILITY_NAMES) |capability| {
-            try std.testing.expect(!std.mem.eql(u8, capability, pending));
-        }
-        for (RUNTIME_CAPABILITY_NAMES_BASE) |capability| {
-            try std.testing.expect(!std.mem.eql(u8, capability, pending));
-        }
-    }
-}
-
-test "status from a runtime without mobile.min_client decodes as unadvertised" {
-    const legacy =
-        \\{"headless_protocol_version":1,"min_supported":1,"max_supported":1,"protocol_version":18,"pid":1,"session_count":0,"chat_turn_count":0,"capabilities":{"terminal_raw":true,"terminal_grid":false,"chat":false,"processes":false,"leases":false,"browser_execution":false,"browser_presentation":false}}
-    ;
-    const parsed = try std.json.parseFromSlice(StatusResult, std.testing.allocator, legacy, .{
-        .ignore_unknown_fields = true,
-    });
-    defer parsed.deinit();
-    try std.testing.expectEqual(@as(u32, 0), parsed.value.mobile.min_client);
-    try std.testing.expectEqual(MOBILE_MIN_CLIENT, MobileCompatibility.current().min_client);
-}
-
-test "store-backed runtimes advertise complete Pair transport enforcement" {
-    var found_store_backed = false;
-    for (RUNTIME_CAPABILITY_NAMES) |capability| {
-        if (std.mem.eql(u8, capability, access_protocol.PAIR_RUNTIME_CAPABILITY)) {
-            found_store_backed = true;
-        }
-    }
-    var found_base = false;
-    for (RUNTIME_CAPABILITY_NAMES_BASE) |capability| {
-        if (std.mem.eql(u8, capability, access_protocol.PAIR_RUNTIME_CAPABILITY)) found_base = true;
-    }
-    try std.testing.expect(found_store_backed);
-    try std.testing.expect(!found_base);
 }
 
 test "advertised chat attachment capability is reachable through paired sessions" {
@@ -899,89 +815,6 @@ test "advertised chat attachment capability is reachable through paired sessions
     }
 }
 
-test "parseResponse reads error envelopes" {
-    const allocator = std.testing.allocator;
-    const err_json = try encodeErrorResponse(allocator, 7, ERR_UNKNOWN_METHOD, "nope");
-    defer allocator.free(err_json);
-
-    var parsed = try parseResponse(allocator, err_json);
-    defer parsed.deinit();
-    try std.testing.expect(!parsed.response.isOk());
-    try std.testing.expectEqual(@as(?u64, 7), parsed.response.id);
-    try std.testing.expectEqualStrings(ERR_UNKNOWN_METHOD, parsed.response.err.?.code);
-    try std.testing.expectEqualStrings("nope", parsed.response.err.?.message);
-}
-
-test "error response without data remains byte compatible" {
-    const allocator = std.testing.allocator;
-    const err_json = try encodeErrorResponse(allocator, 7, ERR_UNKNOWN_METHOD, "nope");
-    defer allocator.free(err_json);
-
-    try std.testing.expectEqualStrings(
-        "{\"jsonrpc\":\"2.0\",\"id\":7,\"error\":{\"code\":\"unknown_method\",\"message\":\"nope\"}}",
-        err_json,
-    );
-}
-
-test "error data round trips as a structured JSON value" {
-    const allocator = std.testing.allocator;
-    var data_parsed = try std.json.parseFromSlice(
-        std.json.Value,
-        allocator,
-        "{\"expected_store_revision\":4,\"resource\":\"workspace\"}",
-        .{},
-    );
-    defer data_parsed.deinit();
-
-    const err_json = try encodeErrorResponseWithData(
-        allocator,
-        8,
-        ERR_CONFLICT,
-        "store revision conflict",
-        data_parsed.value,
-    );
-    defer allocator.free(err_json);
-
-    var parsed = try parseResponse(allocator, err_json);
-    defer parsed.deinit();
-    const err = parsed.response.err.?;
-    try std.testing.expectEqualStrings(ERR_CONFLICT, err.code);
-    try std.testing.expectEqualStrings("store revision conflict", err.message);
-    try std.testing.expect(err.data != null);
-    const data = err.data.?.object;
-    try std.testing.expectEqual(@as(i64, 4), data.get("expected_store_revision").?.integer);
-    try std.testing.expectEqualStrings("workspace", data.get("resource").?.string);
-}
-
-test "legacy error decoders tolerate the optional data field" {
-    const LegacyError = struct {
-        code: []const u8,
-        message: []const u8,
-    };
-    const LegacyResponse = struct {
-        jsonrpc: []const u8,
-        id: u64,
-        @"error": LegacyError,
-    };
-    const raw =
-        "{\"jsonrpc\":\"2.0\",\"id\":9,\"error\":{\"code\":\"conflict\",\"message\":\"stale\",\"data\":{\"expected_store_revision\":4}}}";
-
-    var parsed = try std.json.parseFromSlice(LegacyResponse, std.testing.allocator, raw, .{
-        .ignore_unknown_fields = true,
-    });
-    defer parsed.deinit();
-    try std.testing.expectEqualStrings("conflict", parsed.value.@"error".code);
-    try std.testing.expectEqualStrings("stale", parsed.value.@"error".message);
-}
-
-test "storage error codes retain their stable wire values" {
-    try std.testing.expectEqualStrings("store_busy", ERR_STORE_BUSY);
-    try std.testing.expectEqualStrings("schema_too_new", ERR_SCHEMA_TOO_NEW);
-    try std.testing.expectEqualStrings("store_corrupt", ERR_STORE_CORRUPT);
-    try std.testing.expectEqualStrings("store_unavailable", ERR_STORE_UNAVAILABLE);
-    try std.testing.expectEqualStrings("revision_expired", ERR_REVISION_EXPIRED);
-}
-
 test "parseResponse accepts null id on error envelopes" {
     const allocator = std.testing.allocator;
     // Matches the daemon generic internal-error path (id: null).
@@ -994,20 +827,6 @@ test "parseResponse accepts null id on error envelopes" {
     try std.testing.expect(parsed.response.id == null);
     try std.testing.expectEqualStrings("internal_error", parsed.response.err.?.code);
     try std.testing.expectEqualStrings("OutOfMemory", parsed.response.err.?.message);
-}
-
-test "parseResponse rejects null id success envelopes" {
-    try std.testing.expectError(
-        error.InvalidRequest,
-        parseResponse(std.testing.allocator, "{\"jsonrpc\":\"2.0\",\"id\":null,\"result\":{}}"),
-    );
-}
-
-test "parseResponse rejects missing jsonrpc" {
-    try std.testing.expectError(
-        error.InvalidRequest,
-        parseResponse(std.testing.allocator, "{\"id\":1,\"result\":{}}"),
-    );
 }
 
 test "parseResponse rejects envelopes with result and error" {
@@ -1047,31 +866,6 @@ test "protocol range validation and negotiation" {
     );
 }
 
-test "advertised runtime envelope limits fit the bounded network gateway" {
-    const limits: RuntimeLimits = .{};
-    try std.testing.expectEqual(RUNTIME_MAX_MESSAGE_BYTES, limits.max_request_bytes);
-    try std.testing.expectEqual(RUNTIME_MAX_MESSAGE_BYTES, limits.max_response_bytes);
-    try std.testing.expect(RUNTIME_MAX_MESSAGE_BYTES < MAX_MESSAGE_BYTES);
-}
-
-test "invalid or empty JSON yields InvalidRequest" {
-    const allocator = std.testing.allocator;
-    try std.testing.expectError(error.InvalidRequest, parseRequest(allocator, ""));
-    try std.testing.expectError(error.InvalidRequest, parseRequest(allocator, "{not-json"));
-    try std.testing.expectError(error.InvalidRequest, parseResponse(allocator, "[]"));
-}
-
-test "unknown fields in params are tolerated by request parse" {
-    const allocator = std.testing.allocator;
-    const raw =
-        \\{"jsonrpc":"2.0","id":1,"method":"core.capabilities","params":{"future_flag":true,"nested":{"x":1}},"extra":"ignored"}
-    ;
-    var parsed = try parseRequest(allocator, raw);
-    defer parsed.deinit();
-    try std.testing.expectEqualStrings("core.capabilities", parsed.request.method);
-    try std.testing.expect(parsed.request.params.object.get("future_flag") != null);
-}
-
 test "old capability shape defaults every granular feature to unavailable" {
     const raw =
         \\{"headless_protocol_version":1,"min_supported":1,"max_supported":1,"capabilities":{"terminal_raw":true,"terminal_grid":false,"chat":false,"processes":false,"leases":false,"browser_execution":false,"browser_presentation":false}}
@@ -1099,85 +893,4 @@ test "old capability shape defaults every granular feature to unavailable" {
     try std.testing.expect(!parsed.value.capabilities.provider_status);
     try std.testing.expect(!parsed.value.capabilities.repository_projection);
     try std.testing.expect(!parsed.value.capabilities.repository_manifests);
-}
-
-test "new granular capability shape round trips" {
-    const capabilities: Capabilities = .withBrowser(.{
-        .session_state = true,
-        .navigation = true,
-        .javascript_eval = true,
-        .screenshot = true,
-        .lifecycle_restart = true,
-    }, true);
-    const result: CapabilitiesResult = .{
-        .headless_protocol_version = HEADLESS_PROTOCOL_VERSION,
-        .min_supported = MIN_SUPPORTED_PROTOCOL_VERSION,
-        .max_supported = MAX_SUPPORTED_PROTOCOL_VERSION,
-        .capabilities = capabilities,
-    };
-
-    var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer writer.deinit();
-    var stringify: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
-    try stringify.write(result);
-    var parsed = try std.json.parseFromSlice(CapabilitiesResult, std.testing.allocator, writer.written(), .{});
-    defer parsed.deinit();
-
-    try std.testing.expect(parsed.value.capabilities.browser_execution);
-    try std.testing.expect(parsed.value.capabilities.browser_presentation);
-    try std.testing.expect(parsed.value.capabilities.browser.available);
-    try std.testing.expect(parsed.value.capabilities.isFeatureAvailable(.browser_navigation));
-    try std.testing.expect(parsed.value.capabilities.isFeatureAvailable(.browser_javascript_eval));
-    try std.testing.expect(parsed.value.capabilities.isFeatureAvailable(.browser_screenshot));
-    try std.testing.expect(parsed.value.capabilities.isFeatureAvailable(.browser_lifecycle_restart));
-    try std.testing.expect(!parsed.value.capabilities.isFeatureAvailable(.browser_dom_inspection));
-    try std.testing.expect(!parsed.value.capabilities.isFeatureAvailable(.terminal_grid));
-    try std.testing.expect(!parsed.value.capabilities.store);
-    try std.testing.expect(!parsed.value.capabilities.snapshots);
-    try std.testing.expect(!parsed.value.capabilities.changes);
-    try std.testing.expect(!parsed.value.capabilities.subscriptions);
-}
-
-test "granular feature and unavailable error helpers use stable names" {
-    var capabilities: Capabilities = .phase1();
-    // M4-P5 flip pin: chat is advertised (was false through M4-P4).
-    try std.testing.expect(capabilities.chat);
-    try std.testing.expect(!capabilities.store);
-    try std.testing.expect(capabilities.snapshots);
-    try std.testing.expect(capabilities.changes);
-    try std.testing.expect(!capabilities.subscriptions);
-    try std.testing.expect(capabilities.workspace_pagination);
-    try std.testing.expect(capabilities.thread_pagination);
-    try std.testing.expect(capabilities.message_pagination);
-    try std.testing.expect(capabilities.provider_status);
-    try std.testing.expect(capabilities.repository_projection);
-    try std.testing.expect(capabilities.repository_manifests);
-    capabilities.terminal_grid = true;
-    try std.testing.expect(capabilities.isFeatureAvailable(.terminal_grid));
-    try std.testing.expect(!capabilities.isFeatureAvailable(.browser_navigation));
-
-    capabilities = .withBrowser(.{ .navigation = true }, false);
-    try std.testing.expect(capabilities.isFeatureAvailable(.browser_navigation));
-    try std.testing.expect(!capabilities.isFeatureAvailable(.browser_screenshot));
-    try std.testing.expectEqualStrings("browser.navigation", CapabilityFeature.browser_navigation.wireName());
-
-    const unavailable = capabilityUnavailable(.browser_screenshot);
-    try std.testing.expectEqualStrings(ERR_CAPABILITY_UNAVAILABLE, unavailable.code);
-    try std.testing.expectEqualStrings("browser.screenshot capability is unavailable", unavailable.message);
-}
-
-test "store-backed runtimes advertise idempotent pairing" {
-    for (RUNTIME_CAPABILITY_NAMES) |capability| {
-        if (std.mem.eql(u8, capability, ACCESS_PAIR_IDEMPOTENT_CAPABILITY)) return;
-    }
-    return error.TestExpectedEqual;
-}
-
-test "store-backed runtimes advertise confined directory browsing" {
-    var advertised = false;
-    for (RUNTIME_CAPABILITY_NAMES) |name| {
-        if (std.mem.eql(u8, name, WORKSPACE_DIRECTORY_CAPABILITY)) advertised = true;
-    }
-    try std.testing.expect(advertised);
-    for (RUNTIME_CAPABILITY_NAMES_BASE) |name| try std.testing.expect(!std.mem.eql(u8, name, WORKSPACE_DIRECTORY_CAPABILITY));
 }

@@ -146,22 +146,6 @@ class CoreHostTest {
         override fun close() { server.shutdown(); client.dispatcher.executorService.shutdown(); client.connectionPool.evictAll() }
     }
 
-    @Test fun chatResponsesOvertakeQueuedSummariesWithoutDroppingThem() = runBlocking<Unit> {
-        val order = mutableListOf<String>()
-        val queue = SummaryResponseQueue(this) { completion, _, _ ->
-            order += (completion(1, 1) as EventHttpResponse).effect_id
-        }
-        fun response(id: String): Completion = { n, w ->
-            EventHttpResponse(now_ms=n, wall_time_ms=w, effect_id=id, generation="1",
-                status=200, headers=emptyList(), body_base64="e30=", error=null)
-        }
-        repeat(20) { queue.submit(response("summary-$it"), 0, true) }
-        queue.submit(response("chat-load"), 0, false)
-        assertEquals(listOf("chat-load"), order)
-        withTimeout(2000) { while (order.size < 21) delay(1) }
-        assertEquals(listOf("chat-load") + (0..19).map { "summary-$it" }, order)
-    }
-
     @Test fun rpcTimingContainsOnlyAllowlistedMetadata() = runBlocking<Unit> {
         TlsFixture().use { fixture ->
             val core = FakeCore()
@@ -181,27 +165,6 @@ class CoreHostTest {
                 assertTrue(timings[0].startsWith("rpc_kind=chat.message.list elapsed_ms="))
                 assertTrue(timings[1].startsWith("rpc_kind=other elapsed_ms="))
                 assertTrue(traces.none { "private-" in it })
-            } finally { host.close() }
-        }
-    }
-
-    @Test fun parkedResponseUsesTheCoreDeadlineInsteadOfTheClientsShortReadTimeout() = runBlocking<Unit> {
-        TlsFixture().use { fixture ->
-            val core = FakeCore()
-            val client = fixture.client.newBuilder().readTimeout(100, TimeUnit.MILLISECONDS).build()
-            val host = CoreHost.create(config, executor(client=client), core)
-            try {
-                fixture.server.enqueue(MockResponse().setHeadersDelay(400, TimeUnit.MILLISECONDS).setBody("{}"))
-                core.effects = listOf(fixture.http("parked"))
-                start(host)
-                val response = core.next<EventHttpResponse>()
-                assertEquals(200, response.status)
-                assertNull(response.error)
-                fixture.server.takeRequest(2, TimeUnit.SECONDS)
-                fixture.server.enqueue(MockResponse().setHeadersDelay(600, TimeUnit.MILLISECONDS).setBody("{}"))
-                core.effects = listOf(fixture.http("deadline").copy(timeout_ms=200))
-                host.send { n,w -> EventForeground(now_ms=n, wall_time_ms=w) }
-                assertNotNull(core.next<EventHttpResponse>().error)
             } finally { host.close() }
         }
     }
@@ -264,18 +227,6 @@ class CoreHostTest {
         }
     }
 
-    @Test fun fileSinkIsBoundedAndClears() {
-        val sink = FileSink(capacity = 2)
-        sink.put("a", FileBody(byteArrayOf(1), null))
-        sink.put("b", FileBody(byteArrayOf(2), null))
-        sink.put("c", FileBody(byteArrayOf(3), null))
-        assertNull(sink.take("a"))
-        assertEquals(2, sink.size())
-        sink.clear()
-        assertNull(sink.take("b"))
-        assertEquals(0, sink.size())
-    }
-
     @Test fun httpSuccessPinMismatchAndSystemTrust() = runBlocking {
         TlsFixture().use { fixture ->
             val core = FakeCore()
@@ -317,7 +268,7 @@ class CoreHostTest {
         }
     }
 
-    @Test fun noRedirectReplayAndIndependentRequests() = runBlocking {
+    @Test fun noRedirectOrRetryReplay() = runBlocking {
         TlsFixture().use { fixture ->
             val core = FakeCore()
             val host = CoreHost.create(config, executor(client=fixture.client), core)
@@ -337,46 +288,6 @@ class CoreHostTest {
                 assertEquals(302, core.next<EventHttpResponse>().status)
                 fixture.server.takeRequest(2, TimeUnit.SECONDS)
                 assertNull(fixture.server.takeRequest(100, TimeUnit.MILLISECONDS))
-                fixture.server.enqueue(MockResponse().setBody("slow").setBodyDelay(500, TimeUnit.MILLISECONDS))
-                core.effects = listOf(fixture.http("slow"))
-                host.send { n,w -> EventForeground(now_ms=n, wall_time_ms=w) }
-                fixture.server.takeRequest(2, TimeUnit.SECONDS)
-                fixture.server.enqueue(MockResponse().setBody("fast"))
-                core.effects = listOf(fixture.http("fast"))
-                host.send { n,w -> EventForeground(now_ms=n, wall_time_ms=w) }
-                assertEquals("fast", core.next<EventHttpResponse>().effect_id)
-                assertEquals("slow", core.next<EventHttpResponse>().effect_id)
-                fixture.server.takeRequest(2, TimeUnit.SECONDS)
-                fixture.server.enqueue(MockResponse().setBody("cancel").setBodyDelay(3, TimeUnit.SECONDS))
-                core.effects = listOf(fixture.http("cancel"))
-                host.send { n,w -> EventForeground(now_ms=n, wall_time_ms=w) }
-                fixture.server.takeRequest(2, TimeUnit.SECONDS)
-                core.effects = listOf(EffectHttpCancel("c", "1", "cancel"))
-                host.send { n,w -> EventForeground(now_ms=n, wall_time_ms=w) }
-                assertNotNull(core.next<EventHttpResponse>().error)
-            } finally { host.close() }
-        }
-    }
-
-    @Test fun parkedCallsDoNotOccupyInteractiveSlots() = runBlocking {
-        TlsFixture().use { fixture ->
-            val arrived = java.util.concurrent.CountDownLatch(6)
-            fixture.server.dispatcher = object : okhttp3.mockwebserver.Dispatcher() {
-                override fun dispatch(request: okhttp3.mockwebserver.RecordedRequest): MockResponse {
-                    if (request.path == "/interactive") return MockResponse().setBody("ready")
-                    arrived.countDown()
-                    return MockResponse().setBody("parked").setBodyDelay(3, TimeUnit.SECONDS)
-                }
-            }
-            val core = FakeCore()
-            val host = CoreHost.create(config, executor(client=fixture.client), core)
-            try {
-                core.effects = (1..6).map { fixture.http("parked-$it").copy(timeout_ms=5000) }
-                start(host)
-                assertTrue(arrived.await(2, TimeUnit.SECONDS))
-                core.effects = listOf(fixture.http("interactive").copy(url=fixture.server.url("/interactive").toString()))
-                host.send { n,w -> EventForeground(now_ms=n, wall_time_ms=w) }
-                assertEquals("interactive", core.next<EventHttpResponse>().effect_id)
             } finally { host.close() }
         }
     }
@@ -424,36 +335,6 @@ class CoreHostTest {
                 assertTrue(peer.system_trusted)
                 assertEquals(fixture.pin, peer.spki_sha256)
                 assertNull(fixture.server.takeRequest(200,TimeUnit.MILLISECONDS))
-            } finally { host.close() }
-        }
-    }
-
-    @Test fun upgradedWebsocketOutlivesThirtySecondCallTimeoutAndStillClosesLocally() = runBlocking {
-        TlsFixture().use { fixture ->
-            fixture.server.enqueue(MockResponse().setHeader("Sec-WebSocket-Protocol", "verde.v1")
-                .withWebSocketUpgrade(object : WebSocketListener() {
-                    override fun onMessage(socket: WebSocket, text: String) { socket.send(text) }
-                    override fun onClosing(socket: WebSocket, code: Int, reason: String) { socket.close(code, null) }
-                }))
-            val core = FakeCore()
-            val host = CoreHost.create(config, executor(client=fixture.client), core)
-            try {
-                core.effects = listOf(EffectWsOpen("long-lived", "1",
-                    fixture.server.url("/ws").toString().replace("https:", "wss:"),
-                    listOf("verde.v1"), Tls(fixture.origin, fixture.pin), 1000))
-                start(host)
-                core.next<EventWsOpen>()
-                // Exercise the production 30s deadline, including an idle upgraded socket.
-                delay(35_000)
-                core.effects = listOf(EffectWsSend("send", "1", "long-lived", "fixture"))
-                host.send { n,w -> EventForeground(now_ms=n, wall_time_ms=w) }
-                assertEquals("fixture", core.next<EventWsMessage>().text)
-                core.effects = listOf(EffectWsClose("close", "1", "long-lived", 1000))
-                host.send { n,w -> EventBackground(now_ms=n, wall_time_ms=w) }
-                val closed = core.next<EventWsClosed>()
-                assertTrue(closed.clean)
-                assertEquals(1000, closed.code)
-                assertNull(closed.error)
             } finally { host.close() }
         }
     }

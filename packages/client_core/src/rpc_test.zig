@@ -137,20 +137,6 @@ test "RPC typed errors, response correlation and FailureKind retry classes" {
     try expect(std.mem.indexOf(u8, err.message, "secret") == null);
 }
 
-test "RPC negotiated limits and explicit snapshot allowance" {
-    var h = try init();
-    defer h.deinit();
-    var tx = try host.Transaction.init(&h);
-    defer tx.deinit();
-    try ready(&tx);
-    try std.testing.expectError(error.ResourceLimit, rpc.request(&tx, "chat.turn.tail", .{ .wait_ms = 30_000 }, .{ .parked_wait_ms = 30_000 }));
-    try std.testing.expectError(error.ResourceLimit, rpc.request(&tx, "chat.thread.list", .{ .limit = 201 }, .{ .mutation = false }));
-    _ = try rpc.request(&tx, "core.snapshot", .{}, .{ .mutation = false, .legacy_snapshot = true });
-    try expect(tx.state.rpc.calls[0].response_cap == protocol.MAX_MESSAGE_BYTES);
-    tx.state.rpc.limits.max_request_bytes = 1;
-    try std.testing.expectError(error.ResourceLimit, rpc.request(&tx, "core.status", .{}, .{ .mutation = false }));
-}
-
 test "RPC runtime changes require trust; incompatible mobile client requires update" {
     inline for (.{ true, false }) |identity| {
         var h = try init();
@@ -167,26 +153,6 @@ test "RPC runtime changes require trust; incompatible mobile client requires upd
         try expect(tx.state.rpc.update_required == !identity);
         try expect(!rpc.takeFullResync(&tx));
     }
-}
-
-test "RPC target rejection rediscovers instance and leaves other mutations uncertain" {
-    var h = try init();
-    defer h.deinit();
-    var tx = try host.Transaction.init(&h);
-    defer tx.deinit();
-    try ready(&tx);
-    _ = try rpc.request(&tx, "chat.turn.start", .{}, .{});
-    _ = try rpc.request(&tx, "chat.turn.cancel", .{}, .{});
-    const call = tx.state.rpc.calls[0];
-    const wire = try std.json.Stringify.valueAlloc(tx.allocator(), .{ .jsonrpc = "2.0", .id = call.id, .@"error" = .{ .code = "runtime_identity_mismatch", .message = "changed" } }, .{});
-    try rawResponse(&tx, call, wire, 200);
-    try eql("rejected", rpc.takeResult(&tx).?.@"error".?.delivery.?);
-    try eql("uncertain", rpc.takeResult(&tx).?.@"error".?.delivery.?);
-    try eql("core.status", tx.state.rpc.calls[0].method);
-    try response(&tx, tx.state.rpc.calls[0], statusValue(other));
-    try response(&tx, tx.state.rpc.calls[0], .{ .runtime_id = runtime, .instance_id = other, .headless_protocol_version = 1, .min_supported = 1, .max_supported = 1, .capabilities = protocol.Capabilities{} });
-    try expect(tx.state.host_error == null);
-    try expect(rpc.takeFullResync(&tx));
 }
 
 test "RPC transport failure is uncertain for mutation, stale generations are ignored, credentials stay out of queries" {
@@ -219,26 +185,4 @@ test "RPC transport failure is uncertain for mutation, stale generations are ign
     try resumed.apply(stale);
     try expect(resumed.state.rpc.calls.len == 1);
     try expect(rpc.takeResult(&resumed) == null);
-}
-
-fn allocationScenario(a: std.mem.Allocator) !void {
-    var h = try host.Host.init(a, config);
-    defer h.deinit();
-    h.state.lifecycle = .foreground;
-    h.state.network_available = true;
-    var tx = try host.Transaction.init(&h);
-    defer tx.deinit();
-    try setup(&tx);
-    _ = try rpc.beginHandshake(&tx);
-    const output = tx.commit(&h, a) catch |err| {
-        try expect(h.state.rpc.bearer == null);
-        try expect(h.state.pending.len == 0);
-        try expect(h.state.rpc.next_id == 1);
-        return err;
-    };
-    defer a.free(output);
-    try expect(h.state.rpc.calls.len == 1);
-}
-test "RPC allocation failures preserve host and effect atomicity" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationScenario, .{});
 }

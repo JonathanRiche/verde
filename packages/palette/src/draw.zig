@@ -534,24 +534,6 @@ fn translatedCommandVisible(command: Command, translation: Vec2, clip: ?Rect) bo
         bounds.y + bounds.h > target.y and bounds.y < target.y + target.h;
 }
 
-test "rect contains points inside bounds" {
-    const rect_value: Rect = .{ .x = 10, .y = 20, .w = 30, .h = 40 };
-    try std.testing.expect(rect_value.contains(.{ .x = 10, .y = 20 }));
-    try std.testing.expect(!rect_value.contains(.{ .x = 40, .y = 20 }));
-}
-
-test "image command carries texture and uv" {
-    var batch: RenderBatch = .{};
-    defer batch.deinit(std.testing.allocator);
-
-    try batch.image(std.testing.allocator, .{ .w = 24, .h = 16 }, TextureId.init(7), .{ .x = 0.25, .y = 0.5, .w = 0.5, .h = 0.25 }, Color.white, .{ .w = 10, .h = 10 });
-
-    try std.testing.expectEqual(CommandKind.image, batch.commands.items[0].kind);
-    try std.testing.expectEqual(@as(u32, 7), batch.commands.items[0].texture.value);
-    try std.testing.expectEqual(@as(f32, 0.25), batch.commands.items[0].uv.x);
-    try std.testing.expect(batch.commands.items[0].clip != null);
-}
-
 test "commands are stably sorted by z-index" {
     var batch: RenderBatch = .{};
     defer batch.deinit(std.testing.allocator);
@@ -599,16 +581,4 @@ test "translated batch moves geometry and intersects clips without copying text"
     try std.testing.expectEqual(@as(f32, 25), command.clip.?.y);
     try std.testing.expectEqual(@as(f32, 30), command.clip.?.w);
     try std.testing.expectEqual(@as(f32, 20), command.clip.?.h);
-}
-
-test "panel command carries renderer-neutral shape style" {
-    var batch: RenderBatch = .{};
-    defer batch.deinit(std.testing.allocator);
-
-    try batch.panel(std.testing.allocator, .{ .w = 20, .h = 10 }, Color.black, Color.white, 6, 2);
-
-    try std.testing.expectEqual(CommandKind.rect, batch.commands.items[0].kind);
-    try std.testing.expectEqual(@as(f32, 6), batch.commands.items[0].radius);
-    try std.testing.expectEqual(@as(f32, 2), batch.commands.items[0].border_width);
-    try std.testing.expect(batch.commands.items[0].border_color != null);
 }

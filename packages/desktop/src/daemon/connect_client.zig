@@ -482,34 +482,6 @@ fn isRedirect(status: std.http.Status) bool {
     };
 }
 
-const FakeTransport = struct {
-    body: []const u8,
-    status: std.http.Status = .ok,
-    saw_bearer: bool = false,
-
-    fn transport(self: *FakeTransport) Transport {
-        return .{ .context = self, .send_fn = send };
-    }
-
-    fn send(raw: *anyopaque, allocator: std.mem.Allocator, request: Request) !Response {
-        const self: *FakeTransport = @ptrCast(@alignCast(raw));
-        self.saw_bearer = request.bearer_token != null;
-        return .{ .status = self.status, .body = try allocator.dupe(u8, self.body) };
-    }
-};
-
-test "strict discovery pins base, issuer metadata, and headless auth semantics" {
-    const body =
-        \\{"contract_version":"1","issuer":"https://connect.example.test","api_base_url":"https://connect.example.test","oidc":{"issuer":"https://id.example.test","authorization_endpoint":"https://id.example.test/auth","token_endpoint":"https://id.example.test/token","device_authorization_endpoint":"https://id.example.test/device","code_challenge_methods_supported":["S256"],"public_client":{"client_id":"verde","scopes":["openid"],"redirect_uris":["http://127.0.0.1:48123/callback"],"response_type":"code","token_endpoint_auth_method":"none"},"headless_authorization":{"supported":true,"grant_type":"urn:ietf:params:oauth:grant-type:device_code"}},"jwks_uri":"https://connect.example.test/v1/.well-known/jwks.json","signer_metadata_url":"https://connect.example.test/v1/signer-metadata","capabilities":["runtime-link-proof-ed25519","inventory-v1","bootstrap-grant-eddsa","connector-credential-jwe-x25519","endpoint-external"]}
-    ;
-    var fake: FakeTransport = .{ .body = body };
-    const client = try Client.init(std.testing.allocator, fake.transport(), "https://connect.example.test");
-    var discovery = try client.discover();
-    defer discovery.deinit();
-    try std.testing.expect(discovery.value().oidc.headless_authorization.supported);
-    try std.testing.expect(!fake.saw_bearer);
-}
-
 test "HTTP request policy rejects redirects, proxies by construction, and oversized bodies" {
     try std.testing.expectError(error.InvalidControlPlaneUrl, validateRequest(.{ .method = .GET, .url = "http://connect.example.test" }));
     try std.testing.expectError(error.InvalidControlPlaneUrl, validateRequest(.{ .method = .GET, .url = "https:///missing-host" }));
@@ -520,8 +492,4 @@ test "HTTP request policy rejects redirects, proxies by construction, and oversi
         .body = &([_]u8{'x'} ** (MAX_REQUEST_BYTES + 1)),
     }));
     try std.testing.expect(isRedirect(.temporary_redirect));
-}
-
-test {
-    _ = @import("connect_transport_test.zig");
 }

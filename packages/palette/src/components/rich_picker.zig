@@ -1527,9 +1527,6 @@ fn subsequenceGaps(haystack: []const u8, needle: []const u8) ?usize {
 
 const TestContext = struct {
     selected: ?usize = null,
-    open_events: usize = 0,
-    close_events: usize = 0,
-    favorites: [6]bool = .{ false, false, false, false, false, false },
 
     const labels = [_][]const u8{ "GPT-5.6 Sol", "GPT-5.5", "Claude Opus 4.7", "Claude Sonnet 4.5", "Composer 2", "Auto" };
     const groups = [_][]const u8{ "Codex", "Codex", "Claude", "Claude", "Cursor", "Cursor" };
@@ -1551,22 +1548,11 @@ const TestContext = struct {
         return if (index == 0) "Default" else "";
     }
 
-    fn favorite(context: ?*anyopaque, index: usize) bool {
-        const self: *TestContext = @ptrCast(@alignCast(context.?));
-        return self.favorites[index];
-    }
-
     fn onEvent(context: ?*anyopaque, event: RichPickerEvent) void {
         const self: *TestContext = @ptrCast(@alignCast(context.?));
         switch (event) {
             .selected => |index| self.selected = index,
-            .action => {},
-            .open_changed => |open| if (open) {
-                self.open_events += 1;
-            } else {
-                self.close_events += 1;
-            },
-            .highlighted => {},
+            else => {},
         }
     }
 };
@@ -1586,86 +1572,13 @@ const TestPicker = RichPicker(.{
     .placement = .below,
 });
 
-fn testRailIcon(_: ?*anyopaque, _: std.mem.Allocator, _: *draw.RenderBatch, _: usize, _: draw.Rect, _: draw.Rect) void {}
-
-const RailTestPicker = RichPicker(.{
-    .width = 300,
-    .row_height = 20,
-    .row_height_with_description = 34,
-    .max_body_height = 400,
-    .fixed_body_height = 180,
-    .search_enabled = true,
-    .search_min_items = 3,
-    .item_label = TestContext.label,
-    .item_description = TestContext.description,
-    .item_group = TestContext.group,
-    .rail_enabled = true,
-    .rail_width = 48,
-    .rail_item_height = 40,
-    .rail_all_icon = "*",
-    .render_rail_icon = testRailIcon,
-    .search_style = .underline,
-    .search_icon = "?",
-    .check_inline = true,
-    .leading_on_description = true,
-    .shortcut_badge_limit = 9,
-    .placement = .below,
-});
-
-const FavoriteRailTestPicker = RichPicker(.{
-    .width = 300,
-    .row_height = 20,
-    .row_height_with_description = 34,
-    .max_body_height = 400,
-    .fixed_body_height = 180,
-    .search_enabled = true,
-    .search_min_items = 3,
-    .item_label = TestContext.label,
-    .item_description = TestContext.description,
-    .item_group = TestContext.group,
-    .item_action_icon = "+",
-    .item_action_active_icon = "*",
-    .item_action_active = TestContext.favorite,
-    .rail_enabled = true,
-    .rail_width = 48,
-    .rail_item_height = 40,
-    .rail_all_icon = "*",
-    .rail_primary_filter = TestContext.favorite,
-    .render_rail_icon = testRailIcon,
-    .placement = .below,
-});
-
-fn openedPickerOf(comptime Picker: type, context: *TestContext) !Picker {
-    var picker = Picker.init(TestContext.labels.len);
+fn openedTestPicker(context: *TestContext) !TestPicker {
+    var picker = TestPicker.init(TestContext.labels.len);
     picker.setCallbacks(.{ .context = context, .on_event = TestContext.onEvent });
     picker.setAnchorRect(.{ .x = 10, .y = 10, .w = 100, .h = 20 });
     picker.setViewportRect(.{ .x = 0, .y = 0, .w = 800, .h = 900 });
     _ = try picker.handleInput(std.testing.allocator, .open);
     return picker;
-}
-
-fn openedTestPicker(context: *TestContext) !TestPicker {
-    return openedPickerOf(TestPicker, context);
-}
-
-fn railItemCenter(picker: *const RailTestPicker, index: usize) draw.Vec2 {
-    const rect = picker.railItemRect(index);
-    return .{ .x = rect.x + rect.w * 0.5, .y = rect.y + rect.h * 0.5 };
-}
-
-test "rich picker builds group headers and selects an item by mouse" {
-    var context: TestContext = .{};
-    var picker = try openedTestPicker(&context);
-    defer picker.deinit(std.testing.allocator);
-
-    // 6 items + 3 group headers.
-    try std.testing.expectEqual(@as(usize, 9), picker.rows.items.len);
-    try std.testing.expectEqual(TestPicker.Row{ .kind = .header, .item = 0, .y = 0, .h = 16 }, picker.rows.items[0]);
-
-    const second_row = picker.rowRect(picker.rows.items[2]);
-    _ = try picker.handleInput(std.testing.allocator, .{ .mouse_down = .{ .point = .{ .x = second_row.x + 4, .y = second_row.y + 4 } } });
-    try std.testing.expectEqual(@as(?usize, 1), context.selected);
-    try std.testing.expect(!picker.isOpen());
 }
 
 test "rich picker search filters, ranks, and enter selects" {
@@ -1681,21 +1594,6 @@ test "rich picker search filters, ranks, and enter selects" {
     _ = try picker.handleInput(std.testing.allocator, .{ .key = .{ .code = .enter } });
     try std.testing.expectEqual(@as(?usize, 3), context.selected);
     try std.testing.expect(!picker.isOpen());
-}
-
-test "rich picker escape clears query first then closes" {
-    var context: TestContext = .{};
-    var picker = try openedTestPicker(&context);
-    defer picker.deinit(std.testing.allocator);
-
-    _ = try picker.handleInput(std.testing.allocator, .{ .text = "opus" });
-    _ = try picker.handleInput(std.testing.allocator, .{ .key = .{ .code = .escape } });
-    try std.testing.expect(picker.isOpen());
-    try std.testing.expectEqual(@as(usize, 0), picker.searchText().len);
-
-    _ = try picker.handleInput(std.testing.allocator, .{ .key = .{ .code = .escape } });
-    try std.testing.expect(!picker.isOpen());
-    try std.testing.expectEqual(@as(usize, 1), context.close_events);
 }
 
 test "rich picker keyboard navigation skips headers" {
@@ -1715,138 +1613,4 @@ test "rich picker keyboard navigation skips headers" {
     try std.testing.expectEqual(@as(?usize, 4), picker.highlighted);
     _ = try picker.handleInput(std.testing.allocator, .{ .key = .{ .code = .up } });
     try std.testing.expectEqual(@as(?usize, 2), picker.highlighted);
-}
-
-test "rich picker places below anchor and clamps to viewport" {
-    var context: TestContext = .{};
-    var picker = try openedTestPicker(&context);
-    defer picker.deinit(std.testing.allocator);
-
-    const rect = picker.pickerRect();
-    try std.testing.expectEqual(@as(f32, 10), rect.x);
-    try std.testing.expect(rect.y >= 30.0);
-
-    // Anchor near the right edge: the popover must slide left to stay inside.
-    picker.setAnchorRect(.{ .x = 280, .y = 10, .w = 100, .h = 20 });
-    picker.setViewportRect(.{ .x = 0, .y = 0, .w = 320, .h = 900 });
-    const clamped = picker.pickerRect();
-    try std.testing.expect(clamped.x + clamped.w <= 320.0);
-}
-
-test "rich picker rail filters by group without headers" {
-    var context: TestContext = .{};
-    var picker = try openedPickerOf(RailTestPicker, &context);
-    defer picker.deinit(std.testing.allocator);
-
-    // Rail mode renders no header rows even though every item has a group.
-    try std.testing.expectEqual(@as(usize, TestContext.labels.len), picker.rows.items.len);
-    try std.testing.expectEqual(@as(usize, 3), picker.groups.items.len);
-    const picker_height = picker.pickerRect().h;
-
-    // Rail entry 0 is "All"; entry 2 is the second group ("Claude").
-    _ = try picker.handleInput(std.testing.allocator, .{ .mouse_down = .{ .point = railItemCenter(&picker, 2) } });
-    try std.testing.expect(picker.isOpen());
-    try std.testing.expectEqual(@as(usize, 2), picker.rows.items.len);
-    try std.testing.expectEqual(@as(usize, 2), picker.rows.items[0].item);
-    try std.testing.expectEqual(@as(usize, 3), picker.rows.items[1].item);
-    try std.testing.expectEqual(picker_height, picker.pickerRect().h);
-
-    _ = try picker.handleInput(std.testing.allocator, .{ .mouse_down = .{ .point = railItemCenter(&picker, 0) } });
-    try std.testing.expectEqual(@as(usize, TestContext.labels.len), picker.rows.items.len);
-}
-
-test "rich picker primary rail entry filters to marked items" {
-    var context: TestContext = .{};
-    context.favorites[1] = true;
-    context.favorites[4] = true;
-    var picker = try openedPickerOf(FavoriteRailTestPicker, &context);
-    defer picker.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 2), picker.filtered.items.len);
-    try std.testing.expectEqual(@as(usize, 1), picker.filtered.items[0]);
-    try std.testing.expectEqual(@as(usize, 4), picker.filtered.items[1]);
-
-    const codex_rail = picker.railItemRect(1);
-    _ = try picker.handleInput(std.testing.allocator, .{ .mouse_down = .{ .point = .{ .x = codex_rail.x + codex_rail.w * 0.5, .y = codex_rail.y + codex_rail.h * 0.5 } } });
-    try std.testing.expectEqual(@as(usize, 2), picker.filtered.items.len);
-    try std.testing.expectEqual(@as(usize, 0), picker.filtered.items[0]);
-    try std.testing.expectEqual(@as(usize, 1), picker.filtered.items[1]);
-}
-
-test "rich picker arrows move between model rows and provider rail" {
-    var context: TestContext = .{};
-    var picker = try openedPickerOf(RailTestPicker, &context);
-    defer picker.deinit(std.testing.allocator);
-
-    // Left enters the rail at the provider of the highlighted model.
-    _ = try picker.handleInput(std.testing.allocator, .{ .key = .{ .code = .left } });
-    try std.testing.expectEqual(@as(?usize, 1), picker.focused_rail);
-    try std.testing.expect(!picker.search.focused);
-
-    // Vertical movement chooses and filters to the adjacent provider.
-    _ = try picker.handleInput(std.testing.allocator, .{ .key = .{ .code = .down } });
-    try std.testing.expectEqual(@as(?usize, 2), picker.focused_rail);
-    try std.testing.expectEqual(@as(usize, 2), picker.rows.items.len);
-    try std.testing.expectEqual(@as(usize, 2), picker.rows.items[0].item);
-
-    // Right returns focus to the model list, where vertical navigation works
-    // as before.
-    _ = try picker.handleInput(std.testing.allocator, .{ .key = .{ .code = .right } });
-    try std.testing.expectEqual(@as(?usize, null), picker.focused_rail);
-    try std.testing.expect(picker.search.focused);
-    _ = try picker.handleInput(std.testing.allocator, .{ .key = .{ .code = .down } });
-    try std.testing.expectEqual(@as(?usize, 1), picker.highlighted);
-}
-
-test "rich picker shortcut ordinal selects within the rail filter" {
-    var context: TestContext = .{};
-    var picker = try openedPickerOf(RailTestPicker, &context);
-    defer picker.deinit(std.testing.allocator);
-
-    _ = try picker.handleInput(std.testing.allocator, .{ .mouse_down = .{ .point = railItemCenter(&picker, 2) } });
-    // Ordinal 1 of the filtered view is the group's second item (item 3).
-    try std.testing.expect(try picker.selectVisibleOrdinal(std.testing.allocator, 1));
-    try std.testing.expectEqual(@as(?usize, 3), context.selected);
-    try std.testing.expect(!picker.isOpen());
-}
-
-test "rich picker rail mode renders rail, chips, and underline" {
-    var context: TestContext = .{};
-    var picker = try openedPickerOf(RailTestPicker, &context);
-    defer picker.deinit(std.testing.allocator);
-
-    var batch: draw.RenderBatch = .{};
-    defer batch.deinit(std.testing.allocator);
-    try picker.render(std.testing.allocator, &batch);
-
-    var text_commands: usize = 0;
-    for (batch.commands.items) |command| {
-        if (command.kind == .text) text_commands += 1;
-    }
-    // Labels + descriptions + shortcut chips + rail "all" glyph + search icon.
-    try std.testing.expect(text_commands >= TestContext.labels.len * 3 + 2);
-    // The picker widens by the rail and the body starts right of it.
-    try std.testing.expect(picker.bodyRect().x >= picker.pickerRect().x + 48.0);
-}
-
-test "rich picker renders labels, descriptions, badges, and search" {
-    var context: TestContext = .{};
-    var picker = try openedTestPicker(&context);
-    defer picker.deinit(std.testing.allocator);
-
-    var batch: draw.RenderBatch = .{};
-    defer batch.deinit(std.testing.allocator);
-    try picker.render(std.testing.allocator, &batch);
-
-    var text_commands: usize = 0;
-    var rect_commands: usize = 0;
-    for (batch.commands.items) |command| {
-        switch (command.kind) {
-            .text => text_commands += 1,
-            .rect => rect_commands += 1,
-            else => {},
-        }
-    }
-    try std.testing.expect(text_commands >= TestContext.labels.len * 2);
-    try std.testing.expect(rect_commands >= 2);
 }

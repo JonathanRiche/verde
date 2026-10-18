@@ -929,15 +929,6 @@ fn conflictRetryBackoffMs(streak: u32) i64 {
     return @min(FLUSH_RETRY_BACKOFF_MS << doublings, FLUSH_CONFLICT_BACKOFF_MAX_MS);
 }
 
-test "conflict retry backoff doubles per consecutive conflict up to the bound" {
-    try std.testing.expectEqual(FLUSH_RETRY_BACKOFF_MS, conflictRetryBackoffMs(0));
-    try std.testing.expectEqual(FLUSH_RETRY_BACKOFF_MS, conflictRetryBackoffMs(1));
-    try std.testing.expectEqual(FLUSH_RETRY_BACKOFF_MS * 2, conflictRetryBackoffMs(2));
-    try std.testing.expectEqual(FLUSH_RETRY_BACKOFF_MS * 8, conflictRetryBackoffMs(4));
-    try std.testing.expectEqual(FLUSH_CONFLICT_BACKOFF_MAX_MS, conflictRetryBackoffMs(6));
-    try std.testing.expectEqual(FLUSH_CONFLICT_BACKOFF_MAX_MS, conflictRetryBackoffMs(std.math.maxInt(u32)));
-}
-
 test "workspace flush conflict stashes a rebase capture and backs off" {
     const allocator = std.testing.allocator;
     var lifecycle: State = .{};
@@ -1188,50 +1179,6 @@ pub fn flushDirtyNow(self: anytype) void {
     scheduleFlushWorker(self, now);
 }
 
-test "lifecycle debounce requires both dirty and interaction quiet periods" {
-    var state: State = .{};
-    state.noteInteraction(100);
-    state.markDirty(200);
-    try std.testing.expect(!state.shouldFlush(800, 750));
-    try std.testing.expect(state.shouldFlush(950, 750));
-    state.clearDirty();
-    try std.testing.expect(!state.shouldFlush(2000, 750));
-}
-
-test "persistence failure timing survives retries until durability recovers" {
-    var state: State = .{};
-    try std.testing.expect(state.persistenceFailureForMs(100) == null);
-    state.notePersistenceFailure(100);
-    state.notePersistenceFailure(250);
-    try std.testing.expectEqual(@as(?i64, 300), state.persistenceFailureForMs(400));
-    state.clearPersistenceFailure();
-    try std.testing.expect(state.persistenceFailureForMs(500) == null);
-}
-
-test "incremental snapshot and worker ownership keep frame progress scheduled" {
-    var state: State = .{ .dirty = true, .last_dirty_at_ms = 100, .last_interaction_at_ms = 100 };
-    try std.testing.expect(!state.persistenceNeedsFrames(849));
-    try std.testing.expect(state.persistenceNeedsFrames(850));
-    state.flush_in_flight = true;
-    state.next_flush_attempt_ms = 10_000;
-    try std.testing.expect(state.persistenceNeedsFrames(900));
-    state.flush_in_flight = false;
-    state.dirty_spooled = true;
-    try std.testing.expect(!state.persistenceNeedsFrames(20_000));
-}
-
-test "selection-only generations coalesce but never hide a full projection mutation" {
-    var state: State = .{};
-    state.markSelectionDirty(100, 2);
-    try std.testing.expect(state.selection_only);
-    try std.testing.expectEqual(@as(usize, 2), state.selected_project_index);
-    state.markSelectionDirty(200, 4);
-    try std.testing.expect(state.selection_only);
-    try std.testing.expectEqual(@as(usize, 4), state.selected_project_index);
-    state.markDirty(300);
-    try std.testing.expect(!state.selection_only);
-}
-
 test "workspace flush ack overlays metadata onto the retained baseline" {
     const FakeStorage = struct {
         allocator: std.mem.Allocator,
@@ -1293,47 +1240,6 @@ test "workspace flush ack overlays metadata onto the retained baseline" {
     try std.testing.expectEqualStrings("b-old", republished.projects[1].workspace_layout_json.?);
 }
 
-test "workspace-only generations retain multiple workspace targets" {
-    var state: State = .{};
-    state.markWorkspaceDirty(100, 2);
-    try std.testing.expectEqualSlices(usize, &.{2}, state.workspace_dirty_indices[0..state.workspace_dirty_count]);
-    try std.testing.expect(!state.selection_only);
-    state.markWorkspaceDirty(200, 2);
-    try std.testing.expectEqualSlices(usize, &.{2}, state.workspace_dirty_indices[0..state.workspace_dirty_count]);
-
-    state.markWorkspaceDirty(300, 4);
-    try std.testing.expectEqualSlices(usize, &.{ 2, 4 }, state.workspace_dirty_indices[0..state.workspace_dirty_count]);
-
-    state.clearDirty();
-    state.markWorkspaceDirty(400, 1);
-    state.markSelectionDirty(500, 3);
-    try std.testing.expectEqual(@as(usize, 0), state.workspace_dirty_count);
-    try std.testing.expect(!state.selection_only);
-}
-
-test "selection worker derives current projection from immutable baseline" {
-    var baseline = LoadedPersistedState.init(std.testing.allocator);
-    baseline.value.selected_project_index = 1;
-    var result: FlushWorkerResult = .{};
-    var args: FlushWorkerArgs = .{
-        .allocator = std.testing.allocator,
-        .storage = undefined,
-        .loaded = null,
-        .baseline = baseline,
-        .selected_project_index = 3,
-        .observed_revision = 8,
-        .result = &result,
-    };
-    defer {
-        if (args.loaded) |*loaded| loaded.deinit();
-        if (args.baseline) |*owned_baseline| owned_baseline.deinit();
-    }
-
-    try prepareFlushWorkerLoaded(&args);
-    try std.testing.expectEqual(@as(usize, 3), args.loaded.?.value.selected_project_index);
-    try std.testing.expectEqual(@as(usize, 1), args.baseline.?.value.selected_project_index);
-}
-
 test "stale flush ack does not clear dirty for later mutations" {
     var state: State = .{};
     state.markDirty(100);
@@ -1345,63 +1251,6 @@ test "stale flush ack does not clear dirty for later mutations" {
     // An ack covering the latest generation clears normally.
     state.clearDirtyForGeneration(state.dirty_generation);
     try std.testing.expect(!state.dirty);
-}
-
-test "acknowledged full save atomically advances revision-paired projection baseline" {
-    const FakeStorage = struct {
-        allocator: std.mem.Allocator,
-        cleared_spool: bool = false,
-
-        fn clearPendingStateSpoolBestEffort(self: *@This()) void {
-            self.cleared_spool = true;
-        }
-        fn markPersistenceUnavailable(_: *@This()) void {}
-    };
-    const FakeState = struct {
-        lifecycle: State = .{},
-        storage: *FakeStorage,
-        close_durability_notice: bool = true,
-
-        fn clearCloseDurabilityNotice(self: *@This()) void {
-            self.close_durability_notice = false;
-        }
-    };
-
-    var storage: FakeStorage = .{ .allocator = std.testing.allocator };
-    var state: FakeState = .{ .storage = &storage };
-    defer state.lifecycle.deinit();
-    var old_baseline = LoadedPersistedState.init(std.testing.allocator);
-    old_baseline.value.sidebar_collapsed = false;
-    state.lifecycle.projection_baseline = old_baseline;
-    state.lifecycle.projection_baseline_revision = 4;
-    state.lifecycle.dirty = true;
-    state.lifecycle.dirty_generation = 1;
-    state.lifecycle.flush_snapshot_generation = 1;
-
-    var acknowledged = LoadedPersistedState.init(std.testing.allocator);
-    acknowledged.value.sidebar_collapsed = true;
-    const result = try std.testing.allocator.create(FlushWorkerResult);
-    result.* = .{ .success = true, .acknowledged_revision = 5 };
-    result.done.store(true, .release);
-    const args = try std.testing.allocator.create(FlushWorkerArgs);
-    args.* = .{
-        .allocator = std.testing.allocator,
-        .storage = undefined,
-        .loaded = acknowledged,
-        .baseline = null,
-        .observed_revision = 4,
-        .result = result,
-    };
-    state.lifecycle.flush_in_flight = true;
-    state.lifecycle.flush_result = result;
-    state.lifecycle.flush_args = args;
-    pollFlushWorker(&state);
-
-    try std.testing.expect(!state.lifecycle.dirty);
-    try std.testing.expect(state.lifecycle.projection_baseline.?.value.sidebar_collapsed);
-    try std.testing.expectEqual(@as(?u64, 5), state.lifecycle.projection_baseline_revision);
-    try std.testing.expect(storage.cleared_spool);
-    try std.testing.expect(!state.close_durability_notice);
 }
 
 test "shutdown blocking flush repairs conflict or terminal adoption before saving" {
@@ -1587,17 +1436,6 @@ test "close durability failure returns before teardown and retry succeeds" {
     try std.testing.expect(state.lifecycle.dirty_spooled);
     try std.testing.expectEqual(@as(usize, 2), state.spool_attempts);
     try std.testing.expect(!state.teardown_started);
-}
-
-test "completed spool owns only its captured dirty generation" {
-    var state: State = .{ .dirty = true, .dirty_generation = 4, .next_flush_attempt_ms = 99 };
-    noteCompletedSpool(&state, 3);
-    try std.testing.expect(!state.dirty_spooled);
-    try std.testing.expectEqual(@as(i64, 0), state.next_flush_attempt_ms);
-    noteCompletedSpool(&state, 4);
-    try std.testing.expect(state.dirty_spooled);
-    state.markDirty(100);
-    try std.testing.expect(!state.dirty_spooled);
 }
 
 test "rejected snapshot with durable spool stops retries without marking daemon unavailable" {

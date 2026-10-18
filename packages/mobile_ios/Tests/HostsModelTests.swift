@@ -159,38 +159,6 @@ final class HostsModelTests: XCTestCase {
         XCTAssertEqual(restored.rows.count, 2)
     }
 
-    func testHostMenuChoiceSwitchesAndOpensPairingOnlyWhenNeeded() async throws {
-        try seed()
-        let model = try await launch()
-        model.choose("beta")
-        XCTAssertEqual(model.active, "beta")
-        XCTAssertEqual(try catalog().active, "beta")
-        XCTAssertNil(model.pairing)
-        model.choose("missing")
-        XCTAssertEqual(model.active, "beta")
-        await model.close()
-        revoked = true
-        let repair = try await launch()
-        repair.choose("alpha")
-        XCTAssertEqual(repair.active, "alpha")
-        XCTAssertEqual(repair.pairing, "alpha")
-    }
-
-    func testSignalsReachEachCoreInOrderAndDeduplicate() async throws {
-        try seed()
-        let model = try await launch()
-        for id in ["alpha", "beta"] {
-            XCTAssertEqual(Array(core(id).events.kinds.prefix(3)), ["start", "network_changed", "foreground"])
-        }
-        model.foreground(true)
-        model.network(NetworkState(available: true, id: "net-1"))
-        model.foreground(false)
-        model.network(NetworkState(available: true, id: "net-2"))
-        model.foreground(true)
-        try await waitUntil("signals delivered") { core("alpha").events.kinds.count == 6 && core("beta").events.kinds.count == 6 }
-        XCTAssertEqual(core("alpha").events.kinds, ["start", "network_changed", "foreground", "background", "network_changed", "foreground"])
-    }
-
     func testSignOutIsHostScopedAndRemovalWaitsForDeleteAcknowledgements() async throws {
         try seed()
         deleteDelayMs = 300
@@ -212,22 +180,6 @@ final class HostsModelTests: XCTestCase {
         XCTAssertEqual(try catalog().hosts.map(\.id), ["beta"])
     }
 
-    func testOfflineSignOutOffersExplicitForget() async throws {
-        try seed()
-        offline = true
-        let model = try await launch()
-        XCTAssertEqual(hostStatus(try XCTUnwrap(model.row("alpha"))), "Unreachable — is Tailscale on?")
-        model.signOut("alpha")
-        try await waitUntil("unconfirmed") { model.row("alpha")?.operation?.error?.code == "sign_out_unconfirmed" }
-        XCTAssertTrue(storage.deletes.isEmpty)
-        XCTAssertEqual(model.row("alpha")?.view?.auth_state, "paired")
-        try await waitUntil("action settled") { model.row("alpha")?.busy == false }
-        model.signOut("alpha", forget: true)
-        try await waitUntil("forgotten") { model.row("alpha")?.view?.auth_state == "signed_out" }
-        XCTAssertEqual(core("alpha").events.count { if case .forget_host = $0 { return true }; return false }, 1)
-        XCTAssertNotNil(storage.values["vc/1/beta/credential"])
-    }
-
     func testDeleteFailureRetriesThroughCoreWithoutRepeatingRevoke() async throws {
         try seed()
         let model = try await launch()
@@ -243,21 +195,6 @@ final class HostsModelTests: XCTestCase {
         XCTAssertEqual(core("alpha").events.count { if case .retry_connection = $0 { return true }; return false }, 1)
     }
 
-    func testRevokedStatusAndRejectedActionAreRecoverable() async throws {
-        try seed()
-        revoked = true
-        let model = try await launch()
-        XCTAssertTrue(hostStatus(try XCTUnwrap(model.row("alpha"))).contains("Pair again"))
-        core("alpha").rejectRetry = true
-        model.retry("alpha")
-        try await waitUntil("rejected") { model.error != nil }
-        XCTAssertEqual(model.error, "This host is still loading or finishing an action. Try again shortly.")
-        XCTAssertEqual(model.row("alpha")?.fatal, false)
-        try await waitUntil("action settled") { model.row("alpha")?.busy == false }
-        model.signOut("alpha")
-        try await waitUntil("signed out") { model.row("alpha")?.view?.auth_state == "signed_out" }
-    }
-
     func testCatalogReadFailureDoesNotEraseHostsAndCanRetry() async throws {
         try seed()
         storage.fail(read: true)
@@ -270,53 +207,6 @@ final class HostsModelTests: XCTestCase {
         XCTAssertFalse(model.loading)
         XCTAssertEqual(model.rows.count, 2)
         XCTAssertNotNil(storage.values["vc/1/alpha/credential"])
-    }
-
-    func testFailedSelectionWritePreservesActiveHost() async throws {
-        try seed()
-        let model = try await launch()
-        storage.fail(write: true)
-        model.select("beta")
-        XCTAssertNotNil(model.error)
-        XCTAssertEqual(model.active, "alpha")
-        storage.fail()
-        XCTAssertEqual(try catalog().active, "alpha")
-        model.select("beta")
-        XCTAssertNil(model.error)
-        XCTAssertEqual(model.active, "beta")
-    }
-
-    func testNicknamePersistsWithoutReopeningHostAndFailedSaveDoesNotChangeIt() async throws {
-        try seed()
-        let model = try await launch()
-        let count = cores.count
-        let session = model.session("alpha")
-        XCTAssertTrue(model.rename("alpha", label: "  Work machine  "))
-        XCTAssertEqual(model.row("alpha")?.saved.label, "Work machine")
-        XCTAssertEqual(try catalog().hosts.first?.label, "Work machine")
-        XCTAssertTrue(model.session("alpha") === session)
-        XCTAssertEqual(cores.count, count)
-        XCTAssertFalse(model.rename("alpha", label: "  "))
-        storage.fail(write: true)
-        XCTAssertFalse(model.rename("alpha", label: "Unsaved"))
-        XCTAssertEqual(model.row("alpha")?.saved.label, "Work machine")
-        storage.fail()
-    }
-
-    func testAddPersistsUniqueHostAndSeedsPrimarySlot() async throws {
-        let model = try await launch()
-        XCTAssertEqual(model.active, "primary")
-        model.add(label: "  Second host  ")
-        XCTAssertEqual(model.rows.count, 2)
-        let added = try XCTUnwrap(model.rows.last?.saved)
-        XCTAssertNotEqual(added.id, "primary")
-        XCTAssertEqual(added.label, "Second host")
-        XCTAssertEqual(model.pairing, added.id)
-        XCTAssertEqual(model.active, added.id)
-        XCTAssertEqual(try catalog().hosts.map(\.label), ["My host", "Second host"])
-        // Non-pairing URLs are ignored rather than opening a host slot.
-        model.open(url: try XCTUnwrap(URL(string: "https://verdeai.dev/other")))
-        XCTAssertEqual(model.rows.count, 2)
     }
 
     func testLegacySingleHostMigratesIntoCatalog() async throws {

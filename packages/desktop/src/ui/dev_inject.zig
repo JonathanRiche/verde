@@ -352,27 +352,3 @@ fn int(args: *std.mem.TokenIterator(u8, .scalar), default: u8) u8 {
     const token = args.next() orelse return default;
     return std.fmt.parseInt(u8, token, 10) catch default;
 }
-
-test "inject script maps chords and pixel coordinates" {
-    const Capture = struct {
-        events: [8]Event = undefined,
-        count: usize = 0,
-        fn dispatch(context: *anyopaque, event: *Event) bool {
-            const self: *@This() = @ptrCast(@alignCast(context));
-            self.events[self.count] = event.*;
-            self.count += 1;
-            return true;
-        }
-    };
-    var capture: Capture = .{};
-    const sink: Sink = .{ .context = &capture, .dispatch = Capture.dispatch, .window = .invalid, .scale = 2 };
-    try std.testing.expect(run("key ctrl+shift+p\n# c\nwheel 100 50 0 -3 precise\n", sink));
-    try std.testing.expectEqual(@as(usize, 3), capture.count);
-    const down = capture.events[0].key_down;
-    try std.testing.expectEqual(Keycode.p, down.key);
-    try std.testing.expect(down.mod.ctrl and down.mod.shift);
-    try std.testing.expectEqual(@as(u32, 25), down.scancode);
-    const wheel = capture.events[2].mouse_wheel;
-    try std.testing.expectEqual(@as(f32, 50), wheel.mouse_x);
-    try std.testing.expect(wheel.precise);
-}

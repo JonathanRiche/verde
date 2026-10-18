@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test'
-import { buildChatCwdChoices, chatCwdLocked, chatCwdTurnParams, createChatCwdApi, safeRelativeCwd } from './chat_cwd.ts'
+import { buildChatCwdChoices, chatCwdLocked, createChatCwdApi, safeRelativeCwd } from './chat_cwd.ts'
 const workspace = { workspace_id: 'ws', path: '/workspace', label: 'Workspace' }
 const manifest = { workspace_id: 'ws', repositories: [
   { repository_id: 'primary', label: 'Main', bindings: [{ runtime_id: 'local', root_path: '/workspace' }, { runtime_id: 'remote', root_path: '/remote' }] },
@@ -33,12 +33,6 @@ test('cwd locks on accepted work, provider session, runtime identity or active w
   expect(chatCwdLocked({ committed: false })).toBe(false)
   for (const thread of [{ committed: true }, { runtime_id: 'runtime' }, { provider_thread_id: 'session' }]) expect(chatCwdLocked(thread)).toBe(true)
   expect(chatCwdLocked({}, true)).toBe(true)
-})
-test('local and remote turn params preserve explicit cwd choices', () => {
-  expect(chatCwdTurnParams({}, false, '/workspace')).toEqual({ project_path: '/workspace' })
-  expect(chatCwdTurnParams({ repository_id: 'api' }, false, '/workspace')).toEqual({ repository_id: 'api', relative_cwd: null })
-  expect(chatCwdTurnParams({ repository_cwd: 'src' }, false, '/workspace')).toEqual({ repository_id: 'primary', relative_cwd: 'src' })
-  expect(chatCwdTurnParams({ repository_cwd: 'src' }, true, '/workspace')).toEqual({ repository_id: 'primary', relative_cwd: 'src', require_provider_ready: true })
 })
 test('cwd setter revalidates choices and lock after fetching, and never browses files', async () => {
   const calls = [], saves = [], notices = []

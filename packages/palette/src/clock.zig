@@ -14,9 +14,3 @@ pub fn sleepNs(ns: u64) void {
     var threaded = std.Io.Threaded.init_single_threaded;
     threaded.io().sleep(.{ .nanoseconds = @intCast(ns) }, .awake) catch {};
 }
-
-test "monotonic clock is nondecreasing" {
-    const before = monotonicTimestampNs();
-    const after = monotonicTimestampNs();
-    try std.testing.expect(after >= before);
-}

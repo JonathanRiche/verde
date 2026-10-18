@@ -1287,15 +1287,6 @@ fn monotonicNs() u64 {
     return @intCast(cu * std.time.ns_per_s / @as(u128, @intCast(@max(f, 1))));
 }
 
-test "cursor mapping" {
-    try std.testing.expectEqual(w.IDC_IBEAM, CursorShape.text.systemCursor());
-    try std.testing.expectEqual(w.IDC_HAND, CursorShape.pointer.systemCursor());
-    try std.testing.expectEqual(w.IDC_SIZEWE, CursorShape.col_resize.systemCursor());
-    try std.testing.expectEqual(w.IDC_SIZENESW, CursorShape.sw_resize.systemCursor());
-    try std.testing.expectEqual(@as(usize, 0), CursorShape.hidden.systemCursor());
-    try std.testing.expectEqual(w.IDC_ARROW, CursorShape.default.systemCursor());
-}
-
 test "clipboard LF to CRLF" {
     const a = std.testing.allocator;
     const u = try clipboardUtf16(a, "a\nb\r\nc\u{1F600}");

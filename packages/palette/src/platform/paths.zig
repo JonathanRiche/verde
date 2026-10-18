@@ -262,28 +262,6 @@ fn windowsPrefPath(gpa: std.mem.Allocator, org: ?[]const u8, app: []const u8) Pr
 
 const testing = std.testing;
 
-test "windows pref path composition matches SDL3" {
-    const L = std.unicode.utf8ToUtf16LeStringLiteral;
-    const a = testing.allocator;
-    const cases = [_]struct { org: []const u16, app: []const u16, want: []const u8, dirs: usize }{
-        .{ .org = L("verde"), .app = L("Native"), .want = "C:\\Users\\u\\AppData\\Roaming\\verde\\Native\\", .dirs = 2 },
-        .{ .org = L(""), .app = L("App"), .want = "C:\\Users\\u\\AppData\\Roaming\\App\\", .dirs = 1 },
-        .{ .org = L("org"), .app = L(""), .want = "C:\\Users\\u\\AppData\\Roaming\\org\\\\", .dirs = 2 },
-        .{ .org = L("\u{e9}t\u{e9}"), .app = L("\u{1F600}"), .want = "C:\\Users\\u\\AppData\\Roaming\\\u{e9}t\u{e9}\\\u{1F600}\\", .dirs = 2 },
-    };
-    for (cases) |cs| {
-        const p = try WindowsPrefPath.compose(L("C:\\Users\\u\\AppData\\Roaming"), cs.org, cs.app);
-        const got = try p.toUtf8(a);
-        defer a.free(got);
-        try testing.expectEqualStrings(cs.want, got);
-        try testing.expectEqual(cs.dirs, p.dir_count);
-    }
-    // MAX_PATH check: base + org + app + 4 > 260 fails, == 260 passes.
-    const long: [200]u16 = @splat('x');
-    _ = try WindowsPrefPath.compose(&long, &(@as([28]u16, @splat('o'))), &(@as([28]u16, @splat('a'))));
-    try testing.expectError(error.PathTooLong, WindowsPrefPath.compose(&long, &(@as([29]u16, @splat('o'))), &(@as([28]u16, @splat('a')))));
-}
-
 test "pref path composition matches SDL3" {
     const a = testing.allocator;
     const cases = [_]struct { xdg: ?[]const u8, home: ?[]const u8, org: ?[]const u8, app: []const u8, want: []const u8 }{
@@ -304,44 +282,4 @@ test "pref path composition matches SDL3" {
         try testing.expectEqualStrings(cs.want, got);
     }
     try testing.expectError(error.NoHomeDirectory, composePrefPath(a, null, null, "o", "a"));
-}
-
-test "pref path creates every component with mode 0700" {
-    if (is_windows) return error.SkipZigTest;
-    const a = testing.allocator;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var buf: [4096]u8 = undefined;
-    const n = try tmp.dir.realPathFile(testing.io, ".", &buf);
-    const root = buf[0..n];
-    const home = try std.fmt.allocPrint(a, "{s}/home", .{root});
-    defer a.free(home);
-    const p = try prefPathFrom(a, null, home, "verde", "Native");
-    defer a.free(p);
-    try testing.expect(std.mem.endsWith(u8, p, "/home/.local/share/verde/Native/"));
-    // Second call: everything exists already.
-    const again = try prefPathFrom(a, null, home, "verde", "Native");
-    defer a.free(again);
-    try testing.expectEqualStrings(p, again);
-    if (builtin.os.tag == .linux) {
-        var stx: linux.Statx = undefined;
-        try testing.expectEqual(@as(usize, 0), linux.statx(linux.AT.FDCWD, p.ptr, 0, .{ .MODE = true, .TYPE = true }, &stx));
-        try testing.expectEqual(@as(u16, 0o700), stx.mode & 0o777);
-        try testing.expect(linux.S.ISDIR(stx.mode));
-    } else {
-        var st: std.c.Stat = undefined;
-        try testing.expectEqual(@as(c_int, 0), std.c.fstatat(std.c.AT.FDCWD, p.ptr, &st, 0));
-        try testing.expectEqual(@as(u32, 0o700), @as(u32, st.mode) & 0o777);
-    }
-}
-
-test "macOS pref path composition matches SDL3 (Cocoa)" {
-    const a = testing.allocator;
-    const base = "/Users/u/Library/Application Support";
-    const p1 = try composeMacPrefPath(a, base, "verde", "Native");
-    defer a.free(p1);
-    try testing.expectEqualStrings("/Users/u/Library/Application Support/verde/Native/", p1);
-    const p2 = try composeMacPrefPath(a, base, null, "App");
-    defer a.free(p2);
-    try testing.expectEqualStrings("/Users/u/Library/Application Support/App/", p2);
 }

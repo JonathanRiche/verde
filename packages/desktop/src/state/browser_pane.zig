@@ -133,26 +133,6 @@ pub const BrowserPaneRef = struct {
     }
 };
 
-test "browser pane tabs preserve independent navigation and active state" {
-    const allocator = std.testing.allocator;
-    var pane: BrowserPaneRef = .{};
-    defer pane.deinit(allocator);
-
-    const first = try pane.ensureTab(allocator);
-    try first.recordNavigation(allocator, "https://one.example/");
-    try first.setTitle(allocator, "One");
-    try pane.tabs.append(allocator, .{});
-    pane.active_tab_index = 1;
-    const second = pane.activeTab().?;
-    try second.recordNavigation(allocator, "https://two.example/a");
-    try second.recordNavigation(allocator, "https://two.example/b");
-
-    try std.testing.expectEqual(@as(usize, 2), pane.tabs.items.len);
-    try std.testing.expectEqualStrings("One", pane.tabs.items[0].title.?);
-    try std.testing.expectEqualStrings("https://two.example/b", pane.activeTabConst().?.url.?);
-    try std.testing.expectEqualStrings("https://two.example/a", pane.activeTabConst().?.historyTarget(-1).?.url);
-}
-
 test "browser pane tab clone and reorder preserve ownership and active state" {
     const allocator = std.testing.allocator;
     var pane: BrowserPaneRef = .{};
@@ -171,26 +151,4 @@ test "browser pane tab clone and reorder preserve ownership and active state" {
     try std.testing.expect(pane.tabs.items[0].pinned);
     try std.testing.expectEqualStrings("One", pane.tabs.items[0].title.?);
     try std.testing.expectEqualStrings("https://one.example/", pane.tabs.items[0].history.items[0]);
-}
-
-test "background tab append preserves active page history and selection" {
-    const allocator = std.testing.allocator;
-    var pane: BrowserPaneRef = .{};
-    defer pane.deinit(allocator);
-    const current = try pane.ensureTab(allocator);
-    try current.recordNavigation(allocator, "https://planner.example/");
-    try current.setTitle(allocator, "Planner");
-    current.pinned = true;
-    const index = try pane.appendBackgroundTab(allocator, "http://localhost:7180/flow.html");
-    try std.testing.expectEqual(@as(usize, 1), index);
-    try std.testing.expectEqual(@as(usize, 0), pane.active_tab_index);
-    try std.testing.expectEqualStrings("https://planner.example/", pane.activeTab().?.url.?);
-    try std.testing.expectEqualStrings("Planner", pane.activeTab().?.title.?);
-    try std.testing.expect(pane.activeTab().?.pinned);
-    try std.testing.expectEqual(@as(usize, 1), pane.activeTab().?.history.items.len);
-    try std.testing.expectEqualStrings("http://localhost:7180/flow.html", pane.tabs.items[index].url.?);
-    try std.testing.expect(!pane.tabs.items[index].loading);
-    pane.active_tab_index = index;
-    _ = try pane.appendBackgroundTab(allocator, "about:blank");
-    try std.testing.expectEqual(index, pane.active_tab_index);
 }

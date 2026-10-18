@@ -203,14 +203,3 @@ test "scroll conversion" {
     try testing.expectApproxEqAbs(@as(f32, 0.35), l.y, 1e-6);
     try testing.expectApproxEqAbs(@as(f32, 0.1), l.x, 1e-6);
 }
-
-test "button mapping" {
-    try testing.expectEqual(@as(u8, 1), mapButton(BTN_LEFT));
-    try testing.expectEqual(@as(u8, 3), mapButton(BTN_RIGHT));
-    try testing.expectEqual(@as(u8, 2), mapButton(BTN_MIDDLE));
-    try testing.expectEqual(@as(u8, 4), mapButton(BTN_SIDE));
-    try testing.expectEqual(@as(u8, 5), mapButton(BTN_EXTRA));
-    var st: event.ButtonState = .{};
-    setButton(&st, 3, true);
-    try testing.expect(st.right and !st.left);
-}

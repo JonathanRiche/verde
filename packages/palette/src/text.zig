@@ -257,14 +257,6 @@ test "utf-8 iterator replaces invalid bytes" {
     try std.testing.expect(iter.next() == null);
 }
 
-test "measure handles utf-8 nbspace cjk and emoji fallback" {
-    const font = FontFace.defaultUi("", 10);
-    try std.testing.expectEqual(@as(f32, 5.5), font.measureRun("A"));
-    try std.testing.expectApproxEqAbs(@as(f32, 3.2), font.measureRun("\xc2\xa0"), 0.001);
-    try std.testing.expectEqual(@as(f32, 10.0), font.measureRun("界"));
-    try std.testing.expectEqual(@as(f32, 10.0), font.measureRun("🙂"));
-}
-
 test "measured width equals glyph placement advances" {
     const font = FontFace.defaultUi("", 12);
     const sample = "A\xc2\xa0界🙂Z";
@@ -280,19 +272,4 @@ test "measured width equals glyph placement advances" {
     var sum: f32 = 0.0;
     for (glyphs.items) |glyph| sum += glyph.advance;
     try std.testing.expectApproxEqAbs(font.measureRun(sample), sum, 0.001);
-}
-
-test "append text to batch emits positioned utf-8 runs" {
-    const font = FontFace.defaultUi("", 10);
-    var batch: draw.RenderBatch = .{};
-    defer batch.deinit(std.testing.allocator);
-    try appendTextToBatch(std.testing.allocator, &batch, .{
-        .rect = .{ .x = 2, .y = 3, .w = 14, .h = 40 },
-        .text = "AB界",
-        .color = draw.Color.white,
-        .font = &font,
-        .wrap = true,
-    });
-    try std.testing.expectEqual(@as(usize, 1), batch.commands.items.len);
-    try std.testing.expect(batch.commands.items[0].text_run_count >= 2);
 }

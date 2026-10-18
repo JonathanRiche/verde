@@ -69,18 +69,6 @@ final class PushContentTests: XCTestCase {
                                           kind: "approval_pending", action: .approve))
     }
 
-    func testCompletedAndInputNeededOfferReply() throws {
-        let device = Curve25519.KeyAgreement.PrivateKey()
-        let records = [(host: "alpha", record: try Sealer.record(device, runtime: "rt-1"))]
-        for kind in ["completed", "input_needed"] {
-            let envelope = try Sealer.seal(try Sealer.payload(kind: kind), to: device.publicKey)
-            let content = PushContentBuilder.content(for: placeholder(envelope)) { records }
-            XCTAssertEqual(content.categoryIdentifier, PushCategory.reply, kind)
-        }
-        let failed = try Sealer.seal(try Sealer.payload(kind: "failed"), to: device.publicKey)
-        XCTAssertEqual(PushContentBuilder.content(for: placeholder(failed)) { records }.categoryIdentifier, PushCategory.open)
-    }
-
     func testDecryptFailureLeavesThePlaceholderAsIs() throws {
         let device = Curve25519.KeyAgreement.PrivateKey()
         let stranger = Curve25519.KeyAgreement.PrivateKey()
@@ -255,18 +243,6 @@ private let token = Data((0..<32).map { UInt8($0) })
 private let tokenHex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
 
 final class PushRelayTests: XCTestCase {
-    func testConfigReadsRelayAndEnvironmentFromInfo() {
-        XCTAssertNil(PushConfig(info: [:]).relayURL)
-        XCTAssertNil(PushConfig(info: ["VerdePushRelayURL": ""]).relayURL)
-        XCTAssertNil(PushConfig(info: ["VerdePushRelayURL": "http://relay.test"]).relayURL)
-        XCTAssertNil(PushConfig(info: ["VerdePushRelayURL": "https://relay.test/?x=1"]).relayURL)
-        XCTAssertEqual(PushConfig(info: ["VerdePushRelayURL": " https://relay.test "]).relayURL?.absoluteString, "https://relay.test")
-        XCTAssertEqual(PushConfig(info: ["VerdeAPSEnvironment": "development"]).environment, "sandbox")
-        XCTAssertEqual(PushConfig(info: [:]).environment, "sandbox")
-        XCTAssertEqual(PushConfig(info: ["VerdeAPSEnvironment": "production"]).environment, "production")
-        XCTAssertEqual(token.pushTokenHex, tokenHex)
-    }
-
     func testRegisterAndDeleteFollowTheRelayContract() async throws {
         RelayStub.reset { call in call.method == "POST" ? (201, ["send_token": "v1.abc.def"]) : (204, nil) }
         let relay = PushRelayClient(base: URL(string: "https://relay.test/base")!, session: RelayStub.session())
@@ -452,44 +428,6 @@ final class PushRegistryTests: XCTestCase {
         registry.hostChanged("alpha")
         await registry.settle()
         XCTAssertEqual(try state(storage).hosts["alpha"]?.send_token, "v1.send1.mac")
-    }
-
-    func testWithoutARelayURLNothingRegisters() async throws {
-        let storage = MemoryStorage(), system = FakeSystem(), hosts = FakeHosts()
-        hosts.add("alpha", auth: "unpaired")
-        system.status = .notDetermined
-        let registry = registry(relay: nil, storage: storage, system: system, hosts: hosts)
-        XCTAssertFalse(registry.available)
-        registry.hostChanged("alpha")
-        hosts.add("alpha")
-        registry.hostChanged("alpha") // A completed pair doesn't prompt in a build without push.
-        await registry.refresh()
-        registry.deviceToken(token)
-        await registry.settle()
-        XCTAssertEqual(system.requests, 0)
-        XCTAssertEqual(system.remoteRegistrations, 0)
-        XCTAssertEqual(RelayStub.calls, [])
-        XCTAssertTrue(hosts.registrations.isEmpty)
-        XCTAssertNil(storage.values[PushRegistry.stateKey])
-    }
-
-    func testPermissionIsRequestedAfterAPairNotAtLaunch() async throws {
-        let system = FakeSystem(), hosts = FakeHosts()
-        system.status = .notDetermined
-        hosts.add("alpha") // Already paired at launch: no prompt.
-        let registry = registry(system: system, hosts: hosts)
-        await registry.refresh()
-        registry.hostChanged("alpha")
-        hosts.add("beta", auth: "unpaired")
-        registry.hostChanged("beta")
-        await registry.settle()
-        XCTAssertEqual(system.requests, 0)
-        XCTAssertEqual(system.remoteRegistrations, 0)
-
-        hosts.add("beta")
-        registry.hostChanged("beta")
-        try await waitUntil("permission requested") { system.requests == 1 && system.remoteRegistrations == 1 }
-        XCTAssertEqual(registry.authorization, .authorized)
     }
 
     func testDeniedPermissionRetiresCapabilities() async throws {

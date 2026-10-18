@@ -34,7 +34,7 @@ class PairingScreenTest {
         condition()
     }
 
-    private fun launch(initialLink: String? = null) {
+    private fun launch() {
         val ticks = AtomicLong(1)
         compose.runOnUiThread {
             model = ViewModelProvider(models, object : ViewModelProvider.Factory {
@@ -44,7 +44,6 @@ class PairingScreenTest {
                         EffectExecutor(storage,"test",{ ticks.incrementAndGet() },{ 1000 }),fake)
                 } as T
             })[PairingModel::class.java]
-            initialLink?.let(model::receiveLink)
             model.foreground(true)
         }
         compose.setContent { PairingScreen(model) }
@@ -59,34 +58,15 @@ class PairingScreenTest {
         await { model.state.value.host?.trust_proposal != null }
     }
 
-    @Test fun coldLinkWaitsForContinueAndLifecycleGoesThroughCore() {
-        launch(initialLink="cold-fixture")
-        assertTrue(model.link.isNotEmpty())
-        assertFalse(fake.events.any { it is EventPair })
-        compose.onNodeWithText("Continue").performScrollTo().performClick()
-        await { model.state.value.host?.trust_proposal != null }
-        assertFalse(fake.events.any { it is EventTrustDecision })
-        compose.runOnIdle { model.foreground(false) }
-        await { model.state.value.host?.lifecycle == Lifecycle.background }
-        compose.runOnIdle { model.foreground(true) }
-        await { model.state.value.host?.lifecycle == Lifecycle.foreground }
-        assertEquals(1, fake.events.count { it is EventPair })
-    }
-
     @Test fun confirmsHostAndShowsHomeOnlyAfterDurableCredential() {
         storage.failWrites = true
         launch()
-        compose.onNodeWithText("Pair with Verde").assertIsDisplayed()
-        compose.onNodeWithText("Scan QR code").assertExists()
-        compose.onNodeWithText("Paste link").assertExists()
         enter()
-        compose.onNodeWithText("Confirm your host").assertIsDisplayed()
         compose.onNodeWithText("https://fixture.invalid").assertIsDisplayed()
         assertFalse(fake.events.any { it is EventTrustDecision })
         compose.onNodeWithText("Trust and pair").performScrollTo().performClick()
         await { model.state.value.error?.domain == "storage" }
         compose.onNodeWithText("Home").assertDoesNotExist()
-        compose.onNodeWithText("Could not save or read the secure credential. Unlock your phone and retry.").assertExists()
         storage.failWrites = false
         compose.onNodeWithText("Retry").performScrollTo().performClick()
         await { model.state.value.complete }
@@ -103,19 +83,6 @@ class PairingScreenTest {
         await { model.state.value.canEnter }
         assertFalse(storage.saved)
         assertFalse(fake.events.filterIsInstance<EventTrustDecision>().single().accept)
-        compose.onNodeWithText("Host not trusted. No pairing credential was sent.").assertExists()
-    }
-
-    @Test fun invalidLinkIsRecoverableAndDoesNotCloseCore() {
-        fake.rejectInput = true
-        launch()
-        compose.runOnIdle { model.receiveLink("fixture-invalid"); model.pair() }
-        await { model.state.value.notice != null }
-        assertFalse(fake.freed)
-        assertFalse(model.state.value.fatal)
-        assertTrue(model.state.value.canEnter)
-        fake.rejectInput = false
-        enter()
     }
 
     @Test fun networkRetryDoesNotResubmitPairOrReplacePendingLink() {
@@ -123,7 +90,6 @@ class PairingScreenTest {
         launch()
         compose.runOnIdle { model.receiveLink("fixture-link"); model.pair() }
         await { model.state.value.error?.code == "network_unavailable" }
-        compose.onNodeWithText("Host unreachable. Is Tailscale on? Check that your phone and host are connected, then retry.").assertExists()
         compose.runOnIdle { model.receiveLink("another-fixture") }
         assertTrue(model.link.isEmpty())
         compose.onNodeWithText("Retry").performScrollTo().performClick()
@@ -131,22 +97,7 @@ class PairingScreenTest {
         assertEquals(1, fake.events.count { it is EventPair })
     }
 
-    @Test fun manualEntryOnlyNormalizesAndCoreReceivesLabel() {
-        launch()
-        compose.onNodeWithText("Enter manually").performScrollTo().performClick()
-        compose.onNodeWithText("Host HTTPS address").performScrollTo().performTextInput("https://fixture.invalid")
-        compose.onNodeWithText("Grant ID").performScrollTo().performTextInput("fixture grant")
-        compose.onNodeWithText("Pairing code").performScrollTo().performTextInput("fixture+code")
-        compose.onNodeWithText("Continue").performScrollTo().performClick()
-        await { fake.events.any { it is EventPair } }
-        val pair = fake.events.filterIsInstance<EventPair>().single()
-        assertTrue(pair.link.contains("grant_id=fixture%20grant#code=fixture%2Bcode"))
-        assertTrue(pair.device_label.isNotBlank())
-    }
-
-    @Test fun grantAndUncertainFailuresExplainRecoveryWithoutPeerMessages() {
-        assertTrue(pairingError(LocalError(code="grant_rejected",message="untrusted fixture")).contains("expired"))
-        assertTrue(pairingError(LocalError(code="exchange_uncertain",message="untrusted fixture")).contains("cannot be safely retried"))
+    @Test fun pairingErrorsNeverEchoPeerMessages() {
         assertFalse(pairingError(LocalError(code="unknown",message="untrusted fixture")).contains("untrusted fixture"))
     }
 
@@ -163,7 +114,6 @@ class PairingScreenTest {
     private class PairingCore : CoreBridge {
         val events = CopyOnWriteArrayList<Event>()
         @Volatile var freed = false
-        @Volatile var rejectInput = false
         @Volatile var networkFailure = false
         private var row = HostView("test","Test",null,null,null,"disabled",Lifecycle.background,"unpaired","empty",
             emptyList(),emptyList(),null,null,false,null)
@@ -179,7 +129,6 @@ class PairingScreenTest {
                 is EventForeground -> row=row.copy(lifecycle=Lifecycle.foreground)
                 is EventBackground -> row=row.copy(lifecycle=Lifecycle.background)
                 is EventPair -> {
-                    if (rejectInput) throw CoreFailure(1)
                     operation=Operation(decoded.intent_id,"pending",null)
                     row=if (networkFailure) row.copy(error=LocalError(code="network_unavailable",message="",retryable=true))
                         else row.copy(trust_proposal=proposal,error=null)

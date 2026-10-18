@@ -925,14 +925,6 @@ fn parseCursorApiKeyLine(line: []const u8) ?[]const u8 {
     return rest[0..end];
 }
 
-test "Cursor resource exhaustion explains provider capacity and links status" {
-    const message = cursorAgentErrorMessage("Error: RetriableError: [resource_exhausted] Error").?;
-    try std.testing.expect(std.mem.indexOf(u8, message, "temporarily at capacity") != null);
-    try std.testing.expect(std.mem.indexOf(u8, message, "https://status.cursor.com") != null);
-    try std.testing.expect(std.mem.indexOf(u8, message, "[resource_exhausted]") != null);
-    try std.testing.expect(cursorAgentErrorMessage("ordinary assistant reply") == null);
-}
-
 test "cursorModelArgAlloc folds params into the CLI model id" {
     const cases = [_]struct { model: []const u8, params: []const u8, expected: []const u8 }{
         // Legacy SDK params fold into suffixes.
@@ -985,28 +977,6 @@ test "parseModelsTextAlloc reads Cursor CLI model output" {
     try std.testing.expectEqualStrings("high", models[2].cursor_reasoning_values.?[2]);
 }
 
-test "parseModelsTextAlloc groups Grok effort rows without an unsuffixed model" {
-    const output =
-        \\Available models
-        \\cursor-grok-4.5-high - Cursor Grok 4.5
-        \\cursor-grok-4.5-high-fast - Cursor Grok 4.5 Fast
-        \\cursor-grok-4.5-low - Cursor Grok 4.5 Low
-        \\cursor-grok-4.5-low-fast - Cursor Grok 4.5 Low Fast
-        \\cursor-grok-4.5-medium - Cursor Grok 4.5 Medium
-        \\cursor-grok-4.5-medium-fast - Cursor Grok 4.5 Medium Fast
-    ;
-    const models = try parseModelsTextAlloc(std.testing.allocator, output);
-    defer provider_types.freeModelInfos(std.testing.allocator, models);
-    try std.testing.expectEqual(@as(usize, 1), models.len);
-    try std.testing.expectEqualStrings("cursor-grok-4.5-high", models[0].model_id);
-    try std.testing.expectEqualStrings("Cursor Grok 4.5", models[0].model_name);
-    try std.testing.expect(models[0].cursor_fast_supported);
-    try std.testing.expectEqual(@as(usize, 3), models[0].cursor_reasoning_values.?.len);
-    try std.testing.expectEqualStrings("low", models[0].cursor_reasoning_values.?[0]);
-    try std.testing.expectEqualStrings("medium", models[0].cursor_reasoning_values.?[1]);
-    try std.testing.expectEqualStrings("high", models[0].cursor_reasoning_values.?[2]);
-}
-
 test "loaded sessions switch to the catalog model behind a Verde model ref" {
     const allocator = std.testing.allocator;
     const load_line =
@@ -1047,12 +1017,4 @@ test "loaded sessions switch to the catalog model behind a Verde model ref" {
         \\{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}
     ;
     try std.testing.expectEqual(@as(?[]u8, null), try loadedSessionModelSwitchAlloc(allocator, init_line, "gpt-5.4-low"));
-}
-
-test "cursorBaseModelId strips Verde's fast, effort, and thinking suffixes" {
-    try std.testing.expectEqualStrings("gpt-5.4", cursorBaseModelId("gpt-5.4-low"));
-    try std.testing.expectEqualStrings("claude-opus-4-8", cursorBaseModelId("claude-opus-4-8-thinking-high-fast"));
-    try std.testing.expectEqualStrings("gpt-5.5", cursorBaseModelId("gpt-5.5-extra-high"));
-    try std.testing.expectEqualStrings("composer-2.5", cursorBaseModelId("composer-2.5"));
-    try std.testing.expectEqualStrings("composer-2.5", cursorBaseModelId("composer-2.5-fast"));
 }

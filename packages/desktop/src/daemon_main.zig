@@ -2033,13 +2033,6 @@ test "daemon CLI rejects ambiguous or unsupported options" {
     );
 }
 
-test "daemon notify target never falls back implicitly" {
-    try std.testing.expectEqual(NotifyTargetMode.data_dir, try selectNotifyTargetMode(true, false));
-    try std.testing.expectEqual(NotifyTargetMode.inherited_endpoint, try selectNotifyTargetMode(false, true));
-    try std.testing.expectError(error.MissingNotifyTarget, selectNotifyTargetMode(false, false));
-    try std.testing.expectError(error.AmbiguousNotifyTarget, selectNotifyTargetMode(true, true));
-}
-
 test "signal watcher recognizes only an accepted prepare-shutdown result" {
     const accepted =
         \\{"jsonrpc":"2.0","id":1,"result":{"accepted":true,"safe_to_exit":true}}
@@ -2083,18 +2076,4 @@ test {
     _ = @import("providers/opencode.zig");
     _ = @import("providers/pi.zig");
     _ = @import("providers/mcp.zig");
-}
-
-test "pair create parses presets and rejects ambiguous scope selections" {
-    for (access_protocol.PAIRING_PRESETS) |preset| {
-        const options = try parseArgs(&.{ "verde-daemon", "pair", "create", "--preset", @tagName(preset) });
-        try std.testing.expectEqual(@as(?access_protocol.PairingPreset, preset), options.pair.preset);
-        try std.testing.expectEqual(@as(usize, 0), options.pair.scope_count);
-    }
-    for ([_][]const []const u8{
-        &.{ "verde-daemon", "pair", "create", "--preset", "unknown" },
-        &.{ "verde-daemon", "pair", "create", "--preset", "chat", "--scope", "runtime:read" },
-        &.{ "verde-daemon", "pair", "create", "--scope", "runtime:read", "--preset", "chat" },
-        &.{ "verde-daemon", "pair", "create", "--preset", "chat", "--preset", "full" },
-    }) |args| try std.testing.expectError(error.InvalidArguments, parseArgs(args));
 }

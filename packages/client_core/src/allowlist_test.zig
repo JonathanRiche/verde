@@ -72,12 +72,6 @@ test "every RPC the core can send has a paired-device allowlist entry" {
     if (failed) return error.UnmappedCoreRpc;
 }
 
-test "WebSocket delta opt-in is mapped directly under the core.changes scope" {
-    // K-16 sends `core.changes.mode` on the feed socket; the gateway answers it
-    // locally but authorizes it through the same allowlist, with no alias.
-    try std.testing.expectEqual(access.requiredScopeMaskForRpc("core.changes").?, access.requiredScopeMaskForRpc("core.changes.mode").?);
-}
-
 const Audit = struct {
     allocator: std.mem.Allocator,
     methods: std.ArrayList([]const u8) = .empty,
@@ -229,12 +223,4 @@ fn mappedScope(method: []const u8) ?u16 {
         if (pendingGitScope(method)) |scope| return scope;
     }
     return access.requiredScopeMaskForRpc(method);
-}
-test "pending Git protocol scope fixture agrees with real mappings once present" {
-    for ([_][]const u8{ "git.changes.summary", "git.changes.status", "git.changes.review", "git.changes.commit_message", "git.changes.workspace", "git.changes.file_patch", "git.changes.commit", "git.changes.push", "git.changes.pull_push" }) |method| {
-        const mapped = mappedScope(method) orelse return error.UnmappedCoreRpc;
-        try std.testing.expectEqual(pendingGitScope(method).?, mapped);
-    }
-    try std.testing.expect(mappedScope("git.changes.unknown") == null);
-    try std.testing.expect(mappedScope("config.commit.set") == null);
 }

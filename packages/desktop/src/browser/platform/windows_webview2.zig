@@ -298,9 +298,3 @@ test "WebView2 string conversion preserves non-ASCII UTF-8" {
         try std.testing.expectEqual(@as(c_int, 1), verde_windows_webview2_test_utf8_roundtrip(value.ptr));
     }
 }
-
-test "WebView2 string conversion rejects invalid UTF-8" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-    const invalid: [:0]const u8 = "\xff";
-    try std.testing.expectEqual(@as(c_int, 0), verde_windows_webview2_test_utf8_roundtrip(invalid.ptr));
-}

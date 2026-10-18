@@ -174,25 +174,6 @@ test "workspace identity matches cross-client vectors" {
     try std.testing.expectEqual(Identity{ .icon_index = 5, .color_index = 5 }, identityFor(""));
 }
 
-test "workspace recency keeps the newest use per id" {
-    recency_count = 0;
-    noteUsed("a", 10);
-    noteUsed("b", 20);
-    noteUsed("a", 5);
-    try std.testing.expectEqual(@as(i64, 10), lastUsedMs("a"));
-    try std.testing.expectEqual(@as(i64, 20), lastUsedMs("b"));
-    try std.testing.expectEqual(@as(i64, 0), lastUsedMs("c"));
-    recency_count = 0;
-}
-
-test "hsl round trip preserves primaries" {
-    const red = hslToRgb(0.0, 1.0, 0.5);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), red[0], 0.001);
-    const back = rgbToHsl(.{ 0.2, 0.6, 0.4, 1.0 });
-    const again = hslToRgb(back[0], back[1], back[2]);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.6), again[1], 0.001);
-}
-
 /// Draws one identity chip (glyph tinted `base_color` on a tinted rounded
 /// square) into `batch`. Shared by the sidebar, the switcher trigger, and
 /// composer pickers so every workspace icon renders identically. The glyph

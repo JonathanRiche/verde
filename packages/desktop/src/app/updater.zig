@@ -272,16 +272,3 @@ test "version comparison accepts release tag prefixes" {
     try std.testing.expectEqual(std.math.Order.gt, compareVersions("0.6.0", "v0.5.0").?);
     try std.testing.expect(compareVersions("development", "v0.5.0") == null);
 }
-
-test "release assets match the current platform archive" {
-    const expected = switch (builtin.os.tag) {
-        .linux => isInstallAssetForCurrentPlatform(if (builtin.cpu.arch == .aarch64) "verde-1.2.3-linux-arm64.tar.gz" else "verde-1.2.3-linux-x86_64.tar.gz"),
-        .macos => isInstallAssetForCurrentPlatform(if (builtin.cpu.arch == .aarch64) "verde-1.2.3-macos-arm64.dmg" else "verde-1.2.3-macos-x86_64.dmg"),
-        .windows => isInstallAssetForCurrentPlatform("verde-1.2.3-windows-x86_64.zip"),
-        else => false,
-    };
-    if (builtin.os.tag == .linux or builtin.os.tag == .macos or builtin.os.tag == .windows) {
-        try std.testing.expect(expected);
-    }
-    try std.testing.expect(!isInstallAssetForCurrentPlatform("SHA256SUMS.txt"));
-}

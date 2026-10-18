@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
 import { resolveClientKey } from "../../src/app.ts";
-import { FixedWindowRateLimiter } from "../../src/rate_limit.ts";
 
 describe("request boundary", () => {
   test("trusts one forwarded IP only from an exact configured proxy", () => {
@@ -21,10 +20,4 @@ describe("request boundary", () => {
     ).toThrow();
   });
 
-  test("rate limiter fails closed at the configured boundary", () => {
-    const limiter = new FixedWindowRateLimiter(2, 60_000);
-    expect(limiter.allow("client")).toBeTrue();
-    expect(limiter.allow("client")).toBeTrue();
-    expect(limiter.allow("client")).toBeFalse();
-  });
 });

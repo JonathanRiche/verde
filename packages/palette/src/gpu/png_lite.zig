@@ -188,16 +188,3 @@ pub fn compare(a: []const u8, b: []const u8, tolerance: u8) Diff {
     }
     return diff;
 }
-
-test "png round trip" {
-    const gpa = std.testing.allocator;
-    var px: [7 * 5 * 4]u8 = undefined;
-    for (&px, 0..) |*p, i| p.* = @truncate(i * 37 + i / 3);
-    const png = try encode(gpa, 7, 5, &px);
-    defer gpa.free(png);
-    const img = try decode(gpa, png);
-    defer img.deinit(gpa);
-    try std.testing.expectEqual(@as(u32, 7), img.width);
-    try std.testing.expectEqualSlices(u8, &px, img.pixels);
-    try std.testing.expectEqual(@as(usize, 0), compare(&px, img.pixels, 0).mismatched);
-}

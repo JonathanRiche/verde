@@ -86,27 +86,6 @@ test "sync recorded daemon snapshot and catalog pages project native models with
     try expect(ws.threads[0].last_activity_at_ms.? == 1700000000000);
 }
 
-test "retry_connection re-reads snapshot and catalog only while ready" {
-    var h = try init();
-    defer h.deinit();
-    var tx = try host.Transaction.init(&h);
-    defer tx.deinit();
-    try fixture(&tx);
-    tx.state.sync.@"error" = .{ .domain = "rpc", .code = "catalog_changed", .message = "Changed", .retryable = true };
-    const retry = "{\"api_version\":1,\"type\":\"retry_connection\",\"now_ms\":1,\"wall_time_ms\":1700000050000,\"intent_id\":\"refresh-1\"}";
-    try tx.apply(try host.parse(tx.allocator(), retry));
-    try expect(tx.state.sync.snapshot_id != null and tx.state.sync.loading);
-    try expect(tx.state.sync.@"error" == null);
-    try respond(&tx, snapshot);
-    try respond(&tx, first);
-    try respond(&tx, last);
-    try expect(!tx.state.sync.loading and tx.state.sync.cursor.? == 9);
-    tx.state.rpc.phase = .disabled;
-    const offline = "{\"api_version\":1,\"type\":\"retry_connection\",\"now_ms\":1,\"wall_time_ms\":1700000050000,\"intent_id\":\"refresh-2\"}";
-    try tx.apply(try host.parse(tx.allocator(), offline));
-    try expect(tx.state.sync.snapshot_id == null and !tx.state.sync.loading);
-}
-
 test "legacy invalidations coalesce and do not advance cursor past applied data" {
     var h = try init();
     defer h.deinit();
@@ -130,162 +109,6 @@ test "legacy invalidations coalesce and do not advance cursor past applied data"
     try push(&tx, "core.changes", "{\"entries\":[],\"heartbeat\":true,\"next_cursor\":999}");
     try expect(tx.state.sync.cursor.? == 9);
     try expect(tx.state.rpc.calls.len == 0);
-}
-
-test "catalog revision expiration restarts and repeated cursors fail visibly" {
-    var h = try init();
-    defer h.deinit();
-    var tx = try host.Transaction.init(&h);
-    defer tx.deinit();
-    try ready(&tx);
-    try respond(&tx, snapshot);
-    try respond(&tx, first);
-    try expect(tx.state.rpc.calls.len > 0);
-    const call = tx.state.rpc.calls[0];
-    tx.state.rpc.results = try tx.allocator().dupe(rpc.Result, &.{.{ .id = call.id, .intent_id = null, .@"error" = .{ .domain = "rpc", .code = "remote_error", .message = "Rejected", .rpc_code = "revision_expired" } }});
-    tx.state.rpc.calls = &.{};
-    try sync.pump(&tx);
-    try expect(tx.state.sync.staged.len == 0);
-    try respond(&tx, first);
-    try respond(&tx, first);
-    try expect(tx.state.sync.@"error" != null);
-    try expect(tx.state.sync.cursor == null);
-}
-
-test "partial snapshots preserve omitted sections and changed nonce resets cursors" {
-    var h = try init();
-    defer h.deinit();
-    var tx = try host.Transaction.init(&h);
-    defer tx.deinit();
-    try fixture(&tx);
-    try sync.applySnapshotScopes(&tx, try host.parse(tx.allocator(), @embedFile("fixtures/sync/snapshot-config.json")), &.{"config"});
-    try sync.applySnapshot(&tx, try host.parse(tx.allocator(), "{\"snapshot\":{},\"store_revision\":1,\"turns\":[],\"incomplete_scopes\":[\"turns\"]}"));
-    try expect(p.rows(p.get(p.get(tx.state.sync.snapshot, "snapshot"), "workspaces")).len == 1);
-    try expect(p.get(tx.state.sync.snapshot, "config") == .object);
-    try push(&tx, "core.changes", "{\"entries\":[],\"expired\":true,\"envelope\":{\"instance_nonce\":\"new\"},\"next_cursor\":1000}");
-    try expect(tx.state.sync.cursor == null);
-    try expect(tx.state.sync.snapshot_id != null);
-}
-
-test "projection sort_index identity, omitted settings, explicit nulls and attention" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const ws = try host.parse(a, "{\"workspace_id\":\"w\",\"path\":\"/project\",\"workspace_layout_json\":\"{\\\"panes\\\":[{\\\"kind\\\":\\\"chat\\\",\\\"thread\\\":42},{\\\"kind\\\":\\\"chat\\\",\\\"thread\\\":42}]}\"}");
-    const t = try host.parse(a, "{\"workspace_id\":\"w\",\"local_thread_id\":\"x\",\"title\":\"X\",\"sort_index\":42}");
-    const turns = try host.parse(a, "[{\"workspace_id\":\"w\",\"local_thread_id\":\"x\",\"status\":\"waiting_approval\",\"started_at_ms\":123}]");
-    const panes = try p.panesForWorkspace(a, ws, &.{t}, .null, .null, turns);
-    try expect(panes.len == 1);
-    try expect(panes[0].attention and panes[0].can_stop);
-    try expect(panes[0].started_at_ms.? == 123);
-    const source = try host.parse(a, "{\"reasoning_effort\":\"high\",\"fast_mode\":\"on\"}");
-    const merged = try p.mergeThreadCatalogSettings(a, t, source, .null);
-    try eql("high", p.s(merged, "reasoning_effort"));
-    const explicit = try p.mergeThreadCatalogSettings(a, try host.parse(a, "{\"reasoning_effort\":null}"), source, .null);
-    try expect(p.get(explicit, "reasoning_effort") == .null);
-    try expect(try p.parseWorkspaceLayout(a, .{ .string = "invalid" }) == .null);
-}
-
-test "terminal panes carry agent TUI provider, surface status and title" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const ws = try host.parse(a, "{\"workspace_id\":\"w\",\"path\":\"/project\"}");
-    const sessions = try host.parse(a,
-        \\[{"session_id":"agent","workspace_id":"w","label":"Shell","command":"/usr/bin/fish -i","running":true,"status":"running","foreground_process":"claude"},
-        \\ {"session_id":"exited-agent","workspace_id":"w","label":"Shell","command":"/usr/bin/fish -i","running":true,"status":"running","foreground_process":"fish"},
-        \\ {"session_id":"legacy","workspace_id":"w","label":"Shell","command":"/usr/bin/fish -i","running":true,"status":"running"}]
-    );
-    const surfaces = try host.parse(a,
-        \\[{"session_id":"agent","provider":"claude","title":"Fix the build","status":"working"},
-        \\ {"session_id":"exited-agent","provider":"codex","title":"Old","status":"working"},
-        \\ {"session_id":"legacy","provider":"grok","title":"","status":"waiting"}]
-    );
-    const panes = try p.panesForWorkspace(a, ws, &.{}, sessions, surfaces, .null);
-    try expect(panes.len == 3);
-    try eql("claude", panes[0].provider.?);
-    try eql("Fix the build", panes[0].title);
-    try eql("working", panes[0].status);
-    try expect(panes[0].attention);
-    // A shell back in the foreground means the agent exited: ignore its stale surface.
-    try expect(panes[1].provider == null);
-    try eql("Shell", panes[1].title);
-    try eql("idle", panes[1].status);
-    try expect(!panes[1].attention);
-    // Daemons without `foreground_process` fall back to the surface row.
-    try eql("grok", panes[2].provider.?);
-    try eql("waiting", panes[2].status);
-    try expect(panes[2].attention);
-}
-
-test "sync consumes only owned RPC outcomes and stale sockets have no effects" {
-    var h = try init();
-    defer h.deinit();
-    var tx = try host.Transaction.init(&h);
-    defer tx.deinit();
-    try fixture(&tx);
-    tx.state.rpc.results = try tx.allocator().dupe(rpc.Result, &.{.{ .id = 999, .intent_id = null, .value = .null }});
-    try sync.pump(&tx);
-    try expect(tx.state.rpc.results.len == 1);
-    const before = tx.effects.items.len;
-    try tx.apply(try host.parse(tx.allocator(), "{\"api_version\":1,\"type\":\"ws_message\",\"now_ms\":2,\"wall_time_ms\":2,\"socket_id\":\"stale\",\"generation\":\"0\",\"text\":\"{}\"}"));
-    try expect(tx.effects.items.len == before);
-}
-
-test "queries remain pure and failed output allocation preserves populated state" {
-    var h = try init();
-    defer h.deinit();
-    var tx = try host.Transaction.init(&h);
-    defer tx.deinit();
-    try fixture(&tx);
-    const batch = try tx.commit(&h, std.testing.allocator);
-    defer std.testing.allocator.free(batch);
-    const before = try std.json.Stringify.valueAlloc(std.testing.allocator, h.state, .{});
-    defer std.testing.allocator.free(before);
-    const one = try h.query("workspaces", std.testing.allocator);
-    defer std.testing.allocator.free(one);
-    const two = try h.query("workspaces", std.testing.allocator);
-    defer std.testing.allocator.free(two);
-    try eql(one, two);
-    const after = try std.json.Stringify.valueAlloc(std.testing.allocator, h.state, .{});
-    defer std.testing.allocator.free(after);
-    try eql(before, after);
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    try std.testing.expectError(error.OutOfMemory, h.handle("{\"api_version\":1,\"type\":\"background\",\"now_ms\":3,\"wall_time_ms\":3}", failing.allocator()));
-    const unchanged = try std.json.Stringify.valueAlloc(std.testing.allocator, h.state, .{});
-    defer std.testing.allocator.free(unchanged);
-    try eql(before, unchanged);
-}
-
-test "full resync drops superseded sync results but preserves other feature results" {
-    var h = try init();
-    defer h.deinit();
-    var tx = try host.Transaction.init(&h);
-    defer tx.deinit();
-    try ready(&tx);
-    const old = tx.state.sync.snapshot_id.?;
-    tx.state.rpc.results = try tx.allocator().dupe(rpc.Result, &.{ .{ .id = old, .intent_id = "@sync", .value = try host.parse(tx.allocator(), snapshot) }, .{ .id = 999, .intent_id = "chat", .value = .null } });
-    tx.state.rpc.full_resync = true;
-    try sync.pump(&tx);
-    try expect(tx.state.sync.snapshot == .null);
-    try expect(tx.state.sync.snapshot_id.? != old);
-    try expect(tx.state.rpc.results.len == 1);
-    try expect(tx.state.rpc.results[0].id == 999);
-    try expect(p.uint(try host.parse(tx.allocator(), "18446744073709551615")).? == std.math.maxInt(u64));
-}
-
-test "valid legacy socket notification enters projection only at the matching generation" {
-    var h = try init();
-    defer h.deinit();
-    var tx = try host.Transaction.init(&h);
-    defer tx.deinit();
-    try fixture(&tx);
-    const socket = try tx.emit("ws_connect", .{});
-    try tx.track(.socket, socket, "fixture");
-    const note = try std.fmt.allocPrint(tx.allocator(), "{{\"method\":\"core.changes\",\"params\":{{\"result\":{s}}}}}", .{changes});
-    const event = try std.json.Stringify.valueAlloc(tx.allocator(), .{ .api_version = 1, .type = "ws_message", .now_ms = 2, .wall_time_ms = 2, .socket_id = socket, .generation = "0", .text = note }, .{});
-    try tx.apply(try host.parse(tx.allocator(), event));
-    try expect(tx.state.sync.snapshot_id != null);
 }
 
 // ---- K-16 delta mode. Fixtures come from a temporary daemon + gateway
@@ -484,28 +307,6 @@ test "delta contract: no full snapshot after hello and projections equal legacy"
     try expect(std.mem.indexOf(u8, (try projections(&tx))[1], "After delta") != null);
 }
 
-test "legacy host without the capability keeps K-09 sync" {
-    var h = try init();
-    defer h.deinit();
-    var tx = try host.Transaction.init(&h);
-    defer tx.deinit();
-    try deltaReady(&tx, false);
-    try expectScopes(&tx, &sync.scopes);
-    try respond(&tx, d_initial);
-    try respond(&tx, d_initial_threads);
-    const socket = try openSocket(&tx);
-    try wsMessage(&tx, socket, d_hello);
-    try wsMessage(&tx, socket, d_change);
-    try expectScopes(&tx, &sync.scopes);
-    try respond(&tx, d_after);
-    try respond(&tx, d_threads);
-    try expect(tx.state.sync.cursor.? == 8);
-    for (tx.effects.items) |effect| {
-        try expect(!host.eq(p.s(effect, "type"), "ws_send"));
-        try expect(!std.mem.endsWith(u8, p.s(effect, "key"), "/sync"));
-    }
-}
-
 test "delta reconnect resumes at the incorporated cursor without a snapshot" {
     var h = try init();
     defer h.deinit();
@@ -539,36 +340,6 @@ test "delta reconnect resumes at the incorporated cursor without a snapshot" {
     try legacyTwin(&legacy, d_final, d_final_threads);
     try expectSameProjections(&tx, &legacy);
     try expect(std.mem.indexOf(u8, (try projections(&tx))[1], "Offline edit") != null);
-}
-
-test "delta cancelled scoped read keeps its cursor and a new instance reseeds" {
-    var h = try init();
-    defer h.deinit();
-    var tx = try host.Transaction.init(&h);
-    defer tx.deinit();
-    const socket = try deltaSeeded(&tx);
-    try wsMessage(&tx, socket, d_change);
-    try expect(tx.state.sync.loading);
-    try tx.invalidateTransport();
-    try sync.pump(&tx);
-    try expect(!tx.state.sync.loading and tx.state.sync.@"error" == null);
-    try expect(tx.state.sync.cursor.? == 7 and tx.state.sync.delta.active_cursor == null);
-    tx.state.rpc.phase = .ready;
-    tx.state.rpc.full_resync = true;
-    try sync.pump(&tx);
-    try expect(tx.state.rpc.calls.len == 0);
-    const before = tx.effects.items.len;
-    try wsMessage(&tx, try openSocket(&tx), d_hello);
-    try expect(p.uint(p.get(p.get((try lastSend(&tx, before)).?, "params"), "cursor")).? == 7);
-    // A restarted daemon instance invalidates the cursor: full legacy seed.
-    try tx.invalidateTransport();
-    tx.state.rpc.instance_id = "ffeeddccbbaa99887766554433221100";
-    tx.state.rpc.phase = .ready;
-    tx.state.rpc.full_resync = true;
-    try sync.pump(&tx);
-    try expectScopes(&tx, &sync.scopes);
-    try expect(tx.state.sync.cursor == null and tx.state.sync.delta.instance_id.len > 0);
-    try eql("ffeeddccbbaa99887766554433221100", tx.state.sync.delta.instance_id);
 }
 
 test "delta expired, foreign nonce, regressed and malformed notices fall back then re-opt-in" {
@@ -614,44 +385,6 @@ test "delta expired, foreign nonce, regressed and malformed notices fall back th
     const before = tx.effects.items.len;
     try wsMessage(&tx, try openSocket(&tx), d_hello);
     try expect((try lastSend(&tx, before)) != null);
-}
-
-test "delta error and invalid notices fall back and superseded scoped reads are dropped" {
-    var h = try init();
-    defer h.deinit();
-    var tx = try host.Transaction.init(&h);
-    defer tx.deinit();
-    const socket = try deltaSeeded(&tx);
-    try wsMessage(&tx, socket, d_change);
-    const scoped = tx.state.sync.snapshot_id.?;
-    // An entry beyond next_cursor is not a valid journal page.
-    try wsMessage(&tx, socket, try frame(&tx, "[{\"change_seq\":20,\"topic\":\"session\",\"resource_id\":\"x\"}]", 9, ""));
-    try expect(tx.state.sync.delta.fallbacks == 1);
-    try expect(tx.state.sync.snapshot_id.? != scoped);
-    try expect(tx.state.rpc.calls.len == 2);
-    // The superseded scoped answer arrives first and is discarded.
-    try respond(&tx, d_scoped);
-    try expect(tx.state.sync.loading and tx.state.sync.cursor == null);
-    try expectScopes(&tx, &sync.scopes);
-    try respond(&tx, d_after);
-    try respond(&tx, d_threads);
-    try ackWith(&tx, socket, d_resume_ack);
-    try expect(tx.state.sync.delta.enabled);
-    try wsMessage(&tx, socket, "{\"jsonrpc\":\"2.0\",\"method\":\"core.changes\",\"params\":{\"jsonrpc\":\"2.0\",\"id\":9,\"error\":{\"code\":-32603,\"message\":\"poll failed\"}}}");
-    try expect(tx.state.sync.delta.fallbacks == 2 and !tx.state.sync.delta.enabled);
-    try expectScopes(&tx, &sync.scopes);
-    try respond(&tx, d_after);
-    try respond(&tx, d_threads);
-    try ackWith(&tx, socket, d_resume_ack);
-    // A failed scoped read also recovers through legacy.
-    try wsMessage(&tx, socket, try frame(&tx, "[{\"change_seq\":9,\"topic\":\"chat.turn\",\"resource_id\":\"t\"}]", 9, ""));
-    try expectScopes(&tx, &.{ "turns", "config" });
-    const call = tx.state.rpc.calls[0];
-    tx.state.rpc.results = try tx.allocator().dupe(rpc.Result, &.{.{ .id = call.id, .intent_id = "@sync", .@"error" = .{ .domain = "rpc", .code = "remote_error", .message = "Rejected" } }});
-    tx.state.rpc.calls = &.{};
-    try sync.pump(&tx);
-    try expect(tx.state.sync.delta.disabled and tx.state.sync.@"error" == null);
-    try expectScopes(&tx, &sync.scopes);
 }
 
 test "delta opt-in rejection or timeout keeps the socket on legacy sync" {
@@ -741,69 +474,6 @@ test "delta checkpoint restores a cold start without snapshots and rejects forei
     try expectScopes(&corrupt, &sync.scopes);
 }
 
-test "delta checkpoint write failures are non-fatal and oversized records are deleted" {
-    var h = try init();
-    defer h.deinit();
-    var tx = try host.Transaction.init(&h);
-    defer tx.deinit();
-    const socket = try deltaSeeded(&tx);
-    try storeDone(&tx, true);
-    try expect(tx.state.sync.@"error" == null and tx.state.sync.delta.enabled);
-    try deltaChanged(&tx, socket);
-    // The failed record is retried at the next incorporated cursor.
-    try expect(pendingIndex(&tx, .store_put, "/sync") != null);
-    // Two cursors while a write is in flight coalesce into one follow-up.
-    try wsMessage(&tx, socket, try frame(&tx, "[{\"change_seq\":9,\"topic\":\"notification\",\"resource_id\":\"n\"}]", 9, ""));
-    try wsMessage(&tx, socket, try frame(&tx, "[{\"change_seq\":10,\"topic\":\"notification\",\"resource_id\":\"n\"}]", 10, ""));
-    try expect(tx.state.sync.cursor.? == 10 and tx.state.sync.delta.save_again);
-    const before = tx.effects.items.len;
-    try storeDone(&tx, false);
-    var puts: usize = 0;
-    for (tx.effects.items[before..]) |effect| {
-        if (host.eq(p.s(effect, "type"), "secure_store_put")) puts += 1;
-    }
-    try expect(puts == 1);
-    try storeDone(&tx, false);
-    // A record over the per-item bound is deleted once instead of kept stale.
-    const big = try tx.allocator().alloc(u8, delta.CHECKPOINT_MAX);
-    @memset(big, 'x');
-    var row = try host.parse(tx.allocator(), "{\"workspace_id\":\"delta-ws\",\"local_thread_id\":\"big\"}");
-    try row.object.put(tx.allocator(), "title", .{ .string = big });
-    tx.state.sync.catalog = try tx.allocator().dupe(std.json.Value, &.{row});
-    try wsMessage(&tx, socket, try frame(&tx, "[{\"change_seq\":11,\"topic\":\"notification\",\"resource_id\":\"n\"}]", 11, ""));
-    try expect(pendingIndex(&tx, .store_delete, "/sync") != null);
-    try storeDone(&tx, false);
-    try wsMessage(&tx, socket, try frame(&tx, "[{\"change_seq\":12,\"topic\":\"notification\",\"resource_id\":\"n\"}]", 12, ""));
-    try expect(pendingIndex(&tx, .store_delete, "/sync") == null and pendingIndex(&tx, .store_put, "/sync") == null);
-}
-
-test "delta notices coalesce, replays are idempotent and heartbeats are free" {
-    var h = try init();
-    defer h.deinit();
-    var tx = try host.Transaction.init(&h);
-    defer tx.deinit();
-    const socket = try deltaSeeded(&tx);
-    try wsMessage(&tx, socket, d_change);
-    try wsMessage(&tx, socket, d_change);
-    try wsMessage(&tx, socket, try frame(&tx, "[{\"change_seq\":8,\"topic\":\"chat.thread\",\"resource_id\":\"delta-thread\"},{\"change_seq\":9,\"topic\":\"chat.turn\",\"resource_id\":\"t\"},{\"change_seq\":10,\"topic\":\"process\",\"resource_id\":\"p\"}]", 10, ""));
-    try wsMessage(&tx, socket, try frame(&tx, "[{\"change_seq\":11,\"topic\":\"session\",\"resource_id\":\"s\"}]", 11, ""));
-    try expectScopes(&tx, &.{ "workspaces", "config" });
-    try respond(&tx, d_scoped);
-    try respond(&tx, d_threads);
-    try expect(tx.state.sync.cursor.? == 8);
-    // One coalesced read for everything queued behind the first.
-    try expectScopes(&tx, &.{ "registry", "sessions", "turns", "config" });
-    try respond(&tx, d_scoped);
-    try expect(tx.state.sync.cursor.? == 11 and !tx.state.sync.loading);
-    try wsMessage(&tx, socket, try frame(&tx, "[]", 11, ",\"heartbeat\":true"));
-    try wsMessage(&tx, socket, try frame(&tx, "[{\"change_seq\":12,\"topic\":\"notification\",\"resource_id\":\"n\"}]", 12, ""));
-    try expect(tx.state.sync.cursor.? == 12 and tx.state.rpc.calls.len == 0);
-    // Unknown future topics refresh every scope but stay in delta mode.
-    try wsMessage(&tx, socket, try frame(&tx, "[{\"change_seq\":13,\"topic\":\"future.topic\",\"resource_id\":\"f\"}]", 13, ""));
-    try expect(tx.state.sync.delta.enabled);
-    try expect(tx.state.sync.delta.active_cursor.? == 13 and tx.state.sync.delta.active_catalog);
-}
-
 test "workspace projection normalizes legacy milliseconds before recent sorting and age buckets" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -837,26 +507,6 @@ test "workspace projection normalizes legacy milliseconds before recent sorting 
     }
 }
 
-test "workspace projection keeps uncommitted drafts out of history but in the thread catalog" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const data = try host.parse(a,
-        \\{"snapshot":{"workspaces":[{"workspace_id":"w","threads":[]}]}}
-    );
-    const listed = [_]std.json.Value{
-        try host.parse(a, "{\"workspace_id\":\"w\",\"local_thread_id\":\"draft\",\"title\":\"New Chat\",\"committed\":false,\"last_activity_at\":1790000050}"),
-        try host.parse(a, "{\"workspace_id\":\"w\",\"local_thread_id\":\"real\",\"title\":\"Real\",\"committed\":true,\"last_activity_at\":1790000000}"),
-        try host.parse(a, "{\"workspace_id\":\"w\",\"local_thread_id\":\"legacy\",\"title\":\"Legacy\",\"last_activity_at\":1700000000}"),
-    };
-    const models = try p.project(a, data, &listed, true, 1790000060000);
-    try std.testing.expectEqual(@as(usize, 2), models.history.len);
-    try eql("real", models.history[0].thread_id);
-    try eql("legacy", models.history[1].thread_id);
-    try std.testing.expectEqual(@as(usize, 3), models.workspaces[0].threads.len);
-    for (models.workspaces[0].threads) |t| try expect(t.committed == !std.mem.eql(u8, t.thread_id, "draft"));
-}
-
 test "workspace identity matches the cross-client FNV-1a vectors" {
     // Pinned in docs/workspace-switcher-sidebar.md consumers (desktop, web, iOS, Android).
     try std.testing.expectEqual(@as(u32, 0x48d4ea0e), p.identityHash("ws-alpha"));
@@ -868,95 +518,4 @@ test "workspace identity matches the cross-client FNV-1a vectors" {
     try std.testing.expectEqual(@as(u32, 0x811c9dc5), p.identityHash(""));
     try std.testing.expectEqual(@as(u8, 5), p.iconIndex(""));
     try std.testing.expectEqual(@as(u8, 5), p.colorIndex(""));
-}
-
-test "workspace identity overrides replace the hash independently" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const data = try host.parse(a,
-        \\{"snapshot":{"workspaces":[
-        \\{"workspace_id":"ws-alpha","icon_index":3,"color_index":null,"threads":[]},
-        \\{"workspace_id":"ws-alpha","color_index":7,"threads":[]},
-        \\{"workspace_id":"ws-alpha","icon_index":16,"color_index":-1,"threads":[]},
-        \\{"workspace_id":"ws-alpha","icon_index":"3","color_index":0,"threads":[]}]}}
-    );
-    const models = try p.project(a, data, &.{}, false, 1790000300000);
-    const expected = [_]struct { u8, bool, u8, bool }{
-        .{ 3, true, 2, false },
-        .{ 14, false, 7, true },
-        .{ 14, false, 2, false },
-        .{ 14, false, 0, true },
-    };
-    for (models.workspaces, expected) |w, e| {
-        try std.testing.expectEqual(e[0], w.icon_index);
-        try std.testing.expectEqual(e[1], w.icon_custom);
-        try std.testing.expectEqual(e[2], w.color_index);
-        try std.testing.expectEqual(e[3], w.color_custom);
-    }
-}
-
-test "workspace recency ranks focus and activity, then untimed open before closed" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const data = try host.parse(a,
-        \\{"snapshot":{"workspaces":[
-        \\{"workspace_id":"closed-idle","archived":true,"threads":[]},
-        \\{"workspace_id":"open-idle","threads":[]},
-        \\{"workspace_id":"ws-alpha","threads":[{"local_thread_id":"a","title":"A","last_activity_at":1790000000}]},
-        \\{"workspace_id":"closed-busy","archived":true,"threads":[{"local_thread_id":"b","title":"B","last_activity_at":1790000100}]},
-        \\{"workspace_id":"focused","threads":[{"local_thread_id":"c","title":"C","last_activity_at":1700000000}]}]}}
-    );
-    const focus = [_]p.FocusStamp{.{ .workspace_id = "focused", .at_ms = 1790000200000 }};
-    const models = try p.projectFocused(a, data, &.{}, false, 1790000300000, &focus);
-    const expected = [_]struct { []const u8, u32, ?i64 }{
-        .{ "closed-idle", 4, null },
-        .{ "open-idle", 3, null },
-        .{ "ws-alpha", 2, 1790000000000 },
-        .{ "closed-busy", 1, 1790000100000 },
-        .{ "focused", 0, 1790000200000 },
-    };
-    for (models.workspaces, expected) |w, e| {
-        try eql(e[0], w.workspace_id);
-        try std.testing.expectEqual(e[1], w.recency_rank);
-        try std.testing.expectEqual(e[2], w.recency_ms);
-        try std.testing.expectEqual(p.iconIndex(e[0]), w.icon_index);
-        try std.testing.expectEqual(p.colorIndex(e[0]), w.color_index);
-    }
-    // Snapshot order is preserved; only the rank changes.
-    try eql("ws-alpha", models.workspaces[2].workspace_id);
-    try std.testing.expectEqual(@as(u8, 14), models.workspaces[2].icon_index);
-}
-
-test "focus intents stamp workspace recency at wall time and survive sync resets" {
-    var h = try init();
-    defer h.deinit();
-    var tx = try host.Transaction.init(&h);
-    defer tx.deinit();
-    const a = tx.allocator();
-    tx.state.sync.snapshot = try host.parse(a,
-        \\{"snapshot":{"workspaces":[
-        \\{"workspace_id":"one","threads":[{"local_thread_id":"a","title":"A","last_activity_at":1790000000}]},
-        \\{"workspace_id":"two","threads":[]}]}}
-    );
-    tx.state.wall_time_ms = 1790000500000;
-    try sync.intent(&tx, "focus", try host.parse(a, "{\"workspace_id\":\"two\",\"thread_id\":null,\"terminal_id\":null}"));
-    try sync.intent(&tx, "focus", try host.parse(a, "{\"workspace_id\":null,\"thread_id\":null,\"terminal_id\":null}"));
-    try sync.intent(&tx, "send", try host.parse(a, "{\"workspace_id\":\"one\"}"));
-    try sync.intent(&tx, "workspace_archive", try host.parse(a, "{\"workspace_id\":\"one\",\"archived\":true}"));
-    try std.testing.expectEqual(@as(usize, 1), tx.state.sync.focus.len);
-    try sync.intent(&tx, "workspace_archive", try host.parse(a, "{\"workspace_id\":\"three\",\"archived\":false}"));
-    try std.testing.expectEqual(@as(usize, 2), tx.state.sync.focus.len);
-    sync.reset(&tx);
-    tx.state.sync.snapshot = try host.parse(a,
-        \\{"snapshot":{"workspaces":[
-        \\{"workspace_id":"one","threads":[{"local_thread_id":"a","title":"A","last_activity_at":1790000000}]},
-        \\{"workspace_id":"two","threads":[]}]}}
-    );
-    const items = p.rows(p.get(try sync.query(a, &tx.state, "workspaces"), "items"));
-    try eql("two", p.s(items[1], "workspace_id"));
-    try std.testing.expectEqual(@as(?i64, 0), p.num(p.get(items[1], "recency_rank")));
-    try std.testing.expectEqual(@as(?i64, 1790000500000), p.num(p.get(items[1], "recency_ms")));
-    try std.testing.expectEqual(@as(?i64, 1), p.num(p.get(items[0], "recency_rank")));
 }

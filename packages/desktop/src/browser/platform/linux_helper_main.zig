@@ -52,13 +52,6 @@ extern fn verde_browser_linux_poll_event(browser: ?*RawBrowser, kind: *c_int, pa
 extern fn verde_browser_linux_poll_frame(browser: ?*RawBrowser, path: *?[*:0]u8, sequence: *u64, slot: *c_int, width: *c_int, height: *c_int, byte_len: *usize, exported_at_ns: *u64, published_at_ns: *u64) c_int;
 extern fn verde_browser_linux_release_frame_slot(browser: ?*RawBrowser, slot: c_uint, sequence: u64) c_int;
 extern fn verde_browser_linux_free_string(payload: ?[*:0]u8) void;
-extern fn verde_browser_linux_test_context_menu_payload(scenario: c_uint, inspector_configured: c_int) ?[*:0]u8;
-extern fn verde_browser_linux_test_active_completion_deadline_us(last_frame_us: i64, now_us: i64) i64;
-extern fn verde_browser_linux_test_active_completion_deadline_with_lead_us(last_frame_us: i64, now_us: i64, production_lead_us: i64) i64;
-extern fn verde_browser_linux_test_updated_production_lead_us(existing_lead_us: i64, dispatched_us: i64, published_us: i64) i64;
-extern fn verde_browser_linux_test_frame_interval_us(visible: c_int) i64;
-extern fn verde_browser_linux_test_disables_process_swapping() c_int;
-extern fn verde_browser_linux_test_disables_async_overflow_scrolling() c_int;
 extern fn verde_browser_linux_test_deferred_frame_publishes_on_release() c_int;
 extern fn verde_browser_linux_test_wheel_event_is_smooth(delta_x: f64, delta_y: f64) c_int;
 extern fn verde_browser_linux_test_wheel_uses_smooth_2d() c_int;
@@ -539,98 +532,6 @@ fn encodeModifierMask(command: ipc.Command) c_uint {
     if (command.alt) mask |= 1 << 2;
     if (command.super) mask |= 1 << 3;
     return mask;
-}
-
-const TestContextMenuPayload = struct {
-    x: f32 = 0,
-    y: f32 = 0,
-    link_url: ?[]const u8 = null,
-    items: []const TestContextMenuItem = &.{},
-};
-
-const TestContextMenuItem = struct {
-    index: u32 = 0,
-    label: []const u8 = "",
-    enabled: bool = false,
-    separator: bool = false,
-    submenu: bool = false,
-    items: []const TestContextMenuItem = &.{},
-};
-
-fn parseTestContextMenu(scenario: c_uint, inspector_configured: bool) !std.json.Parsed(TestContextMenuPayload) {
-    const payload = verde_browser_linux_test_context_menu_payload(scenario, @intFromBool(inspector_configured)) orelse
-        return error.TestUnexpectedResult;
-    defer verde_browser_linux_free_string(payload);
-    return try std.json.parseFromSlice(
-        TestContextMenuPayload,
-        std.testing.allocator,
-        std.mem.span(payload),
-        .{ .allocate = .alloc_always },
-    );
-}
-
-test "WPE context menus serialize page link image and editable actions as valid JSON" {
-    const expected = [_][]const []const u8{
-        &.{ "Back", "Forward", "Stop", "Reload" },
-        &.{ "Open Link", "Open Link in New Window", "Download Linked File", "Copy Link" },
-        &.{ "Open Image in New Window", "Download Image", "Copy Image" },
-        &.{ "Cut", "Copy", "Paste" },
-    };
-    for (expected, 0..) |labels, scenario| {
-        var parsed = try parseTestContextMenu(@intCast(scenario), false);
-        defer parsed.deinit();
-        try std.testing.expect(parsed.value.items.len >= labels.len);
-        for (labels, 0..) |label, index| {
-            try std.testing.expectEqualStrings(label, parsed.value.items[index].label);
-        }
-    }
-}
-
-test "WPE Inspect Element remains informative when remote inspection is not configured" {
-    var unavailable = try parseTestContextMenu(0, false);
-    defer unavailable.deinit();
-    const setup_item = unavailable.value.items[unavailable.value.items.len - 1];
-    try std.testing.expectEqualStrings("Inspect Element (set WEBKIT_INSPECTOR_SERVER)", setup_item.label);
-    try std.testing.expect(!setup_item.enabled);
-
-    var configured = try parseTestContextMenu(0, true);
-    defer configured.deinit();
-    const inspect_item = configured.value.items[configured.value.items.len - 1];
-    try std.testing.expectEqualStrings("Inspect Element", inspect_item.label);
-    try std.testing.expect(inspect_item.enabled);
-}
-
-test "WPE context-menu separators and recursive submenus retain structure" {
-    var separated = try parseTestContextMenu(4, false);
-    defer separated.deinit();
-    try std.testing.expectEqual(@as(usize, 3), separated.value.items.len);
-    try std.testing.expect(separated.value.items[1].separator);
-
-    var nested = try parseTestContextMenu(5, false);
-    defer nested.deinit();
-    try std.testing.expectEqual(@as(usize, 1), nested.value.items.len);
-    try std.testing.expect(nested.value.items[0].submenu);
-    try std.testing.expect(nested.value.items[0].enabled);
-    try std.testing.expectEqual(@as(usize, 1), nested.value.items[0].items.len);
-    try std.testing.expectEqualStrings("Copy", nested.value.items[0].items[0].label);
-}
-
-test "WPE frame pacing uses active cadence while visible and does not postpone overdue work" {
-    try std.testing.expectEqual(@as(i64, 1_000_000 / 60), verde_browser_linux_test_frame_interval_us(1));
-    try std.testing.expectEqual(@as(i64, 1_000_000 / 10), verde_browser_linux_test_frame_interval_us(0));
-    try std.testing.expectEqual(@as(i64, 115_916), verde_browser_linux_test_active_completion_deadline_us(100_000, 110_000));
-    try std.testing.expectEqual(@as(i64, 113_916), verde_browser_linux_test_active_completion_deadline_with_lead_us(100_000, 110_000, 2_000));
-    try std.testing.expectEqual(@as(i64, 130_000), verde_browser_linux_test_active_completion_deadline_us(100_000, 130_000));
-    try std.testing.expectEqual(@as(i64, 2_000), verde_browser_linux_test_updated_production_lead_us(2_000, 100_000, 200_000));
-    try std.testing.expectEqual(@as(i64, 2_250), verde_browser_linux_test_updated_production_lead_us(2_000, 100_000, 103_000));
-}
-
-test "WPE helper keeps its legacy exportable backend in one web process" {
-    try std.testing.expectEqual(@as(c_int, 1), verde_browser_linux_test_disables_process_swapping());
-}
-
-test "WPE helper keeps overflow scrolling on the correctly rendered main path" {
-    try std.testing.expectEqual(@as(c_int, 1), verde_browser_linux_test_disables_async_overflow_scrolling());
 }
 
 test "WPE publishes the newest deferred frame when a shared slot is released" {

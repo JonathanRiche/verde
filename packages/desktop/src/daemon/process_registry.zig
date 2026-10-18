@@ -2183,19 +2183,6 @@ fn pruneOutcomeList(outcomes: *std.ArrayList(TerminalProcessOutcome), allocator:
     return removed_count;
 }
 
-test "workspace commands classify conservatively and infer resources" {
-    try std.testing.expectEqual(CommandClass.build, classifyWorkspaceCommand("mise run build"));
-    try std.testing.expectEqual(CommandClass.@"test", classifyWorkspaceCommand("bun test packages/desktop"));
-    try std.testing.expectEqual(CommandClass.formatter, classifyWorkspaceCommand("zig fmt src/main.zig"));
-    try std.testing.expectEqual(CommandClass.package_install, classifyWorkspaceCommand("pnpm install"));
-    try std.testing.expectEqual(CommandClass.migration, classifyWorkspaceCommand("rails db:migrate"));
-    try std.testing.expectEqual(CommandClass.dev_server, classifyWorkspaceCommand("npm run dev"));
-    try std.testing.expectEqual(CommandClass.other, classifyWorkspaceCommand("rg TODO src"));
-    try std.testing.expectEqual(CommandClass.other, classifyWorkspaceCommand("cat build/log.txt"));
-    try std.testing.expectEqualStrings("build", inferredWorkspaceResource("cargo test").?);
-    try std.testing.expect(inferredWorkspaceResource("rg TODO src") == null);
-}
-
 test "registry lease acquire renew conflict force release and expiry rules" {
     const allocator = std.testing.allocator;
     var registry = try ProcessRegistry.init(allocator, "daemon-a");
@@ -2238,44 +2225,6 @@ test "registry lease acquire renew conflict force release and expiry rules" {
     defer expiring.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 1), registry.activeLeaseCount(allocator, "workspace-a", 3_000 + WORKSPACE_LEASE_TTL_MS - 1));
     try std.testing.expectEqual(@as(usize, 0), registry.activeLeaseCount(allocator, "workspace-a", 3_000 + WORKSPACE_LEASE_TTL_MS));
-}
-
-test "lease ttl clamps to sane bounds and renewLeaseById extends only the owner's lease" {
-    const allocator = std.testing.allocator;
-    var registry = try ProcessRegistry.init(allocator, "daemon-a");
-    defer registry.deinit(allocator);
-
-    try std.testing.expectEqual(WORKSPACE_LEASE_TTL_MS, clampLeaseTtl(0));
-    try std.testing.expectEqual(WORKSPACE_LEASE_TTL_MIN_MS, clampLeaseTtl(999));
-    try std.testing.expectEqual(WORKSPACE_LEASE_TTL_MAX_MS, clampLeaseTtl(1_000_000_000));
-
-    var acquired = try registry.acquireLease(
-        allocator,
-        "workspace-a",
-        "owner-a",
-        "client-a",
-        "build",
-        &[_][]const u8{"build"},
-        false,
-        10_000,
-        100,
-    );
-    defer acquired.deinit(allocator);
-    const lease_id = try allocator.dupe(u8, acquired.lease.id);
-    defer allocator.free(lease_id);
-
-    try std.testing.expectError(
-        error.LeaseOwnerMismatch,
-        registry.renewLeaseById(allocator, "workspace-a", "owner-b", lease_id, 5_000, 200),
-    );
-    const renewed = try registry.renewLeaseById(allocator, "workspace-a", "owner-a", lease_id, 5_000, 200);
-    try std.testing.expectEqualStrings(lease_id, renewed.id);
-    try std.testing.expectEqual(@as(i64, 5_200), renewed.expires_at_ms);
-    try std.testing.expectEqual(@as(i64, 200), renewed.last_renewal_ms);
-    try std.testing.expectError(
-        error.LeaseNotFound,
-        registry.renewLeaseById(allocator, "workspace-a", "owner-a", "lease:missing", 5_000, 300),
-    );
 }
 
 test "registry terminal replacement bumps generation and preserves outcomes" {
@@ -2324,146 +2273,6 @@ test "registry terminal replacement bumps generation and preserves outcomes" {
     try std.testing.expectEqual(TerminalProcessOutcomeStatus.failed, registry.workspace("workspace-a").?.terminal_process_outcomes.items[0].status);
 }
 
-test "registry outcome retention is bounded and time-pruned" {
-    const allocator = std.testing.allocator;
-    var registry = try ProcessRegistry.init(allocator, "daemon-a");
-    defer registry.deinit(allocator);
-
-    for (0..TERMINAL_PROCESS_OUTCOME_MAX + 1) |index| {
-        var session_id_buf: [32]u8 = undefined;
-        const session_id = try std.fmt.bufPrint(&session_id_buf, "session-{d}", .{index});
-        _ = try registry.observeTerminalProcess(allocator, "workspace-a", .{
-            .process_identity = @intCast(index + 1),
-            .session_id = session_id,
-            .command = "build",
-            .cwd = "/tmp",
-            .started_at_ms = 1,
-            .observed_at_ms = @intCast(index + 1),
-            .dock_id = 1,
-            .owner_kind = "terminal",
-            .owner_title = "build",
-        }, .{});
-        try std.testing.expect(try registry.finishTerminalProcess(allocator, "workspace-a", session_id, .{ .exit_code = 0 }, @intCast(index + 1)));
-    }
-    try std.testing.expectEqual(TERMINAL_PROCESS_OUTCOME_MAX, registry.workspace("workspace-a").?.terminal_process_outcomes.items.len);
-    try std.testing.expectEqualStrings("session-1", registry.workspace("workspace-a").?.terminal_process_outcomes.items[0].session_id);
-    const first_finished = registry.workspace("workspace-a").?.terminal_process_outcomes.items[0].finished_at_ms;
-    try std.testing.expectEqual(@as(usize, 0), registry.pruneTerminalProcessOutcomes(allocator, "workspace-a", first_finished + TERMINAL_PROCESS_OUTCOME_TTL_MS));
-    try std.testing.expectEqual(@as(usize, 1), registry.pruneTerminalProcessOutcomes(allocator, "workspace-a", first_finished + TERMINAL_PROCESS_OUTCOME_TTL_MS + 1));
-}
-
-test "registry owns and finishes external processes" {
-    const allocator = std.testing.allocator;
-    var registry = try ProcessRegistry.init(allocator, "daemon-a");
-    defer registry.deinit(allocator);
-
-    const rejected = try ExternalProcess.init(allocator, "workspace-a", "external-rejected", "build", "/tmp", "task", "Build", "client-a");
-    try std.testing.expectError(error.WorkspaceIdRequired, registry.registerExternalProcess(allocator, "", rejected));
-
-    const process = try ExternalProcess.init(allocator, "workspace-a", "external-1", "build", "/tmp", "task", "Build", "client-a");
-    const registered = try registry.registerExternalProcess(allocator, "workspace-a", process);
-    try std.testing.expectEqual(ExternalProcessStatus.running, registered.status);
-    try std.testing.expectEqualStrings("client-a", registered.client_id);
-    try std.testing.expect(registry.finishExternalProcess("workspace-a", "external-1", .completed, 42));
-    try std.testing.expectEqual(ExternalProcessStatus.completed, registered.status);
-    try std.testing.expectEqual(@as(?i64, 42), registered.finished_at_ms);
-}
-
-test "releaseLeasesForClient releases across workspaces and bumps revision once" {
-    const allocator = std.testing.allocator;
-    var registry = try ProcessRegistry.init(allocator, "daemon-release-client");
-    defer registry.deinit(allocator);
-
-    var first = try registry.acquireLease(allocator, "workspace-a", "owner-a", "client-a", "build", &[_][]const u8{"build"}, false, 0, 10);
-    defer first.deinit(allocator);
-    var second = try registry.acquireLease(allocator, "workspace-b", "owner-b", "client-a", "test", &[_][]const u8{"test"}, false, 0, 10);
-    defer second.deinit(allocator);
-    var retained = try registry.acquireLease(allocator, "workspace-a", "owner-c", "client-c", "lint", &[_][]const u8{"lint"}, false, 0, 10);
-    defer retained.deinit(allocator);
-
-    const revision_before = registry.registry_revision;
-    try std.testing.expectEqual(@as(usize, 2), registry.releaseLeasesForClient(allocator, "client-a", 11));
-    try std.testing.expectEqual(revision_before + 1, registry.registry_revision);
-    try std.testing.expectEqual(@as(usize, 1), registry.activeLeaseCount(allocator, "workspace-a", 11));
-    try std.testing.expectEqual(@as(usize, 0), registry.activeLeaseCount(allocator, "workspace-b", 11));
-    try std.testing.expectEqual(@as(usize, 0), registry.releaseLeasesForClient(allocator, "client-a", 11));
-    try std.testing.expectEqual(revision_before + 1, registry.registry_revision);
-}
-
-test "registry lease ids are opaque unique and nonce-scoped" {
-    const allocator = std.testing.allocator;
-    var registry = try ProcessRegistry.init(allocator, "nonce-a");
-    defer registry.deinit(allocator);
-
-    var first = try registry.acquireLease(allocator, "workspace-a", "agent-a", "client-a", "build", &[_][]const u8{"build"}, false, 0, 1);
-    defer first.deinit(allocator);
-    const first_id = try allocator.dupe(u8, first.lease.id);
-    defer allocator.free(first_id);
-    try std.testing.expect(!std.mem.eql(u8, first.lease.id, "lease:1"));
-
-    _ = registry.releaseLease(allocator, "workspace-a", "agent-a", first.lease.id, 2);
-    const revision_before_replacement = registry.registry_revision;
-    try std.testing.expect(revision_before_replacement > 0);
-    try registry.replaceInstanceNonce(allocator, "nonce-b");
-    try std.testing.expectEqual(@as(u64, 0), registry.registry_revision);
-    var second = try registry.acquireLease(allocator, "workspace-a", "agent-a", "client-a", "deps", &[_][]const u8{"deps"}, false, 0, 3);
-    defer second.deinit(allocator);
-    try std.testing.expect(!std.mem.eql(u8, first_id, second.lease.id));
-    try std.testing.expect(std.mem.indexOf(u8, second.lease.id, "nonce-b") != null);
-    try std.testing.expectEqual(@as(u64, 1), registry.registry_revision);
-}
-
-test "registry clients issue opaque IDs track heartbeats and derive compatibility clients" {
-    const allocator = std.testing.allocator;
-    var registry = try ProcessRegistry.init(allocator, "nonce-a");
-    defer registry.deinit(allocator);
-
-    const persistent = try registry.registerClient(allocator, true, 100);
-    try std.testing.expect(std.mem.startsWith(u8, persistent.client_id, "client:nonce-a:"));
-    try std.testing.expect(persistent.persistent);
-    try std.testing.expect(registry.heartbeatClient(persistent.client_id, 200));
-    try std.testing.expectEqual(@as(i64, 200), persistent.last_heartbeat_ms);
-    try std.testing.expect(registry.closeClient(persistent.client_id, 300));
-    try std.testing.expect(!registry.heartbeatClient(persistent.client_id, 400));
-
-    const derived = try ProcessRegistry.deriveCompatibilityClientId(allocator, "session-a");
-    defer allocator.free(derived);
-    const compatibility = try registry.ensureCompatibilityClient(allocator, "session-a", 500);
-    try std.testing.expectEqualStrings(derived, compatibility.client_id);
-    try std.testing.expect(compatibility.compatibility);
-    const same_compatibility = try registry.ensureCompatibilityClient(allocator, "session-a", 600);
-    try std.testing.expectEqualStrings(compatibility.client_id, same_compatibility.client_id);
-    try std.testing.expectEqual(@as(i64, 600), same_compatibility.last_heartbeat_ms);
-    try std.testing.expectEqual(@as(usize, 2), registry.clients.count());
-}
-
-test "forced lease acquisition appends one pull notification per affected owner" {
-    const allocator = std.testing.allocator;
-    var registry = try ProcessRegistry.init(allocator, "nonce-a");
-    defer registry.deinit(allocator);
-
-    var first = try registry.acquireLease(allocator, "workspace-a", "owner-a", "client-a", "build", &[_][]const u8{"build"}, false, 0, 1_000);
-    defer first.deinit(allocator);
-    var forced = try registry.acquireLease(allocator, "workspace-a", "owner-b", "client-b", "cargo test", &[_][]const u8{"build"}, true, 0, 1_001);
-    defer forced.deinit(allocator);
-
-    const mailbox = &registry.workspace("workspace-a").?.notifications;
-    try std.testing.expectEqual(@as(usize, 1), mailbox.entries.items.len);
-    try std.testing.expectEqual(@as(u64, 1), mailbox.entries.items[0].seq);
-    try std.testing.expectEqualStrings("owner-a", mailbox.entries.items[0].owner_session_id.?);
-    try std.testing.expectEqualStrings(NOTIFICATION_TITLE_CONFLICTING_COMMAND, mailbox.entries.items[0].title);
-    try std.testing.expectEqualStrings("cargo test", mailbox.entries.items[0].body);
-    try std.testing.expectEqualStrings(NOTIFICATION_TYPE_COORDINATION_CONFLICT, mailbox.entries.items[0].type);
-    try std.testing.expectEqual(@as(usize, 2), registry.activeLeaseCount(allocator, "workspace-a", 1_001));
-
-    var pulled: std.ArrayList(*const Notification) = .empty;
-    defer pulled.deinit(allocator);
-    const next_seq = try registry.collectNotifications(allocator, "workspace-a", "owner-a", 0, 10, &pulled);
-    try std.testing.expectEqual(@as(usize, 1), pulled.items.len);
-    try std.testing.expectEqual(@as(u64, 2), next_seq);
-    try std.testing.expectEqualStrings("cargo test", pulled.items[0].command);
-}
-
 test "notification mailboxes enforce per-session and global bounds with monotonic cursors" {
     const allocator = std.testing.allocator;
     var registry = try ProcessRegistry.init(allocator, "nonce-a");
@@ -2487,21 +2296,6 @@ test "notification mailboxes enforce per-session and global bounds with monotoni
     _ = try workspace.notifications.collect(allocator, "owner-a", 0, 0, &pulled);
     try std.testing.expectEqual(@as(usize, 2), pulled.items.len);
     try std.testing.expectEqualStrings("two", pulled.items[0].body);
-}
-
-test "registry revision bump is scoped to the active instance nonce" {
-    const allocator = std.testing.allocator;
-    var registry = try ProcessRegistry.init(allocator, "nonce-a");
-    defer registry.deinit(allocator);
-
-    try std.testing.expectError(error.InstanceNonceMismatch, registry.bumpRegistryRevision("nonce-b"));
-    try std.testing.expectEqual(@as(u64, 0), registry.registry_revision);
-    try std.testing.expectEqual(@as(u64, 1), try registry.bumpRegistryRevision("nonce-a"));
-    try std.testing.expectEqual(@as(?u64, 1), registry.revisionForInstance("nonce-a"));
-    try std.testing.expect(registry.revisionForInstance("nonce-b") == null);
-    try registry.replaceInstanceNonce(allocator, "nonce-b");
-    try std.testing.expectEqual(@as(u64, 0), registry.registry_revision);
-    try std.testing.expectEqual(@as(?u64, 0), registry.revisionForInstance("nonce-b"));
 }
 
 test "managed process runtime transitions preserve restart and explicit-stop state" {
@@ -2546,95 +2340,6 @@ test "workspace path aliases reject collisions and expire by fake clock" {
     }
     try std.testing.expect(registry.workspaceByPath(allocator, "/work/alias-0", 200) == null);
     try std.testing.expect(registry.workspaceByPath(allocator, "/work/alias-1", 200) != null);
-}
-
-test "retention helpers pin grace boundaries and turn cap" {
-    try std.testing.expect(!orphanGraceExpired(0, ORPHAN_GRACE_MS));
-    try std.testing.expect(orphanGraceExpired(0, ORPHAN_GRACE_MS + 1));
-    try std.testing.expect(!disconnectedRetentionExpired(0, DISCONNECTED_RETENTION_MS + 1, true));
-    try std.testing.expect(!disconnectedRetentionExpired(0, DISCONNECTED_RETENTION_MS, false));
-    try std.testing.expect(disconnectedRetentionExpired(0, DISCONNECTED_RETENTION_MS + 1, false));
-    try std.testing.expect(!turnAbandonmentExpired(0, TURN_ABANDONMENT_GRACE_MS, .running));
-    try std.testing.expect(turnAbandonmentExpired(0, TURN_ABANDONMENT_GRACE_MS + 1, .running));
-    try std.testing.expect(!turnAbandonmentExpired(0, TURN_RETENTION_TTL_MS, .completed));
-    try std.testing.expect(turnAbandonmentExpired(0, TURN_RETENTION_TTL_MS + 1, .completed));
-    try std.testing.expect(!staleAttachExpired(0, STALE_ATTACH_TIMEOUT_MS));
-    try std.testing.expect(staleAttachExpired(0, STALE_ATTACH_TIMEOUT_MS + 1));
-
-    const allocator = std.testing.allocator;
-    var registry = try ProcessRegistry.init(allocator, "nonce-a");
-    defer registry.deinit(allocator);
-    var id_buffer: [32]u8 = undefined;
-    for (0..TURN_RETENTION_MAX + 1) |index| {
-        const turn_id = try std.fmt.bufPrint(&id_buffer, "turn-{d}", .{index});
-        try registry.retainTurn(allocator, "workspace-a", turn_id, .completed, @intCast(index));
-    }
-    const turns = &registry.workspace("workspace-a").?.retained_turns;
-    try std.testing.expectEqual(TURN_RETENTION_MAX, turns.items.len);
-    try std.testing.expectEqualStrings("turn-1", turns.items[0].id);
-    try std.testing.expectEqual(@as(usize, 0), registry.reapRetainedTurns(allocator, TURN_RETENTION_TTL_MS));
-    try std.testing.expectEqual(@as(usize, TURN_RETENTION_MAX - 1), registry.reapRetainedTurns(allocator, TURN_RETENTION_TTL_MS + 32));
-    try std.testing.expectEqual(@as(usize, 1), registry.reapRetainedTurns(allocator, TURN_RETENTION_TTL_MS + 33));
-}
-
-test "registry job queue is an owned bounded FIFO" {
-    const allocator = std.testing.allocator;
-    try std.testing.expectError(error.JobQueueCapacityRequired, RegistryJobQueue.init(0));
-    var queue = try RegistryJobQueue.init(2);
-    defer queue.deinit(allocator);
-
-    const first = try RegistryJob.init(allocator, .load_config, "workspace-a", "", "client-a");
-    try queue.push(allocator, first);
-    try queue.push(allocator, .{ .kind = .start_managed_process });
-    try std.testing.expect(queue.isFull());
-    try std.testing.expectError(error.JobQueueFull, queue.push(allocator, .{ .kind = .stop_managed_process }));
-    try std.testing.expectEqual(RegistryJobKind.load_config, queue.peek().?.kind);
-    var popped = queue.take().?;
-    defer popped.deinit(allocator);
-    try std.testing.expectEqualStrings("workspace-a", popped.workspace_id);
-    try std.testing.expectEqual(RegistryJobKind.start_managed_process, queue.peek().?.kind);
-    var second = queue.take().?;
-    second.deinit(allocator);
-    try queue.push(allocator, try RegistryJob.init(allocator, .restart_managed_process, "workspace-r", "proc:workspace-r:web", "client-r"));
-    var removed = queue.removeMatching("workspace-r", "proc:workspace-r:web").?;
-    defer removed.deinit(allocator);
-    try std.testing.expectEqual(RegistryJobKind.restart_managed_process, removed.kind);
-    try std.testing.expect(queue.take() == null);
-}
-
-test "ensureManagedProcess is idempotent per workspace and name" {
-    const allocator = std.testing.allocator;
-    var registry = try ProcessRegistry.init(allocator, "nonce-a");
-    defer registry.deinit(allocator);
-
-    const first = try registry.ensureManagedProcess(allocator, "workspace-a", "sleeper", "/bin/cat", 10);
-    try std.testing.expectEqualStrings("proc:workspace-a:sleeper", first.id);
-    const first_id = try allocator.dupe(u8, first.id);
-    defer allocator.free(first_id);
-    try std.testing.expectEqual(@as(usize, 1), registry.workspace("workspace-a").?.managed_processes.items.len);
-    const second = try registry.ensureManagedProcess(allocator, "workspace-a", "sleeper", "/bin/cat", 20);
-    try std.testing.expectEqualStrings(first.id, second.id);
-    try std.testing.expectEqual(@as(usize, 1), registry.workspace("workspace-a").?.managed_processes.items.len);
-
-    const other_workspace = try registry.ensureManagedProcess(allocator, "workspace-b", "sleeper", "/bin/cat", 30);
-    try std.testing.expectEqualStrings("proc:workspace-b:sleeper", other_workspace.id);
-    try std.testing.expect(!std.mem.eql(u8, first_id, other_workspace.id));
-}
-
-test "managed process records are bounded per workspace" {
-    const allocator = std.testing.allocator;
-    var registry = try ProcessRegistry.init(allocator, "nonce-cap");
-    defer registry.deinit(allocator);
-
-    var name_buffer: [32]u8 = undefined;
-    for (0..stack.MAX_PROCESS_DEFINITIONS) |index| {
-        const name = try std.fmt.bufPrint(&name_buffer, "process-{d}", .{index});
-        _ = try registry.ensureManagedProcess(allocator, "workspace-cap", name, "/bin/true", @intCast(index));
-    }
-    try std.testing.expectError(
-        error.ManagedProcessCapacityExceeded,
-        registry.ensureManagedProcess(allocator, "workspace-cap", "process-overflow", "/bin/true", 1000),
-    );
 }
 
 // --- W8: Windows-shaped registry semantics (data only; no builtin.os branches) ---

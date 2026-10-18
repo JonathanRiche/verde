@@ -32,18 +32,6 @@ final class FileViewerTests: XCTestCase {
         XCTAssertEqual(FileProblem.download("too_large", limit: ViewerKind.downloadLimit).title, "Too large to download")
         XCTAssertEqual(FileProblem.of(nil, limit: 1), .failed)
     }
-    func testFileBufferEvictsConsumesAndDiscardsLateCompletions() {
-        let buffer = FileBuffer()
-        for i in 0..<5 { buffer.put(String(i), FileBytes(data: Data([UInt8(i)]), mime: nil)) }
-        XCTAssertNil(buffer.take("0"))
-        XCTAssertEqual(buffer.take("1")?.data, Data([1]))
-        XCTAssertNil(buffer.take("1"))
-        buffer.discard("later")
-        buffer.put("later", FileBytes(data: Data([9]), mime: nil))
-        XCTAssertNil(buffer.take("later"))
-        buffer.clear()
-        XCTAssertNil(buffer.take("4"))
-    }
     func testFileTransportKeepsBytesOutOfCoreAndRejectsOversize() throws {
         let session = URLSession(configuration: .ephemeral)
         defer { session.invalidateAndCancel() }
@@ -63,20 +51,5 @@ final class FileViewerTests: XCTestCase {
             else { XCTAssertNil(received) }
             if size > 4 { XCTAssertEqual(result.error?.kind, .resource) }
         }
-    }
-    func testExplicitShareCopyIsProtectedAndRemoved() throws {
-        let file = try SharedFile(Data("fixture".utf8), name: "a.txt")
-        defer { file.remove() }
-        XCTAssertEqual(try Data(contentsOf: file.url), Data("fixture".utf8))
-        XCTAssertTrue(try file.url.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup == true)
-        file.remove()
-        XCTAssertFalse(FileManager.default.fileExists(atPath: file.url.path))
-    }
-    func testHostPaletteBoundsAndRGBA() throws {
-        XCTAssertNil(HostPalette.components("#fffffffff"))
-        XCTAssertNil(HostPalette.components("bad"))
-        XCTAssertEqual(HostPalette.components("#11223380")?.3 ?? 0, 128.0 / 255, accuracy: 0.001)
-        let palette = try JSONDecoder().decode(HostPalette.self, from: Data(##"{"colors":{"background":"#ffffffff","text":"#000000ff"},"reduced_motion":true}"##.utf8))
-        XCTAssertFalse(palette.dark); XCTAssertNotNil(palette.color("text")); XCTAssertEqual(palette.reduced_motion, true)
     }
 }

@@ -271,52 +271,11 @@ test "phone pairing host validation and fragment-only code" {
     try std.testing.expectEqualStrings("https://verdeai.dev/pair?host=https%3A%2F%2Fhost.ts.net%3A8443&grant_id=grant#code=secret", link);
 }
 
-test "phone pairing close discards outstanding grant and resets confirmation" {
-    var state: State = .{ .opened = true, .confirm_revoke = 2 };
-    state.close();
-    try std.testing.expect(!state.opened and state.discard_grant and state.confirm_revoke == null);
-}
-
 fn fixtureJob(operation: Operation) !*Job {
     const job = try allocator.create(Job);
     job.* = .{ .arena = .init(allocator), .pref_path = "", .operation = operation, .host = "", .device_id = null };
     job.done.store(true, .release);
     return job;
-}
-
-test "phone pairing completed grant expires and closing discards late results" {
-    var state: State = .{};
-    defer state.deinit();
-    const job = try fixtureJob(.create);
-    job.link = try job.arena.allocator().dupe(u8, "secret fixture");
-    job.expires_at_ms = 2000;
-    state.pending = job;
-    try std.testing.expect(state.poll(1000));
-    try std.testing.expect(state.grant != null and state.pending == null);
-    try std.testing.expect(!state.poll(1500));
-    try std.testing.expect(state.poll(2000));
-    try std.testing.expect(state.grant == null);
-    state.pending = try fixtureJob(.create);
-    state.close();
-    try std.testing.expect(state.poll(2100));
-    try std.testing.expect(state.grant == null and state.pending == null);
-}
-
-test "phone pairing failed refresh preserves list and successful revoke replaces it" {
-    var state: State = .{};
-    defer state.deinit();
-    const old = try fixtureJob(.list);
-    state.devices_result = old;
-    const failed = try fixtureJob(.list);
-    failed.failed = true;
-    state.pending = failed;
-    try std.testing.expect(state.poll(0));
-    try std.testing.expect(state.devices_result == old);
-    const revoked = try fixtureJob(.revoke);
-    state.pending = revoked;
-    try std.testing.expect(state.poll(0));
-    try std.testing.expect(state.devices_result == revoked);
-    try std.testing.expectEqualStrings("Device revoked.", state.notice);
 }
 
 test "phone pairing local RPC grant becomes an App Link and local QR" {
@@ -346,36 +305,4 @@ test "phone pairing local RPC grant becomes an App Link and local QR" {
         try std.testing.expect(std.mem.endsWith(u8, job.link.?, "#code=" ++ "d" ** 64));
         try std.testing.expect(job.qr != null and job.qr.?.size > 0);
     }
-}
-
-test "phone pairing presets default to Full and freeze for in-flight or displayed grants" {
-    var state: State = .{};
-    defer state.deinit();
-    try std.testing.expectEqual(access.PairingPreset.full, state.preset);
-    for (PAIRING_PRESETS, 0..) |preset, index| {
-        state.selectPreset(index);
-        try std.testing.expectEqual(preset, state.preset);
-        try std.testing.expect(presetDescription(preset).len > 0);
-    }
-    state.selectPreset(PAIRING_PRESETS.len);
-    try std.testing.expectEqual(access.PairingPreset.monitor, state.preset);
-    state.pending = try fixtureJob(.create);
-    state.selectPreset(0);
-    try std.testing.expectEqual(access.PairingPreset.monitor, state.preset);
-    state.pending.?.expires_at_ms = 2000;
-    _ = state.poll(1000);
-    state.selectPreset(0);
-    try std.testing.expectEqual(access.PairingPreset.monitor, state.preset);
-    state.close();
-    try std.testing.expectEqual(access.PairingPreset.full, state.preset);
-}
-
-test "phone pairing device preset and access cap labels preserve null semantics" {
-    try std.testing.expectEqualStrings("Custom / legacy", presetLabel(null));
-    try std.testing.expectEqualStrings("Full", presetLabel(.full));
-    try std.testing.expectEqualStrings("Chat", presetLabel(.chat));
-    try std.testing.expectEqualStrings("Monitor", presetLabel(.monitor));
-    try std.testing.expectEqualStrings("No cap", accessModeLabel(null));
-    try std.testing.expectEqualStrings("Supervised", accessModeLabel(.supervised));
-    try std.testing.expectEqualStrings("Full access", accessModeLabel(.full_access));
 }

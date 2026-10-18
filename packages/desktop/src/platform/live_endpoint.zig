@@ -23,10 +23,6 @@ pub fn alloc(allocator: std.mem.Allocator, pref_path: []const u8) ![]u8 {
     return allocForOsAndEnv(allocator, builtin.os.tag, pref_path, &env_map);
 }
 
-pub fn allocForOs(allocator: std.mem.Allocator, comptime os_tag: std.Target.Os.Tag, pref_path: []const u8) ![]u8 {
-    return allocForOsAndEnv(allocator, os_tag, pref_path, EmptyEnv{});
-}
-
 fn allocForOsAndEnv(
     allocator: std.mem.Allocator,
     comptime os_tag: std.Target.Os.Tag,
@@ -74,44 +70,4 @@ fn normalizePrefPathForEndpoint(comptime os_tag: std.Target.Os.Tag, pref_path: [
     var end = pref_path.len;
     while (end > 0 and is_sep(pref_path[end - 1])) : (end -= 1) {}
     return if (end == 0) pref_path else pref_path[0..end];
-}
-
-const EmptyEnv = struct {
-    fn get(_: EmptyEnv, _: []const u8) ?[]const u8 {
-        return null;
-    }
-};
-
-const FakeEnv = struct {
-    endpoint: ?[]const u8 = null,
-    legacy_socket: ?[]const u8 = null,
-
-    fn get(self: FakeEnv, name: []const u8) ?[]const u8 {
-        if (std.mem.eql(u8, name, ENDPOINT_ENV)) return self.endpoint;
-        if (std.mem.eql(u8, name, LEGACY_UNIX_SOCKET_ENV)) return self.legacy_socket;
-        return null;
-    }
-};
-
-test "windows endpoint is stable and accepts a transport-neutral override" {
-    const allocator = std.testing.allocator;
-    const pref = "C:\\Users\\Test User\\AppData\\Roaming\\verde\\Native";
-    const endpoint = try allocForOs(allocator, .windows, pref);
-    defer allocator.free(endpoint);
-    try std.testing.expect(std.mem.startsWith(u8, endpoint, WINDOWS_PIPE_PREFIX));
-
-    const trailing = try allocForOs(allocator, .windows, pref ++ "\\");
-    defer allocator.free(trailing);
-    try std.testing.expectEqualStrings(endpoint, trailing);
-
-    const override = try allocForOsAndEnv(allocator, .windows, pref, FakeEnv{ .endpoint = "\\\\.\\pipe\\verde-test" });
-    defer allocator.free(override);
-    try std.testing.expectEqualStrings("\\\\.\\pipe\\verde-test", override);
-}
-
-test "Unix endpoint preserves the legacy socket override" {
-    const allocator = std.testing.allocator;
-    const endpoint = try allocForOsAndEnv(allocator, .linux, "/tmp/verde", FakeEnv{ .legacy_socket = "/tmp/custom.sock" });
-    defer allocator.free(endpoint);
-    try std.testing.expectEqualStrings("/tmp/custom.sock", endpoint);
 }

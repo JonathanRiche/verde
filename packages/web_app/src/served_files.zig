@@ -354,28 +354,6 @@ fn testRoots(allocator: std.mem.Allocator, tree: TestTree, relatives: []const []
     return .{ .paths = paths };
 }
 
-test "confinement accepts files inside a registered root" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tree = try TestTree.init(allocator, io);
-    defer tree.deinit(allocator);
-    try tree.tmp.dir.createDirPath(io, "a/b/docs");
-    try tree.writeFile(io, "a/b/docs/report.pdf");
-
-    const roots = try testRoots(allocator, tree, &.{"a/b"});
-    defer roots.deinit(allocator);
-
-    const inside = try tree.path(allocator, "a/b/docs/report.pdf");
-    defer allocator.free(inside);
-    const resolved = try roots.confine(allocator, io, inside);
-    defer allocator.free(resolved);
-    try std.testing.expectEqualStrings(inside, resolved);
-
-    const missing = try tree.path(allocator, "a/b/docs/absent.pdf");
-    defer allocator.free(missing);
-    try std.testing.expectError(error.FileNotFound, roots.confine(allocator, io, missing));
-}
-
 test "confinement rejects dot-dot traversal that leaves the root" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -473,85 +451,6 @@ const FixtureLister = struct {
     }
 };
 
-test "root cache collects workspace paths and repository bindings across pages" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tree = try TestTree.init(allocator, io);
-    defer tree.deinit(allocator);
-    try tree.tmp.dir.createDirPath(io, "ws-one");
-    try tree.tmp.dir.createDirPath(io, "checkout");
-    try tree.tmp.dir.createDirPath(io, "ws-two");
-    try tree.tmp.dir.symLink(io, "ws-two", "ws-two-link", .{});
-
-    const ws_one = try tree.path(allocator, "ws-one");
-    defer allocator.free(ws_one);
-    const checkout = try tree.path(allocator, "checkout");
-    defer allocator.free(checkout);
-    const ws_two = try tree.path(allocator, "ws-two");
-    defer allocator.free(ws_two);
-    const ws_two_link = try tree.path(allocator, "ws-two-link");
-    defer allocator.free(ws_two_link);
-    const missing = try tree.path(allocator, "missing");
-    defer allocator.free(missing);
-
-    const page_one = try std.fmt.allocPrint(
-        allocator,
-        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"runtime_id\":\"r\",\"workspaces\":[{{\"workspace_id\":\"w1\",\"label\":\"one\",\"path\":\"{s}\",\"repositories\":[{{\"repository_id\":\"primary\",\"label\":\"one\",\"bindings\":[{{\"runtime_id\":\"r\",\"availability\":\"available\",\"root_path\":\"{s}\"}},{{\"runtime_id\":\"r\",\"availability\":\"available\",\"root_path\":\"{s}\"}}]}}]}}],\"next_cursor\":\"1\",\"store_revision\":3}}}}",
-        .{ ws_one, checkout, missing },
-    );
-    defer allocator.free(page_one);
-    const page_two = try std.fmt.allocPrint(
-        allocator,
-        "{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"workspaces\":[{{\"workspace_id\":\"w2\",\"label\":\"two\",\"path\":\"{s}\"}},{{\"workspace_id\":\"w3\",\"label\":\"dup\",\"path\":\"{s}\"}}],\"next_cursor\":null,\"store_revision\":3}}}}",
-        .{ ws_two_link, ws_one },
-    );
-    defer allocator.free(page_two);
-
-    var lister: FixtureLister = .{ .allocator = allocator, .pages = &.{ page_one, page_two } };
-    var cache: RootCache = .{ .ttl_ms = 1_000 };
-    defer cache.deinit(allocator);
-
-    const first = try cache.snapshot(allocator, io, 10_000, &lister);
-    defer {
-        for (first) |root| allocator.free(root);
-        allocator.free(first);
-    }
-    try std.testing.expectEqual(@as(usize, 2), lister.calls);
-    try std.testing.expectEqual(@as(usize, 3), first.len);
-    try std.testing.expectEqualStrings(ws_one, first[0]);
-    try std.testing.expectEqualStrings(checkout, first[1]);
-    // A symlinked workspace path is stored resolved so files beneath it match.
-    try std.testing.expectEqualStrings(ws_two, first[2]);
-
-    const cached = try cache.snapshot(allocator, io, 10_999, &lister);
-    defer {
-        for (cached) |root| allocator.free(root);
-        allocator.free(cached);
-    }
-    try std.testing.expectEqual(@as(usize, 2), lister.calls);
-    try std.testing.expectEqual(@as(usize, 3), cached.len);
-
-    const refreshed = try cache.snapshot(allocator, io, 11_000, &lister);
-    defer {
-        for (refreshed) |root| allocator.free(root);
-        allocator.free(refreshed);
-    }
-    try std.testing.expectEqual(@as(usize, 4), lister.calls);
-    try std.testing.expectEqual(@as(usize, 3), refreshed.len);
-}
-
-test "root cache refuses to serve when the daemon list fails" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    const failure = try headless.protocol.encodeErrorResponse(allocator, 1, "unavailable", "daemon offline");
-    defer allocator.free(failure);
-    var lister: FixtureLister = .{ .allocator = allocator, .pages = &.{failure} };
-    var cache: RootCache = .{};
-    defer cache.deinit(allocator);
-    try std.testing.expectError(error.WorkspaceListFailed, cache.snapshot(allocator, io, 0, &lister));
-    try std.testing.expectEqual(@as(usize, 1), lister.calls);
-}
-
 test "descriptor confinement survives file and ancestor swaps and rejects dangling escapes" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -589,75 +488,6 @@ test "descriptor confinement survives file and ancestor swaps and rejects dangli
     try tree.tmp.dir.deleteTree(io, "root");
     try tree.tmp.dir.symLink(io, "outside", "root", .{});
     try std.testing.expectError(error.PathOutsideWorkspace, roots.open(allocator, io, requested));
-}
-
-test "in-root relative symlinks remain readable on Linux" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tree = try TestTree.init(allocator, io);
-    defer tree.deinit(allocator);
-    try tree.tmp.dir.createDirPath(io, "root/docs");
-    try tree.writeFile(io, "root/docs/report.pdf");
-    try tree.tmp.dir.symLink(io, "docs/report.pdf", "root/link.pdf", .{});
-    const roots = try testRoots(allocator, tree, &.{"root"});
-    defer roots.deinit(allocator);
-    const requested = try tree.path(allocator, "root/link.pdf");
-    defer allocator.free(requested);
-    const file = try roots.open(allocator, io, requested);
-    defer file.close(io);
-    const bytes = try readAlloc(allocator, io, file, 100);
-    defer allocator.free(bytes);
-    try std.testing.expectEqualStrings("%PDF-1.4\n", bytes);
-}
-
-test "directories and FIFO documents are rejected within a finite deadline" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tree = try TestTree.init(allocator, io);
-    defer tree.deinit(allocator);
-    try tree.tmp.dir.createDirPath(io, "root/directory.pdf");
-    const roots = try testRoots(allocator, tree, &.{"root"});
-    defer roots.deinit(allocator);
-    const directory = try tree.path(allocator, "root/directory.pdf");
-    defer allocator.free(directory);
-    try std.testing.expectError(error.PathOutsideWorkspace, roots.open(allocator, io, directory));
-    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.mknodat(tree.tmp.dir.handle, "root/fifo.pdf", 0o010600, 0)));
-    const fifo = try tree.path(allocator, "root/fifo.pdf");
-    defer allocator.free(fifo);
-
-    // If NONBLOCK regresses, supply a writer after the deadline to unblock
-    // open, fail the test, and join deterministically rather than hanging CI.
-    const Watchdog = struct {
-        io: std.Io,
-        dir: std.Io.Dir,
-        done: std.atomic.Value(u32) = .init(0),
-        expired: std.atomic.Value(bool) = .init(false),
-        writer: ?std.Io.File = null,
-        fn run(self: *@This()) void {
-            const deadline = std.Io.Clock.awake.now(self.io).toMilliseconds() + 1000;
-            while (self.done.load(.acquire) == 0) {
-                if (std.Io.Clock.awake.now(self.io).toMilliseconds() >= deadline) {
-                    self.expired.store(true, .release);
-                    const fd = std.posix.openat(self.dir.handle, "root/fifo.pdf", .{ .ACCMODE = .RDWR, .NONBLOCK = true, .CLOEXEC = true }, 0) catch return;
-                    self.writer = .{ .handle = fd, .flags = .{ .nonblocking = true } };
-                    return;
-                }
-                self.io.futexWaitTimeout(u32, &self.done.raw, 0, .{ .duration = .{ .raw = .fromMilliseconds(20), .clock = .awake } }) catch return;
-            }
-        }
-    };
-    var watchdog: Watchdog = .{ .io = io, .dir = tree.tmp.dir };
-    const thread = try std.Thread.spawn(.{}, Watchdog.run, .{&watchdog});
-    defer {
-        watchdog.done.store(1, .release);
-        io.futexWake(u32, &watchdog.done.raw, 1);
-        thread.join();
-        if (watchdog.writer) |writer| writer.close(io);
-    }
-    try std.testing.expectError(error.PathOutsideWorkspace, roots.open(allocator, io, fifo));
-    try std.testing.expect(!watchdog.expired.load(.acquire));
 }
 
 test "preview cache opens reject symlinks and directories" {

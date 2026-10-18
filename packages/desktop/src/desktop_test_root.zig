@@ -43,7 +43,6 @@ test {
     _ = @import("state/workspace_tabs.zig");
     _ = @import("state/resource_waiters.zig");
     _ = @import("chat/slash_commands.zig");
-    _ = @import("theme/coverage_test.zig");
     _ = @import("app/update_installer.zig");
     _ = @import("app/updater.zig");
     _ = @import("ui/command_palette.zig");

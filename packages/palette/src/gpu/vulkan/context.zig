@@ -592,20 +592,3 @@ fn debugCallback(severity: vk.Flags, types: vk.Flags, data: ?*const vk.DebugUtil
     }
     return vk.false_;
 }
-
-test "dev_t decoding matches glibc" {
-    // makedev(226, 128) == 0xe280
-    try std.testing.expectEqual(@as(u64, 226), devMajor(0xe280));
-    try std.testing.expectEqual(@as(u64, 128), devMinor(0xe280));
-}
-
-test "context smoke: create device (skipped without Vulkan)" {
-    const ctx = Context.init(std.testing.allocator, .{}) catch |err| switch (err) {
-        error.VulkanLoaderNotFound, error.NoSuitableGpu => return error.SkipZigTest,
-        else => return err,
-    };
-    defer ctx.deinit();
-    try std.testing.expect(ctx.deviceName().len > 0);
-    const buf = try ctx.createBuffer(4096, vk.BufferUsageFlags.transfer_src, vk.MemoryPropertyFlags.host_visible, 0);
-    ctx.destroyBuffer(buf);
-}

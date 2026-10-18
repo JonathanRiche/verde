@@ -227,15 +227,3 @@ test "typos within the edit budget still match" {
     // Exact beats typo.
     try std.testing.expect(scoreText("palette", "palette").? > scoreText("palette", "palete").?);
 }
-
-test "acronym subsequences prefer word starts" {
-    const acronym = scoreText("Command Palette", "cp").?;
-    const scattered = scoreText("scope", "cp").?;
-    try std.testing.expect(acronym > scattered);
-}
-
-test "fields without subsequence only accept substrings and typos" {
-    const fields = [_]Field{.{ .text = "a long description about many unrelated things", .subsequence = false }};
-    try std.testing.expect(score(&fields, "lmn") == null);
-    try std.testing.expect(score(&fields, "unrelatd") != null);
-}

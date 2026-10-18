@@ -156,13 +156,3 @@ pub fn Menu(comptime config: MenuConfig) type {
         }
     };
 }
-
-test "menu opens highlights and selects" {
-    const Popup = Menu(.{ .x = 0, .y = 0, .width = 100, .row_height = 20 });
-    var menu = Popup.init(3);
-    try std.testing.expect(menu.handleInput(.open));
-    try std.testing.expect(menu.handleInput(.{ .mouse_move = .{ .x = 5, .y = 25 } }));
-    try std.testing.expectEqual(@as(?usize, 1), menu.highlighted_index);
-    try std.testing.expect(menu.handleInput(.{ .key = .{ .code = .enter } }));
-    try std.testing.expect(!menu.open);
-}

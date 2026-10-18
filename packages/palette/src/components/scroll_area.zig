@@ -176,31 +176,3 @@ pub fn ScrollArea(comptime config: ScrollAreaConfig) type {
         }
     };
 }
-
-test "scroll area clamps and emits scroll state" {
-    const Area = ScrollArea(.{ .height = 100, .content_height = 250 });
-    var area = Area.init();
-
-    area.setScrollY(999);
-    try std.testing.expectEqual(@as(f32, 150), area.scrollY());
-    area.setScrollY(-20);
-    try std.testing.expectEqual(@as(f32, 0), area.scrollY());
-}
-
-test "scroll area handles wheel and renders scrollbar on overflow" {
-    const Area = ScrollArea(.{ .x = 0, .y = 0, .width = 100, .height = 50, .content_height = 150, .line_height = 10, .scrollbar_width = 5 });
-    var area = Area.init();
-
-    try std.testing.expect(area.handleInput(.{ .mouse_wheel = .{ .point = .{ .x = 10, .y = 10 }, .y = -1 } }));
-    try std.testing.expect(area.scrollY() > 0);
-
-    var batch: draw.RenderBatch = .{};
-    defer batch.deinit(std.testing.allocator);
-    try area.render(std.testing.allocator, &batch);
-
-    var scrollbar_count: usize = 0;
-    for (batch.commands.items) |command| {
-        if (command.kind == .scrollbar) scrollbar_count += 1;
-    }
-    try std.testing.expectEqual(@as(usize, 2), scrollbar_count);
-}

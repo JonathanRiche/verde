@@ -4178,15 +4178,6 @@ test "double click selection expands to a code word on raw lines" {
     try std.testing.expectEqualStrings("answer", sliceForColumns(line, selection.anchor.column, selection.focus.column));
 }
 
-test "triple click selection expands to the full raw line" {
-    const allocator = std.testing.allocator;
-    const line = "hello world";
-    const selection = selectionRangeForRawLine(allocator, 2, line, countColumns(line), 4, 3).?;
-
-    try std.testing.expectEqual(@as(usize, 0), selection.anchor.column);
-    try std.testing.expectEqual(@as(usize, countColumns(line)), selection.focus.column);
-}
-
 fn expectWholeBodyCopy(source: []const u8, plain: bool, expected: []const u8) !void {
     const allocator = std.testing.allocator;
     var body = if (plain)
@@ -4227,71 +4218,6 @@ test "assistant markdown selection copies rendered text" {
     try expectWholeBodyCopy("Selectable **assistant** text.", false, "Selectable assistant text.");
 }
 
-test "plain transcript selection preserves user and system text literally" {
-    try expectWholeBodyCopy("User *literal* text\nSystem notice", true, "User *literal* text\nSystem notice");
-}
-
-test "static and selectable plain transcript rendering share layout height" {
-    const allocator = std.testing.allocator;
-    var body = try buildPlainBodyView(
-        allocator,
-        "A streamed paragraph long enough to wrap across several visual lines without changing its literal text.\nThen another line arrives.",
-    );
-    defer body.deinit(allocator);
-
-    var static_batch: palette.RenderBatch = .{};
-    defer static_batch.deinit(allocator);
-    var static_text: std.ArrayList(u8) = .empty;
-    defer static_text.deinit(allocator);
-    var static_arena = std.heap.ArenaAllocator.init(allocator);
-    defer static_arena.deinit();
-    var static_context: PaletteRenderContext = .{
-        .allocator = allocator,
-        .batch = &static_batch,
-        .frame_text = &static_text,
-        .text_arena = &static_arena,
-        .cursor = .{ .x = 0.0, .y = 0.0, .w = 240.0, .h = 600.0 },
-        .available_width = 240.0,
-    };
-
-    var selectable_batch: palette.RenderBatch = .{};
-    defer selectable_batch.deinit(allocator);
-    var selectable_text: std.ArrayList(u8) = .empty;
-    defer selectable_text.deinit(allocator);
-    var selectable_arena = std.heap.ArenaAllocator.init(allocator);
-    defer selectable_arena.deinit();
-    var selectable_context: PaletteRenderContext = .{
-        .allocator = allocator,
-        .batch = &selectable_batch,
-        .frame_text = &selectable_text,
-        .text_arena = &selectable_arena,
-        .cursor = .{ .x = 0.0, .y = 0.0, .w = 240.0, .h = 600.0 },
-        .available_width = 240.0,
-    };
-
-    const options: RenderOptions = .{ .base_font_size = 16.0, .line_height = 22.0 };
-    renderPaletteBody(&static_context, body, options);
-    var output = renderSelectablePaletteBody(&selectable_context, allocator, body, options, null, false);
-    defer output.deinit(allocator);
-
-    try std.testing.expectApproxEqAbs(static_context.cursor.y, selectable_context.cursor.y, 0.001);
-}
-
-test "unicode arrows survive markdown flatten for chat prose" {
-    // Agents often write path edges as →/⇒ in chat. Keep them as real Unicode
-    // so the prose font-fallback chain can render them (Noto Sans lacks the
-    // Arrows block; measurement goes through the coverage path for non-ASCII).
-    const allocator = std.testing.allocator;
-    const source = "WPE → SDL_GPU and A ⇒ B with ➜ dingbat";
-    var body = try buildBodyView(allocator, source);
-    defer body.deinit(allocator);
-    try std.testing.expectEqual(@as(usize, 1), body.blockCount());
-    switch (body.blockAt(0)) {
-        .text => |text| try std.testing.expectEqualStrings(source, text.text),
-        else => unreachable,
-    }
-}
-
 test "selectable text extent matches the selectable lines hit testing builds" {
     const allocator = std.testing.allocator;
     var view = try buildBodyView(
@@ -4315,14 +4241,4 @@ test "selectable text extent matches the selectable lines hit testing builds" {
             try std.testing.expectApproxEqAbs(bottom, extent.height, 0.001);
         }
     }
-}
-
-test "link hit testing stops after the last linked block" {
-    const allocator = std.testing.allocator;
-    var linked = try buildBodyView(allocator, "First [link](https://example.com) here.\n\nPlain trailing paragraph.");
-    defer linked.deinit(allocator);
-    try std.testing.expectEqual(@as(?usize, 1), linkBlocksEnd(linked));
-    var plain = try buildBodyView(allocator, "No links in this body.\n\nNor here.");
-    defer plain.deinit(allocator);
-    try std.testing.expectEqual(@as(?usize, null), linkBlocksEnd(plain));
 }

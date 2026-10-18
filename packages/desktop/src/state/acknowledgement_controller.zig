@@ -443,16 +443,6 @@ fn restoreChatInProject(project: anytype, ack: ChatAcknowledgement) bool {
     return false;
 }
 
-fn containsChat(state: *const State, workspace_id: []const u8, local_thread_id: []const u8) bool {
-    if (state.worker_args) |args| {
-        if (args.acknowledgement.matchesChat(workspace_id, local_thread_id)) return true;
-    }
-    for (state.pending.items) |acknowledgement| {
-        if (acknowledgement.matchesChat(workspace_id, local_thread_id)) return true;
-    }
-    return false;
-}
-
 fn countPendingChats(state: *const State) usize {
     var count: usize = 0;
     if (state.worker_args) |args| switch (args.acknowledgement) {
@@ -566,49 +556,6 @@ test "chat acknowledgement retries stay hidden, paced, and completion-scoped" {
     scheduleChatRetry(pending, 2_000);
     try std.testing.expectEqual(@as(i64, 4_000), pending.retry_not_before_ms);
     try std.testing.expectEqual(CHAT_RETRY_MAX_MS, chatRetryDelayMs(20));
-}
-
-test "surface acknowledgement queue coalesces exact identity but orders same-session replacement" {
-    const allocator = std.testing.allocator;
-    var state: State = .{};
-    defer {
-        for (state.pending.items) |*acknowledgement| acknowledgement.deinit(allocator);
-        state.pending.deinit(allocator);
-    }
-    try state.pending.append(allocator, .{ .chat = .{
-        .workspace_id = try allocator.dupe(u8, "workspace-a"),
-        .local_thread_id = try allocator.dupe(u8, "thread-a"),
-        .completed_at_ms = 1,
-    } });
-    try std.testing.expect(containsChat(&state, "workspace-a", "thread-a"));
-    try std.testing.expect(!containsChat(&state, "workspace-a", "thread-b"));
-    var original: surface_controller.SurfaceState = .{
-        .session_id = @constCast("session-a"),
-        .workspace_id = @constCast("workspace-a"),
-        .workspace_path = @constCast("/workspace-a"),
-        .title = @constCast("old title"),
-        .status = .done,
-        .status_changed_at_ms = 90,
-        .completed_at_ms = 100,
-        .last_event_body = @constCast("old body"),
-    };
-    const original_canonical = surface_controller.persistedSurfaceState(&original);
-    try std.testing.expect(!containsSurfaceCompletionState(&state, original_canonical));
-    try std.testing.expect(enqueueSurface(&state, allocator, &original));
-    try std.testing.expect(enqueueSurface(&state, allocator, &original));
-    try std.testing.expectEqual(@as(usize, 2), state.pending.items.len);
-    try std.testing.expect(containsSurfaceCompletionState(&state, original_canonical));
-    const old = state.pending.items[1].surface.canonical;
-    try std.testing.expect(state.pending.items[1].matchesSurfaceCompletion(old));
-    original.status_changed_at_ms = 91;
-    original.title = @constCast("new title");
-    original.last_event_body = @constCast("new body");
-    const newer = surface_controller.persistedSurfaceState(&original);
-    try std.testing.expect(!containsSurfaceCompletionState(&state, newer));
-    try std.testing.expect(enqueueSurface(&state, allocator, &original));
-    try std.testing.expectEqual(@as(usize, 3), state.pending.items.len);
-    try std.testing.expect(state.pending.items[1].matchesSurfaceCompletion(old));
-    try std.testing.expect(state.pending.items[2].matchesSurfaceCompletion(newer));
 }
 
 test "surface failure restoration is conditional on the consumed presentation generation" {

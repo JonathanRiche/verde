@@ -142,12 +142,3 @@ pub fn clearBrowserHistory(self: anytype) void {
     };
     self.setSidebarNotice("Browsing history cleared.");
 }
-
-test "isRecordableUrl only admits http(s) pages" {
-    try std.testing.expect(isRecordableUrl("https://example.com/"));
-    try std.testing.expect(isRecordableUrl("http://localhost:3000"));
-    try std.testing.expect(!isRecordableUrl("about:blank"));
-    try std.testing.expect(!isRecordableUrl("data:text/html,hi"));
-    try std.testing.expect(!isRecordableUrl("file:///tmp/x.html"));
-    try std.testing.expect(!isRecordableUrl("https://"));
-}

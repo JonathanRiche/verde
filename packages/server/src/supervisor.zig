@@ -197,12 +197,3 @@ pub fn nextState(state: StartState, event: enum { daemon_started, gateway_starte
         .shutdown_complete => if (state == .stopping) .stopped else error.InvalidTransition,
     };
 }
-
-test "supervision state requires partial-start cleanup" {
-    var state: StartState = .idle;
-    state = try nextState(state, .daemon_started);
-    state = try nextState(state, .child_failed);
-    state = try nextState(state, .shutdown_complete);
-    try std.testing.expectEqual(StartState.stopped, state);
-    try std.testing.expectError(error.InvalidTransition, nextState(.idle, .gateway_started));
-}

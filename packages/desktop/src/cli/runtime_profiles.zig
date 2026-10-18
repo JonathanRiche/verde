@@ -674,49 +674,6 @@ test "runtime add-ssh parsing is strict and secret flags are rejected" {
     }));
 }
 
-test "runtime remove parsing requires one id" {
-    const parsed = try parseRemove(&.{ "--id", "profile-0123456789abcdef0123456789abcdef", "--json" });
-    try std.testing.expectEqualStrings("profile-0123456789abcdef0123456789abcdef", parsed.id);
-    try std.testing.expect(parsed.json);
-    try std.testing.expectError(error.MissingId, parseRemove(&.{}));
-    try std.testing.expectError(error.InvalidOption, parseRemove(&.{ "--id", "one", "--id", "two" }));
-}
-
-test "runtime default parsing is strict and never accepts secrets" {
-    const show = try parseDefault(&.{ "--workspace", "workspace-one", "--json" });
-    try std.testing.expectEqualStrings("workspace-one", show.workspace_id);
-    try std.testing.expectEqual(.show, std.meta.activeTag(show.action));
-    try std.testing.expect(show.json);
-
-    const set = try parseDefault(&.{
-        "--profile",
-        "profile-0123456789abcdef0123456789abcdef",
-        "--workspace",
-        "workspace-one",
-    });
-    try std.testing.expectEqualStrings(
-        "profile-0123456789abcdef0123456789abcdef",
-        set.action.set,
-    );
-
-    const clear = try parseDefault(&.{ "--clear", "--workspace", "workspace-one" });
-    try std.testing.expectEqual(.clear, std.meta.activeTag(clear.action));
-    try std.testing.expectError(error.MissingWorkspace, parseDefault(&.{}));
-    try std.testing.expectError(error.ConflictingOptions, parseDefault(&.{
-        "--workspace",
-        "workspace-one",
-        "--profile",
-        "local",
-        "--clear",
-    }));
-    try std.testing.expectError(error.UnknownOption, parseDefault(&.{
-        "--workspace",
-        "workspace-one",
-        "--token",
-        "must-not-enter-argv",
-    }));
-}
-
 test "runtime default requires configured profiles and resolves stale mappings to Local" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

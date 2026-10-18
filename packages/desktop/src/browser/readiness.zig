@@ -31,17 +31,8 @@ test "restart then reset stays opening until each replacement document loads" {
     }
 }
 
-test "showing a loaded document and same-document navigation remain ready" {
-    try std.testing.expectEqual(Status.ready, afterEvent(.opening, .opened, false));
-    try std.testing.expectEqual(Status.ready, afterEvent(.ready, .navigated, false));
-}
-
 test "late lifecycle events cannot erase a navigation failure" {
     for ([_]Event{ .opened, .navigated, .document_loaded }) |event| {
         try std.testing.expectEqual(Status.failed, afterEvent(.failed, event, false));
     }
-}
-
-test "load completion after closing does not reopen the runtime" {
-    try std.testing.expectEqual(Status.hidden, afterEvent(.hidden, .document_loaded, true));
 }

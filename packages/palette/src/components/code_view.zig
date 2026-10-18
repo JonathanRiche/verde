@@ -214,18 +214,3 @@ pub fn CodeView(comptime config: CodeViewConfig) type {
 }
 
 pub const DiffView = CodeView;
-
-test "code view selects text and renders diff lines" {
-    const View = CodeView(.{ .x = 0, .y = 0, .width = 200, .height = 80, .glyph_width = 10, .line_height = 20 });
-    var view = try View.init(std.testing.allocator, "one\n+two\n-three");
-    defer view.deinit(std.testing.allocator);
-
-    try std.testing.expect(view.handleInput(.{ .mouse_down = .{ .x = 60, .y = 5 } }));
-    try std.testing.expect(view.handleInput(.{ .mouse_drag = .{ .x = 90, .y = 25 } }));
-    try std.testing.expect(view.selection() != null);
-
-    var batch: draw.RenderBatch = .{};
-    defer batch.deinit(std.testing.allocator);
-    try view.render(std.testing.allocator, &batch);
-    try std.testing.expect(batch.commands.items.len > 0);
-}

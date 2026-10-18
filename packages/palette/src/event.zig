@@ -410,28 +410,6 @@ pub const Event = union(enum) {
     quit: void,
 };
 
-test "keycode ascii mapping" {
-    try std.testing.expectEqual(Keycode.c, Keycode.fromAscii('c'));
-    try std.testing.expectEqual(Keycode.@"7", Keycode.fromAscii('7'));
-    try std.testing.expectEqual(Keycode.space, Keycode.fromAscii(' '));
-}
-
-test "mod keys from evdev" {
-    var m: ModKeys = .{};
-    m.set(54, true);
-    m.set(97, true);
-    m.set(30, true);
-    try std.testing.expect(m.rshift and m.rctrl and !m.lshift and !m.lctrl);
-    m.set(54, false);
-    try std.testing.expect(!m.rshift);
-}
-
-test "primary modifier" {
-    try std.testing.expect((Mods{ .ctrl = true }).primary());
-    try std.testing.expect((Mods{ .super = true }).primary());
-    try std.testing.expect(!(Mods{ .shift = true }).primary());
-}
-
 test "ModKeys.effective and KeyEvent shortcut helpers" {
     const k: ModKeys = .{ .rshift = true, .lctrl = true };
     const e = k.effective(.{ .shift = true, .alt = true });

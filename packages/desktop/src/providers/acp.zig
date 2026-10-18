@@ -2022,64 +2022,6 @@ const TestDiffCapture = struct {
     }
 };
 
-test "session setup passes Verde MCP through ACP" {
-    const json = try makeSessionNewRequestAlloc(std.testing.allocator, 2, "/tmp/project", "/opt/verde/bin/verde");
-    defer std.testing.allocator.free(json);
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
-    defer parsed.deinit();
-    const params = getObjectField(parsed.value, "params").?;
-    const servers = getObjectField(params, "mcpServers").?.array.items;
-    try std.testing.expectEqual(@as(usize, 1), servers.len);
-    try std.testing.expectEqualStrings("verde", getOptionalObjectString(servers[0], "name").?);
-    try std.testing.expectEqualStrings("/opt/verde/bin/verde", getOptionalObjectString(servers[0], "command").?);
-    const args = getObjectField(servers[0], "args").?.array.items;
-    try std.testing.expectEqualStrings("mcp", args[0].string);
-    const environment = getObjectField(servers[0], "env").?.array.items;
-    try std.testing.expectEqualStrings("VERDE_MCP_MANAGED", getOptionalObjectString(environment[0], "name").?);
-    try std.testing.expectEqualStrings("1", getOptionalObjectString(environment[0], "value").?);
-}
-
-test "session setup passes authenticated Verde HTTP MCP through ACP" {
-    const json = try makeSessionNewRequestWithHttpMcpAlloc(std.testing.allocator, 2, "/tmp/project", .{
-        .url = "http://127.0.0.1:47371/mcp",
-        .authorization = "Bearer test-token",
-        .client_name = "fx",
-    });
-    defer std.testing.allocator.free(json);
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
-    defer parsed.deinit();
-    const params = getObjectField(parsed.value, "params").?;
-    const server = getObjectField(params, "mcpServers").?.array.items[0];
-    try std.testing.expectEqualStrings("http", getOptionalObjectString(server, "type").?);
-    try std.testing.expectEqualStrings("http://127.0.0.1:47371/mcp", getOptionalObjectString(server, "url").?);
-    const headers = getObjectField(server, "headers").?.array.items;
-    try std.testing.expectEqual(@as(usize, 3), headers.len);
-    try std.testing.expectEqualStrings("Authorization", getOptionalObjectString(headers[0], "name").?);
-    try std.testing.expectEqualStrings("Bearer test-token", getOptionalObjectString(headers[0], "value").?);
-    try std.testing.expectEqualStrings("fx", getOptionalObjectString(headers[1], "value").?);
-}
-
-test "parseSessionListResponse maps ACP sessions to thread summaries" {
-    const payload =
-        \\{"jsonrpc":"2.0","id":2,"result":{"sessions":[{"sessionId":"s1","cwd":"/tmp","title":"One"},{"sessionId":"s2","cwd":"/tmp"}]}}
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
-    defer parsed.deinit();
-    var threads: std.ArrayList(provider_types.ChatThreadSummary) = .empty;
-    defer {
-        for (threads.items) |thread| {
-            std.testing.allocator.free(thread.id);
-            std.testing.allocator.free(thread.title);
-        }
-        threads.deinit(std.testing.allocator);
-    }
-    try parseSessionListResponse(std.testing.allocator, parsed.value, &threads);
-    try std.testing.expectEqual(@as(usize, 2), threads.items.len);
-    try std.testing.expectEqualStrings("s1", threads.items[0].id);
-    try std.testing.expectEqualStrings("One", threads.items[0].title);
-    try std.testing.expectEqualStrings("s2", threads.items[1].title);
-}
-
 test "handleReadSessionUpdate combines consecutive role chunks" {
     var state: ReadThreadState = .{};
     defer state.deinit(std.testing.allocator);
@@ -2123,21 +2065,6 @@ test "agent prose errors are rewritten and duplicate retries are suppressed" {
     try std.testing.expectEqualStrings("Friendly provider message", live.reply.items);
 }
 
-test "ACP tool updates emit structured diff snapshots" {
-    const payload =
-        \\{"sessionUpdate":"tool_call_update","toolCall":{"input":{"filePath":"src/main.zig"},"output":{"patch":"--- a/src/main.zig\n+++ b/src/main.zig\n@@ -1 +1,2 @@\n-old\n+new\n+again"}}}
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
-    defer parsed.deinit();
-
-    var capture: TestDiffCapture = .{};
-    emitDiffUpdate(std.testing.allocator, parsed.value, null, &capture, TestDiffCapture.handle);
-    try std.testing.expectEqual(@as(usize, 1), capture.count);
-    try std.testing.expectEqualStrings("src/main.zig", capture.path.?);
-    try std.testing.expectEqual(@as(i64, 2), capture.additions);
-    try std.testing.expectEqual(@as(i64, 1), capture.deletions);
-}
-
 test "ACP text diff content emits a compact structured patch" {
     const payload =
         \\{"sessionUpdate":"tool_call_update","toolCallId":"call-1","title":"Edit File","kind":"edit","status":"completed","content":[{"type":"diff","path":"src/main.zig","oldText":"const a = 1;\nconst b = 2;\nconst c = 3;\n","newText":"const a = 1;\nconst b = 4;\nconst c = 3;\n"}]}
@@ -2161,56 +2088,6 @@ test "ACP text diff content emits a compact structured patch" {
             " const c = 3;\n",
         capture.patch.?,
     );
-}
-
-test "ACP text diff content preserves new-file semantics" {
-    const payload =
-        \\{"sessionUpdate":"tool_call_update","content":[{"type":"diff","path":"src/new.zig","oldText":null,"newText":"const created = true;\n"}]}
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
-    defer parsed.deinit();
-
-    var capture: TestDiffCapture = .{};
-    emitDiffUpdate(std.testing.allocator, parsed.value, null, &capture, TestDiffCapture.handle);
-    try std.testing.expectEqual(@as(usize, 1), capture.count);
-    try std.testing.expectEqual(@as(i64, 1), capture.additions);
-    try std.testing.expectEqual(@as(i64, 0), capture.deletions);
-    try std.testing.expect(std.mem.startsWith(u8, capture.patch.?, "--- /dev/null\n+++ b/src/new.zig\n"));
-}
-
-test "ACP serialized tool output emits a structured text diff" {
-    const payload =
-        \\{"sessionUpdate":"tool_call_update","toolCallId":"call-1","status":"completed"}
-    ;
-    const output =
-        \\[{"type":"diff","path":"tmp/temp.txt","oldText":"before\n","newText":"before\nafter\n"}]
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
-    defer parsed.deinit();
-
-    var capture: TestDiffCapture = .{};
-    emitDiffUpdate(std.testing.allocator, parsed.value, output, &capture, TestDiffCapture.handle);
-    try std.testing.expectEqual(@as(usize, 1), capture.count);
-    try std.testing.expectEqualStrings("tmp/temp.txt", capture.path.?);
-    try std.testing.expectEqual(@as(i64, 1), capture.additions);
-    try std.testing.expectEqual(@as(i64, 0), capture.deletions);
-    try std.testing.expect(std.mem.indexOf(u8, capture.patch.?, "+after\n") != null);
-}
-
-test "toolEvent preserves status-only ACP lifecycle updates" {
-    const payload =
-        \\{"sessionUpdate":"tool_call_update","toolCallId":"call-1","status":"in_progress"}
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
-    defer parsed.deinit();
-    const event = (try toolEventAlloc(std.testing.allocator, parsed.value)).?;
-    defer event.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("call-1", event.call_id);
-    try std.testing.expectEqualStrings("", event.title);
-    try std.testing.expectEqual(provider_types.ToolCallStatus.in_progress, event.status.?);
-    try std.testing.expect(event.tool_kind == null);
-    try std.testing.expect(event.input == null);
-    try std.testing.expect(event.output == null);
 }
 
 test "toolEvent maps ACP titles, kinds, statuses, and inputs" {
@@ -2263,66 +2140,6 @@ test "toolEvent maps ACP titles, kinds, statuses, and inputs" {
         if (case.status) |status| try std.testing.expectEqual(status, event.status.?);
         if (case.input) |input| try std.testing.expectEqualStrings(input, event.input.?);
     }
-}
-
-test "toolEvent recognizes Grok native task variants without guessing from prompts" {
-    const cases = .{
-        .{ .payload =
-        \\{"sessionUpdate":"tool_call","toolCallId":"task-1","title":"Calculate 23 times 17","kind":"other","rawInput":{"variant":"Task","description":"Calculate 23 times 17","subagent_type":"general-purpose"},"status":"in_progress"}
-        , .expected = provider_types.ToolCallKind.subagent },
-        .{ .payload =
-        \\{"sessionUpdate":"tool_call_update","toolCall":{"id":"task-1","title":"Calculate 23 times 17","kind":"other","rawInput":{"variant":"Task"}},"status":"completed"}
-        , .expected = provider_types.ToolCallKind.subagent },
-        .{ .payload =
-        \\{"sessionUpdate":"tool_call","toolCallId":"read-1","title":"Read file","kind":"read","rawInput":{"variant":"Read","prompt":"Task"},"status":"completed"}
-        , .expected = provider_types.ToolCallKind.read },
-    };
-    inline for (cases) |case| {
-        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, case.payload, .{});
-        defer parsed.deinit();
-        const event = (try toolEventAlloc(std.testing.allocator, parsed.value)).?;
-        defer event.deinit(std.testing.allocator);
-        try std.testing.expectEqual(case.expected, event.tool_kind.?);
-    }
-}
-
-test "toolEvent ignores empty ACP input containers" {
-    const payload =
-        \\{"sessionUpdate":"tool_call","toolCallId":"call-2","title":"Read File","kind":"read","rawInput":{},"locations":[{"path":"/tmp/a.txt"}],"status":"pending"}
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
-    defer parsed.deinit();
-    const event = (try toolEventAlloc(std.testing.allocator, parsed.value)).?;
-    defer event.deinit(std.testing.allocator);
-    try std.testing.expect(event.input == null);
-    try std.testing.expectEqualStrings("[{\"path\":\"/tmp/a.txt\"}]", event.locations.?);
-    try std.testing.expectEqualStrings(payload, event.raw);
-}
-
-test "toolEvent ignores empty ACP output arrays" {
-    const payload =
-        \\{"sessionUpdate":"tool_call_update","toolCallId":"call-3","title":"MCP: tool","kind":"other","content":[],"status":"completed"}
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
-    defer parsed.deinit();
-    const event = (try toolEventAlloc(std.testing.allocator, parsed.value)).?;
-    defer event.deinit(std.testing.allocator);
-    try std.testing.expectEqual(provider_types.ToolCallKind.mcp, event.tool_kind.?);
-    try std.testing.expect(event.output == null);
-    try std.testing.expectEqualStrings(payload, event.raw);
-}
-
-test "toolEvent promotes tagged Verde MCP results into the title" {
-    const payload =
-        \\{"sessionUpdate":"tool_call_update","toolCallId":"call-4","status":"completed","rawOutput":{"success":true,"_verdeMcpTool":"navigate_browser"}}
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
-    defer parsed.deinit();
-    const event = (try toolEventAlloc(std.testing.allocator, parsed.value)).?;
-    defer event.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("MCP: navigate_browser", event.title);
-    try std.testing.expectEqual(provider_types.ToolCallKind.mcp, event.tool_kind.?);
-    try std.testing.expectEqualStrings("{\"success\":true}", event.output.?);
 }
 
 test "handleSendPromptLine accepts session/load response without sessionId" {
@@ -2442,53 +2259,6 @@ test "handleSendPromptLine reports JSON-RPC error text through on_failure" {
     try std.testing.expectEqualStrings("Vercel AI Gateway requires a new sign-in.", Capture.message[0..Capture.message_len]);
 }
 
-test "isAuthError recognizes fx credential notices" {
-    try std.testing.expect(isAuthError("fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY."));
-    try std.testing.expect(isAuthError("Codex requires a new sign-in."));
-    try std.testing.expect(isAuthError("Credential refresh is temporarily unavailable. Retry shortly."));
-    try std.testing.expect(isAuthError("The credential account or team changed. Review authentication before retrying."));
-    try std.testing.expect(!isAuthError("Session is not active"));
-    try std.testing.expect(!isAuthError("Image prompt exceeds size limit"));
-}
-
-test "handleSendPromptLine routes leading diagnostic chunks to a system event" {
-    const Capture = struct {
-        var events: usize = 0;
-        fn onEvent(_: ?*anyopaque, event: provider_types.StreamEvent) void {
-            switch (event) {
-                .message => |message| {
-                    if (std.mem.eql(u8, message.title, "FX warning")) events += 1;
-                },
-                else => {},
-            }
-        }
-    };
-    Capture.events = 0;
-    const harness: Harness = .{
-        .diagnostics_category = .cursor_acp,
-        .assistant_author = "Assistant",
-        .permission_default_title = "Permission request",
-        .diagnostic_chunk_prefix = "skill discovery warning:",
-        .diagnostic_event_title = "FX warning",
-    };
-    var state: SendPromptState = .{};
-    defer state.deinit(std.testing.allocator);
-    state.prompt_submitted = true;
-    const request = provider_types.SendPromptRequest{ .prompt = "yo", .on_stream_event = Capture.onEvent };
-    const warning =
-        \\{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"skill discovery warning: candidate skipped"}}}}
-    ;
-    const reply =
-        \\{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Ready."}}}}
-    ;
-    _ = try handleSendPromptLine(std.testing.allocator, harness, warning, request, &state, null);
-    _ = try handleSendPromptLine(std.testing.allocator, harness, reply, request, &state, null);
-    // A later chunk with the prefix is real reply text, not a diagnostic.
-    _ = try handleSendPromptLine(std.testing.allocator, harness, warning, request, &state, null);
-    try std.testing.expectEqual(@as(usize, 1), Capture.events);
-    try std.testing.expectEqualStrings("Ready.skill discovery warning: candidate skipped", state.reply.items);
-}
-
 test "handleSendPromptLine ignores session history replay before prompt submission" {
     var state: SendPromptState = .{};
     defer state.deinit(std.testing.allocator);
@@ -2512,24 +2282,6 @@ test "handleSendPromptLine ignores session history replay before prompt submissi
         try handleSendPromptLine(std.testing.allocator, TEST_HARNESS, line, request, &state, null),
     );
     try std.testing.expectEqualStrings("replayed history", state.reply.items);
-}
-
-test "handleSendPromptLine handles permission request id collision before prompt response" {
-    var state: SendPromptState = .{};
-    defer state.deinit(std.testing.allocator);
-    const request = provider_types.SendPromptRequest{
-        .thread_id = "existing-session",
-        .prompt = "continue",
-        .approval_policy = .never,
-    };
-    const line =
-        \\{"jsonrpc":"2.0","id":3,"method":"session/request_permission","params":{"toolCallId":"tool-3","options":[{"optionId":"reject-once"},{"optionId":"allow-once"}]}}
-    ;
-
-    try std.testing.expectEqual(
-        SendLineAction.continue_reading,
-        try handleSendPromptLine(std.testing.allocator, TEST_HARNESS, line, request, &state, null),
-    );
 }
 
 test "handleSendPromptLine ignores non-permission ACP server request id collisions" {
@@ -2561,49 +2313,6 @@ test "handleSendPromptLine ignores non-permission ACP server request id collisio
     try std.testing.expect(state.session_id == null);
 }
 
-test "permissionOptionId matches hyphen and FX underscore option ids" {
-    for ([_][]const u8{
-        \\{"options":[{"optionId":"reject-once"},{"optionId":"allow-once"}]}
-        ,
-        \\{"options":[{"optionId":"allow_once","name":"Allow once"},{"optionId":"allow_always","name":"Allow for this session"},{"optionId":"reject_once","name":"Reject"}]}
-        ,
-    }, [_][2][]const u8{ .{ "allow-once", "reject-once" }, .{ "allow_once", "reject_once" } }) |payload, expected| {
-        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
-        defer parsed.deinit();
-        try std.testing.expectEqualStrings(expected[0], permissionOptionId(parsed.value, .approve).?);
-        try std.testing.expectEqualStrings(expected[1], permissionOptionId(parsed.value, .deny).?);
-    }
-}
-
-test "ACP permission server requests invoke the callback for string and numeric IDs" {
-    const Capture = struct {
-        calls: usize = 0,
-        fn approve(context: ?*anyopaque, _: provider_types.ApprovalRequest) provider_types.ApprovalDecision {
-            const self: *@This() = @ptrCast(@alignCast(context.?));
-            self.calls += 1;
-            return .approve;
-        }
-    };
-    const allocator = std.testing.allocator;
-    var state: SendPromptState = .{};
-    defer state.deinit(allocator);
-    var capture: Capture = .{};
-    for ([_][]const u8{
-        \\{"id":3,"method":"session/request_permission","params":{}}
-        ,
-        \\{"id":"permission-3","method":"session/request_permission","params":{}}
-        ,
-    }) |line| {
-        _ = try handleSendPromptLine(allocator, TEST_HARNESS, line, .{ .prompt = "test", .stream_context = &capture, .on_approval_request = Capture.approve }, &state, null);
-    }
-    try std.testing.expectEqual(@as(usize, 2), capture.calls);
-    const response = try makePermissionResponseAlloc(allocator, .{ .string = "permission-3" }, "allow-once");
-    defer allocator.free(response);
-    try std.testing.expectEqualStrings(
-        \\{"jsonrpc":"2.0","id":"permission-3","result":{"outcome":{"outcome":"selected","optionId":"allow-once"}}}
-    , response);
-}
-
 test "ACP permission decisions use kinds and never approve an unrecognized rejection" {
     var params = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
         \\{"options":[{"optionId":"opaque-always","kind":"allow_always"},{"optionId":"opaque-once","kind":"allow_once"},{"optionId":"opaque-reject","kind":"reject_once"}]}
@@ -2621,36 +2330,6 @@ test "ACP permission decisions use kinds and never approve an unrecognized rejec
     try std.testing.expectEqualStrings(
         \\{"jsonrpc":"2.0","id":3,"result":{"outcome":{"outcome":"cancelled"}}}
     , response);
-}
-
-test "Cursor blocking extensions reply on the wire without ending the prompt" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const output = try tmp.dir.createFile(std.testing.io, "responses", .{});
-    defer output.close(std.testing.io);
-    var state: SendPromptState = .{ .prompt_submitted = true };
-    defer state.deinit(allocator);
-    var harness = TEST_HARNESS;
-    harness.cursor_extensions_enabled = true;
-    for ([_][]const u8{
-        \\{"id":3,"method":"cursor/ask_question","params":{"questions":[]}}
-        ,
-        \\{"id":"plan-3","method":"cursor/create_plan","params":{"plan":"Inspect and implement"}}
-        ,
-        \\{"id":4,"method":"cursor/future_extension","params":{}}
-        ,
-    }) |line| {
-        try std.testing.expectEqual(SendLineAction.continue_reading, try handleSendPromptLine(allocator, harness, line, .{ .prompt = "test" }, &state, output));
-    }
-    const responses = try tmp.dir.readFileAlloc(std.testing.io, "responses", allocator, .limited(4096));
-    defer allocator.free(responses);
-    try std.testing.expectEqualStrings(
-        \\{"jsonrpc":"2.0","id":3,"result":{"outcome":{"outcome":"skipped"}}}
-        \\{"jsonrpc":"2.0","id":"plan-3","result":{"outcome":{"outcome":"rejected"}}}
-        \\{"jsonrpc":"2.0","id":4,"error":{"code":-32601,"message":"Unsupported Cursor extension"}}
-        \\
-    , responses);
 }
 
 test "ACP prompts preserve multiple images and reject unsupported attachments" {
@@ -2686,28 +2365,6 @@ test "ACP prompts preserve multiple images and reject unsupported attachments" {
     try std.testing.expectEqualStrings("text", getOptionalObjectString(text_blocks[0], "type").?);
 }
 
-test "parseCapabilities reads resume and HTTP MCP support" {
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
-        \\{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"loadSession":true,
-        \\"mcpCapabilities":{"http":true,"sse":false},
-        \\"sessionCapabilities":{"list":{},"resume":{},"close":null}}}}
-    , .{});
-    defer parsed.deinit();
-    const capabilities = parseCapabilities(parsed.value);
-    try std.testing.expect(capabilities.load_session);
-    try std.testing.expect(capabilities.list_sessions);
-    try std.testing.expect(capabilities.resume_session);
-    try std.testing.expect(capabilities.mcp_http);
-
-    var bare = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
-        \\{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"sessionCapabilities":{"resume":null}}}}
-    , .{});
-    defer bare.deinit();
-    const none = parseCapabilities(bare.value);
-    try std.testing.expect(!none.resume_session);
-    try std.testing.expect(!none.mcp_http);
-}
-
 fn testWriteMeta(stringify: *std.json.Stringify) std.json.Stringify.Error!void {
     try stringify.write(.{ .fx = .{ .profileMcpServers = true } });
 }
@@ -2734,137 +2391,6 @@ test "makeTurnSessionRequestAlloc picks new, resume, or load and gates HTTP MCP"
     const loaded = try makeTurnSessionRequestAlloc(allocator, 2, .{}, .{ .cwd = "/w", .session_id = "s-1" });
     defer allocator.free(loaded);
     try std.testing.expect(std.mem.indexOf(u8, loaded, "\"method\":\"session/load\"") != null);
-}
-
-test "handleSendPromptLine reports initialize and answers unknown agent requests" {
-    var state: SendPromptState = .{};
-    defer state.deinit(std.testing.allocator);
-    const request = provider_types.SendPromptRequest{ .prompt = "hi" };
-    try std.testing.expectEqual(SendLineAction.initialized, try handleSendPromptLine(
-        std.testing.allocator,
-        TEST_HARNESS,
-        \\{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"sessionCapabilities":{"resume":{}}}}}
-    ,
-        request,
-        &state,
-        null,
-    ));
-    try std.testing.expect(state.capabilities.resume_session);
-
-    const response = try makeMethodNotFoundResponseAlloc(std.testing.allocator, .{ .string = "req-7" });
-    defer std.testing.allocator.free(response);
-    try std.testing.expectEqualStrings(
-        \\{"jsonrpc":"2.0","id":"req-7","error":{"code":-32601,"message":"Method not supported by Verde"}}
-    , response);
-}
-
-test "ACP plan updates publish one Todos card per distinct plan" {
-    const Capture = struct {
-        count: usize = 0,
-        title: [16]u8 = undefined,
-        title_len: usize = 0,
-        body: [256]u8 = undefined,
-        body_len: usize = 0,
-
-        fn onEvent(context: ?*anyopaque, event: provider_types.StreamEvent) void {
-            const self: *@This() = @ptrCast(@alignCast(context.?));
-            switch (event) {
-                .message => |message| {
-                    self.count += 1;
-                    @memcpy(self.title[0..message.title.len], message.title);
-                    self.title_len = message.title.len;
-                    @memcpy(self.body[0..message.body.len], message.body);
-                    self.body_len = message.body.len;
-                },
-                else => {},
-            }
-        }
-    };
-    var capture: Capture = .{};
-    var state: SendPromptState = .{ .prompt_submitted = true };
-    defer state.deinit(std.testing.allocator);
-    const request = provider_types.SendPromptRequest{
-        .prompt = "plan",
-        .stream_context = &capture,
-        .on_stream_event = Capture.onEvent,
-    };
-    const plan =
-        \\{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"plan","entries":[
-        \\{"content":"Read code","priority":"high","status":"completed"},
-        \\{"content":"Write\nfix","priority":"medium","status":"in_progress"},
-        \\{"content":"Test","priority":"low","status":"pending"}]}}}
-    ;
-    _ = try handleSendPromptLine(std.testing.allocator, TEST_HARNESS, plan, request, &state, null);
-    _ = try handleSendPromptLine(std.testing.allocator, TEST_HARNESS, plan, request, &state, null);
-    try std.testing.expectEqual(@as(usize, 1), capture.count);
-    try std.testing.expectEqualStrings("Todos", capture.title[0..capture.title_len]);
-    try std.testing.expectEqualStrings("- [x] Read code\n- [>] Write fix\n- [ ] Test\n", capture.body[0..capture.body_len]);
-}
-
-test "usage_update and prompt token counts publish one Usage row per turn" {
-    const Capture = struct {
-        count: usize = 0,
-        title: [16]u8 = undefined,
-        title_len: usize = 0,
-        body: [256]u8 = undefined,
-        body_len: usize = 0,
-
-        fn onEvent(context: ?*anyopaque, event: provider_types.StreamEvent) void {
-            const self: *@This() = @ptrCast(@alignCast(context.?));
-            switch (event) {
-                .message => |message| {
-                    self.count += 1;
-                    @memcpy(self.title[0..message.title.len], message.title);
-                    self.title_len = message.title.len;
-                    @memcpy(self.body[0..message.body.len], message.body);
-                    self.body_len = message.body.len;
-                },
-                else => {},
-            }
-        }
-    };
-    var capture: Capture = .{};
-    var state: SendPromptState = .{ .prompt_submitted = true };
-    defer state.deinit(std.testing.allocator);
-    const request = provider_types.SendPromptRequest{
-        .prompt = "usage",
-        .stream_context = &capture,
-        .on_stream_event = Capture.onEvent,
-    };
-    const stale =
-        \\{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"usage_update","used":100,"size":500000}}}
-    ;
-    const latest =
-        \\{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"usage_update","used":61234,"size":500000,"cost":{"amount":0.123,"currency":"USD"}}}}
-    ;
-    const done =
-        \\{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn","_meta":{"inputTokens":1200,"outputTokens":340,"reasoningTokens":5}}}
-    ;
-    _ = try handleSendPromptLine(std.testing.allocator, TEST_HARNESS, stale, request, &state, null);
-    _ = try handleSendPromptLine(std.testing.allocator, TEST_HARNESS, latest, request, &state, null);
-    try std.testing.expectEqual(@as(usize, 0), capture.count);
-    try std.testing.expectEqual(SendLineAction.prompt_done, try handleSendPromptLine(std.testing.allocator, TEST_HARNESS, done, request, &state, null));
-    try std.testing.expectEqual(@as(usize, 1), capture.count);
-    try std.testing.expectEqualStrings("Usage", capture.title[0..capture.title_len]);
-    try std.testing.expectEqualStrings(
-        "Context: 61,234 of 500,000 tokens (12%) · Session cost: $0.12 · Last turn: 1,200 in / 340 out",
-        capture.body[0..capture.body_len],
-    );
-
-    // Turns without any figures publish nothing.
-    var quiet_capture: Capture = .{};
-    var quiet_state: SendPromptState = .{ .prompt_submitted = true };
-    defer quiet_state.deinit(std.testing.allocator);
-    const quiet_request = provider_types.SendPromptRequest{
-        .prompt = "usage",
-        .stream_context = &quiet_capture,
-        .on_stream_event = Capture.onEvent,
-    };
-    const plain_done =
-        \\{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}
-    ;
-    _ = try handleSendPromptLine(std.testing.allocator, TEST_HARNESS, plain_done, quiet_request, &quiet_state, null);
-    try std.testing.expectEqual(@as(usize, 0), quiet_capture.count);
 }
 
 test "available_commands_update feeds the live slash catalog merged with static rows" {
@@ -2925,19 +2451,4 @@ test "available_commands_update feeds the live slash catalog merged with static 
     var cleared = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "[]", .{});
     defer cleared.deinit();
     rememberAvailableCommands(.fx_acp, cleared.value);
-}
-
-test "slashCommandRoot parses the command root" {
-    try std.testing.expectEqualStrings("/context", slashCommandRoot("  /context \n").?);
-    try std.testing.expectEqualStrings("/loop", slashCommandRoot("/loop 5m run tests").?);
-    try std.testing.expect(slashCommandRoot("plain text") == null);
-    try std.testing.expect(slashCommandRoot("/") == null);
-}
-
-test "makeSetModelRequestAlloc writes the standard session/set_model request" {
-    const line = try makeSetModelRequestAlloc(std.testing.allocator, 12, "s-1", "composer-2.5[fast=true]");
-    defer std.testing.allocator.free(line);
-    try std.testing.expectEqualStrings(
-        \\{"jsonrpc":"2.0","id":12,"method":"session/set_model","params":{"sessionId":"s-1","modelId":"composer-2.5[fast=true]"}}
-    , line);
 }

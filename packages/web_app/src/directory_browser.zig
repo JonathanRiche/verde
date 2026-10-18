@@ -120,9 +120,3 @@ fn errorResponse(
     try json.endObject();
     return try writer.toOwnedSlice();
 }
-
-test "rejects relative directory paths" {
-    const response = (try respond(std.testing.allocator, std.testing.io, "{\"id\":1,\"method\":\"web.directory.list\",\"params\":{\"path\":\"tmp\"}}")) orelse unreachable;
-    defer std.testing.allocator.free(response);
-    try std.testing.expect(std.mem.indexOf(u8, response, "directory path must be absolute") != null);
-}

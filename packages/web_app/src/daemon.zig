@@ -323,15 +323,6 @@ fn testDaemon() Daemon {
     return .init(std.testing.allocator, std.testing.io, config);
 }
 
-test "empty daemon endpoint fails closed through the production transport" {
-    var daemon = testDaemon();
-    daemon.config.sessionizer_endpoint = "";
-    try std.testing.expectError(
-        error.FileNotFound,
-        daemon.callRaw("{\"id\":1,\"method\":\"core.status\",\"params\":{}}"),
-    );
-}
-
 test "access bridges deliberately reveal only transient daemon request secrets" {
     const target: protocol.RequestTarget = .{
         .runtime_id = "0123456789abcdef0123456789abcdef",

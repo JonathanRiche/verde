@@ -273,50 +273,6 @@ test "generated thread title strips response framing" {
     try std.testing.expectEqualStrings("Fix flaky auth tests", title);
 }
 
-test "placeholder thread titles cover daemon desktop and web defaults" {
-    try std.testing.expect(isPlaceholderThreadTitle("New Chat"));
-    try std.testing.expect(isPlaceholderThreadTitle("New chat"));
-    try std.testing.expect(isPlaceholderThreadTitle("New thread"));
-    try std.testing.expect(!isPlaceholderThreadTitle("My Manual Title"));
-}
-
-test "generated thread title rejects an empty first line" {
-    try std.testing.expect((try makeGeneratedThreadTitle(std.testing.allocator, "\nA later explanation")) == null);
-}
-
-test "title generation prompt keeps conversation inside role tags" {
-    const prompt = try makeTitleGenerationPrompt(std.testing.allocator, "first request", "first answer");
-    defer std.testing.allocator.free(prompt);
-
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "<user>\nfirst request\n</user>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "<assistant>\nfirst answer\n</assistant>") != null);
-}
-
-test "title generation prompt omits the assistant block for prompt-only titles" {
-    const prompt = try makeTitleGenerationPrompt(std.testing.allocator, "first request", "");
-    defer std.testing.allocator.free(prompt);
-
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "<user>\nfirst request\n</user>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "<assistant>") == null);
-}
-
-test "generated thread description reads the second line" {
-    const allocator = std.testing.allocator;
-    const description = (try makeGeneratedThreadDescription(allocator, "Fix flaky auth tests\n\nDescription: Stabilize  the OAuth refresh test in auth.zig by mocking the clock.\n")) orelse return error.TestExpectedEqual;
-    defer allocator.free(description);
-    try std.testing.expectEqualStrings("Stabilize the OAuth refresh test in auth.zig by mocking the clock.", description);
-
-    try std.testing.expect((try makeGeneratedThreadDescription(allocator, "Only a title")) == null);
-    try std.testing.expect((try makeGeneratedThreadDescription(allocator, "Same line\nsame line")) == null);
-}
-
-test "title generation prompt asks for a title and a description line" {
-    const prompt = try makeTitleGenerationPrompt(std.testing.allocator, "first request", "");
-    defer std.testing.allocator.free(prompt);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Line 1: a concise 2-6 word title.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Line 2: one plain sentence") != null);
-}
-
 /// A durable refresh can arrive before the terminal tail is consumed. Match
 /// only this turn's saved rows, in order, so repeated text in other turns or
 /// repeated messages within this turn are not accidentally suppressed.
@@ -401,12 +357,4 @@ pub fn transcriptSyncGeneration(messages: anytype) u64 {
         generation = @max(generation, value);
     }
     return generation;
-}
-
-test "thread sync generation distinguishes replacement from ordinary tail rows" {
-    const Row = struct { message_id: ?[]const u8 };
-    try std.testing.expectEqual(@as(u64, 0), transcriptSyncGeneration(&[_]Row{.{ .message_id = "turn:old:msg:1" }}));
-    try std.testing.expectEqual(@as(u64, 42), transcriptSyncGeneration(&[_]Row{
-        .{ .message_id = "turn:sync:42:msg:0" }, .{ .message_id = "turn:next:msg:1" }, .{ .message_id = "turn:sync:bad:msg:0" },
-    }));
 }

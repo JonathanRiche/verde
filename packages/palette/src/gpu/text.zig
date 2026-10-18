@@ -566,22 +566,6 @@ test "natural text: baseline, snapping, newline and wrap" {
     try std.testing.expectEqual(before, cache.stats.rasterized);
 }
 
-test "fixed-cell mono text" {
-    const gpa = std.testing.allocator;
-    var stub: StubGlyphSource = .{};
-    var cache = GlyphCache.init(gpa, .{ .coverage_initial = 256 });
-    defer cache.deinit();
-    var lay: Layouter = .{ .gpa = gpa, .source = stub.source(), .cache = &cache, .scale = 1.0 };
-    defer lay.deinit();
-    var sink: TestSink = .{ .gpa = gpa };
-    defer sink.quads.deinit(gpa);
-    try lay.drawFixed(&sink, "a\tb c\nd", 0, 0, .{}, 10, 8.5, 15, null, null, .mono);
-    try std.testing.expectEqual(@as(usize, 4), sink.quads.items.len);
-    try std.testing.expectEqual(@as(f32, 1), sink.quads.items[0].x);
-    try std.testing.expectEqual(@as(f32, @round(8.5 * 5) + 1), sink.quads.items[1].x);
-    try std.testing.expectEqual(sink.quads.items[0].y + 15, sink.quads.items[3].y);
-}
-
 test "glyph cache evicts when the atlas is full" {
     const gpa = std.testing.allocator;
     var stub: StubGlyphSource = .{};

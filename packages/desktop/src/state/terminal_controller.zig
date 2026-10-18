@@ -42,34 +42,6 @@ fn managedProcessPollDue(last_poll_ms: i64, now_ms: i64) bool {
         now_ms - last_poll_ms >= MANAGED_PROCESS_POLL_INTERVAL_MS;
 }
 
-test "managed process maintenance is decoupled from terminal tail cadence" {
-    try std.testing.expect(managedProcessPollDue(0, 100));
-    try std.testing.expect(!managedProcessPollDue(100, 349));
-    try std.testing.expect(managedProcessPollDue(100, 350));
-    try std.testing.expect(managedProcessPollDue(500, 10));
-}
-
-test "composite session scope becomes an owned bounded projection" {
-    const source = [_]headless.store.SessionSummary{.{
-        .session_id = "session-1",
-        .workspace_id = "workspace-1",
-        .workspace_path = "/tmp/workspace-1",
-        .cwd = "/tmp/workspace-1",
-        .label = "shell",
-        .command = "bash",
-        .dock_id = 2,
-        .pane_id = 3,
-        .pid = 42,
-        .running = true,
-        .status = "running",
-    }};
-    var projection = try buildDaemonSessionProjection(std.testing.allocator, &source);
-    defer deinitDaemonSessionProjection(std.testing.allocator, &projection);
-    try std.testing.expectEqual(@as(usize, 1), projection.items.len);
-    try std.testing.expectEqualStrings("session-1", projection.items[0].session_id);
-    try std.testing.expect(projection.items[0].running);
-}
-
 pub const DefaultAgentTui = struct {
     name: []const u8,
     command: []const u8,

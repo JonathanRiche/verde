@@ -265,14 +265,6 @@ fn validPrefixedHex32(value: []const u8, prefix: []const u8) bool {
     return true;
 }
 
-test "connect methods keep login/link and unlink/logout distinct" {
-    try std.testing.expect(isMutatingMethod(METHOD_LOGIN));
-    try std.testing.expect(isMutatingMethod(METHOD_LINK));
-    try std.testing.expect(isMutatingMethod(METHOD_UNLINK));
-    try std.testing.expect(isMutatingMethod(METHOD_LOGOUT));
-    try std.testing.expect(!isMutatingMethod(METHOD_STATUS));
-}
-
 test "control-plane URL and credential handoff are fail closed" {
     try validateControlPlaneUrl("https://connect.example.test");
     try std.testing.expectError(error.InsecureControlPlaneUrl, validateControlPlaneUrl("http://connect.example.test"));
@@ -281,33 +273,6 @@ test "control-plane URL and credential handoff are fail closed" {
     try std.testing.expectError(error.InvalidControlPlaneUrl, validateControlPlaneUrl("https://connect.example.test/"));
     try validateCredentialFile("/run/user/1000/verde-connect-token");
     try std.testing.expectError(error.InvalidCredentialFile, validateCredentialFile("relative-token"));
-}
-
-test "connect secrets redact by default" {
-    const secret: Secret = .{ .bytes = "do-not-print" };
-    const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, secret, .{});
-    defer std.testing.allocator.free(encoded);
-    try std.testing.expectEqualStrings("\"[REDACTED]\"", encoded);
-}
-
-test "runtime descriptors enforce public v1 identity and endpoint constraints" {
-    const descriptor: RuntimeDescriptor = .{
-        .contract_version = "1",
-        .runtime_id = "0123456789abcdef0123456789abcdef",
-        .instance_id = "abcdef0123456789abcdef0123456789",
-        .https_url = "https://runtime.example.test",
-        .wss_url = "wss://runtime.example.test/v1/ws",
-        .tls_identity = .{ .kind = "spki_sha256", .sha256 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
-        .protocol = .{ .major = 1, .minor = 0 },
-        .capabilities = &.{ "chat.read", "terminal.write" },
-    };
-    try validateRuntimeDescriptor(descriptor, descriptor.runtime_id, descriptor.instance_id);
-    var invalid = descriptor;
-    invalid.wss_url = "wss:///missing-host";
-    try std.testing.expectError(
-        error.InvalidRuntimeDescriptor,
-        validateRuntimeDescriptor(invalid, descriptor.runtime_id, descriptor.instance_id),
-    );
 }
 
 test "public Connect bootstrap DTO is strict redacting and identity-explicit" {

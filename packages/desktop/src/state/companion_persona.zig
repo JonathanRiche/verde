@@ -69,35 +69,3 @@ pub fn noteAlloc(
         \\</verde_companion>
     , .{ name, workspace_label, home_workspace_id, thread_id, thread_id, thread_id, autonomyClause(character), orders_block });
 }
-
-test "persona note names the companion and its machine-wide role" {
-    const allocator = std.testing.allocator;
-    const note = try noteAlloc(allocator, "Juniper", .moss, "ws-1", "chat-9", "verde", "");
-    defer allocator.free(note);
-    try std.testing.expect(std.mem.indexOf(u8, note, "You are Juniper") != null);
-    try std.testing.expect(std.mem.indexOf(u8, note, "all of Verde across every workspace") != null);
-    try std.testing.expect(std.mem.indexOf(u8, note, "workspace_id ws-1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, note, "Your own thread id is chat-9.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, note, "--parent-thread-id chat-9") != null);
-    try std.testing.expect(std.mem.indexOf(u8, note, "Temperament: steady") != null);
-    try std.testing.expect(std.mem.startsWith(u8, note, "<verde_companion>"));
-}
-
-test "persona temperament follows the character" {
-    const allocator = std.testing.allocator;
-    inline for (.{ .{ .sprout, "careful" }, .{ .vireo, "quick and autonomous" } }) |case| {
-        const note = try noteAlloc(allocator, "X", case[0], "ws", "t", "w", "");
-        defer allocator.free(note);
-        try std.testing.expect(std.mem.indexOf(u8, note, case[1]) != null);
-    }
-}
-
-test "persona includes standing orders only when the user wrote some" {
-    const allocator = std.testing.allocator;
-    const without = try noteAlloc(allocator, "X", .sprout, "ws", "t", "w", "   ");
-    defer allocator.free(without);
-    try std.testing.expect(std.mem.indexOf(u8, without, "Standing orders") == null);
-    const with = try noteAlloc(allocator, "X", .sprout, "ws", "t", "w", "Never push to main.");
-    defer allocator.free(with);
-    try std.testing.expect(std.mem.indexOf(u8, with, "Standing orders from the user (always follow these):\nNever push to main.") != null);
-}

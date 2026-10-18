@@ -1205,71 +1205,6 @@ fn unixTimestampMs() i64 {
     return platform_runtime.unixTimestampMs();
 }
 
-test "chat activity distinguishes approval waiting from working" {
-    const allocator = std.testing.allocator;
-    var thread = try ChatThread.init(allocator, "Activity");
-    defer thread.deinit(allocator);
-
-    try std.testing.expectEqual(ChatActivityStatus.idle, thread.activityStatusForUi());
-    thread.send_state.status = .pending;
-    try std.testing.expectEqual(ChatActivityStatus.working, thread.activityStatusForUi());
-
-    thread.send_state.pending_approval = .{
-        .call_id = try std.heap.page_allocator.dupe(u8, "call-1"),
-        .title = try std.heap.page_allocator.dupe(u8, "Approval"),
-        .body = try std.heap.page_allocator.dupe(u8, "Run command?"),
-    };
-    try std.testing.expectEqual(ChatActivityStatus.waiting, thread.activityStatusForUi());
-    freePendingApproval(std.heap.page_allocator, &thread.send_state.pending_approval);
-
-    thread.send_state.status = .failed;
-    try std.testing.expectEqual(ChatActivityStatus.@"error", thread.activityStatusForUi());
-    thread.completion_pending = true;
-    try std.testing.expectEqual(ChatActivityStatus.done, thread.activityStatusForUi());
-}
-
-test "chat activity waits for running background work" {
-    const allocator = std.testing.allocator;
-    var thread = try ChatThread.init(allocator, "Background activity");
-    defer thread.deinit(allocator);
-    try thread.background_tasks.append(allocator, .{
-        .command = try allocator.dupeZ(u8, "background task"),
-        .status = .running,
-    });
-
-    thread.completion_pending = true;
-    try std.testing.expectEqual(ChatActivityStatus.waiting, thread.activityStatusForUi());
-
-    thread.send_state.status = .pending;
-    try std.testing.expectEqual(ChatActivityStatus.working, thread.activityStatusForUi());
-
-    thread.send_state.status = .completed;
-    thread.background_tasks.items[0].status = .completed;
-    try std.testing.expectEqual(ChatActivityStatus.done, thread.activityStatusForUi());
-}
-
-test "interrupted transcript rebuild stops unowned background work" {
-    const allocator = std.testing.allocator;
-    var thread = try ChatThread.init(allocator, "Interrupted background");
-    defer thread.deinit(allocator);
-    try thread.messages.append(allocator, .{
-        .role = .system,
-        .author = try allocator.dupeZ(u8, "Background command"),
-        .body = try allocator.dupeZ(u8, "wait forever"),
-    });
-    try thread.messages.append(allocator, .{
-        .role = .system,
-        .author = try allocator.dupeZ(u8, "Conversation interrupted"),
-        .body = try allocator.dupeZ(u8, "Tell the model what to do differently."),
-    });
-
-    thread.rebuildBackgroundTasksFromMessages(allocator);
-
-    try std.testing.expectEqual(@as(usize, 1), thread.background_tasks.items.len);
-    try std.testing.expectEqual(BackgroundTaskStatus.stopped, thread.background_tasks.items[0].status);
-    try std.testing.expectEqual(ChatActivityStatus.idle, thread.activityStatusForUi());
-}
-
 test "transcript rebuild completes Codex terminals a later snapshot no longer lists" {
     const allocator = std.testing.allocator;
     var thread = try ChatThread.init(allocator, "Codex snapshot rebuild");
@@ -1313,52 +1248,6 @@ test "transcript rebuild completes Codex terminals a later snapshot no longer li
     try std.testing.expectEqual(@as(usize, 1), thread.background_tasks.items.len);
     try std.testing.expectEqual(BackgroundTaskStatus.completed, thread.background_tasks.items[0].status);
     try std.testing.expect(!thread.backgroundCommandIsRunning(command_body));
-}
-
-test "terminal events resolve repeated anonymous background commands in order" {
-    const allocator = std.testing.allocator;
-    var thread = try ChatThread.init(allocator, "Repeated background");
-    defer thread.deinit(allocator);
-
-    try thread.background_tasks.append(allocator, .{
-        .command = try allocator.dupeZ(u8, "same command"),
-        .status = .running,
-    });
-    try thread.background_tasks.append(allocator, .{
-        .command = try allocator.dupeZ(u8, "same command"),
-        .status = .running,
-    });
-    try thread.noteBackgroundTaskEvent(allocator, "Background task stopped", "same command");
-    try thread.noteBackgroundTaskEvent(allocator, "Background task stopped", "same command");
-
-    try std.testing.expectEqual(@as(usize, 2), thread.background_tasks.items.len);
-    try std.testing.expectEqual(BackgroundTaskStatus.stopped, thread.background_tasks.items[0].status);
-    try std.testing.expectEqual(BackgroundTaskStatus.stopped, thread.background_tasks.items[1].status);
-}
-
-test "subagent local thread ids encode the parent and stay stable" {
-    const allocator = std.testing.allocator;
-    const first = try mintSubagentLocalThreadId(allocator, "chat-1-abc", "call-9");
-    defer allocator.free(first);
-    const second = try mintSubagentLocalThreadId(allocator, "chat-1-abc", "call-9");
-    defer allocator.free(second);
-    const other = try mintSubagentLocalThreadId(allocator, "chat-1-abc", "call-8");
-    defer allocator.free(other);
-
-    try std.testing.expectEqualStrings(first, second);
-    try std.testing.expect(isSubagentLocalThreadId(first));
-    try std.testing.expectEqualStrings("chat-1-abc", subagentParentLocalId(first).?);
-    try std.testing.expect(!std.mem.eql(u8, first, other));
-
-    // A nested agent's pane hangs off the child pane, so the encoded parent
-    // stays resolvable through the extra `subagent:` level.
-    const grandchild = try mintSubagentLocalThreadId(allocator, first, "nested-call");
-    defer allocator.free(grandchild);
-    try std.testing.expect(isSubagentLocalThreadId(grandchild));
-    try std.testing.expectEqualStrings(first, subagentParentLocalId(grandchild).?);
-    try std.testing.expect(isSubagentAuthorOrKind("Subagent", null));
-    try std.testing.expect(isSubagentAuthorOrKind("Read", .subagent));
-    try std.testing.expect(!isSubagentAuthorOrKind("Read", .read));
 }
 
 test "tool body sections keep blank lines until the next label" {

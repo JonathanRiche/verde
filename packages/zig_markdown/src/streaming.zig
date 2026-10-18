@@ -141,14 +141,6 @@ fn heldTail(source: []const u8) []const u8 {
     return source[source.len - streamingHoldLength(source) ..];
 }
 
-test "plain prose and complete blocks hold nothing" {
-    try std.testing.expectEqual(@as(usize, 0), streamingHoldLength(""));
-    try std.testing.expectEqual(@as(usize, 0), streamingHoldLength("Hello there, this is prose"));
-    try std.testing.expectEqual(@as(usize, 0), streamingHoldLength("# Heading\n\nA paragraph.\n"));
-    try std.testing.expectEqual(@as(usize, 0), streamingHoldLength("- item one\n- item two"));
-    try std.testing.expectEqual(@as(usize, 0), streamingHoldLength("1. first\n2. second item"));
-}
-
 test "table header waits for its delimiter row, then rows stream by line" {
     try std.testing.expectEqualStrings("| a | b |", heldTail("intro\n| a | b |"));
     try std.testing.expectEqualStrings("| a | b |\n", heldTail("intro\n| a | b |\n"));

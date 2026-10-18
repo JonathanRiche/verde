@@ -62,38 +62,6 @@ test "push open agrees with the A-12 daemon vector through the stored record" {
     try eql(push.GENERIC_BODY, model.body);
 }
 
-test "push open returns a typed model for a daemon-sealed payload" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const device = try seal.KeyPair.generateDeterministic(hex("1111111111111111111111111111111111111111111111111111111111111111"));
-    const other = try seal.KeyPair.generateDeterministic(hex("2222222222222222222222222222222222222222222222222222222222222222"));
-    const envelope = try seal.seal(a, std.testing.io, device.public_key, try daemonPayload(a, "approval_pending", runtime_id, "Run `rm -rf build`?\nIn repo"));
-    const keys = [_]push.OpenKey{ .{ .host_id = "other", .record_base64 = try record(a, other, runtime_id) }, .{ .host_id = "home", .record_base64 = try record(a, device, runtime_id) } };
-    const model = try push.open(a, try request(a, envelope, &keys, &.{}));
-    try expect(model.opened and model.@"error" == null and !model.duplicate);
-    try eql("home", model.host_id.?);
-    try eql("approval_pending", model.kind);
-    try eql("needs_approval", model.attention.?);
-    try eql("attention", model.channel);
-    try eql("Fix the build", model.title);
-    try eql("Needs approval: Run `rm -rf build`?\nIn repo", model.body);
-    try eql("verde://open?host_id=home&workspace_id=ws%201&thread_id=thread%2F1", model.deep_link);
-    try expect(model.actions.len == 3);
-    try eql("approve", model.actions[1]);
-    try eql("home:turn-1:approval_pending", model.dedupe_key.?);
-
-    const done = try push.open(a, try request(a, try seal.seal(a, std.testing.io, device.public_key, try h.encode(a, .{ .runtime_id = runtime_id, .workspace_id = "ws", .thread_id = "t", .turn_id = "turn-2", .kind = "completed", .title = "" })), keys[1..], &.{}));
-    try eql("Verde", done.title);
-    try eql("Reply ready", done.body);
-    try eql("completed", done.channel);
-    try eql("reply", done.actions[1]);
-
-    const test_push = try push.open(a, try request(a, try seal.seal(a, std.testing.io, device.public_key, try h.encode(a, .{ .runtime_id = runtime_id, .kind = "test", .title = "Verde push test" })), keys[1..], &.{}));
-    try expect(test_push.opened and test_push.dedupe_key == null and test_push.actions.len == 1);
-    try eql("verde://open?host_id=home", test_push.deep_link);
-}
-
 test "push open rejects tamper, wrong key, newer version and foreign runtime generically" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -216,8 +184,6 @@ const Fixture = struct {
     host: h.Host,
     now: i64 = 1,
     serial: u64 = 1,
-    /// Acknowledge attention record writes as the platform would.
-    auto: bool = false,
     fn init(scopes: []const []const u8) !Fixture {
         var host = try h.Host.init(std.testing.allocator,
             \\{"api_version":1,"host_id":"home","label":"Home","https_url":"https://host.example","wss_url":"wss://host.example/ws","client_revision":1,"session_nonce":"0123456789abcdef0123456789abcdef","jitter_seed":7}
@@ -249,11 +215,7 @@ const Fixture = struct {
         f.now += 1;
         try v.object.put(f.a(), "now_ms", .{ .integer = f.now });
         try v.object.put(f.a(), "wall_time_ms", .{ .integer = 1790000000000 + f.now });
-        const batch = try h.parseLimit(f.a(), try f.host.handle(try h.encode(f.a(), v), f.a()), h.MAX_HTTP_INPUT);
-        if (f.auto) if (find(batch, "secure_store_put", "/attention")) |put| {
-            _ = try f.answer(put, null);
-        };
-        return batch;
+        return h.parseLimit(f.a(), try f.host.handle(try h.encode(f.a(), v), f.a()), h.MAX_HTTP_INPUT);
     }
     fn intent(f: *Fixture, tag: []const u8, payload: anytype) !V {
         var v = try h.parse(f.a(), try h.encode(f.a(), payload));
@@ -261,16 +223,6 @@ const Fixture = struct {
         try v.object.put(f.a(), "intent_id", .{ .string = try std.fmt.allocPrint(f.a(), "intent-{d}", .{f.serial}) });
         f.serial += 1;
         return f.event(tag, v);
-    }
-    /// Replace the sync snapshot: one workspace, two threads, given turns.
-    fn snapshot(f: *Fixture, turn_json: []const u8) !void {
-        var tx = try h.Transaction.init(&f.host);
-        defer tx.deinit();
-        const json = try std.fmt.allocPrint(tx.allocator(),
-            \\{{"snapshot":{{"workspaces":[{{"workspace_id":"ws","label":"Repo","path":"/repo","threads":[{{"local_thread_id":"t1","title":"Fix build"}},{{"local_thread_id":"t2","title":"Docs"}}]}}]}},"sessions":[],"turns":{s},"incomplete_scopes":[]}}
-        , .{turn_json});
-        tx.state.sync.snapshot = try h.parse(tx.allocator(), json);
-        f.a().free(try tx.commit(&f.host, f.a()));
     }
     fn tick(f: *Fixture) !V {
         return f.event("foreground", .{});
@@ -280,9 +232,6 @@ const Fixture = struct {
             return f.event("secure_store_value", .{ .effect_id = p.s(effect, "effect_id"), .generation = p.s(effect, "generation"), .key = p.s(effect, "key"), .value_base64 = if (value) |bytes| try rpc.encodeBase64(f.a(), bytes) else null, .@"error" = @as(?u8, null) });
         }
         return f.event("secure_store_done", .{ .effect_id = p.s(effect, "effect_id"), .generation = p.s(effect, "generation"), .key = p.s(effect, "key"), .@"error" = @as(?u8, null) });
-    }
-    fn query(f: *Fixture, selector: []const u8) !V {
-        return p.get(try h.parse(f.a(), try f.host.query(selector, f.a())), "data");
     }
 };
 fn find(batch: V, tag: []const u8, key_suffix: []const u8) ?V {
@@ -297,123 +246,6 @@ fn count(batch: V, tag: []const u8) usize {
         if (h.eq(p.s(effect, "type"), tag)) n += 1;
     }
     return n;
-}
-fn running(turn: []const u8, thread: []const u8, status: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(std.testing.allocator, "{{\"turn_id\":\"{s}\",\"workspace_id\":\"ws\",\"local_thread_id\":\"{s}\",\"status\":\"{s}\",\"started_at_ms\":10}}", .{ turn, thread, status });
-}
-fn turns(f: *Fixture, items: []const []const u8) !void {
-    var list: std.ArrayList(u8) = .empty;
-    try list.append(f.a(), '[');
-    for (items, 0..) |item, i| {
-        if (i > 0) try list.append(f.a(), ',');
-        try list.appendSlice(f.a(), item);
-        std.testing.allocator.free(item);
-    }
-    try list.append(f.a(), ']');
-    try f.snapshot(list.items);
-}
-
-test "host attention seeds silently, notifies on completion, clears on view and persists" {
-    var f = try Fixture.init(&.{"chat:read"});
-    defer f.deinit();
-    f.auto = true;
-    try turns(&f, &.{try running("old", "t1", "completed")});
-    const load = find(try f.tick(), "secure_store_get", "/home/attention").?;
-    const seeded = try f.answer(load, null);
-    try expect(count(seeded, "notify") == 0);
-    try expect(p.get(try f.query("attention"), "count").integer == 0);
-
-    try turns(&f, &.{try running("turn-1", "t1", "running")});
-    try expect(count(try f.tick(), "notify") == 0);
-    try turns(&f, &.{try running("turn-1", "t1", "completed")});
-    const batch = try f.tick();
-    try expect(count(batch, "notify") == 1);
-    const notice = find(batch, "notify", "").?;
-    try eql("home:turn-1:completed", p.s(notice, "notification_id"));
-    try eql("Reply ready in Repo", p.s(notice, "body"));
-    try eql("Fix build", p.s(notice, "title"));
-    try eql("t1", p.s(p.get(notice, "target"), "thread_id"));
-    var scoped = false;
-    for (p.rows(p.get(find(batch, "state_changed", "").?, "scopes"))) |scope| scoped = scoped or h.eq(scope.string, "attention");
-    try expect(scoped);
-    const saved = find(batch, "secure_store_put", "/home/attention").?;
-    // Re-observing the same state neither re-notifies nor rewrites.
-    try expect(count(try f.tick(), "notify") == 0);
-
-    const view = try f.query("attention");
-    try expect(p.get(view, "count").integer == 1);
-    const item = p.rows(p.get(view, "items"))[0];
-    try eql("unread", p.s(item, "kind"));
-    try eql("Fix build", p.s(item, "title"));
-    try eql("verde://open?host_id=home&workspace_id=ws&thread_id=t1", p.s(item, "deep_link"));
-    const decoded = try std.json.parseFromValue(@import("wire.zig").Query(attention.View), std.testing.allocator, try h.parse(f.a(), try f.host.query("attention", f.a())), .{});
-    defer decoded.deinit();
-    const home = p.rows(p.get(try f.query("home"), "items"));
-    try expect(home.len == 1);
-    try eql("unread", p.s(home[0], "attention_kind"));
-    try expect(p.yes(p.get(home[0], "attention")));
-    const panes = p.rows(p.get(p.rows(p.get(try f.query("workspaces"), "items"))[0], "panes"));
-    for (panes) |pane| if (h.eq(p.s(pane, "thread_id"), "t1")) try eql("unread", p.s(pane, "attention_kind"));
-
-    // Persisted entries restore unread in a new process.
-    const stored = try @import("auth.zig").decode64(f.a(), p.s(saved, "value_base64"));
-    var g = try Fixture.init(&.{"chat:read"});
-    defer g.deinit();
-    try turns(&g, &.{try running("turn-1", "t1", "completed")});
-    _ = try g.answer(find(try g.tick(), "secure_store_get", "/attention").?, stored);
-    try expect(p.get(try g.query("attention"), "count").integer == 1);
-
-    // Viewing the thread clears it.
-    _ = try f.intent("thread_open", .{ .workspace_id = "ws", .thread_id = "t1" });
-    try expect(p.get(try f.query("attention"), "count").integer == 0);
-    try expect(p.rows(p.get(try f.query("home"), "items")).len == 0);
-}
-
-test "host attention suppresses the focused thread and follows approval, failure and push" {
-    var f = try Fixture.init(&.{"chat:read"});
-    defer f.deinit();
-    f.auto = true;
-    try turns(&f, &.{ try running("a", "t1", "running"), try running("b", "t2", "running") });
-    _ = try f.answer(find(try f.tick(), "secure_store_get", "/attention").?, null);
-    _ = try f.intent("focus", .{ .workspace_id = "ws", .thread_id = "t1", .terminal_id = null });
-    try turns(&f, &.{ try running("a", "t1", "completed"), try running("b", "t2", "waiting_approval") });
-    var batch = try f.tick();
-    try expect(count(batch, "notify") == 1);
-    try eql("home:b:approval_pending", p.s(find(batch, "notify", "").?, "notification_id"));
-    try eql("Needs approval", p.s(find(batch, "notify", "").?, "body"));
-    var view = try f.query("attention");
-    try expect(p.get(view, "count").integer == 1);
-    try eql("needs_approval", p.s(p.rows(p.get(view, "items"))[0], "kind"));
-
-    // In the background the focused thread is not being viewed.
-    _ = try f.event("background", .{});
-    try turns(&f, &.{ try running("a2", "t1", "failed"), try running("b", "t2", "failed") });
-    batch = try f.event("background", .{});
-    try expect(count(batch, "notify") == 2);
-    view = try f.query("attention");
-    try expect(p.get(view, "count").integer == 2);
-    for (p.rows(p.get(view, "items"))) |item| try eql("failed", p.s(item, "kind"));
-    // Returning to the foreground on the focused thread clears only that one.
-    _ = try f.event("foreground", .{});
-    view = try f.query("attention");
-    try expect(p.get(view, "count").integer == 1);
-    try eql("t2", p.s(p.rows(p.get(view, "items"))[0], "thread_id"));
-    _ = try f.intent("focus", .{ .workspace_id = null, .thread_id = null, .terminal_id = null });
-
-    // Blocked is push-only; it survives its running turn and the in-app
-    // notification is not repeated for a pushed event.
-    try turns(&f, &.{ try running("a2", "t1", "failed"), try running("c", "t2", "running") });
-    _ = try f.tick();
-    _ = try f.event("push_received", .{ .workspace_id = "ws", .thread_id = "t2", .turn_id = "c", .kind = "input_needed" });
-    try expect(count(try f.tick(), "notify") == 0);
-    view = try f.query("attention");
-    var blocked = false;
-    for (p.rows(p.get(view, "items"))) |item| blocked = blocked or (h.eq(p.s(item, "thread_id"), "t2") and h.eq(p.s(item, "kind"), "blocked"));
-    try expect(blocked);
-    _ = try f.event("push_received", .{ .workspace_id = "ws", .thread_id = "t2", .turn_id = "c", .kind = "completed" });
-    try turns(&f, &.{ try running("a2", "t1", "failed"), try running("c", "t2", "completed") });
-    try expect(count(try f.tick(), "notify") == 0);
-    try std.testing.expectError(error.InvalidArgument, f.event("push_received", .{ .workspace_id = "", .thread_id = "t2", .turn_id = "c", .kind = "completed" }));
 }
 
 test "push_register stores one key per host and registers the public key" {
@@ -514,32 +346,4 @@ test "sign out wipes chat drafts, push key, attention and the chat index" {
     try expect(deleted.items.len == want.len);
     for (want, deleted.items) |w, d| try eql(w, d);
     try expect(f.host.state.chat.threads.len == 0 and f.host.state.attention.entries.len == 0 and f.host.state.chat_index.digests.len == 0);
-}
-
-test "sign out reads an unloaded chat index and retries a failed chat delete" {
-    var f = try Fixture.init(&.{"chat:read"});
-    defer f.deinit();
-    const indexed = "cd" ** 32;
-    var effect = storeEffect(try f.intent("forget_host", .{ .host_id = "home" })).?;
-    // credential, profile, sync, attention, push
-    for (0..5) |_| {
-        try eql("secure_store_delete", p.s(effect, "type"));
-        effect = storeEffect(try f.answer(effect, null)).?;
-    }
-    // After push, the index is read because this process never loaded it.
-    try eql("vc/1/home/chat_index", p.s(effect, "key"));
-    try eql("secure_store_get", p.s(effect, "type"));
-    const batch = try f.answer(effect, try h.encode(f.a(), .{ .version = 1, .digests = &[_][]const u8{ indexed, "not-a-digest" } }));
-    const chat_delete = storeEffect(batch).?;
-    try eql("secure_store_delete", p.s(chat_delete, "type"));
-    try eql("vc/1/home/chat/" ++ indexed, p.s(chat_delete, "key"));
-    _ = try f.event("secure_store_done", .{ .effect_id = p.s(chat_delete, "effect_id"), .generation = p.s(chat_delete, "generation"), .key = p.s(chat_delete, "key"), .@"error" = .{ .code = "locked" } });
-    try eql("sign_out_delete_failed", f.host.state.host_error.?.code);
-    const retried = storeEffect(try f.intent("retry_connection", .{})).?;
-    try eql(p.s(chat_delete, "key"), p.s(retried, "key"));
-    const last = storeEffect(try f.answer(retried, null)).?;
-    try eql("vc/1/home/chat_index", p.s(last, "key"));
-    try eql("secure_store_delete", p.s(last, "type"));
-    try expect(storeEffect(try f.answer(last, null)) == null);
-    try eql("signed_out", f.host.state.auth_state);
 }

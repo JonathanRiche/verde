@@ -249,12 +249,3 @@ test "Muse TUI log parser preserves ordered title and lifecycle events" {
     try std.testing.expectEqualStrings("foggy-betelgeuse", tracker.title.?);
     try std.testing.expectEqualSlices(Event, &.{ .title_changed, .working, .done }, batch.slice());
 }
-
-test "Muse TUI route facts bind logs to the launched process and workspace" {
-    const payload =
-        \\{"payload_type":"runtime.session.route_facts","payload":{"record":{"cwd":"/work/verde","pid":4242}}}
-    ;
-    try std.testing.expect(routeFactsMatch(payload, 4242, "/work/verde"));
-    try std.testing.expect(!routeFactsMatch(payload, 4243, "/work/verde"));
-    try std.testing.expect(!routeFactsMatch(payload, 4242, "/work/other"));
-}

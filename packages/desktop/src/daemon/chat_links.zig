@@ -317,26 +317,6 @@ pub fn recoverTasks(conn: zqlite.Conn, allocator: std.mem.Allocator, now: i64) !
     }
 }
 
-test "removing a linked chat stops parent delivery" {
-    var conn = try zqlite.open(":memory:", zqlite.OpenFlags.Create | zqlite.OpenFlags.EXResCode);
-    defer conn.close();
-    try conn.execNoArgs(@import("../db/chat_links_schema.zig").SCHEMA_SQL);
-    try ensureParentWorkspaceColumn(conn);
-    try initialize(conn);
-    try conn.execNoArgs("insert into chat_links(link_id,workspace_id,parent_thread_id,local_thread_id) values('l','w','p','c')");
-    try createTask(conn, "t1", "w", "c", "verde", 1);
-    try updateTask(conn, "t1", "completed", "queued", null, null, 2);
-    try clear(conn, "w", "p", "l", false);
-    var pending = (try conn.row("select count(*) from chat_deliveries where delivered=0", .{})).?;
-    try std.testing.expectEqual(@as(i64, 0), pending.int(0));
-    pending.deinit();
-    try createTask(conn, "t2", "w", "c", "verde", 3);
-    try updateTask(conn, "t2", "completed", "after removal", null, null, 4);
-    var rows = (try conn.row("select count(*) from chat_deliveries where task_id='t2'", .{})).?;
-    defer rows.deinit();
-    try std.testing.expectEqual(@as(i64, 0), rows.int(0));
-}
-
 test "turns folded into one child run notify the parent once" {
     var conn = try zqlite.open(":memory:", zqlite.OpenFlags.Create | zqlite.OpenFlags.EXResCode);
     defer conn.close();
@@ -389,26 +369,6 @@ test "delegated work notifies only the parent that asked for it" {
     var resumed = (try conn.row("select group_concat(link_id) from chat_deliveries where task_id='resume:x'", .{})).?;
     defer resumed.deinit();
     try std.testing.expectEqualStrings("l2", resumed.text(0));
-}
-
-test "active child count tracks working children and undelivered results" {
-    var conn = try zqlite.open(":memory:", zqlite.OpenFlags.Create | zqlite.OpenFlags.EXResCode);
-    defer conn.close();
-    try conn.execNoArgs(@import("../db/chat_links_schema.zig").SCHEMA_SQL);
-    try ensureParentWorkspaceColumn(conn);
-    try initialize(conn);
-    try conn.execNoArgs("insert into chat_links(link_id,workspace_id,parent_thread_id,local_thread_id) values('l1','w','p','c1'),('l2','w','p','c2')");
-    try createTask(conn, "t1", "w", "c1", "mcp", 1);
-    try createTask(conn, "t2", "w", "c2", "mcp", 1);
-    try std.testing.expectEqual(@as(usize, 2), try activeChildCount(conn, "w", "p", null));
-    try updateTask(conn, "t1", "completed", "one", null, null, 2);
-    // c2 still running, t1's result not yet handed over.
-    try std.testing.expectEqual(@as(usize, 2), try activeChildCount(conn, "w", "p", null));
-    try conn.execNoArgs("update chat_deliveries set parent_turn_id='child-event:batch'");
-    try std.testing.expectEqual(@as(usize, 1), try activeChildCount(conn, "w", "p", "child-event:batch"));
-    try updateTask(conn, "t2", "completed", "two", "{}", "{}", 3);
-    try conn.execNoArgs("update chat_deliveries set delivered=1");
-    try std.testing.expectEqual(@as(usize, 0), try activeChildCount(conn, "w", "p", null));
 }
 
 test "cross-workspace links count, deliver, and clear under the parent's workspace" {

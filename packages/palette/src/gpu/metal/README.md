@@ -14,7 +14,7 @@ the precompiled `shader.metallib`, loaded with `newLibraryWithData:`, and the MS
 | file | role |
 |---|---|
 | `mtl.zig` | The slice of the Metal API used: enum values and by-value structs (MTLOrigin/Size/Viewport/ScissorRect/ClearColor) from the macOS 14 SDK, `MTLCreateSystemDefaultDevice` via dlsym, texture/buffer/blit helpers |
-| `shader.metal` | MSL port of `src/shaders/ui.{vert,frag}.glsl`. The same maths, kept in lockstep because the goldens are shared, plus `clear_vertex`/`clear_fragment` for partial redraws |
+| `shader.metal` | MSL port of `src/shaders/ui.{vert,frag}.glsl`. The same maths, kept in lockstep, plus `clear_vertex`/`clear_fragment` for partial redraws |
 | `shader.metallib` | `shader.metal` precompiled by `zig build compile-metal` (checked in, like the SPIR-V and DXBC). Regenerate it whenever `shader.metal` changes |
 | `renderer.zig` | `Context` (device, queue, serials, memory stats), `Renderer` (pipelines, atlases, textures, uploads, `streamTexture`, recording and commit) |
 | `targets.zig` | `Offscreen` (texture + CPU readback, BGRA→RGBA) and `LayerTarget` (CAMetalLayer window target) |
@@ -54,11 +54,6 @@ the precompiled `shader.metallib`, loaded with `newLibraryWithData:`, and the MS
 
 ## Measurements (M2, macOS 14.6)
 
-* **Goldens.** `zig build test-gpu` renders the shared reference scene offscreen and compares it with the
-  Vulkan-generated goldens. Tolerance is 3 LSB, with no more than 0.1% of pixels beyond it. On Metal, 0 pixels exceed the
-  tolerance. 15906 of 153600 pixels at 1x and 21826 of 240000 at 1.25x differ, all by exactly **1 LSB**. They sit in AA
-  ramps and blended overlays (e.g. 43 vs 44). Solid fills, text placement and the background are identical. The
-  expected-pixel test allows ±1 on Metal for the same reason. Partial redraw matches full redraw with 0 mismatches.
 * **Damage.** In `run-macos-window` every animation frame was partial: the average damage was 3136 of 79200 px (4%),
   90/90 frames were presented at 60.2–60.6 fps (interval p50 16.7 ms), and renderer CPU was 0.6 ms/frame in Debug.
   In `gpu-bench` (2000 commands, 1920x1080) wall+GPU time per frame is 1479 µs for a full redraw, 398 µs when one label
@@ -85,9 +80,6 @@ the precompiled `shader.metallib`, loaded with `newLibraryWithData:`, and the MS
   warning and compiles the embedded MSL instead. `Renderer.shader_library` (`.metallib` / `.source`) records the
   path, and a debug log line names it. `PALETTE_METAL_SHADER=source` (or `metal.renderer.force_source_shader`) forces
   the runtime compile for tests and measurements.
-* **Parity.** The test "Metal: precompiled metallib and runtime-compiled MSL render identically" renders the golden
-  scene through both paths at 1x and 1.25x and requires 0 differing pixels. `gpu-offscreen` PNGs are byte-identical
-  for both paths, and both differ from the shared goldens only by the known 1 LSB AA pixels (15906 at 1x, 21826 at 1.25x).
 * **Cold start** (M2, macOS 14.6, ReleaseFast `gpu-offscreen`, 5 runs each). Metal keeps one user-wide cache keyed by
   shader content (`$(getconf DARWIN_USER_CACHE_DIR)/com.apple.metal`), not one per executable: a copied or renamed
   binary is warm. So each cold run salts the shader with a unique comment (and, for the metallib, rebuilds it) instead

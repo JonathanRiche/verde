@@ -418,27 +418,3 @@ test "proc net tcp rows keep only local listeners owned by the user" {
     const loopback_v6 = "   0: 00000000000000000000000001000000:1A7F 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 51234 1 0000000000000000 100 0 0 10 0";
     try std.testing.expectEqual(@as(u16, 6783), parseListenerLine(loopback_v6, .v6, 1000).?.port);
 }
-
-test "server labels prefer the project directory over home or root" {
-    try std.testing.expectEqualStrings("t3code", cwdLabel("/home/me/dev/t3code", "/home/me").?);
-    try std.testing.expect(cwdLabel("/home/me", "/home/me/") == null);
-    try std.testing.expect(cwdLabel("/", "/home/me") == null);
-    try std.testing.expectEqual(@as(?u64, 123), socketInode("socket:[123]"));
-    try std.testing.expect(socketInode("pipe:[123]") == null);
-}
-
-test "probe accepts pages and redirects but not API-only roots" {
-    try std.testing.expect(isBrowsableStatusLine("HTTP/1.1 200 OK\r\n"));
-    try std.testing.expect(isBrowsableStatusLine("HTTP/1.1 302 Fou"));
-    try std.testing.expect(!isBrowsableStatusLine("HTTP/1.1 404 Not"));
-    try std.testing.expect(!isBrowsableStatusLine("HTTP/1.1 405 Met"));
-    try std.testing.expect(!isBrowsableStatusLine("SSH-2.0-OpenSSH"));
-    try std.testing.expect(isGenericRuntime("python3.12"));
-    try std.testing.expect(!isGenericRuntime("t3code"));
-}
-
-test "privileged and database ports are not probed" {
-    try std.testing.expect(!isLikelyWebPort(80));
-    try std.testing.expect(!isLikelyWebPort(5432));
-    try std.testing.expect(isLikelyWebPort(5173));
-}

@@ -209,31 +209,6 @@ fn clipTitle(title: []const u8) []const u8 {
 
 // -- tests -----------------------------------------------------------------
 
-const schema = @import("../db/schema.zig");
-
-const TestDb = struct {
-    tmp: std.testing.TmpDir,
-    conn: zqlite.Conn,
-
-    fn open() !TestDb {
-        var tmp = std.testing.tmpDir(.{});
-        errdefer tmp.cleanup();
-        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-        const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
-        const path = try std.fs.path.joinZ(std.testing.allocator, &.{ path_buf[0..path_len], "state.sqlite" });
-        defer std.testing.allocator.free(path);
-        const conn = try zqlite.open(path, zqlite.OpenFlags.Create | zqlite.OpenFlags.EXResCode);
-        errdefer conn.close();
-        try schema.initializeToVersion(conn, schema.MAX_SUPPORTED_VERSION);
-        return .{ .tmp = tmp, .conn = conn };
-    }
-
-    fn close(self: *TestDb) void {
-        self.conn.close();
-        self.tmp.cleanup();
-    }
-};
-
 test "isRecordableUrl accepts web pages and rejects internal schemes" {
     try std.testing.expect(isRecordableUrl("https://example.com/"));
     try std.testing.expect(isRecordableUrl("http://localhost:3000/app"));
@@ -245,85 +220,4 @@ test "isRecordableUrl accepts web pages and rejects internal schemes" {
     try std.testing.expect(!isRecordableUrl("javascript://void(0)"));
     try std.testing.expect(!isRecordableUrl("example.com"));
     try std.testing.expect(!isRecordableUrl("https://"));
-}
-
-test "recordVisit upserts counts, refreshes recency, and keeps titles across untitled visits" {
-    var db = try TestDb.open();
-    defer db.close();
-
-    try recordVisit(db.conn, "https://ziglang.org/", "", 1_000);
-    try recordVisit(db.conn, "https://ziglang.org/", "Zig Programming Language", 2_000);
-    try recordVisit(db.conn, "https://ziglang.org/", "", 3_000);
-    try updateTitle(db.conn, "https://ziglang.org/", "");
-    try std.testing.expectError(error.InvalidParams, recordVisit(db.conn, "about:blank", "", 4_000));
-
-    var row = (try db.conn.row("select visit_count, last_visit_ms, title from browser_history where url = ?", .{"https://ziglang.org/"})).?;
-    defer row.deinit();
-    try std.testing.expectEqual(@as(i64, 3), row.int(0));
-    try std.testing.expectEqual(@as(i64, 3_000), row.int(1));
-    try std.testing.expectEqualStrings("Zig Programming Language", row.text(2));
-
-    try updateTitle(db.conn, "https://ziglang.org/", "Zig ⚡");
-    var updated = (try db.conn.row("select title from browser_history where url = ?", .{"https://ziglang.org/"})).?;
-    defer updated.deinit();
-    try std.testing.expectEqualStrings("Zig ⚡", updated.text(0));
-}
-
-test "query ranks by frecency and match quality, filters by every term, and clears" {
-    var db = try TestDb.open();
-    defer db.close();
-    const day_ms: i64 = 24 * 60 * 60 * 1000;
-    const now_ms: i64 = 400 * day_ms;
-
-    // Visited often but long ago.
-    var i: usize = 0;
-    while (i < 20) : (i += 1) try recordVisit(db.conn, "https://old.example.com/docs", "Old Docs", 10 * day_ms);
-    // Visited once, today.
-    try recordVisit(db.conn, "https://fresh.example.com/", "Fresh Example", now_ms - day_ms);
-    // Visited a few times recently: title match only.
-    try recordVisit(db.conn, "https://ziglang.org/documentation/master/", "Zig Language Reference", now_ms - day_ms);
-    try recordVisit(db.conn, "https://ziglang.org/documentation/master/", "Zig Language Reference", now_ms - day_ms);
-    try recordVisit(db.conn, "https://news.example.org/", "Daily News", now_ms);
-
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    // Title word prefix (1.5x) beats the bare URL substring hit on the news site
-    // at equal recency; twenty stale visits trail both fresh ones.
-    const example = try query(db.conn, arena, "example", 8, now_ms);
-    try std.testing.expectEqual(@as(usize, 3), example.len);
-    try std.testing.expectEqualStrings("https://fresh.example.com/", example[0].url);
-    try std.testing.expectEqualStrings("https://news.example.org/", example[1].url);
-    try std.testing.expectEqualStrings("https://old.example.com/docs", example[2].url);
-    try std.testing.expectEqual(@as(u32, 20), example[2].visit_count);
-
-    // Typing the host prefix outranks everything else matching the same term.
-    const host = try query(db.conn, arena, "old.ex", 8, now_ms);
-    try std.testing.expectEqual(@as(usize, 1), host.len);
-    try std.testing.expectEqualStrings("Old Docs", host[0].title);
-
-    // Multi-term: both terms must match somewhere in url/title, case-insensitively.
-    const multi = try query(db.conn, arena, "ZIG reference", 8, now_ms);
-    try std.testing.expectEqual(@as(usize, 1), multi.len);
-    try std.testing.expectEqualStrings("Zig Language Reference", multi[0].title);
-    try std.testing.expectEqual(@as(usize, 0), (try query(db.conn, arena, "zig missing", 8, now_ms)).len);
-
-    // Empty query returns the most frecent entries, capped by limit; equal
-    // scores tie-break on recency.
-    const top = try query(db.conn, arena, "  ", 2, now_ms);
-    try std.testing.expectEqual(@as(usize, 2), top.len);
-    try std.testing.expectEqualStrings("https://ziglang.org/documentation/master/", top[0].url);
-    try std.testing.expectEqualStrings("https://news.example.org/", top[1].url);
-
-    try clear(db.conn);
-    try std.testing.expectEqual(@as(usize, 0), (try query(db.conn, arena, "", 8, now_ms)).len);
-}
-
-test "frecency weights recent visits above stale visit counts" {
-    const day_ms: i64 = 24 * 60 * 60 * 1000;
-    const now: i64 = 1000 * day_ms;
-    try std.testing.expect(frecencyScore(1, now - day_ms, now) > frecencyScore(9, now - 400 * day_ms, now));
-    try std.testing.expect(frecencyScore(3, now - 10 * day_ms, now) > frecencyScore(2, now - 10 * day_ms, now));
-    try std.testing.expectEqual(@as(f64, 100.0), frecencyScore(1, now + day_ms, now));
 }

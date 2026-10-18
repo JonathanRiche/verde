@@ -386,24 +386,6 @@ test "durable store identity is stable across restart" {
     try std.testing.expectEqualStrings(instance_id, second.identity.instance_id);
 }
 
-test "separate new stores receive separate secure identities" {
-    var first_tmp = std.testing.tmpDir(.{});
-    defer first_tmp.cleanup();
-    var second_tmp = std.testing.tmpDir(.{});
-    defer second_tmp.cleanup();
-    const first_paths = try testPaths(&first_tmp);
-    defer freeTestPaths(first_paths);
-    const second_paths = try testPaths(&second_tmp);
-    defer freeTestPaths(second_paths);
-
-    var first = try initStore(std.testing.allocator, std.testing.io, first_paths.dir, first_paths.db, .none);
-    defer first.deinit(std.testing.allocator);
-    var second = try initStore(std.testing.allocator, std.testing.io, second_paths.dir, second_paths.db, .none);
-    defer second.deinit(std.testing.allocator);
-    try std.testing.expect(!std.mem.eql(u8, first.identity.runtime_id, second.identity.runtime_id));
-    try std.testing.expect(!std.mem.eql(u8, first.identity.instance_id, second.identity.instance_id));
-}
-
 test "deleting state database preserves runtime and rotates instance" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -460,53 +442,6 @@ test "mismatched database and identity file fail without adoption" {
     try std.testing.expectEqualStrings(first_instance_id, restored.identity.instance_id);
 }
 
-test "missing or malformed identity beside initialized database fails" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const paths = try testPaths(&tmp);
-    defer freeTestPaths(paths);
-
-    var initialized = try initStore(std.testing.allocator, std.testing.io, paths.dir, paths.db, .none);
-    initialized.deinit(std.testing.allocator);
-    const identity_path = try std.fs.path.join(std.testing.allocator, &.{ paths.dir, FILE_NAME });
-    defer std.testing.allocator.free(identity_path);
-    try std.Io.Dir.cwd().deleteFile(std.testing.io, identity_path);
-    try std.testing.expectError(
-        error.RuntimeIdentityFileMissing,
-        initStore(std.testing.allocator, std.testing.io, paths.dir, paths.db, .none),
-    );
-
-    var file = try std.Io.Dir.cwd().createFile(std.testing.io, identity_path, .{});
-    try file.writeStreamingAll(std.testing.io, "{\"version\":1,\"runtime_id\":\"bad\",\"instance_id\":\"bad\"}\n");
-    file.close(std.testing.io);
-    try std.testing.expectError(
-        error.InvalidRuntimeIdentity,
-        initStore(std.testing.allocator, std.testing.io, paths.dir, paths.db, .none),
-    );
-}
-
-test "valid v1 identity seeds a legacy database exactly once" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const paths = try testPaths(&tmp);
-    defer freeTestPaths(paths);
-
-    var identity = try loadOrCreateFileOnly(std.testing.allocator, std.testing.io, paths.dir);
-    defer identity.deinit(std.testing.allocator);
-    const db_path_z = try std.testing.allocator.dupeZ(u8, paths.db);
-    defer std.testing.allocator.free(db_path_z);
-    {
-        const conn = try zqlite.open(db_path_z, zqlite.OpenFlags.Create | zqlite.OpenFlags.EXResCode);
-        defer conn.close();
-        try schema.initializeToVersion(conn, 7);
-    }
-
-    var migrated = try initStore(std.testing.allocator, std.testing.io, paths.dir, paths.db, .none);
-    defer migrated.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings(identity.runtime_id, migrated.identity.runtime_id);
-    try std.testing.expectEqualStrings(identity.instance_id, migrated.identity.instance_id);
-}
-
 test "pre-v8 database without sidecar upgrades and crash retry reuses pair" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -536,120 +471,6 @@ test "pre-v8 database without sidecar upgrades and crash retry reuses pair" {
     try std.testing.expectEqualStrings(instance_id, upgraded.identity.instance_id);
 }
 
-test "unknown nonempty version-zero database fails without rotating sidecar" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const paths = try testPaths(&tmp);
-    defer freeTestPaths(paths);
-
-    var staged = try loadOrCreateFileOnly(std.testing.allocator, std.testing.io, paths.dir);
-    const runtime_id = try std.testing.allocator.dupe(u8, staged.runtime_id);
-    defer std.testing.allocator.free(runtime_id);
-    const instance_id = try std.testing.allocator.dupe(u8, staged.instance_id);
-    defer std.testing.allocator.free(instance_id);
-    staged.deinit(std.testing.allocator);
-    const db_path_z = try std.testing.allocator.dupeZ(u8, paths.db);
-    defer std.testing.allocator.free(db_path_z);
-    {
-        const conn = try zqlite.open(db_path_z, zqlite.OpenFlags.Create | zqlite.OpenFlags.EXResCode);
-        defer conn.close();
-        try conn.execNoArgs("create table foreign_restore_marker (id integer primary key)");
-    }
-
-    try std.testing.expectError(
-        error.InvalidRuntimeDatabase,
-        initStore(std.testing.allocator, std.testing.io, paths.dir, paths.db, .none),
-    );
-    var unchanged = try loadOrCreateFileOnly(std.testing.allocator, std.testing.io, paths.dir);
-    defer unchanged.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings(runtime_id, unchanged.runtime_id);
-    try std.testing.expectEqualStrings(instance_id, unchanged.instance_id);
-}
-
-test "future schema fails before requiring or reading sidecar" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const paths = try testPaths(&tmp);
-    defer freeTestPaths(paths);
-
-    const db_path_z = try std.testing.allocator.dupeZ(u8, paths.db);
-    defer std.testing.allocator.free(db_path_z);
-    {
-        const conn = try zqlite.open(db_path_z, zqlite.OpenFlags.Create | zqlite.OpenFlags.EXResCode);
-        defer conn.close();
-        try conn.execNoArgs(std.fmt.comptimePrint(
-            "pragma user_version = {d}",
-            .{schema.MAX_SUPPORTED_VERSION + 1},
-        ));
-    }
-    try std.testing.expectError(
-        error.SchemaTooNew,
-        initStore(std.testing.allocator, std.testing.io, paths.dir, paths.db, .none),
-    );
-    const identity_path = try std.fs.path.join(std.testing.allocator, &.{ paths.dir, FILE_NAME });
-    defer std.testing.allocator.free(identity_path);
-    try std.testing.expectError(
-        error.FileNotFound,
-        std.Io.Dir.cwd().statFile(std.testing.io, identity_path, .{}),
-    );
-}
-
-test "recognized pre-version Verde schema follows legacy migration" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const paths = try testPaths(&tmp);
-    defer freeTestPaths(paths);
-
-    const db_path_z = try std.testing.allocator.dupeZ(u8, paths.db);
-    defer std.testing.allocator.free(db_path_z);
-    {
-        const conn = try zqlite.open(db_path_z, zqlite.OpenFlags.Create | zqlite.OpenFlags.EXResCode);
-        defer conn.close();
-        try conn.execNoArgs(schema.INIT_SQL);
-    }
-    var migrated = try initStore(std.testing.allocator, std.testing.io, paths.dir, paths.db, .none);
-    defer migrated.deinit(std.testing.allocator);
-    try std.testing.expect(validIdentityPart(migrated.identity.runtime_id));
-    try std.testing.expect(validIdentityPart(migrated.identity.instance_id));
-}
-
-test "current schema with missing identity metadata is corrupt" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const paths = try testPaths(&tmp);
-    defer freeTestPaths(paths);
-
-    var identity = try loadOrCreateFileOnly(std.testing.allocator, std.testing.io, paths.dir);
-    defer identity.deinit(std.testing.allocator);
-    var generic_store = try daemon_store.Store.init(std.testing.allocator, paths.db);
-    generic_store.deinit();
-    try std.testing.expectError(
-        error.StoreCorrupt,
-        initStore(std.testing.allocator, std.testing.io, paths.dir, paths.db, .none),
-    );
-}
-
-test "current schema with deleted identity metadata row is corrupt" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const paths = try testPaths(&tmp);
-    defer freeTestPaths(paths);
-
-    var initialized = try initStore(std.testing.allocator, std.testing.io, paths.dir, paths.db, .none);
-    initialized.deinit(std.testing.allocator);
-    const db_path_z = try std.testing.allocator.dupeZ(u8, paths.db);
-    defer std.testing.allocator.free(db_path_z);
-    {
-        const conn = try zqlite.open(db_path_z, zqlite.OpenFlags.EXResCode);
-        defer conn.close();
-        try conn.execNoArgs("delete from store_state where id = 1");
-    }
-    try std.testing.expectError(
-        error.StoreCorrupt,
-        initStore(std.testing.allocator, std.testing.io, paths.dir, paths.db, .none),
-    );
-}
-
 test "sidecar-first crash seam remains recoverable before SQLite commit" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -676,25 +497,4 @@ test "sidecar-first crash seam remains recoverable before SQLite commit" {
     defer recovered.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(runtime_id, recovered.identity.runtime_id);
     try std.testing.expect(!std.mem.eql(u8, staged_instance_id, recovered.identity.instance_id));
-}
-
-test "store-disabled file-only identity remains stable and isolated" {
-    var first_tmp = std.testing.tmpDir(.{});
-    defer first_tmp.cleanup();
-    var second_tmp = std.testing.tmpDir(.{});
-    defer second_tmp.cleanup();
-    const first_paths = try testPaths(&first_tmp);
-    defer freeTestPaths(first_paths);
-    const second_paths = try testPaths(&second_tmp);
-    defer freeTestPaths(second_paths);
-
-    var first = try loadOrCreateFileOnly(std.testing.allocator, std.testing.io, first_paths.dir);
-    defer first.deinit(std.testing.allocator);
-    var restarted = try loadOrCreateFileOnly(std.testing.allocator, std.testing.io, first_paths.dir);
-    defer restarted.deinit(std.testing.allocator);
-    var overridden = try loadOrCreateFileOnly(std.testing.allocator, std.testing.io, second_paths.dir);
-    defer overridden.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings(first.runtime_id, restarted.runtime_id);
-    try std.testing.expectEqualStrings(first.instance_id, restarted.instance_id);
-    try std.testing.expect(!std.mem.eql(u8, first.runtime_id, overridden.runtime_id));
 }

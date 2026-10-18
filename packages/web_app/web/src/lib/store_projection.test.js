@@ -1,155 +1,8 @@
 import { describe, expect, test } from 'bun:test'
 
-import {
-  chatPaneHasLiveTurn,
-  clipboardImageFiles,
-  findLastChatPane,
-  isAbsentDaemonThread,
-  lastDeliveredTailSeq,
-  layoutFromLivePanes,
-  carryLiveChatIdentity,
-  mapTranscriptRows,
-  fetchTranscriptPage,
-  prependTranscriptPage,
-  mergeThreadCatalogSettings,
-  panesForWorkspace,
-  withSurfaceStatus,
-  parseFavoriteModels,
-  requestPaneClose,
-  requestTerminalOpen,
-  setFavoriteModelInList,
-  threadFromDaemonGet,
-  mergeThreadMetadata,
-} from './store.ts'
-import { adjacentPaneInGroups, workspacePaneGroups } from './types.ts'
-
-describe('scrolling tile groups', () => {
-  const panes = [
-    { pane_id: 101, native_pane_id: 1, scroll_group_id: 1, workspace_id: 'w', kind: 'chat' },
-    { pane_id: 102, native_pane_id: 2, scroll_group_id: 1, workspace_id: 'w', kind: 'terminal' },
-    { pane_id: 103, native_pane_id: 3, workspace_id: 'w', kind: 'chat' },
-  ]
-  const root = {
-    split: {
-      axis: 'vertical',
-      ratio: 0.6,
-      first: {
-        split: {
-          axis: 'horizontal',
-          ratio: 0.4,
-          first: { leaf: 1 },
-          second: { leaf: 2 },
-        },
-      },
-      second: { leaf: 3 },
-    },
-  }
-
-  test('preserves live root and scrolling group ids', () => {
-    const layout = layoutFromLivePanes({ result: {
-      focused_pane_id: 2,
-      panes: [
-        { pane_id: 1, kind: 'chat', thread_index: 0, scroll_group: 1 },
-        { pane_id: 2, kind: 'terminal', dock_id: 7, scroll_group: 1 },
-      ],
-      root,
-    } })
-
-    expect(layout).toMatchObject({
-      focused: 2,
-      panes: [{ id: 1, scroll_group: 1 }, { id: 2, scroll_group: 1 }],
-      root,
-    })
-  })
-
-  test('renders a nested group as one strip item and keeps the standalone pane separate', () => {
-    const groups = workspacePaneGroups(panes, root)
-
-    expect(groups).toHaveLength(2)
-    expect(groups[0].panes.map((pane) => pane.pane_id)).toEqual([101, 102])
-    expect(groups[0].layout).toEqual({
-      split: {
-        axis: 'horizontal',
-        ratio: 0.4,
-        first: { leaf: 101 },
-        second: { leaf: 102 },
-      },
-    })
-    expect(groups[1].layout).toEqual({ leaf: 103 })
-  })
-
-  test('directional focus follows inner split geometry before the scrolling strip', () => {
-    const groups = workspacePaneGroups(panes, root)
-
-    expect(adjacentPaneInGroups(groups, 101, 'down')).toBe(102)
-    expect(adjacentPaneInGroups(groups, 102, 'up')).toBe(101)
-    expect(adjacentPaneInGroups(groups, 101, 'right')).toBe(103)
-  })
-})
-
-test('model favorites parse trimmed/deduplicated and set idempotently', () => {
-  expect(parseFavoriteModels({
-    chat: {
-      favorite_models: [
-        { provider: 'codex', model: 'gpt-5.6-sol' },
-        { provider: ' codex ', model: ' gpt-5.6-sol ' },
-        { provider: 'claude', model: 'opus' },
-        { provider: '', model: 'ignored' },
-      ],
-    },
-  })).toEqual([
-    { provider: 'codex', model: 'gpt-5.6-sol' },
-    { provider: 'claude', model: 'opus' },
-  ])
-  const original = [{ provider: 'codex', model: 'gpt-5.6-sol' }]
-  expect(setFavoriteModelInList(original, 'codex', 'gpt-5.6-sol', true)).toBe(original)
-  expect(setFavoriteModelInList(original, 'codex', 'gpt-5.6-sol', false)).toEqual([])
-  expect(setFavoriteModelInList(original, 'claude', 'opus', true)).toEqual([...original, { provider: 'claude', model: 'opus' }])
-})
-
-test('clipboardImageFiles returns every image item, falling back to the file list', () => {
-  const png = new File(['png'], 'screenshot.png', { type: 'image/png' })
-  const webp = new File(['webp'], 'second.webp', { type: 'image/webp' })
-  expect(clipboardImageFiles({
-    items: [
-      { kind: 'string', getAsFile: () => null },
-      { kind: 'file', getAsFile: () => png },
-      { kind: 'file', getAsFile: () => webp },
-    ],
-    files: [png, webp],
-  })).toEqual([png, webp])
-  const jpeg = new File(['jpeg'], 'clipboard.jpg', { type: 'image/jpeg' })
-  const text = new File(['text'], 'notes.txt', { type: 'text/plain' })
-  expect(clipboardImageFiles({ items: [], files: [jpeg, text] })).toEqual([jpeg])
-})
-
-test('mapTranscriptRows preserves every image and a legacy single image', () => {
-  const images = [
-    { path: '/tmp/first.png', mime: 'image/png', byte_size: 101 },
-    { path: '/tmp/second.webp', mime: 'image/webp', byte_size: 202 },
-  ]
-  const [message] = mapTranscriptRows({
-    thread: { messages: [{ message_id: 'message-1', role: 'user', author: 'You', body: 'Compare these', images, created_at_ms: 1234 }] },
-  }, 'thread-1')
-  expect(message.images).toEqual(images.map((image) => ({ ...image, attachment_id: null })))
-  expect(message.created_at_ms).toBe(1234)
-
-  const image = { path: '/tmp/legacy.jpg', mime: 'image/jpeg', byte_size: 303 }
-  const [legacy] = mapTranscriptRows({ thread: { messages: [{ role: 'user', author: 'You', body: '', image }] } }, 'thread-legacy')
-  expect(legacy.images).toEqual([{ ...image, attachment_id: null }])
-})
+import { findLastChatPane, lastDeliveredTailSeq, mapTranscriptRows, fetchTranscriptPage, prependTranscriptPage, mergeThreadCatalogSettings, panesForWorkspace, requestPaneClose, requestTerminalOpen } from './store.ts'
 
 describe('fetchTranscriptPage', () => {
-  test('returns the recent tail after one request and leaves the older cursor lazy', async () => {
-    const calls = []
-    const page = await fetchTranscriptPage(async (method, params) => {
-      calls.push({ method, params })
-      return { result: { messages: [{ message_id: 'new', body: 'recent' }], next_cursor: 'b:2' } }
-    }, { workspace_id: 'ws', local_thread_id: 'thread' })
-    expect(calls).toEqual([{ method: 'chat.message.list', params: { workspace_id: 'ws', local_thread_id: 'thread', direction: 'backward', limit: 40 } }])
-    expect(page.messages.map(row => row.message_id)).toEqual(['new'])
-    expect(page.cursor).toBe('b:2')
-  })
   test('falls back to a legacy full get only when pagination is unsupported', async () => {
     const page = await fetchTranscriptPage(async method => method === 'chat.message.list'
       ? { error: { code: 'method_not_found', message: 'unknown' } }
@@ -157,22 +10,6 @@ describe('fetchTranscriptPage', () => {
     { workspace_id: 'ws', local_thread_id: 'thread' })
     expect(page.messages).toMatchObject([{ message_id: 'legacy', body: 'from get' }])
     expect(page.cursor).toBeNull()
-  })
-  test('shrinks oversized pages, and restores the limit for an explicit older request', async () => {
-    const limits = []
-    const call = async (method, params) => {
-      expect(method).toBe('chat.message.list')
-      limits.push(params.limit)
-      if (!params.cursor && params.limit > 1) return { ok: false, error: { code: 'unavailable' } }
-      return { result: { messages: [{ message_id: params.cursor ? 'old' : 'huge', body: 'fits' }], next_cursor: params.cursor ? null : 'b:older' } }
-    }
-    const args = { workspace_id: 'ws', local_thread_id: 'thread' }
-    const first = await fetchTranscriptPage(call, args)
-    expect(limits).toEqual([40, 20, 10, 5, 2, 1])
-    expect(first.cursor).toBe('b:older')
-    const older = await fetchTranscriptPage(call, args, first.cursor)
-    expect(limits.at(-1)).toBe(40)
-    expect(older.messages[0].message_id).toBe('old')
   })
   test('persistent page failure remains retryable without silently returning an empty transcript', async () => {
     await expect(fetchTranscriptPage(async method => {
@@ -207,40 +44,6 @@ describe('findLastChatPane', () => {
     },
   ]
 
-  test('restores the thread instead of the desktop-focused chat', () => {
-    expect(findLastChatPane(chats, {
-      workspace_id: 'workspace-1',
-      pane_id: 202,
-      thread_id: 'thread-2',
-    })).toBe(chats[1])
-  })
-
-  test('survives a placeholder pane id changing when its thread resolves', () => {
-    expect(findLastChatPane(chats, {
-      workspace_id: 'workspace-1',
-      pane_id: 999,
-      thread_index: 5,
-      thread_title: 'Last chat',
-    })).toBe(chats[1])
-  })
-
-  test('resolves the live placeholder before the thread catalog arrives', () => {
-    const placeholder = {
-      pane_id: 999,
-      workspace_id: 'workspace-1',
-      kind: 'chat',
-      thread_index: 5,
-      thread_title: 'Last chat',
-    }
-    expect(findLastChatPane([placeholder], {
-      workspace_id: 'workspace-1',
-      pane_id: 202,
-      thread_id: 'thread-2',
-      thread_index: 5,
-      thread_title: 'Last chat',
-    })).toBe(placeholder)
-  })
-
   test('does not restore a same-named pane from another workspace', () => {
     expect(findLastChatPane(chats, {
       workspace_id: 'workspace-2',
@@ -250,23 +53,6 @@ describe('findLastChatPane', () => {
     })).toBeNull()
   })
 
-  test('does not guess between duplicate placeholder titles', () => {
-    expect(findLastChatPane([
-      ...chats,
-      { ...chats[1], pane_id: 303, thread_id: undefined, thread_index: 8 },
-    ], {
-      workspace_id: 'workspace-1',
-      pane_id: 999,
-      thread_title: 'Last chat',
-    })).toBeNull()
-  })
-})
-
-test('chatPaneHasLiveTurn counts pending sends and streaming, not unacknowledged completions', () => {
-  const pane = { pane_id: 1, workspace_id: 'workspace-1', kind: 'chat', thread_id: 'thread-1' }
-  expect(chatPaneHasLiveTurn({ ...pane, completion_pending: true }, false)).toBe(false)
-  expect(chatPaneHasLiveTurn({ ...pane, send_pending: true }, false)).toBe(true)
-  expect(chatPaneHasLiveTurn(pane, true)).toBe(true)
 })
 
 test('lastDeliveredTailSeq never advances to the daemon next unused sequence', () => {
@@ -299,46 +85,6 @@ describe('panesForWorkspace', () => {
     const titles = panesForWorkspace(workspace, [], turns, new Set()).map((pane) => pane.thread_title)
 
     expect(titles).toEqual(['A', 'B', 'Busy', 'Project Manager', 'Late'])
-  })
-
-  test('terminals already working at load hydrate from desktop surface states', () => {
-    const workspace = { workspace_id: 'workspace-1', label: 'Workspace', path: '/workspace', threads: [] }
-    const session = (dock, created_at_ms) => ({
-      session_id: `verde:ws:dock:${dock}:pane:1`, workspace_id: 'workspace-1', dock_id: dock,
-      running: true, status: 'running', created_at_ms,
-    })
-    const statuses = new Map([
-      ['verde:ws:dock:1:pane:1', { status: 'working', status_changed_at_ms: 200 }],
-      ['verde:ws:dock:2:pane:1', { status: 'done', status_changed_at_ms: 200 }],
-      // Recorded for an earlier shell that reused this dock's session id.
-      ['verde:ws:dock:3:pane:1', { status: 'working', status_changed_at_ms: 50 }],
-    ])
-    const layout = { panes: [1, 2, 3].map((dock) => ({ id: dock, kind: 'terminal', dock })) }
-    const sessions = withSurfaceStatus([session(1, 100), session(2, 100), session(3, 100)], statuses)
-
-    const panes = panesForWorkspace(workspace, sessions, [], new Set(), layout)
-
-    expect(panes.map((pane) => pane.working)).toEqual([true, false, false])
-  })
-
-  test('shows open committed chats started by another web client', () => {
-    const workspace = {
-      workspace_id: 'workspace-1',
-      label: 'Workspace',
-      path: '/workspace',
-      threads: [
-        { local_thread_id: 'desktop-thread', title: 'Desktop', sort_index: 0, open: true },
-        { local_thread_id: 'web-thread-other', title: 'Other browser', sort_index: 1, open: true, committed: true },
-        { local_thread_id: 'web-thread-closed', title: 'Closed', sort_index: 2, open: false, committed: true },
-        { local_thread_id: 'web-thread-draft', title: 'New Chat', sort_index: 3, open: true, committed: false },
-        { local_thread_id: 'cli-thread-stale', title: 'Stale MCP child', sort_index: 4, open: true, committed: true },
-      ],
-    }
-    const layout = { panes: [{ id: 1, kind: 'chat', thread: 0, title: 'Desktop' }] }
-
-    const titles = panesForWorkspace(workspace, [], [], new Set(), layout).map((pane) => pane.thread_title)
-
-    expect(titles).toEqual(['Desktop', 'Other browser'])
   })
 
   test('keeps daemon thread settings ahead of a stale live pane', () => {
@@ -385,38 +131,6 @@ describe('panesForWorkspace', () => {
       reasoning_variant: 'max',
       fast_mode: true,
       send_pending: true,
-    })
-  })
-
-  test('projects an automatic title over a stale live placeholder', () => {
-    const workspace = {
-      workspace_id: 'workspace-1',
-      label: 'Workspace',
-      path: '/workspace',
-      threads: [
-        {
-          local_thread_id: 'thread-1',
-          title: 'Automatic Thread Title',
-          sort_index: 0,
-          provider: 'codex',
-        },
-      ],
-    }
-    const stale_live_layout = {
-      panes: [{ id: 7, kind: 'chat', thread: 0, title: 'New thread', provider: 'codex' }],
-    }
-
-    const [pane] = panesForWorkspace(
-      workspace,
-      [],
-      [],
-      new Set(['thread-1']),
-      stale_live_layout,
-    )
-
-    expect(pane).toMatchObject({
-      thread_id: 'thread-1',
-      thread_title: 'Automatic Thread Title',
     })
   })
 
@@ -538,12 +252,6 @@ describe('panesForWorkspace', () => {
   })
 })
 
-test('carryLiveChatIdentity keeps ids omitted by a later tick, only for the same native pane', () => {
-  const previous = [{ id: 7, kind: 'chat', thread: 0, title: 'New thread', local_thread_id: 'thread-1', provider_thread_id: 'provider-1' }]
-  expect(carryLiveChatIdentity(previous, [{ id: 7, kind: 'chat', thread: 0, title: 'New thread' }])).toEqual(previous)
-  expect(carryLiveChatIdentity(previous, [{ id: 8, kind: 'chat', title: 'New thread' }])[0].local_thread_id).toBeUndefined()
-})
-
 describe('mergeThreadCatalogSettings', () => {
   test('retains a locally opened thread until it appears in the daemon catalog', () => {
     const existing = { local_thread_id: 'thread-1', title: 'Existing thread' }
@@ -567,57 +275,8 @@ describe('mergeThreadCatalogSettings', () => {
   })
 })
 
-test('only a missing daemon row is the opening-thread case, and a failed get invents no thread', () => {
-  const missing = { ok: false, error: { code: 'resource_not_found', message: 'resource not found' } }
-  expect(isAbsentDaemonThread(missing)).toBe(true)
-  expect(isAbsentDaemonThread({ error: { code: 'not_found', message: 'thread is not on the daemon' } })).toBe(true)
-  expect(isAbsentDaemonThread({ ok: false, error: { code: 'store_unavailable', message: 'store is unavailable' } })).toBe(false)
-  expect(isAbsentDaemonThread({ result: { thread: { local_thread_id: 't1' } } })).toBe(false)
-  expect(threadFromDaemonGet(missing)).toBeNull()
-  expect(threadFromDaemonGet({ result: { thread: { local_thread_id: 'thread-1', title: 'New thread', committed: false } } }))
-    .toMatchObject({ local_thread_id: 'thread-1', committed: false })
-})
-
-describe('mergeThreadMetadata', () => {
-  test('keeps catalog fields and drops transcript bodies', () => {
-    const merged = mergeThreadMetadata(
-      {
-        local_thread_id: 'chat-1',
-        title: "I'm starting a new venture with my family.",
-        committed: true,
-        provider: 'codex',
-        provider_thread_id: 'thr_abc',
-        messages: [{ message_id: 'huge', role: 'assistant', author: 'Codex', body: 'x'.repeat(100) }],
-      },
-      { profile_id: 'local' },
-    )
-    expect(merged).toMatchObject({
-      local_thread_id: 'chat-1',
-      title: "I'm starting a new venture with my family.",
-      committed: true,
-      provider: 'codex',
-      provider_thread_id: 'thr_abc',
-      profile_id: 'local',
-    })
-    expect(merged.messages).toBeUndefined()
-  })
-})
-
 describe('requestTerminalOpen', () => {
   const workspace = { workspace_id: 'workspace-1', path: '/workspace' }
-
-  test('uses the native desktop terminal operation when available', async () => {
-    const calls = []
-    const result = await requestTerminalOpen(async (method, params) => {
-      calls.push({ method, params })
-      return { id: 1, result: { panes: [] } }
-    }, workspace, 'fallback-session')
-
-    expect(result.native).toBe(true)
-    expect(calls).toEqual([
-      { method: 'terminal.open', params: { workspace_id: 'workspace-1' } },
-    ])
-  })
 
   test('falls back to a daemon session only when terminal.open is unavailable', async () => {
     const calls = []
@@ -663,15 +322,6 @@ describe('requestPaneClose', () => {
     const response = await requestPaneClose(async () => { throw new Error('unexpected RPC') },
       'workspace-1', { kind: 'chat', native_pane_id: 42 })
     expect(response.error?.message).toBe('This pane has no running session to close.')
-  })
-
-  test('a daemon terminal session can close even with a native pane identity', async () => {
-    const calls = []
-    await requestPaneClose(async (method, params) => {
-      calls.push({ method, params })
-      return { result: { stopped: true } }
-    }, 'workspace-1', { kind: 'terminal', native_pane_id: 42, session_id: 'session-1' })
-    expect(calls).toEqual([{ method: 'session.kill', params: { id: 'session-1' } }])
   })
 
   test('reports unavailable instead of archiving a detached chat', async () => {

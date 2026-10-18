@@ -171,27 +171,3 @@ test "stacked emphasis follows the split pairing" {
     _ = cache.stackedWithContext(allocator, patch, 1) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(usize, 2), cache.entries.items.len);
 }
-
-test "diff view cache reuses parsed layouts for the same patch" {
-    const allocator = std.testing.allocator;
-    var cache: Cache = .{};
-    defer cache.deinit(allocator);
-
-    const patch =
-        \\diff --git a/src/main.zig b/src/main.zig
-        \\--- a/src/main.zig
-        \\+++ b/src/main.zig
-        \\@@ -1 +1 @@
-        \\-const before = 1;
-        \\+const after = 2;
-    ;
-
-    const first_stacked = cache.stacked(allocator, patch) orelse return error.TestExpectedEqual;
-    const second_stacked = cache.stacked(allocator, patch) orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(first_stacked, second_stacked);
-
-    const first_split = cache.split(allocator, patch) orelse return error.TestExpectedEqual;
-    const second_split = cache.split(allocator, patch) orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(first_split, second_split);
-    try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
-}

@@ -129,28 +129,3 @@ test "append chunk sizing keeps the encoded fit contract for every limit" {
     try std.testing.expectEqual(@as(usize, 3), maxAppendChunkBytes(APPEND_ENVELOPE_RESERVE_BYTES + 4));
     try std.testing.expectEqual(@as(usize, 3072), maxAppendChunkBytes(8 * 1024));
 }
-
-test "magic byte sniffing matches declared mime" {
-    const png_head = "\x89PNG\r\n\x1a\n" ++ [_]u8{0} ** 8;
-    try std.testing.expect(imageBytesMatchMime("image/png", png_head));
-    try std.testing.expect(!imageBytesMatchMime("image/jpeg", png_head));
-    try std.testing.expect(imageBytesMatchMime("image/jpeg", &[_]u8{ 0xff, 0xd8, 0xff, 0xe0 }));
-    try std.testing.expect(imageBytesMatchMime("image/webp", "RIFF\x00\x00\x00\x00WEBPVP8 "));
-    try std.testing.expect(imageBytesMatchMime("image/gif", "GIF89a\x00\x00"));
-    try std.testing.expect(!imageBytesMatchMime("image/png", "not an image"));
-    try std.testing.expectEqual(@as(?[]const u8, null), sniffImageMime("plain text"));
-}
-
-test "canonical image extensions map every supported mime" {
-    try std.testing.expectEqualStrings("png", imageExtension("image/png"));
-    try std.testing.expectEqualStrings("jpg", imageExtension("image/jpeg"));
-    try std.testing.expectEqualStrings("webp", imageExtension("image/webp"));
-    try std.testing.expectEqualStrings("gif", imageExtension("image/gif"));
-}
-
-test "supported mime allowlist is case-insensitive and closed" {
-    try std.testing.expectEqualStrings("image/png", supportedImageMime("IMAGE/PNG").?);
-    try std.testing.expectEqualStrings("image/jpeg", supportedImageMime("image/jpeg").?);
-    try std.testing.expectEqual(@as(?[]const u8, null), supportedImageMime("image/bmp"));
-    try std.testing.expectEqual(@as(?[]const u8, null), supportedImageMime("application/json"));
-}

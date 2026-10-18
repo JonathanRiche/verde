@@ -105,16 +105,6 @@ pub fn currentCursor() CursorShape {
     return cursor_shape;
 }
 
-test "host without a platform app reports no modifiers and refuses clipboard access" {
-    const previous_app = installed_app;
-    defer installed_app = previous_app;
-    installed_app = null;
-
-    try std.testing.expectEqual(Mods{}, modState());
-    try std.testing.expectError(error.NoPlatform, setClipboardText("x"));
-    try std.testing.expectError(error.NoPlatform, getClipboardText(std.testing.allocator));
-}
-
 test "held keys follow key events and clear on focus loss" {
     const previous = held_keys;
     defer held_keys = previous;

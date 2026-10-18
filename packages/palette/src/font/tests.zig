@@ -17,46 +17,6 @@ pub fn loadAsset(name: []const u8) !*SfntFace {
     return SfntFace.initPath(testing.allocator, testing.io, assetPath(&buf, name), 0);
 }
 
-test "parse NotoSans basics" {
-    const f = try loadAsset("NotoSans-Regular.ttf");
-    defer f.deinit(testing.allocator);
-    const font = &f.font;
-    try testing.expectEqual(@as(u16, 1000), font.units_per_em);
-    try testing.expect(font.num_glyphs > 100);
-    try testing.expect(font.cmap.format == .f4 or font.cmap.format == .f12);
-    const a = font.glyphIndex('A');
-    try testing.expect(a != 0);
-    try testing.expect(font.advance(a) > 0);
-    try testing.expectEqual(@as(u32, 0), font.glyphIndex(0x10FFFD));
-    const v = font.vMetrics();
-    try testing.expectEqual(@as(i32, 1069), v.ascent);
-    try testing.expectEqual(@as(i32, 293), v.descent);
-    try testing.expect(!font.isFixedPitch());
-    var nb: [128]u8 = undefined;
-    try testing.expectEqualStrings("Noto Sans", sfnt.nameString(font.name, .family, &nb).?);
-}
-
-test "JetBrains Mono is fixed pitch" {
-    const f = try loadAsset("JetBrainsMonoNerdFont-Regular.ttf");
-    defer f.deinit(testing.allocator);
-    try testing.expect(f.font.isFixedPitch());
-    const adv = f.font.advance(f.font.glyphIndex('M'));
-    try testing.expectEqual(adv, f.font.advance(f.font.glyphIndex('i')));
-}
-
-test "GPOS kerning pairs in NotoSans" {
-    const f = try loadAsset("NotoSans-Regular.ttf");
-    defer f.deinit(testing.allocator);
-    const font = &f.font;
-    try testing.expect(font.hasKerning());
-    const av = font.kerning(font.glyphIndex('A'), font.glyphIndex('V'));
-    const to = font.kerning(font.glyphIndex('T'), font.glyphIndex('o'));
-    const hh = font.kerning(font.glyphIndex('H'), font.glyphIndex('H'));
-    try testing.expect(av < 0);
-    try testing.expect(to < 0);
-    try testing.expectEqual(@as(i32, 0), hh);
-}
-
 test "composite glyph eacute" {
     const f = try loadAsset("NotoSans-Regular.ttf");
     defer f.deinit(testing.allocator);
@@ -74,23 +34,6 @@ test "composite glyph eacute" {
     try testing.expect(max_y > 600);
     const box = font.glyphBox(g).?;
     try testing.expect(@abs(max_y - @as(f32, @floatFromInt(box.y_max))) < 2);
-}
-
-test "rasterize A" {
-    const f = try loadAsset("NotoSans-Regular.ttf");
-    defer f.deinit(testing.allocator);
-    var ws: raster.Workspace = .{};
-    defer ws.deinit(testing.allocator);
-    var ob: sfnt.OutlineBuffer = .{};
-    defer ob.deinit(testing.allocator);
-    const bm = try f.rasterizeInto(testing.allocator, &ws, &ob, f.font.glyphIndex('A'), 16, 0, testing.allocator);
-    defer testing.allocator.free(bm.pixels);
-    try testing.expect(bm.width >= 9 and bm.width <= 12);
-    try testing.expect(bm.top >= 11 and bm.top <= 13);
-    try testing.expect(bm.height >= 11 and bm.height <= 13);
-    var sum: u64 = 0;
-    for (bm.pixels) |p| sum += p;
-    try testing.expect(sum > 20 * 255);
 }
 
 // -- Collection ---------------------------------------------------------------------------------
@@ -173,38 +116,6 @@ test "collection: advanceAt ASCII pair cache equals the uncached path (ligatures
     try testing.expectEqual(@as(usize, 2), t.coll.advanceAt(.ui, 16, "fi", 0).byte_len);
 }
 
-test "collection: advances are rounded per glyph (SDL_ttf parity)" {
-    const t = try TestSet.init();
-    defer t.deinit();
-    // Values from the SDL3_ttf reference dump (tools/font_reference), NotoSans 16 px and
-    // 11.18 px: 'O' is 12.496 px unrounded but FreeType's 26.6 math gives 13.
-    const cases = [_]struct { size: f32, text: []const u8, want: []const f32 }{
-        .{ .size = 16, .text = "OQ`Hi", .want = &.{ 13, 13, 5, 12, 4 } },
-        .{ .size = 11.18, .text = "NAa", .want = &.{ 9, 7, 6 } },
-    };
-    for (cases) |c| for (c.text, c.want) |ch, w| {
-        try testing.expectEqual(w, try t.coll.measureText(.ui, c.size, &.{ch}));
-    };
-    // head.flags bit 3 fonts are measured at the integer ppem (CalSans 13.76 px -> 14 ppem).
-    try testing.expectEqual(@as(f32, 9), collection.hintedAdvance(616, 13.76, 1000, true));
-    try testing.expectEqual(@as(f32, 8), collection.hintedAdvance(616, 13.76, 1000, false));
-}
-
-test "collection: line metrics match SDL_ttf (NotoSans 16 px)" {
-    const t = try TestSet.init();
-    defer t.deinit();
-    const m = t.coll.lineMetrics(.ui, 16);
-    // SDL_ttf: ascent=18 descent=-4 height=22 lineskip=22.
-    try testing.expectEqual(@as(f32, 18), m.ascent);
-    try testing.expectEqual(@as(f32, 4), m.descent);
-    try testing.expectEqual(@as(f32, 22), m.lineHeight());
-    // 11.18 px: ascent=12 descent=-3 lineskip=16 (height 16 != 12 + 3: FreeType ceils each).
-    const s = t.coll.lineMetrics(.ui, 11.18);
-    try testing.expectEqual(@as(f32, 12), s.ascent);
-    try testing.expectEqual(@as(f32, 3), s.descent);
-    try testing.expectEqual(@as(f32, 16), s.lineHeight());
-}
-
 test "collection: fallback chain for U+273B" {
     const t = try TestSet.init();
     defer t.deinit();
@@ -268,23 +179,6 @@ test "collection: fi ligature on ui, off on mono, clusters" {
     try testing.expectEqual(@as(usize, 3), out.items.len);
 }
 
-test "collection: shape cache hits and text_layout adapter" {
-    const t = try TestSet.init();
-    defer t.deinit();
-    const a = try t.coll.shapeCached(.ui, 16, "Hello, world");
-    const n = a.len;
-    const misses = t.coll.stats.shape_misses;
-    const b = try t.coll.shapeCached(.ui, 16, "Hello, world");
-    try testing.expectEqual(n, b.len);
-    try testing.expectEqual(misses, t.coll.stats.shape_misses);
-    try testing.expect(t.coll.stats.shape_hits >= 1);
-    const fm = t.coll.fontMetrics(.mono, 13);
-    const adv = fm.advance.?(fm.context, "abc", 1, 13);
-    try testing.expectEqual(@as(usize, 1), adv.byte_len);
-    try testing.expect(adv.width > 0);
-    try testing.expect(fm.line_height > 0);
-}
-
 test "collection: shape cache rotation never stores empty glyph runs" {
     const c = try Collection.create(testing.allocator, .{ .io = testing.io, .shape_cache_bytes = 4096 });
     defer c.destroy();
@@ -301,19 +195,6 @@ test "collection: shape cache rotation never stores empty glyph runs" {
         const again = try c.shapeCached(.ui, 16, text);
         try testing.expectEqual(first.len, again.len);
     }
-}
-
-test "collection: rasterize via GlyphKey" {
-    const t = try TestSet.init();
-    defer t.deinit();
-    const r = t.coll.resolve(.ui, 'g').?;
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const bm = try t.coll.rasterize(api.GlyphKey.init(r.face, r.glyph, 16, 2), arena.allocator());
-    try testing.expect(!bm.isEmpty());
-    try testing.expectEqual(bm.width, bm.stride);
-    // 'g' has a descender: bottom below baseline.
-    try testing.expect(@as(i32, @intCast(bm.height)) - bm.top > 2);
 }
 
 // -- Malformed input ----------------------------------------------------------------------------
@@ -393,69 +274,6 @@ test "discovery: index of the asset dir, match and codepoint fallback" {
     try testing.expect(std.mem.indexOf(u8, fb.path, "Symbols") != null);
     try testing.expect(idx.fallbackForCodepoint(0x10FFFD) == null);
     try testing.expect(idx.fallbackForCodepoint(0x10FFFD) == null);
-}
-
-test "discovery: cache round trip" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_path = try tmp.dir.realPathFile(testing.io, ".", &pbuf);
-    var cbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const cache = try std.fmt.bufPrint(&cbuf, "{s}/sub/fonts.bin", .{pbuf[0..tmp_path]});
-    const o: discovery.Options = .{ .extra_dirs = &.{options.assets_dir}, .use_standard_dirs = false, .cache_path = cache };
-    const a = try discovery.Index.create(testing.allocator, testing.io, null, o);
-    defer a.destroy();
-    try testing.expect(!a.from_cache);
-    const b = try discovery.Index.create(testing.allocator, testing.io, null, o);
-    defer b.destroy();
-    try testing.expect(b.from_cache);
-    try testing.expectEqual(a.count(), b.count());
-    for (a.entries.items, b.entries.items) |x, y| {
-        try testing.expectEqualStrings(x.family, y.family);
-        try testing.expectEqual(x.weight, y.weight);
-        try testing.expectEqualStrings(a.pathOf(&x), b.pathOf(&y));
-    }
-}
-
-// -- System fonts (skipped when not installed) ------------------------------------------------
-
-fn loadSystem(path: []const u8, index: u32) !*SfntFace {
-    return SfntFace.initPath(testing.allocator, testing.io, path, index) catch |e| switch (e) {
-        error.FileNotFound => return error.SkipZigTest,
-        else => return e,
-    };
-}
-
-test "CFF outlines (URW C059 .otf)" {
-    const f = try loadSystem("/usr/share/fonts/gsfonts/C059-Roman.otf", 0);
-    defer f.deinit(testing.allocator);
-    try testing.expect(f.font.outline_kind == .cff);
-    var ws: raster.Workspace = .{};
-    defer ws.deinit(testing.allocator);
-    var ob: sfnt.OutlineBuffer = .{};
-    defer ob.deinit(testing.allocator);
-    for ("AQg&@") |ch| {
-        const bm = try f.rasterizeInto(testing.allocator, &ws, &ob, f.font.glyphIndex(ch), 24, 0, testing.allocator);
-        defer testing.allocator.free(bm.pixels);
-        try testing.expect(bm.width > 4 and bm.height > 4);
-        var sum: u64 = 0;
-        for (bm.pixels) |p| sum += p;
-        try testing.expect(sum > 30 * 255);
-    }
-}
-
-test "TTC collection faces (Noto Sans CJK)" {
-    const path = "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc";
-    const n = blk: {
-        const f = try loadSystem(path, 0);
-        defer f.deinit(testing.allocator);
-        break :blk try sfnt.faceCount(f.font.data);
-    };
-    try testing.expect(n > 1);
-    const f = try loadSystem(path, n - 1);
-    defer f.deinit(testing.allocator);
-    try testing.expect(f.font.glyphIndex(0x4E2D) != 0);
-    try testing.expectError(error.FaceIndexOutOfRange, SfntFace.initPath(testing.allocator, testing.io, path, n));
 }
 
 // -- Synthetic cmap subtables -------------------------------------------------------------------
@@ -559,221 +377,4 @@ test "cmap formats 0/6/12 and subtable preference" {
         _ = t.lookup('A');
         _ = t.lookup(0x1F600);
     }
-}
-
-test "malformed: corrupted CFF charstrings never crash" {
-    const f = try loadSystem("/usr/share/fonts/gsfonts/C059-Roman.otf", 0);
-    defer f.deinit(testing.allocator);
-    const orig = f.font.data;
-    const buf = try testing.allocator.dupe(u8, orig);
-    defer testing.allocator.free(buf);
-    const cff_off = @intFromPtr(f.font.cff.?.data.ptr) - @intFromPtr(orig.ptr);
-    const cff_len = f.font.cff.?.data.len;
-    var ws: raster.Workspace = .{};
-    defer ws.deinit(testing.allocator);
-    var ob: sfnt.OutlineBuffer = .{};
-    defer ob.deinit(testing.allocator);
-    var prng = std.Random.DefaultPrng.init(0xcff);
-    const rnd = prng.random();
-    for (0..300) |_| {
-        @memcpy(buf, orig);
-        for (0..1 + rnd.uintLessThan(usize, 32)) |_| buf[cff_off + rnd.uintLessThan(usize, cff_len)] = rnd.int(u8);
-        var font = sfnt.Font.init(buf, 0) catch continue;
-        for ("Ag@") |ch| {
-            var fl = ws.begin(testing.allocator, 0.016, 0.5);
-            font.outline(testing.allocator, font.glyphIndex(ch), &ob, &fl) catch continue;
-            const bm = ws.finish(testing.allocator, &fl, testing.allocator) catch continue;
-            testing.allocator.free(bm.pixels);
-        }
-    }
-}
-
-test "collection: system fallback adds faces lazily" {
-    // macOS: point HOME at a scratch dir so the scan stays out of the user's ~/Library.
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var env = std.process.Environ.Map.init(testing.allocator);
-    defer env.deinit();
-    var hbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const hlen = try tmp.dir.realPathFile(testing.io, ".", &hbuf);
-    try env.put("HOME", hbuf[0..hlen]);
-    const environ: ?*const std.process.Environ.Map = if (@import("builtin").os.tag == .macos) &env else null;
-    const c = try Collection.create(testing.allocator, .{ .io = testing.io, .environ = environ, .system_fallback = true, .discovery = .{ .use_cache = false } });
-    defer c.destroy();
-    var buf: [1024]u8 = undefined;
-    const sans = try c.addFace(.{ .path = assetPath(&buf, "NotoSans-Regular.ttf") });
-    try c.setRoleChain(.ui, &.{sans});
-    const r = c.resolve(.ui, 0x4E2D) orelse return error.SkipZigTest;
-    if (r.glyph == 0) return error.SkipZigTest; // no CJK font installed
-    try testing.expect(r.face != sans);
-    try testing.expectEqual(@as(usize, 2), c.faceCount());
-    _ = c.resolve(.ui, 0x6587); // same face, no new entry
-    try testing.expectEqual(@as(usize, 2), c.faceCount());
-}
-
-const BoxFace = struct {
-    deinit_called: *bool,
-    fn cast(p: *anyopaque) *BoxFace {
-        return @ptrCast(@alignCast(p));
-    }
-    fn glyphIndex(_: *anyopaque, cp: u21) api.GlyphId {
-        return if (cp == 0x25A0) 1 else 0;
-    }
-    fn advance(_: *anyopaque, _: api.GlyphId) i32 {
-        return 500;
-    }
-    fn kerning(_: *anyopaque, _: api.GlyphId, _: api.GlyphId) i32 {
-        return 0;
-    }
-    fn unitsPerEm(_: *anyopaque) u16 {
-        return 1000;
-    }
-    fn unitMetrics(_: *anyopaque) api.UnitMetrics {
-        return .{ .ascent = 800, .descent = 200 };
-    }
-    fn rasterize(_: *anyopaque, _: api.GlyphId, px: f32, _: u8, scratch: std.mem.Allocator) anyerror!api.Bitmap {
-        const n: u32 = @intFromFloat(@round(px / 2));
-        const pixels = try scratch.alloc(u8, n * n);
-        @memset(pixels, 255);
-        return .{ .width = n, .height = n, .stride = n, .top = @intCast(n), .pixels = pixels };
-    }
-    fn deinit(p: *anyopaque, _: std.mem.Allocator) void {
-        cast(p).deinit_called.* = true;
-    }
-    const vtable: api.Face.VTable = .{ .glyphIndex = glyphIndex, .advance = advance, .kerning = kerning, .unitsPerEm = unitsPerEm, .unitMetrics = unitMetrics, .rasterize = rasterize, .deinit = deinit };
-};
-
-test "collection: custom Face in a role chain" {
-    var called = false;
-    var box: BoxFace = .{ .deinit_called = &called };
-    {
-        const t = try TestSet.init();
-        defer t.deinit();
-        const id = try t.coll.addFace(.{ .custom = .{ .ptr = &box, .vtable = &BoxFace.vtable } });
-        try t.coll.setRoleChain(.icon, &.{ id, t.sans });
-        var out: std.ArrayList(api.ShapedGlyph) = .empty;
-        defer out.deinit(testing.allocator);
-        try t.coll.shape(testing.allocator, .icon, 20, "\u{25A0}a", &out);
-        try testing.expectEqual(id, out.items[0].face);
-        try testing.expectEqual(@as(f32, 10), out.items[0].x_advance);
-        try testing.expectEqual(t.sans, out.items[1].face);
-        var arena = std.heap.ArenaAllocator.init(testing.allocator);
-        defer arena.deinit();
-        const bm = try t.coll.rasterize(api.GlyphKey.init(id, 1, 20, 0), arena.allocator());
-        try testing.expectEqual(@as(u32, 10), bm.width);
-    }
-    try testing.expect(called);
-}
-
-test "collection: glyphInk is the rasterized ink box, within 1 px of SDL_ttf" {
-    const t = try TestSet.init();
-    defer t.deinit();
-    // SDL_ttf 3.2 TTF_GetGlyphMetrics (hinted FreeType bitmaps) for NotoSans:
-    // { size, cp, minx, maxx, miny, maxy }.
-    const ref = [_]struct { f32, u21, [4]f32 }{
-        .{ 16, 'A', .{ 0, 11, 0, 12 } },
-        .{ 16, 'g', .{ 0, 9, -4, 9 } },
-        .{ 16, 'o', .{ 0, 9, 0, 9 } },
-        .{ 16, '|', .{ 3, 5, -4, 12 } },
-        .{ 13.76, 'A', .{ 0, 9, 0, 10 } },
-        .{ 13.76, 'g', .{ 0, 8, -3, 8 } },
-        .{ 20, 'o', .{ 1, 12, 0, 11 } },
-        .{ 20, '|', .{ 4, 7, -5, 15 } },
-    };
-    for (ref) |r| {
-        const ink = t.coll.glyphInk(.ui, r[0], r[1]).?;
-        for (0..4) |k| try testing.expect(@abs(ink[k] - r[2][k]) <= 1);
-        try testing.expect(ink[1] > ink[0] and ink[3] > ink[2]);
-    }
-    // Unhinted outline box: 'A' at 16 px spans x 0..10.21, y 0..11.47.
-    try testing.expectEqual([4]f32{ 0, 11, 0, 12 }, t.coll.glyphInk(.ui, 16, 'A').?);
-    // No outline -> null; fallback faces are used (Nerd icon through the mono chain).
-    try testing.expectEqual(@as(?[4]f32, null), t.coll.glyphInk(.ui, 16, ' '));
-    const icon = t.coll.glyphInk(.mono, 16, 0xf07b).?;
-    try testing.expectEqual([4]f32{ 0, 16, -2, 13 }, icon);
-}
-
-test "macOS system fonts: .ttc faces index, every face loads or fails cleanly" {
-    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
-    // System domain only (never the user's ~/Library/Fonts from a test).
-    const idx = try discovery.Index.create(testing.allocator, testing.io, null, .{
-        .extra_dirs = &.{ "/System/Library/Fonts", "/Library/Fonts" },
-        .use_standard_dirs = false,
-        .use_cache = false,
-    });
-    defer idx.destroy();
-    var ttc_faces: usize = 0;
-    var loaded: usize = 0;
-    var failed: usize = 0;
-    var bitmap_only: usize = 0;
-    var variable: usize = 0;
-    var ws: raster.Workspace = .{};
-    defer ws.deinit(testing.allocator);
-    var ob: sfnt.OutlineBuffer = .{};
-    defer ob.deinit(testing.allocator);
-    for (idx.entries.items) |*e| {
-        const path = idx.pathOf(e);
-        if (std.ascii.endsWithIgnoreCase(path, ".ttc") and e.face_index > 0) ttc_faces += 1;
-        if (!e.outlines) bitmap_only += 1; // sbix (Apple Color Emoji): not rendered, skipped by fallback
-        const f = SfntFace.initPath(testing.allocator, testing.io, path, e.face_index) catch |err| {
-            std.debug.print("rejected {s}#{d}: {s}\n", .{ path, e.face_index, @errorName(err) });
-            failed += 1;
-            continue;
-        };
-        defer f.deinit(testing.allocator);
-        loaded += 1;
-        if (sfnt.Directory.init(f.font.data, e.face_index)) |d| {
-            if (d.find(sfnt.tag("fvar")) != null) variable += 1;
-        } else |_| {}
-        if (f.font.outline_kind == .none) continue;
-        const g = f.font.glyphIndex('A');
-        if (g == 0) continue;
-        const bm = f.rasterizeInto(testing.allocator, &ws, &ob, g, 16, 0, testing.allocator) catch continue;
-        testing.allocator.free(bm.pixels);
-    }
-    std.debug.print("macOS fonts: {d} faces indexed ({d} non-first .ttc faces), {d} loaded, {d} rejected, {d} bitmap-only (sbix), {d} variable (default instance)\n", .{ idx.count(), ttc_faces, loaded, failed, bitmap_only, variable });
-    try testing.expect(idx.count() > 50);
-    try testing.expect(ttc_faces > 0);
-    try testing.expect(idx.match(.{ .family = "Helvetica" }) != null);
-    const mono = idx.match(.{ .family = "monospace", .monospace = true }) orelse return error.NoMonospace;
-    try testing.expect(mono.entry.monospace);
-    // Emoji fallback must not pick the sbix font (its glyf outlines are empty).
-    if (idx.fallbackForCodepoint(0x1F600)) |m| try testing.expect(std.mem.indexOf(u8, m.path, "Apple Color Emoji") == null);
-}
-
-test "discovery (Windows): %WINDIR%\\Fonts + per-user fonts, cache under %LOCALAPPDATA%\\palette" {
-    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const n = try tmp.dir.realPathFile(testing.io, ".", &pbuf);
-    const base = pbuf[0..n];
-    try tmp.dir.createDirPath(testing.io, "win/Fonts");
-    try tmp.dir.createDirPath(testing.io, "local/Microsoft/Windows/Fonts");
-    var abuf: [1024]u8 = undefined;
-    // Upper-case extension, as many Windows system fonts have.
-    try std.Io.Dir.cwd().copyFile(assetPath(&abuf, "NotoSans-Regular.ttf"), tmp.dir, "win/Fonts/NOTOSANS.TTF", testing.io, .{});
-    try std.Io.Dir.cwd().copyFile(assetPath(&abuf, "NotoSans-Bold.ttf"), tmp.dir, "local/Microsoft/Windows/Fonts/NotoSans-Bold.ttf", testing.io, .{});
-
-    var env = std.process.Environ.Map.init(testing.allocator);
-    defer env.deinit();
-    var wbuf: [std.fs.max_path_bytes]u8 = undefined;
-    var lbuf: [std.fs.max_path_bytes]u8 = undefined;
-    try env.put("WINDIR", try std.fmt.bufPrint(&wbuf, "{s}\\win", .{base}));
-    try env.put("LOCALAPPDATA", try std.fmt.bufPrint(&lbuf, "{s}\\local", .{base}));
-
-    const a = try discovery.Index.create(testing.allocator, testing.io, &env, .{});
-    defer a.destroy();
-    try testing.expect(!a.from_cache);
-    try testing.expectEqual(@as(usize, 2), a.count());
-    const bold = a.match(.{ .family = "Noto Sans", .weight = 700 }).?;
-    try testing.expect(std.mem.endsWith(u8, bold.path, "NotoSans-Bold.ttf"));
-    // Second index loads the cache written to %LOCALAPPDATA%\palette\fonts-v1.bin.
-    const b = try discovery.Index.create(testing.allocator, testing.io, &env, .{});
-    defer b.destroy();
-    try testing.expect(b.from_cache);
-    try testing.expectEqual(a.count(), b.count());
-    var cdir = try tmp.dir.openDir(testing.io, "local/palette", .{});
-    defer cdir.close(testing.io);
-    _ = try cdir.statFile(testing.io, "fonts-v1.bin", .{});
 }

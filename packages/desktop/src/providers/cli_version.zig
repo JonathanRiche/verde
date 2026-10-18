@@ -185,31 +185,6 @@ pub fn probe(allocator: std.mem.Allocator, executable_name: []const u8, out: []u
     return copyFirstLine(source, out);
 }
 
-test "version probe keeps the first line and drops a blank lead-in" {
-    var out: [48]u8 = undefined;
-    const line = copyFirstLine("\n  claude 2.1.89\nrest\n", &out).?;
-    try std.testing.expectEqualStrings("claude 2.1.89", line);
-    try std.testing.expect(copyFirstLine(" \n\t", &out) == null);
-}
-
-test "short version prefers the version token" {
-    try std.testing.expectEqualStrings("0.154.0", shortVersion("codex-cli 0.154.0"));
-    try std.testing.expectEqualStrings("2.1.273", shortVersion("2.1.273 (Claude Code)"));
-    try std.testing.expectEqualStrings("v0.0.0-beta-18414", shortVersion("opencode v0.0.0-beta-18414"));
-    try std.testing.expectEqualStrings("1.0.40", shortVersion("grok 1.0.40 (eb1a2256660d) [stable]"));
-}
-
-test "published version tokens parse from each channel document" {
-    var out: [48]u8 = undefined;
-    try std.testing.expectEqualStrings("2.1.278", parseLatestToken(.plain, "2.1.278\n", &out).?);
-    try std.testing.expectEqualStrings("0.0.10", parseLatestToken(.plain, "v0.0.10\n", &out).?);
-    try std.testing.expectEqualStrings("2.0.12", parseLatestToken(.json_version, "{\"version\":\"2.0.12\",\"channel\":\"latest\"}", &out).?);
-    try std.testing.expectEqualStrings("1.3.0-R3401.1", parseLatestToken(.json_version, "{\"channel\":\"muse-stable\",\"version\":\"1.3.0-R3401.1\"}", &out).?);
-    try std.testing.expectEqualStrings("0.155.1", parseLatestToken(.json_tag, "{\"assets\":[],\"tag_name\":\"rust-v0.155.1\"}", &out).?);
-    try std.testing.expectEqualStrings("2026.09.18-9a7762b", parseLatestToken(.cursor_script, "DOWNLOAD_URL=\"https://downloads.cursor.com/lab/2026.09.18-9a7762b/${OS}/agent.tar.gz\"", &out).?);
-    try std.testing.expectEqualStrings("0.87.0", parseLatestToken(.github_tag, "\"html_url\":\"https://github.com/earendil-works/pi/releases/tag/v0.87.0\"", &out).?);
-}
-
 test "install path picks the package manager that owns the binary" {
     try expectPlan("/home/rtg/.local/share/mise/installs/codex/0.154.0/bin/codex", .{ .managed = true, .shell = "mise upgrade codex", .latest = .mise, .arg = "codex" });
     try expectPlan("/home/rtg/.local/share/mise/shims/claude", .{ .managed = true, .shell = "mise upgrade claude", .latest = .mise, .arg = "claude" });

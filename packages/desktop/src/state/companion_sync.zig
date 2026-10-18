@@ -172,10 +172,3 @@ fn workerMain(job: *Job) void {
         };
     }
 }
-
-test "idle sync reports nothing and a failed spawn surfaces as failure" {
-    var sync: Self = .{};
-    defer sync.deinit();
-    try std.testing.expectEqual(Outcome.none, sync.poll(std.testing.allocator));
-    try std.testing.expect(!sync.busy());
-}

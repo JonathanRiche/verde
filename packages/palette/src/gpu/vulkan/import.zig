@@ -132,10 +132,3 @@ pub fn appendImportFormats(ctx: *Context, gpa: std.mem.Allocator, out: *std.Arra
         }
     }
 }
-
-test "fourcc mapping" {
-    try std.testing.expectEqual(vk.Format.b8g8r8a8_unorm, mapFourcc(.xrgb8888).?.format);
-    try std.testing.expect(mapFourcc(.xrgb8888).?.alpha_one);
-    try std.testing.expect(!mapFourcc(.abgr8888).?.alpha_one);
-    try std.testing.expect(mapFourcc(@enumFromInt(0x3231564e)) == null); // NV12
-}

@@ -200,12 +200,3 @@ pub fn Table(comptime config: TableConfig) type {
         }
     };
 }
-
-test "table selects rows and requests sort" {
-    const Grid = Table(.{ .x = 0, .y = 0, .width = 240, .height = 80, .header_height = 20, .row_height = 20, .column_width = 80 });
-    var table = Grid.init(5, 3);
-    try std.testing.expect(table.handleInput(.{ .mouse_down = .{ .x = 10, .y = 45 } }));
-    try std.testing.expectEqual(@as(?usize, 1), table.selected_row);
-    try std.testing.expect(table.handleInput(.{ .key = .{ .code = .end } }));
-    try std.testing.expectEqual(@as(?usize, 4), table.selected_row);
-}

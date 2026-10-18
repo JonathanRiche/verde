@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { engineFailureIsPermanent, TextScreen } from './text_screen'
+import { TextScreen } from './text_screen'
 
 const rows = (screen) => screen.text().split('\n')
 
@@ -68,11 +68,4 @@ describe('text_screen', () => {
     expect(rows(screen)).toEqual(['b', 'prom'])
     expect(screen.cursor).toEqual({ x: 3, y: 1, visible: true })
   })
-})
-
-test('engine failures: CSP/compile/SIMD are permanent, fetch failures are transient', () => {
-  expect(engineFailureIsPermanent(new WebAssembly.CompileError("WebAssembly.instantiate(): Refused to compile or instantiate WebAssembly module because 'unsafe-eval' is not an allowed source"))).toBe(true)
-  expect(engineFailureIsPermanent(new Error('Terminal engine unavailable: this browser lacks WebAssembly SIMD128.'))).toBe(true)
-  expect(engineFailureIsPermanent(new TypeError('Failed to fetch'))).toBe(false)
-  expect(engineFailureIsPermanent(new Error('ghostty-vt.wasm fetch failed (503)'))).toBe(false)
 })

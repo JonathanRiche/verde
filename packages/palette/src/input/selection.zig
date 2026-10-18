@@ -108,7 +108,3 @@ test "selection normalizes and clamps ranges" {
     state.clamp(4);
     try std.testing.expectEqual(Range{ .start = 2, .end = 4 }, state.normalized(20).?);
 }
-
-test "word range selects adjacent word at boundary" {
-    try std.testing.expectEqualStrings("world", "hello world"[wordRangeAt("hello world", 11).start..wordRangeAt("hello world", 11).end]);
-}

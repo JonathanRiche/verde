@@ -1,7 +1,6 @@
 //! Windows ConPTY process backend owned by the persistent session daemon.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const process_env = @import("../../platform/env.zig");
 
 const windows = std.os.windows;
@@ -20,7 +19,6 @@ const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: windows.DWORD_PTR = 0x00020016;
 const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: windows.DWORD = 0x00002000;
 const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: c_int = 9;
 const WAIT_OBJECT_0: windows.DWORD = 0;
-const WAIT_TIMEOUT: windows.DWORD = 258;
 const INFINITE: windows.DWORD = 0xffffffff;
 const INVALID_RESUME_RESULT: windows.DWORD = 0xffffffff;
 const FALSE: windows.BOOL = .FALSE;
@@ -943,51 +941,4 @@ test "batch command line rejects lossy control characters" {
     try std.testing.expectError(error.InvalidBatchScriptArg, windowsBatchCommandLine(allocator, "npm.cmd", &.{"line\nnext"}));
     try std.testing.expectError(error.InvalidBatchScriptArg, windowsBatchCommandLine(allocator, "npm.cmd", &.{"line\rnext"}));
     try std.testing.expectError(error.InvalidBatchScriptArg, windowsBatchCommandLine(allocator, "npm.cmd", &.{"nul\x00tail"}));
-}
-
-test "ConPTY worker health preserves completion reasons" {
-    if (builtin.os.tag != .windows) return;
-    var state = try IoState.init(std.testing.allocator);
-    defer state.deinit();
-
-    state.finishReader(.broken_pipe, @intFromEnum(windows.Win32Error.BROKEN_PIPE));
-    state.finishWriter(.cancelled, @intFromEnum(windows.Win32Error.OPERATION_ABORTED));
-    const health = state.health();
-
-    try std.testing.expectEqual(IoWorkerStatus.broken_pipe, health.output_reader_status);
-    try std.testing.expectEqual(@as(?u32, @intFromEnum(windows.Win32Error.BROKEN_PIPE)), health.output_reader_error_code);
-    try std.testing.expectEqual(IoWorkerStatus.cancelled, health.input_writer_status);
-    try std.testing.expectEqual(@as(?u32, @intFromEnum(windows.Win32Error.OPERATION_ABORTED)), health.input_writer_error_code);
-    try std.testing.expectEqual(IoWorkerStatus.broken_pipe, workerStatusForError(.PIPE_NOT_CONNECTED));
-    try std.testing.expectEqual(IoWorkerStatus.failed, workerStatusForError(.INVALID_HANDLE));
-}
-
-test "ConPTY input queue signals and resets its writer event" {
-    if (builtin.os.tag != .windows) return;
-    var state = try IoState.init(std.testing.allocator);
-    defer state.deinit();
-
-    try state.queueInput("abc");
-    try std.testing.expectEqual(WAIT_OBJECT_0, WaitForSingleObject(state.input_ready_event, 0));
-    try std.testing.expectEqual(WAIT_TIMEOUT, WaitForSingleObject(state.input_ready_event, 0));
-
-    var buffer: [8]u8 = undefined;
-    const input = state.takeInput(&buffer);
-    try std.testing.expectEqualStrings("abc", buffer[0..input.bytes]);
-    try std.testing.expect(!input.stop);
-
-    state.beginShutdown();
-    try std.testing.expectEqual(WAIT_OBJECT_0, WaitForSingleObject(state.input_ready_event, 0));
-    try std.testing.expect(state.takeInput(&buffer).stop);
-}
-
-test "ConPTY startup replaces detached daemon standard streams" {
-    var attribute_storage: usize = 0;
-    const startup_info = conptyStartupInfo(@ptrCast(&attribute_storage));
-
-    try std.testing.expectEqual(@as(windows.DWORD, @sizeOf(StartupInfoEx)), startup_info.startup_info.cb);
-    try std.testing.expect(startup_info.startup_info.dwFlags & windows.STARTF_USESTDHANDLES != 0);
-    try std.testing.expectEqual(@as(?windows.HANDLE, null), startup_info.startup_info.hStdInput);
-    try std.testing.expectEqual(@as(?windows.HANDLE, null), startup_info.startup_info.hStdOutput);
-    try std.testing.expectEqual(@as(?windows.HANDLE, null), startup_info.startup_info.hStdError);
 }

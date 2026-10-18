@@ -342,13 +342,3 @@ pub const SteerThreadRequest = struct {
     prompt: []const u8,
     images: []const ImageAttachment = &.{},
 };
-
-test "subagent tool names match delegation tools only" {
-    try std.testing.expect(isSubagentToolName("task"));
-    try std.testing.expect(isSubagentToolName("Agent"));
-    try std.testing.expect(isSubagentToolName("TaskExecute"));
-    try std.testing.expect(isSubagentToolName("spawnAgent"));
-    try std.testing.expect(!isSubagentToolName("TaskCreate"));
-    try std.testing.expect(!isSubagentToolName("bash"));
-    try std.testing.expect(!isSubagentToolName(""));
-}

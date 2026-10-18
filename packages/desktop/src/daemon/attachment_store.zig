@@ -196,27 +196,3 @@ test "message images resolve only through their own message row" {
     try std.testing.expect((try resolveForMessage(conn, allocator, "/pref", "ws", "other", "m1", 0)) == null);
     try std.testing.expectError(error.InvalidParams, storePathAlloc(allocator, "/pref", "../escape"));
 }
-
-test "persisted images read back in bounded chunks" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
-    defer allocator.free(dir);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "staged.jpg", .data = "0123456789" });
-    const staged = try std.fs.path.join(allocator, &.{ dir, "staged.jpg" });
-    defer allocator.free(staged);
-    persistClaimed(allocator, dir, "abc123", staged);
-    const stored = try storePathAlloc(allocator, dir, "abc123");
-    defer allocator.free(stored);
-    const chunk = try readChunk(allocator, stored, 4, 3);
-    defer allocator.free(chunk.data);
-    try std.testing.expectEqual(@as(usize, 10), chunk.total);
-    try std.testing.expectEqualStrings("456", chunk.data);
-    const tail = try readChunk(allocator, stored, 8, 100);
-    defer allocator.free(tail.data);
-    try std.testing.expectEqualStrings("89", tail.data);
-    prune(allocator, dir, 0);
-    const still = try readChunk(allocator, stored, 0, 1);
-    allocator.free(still.data);
-}

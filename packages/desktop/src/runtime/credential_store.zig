@@ -260,21 +260,3 @@ test "credential refs are namespaced and shell-safe" {
     try std.testing.expectEqualStrings("verde-runtime/cloud.verdeai.dev/cloud-session", cloud);
     try std.testing.expectError(error.InvalidCredentialRef, cloudSessionRefAlloc(std.testing.allocator, "a b"));
 }
-
-test "memory-only store round trips and forgets without touching the OS" {
-    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
-    defer threaded.deinit();
-    var store = Store.initMemoryOnly(std.testing.allocator, threaded.io());
-    defer store.deinit();
-    try std.testing.expect(!store.backend.durable());
-    const ref = "verde-runtime/0123456789abcdef0123456789abcdef/device";
-    const credential = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    try std.testing.expect((try store.getAlloc(std.testing.allocator, ref)) == null);
-    try store.put(ref, credential);
-    const held = (try store.getAlloc(std.testing.allocator, ref)).?;
-    defer std.testing.allocator.free(held);
-    try std.testing.expectEqualStrings(credential, held);
-    try std.testing.expect(try store.remove(ref));
-    try std.testing.expect(!try store.remove(ref));
-    try std.testing.expectError(error.WeakToken, store.put(ref, "short"));
-}

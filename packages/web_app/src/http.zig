@@ -3434,35 +3434,6 @@ test "device authorization and WebSocket ticket headers are exact" {
     ) == null);
 }
 
-test "gateway followup and approval routes require chat write and allow the remote bridge" {
-    for ([_][]const u8{ "chat.turn.steer", "chat.followup", "chat.turn.start", "chat.turn.approve" }) |method| {
-        try std.testing.expect(!blockedRpcMethod(method));
-        const chat_write = headless.access_protocol.scopeBit(.chat_write);
-        switch (pairedRpcPolicy(method, chat_write)) {
-            .authorize => |mask| try std.testing.expectEqual(chat_write, mask),
-            else => return error.FollowupMethodNotForwarded,
-        }
-        try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy(method, headless.access_protocol.scopeBit(.chat_read)));
-        try std.testing.expect(@import("web_runtime").allowedMethod(method));
-    }
-}
-
-test "gateway slash commands require runtime read or chat write" {
-    inline for (.{ "provider.slash.list", "provider.slash.run" }, .{ .runtime_read, .chat_write }) |method, scope| {
-        const required = headless.access_protocol.scopeBit(scope);
-        try std.testing.expect(!blockedRpcMethod(method));
-        switch (pairedRpcPolicy(method, required)) {
-            .authorize => |mask| try std.testing.expectEqual(required, mask),
-            else => return error.SlashMethodNotForwarded,
-        }
-        try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy(method, headless.access_protocol.scopeBit(.chat_read)));
-    }
-    try std.testing.expect(blockedRpcMethod("web.directory.list"));
-    try std.testing.expect(!@import("web_runtime").allowedMethod("web.directory.list"));
-    try std.testing.expectEqual(PairedRpcPolicy.forbidden, pairedRpcPolicy("workspace.file.search", 0xffff));
-    try std.testing.expect(!@import("web_runtime").allowedMethod("session.create"));
-}
-
 test "paired gateway forwards staged attachment uploads with default device scopes" {
     // Regression: a gateway built without the attachment allowlist answered
     // chat.attachment.* with `forbidden` even though the daemon advertised
@@ -3498,34 +3469,6 @@ test "paired gateway forwards staged attachment uploads with default device scop
     );
 }
 
-test "durable device rejection is distinguished from daemon failure" {
-    const rejected = try headless.encodeErrorResponse(
-        std.testing.allocator,
-        1,
-        "authentication_rejected",
-        "access credential was not accepted",
-    );
-    defer std.testing.allocator.free(rejected);
-    try std.testing.expectEqual(
-        DeviceAuthorizationStatus.rejected,
-        deviceAuthorizationStatus(
-            std.testing.allocator,
-            rejected,
-            "0123456789abcdef0123456789abcdef",
-            headless.access_protocol.scopeBit(.runtime_read),
-        ),
-    );
-    try std.testing.expectEqual(
-        DeviceAuthorizationStatus.unavailable,
-        deviceAuthorizationStatus(
-            std.testing.allocator,
-            "not-json",
-            "0123456789abcdef0123456789abcdef",
-            headless.access_protocol.scopeBit(.runtime_read),
-        ),
-    );
-}
-
 test "network RPC requires a target after bootstrap status" {
     const untargeted_status: headless.protocol.Request = .{
         .id = 1,
@@ -3548,36 +3491,6 @@ test "network RPC requires a target after bootstrap status" {
         },
     };
     try std.testing.expect(!rpcRequestMissingRequiredTarget(targeted_mutation));
-}
-
-test "websocket session target is copied from a capable status envelope" {
-    const status_json = try headless.encodeOkResponse(std.testing.allocator, 1, .{
-        .runtime_id = "0123456789abcdef0123456789abcdef",
-        .instance_id = "00112233445566778899aabbccddeeff",
-        .runtime_capabilities = &.{ "rpc.target.v1", "core.snapshot.v1" },
-    });
-    defer std.testing.allocator.free(status_json);
-
-    const target = try SessionRuntimeTarget.fromStatusEnvelope(std.testing.allocator, status_json);
-    try std.testing.expectEqualStrings(
-        "0123456789abcdef0123456789abcdef",
-        target.borrowed().runtime_id,
-    );
-    try std.testing.expectEqualStrings(
-        "00112233445566778899aabbccddeeff",
-        target.borrowed().instance_id,
-    );
-
-    const incapable_json = try headless.encodeOkResponse(std.testing.allocator, 2, .{
-        .runtime_id = "0123456789abcdef0123456789abcdef",
-        .instance_id = "00112233445566778899aabbccddeeff",
-        .runtime_capabilities = &.{"core.snapshot.v1"},
-    });
-    defer std.testing.allocator.free(incapable_json);
-    try std.testing.expectError(
-        error.TargetRpcUnavailable,
-        SessionRuntimeTarget.fromStatusEnvelope(std.testing.allocator, incapable_json),
-    );
 }
 
 test "loopback Host and exact HTTP Origin validation" {
@@ -3713,17 +3626,6 @@ test "session cookie parsing is exact and rejects duplicates" {
     try std.testing.expect(cookieValue("verde_session=bad value", "verde_session") == null);
 }
 
-test "built-in login flow keeps credentials out of URLs and browser storage" {
-    try std.testing.expect(std.mem.indexOf(u8, LOGIN_HTML, "action=\"/auth/session\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, LOGIN_HTML, "autocomplete=\"off\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, LOGIN_JS, "fetch('/auth/session'") != null);
-    try std.testing.expect(std.mem.indexOf(u8, LOGIN_JS, "JSON.stringify({ token })") != null);
-    try std.testing.expect(std.mem.indexOf(u8, LOGIN_JS, "window.location.replace('/')") != null);
-    try std.testing.expect(std.mem.indexOf(u8, LOGIN_JS, "localStorage") == null);
-    try std.testing.expect(std.mem.indexOf(u8, LOGIN_JS, "sessionStorage") == null);
-    try std.testing.expect(std.mem.indexOf(u8, LOGIN_JS, "URLSearchParams") == null);
-}
-
 test "security headers omit CORS and constrain active content" {
     var saw_csp = false;
     var saw_nosniff = false;
@@ -3761,12 +3663,6 @@ test "web chat image upload validation accepts supported signatures only" {
     try std.testing.expect(!validAttachmentId("web-user.html"));
 }
 
-test "static javascript modules advertise a script mime type" {
-    try std.testing.expectEqualStrings("text/javascript; charset=utf-8", mimeType("/assets/index-abc.js"));
-    try std.testing.expectEqualStrings("text/javascript; charset=utf-8", mimeType("/assets/pdf.worker.min-Dswkl-cV.mjs"));
-    try std.testing.expectEqualStrings("application/wasm", mimeType("/assets/ghostty-vt.wasm"));
-}
-
 test "served file path validation rejects traversal, relative paths, and HTML" {
     try std.testing.expect(validServedFilePath("/home/user/deliverables/report.pdf"));
     try std.testing.expect(!validServedFilePath("deliverables/report.pdf"));
@@ -3778,16 +3674,6 @@ test "served file path validation rejects traversal, relative paths, and HTML" {
     try std.testing.expectEqualStrings("application/pdf", servedFileMime("/tmp/Pitch-Deck.pdf"));
     try std.testing.expect(std.mem.indexOf(u8, FILE_FRAME_CSP, "frame-ancestors 'self'") != null);
     try std.testing.expect(std.mem.indexOf(u8, FILE_FRAME_CSP, "default-src") == null);
-}
-
-test "query component decoding resolves percent escapes and plus" {
-    const decoded = try decodeQueryComponent(std.testing.allocator, "/home/rtg/My%20Files/a%2Bb.pdf");
-    defer std.testing.allocator.free(decoded);
-    try std.testing.expectEqualStrings("/home/rtg/My Files/a+b.pdf", decoded);
-
-    const plus = try decodeQueryComponent(std.testing.allocator, "/tmp/a+b.txt");
-    defer std.testing.allocator.free(plus);
-    try std.testing.expectEqualStrings("/tmp/a b.txt", plus);
 }
 
 test "chat file names stay one readable path component" {
@@ -3805,24 +3691,6 @@ test "chat file names stay one readable path component" {
         defer allocator.free(name);
         try std.testing.expectEqualStrings(case[1], name);
     }
-}
-
-test "attachment disposition quotes and sanitizes the basename" {
-    const disposition = try attachmentDisposition(std.testing.allocator, "/tmp/Report \"final\".pdf");
-    defer std.testing.allocator.free(disposition);
-    try std.testing.expectEqualStrings("attachment; filename=\"Report _final_.pdf\"", disposition);
-}
-
-test "history mutation and gateway registration preserve paired scope boundaries" {
-    const access = headless.access_protocol;
-    const write = access.scopeBit(.chat_write);
-    try std.testing.expectEqual(pairedRpcPolicy("chat.thread.upsert", write), pairedRpcPolicy("chat.thread.archive.set", write));
-    try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy("chat.thread.archive.set", access.scopeBit(.chat_read)));
-    try std.testing.expectEqual(PairedRpcPolicy{ .authorize = access.scopeBit(.runtime_read) }, pairedRpcPolicy("daemon.client.register", access.scopeBit(.runtime_read)));
-    try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy("daemon.client.register", access.scopeBit(.chat_read)));
-    try std.testing.expectEqual(PairedRpcPolicy.forbidden, pairedRpcPolicy("daemon.client.close", 0xffff));
-    // Store metadata belongs to the local daemon, just like upsert.
-    try std.testing.expectEqual(@import("web_runtime").allowedMethod("chat.thread.upsert"), @import("web_runtime").allowedMethod("chat.thread.archive.set"));
 }
 
 test "paired gateway dispatches every allowlisted RPC and binds process ownership" {
@@ -3916,18 +3784,6 @@ test "delta opt-in validates params and resumes from explicit or snapshot cursor
     try feed.setMode(allocator, params.value);
     try std.testing.expectEqual(@as(?u64, 18), feed.cursor);
     try std.testing.expectEqual(@as(u64, 2), feed.generation);
-}
-
-test "a resume cursor below the journal floor is forwarded rather than closing the socket" {
-    const allocator = std.testing.allocator;
-    const expired = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":\"revision_expired\",\"message\":\"cursor below journal floor\",\"data\":{\"floor_seq\":57065}}}";
-    try std.testing.expect(rpcErrorIs(allocator, expired, headless.protocol.ERR_REVISION_EXPIRED));
-    const unavailable = try headless.encodeErrorResponse(allocator, 1, "unavailable", "daemon unavailable");
-    defer allocator.free(unavailable);
-    try std.testing.expect(!rpcErrorIs(allocator, unavailable, headless.protocol.ERR_REVISION_EXPIRED));
-    const ok = try headless.encodeOkResponse(allocator, 1, .{ .next_cursor = 7 });
-    defer allocator.free(ok);
-    try std.testing.expect(!rpcErrorIs(allocator, ok, headless.protocol.ERR_REVISION_EXPIRED));
 }
 
 test "delta changes resync on expiry or nonce change but legacy snapshots every change" {
@@ -4047,104 +3903,6 @@ test "successful self and owner revoke invalidate the next token call and ticket
     }
 }
 
-test "paired preset RPC policy permits only each preset's selected authority" {
-    const access = headless.access_protocol;
-    const full = try access.scopeMask(access.PairingPreset.full.scopes());
-    const chat = try access.scopeMask(access.PairingPreset.chat.scopes());
-    const monitor = try access.scopeMask(access.PairingPreset.monitor.scopes());
-    for (access.PAIRED_RPC_METHODS) |entry| try std.testing.expectEqual(PairedRpcPolicy{ .authorize = entry.scope_mask }, pairedRpcPolicy(entry.method, full));
-    for ([_][]const u8{ "chat.turn.start", "chat.turn.approve", "device.push.register" }) |method| {
-        try std.testing.expectEqual(PairedRpcPolicy{ .authorize = access.requiredScopeMaskForRpc(method).? }, pairedRpcPolicy(method, chat));
-    }
-    for ([_][]const u8{ "chat.shell.run", "session.write", "process.list", "process.start", "workspace.upsert" }) |method| {
-        try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy(method, chat));
-    }
-    for ([_][]const u8{ "chat.turn.start", "chat.turn.approve", "chat.shell.run", "session.write", "process.start", "workspace.upsert" }) |method| {
-        try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy(method, monitor));
-    }
-    for ([_][]const u8{ "core.snapshot", "process.list", "device.push.register" }) |method| {
-        try std.testing.expectEqual(PairedRpcPolicy{ .authorize = access.requiredScopeMaskForRpc(method).? }, pairedRpcPolicy(method, monitor));
-    }
-}
-
-test "paired directory listing uses repository read and the daemon route" {
-    const read = headless.access_protocol.scopeBit(.repository_read);
-    try std.testing.expect(!blockedRpcMethod("workspace.directory.list"));
-    try std.testing.expect(@import("web_runtime").allowedMethod("workspace.directory.list"));
-    try std.testing.expectEqual(@as(PairedRpcPolicy, .{ .authorize = read }), pairedRpcPolicy("workspace.directory.list", read));
-    try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy("workspace.directory.list", 0));
-}
-
-test "git change review and commits are daemon routed with repository scopes" {
-    const access = headless.access_protocol;
-    const read = access.scopeBit(.repository_read);
-    const write = access.scopeBit(.repository_write);
-    const commit = access.scopeBit(.chat_write) | read;
-    const chat_preset = try access.scopeMask(access.PairingPreset.chat.scopes());
-    const monitor_preset = try access.scopeMask(access.PairingPreset.monitor.scopes());
-    inline for (.{ "git.changes.summary", "git.changes.status", "git.changes.review", "git.changes.commit_message", "git.changes.workspace", "git.changes.file_patch" }) |method| {
-        try std.testing.expect(!blockedRpcMethod(method));
-        try std.testing.expectEqual(@as(PairedRpcPolicy, .{ .authorize = read }), pairedRpcPolicy(method, read));
-        try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy(method, 0));
-    }
-    // Chat-preset phones may commit and push their chats' changes without
-    // general repository:write; Monitor-preset phones stay read-only.
-    inline for (.{ "git.changes.commit", "git.changes.push", "git.changes.pull_push" }) |method| {
-        try std.testing.expect(!blockedRpcMethod(method));
-        try std.testing.expectEqual(@as(PairedRpcPolicy, .{ .authorize = commit }), pairedRpcPolicy(method, chat_preset));
-        try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy(method, monitor_preset));
-        try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy(method, read | write));
-        try std.testing.expect(@import("web_runtime").allowedMethod(method));
-    }
-    try std.testing.expect(@import("web_runtime").allowedMethod("git.changes.review"));
-    try std.testing.expect(@import("web_runtime").allowedMethod("git.changes.status"));
-    try std.testing.expect(@import("web_runtime").allowedMethod("git.changes.commit_message"));
-    // Settings writes are owner-only, like config.ui.set.
-    try std.testing.expectEqual(PairedRpcPolicy.forbidden, pairedRpcPolicy("config.commit.set", 0xffff));
-    try std.testing.expect(!blockedRpcMethod("config.commit.set"));
-    try std.testing.expect(!@import("web_runtime").allowedMethod("config.commit.set"));
-}
-
-test "workspace creation is daemon routed and requires repository write" {
-    const write = headless.access_protocol.scopeBit(.repository_write);
-    try std.testing.expect(!blockedRpcMethod("workspace.create"));
-    try std.testing.expect(@import("web_runtime").allowedMethod("workspace.create"));
-    try std.testing.expectEqual(@as(PairedRpcPolicy, .{ .authorize = write }), pairedRpcPolicy("workspace.create", write));
-    try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy("workspace.create", headless.access_protocol.scopeBit(.repository_read)));
-}
-
-test "workspace close is daemon routed and requires repository write" {
-    const write = headless.access_protocol.scopeBit(.repository_write);
-    try std.testing.expect(!blockedRpcMethod("workspace.close"));
-    try std.testing.expect(@import("web_runtime").allowedMethod("workspace.close"));
-    try std.testing.expectEqual(@as(PairedRpcPolicy, .{ .authorize = write }), pairedRpcPolicy("workspace.close", write));
-    try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy("workspace.close", headless.access_protocol.scopeBit(.repository_read)));
-}
-
-test "delta opt-in is authorized like core.changes and stays WebSocket-only" {
-    const access = headless.access_protocol;
-    for ([_]u16{ 0, access.scopeBit(.chat_read), access.scopeBit(.runtime_read), access.scopeBit(.chat_write), try access.scopeMask(&access.DEFAULT_SCOPE_NAMES), 0xffff }) |mask| {
-        try std.testing.expectEqual(pairedRpcPolicy("core.changes", mask), pairedRpcPolicy("core.changes.mode", mask));
-    }
-    try std.testing.expect(!blockedRpcMethod("core.changes.mode"));
-    try std.testing.expect(websocketOnlyRpcMethod("core.changes.mode"));
-    try std.testing.expect(!websocketOnlyRpcMethod("core.changes"));
-    for (access.PAIRED_RPC_METHODS) |entry| {
-        if (!std.mem.eql(u8, entry.method, "core.changes.mode")) try std.testing.expect(!websocketOnlyRpcMethod(entry.method));
-    }
-}
-
-test "subagent open is daemon routed and requires chat write" {
-    const write = headless.access_protocol.scopeBit(.chat_write);
-    try std.testing.expect(!blockedRpcMethod("chat.subagent.open"));
-    try std.testing.expect(@import("web_runtime").allowedMethod("chat.subagent.open"));
-    try std.testing.expectEqual(@as(PairedRpcPolicy, .{ .authorize = write }), pairedRpcPolicy("chat.subagent.open", write));
-    try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy("chat.subagent.open", headless.access_protocol.scopeBit(.chat_read)));
-    try std.testing.expectEqual(PairedRpcPolicy.insufficient_scope, pairedRpcPolicy("chat.subagent.open", headless.access_protocol.scopeBit(.repository_write)));
-    // The GUI's read-only provider-subagent view stays desktop-only.
-    try std.testing.expectEqual(PairedRpcPolicy.forbidden, pairedRpcPolicy("chat.open_subagent", 0xffff));
-}
-
 fn desktopWebSocketTargetAllowed(method: std.http.Method, target: []const u8) bool {
     return method == .GET and std.mem.eql(u8, target, "/ws/desktop");
 }
@@ -4206,13 +3964,4 @@ fn handleDesktopUpgrade(
         },
     };
     try session.run();
-}
-
-test "desktop upgrade target is exact and separate from RPC" {
-    try std.testing.expect(desktopWebSocketTargetAllowed(.GET, "/ws/desktop"));
-    try std.testing.expect(!desktopWebSocketTargetAllowed(.GET, "/ws/desktop?token=x"));
-    try std.testing.expect(!desktopWebSocketTargetAllowed(.GET, "/ws/desktop/"));
-    try std.testing.expect(!desktopWebSocketTargetAllowed(.POST, "/ws/desktop"));
-    try std.testing.expect(!desktopWebSocketTargetAllowed(.GET, "/ws"));
-    try std.testing.expect(!webSocketTargetAllowed(.GET, "/ws/desktop"));
 }

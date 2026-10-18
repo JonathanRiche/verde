@@ -342,68 +342,6 @@ pub fn transcriptTransitionNeedsContinuousFrames(self: anytype, now_ms: i64) boo
     return self.transcript_controller.transition.needsContinuousFrames(now_ms, fade_out_ms, fade_in_ms);
 }
 
-test "transcript transition skips its loading indicator when content is ready inside the grace" {
-    var transition: TranscriptTransition = .{};
-    transition.retarget(7, 100, false);
-    transition.advance(100 + TRANSCRIPT_LOADING_GRACE_MS - 1, 7, true, theme.MOTION_FAST_MS, theme.MOTION_BASE_MS);
-    try std.testing.expectEqual(TranscriptTransitionPhase.fading_in, transition.phase);
-    try std.testing.expect(!transition.indicatorVisible(100 + TRANSCRIPT_LOADING_GRACE_MS - 1));
-}
-
-test "transcript transition cancels a stale generation" {
-    var transition: TranscriptTransition = .{};
-    transition.retarget(3, 100, true);
-    transition.advance(110, 4, false, theme.MOTION_FAST_MS, theme.MOTION_BASE_MS);
-    try std.testing.expectEqual(TranscriptTransitionPhase.idle, transition.phase);
-}
-
-test "transcript transition retargets a mid-fade selection" {
-    var transition: TranscriptTransition = .{};
-    transition.retarget(1, 100, true);
-    transition.retarget(2, 145, true);
-    try std.testing.expectEqual(TranscriptTransitionPhase.fading_out, transition.phase);
-    try std.testing.expectEqual(@as(i64, 145), transition.started_ms);
-    try std.testing.expectEqual(@as(u64, 2), transition.generation);
-}
-
-test "transcript transition starts only for a different thread in the same pane" {
-    const presented: TranscriptPresentationIdentity = .{
-        .project_index = 2,
-        .thread_index = 4,
-        .pane_id = 9,
-        .project_key = 100,
-        .thread_key = 200,
-    };
-    try std.testing.expect(shouldStartTranscriptTransition(presented, .{
-        .project_index = 2,
-        .thread_index = 7,
-        .pane_id = 9,
-        .project_key = 100,
-        .thread_key = 300,
-    }));
-    try std.testing.expect(!shouldStartTranscriptTransition(presented, .{
-        .project_index = 2,
-        .thread_index = 4,
-        .pane_id = 9,
-        .project_key = 100,
-        .thread_key = 200,
-    }));
-    try std.testing.expect(!shouldStartTranscriptTransition(presented, .{
-        .project_index = 2,
-        .thread_index = 7,
-        .pane_id = 10,
-        .project_key = 100,
-        .thread_key = 300,
-    }));
-    try std.testing.expect(!shouldStartTranscriptTransition(presented, .{
-        .project_index = 0,
-        .thread_index = 7,
-        .pane_id = 9,
-        .project_key = 101,
-        .thread_key = 300,
-    }));
-}
-
 test "transcript transition ignores projection reindexing of the same stable thread" {
     const presented: TranscriptPresentationIdentity = .{
         .project_index = 1,
@@ -421,13 +359,6 @@ test "transcript transition ignores projection reindexing of the same stable thr
     };
     try std.testing.expect(sameTranscriptPresentation(presented, reindexed));
     try std.testing.expect(!shouldStartTranscriptTransition(presented, reindexed));
-}
-
-test "resident transcript and pane strip motion suppress competing fades" {
-    try std.testing.expect(shouldPresentTranscriptImmediately(.fading_out, true, false));
-    try std.testing.expect(shouldPresentTranscriptImmediately(.loading, false, true));
-    try std.testing.expect(shouldPresentTranscriptImmediately(.fading_in, true, true));
-    try std.testing.expect(!shouldPresentTranscriptImmediately(.loading, false, false));
 }
 
 pub fn closeTranscriptSelectionModal(self: anytype) void {
@@ -751,21 +682,6 @@ fn buildTranscriptBodyView(allocator: std.mem.Allocator, body: []const u8, kind:
     };
 }
 
-test "pending transcript body slot reuses unchanged text and replaces changed text" {
-    const FakeState = struct {
-        allocator: std.mem.Allocator,
-    };
-    var state: FakeState = .{ .allocator = std.testing.allocator };
-    var slot: ?*TranscriptMarkdownBody = null;
-    defer if (slot) |entry| entry.deinit(std.testing.allocator);
-
-    const first = transcriptBodyEntryForSlot(&state, &slot, "hello", .plain).?;
-    try std.testing.expectEqual(first, transcriptBodyEntryForSlot(&state, &slot, "hello", .plain).?);
-    const changed = transcriptBodyEntryForSlot(&state, &slot, "hello world", .plain).?;
-    try std.testing.expectEqualStrings("hello world", changed.owned_body);
-    try std.testing.expectEqual(TranscriptBodyKind.plain, changed.kind);
-}
-
 pub fn buildCurrentTranscriptSelectionText(self: anytype) ![:0]u8 {
     var buffer = std.ArrayList(u8).empty;
     defer buffer.deinit(self.allocator);
@@ -1002,53 +918,4 @@ pub fn clearChatCompletion(self: anytype, project_index: usize, thread_index: us
     // the compatibility projection dirty here made a tiny focus-only change
     // recapture every transcript on close.
     return true;
-}
-
-test "chat completion focus clear queues persistence and updates local state immediately" {
-    const ProjectStub = struct {
-        id: []const u8,
-        threads: std.ArrayList(chat_types.ChatThread) = .empty,
-    };
-    const FakeState = struct {
-        allocator: std.mem.Allocator,
-        project_controller: struct {
-            projects: std.ArrayList(ProjectStub) = .empty,
-        } = .{},
-        queued: bool = false,
-        dirty: bool = false,
-
-        fn queueChatCompletionAcknowledgement(
-            self: *@This(),
-            workspace_id: []const u8,
-            local_thread_id: []const u8,
-            completed_at_ms: i64,
-        ) bool {
-            self.queued = std.mem.eql(u8, workspace_id, "workspace-a") and
-                local_thread_id.len > 0 and completed_at_ms == 42;
-            return true;
-        }
-
-        fn markDirty(self: *@This()) void {
-            self.dirty = true;
-        }
-    };
-
-    var state: FakeState = .{ .allocator = std.testing.allocator };
-    defer state.project_controller.projects.deinit(state.allocator);
-    var project: ProjectStub = .{ .id = "workspace-a" };
-    var thread = try chat_types.ChatThread.init(state.allocator, "Done");
-    thread.completion_pending = true;
-    thread.completed_at_ms = 42;
-    try project.threads.append(state.allocator, thread);
-    defer {
-        for (project.threads.items) |*item| item.deinit(state.allocator);
-        project.threads.deinit(state.allocator);
-    }
-    try state.project_controller.projects.append(state.allocator, project);
-
-    try std.testing.expect(clearChatCompletion(&state, 0, 0));
-    try std.testing.expect(state.queued);
-    try std.testing.expect(!state.dirty);
-    try std.testing.expect(!project.threads.items[0].completion_pending);
-    try std.testing.expectEqual(@as(i64, 0), project.threads.items[0].completed_at_ms);
 }

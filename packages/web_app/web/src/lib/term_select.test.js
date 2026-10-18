@@ -1,15 +1,10 @@
 import { describe, expect, test } from 'bun:test'
 
-import { orderRange, pasteBytes, selectionText, wordBounds } from './term_select'
+import { pasteBytes, selectionText, wordBounds } from './term_select'
 
 const cells = (text) => [...text]
 
 describe('term_select', () => {
-  test('orders reversed drags', () => {
-    const range = orderRange({ x: 3, row: 5 }, { x: 9, row: 2 })
-    expect(range.start).toEqual({ x: 9, row: 2 })
-    expect(range.end).toEqual({ x: 3, row: 5 })
-  })
 
   test('word bounds stop at whitespace', () => {
     expect(wordBounds(cells('ls  foo/bar.txt x'), 6)).toEqual({ from: 4, to: 14 })

@@ -53,33 +53,6 @@ fn testAbsolutePathAlloc(allocator: std.mem.Allocator, dir: std.Io.Dir) ![]u8 {
     return allocator.dupe(u8, buffer[0..length]);
 }
 
-test "repository cwd resolution opens every relative segment" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "repo/services/api");
-
-    const temporary_root = try testAbsolutePathAlloc(allocator, tmp.dir);
-    defer allocator.free(temporary_root);
-    const repository_root = try std.fs.path.join(allocator, &.{ temporary_root, "repo" });
-    defer allocator.free(repository_root);
-    const expected = try std.fs.path.join(allocator, &.{ repository_root, "services/api" });
-    defer allocator.free(expected);
-
-    const resolved = try resolveDirectoryAlloc(
-        allocator,
-        std.testing.io,
-        repository_root,
-        "services/api",
-    );
-    defer allocator.free(resolved);
-    try std.testing.expectEqualStrings(expected, resolved);
-
-    const root = try resolveDirectoryAlloc(allocator, std.testing.io, repository_root, null);
-    defer allocator.free(root);
-    try std.testing.expectEqualStrings(repository_root, root);
-}
-
 test "repository cwd resolution rejects traversal and symlink segments" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

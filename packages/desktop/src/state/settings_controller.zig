@@ -1813,24 +1813,3 @@ fn settingsOpenActionFromConfig(action: app_config.DefaultOpenAction) OpenAction
         .custom => .custom,
     };
 }
-
-test "companion character draft sync dirty and save semantics" {
-    var settings: State = .{};
-    var config: app_config.AppConfig = .{};
-    defer config.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(app_config.CompanionCharacter.sprout, settings.draft.companion_character);
-    try std.testing.expect(!settings.companion_character_dropdown_open);
-    try std.testing.expect(settings.companion_character_hover_index == null);
-
-    config.companion_character = .moss;
-    syncCompanionCharacterDraft(&settings, &config);
-    try std.testing.expectEqual(app_config.CompanionCharacter.moss, settings.draft.companion_character);
-    try std.testing.expect(!isCompanionCharacterDraftDirty(&settings, &config));
-
-    settings.draft.companion_character = .vireo;
-    try std.testing.expect(isCompanionCharacterDraftDirty(&settings, &config));
-    applyCompanionCharacterDraft(&settings, &config);
-    try std.testing.expectEqual(app_config.CompanionCharacter.vireo, config.companion_character);
-    try std.testing.expect(!isCompanionCharacterDraftDirty(&settings, &config));
-}

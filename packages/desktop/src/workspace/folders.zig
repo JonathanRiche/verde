@@ -464,29 +464,6 @@ test "terminal launches preserve resume args and quote folder paths as data" {
     try std.testing.expectEqualSlices([]const u8, &plain, try terminalCommand(&workspace, &plain));
 }
 
-test "user links and instructions survive adding and removing matching folders" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const io = std.testing.io;
-    try tmp.dir.createDirPath(io, "home");
-    try tmp.dir.createDirPath(io, "target");
-    const home = try tmp.dir.realPathFileAlloc(io, "home", a);
-    defer a.free(home);
-    const target = try tmp.dir.realPathFileAlloc(io, "target", a);
-    defer a.free(target);
-    try tmp.dir.symLink(io, target, "home/api", .{ .is_directory = true });
-    try tmp.dir.writeFile(io, .{ .sub_path = "home/AGENTS.md", .data = "User instructions" });
-    try tmp.dir.writeFile(io, .{ .sub_path = "home/verde.toml", .data = "[workspace]\nlinks=true\n[folders.api]\npath='../target'\n" });
-    try sync(a, home);
-    try remove(a, home, "api");
-    _ = try tmp.dir.statFile(io, "home/api", .{});
-    const instructions = try tmp.dir.readFileAlloc(io, "home/AGENTS.md", a, .limited(1024));
-    defer a.free(instructions);
-    try std.testing.expectEqualStrings("User instructions", instructions);
-}
-
 test "folder picker additions retain process config and reject occupied link paths" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

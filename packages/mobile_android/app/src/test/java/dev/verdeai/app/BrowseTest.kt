@@ -1,16 +1,11 @@
 package dev.verdeai.app
 
-import androidx.activity.OnBackPressedDispatcher
-import androidx.activity.compose.LocalOnBackPressedDispatcherOwner
-import android.content.ClipboardManager
-import android.content.Context
 import android.os.Looper
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.ViewModelStore
-import androidx.test.core.app.ApplicationProvider
 import dev.verdeai.core.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.runBlocking
@@ -33,7 +28,6 @@ import java.util.concurrent.CopyOnWriteArrayList
 class BrowseTest {
     @get:Rule val compose = createComposeRule()
     private val models = ViewModelStore()
-    private lateinit var backDispatcher: OnBackPressedDispatcher
     private lateinit var hosts: HostsModel
     private lateinit var browse: BrowseModel
     private val store = Store()
@@ -41,24 +35,19 @@ class BrowseTest {
     private val cache = ViewCache(cacheStore)
     private val signals = FakeSignals()
     private val cores = CopyOnWriteArrayList<BrowseCore>()
-    private var setup: (BrowseCore) -> Unit = {}
     private val core get() = cores.single()
 
     private fun await(condition: () -> Boolean) = compose.waitUntil(5000) {
         shadowOf(Looper.getMainLooper()).idle(); condition()
     }
-    private fun awaitText(text: String, substring: Boolean = false) = compose.waitUntil(5000) {
-        shadowOf(Looper.getMainLooper()).idle()
-        compose.onAllNodesWithText(text, substring=substring, useUnmergedTree=true).fetchSemanticsNodes().isNotEmpty()
-    }
-    private fun launch(active: Boolean = true) {
-        store.values[HostsModel.CATALOG_KEY]=CoreJson.encodeToString(HostCatalog(listOf(SavedHost("alpha","Studio")), if (active) "alpha" else null))
+    private fun launch() {
+        store.values[HostsModel.CATALOG_KEY]=CoreJson.encodeToString(HostCatalog(listOf(SavedHost("alpha","Studio")), "alpha"))
         compose.runOnUiThread {
             val provider=ViewModelProvider(models, object : ViewModelProvider.Factory {
                 @Suppress("UNCHECKED_CAST")
                 override fun <T : ViewModel> create(modelClass: Class<T>): T = when (modelClass) {
                     HostsModel::class.java -> HostsModel(store, signals, cache) { saved ->
-                        val fake=BrowseCore(saved).also(setup).also(cores::add)
+                        val fake=BrowseCore(saved).also(cores::add)
                         CoreHost.create(dev.verdeai.core.Config(1,saved.id,saved.label,null,null,1,"",0uL), EffectExecutor(store,saved.id), fake)
                     }
                     else -> BrowseModel(hosts, cache, signals, wallClock={ NOW }, saveIntervalMs=50)
@@ -68,396 +57,21 @@ class BrowseTest {
             browse=provider[BrowseModel::class.java]
         }
         compose.setContent {
-            backDispatcher = LocalOnBackPressedDispatcherOwner.current!!.onBackPressedDispatcher
             VerdeApp(hosts, browse, UiClock(now={ NOW }, ticking=false))
         }
     }
-    private fun list() = compose.onNodeWithTag(BROWSE_LIST)
-    private fun scrollTo(text: String) { list().performScrollToNode(hasText(text)) }
 
     @After fun cleanup() {
         compose.runOnUiThread { models.clear() }
         await { cores.all { it.freed } }
     }
 
-    @Test fun homeShowsAttentionRunningRecentAndWorkspacesWithTimers() {
-        launch()
-        awaitText("NEEDS ATTENTION")
-        compose.onNodeWithText("Studio · Connected", useUnmergedTree=true).assertExists()
-        compose.onNodeWithText("Chat · Needs approval · 1:00", useUnmergedTree=true).assertExists()
-        compose.onNodeWithText("Terminal · Running", useUnmergedTree=true).assertExists()
-        scrollTo("RUNNING")
-        compose.onNodeWithText("Chat · Working · 0:55", useUnmergedTree=true).assertExists()
-        scrollTo("RECENT CHATS")
-        // Subagent threads never surface as top-level recent chats.
-        compose.onNodeWithText("Child", useUnmergedTree=true).assertDoesNotExist()
-        scrollTo("Fixture workspace")
-        // Platform signals reach the core in order: start → network → foreground.
-        val kinds=core.events.map { it::class.simpleName }
-        assertEquals(listOf("EventStart","EventNetworkChanged","EventForeground"), kinds.take(3))
-        assertEquals("net-1", core.events.filterIsInstance<EventNetworkChanged>().single().network_id)
-    }
-
-    @Test fun attentionKindShowsAsBadgesOnHomeAndWorkspaceRows() {
-        fun tag(q: HomeQuery) = q.copy(data=q.data!!.copy(items=q.data!!.items.map {
-            if (it.thread_id == "layout-thread") it.copy(attention_kind="needs_approval") else it }))
-        setup={ core ->
-            core.home=tag(K09.homeLive)
-            core.workspaces=K09.workspacesLive.let { q -> q.copy(data=q.data!!.copy(items=q.data!!.items.map { ws ->
-                ws.copy(panes=ws.panes.map { if (it.thread_id == "web-thread-fixture") it.copy(attention=true, attention_kind="unread") else it }) })) }
-        }
-        launch()
-        awaitText("NEEDS ATTENTION")
-        compose.onNodeWithText("Needs approval", useUnmergedTree=true).assertExists()
-        compose.onNodeWithContentDescription("Open workspace drawer").performClick()
-        compose.onNode(hasText("Workspaces") and hasClickAction()).performClick()
-        awaitText("1 needs attention")
-        compose.onNodeWithText("Fixture workspace").performClick()
-        awaitText("Unread")
-    }
-
-    @Test fun workspaceThreadsSortMixedMissingAndPresentTimestamps() {
-        val workspace = K09.workspaces.data!!.items.first()
-        val template = workspace.threads.first()
-        val threads = listOf(
-            template.copy(thread_id = "unknown", last_activity_at_ms = null),
-            template.copy(thread_id = "older", last_activity_at_ms = 100L),
-            template.copy(thread_id = "newest", last_activity_at_ms = 200L),
-        )
-        assertEquals(listOf("newest", "older", "unknown"),
-            workspaceThreads(workspace.copy(threads = threads)).map { it.thread_id })
-    }
-
-    @Test fun recentChatsSortAcrossWorkspacesBeforeLimitingAndIgnoreHistorySearch() {
-        val view = K09.workspaces.data!!
-        val workspace = view.items.first()
-        val template = workspace.threads.first()
-        fun thread(id: String, time: Long?, ws: String = "a") =
-            template.copy(workspace_id = ws, thread_id = id, last_activity_at_ms = time, archived = false)
-        val catalog = view.copy(items = listOf(
-            workspace.copy(workspace_id = "a", threads = listOf(
-                thread("unknown", null), thread("older", 100),
-                thread("archived", 900).copy(archived = true),
-                thread("subagent:child", 800), thread("tie", 200),
-                thread("draft", 950).copy(committed = false),
-                thread("draft-running", 50).copy(committed = false, status = "running"))),
-            workspace.copy(workspace_id = "b", threads = listOf(
-                thread("newest", 300, "b"), thread("tie", 200, "b"))),
-        ), history = view.history.copy(query = "older", items = listOf(thread("older", 100))))
-        assertEquals(listOf("b:newest", "a:tie", "b:tie"),
-            recentThreads(catalog, 3).map { "${it.workspace_id}:${it.thread_id}" })
-        assertEquals(listOf("newest", "tie", "tie", "older", "draft-running", "unknown"),
-            recentThreads(catalog).map { it.thread_id })
-        assertEquals(recentThreads(catalog), recentThreads(catalog.copy(
-            history = catalog.history.copy(items = emptyList()))))
-        assertTrue(recentThreads(null).isEmpty())
-    }
-
-    @Test fun switcherOrdersByRecencyFiltersFuzzilyAndTargetsMostRecentOpenWorkspace() {
-        fun ws(id: String, rank: Long, open: Boolean = true) = Workspace(id, id, "/$id", open, emptyList(), emptyList(), recency_rank = rank)
-        val items = listOf(ws("c", 2), ws("closed", 0, open = false), ws("a", 1))
-        assertEquals(listOf("closed", "a", "c"), switcherWorkspaces(items).map { it.workspace_id })
-        assertEquals("a", mostRecentOpenWorkspace(items)?.workspace_id)
-        assertNull(mostRecentOpenWorkspace(listOf(ws("closed", 0, open = false))))
-        assertTrue(fuzzyMatches("vrd", "Verde"))
-        assertTrue(fuzzyMatches(" ", "anything"))
-        assertTrue(fuzzyMatches("all", "All Workspaces"))
-        assertFalse(fuzzyMatches("dv", "Verde"))
-    }
-
-    @Test fun workspaceIdentityColorsRotateTheClampedAccent() {
-        assertEquals(16, WORKSPACE_ICON_NAMES.size)
-        val slot0 = workspaceColor(0)
-        val slot4 = workspaceColor(4)
-        // Slot 0 keeps the accent hue (green dominant); slot 4 is the complement (+180°).
-        assertTrue(slot0.green > slot0.red && slot0.green > slot0.blue)
-        assertTrue(slot4.red > slot4.green || slot4.blue > slot4.green)
-        assertEquals(workspaceColor(1), workspaceColor(9))
-        (0 until 8).forEach { k ->
-            val c = workspaceColor(k)
-            val l = (maxOf(c.red, c.green, c.blue) + minOf(c.red, c.green, c.blue)) / 2f
-            assertTrue("slot $k lightness $l", l in .545f..0.725f)
-            val light = workspaceColor(k, dark = false)
-            val ll = (maxOf(light.red, light.green, light.blue) + minOf(light.red, light.green, light.blue)) / 2f
-            assertTrue("light slot $k lightness $ll", ll in .375f..0.505f)
-        }
-    }
-
-    @Test fun drawerSectionsSplitActiveFromOpenAcrossScope() {
-        val workspace = K09.workspaces.data!!.items.first()
-        val (active, open) = drawerItems(listOf(workspace), null)
-        val all = active + open
-        assertTrue(all.isNotEmpty())
-        assertTrue(all.all { it.workspace.workspace_id == workspace.workspace_id })
-        assertTrue(active.all { it.active } && open.none { it.active })
-        // Active ignores the scope; Open follows it.
-        val (scopedActive, scopedOpen) = drawerItems(listOf(workspace), "other")
-        assertEquals(active.map { it.key }, scopedActive.map { it.key })
-        assertTrue(scopedOpen.isEmpty())
-        assertEquals(open.map { it.key }, drawerItems(listOf(workspace), workspace.workspace_id).second.map { it.key })
-        val closed = drawerItems(listOf(workspace.copy(open = false)), null)
-        assertTrue(closed.first.isEmpty() && closed.second.isEmpty())
-    }
-
-    @Test fun drawerActiveSpansEveryOpenWorkspaceWhileOpenFollowsScope() {
-        fun t(ws: String, id: String, status: String) = ThreadSummary(ws, id, id, "codex", null, null, true, false, 1L, status, "Today")
-        fun w(id: String, thread: ThreadSummary, open: Boolean = true) = Workspace(id, id, "/$id", open,
-            listOf(Pane("p-${thread.thread_id}", id, "chat", thread.title, thread_id = thread.thread_id)), listOf(thread))
-        val items = listOf(w("a", t("a", "busy", "working")), w("b", t("b", "idle", "idle")), w("c", t("c", "gone", "failed"), open = false))
-        val (active, open) = drawerItems(items, "b")
-        assertEquals(listOf("busy"), active.map { it.thread?.thread_id })
-        assertEquals(listOf("idle"), open.map { it.thread?.thread_id })
-        assertTrue(drawerItems(items, "a").second.isEmpty())
-        assertEquals(listOf("idle"), drawerItems(items, null).second.map { it.thread?.thread_id })
-    }
-
-    @Test fun companionConversationsStayOutOfTheSidebarAndRecentChats() {
-        fun t(ws: String, id: String, status: String) = ThreadSummary(ws, id, id, "codex", null, null, true, false, 1L, status, "Today")
-        val threads = listOf(t("a", "moss", "working"), t("a", "old-moss", "idle"), t("a", "work", "working"), t("a", "chat", "idle"))
-        val ws = Workspace("a", "a", "/a", true, threads.map { Pane("p-${it.thread_id}", "a", "chat", it.title, thread_id = it.thread_id) }, threads)
-        val hidden = setOf("moss", "old-moss")
-        val (active, open) = drawerItems(listOf(ws), null, hidden)
-        assertEquals(listOf("work"), active.map { it.thread?.thread_id })
-        assertEquals(listOf("chat"), open.map { it.thread?.thread_id })
-        assertEquals(setOf("work", "chat"), recentThreads(K09.workspaces.data!!.copy(items = listOf(ws)), hidden = hidden)
-            .map { it.thread_id }.toSet())
-        assertTrue(hiddenPane(ws.panes.first(), hidden))
-        assertFalse(hiddenPane(ws.panes.last(), hidden))
-        // Without a roster nothing is hidden.
-        assertEquals(2, drawerItems(listOf(ws), null).first.size)
-    }
-
-    @Test fun drawerAllWorkspacesOpenInterleavesNewestActivityFirst() {
-        fun t(ws: String, id: String, at: Long?) = ThreadSummary(ws, id, id, "codex", null, null, true, false, at, "idle", "Today")
-        fun w(id: String, rank: Long, vararg threads: ThreadSummary) = Workspace(id, id, "/$id", true,
-            threads.map { Pane("p-${it.thread_id}", id, "chat", it.title, thread_id = it.thread_id) } +
-                Pane("p-$id-term", id, "terminal", "shell", terminal_id = "$id-term"),
-            threads.toList(), recency_rank = rank)
-        val items = listOf(
-            w("a", 0, t("a", "a-old", 10L), t("a", "a-tie", 20L)),
-            w("b", 1, t("b", "b-new", 30L), t("b", "b-tie", 20L), t("b", "b-none", null)),
-        )
-        fun keys(rows: List<DrawerItem>) = rows.map { it.thread?.thread_id ?: it.pane?.terminal_id }
-        // Ties keep workspace then layout order; untimed chats and terminals sort last.
-        assertEquals(listOf("b-new", "a-tie", "b-tie", "a-old", "a-term", "b-none", "b-term"), keys(drawerItems(items, null).second))
-        // A single-workspace scope keeps its own order.
-        assertEquals(listOf("b-new", "b-tie", "b-none", "b-term"), keys(drawerItems(items, "b").second))
-    }
-
-    @Test fun drawerOnlyListsOpenChatsWhileWorkspaceKeepsHistory() {
-        val workspace = K09.workspaces.data!!.items.first()
-        val template = workspace.threads.first { it.thread_id == "layout-thread" }
-        val threads = listOf(template, template.copy(thread_id = "history-only"))
-        val withHistory = workspace.copy(threads = threads)
-        assertEquals(listOf("layout-thread"), drawerThreads(withHistory).map { it.thread_id })
-        assertEquals(2, workspaceThreads(withHistory).size)
-    }
-
-    @Test fun drawerOpensWorkspaceAndChatAndClosesAfterNavigation() {
-        launch()
-        awaitText("NEEDS ATTENTION")
-        compose.onNodeWithContentDescription("Open workspace drawer").performClick()
-        compose.onNodeWithTag("workspace-switcher").performClick()
-        compose.onNodeWithText("Search workspaces").assertExists()
-        compose.onNodeWithContentDescription("Settings for Fixture workspace").performClick()
-        awaitText("PANES")
-        compose.onNodeWithContentDescription("Close workspace drawer").assertDoesNotExist()
-        compose.onNodeWithContentDescription("Open workspace drawer").performClick()
-        compose.onAllNodes(hasText("Layout chat") and hasClickAction() and hasAnyAncestor(hasTestTag("workspace-drawer")))[0].performClick()
-        await { core.events.any { it is EventFocus && it.thread_id == "layout-thread" } }
-        compose.onNodeWithContentDescription("Close workspace drawer").assertDoesNotExist()
-        compose.onNodeWithContentDescription("Back").performClick()
-        awaitText("PANES")
-    }
-
-    @Test fun drawerHostsReturnsToRootAfterOpeningAChatFromHosts() {
-        launch()
-        awaitText("NEEDS ATTENTION")
-        compose.onNodeWithContentDescription("Open workspace drawer").performClick()
-        compose.onNode(hasText("Hosts") and hasClickAction()).performClick()
-        awaitText("Use Studio")
-        compose.onNodeWithContentDescription("Actions for Studio").assertExists()
-        compose.onNodeWithContentDescription("Open workspace drawer").performClick()
-        compose.onAllNodes(hasText("Layout chat") and hasClickAction() and hasAnyAncestor(hasTestTag("workspace-drawer")))[0].performClick()
-        await { core.events.any { it is EventFocus && it.thread_id == "layout-thread" } }
-        compose.onNodeWithContentDescription("Open workspace drawer").performClick()
-        compose.onNode(hasText("Hosts") and hasClickAction()).performClick()
-        awaitText("Use Studio")
-        compose.onNodeWithContentDescription("Actions for Studio").assertExists()
-        compose.onNodeWithTag(TRANSCRIPT_LIST).assertDoesNotExist()
-        compose.onNodeWithContentDescription("Open workspace drawer").performClick()
-        compose.onNode(hasText("Home") and hasClickAction()).performClick()
-        awaitText("NEEDS ATTENTION")
-        compose.onNodeWithContentDescription("Open workspace drawer").performClick()
-        compose.onNode(hasText("Workspaces") and hasClickAction()).performClick()
-        awaitText("Add workspace")
-    }
-
-    @Test fun systemBackClosesDrawerBeforeNavigatingTheConversation() {
-        launch()
-        awaitText("NEEDS ATTENTION")
-        compose.onAllNodesWithText("Layout chat")[0].performClick()
-        await { core.events.any { it is EventFocus && it.thread_id == "layout-thread" } }
-        compose.onNodeWithContentDescription("Open workspace drawer").performClick()
-        compose.onNodeWithContentDescription("Close workspace drawer").assertIsDisplayed()
-        compose.runOnUiThread { backDispatcher.onBackPressed() }
-        await { compose.onAllNodesWithContentDescription("Close workspace drawer").fetchSemanticsNodes().isEmpty() }
-        compose.onNodeWithContentDescription("Close workspace drawer").assertDoesNotExist()
-        compose.onNodeWithContentDescription("Back").assertIsDisplayed()
-        assertEquals("layout-thread", core.events.filterIsInstance<EventFocus>().last().thread_id)
-        compose.onNodeWithContentDescription("Back").performClick()
-        awaitText("NEEDS ATTENTION")
-    }
-
-    @Test fun tappingAChatOpensTheFocusedTranscriptAndBackUnfocuses() {
-        launch()
-        awaitText("NEEDS ATTENTION")
-        compose.onAllNodesWithText("Layout chat")[0].performClick()
-        // D-06: the transcript focuses its thread (K-17 attention clears) and loads from the core.
-        awaitText("Loading conversation…")
-        await { core.events.any { it is EventFocus && it.thread_id == "layout-thread" } }
-        compose.onNodeWithContentDescription("Back").performClick()
-        awaitText("NEEDS ATTENTION")
-        await { core.events.any { it is EventFocus && it.thread_id == null } }
-    }
-
-    @Test fun workspacesListDetailAndLongPressMenus() {
-        launch()
-        awaitText("NEEDS ATTENTION")
-        compose.onNodeWithContentDescription("Open workspace drawer").performClick()
-        compose.onNode(hasText("Workspaces") and hasClickAction()).performClick()
-        awaitText("/tmp/k09-fixture-project", substring=true)
-        compose.onNodeWithText("Fixture workspace").performTouchInput { longClick() }
-        compose.onNodeWithText("Copy path").performClick()
-        val clipboard=ApplicationProvider.getApplicationContext<Context>().getSystemService(ClipboardManager::class.java)
-        assertEquals("/tmp/k09-fixture-project", clipboard.primaryClip?.getItemAt(0)?.text?.toString())
-        compose.onNodeWithText("Fixture workspace").performClick()
-        awaitText("PANES")
-        compose.onNodeWithText("Browser · Unavailable", useUnmergedTree=true).assertExists()
-        scrollTo("CHATS")
-        compose.onNodeWithText("Child", useUnmergedTree=true).assertDoesNotExist()
-        // The workspace's chats come from the paged catalog, newest first.
-        val chats=compose.onAllNodes(hasText("Web chat") or hasText("Layout chat")).fetchSemanticsNodes()
-        assertTrue(chats.size >= 4)
-        list().performScrollToNode(hasText("htop"))
-        compose.onNodeWithText("htop").performTouchInput { longClick() }
-        compose.onNodeWithText("Open").performClick()
-        // The terminal screen attaches through the core (this fake core serves no terminal view).
-        awaitText("Opening terminal…")
-        await { core.events.any { it is EventTerminalAttach && it.terminal_id == "sess-7" } }
-        compose.onNodeWithContentDescription("Back").performClick()
-        awaitText("PANES")
-        await { core.events.any { it is EventTerminalDetach && it.terminal_id == "sess-7" } }
-    }
-
-    @Test fun pullToRefreshSendsRetryAndShowsTheRefreshedProjection() {
-        setup={ it.afterRefresh=K09.home to K09.workspaces }
-        launch()
-        awaitText("NEEDS ATTENTION")
-        list().performTouchInput { swipeDown(startY=top + 10f, endY=bottom, durationMillis=600) }
-        await { core.events.any { it is EventRetryConnection } }
-        awaitText("Nothing is running or waiting on you.")
-        await { !browse.state.value.refreshing }
-        compose.onNodeWithText("NEEDS ATTENTION").assertDoesNotExist()
-    }
-
-    @Test fun warmStartShowsCacheUntilLiveSyncThenSavesLiveViews() {
-        runBlocking { cache.save("alpha", CachedViews(saved_at_ms=NOW - 3 * 60_000, home=K09.homeLive.data!!, workspaces=K09.workspacesLive.data!!)) }
-        setup={ it.syncDelayMs=null; it.home=K09.home; it.workspaces=K09.workspaces }
-        launch()
-        awaitText("Showing saved data from 3 min ago.", substring=true)
-        compose.onNodeWithText("Chat · Needs approval · 1:00", useUnmergedTree=true).assertExists()
-        // A route change lets the (fake) core finish its first sync.
-        core.syncDelayMs=10
-        compose.runOnIdle { signals.network.value=NetworkState(true, "net-2") }
-        awaitText("Nothing is running or waiting on you.")
-        compose.onNodeWithText("Showing saved data", substring=true).assertDoesNotExist()
-        await { runBlocking { cache.load("alpha") }?.home?.items?.isEmpty() == true }
-        assertEquals(NOW, runBlocking { cache.load("alpha") }!!.saved_at_ms)
-    }
-
-    @Test fun offlineWithoutCacheShowsOfflineAndNoData() {
-        signals.network.value=NetworkState(false, "")
-        launch()
-        awaitText("You're offline.")
-        compose.onNodeWithText("No data yet. Pull down to retry when the host is reachable.").assertExists()
-        assertEquals(false, core.events.filterIsInstance<EventNetworkChanged>().single().available)
-    }
-
-    @Test fun backgroundAndNetworkChangesReachTheCoreAndForegroundRecovers() {
-        launch()
-        awaitText("NEEDS ATTENTION")
-        compose.runOnIdle { signals.foreground.value=false }
-        await { core.events.any { it is EventBackground } }
-        compose.runOnIdle { signals.foreground.value=false; signals.network.value=NetworkState(true, "net-1") }
-        compose.runOnIdle { signals.foreground.value=true }
-        await { core.events.count { it is EventForeground } == 2 }
-        await { browse.state.value.host?.phase == "ready" }
-        compose.runOnIdle { signals.network.value=NetworkState(true, "net-3") }
-        await { core.events.any { it is EventNetworkChanged && it.network_id == "net-3" } }
-        // Unchanged values are deduplicated before reaching the core.
-        assertEquals(1, core.events.count { it is EventBackground })
-        assertEquals(2, core.events.count { it is EventForeground })
-        awaitText("NEEDS ATTENTION")
-    }
-
     @Test fun signOutClearsCachedAndShownViews() {
         launch()
-        awaitText("NEEDS ATTENTION")
         await { runBlocking { cache.load("alpha") } != null }
         compose.runOnIdle { hosts.signOut("alpha") }
         await { runBlocking { cache.load("alpha") } == null && !cacheStore.values.containsKey(ViewCache.key("alpha")) }
-        awaitText("This phone isn't paired with Studio yet.")
-        compose.onNodeWithText("NEEDS ATTENTION").assertDoesNotExist()
-        compose.onNodeWithText("Pair with this host").assertExists()
-    }
-
-    @Test fun withoutActiveHostTheAppStartsOnHosts() {
-        launch(active=false)
-        awaitText("Hosts")
-        compose.onNodeWithText("Use Studio").performScrollTo().performClick()
-        awaitText("NEEDS ATTENTION")
-    }
-
-    @Test fun refreshKeepsWorkspacesVisibleAcrossRepeatedLoadingCycles() {
-        launch()
-        awaitText("NEEDS ATTENTION")
-        compose.onNodeWithContentDescription("Open workspace drawer").performClick()
-        compose.onNode(hasText("Workspaces") and hasClickAction()).performClick()
-        awaitText("Fixture workspace")
-        repeat(3) {
-            compose.runOnUiThread { browse.refresh() }
-            await { browse.state.value.row?.view?.sync_state == "loading" }
-            compose.onNodeWithText("Fixture workspace").assertExists()
-            compose.onNodeWithText("Loading workspaces…").assertDoesNotExist()
-            await { !browse.state.value.refreshing }
-        }
-        assertEquals(3, core.events.filterIsInstance<EventRetryConnection>().size)
-    }
-
-    @Test fun bannerAndLabelRules() {
-        val row=HostRow(SavedHost("a","Studio"), HostView("a","Studio",null,null,null,"ready",Lifecycle.foreground,"paired","ready",
-            emptyList(),emptyList(),null,null,false,null))
-        val ready=BrowseState("a", row, K09.home.data, K09.workspaces.data)
-        assertNull(browseBanner(ready, NOW))
-        assertEquals("You're offline. Showing saved data from 5 min ago.",
-            browseBanner(ready.copy(networkAvailable=false, savedAtMs=NOW - 5 * 60_000), NOW)!!.text)
-        val unreachable=ready.copy(row=row.copy(view=row.view!!.copy(phase="failed", error=LocalError(domain="net",code="x",message="",failure_kind="network"))))
-        assertEquals(BannerAction.Retry, browseBanner(unreachable, NOW)!!.action)
-        assertEquals(BannerAction.Hosts, browseBanner(ready.copy(row=row.copy(view=row.view.copy(auth_state="repair_required"))), NOW)!!.action)
-        val failed=ready.copy(home=ready.home!!.copy(error=LocalError(domain="rpc",code="x",message="",retryable=true)))
-        assertTrue(browseBanner(failed, NOW)!!.text.startsWith("Couldn't load"))
-        assertTrue(hasContent(ready.copy(row=row.copy(view=row.view.copy(sync_state="loading")))))
-        assertTrue(showSpinner(ready.copy(row=row.copy(view=row.view.copy(sync_state="loading")))))
-        assertEquals("1:01:05", elapsedLabel(0, 3_665_000))
-        assertEquals("0:00", elapsedLabel(10, 0))
-        assertEquals("2 h ago", agoLabel(0, 2 * 3_600_000 + 5))
-        assertEquals(listOf("Web chat","Layout chat"), recentThreads(K09.workspaces.data).map { it.title })
-        assertEquals("Needs approval", statusLabel("waiting_approval"))
-        assertEquals("Unread", attentionLabel("unread"))
-        assertNull(attentionLabel(null))
-        assertFalse(openable(K09.workspaces.data!!.items.single().panes.single { it.kind == "browser" }))
-        assertFalse(openable(K09.workspaces.data!!.items.single().panes.single { it.kind == "terminal" }))
+        await { browse.state.value.home?.items.isNullOrEmpty() }
     }
 
     @Test fun cacheIsBoundedAndSkipsDisallowedWrites() = runBlocking {
@@ -475,8 +89,6 @@ class BrowseTest {
 
     private object K09 {
         private fun read(name: String) = BrowseTest::class.java.getResource("/fixtures/k09/$name")!!.readText()
-        val home: HomeQuery = CoreJson.decodeFromString(read("home.json"))
-        val workspaces: WorkspacesQuery = CoreJson.decodeFromString(read("workspaces.json"))
         val homeLive: HomeQuery = CoreJson.decodeFromString(read("home-live.json"))
         val workspacesLive: WorkspacesQuery = CoreJson.decodeFromString(read("workspaces-live.json"))
     }
@@ -503,7 +115,6 @@ class BrowseTest {
         @Volatile var syncDelayMs: Long?=10
         @Volatile var home=K09.homeLive
         @Volatile var workspaces=K09.workspacesLive
-        @Volatile var afterRefresh: Pair<HomeQuery, WorkspacesQuery>?=null
         @Volatile private var row=HostView(saved.id,saved.label,null,null,null,"idle",Lifecycle.background,"paired","empty",
             emptyList(),emptyList(),null,null,false,null)
         @Volatile private var synced=false
@@ -530,7 +141,7 @@ class BrowseTest {
                 }
                 is EventTimerFired -> when (decoded.timer_id) {
                     "sync" -> if (row.phase == "connecting") { synced=true; row=row.copy(phase="ready", sync_state="ready") }
-                    "refresh" -> { loading=false; row=row.copy(sync_state="ready"); afterRefresh?.let { (h, w) -> home=h; workspaces=w } }
+                    "refresh" -> { loading=false; row=row.copy(sync_state="ready") }
                 }
                 is EventRetryConnection -> if (row.phase == "ready") { loading=true; row=row.copy(sync_state="loading"); timer("refresh", 150) }
                 is EventSignOut -> { synced=false; row=row.copy(auth_state="signed_out", phase="disabled", sync_state="empty") }

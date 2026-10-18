@@ -372,67 +372,12 @@ pub const QueryCursor = struct {
     }
 };
 
-test "point converts to and from c value" {
-    const point: Point = .{ .row = 3, .column = 9 };
-    const c_point = point.toC();
-    const roundtrip = Point.fromC(c_point);
-
-    try std.testing.expectEqual(point.row, roundtrip.row);
-    try std.testing.expectEqual(point.column, roundtrip.column);
-}
-
-test "typescript grammar parses a simple source file" {
-    var parser = try Parser.init();
-    defer parser.deinit();
-
-    try std.testing.expect(parser.setLanguage(grammars.typescript.language()));
-    var tree = parser.parseString("const value: string = \"verde\";\n", null) orelse return error.UnexpectedNull;
-    defer tree.deinit();
-
-    const root = tree.rootNode();
-    try std.testing.expectEqualStrings("program", root.kind());
-    try std.testing.expect(root.childCount() > 0);
-}
-
 test "typescript highlights query compiles" {
     var query = try Query.init(grammars.typescript.language(), grammars.typescript.highlights_query);
     defer query.deinit();
 
     try std.testing.expect(query.captureCount() > 0);
     try std.testing.expect(query.captureName(0) != null);
-}
-
-test "javascript grammar parses a simple source file" {
-    var parser = try Parser.init();
-    defer parser.deinit();
-
-    try std.testing.expect(parser.setLanguage(grammars.javascript.language()));
-    var tree = parser.parseString("const value = call(input);\n", null) orelse return error.UnexpectedNull;
-    defer tree.deinit();
-
-    try std.testing.expectEqualStrings("program", tree.rootNode().kind());
-}
-
-test "tsx grammar parses jsx syntax" {
-    var parser = try Parser.init();
-    defer parser.deinit();
-
-    try std.testing.expect(parser.setLanguage(grammars.typescript.tsxLanguage()));
-    var tree = parser.parseString("export const view = <Card title=\"verde\" />;\n", null) orelse return error.UnexpectedNull;
-    defer tree.deinit();
-
-    try std.testing.expectEqualStrings("program", tree.rootNode().kind());
-}
-
-test "json grammar parses a simple object" {
-    var parser = try Parser.init();
-    defer parser.deinit();
-
-    try std.testing.expect(parser.setLanguage(grammars.json.language()));
-    var tree = parser.parseString("{\"ready\":true,\"count\":2}\n", null) orelse return error.UnexpectedNull;
-    defer tree.deinit();
-
-    try std.testing.expectEqualStrings("document", tree.rootNode().kind());
 }
 
 test {

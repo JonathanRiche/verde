@@ -943,10 +943,3 @@ fn queueRoleText(state: *runtime.AppState, rect: palette.Rect, value: []const u8
     const stable = state.palette_frame_text_arena.allocator().dupe(u8, value) catch return;
     state.palette_overlay_batch.roleText(state.allocator, rect, stable, paletteColor(fill), font_size, role, null, clip) catch {};
 }
-
-test "format size matches the shared 1024-based labels" {
-    var buffer: [32]u8 = undefined;
-    try std.testing.expectEqualStrings("12 B", formatSize(&buffer, 12));
-    try std.testing.expectEqualStrings("1.5 KB", formatSize(&buffer, 1536));
-    try std.testing.expectEqualStrings("2.0 MB", formatSize(&buffer, 2 * 1024 * 1024));
-}

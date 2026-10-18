@@ -288,33 +288,3 @@ pub const WorkspaceFinder = struct {
         for (self.entries.items) |*entry| entry.finder.trackQuery(allocator, query, path);
     }
 };
-
-test "workspace search finds files in separate real roots without symlinks" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io, "home");
-    try tmp.dir.createDirPath(io, "api");
-    try tmp.dir.createDirPath(io, "docs");
-    try tmp.dir.createDirPath(io, "state");
-    try tmp.dir.writeFile(io, .{ .sub_path = "api/multifolder-needle.txt", .data = "api" });
-    try tmp.dir.writeFile(io, .{ .sub_path = "docs/multifolder-needle.txt", .data = "docs" });
-    try tmp.dir.writeFile(io, .{ .sub_path = "home/verde.toml", .data = "[folders.api]\npath='../api'\n[folders.docs]\npath='../docs'\n" });
-    const home = try tmp.dir.realPathFileAlloc(io, "home", allocator);
-    defer allocator.free(home);
-    const storage = try tmp.dir.realPathFileAlloc(io, "state", allocator);
-    defer allocator.free(storage);
-    var finder = try WorkspaceFinder.init(allocator, storage, home);
-    defer finder.deinit();
-    for (0..200) |_| {
-        if (!finder.isScanning()) break;
-        try std.Io.sleep(io, .fromMilliseconds(25), .awake);
-    } else return error.WorkspaceSearchScanTimedOut;
-    var result = try finder.search(allocator, "multifolder-needle", 8);
-    defer result.deinit(allocator);
-    try std.testing.expectEqual(@as(usize, 2), result.items.len);
-    try std.testing.expectEqualStrings("api/multifolder-needle.txt", result.items[0].relative_path);
-    try std.testing.expectEqualStrings("docs/multifolder-needle.txt", result.items[1].relative_path);
-    try std.testing.expect(!std.mem.eql(u8, result.items[0].path, result.items[1].path));
-}

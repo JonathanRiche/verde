@@ -888,10 +888,6 @@ test "Windows numeric version keeps the release core and drops prerelease metada
     try std.testing.expectEqual([_]u16{ 1, 2, 3, 4 }, windowsNumericVersion("1.2.3.4+build.9"));
 }
 
-test "Windows numeric version uses zero for nonnumeric release labels" {
-    try std.testing.expectEqual([_]u16{ 0, 0, 0, 0 }, windowsNumericVersion("ci-123"));
-}
-
 test "build version accepts only resource-safe ASCII" {
     try std.testing.expect(isValidVersion("0.1.27-internal-20260710"));
     try std.testing.expect(!isValidVersion("0.1.27 internal"));

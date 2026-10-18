@@ -67,15 +67,3 @@ d3dcompiler (vkd3d-shader). Microsoft's runtime accepts them, but they have not 
 Microsoft's validator. On real Windows, run `zig build compile-hlsl` once (hardware
 checklist, STATUS.md) and commit the result if it differs.
 
-## Tests and parity
-
-* `tools/wine-zig.sh test-gpu` runs the full GPU suite on Wine's D3D11. Wine's D3D11 runs on
-  the host GPU (Intel Iris Xe, Mesa). Results: 28 pass and 1 skipped (the dma-buf test,
-  which is Vulkan-only).
-* The goldens `../testdata/scene_{1x,1.25x}.png` are the Linux Vulkan references. The D3D11
-  output is **bit-exact** against them at both scales: 0 mismatched pixels and a max channel
-  delta of 0. The test allows 3 LSB on ≤0.1% of the pixels for driver AA rounding. This
-  validates the HLSL port, blend and sampler state and the partial-redraw path. It does not
-  validate a Windows driver.
-* `src/app_win32.zig` has a live test of the swapchain under Wine: present, `frame` events,
-  unchanged skip, partial redraw, resize, and every system cursor.

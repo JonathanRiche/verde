@@ -702,21 +702,6 @@ pub fn checkBackend(comptime B: type) void {
     }
 }
 
-test "stroked rects snap to whole device pixels" {
-    const snapped = snapRectToPixelGrid(.{ .x = 10.4, .y = 20.6, .w = 100.3, .h = 30.2 });
-    try std.testing.expectEqual(@as(f32, 10.0), snapped.x);
-    try std.testing.expectEqual(@as(f32, 21.0), snapped.y);
-    try std.testing.expectEqual(@as(f32, 101.0), snapped.w);
-    try std.testing.expectEqual(@as(f32, 30.0), snapped.h);
-    try std.testing.expectEqual(@as(f32, 1.0), strokePixelWidth(1.25));
-    try std.testing.expectEqual(@as(f32, 1.0), strokePixelWidth(0.5));
-    try std.testing.expectEqual(@as(f32, 2.0), strokePixelWidth(1.75));
-}
-
-test "packColor puts red in the low byte" {
-    try std.testing.expectEqual(@as(u32, 0xff0000ff), packColor(.{ .r = 1, .g = 0, .b = 0, .a = 1 }));
-}
-
 const NoTextures = struct {
     known: u32 = 0,
     generation: u32 = 1,

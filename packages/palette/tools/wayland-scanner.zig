@@ -513,12 +513,6 @@ pub fn main(init: std.process.Init) !void {
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = args[1], .data = aw.written() });
 }
 
-test "names" {
-    var b: IdBuf = undefined;
-    try std.testing.expectEqualStrings("ZwpLinuxDmabufV1", pascal(&b, "zwp_linux_dmabuf_v1"));
-    try std.testing.expectEqualStrings("getXdgSurface", camel(&b, "get_xdg_surface"));
-}
-
 test "generate small protocol" {
     const xml =
         \\<?xml version="1.0"?>

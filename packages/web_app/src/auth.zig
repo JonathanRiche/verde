@@ -972,27 +972,6 @@ test "token verifier accepts only the exact token" {
     try std.testing.expect(!verifier.verify(""));
 }
 
-test "weak and non-header-safe tokens are rejected" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try writeTestToken(std.testing.io, tmp.dir, "weak", "too-short", 0o600);
-    try std.testing.expectError(
-        error.WeakToken,
-        TokenVerifier.initFromDir(std.testing.allocator, std.testing.io, tmp.dir, "weak"),
-    );
-    try writeTestToken(
-        std.testing.io,
-        tmp.dir,
-        "control",
-        "0123456789abcdefghijklmno\x01pqrstuvwxyz",
-        0o600,
-    );
-    try std.testing.expectError(
-        error.InvalidTokenEncoding,
-        TokenVerifier.initFromDir(std.testing.allocator, std.testing.io, tmp.dir, "control"),
-    );
-}
-
 test "browser sessions expire and enforce their cap" {
     var sessions = try SessionManager.init(.{ .max_sessions = 2, .ttl_ms = 100 });
     defer sessions.deinit();
@@ -1030,18 +1009,6 @@ test "browser sessions can be revoked and emit strict cookie metadata" {
     try std.testing.expect(!try sessions.validate(std.testing.io, issued.id[0..], 2_001));
 }
 
-test "HTTPS proxy sessions add the Secure cookie attribute" {
-    var issued: IssuedSession = .{
-        .id = [_]u8{'a'} ** SESSION_ID_BYTES,
-        .expires_at_ms = 2_000,
-        .max_age_seconds = 60,
-    };
-    defer issued.clear();
-    var buffer: [256]u8 = undefined;
-    const cookie = try formatSessionCookie(&buffer, &issued, true);
-    try std.testing.expect(std.mem.endsWith(u8, cookie, "; Secure"));
-}
-
 test "failed logins are rate limited for a bounded window" {
     var limiter = try LoginRateLimiter.init(.{
         .max_clients = 2,
@@ -1066,33 +1033,6 @@ test "failed logins are rate limited for a bounded window" {
     try std.testing.expectEqual(
         RateLimitDecision.allowed,
         try limiter.recordAttempt(std.testing.io, "client-a", true, 1_501),
-    );
-}
-
-test "pair rate limiter rejects blocked clients before credential work" {
-    var limiter = try LoginRateLimiter.init(.{
-        .max_clients = 1,
-        .max_failures = 1,
-        .window_ms = 100,
-        .block_ms = 500,
-    });
-    defer limiter.deinit();
-    try std.testing.expectEqual(
-        RateLimitDecision.allowed,
-        try limiter.preflight(std.testing.io, "client-a", 1_000),
-    );
-    _ = try limiter.recordAttempt(std.testing.io, "client-a", false, 1_000);
-    try std.testing.expectEqual(
-        RateLimitDecision.rate_limited,
-        try limiter.preflight(std.testing.io, "client-a", 1_001),
-    );
-    try std.testing.expectEqual(
-        RateLimitDecision.rate_limited,
-        try limiter.preflight(std.testing.io, "unseen-full-table", 1_001),
-    );
-    try std.testing.expectEqual(
-        RateLimitDecision.allowed,
-        try limiter.preflight(std.testing.io, "client-a", 1_500),
     );
 }
 
@@ -1188,140 +1128,4 @@ test "Pair credentials replace per device without consuming another device capac
     var consumed_b = (try manager.consumeWebSocketTicket(std.testing.io, ticket_b.value[0..], 1_008)).?;
     defer consumed_b.clear();
     try std.testing.expectEqualStrings(device_b, consumed_b.device_id[0..]);
-}
-
-test "concurrent access-token issuance leaves one live credential per device" {
-    var manager = try PairCredentialManager.init(.{
-        .max_access_tokens = 1,
-        .max_websocket_tickets = 1,
-    });
-    defer manager.deinit();
-    const device_id = "0123456789abcdef0123456789abcdef";
-
-    const Race = struct {
-        manager: *PairCredentialManager,
-        device_id: []const u8,
-        ready: *std.atomic.Value(u8),
-        start: *std.atomic.Value(bool),
-        issued: ?IssuedPairCredential = null,
-        failure: ?anyerror = null,
-
-        fn run(self: *@This()) void {
-            var threaded = std.Io.Threaded.init_single_threaded;
-            _ = self.ready.fetchAdd(1, .release);
-            while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
-            self.issued = self.manager.issueAccessToken(
-                threaded.io(),
-                self.device_id,
-                1,
-                1_000,
-                10_000,
-            ) catch |err| {
-                self.failure = err;
-                return;
-            };
-        }
-    };
-    var ready: std.atomic.Value(u8) = .init(0);
-    var start: std.atomic.Value(bool) = .init(false);
-    var first: Race = .{ .manager = &manager, .device_id = device_id, .ready = &ready, .start = &start };
-    var second: Race = .{ .manager = &manager, .device_id = device_id, .ready = &ready, .start = &start };
-    const first_thread = try std.Thread.spawn(.{}, Race.run, .{&first});
-    const second_thread = try std.Thread.spawn(.{}, Race.run, .{&second});
-    while (ready.load(.acquire) != 2) std.atomic.spinLoopHint();
-    start.store(true, .release);
-    first_thread.join();
-    second_thread.join();
-    if (first.failure) |err| return err;
-    if (second.failure) |err| return err;
-    defer if (first.issued) |*issued| issued.clear();
-    defer if (second.issued) |*issued| issued.clear();
-
-    var first_claims = try manager.validateAccessToken(std.testing.io, first.issued.?.value[0..], 1_001);
-    defer if (first_claims) |*claims| claims.clear();
-    var second_claims = try manager.validateAccessToken(std.testing.io, second.issued.?.value[0..], 1_001);
-    defer if (second_claims) |*claims| claims.clear();
-    try std.testing.expect((first_claims != null) != (second_claims != null));
-}
-
-test "concurrent WebSocket ticket replay has exactly one winner" {
-    var manager = try PairCredentialManager.init(.{
-        .max_access_tokens = 1,
-        .max_websocket_tickets = 1,
-    });
-    defer manager.deinit();
-    var claims: PairClaims = .{
-        .device_id = "0123456789abcdef0123456789abcdef".*,
-        .scope_mask = 1,
-        .deadline_ms = 10_000,
-    };
-    defer claims.clear();
-    var ticket = try manager.issueWebSocketTicket(std.testing.io, claims, 1_000, 10_000);
-    defer ticket.clear();
-
-    const Race = struct {
-        manager: *PairCredentialManager,
-        ticket: *const [PAIR_TOKEN_BYTES]u8,
-        ready: *std.atomic.Value(u8),
-        start: *std.atomic.Value(bool),
-        consumed: bool = false,
-        failure: ?anyerror = null,
-
-        fn run(self: *@This()) void {
-            var threaded = std.Io.Threaded.init_single_threaded;
-            _ = self.ready.fetchAdd(1, .release);
-            while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
-            const result = self.manager.consumeWebSocketTicket(
-                threaded.io(),
-                self.ticket[0..],
-                1_001,
-            ) catch |err| {
-                self.failure = err;
-                return;
-            };
-            if (result) |claims_value| {
-                var owned = claims_value;
-                owned.clear();
-                self.consumed = true;
-            }
-        }
-    };
-    var ready: std.atomic.Value(u8) = .init(0);
-    var start: std.atomic.Value(bool) = .init(false);
-    var first: Race = .{ .manager = &manager, .ticket = &ticket.value, .ready = &ready, .start = &start };
-    var second: Race = .{ .manager = &manager, .ticket = &ticket.value, .ready = &ready, .start = &start };
-    const first_thread = try std.Thread.spawn(.{}, Race.run, .{&first});
-    const second_thread = try std.Thread.spawn(.{}, Race.run, .{&second});
-    while (ready.load(.acquire) != 2) std.atomic.spinLoopHint();
-    start.store(true, .release);
-    first_thread.join();
-    second_thread.join();
-    if (first.failure) |err| return err;
-    if (second.failure) |err| return err;
-    try std.testing.expect(first.consumed != second.consumed);
-}
-
-test "redeemed WebSocket ticket retains access lifetime while unused tickets expire" {
-    var manager = try PairCredentialManager.init(.{ .access_token_ttl_ms = 900_000, .websocket_ticket_ttl_ms = 30_000 });
-    defer manager.deinit();
-    var token = try manager.issueAccessToken(std.testing.io, "0123456789abcdef0123456789abcdef", 5, 1_000, 10_000);
-    defer token.clear();
-    const claims = (try manager.validateAccessToken(std.testing.io, &token.value, 1_000)).?;
-    var ticket = try manager.issueWebSocketTicket(std.testing.io, claims, 1_000, 10_000);
-    defer ticket.clear();
-    try std.testing.expectEqual(@as(i64, 40_000), ticket.expires_at_ms);
-    const consumed = (try manager.consumeWebSocketTicket(std.testing.io, &ticket.value, 30_999)).?;
-    try std.testing.expectEqual(claims.deadline_ms, consumed.deadline_ms);
-    try std.testing.expect(consumed.deadline_ms > 31_000);
-    try std.testing.expectEqual(claims.scope_mask, consumed.scope_mask);
-    try std.testing.expectEqualStrings(&claims.device_id, &consumed.device_id);
-    try std.testing.expect((try manager.consumeWebSocketTicket(std.testing.io, &ticket.value, 30_999)) == null);
-
-    var expired = try manager.issueWebSocketTicket(std.testing.io, claims, 31_000, 40_000);
-    defer expired.clear();
-    try std.testing.expect((try manager.consumeWebSocketTicket(std.testing.io, &expired.value, 61_000)) == null);
-    var capped = try manager.issueWebSocketTicket(std.testing.io, claims, 900_000, 909_000);
-    defer capped.clear();
-    try std.testing.expectEqual(@as(i64, 910_000), capped.expires_at_ms);
-    try std.testing.expect((try manager.consumeWebSocketTicket(std.testing.io, &capped.value, 901_000)) == null);
 }

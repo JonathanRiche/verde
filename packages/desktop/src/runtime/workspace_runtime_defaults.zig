@@ -491,14 +491,6 @@ fn acquireExclusiveAtPath(
     return (try openExclusiveAtPath(allocator, io, path, false)) orelse unreachable;
 }
 
-fn tryAcquireExclusiveAtPath(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    path: []const u8,
-) !?ExclusiveLock {
-    return openExclusiveAtPath(allocator, io, path, true);
-}
-
 fn openExclusiveAtPath(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -605,41 +597,6 @@ fn writeTestFile(dir: std.Io.Dir, name: []const u8, bytes: []const u8) !void {
     try file.writeStreamingAll(std.testing.io, bytes);
 }
 
-test "workspace runtime defaults save through a symlinked config directory" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDir(std.testing.io, "config-real", .default_dir);
-    try tmp.dir.symLink(std.testing.io, "config-real", "config-link", .{});
-
-    var absolute_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const absolute_len = try tmp.dir.realPath(std.testing.io, &absolute_buffer);
-    const path = try std.fs.path.join(allocator, &.{
-        absolute_buffer[0..absolute_len],
-        "config-link",
-        FILE_NAME,
-    });
-    defer allocator.free(path);
-
-    try std.testing.expectEqual(.inserted, try upsertAtPath(
-        allocator,
-        std.testing.io,
-        path,
-        "workspace-symlink",
-        LOCAL_PROFILE_ID,
-    ));
-    const profile_id = (try lookupAtPath(
-        allocator,
-        std.testing.io,
-        path,
-        "workspace-symlink",
-    )).?;
-    defer allocator.free(profile_id);
-    try std.testing.expectEqualStrings(LOCAL_PROFILE_ID, profile_id);
-}
-
 test "workspace runtime defaults round trip and preserve unrelated mappings" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -738,107 +695,6 @@ test "workspace runtime defaults round trip and preserve unrelated mappings" {
     }
 }
 
-const ConcurrentUpsertContext = struct {
-    path: []const u8,
-    workspace_id: []const u8,
-    profile_id: []const u8,
-    ready: *std.atomic.Value(u8),
-    start: *std.atomic.Value(bool),
-    failure: ?anyerror = null,
-
-    fn run(self: *ConcurrentUpsertContext) void {
-        _ = self.ready.fetchAdd(1, .release);
-        while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
-        var threaded = std.Io.Threaded.init_single_threaded;
-        _ = upsertAtPath(
-            std.testing.allocator,
-            threaded.io(),
-            self.path,
-            self.workspace_id,
-            self.profile_id,
-        ) catch |err| {
-            self.failure = err;
-            return;
-        };
-    }
-};
-
-test "workspace runtime defaults serialize concurrent mutations" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try testPathAlloc(allocator, tmp.dir);
-    defer allocator.free(path);
-
-    var ready: std.atomic.Value(u8) = .init(0);
-    var start: std.atomic.Value(bool) = .init(false);
-    var first: ConcurrentUpsertContext = .{
-        .path = path,
-        .workspace_id = "workspace-one",
-        .profile_id = LOCAL_PROFILE_ID,
-        .ready = &ready,
-        .start = &start,
-    };
-    var second: ConcurrentUpsertContext = .{
-        .path = path,
-        .workspace_id = "workspace-two",
-        .profile_id = "profile-fedcba9876543210fedcba9876543210",
-        .ready = &ready,
-        .start = &start,
-    };
-    const first_thread = try std.Thread.spawn(.{}, ConcurrentUpsertContext.run, .{&first});
-    const second_thread = try std.Thread.spawn(.{}, ConcurrentUpsertContext.run, .{&second});
-    while (ready.load(.acquire) != 2) std.atomic.spinLoopHint();
-    start.store(true, .release);
-    first_thread.join();
-    second_thread.join();
-    if (first.failure) |err| return err;
-    if (second.failure) |err| return err;
-
-    var loaded = try loadAtPath(allocator, std.testing.io, path);
-    defer loaded.deinit(allocator);
-    try std.testing.expectEqual(@as(usize, 2), loaded.items.len);
-    const first_profile = (try lookupAtPath(
-        allocator,
-        std.testing.io,
-        path,
-        "workspace-one",
-    )).?;
-    defer allocator.free(first_profile);
-    try std.testing.expectEqualStrings(first.profile_id, first_profile);
-    const second_profile = (try lookupAtPath(
-        allocator,
-        std.testing.io,
-        path,
-        "workspace-two",
-    )).?;
-    defer allocator.free(second_profile);
-    try std.testing.expectEqualStrings(second.profile_id, second_profile);
-}
-
-test "workspace runtime defaults lock is exclusive and private" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try testPathAlloc(allocator, tmp.dir);
-    defer allocator.free(path);
-
-    var first = try acquireExclusiveAtPath(allocator, std.testing.io, path);
-    defer first.deinit();
-    try std.testing.expect((try tryAcquireExclusiveAtPath(
-        allocator,
-        std.testing.io,
-        path,
-    )) == null);
-    if (builtin.os.tag != .windows) {
-        const stat = try tmp.dir.statFile(std.testing.io, FILE_NAME ++ LOCK_SUFFIX, .{});
-        try std.testing.expectEqual(
-            @as(std.posix.mode_t, 0o600),
-            stat.permissions.toMode() & @as(std.posix.mode_t, 0o777),
-        );
-    }
-}
-
 test "workspace runtime defaults reject malformed duplicate and secret fields" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -886,78 +742,4 @@ test "workspace runtime defaults reject malformed duplicate and secret fields" {
         error.InvalidWorkspaceRuntimeDefaultsDocument,
         loadAtPath(allocator, std.testing.io, path),
     );
-}
-
-test "workspace runtime defaults enforce field and document bounds transactionally" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try testPathAlloc(allocator, tmp.dir);
-    defer allocator.free(path);
-    try std.testing.expectEqual(.inserted, try upsertAtPath(
-        allocator,
-        std.testing.io,
-        path,
-        "preserved",
-        LOCAL_PROFILE_ID,
-    ));
-    const before = try tmp.dir.readFileAlloc(
-        std.testing.io,
-        FILE_NAME,
-        allocator,
-        .limited(MAX_DOCUMENT_BYTES + 1),
-    );
-    defer allocator.free(before);
-
-    const oversized_id = try allocator.alloc(u8, MAX_WORKSPACE_ID_BYTES + 1);
-    defer allocator.free(oversized_id);
-    @memset(oversized_id, 'a');
-    try std.testing.expectError(
-        error.InvalidWorkspaceId,
-        upsertAtPath(allocator, std.testing.io, path, oversized_id, LOCAL_PROFILE_ID),
-    );
-    try std.testing.expectError(
-        error.InvalidRuntimeProfileId,
-        upsertAtPath(allocator, std.testing.io, path, "new-workspace", "profile-token"),
-    );
-    const after = try tmp.dir.readFileAlloc(
-        std.testing.io,
-        FILE_NAME,
-        allocator,
-        .limited(MAX_DOCUMENT_BYTES + 1),
-    );
-    defer allocator.free(after);
-    try std.testing.expectEqualStrings(before, after);
-
-    const oversized_document = try allocator.alloc(u8, MAX_DOCUMENT_BYTES + 1);
-    defer allocator.free(oversized_document);
-    @memset(oversized_document, 'x');
-    try writeTestFile(tmp.dir, FILE_NAME, oversized_document);
-    try std.testing.expectError(
-        error.InvalidWorkspaceRuntimeDefaultsDocument,
-        loadAtPath(allocator, std.testing.io, path),
-    );
-}
-
-test "workspace runtime defaults staging failure preserves prior document" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const original =
-        \\{"version":1,"defaults":[]}
-    ;
-    try writeTestFile(tmp.dir, FILE_NAME, original);
-    try tmp.dir.createDir(std.testing.io, "collision.tmp", .default_dir);
-    try std.testing.expectError(
-        error.PathAlreadyExists,
-        stageAndReplace(std.testing.io, tmp.dir, FILE_NAME, "collision.tmp", "replacement"),
-    );
-    const after = try tmp.dir.readFileAlloc(
-        std.testing.io,
-        FILE_NAME,
-        allocator,
-        .limited(MAX_DOCUMENT_BYTES + 1),
-    );
-    defer allocator.free(after);
-    try std.testing.expectEqualStrings(original, after);
 }

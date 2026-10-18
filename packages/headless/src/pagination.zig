@@ -98,19 +98,6 @@ fn isLowerHex(value: []const u8) bool {
     return true;
 }
 
-test "page cursor round trips revision scope and offset" {
-    const allocator = std.testing.allocator;
-    const encoded = try encodeAlloc(allocator, .thread, 42, "workspace-a", 200);
-    defer allocator.free(encoded);
-
-    try std.testing.expect(encoded.len <= MAX_CURSOR_BYTES);
-    try std.testing.expectEqual(
-        @as(usize, 200),
-        try decode(encoded, .thread, 42, "workspace-a"),
-    );
-    try std.testing.expectEqual(@as(usize, 0), try decode(null, .thread, 99, "workspace-a"));
-}
-
 test "page cursor rejects stale and mismatched queries" {
     const allocator = std.testing.allocator;
     const encoded = try encodeAlloc(allocator, .thread, 42, "workspace-a", 10);

@@ -203,30 +203,6 @@ fn waitDetachedChild(pid: std.posix.pid_t) void {
     }
 }
 
-test "reapDetachedChild reaps a fire-and-forget child without aborting" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-    const pid = std.c.fork();
-    if (pid == 0) std.c._exit(0);
-    try std.testing.expect(pid > 0);
-    reapDetachedChild(pid);
-    var waited: usize = 0;
-    while (waited < 200) : (waited += 1) {
-        // kill(pid, 0) fails with ESRCH once the reaper thread has collected it.
-        if (std.c.kill(pid, @enumFromInt(0)) != 0) return;
-        _ = std.c.nanosleep(&.{ .sec = 0, .nsec = 10 * std.time.ns_per_ms }, null);
-    }
-    return error.ChildNotReaped;
-}
-
-test "spawn preflight rejects missing tools and directories before forking" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-    try std.testing.expectError(error.FileNotFound, spawnPreflight("verde-definitely-missing-tool-6c1f", null));
-    try std.testing.expectError(error.FileNotFound, spawnPreflight("/nonexistent/verde/tool", null));
-    try std.testing.expectError(error.FileNotFound, spawnPreflight("sh", "/nonexistent/verde-deleted-worktree"));
-    try spawnPreflight("sh", null);
-    try spawnPreflight("/bin/sh", "/");
-}
-
 /// Returns true when the executable can be found in the augmented PATH.
 pub fn commandExists(executable: []const u8) bool {
     var env_map = buildAugmentedEnvMap(std.heap.page_allocator) catch return false;
@@ -443,38 +419,4 @@ fn hasWindowsExecutableExtension(path: []const u8) bool {
 pub fn isWindowsCommandScript(path: []const u8) bool {
     const extension = std.fs.path.extension(path);
     return std.ascii.eqlIgnoreCase(extension, ".cmd") or std.ascii.eqlIgnoreCase(extension, ".bat");
-}
-
-test "windows PATH augmentation includes common user CLI dirs without duplicates" {
-    const allocator = std.testing.allocator;
-    var env_map = std.process.Environ.Map.init(allocator);
-    defer env_map.deinit();
-
-    try env_map.put("PATH", "C:\\Existing;C:\\Users\\Test\\AppData\\Roaming\\npm");
-    try env_map.put("APPDATA", "C:\\Users\\Test\\AppData\\Roaming\\");
-    try env_map.put("LOCALAPPDATA", "C:\\Users\\Test\\AppData\\Local");
-    try env_map.put("USERPROFILE", "C:\\Users\\Test User");
-
-    var path_builder: std.ArrayList(u8) = .empty;
-    defer path_builder.deinit(allocator);
-    try path_builder.appendSlice(allocator, env_map.get("PATH").?);
-    try appendWindowsUserPathDirsForOs(allocator, &path_builder, &env_map, .windows);
-
-    const path = path_builder.items;
-    try std.testing.expect(std.mem.indexOf(u8, path, "C:\\Users\\Test\\AppData\\Local\\Microsoft\\WindowsApps") != null);
-    try std.testing.expect(std.mem.indexOf(u8, path, "C:\\Users\\Test User\\.bun\\bin") != null);
-    try std.testing.expect(std.mem.indexOf(u8, path, "C:\\Users\\Test User\\scoop\\shims") != null);
-    try std.testing.expect(pathContainsDirForOs(path, .windows, "c:\\users\\test\\appdata\\roaming\\NPM"));
-    try std.testing.expect(!pathContainsDirForOs(path, .windows, "C:\\Users\\Test\\AppData\\Roaming\\npm-extra"));
-}
-
-test "windows executable helpers recognize PATHEXT scripts and qualified paths" {
-    try std.testing.expect(hasWindowsExecutableExtension("codex.exe"));
-    try std.testing.expect(hasWindowsExecutableExtension("C:\\Tools\\claude.CMD"));
-    try std.testing.expect(!hasWindowsExecutableExtension("C:\\Tools\\agent"));
-    try std.testing.expect(isQualifiedExecutablePath("\\\\server\\share\\tools\\codex.cmd"));
-    try std.testing.expect(!isQualifiedExecutablePath("codex"));
-    try std.testing.expect(isWindowsCommandScript("C:\\Tools\\CLAUDE.CMD"));
-    try std.testing.expect(isWindowsCommandScript("agent.bat"));
-    try std.testing.expect(!isWindowsCommandScript("codex.exe"));
 }

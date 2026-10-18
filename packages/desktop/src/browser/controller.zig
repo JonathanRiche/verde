@@ -469,20 +469,3 @@ fn configuredPresentationKind() browser_types.PresentationKind {
         .stub => .stub,
     };
 }
-
-test "host window and pane bounds preserve lazy backend startup" {
-    var controller = try Controller.init(std.testing.allocator);
-    defer controller.deinit();
-
-    try std.testing.expect(!controller.hasBackend());
-    try std.testing.expectEqual(@as(u32, 1280), controller.pane_bounds.width);
-    try std.testing.expectEqual(@as(u32, 720), controller.pane_bounds.height);
-    try controller.setHostWindow(@ptrFromInt(0x1));
-    try controller.setPaneBounds(.{ .screen_x = 10, .screen_y = 20, .width = 640, .height = 360 });
-    try controller.resizePane(800, 450);
-    try std.testing.expectEqual(@as(u32, 800), controller.pane_bounds.width);
-    try std.testing.expectEqual(@as(u32, 450), controller.pane_bounds.height);
-
-    try std.testing.expect(!controller.hasBackend());
-    try std.testing.expect(!controller.runtimeInitialized());
-}

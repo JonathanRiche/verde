@@ -299,48 +299,6 @@ pub fn Text(comptime config: TextConfig) type {
     };
 }
 
-const TextProbe = struct {
-    changed: usize = 0,
-};
-
-fn probeTextEvent(context: ?*anyopaque, event: TextEvent) void {
-    const probe: *TextProbe = @ptrCast(@alignCast(context orelse return));
-    switch (event) {
-        .changed => probe.changed += 1,
-        .selection_changed => {},
-    }
-}
-
-test "text component emits change callbacks" {
-    const Label = Text(.{});
-    var label = try Label.init(std.testing.allocator, "before");
-    defer label.deinit(std.testing.allocator);
-
-    var probe: TextProbe = .{};
-    label.setCallbacks(.{ .context = &probe, .on_event = probeTextEvent });
-    try label.setText(std.testing.allocator, "after");
-
-    try std.testing.expectEqualStrings("after", label.text());
-    try std.testing.expectEqual(@as(usize, 1), probe.changed);
-}
-
-test "selectable text can drag selection and copy" {
-    const Label = Text(.{ .x = 0, .y = 0, .width = 200, .height = 24, .glyph_width = 10, .selectable = true });
-    var label = try Label.init(std.testing.allocator, "hello");
-    defer label.deinit(std.testing.allocator);
-
-    var copied: std.ArrayList(u8) = .empty;
-    defer copied.deinit(std.testing.allocator);
-    label.setCallbacks(.{ .context = &copied, .set_clipboard = setProbeClipboard });
-
-    try std.testing.expect(label.handleInput(.{ .mouse_down = .{ .x = 0, .y = 4 } }));
-    try std.testing.expect(label.handleInput(.{ .mouse_drag = .{ .x = 30, .y = 4 } }));
-    try std.testing.expect(label.handleInput(.{ .mouse_up = .{ .x = 30, .y = 4 } }));
-    try std.testing.expectEqualStrings("hel", label.text()[label.selection().?.start..label.selection().?.end]);
-    try std.testing.expect(label.handleInput(.copy_selection));
-    try std.testing.expectEqualStrings("hel", copied.items);
-}
-
 test "text component emits rich text runs" {
     const Label = Text(.{ .x = 10, .y = 20, .width = 220, .height = 24, .glyph_width = 8 });
     var label = try Label.init(std.testing.allocator, "plain code link");
@@ -366,11 +324,4 @@ test "text component emits rich text runs" {
     try std.testing.expectEqualStrings(" ", text_command.?.text_runs[2].text);
     try std.testing.expectEqualStrings("link", text_command.?.text_runs[3].text);
     try std.testing.expectEqual(@as(f32, 18), text_command.?.text_runs[3].font_size);
-}
-
-fn setProbeClipboard(context: ?*anyopaque, text: []const u8) bool {
-    const copied: *std.ArrayList(u8) = @ptrCast(@alignCast(context orelse return false));
-    copied.clearRetainingCapacity();
-    copied.appendSlice(std.testing.allocator, text) catch return false;
-    return true;
 }

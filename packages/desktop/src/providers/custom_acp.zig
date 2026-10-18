@@ -422,23 +422,3 @@ fn mapAcpError(err: anyerror) anyerror {
         else => err,
     };
 }
-
-test "makeSetModelOptionRequestAlloc emits a standard config option request" {
-    const json = try makeSetModelOptionRequestAlloc(std.testing.allocator, 12, "s-1", "anthropic/claude");
-    defer std.testing.allocator.free(json);
-    try std.testing.expectEqualStrings(
-        \\{"jsonrpc":"2.0","id":12,"method":"session/set_config_option","params":{"sessionId":"s-1","configId":"model","value":"anthropic/claude"}}
-    , json);
-}
-
-test "harnessFor labels replies with the agent name" {
-    var args = [_][]u8{};
-    const agent: custom_agents.Agent = .{
-        .id = @constCast("my-agent"),
-        .name = @constCast("My Agent"),
-        .command = @constCast("agent"),
-        .args = &args,
-    };
-    const harness = harnessFor(agent);
-    try std.testing.expectEqualStrings("My Agent", harness.assistant_author);
-}

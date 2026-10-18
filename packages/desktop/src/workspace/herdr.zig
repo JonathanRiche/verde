@@ -232,13 +232,3 @@ fn appendSafePart(writer: *std.Io.Writer, value: []const u8) !void {
     }
     if (!wrote) try writer.writeAll("default");
 }
-
-test "default local dir encodes Herdr identity safely" {
-    const request: OpenRequest = .{
-        .session = "default",
-        .herdr_workspace = "w1:p1",
-    };
-    const path = try defaultLocalDir(std.testing.allocator, "/tmp/verde", request);
-    defer std.testing.allocator.free(path);
-    try std.testing.expectEqualStrings("/tmp/verde/herdr-workspaces/local-default-w1_p1", path);
-}

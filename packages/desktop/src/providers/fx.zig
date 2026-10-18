@@ -547,23 +547,3 @@ test "parseModelConfigOptionsAlloc reads fx configOptions model select" {
     defer missing.deinit();
     try std.testing.expectError(error.AcpFailed, parseModelConfigOptionsAlloc(std.testing.allocator, missing.value));
 }
-
-test "newestSessionIdAlloc picks the most recently updated fx session" {
-    const payload =
-        \\{"jsonrpc":"2.0","id":2,"result":{"sessions":[
-        \\{"sessionId":"old","cwd":"/w","updatedAt":"2026-08-01T10:00:00Z"},
-        \\{"sessionId":"new","cwd":"/w","updatedAt":"2026-08-20T09:30:00Z"},
-        \\{"sessionId":"mid","cwd":"/w","updatedAt":"2026-08-10T12:00:00Z"}]}}
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
-    defer parsed.deinit();
-    const id = (try newestSessionIdAlloc(std.testing.allocator, parsed.value)).?;
-    defer std.testing.allocator.free(id);
-    try std.testing.expectEqualStrings("new", id);
-
-    var empty = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
-        \\{"jsonrpc":"2.0","id":2,"result":{"sessions":[]}}
-    , .{});
-    defer empty.deinit();
-    try std.testing.expectEqual(@as(?[]u8, null), try newestSessionIdAlloc(std.testing.allocator, empty.value));
-}

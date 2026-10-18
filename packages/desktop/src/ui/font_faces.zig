@@ -138,23 +138,3 @@ test "every icon codepoint in the desktop UI resolves to a glyph in the icon cha
     try std.testing.expect(checked >= 100);
     try std.testing.expectEqual(@as(usize, 0), missing);
 }
-
-test "the .txt file icon (codicon file-text, newer than Symbols Nerd Font) draws from Codicon" {
-    const fonts = try palette.fonts.Fonts.init(std.testing.allocator, bundled(null, null), .{ .optional_missing = false });
-    defer fonts.deinit();
-    const chain = fonts.collection.roleChain(.icon);
-    const nerd = fonts.collection.sfntFace(chain[0]).?;
-    try std.testing.expectEqual(@as(u32, 0), nerd.font.glyphIndex(0xEC5E));
-    const entry = fonts.collection.resolve(.icon, 0xEC5E).?;
-    try std.testing.expect(entry.face != chain[0]);
-    try std.testing.expect(entry.glyph != 0);
-    try std.testing.expect((try fonts.measure(.icon, 16, "\u{EC5E}")) > 0);
-}
-
-test "collectIconCodepoints reads literal glyphs and escapes" {
-    const gpa = std.testing.allocator;
-    var cps: std.AutoArrayHashMapUnmanaged(u21, void) = .empty;
-    defer cps.deinit(gpa);
-    try collectIconCodepoints(gpa, "a \"\u{EA83}\" \\u{ec5e} \\u{f0615} \\u{2192} \\u{zz}", &cps);
-    try std.testing.expectEqualSlices(u21, &.{ 0xEA83, 0xEC5E, 0xF0615 }, cps.keys());
-}

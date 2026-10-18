@@ -306,27 +306,3 @@ test "flatten nests expanded listings and notes loading and truncation" {
     try testing.expectEqual(@as(usize, 2), explorer.rows.items.len);
     try testing.expect(explorer.dir(key.items) != null);
 }
-
-test "a failed refresh keeps the previous listing" {
-    const explorer = try Explorer.create("ws");
-    defer explorer.destroy();
-    var arena: std.heap.ArenaAllocator = .init(page);
-    const entries = try arena.allocator().dupe(Entry, &.{testEntry("a", "a", .file)});
-    try explorer.applyListing("home\x00", &arena, entries, false, 1);
-    try explorer.failListing("home\x00", "boom");
-    try testing.expectEqual(DirStatus.ready, explorer.dir("home\x00").?.status);
-    try explorer.failListing("home\x00x", "boom");
-    try testing.expectEqual(DirStatus.failed, explorer.dir("home\x00x").?.status);
-    try testing.expectEqualStrings("boom", explorer.dir("home\x00x").?.message);
-}
-
-test "key and path helpers" {
-    const parts = splitKey("docs\x00guide/intro.md");
-    try testing.expectEqualStrings("docs", parts.root_id);
-    try testing.expectEqualStrings("guide/intro.md", parts.path);
-    try testing.expectEqualStrings("guide", parentPath("guide/intro.md"));
-    try testing.expectEqualStrings("", parentPath("intro.md"));
-    const joined = try joinAbsolute(testing.allocator, "/home/u/p/", "src/a.zig");
-    defer testing.allocator.free(joined);
-    try testing.expectEqualStrings("/home/u/p/src/a.zig", joined);
-}

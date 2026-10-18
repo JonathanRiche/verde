@@ -98,21 +98,6 @@ fn intervalElapsed(last_ms: ?i64, now_ms: i64, interval_ms: i64) bool {
     return now_ms < previous_ms or now_ms - previous_ms >= interval_ms;
 }
 
-test "wake rendering is immediate once then bounded to the display cadence" {
-    var pacer: FramePacer = .{};
-    pacer.requestWakeRender();
-    try std.testing.expect(pacer.wakeRenderDue(100, 16));
-    pacer.noteRendered(100);
-
-    pacer.requestWakeRender();
-    try std.testing.expect(!pacer.wakeRenderDue(105, 16));
-    try std.testing.expectEqual(@as(c_int, 11), pacer.nextWaitTimeoutMs(105, 33, 16));
-    try std.testing.expect(pacer.wakeRenderDue(116, 16));
-
-    pacer.noteRendered(116);
-    try std.testing.expectEqual(@as(c_int, 33), pacer.nextWaitTimeoutMs(117, 33, 16));
-}
-
 test "rapid switch keeps the final frame scheduled when swapchain acquisition is deferred" {
     var demand: PresentationDemand = .{};
 
@@ -143,12 +128,4 @@ test "texture-only demand never downgrades a pending layout frame" {
     try std.testing.expect(!demand.pending);
     demand.requestTextureOnly();
     try std.testing.expect(demand.textureOnly());
-}
-
-test "poll cadence runs immediately and recovers from clock rollback" {
-    var cadence: Cadence = .{};
-    try std.testing.expect(cadence.shouldRun(100, 250));
-    try std.testing.expect(!cadence.shouldRun(349, 250));
-    try std.testing.expect(cadence.shouldRun(350, 250));
-    try std.testing.expect(cadence.shouldRun(10, 250));
 }

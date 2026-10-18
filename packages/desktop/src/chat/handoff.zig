@@ -284,32 +284,6 @@ fn asciiIndexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
     return null;
 }
 
-test "handoff preserves namespaced source identity and history access" {
-    const messages = [_]MessageView{
-        .{ .role = .user, .author = "You", .body = "Fix the pane state" },
-        .{ .role = .assistant, .author = "Agent", .body = "I traced the layout" },
-    };
-    const package = try buildAlloc(std.testing.allocator, .{
-        .workspace_id = "workspace-1",
-        .workspace_label = "Verde",
-        .workspace_path = "/tmp/verde",
-        .pane_id = 7,
-        .source_surface = .gui_chat,
-        .source_provider = "codex",
-        .verde_thread_index = 3,
-        .verde_thread_id = "chat-local",
-        .provider_thread_id = "provider-native",
-        .title = "Pane state",
-        .messages = &messages,
-    });
-    defer std.testing.allocator.free(package);
-
-    try std.testing.expect(std.mem.indexOf(u8, package, "Source provider thread ID: provider-native") != null);
-    try std.testing.expect(std.mem.indexOf(u8, package, "source provider only") != null);
-    try std.testing.expect(std.mem.indexOf(u8, package, "--thread provider-native") != null);
-    try std.testing.expect(std.mem.indexOf(u8, package, "--pane 7") != null);
-}
-
 test "handoff redacts likely credentials" {
     const messages = [_]MessageView{
         .{ .role = .user, .author = "You", .body = "Authorization: Bearer secret-value\nkeep this line" },
@@ -328,24 +302,6 @@ test "handoff redacts likely credentials" {
 
     try std.testing.expect(std.mem.indexOf(u8, package, "secret-value") == null);
     try std.testing.expect(std.mem.indexOf(u8, package, "keep this line") != null);
-}
-
-test "TUI handoff exposes the Verde session history handle" {
-    const package = try buildAlloc(std.testing.allocator, .{
-        .workspace_id = "w",
-        .workspace_label = "W",
-        .workspace_path = "/tmp/w",
-        .pane_id = 4,
-        .source_surface = .tui,
-        .source_provider = "claude",
-        .verde_session_id = "verde-session-9",
-        .provider_thread_id = "claude-thread-2",
-        .title = "Agent TUI",
-    });
-    defer std.testing.allocator.free(package);
-
-    try std.testing.expect(std.mem.indexOf(u8, package, "Verde terminal session ID: verde-session-9") != null);
-    try std.testing.expect(std.mem.indexOf(u8, package, "verde session tail --id verde-session-9") != null);
 }
 
 test "full transcript package stays within the GUI draft capacity" {

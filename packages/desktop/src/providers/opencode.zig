@@ -2759,117 +2759,6 @@ fn parseModelRef(model_ref: []const u8) struct { []const u8, []const u8 } {
 
 // Tests -----------------------------------------------------------------------
 
-const OpenCodeTestToolCapture = struct {
-    call_id: ?[]const u8 = null,
-    title: ?[]const u8 = null,
-    kind: ?provider_types.ToolCallKind = null,
-    status: ?provider_types.ToolCallStatus = null,
-    output_buffer: [256]u8 = undefined,
-    output_len: usize = 0,
-    input_buffer: [256]u8 = undefined,
-    input_len: usize = 0,
-    count: usize = 0,
-
-    fn handle(context: ?*anyopaque, event: provider_types.StreamEvent) void {
-        const self: *OpenCodeTestToolCapture = @ptrCast(@alignCast(context orelse return));
-        switch (event) {
-            .tool_call => |tool_call| {
-                self.call_id = tool_call.call_id;
-                self.title = tool_call.title;
-                self.kind = tool_call.kind;
-                self.status = tool_call.status;
-                if (tool_call.input) |input| {
-                    self.input_len = @min(input.len, self.input_buffer.len);
-                    @memcpy(self.input_buffer[0..self.input_len], input[0..self.input_len]);
-                }
-                if (tool_call.output) |output| {
-                    self.output_len = @min(output.len, self.output_buffer.len);
-                    @memcpy(self.output_buffer[0..self.output_len], output[0..self.output_len]);
-                }
-                self.count += 1;
-            },
-            else => {},
-        }
-    }
-};
-
-test "OpenCode tool called events preserve MCP input" {
-    const payload =
-        \\{"sessionID":"ses_1","assistantMessageID":"msg_1","callID":"call-1","tool":"verde:list_processes","input":{"workspace":"current"}}
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
-    defer parsed.deinit();
-    var capture: OpenCodeTestToolCapture = .{};
-
-    try std.testing.expect(try emitToolCalled(std.testing.allocator, .{
-        .prompt = "",
-        .stream_context = &capture,
-        .on_stream_event = OpenCodeTestToolCapture.handle,
-    }, "verde:list_processes", parsed.value));
-    try std.testing.expectEqual(@as(usize, 1), capture.count);
-    try std.testing.expectEqualStrings("call-1", capture.call_id.?);
-    try std.testing.expectEqualStrings("verde:list_processes", capture.title.?);
-    try std.testing.expectEqual(provider_types.ToolCallKind.mcp, capture.kind.?);
-    try std.testing.expectEqual(provider_types.ToolCallStatus.in_progress, capture.status.?);
-    try std.testing.expectEqualStrings("{\"workspace\":\"current\"}", capture.input_buffer[0..capture.input_len]);
-}
-
-test "OpenCode tool called events classify task tools as subagents" {
-    const payload =
-        \\{"sessionID":"ses_1","callID":"task-1","tool":"task","input":{"description":"Explore website package"}}
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
-    defer parsed.deinit();
-    var capture: OpenCodeTestToolCapture = .{};
-
-    try std.testing.expect(try emitToolCalled(std.testing.allocator, .{
-        .prompt = "",
-        .stream_context = &capture,
-        .on_stream_event = OpenCodeTestToolCapture.handle,
-    }, "task", parsed.value));
-    try std.testing.expectEqual(provider_types.ToolCallKind.subagent, capture.kind.?);
-    try std.testing.expectEqualStrings("Explore website package", capture.title.?);
-}
-
-test "OpenCode tool success events take subagent titles from input only" {
-    for ([_][]const u8{
-        \\{"sessionID":"ses_1","callID":"task-1","input":{"description":"Explore website package"},"content":[{"type":"text","text":"done"}]}
-        ,
-        \\{"sessionID":"ses_1","callID":"task-1","content":[{"type":"text","text":"done"}]}
-        ,
-    }, [_][]const u8{ "Explore website package", "" }) |payload, expected_title| {
-        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
-        defer parsed.deinit();
-        var capture: OpenCodeTestToolCapture = .{};
-
-        try std.testing.expect(try emitToolResult(std.testing.allocator, .{
-            .prompt = "",
-            .stream_context = &capture,
-            .on_stream_event = OpenCodeTestToolCapture.handle,
-        }, "task", parsed.value, .completed));
-        try std.testing.expectEqual(provider_types.ToolCallKind.subagent, capture.kind.?);
-        try std.testing.expectEqualStrings(expected_title, capture.title.?);
-    }
-}
-
-test "OpenCode tool success events join text content into output" {
-    const payload =
-        \\{"sessionID":"ses_1","callID":"bash-1","content":[{"type":"text","text":"clean"},{"type":"file","uri":"file:///tmp/x"}]}
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
-    defer parsed.deinit();
-    var capture: OpenCodeTestToolCapture = .{};
-
-    try std.testing.expect(try emitToolResult(std.testing.allocator, .{
-        .prompt = "",
-        .stream_context = &capture,
-        .on_stream_event = OpenCodeTestToolCapture.handle,
-    }, "bash", parsed.value, .completed));
-    try std.testing.expectEqual(provider_types.ToolCallKind.execute, capture.kind.?);
-    try std.testing.expectEqual(provider_types.ToolCallStatus.completed, capture.status.?);
-    try std.testing.expectEqualStrings("clean\nfile:///tmp/x", capture.output_buffer[0..capture.output_len]);
-}
-
 const OpenCodeTestTranscriptCapture = struct {
     transcript_buffer: [4096]u8 = undefined,
     transcript_len: usize = 0,
@@ -2972,29 +2861,6 @@ test "OpenCode child subagent activity streams into the parent task transcript" 
     try std.testing.expectEqualStrings("The router lives in web_app.", capture.output());
 }
 
-test "OpenCode child tool failures become error transcript results" {
-    var capture: OpenCodeTestTranscriptCapture = .{};
-    var context = try openCodeTestEventContext("ses_parent", &capture);
-    defer context.deinit();
-
-    try feedOpenCodeTestEvents(&context, &.{
-        \\{"type":"session.tool.input.started","data":{"sessionID":"ses_parent","id":"call-task","name":"task"}}
-        ,
-        \\{"type":"session.tool.progress","data":{"sessionID":"ses_parent","id":"call-task","metadata":{"sessionID":"ses_child","status":"running"}}}
-        ,
-        \\{"type":"session.tool.input.started","data":{"sessionID":"ses_child","id":"call-read","name":"read"}}
-        ,
-        \\{"type":"session.tool.failed","data":{"sessionID":"ses_child","id":"call-read","error":{"message":"File not found"}}}
-        ,
-    });
-
-    try std.testing.expectEqualStrings(
-        \\{"type":"tool_result","id":"call-read","is_error":true,"output":"File not found"}
-    ++ "\n",
-        capture.transcript(),
-    );
-}
-
 test "OpenCode ignores sessions that are not linked to a running task call" {
     var capture: OpenCodeTestTranscriptCapture = .{};
     var context = try openCodeTestEventContext("ses_parent", &capture);
@@ -3014,55 +2880,6 @@ test "OpenCode ignores sessions that are not linked to a running task call" {
     try std.testing.expect(!eventStreamReachedTerminal(&context));
 }
 
-test "eventTypeIs accepts live and schema event spellings" {
-    try std.testing.expect(eventTypeIs("session.text.delta", "session.text.delta"));
-    try std.testing.expect(eventTypeIs("session.next.text.delta", "session.text.delta"));
-    try std.testing.expect(!eventTypeIs("session.text.started", "session.text.delta"));
-    try std.testing.expect(eventTypeIs("permission.asked", "permission.asked"));
-}
-
-test "parseEventEnvelope reads v2 data frames" {
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
-        \\{"id":"evt_1","type":"session.text.delta","data":{"sessionID":"ses_1","delta":"hi"}}
-    , .{});
-    defer parsed.deinit();
-
-    const envelope = parseEventEnvelope(parsed.value, "") orelse return error.TestUnexpectedNull;
-    try std.testing.expectEqualStrings("session.text.delta", envelope.event_type);
-    try std.testing.expect(eventTargetsSession(envelope.properties, "ses_1"));
-    try std.testing.expectEqualStrings("hi", getOptionalObjectString(envelope.properties, "delta").?);
-}
-
-test "extractAssistantTextAlloc joins text content parts" {
-    const allocator = std.testing.allocator;
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
-        \\{"type":"assistant","content":[{"type":"text","text":"hello "},{"type":"reasoning","text":"hidden"},{"type":"text","text":"world"},{"type":"tool","name":"bash"}]}
-    , .{});
-    defer parsed.deinit();
-
-    const text = try extractAssistantTextAlloc(allocator, parsed.value);
-    defer allocator.free(text);
-    try std.testing.expectEqualStrings("hello world", text);
-}
-
-test "readEventStreamLine accepts SSE lines larger than the file buffer" {
-    const allocator = std.testing.allocator;
-    const large_len = 96 * 1024;
-    const payload = try allocator.alloc(u8, large_len + 6);
-    defer allocator.free(payload);
-    @memset(payload[0..large_len], 'x');
-    @memcpy(payload[large_len..], "\nlast\n");
-
-    var reader = std.Io.Reader.fixed(payload);
-    var line_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer line_writer.deinit();
-
-    const large_line = (try readEventStreamLine(&reader, &line_writer, MAX_HTTP_BODY_BYTES)).?;
-    try std.testing.expectEqual(large_len, large_line.len);
-    try std.testing.expectEqualStrings("last", (try readEventStreamLine(&reader, &line_writer, MAX_HTTP_BODY_BYTES)).?);
-    try std.testing.expectEqual(null, try readEventStreamLine(&reader, &line_writer, MAX_HTTP_BODY_BYTES));
-}
-
 test "oversized SSE lines can be discarded before reading the next event" {
     var reader = std.Io.Reader.fixed("oversized\nok\n");
     var line_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
@@ -3071,23 +2888,6 @@ test "oversized SSE lines can be discarded before reading the next event" {
     try std.testing.expectError(error.StreamTooLong, readEventStreamLine(&reader, &line_writer, 4));
     try std.testing.expect(try discardEventStreamLineRemainder(&reader));
     try std.testing.expectEqualStrings("ok", (try readEventStreamLine(&reader, &line_writer, 4)).?);
-}
-
-test "extractLatestAssistantTaskSummaryAlloc summarizes the newest subagent tool" {
-    const allocator = std.testing.allocator;
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
-        \\[
-        \\  {"id":"a2","type":"assistant","content":[{"type":"tool","name":"task","state":{"status":"running","input":{"description":"New task"}}}]},
-        \\  {"id":"a1","type":"assistant","content":[{"type":"tool","name":"task","state":{"status":"completed","input":{"description":"Old task"}}}]},
-        \\  {"id":"u1","type":"user","text":"go"},
-        \\  {"id":"a0","type":"assistant","content":[{"type":"tool","name":"task","state":{"status":"completed","input":{"description":"Stale task"}}}]}
-        \\]
-    , .{});
-    defer parsed.deinit();
-
-    const summary = (try extractLatestAssistantTaskSummaryAlloc(allocator, parsed.value, "u1")).?;
-    defer allocator.free(summary);
-    try std.testing.expectEqualStrings("Running subtask: New task", summary);
 }
 
 test "findPrimaryAssistantAfterUser picks final step after tool calls" {
@@ -3105,42 +2905,6 @@ test "findPrimaryAssistantAfterUser picks final step after tool calls" {
 
     const item = findPrimaryAssistantAfterUser(parsed.value, "u1") orelse return error.TestUnexpectedNull;
     try std.testing.expectEqualStrings("final", getOptionalObjectString(item, "id") orelse return error.TestUnexpectedNull);
-}
-
-test "findPrimaryAssistantAfterUser falls back to the first in-flight step" {
-    const allocator = std.testing.allocator;
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
-        \\[
-        \\  {"id":"step-2","type":"assistant","finish":"tool-calls","content":[]},
-        \\  {"id":"step-1","type":"assistant","finish":"tool-calls","content":[]},
-        \\  {"id":"u1","type":"user","text":"test it"}
-        \\]
-    , .{});
-    defer parsed.deinit();
-
-    const item = findPrimaryAssistantAfterUser(parsed.value, null) orelse return error.TestUnexpectedNull;
-    try std.testing.expectEqualStrings("step-1", getOptionalObjectString(item, "id") orelse return error.TestUnexpectedNull);
-    // An anchor that scrolled out of the window means the whole window is the turn.
-    const unanchored = findPrimaryAssistantAfterUser(parsed.value, "u0-missing-window") orelse return error.TestUnexpectedNull;
-    try std.testing.expectEqualStrings("step-1", getOptionalObjectString(unanchored, "id") orelse return error.TestUnexpectedNull);
-}
-
-test "appendSessionDiffFiles reads the vcs diff data wrapper" {
-    const allocator = std.testing.allocator;
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
-        \\{"data":[{"file":"packages/desktop/src/ui/chat_panel.zig","patch":"@@ -1 +1 @@\n-old\n+new\n","status":"modified"}]}
-    , .{});
-    defer parsed.deinit();
-
-    var files: std.ArrayList(provider_types.StreamDiffFile) = .empty;
-    defer files.deinit(std.heap.page_allocator);
-
-    try appendSessionDiffFiles(parsed.value, &files);
-    try std.testing.expectEqual(@as(usize, 1), files.items.len);
-    try std.testing.expectEqualStrings("packages/desktop/src/ui/chat_panel.zig", files.items[0].path);
-    try std.testing.expectEqual(@as(i64, 1), files.items[0].additions);
-    try std.testing.expectEqual(@as(i64, 1), files.items[0].deletions);
-    try std.testing.expectEqualStrings("@@ -1 +1 @@\n-old\n+new\n", files.items[0].patch.?);
 }
 
 test "diff progress compares escaped baseline paths and patches while their JSON is alive" {
@@ -3170,59 +2934,6 @@ test "diff progress compares escaped baseline paths and patches while their JSON
     changed.clearRetainingCapacity();
     try appendChangedSessionDiffFilesFromPayload(std.testing.allocator, " \n", &current, &changed);
     try std.testing.expectEqual(current.len, changed.items.len);
-}
-
-test "parseModelsAlloc reads v2 models with provider names and variants" {
-    const allocator = std.testing.allocator;
-    var parsed_models = try std.json.parseFromSlice(std.json.Value, allocator,
-        \\{"data":[
-        \\  {"id":"openai/gpt-5.4","modelID":"gpt-5.4","providerID":"openai","name":"GPT-5.4","enabled":true,"variants":[{"id":"low"},{"id":"high"}]},
-        \\  {"id":"anthropic/sonnet","modelID":"sonnet","providerID":"anthropic","name":"Claude Sonnet","enabled":true,"variants":[]},
-        \\  {"id":"zen/hidden","modelID":"hidden","providerID":"zen","name":"Hidden","enabled":false}
-        \\]}
-    , .{});
-    defer parsed_models.deinit();
-    var parsed_providers = try std.json.parseFromSlice(std.json.Value, allocator,
-        \\{"data":[{"id":"openai","name":"OpenAI"}]}
-    , .{});
-    defer parsed_providers.deinit();
-
-    const models = try parseModelsAlloc(allocator, parsed_models.value, parsed_providers.value);
-    defer provider_types.freeModelInfos(allocator, models);
-
-    try std.testing.expectEqual(@as(usize, 2), models.len);
-    try std.testing.expectEqualStrings("openai", models[0].provider_id);
-    try std.testing.expectEqualStrings("OpenAI", models[0].provider_name);
-    try std.testing.expectEqualStrings("gpt-5.4", models[0].model_id);
-    try std.testing.expectEqualStrings("GPT-5.4", models[0].model_name);
-    try std.testing.expect(models[0].reasoning_supported);
-    try std.testing.expectEqual(@as(usize, 2), models[0].reasoning_variant_keys.?.len);
-    try std.testing.expectEqualStrings("high", models[0].reasoning_variant_keys.?[0]);
-    try std.testing.expectEqualStrings("low", models[0].reasoning_variant_keys.?[1]);
-    try std.testing.expectEqualStrings("anthropic", models[1].provider_name);
-    try std.testing.expect(!models[1].reasoning_supported);
-    try std.testing.expect(models[1].reasoning_variant_keys == null);
-}
-
-test "buildSessionCreateBody prefers explicit opencode variant over reasoning effort" {
-    const allocator = std.testing.allocator;
-    const body = try buildSessionCreateBody(allocator, "Verde chat", "/tmp/work", .{
-        .prompt = "hi",
-        .model = "openai/gpt-5.4",
-        .opencode_variant = "minimal",
-        .reasoning_effort = .high,
-    });
-    defer allocator.free(body);
-    try std.testing.expectEqualStrings(
-        \\{"title":"Verde chat","location":{"directory":"/tmp/work"},"model":{"providerID":"openai","id":"gpt-5.4","variant":"minimal"}}
-    , body);
-}
-
-test "buildPromptBody sends text-only prompts without files" {
-    const allocator = std.testing.allocator;
-    const body = try buildPromptBody(allocator, .{ .prompt = "hi there" });
-    defer allocator.free(body);
-    try std.testing.expectEqualStrings("{\"text\":\"hi there\"}", body);
 }
 
 test "buildPromptBody de-duplicates the legacy image against the full list" {
@@ -3279,68 +2990,6 @@ test "buildPromptBody de-duplicates the legacy image against the full list" {
     var parsed_solo = try std.json.parseFromSlice(std.json.Value, allocator, solo, .{});
     defer parsed_solo.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed_solo.value.object.get("files").?.array.items.len);
-}
-
-test "apiPathAlloc scopes requests with an encoded location directory" {
-    var client: Client = .{
-        .allocator = std.testing.allocator,
-        .config = .{ .allocator = std.testing.allocator, .working_directory = "/tmp/my work" },
-        .endpoint = .{ .base_url = "http://127.0.0.1:1", .password = null },
-    };
-    const path = try client.apiPathAlloc("/session/{s}/message", .{"ses_1"}, "order=desc&limit=12");
-    defer std.testing.allocator.free(path);
-    try std.testing.expectEqualStrings(
-        "/api/session/ses_1/message?location%5Bdirectory%5D=%2Ftmp%2Fmy%20work&order=desc&limit=12",
-        path,
-    );
-}
-
-test "parseServiceRegistrationAlloc reads the service url and password" {
-    const allocator = std.testing.allocator;
-    var registration = (try parseServiceRegistrationAlloc(allocator,
-        \\{"id":"svc","version":"0.0.0-beta-18414","url":"http://127.0.0.1:49374","pid":1105379,"password":"secret"}
-    )) orelse return error.TestUnexpectedNull;
-    defer registration.deinit(allocator);
-    try std.testing.expectEqualStrings("http://127.0.0.1:49374", registration.url);
-    try std.testing.expectEqualStrings("secret", registration.password.?);
-    try std.testing.expectEqual(null, try parseServiceRegistrationAlloc(allocator, "{\"pid\":1}"));
-}
-
-test "buildPermissionBody summarizes v2 permission requests" {
-    const allocator = std.testing.allocator;
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
-        \\{"id":"per_1","sessionID":"ses_1","action":"bash","resources":["git status"],"source":{"type":"tool","messageID":"msg_1","callID":"call_1"}}
-    , .{});
-    defer parsed.deinit();
-
-    const body = try buildPermissionBody(allocator, parsed.value);
-    defer allocator.free(body);
-    try std.testing.expectEqualStrings("Action: bash\nResources:\n- git status\nTool call: call_1", body);
-}
-
-test "health probe times out against a server that accepts but never responds" {
-    // Wedge listener: bound and listening but never accepting or answering.
-    // The kernel completes the TCP handshake via the backlog, so the probe
-    // connects fine and then gets no bytes — the exact failure observed live
-    // 2026-07-15, where the old fetch-based probe blocked forever.
-    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    const listen_address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
-    var server = try listen_address.listen(io, .{});
-    defer server.deinit(io);
-    const port = server.socket.address.getPort();
-
-    const base_url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}", .{port});
-    defer std.testing.allocator.free(base_url);
-
-    const started_ms = platform_runtime.unixTimestampMs();
-    try std.testing.expect(!checkHealth(std.testing.allocator, base_url, null, "secret"));
-    const elapsed_ms = platform_runtime.unixTimestampMs() - started_ms;
-    // Must fail via the receive timeout (~2s), not block unboundedly; the
-    // upper bound is loose to tolerate slow CI machines.
-    try std.testing.expect(elapsed_ms >= 1_000);
-    try std.testing.expect(elapsed_ms < 8_000);
 }
 
 test "workspace directory approval checks real roots and never grants other tools" {

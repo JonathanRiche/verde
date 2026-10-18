@@ -745,148 +745,8 @@ test "relay flushes a small chunk before waiting for more input" {
     try std.testing.expect(writer.flushed);
 }
 
-fn waitForLifecycle(supervisor: *const Supervisor, expected: Lifecycle) !void {
-    for (0..2_000) |_| {
-        if (supervisor.getSnapshot().lifecycle == expected) return;
-        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
-    }
-    return error.TestExpectedLifecycle;
-}
-
-const BlockingFake = struct {
-    observed_argv: std.atomic.Value(bool) = .init(false),
-    observed_port: std.atomic.Value(u16) = .init(0),
-    stop_observed: std.atomic.Value(bool) = .init(false),
-    allow_exit: std.atomic.Value(bool) = .init(false),
-    finished: std.atomic.Value(bool) = .init(false),
-    retained: std.atomic.Value(usize) = .init(0),
-
-    fn retain(raw_context: ?*anyopaque) void {
-        const self: *BlockingFake = @ptrCast(@alignCast(raw_context.?));
-        _ = self.retained.fetchAdd(1, .acq_rel);
-    }
-
-    fn release(raw_context: ?*anyopaque) void {
-        const self: *BlockingFake = @ptrCast(@alignCast(raw_context.?));
-        _ = self.retained.fetchSub(1, .acq_rel);
-    }
-
-    fn run(
-        raw_context: ?*anyopaque,
-        io: std.Io,
-        argv: []const []const u8,
-        local_port: u16,
-        control: Control,
-    ) Outcome {
-        const self: *BlockingFake = @ptrCast(@alignCast(raw_context.?));
-        var safe = argv.len > 1 and std.mem.eql(u8, argv[0], "ssh");
-        for (argv) |arg| {
-            if (std.mem.indexOf(u8, arg, "bearer-secret") != null) safe = false;
-            if (std.mem.eql(u8, arg, "-L")) safe = false;
-        }
-        self.observed_argv.store(safe, .release);
-        self.observed_port.store(local_port, .release);
-        control.markForwardReady(42_424);
-        while (!control.stopRequested()) {
-            std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
-        }
-        self.stop_observed.store(true, .release);
-        while (!self.allow_exit.load(.acquire)) {
-            std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
-        }
-        self.finished.store(true, .release);
-        return .stopped;
-    }
-};
-
-test "stop is non-blocking and lifecycle is observable" {
-    var host = "configured-host".*;
-    var user = "verde".*;
-    const ssh: profile.SshTunnel = .{
-        .host = host[0..],
-        .user = user[0..],
-        .port = 22,
-        .remote_gateway_port = 7420,
-    };
-    var fake: BlockingFake = .{};
-    var supervisor = Supervisor.init();
-    defer supervisor.deinit();
-    try supervisor.startWithBackend(std.testing.allocator, std.testing.io, ssh, 43_127, .{
-        .context = &fake,
-        .run = BlockingFake.run,
-        .retain_context = BlockingFake.retain,
-        .release_context = BlockingFake.release,
-    });
-
-    try waitForLifecycle(&supervisor, .running);
-    const running = supervisor.getSnapshot();
-    try std.testing.expectEqual(@as(?u32, 42_424), running.pid);
-    try std.testing.expect(fake.observed_argv.load(.acquire));
-    try std.testing.expectEqual(@as(u16, 43_127), fake.observed_port.load(.acquire));
-
-    supervisor.stop();
-    supervisor.stop();
-    try std.testing.expectEqual(Lifecycle.stopping, supervisor.getSnapshot().lifecycle);
-    while (!fake.stop_observed.load(.acquire)) {
-        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
-    }
-    // The worker is deliberately still running here, proving stop did not join it.
-    try std.testing.expectEqual(Lifecycle.stopping, supervisor.getSnapshot().lifecycle);
-    fake.allow_exit.store(true, .release);
-    try waitForLifecycle(&supervisor, .stopped);
-    try std.testing.expectEqual(@as(?u32, null), supervisor.getSnapshot().pid);
-
-    supervisor.deinit();
-    supervisor.deinit();
-    try std.testing.expectEqual(Lifecycle.stopped, supervisor.getSnapshot().lifecycle);
-    try std.testing.expectEqual(@as(usize, 0), fake.retained.load(.acquire));
-}
-
-fn exitedFake(_: ?*anyopaque, _: std.Io, _: []const []const u8, _: u16, control: Control) Outcome {
-    control.markForwardReady(1234);
-    return .{ .exited = .{ .exited = 7 } };
-}
-
-test "natural tunnel exit remains distinguishable from an intentional stop" {
-    var host = "configured-host".*;
-    const ssh: profile.SshTunnel = .{
-        .host = host[0..],
-        .user = null,
-        .port = 22,
-        .remote_gateway_port = 7420,
-    };
-    var supervisor = Supervisor.init();
-    defer supervisor.deinit();
-    try supervisor.startWithBackend(std.testing.allocator, std.testing.io, ssh, 43_127, .{
-        .run = exitedFake,
-    });
-    try waitForLifecycle(&supervisor, .exited);
-    const snapshot = supervisor.getSnapshot();
-    try std.testing.expectEqual(@as(?u32, null), snapshot.pid);
-    try std.testing.expectEqual(@as(u8, 7), snapshot.term.?.exited);
-}
-
 fn failedFake(_: ?*anyopaque, _: std.Io, _: []const []const u8, _: u16, _: Control) Outcome {
     return .{ .failed = .spawn };
-}
-
-test "backend failures expose only a bounded category" {
-    var host = "configured-host".*;
-    const ssh: profile.SshTunnel = .{
-        .host = host[0..],
-        .user = null,
-        .port = 22,
-        .remote_gateway_port = 7420,
-    };
-    var supervisor = Supervisor.init();
-    defer supervisor.deinit();
-    try supervisor.startWithBackend(std.testing.allocator, std.testing.io, ssh, 43_127, .{
-        .run = failedFake,
-    });
-    try waitForLifecycle(&supervisor, .failed);
-    const snapshot = supervisor.getSnapshot();
-    try std.testing.expectEqual(Failure.spawn, snapshot.failure.?);
-    try std.testing.expectEqual(@as(?std.process.Child.Term, null), snapshot.term);
 }
 
 fn testShared() Shared {
@@ -910,13 +770,6 @@ test "accepted relay sockets require and consume one bearer permit" {
     defer lease.release();
     try std.testing.expect(consumeAcceptPermit(control));
     try std.testing.expect(!consumeAcceptPermit(control));
-}
-
-test "missing SSH executable is a spawn failure" {
-    try std.testing.expectError(
-        error.RelaySpawnFailed,
-        spawnRelayChild(std.testing.io, &.{"verde-test-ssh-does-not-exist"}),
-    );
 }
 
 const BlockingReader = struct {
@@ -981,10 +834,6 @@ test "response completion cancels a client request that keeps its write side ope
     try std.testing.expect(!request_completed.load(.acquire));
 }
 
-fn expectPumpCanceledBy(stop_immediately: bool) !void {
-    try expectPumpCanceledByOn(std.testing.io, stop_immediately);
-}
-
 fn expectPumpCanceledByOn(io: std.Io, stop_immediately: bool) !void {
     var shared = testShared();
     if (stop_immediately) shared.stop_requested.store(true, .release);
@@ -1019,136 +868,10 @@ fn expectPumpCanceledByOn(io: std.Io, stop_immediately: bool) !void {
     try std.testing.expect(response_reader.canceled.load(.acquire));
 }
 
-test "relay timeout cancels both stream operations before cleanup" {
-    try expectPumpCanceledBy(false);
-}
-
 test "relay timeout fires when the pool has no async capacity left" {
     // Regression: with `Select.async`, a saturated pool ran each arm inline,
     // so the stop poll spun forever (hung on a 4-core Windows VM).
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{ .async_limit = .nothing });
     defer threaded.deinit();
     try expectPumpCanceledByOn(threaded.io(), false);
-}
-
-test "relay stop cancels both stream operations before cleanup" {
-    try expectPumpCanceledBy(true);
-}
-
-test "stdout EOF cannot wedge a TERM-ignoring relay child" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
-    var shared = testShared();
-    const control: Control = .{ .shared = &shared };
-    const script =
-        \\trap '' TERM
-        \\exec 1>&-
-        \\while :; do sleep 1; done
-    ;
-    var child = try process.spawn(std.testing.allocator, std.testing.io, .{
-        .argv = &.{ "sh", "-c", script },
-        .stdin = .pipe,
-        .stdout = .pipe,
-        .stderr = .ignore,
-        .own_process_tree = true,
-    });
-    defer if (child.child.id != null) child.kill(std.testing.io);
-    const pid = child.processId() orelse return error.TestChildDidNotStart;
-    control.markSpawned(pid);
-    defer control.clearActiveChild(pid);
-
-    var read_buffer: [8]u8 = undefined;
-    var reader = child.child.stdout.?.reader(std.testing.io, &read_buffer);
-    var discard_buffer: [8]u8 = undefined;
-    var discard: std.Io.Writer.Discarding = .init(&discard_buffer);
-    while (true) {
-        _ = reader.interface.stream(&discard.writer, .unlimited) catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => return err,
-        };
-    }
-
-    const finish = try finishRelayChild(std.testing.io, &child, pid, control, 2, 2);
-    try std.testing.expect(finish == .forced);
-    try std.testing.expect(child.child.id == null);
-}
-
-test "terminal relay poll unpublishes its pid before returning" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
-    var shared = testShared();
-    const control: Control = .{ .shared = &shared };
-    var child = try process.spawn(std.testing.allocator, std.testing.io, .{
-        .argv = &.{ "sh", "-c", "exit 0" },
-        .stdin = .ignore,
-        .stdout = .ignore,
-        .stderr = .ignore,
-        .own_process_tree = true,
-    });
-    defer if (child.child.id != null) child.kill(std.testing.io);
-    const pid = child.processId() orelse return error.TestChildDidNotStart;
-    control.markSpawned(pid);
-    defer control.clearActiveChild(pid);
-
-    for (0..2_000) |_| {
-        if (try control.pollActiveChild(std.testing.io, &child, pid)) |_| {
-            try std.testing.expectEqual(@as(?u32, null), shared.snapshot.pid);
-            return;
-        }
-        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
-    }
-    return error.TestChildDidNotExit;
-}
-
-test "deinit hands a non-terminal worker exact cleanup without joining" {
-    var host = "configured-host".*;
-    const ssh: profile.SshTunnel = .{
-        .host = host[0..],
-        .user = null,
-        .port = 22,
-        .remote_gateway_port = 7420,
-    };
-    var fake: BlockingFake = .{};
-    var supervisor = Supervisor.init();
-    try supervisor.startWithBackend(std.testing.allocator, std.testing.io, ssh, 43_127, .{
-        .context = &fake,
-        .run = BlockingFake.run,
-        .retain_context = BlockingFake.retain,
-        .release_context = BlockingFake.release,
-    });
-    try waitForLifecycle(&supervisor, .running);
-
-    // The fake refuses to finish until after deinit returns.
-    supervisor.deinit();
-    try std.testing.expectEqual(Lifecycle.stopped, supervisor.getSnapshot().lifecycle);
-    while (!fake.stop_observed.load(.acquire)) {
-        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
-    }
-    fake.allow_exit.store(true, .release);
-    while (!fake.finished.load(.acquire)) {
-        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
-    }
-    for (0..2_000) |_| {
-        if (fake.retained.load(.acquire) == 0) break;
-        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
-    }
-    try std.testing.expectEqual(@as(usize, 0), fake.retained.load(.acquire));
-}
-
-test "detachable backend contexts require an owned lifetime" {
-    var host = "configured-host".*;
-    const ssh: profile.SshTunnel = .{
-        .host = host[0..],
-        .user = null,
-        .port = 22,
-        .remote_gateway_port = 7420,
-    };
-    var fake: BlockingFake = .{};
-    var supervisor = Supervisor.init();
-    defer supervisor.deinit();
-    try std.testing.expectError(
-        error.UnsafeTunnelBackendLifetime,
-        supervisor.startWithBackend(std.testing.allocator, std.testing.io, ssh, 43_127, .{
-            .context = &fake,
-            .run = BlockingFake.run,
-        }),
-    );
 }

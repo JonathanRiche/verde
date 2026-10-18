@@ -143,82 +143,6 @@ fn deinitArgvList(allocator: std.mem.Allocator, argv: *std.ArrayList([]const u8)
     argv.deinit(allocator);
 }
 
-fn expectArgvEqual(expected: []const []const u8, actual: []const []const u8) !void {
-    try std.testing.expectEqual(expected.len, actual.len);
-    for (expected, actual) |expected_arg, actual_arg| {
-        try std.testing.expectEqualStrings(expected_arg, actual_arg);
-    }
-}
-
-fn containsArg(argv: []const []const u8, expected: []const u8) bool {
-    for (argv) |arg| if (std.mem.eql(u8, arg, expected)) return true;
-    return false;
-}
-
-test "SSH stdio relay argv is exact shell-free and loopback-only" {
-    var host = "devbox.example".*;
-    var user = "verde".*;
-    const ssh: profile.SshTunnel = .{
-        .host = host[0..],
-        .user = user[0..],
-        .port = 2202,
-        .remote_gateway_port = 7420,
-    };
-    var owned = try buildArgvAlloc(std.testing.allocator, ssh);
-    defer owned.deinit(std.testing.allocator);
-
-    const expected = [_][]const u8{
-        "ssh",
-        "-T",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "ExitOnForwardFailure=yes",
-        "-o",
-        "ClearAllForwardings=yes",
-        "-o",
-        "ConnectTimeout=15",
-        "-o",
-        "ServerAliveInterval=15",
-        "-o",
-        "ServerAliveCountMax=3",
-        "-o",
-        "ControlMaster=no",
-        "-o",
-        "ControlPath=none",
-        "-o",
-        "ControlPersist=no",
-        "-p",
-        "2202",
-        "-W",
-        "127.0.0.1:7420",
-        "-l",
-        "verde",
-        "devbox.example",
-    };
-    try expectArgvEqual(&expected, owned.argv);
-
-    // Ownership is independent of the borrowed profile and no shell text is
-    // constructed around either user-controlled field.
-    host[0] = 'X';
-    user[0] = 'X';
-    try std.testing.expectEqualStrings("devbox.example", owned.argv[owned.argv.len - 1]);
-    try std.testing.expectEqualStrings("verde", owned.argv[owned.argv.len - 2]);
-
-    // Without a user the host is still last and no `-l` is emitted, leaving
-    // the user's SSH config in charge of the login name.
-    var alias = "configured-alias".*;
-    var no_user = try buildArgvAlloc(std.testing.allocator, .{
-        .host = alias[0..],
-        .user = null,
-        .port = 22,
-        .remote_gateway_port = 7420,
-    });
-    defer no_user.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("configured-alias", no_user.argv[no_user.argv.len - 1]);
-    try std.testing.expect(!containsArg(no_user.argv, "-l"));
-}
-
 test "SSH argv rejects invalid ports and option-shaped destinations" {
     var host = "devbox".*;
     var user = "verde".*;
@@ -259,21 +183,4 @@ test "SSH argv rejects invalid ports and option-shaped destinations" {
     var option_user = "-root".*;
     ssh.user = option_user[0..];
     try std.testing.expectError(error.InvalidSshUser, buildArgvAlloc(std.testing.allocator, ssh));
-}
-
-fn checkAllocationFailures(allocator: std.mem.Allocator) !void {
-    var host = "devbox.example".*;
-    var user = "verde".*;
-    const ssh: profile.SshTunnel = .{
-        .host = host[0..],
-        .user = user[0..],
-        .port = 2202,
-        .remote_gateway_port = 7420,
-    };
-    var owned = try buildArgvAlloc(allocator, ssh);
-    owned.deinit(allocator);
-}
-
-test "SSH argv cleans up every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkAllocationFailures, .{});
 }

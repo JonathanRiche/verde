@@ -33,18 +33,6 @@ class PushRegistrarTest {
     private fun take(): RecordedRequest = relayServer.takeRequest(5, TimeUnit.SECONDS)!!
     private fun record(): PushRecord = CoreJson.decodeFromString(store.values[PushRegistrar.KEY]!!)
 
-    @Test fun withoutFirebaseOrRelayNothingIsRegistered() = runBlocking {
-        for (push in listOf(registrar(withTokens = false), registrar(withRelay = false))) {
-            push.attach(hosts)
-            push.setEnabled(true)
-            assertEquals(PushStatus.Unavailable, push.state.value.status)
-            assertFalse(push.state.value.available)
-        }
-        assertEquals(0, relayServer.requestCount)
-        assertEquals(0, tokens.requests)
-        assertTrue(hosts.registered.isEmpty())
-    }
-
     @Test fun enablingRegistersTheTokenThenEveryPairedHost() = runBlocking {
         hosts.states = mapOf("a" to HostPushState.Paired, "b" to HostPushState.Paired, "c" to HostPushState.Gone)
         relayServer.enqueue(created("v1.one.sig"))

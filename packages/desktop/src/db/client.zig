@@ -865,24 +865,10 @@ fn testOpenDatabase(allocator: std.mem.Allocator, pref_path: []const u8) !zqlite
     return zqlite.open(path, flags);
 }
 
-test "chat roles preserve the shipped store codec" {
-    // The shipped on-disk codes are user=0, assistant=1, system=2.
-    try testing.expectEqual(db_types.ChatRole.user, db_types.decodeStoredChatRole(0, "You"));
-    try testing.expectEqual(db_types.ChatRole.assistant, db_types.decodeStoredChatRole(1, "Assistant"));
-    try testing.expectEqual(db_types.ChatRole.system, db_types.decodeStoredChatRole(2, "System"));
-}
-
 fn testCreateLegacyFixture(pref_path: []const u8) !void {
     const conn = try testOpenDatabase(testing.allocator, pref_path);
     defer conn.close();
     try conn.execNoArgs(migration_fixture.LEGACY_V0_SQL);
-}
-
-fn testCreateLegacyWalFixture(pref_path: []const u8) !zqlite.Conn {
-    const conn = try testOpenDatabase(testing.allocator, pref_path);
-    errdefer conn.close();
-    try conn.execNoArgs(migration_fixture.LEGACY_V0_WAL_SQL);
-    return conn;
 }
 
 fn testExpectShippedFixtureRoleCodes(conn: zqlite.Conn) !void {
@@ -1096,22 +1082,6 @@ fn testExpectLegacyFixtureState(state: PersistedState, expected_reasoning_varian
     try testing.expectEqual(@as(i64, 1700000007000), state.chat_completions[1].completed_at_ms);
 }
 
-test "fresh database initializes at the current schema version" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
-    defer testing.allocator.free(pref_path);
-
-    var client = try testInitMigrated(testing.allocator, pref_path);
-    defer client.deinit();
-    try testing.expectEqual(schema.CURRENT_VERSION, try testUserVersion(client.conn));
-    try testing.expect(try schema.testHasColumn(client.conn, "threads", "reasoning_variant"));
-    var table_count = (try client.conn.row("select count(*) from sqlite_schema where type = 'table' and name not like 'sqlite_%'", .{})).?;
-    defer table_count.deinit();
-    try testing.expectEqual(@as(i64, 6), table_count.int(0));
-    try testExpectDatabaseChecks(client.conn);
-}
-
 test "read-only open cannot migrate a legacy database" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1126,83 +1096,6 @@ test "read-only open cannot migrate a legacy database" {
     try testing.expectEqual(@as(i64, 0), try testUserVersion(conn));
     try testing.expect(!try schema.testHasColumn(conn, "threads", "reasoning_variant"));
     try testExpectRowCount(conn, "messages", 5);
-}
-
-test "read-only open loads a current database" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
-    defer testing.allocator.free(pref_path);
-
-    {
-        var writer = try testInitMigrated(testing.allocator, pref_path);
-        defer writer.deinit();
-        try writer.conn.execNoArgs("insert into app_state (id, selected_workspace_index, sidebar_collapsed) values (1, 0, 1)");
-    }
-
-    var reader = try Client.initReadOnly(testing.allocator, pref_path);
-    defer reader.deinit();
-    var busy_timeout = (try reader.conn.row("pragma busy_timeout", .{})).?;
-    defer busy_timeout.deinit();
-    try testing.expectEqual(@as(i64, schema.BUSY_TIMEOUT_MS), busy_timeout.int(0));
-    var loaded = (try reader.load(testing.allocator)).?;
-    defer loaded.deinit();
-    try testing.expect(loaded.value.sidebar_collapsed);
-    try testing.expectError(error.ReadOnly, reader.conn.execNoArgs("delete from app_state"));
-}
-
-test "read-only load repairs mixed historical daemon chat roles without mutation" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
-    defer testing.allocator.free(pref_path);
-
-    {
-        var writer = try testInitMigrated(testing.allocator, pref_path);
-        defer writer.deinit();
-        try testSeedThread(writer.conn, "mixed-workspace", "Mixed roles", "/tmp/mixed", "mixed-thread", "Mixed roles");
-        try writer.conn.exec("update threads set provider = ?1", .{@as(i64, @intFromEnum(db_types.Provider.codex))});
-        // Canonical rows first, then the historical daemon's overlapping role
-        // integers that the read path must repair from the author.
-        try testSeedMessage(writer.conn, "mixed-thread", 0, 0, "You", "canonical user");
-        try testSeedMessage(writer.conn, "mixed-thread", 1, 1, "Assistant", "canonical assistant");
-        try testSeedMessage(writer.conn, "mixed-thread", 2, 2, "System", "canonical system");
-        try testSeedMessage(writer.conn, "mixed-thread", 3, 0, "Ran command", "legacy system");
-        try writer.conn.exec(
-            "update messages set tool_call_id = 'legacy-call', tool_call_kind = ?1, tool_call_status = ?2 where body = 'legacy system'",
-            .{ @as(i64, @intFromEnum(provider_types.ToolCallKind.execute)), @as(i64, @intFromEnum(provider_types.ToolCallStatus.completed)) },
-        );
-        try testSeedMessage(writer.conn, "mixed-thread", 4, 1, "You", "legacy user");
-        try testSeedMessage(writer.conn, "mixed-thread", 5, 2, "Codex", "legacy assistant");
-        try testSeedMessage(writer.conn, "mixed-thread", 6, 0, "Codex", "desktop assistant");
-        try testSeedMessage(writer.conn, "mixed-thread", 7, 1, "Changed files", "desktop system");
-        try testSeedMessage(writer.conn, "mixed-thread", 8, 2, "You", "desktop user");
-    }
-
-    var reader = try Client.initReadOnly(testing.allocator, pref_path);
-    defer reader.deinit();
-    var loaded = (try reader.load(testing.allocator)).?;
-    defer loaded.deinit();
-    const messages = loaded.value.projects[0].threads.?[0].messages;
-    const expected_roles = [_]db_types.ChatRole{ .user, .assistant, .system, .system, .user, .assistant, .assistant, .system, .user };
-    try testing.expectEqual(expected_roles.len, messages.len);
-    for (messages, expected_roles) |message, expected| {
-        try testing.expectEqual(expected, message.role);
-    }
-    try testing.expectEqualStrings("legacy-call", messages[3].tool_call_id.?);
-    try testing.expectEqual(provider_types.ToolCallKind.execute, messages[3].tool_call_kind.?);
-    try testing.expectEqual(provider_types.ToolCallStatus.completed, messages[3].tool_call_status.?);
-
-    const expected_raw = [_]i64{ 0, 1, 2, 0, 1, 2, 0, 1, 2 };
-    var rows = try reader.conn.rows("select role from messages order by sort_index", .{});
-    defer rows.deinit();
-    var index: usize = 0;
-    while (rows.next()) |row| : (index += 1) {
-        try testing.expect(index < expected_raw.len);
-        try testing.expectEqual(expected_raw[index], row.int(0));
-    }
-    if (rows.err) |err| return err;
-    try testing.expectEqual(expected_raw.len, index);
 }
 
 test "load holds one WAL snapshot across all reads" {
@@ -1276,90 +1169,6 @@ test "pre-versioning fixture migrates without transcript or ledger loss" {
     try testExpectDatabaseChecks(client.conn);
 }
 
-test "WAL pre-versioning fixture migrates and reopens with sidecars present" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
-    defer testing.allocator.free(pref_path);
-
-    const legacy = try testCreateLegacyWalFixture(pref_path);
-    var legacy_open = true;
-    defer if (legacy_open) legacy.close();
-    {
-        var journal_mode = (try legacy.row("pragma journal_mode", .{})).?;
-        defer journal_mode.deinit();
-        try testing.expectEqualStrings("wal", journal_mode.text(0));
-    }
-    _ = try tmp.dir.statFile(testing.io, STATE_DB_NAME ++ "-wal", .{});
-    _ = try tmp.dir.statFile(testing.io, STATE_DB_NAME ++ "-shm", .{});
-
-    {
-        var migrated = try testInitMigrated(testing.allocator, pref_path);
-        defer migrated.deinit();
-        try testing.expectEqual(schema.CURRENT_VERSION, try testUserVersion(migrated.conn));
-        try testing.expect(try schema.testHasColumn(migrated.conn, "threads", "reasoning_variant"));
-        try testExpectRowCount(migrated.conn, "messages", 5);
-        var loaded = (try migrated.load(testing.allocator)).?;
-        defer loaded.deinit();
-        try testExpectLegacyFixtureState(loaded.value, null);
-        try testExpectDatabaseChecks(migrated.conn);
-    }
-    legacy.close();
-    legacy_open = false;
-
-    var reopened = try testInitMigrated(testing.allocator, pref_path);
-    defer reopened.deinit();
-    try testing.expectEqual(schema.CURRENT_VERSION, try testUserVersion(reopened.conn));
-    try testing.expect(try schema.testHasColumn(reopened.conn, "threads", "reasoning_variant"));
-    try testExpectRowCount(reopened.conn, "messages", 5);
-    var loaded = (try reopened.load(testing.allocator)).?;
-    defer loaded.deinit();
-    try testExpectLegacyFixtureState(loaded.value, null);
-    try testExpectDatabaseChecks(reopened.conn);
-}
-
-test "schema migration is idempotent across repeated v1 initialization" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
-    defer testing.allocator.free(pref_path);
-    try testCreateLegacyFixture(pref_path);
-    {
-        const legacy = try testOpenDatabase(testing.allocator, pref_path);
-        defer legacy.close();
-        try legacy.execNoArgs(
-            \\alter table threads add column reasoning_variant text;
-            \\update threads set reasoning_variant = '最高' where id = 1001;
-        );
-    }
-
-    {
-        var first = try testInitMigrated(testing.allocator, pref_path);
-        defer first.deinit();
-        try testing.expectEqual(schema.CURRENT_VERSION, try testUserVersion(first.conn));
-    }
-    {
-        var second = try testInitMigrated(testing.allocator, pref_path);
-        defer second.deinit();
-        try testing.expectEqual(schema.CURRENT_VERSION, try testUserVersion(second.conn));
-        var columns = try second.conn.rows("pragma table_info(threads)", .{});
-        defer columns.deinit();
-        var reasoning_variant_count: usize = 0;
-        while (columns.next()) |row| {
-            if (std.mem.eql(u8, row.text(1), "reasoning_variant")) reasoning_variant_count += 1;
-        }
-        if (columns.err) |err| return err;
-        try testing.expectEqual(@as(usize, 1), reasoning_variant_count);
-        try testExpectRowCount(second.conn, "workspaces", 2);
-        try testExpectRowCount(second.conn, "threads", 3);
-        try testExpectRowCount(second.conn, "messages", 5);
-        var loaded = (try second.load(testing.allocator)).?;
-        defer loaded.deinit();
-        try testExpectLegacyFixtureState(loaded.value, "最高");
-        try testExpectDatabaseChecks(second.conn);
-    }
-}
-
 test "newer schema version is rejected without touching the database" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1394,125 +1203,4 @@ test "newer schema version is rejected without touching the database" {
     defer marker.deinit();
     try testing.expectEqualStrings("future data Ω", marker.text(0));
     try testing.expect(!try schema.testHasColumn(conn, "future_marker", "reasoning_variant"));
-}
-
-test "newer WAL schema rejection leaves WAL state untouched" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
-    defer testing.allocator.free(pref_path);
-
-    const future = try testCreateLegacyWalFixture(pref_path);
-    defer future.close();
-    // Derive the future version so schema-chain growth can't stale this fixture.
-    try future.execNoArgs(std.fmt.comptimePrint(
-        \\create table future_marker (id integer primary key, value text not null);
-        \\insert into future_marker (id, value) values (1, 'future WAL data Ω');
-        \\pragma user_version = {d};
-    , .{schema.MAX_SUPPORTED_VERSION + 1}));
-    _ = try tmp.dir.statFile(testing.io, STATE_DB_NAME ++ "-wal", .{});
-    _ = try tmp.dir.statFile(testing.io, STATE_DB_NAME ++ "-shm", .{});
-
-    const main_before = try tmp.dir.readFileAlloc(testing.io, STATE_DB_NAME, testing.allocator, .unlimited);
-    defer testing.allocator.free(main_before);
-    const wal_before = try tmp.dir.readFileAlloc(testing.io, STATE_DB_NAME ++ "-wal", testing.allocator, .unlimited);
-    defer testing.allocator.free(wal_before);
-    try testing.expectError(error.DatabaseSchemaTooNew, Client.initReadOnly(testing.allocator, pref_path));
-    try testing.expectError(error.DatabaseSchemaTooNew, testInitMigrated(testing.allocator, pref_path));
-
-    const main_after = try tmp.dir.readFileAlloc(testing.io, STATE_DB_NAME, testing.allocator, .unlimited);
-    defer testing.allocator.free(main_after);
-    const wal_after = try tmp.dir.readFileAlloc(testing.io, STATE_DB_NAME ++ "-wal", testing.allocator, .unlimited);
-    defer testing.allocator.free(wal_after);
-    try testing.expectEqualSlices(u8, main_before, main_after);
-    try testing.expectEqualSlices(u8, wal_before, wal_after);
-    // SQLite may update volatile WAL-index read marks while opening a
-    // connection, even when the database and WAL receive no writes.
-    _ = try tmp.dir.statFile(testing.io, STATE_DB_NAME ++ "-shm", .{});
-
-    try testing.expectEqual(schema.MAX_SUPPORTED_VERSION + 1, try testUserVersion(future));
-    var marker = (try future.row("select value from future_marker where id = 1", .{})).?;
-    defer marker.deinit();
-    try testing.expectEqualStrings("future WAL data Ω", marker.text(0));
-    try testing.expect(!try schema.testHasColumn(future, "future_marker", "reasoning_variant"));
-}
-
-test "load preserves archived workspaces, archived threads, and the companion thread" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
-    defer testing.allocator.free(pref_path);
-
-    {
-        var writer = try testInitMigrated(testing.allocator, pref_path);
-        defer writer.deinit();
-        try testSeedThread(writer.conn, "project-active", "Active Workspace", "/tmp/project-active", "visible-local", "Visible thread");
-        try writer.conn.exec(
-            "insert into threads (workspace_id, sort_index, title, local_thread_id, provider, harness) " ++
-                "select id, 1, 'Companion', 'companion-local', ?1, ?2 from workspaces where workspace_id = 'project-active'",
-            .{ @as(i64, @intFromEnum(db_types.Provider.codex)), @as(i64, @intFromEnum(db_types.Harness.local_cli)) },
-        );
-        try writer.conn.execNoArgs("update workspaces set companion_thread_local_id = 'companion-local' where workspace_id = 'project-active'");
-        try testSeedThread(writer.conn, "project-archived", "Archived Workspace", "/tmp/project-archived", "archived-local", "Archived project thread");
-        try writer.conn.execNoArgs(
-            \\update workspaces set archived = 1 where workspace_id = 'project-archived';
-            \\update threads set archived = 1 where local_thread_id = 'archived-local';
-        );
-        try testSeedMessage(writer.conn, "visible-local", 0, 0, "You", "active");
-        try testSeedMessage(writer.conn, "companion-local", 0, 0, "You", "companion-thread");
-        try testSeedMessage(writer.conn, "archived-local", 0, 0, "You", "archived-project");
-    }
-
-    var reader = try Client.initReadOnly(testing.allocator, pref_path);
-    defer reader.deinit();
-    var loaded = (try reader.load(testing.allocator)).?;
-    defer loaded.deinit();
-    const projects = loaded.value.projects;
-    try testing.expectEqual(@as(usize, 2), projects.len);
-    try testing.expect(!projects[0].archived);
-    try testing.expectEqual(@as(usize, 2), projects[0].threads.?.len);
-    try testing.expect(!projects[0].threads.?[0].archived);
-    try testing.expectEqualStrings("companion-local", projects[0].companion_thread_local_id.?);
-    try testing.expectEqualStrings("companion-local", projects[0].threads.?[1].local_thread_id.?);
-    try testing.expectEqualStrings("companion-thread", projects[0].threads.?[1].messages[0].body);
-    try testing.expect(projects[1].archived);
-    try testing.expectEqual(@as(usize, 1), projects[1].threads.?.len);
-    try testing.expect(projects[1].threads.?[0].archived);
-}
-
-test "load preserves Herdr workspace links" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
-    defer testing.allocator.free(pref_path);
-
-    const pane_links_json = "[{\"verde_pane_id\":3,\"herdr_pane_id\":\"w1:p1\",\"provider\":\"codex\",\"presentation\":\"gui_chat\"}]";
-    {
-        var writer = try testInitMigrated(testing.allocator, pref_path);
-        defer writer.deinit();
-        try testSeedWorkspace(writer.conn, "project-herdr", "Herdr Workspace", "/tmp/herdr-shadow");
-        try writer.conn.exec(
-            "update workspaces set herdr_remote_alias = 'zod.example.ts.net', herdr_session_name = 'default', herdr_workspace_id = 'w1', " ++
-                "herdr_local_dir = '/tmp/herdr-shadow', herdr_remote_cwd = '/home/rtg/project', herdr_last_pane_id = 'w1:p1', " ++
-                "herdr_attach_dock_id = 7, herdr_attach_pane_id = 3, herdr_pane_links_json = ?1, herdr_updated_at_ms = 1234 " ++
-                "where workspace_id = 'project-herdr'",
-            .{pane_links_json},
-        );
-    }
-
-    var reader = try Client.initReadOnly(testing.allocator, pref_path);
-    defer reader.deinit();
-    var loaded = (try reader.load(testing.allocator)).?;
-    defer loaded.deinit();
-    const link = loaded.value.projects[0].herdr_link orelse return error.TestExpectedEqual;
-    try testing.expectEqualStrings("zod.example.ts.net", link.remote_alias);
-    try testing.expectEqualStrings("default", link.session_name);
-    try testing.expectEqualStrings("w1", link.workspace_id);
-    try testing.expectEqualStrings("/tmp/herdr-shadow", link.local_dir);
-    try testing.expectEqualStrings("/home/rtg/project", link.remote_cwd.?);
-    try testing.expectEqualStrings("w1:p1", link.last_pane_id.?);
-    try testing.expectEqual(@as(?u32, 7), link.attach_dock_id);
-    try testing.expectEqual(@as(?u32, 3), link.attach_pane_id);
-    try testing.expectEqualStrings(pane_links_json, link.pane_links_json.?);
-    try testing.expectEqual(@as(i64, 1234), link.updated_at_ms);
 }

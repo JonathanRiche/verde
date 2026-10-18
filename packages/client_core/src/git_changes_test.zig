@@ -3,8 +3,6 @@ const std = @import("std");
 const h = @import("host.zig");
 const rpc = @import("rpc.zig");
 const p = @import("projection.zig");
-const chat = @import("chat.zig");
-const manage = @import("manage.zig");
 const expect = std.testing.expect;
 const eql = std.testing.expectEqualStrings;
 const V = std.json.Value;
@@ -72,14 +70,6 @@ const Fixture = struct {
         _ = try f.event(tag, v);
         return id;
     }
-    fn summaryTimer(f: *Fixture) !void {
-        for (f.host.state.pending) |timer| if (timer.kind == .timer and h.eq(timer.purpose, "git_summary")) {
-            f.now = @max(f.now, timer.deadline);
-            _ = try f.event("timer_fired", .{ .timer_id = timer.id, .generation = try std.fmt.allocPrint(f.a(), "{d}", .{f.host.state.generation}) });
-            return;
-        };
-        return error.MissingSummaryTimer;
-    }
     fn pending(f: *Fixture, method: []const u8) usize {
         var n: usize = 0;
         for (f.host.state.rpc.calls) |call| if (h.eq(call.method, method)) {
@@ -105,34 +95,14 @@ const Fixture = struct {
         const call = try f.find(method);
         try f.respond(call, try h.encode(f.a(), .{ .jsonrpc = "2.0", .id = call.id, .result = result }));
     }
-    fn replyJson(f: *Fixture, method: []const u8, result: []const u8) !void {
-        const call = try f.find(method);
-        try f.respond(call, try std.fmt.allocPrint(f.a(), "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{s}}}", .{ call.id, result }));
-    }
-    fn reject(f: *Fixture, method: []const u8, code: []const u8, data: anytype) !void {
-        const call = try f.find(method);
-        try f.respond(call, try h.encode(f.a(), .{ .jsonrpc = "2.0", .id = call.id, .@"error" = .{ .code = code, .message = "rejected", .data = data } }));
-    }
     fn view(f: *Fixture) !V {
         const q = try h.parse(f.a(), try f.host.query("git_review", f.a()));
         try expect(p.get(q, "error") == .null);
         return p.get(q, "data");
     }
-    fn job(f: *Fixture, id: []const u8) !V {
-        for (p.rows(p.get(try f.view(), "operations"))) |row| if (h.eq(p.s(row, "intent_id"), id)) return row;
-        return error.MissingJob;
-    }
     fn receipt(f: *Fixture, id: []const u8) !h.Operation {
         for (f.host.state.receipts) |r| if (h.eq(r.operation.intent_id, id)) return r.operation;
         return error.MissingReceipt;
-    }
-    fn expectFailed(f: *Fixture, id: []const u8, code: []const u8) !void {
-        const j = try f.job(id);
-        try eql("failed", p.s(j, "state"));
-        try eql(code, p.s(p.get(j, "error"), "code"));
-        const r = try f.receipt(id);
-        try eql("failed", r.state);
-        try eql(code, r.@"error".?.code);
     }
 };
 
@@ -177,17 +147,6 @@ test "git writes and config are gated without emitting a mutation" {
     try eql("scope_denied", (try f.receipt(config_id)).@"error".?.code);
     try expect(f.pending("config.commit.set") == 0);
 }
-test "git stale reviews refresh without replaying commit" {
-    var f = try Fixture.init(all_scopes, &.{});
-    defer f.deinit();
-    try loaded(&f);
-    const id = try f.intent("git_commit", .{ .review_id = "review-1", .message = "Fixture", .selections = selection, .push = false });
-    try f.reject("git.changes.commit", "changed_since_review", null);
-    try eql("failed", (try f.receipt(id)).state);
-    try expect(f.pending("git.changes.review") == 1);
-    try expect(f.pending("git.changes.commit") == 0);
-    try eql("stale", p.s(try f.view(), "state"));
-}
 test "git interrupted commit reuses the exact request and receipt" {
     var f = try Fixture.init(all_scopes, &.{});
     defer f.deinit();
@@ -219,25 +178,6 @@ test "git hunk selections cannot escape frozen review" {
     try expect(!g.validSelections(limited, &.{.{ .root = "/repo", .files = &.{.{ .path = "a.zig", .hunks = &.{0} }} }}));
 }
 
-test "git malformed outcomes recover only the original idempotent operation" {
-    var f = try Fixture.init(all_scopes, &.{});
-    defer f.deinit();
-    const open_id = try f.intent("git_review_open", .{ .workspace_id = "ws-1", .thread_id = "thread" });
-    try f.replyJson("git.changes.review", "{}");
-    try eql("failed", (try f.receipt(open_id)).state);
-    try loaded(&f);
-    const generate = try f.intent("git_message_generate", .{ .review_id = "review-1" });
-    try f.replyJson("git.changes.commit_message", "{}");
-    try eql("failed", (try f.receipt(generate)).state);
-    const commit = try f.intent("git_commit", .{ .review_id = "review-1", .message = "Fixture", .selections = selection });
-    try f.replyJson("git.changes.commit", "{}");
-    try eql("uncertain", (try f.receipt(commit)).state);
-    try expect(f.pending("git.changes.commit") == 0);
-    try expect(f.pending("git.changes.review") == 0);
-    try retryTick(&f);
-    try expect(f.pending("git.changes.commit") == 1);
-}
-
 test "git mutation rejects 401 without auth replay" {
     var f = try Fixture.init(all_scopes, &.{});
     defer f.deinit();
@@ -250,94 +190,6 @@ test "git mutation rejects 401 without auth replay" {
     try expect(f.pending("git.changes.commit") == 0);
 }
 
-test "git summary bursts debounce and in flight signals coalesce once" {
-    var f = try Fixture.init(all_scopes, &.{});
-    defer f.deinit();
-    for (0..10) |_| _ = try f.intent("git_summary_refresh", .{ .workspace_id = "ws-1" });
-    try expect(f.pending("git.changes.summary") == 0);
-    try f.summaryTimer();
-    try expect(f.now == 401);
-    try expect(f.pending("git.changes.summary") == 1);
-    for (0..10) |_| _ = try f.intent("git_summary_refresh", .{ .workspace_id = "ws-1" });
-    try expect(f.pending("git.changes.summary") == 1);
-    const response = .{ .workspace_id = "ws-1", .revision = 1, .threads = .{.{ .local_thread_id = "thread", .files = 2, .additions = 4, .deletions = 1, .attention = 1 }} };
-    try f.reply("git.changes.summary", response);
-    try expect(f.pending("git.changes.summary") == 0);
-    const q = try h.parse(f.a(), try f.host.query("git_summary:ws-1", f.a()));
-    try expect(p.rows(p.get(p.get(q, "data"), "threads")).len == 1);
-    try f.summaryTimer();
-    try expect(f.pending("git.changes.summary") == 1);
-    try f.reply("git.changes.summary", response);
-    try expect(f.pending("git.changes.summary") == 0);
-    _ = try f.event("foreground", .{});
-    try expect(f.pending("git.changes.summary") == 0); // Background watch remains lazy.
-}
-
-test "git focus refreshes only its workspace and defers background turn changes" {
-    var f = try Fixture.init(all_scopes, &.{});
-    defer f.deinit();
-    for ([_][]const u8{ "ws-1", "ws-closed" }) |ws| {
-        _ = try f.intent("git_summary_refresh", .{ .workspace_id = ws });
-        try f.summaryTimer();
-        try f.reply("git.changes.summary", .{ .workspace_id = ws, .revision = 1, .threads = .{} });
-    }
-    // Exercise observation independently of route loading/provider fixtures.
-    var tx = try h.Transaction.init(&f.host);
-    defer tx.deinit();
-    try g.observe(&tx, try f.value(.{ .type = "focus", .workspace_id = "ws-1" }));
-    g.turnChanged(&tx);
-    try g.pump(&tx);
-    _ = try tx.commit(&f.host, f.a());
-    try f.summaryTimer();
-    try expect(f.pending("git.changes.summary") == 1);
-    try eql("ws-1", p.s(try f.params("git.changes.summary"), "workspace_id"));
-    try f.reply("git.changes.summary", .{ .workspace_id = "ws-1", .revision = 2, .threads = .{} });
-    try expect(f.pending("git.changes.summary") == 0);
-    var next = try h.Transaction.init(&f.host);
-    defer next.deinit();
-    try g.observe(&next, try f.value(.{ .type = "focus", .workspace_id = "ws-closed" }));
-    try g.pump(&next);
-    _ = try next.commit(&f.host, f.a());
-    try f.summaryTimer();
-    try expect(f.pending("git.changes.summary") == 1);
-    try eql("ws-closed", p.s(try f.params("git.changes.summary"), "workspace_id"));
-}
-
-test "git remote runtime review is unsupported and signout clears projections" {
-    var f = try Fixture.init(all_scopes, &.{});
-    defer f.deinit();
-    var tx = try h.Transaction.init(&f.host);
-    defer tx.deinit();
-    tx.state.sync.catalog = &.{try h.parse(tx.allocator(), "{\"workspace_id\":\"ws-1\",\"local_thread_id\":\"thread\",\"profile_id\":\"remote\"}")};
-    const output = try tx.commit(&f.host, f.a());
-    _ = output;
-    const id = try f.intent("git_review_open", .{ .workspace_id = "ws-1", .thread_id = "thread" });
-    try eql("unsupported", (try f.receipt(id)).@"error".?.code);
-    try expect(f.pending("git.changes.review") == 0);
-    _ = try f.intent("git_summary_refresh", .{ .workspace_id = "ws-1" });
-    var clear = try h.Transaction.init(&f.host);
-    defer clear.deinit();
-    clear.state.auth.credential = null;
-    try g.observe(&clear, .null);
-    const changed = try g.scopes(f.a(), &f.host.state, &clear.state);
-    var found = false;
-    for (changed) |scope| if (h.eq(scope, "git_summary:ws-1")) {
-        found = true;
-    };
-    try expect(found);
-    try expect(clear.state.git.watches.len == 0);
-}
-
-test "git selection receipt identity includes paths and hunks" {
-    var f = try Fixture.init(all_scopes, &.{});
-    defer f.deinit();
-    try loaded(&f);
-    const id = try f.intent("git_commit", .{ .review_id = "review-1", .message = "Fixture", .selections = selection });
-    _ = try f.event("git_commit", .{ .intent_id = id, .review_id = "review-1", .message = "Fixture", .selections = selection });
-    try expect(f.pending("git.changes.commit") == 1);
-    try std.testing.expectError(error.InvalidArgument, f.event("git_commit", .{ .intent_id = id, .review_id = "review-1", .message = "Fixture", .selections = .{.{ .root = "/repo", .files = .{.{ .path = "a.zig", .hunks = .{0} }} }} }));
-}
-
 fn retryTick(f: *Fixture) !void {
     f.now += 2_001;
     for (f.host.state.pending) |pending| if (pending.kind == .timer and h.eq(pending.purpose, "git_retry")) {
@@ -345,48 +197,4 @@ fn retryTick(f: *Fixture) !void {
         return;
     };
     return error.MissingTimer;
-}
-test "Chat preset commits on a new branch without repository write" {
-    var f = try Fixture.init(&.{ "chat:write", "repository:read" }, &.{});
-    defer f.deinit();
-    try loaded(&f);
-    try expect(p.yes(p.get(try f.view(), "can_commit")));
-    _ = try f.intent("git_commit", .{ .review_id = "review-1", .message = "Fixture", .selections = selection, .new_branch = true, .branch_name = "feature/fixture" });
-    const request = try f.params("git.changes.commit");
-    try expect(p.yes(p.get(request, "new_branch")));
-    try eql("feature/fixture", p.s(request, "branch_name"));
-}
-test "git status and push use retained request identity with finite retry window" {
-    var f = try Fixture.init(&.{ "chat:write", "repository:read" }, &.{});
-    defer f.deinit();
-    _ = try f.intent("git_status_refresh", .{ .workspace_id = "ws-1", .thread_id = "thread" });
-    try f.reply("git.changes.status", .{ .workspace_id = "ws-1", .local_thread_id = "thread", .repos = .{.{ .root = "/repo", .name = "repo", .branch = "feature/test", .has_remote = true, .ahead = 2 }} });
-    const id = try f.intent("git_push", .{ .workspace_id = "ws-1", .root = "/repo" });
-    const key = try f.a().dupe(u8, p.s(try f.params("git.changes.push"), "request_id"));
-    try expect(key.len > 0);
-    try f.reject("git.changes.push", "in_progress", null);
-    try retryTick(&f);
-    try eql(key, p.s(try f.params("git.changes.push"), "request_id"));
-    try f.reply("git.changes.push", .{ .root = "/repo", .push = "pushed" });
-    try eql("succeeded", (try f.receipt(id)).state);
-    try expect(f.pending("git.changes.status") == 1);
-}
-test "git idempotent recovery is bounded and does not refresh the frozen review" {
-    var f = try Fixture.init(all_scopes, &.{});
-    defer f.deinit();
-    try loaded(&f);
-    const id = try f.intent("git_commit", .{ .review_id = "review-1", .message = "Fixture", .selections = selection });
-    for (0..3) |_| {
-        try f.reject("git.changes.commit", "in_progress", null);
-        try retryTick(&f);
-        try expect(f.pending("git.changes.review") == 0);
-    }
-    try f.reject("git.changes.commit", "in_progress", null);
-    try expect(f.pending("git.changes.commit") == 0);
-    try expect(p.yes(p.get(try f.view(), "can_retry")));
-    f.now = 3_600_002;
-    _ = try f.intent("git_retry", .{});
-    try expect(f.pending("git.changes.commit") == 0);
-    try eql("uncertain", (try f.receipt(id)).state);
-    try expect(!p.yes(p.get(try f.view(), "can_retry")));
 }

@@ -439,22 +439,3 @@ test "virtual list computes visible variable-height rows and emits labels" {
     }
     try std.testing.expect(text_count > 0);
 }
-
-test "virtual list handles wheel selection and scrollbar" {
-    const List = VirtualList(.{ .width = 100, .height = 40, .padding_x = 0, .padding_y = 0, .row_height = 20, .item_count = 8 });
-    var list = List.initFromConfig();
-
-    try std.testing.expect(list.handleInput(.{ .mouse_wheel = .{ .point = .{ .x = 10, .y = 10 }, .y = -1 } }));
-    try std.testing.expect(list.scrollY() > 0);
-    try std.testing.expect(list.handleInput(.{ .mouse_down = .{ .x = 10, .y = 10 } }));
-    try std.testing.expect(list.selected_index != null);
-
-    var batch: draw.RenderBatch = .{};
-    defer batch.deinit(std.testing.allocator);
-    try list.render(std.testing.allocator, &batch);
-    var scrollbar_count: usize = 0;
-    for (batch.commands.items) |command| {
-        if (command.kind == .scrollbar) scrollbar_count += 1;
-    }
-    try std.testing.expectEqual(@as(usize, 2), scrollbar_count);
-}

@@ -82,8 +82,6 @@ enum K09 {
         }
         return value
     }
-    static var home: HomeQuery { read("home") }
-    static var workspaces: WorkspacesQuery { read("workspaces") }
     static var homeLive: HomeQuery { read("home-live") }
     static var workspacesLive: WorkspacesQuery { read("workspaces-live") }
 }

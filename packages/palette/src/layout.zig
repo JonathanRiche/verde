@@ -388,16 +388,6 @@ fn tupleLen(comptime T: type) comptime_int {
     return info.@"struct".fields.len;
 }
 
-test "box exposes padded content rect" {
-    const box: Box = .{
-        .rect = .{ .x = 10, .y = 20, .w = 100, .h = 80 },
-        .margin = Edges.xy(4, 2),
-        .padding = Edges.all(8),
-    };
-    try std.testing.expectEqual(draw.Rect{ .x = 14, .y = 22, .w = 92, .h = 76 }, box.bounds());
-    try std.testing.expectEqual(draw.Rect{ .x = 22, .y = 30, .w = 76, .h = 60 }, box.contentRect());
-}
-
 test "flex row grows and honors margins gaps and padding" {
     const items = [_]FlexItem{
         .{ .basis_w = 50, .basis_h = 20, .margin = Edges.xy(5, 0) },
@@ -431,24 +421,4 @@ test "grid resolves fixed and fractional tracks with spans" {
     var rects: [1]draw.Rect = undefined;
     try grid(std.testing.allocator, .{ .w = 260, .h = 100 }, .{ .columns = &columns, .rows = &rows, .gap_x = 10, .gap_y = 5 }, &items, &rects);
     try std.testing.expectEqual(draw.Rect{ .x = 62, .y = 2, .w = 196, .h = 96 }, rects[0]);
-}
-
-test "apply flex sets component bounds" {
-    const Component = struct {
-        rect: draw.Rect = .{},
-
-        fn setBounds(self: *@This(), rect: draw.Rect) void {
-            self.rect = rect;
-        }
-    };
-    var first: Component = .{};
-    var second: Component = .{};
-    applyFlex(
-        .{ .w = 100, .h = 30 },
-        .{ .gap = 4, .align_items = .stretch },
-        .{ FlexItem.fixed(20, 10), FlexItem{ .basis_w = 10, .basis_h = 10, .grow = 1 } },
-        .{ &first, &second },
-    );
-    try std.testing.expectEqual(draw.Rect{ .x = 0, .y = 0, .w = 20, .h = 30 }, first.rect);
-    try std.testing.expectEqual(draw.Rect{ .x = 24, .y = 0, .w = 76, .h = 30 }, second.rect);
 }

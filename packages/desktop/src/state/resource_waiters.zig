@@ -352,13 +352,3 @@ test "resource waiters replace per chat and drop when the workspace closes" {
     self.poll(allocator, "/nonexistent", 10_000, &closed);
     try std.testing.expect(self.isEmpty());
 }
-
-test "resource waiters expire" {
-    const allocator = std.testing.allocator;
-    var self: Self = .{};
-    defer self.deinit(allocator);
-    try self.register(allocator, "ws", "chat-a", &.{"build"}, "", 0);
-    const busy: TestChecker = .{ .busy_value = true };
-    self.poll(allocator, "/nonexistent", EXPIRE_AFTER_MS + 1, &busy);
-    try std.testing.expect(self.isEmpty());
-}

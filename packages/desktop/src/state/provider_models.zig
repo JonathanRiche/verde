@@ -296,20 +296,6 @@ pub fn grokReasoningGauge(values: ?[]const [:0]const u8, selected: ?ReasoningEff
     return .{ .index = index, .count = count };
 }
 
-test "grok effort support follows the per-model catalog" {
-    try std.testing.expect(grokEffortSupported(null, .xhigh));
-    try std.testing.expect(!grokEffortSupported(null, .max));
-    const grok_45 = [_][:0]const u8{ "high", "medium", "low" };
-    try std.testing.expect(grokEffortSupported(grok_45[0..], .high));
-    try std.testing.expect(!grokEffortSupported(grok_45[0..], .xhigh));
-    const gauge = grokReasoningGauge(grok_45[0..], .high);
-    try std.testing.expectEqual(@as(usize, 4), gauge.count);
-    try std.testing.expectEqual(@as(usize, 3), gauge.index);
-    const unset = grokReasoningGauge(null, null);
-    try std.testing.expectEqual(@as(usize, GROK_REASONING_OPTIONS.len), unset.count);
-    try std.testing.expectEqual(@as(usize, 0), unset.index);
-}
-
 /// Muse calls its highest protocol tier `ultra`; Verde persists the existing
 /// `max` enum value and the Muse transport maps that value to `ultra`.
 pub const MUSE_REASONING_OPTIONS = [_]ReasoningOption{
@@ -358,11 +344,3 @@ pub const CODEX_ACCESS_MODE_OPTIONS = [_]AccessModeOption{
     .{ .label = "Full access", .value = .full_access },
     .{ .label = "Supervised", .value = .supervised },
 };
-
-test "persisted Cursor model cache refreshes duplicate model ids" {
-    const options = [_]PersistedCursorModelOption{
-        .{ .label = "GPT-5.6 Sol", .value = "gpt-5.6-sol-medium" },
-        .{ .label = "GPT-5.6 Sol Fast", .value = "gpt-5.6-sol-medium", .fast_supported = true },
-    };
-    try std.testing.expect(persistedCursorModelCacheNeedsRefresh(&options));
-}

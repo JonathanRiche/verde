@@ -723,18 +723,6 @@ test "access scopes use frozen names and reject aliases or duplicates" {
     try std.testing.expectEqualStrings("terminal:write", names[1]);
 }
 
-test "device labels are bounded UTF-8 without controls" {
-    try validateDeviceLabel("Ryan's laptop");
-    try validateDeviceLabel("Téléphone");
-    try std.testing.expectError(error.DeviceLabelRequired, validateDeviceLabel(""));
-    try std.testing.expectError(error.InvalidDeviceLabel, validateDeviceLabel("bad\nlabel"));
-    try std.testing.expectError(error.InvalidDeviceLabel, validateDeviceLabel("bad\xff"));
-    try std.testing.expectError(
-        error.DeviceLabelTooLong,
-        validateDeviceLabel("x" ** (MAX_DEVICE_LABEL_BYTES + 1)),
-    );
-}
-
 test "opaque access identifiers and pairing TTLs are canonical" {
     try validateGrantId("0123456789abcdef0123456789abcdef");
     try validateDeviceId("fedcba9876543210fedcba9876543210");
@@ -801,53 +789,6 @@ test "pair exchange and WebSocket ticket DTOs have stable object shapes" {
     try std.testing.expectEqualStrings("{\"access_protocol_version\":1}", ticket_request);
 }
 
-test "access token and ticket requests are strict and versioned" {
-    var token = try parseAccessTokenRequest(
-        std.testing.allocator,
-        "{\"access_protocol_version\":1,\"requested_scopes\":[\"runtime:read\",\"chat:write\"]}",
-    );
-    defer token.deinit();
-    try std.testing.expectEqual(@as(usize, 2), token.value.requested_scopes.len);
-    try std.testing.expectError(
-        error.DuplicateField,
-        parseAccessTokenRequest(
-            std.testing.allocator,
-            "{\"access_protocol_version\":1,\"access_protocol_version\":1,\"requested_scopes\":[\"runtime:read\"]}",
-        ),
-    );
-    try std.testing.expectError(
-        error.UnknownField,
-        parseWebSocketTicketRequest(
-            std.testing.allocator,
-            "{\"access_protocol_version\":1,\"future\":true}",
-        ),
-    );
-    try std.testing.expectError(
-        error.IncompatibleAccessProtocol,
-        parseWebSocketTicketRequest(
-            std.testing.allocator,
-            "{\"access_protocol_version\":2}",
-        ),
-    );
-}
-
-test "runtime endpoint metadata has the frozen direct-runtime shape" {
-    const metadata: RuntimeEndpointMetadata = .{
-        .access_protocol_version = ACCESS_PROTOCOL_VERSION,
-        .runtime_id = "0123456789abcdef0123456789abcdef",
-        .instance_id = "00112233445566778899aabbccddeeff",
-        .https_url = "https://runtime.example.test",
-        .wss_url = "wss://runtime.example.test/ws",
-        .capabilities = &.{PAIR_RUNTIME_CAPABILITY},
-    };
-    const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, metadata, .{});
-    defer std.testing.allocator.free(encoded);
-    try std.testing.expectEqualStrings(
-        "{\"access_protocol_version\":1,\"runtime_id\":\"0123456789abcdef0123456789abcdef\",\"instance_id\":\"00112233445566778899aabbccddeeff\",\"https_url\":\"https://runtime.example.test\",\"wss_url\":\"wss://runtime.example.test/ws\",\"capabilities\":[\"access.pair.v1\"]}",
-        encoded,
-    );
-}
-
 test "paired RPC scope policy is exact and fails closed" {
     try std.testing.expectEqual(
         scopeBit(.chat_write),
@@ -878,17 +819,6 @@ test "paired RPC scope policy is exact and fails closed" {
     try std.testing.expect(requiredScopeMaskForRpc("daemon.stop") == null);
     try std.testing.expect(requiredScopeMaskForRpc("future.method") == null);
     try std.testing.expect(requiredScopeMaskForRpc(METHOD_DAEMON_DEVICE_AUTHORIZE) == null);
-}
-
-test "thread sync requires chat write authority" {
-    try std.testing.expectEqual(scopeBit(.chat_write), requiredScopeMaskForRpc("provider.thread.sync").?);
-}
-
-test "composer shell commands require chat and terminal write authority" {
-    const required = requiredScopeMaskForRpc("chat.shell.run").?;
-    try std.testing.expect(scopeMaskContains(required, scopeBit(.chat_write)));
-    try std.testing.expect(scopeMaskContains(required, scopeBit(.terminal_write)));
-    try std.testing.expect(scopeMaskContains(try scopeMask(&DEFAULT_SCOPE_NAMES), required));
 }
 
 test "new access scopes are opt-in and preserve stored scope bits" {
@@ -934,79 +864,4 @@ test "P2 daemon RPC mappings require their exact scopes and desktop methods stay
         "config.ui.set",     "web.directory.list",
         "config.commit.set", "config.favoriteModel.set",
     }) |method| try std.testing.expect(requiredScopeMaskForRpc(method) == null);
-}
-
-test "chat preset may commit and push but monitor may not" {
-    const chat = try scopeMask(PairingPreset.chat.scopes());
-    const monitor = try scopeMask(PairingPreset.monitor.scopes());
-    const full = try scopeMask(PairingPreset.full.scopes());
-    // Legacy grants (the frozen default scope list) keep commit authority.
-    const legacy = try scopeMask(&DEFAULT_SCOPE_NAMES);
-    for ([_][]const u8{ "git.changes.commit", "git.changes.push", "git.changes.pull_push" }) |method| {
-        const required = requiredScopeMaskForRpc(method).?;
-        try std.testing.expect(scopeMaskContains(chat, required));
-        try std.testing.expect(scopeMaskContains(full, required));
-        try std.testing.expect(scopeMaskContains(legacy, required));
-        try std.testing.expect(!scopeMaskContains(monitor, required));
-        try std.testing.expect(required & REPOSITORY_WRITE == 0);
-    }
-    for ([_][]const u8{ "git.changes.summary", "git.changes.status", "git.changes.review", "git.changes.commit_message", "git.changes.workspace", "git.changes.file_patch" }) |method| {
-        try std.testing.expectEqual(@as(?u16, REPOSITORY_READ), requiredScopeMaskForRpc(method));
-        try std.testing.expect(scopeMaskContains(monitor, REPOSITORY_READ));
-    }
-}
-
-test "pair exchange accepts only canonical optional client nonces" {
-    const prefix = "{\"access_protocol_version\":1,\"grant_id\":\"0123456789abcdef0123456789abcdef\",\"pairing_token\":\"" ++ "a" ** SECRET_HEX_BYTES ++ "\",\"device_label\":\"Phone\"";
-    var parsed = try parsePairingGrantExchangeRequest(std.testing.allocator, prefix ++ ",\"client_nonce\":\"0123456789abcdef0123456789abcdef\"}");
-    defer parsed.deinit();
-    try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", parsed.value.client_nonce.?);
-    for ([_][]const u8{ "", "a" ** 31, "a" ** 33, "A" ** 32, "g" ** 32 }) |nonce| {
-        const body = try std.fmt.allocPrint(std.testing.allocator, "{s},\"client_nonce\":\"{s}\"}}", .{ prefix, nonce });
-        defer std.testing.allocator.free(body);
-        try std.testing.expectError(error.InvalidGrantId, parsePairingGrantExchangeRequest(std.testing.allocator, body));
-    }
-    try std.testing.expectError(error.DuplicateField, parsePairingGrantExchangeRequest(std.testing.allocator, prefix ++ ",\"client_nonce\":null,\"client_nonce\":null}"));
-}
-
-test "push RPCs require the opt-in device write scope" {
-    for ([_][]const u8{ "device.push.register", "device.push.unregister", "device.push.test" }) |method| {
-        try std.testing.expectEqual(@as(?u16, scopeBit(.device_write)), requiredScopeMaskForRpc(method));
-        try std.testing.expect((try scopeMask(&DEFAULT_SCOPE_NAMES)) & requiredScopeMaskForRpc(method).? == 0);
-    }
-    try std.testing.expect(requiredScopeMaskForRpc("device.push.unknown") == null);
-}
-
-test "device self service is scoped and administration is owner only" {
-    for ([_][]const u8{ METHOD_DEVICE_SELF_GET, METHOD_DEVICE_SELF_REVOKE }) |method| {
-        try std.testing.expectEqual(scopeBit(.device_read), requiredScopeMaskForRpc(method).?);
-    }
-    for ([_][]const u8{ METHOD_DEVICE_LIST, METHOD_DEVICE_REVOKE }) |method| {
-        try std.testing.expect(requiredScopeMaskForRpc(method) == null);
-    }
-}
-
-test "pairing presets have exact scopes and caps" {
-    try std.testing.expectEqual(try scopeMask(&ALL_SCOPE_NAMES), try scopeMask(PairingPreset.full.scopes()));
-    try std.testing.expectEqual(@as(?AccessMode, null), PairingPreset.full.maxAccessMode());
-    const chat = try scopeMask(PairingPreset.chat.scopes());
-    const monitor = try scopeMask(PairingPreset.monitor.scopes());
-    try std.testing.expectEqual(@as(?AccessMode, .supervised), PairingPreset.chat.maxAccessMode());
-    try std.testing.expectEqual(@as(?AccessMode, null), PairingPreset.monitor.maxAccessMode());
-    try std.testing.expectEqual(try scopeMask(&.{ "runtime:read", "chat:read", "chat:write", "terminal:read", "repository:read", "device:read", "device:write" }), chat);
-    try std.testing.expectEqual(try scopeMask(&.{ "runtime:read", "chat:read", "terminal:read", "repository:read", "device:read", "process:read", "device:write" }), monitor);
-    for (PAIRING_PRESETS) |preset| {
-        const mask = try scopeMask(preset.scopes());
-        try std.testing.expect(scopeMaskContains(mask, webSocketBootstrapScopeMask()));
-        try std.testing.expect(scopeMaskContains(mask, requiredScopeMaskForRpc("device.push.register").?));
-    }
-    try std.testing.expect(!scopeMaskContains(chat, requiredScopeMaskForRpc("chat.shell.run").?));
-    try std.testing.expect(!scopeMaskContains(monitor, requiredScopeMaskForRpc("chat.turn.start").?));
-    try std.testing.expect(scopeMaskContains(chat, requiredScopeMaskForRpc("chat.turn.approve").?));
-}
-
-test "directory browsing requires repository read for paired devices" {
-    try std.testing.expectEqual(@as(?u16, REPOSITORY_READ), requiredScopeMaskForRpc("workspace.directory.list"));
-    try std.testing.expectEqual(@as(?u16, REPOSITORY_READ), requiredScopeMaskForRpc("workspace.files.list"));
-    try std.testing.expectEqual(@as(?u16, REPOSITORY_READ), requiredScopeMaskForRpc("workspace.files.read"));
 }

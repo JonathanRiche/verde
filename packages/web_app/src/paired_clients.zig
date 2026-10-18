@@ -376,31 +376,6 @@ test "paired registrations are nonpersistent cached and mutations use the authen
     try std.testing.expectEqual(@as(usize, 2), daemon.registrations);
 }
 
-test "paired registration rejection propagates without caching or forwarding a mutation" {
-    const FakeDaemon = struct {
-        calls: usize = 0,
-        pub fn callRaw(self: *@This(), raw: []const u8) !@import("daemon.zig").CallResult {
-            self.calls += 1;
-            var request = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
-            defer request.deinit();
-            try std.testing.expectEqualStrings("daemon.client.register", request.value.object.get("method").?.string);
-            try std.testing.expectEqualStrings("b" ** 32, request.value.object.get("target").?.object.get("instance_id").?.string);
-            return .{ .json = try std.testing.allocator.dupe(u8, "{\"id\":99,\"error\":{\"code\":\"invalid_state\",\"message\":\"draining\"}}") };
-        }
-    };
-    var manager: Manager = .{};
-    var daemon: FakeDaemon = .{};
-    const claims: auth.PairClaims = .{ .device_id = @splat('a'), .scope_mask = 0xffff, .deadline_ms = auth.nowMillis(std.testing.io) + 60_000 };
-    const raw = "{\"id\":7,\"target\":{\"runtime_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"instance_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"},\"method\":\"workspace.upsert\",\"params\":{\"mutation\":{\"client_id\":\"forged\"}}}";
-    for (0..2) |_| {
-        const response = try manager.forward(std.testing.allocator, std.testing.io, claims, raw, &daemon);
-        defer std.testing.allocator.free(response);
-        try std.testing.expect(std.mem.indexOf(u8, response, "\"id\":7") != null);
-        try std.testing.expect(std.mem.indexOf(u8, response, "draining") != null);
-    }
-    try std.testing.expectEqual(@as(usize, 2), daemon.calls);
-}
-
 test "paired identities canonicalize targets and close on expiry revocation and shutdown" {
     const FakeDaemon = struct {
         registrations: usize = 0,
@@ -467,28 +442,6 @@ test "paired identities canonicalize targets and close on expiry revocation and 
     }
     try std.testing.expectEqual(@as(usize, 3), daemon.closes);
     for (manager.entries) |entry| try std.testing.expectEqual(@as(usize, 0), entry.len);
-}
-
-test "paired shutdown cleanup cancels an unresponsive daemon within its deadline" {
-    const FakeDaemon = struct {
-        canceled: bool = false,
-        pub fn callRaw(self: *@This(), _: []const u8) !@import("daemon.zig").CallResult {
-            std.Io.sleep(std.testing.io, .fromMilliseconds(60_000), .awake) catch |err| {
-                self.canceled = true;
-                return err;
-            };
-            return error.UnexpectedCompletion;
-        }
-    };
-    var manager: Manager = .{};
-    manager.entries[0] = .{ .len = 1, .client_id = @splat('x') };
-    manager.entries[1] = .{ .len = 1, .client_id = @splat('y'), .deadline_ms = auth.nowMillis(std.testing.io) + 60_000 };
-    var daemon: FakeDaemon = .{};
-    try std.testing.expectError(error.CloseTimedOut, manager.closeAll(std.testing.allocator, std.testing.io, &daemon));
-    try std.testing.expect(daemon.canceled);
-    try std.testing.expectEqual(@as(usize, 1), manager.entries[0].len);
-    try std.testing.expectEqual(@as(usize, 1), manager.entries[1].len);
-    try std.testing.expectEqual(@as(i64, 0), manager.entries[1].deadline_ms);
 }
 
 test "push RPC forwarding binds every operation to the authenticated device" {

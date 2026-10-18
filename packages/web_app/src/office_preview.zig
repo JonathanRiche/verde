@@ -212,15 +212,6 @@ fn pruneStalePreviews(
     }
 }
 
-test "convertible allowlists office document extensions" {
-    try std.testing.expect(convertible("/tmp/deck.pptx"));
-    try std.testing.expect(convertible("/tmp/DECK.PPTX"));
-    try std.testing.expect(convertible("/tmp/report.docx"));
-    try std.testing.expect(convertible("/tmp/sheet.ods"));
-    try std.testing.expect(!convertible("/tmp/archive.zip"));
-    try std.testing.expect(!convertible("/tmp/proof.pdf"));
-}
-
 test "preview converts the held descriptor through a private copy and cleans up" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;

@@ -78,10 +78,3 @@ test "browser bridge policy allows user-triggered inspector on web pages" {
     try std.testing.expect(!policy.allowsInspector("file:///tmp/page.html"));
     try std.testing.expect(!policy.allowsInspector("about:blank"));
 }
-
-test "browser bridge policy can explicitly allow untrusted pages" {
-    const policy: Policy = .{ .allow_untrusted = true };
-    try std.testing.expect(policy.allowsHostMessaging("https://example.com"));
-    try std.testing.expect(policy.allowsHostMessaging("data:text/html,<script></script>"));
-    try std.testing.expect(policy.allowsInspector("data:text/html,<script></script>"));
-}

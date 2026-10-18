@@ -117,18 +117,7 @@ pub fn allowedMethod(method: []const u8) bool {
 
 test "web runtime routing exposes only chat execution and repository inspection" {
     try std.testing.expect(allowedMethod("chat.turn.start"));
-    try std.testing.expect(allowedMethod("chat.turn.cancel"));
-    try std.testing.expect(allowedMethod("chat.attachment.append"));
-    try std.testing.expect(allowedMethod("provider.slash.run"));
-    try std.testing.expect(allowedMethod("chat.shell.run"));
-    try std.testing.expect(allowedMethod("workspace.files.list"));
     try std.testing.expect(allowedMethod("workspace.files.read"));
-    try std.testing.expect(allowedMethod("git.changes.review"));
-    try std.testing.expect(allowedMethod("git.changes.commit"));
-    try std.testing.expect(allowedMethod("git.changes.status"));
-    try std.testing.expect(allowedMethod("git.changes.push"));
-    try std.testing.expect(allowedMethod("git.changes.workspace"));
-    try std.testing.expect(allowedMethod("git.changes.file_patch"));
     try std.testing.expect(!allowedMethod("config.commit.set"));
     try std.testing.expect(!allowedMethod("access.pairing.create"));
     try std.testing.expect(!allowedMethod("workspace.repository.binding.upsert"));

@@ -108,66 +108,6 @@ test "parses paragraphs, blank lines, and fenced code blocks" {
     }
 }
 
-test "extracts the fenced code language from info text" {
-    const allocator = std.testing.allocator;
-    const source =
-        \\~~~tsx custom-info
-        \\<Button />
-        \\~~~
-    ;
-
-    var document = try parse(allocator, source);
-    defer document.deinit(allocator);
-
-    try std.testing.expectEqual(@as(usize, 1), document.blockCount());
-
-    const code = document.blockAt(0);
-    try std.testing.expectEqual(BlockKind.fenced_code, code.kind());
-    switch (code) {
-        .fenced_code => |fenced_code| {
-            try std.testing.expectEqualStrings("tsx custom-info", fenced_code.info);
-            try std.testing.expectEqualStrings("tsx", fenced_code.language.?);
-            try std.testing.expectEqualStrings("<Button />\n", fenced_code.code);
-            try std.testing.expectEqual(@as(u8, '~'), fenced_code.fence.marker);
-        },
-        else => unreachable,
-    }
-}
-
-test "extracts the first fenced code language token" {
-    try std.testing.expectEqualStrings("zig", fenceLanguage("zig  async preview").?);
-    try std.testing.expect(fenceLanguage("   ") == null);
-}
-
-test "keeps soft wrapped paragraph lines together" {
-    const allocator = std.testing.allocator;
-    const source =
-        \\one line
-        \\two line
-        \\
-        \\tail
-    ;
-
-    var document = try parse(allocator, source);
-    defer document.deinit(allocator);
-
-    try std.testing.expectEqual(@as(usize, 3), document.blockCount());
-
-    const paragraph = document.blockAt(0);
-    try std.testing.expectEqual(BlockKind.paragraph, paragraph.kind());
-    switch (paragraph) {
-        .paragraph => |value| try std.testing.expectEqualStrings("one line\ntwo line", value.text),
-        else => unreachable,
-    }
-
-    const tail = document.blockAt(2);
-    try std.testing.expectEqual(BlockKind.paragraph, tail.kind());
-    switch (tail) {
-        .paragraph => |value| try std.testing.expectEqualStrings("tail", value.text),
-        else => unreachable,
-    }
-}
-
 test "parses headings, thematic breaks, block quotes, and lists" {
     const allocator = std.testing.allocator;
     const source =

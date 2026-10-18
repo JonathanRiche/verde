@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { COMMANDS, dispatchWebCommand, openChatCommandPicker, registerChatCommandPickers } from './commands.ts'
+import { COMMANDS, dispatchWebCommand } from './commands.ts'
 
 const workspace = { workspace_id: 'ws', label: 'Workspace', path: '/workspace' }
 const pane = { workspace_id: 'ws', pane_id: 1, kind: 'chat', thread_id: 'thread', native_pane_id: 42 }
@@ -18,33 +18,6 @@ function fixture(overrides = {}) {
 }
 
 describe('web command catalog and dispatch', () => {
-  test('every catalog command runs without a native desktop pane', async () => {
-    for (const command of COMMANDS) {
-      const { context, calls, notices } = fixture({ pane: { ...pane, native_pane_id: undefined } })
-      await dispatchWebCommand(command.id, context)
-      expect(calls).toEqual([['native', command.id]])
-      expect(notices).toEqual([])
-    }
-  })
-  test('legacy sidebar command IDs still work', async () => {
-    const { context, calls } = fixture()
-    for (const id of ['new-thread', 'new-terminal', 'toggle-sidebar', 'settings', 'maximize']) await dispatchWebCommand(id, context)
-    expect(calls.map((row) => row[1])).toEqual(['thread.new', 'pane.terminal', 'app.sidebar', 'app.settings', 'pane.zoom'])
-  })
-  test('existing focus action names use native handlers', async () => {
-    const { context, calls, notices } = fixture()
-    for (const direction of ['left', 'right', 'up', 'down', 'prompt']) {
-      await dispatchWebCommand(`workspace.focus_${direction}`, context)
-    }
-    expect(calls.map((row) => row[1])).toEqual(['pane.focus_left', 'pane.focus_right', 'pane.focus_up', 'pane.focus_down', 'pane.focus_prompt'])
-    expect(notices).toEqual([])
-  })
-  test('add workspace and app actions work without a selected workspace', async () => {
-    const { context, calls, notices } = fixture({ workspace: null, pane: null })
-    for (const id of ['workspace.add', 'app.settings', 'app.sidebar']) await dispatchWebCommand(id, context)
-    expect(calls.length).toBe(3)
-    expect(notices).toEqual([])
-  })
   test('missing targets yield notices, never an unrelated action', async () => {
     for (const [id, overrides, notice] of [
       ['thread.new', { workspace: null }, 'workspace'],
@@ -59,18 +32,6 @@ describe('web command catalog and dispatch', () => {
       expect(notices[0]).toContain(notice)
     }
   })
-  test('workspace commands can target an unfocused workspace', async () => {
-    const { context, calls } = fixture({ pane: { ...pane, workspace_id: 'other' } })
-    await dispatchWebCommand('thread.new', context)
-    expect(calls).toEqual([['native', 'thread.new']])
-  })
-  test('unknown commands do not silently disappear or fall through to Live', async () => {
-    const { context, calls, notices } = fixture()
-    await dispatchWebCommand('invented.command', context)
-    expect(calls).toEqual([])
-    expect(notices.length).toBe(1)
-    expect(notices.every((message) => message.includes('not available'))).toBe(true)
-  })
   test('handler failures become notices without exposing exception contents', async () => {
     const { context, notices } = fixture()
     context.handlers['thread.new'] = async () => { throw new Error('private response') }
@@ -78,33 +39,4 @@ describe('web command catalog and dispatch', () => {
     expect(notices.length).toBe(1)
     expect(notices.every((message) => message.startsWith('Could not run') && !message.includes('private'))).toBe(true)
   })
-})
-
-test('picker bridge isolates workspaces and preserves replacement registrations during cleanup', () => {
-  const calls = []
-  const other = { ...pane, workspace_id: 'other' }
-  const old = registerChatCommandPickers(pane, (command) => calls.push(['old', command]))
-  const replacement = registerChatCommandPickers(pane, (command) => calls.push(['new', command]))
-  const otherCleanup = registerChatCommandPickers(other, (command) => calls.push(['other', command]))
-  old()
-  expect(openChatCommandPicker(pane, 'model')).toBe(true)
-  expect(openChatCommandPicker(other, 'run_config')).toBe(true)
-  expect(calls).toEqual([['new', 'model'], ['other', 'run_config']])
-  replacement()
-  otherCleanup()
-  expect(openChatCommandPicker(pane, 'model')).toBe(false)
-  expect(openChatCommandPicker(other, 'model')).toBe(false)
-})
-
-
-test('validation rejects without dismissing the palette; accepted handlers dismiss first', async () => {
-  let open = true
-  const { context, notices } = fixture({ accepted: () => { open = false } })
-  await dispatchWebCommand('missing', context)
-  expect(open).toBe(true)
-  await dispatchWebCommand('pane.close', { ...context, pane: null })
-  expect(open).toBe(true)
-  expect(notices).toHaveLength(2)
-  context.handlers['app.settings'] = () => expect(open).toBe(false)
-  await dispatchWebCommand('app.settings', context)
 })

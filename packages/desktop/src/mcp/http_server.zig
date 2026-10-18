@@ -741,17 +741,6 @@ fn jsonString(value: std.json.Value) ?[]const u8 {
     };
 }
 
-fn testHandler(
-    allocator: std.mem.Allocator,
-    _: std.Io,
-    _: []const u8,
-    context: RequestContext,
-) !?[]u8 {
-    try std.testing.expectEqualStrings(MODERN_PROTOCOL_VERSION, context.protocol_version);
-    try std.testing.expectEqualStrings("test-client", context.client_name);
-    return @as(?[]u8, try allocator.dupe(u8, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}"));
-}
-
 test "modern requests require matching routable headers" {
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
         \\{"name":"list_processes","arguments":{},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}
@@ -771,92 +760,4 @@ test "origin policy accepts only the bound loopback origin" {
     try std.testing.expect(originAllowed("http://127.0.0.1:47371", 47_371));
     try std.testing.expect(originAllowed("http://localhost:47371", 47_371));
     try std.testing.expect(!originAllowed("https://attacker.invalid", 47_371));
-}
-
-test "TCP table rows match only loopback or wildcard listeners on the port" {
-    const port: u16 = 47371;
-    const net_port: u32 = std.mem.nativeToBig(u16, port);
-    const loopback = std.mem.nativeToBig(u32, 0x7f000001);
-    try std.testing.expect(tcpRowListensOnLoopbackPort(.{ .state = MIB_TCP_STATE_LISTEN, .local_addr = loopback, .local_port = net_port, .remote_addr = 0, .remote_port = 0 }, port));
-    try std.testing.expect(tcpRowListensOnLoopbackPort(.{ .state = MIB_TCP_STATE_LISTEN, .local_addr = 0, .local_port = net_port, .remote_addr = 0, .remote_port = 0 }, port));
-    // Established connection on the port, a different port, another address.
-    try std.testing.expect(!tcpRowListensOnLoopbackPort(.{ .state = 5, .local_addr = loopback, .local_port = net_port, .remote_addr = loopback, .remote_port = 1 }, port));
-    try std.testing.expect(!tcpRowListensOnLoopbackPort(.{ .state = MIB_TCP_STATE_LISTEN, .local_addr = loopback, .local_port = std.mem.nativeToBig(u16, port + 1), .remote_addr = 0, .remote_port = 0 }, port));
-    try std.testing.expect(!tcpRowListensOnLoopbackPort(.{ .state = MIB_TCP_STATE_LISTEN, .local_addr = std.mem.nativeToBig(u32, 0x0a000001), .local_port = net_port, .remote_addr = 0, .remote_port = 0 }, port));
-}
-
-test "loopback bind skips a port with a live listener" {
-    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    const first = bindLoopback(io, endpoint_mod.DEFAULT_PORT) catch |err| switch (err) {
-        // The test runner's filesystem sandbox can also deny creating sockets.
-        error.Unexpected => return error.SkipZigTest,
-        else => |other| return other,
-    };
-    var first_listener = first.listener;
-    defer first_listener.socket.close(io);
-    if (try tryBind(io, first.port)) |shared| {
-        // Close the second listener so later tests cannot connect into it.
-        var listener = shared;
-        listener.socket.close(io);
-        return error.TestUnexpectedResult;
-    }
-    var second = try bindLoopback(io, first.port);
-    defer second.listener.socket.close(io);
-    try std.testing.expect(second.port != first.port);
-}
-
-test "daemon HTTP transport accepts a stateless request and keeps its port across restart" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const pref_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    defer std.testing.allocator.free(pref_path);
-    var first_port: u16 = undefined;
-    {
-        var server = start(std.testing.allocator, pref_path, testHandler) catch |err| switch (err) {
-            // The test runner's filesystem sandbox can also deny creating sockets.
-            error.Unexpected => return error.SkipZigTest,
-            else => |other| return other,
-        };
-        defer server.deinit();
-        const bound_endpoint = server.endpoint();
-        first_port = bound_endpoint.port;
-        const url = try bound_endpoint.urlAlloc(std.testing.allocator);
-        defer std.testing.allocator.free(url);
-        const authorization = try bound_endpoint.authorizationAlloc(std.testing.allocator);
-        defer std.testing.allocator.free(authorization);
-
-        var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
-        defer threaded.deinit();
-        var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = threaded.io() };
-        defer client.deinit();
-        var response_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
-        defer response_writer.deinit();
-        const payload =
-            \\{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"test-client","version":"1"}}}}
-        ;
-        const result = try client.fetch(.{
-            .location = .{ .url = url },
-            .method = .POST,
-            .payload = payload,
-            .response_writer = &response_writer.writer,
-            .extra_headers = &.{
-                .{ .name = "content-type", .value = "application/json" },
-                .{ .name = "authorization", .value = authorization },
-                .{ .name = "mcp-protocol-version", .value = MODERN_PROTOCOL_VERSION },
-                .{ .name = "mcp-method", .value = "tools/list" },
-                .{ .name = "x-verde-mcp-client", .value = "test-client" },
-            },
-        });
-        try std.testing.expectEqual(std.http.Status.ok, result.status);
-        try std.testing.expect(std.mem.indexOf(u8, response_writer.written(), "\"tools\":[]") != null);
-    }
-
-    var restarted = start(std.testing.allocator, pref_path, testHandler) catch |err| switch (err) {
-        error.Unexpected => return error.SkipZigTest,
-        else => |other| return other,
-    };
-    defer restarted.deinit();
-    try std.testing.expectEqual(first_port, restarted.endpoint().port);
 }

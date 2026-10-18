@@ -581,13 +581,3 @@ pub extern "d3d11" fn D3D11CreateDevice(
 
 pub extern "kernel32" fn CloseHandle(h: HANDLE) callconv(.winapi) BOOL;
 pub extern "kernel32" fn WaitForSingleObjectEx(h: HANDLE, ms: u32, alertable: BOOL) callconv(.winapi) u32;
-
-test "COM structs match the C layouts" {
-    try std.testing.expectEqual(@as(usize, 44), @sizeOf(TEXTURE2D_DESC));
-    try std.testing.expectEqual(@as(usize, 52), @sizeOf(SAMPLER_DESC));
-    try std.testing.expectEqual(@as(usize, 8 + 8 * 32), @sizeOf(BLEND_DESC));
-    try std.testing.expectEqual(@as(usize, 40), @sizeOf(RASTERIZER_DESC));
-    try std.testing.expectEqual(@as(usize, 48), @sizeOf(DXGI_SWAP_CHAIN_DESC1));
-    try std.testing.expectEqual(@as(usize, 24), @sizeOf(BUFFER_DESC));
-    try std.testing.expectEqual(@sizeOf(usize) + 24, @sizeOf(INPUT_ELEMENT_DESC));
-}

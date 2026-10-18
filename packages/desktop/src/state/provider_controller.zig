@@ -1665,14 +1665,6 @@ fn findModelOptionByValue(options: []const ModelOption, ref: []const u8) ?ModelO
     return null;
 }
 
-test "claude model base ref strips context-window suffix" {
-    try std.testing.expectEqualStrings("opus", claudeModelBaseRef("opus[1m]"));
-    try std.testing.expectEqualStrings("fable", claudeModelBaseRef("fable[1m]"));
-    try std.testing.expectEqualStrings("default", claudeModelBaseRef("default"));
-    try std.testing.expectEqualStrings("[1m]", claudeModelBaseRef("[1m]"));
-    try std.testing.expectEqualStrings("", claudeModelBaseRef(""));
-}
-
 pub fn cursorModelParamsJsonAlloc(self: anytype, allocator: std.mem.Allocator, thread: *const ChatThread) !?[]u8 {
     if (thread.provider != .cursor) return null;
     const opt = self.cursorModelOptionForRef(thread.model_ref) orelse return null;

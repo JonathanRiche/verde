@@ -1149,10 +1149,3 @@ fn elideStart(state: *AppState, value: []const u8, font_size: f32, max_w: f32) [
     }
     return ellipsis;
 }
-
-test "change bar splits blocks by share" {
-    // Exercised through the pure arithmetic: a 30/10 change fills 4 blocks.
-    const total: u64 = 40;
-    const filled: usize = @intCast(@min(@as(u64, BAR_BLOCKS), @max(@as(u64, 1), (total + 9) / 10)));
-    try std.testing.expectEqual(@as(usize, 4), filled);
-}

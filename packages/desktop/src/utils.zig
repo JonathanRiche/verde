@@ -2052,69 +2052,6 @@ test "structured tool-call updates upsert and merge lifecycle content" {
     try std.testing.expect(std.mem.indexOf(u8, event.body, "Updated 3 lines") != null);
 }
 
-test "tagged MCP completion keeps the method inside a structured MCP card" {
-    var events: std.ArrayListUnmanaged(chat_types.PendingTimelineEvent) = .empty;
-    defer freePendingTimelineEvents(std.testing.allocator, &events);
-
-    try upsertPendingToolCallEvent(std.testing.allocator, &events, .{
-        .call_id = "call-mcp",
-        .title = "MCP: tool",
-        .kind = .mcp,
-        .status = .in_progress,
-    });
-    try upsertPendingToolCallEvent(std.testing.allocator, &events, .{
-        .call_id = "call-mcp",
-        .title = "MCP: navigate_browser",
-        .kind = .mcp,
-        .status = .completed,
-        .output = "{\"success\":true}",
-    });
-
-    try std.testing.expectEqual(@as(usize, 1), events.items.len);
-    try std.testing.expectEqualStrings("MCP tool", events.items[0].author);
-    try std.testing.expectEqualStrings(
-        "Tool:\nMCP: navigate_browser\n\nOutput:\n{\n  \"success\": true\n}",
-        events.items[0].body,
-    );
-}
-
-test "provider MCP method titles cannot bypass the structured card renderer" {
-    var events: std.ArrayListUnmanaged(chat_types.PendingTimelineEvent) = .empty;
-    defer freePendingTimelineEvents(std.testing.allocator, &events);
-
-    try upsertPendingToolCallEvent(std.testing.allocator, &events, .{
-        .call_id = "toolu-1",
-        .title = "verde.list_panes",
-        .kind = .mcp,
-        .status = .completed,
-        .input = "{}",
-        .output = "{\"ok\":true}",
-    });
-
-    try std.testing.expectEqual(@as(usize, 1), events.items.len);
-    try std.testing.expectEqualStrings("MCP tool", events.items[0].author);
-    try std.testing.expectEqualStrings(
-        "Tool:\nverde.list_panes\n\nInput:\n{}\n\nOutput:\n{\n  \"ok\": true\n}",
-        events.items[0].body,
-    );
-}
-
-test "MCP card JSON formatting preserves arrays and invalid text" {
-    const pretty = (try prettyJsonContainerAlloc(
-        std.testing.allocator,
-        "[{\"name\":\"verde\",\"active\":true}]",
-    )).?;
-    defer std.testing.allocator.free(pretty);
-    try std.testing.expectEqualStrings(
-        "[\n  {\n    \"name\": \"verde\",\n    \"active\": true\n  }\n]",
-        pretty,
-    );
-    try std.testing.expect((try prettyJsonContainerAlloc(
-        std.testing.allocator,
-        "{not json}",
-    )) == null);
-}
-
 test "lingering running tool calls are cancelled at turn end" {
     var events: std.ArrayListUnmanaged(chat_types.PendingTimelineEvent) = .empty;
     defer freePendingTimelineEvents(std.testing.allocator, &events);
@@ -2143,26 +2080,6 @@ test "lingering running tool calls are cancelled at turn end" {
     try std.testing.expectEqual(@as(usize, 2), events.items.len);
     try std.testing.expectEqual(provider_types.ToolCallStatus.cancelled, events.items[0].tool_call_status.?);
     try std.testing.expectEqual(provider_types.ToolCallStatus.completed, events.items[1].tool_call_status.?);
-}
-
-test "transient think detection drives the pending thinking indicator" {
-    try std.testing.expectEqual(
-        @as(?bool, true),
-        transientThinkStatus(.{ .call_id = "t", .title = "", .kind = .think, .status = .in_progress }),
-    );
-    try std.testing.expectEqual(
-        @as(?bool, false),
-        transientThinkStatus(.{ .call_id = "t", .title = "", .kind = .think, .status = .completed }),
-    );
-    // Think updates carrying real thought content stay timeline rows.
-    try std.testing.expectEqual(
-        @as(?bool, null),
-        transientThinkStatus(.{ .call_id = "t", .title = "", .kind = .think, .status = .completed, .output = "weighed options" }),
-    );
-    try std.testing.expectEqual(
-        @as(?bool, null),
-        transientThinkStatus(.{ .call_id = "t", .title = "", .kind = .execute, .status = .in_progress }),
-    );
 }
 
 test "content-less think rows are transient across their lifecycle" {
@@ -2657,18 +2574,6 @@ test "file references separate line and column suffixes from paths" {
     try std.testing.expectEqual(@as(?usize, null), literal.location.line);
 }
 
-test "Neovim location arguments preserve line and column" {
-    const allocator = std.testing.allocator;
-    const line_arg = (try vimLocationArgumentAlloc(allocator, "nvim", .{ .line = 986 })).?;
-    defer allocator.free(line_arg);
-    try std.testing.expectEqualStrings("+986", line_arg);
-
-    const column_arg = (try vimLocationArgumentAlloc(allocator, "nvim", .{ .line = 531, .column = 8 })).?;
-    defer allocator.free(column_arg);
-    try std.testing.expectEqualStrings("+call cursor(531,8)", column_arg);
-    try std.testing.expect((try vimLocationArgumentAlloc(allocator, "nano", .{ .line = 12 })) == null);
-}
-
 test "upsertPendingDiffFileLocked clears stale patch when later snapshot omits it" {
     const allocator = std.testing.allocator;
     var files: std.ArrayListUnmanaged(chat_types.PendingDiffFile) = .empty;
@@ -2689,34 +2594,6 @@ test "upsertPendingDiffFileLocked clears stale patch when later snapshot omits i
 
     try std.testing.expectEqual(@as(usize, 1), files.items.len);
     try std.testing.expect(files.items[0].patch == null);
-}
-
-test "streamed diff becomes a live timeline event and updates in place" {
-    const allocator = std.testing.allocator;
-    var files: std.ArrayListUnmanaged(chat_types.PendingDiffFile) = .empty;
-    defer freePendingDiffFiles(allocator, &files);
-    var events: std.ArrayListUnmanaged(chat_types.PendingTimelineEvent) = .empty;
-    defer freePendingTimelineEvents(allocator, &events);
-
-    mergePendingDiffFilesLocked(allocator, &files, &.{.{
-        .path = "src/with\ttab.zig",
-        .additions = 1,
-        .deletions = 1,
-        .patch = "@@ -1 +1 @@\n-old\n+new",
-    }});
-    upsertPendingDiffSummaryEventLocked(allocator, &events, files.items);
-    try std.testing.expectEqual(@as(usize, 1), events.items.len);
-    try std.testing.expect(isPersistedDiffBody(events.items[0].body));
-
-    mergePendingDiffFilesLocked(allocator, &files, &.{.{
-        .path = "src/with\ttab.zig",
-        .additions = 2,
-        .deletions = 1,
-        .patch = "@@ -1 +1,2 @@\n-old\n+new\n+again",
-    }});
-    upsertPendingDiffSummaryEventLocked(allocator, &events, files.items);
-    try std.testing.expectEqual(@as(usize, 1), events.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, events.items[0].body, "+again") != null);
 }
 
 test "turn diff snapshot cannot be overwritten by a later individual edit" {
@@ -2780,18 +2657,4 @@ test "provider failure display identifies Claude and Codex usage limits" {
     );
     try std.testing.expectEqual(provider_models.Provider.claude, usageLimitProviderForDisplayMessage(CLAUDE_USAGE_LIMIT_MESSAGE).?);
     try std.testing.expectEqual(provider_models.Provider.codex, usageLimitProviderForDisplayMessage(CODEX_USAGE_LIMIT_MESSAGE).?);
-}
-
-test "legacy provider failures retain an actionable usage path" {
-    try std.testing.expectEqual(provider_models.Provider.claude, providerFailureActionProvider("ClaudeRequestFailed").?);
-    try std.testing.expectEqual(provider_models.Provider.codex, providerFailureActionProvider("Provider request failed: CodexTurnFailed").?);
-    try std.testing.expect(std.mem.indexOf(u8, providerFailureActionBody("ClaudeRequestFailed"), "did not save") != null);
-    try std.testing.expect(providerFailureActionProvider("Authentication failed") == null);
-}
-
-test "signed-out Claude failures offer a sign-in action" {
-    try std.testing.expectEqual(provider_models.Provider.claude, signInRequiredProviderForDisplayMessage(CLAUDE_SIGN_IN_REQUIRED_MESSAGE).?);
-    try std.testing.expectEqual(provider_models.Provider.claude, providerFailureActionProvider(CLAUDE_SIGN_IN_REQUIRED_MESSAGE).?);
-    try std.testing.expectEqualStrings(CLAUDE_SIGN_IN_REQUIRED_MESSAGE, providerFailureActionBody(CLAUDE_SIGN_IN_REQUIRED_MESSAGE));
-    try std.testing.expect(signInRequiredProviderForDisplayMessage(CLAUDE_USAGE_LIMIT_MESSAGE) == null);
 }

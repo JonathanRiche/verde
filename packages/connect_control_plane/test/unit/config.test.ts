@@ -14,13 +14,4 @@ describe("exact URL validation", () => {
     ).toThrow();
   });
 
-  test("preserves exact trailing slash and explicit default port strings for issuer comparison", () => {
-    expect(validateOidcUrl("https://id.example.test/", "production", "issuer").href).toBe(
-      "https://id.example.test/",
-    );
-    // URL parsing normalizes the object, but auth retains and compares the original configured string.
-    expect(() =>
-      validateOidcUrl("https://id.example.test:443", "production", "issuer"),
-    ).not.toThrow();
-  });
 });

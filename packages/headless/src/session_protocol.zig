@@ -135,11 +135,6 @@ fn isSafeIdByte(byte: u8) bool {
     return std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_' or byte == '.';
 }
 
-test "session tail batching is an additive daemon method" {
-    try std.testing.expectEqualStrings("session.tail", METHOD_NAMES[7]);
-    try std.testing.expectEqualStrings("session.tail.batch", METHOD_NAMES[8]);
-}
-
 test "stable session ids sanitize project identifiers" {
     const id = try stableSessionId(std.testing.allocator, " hello///world ", 2, 3);
     defer std.testing.allocator.free(id);

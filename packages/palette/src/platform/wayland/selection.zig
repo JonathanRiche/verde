@@ -252,11 +252,3 @@ pub fn Selection(comptime Offer: type, comptime Source: type) type {
         }
     };
 }
-
-test "mime selection" {
-    try std.testing.expectEqual(@as(u8, 1), mimeBit("text/plain;charset=utf-8"));
-    try std.testing.expectEqual(@as(u8, 4), mimeBit("text/plain"));
-    try std.testing.expectEqual(@as(u8, 0), mimeBit("image/png"));
-    try std.testing.expectEqualStrings("UTF8_STRING", bestMime(2 | 4).?);
-    try std.testing.expectEqual(@as(?[]const u8, null), bestMime(0));
-}

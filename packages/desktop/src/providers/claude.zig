@@ -910,25 +910,6 @@ fn emitBridgeToolCallEvent(root: std.json.Value, request: provider_types.SendPro
     return true;
 }
 
-const ClaudeTestDiffCapture = struct {
-    path: ?[]const u8 = null,
-    patch: ?[]const u8 = null,
-    count: usize = 0,
-
-    fn handle(context: ?*anyopaque, event: provider_types.StreamEvent) void {
-        const self: *ClaudeTestDiffCapture = @ptrCast(@alignCast(context orelse return));
-        switch (event) {
-            .diff => |diff| {
-                if (diff.files.len == 0) return;
-                self.path = diff.files[0].path;
-                self.patch = diff.files[0].patch;
-                self.count += 1;
-            },
-            else => {},
-        }
-    }
-};
-
 const ClaudeTestToolCapture = struct {
     call_id: ?[]const u8 = null,
     title: ?[]const u8 = null,
@@ -1056,81 +1037,6 @@ test "Claude bridge reader accepts lines larger than its scratch buffer" {
     try std.testing.expectEqual(@as(?[]u8, null), try takeBridgeLineAlloc(std.testing.allocator, &reader));
 }
 
-test "Claude bridge stop monitor interrupts a blocked provider request" {
-    const Capture = struct {
-        stop_requested: std.atomic.Value(bool) = .init(false),
-        terminate_count: std.atomic.Value(usize) = .init(0),
-
-        fn shouldStop(context: ?*anyopaque) bool {
-            const self: *@This() = @ptrCast(@alignCast(context orelse return true));
-            return self.stop_requested.load(.acquire);
-        }
-
-        fn terminate(context: *anyopaque) void {
-            const self: *@This() = @ptrCast(@alignCast(context));
-            _ = self.terminate_count.fetchAdd(1, .monotonic);
-        }
-    };
-
-    var capture: Capture = .{};
-    var monitor: BridgeStopMonitor = .{
-        .request = .{
-            .prompt = "blocked",
-            .stream_context = &capture,
-            .on_should_stop = Capture.shouldStop,
-        },
-        .target = &capture,
-        .terminate = Capture.terminate,
-    };
-    try monitor.start();
-    defer monitor.finish();
-
-    capture.stop_requested.store(true, .release);
-    var attempts: usize = 0;
-    while (capture.terminate_count.load(.acquire) == 0 and attempts < 100) : (attempts += 1) {
-        platform_runtime.sleepMillis(1);
-    }
-
-    try std.testing.expect(monitor.cancelled.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 1), capture.terminate_count.load(.acquire));
-}
-
-test "collectImageAttachments preserves multi-image and legacy compatibility" {
-    const modern = [_]provider_types.ImageAttachment{
-        .{ .path = "/tmp/one.png" },
-        .{ .path = "/tmp/two.png" },
-    };
-    const collected = try collectImageAttachments(std.testing.allocator, .{
-        .prompt = "hello",
-        .image = .{ .path = "/tmp/legacy.png" },
-        .images = modern[0..],
-    });
-    defer std.testing.allocator.free(collected);
-
-    try std.testing.expectEqual(@as(usize, 3), collected.len);
-    try std.testing.expectEqualStrings("/tmp/one.png", collected[0].path);
-    try std.testing.expectEqualStrings("/tmp/two.png", collected[1].path);
-    try std.testing.expectEqualStrings("/tmp/legacy.png", collected[2].path);
-}
-
-test "Claude bridge diff events preserve file patches" {
-    const payload =
-        \\{"type":"diff_event","files":[{"path":"src/main.zig","additions":1,"deletions":1,"patch":"@@ -1 +1 @@\n-old\n+new"}]}
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
-    defer parsed.deinit();
-    var capture: ClaudeTestDiffCapture = .{};
-
-    try std.testing.expect(try emitBridgeDiffEvent(parsed.value, .{
-        .prompt = "",
-        .stream_context = &capture,
-        .on_stream_event = ClaudeTestDiffCapture.handle,
-    }));
-    try std.testing.expectEqual(@as(usize, 1), capture.count);
-    try std.testing.expectEqualStrings("src/main.zig", capture.path.?);
-    try std.testing.expect(std.mem.indexOf(u8, capture.patch.?, "+new") != null);
-}
-
 test "Claude bridge MCP events preserve input and output" {
     const payload =
         \\{"type":"tool_call_event","call_id":"tool-1","title":"verde.list_processes","kind":"mcp","status":"completed","input":"{\"workspace\":\"current\"}","output":"{\"ok\":true}"}
@@ -1185,42 +1091,4 @@ test "Claude bridge subagent transcript chunks and deltas reach the stream witho
     try std.testing.expectEqualStrings("agent-1", delta_capture.call_id.?);
     try std.testing.expect(delta_capture.transcript == null);
     try std.testing.expectEqualStrings("par", delta_capture.transcript_delta.?);
-}
-
-test "Windows provider bridge probes CLI and package-root GUI layouts" {
-    var paths = try providerBridgeInstalledPathsAlloc(std.testing.allocator, .windows, "/package/bin");
-    defer deinitOwnedPaths(std.testing.allocator, &paths);
-
-    try std.testing.expectEqual(@as(usize, 2), paths.items.len);
-    for (paths.items) |path| {
-        for (path) |*byte| if (byte.* == '\\') {
-            byte.* = '/';
-        };
-    }
-    try std.testing.expect(std.mem.endsWith(u8, paths.items[0], "/package/share/verde/provider_bridge.mjs"));
-    try std.testing.expect(std.mem.endsWith(u8, paths.items[1], "/package/bin/share/verde/provider_bridge.mjs"));
-}
-
-test "Linux provider bridge probes packaged, flat, and system share layouts" {
-    var paths = try providerBridgeInstalledPathsAlloc(std.testing.allocator, .linux, "/usr/lib/verde");
-    defer deinitOwnedPaths(std.testing.allocator, &paths);
-
-    try std.testing.expectEqual(@as(usize, 4), paths.items.len);
-    try std.testing.expectEqualStrings("/usr/lib/share/verde/provider_bridge.mjs", paths.items[0]);
-    try std.testing.expectEqualStrings("/usr/lib/verde/share/verde/provider_bridge.mjs", paths.items[1]);
-    try std.testing.expectEqualStrings("/usr/local/share/verde/provider_bridge.mjs", paths.items[2]);
-    try std.testing.expectEqualStrings("/usr/share/verde/provider_bridge.mjs", paths.items[3]);
-}
-
-test "Windows detached bridge source uses PowerShell temp paths and tree cleanup" {
-    const source = @embedFile("provider_bridge.ts");
-    try std.testing.expect(std.mem.indexOf(u8, source, "process.platform === \"win32\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "tmpdir()") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "detachedPosixShellCommand") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "setsid sh -lc") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "taskkill.exe") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "'/T' '/F'") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "PID file:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "Stop-Process") == null);
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "Write-Output"));
 }

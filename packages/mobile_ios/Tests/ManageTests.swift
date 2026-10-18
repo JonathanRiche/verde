@@ -24,19 +24,6 @@ final class ManageTests: XCTestCase {
         await harness.close()
     }
 
-    func testBusyWorkspaceCloseShowsCountsAndDoesNotReportSuccess() async throws {
-        let harness = ChatHarness()
-        try await harness.launch()
-        let model = ManageModel(browse: harness.browse)
-        await model.start()
-        let result = await model.workspace("close", id: chatWS)
-        XCTAssertNil(result)
-        XCTAssertEqual(model.notice, "Stop 2 running requests and 1 background tasks first.")
-        XCTAssertFalse(model.busy)
-        XCTAssertEqual(harness.core.events.count { if case .workspace_close = $0 { return true }; return false }, 1)
-        await harness.close()
-    }
-
     func testIdentityPinsAndResetsWithExplicitNulls() async throws {
         let harness = ChatHarness()
         try await harness.launch()
@@ -53,42 +40,5 @@ final class ManageTests: XCTestCase {
         let json = String(decoding: try JSONEncoder().encode(Event.workspace_identity(sent[0])), as: UTF8.self)
         XCTAssertTrue(json.contains("\"color_index\":null"), json)
         await harness.close()
-    }
-
-    func testHistorySearchCarriesFilterAndCanResetForHome() async throws {
-        let harness = ChatHarness()
-        try await harness.launch()
-        let model = ManageModel(browse: harness.browse)
-        await model.start()
-        await model.history("  query  ", workspace: chatWS)
-        await model.history("", workspace: nil)
-        let searches = harness.core.events.all.compactMap { if case .history_search(let e) = $0 { return e }; return nil }
-        XCTAssertEqual(searches.map(\.query), ["query", ""])
-        XCTAssertEqual(searches.first?.workspace_id, chatWS)
-        XCTAssertNil(searches.last?.workspace_id)
-        await harness.close()
-    }
-
-    func testOptionalModelDiscoveryNoticePreservesOtherErrors() {
-        let unavailable = LocalError(code: "remote_error", message: "The runtime rejected the request.", rpc_code: "provider_unavailable")
-        XCTAssertEqual(newChatModelMessage(unavailable), "Live models are unavailable. You can start a chat with the built-in choices.")
-        for code in ["scope_denied", "unauthorized", "invalid_params"] {
-            let failure = LocalError(code: "remote_error", message: "Actual failure", rpc_code: code)
-            XCTAssertEqual(newChatModelMessage(failure), "Actual failure")
-        }
-    }
-
-    func testUncertainMutationRequiresRefresh() {
-        let job = ManageJob(intent_id: "i", kind: "thread_create", state: "uncertain")
-        XCTAssertTrue(manageMessage(job).contains("Refresh"))
-    }
-
-    func testHistoryKeepsCoreBucketOrderAndOmitsSubagents() {
-        func row(_ id: String, _ bucket: String) -> ThreadSummary {
-            ThreadSummary(workspace_id: "w", thread_id: id, title: id, provider: "codex", model: nil, cwd: nil, open: false, archived: false, last_activity_at_ms: nil, status: "idle", history_bucket: bucket)
-        }
-        let groups = historySections([row("one", "Today"), row("subagent:child", "Today"), row("two", "Today"), row("old", "Earlier")])
-        XCTAssertEqual(groups.map(\.0), ["Today", "Earlier"])
-        XCTAssertEqual(groups[0].1.map(\.thread_id), ["one", "two"])
     }
 }

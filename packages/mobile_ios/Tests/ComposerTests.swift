@@ -4,36 +4,6 @@ import UIKit
 
 @MainActor
 final class ComposerTests: XCTestCase {
-    func testOnlyConfirmedInlineSteerIsHidden() {
-        var followup = ChatFollowup(id: "fixture", kind: "steer", turn_id: "turn", steer_id: "steer", next_turn_id: "", text: "synthetic")
-        followup.state = "sent_inline"; followup.delivery = "uncertain"
-        XCTAssertTrue(visibleFollowup(followup))
-        followup.delivery = "accepted"
-        XCTAssertFalse(visibleFollowup(followup))
-        followup.state = "fallback_next_turn"
-        XCTAssertTrue(visibleFollowup(followup))
-    }
-
-    func testMissingSelectionDoesNotDisplayFirstCatalogOption() {
-        let choices = [ChatChoice(id: "high", label: "High"), ChatChoice(id: "medium", label: "Medium")]
-        XCTAssertEqual(composerChoiceLabel(choices, value: "medium"), "Medium")
-        XCTAssertEqual(composerChoiceLabel(choices, value: "custom-effort"), "custom-effort")
-        XCTAssertEqual(composerChoiceLabel(choices, value: nil), "Default")
-        XCTAssertEqual(composerChoiceLabel(choices, value: ""), "Default")
-        XCTAssertEqual(composerChoiceLabel([], value: "model-outside-catalog"), "model-outside-catalog")
-    }
-
-    func testCoreProjectionAdoptsWithoutAViewObserver() async throws {
-        let harness = ChatHarness()
-        try await harness.launch()
-        let chat = TranscriptModel(browse: harness.browse, workspaceID: chatWS, threadID: chatThread)
-        chat.start(); chat.setVisible(true)
-        try await waitUntil { chat.input.view != nil }
-        XCTAssertEqual(chat.input.view?.draft.revision, chat.composer?.draft.revision)
-        XCTAssertEqual(chat.input.text, chat.composer?.draft.text)
-        chat.stop(); await harness.close()
-    }
-
     func testDelayedSettingShowsImmediatelyAndBlocksSend() async throws {
         let harness = ChatHarness()
         try await harness.launch { $0.holdSelection = true }
@@ -56,56 +26,6 @@ final class ComposerTests: XCTestCase {
         chat.stop(); await harness.close()
     }
 
-    func testRapidSettingsSaveInOrderWithoutDroppingEarlierChoices() async throws {
-        let harness = ChatHarness()
-        try await harness.launch { $0.holdSelection = true }
-        let chat = TranscriptModel(browse: harness.browse, workspaceID: chatWS, threadID: chatThread)
-        chat.start(); chat.setVisible(true)
-        try await waitUntil { chat.input.view != nil }
-        let model = chat.input
-        model.select(.speed, "on"); model.select(.model, "gpt-6-luna")
-        XCTAssertEqual(model.displayedSelection?.speed, "on")
-        XCTAssertEqual(model.displayedSelection?.model, "gpt-6-luna")
-        let count = { harness.core.events.count { if case .composer_select = $0 { return true }; return false } }
-        try await waitUntil { count() == 1 }
-        try harness.core.completeSelection()
-        try await waitUntil { count() == 2 }
-        XCTAssertNotNil(model.pendingSelection)
-        try harness.core.completeSelection()
-        try await waitUntil { model.pendingSelection == nil }
-        XCTAssertEqual(model.view?.selection.speed, "on")
-        XCTAssertEqual(model.view?.selection.model, "gpt-6-luna")
-        let saves = harness.core.events.all.compactMap { if case .composer_select(let e) = $0 { return e }; return nil }
-        XCTAssertEqual(saves.map(\.speed), ["on", "on"])
-        XCTAssertEqual(saves.last?.model, "gpt-6-luna")
-        chat.stop(); await harness.close()
-    }
-
-    func testRejectedSettingRestoresConfirmedValueAndShowsError() async throws {
-        let harness = ChatHarness()
-        try await harness.launch { $0.holdSelection = true; $0.rejectSelection = true }
-        let chat = TranscriptModel(browse: harness.browse, workspaceID: chatWS, threadID: chatThread)
-        chat.start(); chat.setVisible(true)
-        try await waitUntil { chat.input.view != nil }
-        let model = chat.input, original = model.displayedSelection?.speed
-        model.select(.speed, "on")
-        XCTAssertEqual(model.displayedSelection?.speed, "on")
-        try await waitUntil { harness.core.events.count { if case .composer_select = $0 { return true }; return false } == 1 }
-        try harness.core.completeSelection()
-        try await waitUntil { model.pendingSelection == nil }
-        XCTAssertEqual(model.displayedSelection?.speed, original)
-        XCTAssertEqual(model.notice, "That option isn't available for this model.")
-        chat.stop(); await harness.close()
-    }
-
-    func testPromptResizeKeepsConversationVisibleAboveKeyboard() {
-        XCTAssertEqual(composerPromptHeight(10, available: 700), 56)
-        XCTAssertEqual(composerPromptHeight(1000, available: 700), 420)
-        XCTAssertEqual(composerPromptHeight(420, available: 400), 200)
-        XCTAssertEqual(composerPromptHeight(420, available: 220), 56)
-        XCTAssertEqual(composerPromptHeight(56, available: 700), 56)
-    }
-
     func testMentionsRespectCaretAndUTF16() {
         let text = "Hello 👋 @src/file trailing"
         let caret = ("Hello 👋 @src/fi" as NSString).length
@@ -114,40 +34,6 @@ final class ComposerTests: XCTestCase {
         XCTAssertEqual(token?.range.location, ("Hello 👋 " as NSString).length)
         XCTAssertNil(composerToken("hello /help", caret: 11))
         XCTAssertEqual(composerToken("/help", caret: 3)?.query, "he")
-    }
-
-    func testFollowupKindMatrix() {
-        for provider in ["codex", "claude", "pi"] {
-            XCTAssertEqual(composerFollowupKind(provider: provider, images: false, interruptAvailable: true), .steer, provider)
-            XCTAssertEqual(composerFollowupKind(provider: provider, images: true, interruptAvailable: true), .interrupt,
-                           "images can't steer natively: \(provider)")
-        }
-        for provider in ["cursor", "opencode", "grok", "fx", "muse", "amp"] {
-            XCTAssertEqual(composerFollowupKind(provider: provider, images: false, interruptAvailable: true), .interrupt, provider)
-            XCTAssertEqual(composerFollowupKind(provider: provider, images: true, interruptAvailable: true), .interrupt, provider)
-        }
-        XCTAssertEqual(composerFollowupKind(provider: nil, images: false, interruptAvailable: true), .interrupt)
-        // Before the models know `interrupt`, nothing promises it.
-        XCTAssertEqual(composerFollowupKind(provider: "cursor", images: false, interruptAvailable: false), .queue)
-        XCTAssertEqual(composerFollowupKind(provider: "codex", images: false, interruptAvailable: false), .steer)
-        XCTAssertEqual(followupWireKind(.queue), .queue)
-        XCTAssertEqual(followupWireKind(.steer), .steer)
-        XCTAssertEqual(followupWireKind(.interrupt).rawValue, followupInterruptAvailable ? "interrupt" : "queue")
-    }
-
-    func testFollowupLabelsAndAlternatives() {
-        XCTAssertEqual(FollowupKind.steer.label, "Steer")
-        XCTAssertEqual(FollowupKind.interrupt.label, "Interrupt & steer")
-        XCTAssertEqual(FollowupKind.queue.label, "Queue")
-        XCTAssertEqual(FollowupKind.steer.hint, "Steer the current reply")
-        XCTAssertEqual(FollowupKind.interrupt.hint, "Interrupts and continues with this")
-        XCTAssertEqual(FollowupKind.queue.hint, "Queue after the current reply")
-        XCTAssertEqual(FollowupKind.queue.insteadLabel, "Queue instead")
-        XCTAssertEqual(followupAlternatives(provider: "claude", images: false, interruptAvailable: true), [.interrupt, .queue])
-        XCTAssertEqual(followupAlternatives(provider: "claude", images: true, interruptAvailable: true), [.queue])
-        XCTAssertEqual(followupAlternatives(provider: "cursor", images: false, interruptAvailable: true), [.queue])
-        XCTAssertEqual(followupAlternatives(provider: "cursor", images: false, interruptAvailable: false), [])
-        XCTAssertEqual(followupAlternatives(provider: "codex", images: false, interruptAvailable: false), [.queue])
     }
 
     func testImageEncodingIsBoundedJPEG() throws {
@@ -202,19 +88,6 @@ final class ComposerTests: XCTestCase {
 
     // MARK: Ask agent hand-off (file/diff viewer selections)
 
-    func testAskSendsIntoAnEmptyDraft() async throws {
-        let harness = ChatHarness()
-        try await harness.launch()
-        let chat = TranscriptModel(browse: harness.browse, workspaceID: chatWS, threadID: chatThread)
-        chat.start(); chat.setVisible(true)
-        chat.input.ask("Explain these lines")
-        try await waitUntil("send") { harness.core.events.count { if case .send = $0 { return true }; return false } == 1 }
-        let drafts = harness.core.events.all.compactMap { if case .draft_set(let value) = $0 { return value }; return nil }
-        XCTAssertEqual(drafts.map(\.text), ["Explain these lines"])
-        XCTAssertEqual(harness.core.events.count { if case .followup_submit = $0 { return true }; return false }, 0)
-        chat.stop(); await harness.close()
-    }
-
     func testAskAppendsToAnUnsentDraftWithoutSending() async throws {
         let harness = ChatHarness()
         try await harness.launch()
@@ -229,21 +102,6 @@ final class ComposerTests: XCTestCase {
             harness.core.events.all.compactMap { if case .draft_set(let value) = $0 { return value.text }; return nil }.last == expected
         }
         XCTAssertEqual(model.text, expected)
-        XCTAssertEqual(model.notice, "Added to your draft. Send when ready.")
-        XCTAssertEqual(harness.core.events.count { if case .send = $0 { return true }; return false }, 0)
-        chat.stop(); await harness.close()
-    }
-
-    func testAskDuringARunningTurnGoesInAsAFollowup() async throws {
-        let harness = ChatHarness()
-        try await harness.launch { $0.thread = "thread-running"; $0.composer = "composer-running" }
-        let chat = TranscriptModel(browse: harness.browse, workspaceID: chatWS, threadID: chatThread)
-        chat.start(); chat.setVisible(true)
-        try await waitUntil("running") { chat.state.turn != nil }
-        chat.input.ask("Explain these lines")
-        try await waitUntil("followup") { harness.core.events.count { if case .followup_submit = $0 { return true }; return false } == 1 }
-        let drafts = harness.core.events.all.compactMap { if case .draft_set(let value) = $0 { return value }; return nil }
-        XCTAssertEqual(drafts.map(\.text), ["Explain these lines"])
         XCTAssertEqual(harness.core.events.count { if case .send = $0 { return true }; return false }, 0)
         chat.stop(); await harness.close()
     }

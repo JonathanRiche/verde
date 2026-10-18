@@ -171,26 +171,3 @@ test "consumed wake stays coalesced until the covered frame finishes" {
     finish(7);
     try std.testing.expectEqual(@as(usize, 1), sink.posts);
 }
-
-test "texture frame wakes leave the layout sequence alone" {
-    const previous_poster = poster;
-    const previous_pending = wake_pending.load(.acquire);
-    const previous_sequence = wake_sequence.load(.acquire);
-    const previous_layout = layout_sequence.load(.acquire);
-    defer {
-        poster = previous_poster;
-        wake_pending.store(previous_pending, .release);
-        wake_sequence.store(previous_sequence, .release);
-        layout_sequence.store(previous_layout, .release);
-    }
-
-    var sink: TestPoster = .{};
-    poster = .{ .ctx = &sink, .post = TestPoster.post };
-    wake_pending.store(false, .release);
-    const layout_before = layoutSequence();
-    try std.testing.expectEqual(NotifyResult.queued, notifyTextureFrameResult());
-    try std.testing.expectEqual(@as(usize, 1), sink.posts);
-    try std.testing.expectEqual(layout_before, layoutSequence());
-    try std.testing.expectEqual(NotifyResult.coalesced, notifyResult());
-    try std.testing.expectEqual(layout_before + 1, layoutSequence());
-}

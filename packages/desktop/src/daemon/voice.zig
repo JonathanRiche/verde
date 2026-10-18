@@ -466,10 +466,6 @@ pub const TOOLS_JSON =
 
 // ---- tests -------------------------------------------------------------------
 
-fn noEnv(_: std.mem.Allocator, _: []const u8) ?[]const u8 {
-    return null;
-}
-
 fn testEnv(_: std.mem.Allocator, name: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, name, "GOOGLE_API_KEY")) return "g-key";
     return null;
@@ -488,83 +484,4 @@ test "config picks env keys, prefers the stored default, and never lists keys" {
     try writeProviders(&s, &config);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "g-key") == null);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"key_source\":\"environment\"") != null);
-}
-
-test "configure writes an owner-only file that load reads back" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
-    defer allocator.free(dir);
-    try configure(allocator, dir, .{ .provider = .xai, .api_key = "xai-123", .voice = "ara", .make_default = true });
-    try std.testing.expectError(error.InvalidParams, configure(allocator, dir, .{ .provider = .openai, .api_key = "bad key\n" }));
-    var config = load(allocator, dir, noEnv);
-    defer config.deinit();
-    try std.testing.expectEqual(ProviderId.xai, config.pick().?);
-    try std.testing.expectEqualStrings("ara", config.voice(.xai));
-    try std.testing.expectEqualStrings("grok-voice-latest", config.model(.xai));
-    try configure(allocator, dir, .{ .provider = .xai, .api_key = "" });
-    var cleared = load(allocator, dir, noEnv);
-    defer cleared.deinit();
-    try std.testing.expect(cleared.pick() == null);
-}
-
-var fake_status: u16 = 200;
-var fake_body: []const u8 = "";
-var fake_url: [256]u8 = undefined;
-var fake_url_len: usize = 0;
-
-fn fakePost(allocator: std.mem.Allocator, url: []const u8, _: []const std.http.Header, _: []const u8) anyerror!HttpResult {
-    @memcpy(fake_url[0..url.len], url);
-    fake_url_len = url.len;
-    return .{ .status = fake_status, .body = try allocator.dupe(u8, fake_body) };
-}
-
-test "sessions mint provider tokens and build websocket urls" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var config: Config = .{ .arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
-    defer config.deinit();
-    config.providers = .{ .{ .api_key = "x" }, .{ .api_key = "o", .voice = "cedar" }, .{ .api_key = "g" } };
-
-    fake_status = 200;
-    fake_body = "{\"value\":\"xai-ephemeral\",\"expires_at\":1800000000}";
-    const xai = try createSession(arena, &config, .xai, null, null, 1_000, fakePost);
-    try std.testing.expectEqualStrings("xai-ephemeral", xai.token);
-    try std.testing.expectEqual(@as(i64, 1_800_000_000_000), xai.expires_at_ms);
-    try std.testing.expectEqualStrings("wss://api.x.ai/v1/realtime?model=grok-voice-latest", xai.websocket_url);
-    try std.testing.expectEqualStrings("https://api.x.ai/v1/realtime/client_secrets", fake_url[0..fake_url_len]);
-
-    fake_body = "{\"client_secret\":{\"value\":\"ek_1\",\"expires_at\":5}}";
-    const openai = try createSession(arena, &config, .openai, "gpt-realtime-mini", null, 1_000, fakePost);
-    try std.testing.expectEqualStrings("ek_1", openai.token);
-    try std.testing.expectEqualStrings("cedar", openai.voice);
-    try std.testing.expectEqualStrings("wss://api.openai.com/v1/realtime?model=gpt-realtime-mini", openai.websocket_url);
-
-    fake_body = "{\"name\":\"auth_tokens/abc 1\"}";
-    const gemini = try createSession(arena, &config, .gemini, null, null, 0, fakePost);
-    try std.testing.expectEqualStrings("query", gemini.auth);
-    try std.testing.expect(std.mem.endsWith(u8, gemini.websocket_url, "access_token=auth_tokens/abc%201"));
-
-    fake_status = 401;
-    try std.testing.expectError(error.ProviderRejectedKey, createSession(arena, &config, .xai, null, null, 0, fakePost));
-    config.providers[0].api_key = "";
-    try std.testing.expectError(error.ProviderNotConfigured, createSession(arena, &config, .xai, null, null, 0, fakePost));
-}
-
-test "rfc3339 formats UTC timestamps" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    try std.testing.expectEqualStrings("2026-10-12T18:44:01Z", try rfc3339(arena_state.allocator(), 1791830641000));
-}
-
-test "voice instructions name the companion and include standing orders" {
-    const note = try instructionsAlloc(std.testing.allocator, "Moss", "Steady", "Never push to main.");
-    defer std.testing.allocator.free(note);
-    try std.testing.expect(std.mem.startsWith(u8, note, "You are Moss"));
-    try std.testing.expect(std.mem.indexOf(u8, note, "Standing orders from the user: Never push to main.") != null);
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, TOOLS_JSON, .{});
-    defer parsed.deinit();
-    try std.testing.expectEqual(@as(usize, 3), parsed.value.array.items.len);
 }

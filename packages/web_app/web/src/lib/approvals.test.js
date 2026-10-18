@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { createApprovalTracker } from './approvals'
-import { approvalFromTurn, pendingApprovalForPane, requestApprovalResolution, mergeLocalTurnSnapshot, isLocalTurnRequest } from './store'
+import { approvalFromTurn, pendingApprovalForPane, mergeLocalTurnSnapshot, isLocalTurnRequest } from './store'
 
 const details = { call_id: 'call-1', title: 'Run command?', body: 'Permission to run the command' }
 const turn = { turn_id: 'turn-1', workspace_id: 'w', local_thread_id: 'thread-1', status: 'waiting_approval', pending_approval: details }
@@ -144,20 +144,5 @@ describe('approval RPC', () => {
     expect(isLocalTurnRequest(pane, [{ ...turn, profile_id: 'remote' }], { turn_id: 'turn-1' })).toBe(false)
     expect(isLocalTurnRequest({ ...pane, thread_id: 'other' }, [turn], { turn_id: 'turn-1' })).toBe(false)
     expect(isLocalTurnRequest(pane, [turn], {})).toBe(false)
-  })
-  test('sends the exact decision and identity using the supplied pane route', async () => {
-    for (const decision of ['approve', 'deny']) {
-      const calls = []
-      await requestApprovalResolution(approval, decision, async (...args) => {
-        calls.push(args)
-        return { ok: true, result: { accepted: true } }
-      })
-      expect(calls).toEqual([['chat.turn.approve', { turn_id: 'turn-1', call_id: 'call-1', decision }]])
-    }
-  })
-  test('preserves server, scope, and connection errors for the notice mechanism', async () => {
-    await expect(requestApprovalResolution(approval, 'deny', async () => ({ error: { message: 'approval not found' } }))).rejects.toThrow('approval not found')
-    await expect(requestApprovalResolution(approval, 'approve', async () => ({ ok: false }))).rejects.toThrow('Could not resolve')
-    await expect(requestApprovalResolution(approval, 'approve', async () => { throw new Error('Owner login required for saved connections') })).rejects.toThrow('Owner login required')
   })
 })

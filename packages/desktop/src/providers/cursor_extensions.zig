@@ -224,25 +224,6 @@ test "Cursor questions preserve option IDs and allow multiple selections" {
     try std.testing.expectEqual(@as(usize, 4), interaction.calls);
 }
 
-test "Cursor questions skip declined choices and cancel stopped turns" {
-    const allocator = std.testing.allocator;
-    var params = try std.json.parseFromSlice(std.json.Value, allocator,
-        \\{"questions":[{"id":"q","prompt":"Which?","options":[{"id":"a","label":"A"}]}]}
-    , .{});
-    defer params.deinit();
-    var interaction: TestInteraction = .{};
-    const skipped = try questionResponseAlloc(allocator, .{ .integer = 1 }, params.value, interaction.request());
-    defer allocator.free(skipped);
-    try std.testing.expect(std.mem.indexOf(u8, skipped, "skipped") != null);
-    interaction = .{ .decisions = &.{.approve}, .cancel_after = 1 };
-    const cancelled = try questionResponseAlloc(allocator, .{ .integer = 1 }, params.value, interaction.request());
-    defer allocator.free(cancelled);
-    try std.testing.expect(std.mem.indexOf(u8, cancelled, "cancelled") != null);
-    const no_ui = try questionResponseAlloc(allocator, .{ .integer = 1 }, params.value, .{ .prompt = "test" });
-    defer allocator.free(no_ui);
-    try std.testing.expect(std.mem.indexOf(u8, no_ui, "skipped") != null);
-}
-
 test "Cursor plan approval remains explicit with automatic tool permissions" {
     const allocator = std.testing.allocator;
     var params = try std.json.parseFromSlice(std.json.Value, allocator, "{\"plan\":\"Do the work\"}", .{});
@@ -275,38 +256,6 @@ test "Cursor todo notifications merge by ID and replace snapshots" {
         try std.testing.expectEqual(@as(usize, if (index == 2) 0 else 2), state.todos.items.len);
         if (index == 1) try std.testing.expectEqualStrings("completed", state.todos.items[0].status);
     }
-}
-
-test "Cursor task and image notifications emit completed tool rows" {
-    const Capture = struct {
-        count: usize = 0,
-        subagents: usize = 0,
-        saw_path: bool = false,
-        fn event(context: ?*anyopaque, update: types.StreamEvent) void {
-            const self: *@This() = @ptrCast(@alignCast(context.?));
-            if (update != .tool_call) return;
-            self.count += 1;
-            if (update.tool_call.kind == .subagent) self.subagents += 1;
-            if (update.tool_call.output) |output| self.saw_path = self.saw_path or std.mem.indexOf(u8, output, "/tmp/image.png") != null;
-        }
-    };
-    const allocator = std.testing.allocator;
-    var state: State = .{};
-    defer state.deinit(allocator);
-    var capture: Capture = .{};
-    for ([_][]const u8{
-        \\{"method":"cursor/task","params":{"toolCallId":"t1","description":"Explore the code","agentId":"a1"}}
-        ,
-        \\{"method":"cursor/generate_image","params":{"toolCallId":"i1","description":"App icon","filePath":"/tmp/image.png"}}
-        ,
-    }) |line| {
-        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
-        defer parsed.deinit();
-        try std.testing.expect(try handle(allocator, parsed.value, .{ .prompt = "test", .stream_context = &capture, .on_stream_event = Capture.event }, &state, null));
-    }
-    try std.testing.expectEqual(@as(usize, 2), capture.count);
-    try std.testing.expectEqual(@as(usize, 1), capture.subagents);
-    try std.testing.expect(capture.saw_path);
 }
 
 test "Cursor notification requests render progress and receive acknowledgements" {

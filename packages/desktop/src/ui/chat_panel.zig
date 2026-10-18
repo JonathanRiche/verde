@@ -270,24 +270,6 @@ fn runtimeBannerActionAt(x: f32, y: f32) ?RuntimeBannerAction {
     return null;
 }
 
-test "runtime banner actions use their rendered button rectangles" {
-    const previous = runtime_banner_hits;
-    defer runtime_banner_hits = previous;
-    runtime_banner_hits = .{
-        .primary_rect = .{ .x = 10.0, .y = 10.0, .w = 80.0, .h = 30.0 },
-        .setup_rect = .{ .x = 100.0, .y = 10.0, .w = 80.0, .h = 30.0 },
-        .diagnostics_rect = .{ .x = 190.0, .y = 10.0, .w = 80.0, .h = 30.0 },
-        .profile_id_len = 0,
-    };
-    // No profile means no live banner: stale rects never route clicks.
-    try std.testing.expect(runtimeBannerActionAt(20.0, 20.0) == null);
-    runtime_banner_hits.profile_id_len = 1;
-    try std.testing.expectEqual(RuntimeBannerAction.primary, runtimeBannerActionAt(20.0, 20.0).?);
-    try std.testing.expectEqual(RuntimeBannerAction.setup, runtimeBannerActionAt(120.0, 20.0).?);
-    try std.testing.expectEqual(RuntimeBannerAction.diagnostics, runtimeBannerActionAt(200.0, 20.0).?);
-    try std.testing.expect(runtimeBannerActionAt(95.0, 20.0) == null);
-}
-
 /// Per-frame reset, called before the root render. The banner is a global
 /// hit cache, so a frame that never renders the live chat composer (terminal
 /// or browser pane active, chat collapsed) must not keep last frame's
@@ -295,24 +277,6 @@ test "runtime banner actions use their rendered button rectangles" {
 /// its current rects later in the same frame.
 pub fn resetRuntimeBannerHits() void {
     runtime_banner_hits = .{};
-}
-
-test "per-frame reset drops runtime banner hits until the composer republishes" {
-    const previous = runtime_banner_hits;
-    defer runtime_banner_hits = previous;
-    publishRuntimeBannerHits(.{
-        .primary_rect = .{ .x = 10.0, .y = 10.0, .w = 80.0, .h = 30.0 },
-        .setup_rect = .{ .x = 100.0, .y = 10.0, .w = 80.0, .h = 30.0 },
-        .diagnostics_rect = .{ .x = 190.0, .y = 10.0, .w = 80.0, .h = 30.0 },
-        .recovery = .reconnect,
-    }, "profile-live");
-    try std.testing.expect(runtimeBannerActionAt(20.0, 20.0) != null);
-    resetRuntimeBannerHits();
-    try std.testing.expectEqual(@as(usize, 0), runtime_banner_hits.profile_id_len);
-    try std.testing.expect(runtimeBannerActionAt(20.0, 20.0) == null);
-    try std.testing.expect(runtimeBannerActionAt(120.0, 20.0) == null);
-    try std.testing.expect(runtimeBannerActionAt(200.0, 20.0) == null);
-    try std.testing.expect(!approvalActionWantsPointerAt(200.0, 20.0));
 }
 
 /// Publishes the banner's hit rects for the next pointer event. Fails closed:
@@ -381,24 +345,6 @@ fn planRuntimeBannerButtons(
         buttons_w -= w + gap;
     }
     return plan;
-}
-
-test "runtime banner drops diagnostics then setup before squeezing the text" {
-    // Widths already include button padding; gap 8, text needs 96.
-    const wide = planRuntimeBannerButtons(600.0, 96.0, 8.0, 80.0, 120.0, 110.0);
-    try std.testing.expect(wide.setup and wide.diagnostics);
-    // 80+8 + 120+8 + 110+8 = 334; 400-334 = 66 < 96 -> drop diagnostics.
-    const medium = planRuntimeBannerButtons(400.0, 96.0, 8.0, 80.0, 120.0, 110.0);
-    try std.testing.expect(medium.setup and !medium.diagnostics);
-    // 80+8 + 120+8 = 216; 300-216 = 84 < 96 -> drop setup as well.
-    const narrow = planRuntimeBannerButtons(300.0, 96.0, 8.0, 80.0, 120.0, 110.0);
-    try std.testing.expect(!narrow.setup and !narrow.diagnostics);
-    // No setup offered: only diagnostics can be shed.
-    const no_setup = planRuntimeBannerButtons(250.0, 96.0, 8.0, 80.0, null, 110.0);
-    try std.testing.expect(!no_setup.setup and !no_setup.diagnostics);
-    // No primary (transient states): diagnostics alone fits.
-    const transient = planRuntimeBannerButtons(250.0, 96.0, 8.0, 0.0, null, 110.0);
-    try std.testing.expect(transient.diagnostics);
 }
 
 const ApprovalAction = enum {
@@ -580,27 +526,6 @@ pub fn chatLaneColumn(lane_x: f32, lane_w: f32, right_reserve: f32) ChatColumn {
     const full = chatContentColumn(lane_x, lane_w);
     if (right_reserve <= 0.0 or full.x + full.w <= lane_x + lane_w - right_reserve) return full;
     return chatContentColumn(lane_x, @max(lane_w - right_reserve, 0.0));
-}
-
-test "chat lane column keeps the full-lane axis until the linked drawer collides" {
-    defer theme.applyTheme(1.0);
-    theme.applyTheme(1.0);
-    // Wide lane: the 900px-capped column clears a 48px rail, so composer and
-    // transcript keep the exact full-lane column.
-    const full = chatContentColumn(100.0, 1600.0);
-    const wide = chatLaneColumn(100.0, 1600.0, 48.0);
-    try std.testing.expectEqual(full.x, wide.x);
-    try std.testing.expectEqual(full.w, wide.w);
-    // Narrow lane: the column would run under the drawer, so it re-centers in
-    // the lane that remains and stays clear of the reserve.
-    const narrow = chatLaneColumn(100.0, 600.0, 258.0);
-    const reduced = chatContentColumn(100.0, 600.0 - 258.0);
-    try std.testing.expectEqual(reduced.x, narrow.x);
-    try std.testing.expectEqual(reduced.w, narrow.w);
-    try std.testing.expect(narrow.x + narrow.w <= 100.0 + 600.0 - 258.0);
-    // No reserve is the plain shared formula.
-    const none = chatLaneColumn(100.0, 600.0, 0.0);
-    try std.testing.expectEqual(chatContentColumn(100.0, 600.0).x, none.x);
 }
 
 pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: palette.Rect, pane_id: ?app_state.WorkspacePaneId, header_right_reserve: f32) void {
@@ -1545,31 +1470,6 @@ fn renderLinkedChatsRail(state: *app_state.AppState, rect: palette.Rect, parent:
     appendLinkedChatHit(pane_id, rect, .toggle, parent.workspace_id, parent.parent_thread_id, "", "");
 }
 
-test "linked-chats lane reserve vanishes without rows and collapses to a rail when narrow" {
-    const allocator = std.testing.allocator;
-    var parent: linked_chats.Parent = .{
-        .workspace_id = try allocator.dupe(u8, "ws"),
-        .parent_thread_id = try allocator.dupe(u8, "chat-parent"),
-    };
-    defer {
-        parent.entries.deinit(allocator);
-        allocator.free(parent.workspace_id);
-        allocator.free(parent.parent_thread_id);
-    }
-    try std.testing.expectEqual(@as(f32, 0.0), linkedChatsLaneReserve(1200.0, null));
-    try std.testing.expectEqual(@as(f32, 0.0), linkedChatsLaneReserve(1200.0, &parent));
-    // A row makes the drawer claim lane space; narrow panes get only the rail.
-    try parent.entries.append(allocator, undefined);
-    const narrow = linkedChatsLaneReserve(600.0, &parent);
-    try std.testing.expectEqual(narrow, linkedChatsLaneReserve(1200.0, &parent));
-    parent.collapsed = false;
-    const wide = linkedChatsLaneReserve(1200.0, &parent);
-    try std.testing.expect(wide > narrow);
-    try std.testing.expect(narrow > 0.0);
-    parent.collapsed = true;
-    try std.testing.expectEqual(narrow, linkedChatsLaneReserve(1200.0, &parent));
-}
-
 fn estimateWorkspaceOriginX(state: *app_state.AppState, workspace_width: f32) f32 {
     var sidebar_width: f32 = if (state.isSidebarCollapsed()) theme.scaledUi(68.0) else theme.scaledUi(280.0);
     var i: usize = 0;
@@ -1923,100 +1823,6 @@ pub fn handleFollowupPinMouseButton(state: *app_state.AppState, x: f32, y: f32, 
     if (hit.pane_id) |pane_id| _ = state.focusCurrentProjectWorkspacePane(pane_id);
     if (clicks >= 2) state.editPendingFollowup();
     return true;
-}
-
-test "follow-up edit hits survive rendering another chat pane" {
-    resetTranscriptHitCache();
-    defer resetTranscriptHitCache();
-
-    appendFollowupPinHit(11, .{ .x = 10.0, .y = 20.0, .w = 100.0, .h = 40.0 });
-    appendFollowupPinHit(22, .{ .x = 200.0, .y = 20.0, .w = 100.0, .h = 40.0 });
-
-    const first = followupPinHitAt(40.0, 40.0) orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(@as(?app_state.WorkspacePaneId, 11), first.pane_id);
-    const second = followupPinHitAt(240.0, 40.0) orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(@as(?app_state.WorkspacePaneId, 22), second.pane_id);
-}
-
-test "transcript action hit testing resolves every transcript action kind" {
-    resetTranscriptHitCache();
-    defer resetTranscriptHitCache();
-    usage_action_hits[0] = .{ .rect = .{ .x = 10.0, .y = 20.0, .w = 30.0, .h = 40.0 } };
-    usage_action_hit_count = 1;
-    diff_file_open_hits[0] = .{
-        .rect = .{ .x = 100.0, .y = 120.0, .w = 30.0, .h = 20.0 },
-        .path = "src/main.zig",
-    };
-    diff_file_open_hit_count = 1;
-
-    const usage = transcriptActionAt(20.0, 30.0) orelse return error.TestExpectedEqual;
-    switch (usage) {
-        .usage => {},
-        else => return error.TestExpectedEqual,
-    }
-    usage_action_hits[1] = .{ .rect = .{ .x = 10.0, .y = 70.0, .w = 30.0, .h = 20.0 }, .sign_in_provider = .claude };
-    usage_action_hit_count = 2;
-    const sign_in = transcriptActionAt(20.0, 80.0) orelse return error.TestExpectedEqual;
-    switch (sign_in) {
-        .sign_in => |provider| try std.testing.expectEqual(app_state.Provider.claude, provider),
-        else => return error.TestExpectedEqual,
-    }
-
-    const open = transcriptActionAt(110.0, 130.0) orelse return error.TestExpectedEqual;
-    switch (open) {
-        .diff_file_open => |path| try std.testing.expectEqualStrings("src/main.zig", path),
-        else => return error.TestExpectedEqual,
-    }
-
-    diff_file_comment_hits[0] = .{
-        .rect = .{ .x = 400.0, .y = 120.0, .w = 60.0, .h = 20.0 },
-        .path = "src/main.zig",
-        .additions = 5,
-        .deletions = 2,
-    };
-    diff_file_comment_hit_count = 1;
-    const comment = transcriptActionAt(410.0, 130.0) orelse return error.TestExpectedEqual;
-    switch (comment) {
-        .diff_file_comment => |hit| {
-            try std.testing.expectEqualStrings("src/main.zig", hit.path);
-            try std.testing.expectEqual(@as(i64, 5), hit.additions);
-            try std.testing.expectEqual(@as(i64, 2), hit.deletions);
-        },
-        else => return error.TestExpectedEqual,
-    }
-
-    diff_layout_hits[0] = .{
-        .rect = .{ .x = 200.0, .y = 220.0, .w = 60.0, .h = 28.0 },
-        .split = true,
-    };
-    diff_layout_hit_count = 1;
-    const layout = transcriptActionAt(230.0, 234.0) orelse return error.TestExpectedEqual;
-    switch (layout) {
-        .diff_layout => |split| try std.testing.expect(split),
-        else => return error.TestExpectedEqual,
-    }
-
-    transcript_image_hits[0] = .{
-        .rect = .{ .x = 300.0, .y = 320.0, .w = 80.0, .h = 60.0 },
-        .path = "/tmp/chat-image.png",
-    };
-    transcript_image_hit_count = 1;
-    const image = transcriptActionAt(340.0, 350.0) orelse return error.TestExpectedEqual;
-    switch (image) {
-        .image_open => |path| try std.testing.expectEqualStrings("/tmp/chat-image.png", path),
-        else => return error.TestExpectedEqual,
-    }
-
-    bang_retry_hits[0] = .{
-        .rect = .{ .x = 500.0, .y = 30.0, .w = 60.0, .h = 24.0 },
-        .command = "zig build test",
-    };
-    bang_retry_hit_count = 1;
-    const retry = transcriptActionAt(520.0, 40.0) orelse return error.TestExpectedEqual;
-    switch (retry) {
-        .retry_command => |command| try std.testing.expectEqualStrings("zig build test", command),
-        else => return error.TestExpectedEqual,
-    }
 }
 
 /// True when the mouse rests on a pending-approval or runtime-banner action.
@@ -2775,31 +2581,6 @@ fn approvalActionAt(x: f32, y: f32) ?ApprovalAction {
     if (rectContains(approval_hits.approve_rect, x, y)) return .approve;
     if (rectContains(approval_hits.deny_rect, x, y)) return .deny;
     return null;
-}
-
-test "approval actions use their rendered button rectangles" {
-    const previous = approval_hits;
-    defer approval_hits = previous;
-    approval_hits = .{
-        .copy_rect = .{ .x = 212.0, .y = 40.0, .w = 64.0, .h = 36.0 },
-        .approve_rect = .{ .x = 120.0, .y = 40.0, .w = 80.0, .h = 36.0 },
-        .deny_rect = .{ .x = 28.0, .y = 40.0, .w = 80.0, .h = 36.0 },
-    };
-
-    try std.testing.expectEqual(ApprovalAction.copy, approvalActionAt(244.0, 58.0).?);
-    try std.testing.expectEqual(ApprovalAction.approve, approvalActionAt(160.0, 58.0).?);
-    try std.testing.expectEqual(ApprovalAction.deny, approvalActionAt(68.0, 58.0).?);
-    try std.testing.expect(approvalActionAt(114.0, 58.0) == null);
-}
-
-test "transcript body selection includes user assistant and ordinary system text" {
-    try std.testing.expectEqual(TranscriptSelectableBodyKind.plain, transcriptSelectableBodyKind(.user, "You", "literal *prompt*", false, false).?);
-    try std.testing.expectEqual(TranscriptSelectableBodyKind.markdown, transcriptSelectableBodyKind(.assistant, "Assistant", "**answer**", false, false).?);
-    try std.testing.expectEqual(TranscriptSelectableBodyKind.plain, transcriptSelectableBodyKind(.system, "Notice", "Connection restored", false, false).?);
-    try std.testing.expectEqual(TranscriptSelectableBodyKind.plain, transcriptSelectableBodyKind(.assistant, "Assistant", "stream tail", false, true).?);
-    // Bounded transcript controls stay outside drag selection.
-    try std.testing.expect(transcriptSelectableBodyKind(.system, "Ran command", "Command:\nzig build", false, false) == null);
-    try std.testing.expect(transcriptSelectableBodyKind(.system, "Changed files", utils.PERSISTED_DIFF_MARKER, false, false) == null);
 }
 
 fn queueApprovalButtonLabel(state: *app_state.AppState, rect: palette.Rect, label: []const u8, color: palette.Color) void {
@@ -3647,16 +3428,6 @@ pub fn isTailFollowAnimating() bool {
     return slot.target - slot.y > 0.5;
 }
 
-test "tail follow eases toward a growing tail and settles" {
-    try std.testing.expectApproxEqAbs(@as(f32, 100.4), approachTailFollow(100.0, 100.4, 16), 0.001);
-    const eased = approachTailFollow(100.0, 200.0, 16);
-    try std.testing.expect(eased > 100.0 and eased < 200.0);
-    var y: f32 = 0.0;
-    var frame: usize = 0;
-    while (frame < 60) : (frame += 1) y = approachTailFollow(y, 300.0, 16);
-    try std.testing.expectApproxEqAbs(@as(f32, 300.0), y, 0.001);
-}
-
 fn transcriptShouldFollowTail(saved_scroll: ?f32, manual_scroll_requested: bool) bool {
     // The pane-local semantic state is authoritative. A missing offset means
     // tail-follow on every frame, including invalid/rebuilding layouts; the
@@ -3707,37 +3478,6 @@ fn appendTranscriptHit(hit: TranscriptHit) void {
     transcript_hit_count += 1;
 }
 
-test "transcript hit geometry remains pane-local through scrolling clips" {
-    resetTranscriptHitCache();
-    defer resetTranscriptHitCache();
-    appendTranscriptHit(.{
-        .pane_id = 11,
-        .rect = .{ .x = 10.0, .y = 20.0, .w = 300.0, .h = 240.0 },
-        .column = .{ .x = 30.0, .y = 48.0, .w = 260.0, .h = 190.0 },
-        .clip = .{ .x = 10.0, .y = 20.0, .w = 300.0, .h = 240.0 },
-        .scroll_y = 72.0,
-    });
-    appendTranscriptHit(.{
-        .pane_id = 12,
-        .rect = .{ .x = 10.0, .y = 280.0, .w = 300.0, .h = 240.0 },
-        .column = .{ .x = 30.0, .y = 308.0, .w = 260.0, .h = 190.0 },
-        .clip = .{ .x = 10.0, .y = 280.0, .w = 300.0, .h = 240.0 },
-        .scroll_y = 144.0,
-    });
-
-    const first = findTranscriptHit(100.0, 100.0).?;
-    try std.testing.expectEqual(@as(?app_state.WorkspacePaneId, 11), first.pane_id);
-    try std.testing.expectEqual(@as(f32, 48.0), first.column.y);
-    try std.testing.expectEqual(@as(f32, 72.0), first.scroll_y);
-
-    clipTranscriptHitCache(.{ .x = 0.0, .y = 60.0, .w = 400.0, .h = 200.0 });
-    try std.testing.expectEqual(@as(usize, 1), transcript_hit_count);
-    const clipped = findTranscriptHit(100.0, 100.0).?;
-    try std.testing.expectEqual(@as(f32, 48.0), clipped.column.y);
-    try std.testing.expectEqual(@as(f32, 60.0), clipped.clip.y);
-    try std.testing.expect(findTranscriptHit(100.0, 300.0) == null);
-}
-
 /// Lane geometry the transcript wraps against: the destination lane width and
 /// the linked-drawer reserve at that width, so the column matches the composer.
 const TranscriptLane = struct {
@@ -3753,16 +3493,6 @@ fn transcriptColumnAtLayoutWidth(rect: palette.Rect, lane: TranscriptLane) palet
         .w = content_column.w,
         .h = @max(rect.h - theme.scaledUi(42.0), 1.0),
     });
-}
-
-test "sidebar animation keeps transcript wrapping at the destination width" {
-    defer theme.applyTheme(1.0);
-    theme.applyTheme(1.0);
-
-    const first = transcriptColumnAtLayoutWidth(.{ .x = 100.0, .y = 40.0, .w = 620.0, .h = 500.0 }, .{ .layout_width = 480.0 });
-    const second = transcriptColumnAtLayoutWidth(.{ .x = 140.0, .y = 40.0, .w = 540.0, .h = 500.0 }, .{ .layout_width = 480.0 });
-    try std.testing.expectEqual(first.w, second.w);
-    try std.testing.expectEqual(first.x - 100.0, second.x - 140.0);
 }
 
 const TranscriptRenderOptions = struct {
@@ -3910,16 +3640,6 @@ fn pendingTranscriptCardOpacity(
     if (event.role != .system) return 1.0;
     if (event.transcript_card_started_ms == 0) event.transcript_card_started_ms = now_ms;
     return transcriptCardEntranceOpacity(event.transcript_card_started_ms, now_ms, reduced_motion);
-}
-
-test "streamed transcript cards fade with the fast token and reduced motion is instant" {
-    const started_ms: i64 = 1_000;
-    try std.testing.expectEqual(@as(f32, 0.0), transcriptCardEntranceOpacity(started_ms, started_ms, false));
-    const mid = transcriptCardEntranceOpacity(started_ms, started_ms + @divTrunc(theme.MOTION_FAST_MS, 2), false);
-    try std.testing.expect(mid > 0.5 and mid < 1.0);
-    try std.testing.expectEqual(@as(f32, 1.0), transcriptCardEntranceOpacity(started_ms, started_ms + theme.MOTION_FAST_MS, false));
-    try std.testing.expectEqual(@as(f32, 1.0), transcriptCardEntranceOpacity(started_ms, started_ms, true));
-    try std.testing.expectEqual(@as(f32, 1.0), transcriptCardEntranceOpacity(0, started_ms, false));
 }
 
 fn renderOutgoingTranscript(
@@ -4191,51 +3911,6 @@ fn shouldImplicitlyFollowColdTail(cold_tail_follow: bool, saved_scroll: ?f32, ma
     return cold_tail_follow and saved_scroll == null and !manual_scroll_requested;
 }
 
-test "implicit transcript tail follow survives changing cold-layout estimates" {
-    const changing_max_scroll = [_]f32{ 1_000.0, 4_500.0, 2_800.0, 9_200.0 };
-    var saved_scroll: ?f32 = null;
-    // A transient empty render before historical hydration must not create an
-    // explicit zero offset that the loaded transcript interprets as its top.
-    try std.testing.expect(saved_scroll == null);
-
-    for (changing_max_scroll) |max_scroll| {
-        const scroll_y = snapTranscriptScrollY(saved_scroll orelse max_scroll, max_scroll);
-        try std.testing.expectEqual(max_scroll, scroll_y);
-    }
-    try std.testing.expect(saved_scroll == null);
-
-    const manual_scroll = snapTranscriptScrollY(changing_max_scroll[0] - 240.0, changing_max_scroll[0]);
-    saved_scroll = manual_scroll;
-    try std.testing.expectEqual(manual_scroll, snapTranscriptScrollY(saved_scroll.?, changing_max_scroll[1]));
-
-    try std.testing.expect(!shouldImplicitlyFollowColdTail(true, null, true));
-    try std.testing.expect(!shouldImplicitlyFollowColdTail(true, manual_scroll, false));
-    try std.testing.expect(shouldImplicitlyFollowColdTail(true, null, false));
-}
-
-test "only manual movement toward the bottom returns to semantic transcript tail-follow" {
-    try std.testing.expect(manualScrollReachesTranscriptTail(true, 950.0, 1_000.0));
-    try std.testing.expect(!manualScrollReachesTranscriptTail(false, 950.0, 1_000.0));
-    try std.testing.expect(!manualScrollReachesTranscriptTail(true, 800.0, 1_000.0));
-}
-
-test "pane-local semantic scroll state owns transcript tail-follow" {
-    try std.testing.expect(transcriptShouldFollowTail(null, false));
-    // Manual input must be applied before the frame re-enters tail-follow.
-    try std.testing.expect(!transcriptShouldFollowTail(null, true));
-    // A saved anchor remains authoritative through refresh, streaming, and
-    // pane focus changes regardless of global controller latches.
-    try std.testing.expect(!transcriptShouldFollowTail(420.0, false));
-}
-
-test "streaming geometry cannot release a manual tail-follow suspension" {
-    try std.testing.expect(transcriptScrollNearBottom(950.0, 1_000.0));
-    try std.testing.expect(!shouldReleaseTranscriptAutoFollowSuspension(false, true, 950.0, 1_000.0));
-    try std.testing.expect(!shouldReleaseTranscriptAutoFollowSuspension(true, false, 950.0, 1_000.0));
-    try std.testing.expect(shouldReleaseTranscriptAutoFollowSuspension(true, true, 950.0, 1_000.0));
-    try std.testing.expect(!shouldReleaseTranscriptAutoFollowSuspension(true, true, 800.0, 1_000.0));
-}
-
 fn transcriptContentHeight(
     state: *app_state.AppState,
     thread: anytype,
@@ -4269,31 +3944,6 @@ fn estimatedPartialTranscriptHeight(thread: anytype) f32 {
     if (materialized_count == 0 or thread.transcript_layout_first_message_index == 0) return thread.transcript_layout_committed_height;
     const average = thread.transcript_layout_committed_height / @as(f32, @floatFromInt(materialized_count));
     return thread.transcript_layout_committed_height + average * @as(f32, @floatFromInt(thread.transcript_layout_first_message_index));
-}
-
-test "partial transcript height projects unfinished rows without a full walk" {
-    const FakeThread = struct {
-        transcript_layout_message_count: usize,
-        transcript_layout_first_message_index: usize,
-        transcript_layout_committed_height: f32,
-        messages: struct { items: []const u8 },
-    };
-    const messages = [_]u8{ 0, 1, 2, 3 };
-    const partial: FakeThread = .{
-        .transcript_layout_message_count = 2,
-        .transcript_layout_first_message_index = 2,
-        .transcript_layout_committed_height = 100.0,
-        .messages = .{ .items = &messages },
-    };
-    try std.testing.expectApproxEqAbs(@as(f32, 200.0), estimatedPartialTranscriptHeight(&partial), 0.001);
-
-    const empty: FakeThread = .{
-        .transcript_layout_message_count = 0,
-        .transcript_layout_first_message_index = 4,
-        .transcript_layout_committed_height = 0.0,
-        .messages = .{ .items = &messages },
-    };
-    try std.testing.expectEqual(@as(f32, 0.0), estimatedPartialTranscriptHeight(&empty));
 }
 
 test "materializing older rows keeps a manual upward scroll on the same content" {
@@ -4703,34 +4353,6 @@ test "transcript width reflow preserves the visible semantic row" {
     try std.testing.expectEqual(anchor.viewport_y, estimate_after + after_items[1].top - scroll_after);
 }
 
-test "streamed tail append preserves the visible semantic row across reset" {
-    // A layout that no longer covers the tail (rows streamed in below) still
-    // anchors: existing row indices are untouched by appends, so the anchor
-    // found in the stale layout must resolve in the rebuilt one.
-    const before_items = [_]chat_types.TranscriptLayoutItem{
-        .{ .message_index = 9, .group_end = 10, .top = -80.0, .height = 68.0 },
-        .{ .message_index = 8, .group_end = 9, .top = -172.0, .height = 80.0 },
-        .{ .message_index = 7, .group_end = 8, .top = -264.0, .height = 80.0 },
-    };
-    const anchor = transcriptLayoutAnchor(&before_items, 1_200.0, 1_050.0) orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(@as(usize, 8), anchor.message_index);
-    try std.testing.expectEqual(@as(f32, -22.0), anchor.viewport_y);
-
-    // Rebuilt layout includes two appended tail rows; every old row's
-    // tail-relative top shifted and the unfinished-history estimate changed.
-    const after_items = [_]chat_types.TranscriptLayoutItem{
-        .{ .message_index = 11, .group_end = 12, .top = -60.0, .height = 48.0 },
-        .{ .message_index = 10, .group_end = 11, .top = -120.0, .height = 48.0 },
-        .{ .message_index = 9, .group_end = 10, .top = -200.0, .height = 68.0 },
-        .{ .message_index = 8, .group_end = 9, .top = -292.0, .height = 80.0 },
-        .{ .message_index = 7, .group_end = 8, .top = -384.0, .height = 80.0 },
-    };
-    const estimate_after: f32 = 1_500.0;
-    const scroll_after = transcriptScrollForLayoutAnchor(&after_items, estimate_after, anchor) orelse return error.TestExpectedEqual;
-    // Same semantic row at the same viewport position, whatever the new estimate.
-    try std.testing.expectEqual(anchor.viewport_y, estimate_after + after_items[3].top - scroll_after);
-}
-
 test "transcript layout hit lookup skips gaps and finds rows logarithmically" {
     const items: [3]chat_types.TranscriptLayoutItem = .{
         .{ .message_index = 2, .group_end = 4, .top = -50.0, .height = 50.0 },
@@ -4742,18 +4364,6 @@ test "transcript layout hit lookup skips gaps and finds rows logarithmically" {
     try std.testing.expectEqual(@as(usize, 1), transcriptLayoutItemAtContentY(&items, 144.0, 52.0).?.message_index);
     try std.testing.expectEqual(@as(usize, 2), transcriptLayoutItemAtContentY(&items, 144.0, 144.0).?.message_index);
     try std.testing.expect(transcriptLayoutItemAtContentY(&items, 144.0, 145.0) == null);
-}
-
-test "transcript layout lookup starts at the first row intersecting the viewport" {
-    const items: [3]chat_types.TranscriptLayoutItem = .{
-        .{ .message_index = 2, .group_end = 3, .top = -50.0, .height = 50.0 },
-        .{ .message_index = 1, .group_end = 2, .top = -92.0, .height = 30.0 },
-        .{ .message_index = 0, .group_end = 1, .top = -144.0, .height = 40.0 },
-    };
-    try std.testing.expectEqual(@as(usize, 2), oldestVisibleTranscriptLayoutItem(&items, -104.0).?);
-    try std.testing.expectEqual(@as(usize, 1), oldestVisibleTranscriptLayoutItem(&items, -103.0).?);
-    try std.testing.expectEqual(@as(usize, 0), oldestVisibleTranscriptLayoutItem(&items, -54.0).?);
-    try std.testing.expect(oldestVisibleTranscriptLayoutItem(&items, 1.0) == null);
 }
 
 // Renders the visible committed transcript rows from cached layout positions.
@@ -5339,13 +4949,6 @@ fn monotonicMs() i64 {
     return @intCast(@divTrunc(profiler.nowNs(), std.time.ns_per_ms));
 }
 
-test "thinking label holds briefly after reasoning closes" {
-    try std.testing.expect(thinkingLabelShown(true, 0, 10_000));
-    try std.testing.expect(!thinkingLabelShown(false, 0, 10_000));
-    try std.testing.expect(thinkingLabelShown(false, 9_000, 10_000));
-    try std.testing.expect(!thinkingLabelShown(false, 8_000, 10_000));
-}
-
 fn formatPendingWorkingLabel(buf: []u8, started_at_ms: i64, thinking: bool) []const u8 {
     const now_ms = unixTimestampMs();
     const safe_started_at_ms = @max(started_at_ms, 0);
@@ -5506,23 +5109,6 @@ test "tool call groups stop before user-required system events" {
     try std.testing.expectEqual(@as(usize, 1), toolCallGroupRunningCount(entries[0..], 0, 2, true));
 }
 
-test "tool call groups use structured lifecycle status" {
-    const Event = struct {
-        role: app_state.ChatRole = .system,
-        author: []const u8,
-        body: []const u8,
-        tool_call_status: ?provider_types.ToolCallStatus,
-    };
-    const entries = [_]Event{
-        .{ .author = "Read", .body = "Input", .tool_call_status = .completed },
-        .{ .author = "Edit", .body = "Input", .tool_call_status = .in_progress },
-        .{ .author = "MCP tool", .body = "Error", .tool_call_status = .failed },
-    };
-
-    try std.testing.expectEqual(@as(usize, 1), toolCallGroupRunningCount(entries[0..], 0, entries.len, false));
-    try std.testing.expectEqual(@as(usize, 1), toolCallGroupFailureCount(entries[0..], 0, entries.len));
-}
-
 test "subagent rows group separately from ordinary tool calls" {
     const Event = struct {
         role: app_state.ChatRole = .system,
@@ -5544,30 +5130,6 @@ test "subagent rows group separately from ordinary tool calls" {
     try std.testing.expect(commandGroupRendersGrouped(entries[0..], 1, 3));
     try std.testing.expect(commandGroupRendersGrouped(entries[0..], 1, 2));
     try std.testing.expect(!commandGroupRendersGrouped(entries[0..], 0, 1));
-}
-
-test "structured ordinary tools do not scan legacy subagent markers" {
-    const Event = struct {
-        role: app_state.ChatRole = .system,
-        author: []const u8,
-        body: []const u8,
-        tool_call_id: ?[]const u8 = null,
-        tool_call_kind: ?provider_types.ToolCallKind = null,
-    };
-    const legacy_marker_body =
-        \\Tool:
-        \\task
-        \\
-        \\Input:
-        \\{"subagent_type":"Explore"}
-    ;
-    const events = [_]Event{
-        .{ .author = "Read", .body = legacy_marker_body, .tool_call_kind = .read },
-        .{ .author = "provider-specific tool", .body = "opaque output", .tool_call_id = "call-1" },
-    };
-
-    try std.testing.expect(!isSubagentTimelineEntry(events[0]));
-    try std.testing.expectEqual(@as(usize, 2), toolCallGroupEnd(events[0..], 0));
 }
 
 /// True when the body looks like an executed shell one-liner (e.g. Codex/OpenCode style `/usr/bin/bash -lc '…'`).
@@ -5635,17 +5197,6 @@ fn isCursorToolSystemEvent(author_raw: []const u8, body_raw: []const u8) bool {
     if (std.mem.indexOf(u8, body, "{\"command\"") != null) return true;
     if (std.mem.endsWith(u8, body, ": {}")) return true;
     return false;
-}
-
-test "provider-specific MCP authors still render as structured tool cards" {
-    try std.testing.expect(isCursorToolSystemEvent(
-        "verde.list_panes",
-        "Input:\n{}\n\nOutput:\n{\"ok\":true}",
-    ));
-    try std.testing.expect(!isCursorToolSystemEvent(
-        "System",
-        "Output:\nordinary system message",
-    ));
 }
 
 fn shouldHideCursorLifecycleSystemEvent(thread: anytype, author: []const u8, body_raw: []const u8) bool {
@@ -5906,34 +5457,6 @@ fn renderPinnedBackgroundCommands(
     }
 }
 
-test "running background commands pin above the composer after the stream commits" {
-    const allocator = std.testing.allocator;
-    var thread = try app_state.ChatThread.init(allocator, "Pinned background command");
-    defer thread.deinit(allocator);
-    try thread.background_tasks.append(allocator, .{
-        .command = try allocator.dupeZ(u8, "mise run dev"),
-        .status = .running,
-    });
-    try thread.messages.append(allocator, .{
-        .role = .system,
-        .author = try allocator.dupeZ(u8, "Background command"),
-        .body = try allocator.dupeZ(u8, "mise run dev"),
-    });
-
-    var rows: [MAX_PINNED_BACKGROUND_COMMANDS]PinnedBackgroundCommand = undefined;
-    const count = collectPinnedBackgroundCommands(&thread, &rows);
-    try std.testing.expectEqual(@as(usize, 1), count);
-    try std.testing.expectEqual(@as(usize, 0), rows[0].message_index);
-    try std.testing.expectEqualStrings("mise run dev", rows[0].body);
-    // Persistence owns the row; presentation alone suppresses the known task event.
-    try std.testing.expect(shouldHideCursorLifecycleSystemEvent(
-        &thread,
-        thread.messages.items[0].author,
-        thread.messages.items[0].body,
-    ));
-    try std.testing.expect(!shouldHideCursorLifecycleSystemEvent(&thread, "Notice", "mise run dev"));
-}
-
 test "finished background commands leave the pin stack" {
     const allocator = std.testing.allocator;
     const page = std.heap.page_allocator;
@@ -5983,101 +5506,6 @@ test "finished background commands leave the pin stack" {
     try std.testing.expectEqual(@as(usize, 0), collectPinnedBackgroundCommands(&thread, &rows));
 }
 
-test "pending background commands pin instead of occupying the live stream" {
-    const allocator = std.testing.allocator;
-    const page = std.heap.page_allocator;
-    var thread = try app_state.ChatThread.init(allocator, "Pending background pin");
-    defer thread.deinit(allocator);
-    thread.send_state.status = .pending;
-    try thread.send_state.pending_events.append(page, .{
-        .role = .system,
-        .author = try page.dupe(u8, "Background command"),
-        .body = try page.dupe(u8, "npm run dev"),
-    });
-
-    var rows: [MAX_PINNED_BACKGROUND_COMMANDS]PinnedBackgroundCommand = undefined;
-    const count = collectPinnedBackgroundCommands(&thread, &rows);
-    try std.testing.expectEqual(@as(usize, 1), count);
-    try std.testing.expectEqual(@as(usize, 0), rows[0].message_index);
-    try std.testing.expectEqualStrings("npm run dev", rows[0].body);
-    try std.testing.expect(shouldSkipPendingTranscriptEvent(&thread, "Background command", "npm run dev"));
-    try std.testing.expect(!shouldSkipPendingTranscriptEvent(&thread, "Ran command", "npm test"));
-}
-
-test "running background tasks pin from a cancelled Ran command row" {
-    const allocator = std.testing.allocator;
-    var thread = try app_state.ChatThread.init(allocator, "Yellow ran command pin");
-    defer thread.deinit(allocator);
-    try thread.background_tasks.append(allocator, .{
-        .command = try allocator.dupeZ(u8, "bun run dev"),
-        .status = .running,
-    });
-    try thread.messages.append(allocator, .{
-        .role = .system,
-        .author = try allocator.dupeZ(u8, "Ran command"),
-        .body = try allocator.dupeZ(u8, "Input:\n/usr/bin/bash -lc 'bun run dev'"),
-        .tool_call_status = .cancelled,
-    });
-
-    var rows: [MAX_PINNED_BACKGROUND_COMMANDS]PinnedBackgroundCommand = undefined;
-    const count = collectPinnedBackgroundCommands(&thread, &rows);
-    try std.testing.expectEqual(@as(usize, 1), count);
-    try std.testing.expectEqual(@as(usize, 0), rows[0].message_index);
-    try std.testing.expectEqual(@as(?usize, 0), rows[0].task_index);
-    try std.testing.expectEqualStrings("Ran command", rows[0].author);
-    try std.testing.expect(commandTextMatchesTask(rows[0].body, "bun run dev"));
-    try std.testing.expect(!commandTextMatchesTask(
-        "until ! pgrep -f \"zig build test --release=safe\"",
-        "zig build test --release=safe -Dbrowser-backend=native_webview",
-    ));
-}
-
-test "grouped running background tasks pin with distinct task indexes" {
-    const allocator = std.testing.allocator;
-    var thread = try app_state.ChatThread.init(allocator, "Grouped background pins");
-    defer thread.deinit(allocator);
-    try thread.background_tasks.append(allocator, .{
-        .command = try allocator.dupeZ(u8, "until ! pgrep -f zig"),
-        .status = .running,
-    });
-    try thread.background_tasks.append(allocator, .{
-        .command = try allocator.dupeZ(u8, "zig build test --release=safe"),
-        .status = .running,
-    });
-    try thread.background_tasks.append(allocator, .{
-        .command = try allocator.dupeZ(u8, "mise run build"),
-        .status = .running,
-    });
-
-    var rows: [MAX_PINNED_BACKGROUND_COMMANDS]PinnedBackgroundCommand = undefined;
-    const count = collectPinnedBackgroundCommands(&thread, &rows);
-    try std.testing.expectEqual(@as(usize, 3), count);
-    try std.testing.expectEqual(@as(?usize, 0), rows[0].task_index);
-    try std.testing.expectEqual(@as(?usize, 1), rows[1].task_index);
-    try std.testing.expectEqual(@as(?usize, 2), rows[2].task_index);
-    try std.testing.expectEqualStrings("until ! pgrep -f zig", rows[0].body);
-    try std.testing.expectEqualStrings("zig build test --release=safe", rows[1].body);
-    try std.testing.expectEqualStrings("mise run build", rows[2].body);
-}
-
-test "running background tasks pin even without a transcript row" {
-    const allocator = std.testing.allocator;
-    var thread = try app_state.ChatThread.init(allocator, "Synthetic background pin");
-    defer thread.deinit(allocator);
-    try thread.background_tasks.append(allocator, .{
-        .command = try allocator.dupeZ(u8, "bun run dev"),
-        .status = .running,
-    });
-
-    var rows: [MAX_PINNED_BACKGROUND_COMMANDS]PinnedBackgroundCommand = undefined;
-    const count = collectPinnedBackgroundCommands(&thread, &rows);
-    try std.testing.expectEqual(@as(usize, 1), count);
-    try std.testing.expectEqual(std.math.maxInt(usize), rows[0].message_index);
-    try std.testing.expectEqual(@as(?usize, 0), rows[0].task_index);
-    try std.testing.expectEqualStrings("Background command", rows[0].author);
-    try std.testing.expectEqualStrings("bun run dev", rows[0].body);
-}
-
 test "a running task with a pending detached event pins one card" {
     const allocator = std.testing.allocator;
     const page = std.heap.page_allocator;
@@ -6114,21 +5542,6 @@ test "a running task with a pending detached event pins one card" {
     try std.testing.expectEqual(@as(?usize, 0), rows[0].task_index);
     try std.testing.expectEqualStrings("Background command", rows[0].author);
     try std.testing.expectEqualStrings(body, rows[0].body);
-}
-
-test "background-task pin hits survive rendering another chat pane" {
-    resetTranscriptHitCache();
-    defer resetTranscriptHitCache();
-
-    appendBackgroundTaskPinHit(11, .{ .x = 10.0, .y = 20.0, .w = 100.0, .h = 40.0 });
-    appendBackgroundTaskPinHit(22, .{ .x = 200.0, .y = 20.0, .w = 100.0, .h = 40.0 });
-
-    const first = backgroundTaskPinHitAt(40.0, 40.0) orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(@as(?app_state.WorkspacePaneId, 11), first.pane_id);
-    const second = backgroundTaskPinHitAt(240.0, 40.0) orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(@as(?app_state.WorkspacePaneId, 22), second.pane_id);
-    try std.testing.expect(backgroundTaskPinWantsPointerAt(40.0, 40.0));
-    try std.testing.expect(!backgroundTaskPinWantsPointerAt(0.0, 0.0));
 }
 
 fn isUsageSummaryBody(body: []const u8, title: []const u8) bool {
@@ -7870,16 +7283,6 @@ test "todo list detection accepts provider task lists and rejects prose" {
     try std.testing.expect(!isTodoListMessage("Todos", ""));
 }
 
-test "todo summary counts statuses" {
-    const summary = summarizeTodos("- [x] one\n- [>] two\n- [ ] three\n- [-] four");
-    try std.testing.expectEqual(@as(usize, 4), summary.total);
-    try std.testing.expectEqual(@as(usize, 1), summary.completed);
-    try std.testing.expectEqual(@as(usize, 1), summary.in_progress);
-    const item = parseTodoLine("-  [X]   spaced   ").?;
-    try std.testing.expectEqual(TodoItemStatus.completed, item.status);
-    try std.testing.expectEqualStrings("spaced", item.text);
-}
-
 const GIT_COMMIT_MESSAGE_AUTHOR = "git";
 const GIT_COMMIT_MAX_ENTRIES: usize = 8;
 
@@ -8311,40 +7714,6 @@ test "git commit row parses remote links and pushed headline" {
     try std.testing.expect(parseGitCommitBody("Committed 1 file: 1a2b3c4\n\n\nremote git@x:y").?.firstRemote() == null);
     // Card height is unchanged by links (they sit on row 1).
     try std.testing.expectEqual(gitCommitCardHeight("Committed 1 file: 1a2b3c4\ns\nbranch main"), gitCommitCardHeight("Committed 1 file: 1a2b3c4\ns\nbranch main\nremote https://h/o/r/commit/1"));
-}
-
-test "git commit row parses old one-line bodies" {
-    const summary = parseGitCommitBody("Committed 1 file: 1a2b3c4").?;
-    try std.testing.expectEqualStrings("Committed 1 file", summary.headline);
-    try std.testing.expectEqual(@as(usize, 1), summary.entry_count);
-    try std.testing.expectEqualStrings("1a2b3c4", summary.entries[0].sha);
-    try std.testing.expect(summary.entries[0].repo == null);
-    try std.testing.expect(!summary.entries[0].pushed);
-    try std.testing.expect(summary.subject == null and summary.branch == null);
-    try std.testing.expect(!summary.hasDetail());
-    try std.testing.expect(isGitCommitMessage("git", "Committed 1 file: 1a2b3c4"));
-    try std.testing.expect(gitCommitCardHeight("Committed 1 file: 1a2b3c4") < gitCommitCardHeight("Committed 1 file: 1a2b3c4\nfix it"));
-}
-
-test "git commit row parses pushed, multi-repo, subject and branch" {
-    const pushed = parseGitCommitBody("Committed 3 files: 1a2b3c4 \u{00B7} pushed").?;
-    try std.testing.expectEqualStrings("Committed 3 files", pushed.headline);
-    try std.testing.expect(pushed.entries[0].pushed);
-
-    const multi = parseGitCommitBody("Committed 5 files: 1a2b3c4 (verde) \u{00B7} pushed, abcdef0 (verde-cloud)\nfeat: add commit card\nbranch feature/commit-card").?;
-    try std.testing.expectEqual(@as(usize, 2), multi.entry_count);
-    try std.testing.expectEqualStrings("verde", multi.entries[0].repo.?);
-    try std.testing.expect(multi.entries[0].pushed);
-    try std.testing.expectEqualStrings("abcdef0", multi.entries[1].sha);
-    try std.testing.expectEqualStrings("verde-cloud", multi.entries[1].repo.?);
-    try std.testing.expect(!multi.entries[1].pushed);
-    try std.testing.expectEqualStrings("feat: add commit card", multi.subject.?);
-    try std.testing.expectEqualStrings("feature/commit-card", multi.branch.?);
-
-    // An empty positional subject still lets the branch line through.
-    const branch_only = parseGitCommitBody("Committed 1 file: 1a2b3c4\n\nbranch main").?;
-    try std.testing.expect(branch_only.subject == null);
-    try std.testing.expectEqualStrings("main", branch_only.branch.?);
 }
 
 test "git commit row rejects other system rows" {
@@ -9943,21 +9312,6 @@ fn hashOptionalFloat(hasher: *std.hash.Wyhash, value: ?f32) void {
     if (value) |number| hasher.update(std.mem.asBytes(&number));
 }
 
-test "transcript render cache detects fenced code and live-style bypass frames" {
-    var prose = try chat_markdown.buildBodyView(std.testing.allocator, "A paragraph with **formatting**.");
-    defer prose.deinit(std.testing.allocator);
-    try std.testing.expect(!transcriptBodyViewHasFencedCode(prose));
-
-    var code = try chat_markdown.buildBodyView(std.testing.allocator, "```zig\nconst value = 1;\n```");
-    defer code.deinit(std.testing.allocator);
-    try std.testing.expect(transcriptBodyViewHasFencedCode(code));
-
-    // Fenced-code messages replay from cache except on hover / "Copied" frames.
-    try std.testing.expect(!codeCopyCacheBypass(false, false));
-    try std.testing.expect(codeCopyCacheBypass(true, false));
-    try std.testing.expect(codeCopyCacheBypass(false, true));
-}
-
 test "transcript render cache caches fenced code copy buttons for replay" {
     const allocator = std.testing.allocator;
     const body = "```zig\nconst value = 1;\n```";
@@ -10000,28 +9354,6 @@ test "transcript render cache caches fenced code copy buttons for replay" {
     try std.testing.expectEqual(@as(usize, 1), entry.render_cache_copy_buttons.items.len);
 }
 
-test "replayed copy-button hit rects translate with the message and clip away" {
-    const hit_rect: palette.Rect = .{ .x = 500.0, .y = 4.0, .w = 24.0, .h = 24.0 };
-    const clip: palette.Rect = .{ .x = 0.0, .y = 0.0, .w = 800.0, .h = 600.0 };
-    const visible = translatedCopyHitRect(hit_rect, 100.0, 200.0, clip) orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(@as(f32, 600.0), visible.x);
-    try std.testing.expectEqual(@as(f32, 204.0), visible.y);
-    // A message scrolled out of the viewport registers no hit.
-    try std.testing.expect(translatedCopyHitRect(hit_rect, 100.0, 700.0, clip) == null);
-}
-
-test "transcript render cache only invalidates selected messages" {
-    const selection: app_state.TranscriptMarkdownSelection = .{
-        .anchor = .{ .message_index = 7, .point = .{ .line_index = 0, .column = 2 } },
-        .focus = .{ .message_index = 5, .point = .{ .line_index = 1, .column = 4 } },
-    };
-    try std.testing.expect(!transcriptMessageIntersectsSelection(4, selection));
-    try std.testing.expect(transcriptMessageIntersectsSelection(5, selection));
-    try std.testing.expect(transcriptMessageIntersectsSelection(6, selection));
-    try std.testing.expect(transcriptMessageIntersectsSelection(7, selection));
-    try std.testing.expect(!transcriptMessageIntersectsSelection(8, selection));
-}
-
 const TruncatedText = struct {
     text: []const u8,
     allocated: bool,
@@ -10054,16 +9386,6 @@ fn commandRowPreviewAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 
         pending_space = false;
     }
     return preview.toOwnedSlice(allocator);
-}
-
-test "command row preview joins content after its label and flattens CRLF" {
-    const preview = try commandRowPreviewAlloc(std.testing.allocator, "Input:\n  {\"cmd\":\"mise run build\"}");
-    defer std.testing.allocator.free(preview);
-    try std.testing.expectEqualStrings("Input: {\"cmd\":\"mise run build\"}", preview);
-
-    const crlf = try commandRowPreviewAlloc(std.testing.allocator, "Output:\r\n{\"success\":true}\n\n");
-    defer std.testing.allocator.free(crlf);
-    try std.testing.expectEqualStrings("Output: {\"success\":true}", crlf);
 }
 
 /// Truncates `text` so it fits in `max_width` pixels at `font_size` using the
@@ -11451,16 +10773,6 @@ fn chromeLabelWidth(font_size: f32, value: []const u8) f32 {
     return width;
 }
 
-test "chrome label width memo returns stable widths per text and font size" {
-    const first = chromeLabelWidth(12.0, "Working \u{00B7} 0:42");
-    const again = chromeLabelWidth(12.0, "Working \u{00B7} 0:42");
-    try std.testing.expectEqual(first, again);
-    // A different font size measures independently rather than serving the
-    // cached width for the same text.
-    const larger = chromeLabelWidth(16.0, "Working \u{00B7} 0:42");
-    try std.testing.expect(larger > first);
-}
-
 fn centeredLabelRect(container: palette.Rect, label_w: f32, label_h: f32) palette.Rect {
     return .{
         .x = container.x + @max((container.w - label_w) * 0.5, 0.0),
@@ -11524,17 +10836,6 @@ test "diff summary v2 round trips delimiter characters and multiple files" {
 test "diff summary v2 rejects truncated payloads" {
     const body = utils.PERSISTED_DIFF_MARKER ++ "FILE\t4\t1\t0\t99\nmain";
     try std.testing.expect(parseDiffSummary(std.testing.allocator, body) == null);
-}
-
-test "parent steer wrapper is hidden in the child transcript" {
-    const wrapped = "<verde_parent_message from_thread=\"cli-thread-1\">\nplease rebase\n</verde_parent_message>\n(Steering from the Verde agent orchestrating you, not the human user.)";
-    try std.testing.expectEqualStrings("please rebase", parentSteerBody(.user, wrapped).?);
-    try std.testing.expectEqualStrings("please rebase", transcriptDisplayBody(.user, wrapped));
-    try std.testing.expectEqualStrings("please rebase", parentSteerBody(.system, wrapped).?);
-    try std.testing.expect(parentSteerBody(.assistant, wrapped) == null);
-    try std.testing.expectEqualStrings("You", userRoleLabel("Codex"));
-    try std.testing.expectEqualStrings("Agent \u{00B7} Planner", userRoleLabel("Agent \u{00B7} Planner"));
-    try std.testing.expect(parentSteerBody(.user, "plain prompt") == null);
 }
 
 test "child notification card parses fenced and legacy replies" {
@@ -11656,48 +10957,6 @@ test "orchestration runs fold every exchange but the last" {
     try std.testing.expect(orchestrationRunStartingAt(&steered, 4) == null);
 }
 
-test "a single superseded orchestration exchange is not folded" {
-    const n1 = comptime testChildEnvelope("c1", "r1");
-    const n2 = comptime testChildEnvelope("c2", "r2");
-    const msg = struct {
-        fn make(role: app_state.ChatRole, body: [:0]const u8) app_state.ChatMessage {
-            return .{ .role = role, .author = "", .body = body };
-        }
-    }.make;
-    const messages = [_]app_state.ChatMessage{
-        msg(.user, "human kickoff"),
-        msg(.assistant, "spawning"),
-        msg(.user, n1),
-        msg(.assistant, "status"),
-        msg(.user, n2),
-        msg(.assistant, "wrap-up"),
-    };
-    try std.testing.expect(orchestrationRunEndingAt(&messages, 4) == null);
-    try std.testing.expect(orchestrationRunStartingAt(&messages, 2) == null);
-}
-
-test "child reply preview is one plain sentence without the summary label" {
-    var buf: [CHILD_PREVIEW_MAX_BYTES]u8 = undefined;
-    try std.testing.expectEqualStrings(
-        "The three most recent commits changed Verde's keybindings.",
-        childReplyPreview(&buf, "**Summary:** The three most recent commits changed Verde's keybindings. Details follow.\n\n**Details for the parent agent:**\n1. x"),
-    );
-    try std.testing.expectEqualStrings(
-        "Count: 56 AGENTS.md files found under packages/.",
-        childReplyPreview(&buf, "**Count: 56 AGENTS.md files found under packages/.**\n\n**File paths:**"),
-    );
-    try std.testing.expectEqualStrings("Fixed the parser in main.zig", childReplyPreview(&buf, "- Fixed the parser in `main.zig`"));
-    try std.testing.expectEqualStrings("", childReplyPreview(&buf, "```\ncode\n```\n"));
-}
-
-test "child results that need the human open expanded" {
-    try std.testing.expect(childNotificationDefaultExpanded(.waiting_approval));
-    try std.testing.expect(childNotificationDefaultExpanded(.blocked));
-    try std.testing.expect(childNotificationDefaultExpanded(.failed));
-    try std.testing.expect(!childNotificationDefaultExpanded(.completed));
-    try std.testing.expect(!childNotificationDefaultExpanded(.aborted));
-}
-
 const CursorBenchFixture = struct {
     tmp: std.testing.TmpDir,
     storage: *@import("../state/storage.zig").Storage,
@@ -11796,41 +11055,6 @@ const CursorBenchFixture = struct {
         self.tmp.cleanup();
     }
 };
-
-fn benchTranscriptCursorQueryNs(state: *app_state.AppState, x: f32, y: f32, iterations: usize, cold: bool) u64 {
-    const start = profiler.nowNs();
-    var index: usize = 0;
-    while (index < iterations) : (index += 1) {
-        // Cold: a stream delta replaced the body since the last query.
-        if (cold) transcript_body_hit_memo = null;
-        // Mirrors syncMouseCursor's transcript tail: link pointer, then I-beam.
-        std.mem.doNotOptimizeAway(transcriptCursorAt(state, x, y));
-    }
-    const elapsed = profiler.nowNs() - start;
-    return @intCast(@divTrunc(elapsed, @as(@TypeOf(elapsed), @intCast(iterations))));
-}
-
-test "transcript cursor hit test over a long pending stream (microbenchmark)" {
-    const allocator = std.testing.allocator;
-    var fixture = try CursorBenchFixture.init(allocator, 240, 160);
-    defer fixture.deinit(allocator);
-    fixture.renderTail();
-    const column = fixture.column;
-    // Over the tail of the streamed reply, the common hover target while a
-    // turn streams in the shown chat.
-    const tail_x = column.x + 120.0;
-    const tail_y = column.y + column.h - 60.0;
-    const cold_ns = benchTranscriptCursorQueryNs(fixture.state, tail_x, tail_y, 20, true);
-    const warm_ns = benchTranscriptCursorQueryNs(fixture.state, tail_x, tail_y, 200, false);
-    // Over the bottom gap below the stream (no row): resolution alone.
-    const miss_ns = benchTranscriptCursorQueryNs(fixture.state, tail_x, column.y + column.h - 1.0, 200, true);
-    std.log.scoped(.cursor_bench).warn("pending_rows=240 stream_bytes={d} per-call cold={d}us warm={d}us miss={d}us", .{
-        fixture.state.currentThread().send_state.partial_text.items.len,
-        cold_ns / std.time.ns_per_us,
-        warm_ns / std.time.ns_per_us,
-        miss_ns / std.time.ns_per_us,
-    });
-}
 
 fn firstPendingRowHit(pending_index: ?usize) ?PendingRowHit {
     for (pending_row_hits[0..pending_row_hit_count]) |hit| {

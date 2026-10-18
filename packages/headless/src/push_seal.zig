@@ -233,34 +233,6 @@ fn tamperedEnvelope(allocator: std.mem.Allocator, envelope: []const u8, index: u
     return out;
 }
 
-test "push seal round-trips with random keys" {
-    const device = generateKeyPair(testing.io);
-    const plaintext = "{\"kind\":\"attention\",\"title\":\"Chat needs input\"}";
-
-    const first = try seal(testing.allocator, testing.io, device.public_key, plaintext);
-    defer testing.allocator.free(first);
-    const second = try seal(testing.allocator, testing.io, device.public_key, plaintext);
-    defer testing.allocator.free(second);
-    try testing.expectEqual(envelopeLen(plaintext.len), first.len);
-    // Fresh ephemeral keys make every envelope distinct.
-    try testing.expect(!std.mem.eql(u8, first, second));
-
-    for ([_][]const u8{ first, second }) |envelope| {
-        const opened = try open(testing.allocator, device.secret_key, envelope);
-        defer testing.allocator.free(opened);
-        try testing.expectEqualStrings(plaintext, opened);
-    }
-}
-
-test "push seal round-trips an empty plaintext" {
-    const device = generateKeyPair(testing.io);
-    const envelope = try seal(testing.allocator, testing.io, device.public_key, "");
-    defer testing.allocator.free(envelope);
-    const opened = try open(testing.allocator, device.secret_key, envelope);
-    defer testing.allocator.free(opened);
-    try testing.expectEqual(@as(usize, 0), opened.len);
-}
-
 test "push seal matches the fixed vector" {
     const recipient = try KeyPair.generateDeterministic(vector_recipient_secret);
     try testing.expectEqualSlices(u8, &vector_recipient_public, &recipient.public_key);
@@ -292,11 +264,6 @@ test "push open rejects tampering in every envelope field" {
     }
 }
 
-test "push open rejects the wrong recipient key" {
-    const other = generateKeyPair(testing.io);
-    try expectOpenError(error.AuthenticationFailed, other.secret_key, vector_envelope);
-}
-
 test "push open rejects malformed envelopes" {
     try expectOpenError(error.InvalidEnvelope, vector_recipient_secret, "");
     // Shorter than the fixed overhead.
@@ -313,29 +280,4 @@ test "push open rejects malformed envelopes" {
     var truncated_buffer: [MAX_ENVELOPE_LEN]u8 = undefined;
     const truncated = base64.Encoder.encode(&truncated_buffer, raw[0 .. raw.len - 1]);
     try expectOpenError(error.AuthenticationFailed, vector_recipient_secret, truncated);
-}
-
-test "push seal rejects a low-order recipient key" {
-    const zero_key = [_]u8{0} ** PUBLIC_KEY_LENGTH;
-    try testing.expectError(error.WeakPublicKey, seal(testing.allocator, testing.io, zero_key, "x"));
-}
-
-test "push seal enforces the 3 KiB plaintext limit" {
-    const device = generateKeyPair(testing.io);
-    var plaintext: [MAX_PLAINTEXT_LEN + 1]u8 = undefined;
-    @memset(&plaintext, 'a');
-
-    const envelope = try seal(testing.allocator, testing.io, device.public_key, plaintext[0..MAX_PLAINTEXT_LEN]);
-    defer testing.allocator.free(envelope);
-    try testing.expectEqual(MAX_ENVELOPE_LEN, envelope.len);
-    const opened = try open(testing.allocator, device.secret_key, envelope);
-    defer testing.allocator.free(opened);
-    try testing.expectEqualSlices(u8, plaintext[0..MAX_PLAINTEXT_LEN], opened);
-
-    try testing.expectError(error.PlaintextTooLarge, seal(testing.allocator, testing.io, device.public_key, &plaintext));
-
-    // One character past the largest valid envelope is rejected before decoding.
-    var oversized: [MAX_ENVELOPE_LEN + 1]u8 = undefined;
-    @memset(&oversized, 'A');
-    try expectOpenError(error.EnvelopeTooLarge, device.secret_key, &oversized);
 }

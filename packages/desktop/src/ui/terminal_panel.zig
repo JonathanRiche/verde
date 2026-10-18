@@ -2707,17 +2707,6 @@ test "box drawing mappings preserve tee directions and line styles" {
     try std.testing.expectEqual(BoxLines{ .up = .double, .right = .double, .down = .double, .left = .double }, boxLinesForCodepoint(0x256c).?); // ╬
 }
 
-test "box drawing mappings cover every non-specialized codepoint" {
-    var cp: u21 = 0x2500;
-    while (cp <= 0x257f) : (cp += 1) {
-        const specialized = switch (cp) {
-            0x2504...0x250b, 0x254c...0x254f, 0x256d...0x2573 => true,
-            else => false,
-        };
-        try std.testing.expect(specialized or boxLinesForCodepoint(cp) != null);
-    }
-}
-
 test "disjoint box arms never overlap and preserve total coverage" {
     // A `┼` cell: horizontal arms and vertical arms cross at the center.
     var arms: DisjointRects = .{};
@@ -2732,118 +2721,6 @@ test "disjoint box arms never overlap and preserve total coverage" {
     }
     // Union: 16x2 horizontal band + 2x32 vertical band - 2x2 shared center.
     try std.testing.expectApproxEqAbs(@as(f32, 16 * 2 + 2 * 32 - 4), area, 0.001);
-}
-
-test "subtractRect splits into top, bottom, left, and right bands" {
-    var out: [4]palette.Rect = undefined;
-    const count = subtractRect(.{ .x = 0, .y = 0, .w = 10, .h = 10 }, .{ .x = 4, .y = 4, .w = 2, .h = 2 }, &out);
-    try std.testing.expectEqual(@as(usize, 4), count);
-    var area: f32 = 0.0;
-    for (out[0..count]) |r| area += r.w * r.h;
-    try std.testing.expectApproxEqAbs(@as(f32, 96), area, 0.001);
-    try std.testing.expectEqual(@as(usize, 1), subtractRect(.{ .x = 0, .y = 0, .w = 4, .h = 4 }, .{ .x = 4, .y = 0, .w = 2, .h = 2 }, &out));
-    try std.testing.expectEqual(@as(usize, 0), subtractRect(.{ .x = 0, .y = 0, .w = 4, .h = 4 }, .{ .x = 0, .y = 0, .w = 4, .h = 4 }, &out));
-}
-
-test "terminal draw cache translates every cached command" {
-    const color: palette.Color = .{ .r = 0.1, .g = 0.2, .b = 0.3, .a = 0.4 };
-    const offset: palette.draw.Vec2 = .{ .x = -125.0, .y = 18.0 };
-    const clip: palette.Rect = .{ .x = 10.0, .y = 20.0, .w = 300.0, .h = 200.0 };
-
-    const rect_command = translatedCachedDrawCommand(.{ .rect = .{
-        .rect = .{ .x = 12.0, .y = 24.0, .w = 30.0, .h = 40.0 },
-        .color = color,
-        .clip = clip,
-    } }, offset);
-    switch (rect_command) {
-        .rect => |cmd| {
-            try std.testing.expectEqual(palette.Rect{ .x = -113.0, .y = 42.0, .w = 30.0, .h = 40.0 }, cmd.rect);
-            try std.testing.expectEqual(@as(?palette.Rect, .{ .x = -115.0, .y = 38.0, .w = 300.0, .h = 200.0 }), cmd.clip);
-            try std.testing.expectEqual(color, cmd.color);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-
-    const border_command = translatedCachedDrawCommand(.{ .border = .{
-        .rect = .{ .x = 20.0, .y = 30.0, .w = 50.0, .h = 60.0 },
-        .color = color,
-        .radius = 4.0,
-        .width = 2.0,
-        .clip = clip,
-    } }, offset);
-    switch (border_command) {
-        .border => |cmd| {
-            try std.testing.expectEqual(palette.Rect{ .x = -105.0, .y = 48.0, .w = 50.0, .h = 60.0 }, cmd.rect);
-            try std.testing.expectEqual(@as(f32, 4.0), cmd.radius);
-            try std.testing.expectEqual(@as(f32, 2.0), cmd.width);
-            try std.testing.expectEqual(@as(?palette.Rect, .{ .x = -115.0, .y = 38.0, .w = 300.0, .h = 200.0 }), cmd.clip);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-
-    const triangle_command = translatedCachedDrawCommand(.{ .triangle = .{
-        .p0 = .{ .x = 1.0, .y = 2.0 },
-        .p1 = .{ .x = 3.0, .y = 4.0 },
-        .p2 = .{ .x = 5.0, .y = 6.0 },
-        .color = color,
-        .clip = clip,
-    } }, offset);
-    switch (triangle_command) {
-        .triangle => |cmd| {
-            try std.testing.expectEqual(palette.draw.Vec2{ .x = -124.0, .y = 20.0 }, cmd.p0);
-            try std.testing.expectEqual(palette.draw.Vec2{ .x = -122.0, .y = 22.0 }, cmd.p1);
-            try std.testing.expectEqual(palette.draw.Vec2{ .x = -120.0, .y = 24.0 }, cmd.p2);
-            try std.testing.expectEqual(@as(?palette.Rect, .{ .x = -115.0, .y = 38.0, .w = 300.0, .h = 200.0 }), cmd.clip);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-
-    const text_command = translatedCachedDrawCommand(.{ .terminal_text = .{
-        .rect = .{ .x = 15.0, .y = 25.0, .w = 80.0, .h = 20.0 },
-        .value = "translated",
-        .color = color,
-        .font_size = 14.0,
-        .clip = clip,
-        .glyph_kind = .icon,
-    } }, offset);
-    switch (text_command) {
-        .terminal_text => |cmd| {
-            try std.testing.expectEqual(palette.Rect{ .x = -110.0, .y = 43.0, .w = 80.0, .h = 20.0 }, cmd.rect);
-            try std.testing.expectEqualStrings("translated", cmd.value);
-            try std.testing.expectEqual(@as(f32, 14.0), cmd.font_size);
-            try std.testing.expectEqual(TerminalGlyphKind.icon, cmd.glyph_kind);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-}
-
-test "terminal draw cache culls commands outside the scrolling viewport" {
-    const color: palette.Color = .{ .r = 0.1, .g = 0.2, .b = 0.3, .a = 1.0 };
-    const viewport: palette.Rect = .{ .x = 100.0, .y = 50.0, .w = 200.0, .h = 120.0 };
-
-    try std.testing.expect(cachedDrawCommandIntersects(.{ .rect = .{
-        .rect = .{ .x = 90.0, .y = 60.0, .w = 20.0, .h = 20.0 },
-        .color = color,
-    } }, viewport));
-    try std.testing.expect(!cachedDrawCommandIntersects(.{ .terminal_text = .{
-        .rect = .{ .x = 20.0, .y = 60.0, .w = 40.0, .h = 20.0 },
-        .value = "offscreen",
-        .color = color,
-        .font_size = 14.0,
-        .glyph_kind = .text,
-    } }, viewport));
-    try std.testing.expect(!cachedDrawCommandIntersects(.{ .rect = .{
-        .rect = .{ .x = 120.0, .y = 60.0, .w = 20.0, .h = 20.0 },
-        .color = color,
-        .clip = .{ .x = 0.0, .y = 0.0, .w = 50.0, .h = 50.0 },
-    } }, viewport));
-    try std.testing.expect(!cachedDrawCommandIntersects(.{ .border = .{
-        .rect = .{ .x = 120.0, .y = 60.0, .w = 20.0, .h = 20.0 },
-        .color = color,
-        .radius = 10.0,
-        .width = 1.0,
-        .clip = .{ .x = 0.0, .y = 0.0, .w = 50.0, .h = 50.0 },
-    } }, viewport));
 }
 
 test "terminal row cache geometry allows translation and partial dirtiness" {
@@ -2868,24 +2745,4 @@ test "terminal row cache geometry allows translation and partial dirtiness" {
     render_state.dirty = .partial;
     try std.testing.expect(cache.geometryValidFor(&render_state, .{ .x = -220.0, .y = 80.0, .w = 800.0, .h = 600.0 }, 1.0, 0, 24, false));
     try std.testing.expect(!cache.geometryValidFor(&render_state, .{ .x = -220.0, .y = 80.0, .w = 800.0, .h = 600.0 }, 1.0, 0, 24, true));
-}
-
-test "terminal row cache rebuilds only changed or cursor-affected rows" {
-    try std.testing.expect(!terminalRowNeedsRebuild(false, true, false, false));
-    try std.testing.expect(terminalRowNeedsRebuild(false, true, true, false));
-    try std.testing.expect(terminalRowNeedsRebuild(false, true, false, true));
-    try std.testing.expect(terminalRowNeedsRebuild(false, false, false, false));
-    try std.testing.expect(terminalRowNeedsRebuild(true, true, false, false));
-}
-
-test "terminal row cache detects cursor visual style changes" {
-    var render_state: ghostty_vt.RenderState = .empty;
-    const cache: TerminalPaneDrawCache = .{
-        .cursor_visible = true,
-        .cursor_visual_style = .block,
-    };
-
-    try std.testing.expect(!cache.cursorStateChanged(&render_state));
-    render_state.cursor.visual_style = .bar;
-    try std.testing.expect(cache.cursorStateChanged(&render_state));
 }

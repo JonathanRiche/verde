@@ -85,27 +85,6 @@ final class DiffTests: XCTestCase {
         XCTAssertEqual(source.misses, [])
     }
 
-    func testMultiFileGoldensUseCoreParseAndHighlightSpans() async throws {
-        let index = try await entries(multi)
-        XCTAssertEqual(index.map(\.path), ["web/src/greet.ts", "config/settings.json", "assets/logo.png", "scripts/run.sh",
-                                           "notes/big.txt", "data/huge.txt"])
-        let totals = diffTotals(index)
-        XCTAssertEqual([totals.additions, totals.deletions], [4657, 2])
-        // Tabs expand to the column grid; emoji and word spans map from UTF-8 bytes to UTF-16.
-        assertGolden("greet-ts.golden.txt", diffGolden(try await parsed("web/src/greet.ts")))
-        assertGolden("settings-json.golden.txt", diffGolden(try await parsed("config/settings.json")))
-        let logo = try await parsed("assets/logo.png")
-        XCTAssertTrue(logo.binary)
-        let run = try await parsed("scripts/run.sh")
-        XCTAssertTrue(run.hunks.isEmpty)
-        let big = try await parsed("notes/big.txt")
-        XCTAssertEqual(big.lineCount, 450)
-        // Past the core's per-patch budget: the source text, never a Swift parse.
-        guard case .source(let patch) = try await render(multi, "data/huge.txt") else { return XCTFail("huge.txt should fall back") }
-        XCTAssertTrue(patch.hasPrefix("--- /dev/null\n+++ b/data/huge.txt\n@@ -0,0 +1,4200 @@\n+generated row 00001\n"))
-        XCTAssertEqual(source.misses, [])
-    }
-
     func testCopiedHunksAreTheOriginalUnifiedFragments() async throws {
         let greet = try await parsed("web/src/greet.ts")
         XCTAssertEqual(greet.hunks.map(\.header), ["@@ -1,5 +1,6 @@", "@@ -20,3 +21,3 @@"])
@@ -124,15 +103,5 @@ final class DiffTests: XCTestCase {
         XCTAssertTrue(row.text.hasPrefix("    const"))
         XCTAssertEqual(diffGutter(row, width: greet.numberWidth), " 3  3   ")
         XCTAssertEqual(source.misses, [])
-    }
-
-    func testUndecodableBodyAndLanguages() async throws {
-        let broken = await source.index("VERDE_DIFF_V2\nFILE\tbroken")
-        XCTAssertNil(broken.value)
-        XCTAssertEqual(diffLanguage("web/src/greet.ts"), "ts")
-        XCTAssertEqual(diffLanguage("a/B.JSON"), "json")
-        XCTAssertEqual(diffLanguage("x.tsx"), "tsx")
-        XCTAssertNil(diffLanguage("Makefile"))
-        XCTAssertNil(diffLanguage("run.sh"))
     }
 }

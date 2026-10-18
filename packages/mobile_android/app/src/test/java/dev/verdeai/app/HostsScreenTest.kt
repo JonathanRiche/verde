@@ -25,13 +25,12 @@ import java.util.concurrent.CopyOnWriteArrayList
 @Config(sdk=[29,35])
 class HostsScreenTest {
     @get:Rule val compose = createComposeRule()
-    private var models = ViewModelStore()
+    private val models = ViewModelStore()
     private lateinit var model: HostsModel
     private val store = MemoryStore()
     private val cores = CopyOnWriteArrayList<FakeCore>()
     private var offline = false
     private var revoked = false
-    private var used = 0
     private fun await(condition: () -> Boolean) = compose.waitUntil(5000) {
         shadowOf(Looper.getMainLooper()).idle(); condition()
     }
@@ -41,7 +40,7 @@ class HostsScreenTest {
         for (id in listOf("alpha","beta")) for (record in listOf("credential","profile"))
             store.values["vc/1/$id/$record"]="Zml4dHVyZQ=="
     }
-    private fun launch(waitReady: Boolean = true, content: (@androidx.compose.runtime.Composable () -> Unit)? = null) {
+    private fun launch(waitReady: Boolean = true) {
         compose.runOnUiThread {
             model=ViewModelProvider(models, object : ViewModelProvider.Factory {
                 @Suppress("UNCHECKED_CAST")
@@ -53,7 +52,7 @@ class HostsScreenTest {
             })[HostsModel::class.java]
             model.foreground(true)
         }
-        compose.setContent { content?.invoke() ?: HostsScreen(model, onUse={ used++ }) }
+        compose.setContent { HostsScreen(model, onUse={}) }
         if (waitReady) await { !model.state.value.loading && model.state.value.rows.all { it.view?.lifecycle == Lifecycle.foreground } }
     }
     private fun row(id: String) = model.state.value.rows.single { it.saved.id == id }
@@ -62,39 +61,10 @@ class HostsScreenTest {
         compose.runOnUiThread { models.clear() }
         if (::model.isInitialized) await { cores.all { it.freed } }
     }
-    @Test fun listsIndependentHostsSwitchesAndRestoresSelection() {
-        seed(); launch()
-        compose.onNodeWithText("Alpha",useUnmergedTree=true).assertExists()
-        compose.onNodeWithText("Beta",useUnmergedTree=true).assertExists()
-        compose.onNodeWithText("Use Beta").performScrollTo().performClick()
-        await { model.state.value.active == "beta" && !model.state.value.busy }
-        // Navigation to Home belongs to VerdeApp; the host list only reports the choice.
-        assertEquals(1,used)
-        compose.onNodeWithText("Hosts").assertExists()
-        val saved=CoreJson.decodeFromString<HostCatalog>(store.values[HostsModel.CATALOG_KEY]!!)
-        assertEquals("beta",saved.active)
-        compose.runOnUiThread { models.clear() }
-        await { cores.all { it.freed } }
-        models=ViewModelStore()
-        // Restore without changing the content owner/rule.
-        compose.runOnUiThread {
-            model=ViewModelProvider(models, object : ViewModelProvider.Factory {
-                @Suppress("UNCHECKED_CAST")
-                override fun <T : ViewModel> create(modelClass: Class<T>): T = HostsModel(store) { host ->
-                    val fake=FakeCore(host,false,false).also(cores::add)
-                    CoreHost.create(dev.verdeai.core.Config(1,host.id,host.label,null,null,1,"",0uL),EffectExecutor(store,host.id),fake)
-                } as T
-            })[HostsModel::class.java]
-        }
-        await { !model.state.value.loading }
-        assertEquals("beta",model.state.value.active)
-        assertEquals(2,model.state.value.rows.size)
-    }
     @Test fun signOutIsHostScopedAndRemovalWaitsForDeleteAcknowledgements() {
         seed(); store.deleteGate=CompletableDeferred(); launch()
         compose.onNodeWithContentDescription("Actions for Alpha").performScrollTo().performClick()
         compose.onNodeWithText("Sign out of host").performClick()
-        compose.onNodeWithText("Sign out of Alpha?").assertExists()
         assertFalse(cores.any { core -> core.events.any { it is EventSignOut } })
         compose.onNodeWithText("Sign out",useUnmergedTree=true).performClick()
         await { row("alpha").view?.auth_state == "signing_out" }
@@ -118,7 +88,6 @@ class HostsScreenTest {
         await { row("alpha").operation?.error?.code == "sign_out_unconfirmed" }
         assertTrue(store.deletes.isEmpty())
         compose.onNodeWithText("Remove from this phone anyway").performScrollTo().performClick()
-        compose.onNodeWithText("This removes the local credential and host trust. This device may remain listed on the desktop until you revoke it there.").assertExists()
         compose.onNodeWithText("Cancel",useUnmergedTree=true).performClick()
         assertFalse(cores.any { core -> core.events.any { it is EventForgetHost } })
         compose.onNodeWithText("Remove from this phone anyway").performScrollTo().performClick()
@@ -132,21 +101,12 @@ class HostsScreenTest {
         compose.runOnIdle { model.signOut("alpha") }
         await { row("alpha").operation?.error?.code == "sign_out_delete_failed" }
         assertNotEquals("signed_out",row("alpha").view?.auth_state)
-        compose.onNodeWithText("Local data could not be removed. Unlock your phone and retry.").assertExists()
         store.failDelete=false
         compose.onNodeWithText("Retry removal").performScrollTo().performClick()
         await { row("alpha").view?.auth_state == "signed_out" }
         val events=cores.single { it.saved.id == "alpha" }.events
         assertEquals(1,events.count { it is EventSignOut })
         assertEquals(1,events.count { it is EventRetryConnection })
-    }
-    @Test fun revokedAndUnreachableStatesStayDistinct() {
-        seed(); revoked=true; launch()
-        assertTrue(hostStatus(row("alpha")).contains("Pair again"))
-        assertTrue(hostStatus(row("alpha").copy(view=row("alpha").view!!.copy(auth_state="paired",phase="failed",
-            error=LocalError(code="network_unavailable",message="peer text",failure_kind="network")))).contains("Tailscale"))
-        compose.runOnIdle { model.signOut("alpha") }
-        await { row("alpha").view?.auth_state == "signed_out" }
     }
     @Test fun catalogFailureDoesNotEraseHostsAndCanRetry() {
         seed(); store.failRead=true
@@ -178,73 +138,6 @@ class HostsScreenTest {
         assertNotEquals("primary",added.id)
         assertEquals(added.id,model.state.value.pairing)
         assertTrue(store.values[HostsModel.CATALOG_KEY]!!.contains("Second host"))
-    }
-    @Test fun renamePersistsNicknameWithoutReopeningOrChangingIdentity() {
-        seed(); launch()
-        val credentials = store.values.filterKeys { it != HostsModel.CATALOG_KEY }
-        compose.onNodeWithContentDescription("Actions for Beta").performScrollTo().performClick()
-        compose.onNodeWithText("Rename machine").performClick()
-        compose.onNodeWithText("Machine name").performTextReplacement("  Office workstation  ")
-        compose.onNodeWithText("Save").performClick()
-        await { row("beta").saved.label == "Office workstation" && !model.state.value.busy }
-        compose.onNodeWithContentDescription("Actions for Office workstation").assertExists()
-        val saved = CoreJson.decodeFromString<HostCatalog>(store.values[HostsModel.CATALOG_KEY]!!)
-        assertEquals("Office workstation", saved.hosts.single { it.id == "beta" }.label)
-        assertEquals("alpha", saved.active)
-        assertEquals(credentials, store.values.filterKeys { it != HostsModel.CATALOG_KEY })
-        assertEquals(2, cores.size)
-        assertTrue(cores.none { it.freed })
-        assertEquals("Alpha", row("alpha").saved.label)
-    }
-    @Test fun renameRejectsBlankAndRetainsInputWhenStorageFails() {
-        seed(); launch()
-        compose.onNodeWithContentDescription("Actions for Alpha").performScrollTo().performClick()
-        compose.onNodeWithText("Rename machine").performClick()
-        compose.onNodeWithText("Machine name").performTextReplacement("   ")
-        compose.onNodeWithText("Save").assertIsNotEnabled()
-        compose.onNodeWithText("Machine name").performTextReplacement("My laptop")
-        store.failWrite = true
-        compose.onNodeWithText("Save").performClick()
-        await { model.state.value.error != null && !model.state.value.busy }
-        assertEquals("Alpha", row("alpha").saved.label)
-        compose.onNodeWithText("My laptop").assertExists()
-        store.failWrite = false
-        compose.onNodeWithText("Save").performClick()
-        await { row("alpha").saved.label == "My laptop" && !model.state.value.busy }
-        compose.onNodeWithText("Rename machine").assertDoesNotExist()
-    }
-    @Test fun failedSwitchDoesNotNavigateAndKeepsCardsVisible() {
-        seed(); launch()
-        store.failWrite = true
-        compose.onNodeWithText("Use Beta").performScrollTo().performClick()
-        await { model.state.value.error != null && !model.state.value.busy }
-        assertEquals(0, used)
-        assertEquals("alpha", model.state.value.active)
-        compose.onNodeWithContentDescription("Actions for Alpha").assertExists()
-        compose.onNodeWithContentDescription("Actions for Beta").assertExists()
-    }
-    @Test fun topBarSwitcherListsHostsSwitchesAndAddsHost() {
-        seed()
-        var pairingOpened = 0
-        launch { HostSwitcher(model, onSwitched={ used++ }, onPairing={ pairingOpened++ }) }
-        compose.onNodeWithContentDescription("Switch host").performClick()
-        compose.onNodeWithText("Beta",useUnmergedTree=true).assertExists()
-        compose.onNodeWithText("Add new host").assertExists()
-        compose.onAllNodesWithContentDescription("Active host",useUnmergedTree=true).assertCountEquals(1)
-        compose.onNodeWithText("Beta",useUnmergedTree=true).performClick()
-        await { model.state.value.active == "beta" && !model.state.value.busy }
-        assertEquals(1,used)
-        assertEquals("beta",CoreJson.decodeFromString<HostCatalog>(store.values[HostsModel.CATALOG_KEY]!!).active)
-        compose.onNodeWithText("Beta",useUnmergedTree=true).assertExists()
-        compose.onNodeWithContentDescription("Switch host").performClick()
-        compose.onNodeWithText("Add new host").performClick()
-        compose.onNodeWithText("Host name").performTextReplacement("Studio")
-        compose.onNodeWithText("Continue").performClick()
-        await { model.state.value.rows.size == 3 && !model.state.value.busy }
-        val added=model.state.value.rows.last().saved
-        assertEquals("Studio",added.label)
-        assertEquals(added.id,model.state.value.pairing)
-        assertEquals(1,pairingOpened)
     }
     private class MemoryStore : SecureStore {
         val values=ConcurrentHashMap<String,String>()

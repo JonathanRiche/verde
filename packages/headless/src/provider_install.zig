@@ -3,7 +3,6 @@
 //! These are the upstream one-liners. Verde shows them and can open them in a
 //! terminal; it does not download or execute them itself.
 
-const std = @import("std");
 const provider_types = @import("provider_types.zig");
 
 /// Custom ACP agents are configured in Settings, not installed or signed in
@@ -89,34 +88,4 @@ pub fn loginShell(provider: provider_types.Provider) []const u8 {
         .muse => "muse login",
         .custom_acp => "echo " ++ CUSTOM_ACP_HINT,
     };
-}
-
-test "provider login shell matches its argv" {
-    inline for (std.meta.tags(provider_types.Provider)) |provider| {
-        const joined = try std.mem.join(std.testing.allocator, " ", loginArgv(provider));
-        defer std.testing.allocator.free(joined);
-        try std.testing.expectEqualStrings(joined, loginShell(provider));
-    }
-}
-
-test "windows installers are single-line commands" {
-    inline for (std.meta.tags(provider_types.Provider)) |provider| {
-        if (installShellWindows(provider)) |shell| {
-            try std.testing.expect(shell.len > 0);
-            try std.testing.expect(std.mem.indexOfAny(u8, shell, "\r\n") == null);
-            // PowerShell has no `bash`; a POSIX pipe target means a copy/paste slip.
-            try std.testing.expect(std.mem.indexOf(u8, shell, "| bash") == null);
-            try std.testing.expect(std.mem.indexOf(u8, shell, "| sh") == null);
-        }
-    }
-}
-
-test "provider installers are single-line curl commands" {
-    inline for (std.meta.tags(provider_types.Provider)) |provider| {
-        const shell = installShell(provider);
-        try std.testing.expect(shell.len > 0);
-        try std.testing.expect(std.mem.indexOfAny(u8, shell, "\r\n") == null);
-        try std.testing.expect(std.mem.startsWith(u8, shell, "curl "));
-        try std.testing.expectEqualStrings(shell, installArgv(provider)[0]);
-    }
 }

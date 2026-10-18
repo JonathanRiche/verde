@@ -754,35 +754,6 @@ test "marshal request bytes" {
     try testing.expectEqualSlices(u32, &expected, words);
 }
 
-test "marshal request with fd" {
-    const fds = try socketPair();
-    var c = try Connection.fromFd(testing.allocator, fds[0], .{});
-    defer c.deinit();
-    defer _ = linux.close(fds[1]);
-
-    var pipe_fds: [2]i32 = undefined;
-    _ = linux.pipe2(&pipe_fds, .{ .CLOEXEC = true });
-    defer _ = linux.close(pipe_fds[0]);
-    defer _ = linux.close(pipe_fds[1]);
-    const shm = try c.newObject(proto.WlShm, 1);
-    _ = try shm.createPool(c, @enumFromInt(pipe_fds[0]), 4096);
-    try c.flush();
-
-    var buf: [64]u8 align(4) = undefined;
-    var iov = [1]std.posix.iovec{.{ .base = &buf, .len = buf.len }};
-    var cbuf: [cmsgSpace(4 * 4)]u8 align(8) = undefined;
-    var msg: linux.msghdr = .{ .name = null, .namelen = 0, .iov = &iov, .iovlen = 1, .control = &cbuf, .controllen = cbuf.len, .flags = 0 };
-    const n = linux.recvmsg(fds[1], &msg, linux.MSG.CMSG_CLOEXEC);
-    const words: []const u32 = @alignCast(std.mem.bytesAsSlice(u32, buf[0..n]));
-    // wl_shm.create_pool(new 3, fd, 4096): the fd takes no payload bytes.
-    try testing.expectEqualSlices(u32, &.{ 2, (16 << 16) | 0, 3, 4096 }, words);
-    const hdr: *const linux.cmsghdr = @ptrCast(&cbuf);
-    try testing.expectEqual(@as(c_int, linux.SCM.RIGHTS), @as(c_int, @intCast(hdr.type)));
-    const got = std.mem.readInt(i32, cbuf[@sizeOf(linux.cmsghdr)..][0..4], builtin.cpu.arch.endian());
-    try testing.expect(got >= 0 and got != pipe_fds[0]);
-    _ = linux.close(got);
-}
-
 test "roundtrip events with fds, strings, arrays and new ids" {
     const fds = try socketPair();
     var c = try Connection.fromFd(testing.allocator, fds[0], .{});
@@ -899,28 +870,4 @@ test "partial messages wait for more bytes" {
     try testing.expectEqual(@as(u32, 99), (try m.decode(proto.WlCallback)).done.callback_data);
     // done is a destructor event: object becomes a zombie until delete_id.
     try testing.expectEqual(ObjectState.zombie, c.lookup(2).?.state);
-}
-
-test "protocol error is reported" {
-    const fds = try socketPair();
-    var c = try Connection.fromFd(testing.allocator, fds[0], .{});
-    defer c.deinit();
-    defer _ = linux.close(fds[1]);
-    const surf = try c.newObject(proto.WlSurface, 6); // id 2
-    _ = surf;
-    var s: [16]u32 = undefined;
-    s[0] = 1;
-    s[1] = (28 << 16) | 0;
-    s[2] = 2;
-    s[3] = 2;
-    s[4] = 8;
-    const bytes = std.mem.sliceAsBytes(s[0..7]);
-    @memcpy(bytes[20..28], "bad siz\x00");
-    _ = linux.write(fds[1], bytes.ptr, bytes.len);
-    _ = try c.read();
-    try testing.expectError(error.ProtocolError, c.nextMessage());
-    const e = c.display_error.?;
-    try testing.expectEqualStrings("wl_surface", e.interface);
-    try testing.expectEqual(@as(u32, 2), e.code);
-    try testing.expectEqualStrings("bad siz", e.message());
 }

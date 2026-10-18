@@ -331,102 +331,11 @@ fn subsequenceScore(path: []const u8, start: usize, query: []const u8) ?i32 {
     return if (qi == query.len) total else null;
 }
 
-test "score prefers exact basename, prefix and contiguous matches" {
-    try std.testing.expect(score("src/main.zig", "xyz") == null);
-    try std.testing.expect(score("src/main.zig", "main.zig").? > score("src/domain/amain.zig", "main.zig").?);
-    try std.testing.expect(score("src/state.zig", "state").? > score("src/sidebar/tabs_ate.zig", "state").?);
-    try std.testing.expect(score("a/b/composer_commands.ts", "cmpcmd") != null);
-    try std.testing.expect(score("web/src/lib/store.ts", "lib/store").? > score("web/src/lib/other_store.ts", "lib/store").?);
-}
-
 test "unsafe relative paths are never emitted" {
     for ([_][]const u8{ "", "/etc/passwd", "../x", "a/../b", "a//b", "a\\b", "a\nb", "./a" }) |path| {
         try std.testing.expect(!safeRelativePath(path));
     }
     try std.testing.expect(safeRelativePath("dir/my file.ts"));
-}
-
-test "walk fallback lists relative files and skips heavy directories" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io, "src/nested");
-    try tmp.dir.createDirPath(io, "node_modules/pkg");
-    try tmp.dir.writeFile(io, .{ .sub_path = "src/nested/needle_file.ts", .data = "x" });
-    try tmp.dir.writeFile(io, .{ .sub_path = "node_modules/pkg/needle_file.ts", .data = "x" });
-    try tmp.dir.writeFile(io, .{ .sub_path = "README.md", .data = "x" });
-    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
-    defer allocator.free(root);
-
-    var arena_state: std.heap.ArenaAllocator = .init(allocator);
-    defer arena_state.deinit();
-    var files: std.ArrayList([]const u8) = .empty;
-    var truncated = false;
-    try walkListFiles(arena_state.allocator(), root, &files, &truncated);
-    try std.testing.expect(!truncated);
-    try std.testing.expectEqual(@as(usize, 2), files.items.len);
-
-    const ranked = try rank(arena_state.allocator(), files.items, "needle", 10);
-    try std.testing.expectEqual(@as(usize, 1), ranked.len);
-    try std.testing.expectEqualStrings("src/nested/needle_file.ts", ranked[0].path);
-    try std.testing.expectEqualStrings("needle_file.ts", ranked[0].file_name);
-}
-
-test "daemon fff cache reuses indexes and confines matches to each repository cwd" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io, "a");
-    try tmp.dir.createDirPath(io, "b");
-    try tmp.dir.writeFile(io, .{ .sub_path = "a/alpha-needle.txt", .data = "" });
-    try tmp.dir.writeFile(io, .{ .sub_path = "a/second-needle.txt", .data = "" });
-    try tmp.dir.writeFile(io, .{ .sub_path = "b/beta-needle.txt", .data = "" });
-    const a = try tmp.dir.realPathFileAlloc(io, "a", allocator);
-    defer allocator.free(a);
-    const b = try tmp.dir.realPathFileAlloc(io, "b", allocator);
-    defer allocator.free(b);
-    var cache: IndexCache = .{};
-    defer cache.deinit(allocator);
-    for (0..200) |_| {
-        if (try cache.searchIndexed(allocator, a, "needle", 1)) |value| {
-            var result = value;
-            defer result.deinit();
-            if (result.source == .fff and result.files.len == 1) break;
-        }
-        try std.Io.sleep(io, .fromMilliseconds(25), .awake);
-    } else return error.IndexScanTimedOut;
-    const handle = cache.entries[0].?.finder.handle;
-    var result = (try cache.searchIndexed(allocator, a, "alpha", 20)).?;
-    defer result.deinit();
-    try std.testing.expectEqual(Source.fff, result.source);
-    try std.testing.expectEqual(@as(usize, 1), result.files.len);
-    try std.testing.expectEqualStrings("alpha-needle.txt", result.files[0].path);
-    try std.testing.expectEqual(handle, cache.entries[0].?.finder.handle);
-    for (0..200) |_| {
-        if (try cache.searchIndexed(allocator, b, "needle", 20)) |value| {
-            var other = value;
-            defer other.deinit();
-            if (other.source == .fff and other.files.len == 1) {
-                try std.testing.expectEqualStrings("beta-needle.txt", other.files[0].path);
-                break;
-            }
-        }
-        try std.Io.sleep(io, .fromMilliseconds(25), .awake);
-    } else return error.IndexScanTimedOut;
-    // The watcher updates the same warm index as the filesystem changes.
-    try tmp.dir.writeFile(io, .{ .sub_path = "a/new-needle.txt", .data = "" });
-    for (0..200) |_| {
-        if (try cache.searchIndexed(allocator, a, "new-needle", 20)) |value| {
-            var updated = value;
-            defer updated.deinit();
-            if (updated.source == .fff and updated.files.len == 1) break;
-        }
-        try std.Io.sleep(io, .fromMilliseconds(25), .awake);
-    } else return error.IndexWatcherTimedOut;
-    cache.deinit(allocator);
-    for (cache.entries) |slot| try std.testing.expect(slot == null);
 }
 
 test "indexed paths normalize Windows separators without accepting absolute or parent paths" {

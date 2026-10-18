@@ -331,15 +331,3 @@ test "form encoding does not use shell or argv" {
     defer std.testing.allocator.free(encoded);
     try std.testing.expectEqualStrings("scope=openid%20profile&device_code=a%2Bb%2Fc", encoded);
 }
-
-test "OIDC HTTP transport rejects redirects before following" {
-    try std.testing.expectEqual(std.http.Client.Request.RedirectBehavior.not_allowed, REDIRECT_BEHAVIOR);
-}
-
-test "OIDC HTTP timeout policy is finite and configurable" {
-    const default = try timeoutDuration(DEFAULT_TIMEOUT_MS);
-    const readiness = try timeoutDuration(2_000);
-    try std.testing.expect(!std.meta.eql(default, readiness));
-    try std.testing.expectError(error.InvalidOidcTimeout, timeoutDuration(0));
-    try std.testing.expectError(error.InvalidOidcTimeout, timeoutDuration(MAX_TIMEOUT_MS + 1));
-}

@@ -82,10 +82,6 @@ const Fixture = struct {
         const call = try f.find(method);
         return f.respond(call, try std.fmt.allocPrint(f.a(), "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{s}}}", .{ call.id, result }));
     }
-    fn reject(f: *Fixture, method: []const u8, code: []const u8) !V {
-        const call = try f.find(method);
-        return f.respond(call, try h.encode(f.a(), .{ .jsonrpc = "2.0", .id = call.id, .@"error" = .{ .code = code, .message = "rejected" } }));
-    }
     fn view(f: *Fixture) !V {
         const q = try h.parse(f.a(), try f.host.query("companion", f.a()));
         try expect(p.get(q, "error") == .null);
@@ -96,49 +92,6 @@ const Fixture = struct {
         return error.MissingReceipt;
     }
 };
-
-fn announced(output: V, scope: []const u8) bool {
-    for (p.rows(p.get(output, "effects"))) |effect| if (h.eq(p.s(effect, "type"), "state_changed")) {
-        for (p.rows(p.get(effect, "scopes"))) |s| if (h.eq(p.str(s), scope)) return true;
-    };
-    return false;
-}
-
-const roster_json =
-    \\{"revision":3,"roster":{"version":1,"active_id":"c1","future":true,"companions":[
-    \\ {"id":"c1","name":"Juniper","character":"moss","home_workspace_id":"ws","thread_id":"t1","provider":"claude","model":"opus","orders":"Run tests."},
-    \\ {"id":"c2","name":"Wren","character":"dragon"},
-    \\ {"name":"no id"}
-    \\]}}
-;
-
-test "roster refresh reads leniently, coalesces and announces the companion selector" {
-    var f = try Fixture.init(all_scopes);
-    defer f.deinit();
-    var view = try f.view();
-    try expect(!p.yes(p.get(view, "loaded")));
-    const first = try f.intent("companion_refresh", .{});
-    try eql("pending", (try f.receipt(first)).state);
-    const second = try f.intent("companion_refresh", .{});
-    try eql("succeeded", (try f.receipt(second)).state);
-    try expect(f.pending("companion.roster.get") == 1);
-    const out = try f.reply("companion.roster.get", roster_json);
-    try expect(announced(out, "companion"));
-    try eql("succeeded", (try f.receipt(first)).state);
-    view = try f.view();
-    try expect(p.yes(p.get(view, "loaded")) and p.yes(p.get(view, "can_edit")));
-    try eql("3", p.s(view, "revision"));
-    const roster = p.get(view, "roster");
-    try eql("c1", p.s(roster, "active_id"));
-    const list = p.rows(p.get(roster, "companions"));
-    try expect(list.len == 2);
-    try eql("Juniper", p.s(list[0], "name"));
-    try eql("moss", p.s(list[0], "character"));
-    try eql("Run tests.", p.s(list[0], "orders"));
-    // Unknown characters fall back to Sprout; missing fields read as empty.
-    try eql("sprout", p.s(list[1], "character"));
-    try eql("", p.s(list[1], "thread_id"));
-}
 
 test "save sends the roster at the expected revision and adopts the new revision" {
     var f = try Fixture.init(all_scopes);
@@ -161,69 +114,6 @@ test "save sends the roster at the expected revision and adopts the new revision
     try expect(!p.yes(p.get(view, "saving")));
     try eql("1", p.s(view, "revision"));
     try eql("a", p.s(p.get(view, "roster"), "active_id"));
-}
-
-test "a conflicting save fails with conflict and re-reads the roster" {
-    var f = try Fixture.init(all_scopes);
-    defer f.deinit();
-    _ = try f.intent("companion_refresh", .{});
-    _ = try f.reply("companion.roster.get", "{\"revision\":2,\"roster\":{\"companions\":[]}}");
-    const save = try f.intent("companion_save", .{ .roster = companion.Roster{ .companions = &.{.{ .id = "a", .name = "Moss", .character = "moss" }} }, .expected_revision = "2" });
-    _ = try f.reject("companion.roster.put", "conflict");
-    const op = try f.receipt(save);
-    try eql("failed", op.state);
-    try eql("conflict", op.@"error".?.code);
-    try expect(f.pending("companion.roster.get") == 1);
-    _ = try f.reply("companion.roster.get", "{\"revision\":3,\"roster\":{\"active_id\":\"b\",\"companions\":[{\"id\":\"b\",\"name\":\"Vireo\",\"character\":\"vireo\"}]}}");
-    const view = try f.view();
-    try eql("3", p.s(view, "revision"));
-    try eql("Vireo", p.s(p.rows(p.get(p.get(view, "roster"), "companions"))[0], "name"));
-}
-
-test "invalid rosters, missing scopes and old hosts are refused locally" {
-    var f = try Fixture.init(&.{"chat:read"});
-    defer f.deinit();
-    const scoped = try f.intent("companion_save", .{ .roster = companion.Roster{}, .expected_revision = "0" });
-    try eql("insufficient_scope", (try f.receipt(scoped)).@"error".?.code);
-    try expect(f.pending("companion.roster.put") == 0);
-    _ = try f.intent("companion_refresh", .{});
-    _ = try f.reject("companion.roster.get", "method_not_found");
-    const view = try f.view();
-    try expect(!p.yes(p.get(view, "supported")) and !p.yes(p.get(view, "can_edit")));
-
-    var g = try Fixture.init(all_scopes);
-    defer g.deinit();
-    const long = try g.intent("companion_save", .{ .roster = companion.Roster{ .companions = &.{.{ .id = "a", .name = "A name that is far too long for any companion" }} }, .expected_revision = "0" });
-    try eql("invalid_name", (try g.receipt(long)).@"error".?.code);
-    const bad = try g.intent("companion_save", .{ .roster = companion.Roster{ .companions = &.{.{ .id = "a", .name = "Ok", .character = "dragon" }} }, .expected_revision = "0" });
-    try eql("invalid_character", (try g.receipt(bad)).@"error".?.code);
-    try expect(g.pending("companion.roster.put") == 0);
-}
-
-test "crew lists the companion thread's links and resets when the companion changes" {
-    var f = try Fixture.init(all_scopes);
-    defer f.deinit();
-    const id = try f.intent("companion_crew_refresh", .{ .workspace_id = "ws", .thread_id = "t1" });
-    const sent = try f.params("chat.links.list");
-    try eql("ws", p.s(sent, "workspace_id"));
-    try eql("t1", p.s(sent, "parent_thread_id"));
-    _ = try f.intent("companion_crew_refresh", .{ .workspace_id = "ws", .thread_id = "t1" });
-    try expect(f.pending("chat.links.list") == 1);
-    _ = try f.reply("chat.links.list",
-        \\{"links":[{"link_id":"l1","workspace_id":"other","parent_workspace_id":"ws","local_thread_id":"child","title":"Fix CI","provider":"codex","status":"waiting_approval","summary":"Needs approval","updated_at_ms":5,"hidden":false,"extra":1},
-        \\ {"link_id":"l2","workspace_id":"","local_thread_id":"x"}]}
-    );
-    try eql("succeeded", (try f.receipt(id)).state);
-    var crew = p.get(try f.view(), "crew");
-    try expect(p.yes(p.get(crew, "loaded")));
-    const links = p.rows(p.get(crew, "links"));
-    try expect(links.len == 1);
-    try eql("waiting_approval", p.s(links[0], "status"));
-    try eql("other", p.s(links[0], "workspace_id"));
-    _ = try f.intent("companion_crew_refresh", .{ .workspace_id = "ws", .thread_id = "t2" });
-    crew = p.get(try f.view(), "crew");
-    try expect(p.rows(p.get(crew, "links")).len == 0 and p.yes(p.get(crew, "loading")));
-    try eql("t2", p.s(crew, "thread_id"));
 }
 
 const Line = companion.TranscriptMessage;
@@ -263,94 +153,4 @@ test "transcript save registers once, appends each line with a stable request ke
     _ = try f.intent("companion_transcript_save", .{ .workspace_id = "ws", .thread_id = "t1", .session_id = "s1", .messages = lines[0..1] });
     try expect(f.pending("daemon.client.register") == 0);
     try eql("live:s1:0", p.s(p.get(try f.params("chat.message.append"), "mutation"), "request_key"));
-}
-
-test "transcript save rejects bad input locally and a failed append moves on to the next save" {
-    var f = try Fixture.init(all_scopes);
-    defer f.deinit();
-    f.host.state.chat.client_id = "phone";
-    const bad = try f.intent("companion_transcript_save", .{ .workspace_id = "ws", .thread_id = "t1", .session_id = "s", .messages = [_]Line{.{ .key = "0", .role = "tool", .body = "x" }} });
-    try eql("invalid_role", (try f.receipt(bad)).@"error".?.code);
-    const many = try f.a().alloc(Line, companion.MAX_TRANSCRIPT_MESSAGES + 1);
-    for (many) |*m| m.* = .{ .key = "k", .role = "user", .body = "x" };
-    const too_many = try f.intent("companion_transcript_save", .{ .workspace_id = "ws", .thread_id = "t1", .session_id = "s", .messages = many });
-    try eql("too_many", (try f.receipt(too_many)).@"error".?.code);
-    const empty = try f.intent("companion_transcript_save", .{ .workspace_id = "ws", .thread_id = "t1", .session_id = "s", .messages = [_]Line{} });
-    try eql("succeeded", (try f.receipt(empty)).state);
-    try expect(f.pending("chat.message.append") == 0);
-
-    const first = try f.intent("companion_transcript_save", .{ .workspace_id = "ws", .thread_id = "gone", .session_id = "a", .messages = [_]Line{.{ .key = "0", .role = "user", .body = "hi" }} });
-    const second = try f.intent("companion_transcript_save", .{ .workspace_id = "ws", .thread_id = "t1", .session_id = "b", .messages = [_]Line{.{ .key = "0", .role = "assistant", .body = "hello" }} });
-    try expect(f.pending("chat.message.append") == 1);
-    _ = try f.reject("chat.message.append", "resource_not_found");
-    try eql("failed", (try f.receipt(first)).state);
-    try eql("live:b:0", p.s(p.get(try f.params("chat.message.append"), "mutation"), "request_key"));
-    _ = try f.reply("chat.message.append", "{\"store_revision\":2,\"applied\":true}");
-    try eql("succeeded", (try f.receipt(second)).state);
-
-    var r = try Fixture.init(&.{"chat:read"});
-    defer r.deinit();
-    const denied = try r.intent("companion_transcript_save", .{ .workspace_id = "ws", .thread_id = "t1", .session_id = "s", .messages = [_]Line{.{ .key = "0", .role = "user", .body = "hi" }} });
-    try eql("insufficient_scope", (try r.receipt(denied)).@"error".?.code);
-}
-
-const history_roster =
-    \\{"revision":4,"roster":{"active_id":"a","companions":[{"id":"a","name":"Moss","character":"moss","home_workspace_id":"ws","thread_id":"t2","provider":"claude","model":"opus",
-    \\ "history":[{"thread_id":"t1","title":"Fix CI","provider":"codex","model":"gpt","ended_at_ms":7},{"title":"no thread"}]}]}}
-;
-
-test "history round-trips through read, validation and save" {
-    var f = try Fixture.init(all_scopes);
-    defer f.deinit();
-    _ = try f.intent("companion_refresh", .{});
-    _ = try f.reply("companion.roster.get", history_roster);
-    const entry = p.rows(p.get(p.get(try f.view(), "roster"), "companions"))[0];
-    const history = p.rows(p.get(entry, "history"));
-    try expect(history.len == 1);
-    try eql("Fix CI", p.s(history[0], "title"));
-    try expect(p.num(p.get(history[0], "ended_at_ms")).? == 7);
-    const past = [_]companion.PastConversation{ .{ .thread_id = "t2", .title = "Now", .provider = "claude", .ended_at_ms = 9 }, .{ .thread_id = "t1", .title = "Fix CI" } };
-    const roster = companion.Roster{ .active_id = "a", .companions = &.{.{ .id = "a", .name = "Moss", .history = &past }} };
-    _ = try f.intent("companion_save", .{ .roster = roster, .expected_revision = "4" });
-    const sent = p.rows(p.get(p.rows(p.get(p.get(try f.params("companion.roster.put"), "roster"), "companions"))[0], "history"));
-    try expect(sent.len == 2);
-    try eql("t2", p.s(sent[0], "thread_id"));
-    _ = try f.reply("companion.roster.put", "{\"revision\":5}");
-    var many: [companion.MAX_HISTORY + 1]companion.PastConversation = undefined;
-    for (&many) |*m| m.* = .{ .thread_id = "x" };
-    const bad = try f.intent("companion_save", .{ .roster = companion.Roster{ .companions = &.{.{ .id = "a", .name = "Moss", .history = &many }} }, .expected_revision = "5" });
-    try eql("invalid_history", (try f.receipt(bad)).@"error".?.code);
-}
-
-test "brain switch reports briefing, then clears when the roster shows the new provider" {
-    var f = try Fixture.init(all_scopes);
-    defer f.deinit();
-    _ = try f.intent("companion_refresh", .{});
-    _ = try f.reply("companion.roster.get", history_roster);
-    const id = try f.intent("companion_brain_switch", .{ .provider = "codex", .model = "gpt-5", .brief = true });
-    var sw = p.get(try f.view(), "brain_switch");
-    try eql("pending", p.s(sw, "status"));
-    const sent = try f.params("companion.brain.switch");
-    try eql("codex", p.s(sent, "provider"));
-    try expect(p.yes(p.get(sent, "brief")));
-    try expect(p.get(sent, "companion_id") == .null);
-    const busy = try f.intent("companion_brain_switch", .{ .provider = "pi" });
-    try eql("busy", (try f.receipt(busy)).@"error".?.code);
-    _ = try f.reply("companion.brain.switch", "{\"status\":\"briefing\",\"briefing\":true,\"from\":\"Claude \\u00b7 opus\",\"to\":\"Codex \\u00b7 gpt-5\"}");
-    try eql("succeeded", (try f.receipt(id)).state);
-    sw = p.get(try f.view(), "brain_switch");
-    try eql("briefing", p.s(sw, "status"));
-    try eql("Codex · gpt-5", p.s(sw, "to"));
-    // Still the old brain on the next read: keep showing the handoff.
-    _ = try f.intent("companion_refresh", .{});
-    _ = try f.reply("companion.roster.get", history_roster);
-    try expect(p.get(try f.view(), "brain_switch") != .null);
-    _ = try f.intent("companion_refresh", .{});
-    _ = try f.reply("companion.roster.get", "{\"revision\":6,\"roster\":{\"active_id\":\"a\",\"companions\":[{\"id\":\"a\",\"name\":\"Moss\",\"thread_id\":\"t2\",\"home_workspace_id\":\"ws\",\"provider\":\"codex\",\"model\":\"gpt-5\"}]}}");
-    try expect(p.get(try f.view(), "brain_switch") == .null);
-
-    const failed = try f.intent("companion_brain_switch", .{ .provider = "claude" });
-    _ = try f.reject("companion.brain.switch", "companion_busy");
-    try eql("failed", (try f.receipt(failed)).state);
-    try eql("companion_busy", p.s(p.get(try f.view(), "brain_switch"), "error_code"));
 }

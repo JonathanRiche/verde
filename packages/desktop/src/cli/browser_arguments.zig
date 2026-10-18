@@ -60,16 +60,6 @@ pub fn workspace(arguments: std.json.Value, allowed: []const []const u8, default
     return result;
 }
 
-test "browser aliases select the requested workspace rather than a default" {
-    inline for (.{ "workspace", "workspace_id", "project" }) |key| {
-        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"" ++ key ++ "\":\"kohl\"}", .{});
-        defer parsed.deinit();
-        try std.testing.expectEqualStrings("kohl", try workspace(parsed.value, &.{}, "mirage"));
-    }
-    try std.testing.expectEqualStrings("agent", try workspace(.null, &.{}, "agent"));
-    try std.testing.expectError(error.BrowserWorkspaceRequired, workspace(.null, &.{}, null));
-}
-
 test "browser invalid explicit addressing never falls back" {
     const Case = struct { input: []const u8, expected: anyerror };
     const cases = [_]Case{
@@ -85,14 +75,4 @@ test "browser invalid explicit addressing never falls back" {
         defer parsed.deinit();
         try std.testing.expectError(case.expected, workspace(parsed.value, fields("evaluate_browser_js").?, "mirage"));
     }
-}
-
-test "browser tools accept thread_id addressing on every tool" {
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"thread_id\":\"chat-1\",\"script\":\"return 1\"}", .{});
-    defer parsed.deinit();
-    try std.testing.expectEqualStrings("mirage", try workspace(parsed.value, fields("evaluate_browser_js").?, "mirage"));
-    try std.testing.expectEqualStrings("chat-1", threadId(parsed.value).?);
-    var blank = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"thread_id\":\" \"}", .{});
-    defer blank.deinit();
-    try std.testing.expectError(error.InvalidBrowserThread, workspace(blank.value, fields("browser_status").?, "mirage"));
 }

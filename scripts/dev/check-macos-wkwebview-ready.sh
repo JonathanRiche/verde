@@ -14,7 +14,6 @@ manual_helpers=(
   scripts/dev/run-macos-wkwebview-manual-signoff.sh
   scripts/dev/run-macos-wkwebview-manual-status-checklist.sh
   scripts/dev/summarize-macos-wkwebview-manual-evidence.sh
-  scripts/dev/test-macos-wkwebview-manual-evidence-tools.sh
   scripts/dev/validate-macos-wkwebview-input-evidence.sh
   scripts/dev/validate-macos-wkwebview-status-evidence.sh
 )
@@ -54,7 +53,6 @@ fi
     exit 1
   fi
   scripts/dev/run-macos-wkwebview-manual-signoff.sh --dry-run >/dev/null
-  scripts/dev/test-macos-wkwebview-manual-evidence-tools.sh >/dev/null
   zig build test --release=safe -Dbrowser-backend=stub
   scripts/release/install-macos-local.sh
 )

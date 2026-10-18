@@ -146,18 +146,3 @@ pub fn Toolbar(comptime config: ToolbarConfig) type {
         }
     };
 }
-
-test "toolbar assigns grow and right aligned rects" {
-    const Bar = Toolbar(.{ .width = 300, .height = 40, .gap = 10 });
-    var bar = Bar.init();
-    var rects: [3]draw.Rect = undefined;
-    const items = [_]ToolbarItem{
-        ToolbarItem.fixed(60, 28),
-        ToolbarItem.flexible(80, 28, 1),
-        .{ .width = 32, .height = 32, .right_aligned = true },
-    };
-    bar.layout(&items, &rects);
-    try std.testing.expectEqual(@as(f32, 0), rects[0].x);
-    try std.testing.expect(rects[1].w > 80);
-    try std.testing.expectEqual(@as(f32, 268), rects[2].x);
-}

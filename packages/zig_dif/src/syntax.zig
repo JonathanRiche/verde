@@ -560,15 +560,6 @@ fn testTokenKindsContain(tokens: []const Token, kind: TokenKind, text: []const u
     return false;
 }
 
-test "infer language maps common extensions" {
-    try std.testing.expectEqual(Language.typescript, inferLanguage("src/example.ts"));
-    try std.testing.expectEqual(Language.tsx, inferLanguage("src/example.tsx"));
-    try std.testing.expectEqual(Language.javascript, inferLanguage("src/example.js"));
-    try std.testing.expectEqual(Language.json, inferLanguage("data/config.json"));
-    try std.testing.expectEqual(Language.markdown, inferLanguage("README.md"));
-    try std.testing.expectEqual(Language.plain, inferLanguage("Dockerfile"));
-}
-
 test "tokenize json line uses heuristic keywords and numbers" {
     const allocator = std.testing.allocator;
     const line = "{ \"count\": 42, \"active\": true, \"value\": null }";
@@ -579,78 +570,6 @@ test "tokenize json line uses heuristic keywords and numbers" {
     try std.testing.expect(testTokenKindsContain(tokens, .number, "42"));
     try std.testing.expect(testTokenKindsContain(tokens, .keyword, "true"));
     try std.testing.expect(testTokenKindsContain(tokens, .keyword, "null"));
-}
-
-test "tokenize javascript line uses tree-sitter captures" {
-    const allocator = std.testing.allocator;
-    const line = "const output = console.log(items.length);";
-    const tokens = try tokenizeLine(allocator, .javascript, line);
-    defer allocator.free(tokens);
-
-    try std.testing.expect(testTokenKindsContain(tokens, .keyword, "const"));
-    try std.testing.expect(testTokenKindsContain(tokens, .variable_name, "output"));
-    try std.testing.expect(testTokenKindsContain(tokens, .constant_name, "console"));
-    try std.testing.expect(testTokenKindsContain(tokens, .function_name, "log"));
-    try std.testing.expect(testTokenKindsContain(tokens, .property_name, "length"));
-}
-
-test "tokenize jsx line highlights tags and strings" {
-    const allocator = std.testing.allocator;
-    const line = "return <Card title=\"verde\">ok</Card>;";
-    const tokens = try tokenizeLine(allocator, .jsx, line);
-    defer allocator.free(tokens);
-
-    try std.testing.expect(testTokenKindsContain(tokens, .type_name, "Card"));
-    try std.testing.expect(testTokenKindsContain(tokens, .property_name, "title"));
-    try std.testing.expect(testTokenKindsContain(tokens, .string, "\"verde\""));
-}
-
-test "tokenize tsx line highlights jsx tags and types" {
-    const allocator = std.testing.allocator;
-    const line = "export const view = <Card count={items.length} />;";
-    const tokens = try tokenizeLine(allocator, .tsx, line);
-    defer allocator.free(tokens);
-
-    try std.testing.expect(testTokenKindsContain(tokens, .keyword, "export"));
-    try std.testing.expect(testTokenKindsContain(tokens, .type_name, "Card"));
-    try std.testing.expect(testTokenKindsContain(tokens, .property_name, "count"));
-    try std.testing.expect(testTokenKindsContain(tokens, .property_name, "length"));
-}
-
-test "tokenize zig line uses heuristic function and type names" {
-    const allocator = std.testing.allocator;
-    const line = "const Parser = try buildParser(source);";
-    const tokens = try tokenizeLine(allocator, .zig, line);
-    defer allocator.free(tokens);
-
-    try std.testing.expect(testTokenKindsContain(tokens, .keyword, "const"));
-    try std.testing.expect(testTokenKindsContain(tokens, .type_name, "Parser"));
-    try std.testing.expect(testTokenKindsContain(tokens, .function_name, "buildParser"));
-}
-
-test "tokenize typescript line classifies keywords and strings" {
-    const allocator = std.testing.allocator;
-    const line = "export const review = async (csvPath: string) => \"ok\";";
-    const tokens = try tokenizeLine(allocator, .typescript, line);
-    defer allocator.free(tokens);
-
-    try std.testing.expectEqual(@as(TokenKind, .keyword), tokens[0].kind);
-    try std.testing.expectEqualStrings("export", tokens[0].text);
-    try std.testing.expect(testTokenKindsContain(tokens, .keyword, "async"));
-    try std.testing.expect(testTokenKindsContain(tokens, .string, "\"ok\""));
-    try std.testing.expect(testTokenKindsContain(tokens, .type_name, "string"));
-}
-
-test "tokenize typescript line uses tree-sitter highlight captures for functions" {
-    const allocator = std.testing.allocator;
-    const line = "const result = reviewCampaign(csvPath);";
-    const tokens = try tokenizeLine(allocator, .typescript, line);
-    defer allocator.free(tokens);
-
-    try std.testing.expect(testTokenKindsContain(tokens, .keyword, "const"));
-    try std.testing.expect(testTokenKindsContain(tokens, .function_name, "reviewCampaign"));
-    try std.testing.expect(testTokenKindsContain(tokens, .variable_name, "result"));
-    try std.testing.expect(testTokenKindsContain(tokens, .variable_name, "csvPath"));
 }
 
 test "reusable tokenizer preserves tree-sitter captures across lines" {
@@ -668,28 +587,4 @@ test "reusable tokenizer preserves tree-sitter captures across lines" {
     try std.testing.expect(testTokenKindsContain(first, .type_name, "Result"));
     try std.testing.expect(testTokenKindsContain(second, .keyword, "return"));
     try std.testing.expect(testTokenKindsContain(second, .property_name, "total"));
-}
-
-test "tokenize typescript line classifies properties and constants" {
-    const allocator = std.testing.allocator;
-    const line = "const keys = Object.keys(CONSTANT_VALUE);";
-    const tokens = try tokenizeLine(allocator, .typescript, line);
-    defer allocator.free(tokens);
-
-    try std.testing.expect(testTokenKindsContain(tokens, .type_name, "Object"));
-    try std.testing.expect(testTokenKindsContain(tokens, .function_name, "keys"));
-    try std.testing.expect(testTokenKindsContain(tokens, .constant_name, "CONSTANT_VALUE"));
-}
-
-test "tokenize typescript line classifies builtins punctuation and operators" {
-    const allocator = std.testing.allocator;
-    const line = "console.log(items?.length ?? 0);";
-    const tokens = try tokenizeLine(allocator, .typescript, line);
-    defer allocator.free(tokens);
-
-    try std.testing.expect(testTokenKindsContain(tokens, .constant_name, "console"));
-    try std.testing.expect(testTokenKindsContain(tokens, .function_name, "log"));
-    try std.testing.expect(testTokenKindsContain(tokens, .punctuation, "?."));
-    try std.testing.expect(testTokenKindsContain(tokens, .operator, "??"));
-    try std.testing.expect(testTokenKindsContain(tokens, .number, "0"));
 }

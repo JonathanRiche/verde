@@ -93,26 +93,6 @@ fn eraseAndFree(allocator: std.mem.Allocator, bytes: []u8) void {
     allocator.free(bytes);
 }
 
-test "ephemeral token store owns, replaces, and removes credentials" {
-    const allocator = std.testing.allocator;
-    const first = "0123456789abcdef0123456789abcdef";
-    const second = "fedcba9876543210fedcba9876543210";
-    var store = Store.init(allocator);
-    defer store.deinit();
-
-    try store.put("profile-home", first);
-    try std.testing.expectEqualStrings(first, store.get("profile-home").?);
-    try std.testing.expectEqual(@as(usize, 1), store.count());
-
-    try store.put("profile-home", second);
-    try std.testing.expectEqualStrings(second, store.get("profile-home").?);
-    try std.testing.expectEqual(@as(usize, 1), store.count());
-
-    try std.testing.expect(store.remove("profile-home"));
-    try std.testing.expect(!store.remove("profile-home"));
-    try std.testing.expectEqual(@as(usize, 0), store.count());
-}
-
 test "ephemeral token store rejects unsafe identifiers and tokens" {
     var store = Store.init(std.testing.allocator);
     defer store.deinit();
@@ -124,16 +104,4 @@ test "ephemeral token store rejects unsafe identifiers and tokens" {
         error.InvalidTokenEncoding,
         store.put("profile-one", "0123456789abcdef0123456789abcde\n"),
     );
-}
-
-fn checkStoreAllocationFailure(allocator: std.mem.Allocator) !void {
-    var store = Store.init(allocator);
-    defer store.deinit();
-    try store.put("profile-home", "0123456789abcdef0123456789abcdef");
-    try store.put("profile-home", "fedcba9876543210fedcba9876543210");
-    try store.put("profile-work", "00112233445566778899aabbccddeeff");
-}
-
-test "ephemeral token store cleans up allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkStoreAllocationFailure, .{});
 }

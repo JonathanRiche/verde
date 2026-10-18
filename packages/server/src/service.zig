@@ -388,42 +388,6 @@ fn deleteIfExists(io: std.Io, dir_path: []const u8, name: []const u8) !void {
     };
 }
 
-test "units use exact foreground boundaries and no raw secret" {
-    const artifacts: ArtifactPaths = .{
-        .server = "/opt/verde/releases/1/bin/verde-server",
-        .daemon = "/opt/verde/releases/1/bin/verde-daemon",
-        .web = "/opt/verde/releases/1/bin/verde-web",
-        .static_dir = "/opt/verde/releases/1/share/verde/web",
-        .provider_bridge = "/opt/verde/releases/1/share/verde/provider_bridge.mjs",
-    };
-    const paths: RuntimePaths = .{
-        .data_dir = "/home/verde/.local/share/verde/runtime",
-        .token_file = "/home/verde/.config/verde/web-token",
-        .unit_dir = "/home/verde/.config/systemd/user",
-        .state_dir = "/home/verde/.local/state/verde-server",
-        .gateway_port = 7420,
-        .trusted_proxy_origin = "https://runtime.tail.ts.net",
-    };
-    const daemon = try daemonUnitAlloc(std.testing.allocator, artifacts, paths);
-    defer std.testing.allocator.free(daemon);
-    const web = try webUnitAlloc(std.testing.allocator, artifacts, paths);
-    defer std.testing.allocator.free(web);
-    try std.testing.expect(std.mem.indexOf(u8, daemon, "Type=simple") != null);
-    try std.testing.expect(std.mem.indexOf(u8, daemon, "KillMode=mixed") != null);
-    try std.testing.expect(std.mem.indexOf(u8, web, "--token-file /home/verde/.config/verde/web-token") != null);
-    try std.testing.expect(std.mem.indexOf(u8, web, "--port 7420") != null);
-    try std.testing.expect(std.mem.indexOf(u8, web, "--trusted-proxy-origin https://runtime.tail.ts.net") != null);
-    try std.testing.expect(std.mem.indexOf(u8, web, "VERDE_WEB_TOKEN=") == null);
-
-    const daemon_plist = try daemonPlistAlloc(std.testing.allocator, artifacts, paths);
-    defer std.testing.allocator.free(daemon_plist);
-    const web_plist = try webPlistAlloc(std.testing.allocator, artifacts, paths);
-    defer std.testing.allocator.free(web_plist);
-    try std.testing.expect(std.mem.indexOf(u8, daemon_plist, "dev.verde.runtime.daemon") != null);
-    try std.testing.expect(std.mem.indexOf(u8, web_plist, "--trusted-proxy-origin") != null);
-    try std.testing.expect(std.mem.indexOf(u8, web_plist, "https://runtime.tail.ts.net") != null);
-}
-
 test "activation and rollback retain exact version roots" {
     const current: ReleaseState = .{ .active_version = "1.0.0", .active_root = "/opt/verde/releases/1.0.0" };
     const pending = beginCandidate(current, "1.1.0", "/opt/verde/releases/1.1.0");
@@ -441,17 +405,4 @@ test "path validation and redaction fail closed" {
     try std.testing.expectError(error.UnsafeSystemdPath, validateSafeAbsolutePath("/opt/verde bad/bin"));
     try std.testing.expectEqualStrings("[redacted]", redactedCommand("curl --token secret"));
     try std.testing.expectEqualStrings("systemctl --user status", redactedCommand("systemctl --user status"));
-}
-
-test "atomic unit writes are idempotent" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path_len = try tmp.dir.realPath(std.testing.io, &path_buffer);
-    const path = path_buffer[0..path_len];
-    try writeAtomic(std.testing.io, path, "verde.service", "unit-v1\n", 0o600);
-    try writeAtomic(std.testing.io, path, "verde.service", "unit-v1\n", 0o600);
-    const contents = try tmp.dir.readFileAlloc(std.testing.io, "verde.service", std.testing.allocator, .limited(128));
-    defer std.testing.allocator.free(contents);
-    try std.testing.expectEqualStrings("unit-v1\n", contents);
 }

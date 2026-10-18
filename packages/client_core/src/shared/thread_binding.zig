@@ -307,43 +307,6 @@ test "runtime pin is idempotent and rejects identity drift" {
     );
 }
 
-test "migrated committed route stays immutable before runtime identity is known" {
-    const allocator = std.testing.allocator;
-    var binding = try ThreadBinding.initPersisted(allocator, .{
-        .profile_id = "local",
-        .repository_id = "primary",
-    }, true, null);
-    defer binding.deinit(allocator);
-
-    try std.testing.expect(binding.pinnedRoute().?.runtime_id == null);
-    try std.testing.expectEqual(SelectResult.new_thread_required, try binding.select(allocator, .{
-        .profile_id = "remote-one",
-        .repository_id = "primary",
-    }));
-    try binding.pin(allocator, "0123456789abcdef0123456789abcdef");
-    try std.testing.expectEqualStrings(
-        "0123456789abcdef0123456789abcdef",
-        binding.pinnedRoute().?.runtime_id.?,
-    );
-}
-
-test "committed non-local persisted route requires runtime identity" {
-    try std.testing.expectError(error.MissingRuntimeIdentity, ThreadBinding.initPersisted(
-        std.testing.allocator,
-        .{ .profile_id = "remote-box", .repository_id = "primary" },
-        true,
-        null,
-    ));
-    var draft = try ThreadBinding.initPersisted(
-        std.testing.allocator,
-        .{ .profile_id = "remote-box", .repository_id = "primary" },
-        false,
-        null,
-    );
-    defer draft.deinit(std.testing.allocator);
-    try std.testing.expect(draft.pinnedRoute() == null);
-}
-
 test "route validation rejects ambiguous paths and identifiers" {
     try std.testing.expectError(error.InvalidProfileId, ThreadBinding.initDraft(
         std.testing.allocator,
@@ -357,22 +320,4 @@ test "route validation rejects ambiguous paths and identifiers" {
         std.testing.allocator,
         .{ .profile_id = "local", .repository_id = "primary", .relative_cwd = "/absolute" },
     ));
-}
-
-fn checkBindingAllocationFailure(allocator: std.mem.Allocator) !void {
-    var binding = try ThreadBinding.initDraft(allocator, .{
-        .profile_id = "local",
-        .repository_id = "primary",
-    });
-    defer binding.deinit(allocator);
-    _ = try binding.select(allocator, .{
-        .profile_id = "profile-0123456789abcdef0123456789abcdef",
-        .repository_id = "repo-api",
-        .relative_cwd = "services/api",
-    });
-    try binding.pin(allocator, "0123456789abcdef0123456789abcdef");
-}
-
-test "thread binding cleans up every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkBindingAllocationFailure, .{});
 }

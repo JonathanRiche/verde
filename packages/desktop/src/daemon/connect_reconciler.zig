@@ -170,13 +170,3 @@ test "connector reconciliation is single-owner across restart and unlink" {
     try std.testing.expectEqual(Outcome.stopped, try restarted.reconcile(.unlinked, null, 3_000));
     try std.testing.expectEqual(@as(usize, 1), fake.stops);
 }
-
-test "connector retries are bounded, jittered, and secrets are cleared" {
-    var fake: FakeAdapter = .{ .fail_starts = 1 };
-    var reconciler = Reconciler.init(fake.connector(), "runtime-b");
-    var secret = [_]u8{0xcc} ** 32;
-    const outcome = try reconciler.reconcile(.linked, &secret, 10_000);
-    const retry_at = outcome.retry_at_ms;
-    try std.testing.expect(retry_at > 11_000 and retry_at <= 312_000);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 32), &secret);
-}

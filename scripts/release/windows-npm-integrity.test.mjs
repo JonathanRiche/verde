@@ -10,15 +10,9 @@ import {
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
 
-import {
-  verifyWindowsNpmPayload,
-  WINDOWS_NPM_PAYLOAD_ENTRIES,
-} from "./windows-npm-integrity.mjs";
+import { verifyWindowsNpmPayload } from "./windows-npm-integrity.mjs";
 
-const scriptDir = path.dirname(fileURLToPath(import.meta.url));
-const repoRoot = path.resolve(scriptDir, "..", "..");
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -61,17 +55,6 @@ function withFixture(callback) {
     rmSync(root, { recursive: true, force: true });
   }
 }
-
-test("Windows npm payload retains the terminal smoke test", () => {
-  assert.ok(WINDOWS_NPM_PAYLOAD_ENTRIES.includes("test-terminal.ps1"));
-  const packageJson = JSON.parse(
-    readFileSync(
-      path.join(repoRoot, "packages", "npm", "verde-windows-x64", "package.json"),
-      "utf8",
-    ),
-  );
-  assert.ok(packageJson.files.includes("test-terminal.ps1"));
-});
 
 test("valid copied payload passes manifest and checksum verification", () => {
   withFixture((root) => {

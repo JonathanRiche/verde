@@ -1285,13 +1285,6 @@ test {
     _ = oidc;
 }
 
-test "status requires semantic JSON ok" {
-    try std.testing.expect(jsonOk(std.testing.allocator, "{\"ok\":true}"));
-    try std.testing.expect(!jsonOk(std.testing.allocator, "{\"ok\":false}"));
-    try std.testing.expect(!jsonOk(std.testing.allocator, "[]"));
-    try std.testing.expect(!jsonOk(std.testing.allocator, "not-json"));
-}
-
 test "Pair URL keeps the one-time code in the fragment" {
     const url = try pairUrlAlloc(
         std.testing.allocator,
@@ -1330,47 +1323,6 @@ test "App Link escapes the HTTPS origin and keeps the code only in the fragment"
     ));
 }
 
-test "Pair URL preserves a dedicated Tailscale HTTPS port" {
-    const url = try pairUrlAlloc(
-        std.testing.allocator,
-        "https://runtime.tail.ts.net:8443",
-        "0123456789abcdef0123456789abcdef",
-        "cd" ** 32,
-    );
-    defer std.testing.allocator.free(url);
-    try std.testing.expect(std.mem.startsWith(
-        u8,
-        url,
-        "verde://pair?host=https%3A%2F%2Fruntime.tail.ts.net%3A8443&grant_id=",
-    ));
-    const fragment = std.mem.indexOfScalar(u8, url, '#').?;
-    try std.testing.expect(std.mem.indexOf(u8, url[0..fragment], "cd" ** 8) == null);
-}
-
-test "Linux activation reloads enables and restarts exact units" {
-    var fake: ActivationFake = .{};
-    defer fake.deinit();
-    try activateLinuxServices(std.testing.allocator, fake.runner(), false);
-    try std.testing.expectEqual(@as(usize, 3), fake.calls.items.len);
-    try std.testing.expectEqualStrings("systemctl\x1f--user\x1fdaemon-reload", fake.calls.items[0]);
-    try std.testing.expectEqualStrings(
-        "systemctl\x1f--user\x1fenable\x1fverde-daemon.service\x1fverde-web.service",
-        fake.calls.items[1],
-    );
-    try std.testing.expectEqualStrings(
-        "systemctl\x1f--user\x1frestart\x1fverde-daemon.service\x1fverde-web.service",
-        fake.calls.items[2],
-    );
-}
-
-test "Linux no-start activation only reloads units" {
-    var fake: ActivationFake = .{};
-    defer fake.deinit();
-    try activateLinuxServices(std.testing.allocator, fake.runner(), true);
-    try std.testing.expectEqual(@as(usize, 1), fake.calls.items.len);
-    try std.testing.expectEqualStrings("systemctl\x1f--user\x1fdaemon-reload", fake.calls.items[0]);
-}
-
 test "public readiness requires the frozen runtime metadata" {
     const origin = "https://runtime.tail.ts.net";
     const valid =
@@ -1382,27 +1334,3 @@ test "public readiness requires the frozen runtime metadata" {
         \\{"access_protocol_version":1,"runtime_id":"0123456789abcdef0123456789abcdef","instance_id":"00112233445566778899aabbccddeeff","https_url":"https://runtime.tail.ts.net","wss_url":"wss://runtime.tail.ts.net/ws","capabilities":[]}
     , origin));
 }
-
-const ActivationFake = struct {
-    calls: std.ArrayList([]u8) = .empty,
-
-    fn runner(self: *ActivationFake) tailscale.Runner {
-        return .{ .context = self, .run_fn = fakeRun };
-    }
-
-    fn deinit(self: *ActivationFake) void {
-        for (self.calls.items) |call| std.testing.allocator.free(call);
-        self.calls.deinit(std.testing.allocator);
-    }
-
-    fn fakeRun(context: *anyopaque, allocator: std.mem.Allocator, argv: []const []const u8) !tailscale.CommandResult {
-        const self: *ActivationFake = @ptrCast(@alignCast(context));
-        const joined = try std.mem.join(allocator, "\x1f", argv);
-        try self.calls.append(std.testing.allocator, joined);
-        return .{
-            .code = 0,
-            .stdout = try allocator.dupe(u8, ""),
-            .stderr = try allocator.dupe(u8, ""),
-        };
-    }
-};

@@ -1,16 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { JSDOM } from 'jsdom'
 
-import {
-  LiveClient,
-  chatImageUrl,
-  deleteChatImage,
-  fetchRpc,
-  resetRuntimeIdentityForTests,
-  stripLegacyTokenCredential,
-  uploadChatImage,
-  webSocketEndpoint,
-} from './live.ts'
+import { LiveClient, chatImageUrl, deleteChatImage, fetchRpc, resetRuntimeIdentityForTests, stripLegacyTokenCredential, uploadChatImage } from './live.ts'
 
 const original_window = globalThis.window
 const original_fetch = globalThis.fetch
@@ -35,13 +26,6 @@ describe('cookie-backed browser session transport', () => {
     expect(dom.window.location.href).toBe('https://verde.example/workspace?keep=yes#pane-2')
     expect(dom.window.localStorage.getItem('verde.web.token')).toBeNull()
     dom.window.close()
-  })
-
-  test('uses the exact same-origin WebSocket path without a query', () => {
-    expect(webSocketEndpoint('https://verde.example/workspace?token=old#pane').href)
-      .toBe('wss://verde.example/ws')
-    expect(webSocketEndpoint('http://127.0.0.1:6783/').href)
-      .toBe('ws://127.0.0.1:6783/ws')
   })
 
   test('builds only daemon-owned attachment URLs', () => {

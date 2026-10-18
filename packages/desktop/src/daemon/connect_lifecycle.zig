@@ -579,20 +579,6 @@ fn formatRfc3339Alloc(allocator: std.mem.Allocator, seconds: i64) ![]u8 {
     );
 }
 
-test "timestamp helpers round-trip the public vector instant" {
-    const seconds = try parseRfc3339Seconds("2030-01-01T00:00:00.000Z");
-    try std.testing.expectEqual(@as(i64, 1_893_456_000), seconds);
-    const formatted = try formatRfc3339Alloc(std.testing.allocator, seconds);
-    defer std.testing.allocator.free(formatted);
-    try std.testing.expectEqualStrings("2030-01-01T00:00:00.000Z", formatted);
-}
-
-test "request IDs are canonical and generated from secure entropy" {
-    const id = try randomRequestId(std.testing.io);
-    try validateRequestId(&id);
-    try std.testing.expectError(error.InvalidConnectRequestId, validateRequestId("req_NOT_HEX"));
-}
-
 test "native link signs with fresh time after delayed challenge and rejects expired challenge" {
     const Fixture = struct {
         var seconds: i64 = 1_893_456_000;

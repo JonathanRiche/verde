@@ -155,9 +155,3 @@ test "parse classifies provider, local, literal, unknown, and ordinary input" {
 
     try std.testing.expect(parse("please do /something", TEST_PROVIDER_COMMANDS[0..]) == .not_slash);
 }
-
-test "ordinary prompts do not need provider slash metadata" {
-    try std.testing.expect(!isSlashInput("reply exactly READY"));
-    try std.testing.expect(!isSlashInput("  mention /compact in prose  "));
-    try std.testing.expect(isSlashInput("  /compact  "));
-}

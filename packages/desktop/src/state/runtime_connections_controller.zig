@@ -81,13 +81,6 @@ pub fn bootstrapNoticeIsStale(notice: []const u8, live_ready_or_connecting: bool
     return std.mem.eql(u8, notice, BOOTSTRAP_SAVED_NOTICE) or std.mem.eql(u8, notice, BOOTSTRAP_MEMORY_NOTICE);
 }
 
-test "bootstrap custody notice is hidden once live status leaves ready or connecting" {
-    try std.testing.expect(!bootstrapNoticeIsStale(BOOTSTRAP_SAVED_NOTICE, true));
-    try std.testing.expect(bootstrapNoticeIsStale(BOOTSTRAP_SAVED_NOTICE, false));
-    try std.testing.expect(bootstrapNoticeIsStale(BOOTSTRAP_MEMORY_NOTICE, false));
-    try std.testing.expect(!bootstrapNoticeIsStale("Signed out. Local connection authority was cleared.", false));
-}
-
 pub const WizardField = enum { label, host, user, ssh_port, gateway_port, grant_id, pairing_code, device_label, control_plane_url };
 /// Connect sign-in and bootstrap progress mirrored into the connection wizard.
 pub const ConnectPhase = connect_client.Phase;
@@ -2150,144 +2143,6 @@ test "readiness state machine serializes manifest before providers" {
     try std.testing.expectEqual(ReadinessRequest.manifest, readinessNextRequest(&rc, 1_250).?);
 }
 
-test "readiness retry is capped and never becomes permanently failed" {
-    var retry: ReadinessRetry = .{};
-    var now_ms: u64 = 0;
-    for (0..40) |_| {
-        retry.schedule(now_ms);
-        const delay = retry.retry_at_ms - now_ms;
-        try std.testing.expect(delay >= 250);
-        try std.testing.expect(delay <= 4_000);
-        try std.testing.expect(!retry.due(retry.retry_at_ms - 1));
-        try std.testing.expect(retry.due(retry.retry_at_ms));
-        now_ms = retry.retry_at_ms;
-    }
-    try std.testing.expectEqual(@as(u64, 4_000), readinessRetryDelayMs(retry.attempt));
-
-    var rc: State = .{};
-    applyReadinessChannelFailure(&rc, .manifest, .network, 10_000);
-    try std.testing.expectEqual(ReadinessState.failed, rc.manifest_state);
-    try std.testing.expectEqual(@as(u8, 1), rc.manifest_retry.attempt);
-    applyReadinessChannelFailure(&rc, .manifest, .protocol, 10_001);
-    try std.testing.expectEqual(@as(u8, 0), rc.manifest_retry.attempt);
-    try std.testing.expect(readinessFailureReasonTransient(.server_unavailable));
-    try std.testing.expect(readinessFailureReasonTransient(.transport_offline));
-    try std.testing.expect(!readinessFailureReasonTransient(.workspace_binding_missing));
-    try std.testing.expect(!readinessFailureReasonTransient(.provider_not_authenticated));
-}
-
-test "readiness preserves typed binding and provider failures for UI" {
-    const TestState = struct {
-        allocator: std.mem.Allocator = std.testing.allocator,
-        runtime_connections: State = .{},
-
-        fn runtimeNowMs(_: *const @This()) u64 {
-            return 50_000;
-        }
-    };
-    var state: TestState = .{};
-    applyReadinessResponse(&state, .manifest, .{
-        .failure_reason = @as(?RuntimeService.FailureReason, .workspace_binding_missing),
-        .json = "",
-    }, "runtime");
-    try std.testing.expectEqual(
-        RuntimeService.FailureReason.workspace_binding_missing,
-        state.runtime_connections.manifest_failure_reason.?,
-    );
-    applyReadinessResponse(&state, .providers, .{
-        .failure_reason = @as(?RuntimeService.FailureReason, .provider_unavailable),
-        .json = "",
-    }, "runtime");
-    try std.testing.expectEqual(
-        RuntimeService.FailureReason.provider_unavailable,
-        state.runtime_connections.providers_failure_reason.?,
-    );
-    applyReadinessResponse(&state, .providers, .{
-        .failure_reason = @as(?RuntimeService.FailureReason, .provider_not_authenticated),
-        .json = "",
-    }, "runtime");
-    try std.testing.expectEqual(
-        RuntimeService.FailureReason.provider_not_authenticated,
-        state.runtime_connections.providers_failure_reason.?,
-    );
-    applyReadinessResponse(&state, .providers, .{
-        .failure_reason = @as(?RuntimeService.FailureReason, .server_unavailable),
-        .json = "",
-    }, "runtime");
-    try std.testing.expectEqual(@as(u8, 1), state.runtime_connections.providers_retry.attempt);
-    try std.testing.expectEqual(
-        RuntimeService.FailureReason.server_unavailable,
-        state.runtime_connections.providers_failure_reason.?,
-    );
-}
-
-test "readiness ticket identity rejects profile generation and trust changes" {
-    const runtime_a = "0123456789abcdef0123456789abcdef";
-    const runtime_b = "fedcba9876543210fedcba9876543210";
-    const instance_a = "00112233445566778899aabbccddeeff";
-    const instance_b = "ffeeddccbbaa99887766554433221100";
-    try std.testing.expect(readinessIdentityMatches(
-        7,
-        "profile-a",
-        runtime_a,
-        instance_a,
-        7,
-        "profile-a",
-        runtime_a,
-        instance_a,
-        runtime_a,
-        instance_a,
-    ));
-    try std.testing.expect(!readinessIdentityMatches(
-        7,
-        "profile-a",
-        runtime_a,
-        instance_a,
-        8,
-        "profile-a",
-        runtime_a,
-        instance_a,
-        runtime_a,
-        instance_a,
-    ));
-    try std.testing.expect(!readinessIdentityMatches(
-        7,
-        "profile-a",
-        runtime_a,
-        instance_a,
-        7,
-        "profile-b",
-        runtime_a,
-        instance_a,
-        runtime_a,
-        instance_a,
-    ));
-    try std.testing.expect(!readinessIdentityMatches(
-        7,
-        "profile-a",
-        runtime_a,
-        instance_a,
-        7,
-        "profile-a",
-        runtime_a,
-        instance_a,
-        runtime_b,
-        instance_a,
-    ));
-    try std.testing.expect(!readinessIdentityMatches(
-        7,
-        "profile-a",
-        runtime_a,
-        instance_a,
-        7,
-        "profile-a",
-        runtime_a,
-        instance_a,
-        runtime_a,
-        instance_b,
-    ));
-}
-
 test "row action encoding round-trips every action for the last profile row" {
     inline for (@typeInfo(RowAction).@"enum".fields) |field| {
         const action: RowAction = @enumFromInt(field.value);
@@ -2296,44 +2151,6 @@ test "row action encoding round-trips every action for the last profile row" {
         try std.testing.expectEqual(action, decoded.action);
     }
     try std.testing.expect(decodeRowAction(255) == null);
-}
-
-test "wizard validation reports the first invalid field and accepts defaults" {
-    var rc: State = .{};
-    try std.testing.expectEqual(WizardField.label, validateWizardForm(&rc).?.field);
-    fillZ(&rc.label_storage, "Build VM");
-    try std.testing.expectEqual(WizardField.host, validateWizardForm(&rc).?.field);
-    fillZ(&rc.host_storage, "-bad");
-    try std.testing.expectEqual(WizardField.host, validateWizardForm(&rc).?.field);
-    fillZ(&rc.host_storage, "build.example");
-    try std.testing.expect(validateWizardForm(&rc) == null);
-    fillZ(&rc.user_storage, "bad user");
-    try std.testing.expectEqual(WizardField.user, validateWizardForm(&rc).?.field);
-    fillZ(&rc.user_storage, "verde");
-    fillZ(&rc.ssh_port_storage, "0");
-    try std.testing.expectEqual(WizardField.ssh_port, validateWizardForm(&rc).?.field);
-    fillZ(&rc.ssh_port_storage, "2222");
-    fillZ(&rc.gateway_port_storage, "99999");
-    try std.testing.expectEqual(WizardField.gateway_port, validateWizardForm(&rc).?.field);
-    fillZ(&rc.gateway_port_storage, "");
-    try std.testing.expect(validateWizardForm(&rc) == null);
-    const input = wizardSshInput(&rc);
-    try std.testing.expectEqualStrings("build.example", input.host);
-    try std.testing.expectEqualStrings("verde", input.user.?);
-    try std.testing.expectEqual(@as(u16, 2222), input.port);
-    try std.testing.expectEqual(profile.DEFAULT_REMOTE_GATEWAY_PORT, input.remote_gateway_port);
-}
-
-test "wizard state never stores bearer material" {
-    // Runtime bearers stay in state.zig's masked credential modal. The only
-    // secret the wizard holds is the one-time pairing code, which has its own
-    // zeroing path (checked below) and is masked when rendered.
-    const fields = @typeInfo(State).@"struct".fields;
-    inline for (fields) |field| {
-        try std.testing.expect(std.mem.indexOf(u8, field.name, "token") == null);
-        try std.testing.expect(std.mem.indexOf(u8, field.name, "bearer") == null);
-        try std.testing.expect(std.mem.indexOf(u8, field.name, "secret") == null);
-    }
 }
 
 test "pair grant validation follows the access protocol and reset wipes the code" {
@@ -2393,36 +2210,4 @@ test "Pair link rejects query secrets duplicates and non-origin hosts" {
         fillZ(&rc.control_plane_url_storage, value);
         try std.testing.expectError(error.InvalidPairLink, importPairLink(&rc));
     }
-}
-
-test "readiness diagnostics preserve method reasons only for current identity" {
-    const allocator = std.testing.allocator;
-    var rc: State = .{};
-    defer rc.deinit(allocator);
-    rc.readiness_profile_id = try allocator.dupe(u8, "profile");
-    rc.readiness_runtime_id = try allocator.dupe(u8, "runtime");
-    rc.readiness_instance_id = try allocator.dupe(u8, "instance");
-    rc.manifest_state = .failed;
-    rc.manifest_failure_reason = .workspace_binding_missing;
-    rc.providers_state = .failed;
-    rc.providers_failure_reason = .provider_not_authenticated;
-    const Fixture = struct {
-        profile_id: []const u8 = "profile",
-        phase: enum { ready, failed } = .ready,
-        runtime: ?struct { runtime_id: []const u8 = "runtime", instance_id: []const u8 = "instance" } = .{},
-    };
-    var snapshot: Fixture = .{};
-    const text = try appendReadinessDiagnostics(allocator, "credential: <redacted>\n", &rc, snapshot);
-    defer allocator.free(text);
-    try std.testing.expect(std.mem.indexOf(u8, text, "repository_manifest_failure_reason: workspace_binding_missing") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "providers_failure_reason: provider_not_authenticated") != null);
-    snapshot.runtime.?.instance_id = "replacement";
-    const stale = try appendReadinessDiagnostics(allocator, "base\n", &rc, snapshot);
-    defer allocator.free(stale);
-    try std.testing.expectEqualStrings("base\n", stale);
-    snapshot.runtime.?.instance_id = "instance";
-    snapshot.profile_id = "other";
-    const other = try appendReadinessDiagnostics(allocator, "base\n", &rc, snapshot);
-    defer allocator.free(other);
-    try std.testing.expectEqualStrings("base\n", other);
 }

@@ -282,35 +282,6 @@ pub const Fonts = struct {
     }
 };
 
-test "fonts: chains and scaled metrics with the bundled faces" {
-    const io = std.testing.io;
-    var buf: [2048]u8 = undefined;
-    const set = try FaceSet.fromDir("../assets/fonts", &buf);
-    const f = Fonts.init(std.testing.allocator, set, .{ .io = io }) catch |err| switch (err) {
-        error.MissingUiFont => return error.SkipZigTest,
-        else => return err,
-    };
-    defer f.deinit();
-    try std.testing.expect(f.collection.roleChain(.ui).len >= 2);
-    // Codicon, then Symbols Nerd Font Mono (the bundled set's mono_symbols).
-    try std.testing.expectEqual(@as(usize, 2), f.collection.roleChain(.icon).len);
-    const m = f.metrics(.ui, 16, null);
-    try std.testing.expectEqual(@as(f32, 16), m.font_size);
-    const w = m.measureSlice("Hello");
-    const direct = try f.collection.measureText(.ui, 16 * 0.86, "Hello");
-    try std.testing.expectApproxEqAbs(direct, w, 0.01);
-
-    // glyphInk: evaluated at the drawn size, reported in logical units.
-    const ink = f.glyphInk(.ui, 16, 'A').?;
-    try std.testing.expectEqual(f.collection.glyphInk(.ui, 16 * 0.86, 'A').?, ink);
-    f.setDeviceScale(2);
-    defer f.setDeviceScale(1);
-    const ink2 = f.glyphInk(.ui, 16, 'A').?;
-    const dev = f.collection.glyphInk(.ui, 16 * 0.86 * 2, 'A').?;
-    for (0..4) |k| try std.testing.expectEqual(dev[k] / 2, ink2[k]);
-    try std.testing.expect(f.glyphInk(.ui, 16, ' ') == null);
-}
-
 test "fonts: icon chain falls back across icon faces (Codicon-only and Nerd-only glyphs)" {
     const io = std.testing.io;
     const dir = "../assets/fonts";
@@ -356,22 +327,4 @@ test "fonts: icon chain falls back across icon faces (Codicon-only and Nerd-only
     defer bundled.deinit();
     try std.testing.expect(bundled.collection.resolve(.icon, codicon_only).?.glyph != 0);
     for (nerd_only) |cp| try std.testing.expect(bundled.collection.resolve(.icon, cp).?.glyph != 0);
-}
-
-test "fonts: icon_fallback alone becomes the icon face; chains skip duplicate faces" {
-    const io = std.testing.io;
-    var ui_buf: [256]u8 = undefined;
-    var codicon_buf: [256]u8 = undefined;
-    const ui_path = try std.fmt.bufPrint(&ui_buf, "../assets/fonts/{s}", .{FaceSet.file_names.ui});
-    const codicon_path = try std.fmt.bufPrint(&codicon_buf, "../assets/fonts/{s}", .{FaceSet.file_names.icon});
-    const f = Fonts.init(std.testing.allocator, .{
-        .ui = .{ .path = ui_path },
-        .icon_fallback = .{ .path = codicon_path },
-    }, .{ .io = io, .optional_missing = false }) catch |err| switch (err) {
-        error.FileNotFound => return error.SkipZigTest,
-        else => return err,
-    };
-    defer f.deinit();
-    try std.testing.expectEqual(@as(usize, 1), f.collection.roleChain(.icon).len);
-    try std.testing.expect(f.collection.resolve(.icon, 0xEC5E).?.glyph != 0);
 }

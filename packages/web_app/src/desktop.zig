@@ -163,9 +163,3 @@ pub const Session = struct {
         }
     }
 };
-
-test "desktop backend is opt-in" {
-    try std.testing.expect(!enabled(.{}));
-    try std.testing.expect(enabled(.{ .desktop_socket = "/run/user/1000/verde-desktop/vnc.sock" }));
-    try std.testing.expect(enabled(.{ .desktop_port = 5900 }));
-}

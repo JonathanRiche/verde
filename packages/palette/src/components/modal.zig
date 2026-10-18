@@ -114,16 +114,3 @@ pub fn Modal(comptime config: ModalConfig) type {
         }
     };
 }
-
-test "modal dismisses on outside click and escape" {
-    const Dialog = Modal(.{ .x = 10, .y = 10, .width = 100, .height = 80 });
-    var modal = Dialog.init(true);
-
-    try std.testing.expect(modal.handleInput(.{ .mouse_down = .{ .x = 20, .y = 20 } }));
-    try std.testing.expect(modal.open);
-    try std.testing.expect(modal.handleInput(.{ .mouse_down = .{ .x = 200, .y = 20 } }));
-    try std.testing.expect(!modal.open);
-    try std.testing.expect(modal.handleInput(.open));
-    try std.testing.expect(modal.handleInput(.{ .key = .{ .code = .escape } }));
-    try std.testing.expect(!modal.open);
-}

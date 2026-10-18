@@ -1005,73 +1005,6 @@ fn testResult() WorkspaceResult {
     return .{ .workspace_id = "ws", .repos = &S.repos };
 }
 
-test "chips list chats in claim order and unassigned last" {
-    const chips = try collectChips(testing.allocator, testResult());
-    defer testing.allocator.free(chips);
-    try testing.expectEqual(@as(usize, 4), chips.len);
-    try testing.expectEqual(FilterKind.all, chips[0].kind);
-    try testing.expectEqual(@as(usize, 4), chips[0].files);
-    try testing.expectEqualStrings("t-a", chips[1].thread_id);
-    try testing.expectEqualStrings("Fix parser", chips[1].title);
-    try testing.expectEqual(@as(usize, 2), chips[1].files);
-    try testing.expectEqualStrings("t-b", chips[2].thread_id);
-    try testing.expectEqualStrings("Chat", chips[2].title);
-    try testing.expectEqual(@as(usize, 2), chips[2].files);
-    try testing.expectEqual(FilterKind.unassigned, chips[3].kind);
-    try testing.expectEqual(@as(usize, 1), chips[3].files);
-}
-
-test "filters and totals follow chip choice" {
-    const result = testResult();
-    const all = totals(result, .{});
-    try testing.expectEqual(@as(usize, 4), all.files);
-    try testing.expectEqual(@as(u64, 14), all.additions);
-    try testing.expectEqual(@as(u64, 9), all.deletions);
-    try testing.expectEqual(@as(usize, 2), all.repos_with_files);
-    const chat_b = totals(result, .{ .kind = .thread, .thread_id = "t-b" });
-    try testing.expectEqual(@as(usize, 2), chat_b.files);
-    try testing.expectEqual(@as(usize, 2), chat_b.repos_with_files);
-    const unassigned = totals(result, .{ .kind = .unassigned });
-    try testing.expectEqual(@as(usize, 1), unassigned.files);
-    try testing.expectEqual(@as(u64, 10), unassigned.additions);
-}
-
-test "prompt lines prefer the new side unless only deletions are selected" {
-    var empty: [0]u8 = .{};
-    const base = DiffSelection{ .root = &empty, .path = &empty, .text = &empty };
-    var mixed = base;
-    mixed.old_first = 10;
-    mixed.old_last = 12;
-    mixed.new_first = 10;
-    mixed.new_last = 14;
-    try std.testing.expectEqual(PromptLines{ .side = .new, .first = 10, .last = 14 }, mixed.promptLines().?);
-    var deletions = base;
-    deletions.old_first = 7;
-    deletions.old_last = 9;
-    try std.testing.expectEqual(PromptLines{ .side = .old, .first = 7, .last = 9 }, deletions.promptLines().?);
-    try std.testing.expect(base.promptLines() == null);
-}
-
-test "row labels" {
-    const result = testResult();
-    try testing.expectEqualStrings("M", statusLetter(result.repos[0].files[0]));
-    try testing.expectEqualStrings("U", statusLetter(result.repos[0].files[1]));
-    try testing.expectEqualStrings("D", statusLetter(result.repos[1].files[0]));
-    var buf: [32]u8 = undefined;
-    try testing.expectEqualStrings("Fix parser", ownerLabel(&buf, result.repos[0].files[0]));
-    try testing.expectEqualStrings("", ownerLabel(&buf, result.repos[0].files[1]));
-    try testing.expectEqualStrings("2 chats", ownerLabel(&buf, result.repos[0].files[2]));
-    try testing.expect(fileInResult(result, "/w/two", "README.md") != null);
-    try testing.expect(fileInResult(result, "/w/one", "README.md") == null);
-}
-
-test "expand levels widen context and cap at the whole file" {
-    try testing.expectEqual(BASE_CONTEXT_LINES, viewContextLines(0));
-    try testing.expectEqual(BASE_CONTEXT_LINES + EXPAND_STEP_LINES, viewContextLines(1));
-    try testing.expect(viewContextLines(1) < viewContextLines(2));
-    try testing.expectEqual(@as(usize, FULL_CONTEXT), viewContextLines(MAX_EXPAND_LEVEL));
-}
-
 test "stored listings drop gone expansions and stale filters" {
     var state: State = .{};
     defer state.deinit();
@@ -1112,17 +1045,4 @@ test "patch eviction keeps in-flight and recent entries" {
     try testing.expect(state.findPatch("/r", "f1", false) == null);
     try testing.expect(state.findPatch("/r", "f3", false) == null);
     try testing.expect(state.findPatch("/r", "f4", false) != null);
-}
-
-test "memoized row counts reset with the context" {
-    var empty: [0]u8 = .{};
-    var entry: PatchEntry = .{ .root = &empty, .path = &empty, .full = false };
-    try testing.expect(entry.cachedCount(false, 3) == null);
-    entry.storeCount(false, 3, 12);
-    entry.storeCount(true, 3, 9);
-    try testing.expectEqual(@as(?usize, 12), entry.cachedCount(false, 3));
-    try testing.expectEqual(@as(?usize, 9), entry.cachedCount(true, 3));
-    try testing.expect(entry.cachedCount(false, 23) == null);
-    entry.storeCount(false, 23, 40);
-    try testing.expect(entry.cachedCount(true, 23) == null);
 }

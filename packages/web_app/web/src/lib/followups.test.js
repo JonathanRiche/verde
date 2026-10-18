@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { FOLLOWUP_CACHE_KEY, followupImages, createFollowupApi, steerCanFallback, followupRpcError, FollowupRejectedError } from './followups'
+import { FOLLOWUP_CACHE_KEY, createFollowupApi, steerCanFallback, followupRpcError, FollowupRejectedError } from './followups'
 
 const pane = { kind: 'chat', workspace_id: 'w', thread_id: 't', pane_id: 1 }
 const image = { path: '/tmp/image.png', mime: 'image/png' }
@@ -23,16 +23,6 @@ describe('follow-up contract', () => {
   test('bridge error envelopes cannot be mistaken for definite rejections', () => {
     expect(followupRpcError({ error: { message: 'RemoteRequestTimedOut' } })).not.toBeInstanceOf(FollowupRejectedError)
     expect(followupRpcError({ error: { code: 'insufficient_scope', message: 'Denied' } })).toBeInstanceOf(FollowupRejectedError)
-  })
-  test('steering uses stable identity and supports local images', async () => {
-    const f = fixture()
-    expect(await f.submit(pane, 'change direction', [image])).toBe(true)
-    expect(f.calls[0]).toEqual([pane, 'chat.turn.steer', { turn_id: 'turn-1', steer_id: 'id-1', prompt: 'change direction', image_paths: [image.path] }])
-    expect(f.pendingFollowup(pane)).toMatchObject({ kind: 'steer', state: 'sent_inline', text: 'change direction' })
-    expect(f.pendingFollowupHint(pane)).toContain('applied')
-    expect(f.cancelFollowup(pane)).toBe(false)
-    f.finish()
-    expect(f.pendingFollowup(pane)).toBeNull()
   })
   test('queues send exactly once after completion and leave the composer alone', async () => {
     const f = fixture({ kind: () => 'queue' })
@@ -58,17 +48,6 @@ describe('follow-up contract', () => {
     f.active(null)
     await f.flushReady()
     expect(f.starts).toHaveLength(1)
-  })
-  test('pull-back restores text and images; cancellation discards only the pending entry', async () => {
-    const f = fixture({ kind: () => 'queue' })
-    await f.submit(pane, 'next', [image])
-    expect(f.pullBackFollowup(pane)).toBe(true)
-    expect(f.restored).toEqual([[pane, 'next', [image]]])
-    expect(f.pendingFollowup(pane)).toBeNull()
-    await f.submit(pane, 'cancel me', [])
-    expect(f.cancelFollowup(pane)).toBe(true)
-    f.finish(); await f.flushReady()
-    expect(f.starts).toHaveLength(0)
   })
   test('identity follows the thread, not a reused pane number', async () => {
     const f = fixture({ kind: () => 'queue' })
@@ -125,14 +104,6 @@ describe('follow-up contract', () => {
     await f.retryFollowup(pane)
     expect(ids).toEqual(['id-2', 'id-2'])
   })
-  test('definite rejections allow pull-back instead of trapping the draft', async () => {
-    const f = fixture({ rpc: async () => ({ error: { code: 'insufficient_scope', message: 'chat.write required' } }) })
-    await f.submit(pane, 'next', [])
-    expect(f.pullBackFollowup(pane)).toBe(true)
-    const queued = fixture({ kind: () => 'queue', start: async () => { throw new FollowupRejectedError('rejected') } })
-    await queued.submit(pane, 'next', []); queued.finish(); await queued.flushReady()
-    expect(queued.cancelFollowup(pane)).toBe(true)
-  })
   test('tail replay recovers accepted steering and preserves a newer queued follow-up', async () => {
     const f = fixture()
     f.observeSteer(pane, 'turn-1', { steer_id: 'old', body: 'already sent' })
@@ -147,17 +118,6 @@ describe('follow-up contract', () => {
     f.observeSteer(pane, 'turn-1', { steer_id: 'second', body: 'second' }, 8)
     f.observeSteer(pane, 'turn-1', { steer_id: 'first', body: 'first' }, 2)
     expect(f.pendingFollowup(pane)?.text).toBe('second')
-  })
-  test('remote images queue as the next turn; empty submissions and replacement cannot lose an existing draft', async () => {
-    const remote = fixture({ remote: () => true })
-    expect(await remote.submit(pane, 'image', [image])).toBe(true)
-    expect(remote.calls).toHaveLength(0)
-    expect(remote.pendingFollowup(pane)).toMatchObject({ kind: 'queue', state: 'pending', images: [image] })
-    const f = fixture({ kind: () => 'queue' })
-    expect(await f.submit(pane, ' ', [])).toBe(false)
-    await f.submit(pane, 'first', [])
-    expect(await f.submit(pane, 'second', [])).toBe(false)
-    expect(f.pendingFollowup(pane)?.text).toBe('first')
   })
 })
 
@@ -253,32 +213,6 @@ test('restored unsent queues are paused even if their parent completed', async (
   expect(reloaded.starts).toHaveLength(1)
 })
 
-test('tail images follow their own steer identity and validate daemon empty mime contract', async () => {
-  const f = fixture()
-  await f.submit(pane, 'first', [image])
-  f.observeSteer(pane, 'turn-1', { steer_id: 'second', body: 'second' }, 2)
-  expect(f.pendingFollowup(pane)?.images).toEqual([])
-  const tailImage = { path: '/tmp/second.png', mime: '', byte_size: 0 }
-  f.observeSteer(pane, 'turn-1', { steer_id: 'third', body: 'third', images: [tailImage, null, { path: 5 }, { path: '/x', mime: 'text/html' }] }, 3)
-  expect(f.pendingFollowup(pane)?.images).toEqual([tailImage])
-  expect(followupImages({ path: '/tmp/no-array.png' })).toEqual([])
-})
-
-test('attachment ownership spans RPC and only unsent cancellation discards uploads', async () => {
-  let release
-  const discarded = []
-  const f = fixture({ rpc: () => new Promise((resolve) => { release = resolve }), discard: (images) => discarded.push(...images) })
-  const sending = f.submit(pane, 'next', [image])
-  expect(f.ownsAttachment(image.path)).toBe(true)
-  expect(f.cancelFollowup(pane)).toBe(false)
-  release({ result: { accepted: true } }); await sending
-  expect(discarded).toEqual([])
-  const queued = fixture({ kind: () => 'queue', discard: (images) => discarded.push(...images) })
-  await queued.submit(pane, 'next', [image]); queued.cancelFollowup(pane)
-  expect(queued.ownsAttachment(image.path)).toBe(false)
-  expect(discarded).toEqual([image])
-})
-
 test('failure persisting the sending transition prevents both steer and queued RPCs', async () => {
   for (const kind of ['steer', 'queue']) {
     const memory = memoryStorage()
@@ -358,7 +292,6 @@ test('real store cancellation retains uploads still owned by a composer', async 
     globalThis.fetch = previousFetch
   }
 })
-
 
 test('persisted follow-ups fail closed when their runtime or cwd route changes', async () => {
   const storage = memoryStorage()

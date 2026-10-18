@@ -7,7 +7,6 @@ the recorded temporary-daemon responses in
 `packages/client_core/src/fixtures/sync/` (`snapshot.json`, `threads-0.json`,
 `threads-1.json`) with wall time `1700000050000`.
 
-- `home.json`, `workspaces.json`: the recorded snapshot and catalog as-is.
 - `home-live.json`, `workspaces-live.json`: **derived**, not a daemon recording.
   Before projection, the recorded snapshot's empty `sessions` and `turns` were
   replaced with one running `htop` session on dock 7 and two turns

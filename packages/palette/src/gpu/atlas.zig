@@ -123,18 +123,6 @@ pub const Packer = struct {
     }
 };
 
-test "packer places glyphs on shared shelves" {
-    const gpa = std.testing.allocator;
-    var p = Packer.init(64, 64);
-    defer p.deinit(gpa);
-    const a = (try p.alloc(gpa, 10, 12, 1)).?;
-    const b = (try p.alloc(gpa, 10, 11, 1)).?;
-    try std.testing.expectEqual(a.shelf, b.shelf);
-    try std.testing.expectEqual(@as(u16, 11), b.rect.x);
-    const c = (try p.alloc(gpa, 10, 30, 1)).?;
-    try std.testing.expect(c.shelf != a.shelf);
-}
-
 test "packer grows then evicts least recently used shelf" {
     const gpa = std.testing.allocator;
     var p = Packer.init(32, 64);

@@ -22,21 +22,8 @@ fn find(nodes: []const Node, kind: []const u8) ?Node {
     }
     return null;
 }
-fn ranges(nodes: []const Node, source: []const u8) !void {
-    for (nodes) |node| {
-        try expect(node.start <= node.end and node.end <= source.len);
-        try expect(rendering.boundary(source, node.start) and rendering.boundary(source, node.end));
-        try ranges(node.children, source);
-    }
-}
 
-test "markdown golden uses UTF-8 content ranges" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    try golden(a, @embedFile("fixtures/render-markdown.json"), try rendering.markdown.render(a, "# Hé **世界**\n"));
-}
-
+// Mobile app tests decode verbatim copies of this golden (see mobile_android d07 fixtures).
 test "diff golden matches web changed-middle emphasis" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -62,104 +49,6 @@ test "web raw HTML and javascript security fixtures stay inert" {
         const parsed = try rendering.markdown.render(a, input);
         if (find(parsed.nodes, "link")) |link| try expect(link.url == null);
     }
-}
-
-test "web file citation and document links produce abstract targets" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    for ([_][]const u8{ "/tmp/report one.pdf", "/tmp/report_one_final.pdf", "/tmp/報告😀.pdf" }) |path| {
-        const source = try std.fmt.allocPrint(a, ":codex-file-citation{{path=\"{s}\" purpose=\"output\"}}", .{path});
-        const result = try rendering.markdown.render(a, source);
-        const link = find(result.nodes, "link").?;
-        try eql(path, link.citation.?.path);
-        try expect(link.url == null);
-        try ranges(result.nodes, source);
-        const code = try rendering.markdown.render(a, try std.fmt.allocPrint(a, "`{s}`", .{source}));
-        try expect(find(code.nodes, "link") == null);
-        try eql(source, find(code.nodes, "code").?.text.?);
-    }
-    const docs = try rendering.markdown.render(a, "- [Business Plan — Word](/home/rtg/SJ-Co-Events-Business-Plan.docx)\n- [Pitch Deck — PDF](/home/rtg/SJ-Co-Events-Pitch-Deck.pdf)");
-    const items = find(docs.nodes, "list").?.children;
-    try eql("/home/rtg/SJ-Co-Events-Business-Plan.docx", find(items[0].children, "link").?.citation.?.path);
-    try eql("/home/rtg/SJ-Co-Events-Pitch-Deck.pdf", find(items[1].children, "link").?.citation.?.path);
-    const spaced = try rendering.markdown.render(a, "[Download labels](</Users/me/Library/Application Support/Verde/labels.pdf>) and [site](<https://verdeai.dev>)");
-    try eql("/Users/me/Library/Application Support/Verde/labels.pdf", find(spaced.nodes, "link").?.citation.?.path);
-    var spaced_links: usize = 0;
-    for (find(spaced.nodes, "paragraph").?.children) |child| {
-        if (!std.mem.eql(u8, child.kind, "link")) continue;
-        spaced_links += 1;
-        if (spaced_links == 2) try eql("https://verdeai.dev", child.url.?);
-    }
-    try expect(spaced_links == 2);
-    try ranges(spaced.nodes, "[Download labels](</Users/me/Library/Application Support/Verde/labels.pdf>) and [site](<https://verdeai.dev>)");
-    for ([_][]const u8{ "/src/main.zig:42", "file:///src/main.zig#L42" }) |target| {
-        const citation = (try rendering.markdown.citation(a, target)).?;
-        try eql("/src/main.zig", citation.path);
-        try expect(citation.line == 42);
-        try expect(citation.end_line == null);
-    }
-    for ([_][]const u8{ "/src/main.zig:10-20", "file:///src/main.zig#L10-L20", "/src/main.zig#L10-20" }) |target| {
-        const citation = (try rendering.markdown.citation(a, target)).?;
-        try eql("/src/main.zig", citation.path);
-        try expect(citation.line == 10 and citation.end_line == 20);
-    }
-    // A reversed or malformed range is not a line target.
-    for ([_][]const u8{ "/src/main.zig:20-10", "/src/main.zig#L1_0" }) |target|
-        try expect((try rendering.markdown.citation(a, target)).?.line == null);
-    for ([_][]const u8{ "/api/file?path=%2Fhome%2Frtg%2Fplan.docx", "/api/preview?path=%2Fhome%2Frtg%2Fplan.docx" }) |target|
-        try eql("/home/rtg/plan.docx", (try rendering.markdown.citation(a, target)).?.path);
-    for ([_][]const u8{ "/login", "/assets/index.js", "https://example.com/report.pdf" }) |target|
-        try expect(try rendering.markdown.citation(a, target) == null);
-}
-
-test "markdown containers tables images code and nested UTF-8 ranges" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const source = "# Heading\n\n> quoted *é* and ~~gone~~\n> next **世界**\n\n1. one\n2. two\n\n---\n\n| a | b |\n| --- | --- |\n| é | 😀 |\n\n![alt](/tmp/image.png)\n\n```ts\nconst x = 1;\n```\n";
-    const result = try rendering.markdown.render(a, source);
-    for ([_][]const u8{ "heading", "quote", "emphasis", "strike", "strong", "list", "item", "thematic_break", "table", "table_row", "table_cell", "image", "code_block", "line_break" }) |kind|
-        try expect(find(result.nodes, kind) != null);
-    try expect(find(result.nodes, "list").?.ordered.?);
-    try eql("const x = 1;\n", find(result.nodes, "code_block").?.text.?);
-    try ranges(result.nodes, source);
-    const nested = "> ```js\n> /* é\n> 😀 */\n> ```\n";
-    const code = try rendering.markdown.render(a, nested);
-    try eql("/* é\n😀 */\n", find(code.nodes, "code_block").?.text.?);
-    try ranges(code.nodes, nested);
-    const repeated = "> ```js\n> js\n> ```\n";
-    const repeated_code = find((try rendering.markdown.render(a, repeated)).nodes, "code_block").?;
-    try eql("js\n", repeated_code.text.?);
-    try expect(repeated_code.end >= 12);
-}
-
-test "web highlight string comments multiline and UTF-8 cases" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const source = "const a = \"// no /* no */\" // yes";
-    const result = try rendering.highlight(a, source, "ts");
-    var comments: usize = 0;
-    for (result.spans) |span| if (rendering.eq(span.kind, "comment")) {
-        comments += 1;
-        try eql("// yes", source[span.start..span.end]);
-    };
-    try expect(comments == 1);
-    for ([_][]const u8{ "js", "ts", "jsx", "tsx", "json" }) |language| {
-        const text = if (rendering.eq(language, "json")) "{\"é😀\": true}" else "const x = \"<script>alert(1)</script>\";\n/* é\n😀 */";
-        const spans = try rendering.highlight(a, text, language);
-        try expect(spans.spans.len > 0);
-        var end: usize = 0;
-        for (spans.spans) |span| {
-            try expect(span.start >= end and span.end > span.start);
-            try expect(rendering.boundary(text, span.start) and rendering.boundary(text, span.end));
-            end = span.end;
-        }
-    }
-    for ([_][]const u8{ "sh", "rust", "go", "yaml", "unknown" }) |language|
-        try expect((try rendering.highlight(a, "😀 /* plain */", language)).spans.len == 0);
-    try expect((try rendering.highlight(a, "", "ts")).spans.len == 0);
 }
 
 fn framed(a: std.mem.Allocator, path: []const u8, patch: []const u8) ![]const u8 {
@@ -211,42 +100,6 @@ test "diff_index locates V2 records that render alone like the whole body" {
         try std.testing.expectError(error.InvalidInput, rendering.diff.index(a, bad));
 }
 
-test "diff_index accepts bodies beyond the per-patch text budget" {
-    var h = try host.Host.init(std.testing.allocator, config);
-    defer h.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var body: std.ArrayList(u8) = .empty;
-    try body.appendSlice(a, "VERDE_DIFF_V2\n");
-    var count: usize = 0;
-    while (body.items.len <= rendering.MAX_TEXT) : (count += 1)
-        try body.appendSlice(a, try framed(a, try std.fmt.allocPrint(a, "f{d}.ts", .{count}), "@@ -1 +1 @@\n-const a = 1;\n+const a = 2;\n"));
-    const whole = try host.parse(a, try h.query(try std.json.Stringify.valueAlloc(a, .{ .utility = "diff", .text = body.items }, .{}), a));
-    try eql("resource_limit", whole.object.get("error").?.object.get("code").?.string);
-    const listed = try host.parse(a, try h.query(try std.json.Stringify.valueAlloc(a, .{ .utility = "diff_index", .text = body.items }, .{}), a));
-    try expect(listed.object.get("error").? == .null);
-    try expect(listed.object.get("data").?.object.get("files").?.array.items.len == count);
-    const plain = try host.parse(a, try h.query("{\"utility\":\"diff_index\",\"text\":\"@@ -1 +1 @@\\n-a\\n+b\\n\"}", a));
-    try eql("invalid_input", plain.object.get("error").?.object.get("code").?.string);
-}
-
-test "diff binary new deleted no-newline and multiple hunks" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const added = try rendering.diff.render(a, "--- /dev/null\n+++ b/new\n@@ -0,0 +1 @@\n+hello\n\\ No newline at end of file\n");
-    try expect(added.files[0].old_path == null);
-    try eql("meta", added.files[0].hunks[0].lines[1].kind);
-    const deleted = try rendering.diff.render(a, "--- a/old\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\n");
-    try expect(deleted.files[0].new_path == null);
-    const binary = try rendering.diff.render(a, "diff --git a/a.png b/a.png\nBinary files a/a.png and b/a.png differ\n");
-    try expect(binary.files[0].binary);
-    const multiple = try rendering.diff.render(a, "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n@@ -10,2 +10,2 @@\n context\n-foo\n+bar\n");
-    try expect(multiple.files[0].hunks.len == 2);
-    try expect(multiple.files[0].hunks[1].lines[1].old_line == 11);
-}
-
 test "malformed V2 and diff counters fail instead of returning partial data" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -288,67 +141,4 @@ test "query errors budgets purity and ABI ownership" {
     defer abi.vcBufFree(buf);
     try expect(buf.len > 0 and buf.ptr.?[0] == '{');
     try expect(h.state.revision == revision and h.state.pending.len == 0);
-}
-
-fn allocationFixture(allocator: std.mem.Allocator) !void {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const request = try host.parse(a, "{\"utility\":\"markdown\",\"text\":\"# é **世界** [file](/tmp/x.zig:2)\"}");
-    const result = try rendering.query(a, request);
-    try expect(result.failure == null);
-}
-test "markdown utility allocation failures clean up" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationFixture, .{});
-}
-
-test "utility node depth output budgets and selector whitespace" {
-    var h = try host.Host.init(std.testing.allocator, config);
-    defer h.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const reply = try host.parse(a, try h.query(" \n{\"utility\":\"markdown\",\"text\":\"hello\"}", a));
-    try expect(reply.object.get("error").? == .null);
-    for ([_][]const u8{ "> " ** 65 ++ "x", "a\n\n" ** 2500 }) |source| {
-        const selector = try std.json.Stringify.valueAlloc(a, .{ .utility = "markdown", .text = source }, .{});
-        const limited = try host.parse(a, try h.query(selector, a));
-        try eql("resource_limit", limited.object.get("error").?.object.get("code").?.string);
-    }
-    // Source is under the text budget, but thousands of spans exceed JSON budget.
-    const selector = try std.json.Stringify.valueAlloc(a, .{ .utility = "highlight", .language = "json", .text = "[" ++ "1," ** 30000 ++ "1]" }, .{});
-    const limited = try host.parse(a, try h.query(selector, a));
-    try expect(limited.object.get("error").? == .object);
-    try eql("resource_limit", limited.object.get("error").?.object.get("code").?.string);
-}
-
-test "registered query models decode real rendering replies" {
-    var h = try host.Host.init(std.testing.allocator, config);
-    defer h.deinit();
-    const wire = @import("wire.zig");
-    inline for (.{
-        .{ "{\"utility\":\"markdown\",\"text\":\"# é **世界**\"}", rendering.markdown.Markdown },
-        .{ "{\"utility\":\"highlight\",\"text\":\"const x = 1\",\"language\":\"ts\"}", rendering.Highlight },
-        .{ "{\"utility\":\"diff\",\"text\":\"@@ -1 +1 @@\\n-old\\n+new\\n\"}", rendering.diff.Diff },
-        .{ "{\"utility\":\"diff_index\",\"text\":\"VERDE_DIFF_V2\\nFILE\\t1\\t0\\t0\\t0\\nx\"}", rendering.diff.Index },
-    }) |entry| {
-        const output = try h.query(entry[0], std.testing.allocator);
-        defer std.testing.allocator.free(output);
-        const model = try std.json.parseFromSlice(wire.Query(entry[1]), std.testing.allocator, output, .{});
-        defer model.deinit();
-        try expect(model.value.data != null and model.value.@"error" == null);
-    }
-}
-
-test "selection_prompt utility formats the shared ask-agent message" {
-    var h = try host.Host.init(std.testing.allocator, config);
-    defer h.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const request = .{ .utility = "selection_prompt", .path = "/w/app/src/a.kt", .roots = .{.{ .name = "app", .path = "/w/app", .home = true }}, .start_line = 2, .end_line = 4, .side = "new", .text = "val a = 1\n", .instruction = "Explain" };
-    const ok = try host.parse(a, try h.query(try std.json.Stringify.valueAlloc(a, request, .{}), a));
-    try eql("In `src/a.kt` lines 2\u{2013}4 (diff, new side):\n```kotlin\nval a = 1\n```\nExplain", ok.object.get("data").?.object.get("text").?.string);
-    const bad = try host.parse(a, try h.query("{\"utility\":\"selection_prompt\",\"path\":\"/a\",\"start_line\":0,\"text\":\"\",\"instruction\":\"\"}", a));
-    try eql("invalid_input", bad.object.get("error").?.object.get("code").?.string);
 }

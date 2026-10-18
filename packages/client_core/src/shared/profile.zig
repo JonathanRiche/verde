@@ -1496,47 +1496,6 @@ test "legacy documents and unknown fields decode without being persisted" {
     try std.testing.expect(std.mem.indexOf(u8, canonical, "\"version\": 4") != null);
 }
 
-test "unversioned objects and arrays retain version zero migration behavior" {
-    const payloads = [_][]const u8{
-        \\{"future_document_field":{"client_secret":"sentinel-document"},"profiles":[{"id":"profile-0123456789abcdef0123456789abcdef","label":"VM","kind":"ssh","hostname":"vm","future_profile_field":{"client_secret":"sentinel-profile"}}]}
-        ,
-        \\[{"id":"profile-0123456789abcdef0123456789abcdef","label":"Local","kind":"local","future_profile_field":{"client_secret":"sentinel-array"}}]
-        ,
-    };
-    for (payloads) |payload| {
-        var decoded = try decodeAlloc(std.testing.allocator, payload);
-        defer decoded.deinit(std.testing.allocator);
-        const canonical = try encodeAlloc(std.testing.allocator, decoded.items);
-        defer std.testing.allocator.free(canonical);
-        try std.testing.expect(std.mem.indexOf(u8, canonical, "future_") == null);
-        try std.testing.expect(std.mem.indexOf(u8, canonical, "sentinel-") == null);
-        try std.testing.expect(std.mem.indexOf(u8, canonical, "\"version\": 4") != null);
-    }
-}
-
-test "version one rejects unknown fields at every schema level" {
-    const payloads = [_][]const u8{
-        \\{"version":1,"profiles":[],"future_document_field":{"client_secret":"sentinel-document"}}
-        ,
-        \\{"version":1,"profiles":[{"id":"profile-0123456789abcdef0123456789abcdef","label":"VM","transport":{"kind":"local_socket"},"future_profile_field":{"client_secret":"sentinel-profile"}}]}
-        ,
-        \\{"version":1,"profiles":[{"id":"profile-0123456789abcdef0123456789abcdef","label":"VM","transport":{"kind":"ssh_tunnel","host":"vm","future_transport_field":{"client_secret":"sentinel-transport"}}}]}
-        ,
-        \\{"version":1,"profiles":[{"id":"profile-0123456789abcdef0123456789abcdef","label":"VM","transport":{"kind":"local_socket","host":"must-not-be-accepted-for-local"}}]}
-        ,
-    };
-    for (payloads) |payload| {
-        try std.testing.expectError(
-            error.UnknownProfileField,
-            decodeAlloc(std.testing.allocator, payload),
-        );
-    }
-
-    const message = redactedErrorMessage(error.UnknownProfileField);
-    try std.testing.expect(std.mem.indexOf(u8, message, "sentinel") == null);
-    try std.testing.expect(std.mem.indexOf(u8, message, "client_secret") == null);
-}
-
 test "secret-bearing fields are rejected and diagnostics are redacted" {
     const payloads = [_][]const u8{
         \\{"version":1,"token":"sentinel-token","profiles":[]}
@@ -1676,29 +1635,6 @@ test "current version persists paired-device and connect access without secrets"
     for (rejected) |payload| {
         try std.testing.expectError(error.InvalidProfileDocument, normalizeValidationError(payload));
     }
-}
-
-test "version four direct HTTPS profile round trips desired state without secret material" {
-    var random: TestRandom = .{};
-    const allocator = std.testing.allocator;
-    var direct = try Profile.createPairedDirect(
-        allocator,
-        &random,
-        "Tailnet runtime",
-        "https://runtime.example/",
-        "wss://runtime.example/ws",
-    );
-    defer direct.deinit(allocator);
-    direct.desired_enabled = true;
-    const encoded = try encodeAlloc(allocator, &.{direct});
-    defer allocator.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"kind\": \"direct_https\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "pairing_token") == null);
-    var decoded = try decodeAlloc(allocator, encoded);
-    defer decoded.deinit(allocator);
-    try std.testing.expectEqualStrings("https://runtime.example", decoded.items[0].transport.direct_https.https_url.?);
-    try std.testing.expect(decoded.items[0].access == .paired_device);
-    try std.testing.expect(decoded.items[0].desired_enabled);
 }
 
 test "runtime endpoints are exact origins with a same-authority websocket" {

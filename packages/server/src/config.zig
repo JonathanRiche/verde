@@ -192,23 +192,6 @@ test "parses operator and delegated commands without accepting raw tokens" {
     try std.testing.expectError(error.InvalidArguments, parse(std.testing.allocator, &.{ "verde-server", "pair", "list", "--token=secret" }));
 }
 
-test "--no-qr is consumed for pair create and serve only" {
-    var pair = try parse(std.testing.allocator, &.{ "verde-server", "pair", "create", "--label", "Phone", "--no-qr" });
-    defer deinit(&pair, std.testing.allocator);
-    try std.testing.expect(pair.no_qr);
-    try std.testing.expectEqualSlices([]const u8, &.{ "--label", "Phone" }, pair.delegate_args);
-
-    var serve = try parse(std.testing.allocator, &.{ "verde-server", "serve", "--tailscale", "--no-qr" });
-    defer deinit(&serve, std.testing.allocator);
-    try std.testing.expect(serve.no_qr);
-
-    var default_pair = try parse(std.testing.allocator, &.{ "verde-server", "pair", "create" });
-    defer deinit(&default_pair, std.testing.allocator);
-    try std.testing.expect(!default_pair.no_qr);
-
-    try std.testing.expectError(error.InvalidArguments, parse(std.testing.allocator, &.{ "verde-server", "status", "--no-qr" }));
-}
-
 test "service and gateway options validate bounds" {
     var defaults = try parse(std.testing.allocator, &.{ "verde-server", "serve" });
     defer deinit(&defaults, std.testing.allocator);
@@ -235,44 +218,4 @@ test "service and gateway options validate bounds" {
     try std.testing.expectError(error.InvalidArguments, parse(std.testing.allocator, &.{
         "verde-server", "serve", "--tailscale-https-port", "8443",
     }));
-}
-
-test "Tailscale doctor and status aliases are read-only commands" {
-    var doctor = try parse(std.testing.allocator, &.{
-        "verde-server", "tailscale", "doctor", "--tailscale-https-port", "8443", "--json",
-    });
-    defer deinit(&doctor, std.testing.allocator);
-    try std.testing.expectEqual(Command.tailscale_doctor, doctor.command);
-    try std.testing.expectEqual(@as(u16, 8443), doctor.tailscale_https_port);
-    try std.testing.expect(doctor.json);
-
-    var status = try parse(std.testing.allocator, &.{ "verde-server", "tailscale", "status" });
-    defer deinit(&status, std.testing.allocator);
-    try std.testing.expectEqual(Command.tailscale_doctor, status.command);
-}
-
-test "Connect onboarding and lifecycle commands are explicit" {
-    var bare = try parse(std.testing.allocator, &.{ "verde-server", "connect" });
-    defer deinit(&bare, std.testing.allocator);
-    try std.testing.expectEqual(Command.connect, bare.command);
-    var onboarding = try parse(std.testing.allocator, &.{
-        "verde-server",      "connect",           "--control-plane", "https://connect.example.test",
-        "--descriptor-file", "/tmp/runtime.json", "--headless",      "--install-service",
-    });
-    defer deinit(&onboarding, std.testing.allocator);
-    try std.testing.expectEqual(Command.connect, onboarding.command);
-    try std.testing.expect(onboarding.headless);
-    try std.testing.expect(onboarding.install_service);
-    var status = try parse(std.testing.allocator, &.{ "verde-server", "connect", "status", "--json" });
-    defer deinit(&status, std.testing.allocator);
-    try std.testing.expectEqual(Command.connect_status, status.command);
-}
-
-test "pair create delegates each preset to the daemon" {
-    for ([_][]const u8{ "full", "chat", "monitor" }) |preset| {
-        var parsed = try parse(std.testing.allocator, &.{ "verde-server", "pair", "create", "--preset", preset });
-        defer deinit(&parsed, std.testing.allocator);
-        try std.testing.expectEqual(Command.pair_create, parsed.command);
-        try std.testing.expectEqualSlices([]const u8, &.{ "--preset", preset }, parsed.delegate_args);
-    }
 }

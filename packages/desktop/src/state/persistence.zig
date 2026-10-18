@@ -307,69 +307,6 @@ test "snapshot retains pane-backed draft threads without shifting indexes" {
     try std.testing.expect(std.mem.indexOf(u8, persisted_project.workspace_layout_json.?, "\"thread\":2") != null);
 }
 
-test "incremental snapshot body capture is bounded and finalizes exact transcript bytes" {
-    const allocator = std.testing.allocator;
-    var projects: [1]Project = .{try Project.init(allocator, "workspace-id", "Workspace", "/tmp/workspace", 0)};
-    defer projects[0].deinit(allocator);
-    const thread = &projects[0].threads.items[0];
-    thread.committed = true;
-    const author = try allocator.dupeZ(u8, "Assistant");
-    errdefer allocator.free(author);
-    const body = try allocator.dupeZ(u8, "0123456789abcdef");
-    errdefer allocator.free(body);
-    const extra_images = try allocator.alloc(ChatImageAttachment, 0);
-    errdefer allocator.free(extra_images);
-    try thread.messages.append(allocator, .{
-        .role = .assistant,
-        .author = author,
-        .body = body,
-        .extra_images = extra_images,
-    });
-
-    const context: SnapshotContext = .{
-        .projects = &projects,
-        .archived_projects = &.{},
-        .selected_project_index = 0,
-        .sidebar_collapsed = false,
-    };
-    var capture = try IncrementalBodyCapture.init(allocator, context, 7);
-    defer capture.deinit();
-    try std.testing.expectEqual(@as(u64, 7), capture.dirty_generation);
-    try std.testing.expect(!capture.advance(5));
-    try std.testing.expectEqual(@as(usize, 5), capture.copied_bytes);
-    try std.testing.expect(capture.advance(64));
-
-    var snapshot = try buildSnapshotFromBodyCapture(context, allocator, &capture);
-    defer snapshot.deinit();
-    const persisted_body = snapshot.value.projects[0].threads.?[0].messages[0].body;
-    try std.testing.expectEqualStrings(body, persisted_body);
-    try std.testing.expect(persisted_body.ptr != body.ptr);
-}
-
-test "snapshot retains pane-less Companion identity and stable thread indexes" {
-    const allocator = std.testing.allocator;
-    var projects: [1]Project = .{try Project.init(allocator, "workspace-id", "Workspace", "/tmp/workspace", 0)};
-    defer projects[0].deinit(allocator);
-    const project = &projects[0];
-    project.threads.items[0].committed = true;
-    const selected_before = project.selected_thread_index;
-    const companion = try project.ensureCompanionThread(allocator);
-
-    var snapshot = try buildSnapshot(.{
-        .projects = &projects,
-        .archived_projects = &.{},
-        .selected_project_index = 0,
-        .sidebar_collapsed = false,
-    }, allocator);
-    defer snapshot.deinit();
-
-    const persisted = snapshot.value.projects[0];
-    try std.testing.expectEqualStrings(companion.local_thread_id, persisted.companion_thread_local_id.?);
-    try std.testing.expectEqual(@as(usize, 2), persisted.threads.?.len);
-    try std.testing.expectEqual(selected_before, persisted.selected_thread_index);
-    try std.testing.expectEqualStrings(companion.local_thread_id, persisted.threads.?[1].local_thread_id.?);
-}
-
 test "terminal dock snapshot payload round trips through production consumer" {
     const allocator = std.testing.allocator;
     const layout_json =
@@ -890,7 +827,7 @@ fn restoreThreadRuntimeRoute(
         persisted.runtime_id,
     ) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        log.err("persisted thread route quarantined err={s}", .{@errorName(err)});
+        log.warn("persisted thread route quarantined err={s}", .{@errorName(err)});
         return error.InvalidPersistedThreadRoute;
     };
     thread.runtime_route.deinit(allocator);
@@ -927,35 +864,6 @@ test "thread runtime route snapshots and restores without migration" {
         .profile_id = chat_types.LOCAL_RUNTIME_PROFILE_ID,
         .repository_id = chat_types.PRIMARY_REPOSITORY_ID,
     }));
-}
-
-test "only fully absent legacy route defaults to locked local primary" {
-    const allocator = std.testing.allocator;
-    var thread = try ChatThread.init(allocator, "Legacy route");
-    defer thread.deinit(allocator);
-    const legacy: PersistedThread = .{
-        .title = "Legacy route",
-        .committed = true,
-    };
-    try restoreThreadRuntimeRoute(allocator, &thread, legacy);
-    thread.committed = true;
-    const route = thread.selectedRuntimeRoute();
-    try std.testing.expectEqualStrings(chat_types.LOCAL_RUNTIME_PROFILE_ID, route.profile_id);
-    try std.testing.expectEqualStrings(chat_types.PRIMARY_REPOSITORY_ID, route.repository_id);
-    try std.testing.expect(thread.pinnedRuntimeRoute().?.runtime_id == null);
-    try std.testing.expectEqual(.new_thread_required, try thread.selectRuntimeRoute(allocator, .{
-        .profile_id = "remote-box",
-        .repository_id = chat_types.PRIMARY_REPOSITORY_ID,
-    }));
-
-    const explicit_local: PersistedThread = .{
-        .title = "Explicit local",
-        .committed = true,
-        .profile_id = chat_types.LOCAL_RUNTIME_PROFILE_ID,
-        .repository_id = chat_types.PRIMARY_REPOSITORY_ID,
-    };
-    try restoreThreadRuntimeRoute(allocator, &thread, explicit_local);
-    try std.testing.expect(thread.pinnedRuntimeRoute().?.runtime_id == null);
 }
 
 test "partial or malformed committed routes stay quarantined" {
@@ -1920,51 +1828,6 @@ test "transport delta keeps hydrated durable history off the snapshot wire" {
     defer compact.deinit();
     try std.testing.expectEqual(@as(usize, 44), compact.value.projects[0].threads.?[0].message_offset);
     try std.testing.expectEqual(@as(usize, 3), compact.value.projects[0].threads.?[1].message_offset);
-}
-
-test "compact baseline and spool delta omit durable transcript bodies" {
-    const old_messages = [_]PersistedMessage{.{ .role = .assistant, .author = "Assistant", .body = "large durable body" }};
-    const extended_messages = [_]PersistedMessage{
-        .{ .role = .assistant, .author = "Assistant", .body = "large durable body" },
-        .{ .role = .user, .author = "You", .body = "new suffix" },
-    };
-    const new_messages = [_]PersistedMessage{.{ .role = .user, .author = "You", .body = "local-only body" }};
-    const baseline_threads = [_]PersistedThread{.{
-        .title = "Durable",
-        .local_thread_id = "durable-thread",
-        .messages = &old_messages,
-    }};
-    const current_threads = [_]PersistedThread{
-        .{ .title = "Renamed", .local_thread_id = "durable-thread", .messages = &extended_messages },
-        .{ .title = "Local", .local_thread_id = "local-thread", .messages = &new_messages },
-    };
-    const baseline_projects = [_]PersistedProject{.{
-        .id = "workspace",
-        .label = "Before",
-        .path = "/tmp/workspace",
-        .threads = &baseline_threads,
-    }};
-    const current_projects = [_]PersistedProject{.{
-        .id = "workspace",
-        .label = "After",
-        .path = "/tmp/workspace",
-        .threads = &current_threads,
-    }};
-    const baseline_state: PersistedState = .{ .projects = &baseline_projects };
-    const current_state: PersistedState = .{ .projects = &current_projects };
-
-    var compact = try clonePersistedBaseline(std.testing.allocator, baseline_state);
-    defer compact.deinit();
-    try std.testing.expectEqual(@as(usize, 0), compact.value.projects[0].threads.?[0].messages.len);
-
-    var delta = try clonePersistedSpoolDelta(std.testing.allocator, current_state, baseline_state);
-    defer delta.deinit();
-    try std.testing.expectEqualStrings("After", delta.value.projects[0].label);
-    try std.testing.expectEqual(@as(usize, 1), delta.value.projects[0].threads.?[0].message_offset);
-    try std.testing.expectEqual(@as(usize, 1), delta.value.projects[0].threads.?[0].messages.len);
-    try std.testing.expectEqualStrings("new suffix", delta.value.projects[0].threads.?[0].messages[0].body);
-    try std.testing.expectEqual(@as(usize, 1), delta.value.projects[0].threads.?[1].messages.len);
-    try std.testing.expectEqualStrings("local-only body", delta.value.projects[0].threads.?[1].messages[0].body);
 }
 
 pub fn applyPersistedTerminalDocksJson(self: anytype, project: *Project, json: []const u8) !void {

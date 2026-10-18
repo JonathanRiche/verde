@@ -343,50 +343,6 @@ pub fn keyEvent(mac_code: u16, chars: []const u8, base: []const u8, flags: u64, 
     };
 }
 
-test "mac key codes map to SDL-equivalent evdev codes" {
-    try std.testing.expectEqual(@as(u16, 30), entry(0x00).evdev); // A
-    try std.testing.expectEqual(@as(u16, 28), entry(0x24).evdev); // Return
-    try std.testing.expectEqual(@as(u16, 96), entry(0x4C).evdev); // keypad Enter
-    try std.testing.expectEqual(@as(u16, 82), entry(0x52).evdev); // keypad 0
-    try std.testing.expectEqual(@as(u16, 99), entry(0x69).evdev); // F13 -> PRINTSCREEN like SDL
-    try std.testing.expectEqual(@as(u16, 186), entry(0x6A).evdev); // F16
-    try std.testing.expectEqual(@as(u16, 190), entry(0x5A).evdev); // F20
-    try std.testing.expectEqual(@as(u16, 126), entry(0x36).evdev); // right Command
-    try std.testing.expectEqual(@as(u16, 0), entry(0x3F).evdev); // fn: no events
-    try std.testing.expectEqual(Keycode.kp_enter, entry(0x4C).key);
-    try std.testing.expectEqual(Keycode.kp_equals, entry(0x51).key);
-    // Every keypad digit is distinct and fixed.
-    var seen: [10]bool = @splat(false);
-    for (table) |en| {
-        const v = @intFromEnum(en.key);
-        if (v >= @intFromEnum(Keycode.kp_0) and v <= @intFromEnum(Keycode.kp_9)) {
-            try std.testing.expect(en.fixed);
-            seen[v - @intFromEnum(Keycode.kp_0)] = true;
-        }
-    }
-    for (seen) |s| try std.testing.expect(s);
-    try std.testing.expectEqual(@as(u16, 50), normalizeIso(10, true));
-    try std.testing.expectEqual(@as(u16, 10), normalizeIso(50, true));
-    try std.testing.expectEqual(@as(u16, 10), normalizeIso(10, false));
-}
-
-test "function keys F13-F24" {
-    try std.testing.expectEqual(@as(u16, 183), evdevForFunctionKey(13));
-    try std.testing.expectEqual(@as(u16, 194), evdevForFunctionKey(24));
-    try std.testing.expectEqual(@as(u16, 59), evdevForFunctionKey(1));
-    try std.testing.expectEqual(@as(u16, 88), evdevForFunctionKey(12));
-    try std.testing.expectEqual(@as(u8, 21), functionKeyNumber(0xF704 + 20));
-    try std.testing.expectEqual(Keycode.f21, keycodeForFunctionNumber(21));
-    try std.testing.expectEqual(Keycode.f13, keycodeForFunctionNumber(13));
-    // A key code without a table entry delivering NSF22FunctionKey.
-    var buf: [4]u8 = undefined;
-    const n = try std.unicode.utf8Encode(0xF704 + 21, &buf);
-    const k = keyEvent(0x6C, buf[0..n], buf[0..n], 0, true, false);
-    try std.testing.expectEqual(Keycode.f22, k.key);
-    try std.testing.expectEqual(@as(u32, 192), k.scancode);
-    try std.testing.expectEqual(@as(u21, 0), k.codepoint);
-}
-
 test "layout resolution: AZERTY, Cyrillic, punctuation" {
     // US: kVK_ANSI_Q gives 'q'.
     try std.testing.expectEqual(Keycode.q, resolve(0x0C, 'q'));

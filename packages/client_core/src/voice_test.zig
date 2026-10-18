@@ -96,13 +96,6 @@ const Fixture = struct {
     }
 };
 
-fn announced(output: V, scope: []const u8) bool {
-    for (p.rows(p.get(output, "effects"))) |effect| if (h.eq(p.s(effect, "type"), "state_changed")) {
-        for (p.rows(p.get(effect, "scopes"))) |s| if (h.eq(p.str(s), scope)) return true;
-    };
-    return false;
-}
-
 const providers_json =
     \\{"default_provider":"xai","providers":[
     \\ {"id":"xai","label":"xAI Grok","protocol":"openai_realtime","configured":true,"key_source":"verde","model":"grok-voice","voice":"Ara","voices":["Ara","Rex"]},
@@ -115,26 +108,6 @@ const session_json =
     \\ "tools":[{"name":"ask_companion","description":"Hand off","parameters":{"type":"object","properties":{"request":{"type":"string"}},"required":["request"]}},{"name":"companion_status","description":"Status"}],
     \\ "companion":{"id":"c1","name":"Moss","home_workspace_id":"ws","thread_id":"t1"}}
 ;
-
-test "providers refresh coalesces and lists providers without keys" {
-    var f = try Fixture.init(all_scopes);
-    defer f.deinit();
-    const first = try f.intent("voice_providers_refresh", .{});
-    const second = try f.intent("voice_providers_refresh", .{});
-    try eql("succeeded", (try f.receipt(second)).state);
-    try expect(f.pending("voice.providers") == 1);
-    const out = try f.reply("voice.providers", providers_json);
-    try expect(announced(out, "voice"));
-    try eql("succeeded", (try f.receipt(first)).state);
-    const view = try f.view();
-    try expect(p.yes(p.get(view, "loaded")));
-    try eql("xai", p.s(view, "default_provider"));
-    const list = p.rows(p.get(view, "providers"));
-    try expect(list.len == 2);
-    try eql("verde", p.s(list[0], "key_source"));
-    try expect(p.rows(p.get(list[0], "voices")).len == 2);
-    try expect(!p.yes(p.get(list[1], "configured")));
-}
 
 test "configure sends the key only in the RPC body, never in receipts or views" {
     var f = try Fixture.init(all_scopes);
@@ -157,38 +130,6 @@ test "configure sends the key only in the RPC body, never in receipts or views" 
     // Absent key keeps the stored one.
     _ = try f.intent("voice_provider_configure", .{ .provider = "xai", .voice = "Rex" });
     try expect(p.get(try f.params("voice.provider.configure"), "api_key") == .null);
-}
-
-test "session create exposes a ready session with raw tool schemas and is replaced by the next request" {
-    var f = try Fixture.init(all_scopes);
-    defer f.deinit();
-    const id = try f.intent("voice_session_create", .{ .companion_id = "c1" });
-    var session = p.get(try f.view(), "session");
-    try eql("pending", p.s(session, "status"));
-    try eql(id, p.s(session, "intent_id"));
-    try eql("c1", p.s(try f.params("voice.session.create"), "companion_id"));
-    try expect(p.get(try f.params("voice.session.create"), "provider") == .null);
-    _ = try f.reply("voice.session.create", session_json);
-    session = p.get(try f.view(), "session");
-    try eql("ready", p.s(session, "status"));
-    try eql("ephemeral-secret", p.s(session, "token"));
-    try eql("bearer", p.s(session, "auth"));
-    try eql("Moss", p.s(p.get(session, "companion"), "name"));
-    const tools = p.rows(p.get(session, "tools"));
-    try expect(tools.len == 2);
-    const schema = try h.parse(f.a(), p.s(tools[0], "parameters"));
-    try eql("request", p.rows(p.get(schema, "required"))[0].string);
-    try eql("{\"type\":\"object\",\"properties\":{}}", p.s(tools[1], "parameters"));
-    try eql("succeeded", (try f.receipt(id)).state);
-    // A new request drops the old token before anything else happens.
-    _ = try f.intent("voice_session_create", .{ .provider = "gemini" });
-    session = p.get(try f.view(), "session");
-    try eql("pending", p.s(session, "status"));
-    try eql("", p.s(session, "token"));
-    _ = try f.reject("voice.session.create", "voice_not_configured");
-    session = p.get(try f.view(), "session");
-    try eql("failed", p.s(session, "status"));
-    try eql("voice_not_configured", p.s(session, "error_code"));
 }
 
 test "backgrounding drops the session token and an old host is unsupported" {

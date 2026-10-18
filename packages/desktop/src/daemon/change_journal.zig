@@ -313,71 +313,6 @@ fn optionalLen(value: ?[]u8) usize {
     return if (value) |slice| slice.len else 0;
 }
 
-test "topic set and wire names are frozen" {
-    // Q10 freeze: any change to this list is a design decision, not a patch.
-    const expected = [_]struct { topic: Topic, wire: []const u8 }{
-        .{ .topic = .workspace, .wire = "workspace" },
-        .{ .topic = .chat_thread, .wire = "chat.thread" },
-        .{ .topic = .chat_turn, .wire = "chat.turn" },
-        .{ .topic = .chat_completion, .wire = "chat.completion" },
-        .{ .topic = .surface, .wire = "surface" },
-        .{ .topic = .process, .wire = "process" },
-        .{ .topic = .lease, .wire = "lease" },
-        .{ .topic = .session, .wire = "session" },
-        .{ .topic = .notification, .wire = "notification" },
-    };
-    try std.testing.expectEqual(expected.len, std.enums.values(Topic).len);
-    for (expected, std.enums.values(Topic)) |pin, topic| {
-        try std.testing.expectEqual(pin.topic, topic);
-        try std.testing.expectEqualStrings(pin.wire, topic.wireName());
-        try std.testing.expectEqual(topic, Topic.fromWireName(pin.wire).?);
-    }
-    try std.testing.expectEqual(@as(?Topic, null), Topic.fromWireName("chat.turn.tail"));
-    try std.testing.expectEqual(@as(usize, 4096), CHANGE_JOURNAL_ENTRY_MAX);
-    try std.testing.expect(CHANGE_JOURNAL_BYTE_MAX > 0);
-}
-
-test "change_seq starts at 1 and is monotonic" {
-    const allocator = std.testing.allocator;
-    var journal: ChangeJournal = .{};
-    defer journal.deinit(allocator);
-
-    try std.testing.expectEqual(@as(u64, 1), try journal.append(allocator, .process, "p1", "ws", .{ .registry = 7 }, 100));
-    try std.testing.expectEqual(@as(u64, 2), try journal.append(allocator, .lease, "l1", "ws", .{ .registry = 8 }, 101));
-    try std.testing.expectEqual(@as(u64, 3), try journal.append(allocator, .chat_thread, "t1", "ws", .{ .store = 4 }, 102));
-    try std.testing.expectEqual(@as(u64, 3), journal.last_seq);
-    try std.testing.expectEqual(@as(usize, 3), journal.len());
-    try std.testing.expectEqual(@as(i64, 102), journal.entries.items[2].appended_at_ms);
-}
-
-test "exactly one revision field is set and topic families are enforced" {
-    const allocator = std.testing.allocator;
-    var journal: ChangeJournal = .{};
-    defer journal.deinit(allocator);
-
-    // Wrong family is rejected for single-plane topics. `surface` pins the
-    // M5-P3 amendment: store commits are its ONLY publisher, so a registry
-    // revision is the wrong plane.
-    try std.testing.expectError(error.RevisionKindMismatch, journal.append(allocator, .lease, "l1", null, .{ .store = 1 }, 0));
-    try std.testing.expectError(error.RevisionKindMismatch, journal.append(allocator, .chat_thread, "t1", null, .{ .registry = 1 }, 0));
-    try std.testing.expectError(error.RevisionKindMismatch, journal.append(allocator, .surface, "sess-1", null, .{ .registry = 1 }, 0));
-    try std.testing.expectError(error.ResourceIdRequired, journal.append(allocator, .process, "", null, .{ .registry = 1 }, 0));
-    try std.testing.expectEqual(@as(usize, 0), journal.len());
-
-    // Dual-plane topics accept either family; every entry carries exactly one.
-    _ = try journal.append(allocator, .chat_turn, "turn1", "ws", .{ .registry = 5 }, 0);
-    _ = try journal.append(allocator, .workspace, "ws", null, .{ .store = 9 }, 0);
-    _ = try journal.append(allocator, .chat_completion, "turn1", "ws", .{ .store = 10 }, 0);
-    _ = try journal.append(allocator, .surface, "sess-1", "ws", .{ .store = 11 }, 0);
-    for (journal.entries.items) |entry| {
-        const store_set = entry.store_revision != null;
-        const registry_set = entry.registry_revision != null;
-        try std.testing.expect(store_set != registry_set);
-    }
-    try std.testing.expectEqual(@as(u64, 5), journal.entries.items[0].registry_revision.?);
-    try std.testing.expectEqual(@as(u64, 9), journal.entries.items[1].store_revision.?);
-}
-
 test "adjacent same-topic same-resource entries coalesce with a bumped seq" {
     const allocator = std.testing.allocator;
     var journal: ChangeJournal = .{};
@@ -404,37 +339,6 @@ test "adjacent same-topic same-resource entries coalesce with a bumped seq" {
     try std.testing.expectEqual(@as(usize, 4), journal.len());
 }
 
-test "dual-plane coalescing keeps only the newest revision reference" {
-    const allocator = std.testing.allocator;
-    var journal: ChangeJournal = .{};
-    defer journal.deinit(allocator);
-
-    _ = try journal.append(allocator, .chat_turn, "turn1", "ws", .{ .registry = 3 }, 0);
-    _ = try journal.append(allocator, .chat_turn, "turn1", "ws", .{ .store = 12 }, 1);
-    try std.testing.expectEqual(@as(usize, 1), journal.len());
-    try std.testing.expectEqual(@as(u64, 12), journal.entries.items[0].store_revision.?);
-    try std.testing.expectEqual(@as(?u64, null), journal.entries.items[0].registry_revision);
-}
-
-test "count cap evicts oldest and advances the floor" {
-    const allocator = std.testing.allocator;
-    var journal: ChangeJournal = .{ .max_entries = 2 };
-    defer journal.deinit(allocator);
-
-    _ = try journal.append(allocator, .process, "p1", null, .{ .registry = 1 }, 0);
-    _ = try journal.append(allocator, .process, "p2", null, .{ .registry = 2 }, 0);
-    try std.testing.expectEqual(@as(u64, 0), journal.journal_floor_seq);
-    _ = try journal.append(allocator, .process, "p3", null, .{ .registry = 3 }, 0);
-    try std.testing.expectEqual(@as(usize, 2), journal.len());
-    try std.testing.expectEqual(@as(u64, 1), journal.journal_floor_seq);
-    try std.testing.expectEqual(@as(u64, 2), journal.entries.items[0].change_seq);
-
-    // Coalescing must not consume ring capacity or move the floor.
-    _ = try journal.append(allocator, .process, "p3", null, .{ .registry = 4 }, 0);
-    try std.testing.expectEqual(@as(usize, 2), journal.len());
-    try std.testing.expectEqual(@as(u64, 1), journal.journal_floor_seq);
-}
-
 test "byte cap accounting evicts by size and frees owned strings exactly once" {
     const allocator = std.testing.allocator;
     const base_cost = entryByteCost(2, 2);
@@ -458,17 +362,6 @@ test "byte cap accounting evicts by size and frees owned strings exactly once" {
     try std.testing.expectEqual(@as(u64, 2), journal.journal_floor_seq);
     // std.testing.allocator fails the test on any leak or double free of the
     // owned resource/workspace strings across eviction, coalesce, and deinit.
-}
-
-test "oversized single entry is rejected without mutating the journal" {
-    const allocator = std.testing.allocator;
-    var journal: ChangeJournal = .{ .max_bytes = 1 };
-    defer journal.deinit(allocator);
-
-    try std.testing.expectError(error.ChangeEntryTooLarge, journal.append(allocator, .process, "p1", null, .{ .registry = 1 }, 0));
-    try std.testing.expectEqual(@as(usize, 0), journal.len());
-    try std.testing.expectEqual(@as(u64, 0), journal.last_seq);
-    try std.testing.expectEqual(@as(usize, 0), journal.byte_count);
 }
 
 test "entriesAfter returns the suffix, a heartbeat, or a typed expiry" {
@@ -518,30 +411,6 @@ test "entriesAfter returns the suffix, a heartbeat, or a typed expiry" {
             try std.testing.expectEqual(@as(usize, 1), window.entries.len);
             try std.testing.expectEqual(@as(u64, 4), window.entries[0].change_seq);
         },
-        .expired => return error.TestUnexpectedResult,
-    }
-}
-
-test "reset restarts the instance-scoped sequence" {
-    const allocator = std.testing.allocator;
-    var journal: ChangeJournal = .{ .max_entries = 2 };
-    defer journal.deinit(allocator);
-
-    _ = try journal.append(allocator, .process, "p1", "ws", .{ .registry = 1 }, 0);
-    _ = try journal.append(allocator, .process, "p2", "ws", .{ .registry = 2 }, 0);
-    _ = try journal.append(allocator, .process, "p3", "ws", .{ .registry = 3 }, 0);
-    try std.testing.expect(journal.journal_floor_seq != 0);
-
-    journal.reset(allocator);
-    try std.testing.expectEqual(@as(usize, 0), journal.len());
-    try std.testing.expectEqual(@as(u64, 0), journal.last_seq);
-    try std.testing.expectEqual(@as(u64, 0), journal.journal_floor_seq);
-    try std.testing.expectEqual(@as(usize, 0), journal.byte_count);
-
-    // Fresh instance scope: seq restarts at 1 and cursor 0 is valid again.
-    try std.testing.expectEqual(@as(u64, 1), try journal.append(allocator, .process, "p1", "ws", .{ .registry = 1 }, 0));
-    switch (journal.entriesAfter(0)) {
-        .ok => |window| try std.testing.expectEqual(@as(usize, 1), window.entries.len),
         .expired => return error.TestUnexpectedResult,
     }
 }

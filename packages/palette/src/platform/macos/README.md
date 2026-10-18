@@ -81,7 +81,7 @@ with `objc_allocateClassPair`. Everything therefore cross-compiles from Linux
 
 Input is injected in-process only, by sending NSEvents to the window or calling the view's methods. No CGEventPost or
 AppleScript is used, and no Accessibility or Input Monitoring permission is ever requested. Screenshots of the screen
-(which need Screen Recording permission) are not used either. Visuals are checked by offscreen Metal readback (`test-gpu` goldens).
+(which need Screen Recording permission) are not used either.
 
 ## Limitations
 

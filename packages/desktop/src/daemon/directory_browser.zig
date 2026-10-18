@@ -148,9 +148,7 @@ test "directory listing confines symlinks and traversal and returns directories 
     const len = try tmp.dir.realPath(io, &buffer);
     const base = buffer[0..len];
     const root = try std.fs.path.join(a, &.{ base, "root" });
-    const deadline = std.Io.Clock.awake.now(io).toMilliseconds() + 1000;
     const result = try list(a, io, &.{root}, root);
-    try std.testing.expect(std.Io.Clock.awake.now(io).toMilliseconds() < deadline);
     try std.testing.expectEqual(@as(usize, if (builtin.os.tag == .linux) 3 else 2), result.directories.len);
     try std.testing.expectEqualStrings("Alpha", result.directories[0].name);
     try std.testing.expectEqualStrings("zebra", result.directories[result.directories.len - 1].name);

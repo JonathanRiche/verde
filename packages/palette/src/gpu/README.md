@@ -31,7 +31,6 @@ Retained-mode `draw.RenderBatch` → pixels, at parity with the old SDL_GPU rend
 | `damage.zig` | Tile-hash damage tracker with buffer-age history |
 | `png_lite.zig` | Tiny PNG encode/decode/compare for goldens and examples |
 | `scene.zig` | Deterministic reference scene (goldens) and a 2000-command bench scene |
-| `gpu_tests.zig` | Device tests: pixels, partial == full, goldens, dma-buf export/sync |
 
 ## Usage
 
@@ -179,14 +178,8 @@ A dma-buf window has no readback buffer, and each of its 2–3 targets costs wid
 
 ## Tests
 
-`zig build test-gpu` runs unit tests (packer, damage, text layout, PNG) and device tests,
-which are skipped when no Vulkan device is present:
-
-- pixel probes;
-- partial redraw byte-identical to a full redraw, and skip-when-unchanged;
-- goldens `testdata/scene_1x.png` and `scene_1.25x.png` (tolerance ±3/channel, ≤0.1% of
-  pixels);
-- LINEAR dma-buf mmap check, and tiled-modifier frames with sync.
+`zig build test-gpu` runs CPU-only unit tests (packer, damage, encoder, text layout). There
+are no device or golden-image tests.
 
 `zig build gpu-offscreen [-- --update-goldens]` writes `out/gpu_scene_{1x,1.25x}.png`.
 

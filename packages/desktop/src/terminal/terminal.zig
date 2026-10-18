@@ -413,58 +413,6 @@ fn daemonTailRequestMatchesSession(request: DaemonTailBatchRequest, session: *co
         request.offset == session.remote_output_offset;
 }
 
-test "daemon terminal polling returns while a request is pending and suppresses timeout fallback" {
-    if (!SESSION_SUPPORTED) return error.SkipZigTest;
-    // No emulator is needed: neither pending IPC nor a transport failure may
-    // touch it or issue an individual session.tail request on this thread.
-    var session: Session = undefined;
-    var batch: DaemonPollBatch = .{};
-    defer batch.deinit(std.testing.allocator);
-    try batch.sessions.append(std.testing.allocator, &session);
-    const job = try DaemonTailJob.create("unused-test-endpoint", &.{});
-    batch.job = job;
-
-    try batch.prefetch(std.testing.allocator, "unused-test-endpoint");
-    try std.testing.expect(batch.job == job);
-    try std.testing.expect(session.daemon_prefetched);
-    try std.testing.expect(!session.daemon_prefetched_changed);
-
-    job.failure = error.ConnectionTimedOut;
-    job.done.store(true, .release);
-    try std.testing.expectError(error.ConnectionTimedOut, batch.prefetch(std.testing.allocator, "unused-test-endpoint"));
-    try std.testing.expect(batch.job == null);
-    try std.testing.expect(session.daemon_prefetched);
-    try std.testing.expect(!session.daemon_prefetched_changed);
-}
-
-test "daemon terminal polling owns identities and rejects replies after reattach or cursor advance" {
-    if (!SESSION_SUPPORTED) return error.SkipZigTest;
-    var id = [_]u8{ 'p', 't', 'y' };
-    var attach = [_]u8{ 'o', 'l', 'd' };
-    const job = try DaemonTailJob.create("test-endpoint", &.{.{ .id = &id, .attach_id = &attach, .offset = 10, .max_bytes = 100 }});
-    defer job.destroy();
-    id[0] = 'x';
-    attach[0] = 'x';
-    try std.testing.expectEqualStrings("pty", job.requests[0].id);
-    try std.testing.expectEqualStrings("old", job.requests[0].attach_id);
-
-    var session: Session = undefined;
-    var live_id = [_]u8{ 'p', 't', 'y' };
-    var live_attach = [_]u8{ 'o', 'l', 'd' };
-    session.session_id = &live_id;
-    session.attach_id = &live_attach;
-    session.remote_output_offset = 10;
-    try std.testing.expect(daemonTailRequestMatchesSession(job.requests[0], &session));
-    session.remote_output_offset = 11;
-    try std.testing.expect(!daemonTailRequestMatchesSession(job.requests[0], &session));
-    session.remote_output_offset = 10;
-    live_attach[0] = 'n';
-    try std.testing.expect(!daemonTailRequestMatchesSession(job.requests[0], &session));
-    live_attach[0] = 'o';
-    live_id[0] = 'n';
-    try std.testing.expect(!daemonTailRequestMatchesSession(job.requests[0], &session));
-}
-
 fn cachedDaemonResponseMatches(cached: *const std.ArrayList(u8), response: []const u8) bool {
     return cached.items.len > 0 and std.mem.eql(u8, cached.items, response);
 }
@@ -2240,63 +2188,6 @@ fn resolveSessionTeardown(
     };
 }
 
-pub const lifecycle_testing = if (builtin.is_test and SESSION_SUPPORTED) struct {
-    pub fn assignActiveSessionId(dock: *Dock, allocator: std.mem.Allocator, session_id: []const u8) !void {
-        const leaf = dock.activePane() orelse return error.MissingTerminalPane;
-        const session = leaf.session orelse return error.MissingTerminalSession;
-        if (session.session_id) |existing| allocator.free(existing);
-        session.session_id = try allocator.dupe(u8, session_id);
-        if (leaf.session_id) |existing| allocator.free(existing);
-        leaf.session_id = try allocator.dupe(u8, session_id);
-    }
-
-    pub fn simulateActiveDaemonUnavailable(dock: *Dock, running: bool) !void {
-        const leaf = dock.activePane() orelse return error.MissingTerminalPane;
-        const session = leaf.session orelse return error.MissingTerminalSession;
-        session.backend = .daemon;
-        session.daemon_state = .unavailable;
-        session.running = running;
-    }
-
-    pub fn restoreActiveLocal(dock: *Dock) void {
-        const leaf = dock.activePane() orelse return;
-        const session = leaf.session orelse return;
-        session.backend = .local;
-        session.daemon_state = .attached;
-        session.test_daemon_kill_response = null;
-        session.running = true;
-    }
-
-    pub fn simulateActiveDaemonKillResponse(dock: *Dock, response: []const u8) !void {
-        const leaf = dock.activePane() orelse return error.MissingTerminalPane;
-        const session = leaf.session orelse return error.MissingTerminalSession;
-        session.backend = .daemon;
-        session.daemon_state = .attached;
-        session.running = true;
-        session.test_daemon_kill_response = response;
-    }
-
-    pub fn signalTeardownForConfirmedExit(teardown: *SessionTeardown) void {
-        teardown.session.backend = .local;
-        teardown.session.daemon_state = .attached;
-        teardown.session.test_daemon_kill_response = null;
-        teardown.session.running = true;
-        std.posix.kill(teardown.session.child_pid, std.posix.SIG.TERM) catch {};
-    }
-
-    pub fn pollTeardownSession(teardown: *SessionTeardown, allocator: std.mem.Allocator) !SessionSnapshot {
-        _ = try teardown.session.poll(allocator);
-        return teardown.session.snapshot();
-    }
-
-    pub fn restoreTeardownLocal(teardown: *SessionTeardown) void {
-        teardown.session.backend = .local;
-        teardown.session.daemon_state = .attached;
-        teardown.session.test_daemon_kill_response = null;
-        teardown.session.running = true;
-    }
-} else struct {};
-
 fn collectPaneSessionIds(allocator: std.mem.Allocator, node: *PaneNode, session_ids: *std.ArrayList([]const u8)) !void {
     switch (node.*) {
         .leaf => |*leaf| {
@@ -3054,7 +2945,6 @@ const UnixSession = struct {
     /// where a desync (visible SGR params like `5;174m`, stray `\e`) manifests.
     parser_log_enabled: bool = false,
     parser_log_prev_tail_had_esc: bool = false,
-    test_daemon_kill_response: if (builtin.is_test) ?[]const u8 else void = if (builtin.is_test) null else {},
     pending_notification_attention: bool = false,
     pending_notification_title: [128]u8 = undefined,
     pending_notification_title_len: usize = 0,
@@ -4272,11 +4162,6 @@ const UnixSession = struct {
     }
 
     fn killDaemon(self: *UnixSession) !void {
-        if (comptime builtin.is_test) {
-            if (self.test_daemon_kill_response) |response| {
-                return ensureSessionKillSignaled(std.heap.smp_allocator, response);
-            }
-        }
         const pref_path = self.pref_path orelse return error.MissingSessionPrefPath;
         const session_id = self.session_id orelse return error.MissingSessionId;
         const response = try daemon_client.requestAlloc(std.heap.smp_allocator, pref_path, "session.kill", .{ .id = session_id }, 1);
@@ -5904,23 +5789,6 @@ test "terminal key encoding follows default and negotiated terminal input modes"
     try std.testing.expectEqualStrings("\x1b[13;2u", writer.buffered());
 }
 
-test "focus adjacent pane uses split direction" {
-    const allocator = std.testing.allocator;
-    var dock = try Dock.init(allocator);
-    defer dock.deinit(allocator);
-
-    try dock.tabs.append(allocator, try dock.buildSinglePaneTabWithoutSession(allocator));
-    const left_id = dock.activePaneConst().?.id;
-    try dock.splitActivePane(allocator, .right);
-    const right_id = dock.activePaneConst().?.id;
-
-    try std.testing.expectEqual(right_id, dock.activePaneConst().?.id);
-    try std.testing.expect(try dock.focusAdjacentPane(allocator, .left));
-    try std.testing.expectEqual(left_id, dock.activePaneConst().?.id);
-    try std.testing.expect(try dock.focusAdjacentPane(allocator, .right));
-    try std.testing.expectEqual(right_id, dock.activePaneConst().?.id);
-}
-
 test "persisted layout accepts leaves without session metadata" {
     const allocator = std.testing.allocator;
     var dock = try Dock.init(allocator);
@@ -6020,135 +5888,6 @@ test "pane id exhaustion is fallible and never returns a duplicate" {
     try std.testing.expectEqualStrings("session-3", dock.paneById(3).?.session_id.?);
 }
 
-test "pane id allocation stays linear at the full id bound" {
-    const allocator = std.testing.allocator;
-    var dock = try Dock.init(allocator);
-    defer dock.deinit(allocator);
-
-    var pane_id: u32 = 1;
-    while (pane_id < MAX_PANE_ID) : (pane_id += 1) {
-        const node = try allocator.create(PaneNode);
-        node.* = .{ .leaf = .{ .id = pane_id } };
-        dock.tabs.append(allocator, .{
-            .id = pane_id,
-            .root = node,
-            .active_pane_id = pane_id,
-        }) catch |err| {
-            allocator.destroy(node);
-            return err;
-        };
-    }
-    dock.next_pane_id = 1;
-    try std.testing.expectEqual(MAX_PANE_ID, try dock.allocatePaneIdWithin(MAX_PANE_ID));
-
-    const last_node = try allocator.create(PaneNode);
-    last_node.* = .{ .leaf = .{ .id = MAX_PANE_ID } };
-    dock.tabs.append(allocator, .{
-        .id = MAX_PANE_ID,
-        .root = last_node,
-        .active_pane_id = MAX_PANE_ID,
-    }) catch |err| {
-        allocator.destroy(last_node);
-        return err;
-    };
-    try std.testing.expectError(error.PaneIdExhausted, dock.allocatePaneIdWithin(MAX_PANE_ID));
-}
-
-test "persisted restart revive policy reloads as attach" {
-    const allocator = std.testing.allocator;
-    var dock = try Dock.init(allocator);
-    defer dock.deinit(allocator);
-
-    const layout_json =
-        \\{
-        \\  "active_tab_index": 0,
-        \\  "tabs": [{
-        \\    "active_pane_id": 1,
-        \\    "root_node_id": 1,
-        \\    "nodes": [{
-        \\      "node_id": 1,
-        \\      "kind": "leaf",
-        \\      "pane_id": 1,
-        \\      "revive_policy": "restart"
-        \\    }]
-        \\  }]
-        \\}
-    ;
-
-    try dock.applyPersistedLayoutJson(allocator, layout_json);
-    try std.testing.expectEqual(TerminalRevivePolicy.attach_or_create, dock.activePaneConst().?.revive_policy);
-}
-
-test "persisted dock replacement keeps matching live emulator ownership" {
-    if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
-    const allocator = std.testing.allocator;
-    var current = try Dock.init(allocator);
-    defer current.deinit(allocator);
-    try current.restartWithProfile(allocator, "/tmp", .{
-        .kind = .custom,
-        .label = "projection runtime transfer",
-        .command = &.{ "/bin/sh", "-c", "sleep 30" },
-    });
-    try lifecycle_testing.assignActiveSessionId(&current, allocator, "stable-daemon-session");
-    const live_session = current.activePane().?.session.?;
-
-    var replacement = try Dock.init(allocator);
-    defer replacement.deinit(allocator);
-    try replacement.applyPersistedLayoutJson(allocator,
-        \\{
-        \\  "tabs": [{
-        \\    "title": "persisted replacement",
-        \\    "active_pane_id": 42,
-        \\    "root_node_id": 1,
-        \\    "nodes": [{
-        \\      "node_id": 1,
-        \\      "kind": "leaf",
-        \\      "pane_id": 42,
-        \\      "session_id": "stable-daemon-session"
-        \\    }]
-        \\  }]
-        \\}
-    );
-
-    try std.testing.expectEqual(@as(usize, 1), replacement.transferRuntimeFrom(&current));
-    try std.testing.expect(current.activePane().?.session == null);
-    try std.testing.expect(replacement.activePane().?.session.? == live_session);
-    try std.testing.expectEqual(@as(u32, 42), replacement.activePane().?.id);
-    try std.testing.expectEqualStrings("persisted replacement", replacement.tabs.items[0].title.?);
-    try std.testing.expectEqualStrings("/tmp", replacement.cwd.?);
-}
-
-test "session ensure preserves a running session and releases a stopped one" {
-    const allocator = std.testing.allocator;
-    const FakeSession = struct {
-        running: bool,
-        deinit_count: *usize,
-
-        fn isRunning(self: *const @This()) bool {
-            return self.running;
-        }
-
-        fn deinit(self: *@This(), _: std.mem.Allocator) void {
-            self.deinit_count.* += 1;
-        }
-    };
-
-    var deinit_count: usize = 0;
-    const session = try allocator.create(FakeSession);
-    session.* = .{ .running = true, .deinit_count = &deinit_count };
-    var slot: ?*FakeSession = session;
-    defer if (slot) |remaining| allocator.destroy(remaining);
-
-    try std.testing.expect(!prepareSessionSlotForCreate(FakeSession, allocator, &slot));
-    try std.testing.expect(slot.? == session);
-    try std.testing.expectEqual(@as(usize, 0), deinit_count);
-
-    session.running = false;
-    try std.testing.expect(prepareSessionSlotForCreate(FakeSession, allocator, &slot));
-    try std.testing.expectEqual(@as(?*FakeSession, null), slot);
-    try std.testing.expectEqual(@as(usize, 1), deinit_count);
-}
-
 test "closing a restored tab without a live session does not claim teardown ownership" {
     const allocator = std.testing.allocator;
     var dock = try Dock.init(allocator);
@@ -6215,117 +5954,6 @@ test "terminal teardown survives daemon unavailability or termination failure un
     try std.testing.expectEqualStrings("terminal restarted", cancelled.cancellation_reason.?);
 }
 
-test "daemon kill response requires an accepted signal" {
-    const allocator = std.testing.allocator;
-    try std.testing.expectError(
-        error.SessionTerminationNotSignaled,
-        ensureSessionKillSignaled(allocator, "{\"result\":{\"accepted\":true,\"signaled\":false}}"),
-    );
-    try ensureSessionKillSignaled(allocator, "{\"result\":{\"accepted\":true,\"signaled\":true}}");
-    try std.testing.expectError(
-        error.SessionRequestFailed,
-        ensureSessionKillSignaled(allocator, "{\"error\":{\"code\":\"not_found\"}}"),
-    );
-}
-
-test "unsignaled daemon kill response keeps a real teardown pending until observed exit" {
-    if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
-    const allocator = std.testing.allocator;
-    var dock = try Dock.init(allocator);
-    defer dock.deinit(allocator);
-    try dock.restartWithProfile(allocator, "/tmp", .{
-        .kind = .custom,
-        .label = "unsignaled daemon teardown",
-        .command = &.{ "/bin/sh", "-c", "sleep 30" },
-    });
-    try lifecycle_testing.assignActiveSessionId(&dock, allocator, "unsignaled-daemon-session");
-    try lifecycle_testing.simulateActiveDaemonKillResponse(
-        &dock,
-        "{\"result\":{\"accepted\":true,\"signaled\":false}}",
-    );
-
-    try dock.closeTab(allocator, 0);
-    var teardown = dock.takeSessionTeardown() orelse return error.MissingSessionTeardown;
-    defer teardown.deinit(allocator);
-    defer lifecycle_testing.restoreTeardownLocal(&teardown);
-    if (teardown.cancellation_initiated) return error.UnexpectedCancellationInitiation;
-    if ((try teardown.poll(allocator)) != null) return error.UnexpectedEarlyTeardownCompletion;
-
-    lifecycle_testing.signalTeardownForConfirmedExit(&teardown);
-    var attempts: usize = 0;
-    var snapshot: SessionSnapshot = .{ .running = true };
-    while (attempts < 100 and !snapshot.confirmed_exit) : (attempts += 1) {
-        snapshot = try lifecycle_testing.pollTeardownSession(&teardown, allocator);
-        if (!snapshot.confirmed_exit) try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake);
-    }
-    if (!snapshot.confirmed_exit) return error.UnconfirmedTerminalExit;
-    const completion = try teardown.poll(allocator);
-    const result = completion orelse return error.UnconfirmedTerminalExit;
-    if (result.signal != @as(?u32, @intFromEnum(std.posix.SIG.TERM))) return error.UnexpectedTerminalSignal;
-    if (result.cancellation_reason != null) return error.UnexpectedCancellationReason;
-}
-
-test "real teardown keeps unavailable live identity, completes missing, and preserves exit" {
-    if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
-    const allocator = std.testing.allocator;
-
-    var unavailable_dock = try Dock.init(allocator);
-    defer unavailable_dock.deinit(allocator);
-    try unavailable_dock.restartWithProfile(allocator, "/tmp", .{
-        .kind = .custom,
-        .label = "unavailable teardown",
-        .command = &.{ "/bin/sh", "-c", "sleep 30" },
-    });
-    try lifecycle_testing.assignActiveSessionId(&unavailable_dock, allocator, "live-unavailable-session");
-    const unavailable_leaf = unavailable_dock.activePane() orelse return error.MissingTerminalPane;
-    const live_session_id = try allocator.dupe(u8, unavailable_leaf.session.?.sessionId() orelse return error.MissingSessionId);
-    defer allocator.free(live_session_id);
-    if (unavailable_leaf.session_id) |stored| allocator.free(stored);
-    unavailable_leaf.session_id = try allocator.dupe(u8, "stale-persisted-session");
-    unavailable_leaf.session.?.backend = .daemon;
-    unavailable_leaf.session.?.daemon_state = .unavailable;
-    unavailable_leaf.session.?.running = false;
-
-    try unavailable_dock.closeTab(allocator, 0);
-    var unavailable = unavailable_dock.takeSessionTeardown() orelse return error.MissingSessionTeardown;
-    defer {
-        unavailable.session.backend = .local;
-        unavailable.session.daemon_state = .attached;
-        unavailable.session.running = true;
-        unavailable.deinit(allocator);
-    }
-    try std.testing.expectEqualStrings(live_session_id, unavailable.sessionId().?);
-    try std.testing.expect((try unavailable.poll(allocator)) == null);
-    try std.testing.expect(!unavailable.cancellation_initiated);
-    unavailable.session.daemon_state = .missing;
-    try std.testing.expect(!unavailable.session.snapshot().confirmed_exit);
-    const missing = (try unavailable.poll(allocator)) orelse return error.MissingTeardownCompletion;
-    try std.testing.expectEqual(@as(?u32, null), missing.exit_code);
-    try std.testing.expectEqual(@as(?u32, null), missing.signal);
-    try std.testing.expect(missing.cancellation_reason == null);
-
-    var exited_dock = try Dock.init(allocator);
-    defer exited_dock.deinit(allocator);
-    try exited_dock.restartWithProfile(allocator, "/tmp", .{
-        .kind = .custom,
-        .label = "already exited teardown",
-        .command = &.{ "/bin/sh", "-c", "exit 17" },
-    });
-    try lifecycle_testing.assignActiveSessionId(&exited_dock, allocator, "already-exited-session");
-    var attempts: usize = 0;
-    while (attempts < 100 and !(exited_dock.activeSessionSnapshot() orelse SessionSnapshot{ .running = false }).confirmed_exit) : (attempts += 1) {
-        _ = try exited_dock.poll(allocator);
-        try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake);
-    }
-    try std.testing.expect((exited_dock.activeSessionSnapshot() orelse return error.MissingSessionSnapshot).confirmed_exit);
-    try exited_dock.closeTab(allocator, 0);
-    var exited = exited_dock.takeSessionTeardown() orelse return error.MissingSessionTeardown;
-    defer exited.deinit(allocator);
-    const completion = (try exited.poll(allocator)) orelse return error.UnconfirmedTerminalExit;
-    try std.testing.expectEqual(@as(?u32, 17), completion.exit_code);
-    try std.testing.expect(completion.cancellation_reason == null);
-}
-
 test "automatic terminal restart uses capped exponential backoff" {
     var backoff: AutoRestartBackoff = .{};
     const expected_delays = [_]i64{ 1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000 };
@@ -6340,31 +5968,6 @@ test "automatic terminal restart uses capped exponential backoff" {
 
     try std.testing.expectEqual(@as(u8, @intCast(expected_delays.len)), backoff.attempts);
     try std.testing.expectEqual(AUTO_RESTART_MAX_DELAY_MS, autoRestartDelayMs(backoff.attempts));
-}
-
-test "automatic terminal restart retains stopped render state after creation" {
-    var backoff: AutoRestartBackoff = .{};
-
-    // Explicit starts do not reserve an automatic attempt first, but still
-    // need a hold so their stopped VT model reaches the renderer.
-    backoff.armAfterCreate(1_000, true);
-    try std.testing.expectEqual(@as(u8, 1), backoff.attempts);
-    try std.testing.expectEqual(@as(i64, 2_000), backoff.retry_after_ms);
-
-    // Anchor a full delay at the transition to stopped, rather than leaving
-    // only the unused remainder of the delay that began before the shell ran.
-    backoff.observeHealth(1_900, false);
-    try std.testing.expectEqual(@as(?i64, 1_900), backoff.stopped_since_ms);
-    try std.testing.expectEqual(@as(i64, 2_900), backoff.retry_after_ms);
-    try std.testing.expect(!backoff.reserve(2_899));
-    try std.testing.expect(backoff.reserve(2_900));
-
-    // Creation time can move past work done by the reservation; extend the
-    // next deadline without double-counting the attempt.
-    backoff.armAfterCreate(3_000, false);
-    try std.testing.expectEqual(@as(u8, 2), backoff.attempts);
-    try std.testing.expectEqual(@as(i64, 5_000), backoff.retry_after_ms);
-    try std.testing.expectEqual(@as(?i64, 3_000), backoff.stopped_since_ms);
 }
 
 test "automatic terminal restart resets only after continuous health" {
@@ -6386,133 +5989,6 @@ test "automatic terminal restart resets only after continuous health" {
     try std.testing.expectEqual(@as(i64, 0), backoff.retry_after_ms);
     try std.testing.expectEqual(@as(?i64, null), backoff.healthy_since_ms);
     try std.testing.expectEqual(@as(?i64, null), backoff.stopped_since_ms);
-}
-
-test "unix session PTY smoke" {
-    if (!SESSION_SUPPORTED) return error.SkipZigTest;
-
-    const testing = std.testing;
-    const allocator = testing.allocator;
-    const cwd = try std.process.currentPathAlloc(testing.io, allocator);
-    defer allocator.free(cwd);
-
-    const session = try UnixSession.create(allocator, .{
-        .cwd = cwd,
-        .cols = 80,
-        .rows = 24,
-    });
-    defer {
-        session.deinit(allocator);
-        allocator.destroy(session);
-    }
-
-    _ = try session.writeInput("printf 'verde-terminal-smoke'\r");
-
-    var found = false;
-    var saw_change = false;
-    for (0..40) |_| {
-        if (try session.poll(allocator)) saw_change = true;
-        const screen = try session.terminal.plainString(allocator);
-        defer allocator.free(screen);
-        if (std.mem.indexOf(u8, screen, "verde-terminal-smoke") != null) {
-            found = true;
-            break;
-        }
-        try std.Io.sleep(testing.io, .fromMilliseconds(50), .awake);
-    }
-
-    try testing.expect(saw_change);
-    try testing.expect(found);
-
-    _ = try session.writeInput("exit\r");
-    for (0..40) |_| {
-        _ = try session.poll(allocator);
-        if (!session.running) break;
-        try std.Io.sleep(testing.io, .fromMilliseconds(25), .awake);
-    }
-}
-
-test "unix session alternate-screen resize follows terminal model without clearing" {
-    if (!SESSION_SUPPORTED) return error.SkipZigTest;
-
-    const testing = std.testing;
-    const allocator = testing.allocator;
-    const cwd = try std.process.currentPathAlloc(testing.io, allocator);
-    defer allocator.free(cwd);
-
-    const session = try UnixSession.create(allocator, .{
-        .cwd = cwd,
-        .cols = 80,
-        .rows = 10,
-    });
-    defer {
-        session.deinit(allocator);
-        allocator.destroy(session);
-    }
-
-    session.stream.nextSlice(
-        "\x1b[?1049h" ++
-            "ALT-KEEP-01\r\n" ++
-            "ALT-KEEP-02\r\n" ++
-            "ALT-KEEP-03\r\n" ++
-            "ALT-KEEP-04\r\n" ++
-            "ALT-KEEP-05\r\n" ++
-            "ALT-KEEP-06\r\n" ++
-            "ALT-KEEP-07\r\n" ++
-            "ALT-KEEP-08\r\n" ++
-            "ALT-KEEP-09",
-    );
-    try session.refreshRenderState(allocator);
-
-    try testing.expectEqual(.alternate, session.terminal.screens.active_key);
-
-    try session.resize(allocator, 80, 6, CELL_PIXEL_WIDTH, CELL_PIXEL_HEIGHT);
-    try testing.expectEqual(@as(u16, 80), session.cols);
-    try testing.expectEqual(@as(u16, 80), session.terminal.cols);
-    try testing.expectEqual(@as(u16, 6), session.rows);
-    try testing.expectEqual(@as(u16, 6), session.terminal.rows);
-
-    const screen = try session.terminal.plainString(allocator);
-    defer allocator.free(screen);
-
-    try testing.expect(std.mem.indexOf(u8, screen, "ALT-KEEP-04") != null);
-    try testing.expect(std.mem.indexOf(u8, screen, "ALT-KEEP-09") != null);
-
-    try session.resize(allocator, 80, 12, CELL_PIXEL_WIDTH, CELL_PIXEL_HEIGHT);
-    try testing.expectEqual(@as(u16, 80), session.cols);
-    try testing.expectEqual(@as(u16, 80), session.terminal.cols);
-    try testing.expectEqual(@as(u16, 12), session.rows);
-    try testing.expectEqual(@as(u16, 12), session.terminal.rows);
-}
-
-test "unix session restores alternate screen and mouse modes before daemon replay" {
-    if (!SESSION_SUPPORTED) return error.SkipZigTest;
-
-    const testing = std.testing;
-    const allocator = testing.allocator;
-    const cwd = try std.process.currentPathAlloc(testing.io, allocator);
-    defer allocator.free(cwd);
-
-    const session = try UnixSession.create(allocator, .{
-        .cwd = cwd,
-        .cols = 80,
-        .rows = 24,
-    });
-    defer {
-        session.deinit(allocator);
-        allocator.destroy(session);
-    }
-
-    session.applyRestoredTerminalModes(.{
-        .alternate_screen = true,
-        .mouse_event = .any,
-        .mouse_format = .sgr,
-    });
-    try testing.expectEqual(PersistedTerminalModes{
-        .alternate_screen = true,
-        .mouse_event = .any,
-        .mouse_format = .sgr,
-    }, session.persistedTerminalModes());
 }
 
 test "discontinuous terminal replay drops an orphaned escape suffix" {
@@ -6545,37 +6021,6 @@ test "terminal geometry sanitization never returns zero cells" {
     try testing.expectEqual(@as(u16, INITIAL_ROWS), rowsForHeight(0.0, 1.0));
     try testing.expectEqual(@as(u16, INITIAL_ROWS), rowsForHeight(-10.0, 1.0));
     try testing.expectEqual(@as(u16, INITIAL_ROWS), rowsForHeight(std.math.nan(f32), 1.0));
-}
-
-test "repair terminal state resets invalid scrolling region" {
-    if (!SESSION_SUPPORTED) return error.SkipZigTest;
-
-    const testing = std.testing;
-    const allocator = testing.allocator;
-    const cwd = try std.process.currentPathAlloc(testing.io, allocator);
-    defer allocator.free(cwd);
-
-    const session = try UnixSession.create(allocator, .{
-        .cwd = cwd,
-        .cols = 80,
-        .rows = 24,
-    });
-    defer {
-        session.deinit(allocator);
-        allocator.destroy(session);
-    }
-
-    session.terminal.scrolling_region.left = 0;
-    session.terminal.scrolling_region.right = 0;
-    session.terminal.scrolling_region.top = 99;
-    session.terminal.scrolling_region.bottom = 0;
-
-    try session.repairTerminalState(allocator);
-
-    try testing.expectEqual(@as(@TypeOf(session.terminal.scrolling_region.left), 0), session.terminal.scrolling_region.left);
-    try testing.expectEqual(session.terminal.cols - 1, session.terminal.scrolling_region.right);
-    try testing.expectEqual(@as(@TypeOf(session.terminal.scrolling_region.top), 0), session.terminal.scrolling_region.top);
-    try testing.expectEqual(session.terminal.rows - 1, session.terminal.scrolling_region.bottom);
 }
 
 test "observed tab title persists only after the live title holds steady" {

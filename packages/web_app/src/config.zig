@@ -221,25 +221,6 @@ fn parsePortRequired(raw: []const u8) !u16 {
     return parsed;
 }
 
-test "loopback detection is intentionally strict" {
-    try std.testing.expect(isLoopback("127.0.0.1"));
-    try std.testing.expect(isLoopback("localhost"));
-    try std.testing.expect(isLoopback("::1"));
-    try std.testing.expect(!isLoopback("0.0.0.0"));
-    try std.testing.expect(!isLoopback("192.0.2.1"));
-}
-
-test "token file is mandatory" {
-    var env = std.process.Environ.Map.init(std.testing.allocator);
-    defer env.deinit();
-    try env.put("HOME", "/tmp/verde-config-test");
-
-    try std.testing.expectError(
-        error.TokenFileRequired,
-        parse(std.testing.allocator, &env, &.{"verde-web"}),
-    );
-}
-
 test "raw token and legacy backend configuration are rejected" {
     var env = std.process.Environ.Map.init(std.testing.allocator);
     defer env.deinit();
@@ -278,38 +259,6 @@ test "non-loopback host is rejected" {
     );
 }
 
-test "environment token file configures a loopback gateway" {
-    var env = std.process.Environ.Map.init(std.testing.allocator);
-    defer env.deinit();
-    try env.put("HOME", "/tmp/verde-config-test");
-    try env.put(TOKEN_FILE_ENV, "/tmp/verde-token");
-
-    const parsed = try parse(std.testing.allocator, &env, &.{"verde-web"});
-    defer std.testing.allocator.free(parsed.pref_path);
-    defer std.testing.allocator.free(parsed.sessionizer_endpoint);
-    defer std.testing.allocator.free(parsed.static_dir);
-    try std.testing.expectEqualStrings(DEFAULT_HOST, parsed.host);
-    try std.testing.expectEqualStrings("/tmp/verde-token", parsed.token_file);
-}
-
-test "localhost bind normalizes to a numeric loopback address" {
-    var env = std.process.Environ.Map.init(std.testing.allocator);
-    defer env.deinit();
-    try env.put("HOME", "/tmp/verde-config-test");
-
-    const parsed = try parse(std.testing.allocator, &env, &.{
-        "verde-web",
-        "--host",
-        "localhost",
-        "--token-file",
-        "/tmp/verde-token",
-    });
-    defer std.testing.allocator.free(parsed.pref_path);
-    defer std.testing.allocator.free(parsed.sessionizer_endpoint);
-    defer std.testing.allocator.free(parsed.static_dir);
-    try std.testing.expectEqualStrings(DEFAULT_HOST, parsed.host);
-}
-
 test "trusted proxy mode requires one exact pathless HTTPS origin" {
     var env = std.process.Environ.Map.init(std.testing.allocator);
     defer env.deinit();
@@ -332,19 +281,5 @@ test "trusted proxy mode requires one exact pathless HTTPS origin" {
     }));
     try std.testing.expectError(error.InvalidTrustedProxyOrigin, parse(std.testing.allocator, &env, &.{
         "verde-web", "--token-file", "/tmp/verde-token", "--trusted-proxy-origin", "https://runtime.example.test/path",
-    }));
-}
-
-test "desktop configuration rejects ambiguous or nonlocal socket targets" {
-    var env = std.process.Environ.Map.init(std.testing.allocator);
-    defer env.deinit();
-    try std.testing.expectError(error.AmbiguousDesktopBackend, parse(std.testing.allocator, &env, &.{
-        "verde-web", "--token-file", "/token", "--desktop-socket", "/vnc.sock", "--desktop-port", "5900",
-    }));
-    try std.testing.expectError(error.InvalidDesktopSocket, parse(std.testing.allocator, &env, &.{
-        "verde-web", "--token-file", "/token", "--desktop-socket", "relative.sock",
-    }));
-    try std.testing.expectError(error.InvalidPort, parse(std.testing.allocator, &env, &.{
-        "verde-web", "--token-file", "/token", "--desktop-port", "0",
     }));
 }

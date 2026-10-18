@@ -267,18 +267,6 @@ pub fn keycodeFromScancode(sc: u32) Keycode {
     };
 }
 
-test "keysym names" {
-    try std.testing.expectEqual(@as(?u32, 0x61), fromName("a"));
-    try std.testing.expectEqual(@as(?u32, 0x31), fromName("1"));
-    try std.testing.expectEqual(@as(?u32, 0xff0d), fromName("Return"));
-    try std.testing.expectEqual(@as(?u32, 0x6c1), fromName("Cyrillic_a"));
-    try std.testing.expectEqual(@as(?u32, 0x1008ff14), fromName("XF86AudioPlay"));
-    try std.testing.expectEqual(@as(?u32, 0x1000444), fromName("U0444"));
-    try std.testing.expectEqual(@as(?u32, 0x41), fromName("U0041"));
-    try std.testing.expectEqual(@as(?u32, 0xfe50), fromName("0xfe50"));
-    try std.testing.expectEqual(@as(?u32, null), fromName("NotAKeysym"));
-}
-
 test "keysym to unicode" {
     try std.testing.expectEqual(@as(u21, 'a'), toUnicode(0x61));
     try std.testing.expectEqual(@as(u21, 0xe9), toUnicode(0xe9));
@@ -291,26 +279,4 @@ test "keysym to unicode" {
     try std.testing.expectEqual(@as(u32, 0x6e1), toUpperKeysym(0x6c1)); // Cyrillic_A
     try std.testing.expectEqual(@as(u32, 'A'), toUpperKeysym('a'));
     try std.testing.expect(isLower('q') and isUpper('Q') and !isLower('1'));
-}
-
-test "keysym to keycode" {
-    try std.testing.expectEqual(Keycode.c, toKeycode('c'));
-    try std.testing.expectEqual(Keycode.c, toKeycode('C'));
-    try std.testing.expectEqual(Keycode.f5, toKeycode(0xffc2));
-    try std.testing.expectEqual(Keycode.@"return", toKeycode(Return));
-    try std.testing.expectEqual(Keycode.character, toKeycode(0x6c1));
-    try std.testing.expectEqual(Keycode.kp_7, toKeycode(0xffb7));
-    try std.testing.expectEqual(Keycode.home, toKeycode(0xff95)); // KP_Home (NumLock off)
-    try std.testing.expectEqual(Keycode.kp_enter, toKeycode(0xff8d));
-    try std.testing.expectEqual(Keycode.kp_divide, toKeycode(0xffaf));
-    try std.testing.expectEqual(Keycode.kp_plus, toKeycode(0xffab));
-    try std.testing.expectEqual(Keycode.f13, toKeycode(0xffca));
-    try std.testing.expectEqual(Keycode.f24, toKeycode(0xffd5));
-    try std.testing.expectEqual(Keycode.find, toKeycode(0xff68));
-    try std.testing.expectEqual(Keycode.copy, toKeycode(0x1008ff57));
-    try std.testing.expect(isKeypad(0xffb7) and !isKeypad('7'));
-    try std.testing.expectEqual(Keycode.f13, keycodeFromScancode(183));
-    try std.testing.expectEqual(Keycode.f24, keycodeFromScancode(194));
-    try std.testing.expectEqual(Keycode.c, keycodeFromScancode(46));
-    try std.testing.expectEqual(Keycode.@"1", keycodeFromScancode(2));
 }

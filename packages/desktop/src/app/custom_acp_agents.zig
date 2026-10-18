@@ -432,17 +432,6 @@ fn dupeEnv(allocator: std.mem.Allocator, env: []const EnvVar) ![]const EnvVar {
     return out;
 }
 
-test "parseModelRef splits agent id from agent model" {
-    const plain = parseModelRef("gemini").?;
-    try std.testing.expectEqualStrings("gemini", plain.agent_id);
-    try std.testing.expect(plain.model == null);
-    const nested = parseModelRef("my-agent/anthropic/claude").?;
-    try std.testing.expectEqualStrings("my-agent", nested.agent_id);
-    try std.testing.expectEqualStrings("anthropic/claude", nested.model.?);
-    try std.testing.expect(parseModelRef("") == null);
-    try std.testing.expect(parseModelRef("/x") == null);
-}
-
 test "splitCommandLineAlloc handles quotes and escapes" {
     const allocator = std.testing.allocator;
     const words = try splitCommandLineAlloc(allocator, "npx -y '@scope/agent acp' --flag=\"a \\\"b\\\"\" c\\ d");

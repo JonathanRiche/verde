@@ -243,8 +243,6 @@ Verification after `mise run web-app`:
 python3 scripts/remote-desktop/gateway-test.py
 python3 scripts/remote-desktop/omarchy_test.py
 bash scripts/remote-desktop/macos-screen-sharing-test.sh
-# Optional, with agent-browser on PATH and a workspace browser lease:
-python3 scripts/remote-desktop/browser-test.py
 ```
 
 Tests use temporary state and synthetic RFB, never the user's desktop or daemon.

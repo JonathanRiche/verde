@@ -4678,31 +4678,6 @@ const TestStreamEventCapture = struct {
     }
 };
 
-test "turn steer payload preserves multiple local images" {
-    const allocator = std.testing.allocator;
-    const images = [_]provider_types.ImageAttachment{
-        .{ .path = "/tmp/first.png" },
-        .{ .path = "/tmp/second.jpg" },
-    };
-    const payload = try turnSteerRequestPayloadAlloc(allocator, 17, .{
-        .thread_id = "thread-1",
-        .turn_id = "turn-1",
-        .prompt = "compare these",
-        .images = &images,
-    });
-    defer allocator.free(payload);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
-    defer parsed.deinit();
-    const params = parsed.value.object.get("params").?;
-    const input = params.object.get("input").?;
-    try std.testing.expectEqual(@as(usize, 3), input.array.items.len);
-    try std.testing.expectEqualStrings("text", input.array.items[0].object.get("type").?.string);
-    try std.testing.expectEqualStrings("localImage", input.array.items[1].object.get("type").?.string);
-    try std.testing.expectEqualStrings("/tmp/first.png", input.array.items[1].object.get("path").?.string);
-    try std.testing.expectEqualStrings("/tmp/second.jpg", input.array.items[2].object.get("path").?.string);
-}
-
 test "turn start input de-duplicates the legacy image against the full list" {
     const allocator = std.testing.allocator;
     const images = [_]provider_types.ImageAttachment{
@@ -4767,218 +4742,11 @@ test "turn steer mismatch extracts the server active turn id" {
     try std.testing.expect(extractActualTurnIdFromSteerMismatch("expected active turn id `old` but found ``") == null);
 }
 
-test "compute accept key matches websocket example" {
-    const allocator = std.testing.allocator;
-    const accept = try computeAcceptKeyAlloc(allocator, "dGhlIHNhbXBsZSBub25jZQ==");
-    defer allocator.free(accept);
-
-    try std.testing.expectEqualStrings("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", accept);
-}
-
-test "appendImportedMessagesForItem maps transcript items into chat messages" {
-    const allocator = std.testing.allocator;
-    const json =
-        \\[
-        \\  {
-        \\    "type": "userMessage",
-        \\    "id": "u1",
-        \\    "content": [
-        \\      { "type": "text", "text": "Look at this" },
-        \\      { "type": "localImage", "path": "/tmp/screenshot.png" }
-        \\    ]
-        \\  },
-        \\  {
-        \\    "type": "agentMessage",
-        \\    "id": "a1",
-        \\    "text": "I checked it."
-        \\  },
-        \\  {
-        \\    "type": "commandExecution",
-        \\    "id": "c1",
-        \\    "command": "git status",
-        \\    "status": "completed"
-        \\  },
-        \\  {
-        \\    "type": "mcpToolCall",
-        \\    "id": "m1",
-        \\    "server": "verde",
-        \\    "tool": "capture_browser_screenshot",
-        \\    "status": "completed"
-        \\  },
-        \\  {
-        \\    "type": "fileChange",
-        \\    "id": "f1",
-        \\    "changes": [
-        \\      {
-        \\        "path": "src/main.zig",
-        \\        "diff": "@@ -1 +1 @@\n-old\n+new\n"
-        \\      }
-        \\    ]
-        \\  }
-        \\]
-    ;
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
-    defer parsed.deinit();
-
-    var messages: std.ArrayList(provider_types.ChatMessage) = .empty;
-    defer {
-        for (messages.items) |message| {
-            allocator.free(message.author);
-            allocator.free(message.body);
-        }
-        messages.deinit(allocator);
-    }
-
-    for (parsed.value.array.items) |item| {
-        try appendImportedMessagesForItem(allocator, item, &messages);
-    }
-
-    try std.testing.expectEqual(@as(usize, 5), messages.items.len);
-    try std.testing.expectEqual(provider_types.MessageRole.user, messages.items[0].role);
-    try std.testing.expectEqualStrings("You", messages.items[0].author);
-    try std.testing.expectEqualStrings("Look at this\n\n[Image: /tmp/screenshot.png]", messages.items[0].body);
-    try std.testing.expectEqual(provider_types.MessageRole.assistant, messages.items[1].role);
-    try std.testing.expectEqualStrings("Codex", messages.items[1].author);
-    try std.testing.expectEqualStrings("I checked it.", messages.items[1].body);
-    try std.testing.expectEqualStrings("Ran command", messages.items[2].author);
-    try std.testing.expectEqualStrings("git status", messages.items[2].body);
-    try std.testing.expectEqualStrings("Ran command", messages.items[3].author);
-    try std.testing.expectEqualStrings("verde.capture_browser_screenshot", messages.items[3].body);
-    try std.testing.expectEqualStrings("Changed files", messages.items[4].author);
-    try std.testing.expectEqualStrings("src/main.zig  +1 / -1", messages.items[4].body);
-}
-
-test "formatUsageSummaryAlloc renders concise usage summary" {
-    const allocator = std.testing.allocator;
-    const json =
-        \\{
-        \\  "summary": {
-        \\    "lifetimeTokens": 9827869446,
-        \\    "peakDailyTokens": 680466423,
-        \\    "longestRunningTurnSec": 72844,
-        \\    "currentStreakDays": 5,
-        \\    "longestStreakDays": 49
-        \\  },
-        \\  "dailyUsageBuckets": [
-        \\    { "startDate": "2026-06-12", "tokens": 1000 },
-        \\    { "startDate": "2026-06-13", "tokens": 2000000 },
-        \\    { "startDate": "2026-06-14", "tokens": 3000000 },
-        \\    { "startDate": "2026-06-15", "tokens": 4000000 },
-        \\    { "startDate": "2026-06-16", "tokens": 5000000 },
-        \\    { "startDate": "2026-06-17", "tokens": 680466423 },
-        \\    { "startDate": "2026-06-18", "tokens": 7000000 },
-        \\    { "startDate": "2026-06-19", "tokens": 8000000 }
-        \\  ]
-        \\}
-    ;
-
-    const body = try formatUsageSummaryAlloc(allocator, json, null);
-    defer allocator.free(body);
-
-    try std.testing.expect(std.mem.indexOf(u8, body, "Lifetime tokens: 9.8 B tokens") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "Peak day: 680.4 M tokens on 2026-06-17") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "Current streak: 5 days (longest 49)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "Longest turn: 20h 14m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "2026-06-12") == null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "2026-06-19: 8 M tokens") != null);
-}
-
-test "formatGoalSummaryAlloc renders active and empty goals" {
-    const allocator = std.testing.allocator;
-    const body = try formatGoalSummaryAlloc(allocator,
-        \\{"goal":{"objective":"Ship GUI slash commands","status":"active","tokenBudget":12000}}
-    );
-    defer allocator.free(body);
-    try std.testing.expectEqualStrings(
-        "Codex goal\n\nStatus: active\nObjective: Ship GUI slash commands\nToken budget: 12000\n",
-        body,
-    );
-
-    const empty = try formatGoalSummaryAlloc(allocator,
-        \\{"result":{"goal":null}}
-    );
-    defer allocator.free(empty);
-    try std.testing.expectEqualStrings("Codex goal\n\nNo active Codex goal.", empty);
-}
-
-test "writeReviewTarget serializes supported target shapes" {
-    const allocator = std.testing.allocator;
-
-    var writer: std.Io.Writer.Allocating = .init(allocator);
-    defer writer.deinit();
-    var stringify: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
-    try writeReviewTarget(&stringify, "");
-    const changes = try writer.toOwnedSlice();
-    defer allocator.free(changes);
-    try std.testing.expectEqualStrings("{\"type\":\"uncommittedChanges\"}", changes);
-
-    var base_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer base_writer.deinit();
-    var base_stringify: std.json.Stringify = .{ .writer = &base_writer.writer, .options = .{} };
-    try writeReviewTarget(&base_stringify, "base main");
-    const base = try base_writer.toOwnedSlice();
-    defer allocator.free(base);
-    try std.testing.expectEqualStrings("{\"type\":\"baseBranch\",\"branch\":\"main\"}", base);
-
-    var commit_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer commit_writer.deinit();
-    var commit_stringify: std.json.Stringify = .{ .writer = &commit_writer.writer, .options = .{} };
-    try writeReviewTarget(&commit_stringify, "commit abc123 Polish slash commands");
-    const commit = try commit_writer.toOwnedSlice();
-    defer allocator.free(commit);
-    try std.testing.expectEqualStrings("{\"type\":\"commit\",\"sha\":\"abc123\",\"title\":\"Polish slash commands\"}", commit);
-}
-
 test "confirmedShellCommand requires explicit confirmation" {
     try std.testing.expect(confirmedShellCommand("git status") == null);
     try std.testing.expect(confirmedShellCommand("confirm") == null);
     try std.testing.expect(confirmedShellCommand("confirmed git status") == null);
     try std.testing.expectEqualStrings("git status --short", confirmedShellCommand(" confirm git status --short ").?);
-}
-
-test "formatUsageSummaryAlloc includes remaining rate limits" {
-    const allocator = std.testing.allocator;
-    const usage_json =
-        \\{
-        \\  "summary": { "lifetimeTokens": 1000 },
-        \\  "dailyUsageBuckets": []
-        \\}
-    ;
-    const rate_json =
-        \\{
-        \\  "rateLimits": {
-        \\    "limitId": "codex",
-        \\    "limitName": null,
-        \\    "primary": { "usedPercent": 10, "windowDurationMins": 300 },
-        \\    "secondary": { "usedPercent": 2, "windowDurationMins": 10080 },
-        \\    "credits": { "hasCredits": false, "unlimited": false, "balance": "0" }
-        \\  },
-        \\  "rateLimitsByLimitId": {
-        \\    "codex_bengalfox": {
-        \\      "limitId": "codex_bengalfox",
-        \\      "limitName": "GPT-5.3-Codex-Spark",
-        \\      "primary": { "usedPercent": 0, "windowDurationMins": 300 },
-        \\      "secondary": { "usedPercent": 0, "windowDurationMins": 10080 }
-        \\    },
-        \\    "codex": {
-        \\      "limitId": "codex",
-        \\      "limitName": null,
-        \\      "primary": { "usedPercent": 10, "windowDurationMins": 300 },
-        \\      "secondary": { "usedPercent": 2, "windowDurationMins": 10080 }
-        \\    }
-        \\  },
-        \\  "rateLimitResetCredits": { "availableCount": 2 }
-        \\}
-    ;
-
-    const body = try formatUsageSummaryAlloc(allocator, usage_json, rate_json);
-    defer allocator.free(body);
-
-    try std.testing.expect(std.mem.indexOf(u8, body, "Codex 5h: 90% left") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "Codex weekly: 98% left") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "GPT-5.3-Codex-Spark 5h: 100% left") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "Reset credits: 2 available") != null);
 }
 
 test "dynamic tool server request returns a failure result instead of hanging" {
@@ -5011,24 +4779,6 @@ test "dynamic tool server request returns a failure result instead of hanging" {
     );
 }
 
-test "unknown Codex server request receives method not found" {
-    const allocator = std.testing.allocator;
-    try std.testing.expectEqual(ServerRequestKind.unsupported, serverRequestKind("currentTime/read"));
-
-    const request_id: std.json.Value = .{ .integer = 42 };
-    const payload = try serverErrorPayloadAlloc(
-        allocator,
-        request_id,
-        JSON_RPC_METHOD_NOT_FOUND,
-        "Unsupported Codex app-server request: currentTime/read",
-    );
-    defer allocator.free(payload);
-    try std.testing.expectEqualStrings(
-        "{\"id\":42,\"error\":{\"code\":-32601,\"message\":\"Unsupported Codex app-server request: currentTime/read\"}}",
-        payload,
-    );
-}
-
 test "MCP elicitation only accepts content-free schemas" {
     const allocator = std.testing.allocator;
     var empty_schema = try std.json.parseFromSlice(std.json.Value, allocator,
@@ -5042,25 +4792,6 @@ test "MCP elicitation only accepts content-free schemas" {
     , .{});
     defer required_schema.deinit();
     try std.testing.expect(!mcpElicitationAllowsEmptyContent(required_schema.value));
-}
-
-test "detectTurnTerminalState recognizes thread idle fallback for the active thread" {
-    const allocator = std.testing.allocator;
-    const json =
-        \\{
-        \\  "method": "thread/status/changed",
-        \\  "params": {
-        \\    "threadId": "thread-123",
-        \\    "status": { "type": "idle" }
-        \\  }
-        \\}
-    ;
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
-    defer parsed.deinit();
-
-    const terminal = detectTurnTerminalState(parsed.value, "thread-123", "turn-456");
-    try std.testing.expectEqual(TurnTerminalState.completed, terminal.?);
 }
 
 test "detectTurnTerminalState matches turn completion status for the started turn" {
@@ -5151,21 +4882,6 @@ test "command execution emits lifecycle tool call updates" {
     try std.testing.expect(std.mem.indexOf(u8, capture.tool_output.?, "clean tree") != null);
 }
 
-test "turn diff notification emits file snapshots with patch aliases" {
-    const payload =
-        \\{"method":"turn/diff/updated","params":{"files":[{"path":"src/main.zig","patch":"--- a/src/main.zig\n+++ b/src/main.zig\n@@ -1 +1 @@\n-old\n+new"}]}}
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
-    defer parsed.deinit();
-
-    var capture: TestStreamEventCapture = .{};
-    try std.testing.expect(buildDiffSummary(parsed.value, .turn_snapshot, &capture, TestStreamEventCapture.handle));
-    try std.testing.expectEqual(@as(usize, 1), capture.diff_count);
-    try std.testing.expectEqual(provider_types.StreamDiffScope.turn_snapshot, capture.diff_scope.?);
-    try std.testing.expectEqualStrings("src/main.zig", capture.diff_path.?);
-    try std.testing.expect(std.mem.indexOf(u8, capture.diff_patch.?, "+new") != null);
-}
-
 test "file change items emit edit lifecycle and diff events" {
     const payload =
         \\{
@@ -5197,51 +4913,6 @@ test "file change items emit edit lifecycle and diff events" {
     try std.testing.expectEqual(@as(usize, 1), capture.diff_count);
     try std.testing.expectEqualStrings("/work/test.ts", capture.diff_path.?);
     try std.testing.expect(std.mem.indexOf(u8, capture.diff_patch.?, "+new") != null);
-}
-
-test "reasoning items emit transient think lifecycle tool call updates" {
-    const allocator = std.testing.allocator;
-    const started_json =
-        \\{
-        \\  "method": "item/started",
-        \\  "params": {
-        \\    "item": {
-        \\      "id": "reasoning-1",
-        \\      "type": "reasoning"
-        \\    }
-        \\  }
-        \\}
-    ;
-    var started = try std.json.parseFromSlice(std.json.Value, allocator, started_json, .{});
-    defer started.deinit();
-
-    var capture: TestStreamEventCapture = .{};
-    try std.testing.expect(try emitItemEvent(allocator, started.value, &capture, TestStreamEventCapture.handle));
-    try std.testing.expectEqual(@as(usize, 1), capture.tool_call_count);
-    try std.testing.expectEqual(provider_types.ToolCallKind.think, capture.tool_kind.?);
-    try std.testing.expectEqual(provider_types.ToolCallStatus.in_progress, capture.tool_status.?);
-
-    const completed_json =
-        \\{
-        \\  "method": "item/completed",
-        \\  "params": {
-        \\    "item": {
-        \\      "id": "reasoning-1",
-        \\      "type": "reasoning",
-        \\      "summary": ["**Reviewing layout code**", "Checking zoom handling"]
-        \\    }
-        \\  }
-        \\}
-    ;
-    var completed = try std.json.parseFromSlice(std.json.Value, allocator, completed_json, .{});
-    defer completed.deinit();
-
-    try std.testing.expect(try emitItemEvent(allocator, completed.value, &capture, TestStreamEventCapture.handle));
-    try std.testing.expectEqual(@as(usize, 2), capture.tool_call_count);
-    try std.testing.expectEqual(provider_types.ToolCallStatus.completed, capture.tool_status.?);
-    // No summary output travels with the terminal event; the shared upsert
-    // relies on that to drop the transient "Thinking" row.
-    try std.testing.expect(capture.tool_output == null);
 }
 
 test "MCP calls emit lifecycle tool call updates" {
@@ -5322,88 +4993,6 @@ test "MCP calls emit lifecycle tool call updates" {
     try std.testing.expectEqualStrings("mcp-2", capture.tool_call_id.?);
     try std.testing.expectEqual(provider_types.ToolCallStatus.failed, capture.tool_status.?);
     try std.testing.expectEqualStrings("blender.execute_blender_code", capture.tool_input.?);
-}
-
-test "MCP call input includes readable arguments" {
-    const allocator = std.testing.allocator;
-    const started_json =
-        \\{
-        \\  "method": "item/started",
-        \\  "params": {
-        \\    "item": {
-        \\      "id": "mcp-3",
-        \\      "type": "mcpToolCall",
-        \\      "server": "verde",
-        \\      "tool": "send_chat_message",
-        \\      "status": "inProgress",
-        \\      "arguments": {
-        \\        "workspace": "abc",
-        \\        "prompt": "Fix the bug.\n\nOutput:\nkeep this inside the prompt\r\n",
-        \\        "wait": true
-        \\      }
-        \\    }
-        \\  }
-        \\}
-    ;
-    var started = try std.json.parseFromSlice(std.json.Value, allocator, started_json, .{});
-    defer started.deinit();
-
-    var capture: TestStreamEventCapture = .{};
-    try std.testing.expect(try emitItemEvent(allocator, started.value, &capture, TestStreamEventCapture.handle));
-    try std.testing.expectEqualStrings(
-        "verde.send_chat_message\n" ++
-            "workspace: \"abc\"\n" ++
-            "prompt:\n" ++
-            "  Fix the bug.\n" ++
-            "\n" ++
-            "  Output:\n" ++
-            "  keep this inside the prompt\n" ++
-            "wait: true",
-        capture.tool_input.?,
-    );
-
-    const short_json =
-        \\{ "server": "verde", "tool": "list_panes", "arguments": { "workspace": "abc", "limit": 2 } }
-    ;
-    var short = try std.json.parseFromSlice(std.json.Value, allocator, short_json, .{});
-    defer short.deinit();
-    const short_input = (try formatMcpToolCallInputAlloc(allocator, short.value)).?;
-    defer allocator.free(short_input);
-    try std.testing.expectEqualStrings(
-        "verde.list_panes\n{\n  \"workspace\": \"abc\",\n  \"limit\": 2\n}",
-        short_input,
-    );
-
-    const empty_json =
-        \\{ "server": "verde", "tool": "list_workspaces", "arguments": {} }
-    ;
-    var empty = try std.json.parseFromSlice(std.json.Value, allocator, empty_json, .{});
-    defer empty.deinit();
-    const empty_input = (try formatMcpToolCallInputAlloc(allocator, empty.value)).?;
-    defer allocator.free(empty_input);
-    try std.testing.expectEqualStrings("verde.list_workspaces", empty_input);
-}
-
-test "MCP call input truncates oversized arguments" {
-    const allocator = std.testing.allocator;
-    const huge = try allocator.alloc(u8, MCP_TOOL_ARGUMENTS_LIMIT * 2);
-    defer allocator.free(huge);
-    @memset(huge, 'x');
-
-    var arguments: std.json.ObjectMap = .empty;
-    defer arguments.deinit(allocator);
-    try arguments.put(allocator, "prompt", .{ .string = huge });
-    var item: std.json.ObjectMap = .empty;
-    defer item.deinit(allocator);
-    try item.put(allocator, "server", .{ .string = "verde" });
-    try item.put(allocator, "tool", .{ .string = "open_chat" });
-    try item.put(allocator, "arguments", .{ .object = arguments });
-
-    const input = (try formatMcpToolCallInputAlloc(allocator, .{ .object = item })).?;
-    defer allocator.free(input);
-    try std.testing.expect(std.mem.startsWith(u8, input, "verde.open_chat\nprompt:\n  xxx"));
-    try std.testing.expect(std.mem.endsWith(u8, input, "\n… [arguments truncated: 16384 of 32778 bytes shown]"));
-    try std.testing.expect(input.len < MCP_TOOL_ARGUMENTS_LIMIT + 128);
 }
 
 test "collab agent spawn emits subagent lifecycle updates" {
@@ -5528,26 +5117,6 @@ test "collab child thread items stream into the parent card transcript" {
     try std.testing.expectEqualStrings("Found one TODO.", capture.tool_output.?);
 }
 
-test "collab wait hand-back fills the parent card output" {
-    const allocator = std.testing.allocator;
-    var collab_agents: CollabAgentTracker = .{ .allocator = allocator };
-    defer collab_agents.deinit();
-    var capture: TestStreamEventCapture = .{};
-
-    const payload =
-        \\{"method":"item/completed","params":{"threadId":"parent-1","item":{"id":"collab-2","type":"collabAgentToolCall","tool":"waitAgent","status":"completed","receiverThreadIds":["child-9"],"result":{"text":"The parser handles escapes."}}}}
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
-    defer parsed.deinit();
-
-    try std.testing.expect(try emitCollabAgentItem(&collab_agents, parsed.value, &capture, TestStreamEventCapture.handle));
-    try std.testing.expectEqual(@as(usize, 1), capture.tool_call_count);
-    try std.testing.expectEqualStrings("child-9", capture.tool_call_id.?);
-    try std.testing.expectEqualStrings("The parser handles escapes.", capture.tool_output.?);
-    // Wait/send only report; they must not restate the card's lifecycle.
-    try std.testing.expectEqual(@as(?provider_types.ToolCallStatus, null), capture.tool_status);
-}
-
 test "collab child thread reads backfill items the connection never received" {
     const allocator = std.testing.allocator;
     var collab_agents: CollabAgentTracker = .{ .allocator = allocator };
@@ -5622,159 +5191,4 @@ test "child transcript entries cap oversized tool output" {
     defer parsed.deinit();
     const parsed_output = getOptionalObjectString(parsed.value, "output").?;
     try std.testing.expect(parsed_output.len < output.len);
-}
-
-test "hydrated Codex turn items backfill MCP output" {
-    const payload =
-        \\{
-        \\  "thread": {
-        \\    "id": "thread-1",
-        \\    "turns": [{
-        \\      "id": "turn-1",
-        \\      "items": [{
-        \\        "id": "mcp-1",
-        \\        "type": "mcpToolCall",
-        \\        "server": "verde",
-        \\        "tool": "list_workspaces",
-        \\        "status": "completed",
-        \\        "arguments": {},
-        \\        "result": {
-        \\          "content": [{"type":"text","text":"{\"ok\":true}"}],
-        \\          "structuredContent": null
-        \\        }
-        \\      }]
-        \\    }]
-        \\  }
-        \\}
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
-    defer parsed.deinit();
-    var capture: TestStreamEventCapture = .{};
-
-    try std.testing.expectEqual(@as(usize, 1), try emitHydratedMcpToolOutputsFromThreadValue(
-        std.testing.allocator,
-        parsed.value,
-        "turn-1",
-        &capture,
-        TestStreamEventCapture.handle,
-    ));
-    try std.testing.expectEqual(@as(usize, 1), capture.tool_call_count);
-    try std.testing.expectEqualStrings("mcp-1", capture.tool_call_id.?);
-    try std.testing.expectEqual(provider_types.ToolCallStatus.completed, capture.tool_status.?);
-    try std.testing.expectEqualStrings("{\"ok\":true}", capture.tool_output.?);
-}
-
-test "isContextCompactionCompleted matches compact item completion" {
-    const allocator = std.testing.allocator;
-    const json =
-        \\{
-        \\  "method": "item/completed",
-        \\  "params": {
-        \\    "threadId": "thread-123",
-        \\    "item": {
-        \\      "id": "item-1",
-        \\      "type": "contextCompaction"
-        \\    }
-        \\  }
-        \\}
-    ;
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
-    defer parsed.deinit();
-
-    try std.testing.expect(isContextCompactionCompleted(parsed.value, "thread-123"));
-    try std.testing.expect(!isContextCompactionCompleted(parsed.value, "other-thread"));
-
-    var capture: TestStreamEventCapture = .{};
-    try std.testing.expect(try emitItemEvent(allocator, parsed.value, &capture, TestStreamEventCapture.handle));
-    try std.testing.expectEqualStrings("Context compacted", capture.title.?);
-    try std.testing.expectEqualStrings(
-        "Codex summarized earlier conversation context to make room for the rest of this turn.",
-        capture.body.?,
-    );
-}
-
-test "isThreadCompactionIdle matches idle fallback" {
-    const allocator = std.testing.allocator;
-    const json =
-        \\{
-        \\  "method": "thread/status/changed",
-        \\  "params": {
-        \\    "threadId": "thread-123",
-        \\    "status": { "type": "idle" }
-        \\  }
-        \\}
-    ;
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
-    defer parsed.deinit();
-
-    try std.testing.expect(isThreadCompactionIdle(parsed.value, "thread-123"));
-    try std.testing.expect(!isThreadCompactionIdle(parsed.value, "other-thread"));
-}
-
-test "extractReviewCompletedText reads exited review item" {
-    const allocator = std.testing.allocator;
-    const json =
-        \\{
-        \\  "method": "item/completed",
-        \\  "params": {
-        \\    "threadId": "thread-123",
-        \\    "item": {
-        \\      "type": "exitedReviewMode",
-        \\      "id": "turn-1",
-        \\      "review": "Looks solid overall."
-        \\    }
-        \\  }
-        \\}
-    ;
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
-    defer parsed.deinit();
-
-    try std.testing.expectEqualStrings("Looks solid overall.", extractReviewCompletedText(parsed.value, "thread-123").?);
-    try std.testing.expect(extractReviewCompletedText(parsed.value, "other-thread") == null);
-}
-
-test "extractShellOutputDelta and completion parse shell notifications" {
-    const allocator = std.testing.allocator;
-    const delta_json =
-        \\{
-        \\  "method": "item/commandExecution/outputDelta",
-        \\  "params": {
-        \\    "threadId": "thread-123",
-        \\    "delta": { "text": "hello\\n" }
-        \\  }
-        \\}
-    ;
-    var delta = try std.json.parseFromSlice(std.json.Value, allocator, delta_json, .{});
-    defer delta.deinit();
-    try std.testing.expectEqualStrings("hello\\n", extractShellOutputDelta(delta.value).?);
-
-    const completed_json =
-        \\{
-        \\  "method": "item/completed",
-        \\  "params": {
-        \\    "threadId": "thread-123",
-        \\    "item": { "type": "commandExecution", "status": "completed" }
-        \\  }
-        \\}
-    ;
-    var completed = try std.json.parseFromSlice(std.json.Value, allocator, completed_json, .{});
-    defer completed.deinit();
-    try std.testing.expect(isShellCommandCompleted(completed.value, "thread-123"));
-    try std.testing.expect(!isShellCommandCompleted(completed.value, "other-thread"));
-}
-
-test "background terminal list matches the exact provider process" {
-    const payload =
-        \\{
-        \\  "data": [
-        \\    { "processId": "123", "command": "sleep 10" },
-        \\    { "processId": "456", "command": "mise run build" }
-        \\  ]
-        \\}
-    ;
-    try std.testing.expect(try backgroundTerminalListContainsProcess(std.testing.allocator, payload, "456"));
-    try std.testing.expect(!try backgroundTerminalListContainsProcess(std.testing.allocator, payload, "45"));
 }

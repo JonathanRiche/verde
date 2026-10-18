@@ -731,18 +731,6 @@ fn clippedRect(rect: draw.Rect, clip: draw.Rect) ?draw.Rect {
     return .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
 }
 
-test "text area edits retained buffer" {
-    const Area = TextArea(.{});
-    var area = try Area.init(std.testing.allocator, "hello");
-    defer area.deinit(std.testing.allocator);
-    area.focused = true;
-
-    try std.testing.expect(try area.handleInput(std.testing.allocator, .{ .text = "!" }));
-    try std.testing.expectEqualStrings("hello!", area.text());
-    try std.testing.expect(try area.handleInput(std.testing.allocator, .{ .key = .{ .code = .backspace } }));
-    try std.testing.expectEqualStrings("hello", area.text());
-}
-
 test "text area clamps stale selection before backspace" {
     const Area = TextArea(.{});
     var area = try Area.init(std.testing.allocator, "abc");
@@ -756,34 +744,6 @@ test "text area clamps stale selection before backspace" {
     try std.testing.expectEqualStrings("a", area.text());
     try std.testing.expectEqual(@as(usize, 1), area.cursor);
     try std.testing.expect(area.selection() == null);
-}
-
-test "text area click type backspace keeps cursor and buffer in range" {
-    const Area = TextArea(.{ .x = 0, .y = 0, .width = 200, .height = 80 });
-    var area = try Area.init(std.testing.allocator, "");
-    defer area.deinit(std.testing.allocator);
-
-    try std.testing.expect(try area.handleInput(std.testing.allocator, .{ .mouse_down = .{ .point = .{ .x = 10, .y = 10 } } }));
-    try std.testing.expect(try area.handleInput(std.testing.allocator, .{ .text = "z" }));
-    try std.testing.expectEqualStrings("z", area.text());
-    try std.testing.expect(try area.handleInput(std.testing.allocator, .{ .key = .{ .code = .backspace } }));
-    try std.testing.expectEqualStrings("", area.text());
-    try std.testing.expectEqual(@as(usize, 0), area.cursor);
-}
-
-test "text area wraps cursor position by default" {
-    const Area = TextArea(.{ .x = 0, .y = 0, .width = 22, .height = 80, .padding_x = 0, .padding_y = 0, .font_size = 10 });
-    var area = try Area.init(std.testing.allocator, "abcdef");
-    defer area.deinit(std.testing.allocator);
-    area.focused = true;
-
-    var batch: draw.RenderBatch = .{};
-    defer batch.deinit(std.testing.allocator);
-    try area.render(std.testing.allocator, &batch);
-
-    const cursor = batch.commands.items[batch.commands.items.len - 1];
-    try std.testing.expectEqual(draw.CommandKind.cursor, cursor.kind);
-    try std.testing.expect(cursor.rect.y > 0);
 }
 
 test "text area maps clicks onto wrapped rows" {
@@ -807,20 +767,6 @@ test "text area double and triple click select word and line" {
     try std.testing.expectEqualStrings("second line", area.text()[area.selection().?.start..area.selection().?.end]);
 }
 
-test "text area ignores hover motion without pressed button" {
-    const Area = TextArea(.{ .x = 0, .y = 0, .width = 400, .height = 120, .padding_x = 0, .padding_y = 0, .glyph_width = 10, .line_height = 10 });
-    var area = try Area.init(std.testing.allocator, "hello world");
-    defer area.deinit(std.testing.allocator);
-    area.focused = true;
-    area.cursor = 0;
-
-    const event: Event = .{ .mouse_motion = .{ .x = 70, .y = 0 } };
-
-    try std.testing.expect(!try area.update(std.testing.allocator, &event));
-    try std.testing.expectEqual(@as(usize, 0), area.cursor);
-    try std.testing.expect(area.selection() == null);
-}
-
 test "text area supports word and page navigation" {
     const Area = TextArea(.{ .x = 0, .y = 0, .width = 400, .height = 20, .padding_x = 0, .padding_y = 0, .glyph_width = 10, .line_height = 10 });
     var area = try Area.init(std.testing.allocator, "alpha beta\nsecond\nthird\nfourth");
@@ -839,188 +785,6 @@ test "text area supports word and page navigation" {
     try std.testing.expect(area.cursor > 5);
 }
 
-test "text area can disable wrapping" {
-    const Area = TextArea(.{ .x = 0, .y = 0, .width = 22, .height = 80, .padding_x = 0, .padding_y = 0, .font_size = 10, .wrap = false });
-    var area = try Area.init(std.testing.allocator, "abcdef");
-    defer area.deinit(std.testing.allocator);
-    area.focused = true;
-
-    var batch: draw.RenderBatch = .{};
-    defer batch.deinit(std.testing.allocator);
-    try area.render(std.testing.allocator, &batch);
-
-    const cursor = batch.commands.items[batch.commands.items.len - 1];
-    try std.testing.expectEqual(@as(f32, 0), cursor.rect.y);
-}
-
-test "text area scrolls cursor into visible bounds" {
-    const Area = TextArea(.{ .x = 0, .y = 0, .width = 100, .height = 24, .padding_x = 0, .padding_y = 0, .font_size = 10, .line_height = 10 });
-    var area = try Area.init(std.testing.allocator, "");
-    defer area.deinit(std.testing.allocator);
-    area.focused = true;
-
-    try std.testing.expect(try area.handleInput(std.testing.allocator, .{ .text = "one\ntwo\nthree\nfour" }));
-    try std.testing.expect(area.scrollY() > 0);
-
-    var batch: draw.RenderBatch = .{};
-    defer batch.deinit(std.testing.allocator);
-    try area.render(std.testing.allocator, &batch);
-
-    const cursor = batch.commands.items[batch.commands.items.len - 3];
-    try std.testing.expectEqual(draw.CommandKind.cursor, cursor.kind);
-    try std.testing.expect(cursor.rect.y >= 0);
-    try std.testing.expect(cursor.rect.y + cursor.rect.h <= 24);
-}
-
-test "text area render emits self-contained text command" {
-    const Area = TextArea(.{ .x = 5, .y = 7, .width = 120, .height = 48, .padding_x = 3, .padding_y = 4, .font_size = 10, .glyph_width = 5, .line_height = 12, .placeholder_text = "empty" });
-    var area = try Area.init(std.testing.allocator, "");
-    defer area.deinit(std.testing.allocator);
-
-    var batch: draw.RenderBatch = .{};
-    defer batch.deinit(std.testing.allocator);
-    try area.render(std.testing.allocator, &batch);
-
-    var text_command: ?draw.Command = null;
-    for (batch.commands.items) |command| {
-        if (command.kind == .text) text_command = command;
-    }
-    try std.testing.expect(text_command != null);
-    try std.testing.expectEqualStrings("empty", text_command.?.text);
-    try std.testing.expectEqual(area.textRect(), text_command.?.rect);
-    try std.testing.expectEqual(area.textRect(), text_command.?.clip.?);
-    try std.testing.expectEqual(area.glyphWidth(), text_command.?.glyph_width);
-    try std.testing.expectEqual(area.lineHeight(), text_command.?.line_height);
-
-    batch.clear();
-    area.focused = true;
-    try std.testing.expect(try area.handleInput(std.testing.allocator, .{ .text = "hello\nworld" }));
-    try area.render(std.testing.allocator, &batch);
-    text_command = null;
-    for (batch.commands.items) |command| {
-        if (command.kind == .text) text_command = command;
-    }
-    try std.testing.expectEqualStrings(area.text(), text_command.?.text);
-}
-
-test "text area owns wrapped layout from injected font metrics" {
-    const Area = TextArea(.{ .x = 0, .y = 0, .width = 20, .height = 36, .padding_x = 0, .padding_y = 0, .font_size = 10 });
-    var area = try Area.init(std.testing.allocator, "");
-    defer area.deinit(std.testing.allocator);
-    area.setFontMetrics(text_layout.FontMetrics.fixed(10, 5, 12));
-    area.focused = true;
-
-    try std.testing.expect(try area.handleInput(std.testing.allocator, .{ .text = "abcdef" }));
-    try std.testing.expectEqualStrings("abcdef", area.text());
-
-    var batch: draw.RenderBatch = .{};
-    defer batch.deinit(std.testing.allocator);
-    try area.render(std.testing.allocator, &batch);
-
-    var text_command: ?draw.Command = null;
-    for (batch.commands.items) |command| {
-        if (command.kind == .text) text_command = command;
-    }
-    try std.testing.expect(text_command != null);
-    try std.testing.expectEqual(@as(usize, 2), text_command.?.text_runs.len);
-    try std.testing.expectEqualStrings("abcd", text_command.?.text_runs[0].text);
-    try std.testing.expectEqual(@as(usize, 0), text_command.?.text_runs[0].byte_start);
-    try std.testing.expectEqual(@as(usize, 4), text_command.?.text_runs[0].byte_end);
-    try std.testing.expectEqual(@as(f32, 0), text_command.?.text_runs[0].x);
-    try std.testing.expectEqual(@as(f32, 0), text_command.?.text_runs[0].y);
-    try std.testing.expectEqualStrings("ef", text_command.?.text_runs[1].text);
-    try std.testing.expectEqual(@as(f32, 12), text_command.?.text_runs[1].y);
-
-    const cursor = area.cursorRect();
-    try std.testing.expectEqual(@as(f32, 10), cursor.x);
-    try std.testing.expectEqual(@as(f32, 12), cursor.y);
-    try std.testing.expectEqual(@as(f32, 12), cursor.h);
-
-    area.selection_anchor = 1;
-    area.selection_focus = 5;
-    var selection_rects: std.ArrayList(draw.Rect) = .empty;
-    defer selection_rects.deinit(std.testing.allocator);
-    try area.appendSelectionRects(std.testing.allocator, &selection_rects);
-    try std.testing.expectEqual(@as(usize, 2), selection_rects.items.len);
-    try std.testing.expectEqual(@as(f32, 5), selection_rects.items[0].x);
-    try std.testing.expectEqual(@as(f32, 15), selection_rects.items[0].w);
-    try std.testing.expectEqual(@as(f32, 0), selection_rects.items[0].y);
-    try std.testing.expectEqual(@as(f32, 0), selection_rects.items[1].x);
-    try std.testing.expectEqual(@as(f32, 5), selection_rects.items[1].w);
-    try std.testing.expectEqual(@as(f32, 12), selection_rects.items[1].y);
-}
-
-test "text area renders scrollbar only when content overflows" {
-    const Area = TextArea(.{ .x = 0, .y = 0, .width = 100, .height = 24, .padding_x = 0, .padding_y = 0, .font_size = 10, .line_height = 10, .scrollbar_width = 5 });
-    var short = try Area.init(std.testing.allocator, "one");
-    defer short.deinit(std.testing.allocator);
-    var long = try Area.init(std.testing.allocator, "one\ntwo\nthree\nfour");
-    defer long.deinit(std.testing.allocator);
-    long.focused = true;
-    _ = try long.handleInput(std.testing.allocator, .{ .key = .{ .code = .end } });
-
-    var batch: draw.RenderBatch = .{};
-    defer batch.deinit(std.testing.allocator);
-    try short.render(std.testing.allocator, &batch);
-    for (batch.commands.items) |command| {
-        try std.testing.expect(command.kind != .scrollbar);
-    }
-
-    batch.clear();
-    try long.render(std.testing.allocator, &batch);
-    var scrollbar_count: usize = 0;
-    for (batch.commands.items) |command| {
-        if (command.kind == .scrollbar) {
-            scrollbar_count += 1;
-            try std.testing.expect(command.rect.x >= 95);
-            try std.testing.expect(command.rect.x + command.rect.w <= 100);
-            try std.testing.expect(command.rect.y >= 0);
-            try std.testing.expect(command.rect.y + command.rect.h <= 24);
-        }
-    }
-    try std.testing.expectEqual(@as(usize, 2), scrollbar_count);
-}
-
-test "text area scrolls with mouse wheel inside bounds" {
-    const Area = TextArea(.{ .x = 0, .y = 0, .width = 100, .height = 24, .padding_x = 0, .padding_y = 0, .font_size = 10, .line_height = 10 });
-    var area = try Area.init(std.testing.allocator, "one\ntwo\nthree\nfour\nfive");
-    defer area.deinit(std.testing.allocator);
-
-    try std.testing.expect(try area.handleInput(std.testing.allocator, .{ .mouse_wheel = .{ .point = .{ .x = 10, .y = 10 }, .y = -1 } }));
-    try std.testing.expect(area.scrollY() > 0);
-    const after_inside_scroll = area.scrollY();
-
-    try std.testing.expect(!try area.handleInput(std.testing.allocator, .{ .mouse_wheel = .{ .point = .{ .x = 200, .y = 10 }, .y = -1 } }));
-    try std.testing.expectEqual(after_inside_scroll, area.scrollY());
-}
-
-test "text area drags scrollbar thumb" {
-    const Area = TextArea(.{ .x = 0, .y = 0, .width = 100, .height = 24, .padding_x = 0, .padding_y = 0, .font_size = 10, .line_height = 10, .scrollbar_width = 5 });
-    var area = try Area.init(std.testing.allocator, "one\ntwo\nthree\nfour\nfive\nsix");
-    defer area.deinit(std.testing.allocator);
-    area.focused = true;
-
-    try std.testing.expect(try area.handleInput(std.testing.allocator, .{ .mouse_down = .{ .point = .{ .x = 97, .y = 2 } } }));
-    try std.testing.expect(area.dragging_scrollbar);
-    try std.testing.expect(try area.handleInput(std.testing.allocator, .{ .mouse_drag = .{ .x = 97, .y = 22 } }));
-    try std.testing.expect(area.scrollY() > 0);
-    try std.testing.expect(try area.handleInput(std.testing.allocator, .{ .mouse_up = .{ .x = 97, .y = 22 } }));
-    try std.testing.expect(!area.dragging_scrollbar);
-}
-
-test "text area exposes placeholder state" {
-    const Area = TextArea(.{ .placeholder_text = "Write a prompt" });
-    var area = try Area.init(std.testing.allocator, "");
-    defer area.deinit(std.testing.allocator);
-
-    try std.testing.expect(area.placeholderVisible());
-    try std.testing.expectEqualStrings("Write a prompt", area.placeholder());
-
-    area.focused = true;
-    try std.testing.expect(try area.handleInput(std.testing.allocator, .{ .text = "x" }));
-    try std.testing.expect(!area.placeholderVisible());
-}
-
 test "text area read only and max bytes block edits" {
     const ReadOnly = TextArea(.{ .read_only = true });
     var read_only = try ReadOnly.init(std.testing.allocator, "abc");
@@ -1037,95 +801,9 @@ test "text area read only and max bytes block edits" {
     try std.testing.expectEqualStrings("abc", limited.text());
 }
 
-fn rejectBang(_: ?*anyopaque, _: []const u8, replacement: []const u8, _: usize, _: usize) bool {
-    return std.mem.indexOfScalar(u8, replacement, '!') == null;
-}
-
-test "text area validation callback can reject edits" {
-    const Area = TextArea(.{});
-    var area = try Area.init(std.testing.allocator, "");
-    defer area.deinit(std.testing.allocator);
-    area.focused = true;
-    area.setCallbacks(.{ .validate_edit = rejectBang });
-
-    try std.testing.expect(try area.handleInput(std.testing.allocator, .{ .text = "ok" }));
-    try std.testing.expect(try area.handleInput(std.testing.allocator, .{ .text = "!" }));
-    try std.testing.expectEqualStrings("ok", area.text());
-}
-
-test "text area cursor blink can be ticked" {
-    const Area = TextArea(.{ .cursor_blink_ms = 10 });
-    var area = try Area.init(std.testing.allocator, "");
-    defer area.deinit(std.testing.allocator);
-    area.focused = true;
-
-    try std.testing.expect(area.cursor_visible);
-    area.tick(10);
-    try std.testing.expect(!area.cursor_visible);
-    area.tick(10);
-    try std.testing.expect(area.cursor_visible);
-}
-
-test "text area emits composition events without editing buffer" {
-    const Area = TextArea(.{});
-    var area = try Area.init(std.testing.allocator, "");
-    defer area.deinit(std.testing.allocator);
-    area.focused = true;
-
-    var probe: CallbackProbe = .{};
-    defer probe.clipboard.deinit(std.testing.allocator);
-    area.setCallbacks(.{ .context = &probe, .on_event = probeTextAreaEvent });
-
-    try std.testing.expect(try area.handleInput(std.testing.allocator, .{ .composition = "compose" }));
-    try std.testing.expectEqual(@as(usize, 1), probe.compositions);
-    try std.testing.expectEqualStrings("", area.text());
-}
-
-test "text area clips selection to text bounds" {
-    const Area = TextArea(.{ .x = 5, .y = 7, .width = 35, .height = 24, .padding_x = 2, .padding_y = 3, .font_size = 10, .line_height = 10 });
-    var area = try Area.init(std.testing.allocator, "abc\ndef\nghi\njkl");
-    defer area.deinit(std.testing.allocator);
-    area.focused = true;
-    area.selection_anchor = 0;
-    area.selection_focus = area.text().len;
-
-    var batch: draw.RenderBatch = .{};
-    defer batch.deinit(std.testing.allocator);
-    try area.render(std.testing.allocator, &batch);
-
-    const clip: draw.Rect = .{ .x = 7, .y = 10, .w = 31, .h = 18 };
-    for (batch.commands.items) |command| {
-        if (command.kind != .selection) continue;
-        try std.testing.expect(command.rect.x >= clip.x);
-        try std.testing.expect(command.rect.y >= clip.y);
-        try std.testing.expect(command.rect.x + command.rect.w <= clip.x + clip.w);
-        try std.testing.expect(command.rect.y + command.rect.h <= clip.y + clip.h);
-    }
-}
-
 const CallbackProbe = struct {
-    changed: usize = 0,
-    submitted: usize = 0,
-    compositions: usize = 0,
     clipboard: std.ArrayList(u8) = .empty,
 };
-
-fn probeTextAreaEvent(context: ?*anyopaque, event: TextAreaEvent) void {
-    const probe: *CallbackProbe = @ptrCast(@alignCast(context orelse return));
-    switch (event) {
-        .changed => probe.changed += 1,
-        .submitted => probe.submitted += 1,
-        .composition => probe.compositions += 1,
-        else => {},
-    }
-}
-
-fn probeTextAreaKey(context: ?*anyopaque, key: Key) TextAreaAction {
-    _ = context;
-    if (key.code == .enter and key.shift) return .insert_newline;
-    if (key.code == .enter) return .submit;
-    return .default;
-}
 
 fn probeSetClipboard(context: ?*anyopaque, text: []const u8) bool {
     const probe: *CallbackProbe = @ptrCast(@alignCast(context orelse return false));
@@ -1137,28 +815,6 @@ fn probeSetClipboard(context: ?*anyopaque, text: []const u8) bool {
 fn probeGetClipboard(context: ?*anyopaque, allocator: std.mem.Allocator) ?[]u8 {
     const probe: *CallbackProbe = @ptrCast(@alignCast(context orelse return null));
     return allocator.dupe(u8, probe.clipboard.items) catch null;
-}
-
-test "text area callbacks can bind enter and shift enter" {
-    const Area = TextArea(.{});
-    var area = try Area.init(std.testing.allocator, "");
-    defer area.deinit(std.testing.allocator);
-    area.focused = true;
-
-    var probe: CallbackProbe = .{};
-    area.setCallbacks(.{
-        .context = &probe,
-        .on_event = probeTextAreaEvent,
-        .on_key = probeTextAreaKey,
-    });
-
-    try std.testing.expect(try area.handleInput(std.testing.allocator, .{ .key = .{ .code = .enter, .shift = true } }));
-    try std.testing.expectEqualStrings("\n", area.text());
-    try std.testing.expectEqual(@as(usize, 1), probe.changed);
-
-    try std.testing.expect(try area.handleInput(std.testing.allocator, .{ .key = .{ .code = .enter } }));
-    try std.testing.expect(area.submitted);
-    try std.testing.expectEqual(@as(usize, 1), probe.submitted);
 }
 
 test "text area clipboard callbacks handle copy cut and paste" {

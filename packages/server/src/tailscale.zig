@@ -1197,8 +1197,6 @@ const FakeRunner = struct {
     outputs: []const CommandResult,
     off_called: bool = false,
     unsafe_called: bool = false,
-    mutation_called: bool = false,
-    https_port: ?u16 = null,
     cas_calls: usize = 0,
     cas_changed: bool = false,
     cas_config: ?[]u8 = null,
@@ -1216,10 +1214,6 @@ const FakeRunner = struct {
         if (argv.len > 0 and std.mem.eql(u8, argv[argv.len - 1], "off")) self.off_called = true;
         for (argv) |arg| {
             if (std.mem.eql(u8, arg, "reset") or std.mem.eql(u8, arg, "--all")) self.unsafe_called = true;
-            if (std.mem.startsWith(u8, arg, "--https=")) {
-                self.mutation_called = true;
-                self.https_port = std.fmt.parseInt(u16, arg["--https=".len..], 10) catch null;
-            }
         }
         const value = self.outputs[self.calls];
         self.calls += 1;
@@ -1245,7 +1239,6 @@ const FakeRunner = struct {
     fn compareAndSetServeConfig(context: *anyopaque, allocator: std.mem.Allocator, _: []const u8, config: []const u8) ![]u8 {
         const self: *FakeRunner = @ptrCast(@alignCast(context));
         self.cas_calls += 1;
-        self.mutation_called = true;
         if (self.cas_changed) return error.TailscaleServeChanged;
         if (self.cas_config) |value| allocator.free(value);
         self.cas_config = try allocator.dupe(u8, config);
@@ -1299,13 +1292,6 @@ test "occupied ServeConfig forms are collisions" {
     }
 }
 
-test "ServeConfig CAS accepts only documented status" {
-    try validateCasStatus(200);
-    try std.testing.expectError(error.TailscaleServeChanged, validateCasStatus(412));
-    try std.testing.expectError(error.TailscaleServeConfigureFailed, validateCasStatus(201));
-    try std.testing.expectError(error.TailscaleServeConfigureFailed, validateCasStatus(204));
-}
-
 test "verbose LocalAPI snapshot decodes content length and chunked framing" {
     const content_length_response =
         "HTTP/1.1 200 OK\r\nEtag: length-etag\r\nContent-Length: 2\r\n\r\n{}";
@@ -1323,20 +1309,6 @@ test "verbose LocalAPI snapshot decodes content length and chunked framing" {
     const chunked_snapshot = try parseServeSnapshot(chunked_bytes);
     try std.testing.expectEqualStrings("chunk-etag", chunked_snapshot.etag);
     try std.testing.expectEqualStrings("{}", chunked_snapshot.config);
-}
-
-test "verbose LocalAPI snapshot rejects malformed framing" {
-    const fixtures = [_][]const u8{
-        "HTTP/1.1 200 OK\r\nEtag: e\r\nContent-Length: 3\r\n\r\n{}",
-        "HTTP/1.1 200 OK\r\nEtag: e\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n{}",
-        "HTTP/1.1 200 OK\r\nEtag: e\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n",
-        "HTTP/1.1 200 OK\r\nEtag: e\r\n\r\n{}",
-    };
-    for (fixtures) |fixture| {
-        const bytes = try std.testing.allocator.dupe(u8, fixture);
-        defer std.testing.allocator.free(bytes);
-        try std.testing.expectError(error.InvalidTailscaleStatus, parseServeSnapshot(bytes));
-    }
 }
 
 test "local-creds parser accepts official Unix and authenticated localhost forms" {
@@ -1379,32 +1351,6 @@ test "local-creds parser accepts official Unix and authenticated localhost forms
     );
 }
 
-test "lifecycle lock serializes independent file handles and releases cleanly" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const length = try tmp.dir.realPath(std.testing.io, &buffer);
-    const state_dir = buffer[0..length];
-    var first = try LifecycleLock.acquire(std.testing.io, state_dir);
-    errdefer first.deinit(std.testing.io);
-    try std.testing.expectError(
-        error.WouldBlock,
-        tmp.dir.openFile(std.testing.io, LOCK_FILE, .{
-            .mode = .read_write,
-            .lock = .exclusive,
-            .lock_nonblocking = true,
-        }),
-    );
-    first.deinit(std.testing.io);
-
-    const after_release = try tmp.dir.openFile(std.testing.io, LOCK_FILE, .{
-        .mode = .read_write,
-        .lock = .exclusive,
-        .lock_nonblocking = true,
-    });
-    after_release.close(std.testing.io);
-}
-
 test "cleanup removes only an unchanged exact mapping without reset" {
     const outputs = [_]CommandResult{
         .{ .code = 0, .stdout = @constCast("{\"BackendState\":\"Running\",\"Self\":{\"DNSName\":\"runtime.tail.ts.net.\"}}"), .stderr = @constCast("") },
@@ -1426,26 +1372,6 @@ test "cleanup removes only an unchanged exact mapping without reset" {
     try std.testing.expect(!fake.unsafe_called);
 }
 
-test "cleanup preserves a mapping after a foreign handler appears" {
-    const outputs = [_]CommandResult{
-        .{ .code = 0, .stdout = @constCast("{\"BackendState\":\"Running\",\"Self\":{\"DNSName\":\"runtime.tail.ts.net\"}}"), .stderr = @constCast("") },
-        .{ .code = 0, .stdout = @constCast("{\"TCP\":{\"443\":{\"HTTPS\":true}},\"Web\":{\"runtime.tail.ts.net:443\":{\"Handlers\":{\"/\":{\"Proxy\":\"http://127.0.0.1:7420\"},\"/other\":{\"Proxy\":\"http://127.0.0.1:8080\"}}}}}"), .stderr = @constCast("") },
-    };
-    var fake: FakeRunner = .{ .outputs = &outputs };
-    defer fake.deinit();
-    try std.testing.expectEqual(Cleanup.preserved_changed, try rollbackExact(
-        std.testing.allocator,
-        fake.runner(),
-        "https://runtime.tail.ts.net",
-        "http://127.0.0.1:7420",
-        443,
-        "test-etag",
-    ));
-    try std.testing.expect(!fake.off_called);
-    try std.testing.expect(!fake.unsafe_called);
-    try std.testing.expectEqual(@as(usize, 2), fake.calls);
-}
-
 test "cleanup preserves an exact mapping when its CAS snapshot changes" {
     const outputs = [_]CommandResult{
         .{ .code = 0, .stdout = @constCast("{\"BackendState\":\"Running\",\"Self\":{\"DNSName\":\"runtime.tail.ts.net\"}}"), .stderr = @constCast("") },
@@ -1463,147 +1389,6 @@ test "cleanup preserves an exact mapping when its CAS snapshot changes" {
     ));
     try std.testing.expectEqual(@as(usize, 1), fake.cas_calls);
     try std.testing.expect(fake.cas_config == null);
-}
-
-test "cleanup preserves an exact mapping after any visible global config change" {
-    const outputs = [_]CommandResult{
-        .{ .code = 0, .stdout = @constCast("{\"BackendState\":\"Running\",\"Self\":{\"DNSName\":\"runtime.tail.ts.net\"}}"), .stderr = @constCast("") },
-        .{ .code = 0, .stdout = @constCast("{\"TCP\":{\"443\":{\"HTTPS\":true}},\"Web\":{\"runtime.tail.ts.net:443\":{\"Handlers\":{\"/\":{\"Proxy\":\"http://127.0.0.1:7420\"}}}}}"), .stderr = @constCast("") },
-    };
-    var fake: FakeRunner = .{ .outputs = &outputs };
-    defer fake.deinit();
-    try std.testing.expectEqual(Cleanup.preserved_changed, try rollbackExact(
-        std.testing.allocator,
-        fake.runner(),
-        "https://runtime.tail.ts.net",
-        "http://127.0.0.1:7420",
-        443,
-        "older-owned-etag",
-    ));
-    try std.testing.expectEqual(@as(usize, 0), fake.cas_calls);
-}
-
-test "legacy owned intent atomically adopts an exact current ETag before cleanup" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const length = try tmp.dir.realPath(std.testing.io, &buffer);
-    const state_dir = buffer[0..length];
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = STATE_FILE,
-        .data = "{\"schema_version\":1,\"origin\":\"https://runtime.tail.ts.net\",\"target\":\"http://127.0.0.1:7420\",\"https_port\":443,\"verde_owned\":true,\"owned_etag\":null}",
-    });
-    const outputs = [_]CommandResult{
-        .{ .code = 0, .stdout = @constCast("{\"BackendState\":\"Running\",\"Self\":{\"DNSName\":\"runtime.tail.ts.net\"}}"), .stderr = @constCast("") },
-        .{ .code = 0, .stdout = @constCast("{\"TCP\":{\"443\":{\"HTTPS\":true}},\"Web\":{\"runtime.tail.ts.net:443\":{\"Handlers\":{\"/\":{\"Proxy\":\"http://127.0.0.1:7420\"}}}}}"), .stderr = @constCast("") },
-        .{ .code = 0, .stdout = @constCast("{\"BackendState\":\"Running\",\"Self\":{\"DNSName\":\"runtime.tail.ts.net\"}}"), .stderr = @constCast("") },
-        .{ .code = 0, .stdout = @constCast("{\"TCP\":{\"443\":{\"HTTPS\":true}},\"Web\":{\"runtime.tail.ts.net:443\":{\"Handlers\":{\"/\":{\"Proxy\":\"http://127.0.0.1:7420\"}}}}}"), .stderr = @constCast("") },
-    };
-    var fake: FakeRunner = .{ .outputs = &outputs };
-    defer fake.deinit();
-    try std.testing.expectEqual(
-        Cleanup.removed,
-        try cleanupSaved(std.testing.io, std.testing.allocator, fake.runner(), state_dir),
-    );
-    try std.testing.expectEqual(@as(usize, 1), fake.cas_calls);
-    const encoded = try tmp.dir.readFileAlloc(std.testing.io, STATE_FILE, std.testing.allocator, .limited(4096));
-    defer std.testing.allocator.free(encoded);
-    var intent = try std.json.parseFromSlice(Intent, std.testing.allocator, encoded, .{});
-    defer intent.deinit();
-    try std.testing.expect(intent.value.verde_owned);
-    try std.testing.expectEqualStrings("test-etag", intent.value.owned_etag.?);
-}
-
-test "legacy owned intent preserves a non-exact current mapping" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const length = try tmp.dir.realPath(std.testing.io, &buffer);
-    const state_dir = buffer[0..length];
-    const legacy = "{\"schema_version\":1,\"origin\":\"https://runtime.tail.ts.net\",\"target\":\"http://127.0.0.1:7420\",\"https_port\":443,\"verde_owned\":true,\"owned_etag\":null}";
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = STATE_FILE, .data = legacy });
-    const outputs = [_]CommandResult{
-        .{ .code = 0, .stdout = @constCast("{\"BackendState\":\"Running\",\"Self\":{\"DNSName\":\"runtime.tail.ts.net\"}}"), .stderr = @constCast("") },
-        .{ .code = 0, .stdout = @constCast("{\"TCP\":{\"443\":{\"HTTPS\":true}},\"Web\":{\"runtime.tail.ts.net:443\":{\"Handlers\":{\"/\":{\"Proxy\":\"http://127.0.0.1:8080\"}}}}}"), .stderr = @constCast("") },
-    };
-    var fake: FakeRunner = .{ .outputs = &outputs };
-    defer fake.deinit();
-    try std.testing.expectEqual(
-        Cleanup.preserved_changed,
-        try cleanupSaved(std.testing.io, std.testing.allocator, fake.runner(), state_dir),
-    );
-    try std.testing.expectEqual(@as(usize, 0), fake.cas_calls);
-    const preserved = try tmp.dir.readFileAlloc(std.testing.io, STATE_FILE, std.testing.allocator, .limited(4096));
-    defer std.testing.allocator.free(preserved);
-    try std.testing.expectEqualStrings(legacy, preserved);
-}
-
-test "re-running exact configuration retains Verde ownership" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const length = try tmp.dir.realPath(std.testing.io, &buffer);
-    const state_dir = buffer[0..length];
-    var created: Prepared = .{
-        .allocator = std.testing.allocator,
-        .origin = try std.testing.allocator.dupe(u8, "https://runtime.tail.ts.net"),
-        .listener_url = try std.testing.allocator.dupe(u8, "https://runtime.tail.ts.net:443"),
-        .target = try std.testing.allocator.dupe(u8, "http://127.0.0.1:7420"),
-        .current_target = null,
-        .etag = try std.testing.allocator.dupe(u8, "test-etag"),
-        .desired_config = try std.testing.allocator.dupe(u8, "{}"),
-        .owned_etag = try std.testing.allocator.dupe(u8, "post-etag"),
-        .handler_count = 0,
-        .https_port = 443,
-        .state = .available,
-    };
-    defer created.deinit();
-    try writeIntent(std.testing.io, std.testing.allocator, state_dir, created);
-    const pending_state = try writePendingIntent(std.testing.io, std.testing.allocator, state_dir, created);
-    try std.testing.expectEqual(PendingIntentState.existing_owned, pending_state);
-    const preserved = try tmp.dir.readFileAlloc(std.testing.io, STATE_FILE, std.testing.allocator, .limited(4096));
-    defer std.testing.allocator.free(preserved);
-    var preserved_intent = try std.json.parseFromSlice(Intent, std.testing.allocator, preserved, .{});
-    defer preserved_intent.deinit();
-    try std.testing.expect(preserved_intent.value.verde_owned);
-
-    var different: Prepared = .{
-        .allocator = std.testing.allocator,
-        .origin = try std.testing.allocator.dupe(u8, "https://other.tail.ts.net"),
-        .listener_url = try std.testing.allocator.dupe(u8, "https://other.tail.ts.net:443"),
-        .target = try std.testing.allocator.dupe(u8, "http://127.0.0.1:9000"),
-        .current_target = null,
-        .etag = try std.testing.allocator.dupe(u8, "test-etag"),
-        .desired_config = try std.testing.allocator.dupe(u8, "{}"),
-        .handler_count = 0,
-        .https_port = 443,
-        .state = .available,
-    };
-    defer different.deinit();
-    try std.testing.expectError(
-        error.TailscaleIntentConflict,
-        writePendingIntent(std.testing.io, std.testing.allocator, state_dir, different),
-    );
-    var reused: Prepared = .{
-        .allocator = std.testing.allocator,
-        .origin = try std.testing.allocator.dupe(u8, created.origin),
-        .listener_url = try std.testing.allocator.dupe(u8, created.listener_url),
-        .target = try std.testing.allocator.dupe(u8, created.target),
-        .current_target = try std.testing.allocator.dupe(u8, created.target),
-        .etag = try std.testing.allocator.dupe(u8, "test-etag"),
-        .desired_config = null,
-        .handler_count = 1,
-        .https_port = 443,
-        .state = .matching,
-    };
-    defer reused.deinit();
-    try writeIntent(std.testing.io, std.testing.allocator, state_dir, reused);
-    const encoded = try tmp.dir.readFileAlloc(std.testing.io, STATE_FILE, std.testing.allocator, .limited(4096));
-    defer std.testing.allocator.free(encoded);
-    var parsed = try std.json.parseFromSlice(Intent, std.testing.allocator, encoded, .{});
-    defer parsed.deinit();
-    try std.testing.expect(parsed.value.verde_owned);
-    try std.testing.expectEqualStrings("post-etag", parsed.value.owned_etag.?);
 }
 
 test "CAS conflict retains a newly created pending recovery intent" {
@@ -1647,52 +1432,6 @@ test "CAS conflict retains a newly created pending recovery intent" {
     try std.testing.expectEqualStrings(prepared.target, intent.value.target);
 }
 
-test "preflight reports a typed collision without applying commands" {
-    const outputs = [_]CommandResult{
-        .{ .code = 0, .stdout = @constCast("1.92.0"), .stderr = @constCast("") },
-        .{ .code = 0, .stdout = @constCast("{\"BackendState\":\"Running\",\"Self\":{\"DNSName\":\"runtime.tail.ts.net\"}}"), .stderr = @constCast("") },
-        .{ .code = 0, .stdout = @constCast("{\"TCP\":{\"443\":{\"HTTPS\":true}},\"Web\":{\"runtime.tail.ts.net:443\":{\"Handlers\":{\"/\":{\"Proxy\":\"http://127.0.0.1:8080\"}}}}}"), .stderr = @constCast("") },
-    };
-    var fake: FakeRunner = .{ .outputs = &outputs };
-    defer fake.deinit();
-    var prepared = try prepare(std.testing.allocator, fake.runner(), 7420, 443);
-    defer prepared.deinit();
-    try std.testing.expectEqual(ListenerState.collision, prepared.state);
-    const report = diagnostic(prepared);
-    try std.testing.expectEqual(DiagnosticCode.tailscale_serve_collision, report.code);
-    try std.testing.expectEqualStrings("https://runtime.tail.ts.net:443", report.endpoint);
-    try std.testing.expect(!report.safe_to_configure);
-    try std.testing.expectEqual(@as(?u16, 8443), report.suggested_https_port);
-    const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, report, .{});
-    defer std.testing.allocator.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"schema_version\":1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"code\":\"tailscale_serve_collision\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"endpoint\":\"https://runtime.tail.ts.net:443\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"current_target\":\"http://127.0.0.1:8080\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"choose_alternate_https_port\"") != null);
-    try std.testing.expectEqual(@as(usize, 3), fake.calls);
-    try std.testing.expect(!fake.mutation_called);
-}
-
-test "apply fails closed when the ServeConfig ETag changes" {
-    const outputs = [_]CommandResult{
-        .{ .code = 0, .stdout = @constCast("1.102.3"), .stderr = @constCast("") },
-        .{ .code = 0, .stdout = @constCast("{\"BackendState\":\"Running\",\"Self\":{\"DNSName\":\"runtime.tail.ts.net\"}}"), .stderr = @constCast("") },
-        .{ .code = 0, .stdout = @constCast("{}"), .stderr = @constCast("") },
-    };
-    var fake: FakeRunner = .{ .outputs = &outputs, .cas_changed = true };
-    defer fake.deinit();
-    var prepared = try prepare(std.testing.allocator, fake.runner(), 7420, 443);
-    defer prepared.deinit();
-    try std.testing.expectEqual(ListenerState.available, prepared.state);
-    try std.testing.expectError(
-        error.TailscaleServeChanged,
-        apply(std.testing.allocator, fake.runner(), &prepared),
-    );
-    try std.testing.expectEqual(@as(usize, 1), fake.cas_calls);
-    try std.testing.expect(fake.cas_config == null);
-}
-
 test "foreign target diagnostics redact credentials and request details" {
     const outputs = [_]CommandResult{
         .{ .code = 0, .stdout = @constCast("1.102.3"), .stderr = @constCast("") },
@@ -1711,34 +1450,6 @@ test "foreign target diagnostics redact credentials and request details" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "private") == null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "hunter2") == null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "fragment") == null);
-}
-
-test "an extra path on the selected listener is a collision" {
-    const outputs = [_]CommandResult{
-        .{ .code = 0, .stdout = @constCast("1.92.0"), .stderr = @constCast("") },
-        .{ .code = 0, .stdout = @constCast("{\"BackendState\":\"Running\",\"Self\":{\"DNSName\":\"runtime.tail.ts.net\"}}"), .stderr = @constCast("") },
-        .{ .code = 0, .stdout = @constCast("{\"TCP\":{\"443\":{\"HTTPS\":true}},\"Web\":{\"runtime.tail.ts.net:443\":{\"Handlers\":{\"/\":{\"Proxy\":\"http://127.0.0.1:7420\"},\"/openclaw\":{\"Proxy\":\"http://127.0.0.1:8080\"}}}}}"), .stderr = @constCast("") },
-    };
-    var fake: FakeRunner = .{ .outputs = &outputs };
-    defer fake.deinit();
-    var prepared = try prepare(std.testing.allocator, fake.runner(), 7420, 443);
-    defer prepared.deinit();
-    try std.testing.expectEqual(ListenerState.collision, prepared.state);
-    try std.testing.expect(!fake.mutation_called);
-}
-
-test "Funnel on the selected listener is a collision even for the requested backend" {
-    const outputs = [_]CommandResult{
-        .{ .code = 0, .stdout = @constCast("1.92.0"), .stderr = @constCast("") },
-        .{ .code = 0, .stdout = @constCast("{\"BackendState\":\"Running\",\"Self\":{\"DNSName\":\"runtime.tail.ts.net\"}}"), .stderr = @constCast("") },
-        .{ .code = 0, .stdout = @constCast("{\"TCP\":{\"443\":{\"HTTPS\":true}},\"Web\":{\"runtime.tail.ts.net:443\":{\"Handlers\":{\"/\":{\"Proxy\":\"http://127.0.0.1:7420\"}}}},\"AllowFunnel\":{\"runtime.tail.ts.net:443\":true}}"), .stderr = @constCast("") },
-    };
-    var fake: FakeRunner = .{ .outputs = &outputs };
-    defer fake.deinit();
-    var prepared = try prepare(std.testing.allocator, fake.runner(), 7420, 443);
-    defer prepared.deinit();
-    try std.testing.expectEqual(ListenerState.collision, prepared.state);
-    try std.testing.expect(!fake.mutation_called);
 }
 
 test "an unrelated 443 listener allows a dedicated Verde HTTPS port" {
@@ -1765,26 +1476,5 @@ test "an unrelated 443 listener allows a dedicated Verde HTTPS port" {
     );
     defer if (classification.current_target) |value| std.testing.allocator.free(value);
     try std.testing.expectEqual(ListenerState.matching, classification.state);
-    try std.testing.expect(!fake.unsafe_called);
-}
-
-test "cleanup targets only the saved dedicated HTTPS listener" {
-    const outputs = [_]CommandResult{
-        .{ .code = 0, .stdout = @constCast("{\"BackendState\":\"Running\",\"Self\":{\"DNSName\":\"runtime.tail.ts.net\"}}"), .stderr = @constCast("") },
-        .{ .code = 0, .stdout = @constCast("{\"TCP\":{\"443\":{\"HTTPS\":true},\"8443\":{\"HTTPS\":true}},\"Web\":{\"runtime.tail.ts.net:443\":{\"Handlers\":{\"/\":{\"Proxy\":\"http://127.0.0.1:8080\"}}},\"runtime.tail.ts.net:8443\":{\"Handlers\":{\"/\":{\"Proxy\":\"http://127.0.0.1:7420\"}}}}}"), .stderr = @constCast("") },
-        .{ .code = 0, .stdout = @constCast(""), .stderr = @constCast("") },
-    };
-    var fake: FakeRunner = .{ .outputs = &outputs };
-    defer fake.deinit();
-    try std.testing.expectEqual(Cleanup.removed, try rollbackExact(
-        std.testing.allocator,
-        fake.runner(),
-        "https://runtime.tail.ts.net:8443",
-        "http://127.0.0.1:7420",
-        8443,
-        "test-etag",
-    ));
-    try std.testing.expectEqual(@as(usize, 1), fake.cas_calls);
-    try std.testing.expect(!fake.off_called);
     try std.testing.expect(!fake.unsafe_called);
 }

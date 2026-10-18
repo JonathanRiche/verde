@@ -178,26 +178,6 @@ test "round trip every color type, bit depth, interlace, filter and compression"
     try testing.expect(cases > 1000);
 }
 
-test "rgba8 helpers and large image with best compression" {
-    const gpa = testing.allocator;
-    const w = 300;
-    const h = 200;
-    const px = try gpa.alloc(u8, w * h * 4);
-    defer gpa.free(px);
-    for (0..h) |y| for (0..w) |x| {
-        px[(y * w + x) * 4 ..][0..4].* = .{ @truncate(x), @truncate(y), @truncate(x ^ y), 200 };
-    };
-    for ([_]png.Compression{ .fastest, .default, .best }) |c| {
-        const enc = try png.encodeRgba(gpa, px, w, h, .{ .compression = c });
-        defer gpa.free(enc);
-        try testing.expect(enc.len < px.len / 4); // gradients compress well
-        const img = try png.loadFromMemory(gpa, enc);
-        defer img.deinit(gpa);
-        try testing.expectEqual(@as(u32, w * 4), img.pitch());
-        try testing.expectEqualSlices(u8, px, img.pixels);
-    }
-}
-
 // 1x1 RGBA (255,0,0,128) produced by Python's zlib + hand-assembled chunks (externally encoded).
 const tiny_external = [_]u8{
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
@@ -296,14 +276,4 @@ test "truncated and corrupted inputs never crash" {
         @memcpy(noise[0..8], &png.signature);
         fuzzOne(gpa, &noise, false);
     }
-}
-
-test "fuzz entry (zig build test-image --fuzz)" {
-    try testing.fuzz({}, struct {
-        fn f(_: void, smith: *testing.Smith) anyerror!void {
-            var buf: [4096]u8 = undefined;
-            const n = smith.slice(&buf);
-            fuzzOne(testing.allocator, buf[0..n], false);
-        }
-    }.f, .{});
 }

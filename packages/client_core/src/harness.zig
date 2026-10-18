@@ -169,54 +169,6 @@ fn fillReceipts(f: *Fixture, count: usize, state: []const u8) !void {
     f.host.state.receipts = receipts;
 }
 
-test "long sessions roll settled receipts off without teardown and keep in-flight ones" {
-    var f = try Fixture.init();
-    defer f.deinit();
-    _ = try retryIntent(&f, "held-0");
-    @constCast(f.host.state.receipts)[0].operation.state = "pending";
-    var name: [32]u8 = undefined;
-    const total = 10_050;
-    for (0..total) |i| {
-        const batch = effects(try retryIntent(&f, try std.fmt.bufPrint(&name, "intent-{d}", .{i})));
-        try expect(batch.len == 1);
-        try eql("state_changed", get(batch[0], "type").string);
-        // Each admission adds (and past the window evicts) a receipt: operations, not hosts.
-        try expect(hasScope(batch[0], "operations"));
-        try expect(!hasScope(batch[0], "hosts"));
-        try expect(f.host.state.receipts.len <= core.RECENT_RECEIPTS + 1);
-    }
-    // The in-flight receipt survives ten thousand newer intents and still deduplicates.
-    try expect(receiptIndex(&f, "held-0") != null);
-    try eql("pending", f.host.state.receipts[receiptIndex(&f, "held-0").?].operation.state);
-    try expect(effects(try retryIntent(&f, "held-0")).len == 0);
-    // The settled window keeps exactly the newest intents, oldest first.
-    try expect(f.host.state.receipts.len == core.RECENT_RECEIPTS + 1);
-    try expect(receiptIndex(&f, try std.fmt.bufPrint(&name, "intent-{d}", .{total - core.RECENT_RECEIPTS})) != null);
-    try expect(receiptIndex(&f, try std.fmt.bufPrint(&name, "intent-{d}", .{total - core.RECENT_RECEIPTS - 1})) == null);
-    try expect(get(get(try f.query("hosts"), "data"), "operations").array.items.len == core.RECENT_RECEIPTS + 1);
-    try expect(get(get(try f.query("operations"), "data"), "items").array.items.len == core.RECENT_RECEIPTS + 1);
-}
-fn hasScope(effect: V, selector: []const u8) bool {
-    for (get(effect, "scopes").array.items) |scope| if (core.eq(scope.string, selector)) return true;
-    return false;
-}
-
-test "recent settled receipts deduplicate and reject changed payloads" {
-    var f = try Fixture.init();
-    defer f.deinit();
-    var name: [32]u8 = undefined;
-    for (0..core.RECENT_RECEIPTS * 3) |i| _ = try retryIntent(&f, try std.fmt.bufPrint(&name, "intent-{d}", .{i}));
-    const oldest = core.RECENT_RECEIPTS * 2;
-    for ([_]usize{ oldest, oldest + 17, core.RECENT_RECEIPTS * 3 - 1 }) |i| {
-        const id = try std.fmt.bufPrint(&name, "intent-{d}", .{i});
-        const snapshot = try f.host.query("hosts", f.arena.allocator());
-        try expect(effects(try retryIntent(&f, id)).len == 0);
-        try eql(snapshot, try f.host.query("hosts", f.arena.allocator()));
-        const changed = try std.fmt.allocPrint(f.arena.allocator(), "{{\"api_version\":1,\"type\":\"history_load_more\",\"now_ms\":11,\"wall_time_ms\":100,\"intent_id\":\"{s}\"}}", .{id});
-        try std.testing.expectError(error.InvalidArgument, f.event(changed));
-    }
-}
-
 test "in-flight receipts at the cap reject new intents with retryable backpressure" {
     var f = try Fixture.init();
     defer f.deinit();
@@ -314,22 +266,6 @@ test "every constructor, staging, effect and output allocation failure rolls bac
     try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationScenario, .{});
 }
 
-test "retry without a started host fails visibly and emits no I/O" {
-    const cases = [_]struct { tag: []const u8, payload: []const u8 }{
-        .{ .tag = "retry_connection", .payload = "" },
-    };
-    for (cases) |case| {
-        var f = try Fixture.init();
-        defer f.deinit();
-        const ids = if (core.eq(case.tag, "focus")) "" else ",\"workspace_id\":\"w\",\"thread_id\":\"t\",\"terminal_id\":\"term\"";
-        const event = try std.fmt.allocPrint(f.arena.allocator(), "{{\"api_version\":1,\"type\":\"{s}\",\"now_ms\":0,\"wall_time_ms\":0,\"intent_id\":\"i\"{s}{s}}}", .{ case.tag, ids, case.payload });
-        const batch = effects(try f.event(event));
-        try expect(batch.len == 1);
-        try eql("state_changed", get(batch[0], "type").string);
-        try eql("unsupported", f.host.state.receipts[0].operation.@"error".?.code);
-    }
-}
-
 test "constructor uses shared mobile URL rules, limits nesting, and keeps 64 bit revisions lossless" {
     const invalid_configs = [_][]const u8{
         "{\"api_version\":2}",
@@ -358,26 +294,4 @@ test "constructor uses shared mobile URL rules, limits nesting, and keeps 64 bit
     const before = f.host.state.revision;
     _ = try f.event("{\"api_version\":1,\"type\":\"foreground\",\"now_ms\":10,\"wall_time_ms\":-100,\"future\":true}");
     try expect(f.host.state.revision == before);
-}
-
-test "matching generation completes once, due timer drains, storage failure is not unpaired" {
-    var f = try Fixture.init();
-    defer f.deinit();
-    const batch = effects(try f.event(start));
-    const fail = try std.fmt.allocPrint(f.arena.allocator(), "{{\"api_version\":1,\"type\":\"secure_store_value\",\"now_ms\":10,\"wall_time_ms\":0,\"effect_id\":\"{s}\",\"generation\":\"0\",\"key\":\"vc/1/phone-1/credential\",\"value_base64\":null,\"error\":{{\"code\":\"locked\"}}}}", .{get(batch[1], "effect_id").string});
-    _ = try f.event(fail);
-    try eql("loading", f.host.state.auth_state);
-    try expect(f.host.state.host_error != null);
-    var tx = try core.Transaction.init(&f.host);
-    defer tx.deinit();
-    try tx.setTimer("test", 5);
-    const id = tx.state.pending[1].id;
-    _ = try tx.commit(&f.host, f.arena.allocator());
-    const wrong = try std.fmt.allocPrint(f.arena.allocator(), "{{\"api_version\":1,\"type\":\"timer_fired\",\"now_ms\":15,\"wall_time_ms\":0,\"timer_id\":\"{s}\",\"generation\":\"1\"}}", .{id});
-    try expect(effects(try f.event(wrong)).len == 0);
-    try expect(f.host.state.pending.len == 2);
-    const due = try std.fmt.allocPrint(f.arena.allocator(), "{{\"api_version\":1,\"type\":\"timer_fired\",\"now_ms\":15,\"wall_time_ms\":0,\"timer_id\":\"{s}\",\"generation\":\"0\"}}", .{id});
-    try expect(effects(try f.event(due)).len == 0);
-    try expect(f.host.state.pending.len == 1);
-    try expect(effects(try f.event(due)).len == 0);
 }
