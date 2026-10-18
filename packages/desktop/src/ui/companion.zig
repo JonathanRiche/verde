@@ -446,7 +446,7 @@ fn computeGeometryAt(state: *runtime.AppState, width: f32, height: f32, s: f32) 
     const text_right = (if (switcher) prev_button.x else new_button.x) - 8.0 * s;
     const name_w = @min(text_measure.textWidth(.ui_bold, 15.0 * s, companion.identity.name.slice()) + 22.0 * s, @max(text_right - text_x, 0.0));
     const name_button: palette.Rect = .{ .x = text_x - 4.0 * s, .y = header.y + 10.0 * s, .w = name_w + 4.0 * s, .h = 24.0 * s };
-    const brain_w = @min(text_measure.textWidth(.ui, 11.0 * s, companion.identity.brain.slice()) + 30.0 * s, @max(text_right - text_x, 0.0));
+    const brain_w = @min(text_measure.textWidth(.ui, 11.0 * s, companion.identity.brain.slice()) + 40.0 * s, @max(text_right - text_x, 0.0));
     const brain_button: palette.Rect = .{ .x = text_x - 4.0 * s, .y = header.y + 35.0 * s, .w = brain_w + 4.0 * s, .h = 20.0 * s };
 
     // Body stack between header and footer: inbox, crew, conversation, approval.
@@ -716,13 +716,14 @@ fn renderHeader(state: *runtime.AppState, geometry: Geometry) void {
     const name_w = @max(name_rect.w - 26.0 * s, 0.0);
     queueBoldText(state, .{ .x = name_rect.x + 4.0 * s, .y = name_rect.y + 2.0 * s, .w = name_w, .h = 20.0 * s }, truncatedText(state, .ui_bold, 15.0 * s, name_w, identity.name.slice()), color(chrome.text), 15.0 * s, header);
     const caret_x = name_rect.x + 4.0 * s + @min(text_measure.textWidth(.ui_bold, 15.0 * s, identity.name.slice()), name_w) + 6.0 * s;
-    queueText(state, .{ .x = caret_x, .y = name_rect.y + 4.0 * s, .w = 12.0 * s, .h = 16.0 * s }, "▾", color(chrome.text_subtle), 10.0 * s, header);
+    queueChevronDown(state, .{ .x = caret_x, .y = name_rect.y + (name_rect.h - 13.0 * s) * 0.5, .w = 13.0 * s, .h = 13.0 * s }, color(chrome.text_muted), header);
 
     const brain = geometry.brain_button;
     queuePanel(state, brain, color(chrome.surface_deep), color(hairline()), 10.0 * s, 1.0 * s);
     queueRoundedRect(state, .{ .x = brain.x + 8.0 * s, .y = brain.y + (brain.h - 6.0 * s) * 0.5, .w = 6.0 * s, .h = 6.0 * s }, color(chrome.accent), 3.0 * s);
-    const brain_w = @max(brain.w - 26.0 * s, 0.0);
+    const brain_w = @max(brain.w - 36.0 * s, 0.0);
     queueText(state, .{ .x = brain.x + 19.0 * s, .y = brain.y + 2.5 * s, .w = brain_w, .h = 15.0 * s }, truncatedText(state, .ui, 11.0 * s, brain_w, identity.brain.slice()), color(chrome.text_muted), 11.0 * s, brain);
+    queueChevronDown(state, .{ .x = brain.x + brain.w - 17.0 * s, .y = brain.y + (brain.h - 10.0 * s) * 0.5, .w = 10.0 * s, .h = 10.0 * s }, color(chrome.text_subtle), brain);
 
     if (identity.count > 1) {
         renderHeaderButton(state, geometry.prev_button, "‹");
@@ -732,6 +733,14 @@ fn renderHeader(state: *runtime.AppState, geometry: Geometry) void {
     renderHeaderButton(state, geometry.close_button, "−");
     const divider_inset = snappedStroke(1.0 * s);
     queueRect(state, .{ .x = header.x + divider_inset, .y = header.y + header.h - 1.0 * s, .w = @max(header.w - divider_inset * 2.0, 0.0), .h = 1.0 * s }, color(hairline()));
+}
+
+/// Codicon chevron-down from the icon font; the UI text face has no
+/// legible small caret glyph.
+const NF_COD_CHEVRON_DOWN = "\u{EAB4}";
+
+fn queueChevronDown(state: *runtime.AppState, rect: palette.Rect, fill: palette.Color, clip: palette.Rect) void {
+    state.palette_overlay_batch.roleText(state.allocator, nonNegativeRect(rect), NF_COD_CHEVRON_DOWN, fill, rect.h, .icon, null, nonNegativeRect(clip)) catch |err| log.warn("failed to queue chevron: {s}", .{@errorName(err)});
 }
 
 fn renderHeaderButton(state: *runtime.AppState, rect: palette.Rect, glyph: []const u8) void {
