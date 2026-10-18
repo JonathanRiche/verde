@@ -1951,6 +1951,10 @@ fn handleEvent(window: *palette.platform.Window, state: *AppState, keyboard: *ke
                 syncWindowTextInput(window, state);
                 return true;
             }
+            if (ui_layout.handleCompanionTextShortcut(state, key_event, isPrimaryModifierPressed(key_event.mod))) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
             if (terminal_panel_ui.handlePaletteKeyDown(state, key_event)) {
                 syncWindowTextInput(window, state);
                 return true;

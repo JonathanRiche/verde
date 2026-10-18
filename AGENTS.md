@@ -41,6 +41,10 @@ Run commands from the repository root. Use the narrowest check during iteration.
 - Prefer `send_terminal_key`; inspect the target before consequential input. Raw `terminal.write` can restart sessions and execute existing input.
 - Logs: `~/.local/share/verde/Native/logs/verde.stderr.log`. Never log clipboard contents.
 
+## Text surfaces
+
+- Any new surface that shows content text (messages, transcripts, logs, output, details, errors) must let the user select it (drag, double-click word, triple-click line/message), see the highlight, and copy it (platform copy shortcut plus a right-click/long-press Copy; select-all where a whole block makes sense), on desktop, web, and mobile alike. Skip it only where selection does not make sense: controls and chrome such as buttons, chips, menus, sidebar rows, tabs, and badges. Desktop specifics: [UI rules](packages/desktop/src/ui/AGENTS.md#selectable-text).
+
 ## Zig 0.16
 
 - Discover standard-library/dependency APIs with `zigdoc`; do not copy older Zig examples.

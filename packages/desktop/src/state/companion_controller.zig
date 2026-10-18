@@ -63,6 +63,8 @@ pub const HitAction = enum {
     brain_provider,
     brain_model,
     brain_reasoning,
+    text_copy,
+    text_select_all,
     crew_open,
     inbox_open,
     suggestion,
@@ -543,7 +545,24 @@ pub const Frame = struct {
 
 pub const Presentation = Frame;
 
-pub const Menu = enum { none, companions, brain };
+pub const Menu = enum { none, companions, brain, text };
+
+/// A caret position in the conversation: an activity item and a byte offset
+/// into the text that item displays.
+pub const TextPoint = struct {
+    item: usize,
+    offset: usize,
+
+    pub fn lessThan(a: TextPoint, b: TextPoint) bool {
+        return a.item < b.item or (a.item == b.item and a.offset < b.offset);
+    }
+
+    pub fn eql(a: TextPoint, b: TextPoint) bool {
+        return a.item == b.item and a.offset == b.offset;
+    }
+};
+
+pub const TextRange = struct { start: TextPoint, end: TextPoint };
 
 pub const MAX_CREW: usize = 8;
 pub const MAX_INBOX: usize = 8;
@@ -686,6 +705,15 @@ dock_bottom: f32 = DOCK_DEFAULT_BOTTOM,
 dock_press: ?DockPress = null,
 /// Open/close transition: 0 = dock only, 1 = panel fully shown. Visibility
 /// flips immediately for input; this only drives what is drawn.
+/// Conversation text selection (drag, double/triple click, select all).
+text_anchor: ?TextPoint = null,
+text_focus: ?TextPoint = null,
+text_dragging: bool = false,
+/// Set after a click in the conversation so Ctrl/Cmd+A selects it.
+conversation_focused: bool = false,
+/// Where the right-click Copy / Select all menu opened.
+text_menu_x: f32 = 0.0,
+text_menu_y: f32 = 0.0,
 panel_progress: f32 = 0.0,
 transition_last_ms: i64 = 0,
 
@@ -739,6 +767,55 @@ pub fn transitionAnimating(self: *const Self) bool {
     return self.panel_progress != target;
 }
 
+pub fn beginTextSelection(self: *Self, point: TextPoint) void {
+    self.text_anchor = point;
+    self.text_focus = point;
+    self.text_dragging = true;
+    self.conversation_focused = true;
+}
+
+pub fn selectTextRange(self: *Self, start: TextPoint, end: TextPoint) void {
+    self.text_anchor = start;
+    self.text_focus = end;
+    self.text_dragging = false;
+    self.conversation_focused = true;
+}
+
+pub fn extendTextSelection(self: *Self, point: TextPoint) void {
+    if (self.text_anchor == null) return;
+    self.text_focus = point;
+}
+
+/// Ends a drag; a click that never moved leaves no selection.
+pub fn endTextDrag(self: *Self) void {
+    self.text_dragging = false;
+    if (self.textRange() == null) {
+        self.text_anchor = null;
+        self.text_focus = null;
+    }
+}
+
+pub fn clearTextSelection(self: *Self) void {
+    self.text_anchor = null;
+    self.text_focus = null;
+    self.text_dragging = false;
+    if (self.menu == .text) self.menu = .none;
+}
+
+/// Ordered, non-empty selection, or null.
+pub fn textRange(self: *const Self) ?TextRange {
+    const anchor = self.text_anchor orelse return null;
+    const focus = self.text_focus orelse return null;
+    if (anchor.eql(focus)) return null;
+    return if (focus.lessThan(anchor)) .{ .start = focus, .end = anchor } else .{ .start = anchor, .end = focus };
+}
+
+pub fn openTextMenu(self: *Self, x: f32, y: f32) void {
+    self.text_menu_x = x;
+    self.text_menu_y = y;
+    self.menu = .text;
+}
+
 pub fn beginDockPress(self: *Self, x: f32, y: f32) void {
     self.dock_press = .{ .x = x, .y = y, .right = self.dock_right, .bottom = self.dock_bottom };
 }
@@ -777,6 +854,8 @@ pub fn show(self: *Self) void {
 }
 
 pub fn collapse(self: *Self) void {
+    self.clearTextSelection();
+    self.conversation_focused = false;
     self.menu = .none;
     self.rename_mode = false;
     self.orders_mode = false;
@@ -805,6 +884,8 @@ pub fn handleEscapeKey(self: *Self, down: bool) bool {
     self.escape_key_captured = true;
     if (self.menu != .none) {
         self.menu = .none;
+    } else if (self.textRange() != null) {
+        self.clearTextSelection();
     } else if (self.rename_mode or self.orders_mode) {
         self.rename_mode = false;
         self.orders_mode = false;
@@ -881,6 +962,7 @@ pub fn setFrame(self: *Self, frame: Frame) void {
         !std.mem.eql(u8, self.presentation.workspace_id.slice(), frame.workspace_id.slice()) or
         !std.mem.eql(u8, self.presentation.thread_id.slice(), frame.thread_id.slice());
     if (identity_changed) {
+        self.clearTextSelection();
         self.conversation_scroll_y = 0.0;
         self.conversation_max_scroll = 0.0;
         self.conversation_follow_tail = true;
@@ -1224,4 +1306,27 @@ test "open and close transitions step toward visibility and snap under reduced m
     companion.stepTransition(9000, 0);
     try std.testing.expectEqual(@as(f32, 0.0), companion.panel_progress);
     try std.testing.expect(!companion.transitionAnimating());
+}
+
+test "text selection orders its ends and a still click selects nothing" {
+    var companion = Self.init();
+    companion.beginTextSelection(.{ .item = 2, .offset = 5 });
+    try std.testing.expect(companion.textRange() == null);
+    companion.extendTextSelection(.{ .item = 1, .offset = 3 });
+    const range = companion.textRange().?;
+    try std.testing.expectEqual(@as(usize, 1), range.start.item);
+    try std.testing.expectEqual(@as(usize, 5), range.end.offset);
+    companion.endTextDrag();
+    try std.testing.expect(companion.textRange() != null);
+
+    companion.beginTextSelection(.{ .item = 0, .offset = 1 });
+    companion.endTextDrag();
+    try std.testing.expect(companion.text_anchor == null);
+    try std.testing.expect(companion.conversation_focused);
+
+    companion.selectTextRange(.{ .item = 0, .offset = 0 }, .{ .item = 3, .offset = 9 });
+    companion.openTextMenu(10.0, 20.0);
+    companion.clearTextSelection();
+    try std.testing.expect(companion.textRange() == null);
+    try std.testing.expectEqual(Menu.none, companion.menu);
 }

@@ -11,6 +11,7 @@ const companion_roster = @import("../state/companion_roster.zig");
 const runtime = @import("runtime.zig");
 const theme = @import("theme.zig");
 const text_measure = @import("text_measure.zig");
+const context_menu = @import("context_menu.zig");
 const profiler = @import("../runtime/profiler.zig");
 
 // Keep settings_modal tests on the registered root suite without editing main.zig.
@@ -119,7 +120,16 @@ pub fn handleMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, d
             return true;
         }
     }
+    const companion = &state.companion_controller;
+    if (button == 1 and !down and companion.text_dragging) {
+        companion.endTextDrag();
+        state.markDirty();
+        return true;
+    }
+    if (down and !result.consumed) companion.conversation_focused = false;
     if (!result.consumed) return false;
+    if (down and companion.visibility == .sidecar_open and companion.menu == .none and
+        handleConversationPress(state, x, y, button, clicks, result.action)) return true;
     if (result.action) |action| {
         switch (action) {
             // A bubble press opens on release, unless it turns into a drag.
@@ -149,6 +159,14 @@ pub fn handleMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, d
             .brain_provider => state.selectCompanionBrainProvider(result.index),
             .brain_model => state.setCompanionBrain(result.index),
             .brain_reasoning => state.setCompanionReasoning(result.index),
+            .text_copy => {
+                copyConversationSelection(state);
+                state.companion_controller.closeMenu();
+            },
+            .text_select_all => {
+                selectAllConversation(state, computeGeometry(state, state.companion_controller.frame_width, state.companion_controller.frame_height).conversation);
+                state.companion_controller.closeMenu();
+            },
             .crew_open => state.openCompanionChatRow(false, result.index),
             .inbox_open => state.openCompanionChatRow(true, result.index),
             .suggestion => state.sendCompanionSuggestion(result.index),
@@ -164,10 +182,78 @@ pub fn handleMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, d
     return true;
 }
 
+/// Starts a selection (click/drag, double-click word, triple-click message)
+/// or opens the Copy / Select all menu on right-click in the conversation.
+fn handleConversationPress(state: *runtime.AppState, x: f32, y: f32, button: u8, clicks: u8, action: ?controller.HitAction) bool {
+    const companion = &state.companion_controller;
+    const geometry = computeGeometry(state, companion.frame_width, companion.frame_height);
+    const on_text = pointInRect(geometry.conversation, x, y) and (action == null or action.? == .body);
+    if (!on_text) {
+        // Clicking elsewhere in the panel (the composer, blank chrome) drops it.
+        if (button == 1 and action != null and action.? == .panel) {
+            companion.clearTextSelection();
+            companion.conversation_focused = false;
+        }
+        return false;
+    }
+    const point = conversationPointAt(state, geometry.conversation, x, y) orelse return false;
+    switch (button) {
+        1 => {
+            if (clicks >= 3) {
+                selectItemAt(state, geometry.conversation, point.item);
+            } else if (clicks == 2) {
+                selectWordAt(state, geometry.conversation, point);
+            } else {
+                companion.beginTextSelection(point);
+            }
+            state.blurCompanionComposer();
+        },
+        3 => {
+            companion.conversation_focused = true;
+            companion.openTextMenu(x, y);
+        },
+        else => return false,
+    }
+    refreshAfterAction(state);
+    return true;
+}
+
+/// Ctrl/Cmd+C copies the conversation selection; Ctrl/Cmd+A selects the
+/// whole conversation after a click in it. The composer keeps its own.
+pub fn handleTextShortcut(state: *runtime.AppState, event: *const palette.event.KeyEvent, primary: bool) bool {
+    if (!state.isCompanionEnabled()) return false;
+    if (!event.down or event.repeat or !primary or event.mod.shift or event.mod.alt) return false;
+    const companion = &state.companion_controller;
+    if (companion.visibility != .sidecar_open or state.companion_composer.focused) return false;
+    switch (event.key) {
+        .c => {
+            if (companion.textRange() == null) return false;
+            copyConversationSelection(state);
+            return true;
+        },
+        .a => {
+            if (!companion.conversation_focused) return false;
+            selectAllConversation(state, computeGeometry(state, companion.frame_width, companion.frame_height).conversation);
+            state.markDirty();
+            return true;
+        },
+        else => return false,
+    }
+}
+
 /// Prevents underlying hover routing only inside the dock or panel.
 pub fn handleMouseMotion(state: *runtime.AppState, x: f32, y: f32, dragging: bool) bool {
     if (!state.isCompanionEnabled()) return false;
     const companion = &state.companion_controller;
+    if (companion.text_dragging) {
+        const conversation = computeGeometry(state, companion.frame_width, companion.frame_height).conversation;
+        // Dragging past the top or bottom edge scrolls the conversation along.
+        if (y < conversation.y) companion.scrollConversation(-@min(conversation.y - y, companionScaled(24.0)));
+        if (y > conversation.y + conversation.h) companion.scrollConversation(@min(y - conversation.y - conversation.h, companionScaled(24.0)));
+        if (conversationPointAt(state, conversation, x, y)) |point| companion.extendTextSelection(point);
+        state.markDirty();
+        return true;
+    }
     if (companion.dock_press != null) {
         const bounds = dockBoundsAt(companion.frame_width, companion.frame_height, companionScale());
         if (companion.dragDock(x, y, companionScale(), bounds)) refreshAfterAction(state);
@@ -501,6 +587,7 @@ fn registerHits(state: *runtime.AppState, geometry: Geometry) void {
                 .none => {},
                 .companions => registerCompanionMenuHits(state, geometry),
                 .brain => registerBrainMenuHits(state, geometry),
+                .text => registerTextMenuHits(state, geometry),
             }
         },
     }
@@ -611,6 +698,7 @@ fn renderPanel(state: *runtime.AppState, geometry: Geometry) void {
         .none => {},
         .companions => renderCompanionMenu(state, geometry),
         .brain => renderBrainMenu(state, geometry),
+        .text => renderTextMenu(state, geometry),
     }
 }
 
@@ -967,10 +1055,10 @@ fn renderConversation(state: *runtime.AppState, geometry: Geometry) void {
     for (frame.activity[0..frame.activity_count]) |*item| total += conversationItemHeight(state, item, conversation);
     companion.updateConversationExtent(@max(total - conversation.h, 0.0));
     var y = conversation.y + pad - companion.conversation_scroll_y;
-    for (frame.activity[0..frame.activity_count]) |*item| {
+    for (frame.activity[0..frame.activity_count], 0..) |*item, index| {
         const height = conversationItemHeight(state, item, conversation);
         if (height > 0.0 and y + height >= conversation.y and y <= conversation.y + conversation.h) {
-            renderConversationItem(state, item, conversation, y);
+            renderConversationItem(state, index, item, conversation, y);
         }
         y += height;
     }
@@ -991,60 +1079,312 @@ fn renderFade(state: *runtime.AppState, conversation: palette.Rect, top: bool) v
     }
 }
 
-fn renderConversationItem(state: *runtime.AppState, item: *const controller.ActivityItem, conversation: palette.Rect, y: f32) void {
+fn renderConversationItem(state: *runtime.AppState, item_index: usize, item: *const controller.ActivityItem, conversation: palette.Rect, y: f32) void {
     const s = companionScale();
     const chrome = theme.companionChrome();
+    const layout = itemTextLayout(state, item, conversation, y);
+    if (layout.bubble) |bubble| {
+        queuePanelClipped(state, bubble, color(opaqueOver(surface(), chrome.ready_fill)), color(opaqueOver(surface(), theme.withAlpha(chrome.accent, 60))), 12.0 * s, 1.0 * s, conversation);
+    }
+    renderTextSelection(state, item_index, &layout, conversation);
+    const text_color = switch (item.kind) {
+        .user, .assistant, .streaming => chrome.text,
+        .tool, .process, .system => chrome.text_subtle,
+    };
+    if (item.kind == .tool or item.kind == .process) {
+        const status = item.status orelse .completed;
+        const glyph: []const u8 = switch (status) {
+            .pending, .in_progress => "●",
+            .completed => "✓",
+            .failed => "✕",
+            .cancelled => "–",
+        };
+        const glyph_color = switch (status) {
+            .pending, .in_progress => chrome.accent,
+            .completed => chrome.text_subtle,
+            .failed => chrome.danger,
+            .cancelled => chrome.text_subtle,
+        };
+        queueText(state, .{ .x = conversation.x + CONTENT_INSET * s + 2.0 * s, .y = y + 4.0 * s, .w = 14.0 * s, .h = 16.0 * s }, glyph, color(glyph_color), 10.5 * s, conversation);
+    }
+    for (layout.lines[0..layout.count], 0..) |line, index| {
+        const last = index + 1 == layout.count;
+        const shown = if (last and item.kind == .streaming) framePrint(state, "{s} ▍", .{line.text}) else if (last and layout.truncated) framePrint(state, "{s} …", .{line.text}) else line.text;
+        const rect: palette.Rect = .{ .x = line.x, .y = line.y, .w = line.w, .h = line.h };
+        state.palette_overlay_batch.roleText(state.allocator, nonNegativeRect(rect), shown, color(text_color), line.font, line.role, null, nonNegativeRect(conversation)) catch |err| log.warn("failed to queue text: {s}", .{@errorName(err)});
+    }
+}
+
+// ---- selectable conversation text --------------------------------------------
+
+/// One drawn line of an activity item, positioned, with its byte offset into
+/// the item's displayed text. Rendering, hit-testing, highlighting and copy
+/// all read this one layout so they cannot drift apart.
+const SelectableLine = struct {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    text: []const u8,
+    offset: usize,
+    role: palette.FontRole,
+    font: f32,
+};
+
+const ItemTextLayout = struct {
+    /// Everything the item displays; selection offsets index into this.
+    text: []const u8 = "",
+    lines: [MAX_WRAP_LINES]SelectableLine = undefined,
+    count: usize = 0,
+    truncated: bool = false,
+    bubble: ?palette.Rect = null,
+};
+
+fn itemTextLayout(state: *runtime.AppState, item: *const controller.ActivityItem, conversation: palette.Rect, y: f32) ItemTextLayout {
+    const s = companionScale();
     const widths = conversationWidths(conversation);
     const x = conversation.x + CONTENT_INSET * s;
     const line_h = bodyLineHeight();
     const font = companionScaled(BODY_FONT);
+    var layout: ItemTextLayout = .{};
     switch (item.kind) {
-        .user => {
-            const wrapped = wrapText(conversationalText(state, item.body.slice()), widths.bubble, .ui, font, USER_MAX_LINES);
-            var widest: f32 = 0.0;
-            for (wrapped.lines[0..wrapped.count]) |line| widest = @max(widest, text_measure.textWidth(.ui, font, line));
-            const bubble_w = @min(widest + 22.0 * s, widths.bubble + 20.0 * s);
-            const bubble_h = @as(f32, @floatFromInt(@max(wrapped.count, 1))) * line_h + 18.0 * s;
-            const bubble: palette.Rect = .{ .x = x + widths.text - bubble_w, .y = y + 4.0 * s, .w = bubble_w, .h = bubble_h };
-            queuePanelClipped(state, bubble, color(opaqueOver(surface(), chrome.ready_fill)), color(opaqueOver(surface(), theme.withAlpha(chrome.accent, 60))), 12.0 * s, 1.0 * s, conversation);
-            for (wrapped.lines[0..wrapped.count], 0..) |line, index| {
-                queueText(state, .{ .x = bubble.x + 11.0 * s, .y = bubble.y + 9.0 * s + @as(f32, @floatFromInt(index)) * line_h, .w = widths.bubble + 4.0 * s, .h = line_h }, line, color(chrome.text), font, conversation);
+        .user, .assistant, .streaming => {
+            const user = item.kind == .user;
+            layout.text = conversationalText(state, item.body.slice());
+            const wrapped = wrapText(layout.text, if (user) widths.bubble else widths.text, .ui, font, if (user) USER_MAX_LINES else ASSISTANT_MAX_LINES);
+            layout.truncated = wrapped.truncated;
+            var origin_x = x;
+            var origin_y = y + 6.0 * s;
+            var line_w = widths.text + 12.0 * s;
+            if (user) {
+                var widest: f32 = 0.0;
+                for (wrapped.lines[0..wrapped.count]) |line| widest = @max(widest, text_measure.textWidth(.ui, font, line));
+                const bubble_w = @min(widest + 22.0 * s, widths.bubble + 20.0 * s);
+                const bubble_h = @as(f32, @floatFromInt(@max(wrapped.count, 1))) * line_h + 18.0 * s;
+                const bubble: palette.Rect = .{ .x = x + widths.text - bubble_w, .y = y + 4.0 * s, .w = bubble_w, .h = bubble_h };
+                layout.bubble = bubble;
+                origin_x = bubble.x + 11.0 * s;
+                origin_y = bubble.y + 9.0 * s;
+                line_w = widths.bubble + 4.0 * s;
             }
-        },
-        .assistant, .streaming => {
-            const wrapped = wrapText(conversationalText(state, item.body.slice()), widths.text, .ui, font, ASSISTANT_MAX_LINES);
+            var previous_end: usize = 0;
             for (wrapped.lines[0..wrapped.count], 0..) |line, index| {
-                const last = index + 1 == wrapped.count;
-                const shown = if (last and item.kind == .streaming) framePrint(state, "{s} ▍", .{line}) else if (last and wrapped.truncated) framePrint(state, "{s} …", .{line}) else line;
-                queueText(state, .{ .x = x, .y = y + 6.0 * s + @as(f32, @floatFromInt(index)) * line_h, .w = widths.text + 12.0 * s, .h = line_h }, shown, color(chrome.text), font, conversation);
+                const offset = sliceOffset(layout.text, line) orelse previous_end;
+                previous_end = offset + line.len;
+                layout.lines[index] = .{ .x = origin_x, .y = origin_y + @as(f32, @floatFromInt(index)) * line_h, .w = line_w, .h = line_h, .text = line, .offset = offset, .role = .ui, .font = font };
             }
+            layout.count = wrapped.count;
         },
         .tool, .process => {
-            const status = item.status orelse .completed;
-            const glyph: []const u8 = switch (status) {
-                .pending, .in_progress => "●",
-                .completed => "✓",
-                .failed => "✕",
-                .cancelled => "–",
-            };
-            const glyph_color = switch (status) {
-                .pending, .in_progress => chrome.accent,
-                .completed => chrome.text_subtle,
-                .failed => chrome.danger,
-                .cancelled => chrome.text_subtle,
-            };
-            queueText(state, .{ .x = x + 2.0 * s, .y = y + 4.0 * s, .w = 14.0 * s, .h = 16.0 * s }, glyph, color(glyph_color), 10.5 * s, conversation);
             const label = if (item.body.slice().len > 0)
                 framePrint(state, "{s} · {s}", .{ item.author.slice(), singleLineText(state, item.body.slice()) })
             else
                 item.author.slice();
             const text_w = @max(widths.text - 20.0 * s, 0.0);
-            queueMonoText(state, .{ .x = x + 18.0 * s, .y = y + 4.0 * s, .w = text_w, .h = 16.0 * s }, truncatedText(state, .mono, 10.5 * s, text_w, label), color(chrome.text_subtle), 10.5 * s, conversation);
+            layout.text = truncatedText(state, .mono, 10.5 * s, text_w, label);
+            layout.lines[0] = .{ .x = x + 18.0 * s, .y = y + 4.0 * s, .w = text_w, .h = 16.0 * s, .text = layout.text, .offset = 0, .role = .mono, .font = 10.5 * s };
+            layout.count = 1;
         },
         .system => {
-            const text_w = widths.text;
-            queueText(state, .{ .x = x, .y = y + 3.0 * s, .w = text_w, .h = 16.0 * s }, truncatedText(state, .ui, 11.0 * s, text_w, singleLineText(state, item.body.slice())), color(chrome.text_subtle), 11.0 * s, conversation);
+            if (std.mem.trim(u8, item.body.slice(), " \t\r\n").len == 0) return layout;
+            layout.text = truncatedText(state, .ui, 11.0 * s, widths.text, singleLineText(state, item.body.slice()));
+            layout.lines[0] = .{ .x = x, .y = y + 3.0 * s, .w = widths.text, .h = 16.0 * s, .text = layout.text, .offset = 0, .role = .ui, .font = 11.0 * s };
+            layout.count = 1;
         },
+    }
+    return layout;
+}
+
+/// Byte offset of `part` inside `whole` when it is a sub-slice of it.
+fn sliceOffset(whole: []const u8, part: []const u8) ?usize {
+    if (part.len == 0) return null;
+    const base = @intFromPtr(whole.ptr);
+    const at = @intFromPtr(part.ptr);
+    if (at < base or at + part.len > base + whole.len) return null;
+    return at - base;
+}
+
+/// Top y of every activity item, matching `renderConversation`.
+fn conversationItemTop(state: *runtime.AppState, conversation: palette.Rect, target: usize) f32 {
+    const companion = &state.companion_controller;
+    var y = conversation.y + 10.0 * companionScale() - companion.conversation_scroll_y;
+    for (companion.presentation.activity[0..@min(target, companion.presentation.activity_count)]) |*item| y += conversationItemHeight(state, item, conversation);
+    return y;
+}
+
+/// Byte index in `line` nearest to x (snapped to a UTF-8 boundary).
+fn lineByteAtX(line: SelectableLine, x: f32) usize {
+    if (x <= line.x) return 0;
+    var previous_boundary: usize = 0;
+    var previous_w: f32 = 0.0;
+    var index: usize = 0;
+    while (index < line.text.len) {
+        const step = std.unicode.utf8ByteSequenceLength(line.text[index]) catch 1;
+        index = @min(index + step, line.text.len);
+        const w = text_measure.textPrefixWidth(line.role, line.text, line.font, index);
+        if (line.x + (previous_w + w) * 0.5 >= x) return previous_boundary;
+        previous_boundary = index;
+        previous_w = w;
+    }
+    return line.text.len;
+}
+
+/// Caret position under a pointer, clamped into the conversation's items.
+fn conversationPointAt(state: *runtime.AppState, conversation: palette.Rect, x: f32, y: f32) ?controller.TextPoint {
+    const companion = &state.companion_controller;
+    const count = companion.presentation.activity_count;
+    if (count == 0) return null;
+    var top = conversationItemTop(state, conversation, 0);
+    if (y < top) return .{ .item = 0, .offset = 0 };
+    var last_text: ?controller.TextPoint = null;
+    for (companion.presentation.activity[0..count], 0..) |*item, index| {
+        const height = conversationItemHeight(state, item, conversation);
+        defer top += height;
+        if (height <= 0.0) continue;
+        const layout = itemTextLayout(state, item, conversation, top);
+        if (layout.count == 0) continue;
+        last_text = .{ .item = index, .offset = layout.text.len };
+        if (y >= top + height) continue;
+        var line = layout.lines[layout.count - 1];
+        for (layout.lines[0..layout.count]) |candidate| {
+            if (y < candidate.y + candidate.h) {
+                line = candidate;
+                break;
+            }
+        }
+        return .{ .item = index, .offset = @min(line.offset + lineByteAtX(line, x), layout.text.len) };
+    }
+    return last_text;
+}
+
+/// Text an item displays (what selection offsets index into).
+fn itemSelectableText(state: *runtime.AppState, index: usize, conversation: palette.Rect) []const u8 {
+    const companion = &state.companion_controller;
+    if (index >= companion.presentation.activity_count) return "";
+    return itemTextLayout(state, &companion.presentation.activity[index], conversation, 0.0).text;
+}
+
+fn isWordByte(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-' or byte >= 0x80;
+}
+
+fn selectWordAt(state: *runtime.AppState, conversation: palette.Rect, point: controller.TextPoint) void {
+    const text = itemSelectableText(state, point.item, conversation);
+    var start = @min(point.offset, text.len);
+    var end = start;
+    while (start > 0 and isWordByte(text[start - 1])) start -= 1;
+    while (end < text.len and isWordByte(text[end])) end += 1;
+    if (start == end and end < text.len) end = utf8FloorIndex(text, end + 1);
+    state.companion_controller.selectTextRange(.{ .item = point.item, .offset = start }, .{ .item = point.item, .offset = end });
+}
+
+fn selectItemAt(state: *runtime.AppState, conversation: palette.Rect, item: usize) void {
+    const text = itemSelectableText(state, item, conversation);
+    state.companion_controller.selectTextRange(.{ .item = item, .offset = 0 }, .{ .item = item, .offset = text.len });
+}
+
+fn selectAllConversation(state: *runtime.AppState, conversation: palette.Rect) void {
+    const count = state.companion_controller.presentation.activity_count;
+    if (count == 0) return;
+    const text = itemSelectableText(state, count - 1, conversation);
+    state.companion_controller.selectTextRange(.{ .item = 0, .offset = 0 }, .{ .item = count - 1, .offset = text.len });
+}
+
+/// Selected conversation text, items separated by a blank line. Caller frees.
+fn selectedTextAlloc(state: *runtime.AppState, allocator: std.mem.Allocator, conversation: palette.Rect) !?[]u8 {
+    const range = state.companion_controller.textRange() orelse return null;
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var item = range.start.item;
+    while (item <= range.end.item and item < state.companion_controller.presentation.activity_count) : (item += 1) {
+        const text = itemSelectableText(state, item, conversation);
+        const from = if (item == range.start.item) @min(range.start.offset, text.len) else 0;
+        const to = if (item == range.end.item) @min(range.end.offset, text.len) else text.len;
+        if (to <= from) continue;
+        if (out.items.len > 0) try out.appendSlice(allocator, "\n\n");
+        try out.appendSlice(allocator, text[from..to]);
+    }
+    if (out.items.len == 0) {
+        out.deinit(allocator);
+        return null;
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+fn copyConversationSelection(state: *runtime.AppState) void {
+    const companion = &state.companion_controller;
+    const geometry = computeGeometry(state, companion.frame_width, companion.frame_height);
+    const text = (selectedTextAlloc(state, state.allocator, geometry.conversation) catch {
+        state.setSidebarNotice("Failed to copy selection.");
+        return;
+    }) orelse return;
+    defer state.allocator.free(text);
+    if (state.setClipboardText(text)) state.setSidebarNotice("Copied selection.") else state.setSidebarNotice("Failed to copy selection.");
+}
+
+/// Highlights the selected part of each line of one item.
+fn renderTextSelection(state: *runtime.AppState, item_index: usize, layout: *const ItemTextLayout, conversation: palette.Rect) void {
+    const range = state.companion_controller.textRange() orelse return;
+    if (item_index < range.start.item or item_index > range.end.item) return;
+    const from = if (item_index == range.start.item) range.start.offset else 0;
+    const to = if (item_index == range.end.item) range.end.offset else layout.text.len;
+    const fill = color(theme.withAlpha(theme.selection(), 90));
+    for (layout.lines[0..layout.count], 0..) |line, index| {
+        const line_end = line.offset + line.text.len;
+        // A selection running past this line also covers its line break.
+        const spans_break = to > line_end and index + 1 < layout.count;
+        if (to <= line.offset or from > line_end or (from == line_end and !spans_break)) continue;
+        const a = @max(from, line.offset) - line.offset;
+        const b = @min(to, line_end) - line.offset;
+        const x0 = line.x + text_measure.textPrefixWidth(line.role, line.text, line.font, a);
+        var x1 = line.x + text_measure.textPrefixWidth(line.role, line.text, line.font, b);
+        if (spans_break) x1 += line.font * 0.35;
+        if (x1 <= x0) continue;
+        queueRoundedRectClipped(state, .{ .x = x0, .y = line.y, .w = x1 - x0, .h = line.h }, fill, 2.0 * companionScale(), conversation);
+    }
+}
+
+// ---- conversation text menu -----------------------------------------------------
+
+const TEXT_MENU_ROWS = [_]struct { label: []const u8, action: controller.HitAction }{
+    .{ .label = "Copy", .action = .text_copy },
+    .{ .label = "Select all", .action = .text_select_all },
+};
+
+const TextMenuLayout = struct { menu: palette.Rect, rows: [TEXT_MENU_ROWS.len]palette.Rect };
+
+fn textMenuLayout(state: *runtime.AppState, geometry: Geometry) TextMenuLayout {
+    const companion = &state.companion_controller;
+    const pad = theme.scaledUi(context_menu.PAD_UI);
+    const row_h = theme.scaledUi(context_menu.ROW_HEIGHT_UI);
+    const w = theme.scaledUi(150.0);
+    const h = pad * 2.0 + row_h * @as(f32, @floatFromInt(TEXT_MENU_ROWS.len));
+    const x = std.math.clamp(companion.text_menu_x, geometry.window.x, @max(geometry.window.x + geometry.window.w - w, geometry.window.x));
+    const y = std.math.clamp(companion.text_menu_y, geometry.window.y, @max(geometry.window.y + geometry.window.h - h, geometry.window.y));
+    var layout: TextMenuLayout = .{ .menu = .{ .x = x, .y = y, .w = w, .h = h }, .rows = undefined };
+    for (&layout.rows, 0..) |*row, index| row.* = .{ .x = x + pad, .y = y + pad + row_h * @as(f32, @floatFromInt(index)), .w = w - pad * 2.0, .h = row_h };
+    return layout;
+}
+
+fn registerTextMenuHits(state: *runtime.AppState, geometry: Geometry) void {
+    const companion = &state.companion_controller;
+    const layout = textMenuLayout(state, geometry);
+    companion.addHit(geometry.window, .menu_dismiss);
+    companion.addHit(layout.menu, .body);
+    const has_selection = companion.textRange() != null;
+    for (TEXT_MENU_ROWS, layout.rows) |row, rect| {
+        if (row.action == .text_copy and !has_selection) continue;
+        companion.addHit(rect, row.action);
+    }
+}
+
+fn renderTextMenu(state: *runtime.AppState, geometry: Geometry) void {
+    const layout = textMenuLayout(state, geometry);
+    const panel = context_menu.queuePanel(state, layout.menu);
+    const has_selection = state.companion_controller.textRange() != null;
+    for (TEXT_MENU_ROWS, layout.rows) |row, rect| {
+        const enabled = row.action != .text_copy or has_selection;
+        context_menu.queueLabel(state, rect, row.label, context_menu.labelColor(enabled, false), 0.0, 0.0, panel);
     }
 }
 
@@ -2502,4 +2842,64 @@ test "bubble stays compact, grows a pill only for notifications, and drags insid
     // The bubble's hit still routes to the open action.
     registerHits(&state, geometry);
     try std.testing.expectEqual(controller.HitAction.open, companion.hitAt(geometry.dock_bubble.x + 10.0, geometry.dock_bubble.y + 10.0).?);
+}
+
+test "conversation text selects by drag, word, and message and copies across items" {
+    const allocator = std.testing.allocator;
+    theme.applyTheme(1.0);
+    var state: runtime.AppState = undefined;
+    try testState(allocator, &state);
+    defer deinitTestState(allocator, &state);
+    state.companion_controller.show();
+    state.companion_controller.settleTransition();
+    var frame: controller.Frame = .{ .has_thread = true };
+    _ = frame.setOwner("companion-ui", "chat-1");
+    var user: controller.ActivityItem = .{ .kind = .user, .sequence = 1 };
+    user.body.set("Fix the build");
+    frame.appendActivity(user);
+    var reply: controller.ActivityItem = .{ .kind = .assistant, .sequence = 2 };
+    reply.body.set("Opened a codex chat for it.");
+    frame.appendActivity(reply);
+    state.companion_controller.setFrame(frame);
+    const geometry = computeGeometry(&state, 1360.0, 860.0);
+    const conversation = geometry.conversation;
+
+    // The point under the start of the reply's first line is offset 0 there.
+    const top = conversationItemTop(&state, conversation, 1);
+    const layout = itemTextLayout(&state, &state.companion_controller.presentation.activity[1], conversation, top);
+    try std.testing.expectEqualStrings("Opened a codex chat for it.", layout.text);
+    const first = layout.lines[0];
+    const start = conversationPointAt(&state, conversation, first.x - 4.0, first.y + first.h * 0.5).?;
+    try std.testing.expectEqual(controller.TextPoint{ .item = 1, .offset = 0 }, start);
+
+    selectWordAt(&state, conversation, .{ .item = 1, .offset = 10 });
+    var copied = (try selectedTextAlloc(&state, allocator, conversation)).?;
+    try std.testing.expectEqualStrings("codex", copied);
+    allocator.free(copied);
+
+    selectItemAt(&state, conversation, 0);
+    copied = (try selectedTextAlloc(&state, allocator, conversation)).?;
+    try std.testing.expectEqualStrings("Fix the build", copied);
+    allocator.free(copied);
+
+    // Drag from inside the user message into the reply joins with a blank line.
+    state.companion_controller.beginTextSelection(.{ .item = 0, .offset = 8 });
+    state.companion_controller.extendTextSelection(.{ .item = 1, .offset = 6 });
+    copied = (try selectedTextAlloc(&state, allocator, conversation)).?;
+    try std.testing.expectEqualStrings("build\n\nOpened", copied);
+    allocator.free(copied);
+
+    selectAllConversation(&state, conversation);
+    render(&state, 1360.0, 860.0);
+    copied = (try selectedTextAlloc(&state, allocator, conversation)).?;
+    defer allocator.free(copied);
+    try std.testing.expectEqualStrings("Fix the build\n\nOpened a codex chat for it.", copied);
+
+    // Right-click opens Copy / Select all above a dismiss layer.
+    state.companion_controller.openTextMenu(400.0, 300.0);
+    registerHits(&state, geometry);
+    const menu = textMenuLayout(&state, geometry);
+    try std.testing.expectEqual(controller.HitAction.text_copy, state.companion_controller.hitAt(menu.rows[0].x + 4.0, menu.rows[0].y + 4.0).?);
+    try std.testing.expectEqual(controller.HitAction.text_select_all, state.companion_controller.hitAt(menu.rows[1].x + 4.0, menu.rows[1].y + 4.0).?);
+    try std.testing.expectEqual(controller.HitAction.menu_dismiss, state.companion_controller.hitAt(5.0, 5.0).?);
 }

@@ -124,6 +124,11 @@ pub fn handleCompanionMouseButton(state: *runtime.AppState, x: f32, y: f32, butt
     return companion.handleMouseButton(state, x, y, button, down, clicks);
 }
 
+/// Copy / select-all shortcuts for the Companion conversation text.
+pub fn handleCompanionTextShortcut(state: *runtime.AppState, event: *const palette.event.KeyEvent, primary: bool) bool {
+    return companion.handleTextShortcut(state, event, primary);
+}
+
 /// Routes pointer motion to the visible Companion surface only.
 pub fn handleCompanionMouseMotion(state: *runtime.AppState, x: f32, y: f32, dragging: bool) bool {
     return companion.handleMouseMotion(state, x, y, dragging);

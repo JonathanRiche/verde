@@ -12,3 +12,8 @@
 Every changed input needs a metric-aligned caret; click/drag, double-click word, and triple-click field/line selection; Left/Right/Home/End with Shift; platform select-all/copy/cut/paste; selection-aware insertion/Backspace/Delete; and blur cleanup. Strip control characters in single-line fields.
 
 References: `browser.zig` (URL bar), `layout.zig` (modal fields). Keep transcript categories centralized in `chat_panel.zig`; provider event rules live in [../providers/AGENTS.md](../providers/AGENTS.md).
+
+## Selectable text
+
+Content text (transcripts, the Companion conversation, logs, details, error bodies) must be selectable and copyable; controls and chrome (buttons, chips, menus, sidebar rows, tabs, badges) stay plain. Required: click-drag selection with a visible highlight that auto-scrolls past the viewport edge, double-click word and triple-click message/line selection, primary-modifier+C copy and +A select-all once the surface was clicked, a right-click Copy / Select all menu (`context_menu.zig` chrome), and Escape to clear. Drive rendering, hit-testing, highlight, and copy from one positioned line layout so they cannot drift; see `itemTextLayout` in `companion.zig` and the transcript selection in `chat_panel.zig`. Never log copied text.
+
