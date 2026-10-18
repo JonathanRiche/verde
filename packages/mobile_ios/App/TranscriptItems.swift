@@ -178,11 +178,37 @@ func toolStatusLabel(_ row: ChatRow) -> String {
     commandFailed(row) ? "Failed" : commandRunning(row) ? "Running" : "Completed"
 }
 
+/// Consecutive live-voice lines from one speaker become one row (the first row's id, the last
+/// row's delivery): a user turn's pieces are merged by `mergedSpeech` (which also cleans up older
+/// saves of fragments and cumulative snapshots), a companion's replies become paragraphs.
+func groupVoiceRows(_ rows: [ChatRow]) -> [ChatRow] {
+    var out: [ChatRow] = []
+    out.reserveCapacity(rows.count)
+    var run: [ChatRow] = []
+    func flush() {
+        guard var merged = run.first else { return }
+        if run.count > 1 {
+            let bodies = run.map(\.body)
+            merged.body = merged.role == "user" ? mergedSpeech(bodies)
+                : bodies.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }.joined(separator: "\n\n")
+            merged.delivery = run[run.count - 1].delivery
+        }
+        out.append(merged)
+        run = []
+    }
+    for row in rows {
+        let voice = (row.role == "user" || row.role == "assistant") && isVoiceSpeaker(row.author)
+        if let first = run.first, !(voice && row.role == first.role && row.author == first.author) { flush() }
+        if voice { run.append(row) } else { out.append(row) }
+    }
+    flush()
+    return out
+}
+
 /// Pure projection from the core's thread view to renderable items (oldest first).
 func transcriptItems(_ view: ChatThreadView) -> [TranscriptItem] {
     var out: [TranscriptItem] = []
     out.reserveCapacity(view.rows.count + 2)
-    let lastUsage = view.usage == nil ? -1 : (view.rows.lastIndex { $0.role == "system" && $0.author == "Usage" } ?? -1)
     var run: [ChatRow] = []
     var runSubagent = false
     func flush() {
@@ -193,7 +219,9 @@ func transcriptItems(_ view: ChatThreadView) -> [TranscriptItem] {
         run = []
         runSubagent = false
     }
-    for (index, row) in view.rows.enumerated() {
+    let rows = view.rows.contains(where: { isVoiceSpeaker($0.author) }) ? groupVoiceRows(view.rows) : view.rows
+    let lastUsage = view.usage == nil ? -1 : (rows.lastIndex { $0.role == "system" && $0.author == "Usage" } ?? -1)
+    for (index, row) in rows.enumerated() {
         if row.author == hiddenAuthor { continue }
         if let notifications = childNotifications(role: row.role, body: row.body) {
             flush()

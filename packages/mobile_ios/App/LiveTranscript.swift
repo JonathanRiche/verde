@@ -4,7 +4,8 @@ import Foundation
  * The text record of a live voice conversation, saved into the companion's chat
  * (`companion_transcript_save`) so the conversation survives as ordinary history. Pure and unit
  * tested: lines accumulate from streaming events, finished lines are saved in order, and keys
- * ("<session>:<n>") make every save idempotent. Audio is never kept.
+ * ("<session>:<n>") make every save idempotent. Audio is never kept. Everything the user says
+ * between companion replies or system lines is one user line (one turn), merged by `mergedSpeech`.
  */
 
 struct LiveTranscriptLine: Equatable {
@@ -28,13 +29,19 @@ struct LiveTranscript {
     private var counter = 0
     /// Lines are tracked by key: inserting or dropping lines never misdirects an update.
     private var userOpenKey: String?
+    private var userPiece = 0
     private var userItem: String?
     private var assistantOpenKey: String?
     /// The last user line plain deltas may still extend (Gemini sends input pieces late).
     private var appendKey: String?
+    private var appendPiece = 0
     private var lastUserUpdate: Int64 = 0
-    /// Transcription item id → its line, so updates for an item replace that line.
-    private var itemKeys: [String: String] = [:]
+    /// The user line collecting the current turn; it is not saved until the turn ends.
+    private var turnKey: String?
+    /// Each user line's utterances (raw text, oldest first); its body is `mergedSpeech` of them.
+    private var pieces: [String: [String]] = [:]
+    /// Transcription item id → its line and utterance, so updates for an item replace that text.
+    private var itemRefs: [String: PieceRef] = [:]
     /// xAI's cumulative transcript keeps growing across utterances: the part already committed
     /// to closed lines, and the newest snapshot.
     private var cumulativeStream = false
@@ -74,10 +81,31 @@ struct LiveTranscript {
         return lines.firstIndex { $0.key == key }
     }
 
+    /// One utterance within a user line.
+    private struct PieceRef: Equatable {
+        var key: String
+        var piece: Int
+    }
+
+    private func pieceText(_ ref: PieceRef) -> String {
+        guard let list = pieces[ref.key], ref.piece < list.count else { return "" }
+        return list[ref.piece]
+    }
+
+    /// Replaces one utterance of a user line and rebuilds the line from its utterances.
+    private mutating func setPiece(_ ref: PieceRef, _ text: String, line: Int) {
+        var list = pieces[ref.key] ?? [lines[line].body]
+        while list.count <= ref.piece { list.append("") }
+        list[ref.piece] = text
+        pieces[ref.key] = list
+        lines[line].body = mergedSpeech(list)
+    }
+
     /// What the user said, per transcription `item`. `cumulative` and `final` updates carry the
     /// whole transcript so far (replace); others are deltas (append). On a cumulative stream the
     /// text already committed to earlier lines is stripped, so each utterance is saved once.
-    /// A late final transcript goes before the unsaved reply it triggered.
+    /// A late final transcript goes before the unsaved reply it triggered. A new utterance joins
+    /// the same turn's unsaved user line instead of starting another one.
     mutating func user(_ text: String, final: Bool, cumulative: Bool, item: String? = nil, at: Int64) {
         let whole = cumulative || final
         if let item, userOpenKey != nil, let current = userItem, current != item { closeUser() }
@@ -94,37 +122,60 @@ struct LiveTranscript {
         body = body.trimmingCharacters(in: .whitespacesAndNewlines)
         lastUserUpdate = at
 
-        // The open line, or (for the same item, not new speech) the item's unsaved closed line.
-        var target = index(of: userOpenKey)
-        if target == nil, !stripped, let item, let line = index(of: itemKeys[item]), line >= saved { target = line }
-        if target == nil, !whole, let line = index(of: appendKey), line >= saved { target = line }
+        // The open utterance, or (for the same item, not new speech) the item's unsaved closed line.
+        var target: PieceRef?
+        if let key = userOpenKey, index(of: key) != nil { target = PieceRef(key: key, piece: userPiece) }
+        if target == nil, !stripped, let item, let ref = itemRefs[item], let line = index(of: ref.key), line >= saved { target = ref }
+        if target == nil, !whole, let key = appendKey, let line = index(of: key), line >= saved { target = PieceRef(key: key, piece: appendPiece) }
 
-        if let line = target {
+        if let ref = target, let line = index(of: ref.key) {
             if whole {
-                if !body.isEmpty { lines[line].body = body }
+                if !body.isEmpty { setPiece(ref, body, line: line) }
             } else {
-                lines[line].body += text
+                setPiece(ref, pieceText(ref) + text, line: line)
             }
-            if let item { itemKeys[item] = lines[line].key }
-            if final && lines[line].key == userOpenKey { closeUser() }
+            if let item { itemRefs[item] = ref }
+            if final && ref.key == userOpenKey { closeUser() }
             return
         }
         guard !body.isEmpty else { return }
         // A delta keeps its spacing ("check " + "the build"); lines are trimmed when they close.
         let firstText = whole ? body : text
         let trailing = lines.indices.last.flatMap { lines[$0].role == "assistant" && $0 >= saved && $0 > 0 ? $0 : nil }
-        let key: String
-        if final, let reply = index(of: assistantOpenKey) ?? trailing {
-            key = nextKey()
+        let reply: Int? = final ? (index(of: assistantOpenKey) ?? trailing) : nil
+        // The turn's unsaved user line: just before the reply a late transcript belongs to, or the open turn.
+        var turnLine: Int?
+        if let reply {
+            if reply > saved, lines[reply - 1].role == "user" { turnLine = reply - 1 }
+        } else if let line = index(of: turnKey), line == lines.count - 1, line >= saved {
+            turnLine = line
+        }
+        let ref: PieceRef
+        if let line = turnLine {
+            let key = lines[line].key
+            var list = pieces[key] ?? [lines[line].body]
+            ref = PieceRef(key: key, piece: list.count)
+            list.append(firstText)
+            pieces[key] = list
+            lines[line].body = mergedSpeech(list)
+        } else if let reply {
+            let key = nextKey()
             lines.insert(LiveTranscriptLine(key: key, role: "user", author: userAuthor, body: firstText,
                                             createdAtMs: min(at, lines[reply].createdAtMs - 1)), at: reply)
+            pieces[key] = [firstText]
+            ref = PieceRef(key: key, piece: 0)
         } else {
-            key = lines[append(role: "user", author: userAuthor, body: firstText, at: at)].key
+            let key = lines[append(role: "user", author: userAuthor, body: firstText, at: at)].key
+            pieces[key] = [firstText]
+            ref = PieceRef(key: key, piece: 0)
         }
-        userOpenKey = key
+        if reply == nil { turnKey = ref.key }
+        userOpenKey = ref.key
+        userPiece = ref.piece
         userItem = item
-        appendKey = key
-        if let item { itemKeys[item] = key }
+        appendKey = ref.key
+        appendPiece = ref.piece
+        if let item { itemRefs[item] = ref }
         if final { closeUser() }
     }
 
@@ -135,6 +186,7 @@ struct LiveTranscript {
         } else {
             guard !delta.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
             closeUser()
+            turnKey = nil
             assistantOpenKey = lines[append(role: "assistant", author: assistantAuthor, body: delta, at: at)].key
         }
     }
@@ -143,7 +195,7 @@ struct LiveTranscript {
     /// utterance; OpenAI-style sessions end it when the user starts speaking again.
     mutating func endResponse(newTurn: Bool = false) {
         closeAssistant()
-        if newTurn { closeUser(); appendKey = nil }
+        if newTurn { closeUser(); appendKey = nil; turnKey = nil }
     }
 
     /// The user started a new utterance (barge-in included).
@@ -158,6 +210,7 @@ struct LiveTranscript {
         closeUser()
         closeAssistant()
         appendKey = nil
+        turnKey = nil
         append(role: "system", author: Self.systemAuthor, body: text, at: at)
     }
 
@@ -191,7 +244,9 @@ struct LiveTranscript {
         let key = lines[line].key
         lines.remove(at: line)
         if appendKey == key { appendKey = nil }
-        itemKeys = itemKeys.filter { $0.value != key }
+        if turnKey == key { turnKey = nil }
+        pieces[key] = nil
+        itemRefs = itemRefs.filter { $0.value.key != key }
     }
 
     private mutating func closeAssistant() {
@@ -203,6 +258,7 @@ struct LiveTranscript {
     mutating func finish() {
         closeUser()
         closeAssistant()
+        turnKey = nil
     }
 
     /// The utterance being transcribed (or the last one), for captions.
@@ -211,10 +267,11 @@ struct LiveTranscript {
         return lines.last { $0.role == "user" }?.body
     }
 
-    /// Finished lines not yet saved, oldest first; open lines (and anything after them) wait.
+    /// Finished lines not yet saved, oldest first; open lines, the user turn still being spoken,
+    /// and anything after them wait.
     var unsaved: [LiveTranscriptLine] {
         guard !isEmpty else { return [] }
-        let open = [index(of: assistantOpenKey), index(of: userOpenKey)].compactMap { $0 }.min() ?? lines.count
+        let open = [index(of: assistantOpenKey), index(of: userOpenKey), index(of: turnKey)].compactMap { $0 }.min() ?? lines.count
         guard open > saved else { return [] }
         return Array(lines[saved..<open]).filter { !$0.body.isEmpty }
     }
@@ -232,6 +289,52 @@ func transcriptBatches(_ lines: [LiveTranscriptLine], limit: Int = LiveTranscrip
 
 /// Voice-conversation lines in the chat (rendered with a mic glyph in the Companion sheet).
 func isVoiceAuthor(_ author: String) -> Bool { author.hasSuffix("(voice)") || author == LiveTranscript.systemAuthor }
+
+/// A spoken line's speaker ("You (voice)", "Moss (voice)"), not a "Live" marker.
+func isVoiceSpeaker(_ author: String) -> Bool { author.hasSuffix("(voice)") }
+
+/// "Moss (voice)" → "Moss".
+func voiceSpeakerName(_ author: String) -> String {
+    var name = author
+    if name.hasSuffix("(voice)") { name = String(name.dropLast("(voice)".count)) }
+    return name.trimmingCharacters(in: .whitespaces)
+}
+
+/// One user turn's text from its utterances, oldest first. A piece whose words contain all the
+/// earlier pieces' words, or start with the first earlier pieces holding most of their words (the
+/// rest were drafts it re-transcribes), is a cumulative snapshot that replaces them. The pieces
+/// left are joined with single spaces. Pieces without words are dropped.
+func mergedSpeech(_ pieces: [String]) -> String {
+    var kept: [String] = []
+    var keptWords: [String] = []
+    for piece in pieces {
+        let text = piece.trimmingCharacters(in: .whitespacesAndNewlines)
+        let words = normalizedSpeech(text)
+        guard !words.isEmpty else { continue }
+        if !keptWords.isEmpty && speechSupersedes(words, keptWords) {
+            kept = []
+            keptWords = []
+        }
+        kept.append(text)
+        keptWords.append(words)
+    }
+    return kept.joined(separator: " ")
+}
+
+/// `words` (normalized) restates the normalized `earlier` pieces.
+private func speechSupersedes(_ words: String, _ earlier: [String]) -> Bool {
+    let all = earlier.joined(separator: " ")
+    if (" " + words + " ").contains(" " + all + " ") { return true }
+    let total = all.split(separator: " ").count
+    var prefix = ""
+    var covered = 0
+    for piece in earlier {
+        prefix = prefix.isEmpty ? piece : prefix + " " + piece
+        guard (words + " ").hasPrefix(prefix + " ") else { break }
+        covered += piece.split(separator: " ").count
+    }
+    return covered * 2 > total
+}
 
 // MARK: - Speech text matching
 

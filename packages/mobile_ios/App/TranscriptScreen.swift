@@ -409,7 +409,9 @@ private struct MessageRow: View {
         // A parent agent's steer shows only its words, labelled apart from the human's turns.
         let steer = parentSteerBody(role: row.role, body: row.body)
         let shown = steer ?? row.body
-        if compact && steer == nil {
+        if steer == nil && isVoiceSpeaker(row.author) {
+            VoiceMessageRow(row: row, mine: mine, compact: compact)
+        } else if compact && steer == nil {
             CompactMessageRow(row: row, model: model, mine: mine, shown: shown)
         } else {
             regular(mine: mine, steer: steer, shown: shown)
@@ -454,6 +456,65 @@ private struct MessageRow: View {
     }
 }
 
+/// A live voice turn (consecutive lines grouped by `groupVoiceRows`): yours styled like a typed
+/// message (a right-aligned bubble in the Companion sheet), the companion's as assistant text on
+/// the left, each under a small mic and "<speaker> · voice".
+private struct VoiceMessageRow: View {
+    let row: ChatRow
+    let mine: Bool
+    let compact: Bool
+
+    private var speaker: String {
+        if mine { return "You" }
+        let name = voiceSpeakerName(row.author)
+        return name.isEmpty ? "Companion" : name
+    }
+
+    var body: some View {
+        content
+            .contextMenu { Button("Copy message") { UIPasteboard.general.string = row.body } }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(speaker + ", by voice: " + row.body)
+            .accessibilityIdentifier("message-row")
+    }
+
+    private var label: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "mic.fill").font(.system(size: compact ? 9 : 10)).accessibilityHidden(true)
+            Text(speaker + " · voice").font(compact ? VerdeTheme.ui(11) : Font.caption.weight(.medium))
+        }
+        .foregroundStyle(.secondary)
+    }
+
+    @ViewBuilder private var content: some View {
+        if compact && mine {
+            HStack(alignment: .bottom, spacing: 0) {
+                Spacer(minLength: 56)
+                VStack(alignment: .trailing, spacing: 2) {
+                    label
+                    Text(row.body).font(VerdeTheme.ui(14)).textSelection(.enabled)
+                        .padding(.horizontal, 10).padding(.vertical, 8)
+                        .background(VerdeTheme.user, in: RoundedRectangle(cornerRadius: 12))
+                }
+            }
+        } else if compact {
+            VStack(alignment: .leading, spacing: 2) {
+                label
+                Text(row.body).font(VerdeTheme.ui(14)).textSelection(.enabled)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        } else {
+            VStack(alignment: .leading, spacing: 4) {
+                label
+                Text(row.body).font(VerdeTheme.ui(15)).textSelection(.enabled)
+            }
+            .padding(.horizontal, 12).padding(.vertical, 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(mine ? VerdeTheme.user : VerdeTheme.assistant, in: RoundedRectangle(cornerRadius: 12))
+        }
+    }
+}
+
 /// Companion sheet: your messages as compact right-aligned bubbles, replies as plain text.
 private struct CompactMessageRow: View {
     let row: ChatRow
@@ -463,7 +524,6 @@ private struct CompactMessageRow: View {
 
     var body: some View {
         let delivery = deliveryLabel(row.delivery)
-        let voice = isVoiceAuthor(row.author)
         HStack(alignment: .bottom, spacing: 0) {
             if mine { Spacer(minLength: 56) }
             VStack(alignment: mine ? .trailing : .leading, spacing: 2) {
@@ -473,18 +533,9 @@ private struct CompactMessageRow: View {
                 }
                 if !shown.isEmpty {
                     if mine {
-                        HStack(alignment: .firstTextBaseline, spacing: 5) {
-                            if voice { Image(systemName: "mic.fill").font(.system(size: 10)).foregroundStyle(.secondary).accessibilityHidden(true) }
-                            Text(shown).font(VerdeTheme.ui(14)).textSelection(.enabled)
-                        }
-                        .padding(.horizontal, 10).padding(.vertical, 8)
-                        .background(VerdeTheme.user, in: RoundedRectangle(cornerRadius: 12))
-                    } else if voice {
-                        // A spoken reply from a live conversation: plain text with a small mic.
-                        HStack(alignment: .firstTextBaseline, spacing: 5) {
-                            Image(systemName: "mic.fill").font(.system(size: 10)).foregroundStyle(.secondary).accessibilityHidden(true)
-                            Text(shown).font(VerdeTheme.ui(14)).textSelection(.enabled)
-                        }
+                        Text(shown).font(VerdeTheme.ui(14)).textSelection(.enabled)
+                            .padding(.horizontal, 10).padding(.vertical, 8)
+                            .background(VerdeTheme.user, in: RoundedRectangle(cornerRadius: 12))
                     } else {
                         MarkdownText(text: streamTail(row), model: model)
                     }
@@ -497,7 +548,7 @@ private struct CompactMessageRow: View {
             .contextMenu { Button("Copy message") { UIPasteboard.general.string = shown } }
         }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel((mine ? (voice ? "You, by voice: " : "You: ") : (row.author.isEmpty ? "Reply: " : row.author + ": ")) + shown)
+        .accessibilityLabel((mine ? "You: " : (row.author.isEmpty ? "Reply: " : row.author + ": ")) + shown)
         .accessibilityIdentifier("message-row")
     }
 }
@@ -717,14 +768,16 @@ private struct NoticeRow: View {
     @Environment(\.compactChat) private var compact
 
     var body: some View {
-        if compact && isVoiceAuthor(row.author) {
+        if isVoiceAuthor(row.author) {
             // Live conversation markers ("🎙 Live voice · …", "→ Asked Moss: …") as one quiet line.
             HStack(alignment: .firstTextBaseline, spacing: 5) {
                 Image(systemName: "waveform").font(.system(size: 10)).foregroundStyle(VerdeTheme.subtle).accessibilityHidden(true)
-                Text(row.body).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.muted).lineLimit(3)
+                Text(row.body).font(VerdeTheme.ui(compact ? 12 : 13)).foregroundStyle(VerdeTheme.muted).lineLimit(3)
+                    .textSelection(.enabled)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.vertical, 2)
+            .padding(.vertical, 2).padding(.horizontal, compact ? 0 : 4)
+            .contextMenu { Button("Copy") { UIPasteboard.general.string = row.body } }
             .accessibilityElement(children: .combine)
         } else {
             regular
