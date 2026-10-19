@@ -1147,6 +1147,9 @@ const Core = struct {
         const state = core.operationState(intent_id);
         if (h.eq(state, "failed") or h.eq(state, "uncertain")) {
             std.debug.print("contract: intent {s} ended {s}\n", .{ intent_id, state });
+            for (core.host.state.receipts) |r| if (h.eq(r.operation.intent_id, intent_id)) if (r.operation.@"error") |e| {
+                std.debug.print("contract:   error code={s} rpc_code={s} message={s}\n", .{ e.code, e.rpc_code orelse "none", e.message });
+            };
             core.diagnose();
             return error.IntentFailed;
         }
@@ -1362,6 +1365,20 @@ test "K-14 contract: real core pairs, syncs, runs an approval turn, and signs ou
     try std.testing.expectEqualStrings("succeeded", core.operationState("k14-send"));
     try std.testing.expectEqualStrings("succeeded", core.operationState("k14-approve"));
     try std.testing.expect(get(try core.query(try threadSelector(&core)), "approval") == .null);
+
+    // Rename the chat once it has a transcript: the core reads the thread and
+    // writes its metadata back, which the daemon must accept.
+    try core.intent("thread_rename", .{ .intent_id = "k14-rename", .workspace_id = workspace_id, .thread_id = thread_id, .title = "K-14 renamed" });
+    try core.waitFor("renamed thread", step_timeout_ms, {}, struct {
+        fn pred(k: *Core, _: void) !bool {
+            try k.requireNotFailed("k14-rename");
+            return h.eq(k.operationState("k14-rename"), "succeeded");
+        }
+    }.pred);
+    {
+        const read = try core.rpcCall("chat.thread.get", .{ .workspace_id = workspace_id, .local_thread_id = thread_id }, false);
+        try std.testing.expectEqualStrings("K-14 renamed", str(get(read, "thread"), "title"));
+    }
 
     // D-04 sign_out: the core revokes this device with targeted
     // device.self.revoke over its authenticated RPC, then wipes the

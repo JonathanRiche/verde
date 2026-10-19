@@ -475,7 +475,8 @@ fn advance(tx: *h.Transaction, i: usize) E!void {
         .register => t.rpc_id = try rpc.request(tx, "daemon.client.register", .{ .persistent = false }, .{ .intent_id = "@manage" }),
         .snapshot => t.rpc_id = try rpc.request(tx, "core.snapshot", .{ .workspace_id = t.job.workspace_id.?, .scopes = [_][]const u8{"workspaces"} }, .{ .mutation = false, .legacy_snapshot = true, .intent_id = "@manage" }),
         .workspace_upsert => t.rpc_id = try rpc.request(tx, "workspace.upsert", .{ .mutation = .{ .request_key = try requestKey(tx, t), .client_id = tx.state.chat.client_id.? }, .workspace = .{ .workspace_id = t.job.workspace_id.?, .label = t.label orelse std.fs.path.basenamePosix(t.path), .path = t.path } }, .{ .intent_id = "@manage" }),
-        .thread_get => t.rpc_id = try rpc.request(tx, "chat.thread.get", .{ .workspace_id = t.job.workspace_id.?, .local_thread_id = t.job.thread_id.? }, .{ .mutation = false, .intent_id = "@manage" }),
+        // Only the thread's metadata is needed; a long transcript could also exceed the response cap.
+        .thread_get => t.rpc_id = try rpc.request(tx, "chat.thread.get", .{ .workspace_id = t.job.workspace_id.?, .local_thread_id = t.job.thread_id.?, .message_limit = @as(u32, 0) }, .{ .mutation = false, .intent_id = "@manage" }),
         .thread_mutate => {
             const mutation = .{ .client_id = tx.state.chat.client_id.?, .request_key = try requestKey(tx, t), .expected_store_revision = t.revision };
             if (eq(t.job.kind, "thread_rename")) {
@@ -632,6 +633,9 @@ fn step(tx: *h.Transaction, i: usize, result: rpc.Result) E!void {
             const read = std.json.parseFromValueLeaky(store.ThreadGetResult, tx.allocator(), v, .{ .ignore_unknown_fields = true }) catch return finish(tx, i, failure("invalid_thread", "The host returned an unreadable chat."));
             if (!eq(read.thread.local_thread_id, t.job.thread_id.?)) return finish(tx, i, failure("invalid_thread", "The host returned a different chat."));
             t.thread = read.thread;
+            // The daemon rejects a thread upsert that carries messages; older hosts ignore message_limit.
+            t.thread.?.messages = &.{};
+            t.thread.?.message_offset = 0;
             t.revision = read.store_revision;
             if (t.label) |title| t.thread.?.title = title;
             t.step = .thread_mutate;
