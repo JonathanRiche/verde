@@ -654,8 +654,8 @@ pre code {
   display: block;
   width: 100%;
   height: auto;
-  /* Match the source screenshot ratio (2536×1030) so it renders uncropped */
-  aspect-ratio: 2536 / 1030;
+  /* Match the source screenshot ratio (2000×1282) so it renders uncropped */
+  aspect-ratio: 2000 / 1282;
   object-fit: cover;
   background: #0b1011;
 }
@@ -2088,7 +2088,21 @@ thead .comp-rowhead { background: transparent; }
 
 .shot-link {
   display: block;
+  width: 100%;
+  padding: 0;
+  border: 0;
   border-bottom: 1px solid var(--line-soft);
+  background: none;
+  cursor: zoom-in;
+}
+
+.shot-link img {
+  display: block;
+}
+
+.shot-link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 
 .shot-link img {
@@ -3163,6 +3177,184 @@ thead .comp-rowhead { background: transparent; }
 .docs-notfound {
   max-width: 40rem;
   padding: 3rem 0;
+}
+
+/* ── Store badges (coming soon) ── */
+.store-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin: 0 0 1.4rem;
+}
+
+.store-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.7rem;
+  padding: 0.55rem 1.1rem 0.55rem 0.9rem;
+  border: 1px dashed var(--line);
+  border-radius: 0.8rem;
+  background: var(--panel);
+  color: var(--muted);
+  cursor: default;
+  user-select: none;
+}
+
+.store-badge svg {
+  width: 1.6rem;
+  height: 1.6rem;
+  flex: none;
+  opacity: 0.75;
+}
+
+.store-badge-text {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.15;
+  font-weight: 600;
+  font-size: 1rem;
+  color: var(--text);
+  opacity: 0.8;
+}
+
+.store-badge-text small {
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+/* ── Gallery lightbox ── */
+.lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 3.5rem 5rem;
+  background: rgba(4, 7, 8, 0.88);
+  backdrop-filter: blur(6px);
+  animation: lightbox-in 160ms ease-out;
+  touch-action: pan-y;
+  user-select: none;
+}
+
+@keyframes lightbox-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.lightbox-figure {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1rem;
+  margin: 0;
+  max-width: 100%;
+  max-height: 100%;
+}
+
+.lightbox-img {
+  max-width: min(100%, 1600px);
+  max-height: calc(100vh - 13rem);
+  width: auto;
+  height: auto;
+  border: 1px solid var(--line);
+  border-radius: 0.7rem;
+  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.55);
+  cursor: grab;
+}
+
+.lightbox-img:active { cursor: grabbing; }
+
+.lightbox-caption {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: center;
+  gap: 0.4rem 0.85rem;
+  max-width: 48rem;
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+
+.lightbox-caption strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.lightbox-count {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--accent);
+}
+
+.lightbox-dots {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.lightbox-dot {
+  width: 0.55rem;
+  height: 0.55rem;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: var(--line);
+  cursor: pointer;
+  transition: background 150ms, transform 150ms;
+}
+
+.lightbox-dot--active {
+  background: var(--accent);
+  transform: scale(1.25);
+}
+
+.lightbox-close,
+.lightbox-nav {
+  position: absolute;
+  display: grid;
+  place-items: center;
+  width: 2.8rem;
+  height: 2.8rem;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+  transition: border-color 150ms, color 150ms;
+}
+
+.lightbox-close:hover,
+.lightbox-nav:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.lightbox-close svg,
+.lightbox-nav svg {
+  width: 1.2rem;
+  height: 1.2rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.lightbox-close { top: 1rem; right: 1rem; }
+.lightbox-prev { left: 1rem; top: 50%; transform: translateY(-50%); }
+.lightbox-next { right: 1rem; top: 50%; transform: translateY(-50%); }
+
+@media (max-width: 720px) {
+  .lightbox { padding: 4rem 0.75rem 2rem; }
+  .lightbox-nav { display: none; }
+  .lightbox-img { max-height: calc(100vh - 14rem); }
 }
 
 /* ── Responsive: drop the sidebar and TOC under ~820px ── */

@@ -18,17 +18,17 @@ import appScreenshot from '../../../../assets/green_verde.png'
     theme slug — validated against the manifest on every read. */
 export const THEME_COOKIE = 'verde_theme'
 
-/* Screenshots live in src/assets/theme_shots/<slug>.png. The glob picks them
+/* Screenshots live in src/assets/theme_shots/<slug>.webp. The glob picks them
    up at build time, so dropping a new capture into that folder is all it
    takes for its theme to appear — no code change. Themes without a
    screenshot are hidden. */
-const themeShotModules = import.meta.glob('../assets/theme_shots/*.png', {
+const themeShotModules = import.meta.glob('../assets/theme_shots/*.webp', {
   eager: true,
   import: 'default',
 }) as Record<string, string>
 
 function themeShot(slug: string): string | undefined {
-  return themeShotModules[`../assets/theme_shots/${slug}.png`]
+  return themeShotModules[`../assets/theme_shots/${slug}.webp`]
 }
 
 export interface OmarchyTheme {

@@ -1,5 +1,6 @@
 import { createFileRoute, getRouteApi } from '@tanstack/solid-router'
-import { For, Show, createSignal, onCleanup, onMount } from 'solid-js'
+import { For, Show, createEffect, createSignal, onCleanup, onMount } from 'solid-js'
+import { Portal } from 'solid-js/web'
 
 import { availableThemes, displayedTheme, setActiveThemeSlug } from '../lib/site-theme'
 import {
@@ -224,6 +225,161 @@ const gallery = [
   },
 ]
 
+type GalleryItem = (typeof gallery)[number]
+
+/* Full-screen viewer for the screenshot gallery. Arrow keys / buttons / dots
+   step through, a horizontal swipe (touch or mouse drag) does the same, and
+   Escape, the close button, or a click on the backdrop dismisses it. */
+function Lightbox(props: {
+  items: GalleryItem[]
+  index: number | null
+  onIndex: (i: number | null) => void
+}) {
+  const count = () => props.items.length
+  const go = (delta: number) => {
+    const i = props.index
+    if (i === null) return
+    props.onIndex((i + delta + count()) % count())
+  }
+  const close = () => props.onIndex(null)
+
+  const [drag, setDrag] = createSignal(0)
+  let startX: number | null = null
+  let startY = 0
+  let moved = false
+
+  createEffect(() => {
+    if (props.index === null) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') close()
+      else if (e.key === 'ArrowRight') go(1)
+      else if (e.key === 'ArrowLeft') go(-1)
+    }
+    const prevOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    document.addEventListener('keydown', onKey)
+    onCleanup(() => {
+      document.removeEventListener('keydown', onKey)
+      document.body.style.overflow = prevOverflow
+    })
+  })
+
+  const onPointerDown = (e: PointerEvent) => {
+    if (e.button !== 0) return
+    startX = e.clientX
+    startY = e.clientY
+    moved = false
+  }
+  const onPointerMove = (e: PointerEvent) => {
+    if (startX === null) return
+    const dx = e.clientX - startX
+    if (!moved && Math.abs(dx) > 8 && Math.abs(dx) > Math.abs(e.clientY - startY)) {
+      moved = true
+      ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
+    }
+    if (moved) setDrag(dx)
+  }
+  const onPointerUp = () => {
+    if (startX === null) return
+    const dx = drag()
+    startX = null
+    setDrag(0)
+    if (dx < -60) go(1)
+    else if (dx > 60) go(-1)
+  }
+  // A drag that ended over the backdrop must not count as a click-to-close.
+  const onBackdropClick = (e: MouseEvent) => {
+    if (moved) {
+      moved = false
+      return
+    }
+    if (e.target === e.currentTarget) close()
+  }
+
+  return (
+    <Show when={props.index !== null}>
+      <Portal>
+        <div
+          class="lightbox"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Screenshot viewer"
+          onClick={onBackdropClick}
+          onPointerDown={onPointerDown}
+          onPointerMove={onPointerMove}
+          onPointerUp={onPointerUp}
+          onPointerCancel={onPointerUp}
+        >
+          <button type="button" class="lightbox-close" aria-label="Close" onClick={close}>
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M6 6l12 12M18 6L6 18" />
+            </svg>
+          </button>
+          <button
+            type="button"
+            class="lightbox-nav lightbox-prev"
+            aria-label="Previous screenshot"
+            onClick={() => go(-1)}
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M15 5l-7 7 7 7" />
+            </svg>
+          </button>
+          <button
+            type="button"
+            class="lightbox-nav lightbox-next"
+            aria-label="Next screenshot"
+            onClick={() => go(1)}
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M9 5l7 7-7 7" />
+            </svg>
+          </button>
+
+          {(() => {
+            const item = () => props.items[props.index ?? 0]
+            return (
+              <figure class="lightbox-figure" onClick={(e) => e.target === e.currentTarget && !moved && close()}>
+                <img
+                  src={item().src}
+                  alt={`${item().title}: ${item().body}`}
+                  class="lightbox-img"
+                  draggable={false}
+                  style={{
+                    transform: `translateX(${drag()}px)`,
+                    transition: drag() === 0 ? 'transform 220ms ease' : 'none',
+                  }}
+                />
+                <figcaption class="lightbox-caption">
+                  <span class="lightbox-count">
+                    {(props.index ?? 0) + 1} / {count()}
+                  </span>
+                  <strong>{item().title}</strong>
+                  <span>{item().body}</span>
+                  <span class="shot-theme">{item().theme}</span>
+                </figcaption>
+                <div class="lightbox-dots">
+                  <For each={props.items}>
+                    {(g, i) => (
+                      <button
+                        type="button"
+                        class={`lightbox-dot${i() === props.index ? ' lightbox-dot--active' : ''}`}
+                        aria-label={`Show ${g.title}`}
+                        aria-current={i() === props.index}
+                        onClick={() => props.onIndex(i())}
+                      />
+                    )}
+                  </For>
+                </div>
+              </figure>
+            )
+          })()}
+        </div>
+      </Portal>
+    </Show>
+  )
+}
+
 const mobilePoints = [
   {
     title: 'Your agent needs you? Approve it in one tap.',
@@ -363,6 +519,7 @@ function CompCell(props: { value: Cell }) {
 
 function App() {
   const [showMoreInstall, setShowMoreInstall] = createSignal(false)
+  const [lightbox, setLightbox] = createSignal<number | null>(null)
 
   // Theme state lives in lib/site-theme.ts, shared with the nav dropdown; the
   // Header owns the site-wide <style> overrides. During SSR the theme comes
@@ -455,13 +612,13 @@ function App() {
               Local · native · keyboard-first
             </p>
             <h1 class="display">
-              Every coding agent.<br />
-              <span class="display-accent">One tiling window.</span>
+              All your coding agents.<br />
+              <span class="display-accent">Anywhere you work.</span>
             </h1>
             <p class="lead">
               Run Codex, Claude Code, Cursor, OpenCode, Grok Build and more
-              side by side, as native chats or their own TUIs, next to your
-              terminals and a built-in browser. No new subscription, no API
+              in one native workspace, as GUI chats or their own TUIs, tiled
+              next to your terminals and a built-in browser. No new subscription, no API
               keys, no hosted relay: Verde drives the agent CLIs you already
               use. Then pick up the same chats from your phone.
             </p>
@@ -499,10 +656,10 @@ function App() {
             {/* Follows the Omarchy theme picker (nav dropdown / #themes chips) */}
             <img
               src={theme().shot}
-              alt="Verde desktop app with a sidebar of projects and threads, a chat pane, a terminal pane, and an Amp TUI, themed to match the selected Omarchy theme."
+              alt="Verde desktop app with a sidebar of chats and terminals, a Codex chat and a Claude chat side by side, themed to match the selected Omarchy theme."
               class="app-screenshot"
-              width="2536"
-              height="1030"
+              width="2000"
+              height="1282"
               loading="eager"
               fetchpriority="high"
               decoding="async"
@@ -577,9 +734,14 @@ function App() {
 
           <div class="shot-grid stagger">
             <For each={gallery}>
-              {(g) => (
+              {(g, i) => (
                 <figure class="shot-card">
-                  <a href={g.src} target="_blank" rel="noreferrer" class="shot-link">
+                  <button
+                    type="button"
+                    class="shot-link"
+                    aria-label={`Enlarge: ${g.title}`}
+                    onClick={() => setLightbox(i())}
+                  >
                     <img
                       src={g.src}
                       alt={`${g.title}: ${g.body}`}
@@ -588,7 +750,7 @@ function App() {
                       loading="lazy"
                       decoding="async"
                     />
-                  </a>
+                  </button>
                   <figcaption>
                     <strong>{g.title}</strong>
                     <span>{g.body}</span>
@@ -600,6 +762,8 @@ function App() {
           </div>
         </div>
       </section>
+
+      <Lightbox items={gallery} index={lightbox()} onIndex={setLightbox} />
 
       {/* ── Feature: tiling ── */}
       <section id="tiling" class="band">
@@ -728,9 +892,35 @@ function App() {
                 )}
               </For>
             </ul>
+            <div class="store-badges" aria-label="App store availability">
+              <span class="store-badge" aria-disabled="true">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path
+                    fill="currentColor"
+                    d="M16.37 12.6c-.02-2.3 1.88-3.4 1.96-3.46-1.07-1.56-2.73-1.78-3.32-1.8-1.41-.14-2.76.83-3.48.83-.72 0-1.82-.81-3-.79-1.54.02-2.96.9-3.76 2.28-1.6 2.78-.41 6.9 1.15 9.16.76 1.1 1.67 2.34 2.86 2.3 1.15-.05 1.58-.74 2.97-.74 1.38 0 1.77.74 2.98.72 1.23-.02 2.01-1.12 2.76-2.23.87-1.28 1.23-2.52 1.25-2.58-.03-.01-2.39-.92-2.41-3.65zM14.1 5.86c.63-.77 1.06-1.83.94-2.89-.91.04-2.01.61-2.66 1.37-.58.67-1.1 1.76-.96 2.8 1.01.08 2.05-.52 2.68-1.28z"
+                  />
+                </svg>
+                <span class="store-badge-text">
+                  <small>Coming soon to the</small>
+                  App Store
+                </span>
+              </span>
+              <span class="store-badge" aria-disabled="true">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path fill="currentColor" d="M4.2 2.6c-.25.27-.4.68-.4 1.2v16.4c0 .52.15.93.4 1.2l9.2-9.4z" opacity=".85" />
+                  <path fill="currentColor" d="M16.5 15.1 13.4 12l3.1-3.1 3.7 2.1c1.06.6 1.06 1.6 0 2.2z" />
+                  <path fill="currentColor" d="M16.5 8.9 5.6 2.7c-.53-.3-1.03-.33-1.4-.1l9.2 9.4z" opacity=".7" />
+                  <path fill="currentColor" d="m13.4 12-9.2 9.4c.37.23.87.2 1.4-.1l10.9-6.2z" opacity=".55" />
+                </svg>
+                <span class="store-badge-text">
+                  <small>Coming soon to</small>
+                  Google Play
+                </span>
+              </span>
+            </div>
             <p class="band-body band-body-muted">
-              The iOS and Android apps are in beta, and a browser-based web
-              client is also available. To pair them, see{' '}
+              The iOS and Android apps are in private beta ahead of their
+              store launch, and a browser-based web client is also available. To pair them, see{' '}
               <a
                 href="https://github.com/JonathanRiche/verde/blob/master/docs/serve-pair-connect.md"
                 target="_blank"
