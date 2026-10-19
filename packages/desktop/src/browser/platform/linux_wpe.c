@@ -4,6 +4,14 @@
 #ifndef VERDE_BROWSER_LINUX_WITH_FDO
 #define VERDE_BROWSER_LINUX_WITH_FDO 1
 #endif
+/* WPE WebKit built without its legacy libwpe API (ENABLE_WPE_LEGACY_API=OFF, e.g. Arch's
+ * wpewebkit 2.54) has no WebKitWebViewBackend, so the fdo backend cannot exist. */
+#if VERDE_BROWSER_LINUX_WITH_FDO && defined(__has_include)
+#if !__has_include(<wpe/WebKitWebViewBackend.h>)
+#undef VERDE_BROWSER_LINUX_WITH_FDO
+#define VERDE_BROWSER_LINUX_WITH_FDO 0
+#endif
+#endif
 #define GL_GLEXT_PROTOTYPES
 
 #if VERDE_BROWSER_LINUX_WITH_FDO
@@ -82,23 +90,23 @@ static gboolean verde_browser_linux_wheel_delta_is_integral(double value) {
     return fabs(modf(value, &integral)) < 0.000001;
 }
 
-static enum wpe_input_axis_event_type verde_browser_linux_wheel_event_type(double delta_x, double delta_y) {
-    if (verde_browser_linux_wheel_delta_is_integral(delta_x) && verde_browser_linux_wheel_delta_is_integral(delta_y)) {
-        return wpe_input_axis_event_type_motion;
-    }
-    return wpe_input_axis_event_type_motion_smooth;
+/* Integral (notch) deltas are discrete wheel steps; fractional (touchpad) deltas are smooth. */
+static gboolean verde_browser_linux_wheel_is_smooth(double delta_x, double delta_y) {
+    return !(verde_browser_linux_wheel_delta_is_integral(delta_x) && verde_browser_linux_wheel_delta_is_integral(delta_y));
 }
 
-static double verde_browser_linux_wheel_delta_scale(enum wpe_input_axis_event_type event_type, double wheel_multiplier) {
+static double verde_browser_linux_wheel_delta_scale(gboolean smooth, double wheel_multiplier) {
     // WebKit reduces discrete WPE axis values to their sign, so use its
     // standard line-step distance before dispatching the scaled 2D delta.
-    const double base_scale = event_type == wpe_input_axis_event_type_motion ? 40.0 : 96.0;
+    const double base_scale = smooth ? 96.0 : 40.0;
     return base_scale * wheel_multiplier;
 }
 
+#if VERDE_BROWSER_LINUX_WITH_FDO
 static enum wpe_input_axis_event_type verde_browser_linux_wheel_dispatch_type(void) {
     return (enum wpe_input_axis_event_type)(wpe_input_axis_event_type_motion_smooth | wpe_input_axis_event_type_mask_2d);
 }
+#endif
 
 static uint32_t verde_browser_linux_wheel_axis(double delta_x, double delta_y) {
     return fabs(delta_y) >= fabs(delta_x) ? 0u : 1u;
@@ -128,9 +136,9 @@ struct verde_browser_linux {
 #if VERDE_BROWSER_LINUX_WITH_FDO
     struct wpe_view_backend_exportable_fdo *exportable;
     struct wpe_view_backend_exportable_fdo_egl_client export_client;
-#endif
     struct wpe_view_backend *view_backend;
     WebKitWebViewBackend *webkit_backend;
+#endif
     WebKitWebView *web_view;
     WebKitUserContentManager *content_manager;
     WebKitContextMenu *context_menu;
@@ -381,17 +389,23 @@ static void verde_browser_linux_schedule_frame_complete_at(struct verde_browser_
 #define VERDE_BROWSER_LINUX_HIDDEN_PAINT_GRACE_MS 15000u
 
 static gboolean verde_browser_linux_has_view(struct verde_browser_linux *browser) {
-    return browser->wpe_view != NULL || browser->view_backend != NULL;
+#if VERDE_BROWSER_LINUX_WITH_FDO
+    if (browser->view_backend != NULL) return TRUE;
+#endif
+    return browser->wpe_view != NULL;
 }
 
 /* WebKit-side visibility: hidden views throttle timers/rAF and stop producing frames. */
 static void verde_browser_linux_set_view_visible(struct verde_browser_linux *browser, gboolean visible) {
     if (browser->wpe_view != NULL) {
         wpe_view_set_visible(browser->wpe_view, visible);
-    } else if (browser->view_backend != NULL) {
+    }
+#if VERDE_BROWSER_LINUX_WITH_FDO
+    else if (browser->view_backend != NULL) {
         if (visible) wpe_view_backend_add_activity_state(browser->view_backend, wpe_view_activity_state_visible | wpe_view_activity_state_in_window);
         else wpe_view_backend_remove_activity_state(browser->view_backend, wpe_view_activity_state_visible);
     }
+#endif
 }
 
 static gboolean verde_browser_linux_hidden_pause_timer(gpointer user_data) {
@@ -904,17 +918,22 @@ int verde_browser_linux_test_disables_async_overflow_scrolling(void) {
 }
 
 int verde_browser_linux_test_wheel_event_is_smooth(double delta_x, double delta_y) {
-    return verde_browser_linux_wheel_event_type(delta_x, delta_y) == wpe_input_axis_event_type_motion_smooth;
+    return verde_browser_linux_wheel_is_smooth(delta_x, delta_y) ? 1 : 0;
 }
 
 int verde_browser_linux_test_wheel_uses_smooth_2d(void) {
+#if VERDE_BROWSER_LINUX_WITH_FDO
     const enum wpe_input_axis_event_type event_type = verde_browser_linux_wheel_dispatch_type();
     return (event_type & wpe_input_axis_event_type_mask_2d) != 0 &&
         (event_type & (wpe_input_axis_event_type_mask_2d - 1)) == wpe_input_axis_event_type_motion_smooth;
+#else
+    /* Only WPE Platform scroll events, which always carry precise 2D deltas. */
+    return 1;
+#endif
 }
 
 double verde_browser_linux_test_wheel_delta_scale(double delta_x, double delta_y, double wheel_multiplier) {
-    return verde_browser_linux_wheel_delta_scale(verde_browser_linux_wheel_event_type(delta_x, delta_y), wheel_multiplier);
+    return verde_browser_linux_wheel_delta_scale(verde_browser_linux_wheel_is_smooth(delta_x, delta_y), wheel_multiplier);
 }
 
 unsigned int verde_browser_linux_test_wheel_axis(double delta_x, double delta_y) {
@@ -922,8 +941,8 @@ unsigned int verde_browser_linux_test_wheel_axis(double delta_x, double delta_y)
 }
 
 int32_t verde_browser_linux_test_wheel_value(double delta_x, double delta_y, double wheel_multiplier) {
-    const enum wpe_input_axis_event_type event_type = verde_browser_linux_wheel_event_type(delta_x, delta_y);
-    return verde_browser_linux_wheel_value(delta_x, delta_y, verde_browser_linux_wheel_delta_scale(event_type, wheel_multiplier));
+    const gboolean smooth = verde_browser_linux_wheel_is_smooth(delta_x, delta_y);
+    return verde_browser_linux_wheel_value(delta_x, delta_y, verde_browser_linux_wheel_delta_scale(smooth, wheel_multiplier));
 }
 #endif
 
@@ -1955,6 +1974,7 @@ static void verde_browser_linux_run_internal_script(struct verde_browser_linux *
     webkit_web_view_evaluate_javascript(browser->web_view, script, -1, NULL, "app://verde-browser-input.js", NULL, verde_browser_linux_on_internal_script_finished, browser);
 }
 
+#if VERDE_BROWSER_LINUX_WITH_FDO
 static guint32 verde_browser_linux_encode_modifiers(unsigned int modifiers) {
     guint32 mask = 0;
     if ((modifiers & VERDE_BROWSER_LINUX_MOD_CTRL) != 0) mask |= wpe_input_keyboard_modifier_control;
@@ -1988,7 +2008,6 @@ static guint32 verde_browser_linux_key_code_to_hardware(unsigned int key_code) {
     return wpe_unicode_to_key_code(key_code);
 }
 
-#if VERDE_BROWSER_LINUX_WITH_FDO
 static void verde_browser_linux_destroy_exportable(gpointer user_data) {
     struct wpe_view_backend_exportable_fdo *exportable = user_data;
     if (exportable != NULL) wpe_view_backend_exportable_fdo_destroy(exportable);
@@ -2405,7 +2424,9 @@ void verde_browser_linux_destroy(struct verde_browser_linux *browser) {
     }
     browser->wpe_view = NULL; /* owned by the web view */
     if (browser->web_view != NULL) g_object_unref(browser->web_view);
+#if VERDE_BROWSER_LINUX_WITH_FDO
     if (browser->webkit_backend != NULL) g_object_unref(browser->webkit_backend);
+#endif
     g_clear_object(&browser->wpe_display);
     g_free(browser->cursor_shape);
     g_free(browser->rgba_scratch);
@@ -2436,9 +2457,12 @@ int verde_browser_linux_set_device_scale(struct verde_browser_linux *browser, do
          * devicePixelRatio; CSS px stay logical. */
         WPEToplevel *toplevel = wpe_view_get_toplevel(browser->wpe_view);
         if (toplevel != NULL) wpe_toplevel_scale_changed(toplevel, browser->device_scale);
-    } else if (browser->view_backend != NULL) {
+    }
+#if VERDE_BROWSER_LINUX_WITH_FDO
+    else if (browser->view_backend != NULL) {
         wpe_view_backend_dispatch_set_device_scale_factor(browser->view_backend, (float)browser->device_scale);
     }
+#endif
     return 1;
 }
 
@@ -2573,7 +2597,9 @@ int verde_browser_linux_set_bounds(struct verde_browser_linux *browser, int x, i
     browser->target_width = width;
     browser->target_height = height;
     if (browser->wpe_view != NULL) verde_browser_linux_platform_apply_geometry(browser);
+#if VERDE_BROWSER_LINUX_WITH_FDO
     else if (browser->view_backend != NULL) wpe_view_backend_dispatch_set_size(browser->view_backend, (uint32_t)width, (uint32_t)height);
+#endif
     return 1;
 }
 
@@ -2648,7 +2674,10 @@ int verde_browser_linux_focus(struct verde_browser_linux *browser) {
     if (browser->wpe_view != NULL) {
         verde_browser_linux_platform_set_active(browser, TRUE);
         wpe_view_focus_in(browser->wpe_view);
-    } else if (browser->view_backend != NULL) wpe_view_backend_add_activity_state(browser->view_backend, wpe_view_activity_state_focused);
+    }
+#if VERDE_BROWSER_LINUX_WITH_FDO
+    else if (browser->view_backend != NULL) wpe_view_backend_add_activity_state(browser->view_backend, wpe_view_activity_state_focused);
+#endif
     return 1;
 }
 
@@ -2657,7 +2686,10 @@ int verde_browser_linux_blur(struct verde_browser_linux *browser) {
     if (browser->wpe_view != NULL) {
         wpe_view_focus_out(browser->wpe_view);
         verde_browser_linux_platform_set_active(browser, FALSE);
-    } else if (browser->view_backend != NULL) wpe_view_backend_remove_activity_state(browser->view_backend, wpe_view_activity_state_focused);
+    }
+#if VERDE_BROWSER_LINUX_WITH_FDO
+    else if (browser->view_backend != NULL) wpe_view_backend_remove_activity_state(browser->view_backend, wpe_view_activity_state_focused);
+#endif
     return 1;
 }
 
@@ -2845,11 +2877,11 @@ static void verde_browser_linux_platform_mouse_wheel(struct verde_browser_linux 
      * deltas scroll up/left, as with the libwpe axis events. WebKit multiplies precise
      * scroll deltas by 2.5 (VERDE_BROWSER_LINUX_PRECISE_SCROLL_MULTIPLIER, as in WebKitGTK);
      * divide it out so both backends scroll the same distance. */
-    const enum wpe_input_axis_event_type source_type = verde_browser_linux_wheel_event_type(delta_x, delta_y);
+    const gboolean smooth = verde_browser_linux_wheel_is_smooth(delta_x, delta_y);
     /* WPE Platform deltas are logical px; divide by the device scale to match the fdo
      * path, where WebKit converts device px deltas to CSS px. */
     const double device_scale = browser->device_scale > 0.0 ? browser->device_scale : 1.0;
-    const double delta_scale = verde_browser_linux_wheel_delta_scale(source_type, wheel_multiplier) / VERDE_BROWSER_LINUX_PRECISE_SCROLL_MULTIPLIER / device_scale;
+    const double delta_scale = verde_browser_linux_wheel_delta_scale(smooth, wheel_multiplier) / VERDE_BROWSER_LINUX_PRECISE_SCROLL_MULTIPLIER / device_scale;
     verde_browser_linux_platform_dispatch(browser, wpe_event_scroll_new(browser->wpe_view, WPE_INPUT_SOURCE_MOUSE, verde_browser_linux_now_ms(),
         verde_browser_linux_platform_modifiers(browser, modifiers), delta_x * delta_scale, delta_y * delta_scale, TRUE, FALSE, x, y));
 }
@@ -2871,10 +2903,12 @@ static void verde_browser_linux_platform_key(struct verde_browser_linux *browser
  * WPE textures (see browserPointerCoordinate) and automation multiplies logical coordinates
  * by the device scale. libwpe (fdo) pointer events take device px as-is (WebKit divides by
  * the device scale factor); WPE Platform events are logical, so divide here. */
+#if VERDE_BROWSER_LINUX_WITH_FDO
 static int verde_browser_linux_fdo_coord(const struct verde_browser_linux *browser, double v) {
     (void)browser;
     return (int)v;
 }
+#endif
 
 static double verde_browser_linux_platform_coord(const struct verde_browser_linux *browser, double v) {
     return browser->device_scale > 0.0 ? v / browser->device_scale : v;
@@ -2887,6 +2921,7 @@ int verde_browser_linux_mouse_move(struct verde_browser_linux *browser, double x
         verde_browser_linux_platform_mouse_move(browser, verde_browser_linux_platform_coord(browser, x), verde_browser_linux_platform_coord(browser, y), modifiers);
         return 1;
     }
+#if VERDE_BROWSER_LINUX_WITH_FDO
     if (browser->view_backend == NULL) return 0;
     struct wpe_input_pointer_event event = {
         .type = wpe_input_pointer_event_type_motion,
@@ -2899,6 +2934,9 @@ int verde_browser_linux_mouse_move(struct verde_browser_linux *browser, double x
     };
     wpe_view_backend_dispatch_pointer_event(browser->view_backend, &event);
     return 1;
+#else
+    return 0;
+#endif
 }
 
 int verde_browser_linux_mouse_button(struct verde_browser_linux *browser, double x, double y, unsigned int button, int down, unsigned int modifiers) {
@@ -2908,6 +2946,7 @@ int verde_browser_linux_mouse_button(struct verde_browser_linux *browser, double
         verde_browser_linux_platform_mouse_button(browser, verde_browser_linux_platform_coord(browser, x), verde_browser_linux_platform_coord(browser, y), button, down, modifiers);
         return 1;
     }
+#if VERDE_BROWSER_LINUX_WITH_FDO
     if (browser->view_backend == NULL) return 0;
     const unsigned int wpe_button = verde_browser_linux_protocol_to_wpe_button(button);
     const guint32 button_modifier = verde_browser_linux_pointer_button_modifier(wpe_button);
@@ -2924,6 +2963,9 @@ int verde_browser_linux_mouse_button(struct verde_browser_linux *browser, double
     };
     wpe_view_backend_dispatch_pointer_event(browser->view_backend, &event);
     return 1;
+#else
+    return 0;
+#endif
 }
 
 int verde_browser_linux_mouse_wheel(struct verde_browser_linux *browser, double x, double y, double delta_x, double delta_y, double wheel_multiplier, unsigned int modifiers) {
@@ -2933,9 +2975,9 @@ int verde_browser_linux_mouse_wheel(struct verde_browser_linux *browser, double 
         verde_browser_linux_platform_mouse_wheel(browser, verde_browser_linux_platform_coord(browser, x), verde_browser_linux_platform_coord(browser, y), delta_x, delta_y, wheel_multiplier, modifiers);
         return 1;
     }
+#if VERDE_BROWSER_LINUX_WITH_FDO
     if (browser->view_backend == NULL) return 0;
-    const enum wpe_input_axis_event_type source_type = verde_browser_linux_wheel_event_type(delta_x, delta_y);
-    const double delta_scale = verde_browser_linux_wheel_delta_scale(source_type, wheel_multiplier);
+    const double delta_scale = verde_browser_linux_wheel_delta_scale(verde_browser_linux_wheel_is_smooth(delta_x, delta_y), wheel_multiplier);
     // Smooth 2D events preserve their magnitude in WebKit. Legacy discrete
     // events preserve only direction, making every configured speed identical.
     struct wpe_input_axis_2d_event event = {
@@ -2955,6 +2997,9 @@ int verde_browser_linux_mouse_wheel(struct verde_browser_linux *browser, double 
     };
     wpe_view_backend_dispatch_axis_event(browser->view_backend, &event.base);
     return 1;
+#else
+    return 0;
+#endif
 }
 
 int verde_browser_linux_key_input(struct verde_browser_linux *browser, unsigned int key_code, int down, unsigned int modifiers) {
@@ -2964,6 +3009,7 @@ int verde_browser_linux_key_input(struct verde_browser_linux *browser, unsigned 
         verde_browser_linux_platform_key(browser, key_code, down, modifiers);
         return 1;
     }
+#if VERDE_BROWSER_LINUX_WITH_FDO
     if (browser->view_backend == NULL) return 0;
     struct wpe_input_keyboard_event event = {
         .time = verde_browser_linux_now_ms(),
@@ -2974,6 +3020,9 @@ int verde_browser_linux_key_input(struct verde_browser_linux *browser, unsigned 
     };
     wpe_view_backend_dispatch_keyboard_event(browser->view_backend, &event);
     return 1;
+#else
+    return 0;
+#endif
 }
 
 int verde_browser_linux_text_input(struct verde_browser_linux *browser, const char *text, unsigned int modifiers) {
