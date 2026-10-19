@@ -454,14 +454,13 @@ struct ChatComposer: View {
         }
     }
     private func prepare(_ image: UIImage) {
-        guard let bytes = composerImage(image) else { model.notice = "This image is too large to attach."; return }
-        model.attach(bytes)
+        model.attach { budget in composerImage(image, maxBytes: budget) }
     }
 }
 
 /// Re-encoding strips source metadata; drafts respect the core's encrypted record limit.
 @MainActor
-func composerImage(_ image: UIImage) -> Data? {
+func composerImage(_ image: UIImage, maxBytes: Int = ComposerModel.maxImageBytes) -> Data? {
     guard image.size.width > 0, image.size.height > 0 else { return nil }
     var edge: CGFloat = 1600
     while edge >= 200 {
@@ -472,7 +471,7 @@ func composerImage(_ image: UIImage) -> Data? {
             UIColor.white.setFill(); context.fill(CGRect(origin: .zero, size: size)); image.draw(in: CGRect(origin: .zero, size: size))
         }
         for quality in [0.85, 0.65, 0.45] {
-            if let bytes = resized.jpegData(compressionQuality: quality), bytes.count <= ComposerModel.maxImageBytes { return bytes }
+            if let bytes = resized.jpegData(compressionQuality: quality), bytes.count <= maxBytes { return bytes }
         }
         edge *= 0.7
     }

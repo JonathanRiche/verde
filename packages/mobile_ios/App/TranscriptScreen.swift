@@ -278,7 +278,7 @@ private struct TranscriptList: View {
                         // `follow` still describes the layout before this change.
                         if follow { proxy.scrollTo(bottomID, anchor: .bottom) }
                     }
-                    .modifier(TailFollower(follow: $follow) { proxy.scrollTo(bottomID, anchor: .bottom) })
+                    .modifier(TailFollower(follow: $follow, output: tailKey(items)) { proxy.scrollTo(bottomID, anchor: .bottom) })
 
                     ApprovalBanner(approval: approval, cardVisible: cardVisible, controller: model.approvals) {
                         guard let approval else { return }
@@ -313,29 +313,43 @@ private struct TranscriptList: View {
 
 /// Diffs and images render after a jump to the newest row, and a finished turn drops its working
 /// row, so lazy rows settle to heights that differ from their estimates. That can leave the offset
-/// in blank space past the content. While the reader follows the tail, re-anchor whenever the
-/// settled geometry leaves the bottom; their own scroll stops following until they rest at the end.
+/// in blank space past the content. While the reader follows the tail, re-anchor once the geometry
+/// has been quiet for a moment; their own scroll stops following until they rest at the end.
+///
+/// A jump to the bottom realizes rows at estimated heights, so it moves the geometry again. Anchoring
+/// on every change turned that into a loop that threw the transcript around (worst while the
+/// composer was resized), so re-anchors wait for the geometry to settle and are capped per output.
 private struct TailFollower: ViewModifier {
     @Binding var follow: Bool
+    /// Changes with new output; restores the re-anchor allowance.
+    let output: String
     let anchor: () -> Void
 
     func body(content: Content) -> some View {
-        if #available(iOS 18.0, *) { content.modifier(TailFollowerGeometry(follow: $follow, anchor: anchor)) } else { content }
+        if #available(iOS 18.0, *) { content.modifier(TailFollowerGeometry(follow: $follow, output: output, anchor: anchor)) } else { content }
     }
 }
+
+/// Re-anchors allowed per output before following gives up; the reader or new output resets it.
+private let tailReanchors = 3
+/// Quiet time before a settled geometry is re-anchored.
+private let tailSettle: Duration = .milliseconds(150)
 
 @available(iOS 18.0, *)
 private struct TailFollowerGeometry: ViewModifier {
     @Binding var follow: Bool
+    let output: String
     let anchor: () -> Void
     @State private var phase: ScrollPhase = .idle
     @State private var gap: CGFloat = 0
+    @State private var allowance = tailReanchors
+    @State private var pending: Task<Void, Never>?
 
     func body(content: Content) -> some View {
         content
             .onScrollPhaseChange { _, next in
                 phase = next
-                if next == .interacting { follow = false }
+                if next == .interacting { follow = false; pending?.cancel() }
                 if next == .idle, !follow, abs(gap) <= bottomSlack { follow = true }
             }
             // Points between the current offset and the last reachable one; negative is past the end.
@@ -344,8 +358,25 @@ private struct TailFollowerGeometry: ViewModifier {
                 return last - g.contentOffset.y
             } action: { _, next in
                 gap = next
-                if follow, phase == .idle, abs(next) > bottomSlack { anchor() }
+                schedule()
             }
+            .onChange(of: follow) { _, following in
+                if following { allowance = tailReanchors } else { pending?.cancel() }
+            }
+            .onChange(of: output) { allowance = tailReanchors }
+            .onDisappear { pending?.cancel() }
+    }
+
+    /// Restarts the settle timer on each change, so a burst of layout passes anchors once. When the
+    /// allowance is spent the transcript stops following and shows Jump to latest instead.
+    private func schedule() {
+        pending?.cancel()
+        guard follow, phase == .idle, abs(gap) > bottomSlack else { return }
+        pending = Task { @MainActor in
+            try? await Task.sleep(for: tailSettle)
+            guard !Task.isCancelled, follow, phase == .idle, abs(gap) > bottomSlack else { return }
+            if allowance > 0 { allowance -= 1; anchor() } else { follow = false }
+        }
     }
 }
 

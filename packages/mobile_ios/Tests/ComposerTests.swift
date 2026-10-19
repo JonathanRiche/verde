@@ -47,6 +47,27 @@ final class ComposerTests: XCTestCase {
         XCTAssertEqual(Array(bytes.prefix(2)), [0xff, 0xd8])
     }
 
+    func testImageBudgetFitsFourFullPhotosWithinTheDraftLimit() throws {
+        var attached: [Int] = []
+        for _ in 0..<ComposerModel.maxImages {
+            let budget = ComposerModel.imageBudget(attached: attached)
+            XCTAssertGreaterThanOrEqual(budget, ComposerModel.minImageBytes)
+            XCTAssertLessThanOrEqual(budget, ComposerModel.maxImageBytes)
+            attached.append(budget)
+        }
+        XCTAssertEqual(ComposerModel.imageBudget(attached: [ComposerModel.maxImageBytes]), 96 * 1024)
+        XCTAssertLessThanOrEqual(attached.reduce(0, +), ComposerModel.maxTotalBytes)
+
+        let photo = UIGraphicsImageRenderer(size: CGSize(width: 2400, height: 1800)).image { context in
+            for row in 0..<60 { for column in 0..<80 {
+                UIColor(hue: CGFloat((row * 80 + column) % 97) / 97, saturation: 0.8, brightness: 0.9, alpha: 1).setFill()
+                context.fill(CGRect(x: column * 30, y: row * 30, width: 30, height: 30))
+            } }
+        }
+        let small = try XCTUnwrap(composerImage(photo, maxBytes: ComposerModel.minImageBytes))
+        XCTAssertLessThanOrEqual(small.count, ComposerModel.minImageBytes)
+    }
+
     func testSendFlushesLatestDraftOnceAndPreventsDoubleTap() async throws {
         let harness = ChatHarness()
         try await harness.launch()
