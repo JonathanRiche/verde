@@ -4880,6 +4880,8 @@ pub const AppState = struct {
     /// so the panel hydrates it once instead of every frame.
     companion_hydration_thread: companion_controller.ExactText = .{},
     companion_hydration_offset: usize = 0,
+    /// The chat composer had focus when the Companion opened; restore it on close.
+    companion_restore_chat_focus: bool = false,
     /// Daemon-linked child chats shown in the parent pane drawer.
     linked_chats: linked_chats_controller = .{},
     /// Chats blocked on workspace resources, resumed when they free up.
@@ -14092,9 +14094,18 @@ pub const AppState = struct {
         self.markDirty();
     }
 
+    /// Opens the panel with its prompt focused, so the hotkey (or a click on
+    /// the bubble) goes straight to typing. The chat composer gives up focus
+    /// and gets it back when the panel closes.
     pub fn openCompanion(self: *AppState) void {
         if (!self.isCompanionEnabled()) return;
+        const was_open = self.companion_controller.visibility == .sidecar_open;
         self.companion_controller.show();
+        if (was_open) return;
+        self.companion_restore_chat_focus = self.composer_controller.focused;
+        if (self.composer_controller.focused) self.blurPaletteComposer();
+        _ = self.companion_composer.handleInput(self.allocator, .{ .focus = true }) catch {};
+        self.markDirty();
     }
 
     pub fn toggleCompanion(self: *AppState) void {
@@ -14103,8 +14114,23 @@ pub const AppState = struct {
             self.openCompanion();
             return;
         }
+        self.closeCompanion();
+    }
+
+    /// Collapses the panel and returns focus to the chat composer when it
+    /// had it before the panel opened.
+    pub fn closeCompanion(self: *AppState) void {
         self.companion_controller.collapse();
         self.blurCompanionComposer();
+        self.restoreChatFocusAfterCompanion();
+    }
+
+    pub fn restoreChatFocusAfterCompanion(self: *AppState) void {
+        if (!self.companion_restore_chat_focus) return;
+        self.companion_restore_chat_focus = false;
+        _ = self.composer_controller.composer.handleInput(self.allocator, .{ .focus = true }) catch {};
+        self.composer_controller.focused = true;
+        self.markDirty();
     }
 
     pub fn syncDraftFromPaletteComposer(self: *AppState) void {

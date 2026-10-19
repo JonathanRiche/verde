@@ -134,10 +134,7 @@ pub fn handleMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, d
         switch (action) {
             // A bubble press opens on release, unless it turns into a drag.
             .open => if (down) state.companion_controller.beginDockPress(x, y),
-            .collapse => {
-                state.companion_controller.collapse();
-                state.blurCompanionComposer();
-            },
+            .collapse => state.closeCompanion(),
             .approve, .deny => {
                 const resolved = state.resolveCurrentCompanionApproval(if (action == .approve) .approve else .deny);
                 state.companion_controller.ui_error = if (resolved) null else "Approval decision was not accepted.";
@@ -294,7 +291,10 @@ pub fn handleEscapeKey(state: *runtime.AppState, down: bool) bool {
     if (!state.isCompanionEnabled()) return false;
     const was_open = state.companion_controller.visibility == .sidecar_open;
     if (!state.companion_controller.handleEscapeKey(down)) return false;
-    if (down and was_open and state.companion_controller.visibility != .sidecar_open) state.blurCompanionComposer();
+    if (down and was_open and state.companion_controller.visibility != .sidecar_open) {
+        state.blurCompanionComposer();
+        state.restoreChatFocusAfterCompanion();
+    }
     refreshAfterAction(state);
     return true;
 }
