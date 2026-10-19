@@ -2038,6 +2038,139 @@ thead .comp-rowhead { background: transparent; }
 }
 
 /* ══════════════════════════════════════
+   Tour – promo video + screenshot gallery
+   ══════════════════════════════════════ */
+
+.tour-video {
+  width: min(1080px, 100%);
+  margin: 0 auto 3.5rem;
+}
+
+/* Lifting a frame while someone watches it is distracting. */
+.tour-video:hover,
+.mobile-video:hover {
+  transform: none;
+}
+
+.tour-video-el {
+  display: block;
+  width: 100%;
+  height: auto;
+  aspect-ratio: 16 / 9;
+  background: #0b1011;
+}
+
+.shot-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1.25rem;
+}
+
+.shot-card {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-lg);
+  background: var(--panel-strong);
+  overflow: hidden;
+  transition:
+    border-color 240ms ease,
+    transform 240ms var(--ease-out),
+    box-shadow 240ms ease;
+}
+
+.shot-card:hover {
+  transform: translateY(-3px);
+  border-color: var(--line-glow);
+  box-shadow: var(--shadow-glow);
+}
+
+.shot-link {
+  display: block;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.shot-link img {
+  width: 100%;
+  height: auto;
+  aspect-ratio: 1600 / 1025;
+  object-fit: cover;
+  background: #0b1011;
+}
+
+.shot-card figcaption {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding: 1rem 1.15rem 1.15rem;
+}
+
+.shot-card figcaption strong {
+  font-size: 0.98rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.shot-card figcaption span {
+  font-size: 0.88rem;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.shot-card .shot-theme {
+  margin-top: 0.35rem;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--subtle);
+}
+
+/* ══════════════════════════════════════
+   Mobile companion
+   ══════════════════════════════════════ */
+
+.mobile-video {
+  width: 100%;
+}
+
+.mobile-points {
+  display: grid;
+  gap: 0.9rem;
+  margin: 1.6rem 0 1.4rem;
+  padding: 0;
+  list-style: none;
+}
+
+.mobile-points li {
+  display: flex;
+  gap: 0.85rem;
+  align-items: flex-start;
+}
+
+.mobile-points strong {
+  display: block;
+  color: var(--text);
+  font-weight: 600;
+}
+
+.mobile-points span {
+  color: var(--muted);
+  font-size: 0.93rem;
+}
+
+.mobile-point-dot {
+  flex: none;
+  width: 0.5rem;
+  height: 0.5rem;
+  margin-top: 0.55rem;
+  border-radius: 999px;
+  background: var(--accent);
+  box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.5);
+}
+
+/* ══════════════════════════════════════
    Responsive
    ══════════════════════════════════════ */
 
@@ -2055,6 +2188,11 @@ thead .comp-rowhead { background: transparent; }
 @media (max-width: 1080px) {
   .feature-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .provider-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .shot-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 560px) {
+  .shot-grid { grid-template-columns: 1fr; }
 }
 
 /* Tablet: two columns so the eight cards land in four even rows. */

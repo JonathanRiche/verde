@@ -3,11 +3,11 @@ export const SITE_NAME = 'Verde'
 export const HOME_TITLE =
   'Verde — Native Desktop Workspace for AI Coding Agents'
 export const HOME_DESCRIPTION =
-  'Run Codex, Claude Code, OpenCode, Cursor, Pi, FX, and Grok Build in native chat or terminal TUIs, plus Amp as a terminal TUI, in one local-first tiling workspace.'
-export const SOCIAL_IMAGE_PATH = '/og-image-v2.png'
+  'Run Codex, Claude Code, Cursor, OpenCode, Grok Build and more side by side in one native, local-first tiling workspace, then approve and steer them from your phone.'
+export const SOCIAL_IMAGE_PATH = '/og-image-v3.png'
 export const SOCIAL_IMAGE_URL = `${SITE_ORIGIN}${SOCIAL_IMAGE_PATH}`
-export const SOCIAL_IMAGE_WIDTH = 1730
-export const SOCIAL_IMAGE_HEIGHT = 909
+export const SOCIAL_IMAGE_WIDTH = 1200
+export const SOCIAL_IMAGE_HEIGHT = 630
 
 function escapeXml(value: string): string {
   return value

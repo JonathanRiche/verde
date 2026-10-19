@@ -128,14 +128,17 @@ export default function Header() {
           <a href="/#providers" class="nav-link">
             Providers
           </a>
+          <a href="/#tour" class="nav-link">
+            Tour
+          </a>
+          <a href="/#mobile" class="nav-link">
+            Mobile
+          </a>
           <a href="/#themes" class="nav-link">
             Themes
           </a>
           <a href="/#features" class="nav-link">
             Features
-          </a>
-          <a href="/#cli" class="nav-link">
-            CLI
           </a>
           <a href="/#compare" class="nav-link">
             Compare

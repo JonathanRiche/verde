@@ -68,6 +68,13 @@ function About() {
           you can tile shell terminals and a native embedded browser, persist
           the layout, and control the running app through its local CLI.
         </p>
+        <p class="band-body">
+          A headless session daemon owns every chat turn and terminal, so
+          agents keep working after the window closes. The iOS and Android
+          companion apps (in beta) and a browser-based web client pair with
+          your machines, so you can approve requests, steer a running turn,
+          and review diffs from anywhere.
+        </p>
         <p style={{ 'margin-top': '2rem' }}>
           <a href="/docs/quickstart" class="btn btn-primary">
             Read the quickstart

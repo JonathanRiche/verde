@@ -56,7 +56,9 @@ function FeatureIcon(props: { name: string }) {
     sidebar: 'M3 5h18v14H3z M9 5v14 M5.5 9h1.5 M5.5 12h1.5',
     theme: 'M12 3a9 9 0 1 0 9 9c-2 0-3-1-3-3s1-3-1-4-5 1-5-2c0-1-.5-2-0-2z',
     shield: 'M12 3l7 3v5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z M9 12l2 2 4-4',
-  }
+    steer: 'M4 12h11 M11 8l4 4-4 4 M19 5v14',
+    daemon: 'M5 4h14v6H5z M5 14h14v6H5z M8 7h.01 M8 17h.01 M12 10v4',
+    phone: 'M8 3h8a1 1 0 0 1 1 1v16a1 1 0 0 1-1 1H8a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z M11 18h2',  }
   return (
     <svg class="feat-icon" viewBox="0 0 24 24" aria-hidden="true">
       <path
@@ -135,6 +137,21 @@ const MODE_LABELS: Record<string, string> = {
 
 const featureCards = [
   {
+    icon: 'shield',
+    title: 'Uses the plans you already have',
+    body: 'Verde drives the provider CLIs on your machine with the logins you already have. No new subscription, no API keys, no proxy, and no telemetry sink.',
+  },
+  {
+    icon: 'steer',
+    title: 'Approve and steer in place',
+    body: 'Allow a command, redirect a running turn, or queue a follow-up without breaking the agent’s flow. Per-chat models, effort and permissions sit right in the composer.',
+  },
+  {
+    icon: 'daemon',
+    title: 'Work survives closing the window',
+    body: 'A headless session daemon owns every turn and terminal, so agents keep running when you quit Verde and pick up where they were after restarts and upgrades.',
+  },
+  {
     icon: 'sidebar',
     title: 'Niri-style scrolling panes',
     body: 'When a workspace grows past a couple of panes, switch to a horizontal or vertical strip — free-form panning, resizable columns, sidebar reorder, and per-workspace overrides.',
@@ -155,14 +172,74 @@ const featureCards = [
     body: 'Declare your dev server, build watcher, or queue worker once. Start, stop, restart, and inspect them from chat with /stack and /process.',
   },
   {
-    icon: 'shield',
-    title: 'Local-first, no relay',
-    body: 'No hosted inference, no proxy, no telemetry sink. Verde talks to the CLIs already on your machine; tokens, transcripts, and files stay put.',
+    icon: 'phone',
+    title: 'Your chats, on your phone',
+    body: 'Pair the iOS or Android companion app (beta) to approve, steer, review diffs and push from anywhere. Same chats, same context.',
   },
   {
     icon: 'theme',
     title: 'Themes that match your rig',
     body: 'Import portable theme packages on Linux, macOS, or Windows, or let Verde follow your active Omarchy colors.toml automatically.',
+  },
+]
+
+// Real captures of a demo workspace, each under a different Omarchy theme.
+// Same files as assets/readme/shots in the repo README.
+const gallery = [
+  {
+    src: '/media/shots/1-tiling.webp',
+    title: 'Claude and Codex, side by side',
+    body: 'Each chat works on its own task in the same repo.',
+    theme: 'Tokyo Night',
+  },
+  {
+    src: '/media/shots/2-browser.webp',
+    title: 'Built-in browser',
+    body: 'Preview your dev server and point at elements with Design Mode.',
+    theme: 'Catppuccin Latte',
+  },
+  {
+    src: '/media/shots/3-changes.webp',
+    title: 'Changes, per chat',
+    body: 'See every changed file and which agent touched it, then commit.',
+    theme: 'Gruvbox',
+  },
+  {
+    src: '/media/shots/4-agents.webp',
+    title: 'Agents that delegate',
+    body: 'A chat hands subtasks to helper agents and tracks them live.',
+    theme: 'Rosé Pine',
+  },
+  {
+    src: '/media/shots/5-terminal-agent.webp',
+    title: 'CLI agents too',
+    body: 'Run Claude Code, Codex and other CLIs in real terminal panes.',
+    theme: 'Osaka Jade',
+  },
+  {
+    src: '/media/shots/6-files.webp',
+    title: 'Files at hand',
+    body: 'Browse the project tree without leaving the chat.',
+    theme: 'Nord',
+  },
+]
+
+const mobilePoints = [
+  {
+    title: 'Your agent needs you? Approve it in one tap.',
+    body: 'Approval requests and finished turns reach your phone.',
+  },
+  {
+    title: 'Steer it mid-turn.',
+    body: 'The same chat with the same context, continued from your pocket.',
+  },
+  {
+    title: 'A real terminal and a real diff.',
+    body: 'Review changes and push from your phone.',
+  },
+  {
+    title: 'Every machine in one app.',
+    body: 'Pair your desktop, a home server, or a cloud box, and switch between them in one tap.',
   },
 ]
 
@@ -210,13 +287,13 @@ const scriptingExamples = [
 type Cell = boolean | 'partial'
 const comparisonCols = ['Verde', 'tmux + CLIs', 'Hosted agent apps', 'IDE extension']
 const comparisonRows: { label: string; cells: Cell[] }[] = [
-  { label: 'Run several agent CLIs side by side', cells: [true, 'partial', false, 'partial'] },
-  { label: 'Native tiling chat / terminal / browser', cells: [true, 'partial', false, false] },
-  { label: 'Embedded browser pane', cells: [true, false, 'partial', false] },
+  { label: 'Multi-agent tiling', cells: [true, 'partial', false, 'partial'] },
+  { label: 'Native GUI chat + TUI', cells: [true, false, 'partial', false] },
+  { label: 'Embedded browser + Design Mode', cells: [true, false, 'partial', false] },
   { label: 'Local-only, no hosted relay', cells: [true, true, false, 'partial'] },
-  { label: 'Scriptable over local IPC', cells: [true, true, false, false] },
+  { label: 'Phone approval + steering', cells: [true, false, 'partial', false] },
+  { label: 'Scriptable live control', cells: [true, 'partial', false, false] },
   { label: 'No Electron / Chromium bundle', cells: [true, true, false, false] },
-  { label: 'Layouts that persist across launches', cells: [true, 'partial', 'partial', false] },
 ]
 
 const stack = [
@@ -248,6 +325,16 @@ const faqs = [
     question: 'Which operating systems can run Verde?',
     answer:
       'Verde provides install paths for Linux, macOS, and Windows x64. Its embedded browser uses WPE WebKit on Linux, WKWebView on macOS, and WebView2 on Windows.',
+  },
+  {
+    question: 'Do my agents stop when I close Verde?',
+    answer:
+      'No. A headless session daemon owns every chat turn and terminal, so agents keep working when the window is closed and their work survives restarts and upgrades.',
+  },
+  {
+    question: 'Can I use Verde from my phone?',
+    answer:
+      'Yes. The iOS and Android companion apps (in beta) and a browser-based web client pair with your machines, so you can approve requests, steer a running turn, review diffs, and push from anywhere.',
   },
   {
     question: 'Is Verde free and open source?',
@@ -319,6 +406,10 @@ function App() {
           'Native and terminal coding-agent panes',
           'Tiled chat, terminal, and browser workspace',
           'Local provider CLI integrations',
+          'Embedded browser with Design Mode',
+          'In-place approvals and mid-turn steering',
+          'Session daemon that keeps agents running after the window closes',
+          'iOS, Android, and web companion apps (beta)',
           'Scriptable local IPC',
           'Portable themes',
         ],
@@ -368,12 +459,11 @@ function App() {
               <span class="display-accent">One tiling window.</span>
             </h1>
             <p class="lead">
-              Verde runs Codex, Claude Code, OpenCode, Cursor, Pi, FX, and
-              Grok Build as native chat or terminal TUI panes, with Amp as a
-              terminal TUI in the same native desktop app.
-              Tile or Niri-style scroll chat, terminal, and browser panes with
-              vim keybinds. No hosted relay — Verde just talks to the CLIs
-              already on your machine.
+              Run Codex, Claude Code, Cursor, OpenCode, Grok Build and more
+              side by side, as native chats or their own TUIs, next to your
+              terminals and a built-in browser. No new subscription, no API
+              keys, no hosted relay: Verde drives the agent CLIs you already
+              use. Then pick up the same chats from your phone.
             </p>
 
             <div class="hero-actions">
@@ -455,6 +545,59 @@ function App() {
             the provider CLIs already installed on your machine, so your tokens,
             transcripts, and project files never leave it.
           </p>
+        </div>
+      </section>
+
+      {/* ── Tour: promo video + themed screenshot gallery ── */}
+      <section id="tour" class="band">
+        <div class="wrap">
+          <div class="band-header band-header--center">
+            <p class="tag tag-static">See it work</p>
+            <h2 class="heading">Thirty seconds, one window.</h2>
+            <p class="band-body">
+              Watch a Codex chat, a Claude Code TUI and a shell share one
+              workspace, with approvals and mid-turn steering. Below, the real
+              app in six themes.
+            </p>
+          </div>
+
+          <div class="tour-video app-frame">
+            <video
+              class="tour-video-el"
+              src="/media/verde-desktop.mp4"
+              poster="/media/verde-desktop-poster.webp"
+              controls
+              playsinline
+              preload="none"
+              width="1600"
+              height="900"
+              aria-label="Verde desktop tour, 30 seconds, with sound"
+            />
+          </div>
+
+          <div class="shot-grid stagger">
+            <For each={gallery}>
+              {(g) => (
+                <figure class="shot-card">
+                  <a href={g.src} target="_blank" rel="noreferrer" class="shot-link">
+                    <img
+                      src={g.src}
+                      alt={`${g.title}: ${g.body}`}
+                      width="1600"
+                      height="1025"
+                      loading="lazy"
+                      decoding="async"
+                    />
+                  </a>
+                  <figcaption>
+                    <strong>{g.title}</strong>
+                    <span>{g.body}</span>
+                    <span class="shot-theme">{g.theme}</span>
+                  </figcaption>
+                </figure>
+              )}
+            </For>
+          </div>
         </div>
       </section>
 
@@ -554,6 +697,65 @@ function App() {
                 <span><kbd>Ctrl+↵</kbd> New pane</span>
                 <span><kbd>Esc</kbd> Close</span>
               </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* ── Mobile companion ── */}
+      <section id="mobile" class="band">
+        <div class="wrap feature-row">
+          <div class="feature-copy">
+            <p class="tag tag-static">Companion apps · beta</p>
+            <h2 class="heading">
+              Start at your desk.<br />
+              <span class="display-accent">Finish anywhere.</span>
+            </h2>
+            <p class="band-body">
+              Your agents run on your machines, and the companion apps keep you
+              in the loop when you’re away from the desk.
+            </p>
+            <ul class="mobile-points">
+              <For each={mobilePoints}>
+                {(m) => (
+                  <li>
+                    <span class="mobile-point-dot" aria-hidden="true" />
+                    <div>
+                      <strong>{m.title}</strong>
+                      <span>{m.body}</span>
+                    </div>
+                  </li>
+                )}
+              </For>
+            </ul>
+            <p class="band-body band-body-muted">
+              The iOS and Android apps are in beta, and a browser-based web
+              client is also available. To pair them, see{' '}
+              <a
+                href="https://github.com/JonathanRiche/verde/blob/master/docs/serve-pair-connect.md"
+                target="_blank"
+                rel="noreferrer"
+                class="text-link"
+              >
+                Serve, Pair, and Connect
+              </a>
+              .
+            </p>
+          </div>
+
+          <div class="feature-visual">
+            <div class="app-frame mobile-video">
+              <video
+                class="tour-video-el"
+                src="/media/verde-mobile.mp4"
+                poster="/media/verde-mobile-poster.webp"
+                controls
+                playsinline
+                preload="none"
+                width="1600"
+                height="900"
+                aria-label="Verde mobile tour, 30 seconds, with sound: approve an edit, steer the turn, review the diff and push"
+              />
             </div>
           </div>
         </div>
