@@ -55,11 +55,11 @@ function FeatureIcon(props: { name: string }) {
     terminal: 'M4 5h16v14H4z M7 9l3 3-3 3 M13 15h4',
     process: 'M12 3v4 M12 17v4 M5.6 5.6l2.8 2.8 M15.6 15.6l2.8 2.8 M3 12h4 M17 12h4 M5.6 18.4l2.8-2.8 M15.6 8.4l2.8-2.8',
     sidebar: 'M3 5h18v14H3z M9 5v14 M5.5 9h1.5 M5.5 12h1.5',
-    theme: 'M12 3a9 9 0 1 0 9 9c-2 0-3-1-3-3s1-3-1-4-5 1-5-2c0-1-.5-2-0-2z',
     shield: 'M12 3l7 3v5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z M9 12l2 2 4-4',
     steer: 'M4 12h11 M11 8l4 4-4 4 M19 5v14',
     daemon: 'M5 4h14v6H5z M5 14h14v6H5z M8 7h.01 M8 17h.01 M12 10v4',
-    phone: 'M8 3h8a1 1 0 0 1 1 1v16a1 1 0 0 1-1 1H8a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z M11 18h2',  }
+    bolt: 'M13 3L5 14h6l-1 7 8-11h-6z',
+  }
   return (
     <svg class="feat-icon" viewBox="0 0 24 24" aria-hidden="true">
       <path
@@ -77,157 +77,128 @@ function FeatureIcon(props: { name: string }) {
 /* ───────────────────────── Data ───────────────────────── */
 
 // Two integration modes: 'gui' = native Verde chat pane over the provider's
-// protocol; 'tui' = the agent's own TUI launched in an embedded Ghostty
-// terminal pane. Source of truth: providers/types.zig and
+// protocol; 'tui' = the agent's own TUI launched in an embedded terminal
+// pane. Source of truth: providers/types.zig and
 // state/provider_models.zig (GUI), and workspace/stack.zig (TUI).
 const providers = [
   {
     name: 'Codex',
     logo: openAiLogo,
     modes: ['gui', 'tui'],
-    blurb: 'Runs the local codex CLI and boots codex app-server when a thread starts.',
   },
   {
     name: 'Claude Code',
     logo: claudeLogo,
     modes: ['gui', 'tui'],
-    blurb: 'Talks to your installed Claude Code through the Claude Agent SDK.',
   },
   {
     name: 'OpenCode',
     logo: opencodeLogo,
     modes: ['gui', 'tui'],
-    blurb: 'Drives the opencode CLI and starts opencode serve on demand.',
   },
   {
     name: 'Cursor',
     logo: cursorLogo,
     modes: ['gui', 'tui'],
-    blurb: 'Speaks to the Cursor CLI ACP server (agent acp) on your machine.',
   },
   {
     name: 'Pi',
     logo: piLogo,
     modes: ['gui', 'tui'],
-    blurb: 'Drives the pi CLI in RPC mode (pi --mode rpc) for native chat, and also launches its terminal TUI.',
   },
   {
     name: 'FX',
     logo: fxLogo,
     modes: ['gui', 'tui'],
-    blurb: 'Speaks ACP to the fx CLI (fx acp) for native chat, and also launches its terminal TUI.',
   },
   {
     name: 'Grok Build',
     logo: grokLogo,
     modes: ['gui', 'tui'],
-    blurb: 'Speaks ACP to the grok CLI (grok agent stdio), and also launches its terminal TUI.',
   },
   {
     name: 'Amp',
     logo: ampLogo,
     modes: ['tui'],
-    blurb: 'Launches the amp CLI in an embedded terminal, with hooks that drive live status pips.',
   },
 ]
 
 const MODE_LABELS: Record<string, string> = {
-  gui: 'GUI chat',
-  tui: 'Terminal TUI',
+  gui: 'Chat window',
+  tui: 'Terminal',
 }
 
 const featureCards = [
   {
     icon: 'shield',
     title: 'Uses the plans you already have',
-    body: 'Verde drives the provider CLIs on your machine with the logins you already have. No new subscription, no API keys, no proxy, and no telemetry sink.',
+    body: 'Works with the logins you already have for Claude Code, Codex, Cursor and the rest. No new subscription and no API keys.',
   },
   {
     icon: 'steer',
-    title: 'Approve and steer in place',
-    body: 'Allow a command, redirect a running turn, or queue a follow-up without breaking the agent’s flow. Per-chat models, effort and permissions sit right in the composer.',
+    title: 'Approve and redirect as it works',
+    body: 'Allow a command, change course mid-task, or queue the next request without stopping the agent.',
   },
   {
     icon: 'daemon',
-    title: 'Work survives closing the window',
-    body: 'A headless session daemon owns every turn and terminal, so agents keep running when you quit Verde and pick up where they were after restarts and upgrades.',
-  },
-  {
-    icon: 'sidebar',
-    title: 'Niri-style scrolling panes',
-    body: 'When a workspace grows past a couple of panes, switch to a horizontal or vertical strip — free-form panning, resizable columns, sidebar reorder, and per-workspace overrides.',
+    title: 'Close the window, keep working',
+    body: 'Agents keep running when Verde is closed and pick up where they left off after a restart.',
   },
   {
     icon: 'browser',
-    title: 'Browser + Design Mode',
-    body: 'Tile a native webview beside your agent, then point at an element or draw a region and send the visual context directly to a chat or terminal TUI.',
+    title: 'A browser built in',
+    body: 'Preview your app next to the agent, click any element on the page, and ask for a change.',
   },
   {
     icon: 'terminal',
-    title: 'Project-scoped terminal dock',
-    body: 'A Ghostty-powered terminal under every workspace. Spawn shell tabs or agent launch-profile tabs, with OSC titles and per-terminal zoom that persist.',
+    title: 'Terminals and dev servers',
+    body: 'Real terminals sit beside your chats, and your dev server starts, stops and restarts from one place.',
   },
   {
-    icon: 'process',
-    title: 'Managed workspace processes',
-    body: 'Declare your dev server, build watcher, or queue worker once. Start, stop, restart, and inspect them from chat with /stack and /process.',
-  },
-  {
-    icon: 'phone',
-    title: 'Your chats, on your phone',
-    body: 'Pair the iOS or Android companion app (beta) to approve, steer, review diffs and push from anywhere. Same chats, same context.',
-  },
-  {
-    icon: 'theme',
-    title: 'Themes that match your rig',
-    body: 'Import portable theme packages on Linux, macOS, or Windows, or let Verde follow your active Omarchy colors.toml automatically.',
+    icon: 'bolt',
+    title: 'Native and fast, not Electron',
+    body: 'Built in Zig, so it starts fast and stays light. Ctrl+Shift+P finds any chat or command, and every shortcut can be remapped.',
   },
 ]
 
-// Short screen recordings of a demo workspace, each under a different Omarchy
-// theme. The poster frame doubles as the grid thumbnail.
+// Short screen recordings of a demo workspace. The poster frame doubles as the
+// grid thumbnail.
 const gallery = [
   {
     src: '/media/clips/1-tiling.webp',
     video: '/media/clips/1-tiling.mp4',
     title: 'Claude and Codex, side by side',
     body: 'Each chat works on its own task in the same repo.',
-    theme: 'Tokyo Night',
   },
   {
     src: '/media/clips/2-browser-v3.webp',
     video: '/media/clips/2-browser-v3.mp4',
     title: 'Built-in browser',
-    body: 'Flip between tabs, watch an agent restyle the page and reload it, then point at an element to request an edit.',
-    theme: 'Catppuccin Latte',
+    body: 'Switch tabs, watch an agent restyle the page and reload it, then click an element to ask for an edit.',
   },
   {
     src: '/media/clips/3-changes.webp',
     video: '/media/clips/3-changes.mp4',
     title: 'Changes, per chat',
     body: 'Filter changes by the chat that made them and open any diff.',
-    theme: 'Gruvbox',
   },
   {
     src: '/media/clips/4-agents.webp',
     video: '/media/clips/4-agents.mp4',
     title: 'Agents that delegate',
     body: 'A chat hands subtasks to helper agents and tracks them live.',
-    theme: 'Rosé Pine',
   },
   {
     src: '/media/clips/5-terminal-agent.webp',
     video: '/media/clips/5-terminal-agent.mp4',
     title: 'CLI agents too',
     body: 'Run Claude Code, Codex and other CLIs in real terminal panes.',
-    theme: 'Osaka Jade',
   },
   {
     src: '/media/clips/6-files.webp',
     video: '/media/clips/6-files.mp4',
     title: 'Files at hand',
     body: 'Browse and filter the project tree, and open files beside the chat.',
-    theme: 'Nord',
   },
 ]
 
@@ -369,7 +340,6 @@ function Lightbox(props: {
                   </span>
                   <strong>{item().title}</strong>
                   <span>{item().body}</span>
-                  <span class="shot-theme">{item().theme}</span>
                 </figcaption>
                 <div class="lightbox-dots">
                   <For each={props.items}>
@@ -412,103 +382,56 @@ const mobilePoints = [
   },
 ]
 
-const paletteRows = [
-  { section: 'App', icon: '⌘', label: 'Scrolling Layout: Always', hint: 'workspace' },
-  { section: 'Panes', icon: '▦', label: 'Next Pane', hint: 'Ctrl+Tab' },
-  { section: 'Threads', icon: '◷', label: 'Fix split chat keyboard scrolling', hint: 'kit' },
-  { section: 'Workspaces', icon: '⦿', label: 'kylos-apparel', hint: 'Alt+1' },
-  { section: 'App', icon: '⌘', label: 'Toggle embedded browser', hint: 'Ctrl+Shift+B' },
-]
-
-const keybinds = [
-  { combo: 'Ctrl+Shift+P', desc: 'Command palette — threads, panes, workspaces' },
-  { combo: 'Ctrl+B, then T', desc: 'New terminal tab (prefix mode)' },
-  { combo: 'Ctrl+B, then C', desc: 'New chat tab (prefix mode)' },
-  { combo: 'Ctrl+B, then Shift+T', desc: 'New standalone terminal pane (prefix mode)' },
-  { combo: 'Ctrl+Shift+B', desc: 'Toggle the embedded browser pane' },
-  { combo: 'Ctrl+H / J / K / L', desc: 'Move focus across panes (and the scrolling strip)' },
-  { combo: 'Ctrl+Tab / Ctrl+Shift+Tab', desc: 'Next / previous pane in sidebar order' },
-  { combo: 'Ctrl+Shift+H / J / K / L', desc: 'Swap panes — rearrange the tiling' },
-  { combo: 'Alt+Z', desc: 'Zoom the focused pane to fill the workspace' },
-  { combo: 'Alt+1 … Alt+9', desc: 'Jump between workspaces by sidebar order' },
-  { combo: 'Alt+↑ / Alt+↓', desc: 'Cycle to the previous / next workspace' },
-]
-
-const scriptingExamples = [
-  {
-    label: 'Send a prompt to a specific pane',
-    code: `verde live chat send --pane $PANE --prompt "run the tests and fix failures"`,
-  },
-  {
-    label: 'Drive the embedded terminal from a script',
-    code: `verde live terminal write --focused --text $'cargo test\\r'`,
-  },
-  {
-    label: 'Split a terminal next to a chat pane',
-    code: `verde live pane split --pane $PANE --kind terminal --axis vertical`,
-  },
-  {
-    label: 'Inspect the running app',
-    code: `verde live status --json | jq '.result.browser'`,
-  },
-]
-
 type Cell = boolean | 'partial'
-const comparisonCols = ['Verde', 'tmux + CLIs', 'Hosted agent apps', 'IDE extension']
+const comparisonCols = ['Verde', 'Agents in a terminal', 'Hosted agent apps', 'IDE extensions']
 const comparisonRows: { label: string; cells: Cell[] }[] = [
-  { label: 'Multi-agent tiling', cells: [true, 'partial', false, 'partial'] },
-  { label: 'Native GUI chat + TUI', cells: [true, false, 'partial', false] },
-  { label: 'Embedded browser + Design Mode', cells: [true, false, 'partial', false] },
-  { label: 'Local-only, no hosted relay', cells: [true, true, false, 'partial'] },
-  { label: 'Phone approval + steering', cells: [true, false, 'partial', false] },
-  { label: 'Scriptable live control', cells: [true, 'partial', false, false] },
-  { label: 'No Electron / Chromium bundle', cells: [true, true, false, false] },
-]
-
-const stack = [
-  { label: 'Zig 0.16', detail: 'Native executable, no Electron UI' },
-  { label: 'SDL3 + Palette', detail: 'Our Zig GUI framework, built in-tree' },
-  { label: 'Ghostty VT', detail: 'Embedded terminal engine (libghostty-vt)' },
-  { label: 'Native webview', detail: 'WPE WebKit · WKWebView · WebView2' },
-  { label: 'SQLite', detail: 'Local state, projects, threads, transcripts' },
-  { label: 'Omarchy themes', detail: 'colors.toml auto-detect on Linux' },
+  { label: 'Run several agents at once', cells: [true, 'partial', false, 'partial'] },
+  { label: 'Chat window or terminal, your choice', cells: [true, false, 'partial', false] },
+  { label: 'Built-in browser', cells: [true, false, 'partial', false] },
+  { label: 'Approve from your phone', cells: [true, false, 'partial', false] },
+  { label: 'Runs on your machine, no relay', cells: [true, true, false, 'partial'] },
+  { label: 'Native app, not Electron', cells: [true, true, false, false] },
 ]
 
 const faqs = [
   {
+    question: 'Is Verde free?',
+    answer:
+      'Yes. Verde is free and open source (MIT). You only pay for the AI coding tools you already use.',
+  },
+  {
     question: 'What is Verde?',
     answer:
-      'Verde is a native desktop workspace for AI coding agents. It tiles agent chats, terminal TUIs, shell terminals, and an embedded browser in one project-scoped window.',
+      'A desktop app for running AI coding agents like Claude Code and Codex side by side, with terminals and a browser built in.',
   },
   {
-    question: 'Which coding agents does Verde support?',
+    question: 'What do I need first?',
     answer:
-      'Verde supports Codex, Claude Code, OpenCode, Cursor, Pi, FX, and Grok Build in native GUI chat panes. Codex, Claude Code, OpenCode, Cursor, Pi, FX, Grok Build, and Amp also run as terminal TUIs.',
+      'At least one AI coding tool installed and signed in, such as Claude Code, Codex, Cursor, OpenCode, Pi, FX, Grok Build or Amp.',
   },
   {
-    question: 'Does Verde host models or relay prompts?',
+    question: 'Does Verde see my prompts or code?',
     answer:
-      'No. Verde runs and talks to provider CLIs installed on your computer. It does not provide hosted inference or route prompts through a Verde relay.',
+      "No. Verde doesn't host any AI or relay your prompts. Your agents talk to their providers exactly as they do today.",
   },
   {
-    question: 'Which operating systems can run Verde?',
+    question: 'Can several agents work on the same project?',
     answer:
-      'Verde provides install paths for Linux, macOS, and Windows x64. Its embedded browser uses WPE WebKit on Linux, WKWebView on macOS, and WebView2 on Windows.',
+      'Yes. Each chat works on its own task in the same repo, and Verde shows which chat changed which files.',
+  },
+  {
+    question: 'Which operating systems does it run on?',
+    answer: 'Linux, macOS and Windows (x64).',
   },
   {
     question: 'Do my agents stop when I close Verde?',
     answer:
-      'No. A headless session daemon owns every chat turn and terminal, so agents keep working when the window is closed and their work survives restarts and upgrades.',
+      'No. They keep working in the background and pick up where they left off after restarts and upgrades.',
   },
   {
-    question: 'Can I use Verde from my phone?',
+    question: 'Can I use it from my phone?',
     answer:
-      'Yes. The iOS and Android companion apps (in beta) and a browser-based web client pair with your machines, so you can approve requests, steer a running turn, review diffs, and push from anywhere.',
-  },
-  {
-    question: 'Is Verde free and open source?',
-    answer:
-      'Yes. Verde is MIT-licensed open-source software, and its source code and releases are available on GitHub.',
+      'Yes. The iOS and Android apps are in private beta, and a web version works today. Approve requests, steer a task, review changes and push from anywhere.',
   },
 ]
 
@@ -622,18 +545,17 @@ function App() {
           <div class="hero-content rise">
             <p class="tag">
               <span class="tag-pulse" />
-              Local · native · keyboard-first
+              Free · Open source · Linux, macOS, Windows
             </p>
             <h1 class="display">
               All your coding agents.<br />
               <span class="display-accent">Anywhere you work.</span>
             </h1>
             <p class="lead">
-              Run Codex, Claude Code, Cursor, OpenCode, Grok Build and more
-              in one native workspace, as GUI chats or their own TUIs, tiled
-              next to your terminals and a built-in browser. No new subscription, no API
-              keys, no hosted relay: Verde drives the agent CLIs you already
-              use. Then pick up the same chats from your phone.
+              Verde is a desktop app that runs Claude Code, Codex, Cursor and
+              more side by side, with a terminal and browser built in. It uses
+              the subscriptions you already have, and you can check in from
+              your phone when you step away.
             </p>
 
             <div class="hero-actions">
@@ -684,7 +606,7 @@ function App() {
       {/* ── Provider strip ── */}
       <section id="providers" class="providers-band">
         <div class="wrap">
-          <p class="strip-eyebrow">Coding agents, one workspace — GUI chat or native TUI</p>
+          <p class="strip-eyebrow">Works with the coding agents you already use</p>
           <div class="provider-grid stagger">
             <For each={providers}>
               {(p) => (
@@ -702,18 +624,14 @@ function App() {
                       )}
                     </For>
                   </div>
-                  <p>{p.blurb}</p>
                 </article>
               )}
             </For>
           </div>
           <p class="providers-note">
-            Codex, Claude Code, OpenCode, Cursor, Pi, FX, and Grok Build can
-            run inside an embedded Ghostty terminal pane or drive Verde's native
-            chat panes. Amp is a terminal TUI.
-            Either way, Verde doesn't host a model or run inference — it drives
-            the provider CLIs already installed on your machine, so your tokens,
-            transcripts, and project files never leave it.
+            Use each one in Verde's chat window or in its own terminal app.
+            Verde doesn't host any AI: it runs the tools and logins already on
+            your computer.
           </p>
         </div>
       </section>
@@ -725,9 +643,8 @@ function App() {
             <p class="tag tag-static">See it work</p>
             <h2 class="heading">Thirty seconds, one window.</h2>
             <p class="band-body">
-              Watch a Codex chat, a Claude Code TUI and a shell share one
-              workspace, with approvals and mid-turn steering. Below, the real
-              app in six themes.
+              A 30-second tour, then six short clips of the features you'll use
+              every day.
             </p>
           </div>
 
@@ -772,7 +689,6 @@ function App() {
                   <figcaption>
                     <strong>{g.title}</strong>
                     <span>{g.body}</span>
-                    <span class="shot-theme">{g.theme}</span>
                   </figcaption>
                 </figure>
               )}
@@ -783,59 +699,8 @@ function App() {
 
       <Lightbox items={gallery} index={lightbox()} onIndex={setLightbox} />
 
-      {/* ── Feature: command palette ── */}
-      <section id="palette" class="band band-alt">
-        <div class="wrap feature-row feature-row--reverse">
-          <div class="feature-copy">
-            <p class="tag tag-static">Command palette</p>
-            <h2 class="heading">
-              Hit <span class="heading-warm">Ctrl+Shift+P</span>, type, jump.
-            </h2>
-            <p class="band-body">
-              One Raycast-style launcher ranks your threads, open panes,
-              workspaces, and app commands in a single list. Search past chats by
-              title, hop to any pane, or fire an action without leaving the
-              keyboard.
-            </p>
-            <p class="band-body band-body-muted">
-              Ctrl+Enter opens a thread in a fresh pane. Slash commands like{' '}
-              <code>/stack</code> and <code>/process</code> run straight from the
-              composer alongside each provider's own commands.
-            </p>
-          </div>
-
-          <div class="feature-visual">
-            {/* Pure-CSS mock of the Ctrl+Shift+P launcher overlay */}
-            <div class="palette-mock" aria-hidden="true">
-              <div class="pm-input">
-                <span class="pm-caret-prefix">›</span>
-                <span class="pm-query">scroll</span>
-                <span class="pm-caret" />
-              </div>
-              <div class="pm-list">
-                <For each={paletteRows}>
-                  {(r, i) => (
-                    <div class={`pm-row${i() === 0 ? ' pm-row--active' : ''}`}>
-                      <span class="pm-row-icon">{r.icon}</span>
-                      <span class="pm-row-label">{r.label}</span>
-                      <span class="pm-row-section">{r.section}</span>
-                      <span class="pm-row-hint">{r.hint}</span>
-                    </div>
-                  )}
-                </For>
-              </div>
-              <div class="pm-foot">
-                <span><kbd>↵</kbd> Open</span>
-                <span><kbd>Ctrl+↵</kbd> New pane</span>
-                <span><kbd>Esc</kbd> Close</span>
-              </div>
-            </div>
-          </div>
-        </div>
-      </section>
-
       {/* ── Mobile companion ── */}
-      <section id="mobile" class="band">
+      <section id="mobile" class="band band-alt">
         <div class="wrap feature-row">
           <div class="feature-copy">
             <p class="tag tag-static">Companion apps · beta</p>
@@ -887,17 +752,15 @@ function App() {
               </span>
             </div>
             <p class="band-body band-body-muted">
-              The iOS and Android apps are in private beta ahead of their
-              store launch, and a browser-based web client is also available. To pair them, see{' '}
+              In private beta. A web version works today.{' '}
               <a
                 href="https://github.com/JonathanRiche/verde/blob/master/docs/serve-pair-connect.md"
                 target="_blank"
                 rel="noreferrer"
                 class="text-link"
               >
-                Serve, Pair, and Connect
+                How to pair
               </a>
-              .
             </p>
           </div>
 
@@ -919,19 +782,92 @@ function App() {
         </div>
       </section>
 
+      {/* ── Feature grid ── */}
+      <section id="features" class="band">
+        <div class="wrap">
+          <div class="band-header band-header--center">
+            <p class="tag tag-static">Everything in one window</p>
+            <h2 class="heading">Everything a coding session needs.</h2>
+          </div>
+
+          <div class="feature-grid stagger">
+            <For each={featureCards}>
+              {(f) => (
+                <article class="feature-card">
+                  <span class="feat-icon-wrap">
+                    <FeatureIcon name={f.icon} />
+                  </span>
+                  <h3>{f.title}</h3>
+                  <p>{f.body}</p>
+                </article>
+              )}
+            </For>
+          </div>
+        </div>
+      </section>
+
+      {/* ── Comparison ── */}
+      <section id="compare" class="band band-alt">
+        <div class="wrap">
+          <div class="band-header band-header--center">
+            <p class="tag tag-static">How it compares</p>
+            <h2 class="heading">One app instead of three.</h2>
+            <p class="band-body">
+              What you get with Verde, compared with running agents in a
+              terminal, in a hosted app, or inside your IDE.
+            </p>
+          </div>
+
+          <div class="comp-scroll">
+            <table class="comp-table">
+              <thead>
+                <tr>
+                  <th class="comp-rowhead" />
+                  <For each={comparisonCols}>
+                    {(c, i) => (
+                      <th class={i() === 0 ? 'comp-col comp-col--verde' : 'comp-col'}>
+                        {c}
+                      </th>
+                    )}
+                  </For>
+                </tr>
+              </thead>
+              <tbody>
+                <For each={comparisonRows}>
+                  {(row) => (
+                    <tr>
+                      <th class="comp-rowhead" scope="row">{row.label}</th>
+                      <For each={row.cells}>
+                        {(cell, i) => (
+                          <td class={i() === 0 ? 'comp-td comp-td--verde' : 'comp-td'}>
+                            <CompCell value={cell} />
+                          </td>
+                        )}
+                      </For>
+                    </tr>
+                  )}
+                </For>
+              </tbody>
+            </table>
+          </div>
+          <p class="comp-legend">
+            <span><span class="comp-cell comp-cell--yes">✓</span> full</span>
+            <span><span class="comp-cell comp-cell--partial">~</span> partial / with effort</span>
+            <span><span class="comp-cell comp-cell--no">–</span> not really</span>
+          </p>
+        </div>
+      </section>
+
       {/* ── Portable theme showcase ── */}
       <Show when={availableThemes.length > 0}>
         <section id="themes" class="themes-band">
           <div class="wrap">
             <div class="band-header band-header--center">
-              <p class="tag tag-static">Portable themes</p>
+              <p class="tag tag-static">Themes</p>
               <h2 class="heading">It dresses like your desktop.</h2>
               <p class="band-body">
-                On Omarchy, Verde auto-detects the active theme's{' '}
-                <code>colors.toml</code> with no config needed. On any platform,
-                pick a palette below and import it from this site. Every shot is
-                the real app recaptured under that theme, and this page re-skins
-                itself from the same colors.
+                {availableThemes.length} themes, or let Verde match your desktop
+                automatically.
               </p>
             </div>
 
@@ -989,222 +925,16 @@ function App() {
               </div>
             </div>
 
-            <p class="themes-note">
-              These URLs are ordinary, versioned JSON files, so they also work
-              with <code>verde theme validate</code> and automation. Verde still
-              follows <code>~/.local/state/omarchy/current/theme/colors.toml</code>{' '}
-              automatically. See{' '}
-              <a href="/docs/config" class="text-link">Configuration &amp; state</a>{' '}
-              for the detection order and manual overrides.
-            </p>
           </div>
         </section>
       </Show>
-
-      {/* ── Feature grid ── */}
-      <section id="features" class="band">
-        <div class="wrap">
-          <div class="band-header band-header--center">
-            <p class="tag tag-static">Everything in one window</p>
-            <h2 class="heading">Built like a workstation tool.</h2>
-            <p class="band-body">
-              The pieces a coding session actually needs — a browser, a terminal,
-              your long-running processes, and every agent — without a browser tab
-              or a second app in sight.
-            </p>
-          </div>
-
-          <div class="feature-grid stagger">
-            <For each={featureCards}>
-              {(f) => (
-                <article class="feature-card">
-                  <span class="feat-icon-wrap">
-                    <FeatureIcon name={f.icon} />
-                  </span>
-                  <h3>{f.title}</h3>
-                  <p>{f.body}</p>
-                </article>
-              )}
-            </For>
-          </div>
-        </div>
-      </section>
-
-      {/* ── Keybinds ── */}
-      <section id="keybinds" class="band band-alt">
-        <div class="wrap feature-row">
-          <div class="feature-copy">
-            <p class="tag tag-static">Keyboard-first</p>
-            <h2 class="heading">Your hands stay on home row.</h2>
-            <p class="band-body">
-              Verde is driven the way you drive your editor and window manager —
-              splits, focus, resize, and zoom all have vim-style defaults, and
-              every binding is remappable in one config file.
-            </p>
-            <p class="band-body band-body-muted">
-              These are the defaults; override any of them under{' '}
-              <code>keybinds</code> in your Verde config.
-            </p>
-          </div>
-
-          <div class="keybind-card">
-            <div class="keybind-head">
-              <span class="keybind-head-dot" />
-              <span class="keybind-head-dot" />
-              <span class="keybind-head-dot" />
-              <span class="keybind-head-title">verde.keybinds</span>
-            </div>
-            <dl class="keybind-list">
-              <For each={keybinds}>
-                {(k) => (
-                  <>
-                    <dt>
-                      <kbd>{k.combo}</kbd>
-                    </dt>
-                    <dd>{k.desc}</dd>
-                  </>
-                )}
-              </For>
-            </dl>
-          </div>
-        </div>
-      </section>
-
-      {/* ── Scripting / CLI ── */}
-      <section id="cli" class="band">
-        <div class="wrap">
-          <div class="band-header">
-            <p class="tag tag-static">Scripting</p>
-            <h2 class="heading">Drive Verde from your shell.</h2>
-            <p class="band-body">
-              Every running instance exposes current-user local IPC: a Unix
-              socket on Linux and macOS, or a named pipe on Windows. The{' '}
-              <code>verde live</code> and <code>verde state</code> subcommands let
-              you inspect panes, send prompts, write to terminals, and script the
-              app from your dotfiles, hooks, or CI.
-            </p>
-          </div>
-
-          <div class="script-grid stagger">
-            <For each={scriptingExamples}>
-              {(ex) => (
-                <article class="script-card">
-                  <div class="script-card-head">
-                    <span>{ex.label}</span>
-                    <CopyButton command={ex.code} size="sm" />
-                  </div>
-                  <pre><code>{ex.code}</code></pre>
-                </article>
-              )}
-            </For>
-          </div>
-
-          <p class="script-foot">
-            Full command surface in{' '}
-            <a
-              href="/docs/cli"
-              class="text-link"
-            >
-              the CLI reference
-            </a>
-          </p>
-        </div>
-      </section>
-
-      {/* ── Comparison ── */}
-      <section id="compare" class="band band-alt">
-        <div class="wrap">
-          <div class="band-header band-header--center">
-            <p class="tag tag-static">Where it fits</p>
-            <h2 class="heading">Not a multiplexer. Not a chat app.</h2>
-            <p class="band-body">
-              Verde sits where a terminal multiplexer, a hosted agent app, and an
-              IDE plugin each stop short — a native home for every agent you
-              already run locally.
-            </p>
-          </div>
-
-          <div class="comp-scroll">
-            <table class="comp-table">
-              <thead>
-                <tr>
-                  <th class="comp-rowhead" />
-                  <For each={comparisonCols}>
-                    {(c, i) => (
-                      <th class={i() === 0 ? 'comp-col comp-col--verde' : 'comp-col'}>
-                        {c}
-                      </th>
-                    )}
-                  </For>
-                </tr>
-              </thead>
-              <tbody>
-                <For each={comparisonRows}>
-                  {(row) => (
-                    <tr>
-                      <th class="comp-rowhead" scope="row">{row.label}</th>
-                      <For each={row.cells}>
-                        {(cell, i) => (
-                          <td class={i() === 0 ? 'comp-td comp-td--verde' : 'comp-td'}>
-                            <CompCell value={cell} />
-                          </td>
-                        )}
-                      </For>
-                    </tr>
-                  )}
-                </For>
-              </tbody>
-            </table>
-          </div>
-          <p class="comp-legend">
-            <span><span class="comp-cell comp-cell--yes">✓</span> full</span>
-            <span><span class="comp-cell comp-cell--partial">~</span> partial / with effort</span>
-            <span><span class="comp-cell comp-cell--no">–</span> not really</span>
-          </p>
-        </div>
-      </section>
-
-      {/* ── Under the hood ── */}
-      <section id="stack" class="band">
-        <div class="wrap">
-          <div class="band-header">
-            <p class="tag tag-static">Under the hood</p>
-            <h2 class="heading">
-              Zig and SDL3, <span class="heading-strike">not Electron.</span>
-            </h2>
-            <p class="band-body">
-              Built as a native desktop package on top of Verde's own Palette UI
-              framework. No Electron UI, no bundled Chromium, and no telemetry
-              sink — just the ingredients a workstation tool should be made of.
-            </p>
-          </div>
-
-          <ul class="stack-strip stagger" aria-label="Build ingredients">
-            <For each={stack}>
-              {(s) => (
-                <li class="stack-item">
-                  <span class="stack-bullet" aria-hidden="true" />
-                  <div>
-                    <strong>{s.label}</strong>
-                    <span>{s.detail}</span>
-                  </div>
-                </li>
-              )}
-            </For>
-          </ul>
-        </div>
-      </section>
 
       {/* ── Frequently asked questions ── */}
       <section id="faq" class="band band-alt">
         <div class="wrap">
           <div class="band-header">
             <p class="tag tag-static">Common questions</p>
-            <h2 class="heading">Verde, in plain language.</h2>
-            <p class="band-body">
-              The short version of how Verde fits into a local AI coding
-              workflow.
-            </p>
+            <h2 class="heading">Before you install.</h2>
           </div>
 
           <dl class="faq-grid">
@@ -1225,11 +955,10 @@ function App() {
         <div class="wrap">
           <div class="band-header band-header--center">
             <p class="tag tag-static">Install</p>
-            <h2 class="heading">One command on Linux, macOS, or Windows.</h2>
+            <h2 class="heading">One command to install.</h2>
             <p class="band-body">
-              The installer detects your platform, downloads the matching release
-              artifact from GitHub, and installs Verde into <code>~/.local</code>,{' '}
-              <code>/Applications</code>, or your Windows user profile.
+              You'll need at least one AI coding tool installed and signed in,
+              such as Claude Code, Codex, Cursor or OpenCode.
             </p>
           </div>
 
@@ -1252,12 +981,7 @@ function App() {
               <CopyButton command={WINDOWS_INSTALL_COMMAND} />
             </div>
             <p class="install-primary-note">
-              Windows installs without administrator access and creates a Start
-              Menu shortcut. Then install and authenticate at least one provider CLI —{' '}
-              <code>codex login</code>, Claude Code, <code>opencode</code>,{' '}
-              <code>agent login</code> for Cursor, <code>pi</code>,{' '}
-              <code>fx login</code>, <code>grok login</code>, or{' '}
-              <code>amp</code>.
+              No admin rights needed. Adds a Start Menu shortcut.
             </p>
           </article>
 
@@ -1318,7 +1042,7 @@ bash ./scripts/release/install-linux-local.sh
             />
             <div>
               <strong>verde</strong>
-              <span>A tiling desktop for AI coding agents.</span>
+              <span>All your coding agents in one desktop app.</span>
             </div>
           </div>
 

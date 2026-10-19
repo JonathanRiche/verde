@@ -126,7 +126,7 @@ export default function Header() {
 
         <div class="nav-links">
           <a href="/#providers" class="nav-link">
-            Providers
+            Agents
           </a>
           <a href="/#tour" class="nav-link">
             Tour
@@ -136,12 +136,6 @@ export default function Header() {
           </a>
           <a href="/#themes" class="nav-link">
             Themes
-          </a>
-          <a href="/#features" class="nav-link">
-            Features
-          </a>
-          <a href="/#compare" class="nav-link">
-            Compare
           </a>
           <a href="/#install" class="nav-link">
             Install
