@@ -195,10 +195,10 @@ const gallery = [
     theme: 'Tokyo Night',
   },
   {
-    src: '/media/clips/2-browser-v2.webp',
-    video: '/media/clips/2-browser-v2.mp4',
+    src: '/media/clips/2-browser-v3.webp',
+    video: '/media/clips/2-browser-v3.mp4',
     title: 'Built-in browser',
-    body: 'Point at an element in Design Mode and send it to the chat with a screenshot.',
+    body: 'Flip between tabs, watch an agent restyle the page and reload it, then point at an element to request an edit.',
     theme: 'Catppuccin Latte',
   },
   {
