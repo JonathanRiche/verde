@@ -34,6 +34,9 @@ struct ChatComposer: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var picker: ComposerPicker?
     @State private var photo: PhotosPickerItem?
+    /// The library picker is presented from the composer, not embedded in the attach menu: a
+    /// `PhotosPicker` inside a `Menu` is torn down when the menu closes, so it never appears.
+    @State private var photos = false
     @State private var files = false
     @State private var camera = false
     @State private var focused = false
@@ -70,6 +73,7 @@ struct ChatComposer: View {
                 }.presentationDetents([.medium])
             }
         }
+        .photosPicker(isPresented: $photos, selection: $photo, matching: .images)
         .onChange(of: photo) { _, item in
             Task {
                 guard let item else { return }
@@ -171,7 +175,7 @@ struct ChatComposer: View {
             }
             HStack {
                 Menu {
-                    PhotosPicker(selection: $photo, matching: .images) { Label("Photos", systemImage: "photo") }
+                    Button("Photos", systemImage: "photo") { photos = true }
                     Button("Camera", systemImage: "camera") { openCamera() }
                     Button("Files", systemImage: "folder") { files = true }
                 } label: { Image(systemName: "paperclip").frame(width: 44, height: 44) }
@@ -271,7 +275,7 @@ struct ChatComposer: View {
     private func plusMenu(brainLocked: Bool) -> some View {
         Menu {
             Section {
-                PhotosPicker(selection: $photo, matching: .images) { Label("Photos", systemImage: "photo") }
+                Button("Photos", systemImage: "photo") { photos = true }
                 Button("Camera", systemImage: "camera") { openCamera() }
                 Button("Files", systemImage: "folder") { files = true }
             }
