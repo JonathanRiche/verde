@@ -12,3 +12,8 @@ Soft, uneven or "pixelated" borders with lumpy corners come from these mistakes:
 - **Hairline dividers as thin rects.** Use a snapped `h = stroke` rect on an integer `y`, never `scaledUi(1.0)` tall at a fractional `y`.
 
 Check new chrome at a fractional display scale in the real app; 1x screenshots hide all of the above.
+
+## Cursors and selectable text
+
+Palette draws pixels only; it has no implicit hover cursors or text selection. Every interactive region a caller builds on Palette must set its cursor through `palette.platform.CursorShape` (I-beam over selectable text and inputs, pointer over controls, grab/resize for drag handles) and make content text selectable and copyable. See the root [Text surfaces](../../AGENTS.md#text-surfaces) rules and the desktop [UI rules](../desktop/src/ui/AGENTS.md#cursors).
+

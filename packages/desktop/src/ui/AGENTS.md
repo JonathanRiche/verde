@@ -17,3 +17,7 @@ References: `browser.zig` (URL bar), `layout.zig` (modal fields). Keep transcrip
 
 Content text (transcripts, the Companion conversation, logs, details, error bodies) must be selectable and copyable; controls and chrome (buttons, chips, menus, sidebar rows, tabs, badges) stay plain. Required: click-drag selection with a visible highlight that auto-scrolls past the viewport edge, double-click word and triple-click message/line selection, primary-modifier+C copy and +A select-all once the surface was clicked, a right-click Copy / Select all menu (`context_menu.zig` chrome), and Escape to clear. Drive rendering, hit-testing, highlight, and copy from one positioned line layout so they cannot drift; see `itemTextLayout` in `companion.zig` and the transcript selection in `chat_panel.zig`. Never log copied text.
 
+## Cursors
+
+Every hit region needs its OS cursor. Each surface exposes `systemCursorAt(x, y) ?palette.platform.CursorShape` and `main.zig` `syncMouseCursor` consults it in z-order (topmost surface first). Return `.text` over selectable text (only where text is actually drawn, not the whole panel) and text fields, `.pointer` over buttons, chips, dropdowns, links and clickable rows, `.grab` / `.grabbing` or the resize shapes for drag handles (keep the drag cursor while a drag is captured, even off the handle), and `.default` over plain chrome or modal dismiss layers. Example: `systemCursorAt` in `companion.zig`.
+

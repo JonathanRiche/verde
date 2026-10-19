@@ -44,6 +44,7 @@ Run commands from the repository root. Use the narrowest check during iteration.
 ## Text surfaces
 
 - Any new surface that shows content text (messages, transcripts, logs, output, details, errors) must let the user select it (drag, double-click word, triple-click line/message), see the highlight, and copy it (platform copy shortcut plus a right-click/long-press Copy; select-all where a whole block makes sense), on desktop, web, and mobile alike. Skip it only where selection does not make sense: controls and chrome such as buttons, chips, menus, sidebar rows, tabs, and badges. Desktop specifics: [UI rules](packages/desktop/src/ui/AGENTS.md#selectable-text).
+- Pointer surfaces show the right cursor (desktop and web): an I-beam over selectable text and text inputs, a pointer (hand) over buttons, chips, dropdowns, links and clickable rows, resize/grab shapes for drag handles, and the arrow over plain chrome. A new clickable or selectable region without its cursor is unfinished. Desktop specifics: [UI rules](packages/desktop/src/ui/AGENTS.md#cursors).
 
 ## Zig 0.16
 

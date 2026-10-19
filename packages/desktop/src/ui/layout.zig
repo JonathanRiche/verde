@@ -160,6 +160,11 @@ pub fn companionHitAt(state: *const runtime.AppState, x: f32, y: f32) ?companion
     return companion.hitAt(state, x, y);
 }
 
+/// OS cursor for the Companion surface under (x, y), null when not hit.
+pub fn companionSystemCursorAt(state: *runtime.AppState, x: f32, y: f32) ?palette.platform.CursorShape {
+    return companion.systemCursorAt(state, x, y);
+}
+
 /// Updates import-modal thread list hover using hits from `refreshPaletteModalHits`.
 pub fn updateThreadImportModalHover(state: *runtime.AppState, x: f32, y: f32) void {
     if (state.thread_import_provider == null) {

@@ -852,8 +852,8 @@ fn syncMouseCursor(state: *AppState, cache: *CursorState) void {
     const mouse_x = state.transcript_controller.palette_mouse_x;
     const mouse_y = state.transcript_controller.palette_mouse_y;
     if (!modalHitAtMouse(state)) {
-        if (ui_layout.companionHitAt(state, mouse_x, mouse_y)) |action| {
-            applySystemCursor(cache, systemCursorForCompanionAction(action));
+        if (ui_layout.companionSystemCursorAt(state, mouse_x, mouse_y)) |cursor| {
+            applySystemCursor(cache, cursor);
             return;
         }
     }
@@ -951,13 +951,6 @@ fn syncMouseCursor(state: *AppState, cache: *CursorState) void {
         return;
     }
     applySystemCursor(cache, .default);
-}
-
-fn systemCursorForCompanionAction(action: companion_controller.HitAction) palette.platform.CursorShape {
-    return switch (action) {
-        .panel, .body, .menu_dismiss => .default,
-        else => .pointer,
-    };
 }
 
 fn routeCompanionWheel(state: *AppState, x: f32, y: f32, wheel_y: f32) bool {

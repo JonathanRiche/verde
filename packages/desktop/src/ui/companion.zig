@@ -311,6 +311,46 @@ pub fn resetInputCaptures(state: *runtime.AppState) void {
     state.companion_controller.resetInputCaptures();
 }
 
+/// OS cursor over the Companion: an I-beam over selectable conversation text
+/// and the composer, a pointer over controls, grabbing while the bubble is
+/// dragged; the arrow over plain chrome. Null when the Companion is not hit.
+pub fn systemCursorAt(state: *runtime.AppState, x: f32, y: f32) ?palette.platform.CursorShape {
+    if (!state.isCompanionEnabled()) return null;
+    const companion = &state.companion_controller;
+    if (companion.dock_press) |press| if (press.dragged) return .grabbing;
+    if (companion.text_dragging) return .text;
+    const action = companion.hitAt(x, y) orelse return null;
+    return switch (action) {
+        .menu_dismiss => .default,
+        .body => if (companion.menu == .none and overConversationText(state, x, y)) .text else .default,
+        .panel => blk: {
+            const geometry = computeGeometry(state, companion.frame_width, companion.frame_height);
+            break :blk if (companion.visibility == .sidecar_open and pointInRect(composerRect(geometry.footer), x, y)) .text else .default;
+        },
+        else => .pointer,
+    };
+}
+
+/// True when (x, y) sits on a drawn line of conversation text.
+fn overConversationText(state: *runtime.AppState, x: f32, y: f32) bool {
+    const companion = &state.companion_controller;
+    const conversation = computeGeometry(state, companion.frame_width, companion.frame_height).conversation;
+    if (!pointInRect(conversation, x, y)) return false;
+    var top = conversationItemTop(state, conversation, 0);
+    for (companion.presentation.activity[0..companion.presentation.activity_count]) |*item| {
+        const height = conversationItemHeight(state, item, conversation);
+        defer top += height;
+        if (height <= 0.0 or y < top or y >= top + height) continue;
+        const layout = itemTextLayout(state, item, conversation, top);
+        for (layout.lines[0..layout.count]) |line| {
+            const w = text_measure.textWidth(line.role, line.font, line.text) + line.font * 0.5;
+            if (x >= line.x and x <= line.x + w and y >= line.y and y < line.y + line.h) return true;
+        }
+        return false;
+    }
+    return false;
+}
+
 pub fn hitAt(state: *const runtime.AppState, x: f32, y: f32) ?controller.HitAction {
     if (!state.isCompanionEnabled()) return null;
     return state.companion_controller.hitAt(x, y);
@@ -2911,4 +2951,35 @@ test "conversation text selects by drag, word, and message and copies across ite
     try std.testing.expectEqual(controller.HitAction.text_copy, state.companion_controller.hitAt(menu.rows[0].x + 4.0, menu.rows[0].y + 4.0).?);
     try std.testing.expectEqual(controller.HitAction.text_select_all, state.companion_controller.hitAt(menu.rows[1].x + 4.0, menu.rows[1].y + 4.0).?);
     try std.testing.expectEqual(controller.HitAction.menu_dismiss, state.companion_controller.hitAt(5.0, 5.0).?);
+}
+
+test "cursor is an I-beam over text and the composer and a pointer over controls" {
+    const allocator = std.testing.allocator;
+    theme.applyTheme(1.0);
+    var state: runtime.AppState = undefined;
+    try testState(allocator, &state);
+    defer deinitTestState(allocator, &state);
+    state.companion_controller.show();
+    state.companion_controller.settleTransition();
+    state.companion_controller.frame_width = 1360.0;
+    state.companion_controller.frame_height = 860.0;
+    var frame: controller.Frame = .{ .has_thread = true };
+    _ = frame.setOwner("companion-ui", "chat-1");
+    var reply: controller.ActivityItem = .{ .kind = .assistant, .sequence = 1 };
+    reply.body.set("Opened a codex chat for it.");
+    frame.appendActivity(reply);
+    state.companion_controller.setFrame(frame);
+    const geometry = computeGeometry(&state, 1360.0, 860.0);
+    registerHits(&state, geometry);
+
+    const top = conversationItemTop(&state, geometry.conversation, 0);
+    const line = itemTextLayout(&state, &state.companion_controller.presentation.activity[0], geometry.conversation, top).lines[0];
+    try std.testing.expectEqual(palette.platform.CursorShape.text, systemCursorAt(&state, line.x + 4.0, line.y + line.h * 0.5).?);
+    // Blank conversation space below the text keeps the arrow.
+    try std.testing.expectEqual(palette.platform.CursorShape.default, systemCursorAt(&state, line.x + 4.0, geometry.conversation.y + geometry.conversation.h - 4.0).?);
+    const composer = composerRect(geometry.footer);
+    try std.testing.expectEqual(palette.platform.CursorShape.text, systemCursorAt(&state, composer.x + 8.0, composer.y + 8.0).?);
+    try std.testing.expectEqual(palette.platform.CursorShape.pointer, systemCursorAt(&state, geometry.close_button.x + 4.0, geometry.close_button.y + 4.0).?);
+    try std.testing.expectEqual(palette.platform.CursorShape.pointer, systemCursorAt(&state, geometry.name_button.x + 4.0, geometry.name_button.y + 4.0).?);
+    try std.testing.expect(systemCursorAt(&state, 5.0, 5.0) == null);
 }
