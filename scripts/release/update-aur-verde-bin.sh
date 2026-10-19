@@ -65,7 +65,7 @@ cp "${PKGBUILD}" "${ORIGINAL_PKGBUILD}"
 cp "${SRCINFO}" "${ORIGINAL_SRCINFO}"
 
 # Canonical runtime dependencies. The GUI (Palette) is pure Zig and dlopens
-# Vulkan; the WPE browser helper links WPE WebKit, libsoup, GLib and EGL/GLES;
+# Vulkan; the WPE browser helper links WPE WebKit, libsoup, GLib and EGL;
 # libfff_c links zlib and libgcc_s. The whole depends array is rewritten from
 # this list so dependencies dropped upstream (SDL3, freetype, X11, ...) also
 # disappear from the AUR package.
@@ -77,9 +77,9 @@ DEPENDS=(
   "glib2"
   "libglvnd"
   "libsoup3"
-  "libwpe"
-  "wpebackend-fdo"
-  "wpewebkit"
+  # The helper uses WPE WebKit APIs added in 2.52 and only the WPE Platform
+  # backend, so it needs neither libwpe nor wpebackend-fdo.
+  "wpewebkit>=2.52"
 )
 
 sed -i -E "s/^pkgver=.*/pkgver=${VERSION}/" "${PKGBUILD}"

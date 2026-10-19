@@ -13,9 +13,7 @@ depends=(
   'glib2'
   'libglvnd'
   'libsoup3'
-  'libwpe'
-  'wpebackend-fdo'
-  'wpewebkit'
+  'wpewebkit>=2.52'
 )
 optdepends=(
   'codex: local Codex CLI integration'

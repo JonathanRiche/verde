@@ -135,7 +135,10 @@ EOF
 mkdir -p "$OUTPUT_DIR"
 # Release artifacts must not inherit CPU features from the CI runner. GitHub's
 # AMD runners can otherwise emit SSE4a instructions that crash on Intel CPUs.
-BUILD_ARGS=(zig build --release=safe -p "$PREFIX_DIR" -Dcpu=baseline -Dbrowser-backend=native_webview -Dversion="$VERSION")
+# The legacy wpebackend-fdo backend needs WPE WebKit's legacy libwpe API, which
+# distros are dropping (Arch's wpewebkit 2.54 ships without it). A helper built
+# with it fails to load there, so releases ship only the WPE Platform backend.
+BUILD_ARGS=(zig build --release=safe -p "$PREFIX_DIR" -Dcpu=baseline -Dbrowser-backend=native_webview -Dbrowser-linux-fdo=false -Dversion="$VERSION")
 
 cd "$DESKTOP_ROOT"
 "${BUILD_ARGS[@]}"
