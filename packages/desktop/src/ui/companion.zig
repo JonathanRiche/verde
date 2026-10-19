@@ -372,6 +372,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     if (shown < 1.0) {
         const start = transformMark(state);
         renderDock(state, geometry);
+        if (shown == 0.0) renderDockTooltip(state, geometry);
         if (shown > 0.0) transformSince(state, start, 1.0 - shown, 0.0, 6.0 * companionScale() * shown, null);
     }
     if (shown > 0.0) {
@@ -601,7 +602,9 @@ fn registerHits(state: *runtime.AppState, geometry: Geometry) void {
                 companion.addHit(geometry.prev_button, .switch_prev);
                 companion.addHit(geometry.next_button, .switch_next);
             }
-            companion.addHit(geometry.new_button, .menu_new_companion);
+            // "+" starts a fresh conversation with this companion; adding a
+            // whole new companion lives in the companion menu.
+            companion.addHit(geometry.new_button, .menu_new_conversation);
             companion.addHit(geometry.close_button, .collapse);
             for (0..@min(companion.inbox_count, MAX_INBOX_ROWS_SHOWN)) |index| {
                 const row = rowRect(geometry.inbox, index, INBOX_ROW_HEIGHT);
@@ -711,6 +714,18 @@ fn renderDock(state: *runtime.AppState, geometry: Geometry) void {
     }
 }
 
+/// Hover hint for the collapsed bubble (it carries no text when quiet).
+fn renderDockTooltip(state: *runtime.AppState, geometry: Geometry) void {
+    const companion = &state.companion_controller;
+    if (companion.dock_press != null or companion.visibility != .collapsed_chip) return;
+    const x = state.transcript_controller.palette_mouse_x;
+    const y = state.transcript_controller.palette_mouse_y;
+    if (!pointInRect(geometry.dock, x, y)) return;
+    const label = framePrint(state, "Open {s} · drag to move", .{companion.identity.name.slice()});
+    // renderTooltip flips above the bubble when it sits near the bottom edge.
+    renderTooltip(state, geometry.window, geometry.dock, label);
+}
+
 fn dockNeedsYouCount(state: *runtime.AppState) usize {
     const companion = &state.companion_controller;
     return companion.inboxNeedsYouCount() + @as(usize, if (companion.presentation.has_approval) 1 else 0) + crewNeedsYouCount(companion);
@@ -740,6 +755,44 @@ fn renderPanel(state: *runtime.AppState, geometry: Geometry) void {
         .brain => renderBrainMenu(state, geometry),
         .text => renderTextMenu(state, geometry),
     }
+    if (state.companion_controller.menu == .none) renderHeaderTooltip(state, geometry);
+}
+
+/// What each header control does, shown on hover (the glyphs alone are terse).
+fn headerTooltipAt(state: *runtime.AppState, geometry: Geometry, x: f32, y: f32) ?struct { target: palette.Rect, label: []const u8 } {
+    const companion = &state.companion_controller;
+    const name = companion.identity.name.slice();
+    if (pointInRect(geometry.new_button, x, y)) return .{ .target = geometry.new_button, .label = framePrint(state, "New conversation with {s}", .{name}) };
+    if (pointInRect(geometry.close_button, x, y)) return .{ .target = geometry.close_button, .label = "Minimize" };
+    if (companion.identity.count > 1) {
+        if (pointInRect(geometry.prev_button, x, y)) return .{ .target = geometry.prev_button, .label = "Previous companion" };
+        if (pointInRect(geometry.next_button, x, y)) return .{ .target = geometry.next_button, .label = "Next companion" };
+    }
+    if (pointInRect(geometry.name_button, x, y) or pointInRect(geometry.avatar, x, y))
+        return .{ .target = geometry.name_button, .label = "Companions, past conversations, rename, orders" };
+    if (pointInRect(geometry.brain_button, x, y)) return .{ .target = geometry.brain_button, .label = "Brain: provider, model, reasoning" };
+    return null;
+}
+
+fn renderHeaderTooltip(state: *runtime.AppState, geometry: Geometry) void {
+    const tip = headerTooltipAt(state, geometry, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y) orelse return;
+    renderTooltip(state, geometry.window, tip.target, tip.label);
+}
+
+/// A small label just below `target`, kept inside the window.
+fn renderTooltip(state: *runtime.AppState, window: palette.Rect, target: palette.Rect, label: []const u8) void {
+    const s = companionScale();
+    const chrome = theme.companionChrome();
+    const font = 11.0 * s;
+    const pad_x = 8.0 * s;
+    const text_w = text_measure.textWidth(.ui, font, label);
+    const w = text_w + pad_x * 2.0;
+    const h = 24.0 * s;
+    var rect: palette.Rect = .{ .x = target.x + (target.w - w) * 0.5, .y = target.y + target.h + 6.0 * s, .w = w, .h = h };
+    rect.x = std.math.clamp(rect.x, window.x + 4.0 * s, @max(window.x + window.w - w - 4.0 * s, window.x));
+    if (rect.y + h > window.y + window.h) rect.y = target.y - h - 6.0 * s;
+    queuePanel(state, rect, color(chrome.surface_deep), color(chrome.border), 6.0 * s, 1.0 * s);
+    queueText(state, .{ .x = rect.x + pad_x, .y = rect.y + (h - font * 1.3) * 0.5, .w = text_w + 1.0, .h = font * 1.3 }, label, color(chrome.text), font, rect);
 }
 
 // Header: who the companion is, its brain, the roster switcher, and controls.
@@ -2982,4 +3035,32 @@ test "cursor is an I-beam over text and the composer and a pointer over controls
     try std.testing.expectEqual(palette.platform.CursorShape.pointer, systemCursorAt(&state, geometry.close_button.x + 4.0, geometry.close_button.y + 4.0).?);
     try std.testing.expectEqual(palette.platform.CursorShape.pointer, systemCursorAt(&state, geometry.name_button.x + 4.0, geometry.name_button.y + 4.0).?);
     try std.testing.expect(systemCursorAt(&state, 5.0, 5.0) == null);
+}
+
+test "header plus starts a new conversation and every header control has a tooltip" {
+    const allocator = std.testing.allocator;
+    theme.applyTheme(1.0);
+    var state: runtime.AppState = undefined;
+    try testState(allocator, &state);
+    defer deinitTestState(allocator, &state);
+    state.companion_controller.show();
+    state.companion_controller.settleTransition();
+    const geometry = computeGeometry(&state, 1360.0, 860.0);
+    registerHits(&state, geometry);
+    try std.testing.expectEqual(controller.HitAction.menu_new_conversation, state.companion_controller.hitAt(geometry.new_button.x + 4.0, geometry.new_button.y + 4.0).?);
+
+    const cases = .{
+        .{ geometry.new_button, "New conversation with Juniper" },
+        .{ geometry.close_button, "Minimize" },
+        .{ geometry.brain_button, "Brain: provider, model, reasoning" },
+        .{ geometry.name_button, "Companions, past conversations, rename, orders" },
+    };
+    inline for (cases) |case| {
+        state.palette_overlay_batch.clear();
+        state.transcript_controller.palette_mouse_x = case[0].x + 4.0;
+        state.transcript_controller.palette_mouse_y = case[0].y + 4.0;
+        render(&state, 1360.0, 860.0);
+        try std.testing.expect(batchHasText(&state.palette_overlay_batch, case[1]));
+        try expectBatchInsideWindow(&state.palette_overlay_batch, .{ .w = 1360.0, .h = 860.0 });
+    }
 }
