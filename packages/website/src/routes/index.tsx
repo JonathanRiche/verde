@@ -184,43 +184,49 @@ const featureCards = [
   },
 ]
 
-// Real captures of a demo workspace, each under a different Omarchy theme.
-// Same files as assets/readme/shots in the repo README.
+// Short screen recordings of a demo workspace, each under a different Omarchy
+// theme. The poster frame doubles as the grid thumbnail.
 const gallery = [
   {
-    src: '/media/shots/1-tiling.webp',
+    src: '/media/clips/1-tiling.webp',
+    video: '/media/clips/1-tiling.mp4',
     title: 'Claude and Codex, side by side',
     body: 'Each chat works on its own task in the same repo.',
     theme: 'Tokyo Night',
   },
   {
-    src: '/media/shots/2-browser.webp',
+    src: '/media/clips/2-browser.webp',
+    video: '/media/clips/2-browser.mp4',
     title: 'Built-in browser',
-    body: 'Preview your dev server and point at elements with Design Mode.',
+    body: 'Point at an element in Design Mode and send it to the chat with a screenshot.',
     theme: 'Catppuccin Latte',
   },
   {
-    src: '/media/shots/3-changes.webp',
+    src: '/media/clips/3-changes.webp',
+    video: '/media/clips/3-changes.mp4',
     title: 'Changes, per chat',
-    body: 'See every changed file and which agent touched it, then commit.',
+    body: 'Filter changes by the chat that made them and open any diff.',
     theme: 'Gruvbox',
   },
   {
-    src: '/media/shots/4-agents.webp',
+    src: '/media/clips/4-agents.webp',
+    video: '/media/clips/4-agents.mp4',
     title: 'Agents that delegate',
     body: 'A chat hands subtasks to helper agents and tracks them live.',
     theme: 'Rosé Pine',
   },
   {
-    src: '/media/shots/5-terminal-agent.webp',
+    src: '/media/clips/5-terminal-agent.webp',
+    video: '/media/clips/5-terminal-agent.mp4',
     title: 'CLI agents too',
     body: 'Run Claude Code, Codex and other CLIs in real terminal panes.',
     theme: 'Osaka Jade',
   },
   {
-    src: '/media/shots/6-files.webp',
+    src: '/media/clips/6-files.webp',
+    video: '/media/clips/6-files.mp4',
     title: 'Files at hand',
-    body: 'Browse the project tree without leaving the chat.',
+    body: 'Browse and filter the project tree, and open files beside the chat.',
     theme: 'Nord',
   },
 ]
@@ -340,10 +346,17 @@ function Lightbox(props: {
             const item = () => props.items[props.index ?? 0]
             return (
               <figure class="lightbox-figure" onClick={(e) => e.target === e.currentTarget && !moved && close()}>
-                <img
-                  src={item().src}
-                  alt={`${item().title}: ${item().body}`}
+                <video
+                  src={item().video}
+                  poster={item().src}
+                  aria-label={`${item().title}: ${item().body}`}
                   class="lightbox-img"
+                  autoplay
+                  muted
+                  prop:muted={true}
+                  loop
+                  playsinline
+                  controls
                   draggable={false}
                   style={{
                     transform: `translateX(${drag()}px)`,
@@ -739,17 +752,22 @@ function App() {
                   <button
                     type="button"
                     class="shot-link"
-                    aria-label={`Enlarge: ${g.title}`}
+                    aria-label={`Play video: ${g.title}`}
                     onClick={() => setLightbox(i())}
                   >
                     <img
                       src={g.src}
                       alt={`${g.title}: ${g.body}`}
                       width="1600"
-                      height="1025"
+                      height="1026"
                       loading="lazy"
                       decoding="async"
                     />
+                    <span class="shot-play" aria-hidden="true">
+                      <svg viewBox="0 0 24 24">
+                        <path d="M8 5.5v13l11-6.5z" />
+                      </svg>
+                    </span>
                   </button>
                   <figcaption>
                     <strong>{g.title}</strong>

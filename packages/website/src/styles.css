@@ -2093,7 +2093,7 @@ thead .comp-rowhead { background: transparent; }
   border: 0;
   border-bottom: 1px solid var(--line-soft);
   background: none;
-  cursor: zoom-in;
+  cursor: pointer;
 }
 
 .shot-link img {
@@ -3224,6 +3224,45 @@ thead .comp-rowhead { background: transparent; }
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--accent);
+}
+
+/* ── Gallery play overlay ── */
+.shot-link {
+  position: relative;
+}
+
+.shot-play {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  display: grid;
+  place-items: center;
+  width: 3.6rem;
+  height: 3.6rem;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  border-radius: 999px;
+  background: rgba(8, 12, 14, 0.62);
+  color: #fff;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+  backdrop-filter: blur(4px);
+  transform: translate(-50%, -50%);
+  transition: transform 180ms ease, background 180ms ease, border-color 180ms ease;
+  pointer-events: none;
+}
+
+.shot-play svg {
+  width: 1.45rem;
+  height: 1.45rem;
+  margin-left: 0.2rem;
+  fill: currentColor;
+}
+
+.shot-link:hover .shot-play,
+.shot-link:focus-visible .shot-play {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #060d08;
+  transform: translate(-50%, -50%) scale(1.08);
 }
 
 /* ── Gallery lightbox ── */
