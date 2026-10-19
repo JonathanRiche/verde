@@ -549,6 +549,7 @@ internal class CompanionModel(
     private val browse: StateFlow<BrowseState>,
     private val pollMs: Long = POLL_MS,
     private val openPollMs: Long = OPEN_POLL_MS,
+    private val schedulePollMs: Long = ScheduleController.POLL_MS,
 ) : ViewModel() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val mutableState = MutableStateFlow(CompanionUiState())
@@ -557,6 +558,12 @@ internal class CompanionModel(
     private val sheetOpen = MutableStateFlow(false)
     private var session: CompanionSession? = null
     private var core: CoreHost? = null
+    /** The Scheduled sheet is open: refresh on open and keep refreshing while it shows. */
+    private val schedulesOpen = MutableStateFlow(false)
+    private val mutableSchedules = MutableStateFlow(ScheduleUiState())
+    /** The selected host's scheduled tasks (the companion header's count and the Scheduled sheet). */
+    val schedules = mutableSchedules.asStateFlow()
+    private var planner: ScheduleController? = null
     /** Companions whose conversation setup ran this session; a retry is explicit. */
     private val attempted = mutableSetOf<String>()
     private var seeded = false
@@ -568,9 +575,11 @@ internal class CompanionModel(
     private suspend fun observe(id: String?) = coroutineScope {
         session = null
         core = null
+        planner = null
         attempted.clear()
         seeded = false
         mutableState.value = CompanionUiState(hostId = id)
+        mutableSchedules.value = ScheduleUiState()
         if (id == null) return@coroutineScope
         val host = try { hosts.core(id) } catch (e: CancellationException) { throw e } catch (_: Exception) { null }
         if (host == null) { mutableState.update { it.copy(fatal = true) }; return@coroutineScope }
@@ -593,6 +602,25 @@ internal class CompanionModel(
                 while (interval > 0) {
                     poll(current)
                     delay(interval)
+                }
+            }
+        }
+        // Scheduled tasks: read while the companion sheet (for its count) or the Scheduled sheet is
+        // open, in the foreground on a ready host. Opening the Scheduled sheet restarts the loop, so
+        // it refreshes at once. A host without the methods is asked once per opening, not every poll.
+        val tasks = ScheduleController(HostCompanionCore(host), this)
+        planner = tasks
+        launch { tasks.state.collect { mutableSchedules.value = it } }
+        launch {
+            combine(visible, sheetOpen, schedulesOpen, browse.map { ready(it) }.distinctUntilChanged()) { shown, open, list, online ->
+                if (shown && online && (open || list)) list else null
+            }.distinctUntilChanged().collectLatest { list ->
+                if (list == null) return@collectLatest
+                var first = true
+                while (true) {
+                    if (first || list || tasks.state.value.view?.supported != false) tasks.refreshNow()
+                    first = false
+                    delay(schedulePollMs)
                 }
             }
         }
@@ -802,6 +830,19 @@ internal class CompanionModel(
     }
 
     fun clearSaveError() = mutableState.update { it.copy(saveError = null) }
+
+    // ---- Scheduled tasks ----
+
+    fun setSchedulesOpen(open: Boolean) { schedulesOpen.value = open }
+    fun refreshSchedules() { planner?.refresh() }
+    fun setScheduleEnabled(entry: ScheduleEntry, enabled: Boolean) { planner?.setEnabled(entry, enabled) }
+    fun runSchedule(entry: ScheduleEntry) { planner?.run(entry) }
+    fun deleteSchedule(entry: ScheduleEntry) { planner?.delete(entry) }
+    /** Creates [draft], or updates [original]; [onSaved] runs after the host accepted it. */
+    fun saveSchedule(original: ScheduleEntry?, draft: ScheduleDraft, home: ScheduleHome?, onSaved: () -> Unit) {
+        planner?.save(original, draft, home, onSaved)
+    }
+    fun clearScheduleErrors() { planner?.clearErrors() }
 
     override fun onCleared() { scope.cancel() }
 

@@ -53,6 +53,7 @@ test {
     _ = @import("state/companion_roster.zig");
     _ = @import("state/companion_persona.zig");
     _ = @import("state/companion_sync.zig");
+    _ = @import("state/schedules_sync.zig");
     _ = @import("ui/diff_view_cache.zig");
     _ = @import("ui/diff_render.zig");
     _ = @import("ui/side_panel_changes.zig");

@@ -122,6 +122,8 @@ internal fun CompanionSheet(
     var confirmNew by rememberSaveable { mutableStateOf(false) }
     var conversations by rememberSaveable { mutableStateOf(false) }
     var strip by rememberSaveable { mutableStateOf<StripPanel?>(null) }
+    var scheduled by rememberSaveable { mutableStateOf(false) }
+    val schedules by companion.schedules.collectAsState()
     DisposableEffect(companion) {
         companion.setSheetOpen(true)
         onDispose { companion.setSheetOpen(false) }
@@ -153,7 +155,10 @@ internal fun CompanionSheet(
                 suffixExpanded = shownStrip != null,
                 onNewConversation = { confirmNew = true }, onConversations = { conversations = true },
                 onSwitch = companion::switchTo, onSettings = { settings = true }, onActivity = onActivity, onHideBubble = onHideBubble,
-                liveActive = liveUi?.active == true, onLive = if (live != null && liveSupported) onLive else null)
+                liveActive = liveUi?.active == true, onLive = if (live != null && liveSupported) onLive else null,
+                // Hosts without scheduled tasks hide the entry; the count appears once the list loads.
+                onScheduled = if (schedules.view?.supported != false) ({ scheduled = true }) else null,
+                scheduledCount = schedules.enabledCount.takeIf { schedules.loaded })
             SummaryStrip(snapshot, workspaces, shownStrip, { strip = it }, onOpenPane, onOpenChat)
             HorizontalDivider(color = VerdeColors.Border)
             Box(Modifier.weight(1f).fillMaxWidth()) {
@@ -192,6 +197,12 @@ internal fun CompanionSheet(
         confirmButton = { TextButton(onClick = { confirmNew = false; companion.newConversation(currentTitle) }) { Text("New conversation") } },
         dismissButton = { TextButton(onClick = { confirmNew = false }) { Text("Cancel") } })
     if (conversations && active != null) ConversationsSheet(active, currentTitle, companion) { conversations = false }
+    if (scheduled && active != null) ScheduledSheet(companion, manage, browseState, active,
+        onOpenChat = { ws, chat ->
+            scheduled = false
+            // The companion's own chat is already under this sheet.
+            if (ws != active.home_workspace_id || chat != active.thread_id) onOpenChat(ws, chat)
+        }, onDismiss = { scheduled = false })
     if (brainOnly && active != null) CompanionSettingsSheet(companion, manage, browseState, voice, live, transcript, startOnBrain = true) { brainOnly = false }
 }
 
@@ -217,7 +228,7 @@ private fun CompanionPlaceholder(state: CompanionUiState, hasWorkspace: Boolean)
 private fun CompanionHeader(active: CompanionEntry, roster: CompanionRoster?, pose: CompanionPose, suffix: String?, enabled: Boolean,
     onSwitch: (String) -> Unit, onSettings: () -> Unit, onActivity: () -> Unit, onHideBubble: () -> Unit,
     liveActive: Boolean = false, onLive: (() -> Unit)? = null, onNewConversation: () -> Unit = {}, onConversations: () -> Unit = {},
-    onSuffix: (() -> Unit)? = null, suffixExpanded: Boolean = false) {
+    onSuffix: (() -> Unit)? = null, suffixExpanded: Boolean = false, onScheduled: (() -> Unit)? = null, scheduledCount: Int? = null) {
     val character = CompanionCharacter.of(active.character)
     val name = active.name.ifBlank { character.label }
     val suffixColor = when (pose) {
@@ -236,6 +247,7 @@ private fun CompanionHeader(active: CompanionEntry, roster: CompanionRoster?, po
                     .semantics { if (onSuffix != null) this.selected = suffixExpanded },
                 style = MaterialTheme.typography.bodySmall, color = suffixColor, maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
+        onScheduled?.let { ScheduledButton(scheduledCount, it) }
         onLive?.let { LiveButton(liveActive, it) }
         Box {
             var menu by remember { mutableStateOf(false) }
@@ -244,6 +256,7 @@ private fun CompanionHeader(active: CompanionEntry, roster: CompanionRoster?, po
                 DropdownMenuItem(text = { Text("New conversation") }, enabled = enabled && active.thread_id.isNotEmpty(),
                     onClick = { menu = false; onNewConversation() })
                 DropdownMenuItem(text = { Text("Conversations\u2026") }, onClick = { menu = false; onConversations() })
+                onScheduled?.let { open -> DropdownMenuItem(text = { Text("Scheduled tasks\u2026") }, onClick = { menu = false; open() }) }
                 DropdownMenuItem(text = { Text("All activity") }, onClick = { menu = false; onActivity() })
                 roster?.companions.orEmpty().filter { it.id != active.id }.forEach { entry ->
                     val look = CompanionCharacter.of(entry.character)

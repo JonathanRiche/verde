@@ -299,6 +299,8 @@ pub const PAIRED_RPC_METHODS = [_]PairedRpcMethod{
     // The machine Companion roster: who the user's companions are, their
     // brains, standing orders, and which thread each one talks through.
     .{ .method = "companion.roster.get", .scope_mask = CHAT_READ },
+    // Scheduled tasks: prompts the daemon sends into chats later or on a repeat.
+    .{ .method = "schedule.list", .scope_mask = CHAT_READ },
     // Real-time voice: list providers (never keys) and mint short-lived
     // provider session tokens; configuring a key needs chat:write.
     .{ .method = "voice.providers", .scope_mask = CHAT_READ },
@@ -320,6 +322,10 @@ pub const PAIRED_RPC_METHODS = [_]PairedRpcMethod{
     .{ .method = "companion.roster.put", .scope_mask = CHAT_WRITE },
     // Moves a companion's conversation to another provider with a handoff.
     .{ .method = "companion.brain.switch", .scope_mask = CHAT_WRITE },
+    .{ .method = "schedule.create", .scope_mask = CHAT_WRITE },
+    .{ .method = "schedule.update", .scope_mask = CHAT_WRITE },
+    .{ .method = "schedule.delete", .scope_mask = CHAT_WRITE },
+    .{ .method = "schedule.run", .scope_mask = CHAT_WRITE },
     .{ .method = "voice.session.create", .scope_mask = CHAT_WRITE },
     .{ .method = "voice.provider.configure", .scope_mask = CHAT_WRITE },
     .{ .method = "chat.subagent.open", .scope_mask = CHAT_WRITE },

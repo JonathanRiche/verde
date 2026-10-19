@@ -2059,6 +2059,7 @@ test {
     _ = @import("compile_tests/windows_conpty.zig");
     _ = @import("daemon/chat_links.zig");
     _ = @import("daemon/companions.zig");
+    _ = @import("daemon/schedules.zig");
     _ = @import("daemon/voice.zig");
     _ = @import("daemon/attachment_store.zig");
     _ = @import("daemon/change_journal.zig");

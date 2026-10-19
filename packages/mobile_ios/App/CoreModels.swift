@@ -1539,6 +1539,11 @@ enum Event: Codable {
     case `attachment_fetch`(EventAttachmentFetch)
     case `attachment_release`(EventAttachmentRelease)
     case `companion_crew_refresh`(EventCompanionCrewRefresh)
+    case `schedule_refresh`(EventScheduleRefresh)
+    case `schedule_create`(EventScheduleCreate)
+    case `schedule_update`(EventScheduleUpdate)
+    case `schedule_delete`(EventScheduleDelete)
+    case `schedule_run`(EventScheduleRun)
     case `push_received`(EventPushReceived)
     case `terminal_input`(EventTerminalInput)
     init(from decoder: Decoder) throws {
@@ -1627,6 +1632,11 @@ enum Event: Codable {
         case "attachment_fetch": self = .`attachment_fetch`(try EventAttachmentFetch(from: decoder))
         case "attachment_release": self = .`attachment_release`(try EventAttachmentRelease(from: decoder))
         case "companion_crew_refresh": self = .`companion_crew_refresh`(try EventCompanionCrewRefresh(from: decoder))
+        case "schedule_refresh": self = .`schedule_refresh`(try EventScheduleRefresh(from: decoder))
+        case "schedule_create": self = .`schedule_create`(try EventScheduleCreate(from: decoder))
+        case "schedule_update": self = .`schedule_update`(try EventScheduleUpdate(from: decoder))
+        case "schedule_delete": self = .`schedule_delete`(try EventScheduleDelete(from: decoder))
+        case "schedule_run": self = .`schedule_run`(try EventScheduleRun(from: decoder))
         case "push_received": self = .`push_received`(try EventPushReceived(from: decoder))
         case "terminal_input": self = .`terminal_input`(try EventTerminalInput(from: decoder))
         default: throw DecodingError.dataCorruptedError(forKey: .type, in: c, debugDescription: "Unknown model tag")
@@ -1716,6 +1726,11 @@ enum Event: Codable {
         case .`attachment_fetch`(let value): try value.encode(to: encoder)
         case .`attachment_release`(let value): try value.encode(to: encoder)
         case .`companion_crew_refresh`(let value): try value.encode(to: encoder)
+        case .`schedule_refresh`(let value): try value.encode(to: encoder)
+        case .`schedule_create`(let value): try value.encode(to: encoder)
+        case .`schedule_update`(let value): try value.encode(to: encoder)
+        case .`schedule_delete`(let value): try value.encode(to: encoder)
+        case .`schedule_run`(let value): try value.encode(to: encoder)
         case .`push_received`(let value): try value.encode(to: encoder)
         case .`terminal_input`(let value): try value.encode(to: encoder)
         }
@@ -5404,6 +5419,266 @@ extension EventCompanionCrewRefresh {
         try c.encode(self.`thread_id`, forKey: .`thread_id`)
         var tag = encoder.container(keyedBy: ModelDiscriminator.self)
         try tag.encode("companion_crew_refresh", forKey: .type)
+    }
+}
+
+struct EventScheduleRefresh: Codable {
+    var `api_version`: UInt32 = 1
+    var `now_ms`: Int64
+    var `wall_time_ms`: Int64
+    var `intent_id`: String
+    var `workspace_id`: String? = nil
+}
+
+extension EventScheduleRefresh {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `now_ms`
+        case `wall_time_ms`
+        case `intent_id`
+        case `workspace_id`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`now_ms` = try c.decode(Int64.self, forKey: .`now_ms`)
+        self.`wall_time_ms` = try c.decode(Int64.self, forKey: .`wall_time_ms`)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+        if !c.contains(.`workspace_id`) { self.`workspace_id` = nil } else {
+        self.`workspace_id` = try c.decodeIfPresent(String.self, forKey: .`workspace_id`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`now_ms`, forKey: .`now_ms`)
+        try c.encode(self.`wall_time_ms`, forKey: .`wall_time_ms`)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        var tag = encoder.container(keyedBy: ModelDiscriminator.self)
+        try tag.encode("schedule_refresh", forKey: .type)
+    }
+}
+
+struct EventScheduleCreate: Codable {
+    var `api_version`: UInt32 = 1
+    var `now_ms`: Int64
+    var `wall_time_ms`: Int64
+    var `intent_id`: String
+    var `name`: String? = nil
+    var `prompt`: String
+    var `target`: ScheduleTarget
+    var `repeat`: ScheduleRepeat
+    var `enabled`: Bool? = nil
+    var `parent_workspace_id`: String? = nil
+    var `parent_thread_id`: String? = nil
+    var `created_by`: String? = nil
+}
+
+extension EventScheduleCreate {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `now_ms`
+        case `wall_time_ms`
+        case `intent_id`
+        case `name`
+        case `prompt`
+        case `target`
+        case `repeat`
+        case `enabled`
+        case `parent_workspace_id`
+        case `parent_thread_id`
+        case `created_by`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`now_ms` = try c.decode(Int64.self, forKey: .`now_ms`)
+        self.`wall_time_ms` = try c.decode(Int64.self, forKey: .`wall_time_ms`)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+        if !c.contains(.`name`) { self.`name` = nil } else {
+        self.`name` = try c.decodeIfPresent(String.self, forKey: .`name`)
+        }
+        self.`prompt` = try c.decode(String.self, forKey: .`prompt`)
+        self.`target` = try c.decode(ScheduleTarget.self, forKey: .`target`)
+        self.`repeat` = try c.decode(ScheduleRepeat.self, forKey: .`repeat`)
+        if !c.contains(.`enabled`) { self.`enabled` = nil } else {
+        self.`enabled` = try c.decodeIfPresent(Bool.self, forKey: .`enabled`)
+        }
+        if !c.contains(.`parent_workspace_id`) { self.`parent_workspace_id` = nil } else {
+        self.`parent_workspace_id` = try c.decodeIfPresent(String.self, forKey: .`parent_workspace_id`)
+        }
+        if !c.contains(.`parent_thread_id`) { self.`parent_thread_id` = nil } else {
+        self.`parent_thread_id` = try c.decodeIfPresent(String.self, forKey: .`parent_thread_id`)
+        }
+        if !c.contains(.`created_by`) { self.`created_by` = nil } else {
+        self.`created_by` = try c.decodeIfPresent(String.self, forKey: .`created_by`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`now_ms`, forKey: .`now_ms`)
+        try c.encode(self.`wall_time_ms`, forKey: .`wall_time_ms`)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        try c.encode(self.`name`, forKey: .`name`)
+        try c.encode(self.`prompt`, forKey: .`prompt`)
+        try c.encode(self.`target`, forKey: .`target`)
+        try c.encode(self.`repeat`, forKey: .`repeat`)
+        try c.encode(self.`enabled`, forKey: .`enabled`)
+        try c.encode(self.`parent_workspace_id`, forKey: .`parent_workspace_id`)
+        try c.encode(self.`parent_thread_id`, forKey: .`parent_thread_id`)
+        try c.encode(self.`created_by`, forKey: .`created_by`)
+        var tag = encoder.container(keyedBy: ModelDiscriminator.self)
+        try tag.encode("schedule_create", forKey: .type)
+    }
+}
+
+struct EventScheduleUpdate: Codable {
+    var `api_version`: UInt32 = 1
+    var `now_ms`: Int64
+    var `wall_time_ms`: Int64
+    var `intent_id`: String
+    var `id`: String
+    var `name`: String? = nil
+    var `prompt`: String? = nil
+    var `target`: ScheduleTarget? = nil
+    var `repeat`: ScheduleRepeat? = nil
+    var `enabled`: Bool? = nil
+}
+
+extension EventScheduleUpdate {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `now_ms`
+        case `wall_time_ms`
+        case `intent_id`
+        case `id`
+        case `name`
+        case `prompt`
+        case `target`
+        case `repeat`
+        case `enabled`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`now_ms` = try c.decode(Int64.self, forKey: .`now_ms`)
+        self.`wall_time_ms` = try c.decode(Int64.self, forKey: .`wall_time_ms`)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+        self.`id` = try c.decode(String.self, forKey: .`id`)
+        if !c.contains(.`name`) { self.`name` = nil } else {
+        self.`name` = try c.decodeIfPresent(String.self, forKey: .`name`)
+        }
+        if !c.contains(.`prompt`) { self.`prompt` = nil } else {
+        self.`prompt` = try c.decodeIfPresent(String.self, forKey: .`prompt`)
+        }
+        if !c.contains(.`target`) { self.`target` = nil } else {
+        self.`target` = try c.decodeIfPresent(ScheduleTarget.self, forKey: .`target`)
+        }
+        if !c.contains(.`repeat`) { self.`repeat` = nil } else {
+        self.`repeat` = try c.decodeIfPresent(ScheduleRepeat.self, forKey: .`repeat`)
+        }
+        if !c.contains(.`enabled`) { self.`enabled` = nil } else {
+        self.`enabled` = try c.decodeIfPresent(Bool.self, forKey: .`enabled`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`now_ms`, forKey: .`now_ms`)
+        try c.encode(self.`wall_time_ms`, forKey: .`wall_time_ms`)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        try c.encode(self.`id`, forKey: .`id`)
+        try c.encode(self.`name`, forKey: .`name`)
+        try c.encode(self.`prompt`, forKey: .`prompt`)
+        try c.encode(self.`target`, forKey: .`target`)
+        try c.encode(self.`repeat`, forKey: .`repeat`)
+        try c.encode(self.`enabled`, forKey: .`enabled`)
+        var tag = encoder.container(keyedBy: ModelDiscriminator.self)
+        try tag.encode("schedule_update", forKey: .type)
+    }
+}
+
+struct EventScheduleDelete: Codable {
+    var `api_version`: UInt32 = 1
+    var `now_ms`: Int64
+    var `wall_time_ms`: Int64
+    var `intent_id`: String
+    var `id`: String
+}
+
+extension EventScheduleDelete {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `now_ms`
+        case `wall_time_ms`
+        case `intent_id`
+        case `id`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`now_ms` = try c.decode(Int64.self, forKey: .`now_ms`)
+        self.`wall_time_ms` = try c.decode(Int64.self, forKey: .`wall_time_ms`)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+        self.`id` = try c.decode(String.self, forKey: .`id`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`now_ms`, forKey: .`now_ms`)
+        try c.encode(self.`wall_time_ms`, forKey: .`wall_time_ms`)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        try c.encode(self.`id`, forKey: .`id`)
+        var tag = encoder.container(keyedBy: ModelDiscriminator.self)
+        try tag.encode("schedule_delete", forKey: .type)
+    }
+}
+
+struct EventScheduleRun: Codable {
+    var `api_version`: UInt32 = 1
+    var `now_ms`: Int64
+    var `wall_time_ms`: Int64
+    var `intent_id`: String
+    var `id`: String
+}
+
+extension EventScheduleRun {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `now_ms`
+        case `wall_time_ms`
+        case `intent_id`
+        case `id`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`api_version`) { self.`api_version` = 1 } else {
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        }
+        self.`now_ms` = try c.decode(Int64.self, forKey: .`now_ms`)
+        self.`wall_time_ms` = try c.decode(Int64.self, forKey: .`wall_time_ms`)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+        self.`id` = try c.decode(String.self, forKey: .`id`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`now_ms`, forKey: .`now_ms`)
+        try c.encode(self.`wall_time_ms`, forKey: .`wall_time_ms`)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        try c.encode(self.`id`, forKey: .`id`)
+        var tag = encoder.container(keyedBy: ModelDiscriminator.self)
+        try tag.encode("schedule_run", forKey: .type)
     }
 }
 
@@ -10174,6 +10449,400 @@ extension CompanionTranscriptMessage {
         try c.encode(self.`author`, forKey: .`author`)
         try c.encode(self.`body`, forKey: .`body`)
         try c.encode(self.`created_at_ms`, forKey: .`created_at_ms`)
+    }
+}
+
+struct ScheduleTarget: Codable {
+    var `kind`: String
+    var `workspace_id`: String
+    var `thread_id`: String? = nil
+    var `provider`: String? = nil
+    var `model`: String? = nil
+}
+
+extension ScheduleTarget {
+    private enum CodingKeys: String, CodingKey {
+        case `kind`
+        case `workspace_id`
+        case `thread_id`
+        case `provider`
+        case `model`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`kind` = try c.decode(String.self, forKey: .`kind`)
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        if !c.contains(.`thread_id`) { self.`thread_id` = nil } else {
+        self.`thread_id` = try c.decodeIfPresent(String.self, forKey: .`thread_id`)
+        }
+        if !c.contains(.`provider`) { self.`provider` = nil } else {
+        self.`provider` = try c.decodeIfPresent(String.self, forKey: .`provider`)
+        }
+        if !c.contains(.`model`) { self.`model` = nil } else {
+        self.`model` = try c.decodeIfPresent(String.self, forKey: .`model`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`kind`, forKey: .`kind`)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`thread_id`, forKey: .`thread_id`)
+        try c.encode(self.`provider`, forKey: .`provider`)
+        try c.encode(self.`model`, forKey: .`model`)
+    }
+}
+
+struct ScheduleRepeat: Codable {
+    var `kind`: String
+    var `at_ms`: Int64? = nil
+    var `every_minutes`: UInt32? = nil
+    var `time`: String? = nil
+    var `weekdays`: [UInt16]? = nil
+}
+
+extension ScheduleRepeat {
+    private enum CodingKeys: String, CodingKey {
+        case `kind`
+        case `at_ms`
+        case `every_minutes`
+        case `time`
+        case `weekdays`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`kind` = try c.decode(String.self, forKey: .`kind`)
+        if !c.contains(.`at_ms`) { self.`at_ms` = nil } else {
+        self.`at_ms` = try c.decodeIfPresent(Int64.self, forKey: .`at_ms`)
+        }
+        if !c.contains(.`every_minutes`) { self.`every_minutes` = nil } else {
+        self.`every_minutes` = try c.decodeIfPresent(UInt32.self, forKey: .`every_minutes`)
+        }
+        if !c.contains(.`time`) { self.`time` = nil } else {
+        self.`time` = try c.decodeIfPresent(String.self, forKey: .`time`)
+        }
+        if !c.contains(.`weekdays`) { self.`weekdays` = nil } else {
+        self.`weekdays` = try c.decodeIfPresent([UInt16].self, forKey: .`weekdays`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`kind`, forKey: .`kind`)
+        try c.encode(self.`at_ms`, forKey: .`at_ms`)
+        try c.encode(self.`every_minutes`, forKey: .`every_minutes`)
+        try c.encode(self.`time`, forKey: .`time`)
+        try c.encode(self.`weekdays`, forKey: .`weekdays`)
+    }
+}
+
+struct ScheduleEntry: Codable {
+    var `id`: String
+    var `name`: String = ""
+    var `prompt`: String = ""
+    var `target_kind`: String = "thread"
+    var `target_workspace_id`: String = ""
+    var `target_thread_id`: String = ""
+    var `target_provider`: String = ""
+    var `target_model`: String = ""
+    var `repeat_kind`: String = "once"
+    var `repeat_at_ms`: Int64? = nil
+    var `repeat_every_minutes`: UInt32? = nil
+    var `repeat_time`: String = ""
+    var `repeat_weekdays`: [UInt16] = []
+    var `enabled`: Bool = true
+    var `parent_workspace_id`: String = ""
+    var `parent_thread_id`: String = ""
+    var `created_by`: String = ""
+    var `next_run_ms`: Int64? = nil
+    var `last_run_ms`: Int64? = nil
+    var `last_status`: String? = nil
+    var `last_error`: String? = nil
+    var `last_thread_id`: String = ""
+    var `run_count`: UInt32 = 0
+    var `created_at_ms`: Int64 = 0
+    var `updated_at_ms`: Int64 = 0
+}
+
+extension ScheduleEntry {
+    private enum CodingKeys: String, CodingKey {
+        case `id`
+        case `name`
+        case `prompt`
+        case `target_kind`
+        case `target_workspace_id`
+        case `target_thread_id`
+        case `target_provider`
+        case `target_model`
+        case `repeat_kind`
+        case `repeat_at_ms`
+        case `repeat_every_minutes`
+        case `repeat_time`
+        case `repeat_weekdays`
+        case `enabled`
+        case `parent_workspace_id`
+        case `parent_thread_id`
+        case `created_by`
+        case `next_run_ms`
+        case `last_run_ms`
+        case `last_status`
+        case `last_error`
+        case `last_thread_id`
+        case `run_count`
+        case `created_at_ms`
+        case `updated_at_ms`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`id` = try c.decode(String.self, forKey: .`id`)
+        if !c.contains(.`name`) { self.`name` = "" } else {
+        self.`name` = try c.decode(String.self, forKey: .`name`)
+        }
+        if !c.contains(.`prompt`) { self.`prompt` = "" } else {
+        self.`prompt` = try c.decode(String.self, forKey: .`prompt`)
+        }
+        if !c.contains(.`target_kind`) { self.`target_kind` = "thread" } else {
+        self.`target_kind` = try c.decode(String.self, forKey: .`target_kind`)
+        }
+        if !c.contains(.`target_workspace_id`) { self.`target_workspace_id` = "" } else {
+        self.`target_workspace_id` = try c.decode(String.self, forKey: .`target_workspace_id`)
+        }
+        if !c.contains(.`target_thread_id`) { self.`target_thread_id` = "" } else {
+        self.`target_thread_id` = try c.decode(String.self, forKey: .`target_thread_id`)
+        }
+        if !c.contains(.`target_provider`) { self.`target_provider` = "" } else {
+        self.`target_provider` = try c.decode(String.self, forKey: .`target_provider`)
+        }
+        if !c.contains(.`target_model`) { self.`target_model` = "" } else {
+        self.`target_model` = try c.decode(String.self, forKey: .`target_model`)
+        }
+        if !c.contains(.`repeat_kind`) { self.`repeat_kind` = "once" } else {
+        self.`repeat_kind` = try c.decode(String.self, forKey: .`repeat_kind`)
+        }
+        if !c.contains(.`repeat_at_ms`) { self.`repeat_at_ms` = nil } else {
+        self.`repeat_at_ms` = try c.decodeIfPresent(Int64.self, forKey: .`repeat_at_ms`)
+        }
+        if !c.contains(.`repeat_every_minutes`) { self.`repeat_every_minutes` = nil } else {
+        self.`repeat_every_minutes` = try c.decodeIfPresent(UInt32.self, forKey: .`repeat_every_minutes`)
+        }
+        if !c.contains(.`repeat_time`) { self.`repeat_time` = "" } else {
+        self.`repeat_time` = try c.decode(String.self, forKey: .`repeat_time`)
+        }
+        if !c.contains(.`repeat_weekdays`) { self.`repeat_weekdays` = [] } else {
+        self.`repeat_weekdays` = try c.decode([UInt16].self, forKey: .`repeat_weekdays`)
+        }
+        if !c.contains(.`enabled`) { self.`enabled` = true } else {
+        self.`enabled` = try c.decode(Bool.self, forKey: .`enabled`)
+        }
+        if !c.contains(.`parent_workspace_id`) { self.`parent_workspace_id` = "" } else {
+        self.`parent_workspace_id` = try c.decode(String.self, forKey: .`parent_workspace_id`)
+        }
+        if !c.contains(.`parent_thread_id`) { self.`parent_thread_id` = "" } else {
+        self.`parent_thread_id` = try c.decode(String.self, forKey: .`parent_thread_id`)
+        }
+        if !c.contains(.`created_by`) { self.`created_by` = "" } else {
+        self.`created_by` = try c.decode(String.self, forKey: .`created_by`)
+        }
+        if !c.contains(.`next_run_ms`) { self.`next_run_ms` = nil } else {
+        self.`next_run_ms` = try c.decodeIfPresent(Int64.self, forKey: .`next_run_ms`)
+        }
+        if !c.contains(.`last_run_ms`) { self.`last_run_ms` = nil } else {
+        self.`last_run_ms` = try c.decodeIfPresent(Int64.self, forKey: .`last_run_ms`)
+        }
+        if !c.contains(.`last_status`) { self.`last_status` = nil } else {
+        self.`last_status` = try c.decodeIfPresent(String.self, forKey: .`last_status`)
+        }
+        if !c.contains(.`last_error`) { self.`last_error` = nil } else {
+        self.`last_error` = try c.decodeIfPresent(String.self, forKey: .`last_error`)
+        }
+        if !c.contains(.`last_thread_id`) { self.`last_thread_id` = "" } else {
+        self.`last_thread_id` = try c.decode(String.self, forKey: .`last_thread_id`)
+        }
+        if !c.contains(.`run_count`) { self.`run_count` = 0 } else {
+        self.`run_count` = try c.decode(UInt32.self, forKey: .`run_count`)
+        }
+        if !c.contains(.`created_at_ms`) { self.`created_at_ms` = 0 } else {
+        self.`created_at_ms` = try c.decode(Int64.self, forKey: .`created_at_ms`)
+        }
+        if !c.contains(.`updated_at_ms`) { self.`updated_at_ms` = 0 } else {
+        self.`updated_at_ms` = try c.decode(Int64.self, forKey: .`updated_at_ms`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`id`, forKey: .`id`)
+        try c.encode(self.`name`, forKey: .`name`)
+        try c.encode(self.`prompt`, forKey: .`prompt`)
+        try c.encode(self.`target_kind`, forKey: .`target_kind`)
+        try c.encode(self.`target_workspace_id`, forKey: .`target_workspace_id`)
+        try c.encode(self.`target_thread_id`, forKey: .`target_thread_id`)
+        try c.encode(self.`target_provider`, forKey: .`target_provider`)
+        try c.encode(self.`target_model`, forKey: .`target_model`)
+        try c.encode(self.`repeat_kind`, forKey: .`repeat_kind`)
+        try c.encode(self.`repeat_at_ms`, forKey: .`repeat_at_ms`)
+        try c.encode(self.`repeat_every_minutes`, forKey: .`repeat_every_minutes`)
+        try c.encode(self.`repeat_time`, forKey: .`repeat_time`)
+        try c.encode(self.`repeat_weekdays`, forKey: .`repeat_weekdays`)
+        try c.encode(self.`enabled`, forKey: .`enabled`)
+        try c.encode(self.`parent_workspace_id`, forKey: .`parent_workspace_id`)
+        try c.encode(self.`parent_thread_id`, forKey: .`parent_thread_id`)
+        try c.encode(self.`created_by`, forKey: .`created_by`)
+        try c.encode(self.`next_run_ms`, forKey: .`next_run_ms`)
+        try c.encode(self.`last_run_ms`, forKey: .`last_run_ms`)
+        try c.encode(self.`last_status`, forKey: .`last_status`)
+        try c.encode(self.`last_error`, forKey: .`last_error`)
+        try c.encode(self.`last_thread_id`, forKey: .`last_thread_id`)
+        try c.encode(self.`run_count`, forKey: .`run_count`)
+        try c.encode(self.`created_at_ms`, forKey: .`created_at_ms`)
+        try c.encode(self.`updated_at_ms`, forKey: .`updated_at_ms`)
+    }
+}
+
+struct ScheduleRun: Codable {
+    var `intent_id`: String
+    var `schedule_id`: String
+    var `workspace_id`: String = ""
+    var `thread_id`: String = ""
+    var `turn_id`: String? = nil
+}
+
+extension ScheduleRun {
+    private enum CodingKeys: String, CodingKey {
+        case `intent_id`
+        case `schedule_id`
+        case `workspace_id`
+        case `thread_id`
+        case `turn_id`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`intent_id` = try c.decode(String.self, forKey: .`intent_id`)
+        self.`schedule_id` = try c.decode(String.self, forKey: .`schedule_id`)
+        if !c.contains(.`workspace_id`) { self.`workspace_id` = "" } else {
+        self.`workspace_id` = try c.decode(String.self, forKey: .`workspace_id`)
+        }
+        if !c.contains(.`thread_id`) { self.`thread_id` = "" } else {
+        self.`thread_id` = try c.decode(String.self, forKey: .`thread_id`)
+        }
+        if !c.contains(.`turn_id`) { self.`turn_id` = nil } else {
+        self.`turn_id` = try c.decodeIfPresent(String.self, forKey: .`turn_id`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`intent_id`, forKey: .`intent_id`)
+        try c.encode(self.`schedule_id`, forKey: .`schedule_id`)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`thread_id`, forKey: .`thread_id`)
+        try c.encode(self.`turn_id`, forKey: .`turn_id`)
+    }
+}
+
+struct SchedulesView: Codable {
+    var `loaded`: Bool = false
+    var `loading`: Bool = false
+    var `saving`: Bool = false
+    var `supported`: Bool = true
+    var `can_edit`: Bool = false
+    var `workspace_id`: String? = nil
+    var `now_ms`: Int64 = 0
+    var `schedules`: [ScheduleEntry] = []
+    var `busy_ids`: [String] = []
+    var `last_run`: ScheduleRun? = nil
+    var `error`: LocalError? = nil
+}
+
+extension SchedulesView {
+    private enum CodingKeys: String, CodingKey {
+        case `loaded`
+        case `loading`
+        case `saving`
+        case `supported`
+        case `can_edit`
+        case `workspace_id`
+        case `now_ms`
+        case `schedules`
+        case `busy_ids`
+        case `last_run`
+        case `error`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if !c.contains(.`loaded`) { self.`loaded` = false } else {
+        self.`loaded` = try c.decode(Bool.self, forKey: .`loaded`)
+        }
+        if !c.contains(.`loading`) { self.`loading` = false } else {
+        self.`loading` = try c.decode(Bool.self, forKey: .`loading`)
+        }
+        if !c.contains(.`saving`) { self.`saving` = false } else {
+        self.`saving` = try c.decode(Bool.self, forKey: .`saving`)
+        }
+        if !c.contains(.`supported`) { self.`supported` = true } else {
+        self.`supported` = try c.decode(Bool.self, forKey: .`supported`)
+        }
+        if !c.contains(.`can_edit`) { self.`can_edit` = false } else {
+        self.`can_edit` = try c.decode(Bool.self, forKey: .`can_edit`)
+        }
+        if !c.contains(.`workspace_id`) { self.`workspace_id` = nil } else {
+        self.`workspace_id` = try c.decodeIfPresent(String.self, forKey: .`workspace_id`)
+        }
+        if !c.contains(.`now_ms`) { self.`now_ms` = 0 } else {
+        self.`now_ms` = try c.decode(Int64.self, forKey: .`now_ms`)
+        }
+        if !c.contains(.`schedules`) { self.`schedules` = [] } else {
+        self.`schedules` = try c.decode([ScheduleEntry].self, forKey: .`schedules`)
+        }
+        if !c.contains(.`busy_ids`) { self.`busy_ids` = [] } else {
+        self.`busy_ids` = try c.decode([String].self, forKey: .`busy_ids`)
+        }
+        if !c.contains(.`last_run`) { self.`last_run` = nil } else {
+        self.`last_run` = try c.decodeIfPresent(ScheduleRun.self, forKey: .`last_run`)
+        }
+        if !c.contains(.`error`) { self.`error` = nil } else {
+        self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`loaded`, forKey: .`loaded`)
+        try c.encode(self.`loading`, forKey: .`loading`)
+        try c.encode(self.`saving`, forKey: .`saving`)
+        try c.encode(self.`supported`, forKey: .`supported`)
+        try c.encode(self.`can_edit`, forKey: .`can_edit`)
+        try c.encode(self.`workspace_id`, forKey: .`workspace_id`)
+        try c.encode(self.`now_ms`, forKey: .`now_ms`)
+        try c.encode(self.`schedules`, forKey: .`schedules`)
+        try c.encode(self.`busy_ids`, forKey: .`busy_ids`)
+        try c.encode(self.`last_run`, forKey: .`last_run`)
+        try c.encode(self.`error`, forKey: .`error`)
+    }
+}
+
+struct SchedulesQuery: Codable {
+    var `api_version`: UInt32
+    var `revision`: String
+    var `data`: SchedulesView?
+    var `error`: LocalError?
+}
+
+extension SchedulesQuery {
+    private enum CodingKeys: String, CodingKey {
+        case `api_version`
+        case `revision`
+        case `data`
+        case `error`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`api_version` = try c.decode(UInt32.self, forKey: .`api_version`)
+        self.`revision` = try c.decode(String.self, forKey: .`revision`)
+        self.`data` = try c.decodeIfPresent(SchedulesView.self, forKey: .`data`)
+        self.`error` = try c.decodeIfPresent(LocalError.self, forKey: .`error`)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`api_version`, forKey: .`api_version`)
+        try c.encode(self.`revision`, forKey: .`revision`)
+        try c.encode(self.`data`, forKey: .`data`)
+        try c.encode(self.`error`, forKey: .`error`)
     }
 }
 

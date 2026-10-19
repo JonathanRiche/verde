@@ -34,6 +34,7 @@ const connect_lifecycle = @import("../daemon/connect_lifecycle.zig");
 const connect_store = @import("../daemon/connect_store.zig");
 const chat_links = @import("../daemon/chat_links.zig");
 const companions = @import("../daemon/companions.zig");
+const schedules = @import("../daemon/schedules.zig");
 const voice = @import("../daemon/voice.zig");
 const attachment_store = @import("../daemon/attachment_store.zig");
 const companion_roster = @import("../state/companion_roster.zig");
@@ -2505,6 +2506,11 @@ pub const Daemon = struct {
     /// the wait returns immediately.
     delivering: std.atomic.Value(bool) = .init(false),
     delivery_requested: std.atomic.Value(bool) = .init(false),
+    /// Serializes scheduled-task claims, deliveries, and edits so a run and
+    /// an edit never interleave. Taken before every other daemon lock.
+    schedule_mutex: ParkingMutex = .{},
+    /// Set by schedule.create/update so the scheduler loop runs immediately.
+    schedule_wake: std.atomic.Value(bool) = .init(false),
     changes_signal: std.atomic.Value(u32) = .init(0),
     /// Count of currently parked long-pollers across BOTH park kinds
     /// (`core.changes` and `chat.turn.tail wait_ms`), capped at
@@ -2973,6 +2979,7 @@ pub const Daemon = struct {
         if (!std.mem.startsWith(u8, method, "chat.links.") and !std.mem.startsWith(u8, method, "chat.tasks.") and
             !std.mem.startsWith(u8, method, "browser.history.") and
             !std.mem.startsWith(u8, method, "companion.") and
+            !std.mem.startsWith(u8, method, "schedule.") and
             !std.mem.eql(u8, method, "chat.attachment.read") and
             !std.mem.startsWith(u8, method, "voice.") and
             !std.mem.eql(u8, method, "chat.turn.start") and
@@ -3008,6 +3015,7 @@ pub const Daemon = struct {
         if (std.mem.eql(u8, method, "companion.brain.switch")) return try companionBrainSwitchResponse(self, id_value, params);
         if (std.mem.eql(u8, method, attachment_store.METHOD_READ)) return try chatAttachmentReadResponse(self, id_value, params);
         if (std.mem.startsWith(u8, method, "companion.roster.")) return try companionRosterResponse(self, id_value, method, params);
+        if (std.mem.startsWith(u8, method, "schedule.")) return try scheduleResponse(self, id_value, method, params);
         if (std.mem.startsWith(u8, method, "voice.")) return try voiceResponse(self, id_value, method, params);
         if (std.mem.eql(u8, method, "chat.turn.start")) return try self.chatTurnStartResponse(id_value, params);
         if (std.mem.eql(u8, method, "chat.turn.list")) return try self.chatTurnListResponse(id_value, params);
@@ -10262,6 +10270,7 @@ const SessionizerServerContext = struct {
     mcp_server: ?mcp_http.Server = null,
     drain_thread: ?std.Thread = null,
     push_thread: ?std.Thread = null,
+    schedule_thread: ?std.Thread = null,
     pid_published: bool = false,
 };
 
@@ -10285,6 +10294,7 @@ fn sessionizerServerReady(raw_context: *anyopaque) !void {
     }
     dispatchParentDeliveries(context.daemon);
     context.push_thread = try std.Thread.spawn(.{}, pushSenderThread, .{context});
+    context.schedule_thread = try std.Thread.spawn(.{}, schedulerThread, .{context});
     context.drain_thread = try std.Thread.spawn(.{}, drainSessionsThread, .{DrainThreadContext{
         .daemon = context.daemon,
         .endpoint = context.endpoint,
@@ -10313,6 +10323,7 @@ fn sessionizerServerClosing(raw_context: *anyopaque) void {
     context.stop_requested.store(true, .release);
     joinDrainThread(context);
     joinPushThread(context);
+    joinSchedulerThread(context);
     finalizeSessionizerStore(context);
 }
 
@@ -13188,6 +13199,9 @@ fn methodRunsUnlocked(method: []const u8) bool {
         // Companion roster is one small store row; it pins in_flight and
         // checks the drain flag itself.
         std.mem.startsWith(u8, method, "companion.") or
+        // Scheduled tasks are short store work plus, for schedule.run, a chat
+        // turn start that owns its own lock windows.
+        std.mem.startsWith(u8, method, "schedule.") or
         // Image reads are file I/O after one short store lookup.
         std.mem.eql(u8, method, "chat.attachment.read") or
         // Voice session minting waits on a provider HTTPS call with no lock held.
@@ -13560,6 +13574,11 @@ fn joinPushThread(context: *SessionizerServerContext) void {
     context.push_thread = null;
 }
 
+fn joinSchedulerThread(context: *SessionizerServerContext) void {
+    if (context.schedule_thread) |thread| thread.join();
+    context.schedule_thread = null;
+}
+
 fn joinDrainThread(context: *SessionizerServerContext) void {
     if (context.drain_thread == null) return;
     platform_ipc.wake(context.daemon.allocator, context.endpoint, .{
@@ -13578,6 +13597,7 @@ fn finishSessionizerServer(context: *SessionizerServerContext) void {
     stopMcpHttpServer(context);
     joinDrainThread(context);
     joinPushThread(context);
+    joinSchedulerThread(context);
     // Store finalization is primarily done in on_closing (before endpoint
     // release). This call is a no-op when that already ran.
     finalizeSessionizerStore(context);
@@ -14706,6 +14726,408 @@ fn companionRosterResponse(daemon: *Daemon, id_value: std.json.Value, method: []
     try s.write(.{ .revision = revision });
     try s.endObject();
     return writer.toOwnedSlice();
+}
+
+// ---- scheduled tasks ----------------------------------------------------------
+
+/// `schedule.list|create|update|delete|run` (see daemon/schedules.zig). Edits
+/// and manual runs serialize with the scheduler loop on `schedule_mutex`.
+fn scheduleResponse(daemon: *Daemon, id_value: std.json.Value, method: []const u8, params: std.json.Value) ![]u8 {
+    const allocator = daemon.allocator;
+    const Kind = enum { list, create, update, delete, run };
+    const kind: Kind = if (std.mem.eql(u8, method, schedules.METHOD_LIST))
+        .list
+    else if (std.mem.eql(u8, method, schedules.METHOD_CREATE))
+        .create
+    else if (std.mem.eql(u8, method, schedules.METHOD_UPDATE))
+        .update
+    else if (std.mem.eql(u8, method, schedules.METHOD_DELETE))
+        .delete
+    else if (std.mem.eql(u8, method, schedules.METHOD_RUN))
+        .run
+    else
+        return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_UNKNOWN_METHOD, "unknown schedule method");
+    lockDaemon(daemon);
+    const service = daemon.store_service;
+    if (service) |svc| _ = svc.in_flight.fetchAdd(1, .monotonic);
+    const accepting = daemon.accepting_mutations;
+    daemon.mutex.unlock();
+    const svc = service orelse return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_STORE_UNAVAILABLE, "store is unavailable");
+    defer _ = svc.in_flight.fetchSub(1, .monotonic);
+    if (kind != .list and !accepting) return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_STATE, "daemon is preparing shutdown and is not accepting mutations");
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer };
+    var diag: schedules.Diagnostic = .{};
+    const now = nowMs();
+
+    if (kind == .list) {
+        const workspace_id = if (params == .object) jsonString(params.object.get("workspace_id") orelse .null) else null;
+        const rows = blk: {
+            lockStoreService(svc);
+            defer svc.mutex.unlock();
+            break :blk schedules.list(svc.store.conn, arena, workspace_id) catch |err| return try scheduleErrorResponse(allocator, id_value, err, &diag);
+        };
+        try beginOk(&s, id_value);
+        try s.objectField("result");
+        try s.beginObject();
+        try s.objectField("schedules");
+        try s.beginArray();
+        for (rows) |row| try schedules.writeSchedule(&s, row);
+        try s.endArray();
+        try s.objectField("now_ms");
+        try s.write(now);
+        try s.endObject();
+        try s.endObject();
+        return writer.toOwnedSlice();
+    }
+
+    daemon.schedule_mutex.lock();
+    defer daemon.schedule_mutex.unlock();
+    switch (kind) {
+        .list => unreachable,
+        .create, .update => {
+            const schedule = blk: {
+                if (kind == .create) {
+                    const input = schedules.parseCreate(params, &diag) catch |err| return try scheduleErrorResponse(allocator, id_value, err, &diag);
+                    if (!scheduleProviderKnown(input.target)) return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "target.provider is not a known provider");
+                    lockStoreService(svc);
+                    defer svc.mutex.unlock();
+                    break :blk schedules.create(svc.store.conn, arena, .local, input, now, &diag) catch |err| return try scheduleErrorResponse(allocator, id_value, err, &diag);
+                }
+                const id = schedules.parseId(params, &diag) catch |err| return try scheduleErrorResponse(allocator, id_value, err, &diag);
+                const patch = schedules.parsePatch(params, &diag) catch |err| return try scheduleErrorResponse(allocator, id_value, err, &diag);
+                if (patch.target) |target| if (!scheduleProviderKnown(target)) return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "target.provider is not a known provider");
+                lockStoreService(svc);
+                defer svc.mutex.unlock();
+                break :blk schedules.update(svc.store.conn, arena, .local, id, patch, now, &diag) catch |err| return try scheduleErrorResponse(allocator, id_value, err, &diag);
+            };
+            daemon.schedule_wake.store(true, .release);
+            try beginOk(&s, id_value);
+            try s.objectField("result");
+            try s.beginObject();
+            try s.objectField("schedule");
+            try schedules.writeSchedule(&s, schedule);
+            try s.endObject();
+            try s.endObject();
+            return writer.toOwnedSlice();
+        },
+        .delete => {
+            const id = schedules.parseId(params, &diag) catch |err| return try scheduleErrorResponse(allocator, id_value, err, &diag);
+            const deleted = blk: {
+                lockStoreService(svc);
+                defer svc.mutex.unlock();
+                break :blk schedules.delete(svc.store.conn, id) catch |err| return try scheduleErrorResponse(allocator, id_value, err, &diag);
+            };
+            if (!deleted) return try scheduleErrorResponse(allocator, id_value, error.NotFound, &diag);
+            return try okValueResponse(allocator, id_value, .{ .deleted = true });
+        },
+        .run => {
+            const id = schedules.parseId(params, &diag) catch |err| return try scheduleErrorResponse(allocator, id_value, err, &diag);
+            const begun = blk: {
+                lockStoreService(svc);
+                defer svc.mutex.unlock();
+                break :blk schedules.beginManualRun(svc.store.conn, arena, id, now) catch |err| return try scheduleErrorResponse(allocator, id_value, err, &diag);
+            };
+            const fired = try fireScheduleRun(daemon, arena, svc, begun);
+            const current = blk: {
+                lockStoreService(svc);
+                defer svc.mutex.unlock();
+                break :blk (schedules.get(svc.store.conn, arena, id) catch |err| return try scheduleErrorResponse(allocator, id_value, err, &diag)) orelse begun;
+            };
+            try beginOk(&s, id_value);
+            try s.objectField("result");
+            try s.beginObject();
+            try s.objectField("schedule");
+            try schedules.writeSchedule(&s, current);
+            try s.objectField("thread_id");
+            try s.write(fired.thread_id);
+            if (fired.turn_id) |turn_id| {
+                try s.objectField("turn_id");
+                try s.write(turn_id);
+            }
+            try s.endObject();
+            try s.endObject();
+            return writer.toOwnedSlice();
+        },
+    }
+}
+
+fn scheduleErrorResponse(allocator: std.mem.Allocator, id_value: std.json.Value, err: anyerror, diag: *const schedules.Diagnostic) ![]u8 {
+    return switch (err) {
+        error.InvalidParams => try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, diag.message),
+        error.NotFound => try errorResponseAlloc(allocator, id_value, "not_found", "schedule not found"),
+        error.OutOfMemory => error.OutOfMemory,
+        else => blk: {
+            log.warn("schedule store request failed: {s}", .{@errorName(err)});
+            break :blk try storeErrorResponse(allocator, id_value, error.StoreUnavailable);
+        },
+    };
+}
+
+fn scheduleProviderKnown(target: schedules.Target) bool {
+    return switch (target) {
+        .thread => true,
+        .new_chat => |value| parseEnum(harness.Provider, value.provider) != null,
+    };
+}
+
+const ScheduleFire = struct {
+    /// "ok", "late", "queued" or "failed".
+    status: []const u8,
+    thread_id: ?[]const u8 = null,
+    turn_id: ?[]const u8 = null,
+};
+
+/// Wakes about every TICK_MS (and on create/update) to claim due schedules
+/// and deliver every pending run. The first pass after startup is the
+/// catch-up: runs missed while the daemon was down fire once, marked "late".
+fn schedulerThread(context: *SessionizerServerContext) void {
+    const daemon = context.daemon;
+    var catch_up = true;
+    var next_tick_ms: i64 = 0;
+    while (!context.stop_requested.load(.acquire)) {
+        const woke = daemon.schedule_wake.swap(false, .acq_rel);
+        if (woke or nowMs() >= next_tick_ms) {
+            if (runScheduleTick(daemon, catch_up)) |ran| {
+                if (ran) catch_up = false;
+            } else |err| log.warn("scheduled tasks deferred: {s}", .{@errorName(err)});
+            next_tick_ms = nowMs() + schedules.TICK_MS;
+        }
+        sleepMs(250);
+    }
+}
+
+/// One scheduler pass. Returns false when the store is not serving yet.
+fn runScheduleTick(daemon: *Daemon, catch_up: bool) !bool {
+    daemon.schedule_mutex.lock();
+    defer daemon.schedule_mutex.unlock();
+    lockDaemon(daemon);
+    const service = if (daemon.accepting_mutations) daemon.store_service else null;
+    const active = if (service) |svc| !svc.draining else false;
+    if (active) _ = service.?.in_flight.fetchAdd(1, .monotonic);
+    daemon.mutex.unlock();
+    if (!active) return false;
+    const svc = service.?;
+    defer _ = svc.in_flight.fetchSub(1, .monotonic);
+    var arena_state: std.heap.ArenaAllocator = .init(daemon.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const runs = blk: {
+        lockStoreService(svc);
+        defer svc.mutex.unlock();
+        const claimed = try schedules.claimDue(svc.store.conn, arena, .local, nowMs(), catch_up);
+        if (claimed > 0) log.info("scheduled tasks due count={d} catch_up={}", .{ claimed, catch_up });
+        break :blk try schedules.pending(svc.store.conn, arena);
+    };
+    for (runs) |schedule| {
+        _ = fireScheduleRun(daemon, arena, svc, schedule) catch |err|
+            log.warn("scheduled task run deferred id={s}: {s}", .{ schedule.id, @errorName(err) });
+    }
+    return true;
+}
+
+/// Delivers a claimed run through the same path as child-result delivery
+/// (`deliverThreadPromptWithOptions`): steer a running turn, or start a new
+/// turn keyed by the run id. A new_chat target first gets its thread, linked
+/// to the parent chat when one is set. Caller holds `schedule_mutex` only.
+fn fireScheduleRun(daemon: *Daemon, arena: std.mem.Allocator, svc: *StoreService, schedule: schedules.Schedule) !ScheduleFire {
+    const run_id = schedule.pending_run_id orelse return .{ .status = schedule.last_status orelse "ok", .thread_id = schedule.last_thread_id };
+    const workspace_id = schedule.target.workspaceId();
+    const thread_id: []const u8 = switch (schedule.target) {
+        .thread => |target| target.thread_id,
+        .new_chat => |target| schedule.pending_thread_id orelse blk: {
+            var random_bytes: [8]u8 = undefined;
+            std.Io.Threaded.global_single_threaded.io().random(&random_bytes);
+            const minted = try std.fmt.allocPrint(arena, "schedule-thread-{d}-{s}", .{ nowMs(), std.fmt.bytesToHex(random_bytes, .lower) });
+            if (try openScheduleChat(daemon, arena, svc, schedule, run_id, target.provider, target.model, minted)) |failure| {
+                return finishScheduleRun(svc, schedule, run_id, .{ .status = "failed", .err = failure }, null);
+            }
+            break :blk minted;
+        },
+    };
+    const prompt = try schedules.runPromptAlloc(arena, schedule);
+    var refusal: ?[]const u8 = null;
+    const outcome = deliverThreadPromptWithOptions(daemon, arena, svc, workspace_id, thread_id, run_id, prompt, null, .{
+        .honor_stop = false,
+        .refusal = &refusal,
+    }) catch |err| {
+        log.warn("scheduled task delivery failed id={s}: {s}", .{ schedule.id, @errorName(err) });
+        return finishScheduleRun(svc, schedule, run_id, .{ .status = "failed", .err = @errorName(err), .thread_id = thread_id }, null);
+    };
+    return switch (outcome) {
+        .started, .already_started => finishScheduleRun(svc, schedule, run_id, .{
+            .status = if (schedule.pending_late) "late" else "ok",
+            .thread_id = thread_id,
+        }, run_id),
+        .steered => |turn_id| finishScheduleRun(svc, schedule, run_id, .{ .status = "queued", .thread_id = thread_id }, turn_id),
+        .deferred => blk: {
+            // Busy with a turn that cannot take a follow-up now: keep the run
+            // pending; the next tick starts it once the chat is idle.
+            if (threadTurnBusy(daemon, workspace_id, thread_id)) {
+                lockStoreService(svc);
+                defer svc.mutex.unlock();
+                try schedules.markWaiting(svc.store.conn, schedule.id, run_id, thread_id);
+                break :blk .{ .status = "queued", .thread_id = thread_id };
+            }
+            break :blk finishScheduleRun(svc, schedule, run_id, .{
+                .status = "failed",
+                .err = refusal orelse "the target chat could not start a turn; it may be archived or deleted",
+                .thread_id = thread_id,
+            }, null);
+        },
+    };
+}
+
+fn finishScheduleRun(svc: *StoreService, schedule: schedules.Schedule, run_id: []const u8, result: schedules.RunResult, turn_id: ?[]const u8) !ScheduleFire {
+    lockStoreService(svc);
+    defer svc.mutex.unlock();
+    try schedules.finishRun(svc.store.conn, schedule.id, run_id, result, nowMs());
+    return .{ .status = result.status, .thread_id = result.thread_id, .turn_id = turn_id };
+}
+
+/// Creates the fresh chat for a new_chat run, titled with the schedule name,
+/// and links it under the schedule's parent so its result reports back.
+/// Returns a failure message, or null on success.
+fn openScheduleChat(
+    daemon: *Daemon,
+    arena: std.mem.Allocator,
+    svc: *StoreService,
+    schedule: schedules.Schedule,
+    run_id: []const u8,
+    provider: []const u8,
+    model: ?[]const u8,
+    thread_id: []const u8,
+) !?[]const u8 {
+    const workspace_id = schedule.target.workspaceId();
+    // Serializes with workspace.close, like chat.subagent.open.
+    daemon.workspace_lifecycle_mutex.lock();
+    defer daemon.workspace_lifecycle_mutex.unlock();
+    lockStoreService(svc);
+    defer svc.mutex.unlock();
+    const conn = svc.store.conn;
+    {
+        var workspace_row = (try conn.row("select archived from workspaces where workspace_id=?", .{workspace_id})) orelse return "target workspace no longer exists";
+        defer workspace_row.deinit();
+        if (workspace_row.int(0) != 0) return "target workspace is archived";
+    }
+    const request_key = try std.fmt.allocPrint(arena, "daemon:schedule:{s}", .{run_id});
+    _ = svc.store.upsertThread(.{
+        .mutation = .{ .request_key = request_key, .client_id = "daemon" },
+        .workspace_id = workspace_id,
+        .thread = .{
+            .local_thread_id = thread_id,
+            .title = schedule.name,
+            .provider = provider,
+            .harness = "local_cli",
+            .model_ref = model,
+            .last_activity_at = @divTrunc(nowMs(), std.time.ms_per_s),
+        },
+    }) catch |err| {
+        log.warn("scheduled task chat creation failed id={s}: {s}", .{ schedule.id, @errorName(err) });
+        return "could not create the new chat";
+    };
+    try schedules.setPendingThread(conn, schedule.id, run_id, thread_id);
+    if (schedule.parent_thread_id) |parent| {
+        const parent_workspace = schedule.parent_workspace_id orelse
+            (chat_links.resolveParentWorkspace(conn, arena, workspace_id, parent) catch null) orelse workspace_id;
+        chat_links.linkAcross(conn, arena, parent_workspace, parent, workspace_id, thread_id) catch |err|
+            log.warn("scheduled task chat not linked to parent id={s}: {s}", .{ schedule.id, @errorName(err) });
+    }
+    return null;
+}
+
+test "schedule RPC creates, lists, runs, and deletes against the store" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+
+    var daemon = Daemon.initWithPrefPath(allocator, root_buffer[0..root_len]);
+    defer daemon.deinit();
+    try attachTestRuntimeStoreService(&daemon, db_path);
+    defer detachTestStoreService(&daemon);
+    {
+        const service = daemon.store_service.?;
+        lockStoreService(service);
+        defer service.mutex.unlock();
+        _ = try service.store.upsertWorkspace(.{
+            .mutation = .{ .request_key = "schedule-rpc-workspace", .client_id = "schedule-rpc-test" },
+            .workspace = .{ .workspace_id = "schedule-ws", .label = "Schedules", .path = root_buffer[0..root_len] },
+        });
+        _ = try service.store.upsertThread(.{
+            .mutation = .{ .request_key = "schedule-rpc-thread", .client_id = "schedule-rpc-test" },
+            .workspace_id = "schedule-ws",
+            .thread = .{ .local_thread_id = "schedule-thread", .title = "Target", .provider = "codex", .harness = "local_cli" },
+        });
+    }
+
+    const Call = struct {
+        fn run(d: *Daemon, method: []const u8, raw: []const u8) !std.json.Parsed(std.json.Value) {
+            const params = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+            defer params.deinit();
+            const response = try scheduleResponse(d, .{ .integer = 1 }, method, params.value);
+            defer std.testing.allocator.free(response);
+            return std.json.parseFromSlice(std.json.Value, std.testing.allocator, response, .{ .allocate = .alloc_always });
+        }
+    };
+
+    const bad = try Call.run(&daemon, schedules.METHOD_CREATE,
+        \\{"prompt":"x","target":{"kind":"new_chat","workspace_id":"schedule-ws","provider":"nope"},"repeat":{"kind":"interval","every_minutes":30}}
+    );
+    defer bad.deinit();
+    try std.testing.expectEqualStrings("invalid_params", jsonString(bad.value.object.get("error").?.object.get("code").?).?);
+
+    const created = try Call.run(&daemon, schedules.METHOD_CREATE,
+        \\{"name":"Nightly","prompt":"Summarize the day","target":{"kind":"thread","workspace_id":"schedule-ws","thread_id":"schedule-thread"},"repeat":{"kind":"daily","time":"23:00"},"created_by":"cli"}
+    );
+    defer created.deinit();
+    const schedule = created.value.object.get("result").?.object.get("schedule").?.object;
+    const id = jsonString(schedule.get("id").?).?;
+    try std.testing.expect(schedule.get("next_run_ms").? == .integer);
+    try std.testing.expect(daemon.schedule_wake.load(.acquire));
+
+    const listed = try Call.run(&daemon, schedules.METHOD_LIST, "{\"workspace_id\":\"schedule-ws\"}");
+    defer listed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), listed.value.object.get("result").?.object.get("schedules").?.array.items.len);
+
+    // An archived target cannot start a turn: the run is recorded as failed
+    // without ever reaching a provider.
+    {
+        const service = daemon.store_service.?;
+        lockStoreService(service);
+        defer service.mutex.unlock();
+        try service.store.conn.exec("update threads set archived=1 where local_thread_id='schedule-thread'", .{});
+    }
+    const run_params = try std.fmt.allocPrint(allocator, "{{\"id\":\"{s}\"}}", .{id});
+    defer allocator.free(run_params);
+    const ran = try Call.run(&daemon, schedules.METHOD_RUN, run_params);
+    defer ran.deinit();
+    const ran_schedule = ran.value.object.get("result").?.object.get("schedule").?.object;
+    try std.testing.expectEqualStrings("failed", jsonString(ran_schedule.get("last_status").?).?);
+    try std.testing.expectEqual(@as(i64, 1), ran_schedule.get("run_count").?.integer);
+    // Manual runs leave a daily schedule's next run alone.
+    try std.testing.expectEqual(schedule.get("next_run_ms").?.integer, ran_schedule.get("next_run_ms").?.integer);
+
+    const disabled_params = try std.fmt.allocPrint(allocator, "{{\"id\":\"{s}\",\"enabled\":false}}", .{id});
+    defer allocator.free(disabled_params);
+    const disabled = try Call.run(&daemon, schedules.METHOD_UPDATE, disabled_params);
+    defer disabled.deinit();
+    try std.testing.expect(disabled.value.object.get("result").?.object.get("schedule").?.object.get("next_run_ms").? == .null);
+
+    const deleted = try Call.run(&daemon, schedules.METHOD_DELETE, run_params);
+    defer deleted.deinit();
+    try std.testing.expect(deleted.value.object.get("result").?.object.get("deleted").?.bool);
+    const missing = try Call.run(&daemon, schedules.METHOD_DELETE, run_params);
+    defer missing.deinit();
+    try std.testing.expectEqualStrings("not_found", jsonString(missing.value.object.get("error").?.object.get("code").?).?);
 }
 
 /// Real-time voice: provider list, key configuration, and session minting.
@@ -18691,6 +19113,28 @@ fn deliverThreadPrompt(
     prompt: []const u8,
     orchestration_note: ?[]const u8,
 ) !ThreadPromptDelivery {
+    return deliverThreadPromptWithOptions(daemon, arena, svc, workspace_id, local_thread_id, identity, prompt, orchestration_note, .{});
+}
+
+const ThreadPromptOptions = struct {
+    /// Automatic continuations respect a user's explicit stop. A scheduled
+    /// task is the user's own standing request, so it starts regardless.
+    honor_stop: bool = true,
+    /// Receives (in the arena) why the daemon refused to start the turn.
+    refusal: ?*?[]const u8 = null,
+};
+
+fn deliverThreadPromptWithOptions(
+    daemon: *Daemon,
+    arena: std.mem.Allocator,
+    svc: *StoreService,
+    workspace_id: []const u8,
+    local_thread_id: []const u8,
+    identity: []const u8,
+    prompt: []const u8,
+    orchestration_note: ?[]const u8,
+    options: ThreadPromptOptions,
+) !ThreadPromptDelivery {
     // Wait for unsupported busy providers to finish. An explicit stop
     // suppresses automatic continuation even before its commit lands.
     var running_id: ?[]const u8 = null;
@@ -18713,7 +19157,7 @@ fn deliverThreadPrompt(
             }
         }
     }
-    if (stopped or finishing) return .deferred;
+    if ((stopped and options.honor_stop) or finishing) return .deferred;
     var response: []u8 = undefined;
     if (running_id) |turn_id| {
         const raw = try std.json.Stringify.valueAlloc(arena, .{ .turn_id = turn_id, .steer_id = identity, .prompt = prompt }, .{});
@@ -18774,7 +19218,14 @@ fn deliverThreadPrompt(
     }
     defer daemon.allocator.free(response);
     const parsed = try std.json.parseFromSlice(std.json.Value, arena, response, .{});
-    if (parsed.value != .object or parsed.value.object.contains("error") or !parsed.value.object.contains("result")) return .deferred;
+    if (parsed.value != .object or parsed.value.object.contains("error") or !parsed.value.object.contains("result")) {
+        if (options.refusal) |refusal| if (parsed.value == .object) {
+            if (parsed.value.object.get("error")) |err_value| if (err_value == .object) {
+                if (jsonString(err_value.object.get("message") orelse .null)) |message| refusal.* = try arena.dupe(u8, message);
+            };
+        };
+        return .deferred;
+    }
     return if (running_id) |turn_id| .{ .steered = turn_id } else .started;
 }
 

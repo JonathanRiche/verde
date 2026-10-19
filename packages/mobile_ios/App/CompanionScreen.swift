@@ -23,6 +23,7 @@ struct CompanionSheet: View {
     @State private var pendingPrompt: String?
     /// The summary strip's open panel; the header's count toggles it too.
     @State private var panel: CompanionPanel?
+    @State private var scheduled = false
 
     var body: some View {
         Group {
@@ -51,12 +52,23 @@ struct CompanionSheet: View {
         } message: {
             Text(newConversationMessage(name: model.active?.name ?? "Your companion"))
         }
+        .sheet(isPresented: $scheduled) {
+            ScheduledScreen(model: model.schedules, companion: model, browse: browse, openChat: { workspace, thread in
+                scheduled = false
+                // The companion's own chat is already under this sheet.
+                if let chat = model.conversation, chat.workspace == workspace, chat.thread == thread { return }
+                open(.thread(workspace: workspace, thread: thread))
+            })
+        }
+        // The header's count of enabled tasks; the Scheduled screen keeps it fresh while open.
+        .task(id: browse.hostID) { await model.schedules.refresh() }
     }
 
     private func content(_ active: RosterEntry) -> some View {
         VStack(spacing: 0) {
             CompanionHeader(model: model, live: live, entry: active, panel: $panel, showHome: showHome,
-                            newConversation: { confirmNew = true }, showConversations: { conversations = true }) {
+                            newConversation: { confirmNew = true }, showConversations: { conversations = true },
+                            showScheduled: { scheduled = true }) {
                 settingsBrain = false; settings = true
             }
             if let handoff = model.brainSwitchText {
@@ -116,6 +128,7 @@ private struct CompanionHeader: View {
     let showHome: () -> Void
     let newConversation: () -> Void
     let showConversations: () -> Void
+    let showScheduled: () -> Void
     let openSettings: () -> Void
     @AppStorage(CompanionBubbleStore.hiddenKey) private var bubbleHidden = false
 
@@ -165,6 +178,22 @@ private struct CompanionHeader: View {
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+            if model.schedules.supported {
+                let scheduledCount = model.schedules.enabledCount
+                Button(action: showScheduled) {
+                    HStack(spacing: 2) {
+                        Image(systemName: "clock").font(.system(size: 16, weight: .semibold))
+                        if scheduledCount > 0 {
+                            Text("\(scheduledCount)").font(VerdeTheme.ui(12, bold: true)).monospacedDigit()
+                        }
+                    }
+                    .frame(minWidth: 44, minHeight: 44)
+                    .contentShape(Rectangle())
+                }
+                .accessibilityLabel(scheduledCount > 0 ? "Scheduled tasks, \(scheduledCount) on" : "Scheduled tasks")
+                .accessibilityHint("Shows prompts \(entry.name) runs later or on repeat.")
+                .accessibilityIdentifier("companion-scheduled")
+            }
             Button { live.toggle() } label: {
                 Image(systemName: live.active ? "waveform.circle.fill" : "waveform")
                     .font(.system(size: 17, weight: .semibold)).frame(width: 44, height: 44)
@@ -176,6 +205,7 @@ private struct CompanionHeader: View {
                 Button(action: newConversation) { Label("New conversation", systemImage: "square.and.pencil") }
                     .disabled(model.conversation == nil || model.saving)
                 Button(action: showConversations) { Label("Conversations…", systemImage: "clock.arrow.circlepath") }
+                Button(action: showScheduled) { Label("Scheduled tasks…", systemImage: "clock") }
                 Button(action: showHome) { Label("All activity", systemImage: "list.bullet.rectangle") }
                 if companions.count > 1 {
                     Menu {

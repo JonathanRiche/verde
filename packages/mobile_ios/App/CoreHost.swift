@@ -251,7 +251,9 @@ actor CoreHost {
              // Push (I-10): e.g. registration while offline, or a forwarded push before start.
              .push_register, .push_received,
              // Companion roster/crew: e.g. a malformed roster or an out-of-budget refresh.
-             .companion_refresh, .companion_save, .companion_crew_refresh: return true
+             .companion_refresh, .companion_save, .companion_crew_refresh,
+             // Scheduled tasks: e.g. a malformed target or repeat.
+             .schedule_refresh, .schedule_create, .schedule_update, .schedule_delete, .schedule_run: return true
         default: return false
         }
     }

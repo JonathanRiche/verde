@@ -1347,6 +1347,68 @@ data class EventCompanionCrewRefresh(
 ) : Event()
 
 @Serializable
+@SerialName("schedule_refresh")
+data class EventScheduleRefresh(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `workspace_id`: String? = null,
+) : Event()
+
+@Serializable
+@SerialName("schedule_create")
+data class EventScheduleCreate(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `name`: String? = null,
+    val `prompt`: String,
+    val `target`: ScheduleTarget,
+    val `repeat`: ScheduleRepeat,
+    val `enabled`: Boolean? = null,
+    val `parent_workspace_id`: String? = null,
+    val `parent_thread_id`: String? = null,
+    val `created_by`: String? = null,
+) : Event()
+
+@Serializable
+@SerialName("schedule_update")
+data class EventScheduleUpdate(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `id`: String,
+    val `name`: String? = null,
+    val `prompt`: String? = null,
+    val `target`: ScheduleTarget? = null,
+    val `repeat`: ScheduleRepeat? = null,
+    val `enabled`: Boolean? = null,
+) : Event()
+
+@Serializable
+@SerialName("schedule_delete")
+data class EventScheduleDelete(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `id`: String,
+) : Event()
+
+@Serializable
+@SerialName("schedule_run")
+data class EventScheduleRun(
+    val `api_version`: Long = 1,
+    val `now_ms`: Long,
+    val `wall_time_ms`: Long,
+    val `intent_id`: String,
+    val `id`: String,
+) : Event()
+
+@Serializable
 @SerialName("push_received")
 data class EventPushReceived(
     val `api_version`: Long = 1,
@@ -2499,6 +2561,85 @@ data class CompanionTranscriptMessage(
     val `author`: String = "",
     val `body`: String,
     val `created_at_ms`: Long = 0,
+)
+
+@Serializable
+data class ScheduleTarget(
+    val `kind`: String,
+    val `workspace_id`: String,
+    val `thread_id`: String? = null,
+    val `provider`: String? = null,
+    val `model`: String? = null,
+)
+
+@Serializable
+data class ScheduleRepeat(
+    val `kind`: String,
+    val `at_ms`: Long? = null,
+    val `every_minutes`: Long? = null,
+    val `time`: String? = null,
+    val `weekdays`: List<Int>? = null,
+)
+
+@Serializable
+data class ScheduleEntry(
+    val `id`: String,
+    val `name`: String = "",
+    val `prompt`: String = "",
+    val `target_kind`: String = "thread",
+    val `target_workspace_id`: String = "",
+    val `target_thread_id`: String = "",
+    val `target_provider`: String = "",
+    val `target_model`: String = "",
+    val `repeat_kind`: String = "once",
+    val `repeat_at_ms`: Long? = null,
+    val `repeat_every_minutes`: Long? = null,
+    val `repeat_time`: String = "",
+    val `repeat_weekdays`: List<Int> = emptyList(),
+    val `enabled`: Boolean = true,
+    val `parent_workspace_id`: String = "",
+    val `parent_thread_id`: String = "",
+    val `created_by`: String = "",
+    val `next_run_ms`: Long? = null,
+    val `last_run_ms`: Long? = null,
+    val `last_status`: String? = null,
+    val `last_error`: String? = null,
+    val `last_thread_id`: String = "",
+    val `run_count`: Long = 0,
+    val `created_at_ms`: Long = 0,
+    val `updated_at_ms`: Long = 0,
+)
+
+@Serializable
+data class ScheduleRun(
+    val `intent_id`: String,
+    val `schedule_id`: String,
+    val `workspace_id`: String = "",
+    val `thread_id`: String = "",
+    val `turn_id`: String? = null,
+)
+
+@Serializable
+data class SchedulesView(
+    val `loaded`: Boolean = false,
+    val `loading`: Boolean = false,
+    val `saving`: Boolean = false,
+    val `supported`: Boolean = true,
+    val `can_edit`: Boolean = false,
+    val `workspace_id`: String? = null,
+    val `now_ms`: Long = 0,
+    val `schedules`: List<ScheduleEntry> = emptyList(),
+    val `busy_ids`: List<String> = emptyList(),
+    val `last_run`: ScheduleRun? = null,
+    val `error`: LocalError? = null,
+)
+
+@Serializable
+data class SchedulesQuery(
+    val `api_version`: Long,
+    val `revision`: String,
+    val `data`: SchedulesView?,
+    val `error`: LocalError?,
 )
 
 @Serializable

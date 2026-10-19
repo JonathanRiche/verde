@@ -13,6 +13,7 @@ pub const git = @import("git_changes.zig");
 pub const files = @import("files.zig");
 pub const explorer = @import("workspace_explorer.zig");
 pub const companion = @import("companion.zig");
+pub const schedules = @import("schedules.zig");
 pub const voice = @import("voice.zig");
 pub const attachments = @import("attachments.zig");
 const chat_index = @import("chat_index.zig");
@@ -85,6 +86,7 @@ pub const State = struct {
     files: files.State = .{},
     explorer: explorer.State = .{},
     companion: companion.State = .{},
+    schedules: schedules.State = .{},
     voice: voice.State = .{},
     attachments: attachments.State = .{},
     chat_index: chat_index.State = .{},
@@ -147,6 +149,8 @@ pub const Host = struct {
         try explorer.pump(&tx);
         companion.observe(&tx);
         try companion.pump(&tx);
+        schedules.observe(&tx);
+        try schedules.pump(&tx);
         voice.observe(&tx);
         try voice.pump(&tx);
         try attachments.observe(&tx);
@@ -185,6 +189,8 @@ pub const Host = struct {
             data = explorer_view;
         } else if (try companion.query(a, s, selector)) |companion_view| {
             data = companion_view;
+        } else if (try schedules.query(a, s, selector)) |schedules_view| {
+            data = schedules_view;
         } else if (try voice.query(a, s, selector)) |voice_view| {
             data = voice_view;
         } else if (try attachments.query(a, s, &self.blobs, selector)) |attachments_view| {
@@ -391,6 +397,7 @@ pub const Transaction = struct {
             try files.intent(self, tag, event);
             try explorer.intent(self, tag, event);
             try companion.intent(self, tag, event);
+            try schedules.intent(self, tag, event);
             try voice.intent(self, tag, event);
             try attachments.intent(self, tag, event);
             _ = try push.intent(self, tag, event);
@@ -751,7 +758,7 @@ fn changedScopes(tx: *Transaction, before: *const State) ApiError![]const []cons
     // Terminal receipts/output invalidate terminals and operations, not every
     // cached transcript and workspace. Querying those on each key overwhelms
     // the platform's serial core executor even when network RTT is tiny.
-    const git_scopes = try std.mem.concat(a, []const u8, &.{ try git.scopes(a, before, &tx.state), try explorer.scopes(a, before, &tx.state), try companion.scopes(a, before, &tx.state, host_changed), voice.scopes(before, &tx.state), attachments.scopes(before, &tx.state) });
+    const git_scopes = try std.mem.concat(a, []const u8, &.{ try git.scopes(a, before, &tx.state), try explorer.scopes(a, before, &tx.state), try companion.scopes(a, before, &tx.state, host_changed), schedules.scopes(before, &tx.state, host_changed), voice.scopes(before, &tx.state), attachments.scopes(before, &tx.state) });
     if (!otherViewsChanged(before, &tx.state, host_changed)) return std.mem.concat(a, []const u8, &.{ own, git_scopes });
     const shared: []const []const u8 = if (sharedViewsChanged(before, &tx.state, host_changed)) &.{ "home", "workspaces", "attention", "manage" } else &.{};
     return std.mem.concat(a, []const u8, &.{ own, try chat.scopes(tx, before, host_changed), shared, git_scopes });
@@ -848,7 +855,7 @@ fn append(comptime T: type, a: A, slice: *[]const T, item: T) ApiError!void {
     next[slice.len] = item;
     slice.* = next;
 }
-const intents = [_][]const u8{ "git_status_refresh", "git_push", "git_retry", "git_summary_refresh", "git_review_open", "git_message_generate", "git_commit", "git_pull_push", "git_config_set", "sign_out", "forget_host", "pair", "trust_decision", "retry_connection", "focus", "thread_open", "thread_load_older", "history_search", "history_load_more", "draft_set", "composer_select", "send", "turn_cancel", "followup_submit", "followup_retry", "followup_pull_back", "followup_cancel", "approval_decide", "shell_prepare", "shell_confirm", "slash_search", "slash_run", "mention_search", "terminal_create", "terminal_attach", "terminal_detach", "terminal_input", "terminal_resize", "terminal_kill", "push_register", "thread_rename", "thread_close", "thread_sync", "thread_create", "new_chat_select", "workspace_create", "workspace_rename", "workspace_identity", "workspace_archive", "workspace_close", "directory_list", "file_open", "workspace_files_list", "workspace_file_read", "workspace_preview_close", "workspace_changes_open", "workspace_changes_close", "workspace_file_patch", "companion_refresh", "companion_save", "companion_crew_refresh", "companion_transcript_save", "companion_brain_switch", "voice_providers_refresh", "voice_provider_configure", "voice_session_create", "attachment_fetch", "attachment_release" };
+const intents = [_][]const u8{ "git_status_refresh", "git_push", "git_retry", "git_summary_refresh", "git_review_open", "git_message_generate", "git_commit", "git_pull_push", "git_config_set", "sign_out", "forget_host", "pair", "trust_decision", "retry_connection", "focus", "thread_open", "thread_load_older", "history_search", "history_load_more", "draft_set", "composer_select", "send", "turn_cancel", "followup_submit", "followup_retry", "followup_pull_back", "followup_cancel", "approval_decide", "shell_prepare", "shell_confirm", "slash_search", "slash_run", "mention_search", "terminal_create", "terminal_attach", "terminal_detach", "terminal_input", "terminal_resize", "terminal_kill", "push_register", "thread_rename", "thread_close", "thread_sync", "thread_create", "new_chat_select", "workspace_create", "workspace_rename", "workspace_identity", "workspace_archive", "workspace_close", "directory_list", "file_open", "workspace_files_list", "workspace_file_read", "workspace_preview_close", "workspace_changes_open", "workspace_changes_close", "workspace_file_patch", "companion_refresh", "companion_save", "companion_crew_refresh", "companion_transcript_save", "companion_brain_switch", "schedule_refresh", "schedule_create", "schedule_update", "schedule_delete", "schedule_run", "voice_providers_refresh", "voice_provider_configure", "voice_session_create", "attachment_fetch", "attachment_release" };
 fn isIntent(tag: []const u8) bool {
     for (intents) |intent| if (eq(tag, intent)) return true;
     return false;
@@ -877,6 +884,8 @@ fn validateIntent(a: A, tag: []const u8, event: V) ApiError!void {
         try explorer.validate(a, tag, event);
     } else if (companion.owns(tag)) {
         try companion.validate(a, tag, event);
+    } else if (schedules.owns(tag)) {
+        try schedules.validate(a, tag, event);
     } else if (voice.owns(tag)) {
         try voice.validate(a, tag, event);
     } else if (attachments.owns(tag)) {
@@ -993,6 +1002,7 @@ fn receiptField(context: []const u8, key: []const u8, top: bool) bool {
         if (manage.receiptFields(context)) |fields| break :blk fields;
         if (explorer.receiptFields(context)) |fields| break :blk fields;
         if (companion.receiptFields(context)) |fields| break :blk fields;
+        if (schedules.receiptFields(context)) |fields| break :blk fields;
         if (voice.receiptFields(context)) |fields| break :blk fields;
         if (attachments.receiptFields(context)) |fields| break :blk fields;
         if (eq(context, "file_open")) break :blk "path kind max_bytes";

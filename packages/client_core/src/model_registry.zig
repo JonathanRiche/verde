@@ -12,6 +12,7 @@ const git = @import("git_changes.zig");
 const files = @import("files.zig");
 const explorer = @import("workspace_explorer.zig");
 const companion = @import("companion.zig");
+const schedules = @import("schedules.zig");
 const voice = @import("voice.zig");
 const attachments = @import("attachments.zig");
 pub const types = .{
@@ -156,6 +157,12 @@ pub const types = .{
     .{ "CompanionView", companion.View },
     .{ "CompanionQuery", wire.Query(companion.View) },
     .{ "CompanionTranscriptMessage", companion.TranscriptMessage },
+    .{ "ScheduleTarget", schedules.Target },
+    .{ "ScheduleRepeat", schedules.Repeat },
+    .{ "ScheduleEntry", schedules.Schedule },
+    .{ "ScheduleRun", schedules.Run },
+    .{ "SchedulesView", schedules.View },
+    .{ "SchedulesQuery", wire.Query(schedules.View) },
     .{ "VoiceProvider", voice.Provider },
     .{ "VoiceTool", voice.Tool },
     .{ "VoiceSessionCompanion", voice.SessionCompanion },

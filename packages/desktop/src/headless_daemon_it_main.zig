@@ -218,6 +218,10 @@ pub fn main(init: std.process.Init) !void {
         return;
     };
 
+    if (scenario) |value| if (std.mem.eql(u8, value, "schedules")) {
+        try runScheduleScenario(allocator, io);
+        return;
+    };
     if (scenario) |value| if (std.mem.eql(u8, value, "connect")) {
         try runConnectUnlinkLogoutScenario(allocator, io);
         return;
@@ -268,6 +272,7 @@ pub fn main(init: std.process.Init) !void {
     try runChatMcpToolLayerScenario(allocator, io);
     try runChatOrchestrationScenario(allocator, io);
     try runChatSubagentOpenScenario(allocator, io); // A-18
+    try runScheduleScenario(allocator, io);
     // M4-P5 fix amendment: failed-first identity adoption converges via retry
     // to a single identity set across flush + daemon restart. POSIX-gated.
     try runChatAdoptionRetryDurabilityScenario(allocator, io);
@@ -10950,6 +10955,119 @@ fn runChatSubagentOpenScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     }
     try waitChatTurnTerminal(io, &client, parent_turn, true);
     std.debug.print("headless-daemon-it: chat.subagent.open scenario ok\n", .{});
+}
+
+/// Scheduled tasks over the real transport with the stub provider: create,
+/// list, a manual run into an existing chat, a due once fired by the
+/// scheduler loop into a new chat linked to its parent, and delete.
+fn runScheduleScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref = try makePrefPath(allocator, "schedules");
+    defer allocator.free(pref);
+    defer std.Io.Dir.cwd().deleteTree(io, pref) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref);
+    var isolation = try EndpointIsolation.install(allocator, pref);
+    defer isolation.deinit(allocator);
+    const exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(exe);
+    var daemon = try spawnIsolatedDaemonWithEnv(allocator, io, exe, pref, .{ .store_dir = pref, .chat_stub = true });
+    defer daemon.kill(io);
+    var arena_state: std.heap.ArenaAllocator = .init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var transport: sessionizer.HeadlessTransport = .{ .allocator = arena, .pref_path = pref };
+    var client = sessionizer.headlessClient(arena, &transport);
+    var registered = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+    const client_id = (try client.decodeClientRegister(&registered)).client_id;
+    var workspace = try client.call(headless.store.METHOD_WORKSPACE_UPSERT, headless.store.WorkspaceUpsertRequest{
+        .mutation = .{ .request_key = "sched-ws", .client_id = client_id },
+        .workspace = .{ .workspace_id = "sched", .label = "Schedules", .path = pref },
+    });
+    if (!workspace.response.isOk()) return error.ScheduleWorkspace;
+    var parent = try client.call(headless.store.METHOD_CHAT_THREAD_UPSERT, headless.store.ThreadUpsertRequest{
+        .mutation = .{ .request_key = "sched-parent", .client_id = client_id },
+        .workspace_id = "sched",
+        .thread = .{ .local_thread_id = "sched-parent", .title = "Parent", .provider = "codex", .harness = "local_cli" },
+    });
+    if (!parent.response.isOk()) return error.ScheduleParent;
+
+    var created = try client.call("schedule.create", .{
+        .name = "Check in",
+        .prompt = "hello schedule",
+        .target = .{ .kind = "thread", .workspace_id = "sched", .thread_id = "sched-parent" },
+        .repeat = .{ .kind = "interval", .every_minutes = 60 },
+        .created_by = "cli",
+    });
+    if (!created.response.isOk()) {
+        std.debug.print("schedule.create rejected: {any}\n", .{created.response.err});
+        return error.ScheduleCreateRejected;
+    }
+    const schedule = jsonObjectField(created.response.result.?, "schedule").?;
+    const id = try arena.dupe(u8, jsonObjectField(schedule, "id").?.string);
+    const next_run_ms = jsonObjectField(schedule, "next_run_ms").?.integer;
+
+    var listed = try client.call("schedule.list", .{ .workspace_id = "sched" });
+    if (!listed.response.isOk()) return error.ScheduleListRejected;
+    if (jsonObjectField(listed.response.result.?, "schedules").?.array.items.len != 1) return error.ScheduleListCount;
+
+    var ran = try client.call("schedule.run", .{ .id = id });
+    if (!ran.response.isOk()) {
+        std.debug.print("schedule.run rejected: {any}\n", .{ran.response.err});
+        return error.ScheduleRunRejected;
+    }
+    const ran_schedule = jsonObjectField(ran.response.result.?, "schedule").?;
+    if (!std.mem.eql(u8, jsonObjectField(ran_schedule, "last_status").?.string, "ok")) return error.ScheduleRunStatus;
+    if (jsonObjectField(ran_schedule, "next_run_ms").?.integer != next_run_ms) return error.ScheduleRunMovedNext;
+    if (!std.mem.eql(u8, jsonObjectField(ran.response.result.?, "thread_id").?.string, "sched-parent")) return error.ScheduleRunThread;
+    const turn_id = try arena.dupe(u8, jsonObjectField(ran.response.result.?, "turn_id").?.string);
+    try waitChatTurnTerminal(io, &client, turn_id, true);
+
+    // A once that is just due fires from the scheduler loop (woken by
+    // create) into a fresh chat linked under the parent.
+    var once = try client.call("schedule.create", .{
+        .name = "One-off",
+        .prompt = "hello new chat",
+        .target = .{ .kind = "new_chat", .workspace_id = "sched", .provider = "codex" },
+        .repeat = .{ .kind = "once", .at_ms = platform_runtime.unixTimestampMs() - 1000 },
+        .parent_thread_id = "sched-parent",
+    });
+    if (!once.response.isOk()) {
+        std.debug.print("schedule.create once rejected: {any}\n", .{once.response.err});
+        return error.ScheduleOnceRejected;
+    }
+    const once_id = try arena.dupe(u8, jsonObjectField(jsonObjectField(once.response.result.?, "schedule").?, "id").?.string);
+    const deadline = platform_runtime.unixTimestampMs() + 10000;
+    var fired_thread: []const u8 = "";
+    while (fired_thread.len == 0) {
+        var poll = try client.call("schedule.list", .{});
+        if (!poll.response.isOk()) return error.ScheduleListRejected;
+        for (jsonObjectField(poll.response.result.?, "schedules").?.array.items) |row| {
+            if (!std.mem.eql(u8, jsonObjectField(row, "id").?.string, once_id)) continue;
+            const status = jsonObjectField(row, "last_status").?;
+            if (status != .string) break;
+            if (!std.mem.eql(u8, status.string, "ok") and !std.mem.eql(u8, status.string, "late")) {
+                std.debug.print("scheduled once ended {s}: {any}\n", .{ status.string, jsonObjectField(row, "last_error") });
+                return error.ScheduleOnceStatus;
+            }
+            if (jsonObjectField(row, "enabled").?.bool) return error.ScheduleOnceStillEnabled;
+            fired_thread = try arena.dupe(u8, jsonObjectField(row, "last_thread_id").?.string);
+        }
+        if (fired_thread.len != 0) break;
+        if (platform_runtime.unixTimestampMs() >= deadline) return error.ScheduleOnceNotFired;
+        try io.sleep(.fromMilliseconds(50), .awake);
+    }
+    var links = try client.call("chat.links.list", .{ .workspace_id = "sched", .parent_thread_id = "sched-parent" });
+    if (!links.response.isOk()) return error.ScheduleLinks;
+    var linked = false;
+    for (jsonObjectField(links.response.result.?, "links").?.array.items) |row| {
+        if (std.mem.eql(u8, jsonObjectField(row, "local_thread_id").?.string, fired_thread)) linked = true;
+    }
+    if (!linked) return error.ScheduleNewChatNotLinked;
+
+    var deleted = try client.call("schedule.delete", .{ .id = id });
+    if (!deleted.response.isOk()) return error.ScheduleDeleteRejected;
+    var missing = try client.call("schedule.delete", .{ .id = id });
+    if (missing.response.isOk() or !std.mem.eql(u8, missing.response.err.?.code, "not_found")) return error.ScheduleDeleteNotFound;
+    std.debug.print("headless-daemon-it: schedule scenario ok\n", .{});
 }
 
 fn runChatOrchestrationScenario(allocator: std.mem.Allocator, io: std.Io) !void {

@@ -17,6 +17,7 @@ const platform_runtime = @import("platform_runtime");
 const process_env = @import("../platform/env.zig");
 const provider_hooks = @import("../providers/hooks.zig");
 const spec = @import("spec.zig");
+const schedules = @import("../daemon/schedules.zig");
 const db_client = @import("../db/client.zig");
 const db_types = @import("../db/types.zig");
 const daemon_client = @import("../daemon/client.zig");
@@ -131,6 +132,10 @@ fn dispatchArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []const 
         try handleSession(allocator, out, io, argv[0], parsed.rest);
         return .handled;
     }
+    if (std.mem.eql(u8, parsed.command, "schedule")) {
+        try handleSchedule(allocator, out, io, parsed.rest);
+        return .handled;
+    }
     if (std.mem.eql(u8, parsed.command, "live")) {
         try handleLive(allocator, out, io, parsed.rest);
         return .handled;
@@ -192,6 +197,7 @@ fn printHelp(out: output.Output) !void {
         \\  verde integrations <command>  Inspect optional provider hook support
         \\  verde session <command>       Manage persistent terminal sessions
         \\  verde core <command>          Query the session daemon headless core
+        \\  verde schedule <command>      Manage scheduled tasks (prompts sent later or on a repeat)
         \\  verde live <command>          Talk to the running app
         \\  verde mcp                     Run the stdio MCP bridge
         \\  verde mcp stats               Summarize MCP calls and failures by client
@@ -241,6 +247,13 @@ fn printHelp(out: output.Output) !void {
         \\  screen --id <session-id> [--json]
         \\  kill --id <session-id>
         \\  cleanup
+        \\
+        \\Schedule commands:
+        \\  list [--workspace <id>] [--json]
+        \\  add --prompt <text> [--name <name>] --workspace <id> (--thread <id> | --provider <p> [--model <m>])
+        \\      (--at "YYYY-MM-DD HH:MM" | --in <30m> | --every <2h> | --daily <HH:MM> [--weekdays <mon-fri>])
+        \\      [--parent-thread-id <id> [--parent-workspace <id>]] [--disabled] [--json]
+        \\  enable|disable|remove|run <schedule-id> [--json]
         \\
         \\Core commands:
         \\  status [--json]
@@ -388,6 +401,7 @@ fn printCapabilities(allocator: std.mem.Allocator, out: output.Output, json: boo
             .integrations = spec.integration_commands[0..],
             .theme = spec.theme_commands[0..],
             .session = spec.session_commands[0..],
+            .schedule = spec.schedule_commands[0..],
             .core = CORE_COMMANDS[0..],
             .live = spec.live_capabilities[0..],
             .completion = spec.shells[0..],
@@ -416,6 +430,7 @@ fn printCapabilities(allocator: std.mem.Allocator, out: output.Output, json: boo
         \\  integrations: list, doctor, install, remove, disable
         \\  theme: import, validate, export, reset
         \\  session: list, inspect, new, attach, write, tail, screen, kill, cleanup
+        \\  schedule: list, add, enable, disable, remove, run
         \\  core: status, capabilities, snapshot, changes
         \\  live: status, workspaces, panes, pane control, chat control, terminal text/key/process/agent control
         \\  completion: bash, zsh, fish, powershell
@@ -427,6 +442,304 @@ fn printCapabilities(allocator: std.mem.Allocator, out: output.Output, json: boo
 
 fn workspaceOption(argv: []const []const u8) ?[]const u8 {
     return args.optionValue(argv, "--workspace") orelse args.optionValue(argv, "--project");
+}
+
+fn printScheduleHelp(out: output.Output) !void {
+    try out.stdout(
+        \\Usage:
+        \\  verde schedule list [--workspace <id>] [--json]
+        \\  verde schedule add --prompt <text> [--name <name>] --workspace <id>
+        \\                     (--thread <thread-id> | --provider <provider> [--model <model>])
+        \\                     (--at "YYYY-MM-DD HH:MM" | --in <30m> | --every <2h> | --daily <HH:MM> [--weekdays <days>])
+        \\                     [--parent-thread-id <thread-id> [--parent-workspace <id>]] [--disabled] [--json]
+        \\  verde schedule enable|disable|remove|run <schedule-id> [--json]
+        \\
+        \\Scheduled tasks send a prompt into a chat later or on a repeat. --thread sends into an
+        \\existing chat; --provider opens a new chat in the workspace on every run. Times are this
+        \\machine's local time. Durations take m, h, or d (for example 45m, 2h, 1d); --every needs at
+        \\least 5 minutes. --weekdays takes mon-fri, sat,sun, weekdays, weekends, or a list of days.
+        \\--parent-thread-id links new chats to that chat so each run reports back to it.
+        \\--workspace defaults to VERDE_WORKSPACE_ID.
+        \\
+    , .{});
+}
+
+fn handleSchedule(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv: []const []const u8) !void {
+    const subcommand = args.positional(argv, 0) orelse {
+        try printScheduleHelp(out);
+        if (!args.hasFlag(argv, "--help") and !args.hasFlag(argv, "-h")) std.process.exit(2);
+        return;
+    };
+    if (args.hasFlag(argv, "--help") or args.hasFlag(argv, "-h")) return try printScheduleHelp(out);
+    if (unknownScheduleFlag(subcommand, argv)) |flag| {
+        try out.stderr("unknown or misplaced flag for verde schedule {s}: {s}\n", .{ subcommand, flag });
+        std.process.exit(2);
+    }
+    const json = args.hasFlag(argv, "--json");
+    if (std.mem.eql(u8, subcommand, "list")) {
+        const response = chatDaemonCallEnvelopeAlloc(allocator, io, schedules.METHOD_LIST, .{
+            .workspace_id = scheduleWorkspaceOption(argv, false),
+        }) catch |err| return chatDaemonCliFailure(out, err);
+        defer allocator.free(response);
+        return try finishScheduleCommand(allocator, out, response, json, .list);
+    }
+    if (std.mem.eql(u8, subcommand, "add")) {
+        const params = scheduleAddParams(allocator, out, argv) catch |err| switch (err) {
+            error.InvalidArguments => std.process.exit(2),
+            else => return err,
+        };
+        defer params.deinit();
+        const response = chatDaemonCallEnvelopeAlloc(allocator, io, schedules.METHOD_CREATE, params.value) catch |err| return chatDaemonCliFailure(out, err);
+        defer allocator.free(response);
+        return try finishScheduleCommand(allocator, out, response, json, .added);
+    }
+    const Action = enum { enable, disable, remove, run };
+    const action = std.meta.stringToEnum(Action, subcommand) orelse {
+        try out.stderr("unknown verde schedule command: {s}\n\n", .{subcommand});
+        try printScheduleHelp(out);
+        std.process.exit(2);
+    };
+    const id = args.positional(argv, 1) orelse args.optionValue(argv, "--id") orelse {
+        try out.stderr("verde schedule {s} requires a schedule id\n", .{subcommand});
+        std.process.exit(2);
+    };
+    const response = (switch (action) {
+        .enable, .disable => chatDaemonCallEnvelopeAlloc(allocator, io, schedules.METHOD_UPDATE, .{ .id = id, .enabled = action == .enable }),
+        .remove => chatDaemonCallEnvelopeAlloc(allocator, io, schedules.METHOD_DELETE, .{ .id = id }),
+        .run => chatDaemonCallEnvelopeAlloc(allocator, io, schedules.METHOD_RUN, .{ .id = id }),
+    }) catch |err| return chatDaemonCliFailure(out, err);
+    defer allocator.free(response);
+    return try finishScheduleCommand(allocator, out, response, json, switch (action) {
+        .enable => .enabled,
+        .disable => .disabled,
+        .remove => .removed,
+        .run => .ran,
+    });
+}
+
+/// First flag `verde schedule <subcommand>` does not accept, skipping flag values.
+fn unknownScheduleFlag(subcommand: []const u8, argv: []const []const u8) ?[]const u8 {
+    const id_flags = [_][]const u8{ "--id", "--json" };
+    const allowed: []const []const u8 = if (std.mem.eql(u8, subcommand, "add"))
+        &spec.schedule_add_flags
+    else if (std.mem.eql(u8, subcommand, "list"))
+        &spec.schedule_list_flags
+    else
+        &id_flags;
+    var index: usize = 0;
+    while (index < argv.len) : (index += 1) {
+        const arg = argv[index];
+        if (!std.mem.startsWith(u8, arg, "--")) continue;
+        const known = for (allowed) |flag| {
+            if (std.mem.eql(u8, arg, flag)) break true;
+        } else false;
+        if (!known) return arg;
+        const takes_value = !std.mem.eql(u8, arg, "--json") and !std.mem.eql(u8, arg, "--disabled");
+        if (takes_value) index += 1;
+    }
+    return null;
+}
+
+/// `--workspace` (or VERDE_WORKSPACE_ID; `self` means the env workspace).
+fn scheduleWorkspaceOption(argv: []const []const u8, use_env: bool) ?[]const u8 {
+    if (args.optionValue(argv, "--workspace")) |value| {
+        if (!std.mem.eql(u8, value, "self")) return value;
+        return getenvSlice("VERDE_WORKSPACE_ID");
+    }
+    return if (use_env) getenvSlice("VERDE_WORKSPACE_ID") else null;
+}
+
+/// Builds `schedule.create` params from `verde schedule add` flags.
+fn scheduleAddParams(allocator: std.mem.Allocator, out: output.Output, argv: []const []const u8) !std.json.Parsed(std.json.Value) {
+    const prompt = args.optionValue(argv, "--prompt") orelse {
+        try out.stderr("verde schedule add requires --prompt\n", .{});
+        return error.InvalidArguments;
+    };
+    const workspace_id = scheduleWorkspaceOption(argv, true) orelse {
+        try out.stderr("verde schedule add requires --workspace (or VERDE_WORKSPACE_ID)\n", .{});
+        return error.InvalidArguments;
+    };
+    const thread_id = args.optionValue(argv, "--thread");
+    const provider = args.optionValue(argv, "--provider");
+    if ((thread_id == null) == (provider == null)) {
+        try out.stderr("verde schedule add needs exactly one of --thread or --provider\n", .{});
+        return error.InvalidArguments;
+    }
+    const repeat_flags = [_][]const u8{ "--at", "--in", "--every", "--daily" };
+    var repeat_count: usize = 0;
+    for (repeat_flags) |flag| {
+        if (args.hasFlag(argv, flag)) repeat_count += 1;
+    }
+    if (repeat_count != 1) {
+        try out.stderr("verde schedule add needs exactly one of --at, --in, --every, or --daily\n", .{});
+        return error.InvalidArguments;
+    }
+    if (args.hasFlag(argv, "--weekdays") and !args.hasFlag(argv, "--daily")) {
+        try out.stderr("--weekdays only applies to --daily\n", .{});
+        return error.InvalidArguments;
+    }
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer };
+    try s.beginObject();
+    try s.objectField("prompt");
+    try s.write(prompt);
+    if (args.optionValue(argv, "--name")) |name| {
+        try s.objectField("name");
+        try s.write(name);
+    }
+    try s.objectField("target");
+    if (thread_id) |thread| {
+        try s.write(.{ .kind = "thread", .workspace_id = workspace_id, .thread_id = thread });
+    } else {
+        try s.beginObject();
+        try s.objectField("kind");
+        try s.write("new_chat");
+        try s.objectField("workspace_id");
+        try s.write(workspace_id);
+        try s.objectField("provider");
+        try s.write(provider.?);
+        if (args.optionValue(argv, "--model")) |model| {
+            try s.objectField("model");
+            try s.write(model);
+        }
+        try s.endObject();
+    }
+    try s.objectField("repeat");
+    if (args.optionValue(argv, "--at")) |text| {
+        const at_ms = schedules.parseLocalDateTime(.local, text) orelse {
+            try out.stderr("invalid --at value: {s}; expected \"YYYY-MM-DD HH:MM\" in local time\n", .{text});
+            return error.InvalidArguments;
+        };
+        try s.write(.{ .kind = "once", .at_ms = at_ms });
+    } else if (args.optionValue(argv, "--in")) |text| {
+        const minutes = schedules.parseDurationMinutes(text) orelse {
+            try out.stderr("invalid --in value: {s}; expected a duration such as 30m, 2h, or 1d\n", .{text});
+            return error.InvalidArguments;
+        };
+        try s.write(.{ .kind = "once", .at_ms = unixTimestampMs() + minutes * std.time.ms_per_min });
+    } else if (args.optionValue(argv, "--every")) |text| {
+        const minutes = schedules.parseDurationMinutes(text) orelse {
+            try out.stderr("invalid --every value: {s}; expected a duration such as 30m, 2h, or 1d\n", .{text});
+            return error.InvalidArguments;
+        };
+        try s.write(.{ .kind = "interval", .every_minutes = minutes });
+    } else {
+        const time = args.optionValue(argv, "--daily") orelse "";
+        if (schedules.parseClock(time) == null) {
+            try out.stderr("invalid --daily value: {s}; expected HH:MM in 24-hour time\n", .{time});
+            return error.InvalidArguments;
+        }
+        try s.beginObject();
+        try s.objectField("kind");
+        try s.write("daily");
+        try s.objectField("time");
+        try s.write(time);
+        if (args.optionValue(argv, "--weekdays")) |text| {
+            const mask = schedules.parseWeekdays(text) orelse {
+                try out.stderr("invalid --weekdays value: {s}; try mon-fri, sat,sun, weekdays, or weekends\n", .{text});
+                return error.InvalidArguments;
+            };
+            try s.objectField("weekdays");
+            try s.beginArray();
+            for (0..7) |day| if (mask & (@as(u8, 1) << @intCast(day)) != 0) try s.write(day);
+            try s.endArray();
+        }
+        try s.endObject();
+    }
+    if (args.hasFlag(argv, "--disabled")) {
+        try s.objectField("enabled");
+        try s.write(false);
+    }
+    if (args.optionValue(argv, "--parent-thread-id")) |parent| {
+        try s.objectField("parent_thread_id");
+        try s.write(parent);
+        if (args.optionValue(argv, "--parent-workspace")) |parent_workspace| {
+            try s.objectField("parent_workspace_id");
+            try s.write(parent_workspace);
+        }
+    } else if (args.hasFlag(argv, "--parent-workspace")) {
+        try out.stderr("--parent-workspace needs --parent-thread-id\n", .{});
+        return error.InvalidArguments;
+    }
+    try s.objectField("created_by");
+    try s.write("cli");
+    try s.endObject();
+    return std.json.parseFromSlice(std.json.Value, allocator, writer.written(), .{});
+}
+
+const ScheduleOutcome = enum { list, added, enabled, disabled, removed, ran };
+
+/// Prints a `schedule.*` envelope: raw with --json, otherwise a short human
+/// summary. A daemon error exits 1 either way.
+fn finishScheduleCommand(allocator: std.mem.Allocator, out: output.Output, response: []const u8, json: bool, outcome: ScheduleOutcome) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    const ok = parsed.value == .object and (parsed.value.object.get("ok") orelse .null) == .bool and parsed.value.object.get("ok").?.bool;
+    if (json) {
+        try out.stdout("{s}\n", .{response});
+        if (!ok) std.process.exit(1);
+        return;
+    }
+    if (!ok) {
+        const message = blk: {
+            if (parsed.value != .object) break :blk "invalid daemon response";
+            const err_value = parsed.value.object.get("error") orelse break :blk "request failed";
+            if (err_value != .object) break :blk "request failed";
+            break :blk jsonString(err_value.object.get("message") orelse .null) orelse "request failed";
+        };
+        try out.stderr("verde schedule: {s}\n", .{message});
+        std.process.exit(1);
+    }
+    const result = parsed.value.object.get("result") orelse .null;
+    if (result != .object) return;
+    switch (outcome) {
+        .removed => try out.stdout("Removed scheduled task.\n", .{}),
+        .list => {
+            const rows = result.object.get("schedules") orelse .null;
+            if (rows != .array or rows.array.items.len == 0) return try out.stdout("No scheduled tasks.\n", .{});
+            for (rows.array.items) |row| try printScheduleLine(allocator, out, row, null);
+        },
+        .added, .enabled, .disabled, .ran => {
+            const label: []const u8 = switch (outcome) {
+                .added => "Scheduled",
+                .enabled => "Enabled",
+                .disabled => "Disabled",
+                .ran => "Ran",
+                else => unreachable,
+            };
+            try printScheduleLine(allocator, out, result.object.get("schedule") orelse .null, label);
+            if (outcome == .ran) {
+                if (jsonString(result.object.get("thread_id") orelse .null)) |thread_id| try out.stdout("  thread: {s}\n", .{thread_id});
+                if (jsonString(result.object.get("turn_id") orelse .null)) |turn_id| try out.stdout("  turn: {s}\n", .{turn_id});
+            }
+        },
+    }
+}
+
+fn printScheduleLine(allocator: std.mem.Allocator, out: output.Output, value: std.json.Value, label: ?[]const u8) !void {
+    if (value != .object) return;
+    const object = value.object;
+    var line: std.Io.Writer.Allocating = .init(allocator);
+    defer line.deinit();
+    const w = &line.writer;
+    if (label) |text| try w.print("{s} ", .{text});
+    const enabled = if (object.get("enabled")) |flag| flag == .bool and flag.bool else false;
+    try w.print("{s} [{s}] {s}\n  ", .{ jsonString(object.get("id") orelse .null) orelse "?", if (enabled) "on" else "off", jsonString(object.get("name") orelse .null) orelse "" });
+    var diag: schedules.Diagnostic = .{};
+    if (schedules.parseRepeat(object.get("repeat") orelse .null, &diag)) |repeat| {
+        try schedules.describeRepeat(w, .local, repeat);
+    } else |_| try w.writeAll("unknown repeat");
+    const next_value = object.get("next_run_ms") orelse .null;
+    if (next_value == .integer) {
+        if (schedules.toLocal(.local, @divFloor(next_value.integer, std.time.ms_per_s))) |next| {
+            try w.print(" · next {d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}", .{ next.year, next.month, next.day, next.hour, next.minute });
+        }
+    }
+    if (jsonString(object.get("last_status") orelse .null)) |status| try w.print(" · last {s}", .{status});
+    if (jsonString(object.get("last_error") orelse .null)) |message| try w.print(" ({s})", .{message});
+    try out.stdout("{s}\n", .{line.written()});
 }
 
 fn handleCompletion(allocator: std.mem.Allocator, out: output.Output, argv: []const []const u8) !void {
@@ -4599,6 +4912,11 @@ fn mcpToolsList(allocator: std.mem.Allocator, out: output.Output, id_value: std.
     try writeMcpTypedTool(&s, "approve_chat_turn", "Approve or deny a chat turn's pending tool approval daemon-direct. Returns not_found both for an unknown turn and for a turn with no pending approval matching call_id; re-check tail_chat_turn before retrying.", &CHAT_APPROVE_MCP_INPUTS);
     try writeMcpTypedTool(&s, "stop_chat_turn", "Stop a running chat turn daemon-direct. The interruption still commits durably. Stopping an already-terminal turn is an accepted no-op, not an error.", &CHAT_STOP_MCP_INPUTS);
     try writeMcpTypedTool(&s, "read_chat_thread", "Read a chat thread's durable transcript daemon-direct from the session daemon store.", &CHAT_READ_MCP_INPUTS);
+    try writeMcpTypedTool(&s, "list_schedules", "List Verde scheduled tasks: prompts the daemon sends into a chat later or on a repeat. Each entry has its id, name, prompt, target, repeat, enabled flag, next_run_ms, and the last run's status (ok, queued, failed, or late), error, and thread. Sorted soonest first, disabled last.", &SCHEDULE_LIST_MCP_INPUTS);
+    try writeMcpTypedTool(&s, "create_schedule", "Create a scheduled task that runs a prompt later or repeatedly, for example a reminder in an hour, a daily 09:00 CI check on weekdays, or a check every 2 hours. Use it whenever the user asks for something later or on a recurring basis instead of waiting yourself. Each run sends the prompt as a user turn, either into an existing chat (target kind thread) or into a fresh chat opened in a workspace (target kind new_chat). Pass your own Verde thread id as parent_thread_id so new chats a run opens report their results back to you. Times are the desktop host's local time. Works with no GUI running.", &SCHEDULE_CREATE_MCP_INPUTS);
+    try writeMcpTypedTool(&s, "update_schedule", "Change a scheduled task by id. Only the fields you pass change; changing repeat or enabled recomputes the next run from now. Set enabled false to pause a task without deleting it.", &SCHEDULE_UPDATE_MCP_INPUTS);
+    try writeMcpTypedTool(&s, "delete_schedule", "Delete a scheduled task by id. Chats its earlier runs created are kept.", &SCHEDULE_ID_MCP_INPUTS);
+    try writeMcpTypedTool(&s, "run_schedule", "Run a scheduled task now without waiting for its next time. Its regular schedule is unchanged, except that a one-time task is used up. Returns the schedule, the thread_id the prompt went to, and the turn_id when a turn started. A busy target chat gets the prompt as a queued follow-up (status queued), never an error.", &SCHEDULE_ID_MCP_INPUTS);
     try writeMcpTool(&s, "list_surfaces", "List registered live terminal control surfaces. Use list_panes for ordinary Verde terminal panes.");
     try writeMcpTool(&s, "inspect_surface", "Inspect one Verde terminal surface.");
     try writeMcpTypedTool(&s, "read_surface_screen", "Read terminal screen text. With pane_id uses the desktop Live server; with session_id talks to the session daemon directly (raw_tail fidelity, no GUI).", &TERMINAL_SURFACE_MCP_INPUTS);
@@ -4805,6 +5123,7 @@ fn mcpToolAnnotations(name: []const u8) McpToolAnnotations {
         std.mem.eql(u8, name, "browser_status") or
         std.mem.eql(u8, name, "capture_browser_screenshot");
     const destructive = std.mem.eql(u8, name, "stop_process") or
+        std.mem.eql(u8, name, "delete_schedule") or
         std.mem.eql(u8, name, "restart_process") or
         std.mem.eql(u8, name, "stop_chat_turn") or
         std.mem.eql(u8, name, "reset_browser");
@@ -4921,6 +5240,37 @@ const CHAT_READ_MCP_INPUTS = [_]McpToolInput{
     .{ .name = "local_thread_id", .type_name = "string", .description = "Stable thread id to read.", .required = true },
 };
 
+const SCHEDULE_TARGET_DESCRIPTION = "Where each run sends the prompt. Existing chat: {\"kind\":\"thread\",\"workspace_id\":\"...\",\"thread_id\":\"...\"}. Fresh chat on every run (titled with the schedule name): {\"kind\":\"new_chat\",\"workspace_id\":\"...\",\"provider\":\"codex|claude|opencode|cursor|pi|grok\",\"model\":\"optional\"}.";
+const SCHEDULE_REPEAT_DESCRIPTION = "When to run, in the desktop host's local time. One time: {\"kind\":\"once\",\"at_ms\":<UTC epoch milliseconds>}. Repeating: {\"kind\":\"interval\",\"every_minutes\":120} (5 to 10080). Daily: {\"kind\":\"daily\",\"time\":\"09:00\",\"weekdays\":[1,2,3,4,5]} (0 = Sunday; omit weekdays for every day).";
+
+const SCHEDULE_LIST_MCP_INPUTS = [_]McpToolInput{
+    .{ .name = "workspace_id", .type_name = "string", .description = "Optional: only tasks that target this workspace or report to a chat in it." },
+};
+
+const SCHEDULE_CREATE_MCP_INPUTS = [_]McpToolInput{
+    .{ .name = "prompt", .type_name = "string", .description = "The prompt each run sends, written as the instruction the receiving chat should carry out (1 to 16384 bytes).", .required = true },
+    .{ .name = "name", .type_name = "string", .description = "Optional short name (at most 120 bytes); defaults to the prompt's first line." },
+    .{ .name = "target", .type_name = "object", .description = SCHEDULE_TARGET_DESCRIPTION, .required = true },
+    .{ .name = "repeat", .type_name = "object", .description = SCHEDULE_REPEAT_DESCRIPTION, .required = true },
+    .{ .name = "parent_thread_id", .type_name = "string", .description = "Your Verde local thread id. New chats a run opens are linked under it and report their results back to you." },
+    .{ .name = "parent_workspace_id", .type_name = "string", .description = "Optional workspace of parent_thread_id; resolved automatically when omitted." },
+    .{ .name = "enabled", .type_name = "boolean", .description = "Optional; defaults to true. Pass false to create it paused." },
+    .{ .name = "created_by", .type_name = "string", .description = "Optional label for who created it, such as companion; defaults to mcp." },
+};
+
+const SCHEDULE_UPDATE_MCP_INPUTS = [_]McpToolInput{
+    .{ .name = "id", .type_name = "string", .description = "Schedule id from list_schedules or create_schedule.", .required = true },
+    .{ .name = "name", .type_name = "string", .description = "New name." },
+    .{ .name = "prompt", .type_name = "string", .description = "New prompt." },
+    .{ .name = "target", .type_name = "object", .description = SCHEDULE_TARGET_DESCRIPTION },
+    .{ .name = "repeat", .type_name = "object", .description = SCHEDULE_REPEAT_DESCRIPTION },
+    .{ .name = "enabled", .type_name = "boolean", .description = "Pause (false) or resume (true) the task." },
+};
+
+const SCHEDULE_ID_MCP_INPUTS = [_]McpToolInput{
+    .{ .name = "id", .type_name = "string", .description = "Schedule id from list_schedules or create_schedule.", .required = true },
+};
+
 const TERMINAL_SURFACE_MCP_INPUTS = [_]McpToolInput{
     .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current; defaults to the agent's workspace. Used with pane_id Live addressing." },
     .{ .name = "pane_id", .type_name = "integer", .description = "Target terminal workspace pane id for Live (desktop) addressing. Required when session_id is omitted." },
@@ -5009,6 +5359,56 @@ fn writeMcpTypedTool(s: *std.json.Stringify, name: []const u8, description: []co
     try s.endObject();
     try writeMcpToolAnnotations(s, name);
     try s.endObject();
+}
+
+fn mcpScheduleMethod(tool_name: []const u8) ?[]const u8 {
+    const pairs = [_][2][]const u8{
+        .{ "list_schedules", schedules.METHOD_LIST },
+        .{ "create_schedule", schedules.METHOD_CREATE },
+        .{ "update_schedule", schedules.METHOD_UPDATE },
+        .{ "delete_schedule", schedules.METHOD_DELETE },
+        .{ "run_schedule", schedules.METHOD_RUN },
+    };
+    for (pairs) |pair| if (std.mem.eql(u8, tool_name, pair[0])) return pair[1];
+    return null;
+}
+
+/// Forwards a schedule tool's arguments to the daemon's `schedule.*` method;
+/// the tool fields are the RPC fields, validated by the daemon.
+fn mcpScheduleCallAlloc(allocator: std.mem.Allocator, io: std.Io, method: []const u8, arguments: std.json.Value) ![]u8 {
+    const arg = struct {
+        fn get(value: std.json.Value, name: []const u8) std.json.Value {
+            if (value != .object) return .null;
+            return value.object.get(name) orelse .null;
+        }
+    }.get;
+    if (std.mem.eql(u8, method, schedules.METHOD_LIST)) {
+        return chatDaemonCallEnvelopeAlloc(allocator, io, method, .{ .workspace_id = arg(arguments, "workspace_id") });
+    }
+    if (std.mem.eql(u8, method, schedules.METHOD_CREATE)) {
+        const created_by = arg(arguments, "created_by");
+        return chatDaemonCallEnvelopeAlloc(allocator, io, method, .{
+            .name = arg(arguments, "name"),
+            .prompt = arg(arguments, "prompt"),
+            .target = arg(arguments, "target"),
+            .repeat = arg(arguments, "repeat"),
+            .enabled = arg(arguments, "enabled"),
+            .parent_thread_id = arg(arguments, "parent_thread_id"),
+            .parent_workspace_id = arg(arguments, "parent_workspace_id"),
+            .created_by = if (created_by == .null) std.json.Value{ .string = "mcp" } else created_by,
+        });
+    }
+    if (std.mem.eql(u8, method, schedules.METHOD_UPDATE)) {
+        return chatDaemonCallEnvelopeAlloc(allocator, io, method, .{
+            .id = arg(arguments, "id"),
+            .name = arg(arguments, "name"),
+            .prompt = arg(arguments, "prompt"),
+            .target = arg(arguments, "target"),
+            .repeat = arg(arguments, "repeat"),
+            .enabled = arg(arguments, "enabled"),
+        });
+    }
+    return chatDaemonCallEnvelopeAlloc(allocator, io, method, .{ .id = arg(arguments, "id") });
 }
 
 fn mcpOpenChatCreationSettings(arguments: std.json.Value) error{
@@ -5257,6 +5657,11 @@ fn mcpToolsCall(
             .parent_thread_id = mcpArgString(arguments, "parent_thread_id") orelse return error.InvalidParams,
             .link_id = mcpArgString(arguments, "link_id"),
         });
+        defer allocator.free(response);
+        return try mcpToolTextResult(allocator, out, id_value, response, tool_name);
+    }
+    if (mcpScheduleMethod(tool_name)) |method| {
+        const response = mcpScheduleCallAlloc(allocator, io, method, arguments) catch |err| return try mcpChatDaemonError(allocator, out, id_value, err);
         defer allocator.free(response);
         return try mcpToolTextResult(allocator, out, id_value, response, tool_name);
     }
@@ -7570,7 +7975,8 @@ fn mcpUnavailableCapability(tool_name: []const u8) ?McpUnavailableCapability {
         std.mem.eql(u8, tool_name, "stop_chat_turn") or
         std.mem.eql(u8, tool_name, "list_linked_chats") or
         std.mem.eql(u8, tool_name, "clear_linked_chats") or
-        std.mem.eql(u8, tool_name, "read_chat_thread"))
+        std.mem.eql(u8, tool_name, "read_chat_thread") or
+        mcpScheduleMethod(tool_name) != null)
     {
         return mcpChatUnavailableCapability();
     }
@@ -8771,4 +9177,36 @@ test "stale GUI validation falls back only for unsupported methods" {
         defer parsed.deinit();
         try std.testing.expectEqual(case.expected, chatOpenValidationRoute(parsed.value));
     }
+}
+
+test "schedule add flags build create params and reject strays" {
+    const out: output.Output = .{ .io = std.testing.io };
+    const argv = [_][]const u8{
+        "add",     "--prompt", "Check CI",   "--workspace", "ws-1",               "--provider", "codex",
+        "--daily", "09:00",    "--weekdays", "mon-fri",     "--parent-thread-id", "companion",  "--disabled",
+    };
+    try std.testing.expect(unknownScheduleFlag("add", &argv) == null);
+    const params = try scheduleAddParams(std.testing.allocator, out, &argv);
+    defer params.deinit();
+    const object = params.value.object;
+    try std.testing.expectEqualStrings("Check CI", object.get("prompt").?.string);
+    try std.testing.expectEqualStrings("new_chat", object.get("target").?.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("codex", object.get("target").?.object.get("provider").?.string);
+    const repeat = object.get("repeat").?.object;
+    try std.testing.expectEqualStrings("09:00", repeat.get("time").?.string);
+    try std.testing.expectEqual(@as(usize, 5), repeat.get("weekdays").?.array.items.len);
+    try std.testing.expectEqual(false, object.get("enabled").?.bool);
+    try std.testing.expectEqualStrings("companion", object.get("parent_thread_id").?.string);
+    try std.testing.expectEqualStrings("cli", object.get("created_by").?.string);
+
+    const every = [_][]const u8{ "add", "--prompt", "ping", "--workspace", "ws-1", "--thread", "t-1", "--every", "2h" };
+    const interval = try scheduleAddParams(std.testing.allocator, out, &every);
+    defer interval.deinit();
+    try std.testing.expectEqual(@as(i64, 120), interval.value.object.get("repeat").?.object.get("every_minutes").?.integer);
+    try std.testing.expectEqualStrings("t-1", interval.value.object.get("target").?.object.get("thread_id").?.string);
+
+    const stray = [_][]const u8{ "add", "--prompt", "--every", "--every", "2h", "--everyy", "3h" };
+    try std.testing.expectEqualStrings("--everyy", unknownScheduleFlag("add", &stray).?);
+    const misplaced = [_][]const u8{ "run", "sch-1", "--daily", "09:00" };
+    try std.testing.expectEqualStrings("--daily", unknownScheduleFlag("run", &misplaced).?);
 }

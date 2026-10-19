@@ -17,6 +17,7 @@ pub const top_level_commands = [_][]const u8{
     "notify",
     "integrations",
     "session",
+    "schedule",
     "core",
     "live",
     "mcp",
@@ -82,6 +83,15 @@ pub const session_commands = [_][]const u8{
     "screen",
     "kill",
     "cleanup",
+};
+
+pub const schedule_commands = [_][]const u8{
+    "list",
+    "add",
+    "enable",
+    "disable",
+    "remove",
+    "run",
 };
 
 pub const core_commands = [_][]const u8{
@@ -243,6 +253,11 @@ pub const mcp_chat_tools = [_][]const u8{
     "approve_chat_turn",
     "stop_chat_turn",
     "read_chat_thread",
+    "list_schedules",
+    "create_schedule",
+    "update_schedule",
+    "delete_schedule",
+    "run_schedule",
 };
 
 pub const pane_commands = [_][]const u8{
@@ -403,6 +418,13 @@ pub const all_flags = [_][]const u8{
     "--shift",
     "--alt",
     "--super",
+    "--at",
+    "--in",
+    "--every",
+    "--daily",
+    "--weekdays",
+    "--parent-workspace",
+    "--disabled",
 };
 
 pub const json_flags = [_][]const u8{"--json"};
@@ -471,6 +493,24 @@ pub const palette_run_flags = [_][]const u8{ "--command", "--json" };
 pub const terminal_tail_flags = [_][]const u8{ "--workspace", "--pane", "--focused", "--lines", "--json" };
 pub const process_flags = [_][]const u8{ "--workspace", "--pane", "--focused", "--name", "--lines", "--json" };
 pub const agent_flags = [_][]const u8{ "--workspace", "--provider", "--json" };
+pub const schedule_list_flags = [_][]const u8{ "--workspace", "--json" };
+pub const schedule_add_flags = [_][]const u8{
+    "--prompt",
+    "--name",
+    "--workspace",
+    "--thread",
+    "--provider",
+    "--model",
+    "--at",
+    "--in",
+    "--every",
+    "--daily",
+    "--weekdays",
+    "--parent-thread-id",
+    "--parent-workspace",
+    "--disabled",
+    "--json",
+};
 
 pub const kind_values = [_][]const u8{ "chat", "terminal" };
 pub const axis_values = [_][]const u8{ "horizontal", "vertical" };

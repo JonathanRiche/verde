@@ -16,6 +16,10 @@ const MUTATING_METHODS = [_][]const u8{
     // Sessionizer-owned mutations.
     "companion.roster.put",
     "companion.brain.switch",
+    "schedule.create",
+    "schedule.update",
+    "schedule.delete",
+    "schedule.run",
     "voice.provider.configure",
     "device.push.register",
     "device.push.unregister",

@@ -39,7 +39,7 @@ test "exported native models decode real host queries and effects" {
     const batch = try std.json.parseFromSlice(std.json.Value, a, output, .{});
     defer batch.deinit();
     for (batch.value.object.get("effects").?.array.items) |effect| try checkEffect(effect);
-    inline for (.{ .{ "hosts", wire.HostsView }, .{ "home", wire.HomeView }, .{ "workspaces", wire.WorkspacesView } }) |entry| {
+    inline for (.{ .{ "hosts", wire.HostsView }, .{ "home", wire.HomeView }, .{ "workspaces", wire.WorkspacesView }, .{ "schedules", @import("schedules.zig").View } }) |entry| {
         const query = try h.query(entry[0], a);
         defer a.free(query);
         const decoded = try std.json.parseFromSlice(wire.Query(entry[1]), a, query, .{});

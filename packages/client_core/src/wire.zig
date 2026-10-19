@@ -3,6 +3,7 @@
 const std = @import("std");
 const host = @import("host.zig");
 const files = @import("files.zig");
+const schedules = @import("schedules.zig");
 pub const Config = host.Config;
 pub const Lifecycle = host.Lifecycle;
 pub const LocalError = host.LocalError;
@@ -96,6 +97,11 @@ pub const Event = union(enum) {
     attachment_fetch: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, workspace_id: []const u8, thread_id: []const u8, message_id: []const u8, index: u32 },
     attachment_release: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, key: []const u8 },
     companion_crew_refresh: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, workspace_id: []const u8, thread_id: []const u8 },
+    schedule_refresh: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, workspace_id: ?[]const u8 = null },
+    schedule_create: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, name: ?[]const u8 = null, prompt: []const u8, target: schedules.Target, repeat: schedules.Repeat, enabled: ?bool = null, parent_workspace_id: ?[]const u8 = null, parent_thread_id: ?[]const u8 = null, created_by: ?[]const u8 = null },
+    schedule_update: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, id: []const u8, name: ?[]const u8 = null, prompt: ?[]const u8 = null, target: ?schedules.Target = null, repeat: ?schedules.Repeat = null, enabled: ?bool = null },
+    schedule_delete: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, id: []const u8 },
+    schedule_run: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, id: []const u8 },
     push_received: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, workspace_id: []const u8, thread_id: []const u8, turn_id: []const u8, kind: []const u8 },
     terminal_input: struct { api_version: u32 = 1, now_ms: i64, wall_time_ms: i64, intent_id: []const u8, terminal_id: []const u8, vt_modes: VtModes, input: struct { kind: enum { text, key, paste }, text: ?[]const u8 = null, key: ?[]const u8 = null, ctrl: bool, alt: bool, shift: bool } },
 };

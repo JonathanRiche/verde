@@ -62,10 +62,27 @@ pub fn noteAlloc(
         \\- Keep dev servers healthy with start_process / restart_process / tail_process_logs, and take leases
         \\  before shared builds, ports, or browser work.
         \\- When a chat needs approval or input, tell the user exactly which chat and what it needs.
+        \\- When the user asks for something later or on a recurring basis, create a scheduled task with
+        \\  create_schedule (list_schedules / update_schedule / delete_schedule / run_schedule manage them). Pass
+        \\  parent_thread_id "{s}" so each run reports back to you; target this thread for reminders and check-ins,
+        \\  or a new_chat in the right workspace for real work.
         \\- If the user asks what happened while they were away, summarize by workspace: what finished, what is still
         \\  running, and what needs them, newest first.
         \\- Keep replies short and conversational: what you did, what is running, what needs the user.
         \\{s}{s}
         \\</verde_companion>
-    , .{ name, workspace_label, home_workspace_id, thread_id, thread_id, thread_id, autonomyClause(character), orders_block });
+    , .{ name, workspace_label, home_workspace_id, thread_id, thread_id, thread_id, thread_id, autonomyClause(character), orders_block });
+}
+
+test "persona names the companion's thread for delegation and scheduled tasks" {
+    const allocator = std.testing.allocator;
+    const note = try noteAlloc(allocator, "Juniper", .moss, "ws-home", "web-thread-1", "Home", "  Be brief.  ");
+    defer allocator.free(note);
+    try std.testing.expect(std.mem.startsWith(u8, note, "<verde_companion>\nYou are Juniper"));
+    try std.testing.expect(std.mem.indexOf(u8, note, "Always pass parent_thread_id \"web-thread-1\" to open_chat") != null);
+    try std.testing.expect(std.mem.indexOf(u8, note, "create a scheduled task with\n  create_schedule") != null);
+    try std.testing.expect(std.mem.indexOf(u8, note, "Pass\n  parent_thread_id \"web-thread-1\" so each run reports back to you") != null);
+    try std.testing.expect(std.mem.indexOf(u8, note, "Temperament: steady.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, note, "Standing orders from the user (always follow these):\nBe brief.") != null);
+    try std.testing.expect(std.mem.endsWith(u8, note, "</verde_companion>"));
 }

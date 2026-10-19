@@ -69,6 +69,16 @@ pub const HitAction = enum {
     inbox_open,
     suggestion,
     recap,
+    /// Header clock and the view's back link: conversation <-> schedules.
+    schedules_view,
+    schedule_toggle,
+    schedule_run,
+    schedule_delete,
+    schedule_delete_confirm,
+    schedule_delete_cancel,
+    schedule_expand,
+    /// Empty-state card that pre-fills the composer with an example request.
+    schedule_suggestion,
 };
 
 pub const Hit = struct {
@@ -651,6 +661,197 @@ pub const ConversationRow = struct {
 
 pub const MAX_CONVERSATION_ROWS: usize = 5;
 
+/// What the panel body shows below the header.
+pub const PanelView = enum { conversation, schedules };
+
+/// Schedules the panel keeps; the daemon allows 200, the panel says how many
+/// more exist beyond these.
+pub const MAX_SCHEDULE_ROWS: usize = 24;
+
+/// Daemon schedule id (`sch-<ms>-<rand>`). Assignment is all or nothing so a
+/// click can never act on a truncated id; empty means "none".
+pub const ScheduleId = struct {
+    storage: [64:0]u8 = std.mem.zeroes([64:0]u8),
+
+    pub fn set(self: *ScheduleId, value: []const u8) bool {
+        if (value.len == 0 or value.len >= self.storage.len or std.mem.indexOfScalar(u8, value, 0) != null) return false;
+        self.* = .{};
+        @memcpy(self.storage[0..value.len], value);
+        return true;
+    }
+
+    pub fn clear(self: *ScheduleId) void {
+        self.* = .{};
+    }
+
+    pub fn slice(self: *const ScheduleId) []const u8 {
+        return std.mem.sliceTo(self.storage[0..], 0);
+    }
+
+    pub fn isEmpty(self: *const ScheduleId) bool {
+        return self.storage[0] == 0;
+    }
+
+    pub fn eql(self: *const ScheduleId, other: *const ScheduleId) bool {
+        return !self.isEmpty() and std.mem.eql(u8, self.slice(), other.slice());
+    }
+};
+
+pub const ScheduleStatus = enum {
+    never,
+    ok,
+    queued,
+    failed,
+    late,
+    unknown,
+
+    /// Maps the daemon's `last_status` (null when it never ran).
+    pub fn fromDaemon(value: ?[]const u8) ScheduleStatus {
+        const text = value orelse return .never;
+        inline for (.{ "ok", "queued", "failed", "late" }) |name| {
+            if (std.mem.eql(u8, text, name)) return @field(ScheduleStatus, name);
+        }
+        return .unknown;
+    }
+};
+
+/// A host-local wall-clock moment, already converted from epoch ms.
+pub const LocalStamp = struct {
+    month: u8 = 1,
+    day: u8 = 1,
+    /// 0 = Sunday … 6 = Saturday, as in the daemon's `weekdays`.
+    weekday: u8 = 0,
+    hour: u8 = 0,
+    minute: u8 = 0,
+};
+
+pub const ScheduleRepeat = union(enum) {
+    once: struct {
+        at_ms: i64,
+        local: LocalStamp,
+        /// Within the coming week, so a weekday name is unambiguous.
+        this_week: bool,
+    },
+    interval: u32,
+    daily: struct {
+        hour: u8,
+        minute: u8,
+        /// Bit n = weekday n (0 = Sunday). Zero means every day.
+        weekdays: u7,
+    },
+    unknown,
+};
+
+/// One scheduled task as the panel lists it. Text is copied in so a row
+/// renders without touching daemon memory.
+pub const ScheduleRow = struct {
+    id: ScheduleId = .{},
+    name: ShortText = .{},
+    prompt: BodyText = .{},
+    prompt_truncated: bool = false,
+    repeat: ScheduleRepeat = .unknown,
+    /// Human repeat ("Weekdays at 09:00"), formatted once when listed.
+    repeat_text: ShortText = .{},
+    next_run_ms: ?i64 = null,
+    last_run_ms: ?i64 = null,
+    last_status: ScheduleStatus = .never,
+    last_error: ShortText = .{},
+    enabled: bool = false,
+};
+
+/// A daemon mutation a schedule control asked for.
+pub const ScheduleIntent = union(enum) {
+    set_enabled: struct { id: ScheduleId, enabled: bool },
+    run: ScheduleId,
+    delete: ScheduleId,
+};
+
+const WEEKDAY_SHORT = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+const WEEKDAY_PLURAL = [_][]const u8{ "Sundays", "Mondays", "Tuesdays", "Wednesdays", "Thursdays", "Fridays", "Saturdays" };
+const MONTH_SHORT = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+const WEEKDAYS_MASK: u7 = 0b0111110;
+const WEEKEND_MASK: u7 = 0b1000001;
+
+/// Human repeat text: "Weekdays at 09:00", "Every 2 hours",
+/// "Once · Tue 14:30". Pure; writes into `buffer` (64 bytes is plenty).
+pub fn formatScheduleRepeat(buffer: []u8, repeat: ScheduleRepeat) []const u8 {
+    return switch (repeat) {
+        .once => |once| if (once.this_week)
+            std.fmt.bufPrint(buffer, "Once · {s} {d:0>2}:{d:0>2}", .{ WEEKDAY_SHORT[once.local.weekday % 7], once.local.hour, once.local.minute }) catch ""
+        else
+            std.fmt.bufPrint(buffer, "Once · {s} {d} {d:0>2}:{d:0>2}", .{ MONTH_SHORT[(@max(once.local.month, 1) - 1) % 12], once.local.day, once.local.hour, once.local.minute }) catch "",
+        .interval => |minutes| formatInterval(buffer, minutes),
+        .daily => |daily| formatDaily(buffer, daily.hour, daily.minute, daily.weekdays),
+        .unknown => "Custom schedule",
+    };
+}
+
+fn formatInterval(buffer: []u8, minutes: u32) []const u8 {
+    const day: u32 = 24 * 60;
+    if (minutes == 0) return "Every few minutes";
+    if (minutes % day == 0) {
+        const days = minutes / day;
+        return if (days == 1) "Every day" else if (days == 7) "Every week" else std.fmt.bufPrint(buffer, "Every {d} days", .{days}) catch "";
+    }
+    if (minutes % 60 == 0) {
+        const hours = minutes / 60;
+        return if (hours == 1) "Every hour" else std.fmt.bufPrint(buffer, "Every {d} hours", .{hours}) catch "";
+    }
+    if (minutes > 60 and minutes % 30 == 0) return std.fmt.bufPrint(buffer, "Every {d}.5 hours", .{minutes / 60}) catch "";
+    return std.fmt.bufPrint(buffer, "Every {d} minutes", .{minutes}) catch "";
+}
+
+fn formatDaily(buffer: []u8, hour: u8, minute: u8, weekdays: u7) []const u8 {
+    if (weekdays == 0 or weekdays == std.math.maxInt(u7)) return std.fmt.bufPrint(buffer, "Daily at {d:0>2}:{d:0>2}", .{ hour, minute }) catch "";
+    if (weekdays == WEEKDAYS_MASK) return std.fmt.bufPrint(buffer, "Weekdays at {d:0>2}:{d:0>2}", .{ hour, minute }) catch "";
+    if (weekdays == WEEKEND_MASK) return std.fmt.bufPrint(buffer, "Weekends at {d:0>2}:{d:0>2}", .{ hour, minute }) catch "";
+    if (@popCount(weekdays) == 1) return std.fmt.bufPrint(buffer, "{s} at {d:0>2}:{d:0>2}", .{ WEEKDAY_PLURAL[@ctz(weekdays)], hour, minute }) catch "";
+    // Listed Monday first, Sunday last, the way people say a week.
+    var len: usize = 0;
+    for ([_]u3{ 1, 2, 3, 4, 5, 6, 0 }) |day| {
+        if (weekdays & (@as(u7, 1) << day) == 0) continue;
+        const part = std.fmt.bufPrint(buffer[len..], "{s}{s}", .{ if (len == 0) "" else ", ", WEEKDAY_SHORT[day] }) catch return "";
+        len += part.len;
+    }
+    const tail = std.fmt.bufPrint(buffer[len..], " at {d:0>2}:{d:0>2}", .{ hour, minute }) catch return "";
+    return buffer[0 .. len + tail.len];
+}
+
+/// "Next: in 3h", or "Paused" for a disabled schedule.
+pub fn formatScheduleNext(buffer: []u8, enabled: bool, next_run_ms: ?i64, now_ms: i64) []const u8 {
+    if (!enabled) return "Paused";
+    const next = next_run_ms orelse return "Not scheduled";
+    const delta_ms = next - now_ms;
+    if (delta_ms <= 30 * std.time.ms_per_s) return "Next: now";
+    const minutes: i64 = @max(@divFloor(delta_ms + std.time.ms_per_min - 1, std.time.ms_per_min), 1);
+    if (minutes < 60) return std.fmt.bufPrint(buffer, "Next: in {d}m", .{minutes}) catch "";
+    const hours = @divFloor(minutes, 60);
+    if (hours < 24) {
+        const rest = @mod(minutes, 60);
+        if (hours >= 3 or rest == 0) return std.fmt.bufPrint(buffer, "Next: in {d}h", .{hours}) catch "";
+        return std.fmt.bufPrint(buffer, "Next: in {d}h {d}m", .{ hours, rest }) catch "";
+    }
+    return std.fmt.bufPrint(buffer, "Next: in {d}d", .{@divFloor(hours, 24)}) catch "";
+}
+
+/// "Last run ok · 2h ago", "Never run", …
+pub fn formatScheduleLast(buffer: []u8, status: ScheduleStatus, last_run_ms: ?i64, now_ms: i64) []const u8 {
+    const label: []const u8 = switch (status) {
+        .never => return "Never run",
+        .ok => "Last run ok",
+        .queued => "Queued behind a busy chat",
+        .failed => "Last run failed",
+        .late => "Ran late",
+        .unknown => "Last run",
+    };
+    const last = last_run_ms orelse return label;
+    const minutes = @divFloor(@max(now_ms - last, 0), std.time.ms_per_min);
+    if (minutes < 1) return std.fmt.bufPrint(buffer, "{s} · just now", .{label}) catch label;
+    if (minutes < 60) return std.fmt.bufPrint(buffer, "{s} · {d}m ago", .{ label, minutes }) catch label;
+    if (minutes < 24 * 60) return std.fmt.bufPrint(buffer, "{s} · {d}h ago", .{ label, @divFloor(minutes, 60) }) catch label;
+    return std.fmt.bufPrint(buffer, "{s} · {d}d ago", .{ label, @divFloor(minutes, 24 * 60) }) catch label;
+}
+
 pub const BrainProvider = struct {
     label: ShortText = .{},
     selected: bool = false,
@@ -686,6 +887,24 @@ orders_mode: bool = false,
 /// Set when the user comes back after a while; offers a "catch me up".
 recap_available: bool = false,
 recap_minutes: u32 = 0,
+/// Conversation or the scheduled-tasks list, below the header.
+view: PanelView = .conversation,
+schedules: [MAX_SCHEDULE_ROWS]ScheduleRow = [_]ScheduleRow{.{}} ** MAX_SCHEDULE_ROWS,
+schedule_count: usize = 0,
+/// Schedules the daemon has, which may exceed what the panel keeps.
+schedule_total: usize = 0,
+/// Set once the first list landed; until then the view says it is loading.
+schedules_loaded: bool = false,
+/// Last list or mutation failure; empty when the latest request succeeded.
+schedules_error: ShortText = .{},
+/// Row whose delete asks "Delete?" inline.
+schedule_confirm: ScheduleId = .{},
+/// Row showing its selectable name and prompt detail.
+schedule_expanded: ScheduleId = .{},
+/// Row with a run or delete in flight.
+schedule_pending: ScheduleId = .{},
+schedules_scroll_y: f32 = 0.0,
+schedules_max_scroll: f32 = 0.0,
 frame_width: f32 = 0.0,
 frame_height: f32 = 0.0,
 hits: [160]Hit = undefined,
@@ -859,7 +1078,134 @@ pub fn collapse(self: *Self) void {
     self.menu = .none;
     self.rename_mode = false;
     self.orders_mode = false;
+    // Reopening goes straight to typing, so it shows the conversation.
+    self.view = .conversation;
+    self.schedule_confirm.clear();
     self.visibility = .collapsed_chip;
+}
+
+/// Switches the panel body; selection and pending confirmations belong to
+/// the view they were made in.
+pub fn setView(self: *Self, view: PanelView) void {
+    if (self.view == view) return;
+    self.clearTextSelection();
+    self.conversation_focused = false;
+    self.menu = .none;
+    self.schedule_confirm.clear();
+    self.schedules_scroll_y = 0.0;
+    self.view = view;
+}
+
+pub fn toggleSchedulesView(self: *Self) void {
+    self.setView(if (self.view == .schedules) .conversation else .schedules);
+}
+
+/// Replaces the listed schedules. Expanded and confirming rows survive by
+/// id; a row that disappeared drops its detail selection.
+pub fn setSchedules(self: *Self, rows: []const ScheduleRow, total: usize) void {
+    const n = @min(rows.len, self.schedules.len);
+    @memcpy(self.schedules[0..n], rows[0..n]);
+    self.schedule_count = n;
+    self.schedule_total = @max(total, n);
+    self.schedules_loaded = true;
+    self.schedules_error = .{};
+    if (!self.schedule_confirm.isEmpty() and self.scheduleIndex(&self.schedule_confirm) == null) self.schedule_confirm.clear();
+    if (!self.schedule_expanded.isEmpty() and self.scheduleIndex(&self.schedule_expanded) == null) {
+        self.schedule_expanded.clear();
+        if (self.view == .schedules) self.clearTextSelection();
+    }
+}
+
+pub fn setSchedulesError(self: *Self, message: []const u8) void {
+    self.schedules_error.set(message);
+}
+
+pub fn scheduleIndex(self: *const Self, id: *const ScheduleId) ?usize {
+    for (self.schedules[0..self.schedule_count], 0..) |*row, index| {
+        if (row.id.eql(id)) return index;
+    }
+    return null;
+}
+
+pub fn enabledScheduleCount(self: *const Self) usize {
+    var count: usize = 0;
+    for (self.schedules[0..self.schedule_count]) |row| {
+        if (row.enabled) count += 1;
+    }
+    return count;
+}
+
+pub fn scheduleConfirming(self: *const Self, index: usize) bool {
+    return index < self.schedule_count and self.schedules[index].id.eql(&self.schedule_confirm);
+}
+
+pub fn scheduleExpanded(self: *const Self, index: usize) bool {
+    return index < self.schedule_count and self.schedules[index].id.eql(&self.schedule_expanded);
+}
+
+pub fn schedulePending(self: *const Self, index: usize) bool {
+    return index < self.schedule_count and self.schedules[index].id.eql(&self.schedule_pending);
+}
+
+/// A press anywhere but the confirming row's Yes / No / × backs out of the
+/// inline "Delete?".
+pub fn dismissScheduleConfirmUnless(self: *Self, action: ?HitAction, index: usize) void {
+    if (self.schedule_confirm.isEmpty()) return;
+    if (action) |value| switch (value) {
+        .schedule_delete, .schedule_delete_confirm, .schedule_delete_cancel => if (self.scheduleConfirming(index)) return,
+        else => {},
+    };
+    self.schedule_confirm.clear();
+}
+
+/// Applies a schedule control locally and returns the daemon mutation it
+/// needs, if any. Enabling flips the row at once; the next list confirms it.
+pub fn handleScheduleAction(self: *Self, action: HitAction, index: usize) ?ScheduleIntent {
+    if (index >= self.schedule_count) return null;
+    const row = &self.schedules[index];
+    switch (action) {
+        .schedule_toggle => {
+            row.enabled = !row.enabled;
+            return .{ .set_enabled = .{ .id = row.id, .enabled = row.enabled } };
+        },
+        .schedule_run => {
+            if (self.schedulePending(index)) return null;
+            self.schedule_pending = row.id;
+            return .{ .run = row.id };
+        },
+        .schedule_delete => {
+            if (self.scheduleConfirming(index)) {
+                self.schedule_confirm.clear();
+            } else {
+                self.schedule_confirm = row.id;
+            }
+            return null;
+        },
+        .schedule_delete_cancel => {
+            self.schedule_confirm.clear();
+            return null;
+        },
+        .schedule_delete_confirm => {
+            if (!self.scheduleConfirming(index)) return null;
+            self.schedule_confirm.clear();
+            self.schedule_pending = row.id;
+            return .{ .delete = row.id };
+        },
+        .schedule_expand => {
+            self.clearTextSelection();
+            if (self.scheduleExpanded(index)) {
+                self.schedule_expanded.clear();
+            } else {
+                self.schedule_expanded = row.id;
+            }
+            return null;
+        },
+        else => return null,
+    }
+}
+
+pub fn scrollSchedules(self: *Self, delta: f32) void {
+    self.schedules_scroll_y = std.math.clamp(self.schedules_scroll_y + delta, 0.0, self.schedules_max_scroll);
 }
 
 pub fn openMenu(self: *Self, menu: Menu) void {
@@ -871,8 +1217,9 @@ pub fn closeMenu(self: *Self) void {
     self.menu = .none;
 }
 
-/// Escape peels one layer: menu, then rename, then the panel itself. The
-/// whole physical key press (down, repeats, up) stays Companion-owned.
+/// Escape peels one layer: menu, selection, an inline "Delete?", rename,
+/// the schedules view, then the panel itself. The whole physical key press
+/// (down, repeats, up) stays Companion-owned.
 pub fn handleEscapeKey(self: *Self, down: bool) bool {
     if (!down) {
         if (!self.escape_key_captured) return false;
@@ -886,9 +1233,13 @@ pub fn handleEscapeKey(self: *Self, down: bool) bool {
         self.menu = .none;
     } else if (self.textRange() != null) {
         self.clearTextSelection();
+    } else if (!self.schedule_confirm.isEmpty()) {
+        self.schedule_confirm.clear();
     } else if (self.rename_mode or self.orders_mode) {
         self.rename_mode = false;
         self.orders_mode = false;
+    } else if (self.view == .schedules) {
+        self.setView(.conversation);
     } else {
         self.collapse();
     }
@@ -1329,4 +1680,131 @@ test "text selection orders its ends and a still click selects nothing" {
     companion.clearTextSelection();
     try std.testing.expect(companion.textRange() == null);
     try std.testing.expectEqual(Menu.none, companion.menu);
+}
+
+fn testScheduleRow(id: []const u8, enabled: bool) ScheduleRow {
+    var row: ScheduleRow = .{ .enabled = enabled };
+    std.debug.assert(row.id.set(id));
+    row.name.set(id);
+    return row;
+}
+
+test "schedule repeat formats as people say it" {
+    var buffer: [96]u8 = undefined;
+    try std.testing.expectEqualStrings("Weekdays at 09:00", formatScheduleRepeat(&buffer, .{ .daily = .{ .hour = 9, .minute = 0, .weekdays = 0b0111110 } }));
+    try std.testing.expectEqualStrings("Daily at 18:05", formatScheduleRepeat(&buffer, .{ .daily = .{ .hour = 18, .minute = 5, .weekdays = 0 } }));
+    try std.testing.expectEqualStrings("Daily at 07:30", formatScheduleRepeat(&buffer, .{ .daily = .{ .hour = 7, .minute = 30, .weekdays = 0b1111111 } }));
+    try std.testing.expectEqualStrings("Weekends at 10:00", formatScheduleRepeat(&buffer, .{ .daily = .{ .hour = 10, .minute = 0, .weekdays = 0b1000001 } }));
+    try std.testing.expectEqualStrings("Mondays at 08:15", formatScheduleRepeat(&buffer, .{ .daily = .{ .hour = 8, .minute = 15, .weekdays = 0b0000010 } }));
+    try std.testing.expectEqualStrings("Mon, Wed, Sun at 12:00", formatScheduleRepeat(&buffer, .{ .daily = .{ .hour = 12, .minute = 0, .weekdays = 0b0001011 } }));
+    try std.testing.expectEqualStrings("Every 2 hours", formatScheduleRepeat(&buffer, .{ .interval = 120 }));
+    try std.testing.expectEqualStrings("Every hour", formatScheduleRepeat(&buffer, .{ .interval = 60 }));
+    try std.testing.expectEqualStrings("Every 1.5 hours", formatScheduleRepeat(&buffer, .{ .interval = 90 }));
+    try std.testing.expectEqualStrings("Every 45 minutes", formatScheduleRepeat(&buffer, .{ .interval = 45 }));
+    try std.testing.expectEqualStrings("Every day", formatScheduleRepeat(&buffer, .{ .interval = 1440 }));
+    try std.testing.expectEqualStrings("Every week", formatScheduleRepeat(&buffer, .{ .interval = 10080 }));
+    try std.testing.expectEqualStrings("Every 3 days", formatScheduleRepeat(&buffer, .{ .interval = 4320 }));
+    const tuesday: LocalStamp = .{ .month = 10, .day = 20, .weekday = 2, .hour = 14, .minute = 30 };
+    try std.testing.expectEqualStrings("Once · Tue 14:30", formatScheduleRepeat(&buffer, .{ .once = .{ .at_ms = 0, .local = tuesday, .this_week = true } }));
+    try std.testing.expectEqualStrings("Once · Oct 20 14:30", formatScheduleRepeat(&buffer, .{ .once = .{ .at_ms = 0, .local = tuesday, .this_week = false } }));
+    try std.testing.expectEqualStrings("Custom schedule", formatScheduleRepeat(&buffer, .unknown));
+}
+
+test "schedule next and last run read relative to now" {
+    var buffer: [96]u8 = undefined;
+    const now: i64 = 1_792_430_000_000;
+    const minute: i64 = std.time.ms_per_min;
+    try std.testing.expectEqualStrings("Paused", formatScheduleNext(&buffer, false, now + 60 * minute, now));
+    try std.testing.expectEqualStrings("Not scheduled", formatScheduleNext(&buffer, true, null, now));
+    try std.testing.expectEqualStrings("Next: now", formatScheduleNext(&buffer, true, now - minute, now));
+    try std.testing.expectEqualStrings("Next: in 5m", formatScheduleNext(&buffer, true, now + 5 * minute, now));
+    try std.testing.expectEqualStrings("Next: in 1h 20m", formatScheduleNext(&buffer, true, now + 80 * minute, now));
+    try std.testing.expectEqualStrings("Next: in 3h", formatScheduleNext(&buffer, true, now + 200 * minute, now));
+    try std.testing.expectEqualStrings("Next: in 2d", formatScheduleNext(&buffer, true, now + 50 * 60 * minute, now));
+    try std.testing.expectEqualStrings("Never run", formatScheduleLast(&buffer, .never, null, now));
+    try std.testing.expectEqualStrings("Last run ok · 2h ago", formatScheduleLast(&buffer, .ok, now - 125 * minute, now));
+    try std.testing.expectEqualStrings("Last run failed · just now", formatScheduleLast(&buffer, .failed, now - 1000, now));
+    try std.testing.expectEqualStrings("Ran late · 3d ago", formatScheduleLast(&buffer, .late, now - 3 * 24 * 60 * minute, now));
+    try std.testing.expectEqual(ScheduleStatus.queued, ScheduleStatus.fromDaemon("queued"));
+    try std.testing.expectEqual(ScheduleStatus.never, ScheduleStatus.fromDaemon(null));
+    try std.testing.expectEqual(ScheduleStatus.unknown, ScheduleStatus.fromDaemon("exploded"));
+}
+
+test "schedule controls toggle, run once, and delete only after an inline confirm" {
+    var companion = Self.init();
+    const rows = [_]ScheduleRow{ testScheduleRow("sch-1", true), testScheduleRow("sch-2", false) };
+    companion.setSchedules(&rows, 2);
+    try std.testing.expect(companion.schedules_loaded);
+    try std.testing.expectEqual(@as(usize, 1), companion.enabledScheduleCount());
+
+    const enable = companion.handleScheduleAction(.schedule_toggle, 1).?;
+    try std.testing.expectEqualStrings("sch-2", enable.set_enabled.id.slice());
+    try std.testing.expect(enable.set_enabled.enabled);
+    try std.testing.expectEqual(@as(usize, 2), companion.enabledScheduleCount());
+
+    try std.testing.expectEqualStrings("sch-1", companion.handleScheduleAction(.schedule_run, 0).?.run.slice());
+    // A second press while the run is in flight sends nothing.
+    try std.testing.expect(companion.handleScheduleAction(.schedule_run, 0) == null);
+
+    // × only asks; Yes on another row does nothing; Yes on the row deletes.
+    try std.testing.expect(companion.handleScheduleAction(.schedule_delete, 1) == null);
+    try std.testing.expect(companion.scheduleConfirming(1));
+    try std.testing.expect(companion.handleScheduleAction(.schedule_delete_confirm, 0) == null);
+    companion.dismissScheduleConfirmUnless(.schedule_delete_confirm, 1);
+    try std.testing.expect(companion.scheduleConfirming(1));
+    const delete = companion.handleScheduleAction(.schedule_delete_confirm, 1).?;
+    try std.testing.expectEqualStrings("sch-2", delete.delete.slice());
+    try std.testing.expect(!companion.scheduleConfirming(1));
+
+    // No backs out, and so does a press anywhere else.
+    _ = companion.handleScheduleAction(.schedule_delete, 0);
+    _ = companion.handleScheduleAction(.schedule_delete_cancel, 0);
+    try std.testing.expect(!companion.scheduleConfirming(0));
+    _ = companion.handleScheduleAction(.schedule_delete, 0);
+    companion.dismissScheduleConfirmUnless(.schedule_run, 1);
+    try std.testing.expect(!companion.scheduleConfirming(0));
+    try std.testing.expect(companion.handleScheduleAction(.schedule_toggle, 9) == null);
+}
+
+test "schedules view keeps expanded rows by id and escape steps back out" {
+    var companion = Self.init();
+    companion.show();
+    var rows = [_]ScheduleRow{ testScheduleRow("sch-1", true), testScheduleRow("sch-2", true) };
+    companion.setSchedules(&rows, 30);
+    try std.testing.expectEqual(@as(usize, 30), companion.schedule_total);
+    companion.toggleSchedulesView();
+    try std.testing.expectEqual(PanelView.schedules, companion.view);
+    _ = companion.handleScheduleAction(.schedule_expand, 1);
+    try std.testing.expect(companion.scheduleExpanded(1));
+    // The daemon re-sorted: the expanded row follows its id.
+    std.mem.swap(ScheduleRow, &rows[0], &rows[1]);
+    companion.setSchedules(&rows, 2);
+    try std.testing.expect(companion.scheduleExpanded(0));
+    companion.setSchedules(rows[1..], 1);
+    try std.testing.expect(companion.schedule_expanded.isEmpty());
+
+    _ = companion.handleScheduleAction(.schedule_delete, 0);
+    try std.testing.expect(companion.handleEscapeKey(true));
+    try std.testing.expect(companion.handleEscapeKey(false));
+    try std.testing.expect(companion.schedule_confirm.isEmpty());
+    try std.testing.expectEqual(PanelView.schedules, companion.view);
+    try std.testing.expect(companion.handleEscapeKey(true));
+    try std.testing.expect(companion.handleEscapeKey(false));
+    try std.testing.expectEqual(PanelView.conversation, companion.view);
+    try std.testing.expectEqual(Visibility.sidecar_open, companion.visibility);
+
+    companion.toggleSchedulesView();
+    companion.collapse();
+    try std.testing.expectEqual(PanelView.conversation, companion.view);
+}
+
+test "schedule ids are exact or rejected" {
+    var id: ScheduleId = .{};
+    try std.testing.expect(id.isEmpty());
+    try std.testing.expect(id.set("sch-1792430000000-ab12"));
+    try std.testing.expect(!id.set(""));
+    try std.testing.expect(!id.set("a" ** 80));
+    try std.testing.expectEqualStrings("sch-1792430000000-ab12", id.slice());
+    const empty: ScheduleId = .{};
+    try std.testing.expect(!empty.eql(&empty));
 }

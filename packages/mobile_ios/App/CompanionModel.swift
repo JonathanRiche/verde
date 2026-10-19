@@ -26,7 +26,13 @@ final class CompanionModel {
     /// Keeps the not-yet-saved starter Sprout the same companion across refreshes.
     @ObservationIgnored private(set) var starterID = Roster.newID()
 
-    init(browse: BrowseModel) { self.browse = browse }
+    /// Scheduled tasks on this host (the sheet's "Scheduled" entry).
+    let schedules: ScheduleModel
+
+    init(browse: BrowseModel) {
+        self.browse = browse
+        schedules = ScheduleModel(browse: browse)
+    }
 
     // MARK: Derived state
 

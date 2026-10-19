@@ -1,7 +1,8 @@
 //! Machine-wide Companion overlay: a character dock that summarizes what is
 //! running and what needs the user, and an orchestration panel with the
-//! needs-you inbox, the companion's crew of delegated chats, the conversation,
-//! and the shared composer. Characters are vector art drawn from the theme.
+//! needs-you inbox, the companion's crew of delegated chats, the conversation
+//! or the scheduled-tasks view, and the shared composer. Characters are vector
+//! art drawn from the theme.
 
 const std = @import("std");
 const palette = @import("palette");
@@ -13,6 +14,7 @@ const theme = @import("theme.zig");
 const text_measure = @import("text_measure.zig");
 const context_menu = @import("context_menu.zig");
 const profiler = @import("../runtime/profiler.zig");
+const platform_runtime = @import("platform_runtime");
 
 // Keep settings_modal tests on the registered root suite without editing main.zig.
 test {
@@ -61,6 +63,26 @@ const LINE_HEIGHT_FACTOR: f32 = 1.45;
 const MAX_WRAP_LINES: usize = 64;
 const USER_MAX_LINES: usize = 10;
 const ASSISTANT_MAX_LINES: usize = 64;
+/// Scheduled-tasks view: a summary row per schedule, controls on its right.
+const SCHEDULE_ROW_HEIGHT: f32 = 62.0;
+const SCHEDULE_ROW_GAP: f32 = 8.0;
+const SCHEDULE_CONTROL_H: f32 = 24.0;
+const SCHEDULE_TOGGLE_W: f32 = 30.0;
+const SCHEDULE_TOGGLE_H: f32 = 16.0;
+const SCHEDULE_RUN_W: f32 = 46.0;
+const SCHEDULE_YES_W: f32 = 44.0;
+const SCHEDULE_NO_W: f32 = 40.0;
+const SCHEDULE_DETAIL_FONT: f32 = 12.0;
+const SCHEDULE_NAME_MAX_LINES: usize = 3;
+const SCHEDULE_PROMPT_MAX_LINES: usize = 14;
+const SCHEDULE_ERROR_MAX_LINES: usize = 4;
+/// Name, prompt, and last error of the expanded row.
+const MAX_SCHEDULE_BLOCKS: usize = 3;
+/// Example the empty state puts in the composer (not sent).
+pub const SCHEDULE_SUGGESTION = "Every weekday at 9:00, check CI for every workspace and tell me what failed.";
+/// Codicon "watch" (a clock face) for the header's scheduled-tasks button.
+const NF_COD_WATCH = "\u{EB7B}";
+const NF_COD_CLOSE = "\u{EA76}";
 
 pub const Geometry = struct {
     window: palette.Rect,
@@ -79,10 +101,15 @@ pub const Geometry = struct {
     prev_button: palette.Rect,
     next_button: palette.Rect,
     new_button: palette.Rect,
+    /// Clock: toggles the scheduled-tasks view.
+    schedules_button: palette.Rect,
     close_button: palette.Rect,
     inbox: palette.Rect,
     crew: palette.Rect,
+    /// Zero-sized while the schedules view replaces it.
     conversation: palette.Rect,
+    /// Scheduled-tasks view body; zero-sized in the conversation view.
+    schedules: palette.Rect,
     approval: palette.Rect,
     error_strip: palette.Rect,
     recap: palette.Rect,
@@ -97,6 +124,9 @@ pub fn refreshHits(state: *runtime.AppState, width: f32, height: f32) void {
     }
     state.syncCompanionProjection();
     const companion = &state.companion_controller;
+    const schedules = state.companion_schedules.tick(companion, state.storage.pref_path, companion.visibility == .sidecar_open, platform_runtime.unixTimestampMs());
+    if (schedules.ran) state.setSidebarNotice("Scheduled task started.");
+    if (schedules.changed) state.markDirty();
     companion.frame_width = width;
     companion.frame_height = height;
     const geometry = computeGeometry(state, width, height);
@@ -128,6 +158,7 @@ pub fn handleMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, d
     }
     if (down and !result.consumed) companion.conversation_focused = false;
     if (!result.consumed) return false;
+    if (down and button == 1) companion.dismissScheduleConfirmUnless(result.action, result.index);
     if (down and companion.visibility == .sidecar_open and companion.menu == .none and
         handleConversationPress(state, x, y, button, clicks, result.action)) return true;
     if (result.action) |action| {
@@ -167,6 +198,20 @@ pub fn handleMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, d
             .crew_open => state.openCompanionChatRow(false, result.index),
             .inbox_open => state.openCompanionChatRow(true, result.index),
             .suggestion => state.sendCompanionSuggestion(result.index),
+            .schedules_view => {
+                state.companion_controller.toggleSchedulesView();
+                state.companion_schedules.requestRefresh();
+            },
+            .schedule_toggle, .schedule_run, .schedule_delete, .schedule_delete_confirm, .schedule_delete_cancel, .schedule_expand => {
+                if (state.companion_controller.handleScheduleAction(action, result.index)) |intent| {
+                    if (!state.companion_schedules.submit(intent)) {
+                        state.companion_controller.schedule_pending.clear();
+                        state.companion_controller.setSchedulesError("Too many schedule changes at once. Try again in a moment.");
+                        state.companion_schedules.requestRefresh();
+                    }
+                }
+            },
+            .schedule_suggestion => state.prefillCompanionComposer(SCHEDULE_SUGGESTION),
             .panel, .body => {},
         }
         if (action != .panel and action != .body) refreshAfterAction(state);
@@ -180,11 +225,12 @@ pub fn handleMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, d
 }
 
 /// Starts a selection (click/drag, double-click word, triple-click message)
-/// or opens the Copy / Select all menu on right-click in the conversation.
+/// or opens the Copy / Select all menu on right-click in the conversation or
+/// an expanded schedule's detail.
 fn handleConversationPress(state: *runtime.AppState, x: f32, y: f32, button: u8, clicks: u8, action: ?controller.HitAction) bool {
     const companion = &state.companion_controller;
     const geometry = computeGeometry(state, companion.frame_width, companion.frame_height);
-    const on_text = pointInRect(geometry.conversation, x, y) and (action == null or action.? == .body);
+    const on_text = pointInRect(textArea(state, geometry), x, y) and (action == null or action.? == .body);
     if (!on_text) {
         // Clicking elsewhere in the panel (the composer, blank chrome) drops it.
         if (button == 1 and action != null and action.? == .panel) {
@@ -193,7 +239,7 @@ fn handleConversationPress(state: *runtime.AppState, x: f32, y: f32, button: u8,
         }
         return false;
     }
-    const point = conversationPointAt(state, geometry.conversation, x, y) orelse return false;
+    const point = textPointAt(state, geometry, x, y) orelse return false;
     switch (button) {
         1 => {
             if (clicks >= 3) {
@@ -243,11 +289,15 @@ pub fn handleMouseMotion(state: *runtime.AppState, x: f32, y: f32, dragging: boo
     if (!state.isCompanionEnabled()) return false;
     const companion = &state.companion_controller;
     if (companion.text_dragging) {
-        const conversation = computeGeometry(state, companion.frame_width, companion.frame_height).conversation;
-        // Dragging past the top or bottom edge scrolls the conversation along.
-        if (y < conversation.y) companion.scrollConversation(-@min(conversation.y - y, companionScaled(24.0)));
-        if (y > conversation.y + conversation.h) companion.scrollConversation(@min(y - conversation.y - conversation.h, companionScaled(24.0)));
-        if (conversationPointAt(state, conversation, x, y)) |point| companion.extendTextSelection(point);
+        const geometry = computeGeometry(state, companion.frame_width, companion.frame_height);
+        const schedules = companion.view == .schedules;
+        const area = if (schedules) schedulesLayout(state, geometry).list else geometry.conversation;
+        // Dragging past the top or bottom edge scrolls the text along.
+        const step: f32 = if (y < area.y) -@min(area.y - y, companionScaled(24.0)) else if (y > area.y + area.h) @min(y - area.y - area.h, companionScaled(24.0)) else 0.0;
+        if (step != 0.0) {
+            if (schedules) companion.scrollSchedules(step) else companion.scrollConversation(step);
+        }
+        if (textPointAt(state, geometry, x, y)) |point| companion.extendTextSelection(point);
         state.markDirty();
         return true;
     }
@@ -279,6 +329,11 @@ pub fn handleWheel(state: *runtime.AppState, x: f32, y: f32, wheel_y: f32) bool 
     }
     if (companion.menu != .none) return true;
     if (state.routeCompanionComposerWheel(x, y, wheel_y)) return true;
+    if (companion.view == .schedules and pointInRect(geometry.schedules, x, y)) {
+        companion.scrollSchedules(delta);
+        state.markDirty();
+        return true;
+    }
     if (pointInRect(geometry.conversation, x, y)) {
         companion.scrollConversation(delta);
         state.markDirty();
@@ -311,8 +366,9 @@ pub fn resetInputCaptures(state: *runtime.AppState) void {
     state.companion_controller.resetInputCaptures();
 }
 
-/// OS cursor over the Companion: an I-beam over selectable conversation text
-/// and the composer, a pointer over controls, grabbing while the bubble is
+/// OS cursor over the Companion: an I-beam over selectable conversation or
+/// schedule-detail text and the composer, a pointer over controls (schedule
+/// rows and their toggle, Run, and delete included), grabbing while the bubble is
 /// dragged; the arrow over plain chrome. Null when the Companion is not hit.
 pub fn systemCursorAt(state: *runtime.AppState, x: f32, y: f32) ?palette.platform.CursorShape {
     if (!state.isCompanionEnabled()) return null;
@@ -322,7 +378,7 @@ pub fn systemCursorAt(state: *runtime.AppState, x: f32, y: f32) ?palette.platfor
     const action = companion.hitAt(x, y) orelse return null;
     return switch (action) {
         .menu_dismiss => .default,
-        .body => if (companion.menu == .none and overConversationText(state, x, y)) .text else .default,
+        .body => if (companion.menu == .none and (overConversationText(state, x, y) or overScheduleText(state, x, y))) .text else .default,
         .panel => composerCursorAt(state, x, y),
         else => .pointer,
     };
@@ -489,18 +545,21 @@ fn computeGeometryAt(state: *runtime.AppState, width: f32, height: f32, s: f32) 
     const button_y = header.y + (header.h - button) * 0.5;
     const close_button: palette.Rect = .{ .x = header.x + header.w - 12.0 * s - button, .y = button_y, .w = button, .h = button };
     const new_button: palette.Rect = .{ .x = close_button.x - 6.0 * s - button, .y = button_y, .w = button, .h = button };
+    const schedules_button: palette.Rect = .{ .x = new_button.x - 6.0 * s - button, .y = button_y, .w = button, .h = button };
     const switcher = companion.identity.count > 1;
-    const next_button: palette.Rect = if (switcher) .{ .x = new_button.x - 10.0 * s - button, .y = button_y, .w = button, .h = button } else .{};
+    const next_button: palette.Rect = if (switcher) .{ .x = schedules_button.x - 10.0 * s - button, .y = button_y, .w = button, .h = button } else .{};
     const prev_button: palette.Rect = if (switcher) .{ .x = next_button.x - 2.0 * s - button, .y = button_y, .w = button, .h = button } else .{};
     const avatar: palette.Rect = .{ .x = header.x + 12.0 * s, .y = header.y + 9.0 * s, .w = 44.0 * s, .h = 46.0 * s };
     const text_x = avatar.x + avatar.w + 10.0 * s;
-    const text_right = (if (switcher) prev_button.x else new_button.x) - 8.0 * s;
+    const text_right = (if (switcher) prev_button.x else schedules_button.x) - 8.0 * s;
     const name_w = @min(text_measure.textWidth(.ui_bold, 15.0 * s, companion.identity.name.slice()) + 22.0 * s, @max(text_right - text_x, 0.0));
     const name_button: palette.Rect = .{ .x = text_x - 4.0 * s, .y = header.y + 10.0 * s, .w = name_w + 4.0 * s, .h = 24.0 * s };
     const brain_w = @min(text_measure.textWidth(.ui, 11.0 * s, companion.identity.brain.slice()) + 40.0 * s, @max(text_right - text_x, 0.0));
     const brain_button: palette.Rect = .{ .x = text_x - 4.0 * s, .y = header.y + 35.0 * s, .w = brain_w + 4.0 * s, .h = 20.0 * s };
 
     // Body stack between header and footer: inbox, crew, conversation, approval.
+    // The schedules view takes the inbox, crew, and conversation's place.
+    const schedules_view = companion.view == .schedules;
     var top = header.y + header.h;
     var bottom = footer.y;
     const inner_x = panel.x + CONTENT_INSET * s;
@@ -516,15 +575,17 @@ fn computeGeometryAt(state: *runtime.AppState, width: f32, height: f32, s: f32) 
     const recap: palette.Rect = .{ .x = inner_x, .y = bottom - recap_h, .w = inner_w, .h = @max(recap_h - 8.0 * s, 0.0) };
     bottom -= recap_h;
 
-    const inbox_rows = @min(companion.inbox_count, MAX_INBOX_ROWS_SHOWN);
+    const inbox_rows = if (schedules_view) 0 else @min(companion.inbox_count, MAX_INBOX_ROWS_SHOWN);
     const inbox_h: f32 = if (inbox_rows == 0) 0.0 else (SECTION_TITLE_HEIGHT + @as(f32, @floatFromInt(inbox_rows)) * (INBOX_ROW_HEIGHT + ROW_GAP) + 6.0) * s;
     const inbox: palette.Rect = .{ .x = inner_x, .y = top + 8.0 * s, .w = inner_w, .h = @min(inbox_h, @max(bottom - top - 8.0 * s, 0.0)) };
     if (inbox_h > 0.0) top = inbox.y + inbox.h;
-    const crew_rows = @min(companion.crew_count, MAX_CREW_ROWS_SHOWN);
+    const crew_rows = if (schedules_view) 0 else @min(companion.crew_count, MAX_CREW_ROWS_SHOWN);
     const crew_h: f32 = if (crew_rows == 0) 0.0 else (SECTION_TITLE_HEIGHT + @as(f32, @floatFromInt(crew_rows)) * (CREW_ROW_HEIGHT + ROW_GAP) + 6.0) * s;
     const crew: palette.Rect = .{ .x = inner_x, .y = top + 8.0 * s, .w = inner_w, .h = @min(crew_h, @max(bottom - top - 8.0 * s, 0.0)) };
     if (crew_h > 0.0) top = crew.y + crew.h;
-    const conversation: palette.Rect = .{ .x = panel.x, .y = top + 4.0 * s, .w = panel.w, .h = @max(bottom - top - 4.0 * s, 0.0) };
+    const body: palette.Rect = .{ .x = panel.x, .y = top + 4.0 * s, .w = panel.w, .h = @max(bottom - top - 4.0 * s, 0.0) };
+    const conversation: palette.Rect = if (schedules_view) .{ .x = body.x, .y = body.y } else body;
+    const schedules: palette.Rect = if (schedules_view) body else .{ .x = body.x, .y = body.y };
 
     return .{
         .window = window,
@@ -540,10 +601,12 @@ fn computeGeometryAt(state: *runtime.AppState, width: f32, height: f32, s: f32) 
         .prev_button = prev_button,
         .next_button = next_button,
         .new_button = new_button,
+        .schedules_button = schedules_button,
         .close_button = close_button,
         .inbox = inbox,
         .crew = crew,
         .conversation = conversation,
+        .schedules = schedules,
         .approval = approval,
         .error_strip = error_strip,
         .recap = recap,
@@ -615,6 +678,7 @@ fn registerHits(state: *runtime.AppState, geometry: Geometry) void {
             // "+" starts a fresh conversation with this companion; adding a
             // whole new companion lives in the companion menu.
             companion.addHit(geometry.new_button, .menu_new_conversation);
+            companion.addHit(geometry.schedules_button, .schedules_view);
             companion.addHit(geometry.close_button, .collapse);
             for (0..@min(companion.inbox_count, MAX_INBOX_ROWS_SHOWN)) |index| {
                 const row = rowRect(geometry.inbox, index, INBOX_ROW_HEIGHT);
@@ -624,7 +688,8 @@ fn registerHits(state: *runtime.AppState, geometry: Geometry) void {
                 const row = rowRect(geometry.crew, index, CREW_ROW_HEIGHT);
                 if (row.y + row.h <= geometry.crew.y + geometry.crew.h + 1.0) companion.addIndexedHit(row, .crew_open, index);
             }
-            if (companion.presentation.activity_count == 0) {
+            if (companion.view == .schedules) registerScheduleHits(state, geometry);
+            if (companion.view == .conversation and companion.presentation.activity_count == 0) {
                 const layout = emptyStateLayout(geometry.conversation);
                 for (layout.suggestions, 0..) |rect, index| {
                     if (rectInside(rect, geometry.conversation)) companion.addIndexedHit(rect, .suggestion, index);
@@ -752,9 +817,13 @@ fn renderPanel(state: *runtime.AppState, geometry: Geometry) void {
     queueRoundedRectClipped(state, offsetRect(geometry.panel, 0.0, 4.0 * s), color(theme.scrim(0.24)), 14.0 * s, geometry.window);
     queuePanel(state, geometry.panel, color(surface()), color(chrome.border), 14.0 * s, 1.0 * s);
     renderHeader(state, geometry);
-    renderConversation(state, geometry);
-    renderInbox(state, geometry);
-    renderCrew(state, geometry);
+    if (state.companion_controller.view == .schedules) {
+        renderSchedules(state, geometry);
+    } else {
+        renderConversation(state, geometry);
+        renderInbox(state, geometry);
+        renderCrew(state, geometry);
+    }
     renderErrorStrip(state, geometry);
     renderRecap(state, geometry);
     renderApproval(state, geometry);
@@ -765,7 +834,10 @@ fn renderPanel(state: *runtime.AppState, geometry: Geometry) void {
         .brain => renderBrainMenu(state, geometry),
         .text => renderTextMenu(state, geometry),
     }
-    if (state.companion_controller.menu == .none) renderHeaderTooltip(state, geometry);
+    if (state.companion_controller.menu == .none) {
+        renderHeaderTooltip(state, geometry);
+        renderScheduleTooltip(state, geometry);
+    }
 }
 
 /// What each header control does, shown on hover (the glyphs alone are terse).
@@ -774,6 +846,8 @@ fn headerTooltipAt(state: *runtime.AppState, geometry: Geometry, x: f32, y: f32)
     const name = companion.identity.name.slice();
     if (pointInRect(geometry.new_button, x, y)) return .{ .target = geometry.new_button, .label = framePrint(state, "New conversation with {s}", .{name}) };
     if (pointInRect(geometry.close_button, x, y)) return .{ .target = geometry.close_button, .label = "Minimize" };
+    if (pointInRect(geometry.schedules_button, x, y))
+        return .{ .target = geometry.schedules_button, .label = if (companion.view == .schedules) "Back to conversation" else "Scheduled tasks" };
     if (companion.identity.count > 1) {
         if (pointInRect(geometry.prev_button, x, y)) return .{ .target = geometry.prev_button, .label = "Previous companion" };
         if (pointInRect(geometry.next_button, x, y)) return .{ .target = geometry.next_button, .label = "Next companion" };
@@ -833,6 +907,7 @@ fn renderHeader(state: *runtime.AppState, geometry: Geometry) void {
         renderHeaderButton(state, geometry.next_button, "›");
     }
     renderHeaderButton(state, geometry.new_button, "+");
+    renderSchedulesButton(state, geometry.schedules_button);
     renderHeaderButton(state, geometry.close_button, "−");
     const divider_inset = snappedStroke(1.0 * s);
     queueRect(state, .{ .x = header.x + divider_inset, .y = header.y + header.h - 1.0 * s, .w = @max(header.w - divider_inset * 2.0, 0.0), .h = 1.0 * s }, color(hairline()));
@@ -844,6 +919,41 @@ const NF_COD_CHEVRON_DOWN = "\u{EAB4}";
 
 fn queueChevronDown(state: *runtime.AppState, rect: palette.Rect, fill: palette.Color, clip: palette.Rect) void {
     state.palette_overlay_batch.roleText(state.allocator, nonNegativeRect(rect), NF_COD_CHEVRON_DOWN, fill, rect.h, .icon, null, nonNegativeRect(clip)) catch |err| log.warn("failed to queue chevron: {s}", .{@errorName(err)});
+}
+
+fn queueIcon(state: *runtime.AppState, rect: palette.Rect, glyph: []const u8, fill: palette.Color, clip: palette.Rect) void {
+    state.palette_overlay_batch.roleText(state.allocator, nonNegativeRect(rect), glyph, fill, rect.h, .icon, null, nonNegativeRect(clip)) catch |err| log.warn("failed to queue icon: {s}", .{@errorName(err)});
+}
+
+/// Badge text on the header clock: enabled schedules, or null when none.
+fn scheduleBadgeLabel(state: *runtime.AppState) ?[]const u8 {
+    const count = state.companion_controller.enabledScheduleCount();
+    if (count == 0) return null;
+    return if (count > 9) "9+" else framePrint(state, "{d}", .{count});
+}
+
+// Header clock: opens the scheduled-tasks view (accent ring while it is
+// shown) and badges how many schedules are enabled.
+fn renderSchedulesButton(state: *runtime.AppState, rect: palette.Rect) void {
+    if (rect.w <= 0.0 or rect.h <= 0.0) return;
+    const s = companionScale();
+    const chrome = theme.companionChrome();
+    const active = state.companion_controller.view == .schedules;
+    if (active) {
+        queuePanel(state, rect, color(opaqueOver(surface(), chrome.menu_selected)), color(chrome.accent), 7.0 * s, 1.0 * s);
+    } else {
+        queuePanel(state, rect, color(surface()), color(hairline()), 7.0 * s, 1.0 * s);
+    }
+    const icon = 15.0 * s;
+    queueIcon(state, .{ .x = rect.x + (rect.w - icon) * 0.5, .y = rect.y + (rect.h - icon) * 0.5, .w = icon, .h = icon }, NF_COD_WATCH, color(if (active) chrome.accent else chrome.text_muted), rect);
+    const label = scheduleBadgeLabel(state) orelse return;
+    const font = 9.0 * s;
+    const badge_h = 14.0 * s;
+    const label_w = text_measure.textWidth(.ui_bold, font, label);
+    const badge_w = @max(badge_h, label_w + 7.0 * s);
+    const badge: palette.Rect = .{ .x = rect.x + rect.w - badge_w + 4.0 * s, .y = rect.y - 4.0 * s, .w = badge_w, .h = badge_h };
+    queuePanel(state, badge, color(chrome.accent), color(surface()), badge_h * 0.5, 1.0 * s);
+    queueBoldText(state, .{ .x = badge.x + (badge.w - label_w) * 0.5, .y = badge.y + (badge_h - font * 1.3) * 0.5, .w = label_w + 1.0, .h = font * 1.3 }, label, color(chrome.accent_fg), font, badge);
 }
 
 fn renderHeaderButton(state: *runtime.AppState, rect: palette.Rect, glyph: []const u8) void {
@@ -1369,9 +1479,21 @@ fn conversationPointAt(state: *runtime.AppState, conversation: palette.Rect, x: 
     return last_text;
 }
 
+/// Selectable blocks of the visible text surface: conversation items, or
+/// the expanded schedule's name, prompt, and last error.
+fn textBlockCount(state: *runtime.AppState) usize {
+    const companion = &state.companion_controller;
+    if (companion.view == .schedules) return expandedScheduleBlocks(state).count;
+    return companion.presentation.activity_count;
+}
+
 /// Text an item displays (what selection offsets index into).
 fn itemSelectableText(state: *runtime.AppState, index: usize, conversation: palette.Rect) []const u8 {
     const companion = &state.companion_controller;
+    if (companion.view == .schedules) {
+        const blocks = expandedScheduleBlocks(state);
+        return if (index < blocks.count) blocks.texts[index] else "";
+    }
     if (index >= companion.presentation.activity_count) return "";
     return itemTextLayout(state, &companion.presentation.activity[index], conversation, 0.0).text;
 }
@@ -1396,7 +1518,7 @@ fn selectItemAt(state: *runtime.AppState, conversation: palette.Rect, item: usiz
 }
 
 fn selectAllConversation(state: *runtime.AppState, conversation: palette.Rect) void {
-    const count = state.companion_controller.presentation.activity_count;
+    const count = textBlockCount(state);
     if (count == 0) return;
     const text = itemSelectableText(state, count - 1, conversation);
     state.companion_controller.selectTextRange(.{ .item = 0, .offset = 0 }, .{ .item = count - 1, .offset = text.len });
@@ -1408,7 +1530,7 @@ fn selectedTextAlloc(state: *runtime.AppState, allocator: std.mem.Allocator, con
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     var item = range.start.item;
-    while (item <= range.end.item and item < state.companion_controller.presentation.activity_count) : (item += 1) {
+    while (item <= range.end.item and item < textBlockCount(state)) : (item += 1) {
         const text = itemSelectableText(state, item, conversation);
         const from = if (item == range.start.item) @min(range.start.offset, text.len) else 0;
         const to = if (item == range.end.item) @min(range.end.offset, text.len) else text.len;
@@ -1555,6 +1677,492 @@ fn renderEmptyState(state: *runtime.AppState, geometry: Geometry) void {
         queueText(state, .{ .x = rect.x + 12.0 * s, .y = rect.y + (rect.h - 17.0 * s) * 0.5, .w = text_w, .h = 17.0 * s }, truncatedText(state, .ui, 11.5 * s, text_w, runtime.AppState.COMPANION_SUGGESTIONS[index]), color(chrome.text), 11.5 * s, rect);
         queueText(state, .{ .x = rect.x + rect.w - 22.0 * s, .y = rect.y + (rect.h - 17.0 * s) * 0.5, .w = 14.0 * s, .h = 17.0 * s }, "↗", color(chrome.accent), 11.5 * s, rect);
     }
+}
+
+// ---- scheduled tasks ----------------------------------------------------------
+
+const ScheduleRowLayout = struct {
+    /// Whole card, including the detail when expanded.
+    card: palette.Rect,
+    /// Summary area; a click here expands or collapses the detail.
+    head: palette.Rect,
+    text_x: f32,
+    text_w: f32,
+    /// Hit area of the enable switch (the track is drawn centered in it).
+    toggle: palette.Rect,
+    run: palette.Rect,
+    delete: palette.Rect,
+    confirm_label: palette.Rect,
+    confirm_no: palette.Rect,
+    confirm_yes: palette.Rect,
+    /// Selectable name / prompt / last error; zero-sized when collapsed.
+    detail: palette.Rect,
+};
+
+const SchedulesLayout = struct {
+    title: palette.Rect,
+    back: palette.Rect,
+    /// Failure line under the title while rows are still listed.
+    error_line: palette.Rect,
+    /// Scroll viewport for the rows (and the empty / loading states).
+    list: palette.Rect,
+    rows: [controller.MAX_SCHEDULE_ROWS]ScheduleRowLayout,
+    row_count: usize,
+    /// "Showing 24 of 30" and the working hint, below the rows.
+    footnote: palette.Rect,
+};
+
+/// The expanded row's selectable text, in display order.
+const ScheduleBlocks = struct {
+    row: ?usize = null,
+    texts: [MAX_SCHEDULE_BLOCKS][]const u8 = undefined,
+    captions: [MAX_SCHEDULE_BLOCKS][]const u8 = undefined,
+    max_lines: [MAX_SCHEDULE_BLOCKS]usize = undefined,
+    danger: [MAX_SCHEDULE_BLOCKS]bool = undefined,
+    /// The daemon's text was longer than the panel keeps.
+    clipped: [MAX_SCHEDULE_BLOCKS]bool = undefined,
+    count: usize = 0,
+
+    fn append(self: *ScheduleBlocks, caption: []const u8, text: []const u8, max_lines: usize, danger: bool, clipped: bool) void {
+        if (self.count == MAX_SCHEDULE_BLOCKS or text.len == 0) return;
+        self.captions[self.count] = caption;
+        self.texts[self.count] = text;
+        self.max_lines[self.count] = max_lines;
+        self.danger[self.count] = danger;
+        self.clipped[self.count] = clipped;
+        self.count += 1;
+    }
+};
+
+/// Positioned lines of the expanded detail; rendering, hit-testing,
+/// highlight, and copy all read this one layout.
+const ScheduleDetailLayout = struct {
+    blocks: [MAX_SCHEDULE_BLOCKS]ItemTextLayout = undefined,
+    captions: [MAX_SCHEDULE_BLOCKS]palette.Rect = undefined,
+    count: usize = 0,
+    height: f32 = 0.0,
+};
+
+const SchedulesEmptyLayout = struct {
+    icon: palette.Rect,
+    title_y: f32,
+    hint: WrappedText,
+    hint_y: f32,
+    card: palette.Rect,
+    caption_y: f32,
+};
+
+fn expandedScheduleBlocks(state: *runtime.AppState) ScheduleBlocks {
+    const companion = &state.companion_controller;
+    var blocks: ScheduleBlocks = .{};
+    for (0..companion.schedule_count) |index| {
+        if (!companion.scheduleExpanded(index)) continue;
+        blocks.row = index;
+        const row = &companion.schedules[index];
+        blocks.append("NAME", row.name.slice(), SCHEDULE_NAME_MAX_LINES, false, false);
+        blocks.append("PROMPT", row.prompt.slice(), SCHEDULE_PROMPT_MAX_LINES, false, row.prompt_truncated);
+        blocks.append("LAST ERROR", row.last_error.slice(), SCHEDULE_ERROR_MAX_LINES, true, false);
+        break;
+    }
+    return blocks;
+}
+
+fn scheduleDetailLayout(blocks: *const ScheduleBlocks, x: f32, y: f32, w: f32) ScheduleDetailLayout {
+    const s = companionScale();
+    const font = SCHEDULE_DETAIL_FONT * s;
+    const line_h = font * LINE_HEIGHT_FACTOR;
+    const text_x = x + 12.0 * s;
+    const text_w = @max(w - 24.0 * s, 0.0);
+    var layout: ScheduleDetailLayout = .{ .count = blocks.count };
+    var cursor = y + 8.0 * s;
+    for (0..blocks.count) |index| {
+        layout.captions[index] = .{ .x = text_x, .y = cursor, .w = text_w, .h = 15.0 * s };
+        cursor += 17.0 * s;
+        const text = blocks.texts[index];
+        const wrapped = wrapText(text, text_w, .ui, font, blocks.max_lines[index]);
+        var block: ItemTextLayout = .{ .text = text, .truncated = wrapped.truncated or blocks.clipped[index] };
+        var previous_end: usize = 0;
+        for (wrapped.lines[0..wrapped.count], 0..) |line, line_index| {
+            const offset = sliceOffset(text, line) orelse previous_end;
+            previous_end = offset + line.len;
+            block.lines[line_index] = .{ .x = text_x, .y = cursor + @as(f32, @floatFromInt(line_index)) * line_h, .w = text_w + 8.0 * s, .h = line_h, .text = line, .offset = offset, .role = .ui, .font = font };
+        }
+        block.count = wrapped.count;
+        layout.blocks[index] = block;
+        cursor += @as(f32, @floatFromInt(@max(wrapped.count, 1))) * line_h + 8.0 * s;
+    }
+    layout.height = cursor - y + 2.0 * s;
+    return layout;
+}
+
+fn scheduleRowLayout(card: palette.Rect, confirming: bool, expanded: bool) ScheduleRowLayout {
+    const s = companionScale();
+    const head: palette.Rect = .{ .x = card.x, .y = card.y, .w = card.w, .h = @min(SCHEDULE_ROW_HEIGHT * s, card.h) };
+    const right = card.x + card.w - 10.0 * s;
+    const control_h = SCHEDULE_CONTROL_H * s;
+    const control_y = head.y + (head.h - control_h) * 0.5;
+    const delete: palette.Rect = .{ .x = right - control_h, .y = control_y, .w = control_h, .h = control_h };
+    const run: palette.Rect = .{ .x = delete.x - 6.0 * s - SCHEDULE_RUN_W * s, .y = control_y, .w = SCHEDULE_RUN_W * s, .h = control_h };
+    const toggle: palette.Rect = .{ .x = run.x - 10.0 * s - SCHEDULE_TOGGLE_W * s, .y = control_y, .w = SCHEDULE_TOGGLE_W * s, .h = control_h };
+    const yes: palette.Rect = .{ .x = right - SCHEDULE_YES_W * s, .y = control_y, .w = SCHEDULE_YES_W * s, .h = control_h };
+    const no: palette.Rect = .{ .x = yes.x - 6.0 * s - SCHEDULE_NO_W * s, .y = control_y, .w = SCHEDULE_NO_W * s, .h = control_h };
+    const label_w = text_measure.textWidth(.ui_bold, 11.5 * s, "Delete?");
+    const label: palette.Rect = .{ .x = no.x - 8.0 * s - label_w, .y = control_y, .w = label_w, .h = control_h };
+    const text_x = card.x + 28.0 * s;
+    const text_right = (if (confirming) label.x else toggle.x) - 10.0 * s;
+    return .{
+        .card = card,
+        .head = head,
+        .text_x = text_x,
+        .text_w = @max(text_right - text_x, 0.0),
+        .toggle = toggle,
+        .run = run,
+        .delete = delete,
+        .confirm_label = label,
+        .confirm_no = no,
+        .confirm_yes = yes,
+        .detail = if (expanded) .{ .x = card.x, .y = head.y + head.h, .w = card.w, .h = @max(card.h - head.h, 0.0) } else .{ .x = card.x, .y = head.y + head.h },
+    };
+}
+
+fn scheduleFootnotes(state: *runtime.AppState) [2]?[]const u8 {
+    const companion = &state.companion_controller;
+    const name = companion.identity.name.slice();
+    return .{
+        if (companion.schedule_total > companion.schedule_count)
+            framePrint(state, "Showing {d} of {d}. Ask {s} about the rest.", .{ companion.schedule_count, companion.schedule_total, name })
+        else
+            null,
+        if (companion.presentation.working) framePrint(state, "{s} is working. Replies appear in the conversation.", .{name}) else null,
+    };
+}
+
+/// Rows, controls, and the scroll extent of the schedules view. Clamps the
+/// scroll before placing rows so a shrinking list never renders past its end.
+fn schedulesLayout(state: *runtime.AppState, geometry: Geometry) SchedulesLayout {
+    const s = companionScale();
+    const companion = &state.companion_controller;
+    const body = geometry.schedules;
+    var layout: SchedulesLayout = undefined;
+    layout.row_count = 0;
+    const inner_x = body.x + CONTENT_INSET * s;
+    const inner_w = @max(body.w - CONTENT_INSET * 2.0 * s, 0.0);
+    layout.title = .{ .x = inner_x, .y = body.y + 6.0 * s, .w = inner_w, .h = 18.0 * s };
+    const back_w = text_measure.textWidth(.ui_bold, 11.0 * s, "Back to chat") + 16.0 * s;
+    layout.back = if (inner_w > back_w + 120.0 * s and body.h > SECTION_TITLE_HEIGHT * s)
+        .{ .x = inner_x + inner_w - back_w, .y = layout.title.y - 3.0 * s, .w = back_w, .h = 22.0 * s }
+    else
+        .{ .x = inner_x + inner_w, .y = layout.title.y };
+    var top = body.y + (SECTION_TITLE_HEIGHT + 6.0) * s;
+    const show_error_line = companion.schedules_error.slice().len > 0 and companion.schedule_count > 0;
+    layout.error_line = if (show_error_line) .{ .x = inner_x, .y = top, .w = inner_w, .h = 18.0 * s } else .{ .x = inner_x, .y = top };
+    if (show_error_line) top += 22.0 * s;
+    top = @min(top, body.y + body.h);
+    layout.list = .{ .x = body.x, .y = top, .w = body.w, .h = @max(body.y + body.h - top, 0.0) };
+
+    // Heights first, so the scroll can be clamped before anything is placed.
+    const blocks = expandedScheduleBlocks(state);
+    const detail_h: f32 = if (blocks.row != null) scheduleDetailLayout(&blocks, 0.0, 0.0, inner_w).height else 0.0;
+    var content_h: f32 = 4.0 * s;
+    for (0..companion.schedule_count) |index| {
+        content_h += SCHEDULE_ROW_HEIGHT * s + SCHEDULE_ROW_GAP * s;
+        if (blocks.row != null and blocks.row.? == index) content_h += detail_h;
+    }
+    const notes = scheduleFootnotes(state);
+    var note_count: usize = 0;
+    for (notes) |note| {
+        if (note != null) note_count += 1;
+    }
+    const footnote_h: f32 = if (note_count > 0 and companion.schedule_count > 0) @as(f32, @floatFromInt(note_count)) * 16.0 * s + 6.0 * s else 0.0;
+    content_h += footnote_h + 4.0 * s;
+    companion.schedules_max_scroll = if (companion.schedule_count == 0) 0.0 else @max(content_h - layout.list.h, 0.0);
+    companion.schedules_scroll_y = std.math.clamp(companion.schedules_scroll_y, 0.0, companion.schedules_max_scroll);
+
+    var y = layout.list.y + 4.0 * s - companion.schedules_scroll_y;
+    for (0..companion.schedule_count) |index| {
+        const expanded = blocks.row != null and blocks.row.? == index;
+        const card: palette.Rect = .{ .x = inner_x, .y = y, .w = inner_w, .h = SCHEDULE_ROW_HEIGHT * s + (if (expanded) detail_h else 0.0) };
+        layout.rows[index] = scheduleRowLayout(card, companion.scheduleConfirming(index), expanded);
+        layout.row_count += 1;
+        y += card.h + SCHEDULE_ROW_GAP * s;
+    }
+    layout.footnote = .{ .x = inner_x, .y = y, .w = inner_w, .h = footnote_h };
+    return layout;
+}
+
+fn schedulesEmptyLayout(state: *runtime.AppState, list: palette.Rect) SchedulesEmptyLayout {
+    const s = companionScale();
+    const content_w = @max(list.w - CONTENT_INSET * 4.0 * s, 0.0);
+    const hint_text = framePrint(state, "Ask {s} to schedule something, e.g. 'every weekday at 9 check CI'.", .{state.companion_controller.identity.name.slice()});
+    const hint = wrapText(hint_text, content_w, .ui, 11.5 * s, 3);
+    const hint_h = @as(f32, @floatFromInt(hint.count)) * 16.0 * s;
+    const block_h = 28.0 * s + 10.0 * s + 28.0 * s + hint_h + 14.0 * s + SUGGESTION_HEIGHT * s + 6.0 * s + 16.0 * s;
+    const top = list.y + @max((list.h - block_h) * 0.4, 12.0 * s);
+    const icon: palette.Rect = .{ .x = list.x + (list.w - 28.0 * s) * 0.5, .y = top, .w = 28.0 * s, .h = 28.0 * s };
+    const title_y = icon.y + icon.h + 10.0 * s;
+    const hint_y = title_y + 28.0 * s;
+    const card: palette.Rect = .{ .x = list.x + CONTENT_INSET * s, .y = hint_y + hint_h + 14.0 * s, .w = @max(list.w - CONTENT_INSET * 2.0 * s, 0.0), .h = SUGGESTION_HEIGHT * s };
+    return .{ .icon = icon, .title_y = title_y, .hint = hint, .hint_y = hint_y, .card = card, .caption_y = card.y + card.h + 6.0 * s };
+}
+
+fn registerScheduleHits(state: *runtime.AppState, geometry: Geometry) void {
+    const companion = &state.companion_controller;
+    const layout = schedulesLayout(state, geometry);
+    companion.addHit(geometry.schedules, .body);
+    companion.addHit(layout.back, .schedules_view);
+    if (layout.row_count == 0) {
+        if (companion.schedules_loaded and companion.schedules_error.slice().len == 0) {
+            const empty = schedulesEmptyLayout(state, layout.list);
+            if (rectInside(empty.card, layout.list)) companion.addHit(empty.card, .schedule_suggestion);
+        }
+        return;
+    }
+    for (layout.rows[0..layout.row_count], 0..) |row, index| {
+        if (intersectRects(row.head, layout.list)) |visible| companion.addIndexedHit(visible, .schedule_expand, index);
+        const Control = struct { rect: palette.Rect, action: controller.HitAction };
+        const controls: [3]Control = if (companion.scheduleConfirming(index))
+            .{ .{ .rect = row.confirm_no, .action = .schedule_delete_cancel }, .{ .rect = row.confirm_yes, .action = .schedule_delete_confirm }, .{ .rect = .{}, .action = .body } }
+        else
+            .{ .{ .rect = row.toggle, .action = .schedule_toggle }, .{ .rect = row.run, .action = .schedule_run }, .{ .rect = row.delete, .action = .schedule_delete } };
+        for (controls) |control| {
+            if (intersectRects(control.rect, layout.list)) |visible| companion.addIndexedHit(visible, control.action, index);
+        }
+    }
+}
+
+// Scheduled tasks: each daemon schedule with its repeat, next run, and last
+// result, plus enable, Run now, and an inline-confirmed delete. An expanded
+// row shows its selectable name and prompt. Replaces the conversation, so
+// the composer below stays free to ask the companion for a new one.
+fn renderSchedules(state: *runtime.AppState, geometry: Geometry) void {
+    const body = geometry.schedules;
+    if (body.w <= 0.0 or body.h <= 0.0) return;
+    const s = companionScale();
+    const chrome = theme.companionChrome();
+    const companion = &state.companion_controller;
+    const layout = schedulesLayout(state, geometry);
+
+    const title = if (companion.schedule_total > 0) framePrint(state, "SCHEDULED TASKS · {d}", .{companion.schedule_total}) else "SCHEDULED TASKS";
+    const title_w = @max(layout.back.x - layout.title.x - 8.0 * s, 0.0);
+    queueBoldText(state, .{ .x = layout.title.x + 2.0 * s, .y = layout.title.y + 2.0 * s, .w = title_w, .h = 16.0 * s }, truncatedText(state, .ui_bold, 10.0 * s, title_w, title), color(chrome.text_subtle), 10.0 * s, body);
+    if (layout.back.w > 0.0) queueCenteredText(state, layout.back, "Back to chat", color(chrome.accent), 11.0 * s, .ui_bold, layout.back);
+    const failure = companion.schedules_error.slice();
+    if (layout.error_line.h > 0.0) {
+        queueText(state, layout.error_line, truncatedText(state, .ui, 11.0 * s, layout.error_line.w, singleLineText(state, failure)), color(chrome.danger), 11.0 * s, layout.error_line);
+    }
+    const list = layout.list;
+    if (list.h <= 0.0) return;
+
+    if (layout.row_count == 0) {
+        if (failure.len > 0) {
+            renderSchedulesMessage(state, list, failure, chrome.danger);
+        } else if (!companion.schedules_loaded) {
+            renderSchedulesMessage(state, list, "Loading scheduled tasks…", chrome.text_subtle);
+        } else {
+            renderSchedulesEmpty(state, list);
+        }
+        return;
+    }
+    const now_ms = platform_runtime.unixTimestampMs();
+    for (0..layout.row_count) |index| renderScheduleRow(state, &layout, index, now_ms);
+    if (layout.footnote.h > 0.0) {
+        var y = layout.footnote.y + 2.0 * s;
+        for (scheduleFootnotes(state)) |maybe_note| {
+            const note = maybe_note orelse continue;
+            const rect: palette.Rect = .{ .x = layout.footnote.x + 2.0 * s, .y = y, .w = layout.footnote.w, .h = 15.0 * s };
+            if (intersectRects(rect, list) != null) queueText(state, rect, truncatedText(state, .ui, 10.5 * s, rect.w, note), color(chrome.text_subtle), 10.5 * s, list);
+            y += 16.0 * s;
+        }
+    }
+    if (companion.schedules_scroll_y > 1.0) renderFade(state, list, true);
+    if (companion.schedules_max_scroll - companion.schedules_scroll_y > 1.0) renderFade(state, list, false);
+}
+
+/// Loading or a list failure, centered in the list area.
+fn renderSchedulesMessage(state: *runtime.AppState, list: palette.Rect, message: []const u8, fill: [4]f32) void {
+    const s = companionScale();
+    const wrapped = wrapText(singleLineText(state, message), @max(list.w - CONTENT_INSET * 4.0 * s, 0.0), .ui, 11.5 * s, 4);
+    const line_h = 16.0 * s;
+    const top = list.y + @max((list.h - @as(f32, @floatFromInt(wrapped.count)) * line_h) * 0.4, 8.0 * s);
+    for (wrapped.lines[0..wrapped.count], 0..) |line, index| {
+        queueCenteredText(state, .{ .x = list.x, .y = top + @as(f32, @floatFromInt(index)) * line_h, .w = list.w, .h = line_h }, line, color(fill), 11.5 * s, .ui, list);
+    }
+}
+
+// Empty schedules: how to make one, and an example that fills the composer.
+fn renderSchedulesEmpty(state: *runtime.AppState, list: palette.Rect) void {
+    const s = companionScale();
+    const chrome = theme.companionChrome();
+    const empty = schedulesEmptyLayout(state, list);
+    if (rectInside(empty.icon, list)) queueIcon(state, empty.icon, NF_COD_WATCH, color(chrome.accent), list);
+    queueCenteredText(state, .{ .x = list.x, .y = empty.title_y, .w = list.w, .h = 20.0 * s }, "No scheduled tasks yet", color(chrome.text), 14.0 * s, .ui_bold, list);
+    for (empty.hint.lines[0..empty.hint.count], 0..) |line, index| {
+        queueCenteredText(state, .{ .x = list.x, .y = empty.hint_y + @as(f32, @floatFromInt(index)) * 16.0 * s, .w = list.w, .h = 16.0 * s }, line, color(chrome.text_subtle), 11.5 * s, .ui, list);
+    }
+    const card = empty.card;
+    if (!rectInside(card, list)) return;
+    queuePanel(state, card, color(chrome.surface_deep), color(hairline()), 10.0 * s, 1.0 * s);
+    const text_w = @max(card.w - 36.0 * s, 0.0);
+    queueText(state, .{ .x = card.x + 12.0 * s, .y = card.y + (card.h - 17.0 * s) * 0.5, .w = text_w, .h = 17.0 * s }, truncatedText(state, .ui, 11.5 * s, text_w, SCHEDULE_SUGGESTION), color(chrome.text), 11.5 * s, card);
+    queueText(state, .{ .x = card.x + card.w - 22.0 * s, .y = card.y + (card.h - 17.0 * s) * 0.5, .w = 14.0 * s, .h = 17.0 * s }, "✎", color(chrome.accent), 11.5 * s, card);
+    const caption: palette.Rect = .{ .x = list.x, .y = empty.caption_y, .w = list.w, .h = 15.0 * s };
+    if (rectInside(caption, list)) queueCenteredText(state, caption, "Puts it in the message box to edit before sending.", color(chrome.text_subtle), 10.5 * s, .ui, list);
+}
+
+fn scheduleStatusColor(chrome: theme.CompanionChrome, status: controller.ScheduleStatus) [4]f32 {
+    return switch (status) {
+        .failed => chrome.danger,
+        .queued, .late => chrome.warning,
+        .ok => chrome.identity_fg,
+        .never, .unknown => chrome.text_subtle,
+    };
+}
+
+// One schedule card: status dot, name, repeat and next run, last result, and
+// the switch / Run / × controls (or the inline "Delete?" Yes / No).
+fn renderScheduleRow(state: *runtime.AppState, layout: *const SchedulesLayout, index: usize, now_ms: i64) void {
+    const s = companionScale();
+    const chrome = theme.companionChrome();
+    const companion = &state.companion_controller;
+    const row = &companion.schedules[index];
+    const rl = layout.rows[index];
+    const clip = intersectRects(rl.card, layout.list) orelse return;
+    const expanded = companion.scheduleExpanded(index);
+    const border = if (expanded) opaqueOver(chrome.surface_deep, theme.withAlpha(chrome.accent, 110)) else hairline();
+    queuePanelClipped(state, rl.card, color(chrome.surface_deep), color(border), 10.0 * s, 1.0 * s, layout.list);
+
+    const dot_color = if (!row.enabled) chrome.text_subtle else if (row.last_status == .failed) chrome.danger else chrome.accent;
+    queueRoundedRectClipped(state, .{ .x = rl.card.x + 12.0 * s, .y = rl.head.y + 13.0 * s, .w = 8.0 * s, .h = 8.0 * s }, color(dot_color), 4.0 * s, clip);
+    var buffer: [96]u8 = undefined;
+    const name = singleLineText(state, row.name.slice());
+    queueBoldText(state, .{ .x = rl.text_x, .y = rl.head.y + 7.0 * s, .w = rl.text_w, .h = 17.0 * s }, truncatedText(state, .ui_bold, 12.5 * s, rl.text_w, name), color(if (row.enabled) chrome.text else chrome.text_muted), 12.5 * s, clip);
+    const when = framePrint(state, "{s} · {s}", .{ row.repeat_text.slice(), controller.formatScheduleNext(&buffer, row.enabled, row.next_run_ms, now_ms) });
+    queueText(state, .{ .x = rl.text_x, .y = rl.head.y + 25.0 * s, .w = rl.text_w, .h = 15.0 * s }, truncatedText(state, .ui, 11.0 * s, rl.text_w, when), color(chrome.text_muted), 11.0 * s, clip);
+    const last = framePrint(state, "{s}", .{controller.formatScheduleLast(&buffer, row.last_status, row.last_run_ms, now_ms)});
+    queueText(state, .{ .x = rl.text_x, .y = rl.head.y + 41.0 * s, .w = rl.text_w, .h = 14.0 * s }, truncatedText(state, .ui, 10.5 * s, rl.text_w, last), color(scheduleStatusColor(chrome, row.last_status)), 10.5 * s, clip);
+
+    if (companion.scheduleConfirming(index)) {
+        queueBoldText(state, .{ .x = rl.confirm_label.x, .y = rl.confirm_label.y + (rl.confirm_label.h - 16.0 * s) * 0.5, .w = rl.confirm_label.w + 1.0, .h = 16.0 * s }, "Delete?", color(chrome.danger), 11.5 * s, clip);
+        queuePanelClipped(state, rl.confirm_no, color(surface()), color(chrome.border), 8.0 * s, 1.0 * s, clip);
+        queueCenteredText(state, rl.confirm_no, "No", color(chrome.text), 11.0 * s, .ui_bold, clip);
+        queueRoundedRectClipped(state, rl.confirm_yes, color(chrome.danger), 8.0 * s, clip);
+        queueCenteredText(state, rl.confirm_yes, "Yes", color(surface()), 11.0 * s, .ui_bold, clip);
+    } else {
+        // Enable switch: an accent pill with the knob right when on.
+        const track_h = SCHEDULE_TOGGLE_H * s;
+        const track: palette.Rect = .{ .x = rl.toggle.x, .y = rl.toggle.y + (rl.toggle.h - track_h) * 0.5, .w = rl.toggle.w, .h = track_h };
+        queuePanelClipped(state, track, color(if (row.enabled) chrome.accent else surface()), color(if (row.enabled) chrome.accent else chrome.border), track_h * 0.5, 1.0 * s, clip);
+        const knob = track_h - 6.0 * s;
+        const knob_x = if (row.enabled) track.x + track.w - 3.0 * s - knob else track.x + 3.0 * s;
+        queueRoundedRectClipped(state, .{ .x = knob_x, .y = track.y + 3.0 * s, .w = knob, .h = knob }, color(if (row.enabled) chrome.accent_fg else chrome.text_subtle), knob * 0.5, clip);
+        const pending = companion.schedulePending(index);
+        queuePanelClipped(state, rl.run, color(surface()), color(chrome.border), 8.0 * s, 1.0 * s, clip);
+        queueCenteredText(state, rl.run, if (pending) "…" else "Run", color(if (pending) chrome.text_subtle else chrome.text), 11.0 * s, .ui_bold, clip);
+        queuePanelClipped(state, rl.delete, color(surface()), color(hairline()), 7.0 * s, 1.0 * s, clip);
+        const icon = 12.0 * s;
+        queueIcon(state, .{ .x = rl.delete.x + (rl.delete.w - icon) * 0.5, .y = rl.delete.y + (rl.delete.h - icon) * 0.5, .w = icon, .h = icon }, NF_COD_CLOSE, color(chrome.text_muted), clip);
+    }
+    if (expanded) renderScheduleDetail(state, rl.detail, clip);
+}
+
+// Expanded detail: captioned, selectable name, prompt, and last error.
+fn renderScheduleDetail(state: *runtime.AppState, detail: palette.Rect, clip: palette.Rect) void {
+    const s = companionScale();
+    const chrome = theme.companionChrome();
+    const stroke = snappedStroke(1.0 * s);
+    queueRect(state, .{ .x = detail.x + 10.0 * s, .y = @round(detail.y), .w = @max(detail.w - 20.0 * s, 0.0), .h = stroke }, color(hairline()));
+    const blocks = expandedScheduleBlocks(state);
+    const layout = scheduleDetailLayout(&blocks, detail.x, detail.y, detail.w);
+    for (0..layout.count) |index| {
+        queueBoldText(state, layout.captions[index], blocks.captions[index], color(chrome.text_subtle), 10.0 * s, clip);
+        const block = &layout.blocks[index];
+        renderTextSelection(state, index, block, clip);
+        const fill = color(if (blocks.danger[index]) chrome.danger else chrome.text);
+        for (block.lines[0..block.count], 0..) |line, line_index| {
+            const shown = if (line_index + 1 == block.count and block.truncated) framePrint(state, "{s} …", .{line.text}) else line.text;
+            state.palette_overlay_batch.roleText(state.allocator, nonNegativeRect(.{ .x = line.x, .y = line.y, .w = line.w, .h = line.h }), shown, fill, line.font, line.role, null, nonNegativeRect(clip)) catch |err| log.warn("failed to queue text: {s}", .{@errorName(err)});
+        }
+    }
+}
+
+/// Where selectable text can start: the conversation, or the expanded
+/// schedule's visible detail.
+fn textArea(state: *runtime.AppState, geometry: Geometry) palette.Rect {
+    if (state.companion_controller.view != .schedules) return geometry.conversation;
+    const blocks = expandedScheduleBlocks(state);
+    const row = blocks.row orelse return .{};
+    const layout = schedulesLayout(state, geometry);
+    if (row >= layout.row_count) return .{};
+    return intersectRects(layout.rows[row].detail, layout.list) orelse .{};
+}
+
+fn textPointAt(state: *runtime.AppState, geometry: Geometry, x: f32, y: f32) ?controller.TextPoint {
+    if (state.companion_controller.view == .schedules) return schedulePointAt(state, geometry, x, y);
+    return conversationPointAt(state, geometry.conversation, x, y);
+}
+
+fn expandedDetailLayout(state: *runtime.AppState, geometry: Geometry, blocks: *const ScheduleBlocks) ?struct { detail: ScheduleDetailLayout, list: palette.Rect } {
+    const row = blocks.row orelse return null;
+    const layout = schedulesLayout(state, geometry);
+    if (row >= layout.row_count) return null;
+    const detail = layout.rows[row].detail;
+    return .{ .detail = scheduleDetailLayout(blocks, detail.x, detail.y, detail.w), .list = layout.list };
+}
+
+/// Caret position in the expanded detail, clamped into its blocks.
+fn schedulePointAt(state: *runtime.AppState, geometry: Geometry, x: f32, y: f32) ?controller.TextPoint {
+    const blocks = expandedScheduleBlocks(state);
+    const found = expandedDetailLayout(state, geometry, &blocks) orelse return null;
+    const detail = &found.detail;
+    if (detail.count == 0) return null;
+    for (detail.blocks[0..detail.count], 0..) |*block, index| {
+        if (block.count == 0) continue;
+        if (y < block.lines[0].y) return .{ .item = index, .offset = 0 };
+        const last = block.lines[block.count - 1];
+        if (y >= last.y + last.h) continue;
+        for (block.lines[0..block.count]) |line| {
+            if (y < line.y + line.h) return .{ .item = index, .offset = @min(line.offset + lineByteAtX(line, x), block.text.len) };
+        }
+    }
+    const last_index = detail.count - 1;
+    return .{ .item = last_index, .offset = detail.blocks[last_index].text.len };
+}
+
+/// True when (x, y) sits on a drawn line of the expanded schedule detail.
+fn overScheduleText(state: *runtime.AppState, x: f32, y: f32) bool {
+    const companion = &state.companion_controller;
+    if (companion.view != .schedules) return false;
+    const geometry = computeGeometry(state, companion.frame_width, companion.frame_height);
+    const blocks = expandedScheduleBlocks(state);
+    const found = expandedDetailLayout(state, geometry, &blocks) orelse return false;
+    if (!pointInRect(found.list, x, y)) return false;
+    for (found.detail.blocks[0..found.detail.count]) |*block| {
+        for (block.lines[0..block.count]) |line| {
+            const w = text_measure.textWidth(line.role, line.font, line.text) + line.font * 0.5;
+            if (x >= line.x and x <= line.x + w and y >= line.y and y < line.y + line.h) return true;
+        }
+    }
+    return false;
+}
+
+/// What the schedule icon controls do, on hover.
+fn scheduleTooltipAt(state: *runtime.AppState, geometry: Geometry, x: f32, y: f32) ?struct { target: palette.Rect, label: []const u8 } {
+    const companion = &state.companion_controller;
+    if (companion.view != .schedules or !pointInRect(geometry.schedules, x, y)) return null;
+    const layout = schedulesLayout(state, geometry);
+    if (!pointInRect(layout.list, x, y)) return null;
+    for (layout.rows[0..layout.row_count], 0..) |row, index| {
+        if (companion.scheduleConfirming(index)) continue;
+        if (pointInRect(row.delete, x, y)) return .{ .target = row.delete, .label = "Delete" };
+        if (pointInRect(row.run, x, y)) return .{ .target = row.run, .label = "Run now" };
+        if (pointInRect(row.toggle, x, y)) return .{ .target = row.toggle, .label = if (companion.schedules[index].enabled) "Pause" else "Resume" };
+    }
+    return null;
+}
+
+fn renderScheduleTooltip(state: *runtime.AppState, geometry: Geometry) void {
+    const tip = scheduleTooltipAt(state, geometry, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y) orelse return;
+    renderTooltip(state, geometry.window, tip.target, tip.label);
 }
 
 // ---- menus ------------------------------------------------------------------
@@ -2667,6 +3275,7 @@ fn testState(allocator: std.mem.Allocator, state: *runtime.AppState) !void {
     state.app_config = .{ .companion_enabled = true };
     state.project_controller = .{};
     state.companion_controller = controller.init();
+    state.companion_schedules = .{};
     state.companion_roster = .{};
     state.companion_controller.identity.name.set("Juniper");
     state.companion_controller.identity.brain.set("Claude · Opus");
@@ -3080,4 +3689,285 @@ test "header plus starts a new conversation and every header control has a toolt
         try std.testing.expect(batchHasText(&state.palette_overlay_batch, case[1]));
         try expectBatchInsideWindow(&state.palette_overlay_batch, .{ .w = 1360.0, .h = 860.0 });
     }
+}
+
+const TEST_MINUTE_MS: i64 = std.time.ms_per_min;
+
+/// Three schedules: an enabled weekday one, a paused failing one, and a
+/// one-off; times are relative to `now_ms`.
+fn setTestSchedules(state: *runtime.AppState, now_ms: i64) void {
+    var rows: [3]controller.ScheduleRow = .{ .{ .enabled = true }, .{ .enabled = false }, .{ .enabled = true } };
+    _ = rows[0].id.set("sch-1");
+    rows[0].name.set("Morning CI check");
+    rows[0].prompt.set("Check CI for every workspace and tell me what failed.");
+    rows[0].repeat = .{ .daily = .{ .hour = 9, .minute = 0, .weekdays = 0b0111110 } };
+    rows[0].next_run_ms = now_ms + 190 * TEST_MINUTE_MS;
+    rows[0].last_run_ms = now_ms - 125 * TEST_MINUTE_MS;
+    rows[0].last_status = .ok;
+    _ = rows[1].id.set("sch-2");
+    rows[1].name.set("Deploy ping");
+    rows[1].prompt.set("Ping the staging deploy.");
+    rows[1].repeat = .{ .interval = 120 };
+    rows[1].last_status = .failed;
+    rows[1].last_error.set("provider offline");
+    _ = rows[2].id.set("sch-3");
+    rows[2].name.set("Release notes");
+    rows[2].prompt.set("Draft the release notes.");
+    rows[2].repeat = .{ .once = .{ .at_ms = now_ms, .local = .{ .month = 10, .day = 20, .weekday = 2, .hour = 14, .minute = 30 }, .this_week = true } };
+    rows[2].next_run_ms = now_ms + 20 * TEST_MINUTE_MS;
+    for (&rows) |*row| {
+        var buffer: [96]u8 = undefined;
+        row.repeat_text.set(controller.formatScheduleRepeat(&buffer, row.repeat));
+    }
+    state.companion_controller.setSchedules(&rows, rows.len);
+}
+
+fn openTestSchedulesView(state: *runtime.AppState, width: f32, height: f32) void {
+    state.companion_controller.show();
+    state.companion_controller.settleTransition();
+    state.companion_controller.frame_width = width;
+    state.companion_controller.frame_height = height;
+    state.companion_controller.setView(.schedules);
+}
+
+test "schedules view replaces the conversation and stays inside the window across sizes and scales" {
+    const allocator = std.testing.allocator;
+    defer theme.applyTheme(1.0);
+    inline for (.{
+        .{ @as(f32, 1360.0), @as(f32, 860.0), @as(f32, 1.0) },
+        .{ @as(f32, 900.0), @as(f32, 700.0), @as(f32, 1.25) },
+        .{ @as(f32, 390.0), @as(f32, 760.0), @as(f32, 1.0) },
+        .{ @as(f32, 1280.0), @as(f32, 420.0), @as(f32, 1.5) },
+        .{ @as(f32, 2536.0), @as(f32, 1030.0), @as(f32, 1.5) },
+    }) |fixture| {
+        theme.applyTheme(fixture[2]);
+        var state: runtime.AppState = undefined;
+        try testState(allocator, &state);
+        defer deinitTestState(allocator, &state);
+        const window: palette.Rect = .{ .w = fixture[0], .h = fixture[1] };
+        setTestSchedules(&state, platform_runtime.unixTimestampMs());
+        openTestSchedulesView(&state, fixture[0], fixture[1]);
+        _ = state.companion_controller.handleScheduleAction(.schedule_expand, 0);
+        _ = state.companion_controller.handleScheduleAction(.schedule_delete, 2);
+
+        render(&state, fixture[0], fixture[1]);
+        try expectBatchInsideWindow(&state.palette_overlay_batch, window);
+        try std.testing.expect(!batchHasText(&state.palette_overlay_batch, "Hi, I'm Juniper."));
+        try std.testing.expect(batchHasText(&state.palette_overlay_batch, "SCHEDULED TASKS · 3"));
+
+        const geometry = computeGeometry(&state, fixture[0], fixture[1]);
+        try std.testing.expectEqual(@as(f32, 0.0), geometry.conversation.h);
+        try std.testing.expect(geometry.schedules.y >= geometry.header.y + geometry.header.h);
+        try std.testing.expect(geometry.schedules.y + geometry.schedules.h <= geometry.footer.y + 0.5);
+        try std.testing.expect(rectInside(geometry.schedules_button, geometry.header));
+        try std.testing.expect(geometry.schedules_button.x >= geometry.brain_button.x + geometry.brain_button.w or geometry.schedules_button.y >= geometry.brain_button.y + geometry.brain_button.h);
+        const layout = schedulesLayout(&state, geometry);
+        try std.testing.expectEqual(@as(usize, 3), layout.row_count);
+        for (layout.rows[0..layout.row_count], 0..) |row, index| {
+            try std.testing.expect(row.text_w > 0.0);
+            const controls = if (index == 2) [_]palette.Rect{ row.confirm_label, row.confirm_no, row.confirm_yes } else [_]palette.Rect{ row.toggle, row.run, row.delete };
+            for (controls) |control| {
+                try std.testing.expect(control.x >= row.text_x + row.text_w);
+                try std.testing.expect(control.x + control.w <= row.card.x + row.card.w);
+            }
+        }
+    }
+}
+
+test "schedule rows show repeat, next run, and last result" {
+    const allocator = std.testing.allocator;
+    theme.applyTheme(1.0);
+    var state: runtime.AppState = undefined;
+    try testState(allocator, &state);
+    defer deinitTestState(allocator, &state);
+    setTestSchedules(&state, platform_runtime.unixTimestampMs());
+    openTestSchedulesView(&state, 1360.0, 860.0);
+    render(&state, 1360.0, 860.0);
+    const batch = &state.palette_overlay_batch;
+    try std.testing.expect(batchHasText(batch, "Morning CI check"));
+    try std.testing.expect(batchHasText(batch, "Weekdays at 09:00 · Next: in 3h"));
+    try std.testing.expect(batchHasText(batch, "Last run ok · 2h ago"));
+    try std.testing.expect(batchHasText(batch, "Every 2 hours · Paused"));
+    try std.testing.expect(batchHasText(batch, "Last run failed"));
+    try std.testing.expect(batchHasText(batch, "Once · Tue 14:30 · Next: in 20m"));
+    try std.testing.expect(batchHasText(batch, "Never run"));
+    try std.testing.expect(batchHasText(batch, "Run"));
+    try std.testing.expect(batchHasText(batch, "Back to chat"));
+    // Two enabled schedules badge the header clock.
+    try std.testing.expectEqualStrings("2", scheduleBadgeLabel(&state).?);
+}
+
+test "schedule hits route toggle, run, delete, and the inline confirm" {
+    const allocator = std.testing.allocator;
+    theme.applyTheme(1.0);
+    var state: runtime.AppState = undefined;
+    try testState(allocator, &state);
+    defer deinitTestState(allocator, &state);
+    setTestSchedules(&state, platform_runtime.unixTimestampMs());
+    openTestSchedulesView(&state, 1360.0, 860.0);
+    const companion = &state.companion_controller;
+    var geometry = computeGeometry(&state, 1360.0, 860.0);
+    registerHits(&state, geometry);
+    var layout = schedulesLayout(&state, geometry);
+
+    const Case = struct { rect: palette.Rect, action: controller.HitAction };
+    const row = layout.rows[1];
+    for ([_]Case{
+        .{ .rect = row.toggle, .action = .schedule_toggle },
+        .{ .rect = row.run, .action = .schedule_run },
+        .{ .rect = row.delete, .action = .schedule_delete },
+        .{ .rect = .{ .x = row.text_x, .y = row.head.y + 4.0, .w = 10.0, .h = 10.0 }, .action = .schedule_expand },
+        .{ .rect = layout.back, .action = .schedules_view },
+        .{ .rect = geometry.schedules_button, .action = .schedules_view },
+    }) |case| {
+        const x = case.rect.x + case.rect.w * 0.5;
+        const y = case.rect.y + case.rect.h * 0.5;
+        const hit = companion.hitEntryAt(x, y).?;
+        try std.testing.expectEqual(case.action, hit.action);
+        if (case.action != .schedules_view) try std.testing.expectEqual(@as(usize, 1), hit.index);
+        try std.testing.expectEqual(palette.platform.CursorShape.pointer, systemCursorAt(&state, x, y).?);
+    }
+    // Blank list space is plain chrome.
+    try std.testing.expectEqual(palette.platform.CursorShape.default, systemCursorAt(&state, geometry.schedules.x + 4.0, geometry.schedules.y + geometry.schedules.h - 4.0).?);
+
+    // × asks "Delete?"; the row's controls become No / Yes.
+    const press = companion.handlePointerButton(row.delete.x + 4.0, row.delete.y + 4.0, 1, true);
+    try std.testing.expect(companion.handleScheduleAction(press.action.?, press.index) == null);
+    _ = companion.handlePointerButton(row.delete.x + 4.0, row.delete.y + 4.0, 1, false);
+    try std.testing.expect(companion.scheduleConfirming(1));
+    registerHits(&state, geometry);
+    layout = schedulesLayout(&state, geometry);
+    const confirming = layout.rows[1];
+    try std.testing.expectEqual(controller.HitAction.schedule_delete_confirm, companion.hitAt(confirming.confirm_yes.x + 4.0, confirming.confirm_yes.y + 4.0).?);
+    try std.testing.expectEqual(controller.HitAction.schedule_delete_cancel, companion.hitAt(confirming.confirm_no.x + 4.0, confirming.confirm_no.y + 4.0).?);
+    // The toggle under "Delete?" no longer routes to the switch.
+    try std.testing.expect(companion.hitAt(confirming.toggle.x + 2.0, confirming.toggle.y + 2.0).? != .schedule_toggle);
+    state.palette_overlay_batch.clear();
+    render(&state, 1360.0, 860.0);
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "Delete?"));
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "Yes"));
+    const yes = companion.hitEntryAt(confirming.confirm_yes.x + 4.0, confirming.confirm_yes.y + 4.0).?;
+    const intent = companion.handleScheduleAction(yes.action, yes.index).?;
+    try std.testing.expectEqualStrings("sch-2", intent.delete.slice());
+    try std.testing.expect(companion.schedulePending(1));
+
+    // The icon controls explain themselves on hover.
+    geometry = computeGeometry(&state, 1360.0, 860.0);
+    layout = schedulesLayout(&state, geometry);
+    const hovered = layout.rows[0].delete;
+    state.palette_overlay_batch.clear();
+    state.transcript_controller.palette_mouse_x = hovered.x + 4.0;
+    state.transcript_controller.palette_mouse_y = hovered.y + 4.0;
+    render(&state, 1360.0, 860.0);
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "Delete"));
+    try expectBatchInsideWindow(&state.palette_overlay_batch, .{ .w = 1360.0, .h = 860.0 });
+}
+
+test "header clock toggles the schedules view with a tooltip and an enabled-count badge" {
+    const allocator = std.testing.allocator;
+    theme.applyTheme(1.0);
+    var state: runtime.AppState = undefined;
+    try testState(allocator, &state);
+    defer deinitTestState(allocator, &state);
+    state.companion_controller.show();
+    state.companion_controller.settleTransition();
+    try std.testing.expect(scheduleBadgeLabel(&state) == null);
+    const geometry = computeGeometry(&state, 1360.0, 860.0);
+    registerHits(&state, geometry);
+    try std.testing.expectEqual(controller.HitAction.schedules_view, state.companion_controller.hitAt(geometry.schedules_button.x + 4.0, geometry.schedules_button.y + 4.0).?);
+    state.transcript_controller.palette_mouse_x = geometry.schedules_button.x + 4.0;
+    state.transcript_controller.palette_mouse_y = geometry.schedules_button.y + 4.0;
+    render(&state, 1360.0, 860.0);
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "Scheduled tasks"));
+
+    setTestSchedules(&state, platform_runtime.unixTimestampMs());
+    try std.testing.expectEqualStrings("2", scheduleBadgeLabel(&state).?);
+    state.companion_controller.toggleSchedulesView();
+    state.palette_overlay_batch.clear();
+    render(&state, 1360.0, 860.0);
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "Back to conversation"));
+    try expectBatchInsideWindow(&state.palette_overlay_batch, .{ .w = 1360.0, .h = 860.0 });
+}
+
+test "schedules view explains loading, failure, and the empty state with a composer example" {
+    const allocator = std.testing.allocator;
+    theme.applyTheme(1.0);
+    var state: runtime.AppState = undefined;
+    try testState(allocator, &state);
+    defer deinitTestState(allocator, &state);
+    openTestSchedulesView(&state, 1360.0, 860.0);
+    render(&state, 1360.0, 860.0);
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "Loading scheduled tasks…"));
+
+    state.companion_controller.setSchedules(&.{}, 0);
+    state.palette_overlay_batch.clear();
+    render(&state, 1360.0, 860.0);
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "No scheduled tasks yet"));
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "Ask Juniper to schedule something"));
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "Every weekday at 9:00, check CI"));
+    try expectBatchInsideWindow(&state.palette_overlay_batch, .{ .w = 1360.0, .h = 860.0 });
+    const geometry = computeGeometry(&state, 1360.0, 860.0);
+    registerHits(&state, geometry);
+    const empty = schedulesEmptyLayout(&state, schedulesLayout(&state, geometry).list);
+    const x = empty.card.x + empty.card.w * 0.5;
+    const y = empty.card.y + empty.card.h * 0.5;
+    try std.testing.expectEqual(controller.HitAction.schedule_suggestion, state.companion_controller.hitAt(x, y).?);
+    try std.testing.expectEqual(palette.platform.CursorShape.pointer, systemCursorAt(&state, x, y).?);
+    // The composer stays put below the view so a request can be typed.
+    const composer = composerRect(geometry.footer);
+    try std.testing.expect(composer.w > 0.0 and composer.y >= geometry.schedules.y + geometry.schedules.h);
+
+    state.companion_controller.setSchedulesError("Scheduled tasks need a newer Verde daemon. Relaunch Verde to use them.");
+    state.palette_overlay_batch.clear();
+    render(&state, 1360.0, 860.0);
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "Scheduled tasks need a newer Verde daemon."));
+    try std.testing.expect(!batchHasText(&state.palette_overlay_batch, "No scheduled tasks yet"));
+}
+
+test "expanded schedule detail selects and copies its name and prompt" {
+    const allocator = std.testing.allocator;
+    theme.applyTheme(1.0);
+    var state: runtime.AppState = undefined;
+    try testState(allocator, &state);
+    defer deinitTestState(allocator, &state);
+    setTestSchedules(&state, platform_runtime.unixTimestampMs());
+    openTestSchedulesView(&state, 1360.0, 860.0);
+    const companion = &state.companion_controller;
+    _ = companion.handleScheduleAction(.schedule_expand, 1);
+    const geometry = computeGeometry(&state, 1360.0, 860.0);
+    registerHits(&state, geometry);
+    render(&state, 1360.0, 860.0);
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "PROMPT"));
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "Ping the staging deploy."));
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "provider offline"));
+
+    const blocks = expandedScheduleBlocks(&state);
+    try std.testing.expectEqual(@as(?usize, 1), blocks.row);
+    try std.testing.expectEqual(@as(usize, 3), blocks.count);
+    const found = expandedDetailLayout(&state, geometry, &blocks).?;
+    const prompt_line = found.detail.blocks[1].lines[0];
+    // The prompt is selectable text: an I-beam, and a point at its start.
+    try std.testing.expectEqual(palette.platform.CursorShape.text, systemCursorAt(&state, prompt_line.x + 4.0, prompt_line.y + prompt_line.h * 0.5).?);
+    try std.testing.expectEqual(controller.TextPoint{ .item = 1, .offset = 0 }, schedulePointAt(&state, geometry, prompt_line.x - 2.0, prompt_line.y + prompt_line.h * 0.5).?);
+    try std.testing.expect(pointInRect(textArea(&state, geometry), prompt_line.x + 4.0, prompt_line.y + 2.0));
+
+    selectWordAt(&state, geometry.conversation, .{ .item = 1, .offset = 10 });
+    var copied = (try selectedTextAlloc(&state, allocator, geometry.conversation)).?;
+    try std.testing.expectEqualStrings("staging", copied);
+    allocator.free(copied);
+    selectItemAt(&state, geometry.conversation, 1);
+    copied = (try selectedTextAlloc(&state, allocator, geometry.conversation)).?;
+    try std.testing.expectEqualStrings("Ping the staging deploy.", copied);
+    allocator.free(copied);
+    selectAllConversation(&state, geometry.conversation);
+    copied = (try selectedTextAlloc(&state, allocator, geometry.conversation)).?;
+    defer allocator.free(copied);
+    try std.testing.expectEqualStrings("Deploy ping\n\nPing the staging deploy.\n\nprovider offline", copied);
+    state.palette_overlay_batch.clear();
+    render(&state, 1360.0, 860.0);
+    try expectBatchInsideWindow(&state.palette_overlay_batch, .{ .w = 1360.0, .h = 860.0 });
+
+    // Switching back to the conversation drops the detail selection.
+    companion.toggleSchedulesView();
+    try std.testing.expect(companion.textRange() == null);
 }

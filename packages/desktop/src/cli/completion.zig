@@ -64,6 +64,7 @@ fn writePowerShell(w: *std.Io.Writer) !void {
     try writePowerShellRoute(w, "integrations remove", &spec.integration_providers);
     try writePowerShellRoute(w, "integrations disable", &spec.integration_providers);
     try writePowerShellRoute(w, "session", &spec.session_commands);
+    try writePowerShellRoute(w, "schedule", &spec.schedule_commands);
     try writePowerShellRoute(w, "core", &spec.core_commands);
     try writePowerShellRoute(w, "mcp", &spec.mcp_commands);
     try writePowerShellRoute(w, "live", &spec.live_commands);
@@ -157,6 +158,10 @@ fn writeBash(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.integration_providers);
     try w.writeAll("\"\n  local session=\"");
     try writeWords(w, &spec.session_commands);
+    try w.writeAll("\"\n  local schedule=\"");
+    try writeWords(w, &spec.schedule_commands);
+    try w.writeAll("\"\n  local schedule_add_flags=\"");
+    try writeWords(w, &spec.schedule_add_flags);
     try w.writeAll("\"\n  local core=\"");
     try writeWords(w, &spec.core_commands);
     try w.writeAll("\"\n  local mcp=\"");
@@ -286,7 +291,7 @@ fn writeBash(w: *std.Io.Writer) !void {
         \\    --mode) COMPREPLY=( $(compgen -W "$inspector_mode_values" -- "$cur") ); return 0 ;;
         \\    --key) COMPREPLY=( $(compgen -W "$terminal_key_values" -- "$cur") ); return 0 ;;
         \\    --profile) COMPREPLY=( $(compgen -W "local" -- "$cur") ); return 0 ;;
-        \\    --workspace|--herdr-workspace|--project|--thread|--id|--pane|--first|--second|--ratio|--path|--url|--text|--key|--chord|--target|--script|--json-payload|--prompt|--call|--name|--model|--reasoning-variant|--lines|--command|--label|--cwd|--local-dir|--host|--user|--ssh-port|--gateway-port|--expected-runtime-id) return 0 ;;
+        \\    --workspace|--herdr-workspace|--project|--thread|--id|--pane|--first|--second|--ratio|--path|--url|--text|--key|--chord|--target|--script|--json-payload|--prompt|--call|--name|--model|--reasoning-variant|--lines|--command|--label|--cwd|--local-dir|--host|--user|--ssh-port|--gateway-port|--expected-runtime-id|--at|--in|--every|--daily|--weekdays|--parent-thread-id|--parent-workspace) return 0 ;;
         \\  esac
         \\
         \\  if [[ "$cur" == -* ]]; then
@@ -341,6 +346,13 @@ fn writeBash(w: *std.Io.Writer) !void {
         \\          write) COMPREPLY=( $(compgen -W "--id --text --json" -- "$cur") ) ;;
         \\          tail) COMPREPLY=( $(compgen -W "--id --lines --json" -- "$cur") ) ;;
         \\          kill) COMPREPLY=( $(compgen -W "--id --json" -- "$cur") ) ;;
+        \\          *) COMPREPLY=( $(compgen -W "$json_flags" -- "$cur") ) ;;
+        \\        esac
+        \\        ;;
+        \\      schedule)
+        \\        case "$sub" in
+        \\          list) COMPREPLY=( $(compgen -W "--workspace --json" -- "$cur") ) ;;
+        \\          add) COMPREPLY=( $(compgen -W "$schedule_add_flags" -- "$cur") ) ;;
         \\          *) COMPREPLY=( $(compgen -W "$json_flags" -- "$cur") ) ;;
         \\        esac
         \\        ;;
@@ -427,6 +439,7 @@ fn writeBash(w: *std.Io.Writer) !void {
         \\    2:runtime:*) COMPREPLY=( $(compgen -W "$runtime" -- "$cur") ) ;;
         \\    2:integrations:*) COMPREPLY=( $(compgen -W "$integrations" -- "$cur") ) ;;
         \\    2:session:*) COMPREPLY=( $(compgen -W "$session" -- "$cur") ) ;;
+        \\    2:schedule:*) COMPREPLY=( $(compgen -W "$schedule" -- "$cur") ) ;;
         \\    2:core:*) COMPREPLY=( $(compgen -W "$core" -- "$cur") ) ;;
         \\    2:mcp:*) COMPREPLY=( $(compgen -W "$mcp" -- "$cur") ) ;;
         \\    2:live:*) COMPREPLY=( $(compgen -W "$live" -- "$cur") ) ;;
@@ -480,6 +493,10 @@ fn writeZsh(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.integration_providers);
     try w.writeAll("\"\n  local session=\"");
     try writeWords(w, &spec.session_commands);
+    try w.writeAll("\"\n  local schedule=\"");
+    try writeWords(w, &spec.schedule_commands);
+    try w.writeAll("\"\n  local schedule_add_flags=\"");
+    try writeWords(w, &spec.schedule_add_flags);
     try w.writeAll("\"\n  local core=\"");
     try writeWords(w, &spec.core_commands);
     try w.writeAll("\"\n  local mcp=\"");
@@ -609,7 +626,7 @@ fn writeZsh(w: *std.Io.Writer) !void {
         \\    --mode) compadd -- ${(s: :)inspector_mode_values}; return ;;
         \\    --key) compadd -- ${(s: :)terminal_key_values}; return ;;
         \\    --profile) compadd -- local; return ;;
-        \\    --workspace|--herdr-workspace|--project|--thread|--id|--pane|--first|--second|--ratio|--path|--url|--text|--key|--chord|--target|--script|--json-payload|--prompt|--call|--name|--model|--reasoning-variant|--lines|--command|--label|--cwd|--local-dir|--host|--user|--ssh-port|--gateway-port|--expected-runtime-id) return ;;
+        \\    --workspace|--herdr-workspace|--project|--thread|--id|--pane|--first|--second|--ratio|--path|--url|--text|--key|--chord|--target|--script|--json-payload|--prompt|--call|--name|--model|--reasoning-variant|--lines|--command|--label|--cwd|--local-dir|--host|--user|--ssh-port|--gateway-port|--expected-runtime-id|--at|--in|--every|--daily|--weekdays|--parent-thread-id|--parent-workspace) return ;;
         \\  esac
         \\
         \\  if [[ "$cur" == -* ]]; then
@@ -664,6 +681,13 @@ fn writeZsh(w: *std.Io.Writer) !void {
         \\          write) compadd -- --id --text --json ;;
         \\          tail) compadd -- --id --lines --json ;;
         \\          kill) compadd -- --id --json ;;
+        \\          *) compadd -- ${(s: :)json_flags} ;;
+        \\        esac
+        \\        ;;
+        \\      schedule)
+        \\        case "$sub" in
+        \\          list) compadd -- --workspace --json ;;
+        \\          add) compadd -- ${(s: :)schedule_add_flags} ;;
         \\          *) compadd -- ${(s: :)json_flags} ;;
         \\        esac
         \\        ;;
@@ -750,6 +774,7 @@ fn writeZsh(w: *std.Io.Writer) !void {
         \\    3:runtime:*) compadd -- ${(s: :)runtime} ;;
         \\    3:integrations:*) compadd -- ${(s: :)integrations} ;;
         \\    3:session:*) compadd -- ${(s: :)session} ;;
+        \\    3:schedule:*) compadd -- ${(s: :)schedule} ;;
         \\    3:core:*) compadd -- ${(s: :)core} ;;
         \\    3:mcp:*) compadd -- ${(s: :)mcp} ;;
         \\    3:live:*) compadd -- ${(s: :)live} ;;
@@ -815,6 +840,8 @@ fn writeFish(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.integration_providers);
     try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after session' -a '");
     try writeWords(w, &spec.session_commands);
+    try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after schedule' -a '");
+    try writeWords(w, &spec.schedule_commands);
     try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after core' -a '");
     try writeWords(w, &spec.core_commands);
     try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after mcp' -a '");
@@ -885,6 +912,14 @@ fn writeFish(w: *std.Io.Writer) !void {
         \\complete -c verde -l mode -r -d 'Browser inspector mode'
         \\complete -c verde -l command -r -d 'Command palette id'
         \\complete -c verde -l label -r -d 'Workspace label'
+        \\complete -c verde -l at -r -d 'Scheduled time, "YYYY-MM-DD HH:MM" local'
+        \\complete -c verde -l in -r -d 'Run once after a delay such as 30m or 2h'
+        \\complete -c verde -l every -r -d 'Repeat interval such as 2h'
+        \\complete -c verde -l daily -r -d 'Daily local time HH:MM'
+        \\complete -c verde -l weekdays -r -d 'Days for --daily, such as mon-fri'
+        \\complete -c verde -l parent-thread-id -r -d 'Parent chat that hears results'
+        \\complete -c verde -l parent-workspace -r -d 'Workspace of the parent chat'
+        \\complete -c verde -l disabled -d 'Create the scheduled task disabled'
         \\complete -c verde -s h -l help -d 'Show help'
         \\
         \\complete -c verde -n '__verde_prev_is --kind' -a '

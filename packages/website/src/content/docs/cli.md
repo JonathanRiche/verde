@@ -339,6 +339,42 @@ verde session cleanup [--json]
 `attach` is interactive. For automation, prefer `write`, `tail`, and `screen`
 with an explicit session id.
 
+## Scheduled tasks
+
+A scheduled task sends a prompt into a chat later or on a repeat. The session
+daemon owns them, so they fire with the desktop app closed, and the CLI, MCP
+tools, the Companion, and the mobile apps all manage the same list.
+
+```bash
+verde schedule list [--workspace <id>] [--json]
+verde schedule add --prompt <text> [--name <name>] --workspace <id> \
+  (--thread <thread-id> | --provider <provider> [--model <model>]) \
+  (--at "YYYY-MM-DD HH:MM" | --in 30m | --every 2h | --daily HH:MM [--weekdays mon-fri]) \
+  [--parent-thread-id <thread-id> [--parent-workspace <id>]] [--disabled] [--json]
+verde schedule enable|disable|remove|run <schedule-id> [--json]
+```
+
+- **Target.** `--thread` sends each run into an existing chat. `--provider`
+  (with an optional `--model`) opens a new chat in the workspace on every run,
+  titled with the task's name. `--workspace` defaults to `VERDE_WORKSPACE_ID`.
+- **Repeat.** `--at` runs once at a local date and time, `--in` runs once after
+  a delay, `--every` repeats on an interval (5 minutes to 7 days), and `--daily`
+  runs at a local time, optionally only on `--weekdays` such as `mon-fri`,
+  `sat,sun`, `weekdays`, or `weekends`. Durations take `m`, `h`, or `d`.
+- **Reporting back.** With `--parent-thread-id`, new chats a run opens are linked
+  to that chat and report their results to it, the same way `open_chat` links a
+  child.
+- `run` fires a task now without moving its next run; a one-time task is used
+  up. `--disabled` creates a task paused; `enable` and `disable` toggle it.
+- `--name` defaults to the first line of the prompt.
+
+Times are the desktop machine's local time and follow daylight saving changes.
+After each run the next run is counted from that moment, so runs missed while
+the daemon was stopped never stack up: a missed task fires once when the daemon
+starts again and reports `late`. If the target chat is busy, the prompt is
+queued as a follow-up and the task reports `queued`. Each task's last status is
+`ok`, `queued`, `late`, or `failed` (with an error message).
+
 ## MCP bridge
 
 `verde mcp` starts a JSONL stdio MCP server that exposes Verde's local live
@@ -376,6 +412,11 @@ discovery.
 - Capabilities are granular: a tool that cannot run in the current
   configuration returns `capability_unavailable` instead of failing
   ambiguously. Discover the active surface with `verde capabilities --json`.
+
+`list_schedules`, `create_schedule`, `update_schedule`, `delete_schedule`, and
+`run_schedule` manage [scheduled tasks](#scheduled-tasks) with the same fields
+as the daemon's `schedule.*` methods. An agent should pass its own thread id as
+`parent_thread_id` so new chats a run opens report back to it.
 
 ### Process coordination and retained outcomes
 

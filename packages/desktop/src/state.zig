@@ -60,6 +60,7 @@ const composer_controller = @import("state/composer_controller.zig");
 const companion_controller = @import("state/companion_controller.zig");
 const companion_roster_mod = @import("state/companion_roster.zig");
 const companion_sync_mod = @import("state/companion_sync.zig");
+const schedules_sync_mod = @import("state/schedules_sync.zig");
 const linked_chats_controller = @import("state/linked_chats_controller.zig");
 pub const resource_waiters_controller = @import("state/resource_waiters.zig");
 const browser_controller = @import("state/browser_controller.zig");
@@ -4876,6 +4877,8 @@ pub const AppState = struct {
     companion_roster: companion_roster_mod = .{},
     /// Background sync with the daemon-owned roster.
     companion_sync: companion_sync_mod = .{},
+    /// Background calls to the daemon's scheduled tasks (Companion panel).
+    companion_schedules: schedules_sync_mod = .{},
     /// Last Companion thread/offset whose newest transcript page was requested,
     /// so the panel hydrates it once instead of every frame.
     companion_hydration_thread: companion_controller.ExactText = .{},
@@ -14125,6 +14128,19 @@ pub const AppState = struct {
         self.blurCompanionComposer();
     }
 
+    /// Puts `text` in the Companion composer without sending, so the user
+    /// can adjust an example request first.
+    pub fn prefillCompanionComposer(self: *AppState, text: []const u8) void {
+        const location = self.ensureActiveCompanionThread() catch |err| {
+            log.err("failed to create Companion thread for prefill: {s}", .{@errorName(err)});
+            self.companion_controller.ui_error = "Could not start the companion's conversation.";
+            return;
+        };
+        location.thread.setDraft(text);
+        _ = self.companion_composer.handleInput(self.allocator, .{ .focus = true }) catch {};
+        self.markDirty();
+    }
+
     pub fn sendCompanionSuggestion(self: *AppState, index: usize) void {
         if (index >= COMPANION_SUGGESTIONS.len) return;
         submitCompanionPrompt(self, COMPANION_SUGGESTIONS[index]);
@@ -16568,6 +16584,7 @@ pub const AppState = struct {
         // Join linked-chat fetch workers before any owner they read from goes away.
         self.linked_chats.deinit(self.allocator);
         self.companion_sync.deinit();
+        self.companion_schedules.deinit();
         self.resource_waiters.deinit(self.allocator);
         // Flag the cursor loop first so an in-flight long-poll (bounded by
         // the 4s wait budget + 5s transport timeout) drains concurrently with

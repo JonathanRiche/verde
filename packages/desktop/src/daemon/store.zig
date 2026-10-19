@@ -485,6 +485,7 @@ pub const Store = struct {
         @import("push.zig").initialize(conn) catch |err| return mapOpenError(err);
         @import("chat_links.zig").initialize(conn) catch |err| return mapOpenError(err);
         @import("companions.zig").initialize(conn) catch |err| return mapOpenError(err);
+        @import("schedules.zig").initialize(conn) catch |err| return mapOpenError(err);
         if (runtime_identity) |identity| {
             connect_store.initialize(conn, identity.runtime_id, identity.instance_id) catch |err|
                 return mapOpenError(err);

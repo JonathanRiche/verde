@@ -250,6 +250,16 @@ characters, models, standing orders) show up in the desktop app, the web
 client, and the mobile apps, and a message sent from your phone gets the same
 orchestrator. The feature stays experimental and is off by default.
 
+### Scheduled tasks
+
+Ask the companion for something later or on a repeat ("remind me at 4pm",
+"check CI every weekday at 9") and it creates a scheduled task with Verde's MCP
+tools. Each run sends the prompt into its own conversation, or into a new chat
+in a workspace that reports back to it. Scheduled tasks live in the session
+daemon, so they fire while the desktop app is closed and every client sees
+the same list. Manage them from the terminal with
+[`verde schedule`](/docs/cli#scheduled-tasks).
+
 ## Command palette and slash commands
 
 `Ctrl+Shift+P` opens the command palette — a single ranked list of threads, panes,
