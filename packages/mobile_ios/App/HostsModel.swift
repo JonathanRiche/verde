@@ -357,7 +357,7 @@ extension HostsModel: PushHosts {
 }
 
 func hostStatus(_ row: HostRow) -> String {
-    if row.fatal { return "Connection unavailable — reopen Verde" }
+    if row.fatal { return "Connection unavailable — reopen verde" }
     guard let view = row.view, view.auth_state != "loading" else { return "Loading" }
     if view.auth_state == "signed_out" { return "Signed out" }
     if view.auth_state == "signing_out" { return "Removing local data" }

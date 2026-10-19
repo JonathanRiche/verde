@@ -327,7 +327,7 @@ internal fun AddWorkspaceScreen(browse: BrowseModel, manage: ManageModel, onCrea
         section("Browse folders")
         if (directory == null) return@ManageFrame
         if (!directory.supported) {
-            line("browse-unsupported", "Update Verde on the computer to browse folders. You can still type a path.")
+            line("browse-unsupported", "Update verde on the computer to browse folders. You can still type a path.")
             return@ManageFrame
         }
         if (directory.suggestions.isNotEmpty()) item(key = "suggestions") {
@@ -399,7 +399,7 @@ internal fun WorkspaceActions(state: BrowseState, manage: ManageModel, workspace
     }
     if (closing) {
         AlertDialog(onDismissRequest = { closing = false }, title = { Text("Close ${workspace.label}?") },
-            text = { Text("Verde stops this workspace's terminals and moves it to Closed. Its chats stay in history, and you can reopen it later.") },
+            text = { Text("verde stops this workspace's terminals and moves it to Closed. Its chats stay in history, and you can reopen it later.") },
             confirmButton = { TextButton(onClick = { closing = false; intent = manage.close(workspace.workspace_id) }) { Text("Close workspace") } },
             dismissButton = { TextButton(onClick = { closing = false }) { Text("Cancel") } })
     }

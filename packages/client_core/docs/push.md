@@ -88,7 +88,7 @@ decrypt or payload problem instead returns a displayable `PushNotification`:
 | `duplicate` | `dedupe_key` is in `recent`; the platform should suppress it |
 
 When the envelope cannot be opened, the result is the generic
-`Verde` / `A Verde chat needs attention` model that deep-links to `verde://open`.
+`verde` / `A verde chat needs attention` model that deep-links to `verde://open`.
 A payload whose `runtime_id` differs from the record's runtime is treated as
 invalid even if it decrypts. The kind aliases `done` and `approval` normalize to
 `completed` and `approval_pending`. The `test` kind has no dedupe key.

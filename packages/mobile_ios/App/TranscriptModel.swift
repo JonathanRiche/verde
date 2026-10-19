@@ -39,7 +39,7 @@ struct TranscriptState {
 /// Transcript-level banner: host gates first (shared with browse), then this thread's own error.
 func transcriptBanner(_ state: TranscriptState, _ nowMs: Int64) -> Banner? {
     let browse = state.browse
-    if state.unavailable { return Banner(text: "Connection unavailable — reopen Verde.", error: true) }
+    if state.unavailable { return Banner(text: "Connection unavailable — reopen verde.", error: true) }
     if needsPairing(browse) {
         return Banner(text: "This phone isn't paired with \(browse.row?.saved.label ?? "this host").", action: .hosts, error: true)
     }

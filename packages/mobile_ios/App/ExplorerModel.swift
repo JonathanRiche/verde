@@ -50,7 +50,7 @@ func changeLetter(_ file: GitWorkspaceFile) -> String {
     }
 }
 
-let explorerUpdateText = "Update Verde on the computer to use this."
+let explorerUpdateText = "Update verde on the computer to use this."
 
 func explorerErrorText(_ error: LocalError?) -> String? {
     guard let error else { return nil }

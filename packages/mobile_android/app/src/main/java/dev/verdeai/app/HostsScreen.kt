@@ -52,7 +52,7 @@ internal fun HostsScreen(model: HostsModel, onUse: () -> Unit = {}, onSecurity: 
                     else Button(shape = MaterialTheme.shapes.small, onClick=model::load) { Text("Retry loading hosts") }
                 }
                 else -> {
-                    if (state.rows.isEmpty()) Text("No saved hosts. Add a host to pair with Verde.")
+                    if (state.rows.isEmpty()) Text("No saved hosts. Add a host to pair with verde.")
                     state.rows.forEach { row ->
                         val id = row.saved.id
                         val pending = row.busy || row.operation?.state == "pending"
@@ -123,7 +123,7 @@ internal fun HostsScreen(model: HostsModel, onUse: () -> Unit = {}, onSecurity: 
         AlertDialog(onDismissRequest={ confirmation=null },
             title={ Text(if (forget) "Remove $name from this phone?" else "Sign out of $name?") },
             text={ Text(if (forget) "This removes the local credential and host trust. This device may remain listed on the desktop until you revoke it there."
-                else "Verde will revoke this phone's access to this host and remove its local credential and trust. Other hosts stay paired.") },
+                else "verde will revoke this phone's access to this host and remove its local credential and trust. Other hosts stay paired.") },
             confirmButton={ TextButton(onClick={ confirmation=null; model.signOut(id, forget) }) { Text(if (forget) "Remove anyway" else "Sign out") } },
             dismissButton={ TextButton(onClick={ confirmation=null }) { Text("Cancel") } })
     }

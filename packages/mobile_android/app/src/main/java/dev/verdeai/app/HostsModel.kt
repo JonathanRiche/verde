@@ -208,7 +208,7 @@ internal class HostsModel(private val store: SecureStore,
 }
 
 internal fun hostStatus(row: HostRow): String = when {
-    row.fatal -> "Connection unavailable — reopen Verde"
+    row.fatal -> "Connection unavailable — reopen verde"
     row.view == null || row.view.auth_state == "loading" -> "Loading"
     row.view.auth_state == "signed_out" -> "Signed out"
     row.view.auth_state == "signing_out" -> "Removing local data"

@@ -433,7 +433,7 @@ fn directory(tx: *h.Transaction, id: []const u8, requested: V) E!void {
     s.directory_id = null;
     s.directory.loading = false;
     var err: ?h.LocalError = null;
-    if (!online(tx)) err = failure("unavailable", "Connect to the host first.") else if (!scoped(&tx.state, "repository:read")) err = failure("insufficient_scope", "This device may not browse folders.") else if (!capable(&tx.state, "workspace.directory.v1")) err = failure("unsupported", "Update Verde on the computer to browse folders.");
+    if (!online(tx)) err = failure("unavailable", "Connect to the host first.") else if (!scoped(&tx.state, "repository:read")) err = failure("insufficient_scope", "This device may not browse folders.") else if (!capable(&tx.state, "workspace.directory.v1")) err = failure("unsupported", "Update verde on the computer to browse folders.");
     const raw = if (requested == .string and std.mem.trim(u8, requested.string, " \t\r\n").len > 0) requested.string else try defaultRoot(tx.allocator(), &tx.state);
     const path = cleanPath(raw) orelse blk: {
         if (err == null) err = failure("invalid_path", "Choose an absolute folder path.");

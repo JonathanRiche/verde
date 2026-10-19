@@ -98,7 +98,7 @@ internal data class TranscriptRenderers(
 /** Transcript-level banner: host gates first (shared with browse), then this thread's own error. */
 internal fun transcriptBanner(state: TranscriptState, nowMs: Long): Banner? {
     val browse = state.browse
-    if (state.fatal) return Banner("Connection unavailable — reopen Verde.", error=true)
+    if (state.fatal) return Banner("Connection unavailable — reopen verde.", error=true)
     if (needsPairing(browse)) return Banner("This phone isn't paired with ${browse.row?.saved?.label ?: "this host"}.", BannerAction.Hosts, error=true)
     browseBanner(browse.copy(home=null, workspaces=null, savedAtMs=null), nowMs)?.let { return it }
     // A failed approval decision also lands in the thread error; the approval card reports it.

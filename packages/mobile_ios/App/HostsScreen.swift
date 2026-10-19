@@ -24,7 +24,7 @@ struct HostsScreen: View {
                     if model.busy { ProgressView() }
                     else { Button("Retry loading hosts") { model.load() } }
                 } else {
-                    if model.rows.isEmpty { Text("No saved hosts. Add a host to pair with Verde.") }
+                    if model.rows.isEmpty { Text("No saved hosts. Add a host to pair with verde.") }
                     ForEach(model.rows, id: \.saved.id) { row in
                         Section { HostCard(model: model, row: row, onUse: onUse) { confirmation = $0 } }
                     }
@@ -47,7 +47,7 @@ struct HostsScreen: View {
         } message: { item in
             Text(item.forget
                  ? "This removes the local credential and host trust. This device may remain listed on the desktop until you revoke it there."
-                 : "Verde will revoke this phone's access to this host and remove its local credential and trust. Other hosts stay paired.")
+                 : "verde will revoke this phone's access to this host and remove its local credential and trust. Other hosts stay paired.")
         }
     }
 }

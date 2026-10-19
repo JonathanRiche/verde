@@ -68,7 +68,7 @@ final class PairingModel {
     var error: LocalError? { row?.error ?? operation?.error }
     var errorText: String? {
         if let inputError { return inputError }
-        if fatal { return "The connection stopped unexpectedly. Close and reopen Verde to try again." }
+        if fatal { return "The connection stopped unexpectedly. Close and reopen verde to try again." }
         guard let error else { return nil }
         if error.domain == "storage" { return "Could not save or load this host in Keychain. Unlock your phone, then retry." }
         switch error.code {
@@ -79,7 +79,7 @@ final class PairingModel {
         case "tls_rejected": return "The host's secure connection could not be verified. Check its certificate and address."
         case "network_unavailable": return "Could not reach the host. Check Tailscale and your network, then retry."
         case "discovery_rejected", "identity_rejected": return "The host identity could not be verified. Check the host before pairing again."
-        default: return "Pairing could not complete. Check that Verde is up to date on your phone and host."
+        default: return "Pairing could not complete. Check that verde is up to date on your phone and host."
         }
     }
 
@@ -101,7 +101,7 @@ final class PairingModel {
             await drain()
         } catch {
             openFailed = true
-            inputError = "Could not open the connection. Close and reopen Verde to try again."
+            inputError = "Could not open the connection. Close and reopen verde to try again."
             store.onApply?()
         }
     }
@@ -148,7 +148,7 @@ final class PairingModel {
     }
 
     func open(_ url: URL) async {
-        guard PairingInput.routes(url) else { inputError = "This is not a Verde pairing link."; return }
+        guard PairingInput.routes(url) else { inputError = "This is not a verde pairing link."; return }
         await receive(url.absoluteString)
     }
 

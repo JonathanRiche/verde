@@ -58,8 +58,8 @@ struct VerdeWordmark: View {
     var body: some View {
         HStack(spacing: 8) {
             Image(uiImage: UIImage(named: "verde_logo") ?? UIImage()).resizable().renderingMode(.template).scaledToFit().frame(width: 26, height: 26).foregroundStyle(VerdeTheme.accent)
-            Text("Verde").font(VerdeTheme.display()).tracking(-0.72)
-        }.accessibilityElement(children: .ignore).accessibilityLabel("Verde")
+            Text("verde").font(VerdeTheme.display()).tracking(-0.72)
+        }.accessibilityElement(children: .ignore).accessibilityLabel("verde")
     }
 }
 struct ProviderGlyph: View {

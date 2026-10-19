@@ -199,9 +199,9 @@ internal fun problemText(problem: FileProblem, limit: Long): Pair<String, String
     FileProblem.NotFound -> "File not found" to "It may have been moved or deleted on the host."
     FileProblem.Offline -> "Can't reach the host" to "Check your connection and try again."
     FileProblem.Timeout -> "Host took too long" to "Try again. If this keeps happening, check the host's connection."
-    FileProblem.Interrupted -> "Loading interrupted" to "Return to Verde and try again."
+    FileProblem.Interrupted -> "Loading interrupted" to "Return to verde and try again."
     FileProblem.Busy -> "Too many files loading" to "Wait for the other files to finish, then try again."
-    FileProblem.ServerUnavailable -> "Host couldn't serve the file" to "Try again. If this keeps happening, check Verde on the host."
+    FileProblem.ServerUnavailable -> "Host couldn't serve the file" to "Try again. If this keeps happening, check verde on the host."
     FileProblem.Unauthorized -> "Phone access refused" to "Reconnect to the host. If access is still refused, pair this phone again."
     FileProblem.Identity -> "Host identity not verified" to "Check the host's certificate and trust settings before reconnecting."
     FileProblem.Unsupported -> "No preview for this file" to "This file type can't be previewed on the phone. Download it to open it in another app."
@@ -221,13 +221,13 @@ internal fun downloadFailureText(problem: FileProblem): String = when (problem) 
     FileProblem.Offline -> "Can't reach the host. Check Tailscale and your connection"
     FileProblem.Unavailable -> "Host not connected. Reconnect and try again"
     FileProblem.Timeout -> "Download timed out. Try again"
-    FileProblem.Interrupted -> "Download interrupted. Return to Verde and try again"
+    FileProblem.Interrupted -> "Download interrupted. Return to verde and try again"
     FileProblem.Busy -> "Too many files loading. Wait and try again"
-    FileProblem.ServerUnavailable -> "Host couldn't serve the file. Check Verde on the host and retry"
+    FileProblem.ServerUnavailable -> "Host couldn't serve the file. Check verde on the host and retry"
     FileProblem.Unauthorized -> "Phone access refused. Reconnect or pair this phone again"
     FileProblem.Identity -> "Host identity not verified. Check the host's trust settings"
     // Hosts before attachment downloads refuse HTML/SVG/scripts outright.
-    FileProblem.Unsupported -> "Update Verde on the host to download this file type"
+    FileProblem.Unsupported -> "Update verde on the host to download this file type"
     else -> "Couldn't download the file"
 }
 

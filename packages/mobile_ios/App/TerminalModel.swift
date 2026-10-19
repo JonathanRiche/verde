@@ -129,7 +129,7 @@ func terminalNotice(failure: String?, terminalID: String?, view: TerminalView?, 
     if let failure { return failure }
     if b.hostID != hostID { return "This terminal belongs to another host. Switch hosts to use it." }
     if !b.networkAvailable { return "You're offline. Showing the last screen; input is paused." }
-    if b.fatal || b.row?.fatal == true { return "Connection unavailable — reopen Verde." }
+    if b.fatal || b.row?.fatal == true { return "Connection unavailable — reopen verde." }
     if b.host?.phase != "ready" { return "Reconnecting… Showing the last screen; input is paused." }
     if terminalID == nil { return "Opening a new terminal…" }
     guard let view else { return "Opening terminal…" }
@@ -153,7 +153,7 @@ enum FocusClaim {
 /// never kills the session. Terminal contents are never logged.
 @MainActor @Observable
 final class TerminalModel {
-    static let tooMany = "Too many terminals were opened this session. Reopen Verde to open more."
+    static let tooMany = "Too many terminals were opened this session. Reopen verde to open more."
 
     let hostID: String?
     let workspaceID: String
@@ -307,7 +307,7 @@ final class TerminalModel {
         guard let session = browse.hosts.session(hostID) else { fail("This host is no longer available."); return }
         await session.start()
         guard !closed else { return }
-        guard let host = session.host else { fail("Connection unavailable — reopen Verde."); return }
+        guard let host = session.host else { fail("Connection unavailable — reopen verde."); return }
         self.host = host
         if let id = terminalID { await attach(host, id) } else { pendingCreate = true; reevaluate() }
     }
@@ -315,7 +315,7 @@ final class TerminalModel {
     private func attach(_ host: CoreHost, _ id: String) async {
         let vt: TerminalVT
         do { vt = try await host.openTerminal(id, replies: canWrite(browse.state.host)) }
-        catch { fail("Connection unavailable — reopen Verde."); return }
+        catch { fail("Connection unavailable — reopen verde."); return }
         if closed { await host.closeTerminal(id, vt); return }
         observe(host, id, vt)
         do {
@@ -323,7 +323,7 @@ final class TerminalModel {
                 intent_id: UUID().uuidString, terminal_id: id)))
         } catch CoreBridgeError.rejected(let status) {
             fail(status == 5 ? Self.tooMany : "Couldn't open this terminal.")
-        } catch { fail("Connection unavailable — reopen Verde.") }
+        } catch { fail("Connection unavailable — reopen verde.") }
     }
 
     /// The core needs a measured grid and a ready connection; creation is never retried automatically.

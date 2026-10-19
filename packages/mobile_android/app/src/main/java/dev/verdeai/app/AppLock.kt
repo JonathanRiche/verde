@@ -156,7 +156,7 @@ internal class AppLockModel(
 
     fun unlock(auth: DeviceAuth) {
         if (!state.value.locked) return
-        prompt(auth, "Unlock Verde") { outcome ->
+        prompt(auth, "Unlock verde") { outcome ->
             when (outcome) {
                 AuthOutcome.Success -> mutableState.update { it.copy(locked = false, message = null) }
                 AuthOutcome.Unavailable -> mutableState.update { it.copy(locked = false, available = false, message = null) }
@@ -215,7 +215,7 @@ internal class AppLockModel(
             try {
                 writes.withLock { store.put(KEY, LockJson.encodeToString(LockSettings.serializer(), state.value.settings)) }
             } catch (e: CancellationException) { throw e } catch (_: Exception) {
-                mutableState.update { it.copy(saveError = "Couldn't save this setting. It applies until Verde restarts.") }
+                mutableState.update { it.copy(saveError = "Couldn't save this setting. It applies until verde restarts.") }
             }
         }
     }

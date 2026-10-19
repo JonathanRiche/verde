@@ -73,7 +73,7 @@ internal fun changeLetter(file: GitWorkspaceFile) = when {
 
 internal fun explorerErrorText(error: LocalError?): String? = error?.let {
     when (it.code) {
-        "unsupported", "method_not_found" -> "Update Verde on the computer to use this."
+        "unsupported", "method_not_found" -> "Update verde on the computer to use this."
         "scope_denied", "forbidden" -> "This phone isn't allowed to browse workspace files."
         "offline", "cancelled" -> "Connect to the host to refresh."
         "path_outside_roots" -> "This path is outside the workspace folders."

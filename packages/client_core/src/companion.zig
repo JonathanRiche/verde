@@ -209,7 +209,7 @@ pub fn intent(tx: *h.Transaction, tag: []const u8, event: V) E!void {
     }
     // companion_save
     if (!scoped(&tx.state, "chat:write")) return receipt(tx, id, "failed", failure("insufficient_scope", "This phone can't change companions on this host."));
-    if (!s.view.supported) return receipt(tx, id, "failed", failure("unsupported", "Update Verde on the computer to use companions."));
+    if (!s.view.supported) return receipt(tx, id, "failed", failure("unsupported", "Update verde on the computer to use companions."));
     if (s.put_id != null) return receipt(tx, id, "failed", failure("busy", "Still saving the last change. Try again shortly."));
     const r = try h.decode(struct { roster: Roster, expected_revision: []const u8 }, tx.allocator(), event);
     const expected = std.fmt.parseInt(i64, r.expected_revision, 10) catch return receipt(tx, id, "failed", failure("invalid_revision", "Refresh companions and try again."));
@@ -614,7 +614,7 @@ fn named(e: h.LocalError) h.LocalError {
     if (eq(code, "conflict")) {
         out.message = "Companions changed on another device.";
     } else if (unsupported(e)) {
-        out.message = "Update Verde on the computer to use companions.";
+        out.message = "Update verde on the computer to use companions.";
     } else if (eq(code, "invalid_params")) {
         out.message = "The host rejected this companion.";
     } else if (eq(code, "cancelled") or eq(code, "offline") or eq(e.domain, "transport")) {

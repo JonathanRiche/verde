@@ -51,7 +51,7 @@ targets:
     info:
       path: Generated/App-Info.plist
       properties:
-        CFBundleDisplayName: Verde
+        CFBundleDisplayName: verde
         VerdePushRelayURL: $(VERDE_PUSH_RELAY_URL)
         VerdeAPSEnvironment: $(VERDE_APS_ENVIRONMENT)
         VerdeSharedKeychainGroup: $(AppIdentifierPrefix)dev.verdeai.app.shared
@@ -61,10 +61,10 @@ targets:
         # Only standard TLS/platform crypto (export-exempt); skips the per-build compliance prompt.
         ITSAppUsesNonExemptEncryption: false
         UIAppFonts: [cal_sans.ttf, jetbrains_mono.ttf, noto_sans_bold.ttf, noto_sans_regular.ttf]
-        NSFaceIDUsageDescription: Unlock Verde to access your chats and paired hosts.
-        NSCameraUsageDescription: Scan a Verde pairing QR code or attach a photo to a chat.
-        NSMicrophoneUsageDescription: Talk to your Verde companion. The microphone is only on while you're talking to it.
-        NSSpeechRecognitionUsageDescription: Turn what you say to your Verde companion into a message. Speech is recognized on this iPhone unless you allow server recognition in Companion settings.
+        NSFaceIDUsageDescription: Unlock verde to access your chats and paired hosts.
+        NSCameraUsageDescription: Scan a verde pairing QR code or attach a photo to a chat.
+        NSMicrophoneUsageDescription: Talk to your verde companion. The microphone is only on while you're talking to it.
+        NSSpeechRecognitionUsageDescription: Turn what you say to your verde companion into a message. Speech is recognized on this iPhone unless you allow server recognition in Companion settings.
         CFBundleURLTypes:
           - CFBundleURLName: dev.verdeai.app.pair
             CFBundleURLSchemes: [verde]
@@ -114,7 +114,7 @@ targets:
     info:
       path: Generated/NotificationServiceExtension-Info.plist
       properties:
-        CFBundleDisplayName: Verde
+        CFBundleDisplayName: verde
         VerdeSharedKeychainGroup: $(AppIdentifierPrefix)dev.verdeai.app.shared
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)

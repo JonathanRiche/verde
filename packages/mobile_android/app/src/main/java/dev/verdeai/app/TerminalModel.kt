@@ -128,13 +128,13 @@ internal class TerminalModel(
 
     private suspend fun attach(host: CoreHost, id: String) {
         val terminal = try { host.openTerminal(id, replies = canWrite(browse.state.value.host)) }
-            catch (e: CancellationException) { throw e } catch (_: Exception) { fail("Connection unavailable — reopen Verde."); return }
+            catch (e: CancellationException) { throw e } catch (_: Exception) { fail("Connection unavailable — reopen verde."); return }
         observe(host, id, terminal)
         try {
             host.send { n, w -> EventTerminalAttach(now_ms = n, wall_time_ms = w, intent_id = UUID.randomUUID().toString(), terminal_id = id) }
         } catch (e: CancellationException) { throw e } catch (e: CoreInputRejected) {
             fail(if (e.status == 5) TOO_MANY else "Couldn't open this terminal.")
-        } catch (_: Exception) { fail("Connection unavailable — reopen Verde.") }
+        } catch (_: Exception) { fail("Connection unavailable — reopen verde.") }
     }
 
     private fun observe(host: CoreHost, id: String, terminal: TerminalVt) {
@@ -241,6 +241,6 @@ internal class TerminalModel(
     companion object {
         private val released = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
         const val CREATED_KEY = "created_terminal"
-        private const val TOO_MANY = "Too many terminals were opened this session. Reopen Verde to open more."
+        private const val TOO_MANY = "Too many terminals were opened this session. Reopen verde to open more."
     }
 }

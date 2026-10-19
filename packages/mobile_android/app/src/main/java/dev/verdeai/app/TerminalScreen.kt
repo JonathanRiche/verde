@@ -52,7 +52,7 @@ internal fun terminalNotice(s: TerminalUiState, b: BrowseState, hostId: String?)
         s.failure != null -> s.failure
         b.hostId != hostId -> "This terminal belongs to another host. Switch hosts to use it."
         !b.networkAvailable -> "You're offline. Showing the last screen; input is paused."
-        b.row?.fatal == true -> "Connection unavailable — reopen Verde."
+        b.row?.fatal == true -> "Connection unavailable — reopen verde."
         b.host?.phase != "ready" -> "Reconnecting… Showing the last screen; input is paused."
         s.terminalId == null -> "Opening a new terminal…"
         view == null -> "Opening terminal…"

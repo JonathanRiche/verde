@@ -46,7 +46,7 @@ internal fun pushStatusText(state: PushUiState): String = when (state.status) {
     PushStatus.Registering -> "Setting up notifications…"
     PushStatus.WaitingForHost -> "Notifications start once a paired host is connected."
     PushStatus.On -> "On. Notification content is end-to-end encrypted from your host to this phone."
-    PushStatus.Error -> "Couldn't finish setting up notifications. Verde retries when you next open it."
+    PushStatus.Error -> "Couldn't finish setting up notifications. verde retries when you next open it."
 }
 
 /** Turns notifications on, asking for POST_NOTIFICATIONS (API 33+) first. */
@@ -81,7 +81,7 @@ internal fun PushOptInPrompt(hostsState: HostsState) {
     AlertDialog(
         onDismissRequest = { dismissed = true; scope.launch { controls.markAsked() } },
         title = { Text("Turn on notifications?") },
-        text = { Text("Verde can tell you when an agent finishes, fails or needs your approval, even when your phone is locked. " +
+        text = { Text("verde can tell you when an agent finishes, fails or needs your approval, even when your phone is locked. " +
             "Notification content is encrypted on your host and only this phone can read it.") },
         confirmButton = { TextButton(onClick = { dismissed = true; enable() }) { Text("Turn on") } },
         dismissButton = { TextButton(onClick = { dismissed = true; scope.launch { controls.markAsked() } }) { Text("Not now") } },
@@ -113,7 +113,7 @@ internal fun NotificationSettingsSection() {
         Switch(checked = state.enabled, onCheckedChange = null, enabled = state.loaded && state.available)
     }
     if (state.available && (denied || (state.enabled && !systemAllowed))) {
-        Text("Notifications are blocked for Verde in system settings.", color = MaterialTheme.colorScheme.error)
+        Text("Notifications are blocked for verde in system settings.", color = MaterialTheme.colorScheme.error)
         Button(shape = MaterialTheme.shapes.small, onClick = {
             context.startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
                 .putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))

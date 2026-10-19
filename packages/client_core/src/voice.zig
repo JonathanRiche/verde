@@ -127,7 +127,7 @@ pub fn intent(tx: *h.Transaction, tag: []const u8, event: V) E!void {
         return receipt(tx, id, "pending", null);
     }
     if (!scoped(&tx.state, "chat:write")) return fail(tx, id, tag, failure("insufficient_scope", "This phone can't use voice on this host."));
-    if (!s.view.supported) return fail(tx, id, tag, failure("unsupported", "Update Verde on the computer to use live voice."));
+    if (!s.view.supported) return fail(tx, id, tag, failure("unsupported", "Update verde on the computer to use live voice."));
     if (eq(tag, "voice_provider_configure")) {
         if (s.configure_id != null) return receipt(tx, id, "failed", failure("busy", "Still saving the last voice change."));
         const r = try h.decode(Configure, a, event);
@@ -323,7 +323,7 @@ fn named(e: h.LocalError) h.LocalError {
     } else if (eq(code, "invalid_params")) {
         out.message = "The host rejected these voice settings.";
     } else if (unsupported(e)) {
-        out.message = "Update Verde on the computer to use live voice.";
+        out.message = "Update verde on the computer to use live voice.";
     } else if (eq(e.domain, "transport")) {
         out.message = "Connect to the host to use live voice.";
     }

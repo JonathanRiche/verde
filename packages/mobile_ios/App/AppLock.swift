@@ -15,7 +15,7 @@ struct LockSettings: Codable, Equatable {
         context.localizedCancelTitle = "Cancel"
         var error: NSError?
         guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &error) else { return false }
-        return (try? await context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: "Unlock Verde with Face ID, Touch ID, or your device passcode.")) == true
+        return (try? await context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: "Unlock verde with Face ID, Touch ID, or your device passcode.")) == true
     }
 }
 
@@ -84,7 +84,7 @@ private struct LockCover: View {
                 VerdeWordmark()
                 if !lock.inactive {
                     Image(systemName: "lock.fill").font(.largeTitle).foregroundStyle(VerdeTheme.accent)
-                    Text(lock.loaded ? "Verde is locked" : "Security settings unavailable").font(VerdeTheme.display())
+                    Text(lock.loaded ? "verde is locked" : "Security settings unavailable").font(VerdeTheme.display())
                     if let notice = lock.notice { Text(notice).multilineTextAlignment(.center).font(VerdeTheme.ui(13)) }
                     Button(lock.loaded ? "Unlock" : "Retry") { Task { await lock.unlock() } }.buttonStyle(.borderedProminent).disabled(lock.busy)
                 }

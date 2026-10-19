@@ -34,7 +34,7 @@ internal fun outcome(state: ManageState, intentId: String?): JobOutcome {
         "succeeded" -> JobOutcome.Done(job)
         "failed" -> JobOutcome.Failed(jobMessage(job))
         // The request may have reached the host; a refresh shows whether it applied.
-        "uncertain" -> JobOutcome.Failed("The connection dropped before Verde answered. Pull to refresh to check.")
+        "uncertain" -> JobOutcome.Failed("The connection dropped before verde answered. Pull to refresh to check.")
         else -> JobOutcome.Pending
     }
 }
@@ -60,7 +60,7 @@ internal fun jobMessage(job: ManageJob): String {
         "unavailable" -> "Connect to the host first."
         "insufficient_scope" -> "This phone isn't allowed to do that. Pair again with more access."
         "conflict" -> "The workspace changed on the computer. Try again."
-        "path_outside_roots" -> "Verde can't open folders there. Pick one under your home folder."
+        "path_outside_roots" -> "verde can't open folders there. Pick one under your home folder."
         else -> error.message.ifBlank { error.code.replace('_', ' ').replaceFirstChar { it.uppercase() } }
     }
 }

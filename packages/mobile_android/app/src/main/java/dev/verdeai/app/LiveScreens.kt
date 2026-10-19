@@ -107,7 +107,7 @@ internal fun LiveVoiceSettings(live: LiveVoice) {
     val current = view
     when {
         current == null || (!current.loaded && current.loading) -> LinearProgressIndicator(Modifier.fillMaxWidth().padding(16.dp))
-        !current.supported -> Text("Update Verde on the computer to use live voice.", Modifier.padding(16.dp))
+        !current.supported -> Text("Update verde on the computer to use live voice.", Modifier.padding(16.dp))
         else -> current.providers.forEach { provider ->
             key(provider.id) { ProviderRow(live, provider, isDefault = current.default_provider == provider.id) }
         }

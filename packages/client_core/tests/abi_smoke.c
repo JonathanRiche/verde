@@ -96,7 +96,7 @@ int main(int argc, char **argv) {
     const unsigned char push[] = "{\"api_version\":1,\"envelope\":\"AQ\",\"keys\":[]}";
     vc_buf notice = {0};
     if (vc_push_open(push, sizeof(push)-1, &notice) || !notice.len) return 17;
-    if (!contains(notice, "A Verde chat needs attention")) return 18;
+    if (!contains(notice, "A verde chat needs attention")) return 18;
     vc_buf_free(notice);
     if (vc_push_open(NULL, 1, &notice) != 1 || notice.ptr) return 19;
     return 0;

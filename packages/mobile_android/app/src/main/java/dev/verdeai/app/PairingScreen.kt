@@ -32,11 +32,11 @@ internal fun PairingScreen(model: PairingModel) {
             Column(Modifier.safeDrawingPadding().imePadding().verticalScroll(rememberScrollState())
                 .padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
                 VerdeWordmark()
-                Text(if (state.complete) "Home" else "Pair with Verde", style=MaterialTheme.typography.headlineLarge)
+                Text(if (state.complete) "Home" else "Pair with verde", style=MaterialTheme.typography.headlineLarge)
                 state.notice?.let { Text(it, color=MaterialTheme.colorScheme.error) }
                 when {
-                    state.fatal -> Text("The connection could not start. Close and reopen Verde to try again.")
-                    state.host?.update_required == true -> Text("Update Verde on your phone and host to continue.")
+                    state.fatal -> Text("The connection could not start. Close and reopen verde to try again.")
+                    state.host?.update_required == true -> Text("Update verde on your phone and host to continue.")
                     state.complete -> {
                         Text("Paired securely")
                         Text("Your phone is securely paired with this host.")
@@ -44,7 +44,7 @@ internal fun PairingScreen(model: PairingModel) {
                         if (state.error?.retryable == true) Button(shape = MaterialTheme.shapes.small, onClick=model::retry, enabled=!state.busy) { Text("Retry") }
                     }
                     else -> {
-                        Text("Connect Tailscale on your phone, then create a pairing link in Verde on your host.")
+                        Text("Connect Tailscale on your phone, then create a pairing link in verde on your host.")
                         state.error?.let { Text(pairingError(it), color=MaterialTheme.colorScheme.error) }
                         state.host?.trust_proposal?.let { proposal ->
                             Text(if (state.host?.runtime_id != null) "Review changed host identity" else "Confirm your host",

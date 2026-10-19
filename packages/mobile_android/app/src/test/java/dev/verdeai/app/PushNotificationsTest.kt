@@ -104,7 +104,7 @@ class PushNotificationsTest {
         assertEquals("Run cargo test?", notification.extras.getCharSequence(Notification.EXTRA_TEXT).toString())
         assertEquals(Notification.VISIBILITY_PRIVATE, notification.visibility)
         val public = notification.publicVersion!!
-        assertEquals("Verde", public.extras.getCharSequence(Notification.EXTRA_TITLE).toString())
+        assertEquals("verde", public.extras.getCharSequence(Notification.EXTRA_TITLE).toString())
         assertEquals(PushNotifier.GENERIC_BODY, public.extras.getCharSequence(Notification.EXTRA_TEXT).toString())
         assertEquals(3, notification.actions.size)
         assertTrue(notification.actions.all { it.isAuthenticationRequired })

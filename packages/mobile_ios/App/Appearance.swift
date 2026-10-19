@@ -91,7 +91,7 @@ struct HostPalette: Decodable {
             VerdeTheme.configure()
         } catch {
             guard !Task.isCancelled, stamp == revision else { return }
-            notice = "Host theme unavailable. Showing Verde dark until you reconnect or retry."
+            notice = "Host theme unavailable. Showing verde dark until you reconnect or retry."
         }
     }
     func color(_ key: String, fallback: UInt32, light: UInt32? = nil) -> Color {

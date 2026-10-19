@@ -317,7 +317,7 @@ internal fun brainSwitchError(code: String?, name: String): String = when (code)
     "companion_busy" -> "$name is still working. Wait for the current turn to finish, then switch."
     "busy" -> "Still switching brains."
     "offline", "unavailable" -> "Connect to the host first."
-    "unknown_method", "method_not_found", "unsupported" -> "Update Verde on the computer to switch brains."
+    "unknown_method", "method_not_found", "unsupported" -> "Update verde on the computer to switch brains."
     else -> "Couldn't switch $name's brain. Try again."
 }
 
@@ -378,7 +378,7 @@ internal fun companionError(error: LocalError?): String = when (error?.code) {
     null -> "Something went wrong. Try again."
     "offline", "unavailable", "cancelled" -> "Connect to the host first."
     "insufficient_scope" -> "This phone isn't allowed to change companions. Pair again with chat access."
-    "unsupported", "method_not_found" -> "Update Verde on the computer to use companions."
+    "unsupported", "method_not_found" -> "Update verde on the computer to use companions."
     "conflict" -> "Companions changed on another device. Try again."
     else -> error.message.ifBlank { "Something went wrong. Try again." }
 }

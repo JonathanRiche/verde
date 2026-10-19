@@ -44,7 +44,7 @@ struct LiveVoiceProvider: Decodable, Equatable, Identifiable {
     var keyDescription: String {
         switch key_source {
         case "environment": return "Key from the desktop's environment"
-        case "verde": return "Key saved in Verde on the desktop"
+        case "verde": return "Key saved in verde on the desktop"
         default: return configured ? "Configured" : "No API key yet"
         }
     }
@@ -202,7 +202,7 @@ func liveVoiceMessage(_ code: String?) -> String {
     case "voice_key_rejected"?: return "The provider rejected the API key saved on your desktop. Replace it in Companion settings."
     case "voice_provider_unavailable"?: return "The live voice provider is unavailable right now. Try again shortly."
     case "insufficient_scope"?, "scope_denied"?: return "This phone isn't allowed to start live voice on this host."
-    case "rejected"?, "method_not_found"?, "unsupported"?: return "Update Verde on the computer to use live voice."
+    case "rejected"?, "method_not_found"?, "unsupported"?: return "Update verde on the computer to use live voice."
     case "offline"?: return "Connect to the host first."
     default: return "Couldn't start live voice."
     }

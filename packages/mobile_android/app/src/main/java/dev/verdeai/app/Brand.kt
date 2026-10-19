@@ -33,7 +33,7 @@ internal fun VerdeWordmark() {
     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         Image(painterResource(R.drawable.verde_logo), contentDescription = null,
             colorFilter = ColorFilter.tint(VerdeColors.Accent), modifier = Modifier.size(28.dp))
-        Text("Verde", style = MaterialTheme.typography.headlineMedium)
+        Text("verde", style = MaterialTheme.typography.headlineMedium)
     }
 }
 

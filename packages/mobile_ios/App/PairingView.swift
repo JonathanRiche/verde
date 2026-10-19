@@ -31,7 +31,7 @@ struct PairingView: View {
                 } else if model.paired {
                     Section("Paired") {
                         Label("Host saved securely", systemImage: "checkmark.shield")
-                        Text(model.row?.phase == "ready" ? "Connected to your Verde host." : "Pairing is saved. Connecting to your host…")
+                        Text(model.row?.phase == "ready" ? "Connected to your verde host." : "Pairing is saved. Connecting to your host…")
                         if let origin = model.row?.https_url { Text(origin) }
                         if let scopes = model.row?.scopes, !scopes.isEmpty {
                             Text("Permissions: " + scopes.joined(separator: ", ")) .font(VerdeTheme.ui(12))
@@ -39,7 +39,7 @@ struct PairingView: View {
                     }
                 } else {
                     Section {
-                        Text("Run Tailscale on this phone and your host. Create a pairing grant in Verde on your computer, then scan or paste it here.")
+                        Text("Run Tailscale on this phone and your host. Create a pairing grant in verde on your computer, then scan or paste it here.")
                     }
                     Section("Pair a host") {
                         TextField("Device name", text: $model.deviceLabel)
@@ -84,7 +84,7 @@ struct PairingView: View {
                         }
                     }
                 }
-                if model.row?.update_required == true { Text("Update Verde on your phone or host to continue.") }
+                if model.row?.update_required == true { Text("Update verde on your phone or host to continue.") }
                 if let cameraError {
                     Section("Camera unavailable") {
                         Text(cameraError)
@@ -96,7 +96,7 @@ struct PairingView: View {
             }
             .blur(radius: scenePhase == .active ? 0 : 12)
             .privacySensitive()
-            .navigationTitle("Pair with Verde").navigationBarTitleDisplayMode(.inline)
+            .navigationTitle("Pair with verde").navigationBarTitleDisplayMode(.inline)
             .scrollContentBackground(.hidden).background(VerdeTheme.background)
             .toolbar {
                 if let onClose {

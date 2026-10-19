@@ -208,7 +208,7 @@ pub fn intent(tx: *h.Transaction, tag: []const u8, v: V) E!void {
         const path = std.mem.trimEnd(u8, r.path orelse "", "/");
         if (r.root) |root| if (!validRoot(root) or !relative(path)) return receipt(tx, id, "failed", failure("invalid_path", "This folder can't be opened."));
         const f = try filesFor(tx, ws);
-        if (!f.supported) return receipt(tx, id, "failed", failure("unsupported", "Update Verde on the computer to browse files."));
+        if (!f.supported) return receipt(tx, id, "failed", failure("unsupported", "Update verde on the computer to browse files."));
         const root = r.root orelse {
             if (f.loading) return receipt(tx, id, "succeeded", null);
             f.loading = true;
@@ -222,7 +222,7 @@ pub fn intent(tx: *h.Transaction, tag: []const u8, v: V) E!void {
     if (eq(tag, "workspace_file_read")) {
         const r = try h.decode(ReadIntent, a, v);
         if (!validRoot(r.root) or r.path.len == 0 or !relative(r.path)) return receipt(tx, id, "failed", failure("invalid_path", "This file can't be opened."));
-        if (!s.file.supported) return receipt(tx, id, "failed", failure("unsupported", "Update Verde on the computer to preview files."));
+        if (!s.file.supported) return receipt(tx, id, "failed", failure("unsupported", "Update verde on the computer to preview files."));
         // A newer preview replaces the one on screen; the older response is dropped.
         s.file = .{ .workspace_id = try a.dupe(u8, ws), .root = r.root, .path = r.path, .loading = true };
         s.file_id = try rpc.request(tx, "workspace.files.read", .{ .workspace_id = ws, .root = r.root, .path = r.path, .max_bytes = READ_TEXT_BYTES, .max_image_bytes = READ_IMAGE_BYTES }, read);
@@ -231,7 +231,7 @@ pub fn intent(tx: *h.Transaction, tag: []const u8, v: V) E!void {
     if (eq(tag, "workspace_changes_open")) {
         s.watched = try a.dupe(u8, ws);
         const c = try changesFor(tx, ws);
-        if (!c.view.supported) return receipt(tx, id, "failed", failure("unsupported", "Update Verde on the computer to see workspace changes."));
+        if (!c.view.supported) return receipt(tx, id, "failed", failure("unsupported", "Update verde on the computer to see workspace changes."));
         if (c.in_flight) {
             // Coalesce: one trailing refresh after the read in flight.
             c.dirty = true;
@@ -243,7 +243,7 @@ pub fn intent(tx: *h.Transaction, tag: []const u8, v: V) E!void {
     const r = try h.decode(m.FilePatchRequest, a, v);
     if (!opaqueRoot(r.root) or r.path.len == 0 or !relative(r.path))
         return receipt(tx, id, "failed", failure("invalid_path", "This file can't be shown."));
-    if (!s.patch.supported) return receipt(tx, id, "failed", failure("unsupported", "Update Verde on the computer to see diffs."));
+    if (!s.patch.supported) return receipt(tx, id, "failed", failure("unsupported", "Update verde on the computer to see diffs."));
     const context: ?u32 = if (r.context_lines) |n| @min(n, MAX_CONTEXT_LINES) else null;
     // A newer patch replaces the one on screen; the older response is dropped.
     s.patch = .{ .workspace_id = r.workspace_id, .root = r.root, .path = r.path, .context_lines = context, .loading = true };
@@ -608,7 +608,7 @@ fn failure(code: []const u8, message: []const u8) h.LocalError {
 fn named(e: h.LocalError) h.LocalError {
     const code = e.rpc_code orelse e.code;
     const message = if (eq(code, "method_not_found"))
-        "Update Verde on the computer to use this."
+        "Update verde on the computer to use this."
     else if (eq(code, "path_outside_roots"))
         "This path is outside the workspace folders."
     else if (eq(code, "not_found"))

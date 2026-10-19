@@ -67,7 +67,7 @@ internal fun QrScanner(onLink: (String) -> Unit, onClose: () -> Unit, onError: (
     Dialog(onDismissRequest=onClose) {
         Surface {
             Column(Modifier.padding(16.dp), verticalArrangement=Arrangement.spacedBy(12.dp)) {
-                Text("Scan the Verde pairing QR code")
+                Text("Scan the verde pairing QR code")
                 AndroidView(factory={ previewView }, modifier=Modifier.fillMaxWidth().height(320.dp))
                 TextButton(onClick=onClose) { Text("Cancel scan") }
             }

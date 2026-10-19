@@ -105,7 +105,7 @@ internal fun LockScreen(state: AppLockState, onUnlock: () -> Unit) {
         ) {
             VerdeWordmark()
             Icon(Icons.Filled.Lock, contentDescription = null, Modifier.size(48.dp), tint = MaterialTheme.colorScheme.primary)
-            Text("Verde is locked", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.semantics { heading() })
+            Text("verde is locked", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.semantics { heading() })
             Text("Unlock with your fingerprint, face or screen lock. Your chats keep running on your hosts.",
                 textAlign = TextAlign.Center, style = MaterialTheme.typography.bodyMedium)
             state.message?.let { Text(it, color = MaterialTheme.colorScheme.error, textAlign = TextAlign.Center) }
@@ -135,7 +135,7 @@ internal fun SecuritySettingsScreen(model: AppLockModel, auth: DeviceAuth, onBac
             HorizontalDivider()
             VerdeSection("App lock & privacy")
             SettingSwitch("Require unlock",
-                "Ask for your fingerprint, face or screen lock when you open Verde.",
+                "Ask for your fingerprint, face or screen lock when you open verde.",
                 checked = lockOn, enabled = state.loaded && !state.authenticating && (lockOn || state.available),
             ) { model.setEnabled(it, auth) }
             if (!state.available) {
@@ -148,7 +148,7 @@ internal fun SecuritySettingsScreen(model: AppLockModel, auth: DeviceAuth, onBac
                 }
             }
             state.message?.takeIf { !state.locked }?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-            Text("Lock after leaving Verde", style = MaterialTheme.typography.titleSmall,
+            Text("Lock after leaving verde", style = MaterialTheme.typography.titleSmall,
                 modifier = Modifier.padding(top = 8.dp).semantics { heading() })
             Column(Modifier.selectableGroup()) {
                 RelockAfter.entries.forEach { option ->
@@ -163,7 +163,7 @@ internal fun SecuritySettingsScreen(model: AppLockModel, auth: DeviceAuth, onBac
             }
             HorizontalDivider()
             SettingSwitch("Hide content in screenshots and recents",
-                "Blocks screenshots and screen recording, and blanks Verde's preview in recent apps." +
+                "Blocks screenshots and screen recording, and blanks verde's preview in recent apps." +
                     if (lockOn && android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.TIRAMISU)
                         " On this Android version app lock keeps this on." else "",
                 checked = settings.secure_screen, enabled = state.loaded) { model.setSecureScreen(it) }

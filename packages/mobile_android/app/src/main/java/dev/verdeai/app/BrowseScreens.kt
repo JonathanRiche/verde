@@ -145,12 +145,12 @@ internal fun browseBanner(state: BrowseState, nowMs: Long): Banner? {
     val host = state.host
     val saved = state.savedAtMs?.let { " Showing saved data from ${agoLabel(it, nowMs)}." } ?: ""
     return when {
-        state.fatal || state.row?.fatal == true -> Banner("Connection unavailable — reopen Verde.", error=true)
+        state.fatal || state.row?.fatal == true -> Banner("Connection unavailable — reopen verde.", error=true)
         host == null || host.auth_state == "loading" -> if (state.savedAtMs != null) Banner("Loading.$saved", busy=true) else null
         needsPairing(state) -> null
         host.auth_state == "repair_required" -> Banner("Pair again — device authorization needs renewal.", BannerAction.Hosts, error=true)
         host.trust_proposal != null -> Banner("Review this host's identity before connecting.", BannerAction.Hosts, error=true)
-        host.update_required -> Banner("Update required — update Verde on this phone or host.", error=true)
+        host.update_required -> Banner("Update required — update verde on this phone or host.", error=true)
         !state.networkAvailable -> Banner("You're offline.$saved", error=true)
         host.phase == "failed" || host.error?.failure_kind == "network" ->
             Banner("Can't reach ${state.row?.saved?.label ?: host.label}. Is Tailscale on?$saved", BannerAction.Retry, error=true)
@@ -430,7 +430,7 @@ internal fun WorkspacesScreen(model: BrowseModel, onOpenWorkspace: (String) -> U
             TextButton(onClick = onAddWorkspace, modifier = Modifier.padding(horizontal = 8.dp)) { Text("Add workspace") }
         }
         if (all.isEmpty()) {
-            note("empty", if (onAddWorkspace != null) "No workspaces on this host yet." else "No workspaces on this host yet. Add one from Verde on your computer.")
+            note("empty", if (onAddWorkspace != null) "No workspaces on this host yet." else "No workspaces on this host yet. Add one from verde on your computer.")
             return@BrowseFrame
         }
         items(all.filter { it.open }, key = { it.workspace_id }) { WorkspaceItem(it, onOpenWorkspace) }

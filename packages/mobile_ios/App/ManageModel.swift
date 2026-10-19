@@ -2,7 +2,7 @@ import Foundation
 import Observation
 
 func manageMessage(_ job: ManageJob) -> String {
-    if job.state == "uncertain" { return "The connection dropped before Verde answered. Refresh to check before retrying." }
+    if job.state == "uncertain" { return "The connection dropped before verde answered. Refresh to check before retrying." }
     if job.error?.code == "workspace_busy" {
         return "Stop \(job.busy?.pending_turns ?? 0) running requests and \(job.busy?.running_tasks ?? 0) background tasks first."
     }

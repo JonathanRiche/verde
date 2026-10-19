@@ -44,7 +44,7 @@ internal object PushChannels {
                 lockscreenVisibility = Notification.VISIBILITY_PRIVATE
             },
             NotificationChannel(RUNNING, "Running", NotificationManager.IMPORTANCE_LOW).apply {
-                description = "Agents still working when you left Verde"
+                description = "Agents still working when you left verde"
                 lockscreenVisibility = Notification.VISIBILITY_PRIVATE
                 setShowBadge(false)
             },
@@ -144,7 +144,7 @@ internal fun pushLabel(kind: String): String = when (kind) {
     "approval_pending" -> "Needs approval"
     "input_needed" -> "Needs input"
     "test" -> "Test notification"
-    else -> "A Verde chat needs attention"
+    else -> "A verde chat needs attention"
 }
 
 internal class PushNotifier(private val context: Context) {
@@ -157,10 +157,10 @@ internal class PushNotifier(private val context: Context) {
         val tag = NotificationTags.of(model)
         val id = NotificationTags.PUSH_ID
         // A companion's chat is titled with its name ("Juniper: …") when this process knows the roster.
-        val title = if (hideContent || !model.opened) "Verde"
+        val title = if (hideContent || !model.opened) "verde"
             else companionNotificationTitle(CompanionThreads.name(model.host_id, model.workspace_id, model.thread_id), model.title)
         val body = when {
-            model.update_required -> "Update Verde to read this notification."
+            model.update_required -> "Update verde to read this notification."
             hideContent && model.opened -> pushLabel(model.kind)
             else -> model.body
         }
@@ -214,7 +214,7 @@ internal class PushNotifier(private val context: Context) {
             null, tag, NotificationTags.RUNNING_ID)
         val builder = NotificationCompat.Builder(context, PushChannels.RUNNING)
             .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle(if (hideContent) "Verde" else companionNotificationTitle(CompanionThreads.name(hostId, pane.workspace_id, thread), pane.title.ifBlank { "Chat" }))
+            .setContentTitle(if (hideContent) "verde" else companionNotificationTitle(CompanionThreads.name(hostId, pane.workspace_id, thread), pane.title.ifBlank { "Chat" }))
             .setContentText("Agent is working")
             .setCategory(NotificationCompat.CATEGORY_PROGRESS)
             .setPriority(NotificationCompat.PRIORITY_LOW)
@@ -256,10 +256,10 @@ internal class PushNotifier(private val context: Context) {
 
     private fun publicVersion(channel: String): Notification =
         NotificationCompat.Builder(context, channel).setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle("Verde").setContentText(GENERIC_BODY).build()
+            .setContentTitle("verde").setContentText(GENERIC_BODY).build()
 
     companion object {
-        const val GENERIC_BODY = "A Verde chat needs attention"
+        const val GENERIC_BODY = "A verde chat needs attention"
         const val RUNNING_TIMEOUT_MS = 2 * 60 * 60_000L
     }
 }
@@ -282,7 +282,7 @@ internal object JniPushOpener : PushOpener {
 /** The core's generic model, for when the core cannot even be asked. */
 internal fun genericPush(): PushNotification = PushNotification(api_version = 1, opened = false, update_required = false,
     error = "unavailable", host_id = null, workspace_id = null, thread_id = null, turn_id = null, kind = "generic",
-    attention = null, channel = "attention", title = "Verde", body = PushNotifier.GENERIC_BODY, deep_link = "verde://open",
+    attention = null, channel = "attention", title = "verde", body = PushNotifier.GENERIC_BODY, deep_link = "verde://open",
     actions = listOf("open"), dedupe_key = null, duplicate = false)
 
 /**

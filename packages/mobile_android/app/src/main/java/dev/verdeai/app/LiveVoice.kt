@@ -74,7 +74,7 @@ internal fun liveError(code: String?): String = when (code) {
     "voice_not_configured" -> "Add an API key for live voice in companion settings."
     "voice_key_rejected" -> "The voice provider rejected the API key. Replace it in companion settings."
     "voice_provider_unavailable" -> "Couldn't reach the voice provider. Try again."
-    "unsupported", "unknown_method" -> "Update Verde on the computer to use live voice."
+    "unsupported", "unknown_method" -> "Update verde on the computer to use live voice."
     "offline", "unavailable" -> "Connect to the host first."
     "insufficient_scope" -> "This phone isn't allowed to use live voice. Pair again with chat access."
     "microphone" -> "Couldn't open the microphone."

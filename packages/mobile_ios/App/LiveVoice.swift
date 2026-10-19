@@ -111,7 +111,7 @@ final class LiveVoice {
         generation += 1
         let current = generation
         guard await AVAudioApplication.requestRecordPermission() else {
-            return fail("Allow Microphone access for Verde in Settings to talk live.")
+            return fail("Allow Microphone access for verde in Settings to talk live.")
         }
         do {
             let session = try await LiveVoiceClient(browse: companion.browse).createSession(companionID: companion.active?.id)

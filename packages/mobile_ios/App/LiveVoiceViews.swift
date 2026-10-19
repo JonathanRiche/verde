@@ -100,7 +100,7 @@ struct LiveVoiceSettings: View {
                     }
                 }
             } else if view?.supported == false {
-                Text("Update Verde on the computer to use live voice.").foregroundStyle(VerdeTheme.muted)
+                Text("Update verde on the computer to use live voice.").foregroundStyle(VerdeTheme.muted)
             } else {
                 Text("Loading providers…").foregroundStyle(VerdeTheme.muted)
             }

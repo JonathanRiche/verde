@@ -167,7 +167,7 @@ final class CompanionVoice {
         }
         guard speech == .authorized else {
             notice = speech == .restricted ? "Speech recognition is restricted on this device."
-                : "Allow Speech Recognition for Verde in Settings to talk to your companion."
+                : "Allow Speech Recognition for verde in Settings to talk to your companion."
             return false
         }
         switch AVAudioApplication.shared.recordPermission {
@@ -176,7 +176,7 @@ final class CompanionVoice {
             if await AVAudioApplication.requestRecordPermission() { return true }
         default: break
         }
-        notice = "Allow Microphone access for Verde in Settings to talk to your companion."
+        notice = "Allow Microphone access for verde in Settings to talk to your companion."
         return false
     }
 

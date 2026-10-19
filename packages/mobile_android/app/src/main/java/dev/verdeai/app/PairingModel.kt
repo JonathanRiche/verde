@@ -134,7 +134,7 @@ internal class PairingModel(private val createHost: suspend () -> CoreHost) : Vi
             try { block(host.await()) }
             catch (e: CoreInputRejected) {
                 if (pairSubmission) mutableState.update { it.copy(operation=null) }
-                notice(if (e.status == 1) "Invalid pairing link or device label. Copy a fresh link from Verde."
+                notice(if (e.status == 1) "Invalid pairing link or device label. Copy a fresh link from verde."
                     else "The host is not ready for this action. Try again after it finishes loading.")
             } catch (_: Exception) { mutableState.update { it.copy(fatal=true) } }
             finally { mutableState.update { it.copy(busy=false) } }
@@ -168,6 +168,6 @@ internal fun pairingError(error: LocalError): String = when {
     error.code == "trust_denied" -> "Host not trusted. No pairing credential was sent."
     error.code == "tls_rejected" -> "The host's secure connection could not be verified. Check its certificate before trying a new pairing link."
     error.code == "repair_required" -> "This device needs to pair again. Create a new pairing link on the host."
-    error.code == "protocol_rejected" -> "This host is not compatible. Update Verde on the host and phone."
+    error.code == "protocol_rejected" -> "This host is not compatible. Update verde on the host and phone."
     else -> "Pairing could not complete. Check the host and try again."
 }
