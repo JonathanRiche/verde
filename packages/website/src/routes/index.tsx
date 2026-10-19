@@ -195,8 +195,8 @@ const gallery = [
     theme: 'Tokyo Night',
   },
   {
-    src: '/media/clips/2-browser.webp',
-    video: '/media/clips/2-browser.mp4',
+    src: '/media/clips/2-browser-v2.webp',
+    video: '/media/clips/2-browser-v2.mp4',
     title: 'Built-in browser',
     body: 'Point at an element in Design Mode and send it to the chat with a screenshot.',
     theme: 'Catppuccin Latte',
