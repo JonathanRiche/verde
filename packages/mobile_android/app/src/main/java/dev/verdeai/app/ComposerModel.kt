@@ -495,23 +495,24 @@ internal class ComposerModel(
     private suspend fun choose(s: ChatSelection) = chat.dispatch { id, n, w -> EventComposerSelect(now_ms=n, wall_time_ms=w, intent_id=id,
         workspace_id=workspaceId, thread_id=threadId, provider=s.provider, model=s.model, effort=s.effort, access=s.access, speed=s.speed) }
 
-    /** New images go to the core with bytes; the draft's existing ones by reference. */
+    /**
+     * New images go to the core with bytes; the draft's existing ones by reference. One `draft_set`
+     * per image keeps each event's base64 inside the core's 1 MiB input.
+     */
     fun attach(images: List<PickedImage>, rejected: Int = 0) = action {
         if (!flush()) return@action
-        val existing = references()
+        var existing = references()
         val room = MAX_IMAGES - existing.size
         val accepted = images.take(room.coerceAtLeast(0))
-        val total = chat.latestComposer()?.draft?.attachments.orEmpty().sumOf { it.byte_size.toLongOrNull() ?: 0L } + accepted.sumOf { it.bytes.size.toLong() }
-        when {
-            accepted.isEmpty() && images.isNotEmpty() -> { notice = "Up to $MAX_IMAGES images per message."; return@action }
-            total > MAX_TOTAL_BYTES -> { notice = "These images are too large together. Send some first."; return@action }
-        }
-        if (accepted.isNotEmpty()) {
-            val added = accepted.map { AttachmentInput(local_id="img-" + UUID.randomUUID(), name=it.name, mime=it.mime,
-                byte_size=it.bytes.size.toString(), bytes_base64=Base64.getEncoder().encodeToString(it.bytes)) }
+        if (accepted.isEmpty() && images.isNotEmpty()) { notice = "Up to $MAX_IMAGES images per message."; return@action }
+        for (image in accepted) {
+            if (image.bytes.size > MAX_IMAGE_BYTES) { notice = "This image is too large to attach."; return@action }
+            val added = AttachmentInput(local_id="img-" + UUID.randomUUID(), name=image.name, mime=image.mime,
+                byte_size=image.bytes.size.toString(), bytes_base64=Base64.getEncoder().encodeToString(image.bytes))
             val op = setDraft(field.text, existing + added)
             if (op == null || op.state == "failed") return@action fail(op)
-            imagePreviews = imagePreviews + added.mapIndexed { index, input -> input.local_id to accepted[index].bytes }.toMap()
+            imagePreviews = imagePreviews + (added.local_id to image.bytes)
+            existing = existing + added.copy(bytes_base64="")
         }
         notice = when {
             rejected > 0 -> "Only images can be attached from the phone."
@@ -550,10 +551,11 @@ internal class ComposerModel(
         const val OUTCOME_WAIT_MS = 30_000L
         const val MAX_IMAGES = 4
         const val MAX_SENT_PREVIEWS = 8
-        /** Per image after re-encoding; the core also enforces the daemon's own attachment limit. */
-        const val MAX_IMAGE_BYTES = 160 * 1024
-        /** Base64 in the core's 512 KiB draft record, with room for the text. */
-        const val MAX_TOTAL_BYTES = 320L * 1024
+        /**
+         * Per image after re-encoding. Its base64 must fit one core event (1 MiB) with the draft
+         * text; the core also enforces the daemon's own attachment limit.
+         */
+        const val MAX_IMAGE_BYTES = 700 * 1024
         private val detached = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     }
 }

@@ -88,18 +88,10 @@ enum ComposerPicker: String, CaseIterable, Identifiable {
 /// debounce from overwriting a newer draft or overtaking a send.
 @MainActor @Observable
 final class ComposerModel {
-    static let maxImageBytes = 160 * 1024
-    static let maxTotalBytes = 320 * 1024
+    /// Per photo after re-encoding. Each `draft_set` carries only the newly added photo (earlier
+    /// ones go by reference), so this keeps that event's base64 inside the core's 1 MiB input.
+    static let maxImageBytes = 700 * 1024
     static let maxImages = 4
-    /// Room held back for each image slot still open, so earlier photos can't use up the draft.
-    static let minImageBytes = 32 * 1024
-
-    /// Bytes the next image may encode to: its own cap, less what's attached and the room
-    /// reserved for the slots after it. Photos are compressed to fit instead of being refused.
-    static func imageBudget(attached: [Int]) -> Int {
-        let open = max(0, maxImages - attached.count - 1)
-        return min(maxImageBytes, maxTotalBytes - attached.reduce(0, +) - open * minImageBytes)
-    }
     let chat: TranscriptModel
     private(set) var text = ""
     private(set) var selection = NSRange(location: 0, length: 0)
@@ -358,14 +350,12 @@ final class ComposerModel {
         }
     }
 
-    /// `encode` re-encodes the picked image within the given byte budget, or returns nil.
-    func attach(_ encode: @escaping @MainActor (Int) -> Data?) {
+    func attach(_ bytes: Data) {
         action { [self] in
             guard await flush() else { return }
             let existing = references()
             guard existing.count < Self.maxImages else { notice = "Up to four images per message."; return }
-            let budget = Self.imageBudget(attached: existing.map { Int($0.byte_size) ?? 0 })
-            guard budget > 0, let bytes = encode(budget), bytes.count <= budget else { notice = "These images are too large together. Send some first."; return }
+            guard bytes.count <= Self.maxImageBytes else { notice = "This image is too large to attach."; return }
             let id = "img-" + UUID().uuidString
             if await setDraft(text, existing + [AttachmentInput(local_id: id, name: "Photo.jpg", mime: "image/jpeg", byte_size: String(bytes.count), bytes_base64: bytes.base64EncodedString())]) {
                 previews[id] = bytes

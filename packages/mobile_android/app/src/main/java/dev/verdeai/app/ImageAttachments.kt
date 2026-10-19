@@ -13,11 +13,11 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 
 /**
- * Turns picked or captured images into small JPEGs the core can keep in its draft record.
+ * Turns picked or captured images into JPEGs no larger than providers keep (2048 px edge).
  * Everything stays in memory or the app's private cache; nothing about the image is logged.
  */
 internal object ImageAttachments {
-    private const val MAX_EDGE = 1600
+    private const val MAX_EDGE = 2048
 
     class Prepared(val images: List<PickedImage>, val rejected: Int)
 
@@ -51,7 +51,7 @@ internal object ImageAttachments {
     internal fun encode(source: Bitmap, maxBytes: Int): ByteArray? {
         var bitmap = source
         repeat(6) {
-            for (quality in intArrayOf(85, 70, 55, 40)) {
+            for (quality in intArrayOf(90, 75, 60, 45)) {
                 val out = ByteArrayOutputStream()
                 bitmap.compress(Bitmap.CompressFormat.JPEG, quality, out)
                 if (out.size() in 1..maxBytes) return out.toByteArray()

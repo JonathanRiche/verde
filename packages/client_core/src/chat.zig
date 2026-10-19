@@ -204,8 +204,16 @@ fn persist(tx: *h.Transaction, i: usize) E!void {
     t.dirty = true;
     if (!t.loaded or t.storage_id != null) return;
     const storage_key = try key(tx, t);
-    const bytes = try h.encode(tx.allocator(), t.saved);
-    if (bytes.len > h.MAX_INPUT / 2) return error.ResourceLimit;
+    var bytes = try h.encode(tx.allocator(), t.saved);
+    if (bytes.len > h.MAX_INPUT / 2) {
+        // Phone photos outgrow the secure-store record. Keep the text, selection and follow-up;
+        // the images stay in memory for sending, and a restore after the app closes has none.
+        var record = t.saved;
+        record.inputs = &.{};
+        record.followup_inputs = &.{};
+        bytes = try h.encode(tx.allocator(), record);
+        if (bytes.len > h.MAX_INPUT / 2) return error.ResourceLimit;
+    }
     const effect = try tx.emit("secure_store_put", .{ .key = storage_key, .value_base64 = try rpc.encodeBase64(tx.allocator(), bytes) });
     try tx.track(.store_put, effect, storage_key);
     t.storage_id = effect;

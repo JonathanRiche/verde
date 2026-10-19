@@ -338,6 +338,47 @@ test "phone-sized image survives draft persistence restore and chunk upload" {
     try eql("large", p.rows(p.get(start, "attachments"))[0].string);
 }
 
+test "photos too large for the draft record stay in memory and upload" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.open();
+    const image = try f.a().alloc(u8, 700 * 1024);
+    @memset(image, 7);
+    const out = try f.intent("draft_set", .{ .text = "big photo", .attachments = .{.{ .local_id = "big", .name = "big.jpg", .mime = "image/jpeg", .byte_size = "716800", .bytes_base64 = try rpc.encodeBase64(f.a(), image) }} });
+    var record: ?[]const u8 = null;
+    for (p.rows(p.get(out, "effects"))) |effect| if (h.eq(p.s(effect, "type"), "secure_store_put")) {
+        record = try @import("auth.zig").decode64Limit(f.a(), p.s(effect, "value_base64"), h.MAX_INPUT);
+    };
+    try expect(record.?.len <= h.MAX_INPUT / 2);
+    try expect(std.mem.indexOf(u8, record.?, "big photo") != null);
+    try expect(std.mem.indexOf(u8, record.?, "\"big.jpg\"") == null);
+    _ = try f.storage(null, false);
+    const t = f.host.state.chat.threads[0];
+    try expect(t.saved.inputs.len == 1);
+    // A second photo is added by reference to the first, so each event carries one image.
+    _ = try f.intent("draft_set", .{ .text = "big photo", .attachments = .{
+        .{ .local_id = "big", .name = "big.jpg", .mime = "image/jpeg", .byte_size = "716800", .bytes_base64 = "" },
+        .{ .local_id = "big-2", .name = "big.jpg", .mime = "image/jpeg", .byte_size = "716800", .bytes_base64 = try rpc.encodeBase64(f.a(), image) },
+    } });
+    _ = try f.storage(null, false);
+    const both = f.host.state.chat.threads[0];
+    try expect(both.saved.inputs.len == 2);
+    try eql(both.saved.inputs[0].bytes_base64, both.saved.inputs[1].bytes_base64);
+    _ = try f.intent("send", .{ .draft_revision = try std.fmt.allocPrint(f.a(), "{d}", .{both.saved.revision}) });
+    try f.reply("daemon.client.register", .{ .client_id = "fixture-client" });
+    try f.reply("chat.thread.upsert", .{ .store_revision = 100 });
+    try f.reply("chat.attachment.create", .{ .attachment_id = "first", .max_chunk_bytes = 256 * 1024 });
+    var received: usize = 0;
+    while (received < image.len) {
+        const params = try f.params("chat.attachment.append");
+        received += (try @import("auth.zig").decode64Limit(f.a(), p.s(params, "data"), h.MAX_INPUT)).len;
+        try f.reply("chat.attachment.append", .{ .received_bytes = received });
+    }
+    try f.reply("chat.attachment.commit", .{ .attachment_id = "first" });
+    // The second photo starts uploading after the first commits.
+    _ = try f.find("chat.attachment.create");
+}
+
 test "chat discovers externally started turn after a completed turn without replaying stale snapshot" {
     var f = try Fixture.init();
     defer f.deinit();

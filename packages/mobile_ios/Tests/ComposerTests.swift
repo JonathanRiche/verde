@@ -43,29 +43,24 @@ final class ComposerTests: XCTestCase {
         let bytes = try XCTUnwrap(composerImage(image))
         XCTAssertLessThanOrEqual(bytes.count, ComposerModel.maxImageBytes)
         let decoded = try XCTUnwrap(UIImage(data: bytes))
-        XCTAssertLessThanOrEqual(max(decoded.size.width, decoded.size.height), 1600)
+        XCTAssertLessThanOrEqual(max(decoded.size.width, decoded.size.height), 2048)
         XCTAssertEqual(Array(bytes.prefix(2)), [0xff, 0xd8])
     }
 
-    func testImageBudgetFitsFourFullPhotosWithinTheDraftLimit() throws {
-        var attached: [Int] = []
-        for _ in 0..<ComposerModel.maxImages {
-            let budget = ComposerModel.imageBudget(attached: attached)
-            XCTAssertGreaterThanOrEqual(budget, ComposerModel.minImageBytes)
-            XCTAssertLessThanOrEqual(budget, ComposerModel.maxImageBytes)
-            attached.append(budget)
+    func testLargePhotoKeepsProviderSizeWithinTheImageLimit() throws {
+        let format = UIGraphicsImageRendererFormat(); format.scale = 1
+        let photo = UIGraphicsImageRenderer(size: CGSize(width: 4032, height: 3024), format: format).image { context in
+            for column in 0..<8 {
+                UIColor(hue: CGFloat(column) / 8, saturation: 0.7, brightness: 0.9, alpha: 1).setFill()
+                context.fill(CGRect(x: column * 504, y: 0, width: 504, height: 3024))
+            }
         }
-        XCTAssertEqual(ComposerModel.imageBudget(attached: [ComposerModel.maxImageBytes]), 96 * 1024)
-        XCTAssertLessThanOrEqual(attached.reduce(0, +), ComposerModel.maxTotalBytes)
-
-        let photo = UIGraphicsImageRenderer(size: CGSize(width: 2400, height: 1800)).image { context in
-            for row in 0..<60 { for column in 0..<80 {
-                UIColor(hue: CGFloat((row * 80 + column) % 97) / 97, saturation: 0.8, brightness: 0.9, alpha: 1).setFill()
-                context.fill(CGRect(x: column * 30, y: row * 30, width: 30, height: 30))
-            } }
-        }
-        let small = try XCTUnwrap(composerImage(photo, maxBytes: ComposerModel.minImageBytes))
-        XCTAssertLessThanOrEqual(small.count, ComposerModel.minImageBytes)
+        let bytes = try XCTUnwrap(composerImage(photo))
+        XCTAssertLessThanOrEqual(bytes.count, ComposerModel.maxImageBytes)
+        let decoded = try XCTUnwrap(UIImage(data: bytes))
+        XCTAssertEqual(max(decoded.size.width, decoded.size.height), 2048, accuracy: 1)
+        let small = try XCTUnwrap(composerImage(photo, maxBytes: 32 * 1024))
+        XCTAssertLessThanOrEqual(small.count, 32 * 1024)
     }
 
     func testSendFlushesLatestDraftOnceAndPreventsDoubleTap() async throws {

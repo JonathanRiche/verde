@@ -454,15 +454,17 @@ struct ChatComposer: View {
         }
     }
     private func prepare(_ image: UIImage) {
-        model.attach { budget in composerImage(image, maxBytes: budget) }
+        guard let bytes = composerImage(image) else { model.notice = "This image is too large to attach."; return }
+        model.attach(bytes)
     }
 }
 
-/// Re-encoding strips source metadata; drafts respect the core's encrypted record limit.
+/// Re-encoding strips source metadata. 2048 points is the largest edge providers keep before
+/// downscaling, so larger photos only cost upload time.
 @MainActor
 func composerImage(_ image: UIImage, maxBytes: Int = ComposerModel.maxImageBytes) -> Data? {
     guard image.size.width > 0, image.size.height > 0 else { return nil }
-    var edge: CGFloat = 1600
+    var edge: CGFloat = 2048
     while edge >= 200 {
         let scale = min(1, edge / max(image.size.width, image.size.height))
         let size = CGSize(width: image.size.width * scale, height: image.size.height * scale)
@@ -470,7 +472,7 @@ func composerImage(_ image: UIImage, maxBytes: Int = ComposerModel.maxImageBytes
         let resized = UIGraphicsImageRenderer(size: size, format: format).image { context in
             UIColor.white.setFill(); context.fill(CGRect(origin: .zero, size: size)); image.draw(in: CGRect(origin: .zero, size: size))
         }
-        for quality in [0.85, 0.65, 0.45] {
+        for quality in [0.9, 0.75, 0.6, 0.45] {
             if let bytes = resized.jpegData(compressionQuality: quality), bytes.count <= maxBytes { return bytes }
         }
         edge *= 0.7

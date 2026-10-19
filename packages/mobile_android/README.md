@@ -293,8 +293,10 @@ and the follow-up receipt; the app only holds the text field while you type.
   first, starred), effort, access and speed come from the core's catalogs.
   Favourites can't be changed from the phone.
 - **Images** from Photos, the camera or image files are downscaled to JPEG
-  (≤ 160 KiB each, 320 KiB total, 4 per message) because the draft is kept in the
-  core's 512 KiB record. After that they are re-sent by reference, never
+  (2048 px edge, ≤ 700 KiB each, 4 per message): each is added in its own core
+  event, which is capped at 1 MiB. Drafts too large for the core's 512 KiB secure
+  record are saved without their images, so a draft restored after the app closes
+  keeps only its text. After that they are re-sent by reference, never
   re-uploaded. Upload progress shows while sending. Other file types are not
   supported on the phone.
 
