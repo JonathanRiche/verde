@@ -13309,6 +13309,43 @@ pub const AppState = struct {
             }
             project.setCompanionExtraIds(ids[0..count]);
         }
+        self.closeCompanionPanes();
+    }
+
+    /// True when any roster companion owns the thread (current or remembered).
+    fn companionRosterOwnsThread(self: *const AppState, workspace_id: []const u8, local_thread_id: []const u8) bool {
+        for (self.companion_roster.items()) |*companion| {
+            if (companion.ownsThread(workspace_id, local_thread_id)) return true;
+        }
+        return false;
+    }
+
+    /// Companion conversations live in the Companion panel, separate from
+    /// model chats, so a pane showing one (restored from an older layout or
+    /// tiled before the roster arrived) is closed quietly. The thread stays.
+    fn closeCompanionPanes(self: *AppState) void {
+        if (!self.companion_roster.loaded) return;
+        for (self.project_controller.projects.items, 0..) |*project, project_index| {
+            var index = project.workspace_layout.panes.items.len;
+            while (index > 0) {
+                index -= 1;
+                if (index >= project.workspace_layout.panes.items.len) continue;
+                const pane = project.workspace_layout.panes.items[index];
+                const thread_index = switch (pane.ref) {
+                    .chat => |ref| ref.thread_index,
+                    else => continue,
+                };
+                if (thread_index >= project.threads.items.len) continue;
+                const thread = &project.threads.items[thread_index];
+                if (!project.isCompanionThread(thread) and !self.companionRosterOwnsThread(project.id, thread.local_thread_id)) continue;
+                const notice_at = self.sidebar_notice_set_at_ms;
+                const notice = self.sidebar_notice_storage;
+                _ = self.closeWorkspacePane(project_index, pane.id);
+                // Housekeeping, not a user action: keep whatever notice was up.
+                self.sidebar_notice_storage = notice;
+                self.sidebar_notice_set_at_ms = notice_at;
+            }
+        }
     }
 
     /// Releases the active companion's conversation back to its workspace
@@ -16929,10 +16966,14 @@ pub const AppState = struct {
     /// showing them. Tile each open, sent-to chat once, in the background:
     /// focus, selection, and viewport stay where the user left them.
     pub fn tileWebClientThreads(self: *AppState) void {
+        // Companion conversations are web-client threads too; wait for the
+        // roster so they are never tiled as ordinary chat panes.
+        if (self.isCompanionEnabled() and !self.companion_roster.loaded) return;
         for (self.project_controller.projects.items, 0..) |*project, project_index| {
             if (project.archived) continue;
             for (project.threads.items, 0..) |*thread, thread_index| {
                 if (!isWebClientThreadId(thread.local_thread_id) or !thread.committed or thread.archived) continue;
+                if (project.isCompanionThread(thread) or self.companionRosterOwnsThread(project.id, thread.local_thread_id)) continue;
                 if (self.tiled_web_threads.contains(thread.local_thread_id)) continue;
                 const key = self.allocator.dupe(u8, thread.local_thread_id) catch return;
                 self.tiled_web_threads.put(self.allocator, key, {}) catch {
