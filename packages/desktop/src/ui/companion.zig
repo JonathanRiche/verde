@@ -323,12 +323,22 @@ pub fn systemCursorAt(state: *runtime.AppState, x: f32, y: f32) ?palette.platfor
     return switch (action) {
         .menu_dismiss => .default,
         .body => if (companion.menu == .none and overConversationText(state, x, y)) .text else .default,
-        .panel => blk: {
-            const geometry = computeGeometry(state, companion.frame_width, companion.frame_height);
-            break :blk if (companion.visibility == .sidecar_open and pointInRect(composerRect(geometry.footer), x, y)) .text else .default;
-        },
+        .panel => composerCursorAt(state, x, y),
         else => .pointer,
     };
+}
+
+/// Composer: pointer over its controls (model pill, send), I-beam over the
+/// text area, arrow over the rest of the panel.
+fn composerCursorAt(state: *runtime.AppState, x: f32, y: f32) palette.platform.CursorShape {
+    const companion = &state.companion_controller;
+    if (companion.visibility != .sidecar_open) return .default;
+    const geometry = computeGeometry(state, companion.frame_width, companion.frame_height);
+    if (!pointInRect(composerRect(geometry.footer), x, y)) return .default;
+    if (state.companion_composer.hitTest(.{ .x = x, .y = y })) |part| {
+        return if (part == .send and (state.companion_composer.send_state == .disabled or state.companion_composer.send_state == .pending)) .default else .pointer;
+    }
+    return .text;
 }
 
 /// True when (x, y) sits on a drawn line of conversation text.
@@ -3031,7 +3041,14 @@ test "cursor is an I-beam over text and the composer and a pointer over controls
     // Blank conversation space below the text keeps the arrow.
     try std.testing.expectEqual(palette.platform.CursorShape.default, systemCursorAt(&state, line.x + 4.0, geometry.conversation.y + geometry.conversation.h - 4.0).?);
     const composer = composerRect(geometry.footer);
-    try std.testing.expectEqual(palette.platform.CursorShape.text, systemCursorAt(&state, composer.x + 8.0, composer.y + 8.0).?);
+    state.syncCompanionComposer(composer);
+    const text_area = state.companion_composer.textRect();
+    try std.testing.expectEqual(palette.platform.CursorShape.text, systemCursorAt(&state, text_area.x + 8.0, text_area.y + 8.0).?);
+    const model = state.companion_composer.modelRect();
+    try std.testing.expectEqual(palette.platform.CursorShape.pointer, systemCursorAt(&state, model.x + model.w * 0.5, model.y + model.h * 0.5).?);
+    const send = state.companion_composer.sendButtonRect();
+    state.companion_composer.send_state = .send;
+    try std.testing.expectEqual(palette.platform.CursorShape.pointer, systemCursorAt(&state, send.x + send.w * 0.5, send.y + send.h * 0.5).?);
     try std.testing.expectEqual(palette.platform.CursorShape.pointer, systemCursorAt(&state, geometry.close_button.x + 4.0, geometry.close_button.y + 4.0).?);
     try std.testing.expectEqual(palette.platform.CursorShape.pointer, systemCursorAt(&state, geometry.name_button.x + 4.0, geometry.name_button.y + 4.0).?);
     try std.testing.expect(systemCursorAt(&state, 5.0, 5.0) == null);

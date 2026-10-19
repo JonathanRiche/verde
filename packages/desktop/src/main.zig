@@ -939,6 +939,16 @@ fn syncMouseCursor(state: *AppState, cache: *CursorState) void {
         applySystemCursor(cache, .pointer);
         return;
     }
+    // Composer toolbar controls (directory, model, run settings, send) are
+    // buttons; only the text area takes the I-beam.
+    if (!modal_hit) {
+        const composer = &state.composer_controller.composer;
+        if (composer.hitTest(.{ .x = state.transcript_controller.palette_mouse_x, .y = state.transcript_controller.palette_mouse_y })) |part| {
+            const inert = part == .send and (composer.send_state == .disabled or composer.send_state == .pending);
+            applySystemCursor(cache, if (inert) .default else .pointer);
+            return;
+        }
+    }
     if (!modal_hit and state.composer_controller.composer.textRect().contains(.{
         .x = state.transcript_controller.palette_mouse_x,
         .y = state.transcript_controller.palette_mouse_y,
