@@ -211,6 +211,9 @@ private struct TranscriptList: View {
 
     @State private var position: String?
     @State private var atBottom = true
+    /// The reader wants the newest output. iOS 18 tracks it from scroll phases so late row
+    /// measurements can be followed; iOS 17 mirrors `atBottom`.
+    @State private var follow = true
     @State private var viewport: CGFloat = 0
     @State private var cardVisible = false
     @State private var settled = false
@@ -269,23 +272,27 @@ private struct TranscriptList: View {
                     .onPreferenceChange(BottomOffsetKey.self) { maxY in
                         let bottom = maxY - viewport <= bottomSlack
                         if bottom != atBottom { atBottom = bottom }
+                        if #unavailable(iOS 18.0) { if bottom != follow { follow = bottom } }
                     }
                     .onChange(of: tailKey(items)) {
-                        // `atBottom` still describes the layout before this change.
-                        if atBottom { proxy.scrollTo(bottomID, anchor: .bottom) }
+                        // `follow` still describes the layout before this change.
+                        if follow { proxy.scrollTo(bottomID, anchor: .bottom) }
                     }
+                    .modifier(TailFollower(follow: $follow) { proxy.scrollTo(bottomID, anchor: .bottom) })
 
                     ApprovalBanner(approval: approval, cardVisible: cardVisible, controller: model.approvals) {
                         guard let approval else { return }
+                        follow = false
                         withAnimation(reducedMotion || AppearanceSettings.shared.reducedMotion ? nil : .default) { proxy.scrollTo("approval:\(approval.turn_id):\(approval.call_id)", anchor: .center) }
                     }
 
-                    if !atBottom && !items.isEmpty {
+                    if !atBottom && !follow && !items.isEmpty {
                         VStack {
                             Spacer()
                             HStack {
                                 Spacer()
                                 Button {
+                                    follow = true
                                     withAnimation(reducedMotion || AppearanceSettings.shared.reducedMotion ? nil : .default) { proxy.scrollTo(bottomID, anchor: .bottom) }
                                 } label: {
                                     Image(systemName: "arrow.down").font(.body.weight(.semibold)).padding(12)
@@ -301,6 +308,44 @@ private struct TranscriptList: View {
             .onAppear { viewport = outer.size.height }
             .onChange(of: outer.size.height) { _, height in viewport = height }
         }
+    }
+}
+
+/// Diffs and images render after a jump to the newest row, and a finished turn drops its working
+/// row, so lazy rows settle to heights that differ from their estimates. That can leave the offset
+/// in blank space past the content. While the reader follows the tail, re-anchor whenever the
+/// settled geometry leaves the bottom; their own scroll stops following until they rest at the end.
+private struct TailFollower: ViewModifier {
+    @Binding var follow: Bool
+    let anchor: () -> Void
+
+    func body(content: Content) -> some View {
+        if #available(iOS 18.0, *) { content.modifier(TailFollowerGeometry(follow: $follow, anchor: anchor)) } else { content }
+    }
+}
+
+@available(iOS 18.0, *)
+private struct TailFollowerGeometry: ViewModifier {
+    @Binding var follow: Bool
+    let anchor: () -> Void
+    @State private var phase: ScrollPhase = .idle
+    @State private var gap: CGFloat = 0
+
+    func body(content: Content) -> some View {
+        content
+            .onScrollPhaseChange { _, next in
+                phase = next
+                if next == .interacting { follow = false }
+                if next == .idle, !follow, abs(gap) <= bottomSlack { follow = true }
+            }
+            // Points between the current offset and the last reachable one; negative is past the end.
+            .onScrollGeometryChange(for: CGFloat.self) { g in
+                let last = max(-g.contentInsets.top, g.contentSize.height + g.contentInsets.bottom - g.containerSize.height)
+                return last - g.contentOffset.y
+            } action: { _, next in
+                gap = next
+                if follow, phase == .idle, abs(next) > bottomSlack { anchor() }
+            }
     }
 }
 
