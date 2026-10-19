@@ -783,56 +783,6 @@ function App() {
 
       <Lightbox items={gallery} index={lightbox()} onIndex={setLightbox} />
 
-      {/* ── Feature: tiling ── */}
-      <section id="tiling" class="band">
-        <div class="wrap feature-row">
-          <div class="feature-copy">
-            <p class="tag tag-static">Tiling workspace</p>
-            <h2 class="heading">A workspace, not a chat box.</h2>
-            <p class="band-body">
-              Every pane is a first-class window. Split chat, browser, and
-              terminal side by side — or let Verde scroll them as a Niri-style
-              strip when the workspace fills up. Same vim keybinds either way.
-            </p>
-            <p class="band-body band-body-muted">
-              Automatic, always-on, or disabled per workspace. Free-form wheel
-              panning, resizable columns, sidebar reorder, and layouts that
-              persist across launches.
-            </p>
-          </div>
-
-          <div class="feature-visual">
-            {/* Pure-CSS diagram: Niri-style horizontal scrolling strip of panes */}
-            <div class="tiling-mock" aria-hidden="true">
-              <div class="tm-sidebar">
-                <span class="tm-dot" />
-                <span class="tm-row" />
-                <span class="tm-row tm-row--active" />
-                <span class="tm-row" />
-                <span class="tm-row tm-row--short" />
-              </div>
-              <div class="tm-main tm-main--scroll">
-                <div class="tm-pane tm-pane--chat">
-                  <span class="tm-label">chat · claude</span>
-                  <span class="tm-line" />
-                  <span class="tm-line tm-line--short" />
-                  <span class="tm-bubble" />
-                </div>
-                <div class="tm-pane tm-pane--browser">
-                  <span class="tm-label">browser</span>
-                  <span class="tm-url" />
-                  <span class="tm-block" />
-                </div>
-                <div class="tm-pane tm-pane--term tm-pane--peek">
-                  <span class="tm-label">terminal · zsh</span>
-                  <span class="tm-cmd">$ cargo test</span>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      </section>
-
       {/* ── Feature: command palette ── */}
       <section id="palette" class="band band-alt">
         <div class="wrap feature-row feature-row--reverse">
