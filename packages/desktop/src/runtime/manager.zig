@@ -23,6 +23,8 @@ pub const MAX_RPC_METHOD_BYTES: usize = 128;
 pub const REPOSITORY_MANIFEST_CAPABILITY: []const u8 = "repositories.manifest.v1";
 pub const REPOSITORY_CHAT_ROUTE_CAPABILITY: []const u8 = "chat.repository_route.v1";
 pub const CHAT_ATTACHMENT_CAPABILITY: []const u8 = headless.attachment_protocol.CHAT_ATTACHMENT_CAPABILITY;
+/// Runtime accepts `workspace.attach` (docs/multi-machine-workspaces.md).
+pub const WORKSPACE_ATTACH_CAPABILITY: []const u8 = "workspace.attach.v1";
 /// Paired-device access tokens are re-minted this long before they expire so
 /// a heartbeat never races an expiry.
 pub const ACCESS_TOKEN_REFRESH_MARGIN_MS: u64 = 60_000;
@@ -242,6 +244,12 @@ pub const Snapshot = struct {
     /// Whether the runtime accepts staged chat attachments (chat.attachments.v1).
     /// Old daemons leave this false so attachment sends reject visibly.
     chat_attachment_capable: bool = false,
+    /// Whether the runtime accepts `workspace.attach` (workspace.attach.v1).
+    workspace_attach_capable: bool = false,
+    /// Whether this device may write repositories (`repository:write`).
+    /// True for owner (admin token) access, the granted scope for a paired
+    /// device once an access token was minted, null while unknown.
+    repository_write_granted: ?bool = null,
     /// Runtime-advertised, connection-validated upload limits. Zero until a
     /// verified handshake supplies them.
     max_attachment_bytes: usize = 0,
@@ -397,6 +405,9 @@ const Entry = struct {
     pairing_result: ?OwnedPairingResult = null,
     access_token_expires_at_ms: ?i64 = null,
     access_token_refresh_at_ms: ?u64 = null,
+    /// `repository:write` in the last minted access token's scopes; null
+    /// until a token reports its scopes.
+    repository_write_granted: ?bool = null,
     healthy_generation: ?u64 = null,
     last_heartbeat_ms: ?u64 = null,
     next_heartbeat_at_ms: ?u64 = null,
@@ -604,6 +615,7 @@ pub const Manager = struct {
         clearHealth(entry);
         entry.failure_override = null;
         entry.access_token_expires_at_ms = null;
+        entry.repository_write_granted = null;
         entry.access_token_refresh_at_ms = null;
         entry.device_auth_rejected = false;
         entry.stale_bearer_remint_attempted = false;
@@ -709,6 +721,7 @@ pub const Manager = struct {
         if (entry.pairing_result) |*result| result.deinit(self.allocator);
         entry.pairing_result = null;
         entry.access_token_expires_at_ms = null;
+        entry.repository_write_granted = null;
         entry.access_token_refresh_at_ms = null;
         _ = self.secrets.remove(entry.owned_profile.id);
         var key_buffer: DeviceSecretKeyBuffer = undefined;
@@ -1171,6 +1184,7 @@ pub const Manager = struct {
             // every attempt mints a fresh one from the device credential.
             _ = self.secrets.remove(entry.owned_profile.id);
             entry.access_token_expires_at_ms = null;
+            entry.repository_write_granted = null;
             entry.access_token_refresh_at_ms = null;
         }
 
@@ -1521,6 +1535,7 @@ pub const Manager = struct {
         try self.secrets.put(entry.owned_profile.id, value.access_token);
         entry.access_token_expires_at_ms = value.expires_at_ms;
         entry.access_token_refresh_at_ms = accessTokenRefreshAt(self.io, value.expires_at_ms, now_ms);
+        entry.repository_write_granted = if (value.scopes) |scopes| scopesGrantRepositoryWrite(scopes) else null;
         // The runtime just accepted the device credential, so any previous
         // rejection marker is stale. The remint-attempted bound stays until a
         // healthy RPC proves the fresh bearer actually works.
@@ -1991,7 +2006,16 @@ const AccessTokenResponse = struct {
     access_token: []const u8,
     token_type: []const u8,
     expires_at_ms: i64,
+    /// Granted scope names; older runtimes omit them.
+    scopes: ?[]const []const u8 = null,
 };
+
+fn scopesGrantRepositoryWrite(scopes: []const []const u8) bool {
+    for (scopes) |scope| {
+        if (std.mem.eql(u8, scope, access_protocol.Scope.repository_write.wireName())) return true;
+    }
+    return false;
+}
 
 pub const DeviceSecretKeyBuffer = [secret_store.MAX_PROFILE_ID_BYTES + DEVICE_SECRET_SUFFIX.len]u8;
 
@@ -2811,6 +2835,11 @@ fn snapshotEntry(entry: *const Entry) Snapshot {
         .repository_manifest_capable = runtimeAdvertisesCapability(entry, REPOSITORY_MANIFEST_CAPABILITY),
         .repository_chat_route_capable = runtimeAdvertisesCapability(entry, REPOSITORY_CHAT_ROUTE_CAPABILITY),
         .chat_attachment_capable = runtimeAdvertisesCapability(entry, CHAT_ATTACHMENT_CAPABILITY),
+        .workspace_attach_capable = runtimeAdvertisesCapability(entry, WORKSPACE_ATTACH_CAPABILITY),
+        .repository_write_granted = switch (entry.owned_profile.access) {
+            .admin_token => true,
+            else => entry.repository_write_granted,
+        },
         .max_attachment_bytes = if (entry.connection_state.metadata()) |runtime| runtime.limits.max_attachment_bytes else 0,
         .max_request_bytes = if (entry.connection_state.metadata()) |runtime| runtime.limits.max_request_bytes else 0,
         .execution_ready = entryExecutionReady(entry),

@@ -47,6 +47,7 @@ const chat_types = @import("state/chat_types.zig");
 const state_sync = @import("state/sync.zig");
 const state_ui_types = @import("state/ui_types.zig");
 pub const folder_browser = @import("state/folder_browser.zig");
+pub const workspace_setup = @import("state/workspace_setup.zig");
 pub const custom_agent_form = @import("state/custom_agent_form.zig");
 pub const provider_setup = @import("state/provider_setup.zig");
 const herdr_types = @import("state/herdr_types.zig");
@@ -4052,9 +4053,22 @@ pub fn runtimePickerStatusDescription(status: RuntimePickerStatus) []const u8 {
 
 fn runtimePickerProfileAt(state: *const AppState, index: usize) ?*const RuntimePickerProfile {
     if (index == RUNTIME_PICKER_LOCAL_INDEX) return null;
-    const profile_index = index - 1;
-    if (profile_index >= state.runtime_picker_profiles.items.len) return null;
+    const count = state.runtime_picker_profiles.items.len;
+    if (index - 1 >= count) return null;
+    // Rows are ordered by workspace tier; map the row to its profile.
+    const profile_index = state.workspace_setup.pickerProfileIndex(index - 1, count);
+    if (profile_index >= count) return null;
     return &state.runtime_picker_profiles.items[profile_index];
+}
+
+/// Tier row for a Run on index, when setup tiers are known for it.
+fn runtimePickerSetupRow(state: *const AppState, index: usize) ?*const workspace_setup.PickerRow {
+    if (index == RUNTIME_PICKER_LOCAL_INDEX) return null;
+    const row = state.workspace_setup.pickerRow(index - 1, state.runtime_picker_profiles.items.len) orelse return null;
+    return switch (row.tier) {
+        .same_origin, .set_up => row,
+        .has_workspace, .plain => null,
+    };
 }
 
 fn runtimePickerSnapshotAt(state: *const AppState, index: usize) ?RuntimeService.Snapshot {
@@ -4084,6 +4098,7 @@ fn paletteRuntimePickerLabel(context: ?*anyopaque, index: usize) []const u8 {
     if (index == RUNTIME_PICKER_LOCAL_INDEX) return "Local";
     const state = appStateFromContext(context) orelse return "";
     if (index == runtimePickerAddIndex(state)) return "Add connection…";
+    if (runtimePickerSetupRow(state, index)) |row| return workspace_setup.State.rowLabel(row);
     const snapshot = runtimePickerSnapshotAt(state, index) orelse return "Unavailable runtime";
     return snapshot.label;
 }
@@ -4092,6 +4107,7 @@ fn paletteRuntimePickerDescription(context: ?*anyopaque, index: usize) []const u
     if (index == RUNTIME_PICKER_LOCAL_INDEX) return "Runs on this machine";
     const state = appStateFromContext(context) orelse return "";
     if (index == runtimePickerAddIndex(state)) return "Connect a self-hosted Verde runtime over SSH";
+    if (runtimePickerSetupRow(state, index)) |row| return workspace_setup.State.rowDescription(row);
     const snapshot = runtimePickerSnapshotAt(state, index) orelse return runtimePickerStatusDescription(.unavailable);
     return runtimePickerStatusDescription(runtimePickerStatus(snapshot));
 }
@@ -4100,6 +4116,7 @@ fn paletteRuntimePickerBadge(context: ?*anyopaque, index: usize) []const u8 {
     if (index == RUNTIME_PICKER_LOCAL_INDEX) return "";
     const state = appStateFromContext(context) orelse return "";
     if (index == runtimePickerAddIndex(state)) return "";
+    if (runtimePickerSetupRow(state, index)) |row| return row.badge;
     const snapshot = runtimePickerSnapshotAt(state, index) orelse return runtimePickerStatusBadge(.unavailable);
     return runtimePickerStatusBadge(runtimePickerStatus(snapshot));
 }
@@ -5039,6 +5056,9 @@ pub const AppState = struct {
     /// until the next manager mutation. Labels and secret-free status are
     /// looked up live on the single SDL owner thread.
     runtime_picker_profiles: std.ArrayList(RuntimePickerProfile) = .empty,
+    /// Setting up this workspace on other machines: per-machine snapshot
+    /// cache, Run on tiers, the transcript setup card (multi-machine-workspaces.md).
+    workspace_setup: workspace_setup.State = .{},
     /// Desktop-local, non-secret workspace defaults. A missing or stale
     /// mapping behaves as Local and never rewrites an existing thread route.
     workspace_runtime_defaults: ?runtime_workspace_defaults.OwnedWorkspaceRuntimeDefaults = null,
@@ -6131,6 +6151,11 @@ pub const AppState = struct {
         }
         changed = runtime_connections_controller.pollRuntimeConnectionsReadiness(self) or changed;
         changed = runtime_connections_controller.pollRuntimeConnectionWizard(self) or changed;
+        changed = workspace_setup.poll(self) or changed;
+        if (self.workspace_setup.picker_stale and self.composer_controller.runtime_picker.isOpen()) {
+            self.syncPaletteRuntimePicker();
+            changed = true;
+        }
         return self.maybePresentRuntimeTrustProposal() or changed;
     }
 
@@ -6138,6 +6163,7 @@ pub const AppState = struct {
         self.closeRuntimeCredentialModalState();
         self.closeRuntimeTrustModalState();
         self.runtime_connections.deinit(self.allocator);
+        self.workspace_setup.deinit(self.allocator);
         for (self.runtime_picker_profiles.items) |*profile| profile.deinit(self.allocator);
         self.runtime_picker_profiles.deinit(self.allocator);
         if (self.runtime_service) |service| {
@@ -6503,6 +6529,12 @@ pub const AppState = struct {
             .extra_images = copied_extra,
         });
         thread.touch();
+    }
+
+    /// A remote send was rejected because the machine lacks this workspace:
+    /// show the setup card instead of the failure row when it can attach.
+    pub fn openWorkspaceSetupCardForSend(self: *AppState, project_id: []const u8, local_thread_id: []const u8, profile_id: []const u8) bool {
+        return workspace_setup.openCardForRejectedSend(self, project_id, local_thread_id, profile_id);
     }
 
     pub fn appendInitialSendFailure(self: *AppState, thread: *ChatThread, message: []const u8) void {
@@ -14743,6 +14775,9 @@ pub const AppState = struct {
         self.composer_controller.runtime_picker.setStyle(runtime_style);
         self.composer_controller.runtime_picker.setUiScale(theme.uiScaleFactor());
         self.composer_controller.runtime_picker.setFontMetrics(paletteEstimatedFontMetrics(theme.scaledUi(15.5)));
+        // Machines that have this workspace, then same-origin and "Set up on…" rows.
+        workspace_setup.syncPickerRows(self);
+        self.composer_controller.runtime_picker.invalidateItems();
         // Local, every configured runtime, then the trailing "Add connection…" row.
         self.composer_controller.runtime_picker.setItemCount(2 + self.runtime_picker_profiles.items.len);
         self.composer_controller.runtime_picker.setSelectedItem(self.currentRuntimePickerIndex());
@@ -14754,8 +14789,9 @@ pub const AppState = struct {
         if (std.mem.eql(u8, profile_id, chat_types.LOCAL_RUNTIME_PROFILE_ID)) {
             return RUNTIME_PICKER_LOCAL_INDEX;
         }
+        const count = self.runtime_picker_profiles.items.len;
         for (self.runtime_picker_profiles.items, 0..) |configured, index| {
-            if (std.mem.eql(u8, configured.profile_id, profile_id)) return index + 1;
+            if (std.mem.eql(u8, configured.profile_id, profile_id)) return self.workspace_setup.pickerDisplayRow(index, count) + 1;
         }
         return null;
     }
@@ -14995,6 +15031,8 @@ pub const AppState = struct {
             configured.profile_id
         else
             return;
+        // "Use it" attaches the same-origin checkout; "Set up on…" opens the card.
+        if (workspace_setup.handlePickerSelection(self, profile_id)) return;
 
         const result = selectThreadRuntimeProfile(
             self.currentThreadMutable(),
@@ -16772,6 +16810,8 @@ pub const AppState = struct {
         }
 
         if (next_status != .idle) {
+            // A folder picked on another machine sets that machine up.
+            if (workspace_setup.takePickerResult(self, picked_path, next_status == .selected)) return;
             if (self.workspace_folder_picker_id) |workspace_id| {
                 defer self.allocator.free(workspace_id);
                 self.workspace_folder_picker_id = null;

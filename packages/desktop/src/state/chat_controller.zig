@@ -1535,6 +1535,125 @@ test "acceptance keeps the optimistic clear, retains message id, and restores re
     try std.testing.expectEqual(@as(usize, 1), state.failure_rows);
 }
 
+test "a binding-missing rejection opens the workspace setup card instead of the failure row" {
+    const allocator = std.testing.allocator;
+    const FakeState = struct {
+        allocator: std.mem.Allocator,
+        chat_controller: State = .{},
+        project_controller: struct {
+            projects: std.ArrayList(Project) = .empty,
+            selected_index: usize = 0,
+        } = .{},
+        failure_rows: usize = 0,
+        cards: usize = 0,
+        card_profile: []const u8 = "",
+        /// Mirrors a runtime that advertises workspace.attach.v1.
+        attach_capable: bool = true,
+
+        pub fn projectThreadIndexByLocalId(self: *@This(), workspace_id: []const u8, local_thread_id: []const u8) ?ProjectThreadIndex {
+            for (self.project_controller.projects.items, 0..) |*project, project_index| {
+                if (!std.mem.eql(u8, project.id, workspace_id)) continue;
+                for (project.threads.items, 0..) |*thread, thread_index| {
+                    if (std.mem.eql(u8, thread.local_thread_id, local_thread_id)) return .{
+                        .project_index = project_index,
+                        .thread_index = thread_index,
+                    };
+                }
+            }
+            return null;
+        }
+        pub fn releaseMessage(self: *@This(), message: ChatMessage) void {
+            self.allocator.free(message.author);
+            self.allocator.free(message.body);
+            self.allocator.free(message.extra_images);
+        }
+        pub fn openWorkspaceSetupCardForSend(self: *@This(), _: []const u8, _: []const u8, profile_id: []const u8) bool {
+            if (!self.attach_capable) return false;
+            self.cards += 1;
+            self.card_profile = profile_id;
+            return true;
+        }
+        pub fn appendInitialSendFailure(self: *@This(), _: *ChatThread, _: []const u8) void {
+            self.failure_rows += 1;
+        }
+        pub fn requestTranscriptScrollToBottom(_: *@This()) void {}
+        pub fn resetComposerInputWidget(_: *@This()) void {}
+        pub fn setSidebarNotice(_: *@This(), _: []const u8) void {}
+        pub fn flushDirtyBlocking(_: *@This()) void {}
+        pub fn markDirty(_: *@This()) void {}
+    };
+
+    var state: FakeState = .{ .allocator = allocator };
+    var project = try Project.init(allocator, "setup-card", "Setup card", "/tmp/setup-card", 0);
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+    defer {
+        for (state.project_controller.projects.items) |*owned| owned.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+    }
+    const thread = &state.project_controller.projects.items[0].threads.items[0];
+    try std.testing.expectEqual(.updated, try thread.selectRuntimeRoute(allocator, .{
+        .profile_id = "lightning",
+        .repository_id = chat_types.PRIMARY_REPOSITORY_ID,
+    }));
+
+    const reject = struct {
+        fn call(fake: *FakeState, target: *ChatThread, err: anyerror) !void {
+            const dispatch = try std.heap.page_allocator.create(AcceptanceDispatch);
+            dispatch.* = .{
+                .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+                .project_id = "",
+                .local_thread_id = "",
+                .pref_path = "",
+                .profile_id = "lightning",
+                .repository_id = chat_types.PRIMARY_REPOSITORY_ID,
+                .relative_cwd = null,
+                .runtime_id = null,
+                .turn_id = "gui:test:setup",
+                .prompt = "run there",
+                .message_id = "gui-msg:test:setup",
+                .params = undefined,
+                .snapshot = .{ .message_count = 0, .committed = false, .last_activity_at = 0, .title = null },
+                .outcome = .rejected,
+                .err = err,
+            };
+            const arena = dispatch.arena.allocator();
+            dispatch.project_id = try arena.dupe(u8, fake.project_controller.projects.items[0].id);
+            dispatch.local_thread_id = try arena.dupe(u8, target.local_thread_id);
+            const send_state = target.send_state;
+            send_state.mutex.lock();
+            send_state.status = .pending;
+            send_state.daemon_owned = true;
+            send_state.acceptance_pending = true;
+            send_state.daemon_turn_id = try std.heap.page_allocator.dupe(u8, "gui:test:setup");
+            send_state.mutex.unlock();
+            fake.chat_controller.beginSend();
+            try std.testing.expect(commitAcceptanceDispatch(fake, dispatch));
+            dispatch.destroy(fake.allocator);
+        }
+    }.call;
+
+    thread.setDraft("run there");
+    try reject(&state, thread, error.RemoteWorkspaceBindingMissing);
+    try std.testing.expectEqual(@as(usize, 1), state.cards);
+    try std.testing.expectEqualStrings("lightning", state.card_profile);
+    try std.testing.expectEqual(@as(usize, 0), state.failure_rows);
+    // The draft is kept so the user only has to send again.
+    try std.testing.expectEqualStrings("run there", thread.currentDraft());
+    try std.testing.expect(!thread.isSendPending());
+
+    // Other rejections, and runtimes that cannot attach, keep the error row.
+    try reject(&state, thread, error.DaemonRequestFailed);
+    try std.testing.expectEqual(@as(usize, 1), state.cards);
+    try std.testing.expectEqual(@as(usize, 1), state.failure_rows);
+    state.attach_capable = false;
+    try reject(&state, thread, error.RemoteWorkspaceBindingMissing);
+    try std.testing.expectEqual(@as(usize, 1), state.cards);
+    try std.testing.expectEqual(@as(usize, 2), state.failure_rows);
+}
+
 /// Directory a local provider session should run in: the thread's override
 /// when the user switched it, otherwise the owning workspace path.
 pub fn effectiveThreadCwd(project_path: []const u8, thread: *const ChatThread) []const u8 {
@@ -3410,6 +3529,17 @@ pub fn pollAcceptanceDispatches(self: anytype) bool {
 /// ambiguous keeps the stable turn armed and leaves the composer clear. Tail
 /// reconciliation probes that exact id after reconnect; no submit path can
 /// replay while the unresolved send remains pending.
+/// A remote machine without this workspace (`RemoteWorkspaceBindingMissing`)
+/// gets the workspace setup card in place of the failure row
+/// (docs/multi-machine-workspaces.md). The state declines when the machine
+/// cannot attach, which keeps today's row. The restored draft is untouched.
+fn openSetupCardForRejectedSend(self: anytype, thread: *ChatThread, dispatch: *const AcceptanceDispatch) bool {
+    if (comptime !@hasDecl(std.meta.Child(@TypeOf(self)), "openWorkspaceSetupCardForSend")) return false;
+    const err = dispatch.err orelse return false;
+    if (err != error.RemoteWorkspaceBindingMissing) return false;
+    return self.openWorkspaceSetupCardForSend(dispatch.project_id, thread.local_thread_id, dispatch.profile_id);
+}
+
 pub fn commitAcceptanceDispatch(self: anytype, dispatch: *AcceptanceDispatch) bool {
     const resolved = self.projectThreadIndexByLocalId(dispatch.project_id, dispatch.local_thread_id) orelse return false;
     const project = &self.project_controller.projects.items[resolved.project_index];
@@ -3493,7 +3623,9 @@ pub fn commitAcceptanceDispatch(self: anytype, dispatch: *AcceptanceDispatch) bo
             self.chat_controller.finishSend();
             dispatch.snapshot.restore(self, thread);
             restoreComposerAfterRejectedAcceptance(self, thread, dispatch, selected);
-            self.appendInitialSendFailure(thread, initialSendStartFailureMessage(dispatch.err orelse error.DaemonRequestFailed));
+            if (!openSetupCardForRejectedSend(self, thread, dispatch)) {
+                self.appendInitialSendFailure(thread, initialSendStartFailureMessage(dispatch.err orelse error.DaemonRequestFailed));
+            }
             project.invalidateSidebarThreadCache();
             if (selected) self.requestTranscriptScrollToBottom();
             self.flushDirtyBlocking();

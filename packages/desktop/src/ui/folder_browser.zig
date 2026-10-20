@@ -223,6 +223,12 @@ fn ensurePlaces(state: *runtime.AppState) void {
     if (places_ready) return;
     const model = browser(state);
     place_count = 0;
+    if (model.isRemote()) {
+        // Another machine: only its default root, once the first listing names it.
+        if (model.home.items.len > 0) addPlace("Home", model.home.items, NF_COD_HOME, false);
+        places_ready = model.home.items.len > 0;
+        return;
+    }
     const home = model.home.items;
     if (home.len > 0) addPlace("Home", home, NF_COD_HOME, false);
     var threaded = std.Io.Threaded.init_single_threaded;
@@ -450,7 +456,11 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     queuePanel(state, modal_rect, theme.raise(theme.background(), 0.04), theme.COLOR_PANEL_MUTED, theme.scaledUi(14.0), 1.0);
 
     const pad = theme.scaledUi(18.0);
-    queueText(state, .{ .x = modal_rect.x + pad, .y = modal_rect.y + pad, .w = modal_rect.w * 0.6, .h = theme.scaledUi(22.0) }, if (state.folderBrowserOffersManagedWorkspace()) "Create a workspace" else "Choose a directory", theme.COLOR_WHITE, theme.scaledUi(17.0), modal_rect);
+    var title_buf: [160]u8 = undefined;
+    const title = if (model.isRemote())
+        std.fmt.bufPrint(&title_buf, "Choose a folder on {s}", .{model.remoteMachineLabel()}) catch "Choose a folder"
+    else if (state.folderBrowserOffersManagedWorkspace()) "Create a workspace" else "Choose a directory";
+    queueText(state, .{ .x = modal_rect.x + pad, .y = modal_rect.y + pad, .w = modal_rect.w * 0.6, .h = theme.scaledUi(22.0) }, title, theme.COLOR_WHITE, theme.scaledUi(17.0), modal_rect);
     renderChip(state, hidden_rect, if (model.show_hidden) "Hidden: shown" else "Hidden: off", model.show_hidden);
 
     renderIconButton(state, up_rect, NF_COD_ARROW_UP, std.fs.path.dirname(model.currentDir()) != null);
@@ -557,7 +567,9 @@ fn rowRect(state: *runtime.AppState, row: usize) palette.Rect {
 fn renderRows(state: *runtime.AppState) void {
     const model = browser(state);
     if (rowCount() == 0) {
-        const message = if (model.query().len > 0 and !model.queryIsPath()) "No directories match." else "No directories here.";
+        const message = if (model.remoteLoading() and model.entries.items.len == 0)
+            "Loading folders\u{2026}"
+        else if (model.query().len > 0 and !model.queryIsPath()) "No directories match." else "No directories here.";
         const size = theme.scaledUi(13.0);
         queueText(state, .{ .x = list_rect.x + theme.scaledUi(10.0), .y = list_rect.y + theme.scaledUi(10.0), .w = list_rect.w, .h = size * 1.25 }, message, theme.COLOR_TEXT_MUTED, size, list_rect);
         return;
@@ -574,11 +586,12 @@ fn renderRows(state: *runtime.AppState) void {
             queueRoundedClipped(state, rect, fill, theme.scaledUi(6.0), list_rect);
         }
         queueIcon(state, .{ .x = rect.x + theme.scaledUi(10.0), .y = rect.y + (rect.h - icon_size) * 0.5, .w = icon_size, .h = icon_size }, if (entry.is_git) NF_COD_FOLDER_OPENED else NF_COD_FOLDER, if (entry.is_git) theme.accent() else theme.COLOR_TEXT_MUTED, icon_size, list_rect);
-        const badge = if (entry.is_git) "git" else "";
+        // A remote checkout whose origin matches this workspace reads "same origin".
+        const badge = if (entry.same_origin) "same origin" else if (entry.is_git) "git" else "";
         const badge_size = theme.scaledUi(11.0);
         const badge_w = runtime.paletteUiTextPrefixWidth(badge, badge_size, badge.len);
         const badge_x = rect.x + rect.w - theme.scaledUi(10.0) - badge_w;
-        if (badge.len > 0) queueText(state, .{ .x = badge_x, .y = rect.y + (rect.h - badge_size * 1.25) * 0.5, .w = badge_w, .h = badge_size * 1.25 }, badge, theme.COLOR_TEXT_SUBTLE, badge_size, list_rect);
+        if (badge.len > 0) queueText(state, .{ .x = badge_x, .y = rect.y + (rect.h - badge_size * 1.25) * 0.5, .w = badge_w, .h = badge_size * 1.25 }, badge, if (entry.same_origin) theme.accent() else theme.COLOR_TEXT_SUBTLE, badge_size, list_rect);
         const text_x = rect.x + theme.scaledUi(34.0);
         queueText(state, .{ .x = text_x, .y = rect.y + (rect.h - font_size * 1.25) * 0.5, .w = @max(badge_x - theme.scaledUi(10.0) - text_x, 0.0), .h = font_size * 1.25 }, entry.name, if (entry.hidden) theme.COLOR_TEXT_MUTED else theme.COLOR_WHITE, font_size, list_rect);
     }
@@ -628,7 +641,7 @@ fn renderFooter(state: *runtime.AppState) void {
     renderButton(state, cancel_rect, "Cancel", false);
     var label_buf: [160]u8 = undefined;
     const name = std.fs.path.basename(target);
-    const verb = if (state.folderBrowserOffersManagedWorkspace()) "Add" else "Select";
+    const verb = if (model.isRemote()) "Use" else if (state.folderBrowserOffersManagedWorkspace()) "Add" else "Select";
     const label = std.fmt.bufPrint(&label_buf, "{s} \u{201C}{s}\u{201D}", .{ verb, if (name.len == 0) "/" else name }) catch verb;
     renderButton(state, select_rect, label, true);
 }

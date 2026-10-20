@@ -159,6 +159,15 @@ const MAX_USAGE_ACTION_HITS = 16;
 var usage_action_hit_count: usize = 0;
 var usage_action_hits: [MAX_USAGE_ACTION_HITS]UsageActionHit = [_]UsageActionHit{.{}} ** MAX_USAGE_ACTION_HITS;
 
+/// One button of the live workspace setup card.
+const WorkspaceSetupHit = struct {
+    rect: palette.Rect = .{},
+    kind: app_state.workspace_setup.CardButtonKind = .cancel,
+    index: usize = 0,
+};
+var workspace_setup_hit_count: usize = 0;
+var workspace_setup_hits: [app_state.workspace_setup.MAX_CARD_BUTTONS]WorkspaceSetupHit = [_]WorkspaceSetupHit{.{}} ** app_state.workspace_setup.MAX_CARD_BUTTONS;
+
 const DiffFileOpenHit = struct {
     rect: palette.Rect = .{},
     path: []const u8 = "",
@@ -450,6 +459,7 @@ pub fn resetTranscriptHitCache() void {
     followup_pin_hit_count = 0;
     background_task_pin_hit_count = 0;
     usage_action_hit_count = 0;
+    workspace_setup_hit_count = 0;
     diff_file_open_hit_count = 0;
     diff_file_comment_hit_count = 0;
     diff_layout_hit_count = 0;
@@ -1710,10 +1720,16 @@ const TranscriptAction = union(enum) {
     image_open: [:0]const u8,
     git_commit_link: []const u8,
     git_commit_push: []const u8,
+    workspace_setup: WorkspaceSetupHit,
 };
 
 fn transcriptActionAt(x: f32, y: f32) ?TranscriptAction {
     var index: usize = 0;
+    while (index < workspace_setup_hit_count) : (index += 1) {
+        const hit = workspace_setup_hits[index];
+        if (rectContains(hit.rect, x, y)) return .{ .workspace_setup = hit };
+    }
+    index = 0;
     while (index < usage_action_hit_count) : (index += 1) {
         const hit = usage_action_hits[index];
         if (!rectContains(hit.rect, x, y)) continue;
@@ -2503,6 +2519,7 @@ pub fn handleTranscriptPaletteMouseButton(state: *app_state.AppState, x: f32, y:
                     state.openConfiguredChatWebLink(url);
                 },
                 .git_commit_push => |thread_id| state.startPush(thread_id),
+                .workspace_setup => |button| app_state.workspace_setup.cardAction(state, button.kind, button.index),
             }
             return true;
         }
@@ -6149,7 +6166,8 @@ fn transcriptCommittedMessageHeight(state: *app_state.AppState, message_index: u
     // height cache key does not include — bypass the cache so toggles take
     // effect immediately.
     const has_dynamic_collapse = (message.role == .system and
-        (shouldRenderPaletteCommandRow(message.author, message.body) or isDiffSummaryMessage(message.author, message.body) or isUsageSummaryMessage(message.author, message.body))) or
+        (shouldRenderPaletteCommandRow(message.author, message.body) or isDiffSummaryMessage(message.author, message.body) or isUsageSummaryMessage(message.author, message.body) or
+            isWorkspaceSetupMessage(message.role, message.author))) or
         childNotificationBatch(message.role, message.body) != null;
     if (!has_dynamic_collapse) {
         if (state.cachedTranscriptMessageHeight(message_index, column_width, message.body, message.role, message.author, false, image_present)) |height| {
@@ -6159,6 +6177,7 @@ fn transcriptCommittedMessageHeight(state: *app_state.AppState, message_index: u
 
     var height = transcriptMessageHeight(state, message_index, message.body, message.role, column_width, message.author, false);
     height += transcriptImageBlockHeight(message, column_width);
+    height += workspaceSetupButtonRowHeight(state, message);
     if (!has_dynamic_collapse) {
         state.putTranscriptMessageHeight(message_index, column_width, message.body, message.role, message.author, false, image_present, height);
     }
@@ -6345,6 +6364,10 @@ fn renderTranscriptMessage(state: *app_state.AppState, thread: *const app_state.
         renderGitCommitCard(state, thread.local_thread_id, column, y, height, message.body, clip);
         return;
     }
+    if (isWorkspaceSetupMessage(message.role, message.author)) {
+        renderWorkspaceSetupCard(state, column, y, height, message, clip, message_index);
+        return;
+    }
     if (message.role == .system) {
         if (utils.providerFailureActionProvider(message.body)) |provider| {
             renderProviderFailureActionCard(state, column, y, height, provider, message.body, clip, message_index);
@@ -6462,6 +6485,61 @@ fn renderProviderFailureActionCard(
     });
     renderDiffFileActionButton(state, copy_button, "Copy", false, clip);
     state.recordTranscriptCopyHit(copy_button, body, toolCopyIdentity(message_index, body));
+}
+
+/// The transcript card that sets this workspace up on another machine
+/// (state/workspace_setup.zig). Its body is a plain system message, so it is
+/// selectable and copyable like any other; only the live card has buttons.
+fn isWorkspaceSetupMessage(role: app_state.ChatRole, author: []const u8) bool {
+    return role == .system and std.mem.eql(u8, author, app_state.workspace_setup.CARD_AUTHOR);
+}
+
+const WORKSPACE_SETUP_BUTTON_H_UI: f32 = 30.0;
+const WORKSPACE_SETUP_BUTTON_GAP_UI: f32 = 8.0;
+
+/// Extra height under the card body for its button row; zero once the card
+/// is finished or cancelled.
+fn workspaceSetupButtonRowHeight(state: *app_state.AppState, message: app_state.ChatMessage) f32 {
+    if (!isWorkspaceSetupMessage(message.role, message.author)) return 0.0;
+    var buttons: [app_state.workspace_setup.MAX_CARD_BUTTONS]app_state.workspace_setup.CardButton = undefined;
+    var labels: [app_state.workspace_setup.MAX_CANDIDATES][96]u8 = undefined;
+    if (app_state.workspace_setup.cardButtonsFor(state, message.body, &buttons, &labels) == null) return 0.0;
+    return theme.scaledUi(WORKSPACE_SETUP_BUTTON_H_UI + 12.0);
+}
+
+// Workspace setup card: selectable system body, then Use it / Pick folder… /
+// Cancel along the bottom edge inside the same bubble.
+fn renderWorkspaceSetupCard(
+    state: *app_state.AppState,
+    column: palette.Rect,
+    y: f32,
+    height: f32,
+    message: app_state.ChatMessage,
+    clip: palette.Rect,
+    message_index: usize,
+) void {
+    renderTranscriptBubbleFromParts(state, column, y, height, .system, message.author, message.body, false, false, clip, message_index, false, false);
+    var buttons: [app_state.workspace_setup.MAX_CARD_BUTTONS]app_state.workspace_setup.CardButton = undefined;
+    var labels: [app_state.workspace_setup.MAX_CANDIDATES][96]u8 = undefined;
+    const live = app_state.workspace_setup.cardButtonsFor(state, message.body, &buttons, &labels) orelse return;
+    const pad = theme.scaledUi(14.0);
+    const button_h = theme.scaledUi(WORKSPACE_SETUP_BUTTON_H_UI);
+    const font_size = theme.scaledUi(11.5);
+    var x = column.x + pad;
+    const button_y = y + height - button_h - theme.scaledUi(12.0);
+    for (live, 0..) |button, index| {
+        const width = text_measure.textWidth(.ui, font_size, button.label) + theme.scaledUi(28.0);
+        if (x + width > column.x + column.w - pad and index > 0) break;
+        const rect = snapRect(.{ .x = x, .y = button_y, .w = width, .h = button_h });
+        renderDiffFileActionButton(state, rect, button.label, button.kind == .use_candidate, clip);
+        if (intersectClipRect(clip, rect)) |visible| {
+            if (workspace_setup_hit_count < workspace_setup_hits.len) {
+                workspace_setup_hits[workspace_setup_hit_count] = .{ .rect = visible, .kind = button.kind, .index = button.index };
+                workspace_setup_hit_count += 1;
+            }
+        }
+        x += width + theme.scaledUi(WORKSPACE_SETUP_BUTTON_GAP_UI);
+    }
 }
 
 // Renders clickable attachment previews beneath a committed chat message.
