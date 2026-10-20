@@ -940,44 +940,20 @@ pub const Store = struct {
         errdefer self.allocator.free(owned_workspace_id);
         const default_repository_id = header.default_repository_id;
         errdefer self.allocator.free(default_repository_id);
-        var repositories: std.ArrayListUnmanaged(store_protocol.Repository) = .empty;
-        errdefer {
-            for (repositories.items) |repository| freeOwnedRepository(self.allocator, repository);
-            repositories.deinit(self.allocator);
-        }
-        var found_primary = false;
-        var found_default = false;
-        {
-            var rows = self.conn.rows(
-                "select id, repository_id, label, vcs_identity, default_branch " ++
-                    "from workspace_repositories where workspace_id = ?1 order by sort_index, repository_id",
-                .{header.workspace_row_id},
-            ) catch |err| return mapStoreError(err);
-            defer rows.deinit();
-            while (rows.next()) |row| {
-                if (repositories.items.len >= MAX_WORKSPACE_REPOSITORIES) return error.StoreCorrupt;
-                const definition: RepositoryDefinition = .{
-                    .repository_id = row.text(1),
-                    .label = row.text(2),
-                    .vcs_identity = row.nullableText(3),
-                    .default_branch = row.nullableText(4),
-                };
-                if (!repositoryDefinitionValid(definition)) return error.StoreCorrupt;
-                const repository = self.copyStoredRepository(row.int(0), definition) catch |err| return mapStoreError(err);
-                errdefer freeOwnedRepository(self.allocator, repository);
-                found_primary = found_primary or std.mem.eql(u8, definition.repository_id, store_protocol.PRIMARY_REPOSITORY_ID);
-                found_default = found_default or std.mem.eql(u8, definition.repository_id, default_repository_id);
-                repositories.append(self.allocator, repository) catch return error.OutOfMemory;
-            }
-            if (rows.err) |err| return mapStoreError(err);
-        }
-        if (!found_primary or !found_default) return error.StoreCorrupt;
-
-        const owned_repositories = repositories.toOwnedSlice(self.allocator) catch return error.OutOfMemory;
+        const owned_repositories = self.loadRepositoryRows(self.allocator, header.workspace_row_id) catch |err|
+            return mapStoreError(err);
         errdefer {
             for (owned_repositories) |repository| freeOwnedRepository(self.allocator, repository);
             self.allocator.free(owned_repositories);
         }
+        var found_primary = false;
+        var found_default = false;
+        for (owned_repositories) |repository| {
+            found_primary = found_primary or std.mem.eql(u8, repository.repository_id, store_protocol.PRIMARY_REPOSITORY_ID);
+            found_default = found_default or std.mem.eql(u8, repository.repository_id, default_repository_id);
+        }
+        if (!found_primary or !found_default) return error.StoreCorrupt;
+
         self.conn.commit() catch |err| return mapStoreError(err);
         transaction_open = false;
         return .{
@@ -1034,24 +1010,155 @@ pub const Store = struct {
         };
     }
 
+    /// Load a workspace's repositories (with bindings) inside the caller's
+    /// open read transaction, in manifest order. Returns ResourceNotFound for
+    /// an unknown workspace. Results are owned by `allocator` (arena-friendly).
+    pub fn loadWorkspaceRepositoriesInTransaction(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        workspace_id: []const u8,
+    ) StoreError![]store_protocol.Repository {
+        if (!validWorkspaceId(workspace_id)) return error.InvalidParams;
+        const workspace_row_id = self.requireWorkspaceRowId(workspace_id) catch |err| return mapStoreError(err);
+        return self.loadRepositoryRows(allocator, workspace_row_id) catch |err| return mapStoreError(err);
+    }
+
+    /// One repository checkout bound to the given runtime, for origin capture.
+    pub const LocalRepositoryRoot = struct {
+        repository_id: []const u8,
+        vcs_identity: ?[]const u8,
+        root_path: []const u8,
+    };
+
+    /// Repositories of one workspace that have a checkout on `runtime_id`.
+    /// Results are owned by `allocator` (callers pass a request arena).
+    pub fn loadLocalRepositoryRoots(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        workspace_id: []const u8,
+        runtime_id: []const u8,
+    ) StoreError![]LocalRepositoryRoot {
+        if (!validWorkspaceId(workspace_id) or !validRuntimeId(runtime_id)) return error.InvalidParams;
+        var roots: std.ArrayListUnmanaged(LocalRepositoryRoot) = .empty;
+        var rows = self.conn.rows(
+            "select repository.repository_id, repository.vcs_identity, binding.root_path " ++
+                "from workspace_repositories repository " ++
+                "join workspaces workspace on workspace.id = repository.workspace_id " ++
+                "join workspace_repository_bindings binding on binding.repository_row_id = repository.id " ++
+                "where workspace.workspace_id = ?1 and binding.runtime_id = ?2 " ++
+                "order by repository.sort_index, repository.repository_id",
+            .{ workspace_id, runtime_id },
+        ) catch |err| return mapStoreError(err);
+        defer rows.deinit();
+        while (rows.next()) |row| {
+            if (roots.items.len >= MAX_WORKSPACE_REPOSITORIES) break;
+            roots.append(allocator, .{
+                .repository_id = allocator.dupe(u8, row.text(0)) catch return error.OutOfMemory,
+                .vcs_identity = dupeNullableText(allocator, row.nullableText(1)) catch return error.OutOfMemory,
+                .root_path = allocator.dupe(u8, row.text(2)) catch return error.OutOfMemory,
+            }) catch return error.OutOfMemory;
+        }
+        if (rows.err) |err| return mapStoreError(err);
+        return roots.toOwnedSlice(allocator) catch return error.OutOfMemory;
+    }
+
+    /// Daemon-internal compare-and-set of one repository's `vcs_identity`
+    /// (origin capture). Writes only while the stored value still equals
+    /// `expected`, so a concurrent explicit client write always wins. Returns
+    /// the new store revision, or null when nothing changed. Invalid
+    /// (credential-bearing or malformed) identities are never stored.
+    pub fn setRepositoryVcsIdentity(
+        self: *Self,
+        workspace_id: []const u8,
+        repository_id: []const u8,
+        expected: ?[]const u8,
+        identity: []const u8,
+    ) StoreError!?u64 {
+        if (!validWorkspaceId(workspace_id) or !validRouteId(repository_id) or !validVcsIdentity(identity)) {
+            return error.InvalidParams;
+        }
+        if (expected) |value| if (std.mem.eql(u8, value, identity)) return null;
+        return self.setRepositoryVcsIdentityInternal(workspace_id, repository_id, expected, identity) catch |err|
+            return mapStoreError(err);
+    }
+
+    fn setRepositoryVcsIdentityInternal(
+        self: *Self,
+        workspace_id: []const u8,
+        repository_id: []const u8,
+        expected: ?[]const u8,
+        identity: []const u8,
+    ) !?u64 {
+        try self.conn.execNoArgs("begin immediate");
+        var committed = false;
+        defer if (!committed) self.conn.rollback();
+        try self.conn.exec(
+            "update workspace_repositories set vcs_identity = ?3 " ++
+                "where workspace_id = (select id from workspaces where workspace_id = ?1) " ++
+                "and repository_id = ?2 and vcs_identity is ?4",
+            .{ workspace_id, repository_id, identity, expected },
+        );
+        if (self.conn.changes() == 0) return null;
+        const revision = std.math.add(u64, try self.readStoreRevision(), 1) catch return error.StoreUnavailable;
+        const revision_sql = std.math.cast(i64, revision) orelse return error.StoreUnavailable;
+        try self.conn.exec("update store_state set store_revision = ?1 where id = 1", .{revision_sql});
+        try self.conn.commit();
+        committed = true;
+        return revision;
+    }
+
+    fn loadRepositoryRows(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        workspace_row_id: i64,
+    ) ![]store_protocol.Repository {
+        var repositories: std.ArrayListUnmanaged(store_protocol.Repository) = .empty;
+        errdefer {
+            for (repositories.items) |repository| freeOwnedRepository(allocator, repository);
+            repositories.deinit(allocator);
+        }
+        var rows = try self.conn.rows(
+            "select id, repository_id, label, vcs_identity, default_branch " ++
+                "from workspace_repositories where workspace_id = ?1 order by sort_index, repository_id",
+            .{workspace_row_id},
+        );
+        defer rows.deinit();
+        while (rows.next()) |row| {
+            if (repositories.items.len >= MAX_WORKSPACE_REPOSITORIES) return error.StoreCorrupt;
+            const definition: RepositoryDefinition = .{
+                .repository_id = row.text(1),
+                .label = row.text(2),
+                .vcs_identity = row.nullableText(3),
+                .default_branch = row.nullableText(4),
+            };
+            if (!repositoryDefinitionValid(definition)) return error.StoreCorrupt;
+            const repository = try self.copyStoredRepository(allocator, row.int(0), definition);
+            errdefer freeOwnedRepository(allocator, repository);
+            try repositories.append(allocator, repository);
+        }
+        if (rows.err) |err| return err;
+        return try repositories.toOwnedSlice(allocator);
+    }
+
     fn copyStoredRepository(
         self: *Self,
+        allocator: std.mem.Allocator,
         repository_row_id: i64,
         definition: RepositoryDefinition,
     ) !store_protocol.Repository {
-        const repository_id = try self.allocator.dupe(u8, definition.repository_id);
-        errdefer self.allocator.free(repository_id);
-        const label = try self.allocator.dupe(u8, definition.label);
-        errdefer self.allocator.free(label);
-        const vcs_identity = try dupeNullableText(self.allocator, definition.vcs_identity);
-        errdefer if (vcs_identity) |value| self.allocator.free(value);
-        const default_branch = try dupeNullableText(self.allocator, definition.default_branch);
-        errdefer if (default_branch) |value| self.allocator.free(value);
+        const repository_id = try allocator.dupe(u8, definition.repository_id);
+        errdefer allocator.free(repository_id);
+        const label = try allocator.dupe(u8, definition.label);
+        errdefer allocator.free(label);
+        const vcs_identity = try dupeNullableText(allocator, definition.vcs_identity);
+        errdefer if (vcs_identity) |value| allocator.free(value);
+        const default_branch = try dupeNullableText(allocator, definition.default_branch);
+        errdefer if (default_branch) |value| allocator.free(value);
 
         var bindings: std.ArrayListUnmanaged(store_protocol.RepositoryBinding) = .empty;
         errdefer {
-            for (bindings.items) |binding| freeOwnedRepositoryBinding(self.allocator, binding);
-            bindings.deinit(self.allocator);
+            for (bindings.items) |binding| freeOwnedRepositoryBinding(allocator, binding);
+            bindings.deinit(allocator);
         }
         var rows = try self.conn.rows(
             "select runtime_id, root_path, availability from workspace_repository_bindings " ++
@@ -1067,9 +1174,9 @@ pub const Store = struct {
                 .availability = row.text(2),
             };
             if (!repositoryBindingValid(binding)) return error.StoreCorrupt;
-            const owned_binding = try copyRepositoryBinding(self.allocator, binding);
-            errdefer freeOwnedRepositoryBinding(self.allocator, owned_binding);
-            try bindings.append(self.allocator, owned_binding);
+            const owned_binding = try copyRepositoryBinding(allocator, binding);
+            errdefer freeOwnedRepositoryBinding(allocator, owned_binding);
+            try bindings.append(allocator, owned_binding);
         }
         if (rows.err) |err| return err;
         return .{
@@ -1077,7 +1184,7 @@ pub const Store = struct {
             .label = label,
             .vcs_identity = vcs_identity,
             .default_branch = default_branch,
-            .bindings = try bindings.toOwnedSlice(self.allocator),
+            .bindings = try bindings.toOwnedSlice(allocator),
         };
     }
 
@@ -5102,7 +5209,8 @@ fn validPathSegments(value: []const u8, delimiters: []const u8, minimum_segments
     return count >= minimum_segments;
 }
 
-fn validVcsIdentity(value: []const u8) bool {
+/// True for a credential-free fetch identity the store accepts as `vcs_identity`.
+pub fn validVcsIdentity(value: []const u8) bool {
     if (value.len == 0 or value.len > MAX_VCS_IDENTITY_BYTES or
         !std.unicode.utf8ValidateSlice(value) or
         std.mem.findScalar(u8, value, '?') != null or

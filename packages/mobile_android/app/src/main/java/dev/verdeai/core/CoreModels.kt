@@ -1870,6 +1870,22 @@ data class ThreadSummary(
 )
 
 @Serializable
+data class RepositoryBinding(
+    val `runtime_id`: String,
+    val `root_path`: String,
+    val `availability`: String = "available",
+)
+
+@Serializable
+data class Repository(
+    val `repository_id`: String,
+    val `label`: String,
+    val `vcs_identity`: String? = null,
+    val `default_branch`: String? = null,
+    val `bindings`: List<RepositoryBinding> = emptyList(),
+)
+
+@Serializable
 data class Workspace(
     val `workspace_id`: String,
     val `label`: String,
@@ -1883,6 +1899,8 @@ data class Workspace(
     val `color_custom`: Boolean = false,
     val `recency_ms`: Long? = null,
     val `recency_rank`: Long = 0,
+    val `repositories`: List<Repository> = emptyList(),
+    val `group_key`: String? = null,
 )
 
 @Serializable

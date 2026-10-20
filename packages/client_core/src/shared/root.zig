@@ -9,6 +9,7 @@ pub const pair_client = @import("pair_client.zig");
 pub const threads = @import("threads.zig");
 pub const slash_commands = @import("slash_commands.zig");
 pub const selection_prompt = @import("selection_prompt.zig");
+pub const repo_identity = @import("repo_identity.zig");
 
 test {
     _ = connection;
@@ -20,4 +21,5 @@ test {
     _ = threads;
     _ = slash_commands;
     _ = selection_prompt;
+    _ = repo_identity;
 }

@@ -519,3 +519,40 @@ test "workspace identity matches the cross-client FNV-1a vectors" {
     try std.testing.expectEqual(@as(u8, 5), p.iconIndex(""));
     try std.testing.expectEqual(@as(u8, 5), p.colorIndex(""));
 }
+
+test "workspace projection carries the repository manifest and primary group key" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const data = try host.parse(a,
+        \\{"snapshot":{"workspaces":[
+        \\{"workspace_id":"w","path":"/src/verde","repositories":[
+        \\{"repository_id":"docs","label":"Docs","vcs_identity":"git@github.com:Other/Docs.git","bindings":[]},
+        \\{"repository_id":"primary","label":"verde","vcs_identity":"git@github.com:JonathanRiche/Verde.git","default_branch":"master",
+        \\"bindings":[{"runtime_id":"rt","root_path":"/src/verde","availability":"missing"},{"runtime_id":"","root_path":"/x"},{"runtime_id":"rt2","root_path":"/y"}]},
+        \\{"label":"no id"}]},
+        \\{"workspace_id":"local","repositories":[{"repository_id":"primary","label":"local","vcs_identity":"/srv/repo.git"}]},
+        \\{"workspace_id":"none","repositories":[{"repository_id":"primary","label":"none"}]},
+        \\{"workspace_id":"old"}]}}
+    );
+    const models = try p.project(a, data, &.{}, false, 0);
+    const w = models.workspaces[0];
+    try std.testing.expectEqual(@as(usize, 2), w.repositories.len);
+    try eql("docs", w.repositories[0].repository_id);
+    const primary = w.repositories[1];
+    try eql("primary", primary.repository_id);
+    try eql("git@github.com:JonathanRiche/Verde.git", primary.vcs_identity.?);
+    try eql("master", primary.default_branch.?);
+    try std.testing.expectEqual(@as(usize, 2), primary.bindings.len);
+    try eql("missing", primary.bindings[0].availability);
+    try eql("available", primary.bindings[1].availability);
+    try eql("v1:github.com/jonathanriche/verde", w.group_key.?);
+    try std.testing.expectEqual(@as(?[]const u8, null), models.workspaces[1].group_key);
+    try std.testing.expectEqual(@as(?[]const u8, null), models.workspaces[2].group_key);
+    try std.testing.expectEqual(@as(?[]const u8, null), models.workspaces[2].repositories[0].vcs_identity);
+    // Daemons without repositories in core.snapshot keep the old shape.
+    try std.testing.expectEqual(@as(usize, 0), models.workspaces[3].repositories.len);
+    try std.testing.expectEqual(@as(?[]const u8, null), models.workspaces[3].group_key);
+    const json = try std.json.Stringify.valueAlloc(a, models.workspaces[3], .{});
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"repositories\":[],\"group_key\":null") != null);
+}

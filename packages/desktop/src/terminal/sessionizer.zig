@@ -49,6 +49,7 @@ const workspace_identity = @import("../platform/workspace_identity.zig");
 const stack = @import("../workspace/stack.zig");
 const platform_runtime = @import("platform_runtime");
 const directory_browser = @import("../daemon/directory_browser.zig");
+const repo_origin = @import("../daemon/repo_origin.zig");
 const workspace_files = @import("../daemon/workspace_files.zig");
 const workspace_files_protocol = headless.workspace_files_protocol;
 const process_env = @import("../platform/env.zig");
@@ -4511,6 +4512,12 @@ pub const Daemon = struct {
             return try self.coreSnapshotResponse(arena, id_value, service, req);
         }
 
+        // manifest.get re-reads each local checkout's origin (git, no lock
+        // held) so `git remote set-url` changes reach clients.
+        if (decoded_repository_manifest) |req| {
+            if (is_repository_manifest) _ = captureRepositoryOrigins(self, service, req.workspace_id, .refresh);
+        }
+
         // 3. Store work with NO daemon lock.
         lockStoreService(service);
         var store_locked = true;
@@ -4699,6 +4706,12 @@ pub const Daemon = struct {
                     self.deliverHookSurfaceToLive(request, write_result);
                 }
             },
+            // Fill `vcs_identity` from the local checkout's origin when the
+            // caller supplied none. The receipt keeps its own revision; the
+            // capture publishes a separate workspace change.
+            .workspace_upsert => |request| _ = captureRepositoryOrigins(self, service, request.workspace.workspace_id, .fill_missing),
+            .workspace_repository_upsert => |request| _ = captureRepositoryOrigins(self, service, request.workspace_id, .fill_missing),
+            .workspace_repository_binding_upsert => |request| _ = captureRepositoryOrigins(self, service, request.workspace_id, .fill_missing),
             else => {},
         }
         return try okValueResponse(self.allocator, id_value, write_result);
@@ -12513,7 +12526,8 @@ fn loadSnapshotContents(
             \\       companion_thread_local_id, herdr_remote_alias, herdr_session_name,
             \\       herdr_workspace_id, herdr_local_dir, herdr_remote_cwd,
             \\       herdr_last_pane_id, herdr_attach_dock_id, herdr_attach_pane_id,
-            \\       herdr_pane_links_json, herdr_updated_at_ms, icon_index, color_index
+            \\       herdr_pane_links_json, herdr_updated_at_ms, icon_index, color_index,
+            \\       default_repository_id
             \\from workspaces order by sort_index
         , .{}) catch return error.StoreUnavailable;
         defer rows.deinit();
@@ -12556,10 +12570,26 @@ fn loadSnapshotContents(
                     .herdr_link = herdr_link,
                     .icon_index = if (row.nullableInt(24)) |value| (if (value >= 0 and value < 16) @as(u8, @intCast(value)) else null) else null,
                     .color_index = if (row.nullableInt(25)) |value| (if (value >= 0 and value < 8) @as(u8, @intCast(value)) else null) else null,
+                    .default_repository_id = dupeOptionalText(arena, row.nullableText(26)) catch return error.OutOfMemory,
                 },
             }) catch return error.OutOfMemory;
         }
         if (rows.err) |_| return error.StoreUnavailable;
+    }
+    // Repository manifests, in the same shape as workspace.list, so clients
+    // can group checkouts across machines by `vcs_identity`. Loaded after the
+    // workspace statement finishes (statements never nest).
+    for (workspace_rows.items) |*workspace_row| {
+        // A malformed manifest degrades to the legacy empty list instead of
+        // failing the whole snapshot (old snapshots never carried it).
+        workspace_row.workspace.repositories = store.loadWorkspaceRepositoriesInTransaction(
+            arena,
+            workspace_row.workspace.workspace_id,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.StoreUnavailable, error.StoreBusy => |e| return e,
+            else => &.{},
+        };
     }
 
     // Phase 2: threads per workspace, then messages per thread (statements
@@ -15811,7 +15841,8 @@ fn workspaceCreateResponse(daemon: *Daemon, id_value: std.json.Value, params: st
         break :blk service.store.upsertWorkspace(.{ .mutation = request.mutation, .workspace = .{ .workspace_id = workspace_id, .path = path, .label = label } }) catch |err| return try storeErrorResponse(allocator, id_value, err);
     };
     created_directory = false;
-    return try okValueResponse(allocator, id_value, .{ .workspace_id = workspace_id, .path = path, .label = label, .store_revision = write.store_revision });
+    const store_revision = captureRepositoryOrigins(daemon, service, workspace_id, .fill_missing) orelse write.store_revision;
+    return try okValueResponse(allocator, id_value, .{ .workspace_id = workspace_id, .path = path, .label = label, .store_revision = store_revision });
 }
 
 fn workspaceDirectoryListResponse(daemon: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
@@ -15867,7 +15898,52 @@ fn workspaceDirectoryListWithEnvironment(daemon: *Daemon, id_value: std.json.Val
         error.FileNotFound, error.NotDir => try errorResponseAlloc(allocator, id_value, "not_found", "directory not found"),
         else => try errorResponseAlloc(allocator, id_value, "path_outside_roots", "directory is outside allowed roots or inaccessible"),
     };
+    // Bounded: only `.git` entries, capped call count and git time budget.
+    repo_origin.annotateEntries(arena, @constCast(result.directories));
     return try okValueResponse(allocator, id_value, result);
+}
+
+const OriginCaptureMode = enum { fill_missing, refresh };
+
+/// Store each local checkout's raw `origin` URL as its repository's
+/// `vcs_identity` (see `daemon/repo_origin.zig`). `fill_missing` never
+/// overrides a stored value, so caller-supplied identities win; `refresh`
+/// (manifest.get) picks up `git remote set-url`. git runs with no lock held
+/// and the write is a compare-and-set, so a concurrent explicit write wins.
+/// Best-effort: any failure leaves the stored value untouched. Returns the
+/// newest store revision written, or null when nothing changed.
+fn captureRepositoryOrigins(daemon: *Daemon, service: *StoreService, workspace_id: []const u8, mode: OriginCaptureMode) ?u64 {
+    _ = service.lifetime_pins.fetchAdd(1, .monotonic);
+    defer _ = service.lifetime_pins.fetchSub(1, .monotonic);
+    var arena_state: std.heap.ArenaAllocator = .init(daemon.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const roots = blk: {
+        lockStoreService(service);
+        defer service.mutex.unlock();
+        break :blk service.store.loadLocalRepositoryRoots(arena, workspace_id, daemon.runtime_id) catch return null;
+    };
+    var pending = false;
+    for (roots) |root| pending = pending or mode == .refresh or root.vcs_identity == null;
+    if (!pending) return null;
+    var git = git_changes.Git.init(arena) catch return null;
+    defer git.deinit();
+    const deadline_ms = monotonicNowMs() + repo_origin.CAPTURE_BUDGET_MS;
+    var newest: ?u64 = null;
+    for (roots) |root| {
+        if (mode == .fill_missing and root.vcs_identity != null) continue;
+        if (monotonicNowMs() >= deadline_ms) break;
+        const identity = repo_origin.read(&git, root.root_path, repo_origin.ORIGIN_TIMEOUT_MS) orelse continue;
+        const revision = blk: {
+            lockStoreService(service);
+            defer service.mutex.unlock();
+            if (service.draining) return newest;
+            break :blk service.store.setRepositoryVcsIdentity(workspace_id, root.repository_id, root.vcs_identity, identity) catch null;
+        } orelse continue;
+        daemon.appendJournalEntry(.workspace, workspace_id, workspace_id, .{ .store = revision });
+        newest = revision;
+    }
+    return newest;
 }
 
 fn workspaceFilesSearchResponse(daemon: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
@@ -22750,4 +22826,106 @@ test "delegated prompts are wrapped for the provider and fence the closing tag" 
     const unknown = try delegatedPromptAlloc(a, "hi", null);
     defer a.free(unknown);
     try std.testing.expect(std.mem.startsWith(u8, unknown, "<verde_parent_message from_thread=\"unknown\">"));
+}
+
+fn testOriginRequest(daemon: *Daemon, allocator: std.mem.Allocator, comptime format: []const u8, args: anytype) !std.json.Parsed(std.json.Value) {
+    const request = try std.fmt.allocPrint(allocator, format, args);
+    defer allocator.free(request);
+    const response = try daemon.handleRequest(request);
+    defer allocator.free(response);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    errdefer parsed.deinit();
+    if (parsed.value.object.get("result") == null) {
+        std.debug.print("unexpected response: {s}\n", .{response});
+        return error.TestUnexpectedResult;
+    }
+    return parsed;
+}
+
+fn testOriginRepository(repositories: std.json.Value, repository_id: []const u8) ?std.json.ObjectMap {
+    for (repositories.array.items) |repository| {
+        if (std.mem.eql(u8, repository.object.get("repository_id").?.string, repository_id)) return repository.object;
+    }
+    return null;
+}
+
+test "workspace origin is captured on upsert and bind, refreshed on manifest.get, and carried by core.snapshot" {
+    const allocator = std.testing.allocator;
+    var primary = (try repo_origin.TestOriginRepo.init("git@github.com:Owner/Repo.git")) orelse return error.SkipZigTest;
+    defer primary.deinit();
+    var api = (try repo_origin.TestOriginRepo.init("https://github.com/owner/api.git")) orelse return error.SkipZigTest;
+    defer api.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    try attachTestRuntimeStoreService(&daemon, db_path);
+    defer detachTestStoreService(&daemon);
+    const client_id = try registerTestClientId(&daemon, allocator);
+    defer allocator.free(client_id);
+
+    // Workspace upsert without an identity: the primary checkout's raw origin is stored.
+    var upsert = try testOriginRequest(&daemon, allocator,
+        \\{{"jsonrpc":"2.0","id":2,"method":"workspace.upsert","params":{{"mutation":{{"request_key":"origin-ws","client_id":"{s}"}},"workspace":{{"workspace_id":"origin-ws","label":"Origin","path":"{s}"}}}}}}
+    , .{ client_id, primary.root });
+    defer upsert.deinit();
+    const upsert_revision = upsert.value.object.get("result").?.object.get("store_revision").?.integer;
+
+    var snapshot = try testOriginRequest(&daemon, allocator,
+        \\{{"jsonrpc":"2.0","id":3,"method":"core.snapshot","params":{{"scopes":["workspaces"]}}}}
+    , .{});
+    defer snapshot.deinit();
+    const snapshot_result = snapshot.value.object.get("result").?.object;
+    // The capture is its own committed revision, published as a workspace change.
+    try std.testing.expect(snapshot_result.get("store_revision").?.integer > upsert_revision);
+    const workspace = snapshot_result.get("snapshot").?.object.get("workspaces").?.array.items[0].object;
+    try std.testing.expectEqualStrings("primary", workspace.get("default_repository_id").?.string);
+    const snapshot_primary = testOriginRepository(workspace.get("repositories").?, "primary").?;
+    try std.testing.expectEqualStrings("git@github.com:Owner/Repo.git", snapshot_primary.get("vcs_identity").?.string);
+    try std.testing.expectEqualStrings("Primary", snapshot_primary.get("label").?.string);
+    const binding = snapshot_primary.get("bindings").?.array.items[0].object;
+    try std.testing.expectEqualStrings(daemon.runtime_id, binding.get("runtime_id").?.string);
+    try std.testing.expectEqualStrings(primary.root, binding.get("root_path").?.string);
+    try std.testing.expectEqualStrings("available", binding.get("availability").?.string);
+
+    // Repository upsert + binding without an identity: captured on bind.
+    var repository = try testOriginRequest(&daemon, allocator,
+        \\{{"jsonrpc":"2.0","id":4,"method":"workspace.repository.upsert","params":{{"mutation":{{"request_key":"origin-api","client_id":"{s}"}},"workspace_id":"origin-ws","repository":{{"repository_id":"api","label":"API"}}}}}}
+    , .{client_id});
+    defer repository.deinit();
+    var bind = try testOriginRequest(&daemon, allocator,
+        \\{{"jsonrpc":"2.0","id":5,"method":"workspace.repository.binding.upsert","params":{{"mutation":{{"request_key":"origin-api-bind","client_id":"{s}"}},"workspace_id":"origin-ws","repository_id":"api","binding":{{"runtime_id":"{s}","root_path":"{s}"}}}}}}
+    , .{ client_id, daemon.runtime_id, api.root });
+    defer bind.deinit();
+    // A caller-supplied identity is kept by the fill-missing capture.
+    var explicit = try testOriginRequest(&daemon, allocator,
+        \\{{"jsonrpc":"2.0","id":6,"method":"workspace.repository.upsert","params":{{"mutation":{{"request_key":"origin-explicit","client_id":"{s}"}},"workspace_id":"origin-ws","repository":{{"repository_id":"primary","label":"Primary","vcs_identity":"https://example.com/team/manual.git"}}}}}}
+    , .{client_id});
+    defer explicit.deinit();
+    var listed = try testOriginRequest(&daemon, allocator,
+        \\{{"jsonrpc":"2.0","id":7,"method":"workspace.list","params":{{}}}}
+    , .{});
+    defer listed.deinit();
+    const listed_repositories = listed.value.object.get("result").?.object.get("workspaces").?.array.items[0].object.get("repositories").?;
+    try std.testing.expectEqualStrings("https://github.com/owner/api.git", testOriginRepository(listed_repositories, "api").?.get("vcs_identity").?.string);
+    try std.testing.expectEqualStrings("https://example.com/team/manual.git", testOriginRepository(listed_repositories, "primary").?.get("vcs_identity").?.string);
+
+    // manifest.get re-reads origin, so `git remote set-url` reaches clients.
+    {
+        var arena_state: std.heap.ArenaAllocator = .init(allocator);
+        defer arena_state.deinit();
+        var git = try git_changes.Git.init(arena_state.allocator());
+        defer git.deinit();
+        const changed = try git.run(primary.root, &.{ "remote", "set-url", "origin", "ssh://git@github.com/owner/renamed.git" }, .{ .read_only = false });
+        try std.testing.expect(changed.ok());
+    }
+    var manifest = try testOriginRequest(&daemon, allocator,
+        \\{{"jsonrpc":"2.0","id":8,"method":"workspace.repository.manifest.get","params":{{"workspace_id":"origin-ws"}}}}
+    , .{});
+    defer manifest.deinit();
+    const manifest_repositories = manifest.value.object.get("result").?.object.get("repositories").?;
+    try std.testing.expectEqualStrings("ssh://git@github.com/owner/renamed.git", testOriginRepository(manifest_repositories, "primary").?.get("vcs_identity").?.string);
+    try std.testing.expectEqualStrings("https://github.com/owner/api.git", testOriginRepository(manifest_repositories, "api").?.get("vcs_identity").?.string);
 }

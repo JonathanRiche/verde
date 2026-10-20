@@ -5,7 +5,27 @@ const builtin = @import("builtin");
 
 pub const METHOD = "workspace.directory.list";
 pub const ROOTS_ENV = "VERDE_DIRECTORY_ROOTS";
-pub const Entry = struct { name: []const u8, path: []const u8 };
+pub const Entry = struct {
+    name: []const u8,
+    path: []const u8,
+    /// Raw `origin` URL (see `repo_origin.zig`); omitted from the wire when null.
+    git_identity: ?[]const u8 = null,
+    /// Internal: the entry is a real directory holding `.git`. Never serialized.
+    has_git: bool = false,
+
+    pub fn jsonStringify(self: Entry, json: anytype) !void {
+        try json.beginObject();
+        try json.objectField("name");
+        try json.write(self.name);
+        try json.objectField("path");
+        try json.write(self.path);
+        if (self.git_identity) |identity| {
+            try json.objectField("git_identity");
+            try json.write(identity);
+        }
+        try json.endObject();
+    }
+};
 pub const Result = struct { path: []const u8, parent: ?[]const u8, directories: []const Entry };
 
 // These helpers use a request arena; all returned strings belong to it.
@@ -105,9 +125,16 @@ pub fn list(allocator: std.mem.Allocator, io: std.Io, roots: []const []const u8,
                 error.OutOfMemory => return err,
                 else => continue,
             };
+            // Symlinked checkouts get no identity: the git call reopens by
+            // pathname, so only real directories under the root qualify.
+            const has_git = entry.kind == .directory and hasGitMarker(io, child);
             child.close(io);
             if (entries.items.len == 4096) return error.ResponseTooLarge;
-            try entries.append(allocator, .{ .name = try allocator.dupe(u8, entry.name), .path = try std.fs.path.join(allocator, &.{ path, entry.name }) });
+            try entries.append(allocator, .{
+                .name = try allocator.dupe(u8, entry.name),
+                .path = try std.fs.path.join(allocator, &.{ path, entry.name }),
+                .has_git = has_git,
+            });
         }
         std.mem.sort(Entry, entries.items, {}, struct {
             fn lessThan(_: void, a: Entry, b: Entry) bool {
@@ -125,6 +152,12 @@ pub fn list(allocator: std.mem.Allocator, io: std.Io, roots: []const []const u8,
         return .{ .path = path, .parent = allowed_parent, .directories = entries.items };
     }
     return error.PathOutsideRoots;
+}
+
+/// A `.git` directory, or a `.git` file (worktrees, submodules), directly in `dir`.
+fn hasGitMarker(io: std.Io, dir: std.Io.Dir) bool {
+    const stat = dir.statFile(io, ".git", .{ .follow_symlinks = false }) catch return false;
+    return stat.kind == .directory or stat.kind == .file;
 }
 
 test "directory listing confines symlinks and traversal and returns directories only" {

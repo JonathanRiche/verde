@@ -85,6 +85,8 @@ pub const types = .{
     .{ "DiffIndexQuery", wire.Query(rendering.diff.Index) },
     .{ "Pane", projection.Pane },
     .{ "ThreadSummary", projection.ThreadSummary },
+    .{ "RepositoryBinding", projection.RepositoryBinding },
+    .{ "Repository", projection.Repository },
     .{ "Workspace", projection.Workspace },
     .{ "PushOpenKey", push.OpenKey },
     .{ "PushOpenRequest", push.OpenRequest },

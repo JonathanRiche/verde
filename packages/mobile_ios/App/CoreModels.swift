@@ -7470,6 +7470,74 @@ extension ThreadSummary {
     }
 }
 
+struct RepositoryBinding: Codable {
+    var `runtime_id`: String
+    var `root_path`: String
+    var `availability`: String = "available"
+}
+
+extension RepositoryBinding {
+    private enum CodingKeys: String, CodingKey {
+        case `runtime_id`
+        case `root_path`
+        case `availability`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`runtime_id` = try c.decode(String.self, forKey: .`runtime_id`)
+        self.`root_path` = try c.decode(String.self, forKey: .`root_path`)
+        if !c.contains(.`availability`) { self.`availability` = "available" } else {
+        self.`availability` = try c.decode(String.self, forKey: .`availability`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`runtime_id`, forKey: .`runtime_id`)
+        try c.encode(self.`root_path`, forKey: .`root_path`)
+        try c.encode(self.`availability`, forKey: .`availability`)
+    }
+}
+
+struct Repository: Codable {
+    var `repository_id`: String
+    var `label`: String
+    var `vcs_identity`: String? = nil
+    var `default_branch`: String? = nil
+    var `bindings`: [RepositoryBinding] = []
+}
+
+extension Repository {
+    private enum CodingKeys: String, CodingKey {
+        case `repository_id`
+        case `label`
+        case `vcs_identity`
+        case `default_branch`
+        case `bindings`
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.`repository_id` = try c.decode(String.self, forKey: .`repository_id`)
+        self.`label` = try c.decode(String.self, forKey: .`label`)
+        if !c.contains(.`vcs_identity`) { self.`vcs_identity` = nil } else {
+        self.`vcs_identity` = try c.decodeIfPresent(String.self, forKey: .`vcs_identity`)
+        }
+        if !c.contains(.`default_branch`) { self.`default_branch` = nil } else {
+        self.`default_branch` = try c.decodeIfPresent(String.self, forKey: .`default_branch`)
+        }
+        if !c.contains(.`bindings`) { self.`bindings` = [] } else {
+        self.`bindings` = try c.decode([RepositoryBinding].self, forKey: .`bindings`)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.`repository_id`, forKey: .`repository_id`)
+        try c.encode(self.`label`, forKey: .`label`)
+        try c.encode(self.`vcs_identity`, forKey: .`vcs_identity`)
+        try c.encode(self.`default_branch`, forKey: .`default_branch`)
+        try c.encode(self.`bindings`, forKey: .`bindings`)
+    }
+}
+
 struct Workspace: Codable {
     var `workspace_id`: String
     var `label`: String
@@ -7483,6 +7551,8 @@ struct Workspace: Codable {
     var `color_custom`: Bool = false
     var `recency_ms`: Int64? = nil
     var `recency_rank`: UInt32 = 0
+    var `repositories`: [Repository] = []
+    var `group_key`: String? = nil
 }
 
 extension Workspace {
@@ -7499,6 +7569,8 @@ extension Workspace {
         case `color_custom`
         case `recency_ms`
         case `recency_rank`
+        case `repositories`
+        case `group_key`
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -7526,6 +7598,12 @@ extension Workspace {
         if !c.contains(.`recency_rank`) { self.`recency_rank` = 0 } else {
         self.`recency_rank` = try c.decode(UInt32.self, forKey: .`recency_rank`)
         }
+        if !c.contains(.`repositories`) { self.`repositories` = [] } else {
+        self.`repositories` = try c.decode([Repository].self, forKey: .`repositories`)
+        }
+        if !c.contains(.`group_key`) { self.`group_key` = nil } else {
+        self.`group_key` = try c.decodeIfPresent(String.self, forKey: .`group_key`)
+        }
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -7541,6 +7619,8 @@ extension Workspace {
         try c.encode(self.`color_custom`, forKey: .`color_custom`)
         try c.encode(self.`recency_ms`, forKey: .`recency_ms`)
         try c.encode(self.`recency_rank`, forKey: .`recency_rank`)
+        try c.encode(self.`repositories`, forKey: .`repositories`)
+        try c.encode(self.`group_key`, forKey: .`group_key`)
     }
 }
 

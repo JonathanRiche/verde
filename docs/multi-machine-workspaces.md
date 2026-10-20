@@ -213,9 +213,22 @@ errors: not_found (path) · identity_mismatch · path_outside_roots
    - Plain sends retry `RuntimeRpcBusy` for up to 15 s through the same poll
      loop as attachment uploads, so a send no longer fails when it collides
      with a heartbeat.
-2. **Identity.** Read `origin` in the daemon; add `repo_identity.zig` to
-   `client_core/src/shared`; add `repositories` to `core.snapshot`, the
-   projection, and `git_identity` in `workspace.directory.list`.
+2. **Identity.** Done.
+   - Daemon (`daemon/repo_origin.zig`, `captureRepositoryOrigins` in
+     `sessionizer.zig`): reads `git remote get-url origin` (1 s per call)
+     and stores the raw value. Create, upsert and bind fill a missing
+     `vcs_identity`; `workspace.repository.manifest.get` refreshes it, so a
+     readable origin replaces a hand-set value there. Remotes the store
+     validator rejects (credentials in the URL, scp-style without a user,
+     local paths) stay null.
+   - `core.snapshot` workspaces carry `repositories` and
+     `default_repository_id` in the `workspace.list` shape; a captured
+     identity publishes a `workspace` change entry.
+   - `workspace.directory.list` entries carry `git_identity` for `.git`
+     folders (up to 64 entries, 1.5 s total).
+   - `client_core/src/shared/repo_identity.zig` normalizes to `v1:` keys;
+     the projection's `Workspace` has `repositories` and `group_key` (from
+     the repository whose id is `primary`). Mobile `CoreModels` regenerated.
 3. **Desktop setup.** `workspace.attach` (with aliasing, scopes and the
    `workspace.attach.v1` capability); the per-machine snapshot cache; the
    remote folder browser backend; the setup card; **Use it** and "Set up on…"

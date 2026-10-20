@@ -2,6 +2,7 @@
 const std = @import("std");
 const host = @import("host.zig");
 const store = @import("headless").store_protocol;
+const repo_identity = @import("verde_remote").repo_identity;
 const A = std.mem.Allocator;
 const V = std.json.Value;
 const eq = host.eq;
@@ -55,7 +56,15 @@ pub const Workspace = struct {
     recency_ms: ?i64 = null,
     /// 0 = most recently used; the switcher lists workspaces in this order.
     recency_rank: u32 = 0,
+    /// Repository manifest from `core.snapshot`; empty for daemons that predate it.
+    repositories: []const Repository = &.{},
+    /// Normalized `origin` of the `primary` repository (`repo_identity`), used to
+    /// group checkouts across machines; null without a mappable origin.
+    group_key: ?[]const u8 = null,
 };
+/// Wire shape of `workspace.list` / `core.snapshot` repository rows.
+pub const Repository = store.Repository;
+pub const RepositoryBinding = store.RepositoryBinding;
 /// Wall-clock time the user last focused a workspace on this client.
 pub const FocusStamp = struct { workspace_id: []const u8, at_ms: i64 };
 /// FNV-1a 32-bit over the workspace id bytes; shared with desktop and web.
@@ -107,6 +116,34 @@ pub fn yes(v: V) bool {
 }
 fn nullable(v: V) ?[]const u8 {
     return if (v == .string) v.string else null;
+}
+/// Lenient manifest parse: rows without an id are skipped, so one bad row never
+/// hides the rest. Strings borrow from `ws`.
+pub fn repositories(a: A, ws: V) error{OutOfMemory}![]const Repository {
+    const items = rows(get(ws, "repositories"));
+    var out: std.ArrayList(Repository) = .empty;
+    for (items) |row| {
+        const id = s(row, "repository_id");
+        if (id.len == 0) continue;
+        var bindings: std.ArrayList(RepositoryBinding) = .empty;
+        for (rows(get(row, "bindings"))) |b| {
+            const runtime_id = s(b, "runtime_id");
+            const root_path = s(b, "root_path");
+            if (runtime_id.len == 0 or root_path.len == 0) continue;
+            try bindings.append(a, .{ .runtime_id = runtime_id, .root_path = root_path, .availability = fallback(s(b, "availability"), "available") });
+        }
+        try out.append(a, .{ .repository_id = id, .label = fallback(s(row, "label"), id), .vcs_identity = nullable(get(row, "vcs_identity")), .default_branch = nullable(get(row, "default_branch")), .bindings = try bindings.toOwnedSlice(a) });
+    }
+    return out.toOwnedSlice(a);
+}
+/// `repo_identity` key of the `primary` repository's origin, or null.
+pub fn groupKey(a: A, repos: []const Repository) error{OutOfMemory}!?[]const u8 {
+    for (repos) |repo| {
+        if (!eq(repo.repository_id, store.PRIMARY_REPOSITORY_ID)) continue;
+        const identity = repo.vcs_identity orelse return null;
+        return repo_identity.normalizeAlloc(a, identity);
+    }
+    return null;
 }
 fn fallback(v: []const u8, other: []const u8) []const u8 {
     return if (v.len != 0) v else other;
@@ -393,7 +430,8 @@ pub fn projectFocused(a: A, snapshot: V, catalog: []const V, has_catalog: bool, 
         }
         const icon = identityOverride(ws, "icon_index", 16);
         const color = identityOverride(ws, "color_index", 8);
-        try workspaces.append(a, .{ .workspace_id = wid, .label = fallback(s(ws, "label"), wid), .path = s(ws, "path"), .open = !yes(get(ws, "archived")), .panes = panes, .threads = try summaries.toOwnedSlice(a), .icon_index = icon orelse 0, .color_index = color orelse 0, .icon_custom = icon != null, .color_custom = color != null });
+        const repos = try repositories(a, ws);
+        try workspaces.append(a, .{ .workspace_id = wid, .label = fallback(s(ws, "label"), wid), .path = s(ws, "path"), .open = !yes(get(ws, "archived")), .panes = panes, .threads = try summaries.toOwnedSlice(a), .icon_index = icon orelse 0, .color_index = color orelse 0, .icon_custom = icon != null, .color_custom = color != null, .repositories = repos, .group_key = try groupKey(a, repos) });
     }
     try rankWorkspaces(a, workspaces.items, focus);
     std.mem.sort(Pane, home.items, {}, attentionOrder);
