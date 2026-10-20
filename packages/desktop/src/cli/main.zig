@@ -98,6 +98,12 @@ fn dispatchArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []const 
         return .handled;
     }
     if (std.mem.eql(u8, parsed.command, "runtime")) {
+        // Pairing needs the running app (keyring custody and the exchange),
+        // so it goes over the live channel instead of editing profiles offline.
+        if (parsed.rest.len > 0 and (std.mem.eql(u8, parsed.rest[0], "pair") or std.mem.eql(u8, parsed.rest[0], "pair-status"))) {
+            try handleRuntimePair(allocator, out, io, parsed.rest);
+            return .handled;
+        }
         if (try runtime_profiles_cli.handle(allocator, out, io, parsed.rest) == .invalid_arguments) {
             std.process.exit(2);
         }
@@ -1142,6 +1148,111 @@ fn handleHerdrOpen(
     } else {
         try out.stdout("Queued Herdr workspace {s}/{s} and launched Verde.\n", .{ request.session, request.herdr_workspace });
     }
+}
+
+const RUNTIME_PAIR_WAIT_MS: i64 = 60_000;
+const RUNTIME_PAIR_POLL_MS: u64 = 500;
+
+/// `verde runtime pair --link <link|-> [--label NAME] [--device-label NAME]
+/// [--expect-runtime-id ID] [--wait]` and `verde runtime pair-status --profile ID`.
+/// The link carries a one-time secret; `--link -` reads it from stdin so it
+/// never appears in the process list.
+fn handleRuntimePair(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv: []const []const u8) !void {
+    if (std.mem.eql(u8, argv[0], "pair-status")) {
+        const profile_id = args.optionValue(argv, "--profile") orelse {
+            try out.stderr("usage: verde runtime pair-status --profile ID\n", .{});
+            std.process.exit(2);
+        };
+        const response = sendLiveRequestAlloc(allocator, io, "runtime.pair.status", .{ .profile_id = profile_id }, 1) catch |err| {
+            try out.stderr("verde runtime pair-status requires the Verde app to be running ({s})\n", .{@errorName(err)});
+            std.process.exit(3);
+        };
+        defer allocator.free(response);
+        try out.stdout("{s}\n", .{response});
+        if (!liveResponseOk(allocator, response)) std.process.exit(1);
+        return;
+    }
+
+    const link_arg = args.optionValue(argv, "--link") orelse {
+        try out.stderr("usage: verde runtime pair --link <verde://pair link | -> [--label NAME] [--device-label NAME] [--expect-runtime-id ID] [--wait]\n", .{});
+        std.process.exit(2);
+    };
+    var link_buffer: [4096]u8 = undefined;
+    defer std.crypto.secureZero(u8, &link_buffer);
+    const link: []const u8 = if (std.mem.eql(u8, link_arg, "-")) blk: {
+        var read_buffer: [4096]u8 = undefined;
+        defer std.crypto.secureZero(u8, &read_buffer);
+        var reader = std.Io.File.stdin().readerStreaming(io, &read_buffer);
+        const line = (reader.interface.takeDelimiter('\n') catch null) orelse "";
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0 or trimmed.len > link_buffer.len) {
+            try out.stderr("verde runtime pair --link - expects the link on stdin\n", .{});
+            std.process.exit(2);
+        }
+        @memcpy(link_buffer[0..trimmed.len], trimmed);
+        break :blk link_buffer[0..trimmed.len];
+    } else link_arg;
+
+    const response = sendLiveRequestAlloc(allocator, io, "runtime.pair", .{
+        .link = link,
+        .label = args.optionValue(argv, "--label"),
+        .device_label = args.optionValue(argv, "--device-label"),
+        .expect_runtime_id = args.optionValue(argv, "--expect-runtime-id"),
+    }, 1) catch |err| {
+        try out.stderr("verde runtime pair requires the Verde app to be running ({s})\n", .{@errorName(err)});
+        std.process.exit(3);
+    };
+    defer allocator.free(response);
+    if (liveResponseErrorCodeEquals(allocator, response, "method_not_found")) {
+        try out.stderr("running Verde app does not support runtime pair; rebuild/restart Verde\n", .{});
+        std.process.exit(1);
+    }
+    if (!args.hasFlag(argv, "--wait")) {
+        try out.stdout("{s}\n", .{response});
+        if (!liveResponseOk(allocator, response)) std.process.exit(1);
+        return;
+    }
+    if (!liveResponseOk(allocator, response)) {
+        try out.stdout("{s}\n", .{response});
+        std.process.exit(1);
+    }
+    const profile_id = (try liveResultStringAlloc(allocator, response, "profile_id")) orelse {
+        try out.stdout("{s}\n", .{response});
+        std.process.exit(1);
+    };
+    defer allocator.free(profile_id);
+
+    const deadline = platform_runtime.unixTimestampMs() + RUNTIME_PAIR_WAIT_MS;
+    while (true) {
+        platform_runtime.sleepMillis(RUNTIME_PAIR_POLL_MS);
+        const status_response = sendLiveRequestAlloc(allocator, io, "runtime.pair.status", .{ .profile_id = profile_id }, 1) catch |err| {
+            try out.stderr("lost the Verde app while waiting for pairing ({s})\n", .{@errorName(err)});
+            std.process.exit(3);
+        };
+        defer allocator.free(status_response);
+        const status = (try liveResultStringAlloc(allocator, status_response, "status")) orelse "";
+        defer if (status.len > 0) allocator.free(status);
+        const timed_out = platform_runtime.unixTimestampMs() >= deadline;
+        if (!std.mem.eql(u8, status, "exchanging") or timed_out) {
+            try out.stdout("{s}\n", .{status_response});
+            // awaiting_confirmation is a success for the caller: the user
+            // now sees the IDs and decides. Only failures exit nonzero.
+            if (timed_out or std.mem.eql(u8, status, "failed") or std.mem.eql(u8, status, "unknown_profile")) std.process.exit(1);
+            return;
+        }
+    }
+}
+
+/// `result.<field>` as an owned string, or null when absent.
+fn liveResultStringAlloc(allocator: std.mem.Allocator, response: []const u8, field: []const u8) !?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, response, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const result = parsed.value.object.get("result") orelse return null;
+    if (result != .object) return null;
+    const value = result.object.get(field) orelse return null;
+    if (value != .string) return null;
+    return try allocator.dupe(u8, value.string);
 }
 
 fn handleHerdrHandoff(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv: []const []const u8, json: bool) !void {
@@ -4928,6 +5039,15 @@ fn mcpToolsList(allocator: std.mem.Allocator, out: output.Output, id_value: std.
     try writeMcpTypedTool(&s, "list_processes", "List tracked workspace commands, agents, terminal processes, background tasks, and active leases.", &.{
         .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current; defaults to the desktop-selected workspace." },
     });
+    try writeMcpTypedTool(&s, "pair_runtime", "Pair this Verde desktop with another machine's runtime from a one-time verde://pair link (from `verde-daemon pair create --link-host https://HOST --json` on that machine). The pairing shows in the user's Add connection window. Pass expect_runtime_id (result.runtime_id from the same pair create output) to trust it without the user's confirm click; a mismatch stops for the user. Poll runtime_pair_status with the returned profile_id.", &.{
+        .{ .name = "link", .type_name = "string", .description = "The verde://pair link. It carries a one-time secret: do not log or echo it.", .required = true },
+        .{ .name = "label", .type_name = "string", .description = "Name for the other machine; defaults to the link host's first label." },
+        .{ .name = "device_label", .type_name = "string", .description = "How the other machine lists this computer; defaults to this computer's hostname." },
+        .{ .name = "expect_runtime_id", .type_name = "string", .description = "Runtime id read from the other machine over a trusted channel (SSH)." },
+    });
+    try writeMcpTypedTool(&s, "runtime_pair_status", "Pairing progress for a profile from pair_runtime: exchanging, awaiting_confirmation (the user must click Trust and pair), paired, failed, or unknown_profile.", &.{
+        .{ .name = "profile_id", .type_name = "string", .description = "profile_id returned by pair_runtime.", .required = true },
+    });
     try writeMcpTypedTool(&s, "check_command", "Classify a command and return structured conflicts before starting it.", &.{
         .{ .name = "command", .type_name = "string", .description = "Command that may be started.", .required = true },
         .{ .name = "resources", .type_name = "array", .items_type_name = "string", .description = "Optional explicit workspace resources, such as build, deps, db, or port:3000." },
@@ -6178,6 +6298,19 @@ fn mcpToolsCall(
                 .progress = mcpArgF32(arguments, "progress"),
                 .attention = mcpArgBool(arguments, "attention"),
             }, 1);
+        }
+        if (std.mem.eql(u8, tool_name, "pair_runtime")) {
+            const link = mcpArgString(arguments, "link") orelse return try mcpError(allocator, out, id_value, -32602, "pair_runtime requires link");
+            break :blk sendLiveRequestAlloc(allocator, io, "runtime.pair", .{
+                .link = link,
+                .label = mcpArgString(arguments, "label"),
+                .device_label = mcpArgString(arguments, "device_label"),
+                .expect_runtime_id = mcpArgString(arguments, "expect_runtime_id"),
+            }, 1);
+        }
+        if (std.mem.eql(u8, tool_name, "runtime_pair_status")) {
+            const profile_id = mcpArgString(arguments, "profile_id") orelse return try mcpError(allocator, out, id_value, -32602, "runtime_pair_status requires profile_id");
+            break :blk sendLiveRequestAlloc(allocator, io, "runtime.pair.status", .{ .profile_id = profile_id }, 1);
         }
         if (std.mem.eql(u8, tool_name, "clear_surface_attention")) {
             const session = session_id orelse return try mcpError(allocator, out, id_value, -32602, "clear_surface_attention requires session_id");

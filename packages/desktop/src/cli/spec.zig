@@ -52,6 +52,8 @@ pub const runtime_commands = [_][]const u8{
     "add-ssh",
     "remove",
     "default",
+    "pair",
+    "pair-status",
 };
 
 pub const integration_commands = [_][]const u8{
@@ -141,6 +143,8 @@ pub const live_capabilities = [_][]const u8{
     "herdr.handoff",
     "herdr.unlink",
     "herdr.status",
+    "runtime.pair",
+    "runtime.pair.status",
     "surfaces",
     "surface.list",
     "surface.inspect",

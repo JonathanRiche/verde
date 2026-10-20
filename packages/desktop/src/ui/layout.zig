@@ -2827,7 +2827,10 @@ fn runtimeWizardLayout(state: *const runtime.AppState, width: f32, height: f32) 
     const inventory_rows = @min(rc.connect_runtimes.items.len, WIZARD_INVENTORY_VISIBLE_ROWS);
     const body_h: f32 = switch (step) {
         .method => @as(f32, @floatFromInt(WIZARD_METHOD_COUNT)) * (method_card_h + row_gap),
-        .form => if (rc.wizard_method == .pair) 2.0 * field_row_h else 4.0 * field_row_h,
+        .form => if (rc.wizard_method == .pair)
+            (if (rc.wizard_mode == .add) 3.0 * field_row_h else 2.0 * field_row_h)
+        else
+            4.0 * field_row_h,
         .pair_grant => 3.0 * field_row_h,
         .pair_confirm => 2.0 * (label_h + identity_box_h + row_gap),
         .connect_setup => 2.0 * field_row_h + status_block_h + @as(f32, @floatFromInt(inventory_rows)) * (inventory_row_h + gap) + (if (rc.connect_runtimes_truncated > 0) sub_h else 0.0),
@@ -2850,7 +2853,7 @@ fn runtimeWizardLayout(state: *const runtime.AppState, width: f32, height: f32) 
     switch (step) {
         .form => {
             if (rc.wizard_method == .pair) {
-                for ([_]WizardField{ .label, .control_plane_url }) |field| {
+                for (rc.visibleFields()) |field| {
                     layout.fields[@intFromEnum(field)] = .{ .x = x, .y = y + label_h, .w = content_w, .h = input_h };
                     y += field_row_h;
                 }
@@ -3051,7 +3054,7 @@ fn renderRuntimeWizardModal(state: *runtime.AppState, width: f32, height: f32) v
     const subtitle = switch (rc.wizard_step) {
         .method => "Choose how this desktop reaches the runtime. Only Connect needs an account.",
         .form => if (rc.wizard_method == .pair)
-            "Paste the complete Pair link once. HTTPS and runtime identity are verified before trust is saved."
+            "Paste the pair link. Both names are filled in for you; change them if you like."
         else
             "Reach a self-hosted Verde daemon over SSH. Host keys are verified by OpenSSH; no secrets are stored here.",
         .pair_grant => "Advanced manual fallback: review or enter the grant ID and masked one-time code, then exchange.",
@@ -3078,10 +3081,18 @@ fn renderRuntimeWizardModal(state: *runtime.AppState, width: f32, height: f32) v
             drawActionButton(state, layout.buttons[0], "Cancel", theme.COLOR_PANEL_ALT);
         },
         .form => {
-            drawWizardField(state, layout, .label, "NAME", "Build VM");
-            if (rc.wizard_method == .pair) {
-                drawWizardField(state, layout, .control_plane_url, if (rc.wizard_mode == .add) "PAIR LINK (MASKED)" else "DIRECT HTTPS / TAILSCALE SERVE URL", if (rc.wizard_mode == .add) "verde://pair?host=…&grant_id=…#code=…" else "https://runtime.example");
+            if (rc.wizard_method == .pair and rc.wizard_mode == .add) {
+                drawWizardField(state, layout, .control_plane_url, "PAIR LINK (MASKED)", "verde://pair?host=…&grant_id=…#code=…");
+                // Until the user types a name, show the one the link implies.
+                var default_label_buffer: [runtime_connections.URL_CAPACITY]u8 = undefined;
+                const default_label = runtime_connections.pairLinkDefaultLabel(rc.fieldValue(.control_plane_url), &default_label_buffer) orelse "Taken from the link";
+                drawWizardField(state, layout, .label, "NAME OF THE OTHER MACHINE", default_label);
+                drawWizardField(state, layout, .device_label, "NAME OF THIS COMPUTER (SHOWN ON THE OTHER MACHINE)", "e.g. work laptop");
+            } else if (rc.wizard_method == .pair) {
+                drawWizardField(state, layout, .label, "NAME", "Build VM");
+                drawWizardField(state, layout, .control_plane_url, "DIRECT HTTPS / TAILSCALE SERVE URL", "https://runtime.example");
             } else {
+                drawWizardField(state, layout, .label, "NAME", "Build VM");
                 drawWizardField(state, layout, .host, "SSH HOST OR CONFIG ALIAS", "runtime.example or my-vm");
                 drawWizardField(state, layout, .user, "SSH USER (OPTIONAL)", "leave empty to use ~/.ssh/config");
                 drawWizardField(state, layout, .ssh_port, "SSH PORT", "22");
@@ -3094,7 +3105,7 @@ fn renderRuntimeWizardModal(state: *runtime.AppState, width: f32, height: f32) v
         .pair_grant => {
             drawWizardField(state, layout, .grant_id, "GRANT ID", "32 hex characters");
             drawWizardField(state, layout, .pairing_code, "ONE-TIME PAIRING CODE", "64 hex characters, masked");
-            drawWizardField(state, layout, .device_label, "DEVICE LABEL", "e.g. work laptop");
+            drawWizardField(state, layout, .device_label, "NAME OF THIS COMPUTER (SHOWN ON THE RUNTIME)", "e.g. work laptop");
             drawActionButton(state, layout.buttons[0], "Cancel", theme.COLOR_PANEL_ALT);
             drawActionButton(state, layout.buttons[1], "Back", theme.COLOR_PANEL_ALT);
             drawActionButton(state, layout.buttons[2], if (rc.pairing_exchange_started) "Exchanging…" else "Exchange grant", theme.accent());
@@ -4318,7 +4329,7 @@ test "runtime credential renderer receives only a same-length mask" {
     try std.testing.expect(!std.mem.eql(u8, masked, "not-a-renderable-secret"));
 }
 
-test "Pair wizard form positions only its two visible fields on separate rows" {
+test "Pair wizard form stacks link, runtime name, and device name on separate rows" {
     var state: runtime.AppState = undefined;
     // Fields read by modal key/text routing and new-chat defaults.
     state.folder_browser = .{};
@@ -4330,16 +4341,27 @@ test "Pair wizard form positions only its two visible fields on separate rows" {
     state.runtime_connections.wizard_method = .pair;
 
     const pair_layout = runtimeWizardLayout(&state, 1200.0, 900.0);
-    const label = pair_layout.fields[@intFromEnum(WizardField.label)];
     const pair_link = pair_layout.fields[@intFromEnum(WizardField.control_plane_url)];
-    try std.testing.expect(pair_link.y >= label.y + label.h);
+    const label = pair_layout.fields[@intFromEnum(WizardField.label)];
+    const device_label = pair_layout.fields[@intFromEnum(WizardField.device_label)];
+    try std.testing.expect(label.y >= pair_link.y + pair_link.h);
+    try std.testing.expect(device_label.y >= label.y + label.h);
     try std.testing.expectEqual(label.x, pair_link.x);
     try std.testing.expectEqual(label.w, pair_link.w);
+    try std.testing.expectEqualSlices(
+        WizardField,
+        &.{ .control_plane_url, .label, .device_label },
+        state.runtime_connections.visibleFields(),
+    );
+
+    // Editing a saved direct profile has no grant to exchange: two fields.
+    state.runtime_connections.wizard_mode = .edit;
     try std.testing.expectEqualSlices(
         WizardField,
         &.{ .label, .control_plane_url },
         state.runtime_connections.visibleFields(),
     );
+    state.runtime_connections.wizard_mode = .add;
 
     state.runtime_connections.wizard_method = .ssh;
     const ssh_layout = runtimeWizardLayout(&state, 1200.0, 900.0);

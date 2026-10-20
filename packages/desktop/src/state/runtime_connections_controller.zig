@@ -8,6 +8,7 @@
 //! zeroed buffer only until the exchange starts, then wiped.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const access_protocol = @import("headless").access_protocol;
 const connect_client = @import("../runtime/connect_client.zig");
 const profile = @import("../runtime/profile.zig");
@@ -25,6 +26,7 @@ pub const GRANT_ID_CAPACITY: usize = access_protocol.GRANT_ID_HEX_BYTES;
 pub const PAIRING_CODE_CAPACITY: usize = access_protocol.SECRET_HEX_BYTES;
 pub const DEVICE_LABEL_CAPACITY: usize = access_protocol.MAX_DEVICE_LABEL_BYTES;
 pub const URL_CAPACITY: usize = profile.MAX_URL_BYTES;
+pub const AGENT_EXPECTED_RUNTIME_ID_CAPACITY: usize = 128;
 pub const PAIR_LINK_PREFIX: []const u8 = "verde://pair?";
 const NOTICE_CAPACITY: usize = 256;
 /// Bounded so a hostile or huge manifest cannot grow the settings card
@@ -239,6 +241,11 @@ pub const State = struct {
     /// True once `beginPairing` accepted the grant; the poll advances to
     /// confirmation or reports the failure.
     pairing_exchange_started: bool = false,
+    /// Runtime id an agent read over a channel it already trusts (e.g.
+    /// `verde-daemon identity` over SSH). A matching exchange is trusted
+    /// without the confirm click; a mismatch stops at the confirm step.
+    agent_expected_runtime_id_storage: [AGENT_EXPECTED_RUNTIME_ID_CAPACITY]u8 = undefined,
+    agent_expected_runtime_id_len: usize = 0,
     /// Live Connect session for the wizard's control-plane step.
     connect_session: ?*connect_client.Session = null,
     connect_phase: connect_client.Phase = .idle,
@@ -350,7 +357,7 @@ pub const State = struct {
     pub fn visibleFields(self: *const State) []const WizardField {
         return switch (self.wizard_step) {
             .form => if (self.wizard_method == .pair)
-                &.{ .label, .control_plane_url }
+                (if (self.wizard_mode == .add) &.{ .control_plane_url, .label, .device_label } else &.{ .label, .control_plane_url })
             else
                 &.{ .label, .host, .user, .ssh_port, .gateway_port },
             .pair_grant => &.{ .grant_id, .pairing_code, .device_label },
@@ -385,6 +392,9 @@ pub fn validateWizardForm(state: *const State) ?ValidationError {
             if (!std.mem.startsWith(u8, link, PAIR_LINK_PREFIX)) {
                 return .{ .field = .control_plane_url, .message = "Paste the complete verde://pair link from the runtime." };
             }
+            access_protocol.validateDeviceLabel(state.fieldValue(.device_label)) catch {
+                return .{ .field = .device_label, .message = "Name this computer (1–128 printable characters); the runtime lists it under this name." };
+            };
             return null;
         }
         profile.validateRuntimeHttpsOrigin(std.mem.trim(u8, state.fieldValue(.control_plane_url), &std.ascii.whitespace)) catch {
@@ -419,6 +429,52 @@ pub fn validatePairGrantForm(state: *const State) ?ValidationError {
         return .{ .field = .device_label, .message = "Device label is 1–128 printable characters shown in the runtime's device list." };
     };
     return null;
+}
+
+/// Default runtime name for a pair link: the first DNS label of its host, so
+/// `https://richetech.tailnet.ts.net` becomes "richetech". IP hosts are kept
+/// whole. Null when the link has no usable host. The result lives in `buffer`.
+pub fn pairLinkDefaultLabel(link: []const u8, buffer: []u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, link, PAIR_LINK_PREFIX)) return null;
+    const query_end = std.mem.indexOfScalar(u8, link, '#') orelse link.len;
+    var fields = std.mem.splitScalar(u8, link[PAIR_LINK_PREFIX.len..query_end], '&');
+    const encoded = while (fields.next()) |field| {
+        if (std.mem.startsWith(u8, field, "host=")) break field["host=".len..];
+    } else return null;
+    if (encoded.len > buffer.len) return null;
+    @memcpy(buffer[0..encoded.len], encoded);
+    const origin = std.Uri.percentDecodeInPlace(buffer[0..encoded.len]);
+    const uri = std.Uri.parse(origin) catch return null;
+    const host = switch (uri.host orelse return null) {
+        .raw => |value| value,
+        .percent_encoded => |value| value,
+    };
+    if (host.len == 0) return null;
+    const is_ip = std.ascii.isDigit(host[0]) or host[0] == '[';
+    const name = if (is_ip) host else host[0 .. std.mem.indexOfScalar(u8, host, '.') orelse host.len];
+    profile.validateLabel(name) catch return null;
+    return name;
+}
+
+/// Fills an empty runtime name from the pasted pair link's host.
+fn applyPairLinkDefaultLabel(state: *State) void {
+    if (state.fieldValue(.label).len != 0) return;
+    var buffer: [URL_CAPACITY]u8 = undefined;
+    const name = pairLinkDefaultLabel(state.fieldValue(.control_plane_url), &buffer) orelse return;
+    fillZ(&state.label_storage, name);
+    state.label_cursor = state.fieldValue(.label).len;
+}
+
+/// Prefills the device label (how the runtime lists this computer) with the
+/// local hostname. Never overwrites a name the user typed.
+fn fillLocalDeviceLabel(state: *State) void {
+    if (state.fieldValue(.device_label).len != 0) return;
+    if (comptime builtin.os.tag == .windows) return;
+    var host_buffer: [std.posix.HOST_NAME_MAX]u8 = undefined;
+    const name = std.posix.gethostname(&host_buffer) catch return;
+    access_protocol.validateDeviceLabel(name) catch return;
+    fillZ(&state.device_label_storage, name);
+    state.device_label_cursor = state.fieldValue(.device_label).len;
 }
 
 /// Imports the frozen one-paste Pair URL. The fragment code is copied only to
@@ -575,9 +631,14 @@ pub fn chooseRuntimeWizardMethod(self: anytype, method: WizardMethod) void {
     rc.wizard_method = method;
     setNotice(&rc.wizard_notice_storage, "");
     switch (method) {
-        .ssh, .pair => {
+        .ssh => {
             rc.wizard_step = .form;
             focusWizardField(self, .label);
+        },
+        .pair => {
+            rc.wizard_step = .form;
+            fillLocalDeviceLabel(rc);
+            focusWizardField(self, .control_plane_url);
         },
         .connect => {
             rc.wizard_step = .connect_setup;
@@ -721,6 +782,7 @@ pub fn submitRuntimeConnectionWizard(self: anytype) void {
 
 fn submitEndpointForm(self: anytype) void {
     const rc = &self.runtime_connections;
+    if (rc.wizard_method == .pair and rc.wizard_mode == .add) applyPairLinkDefaultLabel(rc);
     if (validateWizardForm(rc)) |failure| {
         setNotice(&rc.wizard_notice_storage, failure.message);
         focusWizardField(self, failure.field);
@@ -803,6 +865,9 @@ fn submitDirectPairForm(self: anytype, service: *RuntimeService) void {
             setWizardProfileId(self, id);
             self.syncPaletteRuntimePicker();
             enterPairGrantStep(self, "HTTPS endpoint saved. Enter the grant ID and masked one-time code from `verde-server pair create`.");
+            // The link already carried the grant, code, and device name, so
+            // exchange now instead of asking the user to review them again.
+            if (validatePairGrantForm(rc) == null) return submitPairGrant(self);
         },
         .edit => {
             const profile_id = rc.wizard_profile_id orelse return;
@@ -826,6 +891,7 @@ fn submitDirectPairForm(self: anytype, service: *RuntimeService) void {
 
 fn enterPairGrantStep(self: anytype, notice: []const u8) void {
     const rc = &self.runtime_connections;
+    fillLocalDeviceLabel(rc);
     rc.wizard_step = .pair_grant;
     rc.pairing_exchange_started = false;
     setNotice(&rc.wizard_notice_storage, notice);
@@ -861,7 +927,7 @@ fn submitPairGrant(self: anytype) void {
     rc.pairing_code_cursor = 0;
     rc.pairing_exchange_started = true;
     invalidateReadiness(self, profile_id);
-    setNotice(&rc.wizard_notice_storage, "Exchanging the grant over SSH…");
+    setNotice(&rc.wizard_notice_storage, "Exchanging the grant…");
     blurWizardField(self);
     self.markDirty();
 }
@@ -1101,6 +1167,91 @@ fn blurWizardField(self: anytype) void {
 }
 
 // ---------------------------------------------------------------------------
+// Agent pairing: the wizard flow driven by the live `runtime.pair` command
+// ---------------------------------------------------------------------------
+
+pub const AgentPairRequest = struct {
+    /// One-paste `verde://pair` link from `verde-daemon pair create --link-host`.
+    link: []const u8,
+    /// Name for the other machine; defaults to the link host's first label.
+    label: ?[]const u8 = null,
+    /// How the runtime lists this computer; defaults to the local hostname.
+    device_label: ?[]const u8 = null,
+    /// Trust the exchange without the confirm click only if it matches.
+    expect_runtime_id: ?[]const u8 = null,
+};
+
+pub const AgentPairError = error{
+    /// The wizard is mid-flow for something else; never discard the user's draft.
+    WizardBusy,
+    InvalidRequest,
+    /// Validation or profile creation failed; the wizard notice says why.
+    PairingNotStarted,
+};
+
+/// Runs the Add connection Pair flow for an agent, visibly in the wizard so
+/// the user sees what is being paired. Returns the new profile id, owned by
+/// the wizard (valid until the wizard changes profile).
+pub fn startAgentPairing(self: anytype, request: AgentPairRequest) AgentPairError![]const u8 {
+    const rc = &self.runtime_connections;
+    if (rc.wizard_open and rc.wizard_step != .method and rc.wizard_step != .testing) return error.WizardBusy;
+    if (request.link.len == 0 or request.link.len > URL_CAPACITY) return error.InvalidRequest;
+    if (request.label) |label| profile.validateLabel(label) catch return error.InvalidRequest;
+    if (request.device_label) |name| access_protocol.validateDeviceLabel(name) catch return error.InvalidRequest;
+    if (request.expect_runtime_id) |id| {
+        if (id.len == 0 or id.len > AGENT_EXPECTED_RUNTIME_ID_CAPACITY) return error.InvalidRequest;
+    }
+
+    openRuntimeConnectionWizard(self);
+    rc.wizard_method = .pair;
+    rc.wizard_step = .form;
+    fillZ(&rc.control_plane_url_storage, request.link);
+    if (request.label) |label| fillZ(&rc.label_storage, label);
+    if (request.device_label) |name| fillZ(&rc.device_label_storage, name);
+    fillLocalDeviceLabel(rc);
+    inline for (.{ .label, .device_label, .control_plane_url }) |field| {
+        rc.fieldCursor(field).* = rc.fieldValue(field).len;
+    }
+    if (request.expect_runtime_id) |id| {
+        @memcpy(rc.agent_expected_runtime_id_storage[0..id.len], id);
+        rc.agent_expected_runtime_id_len = id.len;
+    }
+    submitEndpointForm(self);
+    if (rc.wizard_step != .pair_grant or !rc.pairing_exchange_started) {
+        rc.agent_expected_runtime_id_len = 0;
+        return error.PairingNotStarted;
+    }
+    return rc.wizard_profile_id orelse error.PairingNotStarted;
+}
+
+/// Progress of a pairing started by `startAgentPairing`, for polling callers.
+pub const AgentPairStatus = enum {
+    /// The grant is being exchanged.
+    exchanging,
+    /// Waiting for the user to compare IDs and click Trust and pair.
+    awaiting_confirmation,
+    /// Paired; the connection is starting or ready.
+    paired,
+    failed,
+    unknown_profile,
+};
+
+pub fn agentPairingStatus(self: anytype, profile_id: []const u8) AgentPairStatus {
+    const service = self.runtime_service orelse return .unknown_profile;
+    const snapshot = service.snapshot(profile_id) orelse return .unknown_profile;
+    switch (snapshot.pairing_state) {
+        .exchanging => return .exchanging,
+        .awaiting_confirmation => return .awaiting_confirmation,
+        .none => {},
+    }
+    if (snapshot.device_credential_held or snapshot.device_id != null) return .paired;
+    const rc = &self.runtime_connections;
+    const wizard_on_profile = if (rc.wizard_profile_id) |current| std.mem.eql(u8, current, profile_id) else false;
+    if (wizard_on_profile and rc.wizard_open and rc.wizard_step == .pair_grant and rc.pairing_exchange_started) return .exchanging;
+    return .failed;
+}
+
+// ---------------------------------------------------------------------------
 // Wizard polling: pairing exchange progress and the Connect session
 // ---------------------------------------------------------------------------
 
@@ -1122,6 +1273,20 @@ fn pollPairingExchange(self: anytype) bool {
     const profile_id = rc.wizard_profile_id orelse return false;
     const snapshot = service.snapshot(profile_id) orelse return false;
     if (snapshot.pairing_state == .awaiting_confirmation) {
+        if (rc.agent_expected_runtime_id_len != 0) {
+            const expected = rc.agent_expected_runtime_id_storage[0..rc.agent_expected_runtime_id_len];
+            const result = service.pairingResult(profile_id);
+            const matches = if (result) |value| std.mem.eql(u8, value.runtime_id, expected) else false;
+            rc.agent_expected_runtime_id_len = 0;
+            if (matches) {
+                confirmPairing(self);
+                return true;
+            }
+            rc.wizard_step = .pair_confirm;
+            setNotice(&rc.wizard_notice_storage, "This runtime ID does not match the one the agent read from the host. Do not trust it unless you can explain the difference.");
+            blurWizardField(self);
+            return true;
+        }
         rc.wizard_step = .pair_confirm;
         setNotice(&rc.wizard_notice_storage, "Compare both IDs with `verde-daemon identity` on the runtime host before confirming.");
         blurWizardField(self);
@@ -2092,6 +2257,7 @@ fn resetWizardFields(rc: *State) void {
     rc.device_label_cursor = 0;
     rc.control_plane_url_cursor = 0;
     rc.pairing_exchange_started = false;
+    rc.agent_expected_runtime_id_len = 0;
 }
 
 fn setWizardProfileId(self: anytype, profile_id: ?[]const u8) void {
@@ -2180,6 +2346,35 @@ test "connect form validation rejects non-https control planes" {
     try std.testing.expectEqual(WizardField.control_plane_url, validateConnectForm(&rc).?.field);
     fillZ(&rc.control_plane_url_storage, "  https://connect.example:8443/  ");
     try std.testing.expect(validateConnectForm(&rc) == null);
+}
+
+test "pair link default name is the host's first label" {
+    var buffer: [URL_CAPACITY]u8 = undefined;
+    const grant = "6" ** 32;
+    const code = "7" ** 64;
+    try std.testing.expectEqualStrings("richetech", pairLinkDefaultLabel(
+        "verde://pair?host=https%3A%2F%2Frichetech.tailc28f01.ts.net&grant_id=" ++ grant ++ "#code=" ++ code,
+        &buffer,
+    ).?);
+    try std.testing.expectEqualStrings("buildbox", pairLinkDefaultLabel(
+        "verde://pair?host=https%3A%2F%2Fbuildbox%3A8443&grant_id=" ++ grant ++ "#code=" ++ code,
+        &buffer,
+    ).?);
+    try std.testing.expectEqualStrings("100.64.0.7", pairLinkDefaultLabel(
+        "verde://pair?host=https%3A%2F%2F100.64.0.7&grant_id=" ++ grant ++ "#code=" ++ code,
+        &buffer,
+    ).?);
+    try std.testing.expect(pairLinkDefaultLabel("https://richetech.example", &buffer) == null);
+    try std.testing.expect(pairLinkDefaultLabel("verde://pair?grant_id=" ++ grant ++ "#code=" ++ code, &buffer) == null);
+
+    // A typed name is never replaced; an empty one is filled from the link.
+    var rc: State = .{};
+    fillZ(&rc.control_plane_url_storage, "verde://pair?host=https%3A%2F%2Frichetech.tailc28f01.ts.net&grant_id=" ++ grant ++ "#code=" ++ code);
+    applyPairLinkDefaultLabel(&rc);
+    try std.testing.expectEqualStrings("richetech", rc.fieldValue(.label));
+    fillZ(&rc.label_storage, "Office box");
+    applyPairLinkDefaultLabel(&rc);
+    try std.testing.expectEqualStrings("Office box", rc.fieldValue(.label));
 }
 
 test "Pair link import is exact and wipes fragment staging" {

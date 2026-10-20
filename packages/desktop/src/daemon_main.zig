@@ -128,6 +128,9 @@ const PairOptions = struct {
     scopes: [access_protocol.MAX_SCOPE_COUNT][]const u8 = @splat(""),
     scope_count: usize = 0,
     preset: ?access_protocol.PairingPreset = null,
+    /// HTTPS origin clients reach this runtime at (e.g. a Tailscale Serve
+    /// URL). When set, `pair create` also prints a one-paste `verde://pair` link.
+    link_host: ?[]const u8 = null,
 };
 
 const RepositoryBindOptions = struct {
@@ -940,7 +943,7 @@ fn handleAccessAdministration(
                 result.pairing_token = undefined;
             }
             try verifyAccessIdentity(handshake.status, result.runtime_id, result.instance_id);
-            try writePairingGrantCreateOutput(io, allocator, data_dir, options.json, result);
+            try writePairingGrantCreateOutput(io, allocator, data_dir, options.json, options.pair.link_host, result);
         },
         .pair_list => {
             var parsed = try client.call(
@@ -1080,8 +1083,17 @@ fn writePairingGrantCreateOutput(
     allocator: std.mem.Allocator,
     data_dir: []const u8,
     json: bool,
+    link_host: ?[]const u8,
     result: access_protocol.PairingGrantCreateResult,
 ) !void {
+    const pair_link: ?[]u8 = if (link_host) |host|
+        try pairLinkAlloc(allocator, host, result.grant_id, result.pairing_token.reveal())
+    else
+        null;
+    defer if (pair_link) |link| {
+        std.crypto.secureZero(u8, link);
+        allocator.free(link);
+    };
     if (json) {
         const encoded = try std.json.Stringify.valueAlloc(allocator, .{
             .ok = true,
@@ -1098,6 +1110,7 @@ fn writePairingGrantCreateOutput(
                 .max_access_mode = result.max_access_mode,
                 .expires_at_ms = result.expires_at_ms,
                 .scopes = result.scopes,
+                .pair_link = pair_link,
             },
         }, .{ .emit_null_optional_fields = false });
         defer {
@@ -1113,6 +1126,53 @@ fn writePairingGrantCreateOutput(
         .{ result.runtime_id, result.grant_id, result.expires_at_ms, result.pairing_token.reveal() },
     );
     try writeScopeLine(io, result.scopes);
+    if (pair_link) |link| {
+        try writeSensitiveStdout(io, "Pair link (shown once; paste into Verde or `verde runtime pair --link -`):\n{s}\n", .{link});
+    }
+}
+
+/// `https://host[:port]` with nothing after the authority.
+fn validPairLinkHost(value: []const u8) bool {
+    const uri = std.Uri.parse(value) catch return false;
+    if (!std.mem.eql(u8, uri.scheme, "https")) return false;
+    if (uri.host == null or uri.user != null or uri.password != null or uri.query != null or uri.fragment != null) return false;
+    const path = switch (uri.path) {
+        .raw => |text| text,
+        .percent_encoded => |text| text,
+    };
+    return path.len == 0 or std.mem.eql(u8, path, "/");
+}
+
+/// The one-paste link the desktop's Add connection wizard imports. The host
+/// is fully percent-encoded; the code travels only in the fragment.
+fn pairLinkAlloc(allocator: std.mem.Allocator, host: []const u8, grant_id: []const u8, code: []const u8) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    try writer.writer.writeAll("verde://pair?host=");
+    for (std.mem.trimEnd(u8, host, "/")) |byte| {
+        if (std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '.' or byte == '_' or byte == '~') {
+            try writer.writer.writeByte(byte);
+        } else {
+            try writer.writer.print("%{X:0>2}", .{byte});
+        }
+    }
+    try writer.writer.print("&grant_id={s}#code={s}", .{ grant_id, code });
+    return writer.toOwnedSlice();
+}
+
+test "pair link encodes the host and carries the code only in the fragment" {
+    const allocator = std.testing.allocator;
+    try std.testing.expect(validPairLinkHost("https://richetech.tailc28f01.ts.net"));
+    try std.testing.expect(validPairLinkHost("https://runtime.example:8443/"));
+    try std.testing.expect(!validPairLinkHost("http://runtime.example"));
+    try std.testing.expect(!validPairLinkHost("https://runtime.example/path"));
+    try std.testing.expect(!validPairLinkHost("https://user@runtime.example"));
+    const link = try pairLinkAlloc(allocator, "https://richetech.tailc28f01.ts.net/", "6" ** 32, "7" ** 64);
+    defer allocator.free(link);
+    try std.testing.expectEqualStrings(
+        "verde://pair?host=https%3A%2F%2Frichetech.tailc28f01.ts.net&grant_id=" ++ "6" ** 32 ++ "#code=" ++ "7" ** 64,
+        link,
+    );
 }
 
 fn writeScopeLine(io: std.Io, scopes: []const []const u8) !void {
@@ -1442,6 +1502,10 @@ fn parseArgs(argv: []const []const u8) ParseError!Options {
                 if (result.pair.expires_set) return error.InvalidArguments;
                 result.pair.ttl_seconds = try parsePairingExpiry(value);
                 result.pair.expires_set = true;
+            } else if (command == .pair_create and std.mem.eql(u8, arg, "--link-host")) {
+                if (result.pair.link_host != null) return error.InvalidArguments;
+                if (!validPairLinkHost(value)) return error.InvalidArguments;
+                result.pair.link_host = value;
             } else if (command == .pair_create and std.mem.eql(u8, arg, "--preset")) {
                 if (result.pair.preset != null or result.pair.scope_count != 0) return error.InvalidArguments;
                 result.pair.preset = std.meta.stringToEnum(access_protocol.PairingPreset, value) orelse return error.InvalidArguments;
@@ -1699,7 +1763,7 @@ fn printHelp(io: std.Io, stderr: bool) !void {
         \\  verde-daemon workspace show --workspace ID [--data-dir PATH] [--json]
         \\  verde-daemon workspace bind --workspace ID --label LABEL --root PATH [--data-dir PATH] [--json]
         \\  verde-daemon workspace repository bind --workspace ID --repository ID --label LABEL --root PATH [options]
-        \\  verde-daemon pair create [--preset full|chat|monitor] [--expires 10m] [--label TEXT] [--scope SCOPE]... [--data-dir PATH] [--json]
+        \\  verde-daemon pair create [--preset full|chat|monitor] [--expires 10m] [--label TEXT] [--scope SCOPE]... [--link-host https://HOST] [--data-dir PATH] [--json]
         \\  verde-daemon pair list [--data-dir PATH] [--json]
         \\  verde-daemon pair revoke --id ID [--data-dir PATH] [--json]
         \\  verde-daemon device list [--data-dir PATH] [--json]

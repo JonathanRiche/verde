@@ -13,6 +13,7 @@ const browser_ui = @import("../ui/browser.zig");
 const command_palette = @import("../ui/command_palette.zig");
 const sidebar_ui = @import("../ui/sidebar.zig");
 const herdr = @import("../workspace/herdr.zig");
+const runtime_connections = @import("../state/runtime_connections_controller.zig");
 const loop_wakeup = @import("loop_wakeup");
 const platform_ipc = @import("../platform/ipc.zig");
 const live_endpoint = @import("../platform/live_endpoint.zig");
@@ -217,6 +218,8 @@ fn handleRequest(allocator: std.mem.Allocator, state: *app_state.AppState, reque
     if (std.mem.eql(u8, method, "herdr.handoff")) return try herdrHandoffResponse(allocator, id_value, state, params);
     if (std.mem.eql(u8, method, "herdr.unlink")) return try herdrUnlinkResponse(allocator, id_value, state, params);
     if (std.mem.eql(u8, method, "herdr.status")) return try herdrStatusResponse(allocator, id_value, state);
+    if (std.mem.eql(u8, method, "runtime.pair")) return try runtimePairResponse(allocator, id_value, state, params);
+    if (std.mem.eql(u8, method, "runtime.pair.status")) return try runtimePairStatusResponse(allocator, id_value, state, params);
     if (std.mem.eql(u8, method, "surfaces") or std.mem.eql(u8, method, "surface.list")) return try surfacesResponse(allocator, id_value, state, params);
     if (std.mem.eql(u8, method, "surface.inspect")) return try surfaceInspectResponse(allocator, id_value, state, params);
     if (std.mem.eql(u8, method, "surface.focus")) return try surfaceFocusResponse(allocator, id_value, state, params);
@@ -440,7 +443,8 @@ fn capabilitiesResponse(allocator: std.mem.Allocator, id_value: std.json.Value) 
             "process.stop",                        "process.restart",                      "process.logs",                       "agent.open",
             "stack.status",                        "stack.start",                          "stack.stop",                         "stack.restart",
             "workspace.processes",                 "workspace.checkCommand",               "workspace.acquireLease",             "workspace.releaseLease",
-            "workspace.waitForResources",          "tab.select",                           "tab.add",
+            "workspace.waitForResources",          "tab.select",                           "tab.add",                            "runtime.pair",
+            "runtime.pair.status",
         },
         .events = &.{},
         .encodings = &.{"json"},
@@ -656,6 +660,43 @@ fn herdrUnlinkResponse(allocator: std.mem.Allocator, id_value: std.json.Value, s
     };
     defer result.deinit(allocator);
     return try okValueResponse(allocator, id_value, result);
+}
+
+/// Pairs this desktop with a runtime from a `verde://pair` link, in the
+/// visible Add connection wizard. Returns at once; poll `runtime.pair.status`.
+fn runtimePairResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value) ![]u8 {
+    if (params != .object) return try errorResponseAlloc(allocator, id_value, "invalid_request", "runtime.pair requires params");
+    const link = stringParam(params, "link") orelse
+        return try errorResponseAlloc(allocator, id_value, "invalid_request", "runtime.pair requires link");
+    const profile_id = runtime_connections.startAgentPairing(state, .{
+        .link = link,
+        .label = stringParam(params, "label"),
+        .device_label = stringParam(params, "device_label"),
+        .expect_runtime_id = stringParam(params, "expect_runtime_id"),
+    }) catch |err| return switch (err) {
+        error.WizardBusy => try errorResponseAlloc(allocator, id_value, "busy", "the Add connection window is in use; finish or close it first"),
+        error.InvalidRequest => try errorResponseAlloc(allocator, id_value, "invalid_request", "invalid link, label, device_label, or expect_runtime_id"),
+        error.PairingNotStarted => try errorResponseAlloc(allocator, id_value, "pairing_failed", state.runtime_connections.wizardNotice()),
+    };
+    state.markDirty();
+    return try okValueResponse(allocator, id_value, .{
+        .profile_id = profile_id,
+        .status = @tagName(runtime_connections.agentPairingStatus(state, profile_id)),
+        .auto_trust = stringParam(params, "expect_runtime_id") != null,
+    });
+}
+
+fn runtimePairStatusResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value) ![]u8 {
+    if (params != .object) return try errorResponseAlloc(allocator, id_value, "invalid_request", "runtime.pair.status requires params");
+    const profile_id = stringParam(params, "profile_id") orelse
+        return try errorResponseAlloc(allocator, id_value, "invalid_request", "runtime.pair.status requires profile_id");
+    const rc = &state.runtime_connections;
+    const wizard_on_profile = if (rc.wizard_profile_id) |current| std.mem.eql(u8, current, profile_id) else false;
+    return try okValueResponse(allocator, id_value, .{
+        .profile_id = profile_id,
+        .status = @tagName(runtime_connections.agentPairingStatus(state, profile_id)),
+        .notice = if (wizard_on_profile and rc.wizard_open) rc.wizardNotice() else "",
+    });
 }
 
 fn herdrStatusResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState) ![]u8 {

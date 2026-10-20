@@ -241,6 +241,16 @@ pub fn printHelp(out: output.Output) !void {
         \\  verde runtime add-ssh --label <label> --host <ssh-host> [options]
         \\  verde runtime remove --id <profile-id> [--json]
         \\  verde runtime default --workspace <id> [--profile <local|profile-id> | --clear] [--json]
+        \\  verde runtime pair --link <verde://pair link | -> [pair options]
+        \\  verde runtime pair-status --profile <profile-id>
+        \\
+        \\Pair options (needs the Verde app running; the pairing shows in its window):
+        \\  --link -                         Read the link from stdin (keeps the secret out of ps)
+        \\  --label <name>                   Name for the other machine (default: link host)
+        \\  --device-label <name>            How the other machine lists this one (default: hostname)
+        \\  --expect-runtime-id <id>         Trust without the confirm click if the IDs match;
+        \\                                   (result.runtime_id from `verde-daemon pair create --json`)
+        \\  --wait                           Wait until paired, awaiting confirmation, or failed
         \\
         \\SSH options:
         \\  --user <user>                    SSH user (otherwise use SSH config)
