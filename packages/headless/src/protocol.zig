@@ -126,6 +126,13 @@ pub const ERR_PROVIDER_UNAVAILABLE: []const u8 = "provider_unavailable";
 /// client reopens it (`workspace.upsert` with `archived:false`).
 pub const ERR_WORKSPACE_ARCHIVED: []const u8 = "workspace_archived";
 
+/// `error.data.resource` on a route-mode `chat.turn.start` `resource_not_found`:
+/// which runtime precondition is missing. Other not-found causes (such as an
+/// expired attachment id) omit it, so clients classify only tagged errors.
+pub const ERROR_DATA_RESOURCE_KEY: []const u8 = "resource";
+pub const ERROR_RESOURCE_WORKSPACE: []const u8 = "workspace";
+pub const ERROR_RESOURCE_REPOSITORY_BINDING: []const u8 = "repository_binding";
+
 /// Typed protocol error carried inside a response envelope.
 pub const Error = struct {
     code: []const u8,

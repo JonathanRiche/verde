@@ -2524,8 +2524,15 @@ const AcceptanceUploadImage = struct {
 /// leaving Send armed forever.
 const REMOTE_ATTACHMENT_UPLOAD_TIMEOUT_MS: i64 = 300_000;
 
+/// Budget for retrying a plain (no-attachment) chat.turn.start whose
+/// profile RPC slot was busy with a heartbeat or token refresh.
+const REMOTE_TURN_START_BUSY_TIMEOUT_MS: i64 = 15_000;
+
 const AcceptanceUploadState = struct {
     stage: enum { create, append, commit, start_turn } = .create,
+    /// No attachments: this chain only retries chat.turn.start after
+    /// RuntimeRpcBusy, so a deadline miss is not an upload failure.
+    busy_retry_only: bool = false,
     image_index: usize = 0,
     sent_bytes: usize = 0,
     pending_chunk_bytes: usize = 0,
@@ -2710,11 +2717,38 @@ fn classifyLocalAcceptanceFailure(alloc: std.mem.Allocator, dispatch: *Acceptanc
     return if (err == error.DaemonRequestFailed) .rejected else .ambiguous;
 }
 
+/// Records the remote error code (and `data.resource`, when tagged) so a
+/// rejected remote send is diagnosable from logs, not just the UI message.
+fn logRemoteTurnStartFailure(response_json: []const u8, err: anyerror) void {
+    const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, response_json, .{}) catch null;
+    defer if (parsed) |value| value.deinit();
+    const err_object: ?std.json.Value = if (parsed) |value| jsonObjectField(value.value, "error") else null;
+    const data: ?std.json.Value = if (err_object) |value| jsonObjectField(value, "data") else null;
+    const code = if (err_object) |value| jsonStringField(value, "code") else null;
+    const resource = if (data) |value| jsonStringField(value, headless.protocol.ERROR_DATA_RESOURCE_KEY) else null;
+    runtime_log.diagnostic("remote chat.turn.start failed err={s} code={s} resource={s}", .{
+        @errorName(err),
+        code orelse "none",
+        resource orelse "none",
+    });
+}
+
+fn jsonObjectField(value: std.json.Value, key: []const u8) ?std.json.Value {
+    if (value != .object) return null;
+    return value.object.get(key);
+}
+
+fn jsonStringField(value: std.json.Value, key: []const u8) ?[]const u8 {
+    const field = jsonObjectField(value, key) orelse return null;
+    return if (field == .string) field.string else null;
+}
+
 fn classifyRemoteAcceptanceResult(dispatch: *AcceptanceDispatch, result: *RuntimeService.RpcCallResult) AcceptanceOutcome {
     return switch (result.*) {
         .response => |response| blk: {
             ensureJsonRpcOk(std.heap.page_allocator, response.json) catch |err| {
                 dispatch.err = if (response.failure_reason) |reason| remoteAcceptanceFailure(reason) else err;
+                logRemoteTurnStartFailure(response.json, dispatch.err.?);
                 break :blk if (err == error.DaemonRequestFailed) .rejected else .ambiguous;
             };
             break :blk .accepted;
@@ -2798,16 +2832,20 @@ fn stepRemoteAttachmentUpload(dispatch: *AcceptanceDispatch, service: anytype) R
         defer result.deinit();
         up.ticket = null;
         if (monotonicMs() > up.deadline_ms) {
-            dispatch.err = error.RemoteAttachmentUploadFailed;
+            dispatch.err = remoteUploadDeadlineError(up);
             return .failed;
         }
         return consumeRemoteUploadResponse(dispatch, &result);
     }
     if (monotonicMs() > up.deadline_ms) {
-        dispatch.err = error.RemoteAttachmentUploadFailed;
+        dispatch.err = remoteUploadDeadlineError(up);
         return .failed;
     }
     return issueNextRemoteUploadRpc(dispatch, service);
+}
+
+fn remoteUploadDeadlineError(up: *const AcceptanceUploadState) anyerror {
+    return if (up.busy_retry_only) error.RuntimeRpcBusy else error.RemoteAttachmentUploadFailed;
 }
 
 fn consumeRemoteUploadResponse(dispatch: *AcceptanceDispatch, result: *RuntimeService.RpcCallResult) RemoteUploadStep {
@@ -3028,6 +3066,15 @@ test "upload step drains an owned ticket before the deadline can fail the dispat
     try std.testing.expectEqual(RemoteUploadStep.failed, stepRemoteAttachmentUpload(&dispatch, &stub));
     try std.testing.expectEqual(@as(usize, 0), stub.begins);
     try std.testing.expectEqual(error.RemoteAttachmentUploadFailed, dispatch.err.?);
+
+    // Plain-send busy retry: running out of time reports the busy RPC slot,
+    // not an attachment upload failure.
+    stub = .{};
+    dispatch.err = null;
+    dispatch.upload = .{ .stage = .start_turn, .busy_retry_only = true, .deadline_ms = 0 };
+    try std.testing.expectEqual(RemoteUploadStep.failed, stepRemoteAttachmentUpload(&dispatch, &stub));
+    try std.testing.expectEqual(@as(usize, 0), stub.begins);
+    try std.testing.expectEqual(error.RuntimeRpcBusy, dispatch.err.?);
 }
 
 /// Stages daemon acceptance for a just-appended user row without blocking the
@@ -3239,7 +3286,17 @@ pub fn dispatchDaemonAcceptance(
                 .legacy_local => unreachable,
             };
             dispatch.rpc_started_at_ms = monotonicMs();
-            const ticket = service.beginRpc(route.profile_id, "chat.turn.start", params) catch |err| break :blk err;
+            const ticket = service.beginRpc(route.profile_id, "chat.turn.start", params) catch |err| {
+                if (err != error.RuntimeRpcBusy) break :blk err;
+                // A heartbeat or token refresh holds the profile's single RPC
+                // slot. Nothing was sent, so retry from the poll loop instead
+                // of failing the send.
+                dispatch.upload.stage = .start_turn;
+                dispatch.upload.busy_retry_only = true;
+                dispatch.upload.deadline_ms = monotonicMs() + REMOTE_TURN_START_BUSY_TIMEOUT_MS;
+                dispatch.transport = .remote_upload;
+                break :blk null;
+            };
             dispatch.transport = .{ .remote_rpc = .{ .ticket = ticket } };
             break :blk null;
         },

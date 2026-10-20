@@ -7480,12 +7480,7 @@ pub const Daemon = struct {
                 headless.protocol.ERR_CAPABILITY_UNAVAILABLE,
                 "repository checkout is unavailable on this runtime",
             ),
-            error.ResourceNotFound => return try errorResponseAlloc(
-                self.allocator,
-                id_value,
-                headless.protocol.ERR_RESOURCE_NOT_FOUND,
-                "repository binding not found on this runtime",
-            ),
+            error.ResourceNotFound => return try routeNotFoundResponseAlloc(self, self.allocator, id_value, params),
             error.StoreCorrupt => return try errorResponseAlloc(
                 self.allocator,
                 id_value,
@@ -8897,7 +8892,7 @@ pub const Daemon = struct {
             var route = (resolveChatExecutionRoute(self, params) catch |err| return switch (err) {
                 error.InvalidParams, error.RouteAttachmentsUnsupported => try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid repository route params"),
                 error.CapabilityUnavailable => try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "repository checkout is unavailable on this runtime"),
-                error.ResourceNotFound => try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_RESOURCE_NOT_FOUND, "repository binding not found on this runtime"),
+                error.ResourceNotFound => try routeNotFoundResponseAlloc(self, self.allocator, id_value, params),
                 error.StoreCorrupt => try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_STORE_CORRUPT, "store is corrupt"),
                 error.StoreUnavailable => try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_STORE_UNAVAILABLE, "store is unavailable"),
                 error.OutOfMemory => error.OutOfMemory,
@@ -14555,6 +14550,51 @@ const ChatExecutionRouteError = error{
     OutOfMemory,
 };
 
+/// `resource_not_found` for a route that did not resolve, tagged with
+/// `data.resource` so clients can tell a missing workspace from a missing
+/// repository binding and offer setup instead of a generic failure.
+fn routeNotFoundResponseAlloc(
+    daemon: *Daemon,
+    allocator: std.mem.Allocator,
+    id_value: std.json.Value,
+    params: std.json.Value,
+) ![]u8 {
+    const workspace_missing = !routeWorkspaceExists(daemon, params);
+    const resource = if (workspace_missing)
+        headless.protocol.ERROR_RESOURCE_WORKSPACE
+    else
+        headless.protocol.ERROR_RESOURCE_REPOSITORY_BINDING;
+    var data: std.json.ObjectMap = .empty;
+    defer data.deinit(allocator);
+    try data.put(allocator, headless.protocol.ERROR_DATA_RESOURCE_KEY, .{ .string = resource });
+    return errorResponseAllocWithData(
+        allocator,
+        id_value,
+        headless.protocol.ERR_RESOURCE_NOT_FOUND,
+        if (workspace_missing) "workspace not found on this runtime" else "repository binding not found on this runtime",
+        .{ .object = data },
+    );
+}
+
+/// Best effort: a store that cannot answer reports the workspace as present,
+/// so the error degrades to the pre-existing "binding not found" meaning.
+fn routeWorkspaceExists(daemon: *Daemon, params: std.json.Value) bool {
+    if (params != .object) return true;
+    const workspace_id = jsonString(params.object.get("workspace_id") orelse .null) orelse return true;
+    lockDaemon(daemon);
+    const service = daemon.store_service;
+    if (service) |svc| _ = svc.lifetime_pins.fetchAdd(1, .monotonic);
+    daemon.mutex.unlock();
+    const svc = service orelse return true;
+    defer _ = svc.lifetime_pins.fetchSub(1, .monotonic);
+    lockStoreService(svc);
+    defer svc.mutex.unlock();
+    const row = (svc.store.conn.row("select 1 from workspaces where workspace_id = ?1", .{workspace_id}) catch return true) orelse
+        return false;
+    row.deinit();
+    return true;
+}
+
 /// Resolve a client-controlled stable repository identity to this daemon's
 /// exact runtime-local checkout. Route-mode callers cannot supply absolute
 /// execution paths; legacy local callers retain their existing contract.
@@ -17605,6 +17645,61 @@ test "repository-routed chat rejects client paths attachments storeless use and 
     );
     defer no_store.deinit();
     try std.testing.expectError(error.CapabilityUnavailable, resolveChatExecutionRoute(&daemon, no_store.value));
+}
+
+test "routed chat.turn.start tags not-found with the missing resource" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+
+    var daemon = Daemon.initWithPrefPath(allocator, root_buffer[0..root_len]);
+    defer daemon.deinit();
+    try attachTestRuntimeStoreService(&daemon, db_path);
+    defer detachTestStoreService(&daemon);
+    {
+        const service = daemon.store_service.?;
+        lockStoreService(service);
+        defer service.mutex.unlock();
+        _ = try service.store.upsertWorkspace(.{
+            .mutation = .{ .request_key = "route-not-found-workspace", .client_id = "route-not-found-test" },
+            .workspace = .{
+                .workspace_id = "present-workspace",
+                .label = "Present",
+                .path = root_buffer[0..root_len],
+            },
+        });
+    }
+
+    const cases = [_]struct { params: []const u8, resource: []const u8 }{
+        .{
+            .params =
+            \\{"turn_id":"missing-workspace-turn","workspace_id":"missing-workspace","local_thread_id":"t1","repository_id":"primary","provider":"codex","prompt":"hi","thread_title":"T"}
+            ,
+            .resource = headless.protocol.ERROR_RESOURCE_WORKSPACE,
+        },
+        .{
+            .params =
+            \\{"turn_id":"missing-binding-turn","workspace_id":"present-workspace","local_thread_id":"t2","repository_id":"unbound-repository","provider":"codex","prompt":"hi","thread_title":"T"}
+            ,
+            .resource = headless.protocol.ERROR_RESOURCE_REPOSITORY_BINDING,
+        },
+    };
+    for (cases) |case| {
+        const params = try std.json.parseFromSlice(std.json.Value, allocator, case.params, .{});
+        defer params.deinit();
+        const response = try daemon.chatTurnStartResponse(.{ .integer = 1 }, params.value);
+        defer allocator.free(response);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+        defer parsed.deinit();
+        const err_object = parsed.value.object.get("error").?.object;
+        try std.testing.expectEqualStrings(headless.protocol.ERR_RESOURCE_NOT_FOUND, jsonString(err_object.get("code").?).?);
+        const data = err_object.get("data").?.object;
+        try std.testing.expectEqualStrings(case.resource, jsonString(data.get(headless.protocol.ERROR_DATA_RESOURCE_KEY).?).?);
+    }
 }
 
 const TestAttachmentMethod = enum { create, append, commit };

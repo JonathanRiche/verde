@@ -2497,12 +2497,25 @@ fn rpcFailureContext(method: []const u8) RpcFailureContext {
 /// Classifies one valid method-level JSON-RPC error by stable method and code.
 /// Display text is intentionally excluded from this contract.
 pub fn classifyRpcFailure(method: []const u8, code: []const u8) FailureReason {
-    return classifyRpcError(rpcFailureContext(method), code);
+    return classifyRpcError(rpcFailureContext(method), code, null);
 }
 
-fn classifyRpcError(context: RpcFailureContext, code: []const u8) FailureReason {
+/// Like `classifyRpcFailure`, but also reads the structured `error.data`.
+pub fn classifyRpcFailureWithData(method: []const u8, code: []const u8, data: ?std.json.Value) FailureReason {
+    return classifyRpcError(rpcFailureContext(method), code, data);
+}
+
+fn classifyRpcError(context: RpcFailureContext, code: []const u8, data: ?std.json.Value) FailureReason {
     if (context == .repository_manifest_get and
         std.mem.eql(u8, code, headless.protocol.ERR_RESOURCE_NOT_FOUND))
+    {
+        return .workspace_binding_missing;
+    }
+    // chat.turn.start also answers resource_not_found for expired attachment
+    // ids; only a daemon-tagged workspace/binding miss means "set up here".
+    if (context == .chat_turn_start and
+        std.mem.eql(u8, code, headless.protocol.ERR_RESOURCE_NOT_FOUND) and
+        notFoundNamesRouteResource(data))
     {
         return .workspace_binding_missing;
     }
@@ -2548,7 +2561,20 @@ fn classifyRpcResponseFailure(
     var parsed = client.parseResponseWithId(request_id, response_json) catch return null;
     defer parsed.deinit();
     const remote_error = parsed.response.err orelse return null;
-    return classifyRpcError(context, remote_error.code);
+    return classifyRpcError(context, remote_error.code, remote_error.data);
+}
+
+fn notFoundNamesRouteResource(data: ?std.json.Value) bool {
+    const object = switch (data orelse return false) {
+        .object => |object| object,
+        else => return false,
+    };
+    const resource = switch (object.get(headless.protocol.ERROR_DATA_RESOURCE_KEY) orelse return false) {
+        .string => |text| text,
+        else => return false,
+    };
+    return std.mem.eql(u8, resource, headless.protocol.ERROR_RESOURCE_WORKSPACE) or
+        std.mem.eql(u8, resource, headless.protocol.ERROR_RESOURCE_REPOSITORY_BINDING);
 }
 
 fn classifyRpcInspectionError(err: anyerror) connection.FailureKind {
@@ -3296,6 +3322,23 @@ test "typed RPC failure reasons use method and code rather than messages" {
         FailureReason.unknown,
         classifyRpcFailure("chat.turn.start", headless.protocol.ERR_RESOURCE_NOT_FOUND),
     );
+    {
+        var data: std.json.ObjectMap = .empty;
+        defer data.deinit(std.testing.allocator);
+        for ([_][]const u8{ headless.protocol.ERROR_RESOURCE_WORKSPACE, headless.protocol.ERROR_RESOURCE_REPOSITORY_BINDING }) |resource| {
+            try data.put(std.testing.allocator, headless.protocol.ERROR_DATA_RESOURCE_KEY, .{ .string = resource });
+            try std.testing.expectEqual(
+                FailureReason.workspace_binding_missing,
+                classifyRpcFailureWithData("chat.turn.start", headless.protocol.ERR_RESOURCE_NOT_FOUND, .{ .object = data }),
+            );
+        }
+        // Untagged not-found (e.g. an expired attachment id) stays generic.
+        try data.put(std.testing.allocator, headless.protocol.ERROR_DATA_RESOURCE_KEY, .{ .string = "attachment" });
+        try std.testing.expectEqual(
+            FailureReason.unknown,
+            classifyRpcFailureWithData("chat.turn.start", headless.protocol.ERR_RESOURCE_NOT_FOUND, .{ .object = data }),
+        );
+    }
     try std.testing.expectEqual(
         FailureReason.provider_unavailable,
         classifyRpcFailure("chat.turn.start", headless.protocol.ERR_PROVIDER_UNAVAILABLE),
