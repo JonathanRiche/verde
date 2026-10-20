@@ -10312,6 +10312,7 @@ const SessionizerServerContext = struct {
     drain_thread: ?std.Thread = null,
     push_thread: ?std.Thread = null,
     schedule_thread: ?std.Thread = null,
+    origin_backfill_thread: ?std.Thread = null,
     pid_published: bool = false,
 };
 
@@ -10336,6 +10337,11 @@ fn sessionizerServerReady(raw_context: *anyopaque) !void {
     dispatchParentDeliveries(context.daemon);
     context.push_thread = try std.Thread.spawn(.{}, pushSenderThread, .{context});
     context.schedule_thread = try std.Thread.spawn(.{}, schedulerThread, .{context});
+    // Best effort and off the request path: readiness never waits for git.
+    context.origin_backfill_thread = std.Thread.spawn(.{}, originBackfillThread, .{context}) catch |err| blk: {
+        log.warn("origin backfill thread failed to start err={s}", .{@errorName(err)});
+        break :blk null;
+    };
     context.drain_thread = try std.Thread.spawn(.{}, drainSessionsThread, .{DrainThreadContext{
         .daemon = context.daemon,
         .endpoint = context.endpoint,
@@ -10365,10 +10371,10 @@ fn sessionizerServerClosing(raw_context: *anyopaque) void {
     joinDrainThread(context);
     joinPushThread(context);
     joinSchedulerThread(context);
+    joinOriginBackfillThread(context);
     finalizeSessionizerStore(context);
 }
 
-/// Full store mutation surface plus storeStatus (S3) and M4 durable chat reads.
 /// Methods whose `workspace_id` resolves `workspace.attach` aliases: chat
 /// sends plus the thread, transcript and manifest reads and writes a remote
 /// client issues after its first send. Each must serve outside the outer
@@ -10398,6 +10404,7 @@ fn workspaceAliasResolvingMethod(method: []const u8) bool {
     return false;
 }
 
+/// Full store mutation surface plus storeStatus (S3) and M4 durable chat reads.
 fn isStoreMethod(method: []const u8) bool {
     return std.mem.eql(u8, method, store_protocol.METHOD_STATE_SNAPSHOT_REPLACE) or
         std.mem.eql(u8, method, store_protocol.METHOD_APP_STATE_SET) or
@@ -13677,6 +13684,11 @@ fn joinPushThread(context: *SessionizerServerContext) void {
     context.push_thread = null;
 }
 
+fn joinOriginBackfillThread(context: *SessionizerServerContext) void {
+    if (context.origin_backfill_thread) |thread| thread.join();
+    context.origin_backfill_thread = null;
+}
+
 fn joinSchedulerThread(context: *SessionizerServerContext) void {
     if (context.schedule_thread) |thread| thread.join();
     context.schedule_thread = null;
@@ -16216,6 +16228,59 @@ fn localWorkspaceOwningFolder(
 }
 
 const OriginCaptureMode = enum { fill_missing, refresh };
+
+/// Startup origin backfill bounds: workspaces created before origin capture
+/// existed get their `vcs_identity` once, without a client having to touch
+/// each one. Each git call is already bounded by `repo_origin.ORIGIN_TIMEOUT_MS`.
+const ORIGIN_BACKFILL_MAX_REPOSITORIES: usize = 200;
+const ORIGIN_BACKFILL_BUDGET_MS: i64 = 60_000;
+
+fn originBackfillThread(context: *SessionizerServerContext) void {
+    _ = backfillRepositoryOrigins(context.daemon, context.stop_requested, ORIGIN_BACKFILL_MAX_REPOSITORIES, ORIGIN_BACKFILL_BUDGET_MS);
+}
+
+/// Fill a missing `vcs_identity` for every local checkout of every open
+/// workspace, sequentially, through `captureRepositoryOrigins(.fill_missing)`
+/// (compare-and-set writes, one `workspace` change entry per capture, so
+/// connected clients refresh). Stops at `max_repositories` attempted
+/// checkouts, after `budget_ms`, on `stop`, or once the daemon or store
+/// starts draining. Returns the number of checkouts attempted.
+fn backfillRepositoryOrigins(daemon: *Daemon, stop: ?*std.atomic.Value(bool), max_repositories: usize, budget_ms: i64) usize {
+    lockDaemon(daemon);
+    const service = daemon.store_service orelse {
+        daemon.mutex.unlock();
+        return 0;
+    };
+    _ = service.lifetime_pins.fetchAdd(1, .monotonic);
+    daemon.mutex.unlock();
+    defer _ = service.lifetime_pins.fetchSub(1, .monotonic);
+
+    var arena_state: std.heap.ArenaAllocator = .init(daemon.allocator);
+    defer arena_state.deinit();
+    const workspaces = blk: {
+        lockStoreService(service);
+        defer service.mutex.unlock();
+        if (service.draining) return 0;
+        break :blk service.store.loadOriginBackfillWorkspaces(arena_state.allocator(), daemon.runtime_id) catch |err| {
+            log.warn("origin backfill could not list workspaces err={s}", .{@errorName(err)});
+            return 0;
+        };
+    };
+    const deadline_ms = monotonicNowMs() + budget_ms;
+    var attempted: usize = 0;
+    for (workspaces) |workspace| {
+        if (attempted >= max_repositories or monotonicNowMs() >= deadline_ms) break;
+        if (stop) |flag| if (flag.load(.acquire)) break;
+        lockDaemon(daemon);
+        const accepting = daemon.accepting_mutations;
+        daemon.mutex.unlock();
+        if (!accepting) break;
+        attempted += workspace.pending_repositories;
+        _ = captureRepositoryOrigins(daemon, service, workspace.workspace_id, .fill_missing);
+    }
+    if (attempted > 0) log.info("origin backfill attempted={d} workspaces={d}", .{ attempted, workspaces.len });
+    return attempted;
+}
 
 /// Store each local checkout's raw `origin` URL as its repository's
 /// `vcs_identity` (see `daemon/repo_origin.zig`). `fill_missing` never
@@ -23552,4 +23617,64 @@ test "workspace.attach reopens an archived workspace it reuses" {
     defer again.deinit();
     _ = try testAttachResult(again);
     try std.testing.expectEqual(reopened_revision, try store.storeRevision());
+}
+
+test "startup origin backfill fills missing identities of open workspaces and publishes them" {
+    const allocator = std.testing.allocator;
+    var repo = (try repo_origin.TestOriginRepo.init("git@github.com:Owner/Backfill.git")) orelse return error.SkipZigTest;
+    defer repo.deinit();
+    var archived_repo = (try repo_origin.TestOriginRepo.init("https://github.com/owner/archived.git")) orelse return error.SkipZigTest;
+    defer archived_repo.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    try attachTestRuntimeStoreService(&daemon, db_path);
+    defer detachTestStoreService(&daemon);
+    const store = &daemon.store_service.?.store;
+
+    // Store writes skip the RPC capture: these rows look like pre-capture workspaces.
+    _ = try store.upsertWorkspace(.{
+        .mutation = .{ .request_key = "backfill-open", .client_id = "test" },
+        .workspace = .{ .workspace_id = "backfill-open", .label = "Open", .path = repo.root },
+    });
+    _ = try store.upsertWorkspace(.{
+        .mutation = .{ .request_key = "backfill-archived", .client_id = "test" },
+        .workspace = .{ .workspace_id = "backfill-archived", .label = "Archived", .path = archived_repo.root, .archived = true },
+    });
+    const before = try store.storeRevision();
+
+    // A stop request (or a draining daemon) skips the work entirely.
+    var stopped: std.atomic.Value(bool) = .init(true);
+    try std.testing.expectEqual(@as(usize, 0), backfillRepositoryOrigins(&daemon, &stopped, 200, 60_000));
+    daemon.accepting_mutations = false;
+    try std.testing.expectEqual(@as(usize, 0), backfillRepositoryOrigins(&daemon, null, 200, 60_000));
+    daemon.accepting_mutations = true;
+    try std.testing.expectEqual(before, try store.storeRevision());
+
+    try std.testing.expectEqual(@as(usize, 1), backfillRepositoryOrigins(&daemon, null, 200, 60_000));
+    try std.testing.expect(try store.storeRevision() > before);
+    var snapshot = try testOriginRequest(&daemon, allocator,
+        \\{{"jsonrpc":"2.0","id":1,"method":"core.snapshot","params":{{"scopes":["workspaces"]}}}}
+    , .{});
+    defer snapshot.deinit();
+    const workspaces = snapshot.value.object.get("result").?.object.get("snapshot").?.object.get("workspaces").?.array.items;
+    var found = false;
+    for (workspaces) |workspace| {
+        if (!std.mem.eql(u8, workspace.object.get("workspace_id").?.string, "backfill-open")) continue;
+        found = true;
+        const primary = testOriginRepository(workspace.object.get("repositories").?, "primary").?;
+        try std.testing.expectEqualStrings("git@github.com:Owner/Backfill.git", primary.get("vcs_identity").?.string);
+    }
+    try std.testing.expect(found);
+    // Archived workspaces are left alone, and a second run finds nothing to do.
+    const archived = (try store.conn.row(
+        "select r.vcs_identity from workspace_repositories r join workspaces w on w.id = r.workspace_id where w.workspace_id = 'backfill-archived'",
+        .{},
+    )).?;
+    defer archived.deinit();
+    try std.testing.expect(archived.nullableText(0) == null);
+    try std.testing.expectEqual(@as(usize, 0), backfillRepositoryOrigins(&daemon, null, 200, 60_000));
 }

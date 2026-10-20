@@ -1064,6 +1064,41 @@ pub const Store = struct {
         return roots.toOwnedSlice(allocator) catch return error.OutOfMemory;
     }
 
+    /// A workspace with local checkouts still missing a captured origin.
+    pub const OriginBackfillWorkspace = struct {
+        workspace_id: []const u8,
+        pending_repositories: usize,
+    };
+
+    /// Non-archived workspaces whose repositories have a checkout on
+    /// `runtime_id` but no `vcs_identity`, in sidebar order: the startup
+    /// origin backfill's work list. Results are owned by `allocator`.
+    pub fn loadOriginBackfillWorkspaces(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        runtime_id: []const u8,
+    ) StoreError![]OriginBackfillWorkspace {
+        if (!validRuntimeId(runtime_id)) return error.InvalidParams;
+        var workspaces: std.ArrayListUnmanaged(OriginBackfillWorkspace) = .empty;
+        var rows = self.conn.rows(
+            "select workspace.workspace_id, count(*) from workspaces workspace " ++
+                "join workspace_repositories repository on repository.workspace_id = workspace.id " ++
+                "join workspace_repository_bindings binding on binding.repository_row_id = repository.id " ++
+                "where workspace.archived = 0 and repository.vcs_identity is null and binding.runtime_id = ?1 " ++
+                "group by workspace.id order by workspace.sort_index, workspace.workspace_id",
+            .{runtime_id},
+        ) catch |err| return mapStoreError(err);
+        defer rows.deinit();
+        while (rows.next()) |row| {
+            workspaces.append(allocator, .{
+                .workspace_id = allocator.dupe(u8, row.text(0)) catch return error.OutOfMemory,
+                .pending_repositories = std.math.cast(usize, row.int(1)) orelse 0,
+            }) catch return error.OutOfMemory;
+        }
+        if (rows.err) |err| return mapStoreError(err);
+        return workspaces.toOwnedSlice(allocator) catch return error.OutOfMemory;
+    }
+
     /// Daemon-internal compare-and-set of one repository's `vcs_identity`
     /// (origin capture). Writes only while the stored value still equals
     /// `expected`, so a concurrent explicit client write always wins. Returns
