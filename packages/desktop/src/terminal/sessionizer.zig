@@ -50,6 +50,7 @@ const stack = @import("../workspace/stack.zig");
 const platform_runtime = @import("platform_runtime");
 const directory_browser = @import("../daemon/directory_browser.zig");
 const repo_origin = @import("../daemon/repo_origin.zig");
+const repo_identity = @import("verde_remote").repo_identity;
 const workspace_files = @import("../daemon/workspace_files.zig");
 const workspace_files_protocol = headless.workspace_files_protocol;
 const process_env = @import("../platform/env.zig");
@@ -2917,6 +2918,7 @@ pub const Daemon = struct {
         if (try self.requestTargetRejection(id_value, parsed.value.object.get("target"))) |response| {
             return response;
         }
+        try self.resolveWorkspaceAliasParam(parsed.arena.allocator(), method, params);
 
         const response = self.handleMethodRequest(id_value, method, params) catch |err| switch (err) {
             error.SessionNotFound => try errorResponseAlloc(self.allocator, id_value, "resource_not_found", "session not found"),
@@ -2928,6 +2930,36 @@ pub const Daemon = struct {
             return try errorResponseAlloc(self.allocator, id_value, "response_too_large", "response exceeds transport limit");
         }
         return response;
+    }
+
+    /// Rewrite `params.workspace_id` from a `workspace.attach` alias to its
+    /// canonical workspace, so chats sent with either ID land in the same
+    /// workspace. Only for chat/thread methods that serve without the outer
+    /// lockDaemon window (store or unlocked class): this takes lockDaemon and
+    /// the store mutex itself. Best effort: a store that cannot answer leaves
+    /// the ID untouched, and the method reports its usual not-found error.
+    fn resolveWorkspaceAliasParam(self: *Daemon, arena: std.mem.Allocator, method: []const u8, params: std.json.Value) !void {
+        if (params != .object or !workspaceAliasResolvingMethod(method)) return;
+        const slot = params.object.getPtr("workspace_id") orelse return;
+        const workspace_id = switch (slot.*) {
+            .string => |text| text,
+            else => return,
+        };
+        lockDaemon(self);
+        const service = self.store_service;
+        if (service) |svc| _ = svc.lifetime_pins.fetchAdd(1, .monotonic);
+        self.mutex.unlock();
+        const svc = service orelse return;
+        defer _ = svc.lifetime_pins.fetchSub(1, .monotonic);
+        const canonical = blk: {
+            lockStoreService(svc);
+            defer svc.mutex.unlock();
+            break :blk svc.store.resolveWorkspaceAlias(arena, workspace_id) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return,
+            };
+        } orelse return;
+        slot.* = .{ .string = canonical };
     }
 
     /// Validate an explicitly targeted request before any method-specific
@@ -2965,6 +2997,7 @@ pub const Daemon = struct {
         // lockDaemon for SQLite work; route before the generic mutator drain gate.
         if (std.mem.eql(u8, method, "workspace.create")) return try workspaceCreateResponse(self, id_value, params);
         if (std.mem.eql(u8, method, directory_browser.METHOD)) return try workspaceDirectoryListResponse(self, id_value, params);
+        if (std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_ATTACH)) return try workspaceAttachResponse(self, id_value, params);
         if (std.mem.eql(u8, method, workspace_files_protocol.METHOD_LIST) or std.mem.eql(u8, method, workspace_files_protocol.METHOD_READ)) return try workspaceFilesBrowseResponse(self, id_value, method, params);
         if (std.mem.eql(u8, method, "workspace.close")) return try self.workspaceCloseResponse(id_value, params);
         if (std.mem.eql(u8, method, "chat.subagent.open")) return try self.chatSubagentOpenResponse(id_value, params);
@@ -10336,6 +10369,35 @@ fn sessionizerServerClosing(raw_context: *anyopaque) void {
 }
 
 /// Full store mutation surface plus storeStatus (S3) and M4 durable chat reads.
+/// Methods whose `workspace_id` resolves `workspace.attach` aliases: chat
+/// sends plus the thread, transcript and manifest reads and writes a remote
+/// client issues after its first send. Each must serve outside the outer
+/// lockDaemon window; `resolveWorkspaceAliasParam` takes that lock itself.
+fn workspaceAliasResolvingMethod(method: []const u8) bool {
+    const methods = [_][]const u8{
+        "chat.turn.start",
+        "chat.followup",
+        "chat.subagent.open",
+        store_protocol.METHOD_CHAT_SHELL_RUN,
+        store_protocol.METHOD_WORKSPACE_REPOSITORY_MANIFEST_GET,
+        store_protocol.METHOD_CHAT_THREAD_GET,
+        store_protocol.METHOD_CHAT_THREAD_LIST,
+        store_protocol.METHOD_CHAT_MESSAGE_LIST,
+        store_protocol.METHOD_CHAT_TURN_RECORD,
+        store_protocol.METHOD_CHAT_THREAD_UPSERT,
+        store_protocol.METHOD_CHAT_THREAD_ARCHIVE_SET,
+        store_protocol.METHOD_CHAT_THREAD_CLOSE,
+        store_protocol.METHOD_CHAT_DRAFT_SET,
+        store_protocol.METHOD_CHAT_MESSAGE_APPEND,
+        workspace_files_protocol.METHOD_LIST,
+        workspace_files_protocol.METHOD_READ,
+    };
+    for (methods) |candidate| {
+        if (std.mem.eql(u8, method, candidate)) return isStoreMethod(method) or methodRunsUnlocked(method);
+    }
+    return false;
+}
+
 fn isStoreMethod(method: []const u8) bool {
     return std.mem.eql(u8, method, store_protocol.METHOD_STATE_SNAPSHOT_REPLACE) or
         std.mem.eql(u8, method, store_protocol.METHOD_APP_STATE_SET) or
@@ -11615,6 +11677,8 @@ fn freeWorkspaceListItem(allocator: std.mem.Allocator, item: store_protocol.Work
     allocator.free(item.default_repository_id);
     for (item.repositories) |repository| freeRepository(allocator, repository);
     if (item.repositories.len > 0) allocator.free(item.repositories);
+    for (item.aliases) |alias| allocator.free(alias);
+    if (item.aliases.len > 0) allocator.free(item.aliases);
 }
 
 fn loadWorkspaceListResult(
@@ -11654,6 +11718,11 @@ fn loadWorkspaceListResult(
         // Transfer its allocations into the list item after append succeeds.
         var manifest = try store.loadWorkspaceRepositoryManifest(workspace_id);
         errdefer manifest.deinit(allocator);
+        const aliases = try store.loadWorkspaceAliases(allocator, workspace_id);
+        errdefer {
+            for (aliases) |alias| allocator.free(alias);
+            allocator.free(aliases);
+        }
         items.append(allocator, .{
             .workspace_id = workspace_id,
             .label = label,
@@ -11662,6 +11731,7 @@ fn loadWorkspaceListResult(
             .archived = row.int(4) != 0,
             .repositories = manifest.repositories,
             .default_repository_id = manifest.default_repository_id,
+            .aliases = aliases,
         }) catch return error.OutOfMemory;
         allocator.free(manifest.workspace_id);
     }
@@ -12590,6 +12660,12 @@ fn loadSnapshotContents(
             error.StoreUnavailable, error.StoreBusy => |e| return e,
             else => &.{},
         };
+        // `workspace.attach` aliases: other IDs that land in this workspace.
+        workspace_row.workspace.aliases = store.loadWorkspaceAliases(arena, workspace_row.workspace.workspace_id) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.StoreUnavailable, error.StoreBusy => |e| return e,
+            else => &.{},
+        };
     }
 
     // Phase 2: threads per workspace, then messages per thread (statements
@@ -13213,6 +13289,8 @@ fn methodRunsUnlocked(method: []const u8) bool {
     // mutex only; the `.normal` outer lockDaemon window cannot nest that work.
     return std.mem.eql(u8, method, "workspace.create") or std.mem.eql(u8, method, "workspace.close") or std.mem.eql(u8, method, "chat.subagent.open") or
         std.mem.eql(u8, method, directory_browser.METHOD) or
+        // Folder validation and `git remote get-url` run with no lock held.
+        std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_ATTACH) or
         // Explorer listing/preview: a short store read, then filesystem and
         // `git check-ignore` work with no lock held.
         std.mem.eql(u8, method, workspace_files_protocol.METHOD_LIST) or
@@ -15861,24 +15939,48 @@ fn workspaceDirectoryListWithEnvironment(daemon: *Daemon, id_value: std.json.Val
     var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    var roots: std.ArrayList([]const u8) = .empty;
-    var workspace_paths: std.ArrayList([]const u8) = .empty;
     lockDaemon(daemon);
     const service = daemon.store_service;
     if (service) |svc| _ = svc.in_flight.fetchAdd(1, .monotonic);
     daemon.mutex.unlock();
     const svc = service orelse return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_STORE_UNAVAILABLE, "store is unavailable");
     defer _ = svc.in_flight.fetchSub(1, .monotonic);
+    const roots = directoryRootsAlloc(arena, io, svc, home, configured_roots) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.StoreUnavailable => return try storeErrorResponse(allocator, id_value, error.StoreUnavailable),
+    };
+    const result = directory_browser.list(arena, io, roots, path orelse (if (roots.len > 0) roots[0] else return try errorResponseAlloc(allocator, id_value, "not_found", "no folders are available"))) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.ResponseTooLarge => error.ResponseTooLarge,
+        error.FileNotFound, error.NotDir => try errorResponseAlloc(allocator, id_value, "not_found", "directory not found"),
+        else => try errorResponseAlloc(allocator, id_value, "path_outside_roots", "directory is outside allowed roots or inaccessible"),
+    };
+    // Bounded: only `.git` entries, capped call count and git time budget.
+    repo_origin.annotateEntries(arena, @constCast(result.directories));
+    return try okValueResponse(allocator, id_value, result);
+}
+
+/// Roots `workspace.directory.list` may browse and `workspace.attach` may
+/// bind: HOME, each workspace folder's parent, and VERDE_DIRECTORY_ROOTS.
+/// Only persisted host state and the environment supply roots; RPC params
+/// cannot widen policy. Filesystem work happens outside the SQLite mutex.
+fn directoryRootsAlloc(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    svc: *StoreService,
+    home: ?[]const u8,
+    configured_roots: ?[]const u8,
+) error{ OutOfMemory, StoreUnavailable }![]const []const u8 {
+    var roots: std.ArrayList([]const u8) = .empty;
+    var workspace_paths: std.ArrayList([]const u8) = .empty;
     {
         lockStoreService(svc);
         defer svc.mutex.unlock();
-        var rows = svc.store.conn.rows("select path from workspaces", .{}) catch return try storeErrorResponse(allocator, id_value, error.StoreUnavailable);
+        var rows = svc.store.conn.rows("select path from workspaces", .{}) catch return error.StoreUnavailable;
         defer rows.deinit();
         while (rows.next()) |row| try workspace_paths.append(arena, try arena.dupe(u8, row.text(0)));
-        if (rows.err) |_| return try storeErrorResponse(allocator, id_value, error.StoreUnavailable);
+        if (rows.err) |_| return error.StoreUnavailable;
     }
-    // Only persisted host state/environment supplies roots; RPC params cannot
-    // widen policy. Filesystem operations happen outside the SQLite mutex.
     if (home) |value| try directory_browser.appendRoot(arena, io, &roots, value);
     for (workspace_paths.items) |workspace_path| {
         if (!directory_browser.validPath(workspace_path)) continue;
@@ -15892,15 +15994,225 @@ fn workspaceDirectoryListWithEnvironment(daemon: *Daemon, id_value: std.json.Val
         var paths = std.mem.tokenizeScalar(u8, configured, ':');
         while (paths.next()) |root| try directory_browser.appendRoot(arena, io, &roots, root);
     }
-    const result = directory_browser.list(arena, io, roots.items, path orelse (if (roots.items.len > 0) roots.items[0] else return try errorResponseAlloc(allocator, id_value, "not_found", "no folders are available"))) catch |err| return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.ResponseTooLarge => error.ResponseTooLarge,
-        error.FileNotFound, error.NotDir => try errorResponseAlloc(allocator, id_value, "not_found", "directory not found"),
-        else => try errorResponseAlloc(allocator, id_value, "path_outside_roots", "directory is outside allowed roots or inaccessible"),
+    return roots.items;
+}
+
+/// `workspace.attach`: validate a folder on this runtime and make it a
+/// workspace's checkout in one idempotent call (what `verde-daemon workspace
+/// bind` does with upsert → bind → default). See
+/// docs/multi-machine-workspaces.md, "New RPC: workspace.attach".
+fn workspaceAttachResponse(daemon: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+    return workspaceAttachWithEnvironment(daemon, id_value, params, if (std.c.getenv("HOME")) |value| std.mem.span(value) else null, if (std.c.getenv(directory_browser.ROOTS_ENV)) |value| std.mem.span(value) else null);
+}
+
+fn workspaceAttachWithEnvironment(daemon: *Daemon, id_value: std.json.Value, params: std.json.Value, home: ?[]const u8, configured_roots: ?[]const u8) ![]u8 {
+    const allocator = daemon.allocator;
+    const protocol = headless.protocol;
+    // Drain gate first (outranks invalid_params), like every store mutator.
+    lockDaemon(daemon);
+    if (!daemon.accepting_mutations) {
+        daemon.mutex.unlock();
+        return try errorResponseAlloc(allocator, id_value, protocol.ERR_INVALID_STATE, "daemon is preparing shutdown and is not accepting mutations");
+    }
+    daemon.mutex.unlock();
+
+    var arena_state: std.heap.ArenaAllocator = .init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const request = std.json.parseFromValueLeaky(store_protocol.WorkspaceAttachRequest, arena, params, .{ .ignore_unknown_fields = true }) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return try errorResponseAlloc(allocator, id_value, protocol.ERR_INVALID_PARAMS, "invalid params");
     };
-    // Bounded: only `.git` entries, capped call count and git time budget.
-    repo_origin.annotateEntries(arena, @constCast(result.directories));
-    return try okValueResponse(allocator, id_value, result);
+    const role_primary = std.mem.eql(u8, request.role, store_protocol.WORKSPACE_ATTACH_ROLE_PRIMARY);
+    if (!role_primary and !std.mem.eql(u8, request.role, store_protocol.WORKSPACE_ATTACH_ROLE_CONTEXT)) {
+        return try errorResponseAlloc(allocator, id_value, protocol.ERR_INVALID_PARAMS, "role must be primary or context");
+    }
+    // The primary role is the workspace's own folder, whose repository is
+    // always `primary`; extra repositories attach with the context role.
+    if (role_primary != std.mem.eql(u8, request.repository_id, store_protocol.PRIMARY_REPOSITORY_ID)) {
+        return try errorResponseAlloc(allocator, id_value, protocol.ERR_INVALID_PARAMS, "repository_id must be primary exactly when role is primary");
+    }
+    if (!daemon_store.validWorkspaceId(request.workspace_id) or !daemon_store.validRouteId(request.repository_id) or request.label.len == 0) {
+        return try errorResponseAlloc(allocator, id_value, protocol.ERR_INVALID_PARAMS, "invalid params");
+    }
+    if (!directory_browser.validPath(request.root_path)) {
+        return try errorResponseAlloc(allocator, id_value, protocol.ERR_INVALID_PARAMS, "root_path must be absolute without parent traversal");
+    }
+
+    lockDaemon(daemon);
+    if (!daemon.accepting_mutations) {
+        daemon.mutex.unlock();
+        return try errorResponseAlloc(allocator, id_value, protocol.ERR_INVALID_STATE, "daemon is preparing shutdown and is not accepting mutations");
+    }
+    if (daemon.registry.client(request.mutation.client_id) == null) {
+        daemon.mutex.unlock();
+        return try errorResponseAlloc(allocator, id_value, protocol.ERR_INVALID_PARAMS, "unknown client_id");
+    }
+    const service = daemon.store_service orelse {
+        daemon.mutex.unlock();
+        return try errorResponseAlloc(allocator, id_value, protocol.ERR_CAPABILITY_UNAVAILABLE, "store capability is unavailable");
+    };
+    _ = service.in_flight.fetchAdd(1, .monotonic);
+    daemon.mutex.unlock();
+    defer _ = service.in_flight.fetchSub(1, .monotonic);
+
+    // 1. The folder: a real directory beneath the browsable roots. Its
+    //    canonical path is what gets stored and compared.
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const roots = directoryRootsAlloc(arena, io, service, home, configured_roots) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.StoreUnavailable => return try storeErrorResponse(allocator, id_value, error.StoreUnavailable),
+    };
+    const root_path = directory_browser.resolveDirectory(arena, io, roots, request.root_path) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.FileNotFound, error.NotDir => try errorResponseAlloc(allocator, id_value, protocol.ERR_NOT_FOUND, "folder not found on this runtime"),
+        else => try errorResponseAlloc(allocator, id_value, protocol.ERR_PATH_OUTSIDE_ROOTS, "folder is outside allowed roots or inaccessible"),
+    };
+
+    // 2. Its origin (git runs with no lock held), checked against the caller's
+    //    repository by normalized identity when the caller sent one.
+    const git_identity: ?[]const u8 = blk: {
+        var git_arena_state: std.heap.ArenaAllocator = .init(allocator);
+        defer git_arena_state.deinit();
+        var git = git_changes.Git.init(git_arena_state.allocator()) catch break :blk null;
+        defer git.deinit();
+        const origin = repo_origin.read(&git, root_path, repo_origin.ORIGIN_TIMEOUT_MS) orelse break :blk null;
+        break :blk try arena.dupe(u8, origin);
+    };
+    if (request.expect_identity) |expected| {
+        const actual = git_identity orelse
+            return try errorResponseAlloc(allocator, id_value, protocol.ERR_IDENTITY_MISMATCH, "folder has no git origin");
+        if (!repo_identity.sameRepository(expected, actual)) {
+            return try errorResponseAlloc(allocator, id_value, protocol.ERR_IDENTITY_MISMATCH, "folder's git origin is a different repository");
+        }
+    }
+
+    // 3. Register the folder, reusing the workspace that already owns it.
+    const client_id = request.mutation.client_id;
+    var workspace_id = request.workspace_id;
+    var reused = false;
+    if (role_primary) {
+        const owner = try localWorkspaceOwningFolder(daemon, service, arena, io, root_path, request.workspace_id) orelse
+            return try storeErrorResponse(allocator, id_value, error.StoreUnavailable);
+        if (owner.workspace_id) |existing| {
+            if (!std.mem.eql(u8, existing, request.workspace_id)) {
+                const revision = blk: {
+                    lockStoreService(service);
+                    defer service.mutex.unlock();
+                    break :blk service.store.setWorkspaceAlias(request.workspace_id, existing, platform_runtime.unixTimestampMs()) catch |err| switch (err) {
+                        error.Conflict => return try errorResponseAlloc(allocator, id_value, protocol.ERR_CONFLICT, "workspace_id already names a different workspace on this runtime"),
+                        else => |e| return try storeErrorResponse(allocator, id_value, e),
+                    };
+                };
+                if (revision) |value| daemon.appendJournalEntry(.workspace, existing, existing, .{ .store = value });
+                workspace_id = existing;
+                reused = true;
+            }
+        } else {
+            lockStoreService(service);
+            defer service.mutex.unlock();
+            const existing = service.store.workspaceArchived(request.workspace_id) catch |err|
+                return try storeErrorResponse(allocator, id_value, err);
+            if (existing != null) {
+                return try errorResponseAlloc(allocator, id_value, protocol.ERR_CONFLICT, "workspace_id already exists on this runtime with a different folder");
+            }
+            _ = service.store.applyMutation(.{ .workspace_upsert = .{
+                .mutation = .{ .request_key = try std.fmt.allocPrint(arena, "{s}:attach:workspace", .{request.mutation.request_key}), .client_id = client_id },
+                .workspace = .{ .workspace_id = request.workspace_id, .label = request.label, .path = root_path },
+            } }) catch |err| return try storeErrorResponse(allocator, id_value, err);
+            // The ID names its own workspace now; a stale alias row never resolves.
+            service.store.clearWorkspaceAlias(request.workspace_id) catch {};
+        }
+    } else {
+        // Context folders join an existing workspace, named directly or by alias.
+        const target: ?[]const u8 = blk: {
+            lockStoreService(service);
+            defer service.mutex.unlock();
+            const direct = service.store.workspaceArchived(request.workspace_id) catch |err|
+                return try storeErrorResponse(allocator, id_value, err);
+            if (direct != null) break :blk request.workspace_id;
+            break :blk service.store.resolveWorkspaceAlias(arena, request.workspace_id) catch |err|
+                return try storeErrorResponse(allocator, id_value, err);
+        };
+        // Tagged `resource: workspace`, like chat.turn.start's missing route.
+        workspace_id = target orelse return try routeNotFoundResponseAlloc(daemon, allocator, id_value, params);
+        reused = !std.mem.eql(u8, workspace_id, request.workspace_id);
+        lockStoreService(service);
+        defer service.mutex.unlock();
+        _ = service.store.applyMutation(.{ .workspace_repository_upsert = .{
+            .mutation = .{ .request_key = try std.fmt.allocPrint(arena, "{s}:attach:repository", .{request.mutation.request_key}), .client_id = client_id },
+            .workspace_id = workspace_id,
+            .repository = .{ .repository_id = request.repository_id, .label = request.label, .vcs_identity = git_identity },
+        } }) catch |err| return try storeErrorResponse(allocator, id_value, err);
+        _ = service.store.applyMutation(.{ .workspace_repository_binding_upsert = .{
+            .mutation = .{ .request_key = try std.fmt.allocPrint(arena, "{s}:attach:binding", .{request.mutation.request_key}), .client_id = client_id },
+            .workspace_id = workspace_id,
+            .repository_id = request.repository_id,
+            .binding = .{ .runtime_id = daemon.runtime_id, .root_path = root_path, .availability = "available" },
+        } }) catch |err| return try storeErrorResponse(allocator, id_value, err);
+    }
+    // Attaching is an explicit user action: an archived target reopens, so
+    // the chats this call enables are not refused with workspace_archived.
+    const reopened = blk: {
+        lockStoreService(service);
+        defer service.mutex.unlock();
+        break :blk service.store.reopenWorkspace(workspace_id) catch |err| return try storeErrorResponse(allocator, id_value, err);
+    };
+    if (reopened) |revision| daemon.appendJournalEntry(.workspace, workspace_id, workspace_id, .{ .store = revision });
+    _ = captureRepositoryOrigins(daemon, service, workspace_id, .fill_missing);
+
+    const store_revision = blk: {
+        lockStoreService(service);
+        defer service.mutex.unlock();
+        break :blk service.store.storeRevision() catch |err| return try storeErrorResponse(allocator, id_value, err);
+    };
+    return try okValueResponse(allocator, id_value, store_protocol.WorkspaceAttachResult{
+        .workspace_id = workspace_id,
+        .repository_id = request.repository_id,
+        .root_path = root_path,
+        .git_identity = git_identity,
+        .store_revision = store_revision,
+        .reused = reused,
+    });
+}
+
+/// The workspace on this runtime whose primary folder is `root_path` (already
+/// canonical), or `.workspace_id = null` when none. Stored paths are compared
+/// exactly first, then by their own canonical path, so a symlinked or
+/// unnormalized stored folder still counts. When several workspaces share the
+/// folder (legacy duplicates) the caller's own ID wins, then the smallest ID.
+/// Null when the store cannot answer.
+fn localWorkspaceOwningFolder(
+    daemon: *Daemon,
+    service: *StoreService,
+    arena: std.mem.Allocator,
+    io: std.Io,
+    root_path: []const u8,
+    preferred_workspace_id: []const u8,
+) !?struct { workspace_id: ?[]const u8 } {
+    const known = blk: {
+        lockStoreService(service);
+        defer service.mutex.unlock();
+        break :blk service.store.loadLocalWorkspacePaths(arena, daemon.runtime_id) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        };
+    };
+    var best: ?[]const u8 = null;
+    for (known) |entry| {
+        const same = std.mem.eql(u8, entry.path, root_path) or same: {
+            if (!directory_browser.validPath(entry.path)) break :same false;
+            var buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const len = std.Io.Dir.realPathFileAbsolute(io, entry.path, &buffer) catch break :same false;
+            break :same std.mem.eql(u8, buffer[0..len], root_path);
+        };
+        if (!same) continue;
+        if (std.mem.eql(u8, entry.workspace_id, preferred_workspace_id)) return .{ .workspace_id = entry.workspace_id };
+        if (best == null or std.mem.lessThan(u8, entry.workspace_id, best.?)) best = entry.workspace_id;
+    }
+    return .{ .workspace_id = best };
 }
 
 const OriginCaptureMode = enum { fill_missing, refresh };
@@ -22928,4 +23240,316 @@ test "workspace origin is captured on upsert and bind, refreshed on manifest.get
     const manifest_repositories = manifest.value.object.get("result").?.object.get("repositories").?;
     try std.testing.expectEqualStrings("ssh://git@github.com/owner/renamed.git", testOriginRepository(manifest_repositories, "primary").?.get("vcs_identity").?.string);
     try std.testing.expectEqualStrings("https://github.com/owner/api.git", testOriginRepository(manifest_repositories, "api").?.get("vcs_identity").?.string);
+}
+
+/// Calls `workspace.attach` with `roots` as VERDE_DIRECTORY_ROOTS and no HOME,
+/// so the policy never depends on the test host. The response stays parsed
+/// whether it is a result or an error.
+fn testAttachRequest(daemon: *Daemon, allocator: std.mem.Allocator, roots: []const u8, comptime params_format: []const u8, args: anytype) !std.json.Parsed(std.json.Value) {
+    const params_json = try std.fmt.allocPrint(allocator, params_format, args);
+    defer allocator.free(params_json);
+    var params = try std.json.parseFromSlice(std.json.Value, allocator, params_json, .{});
+    defer params.deinit();
+    const response = try workspaceAttachWithEnvironment(daemon, .{ .integer = 1 }, params.value, null, roots);
+    defer allocator.free(response);
+    return std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+}
+
+fn testAttachResult(parsed: std.json.Parsed(std.json.Value)) !std.json.ObjectMap {
+    const result = parsed.value.object.get("result") orelse {
+        std.debug.print("unexpected attach response: {f}\n", .{std.json.fmt(parsed.value, .{})});
+        return error.TestUnexpectedResult;
+    };
+    return result.object;
+}
+
+fn testAttachErrorCode(parsed: std.json.Parsed(std.json.Value)) []const u8 {
+    const err = parsed.value.object.get("error") orelse return "";
+    return err.object.get("code").?.string;
+}
+
+fn testWorkspaceRowCount(daemon: *Daemon) !i64 {
+    const row = (try daemon.store_service.?.store.conn.row("select count(*) from workspaces", .{})).?;
+    defer row.deinit();
+    return row.int(0);
+}
+
+test "workspace.attach creates the caller's workspace, is idempotent, and aliases a second id for the same folder" {
+    const allocator = std.testing.allocator;
+    var repo = (try repo_origin.TestOriginRepo.init("git@github.com:Owner/Repo.git")) orelse return error.SkipZigTest;
+    defer repo.deinit();
+    const roots = std.fs.path.dirname(repo.root).?;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    try attachTestRuntimeStoreService(&daemon, db_path);
+    defer detachTestStoreService(&daemon);
+    const client_id = try registerTestClientId(&daemon, allocator);
+    defer allocator.free(client_id);
+    try std.testing.expect(methodRunsUnlocked(store_protocol.METHOD_WORKSPACE_ATTACH));
+
+    // New folder: the workspace is created with the caller's id. An https
+    // expectation matches the scp-style origin (normalized compare).
+    var created = try testAttachRequest(&daemon, allocator, roots,
+        \\{{"mutation":{{"request_key":"attach-1","client_id":"{s}"}},"workspace_id":"src-ws","label":"Repo","repository_id":"primary","role":"primary","root_path":"{s}","expect_identity":"https://github.com/owner/repo"}}
+    , .{ client_id, repo.root });
+    defer created.deinit();
+    const created_result = try testAttachResult(created);
+    try std.testing.expectEqualStrings("src-ws", created_result.get("workspace_id").?.string);
+    try std.testing.expectEqualStrings("primary", created_result.get("repository_id").?.string);
+    try std.testing.expectEqualStrings(repo.root, created_result.get("root_path").?.string);
+    try std.testing.expectEqualStrings("git@github.com:Owner/Repo.git", created_result.get("git_identity").?.string);
+    try std.testing.expect(!created_result.get("reused").?.bool);
+    try std.testing.expectEqual(@as(i64, 1), try testWorkspaceRowCount(&daemon));
+
+    // Re-running the same call changes nothing.
+    var again = try testAttachRequest(&daemon, allocator, roots,
+        \\{{"mutation":{{"request_key":"attach-2","client_id":"{s}"}},"workspace_id":"src-ws","label":"Repo","role":"primary","root_path":"{s}/"}}
+    , .{ client_id, repo.root });
+    defer again.deinit();
+    const again_result = try testAttachResult(again);
+    try std.testing.expectEqualStrings("src-ws", again_result.get("workspace_id").?.string);
+    try std.testing.expect(!again_result.get("reused").?.bool);
+    try std.testing.expectEqual(created_result.get("store_revision").?.integer, again_result.get("store_revision").?.integer);
+
+    // Another id for the same folder reuses the workspace by its path.
+    var aliased = try testAttachRequest(&daemon, allocator, roots,
+        \\{{"mutation":{{"request_key":"attach-3","client_id":"{s}"}},"workspace_id":"other-ws","label":"Other","role":"primary","root_path":"{s}"}}
+    , .{ client_id, repo.root });
+    defer aliased.deinit();
+    const aliased_result = try testAttachResult(aliased);
+    try std.testing.expectEqualStrings("src-ws", aliased_result.get("workspace_id").?.string);
+    try std.testing.expect(aliased_result.get("reused").?.bool);
+    try std.testing.expect(aliased_result.get("store_revision").?.integer > created_result.get("store_revision").?.integer);
+    var aliased_again = try testAttachRequest(&daemon, allocator, roots,
+        \\{{"mutation":{{"request_key":"attach-4","client_id":"{s}"}},"workspace_id":"other-ws","label":"Other","role":"primary","root_path":"{s}"}}
+    , .{ client_id, repo.root });
+    defer aliased_again.deinit();
+    const aliased_again_result = try testAttachResult(aliased_again);
+    try std.testing.expect(aliased_again_result.get("reused").?.bool);
+    try std.testing.expectEqual(aliased_result.get("store_revision").?.integer, aliased_again_result.get("store_revision").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), try testWorkspaceRowCount(&daemon));
+
+    // Both workspace views expose the alias; manifest.get answers for it.
+    var snapshot = try testOriginRequest(&daemon, allocator,
+        \\{{"jsonrpc":"2.0","id":3,"method":"core.snapshot","params":{{"scopes":["workspaces"]}}}}
+    , .{});
+    defer snapshot.deinit();
+    const snapshot_workspace = snapshot.value.object.get("result").?.object.get("snapshot").?.object.get("workspaces").?.array.items[0].object;
+    try std.testing.expectEqualStrings("src-ws", snapshot_workspace.get("workspace_id").?.string);
+    const snapshot_aliases = snapshot_workspace.get("aliases").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), snapshot_aliases.len);
+    try std.testing.expectEqualStrings("other-ws", snapshot_aliases[0].string);
+    var listed = try testOriginRequest(&daemon, allocator,
+        \\{{"jsonrpc":"2.0","id":4,"method":"workspace.list","params":{{}}}}
+    , .{});
+    defer listed.deinit();
+    const listed_aliases = listed.value.object.get("result").?.object.get("workspaces").?.array.items[0].object.get("aliases").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), listed_aliases.len);
+    try std.testing.expectEqualStrings("other-ws", listed_aliases[0].string);
+    var manifest = try testOriginRequest(&daemon, allocator,
+        \\{{"jsonrpc":"2.0","id":5,"method":"workspace.repository.manifest.get","params":{{"workspace_id":"other-ws"}}}}
+    , .{});
+    defer manifest.deinit();
+    try std.testing.expectEqualStrings("src-ws", manifest.value.object.get("result").?.object.get("workspace_id").?.string);
+    const primary = testOriginRepository(manifest.value.object.get("result").?.object.get("repositories").?, "primary").?;
+    try std.testing.expectEqualStrings("git@github.com:Owner/Repo.git", primary.get("vcs_identity").?.string);
+
+    // A thread written under the alias lands in the canonical workspace.
+    var thread = try testOriginRequest(&daemon, allocator,
+        \\{{"jsonrpc":"2.0","id":6,"method":"chat.thread.upsert","params":{{"mutation":{{"request_key":"alias-thread","client_id":"{s}"}},"workspace_id":"other-ws","thread":{{"local_thread_id":"t-alias","title":"Alias"}}}}}}
+    , .{client_id});
+    defer thread.deinit();
+    var thread_get = try testOriginRequest(&daemon, allocator,
+        \\{{"jsonrpc":"2.0","id":7,"method":"chat.thread.get","params":{{"workspace_id":"other-ws","local_thread_id":"t-alias"}}}}
+    , .{});
+    defer thread_get.deinit();
+    const thread_row = (try daemon.store_service.?.store.conn.row(
+        "select w.workspace_id from threads t join workspaces w on w.id = t.workspace_id where t.local_thread_id = 't-alias'",
+        .{},
+    )).?;
+    defer thread_row.deinit();
+    try std.testing.expectEqualStrings("src-ws", thread_row.text(0));
+}
+
+test "workspace.attach reuses a workspace by its primary binding path and chat.turn.start resolves the alias" {
+    const allocator = std.testing.allocator;
+    var repo = (try repo_origin.TestOriginRepo.init("https://github.com/owner/bound.git")) orelse return error.SkipZigTest;
+    defer repo.deinit();
+    const roots = std.fs.path.dirname(repo.root).?;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    try attachTestRuntimeStoreService(&daemon, db_path);
+    defer detachTestStoreService(&daemon);
+    const client_id = try registerTestClientId(&daemon, allocator);
+    defer allocator.free(client_id);
+
+    // The workspace's own path is elsewhere; only its primary binding names the folder.
+    var upsert = try testOriginRequest(&daemon, allocator,
+        \\{{"jsonrpc":"2.0","id":2,"method":"workspace.upsert","params":{{"mutation":{{"request_key":"bound-ws","client_id":"{s}"}},"workspace":{{"workspace_id":"bound-ws","label":"Bound","path":"{s}"}}}}}}
+    , .{ client_id, std.fs.path.dirname(db_path).? });
+    defer upsert.deinit();
+    var bind = try testOriginRequest(&daemon, allocator,
+        \\{{"jsonrpc":"2.0","id":3,"method":"workspace.repository.binding.upsert","params":{{"mutation":{{"request_key":"bound-bind","client_id":"{s}"}},"workspace_id":"bound-ws","repository_id":"primary","binding":{{"runtime_id":"{s}","root_path":"{s}"}}}}}}
+    , .{ client_id, daemon.runtime_id, repo.root });
+    defer bind.deinit();
+
+    var attached = try testAttachRequest(&daemon, allocator, roots,
+        \\{{"mutation":{{"request_key":"bound-attach","client_id":"{s}"}},"workspace_id":"remote-ws","label":"Remote","role":"primary","root_path":"{s}","expect_identity":"git@github.com:owner/bound.git"}}
+    , .{ client_id, repo.root });
+    defer attached.deinit();
+    const result = try testAttachResult(attached);
+    try std.testing.expectEqualStrings("bound-ws", result.get("workspace_id").?.string);
+    try std.testing.expect(result.get("reused").?.bool);
+    try std.testing.expectEqual(@as(i64, 1), try testWorkspaceRowCount(&daemon));
+
+    // Route-mode chat.turn.start under the alias reaches the bound checkout:
+    // it gets past route resolution to the provider check, which an unknown
+    // workspace never does.
+    const alias_turn = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":4,"method":"chat.turn.start","params":{"turn_id":"alias-turn","workspace_id":"remote-ws","repository_id":"primary","local_thread_id":"t1","prompt":"hi","thread_title":"T","provider":"not-a-provider","require_provider_ready":true}}
+    );
+    defer allocator.free(alias_turn);
+    try expectErrorCodeMessage(alias_turn, allocator, headless.protocol.ERR_INVALID_PARAMS, "invalid provider");
+    const unknown_turn = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":5,"method":"chat.turn.start","params":{"turn_id":"unknown-turn","workspace_id":"nobody-ws","repository_id":"primary","local_thread_id":"t1","prompt":"hi","thread_title":"T","provider":"not-a-provider","require_provider_ready":true}}
+    );
+    defer allocator.free(unknown_turn);
+    try expectErrorCodeMessage(unknown_turn, allocator, headless.protocol.ERR_RESOURCE_NOT_FOUND, "workspace not found on this runtime");
+
+    // A context folder may join the workspace through its alias too.
+    var context = try testAttachRequest(&daemon, allocator, roots,
+        \\{{"mutation":{{"request_key":"bound-context","client_id":"{s}"}},"workspace_id":"remote-ws","label":"Docs","repository_id":"docs","role":"context","root_path":"{s}"}}
+    , .{ client_id, repo.root });
+    defer context.deinit();
+    const context_result = try testAttachResult(context);
+    try std.testing.expectEqualStrings("bound-ws", context_result.get("workspace_id").?.string);
+    try std.testing.expectEqualStrings("docs", context_result.get("repository_id").?.string);
+    var binding = try daemon.store_service.?.store.loadWorkspaceRepositoryBinding("bound-ws", "docs", daemon.runtime_id);
+    defer binding.deinit(allocator);
+    try std.testing.expectEqualStrings(repo.root, binding.root_path);
+}
+
+test "workspace.attach refuses identity mismatches, missing folders and folders outside the roots" {
+    const allocator = std.testing.allocator;
+    var repo = (try repo_origin.TestOriginRepo.init("https://github.com/owner/repo.git")) orelse return error.SkipZigTest;
+    defer repo.deinit();
+    var bare = (try repo_origin.TestOriginRepo.init(null)) orelse return error.SkipZigTest;
+    defer bare.deinit();
+    var outside = std.testing.tmpDir(.{});
+    defer outside.cleanup();
+    try outside.dir.createDirPath(std.testing.io, "elsewhere");
+    const outside_base = try outside.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(outside_base);
+    const roots = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ std.fs.path.dirname(repo.root).?, std.fs.path.dirname(bare.root).? });
+    defer allocator.free(roots);
+    try repo.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/file.txt", .data = "not a folder" });
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    try attachTestRuntimeStoreService(&daemon, db_path);
+    defer detachTestStoreService(&daemon);
+    const client_id = try registerTestClientId(&daemon, allocator);
+    defer allocator.free(client_id);
+
+    const Case = struct { workspace_id: []const u8, path: []const u8, suffix: []const u8, role: []const u8, expect: []const u8, code: []const u8 };
+    const cases = [_]Case{
+        .{ .workspace_id = "w1", .path = repo.root, .suffix = "", .role = "primary", .expect = "\"https://github.com/owner/other.git\"", .code = headless.protocol.ERR_IDENTITY_MISMATCH },
+        .{ .workspace_id = "w2", .path = bare.root, .suffix = "", .role = "primary", .expect = "\"https://github.com/owner/repo.git\"", .code = headless.protocol.ERR_IDENTITY_MISMATCH },
+        .{ .workspace_id = "w3", .path = repo.root, .suffix = "/missing", .role = "primary", .expect = "null", .code = headless.protocol.ERR_NOT_FOUND },
+        .{ .workspace_id = "w4", .path = repo.root, .suffix = "/file.txt", .role = "primary", .expect = "null", .code = headless.protocol.ERR_NOT_FOUND },
+        .{ .workspace_id = "w5", .path = outside_base, .suffix = "/elsewhere", .role = "primary", .expect = "null", .code = headless.protocol.ERR_PATH_OUTSIDE_ROOTS },
+        .{ .workspace_id = "w6", .path = repo.root, .suffix = "/../../..", .role = "primary", .expect = "null", .code = headless.protocol.ERR_INVALID_PARAMS },
+        .{ .workspace_id = "w7", .path = repo.root, .suffix = "", .role = "owner", .expect = "null", .code = headless.protocol.ERR_INVALID_PARAMS },
+        // A context folder needs an existing workspace (direct or alias).
+        .{ .workspace_id = "w8", .path = repo.root, .suffix = "", .role = "context", .expect = "null", .code = headless.protocol.ERR_RESOURCE_NOT_FOUND },
+    };
+    for (cases) |case| {
+        var parsed = try testAttachRequest(&daemon, allocator, roots,
+            \\{{"mutation":{{"request_key":"refuse-{s}","client_id":"{s}"}},"workspace_id":"{s}","label":"Refused","repository_id":"{s}","role":"{s}","root_path":"{s}{s}","expect_identity":{s}}}
+        , .{ case.workspace_id, client_id, case.workspace_id, if (std.mem.eql(u8, case.role, "context")) "docs" else "primary", case.role, case.path, case.suffix, case.expect });
+        defer parsed.deinit();
+        std.testing.expectEqualStrings(case.code, testAttachErrorCode(parsed)) catch |err| {
+            std.debug.print("case {s}: {f}\n", .{ case.workspace_id, std.json.fmt(parsed.value, .{}) });
+            return err;
+        };
+    }
+    try std.testing.expectEqual(@as(i64, 0), try testWorkspaceRowCount(&daemon));
+
+    // An unknown client is refused before any filesystem or store work.
+    var unknown_client = try testAttachRequest(&daemon, allocator, roots,
+        \\{{"mutation":{{"request_key":"refuse-client","client_id":"nobody"}},"workspace_id":"w9","label":"Refused","role":"primary","root_path":"{s}"}}
+    , .{repo.root});
+    defer unknown_client.deinit();
+    try std.testing.expectEqualStrings(headless.protocol.ERR_INVALID_PARAMS, testAttachErrorCode(unknown_client));
+}
+
+test "workspace.attach reopens an archived workspace it reuses" {
+    const allocator = std.testing.allocator;
+    var repo = (try repo_origin.TestOriginRepo.init("https://github.com/owner/archived.git")) orelse return error.SkipZigTest;
+    defer repo.deinit();
+    const roots = std.fs.path.dirname(repo.root).?;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    try attachTestRuntimeStoreService(&daemon, db_path);
+    defer detachTestStoreService(&daemon);
+    const client_id = try registerTestClientId(&daemon, allocator);
+    defer allocator.free(client_id);
+    const store = &daemon.store_service.?.store;
+
+    var created = try testAttachRequest(&daemon, allocator, roots,
+        \\{{"mutation":{{"request_key":"arch-attach-1","client_id":"{s}"}},"workspace_id":"arch-src","label":"Archived","role":"primary","root_path":"{s}"}}
+    , .{ client_id, repo.root });
+    defer created.deinit();
+    _ = try testAttachResult(created);
+    const closed = try testWorkspaceCloseRpc(&daemon,
+        \\{"id":2,"method":"workspace.close","params":{"workspace_id":"arch-src"}}
+    );
+    defer allocator.free(closed);
+    try std.testing.expect(std.mem.indexOf(u8, closed, "\"archived\":true") != null);
+    try std.testing.expect((try store.workspaceArchived("arch-src")).?);
+    const closed_revision = try store.storeRevision();
+
+    var reused = try testAttachRequest(&daemon, allocator, roots,
+        \\{{"mutation":{{"request_key":"arch-attach-2","client_id":"{s}"}},"workspace_id":"arch-remote","label":"Remote","role":"primary","root_path":"{s}"}}
+    , .{ client_id, repo.root });
+    defer reused.deinit();
+    const result = try testAttachResult(reused);
+    try std.testing.expectEqualStrings("arch-src", result.get("workspace_id").?.string);
+    try std.testing.expect(result.get("reused").?.bool);
+    try std.testing.expect(!(try store.workspaceArchived("arch-src")).?);
+    try std.testing.expect(result.get("store_revision").?.integer > closed_revision);
+
+    // The reopened workspace keeps its folder and admits chats through the alias.
+    const row = (try store.conn.row("select path from workspaces where workspace_id = 'arch-src'", .{})).?;
+    defer row.deinit();
+    try std.testing.expectEqualStrings(repo.root, row.text(0));
+    const turn = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":3,"method":"chat.turn.start","params":{"turn_id":"arch-alias-turn","workspace_id":"arch-remote","repository_id":"primary","local_thread_id":"t1","prompt":"hi","thread_title":"T","provider":"not-a-provider","require_provider_ready":true}}
+    );
+    defer allocator.free(turn);
+    try expectErrorCodeMessage(turn, allocator, headless.protocol.ERR_INVALID_PARAMS, "invalid provider");
+
+    // Re-running on an open workspace changes nothing.
+    const reopened_revision = try store.storeRevision();
+    var again = try testAttachRequest(&daemon, allocator, roots,
+        \\{{"mutation":{{"request_key":"arch-attach-3","client_id":"{s}"}},"workspace_id":"arch-remote","label":"Remote","role":"primary","root_path":"{s}"}}
+    , .{ client_id, repo.root });
+    defer again.deinit();
+    _ = try testAttachResult(again);
+    try std.testing.expectEqual(reopened_revision, try store.storeRevision());
 }

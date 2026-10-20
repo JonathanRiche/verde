@@ -6,7 +6,7 @@ const zqlite = @import("zqlite");
 /// Latest schema version understood by this build.
 pub const CURRENT_VERSION: i64 = 1;
 /// Maximum schema version understood by read-only clients and the daemon store.
-pub const MAX_SUPPORTED_VERSION: i64 = 17;
+pub const MAX_SUPPORTED_VERSION: i64 = 18;
 /// SQLite busy timeout shared by writer and read-only connections.
 pub const BUSY_TIMEOUT_MS = 5000;
 
@@ -333,6 +333,12 @@ fn migrateToVersionInternal(
                 if (failure_point == .before_version_bump) return error.TestMigrationFailure;
                 try conn.execNoArgs("pragma user_version = 17");
                 version = 17;
+            },
+            17 => {
+                try conn.execNoArgs(WORKSPACE_ALIASES_SCHEMA_SQL);
+                if (failure_point == .before_version_bump) return error.TestMigrationFailure;
+                try conn.execNoArgs("pragma user_version = 18");
+                version = 18;
             },
             else => return error.DatabaseSchemaInvalid,
         }
@@ -976,6 +982,21 @@ fn migrateV16ToV17(conn: zqlite.Conn) !void {
     try ensureColumn(conn, "workspaces", "icon_index", "alter table workspaces add column icon_index integer");
     try ensureColumn(conn, "workspaces", "color_index", "alter table workspaces add column color_index integer");
 }
+
+/// v18: `workspace.attach` aliases. A caller's `workspace_id` that names a
+/// folder this runtime already registered maps to that workspace, so chats
+/// sent with either ID land in one place. Keyed by durable text IDs (not row
+/// ids) like `thread_descriptions`, so snapshot rewrites never drop them; an
+/// alias whose target no longer exists simply stops resolving.
+pub const WORKSPACE_ALIASES_SCHEMA_SQL =
+    \\create table if not exists workspace_aliases (
+    \\    alias_workspace_id text primary key check (length(alias_workspace_id) between 1 and 512),
+    \\    workspace_id text not null check (length(workspace_id) between 1 and 512),
+    \\    created_at_ms integer not null default 0
+    \\);
+    \\create index if not exists workspace_aliases_workspace_idx
+    \\    on workspace_aliases (workspace_id);
+;
 
 const OpenThreadPolicy = struct {
     uncommitted_open: bool,

@@ -133,6 +133,16 @@ pub const ERROR_DATA_RESOURCE_KEY: []const u8 = "resource";
 pub const ERROR_RESOURCE_WORKSPACE: []const u8 = "workspace";
 pub const ERROR_RESOURCE_REPOSITORY_BINDING: []const u8 = "repository_binding";
 
+/// `workspace.attach` refusals. `not_found` and `path_outside_roots` are the
+/// codes `workspace.directory.list` already answers for the same folder checks.
+/// The folder does not exist or is not a directory.
+pub const ERR_NOT_FOUND: []const u8 = "not_found";
+/// The folder is outside the roots `workspace.directory.list` may browse.
+pub const ERR_PATH_OUTSIDE_ROOTS: []const u8 = "path_outside_roots";
+/// `expect_identity` was sent and the folder's normalized `origin` differs or
+/// the folder has no `origin`.
+pub const ERR_IDENTITY_MISMATCH: []const u8 = "identity_mismatch";
+
 /// Typed protocol error carried inside a response envelope.
 pub const Error = struct {
     code: []const u8,
@@ -390,6 +400,7 @@ pub const RUNTIME_CAPABILITY_NAMES = RUNTIME_CAPABILITY_NAMES_BASE ++
         WORKSPACE_DIRECTORY_CAPABILITY,
         DEVICE_PUSH_CAPABILITY,
         ACCESS_PAIR_IDEMPOTENT_CAPABILITY,
+        WORKSPACE_ATTACH_CAPABILITY,
     };
 
 // Mobile capability names. Advertising a name promises the feature works;
@@ -403,6 +414,8 @@ pub const DEVICE_PUSH_CAPABILITY: []const u8 = "device.push.v1";
 pub const WORKSPACE_DIRECTORY_CAPABILITY: []const u8 = "workspace.directory.v1";
 /// Idempotent pair-code exchange (task A-05).
 pub const ACCESS_PAIR_IDEMPOTENT_CAPABILITY: []const u8 = "access.pair.idempotent.v1";
+/// `workspace.attach` and workspace aliases (multi-machine workspaces phase 3).
+pub const WORKSPACE_ATTACH_CAPABILITY: []const u8 = "workspace.attach.v1";
 
 /// Reserved names that must not be advertised yet; tests assert their absence.
 /// To turn one on, the owning task moves its constant from this list into

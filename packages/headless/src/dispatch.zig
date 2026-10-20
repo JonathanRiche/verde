@@ -69,6 +69,7 @@ const MUTATING_METHODS = [_][]const u8{
     "workspace.repository.default.set",
     "workspace.repository.binding.upsert",
     "workspace.repository.binding.remove",
+    "workspace.attach",
     "chat.thread.upsert",
     "chat.thread.close",
     "chat.thread.move",

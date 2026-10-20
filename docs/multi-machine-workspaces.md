@@ -102,8 +102,12 @@ params: { mutation, workspace_id, label, repository_id, role: primary|context,
           root_path, expect_identity? }
 result: { workspace_id, repository_id, root_path, git_identity?, store_revision,
           reused: bool }
-errors: not_found (path) · identity_mismatch · path_outside_roots
+errors: not_found (path) · identity_mismatch · path_outside_roots · conflict
 ```
+
+`conflict` means the caller's `workspace_id` already names a different
+workspace on this machine (another folder). Clients treat it as "pick another
+folder".
 
 - Checks that `root_path` is a directory inside the same roots
   `workspace.directory.list` allows, using its descriptor-based containment.
@@ -111,6 +115,17 @@ errors: not_found (path) · identity_mismatch · path_outside_roots
   that workspace: it adds the caller's `workspace_id` as an alias of it and
   returns `reused: true`. Chats sent with either ID land in the same
   workspace. It never creates a second workspace for the same folder.
+  Only `primary` folders count (`workspaces.path` or the `primary` binding);
+  a context binding never makes its workspace reusable.
+- Aliases are durable (`workspace_aliases`, schema v18). Every workspace in
+  `core.snapshot` and `workspace.list` carries `aliases: [string]`, so a
+  client can see that a machine has its workspace under another id. Requests
+  sent with an alias (`chat.turn.start`, thread and message reads/writes,
+  `workspace.repository.manifest.get`, file browsing) run against the
+  canonical workspace, and their responses carry the **canonical**
+  `workspace_id`, not the alias.
+- An archived workspace that attach lands in is reopened (`archived` cleared,
+  nothing else changed), since attaching is an explicit user action.
 - Otherwise it creates the workspace with the **caller's** `workspace_id`.
 - Reads the folder's `origin`. If `expect_identity` was sent and the
   normalized values differ, or the folder has no `origin`, it refuses with

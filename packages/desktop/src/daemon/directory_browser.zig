@@ -154,6 +154,31 @@ pub fn list(allocator: std.mem.Allocator, io: std.Io, roots: []const []const u8,
     return error.PathOutsideRoots;
 }
 
+/// Canonical real path of `requested`, a directory beneath one of `roots`,
+/// opened with the same descriptor confinement as `list` (escaping symlinks
+/// and traversal are refused). The path is read back from the opened
+/// descriptor, so it names exactly the directory that passed the check.
+pub fn resolveDirectory(allocator: std.mem.Allocator, io: std.Io, roots: []const []const u8, requested: []const u8) ![]const u8 {
+    if (!validPath(requested)) return error.PathOutsideRoots;
+    const path = try std.fs.path.resolve(allocator, &.{requested});
+    for (roots) |root| {
+        if (!contains(root, path)) continue;
+        const base = openRoot(io, root) catch return error.PathOutsideRoots;
+        defer base.close(io);
+        const remainder = std.mem.trimStart(u8, path[root.len..], "/");
+        const dir = try openBeneath(allocator, io, base, if (remainder.len == 0) "." else remainder);
+        defer dir.close(io);
+        var buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const len = dir.realPath(io, &buffer) catch return error.PathOutsideRoots;
+        const real = buffer[0..len];
+        for (roots) |allowed| {
+            if (contains(allowed, real)) return try allocator.dupe(u8, real);
+        }
+        return error.PathOutsideRoots;
+    }
+    return error.PathOutsideRoots;
+}
+
 /// A `.git` directory, or a `.git` file (worktrees, submodules), directly in `dir`.
 fn hasGitMarker(io: std.Io, dir: std.Io.Dir) bool {
     const stat = dir.statFile(io, ".git", .{ .follow_symlinks = false }) catch return false;

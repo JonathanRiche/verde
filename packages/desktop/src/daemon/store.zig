@@ -57,6 +57,8 @@ pub const RuntimeIdentity = schema.RuntimeIdentity;
 
 /// Maximum repositories accepted in one workspace manifest.
 pub const MAX_WORKSPACE_REPOSITORIES: usize = 64;
+/// Most aliases listed for one workspace in `workspace.list` / `core.snapshot`.
+pub const MAX_WORKSPACE_ALIASES: usize = 64;
 /// Maximum runtime bindings accepted for one repository.
 pub const MAX_REPOSITORY_BINDINGS: usize = 64;
 /// Maximum encoded repository identifier length.
@@ -1105,6 +1107,167 @@ pub const Store = struct {
         try self.conn.commit();
         committed = true;
         return revision;
+    }
+
+    /// A local folder registered to a workspace: its `workspaces.path` or its
+    /// `primary` repository's binding root on this runtime.
+    pub const LocalWorkspacePath = struct {
+        workspace_id: []const u8,
+        path: []const u8,
+    };
+
+    /// Every primary folder this runtime knows, for `workspace.attach` reuse.
+    /// Context repository bindings are excluded: reusing their workspace would
+    /// run chats in that workspace's primary folder, not the one asked for.
+    /// Results are owned by `allocator` (callers pass a request arena).
+    pub fn loadLocalWorkspacePaths(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        runtime_id: []const u8,
+    ) StoreError![]LocalWorkspacePath {
+        if (!validRuntimeId(runtime_id)) return error.InvalidParams;
+        var paths: std.ArrayListUnmanaged(LocalWorkspacePath) = .empty;
+        var rows = self.conn.rows(
+            "select workspace_id, path from workspaces " ++
+                "union " ++
+                "select workspace.workspace_id, binding.root_path from workspaces workspace " ++
+                "join workspace_repositories repository on repository.workspace_id = workspace.id " ++
+                "join workspace_repository_bindings binding on binding.repository_row_id = repository.id " ++
+                "where repository.repository_id = 'primary' and binding.runtime_id = ?1",
+            .{runtime_id},
+        ) catch |err| return mapStoreError(err);
+        defer rows.deinit();
+        while (rows.next()) |row| {
+            paths.append(allocator, .{
+                .workspace_id = allocator.dupe(u8, row.text(0)) catch return error.OutOfMemory,
+                .path = allocator.dupe(u8, row.text(1)) catch return error.OutOfMemory,
+            }) catch return error.OutOfMemory;
+        }
+        if (rows.err) |err| return mapStoreError(err);
+        return paths.toOwnedSlice(allocator) catch return error.OutOfMemory;
+    }
+
+    /// Canonical workspace for an ID that is only an alias (`workspace.attach`
+    /// reuse). Null when the ID names a workspace itself, is unknown, or its
+    /// alias target no longer exists. The result is owned by `allocator`.
+    pub fn resolveWorkspaceAlias(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        workspace_id: []const u8,
+    ) StoreError!?[]u8 {
+        if (!validWorkspaceId(workspace_id)) return null;
+        const row = (self.conn.row(
+            \\select alias.workspace_id from workspace_aliases alias
+            \\join workspaces target on target.workspace_id = alias.workspace_id
+            \\where alias.alias_workspace_id = ?1
+            \\  and not exists (select 1 from workspaces direct where direct.workspace_id = ?1)
+        , .{workspace_id}) catch |err| return mapStoreError(err)) orelse return null;
+        defer row.deinit();
+        return allocator.dupe(u8, row.text(0)) catch return error.OutOfMemory;
+    }
+
+    /// Record `alias_id` as another name for `workspace_id`. Returns the new
+    /// store revision, or null when that mapping already existed. Refuses
+    /// (Conflict) an alias that names a workspace of its own.
+    pub fn setWorkspaceAlias(
+        self: *Self,
+        alias_id: []const u8,
+        workspace_id: []const u8,
+        now_ms: i64,
+    ) StoreError!?u64 {
+        if (!validWorkspaceId(alias_id) or !validWorkspaceId(workspace_id) or std.mem.eql(u8, alias_id, workspace_id)) {
+            return error.InvalidParams;
+        }
+        return self.setWorkspaceAliasInternal(alias_id, workspace_id, now_ms) catch |err| return mapStoreError(err);
+    }
+
+    fn setWorkspaceAliasInternal(self: *Self, alias_id: []const u8, workspace_id: []const u8, now_ms: i64) !?u64 {
+        try self.conn.execNoArgs("begin immediate");
+        var committed = false;
+        defer if (!committed) self.conn.rollback();
+        if (try self.conn.row("select 1 from workspaces where workspace_id = ?1", .{alias_id})) |row| {
+            row.deinit();
+            return error.Conflict;
+        }
+        const target = (try self.conn.row("select 1 from workspaces where workspace_id = ?1", .{workspace_id})) orelse
+            return error.ResourceNotFound;
+        target.deinit();
+        if (try self.conn.row(
+            "select 1 from workspace_aliases where alias_workspace_id = ?1 and workspace_id = ?2",
+            .{ alias_id, workspace_id },
+        )) |row| {
+            row.deinit();
+            return null;
+        }
+        try self.conn.exec(
+            "insert into workspace_aliases (alias_workspace_id, workspace_id, created_at_ms) values (?1, ?2, ?3) " ++
+                "on conflict(alias_workspace_id) do update set workspace_id = excluded.workspace_id, created_at_ms = excluded.created_at_ms",
+            .{ alias_id, workspace_id, now_ms },
+        );
+        const revision = std.math.add(u64, try self.readStoreRevision(), 1) catch return error.StoreUnavailable;
+        const revision_sql = std.math.cast(i64, revision) orelse return error.StoreUnavailable;
+        try self.conn.exec("update store_state set store_revision = ?1 where id = 1", .{revision_sql});
+        try self.conn.commit();
+        committed = true;
+        return revision;
+    }
+
+    /// Clear `archived` on one workspace without touching its other fields
+    /// (the reverse of `closeWorkspace`; a full `workspace.upsert` would
+    /// overwrite its layout). Returns the new store revision, or null when the
+    /// workspace was not archived. ResourceNotFound for an unknown workspace.
+    pub fn reopenWorkspace(self: *Self, workspace_id: []const u8) StoreError!?u64 {
+        if (!validWorkspaceId(workspace_id)) return error.InvalidParams;
+        return self.reopenWorkspaceInternal(workspace_id) catch |err| return mapStoreError(err);
+    }
+
+    fn reopenWorkspaceInternal(self: *Self, workspace_id: []const u8) !?u64 {
+        try self.conn.execNoArgs("begin immediate");
+        var committed = false;
+        defer if (!committed) self.conn.rollback();
+        const row = (try self.conn.row("select archived from workspaces where workspace_id = ?1", .{workspace_id})) orelse
+            return error.ResourceNotFound;
+        const archived = row.int(0) != 0;
+        row.deinit();
+        if (!archived) return null;
+        try self.conn.exec("update workspaces set archived = 0 where workspace_id = ?1", .{workspace_id});
+        const revision = std.math.add(u64, try self.readStoreRevision(), 1) catch return error.StoreUnavailable;
+        const revision_sql = std.math.cast(i64, revision) orelse return error.StoreUnavailable;
+        try self.conn.exec("update store_state set store_revision = ?1 where id = 1", .{revision_sql});
+        try self.conn.commit();
+        committed = true;
+        return revision;
+    }
+
+    /// Drop the alias row of an ID that now names its own workspace. Such a
+    /// row never resolves, so removing it needs no revision bump.
+    pub fn clearWorkspaceAlias(self: *Self, alias_id: []const u8) StoreError!void {
+        self.conn.exec("delete from workspace_aliases where alias_workspace_id = ?1", .{alias_id}) catch |err|
+            return mapStoreError(err);
+    }
+
+    /// Aliases that currently resolve to `workspace_id`, sorted, at most
+    /// `MAX_WORKSPACE_ALIASES`. Results are owned by `allocator`.
+    pub fn loadWorkspaceAliases(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        workspace_id: []const u8,
+    ) StoreError![]const []const u8 {
+        var aliases: std.ArrayListUnmanaged([]const u8) = .empty;
+        var rows = self.conn.rows(
+            \\select alias.alias_workspace_id from workspace_aliases alias
+            \\where alias.workspace_id = ?1
+            \\  and not exists (select 1 from workspaces direct where direct.workspace_id = alias.alias_workspace_id)
+            \\order by alias.alias_workspace_id
+            \\limit ?2
+        , .{ workspace_id, @as(i64, MAX_WORKSPACE_ALIASES) }) catch |err| return mapStoreError(err);
+        defer rows.deinit();
+        while (rows.next()) |row| {
+            const alias = allocator.dupe(u8, row.text(0)) catch return error.OutOfMemory;
+            aliases.append(allocator, alias) catch return error.OutOfMemory;
+        }
+        if (rows.err) |err| return mapStoreError(err);
+        return aliases.toOwnedSlice(allocator) catch return error.OutOfMemory;
     }
 
     fn loadRepositoryRows(
@@ -5044,7 +5207,7 @@ fn validateThreadRoute(thread: store_protocol.Thread) StoreError!void {
     }
 }
 
-fn validRouteId(value: []const u8) bool {
+pub fn validRouteId(value: []const u8) bool {
     if (value.len == 0 or value.len > MAX_REPOSITORY_ID_BYTES) return false;
     for (value) |byte| {
         if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '_' and byte != '.') return false;
@@ -5141,7 +5304,7 @@ fn repositoryBindingValid(binding: store_protocol.RepositoryBinding) bool {
             std.mem.eql(u8, binding.availability, "unknown"));
 }
 
-fn validWorkspaceId(value: []const u8) bool {
+pub fn validWorkspaceId(value: []const u8) bool {
     if (value.len == 0 or value.len > 512 or !std.unicode.utf8ValidateSlice(value)) return false;
     for (value) |byte| if (std.ascii.isControl(byte)) return false;
     return true;

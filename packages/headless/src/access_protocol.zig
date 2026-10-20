@@ -398,6 +398,7 @@ pub const PAIRED_RPC_METHODS = [_]PairedRpcMethod{
     .{ .method = "workspace.repository.remove", .scope_mask = REPOSITORY_WRITE },
     .{ .method = "workspace.repository.default.set", .scope_mask = REPOSITORY_WRITE },
     .{ .method = "workspace.repository.binding.upsert", .scope_mask = REPOSITORY_WRITE },
+    .{ .method = "workspace.attach", .scope_mask = REPOSITORY_WRITE },
     .{ .method = "workspace.repository.binding.remove", .scope_mask = REPOSITORY_WRITE },
 
     // Self-service and push calls are bound to the authenticated device by the gateway.
@@ -847,6 +848,7 @@ test "new access scopes are opt-in and preserve stored scope bits" {
 test "P2 daemon RPC mappings require their exact scopes and desktop methods stay excluded" {
     const cases = .{
         .{ "workspace.close", Scope.repository_write },
+        .{ "workspace.attach", Scope.repository_write },
         .{ "chat.subagent.open", Scope.chat_write },
         .{ "provider.threads.list", Scope.chat_read },
         .{ "provider.title.generate", Scope.chat_write },

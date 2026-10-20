@@ -52,6 +52,10 @@ pub const METHOD_WORKSPACE_REPOSITORY_BINDING_UPSERT: []const u8 =
     "workspace.repository.binding.upsert";
 pub const METHOD_WORKSPACE_REPOSITORY_BINDING_REMOVE: []const u8 =
     "workspace.repository.binding.remove";
+/// Validate a folder on this runtime and make it a workspace's checkout in one
+/// idempotent call (see docs/multi-machine-workspaces.md). Reuses a workspace
+/// that already owns the folder by recording the caller's ID as its alias.
+pub const METHOD_WORKSPACE_ATTACH: []const u8 = "workspace.attach";
 /// Sidebar order: listed workspaces lead in the given order; unlisted rows
 /// (closed workspaces, rows the caller has not seen) keep their relative order after them.
 pub const METHOD_WORKSPACE_REORDER: []const u8 = "workspace.reorder";
@@ -196,6 +200,36 @@ pub const WorkspaceRepositoryManifestResult = struct {
     store_revision: u64,
 };
 
+/// `workspace.attach` params. `role` is `primary` (the workspace's own folder;
+/// `repository_id` must be `primary`) or `context` (an extra repository of an
+/// existing workspace). `root_path` is absolute on the target runtime.
+/// `expect_identity` is a raw or normalized remote URL compared by normalized
+/// `v1:` key against the folder's `origin`.
+pub const WorkspaceAttachRequest = struct {
+    mutation: MutationHeader,
+    workspace_id: []const u8,
+    label: []const u8,
+    repository_id: []const u8 = PRIMARY_REPOSITORY_ID,
+    role: []const u8 = WORKSPACE_ATTACH_ROLE_PRIMARY,
+    root_path: []const u8,
+    expect_identity: ?[]const u8 = null,
+};
+
+pub const WORKSPACE_ATTACH_ROLE_PRIMARY: []const u8 = "primary";
+pub const WORKSPACE_ATTACH_ROLE_CONTEXT: []const u8 = "context";
+
+/// `workspace_id` is the workspace that now owns the folder: the caller's ID,
+/// or, when `reused`, the existing workspace the caller's ID is an alias of.
+/// `root_path` is the canonical folder path; `git_identity` its raw `origin`.
+pub const WorkspaceAttachResult = struct {
+    workspace_id: []const u8,
+    repository_id: []const u8,
+    root_path: []const u8,
+    git_identity: ?[]const u8 = null,
+    store_revision: u64,
+    reused: bool,
+};
+
 pub const WorkspaceReorderRequest = struct {
     mutation: MutationHeader,
     workspace_ids: []const []const u8,
@@ -242,6 +276,9 @@ pub const Workspace = struct {
     /// workspace and projects as the stable `primary` repository.
     repositories: []const Repository = &.{},
     default_repository_id: ?[]const u8 = null,
+    /// Other workspace IDs that resolve to this workspace on this runtime
+    /// (`workspace.attach` reuse). Daemon-filled on reads; ignored on writes.
+    aliases: []const []const u8 = &.{},
     archived: bool = false,
     unread_count: u32 = 0,
     collapsed: ?bool = null,
@@ -744,6 +781,8 @@ pub const WorkspaceListItem = struct {
     archived: bool = false,
     repositories: []const Repository = &.{},
     default_repository_id: []const u8 = PRIMARY_REPOSITORY_ID,
+    /// Other workspace IDs that resolve to this workspace (`workspace.attach`).
+    aliases: []const []const u8 = &.{},
 };
 
 /// Returned cursors are opaque, revision-bound, and valid only with the same

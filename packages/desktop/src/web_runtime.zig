@@ -121,4 +121,5 @@ test "web runtime routing exposes only chat execution and repository inspection"
     try std.testing.expect(!allowedMethod("config.commit.set"));
     try std.testing.expect(!allowedMethod("access.pairing.create"));
     try std.testing.expect(!allowedMethod("workspace.repository.binding.upsert"));
+    try std.testing.expect(!allowedMethod("workspace.attach"));
 }
