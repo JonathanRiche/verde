@@ -491,6 +491,7 @@ pub fn titleGenerationWorker(request: *TitleGenerationRequest) void {
         page_alloc.free(request.user_text);
         page_alloc.free(request.assistant_text);
         page_alloc.free(request.model_ref);
+        if (request.chat_model_ref) |model| page_alloc.free(model);
         page_alloc.free(request.workspace_id);
         page_alloc.free(request.local_thread_id);
         page_alloc.destroy(request);
@@ -510,6 +511,8 @@ pub fn titleGenerationWorker(request: *TitleGenerationRequest) void {
         .assistant_text = request.assistant_text,
         .workspace_id = if (request.workspace_id.len > 0) request.workspace_id else null,
         .local_thread_id = if (request.local_thread_id.len > 0) request.local_thread_id else null,
+        .chat_provider = request.chat_provider,
+        .chat_model_ref = request.chat_model_ref,
     }) catch |err| {
         finishTitleGenerationFailure(request.state, @errorName(err));
         return;
@@ -4809,6 +4812,8 @@ pub fn startTitleGeneration(self: anytype, project_index: usize, thread: *ChatTh
     errdefer page_alloc.free(owned_assistant_text);
     const model_ref = try page_alloc.dupe(u8, self.app_config.chatTitleModel());
     errdefer page_alloc.free(model_ref);
+    const chat_model_ref = if (thread.model_ref) |model| try page_alloc.dupe(u8, model) else null;
+    errdefer if (chat_model_ref) |model| page_alloc.free(model);
     const workspace_id = try page_alloc.dupe(u8, self.project_controller.projects.items[project_index].id);
     errdefer page_alloc.free(workspace_id);
     const local_thread_id = try page_alloc.dupe(u8, thread.local_thread_id);
@@ -4823,6 +4828,8 @@ pub fn startTitleGeneration(self: anytype, project_index: usize, thread: *ChatTh
         .assistant_text = owned_assistant_text,
         .provider = harnessProviderForDbProvider(dbProviderForChatTitleProvider(self.app_config.chat_title_provider)),
         .model_ref = model_ref,
+        .chat_provider = harnessProviderForDbProvider(thread.provider),
+        .chat_model_ref = chat_model_ref,
         .workspace_id = workspace_id,
         .local_thread_id = local_thread_id,
     };
@@ -6533,6 +6540,7 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
         self.issuePendingProviderSteer(project_index, thread_index, thread);
         self.issuePendingThreadStop(project_index, self.project_controller.projects.items[project_index].path, thread);
     }
+    noteChatApprovalEdge(self, project_index, thread_index, thread);
 
     var completed_result: ?SendResultPayload = null;
     var failed_message: ?[]u8 = null;
@@ -6847,6 +6855,10 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
     if (!completed_local_command and next_status == .completed and !had_pending_followup) {
         self.noteChatCompletion(project_index, thread_index, thread, completed_daemon_turn_id != null);
     }
+    if (!completed_local_command and next_status == .failed) {
+        noteChatFailure(self, project_index, thread_index, thread);
+    }
+    if (next_status != .idle) thread.approval_notified_key = 0;
     return next_status != .idle or stream_changed or daemon_changed;
 }
 
@@ -8068,6 +8080,39 @@ pub fn noteChatCompletion(self: anytype, project_index: usize, thread_index: usi
     }
     self.markDirty();
 
+    fireChatNotification(self, project, thread, .done);
+}
+
+// Chimes WAITING once per approval request (keyed by call id) so a chat that
+// stops for permission is audible like a terminal agent that needs input.
+// Before this, chats only ever played the DONE chime.
+fn noteChatApprovalEdge(self: anytype, project_index: usize, thread_index: usize, thread: *ChatThread) void {
+    const send_state = thread.send_state;
+    if (!send_state.mutex.tryLock()) return;
+    const key: u64 = if (send_state.status != .pending)
+        0
+    else if (send_state.pending_approval) |approval|
+        std.hash.Wyhash.hash(0, approval.call_id) | 1
+    else
+        0;
+    send_state.mutex.unlock();
+
+    if (key == thread.approval_notified_key) return;
+    thread.approval_notified_key = key;
+    if (key == 0) return;
+    if (self.isChatThreadFocused(project_index, thread_index)) return;
+    if (project_index >= self.project_controller.projects.items.len) return;
+    fireChatNotification(self, &self.project_controller.projects.items[project_index], thread, .waiting);
+}
+
+// Chimes ERROR for a failed chat turn unless its pane already has focus.
+fn noteChatFailure(self: anytype, project_index: usize, thread_index: usize, thread: *ChatThread) void {
+    if (self.isChatThreadFocused(project_index, thread_index)) return;
+    if (project_index >= self.project_controller.projects.items.len) return;
+    fireChatNotification(self, &self.project_controller.projects.items[project_index], thread, .@"error");
+}
+
+fn fireChatNotification(self: anytype, project: anytype, thread: *ChatThread, chime: notifier.Chime) void {
     if (!self.app_config.notifications_enabled) return;
 
     // The pane-less Companion thread cannot be revealed by focusing a chat
@@ -8084,7 +8129,17 @@ pub fn noteChatCompletion(self: anytype, project_index: usize, thread_index: usi
 
     const dir = if (project.path.len > 0) std.fs.path.basename(project.path) else "";
     var body_buf: [256]u8 = undefined;
-    const body = completionNoticeBody(companion_name, dir, &body_buf);
+    const body = switch (chime) {
+        .done => completionNoticeBody(companion_name, dir, &body_buf),
+        .waiting => if (dir.len > 0)
+            std.fmt.bufPrint(&body_buf, "Needs your approval in {s}", .{dir}) catch "Needs your approval"
+        else
+            "Needs your approval",
+        .@"error" => if (dir.len > 0)
+            std.fmt.bufPrint(&body_buf, "Request failed in {s}", .{dir}) catch "Request failed"
+        else
+            "Request failed",
+    };
 
     const icon: ?notifier.Icon = switch (thread.provider) {
         .codex => .{ .key = "codex", .png_bytes = CODEX_LOGO_BYTES },
@@ -8096,7 +8151,7 @@ pub fn noteChatCompletion(self: anytype, project_index: usize, thread_index: usi
         .grok => .{ .key = "grok", .png_bytes = GROK_LOGO_BYTES },
         .muse, .custom_acp => null,
     };
-    notifier.notifyAgentDone(self.allocator, title, body, icon);
+    notifier.notifyAgent(self.allocator, title, body, icon, chime);
 }
 
 // A focused completion can be observed before the daemon snapshot carrying

@@ -16,11 +16,17 @@ const SYSTEM_PATH_DIRS = [_][]const u8{
     "/usr/sbin",
     "/sbin",
 };
+/// Includes the default bin directories of the provider CLIs' official
+/// installers (Claude, Codex, Cursor, FX, and Muse use `.local/bin`), which a
+/// GUI launched before the install never sees on its inherited PATH.
 const HOME_PATH_SUFFIXES = [_][]const u8{
     ".local/bin",
     ".bun/bin",
     ".cargo/bin",
     ".local/share/mise/shims",
+    ".opencode/bin",
+    ".grok/bin",
+    ".pi/agent/bin",
 };
 
 /// Builds an environment map with a PATH that works for packaged GUI launches.
@@ -323,6 +329,9 @@ fn appendWindowsUserPathDirsForOs(
     }
     if (env_map.get("LOCALAPPDATA")) |local_appdata| {
         try appendJoinedPathDirForOs(allocator, path_builder, os_tag, &.{ local_appdata, "Microsoft", "WindowsApps" });
+        // Official Codex and Cursor Agent installer locations.
+        try appendJoinedPathDirForOs(allocator, path_builder, os_tag, &.{ local_appdata, "Programs", "OpenAI", "Codex", "bin" });
+        try appendJoinedPathDirForOs(allocator, path_builder, os_tag, &.{ local_appdata, "cursor-agent" });
     }
     if (env_map.get("USERPROFILE")) |user_profile| {
         try appendJoinedPathDirForOs(allocator, path_builder, os_tag, &.{ user_profile, ".bun", "bin" });
@@ -330,6 +339,9 @@ fn appendWindowsUserPathDirsForOs(
         try appendJoinedPathDirForOs(allocator, path_builder, os_tag, &.{ user_profile, "scoop", "shims" });
         try appendJoinedPathDirForOs(allocator, path_builder, os_tag, &.{ user_profile, ".local", "bin" });
         try appendJoinedPathDirForOs(allocator, path_builder, os_tag, &.{ user_profile, ".local", "share", "mise", "shims" });
+        try appendJoinedPathDirForOs(allocator, path_builder, os_tag, &.{ user_profile, ".opencode", "bin" });
+        try appendJoinedPathDirForOs(allocator, path_builder, os_tag, &.{ user_profile, ".grok", "bin" });
+        try appendJoinedPathDirForOs(allocator, path_builder, os_tag, &.{ user_profile, ".pi", "agent", "bin" });
     }
 }
 

@@ -113,6 +113,8 @@ pub const ClaudeModelCacheState = struct {
     worker: ?std.Thread = null,
 };
 
+pub const MissingRequirement = headless.providers_protocol.MissingRequirement;
+
 pub const ProviderReadiness = enum {
     checking,
     missing,
@@ -183,6 +185,10 @@ pub const ProviderReadinessSnapshot = struct {
     package_managed: [PROVIDER_COUNT]bool = @splat(false),
     /// Indexed by `Provider`'s enum value. Empty uses the official installer.
     update_shells: [PROVIDER_COUNT]ProviderUpdateShell = @splat(.{}),
+    /// Indexed by `Provider`'s enum value. Set when the CLI is present but a
+    /// runtime it needs is not (Claude without Node.js); readiness stays
+    /// `.missing` so every existing "unusable" check still holds.
+    requirements: [PROVIDER_COUNT]?MissingRequirement = @splat(null),
 
     pub fn forProvider(self: ProviderReadinessSnapshot, provider: Provider) ProviderReadiness {
         return switch (provider) {
@@ -196,6 +202,20 @@ pub const ProviderReadinessSnapshot = struct {
             .muse => self.muse,
             .custom_acp => self.custom_acp,
         };
+    }
+
+    pub fn setForProvider(self: *ProviderReadinessSnapshot, provider: Provider, readiness: ProviderReadiness) void {
+        switch (provider) {
+            .codex => self.codex = readiness,
+            .opencode => self.opencode = readiness,
+            .claude => self.claude = readiness,
+            .cursor => self.cursor = readiness,
+            .pi => self.pi = readiness,
+            .fx => self.fx = readiness,
+            .grok => self.grok = readiness,
+            .muse => self.muse = readiness,
+            .custom_acp => self.custom_acp = readiness,
+        }
     }
 
     pub fn versionForProvider(self: *const ProviderReadinessSnapshot, provider: Provider) []const u8 {
@@ -214,9 +234,66 @@ pub const ProviderReadinessSnapshot = struct {
         return self.update_shells[@intFromEnum(provider)].slice();
     }
 
+    pub fn requirementForProvider(self: *const ProviderReadinessSnapshot, provider: Provider) ?MissingRequirement {
+        return self.requirements[@intFromEnum(provider)];
+    }
+
+    /// How close `provider` is to chatting: 0 ready (or still checking),
+    /// 1 installed but signed out or unverified, 2 installed but missing a
+    /// runtime (Node.js), 3 not installed. The model picker and new-chat
+    /// defaults prefer lower ranks, so an installed provider beats a missing one.
+    pub fn setupRank(self: *const ProviderReadinessSnapshot, provider: Provider) u8 {
+        return switch (self.forProvider(provider)) {
+            .ready, .checking => 0,
+            .signed_out, .unavailable => 1,
+            .missing => if (self.requirementForProvider(provider) != null) 2 else 3,
+        };
+    }
+
+    /// True when the CLI is on this machine, signed in or not (including one
+    /// that still lacks a runtime such as Node.js).
+    pub fn installedForProvider(self: *const ProviderReadinessSnapshot, provider: Provider) bool {
+        return switch (self.forProvider(provider)) {
+            .signed_out, .ready, .unavailable => true,
+            .missing => self.requirementForProvider(provider) != null,
+            .checking => false,
+        };
+    }
+
     pub fn hasReadyProvider(self: ProviderReadinessSnapshot) bool {
         return self.codex == .ready or self.opencode == .ready or self.claude == .ready or self.cursor == .ready or self.pi == .ready or self.fx == .ready or self.grok == .ready or self.muse == .ready or self.custom_acp == .ready;
     }
+
+    /// True when a provider Verde's MCP server can register with has its
+    /// CLI installed (signed in or not). The MCP dialog waits for one.
+    pub fn hasMcpCapableProviderInstalled(self: ProviderReadinessSnapshot) bool {
+        for (MCP_CAPABLE_PROVIDERS) |provider| {
+            // Present but unable to run yet still counts: its config can be written.
+            if (self.installedForProvider(provider)) return true;
+        }
+        return false;
+    }
+};
+
+/// Providers `provider.mcp.set` can register Verde with (see `McpSummary`).
+const MCP_CAPABLE_PROVIDERS = [_]Provider{ .codex, .claude, .cursor, .opencode, .pi, .fx, .grok };
+
+fn mcpIntegrationProvider(provider: Provider) ?headless.providers_protocol.IntegrationProvider {
+    return std.meta.stringToEnum(headless.providers_protocol.IntegrationProvider, @tagName(provider));
+}
+
+pub const McpSyncStatus = enum { idle, pending, completed };
+
+/// Background `provider.mcp.set` run that registers Verde with providers
+/// installed after Verde tools were enabled (see `syncMcpForNewProviders`).
+pub const McpSyncState = struct {
+    mutex: Mutex = .{},
+    status: McpSyncStatus = .idle,
+    worker: ?std.Thread = null,
+    summary: ?headless.providers_protocol.McpSummary = null,
+    /// Main thread only. Providers already tried this session, so a provider
+    /// whose registration keeps failing is not retried on every check.
+    attempted: [PROVIDER_COUNT]bool = @splat(false),
 };
 
 pub const ProviderReadinessStatus = enum {
@@ -234,6 +311,14 @@ pub const ProviderReadinessState = struct {
     /// copies `seen_revision` and redraws; the worker never reads it.
     revision: std.atomic.Value(u32) = .init(0),
     seen_revision: u32 = 0,
+    /// Main thread only. Bumped per started check, so a caller can tell the
+    /// check that answers its request from one already in flight.
+    generation: u32 = 0,
+    /// Main thread only. Start another check as soon as this one completes.
+    fresh_requested: bool = false,
+    /// Main thread only. Set once the first completed check has re-picked
+    /// defaults for chats created while every provider still read "checking".
+    startup_defaults_applied: bool = false,
 };
 
 pub const ProviderThreadOperationKind = enum {
@@ -311,6 +396,7 @@ pub const State = struct {
     custom_acp_options_hash: ?u64 = null,
     readiness: ProviderReadinessState = .{},
     thread_operation: ProviderThreadOperationState = .{},
+    mcp_sync: McpSyncState = .{},
 };
 
 const ModelCacheWorkerRequest = struct {
@@ -338,17 +424,7 @@ fn providerProtocolTag(provider: Provider) provider_types.Provider {
 }
 
 fn providerDisplayName(provider: Provider) []const u8 {
-    return switch (provider) {
-        .opencode => "OpenCode",
-        .codex => "Codex",
-        .cursor => "Cursor",
-        .claude => "Claude",
-        .pi => "pi",
-        .fx => "fx",
-        .grok => "grok",
-        .muse => "Muse",
-        .custom_acp => "Custom ACP",
-    };
+    return provider_setup.displayName(provider);
 }
 
 fn setProviderMcp(allocator: std.mem.Allocator, pref_path: []const u8, installed: bool) !headless.providers_protocol.McpSummary {
@@ -464,7 +540,13 @@ fn fetchProviderModels(provider: Provider, request: ModelCacheWorkerRequest) ?[]
     };
     defer parsed.deinit();
     const result = client.decodeProviderModelsList(&parsed) catch |err| {
-        log.warn("failed to decode {s} models from daemon: {s}", .{ providerDisplayName(provider), @errorName(err) });
+        // A provider whose CLI is not installed answers every launch's model
+        // refresh with a remote error; that is expected, not a failure.
+        if (err == error.RemoteError and provider_cli_version.executableForProvider(@tagName(provider)) == null) {
+            log.debug("skipped {s} models: CLI not installed", .{providerDisplayName(provider)});
+        } else {
+            log.warn("failed to decode {s} models from daemon: {s}", .{ providerDisplayName(provider), @errorName(err) });
+        }
         return null;
     };
     if (result.provider != protocol_provider) {
@@ -523,6 +605,7 @@ const FetchedProvider = struct {
     release: ProviderRelease = .unknown,
     package_managed: bool = false,
     update_shell: ProviderUpdateShell = .{},
+    requirement: ?MissingRequirement = null,
 };
 
 fn releaseForInstalledVersion(provider_name: []const u8, installed: []const u8, plan: *const provider_cli_version.UpdatePlan) ProviderRelease {
@@ -556,6 +639,7 @@ fn fetchProviderReadiness(
     if (result.version) |text| fetched.version.set(text);
     if (!result.installed) {
         fetched.readiness = .missing;
+        fetched.requirement = result.missing_requirement;
         return fetched;
     }
     if (result.ready) {
@@ -595,6 +679,7 @@ fn publishProviderReadiness(state: *ProviderReadinessState, provider: Provider, 
     state.snapshot.releases[index] = fetched.release;
     state.snapshot.package_managed[index] = fetched.package_managed;
     state.snapshot.update_shells[index] = fetched.update_shell;
+    state.snapshot.requirements[index] = fetched.requirement;
     state.mutex.unlock();
     _ = state.revision.fetchAdd(1, .release);
     loop_wakeup.notify();
@@ -875,7 +960,28 @@ pub fn startMuseModelOptionsRefresh(self: anytype) void {
 
 pub fn startProviderReadinessCheck(self: anytype) void {
     self.pollProviderReadiness();
+    spawnProviderReadinessCheck(self);
+}
 
+/// Starts a readiness check that begins after this call: when one is already
+/// in flight (its results may predate the caller's change), another starts
+/// as soon as it completes. Returns the generation whose completion answers
+/// the request; see `ProviderReadinessState.generation`.
+pub fn requestFreshProviderReadinessCheck(self: anytype) u32 {
+    self.pollProviderReadiness();
+    const readiness = &self.provider_controller.readiness;
+    readiness.mutex.lock();
+    const pending = readiness.status != .idle;
+    readiness.mutex.unlock();
+    if (pending) {
+        readiness.fresh_requested = true;
+        return readiness.generation +% 1;
+    }
+    spawnProviderReadinessCheck(self);
+    return readiness.generation;
+}
+
+fn spawnProviderReadinessCheck(self: anytype) void {
     self.provider_controller.readiness.mutex.lock();
     defer self.provider_controller.readiness.mutex.unlock();
     if (self.provider_controller.readiness.status == .pending) return;
@@ -897,6 +1003,7 @@ pub fn startProviderReadinessCheck(self: anytype) void {
     };
 
     self.provider_controller.readiness.status = .pending;
+    self.provider_controller.readiness.generation +%= 1;
     // Keep the last versions and Update/Latest labels visible. The worker
     // replaces each row as that provider finishes instead of blanking all
     // eight until the slowest lookup returns.
@@ -906,12 +1013,10 @@ pub fn startProviderReadinessCheck(self: anytype) void {
     }) catch {
         request.deinit();
         self.provider_controller.readiness.status = .completed;
-        self.provider_controller.readiness.snapshot = .{
-            .codex = .unavailable,
-            .opencode = .unavailable,
-            .claude = .unavailable,
-            .cursor = .unavailable,
-        };
+        // Every row, so none is left saying "Checking..." forever.
+        for (std.enums.values(Provider)) |provider| {
+            self.provider_controller.readiness.snapshot.setForProvider(provider, .unavailable);
+        }
         return;
     };
     self.markDirty();
@@ -919,7 +1024,9 @@ pub fn startProviderReadinessCheck(self: anytype) void {
 
 /// Completes the one-time MCP onboarding choice. Enabling registers Verde
 /// in every detected provider's user config; declining makes no external
-/// changes and remains reversible from Settings.
+/// changes and remains reversible from Settings. With no provider detected
+/// there is nothing to decide yet: the dialog steps aside for this session
+/// and returns after a provider is installed.
 pub fn completeMcpOnboarding(self: anytype, enable: bool) void {
     if (enable) {
         const summary = setProviderMcp(self.allocator, self.storage.pref_path, true) catch |err| {
@@ -930,30 +1037,141 @@ pub fn completeMcpOnboarding(self: anytype, enable: bool) void {
         };
         self.settings_controller.mcp_summary = summary;
         if (summary.detectedCount() == 0) {
-            self.setSidebarNotice("No supported agent providers were detected.");
-            self.markDirty();
+            self.setSidebarNotice("No supported agent providers were detected. Verde will ask again after you install one.");
+            snoozeMcpOnboarding(self);
             return;
         }
         self.app_config.mcp_integration_enabled = summary.installedCount() > 0;
-        if (summary.failedCount() > 0) {
-            self.setSidebarNotice("Enabled Verde MCP where possible; some provider configs could not be updated.");
-        } else if (summary.conflictCount() > 0) {
-            self.setSidebarNotice("Enabled Verde MCP where possible; an existing 'verde' entry was preserved.");
-        } else {
-            self.setSidebarNotice("Enabled Verde tools in detected agent providers.");
-        }
+        var notice_buf: [192]u8 = undefined;
+        self.setSidebarNotice(mcpEnableNotice(&notice_buf, summary.installedCount(), summary.conflictCount(), summary.failedCount()));
     } else {
+        if (!self.providerReadinessSnapshot().hasMcpCapableProviderInstalled()) {
+            snoozeMcpOnboarding(self);
+            return;
+        }
         self.app_config.mcp_integration_enabled = false;
         self.setSidebarNotice("Verde MCP tools were not enabled. You can enable them in Settings.");
     }
 
     self.app_config.mcp_onboarding_completed = true;
-    app_config.saveAppConfig(self.allocator, &self.app_config) catch |err| {
+    if (app_config.saveAppConfig(self.allocator, &self.app_config)) |_| {
+        // Our own write: the config watcher must not report it as an outside reload.
+        self.app_config_file_mtime = app_config.configFileMtime(self.allocator) catch self.app_config_file_mtime;
+    } else |err| {
         log.warn("failed to persist MCP onboarding choice: {s}", .{@errorName(err)});
         self.setSidebarNotice("MCP choice applied, but could not save Verde settings.");
-    };
+    }
     self.settings_controller.mcp_onboarding_visible = false;
     self.markDirty();
+}
+
+/// Hides the MCP dialog without recording a choice.
+fn snoozeMcpOnboarding(self: anytype) void {
+    self.settings_controller.mcp_onboarding_visible = false;
+    self.settings_controller.mcp_onboarding_snoozed = true;
+    self.markDirty();
+}
+
+/// Says what Enable actually did, from the registration counts.
+pub fn mcpEnableNotice(buf: []u8, installed: usize, conflicts: usize, failed: usize) []const u8 {
+    if (installed == 0) {
+        if (failed > 0) return "Could not enable Verde MCP: provider configs could not be updated.";
+        if (conflicts > 0) return "Verde MCP was not added: each detected provider already has a 'verde' entry, which was kept.";
+        return "Verde MCP was not added to any provider.";
+    }
+    const plural: []const u8 = if (installed == 1) "" else "s";
+    if (failed > 0) return std.fmt.bufPrint(buf, "Enabled Verde MCP for {d} provider{s}; {d} config(s) could not be updated.", .{ installed, plural, failed }) catch "Enabled Verde MCP; some provider configs could not be updated.";
+    if (conflicts > 0) return std.fmt.bufPrint(buf, "Enabled Verde MCP for {d} provider{s}; kept {d} existing 'verde' entr{s}.", .{ installed, plural, conflicts, if (conflicts == 1) "y" else "ies" }) catch "Enabled Verde MCP; an existing 'verde' entry was kept.";
+    return std.fmt.bufPrint(buf, "Enabled Verde tools for {d} detected provider{s}.", .{ installed, plural }) catch "Enabled Verde tools in detected agent providers.";
+}
+
+/// With Verde tools enabled, registers them with any MCP-capable provider the
+/// check found installed that the last registration did not cover (installed
+/// after the user turned the tools on). Runs off the UI thread; each provider
+/// is tried once per session.
+fn syncMcpForNewProviders(self: anytype, snapshot: ProviderReadinessSnapshot) void {
+    if (!self.app_config.mcp_integration_enabled) return;
+    const sync = &self.provider_controller.mcp_sync;
+    if (sync.status != .idle) return;
+    const summary = self.settings_controller.mcp_summary;
+    var wanted = false;
+    for (MCP_CAPABLE_PROVIDERS) |provider| {
+        if (sync.attempted[@intFromEnum(provider)]) continue;
+        if (!snapshot.installedForProvider(provider)) continue;
+        const integration = mcpIntegrationProvider(provider) orelse continue;
+        switch (summary.forProvider(integration)) {
+            .unavailable, .not_installed => {},
+            .installed, .conflict, .failed => continue,
+        }
+        sync.attempted[@intFromEnum(provider)] = true;
+        wanted = true;
+    }
+    if (!wanted) return;
+    const pref_path = std.heap.page_allocator.dupe(u8, self.storage.pref_path) catch return;
+    sync.status = .pending;
+    sync.worker = std.Thread.spawn(.{}, mcpSyncWorker, .{ sync, pref_path }) catch {
+        std.heap.page_allocator.free(pref_path);
+        sync.status = .idle;
+        return;
+    };
+}
+
+fn mcpSyncWorker(sync: *McpSyncState, pref_path: []u8) void {
+    defer std.heap.page_allocator.free(pref_path);
+    const summary: ?headless.providers_protocol.McpSummary = setProviderMcp(std.heap.page_allocator, pref_path, true) catch |err| blk: {
+        log.warn("failed to register Verde MCP with newly installed providers: {s}", .{@errorName(err)});
+        break :blk null;
+    };
+    sync.mutex.lock();
+    sync.summary = summary;
+    sync.status = .completed;
+    sync.mutex.unlock();
+    loop_wakeup.notify();
+}
+
+/// Applies a finished background registration: the Settings summary updates
+/// and one quiet notice names the providers that gained Verde tools.
+fn pollMcpSync(self: anytype) void {
+    const sync = &self.provider_controller.mcp_sync;
+    sync.mutex.lock();
+    const completed = sync.status == .completed;
+    const summary = sync.summary;
+    sync.mutex.unlock();
+    if (!completed) return;
+    finishMcpSyncWorker(self);
+    const next = summary orelse return;
+    const previous = self.settings_controller.mcp_summary;
+    self.settings_controller.mcp_summary = next;
+    var names_buf: [96]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&names_buf);
+    var added: usize = 0;
+    for (MCP_CAPABLE_PROVIDERS) |provider| {
+        const integration = mcpIntegrationProvider(provider) orelse continue;
+        if (next.forProvider(integration) != .installed or previous.forProvider(integration) == .installed) continue;
+        if (added > 0) writer.writeAll(", ") catch {};
+        writer.writeAll(providerDisplayName(provider)) catch {};
+        added += 1;
+    }
+    if (added > 0) {
+        var notice_buf: [160]u8 = undefined;
+        self.setSidebarNotice(std.fmt.bufPrint(&notice_buf, "Added Verde tools to {s}.", .{names_buf[0..writer.end]}) catch "Added Verde tools to a newly installed provider.");
+    }
+    self.markDirty();
+}
+
+/// Joins a background MCP registration and drops its result. Settings calls
+/// this before its own MCP change so a late worker cannot undo the user's
+/// choice; AppState.deinit calls it on shutdown.
+pub fn finishMcpSyncWorker(self: anytype) void {
+    const sync = &self.provider_controller.mcp_sync;
+    if (sync.worker) |worker| {
+        worker.join();
+        sync.worker = null;
+    }
+    sync.mutex.lock();
+    sync.status = .idle;
+    sync.summary = null;
+    sync.mutex.unlock();
 }
 
 pub fn pollProviderReadiness(self: anytype) void {
@@ -961,6 +1179,7 @@ pub fn pollProviderReadiness(self: anytype) void {
     provider_setup.poll(self, platform_runtime.unixTimestampMs());
     self.pollProviderThreadOperation();
     self.pollProviderSlashCatalog();
+    pollMcpSync(self);
     const revision = self.provider_controller.readiness.revision.load(.acquire);
     if (revision != self.provider_controller.readiness.seen_revision) {
         self.provider_controller.readiness.seen_revision = revision;
@@ -969,37 +1188,65 @@ pub fn pollProviderReadiness(self: anytype) void {
     var completed = false;
     var snapshot: ProviderReadinessSnapshot = .{};
 
-    self.provider_controller.readiness.mutex.lock();
-    if (self.provider_controller.readiness.status == .completed) {
-        snapshot = self.provider_controller.readiness.snapshot;
-        self.provider_controller.readiness.status = .idle;
+    const readiness = &self.provider_controller.readiness;
+    readiness.mutex.lock();
+    if (readiness.status == .completed) {
+        snapshot = readiness.snapshot;
+        readiness.status = .idle;
         completed = true;
     }
-    self.provider_controller.readiness.mutex.unlock();
+    readiness.mutex.unlock();
     if (!completed) return;
 
     self.finishProviderReadinessThread();
-    // Sign-in/install from the dialog worked: close the whole dialog and say
-    // so, rather than leaving the user to click Back and then Not now.
+    if (!readiness.startup_defaults_applied) {
+        readiness.startup_defaults_applied = true;
+        self.reapplyDefaultsToUnstartedChats();
+    }
+    const generation = readiness.generation;
     const setup = &self.settings_controller.provider_setup;
-    if (self.settings_controller.provider_onboarding_visible and setup.visible() and snapshot.forProvider(setup.provider) == .ready) {
+    provider_setup.noteReadinessCompleted(setup, snapshot, generation);
+    const recheck = self.settings_controller.provider_recheck_generation;
+    if (recheck != 0 and generation >= recheck) self.settings_controller.provider_recheck_generation = 0;
+    if (readiness.fresh_requested) {
+        readiness.fresh_requested = false;
+        spawnProviderReadinessCheck(self);
+    }
+    syncMcpForNewProviders(self, snapshot);
+
+    // Sign-in/install from the dialog worked: close the whole dialog and say
+    // so, rather than leaving the user to click Back and then Not now. An
+    // update starts from a ready CLI, so it waits for its command to exit.
+    const updating = setup.mode == .update and setup.status == .running;
+    // A remote target closes from its own status (`provider_setup`).
+    if (self.settings_controller.provider_onboarding_visible and setup.visible() and !updating and setup.target_profile_id == null and snapshot.forProvider(setup.provider) == .ready) {
         const provider = setup.provider;
         self.dismissProviderOnboarding();
         var notice_buf: [128]u8 = undefined;
         const notice = std.fmt.bufPrint(&notice_buf, "{s} is ready. Pick it from the model menu in any chat.", .{providerDisplayName(provider)}) catch "Provider is ready.";
         self.setSidebarNotice(notice);
     }
+    // Never surface a dialog underneath Settings; keys would reach the hidden
+    // dialog first. The next check after Settings closes shows it.
+    const settings_open = self.settings_controller.modal_visible;
     if (snapshot.hasReadyProvider()) {
         // Opened on purpose, or mid sign-in: let the user see the result.
         if (!self.settings_controller.provider_onboarding_pinned and !self.settings_controller.provider_setup.visible()) {
             self.settings_controller.provider_onboarding_visible = false;
         }
         self.settings_controller.provider_onboarding_dismissed = false;
-    } else if (!self.settings_controller.provider_onboarding_dismissed) {
+    } else if (!self.settings_controller.provider_onboarding_dismissed and !settings_open) {
         self.settings_controller.provider_onboarding_visible = true;
     }
-    self.settings_controller.mcp_onboarding_visible = !self.app_config.mcp_onboarding_completed;
-    if (self.settings_controller.mcp_onboarding_visible) self.blurPaletteComposer();
+    // MCP registration needs an installed provider to write to; until one
+    // exists the dialog could only fail. Re-evaluated on every check so it
+    // appears after the first install.
+    if (!settings_open) {
+        self.settings_controller.mcp_onboarding_visible = !self.app_config.mcp_onboarding_completed and
+            !self.settings_controller.mcp_onboarding_snoozed and
+            snapshot.hasMcpCapableProviderInstalled();
+        if (self.settings_controller.mcp_onboarding_visible) self.blurPaletteComposer();
+    }
     self.markDirty();
 }
 
@@ -1011,6 +1258,7 @@ pub fn providerReadinessSnapshot(self: anytype) ProviderReadinessSnapshot {
 
 pub fn dismissProviderOnboarding(self: anytype) void {
     provider_setup.close(self);
+    self.settings_controller.provider_onboarding_highlight = null;
     self.settings_controller.provider_onboarding_pinned = false;
     self.settings_controller.provider_onboarding_visible = false;
     self.settings_controller.provider_onboarding_dismissed = true;
@@ -1019,10 +1267,46 @@ pub fn dismissProviderOnboarding(self: anytype) void {
 
 pub fn recheckProviderReadiness(self: anytype) void {
     self.settings_controller.provider_onboarding_pinned = true;
-    self.settings_controller.provider_setup.last_recheck_ms = platform_runtime.unixTimestampMs();
+    const now_ms = platform_runtime.unixTimestampMs();
+    self.settings_controller.provider_setup.last_recheck_ms = now_ms;
+    // A check with nothing installed answers in a few ms; hold "Checking..."
+    // long enough to read, so the click visibly did something.
+    self.settings_controller.provider_setup.checking_until_ms = now_ms + provider_setup.MIN_CHECKING_VISIBLE_MS;
     self.settings_controller.provider_onboarding_visible = true;
     self.settings_controller.provider_onboarding_dismissed = false;
-    self.startProviderReadinessCheck();
+    // "Check again" shows "Checking..." until a check started after the
+    // click completes, even when a timer check was already running.
+    self.settings_controller.provider_recheck_generation = requestFreshProviderReadinessCheck(self);
+    provider_setup.requestRemoteRefresh(&self.settings_controller.provider_setup);
+    self.markDirty();
+}
+
+/// Opens the provider dialog scrolled to `provider`'s row, highlighted, so
+/// a model picked from an unconnected provider lands on its Install / Sign in.
+pub fn showProviderSetupFor(self: anytype, provider: Provider) void {
+    self.settings_controller.provider_onboarding_highlight = provider;
+    self.settings_controller.provider_onboarding_scroll_to_highlight = true;
+    recheckProviderReadiness(self);
+}
+
+/// Settings > Providers Install / Sign in / Update: runs the command in the
+/// dialog's own setup terminal, so it works before any workspace exists.
+pub fn openProviderSetupCommand(self: anytype, provider: Provider, mode: provider_setup.Mode, shell: []const u8) void {
+    // The dialog draws below Settings; close Settings so it is on top.
+    if (self.settings_controller.modal_visible) self.cancelSettingsModal();
+    self.settings_controller.provider_onboarding_highlight = provider;
+    self.settings_controller.provider_onboarding_scroll_to_highlight = true;
+    self.settings_controller.provider_onboarding_pinned = true;
+    self.settings_controller.provider_onboarding_visible = true;
+    self.settings_controller.provider_onboarding_dismissed = false;
+    // These are this computer's CLIs, whatever runtime the active chat uses.
+    provider_setup.pinLocal(self);
+    provider_setup.startCommand(self, provider, mode, shell);
+    if (!self.settings_controller.provider_setup.visible()) {
+        // The terminal failed to start; the list still offers Copy.
+        self.settings_controller.provider_setup.notes[@intFromEnum(provider)] = .failed;
+    }
+    self.markDirty();
 }
 
 pub fn openProviderSetupGuide(self: anytype) void {
@@ -1032,6 +1316,16 @@ pub fn openProviderSetupGuide(self: anytype) void {
         return;
     };
     self.setSidebarNotice("Opened provider setup guide.");
+}
+
+/// "Get Node.js" for a CLI Verde runs through Node (Claude Code).
+pub fn openNodeDownloadPage(self: anytype) void {
+    utils.openUrlInDefaultBrowser(self.allocator, provider_setup.NODE_DOWNLOAD_URL) catch |err| {
+        log.warn("failed to open the Node.js download page: {s}", .{@errorName(err)});
+        self.setSidebarNotice("Could not open nodejs.org. Install Node.js 18+ with your package manager.");
+        return;
+    };
+    self.setSidebarNotice("Opened nodejs.org. Install Node.js 18+, then Check again.");
 }
 
 fn createModelCacheWorkerRequest(self: anytype) ?ModelCacheWorkerRequest {
@@ -1055,10 +1349,14 @@ fn createModelCacheWorkerRequest(self: anytype) ?ModelCacheWorkerRequest {
     };
 }
 
-fn spawnModelCacheWorker(self: anytype, comptime worker: anytype, state: anytype) ?std.Thread {
+/// Null when there is nothing to fetch (no workspace yet, or the CLI is
+/// known to be missing) or the worker could not start; only the latter warns.
+fn spawnModelCacheWorker(self: anytype, comptime worker: anytype, state: anytype, provider: Provider) ?std.Thread {
+    if (self.providerReadinessSnapshot().forProvider(provider) == .missing) return null;
     const request = createModelCacheWorkerRequest(self) orelse return null;
-    return std.Thread.spawn(.{}, worker, .{ state, request }) catch {
+    return std.Thread.spawn(.{}, worker, .{ state, request }) catch |err| {
         request.deinit();
+        log.warn("failed to spawn {s} model cache worker: {s}", .{ providerDisplayName(provider), @errorName(err) });
         return null;
     };
 }
@@ -1075,6 +1373,7 @@ pub fn refreshOpencodeModelOptionsCacheAsync(self: anytype) void {
         self,
         opencodeModelCacheWorker,
         &self.provider_controller.opencode_model_cache,
+        .opencode,
     ) orelse {
         self.provider_controller.opencode_model_cache.status = .idle;
         return;
@@ -1093,6 +1392,7 @@ pub fn refreshCursorModelOptionsCacheAsync(self: anytype) void {
         self,
         cursorModelCacheWorker,
         &self.provider_controller.cursor_model_cache,
+        .cursor,
     ) orelse {
         self.provider_controller.cursor_model_cache.status = .idle;
         return;
@@ -1111,9 +1411,9 @@ pub fn refreshClaudeModelOptionsCacheAsync(self: anytype) void {
         self,
         claudeModelCacheWorker,
         &self.provider_controller.claude_model_cache,
+        .claude,
     ) orelse {
         self.provider_controller.claude_model_cache.status = .idle;
-        log.warn("failed to spawn Claude model cache worker", .{});
         return;
     };
 }
@@ -1130,9 +1430,9 @@ pub fn refreshPiModelOptionsCacheAsync(self: anytype) void {
         self,
         piModelCacheWorker,
         &self.provider_controller.pi_model_cache,
+        .pi,
     ) orelse {
         self.provider_controller.pi_model_cache.status = .idle;
-        log.warn("failed to spawn pi model cache worker", .{});
         return;
     };
 }
@@ -1149,9 +1449,9 @@ pub fn refreshFxModelOptionsCacheAsync(self: anytype) void {
         self,
         fxModelCacheWorker,
         &self.provider_controller.fx_model_cache,
+        .fx,
     ) orelse {
         self.provider_controller.fx_model_cache.status = .idle;
-        log.warn("failed to spawn fx model cache worker", .{});
         return;
     };
 }
@@ -1168,9 +1468,9 @@ pub fn refreshGrokModelOptionsCacheAsync(self: anytype) void {
         self,
         grokModelCacheWorker,
         &self.provider_controller.grok_model_cache,
+        .grok,
     ) orelse {
         self.provider_controller.grok_model_cache.status = .idle;
-        log.warn("failed to spawn grok model cache worker", .{});
         return;
     };
 }
@@ -1187,9 +1487,9 @@ pub fn refreshMuseModelOptionsCacheAsync(self: anytype) void {
         self,
         museModelCacheWorker,
         &self.provider_controller.muse_model_cache,
+        .muse,
     ) orelse {
         self.provider_controller.muse_model_cache.status = .idle;
-        log.warn("failed to spawn muse model cache worker", .{});
         return;
     };
 }
@@ -1646,6 +1946,32 @@ pub fn claudeModelOptionForRef(self: anytype, model_ref: ?[:0]const u8) ?ModelOp
     const base = claudeModelBaseRef(ref);
     if (base.len == ref.len) return null;
     return findModelOptionByValue(options, base);
+}
+
+/// Display name for a model ref the live catalog does not list (Claude's live
+/// list can omit the built-in `fable[1m]` default), from the built-in catalog,
+/// then Claude's base ref, so labels never fall back to the raw id when a
+/// name is known. `live` is the provider's current option list.
+pub fn knownModelLabel(provider: Provider, live: []const ModelOption, ref: []const u8) ?[]const u8 {
+    const builtin_options: []const ModelOption = switch (provider) {
+        .codex => provider_models.CODEX_MODEL_OPTIONS[0..],
+        .claude => CLAUDE_MODEL_OPTIONS[0..],
+        .cursor => CURSOR_MODEL_OPTIONS[0..],
+        .opencode => OPENCODE_MODEL_OPTIONS[0..],
+        .pi => PI_MODEL_OPTIONS[0..],
+        .fx => FX_MODEL_OPTIONS[0..],
+        .grok => GROK_MODEL_OPTIONS[0..],
+        .muse => MUSE_MODEL_OPTIONS[0..],
+        .custom_acp => &.{},
+    };
+    if (findModelOptionByValue(live, ref)) |option| return option.label;
+    if (findModelOptionByValue(builtin_options, ref)) |option| return option.label;
+    if (provider != .claude) return null;
+    const base = claudeModelBaseRef(ref);
+    if (base.len == ref.len) return null;
+    if (findModelOptionByValue(live, base)) |option| return option.label;
+    if (findModelOptionByValue(builtin_options, base)) |option| return option.label;
+    return null;
 }
 
 /// `ref` without a trailing `[...]` variant suffix (`opus[1m]` -> `opus`).
@@ -2159,4 +2485,41 @@ pub fn pollClaudeModelOptionsCache(self: anytype) void {
         },
         else => {},
     }
+}
+
+test "MCP dialog waits for an installed MCP-capable provider" {
+    var snapshot: ProviderReadinessSnapshot = .{};
+    try std.testing.expect(!snapshot.hasMcpCapableProviderInstalled());
+    inline for (.{ "codex", "opencode", "claude", "cursor", "pi", "fx", "grok", "muse", "custom_acp" }) |name| @field(snapshot, name) = .missing;
+    try std.testing.expect(!snapshot.hasMcpCapableProviderInstalled());
+    // Muse has no MCP registration, so installing it alone is not enough.
+    snapshot.muse = .ready;
+    try std.testing.expect(!snapshot.hasMcpCapableProviderInstalled());
+    snapshot.grok = .signed_out;
+    try std.testing.expect(snapshot.hasMcpCapableProviderInstalled());
+}
+
+test "MCP enable notice reports what was actually enabled" {
+    var buf: [192]u8 = undefined;
+    try std.testing.expectEqualStrings("Verde MCP was not added: each detected provider already has a 'verde' entry, which was kept.", mcpEnableNotice(&buf, 0, 2, 0));
+    try std.testing.expectEqualStrings("Could not enable Verde MCP: provider configs could not be updated.", mcpEnableNotice(&buf, 0, 1, 1));
+    try std.testing.expectEqualStrings("Enabled Verde MCP for 2 providers; kept 1 existing 'verde' entry.", mcpEnableNotice(&buf, 2, 1, 0));
+    try std.testing.expectEqualStrings("Enabled Verde tools for 1 detected provider.", mcpEnableNotice(&buf, 1, 0, 0));
+}
+
+test "every provider has a readiness setter" {
+    var snapshot: ProviderReadinessSnapshot = .{};
+    for (std.enums.values(Provider)) |provider| snapshot.setForProvider(provider, .unavailable);
+    for (std.enums.values(Provider)) |provider| try std.testing.expectEqual(ProviderReadiness.unavailable, snapshot.forProvider(provider));
+}
+
+test "known model label names built-in defaults the live catalog omits" {
+    const live = [_]ModelOption{
+        .{ .label = "Opus", .value = "opus" },
+        .{ .label = "Sonnet", .value = "sonnet" },
+    };
+    try std.testing.expectEqualStrings("Fable 5.1", knownModelLabel(.claude, &live, DEFAULT_CLAUDE_MODEL).?);
+    try std.testing.expectEqualStrings("Sonnet", knownModelLabel(.claude, &live, "sonnet[1m]").?);
+    try std.testing.expect(knownModelLabel(.claude, &live, "mystery") == null);
+    try std.testing.expect(knownModelLabel(.custom_acp, &.{}, "agent") == null);
 }

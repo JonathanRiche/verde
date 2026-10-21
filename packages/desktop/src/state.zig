@@ -417,7 +417,7 @@ fn durableRefreshAlreadyProjected(
     return baseline_paired;
 }
 
-const ChangeCursorPollOutcome = enum { advanced, heartbeat, snapshot_required, busy, unavailable };
+const ChangeCursorPollOutcome = enum { advanced, heartbeat, snapshot_required, busy, unavailable, cancelled };
 
 /// On null, `failure_reason` names the exact silent arm for the caller's
 /// streak logging (static strings only; safe across the arena teardown).
@@ -493,13 +493,20 @@ fn pollCoreChangesOnce(storage: *const Storage, loop: *ChangeCursorLoopState, cu
     var transport: daemon_client.HeadlessTransport = .{
         .allocator = decode_arena.allocator(),
         .pref_path = storage.pref_path,
+        // Shutdown abandons the parked wait instead of joining through the
+        // rest of the long-poll budget.
+        .cancel = &loop.shutdown,
     };
     var client = daemon_client.headlessClient(decode_arena.allocator(), &transport);
     const request: headless.changes_protocol.ChangesRequest = .{
         .cursor = cursor,
         .wait_ms = CHANGE_CURSOR_WAIT_MS,
     };
-    var parsed = client.call(headless.changes_protocol.METHOD_CORE_CHANGES, request) catch return .unavailable;
+    var parsed = client.call(headless.changes_protocol.METHOD_CORE_CHANGES, request) catch |err| {
+        // A cancelled wait is shutdown, not a daemon outage; the loop exits
+        // on its next shutdown check without logging a failed poll.
+        return if (err == error.RequestCanceled) .cancelled else .unavailable;
+    };
     defer parsed.deinit();
     if (parsed.response.err) |err| {
         if (std.mem.eql(u8, err.code, headless.changes_protocol.ERR_REVISION_EXPIRED)) {
@@ -663,6 +670,7 @@ fn changeCursorLoopMain(storage: *const Storage, loop: *ChangeCursorLoopState) v
                 // iteration through the null-cursor arm below.
                 .snapshot_required => backoff_ms = CHANGE_CURSOR_RETRY_MIN_MS,
                 .busy => changeCursorSleep(loop, CHANGE_CURSOR_BUSY_RETRY_MS),
+                .cancelled => {},
                 .unavailable => {
                     poll_failures += 1;
                     if (poll_failures == 1 or poll_failures % 24 == 0) {
@@ -3217,8 +3225,9 @@ fn paletteModelPickerBadge(context: ?*anyopaque, index: usize) []const u8 {
     const state = appStateFromContext(context) orelse return "";
     const entry = modelPickerEntryAt(state, index) orelse return "";
     // Unconnected providers say what they need instead of "Default".
-    switch (state.providerReadinessSnapshot().forProvider(entry.provider)) {
-        .missing => return "Install",
+    const snapshot = state.providerReadinessSnapshot();
+    switch (snapshot.forProvider(entry.provider)) {
+        .missing => return if (snapshot.requirementForProvider(entry.provider) != null) provider_setup.NEEDS_NODE_STATUS else "Install",
         .signed_out, .unavailable => return "Sign in",
         .ready, .checking => {},
     }
@@ -3520,7 +3529,15 @@ pub const PaletteModelPicker = palette.richPicker(.{
     .rail_icon_size = 24.0,
     .rail_all_icon = "\u{EB59}",
     .rail_primary_filter = paletteModelPickerFavorite,
+    .empty_text = "No models match.",
+    .empty_primary_filter_text = "No favorite models yet. Star a model in a provider's list to pin it here.",
     .render_rail_icon = paletteModelPickerRailIcon,
+    // Every enabled provider keeps a rail icon (connected ones first, see
+    // `rebuildModelPickerEntries`); the rail scrolls inside the popover
+    // instead of growing it. It ends with a "+" (codicon-add) that opens
+    // Settings → Providers, where custom ACP agents are added too.
+    .rail_scrolls = true,
+    .rail_add_icon = "\u{EA60}",
     // codicon-check marks the active model inline after its name.
     .check_icon = "\u{EAB2}",
     .check_inline = true,
@@ -3583,7 +3600,7 @@ fn paletteDirectoryPickerEvent(context: ?*anyopaque, event: palette.RichPickerEv
         .open_changed => |open| {
             if (!open) state.restoreComposerAfterShortcutPopover();
         },
-        .highlighted => {},
+        .highlighted, .rail_add => {},
     }
 }
 
@@ -4159,7 +4176,7 @@ fn paletteRuntimePickerEvent(context: ?*anyopaque, event: palette.RichPickerEven
         .open_changed => |open| {
             if (!open) state.restoreComposerAfterShortcutPopover();
         },
-        .highlighted => {},
+        .highlighted, .rail_add => {},
     }
 }
 
@@ -4173,7 +4190,12 @@ fn paletteModelPickerEvent(context: ?*anyopaque, event: palette.RichPickerEvent)
             // provider dialog with its Sign in / Install action instead.
             if (!state.providerUsable(entry.provider)) {
                 state.closePaletteModelPicker();
-                state.recheckProviderReadiness();
+                // Custom ACP agents have no dialog row; they live in Settings.
+                if (entry.provider == .custom_acp) {
+                    state.openSettingsToCategory(.providers);
+                } else {
+                    state.showProviderSetupFor(entry.provider);
+                }
                 return;
             }
             if (entry.provider != state.currentThread().provider) {
@@ -4206,6 +4228,10 @@ fn paletteModelPickerEvent(context: ?*anyopaque, event: palette.RichPickerEvent)
         },
         .open_changed => |open| {
             if (!open) state.restoreComposerAfterShortcutPopover();
+        },
+        .rail_add => {
+            state.openSettingsToCategory(.providers);
+            state.markDirty();
         },
         .highlighted => {},
     }
@@ -5025,6 +5051,10 @@ pub const AppState = struct {
     /// The folder browser is the Add Workspace flow itself (no creator modal):
     /// a pick imports directly and it offers a Verde-managed folder.
     project_directory_picker_adds_workspace: bool,
+    /// Set when the next `importProjectFromInput` adds a folder Verde just
+    /// created (folder browser "Create directory", Create directory in the
+    /// creator), so it says "Workspace created." rather than "imported".
+    project_import_directory_created: bool = false,
     picker_state: PickerState,
     folder_browser: folder_browser.FolderBrowser,
     custom_agent_form: custom_agent_form.Form = .{},
@@ -6288,7 +6318,11 @@ pub const AppState = struct {
     pub const providerReadinessSnapshot = provider_controller.providerReadinessSnapshot;
     pub const dismissProviderOnboarding = provider_controller.dismissProviderOnboarding;
     pub const recheckProviderReadiness = provider_controller.recheckProviderReadiness;
+    pub const requestFreshProviderReadinessCheck = provider_controller.requestFreshProviderReadinessCheck;
+    pub const showProviderSetupFor = provider_controller.showProviderSetupFor;
+    pub const openProviderSetupCommand = provider_controller.openProviderSetupCommand;
     pub const openProviderSetupGuide = provider_controller.openProviderSetupGuide;
+    pub const openNodeDownloadPage = provider_controller.openNodeDownloadPage;
     pub const refreshOpencodeModelOptionsCacheAsync = provider_controller.refreshOpencodeModelOptionsCacheAsync;
     pub const refreshCursorModelOptionsCacheAsync = provider_controller.refreshCursorModelOptionsCacheAsync;
     pub const refreshClaudeModelOptionsCacheAsync = provider_controller.refreshClaudeModelOptionsCacheAsync;
@@ -6427,6 +6461,7 @@ pub const AppState = struct {
         };
         defer self.allocator.free(created);
         self.setSidebarNotice("Directory created. Adding workspace...");
+        self.project_import_directory_created = true;
         try self.importProjectFromInput();
     }
 
@@ -6548,6 +6583,9 @@ pub const AppState = struct {
     pub fn importProjectFromInput(self: *AppState) !void {
         const raw_path = self.importDirectoryDraft();
         const managed_workspace = std.mem.trim(u8, raw_path, &std.ascii.whitespace).len == 0;
+        // One-shot: a later import of an existing folder must say "imported".
+        const created_by_verde = managed_workspace or self.project_import_directory_created;
+        self.project_import_directory_created = false;
         const managed_directory_number = self.project_controller.next_project_number;
         const display_number = nextProjectDisplayNumber(self.project_controller.projects.items.len);
 
@@ -6585,6 +6623,8 @@ pub const AppState = struct {
             },
             else => return err,
         };
+        // createProjectFromPathWithLabel says "imported"; Verde made this one.
+        if (created_by_verde) self.setSidebarNotice("Workspace created.");
         self.project_controller.next_project_number += 1;
         self.clearImportPath();
         self.clearImportProjectName();
@@ -6680,6 +6720,9 @@ pub const AppState = struct {
     /// Completes the folder browser with `path` (null cancels).
     pub fn finishFolderBrowser(self: *AppState, path: ?[]const u8) void {
         if (!self.folder_browser.open) return;
+        // Picking the folder the browser's "Create directory" just made.
+        const adds_workspace = !self.composer_controller.browse_for_chat_directory and !self.project_directory_picker_create_parent and self.workspace_folder_picker_id == null;
+        self.project_import_directory_created = if (path) |value| adds_workspace and self.folder_browser.createdThisSession(value) else false;
         const owned: ?[]u8 = if (path) |value| std.heap.page_allocator.dupe(u8, value) catch null else null;
         self.picker_state.mutex.lock();
         if (owned) |value| {
@@ -8321,10 +8364,34 @@ pub const AppState = struct {
         }
         // Settings keeps the configured default enabled whenever it disables a provider.
         const preferred = providerFromConfig(last_provider orelse self.app_config.new_chat_provider);
-        // A new chat should not land on a provider the user cannot run yet.
-        const fallback = if (self.providerUsable(preferred)) null else self.firstReadyChatProvider();
+        // A new chat should not land on a provider the user cannot run yet:
+        // a ready one wins, else an installed one beats one that is missing.
+        const fallback = self.betterChatProviderThan(preferred);
         try self.applyProviderModelDefaults(thread, fallback orelse preferred, fallback == null and last_provider == null);
         _ = try self.applyWorkspaceRuntimeDefaultToThread(project.id, thread);
+    }
+
+    /// Chats created before the first readiness check finished treated every
+    /// provider as usable, so a fresh install's first chat could land on a CLI
+    /// that is missing or signed out. Once that check completes, re-pick the
+    /// defaults for chats that were never sent, when a provider closer to
+    /// ready (signed in, else at least installed) is enabled.
+    pub fn reapplyDefaultsToUnstartedChats(self: *AppState) void {
+        var changed = false;
+        for (self.project_controller.projects.items, 0..) |*project, project_index| {
+            for (project.threads.items, 0..) |*thread, thread_index| {
+                if (thread.committed or thread.archived or thread.projection_borrowed) continue;
+                if (thread.messages.items.len != 0 or thread.persisted_message_offset != 0) continue;
+                if (thread.provider_thread_id != null) continue;
+                if (self.betterChatProviderThan(thread.provider) == null) continue;
+                self.applyNewChatDefaults(project_index, thread_index) catch |err| {
+                    log.warn("failed to re-apply new-chat defaults: {s}", .{@errorName(err)});
+                    continue;
+                };
+                changed = true;
+            }
+        }
+        if (changed) self.markDirty();
     }
 
     /// True unless the last readiness check found the provider missing or not
@@ -8336,14 +8403,31 @@ pub const AppState = struct {
         };
     }
 
-    /// First enabled provider the last readiness check confirmed signed in.
-    fn firstReadyChatProvider(self: *AppState) ?Provider {
+    /// True unless Settings disabled `provider` for chats.
+    pub fn chatProviderEnabled(self: *const AppState, provider: Provider) bool {
+        return self.app_config.isProviderEnabled(configChatProvider(provider));
+    }
+
+    /// The enabled provider closest to chatting (`setupRank`: ready, then
+    /// installed but signed out, then installed without Node.js), when it is
+    /// strictly closer than `current`; null keeps `current`. A still-checking
+    /// or ready `current` is never replaced, and neither is anything by a
+    /// provider that is missing too.
+    fn betterChatProviderThan(self: *AppState, current: Provider) ?Provider {
         const snapshot = self.providerReadinessSnapshot();
+        var best: ?Provider = null;
+        var best_rank = snapshot.setupRank(current);
         for (COMPOSER_PROVIDER_OPTIONS) |candidate| {
-            if (!self.app_config.isProviderEnabled(configChatProvider(candidate))) continue;
-            if (snapshot.forProvider(candidate) == .ready) return candidate;
+            if (!self.chatProviderEnabled(candidate)) continue;
+            const rank = snapshot.setupRank(candidate);
+            // Custom ACP agents have nothing to install; only a ready one counts.
+            if (candidate == .custom_acp and rank != 0) continue;
+            if (rank < best_rank and snapshot.forProvider(candidate) != .checking) {
+                best = candidate;
+                best_rank = rank;
+            }
         }
-        return null;
+        return best;
     }
 
     fn applyProviderModelDefaults(self: *AppState, thread: *ChatThread, provider: Provider, use_configured: bool) !void {
@@ -10295,7 +10379,10 @@ pub const AppState = struct {
         if (self.composerModelIndex(thread.provider, thread.model_ref)) |index| {
             if (index < options.len) return std.mem.sliceTo(options[index].label, 0);
         }
-        return if (thread.model_ref) |model_ref| std.mem.sliceTo(model_ref, 0) else composerUnsetModelRef(self, thread.provider);
+        const ref: []const u8 = if (thread.model_ref) |model_ref| std.mem.sliceTo(model_ref, 0) else composerUnsetModelRef(self, thread.provider);
+        // A built-in default the live catalog omits (Claude's `fable[1m]`)
+        // still shows its name; truly unknown refs show as-is.
+        return provider_controller.knownModelLabel(thread.provider, options, ref) orelse ref;
     }
 
     pub fn currentComposerReasoningLabel(self: *const AppState) []const u8 {
@@ -14429,10 +14516,13 @@ pub const AppState = struct {
         defer self.allocator.free(previous);
         self.composer_controller.model_picker_entries.clearRetainingCapacity();
         if (self.currentThreadAllowsProviderChoice()) {
-            // Connected providers list first; the rest follow, dimmed.
-            for ([_]bool{ true, false }) |usable_pass| {
+            // Connected providers list first; the rest follow, dimmed: those
+            // installed but signed out (or lacking Node.js) before missing
+            // ones. The provider rail takes the same order.
+            const snapshot = self.providerReadinessSnapshot();
+            for ([_]u8{ 0, 1, 2, 3 }) |rank| {
                 for (COMPOSER_PROVIDER_OPTIONS) |candidate| {
-                    if (self.providerUsable(candidate) != usable_pass) continue;
+                    if (snapshot.setupRank(candidate) != rank) continue;
                     // The thread's own provider stays listed so its current model remains selectable.
                     if (!self.app_config.isProviderEnabled(configChatProvider(candidate)) and candidate != self.currentThread().provider) continue;
                     try self.appendModelPickerEntries(candidate);
@@ -15671,7 +15761,9 @@ pub const AppState = struct {
         if (self.project_controller.projects.items.len == 0) return false;
         // Escape never survives `paletteComposerKeyFromEvent`, so close the
         // composer popovers from the raw SDL event before the conversion.
-        if (event.key == .escape or event.hidScancode() == .escape) {
+        // Layout keycode only: the physical Escape position can type text on
+        // remapped keymaps. The scancode is a fallback for hosts without layout data.
+        if (event.key == .escape or (event.key == .unknown and event.hidScancode() == .escape)) {
             if (self.composer_controller.model_picker.isOpen()) {
                 return self.routePaletteModelPickerKey(.{ .code = .escape });
             }
@@ -16625,10 +16717,10 @@ pub const AppState = struct {
         self.companion_sync.deinit();
         self.companion_schedules.deinit();
         self.resource_waiters.deinit(self.allocator);
-        // Flag the cursor loop first so an in-flight long-poll (bounded by
-        // the 4s wait budget + 5s transport timeout) drains concurrently with
-        // the shutdown work below; the blocking join happens further down,
-        // inside the 10s watchdog envelope.
+        // Flag the cursor loop first: an in-flight long-poll observes the
+        // flag within one receive slice and abandons its parked wait, so the
+        // blocking join further down (inside the 10s watchdog envelope) does
+        // not wait out the 4s core.changes budget.
         self.change_cursor_loop.beginShutdown();
         self.pollAcknowledgements();
         acknowledgement_controller.deinit(self);
@@ -16655,6 +16747,7 @@ pub const AppState = struct {
         self.finishMuseModelCacheThread();
         runtime_log.diagnostic("AppState.deinit muse model cache finished", .{});
         self.finishProviderReadinessThread();
+        provider_controller.finishMcpSyncWorker(self);
         runtime_log.diagnostic("AppState.deinit provider readiness finished", .{});
         self.finishProviderThreadOperation();
         runtime_log.diagnostic("AppState.deinit provider thread operation finished", .{});

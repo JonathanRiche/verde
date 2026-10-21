@@ -12,12 +12,12 @@ const PROBE_DEADLINE_MS: i64 = 800;
 const OUTPUT_LIMIT: usize = 512;
 
 /// Executable the daemon and desktop use for this provider's `--version` probe.
-/// Cursor is `cursor-agent`, falling back to `agent`: Grok also ships an
-/// `agent` binary that can come first on PATH.
+/// Cursor is `cursor-agent`, falling back to `agent` unless that `agent` is
+/// the one Grok's installer links into `~/.grok/bin`.
 pub fn executableForProvider(provider_name: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, provider_name, "cursor")) {
         if (process_env.commandExists("cursor-agent")) return "cursor-agent";
-        if (process_env.commandExists("agent")) return "agent";
+        if (cursorFallbackAgentExists()) return "agent";
         return null;
     }
     const executable: ?[]const u8 = if (std.mem.eql(u8, provider_name, "codex"))
@@ -38,6 +38,25 @@ pub fn executableForProvider(provider_name: []const u8) ?[]const u8 {
         null;
     const name = executable orelse return null;
     return if (process_env.commandExists(name)) name else null;
+}
+
+/// Grok's installer links an `agent` binary into `~/.grok/bin`; it is not
+/// Cursor Agent even though it shares the fallback name.
+pub fn isGrokAgentPath(path: []const u8) bool {
+    var parts = std.mem.tokenizeAny(u8, path, "/\\");
+    while (parts.next()) |part| {
+        if (std.mem.eql(u8, part, ".grok")) return true;
+    }
+    return false;
+}
+
+fn cursorFallbackAgentExists() bool {
+    const allocator = std.heap.page_allocator;
+    var env_map = process_env.buildAugmentedEnvMap(allocator) catch return false;
+    defer env_map.deinit();
+    const resolved = process_env.resolveExecutableInEnvMapAlloc(allocator, &env_map, "agent") catch return false;
+    defer allocator.free(resolved);
+    return !isGrokAgentPath(resolved);
 }
 
 /// Prefers a version-shaped token (`0.154.0`, `v0.0.0-beta-18414`) over the

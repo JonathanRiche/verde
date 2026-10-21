@@ -336,6 +336,20 @@ pub const RenderBatch = struct {
         });
     }
 
+    /// `panel` cut to `clip`, for bordered surfaces that scroll under a
+    /// band's edge (fill and border still composite in one pass).
+    pub fn panelClipped(self: *RenderBatch, allocator: std.mem.Allocator, r: Rect, background: Color, border: ?Color, radius: f32, border_width: f32, clip: Rect) !void {
+        try self.appendCommand(allocator, .{
+            .kind = .rect,
+            .rect = r,
+            .color = background,
+            .radius = radius,
+            .border_width = border_width,
+            .border_color = border,
+            .clip = clip,
+        });
+    }
+
     pub fn glyph(self: *RenderBatch, allocator: std.mem.Allocator, r: Rect, uv: Rect, color: Color) !void {
         try self.image(allocator, r, .invalid, uv, color, null);
     }

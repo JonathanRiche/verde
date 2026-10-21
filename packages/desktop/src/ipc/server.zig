@@ -256,7 +256,7 @@ fn statusResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state:
     try s.objectField("workspace_count");
     try s.write(state.project_controller.projects.items.len);
     try s.objectField("selected_workspace_index");
-    try s.write(state.project_controller.selected_index);
+    try writeSelectedWorkspaceIndex(&s, state);
     try s.objectField("focused_pane_id");
     if (state.project_controller.projects.items.len > 0) {
         if (state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout.focused_pane_id) |pane_id| try s.write(pane_id) else try s.write(null);
@@ -454,6 +454,12 @@ fn capabilitiesResponse(allocator: std.mem.Allocator, id_value: std.json.Value) 
     });
 }
 
+/// Null with no open workspace: index 0 would name a workspace that does not exist.
+fn writeSelectedWorkspaceIndex(s: *std.json.Stringify, state: *app_state.AppState) !void {
+    if (state.project_controller.projects.items.len == 0) return s.write(null);
+    try s.write(state.project_controller.selected_index);
+}
+
 fn workspacesResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer writer.deinit();
@@ -462,7 +468,7 @@ fn workspacesResponse(allocator: std.mem.Allocator, id_value: std.json.Value, st
     try s.objectField("result");
     try s.beginObject();
     try s.objectField("selected_workspace_index");
-    try s.write(state.project_controller.selected_index);
+    try writeSelectedWorkspaceIndex(&s, state);
     try s.objectField("workspaces");
     try s.beginArray();
     for (state.project_controller.projects.items, 0..) |project, index| {
@@ -3243,6 +3249,10 @@ fn workspaceCheckCommandResponse(
     try s.write("run_anyway");
     try s.write("open_owner");
     try s.endArray();
+    if (conflict_count > 0) {
+        try s.objectField("how_to_wait");
+        try s.write("Do not sleep or poll. Run the command as `verde lease run -- <command>` (a background task if your shell times out): it starts the moment the resource is free, follows an identical run instead of repeating it when sources are unchanged, and releases on exit. Otherwise call report_chat_blocked with waiting_for_resources and yield; Verde resumes this chat when the resource frees.");
+    }
     try s.endObject();
     try s.endObject();
     return try writer.toOwnedSlice();

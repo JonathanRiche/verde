@@ -35,9 +35,29 @@ const EMPTY_IDLE_GRACE_POLLS: usize = 16;
 /// Working-tree diffs run `git diff` inside the service; sample them every
 /// ~1.5s instead of on every poll tick.
 const DIFF_POLL_STRIDE: usize = 10;
+/// Keep in sync with OPENCODE_SIGN_IN_REQUIRED_MESSAGE in desktop/src/utils.zig,
+/// which renders this exact text as a sign-in card.
+const SIGN_IN_REQUIRED_MESSAGE = "OpenCode is not signed in. Sign in, then send your message again.";
 
 fn sleepMs(ms: u64) void {
     platform_runtime.sleepMillis(ms);
+}
+
+fn requestShouldStop(request: provider_types.SendPromptRequest) bool {
+    const should_stop = request.on_should_stop orelse return false;
+    return should_stop(request.stream_context);
+}
+
+fn reportPromptFailure(
+    allocator: std.mem.Allocator,
+    request: provider_types.SendPromptRequest,
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    const on_failure = request.on_failure orelse return;
+    const message = std.fmt.allocPrint(allocator, format, args) catch return;
+    defer allocator.free(message);
+    on_failure(request.stream_context, message);
 }
 
 const Mutex = struct {
@@ -145,10 +165,7 @@ pub const Client = struct {
         defer parsed.deinit();
 
         const providers = getObjectField(parsed.value, "data") orelse return .unknown;
-        return switch (providers) {
-            .array => |items| if (items.items.len > 0) .signed_in else .signed_out,
-            else => .unknown,
-        };
+        return authStateFromProviders(providers);
     }
 
     pub fn listThreads(self: *Client, allocator: std.mem.Allocator) ![]provider_types.ChatThreadSummary {
@@ -426,6 +443,15 @@ pub const Client = struct {
 
         var attempt: usize = 0;
         while (attempt < MAX_POLL_ATTEMPTS) : (attempt += 1) {
+            // Stop must end the turn even when OpenCode never acknowledges
+            // the interrupt (the execution may already have failed), so the
+            // interrupt is best-effort and never awaited.
+            if (requestShouldStop(request)) {
+                self.interruptThread(.{ .thread_id = session_id }) catch |err| {
+                    log.warn("OpenCode interrupt after stop failed: {s}", .{@errorName(err)});
+                };
+                return error.OpencodeTurnInterrupted;
+            }
             const has_pending_permissions = try self.handlePendingPermissions(session_id, request, &handled_permission_ids);
             var latest_snapshot = try self.fetchAssistantSnapshot(self.allocator, session_id, user_message_id);
             defer latest_snapshot.deinit(self.allocator);
@@ -452,7 +478,12 @@ pub const Client = struct {
             if (!has_pending_permissions and event_stream_context == null) {
                 const active = try self.sessionIsActive(session_id);
                 if (!active and has_output_activity) break;
-                if (!active and attempt + 1 >= EMPTY_IDLE_GRACE_POLLS) return error.OpencodeEmptyReply;
+                if (!active and attempt + 1 >= EMPTY_IDLE_GRACE_POLLS) break;
+            } else if (!has_pending_permissions and attempt + 1 >= EMPTY_IDLE_GRACE_POLLS and attempt % DIFF_POLL_STRIDE == 0) {
+                // The SSE subscription can miss a terminal event that fires
+                // before it connects (an execution that fails immediately),
+                // so periodically confirm the session is still running.
+                if (!try self.sessionIsActive(session_id)) break;
             }
 
             sleepMs(POLL_INTERVAL_MS);
@@ -473,6 +504,36 @@ pub const Client = struct {
         }
         if (std.mem.trim(u8, streamed_text, &std.ascii.whitespace).len > 0) {
             return allocator.dupe(u8, streamed_text);
+        }
+
+        // No reply at all: report why instead of committing an empty answer.
+        const stream_error = if (event_stream_context) |context| try eventStreamExecutionErrorAlloc(self.allocator, context) else null;
+        defer if (stream_error) |message| self.allocator.free(message);
+        const outcome = final_snapshot.idle_outcome orelse "";
+        if (final_snapshot.idle_error != null or stream_error != null or std.mem.eql(u8, outcome, "failed")) {
+            const detail = final_snapshot.idle_error orelse stream_error orelse "OpenCode could not run this request.";
+            const sign_in_required = final_snapshot.idle_sign_in_required or
+                if (event_stream_context) |context| eventStreamExecutionRequiresSignIn(context) else false;
+            if (sign_in_required) {
+                // Same actionable card as a signed-out Claude; the raw detail
+                // (e.g. "Model unavailable: opencode/...") stays in the log.
+                log.info("OpenCode execution needs sign-in: {s}", .{detail});
+                reportPromptFailure(self.allocator, request, "{s}", .{SIGN_IN_REQUIRED_MESSAGE});
+                return error.OpencodeSignedOut;
+            }
+            reportPromptFailure(self.allocator, request, "OpenCode error: {s}", .{detail});
+            return error.OpencodeExecutionFailed;
+        }
+        // A tool-only turn legitimately ends with an empty assistant step;
+        // only a turn that never produced an assistant message is suspect.
+        const stream_finished = if (event_stream_context) |context| eventStreamReachedTerminal(context) else false;
+        if (final_snapshot.message_id == null and std.mem.eql(u8, outcome, "interrupted")) {
+            reportPromptFailure(self.allocator, request, "OpenCode stopped the reply before it produced any output.", .{});
+            return error.OpencodeTurnInterrupted;
+        }
+        if (final_snapshot.message_id == null and outcome.len == 0 and !stream_finished) {
+            reportPromptFailure(self.allocator, request, "OpenCode finished without a reply.", .{});
+            return error.OpencodeEmptyReply;
         }
 
         return allocator.dupe(u8, "");
@@ -688,18 +749,23 @@ pub const Client = struct {
         defer parsed.deinit();
 
         const messages = getObjectField(parsed.value, "data") orelse .null;
-        const latest = findPrimaryAssistantAfterUser(messages, user_message_id) orelse return .{
-            .text = try allocator.dupe(u8, ""),
-        };
-        const message_id = getOptionalObjectString(latest, "id");
-
-        return .{
-            .message_id = if (message_id) |id| try allocator.dupe(u8, id) else null,
+        var snapshot: AssistantSnapshot = if (findPrimaryAssistantAfterUser(messages, user_message_id)) |latest| .{
+            .message_id = if (getOptionalObjectString(latest, "id")) |id| try allocator.dupe(u8, id) else null,
             .text = try extractAssistantTextAlloc(allocator, latest),
             .error_message = try extractAssistantErrorMessageAlloc(allocator, latest),
             .finish = try extractAssistantFinishAlloc(allocator, latest),
             .task_summary = try extractLatestAssistantTaskSummaryAlloc(allocator, messages, user_message_id),
+        } else .{
+            .text = try allocator.dupe(u8, ""),
         };
+        errdefer snapshot.deinit(allocator);
+
+        if (findIdleAfterUser(messages, user_message_id)) |idle| {
+            snapshot.idle_outcome = try allocator.dupe(u8, getOptionalObjectString(idle, "outcome") orelse "succeeded");
+            snapshot.idle_error = try extractAssistantErrorMessageAlloc(allocator, idle);
+            snapshot.idle_sign_in_required = errorRequiresSignIn(idle);
+        }
+        return snapshot;
     }
 
     fn sessionIsActive(self: *Client, session_id: []const u8) !bool {
@@ -1076,6 +1142,14 @@ const AssistantSnapshot = struct {
     error_message: ?[]u8 = null,
     finish: ?[]u8 = null,
     task_summary: ?[]u8 = null,
+    /// Outcome of the `idle` row OpenCode appends when this turn's execution
+    /// ends (`succeeded`, `failed`, `interrupted`). Executions that fail
+    /// before any model step (e.g. `provider.no-route`) produce no assistant
+    /// message, so this row is the only durable terminal signal.
+    idle_outcome: ?[]u8 = null,
+    idle_error: ?[]u8 = null,
+    /// The idle row's error is one signing in resolves (see `errorRequiresSignIn`).
+    idle_sign_in_required: bool = false,
 
     fn deinit(self: *AssistantSnapshot, allocator: std.mem.Allocator) void {
         if (self.message_id) |id| allocator.free(id);
@@ -1083,9 +1157,12 @@ const AssistantSnapshot = struct {
         if (self.error_message) |message| allocator.free(message);
         if (self.finish) |finish| allocator.free(finish);
         if (self.task_summary) |summary| allocator.free(summary);
+        if (self.idle_outcome) |outcome| allocator.free(outcome);
+        if (self.idle_error) |message| allocator.free(message);
     }
 
     fn isTerminalForPrompt(self: *const AssistantSnapshot) bool {
+        if (self.idle_outcome != null) return true;
         if (self.message_id == null) return false;
         const finish = self.finish orelse return false;
         return !std.mem.eql(u8, finish, "tool-calls") and !std.mem.eql(u8, finish, "unknown");
@@ -1131,9 +1208,14 @@ const EventStreamContext = struct {
     open_state: EventStreamOpenState = .starting,
     stop_requested: bool = false,
     session_terminal: bool = false,
+    /// Message from `session.execution.failed`, guarded by `mutex`.
+    execution_error: ?[]u8 = null,
+    /// That failure is one signing in resolves, guarded by `mutex`.
+    execution_sign_in_required: bool = false,
 
     fn deinit(self: *EventStreamContext) void {
         self.allocator.free(self.session_id);
+        if (self.execution_error) |message| self.allocator.free(message);
         self.streamed_text.deinit(self.allocator);
         var it = self.tool_names.iterator();
         while (it.next()) |entry| {
@@ -1424,6 +1506,26 @@ fn sessionMatchesWorkingDirectory(working_directory: ?[]const u8, session_direct
 
 /// Parses `GET /api/model` (`{data: [Model.Info]}`); `providers_root` is the
 /// optional `GET /api/provider` body used for display names.
+/// Signed in means at least one provider with the user's own credential.
+/// The service always lists its built-in `opencode` provider with the shared
+/// `public` key once its catalog loads; that key serves only free models (a
+/// default-model chat fails with `provider.no-route`). Counting it flipped
+/// readiness to "ready" mid-`opencode auth login` and disagreed with the
+/// offline credential check.
+fn authStateFromProviders(providers: std.json.Value) provider_types.AuthState {
+    if (providers != .array) return .unknown;
+    for (providers.array.items) |provider| {
+        if (provider != .object) continue;
+        const settings = getObjectField(provider, "settings");
+        const api_key = if (settings) |value| getOptionalObjectString(value, "apiKey") else null;
+        if (api_key) |key| {
+            if (std.mem.eql(u8, key, "public")) continue;
+        }
+        return .signed_in;
+    }
+    return .signed_out;
+}
+
 fn parseModelsAlloc(allocator: std.mem.Allocator, root: std.json.Value, providers_root: ?std.json.Value) ![]provider_types.ModelInfo {
     var models: std.ArrayList(provider_types.ModelInfo) = .empty;
     errdefer {
@@ -1543,6 +1645,17 @@ fn extractAssistantErrorMessageAlloc(allocator: std.mem.Allocator, value: std.js
         else => return null,
     };
     return try allocator.dupe(u8, message);
+}
+
+/// The newest `idle` row after this turn's user message, if execution ended.
+fn findIdleAfterUser(messages_desc: std.json.Value, user_message_id: ?[]const u8) ?std.json.Value {
+    if (messages_desc != .array) return null;
+    const items = messages_desc.array.items;
+    const boundary = findUserBoundary(items, user_message_id);
+    for (items[0..boundary]) |item| {
+        if (messageIs(item, "idle")) return item;
+    }
+    return null;
 }
 
 fn extractAssistantFinishAlloc(allocator: std.mem.Allocator, value: std.json.Value) !?[]u8 {
@@ -1938,6 +2051,7 @@ fn processEventStreamMessage(context: *EventStreamContext, raw_event_name: []con
         }
     } else if (eventTypeIs(event_type, "session.execution.failed")) {
         emitExecutionFailure(context, properties);
+        rememberExecutionFailure(context, properties);
         signalEventStreamTerminal(context);
     } else if (eventTypeIs(event_type, "session.execution.succeeded") or
         eventTypeIs(event_type, "session.execution.interrupted") or
@@ -1956,6 +2070,62 @@ fn eventTypeIs(event_type: []const u8, comptime canonical: []const u8) bool {
         return std.mem.eql(u8, event_type, with_next);
     }
     return false;
+}
+
+fn rememberExecutionFailure(context: *EventStreamContext, properties: std.json.Value) void {
+    const message = (extractAssistantErrorMessageAlloc(context.allocator, properties) catch null) orelse
+        (context.allocator.dupe(u8, "OpenCode could not run this request.") catch return);
+    const sign_in_required = errorRequiresSignIn(properties);
+    context.mutex.lock();
+    defer context.mutex.unlock();
+    if (context.execution_error) |old| context.allocator.free(old);
+    context.execution_error = message;
+    context.execution_sign_in_required = sign_in_required;
+}
+
+fn eventStreamExecutionRequiresSignIn(context: *EventStreamContext) bool {
+    context.mutex.lock();
+    defer context.mutex.unlock();
+    return context.execution_sign_in_required;
+}
+
+/// True when `value.error` is a failure signing in to OpenCode resolves: no
+/// provider can serve the model (`provider.no-route`, "Model unavailable"),
+/// which is what a signed-out OpenCode reports for its hosted models, or a
+/// provider auth rejection.
+fn errorRequiresSignIn(value: std.json.Value) bool {
+    const error_value = getObjectField(value, "error") orelse return false;
+    const message = switch (error_value) {
+        .string => |text| text,
+        .object => blk: {
+            inline for (.{ "type", "name" }) |field| {
+                const kind = getOptionalObjectString(error_value, field) orelse "";
+                if (std.ascii.eqlIgnoreCase(kind, "provider.no-route") or
+                    std.ascii.indexOfIgnoreCase(kind, "auth") != null) return true;
+            }
+            break :blk getOptionalObjectString(error_value, "message") orelse return false;
+        },
+        else => return false,
+    };
+    const markers = [_][]const u8{
+        "model unavailable",
+        "no route",
+        "unauthorized",
+        "not authenticated",
+        "invalid api key",
+        "missing api key",
+    };
+    for (markers) |marker| {
+        if (std.ascii.indexOfIgnoreCase(message, marker) != null) return true;
+    }
+    return false;
+}
+
+fn eventStreamExecutionErrorAlloc(allocator: std.mem.Allocator, context: *EventStreamContext) !?[]u8 {
+    context.mutex.lock();
+    defer context.mutex.unlock();
+    const message = context.execution_error orelse return null;
+    return try allocator.dupe(u8, message);
 }
 
 fn signalEventStreamTerminal(context: *EventStreamContext) void {
@@ -3027,5 +3197,243 @@ test "workspace directory approval checks real roots and never grants other tool
         var parsed = try std.json.parseFromSlice(std.json.Value, a, source, .{});
         defer parsed.deinit();
         try std.testing.expect(!try workspaceDirectoryApproved(a, parsed.value, &.{root}));
+    }
+}
+
+/// Loopback stand-in for the OpenCode service routes `waitForPromptResult`
+/// polls. Bodies are fixed per fixture; interrupts are counted.
+const FakeOpenCodeService = struct {
+    threaded: std.Io.Threaded,
+    listener: std.Io.net.Server = undefined,
+    port: u16 = 0,
+    thread: ?std.Thread = null,
+    stopping: std.atomic.Value(bool) = .init(false),
+    interrupts: std.atomic.Value(usize) = .init(0),
+    messages_body: []const u8,
+    active_body: []const u8,
+
+    fn start(self: *FakeOpenCodeService) !void {
+        const io = self.threaded.io();
+        const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+        self.listener = try address.listen(io, .{});
+        self.port = self.listener.socket.address.getPort();
+        self.thread = try std.Thread.spawn(.{}, serve, .{self});
+    }
+
+    fn stop(self: *FakeOpenCodeService) void {
+        const io = self.threaded.io();
+        self.stopping.store(true, .release);
+        if (std.Io.net.IpAddress.parse("127.0.0.1", self.port)) |address| {
+            if (address.connect(io, .{ .mode = .stream })) |stream| stream.close(io) else |_| {}
+        } else |_| {}
+        if (self.thread) |thread| thread.join();
+        self.listener.deinit(io);
+        self.threaded.deinit();
+    }
+
+    fn serve(self: *FakeOpenCodeService) void {
+        const io = self.threaded.io();
+        while (!self.stopping.load(.acquire)) {
+            const stream = self.listener.accept(io) catch return;
+            defer stream.close(io);
+            if (self.stopping.load(.acquire)) return;
+            self.serveOne(io, stream) catch {};
+        }
+    }
+
+    fn serveOne(self: *FakeOpenCodeService, io: std.Io, stream: std.Io.net.Stream) !void {
+        var read_buf: [8192]u8 = undefined;
+        var write_buf: [8192]u8 = undefined;
+        var reader = stream.reader(io, &read_buf);
+        var writer = stream.writer(io, &write_buf);
+        var server: std.http.Server = .init(&reader.interface, &writer.interface);
+        var request = try server.receiveHead();
+        const target = request.head.target;
+        const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
+        const body = if (std.mem.endsWith(u8, path, "/interrupt")) blk: {
+            _ = self.interrupts.fetchAdd(1, .acq_rel);
+            break :blk "{}";
+        } else if (std.mem.endsWith(u8, path, "/permission"))
+            "{\"data\":[]}"
+        else if (std.mem.endsWith(u8, path, "/message"))
+            self.messages_body
+        else if (std.mem.eql(u8, path, "/api/session/active"))
+            self.active_body
+        else
+            "{}";
+        try request.respond(body, .{
+            .keep_alive = false,
+            .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }},
+        });
+    }
+};
+
+const FakeOpenCodeSink = struct {
+    stop_after_polls: ?usize = null,
+    polls: usize = 0,
+    failure_buffer: [256]u8 = undefined,
+    failure_len: usize = 0,
+
+    fn shouldStop(context: ?*anyopaque) bool {
+        const self: *FakeOpenCodeSink = @ptrCast(@alignCast(context orelse return false));
+        self.polls += 1;
+        const limit = self.stop_after_polls orelse return false;
+        return self.polls > limit;
+    }
+
+    fn onFailure(context: ?*anyopaque, message: []const u8) void {
+        const self: *FakeOpenCodeSink = @ptrCast(@alignCast(context orelse return));
+        self.failure_len = @min(message.len, self.failure_buffer.len);
+        @memcpy(self.failure_buffer[0..self.failure_len], message[0..self.failure_len]);
+    }
+
+    fn failure(self: *const FakeOpenCodeSink) []const u8 {
+        return self.failure_buffer[0..self.failure_len];
+    }
+};
+
+fn fakeOpenCodeClient(service: *const FakeOpenCodeService) !Client {
+    const allocator = std.testing.allocator;
+    const base_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{service.port});
+    defer allocator.free(base_url);
+    return .{
+        .allocator = allocator,
+        .config = .{ .allocator = allocator },
+        .endpoint = try Endpoint.init(allocator, base_url, null),
+    };
+}
+
+test "OpenCode execution failure before any model step ends the turn with its error" {
+    // `provider.no-route` fails the execution before an assistant message
+    // exists, and the SSE event can fire before the subscription connects.
+    // The durable idle row must still end the turn instead of polling for an hour.
+    var service: FakeOpenCodeService = .{
+        .threaded = .init(std.testing.allocator, .{}),
+        .messages_body =
+        \\{"data":[{"id":"idle_1","type":"idle","outcome":"failed","error":{"type":"provider.no-route","message":"Model unavailable: opencode/gpt-5.5"}},{"id":"msg_user","type":"user","text":"hello"},{"id":"idle_0","type":"idle","outcome":"succeeded"}]}
+        ,
+        .active_body = "{\"data\":{}}",
+    };
+    try service.start();
+    defer service.stop();
+    var client = try fakeOpenCodeClient(&service);
+    defer client.deinit();
+
+    var sink: FakeOpenCodeSink = .{};
+    var capture: OpenCodeTestTranscriptCapture = .{};
+    var stream_context = try openCodeTestEventContext("ses_1", &capture);
+    defer stream_context.deinit();
+    const request: provider_types.SendPromptRequest = .{
+        .prompt = "hello",
+        .stream_context = &sink,
+        .on_failure = FakeOpenCodeSink.onFailure,
+        .on_should_stop = FakeOpenCodeSink.shouldStop,
+    };
+    // No route for the model is what a signed-out OpenCode reports, so it
+    // gets the same sign-in card a signed-out Claude does.
+    try std.testing.expectError(
+        error.OpencodeSignedOut,
+        client.waitForPromptResult(std.testing.allocator, "ses_1", "msg_user", "", request, &stream_context),
+    );
+    try std.testing.expectEqualStrings(SIGN_IN_REQUIRED_MESSAGE, sink.failure());
+    try std.testing.expectEqual(@as(usize, 1), sink.polls);
+}
+
+test "OpenCode classifies no-route and auth failures as sign-in required" {
+    const cases = [_]struct { json: []const u8, expected: bool }{
+        .{ .json = "{\"error\":{\"type\":\"provider.no-route\",\"message\":\"Model unavailable: opencode/gpt-5.5\"}}", .expected = true },
+        .{ .json = "{\"error\":{\"name\":\"ProviderAuthError\",\"data\":{\"message\":\"bad key\"}}}", .expected = true },
+        .{ .json = "{\"error\":\"401 Unauthorized\"}", .expected = true },
+        .{ .json = "{\"error\":{\"type\":\"provider.overloaded\",\"message\":\"Rate limited, try again\"}}", .expected = false },
+        .{ .json = "{\"error\":\"context window exceeded\"}", .expected = false },
+        .{ .json = "{\"outcome\":\"failed\"}", .expected = false },
+    };
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, case.json, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(case.expected, errorRequiresSignIn(parsed.value));
+    }
+}
+
+test "OpenCode stop ends a turn the service never finishes" {
+    var service: FakeOpenCodeService = .{
+        .threaded = .init(std.testing.allocator, .{}),
+        .messages_body =
+        \\{"data":[{"id":"msg_user","type":"user","text":"hello"}]}
+        ,
+        .active_body = "{\"data\":{\"ses_1\":{}}}",
+    };
+    try service.start();
+    defer service.stop();
+    var client = try fakeOpenCodeClient(&service);
+    defer client.deinit();
+
+    var sink: FakeOpenCodeSink = .{ .stop_after_polls = 2 };
+    var capture: OpenCodeTestTranscriptCapture = .{};
+    var stream_context = try openCodeTestEventContext("ses_1", &capture);
+    defer stream_context.deinit();
+    const request: provider_types.SendPromptRequest = .{
+        .prompt = "hello",
+        .stream_context = &sink,
+        .on_failure = FakeOpenCodeSink.onFailure,
+        .on_should_stop = FakeOpenCodeSink.shouldStop,
+    };
+    try std.testing.expectError(
+        error.OpencodeTurnInterrupted,
+        client.waitForPromptResult(std.testing.allocator, "ses_1", "msg_user", "", request, &stream_context),
+    );
+    try std.testing.expectEqual(@as(usize, 1), service.interrupts.load(.acquire));
+}
+
+test "OpenCode turn ends when the session goes idle without a terminal event" {
+    // Older services append no idle row; an inactive session with no reply
+    // must still end the streamed turn once the start grace has passed.
+    var service: FakeOpenCodeService = .{
+        .threaded = .init(std.testing.allocator, .{}),
+        .messages_body =
+        \\{"data":[{"id":"msg_user","type":"user","text":"hello"}]}
+        ,
+        .active_body = "{\"data\":{}}",
+    };
+    try service.start();
+    defer service.stop();
+    var client = try fakeOpenCodeClient(&service);
+    defer client.deinit();
+
+    var sink: FakeOpenCodeSink = .{};
+    var capture: OpenCodeTestTranscriptCapture = .{};
+    var stream_context = try openCodeTestEventContext("ses_1", &capture);
+    defer stream_context.deinit();
+    const request: provider_types.SendPromptRequest = .{
+        .prompt = "hello",
+        .stream_context = &sink,
+        .on_failure = FakeOpenCodeSink.onFailure,
+    };
+    try std.testing.expectError(
+        error.OpencodeEmptyReply,
+        client.waitForPromptResult(std.testing.allocator, "ses_1", "msg_user", "", request, &stream_context),
+    );
+    try std.testing.expectEqualStrings("OpenCode finished without a reply.", sink.failure());
+}
+
+test "OpenCode's public built-in provider alone is not a sign-in" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { body: []const u8, expected: provider_types.AuthState }{
+        .{ .body = "[]", .expected = .signed_out },
+        .{ .body =
+        \\[{"id":"opencode","settings":{"apiKey":"public","baseURL":"https://opencode.ai/inference/openai/v1"}}]
+        , .expected = .signed_out },
+        .{ .body =
+        \\[{"id":"anthropic","integrationID":"anthropic"},{"id":"opencode","settings":{"apiKey":"public"}}]
+        , .expected = .signed_in },
+        .{ .body =
+        \\[{"id":"opencode","settings":{"apiKey":"sk-zen-user"}}]
+        , .expected = .signed_in },
+        .{ .body = "{}", .expected = .unknown },
+    };
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(case.expected, authStateFromProviders(parsed.value));
     }
 }

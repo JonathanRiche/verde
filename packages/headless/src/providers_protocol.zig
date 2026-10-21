@@ -177,6 +177,11 @@ pub const TitleGenerateRequest = struct {
     /// generated search description for that thread.
     workspace_id: ?[]const u8 = null,
     local_thread_id: ?[]const u8 = null,
+    /// Provider and model of the chat being titled. When `provider` is not
+    /// the chat's provider and is not signed in, the daemon titles with this
+    /// one instead of sending the chat to a provider the user never set up.
+    chat_provider: ?provider_types.Provider = null,
+    chat_model_ref: ?[]const u8 = null,
 };
 
 pub const TitleGenerateResult = struct {
@@ -193,6 +198,13 @@ pub const ProviderRequest = struct {
 
 pub const AuthStatusRequest = ProviderRequest;
 
+/// A runtime the provider CLI needs before Verde can drive it.
+pub const MissingRequirement = enum {
+    /// Verde runs Claude Code through Node.js and the Claude Agent SDK; the
+    /// native Claude installer does not install Node.
+    node,
+};
+
 pub const AuthStatusResult = struct {
     provider: provider_types.Provider,
     installed: bool,
@@ -201,6 +213,9 @@ pub const AuthStatusResult = struct {
     /// First line of `<cli> --version` as seen by this daemon. Absent when the
     /// CLI is missing or the probe did not finish.
     version: ?[]const u8 = null,
+    /// Set when the provider CLI is present but cannot run yet. `installed`
+    /// stays false so older clients still treat the provider as unusable.
+    missing_requirement: ?MissingRequirement = null,
 };
 
 pub const ThreadsListRequest = ProviderRequest;

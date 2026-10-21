@@ -7,6 +7,7 @@ pub const test_backend = @import("state/test_backend.zig");
 
 test {
     _ = @import("main.zig");
+    _ = @import("utils.zig");
     _ = @import("cli/main.zig");
     _ = @import("browser/screenshot.zig");
     // The GUI side of the Linux helper protocol (shm slots, frame socket).
@@ -26,6 +27,8 @@ test {
     _ = @import("runtime/ssh_tunnel.zig");
     _ = @import("runtime/ssh_tunnel_supervisor.zig");
     _ = @import("runtime/thread_binding.zig");
+    _ = @import("runtime/log.zig");
+    _ = @import("terminal/terminal.zig");
     _ = @import("state/browser_controller.zig");
     _ = @import("state/browser_runtime_access.zig");
     _ = @import("state/side_panel_controller.zig");
@@ -37,6 +40,11 @@ test {
     _ = @import("state/folder_browser.zig");
     _ = @import("state/workspace_setup.zig");
     _ = @import("state/custom_agent_form.zig");
+    _ = @import("state/provider_controller.zig");
+    _ = @import("state/provider_setup.zig");
+    _ = @import("state/remote_setup_terminal.zig");
+    _ = @import("state/remote_auth_probe.zig");
+    _ = @import("ui/onboarding_modal.zig");
     _ = @import("providers/offline_auth.zig");
     _ = @import("ui/text_edit.zig");
     _ = @import("ui/dev_inject.zig");
@@ -51,6 +59,7 @@ test {
     _ = @import("ui/fuzzy_match.zig");
     _ = @import("ui/companion.zig");
     _ = @import("state/companion_controller.zig");
+    _ = @import("state/linked_chats_controller.zig");
     _ = @import("state/companion_roster.zig");
     _ = @import("state/companion_persona.zig");
     _ = @import("state/companion_sync.zig");

@@ -1140,17 +1140,57 @@ async function loadClaudeSdk() {
   return claudeSdkStatic;
 }
 
+// Metadata reads (account, models, commands) need only the CLI's initialize
+// handshake. A prompt stream that never yields keeps the CLI from sending an
+// API request, and persistSession:false keeps it from writing a transcript.
+function idleClaudeQuery(sdk, options) {
+  let release;
+  const idle = new Promise((resolve) => { release = resolve; });
+  const prompt = (async function* () { await idle; })();
+  const query = sdk.query({ prompt, options: { ...options, persistSession: false } });
+  return {
+    query,
+    close() {
+      release();
+      query.close?.();
+    },
+  };
+}
+
+const CLAUDE_AUTH_TIMEOUT_MS = 10_000;
+
+// Signed out, the SDK still reports `{tokenSource: "none", apiProvider:
+// "firstParty"}`; only a real credential source counts. Cloud providers
+// (Bedrock, Vertex, ...) authenticate outside Claude Code.
+function claudeAuthStateFromAccountInfo(info) {
+  if (!info || typeof info !== "object") return "signed_out";
+  if (info.apiProvider && info.apiProvider !== "firstParty") return "signed_in";
+  const present = (value) => typeof value === "string" && value.length > 0 && value !== "none";
+  if (present(info.tokenSource) || present(info.apiKeySource)) return "signed_in";
+  return "signed_out";
+}
+
 async function handleClaudeAuth(sdk, request) {
-  const query = sdk.query({ prompt: "", options: { maxTurns: 0, pathToClaudeCodeExecutable: pathToClaudeCodeExecutable(request) } });
-  const info = await query.accountInfo();
-  query.close?.();
-  write({ type: "result", state: info ? "signed_in" : "signed_out" });
+  const { query, close } = idleClaudeQuery(sdk, { pathToClaudeCodeExecutable: pathToClaudeCodeExecutable(request), cwd: request.cwd ?? undefined });
+  let timer;
+  const timeout = new Promise((resolve) => { timer = setTimeout(() => resolve({ timedOut: true }), CLAUDE_AUTH_TIMEOUT_MS); });
+  try {
+    const info = await Promise.race([query.accountInfo(), timeout]);
+    write({ type: "result", state: info?.timedOut ? "unknown" : claudeAuthStateFromAccountInfo(info) });
+  } finally {
+    clearTimeout(timer);
+    close();
+  }
 }
 
 async function handleClaudeListModels(sdk, request) {
-  const query = sdk.query({ prompt: "", options: { maxTurns: 0, pathToClaudeCodeExecutable: pathToClaudeCodeExecutable(request) } });
-  const models = await query.supportedModels();
-  query.close?.();
+  const { query, close } = idleClaudeQuery(sdk, { pathToClaudeCodeExecutable: pathToClaudeCodeExecutable(request) });
+  let models;
+  try {
+    models = await query.supportedModels();
+  } finally {
+    close();
+  }
   write({
     type: "result",
     models: (models ?? []).map((model) => ({
@@ -1197,8 +1237,7 @@ async function handleClaudeReadThread(sdk, request) {
 }
 
 async function handleClaudeSlashCommands(sdk, request) {
-  const options = { ...buildClaudeOptions(request), maxTurns: 0 };
-  const query = sdk.query({ prompt: "", options });
+  const { query, close } = idleClaudeQuery(sdk, buildClaudeOptions(request));
   try {
     const commands = typeof query.supportedCommands === "function"
       ? await query.supportedCommands()
@@ -1208,7 +1247,7 @@ async function handleClaudeSlashCommands(sdk, request) {
       commands: (commands ?? []).map(serializeSlashCommand).filter((command) => command.name),
     });
   } finally {
-    query.close?.();
+    close();
   }
 }
 

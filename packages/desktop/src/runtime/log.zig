@@ -93,7 +93,15 @@ pub fn init(io: std.Io, pref_path: []const u8) !void {
 
     switch (builtin.os.tag) {
         .windows => {},
-        else => if (std.c.dup2(log_file.handle, std.c.STDERR_FILENO) < 0) return error.SystemResources,
+        else => {
+            // The header uses a positional write, so the descriptor offset is
+            // still 0. Without O_APPEND every std.log line (and the inherited
+            // stderr of child processes such as verde-daemon) would overwrite
+            // earlier sessions from byte 0. The flag lives on the shared open
+            // file description, so it survives dup2 and fork/exec.
+            try enableAppendMode(log_file.handle);
+            if (std.c.dup2(log_file.handle, std.c.STDERR_FILENO) < 0) return error.SystemResources;
+        },
     }
 
     stderr_log_path = stderr_path;
@@ -127,7 +135,9 @@ pub fn diagnostic(comptime format: []const u8, args: anytype) void {
     var buffer: [1024]u8 = undefined;
     var writer = file.writer(io, &buffer);
     writer.pos = file.length(io) catch return;
-    writer.interface.print("[diagnostic {d}] ", .{unixTimestampMs()}) catch return;
+    // The pid tells overlapping app instances apart (a relaunch can start
+    // while the previous process is still shutting down into the same log).
+    writer.interface.print("[diagnostic {d} pid={d}] ", .{ unixTimestampMs(), processId() }) catch return;
     writer.interface.print(format, args) catch return;
     writer.interface.writeByte('\n') catch return;
     writer.interface.flush() catch return;
@@ -298,10 +308,41 @@ fn rotateStderrLogIfOversized(
     std.Io.Dir.renameAbsolute(stderr_path, rotated_path, io) catch return;
 }
 
+fn enableAppendMode(fd: std.c.fd_t) !void {
+    const append_mask: c_int = @bitCast(@as(u32, @bitCast(std.c.O{ .APPEND = true })));
+    const flags = std.c.fcntl(fd, std.c.F.GETFL);
+    if (flags < 0) return error.SystemResources;
+    if (std.c.fcntl(fd, std.c.F.SETFL, flags | append_mask) < 0) return error.SystemResources;
+}
+
 fn processId() u32 {
     return platform_runtime.processId();
 }
 
 fn unixTimestampMs() i64 {
     return platform_runtime.unixTimestampMs();
+}
+
+test "stderr log descriptor appends instead of overwriting earlier sessions" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var previous = try tmp.dir.createFile(io, STDERR_LOG_FILE_NAME, .{});
+        defer previous.close(io);
+        try previous.writeStreamingAll(io, "previous session\n");
+    }
+
+    var file = try tmp.dir.createFile(io, STDERR_LOG_FILE_NAME, .{ .read = true, .truncate = false });
+    defer file.close(io);
+    try enableAppendMode(file.handle);
+    // Mirrors std.log after dup2: a plain write on the shared descriptor.
+    const line = "next session\n";
+    try std.testing.expectEqual(@as(isize, line.len), std.c.write(file.handle, line, line.len));
+
+    var buffer: [64]u8 = undefined;
+    const contents = try tmp.dir.readFile(io, STDERR_LOG_FILE_NAME, &buffer);
+    try std.testing.expectEqualStrings("previous session\nnext session\n", contents);
 }

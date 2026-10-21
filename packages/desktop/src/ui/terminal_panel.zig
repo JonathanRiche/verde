@@ -37,6 +37,7 @@ const TerminalContextMenuKind = enum {
 
 const TerminalContextMenuAction = enum {
     copy_selection,
+    copy_link,
     new_tab,
     new_claude_tab,
     new_opencode_tab,
@@ -292,8 +293,37 @@ const TerminalSelection = struct {
     pane_id: u32 = 0,
     start_x: f32 = 0.0,
     start_y: f32 = 0.0,
+    /// Rows are absolute scrollback rows (viewport row + scrollbar offset),
+    /// so the highlight stays on its text when the viewport scrolls.
     anchor: TerminalCellCoord = .{},
     focus: TerminalCellCoord = .{},
+};
+
+/// Multi-click detection for the setup terminal, whose dialog forwards no
+/// click count. Same interval/radius as Palette's own click counter.
+const ClickCounter = struct {
+    const INTERVAL_MS: i64 = 500;
+    const RADIUS: f32 = 6.0;
+
+    last_ms: i64 = 0,
+    last_x: f32 = 0.0,
+    last_y: f32 = 0.0,
+    last_button: u8 = 0,
+    count: u8 = 0,
+
+    fn press(self: *ClickCounter, button: u8, now_ms: i64, x: f32, y: f32) u8 {
+        const near = @abs(x - self.last_x) <= RADIUS and @abs(y - self.last_y) <= RADIUS;
+        if (self.count > 0 and button == self.last_button and now_ms - self.last_ms <= INTERVAL_MS and near) {
+            self.count +|= 1;
+        } else {
+            self.count = 1;
+        }
+        self.last_ms = now_ms;
+        self.last_x = x;
+        self.last_y = y;
+        self.last_button = button;
+        return self.count;
+    }
 };
 
 const PendingLinkClick = struct {
@@ -366,15 +396,26 @@ const TerminalHitCache = struct {
     menu_count: usize = 0,
     menu_hits: [14]ContextMenuHit = [_]ContextMenuHit{.{}} ** 14,
     menu_dock_id: u32 = 0,
+    /// Link under the right-click that opened the pane menu ("Copy Link").
+    menu_link_len: usize = 0,
+    menu_link: [MAX_TERMINAL_LINK_BYTES]u8 = undefined,
     dock_id: u32 = 0,
 };
 
 var hit_cache: TerminalHitCache = .{};
+/// Dock id of the provider dialog's setup terminal, which belongs to no
+/// workspace. Its pane hits are recorded under this id and only reached
+/// through the `handleStandalone*` entry points (the dialog sits above the
+/// workspace panes those hits would otherwise compete with).
+pub const STANDALONE_DOCK_ID: u32 = app_state.provider_setup.SETUP_DOCK_ID;
+/// While set, pane hit-testing only sees this dock's panes.
+var pane_filter: ?u32 = null;
 /// Set by the workspace pane layout while a tiled pane's rect is easing
 /// (item 6) so the PTY is resized once at the settled size, not per frame.
 pub var defer_resize_for_motion: bool = false;
 var selection_state: TerminalSelection = .{};
 var pending_link_click: PendingLinkClick = .{};
+var standalone_clicks: ClickCounter = .{};
 var draw_cache: TerminalDrawCache = .{};
 var image_texture_cache: TerminalImageTextureCache = .{};
 var active_capture: ?*TerminalRowDrawCache = null;
@@ -432,10 +473,14 @@ pub fn renderDockAtForDockWithin(state: *app_state.AppState, rect: palette.Rect,
     }
 }
 
-/// Draws a terminal that belongs to no workspace (the provider dialog's
-/// setup terminal) into `rect`. Input reaches it through its owner, not the
-/// workspace pane hit cache, so no dock id is recorded here.
+/// Draws the provider dialog's setup terminal (no workspace) into `rect`.
+/// Its panes are hit-tested under `STANDALONE_DOCK_ID`, so the dialog can
+/// forward clicks, drags, links, wheel, and copy through the same pane
+/// handlers workspace terminals use.
 pub fn renderStandaloneDock(state: *app_state.AppState, rect: palette.Rect, dock: *terminal.Dock) void {
+    const previous_dock_id = hit_cache.dock_id;
+    defer hit_cache.dock_id = previous_dock_id;
+    hit_cache.dock_id = STANDALONE_DOCK_ID;
     const dock_bg = if (dock.activeRenderState()) |render_state| rgbPaletteColor(render_state.colors.background, 1.0) else paletteColor(theme.background());
     queueRounded(state, rect, dock_bg, theme.scaledUi(8.0));
     if (dock.activeTab()) |tab| {
@@ -443,16 +488,113 @@ pub fn renderStandaloneDock(state: *app_state.AppState, rect: palette.Rect, dock
     } else {
         renderStatus(state, rect, "Starting...");
     }
+    if (hit_cache.menu_open and hit_cache.menu_dock_id == STANDALONE_DOCK_ID) {
+        renderContextMenu(state, dock, rect);
+    }
+}
+
+/// Pointer button over the setup terminal; false when (x, y) misses it and
+/// no drag or menu of its own is in progress.
+pub fn handleStandaloneMouseButton(state: *app_state.AppState, x: f32, y: f32, button: u8, down: bool) bool {
+    const menu_open = hit_cache.menu_open and hit_cache.menu_dock_id == STANDALONE_DOCK_ID;
+    const dragging = selection_state.dragging and selection_state.dock_id == STANDALONE_DOCK_ID;
+    const link = pending_link_click.active and pending_link_click.dock_id == STANDALONE_DOCK_ID;
+    if (!menu_open and !dragging and !link and standalonePaneAt(x, y) == null) {
+        // A click elsewhere in the dialog drops the terminal selection.
+        if (down and selectionAffectsDock(STANDALONE_DOCK_ID)) clearSelection();
+        return false;
+    }
+    pane_filter = STANDALONE_DOCK_ID;
+    defer pane_filter = null;
+    const clicks: u8 = if (down) standalone_clicks.press(button, platform_runtime.unixTimestampMs(), x, y) else 1;
+    _ = handleMouseButtonInPanes(state, x, y, button, down, clicks);
+    return true;
+}
+
+/// Pointer motion for the setup terminal (mouse-aware TUIs, selection drag).
+pub fn handleStandaloneMouseMotion(state: *app_state.AppState, x: f32, y: f32, buttons: palette.event.ButtonState) bool {
+    const dragging = selection_state.dragging and selection_state.dock_id == STANDALONE_DOCK_ID;
+    if (!dragging and standalonePaneAt(x, y) == null) return false;
+    pane_filter = STANDALONE_DOCK_ID;
+    defer pane_filter = null;
+    _ = handlePaletteMouseMotion(state, x, y, buttons);
+    return true;
+}
+
+/// Wheel scrollback for the setup terminal.
+pub fn handleStandaloneWheel(state: *app_state.AppState, x: f32, y: f32, wheel_y: f32) bool {
+    if (standalonePaneAt(x, y) == null) return false;
+    pane_filter = STANDALONE_DOCK_ID;
+    defer pane_filter = null;
+    _ = handleWheelInPanes(state, x, y, wheel_y);
+    return true;
+}
+
+/// Cursor over the setup terminal: the TUI's pointer request (links), else
+/// the I-beam over selectable output. Null when (x, y) misses it.
+pub fn standaloneCursorAt(state: *const app_state.AppState, x: f32, y: f32) ?palette.platform.CursorShape {
+    if (hit_cache.menu_open and hit_cache.menu_dock_id == STANDALONE_DOCK_ID and rectContains(hit_cache.menu_panel, x, y)) return .pointer;
+    const target = standalonePaneAt(x, y) orelse return null;
+    const dock = dockConst(state, target.dock_id) orelse return null;
+    if (dock.mouseShapeForPane(target.pane_id)) |shape| if (shape == .pointer) return .pointer;
+    return .text;
+}
+
+/// Forgets the setup terminal's selection, menu, and pending link click
+/// when the dialog leaves its terminal view.
+pub fn resetStandaloneInput() void {
+    if (selectionAffectsDock(STANDALONE_DOCK_ID) or selection_state.dock_id == STANDALONE_DOCK_ID) clearSelection();
+    if (hit_cache.menu_dock_id == STANDALONE_DOCK_ID) hit_cache.menu_open = false;
+    if (pending_link_click.dock_id == STANDALONE_DOCK_ID) pending_link_click = .{};
+    standalone_clicks = .{};
+}
+
+fn standalonePaneAt(x: f32, y: f32) ?PaneHitTarget {
+    var i: usize = 0;
+    while (i < hit_cache.pane_count) : (i += 1) {
+        const hit = hit_cache.panes[i];
+        if (hit.dock_id == STANDALONE_DOCK_ID and rectContains(hit.rect, x, y)) return .{ .dock_id = hit.dock_id, .pane_id = hit.pane_id, .rect = hit.rect };
+    }
+    return null;
+}
+
+fn selectionAffectsDock(dock_id: u32) bool {
+    return selection_state.active and selection_state.dock_id == dock_id;
+}
+
+/// The setup terminal resolves through the dialog that owns it; every
+/// other id is a dock of the current workspace.
+fn dockMutable(state: *app_state.AppState, dock_id: u32) ?*terminal.Dock {
+    if (dock_id == STANDALONE_DOCK_ID) return state.settings_controller.provider_setup.dock;
+    return state.currentProjectTerminalDockMutable(dock_id);
+}
+
+fn dockConst(state: *const app_state.AppState, dock_id: u32) ?*const terminal.Dock {
+    if (dock_id == STANDALONE_DOCK_ID) return state.settings_controller.provider_setup.dock;
+    return state.currentProjectTerminalDock(dock_id);
 }
 
 pub fn handlePaletteKeyDown(state: *app_state.AppState, event: *const palette.event.KeyEvent) bool {
+    // Escape closes an open terminal context menu (the topmost layer)
+    // instead of reaching the TUI underneath.
+    // `menu_count` is set only when the menu was drawn last frame, so a
+    // stale flag for an off-screen dock never swallows Escape.
+    if (hit_cache.menu_open and hit_cache.menu_count > 0 and event.down and event.key == .escape) {
+        hit_cache.menu_open = false;
+        state.markDirty();
+        return true;
+    }
     if (!terminalCopyShortcut(event) or !selection_state.active) return false;
     return copySelectionToClipboard(state);
 }
 
 pub fn handlePaletteMouseMotion(state: *app_state.AppState, x: f32, y: f32, buttons: palette.event.ButtonState) bool {
     if (pending_link_click.active and selectionDragDistanceExceededFrom(pending_link_click.start_x, pending_link_click.start_y, x, y)) {
+        // A press on a link that turns into a drag selects text from the
+        // press point instead of opening the link.
+        const click = pending_link_click;
         pending_link_click = .{};
+        if (buttons.left) beginSelectionDragFromLink(state, click);
     }
     if (routeTerminalMouseMotion(state, x, y, buttons)) return true;
     if (!selection_state.dragging) return false;
@@ -466,13 +608,13 @@ pub fn handlePaletteMouseMotion(state: *app_state.AppState, x: f32, y: f32, butt
 
 pub fn mouseShapeAtPoint(state: *const app_state.AppState, x: f32, y: f32) ?ghostty_vt.MouseShape {
     const target = paneAtPoint(x, y) orelse return null;
-    const dock = state.currentProjectTerminalDock(target.dock_id) orelse return null;
+    const dock = dockConst(state, target.dock_id) orelse return null;
     return dock.mouseShapeForPane(target.pane_id);
 }
 
 fn routeTerminalMouseMotion(state: *app_state.AppState, x: f32, y: f32, buttons: palette.event.ButtonState) bool {
     const target = paneAtPoint(x, y) orelse return false;
-    var dock = state.currentProjectTerminalDockMutable(target.dock_id) orelse return false;
+    var dock = dockMutable(state, target.dock_id) orelse return false;
     return dock.handleMouseMotion(
         target.pane_id,
         terminalPressedMouseButton(buttons),
@@ -494,10 +636,14 @@ fn terminalPressedMouseButton(buttons: palette.event.ButtonState) ?u8 {
 
 pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, button: u8, down: bool) bool {
     if (state.project_controller.projects.items.len == 0) return false;
+    return handleMouseButtonInPanes(state, x, y, button, down, 1);
+}
+
+fn handleMouseButtonInPanes(state: *app_state.AppState, x: f32, y: f32, button: u8, down: bool, clicks: u8) bool {
     if (button == 1 and !down and pending_link_click.active) return finishPendingLinkClick(state, x, y);
     if (button == 1 and hit_cache.menu_open) {
         if (!down) return true;
-        const dock = state.currentProjectTerminalDockMutable(hit_cache.menu_dock_id) orelse return false;
+        const dock = dockMutable(state, hit_cache.menu_dock_id) orelse return false;
         var i: usize = 0;
         while (i < hit_cache.menu_count) : (i += 1) {
             const hit = hit_cache.menu_hits[i];
@@ -527,13 +673,15 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, butt
     if (button == 1) {
         if (tabAtPoint(x, y)) |target| {
             hit_cache.dock_id = target.dock_id;
-            var dock = state.currentProjectTerminalDockMutable(target.dock_id) orelse return false;
+            var dock = dockMutable(state, target.dock_id) orelse return false;
             dock.selectTab(target.index);
             focusTerminal(state);
             if (dock.consumeWorkspaceChange()) markCurrentWorkspaceDirty(state);
             hit_cache.menu_open = false;
             return true;
         }
+        // Double-click selects a word, triple-click the (soft-wrapped) line.
+        if (clicks >= 2 and selectWordOrLineAt(state, x, y, clicks)) return true;
         if (beginPendingLinkClick(state, x, y)) return true;
         // Try to begin a selection candidate first — it requires both a pane
         // hit AND a valid cell at the click, so clicks in the inset/padding
@@ -541,7 +689,7 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, butt
         if (beginSelectionCandidate(state, x, y)) return true;
         if (paneAtPoint(x, y)) |target| {
             hit_cache.dock_id = target.dock_id;
-            var dock = state.currentProjectTerminalDockMutable(target.dock_id) orelse return false;
+            var dock = dockMutable(state, target.dock_id) orelse return false;
             dock.focusPane(target.pane_id);
             focusTerminal(state);
             clearSelection();
@@ -555,7 +703,7 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, butt
     if (button == 3) {
         if (tabAtPoint(x, y)) |target| {
             hit_cache.dock_id = target.dock_id;
-            var dock = state.currentProjectTerminalDockMutable(target.dock_id) orelse return false;
+            var dock = dockMutable(state, target.dock_id) orelse return false;
             dock.selectTab(target.index);
             focusTerminal(state);
             openContextMenu(.tab, target.index, 0, x, y);
@@ -564,14 +712,14 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, butt
         }
         if (paneAtPoint(x, y)) |target| {
             hit_cache.dock_id = target.dock_id;
-            var dock = state.currentProjectTerminalDockMutable(target.dock_id) orelse return false;
+            var dock = dockMutable(state, target.dock_id) orelse return false;
             dock.focusPane(target.pane_id);
             if (workspacePaneIdForDock(state, target.dock_id)) |workspace_pane_id| {
                 _ = state.focusCurrentProjectWorkspacePane(workspace_pane_id);
             }
             focusTerminal(state);
             if (!selectionAffectsPane(target.dock_id, target.pane_id)) clearSelection();
-            openContextMenu(.pane, 0, target.pane_id, x, y);
+            openPaneContextMenu(state, target, x, y);
             if (dock.consumeWorkspaceChange()) markCurrentWorkspaceDirty(state);
             return true;
         }
@@ -582,7 +730,7 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, butt
 fn routeTerminalMouseButton(state: *app_state.AppState, x: f32, y: f32, button: u8, down: bool) bool {
     const target = paneAtPoint(x, y) orelse return false;
     hit_cache.dock_id = target.dock_id;
-    var dock = state.currentProjectTerminalDockMutable(target.dock_id) orelse return false;
+    var dock = dockMutable(state, target.dock_id) orelse return false;
     dock.focusPane(target.pane_id);
     if (workspacePaneIdForDock(state, target.dock_id)) |workspace_pane_id| {
         _ = state.focusCurrentProjectWorkspacePane(workspace_pane_id);
@@ -602,22 +750,27 @@ fn rightClickSelectedPane(state: *app_state.AppState, x: f32, y: f32, down: bool
     if (!selectionAffectsPane(target.dock_id, target.pane_id)) return false;
     if (!down) return true;
     hit_cache.dock_id = target.dock_id;
-    var dock = state.currentProjectTerminalDockMutable(target.dock_id) orelse return false;
+    var dock = dockMutable(state, target.dock_id) orelse return false;
     dock.focusPane(target.pane_id);
     if (workspacePaneIdForDock(state, target.dock_id)) |workspace_pane_id| {
         _ = state.focusCurrentProjectWorkspacePane(workspace_pane_id);
     }
     focusTerminal(state);
-    openContextMenu(.pane, 0, target.pane_id, x, y);
+    openPaneContextMenu(state, target, x, y);
     if (dock.consumeWorkspaceChange()) markCurrentWorkspaceDirty(state);
     return true;
 }
 
 pub fn handlePaletteWheel(state: *app_state.AppState, x: f32, y: f32, wheel_y: f32) bool {
     if (wheel_y == 0.0 or state.project_controller.projects.items.len == 0) return false;
+    return handleWheelInPanes(state, x, y, wheel_y);
+}
+
+fn handleWheelInPanes(state: *app_state.AppState, x: f32, y: f32, wheel_y: f32) bool {
+    if (wheel_y == 0.0) return false;
     if (paneAtPoint(x, y)) |target| {
         hit_cache.dock_id = target.dock_id;
-        var dock = state.currentProjectTerminalDockMutable(target.dock_id) orelse return false;
+        var dock = dockMutable(state, target.dock_id) orelse return false;
         dock.focusPane(target.pane_id);
         focusTerminal(state);
         hit_cache.menu_open = false;
@@ -706,7 +859,7 @@ fn renderPane(state: *app_state.AppState, dock: anytype, pane_id: u32, rect: pal
         renderStatus(state, rect, dock.statusText(&status_buf));
         return;
     };
-    renderViewport(state, pane_id, render_state, dock.terminalForPane(pane_id), grid_rect, dock.font_scale, viewport_clip);
+    renderViewport(state, pane_id, render_state, dock.terminalForPane(pane_id), grid_rect, dock.font_scale, viewport_clip, paneScrollRow(dock, pane_id));
     if (dock.scrollbarForPane(pane_id)) |scrollbar| {
         renderTerminalScrollbar(state, rect, grid_rect, scrollbar);
     }
@@ -714,7 +867,7 @@ fn renderPane(state: *app_state.AppState, dock: anytype, pane_id: u32, rect: pal
     if (focused) queueBorder(state, rect, paletteColor(theme.accent()), 0.0, theme.scaledUi(1.0));
 }
 
-fn renderViewport(state: *app_state.AppState, pane_id: u32, render_state: *const ghostty_vt.RenderState, terminal_model: ?*ghostty_vt.Terminal, rect: palette.Rect, font_scale: f32, viewport_clip: palette.Rect) void {
+fn renderViewport(state: *app_state.AppState, pane_id: u32, render_state: *const ghostty_vt.RenderState, terminal_model: ?*ghostty_vt.Terminal, rect: palette.Rect, font_scale: f32, viewport_clip: palette.Rect, scroll_row: usize) void {
     if (render_state.rows == 0 or render_state.cols == 0) return;
     if (terminal_model) |model| {
         if (model.screens.active.kitty_images.dirty) {
@@ -791,6 +944,7 @@ fn renderViewport(state: *app_state.AppState, pane_id: u32, render_state: *const
             row_cells[model_y],
             row_selections[model_y],
             model_y,
+            scroll_row,
             visual_y,
             visible_cols,
             cell_w,
@@ -822,6 +976,7 @@ fn renderViewportRow(
     cells: anytype,
     selection: anytype,
     model_y: usize,
+    scroll_row: usize,
     visual_y: usize,
     visible_cols: usize,
     cell_w: f32,
@@ -855,7 +1010,7 @@ fn renderViewportRow(
         if (selection) |range| {
             if (x >= range[0] and x <= range[1]) bg = blendRgb(bg, render_state.colors.foreground, 0.22);
         }
-        if (selectionCoversCell(hit_cache.dock_id, pane_id, x, model_y)) {
+        if (selectionCoversCell(hit_cache.dock_id, pane_id, x, model_y + scroll_row)) {
             bg = blendRgb(bg, render_state.colors.foreground, 0.32);
         }
         if (render_state.cursor.viewport) |cursor| {
@@ -1191,13 +1346,27 @@ fn renderContextMenu(state: *app_state.AppState, dock: anytype, dock_rect: palet
     // labels[count] = "New Cursor Tab";
     // enabled[count] = true;
     // count += 1;
-    if (state.hasCustomTerminalLaunchProfile()) {
+    if (hit_cache.menu_dock_id == STANDALONE_DOCK_ID) {
+        // The setup terminal is one command, not a workspace pane: only Copy.
+        actions[count] = .copy_selection;
+        labels[count] = "Copy";
+        enabled[count] = selectionAffectsPane(hit_cache.menu_dock_id, hit_cache.menu_pane_id);
+        count += 1;
+        if (hit_cache.menu_kind == .pane and hit_cache.menu_link_len > 0) {
+            actions[count] = .copy_link;
+            labels[count] = "Copy Link";
+            enabled[count] = true;
+            count += 1;
+        }
+    } else if (state.hasCustomTerminalLaunchProfile()) {
         actions[count] = .new_custom_tab;
         labels[count] = state.customTerminalLaunchProfileLabel();
         enabled[count] = true;
         count += 1;
     }
-    if (hit_cache.menu_kind == .tab) {
+    if (hit_cache.menu_dock_id == STANDALONE_DOCK_ID) {
+        // Copy only (above).
+    } else if (hit_cache.menu_kind == .tab) {
         actions[count] = .rename_tab;
         labels[count] = "Rename Tab";
         enabled[count] = true;
@@ -1212,6 +1381,12 @@ fn renderContextMenu(state: *app_state.AppState, dock: anytype, dock_rect: palet
         if (selectionAffectsPane(hit_cache.menu_dock_id, hit_cache.menu_pane_id)) {
             actions[count] = .copy_selection;
             labels[count] = "Copy";
+            enabled[count] = true;
+            count += 1;
+        }
+        if (hit_cache.menu_link_len > 0) {
+            actions[count] = .copy_link;
+            labels[count] = "Copy Link";
             enabled[count] = true;
             count += 1;
         }
@@ -1281,6 +1456,7 @@ fn performContextMenuAction(state: *app_state.AppState, dock: anytype, action: T
     };
     switch (action) {
         .copy_selection => _ = copySelectionToClipboard(state),
+        .copy_link => copyMenuLinkToClipboard(state),
         .new_tab => _ = state.createCurrentProjectTerminalTab(hit_cache.menu_dock_id, .{}),
         .new_claude_tab => _ = state.createCurrentProjectTerminalTab(hit_cache.menu_dock_id, .{ .kind = .claude, .label = "Claude" }),
         .new_opencode_tab => _ = state.createCurrentProjectTerminalTab(hit_cache.menu_dock_id, .{ .kind = .opencode, .label = "OpenCode" }),
@@ -1327,7 +1503,11 @@ fn workspacePaneIdForDock(state: *const app_state.AppState, dock_id: u32) ?app_s
 }
 
 fn focusTerminal(state: *app_state.AppState) void {
-    state.requestTerminalDockFocus(if (hit_cache.menu_open) hit_cache.menu_dock_id else hit_cache.dock_id);
+    const dock_id = if (hit_cache.menu_open) hit_cache.menu_dock_id else hit_cache.dock_id;
+    // The dialog routes keys to its setup terminal itself; workspace focus
+    // must stay where it was for when the dialog closes.
+    if (dock_id == STANDALONE_DOCK_ID) return;
+    state.requestTerminalDockFocus(dock_id);
 }
 
 fn markCurrentWorkspaceDirty(state: *app_state.AppState) void {
@@ -1338,7 +1518,7 @@ fn markCurrentWorkspaceDirty(state: *app_state.AppState) void {
 fn beginPendingLinkClick(state: *app_state.AppState, x: f32, y: f32) bool {
     const target = paneAtPoint(x, y) orelse return false;
     hit_cache.dock_id = target.dock_id;
-    const dock = state.currentProjectTerminalDock(target.dock_id) orelse return false;
+    const dock = dockConst(state, target.dock_id) orelse return false;
     // Full-screen TUIs that requested mouse input own plain clicks; do not
     // steal those events for link opening.
     if (dock.paneWantsMouseInput(target.pane_id)) return false;
@@ -1350,7 +1530,7 @@ fn beginPendingLinkClick(state: *app_state.AppState, x: f32, y: f32) bool {
     defer state.allocator.free(href);
     if (href.len == 0 or href.len > pending_link_click.href.len) return false;
 
-    var mutable_dock = state.currentProjectTerminalDockMutable(target.dock_id) orelse return false;
+    var mutable_dock = dockMutable(state, target.dock_id) orelse return false;
     mutable_dock.focusPane(target.pane_id);
     if (workspacePaneIdForDock(state, target.dock_id)) |workspace_pane_id| {
         _ = state.focusCurrentProjectWorkspacePane(workspace_pane_id);
@@ -1381,7 +1561,13 @@ fn finishPendingLinkClick(state: *app_state.AppState, x: f32, y: f32) bool {
     const coord = cellAtPoint(state, target, x, y) orelse return true;
     if (coord.x != click.coord.x or coord.y != click.coord.y) return true;
 
-    state.openConfiguredTerminalWebLink(click.value());
+    // Sign-in URLs from the setup terminal open in the system browser,
+    // which also works before a workspace (and its browser pane) exists.
+    if (click.dock_id == STANDALONE_DOCK_ID) {
+        state.openWebLinkWithTarget(click.value(), .system_browser);
+    } else {
+        state.openConfiguredTerminalWebLink(click.value());
+    }
     return true;
 }
 
@@ -1389,14 +1575,29 @@ fn linkAtCell(allocator: std.mem.Allocator, dock: *const terminal.Dock, pane_id:
     const render_state = dock.renderStateForPane(pane_id) orelse return null;
     const row_data = render_state.row_data.slice();
     const row_cells = row_data.items(.cells);
+    const row_raws = row_data.items(.raw);
     if (coord.y >= row_cells.len) return null;
+
+    // A long URL (a sign-in link) soft-wraps across rows; hit-test the whole
+    // logical line so a click on any of its rows opens the full URL. Columns
+    // are numbered across the joined rows.
+    var first = coord.y;
+    while (first > 0 and row_raws[first - 1].wrap) first -= 1;
+    var last = coord.y;
+    while (last + 1 < row_cells.len and row_raws[last].wrap) last += 1;
 
     var row_text: std.ArrayList(u8) = .empty;
     defer row_text.deinit(allocator);
     var byte_cols: std.ArrayList(usize) = .empty;
     defer byte_cols.deinit(allocator);
-    try appendTerminalRowText(allocator, row_cells[coord.y], &row_text, &byte_cols);
-    return urlAtRowColumn(allocator, row_text.items, byte_cols.items, coord.x);
+    const cols: usize = render_state.cols;
+    var y = first;
+    while (y <= last) : (y += 1) {
+        const start = byte_cols.items.len;
+        try appendTerminalRowText(allocator, row_cells[y], &row_text, &byte_cols);
+        for (byte_cols.items[start..]) |*col| col.* += (y - first) * cols;
+    }
+    return urlAtRowColumn(allocator, row_text.items, byte_cols.items, (coord.y - first) * cols + coord.x);
 }
 
 fn appendTerminalRowText(
@@ -1509,9 +1710,9 @@ fn urlByteRangeColumns(byte_cols: []const usize, start: usize, end: usize) ?stru
 
 fn beginSelectionCandidate(state: *app_state.AppState, x: f32, y: f32) bool {
     const target = paneAtPoint(x, y) orelse return false;
-    const coord = cellAtPoint(state, target, x, y) orelse return false;
+    const coord = selectionCellAtPoint(state, target, x, y) orelse return false;
     hit_cache.dock_id = target.dock_id;
-    var dock = state.currentProjectTerminalDockMutable(target.dock_id) orelse return false;
+    var dock = dockMutable(state, target.dock_id) orelse return false;
     dock.focusPane(target.pane_id);
     focusTerminal(state);
     selection_state = .{
@@ -1542,7 +1743,116 @@ fn selectionDragDistanceExceededFrom(start_x: f32, start_y: f32, x: f32, y: f32)
 
 fn updateSelectionFocus(state: *app_state.AppState, x: f32, y: f32) ?void {
     const target = PaneHitTarget{ .dock_id = selection_state.dock_id, .pane_id = selection_state.pane_id };
-    selection_state.focus = cellAtPoint(state, target, x, y) orelse return null;
+    selection_state.focus = selectionCellAtPoint(state, target, x, y) orelse return null;
+}
+
+/// The cell under (x, y) in absolute scrollback rows, for selection.
+fn selectionCellAtPoint(state: *app_state.AppState, target: PaneHitTarget, x: f32, y: f32) ?TerminalCellCoord {
+    const coord = cellAtPoint(state, target, x, y) orelse return null;
+    const dock = dockMutable(state, target.dock_id) orelse return null;
+    return .{ .x = coord.x, .y = coord.y + paneScrollRow(dock, target.pane_id) };
+}
+
+/// Scrollback rows above the viewport; adds to viewport rows to make them
+/// absolute.
+fn paneScrollRow(dock: *terminal.Dock, pane_id: u32) usize {
+    const scrollbar = dock.scrollbarForPane(pane_id) orelse return 0;
+    return scrollbar.offset;
+}
+
+/// Turns a press on a link that became a drag into a text selection anchored
+/// at the press cell.
+fn beginSelectionDragFromLink(state: *app_state.AppState, click: PendingLinkClick) void {
+    const dock = dockMutable(state, click.dock_id) orelse return;
+    const scroll_row = paneScrollRow(dock, click.pane_id);
+    const anchor: TerminalCellCoord = .{ .x = click.coord.x, .y = click.coord.y + scroll_row };
+    selection_state = .{
+        .active = true,
+        .dragging = true,
+        .moved = true,
+        .dock_id = click.dock_id,
+        .pane_id = click.pane_id,
+        .start_x = click.start_x,
+        .start_y = click.start_y,
+        .anchor = anchor,
+        .focus = anchor,
+    };
+}
+
+/// Double-click selects the word under the pointer, triple-click its whole
+/// soft-wrapped line. False when the press is not over a terminal cell.
+fn selectWordOrLineAt(state: *app_state.AppState, x: f32, y: f32, clicks: u8) bool {
+    const target = paneAtPoint(x, y) orelse return false;
+    const coord = cellAtPoint(state, target, x, y) orelse return false;
+    var dock = dockMutable(state, target.dock_id) orelse return false;
+    const render_state = dock.renderStateForPane(target.pane_id) orelse return false;
+    const row_data = render_state.row_data.slice();
+    const range = (if (clicks >= 3)
+        terminalLineRange(row_data.items(.raw), row_data.items(.cells), coord)
+    else
+        terminalWordRange(row_data.items(.cells), coord)) orelse return false;
+    const scroll_row = paneScrollRow(dock, target.pane_id);
+    hit_cache.dock_id = target.dock_id;
+    dock.focusPane(target.pane_id);
+    focusTerminal(state);
+    pending_link_click = .{};
+    selection_state = .{
+        .active = true,
+        .dragging = false,
+        .moved = true,
+        .dock_id = target.dock_id,
+        .pane_id = target.pane_id,
+        .start_x = x,
+        .start_y = y,
+        .anchor = .{ .x = range.start.x, .y = range.start.y + scroll_row },
+        .focus = .{ .x = range.end.x, .y = range.end.y + scroll_row },
+    };
+    hit_cache.menu_open = false;
+    if (dock.consumeWorkspaceChange()) markCurrentWorkspaceDirty(state);
+    return true;
+}
+
+const TerminalCellRange = struct {
+    start: TerminalCellCoord,
+    end: TerminalCellCoord,
+};
+
+/// Word chars: anything printable except whitespace and the delimiters
+/// terminals conventionally stop a word at (quotes, brackets, pipes, commas).
+fn isTerminalWordCell(raw_cell: ghostty_vt.Cell) bool {
+    if (raw_cell.wide == .spacer_tail) return true;
+    if (!raw_cell.hasText()) return false;
+    return switch (raw_cell.codepoint()) {
+        ' ', '\t', '"', '\'', '`', '|', '(', ')', '[', ']', '{', '}', '<', '>', ',', ';', 0x2502 => false,
+        else => true,
+    };
+}
+
+fn terminalWordRange(row_cells: anytype, coord: TerminalCellCoord) ?TerminalCellRange {
+    if (coord.y >= row_cells.len) return null;
+    const raw_cells = row_cells[coord.y].slice().items(.raw);
+    if (raw_cells.len == 0) return null;
+    const col = @min(coord.x, raw_cells.len - 1);
+    var start = col;
+    var end = col;
+    // A delimiter or blank selects just itself.
+    if (isTerminalWordCell(raw_cells[col])) {
+        while (start > 0 and isTerminalWordCell(raw_cells[start - 1])) start -= 1;
+        while (end + 1 < raw_cells.len and isTerminalWordCell(raw_cells[end + 1])) end += 1;
+        // A leading spacer tail belongs to the wide char before the word.
+        while (start < end and raw_cells[start].wide == .spacer_tail) start += 1;
+    }
+    return .{ .start = .{ .x = start, .y = coord.y }, .end = .{ .x = end, .y = coord.y } };
+}
+
+fn terminalLineRange(row_raws: anytype, row_cells: anytype, coord: TerminalCellCoord) ?TerminalCellRange {
+    if (coord.y >= row_cells.len) return null;
+    var first = coord.y;
+    while (first > 0 and row_raws[first - 1].wrap) first -= 1;
+    var last = coord.y;
+    while (last + 1 < row_cells.len and row_raws[last].wrap) last += 1;
+    const last_cols = row_cells[last].slice().items(.raw).len;
+    return .{ .start = .{ .x = 0, .y = first }, .end = .{ .x = if (last_cols > 0) last_cols - 1 else 0, .y = last } };
 }
 
 fn clearSelection() void {
@@ -1551,7 +1861,7 @@ fn clearSelection() void {
 
 fn cellAtPoint(state: *app_state.AppState, target: PaneHitTarget, x: f32, y: f32) ?TerminalCellCoord {
     const rect = paneRect(target.dock_id, target.pane_id) orelse return null;
-    const dock = state.currentProjectTerminalDock(target.dock_id) orelse return null;
+    const dock = dockConst(state, target.dock_id) orelse return null;
     const render_state = dock.renderStateForPane(target.pane_id) orelse return null;
     if (render_state.cols == 0 or render_state.rows == 0) return null;
     const cell_w = terminalRenderCellSize(terminal.CELL_PIXEL_WIDTH, dock.font_scale);
@@ -1598,9 +1908,10 @@ fn coordLessThan(a: TerminalCellCoord, b: TerminalCellCoord) bool {
 }
 
 fn copySelectionToClipboard(state: *app_state.AppState) bool {
-    const dock = state.currentProjectTerminalDock(selection_state.dock_id) orelse return true;
+    const dock = dockMutable(state, selection_state.dock_id) orelse return true;
     const render_state = dock.renderStateForPane(selection_state.pane_id) orelse return true;
-    const text = selectedRenderStateText(state.allocator, render_state) catch |err| {
+    const scroll_row = paneScrollRow(dock, selection_state.pane_id);
+    const text = selectedRenderStateText(state.allocator, render_state, scroll_row) catch |err| {
         app_state.log.warn("failed to build terminal selection clipboard text: {s}", .{@errorName(err)});
         return true;
     };
@@ -1615,14 +1926,19 @@ fn copySelectionToClipboard(state: *app_state.AppState) bool {
     return true;
 }
 
-fn selectedRenderStateText(allocator: std.mem.Allocator, render_state: *const ghostty_vt.RenderState) ![]u8 {
+/// Text of the selection's visible part. Selection rows are absolute; the
+/// render state holds only the viewport (`scroll_row` is its first row), so
+/// rows scrolled out of view are clipped.
+fn selectedRenderStateText(allocator: std.mem.Allocator, render_state: *const ghostty_vt.RenderState, scroll_row: usize) ![]u8 {
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(allocator);
 
-    const start = selectionStart();
-    const end = selectionEnd();
     const row_data = render_state.row_data.slice();
     const row_cells = row_data.items(.cells);
+    const range = viewportSelectionRange(selectionStart(), selectionEnd(), scroll_row, row_cells.len) orelse
+        return output.toOwnedSlice(allocator);
+    const start = range.start;
+    const end = range.end;
     var y = start.y;
     while (y <= end.y and y < row_cells.len) : (y += 1) {
         const cells_slice = row_cells[y].slice();
@@ -1650,15 +1966,54 @@ fn selectedRenderStateText(allocator: std.mem.Allocator, render_state: *const gh
             if (raw_cell.wide == .wide and x < row_end) try row.append(allocator, ' ');
         }
 
-        try output.appendSlice(allocator, std.mem.trimEnd(u8, row.items, " \t"));
-        if (y < end.y) try output.append(allocator, '\n');
+        // A soft-wrapped row continues on the next one: keep it joined so a
+        // copied wrapped URL or command stays one line.
+        const wrapped = row_data.items(.raw)[y].wrap and y < end.y;
+        try output.appendSlice(allocator, if (wrapped) row.items else std.mem.trimEnd(u8, row.items, " \t"));
+        if (y < end.y and !wrapped) try output.append(allocator, '\n');
     }
 
     return output.toOwnedSlice(allocator);
 }
 
+/// Clips an absolute-row selection to the viewport rows the render state
+/// holds; null when none of it is visible.
+fn viewportSelectionRange(start: TerminalCellCoord, end: TerminalCellCoord, scroll_row: usize, viewport_rows: usize) ?TerminalCellRange {
+    if (viewport_rows == 0 or end.y < scroll_row or start.y >= scroll_row + viewport_rows) return null;
+    const clipped_start: TerminalCellCoord = if (start.y < scroll_row) .{ .x = 0, .y = 0 } else .{ .x = start.x, .y = start.y - scroll_row };
+    const clipped_end: TerminalCellCoord = if (end.y >= scroll_row + viewport_rows)
+        .{ .x = std.math.maxInt(usize), .y = viewport_rows - 1 }
+    else
+        .{ .x = end.x, .y = end.y - scroll_row };
+    return .{ .start = clipped_start, .end = clipped_end };
+}
+
+/// Opens the pane menu and remembers the link under the pointer, if any,
+/// for its "Copy Link" row.
+fn openPaneContextMenu(state: *app_state.AppState, target: PaneHitTarget, x: f32, y: f32) void {
+    openContextMenu(.pane, 0, target.pane_id, x, y);
+    hit_cache.menu_link_len = 0;
+    const dock = dockConst(state, target.dock_id) orelse return;
+    const coord = cellAtPoint(state, target, x, y) orelse return;
+    const href = linkAtCell(state.allocator, dock, target.pane_id, coord) catch return orelse return;
+    defer state.allocator.free(href);
+    if (href.len == 0 or href.len > hit_cache.menu_link.len) return;
+    @memcpy(hit_cache.menu_link[0..href.len], href);
+    hit_cache.menu_link_len = href.len;
+}
+
+fn copyMenuLinkToClipboard(state: *app_state.AppState) void {
+    if (hit_cache.menu_link_len == 0) return;
+    const text = state.allocator.dupeZ(u8, hit_cache.menu_link[0..hit_cache.menu_link_len]) catch return;
+    defer state.allocator.free(text);
+    host.setClipboardText(text) catch |err| {
+        app_state.log.warn("failed to copy terminal link: {s}", .{@errorName(err)});
+    };
+}
+
 fn openContextMenu(kind: TerminalContextMenuKind, tab_index: usize, pane_id: u32, x: f32, y: f32) void {
     hit_cache.menu_open = true;
+    hit_cache.menu_link_len = 0;
     hit_cache.menu_kind = kind;
     hit_cache.menu_dock_id = hit_cache.dock_id;
     hit_cache.menu_tab_index = tab_index;
@@ -1688,6 +2043,9 @@ fn paneAtPoint(x: f32, y: f32) ?PaneHitTarget {
     var i: usize = 0;
     while (i < hit_cache.pane_count) : (i += 1) {
         const hit = hit_cache.panes[i];
+        // The setup terminal is reachable only through its own entry points.
+        if ((pane_filter orelse hit.dock_id) != hit.dock_id) continue;
+        if (pane_filter == null and hit.dock_id == STANDALONE_DOCK_ID) continue;
         if (rectContains(hit.rect, x, y)) return .{ .dock_id = hit.dock_id, .pane_id = hit.pane_id, .rect = hit.rect };
     }
     return null;
@@ -2745,4 +3103,36 @@ test "terminal row cache geometry allows translation and partial dirtiness" {
     render_state.dirty = .partial;
     try std.testing.expect(cache.geometryValidFor(&render_state, .{ .x = -220.0, .y = 80.0, .w = 800.0, .h = 600.0 }, 1.0, 0, 24, false));
     try std.testing.expect(!cache.geometryValidFor(&render_state, .{ .x = -220.0, .y = 80.0, .w = 800.0, .h = 600.0 }, 1.0, 0, 24, true));
+}
+
+test "setup terminal click counter detects double and triple clicks" {
+    var counter: ClickCounter = .{};
+    try std.testing.expectEqual(@as(u8, 1), counter.press(1, 1_000, 10.0, 10.0));
+    try std.testing.expectEqual(@as(u8, 2), counter.press(1, 1_200, 12.0, 11.0));
+    try std.testing.expectEqual(@as(u8, 3), counter.press(1, 1_400, 12.0, 11.0));
+    // Too slow, too far, or another button starts a new sequence.
+    try std.testing.expectEqual(@as(u8, 1), counter.press(1, 2_000, 12.0, 11.0));
+    try std.testing.expectEqual(@as(u8, 1), counter.press(1, 2_100, 40.0, 11.0));
+    try std.testing.expectEqual(@as(u8, 1), counter.press(3, 2_200, 40.0, 11.0));
+}
+
+test "selection rows are absolute so scrolling moves the highlight with its text" {
+    // Selection on absolute rows 12..14; viewport of 10 rows.
+    const start: TerminalCellCoord = .{ .x = 3, .y = 12 };
+    const end: TerminalCellCoord = .{ .x = 5, .y = 14 };
+    // Viewport starting at row 10: rows 2..4 on screen.
+    const at_ten = viewportSelectionRange(start, end, 10, 10).?;
+    try std.testing.expectEqual(@as(usize, 2), at_ten.start.y);
+    try std.testing.expectEqual(@as(usize, 4), at_ten.end.y);
+    // Scrolled up by 4 (viewport starts at row 6): the same text is 4 rows lower.
+    const at_six = viewportSelectionRange(start, end, 6, 10).?;
+    try std.testing.expectEqual(@as(usize, 6), at_six.start.y);
+    try std.testing.expectEqual(@as(usize, 3), at_six.start.x);
+    // Partly above the viewport: clipped to its first row.
+    const at_thirteen = viewportSelectionRange(start, end, 13, 10).?;
+    try std.testing.expectEqual(TerminalCellCoord{ .x = 0, .y = 0 }, at_thirteen.start);
+    try std.testing.expectEqual(TerminalCellCoord{ .x = 5, .y = 1 }, at_thirteen.end);
+    // Fully scrolled out.
+    try std.testing.expect(viewportSelectionRange(start, end, 20, 10) == null);
+    try std.testing.expect(viewportSelectionRange(start, end, 0, 10) == null);
 }

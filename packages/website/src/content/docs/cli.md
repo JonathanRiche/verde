@@ -511,16 +511,17 @@ with `--progress` (0..1), it drives the surface's progress bar.
 
 | Exit | Meaning                                                                            |
 | ---- | --------------------------------------------------------------------------------- |
-| `0`  | CLI command parsed and, for live commands, received a live response.             |
-| `1`  | Command failure before a structured live response.                                |
+| `0`  | CLI command parsed and, for live commands, received an `ok: true` response.       |
+| `1`  | Command failure, including a live or daemon response with `ok: false`.            |
 | `2`  | Invalid CLI arguments.                                                              |
 | `3`  | Live server is not running or not ready.                                            |
 | `4`  | Offline state target not found.                                                    |
 
-Live IPC request failures return JSON error codes such as `not_found`,
-`invalid_request`, `invalid_target`, `rejected`, `unsupported`, or
-`method_not_found`. Scripts must check the JSON envelope's `ok` field, not only
-the process exit code.
+Live IPC request failures print the JSON envelope with error codes such as
+`not_found`, `invalid_request`, `invalid_target`, `rejected`, `unsupported`, or
+`method_not_found`, then exit `1`. Read the envelope's `error.code` to tell
+failures apart. `verde notify` is the exception: agent hooks call it, so a live `ok: false`
+reply does not change its exit status.
 
 ## Shell completion
 

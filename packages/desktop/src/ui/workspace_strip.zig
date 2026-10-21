@@ -351,10 +351,17 @@ fn renderTabKeyTip(state: *runtime.AppState, tab: palette.Rect, clip: palette.Re
     queueCenteredText(state, rect, label, text_w, paletteColor(theme.accent()), font_size, clip);
 }
 
-/// File viewer tabs carry a close X; other kinds close from their pane.
+/// File viewer tabs and one-shot task terminals (provider sign-in/install,
+/// editor tasks: `purpose == .editor`) carry a close X; other kinds close
+/// from their pane. A task terminal that is the only pane is never
+/// auto-closed when its command exits, so it needs a visible way out.
 fn tabClosable(layout: *const runtime.WorkspaceLayout, tab: runtime.WorkspaceTab) bool {
     const pane = layout.paneById(tab.preferred_pane_id) orelse return false;
-    return pane.ref == .file;
+    return switch (pane.ref) {
+        .file => true,
+        .terminal => |terminal_ref| terminal_ref.purpose == .editor,
+        else => false,
+    };
 }
 
 /// Close X at the tab's right edge (where the key tip goes while Ctrl is

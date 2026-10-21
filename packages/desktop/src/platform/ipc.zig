@@ -55,7 +55,16 @@ pub const Options = struct {
     max_message_bytes: usize = DEFAULT_MAX_MESSAGE_BYTES,
     max_response_bytes: usize = DEFAULT_MAX_RESPONSE_BYTES,
     timeout_ms: u32 = DEFAULT_TIMEOUT_MS,
+    /// Client-side cancellation for long-poll requests. The requesting
+    /// thread re-checks it between short receive slices while it waits for
+    /// the response and abandons the request with `error.RequestCanceled`,
+    /// closing its own socket; another thread only sets the flag. Windows
+    /// pipes observe only the deadline.
+    cancel: ?*const std.atomic.Value(bool) = null,
 };
+
+/// Receive granularity while a cancellable request waits for its response.
+const CANCEL_POLL_SLICE_MS: u32 = 50;
 
 /// A response plus the authenticated Windows server PID that produced it.
 /// Unix transports authenticate through their filesystem endpoint and leave
@@ -397,7 +406,7 @@ fn readUnixLineAlloc(
     max_bytes: usize,
     timeout_ms: u32,
 ) ![]u8 {
-    return readUnixLineAllocWithDeadline(allocator, io, stream, max_bytes, deadlineFromNow(timeout_ms));
+    return readUnixLineAllocWithDeadline(allocator, io, stream, max_bytes, deadlineFromNow(timeout_ms), null);
 }
 
 fn readUnixLineAllocWithDeadline(
@@ -406,6 +415,7 @@ fn readUnixLineAllocWithDeadline(
     stream: std.Io.net.Stream,
     max_bytes: usize,
     deadline: u64,
+    cancel: ?*const std.atomic.Value(bool),
 ) ![]u8 {
     var bytes: std.ArrayList(u8) = .empty;
     errdefer {
@@ -416,13 +426,17 @@ fn readUnixLineAllocWithDeadline(
     defer std.crypto.secureZero(u8, buffer[0..]);
 
     while (bytes.items.len <= max_bytes) {
+        if (cancel) |flag| if (flag.load(.acquire)) return error.RequestCanceled;
         const remaining_ms = remainingTimeoutMs(deadline) orelse return error.ConnectionTimedOut;
+        const wait_ms = if (cancel != null) @min(remaining_ms, CANCEL_POLL_SLICE_MS) else remaining_ms;
         const timeout: std.Io.Timeout = .{ .duration = .{
-            .raw = std.Io.Duration.fromMilliseconds(remaining_ms),
+            .raw = std.Io.Duration.fromMilliseconds(wait_ms),
             .clock = .awake,
         } };
         const message = stream.socket.receiveTimeout(io, &buffer, timeout) catch |err| switch (err) {
-            error.Timeout => return error.ConnectionTimedOut,
+            // A slice expiring is not the request deadline; loop to re-check
+            // cancellation and the remaining budget.
+            error.Timeout => if (wait_ms < remaining_ms) continue else return error.ConnectionTimedOut,
             else => return err,
         };
         if (message.data.len == 0) return error.ConnectionAborted;
@@ -452,7 +466,7 @@ fn requestUnixAlloc(
 
     try writeUnixAllWithDeadline(stream, request, deadline);
     try writeUnixAllWithDeadline(stream, "\n", deadline);
-    return readUnixLineAllocWithDeadline(allocator, io, stream, options.max_response_bytes, deadline);
+    return readUnixLineAllocWithDeadline(allocator, io, stream, options.max_response_bytes, deadline, options.cancel);
 }
 
 /// Opens a nonblocking Unix-domain socket and waits only beneath the request's
@@ -1433,4 +1447,36 @@ test "unix accept queue is bounded at TRANSPORT_ACCEPT_QUEUE_CAP" {
     // The ring recovers after wrap-around: capacity is reusable, not consumed.
     try std.testing.expect(pool.tryPush(fake_stream));
     try std.testing.expect(pool.pop() != null);
+}
+
+test "unix request cancel abandons a pending response promptly" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const endpoint = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..dir_len], "c.sock" });
+    defer std.testing.allocator.free(endpoint);
+    // A listener that never answers stands in for a parked long-poll.
+    const address = try std.Io.net.UnixAddress.init(endpoint);
+    var listener = try address.listen(io, .{});
+    defer listener.deinit(io);
+
+    var cancel = std.atomic.Value(bool).init(false);
+    const Canceller = struct {
+        fn run(flag: *std.atomic.Value(bool)) void {
+            runtime.sleepMillis(100);
+            flag.store(true, .release);
+        }
+    };
+    const canceller = try std.Thread.spawn(.{}, Canceller.run, .{&cancel});
+    defer canceller.join();
+    const started = monotonicMilliseconds();
+    try std.testing.expectError(
+        error.RequestCanceled,
+        requestAlloc(std.testing.allocator, endpoint, "{}", .{ .timeout_ms = 10_000, .cancel = &cancel }),
+    );
+    try std.testing.expect(monotonicMilliseconds() - started < 2_000);
 }

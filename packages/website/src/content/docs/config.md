@@ -154,10 +154,9 @@ Most of these options also appear in Settings:
   edge-to-edge. Pane navigation keeps the destination zoomed by default; set
   `ui.unzoom_on_pane_navigation` to `true` to restore on navigation instead.
 - **Agent integrations** — status-pip hooks for supported provider CLIs.
-- **Experimental features** — enable the machine-wide Companion (off by
-  default). **Appearance → Default companion** picks the character for new
-  companions; each companion's name, character, and model are chosen from the
-  companion panel.
+- **Companion** — show or hide the machine-wide Companion (off by default) and
+  pick the default character for new companions; each companion's name,
+  character, and model are chosen from the companion panel.
 - **Updates** — check now, install an available release, and automatic checks.
 - **Notifications** — enable or disable desktop notifications when an agent
   finishes, waits for input, or errors.

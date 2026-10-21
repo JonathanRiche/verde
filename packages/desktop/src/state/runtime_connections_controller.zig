@@ -189,6 +189,8 @@ pub const RepositoryRow = struct {
 };
 
 pub const ProviderRow = struct {
+    /// Stable provider id (`claude`, `codex`, ...); null when unreported.
+    provider: ?[]u8 = null,
     label: []u8,
     state: []u8,
     authentication: []u8,
@@ -197,11 +199,12 @@ pub const ProviderRow = struct {
     mcp: bool,
     lifecycle: bool,
     remediation_label: ?[]u8,
-    /// Space-joined command for display only. The desktop has no safe remote
-    /// execution surface, so this is shown as guidance and never run.
+    /// Space-joined command for display only; Settings offers the provider
+    /// setup flow (`provider_setup.openForRuntime`) instead of running it.
     remediation_command: ?[]u8,
 
     fn deinit(self: *ProviderRow, allocator: std.mem.Allocator) void {
+        if (self.provider) |value| allocator.free(value);
         allocator.free(self.label);
         allocator.free(self.state);
         allocator.free(self.authentication);
@@ -1705,7 +1708,7 @@ pub fn pollRuntimeConnectionsReadiness(self: anytype) bool {
     }
 
     if (readinessNextRequest(rc, now_ms) == .providers) {
-        startReadinessRequest(self, service, .providers, profile_id, runtime.runtime_id, runtime.instance_id, .{}) catch |err| {
+        startReadinessRequest(self, service, .providers, profile_id, runtime.runtime_id, runtime.instance_id, struct {}{}) catch |err| {
             log.warn("provider status rpc start failed: {s}", .{@errorName(err)});
             rc.providers_state = .failed;
             rc.providers_failure_reason = null;
@@ -1869,6 +1872,13 @@ fn applyReadinessResponse(
 ) void {
     const rc = &self.runtime_connections;
     if (response.failure_reason) |reason| {
+        // The reason alone is often `.unknown`; keep the remote error (no
+        // payload data, bounded) so a failing readiness call is diagnosable.
+        log.warn("runtime readiness {s} failed: {s} response={s}", .{
+            @tagName(request),
+            @tagName(reason),
+            response.json[0..@min(response.json.len, 400)],
+        });
         if (readinessFailureReasonTransient(reason)) {
             scheduleReadinessRetry(rc, request, self.runtimeNowMs());
             switch (request) {
@@ -2146,6 +2156,8 @@ fn parseProviders(self: anytype, json: []const u8) !void {
         };
         errdefer if (row.remediation_label) |value| self.allocator.free(value);
         errdefer if (row.remediation_command) |value| self.allocator.free(value);
+        if (stringField(item.object, "provider")) |value| row.provider = try self.allocator.dupe(u8, value);
+        errdefer if (row.provider) |value| self.allocator.free(value);
         try rc.providers.append(self.allocator, row);
     }
 }

@@ -81,15 +81,21 @@ pub const HeadlessTransport = struct {
     allocator: std.mem.Allocator,
     pref_path: []const u8,
     timeout_ms: u32 = REQUEST_TIMEOUT_MS,
+    /// Lets a long-poll owner abandon a parked request promptly (see
+    /// `platform_ipc.Options.cancel`); set by another thread at shutdown.
+    cancel: ?*const std.atomic.Value(bool) = null,
 
     pub fn send(ctx: *anyopaque, request_json: []const u8) anyerror![]u8 {
         const self: *HeadlessTransport = @ptrCast(@alignCast(ctx));
-        return sendRequestJsonAllocWithTimeout(
-            self.allocator,
-            self.pref_path,
-            request_json,
-            self.timeout_ms,
-        );
+        std.debug.assert(self.timeout_ms > 0);
+        const endpoint = try socketPath(self.allocator, self.pref_path);
+        defer self.allocator.free(endpoint);
+        return platform_ipc.requestAlloc(self.allocator, endpoint, request_json, .{
+            .max_message_bytes = MAX_MESSAGE_BYTES,
+            .max_response_bytes = MAX_MESSAGE_BYTES,
+            .timeout_ms = self.timeout_ms,
+            .cancel = self.cancel,
+        });
     }
 };
 

@@ -115,7 +115,26 @@ pub const RichPickerConfig = struct {
     /// Optional filter for the leading rail entry. When present, that entry
     /// shows only matching items instead of all groups (for example favorites).
     rail_primary_filter: ?ItemBoolFn = null,
+    /// Body message when no row is listed. `empty_primary_filter_text`
+    /// replaces it while the leading rail entry's `rail_primary_filter` is
+    /// the active, unsearched view (for example "no favorites yet").
+    empty_text: []const u8 = "",
+    empty_primary_filter_text: []const u8 = "",
     render_rail_icon: ?RailIconRenderFn = null,
+    /// Caps the group icons shown in the rail (0 = no cap). Groups for which
+    /// `rail_group_pinned` returns true (called with the group's first item)
+    /// always show; the remaining slots go to unpinned groups in
+    /// first-appearance order. Rows of hidden groups stay reachable through
+    /// the leading rail entry's filter only.
+    rail_max_groups: usize = 0,
+    rail_group_pinned: ?ItemBoolFn = null,
+    /// When true the rail scrolls (wheel over it, keyboard focus) inside the
+    /// popover's height instead of growing the popover to fit every entry.
+    /// Pair it with `fixed_body_height` so a filtered list keeps the rail tall.
+    rail_scrolls: bool = false,
+    /// Glyph for an optional trailing rail button after the group icons.
+    /// Activating it closes the picker and emits `.rail_add`.
+    rail_add_icon: []const u8 = "",
     search_style: SearchStyle = .boxed,
     /// Optional glyph rendered at the left edge of the search field.
     search_icon: []const u8 = "",
@@ -207,6 +226,8 @@ pub const RichPickerEvent = union(enum) {
     action: usize,
     highlighted: usize,
     open_changed: bool,
+    /// The trailing `rail_add_icon` rail button was activated.
+    rail_add,
 };
 
 pub const RichPickerCallbacks = struct {
@@ -271,7 +292,8 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
         rows: std.ArrayList(Row) = .empty,
         filtered: std.ArrayList(usize) = .empty,
         last_query: std.ArrayList(u8) = .empty,
-        /// First item index per unique group, in first-appearance order.
+        /// First item index per rail-visible group, in first-appearance
+        /// order (after `rail_max_groups` pruning).
         groups: std.ArrayList(usize) = .empty,
         /// Group label the rail is filtering to; empty means "all". Stored as
         /// a copy so the filter survives item-index churn across refreshes.
@@ -281,6 +303,8 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
         /// model rows; otherwise the value is the rail entry index (including
         /// the leading "all groups" entry at zero).
         focused_rail: ?usize = null,
+        /// Rail content offset when `rail_scrolls`; always 0 otherwise.
+        rail_scroll_y: f32 = 0.0,
         search: SearchInput = .{},
         highlighted: ?usize = null,
         selected_item: ?usize = null,
@@ -474,6 +498,12 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
                     if (!self.open) return false;
                     try self.ensureRows(allocator);
                     if (!self.pickerRect().contains(wheel.point)) return false;
+                    if (self.railActive() and self.railRect().contains(wheel.point) and self.railMaxScroll() > 0.0) {
+                        self.rail_scroll_y -= wheel.y * self.scaled(config.rail_item_height);
+                        self.clampRailScroll();
+                        self.hovered_rail = self.railItemAtPoint(wheel.point);
+                        return true;
+                    }
                     self.scrollBy(-wheel.y * self.scaled(config.row_height) * 3.0);
                     return true;
                 },
@@ -499,7 +529,11 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
                 }, self.style.background_color, @max(corner - inset, 0.0), rect);
             }
 
-            if (self.railActive()) try self.renderRail(allocator, batch, rect);
+            if (self.railActive()) {
+                // The viewport (and so the rail) may have shrunk since the last scroll.
+                self.clampRailScroll();
+                try self.renderRail(allocator, batch, rect);
+            }
             if (self.searchActive()) try self.renderSearch(allocator, batch);
 
             const body = self.bodyRect();
@@ -511,7 +545,26 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
                     .item => try self.renderItemRow(allocator, batch, row, row_rect, body),
                 }
             }
+            if (self.rows.items.len == 0) try self.renderEmptyState(allocator, batch, body);
             try self.renderScrollbar(allocator, batch);
+        }
+
+        fn renderEmptyState(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, body: draw.Rect) !void {
+            const primary_filter_view = config.rail_primary_filter != null and self.railActive() and
+                self.active_group_label.items.len == 0 and self.last_query.items.len == 0;
+            const message = if (primary_filter_view and config.empty_primary_filter_text.len > 0)
+                config.empty_primary_filter_text
+            else
+                config.empty_text;
+            if (message.len == 0) return;
+            const metrics_value = self.derivedMetrics(self.scaled(config.description_font_size));
+            const pad = self.scaled(config.row_padding_x);
+            try batch.fixedRoleText(allocator, .{
+                .x = body.x + pad,
+                .y = body.y + pad,
+                .w = @max(body.w - pad * 2.0, 0.0),
+                .h = @max(body.h - pad * 2.0, 0.0),
+            }, message, self.style.description_color, metrics_value.font_size, config.font_role, config.font_id, body, .{}, metrics_value.font_size * 0.55, metrics_value.line_height, true);
         }
 
         pub fn renderPass(_: *const Component, _: *draw.GpuRenderPass) void {}
@@ -551,11 +604,11 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
                 body_h = @max(@min(body_h, max_body), self.scaled(config.row_height));
             }
             var height = pad_y * 2.0 + search_h + body_h;
-            if (self.railActive()) {
+            if (self.railActive() and !config.rail_scrolls) {
                 // The rail never scrolls, so the popover must be tall enough
                 // for every rail entry (still capped to the viewport).
                 var rail_h = pad_y * 2.0 +
-                    @as(f32, @floatFromInt(self.groups.items.len + 1)) * self.scaled(config.rail_item_height);
+                    @as(f32, @floatFromInt(self.railEntryCount())) * self.scaled(config.rail_item_height);
                 if (self.viewport_rect) |viewport| rail_h = @min(rail_h, viewport.h);
                 height = @max(height, rail_h);
             }
@@ -599,6 +652,18 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
             return config.rail_enabled and self.groups.items.len > 1;
         }
 
+        const rail_has_add = config.rail_add_icon.len > 0;
+
+        /// Leading "all groups" entry, one per visible group, then the
+        /// optional trailing add button.
+        fn railEntryCount(self: *const Component) usize {
+            return self.groups.items.len + 1 + @intFromBool(rail_has_add);
+        }
+
+        fn railAddIndex(self: *const Component) ?usize {
+            return if (rail_has_add) self.groups.items.len + 1 else null;
+        }
+
         fn railWidth(self: *const Component) f32 {
             return if (self.railActive()) self.scaled(config.rail_width) else 0.0;
         }
@@ -615,23 +680,47 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
         }
 
         /// Rail entry rect; index 0 is the "all groups" entry, then one per
-        /// group in first-appearance order.
+        /// group in first-appearance order. Scrolled by `rail_scroll_y`.
         fn railItemRect(self: *const Component, index: usize) draw.Rect {
             const rail = self.railRect();
             const item_h = self.scaled(config.rail_item_height);
             return .{
                 .x = rail.x,
-                .y = rail.y + self.scaled(config.padding_y) + @as(f32, @floatFromInt(index)) * item_h,
+                .y = rail.y + self.scaled(config.padding_y) + @as(f32, @floatFromInt(index)) * item_h - self.rail_scroll_y,
                 .w = rail.w,
                 .h = item_h,
             };
+        }
+
+        fn railMaxScroll(self: *const Component) f32 {
+            if (!config.rail_scrolls or !self.railActive()) return 0.0;
+            const content_h = self.scaled(config.padding_y) * 2.0 +
+                @as(f32, @floatFromInt(self.railEntryCount())) * self.scaled(config.rail_item_height);
+            return @max(content_h - self.railRect().h, 0.0);
+        }
+
+        fn clampRailScroll(self: *Component) void {
+            self.rail_scroll_y = std.math.clamp(self.rail_scroll_y, 0.0, self.railMaxScroll());
+        }
+
+        /// Scrolls the rail just enough to show entry `index` whole.
+        fn ensureRailEntryVisible(self: *Component, index: usize) void {
+            if (!config.rail_scrolls) return;
+            const rail = self.railRect();
+            const item = self.railItemRect(index);
+            if (item.y < rail.y) {
+                self.rail_scroll_y -= rail.y - item.y;
+            } else if (item.y + item.h > rail.y + rail.h) {
+                self.rail_scroll_y += item.y + item.h - (rail.y + rail.h);
+            }
+            self.clampRailScroll();
         }
 
         fn railItemAtPoint(self: *const Component, point: draw.Vec2) ?usize {
             if (!self.railActive()) return null;
             if (!self.railRect().contains(point)) return null;
             var index: usize = 0;
-            while (index < self.groups.items.len + 1) : (index += 1) {
+            while (index < self.railEntryCount()) : (index += 1) {
                 if (self.railItemRect(index).contains(point)) return index;
             }
             return null;
@@ -771,9 +860,37 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
                 }
                 if (!known) try self.groups.append(allocator, index);
             }
+            self.pruneRailGroups();
             if (self.active_group_label.items.len > 0 and self.activeGroupIndex() == null) {
                 self.active_group_label.clearRetainingCapacity();
             }
+            self.clampRailScroll();
+        }
+
+        /// Applies `rail_max_groups`: pinned groups always stay, unpinned
+        /// groups fill the remaining slots in first-appearance order.
+        fn pruneRailGroups(self: *Component) void {
+            if (!config.rail_enabled or config.rail_max_groups == 0) return;
+            if (self.groups.items.len <= config.rail_max_groups) return;
+            const context = self.callbacks.context;
+            var pinned_count: usize = 0;
+            if (config.rail_group_pinned) |pinned| {
+                for (self.groups.items) |first_item| {
+                    if (pinned(context, first_item)) pinned_count += 1;
+                }
+            }
+            var unpinned_slots = config.rail_max_groups -| pinned_count;
+            var kept: usize = 0;
+            for (self.groups.items) |first_item| {
+                const is_pinned = if (config.rail_group_pinned) |pinned| pinned(context, first_item) else false;
+                if (!is_pinned) {
+                    if (unpinned_slots == 0) continue;
+                    unpinned_slots -= 1;
+                }
+                self.groups.items[kept] = first_item;
+                kept += 1;
+            }
+            self.groups.shrinkRetainingCapacity(kept);
         }
 
         fn activeGroupIndex(self: *const Component) ?usize {
@@ -918,6 +1035,8 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
             try self.ensureRows(allocator);
             self.scroll_y = 0.0;
             self.focused_rail = null;
+            self.rail_scroll_y = 0.0;
+            if (self.activeGroupIndex()) |group_index| self.ensureRailEntryVisible(group_index + 1);
             self.search.focused = true;
             self.highlighted = blk: {
                 if (self.selected_item) |item| {
@@ -975,13 +1094,21 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
             if (self.focused_rail) |rail_index| {
                 switch (key.code) {
                     .up, .down => {
-                        const entry_count = self.groups.items.len + 1;
+                        const entry_count = self.railEntryCount();
                         const next = if (key.code == .up)
                             rail_index -| 1
                         else
                             @min(rail_index + 1, entry_count - 1);
                         self.focused_rail = next;
-                        try self.setRailGroup(allocator, if (next == 0) null else next - 1);
+                        self.ensureRailEntryVisible(next);
+                        // Focusing the add button keeps the current filter.
+                        if (self.railAddIndex() != next) {
+                            try self.setRailGroup(allocator, if (next == 0) null else next - 1);
+                        }
+                        return true;
+                    },
+                    .enter => if (self.railAddIndex() == rail_index) {
+                        self.activateRailAdd(allocator);
                         return true;
                     },
                     .right => {
@@ -1021,6 +1148,7 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
                         return try self.search.handleInput(allocator, .{ .key = key });
                     }
                     self.focused_rail = self.railIndexForHighlight();
+                    self.ensureRailEntryVisible(self.focused_rail.?);
                     self.search.focused = false;
                     return true;
                 },
@@ -1105,6 +1233,10 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
             try self.ensureRows(allocator);
             if (self.railItemAtPoint(point)) |rail_index| {
                 self.focused_rail = null;
+                if (self.railAddIndex() == rail_index) {
+                    self.activateRailAdd(allocator);
+                    return true;
+                }
                 try self.setRailGroup(allocator, if (rail_index == 0) null else rail_index - 1);
                 return true;
             }
@@ -1174,6 +1306,13 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
             return self.pickerRect().contains(point);
         }
 
+        /// Closes first so the host's close handling (focus restore) runs
+        /// before whatever surface it opens for `.rail_add`.
+        fn activateRailAdd(self: *Component, allocator: std.mem.Allocator) void {
+            self.close(allocator);
+            self.emit(.rail_add);
+        }
+
         fn selectItem(self: *Component, allocator: std.mem.Allocator, item: usize) void {
             self.selected_item = item;
             self.emit(.{ .selected = item });
@@ -1218,9 +1357,15 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
             const active = self.activeGroupIndex();
             const icon_size = self.scaled(config.rail_icon_size);
             var index: usize = 0;
-            while (index < self.groups.items.len + 1) : (index += 1) {
+            while (index < self.railEntryCount()) : (index += 1) {
                 const item_rect = self.railItemRect(index);
-                const is_active = if (index == 0) active == null else active != null and active.? == index - 1;
+                const is_add = self.railAddIndex() == index;
+                const is_active = if (is_add)
+                    false
+                else if (index == 0)
+                    active == null
+                else
+                    active != null and active.? == index - 1;
                 if (self.focused_rail == index or (self.hovered_rail == index and !is_active)) {
                     const pad = self.scaled(4.0);
                     try batch.roundedRectClipped(allocator, .{
@@ -1230,16 +1375,13 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
                         .h = @max(item_rect.h - pad * 2.0, 0.0),
                     }, self.style.highlighted_color, self.scaled(8.0), rail);
                 }
-                if (index == 0) {
+                if (is_add) {
+                    const color = if (self.hovered_rail == index or self.focused_rail == index) self.style.text_color else self.style.description_color;
+                    try self.renderRailGlyph(allocator, batch, config.rail_add_icon, item_rect, color, rail);
+                } else if (index == 0) {
                     if (config.rail_all_icon.len > 0) {
-                        const icon_metrics = self.derivedMetrics(icon_size * 0.8);
                         const color = if (is_active) self.style.text_color else self.style.description_color;
-                        try batch.roleText(allocator, .{
-                            .x = item_rect.x + @max((item_rect.w - icon_metrics.measureSlice(config.rail_all_icon)) * 0.5, 0.0),
-                            .y = item_rect.y + @max((item_rect.h - icon_metrics.line_height) * 0.5, 0.0),
-                            .w = item_rect.w,
-                            .h = icon_metrics.line_height,
-                        }, config.rail_all_icon, color, icon_metrics.font_size, config.icon_font_role, config.icon_font_id, rail);
+                        try self.renderRailGlyph(allocator, batch, config.rail_all_icon, item_rect, color, rail);
                     }
                 } else if (config.render_rail_icon) |render_icon| {
                     render_icon(self.callbacks.context, allocator, batch, self.groups.items[index - 1], rail, .{
@@ -1259,6 +1401,32 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
                     }, self.style.accent_color, bar_w * 0.5, rail);
                 }
             }
+            // A thin thumb on the rail's left edge shows it scrolls.
+            const max_scroll = self.railMaxScroll();
+            if (max_scroll > 0.0) {
+                const thumb_w = @max(self.scaled(3.0), 2.0);
+                const thumb_h = @max(rail.h * rail.h / (rail.h + max_scroll), self.scaled(20.0));
+                try batch.roundedRectClipped(allocator, .{
+                    .x = rail.x + self.scaled(2.0),
+                    .y = rail.y + (rail.h - thumb_h) * (self.rail_scroll_y / max_scroll),
+                    .w = thumb_w,
+                    .h = thumb_h,
+                }, self.style.scrollbar_thumb_color, thumb_w * 0.5, rail);
+            }
+        }
+
+        /// Centers an icon-font glyph in a rail entry. Icon fonts (codicons)
+        /// use square 1em advances, so the glyph box is `font_size` wide; the
+        /// generic 0.55em text estimate would push it right of the logos.
+        fn renderRailGlyph(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, glyph: []const u8, item_rect: draw.Rect, color: draw.Color, clip: draw.Rect) !void {
+            const icon_metrics = self.derivedMetrics(self.scaled(config.rail_icon_size) * 0.8);
+            const glyph_w = icon_metrics.font_size;
+            try batch.roleText(allocator, .{
+                .x = item_rect.x + @max((item_rect.w - glyph_w) * 0.5, 0.0),
+                .y = item_rect.y + @max((item_rect.h - icon_metrics.line_height) * 0.5, 0.0),
+                .w = glyph_w,
+                .h = icon_metrics.line_height,
+            }, glyph, color, icon_metrics.font_size, config.icon_font_role, config.icon_font_id, clip);
         }
 
         // Renders the search area: optional leading icon glyph, the embedded
@@ -1613,4 +1781,138 @@ test "rich picker keyboard navigation skips headers" {
     try std.testing.expectEqual(@as(?usize, 4), picker.highlighted);
     _ = try picker.handleInput(std.testing.allocator, .{ .key = .{ .code = .up } });
     try std.testing.expectEqual(@as(?usize, 2), picker.highlighted);
+}
+
+const RailTestContext = struct {
+    rail_added: bool = false,
+
+    const labels = [_][]const u8{ "A1", "B1", "C1", "D1", "E1", "F1" };
+    const groups = [_][]const u8{ "A", "B", "C", "D", "E", "F" };
+
+    fn label(_: ?*anyopaque, index: usize) []const u8 {
+        return labels[index];
+    }
+
+    fn group(_: ?*anyopaque, index: usize) []const u8 {
+        return groups[index];
+    }
+
+    /// Groups B, E, and F are "connected".
+    fn pinned(_: ?*anyopaque, index: usize) bool {
+        return index == 1 or index == 4 or index == 5;
+    }
+
+    fn onEvent(context: ?*anyopaque, event: RichPickerEvent) void {
+        const self: *RailTestContext = @ptrCast(@alignCast(context.?));
+        switch (event) {
+            .rail_add => self.rail_added = true,
+            else => {},
+        }
+    }
+};
+
+fn RailTestPicker(comptime max_groups: usize) type {
+    return RichPicker(.{
+        .width = 300,
+        .row_height = 20,
+        .padding_y = 0,
+        .rail_item_height = 40,
+        .border_width = 1,
+        .search_enabled = false,
+        .item_label = RailTestContext.label,
+        .item_group = RailTestContext.group,
+        .rail_enabled = true,
+        .rail_max_groups = max_groups,
+        .rail_group_pinned = RailTestContext.pinned,
+        .rail_add_icon = "+",
+        .placement = .below,
+    });
+}
+
+fn railGroupLabels(groups: []const usize, out: []u8) []const u8 {
+    for (groups, 0..) |first_item, index| out[index] = RailTestContext.groups[first_item][0];
+    return out[0..groups.len];
+}
+
+test "rich picker rail caps unpinned groups and keeps pinned ones" {
+    var context: RailTestContext = .{};
+    var buffer: [8]u8 = undefined;
+
+    var capped = RailTestPicker(4).init(RailTestContext.labels.len);
+    defer capped.deinit(std.testing.allocator);
+    capped.setCallbacks(.{ .context = &context, .on_event = RailTestContext.onEvent });
+    _ = try capped.handleInput(std.testing.allocator, .open);
+    // Three pinned groups leave one slot for the first unpinned group (A).
+    try std.testing.expectEqualStrings("ABEF", railGroupLabels(capped.groups.items, &buffer));
+    try std.testing.expectEqual(@as(usize, 6), capped.railEntryCount());
+
+    // A cap below the pinned count still shows every pinned group.
+    var tight = RailTestPicker(2).init(RailTestContext.labels.len);
+    defer tight.deinit(std.testing.allocator);
+    tight.setCallbacks(.{ .context = &context, .on_event = RailTestContext.onEvent });
+    _ = try tight.handleInput(std.testing.allocator, .open);
+    try std.testing.expectEqualStrings("BEF", railGroupLabels(tight.groups.items, &buffer));
+}
+
+test "rich picker rail add button closes and emits rail_add" {
+    var context: RailTestContext = .{};
+    var picker = RailTestPicker(4).init(RailTestContext.labels.len);
+    defer picker.deinit(std.testing.allocator);
+    picker.setCallbacks(.{ .context = &context, .on_event = RailTestContext.onEvent });
+    picker.setAnchorRect(.{ .x = 10, .y = 10, .w = 100, .h = 20 });
+    picker.setViewportRect(.{ .x = 0, .y = 0, .w = 800, .h = 900 });
+    _ = try picker.handleInput(std.testing.allocator, .open);
+
+    const add_rect = picker.railItemRect(picker.railAddIndex().?);
+    const point: draw.Vec2 = .{ .x = add_rect.x + add_rect.w * 0.5, .y = add_rect.y + add_rect.h * 0.5 };
+    try std.testing.expect(picker.wantsPointerAt(point));
+    _ = try picker.handleInput(std.testing.allocator, .{ .mouse_down = .{ .point = point } });
+    try std.testing.expect(context.rail_added);
+    try std.testing.expect(!picker.isOpen());
+}
+
+test "rich picker scrolling rail keeps every group reachable" {
+    var context: RailTestContext = .{};
+    var picker = RichPicker(.{
+        .width = 300,
+        .row_height = 20,
+        .padding_y = 0,
+        .rail_item_height = 40,
+        .border_width = 1,
+        .search_enabled = false,
+        .item_label = RailTestContext.label,
+        .item_group = RailTestContext.group,
+        .rail_enabled = true,
+        .rail_scrolls = true,
+        .rail_add_icon = "+",
+        .placement = .below,
+        // A scrolling rail pairs with a fixed body, so filtering to one
+        // group does not shrink the popover (and the rail) to one row.
+        .fixed_body_height = 160,
+    }).init(RailTestContext.labels.len);
+    defer picker.deinit(std.testing.allocator);
+    picker.setCallbacks(.{ .context = &context, .on_event = RailTestContext.onEvent });
+    picker.setAnchorRect(.{ .x = 10, .y = 10, .w = 100, .h = 20 });
+    picker.setViewportRect(.{ .x = 0, .y = 0, .w = 800, .h = 900 });
+    _ = try picker.handleInput(std.testing.allocator, .open);
+
+    // The 160 px body does not stretch to fit eight 40 px rail entries.
+    try std.testing.expectEqual(@as(usize, 6), picker.groups.items.len);
+    try std.testing.expect(picker.pickerRect().h < 8.0 * 40.0);
+    try std.testing.expect(picker.railMaxScroll() > 0.0);
+
+    // The wheel over the rail scrolls the rail, not the model list.
+    const rail = picker.railRect();
+    _ = try picker.handleInput(std.testing.allocator, .{ .mouse_wheel = .{ .point = .{ .x = rail.x + 4, .y = rail.y + 4 }, .y = -1.0 } });
+    try std.testing.expectEqual(@as(f32, 40.0), picker.rail_scroll_y);
+    try std.testing.expectEqual(@as(f32, 0.0), picker.scroll_y);
+
+    // Keyboard focus walking down the rail scrolls the add button into view.
+    picker.rail_scroll_y = 0.0;
+    _ = try picker.handleInput(std.testing.allocator, .{ .key = .{ .code = .left } });
+    var steps: usize = 0;
+    while (steps < 8) : (steps += 1) _ = try picker.handleInput(std.testing.allocator, .{ .key = .{ .code = .down } });
+    try std.testing.expectEqual(picker.railAddIndex(), picker.focused_rail);
+    const add_rect = picker.railItemRect(picker.railAddIndex().?);
+    try std.testing.expect(add_rect.y >= rail.y and add_rect.y + add_rect.h <= rail.y + rail.h + 0.01);
 }

@@ -27,6 +27,10 @@ const GROK_ACCEPTS_IMAGES = true;
 const AUTHENTICATE_REQUEST_ID: i64 = 10;
 const SET_MODEL_REQUEST_ID: i64 = 11;
 
+/// Auth probes spawn the full ACP agent; a wedged handshake must end before
+/// the next readiness poll instead of piling up.
+const AUTH_PROBE_DEADLINE_MS: u64 = 10_000;
+
 const ACP_HARNESS: acp.Harness = .{
     .diagnostics_category = .grok_acp,
     .assistant_author = "Grok",
@@ -299,6 +303,9 @@ pub const Client = struct {
             else => return err,
         };
         defer proc.deinit();
+        var deadline: acp.ProcessDeadline = .{ .child = &proc.process, .deadline_ms = AUTH_PROBE_DEADLINE_MS };
+        deadline.start() catch return .unknown;
+        defer deadline.finish();
 
         var read_buffer: [16 * 1024]u8 = undefined;
         var reader = proc.process.child.stdout.?.reader(proc.threaded.io(), &read_buffer);

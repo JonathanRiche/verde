@@ -400,6 +400,13 @@ const Entry = struct {
     handshake: ?*HandshakeTask = null,
     rpc_task: ?*RpcTask = null,
     rpc_result: ?CompletedRpc = null,
+    /// Separate one-request lane for remote terminal `session.*` RPCs, so a
+    /// terminal's tail polling never occupies the chat/readiness slot above.
+    terminal_rpc_task: ?*RpcTask = null,
+    terminal_rpc_result: ?CompletedRpc = null,
+    /// The owner abandoned the in-flight terminal ticket; its result is
+    /// dropped on collection instead of wedging the lane.
+    terminal_rpc_abandoned: bool = false,
     access_task: ?*AccessTask = null,
     pending_grant: ?PendingGrant = null,
     pairing_result: ?OwnedPairingResult = null,
@@ -435,8 +442,10 @@ const Entry = struct {
             task.handoffToProcessReaper();
         }
         if (self.rpc_task) |task| task.handoffToProcessReaper();
+        if (self.terminal_rpc_task) |task| task.handoffToProcessReaper();
         if (self.access_task) |task| task.handoffToProcessReaper();
         if (self.rpc_result) |*completed| completed.result.deinit();
+        if (self.terminal_rpc_result) |*completed| completed.result.deinit();
         if (self.pending_grant) |*grant| grant.deinit(allocator);
         if (self.pairing_result) |*result| result.deinit(allocator);
         self.connection_state.deinit();
@@ -1088,6 +1097,90 @@ pub const Manager = struct {
         return error.UnknownRuntimeRpcTicket;
     }
 
+    /// Starts one bounded remote-terminal RPC (`session.*` only) on the
+    /// profile's terminal lane, independent of the general `beginRpc` slot so
+    /// terminal polling never starves chat or readiness. Same target pinning
+    /// and response checks as `beginRpc`. An SSH relay admits one bearer
+    /// connection at a time, so there the lane waits for the general slot.
+    pub fn beginTerminalRpc(
+        self: *Manager,
+        profile_id: []const u8,
+        method: []const u8,
+        params: anytype,
+    ) !RpcTicket {
+        if (!isTerminalRpcMethod(method)) return error.InvalidRuntimeRpcMethod;
+        const entry = self.findEntry(profile_id) orelse return error.UnknownRuntimeProfile;
+        if (!entryExecutionReady(entry)) return error.RuntimeNotExecutionReady;
+        if (entry.terminal_rpc_task != null) return error.RuntimeRpcBusy;
+        if (entry.terminal_rpc_result != null) return error.RuntimeRpcResultPending;
+        if (entry.tunnel_owned and (entry.rpc_task != null or entry.access_task != null or entry.handshake != null)) {
+            return error.RuntimeRpcBusy;
+        }
+
+        const runtime_id = entry.owned_profile.expected_runtime_id orelse
+            return error.RuntimeNotExecutionReady;
+        const instance_id = entry.owned_profile.expected_instance_id orelse
+            return error.RuntimeNotExecutionReady;
+        const request_id = try self.allocateRpcId();
+        var encoder = try headless.Client.initTargetedEncoder(self.allocator, .{
+            .runtime_id = runtime_id,
+            .instance_id = instance_id,
+        });
+        const request_json = try encoder.encodeRequestWithId(request_id, method, params);
+        defer self.allocator.free(request_json);
+        if (request_json.len > headless.protocol.RUNTIME_MAX_MESSAGE_BYTES) {
+            return error.RuntimeRpcRequestTooLarge;
+        }
+
+        const ticket: RpcTicket = .{ .id = request_id };
+        entry.terminal_rpc_task = try self.spawnRpcTask(
+            entry,
+            .{ .user = ticket },
+            request_id,
+            request_json,
+            .general,
+        );
+        entry.terminal_rpc_abandoned = false;
+        return ticket;
+    }
+
+    /// Terminal-lane counterpart of `takeRpcResult`.
+    pub fn takeTerminalRpcResult(self: *Manager, ticket: RpcTicket) !?RpcCallResult {
+        for (self.entries.items) |*entry| {
+            if (entry.terminal_rpc_task) |task| switch (task.kind) {
+                .heartbeat => {},
+                .user => |active| if (active.id == ticket.id) return null,
+            };
+            if (entry.terminal_rpc_result) |*completed| {
+                if (completed.ticket.id != ticket.id) continue;
+                const result = completed.result;
+                entry.terminal_rpc_result = null;
+                return result;
+            }
+        }
+        return error.UnknownRuntimeRpcTicket;
+    }
+
+    /// Releases a terminal ticket its owner will never take (the terminal
+    /// closed), so the lane is not left holding an unread result.
+    pub fn abandonTerminalRpc(self: *Manager, ticket: RpcTicket) void {
+        for (self.entries.items) |*entry| {
+            if (entry.terminal_rpc_task) |task| switch (task.kind) {
+                .heartbeat => {},
+                .user => |active| if (active.id == ticket.id) {
+                    entry.terminal_rpc_abandoned = true;
+                    return;
+                },
+            };
+            if (entry.terminal_rpc_result) |*completed| {
+                if (completed.ticket.id != ticket.id) continue;
+                completed.result.deinit();
+                entry.terminal_rpc_result = null;
+                return;
+            }
+        }
+    }
+
     fn pollEntry(self: *Manager, index: usize, now_ms: u64) !void {
         var entry = &self.entries.items[index];
         // A terminal relay owns the attempt outcome. Observe it before a
@@ -1136,7 +1229,7 @@ pub const Manager = struct {
                 if (!runtimeAdvertisesTargeting(entry)) {
                     try self.invalidateExecution(entry, .protocol, now_ms);
                 } else if (entry.usesDeviceCredential() and entry.rpc_task == null and entry.access_task == null and
-                    accessTokenRefreshDue(entry, now_ms))
+                    !terminalLaneHoldsRelay(entry) and accessTokenRefreshDue(entry, now_ms))
                 {
                     // Re-mint before expiry; the fresh token replaces the old
                     // one in place so the ready generation is preserved.
@@ -1148,7 +1241,7 @@ pub const Manager = struct {
                         };
                         try self.invalidateExecution(entry, failure, now_ms);
                     };
-                } else if (entry.rpc_task == null and entry.access_task == null and heartbeatDue(entry, now_ms)) {
+                } else if (entry.rpc_task == null and entry.access_task == null and !terminalLaneHoldsRelay(entry) and heartbeatDue(entry, now_ms)) {
                     self.startHeartbeat(entry) catch |err| {
                         const failure: connection.FailureKind = switch (err) {
                             error.MissingRuntimeCredential => .authentication,
@@ -1588,7 +1681,16 @@ pub const Manager = struct {
     }
 
     fn collectRpc(self: *Manager, entry: *Entry, now_ms: u64) !void {
-        const task = entry.rpc_task orelse return;
+        try self.collectRpcLane(entry, .general, now_ms);
+        try self.collectRpcLane(entry, .terminal, now_ms);
+    }
+
+    fn collectRpcLane(self: *Manager, entry: *Entry, lane: RpcLane, now_ms: u64) !void {
+        const task_slot: *?*RpcTask = switch (lane) {
+            .general => &entry.rpc_task,
+            .terminal => &entry.terminal_rpc_task,
+        };
+        const task = task_slot.* orelse return;
         if (task.state.load(.acquire) != .finished) return;
 
         const generation = task.generation;
@@ -1599,16 +1701,18 @@ pub const Manager = struct {
         var worker_result: ?RpcWorkerResult = task.takeResult();
         task.releaseFields();
         task_allocator.destroy(task);
-        entry.rpc_task = null;
-        if (!entry.tunnel_owned and entry.handshake == null) entry.local_port = null;
+        task_slot.* = null;
+        if (!entry.tunnel_owned and entry.handshake == null and entry.rpc_task == null and entry.terminal_rpc_task == null) {
+            entry.local_port = null;
+        }
         defer if (worker_result) |*result| result.deinit(task_allocator);
 
         if (!rpcGenerationIsCurrent(entry, generation)) {
             if (kind == .user) {
-                entry.rpc_result = .{
+                publishRpcResult(entry, lane, .{
                     .ticket = kind.user,
                     .result = .canceled,
-                };
+                });
             }
             return;
         }
@@ -1619,10 +1723,10 @@ pub const Manager = struct {
                     try self.invalidateExecution(entry, failure, now_ms);
                 }
                 if (kind == .user) {
-                    entry.rpc_result = .{
+                    publishRpcResult(entry, lane, .{
                         .ticket = kind.user,
                         .result = .{ .failed = mapConnectionFailure(failure) },
-                    };
+                    });
                 }
             },
             .response => |response| {
@@ -1636,10 +1740,10 @@ pub const Manager = struct {
                 )) |failure| {
                     try self.invalidateExecution(entry, failure, now_ms);
                     if (kind == .user) {
-                        entry.rpc_result = .{
+                        publishRpcResult(entry, lane, .{
                             .ticket = kind.user,
                             .result = .{ .failed = mapConnectionFailure(failure) },
-                        };
+                        });
                     }
                 } else {
                     entry.healthy_generation = generation;
@@ -1657,14 +1761,14 @@ pub const Manager = struct {
                             request_id,
                             response,
                         );
-                        entry.rpc_result = .{
+                        publishRpcResult(entry, lane, .{
                             .ticket = kind.user,
                             .result = .{ .response = .{
                                 .allocator = task_allocator,
                                 .json = response,
                                 .failure_reason = failure_reason,
                             } },
-                        };
+                        });
                         worker_result = null;
                     }
                 }
@@ -1703,6 +1807,20 @@ pub const Manager = struct {
         failure_context: RpcFailureContext,
     ) !void {
         if (entry.rpc_task != null) return error.RuntimeRpcBusy;
+        // The relay's one bearer connection is in use by the terminal lane;
+        // callers already treat busy as "retry on a later poll".
+        if (terminalLaneHoldsRelay(entry)) return error.RuntimeRpcBusy;
+        entry.rpc_task = try self.spawnRpcTask(entry, kind, request_id, request_json, failure_context);
+    }
+
+    fn spawnRpcTask(
+        self: *Manager,
+        entry: *Entry,
+        kind: RpcTaskKind,
+        request_id: u64,
+        request_json: []const u8,
+        failure_context: RpcFailureContext,
+    ) !*RpcTask {
         if (entry.connection_state.phase() != .ready) return error.RuntimeNotExecutionReady;
         const generation = entry.connection_state.generation;
         if (entry.tunnel_generation != generation) return error.RelayNotReady;
@@ -1714,7 +1832,7 @@ pub const Manager = struct {
         else
             null;
         defer if (bearer_lease) |*lease| lease.release();
-        entry.rpc_task = try RpcTask.start(
+        return try RpcTask.start(
             generation,
             request_id,
             kind,
@@ -1812,7 +1930,7 @@ pub const Manager = struct {
         // A stale worker still holds both a copied bearer and this numeric port.
         // Reserve it against every other profile until that worker is collected;
         // the supervisor's bearer lease independently keeps the listener bound.
-        if (entry.handshake == null and entry.rpc_task == null) entry.local_port = null;
+        if (entry.handshake == null and entry.rpc_task == null and entry.terminal_rpc_task == null) entry.local_port = null;
     }
 
     fn selectUniquePort(self: *Manager, current_index: usize) !u16 {
@@ -2220,6 +2338,37 @@ fn callSystemAccess(
             .body = body,
         }),
     };
+}
+
+/// Which per-profile request slot an RPC worker reports to.
+const RpcLane = enum { general, terminal };
+
+/// Remote-terminal methods admitted on the terminal lane.
+const TERMINAL_RPC_METHODS = [_][]const u8{ "session.create", "session.tail", "session.write", "session.resize", "session.kill" };
+
+fn isTerminalRpcMethod(method: []const u8) bool {
+    for (TERMINAL_RPC_METHODS) |allowed| {
+        if (std.mem.eql(u8, method, allowed)) return true;
+    }
+    return false;
+}
+
+/// A terminal-lane worker holds the SSH relay's single bearer lease.
+fn terminalLaneHoldsRelay(entry: *const Entry) bool {
+    return entry.tunnel_owned and entry.terminal_rpc_task != null;
+}
+
+fn publishRpcResult(entry: *Entry, lane: RpcLane, completed: CompletedRpc) void {
+    switch (lane) {
+        .general => entry.rpc_result = completed,
+        .terminal => if (entry.terminal_rpc_abandoned) {
+            entry.terminal_rpc_abandoned = false;
+            var dropped = completed.result;
+            dropped.deinit();
+        } else {
+            entry.terminal_rpc_result = completed;
+        },
+    }
 }
 
 const RpcTaskKind = union(enum) {
@@ -3520,4 +3669,131 @@ test "session authentication during device mint preserves credential and require
     try std.testing.expect(!snapshot.automatic_retry_scheduled);
     try std.testing.expectEqual(connection.FailureKind.session_authentication, mapTransportFailure(error.SessionAuthenticationRequired));
     try std.testing.expect(!manager.recoverStaleBearer(entry, .session_authentication));
+}
+
+/// Answers `core.status` like `TestRpc`; every other method waits on `gate`
+/// and then reports `{ "accepted": true }`.
+const TestLaneRpc = struct {
+    gate_open: std.atomic.Value(bool) = .init(true),
+    lane_calls: std.atomic.Value(usize) = .init(0),
+    retained: std.atomic.Value(usize) = .init(0),
+
+    fn retain(raw_context: ?*anyopaque) void {
+        const self: *TestLaneRpc = @ptrCast(@alignCast(raw_context.?));
+        _ = self.retained.fetchAdd(1, .acq_rel);
+    }
+
+    fn release(raw_context: ?*anyopaque) void {
+        const self: *TestLaneRpc = @ptrCast(@alignCast(raw_context.?));
+        _ = self.retained.fetchSub(1, .acq_rel);
+    }
+
+    fn call(
+        raw_context: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        _: TransportTarget,
+        _: []const u8,
+        rpc_json: []const u8,
+    ) connection.TransportError![]u8 {
+        const self: *TestLaneRpc = @ptrCast(@alignCast(raw_context.?));
+        var parsed = headless.protocol.parseRequest(allocator, rpc_json) catch return error.ProtocolRejected;
+        defer parsed.deinit();
+        if (std.mem.eql(u8, parsed.request.method, "core.status")) {
+            return headless.encodeOkResponse(allocator, parsed.request.id, testStatus(TEST_RUNTIME_A)) catch
+                return error.OutOfMemory;
+        }
+        _ = self.lane_calls.fetchAdd(1, .acq_rel);
+        // Bounded: a test that forgets to open the gate fails, never hangs.
+        var spins: usize = 0;
+        while (!self.gate_open.load(.acquire) and spins < 5_000) : (spins += 1) {
+            std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+        }
+        return headless.encodeOkResponse(allocator, parsed.request.id, .{ .accepted = true }) catch
+            return error.OutOfMemory;
+    }
+
+    fn backend(self: *TestLaneRpc) RpcBackend {
+        return .{ .context = self, .call = call, .retain_context = retain, .release_context = release };
+    }
+};
+
+fn waitForTerminalRpcResult(manager: *Manager, ticket: RpcTicket, start_ms: u64) !RpcCallResult {
+    for (0..2_000) |iteration| {
+        try manager.poll(start_ms + iteration);
+        if (try manager.takeTerminalRpcResult(ticket)) |result| return result;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
+    return error.TestExpectedTerminalRpcResult;
+}
+
+test "terminal RPC lane is session-only, separate from the general slot, and abandonable" {
+    var configured = try createTestProfile("Terminal lane");
+    defer configured.deinit(std.testing.allocator);
+    try configured.setExpectedIdentity(std.testing.allocator, TEST_RUNTIME_A, TEST_INSTANCE);
+    var ports: TestPorts = .{ .values = &.{43_127} };
+    var tunnel: TestTunnel = .{};
+    tunnel.allow_ready.store(true, .release);
+    var rpc: TestLaneRpc = .{};
+    var manager = try Manager.init(std.testing.allocator, std.testing.io, &.{configured}, .{
+        .port_selector = .{ .context = &ports, .select = TestPorts.select },
+        .tunnel_backend = tunnel.backend(),
+        .rpc_backend = rpc.backend(),
+    });
+    defer manager.deinit();
+    try manager.hydrateToken(configured.id, TEST_TOKEN_A);
+    try manager.enable(configured.id, 0);
+    try waitForExecutionReady(&manager, configured.id, 1_000);
+
+    try std.testing.expectError(error.InvalidRuntimeRpcMethod, manager.beginTerminalRpc(configured.id, "chat.turn.start", .{}));
+
+    // While a terminal request is in flight, the lane is busy, and on an SSH
+    // relay (one bearer connection) the general slot reports busy too.
+    rpc.gate_open.store(false, .release);
+    const tail = try manager.beginTerminalRpc(configured.id, "session.tail", .{ .id = "setup" });
+    try std.testing.expectError(error.RuntimeRpcBusy, manager.beginTerminalRpc(configured.id, "session.tail", .{ .id = "setup" }));
+    try std.testing.expectError(error.RuntimeRpcBusy, manager.beginRpc(configured.id, "providers.status", .{}));
+    try std.testing.expect((try manager.takeTerminalRpcResult(tail)) == null);
+    rpc.gate_open.store(true, .release);
+    var tail_result = try waitForTerminalRpcResult(&manager, tail, 3_000);
+    defer tail_result.deinit();
+    try std.testing.expect(tail_result == .response);
+    try std.testing.expect(std.mem.indexOf(u8, tail_result.response.json, "\"accepted\":true") != null);
+    try std.testing.expect(manager.snapshot(configured.id).?.execution_ready);
+
+    // An abandoned ticket is dropped on collection and never wedges the lane.
+    const abandoned = try manager.beginTerminalRpc(configured.id, "session.kill", .{ .id = "setup" });
+    manager.abandonTerminalRpc(abandoned);
+    var reopened: ?RpcTicket = null;
+    for (0..2_000) |iteration| {
+        try manager.poll(6_000 + iteration);
+        reopened = manager.beginTerminalRpc(configured.id, "session.tail", .{ .id = "setup" }) catch |err| switch (err) {
+            error.RuntimeRpcBusy => {
+                try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+                continue;
+            },
+            else => return err,
+        };
+        break;
+    }
+    try std.testing.expectError(error.UnknownRuntimeRpcTicket, manager.takeTerminalRpcResult(abandoned));
+    var reopened_result = try waitForTerminalRpcResult(&manager, reopened.?, 9_000);
+    reopened_result.deinit();
+
+    // The general slot never feeds the terminal lane's take, and vice versa.
+    const general = try manager.beginRpc(configured.id, "providers.status", .{});
+    try std.testing.expectError(error.RuntimeRpcBusy, manager.beginTerminalRpc(configured.id, "session.tail", .{ .id = "setup" }));
+    for (0..2_000) |iteration| {
+        try manager.poll(12_000 + iteration);
+        if (try manager.takeRpcResult(general)) |result| {
+            var owned = result;
+            owned.deinit();
+            break;
+        }
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    } else return error.TestExpectedGeneralRpcResult;
+    try std.testing.expectEqual(@as(usize, 4), rpc.lane_calls.load(.acquire));
+
+    try manager.disable(configured.id);
+    try waitForManagerCleanup(&manager, configured.id);
+    try std.testing.expectEqual(@as(usize, 0), rpc.retained.load(.acquire));
 }

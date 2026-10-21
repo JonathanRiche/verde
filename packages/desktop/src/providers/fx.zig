@@ -18,6 +18,10 @@ const DEFAULT_EXECUTABLE = "fx";
 // binary here, which desktop launch environments often lack on PATH.
 const INSTALL_FALLBACK_RELATIVE = ".local/bin/fx";
 
+/// Auth probes spawn the full ACP agent; a wedged handshake must end before
+/// the next readiness poll instead of piling up.
+const AUTH_PROBE_DEADLINE_MS: u64 = 10_000;
+
 const ACP_HARNESS: acp.Harness = .{
     .diagnostics_category = .fx_acp,
     .assistant_author = "FX",
@@ -78,6 +82,9 @@ pub const Client = struct {
             else => return err,
         };
         defer proc.deinit();
+        var deadline: acp.ProcessDeadline = .{ .child = &proc.process, .deadline_ms = AUTH_PROBE_DEADLINE_MS };
+        deadline.start() catch return .unknown;
+        defer deadline.finish();
 
         proc.writeLine(acp.makeInitializeRequestAlloc(self.allocator, 1) catch return .unknown) catch return .unknown;
         proc.closeStdin() catch return .unknown;
@@ -97,6 +104,7 @@ pub const Client = struct {
             };
             if (acp.responseId(parsed.value)) |id| {
                 if (id == 1) {
+                    deadline.finish();
                     proc.stop();
                     return .signed_in;
                 }

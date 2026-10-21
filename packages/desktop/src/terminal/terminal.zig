@@ -562,6 +562,22 @@ pub const NotificationEvent = struct {
 
 pub const TerminalScrollbar = ghostty_vt.PageList.Scrollbar;
 
+/// Upper bound on keyboard/paste bytes a `.remote` session queues before its
+/// owner sends them; further input is refused rather than buffered unbounded.
+pub const REMOTE_INPUT_MAX_BYTES: usize = 64 * 1024;
+
+/// Input and control queue of a `.remote` session. The session never performs
+/// IO itself: its owner carries this over a remote runtime's terminal RPCs
+/// and feeds output back through `Dock.applyRemoteOutput`.
+pub const RemoteIo = struct {
+    /// Bytes typed, pasted, or answered by the VT, not yet sent.
+    input: std.ArrayList(u8) = .empty,
+    /// The local grid changed; the owner sends `session.resize`.
+    resize_pending: bool = false,
+    /// Output or exit applied since the last `poll`.
+    changed: bool = false,
+};
+
 const SessionCreateOptions = struct {
     cwd: []const u8,
     cols: u16,
@@ -575,6 +591,8 @@ const SessionCreateOptions = struct {
     dock_id: u32 = 0,
     pane_id: u32 = 0,
     revive_policy: TerminalRevivePolicy = .attach_or_create,
+    /// The process runs on a remote runtime; see `RemoteIo`.
+    remote: bool = false,
 };
 
 pub const PersistedWorkspace = struct {
@@ -826,6 +844,9 @@ pub const Dock = struct {
     launch_profile: TerminalLaunchProfile = .{},
     auto_restart_backoff: AutoRestartBackoff = .{},
     pending_session_teardowns: std.ArrayList(SessionTeardown) = .empty,
+    /// New panes get `.remote` sessions whose process runs on a remote
+    /// runtime (provider setup); the owner carries their `RemoteIo`.
+    remote_backend: bool = false,
 
     pub fn init(_: std.mem.Allocator) !Dock {
         return .{};
@@ -833,6 +854,20 @@ pub const Dock = struct {
 
     pub fn setDefaultFontSize(self: *Dock, font_size: f32) void {
         self.font_scale = fontScaleForFontSize(font_size);
+    }
+
+    /// Provider setup terminals: the largest font scale no bigger than
+    /// `max_font_size` whose grid in `width`×`height` still holds
+    /// `min_cols`×`min_rows`, so tall output (QR codes) fits on screen.
+    /// Bounded below by the minimum scale. Returns true when it changed.
+    pub fn fitFontToArea(self: *Dock, width: f32, height: f32, min_cols: u16, min_rows: u16, max_font_size: f32) bool {
+        var scale = fontScaleForFontSize(max_font_size);
+        while (scale > MIN_FONT_SCALE and (columnsForWidth(width, scale) < min_cols or rowsForHeight(height, scale) < min_rows)) {
+            scale = @max(scale - 0.025, MIN_FONT_SCALE);
+        }
+        if (@abs(scale - self.font_scale) < 0.001) return false;
+        self.font_scale = scale;
+        return true;
     }
 
     pub fn deinit(self: *Dock, allocator: std.mem.Allocator) void {
@@ -1293,6 +1328,39 @@ pub const Dock = struct {
         return session.snapshot();
     }
 
+    /// The active pane's remote input/control queue; null unless it is a
+    /// `.remote` session.
+    pub fn remoteIo(self: *Dock) ?*RemoteIo {
+        if (comptime Session == UnsupportedSession) return null;
+        const pane = self.activePane() orelse return null;
+        const session = pane.session orelse return null;
+        if (session.backend != .remote) return null;
+        return &session.remote_io;
+    }
+
+    /// Feeds remote PTY output into the active `.remote` session. `replay`
+    /// marks bytes that skipped ahead in the remote ring: they start at a
+    /// parser boundary and their terminal queries are not answered again.
+    pub fn applyRemoteOutput(self: *Dock, allocator: std.mem.Allocator, bytes: []const u8, replay: bool) !void {
+        if (comptime Session == UnsupportedSession) return;
+        const pane = self.activePane() orelse return;
+        const session = pane.session orelse return;
+        if (session.backend != .remote) return;
+        try session.applyRemoteOutput(allocator, bytes, replay);
+    }
+
+    /// Marks the active `.remote` session's process as exited with the
+    /// runtime's raw wait status (null when it is unknown).
+    pub fn finishRemoteSession(self: *Dock, exit_status: ?u32) void {
+        if (comptime Session == UnsupportedSession) return;
+        const pane = self.activePane() orelse return;
+        const session = pane.session orelse return;
+        if (session.backend != .remote) return;
+        session.running = false;
+        session.daemon_exit_status = exit_status;
+        session.remote_io.changed = true;
+    }
+
     /// True only after a live shell is confirmed to own the PTY again.
     /// Missing/stale attach metadata must not retire a restored agent.
     pub fn activeSessionAtShellPrompt(self: *const Dock, status_changed_at_ms: i64) bool {
@@ -1312,6 +1380,7 @@ pub const Dock = struct {
                 if (std.c.ioctl(session.master_fd, ioctl_value, &foreground) != 0) break :blk false;
                 break :blk foreground > 0 and foreground == session.child_pid;
             },
+            .remote => false,
         };
     }
 
@@ -1972,6 +2041,7 @@ pub const Dock = struct {
             .dock_id = self.session_dock_id,
             .pane_id = leaf.id,
             .revive_policy = leaf.revive_policy,
+            .remote = self.remote_backend,
         });
         const now_ms: i64 = @intCast(@divTrunc(platform_runtime.monotonicTimestampNs(), std.time.ns_per_ms));
         self.auto_restart_backoff.armAfterCreate(now_ms, leaf.session.?.isRunning());
@@ -2950,10 +3020,14 @@ const UnixSession = struct {
     pending_notification_title_len: usize = 0,
     pending_notification_body: [512]u8 = undefined,
     pending_notification_body_len: usize = 0,
+    /// `.remote` only: queue its owner carries over the runtime RPC lane.
+    remote_io: RemoteIo = .{},
 
     const Backend = enum {
         local,
         daemon,
+        /// Process on a remote runtime; IO goes through `remote_io`.
+        remote,
     };
 
     const DaemonState = enum {
@@ -2995,6 +3069,34 @@ const UnixSession = struct {
 
         const launch_label = try launchLabel(allocator, options.profile);
         errdefer allocator.free(launch_label);
+
+        if (options.remote) {
+            self.* = .{
+                .backend = .remote,
+                .master_fd = -1,
+                .child_pid = 0,
+                .terminal = terminal,
+                .stream = undefined,
+                .render_state = .empty,
+                .cols = options.cols,
+                .rows = options.rows,
+                .cell_width = CELL_PIXEL_WIDTH,
+                .cell_height = CELL_PIXEL_HEIGHT,
+                .launch_kind = options.profile.kind,
+                .launch_label = launch_label,
+                .created_at_ms = platform_runtime.unixTimestampMs(),
+            };
+            self.stream = self.terminal.vtStream();
+            self.stream.handler.effects.write_pty = &UnixSession.streamWritePty;
+            self.stream.handler.effects.clipboard_write = &UnixSession.streamClipboard;
+            self.stream.handler.effects.device_attributes = &UnixSession.streamDeviceAttributes;
+            self.stream.handler.effects.size = &UnixSession.streamSize;
+            self.stream.handler.effects.xtversion = &UnixSession.streamXtVersion;
+            self.stream.handler.effects.color_scheme = &UnixSession.streamColorScheme;
+            errdefer self.stream.deinit();
+            try self.refreshRenderState(allocator);
+            return self;
+        }
 
         if (options.pref_path != null and options.session_id != null) {
             self.* = .{
@@ -3090,6 +3192,7 @@ const UnixSession = struct {
         if (self.pref_path) |pref_path| allocator.free(pref_path);
         self.output_ring.deinit(allocator);
         self.last_daemon_tail_response.deinit(allocator);
+        self.remote_io.input.deinit(allocator);
     }
 
     pub fn sessionId(self: *const UnixSession) ?[]const u8 {
@@ -3121,6 +3224,11 @@ const UnixSession = struct {
                 self.daemon_prefetched = false;
                 break :blk self.daemon_prefetched_changed;
             } else try self.drainDaemonOutput(allocator),
+            .remote => blk: {
+                const remote_changed = self.remote_io.changed;
+                self.remote_io.changed = false;
+                break :blk remote_changed;
+            },
         };
         const exited = self.captureExitStatus();
         if (changed or exited) {
@@ -3221,6 +3329,9 @@ const UnixSession = struct {
                 try self.resizeDaemon(allocator);
                 self.defer_daemon_replay_until_resize = false;
             },
+            .remote => {
+                if (size_changed) self.remote_io.resize_pending = true;
+            },
         }
         if (size_changed) {
             // Match Ghostty's ordering: notify the PTY/backend first, then
@@ -3262,7 +3373,7 @@ const UnixSession = struct {
         // zooms and any shrink (the frozen/garbled pane-resize bug); the
         // synthetic Ctrl-L injection removed in 02a1933 had been masking it.
         switch (self.backend) {
-            .local => {
+            .local, .remote => {
                 if (size_changed or metrics_changed) self.sendInBandSizeReportAfterResize();
             },
             .daemon => {
@@ -3392,6 +3503,7 @@ const UnixSession = struct {
         const root_pid: ?usize = switch (self.backend) {
             .local => if (self.child_pid > 0) @intCast(self.child_pid) else null,
             .daemon => self.daemon_shell_pid,
+            .remote => null,
         };
         return .{
             .pid = if (process_group orelse root_pid) |value| std.math.cast(u32, value) else null,
@@ -3424,6 +3536,9 @@ const UnixSession = struct {
 
     pub fn terminate(self: *UnixSession) bool {
         if (!self.running) return false;
+        // The owner kills a remote process (`session.kill`); there is no
+        // local pid to signal.
+        if (self.backend == .remote) return false;
         if (self.backend == .daemon) {
             self.killDaemon() catch return false;
             self.running = false;
@@ -3450,18 +3565,7 @@ const UnixSession = struct {
         if (shouldUseTextInputForTerminalPrintableText(event)) return false;
 
         var utf8_buf: [8]u8 = undefined;
-        const synthesized_utf8 = synthesizeTerminalUtf8(event, &utf8_buf);
-        if (synthesized_utf8.len == 0 and shouldDeferToTextInput(event)) return false;
-
-        const key = mapScancodeToGhostty(event.hidScancode()) orelse return false;
-        const key_event: ghostty_vt.input.KeyEvent = .{
-            .action = if (event.repeat) .repeat else .press,
-            .key = key,
-            .mods = modsFromKeyboardEvent(event),
-            .consumed_mods = consumedModsFromKeyboardEvent(event, synthesized_utf8),
-            .utf8 = synthesized_utf8,
-            .unshifted_codepoint = scancodeCodepoint(event.hidScancode()) orelse 0,
-        };
+        const key_event = hostTerminalKeyEvent(event, &utf8_buf) orelse return false;
 
         var buffer: [128]u8 = undefined;
         var writer = std.Io.Writer.fixed(&buffer);
@@ -3546,6 +3650,7 @@ const UnixSession = struct {
                 if (foreground_process_group == 0 or foreground_process_group == shell_pid) return null;
                 return foreground_process_group;
             },
+            .remote => return null,
         }
     }
 
@@ -4015,6 +4120,25 @@ const UnixSession = struct {
         return true;
     }
 
+    /// `.remote`: applies bytes its owner tailed from the runtime PTY.
+    fn applyRemoteOutput(self: *UnixSession, allocator: std.mem.Allocator, raw: []const u8, replay: bool) !void {
+        const text = if (replay) terminalReplayFromParserBoundary(raw) else raw;
+        if (text.len == 0) return;
+        // Follow output while the view is at the bottom; scrollback the user
+        // moved to stays put.
+        const before = self.terminal.screens.active.pages.scrollbar();
+        const following = before.offset + before.len >= before.total;
+        try self.appendOutput(allocator, text);
+        const previous_suppression = self.suppress_pty_responses;
+        self.suppress_pty_responses = previous_suppression or replay;
+        defer self.suppress_pty_responses = previous_suppression;
+        self.stream.nextSlice(text);
+        try self.repairTerminalState(allocator);
+        self.resetAlternateViewport();
+        if (following and self.terminal.screens.active_key == .primary) self.terminal.scrollViewport(.{ .bottom = {} });
+        self.remote_io.changed = true;
+    }
+
     fn resetLocalTerminalView(self: *UnixSession, allocator: std.mem.Allocator) !void {
         const previous_suppression = self.suppress_pty_responses;
         self.suppress_pty_responses = true;
@@ -4173,6 +4297,11 @@ const UnixSession = struct {
         if (self.backend == .local) {
             if (!LOCAL_PTY_SUPPORTED) return false;
             try writeAll(self.master_fd, bytes);
+            return true;
+        }
+        if (self.backend == .remote) {
+            if (self.remote_io.input.items.len + bytes.len > REMOTE_INPUT_MAX_BYTES) return false;
+            try self.remote_io.input.appendSlice(self.terminal.gpa(), bytes);
             return true;
         }
         const pref_path = self.pref_path orelse return false;
@@ -4558,7 +4687,7 @@ const UnixSession = struct {
     }
 
     fn captureExitStatus(self: *UnixSession) bool {
-        if (self.backend == .daemon) return false;
+        if (self.backend != .local) return false;
         if (!LOCAL_PTY_SUPPORTED) return false;
         if (self.exit_status != null) return false;
 
@@ -4573,7 +4702,7 @@ const UnixSession = struct {
 
     fn applyWinsize(self: *UnixSession) void {
         if (!LOCAL_PTY_SUPPORTED) return;
-        if (!self.running or self.backend == .daemon) return;
+        if (!self.running or self.backend != .local) return;
 
         var winsize = std.posix.winsize{
             .row = self.rows,
@@ -5251,6 +5380,165 @@ fn consumedModsFromKeyboardEvent(event: *const palette.event.KeyEvent, utf8: []c
     };
 }
 
+/// Translate a host key press into Ghostty's key event. Characters and the
+/// logical key come from the active keyboard layout (`codepoint` / `key`), as
+/// in every other text input, so non-US layouts, AltGr levels, remapped keys,
+/// and Ctrl+<letter> follow the user's keymap. The physical US position is
+/// only a fallback for hosts that report no layout data. Null means the key
+/// belongs to the text-input path (dead keys, IME) or has no terminal meaning.
+fn hostTerminalKeyEvent(event: *const palette.event.KeyEvent, utf8_buf: *[8]u8) ?ghostty_vt.input.KeyEvent {
+    const utf8 = layoutTerminalUtf8(event, utf8_buf) orelse synthesizeTerminalUtf8(event, utf8_buf);
+    const logical_key = mapKeycodeToGhostty(event.key);
+    // A printable key that produced no character (dead key, compose, IME
+    // pre-edit) must not be encoded as its physical key; its composed text
+    // arrives as a text-input event instead.
+    if (utf8.len == 0 and !hasCommandModifier(event) and event.key == .character) return null;
+    const key = logical_key orelse mapScancodeToGhostty(event.hidScancode()) orelse
+        if (utf8.len > 0) ghostty_vt.input.Key.unidentified else return null;
+
+    const unshifted_codepoint: u21 = if (event.base_codepoint >= 0x20 and event.base_codepoint != 0x7f)
+        event.base_codepoint
+    else
+        scancodeCodepoint(event.hidScancode()) orelse 0;
+    return .{
+        .action = if (event.repeat) .repeat else .press,
+        .key = key,
+        .mods = modsFromKeyboardEvent(event),
+        .consumed_mods = consumedModsFromKeyboardEvent(event, utf8),
+        .utf8 = utf8,
+        .unshifted_codepoint = unshifted_codepoint,
+    };
+}
+
+fn hasCommandModifier(event: *const palette.event.KeyEvent) bool {
+    return event.mod.ctrl or event.mod.alt or event.mod.super;
+}
+
+/// The character the user's layout produces for this press, or null when
+/// the host reported no layout data (`key == .unknown`), in which case the
+/// US-position synthesis is used. Empty for non-printing results.
+fn layoutTerminalUtf8(event: *const palette.event.KeyEvent, buf: *[8]u8) ?[]const u8 {
+    if (hasCommandModifier(event)) return "";
+    if (event.key == .unknown) return null;
+    const cp = event.codepoint;
+    if (cp < 0x20 or cp == 0x7f or (cp >= 0x80 and cp < 0xa0)) return "";
+    const len = std.unicode.utf8Encode(cp, buf[0..4]) catch return "";
+    return buf[0..len];
+}
+
+/// Ghostty's logical key for a layout-resolved keycode; null for keys whose
+/// symbol has no dedicated tag (`.character`) or that the host left unknown.
+fn mapKeycodeToGhostty(keycode: palette.event.Keycode) ?ghostty_vt.input.Key {
+    return switch (keycode) {
+        .unknown, .character => null,
+        .@"return" => .enter,
+        .escape => .escape,
+        .backspace => .backspace,
+        .tab => .tab,
+        .space => .space,
+        .delete => .delete,
+        .insert => .insert,
+        .home => .home,
+        .end => .end,
+        .pageup => .page_up,
+        .pagedown => .page_down,
+        .left => .arrow_left,
+        .right => .arrow_right,
+        .up => .arrow_up,
+        .down => .arrow_down,
+        .kp_enter => .numpad_enter,
+        .caps_lock => .caps_lock,
+        .num_lock => .num_lock,
+        .scroll_lock => .scroll_lock,
+        .print_screen => .print_screen,
+        .pause => .pause,
+        .f1 => .f1,
+        .f2 => .f2,
+        .f3 => .f3,
+        .f4 => .f4,
+        .f5 => .f5,
+        .f6 => .f6,
+        .f7 => .f7,
+        .f8 => .f8,
+        .f9 => .f9,
+        .f10 => .f10,
+        .f11 => .f11,
+        .f12 => .f12,
+        .lshift => .shift_left,
+        .rshift => .shift_right,
+        .lctrl => .control_left,
+        .rctrl => .control_right,
+        .lalt => .alt_left,
+        .ralt => .alt_right,
+        .lgui => .meta_left,
+        .rgui => .meta_right,
+        .a => .key_a,
+        .b => .key_b,
+        .c => .key_c,
+        .d => .key_d,
+        .e => .key_e,
+        .f => .key_f,
+        .g => .key_g,
+        .h => .key_h,
+        .i => .key_i,
+        .j => .key_j,
+        .k => .key_k,
+        .l => .key_l,
+        .m => .key_m,
+        .n => .key_n,
+        .o => .key_o,
+        .p => .key_p,
+        .q => .key_q,
+        .r => .key_r,
+        .s => .key_s,
+        .t => .key_t,
+        .u => .key_u,
+        .v => .key_v,
+        .w => .key_w,
+        .x => .key_x,
+        .y => .key_y,
+        .z => .key_z,
+        .@"0" => .digit_0,
+        .@"1" => .digit_1,
+        .@"2" => .digit_2,
+        .@"3" => .digit_3,
+        .@"4" => .digit_4,
+        .@"5" => .digit_5,
+        .@"6" => .digit_6,
+        .@"7" => .digit_7,
+        .@"8" => .digit_8,
+        .@"9" => .digit_9,
+        .minus => .minus,
+        .equals => .equal,
+        .leftbracket => .bracket_left,
+        .rightbracket => .bracket_right,
+        .backslash => .backslash,
+        .semicolon => .semicolon,
+        .apostrophe => .quote,
+        .grave => .backquote,
+        .comma => .comma,
+        .period => .period,
+        .slash => .slash,
+        .kp_divide => .numpad_divide,
+        .kp_multiply => .numpad_multiply,
+        .kp_minus => .numpad_subtract,
+        .kp_plus => .numpad_add,
+        .kp_period => .numpad_decimal,
+        .kp_equals => .numpad_equal,
+        .kp_0 => .numpad_0,
+        .kp_1 => .numpad_1,
+        .kp_2 => .numpad_2,
+        .kp_3 => .numpad_3,
+        .kp_4 => .numpad_4,
+        .kp_5 => .numpad_5,
+        .kp_6 => .numpad_6,
+        .kp_7 => .numpad_7,
+        .kp_8 => .numpad_8,
+        .kp_9 => .numpad_9,
+        else => null,
+    };
+}
+
 fn synthesizeTerminalUtf8(event: *const palette.event.KeyEvent, buf: *[8]u8) []const u8 {
     if (event.mod.ctrl) return "";
     if (event.mod.alt) return "";
@@ -5787,6 +6075,43 @@ test "terminal key encoding follows default and negotiated terminal input modes"
     writer = std.Io.Writer.fixed(&buffer);
     try encodeTerminalKeyChord(&writer, try TerminalKeyChord.parse("shift+enter"), kitty_disambiguate);
     try std.testing.expectEqualStrings("\x1b[13;2u", writer.buffered());
+}
+
+fn encodeHostKeyForTest(buffer: []u8, event: palette.event.KeyEvent) ![]const u8 {
+    var utf8_buf: [8]u8 = undefined;
+    const key_event = hostTerminalKeyEvent(&event, &utf8_buf) orelse return error.DeferredToTextInput;
+    var writer = std.Io.Writer.fixed(buffer);
+    // Shells start with the ESC-prefix mode on (Ghostty's default terminal mode).
+    var options: ghostty_vt.input.KeyEncodeOptions = .default;
+    options.alt_esc_prefix = true;
+    try ghostty_vt.input.encodeKey(&writer, key_event, options);
+    return writer.buffered();
+}
+
+test "terminal keys follow the active keyboard layout, not the US physical position" {
+    var buffer: [64]u8 = undefined;
+    // A keymap that puts `a` and `c` on evdev 1 (physically Escape): the
+    // layout's character and logical key win, including for Ctrl+C.
+    try std.testing.expectEqualStrings("a", try encodeHostKeyForTest(&buffer, .{ .key = .a, .scancode = 1, .codepoint = 'a', .base_codepoint = 'a' }));
+    try std.testing.expectEqualStrings("\x03", try encodeHostKeyForTest(&buffer, .{ .key = .c, .scancode = 1, .codepoint = 'c', .base_codepoint = 'c', .mod = .{ .ctrl = true } }));
+    // Dvorak Alt+B on the physical N key.
+    try std.testing.expectEqualStrings("\x1bb", try encodeHostKeyForTest(&buffer, .{ .key = .b, .scancode = 49, .codepoint = 'b', .base_codepoint = 'b', .mod = .{ .alt = true } }));
+    // German AltGr+Q (level 3, no Alt modifier) types `@`, not `q`.
+    try std.testing.expectEqualStrings("@", try encodeHostKeyForTest(&buffer, .{ .key = .q, .scancode = 16, .codepoint = '@', .base_codepoint = 'q' }));
+    // Caps Lock remapped to Escape.
+    try std.testing.expectEqualStrings("\x1b", try encodeHostKeyForTest(&buffer, .{ .key = .escape, .scancode = 58, .codepoint = 0x1b }));
+    // Non-ASCII layout characters are written directly.
+    try std.testing.expectEqualStrings("ö", try encodeHostKeyForTest(&buffer, .{ .key = .character, .scancode = 39, .codepoint = 0xf6, .base_codepoint = 0xf6 }));
+    // A dead key produces no character; composition belongs to text input.
+    try std.testing.expectError(error.DeferredToTextInput, encodeHostKeyForTest(&buffer, .{ .key = .character, .scancode = 13 }));
+
+    // US QWERTY is unchanged.
+    try std.testing.expectEqualStrings("A", try encodeHostKeyForTest(&buffer, .{ .key = .a, .scancode = 30, .codepoint = 'A', .base_codepoint = 'a', .mod = .{ .shift = true } }));
+    try std.testing.expectEqualStrings("\x03", try encodeHostKeyForTest(&buffer, .{ .key = .c, .scancode = 46, .codepoint = 'c', .base_codepoint = 'c', .mod = .{ .ctrl = true } }));
+    try std.testing.expectEqualStrings("\r", try encodeHostKeyForTest(&buffer, .{ .key = .@"return", .scancode = 28, .codepoint = '\r' }));
+    try std.testing.expectEqualStrings("\x1b[A", try encodeHostKeyForTest(&buffer, .{ .key = .up, .scancode = 103 }));
+    // Hosts without layout data keep the physical US fallback.
+    try std.testing.expectEqualStrings("A", try encodeHostKeyForTest(&buffer, .{ .key = .unknown, .scancode = 30, .mod = .{ .shift = true } }));
 }
 
 test "persisted layout accepts leaves without session metadata" {

@@ -68,6 +68,9 @@ pub const FolderBrowser = struct {
     notice: []const u8 = "",
     /// Home directory, used for `~` expansion and the Places column.
     home: std.ArrayList(u8) = .empty,
+    /// Folder the last "Create directory" made while this browser was open,
+    /// so the caller can tell a new folder from an existing one it picked.
+    created: std.ArrayList(u8) = .empty,
     /// Set while listing another machine's folders.
     remote: ?Remote = null,
 
@@ -76,6 +79,7 @@ pub const FolderBrowser = struct {
         self.entries.deinit(allocator);
         self.dir.deinit(allocator);
         self.home.deinit(allocator);
+        self.created.deinit(allocator);
         if (self.remote) |*remote| remote.deinit(allocator);
         self.* = .{};
     }
@@ -86,6 +90,7 @@ pub const FolderBrowser = struct {
         self.close(allocator);
         self.dir.clearRetainingCapacity();
         self.home.clearRetainingCapacity();
+        self.created.clearRetainingCapacity();
         self.open = true;
         self.show_hidden = false;
         var remote: Remote = .{};
@@ -213,6 +218,7 @@ pub const FolderBrowser = struct {
         self.open = true;
         self.show_hidden = false;
         self.notice = "";
+        self.created.clearRetainingCapacity();
         if (self.navigate(allocator, start_path)) return;
         if (self.navigate(allocator, home)) return;
         _ = self.navigate(allocator, "/");
@@ -356,7 +362,17 @@ pub const FolderBrowser = struct {
             };
             return false;
         };
-        return self.navigate(allocator, path);
+        if (!self.navigate(allocator, path)) return false;
+        // `navigate` resolved the path; remember it as listed.
+        self.created.clearRetainingCapacity();
+        self.created.appendSlice(allocator, self.dir.items) catch {};
+        return true;
+    }
+
+    /// True when `path` is the folder this browser's "Create directory" made.
+    pub fn createdThisSession(self: *const FolderBrowser, path: []const u8) bool {
+        if (self.created.items.len == 0) return false;
+        return std.mem.eql(u8, std.mem.trimEnd(u8, path, "/"), std.mem.trimEnd(u8, self.created.items, "/"));
     }
 
     /// Absolute path the primary action would pick: the highlighted folder,

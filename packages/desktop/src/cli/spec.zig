@@ -21,6 +21,7 @@ pub const top_level_commands = [_][]const u8{
     "core",
     "live",
     "mcp",
+    "lease",
     "completion",
 };
 

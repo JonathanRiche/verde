@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ -z "${1:-}" && -z "${HOME:-}" ]]; then
+  echo "install-local.sh: HOME is not set; pass an install prefix, e.g. ./install-local.sh /opt/verde" >&2
+  exit 1
+fi
 PREFIX="${1:-$HOME/.local}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -10,6 +14,9 @@ mkdir -p \
   "$PREFIX/share/applications" \
   "$PREFIX/share/pixmaps" \
   "$PREFIX/share/icons/hicolor/256x256/apps"
+# The launcher and desktop entry embed this path, so a relative prefix must not
+# leak into them.
+PREFIX="$(CDPATH= cd -- "$PREFIX" && pwd)"
 
 copy_if_present() {
   local source_path="$1"
@@ -31,13 +38,30 @@ copy_glob_if_present() {
 wpe_runtime_hint() {
   cat >&2 <<'EOF'
 Verde's Linux browser pane uses WPE WebKit.
-Install the WPE WebKit runtime packages for your distro if the browser pane does not open:
-  Debian 13+: sudo apt install libwpewebkit-2.0-1 libwpebackend-fdo-1.0-1 libjavascriptcoregtk-6.0-1 libegl1 libgles2
-  Arch:       sudo pacman -S wpewebkit wpebackend-fdo
-  Fedora:     sudo dnf install wpewebkit wpebackend-fdo
+Install the WPE WebKit runtime package for your distro if the browser pane does not open:
+  Debian 13+/Ubuntu: sudo apt install libwpewebkit-2.0-1
+  Arch:              sudo pacman -S wpewebkit
+  Fedora:            sudo dnf install wpewebkit
+  openSUSE:          sudo zypper install libWPEWebKit-2_0-1
 EOF
 }
 
+# Quote a value as one single-quoted POSIX shell word.
+sh_single_quote() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+# Quote one Desktop Entry Exec argument: escape \ " ` $ inside double quotes,
+# apply the string-value escape on top (so a literal \ becomes \\\\), and
+# write % as %%.
+desktop_exec_arg() {
+  local escaped
+  escaped="$(printf '%s' "$1" | sed -e 's/\\/\\\\\\\\/g' -e 's/["`$]/\\\\&/g' -e 's/%/%%/g')"
+  printf '"%s"' "$escaped"
+}
+
+# Sets wpe_runtime_status to ok, missing, or unchecked.
+wpe_runtime_status="unchecked"
 warn_missing_wpe_runtime() {
   local helper_path="$1"
 
@@ -51,8 +75,11 @@ warn_missing_wpe_runtime() {
   local missing
   missing="$(ldd "$helper_path" 2>/dev/null | awk '/not found/ { print $1 }' | sort -u | tr '\n' ' ')"
   if [[ -n "$missing" ]]; then
+    wpe_runtime_status="missing"
     echo "warning: Verde browser helper is missing runtime libraries: $missing" >&2
     wpe_runtime_hint
+  else
+    wpe_runtime_status="ok"
   fi
 }
 
@@ -63,33 +90,36 @@ for runtime_binary in verde-server verde-daemon verde-web; do
     install -m 755 "$SCRIPT_DIR/bin/$runtime_binary" "$PREFIX/bin/$runtime_binary"
   fi
 done
-cat > "$PREFIX/bin/verde-launch" <<EOF
-#!/usr/bin/env sh
-script_dir="$PREFIX/bin"
+{
+  printf '#!/usr/bin/env sh\n'
+  # Single-quote the install path so quotes, $, and backticks stay literal.
+  printf 'script_dir=%s\n' "$(sh_single_quote "$PREFIX/bin")"
+  cat <<'EOF'
 check_wpe_runtime() {
-  helper="\$script_dir/verde-browser-linux"
-  if [ ! -x "\$helper" ] || ! command -v ldd >/dev/null 2>&1; then
+  helper="$script_dir/verde-browser-linux"
+  if [ ! -x "$helper" ] || ! command -v ldd >/dev/null 2>&1; then
     return
   fi
-  missing="\$(ldd "\$helper" 2>/dev/null | awk '/not found/ { print \$1 }' | sort -u | tr '\n' ' ')"
-  if [ -z "\$missing" ]; then
+  missing="$(ldd "$helper" 2>/dev/null | awk '/not found/ { print $1 }' | sort -u | tr '\n' ' ')"
+  if [ -z "$missing" ]; then
     return
   fi
-  message="Verde's Linux browser pane needs WPE WebKit runtime libraries. Missing: \$missing"
-  echo "\$message" >&2
+  message="Verde's Linux browser pane needs WPE WebKit runtime libraries. Missing: $missing"
+  echo "$message" >&2
   echo "Install WPE WebKit packages for your distro, then reopen Verde." >&2
   if command -v notify-send >/dev/null 2>&1; then
-    notify-send "Verde needs WPE WebKit" "\$message"
+    notify-send "Verde needs WPE WebKit" "$message"
   fi
 }
 
 check_wpe_runtime
 if command -v setsid >/dev/null 2>&1; then
-  setsid "$PREFIX/bin/verde" >/dev/null 2>&1 &
+  setsid "$script_dir/verde" >/dev/null 2>&1 &
 else
-  "$PREFIX/bin/verde" >/dev/null 2>&1 &
+  "$script_dir/verde" >/dev/null 2>&1 &
 fi
 EOF
+} > "$PREFIX/bin/verde-launch"
 chmod 755 "$PREFIX/bin/verde-launch"
 install -m 755 "$SCRIPT_DIR/bin/libfff_c.so" "$PREFIX/bin/libfff_c.so"
 # Pre-Palette releases shipped SDL3 next to the binaries; drop the stale copies.
@@ -101,13 +131,14 @@ if [[ -e "$SCRIPT_DIR/share/icons/hicolor/256x256/apps/verde.png" ]]; then
 else
   install -m 644 "$SCRIPT_DIR/share/pixmaps/verde.png" "$PREFIX/share/icons/hicolor/256x256/apps/verde.png"
 fi
+desktop_exec="$(desktop_exec_arg "$PREFIX/bin/verde-launch")"
 cat > "$PREFIX/share/applications/verde.desktop" <<EOF
 [Desktop Entry]
 Version=1.0
 Type=Application
 Name=Verde
-Comment=Desktop chat app for Codex and OpenCode
-Exec=$PREFIX/bin/verde-launch
+Comment=Run coding agents side by side
+Exec=$desktop_exec
 Icon=verde
 Terminal=false
 Categories=Development;
@@ -140,4 +171,8 @@ fi
 echo "Installed Verde into $PREFIX"
 echo "Binary: $PREFIX/bin/verde"
 echo "Desktop entry: $PREFIX/share/applications/verde.desktop"
-echo "Linux browser runtime: WPE WebKit"
+case "$wpe_runtime_status" in
+  ok) echo "Linux browser runtime: WPE WebKit (found)" ;;
+  missing) echo "Linux browser runtime: WPE WebKit is missing; install it to use the browser pane (see warning above)" ;;
+  *) echo "Linux browser runtime: WPE WebKit (not checked)" ;;
+esac

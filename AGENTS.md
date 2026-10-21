@@ -32,8 +32,9 @@ Run commands from the repository root. Use the narrowest check during iteration.
 
 ## Shared resources and runtime safety
 
-- Inspect `list_processes`, then `check_command` before conflicting work. Lease actual shared resources: `build`, `deps`, `db`, `port:<port>`, or `browser`; not ordinary reads or short focused tests.
-- Use tracked processes/sessions when available; no hidden `nohup`, `disown`, `setsid`, or bare `&`. Renew leases as needed, clean up owned processes, and release on success, failure, or cancellation. Report resource/process cleanup.
+- Run builds, installs, and migrations that touch shared resources (`build`, `deps`, `db`) as `verde lease run -- <command>`, as a background task when the wait may outlast your shell timeout. It queues for the resource, holds the lease only while the command runs, and releases on exit. When an identical command is already running, or just succeeded, on unchanged sources, it shows that run's output and exit status instead of running it again. When files changed after that run started, it lists them and runs again afterwards. Read its `verde lease:` lines before trusting a result. Never wait with `sleep`, `pgrep`, or timed retry loops.
+- Use `acquire_lease` only for shared work that is not one command (`browser`, `port:<port>`, a dev server): short TTL, renew while working, release when done. Ordinary reads and short focused tests need no lease.
+- Use tracked processes/sessions when available; no hidden `nohup`, `disown`, `setsid`, or bare `&`. Clean up owned processes and release on success, failure, or cancellation. Report resource/process cleanup.
 - Never force leases, kill others' processes, reuse their ports, or restart Verde without explicit authorization. Target an explicit workspace for shared browser work; never navigate or close another pane's browser.
 - `wait_for_process: completed` is not success: check status, exit code, signal, and cancellation reason.
 - Inside Verde, do not run `mise run dev`, `mise run dev-term`, `zig build run`, `pkill verde`, or generated desktop binaries. `mise run dev-build` is safe.
@@ -44,6 +45,7 @@ Run commands from the repository root. Use the narrowest check during iteration.
 ## Text surfaces
 
 - Any new surface that shows content text (messages, transcripts, logs, output, details, errors) must let the user select it (drag, double-click word, triple-click line/message), see the highlight, and copy it (platform copy shortcut plus a right-click/long-press Copy; select-all where a whole block makes sense), on desktop, web, and mobile alike. Skip it only where selection does not make sense: controls and chrome such as buttons, chips, menus, sidebar rows, tabs, and badges. Desktop specifics: [UI rules](packages/desktop/src/ui/AGENTS.md#selectable-text).
+- New interactive UI (panels, modals, sheets, menus, settings pages, forms) must be fully keyboard operable on desktop, web, and mobile hardware keyboards: Tab/Shift+Tab reach every control in visual order, a visible focus ring appears on keyboard focus (not on mouse click), Enter/Space activates, arrows move within lists, menus, tab strips, and sliders, Escape closes the topmost layer, and focus scrolls into view. Keys go to the topmost layer only. A new control you can only reach with the pointer is unfinished. Desktop specifics: [UI rules](packages/desktop/src/ui/AGENTS.md#keyboard-access).
 - Pointer surfaces show the right cursor (desktop and web): an I-beam over selectable text and text inputs, a pointer (hand) over buttons, chips, dropdowns, links and clickable rows, resize/grab shapes for drag handles, and the arrow over plain chrome. A new clickable or selectable region without its cursor is unfinished. Desktop specifics: [UI rules](packages/desktop/src/ui/AGENTS.md#cursors).
 
 ## Zig 0.16

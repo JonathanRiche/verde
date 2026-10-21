@@ -7,6 +7,7 @@ const zig_dif = @import("zig_dif");
 const app_state = @import("../state.zig");
 const keybinds = @import("../app/keybinds.zig");
 const provider_types = @import("headless").provider_types;
+const provider_install = @import("headless").provider_install;
 const profiler = @import("../runtime/profiler.zig");
 const platform_runtime = @import("platform_runtime");
 const utils = @import("../utils.zig");
@@ -1095,6 +1096,7 @@ fn linkedChatsLayoutFor(state: *app_state.AppState, pane_w: f32, subagent_view: 
         defer thread.send_state.mutex.unlock();
         for (thread.send_state.pending_events.items, 0..) |event, index| appendSidebarSubagent(state, &subagents, event, thread.messages.items.len + index);
     }
+    std.mem.sort(SidebarSubagent, subagents.items, {}, subagentNewerFirst);
     parent.subagent_count = subagents.items.len;
     parent.narrow = pane_w < theme.scaledUi(LINKED_DRAWER_NARROW_PANE_W_CSS);
     const reserve = linkedChatsLaneReserve(pane_w, parent);
@@ -1135,14 +1137,58 @@ fn appendSidebarSubagent(state: *app_state.AppState, rows: *std.ArrayList(Sideba
     rows.append(state.allocator, row) catch {};
 }
 
+/// Live work is accent-colored (and pulses); settled work drops to grey so
+/// running and done rows never share a hue.
 fn linkedChatStatusColor(status: linked_chats.Status) [4]f32 {
     return switch (status) {
-        .running => theme.COLOR_GREEN,
+        .running => theme.accent(),
         .waiting_approval, .blocked => theme.COLOR_YELLOW,
-        .completed => theme.success(),
+        .completed => theme.COLOR_TEXT_SUBTLE,
         .failed, .aborted, .interrupted => theme.danger(),
-        .idle, .unknown => theme.COLOR_TEXT_MUTED,
+        .idle, .unknown => theme.COLOR_TEXT_SUBTLE,
     };
+}
+
+/// 0..1 breathing pulse for in-flight rows; 1.0 for settled rows or when
+/// status pulses are reduced. Arms the shared pulse tick so it keeps animating.
+fn linkedChatStatusPulse(state: *app_state.AppState, status: linked_chats.Status) f32 {
+    if (!status.isActive() or state.app_config.reduced_motion.status_pulse) return 1.0;
+    state.sidebar_pulse_animating = true;
+    return theme.activityPulse(profiler.nowNs());
+}
+
+/// Status pip for a linked chat or subagent row: a breathing dot with a soft
+/// expanding halo while active, a flat dot once settled.
+fn queueLinkedChatStatusDot(state: *app_state.AppState, x: f32, cy: f32, status: linked_chats.Status, clip: palette.Rect) void {
+    const color = linkedChatStatusColor(status);
+    const r = theme.scaledUi(4.0);
+    const cx = x + r;
+    if (status.isActive()) {
+        const pulse = linkedChatStatusPulse(state, status);
+        const halo_r = r * (1.4 + 0.8 * pulse);
+        queueRoundedClipped(state, .{ .x = cx - halo_r, .y = cy - halo_r, .w = halo_r * 2.0, .h = halo_r * 2.0 }, paletteColor(theme.withAlpha(color, @intFromFloat(20.0 + (1.0 - pulse) * 50.0))), halo_r, clip);
+        queueRoundedClipped(state, .{ .x = cx - r, .y = cy - r, .w = r * 2.0, .h = r * 2.0 }, paletteColor(theme.withAlpha(color, @intFromFloat(140.0 + pulse * 115.0))), r, clip);
+        return;
+    }
+    queueRoundedClipped(state, .{ .x = cx - r, .y = cy - r, .w = r * 2.0, .h = r * 2.0 }, paletteColor(color), r, clip);
+}
+
+/// Meta-line color: active rows read in their (pulsing) status color, failures
+/// in danger, and settled rows recede to muted text.
+fn linkedChatMetaColor(state: *app_state.AppState, status: linked_chats.Status) [4]f32 {
+    return switch (status) {
+        .running, .waiting_approval, .blocked => blk: {
+            const pulse = linkedChatStatusPulse(state, status);
+            break :blk theme.withAlpha(linkedChatStatusColor(status), @intFromFloat(170.0 + pulse * 85.0));
+        },
+        .failed, .aborted, .interrupted => linkedChatStatusColor(status),
+        else => theme.COLOR_TEXT_SUBTLE,
+    };
+}
+
+fn subagentNewerFirst(_: void, left: SidebarSubagent, right: SidebarSubagent) bool {
+    if (left.updated_at_ms != right.updated_at_ms) return left.updated_at_ms > right.updated_at_ms;
+    return left.message_index > right.message_index;
 }
 
 fn linkedChatAgeLabel(buf: []u8, updated_at_ms: i64) []const u8 {
@@ -1315,16 +1361,22 @@ fn renderLinkedChatsList(state: *app_state.AppState, rect: palette.Rect, layout:
         for (layout.subagents.items) |agent| {
             defer y += row_h;
             if (y + row_h < list.y or y > list.y + list.h) continue;
-            const row = palette.Rect{ .x = list.x + pad, .y = y, .w = list.w - pad * 2.0, .h = row_h - theme.scaledUi(4.0) };
+            // Same geometry as linked-chat rows: status pip, title, meta.
+            const row = palette.Rect{ .x = list.x + theme.scaledUi(6.0), .y = y, .w = @max(list.w - theme.scaledUi(12.0), 0.0), .h = row_h - theme.scaledUi(4.0) };
             if (rectContains(intersectRect(row, list_clip), mouse_x, mouse_y)) queueRoundedClipped(state, row, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 10)), theme.scaledUi(8.0), list_clip);
+            const pad_x = theme.scaledUi(10.0);
+            queueLinkedChatStatusDot(state, row.x + pad_x, row.y + theme.scaledUi(15.0), agent.status, list_clip);
+            const text_x = row.x + pad_x + theme.scaledUi(16.0);
+            const text_w = @max(row.x + row.w - pad_x - text_x, theme.scaledUi(24.0));
             var title_buffer: [256]u8 = undefined;
-            const title_text = truncateUiLabel(&title_buffer, agent.title.slice(), row.w, theme.scaledUi(13.0));
-            queueChromeLabel(state, .{ .x = row.x, .y = y + theme.scaledUi(6.0), .w = row.w, .h = theme.scaledUi(18.0) }, title_text, paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.0), list_clip);
+            const title_text = truncateUiLabel(&title_buffer, agent.title.slice(), text_w, theme.scaledUi(13.0));
+            const title_color = if (agent.status.isFinished()) theme.COLOR_TEXT_MUTED else theme.COLOR_WHITE;
+            queueChromeLabel(state, .{ .x = text_x, .y = y + theme.scaledUi(6.0), .w = text_w, .h = theme.scaledUi(18.0) }, title_text, paletteColor(title_color), theme.scaledUi(13.0), list_clip);
             var age_buf: [16]u8 = undefined;
             const age = linkedChatAgeLabel(&age_buf, agent.updated_at_ms);
             var meta_buf: [64]u8 = undefined;
             const meta = if (age.len > 0) std.fmt.bufPrint(&meta_buf, "{s} \u{00B7} {s}", .{ agent.status.label(), age }) catch agent.status.label() else agent.status.label();
-            queueChromeLabel(state, .{ .x = row.x, .y = y + theme.scaledUi(24.0), .w = row.w, .h = theme.scaledUi(16.0) }, meta, paletteColor(linkedChatStatusColor(agent.status)), theme.scaledUi(11.0), list_clip);
+            queueChromeLabel(state, .{ .x = text_x, .y = y + theme.scaledUi(24.0), .w = text_w, .h = theme.scaledUi(16.0) }, meta, paletteColor(linkedChatMetaColor(state, agent.status)), theme.scaledUi(11.0), list_clip);
             var index_buf: [32]u8 = undefined;
             const index_text = std.fmt.bufPrint(&index_buf, "{d}", .{agent.message_index}) catch continue;
             const visible = intersectRect(row, list_clip);
@@ -1369,18 +1421,12 @@ fn renderLinkedChatRow(
     const close_hover = in_clip and rectContains(close_rect, mouse_x, mouse_y);
     if (hover) queueRoundedClipped(state, row, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 10)), theme.scaledUi(8.0), clip);
 
-    const status_color = linkedChatStatusColor(entry.status);
     const dot_r = theme.scaledUi(4.0);
     const dot_cy = row.y + theme.scaledUi(15.0);
     if (entry.is_parent) {
         queueIconText(state, .{ .x = row.x + pad_x, .y = dot_cy - theme.scaledUi(6.0), .w = theme.scaledUi(12.0), .h = theme.scaledUi(12.0) }, NF_COD_LINK_EXTERNAL, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.0), clip);
     } else {
-        queueRoundedClipped(state, .{
-            .x = row.x + pad_x,
-            .y = dot_cy - dot_r,
-            .w = dot_r * 2.0,
-            .h = dot_r * 2.0,
-        }, paletteColor(status_color), dot_r, clip);
+        queueLinkedChatStatusDot(state, row.x + pad_x, dot_cy, entry.status, clip);
     }
 
     const text_x = row.x + pad_x + dot_r * 2.0 + theme.scaledUi(8.0);
@@ -1394,7 +1440,7 @@ fn renderLinkedChatRow(
         .y = row.y + theme.scaledUi(6.0),
         .w = text_w,
         .h = title_font * 1.4,
-    }, title, paletteColor(theme.COLOR_WHITE), title_font, clip);
+    }, title, paletteColor(if (!entry.is_parent and entry.status.isFinished()) theme.COLOR_TEXT_MUTED else theme.COLOR_WHITE), title_font, clip);
 
     const meta_font = theme.scaledUi(11.0);
     var age_buf: [16]u8 = undefined;
@@ -1415,10 +1461,7 @@ fn renderLinkedChatRow(
         entry.statusLabel();
     var meta_trunc: [544]u8 = undefined;
     const meta = truncateUiLabel(&meta_trunc, meta_raw, row.x + row.w - pad_x - text_x, meta_font);
-    const meta_color = switch (entry.status) {
-        .waiting_approval, .failed, .aborted, .interrupted => status_color,
-        else => theme.COLOR_TEXT_MUTED,
-    };
+    const meta_color = if (entry.is_parent) theme.COLOR_TEXT_MUTED else linkedChatMetaColor(state, entry.status);
     queueChromeLabel(state, .{
         .x = text_x,
         .y = row.y + theme.scaledUi(24.0),
@@ -1449,7 +1492,7 @@ fn renderLinkedChatRow(
 
 fn renderLinkedChatsRail(state: *app_state.AppState, rect: palette.Rect, parent: *linked_chats.Parent, pane_id: ?app_state.WorkspacePaneId) void {
     // Region: collapsed rail — an expand chevron over a count badge tinted by
-    // the most urgent child status (rows are sorted by urgency).
+    // the most urgent child status (rows are sorted by recent activity).
     const mouse_x = state.transcript_controller.palette_mouse_x;
     const mouse_y = state.transcript_controller.palette_mouse_y;
     const hover = rectContains(rect, mouse_x, mouse_y);
@@ -1464,7 +1507,10 @@ fn renderLinkedChatsRail(state: *app_state.AppState, rect: palette.Rect, parent:
 
     const entries = parent.entries.items;
     const child_start = parent.parentCount();
-    const urgent = if (entries.len > child_start) entries[child_start].status else .idle;
+    var urgent: linked_chats.Status = .idle;
+    for (entries[@min(child_start, entries.len)..], 0..) |entry, index| {
+        if (index == 0 or entry.status.rank() < urgent.rank()) urgent = entry.status;
+    }
     const badge_color = linkedChatStatusColor(urgent);
     const badge_d = @min(theme.scaledUi(20.0), @max(rect.w - theme.scaledUi(4.0), theme.scaledUi(12.0)));
     const badge = snapRect(.{
@@ -4086,6 +4132,17 @@ fn tryPatchToggledCardLayout(
     if (@abs(thread.transcript_layout_width - width) > 0.5) return false;
     if (@abs(thread.transcript_layout_scale - scale) > 0.001) return false;
     if (thread.transcript_layout_first_message_index + thread.transcript_layout_message_count != thread.messages.items.len) return false;
+    // In-flight rows of a running turn render below the committed layout with
+    // indices at or past `messages.len`. Toggling one (a diff or tool card the
+    // agent just emitted) leaves every committed row's height alone, so the
+    // layout and the saved offset stay valid as-is. Falling through to the
+    // reset instead re-estimated the unmaterialized history with no row to
+    // anchor on (the viewport sits below every committed row) and the
+    // transcript leapt to unrelated older content.
+    if (patch.message_index >= thread.messages.items.len) {
+        thread.transcript_layout_variant_hash = variant_hash;
+        return true;
+    }
     const items = thread.transcript_layout_items.items;
     const found = for (items, 0..) |item, index| {
         if (patch.message_index >= item.message_index and patch.message_index < item.group_end) break index;
@@ -4162,6 +4219,15 @@ fn ensureTranscriptLayout(
     const layout_indices_in_range = thread.transcript_layout_first_message_index + thread.transcript_layout_message_count <= thread.messages.items.len;
     const reset_anchor: ?TranscriptLayoutAnchor = if (!can_extend and layout_indices_in_range)
         transcriptLayoutAnchor(thread.transcript_layout_items.items, estimate_before, saved_scroll)
+    else
+        null;
+    // A viewport scrolled into the pending (in-flight) region sits below every
+    // committed row, so there is no row to anchor on. While the committed
+    // message set is unchanged, keep the viewport's distance from the
+    // committed tail instead of reinterpreting the offset against a fresh
+    // estimate (e.g. two toggles in one frame, or a reflow mid-turn).
+    const reset_tail_offset: ?f32 = if (!can_extend and reset_anchor == null and layout_covers_current_tail)
+        pendingRegionTailOffset(thread.transcript_layout_items.items, estimate_before, saved_scroll)
     else
         null;
     if (!can_extend) {
@@ -4269,6 +4335,8 @@ fn ensureTranscriptLayout(
         if (transcriptScrollForLayoutAnchor(thread.transcript_layout_items.items, estimatedPartialTranscriptHeight(thread), anchor)) |anchored_scroll| {
             rememberTranscriptScroll(state, pane_id, anchored_scroll);
         }
+    } else if (reset_tail_offset) |offset| {
+        rememberTranscriptScroll(state, pane_id, estimatedPartialTranscriptHeight(thread) + offset);
     }
     // Extending older history rewrites the estimate for everything above the
     // materialized region, which moves every row's top-relative coordinate by
@@ -4329,6 +4397,36 @@ fn transcriptLayoutAnchor(
         .message_index = item.message_index,
         .viewport_y = estimated_height + item.top - scroll_y,
     };
+}
+
+/// Distance of the saved viewport top below the newest committed row, or null
+/// when the viewport top still overlaps committed rows (a row anchor applies).
+fn pendingRegionTailOffset(
+    items: []const chat_types.TranscriptLayoutItem,
+    estimated_height: f32,
+    saved_scroll: ?f32,
+) ?f32 {
+    const scroll_y = saved_scroll orelse return null;
+    if (items.len == 0) return null;
+    const newest = items[0];
+    const offset = scroll_y - estimated_height;
+    if (offset <= newest.top + newest.height) return null;
+    return offset;
+}
+
+test "pending-region viewport keeps its distance from the committed tail" {
+    const items = [_]chat_types.TranscriptLayoutItem{
+        .{ .message_index = 9, .group_end = 10, .top = -80.0, .height = 68.0 },
+        .{ .message_index = 8, .group_end = 9, .top = -400.0, .height = 308.0 },
+    };
+    // Viewport top over a committed row: the row anchor owns it.
+    try std.testing.expect(pendingRegionTailOffset(&items, 5_000.0, 4_950.0) == null);
+    try std.testing.expect(pendingRegionTailOffset(&items, 5_000.0, null) == null);
+    // Viewport top inside the in-flight rows below the committed tail.
+    const offset = pendingRegionTailOffset(&items, 5_000.0, 5_300.0) orelse return error.TestExpectedEqual;
+    try std.testing.expectApproxEqAbs(@as(f32, 300.0), offset, 0.001);
+    // A rebuilt layout with a different estimate restores the same distance.
+    try std.testing.expectApproxEqAbs(@as(f32, 2_300.0), 2_000.0 + offset, 0.001);
 }
 
 fn transcriptScrollForLayoutAnchor(
@@ -6430,12 +6528,14 @@ fn renderProviderFailureActionCard(
         std.fmt.bufPrint(&title_buf, "{s} sign-in required", .{utils.providerLabel(provider)}) catch "Sign-in required"
     else
         std.fmt.bufPrint(&title_buf, "{s} request failed", .{utils.providerLabel(provider)}) catch "Provider request failed";
+    // The card is already tinted yellow; a yellow title on it was nearly
+    // unreadable, so the title uses the body's foreground.
     queueChromeLabel(state, .{
         .x = bubble.x + pad,
         .y = bubble.y + theme.scaledUi(11.0),
         .w = bubble.w - pad * 2.0,
         .h = theme.scaledUi(20.0),
-    }, title, paletteColor(theme.COLOR_YELLOW), theme.scaledUi(13.0), clip);
+    }, title, paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.0), clip);
 
     const font_size = theme.scaledUi(TRANSCRIPT_MARKDOWN_FONT_SIZE);
     const inner_width = @max(bubble.w - pad * 2.0, theme.scaledUi(80.0));
@@ -6477,14 +6577,18 @@ fn renderProviderFailureActionCard(
     }, if (is_sign_in) "Sign in" else "View usage", paletteColor(if (hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), clip);
     if (intersectClipRect(clip, button)) |visible_button| recordUsageActionHit(visible_button, if (is_sign_in) provider else null);
 
+    // A sign-in card copies the command that fixes it, not the error text.
+    const sign_in_command = if (is_sign_in) providerSignInCommand(provider) else null;
+    const copy_payload = sign_in_command orelse body;
+    const copy_label = if (sign_in_command != null) "Copy command" else "Copy";
     const copy_button = snapRect(.{
         .x = button.x + button.w + theme.scaledUi(8.0),
         .y = button.y,
-        .w = theme.scaledUi(66.0),
+        .w = @max(theme.scaledUi(66.0), text_measure.textWidth(.ui, theme.scaledUi(11.5), copy_label) + theme.scaledUi(28.0)),
         .h = button.h,
     });
-    renderDiffFileActionButton(state, copy_button, "Copy", false, clip);
-    state.recordTranscriptCopyHit(copy_button, body, toolCopyIdentity(message_index, body));
+    renderDiffFileActionButton(state, copy_button, copy_label, false, clip);
+    state.recordTranscriptCopyHit(copy_button, copy_payload, toolCopyIdentity(message_index, copy_payload));
 }
 
 /// The transcript card that sets this workspace up on another machine
@@ -6540,6 +6644,15 @@ fn renderWorkspaceSetupCard(
         }
         x += width + theme.scaledUi(WORKSPACE_SETUP_BUTTON_GAP_UI);
     }
+}
+
+/// The provider's own sign-in command (`claude auth login`, `codex login`,
+/// ...), the same one the provider setup dialog offers to copy.
+fn providerSignInCommand(provider: app_state.Provider) ?[]const u8 {
+    // Custom ACP agents have no shared sign-in command.
+    if (provider == .custom_acp) return null;
+    const protocol = std.meta.stringToEnum(provider_types.Provider, @tagName(provider)) orelse return null;
+    return provider_install.loginShell(protocol);
 }
 
 // Renders clickable attachment previews beneath a committed chat message.
@@ -10427,6 +10540,29 @@ fn snapIconRectOrigin(rect: palette.Rect) palette.Rect {
     };
 }
 
+/// Status dot on the model pill's provider logo when the chat's provider
+/// cannot run yet (CLI missing: red; signed out or unverified: amber), so a
+/// default model on a provider that is not set up does not look ready.
+fn renderComposerProviderNotReadyBadge(state: *app_state.AppState, logo_slot: palette.Rect, clip: palette.Rect) void {
+    const readiness = state.providerReadinessSnapshot().forProvider(state.currentThread().provider);
+    const color = switch (readiness) {
+        .ready, .checking => return,
+        .missing => theme.danger(),
+        .signed_out, .unavailable => theme.warning(),
+    };
+    const dot = @round(theme.scaledUi(8.0));
+    const ring = @max(@round(theme.scaledUi(1.5)), 1.0);
+    const outer: palette.Rect = .{
+        .x = @round(logo_slot.x + logo_slot.w - dot + ring),
+        .y = @round(logo_slot.y - ring),
+        .w = dot + ring * 2.0,
+        .h = dot + ring * 2.0,
+    };
+    // Background-colored ring keeps the dot legible over any logo.
+    queueRoundedClipped(state, outer, paletteColor(theme.COLOR_PANEL_ALT), outer.w * 0.5, clip);
+    queueRoundedClipped(state, .{ .x = outer.x + ring, .y = outer.y + ring, .w = dot, .h = dot }, paletteColor(color), dot * 0.5, clip);
+}
+
 fn renderComposerToolbarIcons(state: *app_state.AppState) void {
     const previous_z = state.palette_overlay_batch.setZIndex(COMPOSER_TOOLBAR_OVERLAY_Z);
     defer state.palette_overlay_batch.restoreZIndex(previous_z);
@@ -10451,6 +10587,7 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
         const r = utils.snapImageRectToPixels(utils.imageRectContain(cached.width, cached.height, model_icon_slot.x, model_icon_slot.y, model_icon_slot.w, model_icon_slot.h));
         queueProviderLogo(state, .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h }, cached, state.currentThread().provider, model_rect);
     }
+    renderComposerProviderNotReadyBadge(state, model_icon_slot, model_rect);
 
     // The directory pill reserves the same leading cell as the model pill;
     // the folder glyph is drawn through the icon font here rather than by
@@ -11313,4 +11450,48 @@ test "selection-aware transcript rendering places glyphs exactly like the static
         try std.testing.expectEqual(expected.u, actual.u);
         try std.testing.expectEqual(expected.v, actual.v);
     }
+}
+
+test "toggling an in-flight card keeps the committed layout and scroll offset" {
+    const allocator = std.testing.allocator;
+    var fixture = try CursorBenchFixture.init(allocator, 4, 0);
+    defer fixture.deinit(allocator);
+    const state = fixture.state;
+    const thread = state.currentThreadMutable();
+    var index: usize = 0;
+    while (index < 200) : (index += 1) {
+        var body_buf: [96]u8 = undefined;
+        const body = try std.fmt.bufPrint(&body_buf, "Committed reply {d} with enough words to wrap once.", .{index});
+        try state.appendProjectedMessageToThread(thread, if (index % 2 == 0) .user else .assistant, "", body, null, &.{});
+    }
+    const width = fixture.column.w;
+    const visible_height = fixture.column.h * (1.0 + TRANSCRIPT_LAYOUT_VISIBLE_MARGIN_FRAC);
+    // The user scrolled through older history earlier, so more rows are
+    // materialized than a fresh reset would rebuild; a reset would re-estimate
+    // the unmaterialized history from a different average.
+    ensureTranscriptLayout(state, width, visible_height, visible_height * 2.5, null, null);
+    while (thread.transcript_layout_committed_height < visible_height * 2.5 and thread.transcript_layout_first_message_index > 0) {
+        ensureTranscriptLayout(state, width, visible_height, visible_height * 2.5, null, null);
+    }
+    try std.testing.expect(thread.transcript_layout_first_message_index > 0);
+    const items_before = thread.transcript_layout_items.items.len;
+    const committed_before = thread.transcript_layout_committed_height;
+    // Viewport scrolled into the in-flight rows below the committed tail.
+    const scroll_before = estimatedPartialTranscriptHeight(thread) + 120.0;
+    state.rememberCurrentTranscriptScroll(scroll_before);
+
+    // A pending card toggle: index past every committed message.
+    state.setCardExpanded(0xC0FFEE, true);
+    state.pending_card_toggle_layout_patch = .{
+        .project_index = state.project_controller.selected_index,
+        .thread_index = state.currentProject().selected_thread_index,
+        .message_index = thread.messages.items.len + 1,
+    };
+    ensureTranscriptLayout(state, width, visible_height, visible_height, null, scroll_before);
+
+    try std.testing.expect(state.pending_card_toggle_layout_patch == null);
+    try std.testing.expectEqual(transcriptLayoutVariantHash(state), thread.transcript_layout_variant_hash);
+    try std.testing.expectEqual(items_before, thread.transcript_layout_items.items.len);
+    try std.testing.expectEqual(committed_before, thread.transcript_layout_committed_height);
+    try std.testing.expectEqual(scroll_before, state.currentTranscriptScrollY().?);
 }

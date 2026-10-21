@@ -8,6 +8,7 @@ const acp = @import("acp.zig");
 const platform_process = @import("../platform/process.zig");
 const provider_mcp = @import("mcp.zig");
 const process_env = @import("../platform/env.zig");
+const provider_cli_version = @import("cli_version.zig");
 const provider_types = @import("types.zig");
 const runtime_log = @import("../runtime/log.zig");
 
@@ -20,6 +21,9 @@ const DEFAULT_MODEL = "composer-2.5";
 /// its response passes through `acp.handleSendPromptLine`.
 const SET_MODEL_REQUEST_ID: i64 = 12;
 const MAX_CURSOR_OUTPUT_BYTES = 8 * 1024 * 1024;
+/// `status` may refresh a token over the network; never let a readiness check
+/// outlive the UI's patience.
+const AUTH_STATUS_DEADLINE_MS: i64 = 10_000;
 const RESOURCE_EXHAUSTED_MESSAGE =
     \\**Cursor model temporarily unavailable**
     \\
@@ -126,8 +130,12 @@ pub const Client = struct {
             .environ_map = &env_map,
             .stdout_limit = .limited(MAX_CURSOR_OUTPUT_BYTES),
             .stderr_limit = .limited(512 * 1024),
+            .timeout = .{ .duration = .{
+                .raw = .fromMilliseconds(AUTH_STATUS_DEADLINE_MS),
+                .clock = .awake,
+            } },
         }) catch |err| switch (err) {
-            error.FileNotFound => return .unknown,
+            error.FileNotFound, error.Timeout => return .unknown,
             else => return err,
         };
         defer self.allocator.free(result.stdout);
@@ -837,10 +845,15 @@ fn resolveCursorExecutableAlloc(
         if (duplicate) continue;
         tried[tried_len] = candidate;
         tried_len += 1;
-        return process_env.resolveExecutableInEnvMapAlloc(allocator, env_map, candidate) catch |err| switch (err) {
+        const resolved = process_env.resolveExecutableInEnvMapAlloc(allocator, env_map, candidate) catch |err| switch (err) {
             error.FileNotFound, error.AccessDenied => continue,
             else => return err,
         };
+        if (std.mem.eql(u8, candidate, FALLBACK_EXECUTABLE) and provider_cli_version.isGrokAgentPath(resolved)) {
+            allocator.free(resolved);
+            continue;
+        }
+        return resolved;
     }
     runtime_log.diagnostic("cursor CLI not found; install Cursor Agent for this platform, ensure `cursor-agent` or `agent` is on PATH, then run `cursor-agent login`.", .{});
     return error.FileNotFound;
@@ -1017,4 +1030,11 @@ test "loaded sessions switch to the catalog model behind a Verde model ref" {
         \\{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}
     ;
     try std.testing.expectEqual(@as(?[]u8, null), try loadedSessionModelSwitchAlloc(allocator, init_line, "gpt-5.4-low"));
+}
+
+test "Grok's agent link is not mistaken for Cursor Agent" {
+    try std.testing.expect(provider_cli_version.isGrokAgentPath("/home/u/.grok/bin/agent"));
+    try std.testing.expect(provider_cli_version.isGrokAgentPath("C:\\Users\\u\\.grok\\bin\\agent.exe"));
+    try std.testing.expect(!provider_cli_version.isGrokAgentPath("/home/u/.local/bin/agent"));
+    try std.testing.expect(!provider_cli_version.isGrokAgentPath("/home/u/.grokker/bin/agent"));
 }

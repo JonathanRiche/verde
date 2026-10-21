@@ -27,8 +27,9 @@ const CHAT_TITLE_PROVIDER_OPTIONS = [_]app_config.ChatTitleProvider{
     .opencode,
 };
 const NEW_CHAT_PROVIDER_OPTIONS = [_]app_config.ChatProvider{ .codex, .claude, .cursor, .opencode, .pi, .fx, .grok, .muse };
-/// Settings > Providers rows, in display order.
-pub const PROVIDER_OPTIONS = NEW_CHAT_PROVIDER_OPTIONS;
+/// Settings > Providers rows, in display order: the "Connect an AI provider"
+/// dialog's order (`onboarding_modal.PROVIDERS`), so both list providers alike.
+pub const PROVIDER_OPTIONS = [_]app_config.ChatProvider{ .codex, .opencode, .claude, .cursor, .pi, .fx, .grok, .muse };
 const NEW_CHAT_REASONING_OPTIONS = [_]app_config.ChatReasoning{ .provider_default, .low, .medium, .high, .xhigh, .max };
 
 fn monotonicMs() i64 {
@@ -125,6 +126,7 @@ pub const OpenAction = enum {
 
 pub const Category = enum(u8) {
     appearance,
+    companion,
     workspace,
     chat,
     providers,
@@ -134,11 +136,12 @@ pub const Category = enum(u8) {
     agents,
     app,
 
-    pub const all = [_]Category{ .appearance, .workspace, .chat, .providers, .terminal, .browser, .connections, .agents, .app };
+    pub const all = [_]Category{ .appearance, .companion, .workspace, .chat, .providers, .terminal, .browser, .connections, .agents, .app };
 
     pub fn label(self: Category) []const u8 {
         return switch (self) {
             .appearance => "Appearance",
+            .companion => "Companion",
             .workspace => "Workspace",
             .chat => "Chat",
             .providers => "Providers",
@@ -319,6 +322,17 @@ pub const State = struct {
     /// The provider dialog was opened on purpose (Manage, model picker, Check
     /// again), so a ready provider must not auto-dismiss it.
     provider_onboarding_pinned: bool = false,
+    /// Row the dialog was opened for (a model picked from an unconnected
+    /// provider, or a Settings action); drawn highlighted while open.
+    provider_onboarding_highlight: ?Provider = null,
+    /// Scroll the highlighted row into view on the next layout pass.
+    provider_onboarding_scroll_to_highlight: bool = false,
+    /// Readiness generation answering the user's "Check again"; 0 when none
+    /// is in flight. Drives the "Checking..." button label.
+    provider_recheck_generation: u32 = 0,
+    /// "Enable" found no provider (or "Not now" with none installed): hide
+    /// the MCP dialog for this session without recording a choice.
+    mcp_onboarding_snoozed: bool = false,
     update_exit_requested: bool = false,
 };
 
@@ -587,6 +601,9 @@ fn closeSettingsDropdowns(self: anytype) void {
 /// Installs or removes Verde's user-scoped MCP registration across all
 /// detected providers. Existing non-Verde entries are never overwritten.
 pub fn toggleGlobalMcpIntegration(self: anytype) void {
+    // A background registration for a newly installed provider must not land
+    // after (and undo) this explicit choice.
+    @import("provider_controller.zig").finishMcpSyncWorker(self);
     if (self.app_config.mcp_integration_enabled or self.settings_controller.mcp_summary.installedCount() > 0) {
         const result = setProviderMcp(self.allocator, self.storage.pref_path, false) catch |err| {
             log.warn("failed to remove provider MCP registrations: {s}", .{@errorName(err)});
@@ -616,19 +633,19 @@ pub fn toggleGlobalMcpIntegration(self: anytype) void {
             return;
         }
         self.app_config.mcp_integration_enabled = summary.installedCount() > 0;
-        if (summary.failedCount() > 0) {
-            self.setSidebarNotice("Enabled Verde MCP where possible; some provider configs could not be updated.");
-        } else if (summary.conflictCount() > 0) {
-            self.setSidebarNotice("Enabled Verde MCP where possible; existing entries were preserved.");
-        } else {
-            self.setSidebarNotice("Enabled Verde MCP tools in detected providers.");
-        }
+        // Same wording as the onboarding dialog: says what was enabled,
+        // including "nothing" when every provider kept its own entry.
+        var notice_buf: [192]u8 = undefined;
+        self.setSidebarNotice(@import("provider_controller.zig").mcpEnableNotice(&notice_buf, summary.installedCount(), summary.conflictCount(), summary.failedCount()));
     }
     self.app_config.mcp_onboarding_completed = true;
-    app_config.saveAppConfig(self.allocator, &self.app_config) catch |err| {
+    if (app_config.saveAppConfig(self.allocator, &self.app_config)) |_| {
+        // Our own write: the config watcher must not announce a reload.
+        self.app_config_file_mtime = app_config.configFileMtime(self.allocator) catch self.app_config_file_mtime;
+    } else |err| {
         log.warn("failed to persist MCP integration preference: {s}", .{@errorName(err)});
         self.setSidebarNotice("MCP change applied, but could not save Verde settings.");
-    };
+    }
     self.markDirty();
 }
 
@@ -1137,7 +1154,10 @@ pub fn settingsNewChatModelSelectedIndex(self: anytype) ?usize {
 
 pub fn settingsNewChatModelSelectedLabel(self: anytype) []const u8 {
     if (self.settingsNewChatModelSelectedIndex()) |index| return self.settingsNewChatModelLabel(index);
-    return self.settingsNewChatModelRef();
+    const ref = self.settingsNewChatModelRef();
+    // A built-in default the live catalog omits (Claude's `fable[1m]`) keeps its name.
+    const provider = dbProviderForChatProvider(self.settings_controller.draft.new_chat_provider);
+    return @import("provider_controller.zig").knownModelLabel(provider, settingsNewChatModelOptions(self), ref) orelse ref;
 }
 
 fn replaceSettingsNewChatModel(self: anytype, model_ref: []const u8) !void {
@@ -1274,7 +1294,7 @@ pub fn toggleSettingsProviderEnabled(self: anytype, row: usize) void {
     }
     slot.* = !slot.*;
     if (slot.* and draft.new_chat_provider == PROVIDER_OPTIONS[row]) {
-        for (PROVIDER_OPTIONS, 0..) |candidate, index| {
+        for (NEW_CHAT_PROVIDER_OPTIONS, 0..) |candidate, index| {
             if (draft.disabled_providers[@intFromEnum(candidate)]) continue;
             // Commits the draft, including the flipped toggle.
             selectSettingsNewChatProvider(self, index);
@@ -1427,6 +1447,13 @@ pub fn installSettingsProvider(self: anytype, row: usize) void {
             "Could not copy the install command.");
         return;
     }
+    // Installs run in the provider dialog's own terminal, which needs no
+    // workspace and rechecks the row when the command exits. Updates keep
+    // using a workspace terminal when one exists, so the output stays around.
+    if (missing or self.project_controller.projects.items.len == 0) {
+        self.openProviderSetupCommand(installed, if (missing) .install else .update, shell);
+        return;
+    }
     startProviderInstallTerminal(self, provider, shell, missing, false) catch |err| {
         log.warn("failed to open provider installer terminal: {s}", .{@errorName(err)});
         self.setSidebarNotice("Could not open a terminal for the provider installer.");
@@ -1445,7 +1472,7 @@ pub fn runProviderOnboardingAction(self: anytype, provider: Provider) void {
     _ = row;
     // The dialog runs the command in its own inline terminal, so this works
     // before any workspace exists and the user never leaves the checklist.
-    switch (self.providerReadinessSnapshot().forProvider(provider)) {
+    switch (provider_setup.readinessSnapshot(self).forProvider(provider)) {
         .missing, .signed_out, .unavailable => provider_setup.start(self, provider),
         .ready, .checking => {},
     }
@@ -1457,9 +1484,10 @@ pub fn loginSettingsProvider(self: anytype, row: usize) void {
     loginProvider(self, PROVIDER_OPTIONS[row]);
 }
 
-/// Opens the provider's own sign-in command in a workspace terminal. The CLI
-/// owns the flow (browser OAuth, device code, or a TUI `/login`); Verde
-/// rechecks readiness when the terminal exits.
+/// Opens the provider's own sign-in command in the provider dialog's setup
+/// terminal, which works before any workspace exists. The CLI owns the flow
+/// (browser OAuth, device code, or a TUI `/login`); the dialog rechecks
+/// readiness when the command exits and closes once the provider is ready.
 pub fn loginProvider(self: anytype, provider: app_config.ChatProvider) void {
     const shell = headless.provider_install.loginShell(providerProtocol(provider));
     if (!providerTerminalSupported()) {
@@ -1469,11 +1497,7 @@ pub fn loginProvider(self: anytype, provider: app_config.ChatProvider) void {
             "Could not copy the sign-in command.");
         return;
     }
-    startProviderInstallTerminal(self, provider, shell, false, true) catch |err| {
-        log.warn("failed to open provider sign-in terminal: {s}", .{@errorName(err)});
-        self.setSidebarNotice("Could not open a terminal for provider sign-in.");
-        self.markDirty();
-    };
+    self.openProviderSetupCommand(dbProviderForChatProvider(provider), .sign_in, shell);
 }
 
 fn startProviderInstallTerminal(self: anytype, provider: app_config.ChatProvider, shell: []const u8, missing: bool, login: bool) !void {

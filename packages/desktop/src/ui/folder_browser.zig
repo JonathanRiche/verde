@@ -343,7 +343,9 @@ pub fn handleClick(state: *runtime.AppState, action: runtime.PaletteModalAction,
             _ = model.navigate(allocator, places[index].path());
         },
         .folder_browser_row => if (index < rowCount()) {
-            if (clicks >= 2) {
+            // The "Create directory" row is an action, not a folder to
+            // select first: one click creates it.
+            if (clicks >= 2 or isCreateRow(index)) {
                 openRow(state, index);
             } else {
                 model.highlighted = index;
@@ -434,8 +436,25 @@ fn openRow(state: *runtime.AppState, row: usize) void {
     _ = model.navigateInto(state.allocator, name);
 }
 
+fn isCreateRow(row: usize) bool {
+    return create_offered and row == visible_count;
+}
+
+/// True while the highlighted row is "Create directory …", so the primary
+/// button creates that folder instead of picking the listed one.
+fn createRowHighlighted(model: *const runtime.FolderBrowser) bool {
+    const row = model.highlighted orelse return false;
+    return isCreateRow(row);
+}
+
 fn selectTarget(state: *runtime.AppState) void {
     const model = browser(state);
+    if (createRowHighlighted(model)) {
+        const name = state.allocator.dupe(u8, model.creatableName() orelse return) catch return;
+        defer state.allocator.free(name);
+        // createFolder navigates into the new folder, which becomes the target.
+        if (!model.createFolder(state.allocator, name)) return;
+    }
     const target = model.targetPathAlloc(state.allocator, visible[0..visible_count]) catch return;
     defer state.allocator.free(target);
     state.finishFolderBrowser(target);
@@ -640,8 +659,14 @@ fn renderFooter(state: *runtime.AppState) void {
 
     renderButton(state, cancel_rect, "Cancel", false);
     var label_buf: [160]u8 = undefined;
-    const name = std.fs.path.basename(target);
-    const verb = if (model.isRemote()) "Use" else if (state.folderBrowserOffersManagedWorkspace()) "Add" else "Select";
+    // With "Create directory …" highlighted the button creates that folder
+    // and picks it, so name the typed folder rather than the listed one.
+    const creating = createRowHighlighted(model);
+    const name = if (creating) model.creatableName() orelse "" else std.fs.path.basename(target);
+    const adds = state.folderBrowserOffersManagedWorkspace();
+    const verb = if (creating)
+        (if (adds) "Create & add" else "Create & select")
+    else if (model.isRemote()) "Use" else if (adds) "Add" else "Select";
     const label = std.fmt.bufPrint(&label_buf, "{s} \u{201C}{s}\u{201D}", .{ verb, if (name.len == 0) "/" else name }) catch verb;
     renderButton(state, select_rect, label, true);
 }

@@ -851,6 +851,12 @@ fn renderStartupFrame(
 fn syncMouseCursor(state: *AppState, cache: *CursorState) void {
     const mouse_x = state.transcript_controller.palette_mouse_x;
     const mouse_y = state.transcript_controller.palette_mouse_y;
+    // A topmost onboarding dialog answers for the whole window: I-beam over
+    // its text and setup terminal, pointer over its controls.
+    if (ui_layout.onboardingSystemCursorAt(state, mouse_x, mouse_y)) |cursor| {
+        applySystemCursor(cache, cursor);
+        return;
+    }
     if (!modalHitAtMouse(state)) {
         if (ui_layout.companionSystemCursorAt(state, mouse_x, mouse_y)) |cursor| {
             applySystemCursor(cache, cursor);
@@ -1902,7 +1908,7 @@ fn handleEvent(window: *palette.platform.Window, state: *AppState, keyboard: *ke
             disarmPrefix(state);
             exitPrefixNavigate(state);
             ui_layout.resetCompanionInputCaptures(state);
-            ui_layout.blurPaletteModalTextInput(state);
+            releaseModalTextGesturesOnFocusLoss(state);
             state.blurCompanionComposer();
         },
         .key_down => |*key_event| {
@@ -2344,6 +2350,9 @@ fn handleEvent(window: *palette.platform.Window, state: *AppState, keyboard: *ke
             ui_layout.updateCommitSheetHover(state, motion_event.x, motion_event.y);
             ui_layout.updateSettingsModalHover(state, motion_event.x, motion_event.y);
             ui_layout.updateCommandPaletteHover(state, motion_event.x, motion_event.y);
+            if (ui_layout.handleOnboardingMouseMotion(state, motion_event.x, motion_event.y, motion_event.state)) {
+                return true;
+            }
             const modal_owns_motion = ui_layout.handlePaletteMouseMotion(state, motion_event.x, motion_event.y);
             if (state.palette_modal_pointer_captured or modal_owns_motion) {
                 return true;
@@ -2385,6 +2394,12 @@ fn handleEvent(window: *palette.platform.Window, state: *AppState, keyboard: *ke
         .mouse_button_down, .mouse_button_up => |*button_event| {
             if (!button_event.down and ui_layout.companionOwnsPointerRelease(state, button_event.button)) {
                 _ = ui_layout.handleCompanionMouseButton(state, button_event.x, button_event.y, button_event.button, false, button_event.clicks);
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            // Onboarding dialogs route text selection, their Copy menu, and
+            // the setup terminal's clicks before the shared modal hits.
+            if (ui_layout.handleOnboardingMouseButton(state, button_event.x, button_event.y, button_event.button, button_event.down, button_event.clicks)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
@@ -2712,6 +2727,26 @@ fn handleEvent(window: *palette.platform.Window, state: *AppState, keyboard: *ke
     return true;
 }
 
+/// Cancels an in-flight modal text drag whose mouse-up the unfocused window
+/// will never see. The focused field (command palette, folder filter, ...)
+/// is kept: nothing re-focuses it on focus gain, so blurring it here left
+/// typed text dropped after Alt-Tab while shortcuts still worked.
+fn releaseModalTextGesturesOnFocusLoss(state: anytype) void {
+    state.modal_text_drag_active = false;
+}
+
+test "window focus loss keeps the focused modal text field" {
+    var fake: struct {
+        palette_modal_text_focus: native_state.PaletteModalTextFocus = .command_palette,
+        modal_text_selection_anchor: ?usize = 2,
+        modal_text_drag_active: bool = true,
+    } = .{};
+    releaseModalTextGesturesOnFocusLoss(&fake);
+    try std.testing.expectEqual(native_state.PaletteModalTextFocus.command_palette, fake.palette_modal_text_focus);
+    try std.testing.expectEqual(@as(?usize, 2), fake.modal_text_selection_anchor);
+    try std.testing.expect(!fake.modal_text_drag_active);
+}
+
 fn browserInputDebugEnabled() bool {
     return std.c.getenv("VERDE_BROWSER_INPUT_DEBUG") != null;
 }
@@ -2787,7 +2822,7 @@ fn handleBrowserTabShortcut(state: *AppState, event: *const palette.event.KeyEve
 fn handleBrowserInspectorEscape(state: *AppState, event: *const palette.event.KeyEvent) bool {
     if (!state.isBrowserPaneFocused() or !state.isBrowserInspectorEnabled()) return false;
     if (!event.down or event.repeat) return false;
-    if (event.key != .escape and event.hidScancode() != .escape) return false;
+    if (!isEscapeKey(event)) return false;
     state.browser_controller.inspector_menu_open = false;
     state.disableBrowserInspector(false);
     return true;
@@ -3251,6 +3286,23 @@ fn handleComposerFocusShortcut(state: *AppState, event: *const palette.event.Key
     return true;
 }
 
+/// Escape as the user's keymap resolves it. The physical position is only a
+/// fallback when the host reported no layout data: with caps:swapescape or a
+/// virtual-keyboard keymap, the physical Escape key types something else.
+fn isEscapeKey(event: *const palette.event.KeyEvent) bool {
+    return event.key == .escape or (event.key == .unknown and event.hidScancode() == .escape);
+}
+
+test "Escape follows the keymap, not the physical key position" {
+    // evdev KEY_ESC = 1, KEY_CAPSLOCK = 58.
+    // A virtual keyboard keymap can put "/" on the physical Escape position.
+    try std.testing.expect(!isEscapeKey(&.{ .key = .character, .scancode = 1, .codepoint = '/', .base_codepoint = '/' }));
+    // caps:swapescape: the Caps Lock key produces Escape.
+    try std.testing.expect(isEscapeKey(&.{ .key = .escape, .scancode = 58 }));
+    // Hosts without layout data keep the physical fallback.
+    try std.testing.expect(isEscapeKey(&.{ .key = .unknown, .scancode = 1 }));
+}
+
 fn handleComposerBlurShortcut(state: *AppState, event: *const palette.event.KeyEvent) bool {
     if (!state.composer_controller.focused) return false;
     if (state.focusedWorkspaceChatPaneId() == null) return false;
@@ -3258,7 +3310,7 @@ fn handleComposerBlurShortcut(state: *AppState, event: *const palette.event.KeyE
     if (state.isBrowserPaneFocused() or state.browser_controller.address_focused) return false;
     if (state.palette_modal_text_focus != .none) return false;
     if (!event.down or event.repeat) return false;
-    if (event.hidScancode() != .escape and event.key != .escape) return false;
+    if (!isEscapeKey(event)) return false;
     if (event.mod.ctrl or
         event.mod.alt or
         event.mod.super or

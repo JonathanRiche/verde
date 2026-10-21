@@ -251,9 +251,9 @@ hooks = true
 
 Chat turns and terminal sessions live in a **session daemon**, not in the window. The GUI, CLI, MCP bridge, web client and mobile apps all attach to it as clients. If you close the window, agent turns keep running and their results are saved. When a new Verde version starts, the daemon finishes its current work and upgrades itself. Drafts, image attachments and transcripts persist across restarts.
 
-### Experimental companion
+### Companion
 
-Turn it on in **Settings → Experimental**. The companion is a named character (Sprout, Moss or Vireo; you pick it and name it) that orchestrates Verde across every workspace. It hands work off to chats, shows its crew's live status, and gathers everything that needs your approval into one inbox. It runs on whichever connected model you choose, and it follows you to the web and mobile clients.
+Turn it on or off in **Settings → Companion**. The companion is a named character (Sprout, Moss or Vireo; you pick it and name it) that orchestrates Verde across every workspace. It hands work off to chats, shows its crew's live status, and gathers everything that needs your approval into one inbox. It runs on whichever connected model you choose, and it follows you to the web and mobile clients.
 
 ### Scriptable from your shell
 

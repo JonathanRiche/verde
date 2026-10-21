@@ -554,7 +554,7 @@ const uiSchema = closedObject(
     },
     companion_enabled: {
       type: 'boolean',
-      description: 'Experimental Companion sidecar. Off by default.',
+      description: 'Show the Companion sidecar. Off by default.',
     },
     companion_character: {
       type: 'string',

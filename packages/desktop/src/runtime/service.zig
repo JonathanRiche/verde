@@ -786,6 +786,25 @@ pub fn takeRpcResult(
     return self.runtime_manager.takeRpcResult(ticket);
 }
 
+/// Remote-terminal `session.*` RPC on the profile's own terminal lane; see
+/// `Manager.beginTerminalRpc`. Never shares the `beginRpc` slot.
+pub fn beginTerminalRpc(
+    self: *Self,
+    profile_id: []const u8,
+    method: []const u8,
+    params: anytype,
+) !RpcTicket {
+    return self.runtime_manager.beginTerminalRpc(profile_id, method, params);
+}
+
+pub fn takeTerminalRpcResult(self: *Self, ticket: RpcTicket) !?RpcCallResult {
+    return self.runtime_manager.takeTerminalRpcResult(ticket);
+}
+
+pub fn abandonTerminalRpc(self: *Self, ticket: RpcTicket) void {
+    self.runtime_manager.abandonTerminalRpc(ticket);
+}
+
 const TEST_TOKEN = "0123456789abcdef0123456789abcdef";
 const TEST_DEVICE_CREDENTIAL =
     "0123456789abcdef0123456789abcdef" ++

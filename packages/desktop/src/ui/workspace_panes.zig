@@ -896,6 +896,8 @@ fn growScrollingPaneInDirection(
     layout: *runtime.WorkspaceLayout,
     dir: FocusDirection,
 ) bool {
+    // Column widths are a scrolling-layout feature; tabs always fill the view.
+    if (!state.workspaceScrollingStripScrolls(layout)) return false;
     const delta_css = scrollingGrowDeltaCss(state.app_config.workspace_scroll_direction, dir) orelse return false;
     const focused_pane_id = layout.focused_pane_id orelse return false;
     if (!layout.rootContainsPane(focused_pane_id)) return false;
@@ -1268,6 +1270,8 @@ const WELCOME_PROVIDERS = [_]runtime.Provider{ .claude, .codex, .opencode, .curs
 const WelcomeProviders = struct {
     items: [WELCOME_PROVIDERS.len]runtime.Provider = undefined,
     readiness: [WELCOME_PROVIDERS.len]runtime.ProviderReadiness = undefined,
+    /// Installed CLI that cannot run yet (Claude without Node.js).
+    needs_runtime: [WELCOME_PROVIDERS.len]bool = undefined,
     count: usize = 0,
     checking: bool = false,
 };
@@ -1278,10 +1282,12 @@ fn installedWelcomeProviders(state: *runtime.AppState) WelcomeProviders {
     var result: WelcomeProviders = .{};
     for (WELCOME_PROVIDERS) |provider| {
         const readiness = snapshot.forProvider(provider);
+        const needs_runtime = snapshot.requirementForProvider(provider) != null;
         if (readiness == .checking) result.checking = true;
-        if (readiness == .missing or readiness == .checking) continue;
+        if ((readiness == .missing and !needs_runtime) or readiness == .checking) continue;
         result.items[result.count] = provider;
         result.readiness[result.count] = readiness;
+        result.needs_runtime[result.count] = needs_runtime;
         result.count += 1;
     }
     return result;
@@ -1370,18 +1376,20 @@ fn renderWelcomeProviders(state: *runtime.AppState, rect: palette.Rect, provider
         const row: f32 = @floatFromInt(index / 2);
         const cell: palette.Rect = .{ .x = rect.x + pad + column * cell_w, .y = rect.y + pad + row * cell_h, .w = cell_w, .h = cell_h };
         const readiness = providers.readiness[index];
-        const status_color = switch (readiness) {
+        const needs_runtime = providers.needs_runtime[index];
+        const status_color = if (needs_runtime) theme.COLOR_YELLOW else switch (readiness) {
             .ready => theme.success(),
             .signed_out, .unavailable => theme.COLOR_YELLOW,
             .missing => theme.COLOR_DIFF_REMOVE,
             .checking => theme.COLOR_TEXT_MUTED,
         };
-        const status = switch (readiness) {
+        // Same words as the provider dialog this panel opens.
+        const status: []const u8 = if (needs_runtime) runtime.provider_setup.NEEDS_NODE_STATUS else switch (readiness) {
             .ready => "Ready",
             // An unconfirmed login has the same next step as a missing one.
-            .signed_out, .unavailable => "Sign in",
-            .missing => "Missing",
-            .checking => "Checking",
+            .signed_out, .unavailable => "Sign-in needed",
+            .missing => "CLI not found",
+            .checking => "Checking...",
         };
         const dot = theme.scaledUi(7.0);
         queueRounded(state, .{ .x = cell.x + theme.scaledUi(8.0), .y = cell.y + (cell.h - dot) * 0.5, .w = dot, .h = dot }, paletteColor(status_color), dot * 0.5);
@@ -2194,12 +2202,17 @@ fn renderScrollingStrip(
     const target_viewport_width = scrollingViewportExtent(target_workspace_width, gap, pane_count, state.app_config.workspace_panes_per_view);
     const viewport_has_margins = scrollingViewportUsesMargins(pane_count, state.app_config.workspace_panes_per_view);
     const viewport_extent = if (vertical) viewport.h else viewport.w;
+    // Saved column widths only apply while the strip scrolls; in tab mode a
+    // width left over from scrolling would shrink the tab and peek at its
+    // neighbours.
+    const extent_override_css = if (strip_scrolls) layout.scroll_pane_extent_override else null;
+    const extent_override_ratio = if (strip_scrolls) layout.scroll_pane_extent_ratio_override else null;
     const default_extent = responsiveScrollingPaneExtent(
         viewport_extent,
         gap,
         state.app_config.workspace_panes_per_view,
-        layout.scroll_pane_extent_override,
-        layout.scroll_pane_extent_ratio_override,
+        extent_override_css,
+        extent_override_ratio,
         theme.uiScaleFactor(),
     );
     const extents = allocator.alloc(f32, pane_count) catch return;
@@ -2211,6 +2224,7 @@ fn renderScrollingStrip(
         viewport_extent,
         gap,
         theme.uiScaleFactor(),
+        strip_scrolls,
         extents[0..pane_count],
     );
     const target_viewport_extent = if (vertical) viewport.h else target_viewport_width;
@@ -2218,8 +2232,8 @@ fn renderScrollingStrip(
         target_viewport_extent,
         gap,
         state.app_config.workspace_panes_per_view,
-        layout.scroll_pane_extent_override,
-        layout.scroll_pane_extent_ratio_override,
+        extent_override_css,
+        extent_override_ratio,
         theme.uiScaleFactor(),
     );
     const target_extents = allocator.alloc(f32, pane_count) catch return;
@@ -2231,6 +2245,7 @@ fn renderScrollingStrip(
         target_viewport_extent,
         gap,
         theme.uiScaleFactor(),
+        strip_scrolls,
         target_extents[0..pane_count],
     );
     const max_offset = scrollingStripMaxOffset(viewport_extent, extents[0..pane_count], gap);
@@ -2400,12 +2415,13 @@ fn renderScrollingStrip(
             offset.*,
             pane_index,
             viewport_has_margins,
+            strip_scrolls,
         );
         origin += pane_extent + gap;
     }
     clipWorkspaceBatch(state, command_start, text_run_start, viewport);
     clipWorkspaceHitCaches(viewport);
-    renderScrollingEdgeNavigation(state, layout, viewport, direction, pane_count);
+    if (strip_scrolls) renderScrollingEdgeNavigation(state, layout, viewport, direction, pane_count);
 }
 
 const ScrollingEdgeAvailability = struct {
@@ -2564,6 +2580,9 @@ fn renderScrollingGroup(
     offset: f32,
     pane_index: usize,
     viewport_has_margins: bool,
+    /// Edge-drag column resizing is part of the scrolling layout; tab mode
+    /// (scrolling off, or below "Start after") gets no grips.
+    resizable: bool,
 ) void {
     const screen_origin = origin - offset;
     const rect: palette.Rect = switch (direction) {
@@ -2596,7 +2615,7 @@ fn renderScrollingGroup(
         .vertical => .{ .x = workspace.x, .y = rect.y + rect.h, .w = workspace.w, .h = gap },
     };
     if (intersectRects(gutter, workspace) != null) queueRect(state, gutter, paletteColor(theme.background()));
-    if (pane_count > 1) return;
+    if (pane_count > 1 or !resizable) return;
     const grip_extent = theme.scaledUi(10.0);
     const axis: runtime.WorkspaceSplitAxis = if (direction == .horizontal) .vertical else .horizontal;
     // Leading grip stays inside this pane so it resizes the pane the pointer
@@ -2841,10 +2860,15 @@ fn resolveScrollingGroupExtents(
     viewport_extent: f32,
     gap: f32,
     ui_scale: f32,
+    use_saved_widths: bool,
     extents: []f32,
 ) void {
     for (group_ids, representative_pane_ids, extents) |group_id, representative_pane_id, *extent| {
         var resolved_pane = layout.paneById(representative_pane_id) orelse continue;
+        if (!use_saved_widths) {
+            extent.* = if (layout.scrollGroupPaneCount(group_id) > 1) @max(viewport_extent, 1.0) else default_extent;
+            continue;
+        }
         for (layout.panes.items) |*pane| {
             if (layout.scrollGroupIdForPane(pane.id) != group_id) continue;
             if (pane.scroll_extent_css != null or pane.scroll_extent_ratio != null) {
@@ -3089,6 +3113,7 @@ fn renderSkipSlideStrip(
             0.0,
             index,
             viewport_has_margins,
+            true,
         );
     }
     const to_target_width = if (vertical) target_viewport_width else target_extents[to_index];
@@ -3107,6 +3132,7 @@ fn renderSkipSlideStrip(
         0.0,
         to_index,
         viewport_has_margins,
+        true,
     );
 }
 
@@ -4061,6 +4087,27 @@ test "scrolling layout and strip scrolling follow mode and threshold" {
     try std.testing.expect(!scrollingLayoutEnabled(.disabled, 1, 1));
 }
 
+test "tab mode ignores column widths saved while scrolling" {
+    const allocator = std.testing.allocator;
+    var layout = try runtime.WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+    const second = try layout.createTerminalPane(allocator, 1);
+    try layout.splitPaneWithLeaf(allocator, 1, second, .vertical, true);
+    try std.testing.expect(layout.setPaneScrollExtent(1, 400.0, 0.4));
+    var ids: [2]runtime.WorkspacePaneId = undefined;
+    var representatives: [2]runtime.WorkspacePaneId = undefined;
+    const count = collectScrollingGroups(&layout, &ids, &representatives);
+    try std.testing.expectEqual(@as(usize, 2), count);
+    var extents: [2]f32 = undefined;
+    const viewport: f32 = 1000.0;
+    resolveScrollingGroupExtents(&layout, ids[0..count], representatives[0..count], viewport, viewport, 12.0, 1.0, true, extents[0..count]);
+    try std.testing.expect(extents[0] < viewport);
+    // Scrolling off: every tab fills the view, so no neighbour peeks in.
+    resolveScrollingGroupExtents(&layout, ids[0..count], representatives[0..count], viewport, viewport, 12.0, 1.0, false, extents[0..count]);
+    try std.testing.expectApproxEqAbs(viewport, extents[0], 0.0001);
+    try std.testing.expectApproxEqAbs(viewport, extents[1], 0.0001);
+}
+
 test "manual scrolling settles partial positions to the nearest pane" {
     const extents = [_]f32{ 500.0, 360.0, 640.0 };
     const target = freeScrollTarget(0.0, 4.5, SCROLLING_WHEEL_STEP_CSS, 884.0);
@@ -4093,7 +4140,7 @@ test "scrolling strip reveals every group beyond the visible rect budget" {
     defer allocator.free(extents);
     // Both axes and viewport changes share these one-dimensional bounds.
     for ([_]f32{ 600.0, 1200.0, 2400.0 }) |viewport| {
-        resolveScrollingGroupExtents(&layout, ids, representatives, viewport / 2.0, viewport, 12.0, 1.0, extents);
+        resolveScrollingGroupExtents(&layout, ids, representatives, viewport / 2.0, viewport, 12.0, 1.0, true, extents);
         const max_offset = scrollingStripMaxOffset(viewport, extents, 12.0);
         for (ids, 0..) |pane_id, index| {
             try std.testing.expectEqual(@as(?usize, index), scrollGroupIndexForPane(&layout, pane_id));

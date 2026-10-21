@@ -180,3 +180,31 @@ for (const ending of ['notification', 'membership']) {
     assert.equal(finished.length, 1);
   });
 }
+
+for (const [label, info, expected] of [
+  ['signed out', { tokenSource: 'none', apiProvider: 'firstParty' }, 'signed_out'],
+  ['no account', null, 'signed_out'],
+  ['OAuth login', { tokenSource: 'claude.ai', apiProvider: 'firstParty' }, 'signed_in'],
+  ['API key', { tokenSource: 'none', apiKeySource: 'ANTHROPIC_API_KEY', apiProvider: 'firstParty' }, 'signed_in'],
+  ['Bedrock', { apiProvider: 'bedrock' }, 'signed_in'],
+]) {
+  test(`auth check reports ${expected} for ${label} without starting a turn`, { timeout: 2000 }, async () => {
+    const events = [];
+    const context = vm.createContext({ setTimeout, clearTimeout, process: { env: {}, stdout: { write: line => events.push(JSON.parse(line)) } } });
+    vm.runInContext(source, context);
+    let options = null;
+    let promptYielded = false;
+    let closed = false;
+    const sdk = { query(params) {
+      options = params.options;
+      (async () => { for await (const _ of params.prompt) promptYielded = true; })();
+      return { accountInfo: async () => info, close: () => { closed = true; } };
+    } };
+    await context.handleClaudeAuth(sdk, { cwd: '/tmp' });
+    await new Promise(setImmediate);
+    assert.equal(events.at(-1).state, expected);
+    assert.equal(options.persistSession, false, 'auth checks must not write a session transcript');
+    assert.equal(promptYielded, false, 'auth checks must not send a prompt');
+    assert.equal(closed, true);
+  });
+}

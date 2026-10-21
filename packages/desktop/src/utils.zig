@@ -521,15 +521,7 @@ fn runLinuxGuiDirectoryPickerCommand(
     start_path: []const u8,
     unavailable_exit_code: ?u8,
 ) PickDirectoryError![]u8 {
-    const script =
-        \\export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-        \\if [ -z "${WAYLAND_DISPLAY:-}" ]; then
-        \\  for socket in "$XDG_RUNTIME_DIR"/wayland-*; do
-        \\    [ -S "$socket" ] || continue
-        \\    export WAYLAND_DISPLAY="$(basename "$socket")"
-        \\    break
-        \\  done
-        \\fi
+    const script = LINUX_WAYLAND_ENV_PRELUDE ++
         \\if [ -z "${DISPLAY:-}" ] && [ -d /tmp/.X11-unix ]; then
         \\  for socket in /tmp/.X11-unix/X*; do
         \\    [ -S "$socket" ] || continue
@@ -675,15 +667,47 @@ fn runChild(
     // A missing tool (e.g. xclip on Wayland-only systems) would otherwise
     // leave an unreaped child per call; see process_env.spawnPreflight.
     if (argv.len > 0) try process_env.spawnPreflight(argv[0], cwd);
-    var threaded = std.Io.Threaded.init(allocator, .{});
+    // `Threaded.init` defaults to an EMPTY environment, which would strip
+    // WAYLAND_DISPLAY/XDG_RUNTIME_DIR/DISPLAY from clipboard and picker tools
+    // and point them at the wrong (or no) display server. Resolve argv[0]
+    // against the process PATH (matching `spawnPreflight`) and hand the child
+    // the process environment with the packaged-launch PATH repair.
+    var env_map = try process_env.buildAugmentedEnvMap(allocator);
+    defer env_map.deinit();
+    var threaded = std.Io.Threaded.init(allocator, .{ .environ = processEnviron() });
     defer threaded.deinit();
     return std.process.run(allocator, threaded.io(), .{
         .argv = argv,
         .cwd = if (cwd) |path| .{ .path = path } else .inherit,
+        .environ_map = &env_map,
         .stdout_limit = .limited(max_output_bytes),
         .stderr_limit = .limited(max_output_bytes),
     });
 }
+
+fn processEnviron() std.process.Environ {
+    if (builtin.os.tag == .windows) return .{ .block = .global };
+    return .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
+}
+
+/// Shell prelude for Linux GUI helpers (wl-paste, folder pickers). The child
+/// inherits Verde's own WAYLAND_DISPLAY, so it talks to the compositor Verde is
+/// on. A socket scan runs only when WAYLAND_DISPLAY is genuinely unset; the
+/// glob sorts `wayland-0` first, matching the libwayland default Palette uses.
+/// WAYLAND_SOCKET names Verde's close-on-exec compositor fd, which a child can
+/// never use, so it is dropped.
+const LINUX_WAYLAND_ENV_PRELUDE =
+    \\unset WAYLAND_SOCKET
+    \\export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    \\if [ -z "${WAYLAND_DISPLAY:-}" ]; then
+    \\  for socket in "$XDG_RUNTIME_DIR"/wayland-*; do
+    \\    [ -S "$socket" ] || continue
+    \\    export WAYLAND_DISPLAY="$(basename "$socket")"
+    \\    break
+    \\  done
+    \\fi
+    \\
+;
 
 const PreferredEditorEnv = struct {
     name: []const u8,
@@ -1256,6 +1280,8 @@ const CODEX_USAGE_LIMIT_MESSAGE = "Codex's usage limit has been reached. View us
 const CODEX_FIVE_HOUR_LIMIT_MESSAGE = "Codex's 5-hour usage limit has been reached. View usage to see the reset time and your other plan limits.";
 /// Emitted verbatim by `providers/provider_bridge.ts` when the Claude CLI is signed out.
 const CLAUDE_SIGN_IN_REQUIRED_MESSAGE = "Claude Code is not signed in. Sign in, then send your message again.";
+/// Reported verbatim by `providers/opencode.zig` for no-route/auth failures.
+const OPENCODE_SIGN_IN_REQUIRED_MESSAGE = "OpenCode is not signed in. Sign in, then send your message again.";
 
 fn asciiContainsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     if (needle.len == 0) return true;
@@ -1350,8 +1376,16 @@ pub fn legacyProviderFailureForDisplayMessage(message_raw: []const u8) ?provider
 
 /// Identifies a failure row that signing in to the provider CLI resolves.
 pub fn signInRequiredProviderForDisplayMessage(message: []const u8) ?provider_models.Provider {
-    if (std.mem.eql(u8, std.mem.trim(u8, message, &std.ascii.whitespace), CLAUDE_SIGN_IN_REQUIRED_MESSAGE)) return .claude;
+    const trimmed = std.mem.trim(u8, message, &std.ascii.whitespace);
+    if (std.mem.eql(u8, trimmed, CLAUDE_SIGN_IN_REQUIRED_MESSAGE)) return .claude;
+    if (std.mem.eql(u8, trimmed, OPENCODE_SIGN_IN_REQUIRED_MESSAGE)) return .opencode;
     return null;
+}
+
+test "sign-in failure rows name their provider" {
+    try std.testing.expectEqual(provider_models.Provider.claude, signInRequiredProviderForDisplayMessage(CLAUDE_SIGN_IN_REQUIRED_MESSAGE).?);
+    try std.testing.expectEqual(provider_models.Provider.opencode, providerFailureActionProvider(OPENCODE_SIGN_IN_REQUIRED_MESSAGE ++ "\n").?);
+    try std.testing.expect(signInRequiredProviderForDisplayMessage("OpenCode error: Model unavailable: opencode/gpt-5.5") == null);
 }
 
 /// Returns the provider for any failure row that can offer a usage or sign-in action.
@@ -2151,7 +2185,7 @@ pub fn captureClipboardText(allocator: std.mem.Allocator) !?[]u8 {
     return switch (@import("builtin").os.tag) {
         .macos => captureClipboardTextCommand(allocator, &.{"pbpaste"}),
         .linux, .freebsd, .netbsd, .openbsd, .dragonfly => {
-            if (try captureClipboardTextCommand(allocator, &.{ "sh", "-c", "export XDG_RUNTIME_DIR=\"${XDG_RUNTIME_DIR:-/run/user/$(id -u)}\"; export WAYLAND_DISPLAY=\"${WAYLAND_DISPLAY:-wayland-1}\"; wl-paste --no-newline" })) |text| return text;
+            if (try captureClipboardTextCommand(allocator, &.{ "sh", "-c", LINUX_WAYLAND_ENV_PRELUDE ++ "wl-paste --no-newline" })) |text| return text;
             return try captureClipboardTextCommand(allocator, &.{ "xclip", "-selection", "clipboard", "-o" });
         },
         .windows => windows_integrations.clipboardTextAlloc(allocator, 1024 * 1024),
@@ -2387,7 +2421,7 @@ fn captureClipboardImageWayland(allocator: std.mem.Allocator) !?ClipboardImageCa
 
     const types_result = runChild(
         allocator,
-        &.{ "sh", "-c", "export XDG_RUNTIME_DIR=\"${XDG_RUNTIME_DIR:-/run/user/$(id -u)}\"; export WAYLAND_DISPLAY=\"${WAYLAND_DISPLAY:-wayland-1}\"; wl-paste --list-types > \"$1\"", "sh", types_path },
+        &.{ "sh", "-c", LINUX_WAYLAND_ENV_PRELUDE ++ "wl-paste --list-types > \"$1\"", "sh", types_path },
         ".",
         16 * 1024,
     ) catch |err| switch (err) {
@@ -2425,7 +2459,7 @@ fn captureClipboardImageWayland(allocator: std.mem.Allocator) !?ClipboardImageCa
 
     const image_result = runChild(
         allocator,
-        &.{ "sh", "-c", "export XDG_RUNTIME_DIR=\"${XDG_RUNTIME_DIR:-/run/user/$(id -u)}\"; export WAYLAND_DISPLAY=\"${WAYLAND_DISPLAY:-wayland-1}\"; wl-paste --no-newline --type \"$1\" > \"$2\"", "sh", mime, output_path },
+        &.{ "sh", "-c", LINUX_WAYLAND_ENV_PRELUDE ++ "wl-paste --no-newline --type \"$1\" > \"$2\"", "sh", mime, output_path },
         ".",
         16 * 1024,
     ) catch |err| switch (err) {
@@ -2657,4 +2691,28 @@ test "provider failure display identifies Claude and Codex usage limits" {
     );
     try std.testing.expectEqual(provider_models.Provider.claude, usageLimitProviderForDisplayMessage(CLAUDE_USAGE_LIMIT_MESSAGE).?);
     try std.testing.expectEqual(provider_models.Provider.codex, usageLimitProviderForDisplayMessage(CODEX_USAGE_LIMIT_MESSAGE).?);
+}
+
+test "runChild hands helpers the process environment" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const home = std.mem.sliceTo(std.c.getenv("HOME") orelse return error.SkipZigTest, 0);
+    const allocator = std.testing.allocator;
+    const result = try runChild(allocator, &.{ "sh", "-c", "printf %s \"${HOME-<unset>}\"" }, null, 16 * 1024);
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    try std.testing.expectEqualStrings(home, result.stdout);
+}
+
+test "wayland prelude keeps the inherited display and never invents one" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const inherited = try runChild(allocator, &.{ "sh", "-c", "export WAYLAND_DISPLAY=verde-test-7\n" ++ LINUX_WAYLAND_ENV_PRELUDE ++ "printf %s \"$WAYLAND_DISPLAY\"" }, null, 16 * 1024);
+    defer allocator.free(inherited.stdout);
+    defer allocator.free(inherited.stderr);
+    try std.testing.expectEqualStrings("verde-test-7", inherited.stdout);
+
+    const unset = try runChild(allocator, &.{ "sh", "-c", "unset WAYLAND_DISPLAY; export XDG_RUNTIME_DIR=/nonexistent-verde-runtime-dir\n" ++ LINUX_WAYLAND_ENV_PRELUDE ++ "printf %s \"${WAYLAND_DISPLAY-}\"" }, null, 16 * 1024);
+    defer allocator.free(unset.stdout);
+    defer allocator.free(unset.stderr);
+    try std.testing.expectEqualStrings("", unset.stdout);
 }

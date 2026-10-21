@@ -13,6 +13,7 @@
 const std = @import("std");
 const provider_diagnostics = @import("diagnostics.zig");
 const platform_process = @import("../platform/process.zig");
+const platform_runtime = @import("platform_runtime");
 const provider_types = @import("types.zig");
 const cursor_extensions = @import("cursor_extensions.zig");
 
@@ -290,6 +291,46 @@ pub const Process = struct {
         self.env_map.deinit();
         self.allocator.free(self.executable);
         self.threaded.deinit();
+    }
+};
+
+/// Kills a short-lived ACP child (auth probes) once `deadline_ms` passes, so a
+/// wedged handshake ends in EOF instead of blocking its reader forever.
+/// Declare `defer deadline.finish()` after the process's own deinit defer so
+/// the watchdog stops before the child is reaped.
+pub const ProcessDeadline = struct {
+    child: *platform_process.OwnedChild,
+    deadline_ms: u64,
+    finished: std.atomic.Value(bool) = .init(false),
+    expired: std.atomic.Value(bool) = .init(false),
+    thread: ?std.Thread = null,
+
+    const POLL_MS: u64 = 20;
+
+    pub fn start(self: *ProcessDeadline) !void {
+        self.thread = try std.Thread.spawn(.{}, watch, .{self});
+    }
+
+    pub fn finish(self: *ProcessDeadline) void {
+        self.finished.store(true, .release);
+        if (self.thread) |thread| {
+            self.thread = null;
+            thread.join();
+        }
+    }
+
+    fn watch(self: *ProcessDeadline) void {
+        var waited_ms: u64 = 0;
+        while (!self.finished.load(.acquire)) {
+            if (waited_ms >= self.deadline_ms) {
+                self.expired.store(true, .release);
+                // Probes keep no state worth a graceful exit; KILL guarantees EOF.
+                self.child.forceTerminateTree();
+                return;
+            }
+            platform_runtime.sleepMillis(POLL_MS);
+            waited_ms += POLL_MS;
+        }
     }
 };
 

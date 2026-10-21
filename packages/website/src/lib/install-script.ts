@@ -8,12 +8,12 @@ export const macosInstallCliScript = String.raw`macos_install_cli() {
   say "CLI: $cli_path"
 
   case ":$PATH:" in
-    *":$cli_dir:"*) return ;;
+    *":$cli_dir:"*) return 0 ;;
   esac
 
   if [ "$PREFIX" != "$HOME/.local" ]; then
     say "Add $cli_dir to PATH to run Verde as: verde"
-    return
+    return 0
   fi
 
   case "${'${'}SHELL:-/bin/zsh}" in

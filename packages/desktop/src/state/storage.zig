@@ -1894,7 +1894,13 @@ pub const Storage = struct {
         };
         defer parsed.deinit();
         if (parsed.response.err) |err| {
-            log.err("store mutation {s} failed: {s} ({s})", .{ method, err.code, err.message });
+            // A revision conflict is an expected race every caller refreshes
+            // and retries (or rebases); callers report the exhausted case.
+            if (std.mem.eql(u8, err.code, headless.protocol.ERR_CONFLICT)) {
+                log.debug("store mutation {s} conflicted: {s}; caller will refresh and retry", .{ method, err.message });
+            } else {
+                log.err("store mutation {s} failed: {s} ({s})", .{ method, err.code, err.message });
+            }
             if (std.mem.eql(u8, err.code, headless.protocol.ERR_CAPABILITY_UNAVAILABLE) or
                 std.mem.eql(u8, err.code, headless.protocol.ERR_UNKNOWN_METHOD) or
                 std.mem.eql(u8, err.code, "method_not_found"))

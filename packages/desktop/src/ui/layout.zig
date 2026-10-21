@@ -19,7 +19,7 @@ const command_palette = @import("command_palette.zig");
 const folder_browser = @import("folder_browser.zig");
 const custom_agent_form_ui = @import("custom_agent_form.zig");
 const custom_agent_form_state = @import("../state/custom_agent_form.zig");
-const provider_setup = runtime.provider_setup;
+const onboarding_modal = @import("onboarding_modal.zig");
 const terminal_panel = @import("terminal_panel.zig");
 const agent_prompt_popover = @import("agent_prompt_popover.zig");
 const companion = @import("companion.zig");
@@ -41,6 +41,7 @@ const RootLayout = struct {
 const PALETTE_MODAL_Z: i32 = 2000;
 /// Persistent root overlay below true modal ownership and above pane content.
 const COMPANION_Z: i32 = 1550;
+const NOTICE_TOAST_Z: i32 = PALETTE_MODAL_Z + 100;
 
 var sidebar_anim_width: f32 = -1.0;
 var sidebar_anim_x: f32 = 0.0;
@@ -86,8 +87,7 @@ pub fn refreshPaletteModalHits(state: *runtime.AppState, width: f32, height: f32
             handoff_sheet.registerHitsForPane(state, pane_rect);
         }
     }
-    registerProviderOnboardingHits(state, width, height);
-    registerMcpOnboardingHits(state, width, height);
+    onboarding_modal.registerHits(state, width, height, queueModalHit);
     registerImageModalHits(state, width, height);
     registerTranscriptSelectionModalHits(state, width, height);
     registerWorkspaceAddModalHits(state, width, height);
@@ -236,7 +236,6 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     agent_prompt_popover.render(state, width, height);
     renderPrefixStatusBar(state, split.content);
     renderPrefixWhichKey(state, split.content);
-    renderNoticeToast(state, split.content);
     state.palette_overlay_batch.restoreZIndex(which_key_z);
     const modal_z = state.palette_overlay_batch.setZIndex(PALETTE_MODAL_Z);
     defer state.palette_overlay_batch.restoreZIndex(modal_z);
@@ -247,8 +246,7 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     renderThreadImportModal(state, width, height);
     renderCookieImportModal(state, width, height);
     commit_sheet.render(state, width, height);
-    renderProviderOnboardingModal(state, width, height);
-    renderMcpOnboardingModal(state, width, height);
+    onboarding_modal.render(state, width, height);
     settings_modal.render(state, width, height);
     renderWorkspaceSettingsModal(state, width, height);
     renderRuntimeWizardModal(state, width, height);
@@ -258,6 +256,12 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     renderRuntimeCredentialModal(state, width, height);
     renderRuntimeTrustModal(state, width, height);
     debug_window.render(state, width, height);
+    // Notices report the result of actions taken inside modals (Settings,
+    // provider setup, folder browser), so they draw above every modal and
+    // its dimmed backdrop rather than behind them.
+    const toast_z = state.palette_overlay_batch.setZIndex(NOTICE_TOAST_Z);
+    renderNoticeToast(state, split.content);
+    state.palette_overlay_batch.restoreZIndex(toast_z);
 }
 
 // Notice toast (item 11): `setSidebarNotice` text ("Copied selection.",
@@ -1913,17 +1917,17 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             return true;
         }
         if (!down) return true;
+        if (state.settings_controller.modal_visible) settings_modal.noteClickedHit(hit.action, hit.index);
         switch (hit.action) {
-            .mcp_onboarding_not_now => state.completeMcpOnboarding(false),
-            .mcp_onboarding_enable => state.completeMcpOnboarding(true),
-            .provider_onboarding_close => state.dismissProviderOnboarding(),
-            .provider_onboarding_recheck => state.recheckProviderReadiness(),
-            .provider_onboarding_open_guide => state.openProviderSetupGuide(),
-            .provider_onboarding_action => if (hit.index < PROVIDER_ONBOARDING_PROVIDERS.len)
-                state.runProviderOnboardingAction(PROVIDER_ONBOARDING_PROVIDERS[hit.index]),
-            .provider_onboarding_copy => if (hit.index < PROVIDER_ONBOARDING_PROVIDERS.len)
-                provider_setup.copyCommand(state, PROVIDER_ONBOARDING_PROVIDERS[hit.index]),
-            .provider_setup_back => provider_setup.close(state),
+            .mcp_onboarding_not_now,
+            .mcp_onboarding_enable,
+            .provider_onboarding_close,
+            .provider_onboarding_recheck,
+            .provider_onboarding_open_guide,
+            .provider_onboarding_action,
+            .provider_onboarding_copy,
+            .provider_setup_back,
+            => onboarding_modal.clickHit(state, hit.action, hit.index),
             .image_close => state.closeImageModal(),
             .image_zoom_out => state.adjustImageModalZoom(-1),
             .image_zoom_in => state.adjustImageModalZoom(1),
@@ -1973,7 +1977,7 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             .runtime_wizard_method => state.chooseRuntimeWizardMethod(@enumFromInt(@min(hit.index, @typeInfo(runtime_connections.WizardMethod).@"enum".fields.len - 1))),
             .runtime_wizard_select => state.selectRuntimeWizardConnectRuntime(hit.index),
             .runtime_wizard_input => focusModalInput(state, runtimeWizardFocusForIndex(hit.index), hit.rect, x, clicks),
-            .settings_runtime_action => state.applyRuntimeRowAction(hit.index),
+            .settings_runtime_action => settings_modal.applyRuntimeAction(state, hit.index),
             .settings_phone_action => settings_modal.applyPhoneAction(state, hit.index),
             .settings_cancel, .settings_close, .settings_save => state.closeSettingsPanel(),
             .settings_category => settings_modal.applySettingsCategory(state, hit.index),
@@ -2022,39 +2026,7 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             .modal_dismiss => dismissTopModal(state),
             .modal_block => {
                 blurModalTextInput(state);
-                if (state.settings_controller.theme_dropdown_open) {
-                    state.settings_controller.theme_dropdown_open = false;
-                    state.settings_controller.theme_hover_index = null;
-                    state.markDirty();
-                }
-                if (state.settings_controller.companion_character_dropdown_open) {
-                    state.settings_controller.companion_character_dropdown_open = false;
-                    state.settings_controller.companion_character_hover_index = null;
-                    state.markDirty();
-                }
-                if (state.settings_controller.title_provider_dropdown_open or state.settings_controller.title_model_dropdown_open) {
-                    state.settings_controller.title_provider_dropdown_open = false;
-                    state.settings_controller.title_model_dropdown_open = false;
-                    state.settings_controller.title_menu_hover_index = null;
-                    state.markDirty();
-                }
-                if (state.settings_controller.commit_menu != null) {
-                    state.settings_controller.commit_menu = null;
-                    state.settings_controller.commit_menu_hover_index = null;
-                    state.markDirty();
-                }
-                if (state.settings_controller.new_chat_provider_dropdown_open or state.settings_controller.new_chat_model_dropdown_open or state.settings_controller.new_chat_reasoning_dropdown_open) {
-                    state.settings_controller.new_chat_provider_dropdown_open = false;
-                    state.settings_controller.new_chat_model_dropdown_open = false;
-                    state.settings_controller.new_chat_reasoning_dropdown_open = false;
-                    state.settings_controller.new_chat_menu_hover_index = null;
-                    state.markDirty();
-                }
-                if (state.settings_controller.open_action_dropdown_open) {
-                    state.settings_controller.open_action_dropdown_open = false;
-                    state.settings_controller.open_action_hover_index = null;
-                    state.markDirty();
-                }
+                settings_modal.closeDropdowns(state);
             },
             .project_rename_input => focusModalInput(state, .project_rename, hit.rect, x, clicks),
             .thread_import_input => focusModalInput(state, .thread_import, hit.rect, x, clicks),
@@ -2151,9 +2123,7 @@ pub fn hasPaletteModal(state: *const runtime.AppState) bool {
 }
 
 pub fn handlePaletteTextInput(state: *runtime.AppState, text: []const u8) bool {
-    if (state.settings_controller.provider_onboarding_visible and state.settings_controller.provider_setup.visible()) {
-        return provider_setup.handleTextInput(state, text);
-    }
+    if (onboarding_modal.handleTextInput(state, text)) return true;
     if (state.palette_modal_text_focus == .none) {
         // The trust modal intentionally has no editable field, and clicking
         // credential-modal chrome blurs its field. Both still own text input:
@@ -2267,26 +2237,6 @@ pub fn handlePaletteTextInput(state: *runtime.AppState, text: []const u8) bool {
     };
 }
 
-// Arrow/Page/Home/End/Space scroll the provider checklist, bounded by the
-// max scroll recorded on the last draw.
-fn handleProviderOnboardingKeyDown(state: *runtime.AppState, event: *const palette.event.KeyEvent) bool {
-    const step = theme.scaledUi(48.0);
-    const page = theme.scaledUi(240.0);
-    const sc = &state.settings_controller;
-    const delta: f32 = switch (event.key) {
-        .down => step,
-        .up => -step,
-        .pagedown, .space => page,
-        .pageup => -page,
-        .end => sc.provider_onboarding_max_scroll_y,
-        .home => -sc.provider_onboarding_scroll_y,
-        else => return false,
-    };
-    sc.provider_onboarding_scroll_y = theme.clampf(sc.provider_onboarding_scroll_y + delta, 0.0, sc.provider_onboarding_max_scroll_y);
-    state.markDirty();
-    return true;
-}
-
 pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const palette.event.KeyEvent) bool {
     const has_modal_open = state.runtimeCredentialModalOpen() or
         state.runtimeTrustProposal() != null or
@@ -2348,7 +2298,7 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const palette.even
     // the shared modal text path below.
     if (state.command_controller.open and command_palette.handleKeyDown(state, event)) return true;
     if (state.handoff_controller.sheet_open and handoff_sheet.handleKeyDown(state, event)) return true;
-    if (state.settings_controller.modal_visible and settings_modal.handleKeyDown(state, event.key)) return true;
+    if (state.settings_controller.modal_visible and settings_modal.handleKeyDown(state, event)) return true;
     if (commitSheetOwnsKeys(state) and handleCommitSheetKeyDown(state, event)) return true;
     // Workspace Settings keyboard ownership: it has no editable field, so
     // with no higher-priority modal above it Escape closes through the shared
@@ -2364,10 +2314,9 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const palette.even
         if (event.key == .escape) dismissTopModal(state);
         return true;
     }
-    if (state.settings_controller.provider_onboarding_visible and state.settings_controller.provider_setup.visible()) {
-        return provider_setup.handleKeyDown(state, state.command_controller.keyboard_config, event);
-    }
-    if (state.settings_controller.provider_onboarding_visible and handleProviderOnboardingKeyDown(state, event)) return true;
+    // Onboarding dialogs: Tab focus, selection copy, and their setup
+    // terminal; they consume every key while on top.
+    if (onboarding_modal.handleKeyDown(state, event)) return true;
     const primary = event.mod.primary();
     const shift = event.mod.shift;
     switch (event.key) {
@@ -2526,9 +2475,11 @@ fn dismissTopModal(state: *runtime.AppState) void {
         blurModalTextInput(state);
         return;
     }
-    if (state.settings_controller.provider_onboarding_visible) {
+    // Settings draws above the onboarding dialogs, so it closes first.
+    const onboarding_on_top = !state.settings_controller.modal_visible;
+    if (onboarding_on_top and state.settings_controller.provider_onboarding_visible) {
         state.dismissProviderOnboarding();
-    } else if (state.settings_controller.mcp_onboarding_visible) {
+    } else if (onboarding_on_top and state.settings_controller.mcp_onboarding_visible) {
         state.completeMcpOnboarding(false);
     } else if (state.modal_image_path != null) {
         state.closeImageModal();
@@ -3375,171 +3326,25 @@ fn registerTranscriptSelectionModalHits(state: *runtime.AppState, width: f32, he
     queueModalHit(state, close_rect, .transcript_close, 0);
 }
 
-fn providerOnboardingRect(width: f32, height: f32) palette.Rect {
-    const modal_w = theme.clampf(width * 0.54, theme.scaledUi(540.0), theme.scaledUi(720.0));
-    const modal_h = theme.clampf(height * 0.78, theme.scaledUi(500.0), theme.scaledUi(620.0));
-    return .{ .x = (width - modal_w) * 0.5, .y = (height - modal_h) * 0.5, .w = modal_w, .h = modal_h };
-}
-
-const PROVIDER_ONBOARDING_PROVIDERS = [_]runtime.Provider{ .codex, .opencode, .claude, .cursor, .pi, .fx, .grok };
-
-const ProviderOnboardingLayout = struct {
-    modal: palette.Rect,
-    /// Visible band for the provider rows; rows scroll inside it.
-    list: palette.Rect,
-    row_h: f32,
-    row_gap: f32,
-    max_scroll_y: f32,
-    button_y: f32,
-    button_h: f32,
-};
-
-// Fixed-height rows in a clipped, scrollable band between the intro and the
-// buttons, so a short window (or a VM at 1080p) never draws rows behind them.
-fn providerOnboardingLayout(width: f32, height: f32) ProviderOnboardingLayout {
-    const modal = providerOnboardingRect(width, height);
-    const pad = theme.scaledUi(22.0);
-    const button_h = theme.scaledUi(36.0);
-    const button_y = modal.y + modal.h - pad - button_h;
-    const list_top = modal.y + pad + theme.scaledUi(34.0) + theme.scaledUi(52.0);
-    const list_bottom = button_y - theme.scaledUi(14.0);
-    const row_h = theme.scaledUi(82.0);
-    const row_gap = theme.scaledUi(8.0);
-    const count: f32 = @floatFromInt(PROVIDER_ONBOARDING_PROVIDERS.len);
-    const content_h = row_h * count + row_gap * (count - 1.0);
-    const list: palette.Rect = .{ .x = modal.x + pad, .y = list_top, .w = modal.w - pad * 2.0, .h = @max(list_bottom - list_top, 0.0) };
-    return .{
-        .modal = modal,
-        .list = list,
-        .row_h = row_h,
-        .row_gap = row_gap,
-        .max_scroll_y = @max(content_h - list.h, 0.0),
-        .button_y = button_y,
-        .button_h = button_h,
-    };
-}
-
-fn providerOnboardingRowRect(layout: ProviderOnboardingLayout, index: usize, scroll_y: f32) palette.Rect {
-    const offset = @as(f32, @floatFromInt(index)) * (layout.row_h + layout.row_gap);
-    return .{ .x = layout.list.x, .y = layout.list.y - scroll_y + offset, .w = layout.list.w, .h = layout.row_h };
-}
-
-const PROVIDER_ONBOARDING_TEXT_INSET: f32 = 34.0;
-const PROVIDER_ONBOARDING_COMMAND_SIZE: f32 = 11.5;
-
-/// Pill holding a row's setup command; sized to the command text and capped
-/// short of the action button so its Copy control sits right after the text.
-fn providerOnboardingCommandRect(row: palette.Rect, command: []const u8) palette.Rect {
-    const action = providerOnboardingActionRect(row);
-    const size = theme.scaledUi(PROVIDER_ONBOARDING_COMMAND_SIZE);
-    // fixedText lays glyphs out wider than the UI-font measurement, which cut
-    // off the last letters; size for whichever is wider.
-    const measured_w = runtime.paletteUiTextPrefixWidth("$ ", size, 2) + runtime.paletteUiTextPrefixWidth(command, size, command.len);
-    const fixed_w = @as(f32, @floatFromInt(command.len + 2)) * size * 0.55;
-    const text_w = @max(measured_w, fixed_w);
-    const x = row.x + theme.scaledUi(PROVIDER_ONBOARDING_TEXT_INSET);
-    const want_w = theme.scaledUi(10.0) + text_w + theme.scaledUi(12.0) + theme.scaledUi(60.0) + theme.scaledUi(3.0);
-    const max_w = @max(action.x - theme.scaledUi(12.0) - x, theme.scaledUi(80.0));
-    return .{ .x = x, .y = row.y + theme.scaledUi(50.0), .w = @min(want_w, max_w), .h = theme.scaledUi(24.0) };
-}
-
-/// Copy control inset at the right end of the command pill.
-fn providerOnboardingCopyRect(row: palette.Rect, command: []const u8) palette.Rect {
-    const pill = providerOnboardingCommandRect(row, command);
-    const inset = theme.scaledUi(3.0);
-    const w = theme.scaledUi(60.0);
-    return .{ .x = pill.x + pill.w - inset - w, .y = pill.y + inset, .w = w, .h = pill.h - inset * 2.0 };
-}
-
-fn providerOnboardingActionRect(row: palette.Rect) palette.Rect {
-    const w = theme.scaledUi(92.0);
-    const h = theme.scaledUi(30.0);
-    return .{ .x = row.x + row.w - w - theme.scaledUi(12.0), .y = row.y + (row.h - h) * 0.5, .w = w, .h = h };
-}
-
-/// Same verbs as Settings > Providers: a missing CLI installs, an installed
-/// but signed-out (or unverifiable) one signs in.
-fn providerOnboardingActionLabel(readiness: runtime.ProviderReadiness) ?[]const u8 {
-    return switch (readiness) {
-        .missing => "Install",
-        .signed_out, .unavailable => "Sign in",
-        .ready, .checking => null,
-    };
-}
-
-/// Scrolls the provider checklist; the modal swallows the wheel everywhere.
+/// Scrolls the provider checklist, or its setup terminal's scrollback; the
+/// dialog swallows the wheel everywhere.
 pub fn handleProviderOnboardingWheel(state: *runtime.AppState, width: f32, height: f32, x: f32, y: f32, wheel_y: f32) bool {
-    if (!state.settings_controller.provider_onboarding_visible) return false;
-    _ = x;
-    _ = y;
-    const layout = providerOnboardingLayout(width, height);
-    state.settings_controller.provider_onboarding_scroll_y = theme.clampf(
-        state.settings_controller.provider_onboarding_scroll_y - wheel_y * theme.scaledUi(48.0),
-        0.0,
-        layout.max_scroll_y,
-    );
-    state.markDirty();
-    return true;
+    return onboarding_modal.handleWheel(state, width, height, x, y, wheel_y);
 }
 
-fn registerProviderOnboardingHits(state: *runtime.AppState, width: f32, height: f32) void {
-    if (!state.settings_controller.provider_onboarding_visible) return;
-    const modal = providerOnboardingRect(width, height);
-    // Clicking outside closes it, except while a sign-in/install command is
-    // running, where a stray click would kill the login midway.
-    const setup_running = state.settings_controller.provider_setup.visible() and state.settings_controller.provider_setup.status == .running;
-    registerModalChromeHits(state, width, height, modal, !setup_running);
-    const pad = theme.scaledUi(22.0);
-    const button_h = theme.scaledUi(36.0);
-    const gap = theme.scaledUi(10.0);
-    const close_w = theme.scaledUi(104.0);
-    const guide_w = theme.scaledUi(156.0);
-    const check_w = theme.scaledUi(126.0);
-    const button_y = modal.y + modal.h - pad - button_h;
-    const layout = providerOnboardingLayout(width, height);
-    if (state.settings_controller.provider_setup.visible()) {
-        // Inline setup terminal: Back returns to the list; the terminal
-        // itself takes keyboard input, not clicks.
-        queueModalHit(state, .{ .x = modal.x + pad, .y = button_y, .w = close_w, .h = button_h }, .provider_setup_back, 0);
-        queueModalHit(state, .{ .x = modal.x + modal.w - pad - check_w, .y = button_y, .w = check_w, .h = button_h }, .provider_onboarding_recheck, 0);
-        return;
-    }
-    queueModalHit(state, .{ .x = modal.x + pad, .y = button_y, .w = close_w, .h = button_h }, .provider_onboarding_close, 0);
-    const snapshot = state.providerReadinessSnapshot();
-    const scroll_y = theme.clampf(state.settings_controller.provider_onboarding_scroll_y, 0.0, layout.max_scroll_y);
-    for (PROVIDER_ONBOARDING_PROVIDERS, 0..) |provider, index| {
-        if (providerOnboardingActionLabel(snapshot.forProvider(provider)) == null) continue;
-        const row = providerOnboardingRowRect(layout, index, scroll_y);
-        // Clipped to the list band so a half-hidden button can't be clicked
-        // through the intro text or the footer buttons.
-        const clipped = rectIntersection(providerOnboardingActionRect(row), layout.list);
-        if (clipped.h > 0.0) queueModalHit(state, clipped, .provider_onboarding_action, index);
-        if (provider_setup.command(provider, snapshot.forProvider(provider) == .missing)) |command| {
-            const copy = rectIntersection(providerOnboardingCopyRect(row, command), layout.list);
-            if (copy.h > 0.0) queueModalHit(state, copy, .provider_onboarding_copy, index);
-        }
-    }
-    queueModalHit(state, .{ .x = modal.x + modal.w - pad - check_w, .y = button_y, .w = check_w, .h = button_h }, .provider_onboarding_recheck, 0);
-    queueModalHit(state, .{ .x = modal.x + modal.w - pad - check_w - gap - guide_w, .y = button_y, .w = guide_w, .h = button_h }, .provider_onboarding_open_guide, 0);
+/// Onboarding dialog pointer buttons (text selection, its menu, the setup
+/// terminal) ahead of the shared modal hits.
+pub fn handleOnboardingMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, down: bool, clicks: u8) bool {
+    return onboarding_modal.handleMouseButton(state, x, y, button, down, clicks);
 }
 
-fn mcpOnboardingRect(width: f32, height: f32) palette.Rect {
-    const modal_w = theme.clampf(width * 0.5, theme.scaledUi(520.0), theme.scaledUi(680.0));
-    const modal_h = theme.clampf(height * 0.56, theme.scaledUi(400.0), theme.scaledUi(440.0));
-    return .{ .x = (width - modal_w) * 0.5, .y = (height - modal_h) * 0.5, .w = modal_w, .h = modal_h };
+pub fn handleOnboardingMouseMotion(state: *runtime.AppState, x: f32, y: f32, buttons: palette.event.ButtonState) bool {
+    return onboarding_modal.handleMouseMotion(state, x, y, buttons);
 }
 
-fn registerMcpOnboardingHits(state: *runtime.AppState, width: f32, height: f32) void {
-    if (!state.settings_controller.mcp_onboarding_visible or state.settings_controller.provider_onboarding_visible) return;
-    const modal = mcpOnboardingRect(width, height);
-    registerModalChromeHits(state, width, height, modal, false);
-    const pad = theme.scaledUi(22.0);
-    const button_h = theme.scaledUi(36.0);
-    const skip_w = theme.scaledUi(104.0);
-    const enable_w = theme.scaledUi(176.0);
-    const button_y = modal.y + modal.h - pad - button_h;
-    queueModalHit(state, .{ .x = modal.x + pad, .y = button_y, .w = skip_w, .h = button_h }, .mcp_onboarding_not_now, 0);
-    queueModalHit(state, .{ .x = modal.x + modal.w - pad - enable_w, .y = button_y, .w = enable_w, .h = button_h }, .mcp_onboarding_enable, 0);
+/// OS cursor over a topmost onboarding dialog; null when none is on top.
+pub fn onboardingSystemCursorAt(state: *runtime.AppState, x: f32, y: f32) ?palette.platform.CursorShape {
+    return onboarding_modal.systemCursorAt(state, x, y);
 }
 
 fn registerWorkspaceAddModalHits(state: *runtime.AppState, width: f32, height: f32) void {
@@ -3630,247 +3435,6 @@ fn registerThreadImportModalHits(state: *runtime.AppState, width: f32, height: f
     const submit_rect: palette.Rect = .{ .x = cancel_rect.x + button_w + gap, .y = button_y, .w = button_w, .h = button_h };
     queueModalHit(state, cancel_rect, .thread_import_cancel, 0);
     queueModalHit(state, submit_rect, .thread_import_submit, 0);
-}
-
-fn renderMcpOnboardingModal(state: *runtime.AppState, width: f32, height: f32) void {
-    if (!state.settings_controller.mcp_onboarding_visible or state.settings_controller.provider_onboarding_visible) return;
-    const modal = mcpOnboardingRect(width, height);
-    drawModalChromeVisual(state, width, height, modal);
-    const pad = theme.scaledUi(22.0);
-    const clip = modal;
-    var y = modal.y + pad;
-
-    queuePaletteText(state, .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(28.0) }, "Make Verde work better with your agents", paletteColor(theme.COLOR_WHITE), theme.scaledUi(22.0), clip);
-    y += theme.scaledUi(36.0);
-    queuePaletteText(state, .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(40.0) }, "Enable Verde's MCP tools for agents you start in terminal panes or use through Verde.", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.5), clip);
-    y += theme.scaledUi(54.0);
-
-    const benefit_h = theme.scaledUi(52.0);
-    const benefit_gap = theme.scaledUi(7.0);
-    renderMcpBenefitRow(state, .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = benefit_h }, "Test apps", "Inspect and interact with Verde's embedded browser.", clip);
-    y += benefit_h + benefit_gap;
-    renderMcpBenefitRow(state, .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = benefit_h }, "Work with processes", "Start configured services and read their logs.", clip);
-    y += benefit_h + benefit_gap;
-    renderMcpBenefitRow(state, .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = benefit_h }, "Understand the workspace", "Use the current Verde workspace and its panes automatically.", clip);
-    const benefits_bottom = y + benefit_h;
-
-    const button_h = theme.scaledUi(36.0);
-    const button_y = modal.y + modal.h - pad - button_h;
-    queuePaletteText(state, .{ .x = modal.x + pad, .y = benefits_bottom + theme.scaledUi(16.0), .w = modal.w - pad * 2.0, .h = theme.scaledUi(28.0) }, "Updates detected providers' user settings and preserves existing servers. Remove it any time in Settings.", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), clip);
-    drawActionButton(state, .{ .x = modal.x + pad, .y = button_y, .w = theme.scaledUi(104.0), .h = button_h }, "Not now", theme.COLOR_PANEL_ALT);
-    drawActionButton(state, .{ .x = modal.x + modal.w - pad - theme.scaledUi(176.0), .y = button_y, .w = theme.scaledUi(176.0), .h = button_h }, "Enable Verde tools", theme.accent());
-}
-
-// Renders one capability included with Verde's MCP server.
-fn renderMcpBenefitRow(state: *runtime.AppState, rect: palette.Rect, title: []const u8, detail: []const u8, clip: palette.Rect) void {
-    queuePaletteRoundedRect(state, rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 105)), theme.scaledUi(9.0));
-    queuePaletteBorder(state, rect, paletteColor(theme.withAlpha(theme.borderMuted(), 90)), theme.scaledUi(9.0), theme.scaledUi(1.0));
-    const text_x = rect.x + theme.scaledUi(14.0);
-    queuePaletteText(state, .{ .x = text_x, .y = rect.y + theme.scaledUi(7.0), .w = rect.w - theme.scaledUi(28.0), .h = theme.scaledUi(18.0) }, title, paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.5), clip);
-    queuePaletteText(state, .{ .x = text_x, .y = rect.y + theme.scaledUi(27.0), .w = rect.w - theme.scaledUi(28.0), .h = theme.scaledUi(17.0) }, detail, paletteColor(theme.raise(theme.COLOR_TEXT_SUBTLE, 0.1)), theme.scaledUi(12.5), clip);
-}
-
-/// Shows the attachment preview modal for the selected image.
-// Renders the first-run provider checklist when no authenticated GUI provider is available.
-fn renderProviderOnboardingModal(state: *runtime.AppState, width: f32, height: f32) void {
-    if (!state.settings_controller.provider_onboarding_visible) return;
-    const modal = providerOnboardingRect(width, height);
-    drawModalChromeVisual(state, width, height, modal);
-    const pad = theme.scaledUi(22.0);
-    const clip = modal;
-    var y = modal.y + pad;
-
-    queuePaletteText(state, .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(28.0) }, "Connect an AI provider", paletteColor(theme.COLOR_WHITE), theme.scaledUi(22.0), clip);
-    y += theme.scaledUi(34.0);
-    queuePaletteText(state, .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(20.0) }, "Verde uses coding-agent accounts already installed on this computer.", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.5), clip);
-    queuePaletteText(state, .{ .x = modal.x + pad, .y = y + theme.scaledUi(20.0), .w = modal.w - pad * 2.0, .h = theme.scaledUi(20.0) }, "Set up any one provider to start chatting. No Verde subscription needed.", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.5), clip);
-    y += theme.scaledUi(52.0);
-
-    const snapshot = state.providerReadinessSnapshot();
-    const layout = providerOnboardingLayout(width, height);
-    const button_h = layout.button_h;
-    const button_y = layout.button_y;
-    if (state.settings_controller.provider_setup.visible()) {
-        renderProviderSetupTerminal(state, modal, layout, snapshot);
-        return;
-    }
-    const scroll_y = theme.clampf(state.settings_controller.provider_onboarding_scroll_y, 0.0, layout.max_scroll_y);
-    state.settings_controller.provider_onboarding_scroll_y = scroll_y;
-    state.settings_controller.provider_onboarding_max_scroll_y = layout.max_scroll_y;
-    for (PROVIDER_ONBOARDING_PROVIDERS, 0..) |provider, index| {
-        const row = providerOnboardingRowRect(layout, index, scroll_y);
-        if (row.y + row.h <= layout.list.y or row.y >= layout.list.y + layout.list.h) continue;
-        renderProviderReadinessRow(state, row, provider, snapshot.forProvider(provider), layout.list);
-    }
-    if (layout.max_scroll_y > 0.0) renderProviderOnboardingScrollbar(state, layout, scroll_y);
-
-    const gap = theme.scaledUi(10.0);
-    const close_w = theme.scaledUi(104.0);
-    const guide_w = theme.scaledUi(156.0);
-    const check_w = theme.scaledUi(126.0);
-    drawActionButton(state, .{ .x = modal.x + pad, .y = button_y, .w = close_w, .h = button_h }, "Not now", theme.COLOR_PANEL_ALT);
-    drawActionButton(state, .{ .x = modal.x + modal.w - pad - check_w - gap - guide_w, .y = button_y, .w = guide_w, .h = button_h }, "Open setup guide", theme.COLOR_PANEL_MUTED);
-    const checking = snapshot.codex == .checking and snapshot.opencode == .checking and snapshot.claude == .checking and snapshot.cursor == .checking and snapshot.pi == .checking and snapshot.fx == .checking and snapshot.grok == .checking;
-    drawActionButton(state, .{ .x = modal.x + modal.w - pad - check_w, .y = button_y, .w = check_w, .h = button_h }, if (checking) "Checking..." else "Check again", theme.accent());
-}
-
-// Inline sign-in / install terminal shown in place of the provider list.
-fn renderProviderSetupTerminal(state: *runtime.AppState, modal: palette.Rect, layout: ProviderOnboardingLayout, snapshot: runtime.ProviderReadinessSnapshot) void {
-    const setup = &state.settings_controller.provider_setup;
-    const dock = setup.dock orelse return;
-    const pad = theme.scaledUi(22.0);
-    const name = providerOnboardingName(setup.provider);
-    const readiness = snapshot.forProvider(setup.provider);
-    var title_buf: [96]u8 = undefined;
-    const title = std.fmt.bufPrint(&title_buf, "{s} {s}", .{ name, if (setup.login) "sign-in" else "install" }) catch name;
-    var status_buf: [160]u8 = undefined;
-    const status: []const u8, const status_color = if (readiness == .ready)
-        .{ std.fmt.bufPrint(&status_buf, "{s} is ready. You can go back or close this dialog.", .{name}) catch "Ready.", theme.success() }
-    else switch (setup.status) {
-        .running => .{ "Follow the steps in the terminal. Verde notices when you finish.", theme.COLOR_TEXT_MUTED },
-        .succeeded => .{ "Finished. Checking your account…", theme.COLOR_TEXT_MUTED },
-        .failed => .{ "The command did not finish. Go back to try again or copy the command.", theme.COLOR_YELLOW },
-        .idle => .{ "", theme.COLOR_TEXT_MUTED },
-    };
-    const header_y = layout.list.y;
-    queuePaletteText(state, .{ .x = layout.list.x, .y = header_y, .w = layout.list.w, .h = theme.scaledUi(20.0) }, title, paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.5), modal);
-    queuePaletteText(state, .{ .x = layout.list.x, .y = header_y + theme.scaledUi(22.0), .w = layout.list.w, .h = theme.scaledUi(18.0) }, status, paletteColor(status_color), theme.scaledUi(12.5), modal);
-    const term_y = header_y + theme.scaledUi(48.0);
-    const term_rect: palette.Rect = .{ .x = layout.list.x, .y = term_y, .w = layout.list.w, .h = @max(layout.list.y + layout.list.h - term_y, theme.scaledUi(80.0)) };
-    terminal_panel.renderStandaloneDock(state, term_rect, dock);
-    queuePaletteBorder(state, term_rect, paletteColor(if (setup.status == .running) theme.accent() else theme.COLOR_PANEL_MUTED), theme.scaledUi(8.0), @max(@round(theme.scaledUi(1.0)), 1.0));
-
-    const close_w = theme.scaledUi(104.0);
-    const check_w = theme.scaledUi(126.0);
-    drawActionButton(state, .{ .x = modal.x + pad, .y = layout.button_y, .w = close_w, .h = layout.button_h }, "Back", theme.COLOR_PANEL_ALT);
-    drawActionButton(state, .{ .x = modal.x + modal.w - pad - check_w, .y = layout.button_y, .w = check_w, .h = layout.button_h }, "Check again", theme.accent());
-}
-
-fn providerOnboardingName(provider: runtime.Provider) []const u8 {
-    return switch (provider) {
-        .codex => "Codex",
-        .opencode => "OpenCode",
-        .claude => "Claude Code",
-        .cursor => "Cursor",
-        .pi => "Pi",
-        .fx => "FX",
-        .grok => "Grok",
-        .muse => "Muse",
-        .custom_acp => "Custom ACP agents",
-    };
-}
-
-// Thin thumb on the list's right edge so it reads as scrollable.
-fn renderProviderOnboardingScrollbar(state: *runtime.AppState, layout: ProviderOnboardingLayout, scroll_y: f32) void {
-    const track_h = layout.list.h;
-    const content_h = track_h + layout.max_scroll_y;
-    const thumb_h = @max(track_h * track_h / content_h, theme.scaledUi(24.0));
-    const thumb_y = layout.list.y + (track_h - thumb_h) * (scroll_y / layout.max_scroll_y);
-    const w = theme.scaledUi(4.0);
-    queuePaletteRoundedRect(state, .{ .x = layout.list.x + layout.list.w + theme.scaledUi(7.0), .y = thumb_y, .w = w, .h = thumb_h }, paletteColor(theme.withAlpha(theme.COLOR_TEXT_SUBTLE, 120)), w * 0.5);
-}
-
-// Renders one provider's executable/auth status and its shortest recovery step.
-fn renderProviderReadinessRow(state: *runtime.AppState, rect: palette.Rect, provider: runtime.Provider, readiness: runtime.ProviderReadiness, clip: palette.Rect) void {
-    // `clip` is the scrolling list band: backgrounds are intersected with it
-    // and the border/dot (no clip support) only draw when fully inside.
-    const fully_visible = rect.y >= clip.y and rect.y + rect.h <= clip.y + clip.h;
-    if (fully_visible) {
-        // One panel command per bordered surface (Palette crisp-chrome rules).
-        state.palette_overlay_batch.panel(state.allocator, snapPixelRect(rect), paletteColor(theme.sink(theme.COLOR_PANEL_ALT, 0.025)), paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 190)), theme.scaledUi(9.0), @max(@round(theme.scaledUi(1.0)), 1.0)) catch {};
-    } else {
-        queuePaletteRoundedRect(state, rectIntersection(rect, clip), paletteColor(theme.sink(theme.COLOR_PANEL_ALT, 0.025)), theme.scaledUi(9.0));
-    }
-
-    const dot_color = switch (readiness) {
-        .ready => theme.success(),
-        .signed_out => theme.COLOR_YELLOW,
-        .missing => theme.COLOR_DIFF_REMOVE,
-        .checking => theme.COLOR_TEXT_MUTED,
-        .unavailable => theme.COLOR_YELLOW,
-    };
-    const title = providerOnboardingName(provider);
-    const status = switch (readiness) {
-        .checking => "Checking...",
-        .missing => "CLI not found",
-        .signed_out => "Sign-in needed",
-        .ready => "Ready",
-        .unavailable => "Could not verify",
-    };
-    const note = state.settings_controller.provider_setup.note(provider);
-    const step = if (readiness == .ready or readiness == .checking) providerReadinessStep(provider, readiness) else switch (note) {
-        .finished => "Finished. Checking your account…",
-        .failed => "That did not finish. Try again, or run the command yourself.",
-        .copied => "Copied. Run it in any terminal; this row updates on its own.",
-        .none => providerReadinessStep(provider, readiness),
-    };
-    const command: ?[]const u8 = if (readiness != .ready and readiness != .checking) provider_setup.command(provider, readiness == .missing) else null;
-    // Rows without a command line center their two text lines vertically.
-    const top = if (command != null) theme.scaledUi(10.0) else (rect.h - theme.scaledUi(40.0)) * 0.5;
-
-    const dot = theme.scaledUi(8.0);
-    const dot_rect: palette.Rect = .{ .x = rect.x + theme.scaledUi(14.0), .y = rect.y + top + (theme.scaledUi(20.0) - dot) * 0.5, .w = dot, .h = dot };
-    if (dot_rect.y >= clip.y and dot_rect.y + dot_rect.h <= clip.y + clip.h) queuePaletteRoundedRect(state, dot_rect, paletteColor(dot_color), dot * 0.5);
-
-    const text_x = rect.x + theme.scaledUi(PROVIDER_ONBOARDING_TEXT_INSET);
-    const action_label = providerOnboardingActionLabel(readiness);
-    const action_rect = providerOnboardingActionRect(rect);
-    // Text stops short of the action button when one shows.
-    const right_edge = if (action_label != null) action_rect.x - theme.scaledUi(12.0) else rect.x + rect.w - theme.scaledUi(12.0);
-    // Status sits right after the title so every row reads "Name · status"
-    // in the same place, regardless of whether an action button shows.
-    const title_size = theme.scaledUi(14.5);
-    const title_w = @min(runtime.paletteUiTextPrefixWidth(title, title_size, title.len), @max(right_edge - text_x, 0.0));
-    queuePaletteText(state, .{ .x = text_x, .y = rect.y + top, .w = title_w + theme.scaledUi(2.0), .h = theme.scaledUi(20.0) }, title, paletteColor(theme.COLOR_WHITE), title_size, clip);
-    const status_x = text_x + title_w + theme.scaledUi(10.0);
-    queuePaletteText(state, .{ .x = status_x, .y = rect.y + top + theme.scaledUi(1.5), .w = @max(right_edge - status_x, 0.0), .h = theme.scaledUi(18.0) }, status, paletteColor(dot_color), theme.scaledUi(12.0), clip);
-    queuePaletteText(state, .{ .x = text_x, .y = rect.y + top + theme.scaledUi(21.0), .w = @max(right_edge - text_x, 0.0), .h = theme.scaledUi(18.0) }, step, paletteColor(if (note == .failed and readiness != .ready) theme.COLOR_YELLOW else theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), clip);
-    // The exact command in a pill with an inline Copy control, so it can be
-    // run anywhere.
-    if (command) |cmd| {
-        const pill = providerOnboardingCommandRect(rect, cmd);
-        const copy_rect = providerOnboardingCopyRect(rect, cmd);
-        const pill_visible = pill.y >= clip.y and pill.y + pill.h <= clip.y + clip.h;
-        const stroke = @max(@round(theme.scaledUi(1.0)), 1.0);
-        if (pill_visible) {
-            state.palette_overlay_batch.panel(state.allocator, snapPixelRect(pill), paletteColor(theme.sink(theme.COLOR_PANEL_ALT, 0.06)), paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 160)), theme.scaledUi(6.0), stroke) catch {};
-        }
-        var command_buf: [600]u8 = undefined;
-        const shown = std.fmt.bufPrint(&command_buf, "$ {s}", .{cmd}) catch cmd;
-        const size = theme.scaledUi(PROVIDER_ONBOARDING_COMMAND_SIZE);
-        const text_rect: palette.Rect = .{ .x = pill.x + theme.scaledUi(10.0), .y = pill.y, .w = @max(copy_rect.x - theme.scaledUi(8.0) - pill.x - theme.scaledUi(10.0), 0.0), .h = pill.h };
-        queuePaletteText(state, .{ .x = text_rect.x, .y = pill.y + (pill.h - size * 1.25) * 0.5, .w = text_rect.w, .h = size * 1.25 }, shown, paletteColor(theme.COLOR_TEXT_MUTED), size, rectIntersection(text_rect, clip));
-        if (pill_visible) {
-            const hovered = pointInRect(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y, copy_rect);
-            // The copied row's control turns accent so it's obvious which
-            // command is on the clipboard.
-            const copied = note == .copied;
-            const fill = if (copied) theme.withAlpha(theme.accent(), 60) else theme.raise(theme.COLOR_PANEL_ALT, if (hovered) 0.12 else 0.05);
-            const border = if (copied) theme.accent() else theme.COLOR_PANEL_MUTED;
-            state.palette_overlay_batch.panel(state.allocator, snapPixelRect(copy_rect), paletteColor(fill), paletteColor(border), theme.scaledUi(4.0), stroke) catch {};
-            const label = if (copied) "✓ Copied" else "Copy";
-            const label_w = runtime.paletteUiTextPrefixWidth(label, size, label.len);
-            const label_color = if (copied) theme.accent() else if (hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED;
-            queuePaletteText(state, .{ .x = copy_rect.x + (copy_rect.w - label_w) * 0.5, .y = copy_rect.y + (copy_rect.h - size * 1.25) * 0.5, .w = label_w + theme.scaledUi(2.0), .h = size * 1.25 }, label, paletteColor(label_color), size, clip);
-        }
-    }
-    // drawActionButton has no clip, so only draw it fully inside the band.
-    if (action_label) |label| {
-        if (action_rect.y >= clip.y and action_rect.y + action_rect.h <= clip.y + clip.h) {
-            drawActionButton(state, action_rect, label, if (readiness == .missing) theme.COLOR_PANEL_MUTED else theme.accent());
-        }
-    }
-}
-
-fn providerReadinessStep(provider: runtime.Provider, readiness: runtime.ProviderReadiness) []const u8 {
-    _ = provider;
-    return switch (readiness) {
-        .ready => "Installed and signed in. Pick it from the model menu in any chat.",
-        .checking => "Checking the local CLI and account session...",
-        .missing => "Not installed. Install runs the official installer below.",
-        .signed_out => "Installed, not signed in. Sign in opens the login right here.",
-        .unavailable => "Installed, but sign-in could not be confirmed. Sign in to fix it.",
-    };
 }
 
 // Renders the full-size image preview modal over the workspace.

@@ -1928,6 +1928,10 @@ const ChatTurn = struct {
     title_thread: ?std.Thread = null,
     /// Asks the prompt-only title worker to abandon its provider run.
     title_stop: bool = false,
+    /// Armed at acceptance; the prompt-only title starts on the provider's
+    /// first output, so a send that fails before producing any (signed out,
+    /// no model route) never spends a second provider session on a title.
+    title_armed: bool = false,
     error_message: ?[]u8 = null,
     failure_reason: ?ProviderFailureReason = null,
     pending_approval: ?PendingApproval = null,
@@ -2176,17 +2180,72 @@ fn nativeProviderLoginCommand(provider: provider_models.Provider) []const []cons
     return headless.provider_install.loginArgv(protocolProvider(provider));
 }
 
+/// Installed means Verde can run it. Claude also needs Node.js: Verde drives
+/// it through `node provider_bridge.mjs` (the Claude Agent SDK); see
+/// `nativeProviderMissingRequirement` for the distinct "needs Node" state.
 fn nativeProviderInstalled(provider: provider_models.Provider) bool {
     return switch (provider) {
         .codex => process_env.commandExists("codex"),
         .claude => process_env.commandExists("node") and process_env.commandExists("claude"),
-        .cursor => process_env.commandExists("agent") or process_env.commandExists("cursor-agent"),
+        .cursor => provider_cli_version.executableForProvider("cursor") != null,
         .opencode => process_env.commandExists("opencode"),
         .pi => process_env.commandExists("pi"),
         .fx => process_env.commandExists("fx"),
         .grok => process_env.commandExists("grok"),
         .muse => process_env.commandExists("muse"),
         .custom_acp => customAcpAgentInstalled(),
+    };
+}
+
+/// A runtime the provider's own CLI is present without. The official Claude
+/// installer ships a native binary and no Node.js.
+fn nativeProviderMissingRequirement(provider: provider_models.Provider) ?headless.providers_protocol.MissingRequirement {
+    return switch (provider) {
+        .claude => if (process_env.commandExists("claude") and !process_env.commandExists("node")) .node else null,
+        else => null,
+    };
+}
+
+/// At most one auth probe per provider runs at a time. The GUI re-polls
+/// readiness every few seconds and abandons slow replies, so probes of a
+/// wedged CLI used to pile up; a request arriving mid-probe now gets the last
+/// finished answer instead of launching another.
+const ProviderAuthProbeSlot = struct {
+    busy: std.atomic.Value(bool) = .init(false),
+    last: std.atomic.Value(harness.AuthState) = .init(.unknown),
+};
+var provider_auth_probe_slots = std.EnumArray(harness.Provider, ProviderAuthProbeSlot).initFill(.{});
+
+fn probeProviderAuthOnce(allocator: std.mem.Allocator, provider: harness.Provider, project_path: []const u8) harness.AuthState {
+    const slot = provider_auth_probe_slots.getPtr(provider);
+    if (slot.busy.swap(true, .acq_rel)) return slot.last.load(.acquire);
+    defer slot.busy.store(false, .release);
+    const state = probeProviderAuth(allocator, provider, project_path);
+    slot.last.store(state, .release);
+    return state;
+}
+
+// Provider handshakes never intentionally launch a missing long-lived server;
+// each provider bounds its own probe (CLI deadlines, ACP probe watchdogs).
+fn probeProviderAuth(allocator: std.mem.Allocator, provider: harness.Provider, project_path: []const u8) harness.AuthState {
+    var auth_state: harness.AuthState = .unknown;
+    if (send_runner.connectProvider(allocator, provider, project_path, false)) |client_value| {
+        var provider_client = client_value;
+        defer provider_client.deinit();
+        auth_state = provider_client.authState() catch .unknown;
+    } else |_| {}
+    if (auth_state != .unknown) return auth_state;
+    // Codex and OpenCode answer only through a running server, which
+    // readiness probes never start; ask their CLIs' local login record.
+    const offline: provider_offline_auth.State = switch (provider) {
+        .codex => provider_offline_auth.codex(allocator),
+        .opencode => provider_offline_auth.opencode(allocator),
+        else => .unknown,
+    };
+    return switch (offline) {
+        .signed_in => .signed_in,
+        .signed_out => .signed_out,
+        .unknown => .unknown,
     };
 }
 
@@ -2233,7 +2292,7 @@ fn nativeProviderVersionExecutable(provider: provider_models.Provider) ?[]const 
     return switch (provider) {
         .codex => if (process_env.commandExists("codex")) "codex" else null,
         .claude => if (process_env.commandExists("claude")) "claude" else null,
-        .cursor => if (process_env.commandExists("cursor-agent")) "cursor-agent" else if (process_env.commandExists("agent")) "agent" else null,
+        .cursor => provider_cli_version.executableForProvider("cursor"),
         .opencode => if (process_env.commandExists("opencode")) "opencode" else null,
         .pi => if (process_env.commandExists("pi")) "pi" else null,
         .fx => if (process_env.commandExists("fx")) "fx" else null,
@@ -6839,7 +6898,8 @@ pub const Daemon = struct {
         touchAttachFromParams(session, params);
         const text = jsonString(params.object.get("text") orelse .null) orelse "";
         const wrote = try session.writeInput(text);
-        log.info(
+        // Per keystroke: debug only, and never the input text itself.
+        log.debug(
             "write id_len={d} pid={d} pgrp={?d} input_bytes={d}",
             .{ session.session_id.len, session.child_pid, session.foregroundProcessGroup(), text.len },
         );
@@ -8648,39 +8708,23 @@ pub const Daemon = struct {
         const request = parsed.value;
         const provider: harness.Provider = request.provider;
         const installed = nativeProviderInstalled(nativeProviderFromHarness(provider));
+        const missing_requirement = if (installed) null else nativeProviderMissingRequirement(nativeProviderFromHarness(provider));
         var version_buf: [48]u8 = undefined;
-        const version = if (installed) blk: {
+        const version = if (installed or missing_requirement != null) blk: {
             const executable = nativeProviderVersionExecutable(nativeProviderFromHarness(provider)) orelse break :blk null;
             break :blk provider_cli_version.probe(self.allocator, executable, &version_buf);
         } else null;
-        var auth_state: harness.AuthState = .unknown;
-        if (installed) {
-            if (send_runner.connectProvider(self.allocator, provider, request.project_path, false)) |client_value| {
-                var provider_client = client_value;
-                defer provider_client.deinit();
-                auth_state = provider_client.authState() catch .unknown;
-            } else |_| {}
-            // Codex and OpenCode answer only through a running server, which
-            // readiness probes never start; ask their CLIs' local login record.
-            if (auth_state == .unknown) {
-                const offline: provider_offline_auth.State = switch (provider) {
-                    .codex => provider_offline_auth.codex(self.allocator),
-                    .opencode => provider_offline_auth.opencode(self.allocator),
-                    else => .unknown,
-                };
-                auth_state = switch (offline) {
-                    .signed_in => .signed_in,
-                    .signed_out => .signed_out,
-                    .unknown => .unknown,
-                };
-            }
-        }
+        const auth_state: harness.AuthState = if (installed)
+            probeProviderAuthOnce(self.allocator, provider, request.project_path)
+        else
+            .unknown;
         return try okValueResponse(self.allocator, id_value, headless.providers_protocol.AuthStatusResult{
             .provider = request.provider,
             .installed = installed,
             .auth_state = auth_state,
             .ready = installed and auth_state == .signed_in,
             .version = version,
+            .missing_requirement = missing_requirement,
         });
     }
 
@@ -9186,7 +9230,19 @@ pub const Daemon = struct {
             return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid provider title request");
         defer parsed.deinit();
         const request = parsed.value;
-        switch (request.provider) {
+        const route = resolveChatTitleRoute(
+            self.allocator,
+            request.provider,
+            request.model_ref,
+            request.chat_provider,
+            request.chat_model_ref,
+            titleProviderSignedIn,
+        ) orelse return try providerTitleFailureResponse(
+            self.allocator,
+            id_value,
+            "No signed-in provider is available to title this chat.",
+        );
+        switch (route.provider) {
             .codex, .claude, .cursor, .opencode => {},
             .pi, .fx, .grok, .muse, .custom_acp => return try providerTitleFailureResponse(self.allocator, id_value, "UnsupportedTitleProvider"),
         }
@@ -9202,15 +9258,15 @@ pub const Daemon = struct {
         defer self.allocator.free(prompt);
 
         const send_result = send_runner.run(self.allocator, .{
-            .provider = request.provider,
+            .provider = route.provider,
             .harness_kind = .local_cli,
             .project_path = request.cwd,
             .cwd = request.cwd,
             .prompt = prompt,
-            .model_ref = request.model_ref,
-            .reasoning_effort = request.reasoning_effort,
-            .opencode_reasoning_variant = request.reasoning_variant,
-            .fast_mode = if (request.fast) .on else .off,
+            .model_ref = route.model_ref,
+            .reasoning_effort = if (route.configured) request.reasoning_effort else null,
+            .opencode_reasoning_variant = if (route.configured) request.reasoning_variant else null,
+            .fast_mode = if (request.fast and route.provider == .codex) .on else .off,
             .access_mode = switch (request.access_mode) {
                 .supervised => .supervised,
                 .full_access => .full_access,
@@ -18853,6 +18909,80 @@ fn chatTitleProvider(provider: app_config.ChatTitleProvider) harness.Provider {
     };
 }
 
+const ChatTitleRoute = struct {
+    provider: harness.Provider,
+    model_ref: ?[]const u8,
+    /// False when titling fell back to the chat's own provider, whose model
+    /// and reasoning settings differ from the configured title provider's.
+    configured: bool,
+};
+
+fn titleCapableProvider(provider: harness.Provider) bool {
+    return switch (provider) {
+        .codex, .claude, .cursor, .opencode => true,
+        .pi, .fx, .grok, .muse, .custom_acp => false,
+    };
+}
+
+/// Pick who titles a chat. The configured title provider (Codex by default)
+/// only receives the opening prompt when it is the chat's own provider or is
+/// signed in; otherwise titling falls back to the chat's provider and model,
+/// so chat content never reaches a provider the user has not set up. Null
+/// skips AI titling and keeps the prompt-derived title.
+fn resolveChatTitleRoute(
+    allocator: std.mem.Allocator,
+    configured_provider: harness.Provider,
+    configured_model: ?[]const u8,
+    chat_provider: ?harness.Provider,
+    chat_model: ?[]const u8,
+    signed_in: *const fn (std.mem.Allocator, harness.Provider) bool,
+) ?ChatTitleRoute {
+    const configured: ChatTitleRoute = .{ .provider = configured_provider, .model_ref = configured_model, .configured = true };
+    if (chat_provider) |chat| if (chat == configured_provider) return configured;
+    if (titleCapableProvider(configured_provider) and signed_in(allocator, configured_provider)) return configured;
+    const own = chat_provider orelse return null;
+    if (!titleCapableProvider(own)) return null;
+    return .{ .provider = own, .model_ref = chat_model, .configured = false };
+}
+
+/// Local, server-free sign-in evidence for a title provider. Claude and
+/// Cursor are never the default and have no offline auth record, so an
+/// explicit choice of either only needs the CLI to exist.
+fn titleProviderSignedIn(allocator: std.mem.Allocator, provider: harness.Provider) bool {
+    return switch (provider) {
+        .codex => process_env.commandExists("codex") and provider_offline_auth.codex(allocator) == .signed_in,
+        .opencode => process_env.commandExists("opencode") and provider_offline_auth.opencode(allocator) == .signed_in,
+        .claude, .cursor => nativeProviderInstalled(nativeProviderFromHarness(provider)),
+        .pi, .fx, .grok, .muse, .custom_acp => false,
+    };
+}
+
+test "chat titles never route to a configured provider that is not signed in" {
+    const Probe = struct {
+        fn none(_: std.mem.Allocator, _: harness.Provider) bool {
+            return false;
+        }
+        fn codexOnly(_: std.mem.Allocator, provider: harness.Provider) bool {
+            return provider == .codex;
+        }
+    };
+    const a = std.testing.allocator;
+    // Signed-out Codex default + OpenCode chat: title with the chat's own provider/model.
+    const fallback = resolveChatTitleRoute(a, .codex, "gpt-mini", .opencode, "opencode/big-pickle", Probe.none).?;
+    try std.testing.expectEqual(harness.Provider.opencode, fallback.provider);
+    try std.testing.expectEqualStrings("opencode/big-pickle", fallback.model_ref.?);
+    try std.testing.expect(!fallback.configured);
+    // A signed-in configured provider keeps the user's title settings.
+    const configured = resolveChatTitleRoute(a, .codex, "gpt-mini", .opencode, null, Probe.codexOnly).?;
+    try std.testing.expectEqual(harness.Provider.codex, configured.provider);
+    try std.testing.expect(configured.configured);
+    // The chat's own provider needs no extra sign-in evidence.
+    try std.testing.expect(resolveChatTitleRoute(a, .codex, "gpt-mini", .codex, null, Probe.none).?.configured);
+    // Providers without a title harness, or no chat context, skip AI titling.
+    try std.testing.expect(resolveChatTitleRoute(a, .codex, "gpt-mini", .pi, null, Probe.none) == null);
+    try std.testing.expect(resolveChatTitleRoute(a, .codex, "gpt-mini", null, null, Probe.none) == null);
+}
+
 fn boundedTitleUtf8Prefix(value: []const u8, max_len: usize) []const u8 {
     var end = @min(value.len, max_len);
     while (end > 0 and !std.unicode.utf8ValidateSlice(value[0..end])) end -= 1;
@@ -18903,6 +19033,7 @@ fn providerFailureReasonForError(
         },
         error.ProviderBridgeNotFound => if (provider == .claude) .provider_unavailable else null,
         error.OpencodeServerUnavailable => if (provider == .opencode) .provider_unavailable else null,
+        error.OpencodeSignedOut => if (provider == .opencode) .provider_not_authenticated else null,
         // FileNotFound is intentionally unknown here: it can identify the
         // executable, working directory, an attachment, or provider state.
         // The remote acceptance preflight performs the unambiguous executable
@@ -19005,14 +19136,25 @@ fn generateAutomaticChatTurnTitle(
     };
     defer allocator.free(title_prompt);
 
-    const provider = chatTitleProvider(config.chat_title_provider);
+    const route = resolveChatTitleRoute(
+        allocator,
+        chatTitleProvider(config.chat_title_provider),
+        config.chatTitleModel(),
+        turn.request.provider,
+        turn.request.model_ref,
+        titleProviderSignedIn,
+    ) orelse {
+        log.info("automatic chat title skipped: no signed-in title provider for chat provider={s}", .{@tagName(turn.request.provider)});
+        return null;
+    };
+    const provider = route.provider;
     const result = send_runner.run(allocator, .{
         .provider = provider,
         .harness_kind = .local_cli,
         .project_path = turn.request.project_path,
         .cwd = turn.request.cwd,
         .prompt = title_prompt,
-        .model_ref = config.chatTitleModel(),
+        .model_ref = route.model_ref,
         .fast_mode = if (provider == .codex) .on else .off,
         .access_mode = .supervised,
     }, sink) catch |err| {
@@ -19033,20 +19175,36 @@ fn generateAutomaticChatTurnTitle(
     return .{ .title = generated_title, .description = description };
 }
 
-/// Start the prompt-only title beside the provider turn. Only opening turns
-/// whose requested title is still the fallback qualify; the worker rechecks
-/// config and the durable guard off the turn thread.
-fn startInFlightAutomaticChatTurnTitle(daemon: *Daemon, turn: *ChatTurn) void {
+/// Arm the prompt-only title for this turn. It starts on the provider's
+/// first streamed output (see `startArmedInFlightAutomaticChatTurnTitle`).
+fn armInFlightAutomaticChatTurnTitle(turn: *ChatTurn) void {
+    lockTurn(turn);
+    turn.title_armed = true;
+    turn.mutex.unlock();
+}
+
+/// Start the armed prompt-only title beside the provider turn once the
+/// provider has produced output, which proves the turn actually runs. Only
+/// opening turns whose requested title is still the fallback qualify; the
+/// worker rechecks config and the durable guard off the turn thread. Spawned
+/// under the turn lock so `stopInFlightTitleWorker` either sees the thread
+/// or prevents it from starting. Caller must not hold the turn lock.
+fn startArmedInFlightAutomaticChatTurnTitle(turn: *ChatTurn) void {
+    const daemon = turn.daemon orelse return;
+    lockTurn(turn);
+    defer turn.mutex.unlock();
+    if (!turn.title_armed) return;
+    turn.title_armed = false;
+    if (turn.title_stop or turn.title_thread != null or turn.cancel_requested) return;
+    // A finished turn titles itself through the completion path.
+    if (turn.status == .completed or turn.status == .failed or turn.status == .aborted) return;
     var fallback: ?[:0]const u8 = null;
     defer if (fallback) |value| daemon.allocator.free(value);
     if (automaticChatTurnExpectedTitle(daemon.allocator, turn, &fallback) == null) return;
-    const thread = std.Thread.spawn(.{}, inFlightAutomaticChatTurnTitleThread, .{ daemon, turn }) catch |err| {
+    turn.title_thread = std.Thread.spawn(.{}, inFlightAutomaticChatTurnTitleThread, .{ daemon, turn }) catch |err| {
         log.warn("automatic chat title worker spawn failed turn_id={s} err={s}", .{ turn.turn_id, @errorName(err) });
         return;
     };
-    lockTurn(turn);
-    turn.title_thread = thread;
-    turn.mutex.unlock();
 }
 
 /// Stop and join the prompt-only title worker. Completion joins it before
@@ -19268,8 +19426,10 @@ fn chatTurnThread(daemon: *Daemon, turn: *ChatTurn) void {
     }
     if (turn.provider_invocation_count) |count| count.* += 1;
     // The opening prompt is durable now, so its title can be generated while
-    // the provider streams instead of after the turn completes.
-    if (!turn.use_stub) startInFlightAutomaticChatTurnTitle(daemon, turn);
+    // the provider streams instead of after the turn completes. It waits for
+    // the first provider output: a send that fails up front must not start a
+    // second provider session just to title the chat.
+    if (!turn.use_stub) armInFlightAutomaticChatTurnTitle(turn);
     if (!turn.use_stub) gitChangesBeginTurn(daemon, turn);
     // NIT-3: use_stub already folded the env at creation; do not re-eval.
     if (turn.use_stub) {
@@ -19866,6 +20026,8 @@ fn chatSinkTurnId(context: ?*anyopaque, turn_id: []const u8) void {
 
 fn chatSinkDelta(context: ?*anyopaque, delta: []const u8) void {
     const turn = chatTurnFromContext(context) orelse return;
+    // Streamed text proves the provider accepted the turn.
+    startArmedInFlightAutomaticChatTurnTitle(turn);
     const allocator = turn.allocator;
     lockTurn(turn);
     defer turn.mutex.unlock();
@@ -19963,6 +20125,9 @@ fn captureChildToolValue(daemon: *Daemon, turn: *ChatTurn, value: std.json.Value
 
 fn chatSinkEvent(context: ?*anyopaque, event: harness.StreamEvent) void {
     const turn = chatTurnFromContext(context) orelse return;
+    // A tool call proves the provider accepted the turn; plain messages may
+    // be retry or failure notices, so they do not start the title.
+    if (event == .tool_call) startArmedInFlightAutomaticChatTurnTitle(turn);
     if (turn.daemon) |daemon| switch (event) {
         .tool_call => |tool| if (tool.kind == .mcp and tool.status == .completed) {
             if (tool.output) |raw| captureChildToolResult(daemon, turn, raw, 0) catch |err| log.warn("child link capture failed: {s}", .{@errorName(err)});
@@ -22838,6 +23003,32 @@ test "bounded transcript tail keeps the newest rows and never drops the last" {
     try std.testing.expectEqual(@as(usize, 2), oversized[0].sort_index);
     try std.testing.expectEqual(@as(usize, 3), boundedTranscriptTail(&rows, std.math.maxInt(usize)).len);
     try std.testing.expectEqual(@as(usize, 0), boundedTranscriptTail(&.{}, 16).len);
+}
+
+test "in-flight chat title waits for provider output and never starts for a failed send" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    // A send that fails before any output (signed out, no model route) keeps
+    // its title armed but unstarted; late output cannot start it either.
+    const failed = try appendTestChatTurn(&daemon, allocator, "title-failed", "title-ws", "/tmp/title", "hello", "hello", .running, 10);
+    failed.daemon = &daemon;
+    armInFlightAutomaticChatTurnTitle(failed);
+    try std.testing.expect(failed.title_armed);
+    try std.testing.expect(failed.title_thread == null);
+    failed.status = .failed;
+    chatSinkEvent(failed, .{ .tool_call = .{ .call_id = "call-1", .title = "Read" } });
+    try std.testing.expect(!failed.title_armed);
+    try std.testing.expect(failed.title_thread == null);
+
+    // A stopped title (completion already settled it) never restarts.
+    const settled = try appendTestChatTurn(&daemon, allocator, "title-settled", "title-ws", "/tmp/title", "hello", "hello", .running, 10);
+    settled.daemon = &daemon;
+    armInFlightAutomaticChatTurnTitle(settled);
+    stopInFlightTitleWorker(settled);
+    chatSinkDelta(settled, "late text");
+    try std.testing.expect(!settled.title_armed);
+    try std.testing.expect(settled.title_thread == null);
 }
 
 test "answer-ready is durable and consumable while the provider worker still drains" {

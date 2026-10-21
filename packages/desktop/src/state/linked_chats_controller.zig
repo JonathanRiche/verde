@@ -64,8 +64,8 @@ pub const Status = enum {
         return self == .running or self == .waiting_approval or self == .blocked;
     }
 
-    /// Sort rank: what the user must act on first floats to the top.
-    fn rank(self: Status) u8 {
+    /// Urgency rank (lower is more urgent); tints the collapsed rail badge.
+    pub fn rank(self: Status) u8 {
         return switch (self) {
             .waiting_approval, .blocked => 0,
             .running => 1,
@@ -466,10 +466,9 @@ fn firstLine(text: []const u8) []const u8 {
 }
 
 fn entryLessThan(_: void, left: Entry, right: Entry) bool {
+    // Parents stay on top; children list most recent activity first so the
+    // agent the user just heard from is always the first row.
     if (left.is_parent != right.is_parent) return left.is_parent;
-    const left_rank = left.status.rank();
-    const right_rank = right.status.rank();
-    if (left_rank != right_rank) return left_rank < right_rank;
     if (left.updated_at_ms != right.updated_at_ms) return left.updated_at_ms > right.updated_at_ms;
     return std.mem.lessThan(u8, left.link_id, right.link_id);
 }
@@ -584,7 +583,7 @@ fn jobWorkerMain(job: *Job) void {
     };
 }
 
-test "linked chat list results decode, filter hidden rows, and sort by urgency" {
+test "linked chat list results decode, filter hidden rows, and sort by recent activity" {
     const allocator = std.testing.allocator;
     var parent: Parent = .{
         .workspace_id = try allocator.dupe(u8, "ws"),
@@ -601,9 +600,9 @@ test "linked chat list results decode, filter hidden rows, and sort by urgency" 
     ;
     try std.testing.expect(applyListResult(allocator, &parent, json));
     try std.testing.expectEqual(@as(usize, 3), parent.entries.items.len);
-    try std.testing.expectEqualStrings("b", parent.entries.items[0].link_id);
-    try std.testing.expectEqualStrings("a", parent.entries.items[1].link_id);
-    try std.testing.expectEqualStrings("ok", parent.entries.items[1].summary);
+    try std.testing.expectEqualStrings("a", parent.entries.items[0].link_id);
+    try std.testing.expectEqualStrings("ok", parent.entries.items[0].summary);
+    try std.testing.expectEqualStrings("b", parent.entries.items[1].link_id);
     try std.testing.expectEqualStrings("Untitled chat", parent.entries.items[2].title);
     try std.testing.expectEqualStrings("future_state", parent.entries.items[2].statusLabel());
     try std.testing.expect(parent.hasActive());

@@ -8,6 +8,7 @@ const browser_arguments = @import("browser_arguments.zig");
 const completion = @import("completion.zig");
 const output = @import("output.zig");
 const runtime_profiles_cli = @import("runtime_profiles.zig");
+const lease_run = @import("lease_run.zig");
 const workspace_process_poll = @import("workspace_process_poll.zig");
 const herdr = @import("../workspace/herdr.zig");
 const platform_ipc = @import("../platform/ipc.zig");
@@ -73,7 +74,7 @@ fn dispatchArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []const 
         try printHelp(out);
         return .handled;
     }
-    if (std.mem.eql(u8, parsed.command, "version")) {
+    if (std.mem.eql(u8, parsed.command, "version") or std.mem.eql(u8, parsed.command, "--version")) {
         try printVersion(allocator, out, parsed.json);
         return .handled;
     }
@@ -150,6 +151,13 @@ fn dispatchArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []const 
         try handleMcpCommand(allocator, out, io, parsed.rest);
         return .handled;
     }
+    if (std.mem.eql(u8, parsed.command, "lease")) {
+        if (parsed.rest.len == 0 or !std.mem.eql(u8, parsed.rest[0], "run")) {
+            try out.stderr("{s}", .{lease_run.usage});
+            std.process.exit(2);
+        }
+        std.process.exit(try lease_run.run(allocator, io, out, parsed.rest[1..]));
+    }
 
     try out.stderr("unknown verde command: {s}\n\n", .{parsed.command});
     try printHelp(out);
@@ -205,6 +213,8 @@ fn printHelp(out: output.Output) !void {
         \\  verde core <command>          Query the session daemon headless core
         \\  verde schedule <command>      Manage scheduled tasks (prompts sent later or on a repeat)
         \\  verde live <command>          Talk to the running app
+        \\  verde lease run -- <command>  Run a build/install under a workspace lease: waits in line,
+        \\                                reuses an identical run on unchanged sources, releases on exit
         \\  verde mcp                     Run the stdio MCP bridge
         \\  verde mcp stats               Summarize MCP calls and failures by client
         \\  verde mcp errors              Show all retained MCP failure records
@@ -1124,6 +1134,7 @@ fn handleHerdrOpen(
             // about Herdr. Queue the cold-start request instead of dead-ending.
         } else {
             try out.stdout("{s}\n", .{response});
+            exitIfResponseFailed(response);
             return;
         }
     } else |_| {}
@@ -1268,6 +1279,7 @@ fn handleHerdrHandoff(allocator: std.mem.Allocator, out: output.Output, io: std.
             std.process.exit(1);
         }
         try out.stdout("{s}\n", .{response});
+        exitIfResponseFailed(response);
         _ = json;
         return;
     } else |err| {
@@ -1298,6 +1310,7 @@ fn handleHerdrUnlink(allocator: std.mem.Allocator, out: output.Output, io: std.I
             std.process.exit(1);
         }
         try out.stdout("{s}\n", .{response});
+        exitIfResponseFailed(response);
         _ = json;
         return;
     } else |err| {
@@ -1362,6 +1375,7 @@ fn handleHerdrStatus(allocator: std.mem.Allocator, out: output.Output, io: std.I
         defer allocator.free(response);
         if (!liveResponseErrorCodeEquals(allocator, response, "method_not_found")) {
             try out.stdout("{s}\n", .{response});
+            exitIfResponseFailed(response);
             return;
         }
     } else |_| {}
@@ -1723,6 +1737,7 @@ fn handleSession(allocator: std.mem.Allocator, out: output.Output, io: std.Io, e
         if (sendSessionRequestAlloc(allocator, io, "session.list", .{}, 1)) |response| {
             defer allocator.free(response);
             try out.stdout("{s}\n", .{response});
+            exitIfResponseFailed(response);
             return;
         } else |_| {}
     }
@@ -1735,6 +1750,7 @@ fn handleSession(allocator: std.mem.Allocator, out: output.Output, io: std.Io, e
         if (sendSessionRequestAlloc(allocator, io, "session.inspect", .{ .id = wanted_id }, 1)) |response| {
             defer allocator.free(response);
             try out.stdout("{s}\n", .{response});
+            exitIfResponseFailed(response);
             return;
         } else |_| {}
     }
@@ -1849,6 +1865,7 @@ fn handleSession(allocator: std.mem.Allocator, out: output.Output, io: std.Io, e
         }, 1);
         defer allocator.free(response);
         try out.stdout("{s}\n", .{response});
+        exitIfResponseFailed(response);
         return;
     }
 
@@ -1867,6 +1884,7 @@ fn handleSession(allocator: std.mem.Allocator, out: output.Output, io: std.Io, e
         const response = try sendSessionRequestAlloc(allocator, io, "session.write", .{ .id = wanted_id, .text = text }, 1);
         defer allocator.free(response);
         try out.stdout("{s}\n", .{response});
+        exitIfResponseFailed(response);
         return;
     }
 
@@ -1883,6 +1901,7 @@ fn handleSession(allocator: std.mem.Allocator, out: output.Output, io: std.Io, e
         }, 1);
         defer allocator.free(response);
         try out.stdout("{s}\n", .{response});
+        exitIfResponseFailed(response);
         return;
     }
 
@@ -1895,6 +1914,7 @@ fn handleSession(allocator: std.mem.Allocator, out: output.Output, io: std.Io, e
         const response = try sendSessionRequestAlloc(allocator, io, "session.kill", .{ .id = wanted_id }, 1);
         defer allocator.free(response);
         try out.stdout("{s}\n", .{response});
+        exitIfResponseFailed(response);
         return;
     }
 
@@ -1903,6 +1923,7 @@ fn handleSession(allocator: std.mem.Allocator, out: output.Output, io: std.Io, e
         const response = try sendSessionRequestAlloc(allocator, io, "session.cleanup", .{}, 1);
         defer allocator.free(response);
         try out.stdout("{s}\n", .{response});
+        exitIfResponseFailed(response);
         return;
     }
 
@@ -1922,6 +1943,13 @@ fn handleLive(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv
     const json = args.hasFlag(argv, "--json");
     if (std.mem.eql(u8, command, "capabilities")) {
         try printCapabilities(allocator, out, json);
+        return;
+    }
+    if (std.mem.eql(u8, command, "status") and !json) {
+        const response = sendLiveRequestAlloc(allocator, io, "status", .{}, 1) catch |err| liveUnavailable(out, err, false);
+        defer allocator.free(response);
+        try printLiveStatusSummary(out, response);
+        exitIfResponseFailed(response);
         return;
     }
     if (std.mem.eql(u8, command, "status") or
@@ -3201,7 +3229,7 @@ fn handleLiveChat(allocator: std.mem.Allocator, out: output.Output, io: std.Io, 
             return;
         }
         const response = sendLiveRequestAlloc(allocator, io, "chat.open", open_params, 1) catch |err| {
-            liveUnavailable(out, err);
+            liveUnavailable(out, err, json);
         };
         defer allocator.free(response);
         mcpLinkOpenedChat(allocator, io, response, parent_thread_id) catch |err| {
@@ -3209,8 +3237,10 @@ fn handleLiveChat(allocator: std.mem.Allocator, out: output.Output, io: std.Io, 
         };
         if (json) {
             try out.stdout("{s}\n", .{response});
+            exitIfResponseFailed(response);
         } else {
             try printLiveResponse(out, response);
+            exitIfResponseFailed(response);
         }
         return;
     }
@@ -3239,6 +3269,7 @@ fn handleLiveChat(allocator: std.mem.Allocator, out: output.Output, io: std.Io, 
             }) catch |err| return chatDaemonCliFailure(out, err);
             defer allocator.free(response);
             try out.stdout("{s}\n", .{response});
+            exitIfResponseFailed(response);
             return;
         }
         const method = if (std.mem.eql(u8, draft_command, "get"))
@@ -3276,6 +3307,7 @@ fn handleLiveChat(allocator: std.mem.Allocator, out: output.Output, io: std.Io, 
         }) catch |err| return chatDaemonCliFailure(out, err);
         defer allocator.free(response);
         try out.stdout("{s}\n", .{response});
+        exitIfResponseFailed(response);
         return;
     }
     if (std.mem.eql(u8, subcommand, "send")) {
@@ -3304,6 +3336,7 @@ fn handleLiveChat(allocator: std.mem.Allocator, out: output.Output, io: std.Io, 
             }) catch |err| return chatDaemonCliFailure(out, err);
             defer allocator.free(response);
             try out.stdout("{s}\n", .{response});
+            exitIfResponseFailed(response);
             return;
         }
         try sendLiveRequest(allocator, out, io, "chat.send", .{
@@ -3328,6 +3361,7 @@ fn handleLiveChat(allocator: std.mem.Allocator, out: output.Output, io: std.Io, 
             }) catch |err| return chatDaemonCliFailure(out, err);
             defer allocator.free(response);
             try out.stdout("{s}\n", .{response});
+            exitIfResponseFailed(response);
             return;
         }
         try sendLiveRequest(allocator, out, io, "chat.approve", .{
@@ -3349,6 +3383,7 @@ fn handleLiveChat(allocator: std.mem.Allocator, out: output.Output, io: std.Io, 
             }) catch |err| return chatDaemonCliFailure(out, err);
             defer allocator.free(response);
             try out.stdout("{s}\n", .{response});
+            exitIfResponseFailed(response);
             return;
         }
     }
@@ -3374,6 +3409,7 @@ fn handleLiveChat(allocator: std.mem.Allocator, out: output.Output, io: std.Io, 
         }) catch |err| return chatDaemonCliFailure(out, err);
         defer allocator.free(response);
         try out.stdout("{s}\n", .{response});
+        exitIfResponseFailed(response);
         return;
     }
     if (std.mem.eql(u8, subcommand, "read")) {
@@ -3392,6 +3428,7 @@ fn handleLiveChat(allocator: std.mem.Allocator, out: output.Output, io: std.Io, 
         }) catch |err| return chatDaemonCliFailure(out, err);
         defer allocator.free(response);
         try out.stdout("{s}\n", .{response});
+        exitIfResponseFailed(response);
         return;
     }
     const method = try std.fmt.allocPrint(allocator, "chat.{s}", .{subcommand});
@@ -3805,13 +3842,15 @@ fn handleLiveStack(allocator: std.mem.Allocator, out: output.Output, io: std.Io,
 
 fn sendLiveRequest(allocator: std.mem.Allocator, out: output.Output, io: std.Io, method: []const u8, params: anytype, json: bool) !void {
     const response = sendLiveRequestAlloc(allocator, io, method, params, 1) catch |err| {
-        liveUnavailable(out, err);
+        liveUnavailable(out, err, json);
     };
     defer allocator.free(response);
     if (json) {
         try out.stdout("{s}\n", .{response});
+        exitIfResponseFailed(response);
     } else {
         try printLiveResponse(out, response);
+        exitIfResponseFailed(response);
     }
 }
 
@@ -4443,8 +4482,115 @@ fn commandAfterDoubleDash(argv: []const []const u8) []const []const u8 {
     return &.{};
 }
 
+/// Human-mode live output: a failed envelope becomes a plain sentence on
+/// stderr (scripts get the raw envelope with `--json`); results print as-is.
 fn printLiveResponse(out: output.Output, response: []const u8) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, response, .{}) catch {
+        return out.stdout("{s}\n", .{response});
+    };
+    defer parsed.deinit();
+    if (liveFailureText(parsed.value)) |failure| {
+        if (failure.message.len > 0) {
+            try out.stderr("{s}\n", .{failure.message});
+        } else {
+            try out.stderr("Verde could not complete the request ({s}).\n", .{failure.code});
+        }
+        return;
+    }
     try out.stdout("{s}\n", .{response});
+}
+
+const LiveFailureText = struct { code: []const u8, message: []const u8 };
+
+/// The human sentence for an `ok:false` live envelope, or null on success.
+fn liveFailureText(root: std.json.Value) ?LiveFailureText {
+    if (root != .object) return null;
+    const ok = root.object.get("ok") orelse return null;
+    if (ok != .bool or ok.bool) return null;
+    const error_value = root.object.get("error") orelse return .{ .code = "unknown", .message = "" };
+    if (error_value != .object) return .{ .code = "unknown", .message = "" };
+    const code = jsonString(error_value.object.get("code") orelse .null) orelse "unknown";
+    const message = jsonString(error_value.object.get("message") orelse .null) orelse "";
+    // The live server's terse "no workspaces" reads as a sentence here.
+    if (std.mem.eql(u8, message, "no workspaces")) return .{ .code = code, .message = "No workspace is open." };
+    return .{ .code = code, .message = message };
+}
+
+test "human live output turns failed envelopes into a sentence" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"id":1,"ok":false,"error":{"code":"not_found","message":"no workspaces"}}
+    , .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("No workspace is open.", liveFailureText(parsed.value).?.message);
+    var ok = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"id\":1,\"ok\":true,\"result\":{}}", .{});
+    defer ok.deinit();
+    try std.testing.expect(liveFailureText(ok.value) == null);
+}
+
+/// Human-readable `verde live status`; `--json` keeps the raw envelope.
+fn printLiveStatusSummary(out: output.Output, response: []const u8) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, response, .{}) catch {
+        return out.stdout("{s}\n", .{response});
+    };
+    defer parsed.deinit();
+    const root = if (parsed.value == .object) parsed.value.object else return out.stdout("{s}\n", .{response});
+    if (root.get("result")) |result| if (result == .object) {
+        const fields = result.object;
+        const pid = jsonInteger(fields.get("pid") orelse .null);
+        if (pid) |value| try out.stdout("Verde is running (pid {d}).\n", .{value}) else try out.stdout("Verde is running.\n", .{});
+        const count = jsonInteger(fields.get("workspace_count") orelse .null) orelse 0;
+        if (jsonInteger(fields.get("selected_workspace_index") orelse .null)) |selected| {
+            try out.stdout("Workspaces: {d} (selected index {d})\n", .{ count, selected });
+        } else {
+            try out.stdout("Workspaces: {d}\n", .{count});
+        }
+        if (jsonInteger(fields.get("focused_pane_id") orelse .null)) |pane| try out.stdout("Focused pane: {d}\n", .{pane});
+        try out.stdout("Panes: {d}  Terminals: {d}  Processes: {d}  Pending chat sends: {d}\n", .{
+            jsonArrayLen(fields.get("panes")),
+            jsonArrayLen(fields.get("terminals")),
+            jsonArrayLen(fields.get("processes")),
+            jsonInteger(fields.get("pending_send_count") orelse .null) orelse 0,
+        });
+        return;
+    };
+    const message = if (root.get("error")) |error_value|
+        (if (error_value == .object) jsonString(error_value.object.get("message") orelse .null) else null)
+    else
+        null;
+    try out.stderr("verde live status failed: {s}\n", .{message orelse "unexpected response"});
+}
+
+test "only ok:false response envelopes fail the CLI exit status" {
+    try std.testing.expect(responseEnvelopeFailed("{\"id\":1,\"ok\":false,\"error\":{\"code\":\"not_found\"}}"));
+    try std.testing.expect(!responseEnvelopeFailed("{\"id\":1,\"ok\":true,\"result\":{}}"));
+    try std.testing.expect(!responseEnvelopeFailed("{\"result\":{}}"));
+    try std.testing.expect(!responseEnvelopeFailed("not json"));
+}
+
+fn jsonInteger(value: std.json.Value) ?i64 {
+    return switch (value) {
+        .integer => |number| number,
+        else => null,
+    };
+}
+
+fn jsonArrayLen(value: ?std.json.Value) usize {
+    const present = value orelse return 0;
+    return if (present == .array) present.array.items.len else 0;
+}
+
+/// Exit 1 once a printed live/daemon envelope reports `ok: false`, so scripts
+/// can rely on the exit status as well as the JSON (same rule as `schedule`).
+fn exitIfResponseFailed(response: []const u8) void {
+    if (responseEnvelopeFailed(response)) std.process.exit(1);
+}
+
+fn responseEnvelopeFailed(response: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, response, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const ok = parsed.value.object.get("ok") orelse return false;
+    return ok == .bool and !ok.bool;
 }
 
 // pub so the headless IT harness can drive the real MCP serve loop over
@@ -4917,7 +5063,7 @@ fn mcpDefaultWorkspace(workspace_id: ?[]const u8, workspace_path: ?[]const u8, c
     return workspace_id orelse workspace_path orelse cwd;
 }
 
-const MCP_INSTRUCTIONS = "Use explicit workspace and stable process/session ids when available. Read-only list, inspect, status, check, read, and tail tools are safe to call without confirmation. Acquire a lease before exclusive builds, dependency changes, database work, shared browser automation, or long-running shared commands; release it when finished. Preserve the user's desktop focus. Browser tools operate on the addressed workspace without selecting its tab; never switch tabs or focus panes to inspect, interact with, or capture a browser page.";
+const MCP_INSTRUCTIONS = "Use explicit workspace and stable process/session ids when available. Read-only list, inspect, status, check, read, and tail tools are safe to call without confirmation. Run exclusive builds, dependency installs, and migrations as `verde lease run -- <command>` in your shell (as a background task if it may wait): it queues for the resource, reuses an identical in-flight or just-finished run when sources are unchanged, says which files changed when they are not, and releases when the command exits. Use acquire_lease only for shared work that is not one command (browser automation, a dev server) and release it when finished. Never wait for a lease with sleep or polling loops. Preserve the user's desktop focus. Browser tools operate on the addressed workspace without selecting its tab; never switch tabs or focus panes to inspect, interact with, or capture a browser page.";
 
 fn mcpInitialize(
     allocator: std.mem.Allocator,
@@ -5051,20 +5197,20 @@ fn mcpToolsList(allocator: std.mem.Allocator, out: output.Output, id_value: std.
     try writeMcpTypedTool(&s, "check_command", "Classify a command and return structured conflicts before starting it.", &.{
         .{ .name = "command", .type_name = "string", .description = "Command that may be started.", .required = true },
         .{ .name = "resources", .type_name = "array", .items_type_name = "string", .description = "Optional explicit workspace resources, such as build, deps, db, or port:3000." },
-        .{ .name = "owner", .type_name = "string", .description = "Optional opaque owner id; defaults to VERDE_SESSION_ID." },
+        .{ .name = "owner", .type_name = "string", .description = "Your Verde thread id from <verde_orchestration>; pass it, because chats using the same provider otherwise share one owner. Defaults to VERDE_SESSION_ID." },
         .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current." },
     });
-    try writeMcpTypedTool(&s, "acquire_lease", "Acquire or renew an expiring workspace resource lease. Conflicts are rejected unless force is true.", &.{
+    try writeMcpTypedTool(&s, "acquire_lease", "Acquire or renew an expiring workspace resource lease for shared work that is not a single command, such as browser automation or a dev server. For builds, installs, and migrations run `verde lease run -- <command>` in your shell instead; it waits in line, reuses an identical run on unchanged sources, and releases on exit. Conflicts are rejected unless force is true; on a conflict do not sleep or poll: use `verde lease run`, or call report_chat_blocked with waiting_for_resources and yield.", &.{
         .{ .name = "command", .type_name = "string", .description = "Command the lease protects.", .required = true },
         .{ .name = "resources", .type_name = "array", .items_type_name = "string", .description = "Optional explicit workspace resources. Classified commands infer a conventional resource." },
-        .{ .name = "owner", .type_name = "string", .description = "Opaque owner id; defaults to VERDE_SESSION_ID." },
-        .{ .name = "ttl_ms", .type_name = "integer", .description = "Lease lifetime in milliseconds; defaults to 120000 and is capped at one hour." },
+        .{ .name = "owner", .type_name = "string", .description = "Your Verde thread id from <verde_orchestration>; pass it, because chats using the same provider otherwise share one owner. Defaults to VERDE_SESSION_ID." },
+        .{ .name = "ttl_ms", .type_name = "integer", .description = "Lease lifetime in milliseconds; defaults to 120000 and is capped at one hour. Keep it short and renew while working; others wait for it." },
         .{ .name = "force", .type_name = "boolean", .description = "Run anyway despite conflicts and notify affected terminal agents." },
         .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current." },
     });
-    try writeMcpTypedTool(&s, "release_lease", "Release one lease, or all leases belonging to the owner when lease_id is omitted.", &.{
+    try writeMcpTypedTool(&s, "release_lease", "Release one lease, or all leases belonging to the owner when lease_id is omitted (requires an explicit owner).", &.{
         .{ .name = "lease_id", .type_name = "string", .description = "Optional lease id returned by acquire_lease." },
-        .{ .name = "owner", .type_name = "string", .description = "Opaque owner id; defaults to VERDE_SESSION_ID." },
+        .{ .name = "owner", .type_name = "string", .description = "Your Verde thread id from <verde_orchestration>; pass it, because chats using the same provider otherwise share one owner. Defaults to VERDE_SESSION_ID." },
         .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current." },
     });
     try writeMcpTypedTool(&s, "wait_for_process", "Wait until a tracked process completes, is replaced, disappears, or the bounded timeout expires.", &.{
@@ -6342,6 +6488,11 @@ fn mcpToolsCall(
         }
         if (std.mem.eql(u8, tool_name, "release_lease")) {
             const owner = coordination_owner orelse return try mcpError(allocator, out, id_value, -32602, "release_lease requires owner outside a Verde terminal session");
+            // HTTP clients share one default owner per provider; releasing
+            // "all of mine" would drop every other chat's leases too.
+            if (mcpArgString(arguments, "lease_id") == null and mcpArgString(arguments, "owner") == null and std.mem.startsWith(u8, owner, "mcp:http:")) {
+                return try mcpError(allocator, out, id_value, -32602, "release_lease needs lease_id (or your own owner) here; this connection's default owner is shared by every chat of this provider");
+            }
             break :blk sendLiveRequestAlloc(allocator, io, "workspace.releaseLease", .{
                 .workspace = workspace,
                 .lease_id = mcpArgString(arguments, "lease_id"),
@@ -8557,8 +8708,23 @@ fn jsonUsize(value: std.json.Value) ?usize {
     };
 }
 
-fn liveUnavailable(out: output.Output, err: anyerror) noreturn {
-    out.stderr("verde live server is not running: {s}\n", .{@errorName(err)}) catch {};
+fn liveUnavailable(out: output.Output, err: anyerror, json: bool) noreturn {
+    // A missing socket or refused connection just means the app is closed;
+    // anything else is a real transport fault worth naming.
+    const not_running = err == error.FileNotFound or err == error.ConnectionRefused;
+    if (json) {
+        // `--json` callers parse stdout; keep the envelope shape of live
+        // responses (and exit code 3) instead of a plain sentence.
+        if (not_running) {
+            out.stdout("{{\"ok\":false,\"error\":{{\"code\":\"app_not_running\",\"message\":\"Verde is not running. Start the Verde app, then retry.\"}}}}\n", .{}) catch {};
+        } else {
+            out.stdout("{{\"ok\":false,\"error\":{{\"code\":\"app_unreachable\",\"message\":\"Could not reach the running Verde app ({s}).\"}}}}\n", .{@errorName(err)}) catch {};
+        }
+    } else if (not_running) {
+        out.stderr("Verde is not running. Start the Verde app, then retry.\n", .{}) catch {};
+    } else {
+        out.stderr("Could not reach the running Verde app ({s}). Restart Verde if this persists.\n", .{@errorName(err)}) catch {};
+    }
     std.process.exit(3);
 }
 
@@ -9342,4 +9508,8 @@ test "schedule add flags build create params and reject strays" {
     try std.testing.expectEqualStrings("--everyy", unknownScheduleFlag("add", &stray).?);
     const misplaced = [_][]const u8{ "run", "sch-1", "--daily", "09:00" };
     try std.testing.expectEqualStrings("--daily", unknownScheduleFlag("run", &misplaced).?);
+}
+
+test {
+    _ = lease_run;
 }

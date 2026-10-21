@@ -8,6 +8,7 @@ const app_config = @import("../app/config.zig");
 const provider_cli_version = @import("../providers/cli_version.zig");
 const phone_pairing = @import("../state/phone_pairing.zig");
 const settings_controller = @import("../state/settings_controller.zig");
+const custom_agent_form_state = @import("../state/custom_agent_form.zig");
 const updater = @import("../app/updater.zig");
 const theme = @import("theme.zig");
 const runtime = @import("runtime.zig");
@@ -162,7 +163,10 @@ const THEME_MENU_MAX_ROWS: usize = 6;
 const TITLE_MENU_MAX_ROWS: usize = 6;
 const COMPANION_CHARACTER_OPTIONS = [_]app_config.CompanionCharacter{ .sprout, .moss, .vireo };
 const COMPANION_CHARACTER_LABELS = [_][]const u8{ "Sprout", "Moss", "Vireo" };
+const COMPANION_HINT = "Shows running agents and what needs you.";
 const NF_COD_CHEVRON_DOWN = "\u{EAB4}";
+/// Parks controls of inactive pages/rows above the panel.
+const OFFSCREEN_Y: f32 = -10000.0;
 const NF_COD_CHEVRON_UP = "\u{EAB7}";
 
 const Metrics = struct {
@@ -268,7 +272,7 @@ const SettingsLayout = struct {
     terminal_links_system_browser: palette.Rect,
     browser_scroll_speed: palette.Rect,
     browser_hint_y: f32,
-    experimental_card: palette.Rect,
+    companion_card: palette.Rect,
     companion_toggle: palette.Rect,
     companion_hint_y: f32,
     workspace_card: palette.Rect,
@@ -312,6 +316,7 @@ const SettingsLayout = struct {
     integrations_card: palette.Rect,
     mcp_tools: palette.Rect,
     mcp_hint_y: f32,
+    mcp_note_y: f32,
     hooks_label_y: f32,
     hooks_claude: palette.Rect,
     hooks_codex: palette.Rect,
@@ -457,8 +462,10 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         labeled + m.row_gap +
         m.row_h + m.row_gap +
         m.row_h + m.row_gap +
-        @as(f32, @floatFromInt(REDUCED_MOTION_PARTS.len)) * (m.row_h + m.row_gap) +
-        m.row_h +
+        @as(f32, @floatFromInt(REDUCED_MOTION_PARTS.len)) * (m.row_h + m.row_gap) -
+        m.row_gap;
+    const companion_h = m.card_pad * 2.0 + m.title_h + m.row_gap +
+        m.row_h + m.inner_gap + m.label_h +
         if (companion_enabled) m.row_gap + labeled else 0.0;
     const transcript_h = m.card_pad * 2.0 + m.title_h + m.row_gap +
         labeled + m.row_gap +
@@ -471,7 +478,6 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const terminal_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.row_h;
     const browser_h = m.card_pad * 2.0 + m.title_h + m.row_gap +
         labeled * 4.0 + m.row_gap * 3.0;
-    const experimental_h: f32 = 0.0;
     const workspace_h = m.card_pad * 2.0 + m.title_h + m.row_gap +
         labeled + m.row_gap +
         labeled + m.row_gap +
@@ -521,13 +527,14 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const provider_rows_h = @as(f32, @floatFromInt(PROVIDER_ROW_COUNT)) * providerRowHeight();
     const providers_h = m.card_pad * 2.0 + m.title_h + m.row_gap + provider_rows_h + m.label_h * 2.0 + m.row_gap + m.row_h;
     const custom_agent_count = @min(state.app_config.custom_acp_agents.len, MAX_CUSTOM_AGENT_ROWS);
-    const custom_agents_h = customAgentsCardHeight(custom_agent_count, m);
+    const custom_agents_h = customAgentsCardHeight(custom_agent_count, content_w, m);
     const appearance_page_h = appearance_h;
     const chat_page_h = transcript_h + m.card_gap + chat_h + m.card_gap + commit_h;
     const workspace_page_h = workspace_h;
     const app_page_h = updates_h + m.card_gap + notifications_h;
     const body_h = switch (category) {
         .appearance => appearance_page_h,
+        .companion => companion_h,
         .workspace => workspace_page_h,
         .chat => chat_page_h,
         .providers => providers_h + m.card_gap + custom_agents_h,
@@ -556,7 +563,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const cancel: palette.Rect = save;
 
     const content_x = content.x;
-    const offscreen_y: f32 = -10000.0;
+    const offscreen_y: f32 = OFFSCREEN_Y;
     const page_y = content_y - scroll_y;
     var y = if (category == .appearance) page_y else offscreen_y;
 
@@ -577,23 +584,23 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         rect.* = .{ .x = theme_x + motion_part_indent, .y = motion_part_y, .w = content_w - m.card_pad * 2.0 - motion_part_indent, .h = m.row_h };
         motion_part_y += m.row_h + m.row_gap;
     }
-    const companion_toggle_y = motion_part_y;
-    const companion_toggle: palette.Rect = .{ .x = theme_x, .y = companion_toggle_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
-    const companion_hint_y = companion_toggle_y + m.row_h;
-    const companion_character_label_y = if (companion_enabled) companion_toggle_y + m.row_h + m.row_gap else offscreen_y;
-    const companion_row_y = if (companion_enabled) companion_character_label_y + m.label_h + m.inner_gap else offscreen_y;
+
+    // Companion page: on/off switch, one-line hint, then the character
+    // picker only while the companion is enabled.
+    y = if (category == .companion) page_y else offscreen_y;
+
+    const companion_card: palette.Rect = .{ .x = content_x, .y = y, .w = content_w, .h = companion_h };
+    const companion_x = companion_card.x + m.card_pad;
+    const companion_toggle_y = companion_card.y + m.card_pad + m.title_h + m.row_gap;
+    const companion_toggle: palette.Rect = .{ .x = companion_x, .y = companion_toggle_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
+    const companion_hint_y = companion_toggle_y + m.row_h + m.inner_gap;
+    const companion_character_label_y = if (companion_enabled and category == .companion) companion_hint_y + m.label_h + m.row_gap else offscreen_y;
+    const companion_row_y = if (companion_enabled and category == .companion) companion_character_label_y + m.label_h + m.inner_gap else offscreen_y;
     const companion_character_dropdown: palette.Rect = .{
-        .x = theme_x,
+        .x = companion_x,
         .y = companion_row_y,
         .w = content_w - m.card_pad * 2.0,
         .h = m.row_h,
-    };
-
-    const experimental_card: palette.Rect = .{
-        .x = content_x,
-        .y = offscreen_y,
-        .w = content_w,
-        .h = experimental_h,
     };
 
     y = if (category == .chat) page_y else offscreen_y;
@@ -684,20 +691,19 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     var provider_updates: [PROVIDER_ROW_COUNT]palette.Rect = undefined;
     var provider_row_y = providers_card.y + m.card_pad + m.title_h + m.row_gap;
     const provider_action_w = @max(
-        @max(@max(buttonWidth("Install"), buttonWidth("Update")), buttonWidth("Sign in")),
+        @max(@max(buttonWidth("Install"), buttonWidth("Update")), @max(buttonWidth("Sign in"), buttonWidth(PROVIDER_GET_NODE_LABEL))),
         @max(buttonWidth("Latest"), buttonWidth("Checking…")),
     );
-    const provider_badge_w = providerBadgeColumnWidth();
-    const provider_switch_reserve = theme.scaledUi(10.0 + 40.0 + 20.0);
-    const provider_dot = theme.scaledUi(7.0);
+    const provider_switch_reserve = theme.scaledUi(PROVIDER_SWITCH_RESERVE_UI);
     for (&provider_rows, &provider_updates) |*row, *update| {
         row.* = .{ .x = providers_card.x + m.card_pad, .y = provider_row_y, .w = content_w - m.card_pad * 2.0, .h = providerRowHeight() };
-        const badge_x = row.x + row.w - provider_switch_reserve - provider_badge_w;
-        // Keep the installer button on the name line so the version line underneath can use the full width.
-        const update_h = theme.scaledUi(22.0);
+        // The action button sits just left of the switch, vertically
+        // centered, so the name line and the status line beneath it (dot,
+        // status, version) share everything to its left.
+        const update_h = theme.scaledUi(24.0);
         update.* = .{
-            .x = badge_x - provider_dot - theme.scaledUi(7.0 + 8.0) - provider_action_w,
-            .y = row.y + theme.scaledUi(3.0),
+            .x = row.x + row.w - provider_switch_reserve - provider_action_w,
+            .y = row.y + (row.h - update_h) * 0.5,
             .w = provider_action_w,
             .h = update_h,
         };
@@ -717,7 +723,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     var custom_agent_rows: [MAX_CUSTOM_AGENT_ROWS]palette.Rect = @splat(.{});
     var custom_agent_edits: [MAX_CUSTOM_AGENT_ROWS]palette.Rect = @splat(.{});
     var custom_agent_removes: [MAX_CUSTOM_AGENT_ROWS]palette.Rect = @splat(.{});
-    var custom_agent_y = custom_agents_subtitle_y + m.label_h + m.row_gap;
+    var custom_agent_y = custom_agents_subtitle_y + customAgentsSubtitleHeight(content_w, m) + m.row_gap;
     const custom_agents_empty_y = custom_agent_y;
     const custom_agent_button_h = theme.scaledUi(26.0);
     const custom_agent_remove_w = buttonWidth("Remove");
@@ -840,7 +846,9 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const mcp_tools_y = integrations_card.y + m.card_pad + m.title_h + m.row_gap + m.label_h + m.inner_gap;
     const mcp_tools: palette.Rect = .{ .x = integrations_card.x + m.card_pad, .y = mcp_tools_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
     const mcp_hint_y = mcp_tools_y + m.row_h + m.inner_gap;
-    const hooks_label_y = mcp_hint_y + m.label_h + m.row_gap;
+    // The auto-approval note uses the card's spare label slot.
+    const mcp_note_y = mcp_hint_y + m.label_h;
+    const hooks_label_y = mcp_note_y + m.label_h + m.row_gap;
     const hooks_claude_y = hooks_label_y + m.label_h + m.inner_gap;
     const hooks_claude: palette.Rect = .{ .x = integrations_card.x + m.card_pad, .y = hooks_claude_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
     const hooks_codex_y = hooks_claude_y + m.row_h + m.inner_gap;
@@ -873,7 +881,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         updates_notes_toggle = .{
             .x = updates_card.x + m.card_pad,
             .y = updates_links_y,
-            .w = text_measure.textWidth(.ui, theme.scaledUi(NOTES_LINK_FONT_SIZE), notesToggleLabel(state)),
+            .w = settingsTextWidth(theme.scaledUi(NOTES_LINK_FONT_SIZE), notesToggleLabel(state)),
             .h = m.label_h,
         };
     }
@@ -881,7 +889,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const updates_release_page: palette.Rect = .{
         .x = release_page_x,
         .y = updates_links_y,
-        .w = text_measure.textWidth(.ui, theme.scaledUi(NOTES_LINK_FONT_SIZE), RELEASE_PAGE_LABEL),
+        .w = settingsTextWidth(theme.scaledUi(NOTES_LINK_FONT_SIZE), RELEASE_PAGE_LABEL),
         .h = m.label_h,
     };
 
@@ -951,7 +959,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .terminal_links_system_browser = terminal_links_system_browser,
         .browser_scroll_speed = browser_scroll_speed,
         .browser_hint_y = browser_hint_y,
-        .experimental_card = experimental_card,
+        .companion_card = companion_card,
         .companion_toggle = companion_toggle,
         .companion_hint_y = companion_hint_y,
         .workspace_card = workspace_card,
@@ -1000,6 +1008,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .integrations_card = integrations_card,
         .mcp_tools = mcp_tools,
         .mcp_hint_y = mcp_hint_y,
+        .mcp_note_y = mcp_note_y,
         .hooks_label_y = hooks_label_y,
         .hooks_claude = hooks_claude,
         .hooks_codex = hooks_codex,
@@ -1100,6 +1109,7 @@ fn queueControlHit(
     control: Control,
     queue_hit: *const fn (*runtime.AppState, palette.Rect, runtime.PaletteModalAction, usize) void,
 ) void {
+    recordFocusStop(.settings_control, @intFromEnum(control), rect, clip);
     const visible = intersectRect(rect, clip) orelse return;
     queue_hit(state, visible, .settings_control, @intFromEnum(control));
 }
@@ -1488,7 +1498,12 @@ fn registerOpenActionOptionHits(
 
 /// Registers palette hit targets for the settings modal.
 pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit: *const fn (*runtime.AppState, palette.Rect, runtime.PaletteModalAction, usize) void) void {
-    if (!state.settings_controller.modal_visible) return;
+    focus_stop_count = 0;
+    if (!state.settings_controller.modal_visible) {
+        keyboard_focus = null;
+        focus_ring_visible = false;
+        return;
+    }
     if (state.settings_controller.modal_closing) {
         // Swallow input during the fade-out; the controls are already gone.
         queue_hit(state, .{ .x = 0.0, .y = 0.0, .w = width, .h = height }, .modal_block, 0);
@@ -1506,20 +1521,24 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
     queue_hit(state, layout.close, .settings_close, 0);
     for (settings_controller.Category.all, 0..) |_, index| {
         queue_hit(state, layout.nav[index], .settings_category, index);
+        recordFocusStop(.settings_category, index, layout.nav[index], null);
     }
+    focus_body_clip = layout.body_clip;
     const category = state.settings_controller.active_category;
     if (category == .appearance) {
         queueControlHit(state, layout.theme_dropdown, layout.body_clip, .theme_dropdown, queue_hit);
-        if (state.settings_controller.draft.companion_enabled) {
-            queueControlHit(state, layout.companion_character_dropdown, layout.body_clip, .companion_character_dropdown, queue_hit);
-        }
         queueControlHit(state, layout.ui_font_dec, layout.body_clip, .ui_font_dec, queue_hit);
         queueControlHit(state, layout.ui_font_inc, layout.body_clip, .ui_font_inc, queue_hit);
         queueControlHit(state, layout.reduced_motion, layout.body_clip, .reduced_motion, queue_hit);
         for (REDUCED_MOTION_PARTS, layout.reduced_motion_parts) |part, rect| {
             queueControlHit(state, rect, layout.body_clip, part.control, queue_hit);
         }
+    }
+    if (category == .companion) {
         queueControlHit(state, layout.companion_toggle, layout.body_clip, .companion_toggle, queue_hit);
+        if (state.settings_controller.draft.companion_enabled) {
+            queueControlHit(state, layout.companion_character_dropdown, layout.body_clip, .companion_character_dropdown, queue_hit);
+        }
     }
     if (category == .workspace) {
         queueControlHit(state, layout.workspace_tabs_automatic, layout.body_clip, .workspace_tabs_automatic, queue_hit);
@@ -1591,16 +1610,19 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
         const provider_snapshot = state.providerReadinessSnapshot();
         for (layout.provider_updates, 0..) |update, index| {
             const provider = settings_controller.settingsProviderForRow(index);
-            switch (providerAction(provider_snapshot.forProvider(provider), provider_snapshot.releaseForProvider(provider))) {
-                .install, .update, .sign_in => queueControlHit(state, update, layout.body_clip, providerUpdateControl(index), queue_hit),
+            switch (providerAction(&provider_snapshot, provider)) {
+                .install, .update, .sign_in, .get_node => queueControlHit(state, update, layout.body_clip, providerUpdateControl(index), queue_hit),
                 .latest, .pending, .none => {},
             }
         }
         queueControlHit(state, layout.providers_recheck, layout.body_clip, .providers_recheck, queue_hit);
         for (0..layout.custom_agent_count) |index| {
+            recordFocusStop(.settings_custom_agent_edit, index, layout.custom_agent_edits[index], layout.body_clip);
+            recordFocusStop(.settings_custom_agent_remove, index, layout.custom_agent_removes[index], layout.body_clip);
             if (intersectRect(layout.custom_agent_edits[index], layout.body_clip)) |rect| queue_hit(state, rect, .settings_custom_agent_edit, index);
             if (intersectRect(layout.custom_agent_removes[index], layout.body_clip)) |rect| queue_hit(state, rect, .settings_custom_agent_remove, index);
         }
+        recordFocusStop(.settings_custom_agent_add, 0, layout.custom_agents_add, layout.body_clip);
         if (intersectRect(layout.custom_agents_add, layout.body_clip)) |rect| queue_hit(state, rect, .settings_custom_agent_add, 0);
     }
     if (category == .agents) {
@@ -1631,6 +1653,8 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
         _ = phoneCard(state, layout.phone_card, layout.body_clip, false, queue_hit);
         registerRuntimeCardHits(state, layout, queue_hit);
     }
+    // Close ends the Tab cycle: nav, then the page, then the header button.
+    recordFocusStop(.settings_close, 0, layout.close, null);
     registerThemeOptionHits(state, layout, queue_hit);
     registerCompanionCharacterOptionHits(state, layout, queue_hit);
     registerTitleOptionHits(state, layout, queue_hit);
@@ -1684,12 +1708,21 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         for (REDUCED_MOTION_PARTS, layout.reduced_motion_parts) |part, rect| {
             drawSwitchRow(state, rect, part.label, reducedMotionPart(motion, part.part), isControlHovered(state, part.control), layout.body_clip);
         }
-        drawCompanionExperimentalRow(state, layout.companion_toggle, state.settings_controller.draft.companion_enabled, isControlHovered(state, .companion_toggle), layout.body_clip);
+    } else if (category == .companion) {
+        drawCard(state, layout.companion_card, layout.body_clip);
+        drawCardTitle(state, layout.companion_card, "Companion", layout.body_clip);
+        drawSwitchRow(state, layout.companion_toggle, "Show companion", state.settings_controller.draft.companion_enabled, isControlHovered(state, .companion_toggle), layout.body_clip);
+        queueText(state, .{
+            .x = layout.companion_card.x + m.card_pad,
+            .y = layout.companion_hint_y,
+            .w = layout.companion_card.w - m.card_pad * 2.0,
+            .h = m.label_h,
+        }, COMPANION_HINT, paletteColor(textHint()), theme.scaledUi(12.5), layout.body_clip);
         if (state.settings_controller.draft.companion_enabled) {
             queueText(state, .{
-                .x = layout.appearance_card.x + m.card_pad,
+                .x = layout.companion_card.x + m.card_pad,
                 .y = layout.companion_character_label_y,
-                .w = layout.appearance_card.w - m.card_pad * 2.0,
+                .w = layout.companion_card.w - m.card_pad * 2.0,
                 .h = m.label_h,
             }, "Character", paletteColor(textLabel()), theme.scaledUi(12.5), layout.body_clip);
             drawCompanionCharacterDropdown(state, layout);
@@ -1838,21 +1871,38 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         drawFieldLabel(state, layout.integrations_card, m, "Verde MCP", layout.body_clip);
         const mcp_installed = state.settings_controller.mcp_summary.installedCount() > 0;
         drawSwitchRow(state, layout.mcp_tools, "Enable Verde MCP", mcp_installed, isControlHovered(state, .mcp_tools), layout.body_clip);
-        var mcp_status_buf: [120]u8 = undefined;
-        const mcp_status = if (state.settings_controller.mcp_summary.detectedCount() == 0)
+        const mcp_summary = state.settings_controller.mcp_summary;
+        var mcp_names_buf: [96]u8 = undefined;
+        var mcp_status_buf: [200]u8 = undefined;
+        const mcp_status = if (mcp_summary.detectedCount() == 0)
             "No supported providers detected"
-        else if (state.settings_controller.mcp_summary.failedCount() > 0)
-            std.fmt.bufPrint(&mcp_status_buf, "Installed for {d} · {d} failed", .{ state.settings_controller.mcp_summary.installedCount(), state.settings_controller.mcp_summary.failedCount() }) catch "Some provider configs could not be updated"
-        else if (state.settings_controller.mcp_summary.conflictCount() > 0)
-            std.fmt.bufPrint(&mcp_status_buf, "Installed for {d} · {d} conflict(s) kept", .{ state.settings_controller.mcp_summary.installedCount(), state.settings_controller.mcp_summary.conflictCount() }) catch "Some existing verde entries were preserved"
+        else if (!mcp_installed and mcp_summary.failedCount() == 0)
+            // Off: say what turning it on would cover, not "Installed for 0".
+            std.fmt.bufPrint(&mcp_status_buf, "Off · {d} detected provider{s} can use Verde's tools", .{ mcp_summary.detectedCount(), if (mcp_summary.detectedCount() == 1) "" else "s" }) catch "Off"
+        else if (mcp_summary.failedCount() > 0)
+            std.fmt.bufPrint(&mcp_status_buf, "Installed for {d} · could not update {s}", .{ mcp_summary.installedCount(), mcpProviderNames(&mcp_names_buf, mcp_summary, .failed) }) catch "Some provider configs could not be updated"
+        else if (mcp_summary.conflictCount() > 0)
+            std.fmt.bufPrint(&mcp_status_buf, "Installed for {d} · kept the existing verde entry for {s}", .{ mcp_summary.installedCount(), mcpProviderNames(&mcp_names_buf, mcp_summary, .conflict) }) catch "Some existing verde entries were preserved"
         else
-            std.fmt.bufPrint(&mcp_status_buf, "Installed for {d} of {d} detected", .{ state.settings_controller.mcp_summary.installedCount(), state.settings_controller.mcp_summary.detectedCount() }) catch "Workspace-aware in Verde panes";
+            std.fmt.bufPrint(&mcp_status_buf, "Installed for {d} of {d} detected", .{ mcp_summary.installedCount(), mcp_summary.detectedCount() }) catch "Workspace-aware in Verde panes";
+        const mcp_text_w = layout.integrations_card.w - m.card_pad * 2.0;
+        var mcp_status_fit_buf: [200]u8 = undefined;
         queueText(state, .{
             .x = layout.integrations_card.x + m.card_pad,
             .y = layout.mcp_hint_y,
-            .w = layout.integrations_card.w - m.card_pad * 2.0,
+            .w = mcp_text_w,
             .h = m.label_h,
-        }, mcp_status, paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
+        }, ellipsizedText(&mcp_status_fit_buf, mcp_status, theme.scaledUi(12.0), mcp_text_w), paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
+        // Only true while Verde's entry is actually in Codex's config.
+        if (mcp_summary.codex == .installed) {
+            var mcp_note_buf: [160]u8 = undefined;
+            queueText(state, .{
+                .x = layout.integrations_card.x + m.card_pad,
+                .y = layout.mcp_note_y,
+                .w = mcp_text_w,
+                .h = m.label_h,
+            }, ellipsizedText(&mcp_note_buf, MCP_AUTO_APPROVE_NOTE, theme.scaledUi(12.0), mcp_text_w), paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
+        }
         queueText(state, .{
             .x = layout.integrations_card.x + m.card_pad,
             .y = layout.hooks_label_y,
@@ -1953,6 +2003,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     }
 
     drawBodyScrollbar(state, layout);
+    drawFocusRing(state);
     drawThemeDropdownMenu(state, layout);
     drawCompanionCharacterDropdownMenu(state, layout);
     drawChatTitleDropdownMenu(state, layout, true);
@@ -2412,9 +2463,10 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
             const row = providerUpdateRowForControl(control).?;
             const provider = settings_controller.settingsProviderForRow(row);
             const provider_snapshot = state.providerReadinessSnapshot();
-            switch (providerAction(provider_snapshot.forProvider(provider), provider_snapshot.releaseForProvider(provider))) {
+            switch (providerAction(&provider_snapshot, provider)) {
                 .install, .update => state.installSettingsProvider(row),
                 .sign_in => state.loginSettingsProvider(row),
+                .get_node => state.openNodeDownloadPage(),
                 .latest, .pending, .none => {},
             }
             return;
@@ -2488,9 +2540,28 @@ pub fn applyNewChatReasoningOption(state: *runtime.AppState, option_index: usize
     state.selectSettingsNewChatReasoning(option_index);
 }
 
-/// Handles navigation while a settings dropdown owns keyboard focus.
-pub fn handleKeyDown(state: *runtime.AppState, key: palette.event.Keycode) bool {
+/// Handles settings keyboard navigation: open dropdown menus first, then
+/// Tab focus, arrow navigation, and Enter/Space activation.
+pub fn handleKeyDown(state: *runtime.AppState, event: *const palette.event.KeyEvent) bool {
     if (!state.settings_controller.modal_visible) return false;
+    if (state.settings_controller.modal_closing or overlayOwnsKeyboard(state)) return false;
+    if (event.mod.primary() or event.mod.alt) return false;
+    const key = event.key;
+    if (key == .tab) {
+        closeDropdowns(state);
+        moveFocus(state, !event.mod.shift);
+        return true;
+    }
+    if (handleDropdownKeyDown(state, key)) return true;
+    if (dropdownOpen(state)) {
+        // Space confirms like Enter inside an open menu.
+        if (key == .space) return handleDropdownKeyDown(state, .@"return");
+        return false;
+    }
+    return handleFocusKeyDown(state, key);
+}
+
+fn handleDropdownKeyDown(state: *runtime.AppState, key: palette.event.Keycode) bool {
     if (state.settings_controller.theme_dropdown_open) return handleThemeKeyDown(state, key);
     if (state.settings_controller.companion_character_dropdown_open) return handleCompanionCharacterKeyDown(state, key);
     if (state.settings_controller.title_provider_dropdown_open) return handleTitleProviderKeyDown(state, key);
@@ -2501,6 +2572,283 @@ pub fn handleKeyDown(state: *runtime.AppState, key: palette.event.Keycode) bool 
     if (state.settings_controller.open_action_dropdown_open) return handleOpenActionKeyDown(state, key);
     if (state.settings_controller.commit_menu) |menu| return handleCommitMenuKeyDown(state, menu, key);
     return false;
+}
+
+// Keyboard focus. Tab stops are rebuilt by every `registerHits` pass in
+// Tab order (category nav, page controls, Close) with unclipped rects, so
+// focus can reach and scroll to controls outside the body viewport.
+
+const FocusStop = struct {
+    action: runtime.PaletteModalAction,
+    index: usize,
+    rect: palette.Rect,
+    /// Body viewport for page controls; null for panel chrome (nav, Close).
+    clip: ?palette.Rect,
+};
+
+const FocusRef = struct { action: runtime.PaletteModalAction, index: usize };
+
+const MAX_FOCUS_STOPS: usize = 192;
+
+var focus_stops: [MAX_FOCUS_STOPS]FocusStop = undefined;
+var focus_stop_count: usize = 0;
+var focus_body_clip: palette.Rect = .{};
+/// Tracked by identity, not list position, so focus survives a page that
+/// grows or shrinks between frames.
+var keyboard_focus: ?FocusRef = null;
+/// The ring shows only after keyboard input; a click moves focus silently.
+var focus_ring_visible: bool = false;
+
+fn recordFocusStop(action: runtime.PaletteModalAction, index: usize, rect: palette.Rect, clip: ?palette.Rect) void {
+    if (focus_stop_count >= MAX_FOCUS_STOPS) return;
+    if (rect.w <= 0.0 or rect.h <= 0.0 or rect.y <= OFFSCREEN_Y * 0.5) return;
+    focus_stops[focus_stop_count] = .{ .action = action, .index = index, .rect = rect, .clip = clip };
+    focus_stop_count += 1;
+}
+
+fn focusedStopIndex() ?usize {
+    const focus = keyboard_focus orelse return null;
+    for (focus_stops[0..focus_stop_count], 0..) |stop, index| {
+        if (stop.action == focus.action and stop.index == focus.index) return index;
+    }
+    return null;
+}
+
+fn activeCategoryIndex(state: *const runtime.AppState) usize {
+    for (settings_controller.Category.all, 0..) |category, index| {
+        if (category == state.settings_controller.active_category) return index;
+    }
+    return 0;
+}
+
+fn stopIndexFor(action: runtime.PaletteModalAction, index: usize) ?usize {
+    for (focus_stops[0..focus_stop_count], 0..) |stop, i| {
+        if (stop.action == action and stop.index == index) return i;
+    }
+    return null;
+}
+
+fn firstBodyStop(forward: bool) ?usize {
+    var i: usize = 0;
+    while (i < focus_stop_count) : (i += 1) {
+        const index = if (forward) i else focus_stop_count - 1 - i;
+        if (focus_stops[index].clip != null) return index;
+    }
+    return null;
+}
+
+fn setFocus(state: *runtime.AppState, stop_index: usize) void {
+    const stop = focus_stops[stop_index];
+    keyboard_focus = .{ .action = stop.action, .index = stop.index };
+    focus_ring_visible = true;
+    if (stop.clip) |clip| {
+        // Scroll just enough to reveal the stop plus a small margin.
+        const margin = theme.scaledUi(12.0);
+        const top = stop.rect.y;
+        const bottom = stop.rect.y + stop.rect.h;
+        if (top < clip.y) {
+            state.settings_controller.scroll_y = @max(0.0, state.settings_controller.scroll_y - (clip.y - top + margin));
+        } else if (bottom > clip.y + clip.h) {
+            state.settings_controller.scroll_y += bottom - (clip.y + clip.h) + margin;
+        }
+    }
+    state.markDirty();
+}
+
+/// Tab / Shift+Tab. The category nav is one stop (the active category);
+/// arrows move between categories, like a tab list.
+fn moveFocus(state: *runtime.AppState, forward: bool) void {
+    const n = focus_stop_count;
+    if (n == 0) return;
+    const active_nav = activeCategoryIndex(state);
+    var i: usize = focusedStopIndex() orelse if (forward) n - 1 else 0;
+    var steps: usize = 0;
+    while (steps < n) : (steps += 1) {
+        i = if (forward) (i + 1) % n else (i + n - 1) % n;
+        const stop = focus_stops[i];
+        if (stop.action == .settings_category and stop.index != active_nav) continue;
+        setFocus(state, i);
+        return;
+    }
+}
+
+fn selectCategoryByKeyboard(state: *runtime.AppState, index: usize) void {
+    applySettingsCategory(state, index);
+    keyboard_focus = .{ .action = .settings_category, .index = index };
+    focus_ring_visible = true;
+    state.markDirty();
+}
+
+fn stepBrowserScrollSpeed(state: *runtime.AppState, increase: bool) void {
+    const draft = &state.settings_controller.draft;
+    const step = app_config.BROWSER_SCROLL_SPEED_STEP;
+    const raw = draft.browser_scroll_speed + if (increase) step else -step;
+    const steps = @round((theme.clampf(raw, app_config.MIN_BROWSER_SCROLL_SPEED, app_config.MAX_BROWSER_SCROLL_SPEED) - app_config.MIN_BROWSER_SCROLL_SPEED) / step);
+    draft.browser_scroll_speed = app_config.MIN_BROWSER_SCROLL_SPEED + steps * step;
+    state.commitSettingsPreference();
+    state.markDirty();
+}
+
+/// Runs the same action a click on the stop would.
+fn activateStop(state: *runtime.AppState, stop: FocusStop) void {
+    switch (stop.action) {
+        .settings_close => state.closeSettingsPanel(),
+        .settings_category => selectCategoryByKeyboard(state, stop.index),
+        .settings_control => applyControl(state, stop.index),
+        .settings_runtime_action => applyRuntimeAction(state, stop.index),
+        .settings_phone_action => applyPhoneAction(state, stop.index),
+        .settings_custom_agent_add => custom_agent_form_state.openAdd(state),
+        .settings_custom_agent_edit => custom_agent_form_state.openEdit(state, stop.index),
+        .settings_custom_agent_remove => custom_agent_form_state.remove(state, stop.index),
+        else => {},
+    }
+}
+
+fn handleFocusKeyDown(state: *runtime.AppState, key: palette.event.Keycode) bool {
+    const current = focusedStopIndex();
+    const category_count = settings_controller.Category.all.len;
+    switch (key) {
+        .@"return", .kp_enter, .space => {
+            const index = current orelse return false;
+            focus_ring_visible = true;
+            activateStop(state, focus_stops[index]);
+            state.markDirty();
+            return true;
+        },
+        .up, .down => {
+            const forward = key == .down;
+            const index = current orelse {
+                if (firstBodyStop(forward)) |body| setFocus(state, body);
+                return true;
+            };
+            const stop = focus_stops[index];
+            if (stop.action == .settings_category) {
+                const next = if (forward) @min(stop.index + 1, category_count - 1) else stop.index -| 1;
+                if (next != stop.index) selectCategoryByKeyboard(state, next);
+                return true;
+            }
+            if (stop.clip == null) return true;
+            // Walk to the neighboring page control; stop at the page edges.
+            var i = index;
+            while (if (forward) i + 1 < focus_stop_count else i > 0) {
+                i = if (forward) i + 1 else i - 1;
+                if (focus_stops[i].clip != null) {
+                    setFocus(state, i);
+                    break;
+                }
+            }
+            return true;
+        },
+        .left, .right => {
+            const index = current orelse return false;
+            const stop = focus_stops[index];
+            if (stop.action == .settings_control and stop.index == @intFromEnum(Control.browser_scroll_speed)) {
+                stepBrowserScrollSpeed(state, key == .right);
+                return true;
+            }
+            if (stop.action == .settings_category and key == .right) {
+                if (firstBodyStop(true)) |body| setFocus(state, body);
+                return true;
+            }
+            if (stop.clip != null and key == .left) {
+                if (stopIndexFor(.settings_category, activeCategoryIndex(state))) |nav| setFocus(state, nav);
+                return true;
+            }
+            return false;
+        },
+        .home, .end => {
+            const index = current orelse return false;
+            if (focus_stops[index].action != .settings_category) return false;
+            selectCategoryByKeyboard(state, if (key == .home) 0 else category_count - 1);
+            return true;
+        },
+        .pageup, .pagedown => {
+            const page = @max(focus_body_clip.h * 0.9, 1.0);
+            const delta = if (key == .pagedown) page else -page;
+            state.settings_controller.scroll_y = @max(0.0, state.settings_controller.scroll_y + delta);
+            state.markDirty();
+            return true;
+        },
+        else => return false,
+    }
+}
+
+/// Moves keyboard focus to a clicked control without showing the ring, so a
+/// following Tab continues from where the pointer left off.
+pub fn noteClickedHit(action: runtime.PaletteModalAction, index: usize) void {
+    focus_ring_visible = false;
+    if (stopIndexFor(action, index) != null) keyboard_focus = .{ .action = action, .index = index };
+}
+
+/// Keys belong to a sheet or prompt stacked above settings, not to settings.
+fn overlayOwnsKeyboard(state: *const runtime.AppState) bool {
+    return state.custom_agent_form.open or
+        state.folder_browser.open or
+        state.runtimeCredentialModalOpen() or
+        state.runtimeTrustProposal() != null or
+        state.runtime_connections.wizard_open or
+        state.command_controller.open or
+        state.workspaceSettingsOpen() or
+        state.settings_controller.provider_onboarding_visible or
+        state.settings_controller.mcp_onboarding_visible;
+}
+
+fn dropdownOpen(state: *const runtime.AppState) bool {
+    const sc = &state.settings_controller;
+    return sc.theme_dropdown_open or
+        sc.companion_character_dropdown_open or
+        sc.title_provider_dropdown_open or
+        sc.title_model_dropdown_open or
+        sc.new_chat_provider_dropdown_open or
+        sc.new_chat_model_dropdown_open or
+        sc.new_chat_reasoning_dropdown_open or
+        sc.open_action_dropdown_open or
+        sc.commit_menu != null;
+}
+
+/// Closes every settings dropdown menu without applying a choice.
+pub fn closeDropdowns(state: *runtime.AppState) void {
+    if (!dropdownOpen(state)) return;
+    const sc = &state.settings_controller;
+    sc.theme_dropdown_open = false;
+    sc.theme_hover_index = null;
+    sc.companion_character_dropdown_open = false;
+    sc.companion_character_hover_index = null;
+    sc.title_provider_dropdown_open = false;
+    sc.title_model_dropdown_open = false;
+    sc.title_menu_hover_index = null;
+    sc.commit_menu = null;
+    sc.commit_menu_hover_index = null;
+    sc.new_chat_provider_dropdown_open = false;
+    sc.new_chat_model_dropdown_open = false;
+    sc.new_chat_reasoning_dropdown_open = false;
+    sc.new_chat_menu_hover_index = null;
+    sc.open_action_dropdown_open = false;
+    sc.open_action_hover_index = null;
+    state.markDirty();
+}
+
+// Focus ring: accent outline offset outside the focused control.
+fn drawFocusRing(state: *runtime.AppState) void {
+    if (!focus_ring_visible) return;
+    const index = focusedStopIndex() orelse return;
+    const stop = focus_stops[index];
+    const ring_w = @max(1.0, @round(theme.scaledUi(2.0)));
+    const gap = ring_w;
+    const left = @round(stop.rect.x - gap);
+    const top = @round(stop.rect.y - gap);
+    const ring: palette.Rect = .{
+        .x = left,
+        .y = top,
+        .w = @round(stop.rect.x + stop.rect.w + gap) - left,
+        .h = @round(stop.rect.y + stop.rect.h + gap) - top,
+    };
+    const color = paletteColor(theme.accent());
+    if (stop.clip) |clip| {
+        queueBorderClipped(state, ring, color, radiusSm() + gap, ring_w, clip);
+    } else {
+        queueBorder(state, ring, color, radiusSm() + gap, ring_w);
+    }
 }
 
 fn handleThemeKeyDown(state: *runtime.AppState, key: palette.event.Keycode) bool {
@@ -2729,7 +3077,7 @@ fn notesLineHeight() f32 {
 /// slack for ragged word-wrap edges so estimates err toward an extra row
 /// instead of clipping the last one.
 fn wrappedNotesRows(line: []const u8, usable_w: f32) f32 {
-    const width = text_measure.textWidth(.ui, theme.scaledUi(NOTES_FONT_SIZE), line);
+    const width = settingsTextWidth(theme.scaledUi(NOTES_FONT_SIZE), line);
     const rows = @ceil(width / @max(usable_w * 0.94, 1.0));
     return theme.clampf(rows, 1.0, 6.0);
 }
@@ -2787,24 +3135,25 @@ fn drawHeaderBar(state: *runtime.AppState, layout: SettingsLayout) void {
 }
 
 const PROVIDERS_RECHECK_LABEL = "Check again";
+/// Matches the onboarding dialog's wording for an installed CLI that lacks Node.js.
+const PROVIDER_NEEDS_NODE_BADGE = runtime.provider_setup.NEEDS_NODE_STATUS;
+const PROVIDER_GET_NODE_LABEL = "Get Node.js";
 const PROVIDERS_UPDATE_HINT = "Update uses the tool that installed that copy, such as mise.";
+/// Enable switch plus its margins at a provider row's right edge.
+const PROVIDER_SWITCH_RESERVE_UI: f32 = 10.0 + 40.0 + 20.0;
 
 fn providerRowHeight() f32 {
     return theme.scaledUi(46.0);
 }
 
-fn providerBadgeColumnWidth() f32 {
-    const badge_font = theme.scaledUi(12.0);
-    var badge_col_w: f32 = 0.0;
-    for ([_]runtime.ProviderReadiness{ .checking, .missing, .signed_out, .ready, .unavailable }) |value| {
-        badge_col_w = @max(badge_col_w, text_measure.textWidth(.ui, badge_font, providerReadinessBadge(value)));
-    }
-    return badge_col_w + theme.scaledUi(4.0);
-}
+const ProviderAction = enum { install, sign_in, update, latest, pending, get_node, none };
 
-const ProviderAction = enum { install, sign_in, update, latest, pending, none };
-
-fn providerAction(readiness: runtime.ProviderReadiness, release: runtime.ProviderRelease) ProviderAction {
+fn providerAction(snapshot: *const runtime.ProviderReadinessSnapshot, provider: runtime.Provider) ProviderAction {
+    const readiness = snapshot.forProvider(provider);
+    const release = snapshot.releaseForProvider(provider);
+    // The CLI is installed but Verde also needs Node.js; reinstalling the CLI
+    // would not help, so the action points at Node.js itself.
+    if (readiness == .missing and snapshot.requirementForProvider(provider) == .node) return .get_node;
     if (readiness == .missing) return .install;
     // Installed but not authenticated (or auth could not be confirmed): sign-in
     // is the step that unblocks chats, so it takes the slot over Update.
@@ -2825,42 +3174,94 @@ fn providerReadinessColor(readiness: runtime.ProviderReadiness) [4]f32 {
     };
 }
 
+/// Same wording as the "Connect an AI provider" dialog rows (layout.zig
+/// `renderProviderReadinessRow`) so both surfaces describe a provider alike.
 fn providerReadinessBadge(readiness: runtime.ProviderReadiness) []const u8 {
     return switch (readiness) {
         .checking => "Checking…",
-        .missing => "Not installed",
-        .signed_out => "Signed out",
-        .ready => "Authenticated",
-        .unavailable => "Unavailable",
+        .missing => "CLI not found",
+        .signed_out => "Sign-in needed",
+        .ready => "Ready",
+        .unavailable => "Could not verify",
     };
 }
 
+/// Provider names as the onboarding dialog shows them
+/// (layout.zig `providerOnboardingName`).
+fn providerDisplayName(provider: runtime.Provider) []const u8 {
+    return switch (provider) {
+        .codex => "Codex",
+        .opencode => "OpenCode",
+        .claude => "Claude Code",
+        .cursor => "Cursor",
+        .pi => "Pi",
+        .fx => "FX",
+        .grok => "Grok",
+        .muse => "Muse",
+        .custom_acp => "Custom ACP agents",
+    };
+}
+
+/// Codex's Verde MCP entry is written with `default_tools_approval_mode =
+/// "approve"` (providers/mcp.zig), so say so where the user turns it on.
+const MCP_AUTO_APPROVE_NOTE = "In Codex, Verde's tools are set to auto-approve (no prompt per call).";
+
+/// Comma-separated names of the MCP providers in `status`, e.g. the ones whose
+/// existing `verde` entry was kept instead of overwritten.
+fn mcpProviderNames(buf: []u8, summary: anytype, status: @TypeOf(summary.codex)) []const u8 {
+    var writer: std.Io.Writer = .fixed(buf);
+    var count: usize = 0;
+    inline for (std.meta.fields(@TypeOf(summary))) |field| {
+        if (@field(summary, field.name) == status) {
+            if (count > 0) writer.writeAll(", ") catch {};
+            writer.writeAll(mcpProviderName(field.name)) catch {};
+            count += 1;
+        }
+    }
+    return buf[0..writer.end];
+}
+
+fn mcpProviderName(comptime field_name: []const u8) []const u8 {
+    const names = .{
+        .{ "codex", "Codex" },
+        .{ "claude", "Claude Code" },
+        .{ "cursor", "Cursor" },
+        .{ "opencode", "OpenCode" },
+        .{ "amp", "Amp" },
+        .{ "pi", "Pi" },
+        .{ "fx", "FX" },
+        .{ "grok", "Grok" },
+    };
+    inline for (names) |pair| {
+        if (comptime std.mem.eql(u8, pair[0], field_name)) return pair[1];
+    }
+    return field_name;
+}
+
 fn drawProvidersCard(state: *runtime.AppState, layout: SettingsLayout, m: Metrics) void {
-    // Providers page: logo, name, daemon-reported CLI version, installer
-    // button, auth badge, and enable switch.
+    // Providers page: logo, name over a status line (dot, auth status, CLI
+    // version), then the installer/sign-in button and the enable switch.
     const clip = layout.body_clip;
     drawCard(state, layout.providers_card, clip);
     drawCardTitle(state, layout.providers_card, "Model providers", clip);
     const snapshot = state.providerReadinessSnapshot();
-    const badge_font = theme.scaledUi(12.0);
+    const status_font = theme.scaledUi(11.5);
     const name_font = theme.scaledUi(13.0);
-    const version_font = theme.scaledUi(11.0);
     const dot = theme.scaledUi(7.0);
     const inset = theme.scaledUi(10.0);
     const logo = theme.scaledUi(18.0);
     const logo_gap = theme.scaledUi(10.0);
-    const switch_reserve = theme.scaledUi(10.0 + 40.0 + 20.0);
-    const badge_col_w = providerBadgeColumnWidth();
     for (layout.provider_rows, layout.provider_updates, 0..) |row, update, index| {
         const enabled = state.settingsProviderEnabled(index);
         const provider = settings_controller.settingsProviderForRow(index);
         const readiness = snapshot.forProvider(provider);
         const version = snapshot.versionForProvider(provider);
-        const action = providerAction(readiness, snapshot.releaseForProvider(provider));
+        const action = providerAction(&snapshot, provider);
+        const needs_node = readiness == .missing and snapshot.requirementForProvider(provider) == .node;
         drawSwitchRow(state, row, "", enabled, isControlHovered(state, providerRowControl(index)), clip);
 
         const logo_rect: palette.Rect = .{ .x = row.x + inset, .y = row.y + (row.h - logo) * 0.5, .w = logo, .h = logo };
-        const label = state.settingsNewChatProviderLabel(index);
+        const label = providerDisplayName(provider);
         const texture = state.providerLogoTexture(provider);
         if (texture != null and texture.?.valid and texture.?.texture_id != 0) {
             const cached = texture.?;
@@ -2874,42 +3275,44 @@ fn drawProvidersCard(state: *runtime.AppState, layout: SettingsLayout, m: Metric
             queueCenteredText(state, logo_rect, label[0..1], paletteColor(textLabel()), theme.scaledUi(11.0), clip);
         }
 
-        const badge_x = row.x + row.w - switch_reserve - badge_col_w;
-        const dot_x = badge_x - dot - theme.scaledUi(7.0);
+        // Both lines stop short of the action button and ellipsize instead
+        // of running underneath it.
         const name_x = logo_rect.x + logo + logo_gap;
-        const name_w = @max(update.x - theme.scaledUi(8.0) - name_x, 0.0);
-        const name_y = row.y + theme.scaledUi(4.0);
+        const text_w = @max(update.x - theme.scaledUi(10.0) - name_x, 0.0);
+        const name_y = row.y + theme.scaledUi(5.0);
+        var name_buf: [64]u8 = undefined;
         queueText(state, .{
             .x = name_x,
             .y = name_y,
-            .w = name_w,
+            .w = text_w,
             .h = theme.scaledUi(16.0),
-        }, label, paletteColor(if (enabled) theme.COLOR_WHITE else textLabel()), name_font, clip);
-        const version_label = if (version.len > 0)
-            provider_cli_version.shortVersion(version)
-        else if (readiness == .checking)
-            "Checking…"
-        else
-            "—";
-        queueText(state, .{
-            .x = name_x,
-            .y = name_y + theme.scaledUi(16.0),
-            .w = @max(dot_x - theme.scaledUi(8.0) - name_x, 0.0),
-            .h = theme.scaledUi(14.0),
-        }, version_label, paletteColor(textHint()), version_font, clip);
+        }, ellipsizedText(&name_buf, label, name_font, text_w), paletteColor(if (enabled) theme.COLOR_WHITE else textLabel()), name_font, clip);
 
-        const color = if (enabled) providerReadinessColor(readiness) else theme.COLOR_TEXT_SUBTLE;
-        queueRoundedRectClipped(state, .{ .x = dot_x, .y = row.y + (row.h - dot) * 0.5, .w = dot, .h = dot }, paletteColor(color), dot * 0.5, clip);
-        queueText(state, .{
-            .x = badge_x,
-            .y = row.y + (row.h - m.label_h) * 0.5,
-            .w = badge_col_w,
-            .h = m.label_h,
-        }, providerReadinessBadge(readiness), paletteColor(if (enabled) textLabel() else textHint()), badge_font, clip);
+        // Status line: the same dot colors and words as the provider dialog
+        // (Needs Node.js reads amber, as there), then the CLI version.
+        const line_y = name_y + theme.scaledUi(18.0);
+        const line_h = theme.scaledUi(14.0);
+        const color = if (!enabled) theme.COLOR_TEXT_SUBTLE else if (needs_node) theme.warning() else providerReadinessColor(readiness);
+        queueRoundedRectClipped(state, .{ .x = name_x, .y = line_y + (line_h - dot) * 0.5, .w = dot, .h = dot }, paletteColor(color), dot * 0.5, clip);
+        const status_x = name_x + dot + theme.scaledUi(6.0);
+        const status_room = @max(update.x - theme.scaledUi(10.0) - status_x, 0.0);
+        const status = if (needs_node) PROVIDER_NEEDS_NODE_BADGE else providerReadinessBadge(readiness);
+        var status_buf: [64]u8 = undefined;
+        const status_text = ellipsizedText(&status_buf, status, status_font, status_room);
+        queueText(state, .{ .x = status_x, .y = line_y, .w = status_room, .h = line_h }, status_text, paletteColor(if (enabled) textLabel() else textHint()), status_font, clip);
+        if (version.len > 0) {
+            var version_text_buf: [96]u8 = undefined;
+            const version_text = std.fmt.bufPrint(&version_text_buf, " · {s}", .{provider_cli_version.shortVersion(version)}) catch "";
+            const version_x = status_x + settingsTextWidth(status_font, status_text);
+            const version_room = @max(status_x + status_room - version_x, 0.0);
+            var version_buf: [96]u8 = undefined;
+            queueText(state, .{ .x = version_x, .y = line_y, .w = version_room, .h = line_h }, ellipsizedText(&version_buf, version_text, status_font, version_room), paletteColor(textHint()), status_font, clip);
+        }
         switch (action) {
             .install => drawActionButton(state, update, "Install", .secondary, isControlHovered(state, providerUpdateControl(index)), clip),
             .update => drawActionButton(state, update, "Update", .secondary, isControlHovered(state, providerUpdateControl(index)), clip),
             .sign_in => drawActionButton(state, update, "Sign in", .primary, isControlHovered(state, providerUpdateControl(index)), clip),
+            .get_node => drawActionButton(state, update, PROVIDER_GET_NODE_LABEL, .primary, isControlHovered(state, providerUpdateControl(index)), clip),
             .pending => drawActionButton(state, update, "Checking…", .disabled, false, clip),
             .latest => queueCenteredText(state, update, "Latest", paletteColor(textHint()), theme.scaledUi(12.0), clip),
             .none => {},
@@ -2936,15 +3339,23 @@ fn drawProvidersCard(state: *runtime.AppState, layout: SettingsLayout, m: Metric
 
 const MAX_CUSTOM_AGENT_ROWS = app_config.custom_acp_agents.MAX_AGENTS;
 const CUSTOM_AGENTS_ADD_LABEL = "Add custom agent";
+/// One line; ellipsized on narrow cards rather than running past the edge.
+const CUSTOM_AGENTS_EMPTY = "No custom agents yet. Add one with its ACP server command.";
 const CUSTOM_AGENTS_SUBTITLE = "Any agent that speaks the Agent Client Protocol over stdio. Each one appears in the model picker under Custom ACP.";
 
 fn customAgentRowHeight() f32 {
     return theme.scaledUi(44.0);
 }
 
-fn customAgentsCardHeight(count: usize, m: Metrics) f32 {
+fn customAgentsCardHeight(count: usize, card_w: f32, m: Metrics) f32 {
     const rows_h = if (count == 0) m.label_h + m.inner_gap else @as(f32, @floatFromInt(count)) * customAgentRowHeight();
-    return m.card_pad * 2.0 + m.title_h + m.inner_gap + m.label_h + m.row_gap + rows_h + m.row_gap + m.row_h;
+    return m.card_pad * 2.0 + m.title_h + m.inner_gap + customAgentsSubtitleHeight(card_w, m) + m.row_gap + rows_h + m.row_gap + m.row_h;
+}
+
+/// The subtitle wraps inside the card instead of running past its edge.
+fn customAgentsSubtitleHeight(card_w: f32, m: Metrics) f32 {
+    const usable_w = @max(card_w - m.card_pad * 2.0, theme.scaledUi(80.0));
+    return @max(wrappedNotesRows(CUSTOM_AGENTS_SUBTITLE, usable_w) * notesLineHeight(), m.label_h);
 }
 
 fn drawCustomAgentsCard(state: *runtime.AppState, layout: SettingsLayout, m: Metrics) void {
@@ -2952,21 +3363,22 @@ fn drawCustomAgentsCard(state: *runtime.AppState, layout: SettingsLayout, m: Met
     const card = layout.custom_agents_card;
     drawCard(state, card, clip);
     drawCardTitle(state, card, "Custom ACP agents", clip);
-    queueText(state, .{
+    queueWrappedText(state, .{
         .x = card.x + m.card_pad,
         .y = layout.custom_agents_subtitle_y,
-        .w = card.w - m.card_pad * 2.0,
-        .h = m.label_h,
-    }, CUSTOM_AGENTS_SUBTITLE, paletteColor(textHint()), theme.scaledUi(12.0), clip);
+        .w = @max(card.w - m.card_pad * 2.0, theme.scaledUi(80.0)),
+        .h = customAgentsSubtitleHeight(card.w, m),
+    }, CUSTOM_AGENTS_SUBTITLE, paletteColor(textHint()), theme.scaledUi(NOTES_FONT_SIZE), clip);
 
     const agents = state.app_config.custom_acp_agents;
     if (layout.custom_agent_count == 0) {
+        var empty_buf: [96]u8 = undefined;
         queueText(state, .{
             .x = card.x + m.card_pad,
             .y = layout.custom_agents_empty_y,
             .w = card.w - m.card_pad * 2.0,
             .h = m.label_h,
-        }, "No custom agents yet. Add one with the command that starts its ACP server.", paletteColor(textLabel()), theme.scaledUi(12.5), clip);
+        }, ellipsizedText(&empty_buf, CUSTOM_AGENTS_EMPTY, theme.scaledUi(12.5), card.w - m.card_pad * 2.0), paletteColor(textLabel()), theme.scaledUi(12.5), clip);
     }
     const mouse_x = state.transcript_controller.palette_mouse_x;
     const mouse_y = state.transcript_controller.palette_mouse_y;
@@ -2974,9 +3386,11 @@ fn drawCustomAgentsCard(state: *runtime.AppState, layout: SettingsLayout, m: Met
         const agent = agents[index];
         const row = layout.custom_agent_rows[index];
         const text_w = @max(layout.custom_agent_edits[index].x - m.inner_gap - row.x, 0.0);
-        queueText(state, .{ .x = row.x, .y = row.y + theme.scaledUi(5.0), .w = text_w, .h = theme.scaledUi(16.0) }, agent.name, paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.0), clip);
+        var name_buf: [128]u8 = undefined;
+        queueText(state, .{ .x = row.x, .y = row.y + theme.scaledUi(5.0), .w = text_w, .h = theme.scaledUi(16.0) }, ellipsizedText(&name_buf, agent.name, theme.scaledUi(13.0), text_w), paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.0), clip);
         var command_buf: [256]u8 = undefined;
-        queueText(state, .{ .x = row.x, .y = row.y + theme.scaledUi(23.0), .w = text_w, .h = theme.scaledUi(14.0) }, commandSummary(&command_buf, agent), paletteColor(textHint()), theme.scaledUi(11.0), clip);
+        var command_fit_buf: [256]u8 = undefined;
+        queueText(state, .{ .x = row.x, .y = row.y + theme.scaledUi(23.0), .w = text_w, .h = theme.scaledUi(14.0) }, ellipsizedText(&command_fit_buf, commandSummary(&command_buf, agent), theme.scaledUi(11.0), text_w), paletteColor(textHint()), theme.scaledUi(11.0), clip);
         const edit = layout.custom_agent_edits[index];
         const remove = layout.custom_agent_removes[index];
         drawActionButton(state, edit, "Edit", .secondary, pointInRect(mouse_x, mouse_y, edit), clip);
@@ -3095,7 +3509,21 @@ const RuntimeCardPlan = struct {
 const DetailLine = struct {
     text: []const u8,
     tone: enum { normal, muted, warning, good },
+    /// A remote provider's Install / Sign in control drawn before `text`;
+    /// the line occupies two line slots (the next one is a blank spacer).
+    setup: ?ProviderSetupLine = null,
 };
+
+/// Remote provider line action: runs the provider setup flow on the runtime.
+const ProviderSetupLine = struct {
+    /// Index into `runtime_connections.providers`.
+    provider_row: usize,
+    label: []const u8,
+};
+
+/// Marks a `settings_runtime_action` index as a remote provider setup button
+/// (`(row << 8) | provider_row`) rather than an encoded `RowAction`.
+const PROVIDER_SETUP_ACTION_BIT: usize = 1 << (@bitSizeOf(usize) - 2);
 
 const DetailBuffer = struct {
     lines: [MAX_DETAIL_LINES]DetailLine = undefined,
@@ -3112,7 +3540,99 @@ const DetailBuffer = struct {
         self.lines[self.count] = .{ .text = text, .tone = tone };
         self.count += 1;
     }
+
+    fn pushSetup(self: *DetailBuffer, setup: ProviderSetupLine, comptime fmt: []const u8, args: anytype) void {
+        if (self.count + 2 > MAX_DETAIL_LINES) return;
+        self.push(.muted, fmt, args);
+        self.lines[self.count - 1].setup = setup;
+        self.push(.muted, "", .{});
+    }
 };
+
+/// One readable status line for a runtime-reported provider. A runtime that
+/// cannot verify accounts (`authentication: "unknown"`) is not a warning;
+/// only an explicit sign-out or an unexpected state is.
+fn pushRemoteProviderStatus(state: *const runtime.AppState, profile_id: []const u8, row: runtime_connections.ProviderRow, readiness: runtime.ProviderReadiness, out: *DetailBuffer) void {
+    const known_state = std.mem.eql(u8, row.state, "unknown") or std.mem.eql(u8, row.state, "missing") or
+        std.mem.eql(u8, row.state, "ready") or std.mem.eql(u8, row.state, "signed_out");
+    if (!known_state) return out.push(.warning, "{s} · {s}", .{ row.label, row.state });
+    const provider = if (row.provider) |value| std.meta.stringToEnum(runtime.Provider, value) else null;
+    const setup = &state.settings_controller.provider_setup;
+    const signed_in = if (provider) |value| runtime.provider_setup.signedInThisSession(setup, profile_id, value) else false;
+    // Where the daemon cannot report sign-in, the runtime-side status probe
+    // decides; the session memory is the fallback.
+    const probed = if (provider) |value| runtime.provider_setup.probedAuth(setup, profile_id, value) else .unknown;
+    if (readiness == .unavailable) switch (probed) {
+        .signed_in => return out.push(.good, "{s} · signed in", .{row.label}),
+        .signed_out => return out.push(.warning, "{s} · not signed in", .{row.label}),
+        .unknown => {},
+    };
+    switch (readiness) {
+        .ready => out.push(.good, "{s} · ready", .{row.label}),
+        .missing => out.push(.normal, "{s} · not installed", .{row.label}),
+        .signed_out => out.push(.warning, "{s} · not signed in", .{row.label}),
+        .unavailable, .checking => if (signed_in)
+            out.push(.good, "{s} · signed in this session (the runtime can't confirm accounts)", .{row.label})
+        else
+            out.push(.normal, "{s} · installed · sign-in not verifiable on this runtime", .{row.label}),
+    }
+}
+
+/// The dialog provider a remote providers.status row maps to, and whether
+/// it needs installing; null when Verde has no setup flow for it or it is
+/// already ready.
+fn remoteProviderSetup(state: *const runtime.AppState, profile_id: []const u8, row: runtime_connections.ProviderRow) ?struct { provider: runtime.Provider, missing: bool } {
+    const id = row.provider orelse return null;
+    const provider = std.meta.stringToEnum(runtime.Provider, id) orelse return null;
+    if (provider == .custom_acp) return null;
+    const readiness = runtime.provider_setup.remoteReadiness(null, row.state, row.authentication);
+    if (remoteProviderSignedIn(state, profile_id, row, readiness)) return null;
+    return .{ .provider = provider, .missing = readiness == .missing };
+}
+
+/// Ready as reported, or (where the runtime cannot report sign-in) signed in
+/// per the runtime-side probe or a sign-in completed this app session; a
+/// probe that says signed out wins over the session memory.
+fn remoteProviderSignedIn(state: *const runtime.AppState, profile_id: []const u8, row: runtime_connections.ProviderRow, readiness: runtime.ProviderReadiness) bool {
+    if (readiness == .ready) return true;
+    if (readiness != .unavailable) return false;
+    const id = row.provider orelse return false;
+    const provider = std.meta.stringToEnum(runtime.Provider, id) orelse return false;
+    const setup = &state.settings_controller.provider_setup;
+    return switch (runtime.provider_setup.probedAuth(setup, profile_id, provider)) {
+        .signed_in => true,
+        .signed_out => false,
+        .unknown => runtime.provider_setup.signedInThisSession(setup, profile_id, provider),
+    };
+}
+
+/// Install / Sign in button for a detail line with `setup`, left-aligned with
+/// the provider text and centered in its two line slots.
+fn providerSetupButtonRect(row_plan: *const RuntimeRowPlan, line_index: usize, label: []const u8) palette.Rect {
+    const t = RuntimeTileMetrics.init();
+    const h = theme.scaledUi(26.0);
+    const line_y = row_plan.detail_y + @as(f32, @floatFromInt(line_index)) * t.detail_line_h;
+    return .{
+        .x = row_plan.header.x + t.pad + theme.scaledUi(14.0),
+        .y = line_y + (t.detail_line_h * 2.0 - h) * 0.5,
+        .w = buttonWidth(label),
+        .h = h,
+    };
+}
+
+/// Routes a `settings_runtime_action` click or keyboard activation: remote
+/// provider setup buttons open the setup flow on that runtime; everything
+/// else is a runtime row action.
+pub fn applyRuntimeAction(state: *runtime.AppState, index: usize) void {
+    if (index & PROVIDER_SETUP_ACTION_BIT == 0) return state.applyRuntimeRowAction(index);
+    const raw = index & ~PROVIDER_SETUP_ACTION_BIT;
+    const profile_id = runtimeRowProfileId(state, raw >> 8) orelse return;
+    const providers = state.runtime_connections.providers.items;
+    const provider_row = raw & 0xff;
+    if (provider_row >= providers.len) return;
+    const setup = remoteProviderSetup(state, profile_id, providers[provider_row]) orelse return;
+    runtime.provider_setup.openForRuntime(state, profile_id, setup.provider, setup.missing);
+}
 
 fn runtimeRowProfileId(state: *const runtime.AppState, row: usize) ?[]const u8 {
     if (row == 0) return null;
@@ -3131,7 +3651,37 @@ fn runtimeRowIsWorkspaceDefault(state: *const runtime.AppState, profile_id: ?[]c
 fn buttonWidth(label: []const u8) f32 {
     // Measured label plus a fixed horizontal pad so short verbs keep a
     // comfortable click target and long ones never clip.
-    return text_measure.textWidth(.ui, theme.scaledUi(13.0), label) + theme.scaledUi(28.0);
+    return settingsTextWidth(theme.scaledUi(13.0), label) + theme.scaledUi(28.0);
+}
+
+/// Width of text queued through `queueText`. That path leaves the font role
+/// unset, so the renderer draws it with its default face (prose bold), which
+/// is wider than the `.ui` face; measuring `.ui` let long labels such as
+/// "Add custom agent" spill past their buttons.
+fn settingsTextWidth(font_size: f32, value: []const u8) f32 {
+    return text_measure.textWidth(.prose_bold, font_size, value);
+}
+
+/// `value` shortened with a trailing ellipsis to fit `max_w` as drawn by
+/// `queueText`; cuts only at UTF-8 boundaries. Returns `value` when it fits.
+fn ellipsizedText(buf: []u8, value: []const u8, font_size: f32, max_w: f32) []const u8 {
+    if (settingsTextWidth(font_size, value) <= max_w) return value;
+    const ellipsis = "\u{2026}";
+    if (buf.len <= ellipsis.len) return "";
+    const budget = max_w - settingsTextWidth(font_size, ellipsis);
+    // Binary search the longest fitting prefix; widths grow with length.
+    var lo: usize = 0;
+    var hi: usize = @min(value.len, buf.len - ellipsis.len);
+    while (lo < hi) {
+        var mid = lo + (hi - lo + 1) / 2;
+        while (mid > lo and mid < value.len and (value[mid] & 0xC0) == 0x80) mid -= 1;
+        if (mid == lo) break;
+        if (settingsTextWidth(font_size, value[0..mid]) <= budget) lo = mid else hi = mid - 1;
+    }
+    const kept = std.mem.trimEnd(u8, value[0..lo], " ");
+    @memcpy(buf[0..kept.len], kept);
+    @memcpy(buf[kept.len .. kept.len + ellipsis.len], ellipsis);
+    return buf[0 .. kept.len + ellipsis.len];
 }
 
 /// Lays out one row's buttons left-to-right, wrapping to a new line when the
@@ -3286,29 +3836,24 @@ fn collectRuntimeDetailLines(state: *const runtime.AppState, profile_id: ?[]cons
         .failed => out.push(.warning, "Providers · inventory could not be read", .{}),
         .loaded => {
             out.push(.muted, "Providers on this runtime", .{});
-            var needs_remote_setup = false;
-            for (rc.providers.items) |row| {
-                const ready = std.mem.eql(u8, row.state, "ready");
-                out.push(if (ready) .good else .warning, "{s} · {s} · {s}{s}{s}{s}{s}", .{
-                    row.label,
-                    row.state,
-                    row.authentication,
-                    if (row.native_chat) " · chat" else "",
-                    if (row.terminal_tui) " · terminal" else "",
-                    if (row.mcp) " · mcp" else "",
-                    if (row.lifecycle) " · hooks" else "",
-                });
+            for (rc.providers.items, 0..) |row, provider_row| {
+                const readiness = runtime.provider_setup.remoteReadiness(null, row.state, row.authentication);
+                // Signed-in rows (reported, probed, or signed in this
+                // session) need no remediation line or Sign in button.
+                const ready = remoteProviderSignedIn(state, id, row, readiness);
+                pushRemoteProviderStatus(state, id, row, readiness, out);
                 if (!ready) {
-                    if (row.remediation_command) |command| {
+                    if (remoteProviderSetup(state, id, row)) |setup| {
+                        // Runs in a terminal on this runtime, from the provider dialog.
+                        out.pushSetup(.{ .provider_row = provider_row, .label = if (setup.missing) "Install" else "Sign in" }, "{s}", .{row.remediation_command orelse row.remediation_label orelse ""});
+                    } else if (row.remediation_command) |command| {
                         out.push(.muted, "    {s}: {s}", .{ row.remediation_label orelse "Setup", command });
                     } else if (row.remediation_label) |label| {
                         out.push(.muted, "    {s}", .{label});
                     }
-                    needs_remote_setup = true;
                 }
             }
             if (rc.providers_truncated > 0) out.push(.muted, "+{d} more providers", .{rc.providers_truncated});
-            if (needs_remote_setup) out.push(.muted, "Run setup commands on the runtime host; the desktop has no remote shell and cannot sign in for you.", .{});
         },
     }
 }
@@ -3418,16 +3963,33 @@ fn registerRuntimeCardHits(state: *runtime.AppState, layout: SettingsLayout, que
     const plan = &layout.runtimes;
     for (0..plan.row_count) |row| {
         const row_plan = &plan.rows[row];
+        recordFocusStop(.settings_runtime_action, runtime_connections.encodeRowAction(row, .expand), row_plan.header, layout.body_clip);
         if (intersectRect(row_plan.header, layout.body_clip)) |visible| {
             queue_hit(state, visible, .settings_runtime_action, runtime_connections.encodeRowAction(row, .expand));
         }
         for (0..row_plan.button_count) |index| {
             if (row_plan.button_styles[index] == .disabled) continue;
+            recordFocusStop(.settings_runtime_action, runtime_connections.encodeRowAction(row, row_plan.button_actions[index]), row_plan.buttons[index], layout.body_clip);
             if (intersectRect(row_plan.buttons[index], layout.body_clip)) |visible| {
                 queue_hit(state, visible, .settings_runtime_action, runtime_connections.encodeRowAction(row, row_plan.button_actions[index]));
             }
         }
     }
+    // Remote provider Install / Sign in buttons in the expanded row's details.
+    for (0..plan.row_count) |row| {
+        const row_plan = &plan.rows[row];
+        if (!row_plan.expanded or row_plan.detail_line_count == 0) continue;
+        var buffer: DetailBuffer = .{};
+        collectRuntimeDetailLines(state, runtimeRowProfileId(state, row), &buffer);
+        for (buffer.lines[0..buffer.count], 0..) |line, line_index| {
+            const setup = line.setup orelse continue;
+            const rect = providerSetupButtonRect(row_plan, line_index, setup.label);
+            const action = PROVIDER_SETUP_ACTION_BIT | (row << 8) | setup.provider_row;
+            recordFocusStop(.settings_runtime_action, action, rect, layout.body_clip);
+            if (intersectRect(rect, layout.body_clip)) |visible| queue_hit(state, visible, .settings_runtime_action, action);
+        }
+    }
+    recordFocusStop(.settings_runtime_action, runtime_connections.encodeRowAction(0, .add_connection), plan.add_button, layout.body_clip);
     if (intersectRect(plan.add_button, layout.body_clip)) |visible| {
         queue_hit(state, visible, .settings_runtime_action, runtime_connections.encodeRowAction(0, .add_connection));
     }
@@ -3537,7 +4099,7 @@ fn drawRuntimeCard(state: *runtime.AppState, layout: SettingsLayout) void {
         if (badge.len > 0) {
             const badge_font = theme.scaledUi(11.5);
             const badge_h = theme.scaledUi(20.0);
-            const badge_w = text_measure.textWidth(.ui, badge_font, badge) + theme.scaledUi(16.0);
+            const badge_w = settingsTextWidth(badge_font, badge) + theme.scaledUi(16.0);
             const badge_rect: palette.Rect = .{
                 .x = right_edge - badge_w,
                 .y = title_y + (t.title_h - badge_h) * 0.5,
@@ -3583,6 +4145,19 @@ fn drawRuntimeCard(state: *runtime.AppState, layout: SettingsLayout) void {
                 const line_y = row_plan.detail_y + @as(f32, @floatFromInt(line_index)) * t.detail_line_h;
                 const text_h = theme.scaledUi(16.0);
                 const text_y = line_y + (t.detail_line_h - text_h) * 0.5;
+                if (line.setup) |setup| {
+                    const button = providerSetupButtonRect(row_plan, line_index, setup.label);
+                    const action = PROVIDER_SETUP_ACTION_BIT | (row << 8) | setup.provider_row;
+                    drawActionButton(state, button, setup.label, .secondary, isRuntimeActionHovered(state, action), clip);
+                    const command_x = button.x + button.w + m.inner_gap;
+                    queueText(state, .{
+                        .x = command_x,
+                        .y = button.y + (button.h - text_h) * 0.5,
+                        .w = @max(tile.x + tile.w - t.pad - command_x, 0.0),
+                        .h = text_h,
+                    }, line.text, paletteColor(textHint()), theme.scaledUi(12.0), clip);
+                    continue;
+                }
                 // Status lines get a tone dot like the Providers page;
                 // headings and notes stay plain text.
                 const status_color: ?[4]f32 = switch (line.tone) {
@@ -4066,26 +4641,6 @@ fn drawBrowserScrollSpeedSlider(state: *runtime.AppState, row: palette.Rect, val
     queueCenteredText(state, .{ .x = hit.x + hit.w + theme.scaledUi(8.0), .y = row.y, .w = theme.scaledUi(50.0), .h = row.h }, value_text, paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.0), clip);
 }
 
-// Experimental Companion row with semantic active-theme badge copy.
-fn drawCompanionExperimentalRow(state: *runtime.AppState, rect: palette.Rect, on: bool, hovered: bool, clip: palette.Rect) void {
-    drawSwitchRow(state, rect, "Companion", on, hovered, clip);
-    const label_font_size = theme.scaledUi(13.0);
-    const badge_font_size = theme.scaledUi(10.5);
-    const badge_h = theme.scaledUi(19.0);
-    const badge_pad_x = theme.scaledUi(7.0);
-    const label_w = text_measure.textWidth(.ui, label_font_size, "Companion");
-    const badge_text_w = text_measure.textWidth(.ui, badge_font_size, "Experimental");
-    const badge: palette.Rect = .{
-        .x = rect.x + theme.scaledUi(10.0) + label_w + theme.scaledUi(9.0),
-        .y = rect.y + (rect.h - badge_h) * 0.5,
-        .w = badge_text_w + badge_pad_x * 2.0,
-        .h = badge_h,
-    };
-    queueRoundedRectClipped(state, badge, paletteColor(theme.withAlpha(theme.accent(), 34)), badge_h * 0.5, clip);
-    queueBorderClipped(state, badge, paletteColor(theme.withAlpha(theme.accent(), 130)), badge_h * 0.5, theme.scaledUi(1.0), clip);
-    queueCenteredText(state, badge, "Experimental", paletteColor(theme.accent()), badge_font_size, clip);
-}
-
 // Two-option exclusive choice rendered as one segmented control.
 fn drawSegmentedPair(
     state: *runtime.AppState,
@@ -4281,7 +4836,7 @@ fn drawHairline(state: *runtime.AppState, x: f32, y: f32, w: f32) void {
 fn queueCenteredText(state: *runtime.AppState, rect: palette.Rect, value: []const u8, color: palette.Color, font_size: f32, clip: ?palette.Rect) void {
     // Measure the real advance so button labels sit centered instead of
     // drifting left when a per-character estimate overshoots.
-    const estimated_w = text_measure.textWidth(.ui, font_size, value);
+    const estimated_w = settingsTextWidth(font_size, value);
     queueText(state, .{
         .x = rect.x + @max((rect.w - estimated_w) * 0.5, theme.scaledUi(2.0)),
         .y = rect.y + (rect.h - font_size * 1.25) * 0.5,
@@ -4516,6 +5071,7 @@ const PhoneCard = struct {
         const rect: palette.Rect = .{ .x = self.x, .y = self.y, .w = self.w, .h = theme.scaledUi(30.0) };
         if (self.draw) drawActionButton(self.state, rect, label, if (selected) .primary else if (enabled) .secondary else .disabled, self.state.settings_controller.hover_runtime_action == (action | PHONE_HOVER_BIT), self.clip);
         if (enabled) if (self.queue_hit) |queue| {
+            recordFocusStop(.settings_phone_action, action, rect, self.clip);
             if (intersectRect(rect, self.clip)) |visible| queue(self.state, visible, .settings_phone_action, action);
         };
         self.y += rect.h + theme.scaledUi(8.0);

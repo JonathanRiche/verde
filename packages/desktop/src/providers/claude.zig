@@ -12,6 +12,10 @@ const runtime_log = @import("../runtime/log.zig");
 const MAX_BRIDGE_LINE_BYTES = 8 * 1024 * 1024;
 const BRIDGE_STOP_POLL_MS = 20;
 const BRIDGE_STEER_RESPONSE_WAIT_MS = 500;
+/// `claude auth status` reads local credentials; a wedged CLI must not hold a
+/// readiness check open past the UI's patience.
+const AUTH_STATUS_DEADLINE_MS: i64 = 5_000;
+const AUTH_STATUS_OUTPUT_LIMIT: usize = 64 * 1024;
 
 const Mutex = struct {
     inner: std.atomic.Mutex = .unlocked,
@@ -194,7 +198,11 @@ pub const Client = struct {
         return slashCommandResultAlloc(allocator, result);
     }
 
+    /// Asks the CLI's own `auth status` first: it reads local credentials
+    /// without starting a session or calling the API. CLIs too old to have it
+    /// fall back to the bridge's (session-free) SDK account read.
     pub fn authState(self: *Client) !provider_types.AuthState {
+        if (self.cliAuthState()) |state| return state;
         var response = try self.runBridge(.{ .provider = "claude", .command = "auth", .cwd = self.config.cwd, .claude_executable = self.config.claude_executable }, null);
         defer response.deinit(self.allocator);
 
@@ -203,6 +211,38 @@ pub const Client = struct {
         if (std.mem.eql(u8, state, "signed_in")) return .signed_in;
         if (std.mem.eql(u8, state, "signed_out")) return .signed_out;
         return .unknown;
+    }
+
+    /// Result of `claude auth status --json`, or null when this CLI cannot
+    /// answer it (missing subcommand, unparsable output).
+    fn cliAuthState(self: *Client) ?provider_types.AuthState {
+        var env_map = process_env.buildAugmentedEnvMap(self.allocator) catch return null;
+        defer env_map.deinit();
+        const executable = process_env.resolveExecutableInEnvMapAlloc(
+            self.allocator,
+            &env_map,
+            claudeExecutableName(self.config.claude_executable, &env_map),
+        ) catch return null;
+        defer self.allocator.free(executable);
+
+        var threaded: std.Io.Threaded = .init(self.allocator, .{});
+        defer threaded.deinit();
+        const result = std.process.run(self.allocator, threaded.io(), .{
+            .argv = &.{ executable, "auth", "status", "--json" },
+            // Project settings (apiKeyHelper, env) can change the answer.
+            .cwd = if (self.config.cwd) |path| .{ .path = path } else .inherit,
+            .environ_map = &env_map,
+            .stdout_limit = .limited(AUTH_STATUS_OUTPUT_LIMIT),
+            .stderr_limit = .limited(AUTH_STATUS_OUTPUT_LIMIT),
+            .timeout = .{ .duration = .{
+                .raw = .fromMilliseconds(AUTH_STATUS_DEADLINE_MS),
+                .clock = .awake,
+            } },
+        }) catch |err| return if (err == error.Timeout) .unknown else null;
+        defer self.allocator.free(result.stdout);
+        defer self.allocator.free(result.stderr);
+        // Signed out exits 1 with the same JSON shape; the body decides.
+        return authStateFromStatusJson(self.allocator, result.stdout);
     }
 
     pub fn listThreads(self: *Client, allocator: std.mem.Allocator) ![]provider_types.ChatThreadSummary {
@@ -765,6 +805,28 @@ fn containsImagePath(images: []const provider_types.ImageAttachment, path: []con
     return false;
 }
 
+/// Mirrors the bridge's `pathToClaudeCodeExecutable`: an explicit config
+/// wins, then Verde's and the SDK's executable overrides.
+fn claudeExecutableName(configured: []const u8, env_map: *const std.process.Environ.Map) []const u8 {
+    if (!std.mem.eql(u8, configured, "claude")) return configured;
+    for ([_][]const u8{ "VERDE_CLAUDE_CODE_EXECUTABLE", "CLAUDE_CODE_EXECUTABLE" }) |name| {
+        if (env_map.get(name)) |value| {
+            if (value.len > 0) return value;
+        }
+    }
+    return configured;
+}
+
+/// `loggedIn` covers OAuth, API keys, and cloud providers (Bedrock, Vertex).
+fn authStateFromStatusJson(allocator: std.mem.Allocator, stdout: []const u8) ?provider_types.AuthState {
+    const body = std.mem.trim(u8, stdout, &std.ascii.whitespace);
+    if (body.len == 0) return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return null;
+    defer parsed.deinit();
+    const logged_in = getOptionalObjectBool(parsed.value, "loggedIn") orelse return null;
+    return if (logged_in) .signed_in else .signed_out;
+}
+
 fn providerBridgePathAlloc(allocator: std.mem.Allocator) ![]u8 {
     const exe_path = try platform_runtime.executablePathAlloc(allocator);
     defer allocator.free(exe_path);
@@ -1015,6 +1077,21 @@ fn parseRole(text: []const u8) provider_types.MessageRole {
     if (std.mem.eql(u8, text, "system")) return .system;
     if (std.mem.eql(u8, text, "user")) return .user;
     return .assistant;
+}
+
+test "Claude auth status JSON decides sign-in, including API key and cloud auth" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectEqual(provider_types.AuthState.signed_out, authStateFromStatusJson(allocator,
+        \\{"loggedIn": false, "authMethod": "none", "apiProvider": "firstParty"}
+    ).?);
+    try std.testing.expectEqual(provider_types.AuthState.signed_in, authStateFromStatusJson(allocator,
+        \\{"loggedIn": true, "authMethod": "api_key", "apiKeySource": "ANTHROPIC_API_KEY"}
+    ).?);
+    try std.testing.expectEqual(provider_types.AuthState.signed_in, authStateFromStatusJson(allocator,
+        \\{"loggedIn": true, "authMethod": "third_party", "apiProvider": "bedrock"}
+    ).?);
+    try std.testing.expect(authStateFromStatusJson(allocator, "error: unknown command 'auth'") == null);
+    try std.testing.expect(authStateFromStatusJson(allocator, "") == null);
 }
 
 test "Claude bridge reader accepts lines larger than its scratch buffer" {

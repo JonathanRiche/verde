@@ -206,9 +206,9 @@ And the live layout while the app is running:
 verde live panes --project current --json
 ```
 
-## Experimental companion
+## Companion
 
-**Settings → Experimental features** enables the Companion. Toggle it with
+**Settings → Companion** turns the Companion on or off. Toggle it with
 `Ctrl+Shift+Space`. There is one companion roster per machine, not per
 workspace: your companion orchestrates all of Verde from any workspace.
 

@@ -364,6 +364,9 @@ pub const ChatThread = struct {
     tui_dock_id: ?u32 = null,
     completion_pending: bool = false,
     completed_at_ms: i64 = 0,
+    /// Hash of the approval call id already announced with the waiting chime,
+    /// so each approval request notifies once; zero when none is pending.
+    approval_notified_key: u64 = 0,
     /// Durable sort-index boundary before materialized messages.
     persisted_message_offset: usize = 0,
     /// Durable transcript end a projection refresh reported past the live
@@ -1061,6 +1064,10 @@ pub const TitleGenerationRequest = struct {
     assistant_text: []u8,
     provider: provider_types.Provider,
     model_ref: []u8,
+    /// The chat's own provider/model: the daemon's fallback when `provider`
+    /// is not signed in, so the chat is never titled by an unused provider.
+    chat_provider: provider_types.Provider,
+    chat_model_ref: ?[]u8 = null,
     /// Durable identity so the daemon can store the generated description.
     workspace_id: []u8,
     local_thread_id: []u8,

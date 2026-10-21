@@ -849,7 +849,7 @@ fn completeInterruptedClaudeTurn(
     handled: bool,
 ) void {
     const is_escape_press = event.down and !event.repeat and
-        (event.key == .escape or event.hidScancode() == .escape);
+        (event.key == .escape or (event.key == .unknown and event.hidScancode() == .escape));
     if (!isHandledClaudeEscape(provider, handled, is_escape_press)) return;
     const project_index = self.project_controller.selected_index;
     const dock = self.projectTerminalDock(project_index, dock_id) orelse return;

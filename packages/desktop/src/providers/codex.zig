@@ -10,7 +10,8 @@ const runtime_log = @import("../runtime/log.zig");
 
 const OVERLOAD_ERROR_CODE = -32001;
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-const DEFAULT_WS_URL = "ws://127.0.0.1:4500";
+/// Room for `ws://127.0.0.1:<port>` of the owned app-server.
+const OWNED_URL_CAPACITY = 64;
 // Codex can return saved thread history in one frame; match its own app-server client limit.
 const MAX_WS_MESSAGE_BYTES = 128 * 1024 * 1024;
 const MAX_HTTP_LINE_BYTES = 16 * 1024;
@@ -124,7 +125,9 @@ pub const Config = struct {
     executable: []const u8 = "codex",
     cwd: ?[]const u8 = null,
     transport: Transport = .websocket,
-    websocket_url: ?[]const u8 = DEFAULT_WS_URL,
+    /// Explicit app-server to use (and launch there when allowed). Null, the
+    /// default, means a private app-server this process spawns and owns.
+    websocket_url: ?[]const u8 = null,
     launch_on_connect: bool = true,
 };
 
@@ -132,6 +135,9 @@ const SharedServerState = struct {
     mutex: Mutex = .{},
     child: ?platform_process.OwnedChild = null,
     owns_child: bool = false,
+    /// Loopback URL the owned child listens on; empty without one.
+    url_bytes: [OWNED_URL_CAPACITY]u8 = undefined,
+    url_len: usize = 0,
 };
 
 var shared_server_state: SharedServerState = .{};
@@ -799,6 +805,7 @@ pub const Client = struct {
     }
 
     fn connectWebSocket(self: *Client) !void {
+        if (self.config.websocket_url == null) return self.connectOwnedWebSocket();
         const raw_url = self.effectiveWebSocketUrl() orelse return error.MissingWebSocketUrl;
         runtime_log.trace("codex.connectWebSocket begin url_len={d}", .{raw_url.len});
         const uri = std.Uri.parse(raw_url) catch |err| {
@@ -878,6 +885,76 @@ pub const Client = struct {
 
     fn effectiveWebSocketUrl(self: *const Client) ?[]const u8 {
         return self.config.websocket_url;
+    }
+
+    /// Connects only to the app-server this process spawned and still owns.
+    /// Codex answers on loopback without authenticating itself, so a shared
+    /// well-known port let whatever listened there (the user's own Codex from
+    /// another HOME/CODEX_HOME, another account, any local process) serve
+    /// Verde's chats and readiness with its own account. A fresh ephemeral
+    /// port per spawn plus a liveness check on the spawned child replaces
+    /// trusting the port number. Without `launch_on_connect` (readiness
+    /// probes) no owned server means `NotConnected`.
+    fn connectOwnedWebSocket(self: *Client) !void {
+        var url_buffer: [OWNED_URL_CAPACITY]u8 = undefined;
+        if (ownedServerUrl(&url_buffer)) |url| {
+            if (try self.connectOwnedUrl(url, 1, false)) |stream| {
+                self.stream = stream;
+                return;
+            }
+        }
+        if (!self.config.launch_on_connect) return error.NotConnected;
+
+        shared_server_state.mutex.lock();
+        defer shared_server_state.mutex.unlock();
+        if (shared_server_state.owns_child and shared_server_state.url_len > 0) {
+            const url = url_buffer[0..shared_server_state.url_len];
+            @memcpy(url, shared_server_state.url_bytes[0..url.len]);
+            // Another client may have just spawned it and still be waiting.
+            if (try self.connectOwnedUrl(url, MAX_CONNECT_WAIT_ATTEMPTS, true)) |stream| {
+                self.stream = stream;
+                return;
+            }
+            stopOwnedServerLocked();
+        }
+        // A child launched for an explicit URL is not on a private port.
+        if (shared_server_state.child != null) stopOwnedServerLocked();
+
+        const reserved = try reserveLoopbackWebSocketUrl(&url_buffer);
+        @memcpy(shared_server_state.url_bytes[0..reserved.len], reserved);
+        shared_server_state.url_len = reserved.len;
+        self.spawnWebSocketServer(reserved) catch |err| {
+            shared_server_state.url_len = 0;
+            runtime_log.diagnostic("codex.connectOwnedWebSocket spawnWebSocketServer failed: {s}", .{@errorName(err)});
+            return err;
+        };
+        sleepMs(80);
+        if (try self.connectOwnedUrl(reserved, MAX_CONNECT_WAIT_ATTEMPTS, true)) |stream| {
+            runtime_log.trace("codex.connectOwnedWebSocket connected after spawn", .{});
+            self.stream = stream;
+            return;
+        }
+        stopOwnedServerLocked();
+        return error.NotConnected;
+    }
+
+    /// The reserved port can be taken before codex binds it; codex then
+    /// exits. Keep a connection only while the spawned child still runs and
+    /// still owns `url`.
+    fn connectOwnedUrl(self: *Client, url: []const u8, attempts: usize, comptime caller_holds_lock: bool) !?std.Io.net.Stream {
+        if (!ownedChildRunning(url, caller_holds_lock)) return null;
+        const uri = try std.Uri.parse(url);
+        var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
+        const host = (try uri.getHost(&host_buffer)).bytes;
+        const port = uri.port orelse return error.MissingWebSocketPort;
+        const stream = (if (attempts <= 1)
+            try self.tryConnectWebSocket(uri, host, port)
+        else
+            try self.waitForWebSocket(uri, host, port, attempts)) orelse return null;
+        if (ownedChildRunning(url, caller_holds_lock)) return stream;
+        var threaded = std.Io.Threaded.init_single_threaded;
+        stream.close(threaded.io());
+        return null;
     }
 
     fn spawnWebSocketServer(self: *Client, url: []const u8) !void {
@@ -1970,7 +2047,52 @@ fn extractActualTurnIdFromSteerMismatch(message: []const u8) ?[]const u8 {
     return if (actual_turn_id.len == 0) null else actual_turn_id;
 }
 
+fn ownedServerUrl(buffer: *[OWNED_URL_CAPACITY]u8) ?[]const u8 {
+    shared_server_state.mutex.lock();
+    defer shared_server_state.mutex.unlock();
+    if (!shared_server_state.owns_child or shared_server_state.url_len == 0) return null;
+    const url = buffer[0..shared_server_state.url_len];
+    @memcpy(url, shared_server_state.url_bytes[0..url.len]);
+    return url;
+}
+
+fn ownedChildRunning(url: []const u8, comptime caller_holds_lock: bool) bool {
+    if (!caller_holds_lock) shared_server_state.mutex.lock();
+    defer if (!caller_holds_lock) shared_server_state.mutex.unlock();
+    return ownedChildRunningLocked(url);
+}
+
+/// Reaps an owned child that exited (e.g. it lost the port race) so a later
+/// connect spawns a fresh one instead of trusting the stale URL.
+fn ownedChildRunningLocked(url: []const u8) bool {
+    if (!shared_server_state.owns_child) return false;
+    if (!std.mem.eql(u8, shared_server_state.url_bytes[0..shared_server_state.url_len], url)) return false;
+    const child = if (shared_server_state.child) |*value| value else return false;
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const exited = child.poll(threaded.io()) catch return false;
+    if (exited == null) return true;
+    runtime_log.diagnostic("codex owned app-server exited before serving", .{});
+    shared_server_state.child = null;
+    shared_server_state.owns_child = false;
+    shared_server_state.url_len = 0;
+    return false;
+}
+
+/// Picks a free loopback port for a new app-server. The kernel hands out
+/// ephemeral ports, so this never lands on another server's fixed port.
+fn reserveLoopbackWebSocketUrl(buffer: *[OWNED_URL_CAPACITY]u8) ![]const u8 {
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(io, .{});
+    const port = server.socket.address.getPort();
+    server.deinit(io);
+    return std.fmt.bufPrint(buffer, "ws://127.0.0.1:{d}", .{port});
+}
+
 fn stopOwnedServerLocked() void {
+    shared_server_state.url_len = 0;
     if (shared_server_state.child) |*child| {
         if (shared_server_state.owns_child) {
             runtime_log.diagnostic("codex.stopOwnedServer stopping pid={d}", .{child.processId() orelse 0});

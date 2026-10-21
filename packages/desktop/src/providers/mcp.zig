@@ -5,6 +5,7 @@ const builtin = @import("builtin");
 const platform_paths = @import("platform_paths");
 const mcp_endpoint = @import("../mcp/endpoint.zig");
 const process_env = @import("../platform/env.zig");
+const provider_cli_version = @import("cli_version.zig");
 const providers_protocol = @import("headless").providers_protocol;
 
 const log = std.log.scoped(.provider_mcp);
@@ -159,7 +160,7 @@ fn detectedProvidersAtHome(allocator: std.mem.Allocator, home: []const u8) [ALL_
     var detected = [ALL_PROVIDERS.len]bool{
         process_env.commandExists("codex"),
         process_env.commandExists("claude"),
-        process_env.commandExists("agent") or process_env.commandExists("cursor-agent"),
+        provider_cli_version.executableForProvider("cursor") != null,
         process_env.commandExists("opencode"),
         process_env.commandExists("amp"),
         process_env.commandExists("pi"),
@@ -375,7 +376,19 @@ fn removeCodexAtHome(allocator: std.mem.Allocator, home: []const u8) !void {
     defer allocator.free(existing);
     const updated = try removeCodexBlockAlloc(allocator, existing);
     defer allocator.free(updated);
-    if (updated.len != existing.len) try writeFileAtomic(allocator, io, path, updated);
+    if (updated.len != existing.len) try writeOrDeleteConfig(allocator, io, home, path, updated);
+}
+
+/// Writes `content`, or deletes the file (and its then-empty directory) when
+/// removing Verde's entry left nothing else: enabling MCP may have created
+/// the file, so disabling it must not leave an empty config behind.
+fn writeOrDeleteConfig(allocator: std.mem.Allocator, io: std.Io, home: []const u8, path: []const u8, content: []const u8) !void {
+    if (std.mem.trim(u8, content, &std.ascii.whitespace).len > 0) return writeFileAtomic(allocator, io, path, content);
+    try std.Io.Dir.cwd().deleteFile(io, path);
+    const dir = std.fs.path.dirname(path) orelse return;
+    if (std.mem.eql(u8, std.mem.trimEnd(u8, dir, "/\\"), std.mem.trimEnd(u8, home, "/\\"))) return;
+    // Fails harmlessly when the directory holds anything else.
+    std.Io.Dir.cwd().deleteDir(io, dir) catch {};
 }
 
 fn removeCodexBlockAlloc(allocator: std.mem.Allocator, content: []const u8) ![]u8 {
@@ -446,7 +459,7 @@ fn removeGrokAtHome(allocator: std.mem.Allocator, home: []const u8) !void {
     defer allocator.free(existing);
     const updated = try removeCodexBlockAlloc(allocator, existing);
     defer allocator.free(updated);
-    if (updated.len != existing.len) try writeFileAtomic(allocator, io, path, updated);
+    if (updated.len != existing.len) try writeOrDeleteConfig(allocator, io, home, path, updated);
 }
 
 fn inspectPiAtHome(allocator: std.mem.Allocator, home: []const u8) RegistrationStatus {
@@ -676,6 +689,10 @@ fn removeJsonAtHome(allocator: std.mem.Allocator, home: []const u8, spec: JsonSp
     const entry = section_value.object.get("verde") orelse return;
     if (!jsonEntryManaged(entry, spec.environment_key)) return;
     _ = section_value.object.orderedRemove("verde");
+    // `{"<section>": {}}` is what enabling created; it carries no user content.
+    if (section_value.object.count() == 0 and parsed.value.object.count() == 1) {
+        return writeOrDeleteConfig(allocator, io, home, path, "");
+    }
     const encoded = try std.json.Stringify.valueAlloc(allocator, parsed.value, .{ .whitespace = .indent_2 });
     defer allocator.free(encoded);
     try writeFileAtomic(allocator, io, path, encoded);
@@ -803,4 +820,32 @@ test "Codex managed block is idempotent and preserves surrounding TOML" {
     const removed = (try readFileIfPresent(std.testing.allocator, threaded.io(), path)).?;
     defer std.testing.allocator.free(removed);
     try std.testing.expectEqualStrings("model = \"gpt-5\"\n", removed);
+}
+
+test "disabling MCP deletes configs and directories that enabling created" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(home);
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const amp_path = try configPathAlloc(std.testing.allocator, home, AMP_SPEC.relative_path);
+    defer std.testing.allocator.free(amp_path);
+    const grok_path = try configPathAlloc(std.testing.allocator, home, ".grok/config.toml");
+    defer std.testing.allocator.free(grok_path);
+
+    const endpoint = testEndpoint(47_371);
+    try installJsonAtHome(std.testing.allocator, home, &endpoint, .amp, AMP_SPEC);
+    try installGrokAtHome(std.testing.allocator, home, &endpoint);
+    try removeProviderAtHome(std.testing.allocator, home, .amp);
+    try removeProviderAtHome(std.testing.allocator, home, .grok);
+
+    try std.testing.expect((try readFileIfPresent(std.testing.allocator, io, amp_path)) == null);
+    try std.testing.expect((try readFileIfPresent(std.testing.allocator, io, grok_path)) == null);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, std.fs.path.dirname(amp_path).?, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, std.fs.path.dirname(grok_path).?, .{}));
+    // The shared parent (`.config`) and the home directory itself stay.
+    try std.Io.Dir.cwd().access(io, std.fs.path.dirname(std.fs.path.dirname(amp_path).?).?, .{});
+    try std.Io.Dir.cwd().access(io, home, .{});
 }

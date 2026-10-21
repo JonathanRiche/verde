@@ -18,7 +18,7 @@ in your Verde config — see [Remapping](#remapping) below.
 | -------------------------- | ------------------------------------- |
 | `Ctrl+Shift+P` / `Cmd+Shift+P` | Command palette                    |
 | unbound                     | Open Settings (`keybinds.settings`) |
-| `Ctrl+Shift+Space`          | Toggle the experimental Companion (when enabled in Settings) |
+| `Ctrl+Shift+Space`          | Toggle the Companion (when enabled in Settings) |
 | `Ctrl+Shift+R` / `Cmd+Shift+R`, `F5` | Refresh / reload app            |
 | `Alt+O`                     | Open the default project              |
 | `Ctrl+Shift+O`              | Open in external editor               |

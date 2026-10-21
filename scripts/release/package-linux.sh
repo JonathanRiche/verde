@@ -51,15 +51,16 @@ normalize_fff_dependency() {
     return
   fi
 
-  if ! command -v patchelf >/dev/null 2>&1; then
-    echo "warning: patchelf was not found; packaged verde may retain an absolute libfff_c.so dependency" >&2
+  local needed_entries
+  needed_entries="$(readelf -d "$path")"
+  if ! grep -Fq "[$original_needed]" <<<"$needed_entries"; then
+    # Already relative (NEEDED [libfff_c.so] + RUNPATH [$ORIGIN]); nothing to fix.
     return
   fi
 
-  local needed_entries
-  needed_entries="$(readelf -d "$path")"
-  if ! grep -Fq "$original_needed" <<<"$needed_entries"; then
-    return
+  if ! command -v patchelf >/dev/null 2>&1; then
+    echo "error: $path has an absolute NEEDED entry $original_needed; install patchelf so packaging can rewrite it to $replacement_needed" >&2
+    exit 1
   fi
 
   patchelf --replace-needed "$original_needed" "$replacement_needed" "$path"
@@ -171,8 +172,10 @@ if [[ -x "$PREFIX_DIR/bin/verde-browser-linux" ]]; then
   install -m 755 "$PREFIX_DIR/bin/verde-browser-linux" "$PACKAGE_ROOT/bin/verde-browser-linux"
 fi
 write_linux_launcher "$PACKAGE_ROOT/bin/verde-launch"
-install -m 644 "$REPO_ROOT/packages/desktop/src/assets/verde_logo.png" "$PACKAGE_ROOT/share/pixmaps/verde.png"
-install -m 644 "$REPO_ROOT/packages/desktop/src/assets/verde_logo.png" "$PACKAGE_ROOT/share/icons/hicolor/256x256/apps/verde.png"
+# hicolor/256x256 must hold a 256x256 image; verde_logo.png is 315x366, so ship
+# the committed square render (regenerate it from verde_logo.png if the logo changes).
+install -m 644 "$REPO_ROOT/assets/verde-icon-256.png" "$PACKAGE_ROOT/share/pixmaps/verde.png"
+install -m 644 "$REPO_ROOT/assets/verde-icon-256.png" "$PACKAGE_ROOT/share/icons/hicolor/256x256/apps/verde.png"
 printf '%s\n' "$VERSION" > "$PACKAGE_ROOT/share/verde/VERSION"
 install -m 644 "$PREFIX_DIR/share/verde/provider_bridge.mjs" "$PACKAGE_ROOT/share/verde/provider_bridge.mjs"
 cp -a "$PREFIX_DIR/share/verde/web" "$PACKAGE_ROOT/share/verde/web"
@@ -199,7 +202,7 @@ cat > "$PACKAGE_ROOT/share/applications/verde.desktop" <<'EOF'
 Version=1.0
 Type=Application
 Name=Verde
-Comment=Desktop chat app for Codex and OpenCode
+Comment=Run coding agents side by side
 Exec=verde-launch
 Icon=verde
 Terminal=false
