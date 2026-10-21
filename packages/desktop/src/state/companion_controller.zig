@@ -63,6 +63,7 @@ pub const HitAction = enum {
     brain_provider,
     brain_model,
     brain_reasoning,
+    toggle_expand,
     text_copy,
     text_select_all,
     crew_open,
@@ -933,6 +934,11 @@ conversation_focused: bool = false,
 /// Where the right-click Copy / Select all menu opened.
 text_menu_x: f32 = 0.0,
 text_menu_y: f32 = 0.0,
+/// Panel covers the workspace area (full chat size) instead of a sidecar.
+expanded: bool = false,
+/// Left edge of the workspace area (sidebar right edge), set by the root
+/// layout each frame so the expanded panel leaves the sidebar visible.
+workspace_left: f32 = 0.0,
 panel_progress: f32 = 0.0,
 transition_last_ms: i64 = 0,
 

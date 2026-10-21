@@ -42,7 +42,7 @@ const CLOSE_MS: i64 = 160;
 const PANEL_WIDTH: f32 = 420.0;
 const PANEL_INSET: f32 = 10.0;
 const HEADER_HEIGHT: f32 = 64.0;
-const FOOTER_HEIGHT: f32 = 116.0;
+const FOOTER_HEIGHT: f32 = 132.0;
 const CONTENT_INSET: f32 = 14.0;
 const SECTION_TITLE_HEIGHT: f32 = 24.0;
 const INBOX_ROW_HEIGHT: f32 = 46.0;
@@ -58,8 +58,16 @@ const MENU_ROW_HEIGHT: f32 = 40.0;
 const MENU_ACTION_HEIGHT: f32 = 34.0;
 const BRAIN_ROW_HEIGHT: f32 = 30.0;
 const SUGGESTION_HEIGHT: f32 = 36.0;
-const BODY_FONT: f32 = 12.5;
+/// Conversation text uses the chat transcript's face, size and leading
+/// (chat_panel TRANSCRIPT_MARKDOWN_FONT_SIZE / markdownOptions), so a
+/// companion reply reads like any other chat.
+const TRANSCRIPT_FONT_CSS: f32 = 18.0;
+const TRANSCRIPT_LINE_HEIGHT_FACTOR: f32 = 1.43;
+/// Smaller UI text (schedule details) keeps the compact panel leading.
 const LINE_HEIGHT_FACTOR: f32 = 1.45;
+/// Reading column cap, matching chat_panel CHAT_CONTENT_MAX_WIDTH; matters
+/// once the panel is expanded to the workspace width.
+const READING_MAX_CSS: f32 = 900.0;
 const MAX_WRAP_LINES: usize = 64;
 const USER_MAX_LINES: usize = 10;
 const ASSISTANT_MAX_LINES: usize = 64;
@@ -103,6 +111,8 @@ pub const Geometry = struct {
     new_button: palette.Rect,
     /// Clock: toggles the scheduled-tasks view.
     schedules_button: palette.Rect,
+    /// Expands the panel over the workspace (full chat size) and back.
+    expand_button: palette.Rect,
     close_button: palette.Rect,
     inbox: palette.Rect,
     crew: palette.Rect,
@@ -198,6 +208,7 @@ pub fn handleMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, d
             .crew_open => state.openCompanionChatRow(false, result.index),
             .inbox_open => state.openCompanionChatRow(true, result.index),
             .suggestion => state.sendCompanionSuggestion(result.index),
+            .toggle_expand => state.companion_controller.expanded = !state.companion_controller.expanded,
             .schedules_view => {
                 state.companion_controller.toggleSchedulesView();
                 state.companion_schedules.requestRefresh();
@@ -533,9 +544,11 @@ fn computeGeometryAt(state: *runtime.AppState, width: f32, height: f32, s: f32) 
     const avatar_inset = DOCK_AVATAR_INSET * s;
     const dock_avatar: palette.Rect = .{ .x = dock_bubble.x + avatar_inset, .y = dock_bubble.y + avatar_inset, .w = @max(bubble_size - avatar_inset * 2.0, 0.0), .h = @max(bubble_size - avatar_inset * 2.0, 0.0) };
 
-    // Panel: right-side column, full height.
+    // Panel: right-side column, full height. Expanded, it covers the whole
+    // workspace area beside the sidebar, like a full chat screen.
     const inset = @min(PANEL_INSET * s, @min(window.w, window.h) * 0.5);
-    const panel_w = @max(@min(PANEL_WIDTH * s, window.w - inset * 2.0), 0.0);
+    const expanded_w = window.w - inset * 2.0 - @max(companion.workspace_left, 0.0);
+    const panel_w = @max(@min(if (companion.expanded) @max(expanded_w, PANEL_WIDTH * s) else PANEL_WIDTH * s, window.w - inset * 2.0), 0.0);
     const panel: palette.Rect = .{ .x = window.w - inset - panel_w, .y = inset, .w = panel_w, .h = @max(window.h - inset * 2.0, 0.0) };
     const header: palette.Rect = .{ .x = panel.x, .y = panel.y, .w = panel.w, .h = @min(HEADER_HEIGHT * s, panel.h) };
     const footer_h = @min(FOOTER_HEIGHT * s, @max(panel.h - header.h, 0.0));
@@ -546,12 +559,13 @@ fn computeGeometryAt(state: *runtime.AppState, width: f32, height: f32, s: f32) 
     const close_button: palette.Rect = .{ .x = header.x + header.w - 12.0 * s - button, .y = button_y, .w = button, .h = button };
     const new_button: palette.Rect = .{ .x = close_button.x - 6.0 * s - button, .y = button_y, .w = button, .h = button };
     const schedules_button: palette.Rect = .{ .x = new_button.x - 6.0 * s - button, .y = button_y, .w = button, .h = button };
+    const expand_button: palette.Rect = .{ .x = schedules_button.x - 6.0 * s - button, .y = button_y, .w = button, .h = button };
     const switcher = companion.identity.count > 1;
-    const next_button: palette.Rect = if (switcher) .{ .x = schedules_button.x - 10.0 * s - button, .y = button_y, .w = button, .h = button } else .{};
+    const next_button: palette.Rect = if (switcher) .{ .x = expand_button.x - 10.0 * s - button, .y = button_y, .w = button, .h = button } else .{};
     const prev_button: palette.Rect = if (switcher) .{ .x = next_button.x - 2.0 * s - button, .y = button_y, .w = button, .h = button } else .{};
     const avatar: palette.Rect = .{ .x = header.x + 12.0 * s, .y = header.y + 9.0 * s, .w = 44.0 * s, .h = 46.0 * s };
     const text_x = avatar.x + avatar.w + 10.0 * s;
-    const text_right = (if (switcher) prev_button.x else schedules_button.x) - 8.0 * s;
+    const text_right = (if (switcher) prev_button.x else expand_button.x) - 8.0 * s;
     const name_w = @min(text_measure.textWidth(.ui_bold, 15.0 * s, companion.identity.name.slice()) + 22.0 * s, @max(text_right - text_x, 0.0));
     const name_button: palette.Rect = .{ .x = text_x - 4.0 * s, .y = header.y + 10.0 * s, .w = name_w + 4.0 * s, .h = 24.0 * s };
     const brain_w = @min(text_measure.textWidth(.ui, 11.0 * s, companion.identity.brain.slice()) + 40.0 * s, @max(text_right - text_x, 0.0));
@@ -562,8 +576,9 @@ fn computeGeometryAt(state: *runtime.AppState, width: f32, height: f32, s: f32) 
     const schedules_view = companion.view == .schedules;
     var top = header.y + header.h;
     var bottom = footer.y;
-    const inner_x = panel.x + CONTENT_INSET * s;
-    const inner_w = @max(panel.w - CONTENT_INSET * 2.0 * s, 0.0);
+    // Sections share the capped, centered reading column of the conversation.
+    const inner_w = @min(@max(panel.w - CONTENT_INSET * 2.0 * s, 0.0), theme.scaledUi(READING_MAX_CSS));
+    const inner_x = panel.x + @max((panel.w - inner_w) * 0.5, 0.0);
 
     const approval_h: f32 = if (companion.presentation.has_approval) APPROVAL_HEIGHT * s else 0.0;
     const approval: palette.Rect = .{ .x = inner_x, .y = bottom - approval_h, .w = inner_w, .h = @max(approval_h - 8.0 * s, 0.0) };
@@ -602,6 +617,7 @@ fn computeGeometryAt(state: *runtime.AppState, width: f32, height: f32, s: f32) 
         .next_button = next_button,
         .new_button = new_button,
         .schedules_button = schedules_button,
+        .expand_button = expand_button,
         .close_button = close_button,
         .inbox = inbox,
         .crew = crew,
@@ -635,7 +651,9 @@ fn dockShowsText(state: *runtime.AppState) bool {
 fn composerRect(footer: palette.Rect) palette.Rect {
     const s = companionScale();
     if (footer.w < 180.0 * s or footer.h < 70.0 * s) return .{ .x = footer.x, .y = footer.y };
-    return .{ .x = footer.x + 12.0 * s, .y = footer.y + 10.0 * s, .w = footer.w - 24.0 * s, .h = footer.h - 22.0 * s };
+    // Capped like the reading column so an expanded panel keeps a chat-width composer.
+    const w = @min(footer.w - 24.0 * s, theme.scaledUi(READING_MAX_CSS) + 24.0 * s);
+    return .{ .x = footer.x + (footer.w - w) * 0.5, .y = footer.y + 10.0 * s, .w = w, .h = footer.h - 22.0 * s };
 }
 
 fn rowRect(section: palette.Rect, index: usize, row_h: f32) palette.Rect {
@@ -679,6 +697,7 @@ fn registerHits(state: *runtime.AppState, geometry: Geometry) void {
             // whole new companion lives in the companion menu.
             companion.addHit(geometry.new_button, .menu_new_conversation);
             companion.addHit(geometry.schedules_button, .schedules_view);
+            companion.addHit(geometry.expand_button, .toggle_expand);
             companion.addHit(geometry.close_button, .collapse);
             for (0..@min(companion.inbox_count, MAX_INBOX_ROWS_SHOWN)) |index| {
                 const row = rowRect(geometry.inbox, index, INBOX_ROW_HEIGHT);
@@ -846,6 +865,8 @@ fn headerTooltipAt(state: *runtime.AppState, geometry: Geometry, x: f32, y: f32)
     const name = companion.identity.name.slice();
     if (pointInRect(geometry.new_button, x, y)) return .{ .target = geometry.new_button, .label = framePrint(state, "New conversation with {s}", .{name}) };
     if (pointInRect(geometry.close_button, x, y)) return .{ .target = geometry.close_button, .label = "Minimize" };
+    if (pointInRect(geometry.expand_button, x, y))
+        return .{ .target = geometry.expand_button, .label = if (companion.expanded) "Collapse to side panel" else "Expand to full chat size" };
     if (pointInRect(geometry.schedules_button, x, y))
         return .{ .target = geometry.schedules_button, .label = if (companion.view == .schedules) "Back to conversation" else "Scheduled tasks" };
     if (companion.identity.count > 1) {
@@ -908,6 +929,7 @@ fn renderHeader(state: *runtime.AppState, geometry: Geometry) void {
     }
     renderHeaderButton(state, geometry.new_button, "+");
     renderSchedulesButton(state, geometry.schedules_button);
+    renderHeaderIconButton(state, geometry.expand_button, if (state.companion_controller.expanded) NF_MD_ARROW_COLLAPSE else NF_MD_ARROW_EXPAND);
     renderHeaderButton(state, geometry.close_button, "−");
     const divider_inset = snappedStroke(1.0 * s);
     queueRect(state, .{ .x = header.x + divider_inset, .y = header.y + header.h - 1.0 * s, .w = @max(header.w - divider_inset * 2.0, 0.0), .h = 1.0 * s }, color(hairline()));
@@ -916,6 +938,9 @@ fn renderHeader(state: *runtime.AppState, geometry: Geometry) void {
 /// Codicon chevron-down from the icon font; the UI text face has no
 /// legible small caret glyph.
 const NF_COD_CHEVRON_DOWN = "\u{EAB4}";
+/// Same expand / collapse glyphs as the workspace pane zoom control.
+const NF_MD_ARROW_EXPAND = "\u{F0616}";
+const NF_MD_ARROW_COLLAPSE = "\u{F0615}";
 
 fn queueChevronDown(state: *runtime.AppState, rect: palette.Rect, fill: palette.Color, clip: palette.Rect) void {
     state.palette_overlay_batch.roleText(state.allocator, nonNegativeRect(rect), NF_COD_CHEVRON_DOWN, fill, rect.h, .icon, null, nonNegativeRect(clip)) catch |err| log.warn("failed to queue chevron: {s}", .{@errorName(err)});
@@ -954,6 +979,16 @@ fn renderSchedulesButton(state: *runtime.AppState, rect: palette.Rect) void {
     const badge: palette.Rect = .{ .x = rect.x + rect.w - badge_w + 4.0 * s, .y = rect.y - 4.0 * s, .w = badge_w, .h = badge_h };
     queuePanel(state, badge, color(chrome.accent), color(surface()), badge_h * 0.5, 1.0 * s);
     queueBoldText(state, .{ .x = badge.x + (badge.w - label_w) * 0.5, .y = badge.y + (badge_h - font * 1.3) * 0.5, .w = label_w + 1.0, .h = font * 1.3 }, label, color(chrome.accent_fg), font, badge);
+}
+
+/// Header button carrying an icon-font glyph (expand / collapse).
+fn renderHeaderIconButton(state: *runtime.AppState, rect: palette.Rect, glyph: []const u8) void {
+    if (rect.w <= 0.0 or rect.h <= 0.0) return;
+    const s = companionScale();
+    const chrome = theme.companionChrome();
+    queuePanel(state, rect, color(surface()), color(hairline()), 7.0 * s, 1.0 * s);
+    const icon = 15.0 * s;
+    queueIcon(state, .{ .x = rect.x + (rect.w - icon) * 0.5, .y = rect.y + (rect.h - icon) * 0.5, .w = icon, .h = icon }, glyph, color(chrome.text_muted), rect);
 }
 
 fn renderHeaderButton(state: *runtime.AppState, rect: palette.Rect, glyph: []const u8) void {
@@ -1236,14 +1271,23 @@ const ConversationItemLayout = struct {
     height: f32,
 };
 
+fn bodyFont() f32 {
+    return theme.scaledUi(TRANSCRIPT_FONT_CSS);
+}
+
 fn bodyLineHeight() f32 {
-    return companionScaled(BODY_FONT) * LINE_HEIGHT_FACTOR;
+    return bodyFont() * TRANSCRIPT_LINE_HEIGHT_FACTOR;
 }
 
 fn conversationWidths(conversation: palette.Rect) struct { text: f32, bubble: f32 } {
     const s = companionScale();
-    const text_w = @max(conversation.w - CONTENT_INSET * 2.0 * s, 0.0);
+    const text_w = @min(@max(conversation.w - CONTENT_INSET * 2.0 * s, 0.0), theme.scaledUi(READING_MAX_CSS));
     return .{ .text = text_w, .bubble = @max(text_w * 0.82 - 20.0 * s, 0.0) };
+}
+
+/// Left edge of the (possibly capped) reading column, centered in `area`.
+fn columnX(area: palette.Rect) f32 {
+    return area.x + @max((area.w - conversationWidths(area).text) * 0.5, 0.0);
 }
 
 /// Height of one conversation item; render and scroll extent share it.
@@ -1252,11 +1296,11 @@ fn conversationItemHeight(state: *runtime.AppState, item: *const controller.Acti
     const widths = conversationWidths(conversation);
     return switch (item.kind) {
         .user => blk: {
-            const wrapped = wrapText(conversationalText(state, item.body.slice()), widths.bubble, .ui, companionScaled(BODY_FONT), USER_MAX_LINES);
+            const wrapped = wrapText(conversationalText(state, item.body.slice()), widths.bubble, .prose, bodyFont(), USER_MAX_LINES);
             break :blk @as(f32, @floatFromInt(@max(wrapped.count, 1))) * bodyLineHeight() + 20.0 * s + 10.0 * s;
         },
         .assistant, .streaming => blk: {
-            const wrapped = wrapText(conversationalText(state, item.body.slice()), widths.text, .ui, companionScaled(BODY_FONT), ASSISTANT_MAX_LINES);
+            const wrapped = wrapText(conversationalText(state, item.body.slice()), widths.text, .prose, bodyFont(), ASSISTANT_MAX_LINES);
             if (wrapped.count == 0) break :blk 0.0;
             break :blk @as(f32, @floatFromInt(wrapped.count)) * bodyLineHeight() + 14.0 * s;
         },
@@ -1327,7 +1371,7 @@ fn renderConversationItem(state: *runtime.AppState, item_index: usize, item: *co
             .failed => chrome.danger,
             .cancelled => chrome.text_subtle,
         };
-        queueText(state, .{ .x = conversation.x + CONTENT_INSET * s + 2.0 * s, .y = y + 4.0 * s, .w = 14.0 * s, .h = 16.0 * s }, glyph, color(glyph_color), 10.5 * s, conversation);
+        queueText(state, .{ .x = columnX(conversation) + 2.0 * s, .y = y + 4.0 * s, .w = 14.0 * s, .h = 16.0 * s }, glyph, color(glyph_color), 10.5 * s, conversation);
     }
     for (layout.lines[0..layout.count], 0..) |line, index| {
         const last = index + 1 == layout.count;
@@ -1365,22 +1409,22 @@ const ItemTextLayout = struct {
 fn itemTextLayout(state: *runtime.AppState, item: *const controller.ActivityItem, conversation: palette.Rect, y: f32) ItemTextLayout {
     const s = companionScale();
     const widths = conversationWidths(conversation);
-    const x = conversation.x + CONTENT_INSET * s;
+    const x = columnX(conversation);
     const line_h = bodyLineHeight();
-    const font = companionScaled(BODY_FONT);
+    const font = bodyFont();
     var layout: ItemTextLayout = .{};
     switch (item.kind) {
         .user, .assistant, .streaming => {
             const user = item.kind == .user;
             layout.text = conversationalText(state, item.body.slice());
-            const wrapped = wrapText(layout.text, if (user) widths.bubble else widths.text, .ui, font, if (user) USER_MAX_LINES else ASSISTANT_MAX_LINES);
+            const wrapped = wrapText(layout.text, if (user) widths.bubble else widths.text, .prose, font, if (user) USER_MAX_LINES else ASSISTANT_MAX_LINES);
             layout.truncated = wrapped.truncated;
             var origin_x = x;
             var origin_y = y + 6.0 * s;
             var line_w = widths.text + 12.0 * s;
             if (user) {
                 var widest: f32 = 0.0;
-                for (wrapped.lines[0..wrapped.count]) |line| widest = @max(widest, text_measure.textWidth(.ui, font, line));
+                for (wrapped.lines[0..wrapped.count]) |line| widest = @max(widest, text_measure.textWidth(.prose, font, line));
                 const bubble_w = @min(widest + 22.0 * s, widths.bubble + 20.0 * s);
                 const bubble_h = @as(f32, @floatFromInt(@max(wrapped.count, 1))) * line_h + 18.0 * s;
                 const bubble: palette.Rect = .{ .x = x + widths.text - bubble_w, .y = y + 4.0 * s, .w = bubble_w, .h = bubble_h };
@@ -1393,7 +1437,7 @@ fn itemTextLayout(state: *runtime.AppState, item: *const controller.ActivityItem
             for (wrapped.lines[0..wrapped.count], 0..) |line, index| {
                 const offset = sliceOffset(layout.text, line) orelse previous_end;
                 previous_end = offset + line.len;
-                layout.lines[index] = .{ .x = origin_x, .y = origin_y + @as(f32, @floatFromInt(index)) * line_h, .w = line_w, .h = line_h, .text = line, .offset = offset, .role = .ui, .font = font };
+                layout.lines[index] = .{ .x = origin_x, .y = origin_y + @as(f32, @floatFromInt(index)) * line_h, .w = line_w, .h = line_h, .text = line, .offset = offset, .role = .prose, .font = font };
             }
             layout.count = wrapped.count;
         },
@@ -1845,8 +1889,8 @@ fn schedulesLayout(state: *runtime.AppState, geometry: Geometry) SchedulesLayout
     const body = geometry.schedules;
     var layout: SchedulesLayout = undefined;
     layout.row_count = 0;
-    const inner_x = body.x + CONTENT_INSET * s;
-    const inner_w = @max(body.w - CONTENT_INSET * 2.0 * s, 0.0);
+    const inner_w = @min(@max(body.w - CONTENT_INSET * 2.0 * s, 0.0), theme.scaledUi(READING_MAX_CSS));
+    const inner_x = body.x + @max((body.w - inner_w) * 0.5, 0.0);
     layout.title = .{ .x = inner_x, .y = body.y + 6.0 * s, .w = inner_w, .h = 18.0 * s };
     const back_w = text_measure.textWidth(.ui_bold, 11.0 * s, "Back to chat") + 16.0 * s;
     layout.back = if (inner_w > back_w + 120.0 * s and body.h > SECTION_TITLE_HEIGHT * s)
@@ -3970,4 +4014,46 @@ test "expanded schedule detail selects and copies its name and prompt" {
     // Switching back to the conversation drops the detail selection.
     companion.toggleSchedulesView();
     try std.testing.expect(companion.textRange() == null);
+}
+
+test "expand covers the workspace beside the sidebar with a capped reading column" {
+    const allocator = std.testing.allocator;
+    theme.applyTheme(1.0);
+    var state: runtime.AppState = undefined;
+    try testState(allocator, &state);
+    defer deinitTestState(allocator, &state);
+    state.companion_controller.show();
+    state.companion_controller.settleTransition();
+    var frame: controller.Frame = .{ .has_thread = true };
+    _ = frame.setOwner("companion-ui", "chat-1");
+    var reply: controller.ActivityItem = .{ .kind = .assistant, .sequence = 1 };
+    reply.body.set("Opened a codex chat for it.");
+    frame.appendActivity(reply);
+    state.companion_controller.setFrame(frame);
+
+    const window: palette.Rect = .{ .w = 2400.0, .h = 900.0 };
+    var geometry = computeGeometry(&state, window.w, window.h);
+    try std.testing.expectApproxEqAbs(PANEL_WIDTH, geometry.panel.w, 0.01);
+    registerHits(&state, geometry);
+    try std.testing.expectEqual(controller.HitAction.toggle_expand, state.companion_controller.hitAt(geometry.expand_button.x + 4.0, geometry.expand_button.y + 4.0).?);
+
+    state.companion_controller.workspace_left = 300.0;
+    state.companion_controller.expanded = true;
+    geometry = computeGeometry(&state, window.w, window.h);
+    try std.testing.expectApproxEqAbs(300.0 + PANEL_INSET, geometry.panel.x, 0.01);
+    try std.testing.expectApproxEqAbs(window.w - PANEL_INSET, geometry.panel.x + geometry.panel.w, 0.01);
+    // The text column is capped like the chat transcript and centered.
+    const widths = conversationWidths(geometry.conversation);
+    try std.testing.expectApproxEqAbs(theme.scaledUi(READING_MAX_CSS), widths.text, 0.01);
+    const left = columnX(geometry.conversation) - geometry.conversation.x;
+    const right = geometry.conversation.x + geometry.conversation.w - (columnX(geometry.conversation) + widths.text);
+    try std.testing.expectApproxEqAbs(left, right, 0.5);
+
+    // Conversation text uses the chat transcript face and size.
+    const layout = itemTextLayout(&state, &state.companion_controller.presentation.activity[0], geometry.conversation, conversationItemTop(&state, geometry.conversation, 0));
+    try std.testing.expectEqual(palette.FontRole.prose, layout.lines[0].role);
+    try std.testing.expectApproxEqAbs(theme.scaledUi(TRANSCRIPT_FONT_CSS), layout.lines[0].font, 0.01);
+
+    render(&state, window.w, window.h);
+    try expectBatchInsideWindow(&state.palette_overlay_batch, window);
 }

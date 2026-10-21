@@ -225,6 +225,8 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     workspace_panes.renderPaneDragPreview(state);
     sidebar.renderFloatingDragPreview(state);
     const companion_z = state.palette_overlay_batch.setZIndex(COMPANION_Z);
+    // The expanded Companion covers the workspace area but not the sidebar.
+    state.companion_controller.workspace_left = root_layout.workspace.x;
     companion.render(state, width, height);
     state.palette_overlay_batch.restoreZIndex(companion_z);
     // The which-key panel must sit above pane-local layers (composer, pane
