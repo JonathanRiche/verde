@@ -88,11 +88,11 @@ const SaveJob = struct {
     worker: ?std.Thread = null,
     transcript: *Transcript,
     count: usize,
-    pref_path: []u8,
-    workspace_id: []u8,
-    thread_id: []u8,
+    pref_path: []const u8,
+    workspace_id: []const u8,
+    thread_id: []const u8,
     session_id: [16]u8,
-    messages: []SaveMessage,
+    messages: []const SaveMessage,
 
     fn destroy(self: *SaveJob, allocator: std.mem.Allocator) void {
         if (self.worker) |worker| worker.join();
@@ -490,7 +490,15 @@ fn startSave(self: *Self, host: anytype, record: *Transcript, final: bool) void 
         }
         break :blk true;
     };
-    const owned_messages = messages.toOwnedSlice(self.allocator) catch &.{};
+    const owned_messages: []const SaveMessage = messages.toOwnedSlice(self.allocator) catch blk: {
+        for (messages.items) |message| {
+            self.allocator.free(message.key);
+            self.allocator.free(message.author);
+            self.allocator.free(message.body);
+        }
+        messages.deinit(self.allocator);
+        break :blk &.{};
+    };
     job.* = .{
         .transcript = record,
         .count = count,
@@ -842,4 +850,27 @@ test "presentation labels follow phase and activity" {
     p = .{ .phase = .connecting };
     try testing.expect(p.active());
     try testing.expectEqualStrings("Connecting…", p.label());
+}
+
+test "the full controller API instantiates against the host contract" {
+    var host: HostContract = .{};
+    defer host.asked.deinit(testing.allocator);
+    var controller: Self = .{ .allocator = testing.allocator };
+    defer controller.deinit();
+    // Compile every host-generic path; running them would start a real engine.
+    var run_it = false;
+    _ = &run_it;
+    if (run_it) {
+        controller.toggle(&host);
+        controller.start(&host);
+        controller.tick(&host);
+        controller.stop(&host);
+        controller.toggleMute();
+        controller.dismissError();
+        controller.interrupt();
+    }
+    // Idle ticks are safe and do nothing.
+    controller.tick(&host);
+    try testing.expect(!controller.active());
+    try testing.expectEqual(Phase.off, controller.presentation().phase);
 }
