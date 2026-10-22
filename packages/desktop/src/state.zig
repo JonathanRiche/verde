@@ -62,6 +62,7 @@ const companion_controller = @import("state/companion_controller.zig");
 const companion_roster_mod = @import("state/companion_roster.zig");
 const companion_sync_mod = @import("state/companion_sync.zig");
 const schedules_sync_mod = @import("state/schedules_sync.zig");
+const live_voice_controller_mod = @import("state/live_voice_controller.zig");
 const linked_chats_controller = @import("state/linked_chats_controller.zig");
 pub const resource_waiters_controller = @import("state/resource_waiters.zig");
 const browser_controller = @import("state/browser_controller.zig");
@@ -4923,6 +4924,8 @@ pub const AppState = struct {
     companion_sync: companion_sync_mod = .{},
     /// Background calls to the daemon's scheduled tasks (Companion panel).
     companion_schedules: schedules_sync_mod = .{},
+    /// Live voice with the Companion (native audio + provider WebSocket).
+    live_voice: live_voice_controller_mod = .{},
     /// Last Companion thread/offset whose newest transcript page was requested,
     /// so the panel hydrates it once instead of every frame.
     companion_hydration_thread: companion_controller.ExactText = .{},
@@ -14290,6 +14293,122 @@ pub const AppState = struct {
         self.closeCompanion();
     }
 
+    // ---- Live voice host (see state/live_voice_controller.zig) ----
+
+    /// Mic button and keybind: starts Live voice with the active companion
+    /// (opening the panel) or ends it.
+    pub fn toggleLiveVoice(self: *AppState) void {
+        if (!self.isCompanionEnabled()) return;
+        if (!self.live_voice.active() and self.companion_controller.visibility == .collapsed_chip) self.openCompanion();
+        self.live_voice.toggle(self);
+    }
+
+    pub fn toggleLiveVoiceMute(self: *AppState) void {
+        if (self.live_voice.engine == null) return;
+        self.live_voice.toggleMute();
+    }
+
+    pub fn livePrefPath(self: *AppState) []const u8 {
+        return self.storage.pref_path;
+    }
+
+    pub fn liveCompanionId(self: *AppState) []const u8 {
+        const companion = self.companion_roster.activeConst() orelse return "";
+        return companion.id.slice();
+    }
+
+    pub fn liveCompanionName(self: *AppState) []const u8 {
+        return self.companion_controller.identity.name.slice();
+    }
+
+    /// The daemon thread transcripts are saved to, once the companion has one.
+    pub fn liveSaveTarget(self: *AppState) ?struct { workspace_id: []const u8, thread_id: []const u8 } {
+        const companion = self.companion_roster.activeConst() orelse return null;
+        if (companion.home_workspace_id.isEmpty() or companion.thread_id.isEmpty()) return null;
+        return .{ .workspace_id = companion.home_workspace_id.slice(), .thread_id = companion.thread_id.slice() };
+    }
+
+    /// Sends a spoken request as a normal companion turn, after any typed
+    /// draft (as the phone apps do). False when it could not be sent.
+    pub fn liveAskCompanion(self: *AppState, text: []const u8) bool {
+        const draft = if (self.activeCompanionThread()) |thread| thread.currentDraft() else "";
+        const joined = live_voice_controller_mod.joinDraft(self.allocator, draft, text) catch return false;
+        defer self.allocator.free(joined);
+        self.companion_controller.ui_error = null;
+        submitCompanionPrompt(self, joined);
+        return self.companion_controller.ui_error == null;
+    }
+
+    pub fn liveCompanionWorking(self: *AppState) bool {
+        const thread = self.activeCompanionThread() orelse return false;
+        return thread.isSendPendingForUi();
+    }
+
+    pub fn liveCompanionMessageCount(self: *AppState) usize {
+        const thread = self.activeCompanionThread() orelse return 0;
+        return thread.messages.items.len;
+    }
+
+    /// The newest assistant message after the first `count` messages.
+    pub fn liveCompanionReplySince(self: *AppState, count: usize) ?[]const u8 {
+        const thread = self.activeCompanionThread() orelse return null;
+        const messages = thread.messages.items;
+        var index = messages.len;
+        while (index > @min(count, messages.len)) {
+            index -= 1;
+            const message = messages[index];
+            if (message.role != .assistant or message.tool_call_id != null) continue;
+            if (std.mem.trim(u8, message.body, &std.ascii.whitespace).len > 0) return message.body;
+        }
+        return null;
+    }
+
+    /// `companion_status` tool: the crew and what needs the user, by title.
+    pub fn liveCompanionStatus(self: *AppState, arena: std.mem.Allocator) !std.json.Value {
+        const companion = &self.companion_controller;
+        var crew: std.json.Array = .init(arena);
+        for (companion.crew[0..companion.crew_count]) |*row| try crew.append(try liveChatRowJson(arena, row));
+        var needs: std.json.Array = .init(arena);
+        for (companion.inbox[0..companion.inbox_count]) |*row| try needs.append(try liveChatRowJson(arena, row));
+        var root: std.json.ObjectMap = .empty;
+        try root.put(arena, "companion_working", .{ .bool = self.liveCompanionWorking() });
+        try root.put(arena, "crew", .{ .array = crew });
+        try root.put(arena, "needs_you", .{ .array = needs });
+        return .{ .object = root };
+    }
+
+    fn liveChatRowJson(arena: std.mem.Allocator, row: *const companion_controller.ChatRow) !std.json.Value {
+        var object: std.json.ObjectMap = .empty;
+        try object.put(arena, "title", .{ .string = try arena.dupe(u8, if (row.title.slice().len > 0) row.title.slice() else "Chat") });
+        try object.put(arena, "status", .{ .string = row.attention.label() });
+        if (row.detail.slice().len > 0) try object.put(arena, "detail", .{ .string = try arena.dupe(u8, row.detail.slice()) });
+        return .{ .object = object };
+    }
+
+    /// Chats with a pending approval: the companion's own, then inbox and crew.
+    pub fn liveApprovalCandidates(self: *AppState, out: []live_voice_controller_mod.ApprovalCandidate) usize {
+        const companion = &self.companion_controller;
+        var count: usize = 0;
+        if (companion.presentation.has_approval and count < out.len) {
+            out[count] = .{ .workspace_id = companion.presentation.workspace_id.slice(), .thread_id = companion.presentation.thread_id.slice(), .title = companion.identity.name.slice() };
+            count += 1;
+        }
+        inline for (.{ "inbox", "crew" }) |field| {
+            const rows = &@field(companion, field);
+            const len = @field(companion, field ++ "_count");
+            for (rows[0..len]) |*row| {
+                if (row.attention != .approval or count == out.len) continue;
+                out[count] = .{ .workspace_id = row.workspace_id.slice(), .thread_id = row.thread_id.slice(), .title = row.title.slice() };
+                count += 1;
+            }
+        }
+        return count;
+    }
+
+    pub fn liveResolveApproval(self: *AppState, workspace_id: []const u8, thread_id: []const u8, approve: bool) bool {
+        return self.resolveThreadApprovalByLocalId(workspace_id, thread_id, if (approve) .approve else .deny);
+    }
+
     /// Collapses the panel and returns focus to the chat composer when it
     /// had it before the panel opened.
     pub fn closeCompanion(self: *AppState) void {
@@ -16716,6 +16835,7 @@ pub const AppState = struct {
         self.linked_chats.deinit(self.allocator);
         self.companion_sync.deinit();
         self.companion_schedules.deinit();
+        self.live_voice.deinit();
         self.resource_waiters.deinit(self.allocator);
         // Flag the cursor loop first: an in-flight long-poll observes the
         // flag within one receive slice and abandons its parked wait, so the

@@ -65,6 +65,15 @@ test {
     _ = @import("state/companion_persona.zig");
     _ = @import("state/companion_sync.zig");
     _ = @import("state/schedules_sync.zig");
+    _ = @import("state/live_voice_controller.zig");
+    _ = @import("live_voice/protocol.zig");
+    _ = @import("live_voice/transcript.zig");
+    _ = @import("live_voice/pcm.zig");
+    _ = @import("live_voice/session.zig");
+    _ = @import("live_voice/websocket.zig");
+    _ = @import("live_voice/audio.zig");
+    _ = @import("live_voice/engine.zig");
+    if (@import("builtin").os.tag == .linux) _ = @import("live_voice/audio_pipewire.zig");
     _ = @import("ui/diff_view_cache.zig");
     _ = @import("ui/diff_render.zig");
     _ = @import("ui/side_panel_changes.zig");

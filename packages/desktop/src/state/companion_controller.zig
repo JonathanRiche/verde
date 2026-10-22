@@ -34,10 +34,16 @@ pub const Pose = enum {
     paused,
 };
 
+/// Live voice overlay on the character: a listening ring or speaking waves.
+pub const LiveCue = enum { none, listening, speaking };
+
 pub const VisualState = struct {
     pose: Pose,
     show_approval: bool,
     show_failure: bool,
+    live: LiveCue = .none,
+    /// 0..1 loudness driving the live cue.
+    live_level: f32 = 0,
 };
 
 pub const HitAction = enum {
@@ -80,6 +86,12 @@ pub const HitAction = enum {
     schedule_expand,
     /// Empty-state card that pre-fills the composer with an example request.
     schedule_suggestion,
+    /// Header mic: start or end Live voice.
+    live_toggle,
+    live_mute,
+    live_end,
+    /// The speaking character: cut the reply off (half-duplex barge-in).
+    live_interrupt,
 };
 
 pub const Hit = struct {

@@ -3397,6 +3397,8 @@ fn handleKeyboardAction(
         },
         .settings => state.openSettingsModal(),
         .companion => state.toggleCompanion(),
+        .companion_live => state.toggleLiveVoice(),
+        .companion_live_mute => state.toggleLiveVoiceMute(),
         .toggle_sidebar => state.toggleSidebarCollapsed(),
         .toggle_sidebar_hidden => state.toggleSidebarHidden(),
         .toggle_side_panel => state.toggleSidePanel(),

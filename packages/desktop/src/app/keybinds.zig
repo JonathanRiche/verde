@@ -18,6 +18,10 @@ pub const NativeKeyboardAction = enum {
     command_palette,
     settings,
     companion,
+    /// Starts or ends Live voice with the Companion (default Ctrl+Alt+Space).
+    companion_live,
+    /// Mutes the microphone during Live voice (default Ctrl+Alt+M).
+    companion_live_mute,
     toggle_sidebar,
     toggle_sidebar_hidden,
     toggle_side_panel,
@@ -228,6 +232,8 @@ pub const NativeKeyboardConfig = struct {
     command_palette: []Keybind,
     settings: []Keybind,
     companion: []Keybind,
+    companion_live: []Keybind,
+    companion_live_mute: []Keybind,
     toggle_sidebar: []Keybind,
     toggle_sidebar_hidden: []Keybind,
     toggle_side_panel: []Keybind,
@@ -296,6 +302,8 @@ pub const NativeKeyboardConfig = struct {
             .command_palette = try cloneDefaultCommandPaletteKeybinds(allocator),
             .settings = try cloneEmptyKeybinds(allocator),
             .companion = try cloneDefaultCompanionKeybinds(allocator),
+            .companion_live = try cloneDefaultCompanionLiveKeybinds(allocator),
+            .companion_live_mute = try cloneDefaultCompanionLiveMuteKeybinds(allocator),
             .toggle_sidebar = try cloneDefaultSidebarKeybinds(allocator),
             .toggle_sidebar_hidden = try cloneDefaultSidebarHiddenKeybinds(allocator),
             .toggle_side_panel = try cloneDefaultSidePanelKeybinds(allocator),
@@ -375,6 +383,8 @@ pub const NativeKeyboardConfig = struct {
         self.allocator.free(self.command_palette);
         self.allocator.free(self.settings);
         self.allocator.free(self.companion);
+        self.allocator.free(self.companion_live);
+        self.allocator.free(self.companion_live_mute);
         self.allocator.free(self.toggle_sidebar);
         self.allocator.free(self.toggle_sidebar_hidden);
         self.allocator.free(self.toggle_side_panel);
@@ -455,6 +465,12 @@ pub const NativeKeyboardConfig = struct {
         }
         if (matchesAny(self.companion, event)) {
             return .companion;
+        }
+        if (matchesAny(self.companion_live, event)) {
+            return .companion_live;
+        }
+        if (matchesAny(self.companion_live_mute, event)) {
+            return .companion_live_mute;
         }
         if (matchesAny(self.toggle_sidebar, event)) {
             return .toggle_sidebar;
@@ -744,6 +760,18 @@ pub const NativeKeyboardConfig = struct {
             if (self.parseOverrideValue(companion_value, "companion")) |bindings| {
                 self.allocator.free(self.companion);
                 self.companion = bindings;
+            }
+        }
+        if (keybinds_value.object.get("companion_live")) |live_value| {
+            if (self.parseOverrideValue(live_value, "companion_live")) |bindings| {
+                self.allocator.free(self.companion_live);
+                self.companion_live = bindings;
+            }
+        }
+        if (keybinds_value.object.get("companion_live_mute")) |mute_value| {
+            if (self.parseOverrideValue(mute_value, "companion_live_mute")) |bindings| {
+                self.allocator.free(self.companion_live_mute);
+                self.companion_live_mute = bindings;
             }
         }
         if (keybinds_value.object.get("sidebar")) |sidebar_value| {
@@ -1362,6 +1390,8 @@ const PREFIX_ACTION_NAMES = [_]PrefixActionName{
     .{ .name = "command_palette", .target = .{ .app = .command_palette } },
     .{ .name = "settings", .target = .{ .app = .settings } },
     .{ .name = "companion", .target = .{ .app = .companion } },
+    .{ .name = "companion_live", .target = .{ .app = .companion_live } },
+    .{ .name = "companion_live_mute", .target = .{ .app = .companion_live_mute } },
     .{ .name = "sidebar", .target = .{ .app = .toggle_sidebar } },
     .{ .name = "sidebar_hidden", .target = .{ .app = .toggle_sidebar_hidden } },
     .{ .name = "side_panel", .target = .{ .app = .toggle_side_panel } },
@@ -1452,6 +1482,8 @@ pub fn prefixTargetLabel(buf: []u8, target: PrefixTarget) []const u8 {
             .command_palette => "Command palette",
             .settings => "Settings",
             .companion => "Companion",
+            .companion_live => "Live voice",
+            .companion_live_mute => "Mute Live voice",
             .toggle_sidebar => "Sidebar",
             .toggle_sidebar_hidden => "Hide sidebar",
             .toggle_side_panel => "Side panel",
@@ -1612,6 +1644,7 @@ const DEFAULT_PREFIX_TABLE = [_]DefaultPrefixEntry{
     .{ .accelerator = "O", .target = "open" },
     .{ .accelerator = "E", .target = "open_editor" },
     .{ .accelerator = "Space", .target = "companion" },
+    .{ .accelerator = "Shift+Space", .target = "companion_live" },
     .{ .accelerator = "S", .target = "sidebar" },
     .{ .accelerator = "Shift+S", .target = "sidebar_hidden" },
     .{ .accelerator = "B", .target = "browser" },
@@ -1800,6 +1833,18 @@ fn cloneDefaultCommandPaletteKeybinds(allocator: std.mem.Allocator) ![]Keybind {
 fn cloneDefaultCompanionKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("Ctrl+Shift+Space"),
+    });
+}
+
+fn cloneDefaultCompanionLiveKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Ctrl+Alt+Space"),
+    });
+}
+
+fn cloneDefaultCompanionLiveMuteKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Ctrl+Alt+M"),
     });
 }
 
