@@ -29,6 +29,8 @@ const MAX_RETIRING: usize = 4;
 const MAX_UNSAVED: usize = 4;
 const MAX_SAVE_ATTEMPTS: u8 = 3;
 const MAX_APPROVAL_CANDIDATES: usize = 32;
+/// Finished exchanges land in the chat this soon (while the companion is idle).
+const LIVE_SAVE_DEBOUNCE_MS: i64 = 1_500;
 
 pub const Phase = Machine.Phase;
 pub const Activity = Machine.Activity;
@@ -85,6 +87,10 @@ const SaveMessage = struct { key: []u8, role: []const u8, author: []u8, body: []
 const SaveJob = struct {
     done: std.atomic.Value(bool) = .init(false),
     ok: bool = false,
+    /// Daemon error code or local cause when the save failed (never content).
+    failure_buffer: [96]u8 = undefined,
+    failure: []const u8 = "unknown",
+
     worker: ?std.Thread = null,
     transcript: *Transcript,
     count: usize,
@@ -93,6 +99,10 @@ const SaveJob = struct {
     thread_id: []const u8,
     session_id: [16]u8,
     messages: []const SaveMessage,
+
+    fn setFailure(self: *SaveJob, step: []const u8, code: []const u8) void {
+        self.failure = std.fmt.bufPrint(&self.failure_buffer, "{s}: {s}", .{ step, code }) catch step;
+    }
 
     fn destroy(self: *SaveJob, allocator: std.mem.Allocator) void {
         if (self.worker) |worker| worker.join();
@@ -284,7 +294,7 @@ fn handleNote(self: *Self, host: anytype, engine: *Engine, item: Engine.Note, no
     const record = self.transcript orelse return;
     const changed = switch (item) {
         .connected => |v| blk: {
-            const header = std.fmt.allocPrint(self.allocator, "🎙 Live voice · {s} · {s}", .{ providerLabel(v.provider), v.voice }) catch break :blk false;
+            const header = std.fmt.allocPrint(self.allocator, "Live voice · {s} · {s}", .{ providerLabel(v.provider), v.voice }) catch break :blk false;
             defer self.allocator.free(header);
             record.header(header, now) catch {};
             break :blk true;
@@ -455,7 +465,7 @@ fn maybeSave(self: *Self, host: anytype, now: i64) void {
         return;
     };
     const record = self.transcript orelse return;
-    if (now - self.last_save_ms < Transcript.SAVE_INTERVAL_MS or host.liveCompanionWorking()) return;
+    if (now - self.last_save_ms < LIVE_SAVE_DEBOUNCE_MS or host.liveCompanionWorking()) return;
     self.last_save_ms = now;
     self.startSave(host, record, false);
 }
@@ -530,6 +540,7 @@ fn collectSave(self: *Self) void {
         self.save_attempts = 0;
     } else {
         self.save_attempts +|= 1;
+        log.warn("live voice transcript save failed ({s}); attempt {d}", .{ job.failure, self.save_attempts });
     }
     for (&self.unsaved) |*slot| if (slot.* == record) {
         const rest = record.pending(true) catch 0;
@@ -552,13 +563,13 @@ fn saveWorker(job: *SaveJob, allocator: std.mem.Allocator) void {
     const arena = arena_state.allocator();
     var transport: daemon_client.HeadlessTransport = .{ .allocator = arena, .pref_path = job.pref_path, .timeout_ms = SAVE_TIMEOUT_MS };
     var client = daemon_client.headlessClient(arena, &transport);
-    var registered = client.call("daemon.client.register", .{ .persistent = false }) catch return;
+    var registered = client.call("daemon.client.register", .{ .persistent = false }) catch |err| return job.setFailure("register", @errorName(err));
     defer registered.deinit();
-    if (registered.response.err != null) return;
-    const result = registered.response.result orelse return;
-    const client_id = protocol.stringOf(if (result == .object) result.object.get("client_id") else null) orelse return;
+    if (registered.response.err) |err| return job.setFailure("register", err.code);
+    const result = registered.response.result orelse return job.setFailure("register", "no result");
+    const client_id = protocol.stringOf(if (result == .object) result.object.get("client_id") else null) orelse return job.setFailure("register", "no client_id");
     for (job.messages) |message| {
-        const message_id = std.fmt.allocPrint(arena, "live:{s}:{s}", .{ &job.session_id, message.key }) catch return;
+        const message_id = std.fmt.allocPrint(arena, "live:{s}:{s}", .{ &job.session_id, message.key }) catch return job.setFailure("append", "out of memory");
         var appended = client.call("chat.message.append", .{
             .mutation = .{ .request_key = message_id, .client_id = client_id },
             .workspace_id = job.workspace_id,
@@ -571,9 +582,9 @@ fn saveWorker(job: *SaveJob, allocator: std.mem.Allocator) void {
                 .created_at_ms = message.created_at_ms,
                 .updated_at_ms = message.created_at_ms,
             },
-        }) catch return;
+        }) catch |err| return job.setFailure("append", @errorName(err));
         defer appended.deinit();
-        if (appended.response.err != null) return;
+        if (appended.response.err) |err| return job.setFailure("append", err.code);
     }
     job.ok = true;
 }
@@ -717,6 +728,18 @@ pub fn matchApproval(query: []const u8, candidates: []const ApprovalCandidate) A
     if (partial_count == 1) return .{ .found = partial.? };
     if (partial_count > 1) return .ambiguous;
     return .not_found;
+}
+
+/// Authors of saved Live voice lines: "You (voice)", "<Name> (voice)".
+pub fn isVoiceAuthor(author: []const u8) bool {
+    return std.mem.endsWith(u8, author, " (voice)");
+}
+
+/// The speaker of a voice author ("You", "Moss"), or null.
+pub fn voiceSpeaker(author: []const u8) ?[]const u8 {
+    if (!isVoiceAuthor(author)) return null;
+    const speaker = std.mem.trim(u8, author[0 .. author.len - " (voice)".len], " ");
+    return if (speaker.len > 0) speaker else null;
 }
 
 /// Spoken words join an existing draft like the phone apps do.
@@ -873,4 +896,13 @@ test "the full controller API instantiates against the host contract" {
     controller.tick(&host);
     try testing.expect(!controller.active());
     try testing.expectEqual(Phase.off, controller.presentation().phase);
+}
+
+test "voice authors name their speaker" {
+    try testing.expect(isVoiceAuthor("You (voice)"));
+    try testing.expectEqualStrings("You", voiceSpeaker("You (voice)").?);
+    try testing.expectEqualStrings("Moss", voiceSpeaker("Moss (voice)").?);
+    try testing.expect(voiceSpeaker("You") == null);
+    try testing.expect(voiceSpeaker(" (voice)") == null);
+    try testing.expect(!isVoiceAuthor("Live"));
 }

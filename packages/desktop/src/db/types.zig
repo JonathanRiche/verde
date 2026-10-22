@@ -28,6 +28,7 @@ pub fn decodeStoredChatRole(raw: i64, author_raw: []const u8) ChatRole {
     const author = std.mem.trim(u8, author_raw, "\n\r\t ");
     if (storedUserAuthor(author)) return .user;
     if (storedAssistantAuthor(author)) return .assistant;
+    if (storedVoiceRole(author)) |role| return role;
 
     // Every persisted Verde event/card title is a system author. Prefer that
     // stable contract over an ambiguous integer; only authorless corrupt or
@@ -40,6 +41,17 @@ pub fn decodeStoredChatRole(raw: i64, author_raw: []const u8) ChatRole {
         2 => .system,
         else => .user,
     };
+}
+
+/// Live voice transcripts (desktop and phones) save the user's speech as
+/// "You (voice)" and the companion's as "<Name> (voice)"; companion names are
+/// user-chosen, so the suffix is the stable contract.
+fn storedVoiceRole(author: []const u8) ?ChatRole {
+    const suffix = " (voice)";
+    if (author.len <= suffix.len or !std.ascii.endsWithIgnoreCase(author, suffix)) return null;
+    const speaker = std.mem.trim(u8, author[0 .. author.len - suffix.len], " ");
+    if (speaker.len == 0) return null;
+    return if (storedUserAuthor(speaker)) .user else .assistant;
 }
 
 fn storedUserAuthor(author: []const u8) bool {
@@ -83,6 +95,13 @@ test "mixed stored chat role codecs retain semantic roles" {
         .{ .raw = 2, .author = "FX", .expected = .assistant },
         .{ .raw = 2, .author = "Grok", .expected = .assistant },
         .{ .raw = 2, .author = "Sprout", .expected = .assistant },
+        // Live voice transcripts keep the speaker's role whatever the codec.
+        .{ .raw = 0, .author = "You (voice)", .expected = .user },
+        .{ .raw = 2, .author = "You (voice)", .expected = .user },
+        .{ .raw = 1, .author = "Moss (voice)", .expected = .assistant },
+        .{ .raw = 2, .author = "Ada Lovelace (voice)", .expected = .assistant },
+        .{ .raw = 2, .author = "Live", .expected = .system },
+        .{ .raw = 0, .author = "(voice)", .expected = .system },
         // Older desktop projections used assistant=0, system=1, user=2.
         .{ .raw = 0, .author = "Codex", .expected = .assistant },
         .{ .raw = 1, .author = "MCP tool", .expected = .system },

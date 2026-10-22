@@ -8,6 +8,7 @@ const std = @import("std");
 const palette = @import("palette");
 const app_config = @import("../app/config.zig");
 const controller = @import("../state/companion_controller.zig");
+const live_voice = @import("../state/live_voice_controller.zig");
 const companion_roster = @import("../state/companion_roster.zig");
 const runtime = @import("runtime.zig");
 const theme = @import("theme.zig");
@@ -59,6 +60,9 @@ const LIVE_STRIP_ERROR_HEIGHT: f32 = 46.0;
 const LIVE_BUTTON_W: f32 = 58.0;
 const LIVE_BUTTON_H: f32 = 24.0;
 const LIVE_CAPTION_FONT: f32 = 11.5;
+/// "<speaker> · voice" label above saved Live voice lines (mobile style).
+const VOICE_LABEL_H: f32 = 16.0;
+const VOICE_LABEL_FONT: f32 = 10.5;
 const HEADER_BUTTON: f32 = 28.0;
 const MENU_ROW_HEIGHT: f32 = 40.0;
 const MENU_ACTION_HEIGHT: f32 = 34.0;
@@ -96,7 +100,6 @@ const MAX_SCHEDULE_BLOCKS: usize = 3;
 pub const SCHEDULE_SUGGESTION = "Every weekday at 9:00, check CI for every workspace and tell me what failed.";
 /// Codicon "watch" (a clock face) for the header's scheduled-tasks button.
 const NF_COD_WATCH = "\u{EB7B}";
-const NF_MD_MICROPHONE = "\u{F036C}";
 const NF_COD_CLOSE = "\u{EA76}";
 
 pub const Geometry = struct {
@@ -1349,12 +1352,14 @@ fn conversationItemHeight(state: *runtime.AppState, item: *const controller.Acti
     return switch (item.kind) {
         .user => blk: {
             const wrapped = wrapText(conversationalText(state, item.body.slice()), widths.bubble, .prose, bodyFont(), USER_MAX_LINES);
-            break :blk @as(f32, @floatFromInt(@max(wrapped.count, 1))) * bodyLineHeight() + 20.0 * s + 10.0 * s;
+            const label_h: f32 = if (voiceSpeaker(item) != null) VOICE_LABEL_H * s else 0.0;
+            break :blk @as(f32, @floatFromInt(@max(wrapped.count, 1))) * bodyLineHeight() + 20.0 * s + 10.0 * s + label_h;
         },
         .assistant, .streaming => blk: {
             const wrapped = wrapText(conversationalText(state, item.body.slice()), widths.text, .prose, bodyFont(), ASSISTANT_MAX_LINES);
             if (wrapped.count == 0) break :blk 0.0;
-            break :blk @as(f32, @floatFromInt(wrapped.count)) * bodyLineHeight() + 14.0 * s;
+            const label_h: f32 = if (voiceSpeaker(item) != null) VOICE_LABEL_H * s else 0.0;
+            break :blk @as(f32, @floatFromInt(wrapped.count)) * bodyLineHeight() + 14.0 * s + label_h;
         },
         .tool, .process => 24.0 * s,
         .system => if (std.mem.trim(u8, item.body.slice(), " \t\r\n").len == 0) 0.0 else 22.0 * s,
@@ -1405,6 +1410,8 @@ fn renderConversationItem(state: *runtime.AppState, item_index: usize, item: *co
         queuePanelClipped(state, bubble, color(opaqueOver(surface(), chrome.ready_fill)), color(opaqueOver(surface(), theme.withAlpha(chrome.accent, 60))), 12.0 * s, 1.0 * s, conversation);
     }
     renderTextSelection(state, item_index, &layout, conversation);
+    if (layout.voice_label) |label| renderVoiceLabel(state, label.x, label.y, label.speaker, item.kind == .user, conversation);
+    if (layout.live_note_icon) |icon| queueWaveform(state, icon, color(chrome.text_subtle));
     const text_color = switch (item.kind) {
         .user, .assistant, .streaming => chrome.text,
         .tool, .process, .system => chrome.text_subtle,
@@ -1456,6 +1463,9 @@ const ItemTextLayout = struct {
     count: usize = 0,
     truncated: bool = false,
     bubble: ?palette.Rect = null,
+    /// Where the "<speaker> · voice" label (or a Live note's waveform) goes.
+    voice_label: ?struct { x: f32, y: f32, speaker: []const u8 } = null,
+    live_note_icon: ?palette.Rect = null,
 };
 
 fn itemTextLayout(state: *runtime.AppState, item: *const controller.ActivityItem, conversation: palette.Rect, y: f32) ItemTextLayout {
@@ -1474,17 +1484,25 @@ fn itemTextLayout(state: *runtime.AppState, item: *const controller.ActivityItem
             var origin_x = x;
             var origin_y = y + 6.0 * s;
             var line_w = widths.text + 12.0 * s;
+            const speaker = voiceSpeaker(item);
+            const label_h: f32 = if (speaker != null) VOICE_LABEL_H * s else 0.0;
             if (user) {
                 var widest: f32 = 0.0;
                 for (wrapped.lines[0..wrapped.count]) |line| widest = @max(widest, text_measure.textWidth(.prose, font, line));
+                if (speaker) |who| widest = @max(widest, voiceLabelWidth(state, who));
                 const bubble_w = @min(widest + 22.0 * s, widths.bubble + 20.0 * s);
-                const bubble_h = @as(f32, @floatFromInt(@max(wrapped.count, 1))) * line_h + 18.0 * s;
+                const bubble_h = @as(f32, @floatFromInt(@max(wrapped.count, 1))) * line_h + 18.0 * s + label_h;
                 const bubble: palette.Rect = .{ .x = x + widths.text - bubble_w, .y = y + 4.0 * s, .w = bubble_w, .h = bubble_h };
                 layout.bubble = bubble;
                 origin_x = bubble.x + 11.0 * s;
                 origin_y = bubble.y + 9.0 * s;
                 line_w = widths.bubble + 4.0 * s;
+                // Voice labels sit right-aligned on the bubble's first row.
+                if (speaker) |who| layout.voice_label = .{ .x = bubble.x + bubble.w - 11.0 * s - voiceLabelWidth(state, who), .y = origin_y - 2.0 * s, .speaker = who };
+            } else if (speaker) |who| {
+                layout.voice_label = .{ .x = origin_x, .y = origin_y - 2.0 * s, .speaker = who };
             }
+            origin_y += label_h;
             var previous_end: usize = 0;
             for (wrapped.lines[0..wrapped.count], 0..) |line, index| {
                 const offset = sliceOffset(layout.text, line) orelse previous_end;
@@ -1505,8 +1523,12 @@ fn itemTextLayout(state: *runtime.AppState, item: *const controller.ActivityItem
         },
         .system => {
             if (std.mem.trim(u8, item.body.slice(), " \t\r\n").len == 0) return layout;
-            layout.text = truncatedText(state, .ui, 11.0 * s, widths.text, singleLineText(state, item.body.slice()));
-            layout.lines[0] = .{ .x = x, .y = y + 3.0 * s, .w = widths.text, .h = 16.0 * s, .text = layout.text, .offset = 0, .role = .ui, .font = 11.0 * s };
+            // Live notes lead with the waveform, like the phones' VoiceNote.
+            const indent: f32 = if (isLiveNote(item)) 16.0 * s else 0.0;
+            if (indent > 0.0) layout.live_note_icon = .{ .x = x, .y = y + 3.0 * s + (16.0 * s - 11.0 * s) * 0.5, .w = 11.0 * s, .h = 11.0 * s };
+            const text_w = @max(widths.text - indent, 0.0);
+            layout.text = truncatedText(state, .ui, 11.0 * s, text_w, singleLineText(state, item.body.slice()));
+            layout.lines[0] = .{ .x = x + indent, .y = y + 3.0 * s, .w = text_w, .h = 16.0 * s, .text = layout.text, .offset = 0, .role = .ui, .font = 11.0 * s };
             layout.count = 1;
         },
     }
@@ -2634,7 +2656,7 @@ fn renderLiveCue(state: *runtime.AppState, rect: palette.Rect, visual: controlle
     queuePanel(state, badge, color(fill), color(chrome.accent), size * 0.5, 1.0 * s);
     if (visual.live == .listening) {
         const icon = size * 0.62;
-        queueIcon(state, .{ .x = badge.x + (badge.w - icon) * 0.5, .y = badge.y + (badge.h - icon) * 0.5, .w = icon, .h = icon }, NF_MD_MICROPHONE, color(chrome.accent), badge);
+        queueWaveform(state, .{ .x = badge.x + (badge.w - icon) * 0.5, .y = badge.y + (badge.h - icon) * 0.5, .w = icon, .h = icon }, color(chrome.accent));
         return;
     }
     const bar_w = @max(@round(size * 0.13), 1.0);
@@ -2665,7 +2687,8 @@ fn characterVisual(state: *runtime.AppState) controller.VisualState {
     return visual;
 }
 
-// Header mic: accent-filled while Live runs, muted ring otherwise.
+// Header Live button: the phone apps' waveform, on an accent fill while
+// Live runs (like iOS `waveform.circle.fill`).
 fn renderLiveButton(state: *runtime.AppState, rect: palette.Rect) void {
     if (rect.w <= 0.0 or rect.h <= 0.0) return;
     const s = companionScale();
@@ -2677,7 +2700,56 @@ fn renderLiveButton(state: *runtime.AppState, rect: palette.Rect) void {
         queuePanel(state, rect, color(surface()), color(hairline()), 7.0 * s, 1.0 * s);
     }
     const icon = 15.0 * s;
-    queueIcon(state, .{ .x = rect.x + (rect.w - icon) * 0.5, .y = rect.y + (rect.h - icon) * 0.5, .w = icon, .h = icon }, NF_MD_MICROPHONE, color(if (on) chrome.accent_fg else chrome.text_muted), rect);
+    queueWaveform(state, .{ .x = rect.x + (rect.w - icon) * 0.5, .y = rect.y + (rect.h - icon) * 0.5, .w = icon, .h = icon }, color(if (on) chrome.accent_fg else chrome.text_muted));
+}
+
+/// The mobile Live glyph (`ic_waveform`): five rounded bars on a 24-unit
+/// grid at x = 3, 7, 11, 15, 19, two units wide, 4/12/18/10/4 tall, centred.
+/// Drawn as shapes with whole-pixel bar widths so it stays crisp at any scale.
+fn queueWaveform(state: *runtime.AppState, rect: palette.Rect, fill: palette.Color) void {
+    if (rect.w <= 0.0 or rect.h <= 0.0) return;
+    const unit = @min(rect.w, rect.h) / 24.0;
+    const origin_x = rect.x + (rect.w - 24.0 * unit) * 0.5;
+    const mid_y = rect.y + rect.h * 0.5;
+    const bar_w = @max(@round(2.0 * unit), 1.0);
+    const heights = [_]f32{ 4.0, 12.0, 18.0, 10.0, 4.0 };
+    for (heights, 0..) |height, index| {
+        const x = @round(origin_x + (3.0 + 4.0 * @as(f32, @floatFromInt(index))) * unit);
+        const h = @max(height * unit, bar_w);
+        queueRoundedRect(state, .{ .x = x, .y = mid_y - h * 0.5, .w = bar_w, .h = h }, fill, bar_w * 0.5);
+    }
+}
+
+/// Speaker of a saved Live voice line ("You", "Moss"), or null for typed turns.
+fn voiceSpeaker(item: *const controller.ActivityItem) ?[]const u8 {
+    if (item.kind != .user and item.kind != .assistant) return null;
+    return live_voice.voiceSpeaker(item.author.slice());
+}
+
+fn voiceLabelText(state: *runtime.AppState, speaker: []const u8) []const u8 {
+    return framePrint(state, "{s} · voice", .{speaker});
+}
+
+/// A "Live" system note (session header, hand-offs) gets the waveform too.
+fn isLiveNote(item: *const controller.ActivityItem) bool {
+    return item.kind == .system and std.mem.eql(u8, item.author.slice(), "Live");
+}
+
+/// Small waveform plus "<speaker> · voice", as on the phones.
+fn renderVoiceLabel(state: *runtime.AppState, x: f32, y: f32, speaker: []const u8, user: bool, clip: palette.Rect) void {
+    const s = companionScale();
+    const chrome = theme.companionChrome();
+    const icon = 11.0 * s;
+    const font = VOICE_LABEL_FONT * s;
+    const label = voiceLabelText(state, speaker);
+    const label_w = text_measure.textWidth(.ui, font, label);
+    queueWaveform(state, .{ .x = x, .y = y + (VOICE_LABEL_H * s - icon) * 0.5, .w = icon, .h = icon }, color(if (user) chrome.text_muted else chrome.accent));
+    queueText(state, .{ .x = x + icon + 4.0 * s, .y = y + (VOICE_LABEL_H * s - font * 1.3) * 0.5, .w = label_w + 1.0, .h = font * 1.3 }, label, color(if (user) chrome.text_muted else chrome.text_subtle), font, clip);
+}
+
+fn voiceLabelWidth(state: *runtime.AppState, speaker: []const u8) f32 {
+    const s = companionScale();
+    return 11.0 * s + 4.0 * s + text_measure.textWidth(.ui, VOICE_LABEL_FONT * s, voiceLabelText(state, speaker));
 }
 
 fn renderStripButton(state: *runtime.AppState, rect: palette.Rect, label: []const u8, primary: bool) void {
@@ -3517,6 +3589,7 @@ fn testState(allocator: std.mem.Allocator, state: *runtime.AppState) !void {
     state.project_controller = .{};
     state.companion_controller = controller.init();
     state.companion_schedules = .{};
+    state.live_voice = .{};
     state.companion_roster = .{};
     state.companion_controller.identity.name.set("Juniper");
     state.companion_controller.identity.brain.set("Claude · Opus");

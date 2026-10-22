@@ -12943,9 +12943,12 @@ pub const AppState = struct {
     fn projectCompanionTranscript(frame: *companion_controller.Frame, thread: *const ChatThread) void {
         for (thread.messages.items, 0..) |message, index| {
             const sequence: i64 = @intCast(index);
+            // Saved Live voice lines read like typed turns but keep their
+            // "(voice)" author for the label, and never become the objective.
+            const voice = live_voice_controller_mod.isVoiceAuthor(message.author);
             // The Objective mirrors the user's most recent meaningful
             // instruction, not the first prompt of the thread.
-            if (message.role == .user) {
+            if (message.role == .user and !voice) {
                 const trimmed = std.mem.trim(u8, message.body, " \t\r\n");
                 if (trimmed.len > 0) {
                     frame.objective.set(trimmed);
@@ -12959,7 +12962,7 @@ pub const AppState = struct {
                     frame.has_failure = false;
                 }
             }
-            if (message.role == .assistant) {
+            if (message.role == .assistant and !voice) {
                 const trimmed = std.mem.trim(u8, message.body, " \t\r\n");
                 if (trimmed.len > 0) frame.answer.set(trimmed);
             }
@@ -12978,7 +12981,7 @@ pub const AppState = struct {
                 .assistant => .assistant,
                 .system => .system,
             };
-            const author = switch (message.role) {
+            const author = if (voice) message.author else switch (message.role) {
                 .user => "You",
                 .assistant => "Sprout",
                 .system => message.author,
