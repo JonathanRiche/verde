@@ -6,6 +6,7 @@
 //! starts, stops, or replaces a Verde daemon.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const headless = @import("headless");
 const connection = @import("connection.zig");
 const gateway_transport = @import("gateway_transport.zig");
@@ -16,6 +17,7 @@ const secret_store = @import("secret_store.zig");
 const tunnel_supervisor = @import("ssh_tunnel_supervisor.zig");
 
 const access_protocol = headless.access_protocol;
+const log = std.log.scoped(.native_runtime_manager);
 
 pub const MAX_PORT_SELECTION_ATTEMPTS: usize = 8;
 pub const HEARTBEAT_INTERVAL_MS: u64 = 15_000;
@@ -433,6 +435,9 @@ const Entry = struct {
     /// path into the permanent `device_credential_revoked` presentation;
     /// transport, timeout, and generic bearer failures never set it.
     device_auth_rejected: bool = false,
+    /// Last settled state written to the log, so a reconnect loop logs once
+    /// per distinct outcome instead of once per attempt.
+    logged_status: ?LoggedStatus = null,
 
     fn deinit(self: *Entry, allocator: std.mem.Allocator) void {
         // Both handoffs are non-blocking. Their worker-owned state and retained
@@ -930,7 +935,10 @@ pub const Manager = struct {
     /// remain on handshake workers and supervisor collection joins only after
     /// a terminal lifecycle has already been published.
     pub fn poll(self: *Manager, now_ms: u64) !void {
-        for (0..self.entries.items.len) |index| try self.pollEntry(index, now_ms);
+        for (0..self.entries.items.len) |index| {
+            try self.pollEntry(index, now_ms);
+            logStatusChange(&self.entries.items[index]);
+        }
     }
 
     pub fn snapshot(self: *const Manager, profile_id: []const u8) ?Snapshot {
@@ -1525,6 +1533,7 @@ pub const Manager = struct {
             .authentication, .rate_limited => .authentication,
             .session_authentication => .session_authentication,
             .network => .network,
+            .server_unavailable => .server_unavailable,
             .identity => .identity,
             .protocol => .protocol,
             .resource => .resource,
@@ -1533,7 +1542,7 @@ pub const Manager = struct {
             .authentication => if (kind == .pair_exchange) .pairing_rejected else .authentication,
             .session_authentication => .authentication,
             .rate_limited => .rate_limited,
-            .network => .network,
+            .network, .server_unavailable => .network,
             .identity => .identity,
             .protocol => .protocol,
             .resource => .resource,
@@ -2093,6 +2102,8 @@ const AccessFailure = enum {
     session_authentication,
     rate_limited,
     network,
+    /// The endpoint answered with a 5xx: reachable, but its runtime is not.
+    server_unavailable,
     identity,
     protocol,
     resource,
@@ -2310,8 +2321,8 @@ fn mapAccessFailure(err: pair_client.Error) AccessFailure {
         error.NetworkUnavailable,
         error.RequestTimedOut,
         error.ConnectionClosed,
-        error.ServerUnavailable,
         => .network,
+        error.ServerUnavailable => .server_unavailable,
         error.WrongService, error.ProtocolRejected => .protocol,
     };
 }
@@ -2897,6 +2908,40 @@ fn validateRpcMethod(method: []const u8) !void {
         if (!std.ascii.isAlphanumeric(byte) and byte != '.' and byte != '_' and byte != '-') {
             return error.InvalidRuntimeRpcMethod;
         }
+    }
+}
+
+const LoggedStatus = struct {
+    phase: connection.Phase,
+    failure: ?Failure,
+    reason: ?FailureReason,
+};
+
+/// Logs settled phase/failure changes (never secrets) so a profile's connect
+/// history can be read from the stderr log. Connecting and handshaking are
+/// transient and skipped; a retry loop with an unchanged reason logs once.
+fn logStatusChange(entry: *Entry) void {
+    const row = snapshotEntry(entry);
+    switch (row.phase) {
+        .connecting, .handshaking => return,
+        else => {},
+    }
+    const current: LoggedStatus = .{ .phase = row.phase, .failure = row.failure, .reason = row.failure_reason };
+    if (entry.logged_status) |previous| {
+        if (previous.phase == current.phase and previous.failure == current.failure and previous.reason == current.reason) return;
+    }
+    entry.logged_status = current;
+    // The test build runner fails a step on any stderr output.
+    if (builtin.is_test) return;
+    const failure_name = if (current.failure) |failure| @tagName(failure) else "none";
+    const reason_name = if (current.reason) |reason| @tagName(reason) else "none";
+    switch (current.phase) {
+        .failed, .reconnecting => log.warn("runtime {s} transport={s} phase={s} failure={s} reason={s}", .{
+            row.profile_id, @tagName(row.transport), @tagName(current.phase), failure_name, reason_name,
+        }),
+        else => log.info("runtime {s} transport={s} phase={s} failure={s} reason={s}", .{
+            row.profile_id, @tagName(row.transport), @tagName(current.phase), failure_name, reason_name,
+        }),
     }
 }
 
@@ -3669,6 +3714,27 @@ test "session authentication during device mint preserves credential and require
     try std.testing.expect(!snapshot.automatic_retry_scheduled);
     try std.testing.expectEqual(connection.FailureKind.session_authentication, mapTransportFailure(error.SessionAuthenticationRequired));
     try std.testing.expect(!manager.recoverStaleBearer(entry, .session_authentication));
+}
+
+test "a 5xx during device mint reports server unavailable and keeps retrying" {
+    var configured = try createPairedDirectTestProfile("Gateway 5xx");
+    defer configured.deinit(std.testing.allocator);
+    var manager = try Manager.init(std.testing.allocator, std.testing.io, &.{configured}, .{ .durable_credentials = false });
+    defer manager.deinit();
+    try manager.hydrateDeviceCredential(configured.id, TEST_DEVICE_CREDENTIAL);
+    const entry = manager.findEntry(configured.id).?;
+    const generation = try entry.connection_state.enable();
+    try manager.failAccess(entry, generation, .mint_access_token, mapAccessFailure(error.ServerUnavailable), 1000);
+    const snapshot = manager.snapshot(configured.id).?;
+    try std.testing.expectEqual(FailureReason.server_unavailable, snapshot.failure_reason.?);
+    try std.testing.expectEqual(connection.Phase.reconnecting, snapshot.phase);
+    try std.testing.expect(snapshot.automatic_retry_scheduled);
+    try std.testing.expect(snapshot.device_credential_held);
+    try std.testing.expect(!entry.device_auth_rejected);
+    // Settled states are recorded once; an unchanged retry loop is not relogged.
+    logStatusChange(entry);
+    try std.testing.expectEqual(connection.Phase.reconnecting, entry.logged_status.?.phase);
+    try std.testing.expectEqual(FailureReason.server_unavailable, entry.logged_status.?.reason.?);
 }
 
 /// Answers `core.status` like `TestRpc`; every other method waits on `gate`
