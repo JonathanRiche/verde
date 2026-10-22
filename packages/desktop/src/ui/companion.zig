@@ -546,8 +546,10 @@ fn computeGeometryAt(state: *runtime.AppState, width: f32, height: f32, s: f32) 
 
     // Panel: right-side column, full height. Expanded, it covers the whole
     // workspace area beside the sidebar, like a full chat screen.
-    const inset = @min(PANEL_INSET * s, @min(window.w, window.h) * 0.5);
-    const expanded_w = window.w - inset * 2.0 - @max(companion.workspace_left, 0.0);
+    // Expanded, it fills the workspace area edge to edge like a pane: no inset,
+    // no floating chrome (see `renderPanel`).
+    const inset = if (companion.expanded) 0.0 else @min(PANEL_INSET * s, @min(window.w, window.h) * 0.5);
+    const expanded_w = window.w - @max(companion.workspace_left, 0.0);
     const panel_w = @max(@min(if (companion.expanded) @max(expanded_w, PANEL_WIDTH * s) else PANEL_WIDTH * s, window.w - inset * 2.0), 0.0);
     const panel: palette.Rect = .{ .x = window.w - inset - panel_w, .y = inset, .w = panel_w, .h = @max(window.h - inset * 2.0, 0.0) };
     const header: palette.Rect = .{ .x = panel.x, .y = panel.y, .w = panel.w, .h = @min(HEADER_HEIGHT * s, panel.h) };
@@ -831,10 +833,17 @@ fn renderPanel(state: *runtime.AppState, geometry: Geometry) void {
     if (geometry.panel.w <= 0.0 or geometry.panel.h <= 0.0) return;
     const s = companionScale();
     const chrome = theme.companionChrome();
-    queueRect(state, geometry.window, color(theme.scrim(0.18)));
-    queueRoundedRectClipped(state, expandedOffsetRect(geometry.panel, 8.0 * s, 18.0 * s), color(theme.scrim(0.16)), 18.0 * s, geometry.window);
-    queueRoundedRectClipped(state, offsetRect(geometry.panel, 0.0, 4.0 * s), color(theme.scrim(0.24)), 14.0 * s, geometry.window);
-    queuePanel(state, geometry.panel, color(surface()), color(chrome.border), 14.0 * s, 1.0 * s);
+    if (state.companion_controller.expanded) {
+        // Flush with the workspace like a maximized pane: square, no shadow,
+        // only a hairline against the sidebar.
+        queueRect(state, geometry.panel, color(surface()));
+        queueRect(state, .{ .x = geometry.panel.x, .y = geometry.panel.y, .w = snappedStroke(1.0 * s), .h = geometry.panel.h }, color(chrome.border));
+    } else {
+        queueRect(state, geometry.window, color(theme.scrim(0.18)));
+        queueRoundedRectClipped(state, expandedOffsetRect(geometry.panel, 8.0 * s, 18.0 * s), color(theme.scrim(0.16)), 18.0 * s, geometry.window);
+        queueRoundedRectClipped(state, offsetRect(geometry.panel, 0.0, 4.0 * s), color(theme.scrim(0.24)), 14.0 * s, geometry.window);
+        queuePanel(state, geometry.panel, color(surface()), color(chrome.border), 14.0 * s, 1.0 * s);
+    }
     renderHeader(state, geometry);
     if (state.companion_controller.view == .schedules) {
         renderSchedules(state, geometry);
@@ -4040,8 +4049,11 @@ test "expand covers the workspace beside the sidebar with a capped reading colum
     state.companion_controller.workspace_left = 300.0;
     state.companion_controller.expanded = true;
     geometry = computeGeometry(&state, window.w, window.h);
-    try std.testing.expectApproxEqAbs(300.0 + PANEL_INSET, geometry.panel.x, 0.01);
-    try std.testing.expectApproxEqAbs(window.w - PANEL_INSET, geometry.panel.x + geometry.panel.w, 0.01);
+    // Edge to edge over the workspace area, like a maximized pane.
+    try std.testing.expectApproxEqAbs(@as(f32, 300.0), geometry.panel.x, 0.01);
+    try std.testing.expectApproxEqAbs(window.w, geometry.panel.x + geometry.panel.w, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), geometry.panel.y, 0.01);
+    try std.testing.expectApproxEqAbs(window.h, geometry.panel.h, 0.01);
     // The text column is capped like the chat transcript and centered.
     const widths = conversationWidths(geometry.conversation);
     try std.testing.expectApproxEqAbs(theme.scaledUi(READING_MAX_CSS), widths.text, 0.01);
