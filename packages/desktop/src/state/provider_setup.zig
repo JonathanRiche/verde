@@ -18,6 +18,7 @@ const provider_models = @import("provider_models.zig");
 const provider_controller = @import("provider_controller.zig");
 const remote_terminal = @import("remote_setup_terminal.zig");
 const auth_probe = @import("remote_auth_probe.zig");
+pub const remote_github = @import("remote_github.zig");
 const runtime_manager = @import("../runtime/manager.zig");
 const runtime_connections_controller = @import("runtime_connections_controller.zig");
 
@@ -89,6 +90,18 @@ pub const RowNote = enum {
     }
 };
 
+/// Runtime tools set up from Settings > Connections with the same dialog and
+/// terminal as providers (see `remote_github.zig`); never a dialog row.
+pub const Tool = enum {
+    github,
+
+    pub fn displayName(self: Tool) []const u8 {
+        return switch (self) {
+            .github => "GitHub",
+        };
+    }
+};
+
 /// Dialog names, shared by its rows, its notices, and the welcome screen.
 pub fn displayName(provider: Provider) []const u8 {
     return switch (provider) {
@@ -148,6 +161,12 @@ pub const Setup = struct {
     /// When a successful remote sign-in returns to where it started; 0 when
     /// none is pending.
     complete_at_ms: i64 = 0,
+    /// The open command sets up this tool rather than `provider`.
+    tool: ?Tool = null,
+    /// `notes` counterpart for the open tool command.
+    tool_note: RowNote = .none,
+    /// GitHub CLI status probes per runtime profile.
+    github_probes: std.ArrayList(remote_github.Entry) = .empty,
 
     pub fn visible(self: *const Setup) bool {
         return self.dock != null;
@@ -155,6 +174,20 @@ pub const Setup = struct {
 
     pub fn note(self: *const Setup, provider: Provider) RowNote {
         return self.notes[@intFromEnum(provider)];
+    }
+
+    /// The open command's note: its tool's, else its provider row's.
+    pub fn currentNote(self: *const Setup) RowNote {
+        return if (self.tool != null) self.tool_note else self.note(self.provider);
+    }
+
+    fn setCurrentNote(self: *Setup, value: RowNote) void {
+        if (self.tool != null) self.tool_note = value else self.notes[@intFromEnum(self.provider)] = value;
+    }
+
+    /// Name the setup view uses for the open command's subject.
+    pub fn subjectName(self: *const Setup) []const u8 {
+        return if (self.tool) |tool| tool.displayName() else displayName(self.provider);
     }
 
     pub fn deinit(self: *Setup, allocator: std.mem.Allocator) void {
@@ -184,6 +217,8 @@ pub const Setup = struct {
         self.active_probe = null;
         for (self.auth_probes.items) |entry| allocator.free(entry.profile_id);
         self.auth_probes.deinit(allocator);
+        for (self.github_probes.items) |entry| allocator.free(entry.profile_id);
+        self.github_probes.deinit(allocator);
     }
 };
 
@@ -232,7 +267,7 @@ pub fn start(self: anytype, provider: Provider) void {
 pub fn startCommand(self: anytype, provider: Provider, mode: Mode, shell: []const u8) void {
     const setup = &self.settings_controller.provider_setup;
     close(self);
-    if (setup.target_profile_id) |profile_id| return startRemoteCommand(self, profile_id, provider, mode, shell);
+    if (setup.target_profile_id) |profile_id| return startRemoteCommand(self, profile_id, provider, null, mode, shell);
 
     const allocator = self.allocator;
     const cwd = setupDirAlloc(allocator, self.storage.pref_path) catch return;
@@ -269,6 +304,7 @@ pub fn startCommand(self: anytype, provider: Provider, mode: Mode, shell: []cons
 
     setup.dock = dock;
     setup.provider = provider;
+    setup.tool = null;
     setup.mode = mode;
     setup.status = .running;
     setup.notes[@intFromEnum(provider)] = .none;
@@ -301,6 +337,7 @@ pub fn close(self: anytype) void {
     setup.status = .idle;
     setup.complete_at_ms = 0;
     setup.origin_settings = false;
+    setup.tool = null;
     if (setup.remote) |pump| {
         // The remote process is stopped by `session.kill`, delivered by the
         // pump after the view is gone.
@@ -365,16 +402,21 @@ pub fn poll(self: anytype, now_ms: i64) void {
                 if (!snapshot.running and (snapshot.exit_code != null or snapshot.signal != null)) {
                     const ok = snapshot.exit_code != null and snapshot.exit_code.? == 0;
                     setup.status = if (ok) .succeeded else .failed;
-                    setup.notes[@intFromEnum(setup.provider)] = if (!ok) .failed else switch (setup.mode) {
+                    setup.setCurrentNote(if (!ok) .failed else switch (setup.mode) {
                         .install, .update => .install_finished,
                         .sign_in => .sign_in_finished,
-                    };
-                    // A check already in flight may predate the command, so
-                    // the note resolves from the next one to start.
-                    setup.awaited_generation = if (setup.remote != null)
-                        requestRemoteRecheck(setup)
-                    else
-                        self.requestFreshProviderReadinessCheck();
+                    });
+                    if (setup.tool != null) {
+                        // A tool's state comes from its own probe, not readiness.
+                        if (setup.remote) |pump| requestGithubProbe(self, pump.profile_id);
+                    } else {
+                        // A check already in flight may predate the command, so
+                        // the note resolves from the next one to start.
+                        setup.awaited_generation = if (setup.remote != null)
+                            requestRemoteRecheck(setup)
+                        else
+                            self.requestFreshProviderReadinessCheck();
+                    }
                     self.markDirty();
                 }
             }
@@ -565,6 +607,37 @@ pub fn openForRuntime(self: anytype, profile_id: []const u8, provider: Provider,
     self.markDirty();
 }
 
+/// Settings > Connections: opens the dialog on runtime `profile_id` and runs
+/// the GitHub CLI's install (when `missing`) or sign-in there. Finishing,
+/// Done, and Back return to Settings.
+pub fn openGithubForRuntime(self: anytype, profile_id: []const u8, missing: bool) void {
+    const sc = &self.settings_controller;
+    if (sc.modal_visible) self.cancelSettingsModal();
+    sc.provider_onboarding_highlight = null;
+    sc.provider_onboarding_pinned = true;
+    sc.provider_onboarding_visible = true;
+    sc.provider_onboarding_dismissed = false;
+    close(self);
+    setPin(self, .runtime, profile_id);
+    setTarget(self, profile_id);
+    const mode: Mode = if (missing) .install else .sign_in;
+    startRemoteCommand(self, profile_id, sc.provider_setup.provider, .github, mode, if (missing) remote_github.INSTALL_SHELL else remote_github.SIGN_IN_SHELL);
+    sc.provider_setup.origin_settings = sc.provider_setup.visible();
+    // Nothing to show without the terminal; stay in Settings.
+    if (!sc.provider_setup.visible()) {
+        self.dismissProviderOnboarding();
+        self.openSettingsToCategory(.connections);
+    }
+    self.markDirty();
+}
+
+/// Back / Escape from the setup view: a tool command returns to Settings
+/// (it has no dialog row); a provider command returns to the provider list.
+pub fn back(self: anytype) void {
+    if (self.settings_controller.provider_setup.tool != null) return finishFlow(self);
+    close(self);
+}
+
 /// Settings > Providers manages this computer's CLIs, whatever runtime the
 /// active chat uses: its commands always run locally.
 pub fn pinLocal(self: anytype) void {
@@ -650,8 +723,9 @@ fn modeLabel(mode: Mode) []const u8 {
     };
 }
 
-/// Runs `shell` on runtime `profile_id` in a remote-backed setup terminal.
-fn startRemoteCommand(self: anytype, profile_id: []const u8, provider: Provider, mode: Mode, shell: []const u8) void {
+/// Runs `shell` on runtime `profile_id` in a remote-backed setup terminal,
+/// for `tool` when set, else for `provider`.
+fn startRemoteCommand(self: anytype, profile_id: []const u8, provider: Provider, tool: ?Tool, mode: Mode, shell: []const u8) void {
     const setup = &self.settings_controller.provider_setup;
     const allocator = self.allocator;
     const service = self.runtime_service orelse return failRemoteStart(self, "Remote runtimes are unavailable right now.");
@@ -660,7 +734,8 @@ fn startRemoteCommand(self: anytype, profile_id: []const u8, provider: Provider,
     const label = modeLabel(mode);
     const now_ms = platform_runtime.unixTimestampMs();
     var id_buf: [96]u8 = undefined;
-    const session_id = std.fmt.bufPrint(&id_buf, "verde-provider-setup-{s}-{d}", .{ @tagName(provider), now_ms }) catch return;
+    const subject = if (tool) |value| @tagName(value) else @tagName(provider);
+    const session_id = std.fmt.bufPrint(&id_buf, "verde-provider-setup-{s}-{d}", .{ subject, now_ms }) catch return;
     // The remote daemon's own working directory is arbitrary; installers and
     // logins expect the runtime user's home.
     const remote_shell = std.fmt.allocPrint(allocator, "cd \"$HOME\" 2>/dev/null; {s}", .{shell}) catch return;
@@ -689,9 +764,10 @@ fn startRemoteCommand(self: anytype, profile_id: []const u8, provider: Provider,
     setup.dock = dock;
     setup.remote = pump;
     setup.provider = provider;
+    setup.tool = tool;
     setup.mode = mode;
     setup.status = .running;
-    setup.notes[@intFromEnum(provider)] = .none;
+    setup.setCurrentNote(.none);
     // Typing goes to the setup terminal, not any field behind the dialog.
     self.palette_modal_text_focus = .none;
     self.markDirty();
@@ -762,14 +838,14 @@ fn pollRemoteCommand(self: anytype, now_ms: i64) void {
         if (self.runtime_service) |service| {
             if (pump.step(self.allocator, service, setup.dock, now_ms)) self.markDirty();
         }
-        if (setup.status == .running and setup.mode == .sign_in and pump.phase == .exited and pump.exit_status != null and pump.exit_status.? == 0) {
+        if (setup.status == .running and setup.mode == .sign_in and setup.tool == null and pump.phase == .exited and pump.exit_status != null and pump.exit_status.? == 0) {
             rememberSignIn(self, pump.profile_id, setup.provider);
             requestProbe(self, pump.profile_id, setup.provider);
         }
         if (setup.status == .running) switch (pump.phase) {
             .failed => {
                 setup.status = .failed;
-                setup.notes[@intFromEnum(setup.provider)] = .failed;
+                setup.setCurrentNote(.failed);
                 if (pump.failure) |message| self.setSidebarNotice(message);
                 self.markDirty();
             },
@@ -777,11 +853,15 @@ fn pollRemoteCommand(self: anytype, now_ms: i64) void {
             // what actually happened.
             .exited => if (pump.exit_status == null) {
                 setup.status = .succeeded;
-                setup.notes[@intFromEnum(setup.provider)] = switch (setup.mode) {
+                setup.setCurrentNote(switch (setup.mode) {
                     .install, .update => .install_finished,
                     .sign_in => .sign_in_finished,
-                };
-                setup.awaited_generation = requestRemoteRecheck(setup);
+                });
+                if (setup.tool != null) {
+                    requestGithubProbe(self, pump.profile_id);
+                } else {
+                    setup.awaited_generation = requestRemoteRecheck(setup);
+                }
                 self.markDirty();
             },
             .creating, .running, .done => {},
@@ -912,6 +992,10 @@ pub const FINISH_DELAY_MS: i64 = 1_500;
 fn remoteSignInSucceeded(self: anytype) bool {
     const setup = &self.settings_controller.provider_setup;
     if (setup.remote == null or !setup.visible() or setup.mode != .sign_in or setup.status != .succeeded) return false;
+    if (setup.tool != null) {
+        const profile_id = setup.target_profile_id orelse return false;
+        return githubStatus(setup, profile_id) == .signed_in;
+    }
     if (setup.note(setup.provider) == .signed_in_unverified) return true;
     return effectiveRemoteSnapshot(setup).forProvider(setup.provider) == .ready;
 }
@@ -949,12 +1033,14 @@ pub fn finishFlow(self: anytype) void {
 const ActiveProbe = struct {
     pump: *remote_terminal.Pump,
     provider: Provider,
+    /// A GitHub CLI probe (`remote_github.zig`); `provider` is unused.
+    github: bool = false,
     deadline_ms: i64,
     /// Probe output; may hold account emails, so it is wiped, never logged.
     output: std.ArrayList(u8) = .empty,
 };
 
-const ProbeTarget = struct { profile_id: []const u8, provider: Provider };
+const ProbeTarget = struct { profile_id: []const u8, provider: Provider = .codex, github: bool = false };
 
 /// Latest probe outcome for `provider` on runtime `profile_id`.
 pub fn probedAuth(setup: *const Setup, profile_id: []const u8, provider: Provider) auth_probe.Result {
@@ -1011,13 +1097,17 @@ fn probeDue(setup: *const Setup, profile_id: []const u8, provider: Provider, now
     return true;
 }
 
-/// The next due probe for an installed provider on a runtime the user is
-/// looking at: the remote provider dialog's target, or the expanded
-/// Settings > Connections row.
+/// The next due probe for a runtime the user is looking at: installed
+/// providers on the remote provider dialog's target, or on the expanded
+/// Settings > Connections row, then that row's GitHub CLI (or the dialog's,
+/// while it runs a GitHub command).
 fn nextProbe(self: anytype, now_ms: i64) ?ProbeTarget {
     const sc = &self.settings_controller;
     const setup = &sc.provider_setup;
     if (sc.provider_onboarding_visible) if (setup.target_profile_id) |profile_id| {
+        if (setup.tool == .github) {
+            if (githubProbeDue(setup, profile_id, now_ms)) return .{ .profile_id = profile_id, .github = true };
+        }
         for (std.enums.values(Provider)) |provider| {
             if (auth_probe.command(provider) == null) continue;
             switch (setup.remote_readiness.snapshot.forProvider(provider)) {
@@ -1030,14 +1120,15 @@ fn nextProbe(self: anytype, now_ms: i64) ?ProbeTarget {
     if (!sc.modal_visible) return null;
     const rc = &self.runtime_connections;
     const profile_id = rc.expanded_profile_id orelse return null;
-    const loaded = rc.readiness_profile_id orelse return null;
-    if (!std.mem.eql(u8, profile_id, loaded) or rc.providers_state != .loaded) return null;
-    for (rc.providers.items) |row| {
+    const providers_loaded = if (rc.readiness_profile_id) |loaded| std.mem.eql(u8, profile_id, loaded) and rc.providers_state == .loaded else false;
+    if (providers_loaded) for (rc.providers.items) |row| {
         const id = row.provider orelse continue;
         const provider = std.meta.stringToEnum(Provider, id) orelse continue;
         if (auth_probe.command(provider) == null or std.mem.eql(u8, row.state, "missing")) continue;
         if (probeDue(setup, profile_id, provider, now_ms)) return .{ .profile_id = profile_id, .provider = provider };
-    }
+    };
+    // GitHub needs nothing from the daemon beyond a terminal.
+    if (githubProbeDue(setup, profile_id, now_ms)) return .{ .profile_id = profile_id, .github = true };
     return null;
 }
 
@@ -1050,13 +1141,26 @@ fn pollAuthProbes(self: anytype, now_ms: i64) void {
         _ = probe.pump.step(self.allocator, service, null, now_ms);
         const done = probe.pump.finished();
         if (!done and now_ms < probe.deadline_ms) return;
-        const result: auth_probe.Result = if (done and probe.pump.phase == .exited)
-            auth_probe.parse(probe.provider, probe.output.items, auth_probe.exitCode(probe.pump.exit_status))
-        else
-            .unknown;
-        if (probeEntry(self, probe.pump.profile_id, probe.provider)) |entry| {
-            entry.result = result;
-            entry.probed_at_ms = now_ms;
+        const exited = done and probe.pump.phase == .exited;
+        if (probe.github) {
+            const status: remote_github.Status = if (exited)
+                remote_github.parseProbe(probe.output.items, auth_probe.exitCode(probe.pump.exit_status))
+            else
+                .unknown;
+            if (githubEntry(self, probe.pump.profile_id)) |entry| {
+                entry.status = status;
+                entry.probed_at_ms = now_ms;
+            }
+            resolveToolNoteFor(setup, probe.pump.profile_id, status);
+        } else {
+            const result: auth_probe.Result = if (exited)
+                auth_probe.parse(probe.provider, probe.output.items, auth_probe.exitCode(probe.pump.exit_status))
+            else
+                .unknown;
+            if (probeEntry(self, probe.pump.profile_id, probe.provider)) |entry| {
+                entry.result = result;
+                entry.probed_at_ms = now_ms;
+            }
         }
         std.crypto.secureZero(u8, probe.output.items);
         probe.output.deinit(self.allocator);
@@ -1078,15 +1182,134 @@ fn pollAuthProbes(self: anytype, now_ms: i64) void {
     const target = nextProbe(self, now_ms) orelse return;
     const live = service.snapshot(target.profile_id) orelse return;
     if (!live.execution_ready) return;
-    const shell = (auth_probe.shellAlloc(self.allocator, target.provider) catch return) orelse return;
+    const shell = if (target.github)
+        self.allocator.dupe(u8, remote_github.PROBE_SHELL) catch return
+    else
+        (auth_probe.shellAlloc(self.allocator, target.provider) catch return) orelse return;
     defer self.allocator.free(shell);
     var id_buf: [64]u8 = undefined;
     // Stable per provider: the next probe's create replaces the finished
     // session instead of leaving one per probe on the runtime.
-    const session_id = std.fmt.bufPrint(&id_buf, "verde-auth-probe-{s}", .{@tagName(target.provider)}) catch return;
+    const subject = if (target.github) "github" else @tagName(target.provider);
+    const session_id = std.fmt.bufPrint(&id_buf, "verde-auth-probe-{s}", .{subject}) catch return;
     const pump = remote_terminal.Pump.create(self.allocator, target.profile_id, session_id, shell, "Account status", now_ms) catch return;
-    setup.active_probe = .{ .pump = pump, .provider = target.provider, .deadline_ms = now_ms +| auth_probe.deadlineMs(target.provider) };
+    const deadline = if (target.github) auth_probe.PROBE_DEADLINE_MS else auth_probe.deadlineMs(target.provider);
+    setup.active_probe = .{ .pump = pump, .provider = target.provider, .github = target.github, .deadline_ms = now_ms +| deadline };
     pump.capture = &setup.active_probe.?.output;
+}
+
+// ---- GitHub CLI on a runtime ---------------------------------------------------
+
+/// Latest GitHub CLI status on runtime `profile_id`; null until a probe has
+/// finished (Settings shows "checking").
+pub fn githubStatus(setup: *const Setup, profile_id: []const u8) ?remote_github.Status {
+    for (setup.github_probes.items) |entry| {
+        if (std.mem.eql(u8, entry.profile_id, profile_id)) return entry.status;
+    }
+    return null;
+}
+
+/// "Check again" while a GitHub command is open: probe now, keeping the last
+/// result on screen until the new one lands.
+pub fn refreshGithubProbe(self: anytype) void {
+    const setup = &self.settings_controller.provider_setup;
+    if (setup.tool != .github) return;
+    const profile_id = setup.target_profile_id orelse return;
+    if (githubEntry(self, profile_id)) |entry| entry.probed_at_ms = 0;
+}
+
+fn githubEntry(self: anytype, profile_id: []const u8) ?*remote_github.Entry {
+    const setup = &self.settings_controller.provider_setup;
+    for (setup.github_probes.items) |*entry| {
+        if (std.mem.eql(u8, entry.profile_id, profile_id)) return entry;
+    }
+    const owned = self.allocator.dupe(u8, profile_id) catch return null;
+    setup.github_probes.append(self.allocator, .{ .profile_id = owned }) catch {
+        self.allocator.free(owned);
+        return null;
+    };
+    return &setup.github_probes.items[setup.github_probes.items.len - 1];
+}
+
+/// Probes GitHub on `profile_id` next and forgets the last result (an
+/// install or sign-in just changed it).
+fn requestGithubProbe(self: anytype, profile_id: []const u8) void {
+    const entry = githubEntry(self, profile_id) orelse return;
+    entry.probed_at_ms = 0;
+    entry.status = null;
+}
+
+fn githubProbeDue(setup: *const Setup, profile_id: []const u8, now_ms: i64) bool {
+    for (setup.github_probes.items) |entry| {
+        if (std.mem.eql(u8, entry.profile_id, profile_id)) {
+            return entry.probed_at_ms == 0 or now_ms -| entry.probed_at_ms >= auth_probe.PROBE_INTERVAL_MS;
+        }
+    }
+    return true;
+}
+
+/// Setup readiness for a GitHub command's header: "ready" once signed in.
+pub fn githubReadiness(status: ?remote_github.Status) ProviderReadiness {
+    const value = status orelse return .checking;
+    return switch (value) {
+        .signed_in => .ready,
+        .signed_out => .signed_out,
+        .missing => .missing,
+        .unknown => .unavailable,
+    };
+}
+
+/// What a finished GitHub install / sign-in turned into, once its probe is in.
+pub fn resolvedToolNote(row_note: RowNote, status: remote_github.Status) RowNote {
+    if (!row_note.awaitingCheck()) return row_note;
+    return switch (status) {
+        .signed_in => .none,
+        .signed_out => if (row_note == .install_finished) .installed_sign_in_next else .still_signed_out,
+        .missing => .not_on_path,
+        .unknown => .unverified,
+    };
+}
+
+fn resolveToolNoteFor(setup: *Setup, profile_id: []const u8, status: remote_github.Status) void {
+    if (setup.tool != .github) return;
+    const target = setup.target_profile_id orelse return;
+    if (!std.mem.eql(u8, target, profile_id)) return;
+    setup.tool_note = resolvedToolNote(setup.tool_note, status);
+}
+
+test "GitHub notes and readiness follow the probe" {
+    try std.testing.expectEqual(RowNote.installed_sign_in_next, resolvedToolNote(.install_finished, .signed_out));
+    try std.testing.expectEqual(RowNote.still_signed_out, resolvedToolNote(.sign_in_finished, .signed_out));
+    try std.testing.expectEqual(RowNote.none, resolvedToolNote(.sign_in_finished, .signed_in));
+    try std.testing.expectEqual(RowNote.not_on_path, resolvedToolNote(.install_finished, .missing));
+    try std.testing.expectEqual(RowNote.unverified, resolvedToolNote(.sign_in_finished, .unknown));
+    try std.testing.expectEqual(RowNote.failed, resolvedToolNote(.failed, .signed_in));
+    try std.testing.expectEqual(ProviderReadiness.checking, githubReadiness(null));
+    try std.testing.expectEqual(ProviderReadiness.ready, githubReadiness(.signed_in));
+    try std.testing.expectEqual(ProviderReadiness.missing, githubReadiness(.missing));
+
+    var setup: Setup = .{};
+    var entries = [_]remote_github.Entry{
+        .{ .profile_id = @constCast("cloud"), .probed_at_ms = 5, .status = .signed_out },
+    };
+    setup.github_probes = .{ .items = &entries, .capacity = entries.len };
+    defer setup.github_probes = .empty;
+    try std.testing.expectEqual(@as(?remote_github.Status, .signed_out), githubStatus(&setup, "cloud"));
+    try std.testing.expectEqual(@as(?remote_github.Status, null), githubStatus(&setup, "other"));
+    try std.testing.expect(!githubProbeDue(&setup, "cloud", 5 + auth_probe.PROBE_INTERVAL_MS - 1));
+    try std.testing.expect(githubProbeDue(&setup, "cloud", 5 + auth_probe.PROBE_INTERVAL_MS));
+    try std.testing.expect(githubProbeDue(&setup, "other", 0));
+
+    // Only the open GitHub command on the probed runtime takes the result.
+    setup.tool = .github;
+    setup.target_profile_id = @constCast("cloud");
+    defer setup.target_profile_id = null;
+    setup.tool_note = .sign_in_finished;
+    resolveToolNoteFor(&setup, "other", .signed_in);
+    try std.testing.expectEqual(RowNote.sign_in_finished, setup.currentNote());
+    resolveToolNoteFor(&setup, "cloud", .signed_in);
+    try std.testing.expectEqual(RowNote.none, setup.currentNote());
+    try std.testing.expectEqualStrings("GitHub", setup.subjectName());
 }
 
 test "probe results override unknown remote sign-in only" {

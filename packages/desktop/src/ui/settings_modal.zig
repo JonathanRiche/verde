@@ -3516,7 +3516,7 @@ const DetailLine = struct {
 
 /// Remote provider line action: runs the provider setup flow on the runtime.
 const ProviderSetupLine = struct {
-    /// Index into `runtime_connections.providers`.
+    /// Index into `runtime_connections.providers`, or `GITHUB_SETUP_ROW`.
     provider_row: usize,
     label: []const u8,
 };
@@ -3524,6 +3524,13 @@ const ProviderSetupLine = struct {
 /// Marks a `settings_runtime_action` index as a remote provider setup button
 /// (`(row << 8) | provider_row`) rather than an encoded `RowAction`.
 const PROVIDER_SETUP_ACTION_BIT: usize = 1 << (@bitSizeOf(usize) - 2);
+/// `ProviderSetupLine.provider_row` for the GitHub tool line; above any
+/// provider row (`MAX_READINESS_ROWS`) and within the action's 8 bits.
+const GITHUB_SETUP_ROW: usize = 0xff;
+
+comptime {
+    std.debug.assert(runtime_connections.MAX_READINESS_ROWS < GITHUB_SETUP_ROW);
+}
 
 const DetailBuffer = struct {
     lines: [MAX_DETAIL_LINES]DetailLine = undefined,
@@ -3629,6 +3636,15 @@ pub fn applyRuntimeAction(state: *runtime.AppState, index: usize) void {
     const profile_id = runtimeRowProfileId(state, raw >> 8) orelse return;
     const providers = state.runtime_connections.providers.items;
     const provider_row = raw & 0xff;
+    if (provider_row == GITHUB_SETUP_ROW) {
+        const status = runtime.provider_setup.githubStatus(&state.settings_controller.provider_setup, profile_id) orelse return;
+        switch (status) {
+            .missing => runtime.provider_setup.openGithubForRuntime(state, profile_id, true),
+            .signed_out => runtime.provider_setup.openGithubForRuntime(state, profile_id, false),
+            .signed_in, .unknown => {},
+        }
+        return;
+    }
     if (provider_row >= providers.len) return;
     const setup = remoteProviderSetup(state, profile_id, providers[provider_row]) orelse return;
     runtime.provider_setup.openForRuntime(state, profile_id, setup.provider, setup.missing);
@@ -3855,6 +3871,32 @@ fn collectRuntimeDetailLines(state: *const runtime.AppState, profile_id: ?[]cons
             }
             if (rc.providers_truncated > 0) out.push(.muted, "+{d} more providers", .{rc.providers_truncated});
         },
+    }
+    pushRuntimeToolLines(state, id, out);
+}
+
+/// Tools on a remote runtime: the GitHub CLI's sign-in, from a status probe
+/// Verde runs there itself (the daemon need not know about GitHub). Shown
+/// once the runtime can run commands.
+fn pushRuntimeToolLines(state: *const runtime.AppState, profile_id: []const u8, out: *DetailBuffer) void {
+    const service = state.runtime_service orelse return;
+    const live = service.snapshot(profile_id) orelse return;
+    if (!live.execution_ready) return;
+    out.push(.muted, "Tools on this runtime", .{});
+    const status = runtime.provider_setup.githubStatus(&state.settings_controller.provider_setup, profile_id) orelse {
+        return out.push(.muted, "GitHub · checking…", .{});
+    };
+    switch (status) {
+        .signed_in => out.push(.good, "GitHub · signed in", .{}),
+        .signed_out => {
+            out.push(.normal, "GitHub · not signed in", .{});
+            out.pushSetup(.{ .provider_row = GITHUB_SETUP_ROW, .label = "Sign in" }, "{s}", .{runtime.provider_setup.remote_github.SIGN_IN_SUMMARY});
+        },
+        .missing => {
+            out.push(.normal, "GitHub · not installed", .{});
+            out.pushSetup(.{ .provider_row = GITHUB_SETUP_ROW, .label = "Install" }, "{s}", .{runtime.provider_setup.remote_github.INSTALL_SUMMARY});
+        },
+        .unknown => out.push(.muted, "GitHub · status unavailable right now; checking again shortly", .{}),
     }
 }
 

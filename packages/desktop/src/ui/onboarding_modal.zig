@@ -435,7 +435,10 @@ fn activate(state: *runtime.AppState, action: Action, index: usize) void {
         .mcp_onboarding_not_now => state.completeMcpOnboarding(false),
         .mcp_onboarding_enable => state.completeMcpOnboarding(true),
         .provider_onboarding_close => state.dismissProviderOnboarding(),
-        .provider_onboarding_recheck => if (provider_setup.finishPending(state)) provider_setup.finishFlow(state) else state.recheckProviderReadiness(),
+        .provider_onboarding_recheck => if (provider_setup.finishPending(state)) provider_setup.finishFlow(state) else {
+            provider_setup.refreshGithubProbe(state);
+            state.recheckProviderReadiness();
+        },
         .provider_onboarding_open_guide => state.openProviderSetupGuide(),
         .provider_onboarding_action => if (index < PROVIDERS.len) {
             const provider = PROVIDERS[index];
@@ -446,7 +449,7 @@ fn activate(state: *runtime.AppState, action: Action, index: usize) void {
             }
         },
         .provider_onboarding_copy => if (index < PROVIDERS.len) provider_setup.copyCommand(state, PROVIDERS[index]),
-        .provider_setup_back => provider_setup.close(state),
+        .provider_setup_back => provider_setup.back(state),
         else => {},
     }
     state.markDirty();
@@ -624,7 +627,7 @@ pub fn handleKeyDown(state: *runtime.AppState, event: *const palette.event.KeyEv
             } else if (selectionRange() != null) {
                 clearTextSelection();
             } else if (providerVisible(state) and setup.visible()) {
-                provider_setup.close(state);
+                provider_setup.back(state);
             } else if (providerVisible(state)) {
                 state.dismissProviderOnboarding();
             } else {
@@ -1241,15 +1244,22 @@ fn renderProvider(state: *runtime.AppState, width: f32, height: f32) void {
 
     // A remote target says where the rows and commands apply.
     const runtime_label = provider_setup.targetLabel(state);
+    const tool = if (sc.provider_setup.visible()) sc.provider_setup.tool else null;
     var heading_buf: [160]u8 = undefined;
-    const heading = if (runtime_label) |label| std.fmt.bufPrint(&heading_buf, "Connect an AI provider on {s}", .{label}) catch "Connect an AI provider on the runtime" else "Connect an AI provider";
+    const heading = if (tool) |value|
+        std.fmt.bufPrint(&heading_buf, "Connect {s} on {s}", .{ value.displayName(), runtime_label orelse "the runtime" }) catch "Connect a tool on the runtime"
+    else if (runtime_label) |label| std.fmt.bufPrint(&heading_buf, "Connect an AI provider on {s}", .{label}) catch "Connect an AI provider on the runtime" else "Connect an AI provider";
     queueRoleText(state, .{ .x = modal.x + pad, .y = y, .w = content_w, .h = theme.scaledUi(28.0) }, heading, theme.COLOR_WHITE, theme.scaledUi(22.0), TEXT_ROLE, modal);
     y += theme.scaledUi(34.0);
     const intro_size = theme.scaledUi(13.5);
     var intro_buf: [200]u8 = undefined;
     const intro = if (runtime_label) |label| std.fmt.bufPrint(&intro_buf, "These checks and commands run on {s}, not this computer.", .{label}) catch "These checks and commands run on the remote runtime." else "Verde uses coding-agent accounts already installed on this computer.";
     _ = drawSelectable(state, .intro, 0, .{ .x = modal.x + pad, .y = y, .w = content_w, .h = 0.0 }, intro, theme.COLOR_TEXT_SUBTLE, intro_size, TEXT_ROLE, modal, 1);
-    _ = drawSelectable(state, .intro, 1, .{ .x = modal.x + pad, .y = y + theme.scaledUi(20.0), .w = content_w, .h = 0.0 }, "Set up any one provider to start chatting. No Verde subscription needed.", theme.COLOR_TEXT_SUBTLE, intro_size, TEXT_ROLE, modal, 1);
+    const intro_second: []const u8 = if (tool != null)
+        "Agents on this runtime use the GitHub CLI (gh) and git to push branches and open pull requests."
+    else
+        "Set up any one provider to start chatting. No Verde subscription needed.";
+    _ = drawSelectable(state, .intro, 1, .{ .x = modal.x + pad, .y = y + theme.scaledUi(20.0), .w = content_w, .h = 0.0 }, intro_second, theme.COLOR_TEXT_SUBTLE, intro_size, TEXT_ROLE, modal, 1);
 
     const snapshot = provider_setup.readinessSnapshot(state);
     const footer = providerFooter(layout);
@@ -1289,8 +1299,12 @@ fn allChecking(state: *runtime.AppState, snapshot: Snapshot) bool {
 fn renderSetup(state: *runtime.AppState, layout: ProviderLayout, snapshot: Snapshot) void {
     const setup = &state.settings_controller.provider_setup;
     const dock = setup.dock orelse return;
-    const name = provider_setup.displayName(setup.provider);
-    const readiness = snapshot.forProvider(setup.provider);
+    const name = setup.subjectName();
+    // A tool's readiness is its own probe on the target runtime.
+    const readiness = if (setup.tool != null)
+        provider_setup.githubReadiness(if (setup.target_profile_id) |id| provider_setup.githubStatus(setup, id) else null)
+    else
+        snapshot.forProvider(setup.provider);
     var title_buf: [96]u8 = undefined;
     const verb: []const u8 = switch (setup.mode) {
         .install => "install",
@@ -1307,9 +1321,12 @@ fn renderSetup(state: *runtime.AppState, layout: ProviderLayout, snapshot: Snaps
     const status: []const u8, const status_color = if (readiness == .ready and !updating)
         .{ std.fmt.bufPrint(&status_buf, "{s} is ready. You can go back or close this dialog.", .{name}) catch "Ready.", theme.success() }
     else switch (setup.status) {
-        .running => .{ "Follow the steps in the terminal. Click a link to open it, or drag to select and copy it.", theme.COLOR_TEXT_MUTED },
+        .running => .{ if (setup.tool != null and setup.mode == .sign_in)
+            "Copy the one-time code below, then click the github.com/login/device link and enter it there. Drag to select and copy."
+        else
+            "Follow the steps in the terminal. Click a link to open it, or drag to select and copy it.", theme.COLOR_TEXT_MUTED },
         .succeeded, .failed => blk: {
-            const row_note = setup.note(setup.provider);
+            const row_note = setup.currentNote();
             if (row_note == .signed_in_unverified) if (provider_setup.targetLabel(state)) |label| {
                 break :blk .{ std.fmt.bufPrint(&status_buf, "Signed in on {s}. This runtime version can't confirm accounts, so Verde trusts the sign-in.", .{label}) catch "Signed in.", theme.success() };
             };

@@ -1,0 +1,169 @@
+//! GitHub CLI (`gh`) on a remote runtime: the status probe, the user-space
+//! installer, and the sign-in command Settings > Connections offers under a
+//! runtime's providers.
+//!
+//! Everything runs on the runtime over the terminal RPC lane, so it works
+//! with runtime daemons that know nothing about GitHub. The runtime user has
+//! no root: gh goes under ~/.local, and every command puts ~/.local/bin on
+//! PATH itself rather than trusting the login profile to. Probe output names
+//! the GitHub account; it is parsed in memory, wiped, never logged or shown.
+
+const std = @import("std");
+
+/// Printed by the probe when `gh` is not on PATH (exit 127).
+pub const MISSING_MARKER = "verde-gh-missing";
+
+/// Puts the installer's ~/.local/bin first so a user-space gh is found (and
+/// `gh auth setup-git` records that path for git's credential helper).
+const PATH_PREFIX = "export PATH=\"$HOME/.local/bin:$PATH\"; ";
+
+/// Non-interactive status probe for `bash -lc`: from the runtime user's
+/// home, no terminal input, no update check.
+pub const PROBE_SHELL = "cd \"$HOME\" 2>/dev/null; " ++ PATH_PREFIX ++
+    "command -v gh >/dev/null 2>&1 || { echo " ++ MISSING_MARKER ++ "; exit 127; }; " ++
+    "GH_NO_UPDATE_NOTIFIER=1 GH_PROMPT_DISABLED=1 gh auth status --hostname github.com </dev/null";
+
+/// Device-code sign-in. `--hostname` with `--web` keeps gh non-interactive:
+/// it prints the one-time code and the github.com/login/device URL and polls,
+/// with no "Press Enter" step or Git prompt. The browser variables are a
+/// fallback for gh versions that still try to open one: they print the URL
+/// instead of launching anything on the runtime. `setup-git` then makes git
+/// on the runtime use the new login for github.com.
+pub const SIGN_IN_SHELL = PATH_PREFIX ++
+    "command -v gh >/dev/null 2>&1 || { echo 'The GitHub CLI (gh) is not installed on this runtime. Go back and choose Install.'; exit 127; }; " ++
+    "export GH_BROWSER=echo BROWSER=echo GH_NO_UPDATE_NOTIFIER=1; " ++
+    "gh auth login --hostname github.com --git-protocol https --web && gh auth setup-git && " ++
+    "echo 'Signed in. Git on this runtime now uses this GitHub account for github.com.'";
+
+/// User-space install of the latest official gh release for Linux
+/// amd64/arm64: resolves the release from github.com's redirect (no API rate
+/// limit), verifies the tarball against the release's checksums file,
+/// unpacks it to ~/.local/share/gh/<version>, and links ~/.local/bin/gh. No
+/// root needed. curl honors the runtime's HTTPS_PROXY. Runs in a subshell so
+/// `set -eu` and the cleanup trap end with it.
+pub const INSTALL_SHELL =
+    \\(
+    \\set -eu
+    \\case "$(uname -s)" in Linux) ;; *) echo "Verde installs the GitHub CLI on Linux runtimes only." >&2; exit 1 ;; esac
+    \\case "$(uname -m)" in
+    \\  x86_64|amd64) arch=amd64 ;;
+    \\  aarch64|arm64) arch=arm64 ;;
+    \\  *) echo "No GitHub CLI build for this CPU ($(uname -m))." >&2; exit 1 ;;
+    \\esac
+    \\echo "Finding the latest GitHub CLI release..."
+    \\latest=$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/cli/cli/releases/latest)
+    \\tag=${latest##*/}
+    \\version=${tag#v}
+    \\case "$version" in ''|*[!0-9.]*) echo "Could not read the latest release from $latest" >&2; exit 1 ;; esac
+    \\name="gh_${version}_linux_${arch}"
+    \\base="https://github.com/cli/cli/releases/download/$tag"
+    \\tmp=$(mktemp -d)
+    \\trap 'rm -rf "$tmp"' EXIT
+    \\echo "Downloading GitHub CLI $version ($arch)..."
+    \\curl -fsSL --retry 3 -o "$tmp/$name.tar.gz" "$base/$name.tar.gz"
+    \\curl -fsSL --retry 3 -o "$tmp/checksums.txt" "$base/gh_${version}_checksums.txt"
+    \\expected=$(awk -v file="$name.tar.gz" '$2 == file { print $1 }' "$tmp/checksums.txt")
+    \\actual=$(sha256sum "$tmp/$name.tar.gz" | cut -d ' ' -f 1)
+    \\if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then echo "Checksum mismatch for $name.tar.gz; nothing was installed." >&2; exit 1; fi
+    \\echo "Checksum verified."
+    \\tar -xzf "$tmp/$name.tar.gz" -C "$tmp"
+    \\dest="$HOME/.local/share/gh/$version"
+    \\mkdir -p "$HOME/.local/share/gh" "$HOME/.local/bin"
+    \\rm -rf "$dest"
+    \\mv "$tmp/$name" "$dest"
+    \\ln -sfn "$dest/bin/gh" "$HOME/.local/bin/gh"
+    \\"$HOME/.local/bin/gh" --version
+    \\echo "Installed to $dest and linked $HOME/.local/bin/gh."
+    \\)
+;
+
+/// Short descriptions shown beside the Settings buttons (the commands
+/// themselves are long; the setup terminal shows what they do).
+pub const INSTALL_SUMMARY = "Official GitHub CLI release into ~/.local, checksum verified (no sudo)";
+pub const SIGN_IN_SUMMARY = "gh auth login with a one-time code, then git uses it for github.com";
+
+pub const Status = enum { unknown, missing, signed_out, signed_in };
+
+/// Latest probe outcome for one runtime profile.
+pub const Entry = struct {
+    profile_id: []u8,
+    /// When the last probe finished; 0 means due now.
+    probed_at_ms: i64 = 0,
+    /// Null until a probe has finished since the entry was (re)armed.
+    status: ?Status = null,
+};
+
+/// Maps a finished probe. `exit_code` is null for a signal or unknown exit.
+/// gh prints "Logged in to github.com account X" (older: "as X") and exits 0
+/// when signed in; "You are not logged into any GitHub hosts" or "Failed to
+/// log in" with exit 1 when not.
+pub fn parseProbe(output: []const u8, exit_code: ?u32) Status {
+    if (std.mem.indexOf(u8, output, MISSING_MARKER) != null) return .missing;
+    if (exit_code) |code| switch (code) {
+        0 => return .signed_in,
+        // `command not found` from a shell that never reached the marker.
+        127 => return .missing,
+        else => {},
+    };
+    if (containsIgnoreCase(output, "not logged in") or containsIgnoreCase(output, "failed to log in")) return .signed_out;
+    if (std.mem.indexOf(u8, output, "Logged in to github.com") != null) return .signed_in;
+    if (exit_code == @as(?u32, 1)) return .signed_out;
+    return .unknown;
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or haystack.len < needle.len) return needle.len == 0;
+    var index: usize = 0;
+    while (index + needle.len <= haystack.len) : (index += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[index .. index + needle.len], needle)) return true;
+    }
+    return false;
+}
+
+test "gh status probe output maps to account state" {
+    try std.testing.expectEqual(Status.signed_in, parseProbe("github.com\r\n  \xe2\x9c\x93 Logged in to github.com account someone (keyring)\r\n", 0));
+    try std.testing.expectEqual(Status.signed_in, parseProbe("", 0));
+    // Older gh wording, exit status unknown.
+    try std.testing.expectEqual(Status.signed_in, parseProbe("\xe2\x9c\x93 Logged in to github.com as someone (~/.config/gh/hosts.yml)\r\n", null));
+    try std.testing.expectEqual(Status.signed_out, parseProbe("You are not logged into any GitHub hosts. To log in, run: gh auth login\r\n", 1));
+    try std.testing.expectEqual(Status.signed_out, parseProbe("github.com\r\n  X Failed to log in to github.com account someone (default)\r\n  - The token in GH_TOKEN is invalid.\r\n", 1));
+    try std.testing.expectEqual(Status.signed_out, parseProbe("unexpected\r\n", 1));
+    try std.testing.expectEqual(Status.missing, parseProbe(MISSING_MARKER ++ "\r\n", 127));
+    try std.testing.expectEqual(Status.missing, parseProbe(MISSING_MARKER ++ "\r\n", null));
+    try std.testing.expectEqual(Status.missing, parseProbe("bash: gh: command not found\r\n", 127));
+    try std.testing.expectEqual(Status.unknown, parseProbe("", null));
+    try std.testing.expectEqual(Status.unknown, parseProbe("keyring timeout", 4));
+}
+
+test "gh commands put the user-space bin on PATH and never prompt or open a browser" {
+    try std.testing.expect(std.mem.indexOf(u8, PROBE_SHELL, "gh auth status --hostname github.com </dev/null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, PROBE_SHELL, PATH_PREFIX) != null);
+    try std.testing.expect(std.mem.indexOf(u8, PROBE_SHELL, "echo " ++ MISSING_MARKER) != null);
+    try std.testing.expect(std.mem.startsWith(u8, SIGN_IN_SHELL, PATH_PREFIX));
+    try std.testing.expect(std.mem.indexOf(u8, SIGN_IN_SHELL, "gh auth login --hostname github.com --git-protocol https --web && gh auth setup-git") != null);
+    try std.testing.expect(std.mem.indexOf(u8, SIGN_IN_SHELL, "GH_BROWSER=echo BROWSER=echo") != null);
+}
+
+test "gh installer is a rootless, checksum-verified user-space install" {
+    const shell = INSTALL_SHELL;
+    // One subshell, so `set -eu` and the trap end with the install.
+    try std.testing.expect(std.mem.startsWith(u8, shell, "(\nset -eu\n"));
+    try std.testing.expect(std.mem.endsWith(u8, shell, "\n)"));
+    try std.testing.expect(std.mem.indexOf(u8, shell, "sudo") == null);
+    try std.testing.expect(std.mem.indexOf(u8, shell, "x86_64|amd64) arch=amd64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shell, "aarch64|arm64) arch=arm64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shell, "https://github.com/cli/cli/releases/latest") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shell, "https://github.com/cli/cli/releases/download/$tag") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shell, "name=\"gh_${version}_linux_${arch}\"") != null);
+    // The tarball is checked against the release's own checksums file, and
+    // a mismatch exits before anything is unpacked into $HOME.
+    const checksums = std.mem.indexOf(u8, shell, "gh_${version}_checksums.txt").?;
+    const compare = std.mem.indexOf(u8, shell, "[ \"$expected\" != \"$actual\" ]").?;
+    const unpack = std.mem.indexOf(u8, shell, "tar -xzf").?;
+    try std.testing.expect(checksums < compare and compare < unpack);
+    try std.testing.expect(std.mem.indexOf(u8, shell, "dest=\"$HOME/.local/share/gh/$version\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shell, "ln -sfn \"$dest/bin/gh\" \"$HOME/.local/bin/gh\"") != null);
+    // Every line is plain POSIX sh: no bash-only constructs.
+    try std.testing.expect(std.mem.indexOf(u8, shell, "[[") == null);
+    try std.testing.expect(std.mem.indexOf(u8, shell, "$'") == null);
+}
