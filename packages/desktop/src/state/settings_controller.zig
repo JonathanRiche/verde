@@ -253,6 +253,7 @@ pub fn hookSuccessNotice(kind: HookKind, installed: bool) []const u8 {
 
 pub const State = struct {
     phone: @import("phone_pairing.zig").State = .{},
+    remote_access: @import("remote_access.zig").State = .{},
     mcp_onboarding_visible: bool = false,
     provider_onboarding_visible: bool = false,
     provider_onboarding_dismissed: bool = false,
@@ -1555,16 +1556,28 @@ pub fn startUpdateCheck(self: anytype) void {
 }
 
 pub fn startAutomaticUpdateCheck(self: anytype) void {
+    // Remote access version sync runs on its own worker; startup never waits.
+    self.settings_controller.remote_access.startStartup(self.storage.pref_path);
     self.settings_controller.package_update_probe.start();
     if (self.app_config.check_for_updates_automatically) self.startUpdateCheck();
 }
 
 pub fn pollUpdateCheck(self: anytype) void {
     if (self.settings_controller.phone.poll(@import("platform_runtime").unixTimestampMs())) self.markDirty();
+    pollRemoteAccess(self);
     const previous = self.settings_controller.update.status;
     self.settings_controller.update.poll();
     if (self.settings_controller.update.status != previous) self.markDirty();
     if (syncPackageUpdateProbe(self)) self.markDirty();
+}
+
+/// Copies finished Remote access work and points phone pairing at its origin.
+fn pollRemoteAccess(self: anytype) void {
+    const controller = &self.settings_controller;
+    if (controller.remote_access.poll()) self.markDirty();
+    // The gateway serves this desktop's own daemon, so paired devices stay
+    // listed; only the origin phones are given changes.
+    if (controller.phone.useRemoteAccess(controller.remote_access.origin())) self.markDirty();
 }
 
 /// Copies a finished package-ownership probe into the settings fields.

@@ -44,6 +44,10 @@ pub const State = struct {
     discard_grant: bool = false,
     last_second: i64 = -1,
     confirm_revoke: ?usize = null,
+    /// Remote access origin. Its gateway serves this desktop's own daemon,
+    /// so grants are still minted locally; only the host phones use changes.
+    remote_host: [2048]u8 = @splat(0),
+    remote_host_len: usize = 0,
 
     pub fn deinit(self: *State) void {
         if (self.pending) |job| {
@@ -72,6 +76,36 @@ pub const State = struct {
         return if (self.devices_result) |job| job.devices else &.{};
     }
 
+    /// Follows Settings → Remote access. Returns true when the origin
+    /// changed; a change waits for any running request.
+    pub fn useRemoteAccess(self: *State, origin: ?[]const u8) bool {
+        const host = origin orelse "";
+        if (host.len > self.remote_host.len) return false;
+        if (std.mem.eql(u8, host, self.remote_host[0..self.remote_host_len])) return false;
+        if (self.pending != null) return false;
+        // A shown link names the previous origin.
+        self.clearGrant();
+        @memcpy(self.remote_host[0..host.len], host);
+        self.remote_host_len = host.len;
+        return true;
+    }
+
+    pub const HostSource = enum { remote_access, pasted, none };
+
+    pub fn hostSource(self: *const State) HostSource {
+        if (self.remote_host_len > 0) return .remote_access;
+        return if (self.host_len > 0) .pasted else .none;
+    }
+
+    /// Origin phones are told to use: Remote access first, then a pasted URL.
+    pub fn activeHost(self: *const State) ?[]const u8 {
+        return switch (self.hostSource()) {
+            .remote_access => self.remote_host[0..self.remote_host_len],
+            .pasted => self.host[0..self.host_len],
+            .none => null,
+        };
+    }
+
     pub fn setHost(self: *State, raw: []const u8) !void {
         const host = std.mem.trim(u8, raw, " \t\r\n/");
         try validateHost(host);
@@ -90,11 +124,11 @@ pub const State = struct {
 
     pub fn start(self: *State, pref_path: []const u8, operation: Operation, device_id: ?[]const u8) void {
         if (self.pending != null) return;
-        if (operation == .create and self.host_len == 0) {
-            self.notice = "Paste this machine's HTTPS gateway URL first.";
+        if (operation == .create and self.activeHost() == null) {
+            self.notice = "Turn on Remote access, or paste this machine's HTTPS gateway URL first.";
             return;
         }
-        const job = Job.create(pref_path, operation, self.host[0..self.host_len], device_id, self.preset) catch {
+        const job = Job.create(pref_path, operation, self.activeHost() orelse "", device_id, self.preset) catch {
             self.notice = "Could not start the daemon request.";
             return;
         };
@@ -269,6 +303,26 @@ test "phone pairing host validation and fragment-only code" {
     const link = try appLinkAlloc(std.testing.allocator, "https://host.ts.net:8443", "grant", "secret");
     defer std.testing.allocator.free(link);
     try std.testing.expectEqualStrings("https://verdeai.dev/pair?host=https%3A%2F%2Fhost.ts.net%3A8443&grant_id=grant#code=secret", link);
+}
+
+test "phone pairing uses the Remote access origin, paste only as fallback" {
+    var state: State = .{};
+    defer state.deinit();
+    try std.testing.expectEqual(State.HostSource.none, state.hostSource());
+    state.start("/prefs/Native", .create, null);
+    try std.testing.expect(state.pending == null);
+    try state.setHost("https://pasted.ts.net");
+    try std.testing.expectEqualStrings("https://pasted.ts.net", state.activeHost().?);
+
+    try std.testing.expect(state.useRemoteAccess("https://box.ts.net:8443"));
+    try std.testing.expectEqual(State.HostSource.remote_access, state.hostSource());
+    try std.testing.expectEqualStrings("https://box.ts.net:8443", state.activeHost().?);
+    try std.testing.expect(!state.useRemoteAccess("https://box.ts.net:8443"));
+
+    try std.testing.expect(state.useRemoteAccess(null));
+    try std.testing.expectEqual(State.HostSource.pasted, state.hostSource());
+    try std.testing.expectEqualStrings("https://pasted.ts.net", state.activeHost().?);
+    try std.testing.expect(!state.useRemoteAccess(null));
 }
 
 fn fixtureJob(operation: Operation) !*Job {

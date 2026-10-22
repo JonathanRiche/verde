@@ -145,7 +145,7 @@ pub fn webPlistAlloc(allocator: std.mem.Allocator, artifacts: ArtifactPaths, pat
     return launchdPlistAlloc(allocator, LAUNCHD_WEB, arguments.items);
 }
 
-fn launchdPlistAlloc(allocator: std.mem.Allocator, label: []const u8, arguments: []const []const u8) ![]u8 {
+pub fn launchdPlistAlloc(allocator: std.mem.Allocator, label: []const u8, arguments: []const []const u8) ![]u8 {
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
     try output.writer.writeAll(
@@ -291,7 +291,7 @@ pub fn redactedCommand(command: []const u8) []const u8 {
     return command;
 }
 
-fn validateSafeAbsolutePath(path: []const u8) !void {
+pub fn validateSafeAbsolutePath(path: []const u8) !void {
     if (!std.fs.path.isAbsolute(path)) return error.PathMustBeAbsolute;
     if (std.mem.indexOfAny(u8, path, "\r\n\t ") != null) return error.UnsafeSystemdPath;
 }
@@ -361,7 +361,7 @@ fn validateOwner(file: std.Io.File) !void {
     }
 }
 
-fn writeAtomic(io: std.Io, dir_path: []const u8, name: []const u8, data: []const u8, permissions: u16) !void {
+pub fn writeAtomic(io: std.Io, dir_path: []const u8, name: []const u8, data: []const u8, permissions: u16) !void {
     const dir = try std.Io.Dir.openDirAbsolute(io, dir_path, .{});
     defer dir.close(io);
     var random: [8]u8 = undefined;
@@ -376,7 +376,7 @@ fn writeAtomic(io: std.Io, dir_path: []const u8, name: []const u8, data: []const
     try dir.rename(tmp, dir, name, io);
 }
 
-fn deleteIfExists(io: std.Io, dir_path: []const u8, name: []const u8) !void {
+pub fn deleteIfExists(io: std.Io, dir_path: []const u8, name: []const u8) !void {
     const dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{}) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,

@@ -16907,6 +16907,7 @@ pub const AppState = struct {
         self.finishTranscriptHydrationWorker();
         runtime_log.diagnostic("AppState.deinit transcript hydration finished", .{});
         self.settings_controller.phone.deinit();
+        self.settings_controller.remote_access.deinit();
         self.settings_controller.update.deinit();
         self.settings_controller.package_update_probe.deinit();
         runtime_log.diagnostic("AppState.deinit updater finished", .{});

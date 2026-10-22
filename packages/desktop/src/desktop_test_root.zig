@@ -44,10 +44,12 @@ test {
     _ = @import("state/custom_agent_form.zig");
     _ = @import("state/provider_controller.zig");
     _ = @import("state/provider_setup.zig");
+    _ = @import("state/remote_access.zig");
     _ = @import("state/remote_setup_terminal.zig");
     _ = @import("state/remote_auth_probe.zig");
     _ = @import("state/remote_github.zig");
     _ = @import("ui/onboarding_modal.zig");
+    _ = @import("ui/settings_text_selection.zig");
     _ = @import("providers/offline_auth.zig");
     _ = @import("ui/text_edit.zig");
     _ = @import("ui/dev_inject.zig");

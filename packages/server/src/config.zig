@@ -38,6 +38,9 @@ pub const Options = struct {
     /// Suppresses the terminal QR code; it is also off for JSON or non-TTY output.
     no_qr: bool = false,
     no_start: bool = false,
+    /// Remote access for the desktop app's own data dir: a gateway service
+    /// only (the app owns the daemon). See desktop_gateway.zig.
+    desktop: bool = false,
     headless: bool = false,
     install_service: bool = false,
     control_plane_url: ?[]const u8 = null,
@@ -64,6 +67,8 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) !Options {
             (command == .serve or command == .service_install))
         {
             options.tailscale = true;
+        } else if (std.mem.eql(u8, arg, "--desktop") and (command == .serve or command == .service_uninstall)) {
+            options.desktop = true;
         } else if (std.mem.eql(u8, arg, "--headless") and isConnectAuth(command)) {
             options.headless = true;
         } else if (std.mem.eql(u8, arg, "--install-service") and command == .connect) {
@@ -115,6 +120,8 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) !Options {
     {
         return error.InvalidArguments;
     }
+    // Desktop mode exists only to expose the app's data dir over Tailscale.
+    if (options.desktop and command == .serve and !options.tailscale) return error.InvalidArguments;
     options.delegate_args = try delegated.toOwnedSlice(allocator);
     return options;
 }
@@ -218,4 +225,16 @@ test "service and gateway options validate bounds" {
     try std.testing.expectError(error.InvalidArguments, parse(std.testing.allocator, &.{
         "verde-server", "serve", "--tailscale-https-port", "8443",
     }));
+}
+
+test "desktop mode applies to Tailscale serve and service uninstall only" {
+    var serve = try parse(std.testing.allocator, &.{ "verde-server", "serve", "--tailscale", "--desktop", "--data-dir", "/home/u/.local/share/verde/Native", "--json" });
+    defer deinit(&serve, std.testing.allocator);
+    try std.testing.expect(serve.desktop and serve.tailscale and serve.json);
+    try std.testing.expectEqualStrings("/home/u/.local/share/verde/Native", serve.data_dir.?);
+    var uninstall = try parse(std.testing.allocator, &.{ "verde-server", "service", "uninstall", "--desktop", "--json" });
+    defer deinit(&uninstall, std.testing.allocator);
+    try std.testing.expect(uninstall.desktop);
+    try std.testing.expectError(error.InvalidArguments, parse(std.testing.allocator, &.{ "verde-server", "serve", "--desktop" }));
+    try std.testing.expectError(error.InvalidArguments, parse(std.testing.allocator, &.{ "verde-server", "service", "install", "--desktop" }));
 }

@@ -9,6 +9,7 @@ const service = @import("service.zig");
 const supervisor = @import("supervisor.zig");
 const tailscale = @import("tailscale.zig");
 const oidc = @import("oidc.zig");
+const desktop_gateway = @import("desktop_gateway.zig");
 const qr = @import("verde_qr");
 
 const VERSION: []const u8 = build_options.version;
@@ -60,9 +61,23 @@ fn run(init: std.process.Init) !void {
 
     var resolved = try resolve(init.gpa, init.io, init.environ_map, options);
     defer resolved.deinit();
+    dispatch(init, resolved, options) catch |err| {
+        // The desktop Remote access switch reads one stable JSON line; the
+        // collision path already printed its own diagnostic object.
+        if (options.json and jsonFailureCommand(options) and err != error.TailscaleServeConflict and err != error.DesktopGatewayBlocked) {
+            emitJsonFailure(init.io, init.gpa, err) catch {};
+        }
+        return err;
+    };
+}
+
+fn dispatch(init: std.process.Init, resolved: Resolved, options: config.Options) !void {
     switch (options.command) {
         .init => try runInit(init.io, init.gpa, resolved),
-        .serve => try runServe(init.io, init.gpa, resolved, options),
+        .serve => if (options.desktop)
+            try runDesktopServe(init.io, init.gpa, init.environ_map, resolved, options)
+        else
+            try runServe(init.io, init.gpa, resolved, options),
         .status => try runStatus(init.io, init.gpa, resolved, options.json),
         .pair_create, .pair_list, .pair_revoke, .device_list, .device_revoke => try runDelegate(init.io, init.gpa, resolved, options),
         .tailscale_doctor => try runTailscaleDoctor(init.io, init.gpa, resolved, options),
@@ -72,7 +87,10 @@ fn run(init: std.process.Init) !void {
         .service_install => try serviceInstall(init.io, init.gpa, resolved, options),
         .service_status => try serviceStatus(init.io, init.gpa, resolved, options.json),
         .service_update => try serviceUpdate(init.io, init.gpa, resolved),
-        .service_uninstall => try serviceUninstall(init.io, init.gpa, resolved),
+        .service_uninstall => if (options.desktop)
+            try desktopUninstall(init.io, init.gpa, resolved, options.json)
+        else
+            try serviceUninstall(init.io, init.gpa, resolved, options.json),
         .version, .help => unreachable,
     }
 }
@@ -94,6 +112,8 @@ fn resolve(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Env
     const home = env.get("HOME") orelse return error.HomeUnavailable;
     const data_dir = if (options.data_dir) |path|
         try allocator.dupe(u8, path)
+    else if (options.desktop)
+        try desktop_gateway.defaultDataDirAlloc(allocator, env)
     else if (env.get("XDG_DATA_HOME")) |xdg|
         try std.fs.path.join(allocator, &.{ xdg, "verde", "runtime" })
     else
@@ -222,6 +242,9 @@ fn runTailscaleServe(io: std.Io, allocator: std.mem.Allocator, resolved: Resolve
     try waitForGateway(io, managed.runtime.gateway_port);
     try waitForPublicRuntime(io, allocator, prepared.origin);
     service_ready = true;
+    // JSON callers (the desktop Remote access switch) need the origin and the
+    // installed release, not a one-time grant they would never consume.
+    if (options.json) return writeServeResult(io, allocator, managed, prepared);
     try writeStdout(
         io,
         "Verde is installed as a background service and Tailscale terminates HTTPS at {s}.\n",
@@ -486,10 +509,14 @@ fn runtimeMetadataMatches(allocator: std.mem.Allocator, encoded: []const u8, ori
         .ignore_unknown_fields = false,
     }) catch return false;
     defer parsed.deinit();
+    // Newer gateways add capabilities (idempotent exchange, pairing by
+    // approval); readiness only needs the Pair transport itself.
+    var pairs = false;
+    for (parsed.value.capabilities) |capability| {
+        if (std.mem.eql(u8, capability, "access.pair.v1")) pairs = true;
+    }
     if (parsed.value.access_protocol_version != 1 or
-        !std.mem.eql(u8, parsed.value.https_url, origin) or
-        parsed.value.capabilities.len != 1 or
-        !std.mem.eql(u8, parsed.value.capabilities[0], "access.pair.v1")) return false;
+        !std.mem.eql(u8, parsed.value.https_url, origin) or !pairs) return false;
     validateLowerHex(parsed.value.runtime_id, 32) catch return false;
     validateLowerHex(parsed.value.instance_id, 32) catch return false;
     if (!std.mem.startsWith(u8, origin, "https://")) return false;
@@ -1016,7 +1043,7 @@ fn serviceUpdate(io: std.Io, allocator: std.mem.Allocator, resolved: Resolved) !
     try writeStdout(io, "verde-server {s} is already the active verified release at {s}\n", .{ VERSION, root });
 }
 
-fn serviceUninstall(io: std.Io, allocator: std.mem.Allocator, resolved: Resolved) !void {
+fn serviceUninstall(io: std.Io, allocator: std.mem.Allocator, resolved: Resolved, json: bool) !void {
     var lifecycle_lock = try tailscale.LifecycleLock.acquire(io, resolved.runtime.state_dir);
     defer lifecycle_lock.deinit(io);
     if (builtin.os.tag == .linux) {
@@ -1054,7 +1081,311 @@ fn serviceUninstall(io: std.Io, allocator: std.mem.Allocator, resolved: Resolved
             .{},
         ),
     }
+    if (json) {
+        const encoded = try std.json.Stringify.valueAlloc(allocator, UninstallResult{ .tailscale_cleanup = cleanup }, .{});
+        defer allocator.free(encoded);
+        return writeStdout(io, "{s}\n", .{encoded});
+    }
     try writeStdout(io, "Removed Verde user services. Runtime data, token, credentials, and release metadata were retained.\n", .{});
+}
+
+/// Last stdout line of `serve --tailscale --json` on success. Child output
+/// (daemon init, service managers) may precede it, so readers take the last
+/// line that parses as an object.
+const ServeResult = struct {
+    schema_version: u32 = 1,
+    ok: bool = true,
+    code: []const u8 = "remote_access_ready",
+    origin: []const u8,
+    https_port: u16,
+    version: []const u8,
+    root: []const u8,
+    data_dir: []const u8,
+    state_dir: []const u8,
+    /// Release record the desktop's version sync compares with itself.
+    release_file: []const u8,
+    /// Desktop mode: the loopback gateway port and service now serving it,
+    /// and whether an existing gateway service was replaced in place.
+    gateway_port: ?u16 = null,
+    unit: ?[]const u8 = null,
+    adopted: ?bool = null,
+};
+
+const UninstallResult = struct {
+    schema_version: u32 = 1,
+    ok: bool = true,
+    code: []const u8 = "service_uninstalled",
+    tailscale_cleanup: tailscale.Cleanup,
+};
+
+const FailureResult = struct {
+    schema_version: u32 = 1,
+    ok: bool = false,
+    code: []const u8,
+    @"error": []const u8,
+    message: []const u8,
+};
+
+fn writeServeResult(io: std.Io, allocator: std.mem.Allocator, resolved: Resolved, prepared: tailscale.Prepared) !void {
+    const root = std.fs.path.dirname(std.fs.path.dirname(resolved.artifacts.server) orelse return error.InvalidArtifactLayout) orelse
+        return error.InvalidArtifactLayout;
+    const release_file = try std.fs.path.join(allocator, &.{ resolved.runtime.state_dir, service.STATE_FILE });
+    defer allocator.free(release_file);
+    const encoded = try std.json.Stringify.valueAlloc(allocator, ServeResult{
+        .origin = prepared.origin,
+        .https_port = prepared.https_port,
+        .version = VERSION,
+        .root = root,
+        .data_dir = resolved.runtime.data_dir,
+        .state_dir = resolved.runtime.state_dir,
+        .release_file = release_file,
+    }, .{ .emit_null_optional_fields = false });
+    defer allocator.free(encoded);
+    try writeStdout(io, "{s}\n", .{encoded});
+}
+
+const DesktopGatewayBlocked = struct {
+    schema_version: u32 = 1,
+    ok: bool = false,
+    code: desktop_gateway.BlockCode,
+    gateway_port: u16,
+    process: ?[]const u8,
+    message: []const u8,
+};
+
+/// `serve --tailscale --desktop`: Tailscale Serve in front of one loopback
+/// `verde-web` service for the desktop app's own data dir. An existing
+/// gateway service for that dir is replaced in place; anything else on the
+/// port stops setup before Tailscale or services change.
+fn runDesktopServe(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    resolved: Resolved,
+    options: config.Options,
+) !void {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.UnsupportedPlatform;
+    var lifecycle_lock = try tailscale.LifecycleLock.acquire(io, resolved.runtime.state_dir);
+    defer lifecycle_lock.deinit(io);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const data_dir = std.mem.trimEnd(u8, resolved.runtime.data_dir, "/");
+    const default_data_dir = try desktop_gateway.defaultDataDirAlloc(a, env);
+    var system_runner: tailscale.SystemRunner = .{ .io = io };
+    const runner = system_runner.runner();
+
+    const candidates = if (builtin.os.tag == .linux) try desktop_gateway.scanUnits(io, a, resolved.runtime.unit_dir) else &[_]desktop_gateway.Candidate{};
+    var selection = try desktop_gateway.selectUnit(a, data_dir, default_data_dir, candidates);
+    const previous: ?desktop_gateway.State = if (desktop_gateway.readState(io, a, resolved.runtime.state_dir)) |parsed| parsed.value else |_| null;
+    if (builtin.os.tag == .macos) {
+        selection.unit = desktop_gateway.LAUNCHD_LABEL;
+        if (previous) |state| {
+            selection.port = state.gateway_port;
+            selection.token_file = state.token_file;
+            selection.adopted = true;
+        }
+    }
+    const listener = try desktop_gateway.probeListener(io, a, runner, selection.port);
+    var verdict = desktop_gateway.listenerVerdict(data_dir, default_data_dir, listener);
+    // macOS cannot name a listener's owner; our own loaded agent on the
+    // recorded port is the only gateway it may replace.
+    if (builtin.os.tag == .macos and verdict == .blocked and previous != null and
+        try serviceActive(io, a, desktop_gateway.DEFAULT_UNIT, desktop_gateway.LAUNCHD_LABEL)) verdict = .{ .adopt = desktop_gateway.LAUNCHD_LABEL };
+    switch (verdict) {
+        .free => {},
+        .adopt => |unit| if (builtin.os.tag == .linux and !std.mem.eql(u8, unit, selection.unit)) {
+            // The running gateway's unit wins; the unit file found by the scan
+            // (if any) is a second gateway for this dir and is retired.
+            var retire: std.ArrayList([]const u8) = .empty;
+            try retire.appendSlice(a, selection.retire);
+            if (selection.adopted) try retire.append(a, selection.unit);
+            selection.retire = try retire.toOwnedSlice(a);
+            selection.unit = unit;
+            selection.adopted = true;
+        },
+        .blocked => |blocked| {
+            const message: []const u8 = switch (blocked.code) {
+                .gateway_port_in_use => "another program is using the desktop gateway port; Verde changed nothing",
+                .gateway_unmanaged => "a Verde gateway started outside a service already serves this data directory; stop it, then retry",
+            };
+            if (options.json) {
+                const encoded = try std.json.Stringify.valueAlloc(a, DesktopGatewayBlocked{
+                    .code = blocked.code,
+                    .gateway_port = selection.port,
+                    .process = blocked.process,
+                    .message = message,
+                }, .{});
+                try writeStdout(io, "{s}\n", .{encoded});
+            } else {
+                try writeStderr(io, "verde-server: port {d}: {s}\n", .{ selection.port, message });
+            }
+            return error.DesktopGatewayBlocked;
+        },
+    }
+
+    var prepared = try tailscale.prepare(allocator, runner, selection.port, options.tailscale_https_port);
+    defer prepared.deinit();
+    if (prepared.state == .collision) {
+        try emitTailscaleDiagnostic(io, allocator, prepared, options.json);
+        return error.TailscaleServeConflict;
+    }
+    var service_ready = false;
+    var mutation_cleanup_armed = false;
+    errdefer if (mutation_cleanup_armed and !service_ready) {
+        protectFailedTailscaleMutation(io, allocator, runner, resolved.runtime.state_dir, prepared);
+    };
+    if (prepared.state == .available) {
+        _ = try tailscale.writePendingIntent(io, allocator, resolved.runtime.state_dir, prepared);
+        mutation_cleanup_armed = true;
+    }
+    tailscale.apply(allocator, runner, &prepared) catch |err| switch (err) {
+        error.TailscaleServeChanged => {
+            mutation_cleanup_armed = false;
+            return err;
+        },
+        else => return err,
+    };
+    try tailscale.writeIntent(io, allocator, resolved.runtime.state_dir, prepared);
+
+    const token_file = selection.token_file orelse try desktop_gateway.defaultTokenFileAlloc(a, data_dir);
+    try service.validateSafeAbsolutePath(data_dir);
+    try service.validateSafeAbsolutePath(token_file);
+    try service.validateArtifactPaths(io, resolved.artifacts);
+    try service.ensureOwnerOnlyDir(io, resolved.runtime.unit_dir);
+    try service.ensureOwnerOnlyDir(io, resolved.runtime.state_dir);
+    if (std.fs.path.dirname(token_file)) |parent| try service.ensureOwnerOnlyDir(io, parent);
+    try service.ensureOwnerOnlyToken(io, token_file);
+    if (builtin.os.tag == .linux) {
+        for (selection.retire) |unit| {
+            var stopped = runner.run(a, &.{ "systemctl", "--user", "disable", "--now", unit }) catch null;
+            if (stopped) |*result| result.deinit(a);
+            try service.deleteIfExists(io, resolved.runtime.unit_dir, unit);
+        }
+        const unit_text = try desktop_gateway.unitAlloc(a, resolved.artifacts, data_dir, token_file, selection.port, prepared.origin);
+        try service.writeAtomic(io, resolved.runtime.unit_dir, selection.unit, unit_text, 0o600);
+        try runChecked(a, runner, &.{ "systemctl", "--user", "daemon-reload" });
+        try runChecked(a, runner, &.{ "systemctl", "--user", "enable", selection.unit });
+        // Restart replaces an adopted gateway in place: one listener, never two.
+        try runChecked(a, runner, &.{ "systemctl", "--user", "restart", selection.unit });
+    } else {
+        var port_buffer: [8]u8 = undefined;
+        const plist = try service.launchdPlistAlloc(a, desktop_gateway.LAUNCHD_LABEL, &.{
+            resolved.artifacts.web,                                       "--static",     resolved.artifacts.static_dir,
+            "--host",                                                     "127.0.0.1",    "--port",
+            try std.fmt.bufPrint(&port_buffer, "{d}", .{selection.port}), "--token-file", token_file,
+            "--pref-path",                                                data_dir,       "--trusted-proxy-origin",
+            prepared.origin,
+        });
+        try service.writeAtomic(io, resolved.runtime.unit_dir, desktop_gateway.PLIST, plist, 0o600);
+        const domain = try std.fmt.allocPrint(a, "gui/{d}", .{std.c.geteuid()});
+        const plist_path = try std.fs.path.join(a, &.{ resolved.runtime.unit_dir, desktop_gateway.PLIST });
+        var booted_out = runner.run(a, &.{ "launchctl", "bootout", domain, plist_path }) catch null;
+        if (booted_out) |*result| result.deinit(a);
+        var booted = try runner.run(a, &.{ "launchctl", "bootstrap", domain, plist_path });
+        defer booted.deinit(a);
+        if (booted.code != 0) return error.LaunchctlFailed;
+    }
+    try waitForGateway(io, selection.port);
+    try waitForPublicRuntime(io, allocator, prepared.origin);
+    service_ready = true;
+
+    const root = std.fs.path.dirname(std.fs.path.dirname(resolved.artifacts.server) orelse return error.InvalidArtifactLayout) orelse
+        return error.InvalidArtifactLayout;
+    try desktop_gateway.writeState(io, a, resolved.runtime.state_dir, .{
+        .unit = selection.unit,
+        .gateway_port = selection.port,
+        .data_dir = data_dir,
+        .token_file = token_file,
+        .active_version = VERSION,
+        .active_root = root,
+    });
+    if (!options.json) {
+        return writeStdout(io, "Verde desktop Remote access: {s} serves {s} through {s} (port {d}).\n", .{ prepared.origin, data_dir, selection.unit, selection.port });
+    }
+    const release_file = try std.fs.path.join(a, &.{ resolved.runtime.state_dir, desktop_gateway.STATE_FILE });
+    const encoded = try std.json.Stringify.valueAlloc(a, ServeResult{
+        .origin = prepared.origin,
+        .https_port = prepared.https_port,
+        .version = VERSION,
+        .root = root,
+        .data_dir = data_dir,
+        .state_dir = resolved.runtime.state_dir,
+        .release_file = release_file,
+        .gateway_port = selection.port,
+        .unit = selection.unit,
+        .adopted = selection.adopted,
+    }, .{ .emit_null_optional_fields = false });
+    try writeStdout(io, "{s}\n", .{encoded});
+}
+
+/// Turns desktop Remote access off: stops and removes only the recorded
+/// gateway service (never the desktop daemon) and only Verde's own Serve
+/// mapping.
+fn desktopUninstall(io: std.Io, allocator: std.mem.Allocator, resolved: Resolved, json: bool) !void {
+    var lifecycle_lock = try tailscale.LifecycleLock.acquire(io, resolved.runtime.state_dir);
+    defer lifecycle_lock.deinit(io);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var system_runner: tailscale.SystemRunner = .{ .io = io };
+    const runner = system_runner.runner();
+    const recorded: ?desktop_gateway.State = if (desktop_gateway.readState(io, a, resolved.runtime.state_dir)) |parsed| parsed.value else |_| null;
+    if (builtin.os.tag == .linux) {
+        const unit = if (recorded) |state| state.unit else desktop_gateway.DEFAULT_UNIT;
+        var stopped = runner.run(a, &.{ "systemctl", "--user", "disable", "--now", unit }) catch null;
+        if (stopped) |*result| result.deinit(a);
+        try service.deleteIfExists(io, resolved.runtime.unit_dir, unit);
+        try runChecked(a, runner, &.{ "systemctl", "--user", "daemon-reload" });
+    } else if (builtin.os.tag == .macos) {
+        const target = try std.fmt.allocPrint(a, "gui/{d}/{s}", .{ std.c.geteuid(), desktop_gateway.LAUNCHD_LABEL });
+        var booted_out = runner.run(a, &.{ "launchctl", "bootout", target }) catch null;
+        if (booted_out) |*result| result.deinit(a);
+        try service.deleteIfExists(io, resolved.runtime.unit_dir, desktop_gateway.PLIST);
+    } else return error.UnsupportedPlatform;
+    const cleanup = tailscale.cleanupSaved(io, allocator, runner, resolved.runtime.state_dir) catch |err| {
+        try writeStderr(io, "error: preserved Tailscale ownership intent because cleanup failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    switch (cleanup) {
+        .removed, .missing => try tailscale.removeIntent(io, resolved.runtime.state_dir),
+        .preserved_changed => return error.TailscaleServeCleanupPreserved,
+        .not_owned => {},
+    }
+    try service.deleteIfExists(io, resolved.runtime.state_dir, desktop_gateway.STATE_FILE);
+    if (json) {
+        const encoded = try std.json.Stringify.valueAlloc(a, UninstallResult{ .tailscale_cleanup = cleanup }, .{});
+        return writeStdout(io, "{s}\n", .{encoded});
+    }
+    try writeStdout(io, "Removed the Verde desktop gateway service. The desktop app and its data are unchanged.\n", .{});
+}
+
+fn jsonFailureCommand(options: config.Options) bool {
+    return (options.command == .serve and options.tailscale) or options.command == .service_uninstall;
+}
+
+/// Stable machine-readable failure codes for setup blockers the desktop maps
+/// to one user action each; everything else is `failed` with its message.
+fn failureCode(err: anyerror) []const u8 {
+    return switch (err) {
+        error.TailscaleCliMissing, error.TailscaleCliUnavailable => "tailscale_missing",
+        error.TailscaleNotRunning => "tailscale_not_running",
+        error.TailscaleNotLoggedIn => "tailscale_not_logged_in",
+        error.UnsupportedPlatform => "unsupported_platform",
+        error.TailscaleLifecycleLockFailed => "busy",
+        error.GatewayStartupTimedOut, error.PublicGatewayStartupTimedOut => "gateway_timeout",
+        else => "failed",
+    };
+}
+
+fn emitJsonFailure(io: std.Io, allocator: std.mem.Allocator, err: anyerror) !void {
+    const encoded = try std.json.Stringify.valueAlloc(allocator, FailureResult{
+        .code = failureCode(err),
+        .@"error" = @errorName(err),
+        .message = errorMessage(err),
+    }, .{});
+    defer allocator.free(encoded);
+    try writeStdout(io, "{s}\n", .{encoded});
 }
 
 fn protectFailedTailscaleMutation(
@@ -1190,7 +1521,8 @@ fn printHelp(io: std.Io) !void {
         \\  verde-server service install [--tailscale] [--tailscale-https-port PORT] [--no-start]
         \\  verde-server service status [--json]
         \\  verde-server service update
-        \\  verde-server service uninstall
+        \\  verde-server service uninstall [--desktop]
+        \\  verde-server serve --tailscale --desktop [--data-dir PATH] [--json]
         \\  verde-server version
         \\
         \\All paths passed to services are absolute. Pair/device operations delegate
@@ -1234,6 +1566,7 @@ fn errorMessage(err: anyerror) []const u8 {
         error.TailscaleServeChanged => "Tailscale Serve changed concurrently; Verde's compare-and-set made no change",
         error.TailscaleServeCasUnavailable => "Tailscale's local compare-and-set API is unavailable; Verde refused to mutate Serve configuration",
         error.TailscaleLifecycleLockFailed => "the Tailscale lifecycle lock could not be acquired; Verde refused to change services, Serve configuration, or ownership intent",
+        error.DesktopGatewayBlocked => "the desktop gateway port is in use; Verde changed nothing (see the message above)",
         error.TailscaleServePostwriteUnverified => "Tailscale accepted the Serve update, but its resulting version could not be verified; Verde preserved recovery intent and will not claim or automatically remove it",
         error.TailscaleServeCleanupPreserved => "Tailscale cleanup was not exact; the listener and recoverable ownership intent were preserved",
         error.TailscaleIntentConflict => "a different Tailscale ownership intent already exists; Verde preserved it and refused to mutate Serve configuration",
@@ -1283,6 +1616,7 @@ test {
     _ = supervisor;
     _ = tailscale;
     _ = oidc;
+    _ = desktop_gateway;
 }
 
 test "Pair URL keeps the one-time code in the fragment" {
@@ -1323,6 +1657,19 @@ test "App Link escapes the HTTPS origin and keeps the code only in the fragment"
     ));
 }
 
+test "JSON failures map setup blockers to stable codes" {
+    try std.testing.expectEqualStrings("tailscale_missing", failureCode(error.TailscaleCliMissing));
+    try std.testing.expectEqualStrings("tailscale_not_logged_in", failureCode(error.TailscaleNotLoggedIn));
+    try std.testing.expectEqualStrings("tailscale_not_running", failureCode(error.TailscaleNotRunning));
+    try std.testing.expectEqualStrings("unsupported_platform", failureCode(error.UnsupportedPlatform));
+    try std.testing.expectEqualStrings("failed", failureCode(error.OutOfMemory));
+    const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, UninstallResult{ .tailscale_cleanup = .not_owned }, .{});
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expectEqualStrings(
+        \\{"schema_version":1,"ok":true,"code":"service_uninstalled","tailscale_cleanup":"not_owned"}
+    , encoded);
+}
+
 test "public readiness requires the frozen runtime metadata" {
     const origin = "https://runtime.tail.ts.net";
     const valid =
@@ -1332,5 +1679,9 @@ test "public readiness requires the frozen runtime metadata" {
     try std.testing.expect(!runtimeMetadataMatches(std.testing.allocator, valid, "https://other.tail.ts.net"));
     try std.testing.expect(!runtimeMetadataMatches(std.testing.allocator,
         \\{"access_protocol_version":1,"runtime_id":"0123456789abcdef0123456789abcdef","instance_id":"00112233445566778899aabbccddeeff","https_url":"https://runtime.tail.ts.net","wss_url":"wss://runtime.tail.ts.net/ws","capabilities":[]}
+    , origin));
+    // Current gateways also advertise idempotent exchange and approval pairing.
+    try std.testing.expect(runtimeMetadataMatches(std.testing.allocator,
+        \\{"access_protocol_version":1,"runtime_id":"0123456789abcdef0123456789abcdef","instance_id":"00112233445566778899aabbccddeeff","https_url":"https://runtime.tail.ts.net","wss_url":"wss://runtime.tail.ts.net/ws","capabilities":["access.pair.v1","access.pair.idempotent.v1","access.pair.request.v1"]}
     , origin));
 }

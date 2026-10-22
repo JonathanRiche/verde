@@ -7,6 +7,8 @@ const host = @import("host.zig");
 const app_config = @import("../app/config.zig");
 const provider_cli_version = @import("../providers/cli_version.zig");
 const phone_pairing = @import("../state/phone_pairing.zig");
+const remote_access = @import("../state/remote_access.zig");
+const settings_text = @import("settings_text_selection.zig");
 const settings_controller = @import("../state/settings_controller.zig");
 const custom_agent_form_state = @import("../state/custom_agent_form.zig");
 const updater = @import("../app/updater.zig");
@@ -1678,6 +1680,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     if (!state.settings_controller.modal_visible) return;
     state.tickSettingsModalAnimation();
     if (!state.settings_controller.modal_visible) return;
+    settings_text.beginFrame(width, height);
     const fade_t = theme.clampf(state.settings_controller.modal_anim_progress, 0.0, 1.0);
     current_fade_alpha = fade_t * fade_t * (3.0 - 2.0 * fade_t);
     defer current_fade_alpha = 1.0;
@@ -2013,6 +2016,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     drawNewChatDropdownMenu(state, layout, .reasoning);
     drawCommitDropdownMenu(state, layout);
     drawOpenActionDropdownMenu(state, layout);
+    settings_text.drawMenu(state);
 }
 
 /// Scrolls settings modal content within the fixed header/footer chrome.
@@ -2545,6 +2549,7 @@ pub fn applyNewChatReasoningOption(state: *runtime.AppState, option_index: usize
 pub fn handleKeyDown(state: *runtime.AppState, event: *const palette.event.KeyEvent) bool {
     if (!state.settings_controller.modal_visible) return false;
     if (state.settings_controller.modal_closing or overlayOwnsKeyboard(state)) return false;
+    if (settings_text.handleKey(state, event)) return true;
     if (event.mod.primary() or event.mod.alt) return false;
     const key = event.key;
     if (key == .tab) {
@@ -4998,6 +5003,18 @@ comptime {
 }
 
 const PHONE_HOVER_BIT: usize = 1 << (@bitSizeOf(usize) - 1);
+/// Remote access controls share the phone card's action space above every
+/// device index (16 + 2 per device).
+const REMOTE_SWITCH_ACTION: usize = 1 << 20;
+const REMOTE_BLOCKER_ACTION: usize = REMOTE_SWITCH_ACTION + 1;
+/// Selectable text blocks in the Connections card (settings_text_selection).
+const REMOTE_STATUS_BLOCK: u32 = 1;
+const REMOTE_BLOCKER_BLOCK: u32 = 2;
+const REMOTE_DETAIL_BLOCK: u32 = 3;
+const PHONE_NOTICE_BLOCK: u32 = 4;
+const PHONE_HOST_BLOCK: u32 = 5;
+const PHONE_LINK_BLOCK: u32 = 6;
+const REMOTE_NOTICE_BLOCK: u32 = 7;
 
 /// Break at measured UTF-8 boundaries, including inside the unbroken App Link.
 /// The same slices determine card height and rendered lines.
@@ -5105,6 +5122,31 @@ const PhoneCard = struct {
         self.y += theme.scaledUi(8.0);
     }
 
+    /// Content text (status, errors, addresses): selectable and copyable.
+    fn content(self: *PhoneCard, block: u32, value: []const u8) void {
+        var lines: PhoneLines = .{ .value = value, .width = self.w };
+        var index: usize = 0;
+        while (lines.next()) |line| : (index += 1) {
+            const rect: palette.Rect = .{ .x = self.x, .y = self.y, .w = self.w, .h = notesLineHeight() };
+            if (self.draw) {
+                settings_text.recordLine(self.state, block, index, rect, line, theme.scaledUi(NOTES_FONT_SIZE), self.clip);
+                queueText(self.state, rect, line, paletteColor(textLabel()), theme.scaledUi(NOTES_FONT_SIZE), self.clip);
+            }
+            self.y += rect.h;
+        }
+        self.y += theme.scaledUi(8.0);
+    }
+
+    fn switchRow(self: *PhoneCard, label: []const u8, action: usize, enabled: bool, on: bool) void {
+        const rect: palette.Rect = .{ .x = self.x, .y = self.y, .w = self.w, .h = theme.scaledUi(34.0) };
+        if (self.draw) drawSwitchRow(self.state, rect, label, on, enabled and self.state.settings_controller.hover_runtime_action == (action | PHONE_HOVER_BIT), self.clip);
+        if (enabled) if (self.queue_hit) |queue| {
+            recordFocusStop(.settings_phone_action, action, rect, self.clip);
+            if (intersectRect(rect, self.clip)) |visible| queue(self.state, visible, .settings_phone_action, action);
+        };
+        self.y += rect.h + theme.scaledUi(8.0);
+    }
+
     fn button(self: *PhoneCard, label: []const u8, action: usize, enabled: bool) void {
         self.choice(label, action, enabled, false);
     }
@@ -5120,26 +5162,107 @@ const PhoneCard = struct {
     }
 };
 
+/// Settings → Remote access: one switch, one status line, and exactly one
+/// action for the current blocker. Work runs in `state/remote_access.zig`.
+fn remoteAccessSection(card: *PhoneCard) void {
+    const remote = &card.state.settings_controller.remote_access;
+    card.text("Remote access · This computer");
+    card.text("Reach this computer's chats from your phone or your other computers over Tailscale. It keeps running after Verde quits.");
+    card.switchRow("Remote access", REMOTE_SWITCH_ACTION, remote_access.supported and !remote.busy(), remote.switchOn());
+    var buf: [400]u8 = undefined;
+    const status: []const u8 = if (!remote_access.supported)
+        remote_access.blockerSummary(.unsupported_os)
+    else switch (remote.phase) {
+        .loading => "Checking Remote access…",
+        .enabling => "Turning on Remote access…",
+        .disabling => "Turning off Remote access…",
+        .syncing => "Updating Remote access to match this version of Verde…",
+        .on => if (remote.origin()) |origin| std.fmt.bufPrint(&buf, "Reachable at {s}", .{origin}) catch origin else "On.",
+        .off => "Off. Other devices can't reach this computer.",
+    };
+    card.content(REMOTE_STATUS_BLOCK, status);
+    if (remote.notice().len > 0) card.content(REMOTE_NOTICE_BLOCK, remote.notice());
+    if (remote.blocker == null and remote.phase == .on and remote.origin() != null) {
+        // Pairing by approval finds machines on the ports Add connection probes.
+        card.text(if (remote_access.discoverableNearby(remote.saved.https_port))
+            "Your other computers can find this one under Add connection → Nearby machines."
+        else
+            "Add connection → Nearby machines can't find this port; pair other computers with a pairing link.");
+    }
+    const blocker = remote.blocker orelse return;
+    card.content(REMOTE_BLOCKER_BLOCK, remote_access.blockerSummary(blocker));
+    if (remote.message.len > 0) card.content(REMOTE_DETAIL_BLOCK, remote.message.slice());
+    var label_buf: [48]u8 = undefined;
+    const label: ?[]const u8 = switch (remote_access.blockerAction(blocker)) {
+        .none => null,
+        .get_tailscale => "Get Tailscale",
+        .open_tailscale => "Open Tailscale",
+        .use_suggested_port => std.fmt.bufPrint(&label_buf, "Use port {d} instead", .{remote.suggested_port}) catch "Use another port",
+        .retry => "Try again",
+    };
+    if (label) |value| card.button(value, REMOTE_BLOCKER_ACTION, !remote.busy());
+}
+
+fn applyRemoteAccessAction(state: *runtime.AppState, action: usize) void {
+    const remote = &state.settings_controller.remote_access;
+    if (remote.busy()) return;
+    const pref_path = state.storage.pref_path;
+    if (action == REMOTE_SWITCH_ACTION) {
+        if (remote.switchOn()) remote.disable(pref_path) else remote.enable(pref_path, remote.saved.https_port);
+        return;
+    }
+    if (action != REMOTE_BLOCKER_ACTION) return;
+    const blocker = remote.blocker orelse return;
+    switch (remote_access.blockerAction(blocker)) {
+        .none => {},
+        .get_tailscale => utils.openUrlInDefaultBrowser(state.allocator, remote_access.TAILSCALE_DOWNLOAD_URL) catch {
+            state.setSidebarNotice("Could not open the Tailscale download page.");
+        },
+        .open_tailscale => {
+            // macOS ships a Tailscale app; on Linux the admin console is the
+            // closest thing to "open", and the status text names the sign-in.
+            const opened = if (@import("builtin").os.tag == .macos)
+                utils.openPathWithSystemHandler(state.allocator, "/Applications/Tailscale.app")
+            else
+                utils.openUrlInDefaultBrowser(state.allocator, remote_access.TAILSCALE_LOGIN_URL);
+            opened catch state.setSidebarNotice("Could not open Tailscale.");
+        },
+        .use_suggested_port, .retry => remote.retry(pref_path),
+    }
+}
+
 fn phoneCard(state: *runtime.AppState, rect: palette.Rect, clip: palette.Rect, draw: bool, queue_hit: ?*const fn (*runtime.AppState, palette.Rect, runtime.PaletteModalAction, usize) void) f32 {
     // Pairing is local-owner management; remote connection credentials never enter this card.
     const phone = &state.settings_controller.phone;
     const pad = theme.scaledUi(14.0);
     var card: PhoneCard = .{ .state = state, .x = rect.x + pad, .y = rect.y + pad, .w = @max(rect.w - pad * 2, 1), .clip = clip, .draw = draw, .queue_hit = queue_hit };
     const idle = phone.pending == null;
+    remoteAccessSection(&card);
+    card.y += theme.scaledUi(10.0);
     card.text("Paired devices · This machine");
-    card.text(phone.notice);
+    card.content(PHONE_NOTICE_BLOCK, phone.notice);
     card.button(if (phone.opened) "Close pairing" else "Pair a phone", 0, true);
     if (phone.opened) {
-        card.text("Run verde-server serve --tailscale for this runtime, then copy its HTTPS host URL (https://your-host.ts.net).");
-        card.button("Paste host URL", 1, idle);
-        if (phone.host_len > 0) card.text(phone.host[0..phone.host_len]);
+        switch (phone.hostSource()) {
+            .remote_access => {
+                var host_buf: [2100]u8 = undefined;
+                card.content(PHONE_HOST_BLOCK, std.fmt.bufPrint(&host_buf, "Phones connect through Remote access at {s}", .{phone.activeHost().?}) catch phone.activeHost().?);
+            },
+            .pasted, .none => {
+                card.text("Turn on Remote access above so phones can reach this computer.");
+                // Advanced fallback for a gateway Verde does not manage.
+                card.text("Advanced: paste another HTTPS gateway URL (https://your-host.ts.net).");
+                card.button("Paste host URL", 1, idle);
+                if (phone.host_len > 0) card.content(PHONE_HOST_BLOCK, phone.host[0..phone.host_len]);
+            },
+        }
         card.text("Permissions");
         for (phone_pairing.PAIRING_PRESETS, 0..) |preset, index| {
             card.choice(phone_pairing.presetLabel(preset), PHONE_PRESET_ACTION + index, idle and phone.grant == null, phone.preset == preset);
             card.text(phone_pairing.presetDescription(preset));
         }
         if (phone.grant != null) card.text("Close pairing to choose permissions for a new link.");
-        card.button("Create pairing link", 2, idle and phone.host_len > 0 and phone.grant == null);
+        card.button("Create pairing link", 2, idle and phone.activeHost() != null and phone.grant == null);
         if (phone.grant) |grant| {
             if (grant.qr) |*qr| {
                 // Integer modules and a four-module white quiet zone keep the local symbol scannable.
@@ -5163,7 +5286,7 @@ fn phoneCard(state: *runtime.AppState, rect: palette.Rect, clip: palette.Rect, d
             var buf: [80]u8 = undefined;
             const seconds = @divFloor(@max(grant.expires_at_ms - @import("platform_runtime").unixTimestampMs(), 0) + 999, 1000);
             card.text(std.fmt.bufPrint(&buf, "Expires in {d}:{d:0>2}", .{ @divFloor(seconds, 60), @mod(seconds, 60) }) catch "");
-            if (grant.link) |link| card.text(link);
+            if (grant.link) |link| card.content(PHONE_LINK_BLOCK, link);
             card.button("Copy link", 3, seconds > 0);
         }
     }
@@ -5197,8 +5320,30 @@ fn phoneCard(state: *runtime.AppState, rect: palette.Rect, clip: palette.Rect, d
     return card.y - rect.y + pad;
 }
 
+/// Settings content-text selection, routed ahead of the shared modal hits.
+pub fn handleTextMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, down: bool, clicks: u8) bool {
+    if (!state.settings_controller.modal_visible or state.settings_controller.modal_closing) return false;
+    return settings_text.handleMouseButton(state, x, y, button, down, clicks);
+}
+
+pub fn handleTextMouseMotion(state: *runtime.AppState, x: f32, y: f32) bool {
+    if (!state.settings_controller.modal_visible) return false;
+    return settings_text.handleMouseMotion(state, x, y);
+}
+
+/// I-beam over selectable Settings text; null elsewhere.
+pub fn textSystemCursorAt(state: *const runtime.AppState, x: f32, y: f32) ?palette.platform.CursorShape {
+    if (!state.settings_controller.modal_visible) return null;
+    return settings_text.systemCursorAt(x, y);
+}
+
 pub fn applyPhoneAction(state: *runtime.AppState, action: usize) void {
     const phone = &state.settings_controller.phone;
+    if (action >= REMOTE_SWITCH_ACTION) {
+        applyRemoteAccessAction(state, action);
+        state.markDirty();
+        return;
+    }
     if (action >= PHONE_PRESET_ACTION and action < PHONE_PRESET_ACTION + phone_pairing.PAIRING_PRESETS.len) {
         phone.selectPreset(action - PHONE_PRESET_ACTION);
         state.markDirty();

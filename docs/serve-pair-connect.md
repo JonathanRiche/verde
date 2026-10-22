@@ -42,6 +42,35 @@ that port for HTTPS and WSS. Running the command again is idempotent only when
 the selected listener still contains the one exact root proxy to Verde. An
 extra path, a different backend, or Funnel use is a collision.
 
+With `--json`, a successful `serve --tailscale` prints no pairing grant. Its
+last stdout line is `{"schema_version":1,"ok":true,"code":"remote_access_ready",
+"origin":…,"https_port":…,"version":…,"root":…,"data_dir":…,"state_dir":…,
+"release_file":…}` (child processes may print earlier lines). `service
+uninstall --json` ends with `{"schema_version":1,"ok":true,
+"code":"service_uninstalled","tailscale_cleanup":…}`. Other failures of either
+command end with `{"schema_version":1,"ok":false,"code":…,"error":…,"message":…}`
+where `code` is `tailscale_missing`, `tailscale_not_running`,
+`tailscale_not_logged_in`, `unsupported_platform`, `busy`, `gateway_timeout`,
+or `failed`.
+
+`serve --tailscale --desktop [--data-dir PATH]` is the desktop Settings →
+Remote access path. It exposes the desktop app's own data directory (default
+`~/.local/share/verde/Native`, the daemon the app already runs) through one
+loopback `verde-web` user service and installs no daemon unit, so paired
+devices see the desktop's chats. It never starts a second gateway: a
+`verde-web` service already serving that directory (for example a
+hand-installed `verde-web-desktop.service`) is adopted with its unit name,
+port and token file and replaced in place, and further services for the same
+directory are disabled. If another program, a Verde gateway for a different
+data directory, or a hand-started (non-service) gateway holds the port, it
+stops before touching Tailscale or services and prints
+`{"ok":false,"code":"gateway_port_in_use"|"gateway_unmanaged","gateway_port":…,"process":…}`.
+A fresh install uses port 6783 and `<data root>/web/token`. Its release record
+is `desktop-gateway.json` in the state directory; the desktop re-runs this
+idempotent serve at startup when that record names a different version or
+artifact root. `service uninstall --desktop` stops and removes only that
+gateway service and Verde's own Serve mapping.
+
 Collision JSON is a stable setup diagnostic. It has `schema_version: 1`,
 `ok: false`, `code: "tailscale_serve_collision"`, the explicit occupied
 `endpoint` (including `:443`), `requested_target`, the discoverable

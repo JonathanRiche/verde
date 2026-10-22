@@ -3638,15 +3638,20 @@ pub fn handleProviderOnboardingWheel(state: *runtime.AppState, width: f32, heigh
 /// Onboarding dialog pointer buttons (text selection, its menu, the setup
 /// terminal) ahead of the shared modal hits.
 pub fn handleOnboardingMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, down: bool, clicks: u8) bool {
+    // Settings sits above onboarding when open; its selectable status text
+    // shares this early routing slot.
+    if (settings_modal.handleTextMouseButton(state, x, y, button, down, clicks)) return true;
     return onboarding_modal.handleMouseButton(state, x, y, button, down, clicks);
 }
 
 pub fn handleOnboardingMouseMotion(state: *runtime.AppState, x: f32, y: f32, buttons: palette.event.ButtonState) bool {
+    if (settings_modal.handleTextMouseMotion(state, x, y)) return true;
     return onboarding_modal.handleMouseMotion(state, x, y, buttons);
 }
 
-/// OS cursor over a topmost onboarding dialog; null when none is on top.
+/// OS cursor over a topmost onboarding dialog (or Settings text); null otherwise.
 pub fn onboardingSystemCursorAt(state: *runtime.AppState, x: f32, y: f32) ?palette.platform.CursorShape {
+    if (settings_modal.textSystemCursorAt(state, x, y)) |cursor| return cursor;
     return onboarding_modal.systemCursorAt(state, x, y);
 }
 
