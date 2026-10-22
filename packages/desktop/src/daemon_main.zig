@@ -2127,6 +2127,7 @@ test {
     _ = @import("daemon/voice.zig");
     _ = @import("daemon/attachment_store.zig");
     _ = @import("daemon/change_journal.zig");
+    _ = @import("daemon/pairing_requests.zig");
     _ = @import("daemon/process_registry.zig");
     _ = @import("daemon/store.zig");
     _ = @import("daemon/repo_origin.zig");

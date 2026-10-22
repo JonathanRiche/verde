@@ -15,6 +15,8 @@ const keybinds = @import("../app/keybinds.zig");
 const debug_window = @import("debug.zig");
 const settings_modal = @import("settings_modal.zig");
 const runtime_connections = @import("../state/runtime_connections_controller.zig");
+const pairing_approvals = @import("../state/pairing_approvals.zig");
+const platform_runtime = @import("platform_runtime");
 const command_palette = @import("command_palette.zig");
 const folder_browser = @import("folder_browser.zig");
 const custom_agent_form_ui = @import("custom_agent_form.zig");
@@ -105,6 +107,7 @@ pub fn refreshPaletteModalHits(state: *runtime.AppState, width: f32, height: f32
     custom_agent_form_ui.registerHits(state, width, height, queueModalHit);
     registerRuntimeCredentialModalHits(state, width, height);
     registerRuntimeTrustModalHits(state, width, height);
+    registerPairingApprovalHits(state, width, height);
 }
 
 /// Updates command-palette row hover using hits from `refreshPaletteModalHits`.
@@ -255,6 +258,7 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     custom_agent_form_ui.render(state, width, height);
     renderRuntimeCredentialModal(state, width, height);
     renderRuntimeTrustModal(state, width, height);
+    renderPairingApprovalModal(state, width, height);
     debug_window.render(state, width, height);
     // Notices report the result of actions taken inside modals (Settings,
     // provider setup, folder browser), so they draw above every modal and
@@ -1976,6 +1980,25 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             .runtime_wizard_done => state.cancelRuntimeConnectionWizard(),
             .runtime_wizard_method => state.chooseRuntimeWizardMethod(@enumFromInt(@min(hit.index, @typeInfo(runtime_connections.WizardMethod).@"enum".fields.len - 1))),
             .runtime_wizard_select => state.selectRuntimeWizardConnectRuntime(hit.index),
+            .runtime_wizard_nearby => {
+                state.runtime_connections.method_focus_visible = false;
+                state.connectNearbyMachine(hit.index);
+            },
+            .runtime_wizard_rescan => state.rescanNearbyMachines(),
+            .pairing_approval_allow => {
+                state.pairing_approvals.focus_visible = false;
+                state.decidePairingApproval(true);
+            },
+            .pairing_approval_deny => {
+                state.pairing_approvals.focus_visible = false;
+                state.decidePairingApproval(false);
+            },
+            .pairing_approval_preset => {
+                state.pairing_approvals.focus = .presets;
+                state.pairing_approvals.focus_visible = false;
+                state.pairing_approvals.selectPreset(pairing_approvals.PRESETS[@min(hit.index, pairing_approvals.PRESETS.len - 1)]);
+                state.markDirty();
+            },
             .runtime_wizard_input => focusModalInput(state, runtimeWizardFocusForIndex(hit.index), hit.rect, x, clicks),
             .settings_runtime_action => settings_modal.applyRuntimeAction(state, hit.index),
             .settings_phone_action => settings_modal.applyPhoneAction(state, hit.index),
@@ -2238,7 +2261,8 @@ pub fn handlePaletteTextInput(state: *runtime.AppState, text: []const u8) bool {
 }
 
 pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const palette.event.KeyEvent) bool {
-    const has_modal_open = state.runtimeCredentialModalOpen() or
+    const has_modal_open = pairingApprovalOpen(state) or
+        state.runtimeCredentialModalOpen() or
         state.runtimeTrustProposal() != null or
         state.modal_image_path != null or
         state.settings_controller.mcp_onboarding_visible or
@@ -2257,6 +2281,7 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const palette.even
         state.folder_browser.open or
         state.custom_agent_form.open;
     if (!has_modal_open) return false;
+    if (handlePairingApprovalKeyDown(state, event)) return true;
     // The custom agent form sits above the settings modal that opened it.
     if (state.custom_agent_form.open) {
         if (custom_agent_form_ui.handleKeyDown(state, event)) return true;
@@ -2269,6 +2294,17 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const palette.even
         if (folder_browser.handleKeyDown(state, event)) return true;
     }
     if (runtimeWizardOwnsKeys(state)) {
+        if (state.runtime_connections.wizard_step == .method) switch (event.key) {
+            .tab, .down, .up => {
+                state.cycleRuntimeWizardMethodFocus(event.key == .up or (event.key == .tab and event.mod.shift));
+                return true;
+            },
+            .@"return", .kp_enter, .space => {
+                state.activateRuntimeWizardMethodFocus();
+                return true;
+            },
+            else => {},
+        };
         switch (event.key) {
             .tab => {
                 state.cycleRuntimeWizardField(event.mod.shift);
@@ -2285,6 +2321,7 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const palette.even
                         state.runtimeConnectionWizardConnect()
                     else
                         state.cancelRuntimeConnectionWizard(),
+                    .approval_wait => if (runtime_connections.nearbyApprovalRetryable(&state.runtime_connections)) state.submitRuntimeConnectionWizard(),
                     // Identity confirmation and method choice need a click:
                     // a stray Enter must not adopt a runtime identity.
                     .method, .pair_confirm => {},
@@ -2741,6 +2778,8 @@ const WIZARD_METHOD_COUNT: usize = @typeInfo(runtime_connections.WizardMethod).@
 /// Inventory rows shown on the Connect step before the list is clipped;
 /// a count of hidden rows is rendered instead of a scroll surface.
 const WIZARD_INVENTORY_VISIBLE_ROWS: usize = 5;
+/// Nearby machine rows shown on the method step before clipping.
+const WIZARD_NEARBY_VISIBLE_ROWS: usize = 4;
 
 const WizardLayout = struct {
     modal: palette.Rect,
@@ -2752,6 +2791,14 @@ const WizardLayout = struct {
     methods: [WIZARD_METHOD_COUNT]palette.Rect,
     inventory: [WIZARD_INVENTORY_VISIBLE_ROWS]palette.Rect,
     inventory_y: f32,
+    /// Method step: "NEARBY MACHINES" heading, its rows (or status line),
+    /// the Refresh link, and the "ADVANCED" heading above SSH.
+    nearby_label_y: f32,
+    nearby: [WIZARD_NEARBY_VISIBLE_ROWS]palette.Rect,
+    nearby_connect: [WIZARD_NEARBY_VISIBLE_ROWS]palette.Rect,
+    nearby_status_y: f32,
+    rescan: palette.Rect,
+    advanced_label_y: f32,
     /// Identity boxes on the pairing confirmation step.
     identity: [2]palette.Rect,
     notice_y: f32,
@@ -2778,8 +2825,12 @@ fn runtimeWizardLayout(state: *const runtime.AppState, width: f32, height: f32) 
     const field_row_h = label_h + input_h + row_gap;
     const status_block_h = theme.scaledUi(60.0);
     const inventory_rows = @min(rc.connect_runtimes.items.len, WIZARD_INVENTORY_VISIBLE_ROWS);
+    const nearby_rows = @min(runtime_connections.nearbyMachines(rc).len, WIZARD_NEARBY_VISIBLE_ROWS);
+    const nearby_row_h = theme.scaledUi(48.0);
+    const nearby_h: f32 = if (nearby_rows > 0) @as(f32, @floatFromInt(nearby_rows)) * (nearby_row_h + gap) else sub_h + gap;
     const body_h: f32 = switch (step) {
-        .method => @as(f32, @floatFromInt(WIZARD_METHOD_COUNT)) * (method_card_h + row_gap),
+        .method => label_h + gap + nearby_h + row_gap + @as(f32, @floatFromInt(WIZARD_METHOD_COUNT)) * (method_card_h + row_gap) + label_h + gap,
+        .approval_wait => theme.scaledUi(132.0),
         .form => if (rc.wizard_method == .pair)
             (if (rc.wizard_mode == .add) 3.0 * field_row_h else 2.0 * field_row_h)
         else
@@ -2802,6 +2853,14 @@ fn runtimeWizardLayout(state: *const runtime.AppState, width: f32, height: f32) 
     for (&layout.fields) |*rect| rect.* = .{ .x = x, .y = y, .w = content_w, .h = input_h };
     for (&layout.methods, 0..) |*rect, index| {
         rect.* = .{ .x = x, .y = y + @as(f32, @floatFromInt(index)) * (method_card_h + row_gap), .w = content_w, .h = method_card_h };
+    }
+    layout.nearby_label_y = y;
+    layout.nearby_status_y = y;
+    layout.advanced_label_y = y;
+    layout.rescan = .{ .x = x, .y = y, .w = 0, .h = 0 };
+    for (&layout.nearby, &layout.nearby_connect) |*rect, *connect| {
+        rect.* = .{ .x = x, .y = y, .w = content_w, .h = nearby_row_h };
+        connect.* = rect.*;
     }
     switch (step) {
         .form => {
@@ -2852,7 +2911,32 @@ fn runtimeWizardLayout(state: *const runtime.AppState, width: f32, height: f32) 
             }
             if (rc.connect_runtimes_truncated > 0) y += sub_h;
         },
-        .method => y += body_h,
+        .method => {
+            // Nearby machines first, then Verde Cloud and Pairing link, then
+            // SSH under "Advanced". Card rects stay indexed by method ordinal.
+            layout.nearby_label_y = y;
+            const rescan_w = theme.scaledUi(72.0);
+            layout.rescan = .{ .x = x + content_w - rescan_w, .y = y - theme.scaledUi(2.0), .w = rescan_w, .h = label_h + theme.scaledUi(4.0) };
+            y += label_h + gap;
+            layout.nearby_status_y = y;
+            const connect_w = theme.scaledUi(92.0);
+            for (&layout.nearby, &layout.nearby_connect, 0..) |*rect, *connect, index| {
+                rect.* = .{ .x = x, .y = y, .w = content_w, .h = nearby_row_h };
+                connect.* = .{ .x = x + content_w - connect_w - theme.scaledUi(8.0), .y = y + theme.scaledUi(8.0), .w = connect_w, .h = nearby_row_h - theme.scaledUi(16.0) };
+                if (index < nearby_rows) y += nearby_row_h + gap;
+            }
+            if (nearby_rows == 0) y += sub_h + gap;
+            y += row_gap;
+            for (runtime_connections.METHOD_DISPLAY_ORDER) |method| {
+                if (method.advanced()) {
+                    layout.advanced_label_y = y;
+                    y += label_h + gap;
+                }
+                layout.methods[@intFromEnum(method)] = .{ .x = x, .y = y, .w = content_w, .h = method_card_h };
+                y += method_card_h + row_gap;
+            }
+        },
+        .approval_wait => y += body_h,
         .testing => y += status_block_h,
     }
     layout.notice_y = y;
@@ -2877,7 +2961,15 @@ fn registerRuntimeWizardModalHits(state: *runtime.AppState, width: f32, height: 
     switch (rc.wizard_step) {
         .method => {
             for (layout.methods, 0..) |rect, index| queueModalHit(state, rect, .runtime_wizard_method, index);
+            const nearby = runtime_connections.nearbyMachines(rc);
+            for (layout.nearby[0..@min(nearby.len, WIZARD_NEARBY_VISIBLE_ROWS)], 0..) |rect, index| queueModalHit(state, rect, .runtime_wizard_nearby, index);
+            if (rc.nearby.phase != .scanning) queueModalHit(state, layout.rescan, .runtime_wizard_rescan, 0);
             queueModalHit(state, layout.buttons[0], .runtime_wizard_cancel, 0);
+        },
+        .approval_wait => {
+            queueModalHit(state, layout.buttons[0], .runtime_wizard_cancel, 0);
+            queueModalHit(state, layout.buttons[1], .runtime_wizard_back, 0);
+            if (runtime_connections.nearbyApprovalRetryable(rc)) queueModalHit(state, layout.buttons[2], .runtime_wizard_submit, 0);
         },
         .form => {
             queueModalHit(state, layout.buttons[0], .runtime_wizard_cancel, 0);
@@ -2998,6 +3090,7 @@ fn renderRuntimeWizardModal(state: *runtime.AppState, width: f32, height: f32) v
         .method => "Add connection",
         .pair_grant => "Pair this device",
         .pair_confirm => "Confirm the runtime identity",
+        .approval_wait => "Connect to another computer",
         else => switch (rc.wizard_mode) {
             .add => "Add runtime connection",
             .edit => "Edit runtime connection",
@@ -3005,14 +3098,18 @@ fn renderRuntimeWizardModal(state: *runtime.AppState, width: f32, height: f32) v
     };
     queuePaletteText(state, .{ .x = modal.x + pad, .y = modal.y + pad, .w = layout.content_w, .h = theme.scaledUi(24.0) }, heading, paletteColor(theme.COLOR_WHITE), theme.scaledUi(18.0), modal);
     const subtitle = switch (rc.wizard_step) {
-        .method => "Choose how this desktop reaches the runtime. Only Connect needs an account.",
+        .method => "Run chats on another computer of yours, or on Verde Cloud.",
         .form => if (rc.wizard_method == .pair)
             "Paste the pair link. Both names are filled in for you; change them if you like."
         else
             "Reach a self-hosted Verde daemon over SSH. Host keys are verified by OpenSSH; no secrets are stored here.",
-        .pair_grant => "Advanced manual fallback: review or enter the grant ID and masked one-time code, then exchange.",
-        .pair_confirm => "The runtime answered the exchange. Verify both IDs against `verde-daemon identity` before trusting it.",
-        .connect_setup => "Enter your self-hosted Verde Connect URL. Sign-in uses the system browser with PKCE; tokens stay in memory.",
+        .pair_grant => if (rc.pairing_exchange_started)
+            "Pairing with the other machine…"
+        else
+            "Advanced manual fallback: review or enter the grant ID and masked one-time code, then exchange.",
+        .pair_confirm => "The other machine answered. Trust it to finish pairing.",
+        .connect_setup => "Sign in to Verde Cloud, or enter your own Verde Connect URL. Sign-in opens your browser.",
+        .approval_wait => "Approve this computer on the other machine. No code to type.",
         .testing => switch (rc.wizard_method) {
             .ssh => "Connect to verify the daemon identity. You will be asked for the gateway token and to confirm the runtime on first contact.",
             .pair => "Connect uses the paired device credential; no token prompt is needed.",
@@ -3023,8 +3120,11 @@ fn renderRuntimeWizardModal(state: *runtime.AppState, width: f32, height: f32) v
 
     switch (rc.wizard_step) {
         .method => {
+            renderWizardNearbySection(state, layout);
+            queuePaletteText(state, .{ .x = modal.x + pad, .y = layout.advanced_label_y, .w = layout.content_w, .h = theme.scaledUi(16.0) }, "ADVANCED", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), modal);
             for (layout.methods, 0..) |rect, index| {
                 const method: runtime_connections.WizardMethod = @enumFromInt(index);
+                if (rc.method_focus_visible) if (rc.method_focus) |focus| if (runtime_connections.methodFocusEql(focus, .{ .method = method })) drawWizardFocusRing(state, rect);
                 const hovered = pointInRect(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y, rect);
                 queuePaletteRoundedRect(state, rect, paletteColor(if (hovered) theme.raise(theme.COLOR_PANEL_ALT, 0.055) else theme.COLOR_PANEL_ALT), theme.scaledUi(7.0));
                 queuePaletteBorder(state, rect, paletteColor(if (hovered) theme.accent() else theme.COLOR_PANEL_MUTED), theme.scaledUi(7.0), theme.scaledUi(1.0));
@@ -3081,7 +3181,7 @@ fn renderRuntimeWizardModal(state: *runtime.AppState, width: f32, height: f32) v
             drawWizardField(state, layout, .control_plane_url, "CONTROL PLANE URL", "https://connect.example");
             const status: []const u8 = if (rc.connect_failure) |failure| failure.message() else switch (rc.connect_phase) {
                 .idle => "Not checked yet.",
-                .discovering => "Fetching /.well-known/verde-connect-configuration…",
+                .discovering => "Checking the sign-in service…",
                 .discovered => "Ready to sign in.",
                 .signing_in => if (rc.connect_login_open) "Browser opened. Finish sign-in there; this window waits for the loopback redirect." else "Starting sign-in…",
                 .signed_in, .loading_inventory => "Signed in. Loading authorized runtimes…",
@@ -3096,27 +3196,19 @@ fn renderRuntimeWizardModal(state: *runtime.AppState, width: f32, height: f32) v
             const empty_inventory = rc.connect_phase == .inventory_loaded and rc.connect_runtimes.items.len == 0;
             const status_color = if (rc.connect_failure != null) theme.danger() else if (empty_inventory) theme.COLOR_YELLOW else if (connectSignedIn(rc.connect_phase)) theme.success() else theme.COLOR_TEXT_MUTED;
             queuePaletteText(state, .{ .x = modal.x + pad, .y = layout.status_y, .w = layout.content_w, .h = theme.scaledUi(20.0) }, status, paletteColor(status_color), theme.scaledUi(13.0), modal);
-            var issuer_buf: [runtime_connections.URL_CAPACITY + 32]u8 = undefined;
-            const issuer_line: []const u8 = if (rc.connect_issuer) |issuer|
-                std.fmt.bufPrint(&issuer_buf, "Issuer {s}{s}", .{ issuer, if (rc.connect_device_flow_advertised) " · device flow advertised" else "" }) catch issuer
-            else
-                "";
-            queuePaletteText(state, .{ .x = modal.x + pad, .y = layout.status_y + theme.scaledUi(24.0), .w = layout.content_w, .h = theme.scaledUi(18.0) }, issuer_line, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), modal);
             const visible = @min(rc.connect_runtimes.items.len, WIZARD_INVENTORY_VISIBLE_ROWS);
             for (rc.connect_runtimes.items[0..visible], 0..) |row, index| {
                 const rect = layout.inventory[index];
                 const selected = rc.connect_selected == index;
                 queuePaletteRoundedRect(state, rect, paletteColor(if (selected) theme.raise(theme.COLOR_PANEL_ALT, 0.08) else theme.COLOR_PANEL_ALT), theme.scaledUi(7.0));
                 queuePaletteBorder(state, rect, paletteColor(if (selected) theme.accent() else theme.COLOR_PANEL_MUTED), theme.scaledUi(7.0), theme.scaledUi(if (selected) 1.5 else 1.0));
-                queuePaletteText(state, .{ .x = rect.x + theme.scaledUi(12.0), .y = rect.y + theme.scaledUi(6.0), .w = rect.w - theme.scaledUi(24.0), .h = theme.scaledUi(18.0) }, row.https_url, paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.0), rect);
-                var id_buf: [256]u8 = undefined;
-                const id_line = std.fmt.bufPrint(&id_buf, "runtime {s} · instance {s} · spki {s}", .{ row.runtime_id, row.instance_id, row.spki_sha256 }) catch row.runtime_id;
-                queuePaletteText(state, .{ .x = rect.x + theme.scaledUi(12.0), .y = rect.y + theme.scaledUi(24.0), .w = rect.w - theme.scaledUi(24.0), .h = theme.scaledUi(16.0) }, id_line, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), rect);
+                queuePaletteText(state, .{ .x = rect.x + theme.scaledUi(12.0), .y = rect.y + theme.scaledUi(6.0), .w = rect.w - theme.scaledUi(24.0), .h = theme.scaledUi(18.0) }, runtime_connections.runtimeNameFromUrl(row.https_url), paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.0), rect);
+                queuePaletteText(state, .{ .x = rect.x + theme.scaledUi(12.0), .y = rect.y + theme.scaledUi(24.0), .w = rect.w - theme.scaledUi(24.0), .h = theme.scaledUi(16.0) }, if (selected) "Selected" else "Ready", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), rect);
             }
             const hidden = rc.connect_runtimes.items.len - visible + rc.connect_runtimes_truncated;
             if (hidden > 0) {
                 var more_buf: [64]u8 = undefined;
-                const more = std.fmt.bufPrint(&more_buf, "{d} more linked runtime(s) not shown", .{hidden}) catch "";
+                const more = std.fmt.bufPrint(&more_buf, "{d} more machine(s) not shown", .{hidden}) catch "";
                 queuePaletteText(state, .{ .x = modal.x + pad, .y = layout.inventory_y + @as(f32, @floatFromInt(visible)) * (theme.scaledUi(44.0) + theme.scaledUi(8.0)), .w = layout.content_w, .h = theme.scaledUi(18.0) }, more, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), modal);
             }
             drawActionButton(state, layout.buttons[0], "Cancel", theme.COLOR_PANEL_ALT);
@@ -3127,6 +3219,7 @@ fn renderRuntimeWizardModal(state: *runtime.AppState, width: f32, height: f32) v
             }
             drawActionButton(state, layout.buttons[2], connectPrimaryLabel(rc), if (connectPrimaryEnabled(rc)) theme.accent() else theme.COLOR_PANEL_MUTED);
         },
+        .approval_wait => renderWizardApprovalWait(state, layout),
         .testing => {
             var badge: []const u8 = "Saved";
             var description: []const u8 = "";
@@ -3161,6 +3254,216 @@ fn renderRuntimeWizardModal(state: *runtime.AppState, width: f32, height: f32) v
     if (notice.len > 0) {
         queuePaletteText(state, .{ .x = modal.x + pad, .y = layout.notice_y, .w = layout.content_w, .h = theme.scaledUi(20.0) }, notice, paletteColor(theme.COLOR_YELLOW), theme.scaledUi(12.5), modal);
     }
+}
+
+// Keyboard focus ring for wizard choice controls (crisp, outside the rect).
+fn drawWizardFocusRing(state: *runtime.AppState, rect: palette.Rect) void {
+    const ring_w = @max(1.0, @round(theme.scaledUi(2.0)));
+    const ring: palette.Rect = .{
+        .x = @round(rect.x - ring_w * 2.0),
+        .y = @round(rect.y - ring_w * 2.0),
+        .w = @round(rect.w + ring_w * 4.0),
+        .h = @round(rect.h + ring_w * 4.0),
+    };
+    queuePaletteBorder(state, ring, paletteColor(theme.accent()), theme.scaledUi(7.0) + ring_w * 2.0, ring_w);
+}
+
+// Method step, top section: Verde machines on this computer's tailnet, each
+// with its OS and a Connect action, or one status line while none are listed.
+fn renderWizardNearbySection(state: *runtime.AppState, layout: WizardLayout) void {
+    const rc = &state.runtime_connections;
+    const modal = layout.modal;
+    const x = modal.x + layout.pad;
+    queuePaletteText(state, .{ .x = x, .y = layout.nearby_label_y, .w = layout.content_w, .h = theme.scaledUi(16.0) }, "NEARBY MACHINES", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), modal);
+    if (rc.nearby.phase != .scanning) {
+        const rescan_hovered = pointInRect(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y, layout.rescan);
+        queuePaletteText(state, .{ .x = layout.rescan.x, .y = layout.nearby_label_y, .w = layout.rescan.w, .h = theme.scaledUi(16.0) }, "Refresh", paletteColor(if (rescan_hovered) theme.COLOR_WHITE else theme.accent()), theme.scaledUi(12.0), modal);
+        if (rc.method_focus_visible) if (rc.method_focus) |focus| if (focus == .rescan) drawWizardFocusRing(state, layout.rescan);
+    }
+    const machines = runtime_connections.nearbyMachines(rc);
+    const visible = @min(machines.len, WIZARD_NEARBY_VISIBLE_ROWS);
+    for (machines[0..visible], 0..) |*machine, index| {
+        const rect = layout.nearby[index];
+        const hovered = pointInRect(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y, rect);
+        queuePaletteRoundedRect(state, rect, paletteColor(if (hovered) theme.raise(theme.COLOR_PANEL_ALT, 0.055) else theme.COLOR_PANEL_ALT), theme.scaledUi(7.0));
+        queuePaletteBorder(state, rect, paletteColor(if (hovered) theme.accent() else theme.COLOR_PANEL_MUTED), theme.scaledUi(7.0), theme.scaledUi(1.0));
+        if (rc.method_focus_visible) if (rc.method_focus) |focus| if (runtime_connections.methodFocusEql(focus, .{ .nearby = index })) drawWizardFocusRing(state, rect);
+        const text_w = rect.w - layout.nearby_connect[index].w - theme.scaledUi(32.0);
+        queuePaletteText(state, .{ .x = rect.x + theme.scaledUi(12.0), .y = rect.y + theme.scaledUi(7.0), .w = text_w, .h = theme.scaledUi(20.0) }, machine.name.slice(), paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.0), rect);
+        var detail_buf: [96]u8 = undefined;
+        const detail = if (machine.supports_approval)
+            machine.osLabel()
+        else
+            std.fmt.bufPrint(&detail_buf, "{s} · older Verde, pair with a link", .{machine.osLabel()}) catch machine.osLabel();
+        queuePaletteText(state, .{ .x = rect.x + theme.scaledUi(12.0), .y = rect.y + theme.scaledUi(27.0), .w = text_w, .h = theme.scaledUi(16.0) }, detail, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.0), rect);
+        drawActionButton(state, layout.nearby_connect[index], "Connect", theme.accent());
+    }
+    if (visible == 0) {
+        const status: []const u8 = switch (rc.nearby.phase) {
+            .idle, .scanning => "Looking for Verde on your tailnet…",
+            .done => "No other Verde machines on your tailnet. Turn on Remote access on the other computer.",
+            .no_tailscale => "Tailscale isn't running here. Use Verde Cloud or a pairing link below.",
+            .tailscale_stopped => "Tailscale is signed out or stopped. Open Tailscale, or use Verde Cloud below.",
+            .failed => "Couldn't list your tailnet machines. Use Verde Cloud or a pairing link below.",
+        };
+        queuePaletteText(state, .{ .x = x, .y = layout.nearby_status_y, .w = layout.content_w, .h = theme.scaledUi(20.0) }, status, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.5), modal);
+    }
+}
+
+// Waiting step: "Waiting for richetech to approve…" with the match code the
+// other machine shows, then Cancel / Back / Try again.
+fn renderWizardApprovalWait(state: *runtime.AppState, layout: WizardLayout) void {
+    const rc = &state.runtime_connections;
+    const modal = layout.modal;
+    const x = modal.x + layout.pad;
+    const machine = runtime_connections.nearbyApprovalMachine(rc);
+    const view = runtime_connections.nearbyApprovalView(rc);
+    const phase: runtime_connections.ApprovalPhase = if (view) |value| value.phase else .failed;
+    var line_buf: [192]u8 = undefined;
+    const line: []const u8 = switch (phase) {
+        .sending => std.fmt.bufPrint(&line_buf, "Asking {s}…", .{machine.name.slice()}) catch "",
+        .waiting, .approved => std.fmt.bufPrint(&line_buf, "Waiting for {s} to approve…", .{machine.name.slice()}) catch "",
+        else => std.fmt.bufPrint(&line_buf, "Not connected to {s}.", .{machine.name.slice()}) catch "",
+    };
+    queuePaletteText(state, .{ .x = x, .y = layout.status_y, .w = layout.content_w, .h = theme.scaledUi(22.0) }, line, paletteColor(theme.COLOR_WHITE), theme.scaledUi(15.0), modal);
+    if (view) |value| if (value.match_code) |code| if (phase == .waiting or phase == .approved) {
+        queuePaletteText(state, .{ .x = x, .y = layout.status_y + theme.scaledUi(30.0), .w = layout.content_w, .h = theme.scaledUi(18.0) }, "Check that the other machine shows the same code:", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.5), modal);
+        const box: palette.Rect = .{ .x = x, .y = layout.status_y + theme.scaledUi(54.0), .w = theme.scaledUi(132.0), .h = theme.scaledUi(52.0) };
+        queuePaletteRoundedRect(state, box, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(8.0));
+        queuePaletteBorder(state, box, paletteColor(theme.accent()), theme.scaledUi(8.0), theme.scaledUi(1.0));
+        queuePaletteText(state, .{ .x = box.x + theme.scaledUi(18.0), .y = box.y + theme.scaledUi(10.0), .w = box.w - theme.scaledUi(24.0), .h = theme.scaledUi(32.0) }, &code, paletteColor(theme.COLOR_WHITE), theme.scaledUi(26.0), modal);
+        queuePaletteText(state, .{ .x = box.x + box.w + theme.scaledUi(16.0), .y = box.y + theme.scaledUi(17.0), .w = layout.content_w - box.w - theme.scaledUi(16.0), .h = theme.scaledUi(18.0) }, "Requests expire after 2 minutes.", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), modal);
+    };
+    drawActionButton(state, layout.buttons[0], "Cancel", theme.COLOR_PANEL_ALT);
+    drawActionButton(state, layout.buttons[1], "Back", theme.COLOR_PANEL_ALT);
+    const retryable = runtime_connections.nearbyApprovalRetryable(rc);
+    drawActionButton(state, layout.buttons[2], if (retryable) "Try again" else "Waiting…", if (retryable) theme.accent() else theme.COLOR_PANEL_MUTED);
+}
+
+// ---------------------------------------------------------------------------
+// Pairing approval prompt (this machine is being reached): "lightning
+// (j.riche64@) wants to connect · Allow / Deny", the permission preset, and
+// the match code the requesting computer shows. Topmost modal.
+// ---------------------------------------------------------------------------
+
+const PairingApprovalLayout = struct {
+    modal: palette.Rect,
+    pad: f32,
+    content_w: f32,
+    presets: [pairing_approvals.PRESETS.len]palette.Rect,
+    deny: palette.Rect,
+    allow: palette.Rect,
+};
+
+fn pairingApprovalLayout(width: f32, height: f32) PairingApprovalLayout {
+    const pad = theme.scaledUi(20.0);
+    const modal_w = @min(theme.clampf(width * 0.40, theme.scaledUi(440.0), theme.scaledUi(560.0)), @max(width - pad * 2.0, theme.scaledUi(320.0)));
+    const modal_h = @min(theme.scaledUi(332.0), height - pad * 2.0);
+    const modal: palette.Rect = .{ .x = @round((width - modal_w) * 0.5), .y = @round((height - modal_h) * 0.5), .w = @round(modal_w), .h = @round(modal_h) };
+    const content_w = modal.w - pad * 2.0;
+    var layout: PairingApprovalLayout = undefined;
+    layout.modal = modal;
+    layout.pad = pad;
+    layout.content_w = content_w;
+    const chip_gap = theme.scaledUi(8.0);
+    const chip_w = (content_w - chip_gap * @as(f32, @floatFromInt(pairing_approvals.PRESETS.len - 1))) / @as(f32, @floatFromInt(pairing_approvals.PRESETS.len));
+    for (&layout.presets, 0..) |*rect, index| {
+        rect.* = .{ .x = modal.x + pad + @as(f32, @floatFromInt(index)) * (chip_w + chip_gap), .y = modal.y + theme.scaledUi(178.0), .w = chip_w, .h = theme.scaledUi(32.0) };
+    }
+    const button_h = theme.scaledUi(36.0);
+    const gap = theme.scaledUi(10.0);
+    const button_w = (content_w - gap) * 0.5;
+    const button_y = modal.y + modal.h - pad - button_h;
+    layout.deny = .{ .x = modal.x + pad, .y = button_y, .w = button_w, .h = button_h };
+    layout.allow = .{ .x = modal.x + pad + button_w + gap, .y = button_y, .w = button_w, .h = button_h };
+    return layout;
+}
+
+fn pairingApprovalOpen(state: *const runtime.AppState) bool {
+    return state.pairing_approvals.open();
+}
+
+fn registerPairingApprovalHits(state: *runtime.AppState, width: f32, height: f32) void {
+    if (!pairingApprovalOpen(state)) return;
+    const layout = pairingApprovalLayout(width, height);
+    // Not dismissible from the scrim: a stray click must not answer it.
+    registerModalChromeHits(state, width, height, layout.modal, false);
+    for (layout.presets, 0..) |rect, index| queueModalHit(state, rect, .pairing_approval_preset, index);
+    queueModalHit(state, layout.deny, .pairing_approval_deny, 0);
+    queueModalHit(state, layout.allow, .pairing_approval_allow, 0);
+}
+
+fn renderPairingApprovalModal(state: *runtime.AppState, width: f32, height: f32) void {
+    const now_ms = platform_runtime.unixTimestampMs();
+    const request = state.pairing_approvals.current(now_ms) orelse return;
+    const approvals = &state.pairing_approvals;
+    const layout = pairingApprovalLayout(width, height);
+    const modal = layout.modal;
+    const pad = layout.pad;
+    const x = modal.x + pad;
+    drawModalChromeVisual(state, width, height, modal);
+    var heading_buf: [256]u8 = undefined;
+    queuePaletteText(state, .{ .x = x, .y = modal.y + pad, .w = layout.content_w, .h = theme.scaledUi(24.0) }, request.headline(&heading_buf), paletteColor(theme.COLOR_WHITE), theme.scaledUi(18.0), modal);
+    var sub_buf: [256]u8 = undefined;
+    const sub = std.fmt.bufPrint(&sub_buf, "Signed in to Tailscale as {s}. Allow it to run chats on this computer?", .{request.requester_login.slice()}) catch "Allow it to run chats on this computer?";
+    queuePaletteText(state, .{ .x = x, .y = modal.y + pad + theme.scaledUi(32.0), .w = layout.content_w, .h = theme.scaledUi(20.0) }, sub, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.5), modal);
+
+    queuePaletteText(state, .{ .x = x, .y = modal.y + theme.scaledUi(86.0), .w = layout.content_w, .h = theme.scaledUi(16.0) }, "MATCH CODE ON THE OTHER COMPUTER", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), modal);
+    const box: palette.Rect = .{ .x = x, .y = modal.y + theme.scaledUi(106.0), .w = theme.scaledUi(132.0), .h = theme.scaledUi(46.0) };
+    queuePaletteRoundedRect(state, box, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(8.0));
+    queuePaletteBorder(state, box, paletteColor(theme.accent()), theme.scaledUi(8.0), theme.scaledUi(1.0));
+    queuePaletteText(state, .{ .x = box.x + theme.scaledUi(18.0), .y = box.y + theme.scaledUi(8.0), .w = box.w - theme.scaledUi(24.0), .h = theme.scaledUi(30.0) }, &request.match_code, paletteColor(theme.COLOR_WHITE), theme.scaledUi(24.0), modal);
+    const seconds_left = @max(@divFloor(request.expires_at_ms - now_ms, 1000), 0);
+    var expiry_buf: [96]u8 = undefined;
+    const pending = approvals.pendingCount(now_ms);
+    const expiry = if (pending > 1)
+        std.fmt.bufPrint(&expiry_buf, "Expires in {d}s · {d} more waiting", .{ seconds_left, pending - 1 }) catch ""
+    else
+        std.fmt.bufPrint(&expiry_buf, "Expires in {d}s", .{seconds_left}) catch "";
+    queuePaletteText(state, .{ .x = box.x + box.w + theme.scaledUi(16.0), .y = box.y + theme.scaledUi(14.0), .w = layout.content_w - box.w - theme.scaledUi(16.0), .h = theme.scaledUi(18.0) }, expiry, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), modal);
+
+    queuePaletteText(state, .{ .x = x, .y = modal.y + theme.scaledUi(158.0), .w = layout.content_w, .h = theme.scaledUi(16.0) }, "PERMISSIONS", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), modal);
+    for (layout.presets, pairing_approvals.PRESETS) |rect, preset| {
+        const selected = approvals.preset == preset;
+        const hovered = pointInRect(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y, rect);
+        queuePaletteRoundedRect(state, rect, paletteColor(if (selected) theme.raise(theme.COLOR_PANEL_ALT, 0.08) else if (hovered) theme.raise(theme.COLOR_PANEL_ALT, 0.04) else theme.COLOR_PANEL_ALT), theme.scaledUi(7.0));
+        queuePaletteBorder(state, rect, paletteColor(if (selected) theme.accent() else theme.COLOR_PANEL_MUTED), theme.scaledUi(7.0), theme.scaledUi(if (selected) 1.5 else 1.0));
+        queuePaletteText(state, .{ .x = rect.x + theme.scaledUi(12.0), .y = rect.y + theme.scaledUi(7.0), .w = rect.w - theme.scaledUi(24.0), .h = theme.scaledUi(18.0) }, pairing_approvals.presetLabel(preset), paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.0), rect);
+        if (selected and approvals.focus_visible and approvals.focus == .presets) drawWizardFocusRing(state, rect);
+    }
+    queuePaletteText(state, .{ .x = x, .y = modal.y + theme.scaledUi(218.0), .w = layout.content_w, .h = theme.scaledUi(18.0) }, pairing_approvals.presetDescription(approvals.preset), paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.0), modal);
+    if (approvals.notice.len > 0) {
+        queuePaletteText(state, .{ .x = x, .y = modal.y + theme.scaledUi(242.0), .w = layout.content_w, .h = theme.scaledUi(18.0) }, approvals.notice, paletteColor(theme.COLOR_YELLOW), theme.scaledUi(12.0), modal);
+    }
+    drawActionButton(state, layout.deny, "Deny", theme.COLOR_PANEL_ALT);
+    drawActionButton(state, layout.allow, "Allow", theme.accent());
+    if (approvals.focus_visible) switch (approvals.focus) {
+        .deny => drawWizardFocusRing(state, layout.deny),
+        .allow => drawWizardFocusRing(state, layout.allow),
+        else => {},
+    };
+}
+
+/// Keys go to the prompt while it is up. Enter/Space answer only the
+/// control focused from the keyboard: a stray Enter never allows a device.
+fn handlePairingApprovalKeyDown(state: *runtime.AppState, event: *const palette.event.KeyEvent) bool {
+    if (!pairingApprovalOpen(state)) return false;
+    const approvals = &state.pairing_approvals;
+    switch (event.key) {
+        .tab => approvals.cycleFocus(event.mod.shift),
+        .left, .up => if (approvals.focus == .presets) approvals.stepPreset(false),
+        .right, .down => if (approvals.focus == .presets) approvals.stepPreset(true),
+        .@"return", .kp_enter, .space => switch (approvals.focus) {
+            .allow => state.decidePairingApproval(true),
+            .deny => state.decidePairingApproval(false),
+            .presets, .none => {},
+        },
+        // Closing the prompt fails the request on the requesting side.
+        .escape => state.decidePairingApproval(false),
+        else => {},
+    }
+    state.markDirty();
+    return true;
 }
 
 fn runtimeCredentialModalRect(width: f32, height: f32) palette.Rect {

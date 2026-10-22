@@ -13,6 +13,7 @@ const access_protocol = @import("headless").access_protocol;
 const connect_client = @import("../runtime/connect_client.zig");
 const profile = @import("../runtime/profile.zig");
 const RuntimeService = @import("../runtime/service.zig");
+const nearby_pairing = @import("nearby_pairing.zig");
 
 const log = std.log.scoped(.native_runtime_connections);
 
@@ -28,6 +29,11 @@ pub const DEVICE_LABEL_CAPACITY: usize = access_protocol.MAX_DEVICE_LABEL_BYTES;
 pub const URL_CAPACITY: usize = profile.MAX_URL_BYTES;
 pub const AGENT_EXPECTED_RUNTIME_ID_CAPACITY: usize = 128;
 pub const PAIR_LINK_PREFIX: []const u8 = "verde://pair?";
+/// Public Verde Cloud control plane, prefilled for the Verde Cloud method.
+pub const VERDE_CLOUD_URL: []const u8 = "https://cloud.verdeai.dev";
+pub const NearbyMachine = nearby_pairing.Machine;
+pub const NearbyPhase = nearby_pairing.DiscoveryPhase;
+pub const ApprovalPhase = nearby_pairing.ApprovalPhase;
 const NOTICE_CAPACITY: usize = 256;
 /// Bounded so a hostile or huge manifest cannot grow the settings card
 /// without limit; extra rows are reported as a count.
@@ -43,19 +49,34 @@ pub const WizardMethod = enum {
 
     pub fn title(self: WizardMethod) []const u8 {
         return switch (self) {
-            .ssh => "SSH with administrator token",
-            .pair => "Direct / Tailnet (Pair code)",
-            .connect => "Connect through a control plane (account required)",
+            .ssh => "SSH",
+            .pair => "Pairing link",
+            .connect => "Verde Cloud \u{2014} no machine needed",
         };
     }
 
     pub fn description(self: WizardMethod) []const u8 {
         return switch (self) {
             .ssh => "Forward the daemon over SSH and enter its gateway token each session.",
-            .pair => "Connect to an HTTPS runtime or Tailscale Serve URL and keep a revocable device credential.",
-            .connect => "Sign in to a self-hosted Verde Connect URL and pick a linked runtime. Verde Cloud later.",
+            .pair => "Paste a verde://pair link from `verde-daemon pair create` on the other machine.",
+            .connect => "Sign in and run chats on a Verde Cloud machine, or use your own Verde Connect URL.",
         };
     }
+
+    /// SSH is listed under "Advanced" below the everyday methods.
+    pub fn advanced(self: WizardMethod) bool {
+        return self == .ssh;
+    }
+};
+
+/// Method cards in the order normal users need them, after Nearby machines.
+pub const METHOD_DISPLAY_ORDER = [_]WizardMethod{ .connect, .pair, .ssh };
+
+/// Keyboard focus on the method step, tracked by identity.
+pub const MethodFocus = union(enum) {
+    nearby: usize,
+    method: WizardMethod,
+    rescan,
 };
 pub const WizardStep = enum {
     /// Method chooser shown first for new connections.
@@ -70,6 +91,8 @@ pub const WizardStep = enum {
     pair_confirm,
     /// Connect: control-plane URL, discovery, sign-in, inventory selection.
     connect_setup,
+    /// Nearby machine: request sent, waiting for the owner to approve there.
+    approval_wait,
 };
 /// One-shot bootstrap results. They describe credential custody, not the live
 /// connection, so the status step hides them once the runtime is not ready.
@@ -283,8 +306,17 @@ pub const State = struct {
     providers: std.ArrayList(ProviderRow) = .empty,
     providers_truncated: usize = 0,
     card_notice_storage: [NOTICE_CAPACITY:0]u8 = std.mem.zeroes([NOTICE_CAPACITY:0]u8),
+    /// Verde machines found on the tailnet for the method step.
+    nearby: nearby_pairing.Discovery = .{},
+    /// The pairing request sent to a nearby machine, if any.
+    approval: nearby_pairing.Approval = .{},
+    approval_last_phase: ?nearby_pairing.ApprovalPhase = null,
+    method_focus: ?MethodFocus = null,
+    method_focus_visible: bool = false,
 
     pub fn deinit(self: *State, allocator: std.mem.Allocator) void {
+        self.approval.deinit();
+        self.nearby.deinit();
         if (self.wizard_profile_id) |value| allocator.free(value);
         if (self.remove_confirm_profile_id) |value| allocator.free(value);
         if (self.expanded_profile_id) |value| allocator.free(value);
@@ -365,7 +397,7 @@ pub const State = struct {
                 &.{ .label, .host, .user, .ssh_port, .gateway_port },
             .pair_grant => &.{ .grant_id, .pairing_code, .device_label },
             .connect_setup => &.{ .label, .control_plane_url },
-            .method, .testing, .pair_confirm => &.{},
+            .method, .testing, .pair_confirm, .approval_wait => &.{},
         };
     }
 
@@ -619,6 +651,11 @@ pub fn openRuntimeConnectionWizard(self: anytype) void {
     rc.wizard_method = .ssh;
     rc.wizard_step = .method;
     rc.wizard_open = true;
+    rc.approval.cancel();
+    rc.approval_last_phase = null;
+    rc.method_focus = null;
+    rc.method_focus_visible = false;
+    rc.nearby.start();
     setNotice(&rc.wizard_notice_storage, "");
     self.closePaletteRuntimePicker();
     self.closePaletteModelPicker();
@@ -645,6 +682,14 @@ pub fn chooseRuntimeWizardMethod(self: anytype, method: WizardMethod) void {
         },
         .connect => {
             rc.wizard_step = .connect_setup;
+            if (rc.fieldValue(.control_plane_url).len == 0) {
+                fillZ(&rc.control_plane_url_storage, VERDE_CLOUD_URL);
+                rc.control_plane_url_cursor = VERDE_CLOUD_URL.len;
+            }
+            if (rc.fieldValue(.label).len == 0) {
+                fillZ(&rc.label_storage, "Verde Cloud");
+                rc.label_cursor = rc.fieldValue(.label).len;
+            }
             focusWizardField(self, .label);
         },
     }
@@ -720,6 +765,10 @@ pub fn openRuntimePairing(self: anytype, profile_id: []const u8) void {
 
 pub fn cancelRuntimeConnectionWizard(self: anytype) void {
     const rc = &self.runtime_connections;
+    rc.approval.cancel();
+    rc.approval_last_phase = null;
+    rc.nearby.abandon();
+    rc.method_focus = null;
     abandonWizardPairing(self);
     destroyConnectSession(rc, self.allocator);
     rc.wizard_open = false;
@@ -765,6 +814,14 @@ pub fn runtimeConnectionWizardBack(self: anytype) void {
             abandonWizardPairing(self);
             enterPairGrantStep(self, "Pairing canceled. The runtime may still list this device; revoke it there, then mint a new grant.");
         },
+        .approval_wait => {
+            rc.approval.cancel();
+            rc.approval_last_phase = null;
+            rc.wizard_step = .method;
+            rc.wizard_method = .ssh;
+            setNotice(&rc.wizard_notice_storage, "");
+            rc.nearby.start();
+        },
     }
     self.markDirty();
 }
@@ -779,6 +836,7 @@ pub fn submitRuntimeConnectionWizard(self: anytype) void {
         .pair_grant => submitPairGrant(self),
         .pair_confirm => confirmPairing(self),
         .connect_setup => submitConnectSetup(self),
+        .approval_wait => retryNearbyApproval(self),
         .method, .testing => {},
     }
 }
@@ -819,7 +877,7 @@ fn submitEndpointForm(self: anytype) void {
             setWizardProfileId(self, id);
             self.syncPaletteRuntimePicker();
             if (rc.wizard_method == .pair) {
-                enterPairGrantStep(self, "Saved. Enter the one-time grant from `verde-daemon pair create` on the runtime host.");
+                enterPairGrantStep(self, "Saved. Enter the one-time grant from `verde-daemon pair create` on the other machine.");
                 self.markDirty();
                 return;
             }
@@ -867,7 +925,7 @@ fn submitDirectPairForm(self: anytype, service: *RuntimeService) void {
             self.appendRuntimePickerProfile(id) catch {};
             setWizardProfileId(self, id);
             self.syncPaletteRuntimePicker();
-            enterPairGrantStep(self, "HTTPS endpoint saved. Enter the grant ID and masked one-time code from `verde-server pair create`.");
+            enterPairGrantStep(self, "HTTPS endpoint saved. Enter the grant ID and masked one-time code from `verde-daemon pair create`.");
             // The link already carried the grant, code, and device name, so
             // exchange now instead of asking the user to review them again.
             if (validatePairGrantForm(rc) == null) return submitPairGrant(self);
@@ -1108,7 +1166,7 @@ pub fn runtimeConnectionWizardConnect(self: anytype) void {
                 setNotice(&rc.wizard_notice_storage, "Signed out. Local connection authority was cleared.");
             }
         },
-        .method, .form, .pair_grant => {},
+        .method, .form, .pair_grant, .approval_wait => {},
     }
     self.markDirty();
 }
@@ -1255,6 +1313,209 @@ pub fn agentPairingStatus(self: anytype, profile_id: []const u8) AgentPairStatus
 }
 
 // ---------------------------------------------------------------------------
+// Nearby machines: pairing another computer on the tailnet by approval
+// ---------------------------------------------------------------------------
+
+pub fn nearbyMachines(rc: *const State) []const NearbyMachine {
+    return rc.nearby.list();
+}
+
+pub fn rescanNearbyMachines(self: anytype) void {
+    self.runtime_connections.nearby.start();
+    self.markDirty();
+}
+
+/// "Connect" on a nearby row: ask that machine's owner to approve this
+/// computer. Machines with an older Verde fall back to the pairing link form.
+pub fn connectNearbyMachine(self: anytype, index: usize) void {
+    const rc = &self.runtime_connections;
+    if (!rc.wizard_open or rc.wizard_step != .method) return;
+    const machines = rc.nearby.list();
+    if (index >= machines.len) return;
+    const machine = machines[index];
+    rc.method_focus = null;
+    if (!machine.supports_approval) {
+        rc.wizard_method = .pair;
+        rc.wizard_step = .form;
+        fillLocalDeviceLabel(rc);
+        fillZ(&rc.label_storage, machine.name.slice());
+        rc.label_cursor = rc.fieldValue(.label).len;
+        var buffer: [NOTICE_CAPACITY]u8 = undefined;
+        setNotice(&rc.wizard_notice_storage, std.fmt.bufPrint(&buffer, "Update Verde on {s} to connect without a code, or paste a pairing link from it.", .{machine.name.slice()}) catch "");
+        focusWizardField(self, .control_plane_url);
+        self.markDirty();
+        return;
+    }
+    fillLocalDeviceLabel(rc);
+    if (rc.fieldValue(.device_label).len == 0) fillZ(&rc.device_label_storage, "Verde desktop");
+    rc.wizard_method = .pair;
+    rc.wizard_step = .approval_wait;
+    rc.approval_last_phase = null;
+    setNotice(&rc.wizard_notice_storage, "");
+    rc.approval.start(machine, rc.fieldValue(.device_label)) catch |err| {
+        log.warn("nearby pairing request failed to start: {s}", .{@errorName(err)});
+        setApprovalNotice(rc, .failed);
+    };
+    blurWizardField(self);
+    self.markDirty();
+}
+
+/// Primary button on the waiting step after a denial, expiry, or failure.
+fn retryNearbyApproval(self: anytype) void {
+    const rc = &self.runtime_connections;
+    const view = rc.approval.view();
+    if (view) |current| if (current.phase == .sending or current.phase == .waiting or current.phase == .approved) return;
+    const machine = rc.approval.machine;
+    if (machine.https_url.len == 0) return;
+    rc.approval_last_phase = null;
+    setNotice(&rc.wizard_notice_storage, "");
+    rc.approval.start(machine, rc.fieldValue(.device_label)) catch {
+        setApprovalNotice(rc, .failed);
+    };
+    self.markDirty();
+}
+
+/// Whether the waiting step's primary button (Try again) is live.
+pub fn nearbyApprovalRetryable(rc: *const State) bool {
+    const view = rc.approval.view() orelse return rc.approval.machine.https_url.len != 0;
+    return switch (view.phase) {
+        .sending, .waiting, .approved => false,
+        else => rc.approval.finished(),
+    };
+}
+
+pub fn nearbyApprovalView(rc: *const State) ?nearby_pairing.Approval.View {
+    return rc.approval.view();
+}
+
+pub fn nearbyApprovalMachine(rc: *const State) *const NearbyMachine {
+    return &rc.approval.machine;
+}
+
+/// Advances the waiting step. On approval the profile is created, the grant
+/// is exchanged like a pairing link, and the identity the approving machine
+/// reported is trusted without a confirm click: the owner approved this
+/// computer on that machine itself.
+fn pollNearbyApproval(self: anytype) bool {
+    const rc = &self.runtime_connections;
+    const view = rc.approval.view() orelse return false;
+    if (view.phase == .approved) {
+        var grant: nearby_pairing.ApprovedGrant = .{};
+        defer grant.clear();
+        if (!rc.approval.takeGrant(&grant)) return false;
+        finishNearbyApproval(self, &grant);
+        return true;
+    }
+    const changed = rc.approval_last_phase != view.phase;
+    rc.approval_last_phase = view.phase;
+    if (changed and rc.approval.finished()) setApprovalNotice(rc, view.phase);
+    return changed;
+}
+
+fn finishNearbyApproval(self: anytype, grant: *const nearby_pairing.ApprovedGrant) void {
+    const rc = &self.runtime_connections;
+    const machine = rc.approval.machine;
+    const service = self.runtime_service orelse {
+        setNotice(&rc.wizard_notice_storage, "Runtime service is unavailable.");
+        return;
+    };
+    const id = service.createDirectPairedProfile(self.allocator, machine.name.slice(), machine.https_url.slice()) catch |err| {
+        setNotice(&rc.wizard_notice_storage, saveFailureMessage(err));
+        log.warn("nearby paired runtime profile create failed: {s}", .{@errorName(err)});
+        self.markDirty();
+        return;
+    };
+    defer self.allocator.free(id);
+    self.appendRuntimePickerProfile(id) catch {};
+    setWizardProfileId(self, id);
+    self.syncPaletteRuntimePicker();
+    fillZ(&rc.label_storage, machine.name.slice());
+    fillZ(&rc.grant_id_storage, &grant.grant_id);
+    fillZ(&rc.pairing_code_storage, &grant.pairing_token);
+    const runtime_id = grant.runtime_id.slice();
+    @memcpy(rc.agent_expected_runtime_id_storage[0..runtime_id.len], runtime_id);
+    rc.agent_expected_runtime_id_len = runtime_id.len;
+    rc.wizard_mode = .add;
+    enterPairGrantStep(self, "");
+    submitPairGrant(self);
+    if (!rc.pairing_exchange_started) rc.agent_expected_runtime_id_len = 0;
+    self.markDirty();
+}
+
+fn setApprovalNotice(rc: *State, phase: nearby_pairing.ApprovalPhase) void {
+    const name = rc.approval.machine.name.slice();
+    var buffer: [NOTICE_CAPACITY]u8 = undefined;
+    const text: []const u8 = switch (phase) {
+        .sending, .waiting, .approved => "",
+        .denied => std.fmt.bufPrint(&buffer, "{s} declined the request.", .{name}) catch "",
+        .expired => std.fmt.bufPrint(&buffer, "No one approved the request on {s} in time. Try again.", .{name}) catch "",
+        .rate_limited => std.fmt.bufPrint(&buffer, "{s} is limiting pairing requests. Wait a few minutes, then try again.", .{name}) catch "",
+        .refused => std.fmt.bufPrint(&buffer, "{s} can't take requests from this computer. Sign both into the same Tailscale account, or use a pairing link.", .{name}) catch "",
+        .failed => std.fmt.bufPrint(&buffer, "Couldn't reach {s}. Check that it is online with Remote access on, then try again.", .{name}) catch "",
+    };
+    setNotice(&rc.wizard_notice_storage, text);
+}
+
+/// Method-step Tab stops: nearby rows, Refresh, then the method cards in
+/// display order.
+pub fn cycleMethodFocus(self: anytype, backwards: bool) void {
+    const rc = &self.runtime_connections;
+    var stops: [nearby_pairing.MAX_NEARBY + METHOD_DISPLAY_ORDER.len + 1]MethodFocus = undefined;
+    var count: usize = 0;
+    for (0..rc.nearby.list().len) |index| {
+        stops[count] = .{ .nearby = index };
+        count += 1;
+    }
+    stops[count] = .rescan;
+    count += 1;
+    for (METHOD_DISPLAY_ORDER) |method| {
+        stops[count] = .{ .method = method };
+        count += 1;
+    }
+    var position: ?usize = null;
+    if (rc.method_focus) |focus| {
+        for (stops[0..count], 0..) |stop, index| {
+            if (methodFocusEql(stop, focus)) position = index;
+        }
+    }
+    const next = if (position) |index|
+        (if (backwards) (index + count - 1) % count else (index + 1) % count)
+    else if (backwards) count - 1 else 0;
+    rc.method_focus = stops[next];
+    rc.method_focus_visible = true;
+    self.markDirty();
+}
+
+/// Enter/Space on the focused method-step control runs its click action.
+pub fn activateMethodFocus(self: anytype) void {
+    const rc = &self.runtime_connections;
+    const focus = rc.method_focus orelse return;
+    switch (focus) {
+        .nearby => |index| connectNearbyMachine(self, index),
+        .rescan => rescanNearbyMachines(self),
+        .method => |method| chooseRuntimeWizardMethod(self, method),
+    }
+}
+
+pub fn methodFocusEql(a: MethodFocus, b: MethodFocus) bool {
+    return switch (a) {
+        .nearby => |index| b == .nearby and b.nearby == index,
+        .method => |method| b == .method and b.method == method,
+        .rescan => b == .rescan,
+    };
+}
+
+/// Display name for a Connect inventory row: the host's first label
+/// (`richetech` for https://richetech.tail1.ts.net), never ids or hashes.
+pub fn runtimeNameFromUrl(url: []const u8) []const u8 {
+    const without_scheme = if (std.mem.indexOf(u8, url, "://")) |index| url[index + 3 ..] else url;
+    const host_end = std.mem.indexOfAny(u8, without_scheme, ":/") orelse without_scheme.len;
+    const host = without_scheme[0..host_end];
+    const dot = std.mem.indexOfScalar(u8, host, '.') orelse host.len;
+    return if (dot == 0) host else host[0..dot];
+}
+
+// ---------------------------------------------------------------------------
 // Wizard polling: pairing exchange progress and the Connect session
 // ---------------------------------------------------------------------------
 
@@ -1265,6 +1526,8 @@ pub fn pollRuntimeConnectionWizard(self: anytype) bool {
     return switch (rc.wizard_step) {
         .pair_grant => pollPairingExchange(self),
         .connect_setup => pollConnectSession(self),
+        .method => rc.nearby.poll(),
+        .approval_wait => pollNearbyApproval(self),
         else => false,
     };
 }
@@ -1291,7 +1554,7 @@ fn pollPairingExchange(self: anytype) bool {
             return true;
         }
         rc.wizard_step = .pair_confirm;
-        setNotice(&rc.wizard_notice_storage, "Compare both IDs with `verde-daemon identity` on the runtime host before confirming.");
+        setNotice(&rc.wizard_notice_storage, "");
         blurWizardField(self);
         return true;
     }
@@ -2417,4 +2680,15 @@ test "Pair link rejects query secrets duplicates and non-origin hosts" {
         fillZ(&rc.control_plane_url_storage, value);
         try std.testing.expectError(error.InvalidPairLink, importPairLink(&rc));
     }
+}
+
+test "nearby method focus walks rows, refresh, then methods in display order" {
+    try std.testing.expectEqual(WizardMethod.connect, METHOD_DISPLAY_ORDER[0]);
+    try std.testing.expect(WizardMethod.ssh.advanced());
+    try std.testing.expect(std.mem.indexOf(u8, WizardMethod.connect.description(), "later") == null);
+    try std.testing.expect(methodFocusEql(.{ .nearby = 1 }, .{ .nearby = 1 }));
+    try std.testing.expect(!methodFocusEql(.{ .nearby = 1 }, .{ .nearby = 2 }));
+    try std.testing.expect(!methodFocusEql(.{ .method = .pair }, .rescan));
+    try std.testing.expectEqualStrings("richetech", runtimeNameFromUrl("https://richetech.tail1.ts.net"));
+    try std.testing.expectEqualStrings("cloud", runtimeNameFromUrl("https://cloud.verdeai.dev:8443/x"));
 }

@@ -284,6 +284,15 @@ pub const DEFAULT_LOGIN_BLOCK_MS: i64 = 5 * 60 * 1000;
 
 pub const RateLimitDecision = enum { allowed, rate_limited };
 
+/// Approval-pairing submissions are unauthenticated, so every submission
+/// counts against its tailnet node: at most three per five minutes, then a
+/// ten-minute block. The daemon also bounds the pending queue.
+pub const PAIR_REQUEST_RATE_LIMIT: RateLimitOptions = .{
+    .max_failures = 3,
+    .window_ms = 5 * 60 * 1000,
+    .block_ms = 10 * 60 * 1000,
+};
+
 pub const RateLimitOptions = struct {
     max_clients: usize = MAX_RATE_LIMIT_CLIENTS,
     max_failures: u8 = DEFAULT_LOGIN_FAILURES,
@@ -666,6 +675,10 @@ pub const Service = struct {
     connect_rate_limiter: LoginRateLimiter,
     device_rate_limiter: LoginRateLimiter,
     ticket_rate_limiter: LoginRateLimiter,
+    /// Approval-pairing submissions (every one counts) and polls with an
+    /// unknown request id (failures only).
+    pair_request_rate_limiter: LoginRateLimiter = .{ .options = PAIR_REQUEST_RATE_LIMIT },
+    pair_poll_rate_limiter: LoginRateLimiter = .{ .options = .{} },
     pair_credentials: PairCredentialManager,
     paired_clients: @import("paired_clients.zig").Manager = .{},
 
@@ -694,6 +707,8 @@ pub const Service = struct {
 
     pub fn deinit(self: *Service) void {
         self.pair_credentials.deinit();
+        self.pair_poll_rate_limiter.deinit();
+        self.pair_request_rate_limiter.deinit();
         self.ticket_rate_limiter.deinit();
         self.device_rate_limiter.deinit();
         self.connect_rate_limiter.deinit();
@@ -774,6 +789,24 @@ pub const Service = struct {
         now_ms: i64,
     ) !RateLimitDecision {
         return self.device_rate_limiter.recordAttempt(io, client_key, credential_valid, now_ms);
+    }
+
+    pub fn pairRequestPreflight(self: *Service, io: std.Io, client_key: []const u8, now_ms: i64) !RateLimitDecision {
+        return self.pair_request_rate_limiter.preflight(io, client_key, now_ms);
+    }
+
+    /// Count one approval-pairing submission. Successful submissions count
+    /// too: nothing about a request proves the sender is legitimate.
+    pub fn recordPairRequest(self: *Service, io: std.Io, client_key: []const u8, now_ms: i64) !RateLimitDecision {
+        return self.pair_request_rate_limiter.recordAttempt(io, client_key, false, now_ms);
+    }
+
+    pub fn pairPollPreflight(self: *Service, io: std.Io, client_key: []const u8, now_ms: i64) !RateLimitDecision {
+        return self.pair_poll_rate_limiter.preflight(io, client_key, now_ms);
+    }
+
+    pub fn recordPairPollMiss(self: *Service, io: std.Io, client_key: []const u8, now_ms: i64) !RateLimitDecision {
+        return self.pair_poll_rate_limiter.recordAttempt(io, client_key, false, now_ms);
     }
 
     pub fn ticketPreflight(self: *Service, io: std.Io, client_key: []const u8, now_ms: i64) !RateLimitDecision {
@@ -1128,4 +1161,19 @@ test "Pair credentials replace per device without consuming another device capac
     var consumed_b = (try manager.consumeWebSocketTicket(std.testing.io, ticket_b.value[0..], 1_008)).?;
     defer consumed_b.clear();
     try std.testing.expectEqualStrings(device_b, consumed_b.device_id[0..]);
+}
+
+test "approval pairing submissions are limited even when every request is well formed" {
+    var limiter: LoginRateLimiter = .{ .options = PAIR_REQUEST_RATE_LIMIT };
+    defer limiter.deinit();
+    const io = std.testing.io;
+    for (0..PAIR_REQUEST_RATE_LIMIT.max_failures) |index| {
+        const now: i64 = @intCast(1_000 + index);
+        try std.testing.expectEqual(RateLimitDecision.allowed, try limiter.preflight(io, "100.64.0.7", now));
+        _ = try limiter.recordAttempt(io, "100.64.0.7", false, now);
+    }
+    try std.testing.expectEqual(RateLimitDecision.rate_limited, try limiter.preflight(io, "100.64.0.7", 2_000));
+    // Other tailnet nodes are unaffected; the block lifts after block_ms.
+    try std.testing.expectEqual(RateLimitDecision.allowed, try limiter.preflight(io, "100.64.0.8", 2_000));
+    try std.testing.expectEqual(RateLimitDecision.allowed, try limiter.preflight(io, "100.64.0.7", 1_002 + PAIR_REQUEST_RATE_LIMIT.block_ms));
 }

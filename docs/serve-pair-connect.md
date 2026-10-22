@@ -600,3 +600,48 @@ The gateway persists a system notice in the chat transcript. Notices for
 turn starts use a stable message identity so retries do not duplicate them.
 The Chat preset itself lacks terminal-write authority, so shell requests
 are scope-denied before cap enforcement. Owner requests are unchanged.
+
+## Pairing by approval
+
+A computer on the same tailnet can pair without a code: the owner approves it
+on the machine being reached. Runtimes that support it advertise
+`access.pair.request.v1` in `/.well-known/verde-runtime`.
+
+Requester (Add connection → Nearby machines): the desktop reads tailnet peers
+from the local Tailscale LocalAPI (`/localapi/v0/status`), probes each online
+peer at `https://<magicdns>/.well-known/verde-runtime` (port 443, then 8443),
+and lists Verde machines. **Connect** generates a random 32-hex `request_id`
+and sends:
+
+```text
+POST /auth/pair/request          {"access_protocol_version":1,"request_id":"<32-hex>","device_label":"lightning"}
+→ 202 {"access_protocol_version":1,"status":"pending","match_code":"4F2K","expires_at_ms":…}
+POST /auth/pair/request/status   {"access_protocol_version":1,"request_id":"<32-hex>"}
+→ 200 {"status":"pending"|"denied"|"expired","match_code":"4F2K","expires_at_ms":…}
+→ 200 {"status":"approved",…,"runtime_id","instance_id","grant_id","pairing_token","preset"}   (once)
+```
+
+The approved reply carries a one-time pairing grant (two-minute TTL) minted
+exactly as `verde-daemon pair create --preset <chosen>` would. The requester
+exchanges it through the ordinary `POST /auth/pair/exchange` with a fresh
+`client_nonce`, stores the device credential by reference, and pins the
+returned identity without a confirm click when it matches the `runtime_id`
+in the approval. Later polls for the same id report `expired`.
+
+Gateway rules: both endpoints exist only in trusted-proxy (Tailscale Serve)
+mode and require the exact Serve envelope plus exactly one valid
+`Tailscale-User-Login`; loopback/SSH requests get `403 tailscale_serve_required`,
+tagged nodes `403 tailscale_identity_required`. Every submission counts against
+its tailnet address (3 per 5 minutes, then a 10-minute block); status polls
+with unknown ids are failure-limited. Polls are bound to the submitting login
+and tailnet address. The daemon keeps at most 8 pending requests (2 per
+login) in memory, expires them after 2 minutes, and drops them on restart.
+
+Owner (the machine being reached): the daemon publishes a `notification`
+change with resource id `access.pairing.requests`; the desktop reads
+`daemon.access.pairing.request.list` (also at startup) and shows "lightning
+(j.riche64@) wants to connect · Allow / Deny" with the permission preset
+(default Full) and the same match code. `daemon.access.pairing.request.decide`
+`{request_id, allow, preset}` answers it; Escape or Deny fails the request.
+The four `daemon.access.pairing.request.*` methods are private-socket only
+and blocked from every gateway forwarding surface.

@@ -34,6 +34,8 @@ test {
     _ = @import("state/side_panel_controller.zig");
     _ = @import("state/muse_tui.zig");
     _ = @import("state/runtime_connections_controller.zig");
+    _ = @import("state/nearby_pairing.zig");
+    _ = @import("state/pairing_approvals.zig");
     _ = @import("state/workspace_layout.zig");
     _ = @import("state/file_viewer_controller.zig");
     _ = @import("state/file_explorer.zig");

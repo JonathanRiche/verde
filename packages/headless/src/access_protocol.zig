@@ -37,6 +37,30 @@ pub const SECRET_HEX_BYTES: usize = SECRET_BYTES * 2;
 pub const REDACTED_SECRET: []const u8 = "[REDACTED]";
 pub const MAX_PAIR_EXCHANGE_BODY_BYTES: usize = 4 * 1024;
 
+// Pairing by approval (no codes): a tailnet peer asks, the owner allows it on
+// this machine, and the requester receives one short-lived pairing grant that
+// it exchanges through the ordinary `/auth/pair/exchange` path.
+pub const HTTP_PAIR_REQUEST_PATH: []const u8 = "/auth/pair/request";
+pub const HTTP_PAIR_REQUEST_STATUS_PATH: []const u8 = "/auth/pair/request/status";
+pub const PAIR_REQUEST_CAPABILITY: []const u8 = "access.pair.request.v1";
+/// Unanswered requests expire after two minutes.
+pub const PAIR_REQUEST_TTL_MS: i64 = 2 * 60 * 1000;
+/// Lifetime of the one-time grant an approval hands to the requester.
+pub const PAIR_REQUEST_GRANT_TTL_SECONDS: u32 = 2 * 60;
+/// Bounded owner queue: total pending requests, and per requesting identity.
+pub const MAX_PENDING_PAIR_REQUESTS: usize = 8;
+pub const MAX_PENDING_PAIR_REQUESTS_PER_REQUESTER: usize = 2;
+pub const MAX_REQUESTER_LOGIN_BYTES: usize = 256;
+pub const MAX_REQUESTER_ADDRESS_BYTES: usize = 64;
+pub const MAX_PAIR_REQUEST_BODY_BYTES: usize = 1024;
+/// Short code shown on both screens so the user can match the two prompts.
+pub const PAIR_MATCH_CODE_LEN: usize = 4;
+/// No 0/O, 1/I/L: the code is read from one screen and compared on another.
+pub const PAIR_MATCH_CODE_ALPHABET: []const u8 = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
+/// `core.changes` resource id (topic `notification`) published whenever the
+/// pending pairing request set changes, so the desktop re-reads the list.
+pub const PAIRING_REQUEST_CHANGE_RESOURCE: []const u8 = "access.pairing.requests";
+
 // Owner-only daemon RPCs. They are intentionally not remotely callable even
 // when the runtime advertises the complete Pair transport capability.
 pub const METHOD_DAEMON_PAIRING_GRANT_CREATE: []const u8 = "daemon.access.pairing.create";
@@ -55,6 +79,12 @@ pub const METHOD_DAEMON_DEVICE_REVOKE: []const u8 = "daemon.access.device.revoke
 pub const METHOD_DAEMON_PAIRING_EXCHANGE: []const u8 = "daemon.access.pairing.exchange";
 pub const METHOD_DAEMON_DEVICE_AUTHENTICATE: []const u8 = "daemon.access.device.authenticate";
 pub const METHOD_DAEMON_DEVICE_AUTHORIZE: []const u8 = "daemon.access.device.authorize";
+// Gateway-only approval-pairing bridge RPCs (blocked from generic forwarding).
+pub const METHOD_DAEMON_PAIRING_REQUEST_SUBMIT: []const u8 = "daemon.access.pairing.request.submit";
+pub const METHOD_DAEMON_PAIRING_REQUEST_POLL: []const u8 = "daemon.access.pairing.request.poll";
+// Owner-only approval RPCs used by the desktop on the runtime machine.
+pub const METHOD_DAEMON_PAIRING_REQUEST_LIST: []const u8 = "daemon.access.pairing.request.list";
+pub const METHOD_DAEMON_PAIRING_REQUEST_DECIDE: []const u8 = "daemon.access.pairing.request.decide";
 
 /// Secret-bearing protocol value whose default JSON representation is always
 /// redacted. A transport must deliberately call `reveal` and write the one
@@ -582,6 +612,168 @@ pub const RuntimeEndpointMetadata = struct {
     capabilities: []const []const u8,
 };
 
+pub const PairingRequestStatus = enum { pending, approved, denied, expired };
+
+/// Requester body for `POST /auth/pair/request`. The requester generates the
+/// random `request_id` (canonical 32-hex) and keeps it private: it is the
+/// handle used to poll for the decision.
+pub const PairingRequestHttpRequest = struct {
+    access_protocol_version: u32,
+    request_id: []const u8,
+    device_label: []const u8,
+};
+
+/// Requester body for `POST /auth/pair/request/status`. A POST body keeps the
+/// request id out of URLs and access logs.
+pub const PairingRequestPollHttpRequest = struct {
+    access_protocol_version: u32,
+    request_id: []const u8,
+};
+
+pub fn parsePairingRequestHttpRequest(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+) !std.json.Parsed(PairingRequestHttpRequest) {
+    if (body.len > MAX_PAIR_REQUEST_BODY_BYTES) return error.PairRequestBodyTooLarge;
+    var parsed = try std.json.parseFromSlice(PairingRequestHttpRequest, allocator, body, .{});
+    errdefer parsed.deinit();
+    if (parsed.value.access_protocol_version != ACCESS_PROTOCOL_VERSION) return error.IncompatibleAccessProtocol;
+    try validatePairRequestId(parsed.value.request_id);
+    try validateDeviceLabel(parsed.value.device_label);
+    return parsed;
+}
+
+pub fn parsePairingRequestPollHttpRequest(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+) !std.json.Parsed(PairingRequestPollHttpRequest) {
+    if (body.len > MAX_PAIR_REQUEST_BODY_BYTES) return error.PairRequestBodyTooLarge;
+    var parsed = try std.json.parseFromSlice(PairingRequestPollHttpRequest, allocator, body, .{});
+    errdefer parsed.deinit();
+    if (parsed.value.access_protocol_version != ACCESS_PROTOCOL_VERSION) return error.IncompatibleAccessProtocol;
+    try validatePairRequestId(parsed.value.request_id);
+    return parsed;
+}
+
+/// Gateway → daemon. The requester identity comes only from the Tailscale
+/// Serve envelope the gateway verified, never from the request body.
+pub const PairingRequestSubmitRequest = struct {
+    access_protocol_version: u32,
+    request_id: []const u8,
+    device_label: []const u8,
+    requester_login: []const u8,
+    requester_name: ?[]const u8 = null,
+    requester_address: []const u8,
+};
+
+pub const PairingRequestSubmitResult = struct {
+    access_protocol_version: u32,
+    status: PairingRequestStatus,
+    match_code: []const u8,
+    expires_at_ms: i64,
+};
+
+/// Gateway → daemon. Polls are bound to the identity and tailnet address that
+/// submitted the request; a mismatch is indistinguishable from an unknown id.
+pub const PairingRequestPollRequest = struct {
+    access_protocol_version: u32,
+    request_id: []const u8,
+    requester_login: []const u8,
+    requester_address: []const u8,
+};
+
+/// `approved` carries the one-time grant exactly once; later polls report
+/// `expired`. The grant is exchanged through `/auth/pair/exchange`.
+pub const PairingRequestPollResult = struct {
+    access_protocol_version: u32,
+    status: PairingRequestStatus,
+    match_code: []const u8,
+    expires_at_ms: i64,
+    runtime_id: ?[]const u8 = null,
+    instance_id: ?[]const u8 = null,
+    grant_id: ?[]const u8 = null,
+    pairing_token: ?Secret = null,
+    preset: ?PairingPreset = null,
+};
+
+pub const PairingRequestListRequest = struct {
+    access_protocol_version: u32,
+};
+
+/// Owner view of one request. Never contains grant material.
+pub const PairingRequestRecord = struct {
+    request_id: []const u8,
+    device_label: []const u8,
+    requester_login: []const u8,
+    requester_name: ?[]const u8 = null,
+    match_code: []const u8,
+    created_at_ms: i64,
+    expires_at_ms: i64,
+    status: PairingRequestStatus,
+};
+
+pub const PairingRequestListResult = struct {
+    access_protocol_version: u32,
+    now_ms: i64,
+    requests: []const PairingRequestRecord,
+};
+
+pub const PairingRequestDecideRequest = struct {
+    access_protocol_version: u32,
+    request_id: []const u8,
+    allow: bool,
+    preset: PairingPreset = .full,
+};
+
+pub const PairingRequestDecideResult = struct {
+    access_protocol_version: u32,
+    request_id: []const u8,
+    status: PairingRequestStatus,
+};
+
+/// Request ids are 16 random bytes in canonical lowercase hex.
+pub fn validatePairRequestId(value: []const u8) !void {
+    if (!isCanonicalLowerHex(value, GRANT_ID_HEX_BYTES)) return error.InvalidPairRequestId;
+}
+
+/// Tailscale login names (`user@example.com`, `name@github`): printable ASCII
+/// without spaces, bounded.
+pub fn validateRequesterLogin(value: []const u8) !void {
+    if (value.len == 0 or value.len > MAX_REQUESTER_LOGIN_BYTES) return error.InvalidRequesterLogin;
+    for (value) |byte| {
+        if (byte <= 0x20 or byte >= 0x7f) return error.InvalidRequesterLogin;
+    }
+}
+
+pub fn validateMatchCode(value: []const u8) !void {
+    if (value.len != PAIR_MATCH_CODE_LEN) return error.InvalidMatchCode;
+    for (value) |byte| {
+        if (std.mem.indexOfScalar(u8, PAIR_MATCH_CODE_ALPHABET, byte) == null) return error.InvalidMatchCode;
+    }
+}
+
+/// Map uniformly random bytes onto the match-code alphabet (rejection
+/// sampling keeps every symbol equally likely). Returns false when the input
+/// ran out before every symbol was filled.
+pub fn matchCodeFromRandom(random_bytes: []const u8, out: *[PAIR_MATCH_CODE_LEN]u8) bool {
+    const alphabet_len: u16 = PAIR_MATCH_CODE_ALPHABET.len;
+    const limit: u16 = 256 - (256 % alphabet_len);
+    var filled: usize = 0;
+    for (random_bytes) |byte| {
+        if (filled == out.len) break;
+        if (byte >= limit) continue;
+        out[filled] = PAIR_MATCH_CODE_ALPHABET[byte % alphabet_len];
+        filled += 1;
+    }
+    return filled == out.len;
+}
+
+/// Short requester tag for prompts: `j.riche64@example.com` → `j.riche64@`.
+pub fn requesterLoginShort(login: []const u8) []const u8 {
+    const at = std.mem.indexOfScalar(u8, login, '@') orelse return login;
+    return login[0 .. at + 1];
+}
+
 pub const DeviceRecord = struct {
     preset: ?PairingPreset = null,
     max_access_mode: ?AccessMode = null,
@@ -872,4 +1064,40 @@ test "P2 daemon RPC mappings require their exact scopes and desktop methods stay
         "config.ui.set",     "web.directory.list",
         "config.commit.set", "config.favoriteModel.set",
     }) |method| try std.testing.expect(requiredScopeMaskForRpc(method) == null);
+}
+
+test "approval pairing DTOs parse strictly and validate identities" {
+    const allocator = std.testing.allocator;
+    var parsed = try parsePairingRequestHttpRequest(allocator,
+        \\{"access_protocol_version":1,"request_id":"0123456789abcdef0123456789abcdef","device_label":"lightning"}
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("lightning", parsed.value.device_label);
+    try std.testing.expectError(error.UnknownField, parsePairingRequestHttpRequest(allocator,
+        \\{"access_protocol_version":1,"request_id":"0123456789abcdef0123456789abcdef","device_label":"x","requester_login":"forged@example.com"}
+    ));
+    try std.testing.expectError(error.InvalidPairRequestId, parsePairingRequestHttpRequest(allocator,
+        \\{"access_protocol_version":1,"request_id":"0123456789ABCDEF0123456789ABCDEF","device_label":"x"}
+    ));
+    try std.testing.expectError(error.IncompatibleAccessProtocol, parsePairingRequestPollHttpRequest(allocator,
+        \\{"access_protocol_version":2,"request_id":"0123456789abcdef0123456789abcdef"}
+    ));
+    try validateRequesterLogin("j.riche64@gmail.com");
+    try std.testing.expectError(error.InvalidRequesterLogin, validateRequesterLogin(""));
+    try std.testing.expectError(error.InvalidRequesterLogin, validateRequesterLogin("a b@c"));
+    try std.testing.expectEqualStrings("j.riche64@", requesterLoginShort("j.riche64@gmail.com"));
+    try std.testing.expectEqualStrings("tagged-device", requesterLoginShort("tagged-device"));
+    try std.testing.expect(requiredScopeMaskForRpc(METHOD_DAEMON_PAIRING_REQUEST_DECIDE) == null);
+    try std.testing.expect(requiredScopeMaskForRpc(METHOD_DAEMON_PAIRING_REQUEST_POLL) == null);
+}
+
+test "match codes use the unambiguous alphabet without modulo bias" {
+    var code: [PAIR_MATCH_CODE_LEN]u8 = undefined;
+    // 248..255 are rejected for the 31-symbol alphabet; the rest map in order.
+    try std.testing.expect(matchCodeFromRandom(&.{ 255, 0, 250, 1, 30, 31 }, &code));
+    try std.testing.expectEqualStrings("23Z2", &code);
+    try validateMatchCode(&code);
+    try std.testing.expect(!matchCodeFromRandom(&.{ 255, 254, 0 }, &code));
+    try std.testing.expectError(error.InvalidMatchCode, validateMatchCode("4F0K"));
+    try std.testing.expectError(error.InvalidMatchCode, validateMatchCode("4F2"));
 }

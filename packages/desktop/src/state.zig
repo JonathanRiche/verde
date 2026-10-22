@@ -82,6 +82,7 @@ const handoff_controller = @import("state/handoff_controller.zig");
 const settings_controller = @import("state/settings_controller.zig");
 const muse_tui = @import("state/muse_tui.zig");
 const runtime_connections_controller = @import("state/runtime_connections_controller.zig");
+const pairing_approvals = @import("state/pairing_approvals.zig");
 const surface_controller = @import("state/surface_controller.zig");
 const terminal_controller = @import("state/terminal_controller.zig");
 const transcript_controller = @import("state/transcript_controller.zig");
@@ -559,6 +560,7 @@ fn pollCoreChangesOnce(storage: *const Storage, loop: *ChangeCursorLoopState, cu
     var signals: ChangeCursorSignals = .{};
     for (result.entries) |entry| {
         signals.merge(changeCursorSignalsForTopic(entry.topic));
+        if (pairing_approvals.isChangeEntry(entry.topic, entry.resource_id)) pairing_approvals.signalChanged();
     }
     var fetch_reason: []const u8 = "";
     const refresh = (if (durable_changed)
@@ -2319,6 +2321,13 @@ pub const PaletteModalAction = enum {
     runtime_wizard_method,
     /// index = Connect inventory row.
     runtime_wizard_select,
+    /// index = nearby machine row on the method step.
+    runtime_wizard_nearby,
+    runtime_wizard_rescan,
+    pairing_approval_allow,
+    pairing_approval_deny,
+    /// index = `pairing_approvals.PRESETS` position.
+    pairing_approval_preset,
     modal_dismiss,
     modal_block,
     project_rename_input,
@@ -5041,6 +5050,8 @@ pub const AppState = struct {
     settings_controller: settings_controller.State,
     /// Settings › Runtimes & connections card and SSH wizard state.
     runtime_connections: runtime_connections_controller.State = .{},
+    /// "<device> wants to connect · Allow / Deny" prompts for this machine.
+    pairing_approvals: pairing_approvals.State = .{},
     /// Browser "Import cookies…" flow (per-site, agent-safety gated).
     cookie_import: cookie_import_controller.State = .{},
     git_changes: git_changes_controller.State = .{},
@@ -6163,17 +6174,18 @@ pub const AppState = struct {
     /// Advances bounded connection state on the SDL owner thread and reports
     /// only status changes that can alter picker rendering.
     pub fn pollRuntimeService(self: *AppState, now_ms: u64) bool {
-        const service = self.runtime_service orelse return false;
+        const approvals_changed = self.pairing_approvals.poll(self.storage.pref_path, platform_runtime.unixTimestampMs());
+        const service = self.runtime_service orelse return approvals_changed;
         service.poll(now_ms) catch |err| {
             if (!self.runtime_poll_failure_logged) {
                 log.warn("remote runtime service poll failed: {s}", .{@errorName(err)});
                 self.runtime_poll_failure_logged = true;
             }
-            return false;
+            return approvals_changed;
         };
         self.runtime_poll_failure_logged = false;
 
-        var changed = false;
+        var changed = approvals_changed;
         for (self.runtime_picker_profiles.items) |*configured| {
             const next_status = if (service.snapshot(configured.profile_id)) |snapshot|
                 runtimePickerStatus(snapshot)
@@ -8689,6 +8701,16 @@ pub const AppState = struct {
     pub const openRuntimeConnectionEditor = runtime_connections_controller.openRuntimeConnectionEditor;
     pub const openRuntimePairing = runtime_connections_controller.openRuntimePairing;
     pub const chooseRuntimeWizardMethod = runtime_connections_controller.chooseRuntimeWizardMethod;
+    pub const connectNearbyMachine = runtime_connections_controller.connectNearbyMachine;
+    pub const rescanNearbyMachines = runtime_connections_controller.rescanNearbyMachines;
+    pub const cycleRuntimeWizardMethodFocus = runtime_connections_controller.cycleMethodFocus;
+    pub const activateRuntimeWizardMethodFocus = runtime_connections_controller.activateMethodFocus;
+
+    /// Allow or Deny the visible pairing request on this machine.
+    pub fn decidePairingApproval(self: *AppState, allow: bool) void {
+        self.pairing_approvals.decide(self.storage.pref_path, allow);
+        self.markDirty();
+    }
     pub const selectRuntimeWizardConnectRuntime = runtime_connections_controller.selectRuntimeWizardConnectRuntime;
     pub const cancelRuntimeConnectionWizard = runtime_connections_controller.cancelRuntimeConnectionWizard;
     pub const runtimeConnectionWizardBack = runtime_connections_controller.runtimeConnectionWizardBack;
@@ -15611,6 +15633,11 @@ pub const AppState = struct {
                 .runtime_wizard_done,
                 .runtime_wizard_method,
                 .runtime_wizard_select,
+                .runtime_wizard_nearby,
+                .runtime_wizard_rescan,
+                .pairing_approval_allow,
+                .pairing_approval_deny,
+                .pairing_approval_preset,
                 .settings_control,
                 .settings_category,
                 .settings_open_option,
@@ -16810,6 +16837,7 @@ pub const AppState = struct {
 
     pub fn deinit(self: *AppState) void {
         runtime_log.diagnostic("AppState.deinit begin", .{});
+        self.pairing_approvals.deinit();
         self.folder_browser.deinit(self.allocator);
         self.settings_controller.provider_setup.deinit(self.allocator);
         self.clearPaletteHistory();

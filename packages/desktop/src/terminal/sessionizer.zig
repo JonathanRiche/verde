@@ -26,6 +26,7 @@ const git_changes_protocol = headless.git_changes_protocol;
 const workspace_folders = @import("../workspace/folders.zig");
 const browser_cookie_import = @import("../daemon/browser_cookie_import.zig");
 const access_store = @import("../daemon/access_store.zig");
+const pairing_requests = @import("../daemon/pairing_requests.zig");
 const connect_auth = @import("../daemon/connect_auth.zig");
 const connect_client = @import("../daemon/connect_client.zig");
 const connect_grants = @import("../daemon/connect_grants.zig");
@@ -2558,6 +2559,12 @@ pub const Daemon = struct {
     /// and store service mutex → journal_mutex; the journal path never takes
     /// another lock, so no cycle is possible.
     journal_mutex: ParkingMutex = .{},
+    /// Approval-pairing requests from tailnet peers (in memory, bounded).
+    /// Leaf lock, except that an approval holds it while it mints the grant
+    /// under the store mutex: pairing_requests_mutex → store service mutex.
+    /// Nothing takes it while holding the store or daemon locks.
+    pairing_requests: pairing_requests.Queue = .{},
+    pairing_requests_mutex: ParkingMutex = .{},
     /// M5-P3 long-poll park state. `changes_signal` is a futex word bumped by
     /// every journal append (after the leaf lock is RELEASED) and by drain;
     /// parked `core.changes` waiters sleep on it holding NO locks. The
@@ -2635,6 +2642,7 @@ pub const Daemon = struct {
         self.registry_jobs.deinit(self.allocator);
         self.registry.deinit(self.allocator);
         self.journal.deinit(self.allocator);
+        self.pairing_requests.deinit();
     }
 
     fn pollSessions(self: *Daemon) void {
@@ -3062,6 +3070,7 @@ pub const Daemon = struct {
         if (std.mem.eql(u8, method, "chat.subagent.open")) return try self.chatSubagentOpenResponse(id_value, params);
         if (isStoreMethod(method)) return try self.handleStoreRequest(id_value, method, params);
         if (isPushMethod(method)) return try self.handlePushRequest(id_value, method, params);
+        if (isPairingRequestMethod(method)) return try self.handlePairingRequest(id_value, method, params);
         if (isAccessMethod(method)) return try self.handleAccessRequest(id_value, method, params);
         if (isConnectMethod(method)) return try self.handleConnectRequest(id_value, method, params);
         // chat.turn.start owns its drain check under lockDaemon (unlocked serve
@@ -3838,6 +3847,150 @@ pub const Daemon = struct {
                 break :response try okValueResponse(self.allocator, id_value, result);
             },
         };
+    }
+
+    /// Pairing by approval. The gateway submits and polls on behalf of a
+    /// tailnet peer (identity from the verified Tailscale Serve envelope);
+    /// the owner's desktop lists and decides. Allow mints the same one-time
+    /// pairing grant `pair create` would, handed to the requester once.
+    fn handlePairingRequest(
+        self: *Daemon,
+        id_value: std.json.Value,
+        method: []const u8,
+        params: std.json.Value,
+    ) ![]u8 {
+        var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const invalid = "invalid pairing request params";
+        if (std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_PAIRING_REQUEST_LIST)) {
+            const request = std.json.parseFromValueLeaky(access_protocol.PairingRequestListRequest, arena, params, .{}) catch
+                return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, invalid);
+            if (request.access_protocol_version != access_protocol.ACCESS_PROTOCOL_VERSION) return try pairingRequestIncompatible(self.allocator, id_value);
+            const now_ms = nowMs();
+            self.pairing_requests_mutex.lock();
+            defer self.pairing_requests_mutex.unlock();
+            var records: [access_protocol.MAX_PENDING_PAIR_REQUESTS]access_protocol.PairingRequestRecord = undefined;
+            const count = self.pairing_requests.pending(now_ms, &records);
+            return try okValueResponse(self.allocator, id_value, access_protocol.PairingRequestListResult{
+                .access_protocol_version = access_protocol.ACCESS_PROTOCOL_VERSION,
+                .now_ms = now_ms,
+                .requests = records[0..count],
+            });
+        }
+        if (std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_PAIRING_REQUEST_SUBMIT)) {
+            const request = std.json.parseFromValueLeaky(access_protocol.PairingRequestSubmitRequest, arena, params, .{}) catch
+                return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, invalid);
+            if (request.access_protocol_version != access_protocol.ACCESS_PROTOCOL_VERSION) return try pairingRequestIncompatible(self.allocator, id_value);
+            if (!self.pairingRequestsAccepting()) return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_STATE, "daemon is not accepting pairing requests");
+            var code: [access_protocol.PAIR_MATCH_CODE_LEN]u8 = undefined;
+            var threaded = std.Io.Threaded.init_single_threaded;
+            var random: [32]u8 = undefined;
+            while (true) {
+                std.Io.randomSecure(threaded.io(), &random) catch
+                    return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INTERNAL, "secure randomness unavailable");
+                if (access_protocol.matchCodeFromRandom(&random, &code)) break;
+            }
+            const now_ms = nowMs();
+            var result: access_protocol.PairingRequestSubmitResult = undefined;
+            var created = false;
+            {
+                self.pairing_requests_mutex.lock();
+                defer self.pairing_requests_mutex.unlock();
+                const submitted = self.pairing_requests.submit(request, code, now_ms) catch |err|
+                    return try pairingRequestErrorResponse(self.allocator, id_value, err);
+                const entry = submitted.entry;
+                created = submitted.created;
+                result = .{
+                    .access_protocol_version = access_protocol.ACCESS_PROTOCOL_VERSION,
+                    .status = entry.state.wire(),
+                    .match_code = try arena.dupe(u8, &entry.match_code),
+                    .expires_at_ms = entry.expires_at_ms,
+                };
+            }
+            if (created) self.publishPairingRequestsChanged();
+            return try okValueResponse(self.allocator, id_value, result);
+        }
+        if (std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_PAIRING_REQUEST_POLL)) {
+            const request = std.json.parseFromValueLeaky(access_protocol.PairingRequestPollRequest, arena, params, .{}) catch
+                return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, invalid);
+            if (request.access_protocol_version != access_protocol.ACCESS_PROTOCOL_VERSION) return try pairingRequestIncompatible(self.allocator, id_value);
+            var outcome = outcome: {
+                self.pairing_requests_mutex.lock();
+                defer self.pairing_requests_mutex.unlock();
+                break :outcome self.pairing_requests.poll(request.request_id, request.requester_login, request.requester_address, nowMs());
+            };
+            switch (outcome) {
+                .unknown => return try errorResponseAlloc(self.allocator, id_value, "unknown_pairing_request", "unknown pairing request"),
+                .waiting => |waiting| return try okValueResponse(self.allocator, id_value, access_protocol.PairingRequestPollResult{
+                    .access_protocol_version = access_protocol.ACCESS_PROTOCOL_VERSION,
+                    .status = waiting.state.wire(),
+                    .match_code = try arena.dupe(u8, &waiting.match_code),
+                    .expires_at_ms = waiting.expires_at_ms,
+                }),
+                .approved => |*delivered| {
+                    defer delivered.clear();
+                    return try pairingRequestApprovedResponse(self.allocator, id_value, self.runtime_id, self.instance_id, delivered);
+                },
+            }
+        }
+        // METHOD_DAEMON_PAIRING_REQUEST_DECIDE
+        const request = std.json.parseFromValueLeaky(access_protocol.PairingRequestDecideRequest, arena, params, .{}) catch
+            return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, invalid);
+        if (request.access_protocol_version != access_protocol.ACCESS_PROTOCOL_VERSION) return try pairingRequestIncompatible(self.allocator, id_value);
+        const status: access_protocol.PairingRequestStatus = status: {
+            self.pairing_requests_mutex.lock();
+            defer self.pairing_requests_mutex.unlock();
+            const now_ms = nowMs();
+            if (!request.allow) {
+                self.pairing_requests.deny(request.request_id, now_ms) catch |err|
+                    return try pairingRequestErrorResponse(self.allocator, id_value, err);
+                break :status .denied;
+            }
+            const entry = self.pairing_requests.pendingEntry(request.request_id, now_ms) catch |err|
+                return try pairingRequestErrorResponse(self.allocator, id_value, err);
+            // Same store choreography as handleAccessRequest.
+            lockDaemon(self);
+            if (!self.accepting_mutations or self.store_service == null or self.store_service.?.draining) {
+                self.mutex.unlock();
+                return try errorResponseAlloc(self.allocator, id_value, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "store capability is unavailable");
+            }
+            const service = self.store_service.?;
+            _ = service.in_flight.fetchAdd(1, .monotonic);
+            self.mutex.unlock();
+            defer _ = service.in_flight.fetchSub(1, .monotonic);
+            lockStoreService(service);
+            defer service.mutex.unlock();
+            var threaded = std.Io.Threaded.init_single_threaded;
+            var issued = access_store.createPairingGrant(threaded.io(), service.store.conn, .{
+                .access_protocol_version = access_protocol.ACCESS_PROTOCOL_VERSION,
+                .label = entry.device_label.slice(),
+                .ttl_seconds = access_protocol.PAIR_REQUEST_GRANT_TTL_SECONDS,
+                .preset = request.preset,
+            }, now_ms) catch |err| return try accessAdminErrorResponse(self.allocator, id_value, err);
+            defer issued.clear();
+            pairing_requests.Queue.completeApproval(entry, &issued.grant_id, &issued.pairing_token, request.preset, issued.expires_at_ms);
+            break :status .approved;
+        };
+        self.publishPairingRequestsChanged();
+        return try okValueResponse(self.allocator, id_value, access_protocol.PairingRequestDecideResult{
+            .access_protocol_version = access_protocol.ACCESS_PROTOCOL_VERSION,
+            .request_id = request.request_id,
+            .status = status,
+        });
+    }
+
+    fn pairingRequestsAccepting(self: *Daemon) bool {
+        lockDaemon(self);
+        defer self.mutex.unlock();
+        return self.accepting_mutations;
+    }
+
+    /// Tell `core.changes` clients (the desktop prompt) to re-read the list.
+    fn publishPairingRequestsChanged(self: *Daemon) void {
+        lockDaemon(self);
+        defer self.mutex.unlock();
+        self.bumpRegistryRevision(.{ .topic = .notification, .resource_id = access_protocol.PAIRING_REQUEST_CHANGE_RESOURCE });
     }
 
     fn methodMutatesState(method: []const u8) bool {
@@ -12942,6 +13095,69 @@ fn storeErrorResponse(
     return try errorResponseAllocWithData(allocator, id_value, mapped.code, mapped.message, null);
 }
 
+fn isPairingRequestMethod(method: []const u8) bool {
+    return std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_PAIRING_REQUEST_SUBMIT) or
+        std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_PAIRING_REQUEST_POLL) or
+        std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_PAIRING_REQUEST_LIST) or
+        std.mem.eql(u8, method, access_protocol.METHOD_DAEMON_PAIRING_REQUEST_DECIDE);
+}
+
+fn pairingRequestIncompatible(allocator: std.mem.Allocator, id_value: std.json.Value) ![]u8 {
+    return errorResponseAlloc(allocator, id_value, headless.protocol.ERR_PROTOCOL_INCOMPATIBLE, "access protocol version is incompatible");
+}
+
+fn pairingRequestErrorResponse(allocator: std.mem.Allocator, id_value: std.json.Value, err: pairing_requests.Error) ![]u8 {
+    return switch (err) {
+        error.InvalidPairRequest => errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "invalid pairing request"),
+        error.DuplicatePairRequest => errorResponseAlloc(allocator, id_value, "duplicate_pairing_request", "pairing request id already in use"),
+        error.PairRequestQueueFull => errorResponseAlloc(allocator, id_value, "pairing_request_queue_full", "too many pending pairing requests"),
+        error.TooManyPairRequests => errorResponseAlloc(allocator, id_value, "too_many_pairing_requests", "this requester already has pending pairing requests"),
+        error.UnknownPairRequest => errorResponseAlloc(allocator, id_value, "unknown_pairing_request", "unknown pairing request"),
+        error.PairRequestNotPending => errorResponseAlloc(allocator, id_value, "pairing_request_not_pending", "pairing request was already decided or expired"),
+    };
+}
+
+/// The only daemon response that reveals an approval's one-time grant secret.
+/// The gateway clears the returned IPC buffer after writing it.
+fn pairingRequestApprovedResponse(
+    allocator: std.mem.Allocator,
+    id_value: std.json.Value,
+    runtime_id: []const u8,
+    instance_id: []const u8,
+    delivered: *const pairing_requests.Delivered,
+) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer {
+        std.crypto.secureZero(u8, writer.written());
+        writer.deinit();
+    }
+    var json: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try beginOk(&json, id_value);
+    try json.objectField("result");
+    try json.beginObject();
+    try json.objectField("access_protocol_version");
+    try json.write(access_protocol.ACCESS_PROTOCOL_VERSION);
+    try json.objectField("status");
+    try json.write(access_protocol.PairingRequestStatus.approved);
+    try json.objectField("match_code");
+    try json.write(delivered.match_code[0..]);
+    try json.objectField("expires_at_ms");
+    try json.write(delivered.expires_at_ms);
+    try json.objectField("runtime_id");
+    try json.write(runtime_id);
+    try json.objectField("instance_id");
+    try json.write(instance_id);
+    try json.objectField("grant_id");
+    try json.write(delivered.grant_id[0..]);
+    try json.objectField("pairing_token");
+    try json.write(delivered.pairing_token[0..]);
+    try json.objectField("preset");
+    try json.write(delivered.preset);
+    try json.endObject();
+    try json.endObject();
+    return try writer.toOwnedSlice();
+}
+
 fn decodeAccessRequest(
     allocator: std.mem.Allocator,
     method: []const u8,
@@ -13415,6 +13631,7 @@ fn methodRunsUnlocked(method: []const u8) bool {
         // Local access administration is daemon-owned SQLite work and takes
         // only its own short lockDaemon bookkeeping window.
         isPushMethod(method) or
+        isPairingRequestMethod(method) or
         isAccessMethod(method) or
         // Connect owns bounded filesystem/network work and takes the SQLite
         // mutex only for its short durable transitions.
@@ -23868,4 +24085,121 @@ test "startup origin backfill fills missing identities of open workspaces and pu
     defer archived.deinit();
     try std.testing.expect(archived.nullableText(0) == null);
     try std.testing.expectEqual(@as(usize, 0), backfillRepositoryOrigins(&daemon, null, 200, 60_000));
+}
+
+fn expectPairingResponseContains(response: []const u8, needle: []const u8) !void {
+    if (std.mem.indexOf(u8, response, needle) != null) return;
+    std.debug.print("expected {s} in {s}\n", .{ needle, response });
+    return error.TestExpectedPairingResponse;
+}
+
+test "approval pairing submit list allow deliver once and deny" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testStoreDbPath(&tmp);
+    defer a.free(path);
+    var daemon = Daemon.init(a);
+    defer daemon.deinit();
+    try attachTestStoreService(&daemon, path);
+    defer detachTestStoreService(&daemon);
+    try std.testing.expect(methodRunsUnlocked(access_protocol.METHOD_DAEMON_PAIRING_REQUEST_DECIDE));
+
+    const request_id = "0123456789abcdef0123456789abcdef";
+    const submit_params = .{ .access_protocol_version = 1, .request_id = request_id, .device_label = "lightning", .requester_login = "j.riche64@example.com", .requester_name = "Jonathan", .requester_address = "100.64.0.7" };
+    const revision_before = daemon.registry.registry_revision;
+    const submit = try std.json.Stringify.valueAlloc(a, .{ .id = 1, .method = access_protocol.METHOD_DAEMON_PAIRING_REQUEST_SUBMIT, .params = submit_params }, .{});
+    defer a.free(submit);
+    const submitted = try daemon.handleRequest(submit);
+    defer a.free(submitted);
+    var submit_parsed = try std.json.parseFromSlice(std.json.Value, a, submitted, .{});
+    defer submit_parsed.deinit();
+    const submit_result = submit_parsed.value.object.get("result").?;
+    try std.testing.expectEqualStrings("pending", submit_result.object.get("status").?.string);
+    const match_code = submit_result.object.get("match_code").?.string;
+    try access_protocol.validateMatchCode(match_code);
+    // The desktop learns about the request through the change journal.
+    try std.testing.expectEqual(revision_before + 1, daemon.registry.registry_revision);
+
+    const list = try std.json.Stringify.valueAlloc(a, .{ .id = 2, .method = access_protocol.METHOD_DAEMON_PAIRING_REQUEST_LIST, .params = .{ .access_protocol_version = 1 } }, .{});
+    defer a.free(list);
+    {
+        const listed = try daemon.handleRequest(list);
+        defer a.free(listed);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, listed, .{});
+        defer parsed.deinit();
+        const requests = parsed.value.object.get("result").?.object.get("requests").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), requests.len);
+        try std.testing.expectEqualStrings("lightning", requests[0].object.get("device_label").?.string);
+        try std.testing.expectEqualStrings("j.riche64@example.com", requests[0].object.get("requester_login").?.string);
+        try std.testing.expectEqualStrings(match_code, requests[0].object.get("match_code").?.string);
+    }
+
+    const poll_params = .{ .access_protocol_version = 1, .request_id = request_id, .requester_login = "j.riche64@example.com", .requester_address = "100.64.0.7" };
+    const poll = try std.json.Stringify.valueAlloc(a, .{ .id = 3, .method = access_protocol.METHOD_DAEMON_PAIRING_REQUEST_POLL, .params = poll_params }, .{});
+    defer a.free(poll);
+    {
+        const pending = try daemon.handleRequest(poll);
+        defer a.free(pending);
+        try expectPairingResponseContains(pending, "\"status\":\"pending\"");
+        try expectPairingResponseContains(pending, "\"pairing_token\":null");
+    }
+
+    const allow = try std.json.Stringify.valueAlloc(a, .{ .id = 4, .method = access_protocol.METHOD_DAEMON_PAIRING_REQUEST_DECIDE, .params = .{ .access_protocol_version = 1, .request_id = request_id, .allow = true, .preset = access_protocol.PairingPreset.chat } }, .{});
+    defer a.free(allow);
+    {
+        const allowed = try daemon.handleRequest(allow);
+        defer a.free(allowed);
+        try expectPairingResponseContains(allowed, "\"status\":\"approved\"");
+        try std.testing.expect(std.mem.indexOf(u8, allowed, "pairing_token") == null);
+        // A second decision on the same request is refused.
+        const again = try daemon.handleRequest(allow);
+        defer a.free(again);
+        try expectPairingResponseContains(again, "pairing_request_not_pending");
+    }
+
+    // The requester collects the grant once and exchanges it like any grant.
+    const delivered = try daemon.handleRequest(poll);
+    defer a.free(delivered);
+    var delivered_parsed = try std.json.parseFromSlice(std.json.Value, a, delivered, .{});
+    defer delivered_parsed.deinit();
+    const grant = delivered_parsed.value.object.get("result").?;
+    try std.testing.expectEqualStrings("approved", grant.object.get("status").?.string);
+    try std.testing.expectEqualStrings(daemon.runtime_id, grant.object.get("runtime_id").?.string);
+    try std.testing.expectEqualStrings("chat", grant.object.get("preset").?.string);
+    {
+        const replay = try daemon.handleRequest(poll);
+        defer a.free(replay);
+        try expectPairingResponseContains(replay, "\"status\":\"expired\"");
+        try std.testing.expect(std.mem.indexOf(u8, replay, grant.object.get("pairing_token").?.string) == null);
+    }
+    const exchange = try std.json.Stringify.valueAlloc(a, .{ .id = 5, .method = access_protocol.METHOD_DAEMON_PAIRING_EXCHANGE, .params = .{ .access_protocol_version = 1, .grant_id = grant.object.get("grant_id").?.string, .pairing_token = grant.object.get("pairing_token").?.string, .device_label = "lightning", .client_nonce = "b" ** 32 } }, .{});
+    defer a.free(exchange);
+    const exchanged = try daemon.handleRequest(exchange);
+    defer a.free(exchanged);
+    var device = try std.json.parseFromSlice(std.json.Value, a, exchanged, .{});
+    defer device.deinit();
+    try expectPresetResponse(device.value.object.get("result").?, .chat);
+
+    // Deny: a second request fails clearly on the requester side.
+    const denied_id = "fedcba9876543210fedcba9876543210";
+    const submit_denied = try std.json.Stringify.valueAlloc(a, .{ .id = 6, .method = access_protocol.METHOD_DAEMON_PAIRING_REQUEST_SUBMIT, .params = .{ .access_protocol_version = 1, .request_id = denied_id, .device_label = "lightning", .requester_login = "j.riche64@example.com", .requester_address = "100.64.0.7" } }, .{});
+    defer a.free(submit_denied);
+    a.free(try daemon.handleRequest(submit_denied));
+    const deny = try std.json.Stringify.valueAlloc(a, .{ .id = 7, .method = access_protocol.METHOD_DAEMON_PAIRING_REQUEST_DECIDE, .params = .{ .access_protocol_version = 1, .request_id = denied_id, .allow = false } }, .{});
+    defer a.free(deny);
+    const denied = try daemon.handleRequest(deny);
+    defer a.free(denied);
+    try expectPairingResponseContains(denied, "\"status\":\"denied\"");
+    const poll_denied = try std.json.Stringify.valueAlloc(a, .{ .id = 8, .method = access_protocol.METHOD_DAEMON_PAIRING_REQUEST_POLL, .params = .{ .access_protocol_version = 1, .request_id = denied_id, .requester_login = "j.riche64@example.com", .requester_address = "100.64.0.7" } }, .{});
+    defer a.free(poll_denied);
+    const denied_poll = try daemon.handleRequest(poll_denied);
+    defer a.free(denied_poll);
+    try expectPairingResponseContains(denied_poll, "\"status\":\"denied\"");
+    // Another tailnet identity cannot read the decision.
+    const poll_other = try std.json.Stringify.valueAlloc(a, .{ .id = 9, .method = access_protocol.METHOD_DAEMON_PAIRING_REQUEST_POLL, .params = .{ .access_protocol_version = 1, .request_id = denied_id, .requester_login = "mallory@example.com", .requester_address = "100.64.0.9" } }, .{});
+    defer a.free(poll_other);
+    const other = try daemon.handleRequest(poll_other);
+    defer a.free(other);
+    try expectPairingResponseContains(other, "unknown_pairing_request");
 }

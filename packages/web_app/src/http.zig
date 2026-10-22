@@ -468,6 +468,42 @@ fn handleRequest(
         return;
     }
 
+    if (std.mem.eql(u8, split.path, headless.access_protocol.HTTP_PAIR_REQUEST_PATH) or
+        std.mem.eql(u8, split.path, headless.access_protocol.HTTP_PAIR_REQUEST_STATUS_PATH))
+    {
+        if (request.head.method != .POST) return respondMethodNotAllowed(request);
+        const requester = switch (pairRequestGate(
+            config.trustedProxyAuthority() != null,
+            request_envelope,
+            uniqueHeaderValue(request, TAILSCALE_USER_LOGIN_HEADER),
+            uniqueHeaderValue(request, TAILSCALE_USER_NAME_HEADER),
+        )) {
+            .not_found => {
+                try respondJson(request, .not_found, "{\"ok\":false,\"error\":\"not_found\"}");
+                return;
+            },
+            .serve_required => {
+                try respondJson(request, .forbidden, "{\"ok\":false,\"error\":\"tailscale_serve_required\"}");
+                return;
+            },
+            .identity_required => {
+                try respondJson(request, .forbidden, "{\"ok\":false,\"error\":\"tailscale_identity_required\"}");
+                return;
+            },
+            .allowed => |identity| identity,
+        };
+        if (!requestOriginAllowed(config, request_envelope, request, false)) {
+            try respondJson(request, .forbidden, "{\"ok\":false,\"error\":\"origin_forbidden\"}");
+            return;
+        }
+        if (std.mem.eql(u8, split.path, headless.access_protocol.HTTP_PAIR_REQUEST_PATH)) {
+            try handlePairRequestSubmit(allocator, io, daemon, auth, client_key, requester, request);
+        } else {
+            try handlePairRequestStatus(allocator, io, daemon, auth, client_key, requester, request);
+        }
+        return;
+    }
+
     if (std.mem.eql(u8, split.path, headless.access_protocol.HTTP_ACCESS_TOKEN_PATH)) {
         if (request.head.method != .POST) return respondMethodNotAllowed(request);
         if (!requestOriginAllowed(config, request_envelope, request, false)) {
@@ -657,7 +693,7 @@ fn handleRuntimeMetadata(
         .instance_id = &target.instance_id,
         .https_url = config.trusted_proxy_origin,
         .wss_url = wss_url,
-        .capabilities = &.{ headless.access_protocol.PAIR_RUNTIME_CAPABILITY, headless.protocol.ACCESS_PAIR_IDEMPOTENT_CAPABILITY },
+        .capabilities = &.{ headless.access_protocol.PAIR_RUNTIME_CAPABILITY, headless.protocol.ACCESS_PAIR_IDEMPOTENT_CAPABILITY, headless.access_protocol.PAIR_REQUEST_CAPABILITY },
     };
     const body = try std.json.Stringify.valueAlloc(allocator, metadata, .{});
     defer allocator.free(body);
@@ -865,6 +901,249 @@ fn handlePairExchange(
     }
     _ = try auth.recordPairAttempt(io, client_key, true, now_ms);
     try respondPairExchangeResult(allocator, request, exchanged.value);
+}
+
+const TAILSCALE_USER_LOGIN_HEADER = "tailscale-user-login";
+const TAILSCALE_USER_NAME_HEADER = "tailscale-user-name";
+
+/// Tailnet identity Tailscale Serve attached to a proxied request.
+const TailscaleRequester = struct {
+    login: []const u8,
+    name: ?[]const u8,
+};
+
+const PairRequestGate = union(enum) {
+    /// No trusted proxy is configured: the endpoint does not exist.
+    not_found,
+    /// Loopback (SSH, local process) or anything else without Serve's envelope.
+    serve_required,
+    /// Serve envelope but no single valid user identity (for example a
+    /// tagged node, which Serve does not attribute to a user).
+    identity_required,
+    allowed: TailscaleRequester,
+};
+
+/// Approval pairing is unauthenticated, so it is accepted only from the exact
+/// Tailscale Serve envelope with exactly one valid user login. Serve replaces
+/// any client-supplied `Tailscale-User-*` headers with the caller's identity.
+fn pairRequestGate(
+    trusted_proxy_configured: bool,
+    envelope: RequestEnvelope,
+    login_header: HeaderValue,
+    name_header: HeaderValue,
+) PairRequestGate {
+    if (!trusted_proxy_configured) return .not_found;
+    if (envelope != .trusted_proxy) return .serve_required;
+    const login = switch (login_header) {
+        .value => |value| value,
+        else => return .identity_required,
+    };
+    headless.access_protocol.validateRequesterLogin(login) catch return .identity_required;
+    const name: ?[]const u8 = switch (name_header) {
+        .value => |value| if (headless.access_protocol.validateDeviceLabel(value)) |_| value else |_| null,
+        else => null,
+    };
+    return .{ .allowed = .{ .login = login, .name = name } };
+}
+
+fn readPairRequestBody(allocator: std.mem.Allocator, request: *std.http.Server.Request) !?[]u8 {
+    if (!contentTypeIsJson(requestContentType(request))) {
+        try respondJson(request, .unsupported_media_type, "{\"ok\":false,\"error\":\"expected_json\"}");
+        return null;
+    }
+    return readBoundedSecretBody(allocator, request, headless.access_protocol.MAX_PAIR_REQUEST_BODY_BYTES) catch |err| switch (err) {
+        error.AccessBodyTooLarge => {
+            request.head.keep_alive = false;
+            try respondJson(request, .payload_too_large, "{\"ok\":false,\"error\":\"pairing_request_body_too_large\"}");
+            return null;
+        },
+        else => return err,
+    };
+}
+
+/// `POST /auth/pair/request`: queue a request for the owner to approve.
+fn handlePairRequestSubmit(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    daemon: *daemon_mod.Daemon,
+    auth: *auth_mod.Service,
+    client_key: []const u8,
+    requester: TailscaleRequester,
+    request: *std.http.Server.Request,
+) !void {
+    const now_ms = auth_mod.nowMillis(io);
+    if (try auth.pairRequestPreflight(io, client_key, now_ms) == .rate_limited) {
+        try respondJson(request, .too_many_requests, "{\"ok\":false,\"error\":\"pairing_request_rate_limited\"}");
+        return;
+    }
+    const body = (try readPairRequestBody(allocator, request)) orelse return;
+    defer allocator.free(body);
+    _ = try auth.recordPairRequest(io, client_key, now_ms);
+    var parsed = headless.access_protocol.parsePairingRequestHttpRequest(allocator, body) catch {
+        try respondJson(request, .bad_request, "{\"ok\":false,\"error\":\"invalid_pairing_request\"}");
+        return;
+    };
+    defer parsed.deinit();
+    const daemon_result = callMethodTargetedAfterBootstrap(
+        allocator,
+        daemon,
+        headless.access_protocol.METHOD_DAEMON_PAIRING_REQUEST_SUBMIT,
+        headless.access_protocol.PairingRequestSubmitRequest{
+            .access_protocol_version = headless.access_protocol.ACCESS_PROTOCOL_VERSION,
+            .request_id = parsed.value.request_id,
+            .device_label = parsed.value.device_label,
+            .requester_login = requester.login,
+            .requester_name = requester.name,
+            .requester_address = client_key,
+        },
+    ) catch {
+        try respondDaemonUnavailable(request);
+        return;
+    };
+    defer allocator.free(daemon_result.json);
+    var envelope = headless.parseResponse(allocator, daemon_result.json) catch {
+        try respondDaemonUnavailable(request);
+        return;
+    };
+    defer envelope.deinit();
+    const result_value = envelope.response.result orelse {
+        const code = rpcErrorCode(envelope.response.err) orelse "";
+        const mapped = pairRequestSubmitError(code);
+        try respondJson(request, mapped.status, mapped.body);
+        return;
+    };
+    var submitted = std.json.parseFromValue(headless.access_protocol.PairingRequestSubmitResult, allocator, result_value, .{}) catch {
+        try respondDaemonUnavailable(request);
+        return;
+    };
+    defer submitted.deinit();
+    const out = try std.json.Stringify.valueAlloc(allocator, submitted.value, .{});
+    defer allocator.free(out);
+    try respondJson(request, .accepted, out);
+}
+
+const MappedError = struct { status: std.http.Status, body: []const u8 };
+
+fn pairRequestSubmitError(code: []const u8) MappedError {
+    if (std.mem.eql(u8, code, "too_many_pairing_requests")) return .{ .status = .too_many_requests, .body = "{\"ok\":false,\"error\":\"too_many_pairing_requests\"}" };
+    if (std.mem.eql(u8, code, "pairing_request_queue_full")) return .{ .status = .service_unavailable, .body = "{\"ok\":false,\"error\":\"pairing_request_queue_full\"}" };
+    if (std.mem.eql(u8, code, "duplicate_pairing_request")) return .{ .status = .conflict, .body = "{\"ok\":false,\"error\":\"duplicate_pairing_request\"}" };
+    if (std.mem.eql(u8, code, headless.protocol.ERR_INVALID_PARAMS)) return .{ .status = .bad_request, .body = "{\"ok\":false,\"error\":\"invalid_pairing_request\"}" };
+    return .{ .status = .service_unavailable, .body = "{\"ok\":false,\"error\":\"pairing_unavailable\"}" };
+}
+
+/// `POST /auth/pair/request/status`: the requester's decision poll. Bound to
+/// the identity and tailnet address that submitted; an approved grant is
+/// written exactly once and every staging buffer is cleared.
+fn handlePairRequestStatus(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    daemon: *daemon_mod.Daemon,
+    auth: *auth_mod.Service,
+    client_key: []const u8,
+    requester: TailscaleRequester,
+    request: *std.http.Server.Request,
+) !void {
+    const now_ms = auth_mod.nowMillis(io);
+    if (try auth.pairPollPreflight(io, client_key, now_ms) == .rate_limited) {
+        try respondJson(request, .too_many_requests, "{\"ok\":false,\"error\":\"pairing_request_rate_limited\"}");
+        return;
+    }
+    const body = (try readPairRequestBody(allocator, request)) orelse return;
+    defer {
+        std.crypto.secureZero(u8, body);
+        allocator.free(body);
+    }
+    var parsed = headless.access_protocol.parsePairingRequestPollHttpRequest(allocator, body) catch {
+        _ = try auth.recordPairPollMiss(io, client_key, now_ms);
+        try respondJson(request, .bad_request, "{\"ok\":false,\"error\":\"invalid_pairing_request\"}");
+        return;
+    };
+    defer parsed.deinit();
+    const daemon_result = callMethodTargetedAfterBootstrap(
+        allocator,
+        daemon,
+        headless.access_protocol.METHOD_DAEMON_PAIRING_REQUEST_POLL,
+        headless.access_protocol.PairingRequestPollRequest{
+            .access_protocol_version = headless.access_protocol.ACCESS_PROTOCOL_VERSION,
+            .request_id = parsed.value.request_id,
+            .requester_login = requester.login,
+            .requester_address = client_key,
+        },
+    ) catch {
+        try respondDaemonUnavailable(request);
+        return;
+    };
+    defer {
+        std.crypto.secureZero(u8, daemon_result.json);
+        allocator.free(daemon_result.json);
+    }
+    var envelope = headless.parseResponse(allocator, daemon_result.json) catch {
+        try respondDaemonUnavailable(request);
+        return;
+    };
+    defer envelope.deinit();
+    const result_value = envelope.response.result orelse {
+        if (std.mem.eql(u8, rpcErrorCode(envelope.response.err) orelse "", "unknown_pairing_request")) {
+            _ = try auth.recordPairPollMiss(io, client_key, now_ms);
+            try respondJson(request, .not_found, "{\"ok\":false,\"error\":\"unknown_pairing_request\"}");
+        } else {
+            try respondDaemonUnavailable(request);
+        }
+        return;
+    };
+    defer eraseJsonStringField(result_value, "pairing_token");
+    var polled = std.json.parseFromValue(headless.access_protocol.PairingRequestPollResult, allocator, result_value, .{}) catch {
+        try respondDaemonUnavailable(request);
+        return;
+    };
+    defer {
+        if (polled.value.pairing_token) |token| std.crypto.secureZero(u8, @constCast(token.reveal()));
+        polled.deinit();
+    }
+    try respondPairRequestPollResult(allocator, request, polled.value);
+}
+
+fn respondPairRequestPollResult(
+    allocator: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    result: headless.access_protocol.PairingRequestPollResult,
+) !void {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer {
+        std.crypto.secureZero(u8, writer.written());
+        writer.deinit();
+    }
+    var json: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try json.beginObject();
+    try json.objectField("access_protocol_version");
+    try json.write(result.access_protocol_version);
+    try json.objectField("status");
+    try json.write(result.status);
+    try json.objectField("match_code");
+    try json.write(result.match_code);
+    try json.objectField("expires_at_ms");
+    try json.write(result.expires_at_ms);
+    if (result.status == .approved) {
+        const token = result.pairing_token orelse return respondDaemonUnavailable(request);
+        try json.objectField("runtime_id");
+        try json.write(result.runtime_id orelse return respondDaemonUnavailable(request));
+        try json.objectField("instance_id");
+        try json.write(result.instance_id orelse return respondDaemonUnavailable(request));
+        try json.objectField("grant_id");
+        try json.write(result.grant_id orelse return respondDaemonUnavailable(request));
+        try json.objectField("pairing_token");
+        try json.write(token.reveal());
+        try json.objectField("preset");
+        try json.write(result.preset);
+    }
+    try json.endObject();
+    const body = try writer.toOwnedSlice();
+    defer {
+        std.crypto.secureZero(u8, body);
+        allocator.free(body);
+    }
+    try respondJson(request, .ok, body);
 }
 
 fn handleAccessToken(
@@ -2675,7 +2954,11 @@ fn blockedRpcMethod(method: []const u8) bool {
         std.mem.eql(u8, method, headless.access_protocol.METHOD_DAEMON_DEVICE_REVOKE) or
         std.mem.eql(u8, method, headless.access_protocol.METHOD_DAEMON_PAIRING_EXCHANGE) or
         std.mem.eql(u8, method, headless.access_protocol.METHOD_DAEMON_DEVICE_AUTHENTICATE) or
-        std.mem.eql(u8, method, headless.access_protocol.METHOD_DAEMON_DEVICE_AUTHORIZE);
+        std.mem.eql(u8, method, headless.access_protocol.METHOD_DAEMON_DEVICE_AUTHORIZE) or
+        std.mem.eql(u8, method, headless.access_protocol.METHOD_DAEMON_PAIRING_REQUEST_SUBMIT) or
+        std.mem.eql(u8, method, headless.access_protocol.METHOD_DAEMON_PAIRING_REQUEST_POLL) or
+        std.mem.eql(u8, method, headless.access_protocol.METHOD_DAEMON_PAIRING_REQUEST_LIST) or
+        std.mem.eql(u8, method, headless.access_protocol.METHOD_DAEMON_PAIRING_REQUEST_DECIDE);
 }
 
 const SplitTarget = struct { path: []const u8, query: []const u8 };
@@ -3964,4 +4247,32 @@ fn handleDesktopUpgrade(
         },
     };
     try session.run();
+}
+
+test "approval pairing is reachable only through Tailscale Serve with a user identity" {
+    const login: HeaderValue = .{ .value = "j.riche64@example.com" };
+    const name: HeaderValue = .{ .value = "Jonathan" };
+    // No trusted proxy configured (plain loopback or SSH-forwarded gateway).
+    try std.testing.expect(pairRequestGate(false, .loopback, login, name) == .not_found);
+    try std.testing.expect(pairRequestGate(false, .trusted_proxy, login, name) == .not_found);
+    // Loopback without Serve's envelope, even with forged identity headers.
+    try std.testing.expect(pairRequestGate(true, .loopback, login, name) == .serve_required);
+    // Serve envelope without exactly one valid identity (tagged nodes).
+    try std.testing.expect(pairRequestGate(true, .trusted_proxy, .none, name) == .identity_required);
+    try std.testing.expect(pairRequestGate(true, .trusted_proxy, .invalid, name) == .identity_required);
+    try std.testing.expect(pairRequestGate(true, .trusted_proxy, .{ .value = "" }, name) == .identity_required);
+    try std.testing.expect(pairRequestGate(true, .trusted_proxy, .{ .value = "a b@example.com" }, name) == .identity_required);
+    const allowed = pairRequestGate(true, .trusted_proxy, login, name).allowed;
+    try std.testing.expectEqualStrings("j.riche64@example.com", allowed.login);
+    try std.testing.expectEqualStrings("Jonathan", allowed.name.?);
+    // A malformed display name is dropped rather than shown.
+    try std.testing.expect(pairRequestGate(true, .trusted_proxy, login, .{ .value = "bad\x07" }).allowed.name == null);
+    // The bridge methods never pass the generic RPC forwarders.
+    try std.testing.expect(blockedRpcMethod(headless.access_protocol.METHOD_DAEMON_PAIRING_REQUEST_SUBMIT));
+    try std.testing.expect(blockedRpcMethod(headless.access_protocol.METHOD_DAEMON_PAIRING_REQUEST_POLL));
+    try std.testing.expect(blockedRpcMethod(headless.access_protocol.METHOD_DAEMON_PAIRING_REQUEST_LIST));
+    try std.testing.expect(blockedRpcMethod(headless.access_protocol.METHOD_DAEMON_PAIRING_REQUEST_DECIDE));
+    const mapped = pairRequestSubmitError("too_many_pairing_requests");
+    try std.testing.expectEqual(std.http.Status.too_many_requests, mapped.status);
+    try std.testing.expectEqual(std.http.Status.service_unavailable, pairRequestSubmitError("pairing_request_queue_full").status);
 }
