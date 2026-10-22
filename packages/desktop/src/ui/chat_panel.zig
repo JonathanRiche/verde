@@ -2142,6 +2142,13 @@ fn pendingRowHitAt(send_state: *const chat_types.SendState, column: palette.Rect
     return null;
 }
 
+/// Pointer hit tests run on input events, before the frame that rebuilds the
+/// layout, so a layout row can outlive the message it named (a removed setup
+/// card left row 0 over an empty transcript). Check before indexing.
+fn layoutItemInRange(item: anytype, message_count: usize) bool {
+    return item.message_index < message_count and item.group_end <= message_count;
+}
+
 /// Resolves the transcript row under the pointer without measuring text:
 /// committed rows come from the layout index, pending rows from the geometry
 /// the last render recorded. The send mutex is held only to copy one row.
@@ -2163,7 +2170,7 @@ fn resolveTranscriptBodyTarget(state: *app_state.AppState, mouse_x: f32, mouse_y
     const content_offset_y = mouse_y - column.y + scroll_y;
     const estimated_height = estimatedPartialTranscriptHeight(thread);
     if (transcriptLayoutItemAtContentY(thread.transcript_layout_items.items, estimated_height, content_offset_y)) |item| {
-        if (!item.orchestration_collapsed and !commandGroupRendersGrouped(thread.messages.items, item.message_index, item.group_end) and item.message_index < thread.messages.items.len) {
+        if (layoutItemInRange(item, thread.messages.items.len) and !item.orchestration_collapsed and !commandGroupRendersGrouped(thread.messages.items, item.message_index, item.group_end)) {
             const message = thread.messages.items[item.message_index];
             const header = orchestrationHeaderOffset(item);
             if (!(message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body))) {
@@ -11494,4 +11501,17 @@ test "toggling an in-flight card keeps the committed layout and scroll offset" {
     try std.testing.expectEqual(items_before, thread.transcript_layout_items.items.len);
     try std.testing.expectEqual(committed_before, thread.transcript_layout_committed_height);
     try std.testing.expectEqual(scroll_before, state.currentTranscriptScrollY().?);
+}
+
+test "pointer hits skip layout rows that outlived their messages" {
+    // Last frame's layout after the setup card (the chat's only row) was
+    // cancelled: the pointer lookup still finds row 0 over an empty transcript.
+    const stale = [_]chat_types.TranscriptLayoutItem{.{ .message_index = 0, .group_end = 1, .top = -80.0, .height = 80.0 }};
+    const item = transcriptLayoutItemAtContentY(&stale, 80.0, 40.0).?;
+    try std.testing.expect(!layoutItemInRange(item, 0));
+    try std.testing.expect(layoutItemInRange(item, 1));
+    // A grouped row whose tail was removed is out of range as well.
+    const group: chat_types.TranscriptLayoutItem = .{ .message_index = 0, .group_end = 3, .top = -80.0, .height = 80.0 };
+    try std.testing.expect(!layoutItemInRange(group, 2));
+    try std.testing.expect(layoutItemInRange(group, 3));
 }

@@ -178,6 +178,20 @@ pub const FolderBrowser = struct {
         return remote.loading or remote.has_pending;
     }
 
+    /// A remote browse root (the machine's home or another allowed root) is
+    /// where browsing starts, never a workspace folder itself: choosing it
+    /// would attach the whole home directory. With a folder below it
+    /// highlighted, that folder is the target and stays choosable.
+    pub fn remoteTargetBlocked(self: *const FolderBrowser, visible: []const usize) bool {
+        const remote = self.remote orelse return false;
+        if (self.dir.items.len == 0) return true;
+        if (self.highlighted) |row| {
+            if (row < visible.len) return false;
+        }
+        if (!remote.has_parent) return true;
+        return std.mem.eql(u8, std.mem.trimEnd(u8, self.dir.items, "/"), self.home.items);
+    }
+
     pub fn remoteMachineLabel(self: *const FolderBrowser) []const u8 {
         const remote = self.remote orelse return "";
         return remote.machine_label.items;
@@ -460,4 +474,37 @@ test "remote folder browser requests listings and marks same-origin folders" {
 
     browser.close(allocator);
     try std.testing.expect(!browser.isRemote());
+}
+
+test "remote folder browser never offers its browse root as the workspace folder" {
+    const allocator = std.testing.allocator;
+    var browser: FolderBrowser = .{};
+    defer browser.deinit(allocator);
+    browser.openRemote(allocator, "richetech", null);
+    _ = browser.takeRemoteRequest();
+    // Nothing listed yet: nothing to choose.
+    try std.testing.expect(browser.remoteTargetBlocked(&.{}));
+
+    browser.applyRemoteListing(allocator, "/home/rtg", null, &.{ .{ .name = "code" }, .{ .name = "verde" } });
+    const visible = [_]usize{ 0, 1 };
+    // Home itself is blocked; a highlighted folder below it is the target.
+    try std.testing.expect(browser.remoteTargetBlocked(&visible));
+    browser.highlighted = 1;
+    try std.testing.expect(!browser.remoteTargetBlocked(&visible));
+    const target = try browser.targetPathAlloc(allocator, &visible);
+    defer allocator.free(target);
+    try std.testing.expectEqualStrings("/home/rtg/verde", target);
+
+    // Inside a folder below the root, the listed folder itself is choosable.
+    browser.applyRemoteListing(allocator, "/home/rtg/verde", "/home/rtg", &.{});
+    try std.testing.expect(!browser.remoteTargetBlocked(&.{}));
+
+    // Another allowed root (no parent to go up to) is a root as well.
+    browser.applyRemoteListing(allocator, "/srv/code", null, &.{});
+    try std.testing.expect(browser.remoteTargetBlocked(&.{}));
+
+    // Local browsing is unaffected.
+    var local: FolderBrowser = .{};
+    defer local.deinit(allocator);
+    try std.testing.expect(!local.remoteTargetBlocked(&.{}));
 }

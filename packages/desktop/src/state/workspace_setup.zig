@@ -362,11 +362,31 @@ pub fn classifyAttachError(code: []const u8) AttachFailure {
     if (std.mem.eql(u8, code, "identity_mismatch")) return .identity_mismatch;
     if (std.mem.eql(u8, code, "path_outside_roots")) return .path_outside_roots;
     if (std.mem.eql(u8, code, "conflict") or std.mem.eql(u8, code, headless.protocol.ERR_CONFLICT)) return .conflict;
-    if (std.mem.eql(u8, code, "forbidden") or std.mem.eql(u8, code, "insufficient_scope") or
-        std.mem.eql(u8, code, "authentication_rejected")) return .scope;
-    if (std.mem.eql(u8, code, "method_not_found") or std.mem.eql(u8, code, "unknown_method") or
-        std.mem.eql(u8, code, "unsupported")) return .unsupported;
+    if (std.mem.eql(u8, code, "insufficient_scope") or std.mem.eql(u8, code, "authentication_rejected")) return .scope;
+    // The gateway's "forbidden" means the method is not available to paired
+    // sessions at all: an older gateway that predates workspace.attach.
+    if (std.mem.eql(u8, code, "forbidden") or std.mem.eql(u8, code, "method_not_found") or
+        std.mem.eql(u8, code, "unknown_method") or std.mem.eql(u8, code, "unsupported") or
+        std.mem.eql(u8, code, "method_not_allowed")) return .unsupported;
     return .other;
+}
+
+pub const ChannelFailure = @FieldType(RuntimeService.RpcCallResult, "failed");
+
+/// A transport-level failure of one attach step. The desktop transport turns
+/// every HTTP 401/403 from the gateway into an authentication failure and
+/// other 4xx into a protocol failure, so an older gateway that does not know
+/// `workspace.attach` (403 forbidden or insufficient_scope) arrives here, not
+/// as a JSON-RPC error. The client registration just before used the same
+/// connection and credential, so on the attach step those failures are a
+/// refusal of this method, not an outage: say so instead of "could not be
+/// reached". `repository_write_granted == false` makes it the scope message.
+pub fn classifyAttachChannelFailure(step: AttachStep, failure: ChannelFailure, repository_write_granted: ?bool) AttachFailure {
+    if (step != .attach) return .unreachable_runtime;
+    return switch (failure) {
+        .authentication, .protocol, .resource => if (repository_write_granted == false) .scope else .unsupported,
+        else => .unreachable_runtime,
+    };
 }
 
 /// One sentence for the card; `machine` names the target.
@@ -377,7 +397,7 @@ pub fn attachFailureMessage(buffer: []u8, failure: AttachFailure, machine: []con
         .path_outside_roots => std.fmt.bufPrint(buffer, "{s} only allows folders under its home or VERDE_DIRECTORY_ROOTS. Pick a folder there.", .{machine}),
         .conflict => std.fmt.bufPrint(buffer, "{s} already uses this workspace for a different folder. Pick another folder.", .{machine}),
         .scope => std.fmt.bufPrint(buffer, "Setting up a workspace on {s} needs a Full device or the owner. This device can't change its repositories.", .{machine}),
-        .unsupported => std.fmt.bufPrint(buffer, "Verde on {s} is too old to set up workspaces. Update it, then try again.", .{machine}),
+        .unsupported => std.fmt.bufPrint(buffer, "{s}'s Verde can't set up workspaces yet. Update Verde on {s}, then try again.", .{ machine, machine }),
         .unreachable_runtime => std.fmt.bufPrint(buffer, "{s} could not be reached. Check the connection, then try again.", .{machine}),
         .other => std.fmt.bufPrint(buffer, "{s} could not set up this workspace. Try again.", .{machine}),
     } catch "This machine could not set up the workspace.";
@@ -579,7 +599,7 @@ const Card = struct {
     }
 };
 
-const AttachStep = enum { register, attach };
+pub const AttachStep = enum { register, attach };
 
 const AttachJob = struct {
     profile_id: []u8,
@@ -958,17 +978,26 @@ fn refreshCardCandidates(self: anytype, card: *Card) bool {
 /// Rewrites the card message's body after its state changed.
 fn rewriteCardMessage(self: anytype) void {
     const card = if (self.workspace_setup.card) |*value| value else return;
-    const message = cardMessage(self, card) orelse return;
+    const found = cardMessageIndex(self, card) orelse return;
+    const message = &found.thread.messages.items[found.index];
     const body = cardBodyAlloc(self.allocator, cardText(card)) catch return;
     defer self.allocator.free(body);
     const owned = self.allocator.dupeZ(u8, body) catch return;
     self.allocator.free(message.body);
     message.body = owned;
     card.body_addr = @intFromPtr(owned.ptr);
+    relayoutCardRow(self, found);
     self.markDirty();
 }
 
-fn cardMessageIndex(self: anytype, card: *const Card) ?struct { thread: *chat_types.ChatThread, index: usize } {
+const CardRow = struct {
+    project_index: usize,
+    thread_index: usize,
+    thread: *chat_types.ChatThread,
+    index: usize,
+};
+
+fn cardMessageIndex(self: anytype, card: *const Card) ?CardRow {
     const resolved = self.projectThreadIndexByLocalId(card.project_id, card.local_thread_id) orelse return null;
     const thread = &self.project_controller.projects.items[resolved.project_index].threads.items[resolved.thread_index];
     var index = thread.messages.items.len;
@@ -977,7 +1006,7 @@ fn cardMessageIndex(self: anytype, card: *const Card) ?struct { thread: *chat_ty
         const message = &thread.messages.items[index];
         if (@intFromPtr(message.body.ptr) != card.body_addr) continue;
         if (message.role != .system or !std.mem.eql(u8, message.author, CARD_AUTHOR)) return null;
-        return .{ .thread = thread, .index = index };
+        return .{ .project_index = resolved.project_index, .thread_index = resolved.thread_index, .thread = thread, .index = index };
     }
     return null;
 }
@@ -997,7 +1026,55 @@ fn closeCard(self: anytype, remove_message: bool) void {
     const found = cardMessageIndex(self, &card) orelse return;
     const removed = found.thread.messages.orderedRemove(found.index);
     self.releaseMessage(removed);
+    forgetTranscriptRows(self, found.thread);
     self.markDirty();
+}
+
+/// Removing a row renumbers every row after it, and the card is often the
+/// thread's only row. The previous frame's layout, the per-index markdown and
+/// height caches, and any text selection all still name the old indices, and
+/// pointer hit tests read the layout before the next frame rebuilds it (a
+/// stale row 0 over an empty transcript panicked with "index 0, len 0").
+/// Drop them all so the next frame lays the transcript out from scratch.
+fn forgetTranscriptRows(self: anytype, thread: *chat_types.ChatThread) void {
+    forgetTranscriptLayout(thread);
+    thread.clearTranscriptMarkdownEntries(self.allocator);
+    thread.clearTranscriptHeightEntries();
+    self.clearTranscriptMarkdownSelection();
+}
+
+fn forgetTranscriptLayout(thread: *chat_types.ChatThread) void {
+    thread.transcript_layout_valid = false;
+    thread.transcript_layout_items.clearRetainingCapacity();
+    thread.transcript_layout_first_message_index = thread.messages.items.len;
+    thread.transcript_layout_message_count = 0;
+    thread.transcript_layout_committed_height = 0.0;
+    thread.transcript_layout_requested_height = 0.0;
+    thread.transcript_layout_visible_ready = false;
+}
+
+/// The card's text changed (a failure line, "Setting up…", the done text)
+/// and so did its height, but the transcript layout keeps each row's
+/// measured height until told otherwise: the new last line was drawn over
+/// the buttons. Re-measure the row: on screen through the panel's one-row
+/// patch (no scroll jump); otherwise, or when another row already asked for
+/// a patch this frame, by laying the transcript out again.
+fn relayoutCardRow(self: anytype, row: CardRow) void {
+    row.thread.transcript_layout_valid = false;
+    const projects = self.project_controller.projects.items;
+    const on_screen = row.project_index == self.project_controller.selected_index and
+        row.project_index < projects.len and
+        row.thread_index == projects[row.project_index].selected_thread_index;
+    if (on_screen and self.pending_card_toggle_layout_patch == null) {
+        self.pending_card_toggle_layout_patch = .{
+            .project_index = row.project_index,
+            .thread_index = row.thread_index,
+            .message_index = row.index,
+        };
+        return;
+    }
+    if (on_screen) self.pending_card_toggle_layout_patch = null;
+    forgetTranscriptLayout(row.thread);
 }
 
 /// Buttons of the live setup card when `body` is its message body; null for
@@ -1017,11 +1094,18 @@ pub fn cardButtonsFor(
     return if (buttons.len == 0) null else buttons;
 }
 
+/// The card's Cancel: removes its row and forgets the card. The draft and
+/// the thread's machine selection are untouched.
+pub fn cancelCard(self: anytype) void {
+    closeCard(self, true);
+    self.markDirty();
+}
+
 /// Runs a card button.
 pub fn cardAction(self: anytype, kind: CardButtonKind, index: usize) void {
     const card = if (self.workspace_setup.card) |*value| value else return;
     switch (kind) {
-        .cancel => closeCard(self, true),
+        .cancel => cancelCard(self),
         .use_candidate => {
             if (card.phase != .choosing or index >= card.candidates.items.len) return;
             const root = self.allocator.dupe(u8, card.candidates.items[index]) catch return;
@@ -1256,7 +1340,12 @@ fn applyAttachStep(self: anytype, result: *RuntimeService.RpcCallResult) void {
     const job = &self.workspace_setup.attach.?;
     const response = switch (result.*) {
         .response => |value| value,
-        .failed, .canceled => return finishAttach(self, .{ .failure = .unreachable_runtime }),
+        .failed => |failure| return finishAttach(self, .{ .failure = classifyAttachChannelFailure(
+            job.step,
+            failure,
+            if (snapshotFor(self, job.profile_id)) |snapshot| snapshot.repository_write_granted else null,
+        ) }),
+        .canceled => return finishAttach(self, .{ .failure = .unreachable_runtime }),
     };
     var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, response.json, .{}) catch
         return finishAttach(self, .{ .failure = .other });
@@ -1705,7 +1794,8 @@ test "attach errors map to card messages" {
     try std.testing.expectEqual(AttachFailure.path_outside_roots, classifyAttachError("path_outside_roots"));
     try std.testing.expectEqual(AttachFailure.not_found, classifyAttachError("not_found"));
     try std.testing.expectEqual(AttachFailure.conflict, classifyAttachError("conflict"));
-    try std.testing.expectEqual(AttachFailure.scope, classifyAttachError("forbidden"));
+    try std.testing.expectEqual(AttachFailure.unsupported, classifyAttachError("forbidden"));
+    try std.testing.expectEqual(AttachFailure.scope, classifyAttachError("insufficient_scope"));
     try std.testing.expectEqual(AttachFailure.unsupported, classifyAttachError("method_not_found"));
     try std.testing.expectEqual(AttachFailure.other, classifyAttachError("store_unavailable"));
     var buffer: [320]u8 = undefined;
@@ -1747,4 +1837,226 @@ test "setup card text and buttons follow the doc copy" {
     const done = try cardBodyAlloc(allocator, .{ .machine = "Lightning", .workspace = "verde", .phase = .done, .attached_path = "/home/zod/dev/verde" });
     defer allocator.free(done);
     try std.testing.expect(std.mem.indexOf(u8, done, "Send your message again") != null);
+}
+
+test "cancelling the setup card drops the row and every index that named it" {
+    const allocator = std.testing.allocator;
+    const Project = @import("project.zig").Project;
+    const FakeState = struct {
+        allocator: std.mem.Allocator,
+        workspace_setup: State = .{},
+        project_controller: struct {
+            projects: std.ArrayList(Project) = .empty,
+            selected_index: usize = 0,
+        } = .{},
+        selection_clears: usize = 0,
+
+        pub fn projectThreadIndexByLocalId(self: *@This(), workspace_id: []const u8, local_thread_id: []const u8) ?struct { project_index: usize, thread_index: usize } {
+            for (self.project_controller.projects.items, 0..) |*project, project_index| {
+                if (!std.mem.eql(u8, project.id, workspace_id)) continue;
+                for (project.threads.items, 0..) |*thread, thread_index| {
+                    if (std.mem.eql(u8, thread.local_thread_id, local_thread_id)) return .{ .project_index = project_index, .thread_index = thread_index };
+                }
+            }
+            return null;
+        }
+        pub fn releaseMessage(self: *@This(), message: chat_types.ChatMessage) void {
+            self.allocator.free(message.author);
+            self.allocator.free(message.body);
+        }
+        pub fn clearTranscriptMarkdownSelection(self: *@This()) void {
+            self.selection_clears += 1;
+        }
+        pub fn markDirty(_: *@This()) void {}
+    };
+
+    const Case = struct {
+        /// Rows before the card; 0 is a brand-new chat whose only row is the card.
+        earlier_rows: usize,
+
+        fn run(case: @This(), gpa: std.mem.Allocator) !void {
+            var state: FakeState = .{ .allocator = gpa };
+            defer state.workspace_setup.deinit(gpa);
+            var project = try Project.init(gpa, "setup-cancel", "verde", "/tmp/setup-cancel", 0);
+            state.project_controller.projects.append(gpa, project) catch |err| {
+                project.deinit(gpa);
+                return err;
+            };
+            defer {
+                for (state.project_controller.projects.items) |*owned| owned.deinit(gpa);
+                state.project_controller.projects.deinit(gpa);
+            }
+            const thread = &state.project_controller.projects.items[0].threads.items[0];
+            for (0..case.earlier_rows) |_| try thread.messages.append(gpa, .{
+                .role = .user,
+                .author = try gpa.dupeZ(u8, "You"),
+                .body = try gpa.dupeZ(u8, "hello"),
+            });
+            try thread.messages.append(gpa, .{
+                .role = .system,
+                .author = try gpa.dupeZ(u8, CARD_AUTHOR),
+                .body = try gpa.dupeZ(u8, "richetech doesn't have \u{201C}verde\u{201D} yet."),
+            });
+            const rows = thread.messages.items.len;
+            // What the last frame left behind: a valid layout covering every
+            // row, and the per-index markdown and height caches.
+            for (0..rows) |index| {
+                try thread.transcript_layout_items.append(gpa, .{
+                    .message_index = index,
+                    .group_end = index + 1,
+                    .top = -@as(f32, @floatFromInt(rows - index)) * 80.0,
+                    .height = 80.0,
+                });
+            }
+            thread.transcript_layout_first_message_index = 0;
+            thread.transcript_layout_message_count = rows;
+            thread.transcript_layout_valid = true;
+            thread.ensureTranscriptMarkdownEntries(gpa);
+            thread.ensureTranscriptHeightEntries(gpa);
+
+            state.workspace_setup.card = .{
+                .project_id = try gpa.dupe(u8, "setup-cancel"),
+                .local_thread_id = try gpa.dupe(u8, thread.local_thread_id),
+                .profile_id = try gpa.dupe(u8, "richetech"),
+                .machine_label = try gpa.dupe(u8, "richetech"),
+                .workspace_label = try gpa.dupe(u8, "verde"),
+                .body_addr = @intFromPtr(thread.messages.items[rows - 1].body.ptr),
+            };
+            var buttons: [MAX_CARD_BUTTONS]CardButton = undefined;
+            var labels: [MAX_CANDIDATES][96]u8 = undefined;
+            const live = cardButtonsFor(&state, thread.messages.items[rows - 1].body, &buttons, &labels).?;
+            try std.testing.expectEqual(CardButtonKind.cancel, live[live.len - 1].kind);
+
+            // The click: `cardAction(.cancel)` runs exactly this.
+            cancelCard(&state);
+
+            try std.testing.expect(state.workspace_setup.card == null);
+            try std.testing.expectEqual(case.earlier_rows, thread.messages.items.len);
+            for (thread.messages.items) |message| try std.testing.expect(!std.mem.eql(u8, message.author, CARD_AUTHOR));
+            // Hit tests on the next pointer event read the layout before the
+            // next frame rebuilds it: no row may name a message that is gone.
+            try std.testing.expectEqual(@as(usize, 0), thread.transcript_layout_items.items.len);
+            for (thread.transcript_layout_items.items) |item| try std.testing.expect(item.group_end <= thread.messages.items.len);
+            try std.testing.expect(!thread.transcript_layout_valid);
+            try std.testing.expectEqual(thread.messages.items.len, thread.transcript_layout_first_message_index + thread.transcript_layout_message_count);
+            try std.testing.expectEqual(@as(usize, 0), thread.transcript_markdown_entries.items.len);
+            try std.testing.expectEqual(@as(usize, 0), thread.transcript_height_entries.items.len);
+            try std.testing.expectEqual(@as(usize, 1), state.selection_clears);
+            // The frame then re-sizes the per-index caches for what is left.
+            thread.ensureTranscriptMarkdownEntries(gpa);
+            thread.ensureTranscriptHeightEntries(gpa);
+            try std.testing.expectEqual(case.earlier_rows, thread.transcript_height_entries.items.len);
+            // The row is gone, so it shows no buttons any more.
+            try std.testing.expect(cardButtonsFor(&state, "", &buttons, &labels) == null);
+        }
+    };
+    try (Case{ .earlier_rows = 0 }).run(allocator);
+    try (Case{ .earlier_rows = 2 }).run(allocator);
+}
+
+test "an attach refused by the gateway is not reported as an unreachable machine" {
+    // Same credential and connection just registered a client: an auth-class
+    // or 4xx failure on the attach call is the gateway refusing the method.
+    try std.testing.expectEqual(AttachFailure.unsupported, classifyAttachChannelFailure(.attach, .authentication, null));
+    try std.testing.expectEqual(AttachFailure.unsupported, classifyAttachChannelFailure(.attach, .protocol, true));
+    try std.testing.expectEqual(AttachFailure.scope, classifyAttachChannelFailure(.attach, .authentication, false));
+    // Genuine transport failures, and failures before the attach call, stay
+    // "could not be reached".
+    try std.testing.expectEqual(AttachFailure.unreachable_runtime, classifyAttachChannelFailure(.attach, .network, null));
+    try std.testing.expectEqual(AttachFailure.unreachable_runtime, classifyAttachChannelFailure(.register, .authentication, null));
+    var buffer: [320]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "richetech's Verde can't set up workspaces yet. Update Verde on richetech, then try again.",
+        attachFailureMessage(&buffer, .unsupported, "richetech"),
+    );
+}
+
+test "a card whose text grows is re-measured so its buttons stay below the body" {
+    const allocator = std.testing.allocator;
+    const Project = @import("project.zig").Project;
+    const Patch = struct { project_index: usize, thread_index: usize, message_index: usize };
+    const FakeState = struct {
+        allocator: std.mem.Allocator,
+        workspace_setup: State = .{},
+        project_controller: struct {
+            projects: std.ArrayList(Project) = .empty,
+            selected_index: usize = 0,
+        } = .{},
+        pending_card_toggle_layout_patch: ?Patch = null,
+        dirty: usize = 0,
+
+        pub fn projectThreadIndexByLocalId(self: *@This(), workspace_id: []const u8, local_thread_id: []const u8) ?struct { project_index: usize, thread_index: usize } {
+            for (self.project_controller.projects.items, 0..) |*project, project_index| {
+                if (!std.mem.eql(u8, project.id, workspace_id)) continue;
+                for (project.threads.items, 0..) |*thread, thread_index| {
+                    if (std.mem.eql(u8, thread.local_thread_id, local_thread_id)) return .{ .project_index = project_index, .thread_index = thread_index };
+                }
+            }
+            return null;
+        }
+        pub fn markDirty(self: *@This()) void {
+            self.dirty += 1;
+        }
+    };
+    const Mode = enum { on_screen, other_row_patched, off_screen };
+    const run = struct {
+        fn call(gpa: std.mem.Allocator, mode: Mode) !void {
+            var state: FakeState = .{ .allocator = gpa };
+            defer state.workspace_setup.deinit(gpa);
+            var project = try Project.init(gpa, "setup-grow", "verde", "/tmp/setup-grow", 0);
+            state.project_controller.projects.append(gpa, project) catch |err| {
+                project.deinit(gpa);
+                return err;
+            };
+            defer {
+                for (state.project_controller.projects.items) |*owned| owned.deinit(gpa);
+                state.project_controller.projects.deinit(gpa);
+            }
+            if (mode == .off_screen) state.project_controller.selected_index = 1;
+            if (mode == .other_row_patched) state.pending_card_toggle_layout_patch = .{ .project_index = 0, .thread_index = 0, .message_index = 0 };
+            const thread = &state.project_controller.projects.items[0].threads.items[0];
+            try thread.messages.append(gpa, .{ .role = .user, .author = try gpa.dupeZ(u8, "You"), .body = try gpa.dupeZ(u8, "hi") });
+            try thread.messages.append(gpa, .{ .role = .system, .author = try gpa.dupeZ(u8, CARD_AUTHOR), .body = try gpa.dupeZ(u8, "old body") });
+            for (0..2) |index| try thread.transcript_layout_items.append(gpa, .{ .message_index = index, .group_end = index + 1, .top = -80.0 * @as(f32, @floatFromInt(2 - index)), .height = 80.0 });
+            thread.transcript_layout_first_message_index = 0;
+            thread.transcript_layout_message_count = 2;
+            thread.transcript_layout_valid = true;
+            state.workspace_setup.card = .{
+                .project_id = try gpa.dupe(u8, "setup-grow"),
+                .local_thread_id = try gpa.dupe(u8, thread.local_thread_id),
+                .profile_id = try gpa.dupe(u8, "richetech"),
+                .machine_label = try gpa.dupe(u8, "richetech"),
+                .workspace_label = try gpa.dupe(u8, "verde"),
+                .body_addr = @intFromPtr(thread.messages.items[1].body.ptr),
+            };
+            // The attach failed: a notice line joins the body.
+            state.workspace_setup.card.?.setNotice(gpa, "richetech's Verde can't set up workspaces yet.");
+            rewriteCardMessage(&state);
+            try std.testing.expect(std.mem.indexOf(u8, thread.messages.items[1].body, "can't set up workspaces yet") != null);
+            // The body changed, so the card is still found by its new body.
+            var buttons: [MAX_CARD_BUTTONS]CardButton = undefined;
+            var labels: [MAX_CANDIDATES][96]u8 = undefined;
+            try std.testing.expect(cardButtonsFor(&state, thread.messages.items[1].body, &buttons, &labels) != null);
+            // The early "layout unchanged" return no longer applies.
+            try std.testing.expect(!thread.transcript_layout_valid);
+            switch (mode) {
+                // The panel re-measures exactly this row next frame.
+                .on_screen => {
+                    const patch = state.pending_card_toggle_layout_patch.?;
+                    try std.testing.expectEqual(@as(usize, 1), patch.message_index);
+                    try std.testing.expectEqual(@as(usize, 2), thread.transcript_layout_items.items.len);
+                },
+                // Two rows changed, or the thread is not on screen: lay the
+                // whole transcript out again; no stale row height survives.
+                .other_row_patched, .off_screen => {
+                    try std.testing.expect(state.pending_card_toggle_layout_patch == null or mode == .off_screen);
+                    try std.testing.expectEqual(@as(usize, 0), thread.transcript_layout_items.items.len);
+                    try std.testing.expectEqual(thread.messages.items.len, thread.transcript_layout_first_message_index);
+                },
+            }
+        }
+    }.call;
+    try run(allocator, .on_screen);
+    try run(allocator, .other_row_patched);
+    try run(allocator, .off_screen);
 }

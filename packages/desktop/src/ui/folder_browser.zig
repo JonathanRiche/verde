@@ -19,6 +19,7 @@ const NF_COD_HISTORY = "\u{EA82}";
 const NF_COD_ADD = "\u{EA60}";
 
 const ROW_H_UI: f32 = 34.0;
+const REMOTE_ROOT_HINT = "Open a folder to choose it";
 const PLACE_ROW_H_UI: f32 = 30.0;
 const PLACES_W_UI: f32 = 190.0;
 const MAX_VISIBLE: usize = 4096;
@@ -278,7 +279,8 @@ pub fn registerHits(
     queueHit(state, up_rect, .folder_browser_up, 0);
     queueHit(state, hidden_rect, .folder_browser_hidden, 0);
     queueHit(state, cancel_rect, .folder_browser_cancel, 0);
-    queueHit(state, select_rect, .folder_browser_select, 0);
+    // A remote browse root is not choosable: no hit, so no pointer either.
+    if (!browser(state).remoteTargetBlocked(visible[0..visible_count])) queueHit(state, select_rect, .folder_browser_select, 0);
     if (managed_rect.w > 0.0) queueHit(state, managed_rect, .folder_browser_managed, 0);
     for (crumbs[0..crumb_count], 0..) |crumb, index| queueHit(state, crumb.rect, .folder_browser_crumb, index);
     if (places_rect.w > 0.0) {
@@ -449,6 +451,11 @@ fn createRowHighlighted(model: *const runtime.FolderBrowser) bool {
 
 fn selectTarget(state: *runtime.AppState) void {
     const model = browser(state);
+    // Enter / Ctrl+Enter at a remote browse root: there is nothing to choose.
+    if (model.remoteTargetBlocked(visible[0..visible_count])) {
+        model.notice = REMOTE_ROOT_HINT;
+        return;
+    }
     if (createRowHighlighted(model)) {
         const name = state.allocator.dupe(u8, model.creatableName() orelse return) catch return;
         defer state.allocator.free(name);
@@ -652,6 +659,8 @@ fn renderFooter(state: *runtime.AppState) void {
     const info_rect: palette.Rect = .{ .x = info_x, .y = footer_y, .w = @max(cancel_rect.x - info_x - theme.scaledUi(12.0), 0.0), .h = cancel_rect.h };
     if (model.notice.len > 0) {
         queueText(state, .{ .x = info_rect.x, .y = info_rect.y + (info_rect.h - size * 1.25) * 0.5, .w = info_rect.w, .h = size * 1.25 }, model.notice, theme.COLOR_YELLOW, size, info_rect);
+    } else if (model.remoteTargetBlocked(visible[0..visible_count])) {
+        queueText(state, .{ .x = info_rect.x, .y = info_rect.y + (info_rect.h - size * 1.25) * 0.5, .w = info_rect.w, .h = size * 1.25 }, REMOTE_ROOT_HINT, theme.COLOR_TEXT_MUTED, size, info_rect);
     } else {
         const hint = "Enter opens · Ctrl+Enter selects · Backspace goes up";
         queueText(state, .{ .x = info_rect.x, .y = info_rect.y + (info_rect.h - size * 1.25) * 0.5, .w = info_rect.w, .h = size * 1.25 }, hint, theme.COLOR_TEXT_SUBTLE, size, info_rect);
@@ -667,6 +676,10 @@ fn renderFooter(state: *runtime.AppState) void {
     const verb = if (creating)
         (if (adds) "Create & add" else "Create & select")
     else if (model.isRemote()) "Use" else if (adds) "Add" else "Select";
+    if (model.remoteTargetBlocked(visible[0..visible_count])) {
+        renderDisabledButton(state, select_rect, "Use folder");
+        return;
+    }
     const label = std.fmt.bufPrint(&label_buf, "{s} \u{201C}{s}\u{201D}", .{ verb, if (name.len == 0) "/" else name }) catch verb;
     renderButton(state, select_rect, label, true);
 }
@@ -680,6 +693,16 @@ fn renderButton(state: *runtime.AppState, rect: palette.Rect, label: []const u8,
     const max_w = rect.w - theme.scaledUi(20.0);
     const label_w = @min(runtime.paletteUiTextPrefixWidth(label, font_size, label.len), max_w);
     queueText(state, .{ .x = rect.x + (rect.w - label_w) * 0.5, .y = rect.y + (rect.h - font_size * 1.25) * 0.5, .w = label_w, .h = font_size * 1.25 }, label, if (primary) theme.foregroundOn(fill) else theme.COLOR_WHITE, font_size, rect);
+}
+
+/// Primary button that cannot run yet: muted fill and text, no hover.
+fn renderDisabledButton(state: *runtime.AppState, rect: palette.Rect, label: []const u8) void {
+    const fill = theme.raise(theme.background(), 0.05);
+    queuePanel(state, rect, fill, theme.COLOR_PANEL_MUTED, theme.scaledUi(7.0), 1.0);
+    const font_size = theme.scaledUi(13.5);
+    const max_w = rect.w - theme.scaledUi(20.0);
+    const label_w = @min(runtime.paletteUiTextPrefixWidth(label, font_size, label.len), max_w);
+    queueText(state, .{ .x = rect.x + (rect.w - label_w) * 0.5, .y = rect.y + (rect.h - font_size * 1.25) * 0.5, .w = label_w, .h = font_size * 1.25 }, label, theme.COLOR_TEXT_SUBTLE, font_size, rect);
 }
 
 fn renderChip(state: *runtime.AppState, rect: palette.Rect, label: []const u8, active: bool) void {
