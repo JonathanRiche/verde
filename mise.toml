@@ -79,6 +79,10 @@ dir = "packages/web_app"
 depends = ["web-app-setup"]
 run = "zig build --release=safe && bun run build"
 
+[tasks.stage-remote-access]
+description = "Stages verde-server, verde-web and web assets beside the dev GUI in zig-out (release layout) so Settings → Remote access works from a dev build."
+run = "bash scripts/dev/stage-remote-access.sh"
+
 [tasks.web-app-test]
 description = "Runs packages/web_app Zig unit tests with the repo-pinned Zig."
 dir = "packages/web_app"
