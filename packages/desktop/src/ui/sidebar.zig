@@ -410,6 +410,13 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
         const hit = palette_hits[index];
         if (!rectContainsPoint(hit.rect, x, y)) continue;
 
+        // Opening a chat, terminal or new thread from the rail would land
+        // behind an open Companion (fully hidden when it is expanded), so the
+        // Companion steps aside first.
+        switch (hit.kind) {
+            .open_pane, .new_thread, .new_terminal => if (state.isCompanionEnabled() and state.companion_controller.visibility == .sidecar_open) state.closeCompanion(),
+            else => {},
+        }
         switch (hit.kind) {
             // A hover-revealed rail is hidden: the toggle pins it open.
             .collapse => state.toggleSidebarHidden(),
