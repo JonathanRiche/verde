@@ -73,6 +73,14 @@ pub const HitAction = enum {
     text_copy,
     text_select_all,
     crew_open,
+    /// Crew header: show or hide the crew list.
+    crew_toggle,
+    /// "N done" fold: list or hide the finished crew rows.
+    crew_done_toggle,
+    /// "Clear done": unlink finished crew chats from the companion thread.
+    crew_clear_done,
+    /// "Show all": include rows auto-tidy hid (opened or older than a day).
+    crew_show_all,
     inbox_open,
     suggestion,
     recap,
@@ -648,6 +656,70 @@ pub const ChatRow = struct {
     detail: ShortText = .{},
     provider: ShortText = .{},
     attention: Attention = .idle,
+    /// Daemon `updated_at_ms` of the link (latest task update). Links carry no
+    /// separate finished-at time, so for a done row this stands in for when it
+    /// finished; 0 when unknown (auto-tidy then only uses "already opened").
+    updated_at_ms: i64 = 0,
+};
+
+/// Crew rows the open list shows directly, plus the done fold and the
+/// "Show all" toggle.
+pub const MAX_CREW_LINES: usize = MAX_CREW + 2;
+
+pub const CrewLineKind = enum { row, done_fold, show_all };
+
+pub const CrewLine = struct {
+    kind: CrewLineKind,
+    /// Index into `crew` for `.row` lines.
+    row: usize = 0,
+};
+
+/// What the open crew list shows, in order: rows that are running or need
+/// the user, then the "N done" fold (and its rows while unfolded), then the
+/// "Show all" toggle when auto-tidy hid anything. Empty while collapsed.
+pub const CrewLines = struct {
+    lines: [MAX_CREW_LINES]CrewLine = undefined,
+    count: usize = 0,
+    /// Done rows the fold counts (tidied rows only with "Show all").
+    done_count: usize = 0,
+    /// Done rows auto-tidy hides from the default list.
+    tidied_count: usize = 0,
+};
+
+/// Counts behind the collapsed one-line crew summary.
+pub const CrewSummary = struct {
+    total: usize = 0,
+    needs_you: usize = 0,
+    running: usize = 0,
+    done: usize = 0,
+    idle: usize = 0,
+};
+
+/// Finished crew rows older than this drop out of the default list.
+pub const CREW_TIDY_AGE_MS: i64 = 24 * std.time.ms_per_hour;
+/// Crew chats opened from the list, remembered for auto-tidy (memory only).
+pub const MAX_CREW_OPENED: usize = 32;
+
+/// Line breaks of one wrapped conversation body, reused across frames so a
+/// keystroke or hover does not re-measure the whole history. Offsets index
+/// into the body's cleaned display text, which is cheap to rebuild.
+pub const WRAP_CACHE_MAX_LINES: usize = 64;
+/// Set-associative: a key may live in any of WRAP_CACHE_WAYS slots of its
+/// set, so a full 64-item history never thrashes on colliding keys.
+pub const WRAP_CACHE_SLOTS: usize = 256;
+pub const WRAP_CACHE_WAYS: usize = 4;
+
+pub const WrapCacheEntry = struct {
+    /// Hash of body, wrap width, font, role, line cap and font generation; 0 = empty.
+    key: u64 = 0,
+    /// Last use (cache clock); the least recently used way is evicted.
+    used: u64 = 0,
+    count: u8 = 0,
+    truncated: bool = false,
+    /// Widest measured line, for user bubbles.
+    widest: f32 = 0.0,
+    starts: [WRAP_CACHE_MAX_LINES]u16 = undefined,
+    ends: [WRAP_CACHE_MAX_LINES]u16 = undefined,
 };
 
 /// The active companion's identity as the panel and dock present it.
@@ -881,6 +953,31 @@ crew: [MAX_CREW]ChatRow = [_]ChatRow{.{}} ** MAX_CREW,
 crew_count: usize = 0,
 inbox: [MAX_INBOX]ChatRow = [_]ChatRow{.{}} ** MAX_INBOX,
 inbox_count: usize = 0,
+/// Crew list shown under its one-line summary. Collapsed by default; opens
+/// itself when a crew row starts needing the user (see `setCrew`).
+crew_list_open: bool = false,
+/// Finished rows listed under the "N done" fold.
+crew_done_open: bool = false,
+/// Lists the done rows auto-tidy hides (opened, or older than a day).
+crew_show_all: bool = false,
+/// Rows that needed the user at the last `setCrew`, keyed by chat and
+/// attention, so only a new need re-opens a manually collapsed list.
+crew_need_keys: [MAX_CREW]u64 = [_]u64{0} ** MAX_CREW,
+crew_need_count: usize = 0,
+/// Crew chats opened from the list (ring buffer of chat keys).
+crew_opened: [MAX_CREW_OPENED]u64 = [_]u64{0} ** MAX_CREW_OPENED,
+crew_opened_count: usize = 0,
+crew_opened_next: usize = 0,
+/// Conversation wrap cache; see `WrapCacheEntry`.
+wrap_cache: [WRAP_CACHE_SLOTS]WrapCacheEntry = [_]WrapCacheEntry{.{}} ** WRAP_CACHE_SLOTS,
+wrap_cache_misses: usize = 0,
+wrap_cache_clock: u64 = 0,
+/// Signature of the last projected companion frame; an unchanged thread
+/// skips the rebuild. 0 forces the next projection.
+projection_signature: u64 = 0,
+/// Tail glide while a reply streams (see `easeConversationTail`).
+tail_glide_last_ms: i64 = 0,
+tail_gliding: bool = false,
 roster_rows: [MAX_ROSTER_ROWS]RosterRow = [_]RosterRow{.{}} ** MAX_ROSTER_ROWS,
 roster_row_count: usize = 0,
 /// Remembered conversations of the active companion, newest first.
@@ -1336,6 +1433,7 @@ pub fn setFrame(self: *Self, frame: Frame) void {
         self.conversation_max_scroll = 0.0;
         self.conversation_follow_tail = true;
         self.conversation_content_count = 0;
+        self.tail_gliding = false;
     }
     self.presentation = frame;
     self.refreshPosture();
@@ -1409,10 +1507,180 @@ pub fn setRows(rows: []ChatRow, count: *usize, next: []const ChatRow) void {
     }
 }
 
+/// Replaces the crew. A row that starts needing the user (approval, input,
+/// or a failure it did not have at the last sync) opens the crew list; a
+/// manual collapse otherwise sticks.
 pub fn setCrew(self: *Self, next: []const ChatRow) void {
     setRows(&self.crew, &self.crew_count, next);
+    var keys: [MAX_CREW]u64 = undefined;
+    var count: usize = 0;
+    var new_need = false;
+    for (self.crew[0..self.crew_count]) |*row| {
+        if (!crewRowNeedsYou(row)) continue;
+        const key = crewRowKey(row) ^ (@as(u64, @intFromEnum(row.attention)) +% 1) *% 0x9E3779B97F4A7C15;
+        if (std.mem.indexOfScalar(u64, self.crew_need_keys[0..self.crew_need_count], key) == null) new_need = true;
+        keys[count] = key;
+        count += 1;
+    }
+    @memcpy(self.crew_need_keys[0..count], keys[0..count]);
+    self.crew_need_count = count;
+    if (new_need) self.crew_list_open = true;
     self.refreshPosture();
 }
+
+/// Approval, input, or a failure: rows the crew list surfaces first.
+pub fn crewRowNeedsYou(row: *const ChatRow) bool {
+    return switch (row.attention) {
+        .approval, .blocked, .failed => true,
+        .running, .done, .idle => false,
+    };
+}
+
+/// Stable identity of a crew chat for in-memory bookkeeping.
+pub fn crewRowKey(row: *const ChatRow) u64 {
+    var hasher = std.hash.Wyhash.init(0x6372_6577);
+    hasher.update(row.workspace_id.slice());
+    hasher.update(&.{0});
+    hasher.update(row.thread_id.slice());
+    const key = hasher.final();
+    return if (key == 0) 1 else key;
+}
+
+pub fn toggleCrewList(self: *Self) void {
+    self.crew_list_open = !self.crew_list_open;
+}
+
+pub fn toggleCrewDone(self: *Self) void {
+    self.crew_done_open = !self.crew_done_open;
+}
+
+/// "Show all" also unfolds the done rows so the tidied ones are visible.
+pub fn toggleCrewShowAll(self: *Self) void {
+    self.crew_show_all = !self.crew_show_all;
+    if (self.crew_show_all) self.crew_done_open = true;
+}
+
+/// Remembers that the user opened crew row `index` from the list.
+pub fn noteCrewOpened(self: *Self, index: usize) void {
+    if (index >= self.crew_count) return;
+    const key = crewRowKey(&self.crew[index]);
+    if (std.mem.indexOfScalar(u64, self.crew_opened[0..self.crew_opened_count], key) != null) return;
+    self.crew_opened[self.crew_opened_next] = key;
+    self.crew_opened_next = (self.crew_opened_next + 1) % MAX_CREW_OPENED;
+    self.crew_opened_count = @min(self.crew_opened_count + 1, MAX_CREW_OPENED);
+}
+
+pub fn crewOpened(self: *const Self, row: *const ChatRow) bool {
+    return std.mem.indexOfScalar(u64, self.crew_opened[0..self.crew_opened_count], crewRowKey(row)) != null;
+}
+
+/// Auto-tidy: a done row already opened from the list, or finished more
+/// than a day ago, leaves the default list. Rows without a time
+/// (`updated_at_ms == 0`) only tidy once opened.
+pub fn crewRowTidied(self: *const Self, row: *const ChatRow, now_ms: i64) bool {
+    if (row.attention != .done) return false;
+    if (self.crewOpened(row)) return true;
+    return row.updated_at_ms > 0 and now_ms - row.updated_at_ms > CREW_TIDY_AGE_MS;
+}
+
+pub fn crewSummary(self: *const Self) CrewSummary {
+    var summary: CrewSummary = .{ .total = self.crew_count };
+    for (self.crew[0..self.crew_count]) |*row| switch (row.attention) {
+        .approval, .blocked, .failed => summary.needs_you += 1,
+        .running => summary.running += 1,
+        .done => summary.done += 1,
+        .idle => summary.idle += 1,
+    };
+    return summary;
+}
+
+/// Lines of the open crew list (see `CrewLines`); rows keep `setRows`
+/// order, so what needs the user leads, then running, then idle.
+pub fn crewLines(self: *const Self, now_ms: i64) CrewLines {
+    var result: CrewLines = .{};
+    for (self.crew[0..self.crew_count]) |*row| {
+        if (row.attention != .done) continue;
+        if (self.crewRowTidied(row, now_ms)) result.tidied_count += 1;
+        if (self.crew_show_all or !self.crewRowTidied(row, now_ms)) result.done_count += 1;
+    }
+    if (!self.crew_list_open) return result;
+    for (self.crew[0..self.crew_count], 0..) |*row, index| {
+        if (row.attention == .done) continue;
+        result.lines[result.count] = .{ .kind = .row, .row = index };
+        result.count += 1;
+    }
+    if (result.done_count > 0) {
+        result.lines[result.count] = .{ .kind = .done_fold };
+        result.count += 1;
+        if (self.crew_done_open) {
+            for (self.crew[0..self.crew_count], 0..) |*row, index| {
+                if (row.attention != .done) continue;
+                if (!self.crew_show_all and self.crewRowTidied(row, now_ms)) continue;
+                result.lines[result.count] = .{ .kind = .row, .row = index };
+                result.count += 1;
+            }
+        }
+    }
+    if (result.tidied_count > 0) {
+        result.lines[result.count] = .{ .kind = .show_all };
+        result.count += 1;
+    }
+    return result;
+}
+
+fn wrapCacheSet(self: *Self, key: u64) []WrapCacheEntry {
+    const set: usize = @intCast(key % (WRAP_CACHE_SLOTS / WRAP_CACHE_WAYS));
+    return self.wrap_cache[set * WRAP_CACHE_WAYS ..][0..WRAP_CACHE_WAYS];
+}
+
+/// Cached wrap for `key` (marked as just used), or null on a miss.
+pub fn wrapCacheGet(self: *Self, key: u64) ?*const WrapCacheEntry {
+    for (self.wrapCacheSet(key)) |*entry| {
+        if (entry.key != key) continue;
+        self.wrap_cache_clock += 1;
+        entry.used = self.wrap_cache_clock;
+        return entry;
+    }
+    return null;
+}
+
+/// Stores a wrap in an empty way of its set, else over the least recently
+/// used one.
+pub fn wrapCachePut(self: *Self, entry: WrapCacheEntry) void {
+    self.wrap_cache_misses += 1;
+    self.wrap_cache_clock += 1;
+    const ways = self.wrapCacheSet(entry.key);
+    var victim = &ways[0];
+    for (ways) |*way| {
+        if (way.key == 0 or way.key == entry.key) {
+            victim = way;
+            break;
+        }
+        if (way.used < victim.used) victim = way;
+    }
+    victim.* = entry;
+    victim.used = self.wrap_cache_clock;
+}
+
+/// Tail glide: while a reply streams the followed tail eases toward the
+/// newest line (chat_panel's TAIL_FOLLOW_TAU_MS) instead of hopping a line at
+/// a time. `previous` is the offset drawn last frame; call right after
+/// `updateConversationExtent`, which already moved a followed offset to the
+/// tail. Snaps when not following, when the tail ran a viewport ahead, or
+/// when `glide` is false (nothing streaming, or reduced motion).
+pub fn easeConversationTail(self: *Self, previous: f32, now_ms: i64, viewport_h: f32, glide: bool) void {
+    const target = self.conversation_scroll_y;
+    const last = self.tail_glide_last_ms;
+    self.tail_glide_last_ms = now_ms;
+    self.tail_gliding = false;
+    if (!glide or !self.conversation_follow_tail or target - previous <= 0.5 or target - previous > viewport_h or last == 0) return;
+    const dt: f32 = @floatFromInt(std.math.clamp(now_ms - last, 0, 100));
+    self.conversation_scroll_y = previous + (target - previous) * (1.0 - @exp(-dt / TAIL_GLIDE_TAU_MS));
+    self.tail_gliding = target - self.conversation_scroll_y > 0.5;
+}
+
+/// Matches chat_panel TAIL_FOLLOW_TAU_MS.
+pub const TAIL_GLIDE_TAU_MS: f32 = 90.0;
 
 pub fn setInbox(self: *Self, next: []const ChatRow) void {
     setRows(&self.inbox, &self.inbox_count, next);
@@ -1427,9 +1695,10 @@ pub fn scrollConversation(self: *Self, delta: f32) void {
 /// Pins the conversation to its newest line while the user has not scrolled
 /// away; a manual offset survives growth until they return to the tail.
 pub fn updateConversationExtent(self: *Self, max_scroll: f32) void {
-    const grew = self.presentation.activity_count != self.conversation_content_count or max_scroll > self.conversation_max_scroll;
     const was_at_tail = self.conversation_follow_tail or self.conversation_max_scroll - self.conversation_scroll_y <= 2.0;
-    if (grew and was_at_tail) {
+    // A followed tail always targets the newest line, so a glide that is
+    // still catching up (see `easeConversationTail`) keeps following.
+    if (was_at_tail) {
         self.conversation_scroll_y = max_scroll;
     } else {
         self.conversation_scroll_y = std.math.clamp(self.conversation_scroll_y, 0.0, max_scroll);
@@ -1825,4 +2094,163 @@ test "schedule ids are exact or rejected" {
     try std.testing.expectEqualStrings("sch-1792430000000-ab12", id.slice());
     const empty: ScheduleId = .{};
     try std.testing.expect(!empty.eql(&empty));
+}
+
+fn testCrewRow(thread_id: []const u8, attention: Attention, updated_at_ms: i64) ChatRow {
+    var row: ChatRow = .{ .attention = attention, .updated_at_ms = updated_at_ms };
+    _ = row.workspace_id.set("ws");
+    _ = row.thread_id.set(thread_id);
+    row.title.set(thread_id);
+    return row;
+}
+
+test "crew list starts collapsed, opens on a new need, and a manual collapse sticks" {
+    var companion = Self.init();
+    var rows: [2]ChatRow = .{ testCrewRow("a", .running, 0), testCrewRow("b", .done, 0) };
+    companion.setCrew(&rows);
+    try std.testing.expect(!companion.crew_list_open);
+    try std.testing.expectEqual(@as(usize, 0), companion.crewLines(0).count);
+
+    // Running -> approval is a new need: the list opens itself.
+    rows[0].attention = .approval;
+    companion.setCrew(&rows);
+    try std.testing.expect(companion.crew_list_open);
+    // The user collapses it; the same need on later syncs leaves it shut.
+    companion.toggleCrewList();
+    companion.setCrew(&rows);
+    companion.setCrew(&rows);
+    try std.testing.expect(!companion.crew_list_open);
+    // A different row failing is a new need and re-opens it.
+    rows[1].attention = .failed;
+    companion.setCrew(&rows);
+    try std.testing.expect(companion.crew_list_open);
+    // Clearing the needs and raising one again counts as new too.
+    companion.toggleCrewList();
+    rows[0].attention = .running;
+    rows[1].attention = .done;
+    companion.setCrew(&rows);
+    try std.testing.expect(!companion.crew_list_open);
+    rows[0].attention = .blocked;
+    companion.setCrew(&rows);
+    try std.testing.expect(companion.crew_list_open);
+}
+
+test "crew open list leads with running and needs-you rows and folds done rows" {
+    var companion = Self.init();
+    var rows: [5]ChatRow = .{
+        testCrewRow("done-1", .done, 0),
+        testCrewRow("run", .running, 0),
+        testCrewRow("done-2", .done, 0),
+        testCrewRow("ask", .approval, 0),
+        testCrewRow("done-3", .done, 0),
+    };
+    companion.setCrew(&rows);
+    const summary = companion.crewSummary();
+    try std.testing.expectEqual(@as(usize, 5), summary.total);
+    try std.testing.expectEqual(@as(usize, 1), summary.needs_you);
+    try std.testing.expectEqual(@as(usize, 1), summary.running);
+    try std.testing.expectEqual(@as(usize, 3), summary.done);
+
+    companion.crew_list_open = true;
+    var lines = companion.crewLines(0);
+    try std.testing.expectEqual(@as(usize, 3), lines.count);
+    try std.testing.expectEqualStrings("ask", companion.crew[lines.lines[0].row].title.slice());
+    try std.testing.expectEqualStrings("run", companion.crew[lines.lines[1].row].title.slice());
+    try std.testing.expectEqual(CrewLineKind.done_fold, lines.lines[2].kind);
+    try std.testing.expectEqual(@as(usize, 3), lines.done_count);
+
+    companion.toggleCrewDone();
+    lines = companion.crewLines(0);
+    try std.testing.expectEqual(@as(usize, 6), lines.count);
+    for (lines.lines[3..6]) |line| {
+        try std.testing.expectEqual(CrewLineKind.row, line.kind);
+        try std.testing.expectEqual(Attention.done, companion.crew[line.row].attention);
+    }
+}
+
+test "crew auto-tidy hides opened or day-old done rows until show all" {
+    var companion = Self.init();
+    const now: i64 = 10 * std.time.ms_per_day;
+    var rows: [4]ChatRow = .{
+        testCrewRow("fresh", .done, now - std.time.ms_per_hour),
+        testCrewRow("stale", .done, now - 2 * std.time.ms_per_day),
+        testCrewRow("opened", .done, now - std.time.ms_per_min),
+        testCrewRow("untimed", .done, 0),
+    };
+    companion.setCrew(&rows);
+    for (companion.crew[0..companion.crew_count], 0..) |*row, index| {
+        if (std.mem.eql(u8, row.title.slice(), "opened")) companion.noteCrewOpened(index);
+    }
+    // A running row is never tidied, however old.
+    try std.testing.expect(!companion.crewRowTidied(&testCrewRow("old-run", .running, 1), now));
+
+    companion.crew_list_open = true;
+    companion.crew_done_open = true;
+    var lines = companion.crewLines(now);
+    try std.testing.expectEqual(@as(usize, 2), lines.tidied_count);
+    try std.testing.expectEqual(@as(usize, 2), lines.done_count);
+    // Fold, the two kept rows, then "Show all".
+    try std.testing.expectEqual(@as(usize, 4), lines.count);
+    try std.testing.expectEqual(CrewLineKind.show_all, lines.lines[3].kind);
+    for (lines.lines[1..3]) |line| {
+        const title = companion.crew[line.row].title.slice();
+        try std.testing.expect(std.mem.eql(u8, title, "fresh") or std.mem.eql(u8, title, "untimed"));
+    }
+
+    companion.toggleCrewShowAll();
+    lines = companion.crewLines(now);
+    try std.testing.expectEqual(@as(usize, 4), lines.done_count);
+    try std.testing.expectEqual(@as(usize, 6), lines.count);
+    try std.testing.expectEqual(CrewLineKind.show_all, lines.lines[5].kind);
+    companion.toggleCrewShowAll();
+    try std.testing.expectEqual(@as(usize, 4), companion.crewLines(now).count);
+}
+
+test "wrap cache keeps colliding keys per set and evicts the least recently used" {
+    var companion = Self.init();
+    const sets: u64 = WRAP_CACHE_SLOTS / WRAP_CACHE_WAYS;
+    try std.testing.expect(companion.wrapCacheGet(42) == null);
+    companion.wrapCachePut(.{ .key = 42, .count = 3, .widest = 120.0 });
+    try std.testing.expectEqual(@as(u8, 3), companion.wrapCacheGet(42).?.count);
+    // Keys sharing the set all stay until the set is full.
+    for (1..WRAP_CACHE_WAYS) |way| companion.wrapCachePut(.{ .key = 42 + sets * way, .count = @intCast(way) });
+    try std.testing.expect(companion.wrapCacheGet(42) != null);
+    for (1..WRAP_CACHE_WAYS) |way| try std.testing.expect(companion.wrapCacheGet(42 + sets * way) != null);
+    // One more evicts the least recently used (42 + sets), never mis-serving it.
+    _ = companion.wrapCacheGet(42);
+    companion.wrapCachePut(.{ .key = 42 + sets * WRAP_CACHE_WAYS, .count = 9 });
+    try std.testing.expect(companion.wrapCacheGet(42 + sets) == null);
+    try std.testing.expectEqual(@as(u8, 3), companion.wrapCacheGet(42).?.count);
+    try std.testing.expectEqual(@as(u8, 9), companion.wrapCacheGet(42 + sets * WRAP_CACHE_WAYS).?.count);
+    try std.testing.expectEqual(@as(usize, WRAP_CACHE_WAYS + 1), companion.wrap_cache_misses);
+}
+
+test "conversation tail glides toward a streaming tail and stops when the user scrolls away" {
+    var companion = Self.init();
+    companion.presentation.activity_count = 1;
+    companion.updateConversationExtent(100.0);
+    companion.easeConversationTail(100.0, 1_000, 400.0, true);
+    try std.testing.expectEqual(@as(f32, 100.0), companion.conversation_scroll_y);
+    // One new line: the offset eases instead of hopping, and keeps following.
+    var previous = companion.conversation_scroll_y;
+    companion.updateConversationExtent(130.0);
+    companion.easeConversationTail(previous, 1_016, 400.0, true);
+    try std.testing.expect(companion.conversation_scroll_y > 100.0 and companion.conversation_scroll_y < 130.0);
+    try std.testing.expect(companion.tail_gliding);
+    try std.testing.expect(companion.conversation_follow_tail);
+    var now: i64 = 1_016;
+    while (companion.tail_gliding) {
+        now += 16;
+        previous = companion.conversation_scroll_y;
+        companion.updateConversationExtent(130.0);
+        companion.easeConversationTail(previous, now, 400.0, true);
+    }
+    try std.testing.expectApproxEqAbs(@as(f32, 130.0), companion.conversation_scroll_y, 0.5);
+    // Without streaming (or under reduced motion) it snaps.
+    previous = companion.conversation_scroll_y;
+    companion.updateConversationExtent(160.0);
+    companion.easeConversationTail(previous, now + 16, 400.0, false);
+    try std.testing.expectEqual(@as(f32, 160.0), companion.conversation_scroll_y);
+    companion.scrollConversation(-50.0);
+    try std.testing.expect(!companion.conversation_follow_tail);
 }

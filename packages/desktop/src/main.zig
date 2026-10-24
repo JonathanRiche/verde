@@ -1738,6 +1738,8 @@ fn activeContinuousFrames(state: *AppState) bool {
         // Streamed reply text reveals a few characters per frame; the
         // tail-follow scroll eases behind it. Both are false when idle.
         state.streamRevealAnimating() or
+        // The open Companion reveals its own streamed reply the same way.
+        state.companionStreamRevealAnimating() or
         chat_panel_ui.isTailFollowAnimating() or
         ui_layout.isSidebarAnimating() or
         // Run-config stepper thumbs slide for ~160ms after a selection.

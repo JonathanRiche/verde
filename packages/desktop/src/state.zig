@@ -2529,11 +2529,15 @@ fn paletteComposerStyle() PaletteComposerPrompt.Style {
 
 fn companionComposerStyle() CompanionComposerPrompt.Style {
     const chrome = theme.companionChrome();
+    // The component scales this by the display scale; pick the logical width
+    // that lands on whole device pixels (1.5 like the chat composer: 2 px at
+    // 1x and 1.25x, 3 px at 2x) so the focus ring never straddles pixel rows.
+    const scale = @max(theme.displayScaleFactor(), 0.1);
     return .{
         .background_color = paletteColor(chrome.surface),
         .border_color = paletteColor(chrome.border),
         .focus_border_color = paletteColor(chrome.accent),
-        .focus_border_width = 1.0,
+        .focus_border_width = @max(@round(COMPANION_COMPOSER_FOCUS_BORDER_WIDTH * scale), 1.0) / scale,
         .control_background_color = paletteColor(theme.withAlpha(chrome.controls, 0)),
         .control_hover_color = paletteColor(theme.withAlpha(chrome.controls, 70)),
         .separator_color = paletteColor(chrome.hairline),
@@ -2653,8 +2657,12 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .z_index = 120,
 });
 
+/// Focus ring width in logical units, matching the chat composer's.
+const COMPANION_COMPOSER_FOCUS_BORDER_WIDTH: f32 = 1.5;
+
 /// The Companion uses the shared Palette composer behavior with the accepted
-/// compact steering geometry from its sidecar footer.
+/// compact steering geometry from its sidecar footer. Border, focus ring and
+/// corner radius match the chat composer so the two frames read alike.
 pub const CompanionComposerPrompt = palette.composerPrompt(.{
     .padding_x = 11.0,
     .padding_y = 9.0,
@@ -2666,12 +2674,12 @@ pub const CompanionComposerPrompt = palette.composerPrompt(.{
     .pill_chevron_gap = 0.0,
     .model_min_width = 126.0,
     .model_max_width = 220.0,
-    .corner_radius = 14.0,
+    .corner_radius = 18.0,
     .border_width = 1.0,
     .background_color = paletteColor(theme.companionChromeFor(theme.default_colors).surface),
     .border_color = paletteColor(theme.companionChromeFor(theme.default_colors).border),
     .focus_border_color = paletteColor(theme.default_colors.accent),
-    .focus_border_width = 1.0,
+    .focus_border_width = COMPANION_COMPOSER_FOCUS_BORDER_WIDTH,
     // Same faces and sizes as the chat composer so the two read alike.
     .bold_font_role = .ui,
     .control_background_color = paletteColor(theme.withAlpha(theme.default_colors.border_muted, 0)),
@@ -13055,12 +13063,16 @@ pub const AppState = struct {
             frame.event_author.set(event.author);
             frame.event_body.set(event.body);
         }
-        frame.partial_text.set(send_state.partial_text.items);
-        if (send_state.partial_text.items.len > 0) {
+        // Deltas arrive in bursts; like a chat pane, the reply shows only the
+        // revealed prefix, which `pollSend` advances once per frame for every
+        // in-flight thread (the Companion's included) at the chat's pace.
+        const revealed = send_state.streamRevealedText();
+        frame.partial_text.set(revealed);
+        if (revealed.len > 0) {
             // Streaming deltas are this turn's answer-in-progress, so the
             // Result region updates live rather than after completion.
-            frame.answer.set(send_state.partial_text.items);
-            appendCompanionActivity(frame, "streaming", "Sprout", send_state.partial_text.items, .streaming, base_sequence + @as(i64, @intCast(send_state.pending_events.items.len)));
+            frame.answer.set(revealed);
+            appendCompanionActivity(frame, "streaming", "Sprout", revealed, .streaming, base_sequence + @as(i64, @intCast(send_state.pending_events.items.len)));
         }
     }
 
@@ -13366,6 +13378,22 @@ pub const AppState = struct {
         return self.isCompanionEnabled() and self.companion_controller.transitionAnimating();
     }
 
+    /// Continuous-frame signal for the open Companion: its streamed reply
+    /// still has text to reveal (advanced per frame by `pollSend`, like the
+    /// current chat's), or the conversation is gliding after the tail. The
+    /// focused chat's own reveal stays with `streamRevealAnimating`; this only
+    /// asks for frames, so a companion thread that is also the current chat
+    /// is never advanced twice. False when idle.
+    pub fn companionStreamRevealAnimating(self: *AppState) bool {
+        if (!self.isCompanionEnabled() or self.companion_controller.visibility != .sidecar_open) return false;
+        if (self.companion_controller.tail_gliding) return true;
+        const thread = self.activeCompanionThread() orelse return false;
+        const send_state = thread.send_state;
+        if (!send_state.mutex.tryLock()) return false;
+        defer send_state.mutex.unlock();
+        return send_state.status == .pending and send_state.streamRevealPending();
+    }
+
     pub fn activeCompanionThread(self: *AppState) ?*ChatThread {
         const location = self.activeCompanionThreadLocation() orelse return null;
         return &self.project_controller.projects.items[location.project_index].threads.items[location.thread_index];
@@ -13557,6 +13585,7 @@ pub const AppState = struct {
             _ = owner_frame.setOwner(project.id, thread.local_thread_id);
             self.companion_controller.setFrame(owner_frame);
             self.companion_controller.clearHits();
+            self.companion_controller.projection_signature = 0;
         }
         // After a restart only focused panes hydrate their transcript; the
         // Companion's thread rarely is one, so load its newest page here or
@@ -13580,6 +13609,10 @@ pub const AppState = struct {
         const send_state = thread.send_state;
         if (!send_state.mutex.tryLock()) return;
         defer send_state.mutex.unlock();
+        // Runs on every input event and frame: an unchanged thread keeps the
+        // frame it already has instead of rebuilding and copying it.
+        const signature = self.companionFrameSignature(project, thread, send_state);
+        if (signature == self.companion_controller.projection_signature) return;
 
         var frame: companion_controller.Frame = .{ .has_thread = true };
         _ = frame.setOwner(project.id, thread.local_thread_id);
@@ -13603,6 +13636,71 @@ pub const AppState = struct {
             frame.provider_error.slice().len > 0 or frame.control_error.slice().len > 0 or frame.ui_error.slice().len > 0;
         frame.sortOperations();
         self.companion_controller.setFrame(frame);
+        self.companion_controller.projection_signature = signature;
+    }
+
+    /// Fingerprint of everything `syncCompanionFrameForThread` reads. Rows are
+    /// keyed by body address and length (the newest few by content too, in
+    /// case one grows in place), tool and task status, and the send state's
+    /// revision, reveal and errors. Never 0, which forces a rebuild.
+    fn companionFrameSignature(self: *const AppState, project: *const Project, thread: *const ChatThread, send_state: *const SendState) u64 {
+        const Fold = struct {
+            hasher: std.hash.Wyhash,
+            fn int(fold: *@This(), value: u64) void {
+                fold.hasher.update(std.mem.asBytes(&value));
+            }
+            fn slice(fold: *@This(), value: ?[]const u8) void {
+                const bytes = value orelse "";
+                fold.int(@intFromPtr(bytes.ptr));
+                fold.int(bytes.len);
+            }
+            fn toolStatus(fold: *@This(), value: ?provider_types.ToolCallStatus) void {
+                fold.int(if (value) |status| @as(u64, @intFromEnum(status)) + 1 else 0);
+            }
+        };
+        var fold: Fold = .{ .hasher = std.hash.Wyhash.init(0x636f_6d70) };
+        fold.hasher.update(project.id);
+        fold.hasher.update(&.{0});
+        fold.hasher.update(thread.local_thread_id);
+        const messages = thread.messages.items;
+        fold.int(messages.len);
+        for (messages, 0..) |message, index| {
+            fold.int(@intFromEnum(message.role));
+            fold.slice(message.author);
+            fold.slice(message.body);
+            fold.slice(message.tool_call_id);
+            fold.toolStatus(message.tool_call_status);
+            if (index + 4 >= messages.len) fold.hasher.update(message.body);
+        }
+        fold.int(@intFromEnum(send_state.status));
+        fold.int(send_state.ui_revision);
+        fold.int(send_state.reveal_len);
+        fold.int(send_state.reveal_hold);
+        fold.int(send_state.partial_text.items.len);
+        fold.int(send_state.pending_events.items.len);
+        for (send_state.pending_events.items) |event| {
+            fold.slice(event.body);
+            fold.toolStatus(event.tool_call_status);
+        }
+        fold.int(@intFromBool(send_state.pending_approval != null));
+        if (send_state.pending_approval) |approval| {
+            fold.slice(approval.call_id);
+            fold.slice(approval.title);
+            fold.slice(approval.body);
+        }
+        fold.int(@intFromBool(send_state.approval_decision != null));
+        fold.slice(send_state.error_message);
+        fold.slice(send_state.control_error_message);
+        fold.int(thread.background_tasks.items.len);
+        for (thread.background_tasks.items) |task| {
+            fold.int(@intFromEnum(task.status));
+            fold.int(@bitCast(task.started_at_ms));
+            fold.int(@bitCast(task.updated_at_ms));
+        }
+        fold.int(project.terminal_process_outcomes.items.len);
+        fold.slice(self.companion_controller.ui_error);
+        const signature = fold.hasher.final();
+        return if (signature == 0) 1 else signature;
     }
 
     fn companionBrainProviders(self: *AppState, out: *[companion_controller.MAX_BRAIN_PROVIDERS]Provider) usize {
@@ -13855,12 +13953,47 @@ pub const AppState = struct {
                     row.title.set(if (entry.title.len > 0) entry.title else "Untitled chat");
                     row.provider.set(entry.provider);
                     row.detail.set(firstLine(entry.summary));
+                    // Links have no finished-at time; the last update stands in.
+                    row.updated_at_ms = entry.updated_at_ms;
                     rows[count] = row;
                     count += 1;
                 }
             }
         }
         self.companion_controller.setCrew(rows[0..count]);
+    }
+
+    /// "Clear done" in the crew: unlinks the companion thread's finished
+    /// ("done") crew chats through the same daemon `chat.links.clear` path as
+    /// the chat's linked-chats drawer. `completed_only` would also hide
+    /// failed and stopped links, which the crew still shows as needing the
+    /// user, so when any exist the completed links are cleared one by one.
+    /// Never cancels or deletes a child conversation.
+    pub fn clearCompanionCrewDone(self: *AppState) void {
+        const location = self.activeCompanionThreadLocation() orelse return;
+        const project = &self.project_controller.projects.items[location.project_index];
+        const thread = &project.threads.items[location.thread_index];
+        const parent = self.linked_chats.find(project.id, thread.local_thread_id) orelse return;
+        var other_finished = false;
+        for (parent.entries.items) |entry| {
+            if (!entry.is_parent and entry.status.isFinished() and entry.status != .completed) other_finished = true;
+        }
+        if (!other_finished) return self.clearLinkedChats(project.id, thread.local_thread_id, null);
+        // Copy the ids first: each clear drops its entry from `parent.entries`.
+        var ids: std.ArrayList([]u8) = .empty;
+        defer {
+            for (ids.items) |id| self.allocator.free(id);
+            ids.deinit(self.allocator);
+        }
+        for (parent.entries.items) |entry| {
+            if (entry.is_parent or entry.status != .completed) continue;
+            const id = self.allocator.dupe(u8, entry.link_id) catch continue;
+            ids.append(self.allocator, id) catch {
+                self.allocator.free(id);
+                continue;
+            };
+        }
+        for (ids.items) |id| self.clearLinkedChats(project.id, thread.local_thread_id, id);
     }
 
     /// Every chat on the machine that is waiting on the user, so the
@@ -20211,4 +20344,26 @@ fn pixelLuma(pixel: *const [4]u8) f32 {
     const g: f32 = @floatFromInt(pixel[1]);
     const b: f32 = @floatFromInt(pixel[2]);
     return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0;
+}
+
+test "companion stream projection shows only the revealed prefix" {
+    var send_state: SendState = .{ .status = .pending };
+    defer send_state.partial_text.deinit(std.heap.page_allocator);
+    try send_state.partial_text.appendSlice(std.heap.page_allocator, "Hello there, streaming world");
+    send_state.reveal_len = 5;
+    const frame = try std.testing.allocator.create(companion_controller.Frame);
+    defer std.testing.allocator.destroy(frame);
+    frame.* = .{ .has_thread = true };
+    _ = frame.setOwner("ws", "chat");
+    AppState.projectCompanionPending(frame, &send_state);
+    try std.testing.expectEqual(@as(usize, 1), frame.activity_count);
+    try std.testing.expectEqual(companion_controller.ActivityKind.streaming, frame.activity[0].kind);
+    try std.testing.expectEqualStrings("Hello", frame.activity[0].body.slice());
+    try std.testing.expectEqualStrings("Hello", frame.partial_text.slice());
+
+    // Nothing revealed yet: no streaming row, even with text buffered.
+    send_state.reveal_len = 0;
+    frame.* = .{ .has_thread = true };
+    AppState.projectCompanionPending(frame, &send_state);
+    try std.testing.expectEqual(@as(usize, 0), frame.activity_count);
 }

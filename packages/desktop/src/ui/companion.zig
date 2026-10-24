@@ -47,10 +47,22 @@ const FOOTER_HEIGHT: f32 = 132.0;
 const CONTENT_INSET: f32 = 14.0;
 const SECTION_TITLE_HEIGHT: f32 = 24.0;
 const INBOX_ROW_HEIGHT: f32 = 46.0;
-const CREW_ROW_HEIGHT: f32 = 40.0;
 const ROW_GAP: f32 = 6.0;
 const MAX_INBOX_ROWS_SHOWN: usize = 3;
-const MAX_CREW_ROWS_SHOWN: usize = 4;
+/// Crew: a one-line summary header, then one-line rows when open.
+const CREW_HEADER_HEIGHT: f32 = 26.0;
+const CREW_LINE_HEIGHT: f32 = 30.0;
+const CREW_LINE_GAP: f32 = 4.0;
+/// Expanded panel: the crew moves into a right-hand column this wide, like a
+/// chat's linked-chats drawer, when the conversation keeps at least
+/// CREW_COLUMN_MIN_CONTENT beside it.
+const CREW_COLUMN_WIDTH: f32 = 300.0;
+const CREW_COLUMN_MIN_CONTENT: f32 = 460.0;
+const CREW_COLUMN_PAD: f32 = 12.0;
+/// In the side panel the open crew takes at most this share of the body.
+const CREW_STACK_MAX_SHARE: f32 = 0.5;
+/// Preview tooltips on crew rows are capped to this width.
+const CREW_TOOLTIP_MAX: f32 = 360.0;
 const APPROVAL_HEIGHT: f32 = 104.0;
 const ERROR_STRIP_HEIGHT: f32 = 30.0;
 const RECAP_HEIGHT: f32 = 42.0;
@@ -131,7 +143,12 @@ pub const Geometry = struct {
     live_end_button: palette.Rect,
     close_button: palette.Rect,
     inbox: palette.Rect,
+    /// Crew section: summary header plus the open list; zero-sized when the
+    /// companion has no crew or the schedules view is shown.
     crew: palette.Rect,
+    /// Right-hand crew column of the expanded panel; zero-sized when the crew
+    /// stacks above the conversation instead.
+    crew_column: palette.Rect,
     /// Zero-sized while the schedules view replaces it.
     conversation: palette.Rect,
     /// Scheduled-tasks view body; zero-sized in the conversation view.
@@ -223,7 +240,15 @@ pub fn handleMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, d
                 selectAllConversation(state, computeGeometry(state, state.companion_controller.frame_width, state.companion_controller.frame_height).conversation);
                 state.companion_controller.closeMenu();
             },
-            .crew_open => state.openCompanionChatRow(false, result.index),
+            .crew_open => {
+                // Opened from the list: auto-tidy drops it once it is done.
+                state.companion_controller.noteCrewOpened(result.index);
+                state.openCompanionChatRow(false, result.index);
+            },
+            .crew_toggle => state.companion_controller.toggleCrewList(),
+            .crew_done_toggle => state.companion_controller.toggleCrewDone(),
+            .crew_show_all => state.companion_controller.toggleCrewShowAll(),
+            .crew_clear_done => state.clearCompanionCrewDone(),
             .inbox_open => state.openCompanionChatRow(true, result.index),
             .suggestion => state.sendCompanionSuggestion(result.index),
             .toggle_expand => state.companion_controller.expanded = !state.companion_controller.expanded,
@@ -575,8 +600,22 @@ fn computeGeometryAt(state: *runtime.AppState, width: f32, height: f32, s: f32) 
     const panel_w = @max(@min(if (companion.expanded) @max(expanded_w, PANEL_WIDTH * s) else PANEL_WIDTH * s, window.w - inset * 2.0), 0.0);
     const panel: palette.Rect = .{ .x = window.w - inset - panel_w, .y = inset, .w = panel_w, .h = @max(window.h - inset * 2.0, 0.0) };
     const header: palette.Rect = .{ .x = panel.x, .y = panel.y, .w = panel.w, .h = @min(HEADER_HEIGHT * s, panel.h) };
+    // Crew placement: stacked above the conversation, or, when expanded with
+    // room to spare, in a right-hand column beside the body and composer so
+    // the conversation keeps its full height, centered in what is left.
+    const schedules_view = companion.view == .schedules;
+    const has_crew = !schedules_view and companion.crew_count > 0;
+    const side_crew = has_crew and companion.expanded and panel.w - CREW_COLUMN_WIDTH * s >= CREW_COLUMN_MIN_CONTENT * s;
+    const column_w: f32 = if (side_crew) CREW_COLUMN_WIDTH * s else 0.0;
+    const content: palette.Rect = .{ .x = panel.x, .y = panel.y, .w = panel.w - column_w, .h = panel.h };
+    const crew_column: palette.Rect = if (side_crew) .{
+        .x = content.x + content.w,
+        .y = header.y + header.h,
+        .w = column_w,
+        .h = @max(panel.y + panel.h - header.y - header.h, 0.0),
+    } else .{};
     const footer_h = @min(FOOTER_HEIGHT * s, @max(panel.h - header.h, 0.0));
-    const footer: palette.Rect = .{ .x = panel.x, .y = panel.y + panel.h - footer_h, .w = panel.w, .h = footer_h };
+    const footer: palette.Rect = .{ .x = content.x, .y = panel.y + panel.h - footer_h, .w = content.w, .h = footer_h };
 
     const button = HEADER_BUTTON * s;
     const button_y = header.y + (header.h - button) * 0.5;
@@ -598,12 +637,11 @@ fn computeGeometryAt(state: *runtime.AppState, width: f32, height: f32, s: f32) 
 
     // Body stack between header and footer: inbox, crew, conversation, approval.
     // The schedules view takes the inbox, crew, and conversation's place.
-    const schedules_view = companion.view == .schedules;
     var top = header.y + header.h;
     var bottom = footer.y;
     // Sections share the capped, centered reading column of the conversation.
-    const inner_w = @min(@max(panel.w - CONTENT_INSET * 2.0 * s, 0.0), theme.scaledUi(READING_MAX_CSS));
-    const inner_x = panel.x + @max((panel.w - inner_w) * 0.5, 0.0);
+    const inner_w = @min(@max(content.w - CONTENT_INSET * 2.0 * s, 0.0), theme.scaledUi(READING_MAX_CSS));
+    const inner_x = content.x + @max((content.w - inner_w) * 0.5, 0.0);
 
     const live = state.live_voice.presentation();
     const live_h: f32 = if (live.active()) LIVE_STRIP_HEIGHT * s else if (live.error_message != null) LIVE_STRIP_ERROR_HEIGHT * s else 0.0;
@@ -626,11 +664,19 @@ fn computeGeometryAt(state: *runtime.AppState, width: f32, height: f32, s: f32) 
     const inbox_h: f32 = if (inbox_rows == 0) 0.0 else (SECTION_TITLE_HEIGHT + @as(f32, @floatFromInt(inbox_rows)) * (INBOX_ROW_HEIGHT + ROW_GAP) + 6.0) * s;
     const inbox: palette.Rect = .{ .x = inner_x, .y = top + 8.0 * s, .w = inner_w, .h = @min(inbox_h, @max(bottom - top - 8.0 * s, 0.0)) };
     if (inbox_h > 0.0) top = inbox.y + inbox.h;
-    const crew_rows = if (schedules_view) 0 else @min(companion.crew_count, MAX_CREW_ROWS_SHOWN);
-    const crew_h: f32 = if (crew_rows == 0) 0.0 else (SECTION_TITLE_HEIGHT + @as(f32, @floatFromInt(crew_rows)) * (CREW_ROW_HEIGHT + ROW_GAP) + 6.0) * s;
-    const crew: palette.Rect = .{ .x = inner_x, .y = top + 8.0 * s, .w = inner_w, .h = @min(crew_h, @max(bottom - top - 8.0 * s, 0.0)) };
-    if (crew_h > 0.0) top = crew.y + crew.h;
-    const body: palette.Rect = .{ .x = panel.x, .y = top + 4.0 * s, .w = panel.w, .h = @max(bottom - top - 4.0 * s, 0.0) };
+    const crew_h: f32 = if (has_crew) crewSectionHeight(state, s) else 0.0;
+    var crew: palette.Rect = .{};
+    if (side_crew) {
+        const pad = CREW_COLUMN_PAD * s;
+        crew = .{ .x = crew_column.x + pad, .y = crew_column.y + 10.0 * s, .w = @max(crew_column.w - pad * 2.0, 0.0), .h = @min(crew_h, @max(crew_column.h - 20.0 * s, 0.0)) };
+    } else if (has_crew) {
+        // The header always fits; an open list takes at most a share of the body.
+        const available = @max(bottom - top - 8.0 * s, 0.0);
+        const cap = @min(@max(available * CREW_STACK_MAX_SHARE, CREW_HEADER_HEIGHT * s), available);
+        crew = .{ .x = inner_x, .y = top + 8.0 * s, .w = inner_w, .h = @min(crew_h, cap) };
+        top = crew.y + crew.h;
+    }
+    const body: palette.Rect = .{ .x = content.x, .y = top + 4.0 * s, .w = content.w, .h = @max(bottom - top - 4.0 * s, 0.0) };
     const conversation: palette.Rect = if (schedules_view) .{ .x = body.x, .y = body.y } else body;
     const schedules: palette.Rect = if (schedules_view) body else .{ .x = body.x, .y = body.y };
 
@@ -657,6 +703,7 @@ fn computeGeometryAt(state: *runtime.AppState, width: f32, height: f32, s: f32) 
         .close_button = close_button,
         .inbox = inbox,
         .crew = crew,
+        .crew_column = crew_column,
         .conversation = conversation,
         .schedules = schedules,
         .approval = approval,
@@ -689,7 +736,51 @@ fn composerRect(footer: palette.Rect) palette.Rect {
     if (footer.w < 180.0 * s or footer.h < 70.0 * s) return .{ .x = footer.x, .y = footer.y };
     // Capped like the reading column so an expanded panel keeps a chat-width composer.
     const w = @min(footer.w - 24.0 * s, theme.scaledUi(READING_MAX_CSS) + 24.0 * s);
-    return .{ .x = footer.x + (footer.w - w) * 0.5, .y = footer.y + 10.0 * s, .w = w, .h = footer.h - 22.0 * s };
+    // Crisp chrome: each edge lands on a whole device pixel. The composer
+    // draws its frame, text and toolbar straight from these bounds, so a
+    // fractional rect at 1.25x left the rounded border and its contents off
+    // the pixel grid (the chat composer's frame is snapped the same way).
+    return snappedRect(.{ .x = footer.x + (footer.w - w) * 0.5, .y = footer.y + 10.0 * s, .w = w, .h = footer.h - 22.0 * s });
+}
+
+/// Open crew lines for the current time (auto-tidy reads the clock).
+fn crewLinesNow(state: *runtime.AppState) controller.CrewLines {
+    return state.companion_controller.crewLines(platform_runtime.unixTimestampMs());
+}
+
+/// Summary header plus every open line; geometry caps what is shown.
+fn crewSectionHeight(state: *runtime.AppState, s: f32) f32 {
+    const count: f32 = @floatFromInt(crewLinesNow(state).count);
+    return (CREW_HEADER_HEIGHT + count * (CREW_LINE_HEIGHT + CREW_LINE_GAP)) * s;
+}
+
+fn crewHeaderRect(section: palette.Rect) palette.Rect {
+    return .{ .x = section.x, .y = section.y, .w = section.w, .h = @min(CREW_HEADER_HEIGHT * companionScale(), section.h) };
+}
+
+fn crewLineRect(section: palette.Rect, index: usize) palette.Rect {
+    const s = companionScale();
+    return .{
+        .x = section.x,
+        .y = section.y + (CREW_HEADER_HEIGHT + @as(f32, @floatFromInt(index)) * (CREW_LINE_HEIGHT + CREW_LINE_GAP)) * s,
+        .w = section.w,
+        .h = CREW_LINE_HEIGHT * s,
+    };
+}
+
+/// Lines past the section's (capped) height are neither drawn nor hit.
+fn crewLineFits(section: palette.Rect, line: palette.Rect) bool {
+    return line.y + line.h <= section.y + section.h + 1.0;
+}
+
+const CREW_CLEAR_LABEL = "Clear done";
+
+/// "Clear done" button at the right end of the done fold.
+fn crewClearButton(line: palette.Rect) palette.Rect {
+    const s = companionScale();
+    const w = text_measure.textWidth(.ui_bold, 10.5 * s, CREW_CLEAR_LABEL) + 16.0 * s;
+    const h = 20.0 * s;
+    return .{ .x = line.x + line.w - w - 6.0 * s, .y = line.y + (line.h - h) * 0.5, .w = w, .h = h };
 }
 
 fn rowRect(section: palette.Rect, index: usize, row_h: f32) palette.Rect {
@@ -744,10 +835,7 @@ fn registerHits(state: *runtime.AppState, geometry: Geometry) void {
                 const row = rowRect(geometry.inbox, index, INBOX_ROW_HEIGHT);
                 if (row.y + row.h <= geometry.inbox.y + geometry.inbox.h + 1.0) companion.addIndexedHit(row, .inbox_open, index);
             }
-            for (0..@min(companion.crew_count, MAX_CREW_ROWS_SHOWN)) |index| {
-                const row = rowRect(geometry.crew, index, CREW_ROW_HEIGHT);
-                if (row.y + row.h <= geometry.crew.y + geometry.crew.h + 1.0) companion.addIndexedHit(row, .crew_open, index);
-            }
+            registerCrewHits(state, geometry);
             if (companion.view == .schedules) registerScheduleHits(state, geometry);
             if (companion.view == .conversation and companion.presentation.activity_count == 0) {
                 const layout = emptyStateLayout(geometry.conversation);
@@ -768,6 +856,28 @@ fn registerHits(state: *runtime.AppState, geometry: Geometry) void {
                 .text => registerTextMenuHits(state, geometry),
             }
         },
+    }
+}
+
+/// Crew header toggle, one hit per open line, and the done fold's "Clear
+/// done" button (registered after its row so it wins).
+fn registerCrewHits(state: *runtime.AppState, geometry: Geometry) void {
+    const companion = &state.companion_controller;
+    const section = geometry.crew;
+    if (section.w <= 0.0 or section.h <= 0.0) return;
+    companion.addHit(crewHeaderRect(section), .crew_toggle);
+    const lines = crewLinesNow(state);
+    for (lines.lines[0..lines.count], 0..) |line, index| {
+        const rect = crewLineRect(section, index);
+        if (!crewLineFits(section, rect)) break;
+        switch (line.kind) {
+            .row => companion.addIndexedHit(rect, .crew_open, line.row),
+            .done_fold => {
+                companion.addHit(rect, .crew_done_toggle);
+                companion.addHit(crewClearButton(rect), .crew_clear_done);
+            },
+            .show_all => companion.addHit(rect, .crew_show_all),
+        }
     }
 }
 
@@ -908,6 +1018,7 @@ fn renderPanel(state: *runtime.AppState, geometry: Geometry) void {
     if (state.companion_controller.menu == .none) {
         renderHeaderTooltip(state, geometry);
         renderScheduleTooltip(state, geometry);
+        renderCrewTooltip(state, geometry);
     }
 }
 
@@ -993,6 +1104,7 @@ fn renderHeader(state: *runtime.AppState, geometry: Geometry) void {
 /// Codicon chevron-down from the icon font; the UI text face has no
 /// legible small caret glyph.
 const NF_COD_CHEVRON_DOWN = "\u{EAB4}";
+const NF_COD_CHEVRON_RIGHT = "\u{EAB6}";
 /// Same expand / collapse glyphs as the workspace pane zoom control.
 const NF_MD_ARROW_EXPAND = "\u{F0616}";
 const NF_MD_ARROW_COLLAPSE = "\u{F0615}";
@@ -1100,36 +1212,149 @@ fn renderInbox(state: *runtime.AppState, geometry: Geometry) void {
     }
 }
 
-// Crew: chats this companion delegated to, newest attention first.
+// Crew: chats this companion delegated to. A one-line summary header that
+// toggles the list; open, the list leads with what needs the user and what
+// runs, folds finished rows into "N done", and ends with "Show all" when
+// auto-tidy hid anything. Expanded, it sits in its own right-hand column.
 fn renderCrew(state: *runtime.AppState, geometry: Geometry) void {
     const companion = &state.companion_controller;
-    const shown = @min(companion.crew_count, MAX_CREW_ROWS_SHOWN);
-    if (shown == 0 or geometry.crew.h <= 0.0) return;
+    const section = geometry.crew;
+    if (companion.crew_count == 0 or section.w <= 0.0 or section.h <= 0.0) return;
     const s = companionScale();
     const chrome = theme.companionChrome();
-    const running = companion.crewRunningCount();
-    const title = if (running > 0)
-        framePrint(state, "CREW · {d} RUNNING · {d} TOTAL", .{ running, companion.crew_count })
-    else
-        framePrint(state, "CREW · {d}", .{companion.crew_count});
-    renderSectionTitle(state, geometry.crew, title);
-    for (companion.crew[0..shown], 0..) |*row, index| {
-        const rect = rowRect(geometry.crew, index, CREW_ROW_HEIGHT);
-        if (rect.y + rect.h > geometry.crew.y + geometry.crew.h + 1.0) break;
-        const accent = attentionColor(chrome, row.attention);
-        queuePanel(state, rect, color(chrome.surface_deep), color(hairline()), 9.0 * s, 1.0 * s);
-        queueRoundedRect(state, .{ .x = rect.x + 10.0 * s, .y = rect.y + (rect.h - 8.0 * s) * 0.5, .w = 8.0 * s, .h = 8.0 * s }, color(accent), 4.0 * s);
-        const status = row.attention.label();
-        const status_w = text_measure.textWidth(.ui_bold, 10.0 * s, status) + 16.0 * s;
-        const pill: palette.Rect = .{ .x = rect.x + rect.w - status_w - 8.0 * s, .y = rect.y + (rect.h - 20.0 * s) * 0.5, .w = status_w, .h = 20.0 * s };
-        queueRoundedRect(state, pill, color(opaqueOver(chrome.surface_deep, theme.withAlpha(accent, 40))), 10.0 * s);
-        queueCenteredText(state, pill, status, color(accent), 10.0 * s, .ui_bold, pill);
-        const text_x = rect.x + 26.0 * s;
-        const text_w = @max(pill.x - text_x - 8.0 * s, 0.0);
-        queueBoldText(state, .{ .x = text_x, .y = rect.y + 4.0 * s, .w = text_w, .h = 16.0 * s }, truncatedText(state, .ui_bold, 11.5 * s, text_w, row.title.slice()), color(chrome.text), 11.5 * s, rect);
-        const detail = if (row.detail.slice().len > 0) framePrint(state, "{s} · {s}", .{ row.provider.slice(), row.detail.slice() }) else row.provider.slice();
-        queueText(state, .{ .x = text_x, .y = rect.y + 21.0 * s, .w = text_w, .h = 14.0 * s }, truncatedText(state, .ui, 10.5 * s, text_w, detail), color(chrome.text_subtle), 10.5 * s, rect);
+    const column = geometry.crew_column;
+    if (column.w > 0.0) {
+        // Hairline between the conversation and the crew column, like the
+        // linked-chats drawer's edge.
+        queueRect(state, .{ .x = column.x, .y = column.y, .w = snappedStroke(1.0 * s), .h = column.h }, color(hairline()));
     }
+
+    const header = crewHeaderRect(section);
+    const chevron = 11.0 * s;
+    queueIcon(state, .{ .x = header.x + 2.0 * s, .y = header.y + (header.h - chevron) * 0.5, .w = chevron, .h = chevron }, if (companion.crew_list_open) NF_COD_CHEVRON_DOWN else NF_COD_CHEVRON_RIGHT, color(chrome.text_subtle), header);
+    const title_x = header.x + 2.0 * s + chevron + 6.0 * s;
+    const title_w = @max(header.x + header.w - title_x, 0.0);
+    queueBoldText(state, .{ .x = title_x, .y = header.y + (header.h - 15.0 * s) * 0.5, .w = title_w, .h = 15.0 * s }, truncatedText(state, .ui_bold, 10.5 * s, title_w, crewSummaryText(state)), color(chrome.text_subtle), 10.5 * s, header);
+
+    const lines = crewLinesNow(state);
+    for (lines.lines[0..lines.count], 0..) |line, index| {
+        const rect = crewLineRect(section, index);
+        if (!crewLineFits(section, rect)) break;
+        switch (line.kind) {
+            .row => renderCrewRow(state, rect, &companion.crew[line.row]),
+            .done_fold => renderCrewDoneFold(state, rect, lines.done_count),
+            .show_all => {
+                const label = if (companion.crew_show_all) "Hide older" else framePrint(state, "Show all · {d} older", .{lines.tidied_count});
+                const text_w = @max(rect.w - 20.0 * s, 0.0);
+                queueBoldText(state, .{ .x = rect.x + 10.0 * s, .y = rect.y + (rect.h - 15.0 * s) * 0.5, .w = text_w, .h = 15.0 * s }, truncatedText(state, .ui_bold, 10.5 * s, text_w, label), color(chrome.accent), 10.5 * s, rect);
+            },
+        }
+    }
+}
+
+/// "CREW · 5 — 1 needs you · 1 running · 3 done"; zero counts are left out.
+fn crewSummaryText(state: *runtime.AppState) []const u8 {
+    const summary = state.companion_controller.crewSummary();
+    var buffer: [160]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    writer.print("CREW · {d}", .{summary.total}) catch {};
+    var first = true;
+    const parts = [_]struct { count: usize, label: []const u8 }{
+        .{ .count = summary.needs_you, .label = "needs you" },
+        .{ .count = summary.running, .label = "running" },
+        .{ .count = summary.done, .label = "done" },
+        .{ .count = summary.idle, .label = "idle" },
+    };
+    for (parts) |part| {
+        if (part.count == 0) continue;
+        writer.print("{s}{d} {s}", .{ if (first) " — " else " · ", part.count, part.label }) catch {};
+        first = false;
+    }
+    return framePrint(state, "{s}", .{writer.buffered()});
+}
+
+/// One-line crew row: status dot, title, muted provider, status chip.
+fn renderCrewRow(state: *runtime.AppState, rect: palette.Rect, row: *const controller.ChatRow) void {
+    const s = companionScale();
+    const chrome = theme.companionChrome();
+    const accent = attentionColor(chrome, row.attention);
+    queuePanel(state, rect, color(chrome.surface_deep), color(hairline()), 8.0 * s, 1.0 * s);
+    const dot = 8.0 * s;
+    queueRoundedRect(state, .{ .x = rect.x + 10.0 * s, .y = rect.y + (rect.h - dot) * 0.5, .w = dot, .h = dot }, color(accent), dot * 0.5);
+    const status = row.attention.label();
+    const chip_h = 18.0 * s;
+    const chip_w = text_measure.textWidth(.ui_bold, 10.0 * s, status) + 14.0 * s;
+    const chip: palette.Rect = .{ .x = rect.x + rect.w - chip_w - 6.0 * s, .y = rect.y + (rect.h - chip_h) * 0.5, .w = chip_w, .h = chip_h };
+    queueRoundedRect(state, chip, color(opaqueOver(chrome.surface_deep, theme.withAlpha(accent, 40))), chip_h * 0.5);
+    queueCenteredText(state, chip, status, color(accent), 10.0 * s, .ui_bold, chip);
+
+    const text_x = rect.x + 26.0 * s;
+    const available = @max(chip.x - 8.0 * s - text_x, 0.0);
+    const title_font = 11.5 * s;
+    const provider_font = 10.0 * s;
+    const provider = row.provider.slice();
+    const provider_w = if (provider.len > 0) text_measure.textWidth(.ui, provider_font, provider) else 0.0;
+    const gap = 6.0 * s;
+    // The provider label drops out before the title shrinks below ~3 words.
+    const shows_provider = provider_w > 0.0 and available - provider_w - gap >= 64.0 * s;
+    const title_room = if (shows_provider) available - provider_w - gap else available;
+    const title = truncatedText(state, .ui_bold, title_font, title_room, row.title.slice());
+    const title_w = @min(text_measure.textWidth(.ui_bold, title_font, title), title_room);
+    const text_y = rect.y + (rect.h - 16.0 * s) * 0.5;
+    queueBoldText(state, .{ .x = text_x, .y = text_y, .w = title_room, .h = 16.0 * s }, title, color(chrome.text), title_font, rect);
+    if (shows_provider) {
+        queueText(state, .{ .x = text_x + title_w + gap, .y = text_y + 1.0 * s, .w = provider_w + 1.0, .h = 15.0 * s }, provider, color(chrome.text_subtle), provider_font, rect);
+    }
+}
+
+/// "N done" fold with its chevron and the "Clear done" button.
+fn renderCrewDoneFold(state: *runtime.AppState, rect: palette.Rect, done_count: usize) void {
+    const s = companionScale();
+    const chrome = theme.companionChrome();
+    queuePanel(state, rect, color(surface()), color(hairline()), 8.0 * s, 1.0 * s);
+    const chevron = 11.0 * s;
+    queueIcon(state, .{ .x = rect.x + 9.0 * s, .y = rect.y + (rect.h - chevron) * 0.5, .w = chevron, .h = chevron }, if (state.companion_controller.crew_done_open) NF_COD_CHEVRON_DOWN else NF_COD_CHEVRON_RIGHT, color(chrome.text_subtle), rect);
+    const button = crewClearButton(rect);
+    const text_x = rect.x + 26.0 * s;
+    const text_w = @max(button.x - 8.0 * s - text_x, 0.0);
+    queueBoldText(state, .{ .x = text_x, .y = rect.y + (rect.h - 16.0 * s) * 0.5, .w = text_w, .h = 16.0 * s }, truncatedText(state, .ui_bold, 11.0 * s, text_w, framePrint(state, "{d} done", .{done_count})), color(chrome.text_muted), 11.0 * s, rect);
+    queuePanel(state, button, color(chrome.surface_deep), color(chrome.border), 7.0 * s, 1.0 * s);
+    queueCenteredText(state, button, CREW_CLEAR_LABEL, color(chrome.text_muted), 10.5 * s, .ui_bold, button);
+}
+
+/// Hover help for the crew: what the header, fold, and buttons do, and the
+/// preview line a row no longer prints.
+fn crewTooltipAt(state: *runtime.AppState, geometry: Geometry, x: f32, y: f32) ?struct { target: palette.Rect, label: []const u8 } {
+    const companion = &state.companion_controller;
+    const section = geometry.crew;
+    if (section.w <= 0.0 or section.h <= 0.0 or !pointInRect(section, x, y)) return null;
+    const header = crewHeaderRect(section);
+    if (pointInRect(header, x, y)) return .{ .target = header, .label = if (companion.crew_list_open) "Hide crew" else "Show crew" };
+    const lines = crewLinesNow(state);
+    for (lines.lines[0..lines.count], 0..) |line, index| {
+        const rect = crewLineRect(section, index);
+        if (!crewLineFits(section, rect)) break;
+        if (!pointInRect(rect, x, y)) continue;
+        return switch (line.kind) {
+            .row => blk: {
+                const preview = companion.crew[line.row].detail.slice();
+                if (preview.len == 0) break :blk null;
+                const max_w = @max(@min(CREW_TOOLTIP_MAX * companionScale(), geometry.window.w - 24.0 * companionScale()), 0.0);
+                break :blk .{ .target = rect, .label = truncatedText(state, .ui, 11.0 * companionScale(), max_w, singleLineText(state, preview)) };
+            },
+            .done_fold => if (pointInRect(crewClearButton(rect), x, y))
+                .{ .target = crewClearButton(rect), .label = "Unlink finished chats from this conversation" }
+            else
+                .{ .target = rect, .label = if (companion.crew_done_open) "Hide finished" else "Show finished" },
+            .show_all => .{ .target = rect, .label = if (companion.crew_show_all) "Hide chats you opened or that finished over a day ago" else "Show chats you opened or that finished over a day ago" },
+        };
+    }
+    return null;
+}
+
+fn renderCrewTooltip(state: *runtime.AppState, geometry: Geometry) void {
+    const tip = crewTooltipAt(state, geometry, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y) orelse return;
+    renderTooltip(state, geometry.window, tip.target, tip.label);
 }
 
 fn errorMessage(state: *runtime.AppState) []const u8 {
@@ -1322,6 +1547,53 @@ fn conversationalText(state: *runtime.AppState, text: []const u8) []const u8 {
     return buffer[0..len];
 }
 
+/// Wrap of one conversation body (prose at the transcript size), served
+/// from the controller's cache when the same body was wrapped at the same
+/// width, size and line cap with the same fonts. `cleaned` is the body's
+/// `conversationalText` when the caller already has it.
+fn bodyWrap(state: *runtime.AppState, body: []const u8, cleaned: ?[]const u8, max_width: f32, font_size: f32, max_lines: usize) controller.WrapCacheEntry {
+    comptime std.debug.assert(MAX_WRAP_LINES <= controller.WRAP_CACHE_MAX_LINES);
+    const key = wrapCacheKey(body, max_width, .prose, font_size, max_lines);
+    if (state.companion_controller.wrapCacheGet(key)) |entry| return entry.*;
+    const text = cleaned orelse conversationalText(state, body);
+    const wrapped = wrapText(text, max_width, .prose, font_size, max_lines);
+    var entry: controller.WrapCacheEntry = .{ .key = key, .count = @intCast(wrapped.count), .truncated = wrapped.truncated };
+    var previous_end: usize = 0;
+    for (wrapped.lines[0..wrapped.count], 0..) |line, index| {
+        const start = sliceOffset(text, line) orelse previous_end;
+        entry.starts[index] = @intCast(@min(start, std.math.maxInt(u16)));
+        entry.ends[index] = @intCast(@min(start + line.len, std.math.maxInt(u16)));
+        previous_end = start + line.len;
+        entry.widest = @max(entry.widest, text_measure.textWidth(.prose, font_size, line));
+    }
+    state.companion_controller.wrapCachePut(entry);
+    return entry;
+}
+
+fn wrapCacheKey(body: []const u8, max_width: f32, role: palette.FontRole, font_size: f32, max_lines: usize) u64 {
+    var hasher = std.hash.Wyhash.init(0x7772_6170);
+    hasher.update(body);
+    hasher.update(std.mem.asBytes(&max_width));
+    hasher.update(std.mem.asBytes(&font_size));
+    hasher.update(&.{@as(u8, @intCast(@intFromEnum(role)))});
+    hasher.update(std.mem.asBytes(&@as(u64, max_lines)));
+    hasher.update(std.mem.asBytes(&text_measure.fontGeneration()));
+    const key = hasher.final();
+    return if (key == 0) 1 else key;
+}
+
+/// Rebuilds wrapped lines from cached offsets over the cleaned body text;
+/// offsets are clamped so a cleaning fallback can never slice out of range.
+fn cachedLines(entry: *const controller.WrapCacheEntry, text: []const u8) WrappedText {
+    var wrapped: WrappedText = .{ .count = @min(entry.count, MAX_WRAP_LINES), .truncated = entry.truncated };
+    for (0..wrapped.count) |index| {
+        const end = @min(@as(usize, entry.ends[index]), text.len);
+        const start = @min(@as(usize, entry.starts[index]), end);
+        wrapped.lines[index] = text[start..end];
+    }
+    return wrapped;
+}
+
 const ConversationItemLayout = struct {
     height: f32,
 };
@@ -1351,12 +1623,12 @@ fn conversationItemHeight(state: *runtime.AppState, item: *const controller.Acti
     const widths = conversationWidths(conversation);
     return switch (item.kind) {
         .user => blk: {
-            const wrapped = wrapText(conversationalText(state, item.body.slice()), widths.bubble, .prose, bodyFont(), USER_MAX_LINES);
+            const wrapped = bodyWrap(state, item.body.slice(), null, widths.bubble, bodyFont(), USER_MAX_LINES);
             const label_h: f32 = if (voiceSpeaker(item) != null) VOICE_LABEL_H * s else 0.0;
             break :blk @as(f32, @floatFromInt(@max(wrapped.count, 1))) * bodyLineHeight() + 20.0 * s + 10.0 * s + label_h;
         },
         .assistant, .streaming => blk: {
-            const wrapped = wrapText(conversationalText(state, item.body.slice()), widths.text, .prose, bodyFont(), ASSISTANT_MAX_LINES);
+            const wrapped = bodyWrap(state, item.body.slice(), null, widths.text, bodyFont(), ASSISTANT_MAX_LINES);
             if (wrapped.count == 0) break :blk 0.0;
             const label_h: f32 = if (voiceSpeaker(item) != null) VOICE_LABEL_H * s else 0.0;
             break :blk @as(f32, @floatFromInt(wrapped.count)) * bodyLineHeight() + 14.0 * s + label_h;
@@ -1376,7 +1648,11 @@ fn renderConversation(state: *runtime.AppState, geometry: Geometry) void {
     const pad = 10.0 * s;
     var total: f32 = pad * 2.0;
     for (frame.activity[0..frame.activity_count]) |*item| total += conversationItemHeight(state, item, conversation);
+    const previous_scroll = companion.conversation_scroll_y;
     companion.updateConversationExtent(@max(total - conversation.h, 0.0));
+    // A streaming reply grows a line at a time; the followed tail glides
+    // after it like a chat's instead of hopping (snaps under reduced motion).
+    companion.easeConversationTail(previous_scroll, @intCast(@divTrunc(profiler.nowNs(), std.time.ns_per_ms)), conversation.h, frame.working and !state.app_config.reduced_motion.companion);
     var y = conversation.y + pad - companion.conversation_scroll_y;
     for (frame.activity[0..frame.activity_count], 0..) |*item, index| {
         const height = conversationItemHeight(state, item, conversation);
@@ -1386,7 +1662,7 @@ fn renderConversation(state: *runtime.AppState, geometry: Geometry) void {
         y += height;
     }
     if (companion.conversation_scroll_y > 1.0) renderFade(state, conversation, true);
-    if (companion.conversation_max_scroll - companion.conversation_scroll_y > 1.0) renderFade(state, conversation, false);
+    if (companion.conversation_max_scroll - companion.conversation_scroll_y > 1.0 and !companion.tail_gliding) renderFade(state, conversation, false);
 }
 
 fn renderFade(state: *runtime.AppState, conversation: palette.Rect, top: bool) void {
@@ -1479,7 +1755,8 @@ fn itemTextLayout(state: *runtime.AppState, item: *const controller.ActivityItem
         .user, .assistant, .streaming => {
             const user = item.kind == .user;
             layout.text = conversationalText(state, item.body.slice());
-            const wrapped = wrapText(layout.text, if (user) widths.bubble else widths.text, .prose, font, if (user) USER_MAX_LINES else ASSISTANT_MAX_LINES);
+            const wrap = bodyWrap(state, item.body.slice(), layout.text, if (user) widths.bubble else widths.text, font, if (user) USER_MAX_LINES else ASSISTANT_MAX_LINES);
+            const wrapped = cachedLines(&wrap, layout.text);
             layout.truncated = wrapped.truncated;
             var origin_x = x;
             var origin_y = y + 6.0 * s;
@@ -1487,8 +1764,7 @@ fn itemTextLayout(state: *runtime.AppState, item: *const controller.ActivityItem
             const speaker = voiceSpeaker(item);
             const label_h: f32 = if (speaker != null) VOICE_LABEL_H * s else 0.0;
             if (user) {
-                var widest: f32 = 0.0;
-                for (wrapped.lines[0..wrapped.count]) |line| widest = @max(widest, text_measure.textWidth(.prose, font, line));
+                var widest: f32 = wrap.widest;
                 if (speaker) |who| widest = @max(widest, voiceLabelWidth(state, who));
                 const bubble_w = @min(widest + 22.0 * s, widths.bubble + 20.0 * s);
                 const bubble_h = @as(f32, @floatFromInt(@max(wrapped.count, 1))) * line_h + 18.0 * s + label_h;
@@ -3685,19 +3961,34 @@ test "panel shows the inbox, the crew, and a status that counts what needs the u
     render(&state, 1360.0, 860.0);
     try std.testing.expect(batchHasText(&state.palette_overlay_batch, "NEEDS YOU · 1"));
     try std.testing.expect(batchHasText(&state.palette_overlay_batch, "Needs approval: Fix auth tests"));
-    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "CREW · 1 RUNNING · 2 TOTAL"));
-    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "Update docs"));
+    // The crew starts as its one-line summary; rows wait for a click.
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "CREW · 2 — 1 running · 1 done"));
+    try std.testing.expect(!batchHasText(&state.palette_overlay_batch, "Update docs"));
 
-    const geometry = computeGeometry(&state, 1360.0, 860.0);
+    var geometry = computeGeometry(&state, 1360.0, 860.0);
     registerHits(&state, geometry);
     const inbox_row = rowRect(geometry.inbox, 0, INBOX_ROW_HEIGHT);
     const hit = state.companion_controller.hitEntryAt(inbox_row.x + 4.0, inbox_row.y + 4.0).?;
     try std.testing.expectEqual(controller.HitAction.inbox_open, hit.action);
-    const crew_row = rowRect(geometry.crew, 1, CREW_ROW_HEIGHT);
+    const header = crewHeaderRect(geometry.crew);
+    try std.testing.expectEqual(controller.HitAction.crew_toggle, state.companion_controller.hitAt(header.x + 4.0, header.y + 4.0).?);
+    try std.testing.expect(geometry.conversation.y >= geometry.crew.y + geometry.crew.h);
+
+    // Open: the running row, then the done fold; clicking a row opens it.
+    state.companion_controller.toggleCrewList();
+    geometry = computeGeometry(&state, 1360.0, 860.0);
+    registerHits(&state, geometry);
+    const crew_row = crewLineRect(geometry.crew, 0);
     const crew_hit = state.companion_controller.hitEntryAt(crew_row.x + 4.0, crew_row.y + 4.0).?;
     try std.testing.expectEqual(controller.HitAction.crew_open, crew_hit.action);
-    try std.testing.expectEqual(@as(usize, 1), crew_hit.index);
+    try std.testing.expectEqualStrings("Update docs", state.companion_controller.crew[crew_hit.index].title.slice());
     try std.testing.expect(geometry.conversation.y >= geometry.crew.y + geometry.crew.h);
+    state.palette_overlay_batch.clear();
+    render(&state, 1360.0, 860.0);
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "Update docs"));
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "codex"));
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "1 done"));
+    try std.testing.expect(!batchHasText(&state.palette_overlay_batch, "Bump deps"));
 }
 
 test "conversation renders user bubbles, wrapped replies, and tool lines" {
@@ -4329,4 +4620,310 @@ test "expand covers the workspace beside the sidebar with a capped reading colum
 
     render(&state, window.w, window.h);
     try expectBatchInsideWindow(&state.palette_overlay_batch, window);
+}
+
+/// Five crew rows: one needing approval, one running, three done.
+fn setTestCrew(state: *runtime.AppState) void {
+    const titles = [_][]const u8{ "Ship docs", "Fix login", "Bump deps", "Tidy CSS", "Rename API" };
+    const attentions = [_]controller.Attention{ .done, .running, .done, .approval, .done };
+    var rows: [titles.len]controller.ChatRow = undefined;
+    for (&rows, titles, attentions, 0..) |*row, title, attention, index| {
+        row.* = .{ .attention = attention };
+        var buffer: [16]u8 = undefined;
+        _ = row.workspace_id.set("companion-ui");
+        _ = row.thread_id.set(std.fmt.bufPrint(&buffer, "chat-{d}", .{index}) catch unreachable);
+        row.title.set(title);
+        row.provider.set("codex");
+        row.detail.set("Ran the suite; two snapshots changed.");
+    }
+    state.companion_controller.setCrew(&rows);
+}
+
+fn openTestPanel(state: *runtime.AppState, width: f32, height: f32) void {
+    state.companion_controller.show();
+    state.companion_controller.settleTransition();
+    state.companion_controller.frame_width = width;
+    state.companion_controller.frame_height = height;
+}
+
+test "crew collapses to a one-line summary and auto-opens on a new need" {
+    const allocator = std.testing.allocator;
+    defer theme.applyTheme(1.0);
+    theme.applyTheme(1.25);
+    var state: runtime.AppState = undefined;
+    try testState(allocator, &state);
+    defer deinitTestState(allocator, &state);
+    openTestPanel(&state, 1360.0, 860.0);
+    var rows: [3]controller.ChatRow = .{ .{ .attention = .running }, .{ .attention = .done }, .{ .attention = .done } };
+    for (&rows, 0..) |*row, index| {
+        _ = row.workspace_id.set("companion-ui");
+        _ = row.thread_id.set(([_][]const u8{ "a", "b", "c" })[index]);
+        row.title.set("Crew chat");
+    }
+    state.companion_controller.setCrew(&rows);
+
+    // Collapsed: exactly the header line, with chevron and summary.
+    var geometry = computeGeometry(&state, 1360.0, 860.0);
+    try std.testing.expectApproxEqAbs(CREW_HEADER_HEIGHT * 1.25, geometry.crew.h, 0.01);
+    try std.testing.expectEqualStrings("CREW · 3 — 1 running · 2 done", crewSummaryText(&state));
+    render(&state, 1360.0, 860.0);
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "CREW · 3 — 1 running · 2 done"));
+    try std.testing.expect(!batchHasText(&state.palette_overlay_batch, "Crew chat"));
+    registerHits(&state, geometry);
+    const header = crewHeaderRect(geometry.crew);
+    try std.testing.expectEqual(palette.platform.CursorShape.pointer, systemCursorAt(&state, header.x + 6.0, header.y + 6.0).?);
+    state.palette_overlay_batch.clear();
+    state.transcript_controller.palette_mouse_x = header.x + 6.0;
+    state.transcript_controller.palette_mouse_y = header.y + 6.0;
+    render(&state, 1360.0, 860.0);
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "Show crew"));
+
+    // A row starting to need approval opens the list on its own.
+    rows[0].attention = .approval;
+    state.companion_controller.setCrew(&rows);
+    try std.testing.expect(state.companion_controller.crew_list_open);
+    geometry = computeGeometry(&state, 1360.0, 860.0);
+    try std.testing.expect(geometry.crew.h > CREW_HEADER_HEIGHT * 1.25);
+    try std.testing.expectEqualStrings("CREW · 3 — 1 needs you · 2 done", crewSummaryText(&state));
+    state.palette_overlay_batch.clear();
+    render(&state, 1360.0, 860.0);
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "Hide crew"));
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "Crew chat"));
+
+    // Collapsing by hand sticks while the same need persists.
+    state.companion_controller.toggleCrewList();
+    state.companion_controller.setCrew(&rows);
+    geometry = computeGeometry(&state, 1360.0, 860.0);
+    try std.testing.expectApproxEqAbs(CREW_HEADER_HEIGHT * 1.25, geometry.crew.h, 0.01);
+}
+
+test "open crew lists needs and running first, folds done rows, and routes clear done" {
+    const allocator = std.testing.allocator;
+    theme.applyTheme(1.0);
+    var state: runtime.AppState = undefined;
+    try testState(allocator, &state);
+    defer deinitTestState(allocator, &state);
+    openTestPanel(&state, 1360.0, 860.0);
+    setTestCrew(&state);
+    const companion = &state.companion_controller;
+    // The approval row was a new need, so the list is already open.
+    try std.testing.expect(companion.crew_list_open);
+    var geometry = computeGeometry(&state, 1360.0, 860.0);
+    registerHits(&state, geometry);
+
+    const Expect = struct { action: controller.HitAction, title: ?[]const u8 };
+    const expected = [_]Expect{
+        .{ .action = .crew_open, .title = "Tidy CSS" },
+        .{ .action = .crew_open, .title = "Fix login" },
+        .{ .action = .crew_done_toggle, .title = null },
+    };
+    for (expected, 0..) |want, index| {
+        const line = crewLineRect(geometry.crew, index);
+        try std.testing.expect(crewLineFits(geometry.crew, line));
+        const hit = companion.hitEntryAt(line.x + 4.0, line.y + 4.0).?;
+        try std.testing.expectEqual(want.action, hit.action);
+        if (want.title) |title| try std.testing.expectEqualStrings(title, companion.crew[hit.index].title.slice());
+        try std.testing.expectEqual(palette.platform.CursorShape.pointer, systemCursorAt(&state, line.x + 4.0, line.y + 4.0).?);
+    }
+    try std.testing.expect(!crewLineFits(geometry.crew, crewLineRect(geometry.crew, 3)));
+
+    // Rows are one line: title and provider, preview only as a tooltip.
+    render(&state, 1360.0, 860.0);
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "3 done"));
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, CREW_CLEAR_LABEL));
+    try std.testing.expect(!batchHasText(&state.palette_overlay_batch, "Ran the suite"));
+    try std.testing.expect(!batchHasText(&state.palette_overlay_batch, "Ship docs"));
+    const first = crewLineRect(geometry.crew, 0);
+    state.palette_overlay_batch.clear();
+    state.transcript_controller.palette_mouse_x = first.x + 40.0;
+    state.transcript_controller.palette_mouse_y = first.y + 6.0;
+    render(&state, 1360.0, 860.0);
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "Ran the suite; two snapshots changed."));
+    try expectBatchInsideWindow(&state.palette_overlay_batch, .{ .w = 1360.0, .h = 860.0 });
+
+    // "Clear done" sits on the fold and wins over the fold's own toggle.
+    const fold = crewLineRect(geometry.crew, 2);
+    const clear = crewClearButton(fold);
+    try std.testing.expect(rectInside(clear, fold));
+    try std.testing.expectEqual(controller.HitAction.crew_clear_done, companion.hitAt(clear.x + clear.w * 0.5, clear.y + clear.h * 0.5).?);
+    try std.testing.expectEqual(palette.platform.CursorShape.pointer, systemCursorAt(&state, clear.x + 4.0, clear.y + 4.0).?);
+    state.palette_overlay_batch.clear();
+    state.transcript_controller.palette_mouse_x = clear.x + 4.0;
+    state.transcript_controller.palette_mouse_y = clear.y + 4.0;
+    render(&state, 1360.0, 860.0);
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "Unlink finished chats from this conversation"));
+    // Without an active companion thread the clear is a harmless no-op.
+    state.clearCompanionCrewDone();
+
+    // Unfolding lists the done rows after the fold.
+    companion.toggleCrewDone();
+    geometry = computeGeometry(&state, 1360.0, 860.0);
+    registerHits(&state, geometry);
+    for (3..6) |index| {
+        const line = crewLineRect(geometry.crew, index);
+        try std.testing.expect(crewLineFits(geometry.crew, line));
+        const hit = companion.hitEntryAt(line.x + 4.0, line.y + 4.0).?;
+        try std.testing.expectEqual(controller.HitAction.crew_open, hit.action);
+        try std.testing.expectEqual(controller.Attention.done, companion.crew[hit.index].attention);
+    }
+    // Opening one from the list tidies it away behind "Show all".
+    const opened = companion.hitEntryAt(crewLineRect(geometry.crew, 3).x + 4.0, crewLineRect(geometry.crew, 3).y + 4.0).?;
+    companion.noteCrewOpened(opened.index);
+    geometry = computeGeometry(&state, 1360.0, 860.0);
+    registerHits(&state, geometry);
+    const show_all = crewLineRect(geometry.crew, 5);
+    try std.testing.expectEqual(controller.HitAction.crew_show_all, companion.hitAt(show_all.x + 4.0, show_all.y + 4.0).?);
+    state.palette_overlay_batch.clear();
+    render(&state, 1360.0, 860.0);
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "2 done"));
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "Show all · 1 older"));
+    try std.testing.expect(geometry.conversation.y >= geometry.crew.y + geometry.crew.h);
+}
+
+test "expanded panel moves the crew to a side column inside the window across sizes and scales" {
+    const allocator = std.testing.allocator;
+    defer theme.applyTheme(1.0);
+    inline for (.{
+        .{ @as(f32, 2400.0), @as(f32, 900.0), @as(f32, 1.0), @as(f32, 300.0) },
+        .{ @as(f32, 1600.0), @as(f32, 900.0), @as(f32, 1.25), @as(f32, 260.0) },
+        .{ @as(f32, 1366.0), @as(f32, 768.0), @as(f32, 1.26), @as(f32, 240.0) },
+        .{ @as(f32, 900.0), @as(f32, 700.0), @as(f32, 1.0), @as(f32, 280.0) },
+        .{ @as(f32, 1280.0), @as(f32, 420.0), @as(f32, 1.5), @as(f32, 200.0) },
+        .{ @as(f32, 2536.0), @as(f32, 1030.0), @as(f32, 1.5), @as(f32, 300.0) },
+    }) |fixture| {
+        theme.applyTheme(fixture[2]);
+        var state: runtime.AppState = undefined;
+        try testState(allocator, &state);
+        defer deinitTestState(allocator, &state);
+        const window: palette.Rect = .{ .w = fixture[0], .h = fixture[1] };
+        openTestPanel(&state, window.w, window.h);
+        var frame: controller.Frame = .{ .has_thread = true };
+        _ = frame.setOwner("companion-ui", "chat-1");
+        var reply: controller.ActivityItem = .{ .kind = .assistant, .sequence = 1 };
+        reply.body.set("Opened a codex chat for it and it is running the build now.");
+        frame.appendActivity(reply);
+        state.companion_controller.setFrame(frame);
+        setTestCrew(&state);
+        state.companion_controller.toggleCrewDone();
+        state.companion_controller.workspace_left = fixture[3];
+        state.companion_controller.expanded = true;
+
+        inline for (.{ true, false }) |open| {
+            state.companion_controller.crew_list_open = open;
+            const geometry = computeGeometry(&state, window.w, window.h);
+            const s = fixture[2];
+            const side = geometry.crew_column.w > 0.0;
+            try std.testing.expect(geometry.crew.h > 0.0);
+            try std.testing.expect(rectFitsWindow(geometry.crew, window.w + 0.5, window.h + 0.5));
+            try std.testing.expect(intersectRects(geometry.conversation, geometry.crew) == null);
+            const composer = composerRect(geometry.footer);
+            if (side) {
+                try std.testing.expectApproxEqAbs(CREW_COLUMN_WIDTH * s, geometry.crew_column.w, 0.01);
+                try std.testing.expect(rectInside(geometry.crew, geometry.crew_column));
+                try std.testing.expect(rectFitsWindow(geometry.crew_column, window.w + 0.5, window.h + 0.5));
+                // The conversation keeps its full height beside the column...
+                try std.testing.expectApproxEqAbs(geometry.header.y + geometry.header.h + 4.0 * s, geometry.conversation.y, 0.01);
+                try std.testing.expect(geometry.conversation.x + geometry.conversation.w <= geometry.crew_column.x + 0.5);
+                try std.testing.expect(composer.x + composer.w <= geometry.crew_column.x + 0.5);
+                // ...and its reading column stays centered in what is left.
+                const widths = conversationWidths(geometry.conversation);
+                const left = columnX(geometry.conversation) - geometry.conversation.x;
+                const right = geometry.conversation.x + geometry.conversation.w - (columnX(geometry.conversation) + widths.text);
+                try std.testing.expectApproxEqAbs(left, right, 0.5);
+                // Toggling still works from the column header.
+                registerHits(&state, geometry);
+                const header = crewHeaderRect(geometry.crew);
+                try std.testing.expectEqual(controller.HitAction.crew_toggle, state.companion_controller.hitAt(header.x + 4.0, header.y + 4.0).?);
+            } else {
+                try std.testing.expect(geometry.conversation.y >= geometry.crew.y + geometry.crew.h);
+            }
+            state.palette_overlay_batch.clear();
+            render(&state, window.w, window.h);
+            try expectBatchInsideWindow(&state.palette_overlay_batch, window);
+            try std.testing.expect(batchHasText(&state.palette_overlay_batch, "CREW · 5"));
+        }
+        // Wide enough windows use the column; the narrow one stacks.
+        const final = computeGeometry(&state, window.w, window.h);
+        if (fixture[0] >= 1366.0) try std.testing.expect(final.crew_column.w > 0.0);
+        if (fixture[0] == 900.0) try std.testing.expectEqual(@as(f32, 0.0), final.crew_column.w);
+    }
+}
+
+test "companion composer rect lands on whole pixels at fractional scales" {
+    const allocator = std.testing.allocator;
+    defer theme.applyTheme(1.0);
+    inline for (.{ @as(f32, 1.25), @as(f32, 1.26), @as(f32, 1.5) }) |scale| {
+        theme.applyTheme(scale);
+        var state: runtime.AppState = undefined;
+        try testState(allocator, &state);
+        defer deinitTestState(allocator, &state);
+        openTestPanel(&state, 1365.0, 857.0);
+        inline for (.{ false, true }) |expanded| {
+            state.companion_controller.expanded = expanded;
+            state.companion_controller.workspace_left = 233.3;
+            const composer = composerRect(computeGeometry(&state, 1365.0, 857.0).footer);
+            try std.testing.expect(composer.w > 0.0 and composer.h > 0.0);
+            for ([_]f32{ composer.x, composer.y, composer.x + composer.w, composer.y + composer.h }) |edge| {
+                try std.testing.expectEqual(@round(edge), edge);
+            }
+            // The frame the composer draws is exactly these snapped bounds.
+            state.syncCompanionComposer(composer);
+            const frame = state.companion_composer.frameRect();
+            try std.testing.expectEqual(composer.x, frame.x);
+            try std.testing.expectEqual(composer.y + composer.h, frame.y + frame.h);
+        }
+    }
+}
+
+test "companion conversation wraps once and re-wraps only when text, width, or size change" {
+    const allocator = std.testing.allocator;
+    theme.applyTheme(1.0);
+    var state: runtime.AppState = undefined;
+    try testState(allocator, &state);
+    defer deinitTestState(allocator, &state);
+    openTestPanel(&state, 1360.0, 860.0);
+    var frame: controller.Frame = .{ .has_thread = true };
+    _ = frame.setOwner("companion-ui", "chat-1");
+    var user: controller.ActivityItem = .{ .kind = .user, .sequence = 1 };
+    user.body.set("Fix the build and tell me what broke in the release branch");
+    frame.appendActivity(user);
+    var reply: controller.ActivityItem = .{ .kind = .assistant, .sequence = 2 };
+    reply.body.set("I opened a **codex** chat in verde. It is running the build and will report back when it knows more about the failure.");
+    frame.appendActivity(reply);
+    state.companion_controller.setFrame(frame);
+    const companion = &state.companion_controller;
+
+    render(&state, 1360.0, 860.0);
+    const misses = companion.wrap_cache_misses;
+    try std.testing.expectEqual(@as(usize, 2), misses);
+    // Repeated frames, hovers and hit tests reuse the wraps.
+    for (0..3) |_| {
+        state.palette_overlay_batch.clear();
+        render(&state, 1360.0, 860.0);
+        _ = systemCursorAt(&state, 700.0, 300.0);
+    }
+    try std.testing.expectEqual(misses, companion.wrap_cache_misses);
+    // The cached layout matches a fresh measured wrap.
+    const geometry = computeGeometry(&state, 1360.0, 860.0);
+    const item = &companion.presentation.activity[1];
+    const layout = itemTextLayout(&state, item, geometry.conversation, 0.0);
+    const fresh = wrapText(conversationalText(&state, item.body.slice()), conversationWidths(geometry.conversation).text, .prose, bodyFont(), ASSISTANT_MAX_LINES);
+    try std.testing.expectEqual(fresh.count, layout.count);
+    for (fresh.lines[0..fresh.count], layout.lines[0..layout.count]) |want, got| try std.testing.expectEqualStrings(want, got.text);
+
+    // A streamed reply that grows re-wraps just that item.
+    companion.presentation.activity[1].body.set("I opened a **codex** chat in verde. It is running the build and will report back when it knows more about the failure. Done:");
+    state.palette_overlay_batch.clear();
+    render(&state, 1360.0, 860.0);
+    try std.testing.expectEqual(misses + 1, companion.wrap_cache_misses);
+    // A new width (expanded panel) or display scale re-wraps everything.
+    companion.expanded = true;
+    state.palette_overlay_batch.clear();
+    render(&state, 1360.0, 860.0);
+    try std.testing.expectEqual(misses + 3, companion.wrap_cache_misses);
+    theme.applyTheme(1.25);
+    defer theme.applyTheme(1.0);
+    state.palette_overlay_batch.clear();
+    render(&state, 1360.0, 860.0);
+    try std.testing.expectEqual(misses + 5, companion.wrap_cache_misses);
 }
