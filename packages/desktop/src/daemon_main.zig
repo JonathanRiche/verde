@@ -2121,6 +2121,7 @@ test "signal watcher recognizes only an accepted prepare-shutdown result" {
 test {
     _ = sessionizer;
     _ = @import("compile_tests/windows_conpty.zig");
+    _ = @import("daemon/client.zig");
     _ = @import("daemon/chat_links.zig");
     _ = @import("daemon/companions.zig");
     _ = @import("daemon/schedules.zig");

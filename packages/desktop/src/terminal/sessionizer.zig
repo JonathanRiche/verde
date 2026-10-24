@@ -2589,6 +2589,12 @@ pub const Daemon = struct {
     /// saturation that rendered GUI streaming in multi-second chunks).
     /// Over-cap requests degrade to an immediate answer — never an error.
     long_poll_parked: std.atomic.Value(u32) = .init(0),
+    /// In-flight `workspace.directory.list` / `workspace.attach` handlers,
+    /// capped at platform_ipc.MAX_DIRECTORY_BROWSE_IN_FLIGHT. Their
+    /// filesystem calls can block indefinitely (macOS privacy prompts,
+    /// hung network mounts); the cap keeps such stalls from consuming the
+    /// transport worker pool. Over-cap requests get a structured busy error.
+    directory_browse_in_flight: std.atomic.Value(u32) = .init(0),
     /// Sticky drain latch (prepareShutdown accepted, or transport draining).
     /// Parked waiters terminate with the structured drain response; new
     /// positive waits degrade to immediate heartbeats.
@@ -6395,6 +6401,17 @@ pub const Daemon = struct {
     /// caller must have loaded `observed_signal` BEFORE reading turn state
     /// (missed-wake guarantee) and must re-resolve the turn by id after every
     /// wake — a consumed turn frees its memory.
+    fn tryEnterDirectoryBrowse(self: *Daemon) bool {
+        const previous = self.directory_browse_in_flight.fetchAdd(1, .acquire);
+        if (previous < platform_ipc.MAX_DIRECTORY_BROWSE_IN_FLIGHT) return true;
+        _ = self.directory_browse_in_flight.fetchSub(1, .release);
+        return false;
+    }
+
+    fn leaveDirectoryBrowse(self: *Daemon) void {
+        _ = self.directory_browse_in_flight.fetchSub(1, .release);
+    }
+
     fn parkForTurnEvents(self: *Daemon, observed_signal: u32, deadline_ms: i64) ChangesParkOutcome {
         const prev_parked = self.long_poll_parked.fetchAdd(1, .acquire);
         if (prev_parked >= platform_ipc.MAX_PARKED_LONG_POLL_WAITERS) {
@@ -16218,6 +16235,8 @@ fn workspaceDirectoryListWithEnvironment(daemon: *Daemon, id_value: std.json.Val
     if (path != null and !directory_browser.validPath(path.?)) {
         return try errorResponseAlloc(allocator, id_value, headless.protocol.ERR_INVALID_PARAMS, "directory path must be absolute without parent traversal");
     }
+    if (!daemon.tryEnterDirectoryBrowse()) return try directoryBrowseBusyResponse(allocator, id_value);
+    defer daemon.leaveDirectoryBrowse();
     var arena_state: std.heap.ArenaAllocator = .init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -16245,6 +16264,23 @@ fn workspaceDirectoryListWithEnvironment(daemon: *Daemon, id_value: std.json.Val
     return try okValueResponse(allocator, id_value, result);
 }
 
+/// Over-cap folder browsing answers like transport overflow
+/// (`invalid_state` + data.reason="busy") so clients back off instead of
+/// stacking more workers behind a stuck filesystem call.
+fn directoryBrowseBusyResponse(allocator: std.mem.Allocator, id_value: std.json.Value) ![]u8 {
+    var arena_state: std.heap.ArenaAllocator = .init(allocator);
+    defer arena_state.deinit();
+    var data_map: std.json.ObjectMap = .empty;
+    try data_map.put(arena_state.allocator(), "reason", .{ .string = "busy" });
+    return try errorResponseAllocWithData(
+        allocator,
+        id_value,
+        headless.protocol.ERR_INVALID_STATE,
+        "folder browsing is busy; another folder request is still running",
+        .{ .object = data_map },
+    );
+}
+
 /// Roots `workspace.directory.list` may browse and `workspace.attach` may
 /// bind: HOME, each workspace folder's parent, and VERDE_DIRECTORY_ROOTS.
 /// Only persisted host state and the environment supply roots; RPC params
@@ -16267,13 +16303,15 @@ fn directoryRootsAlloc(
         if (rows.err) |_| return error.StoreUnavailable;
     }
     if (home) |value| try directory_browser.appendRoot(arena, io, &roots, value);
+    // Workspace parents are derived lexically from the stored (canonical at
+    // creation) paths. Opening or realpath-ing every workspace per request
+    // touched unrelated folders; on macOS one under ~/Documents raised a TCC
+    // prompt that blocked the call, and retries drained the transport pool.
+    // Only the directory actually being browsed is ever opened.
     for (workspace_paths.items) |workspace_path| {
         if (!directory_browser.validPath(workspace_path)) continue;
-        var buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const workspace_dir = std.Io.Dir.openDirAbsolute(io, workspace_path, .{}) catch continue;
-        defer workspace_dir.close(io);
-        const len = workspace_dir.realPath(io, &buffer) catch continue;
-        if (std.fs.path.dirname(buffer[0..len])) |parent| try directory_browser.appendRoot(arena, io, &roots, parent);
+        const resolved = try std.fs.path.resolve(arena, &.{workspace_path});
+        if (std.fs.path.dirname(resolved)) |parent| try directory_browser.appendLexicalRoot(arena, &roots, parent);
     }
     if (configured_roots) |configured| {
         var paths = std.mem.tokenizeScalar(u8, configured, ':');
@@ -16300,6 +16338,8 @@ fn workspaceAttachWithEnvironment(daemon: *Daemon, id_value: std.json.Value, par
         return try errorResponseAlloc(allocator, id_value, protocol.ERR_INVALID_STATE, "daemon is preparing shutdown and is not accepting mutations");
     }
     daemon.mutex.unlock();
+    if (!daemon.tryEnterDirectoryBrowse()) return try directoryBrowseBusyResponse(allocator, id_value);
+    defer daemon.leaveDirectoryBrowse();
 
     var arena_state: std.heap.ArenaAllocator = .init(allocator);
     defer arena_state.deinit();
@@ -23510,6 +23550,76 @@ test "directory RPC uses durable workspace parents and host roots without deskto
     defer allocator.free(invalid);
     try std.testing.expect(std.mem.indexOf(u8, invalid, "invalid_params") != null);
     try std.testing.expect(methodRunsUnlocked(directory_browser.METHOD));
+}
+
+test "directory RPC derives workspace roots lexically and caps concurrent browsing" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state: std.heap.ArenaAllocator = .init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try tmp.dir.createDirPath(io, "home");
+    try tmp.dir.createDirPath(io, "projects/sibling");
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(io, &buffer);
+    const base = buffer[0..len];
+    const home = try std.fs.path.join(arena, &.{ base, "home" });
+    const projects = try std.fs.path.join(arena, &.{ base, "projects" });
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    const service = try allocator.create(StoreService);
+    service.* = .{ .store = daemon_store.Store.initWithRuntimeIdentity(allocator, db_path, .none, .{
+        .runtime_id = daemon.runtime_id,
+        .instance_id = daemon.instance_id,
+    }) catch |err| {
+        allocator.destroy(service);
+        return err;
+    } };
+    daemon.store_service = service;
+    defer detachTestStoreService(&daemon);
+    // The stored workspace folder cannot be opened (here: it does not exist;
+    // on macOS: a privacy-protected folder whose open blocks on a prompt).
+    // Its parent must still be a root, derived without touching the folder.
+    _ = try service.store.upsertWorkspace(.{
+        .mutation = .{ .request_key = "directory-lexical", .client_id = "test" },
+        .workspace = .{ .workspace_id = "unopenable", .label = "Unopenable", .path = try std.fs.path.join(arena, &.{ projects, "unopenable" }) },
+    });
+    var params: std.json.ObjectMap = .empty;
+    try params.put(arena, "path", .{ .string = projects });
+
+    const listed = try workspaceDirectoryListWithEnvironment(&daemon, .{ .integer = 1 }, .{ .object = params }, home, null);
+    defer allocator.free(listed);
+    var listed_parsed = try headless.parseResponse(allocator, listed);
+    defer listed_parsed.deinit();
+    try std.testing.expect(listed_parsed.response.isOk());
+    const directories = listed_parsed.response.result.?.object.get("directories").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), directories.len);
+    try std.testing.expectEqualStrings("sibling", directories[0].object.get("name").?.string);
+
+    // Every browse slot held (stuck filesystem calls): answer busy at once
+    // with the structured reason, leaving the slot count untouched.
+    const cap: u32 = @intCast(platform_ipc.MAX_DIRECTORY_BROWSE_IN_FLIGHT);
+    try std.testing.expect(cap < platform_ipc.TRANSPORT_WORKER_COUNT / 2);
+    daemon.directory_browse_in_flight.store(cap, .release);
+    const busy = try workspaceDirectoryListWithEnvironment(&daemon, .{ .integer = 2 }, .{ .object = params }, home, null);
+    defer allocator.free(busy);
+    var busy_parsed = try std.json.parseFromSlice(std.json.Value, allocator, busy, .{});
+    defer busy_parsed.deinit();
+    const busy_error = busy_parsed.value.object.get("error").?.object;
+    try std.testing.expectEqualStrings(headless.protocol.ERR_INVALID_STATE, busy_error.get("code").?.string);
+    try std.testing.expectEqualStrings("busy", busy_error.get("data").?.object.get("reason").?.string);
+    try std.testing.expectEqual(cap, daemon.directory_browse_in_flight.load(.acquire));
+
+    // A freed slot serves again, and a finished request releases its slot.
+    daemon.directory_browse_in_flight.store(cap - 1, .release);
+    const again = try workspaceDirectoryListWithEnvironment(&daemon, .{ .integer = 3 }, .{ .object = params }, home, null);
+    defer allocator.free(again);
+    try std.testing.expect(std.mem.indexOf(u8, again, "\"sibling\"") != null);
+    try std.testing.expectEqual(cap - 1, daemon.directory_browse_in_flight.load(.acquire));
 }
 
 fn testSubagentSeedWorkspace(store: *daemon_store.Store, workspace_id: []const u8) !void {

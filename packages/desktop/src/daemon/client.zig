@@ -313,6 +313,12 @@ fn parsePrepareShutdownResult(allocator: std.mem.Allocator, response: []const u8
     };
 }
 
+/// Ensure a protocol-compatible daemon answers at `pref_path`, spawning or
+/// gracefully replacing it as needed. A daemon that is present but saturated
+/// (structured `invalid_state` + data.reason="busy", or a status request that
+/// connects but is never served) yields `error.SessionDaemonBusy` at once:
+/// spawning a second daemon cannot bind the held endpoint, and killing a
+/// saturated one would drop live sessions, so the caller decides.
 pub fn ensureDaemon(allocator: std.mem.Allocator, pref_path: []const u8, exe_path: []const u8) !void {
     var threaded = std.Io.Threaded.init_single_threaded;
     const io = threaded.io();
@@ -320,6 +326,10 @@ pub fn ensureDaemon(allocator: std.mem.Allocator, pref_path: []const u8, exe_pat
 
     if (requestWithPeerAlloc(allocator, pref_path, "status", .{}, 0, MAX_MESSAGE_BYTES)) |result| {
         defer allocator.free(result.response);
+        if (isDaemonBusyResponse(allocator, result.response)) {
+            logDaemonBusy(result.authenticated_server_process_id);
+            return error.SessionDaemonBusy;
+        }
         if (parseDaemonStatus(allocator, result.response)) |status| {
             if (status.protocol_version == PROTOCOL_VERSION) return;
             replacement_requested = true;
@@ -331,7 +341,14 @@ pub fn ensureDaemon(allocator: std.mem.Allocator, pref_path: []const u8, exe_pat
                 result.authenticated_server_process_id,
             );
         }
-    } else |_| {}
+    } else |err| switch (err) {
+        // Connected (the endpoint is held) but the status was never served.
+        error.ConnectionTimedOut => {
+            logDaemonBusy(null);
+            return error.SessionDaemonBusy;
+        },
+        else => {},
+    }
 
     if (replacement_requested) try waitForReplacementBindSlot(allocator, pref_path, io);
     try spawnDaemon(allocator, exe_path);
@@ -340,6 +357,10 @@ pub fn ensureDaemon(allocator: std.mem.Allocator, pref_path: []const u8, exe_pat
     while (attempts < 250) : (attempts += 1) {
         if (requestAlloc(allocator, pref_path, "status", .{}, 0)) |response| {
             defer allocator.free(response);
+            if (isDaemonBusyResponse(allocator, response)) {
+                logDaemonBusy(null);
+                return error.SessionDaemonBusy;
+            }
             if (parseDaemonStatus(allocator, response)) |status| {
                 if (status.protocol_version == PROTOCOL_VERSION) return;
                 last_probe_error = error.IncompatibleDaemonProtocol;
@@ -353,6 +374,30 @@ pub fn ensureDaemon(allocator: std.mem.Allocator, pref_path: []const u8, exe_pat
     }
     log.warn("session daemon unavailable after {d} status attempts last_probe_error={s}", .{ attempts, @errorName(last_probe_error) });
     return error.SessionDaemonUnavailable;
+}
+
+/// The transport's saturation reply (`platform_ipc` accept-queue overflow) or
+/// any handler's structured busy error: `invalid_state` + data.reason="busy".
+fn isDaemonBusyResponse(allocator: std.mem.Allocator, response: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, response, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const err_value = parsed.value.object.get("error") orelse return false;
+    if (err_value != .object) return false;
+    const code = jsonString(err_value.object.get("code") orelse .null) orelse return false;
+    if (!std.mem.eql(u8, code, headless.registry.ERR_INVALID_STATE)) return false;
+    const data = err_value.object.get("data") orelse return false;
+    if (data != .object) return false;
+    const reason = jsonString(data.object.get("reason") orelse .null) orelse return false;
+    return std.mem.eql(u8, reason, "busy");
+}
+
+fn logDaemonBusy(server_process_id: ?u32) void {
+    if (server_process_id) |pid| {
+        log.warn("session daemon pid={d} is running but saturated (all transport workers busy); not spawning or replacing it. Retry shortly, or quit Verde and stop that process to replace it", .{pid});
+    } else {
+        log.warn("session daemon is running but not serving requests (transport saturated); not spawning or replacing it. Retry shortly, or quit Verde and stop the verde-daemon process to replace it", .{});
+    }
 }
 
 pub fn ensureDaemonInteractive(allocator: std.mem.Allocator, pref_path: []const u8, exe_path: []const u8) !void {
@@ -810,3 +855,68 @@ const windows_api = if (builtin.os.tag == .windows) std.os.windows else struct {
 extern "kernel32" fn TerminateProcess(process: windows_api.HANDLE, exit_code: windows_api.UINT) callconv(.winapi) windows_api.BOOL;
 extern "kernel32" fn OpenProcess(desired_access: windows_api.DWORD, inherit_handle: windows_api.BOOL, process_id: windows_api.DWORD) callconv(.winapi) ?windows_api.HANDLE;
 extern "kernel32" fn WaitForSingleObject(handle: windows_api.HANDLE, milliseconds: windows_api.DWORD) callconv(.winapi) windows_api.DWORD;
+
+test "ensureDaemon reports a saturated daemon as busy without spawning a duplicate" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    // The endpoint must come from the temporary pref path, never a live daemon.
+    if (std.c.getenv(SESSIONIZER_SOCKET_ENV_NAME) != null) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    // Short private pref dir: the cache-rooted testing tmpDir exceeds the
+    // Unix socket path limit.
+    var random_bytes: [8]u8 = undefined;
+    std.testing.io.random(&random_bytes);
+    const pref_path = try std.fmt.allocPrint(allocator, "/tmp/verde-ensure-{x}", .{std.mem.readInt(u64, &random_bytes, .little)});
+    defer allocator.free(pref_path);
+    try std.Io.Dir.createDirAbsolute(std.testing.io, pref_path, .default_dir);
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, pref_path) catch {};
+    const endpoint = try defaultSocketPath(allocator, pref_path);
+    defer allocator.free(endpoint);
+
+    // Stand-in for a daemon whose worker pool and accept queue are full: every
+    // connection gets the transport's own overflow reply.
+    const address = try std.Io.net.UnixAddress.init(endpoint);
+    var listener = try address.listen(io, .{});
+    defer listener.deinit(io);
+    const Saturated = struct {
+        fn run(server: *std.Io.net.Server, stop: *std.atomic.Value(bool)) void {
+            var thread_io = std.Io.Threaded.init_single_threaded;
+            while (!stop.load(.acquire)) {
+                const stream = server.accept(thread_io.io()) catch return;
+                platform_ipc.rejectBusyUnix(thread_io.io(), stream);
+            }
+        }
+    };
+    var stop = std.atomic.Value(bool).init(false);
+    const server_thread = try std.Thread.spawn(.{}, Saturated.run, .{ &listener, &stop });
+    defer {
+        stop.store(true, .release);
+        // Wake the blocked accept so the thread observes `stop`.
+        if (requestAlloc(allocator, pref_path, "status", .{}, 0)) |response| allocator.free(response) else |_| {}
+        server_thread.join();
+    }
+
+    const started = nowMs();
+    // A spawn attempt would fail differently (no daemon binary here) and the
+    // old path then polled for 5 s before SessionDaemonUnavailable.
+    try std.testing.expectError(
+        error.SessionDaemonBusy,
+        ensureDaemon(allocator, pref_path, "/nonexistent/verde-test/verde"),
+    );
+    try std.testing.expect(nowMs() - started < 2_000);
+}
+
+test "daemon busy replies are recognized only with the structured busy reason" {
+    const allocator = std.testing.allocator;
+    try std.testing.expect(isDaemonBusyResponse(allocator, platform_ipc.BUSY_RESPONSE));
+    try std.testing.expect(isDaemonBusyResponse(allocator,
+        \\{"jsonrpc":"2.0","id":0,"error":{"code":"invalid_state","message":"folder browsing is busy","data":{"reason":"busy"}}}
+    ));
+    try std.testing.expect(!isDaemonBusyResponse(allocator,
+        \\{"jsonrpc":"2.0","id":0,"error":{"code":"invalid_state","message":"draining","data":{"reason":"draining"}}}
+    ));
+    try std.testing.expect(!isDaemonBusyResponse(allocator,
+        \\{"jsonrpc":"2.0","id":0,"result":{"protocol_version":1}}
+    ));
+}

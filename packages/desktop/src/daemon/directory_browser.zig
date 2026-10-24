@@ -38,6 +38,16 @@ pub fn appendRoot(allocator: std.mem.Allocator, io: std.Io, roots: *std.ArrayLis
     try roots.append(allocator, try allocator.dupe(u8, resolved));
 }
 
+/// Add an already-resolved absolute root without touching the filesystem
+/// (no open, no realpath). For roots derived from stored workspace paths,
+/// which may sit in privacy-protected folders that must not be probed until
+/// the user actually browses there.
+pub fn appendLexicalRoot(allocator: std.mem.Allocator, roots: *std.ArrayList([]const u8), path: []const u8) !void {
+    if (!validPath(path)) return;
+    for (roots.items) |existing| if (std.mem.eql(u8, existing, path)) return;
+    try roots.append(allocator, try allocator.dupe(u8, path));
+}
+
 pub fn validPath(path: []const u8) bool {
     if (!std.fs.path.isAbsolute(path) or std.mem.indexOfScalar(u8, path, 0) != null) return false;
     var parts = std.mem.tokenizeScalar(u8, path, '/');

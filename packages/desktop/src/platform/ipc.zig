@@ -41,9 +41,15 @@ pub const TRANSPORT_ACCEPT_QUEUE_CAP: usize = 16;
 /// property of the worker pool; the enforcement lives with the parking
 /// handler, which owns wait semantics.
 pub const MAX_PARKED_LONG_POLL_WAITERS: usize = TRANSPORT_WORKER_COUNT / 2;
+/// Concurrent folder-browsing handlers (`workspace.directory.list`,
+/// `workspace.attach`). Their filesystem calls can block without bound (a
+/// macOS privacy prompt, a hung network mount), so at most this many workers
+/// may sit in one; over-cap requests answer busy at once and the rest of the
+/// pool stays serviceable. Enforced by the handlers, like the park cap.
+pub const MAX_DIRECTORY_BROWSE_IN_FLIGHT: usize = 2;
 /// Q7 accept-queue overflow reply: `invalid_state` + Error.data.reason="busy".
 /// Written before any request byte is read, so the id is necessarily null.
-const BUSY_RESPONSE = "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":\"invalid_state\",\"message\":\"transport worker pool and accept queue are saturated\",\"data\":{\"reason\":\"busy\"}}}";
+pub const BUSY_RESPONSE = "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":\"invalid_state\",\"message\":\"transport worker pool and accept queue are saturated\",\"data\":{\"reason\":\"busy\"}}}";
 /// Busy replies must stay fast: the payload fits any socket buffer so this
 /// write virtually never blocks, and the short deadline keeps a stalled
 /// overflow peer from holding the accept loop hostage.
@@ -309,7 +315,7 @@ const UnixWorkerPool = struct {
 /// (Q7). The reply is written without reading the request — the peer gets a
 /// definitive structured busy signal instead of an opaque stall — and the
 /// connection is closed immediately afterwards.
-fn rejectBusyUnix(io: std.Io, stream: std.Io.net.Stream) void {
+pub fn rejectBusyUnix(io: std.Io, stream: std.Io.net.Stream) void {
     defer stream.close(io);
     const deadline = deadlineFromNow(BUSY_WRITE_TIMEOUT_MS);
     writeUnixAllWithDeadline(stream, BUSY_RESPONSE, deadline) catch return;
