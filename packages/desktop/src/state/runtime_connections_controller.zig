@@ -14,6 +14,7 @@ const connect_client = @import("../runtime/connect_client.zig");
 const profile = @import("../runtime/profile.zig");
 const RuntimeService = @import("../runtime/service.zig");
 const nearby_pairing = @import("nearby_pairing.zig");
+pub const connect_accounts = @import("connect_accounts.zig");
 
 const log = std.log.scoped(.native_runtime_connections);
 
@@ -30,7 +31,7 @@ pub const URL_CAPACITY: usize = profile.MAX_URL_BYTES;
 pub const AGENT_EXPECTED_RUNTIME_ID_CAPACITY: usize = 128;
 pub const PAIR_LINK_PREFIX: []const u8 = "verde://pair?";
 /// Public Verde Cloud control plane, prefilled for the Verde Cloud method.
-pub const VERDE_CLOUD_URL: []const u8 = "https://cloud.verdeai.dev";
+pub const VERDE_CLOUD_URL: []const u8 = connect_accounts.VERDE_CLOUD_URL;
 pub const NearbyMachine = nearby_pairing.Machine;
 pub const NearbyPhase = nearby_pairing.DiscoveryPhase;
 pub const ApprovalPhase = nearby_pairing.ApprovalPhase;
@@ -139,6 +140,13 @@ pub const RowAction = enum(u8) {
     review_trust,
     /// Open session with stale/blocked readiness: drop it and re-probe.
     reconnect,
+    /// Account actions: `row` is the account index.
+    account_sign_in,
+    account_refresh,
+    account_sign_out,
+    /// Link an available account machine: `row` is
+    /// `account * connect_accounts.LINK_ROW_STRIDE + machine`.
+    link_machine,
 };
 pub const ACTION_BITS: u6 = 8;
 
@@ -282,6 +290,14 @@ pub const State = struct {
     connect_runtimes: std.ArrayList(ConnectRuntimeRow) = .empty,
     connect_runtimes_truncated: usize = 0,
     connect_selected: ?usize = null,
+    /// The wizard's session belongs to a Connect account (`accounts`) and is
+    /// returned to it, never destroyed, when the wizard lets go.
+    connect_session_lent: bool = false,
+    /// A single assigned machine was already auto-selected once; a refused
+    /// bootstrap must not retry in a loop.
+    connect_auto_adopted: bool = false,
+    /// One account (and one long-lived session) per Connect control plane.
+    accounts: connect_accounts.State = .{},
     wizard_notice_storage: [NOTICE_CAPACITY:0]u8 = std.mem.zeroes([NOTICE_CAPACITY:0]u8),
     /// Remove requires a second explicit click on the same row.
     remove_confirm_profile_id: ?[]u8 = null,
@@ -329,6 +345,8 @@ pub const State = struct {
         self.providers.deinit(allocator);
         destroyConnectSession(self, allocator);
         self.connect_runtimes.deinit(allocator);
+        // After the wizard returned any borrowed session.
+        self.accounts.deinit(allocator);
         std.crypto.secureZero(u8, &self.pairing_code_storage);
         self.* = undefined;
     }
@@ -690,6 +708,9 @@ pub fn chooseRuntimeWizardMethod(self: anytype, method: WizardMethod) void {
                 fillZ(&rc.label_storage, "Verde Cloud");
                 rc.label_cursor = rc.fieldValue(.label).len;
             }
+            if (wizardTargetsExistingAccount(rc)) {
+                setNotice(&rc.wizard_notice_storage, "This control plane is already set up here. Continue to open its account card, or enter a different URL.");
+            }
             focusWizardField(self, .label);
         },
     }
@@ -1043,6 +1064,16 @@ fn submitConnectSetup(self: anytype) void {
             return;
         }
         const url = std.mem.trim(u8, rc.fieldValue(.control_plane_url), &std.ascii.whitespace);
+        // One account per control plane: an existing one is focused (with
+        // any machines not linked yet) instead of saving a duplicate.
+        if (rc.wizard_profile_id == null) {
+            if (rc.accounts.accountIndex(url)) |index| {
+                if (rc.accounts.accounts.items[index].profile_count > 0) {
+                    focusConnectAccount(self, index);
+                    return;
+                }
+            }
+        }
         if (rc.wizard_profile_id) |profile_id| {
             const replacement = service.updateConnectProfile(profile_id, rc.fieldValue(.label), url) catch |err| {
                 setNotice(&rc.wizard_notice_storage, saveFailureMessage(err));
@@ -1065,14 +1096,16 @@ fn submitConnectSetup(self: anytype) void {
             self.syncPaletteRuntimePicker();
         }
         destroyConnectSession(rc, self.allocator);
-        rc.connect_session = self.createRuntimeConnectSession(url) catch |err| {
-            setNotice(&rc.wizard_notice_storage, if (err == error.OutOfMemory) "Out of memory." else "Enter the control plane as https://host[:port].");
+        if (!borrowAccountSession(self, url, true)) {
+            setNotice(&rc.wizard_notice_storage, "Could not start a session for that control plane. Check the URL and try again.");
             self.markDirty();
             return;
-        };
+        }
         rc.connect_phase = .discovering;
         rc.connect_failure = null;
         setNotice(&rc.wizard_notice_storage, "Saved. Checking the control plane's discovery document…");
+        // A signed-in account session already has its machines.
+        _ = pollConnectSession(self);
         blurWizardField(self);
         self.markDirty();
         return;
@@ -1522,14 +1555,16 @@ pub fn runtimeNameFromUrl(url: []const u8) []const u8 {
 /// Advances the open wizard from background progress. Returns true on change.
 pub fn pollRuntimeConnectionWizard(self: anytype) bool {
     const rc = &self.runtime_connections;
-    if (!rc.wizard_open) return false;
-    return switch (rc.wizard_step) {
+    const accounts_changed = pollConnectAccounts(self);
+    if (!rc.wizard_open) return accounts_changed;
+    const wizard_changed = switch (rc.wizard_step) {
         .pair_grant => pollPairingExchange(self),
         .connect_setup => pollConnectSession(self),
         .method => rc.nearby.poll(),
         .approval_wait => pollNearbyApproval(self),
         else => false,
     };
+    return accounts_changed or wizard_changed;
 }
 
 fn pollPairingExchange(self: anytype) bool {
@@ -1637,6 +1672,15 @@ fn pollConnectSession(self: anytype) bool {
         if (rc.connect_runtimes.items.len == 1) rc.connect_selected = 0;
         changed = true;
     }
+    // First sign-in with exactly one assigned machine: select and connect it
+    // without another click. Only once, so a refusal does not loop.
+    if (shouldAutoAdopt(rc, snapshot.phase)) {
+        if (self.runtime_service) |service| {
+            rc.connect_auto_adopted = true;
+            adoptSelectedConnectRuntime(self, service);
+            return true;
+        }
+    }
     if (changed) {
         if (snapshot.failure) |failure| {
             setNotice(&rc.wizard_notice_storage, failure.message());
@@ -1650,7 +1694,7 @@ fn pollConnectSession(self: anytype) bool {
             .inventory_loaded => setNotice(&rc.wizard_notice_storage, if (rc.connect_runtimes.items.len == 0)
                 "Ask a team admin to assign a ready runtime to this account, then choose Refresh."
             else
-                "Select the runtime to use with this profile."),
+                "Select the machine to connect first. The account's other machines appear on its card in Settings."),
             .bootstrapping => setNotice(&rc.wizard_notice_storage, "Requesting and consuming the signed Connect bootstrap…"),
             .bootstrap_ready => {},
             .signing_in => {},
@@ -1658,6 +1702,208 @@ fn pollConnectSession(self: anytype) bool {
         }
     }
     return changed;
+}
+
+// ---------------------------------------------------------------------------
+// Connect accounts (one card and one session per control plane)
+// ---------------------------------------------------------------------------
+
+/// `connect_accounts` host over AppState: Connect profiles in picker order,
+/// persisted through the shared runtime service.
+fn AccountHost(comptime App: type) type {
+    return struct {
+        const Host = @This();
+        app: App,
+        allocator: std.mem.Allocator,
+
+        pub fn profileCount(host: *Host) usize {
+            return host.app.runtime_picker_profiles.items.len;
+        }
+
+        pub fn profileAt(host: *Host, index: usize) ?connect_accounts.ProfileRef {
+            if (index >= host.app.runtime_picker_profiles.items.len) return null;
+            const service = host.app.runtime_service orelse return null;
+            const id = host.app.runtime_picker_profiles.items[index].profile_id;
+            const configured = service.runtime_manager.profileConst(id) orelse return null;
+            const link = switch (configured.access) {
+                .connect => |value| value,
+                else => return null,
+            };
+            const https_url: ?[]const u8 = switch (configured.transport) {
+                .connect => |endpoint| endpoint.https_url,
+                else => null,
+            };
+            return .{
+                .profile_id = id,
+                .label = configured.label,
+                .control_plane_url = link.control_plane_url,
+                .runtime_id = configured.expected_runtime_id,
+                .https_url = https_url,
+            };
+        }
+
+        pub fn createSession(host: *Host, url: []const u8) !*connect_client.Session {
+            return host.app.createRuntimeConnectSession(url);
+        }
+
+        pub fn createMachineProfile(host: *Host, label: []const u8, url: []const u8) ![]u8 {
+            const service = host.app.runtime_service orelse return error.RuntimeServiceUnavailable;
+            const id = try service.createConnectProfile(host.allocator, label, url);
+            errdefer host.allocator.free(id);
+            try host.app.appendRuntimePickerProfile(id);
+            return id;
+        }
+
+        pub fn selectMachine(host: *Host, profile_id: []const u8, selection: connect_accounts.Selection) !void {
+            const service = host.app.runtime_service orelse return error.RuntimeServiceUnavailable;
+            try service.selectConnectRuntime(profile_id, .{
+                .link_id = selection.link_id,
+                .runtime_id = selection.runtime_id,
+                .instance_id = selection.instance_id,
+                .https_url = selection.https_url,
+                .wss_url = selection.wss_url,
+                .spki_sha256 = selection.spki_sha256,
+            });
+        }
+
+        pub fn commitMachine(host: *Host, profile_id: []const u8, commit: connect_accounts.Commit) !bool {
+            const service = host.app.runtime_service orelse return error.RuntimeServiceUnavailable;
+            const committed = try service.commitConnectBootstrap(profile_id, .{
+                .runtime_id = commit.runtime_id,
+                .instance_id = commit.instance_id,
+                .device_id = commit.device_id,
+                .device_credential = commit.device_credential,
+            }, host.app.runtimeNowMs());
+            invalidateReadiness(host.app, profile_id);
+            return committed.durable;
+        }
+
+        pub fn removeMachineProfile(host: *Host, profile_id: []const u8) void {
+            if (host.app.runtime_service) |service| {
+                _ = service.removeProfile(profile_id) catch |err| log.warn("connect account cleanup failed: {s}", .{@errorName(err)});
+            }
+            host.app.removeRuntimePickerProfile(profile_id);
+            host.app.syncPaletteRuntimePicker();
+        }
+
+        pub fn machineLinked(host: *Host, profile_id: []const u8, thread_id: ?[]const u8) void {
+            host.app.syncPaletteRuntimePicker();
+            const wanted = thread_id orelse return;
+            // Only the draft that asked; the user may have moved on.
+            if (!std.mem.eql(u8, host.app.currentThread().local_thread_id, wanted)) return;
+            host.app.selectCurrentThreadRuntimeProfile(profile_id);
+        }
+
+        pub fn notice(host: *Host, text: []const u8) void {
+            setNotice(&host.app.runtime_connections.card_notice_storage, text);
+        }
+    };
+}
+
+fn accountHost(self: anytype) AccountHost(@TypeOf(self)) {
+    return .{ .app = self, .allocator = self.allocator };
+}
+
+/// Polls every account session; refreshes the picker when its account rows
+/// or labels moved. Returns true on any visible change.
+fn pollConnectAccounts(self: anytype) bool {
+    const rc = &self.runtime_connections;
+    if (self.runtime_service == null) return false;
+    var host = accountHost(self);
+    const before = rc.accounts.signature;
+    const changed = connect_accounts.poll(&host, &rc.accounts);
+    if (rc.accounts.signature != before) self.syncPaletteRuntimePicker();
+    return changed;
+}
+
+/// Gives the wizard the account's session for `url` (creating the account
+/// and session when needed). Returns false when no session is available.
+fn borrowAccountSession(self: anytype, url: []const u8, retry_failed: bool) bool {
+    const rc = &self.runtime_connections;
+    var host = accountHost(self);
+    const index = connect_accounts.ensureAccount(self.allocator, &rc.accounts, url) orelse return false;
+    const account = &rc.accounts.accounts.items[index];
+    if (retry_failed and (account.session_unavailable or account.phase == .failed or account.phase == .idle)) {
+        _ = connect_accounts.retry(&host, &rc.accounts, index);
+    }
+    const session = connect_accounts.lendSession(&host, &rc.accounts, url) orelse return false;
+    rc.connect_session = session;
+    rc.connect_session_lent = true;
+    rc.connect_phase = .idle;
+    rc.connect_failure = null;
+    return true;
+}
+
+/// The add wizard's control-plane URL names an account that already has
+/// machines here, so its primary action opens that account instead.
+pub fn wizardTargetsExistingAccount(rc: *const State) bool {
+    if (rc.wizard_mode != .add or rc.wizard_profile_id != null) return false;
+    const url = std.mem.trim(u8, rc.fieldValue(.control_plane_url), &std.ascii.whitespace);
+    const index = rc.accounts.accountIndex(url) orelse return false;
+    return rc.accounts.accounts.items[index].profile_count > 0;
+}
+
+fn shouldAutoAdopt(rc: *const State, phase: connect_client.Phase) bool {
+    return phase == .inventory_loaded and rc.wizard_open and rc.wizard_step == .connect_setup and
+        rc.wizard_mode == .add and rc.wizard_profile_id != null and !rc.connect_auto_adopted and
+        rc.connect_failure == null and rc.connect_runtimes.items.len == 1;
+}
+
+/// Closes the wizard and shows the existing account's card instead of a
+/// duplicate connection, refreshing its machines.
+fn focusConnectAccount(self: anytype, index: usize) void {
+    const rc = &self.runtime_connections;
+    cancelRuntimeConnectionWizard(self);
+    var host = accountHost(self);
+    _ = connect_accounts.refresh(&host, &rc.accounts, index);
+    rc.accounts.focus_account = index;
+    const account = &rc.accounts.accounts.items[index];
+    var buffer: [NOTICE_CAPACITY]u8 = undefined;
+    const text = if (account.signedIn())
+        std.fmt.bufPrint(&buffer, "You're already signed in to {s}. Machines not connected here yet are listed with Connect.", .{account.title()}) catch ""
+    else
+        std.fmt.bufPrint(&buffer, "{s} is already set up here. Sign in on its card to see all of its machines.", .{account.title()}) catch "";
+    setNotice(&rc.card_notice_storage, text);
+    self.openSettingsToCategory(.connections);
+    self.markDirty();
+}
+
+fn applyAccountAction(self: anytype, decoded: DecodedRowAction) void {
+    const rc = &self.runtime_connections;
+    var host = accountHost(self);
+    switch (decoded.action) {
+        .account_sign_in => {
+            if (connect_accounts.signIn(&host, &rc.accounts, decoded.row)) {
+                setNotice(&rc.card_notice_storage, "Opening the system browser for sign-in\u{2026}");
+            }
+        },
+        .account_refresh => _ = connect_accounts.refresh(&host, &rc.accounts, decoded.row),
+        .account_sign_out => {
+            if (connect_accounts.signOut(&host, &rc.accounts, decoded.row)) {
+                setNotice(&rc.card_notice_storage, "Signed out. Connected machines keep their device credentials and reconnect after the next sign-in.");
+            }
+        },
+        .link_machine => {
+            const account = decoded.row / connect_accounts.LINK_ROW_STRIDE;
+            const machine = decoded.row % connect_accounts.LINK_ROW_STRIDE;
+            _ = connect_accounts.linkMachine(&host, &rc.accounts, account, machine, null);
+        },
+        else => {},
+    }
+}
+
+/// Composer picker row for an account machine that is not linked yet: link
+/// it, then select it for the current draft.
+pub fn linkAvailableMachineFromPicker(self: anytype, available_index: usize) void {
+    const rc = &self.runtime_connections;
+    const entry = rc.accounts.availableAt(available_index) orelse return;
+    var host = accountHost(self);
+    const thread_id = self.currentThread().local_thread_id;
+    if (connect_accounts.linkMachine(&host, &rc.accounts, entry.account, entry.machine, thread_id)) {
+        self.setSidebarNotice("Connecting that machine to this desktop\u{2026} The chat will use it once it is ready.");
+    } else {
+        self.setSidebarNotice(rc.cardNotice());
+    }
 }
 
 /// UI copy of one inventory row so rendering never borrows worker memory.
@@ -1669,6 +1915,8 @@ pub const ConnectRuntimeRow = struct {
     https_url: []u8,
     wss_url: []u8,
     spki_sha256: []u8,
+    /// Control-plane display name, when the inventory supplies one.
+    label: ?[]u8 = null,
 
     fn clone(allocator: std.mem.Allocator, row: connect_client.RuntimeRow) !ConnectRuntimeRow {
         var out: ConnectRuntimeRow = undefined;
@@ -1685,11 +1933,19 @@ pub const ConnectRuntimeRow = struct {
         out.wss_url = try allocator.dupe(u8, row.wss_url);
         errdefer allocator.free(out.wss_url);
         out.spki_sha256 = try allocator.dupe(u8, row.spki_sha256);
+        errdefer allocator.free(out.spki_sha256);
+        out.label = if (row.label) |value| try allocator.dupe(u8, value) else null;
         return out;
+    }
+
+    /// Name shown in the wizard list: the inventory label, else the host.
+    pub fn name(self: *const ConnectRuntimeRow) []const u8 {
+        return self.label orelse runtimeNameFromUrl(self.https_url);
     }
 
     fn deinit(self: *ConnectRuntimeRow, allocator: std.mem.Allocator) void {
         if (self.selection_key) |key| allocator.free(key);
+        if (self.label) |value| allocator.free(value);
         allocator.free(self.link_id);
         allocator.free(self.runtime_id);
         allocator.free(self.instance_id);
@@ -1704,6 +1960,7 @@ fn connectRowsEqual(previous: []const ConnectRuntimeRow, current: []const connec
     if (previous.len != current.len) return false;
     for (previous, current) |old, fresh| {
         if (!optionalStringsEqual(old.selection_key, fresh.selection_key) or
+            !optionalStringsEqual(old.label, fresh.label) or
             !std.mem.eql(u8, old.link_id, fresh.link_id) or
             !std.mem.eql(u8, old.runtime_id, fresh.runtime_id) or
             !std.mem.eql(u8, old.instance_id, fresh.instance_id) or
@@ -1722,8 +1979,14 @@ fn clearConnectRuntimes(rc: *State, allocator: std.mem.Allocator) void {
 }
 
 fn destroyConnectSession(rc: *State, allocator: std.mem.Allocator) void {
-    if (rc.connect_session) |session| session.destroy();
+    if (rc.connect_session) |session| {
+        // An account's session outlives the wizard; only an unowned one ends.
+        const returned = rc.connect_session_lent and connect_accounts.returnSession(&rc.accounts, session.controlPlaneUrl(), session);
+        if (!returned) session.destroy();
+    }
     rc.connect_session = null;
+    rc.connect_session_lent = false;
+    rc.connect_auto_adopted = false;
     rc.connect_phase = .idle;
     rc.connect_failure = null;
     rc.connect_login_open = false;
@@ -1749,6 +2012,14 @@ pub fn applyRuntimeRowAction(self: anytype, index: usize) void {
     if (decoded.action == .add_connection) {
         openRuntimeConnectionWizard(self);
         return;
+    }
+    switch (decoded.action) {
+        .account_sign_in, .account_refresh, .account_sign_out, .link_machine => {
+            applyAccountAction(self, decoded);
+            self.markDirty();
+            return;
+        },
+        else => {},
     }
     if (decoded.row == 0) {
         switch (decoded.action) {
@@ -1851,7 +2122,7 @@ pub fn applyRuntimeRowAction(self: anytype, index: usize) void {
             };
             setNotice(&rc.card_notice_storage, "Future chats in this workspace will use this runtime. Existing drafts and started chats are unchanged.");
         },
-        .add_connection => unreachable,
+        .add_connection, .account_sign_in, .account_refresh, .account_sign_out, .link_machine => unreachable,
     }
     _ = now_ms;
     self.markDirty();
@@ -2559,6 +2830,39 @@ pub fn setCardNotice(self: anytype, value: []const u8) void {
 // ---------------------------------------------------------------------------
 // Tests: pure state/validation seams with no AppState dependency
 // ---------------------------------------------------------------------------
+
+test "account row actions round-trip and target one account machine" {
+    const machine_row = 2 * connect_accounts.LINK_ROW_STRIDE + 5;
+    const decoded = decodeRowAction(encodeRowAction(machine_row, .link_machine)).?;
+    try std.testing.expectEqual(RowAction.link_machine, decoded.action);
+    try std.testing.expectEqual(@as(usize, 2), decoded.row / connect_accounts.LINK_ROW_STRIDE);
+    try std.testing.expectEqual(@as(usize, 5), decoded.row % connect_accounts.LINK_ROW_STRIDE);
+    try std.testing.expectEqual(RowAction.account_sign_out, decodeRowAction(encodeRowAction(1, .account_sign_out)).?.action);
+}
+
+test "the add wizard auto-connects only a single machine, once, on first sign-in" {
+    var rc: State = .{};
+    rc.wizard_open = true;
+    rc.wizard_step = .connect_setup;
+    rc.wizard_mode = .add;
+    try std.testing.expect(!shouldAutoAdopt(&rc, .inventory_loaded));
+    var id_buffer = "profile-0123456789abcdef0123456789abcdef".*;
+    rc.wizard_profile_id = &id_buffer;
+    defer rc.wizard_profile_id = null;
+    var row_fields = [_]u8{'x'};
+    try rc.connect_runtimes.append(std.testing.allocator, .{ .link_id = &row_fields, .runtime_id = &row_fields, .instance_id = &row_fields, .https_url = &row_fields, .wss_url = &row_fields, .spki_sha256 = &row_fields });
+    defer rc.connect_runtimes.deinit(std.testing.allocator);
+    try std.testing.expect(shouldAutoAdopt(&rc, .inventory_loaded));
+    try std.testing.expect(!shouldAutoAdopt(&rc, .loading_inventory));
+    rc.connect_auto_adopted = true;
+    try std.testing.expect(!shouldAutoAdopt(&rc, .inventory_loaded));
+    rc.connect_auto_adopted = false;
+    rc.connect_failure = .bootstrap_rejected;
+    try std.testing.expect(!shouldAutoAdopt(&rc, .inventory_loaded));
+    rc.connect_failure = null;
+    try rc.connect_runtimes.append(std.testing.allocator, rc.connect_runtimes.items[0]);
+    try std.testing.expect(!shouldAutoAdopt(&rc, .inventory_loaded));
+}
 
 test "readiness state machine serializes manifest before providers" {
     var rc: State = .{};

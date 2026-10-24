@@ -794,7 +794,7 @@ pub fn syncPickerRows(self: anytype) void {
         var candidate_count: usize = 0;
         row.tier = if (workspace_id.len == 0) .plain else tierFor(self, configured.profile_id, workspace_id, &candidates, &candidate_count);
         const snapshot = snapshotFor(self, configured.profile_id);
-        const machine_label: []const u8 = if (snapshot) |value| value.label else configured.profile_id;
+        const machine_label: []const u8 = accountMachineLabel(self, configured.profile_id) orelse if (snapshot) |value| value.label else configured.profile_id;
         const scope_denied = if (snapshot) |value| value.repository_write_granted == false else false;
         switch (row.tier) {
             .has_workspace, .plain => {},
@@ -830,6 +830,14 @@ pub fn syncPickerRows(self: anytype) void {
             return a.tier.rank() < b.tier.rank();
         }
     }.lessThan);
+}
+
+/// `<account> · <machine>` for a Connect account's machine, so "Set up on…"
+/// names the machine rather than only the account.
+fn accountMachineLabel(self: anytype, profile_id: []const u8) ?[]const u8 {
+    if (comptime !@hasField(@TypeOf(self.*), "runtime_connections")) return null;
+    if (comptime !@hasField(@TypeOf(self.runtime_connections), "accounts")) return null;
+    return self.runtime_connections.accounts.displayLabel(profile_id);
 }
 
 fn copyInto(buffer: []u8, value: []const u8) usize {

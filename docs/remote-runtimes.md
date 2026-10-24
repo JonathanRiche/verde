@@ -188,6 +188,64 @@ Each connection tracks:
 
 Backoff includes jitter and resets after a stable ready interval. Local lifecycle behavior is only enabled for the built-in local profile. Multiple ready connections must coexist; opening one runtime must not rebind another workspace or browser.
 
+## Control-plane accounts
+
+A Connect control plane is an account, not a machine. Users sign in once and
+may have several runtimes assigned to that account, so the desktop presents
+one account and its machines instead of one connection per machine.
+
+**Model.** The persisted model is unchanged: every linked machine is still
+its own Connect profile in `runtime-profiles.json`, with its own pinned
+runtime/instance identity, endpoint SPKI pin, link ID and runtime-local
+device credential reference. The desktop *groups* Connect profiles by their
+normalized `control_plane_url`; each group is one account. No account record
+is written, so existing profiles need no migration, keep their device
+credentials and pins, and chats pinned to a profile keep their route.
+
+**Account session.** The desktop keeps at most one Connect session per
+account for the life of the process (created on demand, destroyed on
+sign-out or exit). The connection wizard borrows that session instead of
+opening a second one, so sign-in happens once per account. The session's
+control-plane token stays in memory only and is zeroed on sign-out or
+teardown; it is retained after a bootstrap so further machines can be linked
+without another sign-in. An optional integration session backend (see
+`Session.startWithBackend`) may persist its own sign-in; the desktop only
+sees the same secret-free snapshot either way.
+
+**Inventory.** The account session's inventory lists the account's ready
+machines (optionally with a display label). Inventory rows are matched to
+linked profiles by runtime ID, then by endpoint URL. A row without a
+profile is an *available* machine. Linking it runs the normal signed
+bootstrap: a new Connect profile is created for that machine, the verified
+descriptor is committed, and the runtime-local device credential is stored by
+reference. Each machine therefore keeps a distinct device and pin; only the
+account session is shared. A failed bootstrap removes the profile it created.
+
+**Settings → Connections.** One account card per control plane shows the
+account (title, control plane, signed-in state and identity when the
+session reports one) with Sign in / Refresh / Sign out. Inside, each linked
+machine is a row with its live status, its expandable repository, provider
+and tool readiness, and its usual per-machine actions (Use as default,
+Disconnect, Remove, diagnostics). Available machines show a Connect action.
+After the first sign-in from the wizard, a single assigned machine is
+selected and connected without another click.
+
+**Runtime picker.** Connect machines are listed as `<account> · <machine>`.
+Available (not yet linked) machines of a signed-in account appear too;
+choosing one links it as above and then selects it for the draft, so a chat
+can target any of the account's machines without adding a connection.
+
+**Wizard.** "Connect through a control plane" for a control plane that
+already has an account closes the wizard and focuses that account's card
+(which lists any machines not linked yet) instead of creating a duplicate.
+
+**Security.** Unchanged: the control-plane token never reaches a profile or
+log; device credentials remain per machine in the OS credential store; first
+contact still verifies the runtime/instance identity and SPKI pin from the
+signed bootstrap; revocation of one machine's device affects only that
+machine; sign-out ends the account session but never deletes device
+credentials or profiles.
+
 ## Protocol handshake and compatibility
 
 Add a cheap unauthenticated-or-minimally-authenticated health route only if it reveals no inventory. The authenticated protocol handshake is authoritative and returns:

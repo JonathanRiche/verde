@@ -94,9 +94,13 @@ pub const RuntimeRow = struct {
     https_url: []u8,
     wss_url: []u8,
     spki_sha256: []u8,
+    /// Optional display name the control plane gives this machine. Never
+    /// used for identity; the desktop matches machines by runtime ID.
+    label: ?[]u8 = null,
 
     fn deinit(self: *RuntimeRow, allocator: std.mem.Allocator) void {
         if (self.selection_key) |key| allocator.free(key);
+        if (self.label) |value| allocator.free(value);
         allocator.free(self.link_id);
         allocator.free(self.runtime_id);
         allocator.free(self.instance_id);
@@ -120,6 +124,9 @@ pub const Snapshot = struct {
     login_url_open: bool,
     runtimes: []const RuntimeRow,
     runtimes_truncated: usize,
+    /// Optional non-secret account identity (for example an organization or
+    /// user name) a session backend may report once signed in.
+    identity: ?[]const u8 = null,
 };
 
 const Command = enum { none, discover, login, inventory, bootstrap };
@@ -321,6 +328,8 @@ pub const Session = struct {
         defer shared.unlock();
         const result = shared.bootstrap_result orelse return null;
         shared.bootstrap_result = null;
+        // The account session stays usable for linking further machines.
+        if (shared.phase == .bootstrap_ready) shared.phase = .inventory_loaded;
         return result;
     }
 
@@ -402,6 +411,8 @@ fn cloneRow(allocator: std.mem.Allocator, row: RuntimeRow) !RuntimeRow {
     out.wss_url = try allocator.dupe(u8, row.wss_url);
     errdefer allocator.free(out.wss_url);
     out.spki_sha256 = try allocator.dupe(u8, row.spki_sha256);
+    errdefer allocator.free(out.spki_sha256);
+    out.label = if (row.label) |value| try allocator.dupe(u8, value) else null;
     return out;
 }
 
@@ -1083,7 +1094,8 @@ fn runBootstrap(shared: *Shared, io: std.Io, transport: control_plane.Transport)
     defer shared.unlock();
     if (shared.bootstrap_result) |*previous| previous.deinit();
     shared.bootstrap_result = result;
-    shared.clearToken();
+    // The token stays in memory (zeroed on sign-out or teardown) so the
+    // account session can link the account's other machines.
     if (shared.bootstrap_label) |value| shared.allocator.free(value);
     shared.bootstrap_label = null;
     shared.bootstrap_index = null;
@@ -1368,7 +1380,13 @@ fn parseInventory(shared: *Shared, json: []const u8) !void {
         try profile.validateSpkiSha256(spki);
         try connection.validateRuntimeId(runtime_id);
         try connection.validateRuntimeId(instance_id);
+        // Optional display label; an invalid one is dropped, not fatal.
+        const label: ?[]const u8 = if (jsonString(item.object, "label")) |value|
+            if (profile.validateLabel(value)) |_| value else |_| null
+        else
+            null;
         var row: RuntimeRow = try cloneRow(allocator, .{
+            .label = if (label) |value| @constCast(value) else null,
             .link_id = @constCast(link_id),
             .runtime_id = @constCast(runtime_id),
             .instance_id = @constCast(instance_id),

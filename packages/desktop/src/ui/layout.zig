@@ -3042,14 +3042,14 @@ fn connectPrimaryEnabled(rc: *const runtime_connections.State) bool {
 
 fn connectPrimaryLabel(rc: *const runtime_connections.State) []const u8 {
     return switch (rc.connect_phase) {
-        .idle => if (rc.wizard_profile_id == null) "Save & check" else "Check",
+        .idle => if (runtime_connections.wizardTargetsExistingAccount(rc)) "Open account" else if (rc.wizard_profile_id == null) "Save & check" else "Check",
         .failed => "Retry",
         .discovering => "Checking…",
         .discovered => "Sign in",
         .signing_in => "Waiting for browser…",
         .signed_in => if (rc.connect_failure != null) "Retry" else "Load runtimes",
         .loading_inventory => "Loading…",
-        .inventory_loaded => if (rc.connect_runtimes.items.len == 0) "Refresh" else "Use selected runtime",
+        .inventory_loaded => if (rc.connect_runtimes.items.len == 0) "Refresh" else "Connect machine",
         .bootstrapping => "Creating device…",
         .bootstrap_ready => "Finishing…",
     };
@@ -3202,7 +3202,7 @@ fn renderRuntimeWizardModal(state: *runtime.AppState, width: f32, height: f32) v
                 const selected = rc.connect_selected == index;
                 queuePaletteRoundedRect(state, rect, paletteColor(if (selected) theme.raise(theme.COLOR_PANEL_ALT, 0.08) else theme.COLOR_PANEL_ALT), theme.scaledUi(7.0));
                 queuePaletteBorder(state, rect, paletteColor(if (selected) theme.accent() else theme.COLOR_PANEL_MUTED), theme.scaledUi(7.0), theme.scaledUi(if (selected) 1.5 else 1.0));
-                queuePaletteText(state, .{ .x = rect.x + theme.scaledUi(12.0), .y = rect.y + theme.scaledUi(6.0), .w = rect.w - theme.scaledUi(24.0), .h = theme.scaledUi(18.0) }, runtime_connections.runtimeNameFromUrl(row.https_url), paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.0), rect);
+                queuePaletteText(state, .{ .x = rect.x + theme.scaledUi(12.0), .y = rect.y + theme.scaledUi(6.0), .w = rect.w - theme.scaledUi(24.0), .h = theme.scaledUi(18.0) }, row.name(), paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.0), rect);
                 queuePaletteText(state, .{ .x = rect.x + theme.scaledUi(12.0), .y = rect.y + theme.scaledUi(24.0), .w = rect.w - theme.scaledUi(24.0), .h = theme.scaledUi(16.0) }, if (selected) "Selected" else "Ready", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), rect);
             }
             const hidden = rc.connect_runtimes.items.len - visible + rc.connect_runtimes_truncated;

@@ -447,9 +447,21 @@ fn stepperRects(card: palette.Rect, card_pad: f32, row_y: f32, m: Metrics) struc
     return .{ .dec = dec, .inc = inc };
 }
 
+/// Scrolls a Connect account tile the wizard redirected to into view once.
+/// Returns true when the layout must be recomputed.
 fn consumePendingRuntimesScroll(state: *runtime.AppState, layout: SettingsLayout) bool {
-    _ = state;
-    _ = layout;
+    const accounts = &state.runtime_connections.accounts;
+    const focus = accounts.focus_account orelse return false;
+    if (state.settings_controller.active_category != .connections) return false;
+    accounts.focus_account = null;
+    const plan = &layout.runtimes;
+    for (plan.rows[0..plan.row_count]) |row_plan| {
+        if (row_plan.kind != .account or row_plan.entry.account != focus) continue;
+        const margin = theme.scaledUi(12.0);
+        const target = state.settings_controller.scroll_y + (row_plan.tile.y - (layout.body_clip.y + margin));
+        state.settings_controller.scroll_y = theme.clampf(target, 0.0, layout.max_scroll_y);
+        return true;
+    }
     return false;
 }
 
@@ -3446,8 +3458,9 @@ fn drawCategoryNav(state: *runtime.AppState, layout: SettingsLayout) void {
 // Runtimes & connections card
 // ---------------------------------------------------------------------------
 
-/// Local plus every configured profile.
-const MAX_RUNTIME_ROWS: usize = 65;
+/// Local, every configured profile, account tiles and their machines not
+/// linked yet. Rows past the bound are not drawn.
+const MAX_RUNTIME_ROWS: usize = 96;
 /// Upper bound of `planRuntimeRowButtons` for one profile row: primary
 /// recovery, Disconnect, Show server setup, Forget token/device, Edit,
 /// Confirm remove + Keep, Copy diagnostics, workspace default. `pushButton`
@@ -3485,6 +3498,10 @@ const RuntimeTileMetrics = struct {
 };
 
 const RuntimeRowPlan = struct {
+    kind: RuntimeRowKind,
+    /// Row encoded into this tile's `settings_runtime_action` indices.
+    row: usize,
+    entry: RuntimeDisplayRow,
     /// Full bordered tile for the row, including buttons and details.
     tile: palette.Rect,
     /// Clickable header (title, badge, description) that expands the row.
@@ -3779,7 +3796,9 @@ fn planRuntimeRowButtons(state: *const runtime.AppState, plan: *RuntimeRowPlan, 
         },
         .connect => {},
     };
-    pushButton(plan, .edit, "Edit", .secondary);
+    // An account's machines are managed on the account tile; Edit would
+    // re-point one machine at another control plane.
+    if (state.runtime_connections.accounts.accountForProfile(id) == null) pushButton(plan, .edit, "Edit", .secondary);
     if (state.runtime_connections.isRemoveConfirming(id)) {
         pushButton(plan, .remove_confirm, "Confirm remove", .primary);
         pushButton(plan, .remove_cancel, "Keep", .secondary);
@@ -3962,6 +3981,116 @@ fn runtimeDetailLineCount(state: *const runtime.AppState, profile_id: ?[]const u
     return buffer.count;
 }
 
+/// What one tile in the Runtimes & connections card represents.
+const RuntimeRowKind = enum { local, profile, account, available };
+
+/// Tile order for the card: Local, standalone runtimes, then each Connect
+/// account followed by its linked machines and its machines not linked yet.
+const RuntimeDisplayRow = struct {
+    kind: RuntimeRowKind,
+    /// Row encoded into `settings_runtime_action`: profile rows keep
+    /// `picker index + 1`, account rows the account index, available rows
+    /// `account * LINK_ROW_STRIDE + machine`.
+    row: usize,
+    profile_id: ?[]const u8 = null,
+    account: usize = 0,
+    machine: usize = 0,
+    nested: bool = false,
+};
+
+fn collectRuntimeDisplayRows(state: *const runtime.AppState, out: []RuntimeDisplayRow) usize {
+    const accounts = &state.runtime_connections.accounts;
+    const profiles = state.runtime_picker_profiles.items;
+    var count: usize = 0;
+    out[count] = .{ .kind = .local, .row = 0 };
+    count += 1;
+    for (profiles, 0..) |configured, index| {
+        if (count == out.len) return count;
+        if (accounts.accountForProfile(configured.profile_id) != null) continue;
+        out[count] = .{ .kind = .profile, .row = index + 1, .profile_id = configured.profile_id };
+        count += 1;
+    }
+    for (accounts.accounts.items, 0..) |account, account_index| {
+        if (account.profile_count == 0) continue;
+        if (count == out.len) return count;
+        out[count] = .{ .kind = .account, .row = account_index, .account = account_index };
+        count += 1;
+        for (profiles, 0..) |configured, index| {
+            if (count == out.len) return count;
+            if (accounts.accountForProfile(configured.profile_id) != account_index) continue;
+            out[count] = .{ .kind = .profile, .row = index + 1, .profile_id = configured.profile_id, .account = account_index, .nested = true };
+            count += 1;
+        }
+        for (accounts.available.items) |entry| {
+            if (entry.account != account_index) continue;
+            if (count == out.len) return count;
+            out[count] = .{
+                .kind = .available,
+                .row = account_index * runtime_connections.connect_accounts.LINK_ROW_STRIDE + entry.machine,
+                .account = account_index,
+                .machine = entry.machine,
+                .nested = true,
+            };
+            count += 1;
+        }
+    }
+    return count;
+}
+
+fn planAccountButtons(state: *const runtime.AppState, plan: *RuntimeRowPlan, account_index: usize) void {
+    plan.button_count = 0;
+    const account = state.runtime_connections.accounts.accountAt(account_index) orelse return;
+    if (account.lent) return;
+    if (account.session_unavailable or account.phase == .failed) {
+        pushButton(plan, .account_sign_in, "Retry", .primary);
+        return;
+    }
+    if (account.canSignIn()) {
+        pushButton(plan, .account_sign_in, "Sign in", .primary);
+        return;
+    }
+    if (account.signedIn()) {
+        pushButton(plan, .account_refresh, "Refresh machines", if (account.busy()) .disabled else .secondary);
+        pushButton(plan, .account_sign_out, "Sign out", if (account.link != null) .disabled else .secondary);
+    }
+}
+
+fn planAvailableButtons(state: *const runtime.AppState, plan: *RuntimeRowPlan, account_index: usize, machine_index: usize) void {
+    plan.button_count = 0;
+    const account = state.runtime_connections.accounts.accountAt(account_index) orelse return;
+    const machine = account.machineAt(machine_index) orelse return;
+    if (account.linkingRuntime(machine.runtime_id)) {
+        pushButton(plan, .link_machine, "Connecting\u{2026}", .disabled);
+    } else {
+        pushButton(plan, .link_machine, "Connect", if (account.busy() or account.lent) .disabled else .primary);
+    }
+}
+
+fn accountBadge(account: *const runtime_connections.connect_accounts.Account) struct { text: []const u8, color: ?[4]f32 } {
+    if (account.session_unavailable or account.phase == .failed) return .{ .text = "Unavailable", .color = theme.warning() };
+    if (account.signedIn()) return .{ .text = "Signed in", .color = theme.success() };
+    return switch (account.phase) {
+        .idle, .discovering, .loading_inventory => .{ .text = "Checking", .color = null },
+        .signing_in => .{ .text = "Signing in", .color = null },
+        else => .{ .text = "Sign in required", .color = theme.warning() },
+    };
+}
+
+/// A linked machine the signed-in account no longer lists is stopped (or
+/// unassigned) rather than merely unreachable.
+fn machineStopped(state: *const runtime.AppState, entry: RuntimeDisplayRow, status: runtime.RuntimePickerStatus) bool {
+    if (entry.kind != .profile or !entry.nested or status == .ready) return false;
+    const account = state.runtime_connections.accounts.accountAt(entry.account) orelse return false;
+    if (!account.signedIn() or account.phase != .inventory_loaded) return false;
+    const service = state.runtime_service orelse return false;
+    const configured = service.runtime_manager.profileConst(entry.profile_id.?) orelse return false;
+    const https_url: ?[]const u8 = switch (configured.transport) {
+        .connect => |endpoint| endpoint.https_url,
+        else => null,
+    };
+    return runtime_connections.connect_accounts.matchMachine(account.machines.items, configured.expected_runtime_id, https_url) == null;
+}
+
 fn planRuntimeCard(state: *const runtime.AppState, x: f32, y: f32, w: f32, m: Metrics) RuntimeCardPlan {
     var plan: RuntimeCardPlan = undefined;
     plan.row_count = 0;
@@ -3971,31 +4100,56 @@ fn planRuntimeCard(state: *const runtime.AppState, x: f32, y: f32, w: f32, m: Me
     // Title, then a wrapped explainer before the rows.
     plan.subtitle_h = wrappedNotesRows(RUNTIME_SUBTITLE, inner_w) * notesLineHeight();
     var cursor_y = y + m.card_pad + m.title_h + m.inner_gap + plan.subtitle_h + m.row_gap;
-    const total_rows = @min(1 + state.runtime_picker_profiles.items.len, MAX_RUNTIME_ROWS);
-    const content_x = inner_x + t.pad;
-    const content_w = @max(inner_w - t.pad * 2.0, 0.0);
-    for (0..total_rows) |row| {
-        const profile_id = runtimeRowProfileId(state, row);
+    var display: [MAX_RUNTIME_ROWS]RuntimeDisplayRow = undefined;
+    const total_rows = collectRuntimeDisplayRows(state, &display);
+    // Plan index of the account tile whose machines are being laid out.
+    var open_account: ?usize = null;
+    for (display[0..total_rows]) |entry| {
+        if (open_account) |account_plan| if (!entry.nested) {
+            cursor_y = closeAccountTile(&plan.rows[account_plan], cursor_y, t, m);
+            open_account = null;
+        };
+        // Machines sit inside their account tile, inset by one tile pad.
+        const tile_x = if (entry.nested) inner_x + t.pad else inner_x;
+        const tile_w = if (entry.nested) @max(inner_w - t.pad * 2.0, 0.0) else inner_w;
+        const content_x = tile_x + t.pad;
+        const content_w = @max(tile_w - t.pad * 2.0, 0.0);
         var row_plan: RuntimeRowPlan = undefined;
-        row_plan.expanded = state.runtime_connections.isExpanded(profile_id);
+        row_plan.kind = entry.kind;
+        row_plan.row = entry.row;
+        row_plan.entry = entry;
+        row_plan.expanded = switch (entry.kind) {
+            .local, .profile => state.runtime_connections.isExpanded(entry.profile_id),
+            .account, .available => false,
+        };
         // Title line plus description line; the header spans the tile width
         // so the whole top of the tile toggles expansion.
-        row_plan.header = .{ .x = inner_x, .y = cursor_y, .w = inner_w, .h = t.pad + t.title_h + theme.scaledUi(4.0) + t.desc_h + t.pad };
+        row_plan.header = .{ .x = tile_x, .y = cursor_y, .w = tile_w, .h = t.pad + t.title_h + theme.scaledUi(4.0) + t.desc_h + t.pad };
         var next_y = row_plan.header.y + row_plan.header.h;
-        planRuntimeRowButtons(state, &row_plan, profile_id);
+        switch (entry.kind) {
+            .local, .profile => planRuntimeRowButtons(state, &row_plan, entry.profile_id),
+            .account => planAccountButtons(state, &row_plan, entry.account),
+            .available => planAvailableButtons(state, &row_plan, entry.account, entry.machine),
+        }
         if (row_plan.button_count > 0) next_y = packRowButtons(&row_plan, content_x, next_y, content_w, t.button_h, m) + t.pad;
         // Details sit below a hairline divider, padded on both sides.
         row_plan.detail_y = next_y + t.pad;
-        row_plan.detail_line_count = if (row_plan.expanded) runtimeDetailLineCount(state, profile_id) else 0;
+        row_plan.detail_line_count = if (row_plan.expanded) runtimeDetailLineCount(state, entry.profile_id) else 0;
         if (row_plan.expanded and row_plan.detail_line_count > 0) {
             next_y = row_plan.detail_y + @as(f32, @floatFromInt(row_plan.detail_line_count)) * t.detail_line_h + t.pad;
         }
         row_plan.bottom = next_y;
-        row_plan.tile = .{ .x = inner_x, .y = cursor_y, .w = inner_w, .h = next_y - cursor_y };
+        row_plan.tile = .{ .x = tile_x, .y = cursor_y, .w = tile_w, .h = next_y - cursor_y };
         plan.rows[plan.row_count] = row_plan;
+        if (entry.kind == .account) {
+            open_account = plan.row_count;
+            cursor_y = next_y;
+        } else {
+            cursor_y = next_y + m.inner_gap;
+        }
         plan.row_count += 1;
-        cursor_y = next_y + m.inner_gap;
     }
+    if (open_account) |account_plan| cursor_y = closeAccountTile(&plan.rows[account_plan], cursor_y, t, m);
     cursor_y += m.row_gap - m.inner_gap;
     plan.add_button = .{ .x = inner_x, .y = cursor_y, .w = @min(buttonWidth("Add connection…"), inner_w), .h = m.row_h };
     const notice_h: f32 = if (state.runtime_connections.cardNotice().len > 0) m.label_h + m.inner_gap else 0.0;
@@ -4006,13 +4160,23 @@ fn planRuntimeCard(state: *const runtime.AppState, x: f32, y: f32, w: f32, m: Me
     return plan;
 }
 
+/// Extends an account tile around its machine tiles; returns the next y.
+fn closeAccountTile(account: *RuntimeRowPlan, cursor_y: f32, t: RuntimeTileMetrics, m: Metrics) f32 {
+    const bottom = @max(cursor_y - m.inner_gap, account.bottom) + t.pad;
+    account.tile.h = bottom - account.tile.y;
+    return bottom + m.inner_gap;
+}
+
 fn registerRuntimeCardHits(state: *runtime.AppState, layout: SettingsLayout, queue_hit: *const fn (*runtime.AppState, palette.Rect, runtime.PaletteModalAction, usize) void) void {
     const plan = &layout.runtimes;
-    for (0..plan.row_count) |row| {
-        const row_plan = &plan.rows[row];
-        recordFocusStop(.settings_runtime_action, runtime_connections.encodeRowAction(row, .expand), row_plan.header, layout.body_clip);
-        if (intersectRect(row_plan.header, layout.body_clip)) |visible| {
-            queue_hit(state, visible, .settings_runtime_action, runtime_connections.encodeRowAction(row, .expand));
+    for (0..plan.row_count) |index_in_plan| {
+        const row_plan = &plan.rows[index_in_plan];
+        const row = row_plan.row;
+        if (row_plan.kind == .local or row_plan.kind == .profile) {
+            recordFocusStop(.settings_runtime_action, runtime_connections.encodeRowAction(row, .expand), row_plan.header, layout.body_clip);
+            if (intersectRect(row_plan.header, layout.body_clip)) |visible| {
+                queue_hit(state, visible, .settings_runtime_action, runtime_connections.encodeRowAction(row, .expand));
+            }
         }
         for (0..row_plan.button_count) |index| {
             if (row_plan.button_styles[index] == .disabled) continue;
@@ -4021,13 +4185,11 @@ fn registerRuntimeCardHits(state: *runtime.AppState, layout: SettingsLayout, que
                 queue_hit(state, visible, .settings_runtime_action, runtime_connections.encodeRowAction(row, row_plan.button_actions[index]));
             }
         }
-    }
-    // Remote provider Install / Sign in buttons in the expanded row's details.
-    for (0..plan.row_count) |row| {
-        const row_plan = &plan.rows[row];
+        // Remote provider Install / Sign in buttons in the expanded row's
+        // details, right after the row's own controls in Tab order.
         if (!row_plan.expanded or row_plan.detail_line_count == 0) continue;
         var buffer: DetailBuffer = .{};
-        collectRuntimeDetailLines(state, runtimeRowProfileId(state, row), &buffer);
+        collectRuntimeDetailLines(state, row_plan.entry.profile_id, &buffer);
         for (buffer.lines[0..buffer.count], 0..) |line, line_index| {
             const setup = line.setup orelse continue;
             const rect = providerSetupButtonRect(row_plan, line_index, setup.label);
@@ -4051,8 +4213,89 @@ fn runtimeStatusColor(status: runtime.RuntimePickerStatus) [4]f32 {
     return runtime.runtimeStatusTone(status).color();
 }
 
-// Runtimes & connections: Local plus saved runtimes with live state, per-row
-// actions, and readiness details for the expanded row.
+/// Title, badge and description for one tile header.
+const RuntimeHeaderText = struct {
+    title: []const u8,
+    description: []const u8,
+    badge: []const u8 = "",
+    /// Muted when null.
+    badge_color: ?[4]f32 = null,
+};
+
+fn runtimeHeaderText(state: *const runtime.AppState, entry: RuntimeDisplayRow, description_buf: []u8) RuntimeHeaderText {
+    const accounts = &state.runtime_connections.accounts;
+    switch (entry.kind) {
+        .local => return .{ .title = "Local", .description = "Runs on this machine" },
+        .account => {
+            const account = accounts.accountAt(entry.account) orelse return .{ .title = "Account", .description = "" };
+            const badge = accountBadge(account);
+            const plane = runtime_connections.connect_accounts.urlHost(account.control_plane_url);
+            const description = if (account.signedIn())
+                if (account.identity) |identity|
+                    std.fmt.bufPrint(description_buf, "{s} \u{00B7} signed in as {s} \u{00B7} {d} machine(s) in this account", .{ plane, identity, account.machines.items.len })
+                else
+                    std.fmt.bufPrint(description_buf, "{s} \u{00B7} signed in \u{00B7} {d} machine(s) in this account", .{ plane, account.machines.items.len })
+            else
+                std.fmt.bufPrint(description_buf, "{s} \u{00B7} sign in once to use any of this account's machines", .{plane});
+            return .{ .title = account.title(), .description = description catch plane, .badge = badge.text, .badge_color = badge.color };
+        },
+        .available => {
+            const account = accounts.accountAt(entry.account) orelse return .{ .title = "Machine", .description = "" };
+            const machine = account.machineAt(entry.machine) orelse return .{ .title = "Machine", .description = "" };
+            const linking = account.linkingRuntime(machine.runtime_id);
+            return .{
+                .title = machine.name(),
+                .description = if (linking) "Creating this desktop's device credential on the machine\u{2026}" else "In this account \u{00B7} not connected on this desktop yet",
+                .badge = if (linking) "Connecting" else "Available",
+            };
+        },
+        .profile => {},
+    }
+    const id = entry.profile_id.?;
+    const status = state.runtimeProfileStatus(id);
+    const stopped = machineStopped(state, entry, status);
+    var header: RuntimeHeaderText = .{
+        .title = "Unavailable runtime",
+        .description = runtime.runtimePickerStatusDescription(.unavailable),
+        .badge = if (stopped) "Stopped" else runtime.runtimePickerStatusBadge(status),
+        .badge_color = runtimeStatusColor(status),
+    };
+    const snapshot = state.runtimeProfileSnapshot(id) orelse return header;
+    header.title = if (entry.nested) accounts.machineLabel(id) orelse snapshot.label else snapshot.label;
+    const status_text = if (stopped) "Not running in this account right now" else runtime.runtimePickerStatusDescription(status);
+    header.description = status_text;
+    const configured = state.runtime_service.?.runtime_manager.profileConst(id) orelse return header;
+    header.description = switch (configured.transport) {
+        .ssh_tunnel => |ssh| std.fmt.bufPrint(description_buf, "{s} · ssh {s}{s}{s}:{d} → gateway {d}", .{
+            status_text,
+            ssh.user orelse "",
+            if (ssh.user != null) "@" else "",
+            ssh.host,
+            ssh.port,
+            ssh.remote_gateway_port,
+        }) catch status_text,
+        .local_socket => status_text,
+        .direct_https => |endpoint| std.fmt.bufPrint(description_buf, "{s} · Direct / Tailnet {s}", .{
+            status_text,
+            endpoint.https_url orelse "(missing endpoint)",
+        }) catch status_text,
+        .connect => |endpoint| if (entry.nested)
+            std.fmt.bufPrint(description_buf, "{s} · {s}", .{
+                status_text,
+                if (endpoint.https_url) |url| runtime_connections.connect_accounts.urlHost(url) else "(no machine selected)",
+            }) catch status_text
+        else
+            std.fmt.bufPrint(description_buf, "{s} · Connect {s}", .{
+                status_text,
+                endpoint.https_url orelse "(no runtime selected)",
+            }) catch status_text,
+    };
+    return header;
+}
+
+// Runtimes & connections: Local, standalone runtimes, and one tile per
+// Connect account holding its machines, with per-row actions and readiness
+// details for the expanded row.
 fn drawRuntimeCard(state: *runtime.AppState, layout: SettingsLayout) void {
     const m = metrics();
     const t = RuntimeTileMetrics.init();
@@ -4068,17 +4311,26 @@ fn drawRuntimeCard(state: *runtime.AppState, layout: SettingsLayout) void {
         .h = plan.subtitle_h,
     }, RUNTIME_SUBTITLE, paletteColor(textHint()), theme.scaledUi(12.0), clip);
 
-    for (0..plan.row_count) |row| {
-        const row_plan = &plan.rows[row];
-        const profile_id = runtimeRowProfileId(state, row);
+    for (0..plan.row_count) |index_in_plan| {
+        const row_plan = &plan.rows[index_in_plan];
+        const entry = row_plan.entry;
+        const row = row_plan.row;
+        const profile_id = entry.profile_id;
         const header = row_plan.header;
         const tile = row_plan.tile;
-        const header_hovered = isRuntimeActionHovered(state, runtime_connections.encodeRowAction(row, .expand));
-        const is_default = runtimeRowIsWorkspaceDefault(state, profile_id);
+        const expandable = entry.kind == .local or entry.kind == .profile;
+        const header_hovered = expandable and isRuntimeActionHovered(state, runtime_connections.encodeRowAction(row, .expand));
+        const is_default = expandable and runtimeRowIsWorkspaceDefault(state, profile_id);
 
-        // Tile surface: raised slightly above the card; the header band
-        // brightens on hover so the expand affordance is discoverable.
-        queueRoundedRectClipped(state, tile, paletteColor(raisedSurface(0.13)), radiusSm(), clip);
+        // Tile surface: raised slightly above the card (machine tiles one
+        // step above their account); the header band brightens on hover so
+        // the expand affordance is discoverable.
+        const surface = switch (entry.kind) {
+            .account => raisedSurface(0.09),
+            .available => raisedSurface(0.11),
+            else => raisedSurface(if (entry.nested) 0.16 else 0.13),
+        };
+        queueRoundedRectClipped(state, tile, paletteColor(surface), radiusSm(), clip);
         if (header_hovered) {
             const band: palette.Rect = .{ .x = header.x, .y = header.y, .w = header.w, .h = @min(header.h, tile.h) };
             queueRoundedRectClipped(state, band, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 10)), radiusSm(), clip);
@@ -4086,75 +4338,36 @@ fn drawRuntimeCard(state: *runtime.AppState, layout: SettingsLayout) void {
         const border_color = if (is_default) theme.withAlpha(theme.accent(), 110) else theme.withAlpha(theme.COLOR_WHITE, if (row_plan.expanded) 34 else 22);
         queueBorderClipped(state, tile, paletteColor(border_color), radiusSm(), theme.scaledUi(1.0), clip);
 
-        var title: []const u8 = "Local";
-        var description: []const u8 = "Runs on this machine";
-        var badge: []const u8 = "";
-        var badge_color = theme.COLOR_TEXT_MUTED;
         var description_buf: [320]u8 = undefined;
-        if (profile_id) |id| {
-            const status = state.runtimeProfileStatus(id);
-            badge = runtime.runtimePickerStatusBadge(status);
-            badge_color = runtimeStatusColor(status);
-            if (state.runtimeProfileSnapshot(id)) |snapshot| {
-                title = snapshot.label;
-                if (state.runtime_service.?.runtime_manager.profileConst(id)) |configured| {
-                    switch (configured.transport) {
-                        .ssh_tunnel => |ssh| {
-                            description = std.fmt.bufPrint(&description_buf, "{s} · ssh {s}{s}{s}:{d} → gateway {d}", .{
-                                runtime.runtimePickerStatusDescription(status),
-                                ssh.user orelse "",
-                                if (ssh.user != null) "@" else "",
-                                ssh.host,
-                                ssh.port,
-                                ssh.remote_gateway_port,
-                            }) catch runtime.runtimePickerStatusDescription(status);
-                        },
-                        .local_socket => description = runtime.runtimePickerStatusDescription(status),
-                        .direct_https => |endpoint| {
-                            description = std.fmt.bufPrint(&description_buf, "{s} · Direct / Tailnet {s}", .{
-                                runtime.runtimePickerStatusDescription(status),
-                                endpoint.https_url orelse "(missing endpoint)",
-                            }) catch runtime.runtimePickerStatusDescription(status);
-                        },
-                        .connect => |endpoint| {
-                            description = std.fmt.bufPrint(&description_buf, "{s} · Connect {s}", .{
-                                runtime.runtimePickerStatusDescription(status),
-                                endpoint.https_url orelse "(no runtime selected)",
-                            }) catch runtime.runtimePickerStatusDescription(status);
-                        },
-                    }
-                } else {
-                    description = runtime.runtimePickerStatusDescription(status);
-                }
-            } else {
-                title = "Unavailable runtime";
-                description = runtime.runtimePickerStatusDescription(.unavailable);
-            }
-        }
+        const text = runtimeHeaderText(state, entry, &description_buf);
 
         // Header: title + status badge + expand chevron on the first line,
         // description on the second.
         const title_y = header.y + t.pad;
-        const chevron_rect: palette.Rect = .{
-            .x = header.x + header.w - t.pad - t.chevron,
-            .y = title_y + (t.title_h - t.chevron) * 0.5,
-            .w = t.chevron,
-            .h = t.chevron,
-        };
-        queueIconText(state, chevron_rect, if (row_plan.expanded) NF_COD_CHEVRON_UP else NF_COD_CHEVRON_DOWN, paletteColor(if (header_hovered) theme.COLOR_WHITE else textLabel()), t.chevron, clip);
-        var right_edge = chevron_rect.x - m.inner_gap;
-        if (badge.len > 0) {
+        var right_edge = header.x + header.w - t.pad;
+        if (expandable) {
+            const chevron_rect: palette.Rect = .{
+                .x = header.x + header.w - t.pad - t.chevron,
+                .y = title_y + (t.title_h - t.chevron) * 0.5,
+                .w = t.chevron,
+                .h = t.chevron,
+            };
+            queueIconText(state, chevron_rect, if (row_plan.expanded) NF_COD_CHEVRON_UP else NF_COD_CHEVRON_DOWN, paletteColor(if (header_hovered) theme.COLOR_WHITE else textLabel()), t.chevron, clip);
+            right_edge = chevron_rect.x - m.inner_gap;
+        }
+        if (text.badge.len > 0) {
             const badge_font = theme.scaledUi(11.5);
             const badge_h = theme.scaledUi(20.0);
-            const badge_w = settingsTextWidth(badge_font, badge) + theme.scaledUi(16.0);
+            const badge_w = settingsTextWidth(badge_font, text.badge) + theme.scaledUi(16.0);
             const badge_rect: palette.Rect = .{
                 .x = right_edge - badge_w,
                 .y = title_y + (t.title_h - badge_h) * 0.5,
                 .w = badge_w,
                 .h = badge_h,
             };
+            const badge_color = text.badge_color orelse theme.COLOR_TEXT_MUTED;
             queueRoundedRectClipped(state, badge_rect, paletteColor(theme.withAlpha(badge_color, 40)), badge_h * 0.5, clip);
-            queueCenteredText(state, badge_rect, badge, paletteColor(badge_color), badge_font, clip);
+            queueCenteredText(state, badge_rect, text.badge, paletteColor(badge_color), badge_font, clip);
             right_edge = badge_rect.x - m.inner_gap;
         }
         const title_x = header.x + t.pad;
@@ -4163,12 +4376,12 @@ fn drawRuntimeCard(state: *runtime.AppState, layout: SettingsLayout) void {
             .y = title_y,
             .w = @max(right_edge - title_x, 0.0),
             .h = t.title_h,
-        }, title, paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.0), clip);
+        }, text.title, paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.0), clip);
         var desc_buf: [360]u8 = undefined;
         const description_text = if (is_default)
-            std.fmt.bufPrint(&desc_buf, "{s} · workspace default", .{description}) catch description
+            std.fmt.bufPrint(&desc_buf, "{s} · workspace default", .{text.description}) catch text.description
         else
-            description;
+            text.description;
         queueText(state, .{
             .x = title_x,
             .y = title_y + t.title_h + theme.scaledUi(4.0),

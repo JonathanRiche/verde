@@ -4127,22 +4127,38 @@ fn selectThreadRuntimeProfile(
 }
 
 fn runtimePickerAddIndex(state: *const AppState) usize {
-    return 1 + state.runtime_picker_profiles.items.len;
+    return 1 + state.runtime_picker_profiles.items.len + state.runtime_connections.accounts.available.items.len;
+}
+
+/// Account machine not linked on this desktop yet, listed after the
+/// configured runtimes; choosing it links it and selects it for the draft.
+fn runtimePickerAvailableIndex(state: *const AppState, index: usize) ?usize {
+    const first = 1 + state.runtime_picker_profiles.items.len;
+    if (index < first) return null;
+    const available = index - first;
+    if (available >= state.runtime_connections.accounts.available.items.len) return null;
+    return available;
+}
+
+fn runtimePickerDisplayLabel(state: *const AppState, profile_id: []const u8, fallback: []const u8) []const u8 {
+    return state.runtime_connections.accounts.displayLabel(profile_id) orelse fallback;
 }
 
 fn paletteRuntimePickerLabel(context: ?*anyopaque, index: usize) []const u8 {
     if (index == RUNTIME_PICKER_LOCAL_INDEX) return "Local";
     const state = appStateFromContext(context) orelse return "";
     if (index == runtimePickerAddIndex(state)) return "Add connection…";
+    if (runtimePickerAvailableIndex(state, index)) |available| return state.runtime_connections.accounts.available.items[available].label();
     if (runtimePickerSetupRow(state, index)) |row| return workspace_setup.State.rowLabel(row);
     const snapshot = runtimePickerSnapshotAt(state, index) orelse return "Unavailable runtime";
-    return snapshot.label;
+    return runtimePickerDisplayLabel(state, snapshot.profile_id, snapshot.label);
 }
 
 fn paletteRuntimePickerDescription(context: ?*anyopaque, index: usize) []const u8 {
     if (index == RUNTIME_PICKER_LOCAL_INDEX) return "Runs on this machine";
     const state = appStateFromContext(context) orelse return "";
     if (index == runtimePickerAddIndex(state)) return "Connect a self-hosted Verde runtime over SSH";
+    if (runtimePickerAvailableIndex(state, index) != null) return "In your account \u{00B7} connects this desktop to it, then runs here";
     if (runtimePickerSetupRow(state, index)) |row| return workspace_setup.State.rowDescription(row);
     const snapshot = runtimePickerSnapshotAt(state, index) orelse return runtimePickerStatusDescription(.unavailable);
     return runtimePickerStatusDescription(runtimePickerStatus(snapshot));
@@ -4152,6 +4168,12 @@ fn paletteRuntimePickerBadge(context: ?*anyopaque, index: usize) []const u8 {
     if (index == RUNTIME_PICKER_LOCAL_INDEX) return "";
     const state = appStateFromContext(context) orelse return "";
     if (index == runtimePickerAddIndex(state)) return "";
+    if (runtimePickerAvailableIndex(state, index)) |available| {
+        const entry = state.runtime_connections.accounts.available.items[available];
+        const account = state.runtime_connections.accounts.accountAt(entry.account) orelse return "Available";
+        const machine = account.machineAt(entry.machine) orelse return "Available";
+        return if (account.linkingRuntime(machine.runtime_id)) "Connecting" else "Available";
+    }
     if (runtimePickerSetupRow(state, index)) |row| return row.badge;
     const snapshot = runtimePickerSnapshotAt(state, index) orelse return runtimePickerStatusBadge(.unavailable);
     return runtimePickerStatusBadge(runtimePickerStatus(snapshot));
@@ -15157,8 +15179,9 @@ pub const AppState = struct {
         // Machines that have this workspace, then same-origin and "Set up on…" rows.
         workspace_setup.syncPickerRows(self);
         self.composer_controller.runtime_picker.invalidateItems();
-        // Local, every configured runtime, then the trailing "Add connection…" row.
-        self.composer_controller.runtime_picker.setItemCount(2 + self.runtime_picker_profiles.items.len);
+        // Local, every configured runtime, account machines not linked yet,
+        // then the trailing "Add connection…" row.
+        self.composer_controller.runtime_picker.setItemCount(2 + self.runtime_picker_profiles.items.len + self.runtime_connections.accounts.available.items.len);
         self.composer_controller.runtime_picker.setSelectedItem(self.currentRuntimePickerIndex());
         self.setPaletteRuntimePickerBoundsFromToolbar();
     }
@@ -15180,7 +15203,7 @@ pub const AppState = struct {
         if (std.mem.eql(u8, profile_id, chat_types.LOCAL_RUNTIME_PROFILE_ID)) return "Local";
         const service = self.runtime_service orelse return "Runtime unavailable";
         const snapshot = service.snapshot(profile_id) orelse return "Runtime unavailable";
-        return snapshot.label;
+        return runtimePickerDisplayLabel(self, profile_id, snapshot.label);
     }
 
     /// Blocker for the current thread's selected remote runtime, or null when
@@ -15399,9 +15422,25 @@ pub const AppState = struct {
         });
     }
 
+    /// Selects a configured runtime profile for the current draft through
+    /// the same path as choosing its picker row.
+    pub fn selectCurrentThreadRuntimeProfile(self: *AppState, profile_id: []const u8) void {
+        const count = self.runtime_picker_profiles.items.len;
+        for (self.runtime_picker_profiles.items, 0..) |configured, index| {
+            if (!std.mem.eql(u8, configured.profile_id, profile_id)) continue;
+            self.selectCurrentThreadRuntimePickerIndex(self.workspace_setup.pickerDisplayRow(index, count) + 1);
+            return;
+        }
+    }
+
     fn selectCurrentThreadRuntimePickerIndex(self: *AppState, index: usize) void {
         if (index == runtimePickerAddIndex(self)) {
             self.openRuntimeConnectionWizard();
+            return;
+        }
+        if (runtimePickerAvailableIndex(self, index)) |available| {
+            self.closePaletteRuntimePicker();
+            runtime_connections_controller.linkAvailableMachineFromPicker(self, available);
             return;
         }
         const profile_id = if (index == RUNTIME_PICKER_LOCAL_INDEX)
