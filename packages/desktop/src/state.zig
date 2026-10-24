@@ -10998,9 +10998,14 @@ pub const AppState = struct {
     /// past the focused thread's live rows. Shares the single hydration
     /// worker slot with older-page requests.
     pub fn requestCurrentThreadTranscriptSuffix(self: *AppState) void {
-        if (self.transcript_hydration.in_flight) return;
         const project = self.currentProjectMutable();
-        const thread = project.currentThreadMutable();
+        self.requestThreadTranscriptSuffix(project, project.currentThreadMutable());
+    }
+
+    /// Fetches a reported durable suffix for any thread, focused or not (the
+    /// Companion panel's thread is rarely a pane). Commits by identity.
+    pub fn requestThreadTranscriptSuffix(self: *AppState, project: *Project, thread: *ChatThread) void {
+        if (self.transcript_hydration.in_flight) return;
         const live_end = thread.persisted_message_offset + thread.messages.items.len;
         const gap_end = thread.transcript_suffix_gap_end;
         if (gap_end <= live_end) {
@@ -13565,6 +13570,12 @@ pub const AppState = struct {
                 self.companion_hydration_offset = thread.persisted_message_offset;
                 self.requestOlderThreadMessages(@constCast(project), @constCast(thread));
             }
+        }
+        // Rows another client appended (Live voice saves, phone transcripts)
+        // arrive as a suffix gap past the hydrated rows; only focused panes
+        // fetched it, so the panel never showed them.
+        if (thread.transcript_suffix_gap_end > 0 and thread.messages.items.len > 0) {
+            self.requestThreadTranscriptSuffix(@constCast(project), @constCast(thread));
         }
         const send_state = thread.send_state;
         if (!send_state.mutex.tryLock()) return;
