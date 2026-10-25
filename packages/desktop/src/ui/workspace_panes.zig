@@ -45,6 +45,9 @@ const TERMINAL_ZOOM_HOVER_WIDTH_CSS: f32 = 112.0;
 const TERMINAL_ZOOM_HOVER_HEIGHT_CSS: f32 = 48.0;
 const INACTIVE_BORDER_WIDTH_CSS: f32 = 1.0;
 const FOCUS_BORDER_WIDTH_CSS: f32 = 2.0;
+/// A lone pane has no siblings to tell apart, so its focus/status frame is a
+/// thin line instead of the tiled focus ring.
+const LONE_PANE_BORDER_WIDTH_CSS: f32 = 1.0;
 const ZOOM_BORDER_WIDTH_CSS: f32 = 3.0;
 const LIGHT_PALETTE_FOCUS_BORDER_ALPHA: f32 = 0.55;
 const STATUS_BORDER_WIDTH_CSS: f32 = 3.0;
@@ -236,6 +239,9 @@ var pane_rects: [MAX_WORKSPACE_PANE_RECTS]WorkspacePaneRect = undefined;
 var last_workspace_rect: palette.Rect = .{};
 var browser_pane_rendered: bool = false;
 var scrolling_layout_rendered: bool = false;
+/// This frame's strip shows one tab per view (no viewport margins), so a tab
+/// holding a single pane fills its slot edge-to-edge.
+var scrolling_single_view: bool = false;
 var scrolling_max_offset: f32 = 0.0;
 var scrolling_animating: bool = false;
 var scrolling_previous_proximity: ?palette.Rect = null;
@@ -1080,10 +1086,29 @@ fn focusBorderAlpha(pane_id: runtime.WorkspacePaneId) f32 {
     return 0.0;
 }
 
-// Every unzoomed root pane keeps the muted tile frame, including a lone pane,
-// so zooming is the only state that drops the frame and goes edge-to-edge.
-fn paneUsesRestingBorder(is_root_pane: bool, maximized: bool) bool {
-    return is_root_pane and !maximized;
+// Unzoomed tiled panes keep the muted tile frame; a lone pane already fills
+// the workspace edge-to-edge and draws only its thin focus line instead.
+fn paneUsesRestingBorder(is_root_pane: bool, maximized: bool, lone: bool) bool {
+    return is_root_pane and !maximized and !lone;
+}
+
+/// The workspace's only pane: the layout tree is a single leaf. It renders
+/// edge-to-edge like zoom, with a thin frame instead of the tile ring.
+fn lonePaneId(layout: *const runtime.WorkspaceLayout) ?runtime.WorkspacePaneId {
+    const root = layout.root orelse return null;
+    return switch (root.*) {
+        .leaf => |pane_id| pane_id,
+        else => null,
+    };
+}
+
+/// A pane alone in its view: the workspace's only pane, or the only pane of
+/// its tab when the strip shows one tab per view.
+fn paneIsLone(layout: *const runtime.WorkspaceLayout, pane_id: runtime.WorkspacePaneId) bool {
+    if (lonePaneId(layout) == pane_id) return true;
+    if (!scrolling_single_view) return false;
+    const group_id = layout.scrollGroupIdForPane(pane_id) orelse return false;
+    return layout.scrollGroupPaneCount(group_id) == 1;
 }
 
 /// Renders workspace panes while transcripts use their destination sidebar width.
@@ -1100,6 +1125,7 @@ pub fn renderAtWithTranscriptLayoutWidth(state: *runtime.AppState, workspace_rec
     tickFocusAnimation(state);
     pane_status_animating = false;
     scrolling_layout_rendered = false;
+    scrolling_single_view = false;
     scrolling_max_offset = 0.0;
     scrolling_animating = false;
     state.transcript_controller.motion_suppressed = false;
@@ -1128,14 +1154,15 @@ pub fn renderAtWithTranscriptLayoutWidth(state: *runtime.AppState, workspace_rec
         if (scrollingLayoutActive(state, layout)) {
             renderScrollingStrip(state, layout, rect, target_workspace_width);
         } else {
-            // Unzoomed tiles always sit inside the workspace margin, even when
-            // only one pane is open, so zooming reads as a distinct state.
+            // Tiles sit inside the workspace margin; a lone pane fills it
+            // edge-to-edge like zoom.
             const gap = theme.scaledUi(state.app_config.workspace_pane_gap);
+            const inset = lonePaneId(layout) == null;
             renderNode(
                 state,
                 root,
-                tiledContentRect(rect, gap, true),
-                tiledContentExtent(target_workspace_width, gap, true),
+                tiledContentRect(rect, gap, inset),
+                tiledContentExtent(target_workspace_width, gap, inset),
             );
         }
     } else if (state.project_controller.projects.items.len > 0) {
@@ -2201,6 +2228,7 @@ fn renderScrollingStrip(
     const viewport = scrollingViewportRect(workspace, gap, pane_count, state.app_config.workspace_panes_per_view);
     const target_viewport_width = scrollingViewportExtent(target_workspace_width, gap, pane_count, state.app_config.workspace_panes_per_view);
     const viewport_has_margins = scrollingViewportUsesMargins(pane_count, state.app_config.workspace_panes_per_view);
+    scrolling_single_view = !viewport_has_margins;
     const viewport_extent = if (vertical) viewport.h else viewport.w;
     // Saved column widths only apply while the strip scrolls; in tab mode a
     // width left over from scrolling would shrink the tab and peek at its
@@ -2591,10 +2619,10 @@ fn renderScrollingGroup(
     };
     if (intersectRects(rect, workspace) == null) return;
     // The viewport margin already insets the strip; margin-less strips (one
-    // pane per view) inset every group, single-pane included, so an unzoomed
-    // pane never sits edge-to-edge like a zoomed one.
+    // tab per view) inset split tabs, while a single-pane tab fills its slot
+    // edge-to-edge like zoom.
     const pane_count = layout.scrollGroupPaneCount(group_id);
-    const inset_group = !viewport_has_margins;
+    const inset_group = !viewport_has_margins and pane_count > 1;
     if (zoomedPaneInScrollGroup(layout, group_id)) |zoomed_pane_id| {
         // Zoom is contained to the tab: the zoomed pane takes the whole slot
         // edge-to-edge and its tile siblings stay hidden, while the rest of
@@ -3406,7 +3434,8 @@ fn renderLeafWithin(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, 
     }
     renderZoomControl(state, pane_id, kind, rect, header_h, maximized);
     const layout = &state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout;
-    if (paneUsesRestingBorder(layout.rootContainsPane(pane_id), maximized)) {
+    const lone = !maximized and paneIsLone(layout, pane_id);
+    if (paneUsesRestingBorder(layout.rootContainsPane(pane_id), maximized, lone)) {
         queueBorder(state, rect, paletteColor(theme.borderMuted()), 0.0, theme.scaledUi(INACTIVE_BORDER_WIDTH_CSS));
     }
     // Pane status frame. Live agent states intentionally override the ordinary
@@ -3426,7 +3455,12 @@ fn renderLeafWithin(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, 
         };
         const min_alpha: f32 = if (agent_status == .done or agent_status == .@"error") 0.72 else 0.52;
         border_color[3] *= min_alpha + (1.0 - min_alpha) * pulse;
-        const border_width = theme.scaledUi(if (maximized) STATUS_ZOOM_BORDER_WIDTH_CSS else STATUS_BORDER_WIDTH_CSS);
+        const border_width = theme.scaledUi(if (maximized)
+            STATUS_ZOOM_BORDER_WIDTH_CSS
+        else if (lone)
+            LONE_PANE_BORDER_WIDTH_CSS
+        else
+            STATUS_BORDER_WIDTH_CSS);
         queueBorder(state, rect, paletteColor(border_color), 0.0, border_width);
         return;
     }
@@ -3438,7 +3472,12 @@ fn renderLeafWithin(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, 
         var border_color = if (maximized) zoomBorderAccent() else theme.accent();
         // A full-strength dark accent frame reads heavy on light palettes.
         border_color[3] *= alpha * (if (theme.isLightPalette()) LIGHT_PALETTE_FOCUS_BORDER_ALPHA else 1.0);
-        const border_width = theme.scaledUi(if (maximized) ZOOM_BORDER_WIDTH_CSS else FOCUS_BORDER_WIDTH_CSS);
+        const border_width = theme.scaledUi(if (maximized)
+            ZOOM_BORDER_WIDTH_CSS
+        else if (lone)
+            LONE_PANE_BORDER_WIDTH_CSS
+        else
+            FOCUS_BORDER_WIDTH_CSS);
         queueBorder(state, rect, paletteColor(border_color), 0.0, border_width);
     }
 }
