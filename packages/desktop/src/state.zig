@@ -2535,7 +2535,10 @@ fn companionComposerStyle() CompanionComposerPrompt.Style {
     const scale = @max(theme.displayScaleFactor(), 0.1);
     return .{
         .background_color = paletteColor(chrome.surface),
-        .border_color = paletteColor(chrome.border),
+        // The idle frame is a 1 px ring; in the bright companion border colour
+        // its anti-aliased corners read as jagged. Use the chat composer's
+        // low-contrast panel border so both idle frames look the same.
+        .border_color = paletteColor(theme.COLOR_PANEL_MUTED),
         .focus_border_color = paletteColor(chrome.accent),
         .focus_border_width = @max(@round(COMPANION_COMPOSER_FOCUS_BORDER_WIDTH * scale), 1.0) / scale,
         .control_background_color = paletteColor(theme.withAlpha(chrome.controls, 0)),
