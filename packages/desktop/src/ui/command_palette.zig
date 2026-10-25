@@ -84,6 +84,8 @@ const KeybindRef = enum {
     workspace_split_terminal_horizontal,
     workspace_previous_pane,
     workspace_next_pane,
+    navigate_back,
+    navigate_forward,
 };
 
 /// Static command table — add a row here to add a palette entry.
@@ -155,6 +157,8 @@ const STATIC_COMMANDS = [_]Command{
     .{ .id = "workspace.herdr_handoff", .title = "Handoff Workspace to Herdr", .keywords = "runtime local terminal tui phone", .section = .workspaces, .run = runHerdrHandoffWorkspace, .enabled = hasProjects },
     .{ .id = "workspace.herdr_focus_terminal", .title = "Open/Focus Herdr Terminal", .keywords = "runtime terminal tui", .section = .workspaces, .run = runFocusHerdrTerminal, .enabled = currentWorkspaceHerdrLinked },
     .{ .id = "workspace.herdr_unlink", .title = "Run Workspace Locally", .keywords = "unlink herdr runtime local", .section = .workspaces, .run = runUnlinkHerdrWorkspace, .enabled = currentWorkspaceHerdrLinked },
+    .{ .id = "app.navigate_back", .title = "Go Back", .keywords = "previous history navigate recent chat workspace mouse", .section = .app, .keybind = .navigate_back, .run = runNavigateBack, .enabled = canNavigateBack },
+    .{ .id = "app.navigate_forward", .title = "Go Forward", .keywords = "next history navigate recent chat workspace mouse", .section = .app, .keybind = .navigate_forward, .run = runNavigateForward, .enabled = canNavigateForward },
     .{ .id = "app.history", .title = "History: This Workspace", .keywords = "saved chats threads search recent", .section = .app, .run = runHistoryThisWorkspace, .enabled = hasProjects, .keeps_open = true },
     .{ .id = "app.settings", .title = "Open Settings", .keywords = "preferences config options", .section = .app, .keybind = .settings, .run = runSettings },
     .{ .id = "app.sidebar", .title = "Toggle Sidebar", .keywords = "rail collapse", .section = .app, .keybind = .toggle_sidebar, .run = runToggleSidebar },
@@ -1815,6 +1819,22 @@ fn runOpenWorkspaceSettings(state: *runtime.AppState) void {
     state.openWorkspaceSettingsForProject(index);
 }
 
+fn runNavigateBack(state: *runtime.AppState) void {
+    _ = state.navigateHistory(.back);
+}
+
+fn runNavigateForward(state: *runtime.AppState) void {
+    _ = state.navigateHistory(.forward);
+}
+
+fn canNavigateBack(state: *runtime.AppState) bool {
+    return state.canNavigateHistory(.back);
+}
+
+fn canNavigateForward(state: *runtime.AppState) bool {
+    return state.canNavigateHistory(.forward);
+}
+
 fn runToggleSidebar(state: *runtime.AppState) void {
     state.toggleSidebarCollapsed();
 }
@@ -2398,6 +2418,8 @@ fn keybindHintFor(state: *runtime.AppState, ref: ?KeybindRef) []const u8 {
             .horizontal => config.workspace_focus_right,
             .vertical => config.workspace_focus_down,
         },
+        .navigate_back => config.navigate_back,
+        .navigate_forward => config.navigate_forward,
     };
     if (bindings.len == 0) return "";
     return formatKeybind(&hint_buf, bindings[0]);

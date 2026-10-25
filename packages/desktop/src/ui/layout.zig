@@ -2261,25 +2261,7 @@ pub fn handlePaletteTextInput(state: *runtime.AppState, text: []const u8) bool {
 }
 
 pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const palette.event.KeyEvent) bool {
-    const has_modal_open = pairingApprovalOpen(state) or
-        state.runtimeCredentialModalOpen() or
-        state.runtimeTrustProposal() != null or
-        state.modal_image_path != null or
-        state.settings_controller.mcp_onboarding_visible or
-        state.settings_controller.provider_onboarding_visible or
-        state.rename_project_index != null or
-        state.transcriptSelectionBuffer() != null or
-        state.thread_import_provider != null or
-        state.cookie_import.open or
-        state.handoff_controller.sheet_open or
-        state.commitSheetOpen() or
-        state.project_controller.show_creator or
-        state.settings_controller.modal_visible or
-        state.workspaceSettingsOpen() or
-        state.runtime_connections.wizard_open or
-        state.command_controller.open or
-        state.folder_browser.open or
-        state.custom_agent_form.open;
+    const has_modal_open = paletteModalOpen(state);
     if (!has_modal_open) return false;
     if (handlePairingApprovalKeyDown(state, event)) return true;
     // The custom agent form sits above the settings modal that opened it.
@@ -2477,6 +2459,39 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const palette.even
         },
         else => return true,
     }
+}
+
+/// True while Settings' Back/Forward shortcut recorder waits for input.
+pub fn settingsShortcutCaptureActive(state: *const runtime.AppState) bool {
+    return settings_modal.shortcutCaptureActive(state);
+}
+
+/// Hands an extra mouse button to Settings' shortcut recorder.
+pub fn captureSettingsShortcutMouseButton(state: *runtime.AppState, button: u8) void {
+    settings_modal.captureShortcutMouseButton(state, button);
+}
+
+/// True while any Palette modal or sheet is stacked over the workspace.
+pub fn paletteModalOpen(state: *const runtime.AppState) bool {
+    return pairingApprovalOpen(state) or
+        state.runtimeCredentialModalOpen() or
+        state.runtimeTrustProposal() != null or
+        state.modal_image_path != null or
+        state.settings_controller.mcp_onboarding_visible or
+        state.settings_controller.provider_onboarding_visible or
+        state.rename_project_index != null or
+        state.transcriptSelectionBuffer() != null or
+        state.thread_import_provider != null or
+        state.cookie_import.open or
+        state.handoff_controller.sheet_open or
+        state.commitSheetOpen() or
+        state.project_controller.show_creator or
+        state.settings_controller.modal_visible or
+        state.workspaceSettingsOpen() or
+        state.runtime_connections.wizard_open or
+        state.command_controller.open or
+        state.folder_browser.open or
+        state.custom_agent_form.open;
 }
 
 fn dismissTopModal(state: *runtime.AppState) void {

@@ -140,11 +140,14 @@ export const KEYBIND_TOP_KEYS = [
   'chat',
   'workspace',
   'prefix',
+  'navigation',
   'chat_up',
   'chat_down',
   'chat_page_up',
   'chat_page_down',
 ] as const
+
+export const KEYBIND_NAVIGATION_KEYS = ['back', 'forward'] as const
 
 export const KEYBIND_CHAT_KEYS = ['model_picker', 'run_config', 'directory_picker'] as const
 
@@ -273,6 +276,8 @@ export const PREFIX_ACTION_NAMES = [
   'workspace.grow_right',
   'workspace.grow_up',
   'workspace.grow_down',
+  'navigation.back',
+  'navigation.forward',
 ] as const
 
 export const PREFIX_COMMAND_PLACEMENTS = [
@@ -715,6 +720,18 @@ const keybindChatSchema = closedObject(
   Object.fromEntries(KEYBIND_CHAT_KEYS.map((key) => [key, keybindValue])),
 )
 
+const keybindNavigationSchema = closedObject(
+  {
+    back: describedKeybind(
+      'Go back to the previously visited workspace/chat. Default: `"MouseBack"` (mouse side button). Accepts key chords and `MouseBack`, `MouseForward`, `Mouse4`…`Mouse16`.',
+    ),
+    forward: describedKeybind(
+      'Go forward again after going back. Default: `"MouseForward"` (mouse side button). Accepts key chords and mouse buttons like `back`.',
+    ),
+  },
+  'Back/forward through visited workspaces and chats. Also editable in Settings > Workspace.',
+)
+
 const keybindTerminalObject = closedObject(
   Object.fromEntries(KEYBIND_TERMINAL_KEYS.map((key) => [key, keybindValue])),
 )
@@ -747,6 +764,7 @@ const keybindsSchema = closedObject(
     },
     chat: keybindChatSchema,
     workspace: keybindWorkspaceSchema,
+    navigation: keybindNavigationSchema,
     prefix: {
       description:
         '`true`/`false` toggles prefix mode with defaults, a string sets the prefix chord, or an object configures the table.',

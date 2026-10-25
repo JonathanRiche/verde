@@ -53,6 +53,37 @@ command palette. Bind `workspace.close` / `workspace.close_current` in
 Pane cycling wraps at either end. When a pane is zoomed, cycling switches the
 zoomed pane without restoring the split layout.
 
+### Back & forward
+
+| Combo                       | Action                                |
+| -------------------------- | ------------------------------------- |
+| Mouse back button           | Go back to the previous workspace or chat you visited |
+| Mouse forward button        | Go forward again                       |
+
+Verde keeps a browser-style history of the workspaces and chats you switch
+between. Over the embedded browser pane, the mouse buttons go back and forward
+in the page instead. The command palette has **Go Back** / **Go Forward**.
+There are no default key chords, because `Alt+←`/`Alt+→` already jump words in
+the prompt and `Ctrl+[` is Escape in terminals. Add your own in
+**Settings → Workspace → Back & forward** (click a shortcut, then press a key
+chord or mouse button; Settings refuses chords another action already uses),
+or under `keybinds.navigation`:
+
+```json
+{
+  "keybinds": {
+    "navigation": {
+      "back": ["MouseBack", "Alt+LeftBracket"],
+      "forward": ["MouseForward", "Alt+RightBracket"]
+    }
+  }
+}
+```
+
+Mouse bindings accept `MouseBack`, `MouseForward`, and `Mouse4`…`Mouse16`,
+without modifiers. A chord you bind here takes priority over terminals and the
+prompt, the same way `Alt+↑`/`Alt+↓` do.
+
 ### Focus
 
 | Combo        | Action                                           |

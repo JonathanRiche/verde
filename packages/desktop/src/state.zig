@@ -41,6 +41,7 @@ const text_measure = @import("ui/text_measure.zig");
 const utils = @import("utils.zig");
 const browser_pane = @import("state/browser_pane.zig");
 const workspace_layout = @import("state/workspace_layout.zig");
+const NavigationHistory = @import("state/navigation_history.zig");
 pub const workspace_tabs = @import("state/workspace_tabs.zig");
 const provider_models = @import("state/provider_models.zig");
 const chat_types = @import("state/chat_types.zig");
@@ -4910,6 +4911,10 @@ pub const AppState = struct {
     project_controller: project_controller.State,
     surface_controller: surface_controller.State,
     acknowledgement_controller: acknowledgement_controller.State = .{},
+    /// Visited workspaces/chats for the back/forward navigation actions.
+    navigation_history: NavigationHistory = .{},
+    /// Settings wrote `keybinds.*`; main reloads the keyboard config after the event.
+    keybinds_reload_requested: bool = false,
     import_path_storage: [DRAFT_CAPACITY:0]u8,
     import_name_storage: [256:0]u8,
     rename_storage: [256:0]u8,
@@ -11376,6 +11381,75 @@ pub const AppState = struct {
         if (!self.selectProjectAtIndex(index)) return false;
         self.setSidebarAllWorkspaces(false);
         return true;
+    }
+
+    /// Where the user is now: the selected workspace and its selected chat.
+    pub fn currentNavigationLocation(self: *const AppState) ?NavigationHistory.Location {
+        const projects = self.project_controller.projects.items;
+        if (projects.len == 0 or self.project_controller.selected_index >= projects.len) return null;
+        const project = &projects[self.project_controller.selected_index];
+        const thread_hash: u64 = if (project.selected_thread_index < project.threads.items.len)
+            NavigationHistory.hashId(project.threads.items[project.selected_thread_index].local_thread_id)
+        else
+            0;
+        return .{ .project = NavigationHistory.hashId(project.id), .thread = thread_hash };
+    }
+
+    /// Adds the current location to the back/forward history when it changed.
+    /// Called after user input, so programmatic focus churn inside one event
+    /// collapses into the place the user ends up.
+    pub fn recordNavigationLocation(self: *AppState) void {
+        const location = self.currentNavigationLocation() orelse return;
+        self.navigation_history.record(location);
+    }
+
+    /// Steps back or forward to the nearest history entry that still exists.
+    /// Returns false when there is nowhere to go.
+    pub fn navigateHistory(self: *AppState, direction: NavigationHistory.Direction) bool {
+        self.recordNavigationLocation();
+        var index = self.navigation_history.cursor;
+        while (self.navigation_history.neighbor(index, direction)) |next| {
+            index = next;
+            const target = self.navigation_history.entries[index];
+            const resolved = self.resolveNavigationLocation(target) orelse continue;
+            self.navigation_history.moveTo(index);
+            self.applyNavigationTarget(resolved.project_index, resolved.thread_index);
+            if (self.currentNavigationLocation()) |landed| self.navigation_history.replaceCurrent(landed);
+            self.markDirty();
+            return true;
+        }
+        return false;
+    }
+
+    pub fn canNavigateHistory(self: *const AppState, direction: NavigationHistory.Direction) bool {
+        return self.navigation_history.canStep(direction);
+    }
+
+    const NavigationTarget = struct { project_index: usize, thread_index: ?usize };
+
+    fn resolveNavigationLocation(self: *const AppState, location: NavigationHistory.Location) ?NavigationTarget {
+        for (self.project_controller.projects.items, 0..) |*project, project_index| {
+            if (NavigationHistory.hashId(project.id) != location.project) continue;
+            if (location.thread == 0) return .{ .project_index = project_index, .thread_index = null };
+            for (project.threads.items, 0..) |*thread, thread_index| {
+                if (NavigationHistory.hashId(thread.local_thread_id) == location.thread) {
+                    return .{ .project_index = project_index, .thread_index = thread_index };
+                }
+            }
+            // The chat is gone; skip the entry rather than land somewhere else.
+            return null;
+        }
+        return null;
+    }
+
+    fn applyNavigationTarget(self: *AppState, project_index: usize, thread_index: ?usize) void {
+        if (project_index != self.project_controller.selected_index) {
+            _ = self.selectProjectAtIndex(project_index);
+        }
+        const thread = thread_index orelse return;
+        const project = &self.project_controller.projects.items[project_index];
+        if (project.selected_thread_index == thread) return;
+        self.selectThreadForProject(project_index, thread);
     }
 
     /// Reopens a closed workspace from the switcher and scopes the list to it.

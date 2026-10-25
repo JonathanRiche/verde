@@ -17,6 +17,7 @@ const runtime = @import("runtime.zig");
 const text_measure = @import("text_measure.zig");
 const utils = @import("../utils.zig");
 const runtime_connections = @import("../state/runtime_connections_controller.zig");
+const keybinds = @import("../app/keybinds.zig");
 
 pub const Control = enum(u8) {
     ui_font_dec,
@@ -102,6 +103,10 @@ pub const Control = enum(u8) {
     updates_release_page,
     notifications_toggle,
     providers_recheck,
+    navigation_back_record,
+    navigation_back_reset,
+    navigation_forward_record,
+    navigation_forward_reset,
     // One per settings_controller.PROVIDER_OPTIONS row. Each group stays contiguous.
     provider_update_first,
     provider_update_1,
@@ -293,6 +298,12 @@ const SettingsLayout = struct {
     file_links_hint_y: f32,
     workspace_unzoom_on_navigation: palette.Rect,
     workspace_unzoom_on_navigation_hint_y: f32,
+    navigation_card: palette.Rect,
+    navigation_back_record: palette.Rect,
+    navigation_back_reset: palette.Rect,
+    navigation_forward_record: palette.Rect,
+    navigation_forward_reset: palette.Rect,
+    navigation_hint_y: f32,
     workspace_pane_gap_dec: palette.Rect,
     workspace_pane_gap_inc: palette.Rect,
     workspace_pane_gap_hint_y: f32,
@@ -544,7 +555,8 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const custom_agents_h = customAgentsCardHeight(custom_agent_count, content_w, m);
     const appearance_page_h = appearance_h;
     const chat_page_h = transcript_h + m.card_gap + chat_h + m.card_gap + commit_h;
-    const workspace_page_h = workspace_h;
+    const navigation_h = navigationCardHeight(m);
+    const workspace_page_h = workspace_h + m.card_gap + navigation_h;
     const app_page_h = updates_h + m.card_gap + notifications_h;
     const body_h = switch (category) {
         .appearance => appearance_page_h,
@@ -847,6 +859,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const workspace_scroll_use_global: palette.Rect = .{ .x = 0.0, .y = offscreen_y, .w = 0.0, .h = 0.0 };
     const workspace_scroll_override: palette.Rect = workspace_scroll_use_global;
     const workspace_scroll_scope_hint_y = offscreen_y;
+    const navigation = layoutNavigationCard(.{ .x = content_x, .y = workspace_card.y + workspace_h + m.card_gap, .w = content_w, .h = navigation_h }, m);
 
     y = if (category == .connections) page_y else offscreen_y;
 
@@ -997,6 +1010,12 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .file_links_hint_y = file_links_hint_y,
         .workspace_unzoom_on_navigation = workspace_unzoom_on_navigation,
         .workspace_unzoom_on_navigation_hint_y = workspace_unzoom_on_navigation_hint_y,
+        .navigation_card = navigation.card,
+        .navigation_back_record = navigation.back_record,
+        .navigation_back_reset = navigation.back_reset,
+        .navigation_forward_record = navigation.forward_record,
+        .navigation_forward_reset = navigation.forward_reset,
+        .navigation_hint_y = navigation.hint_y,
         .workspace_pane_gap_dec = workspace_pane_gap_stepper.dec,
         .workspace_pane_gap_inc = workspace_pane_gap_stepper.inc,
         .workspace_pane_gap_hint_y = workspace_pane_gap_hint_y,
@@ -1579,6 +1598,10 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
         queueControlHit(state, layout.workspace_panes_per_view_inc, layout.body_clip, .workspace_panes_per_view_inc, queue_hit);
         queueControlHit(state, layout.workspace_scroll_horizontal, layout.body_clip, .workspace_scroll_horizontal, queue_hit);
         queueControlHit(state, layout.workspace_scroll_vertical, layout.body_clip, .workspace_scroll_vertical, queue_hit);
+        queueControlHit(state, layout.navigation_back_record, layout.body_clip, .navigation_back_record, queue_hit);
+        queueControlHit(state, layout.navigation_back_reset, layout.body_clip, .navigation_back_reset, queue_hit);
+        queueControlHit(state, layout.navigation_forward_record, layout.body_clip, .navigation_forward_record, queue_hit);
+        queueControlHit(state, layout.navigation_forward_reset, layout.body_clip, .navigation_forward_reset, queue_hit);
     }
     if (category == .chat) {
         queueControlHit(state, layout.tool_groups_collapsed, layout.body_clip, .tool_groups_collapsed, queue_hit);
@@ -1815,6 +1838,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
             .h = m.label_h,
         }, "Direction", paletteColor(textLabel()), theme.scaledUi(12.5), layout.body_clip);
         drawSegmentedPair(state, layout.workspace_scroll_horizontal, layout.workspace_scroll_vertical, "Horizontal", "Vertical", state.settings_controller.draft.workspace_scroll_direction == .horizontal, isControlHovered(state, .workspace_scroll_horizontal), isControlHovered(state, .workspace_scroll_vertical), layout.body_clip);
+        drawNavigationCard(state, layout, m);
     } else if (category == .chat) {
         drawCard(state, layout.transcript_card, layout.body_clip);
         drawCardTitle(state, layout.transcript_card, "Transcript", layout.body_clip);
@@ -2260,6 +2284,7 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
         state.settings_controller.commit_menu = null;
         state.settings_controller.commit_menu_hover_index = null;
     }
+    if (applyNavigationControl(state, control)) return;
     switch (control) {
         .commit_provider_dropdown => toggleCommitMenu(state, .provider),
         .commit_model_dropdown => toggleCommitMenu(state, .model),
@@ -2470,6 +2495,8 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
         },
         // Draft toggle: persisted to verde.json on Save, like the other fields.
         .notifications_toggle => state.settings_controller.draft.notifications_enabled = !state.settings_controller.draft.notifications_enabled,
+        // Handled by `applyNavigationControl`; they write keybinds, not the draft.
+        .navigation_back_record, .navigation_back_reset, .navigation_forward_record, .navigation_forward_reset => return,
         .providers_recheck => {
             state.startProviderReadinessCheck();
             state.markDirty();
@@ -2561,6 +2588,8 @@ pub fn applyNewChatReasoningOption(state: *runtime.AppState, option_index: usize
 pub fn handleKeyDown(state: *runtime.AppState, event: *const palette.event.KeyEvent) bool {
     if (!state.settings_controller.modal_visible) return false;
     if (state.settings_controller.modal_closing or overlayOwnsKeyboard(state)) return false;
+    // The shortcut recorder owns every key, modifiers included.
+    if (shortcutCaptureActive(state)) return handleShortcutCaptureKey(state, event);
     if (settings_text.handleKey(state, event)) return true;
     if (event.mod.primary() or event.mod.alt) return false;
     const key = event.key;
@@ -4968,6 +4997,271 @@ const ButtonStyle = enum { primary, secondary, disabled };
 
 // Push button for immediate actions (update check/install), with a real
 // disabled look so inert states don't read as clickable pills.
+// Navigation shortcuts card (Workspace page). Back/Forward step through the
+// workspace/chat history. Bindings live in `keybinds.navigation` and are
+// written straight to verde.json, outside the settings draft.
+
+const NAVIGATION_LABEL_W: f32 = 84.0;
+const MAX_NAVIGATION_BINDINGS: usize = 8;
+
+/// Direction whose shortcut button is waiting for a key or mouse button.
+var shortcut_capture: ?keybinds.NavigationDirection = null;
+var navigation_notice_buf: [128]u8 = undefined;
+var navigation_notice_len: usize = 0;
+var navigation_notice_warning: bool = false;
+
+const NavigationCardLayout = struct {
+    card: palette.Rect,
+    back_record: palette.Rect,
+    back_reset: palette.Rect,
+    forward_record: palette.Rect,
+    forward_reset: palette.Rect,
+    hint_y: f32,
+};
+
+fn navigationCardHeight(m: Metrics) f32 {
+    return m.card_pad * 2.0 + m.title_h + m.row_gap +
+        m.row_h + m.inner_gap + m.row_h + m.inner_gap +
+        m.label_h * 2.0;
+}
+
+fn layoutNavigationCard(card: palette.Rect, m: Metrics) NavigationCardLayout {
+    const label_w = theme.scaledUi(NAVIGATION_LABEL_W);
+    const reset_w = buttonWidth("Reset");
+    const x = card.x + m.card_pad + label_w;
+    const record_w = @max(card.w - m.card_pad * 2.0 - label_w - m.inner_gap - reset_w, theme.scaledUi(80.0));
+    const back_y = card.y + m.card_pad + m.title_h + m.row_gap;
+    const forward_y = back_y + m.row_h + m.inner_gap;
+    return .{
+        .card = card,
+        .back_record = .{ .x = x, .y = back_y, .w = record_w, .h = m.row_h },
+        .back_reset = .{ .x = x + record_w + m.inner_gap, .y = back_y, .w = reset_w, .h = m.row_h },
+        .forward_record = .{ .x = x, .y = forward_y, .w = record_w, .h = m.row_h },
+        .forward_reset = .{ .x = x + record_w + m.inner_gap, .y = forward_y, .w = reset_w, .h = m.row_h },
+        .hint_y = forward_y + m.row_h + m.inner_gap,
+    };
+}
+
+fn navigationBindings(state: *const runtime.AppState, direction: keybinds.NavigationDirection) []const keybinds.Keybind {
+    const config = state.command_controller.keyboard_config orelse return &.{};
+    return config.navigationBindings(direction);
+}
+
+fn navigationBindingsAreDefault(state: *const runtime.AppState, direction: keybinds.NavigationDirection) bool {
+    const defaults = keybinds.defaultNavigationBindings(direction);
+    const current = navigationBindings(state, direction);
+    if (current.len != defaults.len) return false;
+    for (current, defaults) |a, b| {
+        if (a.mouse_button != b.mouse_button or a.key != b.key or a.alt != b.alt or a.ctrl != b.ctrl or
+            a.meta != b.meta or a.primary != b.primary or a.shift != b.shift) return false;
+    }
+    return true;
+}
+
+fn formatNavigationBindings(buf: []u8, bindings: []const keybinds.Keybind) []const u8 {
+    if (bindings.len == 0) return "None";
+    var count: usize = 0;
+    for (bindings, 0..) |binding, index| {
+        if (index > 0) count += copyText(buf[count..], ", ");
+        var one: [48]u8 = undefined;
+        count += copyText(buf[count..], keybinds.formatKeybind(&one, binding));
+    }
+    return buf[0..count];
+}
+
+fn copyText(dest: []u8, src: []const u8) usize {
+    const count = @min(dest.len, src.len);
+    @memcpy(dest[0..count], src[0..count]);
+    return count;
+}
+
+fn setNavigationNotice(comptime fmt: []const u8, args: anytype, warning: bool) void {
+    const text = std.fmt.bufPrint(&navigation_notice_buf, fmt, args) catch navigation_notice_buf[0..0];
+    navigation_notice_len = text.len;
+    navigation_notice_warning = warning;
+}
+
+/// True while a shortcut button waits for input. Leaving the Workspace page
+/// or closing Settings cancels the recording.
+pub fn shortcutCaptureActive(state: *const runtime.AppState) bool {
+    if (shortcut_capture == null) return false;
+    if (!state.settings_controller.modal_visible or state.settings_controller.modal_closing or
+        state.settings_controller.active_category != .workspace)
+    {
+        shortcut_capture = null;
+        return false;
+    }
+    return true;
+}
+
+fn applyNavigationControl(state: *runtime.AppState, control: Control) bool {
+    const direction: keybinds.NavigationDirection = switch (control) {
+        .navigation_back_record, .navigation_back_reset => .back,
+        .navigation_forward_record, .navigation_forward_reset => .forward,
+        else => {
+            shortcut_capture = null;
+            return false;
+        },
+    };
+    const reset = control == .navigation_back_reset or control == .navigation_forward_reset;
+    if (reset) {
+        shortcut_capture = null;
+        if (saveNavigationBindings(state, direction, null)) setNavigationNotice("{s} reset to the mouse side button.", .{directionLabel(direction)}, false);
+    } else if (isCapturing(direction)) {
+        shortcut_capture = null;
+        navigation_notice_len = 0;
+    } else {
+        shortcut_capture = direction;
+        setNavigationNotice("Press a key chord or mouse button for {s}. Esc cancels, Backspace clears.", .{directionLabel(direction)}, false);
+    }
+    state.markDirty();
+    return true;
+}
+
+fn isCapturing(direction: keybinds.NavigationDirection) bool {
+    const active = shortcut_capture orelse return false;
+    return active == direction;
+}
+
+fn directionLabel(direction: keybinds.NavigationDirection) []const u8 {
+    return switch (direction) {
+        .back => "Back",
+        .forward => "Forward",
+    };
+}
+
+fn handleShortcutCaptureKey(state: *runtime.AppState, event: *const palette.event.KeyEvent) bool {
+    const direction = shortcut_capture orelse return false;
+    state.markDirty();
+    const plain = !event.mod.ctrl and !event.mod.alt and !event.mod.shift and !event.mod.super;
+    if (plain and event.key == .escape) {
+        shortcut_capture = null;
+        navigation_notice_len = 0;
+        return true;
+    }
+    if (plain and (event.key == .backspace or event.key == .delete)) {
+        shortcut_capture = null;
+        if (saveNavigationBindings(state, direction, &.{})) setNavigationNotice("{s} has no shortcut now. Reset restores the mouse button.", .{directionLabel(direction)}, false);
+        return true;
+    }
+    // Bare modifiers and unspellable keys keep the recorder waiting.
+    const binding = keybinds.keybindFromKeyEvent(event) orelse return true;
+    if (state.command_controller.keyboard_config) |config| {
+        var label_buf: [64]u8 = undefined;
+        if (config.conflictLabelForEvent(&label_buf, event)) |owner| {
+            var chord_buf: [48]u8 = undefined;
+            setNavigationNotice("{s} is already used by {s}. Try another.", .{ keybinds.formatKeybind(&chord_buf, binding), owner }, true);
+            return true;
+        }
+    }
+    addNavigationBinding(state, direction, binding);
+    return true;
+}
+
+/// Records a pointer button (main routes extra buttons here first).
+pub fn captureShortcutMouseButton(state: *runtime.AppState, button: u8) void {
+    const direction = shortcut_capture orelse return;
+    state.markDirty();
+    const binding = keybinds.keybindFromMouseButton(button) orelse return;
+    const other: keybinds.NavigationDirection = if (direction == .back) .forward else .back;
+    for (navigationBindings(state, other)) |existing| {
+        if (existing.mouse_button == button) {
+            var chord_buf: [48]u8 = undefined;
+            setNavigationNotice("{s} is already used by {s}. Try another.", .{ keybinds.formatKeybind(&chord_buf, binding), directionLabel(other) }, true);
+            return;
+        }
+    }
+    addNavigationBinding(state, direction, binding);
+}
+
+fn addNavigationBinding(state: *runtime.AppState, direction: keybinds.NavigationDirection, binding: keybinds.Keybind) void {
+    shortcut_capture = null;
+    var next: [MAX_NAVIGATION_BINDINGS]keybinds.Keybind = undefined;
+    var count: usize = 0;
+    var already_bound = false;
+    for (navigationBindings(state, direction)) |existing| {
+        if (count == next.len) break;
+        if (existing.mouse_button == binding.mouse_button and existing.key == binding.key and existing.alt == binding.alt and
+            existing.ctrl == binding.ctrl and existing.meta == binding.meta and existing.shift == binding.shift and !existing.primary)
+        {
+            already_bound = true;
+        }
+        next[count] = existing;
+        count += 1;
+    }
+    var chord_buf: [48]u8 = undefined;
+    const chord = keybinds.formatKeybind(&chord_buf, binding);
+    if (already_bound) {
+        setNavigationNotice("{s} already goes {s}.", .{ chord, if (direction == .back) "back" else "forward" }, false);
+        return;
+    }
+    if (count == next.len) count -= 1;
+    next[count] = binding;
+    count += 1;
+    if (saveNavigationBindings(state, direction, next[0..count])) {
+        setNavigationNotice("Added {s} to {s}.", .{ chord, directionLabel(direction) }, false);
+    }
+}
+
+fn saveNavigationBindings(state: *runtime.AppState, direction: keybinds.NavigationDirection, bindings: ?[]const keybinds.Keybind) bool {
+    keybinds.saveNavigationBindings(state.allocator, direction, bindings) catch |err| {
+        std.log.scoped(.settings_modal).warn("saving navigation keybinds failed: {s}", .{@errorName(err)});
+        setNavigationNotice("Could not save the shortcut to verde.json.", .{}, true);
+        return false;
+    };
+    state.keybinds_reload_requested = true;
+    return true;
+}
+
+fn drawNavigationCard(state: *runtime.AppState, layout: SettingsLayout, m: Metrics) void {
+    const card = layout.navigation_card;
+    drawCard(state, card, layout.body_clip);
+    drawCardTitle(state, card, "Back & forward", layout.body_clip);
+    drawNavigationRow(state, layout, m, .back, layout.navigation_back_record, layout.navigation_back_reset, .navigation_back_record, .navigation_back_reset);
+    drawNavigationRow(state, layout, m, .forward, layout.navigation_forward_record, layout.navigation_forward_reset, .navigation_forward_record, .navigation_forward_reset);
+
+    const text_w = card.w - m.card_pad * 2.0;
+    const font_size = theme.scaledUi(12.5);
+    var hint_buf: [160]u8 = undefined;
+    const hint = ellipsizedText(&hint_buf, "Steps through workspaces and chats you visited. Click a shortcut to add a key or mouse button.", font_size, text_w);
+    queueText(state, .{ .x = card.x + m.card_pad, .y = layout.navigation_hint_y, .w = text_w, .h = m.label_h }, hint, paletteColor(textHint()), font_size, layout.body_clip);
+    if (navigation_notice_len > 0) {
+        var notice_buf: [160]u8 = undefined;
+        const notice = ellipsizedText(&notice_buf, navigation_notice_buf[0..navigation_notice_len], font_size, text_w);
+        const color = if (navigation_notice_warning) theme.warning() else textLabel();
+        queueText(state, .{ .x = card.x + m.card_pad, .y = layout.navigation_hint_y + m.label_h, .w = text_w, .h = m.label_h }, notice, paletteColor(color), font_size, layout.body_clip);
+    }
+}
+
+fn drawNavigationRow(
+    state: *runtime.AppState,
+    layout: SettingsLayout,
+    m: Metrics,
+    direction: keybinds.NavigationDirection,
+    record: palette.Rect,
+    reset: palette.Rect,
+    record_control: Control,
+    reset_control: Control,
+) void {
+    queueText(state, .{
+        .x = layout.navigation_card.x + m.card_pad,
+        .y = record.y + (m.row_h - theme.scaledUi(15.0)) * 0.5,
+        .w = theme.scaledUi(NAVIGATION_LABEL_W),
+        .h = theme.scaledUi(15.0),
+    }, directionLabel(direction), paletteColor(textLabel()), theme.scaledUi(13.5), layout.body_clip);
+
+    const capturing = isCapturing(direction);
+    var list_buf: [256]u8 = undefined;
+    var fit_buf: [256]u8 = undefined;
+    const label = if (capturing)
+        "Press keys or a mouse button…"
+    else
+        ellipsizedText(&fit_buf, formatNavigationBindings(&list_buf, navigationBindings(state, direction)), theme.scaledUi(13.0), record.w - theme.scaledUi(20.0));
+    drawActionButton(state, record, label, if (capturing) .primary else .secondary, isControlHovered(state, record_control), layout.body_clip);
+    const is_default = navigationBindingsAreDefault(state, direction);
+    drawActionButton(state, reset, "Reset", if (is_default) .disabled else .secondary, !is_default and isControlHovered(state, reset_control), layout.body_clip);
+}
+
 fn drawActionButton(state: *runtime.AppState, rect: palette.Rect, label: []const u8, style: ButtonStyle, hovered: bool, clip: palette.Rect) void {
     var button_fill: ?[4]f32 = null;
     switch (style) {

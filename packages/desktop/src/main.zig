@@ -1657,6 +1657,15 @@ fn processOneEvent(
         else => {},
     }
     const keep_running = handleEvent(window, state, keyboard, ui_scale, event);
+    switch (event.*) {
+        // Hover focus and motion never count as a visit; clicks and keys do.
+        .key_down, .mouse_button_down, .mouse_button_up => state.recordNavigationLocation(),
+        else => {},
+    }
+    if (state.keybinds_reload_requested) {
+        state.keybinds_reload_requested = false;
+        reloadKeybinds(state, keyboard);
+    }
     if (!keep_running) {
         runtime_log.diagnostic("event requested shutdown type={s}", .{@tagName(event.*)});
     }
@@ -2394,6 +2403,10 @@ fn handleEvent(window: *palette.platform.Window, state: *AppState, keyboard: *ke
             _ = state.handleBrowserMouse(browserMouseMotionEvent(motion_event));
         },
         .mouse_button_down, .mouse_button_up => |*button_event| {
+            if (handleNavigationMouseButton(state, keyboard, button_event)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
             if (!button_event.down and ui_layout.companionOwnsPointerRelease(state, button_event.button)) {
                 _ = ui_layout.handleCompanionMouseButton(state, button_event.x, button_event.y, button_event.button, false, button_event.clicks);
                 syncWindowTextInput(window, state);
@@ -3405,6 +3418,8 @@ fn handleKeyboardAction(
         .toggle_sidebar_hidden => state.toggleSidebarHidden(),
         .toggle_side_panel => state.toggleSidePanel(),
         .workspace_show_all => state.showAllWorkspacesInSidebar(),
+        .navigate_back => _ = state.navigateHistory(.back),
+        .navigate_forward => _ = state.navigateHistory(.forward),
         .toggle_browser => state.toggleBrowser(),
         .toggle_terminal => state.toggleCurrentProjectTerminal(),
         .chat_up => if (canHandleTranscriptScrollAction(state)) {
@@ -3479,10 +3494,32 @@ fn isWorkspacePaneAction(action: keybinds.NativeKeyboardAction) bool {
     };
 }
 
+/// Routes bound extra mouse buttons (side Back/Forward by default) to history
+/// navigation. Settings' shortcut recorder sees them first; the browser pane
+/// keeps them for page history while the pointer is over it.
+fn handleNavigationMouseButton(state: *AppState, keyboard: *const keybinds.NativeKeyboardConfig, button_event: *const palette.event.ButtonEvent) bool {
+    if (button_event.button <= @intFromEnum(palette.event.MouseButton.right)) return false;
+    if (ui_layout.settingsShortcutCaptureActive(state)) {
+        if (button_event.down) ui_layout.captureSettingsShortcutMouseButton(state, button_event.button);
+        return true;
+    }
+    const action = keyboard.actionForMouseButton(button_event.button) orelse return false;
+    if (state.isBrowserVisible() and state.browserPaneContains(button_event.x, button_event.y)) return false;
+    if (ui_layout.paletteModalOpen(state)) return false;
+    if (button_event.down) {
+        _ = state.navigateHistory(if (action == .navigate_back) .back else .forward);
+    }
+    return true;
+}
+
 fn isWorkspaceTraversalAction(action: keybinds.NativeKeyboardAction) bool {
     return switch (action) {
         .workspace_previous,
         .workspace_next,
+        // Navigation chords are opt-in (mouse buttons by default), so a key
+        // the user chose wins over terminals and text fields like Alt+Up does.
+        .navigate_back,
+        .navigate_forward,
         => true,
         else => false,
     };
@@ -3923,6 +3960,20 @@ fn pollOmarchyThemeChanges(state: *AppState) void {
     if (!ui_theme.omarchyThemeChanged(state.allocator, state.app_config.theme_config)) return;
     log.info("omarchy theme changed; reapplying palette", .{});
     applyAppConfigRuntime(state);
+}
+
+/// Reloads only keybinds after Settings rewrote them, and claims the new
+/// config mtime so the file watcher does not run a full refresh as well.
+fn reloadKeybinds(state: *AppState, keyboard: *keybinds.NativeKeyboardConfig) void {
+    const next_keyboard = keybinds.NativeKeyboardConfig.load(state.allocator) catch |err| {
+        log.err("failed to reload native keybinds: {s}", .{@errorName(err)});
+        state.setSidebarNotice("Shortcut saved, but keybinds did not reload.");
+        return;
+    };
+    keyboard.deinit();
+    keyboard.* = next_keyboard;
+    state.app_config_file_mtime = app_config.configFileMtime(state.allocator) catch state.app_config_file_mtime;
+    state.markDirty();
 }
 
 fn reloadApplication(state: *AppState, keyboard: *keybinds.NativeKeyboardConfig) void {

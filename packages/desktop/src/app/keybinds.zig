@@ -59,6 +59,10 @@ pub const NativeKeyboardAction = enum {
     workspace_grow_down,
     /// Widens the sidebar list to every open workspace (default Alt+0).
     workspace_show_all,
+    /// Steps back through recently visited workspaces and chats.
+    navigate_back,
+    /// Steps forward again after `navigate_back`.
+    navigate_forward,
 };
 
 pub const NativeTerminalAction = enum {
@@ -82,6 +86,12 @@ pub const NativeChatAction = enum {
     run_config,
     directory_picker,
 };
+
+/// History direction for `navigate_back` / `navigate_forward`.
+pub const NavigationDirection = enum { back, forward };
+
+/// `keybinds.navigation` holds `back` and `forward`.
+pub const NAVIGATION_CONFIG_KEY = "navigation";
 
 /// What a prefix chord resolves to. Mirrors every dispatch surface the direct
 /// keybind tables reach so `prefix + key` can trigger any built-in command,
@@ -164,6 +174,9 @@ pub const Keybind = struct {
     primary: bool = false,
     shift: bool = false,
     key: palette.event.Keycode,
+    /// Nonzero for a pointer-button binding (`MouseBack`, `Mouse5`, …), which
+    /// carries no modifiers and never matches a key event.
+    mouse_button: u8 = 0,
 
     fn eql(self: Keybind, other: Keybind) bool {
         return self.alt == other.alt and
@@ -171,10 +184,16 @@ pub const Keybind = struct {
             self.meta == other.meta and
             self.primary == other.primary and
             self.shift == other.shift and
-            self.key == other.key;
+            self.key == other.key and
+            self.mouse_button == other.mouse_button;
+    }
+
+    pub fn isMouse(self: Keybind) bool {
+        return self.mouse_button != 0;
     }
 
     fn matches(self: Keybind, event: *const palette.event.KeyEvent) bool {
+        if (self.mouse_button != 0) return false;
         if (!event.down or event.repeat or event.key != self.key) {
             return false;
         }
@@ -187,6 +206,7 @@ pub const Keybind = struct {
     }
 
     fn matchesWithRepeatPolicy(self: Keybind, event: *const palette.event.KeyEvent, allow_repeat: bool) bool {
+        if (self.mouse_button != 0) return false;
         if (!event.down or event.key != self.key) {
             return false;
         }
@@ -290,6 +310,8 @@ pub const NativeKeyboardConfig = struct {
     workspace_grow_down: []Keybind,
     workspace_select: []Keybind,
     workspace_show_all: []Keybind,
+    navigate_back: []Keybind,
+    navigate_forward: []Keybind,
     prefix: PrefixConfig,
 
     pub fn load(allocator: std.mem.Allocator) !NativeKeyboardConfig {
@@ -360,6 +382,8 @@ pub const NativeKeyboardConfig = struct {
             .workspace_grow_down = try cloneDefaultWorkspaceGrowDownKeybinds(allocator),
             .workspace_select = try cloneDefaultWorkspaceSelectKeybinds(allocator),
             .workspace_show_all = try cloneDefaultWorkspaceShowAllKeybinds(allocator),
+            .navigate_back = try cloneDefaultNavigateBackKeybinds(allocator),
+            .navigate_forward = try cloneDefaultNavigateForwardKeybinds(allocator),
             .prefix = try cloneDefaultPrefixConfig(allocator),
         };
 
@@ -441,6 +465,8 @@ pub const NativeKeyboardConfig = struct {
         self.allocator.free(self.workspace_grow_down);
         self.allocator.free(self.workspace_select);
         self.allocator.free(self.workspace_show_all);
+        self.allocator.free(self.navigate_back);
+        self.allocator.free(self.navigate_forward);
         self.prefix.deinit(self.allocator);
     }
 
@@ -577,7 +603,22 @@ pub const NativeKeyboardConfig = struct {
         if (matchesAny(self.workspace_grow_down, event)) {
             return .workspace_grow_down;
         }
+        if (matchesAny(self.navigate_back, event)) {
+            return .navigate_back;
+        }
+        if (matchesAny(self.navigate_forward, event)) {
+            return .navigate_forward;
+        }
 
+        return null;
+    }
+
+    /// Resolves a pointer-button press (e.g. a mouse's side buttons) to an
+    /// app action. Only navigation actions accept mouse bindings.
+    pub fn actionForMouseButton(self: *const NativeKeyboardConfig, button: u8) ?NativeKeyboardAction {
+        if (button == 0) return null;
+        if (matchesMouse(self.navigate_back, button)) return .navigate_back;
+        if (matchesMouse(self.navigate_forward, button)) return .navigate_forward;
         return null;
     }
 
@@ -815,6 +856,9 @@ pub const NativeKeyboardConfig = struct {
         if (keybinds_value.object.get("prefix")) |prefix_value| {
             self.applyPrefixOverrides(prefix_value);
         }
+        if (keybinds_value.object.get(NAVIGATION_CONFIG_KEY)) |navigation_value| {
+            self.applyNavigationOverrides(navigation_value);
+        }
         if (keybinds_value.object.get("chat_up")) |chat_up_value| {
             if (self.parseOverrideValue(chat_up_value, "chat_up")) |bindings| {
                 self.allocator.free(self.chat_up);
@@ -839,6 +883,59 @@ pub const NativeKeyboardConfig = struct {
                 self.chat_page_down = bindings;
             }
         }
+    }
+
+    fn applyNavigationOverrides(self: *NativeKeyboardConfig, navigation_value: std.json.Value) void {
+        if (navigation_value != .object) {
+            log.warn("keybinds.navigation must be an object when provided", .{});
+            return;
+        }
+        if (navigation_value.object.get("back")) |value| {
+            if (self.parseOverrideValue(value, "navigation.back")) |bindings| {
+                self.allocator.free(self.navigate_back);
+                self.navigate_back = bindings;
+            }
+        }
+        if (navigation_value.object.get("forward")) |value| {
+            if (self.parseOverrideValue(value, "navigation.forward")) |bindings| {
+                self.allocator.free(self.navigate_forward);
+                self.navigate_forward = bindings;
+            }
+        }
+    }
+
+    /// Names the existing direct binding a key press would trigger, so
+    /// Settings can refuse to record a navigation chord over it. Navigation's
+    /// own bindings are not conflicts.
+    pub fn conflictLabelForEvent(self: *const NativeKeyboardConfig, buf: []u8, event: *const palette.event.KeyEvent) ?[]const u8 {
+        if (self.isPrefixKeyEvent(event)) return "Prefix key";
+        if (self.actionForEvent(event)) |action| switch (action) {
+            .navigate_back, .navigate_forward => {},
+            else => return prefixTargetLabel(buf, .{ .app = action }),
+        };
+        if (self.chatActionForEvent(event)) |action| return prefixTargetLabel(buf, .{ .chat = action });
+        if (self.terminalActionForEvent(event)) |action| return prefixTargetLabel(buf, .{ .terminal = action });
+        if (self.workspaceShowAllForEvent(event)) return prefixTargetLabel(buf, .{ .app = .workspace_show_all });
+        if (self.workspaceFocusPromptForEvent(event)) return prefixTargetLabel(buf, .focus_prompt);
+        if (self.workspaceSelectIndexForEvent(event)) |index| return prefixTargetLabel(buf, .{ .workspace_select = index });
+        if (self.workspacePaneSelectIndexForEvent(event)) |index| return prefixTargetLabel(buf, .{ .pane_select = index });
+        if (self.workspaceActiveSelectIndexForEvent(event)) |index| return prefixTargetLabel(buf, .{ .active_select = index });
+        if (isBrowserReloadEvent(event) or isBrowserNewTabEvent(event) or isBrowserCloseTabEvent(event)) return "Browser tab chord";
+        // main.zig's font-size handler accepts the primary modifier with any extras.
+        const primary_down = if (builtin.os.tag == .macos) event.mod.super else event.mod.ctrl;
+        if (primary_down) switch (event.key) {
+            .minus, .equals, .kp_minus, .kp_plus => return "Font size",
+            else => {},
+        };
+        return null;
+    }
+
+    /// Loaded bindings for one navigation direction.
+    pub fn navigationBindings(self: *const NativeKeyboardConfig, direction: NavigationDirection) []const Keybind {
+        return switch (direction) {
+            .back => self.navigate_back,
+            .forward => self.navigate_forward,
+        };
     }
 
     fn applyChatOverrides(self: *NativeKeyboardConfig, chat_value: std.json.Value) void {
@@ -1385,6 +1482,8 @@ const PREFIX_ACTION_NAMES = [_]PrefixActionName{
     .{ .name = "workspace.add", .target = .{ .app = .add_workspace } },
     .{ .name = "workspace.add_tab", .target = .{ .app = .add_workspace_tab } },
     .{ .name = "workspace.show_all", .target = .{ .app = .workspace_show_all } },
+    .{ .name = "navigation.back", .target = .{ .app = .navigate_back } },
+    .{ .name = "navigation.forward", .target = .{ .app = .navigate_forward } },
     .{ .name = "workspace.add_tab_terminal", .target = .{ .app = .add_workspace_tab_terminal } },
     .{ .name = "new_terminal", .target = .new_terminal },
     .{ .name = "command_palette", .target = .{ .app = .command_palette } },
@@ -1478,6 +1577,8 @@ pub fn prefixTargetLabel(buf: []u8, target: PrefixTarget) []const u8 {
             .add_workspace => "Add workspace",
             .add_workspace_tab => "New tab",
             .workspace_show_all => "All workspaces",
+            .navigate_back => "Go back",
+            .navigate_forward => "Go forward",
             .add_workspace_tab_terminal => "Terminal tab",
             .command_palette => "Command palette",
             .settings => "Settings",
@@ -2158,6 +2259,27 @@ fn cloneDefaultWorkspaceSelectKeybinds(allocator: std.mem.Allocator) ![]Keybind 
     });
 }
 
+/// Mouse side buttons only. Every browser-style chord is already taken in
+/// Verde (Alt+Left/Right word-jumps in the composer, Ctrl+Left focuses panes,
+/// Cmd/Ctrl+[ is Escape in terminals), so keyboard chords are opt-in through
+/// `keybinds.navigation` or Settings > Workspace.
+fn cloneDefaultNavigateBackKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{try parseDefaultAccelerator("MouseBack")});
+}
+
+fn cloneDefaultNavigateForwardKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{try parseDefaultAccelerator("MouseForward")});
+}
+
+/// Defaults for one direction, for Settings' reset and "is default" checks.
+pub fn defaultNavigationBindings(direction: NavigationDirection) [1]Keybind {
+    const button: palette.event.MouseButton = switch (direction) {
+        .back => .back,
+        .forward => .forward,
+    };
+    return .{.{ .key = .unknown, .mouse_button = @intFromEnum(button) }};
+}
+
 fn cloneDefaultWorkspaceShowAllKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("Alt+0"),
@@ -2166,6 +2288,71 @@ fn cloneDefaultWorkspaceShowAllKeybinds(allocator: std.mem.Allocator) ![]Keybind
 
 /// Formats the first loaded binding for UI hints. The caller owns `buf`, so
 /// separate controls can render hints in the same frame without shared state.
+/// Writes `keybinds.navigation.<direction>` into the Verde config, keeping
+/// every other key. `null` removes the override so the defaults apply again.
+/// The config watcher reloads keybinds after the file changes.
+pub fn saveNavigationBindings(allocator: std.mem.Allocator, direction: NavigationDirection, bindings: ?[]const Keybind) !void {
+    const config_path = try shared_config.resolveConfigPath(allocator);
+    defer allocator.free(config_path);
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var parsed = try shared_config.readRootValue(allocator);
+    defer if (parsed) |*value| value.deinit();
+    const tree_allocator = if (parsed) |*value| value.arena.allocator() else arena;
+    var root: std.json.Value = if (parsed) |*value| value.value else .{ .object = .empty };
+    if (root != .object) root = .{ .object = .empty };
+
+    const keybinds_object = try jsonObjectSection(tree_allocator, &root.object, "keybinds");
+    const navigation_object = try jsonObjectSection(tree_allocator, keybinds_object, NAVIGATION_CONFIG_KEY);
+    const field: []const u8 = @tagName(direction);
+    if (bindings) |list| {
+        var array = std.json.Array.init(tree_allocator);
+        for (list) |binding| {
+            var buf: [64]u8 = undefined;
+            const text = formatAccelerator(&buf, binding);
+            if (text.len == 0) continue;
+            try array.append(.{ .string = try tree_allocator.dupe(u8, text) });
+        }
+        try navigation_object.put(tree_allocator, field, .{ .array = array });
+    } else {
+        _ = navigation_object.orderedRemove(field);
+        if (navigation_object.count() == 0) _ = keybinds_object.orderedRemove(NAVIGATION_CONFIG_KEY);
+    }
+
+    const encoded = try std.json.Stringify.valueAlloc(allocator, root, .{ .whitespace = .indent_2 });
+    defer allocator.free(encoded);
+
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    const cwd = std.Io.Dir.cwd();
+    if (std.fs.path.dirname(config_path)) |parent| {
+        var parent_dir = try cwd.createDirPathOpen(io, parent, .{});
+        parent_dir.close(io);
+    }
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{config_path});
+    defer allocator.free(tmp_path);
+    {
+        var file = try cwd.createFile(io, tmp_path, .{});
+        defer file.close(io);
+        var write_buffer: [4096]u8 = undefined;
+        var writer = file.writer(io, &write_buffer);
+        try writer.interface.writeAll(encoded);
+        try writer.interface.flush();
+    }
+    try cwd.rename(tmp_path, cwd, config_path, io);
+}
+
+fn jsonObjectSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8) !*std.json.ObjectMap {
+    const entry = try object.getOrPut(allocator, key);
+    if (!entry.found_existing or entry.value_ptr.* != .object) {
+        entry.value_ptr.* = .{ .object = .empty };
+    }
+    return &entry.value_ptr.object;
+}
+
 pub fn formatFirstKeybind(buf: []u8, bindings: []const Keybind) []const u8 {
     if (bindings.len == 0) return "";
     return formatKeybind(buf, bindings[0]);
@@ -2265,10 +2452,86 @@ fn formatKeybindForOs(buf: []u8, binding: Keybind, os_tag: std.Target.Os.Tag) []
     }
     if (binding.alt) count += copyInto(buf[count..], "Alt+");
     if (binding.shift) count += copyInto(buf[count..], "Shift+");
+    if (binding.mouse_button != 0) {
+        var name_buf: [16]u8 = undefined;
+        count += copyInto(buf[count..], mouseButtonLabel(&name_buf, binding.mouse_button));
+        return buf[0..count];
+    }
     const name = keycodeLabel(binding.key);
     count += copyInto(buf[count..], name);
     if (name.len == 1 and count > 0) buf[count - 1] = std.ascii.toUpper(buf[count - 1]);
     return buf[0..count];
+}
+
+fn mouseButtonLabel(buf: []u8, button: u8) []const u8 {
+    return switch (button) {
+        @intFromEnum(palette.event.MouseButton.back) => "Mouse Back",
+        @intFromEnum(palette.event.MouseButton.forward) => "Mouse Forward",
+        else => std.fmt.bufPrint(buf, "Mouse{d}", .{button}) catch "Mouse",
+    };
+}
+
+/// Canonical config spelling for a binding, the inverse of `parseAccelerator`.
+/// Settings writes these strings back into `keybinds.navigation`.
+pub fn formatAccelerator(buf: []u8, binding: Keybind) []const u8 {
+    if (binding.mouse_button != 0) {
+        return switch (binding.mouse_button) {
+            @intFromEnum(palette.event.MouseButton.back) => "MouseBack",
+            @intFromEnum(palette.event.MouseButton.forward) => "MouseForward",
+            else => std.fmt.bufPrint(buf, "Mouse{d}", .{binding.mouse_button}) catch "",
+        };
+    }
+    var count: usize = 0;
+    if (binding.primary) count += copyInto(buf[count..], "CommandOrControl+");
+    if (binding.ctrl) count += copyInto(buf[count..], "Ctrl+");
+    if (binding.meta) count += copyInto(buf[count..], if (builtin.os.tag == .macos) "Cmd+" else "Super+");
+    if (binding.alt) count += copyInto(buf[count..], "Alt+");
+    if (binding.shift) count += copyInto(buf[count..], "Shift+");
+    count += copyInto(buf[count..], acceleratorKeyName(binding.key) orelse return "");
+    return buf[0..count];
+}
+
+/// Builds a binding from a live key press so Settings can record a chord.
+/// Returns null for bare modifiers and keys the config parser cannot spell.
+pub fn keybindFromKeyEvent(event: *const palette.event.KeyEvent) ?Keybind {
+    _ = acceleratorKeyName(event.key) orelse return null;
+    return .{
+        .key = event.key,
+        .ctrl = event.mod.ctrl,
+        .meta = event.mod.super,
+        .alt = event.mod.alt,
+        .shift = event.mod.shift,
+    };
+}
+
+/// Builds a binding from a pointer button. Primary, middle, and secondary
+/// clicks stay reserved for the UI itself.
+pub fn keybindFromMouseButton(button: u8) ?Keybind {
+    if (button <= @intFromEnum(palette.event.MouseButton.right)) return null;
+    return .{ .key = .unknown, .mouse_button = button };
+}
+
+/// Config token for a key, or null when `parseKeycode` cannot read it back.
+fn acceleratorKeyName(key: palette.event.Keycode) ?[]const u8 {
+    const name: []const u8 = switch (key) {
+        .unknown => return null,
+        .@"return" => "Enter",
+        .leftbracket => "LeftBracket",
+        .rightbracket => "RightBracket",
+        .grave => "Grave",
+        .minus => "Minus",
+        .equals => "Equals",
+        .backslash => "Backslash",
+        .semicolon => "Semicolon",
+        .apostrophe => "Apostrophe",
+        .comma => "Comma",
+        .period => "Period",
+        .slash => "Slash",
+        else => @tagName(key),
+    };
+    const round_trip = parseKeycode(name) orelse return null;
+    if (round_trip != key) return null;
+    return name;
 }
 
 fn keycodeLabel(key: palette.event.Keycode) []const u8 {
@@ -2316,6 +2579,13 @@ fn matchesAny(bindings: []const Keybind, event: *const palette.event.KeyEvent) b
     return false;
 }
 
+fn matchesMouse(bindings: []const Keybind, button: u8) bool {
+    for (bindings) |binding| {
+        if (binding.mouse_button == button) return true;
+    }
+    return false;
+}
+
 fn matchesAnyAllowRepeat(bindings: []const Keybind, event: *const palette.event.KeyEvent) bool {
     for (bindings) |binding| {
         if (binding.matchesAllowRepeat(event)) {
@@ -2336,7 +2606,24 @@ fn containsKeybind(bindings: []const Keybind, needle: Keybind) bool {
     return false;
 }
 
+/// Parses `MouseBack` / `MouseForward` / `Mouse4`…`Mouse16` (plus the
+/// `XButton1`/`XButton2` Windows spellings). Pointer bindings take no modifiers.
+fn parseMouseToken(token: []const u8) ?u8 {
+    const back = @intFromEnum(palette.event.MouseButton.back);
+    const forward = @intFromEnum(palette.event.MouseButton.forward);
+    if (std.ascii.eqlIgnoreCase(token, "MouseBack") or std.ascii.eqlIgnoreCase(token, "XButton1")) return back;
+    if (std.ascii.eqlIgnoreCase(token, "MouseForward") or std.ascii.eqlIgnoreCase(token, "XButton2")) return forward;
+    if (token.len > 5 and std.ascii.startsWithIgnoreCase(token, "Mouse")) {
+        const number = std.fmt.parseUnsigned(u8, token[5..], 10) catch return null;
+        if (number >= back and number <= 16) return number;
+    }
+    return null;
+}
+
 fn parseAccelerator(binding: []const u8) ?Keybind {
+    if (parseMouseToken(std.mem.trim(u8, binding, &std.ascii.whitespace))) |button| {
+        return .{ .key = .unknown, .mouse_button = button };
+    }
     var parsed: Keybind = .{ .key = .unknown };
     var tokens = std.mem.tokenizeScalar(u8, binding, '+');
 
@@ -2546,4 +2833,27 @@ test "punctuation accelerators parse and format" {
     try std.testing.expectEqual(palette.event.Keycode.comma, parseAccelerator("Comma").?.key);
     var buf: [32]u8 = undefined;
     try std.testing.expectEqualStrings("Shift+[", formatKeybind(&buf, .{ .shift = true, .key = .leftbracket }));
+}
+
+test "mouse navigation bindings parse, match, and round-trip" {
+    const back = parseAccelerator("MouseBack").?;
+    try std.testing.expectEqual(@as(u8, @intFromEnum(palette.event.MouseButton.back)), back.mouse_button);
+    try std.testing.expectEqual(@as(u8, 7), parseAccelerator("mouse7").?.mouse_button);
+    try std.testing.expect(parseAccelerator("Mouse3") == null);
+    try std.testing.expect(parseAccelerator("Alt+MouseBack") == null);
+
+    // A mouse binding never matches a key event, even an unknown key.
+    const unknown_key: palette.event.KeyEvent = .{ .key = .unknown, .down = true };
+    try std.testing.expect(!back.matches(&unknown_key));
+
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("MouseBack", formatAccelerator(&buf, back));
+    try std.testing.expectEqualStrings("Mouse Back", formatKeybind(&buf, back));
+    const chord: Keybind = .{ .alt = true, .key = .leftbracket };
+    const spelled = formatAccelerator(&buf, chord);
+    try std.testing.expectEqualStrings("Alt+LeftBracket", spelled);
+    try std.testing.expect(parseAccelerator(spelled).?.eql(chord));
+
+    const defaults = defaultNavigationBindings(.forward);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(palette.event.MouseButton.forward)), defaults[0].mouse_button);
 }
