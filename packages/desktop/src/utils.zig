@@ -1435,7 +1435,8 @@ fn toolCallDefaultTitle(tool_call: provider_types.ToolCallUpdate) []const u8 {
         },
         .fetch => "Fetch",
         .mcp => "MCP tool",
-        .other => "Cursor tool",
+        // Older rows persisted "Cursor tool"; renderers still accept it.
+        .other => "Tool",
         .subagent => "Subagent",
     };
 }

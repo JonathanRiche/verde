@@ -508,7 +508,9 @@ fn toolDefaultTitle(kind: []const u8, status: []const u8) []const u8 {
     if (std.mem.eql(u8, kind, "fetch")) return "Fetch";
     if (std.mem.eql(u8, kind, "mcp")) return "MCP tool";
     if (std.mem.eql(u8, kind, "subagent")) return "Subagent";
-    return "Cursor tool";
+    // Provider-neutral: every harness emits `other` for tools it cannot
+    // classify. Older rows persisted "Cursor tool"; renderers still accept it.
+    return "Tool";
 }
 
 fn toolDisplayAuthor(kind: []const u8, status: []const u8) []const u8 {

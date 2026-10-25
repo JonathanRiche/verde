@@ -100,6 +100,11 @@ const session_in_use_max_attempts: usize = 40;
 const OPAQUE_HISTORY_NOTICE =
     "Muse could not replay this thread's private reasoning history. Starting a fresh Muse session.";
 
+/// Probe ticks to wait, after the last background workload settles, for the
+/// turn Muse starts to deliver its result. Muse starts it within milliseconds;
+/// the grace only bounds a settle that never wakes the session.
+const background_wake_grace_ticks: usize = 2;
+
 pub fn providerSlashCommands() []const provider_types.ProviderSlashCommand {
     return &.{};
 }
@@ -374,8 +379,25 @@ pub const Client = struct {
         defer if (turn_id_storage) |turn_id| allocator.free(turn_id);
         var foreground_work: std.StringHashMapUnmanaged(void) = .empty;
         defer deinitStringSet(allocator, &foreground_work);
+        // Workflows and backgrounded tasks outlive the turn that launched
+        // them; Muse delivers their results in a turn it starts itself. The
+        // host must stay up (stopping it kills the workload) and the Verde
+        // turn open so that delivery reaches this chat.
+        var background_work: std.StringHashMapUnmanaged(void) = .empty;
+        defer deinitStringSet(allocator, &background_work);
+        var background_settled = false;
+        // Muse names a workflow child only while it is scheduled.
+        var workflow_labels: std.StringHashMapUnmanaged([]u8) = .empty;
+        defer deinitStringMap(allocator, &workflow_labels);
+        var awaiting_wake = false;
+        var wake_grace_ticks: usize = 0;
+        // Muse never reports the live view recovering; without it neither a
+        // settle nor the wake turn can arrive, so the hold must time out.
+        var view_unavailable = false;
+        var separate_next_text = false;
         var cancel_sent = false;
         var agent_message_completed = false;
+        var model_step_done = false;
         var turn_succeeded = false;
         var published_answer = false;
         var turn_started = false;
@@ -400,6 +422,26 @@ pub const Client = struct {
             const raw_line = switch (try pending.await()) {
                 .tick => |result| blk: {
                     try result;
+                    if (awaiting_wake) {
+                        // No turn is running to interrupt; stopping the host
+                        // ends the background workload with it.
+                        if (request.on_should_stop) |should_stop| {
+                            if (should_stop(request.stream_context)) {
+                                turn_succeeded = true;
+                                break;
+                            }
+                        }
+                        if (background_work.count() == 0 or view_unavailable) {
+                            wake_grace_ticks += 1;
+                            if (wake_grace_ticks >= background_wake_grace_ticks) {
+                                turn_succeeded = true;
+                                break;
+                            }
+                        } else {
+                            // The grace runs from the last settle, not the first.
+                            wake_grace_ticks = 0;
+                        }
+                    }
                     try pending.concurrent(.tick, waitForTerminalProbe, .{proc.threaded.io()});
                     // One bounded read-only request at a time. Keep the pending
                     // stdout read intact: canceling it could lose a partial line.
@@ -456,6 +498,7 @@ pub const Client = struct {
                 if (std.mem.eql(u8, acp.getOptionalObjectString(params, "sessionId") orelse "", session_id) and
                     std.mem.eql(u8, acp.getOptionalObjectString(params, "health") orelse "", "unavailable"))
                 {
+                    view_unavailable = true;
                     if (request.on_stream_event) |callback| callback(request.stream_context, .{ .message = .{
                         .title = "Muse updates delayed",
                         .body = "Muse's live updates are unavailable. Checking its saved turn status for completion.",
@@ -463,7 +506,21 @@ pub const Client = struct {
                 }
             } else if (std.mem.eql(u8, method, "turn/started")) {
                 const started_turn_id = acp.getOptionalObjectString(params, "turnId") orelse "";
-                if (!eventBelongsToTurn(turn_id_storage, started_turn_id)) continue;
+                if (!eventBelongsToTurn(turn_id_storage, started_turn_id)) {
+                    if (!awaiting_wake or started_turn_id.len == 0) continue;
+                    // Muse woke the session to deliver background results.
+                    // Follow that turn as the continuation of this send.
+                    const wake_turn_id = try allocator.dupe(u8, started_turn_id);
+                    if (turn_id_storage) |old| allocator.free(old);
+                    turn_id_storage = wake_turn_id;
+                    if (request.on_turn_id) |callback| callback(request.stream_context, wake_turn_id);
+                    awaiting_wake = false;
+                    background_settled = false;
+                    wake_grace_ticks = 0;
+                    agent_message_completed = false;
+                    model_step_done = false;
+                    separate_next_text = reply.items.len > 0;
+                }
                 turn_started = true;
                 emitWorkingEvent(request);
             } else if (std.mem.eql(u8, method, "item/started")) {
@@ -474,16 +531,17 @@ pub const Client = struct {
                         try agent_items.put(allocator, try allocator.dupe(u8, item_id), {});
                     }
                     try noteForegroundWork(allocator, &foreground_work, item, false);
-                    emitItemEvent(request, item);
+                    if (try noteBackgroundWork(allocator, &background_work, item, false)) background_settled = true;
+                    try rememberWorkflowLabels(allocator, &workflow_labels, item);
+                    emitItemEvent(request, item, &workflow_labels);
                 }
             } else if (std.mem.eql(u8, method, "item/delta")) {
                 const item_id = acp.getOptionalObjectString(params, "itemId") orelse "";
                 const field = acp.getOptionalObjectString(params, "field") orelse "text";
                 const delta = acp.getOptionalObjectString(params, "delta") orelse "";
                 if (delta.len > 0 and agent_items.contains(item_id) and isTextField(field)) {
-                    try reply.appendSlice(allocator, delta);
+                    try appendReplyText(allocator, request, &reply, &separate_next_text, delta);
                     if (!streamed_items.contains(item_id)) try streamed_items.put(allocator, try allocator.dupe(u8, item_id), {});
-                    if (request.on_stream_delta) |callback| callback(request.stream_context, delta);
                 }
             } else if (std.mem.eql(u8, method, "item/updated") or std.mem.eql(u8, method, "item/completed")) {
                 if (acp.getObjectField(params, "item")) |item| {
@@ -494,14 +552,15 @@ pub const Client = struct {
                         !streamed_items.contains(item_id))
                     {
                         const text = acp.getOptionalObjectString(item, "text") orelse "";
-                        try reply.appendSlice(allocator, text);
-                        if (request.on_stream_delta) |callback| callback(request.stream_context, text);
+                        if (text.len > 0) try appendReplyText(allocator, request, &reply, &separate_next_text, text);
                     }
                     if (std.mem.eql(u8, method, "item/completed") and std.mem.eql(u8, kind, "agentMessage")) {
                         agent_message_completed = true;
                     }
                     try noteForegroundWork(allocator, &foreground_work, item, std.mem.eql(u8, method, "item/completed"));
-                    emitItemEvent(request, item);
+                    if (try noteBackgroundWork(allocator, &background_work, item, std.mem.eql(u8, method, "item/completed"))) background_settled = true;
+                    try rememberWorkflowLabels(allocator, &workflow_labels, item);
+                    emitItemEvent(request, item, &workflow_labels);
                 }
             } else if (std.mem.eql(u8, method, "approval/requested") or std.mem.eql(u8, method, "approval/updated")) {
                 emitApprovalProgress(request, params);
@@ -510,14 +569,13 @@ pub const Client = struct {
                 emitTodoEvent(request, params);
             } else if (std.mem.eql(u8, method, "session/tokenUsage")) {
                 // Model call finished (after the assistant message). Reminder
-                // children may still run until turn/completed.
-                publishAnswerIfReady(
-                    request,
-                    reply.items,
-                    agent_message_completed or reply.items.len > 0,
-                    foreground_work.count(),
-                    &published_answer,
-                );
+                // children may still run until turn/completed. A step that
+                // ended in tool calls is mid-turn: text before a tool call
+                // (e.g. "launching a workflow") is not the answer.
+                if (!awaiting_wake) model_step_done = !isToolCallsFinish(params);
+            } else if (std.mem.eql(u8, method, "turn/foregroundCompleted")) {
+                const foreground_turn_id = acp.getOptionalObjectString(params, "turnId") orelse "";
+                if (!awaiting_wake and eventBelongsToTurn(turn_id_storage, foreground_turn_id)) model_step_done = true;
             } else if (std.mem.eql(u8, method, "userInput/requested")) {
                 try cancelUserInput(allocator, &proc, params);
                 if (request.on_failure) |callback| callback(request.stream_context, "Muse requested structured user input; continue in a new message.");
@@ -558,16 +616,33 @@ pub const Client = struct {
                     }
                     return error.MuseTurnCancelled;
                 }
+                if (!published_answer and (background_work.count() > 0 or background_settled)) {
+                    awaiting_wake = true;
+                    wake_grace_ticks = 0;
+                    model_step_done = false;
+                    continue;
+                }
                 turn_succeeded = true;
                 break;
             }
 
-            publishAnswerIfReady(request, reply.items, agent_message_completed, foreground_work.count(), &published_answer);
+            publishAnswerIfReady(
+                request,
+                reply.items,
+                model_step_done and (agent_message_completed or reply.items.len > 0),
+                foreground_work.count(),
+                pendingBackgroundWork(awaiting_wake, background_work.count(), background_settled),
+                &published_answer,
+            );
             if (published_answer and !active.draining) active_processes.markDraining(&active);
 
             if (!cancel_sent) {
                 if (request.on_should_stop) |should_stop| {
                     if (should_stop(request.stream_context)) {
+                        if (awaiting_wake) {
+                            turn_succeeded = true;
+                            break;
+                        }
                         const command_id = try uuidV7Alloc(allocator, proc.threaded.io());
                         defer allocator.free(command_id);
                         try proc.writeLine(try makeTurnInterruptRequestAlloc(
@@ -583,7 +658,7 @@ pub const Client = struct {
             }
         }
         if (!turn_succeeded and !published_answer) return error.MuseProtocolFailed;
-        publishAnswerIfReady(request, reply.items, true, 0, &published_answer);
+        publishAnswerIfReady(request, reply.items, true, 0, 0, &published_answer);
         active_processes.unregister(&active);
         proc.stop();
         return .{
@@ -996,10 +1071,11 @@ fn publishAnswerIfReady(
     reply: []const u8,
     agent_output_done: bool,
     foreground_work: usize,
+    background_work: usize,
     published: *bool,
 ) void {
     if (published.*) return;
-    if (!shouldFinishMuseTurn(agent_output_done, foreground_work)) return;
+    if (!shouldFinishMuseTurn(agent_output_done, foreground_work, background_work)) return;
     published.* = true;
     emitTurnFinished(request);
     if (request.on_answer_ready) |callback| callback(request.stream_context, reply);
@@ -1007,9 +1083,41 @@ fn publishAnswerIfReady(
 
 /// Muse keeps the MSP turn open for reminder/memory children after the
 /// assistant message is committed (`eot_gate_ms` ~10–12s). The GUI already
-/// has the answer; do not wait for that housekeeping.
-fn shouldFinishMuseTurn(agent_output_done: bool, foreground_work: usize) bool {
-    return agent_output_done and foreground_work == 0;
+/// has the answer; do not wait for that housekeeping. Background work is
+/// different: its result arrives in a later turn, and publishing would commit
+/// the Verde turn and drop that delivery.
+fn shouldFinishMuseTurn(agent_output_done: bool, foreground_work: usize, background_work: usize) bool {
+    return agent_output_done and foreground_work == 0 and background_work == 0;
+}
+
+/// Counts what still blocks an early publish. A workload that settled during
+/// the turn still owes the wake turn that delivers it.
+fn pendingBackgroundWork(awaiting_wake: bool, open_work: usize, settled: bool) usize {
+    if (awaiting_wake or settled) return @max(open_work, 1);
+    return open_work;
+}
+
+fn isToolCallsFinish(params: std.json.Value) bool {
+    const reason = acp.getOptionalObjectString(params, "finishReason") orelse return false;
+    return std.mem.eql(u8, reason, "tool_calls");
+}
+
+/// Streams answer text, separating a wake turn's answer from the text of the
+/// turn that launched the background work.
+fn appendReplyText(
+    allocator: std.mem.Allocator,
+    request: provider_types.SendPromptRequest,
+    reply: *std.ArrayList(u8),
+    separate: *bool,
+    text: []const u8,
+) !void {
+    if (separate.*) {
+        separate.* = false;
+        try reply.appendSlice(allocator, "\n\n");
+        if (request.on_stream_delta) |callback| callback(request.stream_context, "\n\n");
+    }
+    try reply.appendSlice(allocator, text);
+    if (request.on_stream_delta) |callback| callback(request.stream_context, text);
 }
 
 /// Lifecycle events without our `turn/start` ack belong to a leftover turn
@@ -1062,12 +1170,32 @@ fn isReminderLikeItem(item: std.json.Value) bool {
 }
 
 fn isForegroundWorkItem(item: std.json.Value) bool {
-    if (isReminderLikeItem(item)) return false;
+    if (isReminderLikeItem(item) or isBackgroundedToolItem(item) or isWorkflowChildItem(item)) return false;
     const item_kind = acp.getOptionalObjectString(item, "kind") orelse "";
     return std.mem.eql(u8, item_kind, "toolCall") or
         std.mem.eql(u8, item_kind, "userShell") or
         std.mem.eql(u8, item_kind, "subagent") or
         acp.getOptionalObjectString(item, "tool") != null;
+}
+
+/// A workflow run keeps going after the turn that launched it and always
+/// settles with a delivery. Backgrounded tool tasks (dev servers, watchers)
+/// may never settle, so they do not hold the Verde turn.
+fn isBackgroundWorkItem(item: std.json.Value) bool {
+    return std.mem.eql(u8, acp.getOptionalObjectString(item, "kind") orelse "", "workflow");
+}
+
+fn isBackgroundedToolItem(item: std.json.Value) bool {
+    if (!std.mem.eql(u8, acp.getOptionalObjectString(item, "kind") orelse "", "toolCall")) return false;
+    const background = acp.getObjectField(item, "background") orelse return false;
+    return background == .bool and background.bool;
+}
+
+/// Workflow children are folded into their workflow's row. Their items stay
+/// `inProgress` after the result is ready, so they never settle a turn.
+fn isWorkflowChildItem(item: std.json.Value) bool {
+    const item_kind = acp.getOptionalObjectString(item, "kind") orelse "";
+    return std.mem.eql(u8, item_kind, "subagent") and acp.getOptionalObjectString(item, "workflowRunId") != null;
 }
 
 fn noteForegroundWork(
@@ -1076,10 +1204,10 @@ fn noteForegroundWork(
     item: std.json.Value,
     item_completed: bool,
 ) !void {
-    if (!isForegroundWorkItem(item)) return;
     const id = workItemId(item);
     if (id.len == 0) return;
-    if (item_completed or itemHasTerminalStatus(item)) {
+    // A task backgrounded mid-turn leaves the foreground set.
+    if (item_completed or itemHasTerminalStatus(item) or !isForegroundWorkItem(item)) {
         if (work.fetchRemove(id)) |entry| allocator.free(entry.key);
         return;
     }
@@ -1087,10 +1215,56 @@ fn noteForegroundWork(
     try work.put(allocator, try allocator.dupe(u8, id), {});
 }
 
-fn emitItemEvent(request: provider_types.SendPromptRequest, item: std.json.Value) void {
-    if (isReminderLikeItem(item) or isInterruptedConversationItem(item)) return;
+/// Returns true when a tracked background workload settled.
+fn noteBackgroundWork(
+    allocator: std.mem.Allocator,
+    work: *std.StringHashMapUnmanaged(void),
+    item: std.json.Value,
+    item_completed: bool,
+) !bool {
+    if (!isBackgroundWorkItem(item)) return false;
+    const id = workItemId(item);
+    if (id.len == 0) return false;
+    // A paused run delivers nothing until someone resumes it.
+    if (isPausedItem(item)) {
+        if (work.fetchRemove(id)) |entry| allocator.free(entry.key);
+        return false;
+    }
+    if (item_completed or itemHasTerminalStatus(item)) {
+        const entry = work.fetchRemove(id) orelse return false;
+        allocator.free(entry.key);
+        return true;
+    }
+    if (work.contains(id)) return false;
+    try work.put(allocator, try allocator.dupe(u8, id), {});
+    return false;
+}
+
+/// The `workflow` tool call only admits the run; the `workflow` item that
+/// follows is the row worth showing. A failed launch has no item, so it stays.
+fn isWorkflowLaunchCall(item: std.json.Value) bool {
+    return std.mem.eql(u8, acp.getOptionalObjectString(item, "kind") orelse "", "toolCall") and
+        std.mem.eql(u8, acp.getOptionalObjectString(item, "tool") orelse "", "workflow");
+}
+
+fn isPausedItem(item: std.json.Value) bool {
+    const paused = acp.getObjectField(item, "paused") orelse return false;
+    return paused == .bool and paused.bool;
+}
+
+fn emitItemEvent(
+    request: provider_types.SendPromptRequest,
+    item: std.json.Value,
+    workflow_labels: *const std.StringHashMapUnmanaged([]u8),
+) void {
+    if (isReminderLikeItem(item) or isInterruptedConversationItem(item) or isWorkflowChildItem(item)) return;
     const callback = request.on_stream_event orelse return;
     const item_kind = acp.getOptionalObjectString(item, "kind") orelse "";
+    if (std.mem.eql(u8, item_kind, "workflow")) {
+        emitWorkflowEvent(request, item, workflow_labels);
+        return;
+    }
+    if (isWorkflowLaunchCall(item) and toolStatus(acp.getOptionalObjectString(item, "status") orelse "inProgress") != .failed) return;
     if (std.mem.eql(u8, item_kind, "reasoning")) {
         callback(request.stream_context, .{ .tool_call = .{
             .call_id = acp.getOptionalObjectString(item, "itemId") orelse "muse-reasoning",
@@ -1142,9 +1316,86 @@ fn emitToolEvent(request: provider_types.SendPromptRequest, item: std.json.Value
     } });
 }
 
+/// One row per workflow run, updated in place as Muse re-emits the whole item
+/// on every child change.
+fn emitWorkflowEvent(
+    request: provider_types.SendPromptRequest,
+    item: std.json.Value,
+    workflow_labels: *const std.StringHashMapUnmanaged([]u8),
+) void {
+    const callback = request.on_stream_event orelse return;
+    const status = toolStatus(acp.getOptionalObjectString(item, "status") orelse "inProgress");
+    const summary = acp.getOptionalObjectString(item, "finalSummary");
+    var progress_buffer: [1024]u8 = undefined;
+    callback(request.stream_context, .{ .tool_call = .{
+        .call_id = acp.getOptionalObjectString(item, "itemId") orelse "muse-workflow",
+        .title = "Workflow",
+        .kind = .other,
+        .status = status,
+        .input = acp.getOptionalObjectString(item, "entryId") orelse acp.getOptionalObjectString(item, "fallbackText"),
+        .output = switch (status) {
+            .in_progress => workflowProgressText(&progress_buffer, item, workflow_labels),
+            .failed => null,
+            else => summary,
+        },
+        .error_text = if (status == .failed) summary orelse "Workflow failed" else null,
+    } });
+}
+
+fn workflowProgressText(
+    buffer: []u8,
+    item: std.json.Value,
+    workflow_labels: *const std.StringHashMapUnmanaged([]u8),
+) ?[]const u8 {
+    const children = acp.getObjectField(item, "children") orelse return null;
+    if (children != .array or children.array.items.len == 0) return null;
+    var finished: usize = 0;
+    for (children.array.items) |child| {
+        if (workflowChildFinished(child)) finished += 1;
+    }
+    const paused_suffix: []const u8 = if (isPausedItem(item)) " (paused)" else "";
+    var offset = (std.fmt.bufPrint(buffer, "{d}/{d} agents finished{s}", .{ finished, children.array.items.len, paused_suffix }) catch return null).len;
+    for (children.array.items) |child| {
+        const label = acp.getOptionalObjectString(child, "label") orelse
+            workflow_labels.get(acp.getOptionalObjectString(child, "childId") orelse "") orelse continue;
+        const state = acp.getOptionalObjectString(child, "terminal") orelse acp.getOptionalObjectString(child, "status") orelse continue;
+        const line = std.fmt.bufPrint(buffer[offset..], "\n- {s}: {s}", .{ label, state }) catch break;
+        offset += line.len;
+    }
+    return buffer[0..offset];
+}
+
+fn rememberWorkflowLabels(
+    allocator: std.mem.Allocator,
+    labels: *std.StringHashMapUnmanaged([]u8),
+    item: std.json.Value,
+) !void {
+    if (!std.mem.eql(u8, acp.getOptionalObjectString(item, "kind") orelse "", "workflow")) return;
+    const children = acp.getObjectField(item, "children") orelse return;
+    if (children != .array) return;
+    for (children.array.items) |child| {
+        const child_id = acp.getOptionalObjectString(child, "childId") orelse continue;
+        const label = acp.getOptionalObjectString(child, "label") orelse continue;
+        if (child_id.len == 0 or label.len == 0 or labels.contains(child_id)) continue;
+        const owned_id = try allocator.dupe(u8, child_id);
+        errdefer allocator.free(owned_id);
+        const owned_label = try allocator.dupe(u8, label);
+        errdefer allocator.free(owned_label);
+        try labels.put(allocator, owned_id, owned_label);
+    }
+}
+
+fn workflowChildFinished(child: std.json.Value) bool {
+    if (acp.getOptionalObjectString(child, "terminal") != null) return true;
+    return std.mem.eql(u8, acp.getOptionalObjectString(child, "status") orelse "", "terminal");
+}
+
 fn emitApprovalProgress(request: provider_types.SendPromptRequest, params: std.json.Value) void {
     const callback = request.on_stream_event orelse return;
     const tool = acp.getOptionalObjectString(params, "toolName") orelse "tool";
+    // Keyed by the launch call, which the workflow row replaces; this row
+    // would never receive a terminal update.
+    if (std.mem.eql(u8, tool, "workflow")) return;
     const kind = toolKind(tool);
     const title = if (kind == .execute) "Ran command" else tool;
     callback(request.stream_context, .{ .tool_call = .{
@@ -1558,6 +1809,15 @@ fn makeUserInputCancelRequestAlloc(allocator: std.mem.Allocator, id: i64, comman
     return writer.toOwnedSlice();
 }
 
+fn deinitStringMap(allocator: std.mem.Allocator, map: *std.StringHashMapUnmanaged([]u8)) void {
+    var iterator = map.iterator();
+    while (iterator.next()) |entry| {
+        allocator.free(entry.key_ptr.*);
+        allocator.free(entry.value_ptr.*);
+    }
+    map.deinit(allocator);
+}
+
 fn deinitStringSet(allocator: std.mem.Allocator, set: *std.StringHashMapUnmanaged(void)) void {
     var iterator = set.keyIterator();
     while (iterator.next()) |key| allocator.free(key.*);
@@ -1681,9 +1941,9 @@ test "Muse ignores leftover turn completion before start ack" {
 }
 
 test "Muse GUI turn finishes after the agent message without waiting for EOT gate" {
-    try std.testing.expect(shouldFinishMuseTurn(true, 0));
-    try std.testing.expect(!shouldFinishMuseTurn(true, 1));
-    try std.testing.expect(!shouldFinishMuseTurn(false, 0));
+    try std.testing.expect(shouldFinishMuseTurn(true, 0, 0));
+    try std.testing.expect(!shouldFinishMuseTurn(true, 1, 0));
+    try std.testing.expect(!shouldFinishMuseTurn(false, 0, 0));
 
     var work: std.StringHashMapUnmanaged(void) = .empty;
     defer deinitStringSet(std.testing.allocator, &work);
@@ -1697,7 +1957,7 @@ test "Muse GUI turn finishes after the agent message without waiting for EOT gat
     defer shell.deinit();
     try noteForegroundWork(std.testing.allocator, &work, shell.value, false);
     try std.testing.expectEqual(@as(usize, 1), work.count());
-    try std.testing.expect(!shouldFinishMuseTurn(true, work.count()));
+    try std.testing.expect(!shouldFinishMuseTurn(true, work.count(), 0));
 
     var done = try std.json.parseFromSlice(
         std.json.Value,
@@ -1709,7 +1969,143 @@ test "Muse GUI turn finishes after the agent message without waiting for EOT gat
     defer done.deinit();
     try noteForegroundWork(std.testing.allocator, &work, done.value, true);
     try std.testing.expectEqual(@as(usize, 0), work.count());
-    try std.testing.expect(shouldFinishMuseTurn(true, work.count()));
+    try std.testing.expect(shouldFinishMuseTurn(true, work.count(), 0));
+}
+
+test "Muse keeps the turn open while a workflow runs after its launching turn" {
+    const allocator = std.testing.allocator;
+    var foreground: std.StringHashMapUnmanaged(void) = .empty;
+    defer deinitStringSet(allocator, &foreground);
+    var background: std.StringHashMapUnmanaged(void) = .empty;
+    defer deinitStringSet(allocator, &background);
+
+    // Shapes recorded from `muse serve` 1.4.11 launching a one-agent workflow.
+    var launched = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"itemId":"wf-1","kind":"workflow","status":"inProgress","entryId":"Tiny PONG workflow","fallbackText":"Workflow: Tiny PONG workflow"}
+    , .{});
+    defer launched.deinit();
+    try noteForegroundWork(allocator, &foreground, launched.value, false);
+    try std.testing.expect(!try noteBackgroundWork(allocator, &background, launched.value, false));
+    try std.testing.expectEqual(@as(usize, 0), foreground.count());
+    try std.testing.expectEqual(@as(usize, 1), background.count());
+    try std.testing.expect(!shouldFinishMuseTurn(true, foreground.count(), background.count()));
+
+    // Children stay `inProgress` after their result is ready.
+    var child = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"itemId":"child-1","kind":"subagent","status":"inProgress","controlStatus":"resultReady","workflowRunId":"run-1"}
+    , .{});
+    defer child.deinit();
+    try std.testing.expect(isWorkflowChildItem(child.value));
+    try noteForegroundWork(allocator, &foreground, child.value, false);
+    try std.testing.expectEqual(@as(usize, 0), foreground.count());
+
+    var settled = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"itemId":"wf-1","kind":"workflow","status":"completed","finalSummary":"PONG"}
+    , .{});
+    defer settled.deinit();
+    try std.testing.expect(try noteBackgroundWork(allocator, &background, settled.value, true));
+    try std.testing.expectEqual(@as(usize, 0), background.count());
+    // Settled but undelivered: the wake turn still owes the answer.
+    try std.testing.expectEqual(@as(usize, 1), pendingBackgroundWork(false, background.count(), true));
+    try std.testing.expectEqual(@as(usize, 1), pendingBackgroundWork(true, 0, false));
+    try std.testing.expectEqual(@as(usize, 0), pendingBackgroundWork(false, 0, false));
+}
+
+test "Muse backgrounded tool tasks never hold the turn and paused workflows release it" {
+    const allocator = std.testing.allocator;
+    var foreground: std.StringHashMapUnmanaged(void) = .empty;
+    defer deinitStringSet(allocator, &foreground);
+    var background: std.StringHashMapUnmanaged(void) = .empty;
+    defer deinitStringSet(allocator, &background);
+
+    var running = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"itemId":"task-1","kind":"toolCall","tool":"bash","status":"inProgress"}
+    , .{});
+    defer running.deinit();
+    try noteForegroundWork(allocator, &foreground, running.value, false);
+    try std.testing.expect(!try noteBackgroundWork(allocator, &background, running.value, false));
+    try std.testing.expectEqual(@as(usize, 1), foreground.count());
+    try std.testing.expectEqual(@as(usize, 0), background.count());
+
+    var backgrounded = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"itemId":"task-1","kind":"toolCall","tool":"bash","status":"inProgress","background":true}
+    , .{});
+    defer backgrounded.deinit();
+    try noteForegroundWork(allocator, &foreground, backgrounded.value, false);
+    try std.testing.expect(!try noteBackgroundWork(allocator, &background, backgrounded.value, false));
+    try std.testing.expectEqual(@as(usize, 0), foreground.count());
+    // A backgrounded server may never settle, so it must not hold the turn.
+    try std.testing.expectEqual(@as(usize, 0), background.count());
+
+    var workflow = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"itemId":"wf-1","kind":"workflow","status":"inProgress"}
+    , .{});
+    defer workflow.deinit();
+    _ = try noteBackgroundWork(allocator, &background, workflow.value, false);
+    var paused = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"itemId":"wf-1","kind":"workflow","status":"inProgress","paused":true}
+    , .{});
+    defer paused.deinit();
+    try std.testing.expect(!try noteBackgroundWork(allocator, &background, paused.value, false));
+    try std.testing.expectEqual(@as(usize, 0), background.count());
+}
+
+test "Muse workflow launch call yields to the workflow row" {
+    const allocator = std.testing.allocator;
+    var launch = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"itemId":"call-1","kind":"toolCall","tool":"workflow","status":"completed"}
+    , .{});
+    defer launch.deinit();
+    try std.testing.expect(isWorkflowLaunchCall(launch.value));
+    var shell = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"itemId":"call-2","kind":"toolCall","tool":"bash","status":"completed"}
+    , .{});
+    defer shell.deinit();
+    try std.testing.expect(!isWorkflowLaunchCall(shell.value));
+}
+
+test "Muse text before a tool call is not the answer" {
+    const allocator = std.testing.allocator;
+    var tool_step = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"finishReason":"tool_calls","sessionId":"s"}
+    , .{});
+    defer tool_step.deinit();
+    try std.testing.expect(isToolCallsFinish(tool_step.value));
+    var final_step = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"sessionId":"s"}
+    , .{});
+    defer final_step.deinit();
+    try std.testing.expect(!isToolCallsFinish(final_step.value));
+}
+
+test "Muse workflow row summarizes child progress" {
+    const allocator = std.testing.allocator;
+    var running = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"kind":"workflow","status":"inProgress","children":[{"attempt":1,"childId":"a","status":"terminal","terminal":"completed","label":"Audit verde"},{"attempt":1,"childId":"b","status":"running","label":"Audit cloud"},{"attempt":1,"childId":"c","status":"running"}]}
+    , .{});
+    defer running.deinit();
+    var labels: std.StringHashMapUnmanaged([]u8) = .empty;
+    defer deinitStringMap(allocator, &labels);
+    var buffer: [1024]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "1/3 agents finished\n- Audit verde: completed\n- Audit cloud: running",
+        workflowProgressText(&buffer, running.value, &labels).?,
+    );
+    // A later revision drops the label; the remembered one still names it.
+    var scheduled = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"kind":"workflow","status":"inProgress","children":[{"attempt":1,"childId":"c","status":"scheduled","label":"Audit docs"}]}
+    , .{});
+    defer scheduled.deinit();
+    try rememberWorkflowLabels(allocator, &labels, scheduled.value);
+    try std.testing.expectEqualStrings(
+        "1/3 agents finished\n- Audit verde: completed\n- Audit cloud: running\n- Audit docs: running",
+        workflowProgressText(&buffer, running.value, &labels).?,
+    );
+    var launching = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"kind":"workflow","status":"inProgress","paused":true,"children":[{"attempt":1,"childId":"a","status":"running"}]}
+    , .{});
+    defer launching.deinit();
+    try std.testing.expectEqualStrings("0/1 agents finished (paused)", workflowProgressText(&buffer, launching.value, &labels).?);
 }
 
 test "Muse concurrent sessions retain independent interrupt targets through cleanup" {

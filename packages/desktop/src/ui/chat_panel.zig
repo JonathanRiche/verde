@@ -5310,6 +5310,7 @@ fn isCursorToolSystemEvent(author_raw: []const u8, body_raw: []const u8) bool {
         "Think",
         "Thinking",
         "MCP tool",
+        "Tool",
         "Cursor tool",
         "Subagent",
     };
