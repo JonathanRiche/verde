@@ -54,8 +54,9 @@ pub const usage =
     \\  --resource <name>     Resource to lease (repeatable). Default: inferred
     \\                        from the command (build/test -> build, installs -> deps).
     \\  --workspace <id|path> Verde workspace. Default: $VERDE_WORKSPACE_ID or cwd.
-    \\  --owner <id>          Who is asking (use your Verde thread id); shown to
-    \\                        others. Default: $VERDE_MCP_OWNER or $VERDE_SESSION_ID.
+    \\  --owner <id>          Your Verde thread id. Shown to other agents, and your
+    \\                        chat's sidebar row reads "Waiting · build" / "Building".
+    \\                        Default: $VERDE_MCP_OWNER or $VERDE_SESSION_ID.
     \\  --no-reuse            Always run, even when an identical run can be reused.
     \\  --wait-timeout <sec>  Give up (exit 124) if the resource stays busy this long.
     \\
@@ -319,8 +320,6 @@ pub const Decision = union(enum) {
     join: usize,
     /// An identical run already succeeded on this exact checkout.
     reuse: usize,
-    /// Another wrapper is ahead in line for a shared resource.
-    queued_behind: usize,
     /// Nothing to reuse or wait for locally: try to take the lease.
     acquire,
 };
@@ -341,11 +340,8 @@ pub fn decide(me: Record, others: []const Record, now_ms: i64, reuse: bool, stal
         }
         if (latestReusable(me, others, now_ms)) |index| return .{ .reuse = index };
     }
-    for (others, 0..) |other, index| {
-        if (other.state != .waiting or !recordLive(other, now_ms)) continue;
-        if (!other.sharesResource(me) or !other.ahead(me)) continue;
-        return .{ .queued_behind = index };
-    }
+    // No local queue: a waiter holds nothing, and lining up behind one that
+    // is itself blocked is how waits turned into hour-long cycles.
     return .acquire;
 }
 
@@ -450,6 +446,20 @@ const Live = struct {
         return std.json.parseFromSliceLeaky(std.json.Value, arena, response, .{ .allocate = .alloc_always }) catch null;
     }
 
+    fn daemonCall(self: *Live, arena: std.mem.Allocator, method: []const u8, params: anytype) ?std.json.Value {
+        const response = daemon_client.requestAlloc(arena, self.pref_path, method, params, self.next_id) catch return null;
+        self.next_id += 1;
+        return std.json.parseFromSliceLeaky(std.json.Value, arena, response, .{ .allocate = .alloc_always }) catch null;
+    }
+
+    fn release(self: *Live, arena: std.mem.Allocator, workspace_id: []const u8, owner: []const u8, lease_id: []const u8) void {
+        _ = self.daemonCall(arena, "lease.release", .{
+            .workspace = .{ .workspace_id = workspace_id },
+            .owner = owner,
+            .lease_id = lease_id,
+        });
+    }
+
     fn renew(self: *Live, arena: std.mem.Allocator, workspace_id: []const u8, owner: []const u8, lease_id: []const u8) bool {
         const response = daemon_client.requestAlloc(arena, self.pref_path, "lease.renew", .{
             .workspace = .{ .workspace_id = workspace_id },
@@ -489,27 +499,93 @@ fn intField(object: std.json.Value, name: []const u8) ?i64 {
     return if (value == .integer) value.integer else null;
 }
 
-/// One-line description of what currently holds the resource, for progress
-/// output. Empty when the response lists no conflicts.
-fn holderSummaryAlloc(arena: std.mem.Allocator, result: std.json.Value, now_ms: i64) []const u8 {
+const Acquire = union(enum) { acquired: []const u8, busy: []const u8, failed: []const u8 };
+
+/// Takes the lease straight from the session daemon, which arbitrates real
+/// leases. The app's process view is consulted first only for builds started
+/// outside any lease; other `lease run` wrappers and `pgrep` wait loops are
+/// not builds and never block (counting them deadlocked waiting scripts).
+fn acquire(
+    arena: std.mem.Allocator,
+    live: *Live,
+    workspace_id: []const u8,
+    owner: []const u8,
+    command: []const u8,
+    resources: []const []const u8,
+    now_ms: i64,
+) !Acquire {
+    if (live.call(arena, "workspace.checkCommand", .{
+        .workspace = workspace_id,
+        .command = command,
+        .resources = resources,
+        .owner = owner,
+    })) |check| if (resultObject(check)) |result| {
+        const holders = processHoldersAlloc(arena, result, now_ms);
+        if (holders.len > 0) return .{ .busy = holders };
+    };
+    const response = live.daemonCall(arena, "lease.acquire", .{
+        .workspace = .{ .workspace_id = workspace_id },
+        .owner = owner,
+        .command = command,
+        .resources = resources,
+        .ttl_ms = LEASE_TTL_MS,
+    }) orelse return .{ .busy = "the Verde session daemon is not answering" };
+    if (response != .object) return .{ .failed = "invalid daemon response" };
+    if (response.object.get("error")) |err| {
+        const code = if (err == .object) stringField(err, "code") orelse "" else "";
+        if (std.mem.eql(u8, code, "conflict")) return .{ .busy = daemonHoldersAlloc(arena, err) };
+        return .{ .failed = if (err == .object) stringField(err, "message") orelse "lease.acquire failed" else "lease.acquire failed" };
+    }
+    const result = response.object.get("result") orelse return .{ .failed = "lease.acquire returned no result" };
+    if (result != .object) return .{ .failed = "lease.acquire returned an invalid result" };
+    return .{ .acquired = stringField(result, "lease_id") orelse return .{ .failed = "lease.acquire returned no lease_id" } };
+}
+
+fn isWrapperOrWaitLoop(command: []const u8) bool {
+    return std.mem.indexOf(u8, command, "lease run") != null or std.mem.indexOf(u8, command, "pgrep") != null;
+}
+
+/// Running processes (not leases) that hold the resource, as one line.
+fn processHoldersAlloc(arena: std.mem.Allocator, result: std.json.Value, now_ms: i64) []const u8 {
     const conflicts = result.object.get("conflicts") orelse return "";
-    if (conflicts != .array or conflicts.array.items.len == 0) return "";
+    if (conflicts != .array) return "";
     var text: std.ArrayList(u8) = .empty;
-    for (conflicts.array.items, 0..) |conflict, index| {
+    for (conflicts.array.items) |conflict| {
         if (conflict != .object) continue;
-        if (index > 0) text.appendSlice(arena, "; ") catch break;
-        const owner = stringField(conflict, "owner") orelse "?";
-        const command = stringField(conflict, "command") orelse "?";
-        const resource = stringField(conflict, "resource") orelse "?";
-        const kind = stringField(conflict, "kind") orelse "lease";
-        text.print(arena, "{s} `{s}` held by {s} ({s})", .{ resource, command, owner, kind }) catch break;
-        // Whole minutes only: the line is reprinted only when it changes.
-        const started = intField(conflict, "started_at_ms") orelse 0;
-        if (started > 0 and now_ms - started >= std.time.ms_per_min) {
-            text.print(arena, ", running {d}+ min", .{@divTrunc(now_ms - started, std.time.ms_per_min)}) catch break;
-        }
+        const kind = stringField(conflict, "kind") orelse "";
+        if (std.mem.eql(u8, kind, "lease")) continue; // the daemon arbitrates leases
+        const command = stringField(conflict, "command") orelse "";
+        if (isWrapperOrWaitLoop(command)) continue;
+        if (text.items.len > 0) text.appendSlice(arena, "; ") catch break;
+        appendHolder(arena, &text, conflict, now_ms);
     }
     return text.items;
+}
+
+fn daemonHoldersAlloc(arena: std.mem.Allocator, err: std.json.Value) []const u8 {
+    const data = err.object.get("data") orelse return "another lease";
+    var text: std.ArrayList(u8) = .empty;
+    const conflicts = if (data == .object) data.object.get("conflicts") orelse return "another lease" else return "another lease";
+    if (conflicts != .array) return "another lease";
+    for (conflicts.array.items) |conflict| {
+        if (conflict != .object) continue;
+        if (text.items.len > 0) text.appendSlice(arena, "; ") catch break;
+        text.print(arena, "`{s}` held by {s} (lease)", .{ stringField(conflict, "command") orelse "?", stringField(conflict, "owner") orelse "?" }) catch break;
+    }
+    return if (text.items.len > 0) text.items else "another lease";
+}
+
+fn appendHolder(arena: std.mem.Allocator, text: *std.ArrayList(u8), conflict: std.json.Value, now_ms: i64) void {
+    const owner = stringField(conflict, "owner") orelse "?";
+    const command = stringField(conflict, "command") orelse "?";
+    const resource = stringField(conflict, "resource") orelse "?";
+    const source = stringField(conflict, "source") orelse "process";
+    text.print(arena, "{s} `{s}` run by {s} ({s}, not leased)", .{ resource, command[0..@min(command.len, 120)], owner, source }) catch return;
+    // Whole minutes only: the line is reprinted only when it changes.
+    const started = intField(conflict, "started_at_ms") orelse 0;
+    if (started > 0 and now_ms - started >= std.time.ms_per_min) {
+        text.print(arena, ", running {d}+ min", .{@divTrunc(now_ms - started, std.time.ms_per_min)}) catch return;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -545,6 +621,9 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, out: output.Output, rest: [
     // Unique per run: a shared owner would let a second wrapper "renew" the
     // first one's lease and run alongside it.
     const owner_label = options.owner orelse getenv("VERDE_MCP_OWNER") orelse getenv("VERDE_SESSION_ID");
+    if (owner_label == null) {
+        try out.stderr("verde lease: tip: pass --owner <your Verde thread id> so your chat shows \"Waiting · build\" in the sidebar.\n", .{});
+    }
     const owner = if (owner_label) |label|
         try std.fmt.allocPrint(arena, "{s}#lease-run:{s}", .{ label, run_id })
     else
@@ -610,12 +689,14 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, out: output.Output, rest: [
 
     var reporter: Reporter = .{ .out = out };
     var last_heartbeat_ms = queued_ms;
+    installStopHandlers();
 
     while (true) {
         var tick_arena: std.heap.ArenaAllocator = .init(allocator);
         defer tick_arena.deinit();
         const tick = tick_arena.allocator();
         const now_ms = platform_runtime.unixTimestampMs();
+        if (stopSignal()) |code| return code;
 
         if (options.wait_timeout_ms) |limit| {
             if (now_ms - queued_ms > limit) {
@@ -641,7 +722,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, out: output.Output, rest: [
         switch (decision) {
             .join => |index| {
                 switch (try followRun(allocator, io, out, runs, others[index], &me, cwd)) {
-                    .reused => |code| return code,
+                    .reused, .stopped => |code| return code,
                     .rerun => {},
                 }
                 continue;
@@ -655,42 +736,27 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, out: output.Output, rest: [
                 try printLogTail(tick, io, out, runs, other.run_id, 40);
                 return 0;
             },
-            .queued_behind => |index| {
-                try reporter.queued(tick, others[index], now_ms);
-                platform_runtime.sleepMillis(WAIT_TICK_MS);
-                continue;
-            },
             .acquire => {},
         }
 
-        const response = live.call(tick, "workspace.acquireLease", .{
-            .workspace = workspace_id,
-            .command = command,
-            .resources = resources,
-            .owner = owner,
-            .ttl_ms = LEASE_TTL_MS,
-        }) orelse {
-            try reporter.unreachable_app();
-            platform_runtime.sleepMillis(WAIT_TICK_MS);
-            continue;
+        const lease_id = switch (try acquire(tick, &live, workspace_id, owner, command, resources, now_ms)) {
+            .acquired => |id| try arena.dupe(u8, id),
+            .busy => |holders| {
+                try reporter.busy(holders);
+                platform_runtime.sleepMillis(WAIT_TICK_MS);
+                continue;
+            },
+            .failed => |message| {
+                try out.stderr("verde lease: {s}\n", .{message});
+                return 2;
+            },
         };
-        const result = resultObject(response) orelse {
-            try out.stderr("verde lease: {s}\n", .{errorMessage(response)});
-            return 2;
-        };
-        const acquired = if (result.object.get("acquired")) |value| value == .bool and value.bool else false;
-        if (!acquired) {
-            try reporter.busy(holderSummaryAlloc(tick, result, now_ms));
-            platform_runtime.sleepMillis(WAIT_TICK_MS);
-            continue;
-        }
-        const lease_id = try arena.dupe(u8, stringField(result, "lease_id") orelse "");
         keep_record = true;
         return runLeased(allocator, io, out, runs, &live, &me, lease_id, cwd, options.argv, now_ms - queued_ms);
     }
 }
 
-const FollowOutcome = union(enum) { reused: u8, rerun };
+const FollowOutcome = union(enum) { reused: u8, stopped: u8, rerun };
 
 /// Streams an identical run's log until it finishes, then reuses its exit
 /// status when our checkout still matches the one it ran on.
@@ -714,6 +780,7 @@ fn followRun(allocator: std.mem.Allocator, io: std.Io, out: output.Output, runs:
         var tick_arena: std.heap.ArenaAllocator = .init(allocator);
         defer tick_arena.deinit();
         const tick = tick_arena.allocator();
+        if (stopSignal()) |code| return .{ .stopped = code };
         offset = streamLog(io, out, log_path, offset);
         const now_ms = platform_runtime.unixTimestampMs();
         me.heartbeat_ms = now_ms;
@@ -738,9 +805,9 @@ fn followRun(allocator: std.mem.Allocator, io: std.Io, out: output.Output, runs:
             return .{ .reused = code };
         }
         const changed = try changedPathsAlloc(tick, current.inputs, now_inputs);
-        try out.stderr("\nverde lease: {s}'s run of `{s}` finished (exit {d}), but sources changed after it started, so its result may not include them:\n", .{ target_owner, me.command, code });
+        try out.stderr("\nverde lease: {s}'s identical run finished (exit {d}). {d} file(s) changed after it started:\n", .{ target_owner, code, changed.len });
         try printChanged(out, current.inputs, now_inputs, changed);
-        try out.stderr("verde lease: running it again with the current sources.\n", .{});
+        try out.stderr("verde lease: running it once more to cover them. Unchanged parts come from the build cache, so this is usually quick; no need to run it again yourself.\n", .{});
         return .rerun;
     }
 }
@@ -781,7 +848,10 @@ fn runLeased(
     const exit_code: u8 = spawn: {
         waiter.child = std.process.spawn(io, .{
             .argv = child_argv,
-            .stdin = .inherit,
+            // Own process group so a stop reaches grandchildren (mise -> bash
+            // -> zig). Not the terminal's foreground group, so no stdin.
+            .pgid = if (builtin.os.tag == .windows) null else 0,
+            .stdin = .ignore,
             .stdout = .{ .file = log_file },
             .stderr = .{ .file = log_file },
         }) catch |err| {
@@ -792,7 +862,14 @@ fn runLeased(
         var offset: u64 = 0;
         var last_renew_ms = started_ms;
         var last_heartbeat_ms = started_ms;
+        var forwarded_stop = false;
         while (!waiter.done.load(.acquire)) {
+            // Killed (timeout, Ctrl-C, agent stopped): stop the command too, so
+            // the lease is released now instead of lapsing after the TTL.
+            if (!forwarded_stop and stopSignal() != null) {
+                forwarded_stop = true;
+                if (builtin.os.tag != .windows) if (waiter.child.id) |child_pid| std.posix.kill(-child_pid, .TERM) catch {};
+            }
             offset = streamLog(io, out, log_path, offset);
             const now_ms = platform_runtime.unixTimestampMs();
             if (now_ms - last_renew_ms >= RENEW_INTERVAL_MS) {
@@ -817,11 +894,7 @@ fn runLeased(
 
     var release_arena: std.heap.ArenaAllocator = .init(allocator);
     defer release_arena.deinit();
-    _ = live.call(release_arena.allocator(), "workspace.releaseLease", .{
-        .workspace = me.workspace_id,
-        .owner = me.owner,
-        .lease_id = lease_id,
-    });
+    live.release(release_arena.allocator(), me.workspace_id, me.owner, lease_id);
 
     const end_inputs = readInputs(release_arena.allocator(), io, cwd);
     const changed = try changedPathsAlloc(release_arena.allocator(), me.inputs, end_inputs);
@@ -834,11 +907,36 @@ fn runLeased(
     runs.write(allocator, io, me.*) catch {};
 
     if (me.changed_during_run) {
-        try out.stderr("verde lease: sources changed while `{s}` ran, so this result may not include them:\n", .{me.command});
+        try out.stderr("verde lease: {d} file(s) changed while `{s}` ran (yours or another agent's), so this result may not include them:\n", .{ changed.len, me.command });
         try printChanged(out, me.inputs, end_inputs, changed);
-        try out.stderr("verde lease: rerun it if those changes matter.\n", .{});
+        try out.stderr("verde lease: rerun only if those files matter to what you are checking; a rerun reuses the build cache and is usually quick.\n", .{});
     }
     return exit_code;
+}
+
+var stop_signal: std.atomic.Value(u8) = .init(0);
+
+fn handleStopSignal(signal: std.posix.SIG) callconv(.c) void {
+    // Async-signal-safe: one atomic store.
+    stop_signal.store(@truncate(@intFromEnum(signal)), .release);
+}
+
+fn installStopHandlers() void {
+    if (builtin.os.tag == .windows) return;
+    const action: std.posix.Sigaction = .{
+        .handler = .{ .handler = handleStopSignal },
+        .mask = std.posix.sigemptyset(),
+        .flags = std.posix.SA.RESTART,
+    };
+    std.posix.sigaction(.INT, &action, null);
+    std.posix.sigaction(.TERM, &action, null);
+    std.posix.sigaction(.HUP, &action, null);
+}
+
+/// Exit status for a pending stop signal (128 + signal), if any.
+fn stopSignal() ?u8 {
+    const signal = stop_signal.load(.acquire);
+    return if (signal == 0) null else 128 +% signal;
 }
 
 const ChildWaiter = struct {
@@ -939,12 +1037,6 @@ const Reporter = struct {
         try self.report(line);
     }
 
-    fn queued(self: *Reporter, arena: std.mem.Allocator, ahead: Record, now_ms: i64) !void {
-        _ = now_ms;
-        const line = try std.fmt.allocPrint(arena, "queued behind {s} (`{s}`), which asked first.", .{ ahead.owner, ahead.command });
-        try self.report(line);
-    }
-
     fn unreachable_app(self: *Reporter) !void {
         try self.report("Verde is not answering; retrying.");
     }
@@ -956,17 +1048,17 @@ const Reporter = struct {
         @memcpy(self.stale_reported[0..len], other.run_id[0..len]);
         self.stale_len = len;
         const age_ms = now_ms - (if (other.started_ms > 0) other.started_ms else other.queued_ms);
+        const changed = try changedPathsAlloc(arena, other.inputs, me.inputs);
         if (!other.inputs.known or !me.inputs.known) {
             try self.out.stderr("verde lease: identical `{s}` is in progress ({s}), but this is not a git checkout, so changes cannot be compared; will run again after it.\n", .{ me.command, other.owner });
             return;
         }
         try self.out.stderr(
-            "verde lease: identical `{s}` is in progress ({s}, {d}s), but these sources changed since it started, so it would not include them:\n",
-            .{ me.command, other.owner, @divTrunc(age_ms, 1000) },
+            "verde lease: identical `{s}` is already running ({s}, {d}s in). {d} file(s) changed after it started:\n",
+            .{ me.command, other.owner, @divTrunc(age_ms, 1000), changed.len },
         );
-        const changed = try changedPathsAlloc(arena, other.inputs, me.inputs);
         try printChanged(self.out, other.inputs, me.inputs, changed);
-        try self.out.stderr("verde lease: will run again with these changes once it finishes.\n", .{});
+        try self.out.stderr("verde lease: will run once more right after it to cover them. Unchanged parts come from the build cache, so this is usually quick.\n", .{});
     }
 };
 

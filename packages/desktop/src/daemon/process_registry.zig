@@ -470,9 +470,10 @@ pub const CommandClass = enum {
 /// Conservatively classifies commands whose shared output is well-known.
 /// Unknown commands remain concurrent unless callers declare resources.
 pub fn classifyWorkspaceCommand(command: []const u8) CommandClass {
-    // `verde lease run` holds its own lease only while the command runs, so
-    // the wrapper process itself (also while it waits) claims nothing.
-    if (isLeaseRunCommand(command)) return .other;
+    // `verde lease run` (often `$V lease run` in a script) holds its own lease
+    // only while its command runs, and `pgrep` wait loops build nothing.
+    // Counting either as a build made waiting scripts block each other.
+    if (isLeaseRunCommand(command) or commandHasAnyToken(command, &.{"pgrep"})) return .other;
     if (commandHasAnyToken(command, &.{ "migrate", "migration", "migrations" })) return .migration;
     if (isPackageInstallCommand(command)) return .package_install;
     if (commandHasAnyToken(command, &.{ "fmt", "format", "formatter", "prettier", "gofmt", "rustfmt" })) return .formatter;
@@ -493,12 +494,11 @@ pub fn inferredWorkspaceResource(command: []const u8) ?[]const u8 {
 }
 
 fn isLeaseRunCommand(command: []const u8) bool {
-    var tokens = std.mem.tokenizeAny(u8, command, " \t\r\n'\"");
-    var previous: [2][]const u8 = .{ "", "" };
+    var tokens = std.mem.tokenizeAny(u8, command, " \t\r\n'\";&|(){}");
+    var previous: []const u8 = "";
     while (tokens.next()) |token| {
-        if (std.mem.eql(u8, token, "run") and std.mem.eql(u8, previous[1], "lease") and
-            std.mem.eql(u8, std.fs.path.basename(previous[0]), "verde")) return true;
-        previous = .{ previous[1], token };
+        if (std.mem.eql(u8, token, "run") and std.mem.eql(u8, previous, "lease")) return true;
+        previous = token;
     }
     return false;
 }

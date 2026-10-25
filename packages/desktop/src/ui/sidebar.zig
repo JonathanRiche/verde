@@ -16,6 +16,7 @@ const utils = @import("../utils.zig");
 const profiler = @import("../runtime/profiler.zig");
 const platform_runtime = @import("platform_runtime");
 const native_state = @import("../state.zig");
+const lease_run_status = @import("../state/lease_run_status.zig");
 const Provider = native_state.Provider;
 const SurfaceProvider = native_state.SurfaceProvider;
 
@@ -2018,6 +2019,8 @@ fn renderOpenPaneRow(
     // Unix ms when the pane's live work began, when known; drives the elapsed
     // portion of the status label.
     var status_started_at_ms: ?i64 = null;
+    // A `verde lease run` command of this chat waiting for or holding a lease.
+    var lease_status: ?lease_run_status.Status = null;
     switch (pane.ref) {
         .chat => |ref| {
             if (ref.thread_index < project.threads.items.len) {
@@ -2027,7 +2030,10 @@ fn renderOpenPaneRow(
                 title = thread.title;
                 status = chatSurfaceStatusForUi(thread);
                 running = status.? == .working;
-                if (running) status_started_at_ms = thread.sendStartedAtMsForUi();
+                if (running) {
+                    status_started_at_ms = thread.sendStartedAtMsForUi();
+                    lease_status = lease_run_status.forThread(state.storage.pref_path, thread.local_thread_id);
+                }
             } else {
                 if (intersectRects(.{ .x = icon_x, .y = cy - theme.scaledUi(8.0), .w = theme.scaledUi(12.0), .h = theme.scaledUi(16.0) }, clip) != null)
                     queuePaletteChatBubbleIcon(state, icon_x, cy, muted);
@@ -2117,7 +2123,10 @@ fn renderOpenPaneRow(
     // Status label computed before truncation so the title only surrenders
     // width while a label is actually present.
     var status_buf: [24]u8 = undefined;
-    const status_label = if (compact_tile) "" else paneStatusLabelText(&status_buf, status, running, status_started_at_ms);
+    var lease_buf: [32]u8 = undefined;
+    // "Waiting · build" / "Building" while a leased command of this chat waits or runs.
+    const lease_label = if (compact_tile) "" else if (lease_status) |lease| lease_run_status.label(&lease_buf, lease) else "";
+    const status_label = if (compact_tile) "" else if (lease_label.len > 0) lease_label else paneStatusLabelText(&status_buf, status, running, status_started_at_ms);
     var shortcut_buf: [16]u8 = undefined;
     const shortcut_label = if (state.ctrl_shortcut_hints_visible and shortcut_index != null and active_shortcut and state.shift_shortcut_hints_visible)
         if (state.command_controller.keyboard_config) |config|
