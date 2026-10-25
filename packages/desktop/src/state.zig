@@ -14414,6 +14414,68 @@ pub const AppState = struct {
         self.afterCompanionRosterChange();
     }
 
+    /// Closes the current conversation: it leaves the companion (archived
+    /// like any chat, so it is recoverable) and the newest remembered
+    /// conversation becomes current, or a fresh one starts next message.
+    pub fn closeCompanionConversation(self: *AppState) void {
+        const index = self.companion_roster.active_index;
+        const companion = self.companion_roster.activeConst() orelse return;
+        if (companion.thread_id.isEmpty()) return;
+        if (self.activeCompanionThread()) |thread| {
+            if (thread.isSendPendingForUi()) {
+                self.companion_controller.ui_error = "Wait for the current turn to finish first.";
+                return;
+            }
+        }
+        var workspace_buffer: [160]u8 = undefined;
+        var thread_buffer: [160]u8 = undefined;
+        const workspace_id = copyInto(&workspace_buffer, companion.home_workspace_id.slice()) orelse return;
+        const thread_id = copyInto(&thread_buffer, companion.thread_id.slice()) orelse return;
+        if (self.projectIndexByWorkspaceId(workspace_id)) |project_index| {
+            const project = &self.project_controller.projects.items[project_index];
+            if (project.companion_thread_local_id) |primary| {
+                if (std.mem.eql(u8, primary, thread_id)) {
+                    self.allocator.free(primary);
+                    project.companion_thread_local_id = null;
+                }
+            }
+        }
+        _ = self.companion_roster.closeCurrentConversation(index);
+        self.afterCompanionRosterChange();
+        self.archiveReleasedCompanionThread(workspace_id, thread_id);
+    }
+
+    /// Closes a remembered conversation: forgotten by the companion and
+    /// archived like any chat.
+    pub fn closeCompanionPastConversation(self: *AppState, history_index: usize) void {
+        const index = self.companion_roster.active_index;
+        const companion = self.companion_roster.activeConst() orelse return;
+        const pasts = companion.pastConversations();
+        if (history_index >= pasts.len) return;
+        var workspace_buffer: [160]u8 = undefined;
+        var thread_buffer: [160]u8 = undefined;
+        const workspace_id = copyInto(&workspace_buffer, companion.home_workspace_id.slice()) orelse return;
+        const thread_id = copyInto(&thread_buffer, pasts[history_index].thread_id.slice()) orelse return;
+        _ = self.companion_roster.forgetConversation(index, thread_id);
+        self.afterCompanionRosterChange();
+        self.archiveReleasedCompanionThread(workspace_id, thread_id);
+    }
+
+    /// Archives a thread the companion just let go of. Once no companion
+    /// owns it, it would otherwise surface as an ordinary chat.
+    fn archiveReleasedCompanionThread(self: *AppState, workspace_id: []const u8, thread_id: []const u8) void {
+        if (self.companionRosterOwnsThread(workspace_id, thread_id)) return;
+        const resolved = self.projectThreadIndexByLocalId(workspace_id, thread_id) orelse return;
+        self.archiveThreadAtIndex(resolved.project_index, resolved.thread_index);
+        self.markDirty();
+    }
+
+    fn copyInto(buffer: []u8, value: []const u8) ?[]const u8 {
+        if (value.len == 0 or value.len > buffer.len) return null;
+        @memcpy(buffer[0..value.len], value);
+        return buffer[0..value.len];
+    }
+
     /// Returns to a remembered conversation.
     pub fn resumeCompanionConversation(self: *AppState, history_index: usize) void {
         const index = self.companion_roster.active_index;

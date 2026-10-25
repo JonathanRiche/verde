@@ -227,6 +227,8 @@ pub fn handleMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, d
             .recap => state.sendCompanionRecap(),
             .menu_remove => state.removeActiveCompanion(),
             .menu_new_conversation => state.startNewCompanionConversation(),
+            .menu_close_current_conversation => state.closeCompanionConversation(),
+            .menu_close_conversation => state.closeCompanionPastConversation(result.index),
             .menu_resume_conversation => state.resumeCompanionConversation(result.index),
             .menu_character => if (characterAt(result.index)) |character| state.setActiveCompanionCharacter(character),
             .brain_provider => state.selectCompanionBrainProvider(result.index),
@@ -2571,7 +2573,11 @@ const CompanionMenuLayout = struct {
     new_companion: palette.Rect,
     remove: palette.Rect,
     new_conversation: palette.Rect,
+    /// "Close this conversation"; zero-sized when there is no current one.
+    close_current: palette.Rect,
     conversations: [controller.MAX_CONVERSATION_ROWS]palette.Rect,
+    /// The × on each remembered conversation row.
+    conversation_close: [controller.MAX_CONVERSATION_ROWS]palette.Rect,
     conversation_count: usize,
 };
 
@@ -2609,9 +2615,18 @@ fn companionMenuLayout(state: *runtime.AppState, geometry: Geometry) CompanionMe
     y += 6.0 * s;
     layout.new_conversation = .{ .x = x + 6.0 * s, .y = y, .w = menu_w - 12.0 * s, .h = MENU_ACTION_HEIGHT * s };
     y += MENU_ACTION_HEIGHT * s;
+    if (companion.presentation.has_thread) {
+        layout.close_current = .{ .x = x + 6.0 * s, .y = y, .w = menu_w - 12.0 * s, .h = MENU_ACTION_HEIGHT * s };
+        y += MENU_ACTION_HEIGHT * s;
+    } else {
+        layout.close_current = .{};
+    }
     layout.conversation_count = companion.conversation_row_count;
+    const close_size = 24.0 * s;
     for (0..layout.conversation_count) |index| {
-        layout.conversations[index] = .{ .x = x + 6.0 * s, .y = y, .w = menu_w - 12.0 * s, .h = MENU_ROW_HEIGHT * s };
+        const row: palette.Rect = .{ .x = x + 6.0 * s, .y = y, .w = menu_w - 12.0 * s, .h = MENU_ROW_HEIGHT * s };
+        layout.conversations[index] = row;
+        layout.conversation_close[index] = .{ .x = row.x + row.w - close_size - 6.0 * s, .y = row.y + (row.h - close_size) * 0.5, .w = close_size, .h = close_size };
         y += MENU_ROW_HEIGHT * s;
     }
     const menu_top = geometry.header.y + geometry.header.h - 4.0 * s;
@@ -2632,6 +2647,9 @@ fn registerCompanionMenuHits(state: *runtime.AppState, geometry: Geometry) void 
     companion.addHit(layout.remove, .menu_remove);
     companion.addHit(layout.new_conversation, .menu_new_conversation);
     for (layout.conversations[0..layout.conversation_count], 0..) |rect, index| companion.addIndexedHit(rect, .menu_resume_conversation, index);
+    companion.addHit(layout.close_current, .menu_close_current_conversation);
+    // Registered after the rows so the × wins over resuming the row.
+    for (layout.conversation_close[0..layout.conversation_count], 0..) |rect, index| companion.addIndexedHit(rect, .menu_close_conversation, index);
 }
 
 fn renderMenuSurface(state: *runtime.AppState, rect: palette.Rect) void {
@@ -2688,11 +2706,19 @@ fn renderCompanionMenu(state: *runtime.AppState, geometry: Geometry) void {
     renderMenuAction(state, layout.remove, framePrint(state, "Remove {s}", .{companion.identity.name.slice()}), true);
     queueRect(state, .{ .x = layout.menu.x + 10.0 * s, .y = layout.new_conversation.y - 4.0 * s, .w = layout.menu.w - 20.0 * s, .h = 1.0 * s }, color(hairline()));
     renderMenuAction(state, layout.new_conversation, "✎ New conversation", false);
+    if (layout.close_current.w > 0.0) renderMenuAction(state, layout.close_current, "✕ Close this conversation", true);
     for (companion.conversation_rows[0..layout.conversation_count], 0..) |*row, index| {
         const rect = layout.conversations[index];
-        const text_w = @max(rect.w - 20.0 * s, 0.0);
+        const close = layout.conversation_close[index];
+        queueCenteredText(state, close, "×", color(chrome.text_subtle), 14.0 * s, .ui_bold, rect);
+        const text_w = @max(rect.w - 20.0 * s - close.w, 0.0);
         queueText(state, .{ .x = rect.x + 10.0 * s, .y = rect.y + 4.0 * s, .w = text_w, .h = 17.0 * s }, truncatedText(state, .ui, 12.0 * s, text_w, row.title.slice()), color(chrome.text_muted), 12.0 * s, rect);
         queueText(state, .{ .x = rect.x + 10.0 * s, .y = rect.y + 21.0 * s, .w = text_w, .h = 15.0 * s }, truncatedText(state, .ui, 10.5 * s, text_w, row.detail.slice()), color(chrome.text_subtle), 10.5 * s, rect);
+    }
+    const mouse_x = state.transcript_controller.palette_mouse_x;
+    const mouse_y = state.transcript_controller.palette_mouse_y;
+    for (layout.conversation_close[0..layout.conversation_count]) |close| {
+        if (pointInRect(close, mouse_x, mouse_y)) renderTooltip(state, geometry.window, close, "Close conversation");
     }
 }
 
@@ -4926,4 +4952,33 @@ test "companion conversation wraps once and re-wraps only when text, width, or s
     state.palette_overlay_batch.clear();
     render(&state, 1360.0, 860.0);
     try std.testing.expectEqual(misses + 5, companion.wrap_cache_misses);
+}
+
+test "companion menu closes the current or a remembered conversation" {
+    const allocator = std.testing.allocator;
+    theme.applyTheme(1.0);
+    var state: runtime.AppState = undefined;
+    try testState(allocator, &state);
+    defer deinitTestState(allocator, &state);
+    state.companion_controller.show();
+    state.companion_controller.settleTransition();
+    var frame: controller.Frame = .{ .has_thread = true };
+    _ = frame.setOwner("companion-ui", "chat-1");
+    state.companion_controller.setFrame(frame);
+    state.companion_controller.conversation_row_count = 2;
+    state.companion_controller.conversation_rows[0].title.set("ACP review");
+    state.companion_controller.conversation_rows[1].title.set("Muse rollout");
+    state.companion_controller.openMenu(.companions);
+    const geometry = computeGeometry(&state, 1360.0, 860.0);
+    registerHits(&state, geometry);
+    const layout = companionMenuLayout(&state, geometry);
+    try std.testing.expect(layout.close_current.w > 0.0);
+    try std.testing.expectEqual(controller.HitAction.menu_close_current_conversation, state.companion_controller.hitAt(layout.close_current.x + 4.0, layout.close_current.y + 4.0).?);
+    const close = layout.conversation_close[1];
+    const hit = state.companion_controller.hitEntryAt(close.x + close.w * 0.5, close.y + close.h * 0.5).?;
+    try std.testing.expectEqual(controller.HitAction.menu_close_conversation, hit.action);
+    try std.testing.expectEqual(@as(usize, 1), hit.index);
+    // The rest of the row still resumes it.
+    try std.testing.expectEqual(controller.HitAction.menu_resume_conversation, state.companion_controller.hitAt(layout.conversations[1].x + 4.0, layout.conversations[1].y + 4.0).?);
+    try std.testing.expect(rectInside(close, layout.conversations[1]));
 }

@@ -62,6 +62,10 @@ pub const HitAction = enum {
     menu_new_companion,
     menu_new_conversation,
     menu_resume_conversation,
+    /// Closes the current conversation (returns to the newest remembered one).
+    menu_close_current_conversation,
+    /// Closes a remembered conversation (index into conversation_rows).
+    menu_close_conversation,
     menu_rename,
     menu_orders,
     menu_remove,

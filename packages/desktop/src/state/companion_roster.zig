@@ -258,6 +258,39 @@ pub fn startNewConversation(self: *Self, index: usize, title: []const u8, now_ms
     return true;
 }
 
+/// Forgets a remembered conversation the user closed. True when removed.
+pub fn forgetConversation(self: *Self, index: usize, thread_id: []const u8) bool {
+    if (index >= self.count) return false;
+    const entry = &self.entries[index];
+    for (entry.pastConversations(), 0..) |*past, position| {
+        if (!past.thread_id.eql(thread_id)) continue;
+        entry.removeHistoryAt(position);
+        self.dirty = true;
+        return true;
+    }
+    return false;
+}
+
+/// Closes the current conversation without remembering it; the newest
+/// remembered conversation (if any) becomes current, brain included.
+pub fn closeCurrentConversation(self: *Self, index: usize) bool {
+    if (index >= self.count) return false;
+    const entry = &self.entries[index];
+    if (entry.thread_id.isEmpty()) return false;
+    entry.thread_id.set("");
+    if (entry.history_count > 0) {
+        const resumed = entry.history[0];
+        entry.removeHistoryAt(0);
+        entry.thread_id.set(resumed.thread_id.slice());
+        if (!resumed.provider.isEmpty()) {
+            entry.provider.set(resumed.provider.slice());
+            entry.model.set(resumed.model.slice());
+        }
+    }
+    self.dirty = true;
+    return true;
+}
+
 /// Makes a remembered conversation current again; the conversation it
 /// replaces moves into history. Brain follows the resumed conversation.
 pub fn resumeConversation(self: *Self, index: usize, thread_id: []const u8, current_title: []const u8, now_ms: i64) bool {
@@ -531,4 +564,29 @@ test "legacy roster file migrates and a missing file reports absent" {
     var restored = Self.init();
     try std.testing.expect(restored.loadLegacyFile(allocator, dir_path));
     try std.testing.expectEqualStrings("Fern", restored.active().?.name.slice());
+}
+
+test "closing conversations forgets them and resumes the newest remembered one" {
+    var roster = Self.init();
+    _ = roster.add(.moss, null, 1).?;
+    const index: usize = 0;
+    roster.entries[index].home_workspace_id.set("ws");
+    roster.entries[index].thread_id.set("t1");
+    roster.entries[index].provider.set("claude");
+    try std.testing.expect(roster.startNewConversation(index, "First", 2));
+    roster.entries[index].thread_id.set("t2");
+    roster.entries[index].provider.set("codex");
+    try std.testing.expect(roster.startNewConversation(index, "Second", 3));
+    roster.entries[index].thread_id.set("t3");
+    // History is newest first: t2, t1.
+    try std.testing.expect(roster.forgetConversation(index, "t1"));
+    try std.testing.expect(!roster.forgetConversation(index, "t1"));
+    try std.testing.expectEqual(@as(usize, 1), roster.entries[index].pastConversations().len);
+    try std.testing.expect(roster.closeCurrentConversation(index));
+    try std.testing.expectEqualStrings("t2", roster.entries[index].thread_id.slice());
+    try std.testing.expectEqualStrings("codex", roster.entries[index].provider.slice());
+    try std.testing.expectEqual(@as(usize, 0), roster.entries[index].pastConversations().len);
+    try std.testing.expect(roster.closeCurrentConversation(index));
+    try std.testing.expect(roster.entries[index].thread_id.isEmpty());
+    try std.testing.expect(!roster.closeCurrentConversation(index));
 }
