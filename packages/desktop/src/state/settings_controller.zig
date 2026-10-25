@@ -185,7 +185,7 @@ pub const Draft = struct {
     new_chat_provider: app_config.ChatProvider = .codex,
     /// Indexed by `app_config.ChatProvider`, like `AppConfig.disabled_providers`.
     disabled_providers: [std.meta.fields(app_config.ChatProvider).len]bool = @splat(false),
-    new_chat_reasoning: app_config.ChatReasoning = .medium,
+    new_chat_reasoning: app_config.ChatReasoning = .provider_default,
     new_chat_pane_behavior: app_config.NewChatPaneBehavior = .new_pane,
     check_for_updates_automatically: bool = true,
     notifications_enabled: bool = true,
@@ -1156,7 +1156,7 @@ pub fn settingsNewChatModelSelectedIndex(self: anytype) ?usize {
 pub fn settingsNewChatModelSelectedLabel(self: anytype) []const u8 {
     if (self.settingsNewChatModelSelectedIndex()) |index| return self.settingsNewChatModelLabel(index);
     const ref = self.settingsNewChatModelRef();
-    // A built-in default the live catalog omits (Claude's `fable[1m]`) keeps its name.
+    // A built-in model the live catalog omits (Claude's `fable[1m]`) keeps its name.
     const provider = dbProviderForChatProvider(self.settings_controller.draft.new_chat_provider);
     return @import("provider_controller.zig").knownModelLabel(provider, settingsNewChatModelOptions(self), ref) orelse ref;
 }

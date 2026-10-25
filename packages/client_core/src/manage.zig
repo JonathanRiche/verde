@@ -83,6 +83,9 @@ pub const State = struct {
     models: V = .null,
     models_id: ?u64 = null,
     models_error: ?h.LocalError = null,
+    /// The desktop's starting model is not in the catalog yet; retry once the
+    /// provider's live model list arrives.
+    seed_pending: bool = false,
 };
 
 const MAX_TASKS = 16;
@@ -405,18 +408,33 @@ fn select(tx: *h.Transaction, id: []const u8, event: V) E!void {
     var selection = try h.decode(m.Selection, tx.allocator(), event);
     if (selection.effort != null and selection.effort.?.len == 0) selection.effort = null;
     const same_workspace = s.chat_workspace != null and eq(s.chat_workspace.?, ws_id);
+    const opening = selection.provider == null;
     if (selection.provider == null) selection.provider = if (same_workspace) s.selection.provider else null;
+    // Like the desktop, a new chat starts on the last chosen (else configured)
+    // provider; the workspace's own provider is the fallback for older hosts.
+    const configured_provider = p.s(chatConfig(&tx.state), "new_chat_provider");
+    if (selection.provider == null and known(configured_provider)) selection.provider = configured_provider;
     if (selection.provider == null) selection.provider = if (known(p.s(ws, "provider"))) p.s(ws, "provider") else "codex";
     const provider = selection.provider.?;
     const reload = !same_workspace or !eq(s.selection.provider orelse "", provider);
     if (!known(provider)) return receipt(tx, id, "failed", failure("invalid_selection", "Choose a supported provider."));
     const dynamic: V = if (reload) .null else s.models;
+    // Opening the sheet or switching provider pre-fills the desktop's starting
+    // model, effort and speed; an explicit pick (including "Default") is kept.
+    const unset = selection.model == null and selection.effort == null and selection.speed == null;
+    var seed_pending = false;
+    if (unset and (opening or reload)) {
+        const seeded = try seed(tx.allocator(), &tx.state, &selection, dynamic);
+        // Only a reload fetches the live list the pending model may be in.
+        seed_pending = !seeded and reload and c.supportsModelDiscovery(provider);
+    }
     const catalogs = try c.catalogs(tx.allocator(), selection, dynamic, .null);
     if (!c.contains(catalogs.models, selection.model) or !c.contains(catalogs.efforts, selection.effort) or !c.contains(catalogs.access, selection.access) or !c.contains(catalogs.speeds, selection.speed)) {
         return receipt(tx, id, "failed", failure("invalid_selection", "That model setting is not available."));
     }
     s.chat_workspace = ws_id;
     s.selection = selection;
+    s.seed_pending = seed_pending;
     receipt(tx, id, "succeeded", null);
     if (!reload) return;
     s.models = .null;
@@ -424,6 +442,33 @@ fn select(tx: *h.Transaction, id: []const u8, event: V) E!void {
     s.models_error = null;
     if (!online(tx) or !scoped(&tx.state, "runtime:read") or !c.supportsModelDiscovery(provider)) return;
     s.models_id = try rpc.request(tx, "provider.models.list", .{ .provider = provider, .project_path = p.s(ws, "path") }, .{ .mutation = false, .intent_id = "@manage" });
+}
+
+fn chatConfig(state: *const h.State) V {
+    return p.get(p.get(state.sync.snapshot, "config"), "chat");
+}
+
+/// Applies the desktop's starting model, effort and speed for the selected
+/// provider (`config.chat.new_chat_defaults`), keeping only values the catalog
+/// offers. Returns false when the model is not listed yet; the selection is
+/// then left on the provider default.
+fn seed(a: A, state: *const h.State, selection: *m.Selection, dynamic: V) E!bool {
+    const provider = selection.provider orelse return true;
+    var row: V = .null;
+    for (p.rows(p.get(chatConfig(state), "new_chat_defaults"))) |item| {
+        if (eq(p.s(item, "provider"), provider)) row = item;
+    }
+    const model = p.s(row, "model");
+    if (model.len == 0) return true;
+    var next = selection.*;
+    next.model = try a.dupe(u8, model);
+    const catalogs = try c.catalogs(a, next, dynamic, .null);
+    if (!c.contains(catalogs.models, next.model)) return false;
+    const reasoning = p.s(row, "reasoning");
+    if (reasoning.len > 0 and c.contains(catalogs.efforts, reasoning)) next.effort = try a.dupe(u8, reasoning);
+    if (p.yes(p.get(row, "fast")) and c.contains(catalogs.speeds, "on")) next.speed = "on";
+    selection.* = next;
+    return true;
 }
 
 fn directory(tx: *h.Transaction, id: []const u8, requested: V) E!void {
@@ -524,6 +569,8 @@ pub fn pump(tx: *h.Transaction) E!void {
         if (s.models_id != null and s.models_id.? == result.id) {
             s.models_id = null;
             if (result.@"error") |e| s.models_error = e else s.models = result.value orelse .null;
+            if (s.seed_pending and s.selection.model == null and s.selection.provider != null) _ = try seed(tx.allocator(), &tx.state, &s.selection, s.models);
+            s.seed_pending = false;
             continue;
         }
         for (s.tasks, 0..) |t, i| if (t.rpc_id != null and t.rpc_id.? == result.id) {

@@ -74,8 +74,8 @@ pub fn favorites(a: A, catalog: m.Catalogs, provider: []const u8, config: V) h.A
     return out;
 }
 fn fallback(provider: []const u8) []const []const u8 {
-    if (eq(provider, "codex")) return &.{ "gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.5", "gpt-5.6-terra", "gpt-5.6-luna" };
-    if (eq(provider, "claude")) return &.{ "fable[1m]", "default", "opus[1m]", "sonnet", "haiku" };
+    if (eq(provider, "codex")) return &.{ "gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.5", "gpt-5.6-terra", "gpt-5.6-luna" };
+    if (eq(provider, "claude")) return &.{ "default", "opus[1m]", "fable[1m]", "sonnet", "haiku" };
     if (eq(provider, "opencode")) return &.{ "opencode/gpt-5.5", "opencode/gpt-5.4", "opencode/claude-opus-4-7", "opencode/claude-opus-4-6", "opencode/claude-sonnet-4-5", "opencode/gemini-3.1-pro" };
     if (eq(provider, "grok")) return &.{ "default", "grok-4.7", "grok-4.6", "grok-4.5" };
     if (eq(provider, "muse")) return &.{ "muse-wonder-1.0", "muse-wonder-full-1.0", "muse-spark-1.3", "muse-spark-1.3-contributor", "muse-spark-1.2", "muse-spark-1.2-contributor" };

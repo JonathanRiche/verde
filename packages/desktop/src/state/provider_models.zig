@@ -10,14 +10,17 @@ pub const ChatRole = db_types.ChatRole;
 pub const Provider = db_types.Provider;
 pub const Harness = db_types.Harness;
 
-pub const DEFAULT_CODEX_MODEL: [:0]const u8 = "gpt-6-astra";
-pub const DEFAULT_CODEX_REASONING_EFFORT: ReasoningEffort = .medium;
+// Built-in model defaults for a new user mirror each CLI's own default, or
+// "default"/"auto" where the CLI resolves it per account. Reasoning effort is
+// left unset so each CLI applies its model's default effort.
+pub const DEFAULT_CODEX_MODEL: [:0]const u8 = "gpt-6.1-sol";
 pub const DEFAULT_OPENCODE_MODEL: [:0]const u8 = "opencode/gpt-5.4";
-pub const DEFAULT_CLAUDE_MODEL: [:0]const u8 = "fable[1m]";
-pub const DEFAULT_CURSOR_MODEL: [:0]const u8 = "grok-4.7-medium";
+/// Matches Claude Code: `default` defers to the account-type default model.
+pub const DEFAULT_CLAUDE_MODEL: [:0]const u8 = "default";
+pub const DEFAULT_CURSOR_MODEL: [:0]const u8 = "auto";
 pub const DEFAULT_PI_MODEL: [:0]const u8 = "default";
 pub const DEFAULT_FX_MODEL: [:0]const u8 = "default";
-pub const DEFAULT_GROK_MODEL: [:0]const u8 = "grok-4.7";
+pub const DEFAULT_GROK_MODEL: [:0]const u8 = "default";
 pub const DEFAULT_MUSE_MODEL: [:0]const u8 = "muse-wonder-1.0";
 
 pub const ModelOption = struct {
@@ -134,8 +137,8 @@ pub const OPENCODE_MODEL_OPTIONS = [_]ModelOption{
 };
 
 pub const CODEX_MODEL_OPTIONS = [_]ModelOption{
+    .{ .label = "GPT-6.1 Sol", .value = DEFAULT_CODEX_MODEL },
     .{ .label = "GPT-6 Astra", .value = "gpt-6-astra" },
-    .{ .label = "GPT-6.1 Sol", .value = "gpt-6.1-sol" },
     .{ .label = "GPT-6 Sol", .value = "gpt-6-sol" },
     .{ .label = "GPT-6 Luna", .value = "gpt-6-luna" },
     .{ .label = "GPT-5.6 Sol", .value = "gpt-5.6-sol" },
@@ -152,8 +155,8 @@ const CURSOR_GPT_54_EFFORT_VALUES = [_][:0]const u8{ "low", "medium", "high", "x
 const CURSOR_CLAUDE_EFFORT_VALUES = [_][:0]const u8{ "low", "medium", "high", "xhigh", "max" };
 
 pub const CURSOR_MODEL_OPTIONS = [_]ModelOption{
-    .{ .label = "Auto", .value = "auto" },
-    .{ .label = "Grok 4.7", .value = DEFAULT_CURSOR_MODEL, .cursor_fast_supported = true, .cursor_reasoning_param_id = "effort", .cursor_reasoning_values = CURSOR_GROK_47_EFFORT_VALUES[0..] },
+    .{ .label = "Auto", .value = DEFAULT_CURSOR_MODEL },
+    .{ .label = "Grok 4.7", .value = "grok-4.7-medium", .cursor_fast_supported = true, .cursor_reasoning_param_id = "effort", .cursor_reasoning_values = CURSOR_GROK_47_EFFORT_VALUES[0..] },
     .{ .label = "Composer 2.5", .value = "composer-2.5", .cursor_fast_supported = true },
     .{ .label = "Cursor Grok 4.5", .value = "cursor-grok-4.5-high", .cursor_fast_supported = true, .cursor_reasoning_param_id = "effort", .cursor_reasoning_values = CURSOR_GROK_EFFORT_VALUES[0..] },
     .{ .label = "Opus 4.8 Thinking", .value = "claude-opus-4-8-thinking-high", .cursor_fast_supported = true, .cursor_reasoning_param_id = "effort", .cursor_reasoning_values = CURSOR_CLAUDE_EFFORT_VALUES[0..] },
@@ -179,9 +182,9 @@ pub const CLAUDE_FULL_EFFORT_VALUES = [_][:0]const u8{ "low", "medium", "high", 
 /// Keep this mirroring the Agent SDK's `supportedModels()` output (labels + ids)
 /// so the picker doesn't flash stale model names while the bridge loads.
 pub const CLAUDE_MODEL_OPTIONS = [_]ModelOption{
-    .{ .label = "Fable 5.1", .value = DEFAULT_CLAUDE_MODEL, .reasoning_supported = true, .claude_effort_values = CLAUDE_FULL_EFFORT_VALUES[0..] },
-    .{ .label = "Default (Opus 5.5)", .value = "default", .reasoning_supported = true, .claude_effort_values = CLAUDE_FULL_EFFORT_VALUES[0..] },
+    .{ .label = "Default (Opus 5.5)", .value = DEFAULT_CLAUDE_MODEL, .reasoning_supported = true, .claude_effort_values = CLAUDE_FULL_EFFORT_VALUES[0..] },
     .{ .label = "Opus 5.5 (1M context)", .value = "opus[1m]", .reasoning_supported = true, .claude_effort_values = CLAUDE_FULL_EFFORT_VALUES[0..] },
+    .{ .label = "Fable 5.1", .value = "fable[1m]", .reasoning_supported = true, .claude_effort_values = CLAUDE_FULL_EFFORT_VALUES[0..] },
     .{ .label = "Sonnet 5.5", .value = "sonnet", .reasoning_supported = true, .claude_effort_values = CLAUDE_FULL_EFFORT_VALUES[0..] },
     .{ .label = "Haiku 5.5", .value = "haiku", .reasoning_supported = true, .claude_effort_values = CLAUDE_FULL_EFFORT_VALUES[0..] },
 };
@@ -217,8 +220,8 @@ pub const FX_MODEL_OPTIONS = [_]ModelOption{
 /// handshake reports the live catalog. "default" defers to the model persisted
 /// inside grok itself (no `--model` override).
 pub const GROK_MODEL_OPTIONS = [_]ModelOption{
-    .{ .label = "Default (grok config)", .value = "default", .reasoning_supported = true },
-    .{ .label = "Grok 4.7", .value = DEFAULT_GROK_MODEL, .reasoning_supported = true },
+    .{ .label = "Default (grok config)", .value = DEFAULT_GROK_MODEL, .reasoning_supported = true },
+    .{ .label = "Grok 4.7", .value = "grok-4.7", .reasoning_supported = true },
     .{ .label = "Grok 4.6", .value = "grok-4.6", .reasoning_supported = true },
     .{ .label = "Grok 4.5", .value = "grok-4.5", .reasoning_supported = true },
 };

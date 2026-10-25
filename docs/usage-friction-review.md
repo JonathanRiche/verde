@@ -119,4 +119,5 @@ about:blank; cookie import lacked "select all" and the list overflowed.
   **UI-only and never sent to the agent's context**. A rejected push keeps the local
   commit and offers Pull & push.
 - Found while checking: the title generator's Claude fallback is
-  `provider_models.DEFAULT_CLAUDE_MODEL` (`fable[1m]`), which is expensive for titles.
+  `provider_models.DEFAULT_CLAUDE_MODEL`, which was `fable[1m]` (expensive for titles);
+  it is now `default`, matching Claude Code.

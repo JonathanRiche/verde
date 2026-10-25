@@ -70,6 +70,13 @@ pub const ChatReasoning = enum {
 };
 
 /// Last explicit GUI selection for one provider; never populated by thread restore.
+/// Resolved starting settings for a new chat; see `AppConfig.newChatDefault`.
+pub const NewChatDefault = struct {
+    model: ?[]const u8 = null,
+    reasoning: ?[]const u8 = null,
+    fast: bool = false,
+};
+
 pub const RememberedModel = struct {
     model: []u8,
     reasoning: ?[]u8 = null,
@@ -409,7 +416,7 @@ pub const AppConfig = struct {
     commit_default_action: CommitDefaultAction = .commit,
     new_chat_provider: ChatProvider = .codex,
     new_chat_model: ?[]u8 = null,
-    new_chat_reasoning: ChatReasoning = .medium,
+    new_chat_reasoning: ChatReasoning = .provider_default,
     last_chat_provider: ?ChatProvider = null,
     /// Providers hidden from the model picker and new-chat defaults; indexed by ChatProvider.
     disabled_providers: [std.meta.fields(ChatProvider).len]bool = @splat(false),
@@ -484,6 +491,34 @@ pub const AppConfig = struct {
     pub fn rememberGuiModelSelection(self: *AppConfig, allocator: std.mem.Allocator, provider: ChatProvider, model: []const u8, reasoning: ?[]const u8, fast: bool) !void {
         try self.rememberModel(allocator, provider, model, reasoning, fast);
         self.last_chat_provider = provider;
+    }
+
+    /// Provider a new remote chat starts on: the last explicit choice, else the
+    /// configured default (mirrors the desktop's `applyNewChatDefaults`).
+    pub fn nextChatProvider(self: AppConfig) ChatProvider {
+        if (self.last_chat_provider) |last| {
+            if (self.isProviderEnabled(last)) return last;
+        }
+        return self.new_chat_provider;
+    }
+
+    /// Model, reasoning and speed a new chat on `provider` starts with. The
+    /// configured new-chat model applies until the user makes an explicit
+    /// choice; after that the provider's remembered choice wins. Null fields
+    /// leave the choice to the provider CLI. Slices borrow from `self`.
+    pub fn newChatDefault(self: AppConfig, provider: ChatProvider) NewChatDefault {
+        const configured = self.last_chat_provider == null and provider == self.new_chat_provider;
+        const explicit_model = if (configured) self.new_chat_model else null;
+        if (explicit_model == null) {
+            if (self.remembered_models[@intFromEnum(provider)]) |entry| {
+                if (entry.model.len > 0) return .{ .model = entry.model, .reasoning = entry.reasoning, .fast = entry.fast };
+            }
+        }
+        if (!configured) return .{};
+        return .{
+            .model = explicit_model,
+            .reasoning = if (self.new_chat_reasoning == .provider_default) null else self.new_chat_reasoning.configValue(),
+        };
     }
 
     pub fn rememberModel(self: *AppConfig, allocator: std.mem.Allocator, provider: ChatProvider, model: []const u8, reasoning: ?[]const u8, fast: bool) !void {
@@ -2030,4 +2065,36 @@ test "remembered model options ignore malformed entries and unknown providers" {
     try std.testing.expect(config.remembered_models[@intFromEnum(ChatProvider.claude)] == null);
     try std.testing.expect(config.remembered_models[@intFromEnum(ChatProvider.cursor)] == null);
     try std.testing.expectEqualStrings("valid", config.remembered_models[@intFromEnum(ChatProvider.pi)].?.model);
+}
+
+test "new chat defaults follow the configured model until an explicit choice" {
+    const allocator = std.testing.allocator;
+    var config: AppConfig = .{ .new_chat_provider = .claude, .new_chat_reasoning = .high };
+    defer config.deinit(allocator);
+
+    // Nothing configured or remembered: the provider CLI decides.
+    try std.testing.expectEqual(ChatProvider.claude, config.nextChatProvider());
+    try std.testing.expect(config.newChatDefault(.claude).model == null);
+
+    try config.setNewChatModel(allocator, "opus[1m]");
+    try config.rememberModel(allocator, .codex, "gpt-5.5", "low", true);
+    const configured = config.newChatDefault(.claude);
+    try std.testing.expectEqualStrings("opus[1m]", configured.model.?);
+    try std.testing.expectEqualStrings("high", configured.reasoning.?);
+    const remembered = config.newChatDefault(.codex);
+    try std.testing.expectEqualStrings("gpt-5.5", remembered.model.?);
+    try std.testing.expectEqualStrings("low", remembered.reasoning.?);
+    try std.testing.expect(remembered.fast);
+
+    // An explicit choice moves the next chat to that provider and retires the
+    // configured model in favour of what was remembered.
+    try config.rememberGuiModelSelection(allocator, .claude, "sonnet", null, false);
+    try std.testing.expectEqual(ChatProvider.claude, config.nextChatProvider());
+    try std.testing.expectEqualStrings("sonnet", config.newChatDefault(.claude).model.?);
+    try std.testing.expect(config.newChatDefault(.claude).reasoning == null);
+
+    config.disabled_providers[@intFromEnum(ChatProvider.claude)] = true;
+    try std.testing.expectEqual(ChatProvider.claude, config.new_chat_provider);
+    config.new_chat_provider = .codex;
+    try std.testing.expectEqual(ChatProvider.codex, config.nextChatProvider());
 }

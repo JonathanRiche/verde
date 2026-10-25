@@ -7833,16 +7833,24 @@ pub const Daemon = struct {
         }
         const turn = try createChatTurnFromParams(self.allocator, params, route_ptr, claimed_ptr);
         errdefer turn.deinit(self.allocator);
-        // Web and mobile clients may omit model_ref for fresh chats. Pin the
-        // user's remembered model so the stored thread (and every client's
-        // picker) names the model that actually runs.
-        if (turn.request.model_ref == null) {
+        // Web and mobile clients may omit model_ref for fresh chats. Apply the
+        // desktop's new-chat defaults so the stored thread (and every client's
+        // picker) names the model that actually runs. A model they do choose
+        // for a new chat is remembered, as a desktop picker choice is.
+        const remembers_choice = turn.request.model_ref != null and isRemoteNewChatTurn(turn.turn_id, turn.request);
+        if (turn.request.model_ref == null or remembers_choice) {
             self.config_mutex.lock();
             defer self.config_mutex.unlock();
             if (app_config.loadAppConfig(self.allocator)) |loaded| {
                 var config = loaded;
                 defer config.deinit(self.allocator);
-                try applyRememberedModelDefault(self.allocator, &turn.request, &config);
+                if (remembers_choice) {
+                    rememberRemoteChatChoice(self.allocator, &config, turn.request) catch |err| {
+                        log.warn("chat turn model remember failed err={s}", .{@errorName(err)});
+                    };
+                } else {
+                    try applyNewChatDefaults(self.allocator, &turn.request, &config);
+                }
             } else |err| {
                 log.warn("chat turn model default config load failed err={s}", .{@errorName(err)});
             }
@@ -9565,7 +9573,7 @@ pub const Daemon = struct {
             };
         }
         const snapshot = try configSnapshotFromApp(self.allocator, &config);
-        defer self.allocator.free(snapshot.chat.favorite_models);
+        defer freeConfigSnapshot(self.allocator, snapshot);
         return try okValueResponse(self.allocator, id_value, snapshot.ui);
     }
 
@@ -12412,6 +12420,12 @@ fn writeRawFragment(s: *std.json.Stringify, fragment: []const u8) !void {
     s.endWriteRaw();
 }
 
+/// Frees the slices `configSnapshotFromApp` allocates; strings borrow the config.
+fn freeConfigSnapshot(allocator: std.mem.Allocator, snapshot: store_protocol.ConfigSnapshot) void {
+    allocator.free(snapshot.chat.favorite_models);
+    allocator.free(snapshot.chat.new_chat_defaults);
+}
+
 fn configSnapshotFromApp(allocator: std.mem.Allocator, config: *const app_config.AppConfig) !store_protocol.ConfigSnapshot {
     const favorites = try allocator.alloc(store_protocol.ConfigFavoriteModel, config.favorite_models.len);
     for (config.favorite_models, favorites) |favorite, *snapshot| {
@@ -12420,6 +12434,20 @@ fn configSnapshotFromApp(allocator: std.mem.Allocator, config: *const app_config
             .model = favorite.model,
         };
     }
+    errdefer allocator.free(favorites);
+    var new_chat_defaults: std.ArrayList(store_protocol.ConfigNewChatDefault) = .empty;
+    errdefer new_chat_defaults.deinit(allocator);
+    for (std.enums.values(app_config.ChatProvider)) |provider| {
+        const defaults = config.newChatDefault(provider);
+        const model = defaults.model orelse continue;
+        try new_chat_defaults.append(allocator, .{
+            .provider = @tagName(provider),
+            .model = model,
+            .reasoning = defaults.reasoning,
+            .fast = defaults.fast,
+        });
+    }
+    const new_chat_defaults_slice = try new_chat_defaults.toOwnedSlice(allocator);
     return .{
         .ui = .{
             .workspace_pane_gap = config.workspace_pane_gap,
@@ -12440,6 +12468,8 @@ fn configSnapshotFromApp(allocator: std.mem.Allocator, config: *const app_config
         },
         .chat = .{
             .favorite_models = favorites,
+            .new_chat_provider = @tagName(config.nextChatProvider()),
+            .new_chat_defaults = new_chat_defaults_slice,
             .title_provider = @tagName(config.chat_title_provider),
             .title_model = config.chatTitleModel(),
             .commit_message_provider = @tagName(config.commit_message_provider),
@@ -12520,7 +12550,7 @@ fn writeConfigSnapshot(s: *std.json.Stringify, daemon: *Daemon) !void {
     };
     defer config.deinit(daemon.allocator);
     var snapshot = try configSnapshotFromApp(daemon.allocator, &config);
-    defer daemon.allocator.free(snapshot.chat.favorite_models);
+    defer freeConfigSnapshot(daemon.allocator, snapshot);
     var root = app_config.readRootValue(daemon.allocator) catch null;
     defer if (root) |*parsed| parsed.deinit();
     if (root) |parsed| {
@@ -19033,16 +19063,94 @@ test "attachment staging never follows a planted symlink at create or cleanup" {
 }
 
 /// Fills an omitted model_ref from the provider's remembered model choice.
-fn applyRememberedModelDefault(
+/// Fills a model-less turn from `AppConfig.newChatDefault`: the model, plus
+/// its reasoning and speed when the client sent none. Without a configured or
+/// remembered choice the request stays empty and the provider CLI decides.
+fn applyNewChatDefaults(
     allocator: std.mem.Allocator,
     request: *send_runner.Request,
     config: *const app_config.AppConfig,
 ) !void {
     if (request.model_ref != null) return;
     const config_provider = app_config.ChatProvider.parse(@tagName(request.provider)) orelse return;
-    const remembered = config.remembered_models[@intFromEnum(config_provider)] orelse return;
-    if (remembered.model.len == 0) return;
-    request.model_ref = try allocator.dupe(u8, remembered.model);
+    const defaults = config.newChatDefault(config_provider);
+    const model = defaults.model orelse return;
+    if (model.len == 0) return;
+    request.model_ref = try allocator.dupe(u8, model);
+    if (request.reasoning_effort == null and request.opencode_reasoning_variant == null) {
+        if (defaults.reasoning) |reasoning| switch (request.provider) {
+            .opencode => request.opencode_reasoning_variant = try allocator.dupe(u8, reasoning),
+            // Cursor encodes effort in model params the remembered tag does not carry.
+            .cursor, .fx, .custom_acp => {},
+            else => request.reasoning_effort = std.meta.stringToEnum(harness.ReasoningEffort, reasoning),
+        };
+    }
+    if (defaults.fast and request.provider == .codex) request.fast_mode = .on;
+}
+
+/// True for the first turn of a chat a phone (`mobile:`) or the web
+/// (`web-turn-`) started; only those record a remembered choice. The desktop
+/// remembers its own picker choices, and CLI/MCP agents never do.
+fn isRemoteNewChatTurn(turn_id: []const u8, request: send_runner.Request) bool {
+    if (request.provider_thread_id != null) return false;
+    return std.mem.startsWith(u8, turn_id, "mobile:") or std.mem.startsWith(u8, turn_id, "web-turn-");
+}
+
+fn optionalStrEql(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+fn rememberRemoteChatChoice(
+    allocator: std.mem.Allocator,
+    config: *app_config.AppConfig,
+    request: send_runner.Request,
+) !void {
+    const model = request.model_ref orelse return;
+    if (model.len == 0) return;
+    const provider = app_config.ChatProvider.parse(@tagName(request.provider)) orelse return;
+    const reasoning: ?[]const u8 = if (request.opencode_reasoning_variant) |variant| variant else if (request.reasoning_effort) |effort| @tagName(effort) else null;
+    const fast = request.fast_mode == .on;
+    // Accepting the pre-filled default is not a new choice; recording it would
+    // pin the provider and stop later Settings defaults from applying.
+    if (provider == config.nextChatProvider()) {
+        const defaults = config.newChatDefault(provider);
+        if (optionalStrEql(defaults.model, model) and optionalStrEql(defaults.reasoning, reasoning) and defaults.fast == fast) return;
+    }
+    try config.rememberGuiModelSelection(allocator, provider, model, reasoning, fast);
+    try app_config.saveAppConfig(allocator, config);
+}
+
+test "model-less remote turns take the desktop's new-chat defaults" {
+    const allocator = std.testing.allocator;
+    var config: app_config.AppConfig = .{ .new_chat_provider = .codex };
+    defer config.deinit(allocator);
+    try config.rememberModel(allocator, .codex, "gpt-5.5", "high", true);
+    try config.rememberModel(allocator, .opencode, "opencode/gpt-5.4", "max", false);
+
+    var request: send_runner.Request = .{ .provider = .codex, .harness_kind = .local_cli, .project_path = "/tmp", .prompt = "hi" };
+    try applyNewChatDefaults(allocator, &request, &config);
+    defer if (request.model_ref) |value| allocator.free(value);
+    try std.testing.expectEqualStrings("gpt-5.5", request.model_ref.?);
+    try std.testing.expectEqual(harness.ReasoningEffort.high, request.reasoning_effort.?);
+    try std.testing.expectEqual(send_runner.FastMode.on, request.fast_mode);
+
+    var variant: send_runner.Request = .{ .provider = .opencode, .harness_kind = .local_cli, .project_path = "/tmp", .prompt = "hi" };
+    try applyNewChatDefaults(allocator, &variant, &config);
+    defer if (variant.model_ref) |value| allocator.free(value);
+    defer if (variant.opencode_reasoning_variant) |value| allocator.free(value);
+    try std.testing.expectEqualStrings("max", variant.opencode_reasoning_variant.?);
+
+    // No remembered or configured model: the CLI default stays in charge.
+    var bare: send_runner.Request = .{ .provider = .claude, .harness_kind = .local_cli, .project_path = "/tmp", .prompt = "hi" };
+    try applyNewChatDefaults(allocator, &bare, &config);
+    try std.testing.expect(bare.model_ref == null and bare.reasoning_effort == null);
+
+    try std.testing.expect(isRemoteNewChatTurn("mobile:abc:1", bare));
+    try std.testing.expect(isRemoteNewChatTurn("web-turn-1", bare));
+    try std.testing.expect(!isRemoteNewChatTurn("gui:ws:thread:1", bare));
+    bare.provider_thread_id = "existing";
+    try std.testing.expect(!isRemoteNewChatTurn("mobile:abc:2", bare));
 }
 
 fn createChatTurnFromParams(

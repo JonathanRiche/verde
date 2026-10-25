@@ -25,6 +25,9 @@ const Fixture = struct {
     now: i64 = 1,
 
     fn init(scopes: []const []const u8, capabilities: []const []const u8) !Fixture {
+        return initWith(scopes, capabilities, snapshot);
+    }
+    fn initWith(scopes: []const []const u8, capabilities: []const []const u8, snapshot_json: []const u8) !Fixture {
         var host = try h.Host.init(std.testing.allocator, config);
         errdefer host.deinit();
         var tx = try h.Transaction.init(&host);
@@ -37,7 +40,7 @@ const Fixture = struct {
         tx.state.rpc.instance_id = "00112233445566778899aabbccddeeff";
         tx.state.rpc.phase = .ready;
         tx.state.rpc.runtime_capabilities = capabilities;
-        tx.state.sync.snapshot = try h.parse(tx.allocator(), snapshot);
+        tx.state.sync.snapshot = try h.parse(tx.allocator(), snapshot_json);
         const output = try tx.commit(&host, std.testing.allocator);
         std.testing.allocator.free(output);
         return .{ .arena = .init(std.testing.allocator), .host = host };
@@ -187,6 +190,42 @@ test "thread_create rejects closed workspaces, bad selections and missing scope 
     try g.expectFailed(try g.intent("thread_create", .{ .workspace_id = "ws-1", .provider = "codex" }), "insufficient_scope");
     try g.expectFailed(try g.intent("workspace_close", .{ .workspace_id = "ws-1" }), "insufficient_scope");
     try expect(!p.yes(p.get(try g.view(), "can_manage_workspaces")));
+}
+
+test "new_chat_select pre-fills the desktop's new-chat defaults and keeps explicit picks" {
+    const configured =
+        \\{"store_revision":5,"snapshot":{"workspaces":[
+        \\ {"workspace_id":"ws-1","label":"One","path":"/home/u/src/one","provider":"claude","archived":false,"threads":[]}
+        \\]},"config":{"chat":{"new_chat_provider":"codex","new_chat_defaults":[
+        \\ {"provider":"codex","model":"gpt-5.5","reasoning":"high","fast":true},
+        \\ {"provider":"claude","model":"claude-next","reasoning":"low","fast":false}
+        \\]}}}
+    ;
+    var f = try Fixture.initWith(all_scopes, &.{}, configured);
+    defer f.deinit();
+
+    // Opening the sheet starts on the configured provider, not the workspace's.
+    _ = try f.intent("new_chat_select", .{ .workspace_id = "ws-1" });
+    var selection = p.get(p.get(try f.view(), "new_chat"), "selection");
+    try eql("codex", p.s(selection, "provider"));
+    try eql("gpt-5.5", p.s(selection, "model"));
+    try eql("high", p.s(selection, "effort"));
+    try eql("on", p.s(selection, "speed"));
+
+    // An explicit "Default" pick on the same provider is not overwritten.
+    _ = try f.intent("new_chat_select", .{ .workspace_id = "ws-1", .provider = "codex", .model = @as(?[]const u8, null) });
+    selection = p.get(p.get(try f.view(), "new_chat"), "selection");
+    try expect(p.get(selection, "model") == .null);
+
+    // Switching to a provider whose remembered model is only in the live list
+    // applies it once the list arrives.
+    _ = try f.intent("new_chat_select", .{ .workspace_id = "ws-1", .provider = "claude" });
+    selection = p.get(p.get(try f.view(), "new_chat"), "selection");
+    try expect(p.get(selection, "model") == .null);
+    try f.replyJson("provider.models.list", "{\"models\":[{\"model_id\":\"claude-next\",\"model_name\":\"Next\"}]}");
+    selection = p.get(p.get(try f.view(), "new_chat"), "selection");
+    try eql("claude-next", p.s(selection, "model"));
+    try eql("low", p.s(selection, "effort"));
 }
 
 test "workspace_create hashes the path like the web, trims it and derives the label" {

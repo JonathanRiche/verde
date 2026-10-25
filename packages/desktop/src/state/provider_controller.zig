@@ -1949,7 +1949,7 @@ pub fn claudeModelOptionForRef(self: anytype, model_ref: ?[:0]const u8) ?ModelOp
 }
 
 /// Display name for a model ref the live catalog does not list (Claude's live
-/// list can omit the built-in `fable[1m]` default), from the built-in catalog,
+/// list can omit the built-in `fable[1m]` option), from the built-in catalog,
 /// then Claude's base ref, so labels never fall back to the raw id when a
 /// name is known. `live` is the provider's current option list.
 pub fn knownModelLabel(provider: Provider, live: []const ModelOption, ref: []const u8) ?[]const u8 {
@@ -2513,12 +2513,12 @@ test "every provider has a readiness setter" {
     for (std.enums.values(Provider)) |provider| try std.testing.expectEqual(ProviderReadiness.unavailable, snapshot.forProvider(provider));
 }
 
-test "known model label names built-in defaults the live catalog omits" {
+test "known model label names built-in models the live catalog omits" {
     const live = [_]ModelOption{
         .{ .label = "Opus", .value = "opus" },
         .{ .label = "Sonnet", .value = "sonnet" },
     };
-    try std.testing.expectEqualStrings("Fable 5.1", knownModelLabel(.claude, &live, DEFAULT_CLAUDE_MODEL).?);
+    try std.testing.expectEqualStrings("Fable 5.1", knownModelLabel(.claude, &live, "fable[1m]").?);
     try std.testing.expectEqualStrings("Sonnet", knownModelLabel(.claude, &live, "sonnet[1m]").?);
     try std.testing.expect(knownModelLabel(.claude, &live, "mystery") == null);
     try std.testing.expect(knownModelLabel(.custom_acp, &.{}, "agent") == null);

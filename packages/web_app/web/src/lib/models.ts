@@ -133,8 +133,8 @@ const CLAUDE_FULL_EFFORTS: EffortOption[] = [
 ]
 
 const CODEX_MODELS: ModelOption[] = [
-  { label: 'GPT-6 Astra', value: 'gpt-6-astra', efforts: CODEX_MAX_EFFORTS },
   { label: 'GPT-6.1 Sol', value: 'gpt-6.1-sol', efforts: CODEX_MAX_EFFORTS },
+  { label: 'GPT-6 Astra', value: 'gpt-6-astra', efforts: CODEX_MAX_EFFORTS },
   { label: 'GPT-6 Sol', value: 'gpt-6-sol', efforts: CODEX_MAX_EFFORTS },
   { label: 'GPT-6 Luna', value: 'gpt-6-luna', efforts: CODEX_MAX_EFFORTS },
   { label: 'GPT-5.6 Sol', value: 'gpt-5.6-sol', efforts: CODEX_MAX_EFFORTS },
@@ -144,9 +144,9 @@ const CODEX_MODELS: ModelOption[] = [
 ]
 
 const CLAUDE_MODELS: ModelOption[] = [
-  { label: 'Fable 5.1', value: 'fable[1m]', efforts: CLAUDE_FULL_EFFORTS },
   { label: 'Default (Opus 5.5)', value: 'default', efforts: CLAUDE_FULL_EFFORTS },
   { label: 'Opus 5.5 (1M context)', value: 'opus[1m]', efforts: CLAUDE_FULL_EFFORTS },
+  { label: 'Fable 5.1', value: 'fable[1m]', efforts: CLAUDE_FULL_EFFORTS },
   { label: 'Sonnet 5.5', value: 'sonnet', efforts: CLAUDE_FULL_EFFORTS },
   { label: 'Haiku 5.5', value: 'haiku', efforts: CLAUDE_FULL_EFFORTS },
 ]

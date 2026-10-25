@@ -4431,7 +4431,6 @@ pub const LEGACY_STATE_FILE_NAME = "state.json";
 const CURSOR_MODEL_CACHE_FILE_NAME = "cursor-models.json";
 const SIDEBAR_SCOPE_FILE_NAME = "sidebar-scope";
 pub const DEFAULT_CODEX_MODEL = provider_models.DEFAULT_CODEX_MODEL;
-pub const DEFAULT_CODEX_REASONING_EFFORT = provider_models.DEFAULT_CODEX_REASONING_EFFORT;
 pub const DEFAULT_OPENCODE_MODEL = provider_models.DEFAULT_OPENCODE_MODEL;
 pub const DEFAULT_CLAUDE_MODEL = provider_models.DEFAULT_CLAUDE_MODEL;
 pub const DEFAULT_CURSOR_MODEL = provider_models.DEFAULT_CURSOR_MODEL;
@@ -8491,8 +8490,7 @@ pub const AppState = struct {
         var reasoning_effort: ?ReasoningEffort = null;
         var variant_value: ?[]const u8 = null;
         const raw_reasoning: ?[]const u8 = if (remembered) |entry| entry.reasoning else if (use_configured) (if (self.app_config.new_chat_reasoning == .provider_default) null else self.app_config.new_chat_reasoning.configValue()) else switch (provider) {
-            .codex => @tagName(DEFAULT_CODEX_REASONING_EFFORT),
-            .claude => "medium",
+            // Effort stays unset so each CLI applies its model's default.
             else => null,
         };
         if (raw_reasoning) |raw| {
@@ -10438,7 +10436,7 @@ pub const AppState = struct {
             if (index < options.len) return std.mem.sliceTo(options[index].label, 0);
         }
         const ref: []const u8 = if (thread.model_ref) |model_ref| std.mem.sliceTo(model_ref, 0) else composerUnsetModelRef(self, thread.provider);
-        // A built-in default the live catalog omits (Claude's `fable[1m]`)
+        // A built-in model the live catalog omits (Claude's `fable[1m]`)
         // still shows its name; truly unknown refs show as-is.
         return provider_controller.knownModelLabel(thread.provider, options, ref) orelse ref;
     }

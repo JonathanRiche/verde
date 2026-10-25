@@ -612,8 +612,23 @@ pub const ConfigFavoriteModel = struct {
     model: []const u8,
 };
 
+/// Starting model, reasoning (effort tag or variant) and speed for a new chat
+/// on one provider, as the desktop would pick them.
+pub const ConfigNewChatDefault = struct {
+    provider: []const u8,
+    model: []const u8,
+    reasoning: ?[]const u8 = null,
+    fast: bool = false,
+};
+
 pub const ConfigChatSnapshot = struct {
     favorite_models: []const ConfigFavoriteModel = &.{},
+    /// Provider a new chat starts on: the last explicit choice, else the
+    /// configured default.
+    new_chat_provider: []const u8 = "codex",
+    /// Providers with a configured or remembered starting model; any other
+    /// provider starts on its CLI default.
+    new_chat_defaults: []const ConfigNewChatDefault = &.{},
     /// Resolved `chat.title_provider` / `chat.title_model`, so detached
     /// clients regenerate titles with the same model as the desktop.
     title_provider: []const u8 = "codex",

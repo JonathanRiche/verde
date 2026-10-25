@@ -21,7 +21,6 @@ const Provider = provider_models.Provider;
 const ReasoningEffort = provider_models.ReasoningEffort;
 const FastMode = provider_models.FastMode;
 const ModelOption = provider_models.ModelOption;
-const DEFAULT_CODEX_REASONING_EFFORT = provider_models.DEFAULT_CODEX_REASONING_EFFORT;
 const DEFAULT_CODEX_MODEL = provider_models.DEFAULT_CODEX_MODEL;
 const DEFAULT_OPENCODE_MODEL = provider_models.DEFAULT_OPENCODE_MODEL;
 const DEFAULT_CLAUDE_MODEL = provider_models.DEFAULT_CLAUDE_MODEL;
@@ -2164,7 +2163,7 @@ pub fn resolveChatCreationSettings(self: anytype, request: OpenChatRequest, mode
     }
 
     return .{
-        .reasoning_effort = request.reasoning_effort orelse if (request.provider == .codex) DEFAULT_CODEX_REASONING_EFFORT else null,
+        .reasoning_effort = request.reasoning_effort,
         .reasoning_variant = request.reasoning_variant,
         .fast_mode = request.fast_mode orelse .off,
     };
