@@ -2615,7 +2615,9 @@ fn companionMenuLayout(state: *runtime.AppState, geometry: Geometry) CompanionMe
     y += 6.0 * s;
     layout.new_conversation = .{ .x = x + 6.0 * s, .y = y, .w = menu_w - 12.0 * s, .h = MENU_ACTION_HEIGHT * s };
     y += MENU_ACTION_HEIGHT * s;
-    if (companion.presentation.has_thread) {
+    // Shown for a started conversation, and for an unstarted one when there is
+    // a remembered conversation to go back to.
+    if (companion.presentation.has_thread or companion.conversation_row_count > 0) {
         layout.close_current = .{ .x = x + 6.0 * s, .y = y, .w = menu_w - 12.0 * s, .h = MENU_ACTION_HEIGHT * s };
         y += MENU_ACTION_HEIGHT * s;
     } else {
@@ -4981,4 +4983,10 @@ test "companion menu closes the current or a remembered conversation" {
     // The rest of the row still resumes it.
     try std.testing.expectEqual(controller.HitAction.menu_resume_conversation, state.companion_controller.hitAt(layout.conversations[1].x + 4.0, layout.conversations[1].y + 4.0).?);
     try std.testing.expect(rectInside(close, layout.conversations[1]));
+
+    // An unstarted conversation can still be dismissed while there is one to return to.
+    state.companion_controller.setFrame(.{});
+    try std.testing.expect(companionMenuLayout(&state, geometry).close_current.w > 0.0);
+    state.companion_controller.conversation_row_count = 0;
+    try std.testing.expectEqual(@as(f32, 0.0), companionMenuLayout(&state, geometry).close_current.w);
 }

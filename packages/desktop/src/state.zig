@@ -14492,7 +14492,12 @@ pub const AppState = struct {
     pub fn closeCompanionConversation(self: *AppState) void {
         const index = self.companion_roster.active_index;
         const companion = self.companion_roster.activeConst() orelse return;
-        if (companion.thread_id.isEmpty()) return;
+        if (companion.thread_id.isEmpty()) {
+            // An unstarted conversation has nothing to archive: dismissing it
+            // just returns to the newest remembered conversation.
+            if (companion.pastConversations().len > 0) self.resumeCompanionConversation(0);
+            return;
+        }
         if (self.activeCompanionThread()) |thread| {
             if (thread.isSendPendingForUi()) {
                 self.companion_controller.ui_error = "Wait for the current turn to finish first.";
