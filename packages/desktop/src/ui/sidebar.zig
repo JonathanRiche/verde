@@ -16,6 +16,7 @@ const utils = @import("../utils.zig");
 const profiler = @import("../runtime/profiler.zig");
 const platform_runtime = @import("platform_runtime");
 const native_state = @import("../state.zig");
+const chat_panel = @import("chat_panel.zig");
 const lease_run_status = @import("../state/lease_run_status.zig");
 const Provider = native_state.Provider;
 const SurfaceProvider = native_state.SurfaceProvider;
@@ -48,6 +49,8 @@ const SIDEBAR_THREAD_ICON_TITLE_GAP_CSS: f32 = 10.0;
 /// Width reserved for the live status column ("Working · 59:59"); titles only
 /// give up this width while a status label is actually present.
 const SIDEBAR_STATUS_COLUMN_CSS: f32 = 96.0;
+/// Wider status column for agent waits ("Waiting · 2 agents").
+const SIDEBAR_AGENTS_STATUS_COLUMN_CSS: f32 = 118.0;
 /// Horizontal padding of the expanded rail's content column. Kept tight so
 /// pane titles keep as many characters as possible at typical rail widths.
 const SIDEBAR_PAD_X_CSS: f32 = 16.0;
@@ -2019,6 +2022,8 @@ fn renderOpenPaneRow(
     // Unix ms when the pane's live work began, when known; drives the elapsed
     // portion of the status label.
     var status_started_at_ms: ?i64 = null;
+    // Agents a working chat is waiting on; replaces the elapsed timer.
+    var agent_activity: chat_panel.AgentActivity = .{};
     // A `verde lease run` command of this chat waiting for or holding a lease.
     var lease_status: ?lease_run_status.Status = null;
     switch (pane.ref) {
@@ -2030,6 +2035,7 @@ fn renderOpenPaneRow(
                 title = thread.title;
                 status = chatSurfaceStatusForUi(thread);
                 running = status.? == .working;
+                agent_activity = chatAgentActivity(state, project, thread);
                 if (running) {
                     status_started_at_ms = thread.sendStartedAtMsForUi();
                     lease_status = lease_run_status.forThread(state.storage.pref_path, thread.local_thread_id);
@@ -2123,10 +2129,16 @@ fn renderOpenPaneRow(
     // Status label computed before truncation so the title only surrenders
     // width while a label is actually present.
     var status_buf: [24]u8 = undefined;
-    var lease_buf: [32]u8 = undefined;
-    // "Waiting · build" / "Building" while a leased command of this chat waits or runs.
-    const lease_label = if (compact_tile) "" else if (lease_status) |lease| lease_run_status.label(&lease_buf, lease) else "";
-    const status_label = if (compact_tile) "" else if (lease_label.len > 0) lease_label else paneStatusLabelText(&status_buf, status, running, status_started_at_ms);
+    var agents_buf: [32]u8 = undefined;
+    const agent_wait_label = if (compact_tile) "" else chat_panel.agentActivitySidebarLabel(&agents_buf, agent_activity);
+    // Agents first; otherwise a leased build this chat is waiting on/running.
+    const agents_label = if (agent_wait_label.len > 0 or compact_tile)
+        agent_wait_label
+    else if (lease_status) |lease|
+        lease_run_status.label(&agents_buf, lease)
+    else
+        "";
+    const status_label = if (compact_tile) "" else if (agents_label.len > 0) agents_label else paneStatusLabelText(&status_buf, status, running, status_started_at_ms);
     var shortcut_buf: [16]u8 = undefined;
     const shortcut_label = if (state.ctrl_shortcut_hints_visible and shortcut_index != null and active_shortcut and state.shift_shortcut_hints_visible)
         if (state.command_controller.keyboard_config) |config|
@@ -2142,6 +2154,8 @@ fn renderOpenPaneRow(
         "";
     const status_reserve = if (shortcut_label.len > 0)
         theme.scaledUi(30.0)
+    else if (agents_label.len > 0)
+        theme.scaledUi(SIDEBAR_AGENTS_STATUS_COLUMN_CSS)
     else if (status_label.len > 0)
         theme.scaledUi(SIDEBAR_STATUS_COLUMN_CSS)
     else
@@ -2173,8 +2187,11 @@ fn renderOpenPaneRow(
     // offers over the collapsed rail's bare dots.
     if (shortcut_label.len > 0) {
         renderSidebarShortcutKeyTip(state, rect, clip, shortcut_label);
-    } else if (paneStatusColor(status, running)) |pip_color| {
-        const animated = running or (if (status) |s| s == .working or s == .waiting else false);
+    } else if (paneStatusColor(status, running) orelse
+        (if (agent_activity.waiting()) chat_panel.agentActivityColor(agent_activity) else null)) |status_color|
+    {
+        const pip_color = if (agent_activity.attention > 0) theme.COLOR_YELLOW else status_color;
+        const animated = running or agent_activity.waiting() or (if (status) |s| s == .working or s == .waiting else false);
         const pulse: f32 = if (animated) attentionPulse(state, project_index) else 1.0;
         const dot = theme.scaledUi(6.0);
         const status_font = theme.scaledUi(11.0);
@@ -2276,6 +2293,15 @@ fn openPaneChatThreadIndex(state: *const runtime.AppState, project_index: usize,
     };
 }
 
+/// Agents a chat row's thread is waiting on, including linked chats that
+/// outlive the parent's turn. Marks the thread as a wanted linked-chats
+/// parent so listed rows keep polling their children.
+fn chatAgentActivity(state: *runtime.AppState, project: *const native_state.Project, thread: *const native_state.ChatThread) chat_panel.AgentActivity {
+    if (!thread.committed or thread.isSubagentView()) return .{};
+    _ = state.linked_chats.markWanted(state.allocator, project.id, thread.local_thread_id, unixTimestampMs());
+    return chat_panel.agentActivityForThread(state, project.id, thread);
+}
+
 /// True when a pane should punch through to the attention cluster: chat sends
 /// in flight, or terminal surfaces working/waiting/done/errored. A done pane
 /// stays visible until focusing it acknowledges the completion and resets it
@@ -2290,7 +2316,9 @@ fn paneNeedsAttention(
         .chat => |ref| {
             if (ref.thread_index >= project.threads.items.len) return false;
             const thread = &project.threads.items[ref.thread_index];
-            return chatSurfaceStatusForUi(thread) != .idle;
+            if (chatSurfaceStatusForUi(thread) != .idle) return true;
+            // A parent whose turn ended but whose linked chats still run.
+            return chatAgentActivity(state, project, thread).waiting();
         },
         .terminal => |ref| {
             const surface = state.projectTerminalSurface(project_index, ref.dock_id) orelse return false;
@@ -2325,8 +2353,13 @@ pub fn panePip(
     switch (pane.ref) {
         .chat => |ref| {
             if (ref.thread_index >= project.threads.items.len) return null;
-            status = chatSurfaceStatusForUi(&project.threads.items[ref.thread_index]);
+            const thread = &project.threads.items[ref.thread_index];
+            status = chatSurfaceStatusForUi(thread);
             running = status.? == .working;
+            if (status.? == .idle) {
+                const activity = chatAgentActivity(state, project, thread);
+                if (activity.waiting()) return .{ .color = chat_panel.agentActivityColor(activity), .animated = true, .rank = if (activity.attention > 0) 4 else 2 };
+            }
         },
         .terminal => |ref| {
             const surface = state.projectTerminalSurface(project_index, ref.dock_id) orelse return null;

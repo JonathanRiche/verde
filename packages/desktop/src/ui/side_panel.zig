@@ -205,7 +205,7 @@ fn renderHeader(state: *runtime.AppState, rect: palette.Rect, view: SidePanelVie
     const tab_pad = theme.scaledUi(VIEW_TAB_PAD_X_UI);
     const gap = theme.scaledUi(VIEW_TAB_GAP_UI);
     const dot = theme.scaledUi(BADGE_UI);
-    const agents_active = if (state.sidePanelChatPaneId()) |pane_id| chat_panel.linkedChatsActiveForPane(state, pane_id) else false;
+    const agents_active = if (state.sidePanelChatPaneId()) |pane_id| chat_panel.agentActivityForPane(state, pane_id).waiting() else false;
 
     var file_buffer: [64]WorkspacePaneId = undefined;
     const files = dockedFiles(state, &file_buffer);

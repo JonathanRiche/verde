@@ -699,10 +699,18 @@ pub fn renderWorkspaceAtForPaneWithReserveAndTranscriptLayoutWidth(
             pinned_background_stack_h += theme.scaledUi(8.0) * @as(f32, @floatFromInt(pinned_background_count - 1));
         }
     }
-    const background_task_reserve = if (pinned_background_count > 0)
+    const pinned_background_reserve = if (pinned_background_count > 0)
         pinned_background_stack_h + theme.scaledUi(10.0)
     else
         0.0;
+    // Agents the turn waits on, pinned just above the background commands.
+    var agents_bar: AgentsBar = undefined;
+    const show_agents_bar = !blocked_by_quick and !subagent_view and agentsBarFor(state, live_composer, &agents_bar);
+    const agents_bar_reserve = if (show_agents_bar)
+        theme.scaledUi(AGENTS_BAR_HEIGHT_CSS) + theme.scaledUi(8.0)
+    else
+        0.0;
+    const background_task_reserve = pinned_background_reserve + agents_bar_reserve;
 
     const body = palette.Rect{
         .x = rect.x,
@@ -780,6 +788,16 @@ pub fn renderWorkspaceAtForPaneWithReserveAndTranscriptLayoutWidth(
         );
     }
 
+    if (show_agents_bar) {
+        const bar_rect = snapRect(.{
+            .x = composer_rect.x,
+            .y = composer_rect.y - bang_mode_reserve - attachment_reserve - pinned_background_reserve - theme.scaledUi(AGENTS_BAR_HEIGHT_CSS) - theme.scaledUi(8.0),
+            .w = composer_rect.w,
+            .h = theme.scaledUi(AGENTS_BAR_HEIGHT_CSS),
+        });
+        renderAgentsBar(state, bar_rect, &agents_bar, pane_id);
+    }
+
     // The pin sits above the composer and any draft-image attachments, in the
     // strip reserved by `followup_reserve`. Bottom edge clears the attachments.
     if (show_followup_pin) {
@@ -855,7 +873,7 @@ const LinkedChatsLayout = struct {
     overlay_width: f32 = 0.0,
 };
 
-const LinkedChatHitKind = enum { toggle, open, subagent_open, hide, clear_done };
+const LinkedChatHitKind = enum { toggle, open, subagent_open, hide, clear_done, agents_view, agents_dismiss };
 
 const LINKED_ID_CAPACITY: usize = 192;
 
@@ -974,6 +992,14 @@ pub fn handleLinkedChatsMouseButton(state: *app_state.AppState, x: f32, y: f32, 
         .open => state.openLinkedChat(hit.workspace_id.slice(), hit.local_thread_id.slice()),
         .hide => state.clearLinkedChats(hit.workspace_id.slice(), hit.parent_id.slice(), hit.link_id.slice()),
         .clear_done => state.clearLinkedChats(hit.workspace_id.slice(), hit.parent_id.slice(), null),
+        .agents_view => state.setSidePanelView(.agents),
+        .agents_dismiss => {
+            // link_id carries the spawn signature the bar was showing.
+            const signature = std.fmt.parseInt(u64, hit.link_id.slice(), 10) catch return true;
+            const memory = agentBarMemory(threadKey(hit.parent_id.slice()), unixTimestampMs());
+            memory.dismissed_signature = signature;
+            memory.done_at_ms = 0;
+        },
     }
     return true;
 }
@@ -1017,23 +1043,614 @@ fn markLinkedChatsWanted(state: *app_state.AppState, subagent_view: bool) void {
     _ = state.linked_chats.markWanted(state.allocator, project.id, thread.local_thread_id, unixTimestampMs());
 }
 
-/// Whether the chat pane's thread has linked agents still working. Drives the
-/// side-panel toggle badge while the panel is closed.
-pub fn linkedChatsActiveForPane(state: *app_state.AppState, pane_id: app_state.WorkspacePaneId) bool {
-    if (state.project_controller.projects.items.len == 0) return false;
-    const project = &state.project_controller.projects.items[state.project_controller.selected_index];
-    const thread_index = state.workspaceChatThreadIndexByPane(pane_id) orelse return false;
-    if (thread_index >= project.threads.items.len) return false;
-    const thread = &project.threads.items[thread_index];
-    if (!thread.committed) return false;
-    const parent = state.linked_chats.find(project.id, thread.local_thread_id) orelse return false;
-    for (parent.entries.items) |entry| {
-        switch (entry.status) {
-            .running, .waiting_approval, .blocked => return true,
-            else => {},
+// ---------------------------------------------------------------------------
+// Agent activity: the subagents and linked child chats a parent turn is
+// waiting on, summarized for surfaces outside the Agents view (composer bar,
+// sticky turn status, finish lines, sidebar rows, side-panel toggle badge).
+// Transcript subagents count only while the parent turn is in flight, since
+// a committed row's "running" status can be stale after an interrupt. Linked
+// chats count while active, or once settled when they changed this turn.
+
+const MAX_TURN_AGENTS: usize = 24;
+/// Between turns, a linked child that settled this recently still counts,
+/// so the agents bar can report it finished rather than just disappearing.
+const LINKED_RECENTLY_SETTLED_MS: i64 = 15_000;
+
+const TurnAgentKind = enum { subagent, linked };
+
+const TurnAgent = struct {
+    kind: TurnAgentKind,
+    status: linked_chats.Status,
+    title: LinkedBoundedId = .{},
+    identity: LinkedBoundedId = .{},
+    /// Subagent: transcript row index (as `openSubagent` expects).
+    message_index: usize = 0,
+    tool_call_id: LinkedBoundedId = .{},
+    /// Linked chat: where `openLinkedChat` finds the child.
+    workspace_id: LinkedBoundedId = .{},
+    local_thread_id: LinkedBoundedId = .{},
+    updated_at_ms: i64 = 0,
+};
+
+pub const AgentActivity = struct {
+    total: usize = 0,
+    active: usize = 0,
+    /// Active transcript subagents; stopping the turn stops these.
+    active_subagents: usize = 0,
+    finished: usize = 0,
+    failed: usize = 0,
+    /// Active agents blocked on approval or input.
+    attention: usize = 0,
+    /// Most urgent status among counted agents (`Status.rank`).
+    urgent: linked_chats.Status = .idle,
+    /// Order-independent hash of every counted identity plus the attention
+    /// count. Agents finishing leave it alone, so a dismissed bar returns only
+    /// for a new agent or a new request for input.
+    spawn_signature: u64 = 0,
+
+    pub fn waiting(self: AgentActivity) bool {
+        return self.active > 0;
+    }
+
+    fn note(self: *AgentActivity, agent: *const TurnAgent) void {
+        const status = agent.status;
+        if (self.total == 0 or status.rank() < self.urgent.rank()) self.urgent = status;
+        self.total += 1;
+        if (status.isActive()) {
+            self.active += 1;
+            if (agent.kind == .subagent) self.active_subagents += 1;
+        }
+        if (status == .waiting_approval or status == .blocked) self.attention += 1;
+        if (status.isFinished()) {
+            self.finished += 1;
+            if (status != .completed) self.failed += 1;
+        }
+        self.spawn_signature +%= std.hash.Wyhash.hash(0xA6E7_5AC7_1F17_0001, agent.identity.slice());
+    }
+
+    fn summarize(agents: []const TurnAgent) AgentActivity {
+        var activity: AgentActivity = .{};
+        for (agents) |*agent| activity.note(agent);
+        activity.spawn_signature +%= @as(u64, activity.attention) *% 0x9E37_79B9_7F4A_7C15;
+        return activity;
+    }
+};
+
+fn subagentEntryStatus(entry: anytype) linked_chats.Status {
+    return switch (entry.tool_call_status orelse .unknown) {
+        .pending, .in_progress => .running,
+        .completed => .completed,
+        .failed => .failed,
+        .cancelled => .aborted,
+        .unknown => .unknown,
+    };
+}
+
+fn selectedProjectId(state: *app_state.AppState) ?[]const u8 {
+    if (state.project_controller.projects.items.len == 0) return null;
+    return state.project_controller.projects.items[state.project_controller.selected_index].id;
+}
+
+/// Collects this turn's agents into `out`; `send_state` must already be
+/// locked by the caller. `with_titles` parses subagent bodies for titles;
+/// counting-only callers (sidebar rows, badges) skip that per-frame cost.
+fn collectTurnAgentsLocked(
+    state: *app_state.AppState,
+    project_id: []const u8,
+    thread: *const app_state.ChatThread,
+    with_titles: bool,
+    out: *[MAX_TURN_AGENTS]TurnAgent,
+) usize {
+    if (thread.isSubagentView() or !thread.committed) return 0;
+    const send_state = thread.send_state;
+    const turn_pending = send_state.status == .pending;
+    var count: usize = 0;
+    if (turn_pending) {
+        const events = send_state.pending_events.items;
+        for (events, 0..) |*event, index| {
+            if (count >= out.len) break;
+            if (!isSubagentTimelineEntry(event.*)) continue;
+            // Later rows for the same call carry its newest status.
+            if (event.tool_call_id) |id| {
+                var superseded = false;
+                for (events[index + 1 ..]) |later| {
+                    if (later.tool_call_id) |later_id| {
+                        if (std.mem.eql(u8, id, later_id) and isSubagentTimelineEntry(later)) {
+                            superseded = true;
+                            break;
+                        }
+                    }
+                }
+                if (superseded) continue;
+            }
+            var agent: TurnAgent = .{
+                .kind = .subagent,
+                .status = subagentEntryStatus(event.*),
+                .message_index = thread.messages.items.len + index,
+                .updated_at_ms = event.updated_at_ms orelse 0,
+            };
+            if (event.tool_call_id) |id| {
+                _ = agent.tool_call_id.set(id);
+                _ = agent.identity.set(id);
+            } else {
+                var index_buf: [32]u8 = undefined;
+                _ = agent.identity.set(std.fmt.bufPrint(&index_buf, "row:{d}", .{index}) catch "row");
+            }
+            if (with_titles) {
+                const parsed = chat_types.parseSubagentConversation(event.body);
+                if (!agent.title.set(if (parsed.title.len > 0) parsed.title else "Subagent")) _ = agent.title.set("Subagent");
+            }
+            out[count] = agent;
+            count += 1;
         }
     }
+    const parent = state.linked_chats.find(project_id, thread.local_thread_id) orelse return count;
+    for (parent.entries.items) |*entry| {
+        if (count >= out.len) break;
+        if (entry.is_parent) continue;
+        // Settled children count when they changed this turn, or (between
+        // turns) just now, so the bar can say they finished. Unlinked
+        // children vanish from the list instead, which never reads as done.
+        const settled_since = if (turn_pending) send_state.started_at_ms else unixTimestampMs() - LINKED_RECENTLY_SETTLED_MS;
+        const counted = entry.status.isActive() or
+            (entry.status.isFinished() and entry.updated_at_ms >= settled_since);
+        if (!counted) continue;
+        var agent: TurnAgent = .{ .kind = .linked, .status = entry.status, .updated_at_ms = entry.updated_at_ms };
+        _ = agent.identity.set(entry.link_id);
+        _ = agent.local_thread_id.set(entry.local_thread_id);
+        _ = agent.workspace_id.set(if (entry.workspace_id.len > 0) entry.workspace_id else project_id);
+        if (with_titles and !agent.title.set(if (entry.title.len > 0) entry.title else "Linked chat")) _ = agent.title.set("Linked chat");
+        out[count] = agent;
+        count += 1;
+    }
+    return count;
+}
+
+fn collectTurnAgents(
+    state: *app_state.AppState,
+    project_id: []const u8,
+    thread: *const app_state.ChatThread,
+    with_titles: bool,
+    out: *[MAX_TURN_AGENTS]TurnAgent,
+) usize {
+    thread.send_state.mutex.lock();
+    defer thread.send_state.mutex.unlock();
+    return collectTurnAgentsLocked(state, project_id, thread, with_titles, out);
+}
+
+/// Agents `thread`'s current turn is waiting on. Takes the send mutex.
+pub fn agentActivityForThread(state: *app_state.AppState, project_id: []const u8, thread: *const app_state.ChatThread) AgentActivity {
+    var agents: [MAX_TURN_AGENTS]TurnAgent = undefined;
+    const count = collectTurnAgents(state, project_id, thread, false, &agents);
+    return AgentActivity.summarize(agents[0..count]);
+}
+
+/// Agent activity of the chat shown in `pane_id` (selected workspace).
+/// Drives the side-panel toggle badge while the panel is closed.
+pub fn agentActivityForPane(state: *app_state.AppState, pane_id: app_state.WorkspacePaneId) AgentActivity {
+    const project_id = selectedProjectId(state) orelse return .{};
+    const project = &state.project_controller.projects.items[state.project_controller.selected_index];
+    const thread_index = state.workspaceChatThreadIndexByPane(pane_id) orelse return .{};
+    if (thread_index >= project.threads.items.len) return .{};
+    return agentActivityForThread(state, project_id, &project.threads.items[thread_index]);
+}
+
+/// Accent for an agent summary: attention reads yellow, failures danger,
+/// live work accent.
+pub fn agentActivityColor(activity: AgentActivity) [4]f32 {
+    if (activity.attention > 0) return theme.COLOR_YELLOW;
+    if (activity.active > 0) return theme.accent();
+    if (activity.failed > 0) return theme.danger();
+    return theme.success();
+}
+
+/// Short sidebar status for a working chat that is waiting on agents
+/// ("Waiting · 2 agents", "1/3 agents done", "Agent needs input"); empty
+/// when nothing is running.
+pub fn agentActivitySidebarLabel(buf: []u8, activity: AgentActivity) []const u8 {
+    if (!activity.waiting()) return "";
+    if (activity.attention > 0) return if (activity.attention == 1) "Agent needs input" else "Agents need input";
+    if (activity.finished == 0) {
+        return std.fmt.bufPrint(buf, "Waiting · {d} agent{s}", .{ activity.active, if (activity.active == 1) "" else "s" }) catch "Waiting";
+    }
+    return std.fmt.bufPrint(buf, "{d}/{d} agents done", .{ activity.finished, activity.total }) catch "Waiting";
+}
+
+/// Elapsed time of the in-flight turn, empty when none is pending.
+fn turnElapsedLabel(buf: []u8, thread: *const app_state.ChatThread) []const u8 {
+    const send_state = thread.send_state;
+    send_state.mutex.lock();
+    const pending = send_state.status == .pending;
+    const started_at_ms = send_state.started_at_ms;
+    send_state.mutex.unlock();
+    if (!pending or started_at_ms <= 0) return "";
+    return formatElapsedDuration(buf, started_at_ms);
+}
+
+// Per-thread presentation memory for the agents bar: dismissal and the
+// short "all done" hold after the last agent settles. Keyed by a hash of the
+// thread's local id; slots are recycled oldest-first.
+const AGENT_BAR_MEMORY_LEN: usize = 16;
+/// How long "All agents done" stays up after the last agent settles.
+const AGENT_BAR_DONE_HOLD_MS: i64 = 6_000;
+
+const AgentBarMemory = struct {
+    thread_key: u64 = 0,
+    dismissed_signature: ?u64 = null,
+    last_active: usize = 0,
+    last_total: usize = 0,
+    last_failed: usize = 0,
+    done_at_ms: i64 = 0,
+    touched_ms: i64 = 0,
+};
+
+var agent_bar_memory: [AGENT_BAR_MEMORY_LEN]AgentBarMemory = @splat(.{});
+
+fn threadKey(local_thread_id: []const u8) u64 {
+    return std.hash.Wyhash.hash(0x5EED_A6E7_BA70_0001, local_thread_id) | 1;
+}
+
+fn agentBarMemory(thread_key: u64, now_ms: i64) *AgentBarMemory {
+    var oldest: *AgentBarMemory = &agent_bar_memory[0];
+    for (&agent_bar_memory) |*slot| {
+        if (slot.thread_key == thread_key) {
+            slot.touched_ms = now_ms;
+            return slot;
+        }
+        if (slot.touched_ms < oldest.touched_ms) oldest = slot;
+    }
+    oldest.* = .{ .thread_key = thread_key, .touched_ms = now_ms };
+    return oldest;
+}
+
+const AgentBarMode = enum { hidden, working, all_done };
+
+/// Advances the thread's bar memory with this frame's activity and decides
+/// what the bar shows. The bar hides on dismissal until the spawn signature
+/// changes, and fades out `AGENT_BAR_DONE_HOLD_MS` after the last agent ends.
+fn agentBarMode(memory: *AgentBarMemory, activity: AgentActivity, now_ms: i64) AgentBarMode {
+    if (activity.active > 0) {
+        memory.last_active = activity.active;
+        memory.last_total = activity.total;
+        memory.last_failed = activity.failed;
+        memory.done_at_ms = 0;
+        if (memory.dismissed_signature) |signature| {
+            if (signature == activity.spawn_signature) return .hidden;
+            memory.dismissed_signature = null;
+        }
+        return .working;
+    }
+    if (memory.last_active > 0) {
+        memory.last_active = 0;
+        // A batch the user dismissed ends silently, and so does one whose
+        // agents were unlinked rather than finished (nothing left counted).
+        memory.done_at_ms = if (memory.dismissed_signature == null and activity.finished > 0) now_ms else 0;
+        memory.dismissed_signature = null;
+        if (activity.total > 0) {
+            memory.last_total = activity.total;
+            memory.last_failed = activity.failed;
+        }
+    }
+    if (memory.done_at_ms > 0 and now_ms - memory.done_at_ms < AGENT_BAR_DONE_HOLD_MS) return .all_done;
+    return .hidden;
+}
+
+// Auto-open: the first time a focused chat starts agents while the side
+// panel is closed, open the Agents view once. Closing the panel while those
+// agents still run opts out for the rest of the session.
+var agents_auto_open_declined: bool = false;
+var agents_auto_opened: [AGENT_BAR_MEMORY_LEN]u64 = @splat(0);
+var agents_auto_opened_next: usize = 0;
+var agents_auto_open_watch: u64 = 0;
+
+fn maybeAutoOpenAgentsPanel(state: *app_state.AppState, thread_key: u64, activity: AgentActivity) void {
+    if (agents_auto_open_watch == thread_key) {
+        if (!activity.waiting()) {
+            agents_auto_open_watch = 0;
+        } else if (!state.isSidePanelOpen()) {
+            agents_auto_open_declined = true;
+            agents_auto_open_watch = 0;
+        }
+        return;
+    }
+    if (agents_auto_open_declined or !activity.waiting()) return;
+    for (agents_auto_opened) |key| if (key == thread_key) return;
+    agents_auto_opened[agents_auto_opened_next] = thread_key;
+    agents_auto_opened_next = (agents_auto_opened_next + 1) % agents_auto_opened.len;
+    // Never take over a panel the user has open on another view.
+    if (state.isSidePanelOpen()) return;
+    state.setSidePanelView(.agents);
+    agents_auto_open_watch = thread_key;
+}
+
+// Stream quietness: the provider has gone silent (no new streamed text, no
+// reasoning) for a moment while agents run, so the turn reads as waiting.
+const STREAM_QUIET_MS: i64 = 2_500;
+
+const StreamQuietSlot = struct { send_state: usize = 0, len: usize = 0, changed_ms: i64 = 0 };
+var stream_quiet_slots: [8]StreamQuietSlot = @splat(.{});
+
+/// `send_state` must be locked by the caller.
+fn streamQuietLocked(send_state: *const chat_types.SendState, now_ms: i64) bool {
+    if (send_state.thinking) return false;
+    const key = @intFromPtr(send_state);
+    const len = send_state.partial_text.items.len + send_state.pending_events.items.len;
+    var oldest: *StreamQuietSlot = &stream_quiet_slots[0];
+    for (&stream_quiet_slots) |*slot| {
+        if (slot.send_state == key) {
+            if (slot.len != len) {
+                slot.len = len;
+                slot.changed_ms = now_ms;
+            }
+            return now_ms - slot.changed_ms >= STREAM_QUIET_MS;
+        }
+        if (slot.changed_ms < oldest.changed_ms) oldest = slot;
+    }
+    oldest.* = .{ .send_state = key, .len = len, .changed_ms = now_ms };
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// Agents bar: pinned above the composer while the turn waits on agents, so
+// the wait is visible without the side panel or scrolling. Dismissable; it
+// returns when a new agent starts or one needs input, and clears itself a
+// few seconds after the last agent settles.
+
+const AGENTS_BAR_HEIGHT_CSS: f32 = 40.0;
+const AGENTS_BAR_CHIP_MAX_W_CSS: f32 = 170.0;
+
+const AgentsBar = struct {
+    mode: AgentBarMode,
+    activity: AgentActivity,
+    /// Settled-batch counts kept for the "all done" hold.
+    done_total: usize,
+    done_failed: usize,
+    agents: [MAX_TURN_AGENTS]TurnAgent,
+    count: usize,
+    elapsed_buf: [32]u8,
+    elapsed_len: usize,
+    quiet: bool,
+
+    fn elapsed(self: *const AgentsBar) []const u8 {
+        return self.elapsed_buf[0..self.elapsed_len];
+    }
+};
+
+fn turnAgentBefore(_: void, left: TurnAgent, right: TurnAgent) bool {
+    // Live work first (most urgent first), then the most recently settled.
+    const left_active = left.status.isActive();
+    if (left_active != right.status.isActive()) return left_active;
+    if (left.status.rank() != right.status.rank()) return left.status.rank() < right.status.rank();
+    return left.updated_at_ms > right.updated_at_ms;
+}
+
+/// Builds the bar for the pane's current thread into `out`; false when it is
+/// hidden. The focused pane also drives the one-time Agents panel auto-open.
+fn agentsBarFor(state: *app_state.AppState, live_composer: bool, out: *AgentsBar) bool {
+    const project_id = selectedProjectId(state) orelse return false;
+    const thread = state.currentThread();
+    if (thread.isSubagentView() or !thread.committed) return false;
+    const now_ms = unixTimestampMs();
+    const send_state = thread.send_state;
+    var quiet = false;
+    {
+        send_state.mutex.lock();
+        defer send_state.mutex.unlock();
+        out.count = collectTurnAgentsLocked(state, project_id, thread, true, &out.agents);
+        if (send_state.status == .pending) quiet = streamQuietLocked(send_state, monotonicMs());
+    }
+    std.mem.sort(TurnAgent, out.agents[0..out.count], {}, turnAgentBefore);
+    out.activity = AgentActivity.summarize(out.agents[0..out.count]);
+    const key = threadKey(thread.local_thread_id);
+    if (live_composer) maybeAutoOpenAgentsPanel(state, key, out.activity);
+    const memory = agentBarMemory(key, now_ms);
+    out.mode = agentBarMode(memory, out.activity, now_ms);
+    if (out.mode == .hidden) return false;
+    out.done_total = memory.last_total;
+    out.done_failed = memory.last_failed;
+    out.quiet = quiet;
+    const elapsed = turnElapsedLabel(&out.elapsed_buf, thread);
+    out.elapsed_len = elapsed.len;
+    return true;
+}
+
+fn agentsBarHeadline(buf: []u8, bar: *const AgentsBar) []const u8 {
+    const activity = bar.activity;
+    if (bar.mode == .all_done) {
+        if (bar.done_failed > 0) return std.fmt.bufPrint(buf, "{d} agent{s} finished \u{00B7} {d} failed", .{ bar.done_total, if (bar.done_total == 1) "" else "s", bar.done_failed }) catch "Agents finished";
+        if (bar.done_total <= 1) return "\u{2713} Agent done";
+        return std.fmt.bufPrint(buf, "\u{2713} All {d} agents done", .{bar.done_total}) catch "Agents done";
+    }
+    const elapsed = bar.elapsed();
+    const sep: []const u8 = if (elapsed.len > 0) " \u{00B7} " else "";
+    if (activity.attention > 0) {
+        return std.fmt.bufPrint(buf, "{d} agent{s} need{s} input{s}{s}", .{ activity.attention, if (activity.attention == 1) "" else "s", if (activity.attention == 1) "s" else "", sep, elapsed }) catch "Agent needs input";
+    }
+    if (activity.finished == 0) {
+        return std.fmt.bufPrint(buf, "Waiting on {d} agent{s}{s}{s}", .{ activity.active, if (activity.active == 1) "" else "s", sep, elapsed }) catch "Waiting on agents";
+    }
+    return std.fmt.bufPrint(buf, "{d} of {d} agents done{s}{s}", .{ activity.finished, activity.total, sep, elapsed }) catch "Waiting on agents";
+}
+
+fn renderAgentsBar(state: *app_state.AppState, rect: palette.Rect, bar: *const AgentsBar, pane_id: ?app_state.WorkspacePaneId) void {
+    // Region: pinned agents bar — status dot and headline, one chip per agent
+    // (click opens it), then View (Agents panel) and dismiss on the right.
+    const project_id = selectedProjectId(state) orelse return;
+    const parent_id = state.currentThread().local_thread_id;
+    const mouse_x = state.transcript_controller.palette_mouse_x;
+    const mouse_y = state.transcript_controller.palette_mouse_y;
+    const done = bar.mode == .all_done;
+    const tone = if (done)
+        (if (bar.done_failed > 0) theme.danger() else theme.success())
+    else
+        agentActivityColor(bar.activity);
+    queuePanel(
+        state,
+        rect,
+        paletteColor(theme.mix(theme.background(), tone, 0.07)),
+        paletteColor(theme.withAlpha(tone, 110)),
+        theme.scaledUi(10.0),
+        @max(theme.scaledUi(1.0), 1.0),
+    );
+    const pad = theme.scaledUi(12.0);
+    const cy = rect.y + rect.h * 0.5;
+    const dot_status: linked_chats.Status = if (done)
+        (if (bar.done_failed > 0) .failed else .completed)
+    else
+        bar.activity.urgent;
+    queueLinkedChatStatusDot(state, rect.x + pad, cy, dot_status, rect);
+
+    // Right controls, laid out right to left: dismiss, then View.
+    const control = theme.scaledUi(24.0);
+    const close_rect = snapRect(.{ .x = rect.x + rect.w - theme.scaledUi(8.0) - control, .y = cy - control * 0.5, .w = control, .h = control });
+    const close_hover = rectContains(close_rect, mouse_x, mouse_y);
+    if (close_hover) queueRounded(state, close_rect, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 22)), theme.scaledUi(6.0));
+    const close_icon = theme.scaledUi(11.0);
+    queueIconText(state, .{
+        .x = close_rect.x + (close_rect.w - close_icon) * 0.5,
+        .y = close_rect.y + (close_rect.h - close_icon) * 0.5,
+        .w = close_icon,
+        .h = close_icon,
+    }, NF_COD_CLOSE, paletteColor(if (close_hover) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), close_icon, rect);
+    var signature_buf: [24]u8 = undefined;
+    const signature_text = std.fmt.bufPrint(&signature_buf, "{d}", .{bar.activity.spawn_signature}) catch "0";
+    appendLinkedChatHit(pane_id, close_rect, .agents_dismiss, project_id, parent_id, signature_text, "");
+
+    const view_font = theme.scaledUi(12.0);
+    const view_label = "View";
+    const view_w = chromeLabelWidth(view_font, view_label) + theme.scaledUi(18.0);
+    const view_rect = snapRect(.{ .x = close_rect.x - theme.scaledUi(6.0) - view_w, .y = cy - control * 0.5, .w = view_w, .h = control });
+    const view_hover = rectContains(view_rect, mouse_x, mouse_y);
+    queueRounded(state, view_rect, paletteColor(theme.withAlpha(theme.COLOR_WHITE, if (view_hover) 28 else 14)), control * 0.5);
+    queueCenteredChromeLabel(state, view_rect, view_label, paletteColor(if (view_hover) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), view_font, rect);
+    appendLinkedChatHit(pane_id, view_rect, .agents_view, project_id, parent_id, "", "");
+
+    const headline_font = theme.scaledUi(13.0);
+    var headline_buf: [128]u8 = undefined;
+    const headline_raw = agentsBarHeadline(&headline_buf, bar);
+    const text_x = rect.x + pad + theme.scaledUi(16.0);
+    const controls_left = view_rect.x - theme.scaledUi(10.0);
+    var headline_trunc: [160]u8 = undefined;
+    const headline = truncateUiLabel(&headline_trunc, headline_raw, @max(controls_left - text_x, 0.0), headline_font);
+    const headline_w = chromeLabelWidth(headline_font, headline);
+    queueChromeLabel(state, .{ .x = text_x, .y = cy - headline_font * 0.7, .w = headline_w, .h = headline_font * 1.4 }, headline, paletteColor(theme.COLOR_WHITE), headline_font, rect);
+    if (done) return;
+
+    // Agent chips fill what is left; overflow collapses into "+N".
+    const chip_font = theme.scaledUi(12.0);
+    const chip_h = theme.scaledUi(24.0);
+    const chip_pad = theme.scaledUi(9.0);
+    const chip_dot_slot = theme.scaledUi(14.0);
+    const chip_gap = theme.scaledUi(6.0);
+    const more_reserve = chromeLabelWidth(chip_font, "+00") + chip_gap;
+    var x = text_x + headline_w + theme.scaledUi(14.0);
+    var shown: usize = 0;
+    for (bar.agents[0..bar.count], 0..) |*agent, index| {
+        const remaining_after = bar.count - index - 1;
+        const limit = controls_left - (if (remaining_after > 0) more_reserve else 0.0);
+        const title_max = @min(theme.scaledUi(AGENTS_BAR_CHIP_MAX_W_CSS) - chip_pad * 2.0 - chip_dot_slot, limit - x - chip_pad * 2.0 - chip_dot_slot);
+        if (title_max < theme.scaledUi(40.0)) break;
+        var title_buf: [256]u8 = undefined;
+        const title = truncateUiLabel(&title_buf, agent.title.slice(), title_max, chip_font);
+        const chip_w = chip_pad * 2.0 + chip_dot_slot + chromeLabelWidth(chip_font, title);
+        const chip = snapRect(.{ .x = x, .y = cy - chip_h * 0.5, .w = chip_w, .h = chip_h });
+        const hover = rectContains(chip, mouse_x, mouse_y);
+        queueRounded(state, chip, paletteColor(theme.withAlpha(theme.COLOR_WHITE, if (hover) 26 else 10)), chip_h * 0.5);
+        queueLinkedChatStatusDot(state, chip.x + chip_pad - theme.scaledUi(2.0), cy, agent.status, rect);
+        const title_color = if (agent.status.isFinished()) theme.COLOR_TEXT_MUTED else theme.COLOR_WHITE;
+        queueChromeLabel(state, .{ .x = chip.x + chip_pad + chip_dot_slot, .y = cy - chip_font * 0.7, .w = chip_w - chip_pad * 2.0 - chip_dot_slot, .h = chip_font * 1.4 }, title, paletteColor(if (hover) theme.COLOR_WHITE else title_color), chip_font, rect);
+        switch (agent.kind) {
+            .subagent => {
+                var index_buf: [32]u8 = undefined;
+                const index_text = std.fmt.bufPrint(&index_buf, "{d}", .{agent.message_index}) catch continue;
+                appendLinkedChatHit(pane_id, chip, .subagent_open, project_id, parent_id, index_text, agent.tool_call_id.slice());
+            },
+            .linked => appendLinkedChatHit(pane_id, chip, .open, agent.workspace_id.slice(), parent_id, agent.identity.slice(), agent.local_thread_id.slice()),
+        }
+        x += chip_w + chip_gap;
+        shown += 1;
+    }
+    if (shown < bar.count) {
+        var more_buf: [16]u8 = undefined;
+        const more = std.fmt.bufPrint(&more_buf, "+{d}", .{bar.count - shown}) catch "+";
+        queueChromeLabel(state, .{ .x = x, .y = cy - chip_font * 0.7, .w = chromeLabelWidth(chip_font, more), .h = chip_font * 1.4 }, more, paletteColor(theme.COLOR_TEXT_MUTED), chip_font, rect);
+    }
+}
+
+fn testTurnAgent(identity: []const u8, status: linked_chats.Status) TurnAgent {
+    var agent: TurnAgent = .{ .kind = .linked, .status = status };
+    _ = agent.identity.set(identity);
+    return agent;
+}
+
+test "agent activity counts live, attention and settled agents" {
+    const agents = [_]TurnAgent{
+        testTurnAgent("a", .running),
+        testTurnAgent("b", .waiting_approval),
+        testTurnAgent("c", .completed),
+        testTurnAgent("d", .failed),
+    };
+    const activity = AgentActivity.summarize(agents[0..]);
+    try std.testing.expectEqual(@as(usize, 4), activity.total);
+    try std.testing.expectEqual(@as(usize, 2), activity.active);
+    try std.testing.expectEqual(@as(usize, 1), activity.attention);
+    try std.testing.expectEqual(@as(usize, 2), activity.finished);
+    try std.testing.expectEqual(@as(usize, 1), activity.failed);
+    try std.testing.expectEqual(linked_chats.Status.waiting_approval, activity.urgent);
+
+    // Agents finishing keeps the signature; a new agent or input request changes it.
+    const settled = [_]TurnAgent{
+        testTurnAgent("a", .completed),
+        testTurnAgent("b", .waiting_approval),
+        testTurnAgent("c", .completed),
+        testTurnAgent("d", .failed),
+    };
+    try std.testing.expectEqual(activity.spawn_signature, AgentActivity.summarize(settled[0..]).spawn_signature);
+    const answered = [_]TurnAgent{
+        testTurnAgent("a", .running),
+        testTurnAgent("b", .running),
+        testTurnAgent("c", .completed),
+        testTurnAgent("d", .failed),
+    };
+    try std.testing.expect(activity.spawn_signature != AgentActivity.summarize(answered[0..]).spawn_signature);
+}
+
+test "agent sidebar label names the wait, progress, or input request" {
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("", agentActivitySidebarLabel(&buf, .{ .total = 2, .finished = 2 }));
+    try std.testing.expectEqualStrings("Waiting · 1 agent", agentActivitySidebarLabel(&buf, .{ .total = 1, .active = 1 }));
+    try std.testing.expectEqualStrings("Waiting · 3 agents", agentActivitySidebarLabel(&buf, .{ .total = 3, .active = 3 }));
+    try std.testing.expectEqualStrings("1/3 agents done", agentActivitySidebarLabel(&buf, .{ .total = 3, .active = 2, .finished = 1 }));
+    try std.testing.expectEqualStrings("Agent needs input", agentActivitySidebarLabel(&buf, .{ .total = 2, .active = 2, .attention = 1 }));
+}
+
+test "agents bar stays dismissed until a new agent starts and briefly holds all done" {
+    var memory: AgentBarMemory = .{};
+    const two = [_]TurnAgent{ testTurnAgent("a", .running), testTurnAgent("b", .running) };
+    const working = AgentActivity.summarize(two[0..]);
+    try std.testing.expectEqual(AgentBarMode.working, agentBarMode(&memory, working, 1_000));
+
+    memory.dismissed_signature = working.spawn_signature;
+    const one_done = [_]TurnAgent{ testTurnAgent("a", .completed), testTurnAgent("b", .running) };
+    try std.testing.expectEqual(AgentBarMode.hidden, agentBarMode(&memory, AgentActivity.summarize(one_done[0..]), 2_000));
+
+    const three = [_]TurnAgent{ testTurnAgent("a", .completed), testTurnAgent("b", .running), testTurnAgent("c", .running) };
+    try std.testing.expectEqual(AgentBarMode.working, agentBarMode(&memory, AgentActivity.summarize(three[0..]), 3_000));
+
+    const all_done = [_]TurnAgent{ testTurnAgent("a", .completed), testTurnAgent("b", .completed), testTurnAgent("c", .failed) };
+    const finished = AgentActivity.summarize(all_done[0..]);
+    try std.testing.expectEqual(AgentBarMode.all_done, agentBarMode(&memory, finished, 4_000));
+    try std.testing.expectEqual(@as(usize, 3), memory.last_total);
+    try std.testing.expectEqual(@as(usize, 1), memory.last_failed);
+    try std.testing.expectEqual(AgentBarMode.all_done, agentBarMode(&memory, finished, 4_000 + AGENT_BAR_DONE_HOLD_MS - 1));
+    try std.testing.expectEqual(AgentBarMode.hidden, agentBarMode(&memory, finished, 4_000 + AGENT_BAR_DONE_HOLD_MS));
+
+    // A dismissed batch ends without the "all done" hold.
+    var dismissed: AgentBarMemory = .{};
+    _ = agentBarMode(&dismissed, working, 1_000);
+    dismissed.dismissed_signature = working.spawn_signature;
+    const both_done = [_]TurnAgent{ testTurnAgent("a", .completed), testTurnAgent("b", .completed) };
+    try std.testing.expectEqual(AgentBarMode.hidden, agentBarMode(&dismissed, AgentActivity.summarize(both_done[0..]), 2_000));
 }
 
 /// Agents view of the side panel: the linked chats and subagents of the chat
@@ -4924,6 +5541,11 @@ fn transcriptPendingStreamHeight(state: *app_state.AppState, thread: *const app_
     }
     const stream_msg_idx = base + send_state.pending_events.items.len;
     total += pendingStreamBodyHeight(state, send_state, stream_msg_idx, column_width, variant_hash) + theme.scaledUi(12.0);
+    if (selectedProjectId(state)) |project_id| {
+        var agents: [MAX_TURN_AGENTS]TurnAgent = undefined;
+        const agent_count = collectTurnAgentsLocked(state, project_id, thread, false, &agents);
+        total += turnFinishLinesHeight(turnFinishLineCount(agents[0..agent_count]));
+    }
     return total;
 }
 
@@ -5028,9 +5650,17 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
         pi += 1;
     }
 
-    var status_buf: [40]u8 = undefined;
+    var agents: [MAX_TURN_AGENTS]TurnAgent = undefined;
+    const agent_count = if (selectedProjectId(state)) |project_id| collectTurnAgentsLocked(state, project_id, thread, true, &agents) else 0;
+    const activity = AgentActivity.summarize(agents[0..agent_count]);
+    // Silent provider plus running agents: the turn is waiting, not writing.
+    const waiting_on_agents = activity.waiting() and streamQuietLocked(send_state, monotonicMs());
+
+    var status_buf: [64]u8 = undefined;
     const working_label = if (send_state.local_command)
         formatPendingCommandLabel(&status_buf, send_state.started_at_ms)
+    else if (waiting_on_agents)
+        formatPendingWaitingLabel(&status_buf, send_state.started_at_ms, activity.active)
     else
         formatPendingWorkingLabel(&status_buf, send_state.started_at_ms, thinkingLabelShown(send_state.thinking, send_state.thinking_cleared_at_ms, monotonicMs()));
     const stream_text: []const u8 = send_state.streamRevealedText();
@@ -5050,6 +5680,108 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
         });
         renderTranscriptBubbleFromParts(state, column, y, assistant_h, .assistant, working_label, body, stream_text.len == 0, stream_plain, clip, stream_msg_idx, stream_text.len > 0, true);
     }
+    renderTurnFinishLines(state, column, y + assistant_h + theme.scaledUi(12.0), clip, agents[0..agent_count]);
+    // The working label rides on the stream bubble's header; once that has
+    // scrolled out of view, keep it pinned to the viewport's top edge.
+    const header_visible = y + theme.scaledUi(STICKY_TURN_HEADER_CSS) >= clip.y and y <= clip.y + clip.h;
+    if (!send_state.local_command and !header_visible) renderStickyTurnStatus(state, clip, working_label, activity, waiting_on_agents);
+}
+
+/// Label for a pending turn whose provider is idle while agents run.
+fn formatPendingWaitingLabel(buf: []u8, started_at_ms: i64, active: usize) []const u8 {
+    var elapsed_buf: [32]u8 = undefined;
+    const elapsed = formatElapsedDuration(&elapsed_buf, started_at_ms);
+    return std.fmt.bufPrint(buf, "Waiting on {d} agent{s} - {s}", .{ active, if (active == 1) "" else "s", elapsed }) catch "Waiting on agents";
+}
+
+// Finish lines: one quiet row per agent that settled during this turn, under
+// the streamed reply, so "I'll report as each finishes" has visible follow-up
+// before the model writes about it. Status chrome, not transcript content.
+const TURN_FINISH_LINE_H_CSS: f32 = 22.0;
+const MAX_TURN_FINISH_LINES: usize = 6;
+
+fn turnFinishLineCount(agents: []const TurnAgent) usize {
+    var count: usize = 0;
+    for (agents) |agent| {
+        if (agent.status.isFinished()) count += 1;
+    }
+    return @min(count, MAX_TURN_FINISH_LINES);
+}
+
+fn turnFinishLinesHeight(count: usize) f32 {
+    if (count == 0) return 0.0;
+    return @as(f32, @floatFromInt(count)) * theme.scaledUi(TURN_FINISH_LINE_H_CSS) + theme.scaledUi(12.0);
+}
+
+fn turnAgentSettledEarlier(_: void, left: TurnAgent, right: TurnAgent) bool {
+    return left.updated_at_ms < right.updated_at_ms;
+}
+
+fn renderTurnFinishLines(state: *app_state.AppState, column: palette.Rect, top: f32, clip: palette.Rect, agents: []const TurnAgent) void {
+    // Region: settled-agent lines, oldest first, newest at the tail.
+    var finished: [MAX_TURN_AGENTS]TurnAgent = undefined;
+    var count: usize = 0;
+    for (agents) |agent| {
+        if (!agent.status.isFinished()) continue;
+        finished[count] = agent;
+        count += 1;
+    }
+    if (count == 0) return;
+    std.mem.sort(TurnAgent, finished[0..count], {}, turnAgentSettledEarlier);
+    const first = count - @min(count, MAX_TURN_FINISH_LINES);
+    const line_h = theme.scaledUi(TURN_FINISH_LINE_H_CSS);
+    const font = theme.scaledUi(12.0);
+    const icon_w = theme.scaledUi(18.0);
+    var y = top;
+    for (finished[first..count]) |*agent| {
+        defer y += line_h;
+        if (y + line_h < clip.y or y > clip.y + clip.h) continue;
+        const ok = agent.status == .completed;
+        const tone = if (ok) theme.success() else theme.danger();
+        const glyph: []const u8 = if (ok) "\u{2713}" else "\u{2715}";
+        const verb: []const u8 = switch (agent.status) {
+            .completed => "finished",
+            .failed => "failed",
+            .aborted => "stopped",
+            else => "interrupted",
+        };
+        const x = column.x + theme.scaledUi(6.0);
+        queueChromeLabel(state, .{ .x = x, .y = y + (line_h - font * 1.4) * 0.5, .w = icon_w, .h = font * 1.4 }, glyph, paletteColor(tone), font, clip);
+        var age_buf: [16]u8 = undefined;
+        const age = linkedChatAgeLabel(&age_buf, agent.updated_at_ms);
+        var line_buf: [320]u8 = undefined;
+        const raw = if (age.len > 0)
+            std.fmt.bufPrint(&line_buf, "{s} {s} \u{00B7} {s}", .{ agent.title.slice(), verb, age }) catch verb
+        else
+            std.fmt.bufPrint(&line_buf, "{s} {s}", .{ agent.title.slice(), verb }) catch verb;
+        const text_w = @max(column.w - icon_w - theme.scaledUi(12.0), 0.0);
+        var trunc_buf: [352]u8 = undefined;
+        const line = truncateUiLabel(&trunc_buf, raw, text_w, font);
+        queueChromeLabel(state, .{ .x = x + icon_w, .y = y + (line_h - font * 1.4) * 0.5, .w = text_w, .h = font * 1.4 }, line, paletteColor(theme.COLOR_TEXT_MUTED), font, clip);
+    }
+}
+
+// Sticky turn status: a small pill at the top of the transcript viewport
+// that repeats the stream header ("Working - 1:01", "Waiting on 2 agents -
+// 1:01") while the header itself is scrolled out of view.
+const STICKY_TURN_HEADER_CSS: f32 = 22.0;
+
+fn renderStickyTurnStatus(state: *app_state.AppState, clip: palette.Rect, label: []const u8, activity: AgentActivity, waiting_on_agents: bool) void {
+    const font = theme.scaledUi(12.0);
+    const pad_x = theme.scaledUi(12.0);
+    const dot_slot = theme.scaledUi(16.0);
+    const text_w = chromeLabelWidth(font, label);
+    const h = theme.scaledUi(26.0);
+    const w = @min(pad_x * 2.0 + dot_slot + text_w, clip.w - theme.scaledUi(16.0));
+    if (w <= dot_slot + pad_x * 2.0) return;
+    const pill = snapRect(.{ .x = clip.x + (clip.w - w) * 0.5, .y = clip.y + theme.scaledUi(8.0), .w = w, .h = h });
+    const tone = if (waiting_on_agents or activity.attention > 0) agentActivityColor(activity) else theme.accent();
+    queuePanel(state, pill, paletteColor(theme.mix(theme.background(), tone, 0.10)), paletteColor(theme.withAlpha(tone, 120)), h * 0.5, @max(theme.scaledUi(1.0), 1.0));
+    const status: linked_chats.Status = if (activity.attention > 0) .waiting_approval else .running;
+    queueLinkedChatStatusDot(state, pill.x + pad_x - theme.scaledUi(2.0), pill.y + h * 0.5, status, pill);
+    var trunc_buf: [96]u8 = undefined;
+    const shown = truncateUiLabel(&trunc_buf, label, w - pad_x * 2.0 - dot_slot, font);
+    queueChromeLabel(state, .{ .x = pill.x + pad_x + dot_slot, .y = pill.y + (h - font * 1.4) * 0.5, .w = w - pad_x * 2.0 - dot_slot, .h = font * 1.4 }, shown, paletteColor(theme.COLOR_WHITE), font, pill);
 }
 
 fn unixTimestampMs() i64 {
@@ -9687,6 +10419,8 @@ fn renderSubagentComposerBanner(state: *app_state.AppState, rect: palette.Rect) 
 fn renderComposer(state: *app_state.AppState, rect: palette.Rect) void {
     state.syncPaletteComposerFromDraft();
     state.syncPaletteComposerControls();
+    // After the controls sync, which resets the default placeholder.
+    syncAgentsWaitingPlaceholder(state);
     state.setPaletteComposerBounds(.{ rect.x, rect.y }, .{ rect.x + rect.w, rect.y + rect.h });
     state.updateFileSearch();
     var composer_batch: palette.RenderBatch = .{};
@@ -9703,6 +10437,21 @@ fn renderComposer(state: *app_state.AppState, rect: palette.Rect) void {
     renderComposerFollowupHint(state);
     renderComposerToolbarIcons(state);
     state.syncComposerToolbarOverlayHitRects();
+}
+
+/// While the turn waits on agents, the empty prompt says so and that a
+/// follow-up can still be queued. Runs after `syncPaletteComposerControls`,
+/// which sets the default placeholder every frame.
+fn syncAgentsWaitingPlaceholder(state: *app_state.AppState) void {
+    const thread = state.currentThread();
+    if (thread.draftImageCount() > 0 or thread.isSendAcceptancePending() or state.composerInBangCommandMode()) return;
+    if (state.composer_controller.composer.text().len > 0) return;
+    const project_id = selectedProjectId(state) orelse return;
+    const activity = agentActivityForThread(state, project_id, thread);
+    if (!activity.waiting()) return;
+    var buf: [96]u8 = undefined;
+    const placeholder = std.fmt.bufPrint(&buf, "Waiting on {d} agent{s}\u{2026} type to queue a follow-up", .{ activity.active, if (activity.active == 1) "" else "s" }) catch return;
+    state.composer_controller.composer.setPlaceholder(state.allocator, placeholder) catch {};
 }
 
 /// Renders the unfocused split-pane prompt preview without touching the shared live composer widget.
@@ -10732,7 +11481,33 @@ fn renderComposerShortcutHints(state: *app_state.AppState, directory_rect: palet
         renderComposerSelectorTooltip(state, model_rect, "Choose model", keybinds.formatFirstKeybind(&shortcut_buf, config.chat_model_picker));
     } else if (state.composer_controller.composer.showReasoningToggle() and run_rect.contains(point)) {
         renderComposerSelectorTooltip(state, run_rect, "Run settings", keybinds.formatFirstKeybind(&shortcut_buf, config.chat_run_config));
+    } else if (state.hasPendingStream() and state.composer_controller.composer.sendButtonRect().contains(point)) {
+        renderStopButtonAgentsTooltip(state);
     }
+}
+
+/// Stop-button hover while agents run: say what is still working so the
+/// user knows the turn is waiting, not stuck, before they stop it.
+fn renderStopButtonAgentsTooltip(state: *app_state.AppState) void {
+    const project_id = selectedProjectId(state) orelse return;
+    const activity = agentActivityForThread(state, project_id, state.currentThread());
+    if (!activity.waiting()) return;
+    var buf: [96]u8 = undefined;
+    const label = std.fmt.bufPrint(&buf, "Stop turn \u{00B7} {d} agent{s} running", .{ activity.active, if (activity.active == 1) "" else "s" }) catch return;
+    const target = state.composer_controller.composer.sendButtonRect();
+    const font_size = theme.scaledUi(11.0);
+    const text_w = app_state.paletteUiTextPrefixWidth(label, font_size, label.len);
+    const pad_x = theme.scaledUi(7.0);
+    const w = text_w + pad_x * 2.0;
+    // Right-aligned to the button: it sits at the composer's right edge.
+    const rect: palette.Rect = .{
+        .x = target.x + target.w - w,
+        .y = target.y - theme.scaledUi(28.0),
+        .w = w,
+        .h = theme.scaledUi(22.0),
+    };
+    queuePanel(state, rect, paletteColor(theme.COLOR_PANEL_ALT), paletteColor(theme.borderMuted()), theme.scaledUi(5.0), theme.scaledUi(0.75));
+    queueText(state, .{ .x = rect.x + pad_x, .y = rect.y + (rect.h - font_size * 1.25) * 0.5, .w = text_w, .h = font_size * 1.25 }, label, paletteColor(theme.COLOR_TEXT_MUTED), font_size, rect);
 }
 
 fn renderShortcutKeyTip(state: *app_state.AppState, target: palette.Rect, label: []const u8) void {

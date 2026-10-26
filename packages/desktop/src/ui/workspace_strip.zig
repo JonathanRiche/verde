@@ -13,6 +13,7 @@ const text_measure = @import("text_measure.zig");
 const runtime = @import("runtime.zig");
 const sidebar = @import("sidebar.zig");
 const chat_panel = @import("chat_panel.zig");
+const profiler = @import("../runtime/profiler.zig");
 
 /// Strip height in unscaled UI units: one compact tab row, matching the
 /// sidebar header row so the pane region loses the least height possible.
@@ -265,19 +266,38 @@ fn renderSidePanelToggle(state: *runtime.AppState, strip: palette.Rect, rect: pa
     sidebar.queueSidePanelToggleGlyph(state, rect, open, hovered, strip);
     if (!open) {
         if (state.sidePanelChatPaneId()) |pane_id| {
-            // Linked agents still working while the panel is hidden.
-            if (chat_panel.linkedChatsActiveForPane(state, pane_id)) {
-                const dot = theme.scaledUi(PIP_SIZE_UI);
-                queueRoundedRectClipped(state, .{
-                    .x = rect.x + rect.w - dot - theme.scaledUi(2.0),
-                    .y = rect.y + theme.scaledUi(3.0),
-                    .w = dot,
-                    .h = dot,
-                }, paletteColor(theme.COLOR_GREEN), dot * 0.5, strip);
-            }
+            // Agents still working while the panel is hidden: a count badge
+            // tinted by the most urgent status, breathing while they run.
+            const activity = chat_panel.agentActivityForPane(state, pane_id);
+            if (activity.waiting()) renderAgentCountBadge(state, rect, strip, activity);
         }
     }
     addHit(rect, .side_panel_toggle, project_index, 0);
+}
+
+fn renderAgentCountBadge(state: *runtime.AppState, toggle: palette.Rect, strip: palette.Rect, activity: chat_panel.AgentActivity) void {
+    var count_buf: [8]u8 = undefined;
+    const count = if (activity.active > 9) "9+" else std.fmt.bufPrint(&count_buf, "{d}", .{activity.active}) catch return;
+    const font_size = theme.scaledUi(9.0);
+    const text_w = runtime.paletteUiTextPrefixWidth(count, font_size, count.len);
+    const h = theme.scaledUi(13.0);
+    const w = @max(h, text_w + theme.scaledUi(6.0));
+    const badge: palette.Rect = .{
+        .x = toggle.x + toggle.w - w + theme.scaledUi(3.0),
+        .y = toggle.y + theme.scaledUi(1.0),
+        .w = w,
+        .h = h,
+    };
+    const color = chat_panel.agentActivityColor(activity);
+    // Attention breathes harder than plain running so it reads as a request.
+    var alpha: f32 = 1.0;
+    if (!state.app_config.reduced_motion.status_pulse) {
+        state.sidebar_pulse_animating = true;
+        const pulse = theme.activityPulse(profiler.nowNs());
+        alpha = if (activity.attention > 0) 0.45 + 0.55 * pulse else 0.75 + 0.25 * pulse;
+    }
+    queueRoundedRectClipped(state, badge, paletteColor(theme.withAlpha(color, @intFromFloat(alpha * 255.0))), h * 0.5, strip);
+    queueCenteredText(state, badge, count, text_w, paletteColor(theme.background()), font_size, strip);
 }
 
 /// One tab body: rectangular background with a hairline edge so adjacent
