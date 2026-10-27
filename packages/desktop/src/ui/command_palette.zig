@@ -125,7 +125,7 @@ const STATIC_COMMANDS = [_]Command{
     .{ .id = "browser.tab.close", .title = "Browser: Close Active Tab", .keywords = "web page remove", .section = .panes, .run = runCloseBrowserTab, .enabled = hasBrowserTab },
     .{ .id = "browser.cookies.import", .title = "Browser: Import Cookies\xE2\x80\xA6", .keywords = "cookies login session import sign in firefox chrome", .section = .panes, .run = runImportCookies, .enabled = hasBrowserPane },
     .{ .id = "pane.close", .title = "Close Pane", .section = .panes, .keybind = .workspace_close, .run = runClosePane, .enabled = hasProjects },
-    .{ .id = "pane.zoom", .title = "Zoom Pane", .keywords = "maximize restore fullscreen", .section = .panes, .keybind = .workspace_toggle_maximize, .run = runZoomPane, .enabled = hasProjects },
+    .{ .id = "pane.zoom", .title = "Zoom Pane", .keywords = "maximize restore fullscreen", .section = .panes, .keybind = .workspace_toggle_maximize, .run = runZoomPane, .enabled = canZoomFocusedPane },
     .{ .id = "pane.previous", .title = "Previous Pane", .keywords = "niri scroll focus left up back", .section = .panes, .keybind = .workspace_previous_pane, .run = runPreviousPane, .enabled = canFocusPreviousPane },
     .{ .id = "pane.next", .title = "Next Pane", .keywords = "niri scroll focus right down forward", .section = .panes, .keybind = .workspace_next_pane, .run = runNextPane, .enabled = canFocusNextPane },
     .{ .id = "pane.float", .title = "Float Focused Pane", .keywords = "quick scratch overlay", .section = .panes, .run = runFloatPane, .enabled = hasProjects },
@@ -1361,6 +1361,10 @@ fn hasProjectsAndGrok(state: *runtime.AppState) bool {
 
 fn grokSetupNeeded(_: *runtime.AppState) bool {
     return !native_state.AppState.grokTuiInstalled();
+}
+
+fn canZoomFocusedPane(state: *runtime.AppState) bool {
+    return state.canToggleFocusedWorkspacePaneMaximized();
 }
 
 fn hasQuickPane(state: *runtime.AppState) bool {

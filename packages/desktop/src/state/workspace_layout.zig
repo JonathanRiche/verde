@@ -597,6 +597,30 @@ pub const WorkspaceLayout = struct {
         return count;
     }
 
+    /// Whether zoom means anything for `pane_id`: it needs a sibling to hide,
+    /// either in its own tab (strip) or in the workspace (tiled). A pane that
+    /// is already zoomed can always be restored.
+    pub fn paneCanToggleZoom(self: *const WorkspaceLayout, pane_id: WorkspacePaneId, strip_active: bool) bool {
+        if (self.maximized_pane_id == pane_id) return true;
+        return self.paneHasZoomSiblings(pane_id, strip_active);
+    }
+
+    /// Clears a zoom left with nothing to hide, e.g. after its last sibling
+    /// in the tab (strip) or workspace (tiled) closed.
+    pub fn dropLoneZoom(self: *WorkspaceLayout, strip_active: bool) void {
+        const zoomed = self.maximized_pane_id orelse return;
+        if (!self.paneHasZoomSiblings(zoomed, strip_active)) self.maximized_pane_id = null;
+    }
+
+    fn paneHasZoomSiblings(self: *const WorkspaceLayout, pane_id: WorkspacePaneId, strip_active: bool) bool {
+        if (!self.rootContainsPane(pane_id)) return false;
+        if (strip_active) {
+            const group_id = self.scrollGroupIdForPane(pane_id) orelse return false;
+            return self.scrollGroupPaneCount(group_id) > 1;
+        }
+        return self.visiblePaneCount() > 1;
+    }
+
     /// Records the active child so leaving and later re-entering a tiled
     /// scrolling item restores the user's position inside that tile group.
     pub fn rememberScrollGroupFocusedPane(self: *WorkspaceLayout, pane_id: WorkspacePaneId) bool {
@@ -1396,6 +1420,7 @@ pub const WorkspaceLayout = struct {
                 }
             }
         }
+        self.dropLoneZoom(strip_active);
         return removed_ref;
     }
 
@@ -2467,6 +2492,30 @@ test "focus that lands in a zoomed tabspace after a close takes its zoom" {
     deinitWorkspacePaneRef(&removed, allocator);
     try std.testing.expectEqual(@as(?WorkspacePaneId, fixture.a3), layout.focused_pane_id);
     try std.testing.expectEqual(@as(?WorkspacePaneId, fixture.a3), layout.maximized_pane_id);
+}
+
+test "closing the last sibling of a zoomed pane clears the zoom" {
+    const allocator = std.testing.allocator;
+    var fixture = try buildTwoTabZoomFixture(allocator);
+    defer fixture.layout.deinit(allocator);
+    const layout = &fixture.layout;
+    layout.focused_pane_id = fixture.a;
+    layout.maximized_pane_id = fixture.a;
+
+    // Strip: zoom survives while its tab still has a sibling.
+    var removed = layout.closePaneWithZoomScope(allocator, fixture.a2, true).?;
+    deinitWorkspacePaneRef(&removed, allocator);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, fixture.a), layout.maximized_pane_id);
+    removed = layout.closePaneWithZoomScope(allocator, fixture.a3, true).?;
+    deinitWorkspacePaneRef(&removed, allocator);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, null), layout.maximized_pane_id);
+    try std.testing.expect(!layout.paneCanToggleZoom(fixture.a, true));
+
+    // Tiled: zoom spans the workspace, so it clears with the last other pane.
+    layout.maximized_pane_id = fixture.a;
+    removed = layout.closePaneWithZoomScope(allocator, fixture.b, false).?;
+    deinitWorkspacePaneRef(&removed, allocator);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, null), layout.maximized_pane_id);
 }
 
 test "docked files list in their tab's panel, persist, and undock into tabs" {

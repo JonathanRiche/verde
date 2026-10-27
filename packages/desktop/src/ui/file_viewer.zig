@@ -234,6 +234,8 @@ fn renderHeader(state: *runtime.AppState, doc: *Document, geometry: *PaneGeometr
     const open_x = if (geometry.docked) far_x else blk: {
         const close_rect: palette.Rect = .{ .x = far_x, .y = control_y, .w = control, .h = control };
         renderIconButton(state, geometry, .close, close_rect, NF_COD_CLOSE, clip);
+        // A lone pane has no zoom control, so its slot collapses.
+        if (!state.canToggleCurrentProjectWorkspacePaneMaximized(geometry.pane_id)) break :blk close_rect.x - gap - control;
         const zoom_x = close_rect.x - gap - control;
         break :blk zoom_x - gap - control;
     };

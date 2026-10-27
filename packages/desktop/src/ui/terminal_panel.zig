@@ -1395,7 +1395,7 @@ fn renderContextMenu(state: *app_state.AppState, dock: anytype, dock_rect: palet
             if (state.isCurrentProjectWorkspacePaneMaximized(pane_id)) "Unzoom Pane" else "Zoom Pane"
         else
             "Zoom Pane";
-        enabled[count] = has_workspace_pane;
+        enabled[count] = if (workspace_pane_id) |pane_id| state.canToggleCurrentProjectWorkspacePaneMaximized(pane_id) else false;
         count += 1;
         actions[count] = .split_up;
         labels[count] = "Split Above";

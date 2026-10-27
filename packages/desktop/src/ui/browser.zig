@@ -1323,7 +1323,7 @@ fn renderToolbarOverflowMenu(
     const pane_id = state.currentProjectVisibleBrowserPaneId();
     const docked = browserPaneIsDocked(state);
     const maximized = if (pane_id) |id| state.isCurrentProjectWorkspacePaneMaximized(id) else false;
-    renderToolbarOverflowRow(state, overflowRowRect(y, row_h, pad, menu_w), if (maximized) "Restore pane" else "Maximize pane", .maximize_pane, pane_id != null and !docked);
+    renderToolbarOverflowRow(state, overflowRowRect(y, row_h, pad, menu_w), if (maximized) "Restore pane" else "Maximize pane", .maximize_pane, if (pane_id) |id| !docked and state.canToggleCurrentProjectWorkspacePaneMaximized(id) else false);
     y += row_h;
     const detached = browserPaneIsDetached(state);
     renderToolbarOverflowRow(state, overflowRowRect(y, row_h, pad, menu_w), if (detached) "Return pane to layout" else "Float pane", .toggle_detach, pane_id != null and !docked);

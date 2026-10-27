@@ -1060,6 +1060,24 @@ pub fn isCurrentProjectWorkspacePaneFocused(self: anytype, pane_id: WorkspacePan
     return self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout.focused_pane_id == pane_id;
 }
 
+/// Zoom needs another pane in the same tab (strip) or workspace (tiled).
+pub fn canToggleCurrentProjectWorkspacePaneMaximized(self: anytype, pane_id: WorkspacePaneId) bool {
+    if (self.project_controller.projects.items.len == 0) return false;
+    return self.canToggleWorkspacePaneMaximized(self.project_controller.selected_index, pane_id);
+}
+
+pub fn canToggleWorkspacePaneMaximized(self: anytype, project_index: usize, pane_id: WorkspacePaneId) bool {
+    if (project_index >= self.project_controller.projects.items.len) return false;
+    const layout = &self.project_controller.projects.items[project_index].workspace_layout;
+    return layout.paneCanToggleZoom(pane_id, self.workspaceScrollingStripActive(layout));
+}
+
+pub fn canToggleFocusedWorkspacePaneMaximized(self: anytype) bool {
+    if (self.project_controller.projects.items.len == 0) return false;
+    const pane_id = self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout.focused_pane_id orelse return false;
+    return self.canToggleCurrentProjectWorkspacePaneMaximized(pane_id);
+}
+
 pub fn isCurrentProjectWorkspacePaneMaximized(self: anytype, pane_id: WorkspacePaneId) bool {
     if (self.project_controller.projects.items.len == 0) return false;
     return self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout.maximized_pane_id == pane_id;
@@ -1262,6 +1280,7 @@ pub fn toggleWorkspacePaneMaximized(self: anytype, project_index: usize, pane_id
     if (project_index >= self.project_controller.projects.items.len) return false;
     var layout = &self.project_controller.projects.items[project_index].workspace_layout;
     const pane = layout.paneById(pane_id) orelse return false;
+    if (!layout.paneCanToggleZoom(pane_id, self.workspaceScrollingStripActive(layout))) return false;
     runtime_log.trace("pane maximize toggle begin project={d} pane={d} kind={s} currently_maximized={any}", .{
         project_index,
         pane_id,

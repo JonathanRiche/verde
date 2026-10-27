@@ -3389,8 +3389,10 @@ fn renderLeafWithin(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, 
         pane_rect_count += 1;
     }
     const maximized = state.isCurrentProjectWorkspacePaneMaximized(pane_id);
+    // Zoom is hidden for a lone pane, so its slot collapses too.
+    const zoom_slot_css: f32 = if (state.canToggleCurrentProjectWorkspacePaneMaximized(pane_id)) PANE_CHROME_CONTROL_SIZE_CSS + PANE_CHROME_CONTROL_GAP_CSS else 0.0;
     const reserve = if (kind == .chat)
-        theme.scaledUi(CHAT_PANE_HEADER_RIGHT_RESERVE_CSS + (if (paneShowsSidePanelToggle(state, kind)) PANE_CHROME_CONTROL_SIZE_CSS + PANE_CHROME_CONTROL_GAP_CSS else 0.0))
+        theme.scaledUi(CHAT_PANE_HEADER_RIGHT_RESERVE_CSS - (PANE_CHROME_CONTROL_SIZE_CSS + PANE_CHROME_CONTROL_GAP_CSS) + zoom_slot_css + (if (paneShowsSidePanelToggle(state, kind)) PANE_CHROME_CONTROL_SIZE_CSS + PANE_CHROME_CONTROL_GAP_CSS else 0.0))
     else
         0.0;
     const header_h = switch (kind) {
@@ -3417,7 +3419,7 @@ fn renderLeafWithin(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, 
             // One live page at a time: a second visible browser waits its turn.
             if (state.claimBrowserPanePresentation(pane_id)) {
                 browser_pane_rendered = true;
-                browser_panel.renderDockAtWithReserve(state, rect, theme.scaledUi(BROWSER_TOOLBAR_RIGHT_RESERVE_CSS));
+                browser_panel.renderDockAtWithReserve(state, rect, if (zoom_slot_css > 0.0) theme.scaledUi(BROWSER_TOOLBAR_RIGHT_RESERVE_CSS) else 0.0);
             } else {
                 browser_panel.renderPendingPresentation(state, rect);
             }
@@ -3497,6 +3499,8 @@ fn renderZoomControl(
     header_h: f32,
     maximized: bool,
 ) void {
+    // A lone pane in its tab has nothing to zoom over.
+    const can_zoom = state.canToggleCurrentProjectWorkspacePaneMaximized(pane_id);
     const control_size = theme.scaledUi(PANE_CHROME_CONTROL_SIZE_CSS);
     const margin = theme.scaledUi(PANE_CHROME_RIGHT_MARGIN_CSS);
     // Browser owns the far-right close action; keep zoom immediately to its left.
@@ -3533,6 +3537,7 @@ fn renderZoomControl(
         sidebar_ui.queueSidePanelToggleGlyph(state, toggle_rect, state.isSidePanelOpen(), toggle_hovered, pane_rect);
         appendHit(.{ .pane_id = pane_id, .action = .toggle_side_panel, .rect = toggle_rect });
     }
+    if (!can_zoom) return;
     if (kind == .terminal and !maximized and !state.alt_shortcut_hints_visible) {
         const hover_rect: palette.Rect = .{
             .x = pane_rect.x + pane_rect.w - theme.scaledUi(TERMINAL_ZOOM_HOVER_WIDTH_CSS),
@@ -3708,7 +3713,8 @@ fn renderSplitMenuOverlay(state: *runtime.AppState, workspace_rect: palette.Rect
     const link_separator_h: f32 = if (link_row_count > 0) theme.scaledUi(context_menu.SEPARATOR_HEIGHT_UI) else 0.0;
     // A browser tab can rejoin another tab's side panel.
     const attach_count: usize = if (pane_kind == .browser and state.canAttachBrowserToTab(pane_id)) 1 else 0;
-    const command_count: usize = link_row_count + chat_command_count + attach_count + 3;
+    const zoom_count: usize = if (state.canToggleCurrentProjectWorkspacePaneMaximized(pane_id)) 1 else 0;
+    const command_count: usize = link_row_count + chat_command_count + attach_count + zoom_count + 2;
     const split_count: usize = 8;
     const menu_h = menu_pad_top + menu_pad_bottom + link_separator_h +
         @as(f32, @floatFromInt(command_count)) * row_h +
@@ -3749,8 +3755,10 @@ fn renderSplitMenuOverlay(state: *runtime.AppState, workspace_rect: palette.Rect
         y = renderContextMenuRow(state, pane_id, .refresh_chat_thread, "Refresh Chat Thread", menu_rect, menu_pad_x, y, row_rect_w, row_h) + row_gap;
     }
     if (attach_count > 0) y = renderContextMenuRow(state, pane_id, .attach_browser_to_tab, "Attach to Tab", menu_rect, menu_pad_x, y, row_rect_w, row_h) + row_gap;
-    const zoom_label = if (state.isCurrentProjectWorkspacePaneMaximized(pane_id)) "Unzoom Pane" else "Zoom Pane";
-    y = renderContextMenuRow(state, pane_id, .maximize, zoom_label, menu_rect, menu_pad_x, y, row_rect_w, row_h) + row_gap;
+    if (zoom_count > 0) {
+        const zoom_label = if (state.isCurrentProjectWorkspacePaneMaximized(pane_id)) "Unzoom Pane" else "Zoom Pane";
+        y = renderContextMenuRow(state, pane_id, .maximize, zoom_label, menu_rect, menu_pad_x, y, row_rect_w, row_h) + row_gap;
+    }
     const split_trigger_rect = renderContextMenuStaticRow(state, "Split Pane", menu_rect, menu_pad_x, y, row_rect_w, row_h, true);
     y = split_trigger_rect.y + split_trigger_rect.h + row_gap;
     _ = renderContextMenuRow(state, pane_id, .close, "Close Pane", menu_rect, menu_pad_x, y, row_rect_w, row_h);
