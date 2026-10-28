@@ -24,6 +24,9 @@ struct CompanionSheet: View {
     /// The summary strip's open panel; the header's count toggles it too.
     @State private var panel: CompanionPanel?
     @State private var scheduled = false
+    /// Live voice: the full view instead of the floating pill, and the pill's captions card.
+    @State private var liveExpanded = false
+    @State private var liveCaptions = true
 
     var body: some View {
         Group {
@@ -84,14 +87,32 @@ struct CompanionSheet: View {
                 Text(notice).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.warning)
                     .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16).padding(.bottom, 4)
             }
-            if live.active {
-                LiveVoicePanel(live: live)
-            } else if let failure = live.failure {
+            if !live.active, let failure = live.failure {
                 Text(failure).font(VerdeTheme.ui(12)).foregroundStyle(VerdeTheme.warning)
                     .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16).padding(.bottom, 4)
             }
             CompanionSummary(model: model, open: open, expanded: $panel)
             Divider().overlay(VerdeTheme.border)
+            ZStack(alignment: .top) {
+                if live.active && liveExpanded {
+                    LiveVoiceFullView(live: live, name: active.name) { liveExpanded = false }
+                } else {
+                    conversationArea(active)
+                }
+                // Live floats over the conversation as a pill; it opens into the full view.
+                if live.active && !liveExpanded {
+                    LivePill(live: live, character: active.character, name: active.name, captionsShown: $liveCaptions,
+                             expand: { liveExpanded = true }, openSettings: { settingsBrain = false; settings = true })
+                        .padding(.top, 8)
+                }
+            }
+            .onChange(of: live.active) { _, isActive in if !isActive { liveExpanded = false } }
+        }
+    }
+
+    @ViewBuilder
+    private func conversationArea(_ active: RosterEntry) -> some View {
+        Group {
             if let conversation = model.conversation {
                 CompanionConversation(browse: browse, voice: voice, name: active.name, workspaceID: conversation.workspace,
                                       threadID: conversation.thread, pendingPrompt: $pendingPrompt, onHosts: onHosts,

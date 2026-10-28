@@ -118,6 +118,9 @@ internal fun CompanionSheet(
     val state by companion.state.collectAsState()
     val browseState by browse.state.collectAsState()
     var settings by rememberSaveable { mutableStateOf(settingsRequested) }
+    /** Live voice: the full view instead of the floating pill, and the pill's captions card. */
+    var liveExpanded by rememberSaveable { mutableStateOf(false) }
+    var liveCaptions by rememberSaveable { mutableStateOf(true) }
     var brainOnly by rememberSaveable { mutableStateOf(false) }
     var confirmNew by rememberSaveable { mutableStateOf(false) }
     var conversations by rememberSaveable { mutableStateOf(false) }
@@ -134,6 +137,8 @@ internal fun CompanionSheet(
     val online = browseState.host?.phase == "ready" && browseState.networkAvailable
     val thread = active?.thread_id?.takeIf { it.isNotEmpty() }
     val liveUi = live?.ui?.collectAsState()?.value
+    // Every call opens as the pill.
+    LaunchedEffect(liveUi?.active) { if (liveUi?.active != true) liveExpanded = false }
     val liveSupported = live?.voice?.collectAsState()?.value?.supported != false
     val transcriptState = transcript?.state?.collectAsState()?.value
     val working = transcriptState?.turn != null || snapshot.pulse.running > 0
@@ -162,9 +167,13 @@ internal fun CompanionSheet(
             SummaryStrip(snapshot, workspaces, shownStrip, { strip = it }, onOpenPane, onOpenChat)
             HorizontalDivider(color = VerdeColors.Border)
             Box(Modifier.weight(1f).fillMaxWidth()) {
+                val liveName = active.name.ifBlank { "your companion" }
+                // Live shows as a floating pill over the conversation; the full view (big captions)
+                // opens from the pill, and a failed call opens it so its reason and Try again show.
+                val liveShown = live != null && liveUi != null && (liveUi.active || liveUi.phase == LivePhase.Failed)
+                val liveFull = liveShown && (liveExpanded || liveUi?.phase == LivePhase.Failed)
                 when {
-                    live != null && liveUi != null && (liveUi.active || liveUi.phase == LivePhase.Failed) ->
-                        LivePanel(live, active.name.ifBlank { "your companion" })
+                    liveFull && live != null -> LivePanel(live, liveName, onCollapse = if (liveUi?.phase == LivePhase.Failed) null else ({ liveExpanded = false }))
                     transcript != null && transcriptState != null -> {
                         val knownThreads = workspaces.find { it.workspace_id == active.home_workspace_id }?.threads.orEmpty() +
                             workspaces.filter { it.workspace_id != active.home_workspace_id }.flatMap { it.threads }
@@ -180,6 +189,14 @@ internal fun CompanionSheet(
                     }
                     state.view?.can_edit != true -> Centered { Text("${active.name} will be ready when the host is reachable.") }
                     else -> Centered { CircularProgressIndicator(); Text("Waking ${active.name}…") }
+                }
+                if (liveShown && !liveFull && live != null && liveUi != null) {
+                    val input by live.inputLevel.collectAsState()
+                    val output by live.outputLevel.collectAsState()
+                    LivePill(liveUi, input, output, CompanionCharacter.of(active.character), liveName, liveCaptions,
+                        onExpand = { liveExpanded = true }, onSettings = { settings = true },
+                        onCaptions = { liveCaptions = !liveCaptions }, onMute = live::toggleMute, onEnd = live::stop,
+                        modifier = Modifier.align(Alignment.TopCenter).padding(top = 8.dp))
                 }
             }
         }
