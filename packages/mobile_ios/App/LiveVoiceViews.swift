@@ -79,7 +79,7 @@ struct LivePill: View {
 }
 
 /// "Listening", "Moss is speaking", "Muted"… for the pill's spoken label.
-func liveStatus(_ live: LiveVoice, speaking: Bool, name: String) -> String {
+@MainActor func liveStatus(_ live: LiveVoice, speaking: Bool, name: String) -> String {
     switch live.phase {
     case .connecting: return "Connecting…"
     case .live: return live.muted ? "Muted" : (speaking ? "\(name) is speaking" : "Listening")
