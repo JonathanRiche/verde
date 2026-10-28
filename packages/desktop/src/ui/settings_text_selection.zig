@@ -11,9 +11,11 @@ const runtime = @import("runtime.zig");
 const text_measure = @import("text_measure.zig");
 const theme = @import("theme.zig");
 
-const MAX_LINES: usize = 64;
+const MAX_LINES: usize = 192;
 const MAX_LINE_BYTES: usize = 256;
-const ROLE: palette.FontRole = .ui;
+/// Settings `queueText` leaves the role unset, which the renderer draws
+/// with its default face; measure that same face so highlights line up.
+const ROLE: palette.FontRole = .prose_bold;
 /// Pixels scrolled per pixel the pointer is dragged past the body edge.
 const DRAG_SCROLL_RATE: f32 = 0.5;
 

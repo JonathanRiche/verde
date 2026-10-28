@@ -1901,7 +1901,6 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         drawProvidersCard(state, layout, m);
         drawCustomAgentsCard(state, layout, m);
     } else if (category == .connections) {
-        drawCard(state, layout.phone_card, layout.body_clip);
         _ = phoneCard(state, layout.phone_card, layout.body_clip, true, null);
         drawRuntimeCard(state, layout);
     } else if (category == .agents) {
@@ -3501,48 +3500,37 @@ const MAX_DETAIL_LINES: usize = 40;
 const DETAIL_LINE_BYTES: usize = 240;
 const RowAction = runtime_connections.RowAction;
 
-const RUNTIME_SUBTITLE = "Where chats run. Select a row for repository and provider readiness · Local, SSH, Direct / Tailnet, or Connect";
-const RUNTIME_HINT = "Tokens stay in memory only · started chats keep their pinned runtime · defaults apply to new chats in the selected workspace";
-
-/// Geometry tokens for the runtime row tiles. Rows are bordered tiles inside
-/// the card so each runtime reads as one unit, with padded content instead of
-/// controls flush against the tile edge.
-const RuntimeTileMetrics = struct {
-    pad: f32,
-    title_h: f32,
-    desc_h: f32,
-    button_h: f32,
-    detail_line_h: f32,
-    chevron: f32,
-
-    fn init() RuntimeTileMetrics {
-        return .{
-            .pad = theme.scaledUi(12.0),
-            .title_h = theme.scaledUi(18.0),
-            .desc_h = theme.scaledUi(16.0),
-            .button_h = theme.scaledUi(30.0),
-            .detail_line_h = theme.scaledUi(19.0),
-            .chevron = theme.scaledUi(14.0),
-        };
-    }
-};
+const RUNTIME_SUBTITLE = "Where chats run. New chats in this workspace start on its default runtime.";
+const RUNTIME_HINT = "Started chats stay on the runtime they began on. Administrator tokens are kept in memory only.";
+const ADD_CONNECTION_LABEL = "Add connection\u{2026}";
 
 const RuntimeRowPlan = struct {
     kind: RuntimeRowKind,
     /// Row encoded into this tile's `settings_runtime_action` indices.
     row: usize,
     entry: RuntimeDisplayRow,
-    /// Full bordered tile for the row, including buttons and details.
+    /// Bordered tile for top-level rows and accounts; the band a machine
+    /// occupies inside its account tile.
     tile: palette.Rect,
-    /// Clickable header (title, badge, description) that expands the row.
+    /// Title and status block (plus header buttons); toggles expansion for
+    /// Local and runtime rows.
     header: palette.Rect,
+    /// Right edge of the title/status text, left of any header buttons.
+    text_right: f32,
+    /// Expand chevron; zero width for rows that do not expand.
+    chevron: palette.Rect,
     buttons: [MAX_ROW_BUTTONS]palette.Rect,
     button_actions: [MAX_ROW_BUTTONS]RowAction,
     button_labels: [MAX_ROW_BUTTONS][]const u8,
     button_styles: [MAX_ROW_BUTTONS]ButtonStyle,
     button_count: usize,
+    /// Buttons `[0, header_button_count)` sit in the header; the rest form
+    /// the expanded row's action bar.
+    header_button_count: usize,
+    /// Third header line explaining a failing row.
+    has_note: bool,
+    /// Top of the expanded body, below the divider.
     detail_y: f32,
-    detail_line_count: usize,
     expanded: bool,
     bottom: f32,
 };
@@ -3550,20 +3538,21 @@ const RuntimeRowPlan = struct {
 const RuntimeCardPlan = struct {
     rows: [MAX_RUNTIME_ROWS]RuntimeRowPlan,
     row_count: usize,
-    add_button: palette.Rect,
-    subtitle_h: f32,
-    notice_y: f32,
+    /// Card header (title, helper, Add connection, notice) starts here.
+    header_y: f32,
     hint_y: f32,
-    hint_h: f32,
     height: f32,
 };
 
 const DetailLine = struct {
     text: []const u8,
-    tone: enum { normal, muted, warning, good },
-    /// A remote provider's Install / Sign in control drawn before `text`;
-    /// the line occupies two line slots (the next one is a blank spacer).
+    /// `heading` labels a group; `note` is plain guidance under an item.
+    tone: enum { normal, muted, warning, good, heading, note },
+    /// Install / Sign in button drawn at the right of this status line.
     setup: ?ProviderSetupLine = null,
+    /// Technical value (ids, endpoints, setup commands) shown only in the
+    /// row's Details disclosure.
+    detail: bool = false,
 };
 
 /// Remote provider line action: runs the provider setup flow on the runtime.
@@ -3600,40 +3589,45 @@ const DetailBuffer = struct {
         self.count += 1;
     }
 
-    fn pushSetup(self: *DetailBuffer, setup: ProviderSetupLine, comptime fmt: []const u8, args: anytype) void {
-        if (self.count + 2 > MAX_DETAIL_LINES) return;
+    /// A technical line for the Details disclosure.
+    fn pushDetail(self: *DetailBuffer, comptime fmt: []const u8, args: anytype) void {
         self.push(.muted, fmt, args);
+        if (self.count > 0) self.lines[self.count - 1].detail = true;
+    }
+
+    /// Puts an Install / Sign in button on the status line just pushed. The
+    /// command it runs is kept for Details instead of crowding the row.
+    fn pushSetup(self: *DetailBuffer, setup: ProviderSetupLine, comptime fmt: []const u8, args: anytype) void {
+        if (self.count == 0) return;
         self.lines[self.count - 1].setup = setup;
-        self.push(.muted, "", .{});
+        self.pushDetail(fmt, args);
     }
 };
 
-/// One readable status line for a runtime-reported provider. A runtime that
-/// cannot verify accounts (`authentication: "unknown"`) is not a warning;
-/// only an explicit sign-out or an unexpected state is.
+/// One readable status line for a runtime-reported provider. Signed in
+/// (reported, probed, or this session) is green whatever else the runtime
+/// reports; a runtime that cannot verify accounts (`authentication:
+/// "unknown"`) is not a warning; only an explicit sign-out or an unexpected
+/// state is.
 fn pushRemoteProviderStatus(state: *const runtime.AppState, profile_id: []const u8, row: runtime_connections.ProviderRow, readiness: runtime.ProviderReadiness, out: *DetailBuffer) void {
-    const known_state = std.mem.eql(u8, row.state, "unknown") or std.mem.eql(u8, row.state, "missing") or
-        std.mem.eql(u8, row.state, "ready") or std.mem.eql(u8, row.state, "signed_out");
-    if (!known_state) return out.push(.warning, "{s} · {s}", .{ row.label, row.state });
     const provider = if (row.provider) |value| std.meta.stringToEnum(runtime.Provider, value) else null;
     const setup = &state.settings_controller.provider_setup;
-    const signed_in = if (provider) |value| runtime.provider_setup.signedInThisSession(setup, profile_id, value) else false;
     // Where the daemon cannot report sign-in, the runtime-side status probe
     // decides; the session memory is the fallback.
     const probed = if (provider) |value| runtime.provider_setup.probedAuth(setup, profile_id, value) else .unknown;
-    if (readiness == .unavailable) switch (probed) {
-        .signed_in => return out.push(.good, "{s} · signed in", .{row.label}),
-        .signed_out => return out.push(.warning, "{s} · not signed in", .{row.label}),
-        .unknown => {},
-    };
+    if (remoteProviderSignedIn(state, profile_id, row, readiness)) {
+        const how = if (readiness == .ready) "Ready" else if (probed == .signed_in) "Signed in" else "Signed in this session";
+        return out.push(.good, "{s} \u{00B7} {s}", .{ row.label, how });
+    }
+    const known_state = std.mem.eql(u8, row.state, "unknown") or std.mem.eql(u8, row.state, "missing") or
+        std.mem.eql(u8, row.state, "ready") or std.mem.eql(u8, row.state, "signed_out");
+    if (!known_state) return out.push(.warning, "{s} \u{00B7} {s}", .{ row.label, row.state });
+    if (readiness == .unavailable and probed == .signed_out) return out.push(.warning, "{s} \u{00B7} Not signed in", .{row.label});
     switch (readiness) {
-        .ready => out.push(.good, "{s} · ready", .{row.label}),
-        .missing => out.push(.normal, "{s} · not installed", .{row.label}),
-        .signed_out => out.push(.warning, "{s} · not signed in", .{row.label}),
-        .unavailable, .checking => if (signed_in)
-            out.push(.good, "{s} · signed in this session (the runtime can't confirm accounts)", .{row.label})
-        else
-            out.push(.normal, "{s} · installed · sign-in not verifiable on this runtime", .{row.label}),
+        .ready => out.push(.good, "{s} \u{00B7} Ready", .{row.label}),
+        .missing => out.push(.normal, "{s} \u{00B7} Not installed", .{row.label}),
+        .signed_out => out.push(.warning, "{s} \u{00B7} Not signed in", .{row.label}),
+        .unavailable, .checking => out.push(.normal, "{s} \u{00B7} Installed \u{00B7} sign-in can't be checked here", .{row.label}),
     }
 }
 
@@ -3662,20 +3656,6 @@ fn remoteProviderSignedIn(state: *const runtime.AppState, profile_id: []const u8
         .signed_in => true,
         .signed_out => false,
         .unknown => runtime.provider_setup.signedInThisSession(setup, profile_id, provider),
-    };
-}
-
-/// Install / Sign in button for a detail line with `setup`, left-aligned with
-/// the provider text and centered in its two line slots.
-fn providerSetupButtonRect(row_plan: *const RuntimeRowPlan, line_index: usize, label: []const u8) palette.Rect {
-    const t = RuntimeTileMetrics.init();
-    const h = theme.scaledUi(26.0);
-    const line_y = row_plan.detail_y + @as(f32, @floatFromInt(line_index)) * t.detail_line_h;
-    return .{
-        .x = row_plan.header.x + t.pad + theme.scaledUi(14.0),
-        .y = line_y + (t.detail_line_h * 2.0 - h) * 0.5,
-        .w = buttonWidth(label),
-        .h = h,
     };
 }
 
@@ -3733,10 +3713,10 @@ fn settingsTextWidth(font_size: f32, value: []const u8) f32 {
 /// `value` shortened with a trailing ellipsis to fit `max_w` as drawn by
 /// `queueText`; cuts only at UTF-8 boundaries. Returns `value` when it fits.
 fn ellipsizedText(buf: []u8, value: []const u8, font_size: f32, max_w: f32) []const u8 {
-    if (settingsTextWidth(font_size, value) <= max_w) return value;
+    if (connTextWidth(font_size, value) <= max_w) return value;
     const ellipsis = "\u{2026}";
     if (buf.len <= ellipsis.len) return "";
-    const budget = max_w - settingsTextWidth(font_size, ellipsis);
+    const budget = max_w - connTextWidth(font_size, ellipsis);
     // Binary search the longest fitting prefix; widths grow with length.
     var lo: usize = 0;
     var hi: usize = @min(value.len, buf.len - ellipsis.len);
@@ -3744,31 +3724,12 @@ fn ellipsizedText(buf: []u8, value: []const u8, font_size: f32, max_w: f32) []co
         var mid = lo + (hi - lo + 1) / 2;
         while (mid > lo and mid < value.len and (value[mid] & 0xC0) == 0x80) mid -= 1;
         if (mid == lo) break;
-        if (settingsTextWidth(font_size, value[0..mid]) <= budget) lo = mid else hi = mid - 1;
+        if (connTextWidth(font_size, value[0..mid]) <= budget) lo = mid else hi = mid - 1;
     }
     const kept = std.mem.trimEnd(u8, value[0..lo], " ");
     @memcpy(buf[0..kept.len], kept);
     @memcpy(buf[kept.len .. kept.len + ellipsis.len], ellipsis);
     return buf[0 .. kept.len + ellipsis.len];
-}
-
-/// Lays out one row's buttons left-to-right, wrapping to a new line when the
-/// content width is exhausted. Returns the y after the last line.
-fn packRowButtons(plan: *RuntimeRowPlan, x: f32, y_start: f32, w: f32, button_h: f32, m: Metrics) f32 {
-    var y = y_start;
-    var cursor_x = x;
-    var placed_any = false;
-    for (0..plan.button_count) |index| {
-        const bw = @min(buttonWidth(plan.button_labels[index]), w);
-        if (placed_any and cursor_x + bw > x + w) {
-            cursor_x = x;
-            y += button_h + m.inner_gap;
-        }
-        plan.buttons[index] = .{ .x = cursor_x, .y = y, .w = bw, .h = button_h };
-        cursor_x += bw + m.inner_gap;
-        placed_any = true;
-    }
-    return if (plan.button_count == 0) y_start else y + button_h;
 }
 
 fn pushButton(plan: *RuntimeRowPlan, action: RowAction, label: []const u8, style: ButtonStyle) void {
@@ -3783,7 +3744,7 @@ fn planRuntimeRowButtons(state: *const runtime.AppState, plan: *RuntimeRowPlan, 
     plan.button_count = 0;
     const is_default = runtimeRowIsWorkspaceDefault(state, profile_id);
     const id = profile_id orelse {
-        pushButton(plan, .set_workspace_default, if (is_default) "Workspace default" else "Use as workspace default", if (is_default) .disabled else .secondary);
+        pushButton(plan, .set_workspace_default, if (is_default) "Workspace default" else "Use as default", if (is_default) .disabled else .secondary);
         return;
     };
     const snapshot = state.runtimeProfileSnapshot(id);
@@ -3820,9 +3781,9 @@ fn planRuntimeRowButtons(state: *const runtime.AppState, plan: *RuntimeRowPlan, 
         pushButton(plan, .show_server_setup, "Show server setup", .secondary);
     }
     if (snapshot) |live| switch (live.access) {
-        .admin_token => if (live.credential_held) pushButton(plan, .forget_token, "Forget token", .secondary),
+        .admin_token => if (live.credential_held) pushButton(plan, .forget_token, "Forget token", .danger),
         .paired_device => if (live.device_id != null or live.credential_held) {
-            pushButton(plan, .forget_device, "Forget device", .secondary);
+            pushButton(plan, .forget_device, "Forget device", .danger);
         },
         .connect => {},
     };
@@ -3830,82 +3791,89 @@ fn planRuntimeRowButtons(state: *const runtime.AppState, plan: *RuntimeRowPlan, 
     // re-point one machine at another control plane.
     if (state.runtime_connections.accounts.accountForProfile(id) == null) pushButton(plan, .edit, "Edit", .secondary);
     if (state.runtime_connections.isRemoveConfirming(id)) {
-        pushButton(plan, .remove_confirm, "Confirm remove", .primary);
+        pushButton(plan, .remove_confirm, "Confirm remove", .danger_confirm);
         pushButton(plan, .remove_cancel, "Keep", .secondary);
     } else {
-        pushButton(plan, .remove, "Remove", .secondary);
+        pushButton(plan, .remove, "Remove", .danger);
     }
     pushButton(plan, .copy_diagnostics, "Copy diagnostics", .secondary);
     pushButton(plan, .set_workspace_default, if (is_default) "Workspace default" else "Use as default", if (is_default) .disabled else .secondary);
 }
 
-fn localProviderReadinessLabel(readiness: runtime.ProviderReadiness) []const u8 {
-    return switch (readiness) {
-        .checking => "checking",
-        .missing => "not installed",
-        .signed_out => "signed out",
-        .ready => "ready",
-        .unavailable => "unavailable",
-    };
-}
-
-/// Builds the expanded detail block. Local reads the workspace folder and the
+/// Builds the expanded row's lines. Local reads the workspace folder and the
 /// desktop's own provider probe; remote rows read only daemon-reported data.
+/// Lines flagged `detail` (ids, endpoints, setup commands) go to the row's
+/// Details disclosure; access problems stay in the row.
 fn collectRuntimeDetailLines(state: *const runtime.AppState, profile_id: ?[]const u8, out: *DetailBuffer) void {
     out.count = 0;
     const rc = &state.runtime_connections;
     if (profile_id == null) {
+        out.push(.heading, "Workspace", .{});
         if (state.project_controller.selected_index < state.project_controller.projects.items.len) {
             const project = state.project_controller.projects.items[state.project_controller.selected_index];
-            out.push(.normal, "Repository  {s}", .{project.path});
+            out.push(.good, "{s}", .{project.path});
         } else {
-            out.push(.muted, "Repository  no workspace selected", .{});
+            out.push(.muted, "No workspace selected", .{});
         }
-        out.push(.muted, "Providers on this machine", .{});
+        out.push(.heading, "Providers", .{});
         const snapshot = state.provider_controller.readiness.snapshot;
         inline for (.{ .codex, .claude, .cursor, .opencode, .pi, .fx, .grok }) |provider| {
             const readiness = snapshot.forProvider(provider);
-            out.push(if (readiness == .ready) .good else if (readiness == .checking) .muted else .warning, "{s} · {s}", .{ runtime.providerLabel(provider), localProviderReadinessLabel(readiness) });
+            // Green only when usable; a missing CLI is neutral, only a
+            // needed sign-in is a problem.
+            const tone: @FieldType(DetailLine, "tone") = switch (readiness) {
+                .ready => .good,
+                .signed_out => .warning,
+                .checking => .muted,
+                .missing, .unavailable => .normal,
+            };
+            out.push(tone, "{s} \u{00B7} {s}", .{ providerDisplayName(provider), providerReadinessBadge(readiness) });
         }
         return;
     }
     const id = profile_id.?;
+    const access_start = out.count;
+    pushRuntimeEndpointDetail(state, id, out);
     pushRuntimeAccessDetailLines(state, id, out);
+    for (out.lines[access_start..out.count]) |*line| {
+        if (line.tone != .warning) line.detail = true;
+    }
     const tracking = rc.readiness_profile_id != null and std.mem.eql(u8, rc.readiness_profile_id.?, id);
     const manifest_state = if (tracking) rc.manifest_state else .idle;
     const providers_state = if (tracking) rc.providers_state else .idle;
+    out.push(.heading, "Repositories", .{});
     switch (manifest_state) {
-        .idle, .loading => out.push(.muted, "Repository bindings · checking…", .{}),
-        .not_ready => out.push(.muted, "Repository bindings · connect and verify this runtime first", .{}),
-        .unsupported => out.push(.warning, "Repository bindings · this daemon does not advertise repository manifests", .{}),
-        .failed => out.push(.warning, "Repository bindings · could not be read from the daemon", .{}),
+        .idle, .loading => out.push(.muted, "Checking\u{2026}", .{}),
+        .not_ready => out.push(.muted, "Shown once this runtime is connected and verified", .{}),
+        .unsupported => out.push(.warning, "This daemon does not advertise repository manifests", .{}),
+        .failed => out.push(.warning, "Could not be read from the daemon", .{}),
         .loaded => {
             if (rc.repositories.items.len == 0) {
-                out.push(.warning, "Repository bindings · none registered for this workspace on the daemon", .{});
-            } else {
-                out.push(.muted, "Repository bindings on this runtime", .{});
+                out.push(.warning, "None registered for this workspace on the daemon", .{});
             }
             for (rc.repositories.items) |repo| {
+                const default_tag = if (repo.is_default) " (default)" else "";
                 if (repo.root_path) |root| {
                     if (std.mem.eql(u8, repo.availability, "available")) {
-                        out.push(.good, "{s}{s} · {s}", .{ repo.label, if (repo.is_default) " (default)" else "", root });
+                        out.push(.good, "{s}{s} \u{00B7} {s}", .{ repo.label, default_tag, root });
                     } else {
-                        out.push(.warning, "{s}{s} · {s} · {s}", .{ repo.label, if (repo.is_default) " (default)" else "", root, repo.availability });
+                        out.push(.warning, "{s}{s} \u{00B7} {s} \u{00B7} {s}", .{ repo.label, default_tag, repo.availability, root });
                     }
                 } else {
-                    out.push(.warning, "{s}{s} · not bound on this runtime — bind or clone it on the host (no remote clone from the desktop yet)", .{ repo.label, if (repo.is_default) " (default)" else "" });
+                    out.push(.warning, "{s}{s} \u{00B7} Not bound on this runtime", .{ repo.label, default_tag });
+                    out.push(.note, "Bind or clone it on the host; the desktop can't clone remotely yet.", .{});
                 }
             }
-            if (rc.repositories_truncated > 0) out.push(.muted, "+{d} more repositories", .{rc.repositories_truncated});
+            if (rc.repositories_truncated > 0) out.push(.note, "+{d} more repositories", .{rc.repositories_truncated});
         },
     }
+    out.push(.heading, "Providers", .{});
     switch (providers_state) {
-        .idle, .loading => out.push(.muted, "Providers · checking…", .{}),
-        .not_ready => out.push(.muted, "Providers · available after the runtime is verified", .{}),
-        .unsupported => out.push(.warning, "Providers · not reported by this daemon", .{}),
-        .failed => out.push(.warning, "Providers · inventory could not be read", .{}),
+        .idle, .loading => out.push(.muted, "Checking\u{2026}", .{}),
+        .not_ready => out.push(.muted, "Shown once this runtime is verified", .{}),
+        .unsupported => out.push(.warning, "Not reported by this daemon", .{}),
+        .failed => out.push(.warning, "The provider list could not be read", .{}),
         .loaded => {
-            out.push(.muted, "Providers on this runtime", .{});
             for (rc.providers.items, 0..) |row, provider_row| {
                 const readiness = runtime.provider_setup.remoteReadiness(null, row.state, row.authentication);
                 // Signed-in rows (reported, probed, or signed in this
@@ -3915,18 +3883,36 @@ fn collectRuntimeDetailLines(state: *const runtime.AppState, profile_id: ?[]cons
                 if (!ready) {
                     if (remoteProviderSetup(state, id, row)) |setup| {
                         // Runs in a terminal on this runtime, from the provider dialog.
-                        out.pushSetup(.{ .provider_row = provider_row, .label = if (setup.missing) "Install" else "Sign in" }, "{s}", .{row.remediation_command orelse row.remediation_label orelse ""});
+                        out.pushSetup(.{ .provider_row = provider_row, .label = if (setup.missing) "Install" else "Sign in" }, "{s} setup \u{00B7} {s}", .{ row.label, row.remediation_command orelse row.remediation_label orelse "provider dialog" });
                     } else if (row.remediation_command) |command| {
-                        out.push(.muted, "    {s}: {s}", .{ row.remediation_label orelse "Setup", command });
+                        out.pushDetail("{s} \u{00B7} {s}: {s}", .{ row.label, row.remediation_label orelse "Setup", command });
                     } else if (row.remediation_label) |label| {
-                        out.push(.muted, "    {s}", .{label});
+                        out.push(.note, "{s}", .{label});
                     }
                 }
             }
-            if (rc.providers_truncated > 0) out.push(.muted, "+{d} more providers", .{rc.providers_truncated});
+            if (rc.providers_truncated > 0) out.push(.note, "+{d} more providers", .{rc.providers_truncated});
         },
     }
     pushRuntimeToolLines(state, id, out);
+}
+
+/// Where a standalone runtime is reached; Connect machines list theirs with
+/// the access lines.
+fn pushRuntimeEndpointDetail(state: *const runtime.AppState, profile_id: []const u8, out: *DetailBuffer) void {
+    const service = state.runtime_service orelse return;
+    const configured = service.runtime_manager.profileConst(profile_id) orelse return;
+    switch (configured.transport) {
+        .ssh_tunnel => |ssh| out.pushDetail("SSH \u{00B7} {s}{s}{s}:{d} \u{2192} gateway port {d}", .{
+            ssh.user orelse "",
+            if (ssh.user != null) "@" else "",
+            ssh.host,
+            ssh.port,
+            ssh.remote_gateway_port,
+        }),
+        .direct_https => |endpoint| out.pushDetail("Endpoint \u{00B7} {s}", .{endpoint.https_url orelse "(missing endpoint)"}),
+        .local_socket, .connect => {},
+    }
 }
 
 /// Tools on a remote runtime: the GitHub CLI's sign-in, from a status probe
@@ -3936,22 +3922,22 @@ fn pushRuntimeToolLines(state: *const runtime.AppState, profile_id: []const u8, 
     const service = state.runtime_service orelse return;
     const live = service.snapshot(profile_id) orelse return;
     if (!live.execution_ready) return;
-    out.push(.muted, "Tools on this runtime", .{});
+    out.push(.heading, "Tools", .{});
     const status = runtime.provider_setup.githubStatus(&state.settings_controller.provider_setup, profile_id) orelse {
-        return out.push(.muted, "GitHub · checking…", .{});
+        return out.push(.muted, "GitHub \u{00B7} Checking\u{2026}", .{});
     };
     switch (status) {
-        .signed_in => out.push(.good, "GitHub · signed in", .{}),
+        .signed_in => out.push(.good, "GitHub \u{00B7} Signed in", .{}),
         .signed_out => {
-            out.push(.normal, "GitHub · not signed in", .{});
-            out.pushSetup(.{ .provider_row = GITHUB_SETUP_ROW, .label = "Sign in" }, "{s}", .{runtime.provider_setup.remote_github.SIGN_IN_SUMMARY});
+            out.push(.normal, "GitHub \u{00B7} Not signed in", .{});
+            out.pushSetup(.{ .provider_row = GITHUB_SETUP_ROW, .label = "Sign in" }, "GitHub sign-in \u{00B7} {s}", .{runtime.provider_setup.remote_github.SIGN_IN_SUMMARY});
         },
         .missing => {
-            out.push(.normal, "GitHub · not installed", .{});
+            out.push(.normal, "GitHub \u{00B7} Not installed", .{});
             // gh alone is no use signed out, so one click does both.
-            out.pushSetup(.{ .provider_row = GITHUB_SETUP_ROW, .label = "Install & sign in" }, "{s}", .{runtime.provider_setup.remote_github.INSTALL_AND_SIGN_IN_SUMMARY});
+            out.pushSetup(.{ .provider_row = GITHUB_SETUP_ROW, .label = "Install & sign in" }, "GitHub setup \u{00B7} {s}", .{runtime.provider_setup.remote_github.INSTALL_AND_SIGN_IN_SUMMARY});
         },
-        .unknown => out.push(.muted, "GitHub · status unavailable right now; checking again shortly", .{}),
+        .unknown => out.push(.muted, "GitHub \u{00B7} Status unavailable; checking again shortly", .{}),
     }
 }
 
@@ -4004,12 +3990,6 @@ fn pushRuntimeAccessDetailLines(state: *const runtime.AppState, profile_id: []co
             }
         },
     }
-}
-
-fn runtimeDetailLineCount(state: *const runtime.AppState, profile_id: ?[]const u8) usize {
-    var buffer: DetailBuffer = .{};
-    collectRuntimeDetailLines(state, profile_id, &buffer);
-    return buffer.count;
 }
 
 /// What one tile in the Runtimes & connections card represents.
@@ -4081,7 +4061,7 @@ fn planAccountButtons(state: *const runtime.AppState, plan: *RuntimeRowPlan, acc
         return;
     }
     if (account.signedIn()) {
-        pushButton(plan, .account_refresh, "Refresh machines", if (account.busy()) .disabled else .secondary);
+        pushButton(plan, .account_refresh, "Refresh", if (account.busy()) .disabled else .secondary);
         pushButton(plan, .account_sign_out, "Sign out", if (account.link != null) .disabled else .secondary);
     }
 }
@@ -4095,16 +4075,6 @@ fn planAvailableButtons(state: *const runtime.AppState, plan: *RuntimeRowPlan, a
     } else {
         pushButton(plan, .link_machine, "Connect", if (account.busy() or account.lent) .disabled else .primary);
     }
-}
-
-fn accountBadge(account: *const runtime_connections.connect_accounts.Account) struct { text: []const u8, color: ?[4]f32 } {
-    if (account.session_unavailable or account.phase == .failed) return .{ .text = "Unavailable", .color = theme.warning() };
-    if (account.signedIn()) return .{ .text = "Signed in", .color = theme.success() };
-    return switch (account.phase) {
-        .idle, .discovering, .loading_inventory => .{ .text = "Checking", .color = null },
-        .signing_in => .{ .text = "Signing in", .color = null },
-        else => .{ .text = "Sign in required", .color = theme.warning() },
-    };
 }
 
 /// A linked machine the signed-in account no longer lists is stopped (or
@@ -4122,116 +4092,320 @@ fn machineStopped(state: *const runtime.AppState, entry: RuntimeDisplayRow, stat
     return runtime_connections.connect_accounts.matchMachine(account.machines.items, configured.expected_runtime_id, https_url) == null;
 }
 
-fn planRuntimeCard(state: *const runtime.AppState, x: f32, y: f32, w: f32, m: Metrics) RuntimeCardPlan {
+fn planRuntimeCard(state: *runtime.AppState, x: f32, y: f32, w: f32, m: Metrics) RuntimeCardPlan {
     var plan: RuntimeCardPlan = undefined;
     plan.row_count = 0;
-    const t = RuntimeTileMetrics.init();
+    plan.header_y = y + m.card_pad;
     const inner_x = x + m.card_pad;
-    const inner_w = w - m.card_pad * 2.0;
-    // Title, then a wrapped explainer before the rows.
-    plan.subtitle_h = wrappedNotesRows(RUNTIME_SUBTITLE, inner_w) * notesLineHeight();
-    var cursor_y = y + m.card_pad + m.title_h + m.inner_gap + plan.subtitle_h + m.row_gap;
+    const inner_w = @max(w - m.card_pad * 2.0, 1.0);
+    var pass: ConnPass = .{ .state = state, .x = inner_x, .y = plan.header_y, .w = inner_w, .clip = ZERO_RECT, .draw = false, .queue_hit = null };
+    runtimeCardHeader(&pass);
+    var cursor_y = pass.y;
     var display: [MAX_RUNTIME_ROWS]RuntimeDisplayRow = undefined;
     const total_rows = collectRuntimeDisplayRows(state, &display);
     // Plan index of the account tile whose machines are being laid out.
     var open_account: ?usize = null;
     for (display[0..total_rows]) |entry| {
         if (open_account) |account_plan| if (!entry.nested) {
-            cursor_y = closeAccountTile(&plan.rows[account_plan], cursor_y, t, m);
+            cursor_y = closeAccountTile(&plan.rows[account_plan], cursor_y, m);
             open_account = null;
         };
-        // Machines sit inside their account tile, inset by one tile pad.
-        const tile_x = if (entry.nested) inner_x + t.pad else inner_x;
-        const tile_w = if (entry.nested) @max(inner_w - t.pad * 2.0, 0.0) else inner_w;
-        const content_x = tile_x + t.pad;
-        const content_w = @max(tile_w - t.pad * 2.0, 0.0);
-        var row_plan: RuntimeRowPlan = undefined;
-        row_plan.kind = entry.kind;
-        row_plan.row = entry.row;
-        row_plan.entry = entry;
-        row_plan.expanded = switch (entry.kind) {
-            .local, .profile => state.runtime_connections.isExpanded(entry.profile_id),
-            .account, .available => false,
-        };
-        // Title line plus description line; the header spans the tile width
-        // so the whole top of the tile toggles expansion.
-        row_plan.header = .{ .x = tile_x, .y = cursor_y, .w = tile_w, .h = t.pad + t.title_h + theme.scaledUi(4.0) + t.desc_h + t.pad };
-        var next_y = row_plan.header.y + row_plan.header.h;
-        switch (entry.kind) {
-            .local, .profile => planRuntimeRowButtons(state, &row_plan, entry.profile_id),
-            .account => planAccountButtons(state, &row_plan, entry.account),
-            .available => planAvailableButtons(state, &row_plan, entry.account, entry.machine),
-        }
-        if (row_plan.button_count > 0) next_y = packRowButtons(&row_plan, content_x, next_y, content_w, t.button_h, m) + t.pad;
-        // Details sit below a hairline divider, padded on both sides.
-        row_plan.detail_y = next_y + t.pad;
-        row_plan.detail_line_count = if (row_plan.expanded) runtimeDetailLineCount(state, entry.profile_id) else 0;
-        if (row_plan.expanded and row_plan.detail_line_count > 0) {
-            next_y = row_plan.detail_y + @as(f32, @floatFromInt(row_plan.detail_line_count)) * t.detail_line_h + t.pad;
-        }
-        row_plan.bottom = next_y;
-        row_plan.tile = .{ .x = tile_x, .y = cursor_y, .w = tile_w, .h = next_y - cursor_y };
+        const row_plan = planRuntimeRow(state, entry, inner_x, cursor_y, inner_w);
         plan.rows[plan.row_count] = row_plan;
-        if (entry.kind == .account) {
-            open_account = plan.row_count;
-            cursor_y = next_y;
-        } else {
-            cursor_y = next_y + m.inner_gap;
-        }
+        // Machines stack flush inside their account tile, split by dividers.
+        cursor_y = if (entry.kind == .account or entry.nested) row_plan.bottom else row_plan.bottom + m.inner_gap;
+        if (entry.kind == .account) open_account = plan.row_count;
         plan.row_count += 1;
     }
-    if (open_account) |account_plan| cursor_y = closeAccountTile(&plan.rows[account_plan], cursor_y, t, m);
-    cursor_y += m.row_gap - m.inner_gap;
-    plan.add_button = .{ .x = inner_x, .y = cursor_y, .w = @min(buttonWidth("Add connection…"), inner_w), .h = m.row_h };
-    const notice_h: f32 = if (state.runtime_connections.cardNotice().len > 0) m.label_h + m.inner_gap else 0.0;
-    plan.notice_y = plan.add_button.y + m.row_h + m.row_gap;
-    plan.hint_y = plan.notice_y + notice_h;
-    plan.hint_h = wrappedNotesRows(RUNTIME_HINT, inner_w) * notesLineHeight();
-    plan.height = (plan.hint_y + plan.hint_h + m.card_pad) - y;
+    if (open_account) |account_plan| cursor_y = closeAccountTile(&plan.rows[account_plan], cursor_y, m);
+    plan.hint_y = cursor_y + m.row_gap - m.inner_gap;
+    pass.y = plan.hint_y;
+    pass.text(RUNTIME_HINT, textHint(), theme.scaledUi(12.0), null);
+    plan.height = pass.y + m.card_pad - y;
     return plan;
 }
 
-/// Extends an account tile around its machine tiles; returns the next y.
-fn closeAccountTile(account: *RuntimeRowPlan, cursor_y: f32, t: RuntimeTileMetrics, m: Metrics) f32 {
-    const bottom = @max(cursor_y - m.inner_gap, account.bottom) + t.pad;
+/// Extends an account tile around its machine rows; returns the next y.
+fn closeAccountTile(account: *RuntimeRowPlan, cursor_y: f32, m: Metrics) f32 {
+    const bottom = @max(cursor_y, account.bottom);
     account.tile.h = bottom - account.tile.y;
     return bottom + m.inner_gap;
 }
 
-fn registerRuntimeCardHits(state: *runtime.AppState, layout: SettingsLayout, queue_hit: *const fn (*runtime.AppState, palette.Rect, runtime.PaletteModalAction, usize) void) void {
-    const plan = &layout.runtimes;
-    for (0..plan.row_count) |index_in_plan| {
-        const row_plan = &plan.rows[index_in_plan];
-        const row = row_plan.row;
-        if (row_plan.kind == .local or row_plan.kind == .profile) {
-            recordFocusStop(.settings_runtime_action, runtime_connections.encodeRowAction(row, .expand), row_plan.header, layout.body_clip);
-            if (intersectRect(row_plan.header, layout.body_clip)) |visible| {
-                queue_hit(state, visible, .settings_runtime_action, runtime_connections.encodeRowAction(row, .expand));
-            }
+/// Card title, helper and Add connection, then the card's last notice.
+fn runtimeCardHeader(pass: *ConnPass) void {
+    const m = metrics();
+    pass.header("Runtimes & connections", RUNTIME_SUBTITLE, &.{.{
+        .label = ADD_CONNECTION_LABEL,
+        .action = .settings_runtime_action,
+        .index = runtime_connections.encodeRowAction(0, .add_connection),
+    }});
+    const notice = pass.state.runtime_connections.cardNotice();
+    if (notice.len > 0) {
+        pass.y += m.inner_gap;
+        pass.text(notice, textLabel(), theme.scaledUi(12.0), RUNTIME_NOTICE_BLOCK);
+    }
+    pass.y += m.row_gap;
+}
+
+/// How many of a row's leading buttons sit in its header: every account and
+/// available-machine button, else the row's main action (a recovery,
+/// Disconnect, or Use as default). Management verbs wait in the expanded row.
+fn headerButtonCount(plan: *const RuntimeRowPlan) usize {
+    switch (plan.kind) {
+        .account, .available => return plan.button_count,
+        .local, .profile => {},
+    }
+    if (plan.button_count == 0) return 0;
+    const style = plan.button_styles[0];
+    if (style == .primary) return 1;
+    return switch (plan.button_actions[0]) {
+        .disable => 1,
+        .set_workspace_default => if (style == .disabled) 0 else 1,
+        else => 0,
+    };
+}
+
+fn planRuntimeRow(state: *runtime.AppState, entry: RuntimeDisplayRow, tile_x: f32, y: f32, tile_w: f32) RuntimeRowPlan {
+    const m = metrics();
+    const cm = ConnMetrics.init();
+    var plan: RuntimeRowPlan = undefined;
+    plan.kind = entry.kind;
+    plan.row = entry.row;
+    plan.entry = entry;
+    plan.expanded = switch (entry.kind) {
+        .local, .profile => state.runtime_connections.isExpanded(entry.profile_id),
+        .account, .available => false,
+    };
+    switch (entry.kind) {
+        .local, .profile => planRuntimeRowButtons(state, &plan, entry.profile_id),
+        .account => planAccountButtons(state, &plan, entry.account),
+        .available => planAvailableButtons(state, &plan, entry.account, entry.machine),
+    }
+    plan.header_button_count = headerButtonCount(&plan);
+    var text_buf: [320]u8 = undefined;
+    plan.has_note = runtimeRowText(state, entry, &text_buf).note.len > 0;
+
+    const content_x = tile_x + cm.pad_x;
+    const content_w = @max(tile_w - cm.pad_x * 2.0, 1.0);
+    const text_h = cm.title_h + cm.line_gap + cm.status_h + if (plan.has_note) cm.line_gap + cm.status_h else 0.0;
+    const top = y + cm.pad_y;
+    var right = content_x + content_w;
+    plan.chevron = .{ .x = right, .y = top, .w = 0.0, .h = 0.0 };
+    if (entry.kind == .local or entry.kind == .profile) {
+        plan.chevron = .{ .x = right - cm.chevron, .y = top + (text_h - cm.chevron) * 0.5, .w = cm.chevron, .h = cm.chevron };
+        right = plan.chevron.x - m.inner_gap;
+    }
+    // Header buttons sit right of the text while it keeps a readable width,
+    // else on their own line under it.
+    var buttons_w: f32 = 0.0;
+    for (0..plan.header_button_count) |index| buttons_w += buttonWidth(plan.button_labels[index]) + if (index > 0) m.inner_gap else 0.0;
+    const beside = plan.header_button_count == 0 or right - content_x - buttons_w - m.row_gap >= cm.min_text_w;
+    var header_bottom = top + text_h;
+    plan.text_right = right;
+    if (beside and plan.header_button_count > 0) {
+        var bx = right - buttons_w;
+        const by = top + (text_h - cm.button_h) * 0.5;
+        for (0..plan.header_button_count) |index| {
+            const bw = buttonWidth(plan.button_labels[index]);
+            plan.buttons[index] = .{ .x = bx, .y = by, .w = bw, .h = cm.button_h };
+            bx += bw + m.inner_gap;
         }
-        for (0..row_plan.button_count) |index| {
-            if (row_plan.button_styles[index] == .disabled) continue;
-            recordFocusStop(.settings_runtime_action, runtime_connections.encodeRowAction(row, row_plan.button_actions[index]), row_plan.buttons[index], layout.body_clip);
-            if (intersectRect(row_plan.buttons[index], layout.body_clip)) |visible| {
-                queue_hit(state, visible, .settings_runtime_action, runtime_connections.encodeRowAction(row, row_plan.button_actions[index]));
+        plan.text_right = right - buttons_w - m.row_gap;
+        header_bottom = @max(header_bottom, by + cm.button_h);
+    } else if (plan.header_button_count > 0) {
+        var bx = content_x;
+        var by = header_bottom + m.inner_gap;
+        for (0..plan.header_button_count) |index| {
+            const bw = @min(buttonWidth(plan.button_labels[index]), content_w);
+            if (index > 0 and bx + bw > content_x + content_w) {
+                bx = content_x;
+                by += cm.button_h + m.inner_gap;
             }
+            plan.buttons[index] = .{ .x = bx, .y = by, .w = bw, .h = cm.button_h };
+            bx += bw + m.inner_gap;
         }
-        // Remote provider Install / Sign in buttons in the expanded row's
-        // details, right after the row's own controls in Tab order.
-        if (!row_plan.expanded or row_plan.detail_line_count == 0) continue;
-        var buffer: DetailBuffer = .{};
-        collectRuntimeDetailLines(state, row_plan.entry.profile_id, &buffer);
-        for (buffer.lines[0..buffer.count], 0..) |line, line_index| {
-            const setup = line.setup orelse continue;
-            const rect = providerSetupButtonRect(row_plan, line_index, setup.label);
-            const action = PROVIDER_SETUP_ACTION_BIT | (row << 8) | setup.provider_row;
-            recordFocusStop(.settings_runtime_action, action, rect, layout.body_clip);
-            if (intersectRect(rect, layout.body_clip)) |visible| queue_hit(state, visible, .settings_runtime_action, action);
+        header_bottom = by + cm.button_h;
+    }
+    plan.header = .{ .x = tile_x, .y = y, .w = tile_w, .h = header_bottom + cm.pad_y - y };
+    plan.detail_y = plan.header.y + plan.header.h + cm.pad_y;
+    var bottom = plan.header.y + plan.header.h;
+    if (plan.expanded) {
+        var pass = rowBodyPass(state, &plan, ZERO_RECT, false, null);
+        runtimeRowBody(&pass, &plan);
+        bottom = pass.y + cm.pad_y;
+    }
+    plan.bottom = bottom;
+    plan.tile = .{ .x = tile_x, .y = y, .w = tile_w, .h = bottom - y };
+    return plan;
+}
+
+fn rowBodyPass(state: *runtime.AppState, plan: *const RuntimeRowPlan, clip: palette.Rect, draw: bool, queue_hit: ?QueueHitFn) ConnPass {
+    const cm = ConnMetrics.init();
+    return .{
+        .state = state,
+        .x = plan.tile.x + cm.pad_x,
+        .y = plan.detail_y,
+        .w = @max(plan.tile.w - cm.pad_x * 2.0, 1.0),
+        .clip = clip,
+        .draw = draw,
+        .queue_hit = queue_hit,
+    };
+}
+
+/// Selectable text block for line `line_index` of runtime row `row`.
+fn runtimeTextBlock(row: usize, line_index: usize) u32 {
+    return RUNTIME_TEXT_BLOCK_BASE + @as(u32, @intCast(row % MAX_RUNTIME_ROWS)) * 64 + @as(u32, @intCast(line_index % 64));
+}
+
+/// Expanded row: readiness (repositories, providers, tools) with their
+/// Install / Sign in buttons, the row's management actions (destructive
+/// last), then a Details disclosure with ids, endpoints and setup commands
+/// as selectable text. One pass measures, registers hits and draws.
+fn runtimeRowBody(pass: *ConnPass, plan: *const RuntimeRowPlan) void {
+    const m = metrics();
+    const cm = ConnMetrics.init();
+    const row = plan.row;
+    var buffer: DetailBuffer = .{};
+    collectRuntimeDetailLines(pass.state, plan.entry.profile_id, &buffer);
+    var first = true;
+    var detail_count: usize = 0;
+    for (buffer.lines[0..buffer.count], 0..) |line, line_index| {
+        if (line.detail) {
+            detail_count += 1;
+            continue;
+        }
+        switch (line.tone) {
+            .heading => {
+                if (!first) pass.y += theme.scaledUi(8.0);
+                pass.text(line.text, textHint(), theme.scaledUi(11.5), null);
+                pass.y += theme.scaledUi(2.0);
+            },
+            .note => {
+                const indent = cm.dot + cm.dot_gap;
+                pass.textAt(pass.x + indent, pass.w - indent, line.text, textHint(), cm.status_font, runtimeTextBlock(row, line_index));
+                pass.y += theme.scaledUi(4.0);
+            },
+            else => runtimeBodyItem(pass, line, row, runtimeTextBlock(row, line_index)),
+        }
+        first = false;
+    }
+
+    var specs: [MAX_ROW_BUTTONS]ConnButton = undefined;
+    var count: usize = 0;
+    for ([_]bool{ false, true }) |destructive| {
+        for (plan.header_button_count..plan.button_count) |index| {
+            const style = plan.button_styles[index];
+            // A disabled "Workspace default" is the header's Default chip.
+            if (style == .disabled) continue;
+            const action = plan.button_actions[index];
+            const is_destructive = style == .danger or style == .danger_confirm or action == .remove_cancel;
+            if (is_destructive != destructive) continue;
+            specs[count] = .{
+                .label = plan.button_labels[index],
+                .style = style,
+                .action = .settings_runtime_action,
+                .index = runtime_connections.encodeRowAction(row, action),
+            };
+            count += 1;
         }
     }
-    recordFocusStop(.settings_runtime_action, runtime_connections.encodeRowAction(0, .add_connection), plan.add_button, layout.body_clip);
-    if (intersectRect(plan.add_button, layout.body_clip)) |visible| {
-        queue_hit(state, visible, .settings_runtime_action, runtime_connections.encodeRowAction(0, .add_connection));
+    if (count > 0) {
+        if (!first) pass.y += m.row_gap;
+        pass.buttonRow(specs[0..count]);
+        first = false;
+    }
+
+    if (detail_count == 0) return;
+    const open = detailsOpen(detailsKey(.runtime, plan.entry.profile_id orelse "local"));
+    if (!first) pass.y += m.inner_gap;
+    pass.buttonRow(&.{.{ .label = "Details", .action = .settings_phone_action, .index = RUNTIME_DETAILS_ACTION + row, .disclosure = open }});
+    if (!open) return;
+    pass.y += theme.scaledUi(4.0);
+    const indent = theme.scaledUi(DISCLOSURE_PAD_UI);
+    for (buffer.lines[0..buffer.count], 0..) |line, line_index| {
+        if (!line.detail) continue;
+        pass.textAt(pass.x + indent, pass.w - indent, line.text, textLabel(), cm.status_font, runtimeTextBlock(row, line_index));
+        pass.y += theme.scaledUi(3.0);
+    }
+}
+
+/// One readiness line: tone dot, "Name · status" (the status muted), and its
+/// Install / Sign in button at the right edge. Wraps instead of clipping.
+fn runtimeBodyItem(pass: *ConnPass, line: DetailLine, row: usize, block: u32) void {
+    const m = metrics();
+    const cm = ConnMetrics.init();
+    const font = cm.status_font;
+    const line_h = connLineHeight(font);
+    const top = pass.y;
+    var room = pass.w;
+    var button: ?ConnButton = null;
+    if (line.setup) |setup| {
+        const spec: ConnButton = .{
+            .label = setup.label,
+            .action = .settings_runtime_action,
+            .index = PROVIDER_SETUP_ACTION_BIT | (row << 8) | setup.provider_row,
+        };
+        button = spec;
+        room -= spec.width() + m.row_gap;
+    }
+    const item_pad = @max((cm.item_h - line_h) * 0.5, 0.0);
+    pass.y += item_pad;
+    if (pass.draw) {
+        queueRoundedRectClipped(pass.state, .{
+            .x = pass.x,
+            .y = pass.y + (line_h - cm.dot) * 0.5,
+            .w = cm.dot,
+            .h = cm.dot,
+        }, paletteColor(connToneColor(detailTone(line.tone))), cm.dot * 0.5, pass.clip);
+    }
+    const text_x = pass.x + cm.dot + cm.dot_gap;
+    const text_w = @max(pass.x + room - text_x, 1.0);
+    const split = std.mem.indexOf(u8, line.text, " \u{00B7} ");
+    if (split != null and connTextWidth(font, line.text) <= text_w) {
+        if (pass.draw) {
+            const name = line.text[0..split.?];
+            const name_w = connTextWidth(font, name);
+            const rect: palette.Rect = .{ .x = text_x, .y = pass.y, .w = text_w, .h = line_h };
+            settings_text.recordLine(pass.state, block, 0, rect, line.text, font, pass.clip);
+            queueText(pass.state, .{ .x = text_x, .y = pass.y, .w = name_w + theme.scaledUi(2.0), .h = line_h }, name, paletteColor(theme.COLOR_WHITE), font, pass.clip);
+            queueText(pass.state, .{ .x = text_x + name_w, .y = pass.y, .w = @max(text_w - name_w, 0.0), .h = line_h }, line.text[split.?..], paletteColor(textHint()), font, pass.clip);
+        }
+        pass.y += line_h;
+    } else {
+        pass.textAt(text_x, text_w, line.text, if (line.tone == .muted) textHint() else textLabel(), font, block);
+    }
+    pass.y = @max(pass.y + item_pad, top + cm.item_h);
+    if (button) |spec| {
+        const bw = spec.width();
+        pass.control(.{ .x = pass.x + pass.w - bw, .y = top + (cm.item_h - cm.item_button_h) * 0.5, .w = bw, .h = cm.item_button_h }, spec);
+    }
+}
+
+fn registerRuntimeCardHits(state: *runtime.AppState, layout: SettingsLayout, queue_hit: QueueHitFn) void {
+    const m = metrics();
+    const plan = &layout.runtimes;
+    const card = layout.runtimes_card;
+    // Tab order follows the page: Add connection, then each row's header,
+    // its main action, and its expanded controls.
+    var header: ConnPass = .{ .state = state, .x = card.x + m.card_pad, .y = plan.header_y, .w = @max(card.w - m.card_pad * 2.0, 1.0), .clip = layout.body_clip, .draw = false, .queue_hit = queue_hit };
+    runtimeCardHeader(&header);
+    for (plan.rows[0..plan.row_count]) |*row_plan| {
+        const row = row_plan.row;
+        if (row_plan.kind == .local or row_plan.kind == .profile) {
+            const expand = runtime_connections.encodeRowAction(row, .expand);
+            recordFocusStop(.settings_runtime_action, expand, row_plan.header, layout.body_clip);
+            if (intersectRect(row_plan.header, layout.body_clip)) |visible| queue_hit(state, visible, .settings_runtime_action, expand);
+        }
+        for (0..row_plan.header_button_count) |index| {
+            if (row_plan.button_styles[index] == .disabled) continue;
+            const action = runtime_connections.encodeRowAction(row, row_plan.button_actions[index]);
+            recordFocusStop(.settings_runtime_action, action, row_plan.buttons[index], layout.body_clip);
+            if (intersectRect(row_plan.buttons[index], layout.body_clip)) |visible| queue_hit(state, visible, .settings_runtime_action, action);
+        }
+        if (!row_plan.expanded) continue;
+        var body = rowBodyPass(state, row_plan, layout.body_clip, false, queue_hit);
+        runtimeRowBody(&body, row_plan);
     }
 }
 
@@ -4240,44 +4414,48 @@ fn isRuntimeActionHovered(state: *const runtime.AppState, index: usize) bool {
     return hovered == index;
 }
 
-fn runtimeStatusColor(status: runtime.RuntimePickerStatus) [4]f32 {
-    return runtime.runtimeStatusTone(status).color();
-}
-
-/// Title, badge and description for one tile header.
-const RuntimeHeaderText = struct {
+/// Title, one-line status, and (for failing rows) why, for one row header.
+const RuntimeRowText = struct {
     title: []const u8,
-    description: []const u8,
-    badge: []const u8 = "",
-    /// Muted when null.
-    badge_color: ?[4]f32 = null,
+    status: []const u8,
+    tone: ConnTone,
+    /// Why a failing row fails; a third header line, empty otherwise.
+    note: []const u8 = "",
 };
 
-fn runtimeHeaderText(state: *const runtime.AppState, entry: RuntimeDisplayRow, description_buf: []u8) RuntimeHeaderText {
+fn runtimeRowText(state: *const runtime.AppState, entry: RuntimeDisplayRow, buf: []u8) RuntimeRowText {
     const accounts = &state.runtime_connections.accounts;
     switch (entry.kind) {
-        .local => return .{ .title = "Local", .description = "Runs on this machine" },
+        .local => return .{ .title = "Local", .status = "This computer", .tone = .good },
         .account => {
-            const account = accounts.accountAt(entry.account) orelse return .{ .title = "Account", .description = "" };
-            const badge = accountBadge(account);
-            const plane = runtime_connections.connect_accounts.urlHost(account.control_plane_url);
-            const description = if (account.signedIn())
-                if (account.identity) |identity|
-                    std.fmt.bufPrint(description_buf, "{s} \u{00B7} signed in as {s} \u{00B7} {d} machine(s) in this account", .{ plane, identity, account.machines.items.len })
+            const account = accounts.accountAt(entry.account) orelse return .{ .title = "Account", .status = "", .tone = .neutral };
+            const title = account.title();
+            if (account.session_unavailable or account.phase == .failed) {
+                return .{ .title = title, .status = "Unavailable \u{00B7} retry, or sign in again", .tone = .warning };
+            }
+            if (account.signedIn()) {
+                const count = account.machines.items.len;
+                const plural: []const u8 = if (count == 1) "" else "s";
+                const status = if (account.identity) |identity|
+                    std.fmt.bufPrint(buf, "Signed in as {s} \u{00B7} {d} machine{s}", .{ identity, count, plural })
                 else
-                    std.fmt.bufPrint(description_buf, "{s} \u{00B7} signed in \u{00B7} {d} machine(s) in this account", .{ plane, account.machines.items.len })
-            else
-                std.fmt.bufPrint(description_buf, "{s} \u{00B7} sign in once to use any of this account's machines", .{plane});
-            return .{ .title = account.title(), .description = description catch plane, .badge = badge.text, .badge_color = badge.color };
+                    std.fmt.bufPrint(buf, "Signed in \u{00B7} {d} machine{s}", .{ count, plural });
+                return .{ .title = title, .status = status catch "Signed in", .tone = .good };
+            }
+            return switch (account.phase) {
+                .idle, .discovering, .loading_inventory => .{ .title = title, .status = "Checking\u{2026}", .tone = .neutral },
+                .signing_in => .{ .title = title, .status = "Signing in\u{2026}", .tone = .neutral },
+                else => .{ .title = title, .status = "Sign in to use this account's machines", .tone = .warning },
+            };
         },
         .available => {
-            const account = accounts.accountAt(entry.account) orelse return .{ .title = "Machine", .description = "" };
-            const machine = account.machineAt(entry.machine) orelse return .{ .title = "Machine", .description = "" };
+            const account = accounts.accountAt(entry.account) orelse return .{ .title = "Machine", .status = "", .tone = .neutral };
+            const machine = account.machineAt(entry.machine) orelse return .{ .title = "Machine", .status = "", .tone = .neutral };
             const linking = account.linkingRuntime(machine.runtime_id);
             return .{
                 .title = machine.name(),
-                .description = if (linking) "Creating this desktop's device credential on the machine\u{2026}" else "In this account \u{00B7} not connected on this desktop yet",
-                .badge = if (linking) "Connecting" else "Available",
+                .status = if (linking) "Connecting\u{2026}" else "Available \u{00B7} not connected on this computer",
+                .tone = .neutral,
             };
         },
         .profile => {},
@@ -4285,204 +4463,606 @@ fn runtimeHeaderText(state: *const runtime.AppState, entry: RuntimeDisplayRow, d
     const id = entry.profile_id.?;
     const status = state.runtimeProfileStatus(id);
     const stopped = machineStopped(state, entry, status);
-    var header: RuntimeHeaderText = .{
-        .title = "Unavailable runtime",
-        .description = runtime.runtimePickerStatusDescription(.unavailable),
-        .badge = if (stopped) "Stopped" else runtime.runtimePickerStatusBadge(status),
-        .badge_color = runtimeStatusColor(status),
+    const tone: ConnTone = if (stopped) .neutral else runtimeTone(status);
+    const badge = if (stopped) "Stopped" else runtime.runtimePickerStatusBadge(status);
+    const note: []const u8 = if (stopped)
+        "Not running in this account right now"
+    else if (tone == .warning or tone == .danger)
+        runtime.runtimePickerStatusDescription(status)
+    else
+        "";
+    const snapshot = state.runtimeProfileSnapshot(id) orelse return .{ .title = "Unavailable runtime", .status = badge, .tone = tone, .note = note };
+    if (entry.nested) return .{ .title = accounts.machineLabel(id) orelse snapshot.label, .status = badge, .tone = tone, .note = note };
+    const service = state.runtime_service orelse return .{ .title = snapshot.label, .status = badge, .tone = tone, .note = note };
+    const configured = service.runtime_manager.profileConst(id) orelse return .{ .title = snapshot.label, .status = badge, .tone = tone, .note = note };
+    const via: []const u8 = switch (configured.transport) {
+        .ssh_tunnel => "SSH",
+        .local_socket => "Local socket",
+        .direct_https => "Direct / Tailnet",
+        .connect => "Verde Cloud",
     };
-    const snapshot = state.runtimeProfileSnapshot(id) orelse return header;
-    header.title = if (entry.nested) accounts.machineLabel(id) orelse snapshot.label else snapshot.label;
-    const status_text = if (stopped) "Not running in this account right now" else runtime.runtimePickerStatusDescription(status);
-    header.description = status_text;
-    const configured = state.runtime_service.?.runtime_manager.profileConst(id) orelse return header;
-    header.description = switch (configured.transport) {
-        .ssh_tunnel => |ssh| std.fmt.bufPrint(description_buf, "{s} · ssh {s}{s}{s}:{d} → gateway {d}", .{
-            status_text,
-            ssh.user orelse "",
-            if (ssh.user != null) "@" else "",
-            ssh.host,
-            ssh.port,
-            ssh.remote_gateway_port,
-        }) catch status_text,
-        .local_socket => status_text,
-        .direct_https => |endpoint| std.fmt.bufPrint(description_buf, "{s} · Direct / Tailnet {s}", .{
-            status_text,
-            endpoint.https_url orelse "(missing endpoint)",
-        }) catch status_text,
-        .connect => |endpoint| if (entry.nested)
-            std.fmt.bufPrint(description_buf, "{s} · {s}", .{
-                status_text,
-                if (endpoint.https_url) |url| runtime_connections.connect_accounts.urlHost(url) else "(no machine selected)",
-            }) catch status_text
-        else
-            std.fmt.bufPrint(description_buf, "{s} · Connect {s}", .{
-                status_text,
-                endpoint.https_url orelse "(no runtime selected)",
-            }) catch status_text,
+    return .{
+        .title = snapshot.label,
+        .status = std.fmt.bufPrint(buf, "{s} \u{00B7} {s}", .{ badge, via }) catch badge,
+        .tone = tone,
+        .note = note,
     };
-    return header;
 }
 
 // Runtimes & connections: Local, standalone runtimes, and one tile per
-// Connect account holding its machines, with per-row actions and readiness
-// details for the expanded row.
+// Verde Cloud account holding its machines as divided sub-rows. Each row is
+// a title over a dot-led status line with its main action at the right;
+// expanding shows readiness, management actions and Details.
 fn drawRuntimeCard(state: *runtime.AppState, layout: SettingsLayout) void {
     const m = metrics();
-    const t = RuntimeTileMetrics.init();
     const card = layout.runtimes_card;
     const clip = layout.body_clip;
     const plan = &layout.runtimes;
     drawCard(state, card, clip);
-    drawCardTitle(state, card, "Runtimes & connections", clip);
-    queueWrappedText(state, .{
-        .x = card.x + m.card_pad,
-        .y = card.y + m.card_pad + m.title_h + m.inner_gap,
-        .w = card.w - m.card_pad * 2.0,
-        .h = plan.subtitle_h,
-    }, RUNTIME_SUBTITLE, paletteColor(textHint()), theme.scaledUi(12.0), clip);
+    var pass: ConnPass = .{ .state = state, .x = card.x + m.card_pad, .y = plan.header_y, .w = @max(card.w - m.card_pad * 2.0, 1.0), .clip = clip, .draw = true, .queue_hit = null };
+    runtimeCardHeader(&pass);
+    for (plan.rows[0..plan.row_count]) |*row_plan| drawRuntimeRow(state, row_plan, clip);
+    pass.y = plan.hint_y;
+    pass.text(RUNTIME_HINT, textHint(), theme.scaledUi(12.0), null);
+}
 
-    for (0..plan.row_count) |index_in_plan| {
-        const row_plan = &plan.rows[index_in_plan];
-        const entry = row_plan.entry;
-        const row = row_plan.row;
-        const profile_id = entry.profile_id;
-        const header = row_plan.header;
-        const tile = row_plan.tile;
-        const expandable = entry.kind == .local or entry.kind == .profile;
-        const header_hovered = expandable and isRuntimeActionHovered(state, runtime_connections.encodeRowAction(row, .expand));
-        const is_default = expandable and runtimeRowIsWorkspaceDefault(state, profile_id);
+fn drawRuntimeRow(state: *runtime.AppState, row_plan: *const RuntimeRowPlan, clip: palette.Rect) void {
+    const m = metrics();
+    const cm = ConnMetrics.init();
+    const entry = row_plan.entry;
+    const row = row_plan.row;
+    const tile = row_plan.tile;
+    const header = row_plan.header;
+    const expandable = entry.kind == .local or entry.kind == .profile;
+    const header_hovered = expandable and isRuntimeActionHovered(state, runtime_connections.encodeRowAction(row, .expand));
+    const content_x = tile.x + cm.pad_x;
+    const content_w = @max(tile.w - cm.pad_x * 2.0, 0.0);
+    const wash = paletteColor(theme.withAlpha(theme.COLOR_WHITE, 9));
+    if (entry.nested) {
+        // A machine inside its account tile: a divider, no tile of its own.
+        drawDivider(state, content_x, tile.y, content_w, clip);
+        // Inset by the account tile's stroke so the wash keeps its border.
+        const stroke = @max(@round(theme.scaledUi(1.0)), 1.0);
+        if (header_hovered) queueRoundedRectClipped(state, .{ .x = header.x + stroke, .y = header.y + stroke, .w = @max(header.w - stroke * 2.0, 0.0), .h = @max(header.h - stroke * 2.0, 0.0) }, wash, radiusSm(), clip);
+    } else {
+        const fill = raisedSurface(if (entry.kind == .account) 0.12 else 0.135);
+        const border = theme.withAlpha(theme.COLOR_WHITE, if (row_plan.expanded) 30 else 20);
+        queuePanelClipped(state, tile, fill, border, radiusSm(), clip);
+        if (header_hovered) queueRoundedRectClipped(state, header, wash, radiusSm(), clip);
+    }
 
-        // Tile surface: raised slightly above the card (machine tiles one
-        // step above their account); the header band brightens on hover so
-        // the expand affordance is discoverable.
-        const surface = switch (entry.kind) {
-            .account => raisedSurface(0.09),
-            .available => raisedSurface(0.11),
-            else => raisedSurface(if (entry.nested) 0.16 else 0.13),
+    var text_buf: [320]u8 = undefined;
+    const text = runtimeRowText(state, entry, &text_buf);
+    const top = header.y + cm.pad_y;
+    const text_w = @max(row_plan.text_right - content_x, 0.0);
+    // Title, with a neutral "Default" chip right after it.
+    const is_default = expandable and runtimeRowIsWorkspaceDefault(state, entry.profile_id);
+    const chip_label = "Default";
+    const chip_w = chipWidth(chip_label);
+    const show_chip = is_default and text_w >= chip_w + m.inner_gap + theme.scaledUi(40.0);
+    const title_room = if (show_chip) text_w - chip_w - m.inner_gap else text_w;
+    var title_buf: [256]u8 = undefined;
+    const title = ellipsizedText(&title_buf, text.title, cm.title_font, title_room);
+    queueText(state, .{ .x = content_x, .y = top, .w = title_room, .h = cm.title_h }, title, paletteColor(theme.COLOR_WHITE), cm.title_font, clip);
+    if (show_chip) drawChip(state, content_x + connTextWidth(cm.title_font, title) + m.inner_gap, top + cm.title_h * 0.5, chip_label, clip);
+    const status_y = top + cm.title_h + cm.line_gap;
+    drawStatusLine(state, content_x, status_y, text_w, cm.status_h, text.tone, text.status, clip);
+    if (row_plan.has_note and text.note.len > 0) {
+        const indent = cm.dot + cm.dot_gap;
+        queueFittedText(state, .{
+            .x = content_x + indent,
+            .y = status_y + cm.status_h + cm.line_gap,
+            .w = @max(text_w - indent, 0.0),
+            .h = cm.status_h,
+        }, text.note, paletteColor(textHint()), cm.status_font, clip);
+    }
+    if (expandable) {
+        queueIconText(state, row_plan.chevron, if (row_plan.expanded) NF_COD_CHEVRON_UP else NF_COD_CHEVRON_DOWN, paletteColor(if (header_hovered) theme.COLOR_WHITE else textLabel()), cm.chevron, clip);
+    }
+    for (0..row_plan.header_button_count) |index| {
+        const action_index = runtime_connections.encodeRowAction(row, row_plan.button_actions[index]);
+        drawActionButton(state, row_plan.buttons[index], row_plan.button_labels[index], row_plan.button_styles[index], isRuntimeActionHovered(state, action_index), clip);
+    }
+    if (!row_plan.expanded) return;
+    drawDivider(state, content_x, header.y + header.h, content_w, clip);
+    var body = rowBodyPass(state, row_plan, clip, true, null);
+    runtimeRowBody(&body, row_plan);
+}
+
+// ---------------------------------------------------------------------------
+// Connections page: shared row primitives
+// ---------------------------------------------------------------------------
+
+const QueueHitFn = *const fn (*runtime.AppState, palette.Rect, runtime.PaletteModalAction, usize) void;
+const ZERO_RECT: palette.Rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 };
+
+/// Status tones on the Connections page: green only when something works
+/// (connected, signed in, ready), neutral for idle states (available, not
+/// installed, checking), amber only for a problem the user can fix, red for
+/// failures and revocations.
+const ConnTone = enum { good, neutral, warning, danger };
+
+fn connToneColor(tone: ConnTone) [4]f32 {
+    return switch (tone) {
+        .good => theme.success(),
+        .neutral => textHint(),
+        .warning => theme.warning(),
+        .danger => theme.danger(),
+    };
+}
+
+fn runtimeTone(status: runtime.RuntimePickerStatus) ConnTone {
+    return switch (runtime.runtimeStatusTone(status)) {
+        .success => .good,
+        .muted => .neutral,
+        .warning => .warning,
+        .danger => .danger,
+    };
+}
+
+fn detailTone(tone: @FieldType(DetailLine, "tone")) ConnTone {
+    return switch (tone) {
+        .good => .good,
+        .warning => .warning,
+        .normal, .muted, .heading, .note => .neutral,
+    };
+}
+
+/// Geometry tokens shared by Connections rows (runtimes, machines, paired
+/// devices): a title line over a dot-led status line, compact buttons.
+const ConnMetrics = struct {
+    pad_x: f32,
+    pad_y: f32,
+    title_font: f32,
+    title_h: f32,
+    status_font: f32,
+    status_h: f32,
+    line_gap: f32,
+    button_h: f32,
+    item_button_h: f32,
+    dot: f32,
+    dot_gap: f32,
+    chevron: f32,
+    /// One readiness line, tall enough for its Install / Sign in button.
+    item_h: f32,
+    /// Narrowest title/status text before a row's buttons wrap under it.
+    min_text_w: f32,
+
+    fn init() ConnMetrics {
+        return .{
+            .pad_x = theme.scaledUi(14.0),
+            .pad_y = theme.scaledUi(11.0),
+            .title_font = theme.scaledUi(13.5),
+            .title_h = theme.scaledUi(18.0),
+            .status_font = theme.scaledUi(12.0),
+            .status_h = theme.scaledUi(16.0),
+            .line_gap = theme.scaledUi(3.0),
+            .button_h = theme.scaledUi(28.0),
+            .item_button_h = theme.scaledUi(24.0),
+            .dot = theme.scaledUi(7.0),
+            .dot_gap = theme.scaledUi(7.0),
+            .chevron = theme.scaledUi(14.0),
+            .item_h = theme.scaledUi(28.0),
+            .min_text_w = theme.scaledUi(150.0),
         };
-        queueRoundedRectClipped(state, tile, paletteColor(surface), radiusSm(), clip);
-        if (header_hovered) {
-            const band: palette.Rect = .{ .x = header.x, .y = header.y, .w = header.w, .h = @min(header.h, tile.h) };
-            queueRoundedRectClipped(state, band, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 10)), radiusSm(), clip);
-        }
-        const border_color = if (is_default) theme.withAlpha(theme.accent(), 110) else theme.withAlpha(theme.COLOR_WHITE, if (row_plan.expanded) 34 else 22);
-        queueBorderClipped(state, tile, paletteColor(border_color), radiusSm(), theme.scaledUi(1.0), clip);
+    }
+};
 
-        var description_buf: [320]u8 = undefined;
-        const text = runtimeHeaderText(state, entry, &description_buf);
+fn connLineHeight(font: f32) f32 {
+    return @round(font * 1.3);
+}
 
-        // Header: title + status badge + expand chevron on the first line,
-        // description on the second.
-        const title_y = header.y + t.pad;
-        var right_edge = header.x + header.w - t.pad;
-        if (expandable) {
-            const chevron_rect: palette.Rect = .{
-                .x = header.x + header.w - t.pad - t.chevron,
-                .y = title_y + (t.title_h - t.chevron) * 0.5,
-                .w = t.chevron,
-                .h = t.chevron,
-            };
-            queueIconText(state, chevron_rect, if (row_plan.expanded) NF_COD_CHEVRON_UP else NF_COD_CHEVRON_DOWN, paletteColor(if (header_hovered) theme.COLOR_WHITE else textLabel()), t.chevron, clip);
-            right_edge = chevron_rect.x - m.inner_gap;
-        }
-        if (text.badge.len > 0) {
-            const badge_font = theme.scaledUi(11.5);
-            const badge_h = theme.scaledUi(20.0);
-            const badge_w = settingsTextWidth(badge_font, text.badge) + theme.scaledUi(16.0);
-            const badge_rect: palette.Rect = .{
-                .x = right_edge - badge_w,
-                .y = title_y + (t.title_h - badge_h) * 0.5,
-                .w = badge_w,
-                .h = badge_h,
-            };
-            const badge_color = text.badge_color orelse theme.COLOR_TEXT_MUTED;
-            queueRoundedRectClipped(state, badge_rect, paletteColor(theme.withAlpha(badge_color, 40)), badge_h * 0.5, clip);
-            queueCenteredText(state, badge_rect, text.badge, paletteColor(badge_color), badge_font, clip);
-            right_edge = badge_rect.x - m.inner_gap;
-        }
-        const title_x = header.x + t.pad;
-        queueText(state, .{
-            .x = title_x,
-            .y = title_y,
-            .w = @max(right_edge - title_x, 0.0),
-            .h = t.title_h,
-        }, text.title, paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.0), clip);
-        var desc_buf: [360]u8 = undefined;
-        const description_text = if (is_default)
-            std.fmt.bufPrint(&desc_buf, "{s} · workspace default", .{text.description}) catch text.description
-        else
-            text.description;
-        queueText(state, .{
-            .x = title_x,
-            .y = title_y + t.title_h + theme.scaledUi(4.0),
-            .w = header.w - t.pad * 2.0,
-            .h = t.desc_h,
-        }, description_text, paletteColor(textHint()), theme.scaledUi(12.0), clip);
+/// Direct-mapped memo of Connections text widths. Rows are measured for
+/// layout, hit testing and drawing every frame and their "·" lines take the
+/// GPU shaping path, so uncached measurement made the page lag on hover.
+const ConnWidthSlot = struct { key: u64 = 0, width: f32 = 0.0 };
+var conn_width_cache: [512]ConnWidthSlot = [_]ConnWidthSlot{.{}} ** 512;
 
-        for (0..row_plan.button_count) |index| {
-            const action_index = runtime_connections.encodeRowAction(row, row_plan.button_actions[index]);
-            drawActionButton(state, row_plan.buttons[index], row_plan.button_labels[index], row_plan.button_styles[index], isRuntimeActionHovered(state, action_index), clip);
-        }
+/// `settingsTextWidth`, memoized per font size, font generation and text.
+fn connTextWidth(font_size: f32, value: []const u8) f32 {
+    var hasher = std.hash.Wyhash.init(@as(u32, @bitCast(font_size)));
+    const generation = text_measure.fontGeneration();
+    hasher.update(std.mem.asBytes(&generation));
+    hasher.update(value);
+    const key = hasher.final() | 1;
+    const slot = &conn_width_cache[@intCast(key % conn_width_cache.len)];
+    if (slot.key == key) return slot.width;
+    const width = settingsTextWidth(font_size, value);
+    slot.* = .{ .key = key, .width = width };
+    return width;
+}
 
-        if (row_plan.expanded and row_plan.detail_line_count > 0) {
-            const divider_y = row_plan.detail_y - t.pad;
-            queueRoundedRectClipped(state, .{ .x = tile.x + 1.0, .y = divider_y, .w = tile.w - 2.0, .h = 1.0 }, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 18)), 0.0, clip);
-            var buffer: DetailBuffer = .{};
-            collectRuntimeDetailLines(state, profile_id, &buffer);
-            const dot = theme.scaledUi(6.0);
-            const dot_indent = dot + theme.scaledUi(8.0);
-            for (buffer.lines[0..buffer.count], 0..) |line, line_index| {
-                const line_y = row_plan.detail_y + @as(f32, @floatFromInt(line_index)) * t.detail_line_h;
-                const text_h = theme.scaledUi(16.0);
-                const text_y = line_y + (t.detail_line_h - text_h) * 0.5;
-                if (line.setup) |setup| {
-                    const button = providerSetupButtonRect(row_plan, line_index, setup.label);
-                    const action = PROVIDER_SETUP_ACTION_BIT | (row << 8) | setup.provider_row;
-                    drawActionButton(state, button, setup.label, .secondary, isRuntimeActionHovered(state, action), clip);
-                    const command_x = button.x + button.w + m.inner_gap;
-                    queueText(state, .{
-                        .x = command_x,
-                        .y = button.y + (button.h - text_h) * 0.5,
-                        .w = @max(tile.x + tile.w - t.pad - command_x, 0.0),
-                        .h = text_h,
-                    }, line.text, paletteColor(textHint()), theme.scaledUi(12.0), clip);
-                    continue;
-                }
-                // Status lines get a tone dot like the Providers page;
-                // headings and notes stay plain text.
-                const status_color: ?[4]f32 = switch (line.tone) {
-                    .good => theme.success(),
-                    .warning => theme.warning(),
-                    .normal, .muted => null,
-                };
-                var text_x = title_x;
-                if (status_color) |color| {
-                    queueRoundedRectClipped(state, .{ .x = title_x, .y = line_y + (t.detail_line_h - dot) * 0.5, .w = dot, .h = dot }, paletteColor(color), dot * 0.5, clip);
-                    text_x += dot_indent;
-                }
-                const text_color = switch (line.tone) {
-                    .normal => theme.COLOR_WHITE,
-                    .muted => textHint(),
-                    .good => textLabel(),
-                    .warning => theme.warning(),
-                };
-                queueText(state, .{
-                    .x = text_x,
-                    .y = text_y,
-                    .w = @max(tile.x + tile.w - t.pad - text_x, 0.0),
-                    .h = text_h,
-                }, line.text, paletteColor(text_color), theme.scaledUi(12.0), clip);
+/// Break at measured UTF-8 boundaries, including inside an unbroken URL.
+/// The same slices determine height, hit testing and rendered lines.
+const WrappedLines = struct {
+    value: []const u8,
+    width: f32,
+    font: f32,
+    offset: usize = 0,
+
+    // Measure once per word and binary-search only inside an overlong word.
+    fn next(self: *WrappedLines) ?[]const u8 {
+        const value = self.value;
+        while (self.offset < value.len and value[self.offset] == ' ') self.offset += 1;
+        if (self.offset == value.len) return null;
+        const start = self.offset;
+        var end = start;
+        if (self.fits(start, value.len)) {
+            end = value.len;
+        } else while (end < value.len) {
+            var word_end = end;
+            while (word_end < value.len and value[word_end] == ' ') word_end += 1;
+            word_end = std.mem.indexOfScalarPos(u8, value, word_end, ' ') orelse value.len;
+            if (!self.fits(start, word_end)) break;
+            end = word_end;
+        }
+        if (end == start) {
+            const word_end = std.mem.indexOfScalarPos(u8, value, start, ' ') orelse value.len;
+            var lo = @min(start + (std.unicode.utf8ByteSequenceLength(value[start]) catch 1), word_end);
+            var hi = word_end;
+            while (lo < hi) {
+                var mid = lo + (hi - lo + 1) / 2;
+                while (mid > lo and mid < value.len and value[mid] & 0xC0 == 0x80) mid -= 1;
+                if (mid == lo) break;
+                if (self.fits(start, mid)) lo = mid else hi = mid - 1;
+            }
+            end = lo;
+        }
+        self.offset = end;
+        return value[start..end];
+    }
+
+    fn fits(self: *const WrappedLines, start: usize, end: usize) bool {
+        return connTextWidth(self.font, self.value[start..end]) <= self.width;
+    }
+};
+
+/// A compact button (or a "Details" disclosure) placed by `ConnPass`.
+const ConnButton = struct {
+    label: []const u8,
+    style: ButtonStyle = .secondary,
+    action: runtime.PaletteModalAction,
+    index: usize,
+    /// False draws the button but registers no hit or Tab stop.
+    enabled: bool = true,
+    /// Draws a disclosure in this open state instead of a push button.
+    disclosure: ?bool = null,
+
+    fn width(self: ConnButton) f32 {
+        return if (self.disclosure != null) disclosureWidth(self.label) else buttonWidth(self.label);
+    }
+};
+
+/// One walk over a Connections section that measures it (`draw` false,
+/// no `queue_hit`), registers its hits and Tab stops in visual order, or
+/// draws it, so the three can never disagree. `y` advances as it goes.
+const ConnPass = struct {
+    state: *runtime.AppState,
+    x: f32,
+    y: f32,
+    w: f32,
+    clip: palette.Rect,
+    draw: bool,
+    queue_hit: ?QueueHitFn,
+
+    /// Wrapped text; recorded as selectable content when `block` is given.
+    fn text(self: *ConnPass, value: []const u8, color: [4]f32, font: f32, block: ?u32) void {
+        self.textAt(self.x, self.w, value, color, font, block);
+    }
+
+    fn textAt(self: *ConnPass, x: f32, w: f32, value: []const u8, color: [4]f32, font: f32, block: ?u32) void {
+        const line_h = connLineHeight(font);
+        var lines: WrappedLines = .{ .value = value, .width = @max(w, 1.0), .font = font };
+        var index: usize = 0;
+        while (lines.next()) |line| : (index += 1) {
+            const rect: palette.Rect = .{ .x = x, .y = self.y, .w = @max(w, 1.0), .h = line_h };
+            if (self.draw) {
+                if (block) |id| settings_text.recordLine(self.state, id, index, rect, line, font, self.clip);
+                queueText(self.state, rect, line, paletteColor(color), font, self.clip);
+            }
+            self.y += line_h;
+        }
+    }
+
+    /// Tone dot, then wrapped text indented past it.
+    fn status(self: *ConnPass, tone: ConnTone, value: []const u8, color: [4]f32, font: f32, block: ?u32) void {
+        const cm = ConnMetrics.init();
+        const line_h = connLineHeight(font);
+        if (self.draw) {
+            queueRoundedRectClipped(self.state, .{ .x = self.x, .y = self.y + (line_h - cm.dot) * 0.5, .w = cm.dot, .h = cm.dot }, paletteColor(connToneColor(tone)), cm.dot * 0.5, self.clip);
+        }
+        const indent = cm.dot + cm.dot_gap;
+        self.textAt(self.x + indent, self.w - indent, value, color, font, block);
+    }
+
+    fn control(self: *ConnPass, rect: palette.Rect, spec: ConnButton) void {
+        const hover_key = if (spec.action == .settings_phone_action) spec.index | PHONE_HOVER_BIT else spec.index;
+        const live = spec.enabled and spec.style != .disabled;
+        const hovered = live and self.state.settings_controller.hover_runtime_action == hover_key;
+        if (self.draw) {
+            if (spec.disclosure) |open| {
+                drawDisclosure(self.state, rect, spec.label, open, hovered, self.clip);
+            } else {
+                drawActionButton(self.state, rect, spec.label, spec.style, hovered, self.clip);
             }
         }
+        if (!live) return;
+        const queue = self.queue_hit orelse return;
+        recordFocusStop(spec.action, spec.index, rect, self.clip);
+        if (intersectRect(rect, self.clip)) |visible| queue(self.state, visible, spec.action, spec.index);
     }
 
-    drawActionButton(state, plan.add_button, "Add connection…", .secondary, isRuntimeActionHovered(state, runtime_connections.encodeRowAction(0, .add_connection)), clip);
-    const notice = state.runtime_connections.cardNotice();
-    if (notice.len > 0) {
-        queueText(state, .{ .x = card.x + m.card_pad, .y = plan.notice_y, .w = card.w - m.card_pad * 2.0, .h = m.label_h }, notice, paletteColor(theme.COLOR_YELLOW), theme.scaledUi(12.0), clip);
+    /// Compact buttons left to right from `x`, wrapping at `w`.
+    fn buttonRowAt(self: *ConnPass, x: f32, w: f32, specs: []const ConnButton) void {
+        if (specs.len == 0) return;
+        const m = metrics();
+        const cm = ConnMetrics.init();
+        var cursor_x = x;
+        var row_y = self.y;
+        for (specs, 0..) |spec, index| {
+            const bw = @min(spec.width(), w);
+            if (index > 0 and cursor_x + bw > x + w) {
+                cursor_x = x;
+                row_y += cm.button_h + m.inner_gap;
+            }
+            self.control(.{ .x = cursor_x, .y = row_y, .w = bw, .h = cm.button_h }, spec);
+            cursor_x += bw + m.inner_gap;
+        }
+        self.y = row_y + cm.button_h;
     }
-    queueWrappedText(state, .{ .x = card.x + m.card_pad, .y = plan.hint_y, .w = card.w - m.card_pad * 2.0, .h = plan.hint_h }, RUNTIME_HINT, paletteColor(textHint()), theme.scaledUi(12.0), clip);
+
+    fn buttonRow(self: *ConnPass, specs: []const ConnButton) void {
+        self.buttonRowAt(self.x, self.w, specs);
+    }
+
+    /// Card or section title with right-aligned compact buttons, then the
+    /// helper text. The buttons drop under the helper when the title would
+    /// be cramped.
+    fn header(self: *ConnPass, title: []const u8, helper: []const u8, specs: []const ConnButton) void {
+        const m = metrics();
+        const cm = ConnMetrics.init();
+        const title_font = theme.scaledUi(15.0);
+        var buttons_w: f32 = 0.0;
+        for (specs, 0..) |spec, index| buttons_w += spec.width() + if (index > 0) m.inner_gap else 0.0;
+        const beside = specs.len > 0 and connTextWidth(title_font, title) + m.row_gap + buttons_w <= self.w;
+        const title_w = if (beside) self.w - buttons_w - m.row_gap else self.w;
+        if (self.draw) queueFittedText(self.state, .{ .x = self.x, .y = self.y, .w = title_w, .h = m.title_h }, title, paletteColor(theme.COLOR_WHITE), title_font, self.clip);
+        const top = self.y;
+        self.y += m.title_h;
+        if (beside) {
+            var bx = self.x + self.w - buttons_w;
+            const by = top + (m.title_h - cm.button_h) * 0.5;
+            for (specs) |spec| {
+                const bw = spec.width();
+                self.control(.{ .x = bx, .y = by, .w = bw, .h = cm.button_h }, spec);
+                bx += bw + m.inner_gap;
+            }
+            self.y = @max(self.y, by + cm.button_h);
+        }
+        if (helper.len > 0) {
+            self.y += theme.scaledUi(4.0);
+            self.text(helper, textHint(), theme.scaledUi(12.0), null);
+        }
+        if (specs.len > 0 and !beside) {
+            self.y += m.inner_gap;
+            self.buttonRow(specs);
+        }
+    }
+};
+
+/// One line of row text shortened with an ellipsis to `rect.w`.
+fn queueFittedText(state: *runtime.AppState, rect: palette.Rect, value: []const u8, color: palette.Color, font: f32, clip: palette.Rect) void {
+    var buf: [512]u8 = undefined;
+    queueText(state, rect, ellipsizedText(&buf, value, font, rect.w), color, font, clip);
+}
+
+/// Tone dot centered on one status line, then the fitted status text.
+fn drawStatusLine(state: *runtime.AppState, x: f32, y: f32, w: f32, h: f32, tone: ConnTone, value: []const u8, clip: palette.Rect) void {
+    const cm = ConnMetrics.init();
+    queueRoundedRectClipped(state, .{ .x = x, .y = y + (h - cm.dot) * 0.5, .w = cm.dot, .h = cm.dot }, paletteColor(connToneColor(tone)), cm.dot * 0.5, clip);
+    const text_x = x + cm.dot + cm.dot_gap;
+    queueFittedText(state, .{ .x = text_x, .y = y, .w = @max(x + w - text_x, 0.0), .h = h }, value, paletteColor(textLabel()), cm.status_font, clip);
+}
+
+/// Horizontal padding inside a "Details" disclosure, in UI units.
+const DISCLOSURE_PAD_UI: f32 = 8.0;
+
+fn disclosureWidth(label: []const u8) f32 {
+    return connTextWidth(theme.scaledUi(12.5), label) + theme.scaledUi(DISCLOSURE_PAD_UI * 2.0 + 5.0 + 12.0);
+}
+
+/// Borderless "Details ⌄" toggle; washes on hover like other quiet controls.
+fn drawDisclosure(state: *runtime.AppState, rect: palette.Rect, label: []const u8, open: bool, hovered: bool, clip: palette.Rect) void {
+    if (hovered) queueRoundedRectClipped(state, rect, paletteColor(controlHoverSurface()), radiusSm(), clip);
+    const font = theme.scaledUi(12.5);
+    const color = paletteColor(if (hovered or open) theme.COLOR_WHITE else textLabel());
+    const text_w = connTextWidth(font, label);
+    const text_h = font * 1.25;
+    const text_x = rect.x + theme.scaledUi(DISCLOSURE_PAD_UI);
+    queueText(state, .{ .x = text_x, .y = rect.y + (rect.h - text_h) * 0.5, .w = text_w + theme.scaledUi(2.0), .h = text_h }, label, color, font, clip);
+    const icon = theme.scaledUi(12.0);
+    queueIconText(state, .{
+        .x = text_x + text_w + theme.scaledUi(5.0),
+        .y = rect.y + (rect.h - icon) * 0.5,
+        .w = icon,
+        .h = icon,
+    }, if (open) NF_COD_CHEVRON_UP else NF_COD_CHEVRON_DOWN, color, icon, clip);
+}
+
+fn chipWidth(label: []const u8) f32 {
+    return connTextWidth(theme.scaledUi(11.0), label) + theme.scaledUi(14.0);
+}
+
+/// Small neutral label chip (e.g. "Default") vertically centered on `center_y`.
+fn drawChip(state: *runtime.AppState, x: f32, center_y: f32, label: []const u8, clip: palette.Rect) void {
+    const h = theme.scaledUi(18.0);
+    const rect: palette.Rect = .{ .x = x, .y = center_y - h * 0.5, .w = chipWidth(label), .h = h };
+    queueRoundedRectClipped(state, rect, paletteColor(controlSurface()), h * 0.5, clip);
+    queueCenteredText(state, rect, label, paletteColor(textLabel()), theme.scaledUi(11.0), clip);
+}
+
+/// Hairline divider on whole device pixels.
+fn drawDivider(state: *runtime.AppState, x: f32, y: f32, w: f32, clip: palette.Rect) void {
+    if (w <= 0.0) return;
+    const stroke = @max(@round(theme.scaledUi(1.0)), 1.0);
+    const left = @round(x);
+    queueRoundedRectClipped(state, .{ .x = left, .y = @round(y), .w = @round(x + w) - left, .h = stroke }, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 16)), 0.0, clip);
+}
+
+/// A bordered surface as one snapped panel command (crisp-chrome rules).
+fn queuePanelClipped(state: *runtime.AppState, rect: palette.Rect, fill: [4]f32, border: [4]f32, radius: f32, clip: palette.Rect) void {
+    if (intersectRect(rect, clip) == null) return;
+    const stroke = @max(@round(theme.scaledUi(1.0)), 1.0);
+    const left = @round(rect.x);
+    const top = @round(rect.y);
+    const snapped: palette.Rect = .{ .x = left, .y = top, .w = @round(rect.x + rect.w) - left, .h = @round(rect.y + rect.h) - top };
+    state.palette_overlay_batch.panelClipped(state.allocator, snapped, paletteColor(fill), paletteColor(border), radius, stroke, clip) catch |err| {
+        log.warn("failed to queue settings panel: {s}", .{@errorName(err)});
+    };
+}
+
+/// "Details" disclosures open on the Connections page, keyed by a hash of
+/// the runtime profile or paired device id so they follow the item.
+var open_details: [16]u64 = @splat(0);
+
+const DetailsKind = enum(u8) { runtime, device };
+
+fn detailsKey(kind: DetailsKind, id: []const u8) u64 {
+    var hasher = std.hash.Wyhash.init(@intFromEnum(kind));
+    hasher.update(id);
+    return hasher.final() | 1;
+}
+
+fn detailsOpen(key: u64) bool {
+    return std.mem.indexOfScalar(u64, &open_details, key) != null;
+}
+
+fn toggleDetails(key: u64) void {
+    if (std.mem.indexOfScalar(u64, &open_details, key)) |index| {
+        open_details[index] = 0;
+        return;
+    }
+    const slot = std.mem.indexOfScalar(u64, &open_details, 0) orelse blk: {
+        // Full: forget the oldest.
+        std.mem.copyForwards(u64, open_details[0 .. open_details.len - 1], open_details[1..]);
+        break :blk open_details.len - 1;
+    };
+    open_details[slot] = key;
+}
+
+/// "just now", "5 min ago", "10 h ago", "3 d ago", "2 mo ago", "1 y ago".
+fn humanizeAgo(buf: []u8, seconds: i64) []const u8 {
+    const s = @max(seconds, 0);
+    const minute: i64 = 60;
+    const hour: i64 = 60 * minute;
+    const day: i64 = 24 * hour;
+    if (s < minute) return "just now";
+    const result = if (s < hour)
+        std.fmt.bufPrint(buf, "{d} min ago", .{@divFloor(s, minute)})
+    else if (s < day)
+        std.fmt.bufPrint(buf, "{d} h ago", .{@divFloor(s, hour)})
+    else if (s < 30 * day)
+        std.fmt.bufPrint(buf, "{d} d ago", .{@divFloor(s, day)})
+    else if (s < 365 * day)
+        std.fmt.bufPrint(buf, "{d} mo ago", .{@divFloor(s, 30 * day)})
+    else
+        std.fmt.bufPrint(buf, "{d} y ago", .{@divFloor(s, 365 * day)});
+    return result catch "a while ago";
+}
+
+fn secondsSince(now_ms: i64, then_ms: i64) i64 {
+    return @divFloor(@max(now_ms - then_ms, 0), 1000);
+}
+
+const PairingPreset = @TypeOf(phone_pairing.PAIRING_PRESETS[0]);
+
+/// A device's permissions in a few words; the full scope list is in Details.
+fn deviceAccessSummary(buf: []u8, preset: ?PairingPreset, scope_count: usize) []const u8 {
+    if (preset) |value| return switch (value) {
+        .full => "Full access",
+        .chat => "Chat access",
+        .monitor => "Monitor (read-only)",
+    };
+    if (scope_count == 0) return "No permissions";
+    return std.fmt.bufPrint(buf, "Custom access \u{00B7} {d} permission{s}", .{ scope_count, if (scope_count == 1) "" else "s" }) catch "Custom access";
+}
+
+/// Seen this recently reads as "Active now" with a green dot.
+const DEVICE_ACTIVE_WINDOW_MS: i64 = 10 * 60 * 1000;
+
+fn deviceTone(last_used_at_ms: ?i64, revoked_at_ms: ?i64, now_ms: i64) ConnTone {
+    if (revoked_at_ms != null) return .danger;
+    const last = last_used_at_ms orelse return .neutral;
+    return if (now_ms - last <= DEVICE_ACTIVE_WINDOW_MS) .good else .neutral;
+}
+
+/// "Full access · Last seen 10 h ago", "Revoked 3 d ago · Chat access", …
+fn deviceStatusText(buf: []u8, access: []const u8, last_used_at_ms: ?i64, revoked_at_ms: ?i64, now_ms: i64) []const u8 {
+    var ago_buf: [32]u8 = undefined;
+    if (revoked_at_ms) |revoked| {
+        return std.fmt.bufPrint(buf, "Revoked {s} \u{00B7} {s}", .{ humanizeAgo(&ago_buf, secondsSince(now_ms, revoked)), access }) catch "Revoked";
+    }
+    const last = last_used_at_ms orelse return std.fmt.bufPrint(buf, "{s} \u{00B7} Not used yet", .{access}) catch access;
+    if (now_ms - last <= DEVICE_ACTIVE_WINDOW_MS) return std.fmt.bufPrint(buf, "{s} \u{00B7} Active now", .{access}) catch access;
+    return std.fmt.bufPrint(buf, "{s} \u{00B7} Last seen {s}", .{ access, humanizeAgo(&ago_buf, secondsSince(now_ms, last)) }) catch access;
+}
+
+test "connections ages read as short human phrases" {
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("just now", humanizeAgo(&buf, -5));
+    try std.testing.expectEqualStrings("just now", humanizeAgo(&buf, 59));
+    try std.testing.expectEqualStrings("2 min ago", humanizeAgo(&buf, 150));
+    try std.testing.expectEqualStrings("10 h ago", humanizeAgo(&buf, 36461));
+    try std.testing.expectEqualStrings("3 d ago", humanizeAgo(&buf, 3 * 86400 + 5));
+    try std.testing.expectEqualStrings("1 mo ago", humanizeAgo(&buf, 45 * 86400));
+    try std.testing.expectEqualStrings("1 y ago", humanizeAgo(&buf, 400 * 86400));
+}
+
+test "paired device rows summarize access and last use" {
+    var buf: [96]u8 = undefined;
+    var status_buf: [160]u8 = undefined;
+    try std.testing.expectEqualStrings("Full access", deviceAccessSummary(&buf, .full, 20));
+    try std.testing.expectEqualStrings("Monitor (read-only)", deviceAccessSummary(&buf, .monitor, 7));
+    try std.testing.expectEqualStrings("Custom access \u{00B7} 3 permissions", deviceAccessSummary(&buf, null, 3));
+    try std.testing.expectEqualStrings("No permissions", deviceAccessSummary(&buf, null, 0));
+    const now: i64 = 1_000_000_000;
+    try std.testing.expectEqualStrings("Full access \u{00B7} Last seen 10 h ago", deviceStatusText(&status_buf, "Full access", now - 36461 * 1000, null, now));
+    try std.testing.expectEqualStrings("Full access \u{00B7} Active now", deviceStatusText(&status_buf, "Full access", now - 30 * 1000, null, now));
+    try std.testing.expectEqualStrings("Chat access \u{00B7} Not used yet", deviceStatusText(&status_buf, "Chat access", null, null, now));
+    try std.testing.expectEqualStrings("Revoked 2 d ago \u{00B7} Chat access", deviceStatusText(&status_buf, "Chat access", now, now - 2 * 86400 * 1000, now));
+    try std.testing.expectEqual(ConnTone.danger, deviceTone(now, now - 1000, now));
+    try std.testing.expectEqual(ConnTone.good, deviceTone(now - 1000, null, now));
+    try std.testing.expectEqual(ConnTone.neutral, deviceTone(now - 36461 * 1000, null, now));
+    try std.testing.expectEqual(ConnTone.neutral, deviceTone(null, null, now));
+}
+
+test "connections text fits its width with an ellipsis" {
+    var buf: [256]u8 = undefined;
+    const font: f32 = 12.0;
+    const value = "Permissions \u{00B7} runtime:read, chat:read, chat:write, terminal:read, repository:read";
+    const max_w = settingsTextWidth(font, "Permissions \u{00B7} runtime:read");
+    const fitted = ellipsizedText(&buf, value, font, max_w);
+    try std.testing.expect(std.mem.endsWith(u8, fitted, "\u{2026}"));
+    try std.testing.expect(settingsTextWidth(font, fitted) <= max_w);
+    try std.testing.expectEqualStrings("Ready", ellipsizedText(&buf, "Ready", font, 1000.0));
+}
+
+test "details disclosures toggle by identity and forget the oldest when full" {
+    const saved = open_details;
+    defer open_details = saved;
+    open_details = @splat(0);
+    const key = detailsKey(.device, "device-a");
+    try std.testing.expect(key != detailsKey(.runtime, "device-a"));
+    toggleDetails(key);
+    try std.testing.expect(detailsOpen(key));
+    toggleDetails(key);
+    try std.testing.expect(!detailsOpen(key));
+    for (0..open_details.len + 1) |index| {
+        var id_buf: [16]u8 = undefined;
+        toggleDetails(detailsKey(.runtime, std.fmt.bufPrint(&id_buf, "p{d}", .{index}) catch unreachable));
+    }
+    try std.testing.expect(!detailsOpen(detailsKey(.runtime, "p0")));
+    try std.testing.expect(detailsOpen(detailsKey(.runtime, "p16")));
 }
 
 fn drawCard(state: *runtime.AppState, rect: palette.Rect, clip: palette.Rect) void {
@@ -4868,13 +5448,18 @@ fn drawSwitchRow(state: *runtime.AppState, rect: palette.Rect, label: []const u8
 
     const track_w = theme.scaledUi(40.0);
     const track_h = theme.scaledUi(22.0);
-    const track: palette.Rect = .{
+    drawSwitchTrack(state, .{
         .x = rect.x + rect.w - theme.scaledUi(10.0) - track_w,
         .y = rect.y + (rect.h - track_h) * 0.5,
         .w = track_w,
         .h = track_h,
-    };
-    const track_color = if (on) theme.withAlpha(theme.accent(), 200) else controlSurface();
+    }, on, false, clip);
+}
+
+/// The switch alone (track and knob); `hovered` brightens an off track.
+fn drawSwitchTrack(state: *runtime.AppState, track: palette.Rect, on: bool, hovered: bool, clip: palette.Rect) void {
+    const track_h = track.h;
+    const track_color = if (on) theme.withAlpha(theme.accent(), 200) else if (hovered) controlHoverSurface() else controlSurface();
     queueRoundedRectClipped(state, track, paletteColor(track_color), track_h * 0.5, clip);
     if (!on) {
         queueBorderClipped(state, track, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 34)), track_h * 0.5, theme.scaledUi(1.0), clip);
@@ -4995,7 +5580,9 @@ fn drawSegmentedTriple(
     }
 }
 
-const ButtonStyle = enum { primary, secondary, disabled };
+/// `danger` is a de-emphasized destructive action (Remove, Revoke, Forget);
+/// `danger_confirm` is its armed second step.
+const ButtonStyle = enum { primary, secondary, disabled, danger, danger_confirm };
 
 // Push button for immediate actions (update check/install), with a real
 // disabled look so inert states don't read as clickable pills.
@@ -5281,9 +5868,22 @@ fn drawActionButton(state: *runtime.AppState, rect: palette.Rect, label: []const
         .disabled => {
             queueBorderClipped(state, rect, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 16)), radiusSm(), theme.scaledUi(1.0), clip);
         },
+        .danger => {
+            // Quiet until hovered so destructive verbs never outweigh the
+            // row's main action.
+            const fill = if (hovered) theme.mix(controlSurface(), theme.danger(), 0.18) else theme.withAlpha(controlSurface(), 0);
+            queuePanelClipped(state, rect, fill, theme.withAlpha(theme.danger(), if (hovered) 140 else 70), radiusSm(), clip);
+        },
+        .danger_confirm => {
+            const bg = if (hovered) theme.mix(theme.danger(), theme.foregroundOn(theme.danger()), 0.10) else theme.danger();
+            button_fill = bg;
+            queueRoundedRectClipped(state, rect, paletteColor(bg), radiusSm(), clip);
+        },
     }
     const text_color = if (style == .disabled)
         textHint()
+    else if (style == .danger)
+        theme.mix(theme.danger(), theme.COLOR_WHITE, 0.25)
     else if (button_fill) |fill|
         theme.foregroundOn(fill)
     else
@@ -5512,11 +6112,17 @@ comptime {
 }
 
 const PHONE_HOVER_BIT: usize = 1 << (@bitSizeOf(usize) - 1);
+/// "Details" disclosure of paired device `i`: `DEVICE_DETAILS_ACTION + i`,
+/// above every revoke action (16 + 2 per device).
+const DEVICE_DETAILS_ACTION: usize = 1 << 19;
 /// Remote access controls share the phone card's action space above every
-/// device index (16 + 2 per device).
+/// device index.
 const REMOTE_SWITCH_ACTION: usize = 1 << 20;
 const REMOTE_BLOCKER_ACTION: usize = REMOTE_SWITCH_ACTION + 1;
-/// Selectable text blocks in the Connections card (settings_text_selection).
+/// "Details" disclosure of runtime row `r`: `RUNTIME_DETAILS_ACTION + r`. It
+/// rides the phone action space because it only changes this page's view.
+const RUNTIME_DETAILS_ACTION: usize = 1 << 21;
+/// Selectable text blocks in the Connections page (settings_text_selection).
 const REMOTE_STATUS_BLOCK: u32 = 1;
 const REMOTE_BLOCKER_BLOCK: u32 = 2;
 const REMOTE_DETAIL_BLOCK: u32 = 3;
@@ -5524,81 +6130,31 @@ const PHONE_NOTICE_BLOCK: u32 = 4;
 const PHONE_HOST_BLOCK: u32 = 5;
 const PHONE_LINK_BLOCK: u32 = 6;
 const REMOTE_NOTICE_BLOCK: u32 = 7;
+const RUNTIME_NOTICE_BLOCK: u32 = 8;
+/// `+ row * 64 + line`; see `runtimeTextBlock`.
+const RUNTIME_TEXT_BLOCK_BASE: u32 = 0x1000;
+/// `+ device * 8 + field`; see `pairedDeviceDetails`.
+const DEVICE_DETAILS_BLOCK_BASE: u32 = 0x4000;
 
-/// Break at measured UTF-8 boundaries, including inside the unbroken App Link.
-/// The same slices determine card height and rendered lines.
-const PhoneLines = struct {
-    value: []const u8,
-    width: f32,
-    offset: usize = 0,
-
-    // Each measurement shapes the whole slice and this card is laid out several times per
-    // frame, so measure once per word and binary-search only inside an overlong word.
-    fn next(self: *PhoneLines) ?[]const u8 {
-        const value = self.value;
-        while (self.offset < value.len and value[self.offset] == ' ') self.offset += 1;
-        if (self.offset == value.len) return null;
-        const start = self.offset;
-        var end = start;
-        if (self.fits(start, value.len)) {
-            end = value.len;
-        } else while (end < value.len) {
-            var word_end = end;
-            while (word_end < value.len and value[word_end] == ' ') word_end += 1;
-            word_end = std.mem.indexOfScalarPos(u8, value, word_end, ' ') orelse value.len;
-            if (!self.fits(start, word_end)) break;
-            end = word_end;
-        }
-        if (end == start) {
-            const word_end = std.mem.indexOfScalarPos(u8, value, start, ' ') orelse value.len;
-            var lo = @min(start + (std.unicode.utf8ByteSequenceLength(value[start]) catch 1), word_end);
-            var hi = word_end;
-            while (lo < hi) {
-                var mid = lo + (hi - lo + 1) / 2;
-                while (mid > lo and mid < value.len and value[mid] & 0xC0 == 0x80) mid -= 1;
-                if (mid == lo) break;
-                if (self.fits(start, mid)) lo = mid else hi = mid - 1;
-            }
-            end = lo;
-        }
-        self.offset = end;
-        return value[start..end];
-    }
-
-    fn fits(self: *const PhoneLines, start: usize, end: usize) bool {
-        return phoneTextWidth(self.value[start..end]) <= self.width;
-    }
-};
-
-/// Direct-mapped memo of phone-card text widths. The card is wrapped for layout,
-/// hit testing and drawing on every frame, and its "·" lines take the GPU shaping
-/// path, so uncached measurement made the Connections page lag on hover/scroll.
-const PhoneWidthSlot = struct { key: u64 = 0, width: f32 = 0.0 };
-var phone_width_cache: [512]PhoneWidthSlot = [_]PhoneWidthSlot{.{}} ** 512;
-
-fn phoneTextWidth(value: []const u8) f32 {
-    const font_size = theme.scaledUi(NOTES_FONT_SIZE);
-    var hasher = std.hash.Wyhash.init(@as(u32, @bitCast(font_size)));
-    hasher.update(value);
-    const key = hasher.final() | 1;
-    const slot = &phone_width_cache[@intCast(key % phone_width_cache.len)];
-    if (slot.key == key) return slot.width;
-    const width = text_measure.textWidth(.ui, font_size, value);
-    slot.* = .{ .key = key, .width = width };
-    return width;
+comptime {
+    std.debug.assert(RUNTIME_TEXT_BLOCK_BASE + MAX_RUNTIME_ROWS * 64 <= DEVICE_DETAILS_BLOCK_BASE);
+    std.debug.assert(MAX_DETAIL_LINES <= 64);
 }
 
-test "phone card lines wrap at words and split only overlong words" {
-    const value = "Source: pair · Last seen: 12s ago https://verdeai.dev/pair?host=https%3A%2F%2Fhost.ts.net";
-    const width = text_measure.textWidth(.ui, theme.scaledUi(NOTES_FONT_SIZE), "Source: pair · Last");
-    var lines: PhoneLines = .{ .value = value, .width = width };
+const REMOTE_ACCESS_HELPER = "Reach this computer's chats from your phone or your other computers over Tailscale. It keeps running after Verde quits.";
+
+test "connections text wraps at words and splits only overlong words" {
+    const font = theme.scaledUi(NOTES_FONT_SIZE);
+    const value = "Paired via · pairing link https://verdeai.dev/pair?host=https%3A%2F%2Fhost.ts.net";
+    const width = connTextWidth(font, "Paired via · pairing");
+    var lines: WrappedLines = .{ .value = value, .width = width, .font = font };
     var rebuilt: std.ArrayList(u8) = .empty;
     defer rebuilt.deinit(std.testing.allocator);
     var count: usize = 0;
     while (lines.next()) |line| : (count += 1) {
         try std.testing.expect(line.len > 0 and line[0] != ' ' and line[line.len - 1] != ' ');
-        try std.testing.expect(text_measure.textWidth(.ui, theme.scaledUi(NOTES_FONT_SIZE), line) <= width);
-        if (count == 0) try std.testing.expectEqualStrings("Source: pair · Last", line);
+        try std.testing.expect(connTextWidth(font, line) <= width);
+        if (count == 0) try std.testing.expectEqualStrings("Paired via · pairing", line);
         try rebuilt.appendSlice(std.testing.allocator, line);
     }
     try std.testing.expect(count > 3);
@@ -5611,96 +6167,61 @@ test "phone card lines wrap at words and split only overlong words" {
     try std.testing.expectEqualStrings(expected.items, actual.items);
 }
 
-// Phone pairing shares one measured layout for rendering, clipping and hit testing.
-const PhoneCard = struct {
-    state: *runtime.AppState,
-    x: f32,
-    y: f32,
-    w: f32,
-    clip: palette.Rect,
-    draw: bool,
-    queue_hit: ?*const fn (*runtime.AppState, palette.Rect, runtime.PaletteModalAction, usize) void,
-
-    fn text(self: *PhoneCard, value: []const u8) void {
-        var lines: PhoneLines = .{ .value = value, .width = self.w };
-        while (lines.next()) |line| {
-            const rect: palette.Rect = .{ .x = self.x, .y = self.y, .w = self.w, .h = notesLineHeight() };
-            if (self.draw) queueText(self.state, rect, line, paletteColor(textLabel()), theme.scaledUi(NOTES_FONT_SIZE), self.clip);
-            self.y += rect.h;
-        }
-        self.y += theme.scaledUi(8.0);
+/// Settings → Remote access: a title with its switch, one status line, and
+/// exactly one action for the current blocker. Work runs in
+/// `state/remote_access.zig`.
+fn remoteAccessSection(card: *ConnPass) void {
+    const state = card.state;
+    const remote = &state.settings_controller.remote_access;
+    const m = metrics();
+    const cm = ConnMetrics.init();
+    const font = cm.status_font;
+    const indent = cm.dot + cm.dot_gap;
+    const enabled = remote_access.supported and !remote.busy();
+    const track_w = theme.scaledUi(40.0);
+    const track_h = theme.scaledUi(22.0);
+    const track: palette.Rect = .{ .x = card.x + card.w - track_w, .y = card.y + (m.title_h - track_h) * 0.5, .w = track_w, .h = track_h };
+    if (card.draw) {
+        queueFittedText(state, .{ .x = card.x, .y = card.y, .w = @max(track.x - m.row_gap - card.x, 0.0), .h = m.title_h }, "Remote access", paletteColor(theme.COLOR_WHITE), theme.scaledUi(15.0), card.clip);
+        drawSwitchTrack(state, track, remote.switchOn(), enabled and state.settings_controller.hover_runtime_action == (REMOTE_SWITCH_ACTION | PHONE_HOVER_BIT), card.clip);
     }
+    if (enabled) if (card.queue_hit) |queue| {
+        recordFocusStop(.settings_phone_action, REMOTE_SWITCH_ACTION, track, card.clip);
+        if (intersectRect(track, card.clip)) |visible| queue(state, visible, .settings_phone_action, REMOTE_SWITCH_ACTION);
+    };
+    card.y += m.title_h + theme.scaledUi(4.0);
+    card.text(REMOTE_ACCESS_HELPER, textHint(), font, null);
+    card.y += m.row_gap;
 
-    /// Content text (status, errors, addresses): selectable and copyable.
-    fn content(self: *PhoneCard, block: u32, value: []const u8) void {
-        var lines: PhoneLines = .{ .value = value, .width = self.w };
-        var index: usize = 0;
-        while (lines.next()) |line| : (index += 1) {
-            const rect: palette.Rect = .{ .x = self.x, .y = self.y, .w = self.w, .h = notesLineHeight() };
-            if (self.draw) {
-                settings_text.recordLine(self.state, block, index, rect, line, theme.scaledUi(NOTES_FONT_SIZE), self.clip);
-                queueText(self.state, rect, line, paletteColor(textLabel()), theme.scaledUi(NOTES_FONT_SIZE), self.clip);
-            }
-            self.y += rect.h;
-        }
-        self.y += theme.scaledUi(8.0);
-    }
-
-    fn switchRow(self: *PhoneCard, label: []const u8, action: usize, enabled: bool, on: bool) void {
-        const rect: palette.Rect = .{ .x = self.x, .y = self.y, .w = self.w, .h = theme.scaledUi(34.0) };
-        if (self.draw) drawSwitchRow(self.state, rect, label, on, enabled and self.state.settings_controller.hover_runtime_action == (action | PHONE_HOVER_BIT), self.clip);
-        if (enabled) if (self.queue_hit) |queue| {
-            recordFocusStop(.settings_phone_action, action, rect, self.clip);
-            if (intersectRect(rect, self.clip)) |visible| queue(self.state, visible, .settings_phone_action, action);
-        };
-        self.y += rect.h + theme.scaledUi(8.0);
-    }
-
-    fn button(self: *PhoneCard, label: []const u8, action: usize, enabled: bool) void {
-        self.choice(label, action, enabled, false);
-    }
-
-    fn choice(self: *PhoneCard, label: []const u8, action: usize, enabled: bool, selected: bool) void {
-        const rect: palette.Rect = .{ .x = self.x, .y = self.y, .w = self.w, .h = theme.scaledUi(30.0) };
-        if (self.draw) drawActionButton(self.state, rect, label, if (selected) .primary else if (enabled) .secondary else .disabled, self.state.settings_controller.hover_runtime_action == (action | PHONE_HOVER_BIT), self.clip);
-        if (enabled) if (self.queue_hit) |queue| {
-            recordFocusStop(.settings_phone_action, action, rect, self.clip);
-            if (intersectRect(rect, self.clip)) |visible| queue(self.state, visible, .settings_phone_action, action);
-        };
-        self.y += rect.h + theme.scaledUi(8.0);
-    }
-};
-
-/// Settings → Remote access: one switch, one status line, and exactly one
-/// action for the current blocker. Work runs in `state/remote_access.zig`.
-fn remoteAccessSection(card: *PhoneCard) void {
-    const remote = &card.state.settings_controller.remote_access;
-    card.text("Remote access · This computer");
-    card.text("Reach this computer's chats from your phone or your other computers over Tailscale. It keeps running after Verde quits.");
-    card.switchRow("Remote access", REMOTE_SWITCH_ACTION, remote_access.supported and !remote.busy(), remote.switchOn());
     var buf: [400]u8 = undefined;
+    const reachable = remote.phase == .on and remote.origin() != null;
     const status: []const u8 = if (!remote_access.supported)
         remote_access.blockerSummary(.unsupported_os)
     else switch (remote.phase) {
-        .loading => "Checking Remote access…",
-        .enabling => "Turning on Remote access…",
-        .disabling => "Turning off Remote access…",
-        .syncing => "Updating Remote access to match this version of Verde…",
-        .on => if (remote.origin()) |origin| std.fmt.bufPrint(&buf, "Reachable at {s}", .{origin}) catch origin else "On.",
-        .off => "Off. Other devices can't reach this computer.",
+        .loading => "Checking Remote access\u{2026}",
+        .enabling => "Turning on Remote access\u{2026}",
+        .disabling => "Turning off Remote access\u{2026}",
+        .syncing => "Updating Remote access to match this version of Verde\u{2026}",
+        .on => if (remote.origin()) |origin| std.fmt.bufPrint(&buf, "On \u{00B7} reachable at {s}", .{origin}) catch origin else "On",
+        .off => "Off \u{00B7} other devices can't reach this computer",
     };
-    card.content(REMOTE_STATUS_BLOCK, status);
-    if (remote.notice().len > 0) card.content(REMOTE_NOTICE_BLOCK, remote.notice());
-    if (remote.blocker == null and remote.phase == .on and remote.origin() != null) {
+    const tone: ConnTone = if (!remote_access.supported) .warning else if (reachable) .good else .neutral;
+    card.status(tone, status, textLabel(), font, REMOTE_STATUS_BLOCK);
+    if (remote.notice().len > 0) {
+        card.y += theme.scaledUi(2.0);
+        card.textAt(card.x + indent, card.w - indent, remote.notice(), textLabel(), font, REMOTE_NOTICE_BLOCK);
+    }
+    if (remote.blocker == null and reachable) {
         // Pairing by approval finds machines on the ports Add connection probes.
-        card.text(if (remote_access.discoverableNearby(remote.saved.https_port))
-            "Your other computers can find this one under Add connection → Nearby machines."
+        card.textAt(card.x + indent, card.w - indent, if (remote_access.discoverableNearby(remote.saved.https_port))
+            "Your other computers can find this one under Add connection \u{2192} Nearby machines."
         else
-            "Add connection → Nearby machines can't find this port; pair other computers with a pairing link.");
+            "Add connection \u{2192} Nearby machines can't find this port; pair other computers with a pairing link.", textHint(), font, null);
     }
     const blocker = remote.blocker orelse return;
-    card.content(REMOTE_BLOCKER_BLOCK, remote_access.blockerSummary(blocker));
-    if (remote.message.len > 0) card.content(REMOTE_DETAIL_BLOCK, remote.message.slice());
+    card.y += m.inner_gap;
+    card.status(.warning, remote_access.blockerSummary(blocker), textLabel(), font, REMOTE_BLOCKER_BLOCK);
+    if (remote.message.len > 0) card.textAt(card.x + indent, card.w - indent, remote.message.slice(), textHint(), font, REMOTE_DETAIL_BLOCK);
     var label_buf: [48]u8 = undefined;
     const label: ?[]const u8 = switch (remote_access.blockerAction(blocker)) {
         .none => null,
@@ -5709,7 +6230,14 @@ fn remoteAccessSection(card: *PhoneCard) void {
         .use_suggested_port => std.fmt.bufPrint(&label_buf, "Use port {d} instead", .{remote.suggested_port}) catch "Use another port",
         .retry => "Try again",
     };
-    if (label) |value| card.button(value, REMOTE_BLOCKER_ACTION, !remote.busy());
+    const value = label orelse return;
+    card.y += m.inner_gap;
+    card.buttonRowAt(card.x + indent, card.w - indent, &.{.{
+        .label = value,
+        .style = if (remote.busy()) .disabled else .primary,
+        .action = .settings_phone_action,
+        .index = REMOTE_BLOCKER_ACTION,
+    }});
 }
 
 fn applyRemoteAccessAction(state: *runtime.AppState, action: usize) void {
@@ -5740,93 +6268,248 @@ fn applyRemoteAccessAction(state: *runtime.AppState, action: usize) void {
     }
 }
 
-fn phoneCard(state: *runtime.AppState, rect: palette.Rect, clip: palette.Rect, draw: bool, queue_hit: ?*const fn (*runtime.AppState, palette.Rect, runtime.PaletteModalAction, usize) void) f32 {
-    // Pairing is local-owner management; remote connection credentials never enter this card.
+/// Settings → Paired devices: Refresh and Pair a phone in the header, the
+/// pairing flow in an inset panel while open, then one compact row per
+/// device.
+fn pairedDevicesSection(card: *ConnPass) void {
+    const state = card.state;
     const phone = &state.settings_controller.phone;
-    const pad = theme.scaledUi(14.0);
-    var card: PhoneCard = .{ .state = state, .x = rect.x + pad, .y = rect.y + pad, .w = @max(rect.w - pad * 2, 1), .clip = clip, .draw = draw, .queue_hit = queue_hit };
+    const m = metrics();
+    const cm = ConnMetrics.init();
     const idle = phone.pending == null;
-    remoteAccessSection(&card);
-    card.y += theme.scaledUi(10.0);
-    card.text("Paired devices · This machine");
-    card.content(PHONE_NOTICE_BLOCK, phone.notice);
-    card.button(if (phone.opened) "Close pairing" else "Pair a phone", 0, true);
+    card.header("Paired devices", "", &.{
+        .{ .label = "Refresh", .style = if (idle) .secondary else .disabled, .action = .settings_phone_action, .index = 4 },
+        .{ .label = if (phone.opened) "Close pairing" else "Pair a phone", .style = if (phone.opened) .secondary else .primary, .action = .settings_phone_action, .index = 0 },
+    });
+    card.y += theme.scaledUi(4.0);
+    card.text(phone.notice, textHint(), cm.status_font, PHONE_NOTICE_BLOCK);
     if (phone.opened) {
-        switch (phone.hostSource()) {
-            .remote_access => {
-                var host_buf: [2100]u8 = undefined;
-                card.content(PHONE_HOST_BLOCK, std.fmt.bufPrint(&host_buf, "Phones connect through Remote access at {s}", .{phone.activeHost().?}) catch phone.activeHost().?);
-            },
-            .pasted, .none => {
-                card.text("Turn on Remote access above so phones can reach this computer.");
-                // Advanced fallback for a gateway Verde does not manage.
-                card.text("Advanced: paste another HTTPS gateway URL (https://your-host.ts.net).");
-                card.button("Paste host URL", 1, idle);
-                if (phone.host_len > 0) card.content(PHONE_HOST_BLOCK, phone.host[0..phone.host_len]);
-            },
-        }
-        card.text("Permissions");
-        for (phone_pairing.PAIRING_PRESETS, 0..) |preset, index| {
-            card.choice(phone_pairing.presetLabel(preset), PHONE_PRESET_ACTION + index, idle and phone.grant == null, phone.preset == preset);
-            card.text(phone_pairing.presetDescription(preset));
-        }
-        if (phone.grant != null) card.text("Close pairing to choose permissions for a new link.");
-        card.button("Create pairing link", 2, idle and phone.activeHost() != null and phone.grant == null);
-        if (phone.grant) |grant| {
-            if (grant.qr) |*qr| {
-                // Integer modules and a four-module white quiet zone keep the local symbol scannable.
-                const modules: f32 = @floatFromInt(@as(u16, qr.size) + 8);
-                const unit = @max(1.0, @floor(@min(card.w, theme.scaledUi(320.0)) / modules));
-                const side = modules * unit;
-                const box: palette.Rect = .{ .x = @floor(card.x), .y = @floor(card.y), .w = side, .h = side };
-                if (draw) {
-                    queueRoundedRectClipped(state, box, .{ .r = 1, .g = 1, .b = 1, .a = current_fade_alpha }, 0, clip);
-                    for (0..qr.size) |y| for (0..qr.size) |x| {
-                        if (qr.isDark(@intCast(x), @intCast(y))) queueRoundedRectClipped(state, .{
-                            .x = box.x + @as(f32, @floatFromInt(x + 4)) * unit,
-                            .y = box.y + @as(f32, @floatFromInt(y + 4)) * unit,
-                            .w = unit,
-                            .h = unit,
-                        }, .{ .r = 0, .g = 0, .b = 0, .a = current_fade_alpha }, 0, clip);
-                    };
-                }
-                card.y += side + theme.scaledUi(12.0);
+        card.y += m.row_gap;
+        pairingPanel(card);
+    }
+    const devices = phone.devices();
+    if (phone.devices_result != null and devices.len == 0) {
+        card.y += m.inner_gap;
+        card.text("No paired devices yet.", textHint(), cm.status_font, null);
+    }
+    if (devices.len > 0) card.y += m.inner_gap;
+    for (devices, 0..) |device, index| pairedDeviceRow(card, device, index, idle);
+}
+
+/// The pairing flow in an inset panel: host, permission preset, then the
+/// link and QR code once created. Measured first so the panel is drawn
+/// beneath its contents.
+fn pairingPanel(card: *ConnPass) void {
+    const pad = theme.scaledUi(14.0);
+    var measure = card.*;
+    measure.draw = false;
+    measure.queue_hit = null;
+    measure.x += pad;
+    measure.w = @max(card.w - pad * 2.0, 1.0);
+    measure.y += pad;
+    pairingPanelContents(&measure);
+    const panel: palette.Rect = .{ .x = card.x, .y = card.y, .w = card.w, .h = measure.y + pad - card.y };
+    if (card.draw) queuePanelClipped(card.state, panel, raisedSurface(0.135), theme.withAlpha(theme.COLOR_WHITE, 20), radiusSm(), card.clip);
+    var inner = card.*;
+    inner.x = measure.x;
+    inner.w = measure.w;
+    inner.y = card.y + pad;
+    pairingPanelContents(&inner);
+    card.y = panel.y + panel.h;
+}
+
+fn pairingPanelContents(card: *ConnPass) void {
+    // Pairing is local-owner management; remote connection credentials never enter this card.
+    const state = card.state;
+    const phone = &state.settings_controller.phone;
+    const m = metrics();
+    const cm = ConnMetrics.init();
+    const font = cm.status_font;
+    const idle = phone.pending == null;
+    switch (phone.hostSource()) {
+        .remote_access => {
+            var host_buf: [2100]u8 = undefined;
+            card.status(.good, std.fmt.bufPrint(&host_buf, "Phones connect through Remote access at {s}", .{phone.activeHost().?}) catch phone.activeHost().?, textLabel(), font, PHONE_HOST_BLOCK);
+        },
+        .pasted, .none => {
+            card.text("Turn on Remote access above so phones can reach this computer.", textLabel(), font, null);
+            // Advanced fallback for a gateway Verde does not manage.
+            card.text("Advanced: paste another HTTPS gateway URL, such as https://your-host.ts.net.", textHint(), font, null);
+            card.y += m.inner_gap;
+            card.buttonRow(&.{.{ .label = "Paste host URL", .style = if (idle) .secondary else .disabled, .action = .settings_phone_action, .index = 1 }});
+            if (phone.host_len > 0) {
+                card.y += m.inner_gap;
+                card.status(.neutral, phone.host[0..phone.host_len], textLabel(), font, PHONE_HOST_BLOCK);
             }
-            var buf: [80]u8 = undefined;
-            const seconds = @divFloor(@max(grant.expires_at_ms - @import("platform_runtime").unixTimestampMs(), 0) + 999, 1000);
-            card.text(std.fmt.bufPrint(&buf, "Expires in {d}:{d:0>2}", .{ @divFloor(seconds, 60), @mod(seconds, 60) }) catch "");
-            if (grant.link) |link| card.content(PHONE_LINK_BLOCK, link);
-            card.button("Copy link", 3, seconds > 0);
+        },
+    }
+    card.y += m.row_gap;
+    card.text("Permissions", textLabel(), theme.scaledUi(12.5), null);
+    card.y += theme.scaledUi(6.0);
+    const can_choose = idle and phone.grant == null;
+    var presets: [phone_pairing.PAIRING_PRESETS.len]ConnButton = undefined;
+    for (phone_pairing.PAIRING_PRESETS, 0..) |preset, index| presets[index] = .{
+        .label = phone_pairing.presetLabel(preset),
+        .style = if (phone.preset == preset) .primary else if (can_choose) .secondary else .disabled,
+        .action = .settings_phone_action,
+        .index = PHONE_PRESET_ACTION + index,
+        .enabled = can_choose,
+    };
+    card.buttonRow(&presets);
+    card.y += theme.scaledUi(6.0);
+    card.text(phone_pairing.presetDescription(phone.preset), textHint(), font, null);
+    if (phone.grant != null) card.text("Close pairing to choose permissions for a new link.", textHint(), font, null);
+    card.y += m.row_gap;
+    const can_create = idle and phone.activeHost() != null and phone.grant == null;
+    card.buttonRow(&.{.{ .label = "Create pairing link", .style = if (can_create) .primary else .disabled, .action = .settings_phone_action, .index = 2 }});
+    const grant = phone.grant orelse return;
+    card.y += m.row_gap;
+    if (grant.qr) |*qr| {
+        // Integer modules and a four-module white quiet zone keep the local symbol scannable.
+        const modules: f32 = @floatFromInt(@as(u16, qr.size) + 8);
+        const unit = @max(1.0, @floor(@min(card.w, theme.scaledUi(240.0)) / modules));
+        const side = modules * unit;
+        const box: palette.Rect = .{ .x = @floor(card.x), .y = @floor(card.y), .w = side, .h = side };
+        if (card.draw) {
+            queueRoundedRectClipped(state, box, .{ .r = 1, .g = 1, .b = 1, .a = current_fade_alpha }, 0, card.clip);
+            for (0..qr.size) |y| for (0..qr.size) |x| {
+                if (qr.isDark(@intCast(x), @intCast(y))) queueRoundedRectClipped(state, .{
+                    .x = box.x + @as(f32, @floatFromInt(x + 4)) * unit,
+                    .y = box.y + @as(f32, @floatFromInt(y + 4)) * unit,
+                    .w = unit,
+                    .h = unit,
+                }, .{ .r = 0, .g = 0, .b = 0, .a = current_fade_alpha }, 0, card.clip);
+            };
+        }
+        card.y += side + m.row_gap;
+    }
+    var buf: [80]u8 = undefined;
+    const seconds = @divFloor(@max(grant.expires_at_ms - @import("platform_runtime").unixTimestampMs(), 0) + 999, 1000);
+    card.status(if (seconds > 0) .good else .neutral, std.fmt.bufPrint(&buf, "Link expires in {d}:{d:0>2}", .{ @divFloor(seconds, 60), @mod(seconds, 60) }) catch "", textLabel(), font, null);
+    if (grant.link) |link| {
+        card.y += theme.scaledUi(4.0);
+        card.text(link, textHint(), font, PHONE_LINK_BLOCK);
+    }
+    card.y += m.inner_gap;
+    card.buttonRow(&.{.{ .label = "Copy link", .style = if (seconds > 0) .secondary else .disabled, .action = .settings_phone_action, .index = 3 }});
+}
+
+/// One paired device: name over "Full access · Last seen 10 h ago", with
+/// Details and a quiet Revoke (armed to Confirm revoke / Keep) at the right.
+fn pairedDeviceRow(card: *ConnPass, device: anytype, index: usize, idle: bool) void {
+    const state = card.state;
+    const phone = &state.settings_controller.phone;
+    const m = metrics();
+    const cm = ConnMetrics.init();
+    const now_ms = @import("platform_runtime").unixTimestampMs();
+    const revoked = device.revoked_at_ms != null;
+    const open = detailsOpen(detailsKey(.device, device.device_id));
+    var specs: [3]ConnButton = undefined;
+    var count: usize = 0;
+    specs[count] = .{ .label = "Details", .action = .settings_phone_action, .index = DEVICE_DETAILS_ACTION + index, .disclosure = open };
+    count += 1;
+    if (!revoked) {
+        if (phone.confirm_revoke == index) {
+            specs[count] = .{ .label = "Keep", .style = if (idle) .secondary else .disabled, .action = .settings_phone_action, .index = 17 + index * 2 };
+            count += 1;
+            specs[count] = .{ .label = "Confirm revoke", .style = if (idle) .danger_confirm else .disabled, .action = .settings_phone_action, .index = 16 + index * 2 };
+            count += 1;
+        } else {
+            specs[count] = .{ .label = "Revoke", .style = if (idle) .danger else .disabled, .action = .settings_phone_action, .index = 16 + index * 2 };
+            count += 1;
         }
     }
-    card.button("Refresh devices", 4, idle);
-    if (phone.devices_result != null and phone.devices().len == 0) card.text("No paired devices yet.");
-    for (phone.devices(), 0..) |device, index| {
-        card.text(device.label);
-        var buf: [1024]u8 = undefined;
-        var writer: std.Io.Writer = .fixed(&buf);
-        writer.print("Source: {s} · Last seen: ", .{@tagName(device.source)}) catch {};
-        if (device.last_used_at_ms) |last| {
-            const age = @divFloor(@max(@import("platform_runtime").unixTimestampMs() - last, 0), 1000);
-            writer.print("{d}s ago", .{age}) catch {};
-        } else writer.writeAll("Never") catch {};
-        card.text(writer.buffered());
-        writer = .fixed(&buf);
-        writer.print("Preset: {s} · Max access mode: {s}", .{ phone_pairing.presetLabel(device.preset), phone_pairing.accessModeLabel(device.max_access_mode) }) catch {};
-        card.text(writer.buffered());
-        writer = .fixed(&buf);
-        writer.writeAll("Scopes: ") catch {};
-        for (device.scopes, 0..) |scope, i| {
-            if (i > 0) writer.writeAll(", ") catch {};
-            writer.writeAll(scope) catch {};
-        }
-        card.text(writer.buffered());
-        const confirming = phone.confirm_revoke == index;
-        card.button(if (device.revoked_at_ms != null) "Revoked" else if (confirming) "Confirm revoke" else "Revoke", 16 + index * 2, idle and device.revoked_at_ms == null);
-        if (confirming) card.button("Keep device", 17 + index * 2, idle);
-        card.y += theme.scaledUi(10.0);
+    if (card.draw) drawDivider(state, card.x, card.y, card.w, card.clip);
+    const top = card.y + cm.pad_y;
+    const text_h = cm.title_h + cm.line_gap + cm.status_h;
+    var buttons_w: f32 = 0.0;
+    for (specs[0..count], 0..) |spec, i| buttons_w += spec.width() + if (i > 0) m.inner_gap else 0.0;
+    const beside = card.w - buttons_w - m.row_gap >= cm.min_text_w;
+    const text_w = if (beside) card.w - buttons_w - m.row_gap else card.w;
+    if (card.draw) {
+        const name = if (device.label.len > 0) device.label else "Unnamed device";
+        queueFittedText(state, .{ .x = card.x, .y = top, .w = text_w, .h = cm.title_h }, name, paletteColor(theme.COLOR_WHITE), cm.title_font, card.clip);
+        var access_buf: [64]u8 = undefined;
+        var status_buf: [160]u8 = undefined;
+        const access = deviceAccessSummary(&access_buf, device.preset, device.scopes.len);
+        const status = deviceStatusText(&status_buf, access, device.last_used_at_ms, device.revoked_at_ms, now_ms);
+        drawStatusLine(state, card.x, top + cm.title_h + cm.line_gap, text_w, cm.status_h, deviceTone(device.last_used_at_ms, device.revoked_at_ms, now_ms), status, card.clip);
     }
-    return card.y - rect.y + pad;
+    card.y = top + text_h;
+    if (beside) {
+        var bx = card.x + card.w - buttons_w;
+        const by = top + (text_h - cm.button_h) * 0.5;
+        for (specs[0..count]) |spec| {
+            const bw = spec.width();
+            card.control(.{ .x = bx, .y = by, .w = bw, .h = cm.button_h }, spec);
+            bx += bw + m.inner_gap;
+        }
+        card.y = @max(card.y, by + cm.button_h);
+    } else {
+        card.y += m.inner_gap;
+        card.buttonRow(specs[0..count]);
+    }
+    card.y += cm.pad_y;
+    if (!open) return;
+    pairedDeviceDetails(card, device, index, now_ms);
+    card.y += cm.pad_y;
+}
+
+/// Technical facts about a paired device, one selectable block per field.
+fn pairedDeviceDetails(card: *ConnPass, device: anytype, index: usize, now_ms: i64) void {
+    const font = ConnMetrics.init().status_font;
+    const indent = theme.scaledUi(DISCLOSURE_PAD_UI);
+    const x = card.x + indent;
+    const w = card.w - indent;
+    const base = DEVICE_DETAILS_BLOCK_BASE + @as(u32, @intCast(index % 512)) * 8;
+    const gap = theme.scaledUi(3.0);
+    var buf: [1024]u8 = undefined;
+    card.textAt(x, w, std.fmt.bufPrint(&buf, "Device ID \u{00B7} {s}", .{device.device_id}) catch device.device_id, textLabel(), font, base);
+    card.y += gap;
+    const source: []const u8 = switch (device.source) {
+        .pair => "Pairing link",
+        .connect => "Verde Cloud",
+    };
+    card.textAt(x, w, std.fmt.bufPrint(&buf, "Paired via \u{00B7} {s}", .{source}) catch source, textLabel(), font, base + 1);
+    card.y += gap;
+    var ago_buf: [32]u8 = undefined;
+    card.textAt(x, w, std.fmt.bufPrint(&buf, "Paired \u{00B7} {s}", .{humanizeAgo(&ago_buf, secondsSince(now_ms, device.created_at_ms))}) catch "", textLabel(), font, base + 2);
+    card.y += gap;
+    card.textAt(x, w, std.fmt.bufPrint(&buf, "Access mode cap \u{00B7} {s}", .{phone_pairing.accessModeLabel(device.max_access_mode)}) catch "", textLabel(), font, base + 3);
+    card.y += gap;
+    var writer: std.Io.Writer = .fixed(&buf);
+    writer.writeAll("Permissions \u{00B7} ") catch {};
+    if (device.scopes.len == 0) writer.writeAll("none") catch {};
+    for (device.scopes, 0..) |scope, i| {
+        if (i > 0) writer.writeAll(", ") catch {};
+        writer.writeAll(scope) catch {};
+    }
+    card.textAt(x, w, writer.buffered(), textLabel(), font, base + 4);
+}
+
+const PhoneCardExtent = struct { remote_h: f32, total_h: f32 };
+
+/// Remote access and Paired devices as two cards stacked in `rect`; returns
+/// their combined height. Drawing measures first to size the card surfaces.
+fn phoneCard(state: *runtime.AppState, rect: palette.Rect, clip: palette.Rect, draw: bool, queue_hit: ?QueueHitFn) f32 {
+    const m = metrics();
+    if (draw) {
+        const extent = phoneCardPass(state, rect, clip, false, null);
+        drawCard(state, .{ .x = rect.x, .y = rect.y, .w = rect.w, .h = extent.remote_h }, clip);
+        const devices_y = rect.y + extent.remote_h + m.card_gap;
+        drawCard(state, .{ .x = rect.x, .y = devices_y, .w = rect.w, .h = rect.y + extent.total_h - devices_y }, clip);
+    }
+    return phoneCardPass(state, rect, clip, draw, queue_hit).total_h;
+}
+
+fn phoneCardPass(state: *runtime.AppState, rect: palette.Rect, clip: palette.Rect, draw: bool, queue_hit: ?QueueHitFn) PhoneCardExtent {
+    const m = metrics();
+    var card: ConnPass = .{ .state = state, .x = rect.x + m.card_pad, .y = rect.y + m.card_pad, .w = @max(rect.w - m.card_pad * 2.0, 1.0), .clip = clip, .draw = draw, .queue_hit = queue_hit };
+    remoteAccessSection(&card);
+    const remote_h = card.y + m.card_pad - rect.y;
+    card.y = rect.y + remote_h + m.card_gap + m.card_pad;
+    pairedDevicesSection(&card);
+    return .{ .remote_h = remote_h, .total_h = card.y + m.card_pad - rect.y };
 }
 
 /// Settings content-text selection, routed ahead of the shared modal hits.
@@ -5848,6 +6531,18 @@ pub fn textSystemCursorAt(state: *const runtime.AppState, x: f32, y: f32) ?palet
 
 pub fn applyPhoneAction(state: *runtime.AppState, action: usize) void {
     const phone = &state.settings_controller.phone;
+    if (action >= RUNTIME_DETAILS_ACTION) {
+        toggleDetails(detailsKey(.runtime, runtimeRowProfileId(state, action - RUNTIME_DETAILS_ACTION) orelse "local"));
+        state.markDirty();
+        return;
+    }
+    if (action >= DEVICE_DETAILS_ACTION and action < REMOTE_SWITCH_ACTION) {
+        const devices = phone.devices();
+        const index = action - DEVICE_DETAILS_ACTION;
+        if (index < devices.len) toggleDetails(detailsKey(.device, devices[index].device_id));
+        state.markDirty();
+        return;
+    }
     if (action >= REMOTE_SWITCH_ACTION) {
         applyRemoteAccessAction(state, action);
         state.markDirty();
