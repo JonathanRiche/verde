@@ -24,16 +24,23 @@ pub const PROBE_SHELL = "cd \"$HOME\" 2>/dev/null; " ++ PATH_PREFIX ++
     "command -v gh >/dev/null 2>&1 || { echo " ++ MISSING_MARKER ++ "; exit 127; }; " ++
     "GH_NO_UPDATE_NOTIFIER=1 GH_PROMPT_DISABLED=1 gh auth status --hostname github.com </dev/null";
 
-/// Device-code sign-in. `--hostname` with `--web` keeps gh non-interactive:
-/// it prints the one-time code and the github.com/login/device URL and polls,
-/// with no "Press Enter" step or Git prompt. The browser variables are a
-/// fallback for gh versions that still try to open one: they print the URL
-/// instead of launching anything on the runtime. `setup-git` then makes git
-/// on the runtime use the new login for github.com.
+/// Device-code sign-in. gh treats a terminal stdin as interactive: it then
+/// asks "Authenticate Git with your GitHub credentials?" and blocks on
+/// "Press Enter to open <url> in your browser..." before it polls GitHub.
+/// Reading stdin from /dev/null makes it non-interactive (gh 2.x checks
+/// stdin and stdout are TTYs), so it prints the one-time code and the
+/// github.com/login/device URL and polls right away. The dialog still sends
+/// one Enter once the code shows (`shouldAutoEnter`) for any gh that waits
+/// anyway. Non-interactive login skips gh's own Git setup, so `--scopes
+/// workflow` (which that setup adds, for pushes touching workflows) is asked
+/// for here and `gh auth setup-git` runs after. `--clipboard=false`, where
+/// gh has it, avoids its "Failed to copy one-time code" noise on a headless
+/// VM. The browser variables print a URL instead of launching anything.
 pub const SIGN_IN_SHELL = PATH_PREFIX ++
     "command -v gh >/dev/null 2>&1 || { echo 'The GitHub CLI (gh) is not installed on this runtime. Go back and choose Install.'; exit 127; }; " ++
     "export GH_BROWSER=echo BROWSER=echo GH_NO_UPDATE_NOTIFIER=1; " ++
-    "gh auth login --hostname github.com --git-protocol https --web && gh auth setup-git && " ++
+    "clip=; gh auth login --help 2>&1 | grep -q -- --clipboard && clip=--clipboard=false; " ++
+    "gh auth login --hostname github.com --git-protocol https --web --scopes workflow $clip </dev/null && gh auth setup-git && " ++
     "echo 'Signed in. Git on this runtime now uses this GitHub account for github.com.'";
 
 /// User-space install of the latest official gh release for Linux
@@ -119,21 +126,37 @@ pub fn parseProbe(output: []const u8, exit_code: ?u32) Status {
 }
 
 /// The one-time code from `gh auth login --web` output ("! First copy your
-/// one-time code: 1A2B-3C4D", possibly bold), copied into `out`; null until
-/// it has been printed. The code is shown to the user, never logged.
+/// one-time code: 1A2B-3C4D", or "! One-time code (1A2B-3C4D) copied to
+/// clipboard", possibly bold), copied into `out`; null until it has been
+/// printed. The code is shown to the user, never logged.
 pub fn parseDeviceCode(output: []const u8, out: *[MAX_DEVICE_CODE_LEN]u8) ?[]const u8 {
     var buffer: [4096]u8 = undefined;
     // The code comes within the first lines; later output is irrelevant.
     const clean = auth_probe.stripEscapes(output[0..@min(output.len, buffer.len)], &buffer);
-    const label = "one-time code:";
-    const at = std.mem.indexOf(u8, clean, label) orelse return null;
-    const rest = std.mem.trimStart(u8, clean[at + label.len ..], " \t");
+    const rest = if (std.mem.indexOf(u8, clean, "one-time code:")) |at|
+        std.mem.trimStart(u8, clean[at + "one-time code:".len ..], " \t")
+    else if (std.mem.indexOf(u8, clean, "One-time code (")) |at|
+        clean[at + "One-time code (".len ..]
+    else
+        return null;
     var len: usize = 0;
     while (len < rest.len and len < out.len and (std.ascii.isAlphanumeric(rest[len]) or rest[len] == '-')) : (len += 1) {}
     // Still arriving (no terminator yet), or not a code.
     if (len == rest.len or len < 6 or std.mem.indexOfScalar(u8, rest[0..len], '-') == null) return null;
     @memcpy(out[0..len], rest[0..len]);
     return out[0..len];
+}
+
+/// gh is waiting for Enter before it opens the browser and polls.
+pub fn promptsForEnter(output: []const u8) bool {
+    return std.mem.indexOf(u8, output, "Press Enter") != null;
+}
+
+/// Whether a running sign-in should get its one Enter now: once the code
+/// or gh's "Press Enter" prompt is out, never twice, never before.
+pub fn shouldAutoEnter(already_sent: bool, has_code: bool, output: []const u8) bool {
+    if (already_sent) return false;
+    return has_code or promptsForEnter(output);
 }
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
@@ -168,6 +191,16 @@ test "gh device code is read from sign-in output" {
     try std.testing.expect(parseDeviceCode("Starting...\r\n", &out) == null);
     try std.testing.expect(parseDeviceCode("! First copy your one-time code: 1A2B-3", &out) == null);
     try std.testing.expect(parseDeviceCode("one-time code: none\n", &out) == null);
+    // gh with a working clipboard prints the code in parentheses instead.
+    try std.testing.expectEqualStrings("9Z8Y-7X6W", parseDeviceCode("! One-time code (\x1b[1m9Z8Y-7X6W\x1b[0m) copied to clipboard\r\n", &out).?);
+}
+
+test "sign-in gets one Enter after the code or prompt, never before or twice" {
+    try std.testing.expect(!shouldAutoEnter(false, false, ""));
+    try std.testing.expect(!shouldAutoEnter(false, false, "! Failed to copy one-time code to clipboard\r\n"));
+    try std.testing.expect(shouldAutoEnter(false, true, "! First copy your one-time code: 1A2B-3C4D\r\n"));
+    try std.testing.expect(shouldAutoEnter(false, false, "\x1b[1mPress Enter\x1b[0m to open https://github.com/login/device in your browser... "));
+    try std.testing.expect(!shouldAutoEnter(true, true, "Press Enter to open"));
 }
 
 test "gh commands put the user-space bin on PATH and never prompt or open a browser" {
@@ -175,7 +208,9 @@ test "gh commands put the user-space bin on PATH and never prompt or open a brow
     try std.testing.expect(std.mem.indexOf(u8, PROBE_SHELL, PATH_PREFIX) != null);
     try std.testing.expect(std.mem.indexOf(u8, PROBE_SHELL, "echo " ++ MISSING_MARKER) != null);
     try std.testing.expect(std.mem.startsWith(u8, SIGN_IN_SHELL, PATH_PREFIX));
-    try std.testing.expect(std.mem.indexOf(u8, SIGN_IN_SHELL, "gh auth login --hostname github.com --git-protocol https --web && gh auth setup-git") != null);
+    // stdin from /dev/null: gh never blocks on "Press Enter" or a Git prompt.
+    try std.testing.expect(std.mem.indexOf(u8, SIGN_IN_SHELL, "gh auth login --hostname github.com --git-protocol https --web --scopes workflow $clip </dev/null && gh auth setup-git") != null);
+    try std.testing.expect(std.mem.indexOf(u8, SIGN_IN_SHELL, "grep -q -- --clipboard && clip=--clipboard=false") != null);
     try std.testing.expect(std.mem.indexOf(u8, SIGN_IN_SHELL, "GH_BROWSER=echo BROWSER=echo") != null);
 }
 

@@ -182,6 +182,8 @@ pub const Setup = struct {
     sign_in_output: std.ArrayList(u8) = .empty,
     device_code_buf: [remote_github.MAX_DEVICE_CODE_LEN]u8 = undefined,
     device_code_len: usize = 0,
+    /// The one Enter that lets a waiting gh go on to poll was sent.
+    enter_sent: bool = false,
 
     pub fn visible(self: *const Setup) bool {
         return self.dock != null;
@@ -216,6 +218,7 @@ pub const Setup = struct {
         self.sign_in_output.clearAndFree(allocator);
         std.crypto.secureZero(u8, &self.device_code_buf);
         self.device_code_len = 0;
+        self.enter_sent = false;
     }
 
     pub fn deinit(self: *Setup, allocator: std.mem.Allocator) void {
@@ -426,7 +429,7 @@ pub fn poll(self: anytype, now_ms: i64) void {
     syncTarget(self);
     pollChain(self);
     pollRemoteCommand(self, now_ms);
-    pollDeviceCode(setup);
+    pollSignInOutput(setup);
     pollAuthProbes(self, now_ms);
     pollFinish(self, now_ms);
     if (setup.dock) |dock| {
@@ -745,6 +748,7 @@ pub fn signInNext(self: anytype) void {
 pub fn copyCodeAndOpenGithub(self: anytype) void {
     const setup = &self.settings_controller.provider_setup;
     const code = setup.deviceCode() orelse return;
+    sendEnter(setup);
     const copied = self.setClipboardText(code);
     utils.openUrlInDefaultBrowser(self.allocator, remote_github.DEVICE_URL) catch |err| {
         log.warn("failed to open the GitHub device page: {s}", .{@errorName(err)});
@@ -772,12 +776,25 @@ fn pollChain(self: anytype) void {
     }
 }
 
-/// Reads the running GitHub sign-in's one-time code from its output.
-fn pollDeviceCode(setup: *Setup) void {
-    if (setup.device_code_len != 0 or setup.sign_in_output.items.len == 0) return;
-    if (remote_github.parseDeviceCode(setup.sign_in_output.items, &setup.device_code_buf)) |code| {
-        setup.device_code_len = code.len;
+/// Reads the running GitHub sign-in's one-time code from its output, then
+/// sends gh its one Enter: some gh versions wait on "Press Enter to open …"
+/// before they poll, so an approval in the browser would never be noticed.
+fn pollSignInOutput(setup: *Setup) void {
+    if (setup.sign_in_output.items.len == 0) return;
+    if (setup.device_code_len == 0) {
+        if (remote_github.parseDeviceCode(setup.sign_in_output.items, &setup.device_code_buf)) |code| {
+            setup.device_code_len = code.len;
+        }
     }
+    if (remote_github.shouldAutoEnter(setup.enter_sent, setup.deviceCode() != null, setup.sign_in_output.items)) sendEnter(setup);
+}
+
+/// Sends one Enter to the running GitHub sign-in; idempotent.
+fn sendEnter(setup: *Setup) void {
+    if (setup.enter_sent or setup.status != .running) return;
+    const dock = setup.dock orelse return;
+    _ = dock.writeInputToActivePane("\r") catch return;
+    setup.enter_sent = true;
 }
 
 /// Settings > Providers manages this computer's CLIs, whatever runtime the
@@ -1435,6 +1452,31 @@ test "setup footer offers sign-in after an install and Done after success" {
     try std.testing.expectEqual(Primary.none, primaryFor(.running, .sign_in, .none, .signed_out, false));
     try std.testing.expectEqual(Primary.copy_code, primaryFor(.running, .sign_in, .none, .signed_out, true));
     try std.testing.expectEqual(Primary.none, primaryFor(.running, .install, .none, .missing, true));
+}
+
+test "a GitHub sign-in gets exactly one Enter, only after its code" {
+    const allocator = std.testing.allocator;
+    const dock = try allocator.create(terminal.Dock);
+    dock.* = try terminal.Dock.init(allocator);
+    dock.remote_backend = true;
+    try dock.restartWithProfile(allocator, "~", .{ .kind = .custom, .label = "Sign in" });
+    var setup: Setup = .{ .dock = dock, .tool = .github, .mode = .sign_in, .status = .running };
+    defer {
+        setup.wipeSignInOutput(allocator);
+        destroyDock(allocator, dock);
+    }
+    const io = dock.remoteIo().?;
+    try setup.sign_in_output.appendSlice(allocator, "github.com\r\n");
+    pollSignInOutput(&setup);
+    try std.testing.expectEqual(@as(usize, 0), io.input.items.len);
+    try setup.sign_in_output.appendSlice(allocator, "! First copy your one-time code: 1A2B-3C4D\r\nPress Enter to open https://github.com/login/device in your browser... ");
+    pollSignInOutput(&setup);
+    try std.testing.expectEqualStrings("1A2B-3C4D", setup.deviceCode().?);
+    try std.testing.expectEqualStrings("\r", io.input.items);
+    // Later frames and the Copy code button never send a second one.
+    pollSignInOutput(&setup);
+    sendEnter(&setup);
+    try std.testing.expectEqualStrings("\r", io.input.items);
 }
 
 test "GitHub notes and readiness follow the probe" {
