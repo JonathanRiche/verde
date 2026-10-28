@@ -199,6 +199,42 @@ fn providerFooter(layout: ProviderLayout) Footer {
     };
 }
 
+/// Setup-view footer: the primary sized to its label (it can read "Sign in
+/// to Claude Code"), the secondary right beside it.
+fn setupFooter(layout: ProviderLayout, primary_label: ?[]const u8) Footer {
+    var footer = providerFooter(layout);
+    const label = primary_label orelse {
+        // No primary: the secondary takes its place at the right edge.
+        footer.back.x = footer.check.x + footer.check.w - footer.back.w;
+        footer.check.w = 0.0;
+        return footer;
+    };
+    const want_w = text_measure.textWidth(TEXT_ROLE, theme.scaledUi(14.0), label) + theme.scaledUi(32.0);
+    const right = footer.check.x + footer.check.w;
+    const max_w = @max(right - layout.modal.x - theme.scaledUi(PAD_UI) - footer.back.w - theme.scaledUi(BUTTON_GAP_UI), theme.scaledUi(CHECK_W_UI));
+    const check_w = theme.clampf(want_w, theme.scaledUi(CHECK_W_UI), max_w);
+    footer.check.x = right - check_w;
+    footer.check.w = check_w;
+    footer.back.x = footer.check.x - theme.scaledUi(BUTTON_GAP_UI) - footer.back.w;
+    return footer;
+}
+
+/// Label for the setup view's primary action; null when it has none.
+fn setupPrimaryLabel(state: *runtime.AppState, buf: []u8) ?[]const u8 {
+    const setup = &state.settings_controller.provider_setup;
+    return switch (provider_setup.primaryAction(state)) {
+        .none => null,
+        .done => "Done",
+        .copy_code => "Copy code & open GitHub",
+        .sign_in_next => std.fmt.bufPrint(buf, "Sign in to {s}", .{setup.subjectName()}) catch "Sign in",
+        .check_again => if (state.settings_controller.provider_recheck_generation != 0 or setup.checking_until_ms != 0) "Checking..." else "Check again",
+    };
+}
+
+fn setupSecondaryLabel(state: *runtime.AppState) []const u8 {
+    return if (provider_setup.primaryAction(state) == .sign_in_next) "Not now" else "Back";
+}
+
 fn setupTerminalRect(layout: ProviderLayout) palette.Rect {
     const top = layout.list.y + theme.scaledUi(SETUP_TERMINAL_TOP_UI);
     return .{ .x = layout.list.x, .y = top, .w = layout.list.w, .h = @max(layout.list.y + layout.list.h - top, theme.scaledUi(80.0)) };
@@ -334,12 +370,14 @@ fn registerProviderHits(state: *runtime.AppState, width: f32, height: f32, queue
     registerChromeHits(state, width, height, layout.modal, !running, queue_hit);
     const footer = providerFooter(layout);
     if (setup.visible()) {
-        queue_hit(state, footer.back, .provider_setup_back, 0);
-        queue_hit(state, footer.check, .provider_onboarding_recheck, 0);
+        var label_buf: [96]u8 = undefined;
+        const setup_footer = setupFooter(layout, setupPrimaryLabel(state, &label_buf));
+        queue_hit(state, setup_footer.back, .provider_setup_back, 0);
+        if (setup_footer.check.w > 0.0) queue_hit(state, setup_footer.check, .provider_onboarding_recheck, 0);
         // While the command runs, keys (Tab included) belong to it.
         if (!running) {
-            recordStop(.provider_setup_back, 0, footer.back, null);
-            recordStop(.provider_onboarding_recheck, 0, footer.check, null);
+            recordStop(.provider_setup_back, 0, setup_footer.back, null);
+            if (setup_footer.check.w > 0.0) recordStop(.provider_onboarding_recheck, 0, setup_footer.check, null);
         }
         return;
     }
@@ -435,9 +473,15 @@ fn activate(state: *runtime.AppState, action: Action, index: usize) void {
         .mcp_onboarding_not_now => state.completeMcpOnboarding(false),
         .mcp_onboarding_enable => state.completeMcpOnboarding(true),
         .provider_onboarding_close => state.dismissProviderOnboarding(),
-        .provider_onboarding_recheck => if (provider_setup.finishPending(state)) provider_setup.finishFlow(state) else {
-            provider_setup.refreshGithubProbe(state);
-            state.recheckProviderReadiness();
+        .provider_onboarding_recheck => if (!state.settings_controller.provider_setup.visible()) state.recheckProviderReadiness() else switch (provider_setup.primaryAction(state)) {
+            .none => {},
+            .done => provider_setup.finishFlow(state),
+            .sign_in_next => provider_setup.signInNext(state),
+            .copy_code => provider_setup.copyCodeAndOpenGithub(state),
+            .check_again => {
+                provider_setup.refreshGithubProbe(state);
+                state.recheckProviderReadiness();
+            },
         },
         .provider_onboarding_open_guide => state.openProviderSetupGuide(),
         .provider_onboarding_action => if (index < PROVIDERS.len) {
@@ -1266,10 +1310,14 @@ fn renderProvider(state: *runtime.AppState, width: f32, height: f32) void {
     const checking = sc.provider_recheck_generation != 0 or sc.provider_setup.checking_until_ms != 0 or allChecking(state, snapshot);
     const check_label: []const u8 = if (checking) "Checking..." else "Check again";
     if (sc.provider_setup.visible()) {
-        renderSetup(state, layout, snapshot);
-        drawButton(state, footer.back, "Back", theme.COLOR_PANEL_ALT, null);
-        // A successful sign-in returns on its own shortly; Done goes now.
-        drawButton(state, footer.check, if (provider_setup.finishPending(state)) "Done" else check_label, theme.accent(), null);
+        renderSetup(state, layout);
+        // After an install the primary continues to sign-in; after success
+        // it is Done (a confirmed sign-in also returns on its own shortly).
+        var label_buf: [96]u8 = undefined;
+        const primary_label = setupPrimaryLabel(state, &label_buf);
+        const setup_footer = setupFooter(layout, primary_label);
+        drawButton(state, setup_footer.back, setupSecondaryLabel(state), theme.COLOR_PANEL_ALT, null);
+        if (primary_label) |label| drawButton(state, setup_footer.check, label, theme.accent(), null);
         return;
     }
     const scroll_y = theme.clampf(sc.provider_onboarding_scroll_y, 0.0, layout.max_scroll_y);
@@ -1296,15 +1344,12 @@ fn allChecking(state: *runtime.AppState, snapshot: Snapshot) bool {
 }
 
 // Inline sign-in / install terminal shown in place of the provider list.
-fn renderSetup(state: *runtime.AppState, layout: ProviderLayout, snapshot: Snapshot) void {
+fn renderSetup(state: *runtime.AppState, layout: ProviderLayout) void {
     const setup = &state.settings_controller.provider_setup;
     const dock = setup.dock orelse return;
     const name = setup.subjectName();
     // A tool's readiness is its own probe on the target runtime.
-    const readiness = if (setup.tool != null)
-        provider_setup.githubReadiness(if (setup.target_profile_id) |id| provider_setup.githubStatus(setup, id) else null)
-    else
-        snapshot.forProvider(setup.provider);
+    const readiness = provider_setup.subjectReadiness(state);
     var title_buf: [96]u8 = undefined;
     const verb: []const u8 = switch (setup.mode) {
         .install => "install",
@@ -1319,14 +1364,20 @@ fn renderSetup(state: *runtime.AppState, layout: ProviderLayout, snapshot: Snaps
     var status_buf: [240]u8 = undefined;
     const updating = setup.mode == .update and setup.status == .running;
     const status: []const u8, const status_color = if (readiness == .ready and !updating)
-        .{ std.fmt.bufPrint(&status_buf, "{s} is ready. You can go back or close this dialog.", .{name}) catch "Ready.", theme.success() }
+        .{ std.fmt.bufPrint(&status_buf, "{s} is ready.", .{name}) catch "Ready.", theme.success() }
     else switch (setup.status) {
-        .running => .{ if (setup.tool != null and setup.mode == .sign_in)
-            "Copy the one-time code below, then click the github.com/login/device link and enter it there. Drag to select and copy."
-        else
-            "Follow the steps in the terminal. Click a link to open it, or drag to select and copy it.", theme.COLOR_TEXT_MUTED },
+        .running => if (setup.tool != null and setup.mode == .sign_in) blk: {
+            // The code is the one thing the user must carry to GitHub, so it
+            // leads the header rather than hiding in the terminal.
+            const code = setup.deviceCode() orelse break :blk .{ "Starting GitHub sign-in. Your one-time code appears here in a moment.", theme.COLOR_TEXT_MUTED };
+            break :blk .{ std.fmt.bufPrint(&status_buf, "Your one-time code: {s}  ·  Copy code & open GitHub, paste it at github.com/login/device, and approve. This finishes on its own.", .{code}) catch code, theme.COLOR_WHITE };
+        } else .{ "Follow the steps in the terminal. Click a link to open it, or drag to select and copy it.", theme.COLOR_TEXT_MUTED },
         .succeeded, .failed => blk: {
             const row_note = setup.currentNote();
+            if (setup.status == .succeeded and setup.mode == .install and row_note == .installed_sign_in_next) {
+                const installed = if (setup.tool) |tool| tool.installedName() else name;
+                break :blk .{ std.fmt.bufPrint(&status_buf, "{s} installed. Sign in to {s} to finish setting it up.", .{ installed, name }) catch "Installed. Sign in next.", theme.success() };
+            }
             if (row_note == .signed_in_unverified) if (provider_setup.targetLabel(state)) |label| {
                 break :blk .{ std.fmt.bufPrint(&status_buf, "Signed in on {s}. This runtime version can't confirm accounts, so Verde trusts the sign-in.", .{label}) catch "Signed in.", theme.success() };
             };

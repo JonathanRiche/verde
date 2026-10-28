@@ -3947,7 +3947,8 @@ fn pushRuntimeToolLines(state: *const runtime.AppState, profile_id: []const u8, 
         },
         .missing => {
             out.push(.normal, "GitHub · not installed", .{});
-            out.pushSetup(.{ .provider_row = GITHUB_SETUP_ROW, .label = "Install" }, "{s}", .{runtime.provider_setup.remote_github.INSTALL_SUMMARY});
+            // gh alone is no use signed out, so one click does both.
+            out.pushSetup(.{ .provider_row = GITHUB_SETUP_ROW, .label = "Install & sign in" }, "{s}", .{runtime.provider_setup.remote_github.INSTALL_AND_SIGN_IN_SUMMARY});
         },
         .unknown => out.push(.muted, "GitHub · status unavailable right now; checking again shortly", .{}),
     }

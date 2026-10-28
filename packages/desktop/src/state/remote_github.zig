@@ -9,6 +9,7 @@
 //! the GitHub account; it is parsed in memory, wiped, never logged or shown.
 
 const std = @import("std");
+const auth_probe = @import("remote_auth_probe.zig");
 
 /// Printed by the probe when `gh` is not on PATH (exit 127).
 pub const MISSING_MARKER = "verde-gh-missing";
@@ -77,10 +78,16 @@ pub const INSTALL_SHELL =
     \\)
 ;
 
+/// Where a device-code sign-in is approved.
+pub const DEVICE_URL = "https://github.com/login/device";
+
 /// Short descriptions shown beside the Settings buttons (the commands
 /// themselves are long; the setup terminal shows what they do).
-pub const INSTALL_SUMMARY = "Official GitHub CLI release into ~/.local, checksum verified (no sudo)";
+pub const INSTALL_AND_SIGN_IN_SUMMARY = "Installs the official GitHub CLI into ~/.local (checksum verified, no sudo), then signs in";
 pub const SIGN_IN_SUMMARY = "gh auth login with a one-time code, then git uses it for github.com";
+
+/// Longest device code kept; GitHub's are `XXXX-XXXX`.
+pub const MAX_DEVICE_CODE_LEN: usize = 16;
 
 pub const Status = enum { unknown, missing, signed_out, signed_in };
 
@@ -111,6 +118,24 @@ pub fn parseProbe(output: []const u8, exit_code: ?u32) Status {
     return .unknown;
 }
 
+/// The one-time code from `gh auth login --web` output ("! First copy your
+/// one-time code: 1A2B-3C4D", possibly bold), copied into `out`; null until
+/// it has been printed. The code is shown to the user, never logged.
+pub fn parseDeviceCode(output: []const u8, out: *[MAX_DEVICE_CODE_LEN]u8) ?[]const u8 {
+    var buffer: [4096]u8 = undefined;
+    // The code comes within the first lines; later output is irrelevant.
+    const clean = auth_probe.stripEscapes(output[0..@min(output.len, buffer.len)], &buffer);
+    const label = "one-time code:";
+    const at = std.mem.indexOf(u8, clean, label) orelse return null;
+    const rest = std.mem.trimStart(u8, clean[at + label.len ..], " \t");
+    var len: usize = 0;
+    while (len < rest.len and len < out.len and (std.ascii.isAlphanumeric(rest[len]) or rest[len] == '-')) : (len += 1) {}
+    // Still arriving (no terminator yet), or not a code.
+    if (len == rest.len or len < 6 or std.mem.indexOfScalar(u8, rest[0..len], '-') == null) return null;
+    @memcpy(out[0..len], rest[0..len]);
+    return out[0..len];
+}
+
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     if (needle.len == 0 or haystack.len < needle.len) return needle.len == 0;
     var index: usize = 0;
@@ -133,6 +158,16 @@ test "gh status probe output maps to account state" {
     try std.testing.expectEqual(Status.missing, parseProbe("bash: gh: command not found\r\n", 127));
     try std.testing.expectEqual(Status.unknown, parseProbe("", null));
     try std.testing.expectEqual(Status.unknown, parseProbe("keyring timeout", 4));
+}
+
+test "gh device code is read from sign-in output" {
+    var out: [MAX_DEVICE_CODE_LEN]u8 = undefined;
+    try std.testing.expectEqualStrings("1A2B-3C4D", parseDeviceCode("\x1b[0;33m!\x1b[0m First copy your one-time code: \x1b[1m1A2B-3C4D\x1b[0m\r\nOpen this URL to continue in your web browser: https://github.com/login/device\r\n", &out).?);
+    try std.testing.expectEqualStrings("ABCD-EF12", parseDeviceCode("! First copy your one-time code: ABCD-EF12\n", &out).?);
+    // Not printed yet, or cut mid-code by a tail boundary.
+    try std.testing.expect(parseDeviceCode("Starting...\r\n", &out) == null);
+    try std.testing.expect(parseDeviceCode("! First copy your one-time code: 1A2B-3", &out) == null);
+    try std.testing.expect(parseDeviceCode("one-time code: none\n", &out) == null);
 }
 
 test "gh commands put the user-space bin on PATH and never prompt or open a browser" {

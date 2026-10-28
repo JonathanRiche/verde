@@ -86,7 +86,7 @@ fn claudeLoggedIn(output: []const u8) Result {
 
 /// Copies `input` into `buffer` without ANSI escape sequences (CSI and OSC)
 /// or carriage returns; truncates at the buffer's size.
-fn stripEscapes(input: []const u8, buffer: []u8) []const u8 {
+pub fn stripEscapes(input: []const u8, buffer: []u8) []const u8 {
     var out: usize = 0;
     var index: usize = 0;
     while (index < input.len and out < buffer.len) {

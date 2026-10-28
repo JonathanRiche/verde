@@ -21,6 +21,7 @@ const auth_probe = @import("remote_auth_probe.zig");
 pub const remote_github = @import("remote_github.zig");
 const runtime_manager = @import("../runtime/manager.zig");
 const runtime_connections_controller = @import("runtime_connections_controller.zig");
+const utils = @import("../utils.zig");
 
 const log = std.log.scoped(.provider_setup);
 const Provider = provider_models.Provider;
@@ -100,6 +101,13 @@ pub const Tool = enum {
             .github => "GitHub",
         };
     }
+
+    /// What the install puts on the runtime.
+    pub fn installedName(self: Tool) []const u8 {
+        return switch (self) {
+            .github => "GitHub CLI",
+        };
+    }
 };
 
 /// Dialog names, shared by its rows, its notices, and the welcome screen.
@@ -167,6 +175,13 @@ pub const Setup = struct {
     tool_note: RowNote = .none,
     /// GitHub CLI status probes per runtime profile.
     github_probes: std.ArrayList(remote_github.Entry) = .empty,
+    /// "Install & sign in": start the sign-in once the install exits 0.
+    chain_sign_in: bool = false,
+    /// Output of a running GitHub sign-in, read only for its one-time code;
+    /// wiped when the command closes, never logged.
+    sign_in_output: std.ArrayList(u8) = .empty,
+    device_code_buf: [remote_github.MAX_DEVICE_CODE_LEN]u8 = undefined,
+    device_code_len: usize = 0,
 
     pub fn visible(self: *const Setup) bool {
         return self.dock != null;
@@ -188,6 +203,19 @@ pub const Setup = struct {
     /// Name the setup view uses for the open command's subject.
     pub fn subjectName(self: *const Setup) []const u8 {
         return if (self.tool) |tool| tool.displayName() else displayName(self.provider);
+    }
+
+    /// The running GitHub sign-in's one-time code, once it has been printed.
+    pub fn deviceCode(self: *const Setup) ?[]const u8 {
+        if (self.device_code_len == 0) return null;
+        return self.device_code_buf[0..self.device_code_len];
+    }
+
+    fn wipeSignInOutput(self: *Setup, allocator: std.mem.Allocator) void {
+        std.crypto.secureZero(u8, self.sign_in_output.items);
+        self.sign_in_output.clearAndFree(allocator);
+        std.crypto.secureZero(u8, &self.device_code_buf);
+        self.device_code_len = 0;
     }
 
     pub fn deinit(self: *Setup, allocator: std.mem.Allocator) void {
@@ -219,6 +247,7 @@ pub const Setup = struct {
         self.auth_probes.deinit(allocator);
         for (self.github_probes.items) |entry| allocator.free(entry.profile_id);
         self.github_probes.deinit(allocator);
+        self.wipeSignInOutput(allocator);
     }
 };
 
@@ -338,6 +367,9 @@ pub fn close(self: anytype) void {
     setup.complete_at_ms = 0;
     setup.origin_settings = false;
     setup.tool = null;
+    setup.chain_sign_in = false;
+    if (setup.remote) |pump| pump.capture = null;
+    setup.wipeSignInOutput(self.allocator);
     if (setup.remote) |pump| {
         // The remote process is stopped by `session.kill`, delivered by the
         // pump after the view is gone.
@@ -392,7 +424,9 @@ pub fn poll(self: anytype, now_ms: i64) void {
         self.markDirty();
     }
     syncTarget(self);
+    pollChain(self);
     pollRemoteCommand(self, now_ms);
+    pollDeviceCode(setup);
     pollAuthProbes(self, now_ms);
     pollFinish(self, now_ms);
     if (setup.dock) |dock| {
@@ -623,6 +657,8 @@ pub fn openGithubForRuntime(self: anytype, profile_id: []const u8, missing: bool
     const mode: Mode = if (missing) .install else .sign_in;
     startRemoteCommand(self, profile_id, sc.provider_setup.provider, .github, mode, if (missing) remote_github.INSTALL_SHELL else remote_github.SIGN_IN_SHELL);
     sc.provider_setup.origin_settings = sc.provider_setup.visible();
+    // "Install & sign in": the sign-in follows a successful install.
+    sc.provider_setup.chain_sign_in = missing and sc.provider_setup.visible();
     // Nothing to show without the terminal; stay in Settings.
     if (!sc.provider_setup.visible()) {
         self.dismissProviderOnboarding();
@@ -631,11 +667,117 @@ pub fn openGithubForRuntime(self: anytype, profile_id: []const u8, missing: bool
     self.markDirty();
 }
 
-/// Back / Escape from the setup view: a tool command returns to Settings
-/// (it has no dialog row); a provider command returns to the provider list.
+/// Back / Not now / Escape from the setup view: returns to where the flow
+/// started, Settings > Connections or the provider list.
 pub fn back(self: anytype) void {
-    if (self.settings_controller.provider_setup.tool != null) return finishFlow(self);
-    close(self);
+    finishFlow(self);
+}
+
+/// The setup view's primary footer action for the open command's state.
+pub const Primary = enum {
+    /// A command is running with nothing to offer yet.
+    none,
+    /// Failed or unconfirmed: ask again.
+    check_again,
+    /// Finished and confirmed: return to where the flow started.
+    done,
+    /// An install finished and the CLI is there but signed out.
+    sign_in_next,
+    /// A GitHub sign-in printed its code: copy it and open the device page.
+    copy_code,
+};
+
+pub fn primaryAction(self: anytype) Primary {
+    const setup = &self.settings_controller.provider_setup;
+    if (finishPending(self)) return .done;
+    return primaryFor(setup.status, setup.mode, setup.currentNote(), subjectReadiness(self), setup.tool != null and setup.deviceCode() != null);
+}
+
+/// `primaryAction` from its inputs (unit-tested).
+pub fn primaryFor(status: Status, mode: Mode, row_note: RowNote, readiness: ProviderReadiness, has_code: bool) Primary {
+    return switch (status) {
+        .running => if (has_code and mode == .sign_in) .copy_code else .none,
+        .succeeded => if (mode == .install and row_note == .installed_sign_in_next)
+            .sign_in_next
+        else if (readiness == .ready or row_note == .signed_in_unverified)
+            .done
+        else
+            .check_again,
+        .failed, .idle => .check_again,
+    };
+}
+
+/// Readiness of the open command's subject on its machine.
+pub fn subjectReadiness(self: anytype) ProviderReadiness {
+    const setup = &self.settings_controller.provider_setup;
+    if (setup.tool != null) {
+        const profile_id = setup.target_profile_id orelse return .checking;
+        return githubReadiness(githubStatus(setup, profile_id));
+    }
+    return readinessSnapshot(self).forProvider(setup.provider);
+}
+
+/// "Sign in to …" after an install: runs the sign-in for the same subject
+/// on the same machine in the same dialog, keeping where the flow started.
+pub fn signInNext(self: anytype) void {
+    const setup = &self.settings_controller.provider_setup;
+    if (!setup.visible()) return;
+    const origin = setup.origin_settings;
+    const provider = setup.provider;
+    setup.chain_sign_in = false;
+    if (setup.tool) |tool| {
+        // The target outlives `close`; only a poll with no command moves it.
+        const profile_id = setup.target_profile_id orelse return;
+        close(self);
+        switch (tool) {
+            .github => startRemoteCommand(self, profile_id, provider, .github, .sign_in, remote_github.SIGN_IN_SHELL),
+        }
+    } else {
+        const shell = commandFor(self, provider, false) orelse return;
+        startCommand(self, provider, .sign_in, shell);
+    }
+    setup.origin_settings = origin and setup.visible();
+    self.markDirty();
+}
+
+/// Copies the GitHub one-time code and opens the device page, where the
+/// user pastes it. The code is never logged.
+pub fn copyCodeAndOpenGithub(self: anytype) void {
+    const setup = &self.settings_controller.provider_setup;
+    const code = setup.deviceCode() orelse return;
+    const copied = self.setClipboardText(code);
+    utils.openUrlInDefaultBrowser(self.allocator, remote_github.DEVICE_URL) catch |err| {
+        log.warn("failed to open the GitHub device page: {s}", .{@errorName(err)});
+        self.setSidebarNotice(if (copied) "Code copied. Open github.com/login/device and paste it there." else "Open github.com/login/device and enter the code shown.");
+        self.markDirty();
+        return;
+    };
+    self.setSidebarNotice(if (copied) "Code copied. Paste it on the GitHub page that just opened." else "Enter the code shown on the GitHub page that just opened.");
+    self.markDirty();
+}
+
+/// "Install & sign in": once the install exited 0, the sign-in starts in
+/// the same dialog. A failed install keeps its terminal and note.
+fn pollChain(self: anytype) void {
+    const setup = &self.settings_controller.provider_setup;
+    if (!setup.chain_sign_in) return;
+    if (!setup.visible() or setup.mode != .install) {
+        setup.chain_sign_in = false;
+        return;
+    }
+    switch (setup.status) {
+        .succeeded => signInNext(self),
+        .failed, .idle => setup.chain_sign_in = false,
+        .running => {},
+    }
+}
+
+/// Reads the running GitHub sign-in's one-time code from its output.
+fn pollDeviceCode(setup: *Setup) void {
+    if (setup.device_code_len != 0 or setup.sign_in_output.items.len == 0) return;
+    if (remote_github.parseDeviceCode(setup.sign_in_output.items, &setup.device_code_buf)) |code| {
+        setup.device_code_len = code.len;
+    }
 }
 
 /// Settings > Providers manages this computer's CLIs, whatever runtime the
@@ -765,6 +907,9 @@ fn startRemoteCommand(self: anytype, profile_id: []const u8, provider: Provider,
     setup.remote = pump;
     setup.provider = provider;
     setup.tool = tool;
+    // Only a GitHub sign-in is read, for its one-time code.
+    setup.wipeSignInOutput(allocator);
+    if (tool == .github and mode == .sign_in) pump.capture = &setup.sign_in_output;
     setup.mode = mode;
     setup.status = .running;
     setup.setCurrentNote(.none);
@@ -1275,6 +1420,21 @@ fn resolveToolNoteFor(setup: *Setup, profile_id: []const u8, status: remote_gith
     const target = setup.target_profile_id orelse return;
     if (!std.mem.eql(u8, target, profile_id)) return;
     setup.tool_note = resolvedToolNote(setup.tool_note, status);
+}
+
+test "setup footer offers sign-in after an install and Done after success" {
+    try std.testing.expectEqual(Primary.sign_in_next, primaryFor(.succeeded, .install, .installed_sign_in_next, .signed_out, false));
+    try std.testing.expectEqual(Primary.done, primaryFor(.succeeded, .install, .none, .ready, false));
+    try std.testing.expectEqual(Primary.done, primaryFor(.succeeded, .sign_in, .none, .ready, false));
+    try std.testing.expectEqual(Primary.done, primaryFor(.succeeded, .sign_in, .signed_in_unverified, .unavailable, false));
+    // Failures and unconfirmed results keep Check again.
+    try std.testing.expectEqual(Primary.check_again, primaryFor(.failed, .install, .failed, .missing, false));
+    try std.testing.expectEqual(Primary.check_again, primaryFor(.succeeded, .sign_in, .still_signed_out, .signed_out, false));
+    try std.testing.expectEqual(Primary.check_again, primaryFor(.succeeded, .install, .install_finished, .missing, false));
+    // While running: Copy code once a sign-in printed it, else nothing.
+    try std.testing.expectEqual(Primary.none, primaryFor(.running, .sign_in, .none, .signed_out, false));
+    try std.testing.expectEqual(Primary.copy_code, primaryFor(.running, .sign_in, .none, .signed_out, true));
+    try std.testing.expectEqual(Primary.none, primaryFor(.running, .install, .none, .missing, true));
 }
 
 test "GitHub notes and readiness follow the probe" {
