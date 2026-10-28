@@ -18,6 +18,7 @@ const Engine = @import("../live_voice/engine.zig");
 const Transcript = @import("../live_voice/transcript.zig");
 const Machine = @import("../live_voice/session.zig");
 const protocol = @import("../live_voice/protocol.zig");
+pub const Settings = @import("live_voice_settings.zig");
 
 const log = std.log.scoped(.live_voice_ui);
 
@@ -134,6 +135,8 @@ ask: ?Ask = null,
 /// Spoken requests waiting for a busy companion turn to finish.
 queued_request: ?[]u8 = null,
 muted: bool = false,
+/// Provider and voice choice for the call pill's settings popover.
+settings: Settings = .{},
 status: Engine.Status = .{},
 error_message: ?[]const u8 = null,
 notes: std.ArrayList(Engine.Note) = .empty,
@@ -155,6 +158,7 @@ pub fn deinit(self: *Self) void {
     for (self.notes.items) |item| item.deinit(self.allocator);
     self.notes.deinit(self.allocator);
     if (self.queued_request) |text| self.allocator.free(text);
+    self.settings.deinit();
     self.* = .{};
 }
 
@@ -243,6 +247,28 @@ pub fn toggleMute(self: *Self) void {
     requestFrame();
 }
 
+/// Loads providers and voices for the settings popover.
+pub fn openSettings(self: *Self, host: anytype) void {
+    self.settings.refresh(host.livePrefPath());
+    requestFrame();
+}
+
+/// Uses another provider (with its saved voice) for Live voice.
+pub fn chooseProvider(self: *Self, host: anytype, index: usize) void {
+    if (self.settings.activeIndex() == index) return;
+    _ = self.settings.choose(host.livePrefPath(), index, null);
+    requestFrame();
+}
+
+/// Picks a voice of the active provider.
+pub fn chooseVoice(self: *Self, host: anytype, voice_index: usize) void {
+    const provider_index = self.settings.activeIndex() orelse return;
+    const provider = &self.settings.listing.providers[provider_index];
+    if (provider.voiceIndex() == voice_index) return;
+    _ = self.settings.choose(host.livePrefPath(), provider_index, voice_index);
+    requestFrame();
+}
+
 /// Cuts the companion off mid-sentence (clicking the speaking character).
 pub fn interrupt(self: *Self) void {
     if (self.engine) |engine| engine.interrupt();
@@ -259,6 +285,18 @@ pub fn dismissError(self: *Self) void {
 pub fn tick(self: *Self, host: anytype) void {
     self.reapRetiring();
     self.collectSave();
+    switch (self.settings.poll()) {
+        .none => {},
+        .listed, .failed => requestFrame(),
+        .configured => {
+            // A new provider or voice takes effect by restarting the call.
+            if (self.engine != null) {
+                self.stop(host);
+                self.start(host);
+            }
+            requestFrame();
+        },
+    }
     const now = nowMs();
     if (self.engine) |engine| {
         const previous = self.status;

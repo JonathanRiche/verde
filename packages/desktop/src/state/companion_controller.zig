@@ -104,6 +104,14 @@ pub const HitAction = enum {
     live_end,
     /// The speaking character: cut the reply off (half-duplex barge-in).
     live_interrupt,
+    /// Call pill: settings popover, captions toggle.
+    live_settings,
+    live_captions,
+    /// Settings popover rows: a voice provider, a voice of the chosen one.
+    live_provider,
+    live_voice,
+    /// The call pill's background (no action; blocks clicks to what's under it).
+    live_pill,
 };
 
 pub const Hit = struct {
@@ -580,7 +588,7 @@ pub const Frame = struct {
 
 pub const Presentation = Frame;
 
-pub const Menu = enum { none, companions, brain, text };
+pub const Menu = enum { none, companions, brain, text, live_settings };
 
 /// A caret position in the conversation: an activity item and a byte offset
 /// into the text that item displays.
@@ -1049,6 +1057,8 @@ text_menu_x: f32 = 0.0,
 text_menu_y: f32 = 0.0,
 /// Panel covers the workspace area (full chat size) instead of a sidecar.
 expanded: bool = false,
+/// Live voice call pill shows live captions under it.
+live_captions_shown: bool = true,
 /// Left edge of the workspace area (sidebar right edge), set by the root
 /// layout each frame so the expanded panel leaves the sidebar visible.
 workspace_left: f32 = 0.0,

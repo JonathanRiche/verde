@@ -72,6 +72,7 @@ test {
     _ = @import("state/companion_sync.zig");
     _ = @import("state/schedules_sync.zig");
     _ = @import("state/live_voice_controller.zig");
+    _ = @import("state/live_voice_settings.zig");
     _ = @import("live_voice/protocol.zig");
     _ = @import("live_voice/transcript.zig");
     _ = @import("live_voice/pcm.zig");

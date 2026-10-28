@@ -14634,11 +14634,11 @@ pub const AppState = struct {
 
     // ---- Live voice host (see state/live_voice_controller.zig) ----
 
-    /// Mic button and keybind: starts Live voice with the active companion
-    /// (opening the panel) or ends it.
+    /// Header button and keybind: starts Live voice with the active companion
+    /// or ends it. The panel stays as it is; collapsed, the call pill sits by
+    /// the Companion bubble.
     pub fn toggleLiveVoice(self: *AppState) void {
         if (!self.isCompanionEnabled()) return;
-        if (!self.live_voice.active() and self.companion_controller.visibility == .collapsed_chip) self.openCompanion();
         self.live_voice.toggle(self);
     }
 

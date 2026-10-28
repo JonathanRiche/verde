@@ -113,12 +113,24 @@ and barge-in works when the model starts talking over you
 (`input_audio_buffer.speech_started` or Gemini `interrupted`), because the
 playback ring is flushed at once. Controls:
 
-- the mic button in the Companion header, and **Ctrl+Alt+Space**
-  (`keybinds.companion_live`, prefix `Shift+Space`), start and end Live
-- **Mute** stops sending mic audio, and the provider simply hears nothing
-- **End** stops Live and saves the transcript
-- clicking the character while Moss speaks interrupts it, which is the
-  half-duplex barge-in
+- **Start and end:** the waveform button in the Companion header, or
+  **Ctrl+Alt+Space** (`keybinds.companion_live`; in prefix mode `Shift+Space`,
+  configurable under `keybinds.prefix.bindings` as `companion_live`). The
+  keybind does not open the panel.
+- **Call pill:** a floating bar in the Grok style. It sits over the top of
+  the conversation when the panel is open, and just above the Companion
+  bubble when it is collapsed. It holds:
+  - the character, with a dotted level meter that rises with whoever is
+    talking
+  - **Settings:** a popover to pick the provider (only ones with a key) and
+    the voice. A change restarts the call.
+  - **Captions:** shows or hides the card with the last two spoken lines
+  - **Mute** (**Ctrl+Alt+M**, `keybinds.companion_live_mute`)
+  - a red **End**
+- **Interrupt:** clicking the character in the pill while Moss speaks cuts it
+  off, which is the half-duplex barge-in.
+- **Transcript:** each finished exchange lands in the Companion chat as
+  "You · voice" / "<Name> · voice" turns.
 
 Push-to-talk can be added later with the same engine (send `input_audio_buffer.commit`
 on release and turn server VAD off). It isn't needed for v1.

@@ -67,10 +67,11 @@ const APPROVAL_HEIGHT: f32 = 104.0;
 const ERROR_STRIP_HEIGHT: f32 = 30.0;
 const RECAP_HEIGHT: f32 = 42.0;
 /// Live voice strip: status row plus up to two caption lines.
-const LIVE_STRIP_HEIGHT: f32 = 78.0;
-const LIVE_STRIP_ERROR_HEIGHT: f32 = 46.0;
-const LIVE_BUTTON_W: f32 = 58.0;
-const LIVE_BUTTON_H: f32 = 24.0;
+/// Live voice call pill (floating over the conversation) and its parts.
+const LIVE_PILL_H: f32 = 52.0;
+const LIVE_PILL_BUTTON: f32 = 38.0;
+const LIVE_PILL_METER_W: f32 = 112.0;
+const LIVE_PILL_ERROR_W: f32 = 240.0;
 const LIVE_CAPTION_FONT: f32 = 11.5;
 /// "<speaker> · voice" label above saved Live voice lines (mobile style).
 const VOICE_LABEL_H: f32 = 16.0;
@@ -137,10 +138,6 @@ pub const Geometry = struct {
     expand_button: palette.Rect,
     /// Header mic: starts and ends Live voice.
     live_button: palette.Rect,
-    /// Live voice status, captions, Mute and End; zero-sized when off.
-    live_strip: palette.Rect,
-    live_mute_button: palette.Rect,
-    live_end_button: palette.Rect,
     close_button: palette.Rect,
     inbox: palette.Rect,
     /// Crew section: summary header plus the open list; zero-sized when the
@@ -272,9 +269,17 @@ pub fn handleMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, d
             .live_mute => state.toggleLiveVoiceMute(),
             .live_end => if (state.live_voice.engine != null) state.live_voice.stop(state) else state.live_voice.dismissError(),
             .live_interrupt => state.live_voice.interrupt(),
+            .live_settings => if (state.companion_controller.menu == .live_settings) state.companion_controller.closeMenu() else {
+                state.companion_controller.openMenu(.live_settings);
+                state.live_voice.openSettings(state);
+            },
+            .live_captions => state.companion_controller.live_captions_shown = !state.companion_controller.live_captions_shown,
+            .live_provider => state.live_voice.chooseProvider(state, result.index),
+            .live_voice => state.live_voice.chooseVoice(state, result.index),
+            .live_pill => {},
             .panel, .body => {},
         }
-        if (action != .panel and action != .body) refreshAfterAction(state);
+        if (action != .panel and action != .body and action != .live_pill) refreshAfterAction(state);
     }
     if (button == 1 and state.companion_controller.visibility == .sidecar_open and
         (result.action == null or result.action.? == .panel))
@@ -437,7 +442,7 @@ pub fn systemCursorAt(state: *runtime.AppState, x: f32, y: f32) ?palette.platfor
     if (companion.text_dragging) return .text;
     const action = companion.hitAt(x, y) orelse return null;
     return switch (action) {
-        .menu_dismiss => .default,
+        .menu_dismiss, .live_pill => .default,
         .body => if (companion.menu == .none and (overConversationText(state, x, y) or overScheduleText(state, x, y))) .text else .default,
         .panel => composerCursorAt(state, x, y),
         else => .pointer,
@@ -498,7 +503,12 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     if (shown < 1.0) {
         const start = transformMark(state);
         renderDock(state, geometry);
-        if (shown == 0.0) renderDockTooltip(state, geometry);
+        if (shown == 0.0) {
+            // Live voice started from the keybind: the call pill by the bubble.
+            renderLivePill(state, geometry);
+            if (companion.menu == .live_settings) renderLiveSettings(state, geometry) else renderLivePillTooltip(state, geometry);
+            renderDockTooltip(state, geometry);
+        }
         if (shown > 0.0) transformSince(state, start, 1.0 - shown, 0.0, 6.0 * companionScale() * shown, null);
     }
     if (shown > 0.0) {
@@ -645,13 +655,6 @@ fn computeGeometryAt(state: *runtime.AppState, width: f32, height: f32, s: f32) 
     const inner_w = @min(@max(content.w - CONTENT_INSET * 2.0 * s, 0.0), theme.scaledUi(READING_MAX_CSS));
     const inner_x = content.x + @max((content.w - inner_w) * 0.5, 0.0);
 
-    const live = state.live_voice.presentation();
-    const live_h: f32 = if (live.active()) LIVE_STRIP_HEIGHT * s else if (live.error_message != null) LIVE_STRIP_ERROR_HEIGHT * s else 0.0;
-    const live_strip: palette.Rect = .{ .x = inner_x, .y = bottom - live_h, .w = inner_w, .h = @max(live_h - 8.0 * s, 0.0) };
-    bottom -= live_h;
-    const live_end_button: palette.Rect = if (live_h > 0.0) .{ .x = live_strip.x + live_strip.w - 10.0 * s - LIVE_BUTTON_W * s, .y = live_strip.y + 8.0 * s, .w = LIVE_BUTTON_W * s, .h = LIVE_BUTTON_H * s } else .{};
-    const live_mute_button: palette.Rect = if (live.active()) .{ .x = live_end_button.x - 6.0 * s - LIVE_BUTTON_W * s, .y = live_end_button.y, .w = LIVE_BUTTON_W * s, .h = LIVE_BUTTON_H * s } else .{};
-
     const approval_h: f32 = if (companion.presentation.has_approval) APPROVAL_HEIGHT * s else 0.0;
     const approval: palette.Rect = .{ .x = inner_x, .y = bottom - approval_h, .w = inner_w, .h = @max(approval_h - 8.0 * s, 0.0) };
     bottom -= approval_h;
@@ -699,9 +702,6 @@ fn computeGeometryAt(state: *runtime.AppState, width: f32, height: f32, s: f32) 
         .schedules_button = schedules_button,
         .expand_button = expand_button,
         .live_button = live_button,
-        .live_strip = live_strip,
-        .live_mute_button = live_mute_button,
-        .live_end_button = live_end_button,
         .close_button = close_button,
         .inbox = inbox,
         .crew = crew,
@@ -811,7 +811,11 @@ fn registerHits(state: *runtime.AppState, geometry: Geometry) void {
     const companion = &state.companion_controller;
     companion.clearHits();
     switch (companion.visibility) {
-        .collapsed_chip => companion.addHit(geometry.dock, .open),
+        .collapsed_chip => {
+            companion.addHit(geometry.dock, .open);
+            // Live started from the keybind keeps its call pill by the bubble.
+            if (companion.menu == .live_settings) registerLiveSettingsHits(state, geometry) else registerLivePillHits(state, geometry);
+        },
         .sidecar_open => {
             companion.addHit(geometry.panel, .panel);
             companion.addHit(geometry.conversation, .body);
@@ -829,8 +833,6 @@ fn registerHits(state: *runtime.AppState, geometry: Geometry) void {
             companion.addHit(geometry.expand_button, .toggle_expand);
             companion.addHit(geometry.live_button, .live_toggle);
             companion.addHit(geometry.close_button, .collapse);
-            if (geometry.live_mute_button.w > 0.0) companion.addHit(geometry.live_mute_button, .live_mute);
-            if (geometry.live_end_button.w > 0.0) companion.addHit(geometry.live_end_button, .live_end);
             // While the companion speaks, clicking it cuts the reply off.
             if (liveSpeaking(state)) companion.addHit(geometry.avatar, .live_interrupt);
             for (0..@min(companion.inbox_count, MAX_INBOX_ROWS_SHOWN)) |index| {
@@ -851,11 +853,14 @@ fn registerHits(state: *runtime.AppState, geometry: Geometry) void {
                 companion.addHit(buttons[0], .deny);
                 companion.addHit(buttons[1], .approve);
             }
+            // The call pill floats over the conversation; menus stack above it.
+            if (companion.menu != .live_settings) registerLivePillHits(state, geometry);
             switch (companion.menu) {
                 .none => {},
                 .companions => registerCompanionMenuHits(state, geometry),
                 .brain => registerBrainMenuHits(state, geometry),
                 .text => registerTextMenuHits(state, geometry),
+                .live_settings => registerLiveSettingsHits(state, geometry),
             }
         },
     }
@@ -1007,17 +1012,19 @@ fn renderPanel(state: *runtime.AppState, geometry: Geometry) void {
         renderCrew(state, geometry);
     }
     renderErrorStrip(state, geometry);
-    renderLiveStrip(state, geometry);
     renderRecap(state, geometry);
     renderApproval(state, geometry);
     renderFooter(state, geometry);
+    renderLivePill(state, geometry);
     switch (state.companion_controller.menu) {
         .none => {},
         .companions => renderCompanionMenu(state, geometry),
         .brain => renderBrainMenu(state, geometry),
         .text => renderTextMenu(state, geometry),
+        .live_settings => renderLiveSettings(state, geometry),
     }
     if (state.companion_controller.menu == .none) {
+        renderLivePillTooltip(state, geometry);
         renderHeaderTooltip(state, geometry);
         renderScheduleTooltip(state, geometry);
         renderCrewTooltip(state, geometry);
@@ -3056,76 +3063,330 @@ fn voiceLabelWidth(state: *runtime.AppState, speaker: []const u8) f32 {
     return 11.0 * s + 4.0 * s + text_measure.textWidth(.ui, VOICE_LABEL_FONT * s, voiceLabelText(state, speaker));
 }
 
-fn renderStripButton(state: *runtime.AppState, rect: palette.Rect, label: []const u8, primary: bool) void {
-    if (rect.w <= 0.0 or rect.h <= 0.0) return;
+// ---- Live voice call pill -------------------------------------------------------
+
+const NF_MD_COG = "\u{F0493}";
+const NF_MD_MICROPHONE = "\u{F036C}";
+const NF_MD_MICROPHONE_OFF = "\u{F036D}";
+const NF_MD_CLOSED_CAPTION = "\u{F016E}";
+const NF_MD_CLOSE = "\u{F0156}";
+
+/// The floating call bar while Live voice runs (Grok-style): the character,
+/// a dotted level meter, then settings, captions, mute and a red end button.
+/// A captions card hangs under it; a failed call shows its reason instead.
+const LivePillLayout = struct {
+    pill: palette.Rect,
+    avatar: palette.Rect,
+    meter: palette.Rect,
+    settings: palette.Rect,
+    captions: palette.Rect,
+    mute: palette.Rect,
+    end: palette.Rect,
+    /// Zero-sized when captions are hidden or the call failed.
+    card: palette.Rect,
+};
+
+fn livePillLayout(state: *runtime.AppState, geometry: Geometry) ?LivePillLayout {
+    const docked = state.companion_controller.visibility != .sidecar_open;
+    // Open: over the conversation's top. Collapsed (Live started from the
+    // keybind): just above the Companion bubble, its card stacked above it.
+    const area = if (docked) geometry.window else geometry.panel;
+    if (area.w < 200.0 * companionScale()) return null;
+    const live = state.live_voice.presentation();
+    const failed = !live.active() and live.error_message != null;
+    if (!live.active() and !failed) return null;
     const s = companionScale();
-    const chrome = theme.companionChrome();
-    if (primary) {
-        queuePanel(state, rect, color(chrome.danger), color(chrome.danger), 7.0 * s, 1.0 * s);
-    } else {
-        queuePanel(state, rect, color(surface()), color(hairline()), 7.0 * s, 1.0 * s);
-    }
-    queueCenteredText(state, rect, label, color(if (primary) chrome.accent_fg else chrome.text), 11.0 * s, .ui_bold, rect);
+    const h = LIVE_PILL_H * s;
+    const pad = 7.0 * s;
+    const button = LIVE_PILL_BUTTON * s;
+    const gap = 8.0 * s;
+    const avatar = button;
+    const controls: f32 = if (failed) 1.0 else 4.0;
+    const fixed = pad * 2.0 + avatar + 12.0 * s * 2.0 + controls * button + (controls - 1.0) * gap;
+    const max_w = area.w - 24.0 * s;
+    const meter_w = std.math.clamp(max_w - fixed, 40.0 * s, (if (failed) LIVE_PILL_ERROR_W else LIVE_PILL_METER_W) * s);
+    const w = @min(fixed + meter_w, max_w);
+    const pill_x = if (docked)
+        std.math.clamp(geometry.dock_bubble.x + geometry.dock_bubble.w - w, area.x + 12.0 * s, @max(area.x + area.w - 12.0 * s - w, area.x))
+    else
+        geometry.panel.x + (geometry.panel.w - w) * 0.5;
+    const pill_y = if (docked) @max(geometry.dock.y - 10.0 * s - h, area.y + 8.0 * s) else geometry.header.y + geometry.header.h + 10.0 * s;
+    const pill: palette.Rect = .{ .x = @round(pill_x), .y = @round(pill_y), .w = @round(w), .h = @round(h) };
+    const cy = pill.y + (pill.h - button) * 0.5;
+    const avatar_rect: palette.Rect = .{ .x = pill.x + pad, .y = cy, .w = avatar, .h = avatar };
+    const end: palette.Rect = .{ .x = pill.x + pill.w - pad - button, .y = cy, .w = button, .h = button };
+    const mute: palette.Rect = if (failed) .{ .x = end.x, .y = cy } else .{ .x = end.x - gap - button, .y = cy, .w = button, .h = button };
+    const captions: palette.Rect = if (failed) .{ .x = end.x, .y = cy } else .{ .x = mute.x - gap - button, .y = cy, .w = button, .h = button };
+    const settings: palette.Rect = if (failed) .{ .x = end.x, .y = cy } else .{ .x = captions.x - gap - button, .y = cy, .w = button, .h = button };
+    const meter_right = (if (failed) end.x else settings.x) - 12.0 * s;
+    const meter_x = avatar_rect.x + avatar_rect.w + 12.0 * s;
+    const meter: palette.Rect = .{ .x = meter_x, .y = pill.y, .w = @max(meter_right - meter_x, 0.0), .h = pill.h };
+    const show_card = !failed and state.companion_controller.live_captions_shown;
+    const card_h = (LIVE_CAPTION_FONT * 1.4 * 2.0 + 16.0) * s;
+    const card_y = if (docked) pill.y - 6.0 * s - card_h else pill.y + pill.h + 6.0 * s;
+    const card: palette.Rect = if (show_card) .{ .x = pill.x, .y = @round(card_y), .w = pill.w, .h = @round(card_h) } else .{ .x = pill.x, .y = pill.y };
+    return .{ .pill = pill, .avatar = avatar_rect, .meter = meter, .settings = settings, .captions = captions, .mute = mute, .end = end, .card = card };
 }
 
-// Live voice strip above the composer: status and level, Mute and End, and
-// the last two caption lines (the same lines that are saved to the chat,
-// where they are selectable).
-fn renderLiveStrip(state: *runtime.AppState, geometry: Geometry) void {
-    const rect = geometry.live_strip;
-    if (rect.h <= 0.0 or rect.w <= 0.0) return;
+fn registerLivePillHits(state: *runtime.AppState, geometry: Geometry) void {
+    const layout = livePillLayout(state, geometry) orelse return;
+    const companion = &state.companion_controller;
+    companion.addHit(layout.pill, .live_pill);
+    if (layout.card.h > 0.0) companion.addHit(layout.card, .live_pill);
+    if (liveSpeaking(state)) companion.addHit(layout.avatar, .live_interrupt);
+    if (layout.settings.w > 0.0) companion.addHit(layout.settings, .live_settings);
+    if (layout.captions.w > 0.0) companion.addHit(layout.captions, .live_captions);
+    if (layout.mute.w > 0.0) companion.addHit(layout.mute, .live_mute);
+    companion.addHit(layout.end, .live_end);
+}
+
+fn renderLivePill(state: *runtime.AppState, geometry: Geometry) void {
+    const layout = livePillLayout(state, geometry) orelse return;
     const s = companionScale();
     const chrome = theme.companionChrome();
     const live = state.live_voice.presentation();
-    if (!live.active()) {
-        const message = live.error_message orelse return;
-        queuePanel(state, rect, color(opaqueOver(surface(), chrome.failure_card)), color(opaqueOver(surface(), chrome.failure_border)), 10.0 * s, 1.0 * s);
-        const text_w = @max(geometry.live_end_button.x - rect.x - 20.0 * s, 0.0);
-        queueText(state, .{ .x = rect.x + 12.0 * s, .y = rect.y + (rect.h - 16.0 * s) * 0.5, .w = text_w, .h = 16.0 * s }, truncatedText(state, .ui, 11.0 * s, text_w, message), color(chrome.failure_fg), 11.0 * s, rect);
-        renderStripButton(state, geometry.live_end_button, "Dismiss", false);
-        return;
-    }
-    queuePanel(state, rect, color(opaqueOver(surface(), chrome.ready_fill)), color(opaqueOver(surface(), theme.withAlpha(chrome.accent, 110))), 10.0 * s, 1.0 * s);
-    // Status row: a dot, the label, and a level meter.
-    const row_y = geometry.live_end_button.y;
-    const row_h = geometry.live_end_button.h;
-    const dot = 8.0 * s;
-    const dot_color = if (live.phase == .live and !live.muted) chrome.accent else chrome.text_subtle;
-    queueRoundedRect(state, .{ .x = rect.x + 12.0 * s, .y = row_y + (row_h - dot) * 0.5, .w = dot, .h = dot }, color(dot_color), dot * 0.5);
-    const label = live.label();
-    const label_x = rect.x + 26.0 * s;
-    const label_w = @min(text_measure.textWidth(.ui_bold, 12.0 * s, label), @max(geometry.live_mute_button.x - label_x - 60.0 * s, 0.0));
-    queueBoldText(state, .{ .x = label_x, .y = row_y + (row_h - 17.0 * s) * 0.5, .w = label_w + 1.0, .h = 17.0 * s }, truncatedText(state, .ui_bold, 12.0 * s, label_w + 1.0, label), color(chrome.text), 12.0 * s, rect);
-    const level = if (live.activity == .speaking) live.output_level else live.input_level;
-    const meter_x = label_x + label_w + 10.0 * s;
-    const meter_w = @max(@min(48.0 * s, geometry.live_mute_button.x - meter_x - 8.0 * s), 0.0);
-    if (meter_w > 8.0 * s and live.phase == .live) {
-        const meter: palette.Rect = .{ .x = meter_x, .y = row_y + (row_h - 4.0 * s) * 0.5, .w = meter_w, .h = 4.0 * s };
-        queueRoundedRect(state, meter, color(hairline()), meter.h * 0.5);
-        const filled = meter.w * std.math.clamp(level, 0.0, 1.0);
-        if (filled >= 1.0) queueRoundedRect(state, .{ .x = meter.x, .y = meter.y, .w = filled, .h = meter.h }, color(chrome.accent), meter.h * 0.5);
-    }
-    renderStripButton(state, geometry.live_mute_button, if (live.muted) "Unmute" else "Mute", false);
-    renderStripButton(state, geometry.live_end_button, "End", true);
+    const pill = layout.pill;
+    const radius = pill.h * 0.5;
+    // A floating bar: soft shadow, one bordered surface.
+    queueRoundedRectClipped(state, offsetRect(pill, 0.0, 4.0 * s), color(theme.scrim(0.22)), radius, geometry.window);
+    queuePanel(state, pill, color(chrome.surface_deep), color(chrome.border), radius, 1.0 * s);
 
-    // Captions: newest two lines, one line each.
+    // Avatar: the companion in a round well, accent-ringed while it speaks.
+    const speaking = live.phase == .live and live.activity == .speaking;
+    const well = layout.avatar;
+    queuePanel(state, well, color(opaqueOver(chrome.surface_deep, chrome.ready_fill)), color(if (speaking) chrome.accent else hairline()), well.w * 0.5, 1.0 * s);
+    const character = activeCompanionCharacter(state);
+    const inset = well.w * 0.14;
+    const slot: palette.Rect = .{ .x = well.x + inset, .y = well.y + inset, .w = well.w - inset * 2.0, .h = well.h - inset * 2.0 };
+    renderCompanionCharacter(state, characterInSlot(slot, character), state.companion_controller.visualState(), character, .compact);
+
+    if (live.error_message) |message| if (!live.active()) {
+        const text_w = layout.meter.w;
+        const font = 11.5 * s;
+        queueText(state, .{ .x = layout.meter.x, .y = pill.y + (pill.h - font * 1.4) * 0.5, .w = text_w, .h = font * 1.4 }, truncatedText(state, .ui, font, text_w, message), color(chrome.failure_fg), font, pill);
+        renderPillButton(state, layout.end, NF_MD_CLOSE, .plain);
+        return;
+    };
+
+    renderLiveMeter(state, layout.meter, live);
+    const menu_open = state.companion_controller.menu == .live_settings;
+    renderPillButton(state, layout.settings, NF_MD_COG, if (menu_open) .selected else .plain);
+    renderPillButton(state, layout.captions, NF_MD_CLOSED_CAPTION, if (state.companion_controller.live_captions_shown) .selected else .plain);
+    renderPillButton(state, layout.mute, if (live.muted) NF_MD_MICROPHONE_OFF else NF_MD_MICROPHONE, if (live.muted) .warning else .plain);
+    renderPillButton(state, layout.end, NF_MD_CLOSE, .danger);
+    if (layout.card.h > 0.0) renderLiveCaptionsCard(state, layout.card, live);
+}
+
+const PillButtonTone = enum { plain, selected, warning, danger };
+
+fn renderPillButton(state: *runtime.AppState, rect: palette.Rect, glyph: []const u8, tone: PillButtonTone) void {
+    if (rect.w <= 0.0 or rect.h <= 0.0) return;
+    const s = companionScale();
+    const chrome = theme.companionChrome();
+    const white: [4]f32 = .{ 1.0, 1.0, 1.0, 1.0 };
+    const fill, const ring, const fg = switch (tone) {
+        .plain => .{ opaqueOver(chrome.surface_deep, chrome.menu_hover), hairline(), chrome.text_muted },
+        .selected => .{ opaqueOver(chrome.surface_deep, chrome.menu_selected), chrome.accent, chrome.accent },
+        .warning => .{ opaqueOver(chrome.surface_deep, chrome.failure_card), opaqueOver(chrome.surface_deep, chrome.failure_border), chrome.failure_fg },
+        .danger => .{ chrome.danger, chrome.danger, white },
+    };
+    queuePanel(state, rect, color(fill), color(ring), rect.w * 0.5, 1.0 * s);
+    const icon = rect.w * 0.46;
+    queueIcon(state, .{ .x = rect.x + (rect.w - icon) * 0.5, .y = rect.y + (rect.h - icon) * 0.5, .w = icon, .h = icon }, glyph, color(fg), rect);
+}
+
+/// A row of dots that rise into a waveform with the loudness of whoever is
+/// talking (accent for the companion, muted for you); a single travelling
+/// dot while connecting.
+fn renderLiveMeter(state: *runtime.AppState, rect: palette.Rect, live: live_voice.Presentation) void {
+    if (rect.w < 20.0) return;
+    const s = companionScale();
+    const chrome = theme.companionChrome();
+    const dot = @max(@round(4.0 * s), 2.0);
+    const step = dot + @max(@round(4.0 * s), 2.0);
+    const count: usize = @intFromFloat(@max(@floor((rect.w + step - dot) / step), 1.0));
+    const span = @as(f32, @floatFromInt(count)) * step - (step - dot);
+    const x0 = @round(rect.x + (rect.w - span) * 0.5);
+    const mid = rect.y + rect.h * 0.5;
+    const now_ms: f32 = @floatFromInt(@mod(@divTrunc(profiler.nowNs(), std.time.ns_per_ms), 100_000));
+    const speaking = live.phase == .live and live.activity == .speaking;
+    const level = std.math.clamp(if (speaking) live.output_level else if (live.muted) 0.0 else live.input_level, 0.0, 1.0);
+    const tint = if (speaking) chrome.accent else if (live.phase == .live and !live.muted) chrome.text_muted else chrome.text_subtle;
+    const travelling = @as(usize, @intFromFloat(now_ms / 90.0)) % count;
+    for (0..count) |index| {
+        const t = @as(f32, @floatFromInt(index)) / @as(f32, @floatFromInt(@max(count - 1, 1)));
+        // Taller in the middle; a slow ripple keeps neighbouring dots distinct.
+        const envelope = 1.0 - @abs(t - 0.5) * 1.4;
+        const ripple = 0.65 + 0.35 * @sin(@as(f32, @floatFromInt(index)) * 1.9 + now_ms / 120.0);
+        var h = dot + level * envelope * ripple * (rect.h * 0.55);
+        var fill = tint;
+        if (live.phase == .connecting or live.phase == .reconnecting) {
+            h = dot;
+            fill = if (index == travelling) chrome.accent else chrome.text_subtle;
+        }
+        const x = x0 + @as(f32, @floatFromInt(index)) * step;
+        queueRoundedRect(state, .{ .x = x, .y = mid - h * 0.5, .w = dot, .h = h }, color(fill), dot * 0.5);
+    }
+}
+
+// Captions card under the pill: the newest two spoken lines.
+fn renderLiveCaptionsCard(state: *runtime.AppState, rect: palette.Rect, live: live_voice.Presentation) void {
+    const s = companionScale();
+    const chrome = theme.companionChrome();
+    queuePanel(state, rect, color(chrome.surface_deep), color(chrome.border), 12.0 * s, 1.0 * s);
     const font = LIVE_CAPTION_FONT * s;
     const line_h = font * 1.4;
-    var y = row_y + row_h + 6.0 * s;
-    const first = live.caption_count -| 2;
     const text_w = @max(rect.w - 24.0 * s, 0.0);
+    var y = rect.y + 8.0 * s;
     if (live.caption_count == 0) {
-        const hint = if (!live.echo_cancel and live.phase == .live) "No echo cancellation: use headphones to interrupt by voice." else "Speak naturally. Ask it to hand work to your companion.";
+        const hint = if (live.phase != .live) live.label() else if (!live.echo_cancel) "No echo cancellation: use headphones to interrupt by voice." else if (live.muted) "Muted. Unmute to talk." else "Listening. Speak naturally.";
         queueText(state, .{ .x = rect.x + 12.0 * s, .y = y, .w = text_w, .h = line_h }, truncatedText(state, .ui, font, text_w, hint), color(chrome.text_subtle), font, rect);
         return;
     }
+    const first = live.caption_count -| 2;
     for (live.captions[first..live.caption_count]) |caption| {
         const who = if (caption.user) "You" else state.companion_controller.identity.name.slice();
         const line = framePrint(state, "{s}: {s}", .{ who, singleLineText(state, caption.text) });
-        const fill = if (caption.user) chrome.text_muted else chrome.text;
-        queueText(state, .{ .x = rect.x + 12.0 * s, .y = y, .w = text_w, .h = line_h }, truncatedTail(state, font, text_w, line), color(fill), font, rect);
+        queueText(state, .{ .x = rect.x + 12.0 * s, .y = y, .w = text_w, .h = line_h }, truncatedTail(state, font, text_w, line), color(if (caption.user) chrome.text_muted else chrome.text), font, rect);
         y += line_h;
     }
+}
+
+fn livePillTooltipAt(state: *runtime.AppState, geometry: Geometry, x: f32, y: f32) ?struct { target: palette.Rect, label: []const u8 } {
+    const layout = livePillLayout(state, geometry) orelse return null;
+    const live = state.live_voice.presentation();
+    const companion = &state.companion_controller;
+    if (pointInRect(layout.end, x, y)) return .{ .target = layout.end, .label = if (live.active()) "End · Ctrl+Alt+Space" else "Dismiss" };
+    if (pointInRect(layout.mute, x, y)) return .{ .target = layout.mute, .label = if (live.muted) "Unmute · Ctrl+Alt+M" else "Mute · Ctrl+Alt+M" };
+    if (pointInRect(layout.captions, x, y)) return .{ .target = layout.captions, .label = if (companion.live_captions_shown) "Hide captions" else "Show captions" };
+    if (pointInRect(layout.settings, x, y)) return .{ .target = layout.settings, .label = "Voice settings" };
+    if (pointInRect(layout.avatar, x, y)) {
+        const name = companion.identity.name.slice();
+        return .{ .target = layout.avatar, .label = if (liveSpeaking(state)) framePrint(state, "{s} · click to interrupt", .{name}) else framePrint(state, "{s} · {s}", .{ name, live.label() }) };
+    }
+    return null;
+}
+
+fn renderLivePillTooltip(state: *runtime.AppState, geometry: Geometry) void {
+    const tip = livePillTooltipAt(state, geometry, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y) orelse return;
+    renderTooltip(state, geometry.window, tip.target, tip.label);
+}
+
+// ---- Live voice settings popover -------------------------------------------------
+
+const LiveSettingsLayout = struct {
+    menu: palette.Rect,
+    providers: [live_voice.Settings.MAX_PROVIDERS]palette.Rect,
+    provider_count: usize,
+    voice_title: palette.Rect,
+    voices: [live_voice.Settings.MAX_VOICES]palette.Rect,
+    voice_count: usize,
+    note: palette.Rect,
+};
+
+fn liveSettingsLayout(state: *runtime.AppState, geometry: Geometry) ?LiveSettingsLayout {
+    const pill = livePillLayout(state, geometry) orelse return null;
+    const s = companionScale();
+    const settings = &state.live_voice.settings;
+    var layout: LiveSettingsLayout = undefined;
+    const docked = state.companion_controller.visibility != .sidecar_open;
+    const area = if (docked) geometry.window else geometry.panel;
+    const w = @min(300.0 * s, area.w - 24.0 * s);
+    const x = std.math.clamp(pill.settings.x + pill.settings.w * 0.5 - w * 0.5, area.x + 12.0 * s, @max(area.x + area.w - 12.0 * s - w, area.x));
+    // Laid out from y = 0, then placed below the pill (open) or above its card (docked).
+    const top: f32 = 0.0;
+    var y = top + 34.0 * s;
+    layout.provider_count = if (settings.loaded) settings.listing.count else 0;
+    for (0..layout.provider_count) |index| {
+        layout.providers[index] = .{ .x = x + 6.0 * s, .y = y, .w = w - 12.0 * s, .h = 30.0 * s };
+        y += 30.0 * s;
+    }
+    layout.voice_count = 0;
+    layout.voice_title = .{ .x = x + 14.0 * s, .y = y + 8.0 * s, .w = w - 28.0 * s, .h = 16.0 * s };
+    if (settings.activeIndex()) |active| {
+        const provider = &settings.listing.providers[active];
+        y += 30.0 * s;
+        var cx = x + 12.0 * s;
+        for (provider.voices[0..provider.voice_count], 0..) |*voice, index| {
+            const chip_w = text_measure.textWidth(.ui_bold, 11.0 * s, voice.slice()) + 20.0 * s;
+            if (cx + chip_w > x + w - 12.0 * s and cx > x + 12.0 * s) {
+                cx = x + 12.0 * s;
+                y += 30.0 * s;
+            }
+            layout.voices[index] = .{ .x = cx, .y = y, .w = chip_w, .h = 24.0 * s };
+            cx += chip_w + 6.0 * s;
+        }
+        layout.voice_count = provider.voice_count;
+        if (layout.voice_count > 0) y += 30.0 * s;
+    }
+    layout.note = .{ .x = x + 14.0 * s, .y = y + 6.0 * s, .w = w - 28.0 * s, .h = 16.0 * s };
+    layout.menu = .{ .x = x, .y = top, .w = w, .h = y + 30.0 * s - top };
+    const above = if (pill.card.h > 0.0) pill.card.y else pill.pill.y;
+    const place_y = if (docked) @max(above - 6.0 * s - layout.menu.h, area.y + 8.0 * s) else pill.pill.y + pill.pill.h + 6.0 * s;
+    const dy = place_y - top;
+    layout.menu.y += dy;
+    layout.voice_title.y += dy;
+    layout.note.y += dy;
+    for (layout.providers[0..layout.provider_count]) |*rect| rect.y += dy;
+    for (layout.voices[0..layout.voice_count]) |*rect| rect.y += dy;
+    return layout;
+}
+
+fn registerLiveSettingsHits(state: *runtime.AppState, geometry: Geometry) void {
+    const companion = &state.companion_controller;
+    const layout = liveSettingsLayout(state, geometry) orelse {
+        companion.closeMenu();
+        return;
+    };
+    companion.addHit(geometry.window, .menu_dismiss);
+    // The pill stays usable above the popover (settings button closes it).
+    registerLivePillHits(state, geometry);
+    companion.addHit(layout.menu, .body);
+    const settings = &state.live_voice.settings;
+    for (layout.providers[0..layout.provider_count], 0..) |rect, index| {
+        if (settings.listing.providers[index].configured) companion.addIndexedHit(rect, .live_provider, index);
+    }
+    for (layout.voices[0..layout.voice_count], 0..) |rect, index| companion.addIndexedHit(rect, .live_voice, index);
+}
+
+fn renderLiveSettings(state: *runtime.AppState, geometry: Geometry) void {
+    const layout = liveSettingsLayout(state, geometry) orelse return;
+    const s = companionScale();
+    const chrome = theme.companionChrome();
+    const settings = &state.live_voice.settings;
+    renderMenuSurface(state, layout.menu);
+    const menu = layout.menu;
+    queueBoldText(state, .{ .x = menu.x + 14.0 * s, .y = menu.y + 10.0 * s, .w = menu.w - 28.0 * s, .h = 17.0 * s }, "Live voice", color(chrome.text), 12.5 * s, menu);
+    if (!settings.loaded) {
+        const message = settings.error_message orelse "Loading voices…";
+        queueText(state, .{ .x = menu.x + 14.0 * s, .y = layout.note.y, .w = layout.note.w, .h = 16.0 * s }, truncatedText(state, .ui, 11.0 * s, layout.note.w, message), color(chrome.text_muted), 11.0 * s, menu);
+        return;
+    }
+    const active = settings.activeIndex();
+    for (layout.providers[0..layout.provider_count], 0..) |row, index| {
+        const provider = &settings.listing.providers[index];
+        const selected = active != null and active.? == index;
+        if (selected) queueRoundedRectClipped(state, row, color(opaqueOver(chrome.surface_deep, chrome.menu_selected)), 7.0 * s, menu);
+        const label_w = @max(row.w - 70.0 * s, 0.0);
+        queueText(state, .{ .x = row.x + 10.0 * s, .y = row.y + (row.h - 17.0 * s) * 0.5, .w = label_w, .h = 17.0 * s }, truncatedText(state, .ui, 12.0 * s, label_w, provider.label.slice()), color(if (provider.configured) chrome.text else chrome.text_subtle), 12.0 * s, menu);
+        const trailing: []const u8 = if (selected) "✓" else if (!provider.configured) "No key" else "";
+        if (trailing.len > 0) {
+            const tw = text_measure.textWidth(.ui, 11.0 * s, trailing);
+            queueText(state, .{ .x = row.x + row.w - 10.0 * s - tw, .y = row.y + (row.h - 16.0 * s) * 0.5, .w = tw + 1.0, .h = 16.0 * s }, trailing, color(if (selected) chrome.accent else chrome.text_subtle), 11.0 * s, menu);
+        }
+    }
+    if (active) |provider_index| {
+        const provider = &settings.listing.providers[provider_index];
+        if (layout.voice_count > 0) queueBoldText(state, layout.voice_title, "VOICE", color(chrome.text_subtle), 10.0 * s, menu);
+        const chosen = provider.voiceIndex();
+        for (layout.voices[0..layout.voice_count], 0..) |chip, index| {
+            const selected = chosen != null and chosen.? == index;
+            queuePanel(state, chip, color(if (selected) chrome.accent else chrome.surface_deep), color(if (selected) chrome.accent else chrome.border), chip.h * 0.5, 1.0 * s);
+            queueCenteredText(state, chip, provider.voices[index].slice(), color(if (selected) chrome.accent_fg else chrome.text), 11.0 * s, .ui_bold, chip);
+        }
+    }
+    const note = settings.error_message orelse if (settings.saving) "Saving…" else if (state.live_voice.engine != null) "Changes restart the call." else "Used for your next call.";
+    queueText(state, .{ .x = layout.note.x, .y = layout.note.y, .w = layout.note.w, .h = 16.0 * s }, truncatedText(state, .ui, 10.5 * s, layout.note.w, note), color(chrome.text_subtle), 10.5 * s, menu);
 }
 
 /// Keeps the end of a growing caption visible: drops leading words.
@@ -4989,4 +5250,78 @@ test "companion menu closes the current or a remembered conversation" {
     try std.testing.expect(companionMenuLayout(&state, geometry).close_current.w > 0.0);
     state.companion_controller.conversation_row_count = 0;
     try std.testing.expectEqual(@as(f32, 0.0), companionMenuLayout(&state, geometry).close_current.w);
+}
+
+test "live call pill shows a failed call's reason with a dismiss, and the voice popover stays inside the window" {
+    const allocator = std.testing.allocator;
+    defer theme.applyTheme(1.0);
+    inline for (.{
+        .{ @as(f32, 1360.0), @as(f32, 860.0), @as(f32, 1.0) },
+        .{ @as(f32, 900.0), @as(f32, 700.0), @as(f32, 1.25) },
+        .{ @as(f32, 390.0), @as(f32, 760.0), @as(f32, 1.0) },
+    }) |fixture| {
+        theme.applyTheme(fixture[2]);
+        var state: runtime.AppState = undefined;
+        try testState(allocator, &state);
+        defer deinitTestState(allocator, &state);
+        const window: palette.Rect = .{ .w = fixture[0], .h = fixture[1] };
+        state.companion_controller.show();
+        state.companion_controller.settleTransition();
+        state.live_voice.error_message = "The voice provider rejected the API key.";
+        render(&state, fixture[0], fixture[1]);
+        try expectBatchInsideWindow(&state.palette_overlay_batch, window);
+        try std.testing.expect(batchHasText(&state.palette_overlay_batch, "rejected"));
+        const geometry = computeGeometry(&state, fixture[0], fixture[1]);
+        registerHits(&state, geometry);
+        const pill = livePillLayout(&state, geometry).?;
+        try std.testing.expect(rectFitsWindow(pill.pill, fixture[0], fixture[1]));
+        try std.testing.expectEqual(controller.HitAction.live_end, state.companion_controller.hitAt(pill.end.x + pill.end.w * 0.5, pill.end.y + pill.end.h * 0.5).?);
+
+        // The settings popover lists providers (no key = not choosable) and voices.
+        const settings = &state.live_voice.settings;
+        settings.loaded = true;
+        settings.listing.count = 2;
+        settings.listing.default_id.set("xai");
+        settings.listing.providers[0] = .{ .configured = true, .voice_count = 2 };
+        settings.listing.providers[0].id.set("xai");
+        settings.listing.providers[0].label.set("xAI Grok Voice");
+        settings.listing.providers[0].voice.set("eve");
+        settings.listing.providers[0].voices[0].set("eve");
+        settings.listing.providers[0].voices[1].set("ara");
+        settings.listing.providers[1] = .{};
+        settings.listing.providers[1].id.set("openai");
+        settings.listing.providers[1].label.set("OpenAI Realtime");
+        state.companion_controller.openMenu(.live_settings);
+        state.palette_overlay_batch.clear();
+        render(&state, fixture[0], fixture[1]);
+        try expectBatchInsideWindow(&state.palette_overlay_batch, window);
+        try std.testing.expect(batchHasText(&state.palette_overlay_batch, "No key"));
+        registerHits(&state, geometry);
+        const popover = liveSettingsLayout(&state, geometry).?;
+        const voice = popover.voices[1];
+        try std.testing.expectEqual(controller.HitAction.live_voice, state.companion_controller.hitAt(voice.x + 2.0, voice.y + 2.0).?);
+        const locked = popover.providers[1];
+        try std.testing.expect(state.companion_controller.hitAt(locked.x + 4.0, locked.y + 4.0).? != .live_provider);
+        state.live_voice.settings.deinit();
+    }
+}
+
+test "live call pill sits by the bubble while the panel is collapsed" {
+    const allocator = std.testing.allocator;
+    theme.applyTheme(1.0);
+    var state: runtime.AppState = undefined;
+    try testState(allocator, &state);
+    defer deinitTestState(allocator, &state);
+    state.live_voice.error_message = "Couldn't reach the voice provider. Try again.";
+    render(&state, 1360.0, 860.0);
+    try expectBatchInsideWindow(&state.palette_overlay_batch, .{ .w = 1360.0, .h = 860.0 });
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "Couldn't reach"));
+    const geometry = computeGeometry(&state, 1360.0, 860.0);
+    registerHits(&state, geometry);
+    const pill = livePillLayout(&state, geometry).?;
+    try std.testing.expect(pill.pill.y + pill.pill.h <= geometry.dock.y);
+    try std.testing.expectEqual(controller.HitAction.live_end, state.companion_controller.hitAt(pill.end.x + pill.end.w * 0.5, pill.end.y + pill.end.h * 0.5).?);
+    try std.testing.expectEqual(controller.HitAction.live_pill, state.companion_controller.hitAt(pill.meter.x + 2.0, pill.meter.y + 2.0).?);
+    // The bubble still opens the panel.
+    try std.testing.expectEqual(controller.HitAction.open, state.companion_controller.hitAt(geometry.dock_bubble.x + 4.0, geometry.dock_bubble.y + 4.0).?);
 }
