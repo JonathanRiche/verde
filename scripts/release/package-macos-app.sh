@@ -156,6 +156,52 @@ bash "$SCRIPT_DIR/create-macos-icon.sh" \
 
 bash "$SCRIPT_DIR/fixup-macos-app.sh" "$APP_DIR"
 
+# Notarization runs only when CI (or a developer) supplies an App Store
+# Connect API key and a real signing identity; ad-hoc builds skip it.
+NOTARIZE=0
+if [[ -n "${VERDE_NOTARY_KEY_PATH:-}" ]]; then
+  if [[ "${VERDE_CODESIGN_IDENTITY:--}" == "-" ]]; then
+    echo "VERDE_NOTARY_KEY_PATH is set but VERDE_CODESIGN_IDENTITY is ad-hoc; cannot notarize" >&2
+    exit 1
+  fi
+  : "${VERDE_NOTARY_KEY_ID:?VERDE_NOTARY_KEY_ID is required with VERDE_NOTARY_KEY_PATH}"
+  : "${VERDE_NOTARY_ISSUER_ID:?VERDE_NOTARY_ISSUER_ID is required with VERDE_NOTARY_KEY_PATH}"
+  NOTARIZE=1
+fi
+
+notarize() {
+  local artifact="$1"
+  local result_json="$WORK_DIR/notary-$(basename "$artifact").json"
+  xcrun notarytool submit "$artifact" \
+    --key "$VERDE_NOTARY_KEY_PATH" \
+    --key-id "$VERDE_NOTARY_KEY_ID" \
+    --issuer "$VERDE_NOTARY_ISSUER_ID" \
+    --wait --timeout 45m \
+    --output-format json >"$result_json" || true
+  local status submission_id
+  status="$(plutil -extract status raw -o - "$result_json" 2>/dev/null || echo unknown)"
+  submission_id="$(plutil -extract id raw -o - "$result_json" 2>/dev/null || echo "")"
+  echo "notarization of $(basename "$artifact"): $status (submission ${submission_id:-none})"
+  if [[ "$status" != "Accepted" ]]; then
+    cat "$result_json" >&2 || true
+    if [[ -n "$submission_id" ]]; then
+      xcrun notarytool log "$submission_id" \
+        --key "$VERDE_NOTARY_KEY_PATH" \
+        --key-id "$VERDE_NOTARY_KEY_ID" \
+        --issuer "$VERDE_NOTARY_ISSUER_ID" >&2 || true
+    fi
+    return 1
+  fi
+}
+
+if [[ "$NOTARIZE" -eq 1 ]]; then
+  ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "$WORK_DIR/notarize-app.zip"
+  notarize "$WORK_DIR/notarize-app.zip"
+  xcrun stapler staple "$APP_DIR"
+  xcrun stapler validate "$APP_DIR"
+  spctl --assess --type execute --verbose=2 "$APP_DIR"
+fi
+
 ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "$OUTPUT_DIR/verde-${VERSION}-macos-${ARCH}.zip"
 
 mkdir -p "$DMG_DIR"
@@ -167,3 +213,11 @@ hdiutil create \
   -ov \
   -format UDZO \
   "$OUTPUT_DIR/verde-${VERSION}-macos-${ARCH}.dmg" >/dev/null
+
+if [[ "$NOTARIZE" -eq 1 ]]; then
+  DMG_PATH="$OUTPUT_DIR/verde-${VERSION}-macos-${ARCH}.dmg"
+  codesign --force --timestamp --sign "$VERDE_CODESIGN_IDENTITY" "$DMG_PATH"
+  notarize "$DMG_PATH"
+  xcrun stapler staple "$DMG_PATH"
+  xcrun stapler validate "$DMG_PATH"
+fi
