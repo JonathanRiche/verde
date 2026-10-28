@@ -1696,7 +1696,7 @@ fn renderConversationItem(state: *runtime.AppState, item_index: usize, item: *co
     }
     renderTextSelection(state, item_index, &layout, conversation);
     if (layout.voice_label) |label| renderVoiceLabel(state, label.x, label.y, label.speaker, item.kind == .user, conversation);
-    if (layout.live_note_icon) |icon| queueWaveform(state, icon, color(chrome.text_subtle));
+    if (layout.live_note_icon) |icon| queueWaveform(state, icon, color(chrome.text_subtle), conversation);
     const text_color = switch (item.kind) {
         .user, .assistant, .streaming => chrome.text,
         .tool, .process, .system => chrome.text_subtle,
@@ -2967,7 +2967,7 @@ fn renderLiveCue(state: *runtime.AppState, rect: palette.Rect, visual: controlle
     queuePanel(state, badge, color(fill), color(chrome.accent), size * 0.5, 1.0 * s);
     if (visual.live == .listening) {
         const icon = size * 0.62;
-        queueWaveform(state, .{ .x = badge.x + (badge.w - icon) * 0.5, .y = badge.y + (badge.h - icon) * 0.5, .w = icon, .h = icon }, color(chrome.accent));
+        queueWaveform(state, .{ .x = badge.x + (badge.w - icon) * 0.5, .y = badge.y + (badge.h - icon) * 0.5, .w = icon, .h = icon }, color(chrome.accent), badge);
         return;
     }
     const bar_w = @max(@round(size * 0.13), 1.0);
@@ -3011,13 +3011,15 @@ fn renderLiveButton(state: *runtime.AppState, rect: palette.Rect) void {
         queuePanel(state, rect, color(surface()), color(hairline()), 7.0 * s, 1.0 * s);
     }
     const icon = 15.0 * s;
-    queueWaveform(state, .{ .x = rect.x + (rect.w - icon) * 0.5, .y = rect.y + (rect.h - icon) * 0.5, .w = icon, .h = icon }, color(if (on) chrome.accent_fg else chrome.text_muted));
+    queueWaveform(state, .{ .x = rect.x + (rect.w - icon) * 0.5, .y = rect.y + (rect.h - icon) * 0.5, .w = icon, .h = icon }, color(if (on) chrome.accent_fg else chrome.text_muted), rect);
 }
 
 /// The mobile Live glyph (`ic_waveform`): five rounded bars on a 24-unit
 /// grid at x = 3, 7, 11, 15, 19, two units wide, 4/12/18/10/4 tall, centred.
 /// Drawn as shapes with whole-pixel bar widths so it stays crisp at any scale.
-fn queueWaveform(state: *runtime.AppState, rect: palette.Rect, fill: palette.Color) void {
+/// Clipped like the text beside it, so a label scrolled out of the
+/// conversation never paints over the header.
+fn queueWaveform(state: *runtime.AppState, rect: palette.Rect, fill: palette.Color, clip: palette.Rect) void {
     if (rect.w <= 0.0 or rect.h <= 0.0) return;
     const unit = @min(rect.w, rect.h) / 24.0;
     const origin_x = rect.x + (rect.w - 24.0 * unit) * 0.5;
@@ -3027,7 +3029,7 @@ fn queueWaveform(state: *runtime.AppState, rect: palette.Rect, fill: palette.Col
     for (heights, 0..) |height, index| {
         const x = @round(origin_x + (3.0 + 4.0 * @as(f32, @floatFromInt(index))) * unit);
         const h = @max(height * unit, bar_w);
-        queueRoundedRect(state, .{ .x = x, .y = mid_y - h * 0.5, .w = bar_w, .h = h }, fill, bar_w * 0.5);
+        queueRoundedRectClipped(state, .{ .x = x, .y = mid_y - h * 0.5, .w = bar_w, .h = h }, fill, bar_w * 0.5, clip);
     }
 }
 
@@ -3054,7 +3056,7 @@ fn renderVoiceLabel(state: *runtime.AppState, x: f32, y: f32, speaker: []const u
     const font = VOICE_LABEL_FONT * s;
     const label = voiceLabelText(state, speaker);
     const label_w = text_measure.textWidth(.ui, font, label);
-    queueWaveform(state, .{ .x = x, .y = y + (VOICE_LABEL_H * s - icon) * 0.5, .w = icon, .h = icon }, color(if (user) chrome.text_muted else chrome.accent));
+    queueWaveform(state, .{ .x = x, .y = y + (VOICE_LABEL_H * s - icon) * 0.5, .w = icon, .h = icon }, color(if (user) chrome.text_muted else chrome.accent), clip);
     queueText(state, .{ .x = x + icon + 4.0 * s, .y = y + (VOICE_LABEL_H * s - font * 1.3) * 0.5, .w = label_w + 1.0, .h = font * 1.3 }, label, color(if (user) chrome.text_muted else chrome.text_subtle), font, clip);
 }
 
@@ -5324,4 +5326,20 @@ test "live call pill sits by the bubble while the panel is collapsed" {
     try std.testing.expectEqual(controller.HitAction.live_pill, state.companion_controller.hitAt(pill.meter.x + 2.0, pill.meter.y + 2.0).?);
     // The bubble still opens the panel.
     try std.testing.expectEqual(controller.HitAction.open, state.companion_controller.hitAt(geometry.dock_bubble.x + 4.0, geometry.dock_bubble.y + 4.0).?);
+}
+
+test "waveform bars carry their clip so scrolled-off voice labels never paint over the header" {
+    const allocator = std.testing.allocator;
+    theme.applyTheme(1.0);
+    var state: runtime.AppState = undefined;
+    try testState(allocator, &state);
+    defer deinitTestState(allocator, &state);
+    const clip: palette.Rect = .{ .x = 0.0, .y = 100.0, .w = 400.0, .h = 300.0 };
+    // A label whose row sits above the conversation's top edge.
+    queueWaveform(&state, .{ .x = 20.0, .y = 80.0, .w = 11.0, .h = 11.0 }, color(theme.companionChrome().accent), clip);
+    try std.testing.expect(state.palette_overlay_batch.commands.items.len == 5);
+    for (state.palette_overlay_batch.commands.items) |command| {
+        const command_clip = command.clip orelse return error.TestExpectedClip;
+        try std.testing.expectEqual(clip.y, command_clip.y);
+    }
 }
