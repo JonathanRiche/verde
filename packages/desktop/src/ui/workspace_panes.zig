@@ -237,6 +237,9 @@ var last_pane_drop_target: ?ThreadDropTarget = null;
 var pane_rect_count: usize = 0;
 var pane_rects: [MAX_WORKSPACE_PANE_RECTS]WorkspacePaneRect = undefined;
 var last_workspace_rect: palette.Rect = .{};
+/// This frame's workspace before the side panel split: its left edge meets the
+/// sidebar divider (or the window), and its bottom/right meet the window edge.
+var frame_workspace_rect: palette.Rect = .{};
 var browser_pane_rendered: bool = false;
 var scrolling_layout_rendered: bool = false;
 /// This frame's strip shows one tab per view (no viewport margins), so a tab
@@ -1116,6 +1119,7 @@ pub fn renderAtWithTranscriptLayoutWidth(state: *runtime.AppState, workspace_rec
     // The focused tab's side panel takes the right edge; panes tile the rest.
     side_panel.resetHitCache();
     const panel_split = side_panel.split(state, workspace_rect);
+    frame_workspace_rect = workspace_rect;
     const rect = panel_split.content;
     const target_workspace_width = if (panel_split.panel) |panel| @max(workspace_target_width - panel.w, 0.0) else workspace_target_width;
     tickPaneMotion(state, rect);
@@ -3463,7 +3467,7 @@ fn renderLeafWithin(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, 
             LONE_PANE_BORDER_WIDTH_CSS
         else
             STATUS_BORDER_WIDTH_CSS);
-        queueBorder(state, rect, paletteColor(border_color), 0.0, border_width);
+        queuePaneFrame(state, rect, paletteColor(border_color), border_width, lone);
         return;
     }
 
@@ -3480,7 +3484,39 @@ fn renderLeafWithin(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, 
             LONE_PANE_BORDER_WIDTH_CSS
         else
             FOCUS_BORDER_WIDTH_CSS);
-        queueBorder(state, rect, paletteColor(border_color), 0.0, border_width);
+        queuePaneFrame(state, rect, paletteColor(border_color), border_width, lone);
+    }
+}
+
+/// Tiled and zoomed panes draw a full ring. A lone pane fills the workspace
+/// edge-to-edge, so a full ring would trace the window's own edges and sit
+/// beside the sidebar divider as a doubled line. It draws only the edges that
+/// face other app chrome, and its sidebar-facing edge replaces the divider.
+fn queuePaneFrame(state: *runtime.AppState, rect: palette.Rect, color: palette.Color, width: f32, lone: bool) void {
+    if (!lone) {
+        queueBorder(state, rect, color, 0.0, width);
+        return;
+    }
+    const stroke = @max(@round(width), 1.0);
+    const left = @round(rect.x);
+    const top = @round(rect.y);
+    const right = @round(rect.x + rect.w);
+    const bottom = @round(rect.y + rect.h);
+    const bounds = frame_workspace_rect;
+    const edge_epsilon: f32 = 0.5;
+    const at_window_top = top <= edge_epsilon;
+    const at_window_bottom = bottom >= @round(bounds.y + bounds.h) - edge_epsilon;
+    const at_window_right = right >= @round(bounds.x + bounds.w) - edge_epsilon;
+    const at_window_left = left <= edge_epsilon;
+    const meets_sidebar = !at_window_left and left <= @round(bounds.x) + edge_epsilon;
+    if (!at_window_top) queueRect(state, .{ .x = left, .y = top, .w = right - left, .h = stroke }, color);
+    if (!at_window_bottom) queueRect(state, .{ .x = left, .y = bottom - stroke, .w = right - left, .h = stroke }, color);
+    if (!at_window_right) queueRect(state, .{ .x = right - stroke, .y = top, .w = stroke, .h = bottom - top }, color);
+    if (meets_sidebar) {
+        // Paint over the sidebar's own divider so the seam stays one line.
+        queueRect(state, .{ .x = left - stroke, .y = top, .w = stroke, .h = bottom - top }, color);
+    } else if (!at_window_left) {
+        queueRect(state, .{ .x = left, .y = top, .w = stroke, .h = bottom - top }, color);
     }
 }
 
