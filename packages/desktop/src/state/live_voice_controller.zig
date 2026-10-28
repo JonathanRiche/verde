@@ -388,8 +388,19 @@ fn toolOutput(self: *Self, host: anytype, arena: std.mem.Allocator, name: []cons
             const line = try std.fmt.allocPrint(arena, "→ Asked {s}: {s}", .{ companionName(host), request });
             record.system(line, now) catch {};
         }
-        // A companion turn is running: send once it ends (sends are refused mid-turn).
-        if (host.liveCompanionWorking() or self.queued_request != null) {
+        // A companion turn is running: steer it with the request (Codex,
+        // Claude, Pi; others queue it as the next turn). Only if that fails,
+        // hold it until the turn ends.
+        if (host.liveCompanionWorking()) {
+            if (self.queued_request == null and host.liveSteerCompanion(request)) {
+                // Its reply arrives when the steered turn finishes.
+                if (self.ask == null) self.ask = .{ .before_count = host.liveCompanionMessageCount(), .started = true, .sent_at_ms = now };
+                return objectOf(arena, .{ .accepted = true, .delivered = "to the running turn" });
+            }
+            try self.queueRequest(request);
+            return objectOf(arena, .{ .accepted = true, .queued = true });
+        }
+        if (self.queued_request != null) {
             try self.queueRequest(request);
             return objectOf(arena, .{ .accepted = true, .queued = true });
         }
@@ -397,6 +408,17 @@ fn toolOutput(self: *Self, host: anytype, arena: std.mem.Allocator, name: []cons
         return objectOf(arena, .{ .accepted = true });
     }
     if (std.mem.eql(u8, name, "companion_status")) return host.liveCompanionStatus(arena);
+    if (std.mem.eql(u8, name, "stop_companion")) {
+        if (self.queued_request) |text| self.allocator.free(text);
+        self.queued_request = null;
+        if (!host.liveStopCompanion()) return objectOf(arena, .{ .stopped = false, .@"error" = "not_running" });
+        self.ask = null;
+        if (self.transcript) |record| {
+            const line = try std.fmt.allocPrint(arena, "■ Stopped {s}", .{companionName(host)});
+            record.system(line, now) catch {};
+        }
+        return objectOf(arena, .{ .stopped = true });
+    }
     if (std.mem.eql(u8, name, "decide_approval")) {
         const approve_value = fields.get("approve") orelse .null;
         if (approve_value != .bool) return objectOf(arena, .{ .@"error" = "missing_decision" });
@@ -795,6 +817,7 @@ const testing = std.testing;
 /// The host surface the controller relies on, as a test double.
 const HostContract = struct {
     asked: std.ArrayList(u8) = .empty,
+    steered: std.ArrayList(u8) = .empty,
     working: bool = false,
     message_count: usize = 4,
     reply: ?[]const u8 = null,
@@ -819,6 +842,16 @@ const HostContract = struct {
     }
     pub fn liveCompanionWorking(self: *HostContract) bool {
         return self.working;
+    }
+    pub fn liveSteerCompanion(self: *HostContract, text: []const u8) bool {
+        if (!self.working) return false;
+        self.steered.appendSlice(testing.allocator, text) catch return false;
+        return true;
+    }
+    pub fn liveStopCompanion(self: *HostContract) bool {
+        if (!self.working) return false;
+        self.working = false;
+        return true;
     }
     pub fn liveCompanionMessageCount(self: *HostContract) usize {
         return self.message_count;
@@ -943,4 +976,34 @@ test "voice authors name their speaker" {
     try testing.expect(voiceSpeaker("You") == null);
     try testing.expect(voiceSpeaker(" (voice)") == null);
     try testing.expect(!isVoiceAuthor("Live"));
+}
+
+test "while the companion works, spoken requests steer it and stop_companion interrupts it" {
+    var host: HostContract = .{ .working = true };
+    defer host.asked.deinit(testing.allocator);
+    defer host.steered.deinit(testing.allocator);
+    var controller: Self = .{ .allocator = testing.allocator };
+    defer controller.deinit();
+    var record = try Transcript.init(testing.allocator, "Moss", @splat('a'));
+    defer record.deinit();
+    controller.transcript = &record;
+    defer controller.transcript = null;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var fields: std.json.ObjectMap = .empty;
+    try fields.put(arena, "request", .{ .string = "use the staging branch instead" });
+    const steered = try controller.toolOutput(&host, arena, "ask_companion", fields, 1);
+    try testing.expect(steered.object.get("accepted").?.bool);
+    try testing.expect(steered.object.get("delivered") != null);
+    try testing.expectEqualStrings("use the staging branch instead", host.steered.items);
+    try testing.expectEqual(@as(usize, 0), host.asked.items.len);
+    try testing.expect(controller.ask.?.started);
+
+    const stopped = try controller.toolOutput(&host, arena, "stop_companion", .empty, 2);
+    try testing.expect(stopped.object.get("stopped").?.bool);
+    try testing.expect(controller.ask == null);
+    const idle = try controller.toolOutput(&host, arena, "stop_companion", .empty, 3);
+    try testing.expectEqualStrings("not_running", idle.object.get("error").?.string);
 }

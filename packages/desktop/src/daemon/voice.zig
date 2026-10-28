@@ -450,6 +450,8 @@ pub fn instructionsAlloc(allocator: std.mem.Allocator, name: []const u8, charact
         \\You cannot see code or run anything yourself. For any real work, status beyond what the tools return,
         \\or anything you are unsure about, call ask_companion with a clear, complete request; tell the user you're on it,
         \\and keep chatting while it works. When a companion_update arrives, summarize it in a sentence or two.
+        \\If the user corrects or redirects work in progress, call ask_companion with the change: it reaches the
+        \\running work right away. If they want the companion to stop, call stop_companion.
         \\Use companion_status for "what's running / what needs me". Only call decide_approval after the user clearly
         \\says to approve or deny a specific chat, and read back what you approved.{s}{s}
     , .{ name, character_tagline, if (trimmed.len > 0) "\nStanding orders from the user: " else "", trimmed });
@@ -458,7 +460,8 @@ pub fn instructionsAlloc(allocator: std.mem.Allocator, name: []const u8, charact
 /// Tool schemas shared by every provider adapter (JSON Schema parameters).
 pub const TOOLS_JSON =
     \\[
-    \\ {"name":"ask_companion","description":"Hand a request to the user's Verde companion, which can open and steer coding chats in any workspace, run processes, and report back. Returns once the request is accepted; the companion's reply arrives later as a companion_update message.","parameters":{"type":"object","properties":{"request":{"type":"string","description":"The complete request in plain language."}},"required":["request"]}},
+    \\ {"name":"ask_companion","description":"Hand a request to the user's Verde companion, which can open and steer coding chats in any workspace, run processes, and report back. While it is already working, the request steers that work. Returns once the request is accepted; the companion's reply arrives later as a companion_update message.","parameters":{"type":"object","properties":{"request":{"type":"string","description":"The complete request in plain language."}},"required":["request"]}},
+    \\ {"name":"stop_companion","description":"Stop the companion's current work right now, when the user asks to stop, cancel, or interrupt it.","parameters":{"type":"object","properties":{}}},
     \\ {"name":"companion_status","description":"Current orchestration status: chats running in the companion's crew and chats anywhere that need the user's approval or input.","parameters":{"type":"object","properties":{}}},
     \\ {"name":"decide_approval","description":"Approve or deny a pending approval for a specific chat, only after the user explicitly asked to.","parameters":{"type":"object","properties":{"chat":{"type":"string","description":"Chat title or id from companion_status."},"approve":{"type":"boolean"}},"required":["chat","approve"]}}
     \\]
@@ -484,4 +487,21 @@ test "config picks env keys, prefers the stored default, and never lists keys" {
     try writeProviders(&s, &config);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "g-key") == null);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"key_source\":\"environment\"") != null);
+}
+
+test "voice tools parse and include the companion controls" {
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, TOOLS_JSON, .{});
+    defer parsed.deinit();
+    var names: [8][]const u8 = undefined;
+    var count: usize = 0;
+    for (parsed.value.array.items) |tool| {
+        names[count] = tool.object.get("name").?.string;
+        count += 1;
+    }
+    for ([_][]const u8{ "ask_companion", "stop_companion", "companion_status", "decide_approval" }) |wanted| {
+        const found = for (names[0..count]) |name| {
+            if (std.mem.eql(u8, name, wanted)) break true;
+        } else false;
+        try std.testing.expect(found);
+    }
 }

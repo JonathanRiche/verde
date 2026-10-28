@@ -3133,6 +3133,21 @@ fn canonicalizeCompanionTextChange(state: anytype, text: []const u8) !void {
 /// workspace, which need not be the workspace on screen.
 fn submitCompanionPrompt(state: anytype, text: []const u8) void {
     if (std.mem.trim(u8, text, &std.ascii.whitespace).len == 0) return;
+    // Mid-turn, Enter steers the running turn like the chat composer does.
+    if (companionTurnRunning(state)) {
+        if (!steerCompanionTurn(state, text)) {
+            state.companion_controller.ui_error = "The companion is still starting. Try again in a moment.";
+            return;
+        }
+        if (state.activeCompanionThreadLocation()) |location| {
+            const project = &state.project_controller.projects.items[location.project_index];
+            const thread = &project.threads.items[location.thread_index];
+            thread.setDraft("");
+            projectCompanionDraftForOwner(state, project.id, thread.local_thread_id);
+        }
+        state.companion_controller.ui_error = null;
+        return;
+    }
     const location = state.ensureActiveCompanionThread() catch |err| {
         log.err("failed to create Companion thread for send: {s}", .{@errorName(err)});
         state.companion_controller.ui_error = "Could not start the companion's conversation.";
@@ -3164,6 +3179,25 @@ fn submitCompanionPrompt(state: anytype, text: []const u8) void {
         return;
     };
     state.companion_controller.ui_error = if (sent) null else "The companion's conversation is no longer available.";
+}
+
+fn companionTurnRunning(state: anytype) bool {
+    const thread = state.activeCompanionThread() orelse return false;
+    return thread.isSendPendingForUi();
+}
+
+/// Delivers `text` to the companion's running turn: a steer for Codex,
+/// Claude and Pi, the next queued turn for other providers. False when no
+/// turn runs or it is still being accepted.
+fn steerCompanionTurn(state: anytype, text: []const u8) bool {
+    const location = state.activeCompanionThreadLocation() orelse return false;
+    const thread = &state.project_controller.projects.items[location.project_index].threads.items[location.thread_index];
+    if (!thread.isSendPendingForUi()) return false;
+    if (!state.storeThreadFollowupPrompt(location.project_index, location.thread_index, text)) return false;
+    var notice_buf: [96]u8 = undefined;
+    const notice = std.fmt.bufPrint(&notice_buf, "Sent to {s} mid-turn.", .{state.companion_controller.identity.name.slice()}) catch "Sent to the companion mid-turn.";
+    state.setSidebarNotice(notice);
+    return true;
 }
 
 fn sendCompanionThreadDraft(state: anytype, workspace_id: []const u8, local_thread_id: []const u8, text: []const u8) !bool {
@@ -14676,6 +14710,20 @@ pub const AppState = struct {
         self.companion_controller.ui_error = null;
         submitCompanionPrompt(self, joined);
         return self.companion_controller.ui_error == null;
+    }
+
+    /// A spoken request while the companion works: steers its running turn.
+    pub fn liveSteerCompanion(self: *AppState, text: []const u8) bool {
+        return steerCompanionTurn(self, text);
+    }
+
+    /// `stop_companion`: stops the companion's running turn.
+    pub fn liveStopCompanion(self: *AppState) bool {
+        const location = self.activeCompanionThreadLocation() orelse return false;
+        const project = &self.project_controller.projects.items[location.project_index];
+        const thread = &project.threads.items[location.thread_index];
+        if (!thread.isSendPendingForUi()) return false;
+        return self.abortThreadByLocalId(project.id, thread.local_thread_id);
     }
 
     pub fn liveCompanionWorking(self: *AppState) bool {
