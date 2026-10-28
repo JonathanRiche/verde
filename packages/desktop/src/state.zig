@@ -13118,6 +13118,8 @@ pub const AppState = struct {
             // Saved Live voice lines read like typed turns but keep their
             // "(voice)" author for the label, and never become the objective.
             const voice = live_voice_controller_mod.isVoiceAuthor(message.author);
+            // A mid-turn steer reads as the user's own turn ("You · steering").
+            const steer = message.role == .system and std.mem.eql(u8, message.author, COMPANION_STEER_AUTHOR);
             // The Objective mirrors the user's most recent meaningful
             // instruction, not the first prompt of the thread.
             if (message.role == .user and !voice) {
@@ -13148,12 +13150,12 @@ pub const AppState = struct {
                 appendCompanionTool(frame, call_id, message.author, message.body, message.tool_call_kind, message.tool_call_status, sequence, null);
                 continue;
             }
-            const kind: companion_controller.ActivityKind = switch (message.role) {
+            const kind: companion_controller.ActivityKind = if (steer) .user else switch (message.role) {
                 .user => .user,
                 .assistant => .assistant,
                 .system => .system,
             };
-            const author = if (voice) message.author else switch (message.role) {
+            const author = if (voice or steer) message.author else switch (message.role) {
                 .user => "You",
                 .assistant => "Sprout",
                 .system => message.author,
@@ -13169,12 +13171,13 @@ pub const AppState = struct {
             if (event.tool_call_id) |call_id| {
                 appendCompanionTool(frame, call_id, event.author, event.body, event.tool_call_kind, event.tool_call_status, sequence, &event);
             } else {
-                const kind: companion_controller.ActivityKind = switch (event.role) {
+                const steer = event.role == .system and std.mem.eql(u8, event.author, COMPANION_STEER_AUTHOR);
+                const kind: companion_controller.ActivityKind = if (steer) .user else switch (event.role) {
                     .user => .user,
                     .assistant => .assistant,
                     .system => .system,
                 };
-                const author = switch (event.role) {
+                const author = if (steer) event.author else switch (event.role) {
                     .user => "You",
                     .assistant => "Sprout",
                     .system => event.author,
@@ -13359,6 +13362,9 @@ pub const AppState = struct {
 
     /// Prompts offered on an empty conversation. Each is a real orchestration
     /// request the companion can act on with Verde's MCP tools.
+    /// Title the daemon gives a mid-turn steer row (sessionizer steer event).
+    pub const COMPANION_STEER_AUTHOR = "Steering current turn";
+
     pub const COMPANION_SUGGESTIONS = [_][]const u8{
         "What's running across my workspaces right now?",
         "Check every workspace for chats that need me.",

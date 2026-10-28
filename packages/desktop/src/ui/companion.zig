@@ -1695,7 +1695,7 @@ fn renderConversationItem(state: *runtime.AppState, item_index: usize, item: *co
         queuePanelClipped(state, bubble, color(opaqueOver(surface(), chrome.ready_fill)), color(opaqueOver(surface(), theme.withAlpha(chrome.accent, 60))), 12.0 * s, 1.0 * s, conversation);
     }
     renderTextSelection(state, item_index, &layout, conversation);
-    if (layout.voice_label) |label| renderVoiceLabel(state, label.x, label.y, label.speaker, item.kind == .user, conversation);
+    if (layout.voice_label) |label| renderVoiceLabel(state, label.x, label.y, label.label, item.kind == .user, conversation);
     if (layout.live_note_icon) |icon| queueWaveform(state, icon, color(chrome.text_subtle), conversation);
     const text_color = switch (item.kind) {
         .user, .assistant, .streaming => chrome.text,
@@ -1749,7 +1749,7 @@ const ItemTextLayout = struct {
     truncated: bool = false,
     bubble: ?palette.Rect = null,
     /// Where the "<speaker> · voice" label (or a Live note's waveform) goes.
-    voice_label: ?struct { x: f32, y: f32, speaker: []const u8 } = null,
+    voice_label: ?struct { x: f32, y: f32, label: RowLabel } = null,
     live_note_icon: ?palette.Rect = null,
 };
 
@@ -1783,9 +1783,9 @@ fn itemTextLayout(state: *runtime.AppState, item: *const controller.ActivityItem
                 origin_y = bubble.y + 9.0 * s;
                 line_w = widths.bubble + 4.0 * s;
                 // Voice labels sit right-aligned on the bubble's first row.
-                if (speaker) |who| layout.voice_label = .{ .x = bubble.x + bubble.w - 11.0 * s - voiceLabelWidth(state, who), .y = origin_y - 2.0 * s, .speaker = who };
+                if (speaker) |who| layout.voice_label = .{ .x = bubble.x + bubble.w - 11.0 * s - voiceLabelWidth(state, who), .y = origin_y - 2.0 * s, .label = who };
             } else if (speaker) |who| {
-                layout.voice_label = .{ .x = origin_x, .y = origin_y - 2.0 * s, .speaker = who };
+                layout.voice_label = .{ .x = origin_x, .y = origin_y - 2.0 * s, .label = who };
             }
             origin_y += label_h;
             var previous_end: usize = 0;
@@ -3034,13 +3034,19 @@ fn queueWaveform(state: *runtime.AppState, rect: palette.Rect, fill: palette.Col
 }
 
 /// Speaker of a saved Live voice line ("You", "Moss"), or null for typed turns.
-fn voiceSpeaker(item: *const controller.ActivityItem) ?[]const u8 {
+/// The small label above a voice line ("Moss · voice", with a waveform) or
+/// a mid-turn steer ("You · steering").
+const RowLabel = struct { speaker: []const u8, steer: bool = false };
+
+/// Speaker of a saved Live voice line or a steer, or null for typed turns.
+fn voiceSpeaker(item: *const controller.ActivityItem) ?RowLabel {
     if (item.kind != .user and item.kind != .assistant) return null;
-    return live_voice.voiceSpeaker(item.author.slice());
+    if (item.kind == .user and std.mem.eql(u8, item.author.slice(), runtime.AppState.COMPANION_STEER_AUTHOR)) return .{ .speaker = "You", .steer = true };
+    return .{ .speaker = live_voice.voiceSpeaker(item.author.slice()) orelse return null };
 }
 
-fn voiceLabelText(state: *runtime.AppState, speaker: []const u8) []const u8 {
-    return framePrint(state, "{s} · voice", .{speaker});
+fn voiceLabelText(state: *runtime.AppState, label: RowLabel) []const u8 {
+    return framePrint(state, "{s} · {s}", .{ label.speaker, if (label.steer) "steering" else "voice" });
 }
 
 /// A "Live" system note (session header, hand-offs) gets the waveform too.
@@ -3049,20 +3055,22 @@ fn isLiveNote(item: *const controller.ActivityItem) bool {
 }
 
 /// Small waveform plus "<speaker> · voice", as on the phones.
-fn renderVoiceLabel(state: *runtime.AppState, x: f32, y: f32, speaker: []const u8, user: bool, clip: palette.Rect) void {
+fn renderVoiceLabel(state: *runtime.AppState, x: f32, y: f32, row_label: RowLabel, user: bool, clip: palette.Rect) void {
     const s = companionScale();
     const chrome = theme.companionChrome();
-    const icon = 11.0 * s;
+    const icon: f32 = if (row_label.steer) 0.0 else 11.0 * s;
     const font = VOICE_LABEL_FONT * s;
-    const label = voiceLabelText(state, speaker);
+    const label = voiceLabelText(state, row_label);
     const label_w = text_measure.textWidth(.ui, font, label);
-    queueWaveform(state, .{ .x = x, .y = y + (VOICE_LABEL_H * s - icon) * 0.5, .w = icon, .h = icon }, color(if (user) chrome.text_muted else chrome.accent), clip);
-    queueText(state, .{ .x = x + icon + 4.0 * s, .y = y + (VOICE_LABEL_H * s - font * 1.3) * 0.5, .w = label_w + 1.0, .h = font * 1.3 }, label, color(if (user) chrome.text_muted else chrome.text_subtle), font, clip);
+    if (!row_label.steer) queueWaveform(state, .{ .x = x, .y = y + (VOICE_LABEL_H * s - icon) * 0.5, .w = icon, .h = icon }, color(if (user) chrome.text_muted else chrome.accent), clip);
+    const text_x = x + if (row_label.steer) 0.0 else icon + 4.0 * s;
+    queueText(state, .{ .x = text_x, .y = y + (VOICE_LABEL_H * s - font * 1.3) * 0.5, .w = label_w + 1.0, .h = font * 1.3 }, label, color(if (user) chrome.text_muted else chrome.text_subtle), font, clip);
 }
 
-fn voiceLabelWidth(state: *runtime.AppState, speaker: []const u8) f32 {
+fn voiceLabelWidth(state: *runtime.AppState, row_label: RowLabel) f32 {
     const s = companionScale();
-    return 11.0 * s + 4.0 * s + text_measure.textWidth(.ui, VOICE_LABEL_FONT * s, voiceLabelText(state, speaker));
+    const icon: f32 = if (row_label.steer) 0.0 else 11.0 * s + 4.0 * s;
+    return icon + text_measure.textWidth(.ui, VOICE_LABEL_FONT * s, voiceLabelText(state, row_label));
 }
 
 // ---- Live voice call pill -------------------------------------------------------
@@ -5342,4 +5350,31 @@ test "waveform bars carry their clip so scrolled-off voice labels never paint ov
         const command_clip = command.clip orelse return error.TestExpectedClip;
         try std.testing.expectEqual(clip.y, command_clip.y);
     }
+}
+
+test "a mid-turn steer reads as the user's bubble labelled steering, voice lines as voice" {
+    const allocator = std.testing.allocator;
+    theme.applyTheme(1.0);
+    var state: runtime.AppState = undefined;
+    try testState(allocator, &state);
+    defer deinitTestState(allocator, &state);
+    state.companion_controller.show();
+    state.companion_controller.settleTransition();
+    var frame: controller.Frame = .{ .has_thread = true };
+    _ = frame.setOwner("companion-ui", "chat-1");
+    var steer: controller.ActivityItem = .{ .kind = .user, .sequence = 1 };
+    steer.author.set(runtime.AppState.COMPANION_STEER_AUTHOR);
+    steer.body.set("any new thoughts");
+    frame.appendActivity(steer);
+    var voice: controller.ActivityItem = .{ .kind = .assistant, .sequence = 2 };
+    voice.author.set("Moss (voice)");
+    voice.body.set("Loud and clear.");
+    frame.appendActivity(voice);
+    state.companion_controller.setFrame(frame);
+
+    render(&state, 1360.0, 860.0);
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "any new thoughts"));
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "You · steering"));
+    try std.testing.expect(batchHasText(&state.palette_overlay_batch, "Moss · voice"));
+    try std.testing.expect(!batchHasText(&state.palette_overlay_batch, "Steering current turn"));
 }
