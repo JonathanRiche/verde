@@ -146,6 +146,16 @@ cat > "$APP_DIR/Contents/Info.plist" <<EOF
   <string>NSApplication</string>
   <key>NSHighResolutionCapable</key>
   <true/>
+  <key>NSDocumentsFolderUsageDescription</key>
+  <string>Verde opens project folders in Documents so you and your agents can work in them.</string>
+  <key>NSDesktopFolderUsageDescription</key>
+  <string>Verde opens project folders on the Desktop so you and your agents can work in them.</string>
+  <key>NSDownloadsFolderUsageDescription</key>
+  <string>Verde opens project folders in Downloads so you and your agents can work in them.</string>
+  <key>NSNetworkVolumesUsageDescription</key>
+  <string>Verde opens project folders on network drives so you and your agents can work in them.</string>
+  <key>NSRemovableVolumesUsageDescription</key>
+  <string>Verde opens project folders on external drives so you and your agents can work in them.</string>
 </dict>
 </plist>
 EOF

@@ -2066,6 +2066,10 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
         switch (hit.action) {
             .mcp_onboarding_not_now,
             .mcp_onboarding_enable,
+            .folder_access_skip,
+            .folder_access_primary,
+            .folder_access_row,
+            .folder_access_full_disk,
             .provider_onboarding_close,
             .provider_onboarding_recheck,
             .provider_onboarding_open_guide,
@@ -2503,6 +2507,10 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const palette.even
                 state.completeMcpOnboarding(true);
                 return true;
             }
+            if (state.settings_controller.folder_access_onboarding_visible) {
+                onboarding_modal.activatePrimary(state);
+                return true;
+            }
             if (state.palette_modal_text_focus == .project_rename) {
                 state.finishProjectRename();
                 return true;
@@ -2619,6 +2627,7 @@ pub fn paletteModalOpen(state: *const runtime.AppState) bool {
         state.runtimeTrustProposal() != null or
         state.modal_image_path != null or
         state.settings_controller.mcp_onboarding_visible or
+        state.settings_controller.folder_access_onboarding_visible or
         state.settings_controller.provider_onboarding_visible or
         state.rename_project_index != null or
         state.transcriptSelectionBuffer() != null or
@@ -2674,6 +2683,8 @@ fn dismissTopModal(state: *runtime.AppState) void {
         state.dismissProviderOnboarding();
     } else if (onboarding_on_top and state.settings_controller.mcp_onboarding_visible) {
         state.completeMcpOnboarding(false);
+    } else if (onboarding_on_top and state.settings_controller.folder_access_onboarding_visible) {
+        state.completeFolderAccessOnboarding();
     } else if (state.modal_image_path != null) {
         state.closeImageModal();
     } else if (state.transcriptSelectionBuffer() != null) {
@@ -4447,6 +4458,7 @@ test "workspace settings modal owns keyboard and text input while open" {
     state.runtime_pin_proposal = null;
     state.modal_image_path = null;
     state.settings_controller.mcp_onboarding_visible = false;
+    state.settings_controller.folder_access_onboarding_visible = false;
     state.settings_controller.provider_onboarding_visible = false;
     state.settings_controller.modal_visible = false;
     state.rename_project_index = null;

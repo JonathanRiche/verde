@@ -41,6 +41,7 @@ test {
     _ = @import("state/file_viewer_controller.zig");
     _ = @import("state/file_explorer.zig");
     _ = @import("state/folder_browser.zig");
+    _ = @import("state/folder_access.zig");
     _ = @import("state/workspace_setup.zig");
     _ = @import("state/navigation_history.zig");
     _ = @import("state/custom_agent_form.zig");

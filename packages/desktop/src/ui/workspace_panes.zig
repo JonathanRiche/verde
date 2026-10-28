@@ -418,7 +418,8 @@ fn handleNoWorkspacesKeyDown(state: *runtime.AppState, event: *const palette.eve
     if (state.project_controller.show_creator or
         state.settings_controller.modal_visible or
         state.settings_controller.provider_onboarding_visible or
-        state.settings_controller.mcp_onboarding_visible) return false;
+        state.settings_controller.mcp_onboarding_visible or
+        state.settings_controller.folder_access_onboarding_visible) return false;
     const modifiers = event.mod;
     if (modifiers.ctrl or modifiers.super or modifiers.alt or modifiers.shift) return false;
     switch (event.key) {

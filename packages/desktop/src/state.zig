@@ -2267,6 +2267,12 @@ pub const SurfaceProvider = db_types.SurfaceProvider;
 pub const PaletteModalAction = enum {
     mcp_onboarding_not_now,
     mcp_onboarding_enable,
+    folder_access_skip,
+    /// "Allow all" while folders are unasked, then "Done".
+    folder_access_primary,
+    /// Index into `folder_access.FOLDERS`: Allow, or Open Settings once denied.
+    folder_access_row,
+    folder_access_full_disk,
     provider_onboarding_close,
     provider_onboarding_recheck,
     provider_onboarding_open_guide,
@@ -6198,6 +6204,7 @@ pub const AppState = struct {
             self.runtime_pin_proposal != null or
             self.modal_image_path != null or
             self.settings_controller.mcp_onboarding_visible or
+            self.settings_controller.folder_access_onboarding_visible or
             self.settings_controller.provider_onboarding_visible or
             self.rename_project_index != null or
             self.transcriptSelectionBuffer() != null or
@@ -6400,6 +6407,9 @@ pub const AppState = struct {
     pub const startMuseModelOptionsRefresh = provider_controller.startMuseModelOptionsRefresh;
     pub const startProviderReadinessCheck = provider_controller.startProviderReadinessCheck;
     pub const completeMcpOnboarding = provider_controller.completeMcpOnboarding;
+    pub const completeFolderAccessOnboarding = provider_controller.completeFolderAccessOnboarding;
+    pub const requestFolderAccess = provider_controller.requestFolderAccess;
+    pub const openPrivacySettings = provider_controller.openPrivacySettings;
     pub const pollProviderReadiness = provider_controller.pollProviderReadiness;
     pub const providerReadinessSnapshot = provider_controller.providerReadinessSnapshot;
     pub const dismissProviderOnboarding = provider_controller.dismissProviderOnboarding;
@@ -15982,6 +15992,10 @@ pub const AppState = struct {
             const interactive = switch (hit.action) {
                 .mcp_onboarding_not_now,
                 .mcp_onboarding_enable,
+                .folder_access_skip,
+                .folder_access_primary,
+                .folder_access_row,
+                .folder_access_full_disk,
                 .provider_onboarding_close,
                 .provider_onboarding_recheck,
                 .provider_onboarding_open_guide,

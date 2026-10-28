@@ -11,6 +11,7 @@ const provider_cli_version = @import("../providers/cli_version.zig");
 const provider_models = @import("provider_models.zig");
 const state_sync = @import("sync.zig");
 const provider_setup = @import("provider_setup.zig");
+const folder_access = @import("folder_access.zig");
 const platform_runtime = @import("platform_runtime");
 const runtime_log = @import("../runtime/log.zig");
 
@@ -1111,6 +1112,61 @@ pub fn completeMcpOnboarding(self: anytype, enable: bool) void {
     self.markDirty();
 }
 
+/// macOS first-run folder step: Done or Skip both record the choice; folders
+/// left unasked simply prompt when first used.
+pub fn completeFolderAccessOnboarding(self: anytype) void {
+    self.app_config.folder_access_onboarding_completed = true;
+    if (app_config.saveAppConfig(self.allocator, &self.app_config)) |_| {
+        // Our own write: the config watcher must not report it as an outside reload.
+        self.app_config_file_mtime = app_config.configFileMtime(self.allocator) catch self.app_config_file_mtime;
+    } else |err| {
+        log.warn("failed to persist folder access onboarding: {s}", .{@errorName(err)});
+    }
+    self.settings_controller.folder_access_onboarding_visible = false;
+    self.markDirty();
+}
+
+/// Raise the macOS prompt for one folder (or every unasked one).
+pub fn requestFolderAccess(self: anytype, folder: ?folder_access.Folder) void {
+    if (folder) |one| folder_access.request(one) else folder_access.requestAllUnasked();
+    self.markDirty();
+}
+
+/// Opens System Settings at Files and Folders (a denied folder) or Full
+/// Disk Access; apps cannot grant either themselves.
+pub fn openPrivacySettings(self: anytype, full_disk_access: bool) void {
+    const url = if (full_disk_access) folder_access.FULL_DISK_ACCESS_SETTINGS_URL else folder_access.FILES_AND_FOLDERS_SETTINGS_URL;
+    utils.openUrlInDefaultBrowser(self.allocator, url) catch |err| {
+        log.warn("failed to open macOS privacy settings: {s}", .{@errorName(err)});
+        self.setSidebarNotice("Could not open System Settings. Open Privacy & Security there.");
+        return;
+    };
+}
+
+/// Shows the folder dialog once the startup provider check settled and the
+/// provider and MCP dialogs are out of the way; redraws on probe results.
+fn pollFolderAccessOnboarding(self: anytype) void {
+    const revision = folder_access.currentRevision();
+    if (revision != self.settings_controller.folder_access_seen_revision) {
+        self.settings_controller.folder_access_seen_revision = revision;
+        self.markDirty();
+    }
+    const sc = &self.settings_controller;
+    if (sc.folder_access_onboarding_visible) return;
+    if (folder_access.shouldOffer(
+        folder_access.supported,
+        self.app_config.folder_access_onboarding_completed,
+        false,
+        sc.provider_onboarding_visible or sc.mcp_onboarding_visible,
+        sc.modal_visible,
+        self.provider_controller.readiness.startup_defaults_applied,
+    )) {
+        sc.folder_access_onboarding_visible = true;
+        self.blurPaletteComposer();
+        self.markDirty();
+    }
+}
+
 /// Hides the MCP dialog without recording a choice.
 fn snoozeMcpOnboarding(self: anytype) void {
     self.settings_controller.mcp_onboarding_visible = false;
@@ -1226,6 +1282,7 @@ pub fn pollProviderReadiness(self: anytype) void {
     self.pollProviderThreadOperation();
     self.pollProviderSlashCatalog();
     pollMcpSync(self);
+    pollFolderAccessOnboarding(self);
     const revision = self.provider_controller.readiness.revision.load(.acquire);
     if (revision != self.provider_controller.readiness.seen_revision) {
         self.provider_controller.readiness.seen_revision = revision;

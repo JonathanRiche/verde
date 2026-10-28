@@ -1689,6 +1689,7 @@ pub fn browserBlockedByPaletteOverlay(self: anytype) bool {
         // Centered modals drawn by Palette. A native child view (macOS
         // WKWebView) sits above the Metal layer, so it would cover them.
         self.settings_controller.mcp_onboarding_visible or
+        self.settings_controller.folder_access_onboarding_visible or
         self.settings_controller.provider_onboarding_visible or
         self.workspaceSettingsOpen() or
         self.cookie_import.open or

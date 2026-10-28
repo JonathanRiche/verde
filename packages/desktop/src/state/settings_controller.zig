@@ -256,6 +256,10 @@ pub const State = struct {
     phone: @import("phone_pairing.zig").State = .{},
     remote_access: @import("remote_access.zig").State = .{},
     mcp_onboarding_visible: bool = false,
+    /// macOS first-run step asking for Documents / Desktop / Downloads.
+    folder_access_onboarding_visible: bool = false,
+    /// Folder-access revision the UI last drew (see `folder_access.zig`).
+    folder_access_seen_revision: u32 = 0,
     provider_onboarding_visible: bool = false,
     provider_onboarding_dismissed: bool = false,
     /// Scroll offset of the onboarding provider list (clamped when drawn).
@@ -1470,7 +1474,8 @@ pub fn installSettingsProvider(self: anytype, row: usize) void {
 pub fn providerUpdateToastView(self: anytype) ?provider_controller.UpdateToastView {
     if (self.settings_controller.modal_visible or
         self.settings_controller.provider_onboarding_visible or
-        self.settings_controller.mcp_onboarding_visible) return null;
+        self.settings_controller.mcp_onboarding_visible or
+        self.settings_controller.folder_access_onboarding_visible) return null;
     const snapshot = self.providerReadinessSnapshot();
     const dismissed = &self.provider_controller.update_toast.dismissed;
     var view: ?provider_controller.UpdateToastView = null;

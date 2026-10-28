@@ -2836,7 +2836,8 @@ fn overlayOwnsKeyboard(state: *const runtime.AppState) bool {
         state.command_controller.open or
         state.workspaceSettingsOpen() or
         state.settings_controller.provider_onboarding_visible or
-        state.settings_controller.mcp_onboarding_visible;
+        state.settings_controller.mcp_onboarding_visible or
+        state.settings_controller.folder_access_onboarding_visible;
 }
 
 fn dropdownOpen(state: *const runtime.AppState) bool {

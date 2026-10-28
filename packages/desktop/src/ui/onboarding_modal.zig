@@ -1,5 +1,7 @@
 //! First-run dialogs: "Connect an AI provider" (with its inline setup
-//! terminal) and "Make Verde work better with your agents" (MCP).
+//! terminal), "Make Verde work better with your agents" (MCP), and on macOS
+//! "Let Verde open your project folders" (privacy prompts, asked while the
+//! user is at the screen).
 //!
 //! One layout pass per dialog feeds the pointer hits, the Tab stops, and the
 //! positioned selectable text lines, so clicking, keyboard focus, drawing,
@@ -20,6 +22,7 @@ const Readiness = runtime.ProviderReadiness;
 const Snapshot = runtime.ProviderReadinessSnapshot;
 const Action = runtime.PaletteModalAction;
 const MissingRequirement = @import("../state/provider_controller.zig").MissingRequirement;
+const folder_access = @import("../state/folder_access.zig");
 
 pub const QueueHit = *const fn (*runtime.AppState, palette.Rect, Action, usize) void;
 
@@ -62,6 +65,12 @@ fn mcpVisible(state: *const runtime.AppState) bool {
     return state.settings_controller.mcp_onboarding_visible and !state.settings_controller.provider_onboarding_visible;
 }
 
+/// The folder step waits behind the provider and MCP dialogs.
+fn folderVisible(state: *const runtime.AppState) bool {
+    const sc = &state.settings_controller;
+    return sc.folder_access_onboarding_visible and !sc.provider_onboarding_visible and !sc.mcp_onboarding_visible;
+}
+
 /// Modals drawn above the onboarding dialogs (see `layout.renderRoot`).
 fn coveredByHigherModal(state: *runtime.AppState) bool {
     return state.settings_controller.modal_visible or
@@ -77,7 +86,7 @@ fn coveredByHigherModal(state: *runtime.AppState) bool {
 /// True when an onboarding dialog is the topmost layer, so it owns keys,
 /// pointer input, and the cursor.
 pub fn onTop(state: *runtime.AppState) bool {
-    return (providerVisible(state) or mcpVisible(state)) and !coveredByHigherModal(state);
+    return (providerVisible(state) or mcpVisible(state) or folderVisible(state)) and !coveredByHigherModal(state);
 }
 
 // ---- provider dialog geometry ------------------------------------------
@@ -320,6 +329,95 @@ fn mcpFooter(modal: palette.Rect) McpFooter {
     };
 }
 
+// ---- folder access dialog geometry ----------------------------------------
+
+const FOLDER_ROW_H_UI: f32 = 54.0;
+const FOLDER_ROW_GAP_UI: f32 = 8.0;
+const FOLDER_ACTION_W_UI: f32 = 124.0;
+const FOLDER_FDA_W_UI: f32 = 200.0;
+/// Title plus a three-line description above the rows.
+const FOLDER_ROWS_TOP_UI: f32 = 112.0;
+
+fn folderRect(width: f32, height: f32) palette.Rect {
+    const modal_w = theme.clampf(width * 0.5, theme.scaledUi(540.0), theme.scaledUi(680.0));
+    const modal_h = theme.clampf(height * 0.62, theme.scaledUi(490.0), theme.scaledUi(520.0));
+    return .{ .x = (width - modal_w) * 0.5, .y = (height - modal_h) * 0.5, .w = modal_w, .h = modal_h };
+}
+
+const FolderLayout = struct {
+    modal: palette.Rect,
+    /// Band holding the three folder rows (arrow keys move within it).
+    rows: palette.Rect,
+    note_y: f32,
+    full_disk: palette.Rect,
+    skip: palette.Rect,
+    primary: palette.Rect,
+};
+
+fn folderLayout(modal: palette.Rect) FolderLayout {
+    const pad = theme.scaledUi(PAD_UI);
+    const row_h = theme.scaledUi(FOLDER_ROW_H_UI);
+    const gap = theme.scaledUi(FOLDER_ROW_GAP_UI);
+    const count: f32 = @floatFromInt(folder_access.FOLDERS.len);
+    const rows: palette.Rect = .{ .x = modal.x + pad, .y = modal.y + pad + theme.scaledUi(FOLDER_ROWS_TOP_UI), .w = modal.w - pad * 2.0, .h = row_h * count + gap * (count - 1.0) };
+    const note_y = rows.y + rows.h + theme.scaledUi(18.0);
+    const button_h = theme.scaledUi(BUTTON_H_UI);
+    const button_y = modal.y + modal.h - pad - button_h;
+    const primary_w = theme.scaledUi(150.0);
+    return .{
+        .modal = modal,
+        .rows = rows,
+        .note_y = note_y,
+        .full_disk = .{ .x = modal.x + pad, .y = note_y + theme.scaledUi(38.0), .w = theme.scaledUi(FOLDER_FDA_W_UI), .h = theme.scaledUi(ACTION_H_UI) },
+        .skip = .{ .x = modal.x + pad, .y = button_y, .w = theme.scaledUi(104.0), .h = button_h },
+        .primary = .{ .x = modal.x + modal.w - pad - primary_w, .y = button_y, .w = primary_w, .h = button_h },
+    };
+}
+
+fn folderRowRect(layout: FolderLayout, index: usize) palette.Rect {
+    const row_h = theme.scaledUi(FOLDER_ROW_H_UI);
+    const gap = theme.scaledUi(FOLDER_ROW_GAP_UI);
+    return .{ .x = layout.rows.x, .y = layout.rows.y + @as(f32, @floatFromInt(index)) * (row_h + gap), .w = layout.rows.w, .h = row_h };
+}
+
+fn folderActionRect(row: palette.Rect) palette.Rect {
+    const w = theme.scaledUi(FOLDER_ACTION_W_UI);
+    const h = theme.scaledUi(ACTION_H_UI);
+    return .{ .x = row.x + row.w - theme.scaledUi(12.0) - w, .y = row.y + (row.h - h) * 0.5, .w = w, .h = h };
+}
+
+/// Row button: ask macOS, or (denied) open System Settings. Asked, found,
+/// and missing folders need nothing.
+fn folderActionLabel(status: folder_access.Status) ?[]const u8 {
+    return switch (status) {
+        .unknown => "Allow",
+        .denied => "Open Settings",
+        .checking, .granted, .missing => null,
+    };
+}
+
+fn folderStatusText(status: folder_access.Status) []const u8 {
+    return switch (status) {
+        .unknown => "Not asked yet",
+        .checking => "Waiting for your answer in the macOS prompt...",
+        .granted => "Allowed",
+        .denied => "Not allowed. Turn it on in System Settings > Files and Folders.",
+        .missing => "This Mac has no such folder.",
+    };
+}
+
+fn folderStatusColor(status: folder_access.Status) [4]f32 {
+    return switch (status) {
+        .granted => theme.success(),
+        .denied => theme.COLOR_YELLOW,
+        .unknown, .checking, .missing => theme.COLOR_TEXT_MUTED,
+    };
+}
+
+fn folderPrimaryLabel() []const u8 {
+    return if (folder_access.anyUnasked()) "Allow all" else "Done";
+}
+
 // ---- hits and Tab stops ---------------------------------------------------
 
 /// The dialog box itself, from the last layout pass.
@@ -344,6 +442,8 @@ fn layoutPass(state: *runtime.AppState, width: f32, height: f32, queue_hit: Queu
         registerProviderHits(state, width, height, queue_hit);
     } else if (mcpVisible(state)) {
         registerMcpHits(state, width, height, queue_hit);
+    } else if (folderVisible(state)) {
+        registerFolderHits(state, width, height, queue_hit);
     } else {
         resetInput();
         return;
@@ -426,6 +526,26 @@ fn registerMcpHits(state: *runtime.AppState, width: f32, height: f32, queue_hit:
     recordStop(.mcp_onboarding_enable, 0, footer.enable, null);
 }
 
+fn registerFolderHits(state: *runtime.AppState, width: f32, height: f32, queue_hit: QueueHit) void {
+    const layout = folderLayout(folderRect(width, height));
+    active_modal = layout.modal;
+    registerChromeHits(state, width, height, layout.modal, false, queue_hit);
+    // Visual order: rows top to bottom, Full Disk Access, then the footer.
+    for (folder_access.FOLDERS, 0..) |folder, index| {
+        if (folderActionLabel(folder_access.status(folder)) == null) continue;
+        const action = folderActionRect(folderRowRect(layout, index));
+        queue_hit(state, action, .folder_access_row, index);
+        // The row band as clip marks these as a list for Up/Down.
+        recordStop(.folder_access_row, index, action, layout.rows);
+    }
+    queue_hit(state, layout.full_disk, .folder_access_full_disk, 0);
+    queue_hit(state, layout.skip, .folder_access_skip, 0);
+    queue_hit(state, layout.primary, .folder_access_primary, 0);
+    recordStop(.folder_access_full_disk, 0, layout.full_disk, null);
+    recordStop(.folder_access_skip, 0, layout.skip, null);
+    recordStop(.folder_access_primary, 0, layout.primary, null);
+}
+
 /// One-shot scroll that brings the highlighted row (a model picked from an
 /// unconnected provider, or a Settings action) into view, and moves focus
 /// to its Install / Sign in without showing the ring.
@@ -448,6 +568,10 @@ pub fn ownsAction(action: Action) bool {
     return switch (action) {
         .mcp_onboarding_not_now,
         .mcp_onboarding_enable,
+        .folder_access_skip,
+        .folder_access_primary,
+        .folder_access_row,
+        .folder_access_full_disk,
         .provider_onboarding_close,
         .provider_onboarding_recheck,
         .provider_onboarding_open_guide,
@@ -472,6 +596,17 @@ fn activate(state: *runtime.AppState, action: Action, index: usize) void {
     switch (action) {
         .mcp_onboarding_not_now => state.completeMcpOnboarding(false),
         .mcp_onboarding_enable => state.completeMcpOnboarding(true),
+        .folder_access_skip => state.completeFolderAccessOnboarding(),
+        .folder_access_primary => activatePrimary(state),
+        .folder_access_row => if (index < folder_access.FOLDERS.len) {
+            const folder = folder_access.FOLDERS[index];
+            switch (folder_access.status(folder)) {
+                .unknown => state.requestFolderAccess(folder),
+                .denied => state.openPrivacySettings(false),
+                else => {},
+            }
+        },
+        .folder_access_full_disk => state.openPrivacySettings(true),
         .provider_onboarding_close => state.dismissProviderOnboarding(),
         .provider_onboarding_recheck => if (!state.settings_controller.provider_setup.visible()) state.recheckProviderReadiness() else switch (provider_setup.primaryAction(state)) {
             .none => {},
@@ -495,6 +630,17 @@ fn activate(state: *runtime.AppState, action: Action, index: usize) void {
         .provider_onboarding_copy => if (index < PROVIDERS.len) provider_setup.copyCommand(state, PROVIDERS[index]),
         .provider_setup_back => provider_setup.back(state),
         else => {},
+    }
+    state.markDirty();
+}
+
+/// The folder dialog's primary button (and Enter with nothing focused):
+/// ask for every unasked folder, or close once all were answered.
+pub fn activatePrimary(state: *runtime.AppState) void {
+    if (folder_access.anyUnasked()) {
+        state.requestFolderAccess(null);
+    } else {
+        state.completeFolderAccessOnboarding();
     }
     state.markDirty();
 }
@@ -603,8 +749,14 @@ fn handleFocusKeyDown(state: *runtime.AppState, event: *const palette.event.KeyE
                 return true;
             }
             if (event.key == .space) return false;
-            // Nothing focused: Enter checks again / enables, as before.
-            if (providerVisible(state)) state.recheckProviderReadiness() else state.completeMcpOnboarding(true);
+            // Nothing focused: Enter runs the dialog's primary action.
+            if (providerVisible(state)) {
+                state.recheckProviderReadiness();
+            } else if (mcpVisible(state)) {
+                state.completeMcpOnboarding(true);
+            } else {
+                activatePrimary(state);
+            }
             return true;
         },
         .up, .down => {
@@ -674,8 +826,10 @@ pub fn handleKeyDown(state: *runtime.AppState, event: *const palette.event.KeyEv
                 provider_setup.back(state);
             } else if (providerVisible(state)) {
                 state.dismissProviderOnboarding();
-            } else {
+            } else if (mcpVisible(state)) {
                 state.completeMcpOnboarding(false);
+            } else {
+                state.completeFolderAccessOnboarding();
             }
             state.markDirty();
             return true;
@@ -726,7 +880,8 @@ fn drawFocusRing(state: *runtime.AppState) void {
 /// actions and a row's Sign in (an Install button is muted).
 fn stopIsAccentFilled(state: *runtime.AppState, stop: FocusStop) bool {
     return switch (stop.action) {
-        .provider_onboarding_recheck, .mcp_onboarding_enable => true,
+        .provider_onboarding_recheck, .mcp_onboarding_enable, .folder_access_primary => true,
+        .folder_access_row => stop.index < folder_access.FOLDERS.len and folder_access.status(folder_access.FOLDERS[stop.index]) == .unknown,
         .provider_onboarding_action => stop.index < PROVIDERS.len and actionAccented(provider_setup.readinessSnapshot(state), PROVIDERS[stop.index]),
         else => false,
     };
@@ -749,6 +904,9 @@ const TextBlock = enum(u8) {
     mcp_benefit_title,
     mcp_benefit_detail,
     mcp_note,
+    folder_description,
+    folder_row_status,
+    folder_note,
 };
 
 fn blockId(kind: TextBlock, index: usize) u32 {
@@ -1268,9 +1426,15 @@ pub fn systemCursorAt(state: *runtime.AppState, x: f32, y: f32) ?palette.platfor
 pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     text_line_count = 0;
     last_list_rect = null;
-    if (!providerVisible(state) and !mcpVisible(state)) return;
+    if (!providerVisible(state) and !mcpVisible(state) and !folderVisible(state)) return;
     layoutPass(state, width, height, noQueue);
-    if (providerVisible(state)) renderProvider(state, width, height) else renderMcp(state, width, height);
+    if (providerVisible(state)) {
+        renderProvider(state, width, height);
+    } else if (mcpVisible(state)) {
+        renderMcp(state, width, height);
+    } else {
+        renderFolder(state, width, height);
+    }
     drawTextSelection(state);
     drawFocusRing(state);
     drawTextMenu(state);
@@ -1603,6 +1767,57 @@ fn renderMcp(state: *runtime.AppState, width: f32, height: f32) void {
     drawButton(state, footer.enable, "Enable Verde tools", theme.accent(), null);
 }
 
+// Renders the macOS folder step: why, one row per protected folder with its
+// answer, the Full Disk Access alternative, and Skip / Allow all.
+fn renderFolder(state: *runtime.AppState, width: f32, height: f32) void {
+    const layout = folderLayout(folderRect(width, height));
+    const modal = layout.modal;
+    drawChrome(state, width, height, modal);
+    const pad = theme.scaledUi(PAD_UI);
+    const content_w = modal.w - pad * 2.0;
+    const y = modal.y + pad;
+
+    queueRoleText(state, .{ .x = modal.x + pad, .y = y, .w = content_w, .h = theme.scaledUi(28.0) }, "Let Verde open your project folders", theme.COLOR_WHITE, theme.scaledUi(22.0), TEXT_ROLE, modal);
+    _ = drawSelectable(state, .folder_description, 0, .{ .x = modal.x + pad, .y = y + theme.scaledUi(36.0), .w = content_w, .h = 0.0 }, "macOS asks once before an app opens Documents, Desktop, or Downloads. Answer now, so agents and your other devices are never stuck behind a prompt on this Mac that nobody is there to click.", theme.COLOR_TEXT_SUBTLE, theme.scaledUi(13.5), TEXT_ROLE, modal, 3);
+
+    for (folder_access.FOLDERS, 0..) |folder, index| {
+        renderFolderRow(state, folderRowRect(layout, index), index, folder, modal);
+    }
+
+    _ = drawSelectable(state, .folder_note, 0, .{ .x = modal.x + pad, .y = layout.note_y, .w = content_w, .h = 0.0 }, "Rather never see these prompts? Turn on Full Disk Access for Verde in System Settings.", theme.COLOR_TEXT_SUBTLE, theme.scaledUi(12.0), TEXT_ROLE, modal, 2);
+    drawButton(state, layout.full_disk, "Open Full Disk Access", theme.COLOR_PANEL_ALT, null);
+
+    drawButton(state, layout.skip, "Skip", theme.COLOR_PANEL_ALT, null);
+    drawButton(state, layout.primary, folderPrimaryLabel(), theme.accent(), null);
+}
+
+// One protected folder: status dot, name and path, its answer, and the
+// Allow / Open Settings button when there is something to do.
+fn renderFolderRow(state: *runtime.AppState, rect: palette.Rect, index: usize, folder: folder_access.Folder, clip: palette.Rect) void {
+    const status = folder_access.status(folder);
+    const status_color = folderStatusColor(status);
+    state.palette_overlay_batch.panel(state.allocator, snapRect(rect), paletteColor(theme.sink(theme.COLOR_PANEL_ALT, 0.025)), paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 190)), theme.scaledUi(ROW_RADIUS_UI), crispStroke(1.0)) catch {};
+    const top = theme.scaledUi(8.0);
+    const dot = theme.scaledUi(8.0);
+    state.palette_overlay_batch.roundedRect(state.allocator, .{ .x = rect.x + theme.scaledUi(14.0), .y = rect.y + top + (theme.scaledUi(20.0) - dot) * 0.5, .w = dot, .h = dot }, paletteColor(status_color), dot * 0.5) catch {};
+
+    const text_x = rect.x + theme.scaledUi(TEXT_INSET_UI);
+    const label = folderActionLabel(status);
+    const action = folderActionRect(rect);
+    const right_edge = if (label != null) action.x - theme.scaledUi(12.0) else rect.x + rect.w - theme.scaledUi(12.0);
+    const text_clip = rectIntersection(.{ .x = text_x, .y = rect.y, .w = @max(right_edge - text_x, 0.0), .h = rect.h }, clip);
+    // "Documents  ~/Documents" on the first line, the answer below.
+    const title_size = theme.scaledUi(14.5);
+    const title_w = text_measure.textWidth(TEXT_ROLE, title_size, folder.label());
+    queueRoleText(state, .{ .x = text_x, .y = rect.y + top, .w = title_w + theme.scaledUi(2.0), .h = title_size * 1.25 }, folder.label(), theme.COLOR_WHITE, title_size, TEXT_ROLE, text_clip);
+    const path_size = theme.scaledUi(12.0);
+    const path_x = text_x + title_w + theme.scaledUi(10.0);
+    queueRoleText(state, .{ .x = path_x, .y = rect.y + top + theme.scaledUi(1.5), .w = @max(right_edge - path_x, 0.0), .h = path_size * 1.25 }, folder.displayPath(), theme.COLOR_TEXT_MUTED, path_size, TEXT_ROLE, text_clip);
+    _ = drawSelectable(state, .folder_row_status, index, .{ .x = text_x, .y = rect.y + top + theme.scaledUi(21.0), .w = @max(right_edge - text_x, 0.0), .h = 0.0 }, folderStatusText(status), status_color, theme.scaledUi(12.0), TEXT_ROLE, clip, 1);
+
+    if (label) |text| drawButton(state, action, text, if (status == .unknown) theme.accent() else theme.COLOR_PANEL_ALT, null);
+}
+
 // One capability included with Verde's MCP server: a plain bulleted line
 // pair, no card, so it reads as information rather than a control.
 fn renderBenefitRow(state: *runtime.AppState, rect: palette.Rect, index: usize, title: []const u8, detail: []const u8, clip: palette.Rect) void {
@@ -1706,6 +1921,28 @@ test "provider rows cover every provider with an installer, Muse included" {
     }
     try std.testing.expect(std.mem.indexOfScalar(Provider, &PROVIDERS, .muse) != null);
     try std.testing.expect(std.mem.indexOfScalar(Provider, &PROVIDERS, .fx) != null);
+}
+
+test "folder dialog keeps rows, Full Disk Access, and footer apart" {
+    theme.applyTheme(1.0);
+    for ([_][2]f32{ .{ 1280.0, 900.0 }, .{ 1024.0, 640.0 }, .{ 2560.0, 1440.0 } }) |size| {
+        const layout = folderLayout(folderRect(size[0], size[1]));
+        const last_row = folderRowRect(layout, folder_access.FOLDERS.len - 1);
+        try std.testing.expect(last_row.y + last_row.h <= layout.note_y);
+        try std.testing.expect(layout.full_disk.y + layout.full_disk.h < layout.skip.y);
+        try std.testing.expect(layout.skip.x + layout.skip.w < layout.primary.x);
+        try std.testing.expect(layout.primary.x + layout.primary.w <= layout.modal.x + layout.modal.w);
+        const action = folderActionRect(folderRowRect(layout, 0));
+        try std.testing.expect(action.x > layout.rows.x and action.x + action.w < layout.rows.x + layout.rows.w);
+    }
+}
+
+test "folder rows offer Allow until asked and Settings once denied" {
+    try std.testing.expectEqualStrings("Allow", folderActionLabel(.unknown).?);
+    try std.testing.expectEqualStrings("Open Settings", folderActionLabel(.denied).?);
+    try std.testing.expect(folderActionLabel(.checking) == null);
+    try std.testing.expect(folderActionLabel(.granted) == null);
+    try std.testing.expect(folderActionLabel(.missing) == null);
 }
 
 test "Back never sits where Not now was" {

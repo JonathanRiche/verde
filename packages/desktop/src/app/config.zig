@@ -430,6 +430,8 @@ pub const AppConfig = struct {
     // detected agent's global configuration outside Verde's own config dir.
     mcp_integration_enabled: bool = false,
     mcp_onboarding_completed: bool = false,
+    // macOS first-run folder-access step answered (Done or Skip).
+    folder_access_onboarding_completed: bool = false,
     // Fire a desktop notification when an agent surface finishes (transitions
     // to `.done`). Defaults on so the feature works without first opening
     // Settings; users can disable it from the Settings cog / verde.json.
@@ -992,6 +994,7 @@ fn writeIntegrationsSection(allocator: std.mem.Allocator, object: *std.json.Obje
     const integrations_object = try objectSection(allocator, object, "integrations");
     try integrations_object.put(allocator, "mcp_enabled", .{ .bool = config.mcp_integration_enabled });
     try integrations_object.put(allocator, "mcp_onboarding_completed", .{ .bool = config.mcp_onboarding_completed });
+    try integrations_object.put(allocator, "folder_access_onboarding_completed", .{ .bool = config.folder_access_onboarding_completed });
 }
 
 fn colorToHex(allocator: std.mem.Allocator, color: [4]f32) ![]u8 {
@@ -1352,6 +1355,13 @@ fn applyIntegrationsOverrides(config: *AppConfig, integrations_value: std.json.V
             config.mcp_onboarding_completed = completed_value.bool;
         } else {
             log.warn("integrations.mcp_onboarding_completed must be a boolean when provided", .{});
+        }
+    }
+    if (integrations_value.object.get("folder_access_onboarding_completed")) |completed_value| {
+        if (completed_value == .bool) {
+            config.folder_access_onboarding_completed = completed_value.bool;
+        } else {
+            log.warn("integrations.folder_access_onboarding_completed must be a boolean when provided", .{});
         }
     }
 }

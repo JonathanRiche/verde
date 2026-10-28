@@ -121,7 +121,7 @@ export const CHAT_KEYS = [
 
 export const UPDATES_KEYS = ['check_automatically'] as const
 export const NOTIFICATIONS_KEYS = ['enabled'] as const
-export const INTEGRATIONS_KEYS = ['mcp_enabled', 'mcp_onboarding_completed'] as const
+export const INTEGRATIONS_KEYS = ['mcp_enabled', 'mcp_onboarding_completed', 'folder_access_onboarding_completed'] as const
 
 export const KEYBIND_TOP_KEYS = [
   'refresh',
@@ -825,6 +825,7 @@ export const verdeConfigSchema: JsonSchema = {
     integrations: closedObject({
       mcp_enabled: { type: 'boolean' },
       mcp_onboarding_completed: { type: 'boolean' },
+      folder_access_onboarding_completed: { type: 'boolean' },
     }),
     keybinds: keybindsSchema,
   },
