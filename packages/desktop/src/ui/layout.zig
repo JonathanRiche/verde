@@ -2062,6 +2062,7 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
         }
         if (!down) return true;
         if (state.settings_controller.modal_visible) settings_modal.noteClickedHit(hit.action, hit.index);
+        if (state.commitSheetOpen()) commit_sheet.noteClickedHit(hit.action, hit.index);
         switch (hit.action) {
             .mcp_onboarding_not_now,
             .mcp_onboarding_enable,
@@ -2709,11 +2710,15 @@ fn commitSheetOwnsKeys(state: *runtime.AppState) bool {
         !state.runtime_connections.wizard_open;
 }
 
-/// Commit-dialog keys: Ctrl+Enter runs the primary action, Enter adds a
-/// newline in the message, and Up/Down/Home/End follow wrapped lines.
+/// Commit-dialog keys: Tab/arrows/Enter/Space move and activate keyboard
+/// focus (see commit_sheet.handleKeyDown); Ctrl+Enter runs the primary
+/// action, Enter adds a newline in the message, and Up/Down/Home/End follow
+/// wrapped lines.
 /// Everything else falls through to the shared modal text editing path. In
 /// the default-branch confirmation Enter creates a branch and continues.
 fn handleCommitSheetKeyDown(state: *runtime.AppState, event: *const palette.event.KeyEvent) bool {
+    // Tab focus, arrows, and Enter/Space on the focused control.
+    if (commit_sheet.handleKeyDown(state, event)) return true;
     const sheet = state.commitSheet() orelse {
         if (state.gitQuickConfirm() == null) return false;
         switch (event.key) {

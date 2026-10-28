@@ -522,6 +522,9 @@ fn registerConfirmHits(state: *runtime.AppState, quick: *const Quick, width: f32
     queue_hit(state, geo.abort, .commit_sheet_control, @intFromEnum(Control.confirm_abort));
     queue_hit(state, geo.direct, .commit_sheet_control, @intFromEnum(Control.confirm_direct));
     queue_hit(state, geo.branch, .commit_sheet_control, @intFromEnum(Control.confirm_branch));
+    recordStop(.commit_sheet_control, @intFromEnum(Control.confirm_abort), geo.abort, .footer);
+    recordStop(.commit_sheet_control, @intFromEnum(Control.confirm_direct), geo.direct, .footer);
+    recordStop(.commit_sheet_control, @intFromEnum(Control.confirm_branch), geo.branch, .footer);
 }
 
 fn renderConfirm(state: *runtime.AppState, quick: *const Quick, width: f32, height: f32) void {
@@ -539,6 +542,7 @@ fn renderConfirm(state: *runtime.AppState, quick: *const Quick, width: f32, heig
     drawSecondaryButton(state, geo.abort, "Abort", true, modal);
     drawSecondaryButton(state, geo.direct, text.direct, true, modal);
     drawActionButton(state, geo.branch, CONFIRM_BRANCH_LABEL, true, modal);
+    drawFocusRing(state, full, null);
 }
 
 // ------------------------------------------------------------------
@@ -550,27 +554,43 @@ pub const QueueHit = *const fn (*runtime.AppState, palette.Rect, runtime.Palette
 /// Registers the dialog's (or the confirmation's) hit targets; later hits win.
 pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit: QueueHit) void {
     const sheet = state.commitSheet() orelse {
-        if (state.gitQuickConfirm()) |quick| registerConfirmHits(state, quick, width, height, queue_hit);
+        if (state.gitQuickConfirm()) |quick| {
+            beginFocusPass(.confirm);
+            registerConfirmHits(state, quick, width, height, queue_hit);
+            endFocusPass();
+        } else {
+            beginFocusPass(.none);
+        }
         return;
     };
+    beginFocusPass(.sheet);
+    defer endFocusPass();
     var layout = Layout.init(sheet, width, height);
     defer layout.deinit();
     const geo = &layout.geo;
+    focus_list = geo.list;
+    focus_list_max_scroll = @max(0.0, contentHeight(layout.rows) - geo.list.h);
     queue_hit(state, .{ .x = 0, .y = 0, .w = width, .h = height }, if (sheet.busy != null) .modal_block else .modal_dismiss, 0);
     queue_hit(state, geo.modal, .modal_block, 0);
 
     const locked = sheet.locked();
     if (sheet.phase == .ready) {
         if (!locked) {
+            // Tab order follows the screen: diffs toggle, file rows, message.
+            recordStop(.commit_sheet_control, @intFromEnum(Control.edit_toggle), geo.edit, .single);
             for (layout.rows) |row| {
                 const rect = rowRect(row, geo.list, sheet.scroll_y);
-                const visible = intersect(rect, geo.list) orelse continue;
+                // Stops keep the unclipped rect so focus can scroll a row
+                // into view; hits only cover the visible part.
+                const visible = intersect(rect, geo.list);
                 switch (row.kind) {
                     .file => {
                         const found = sheet.fileAt(row.file) orelse continue;
+                        recordStop(.commit_sheet_file_toggle, row.file, rect, .list);
+                        const shown = visible orelse continue;
                         // Clicking a row ticks it; the chevron beside the
                         // checkbox expands its hunks.
-                        queue_hit(state, visible, .commit_sheet_file_toggle, row.file);
+                        queue_hit(state, shown, .commit_sheet_file_toggle, row.file);
                         if (expandable(found.file)) {
                             if (intersect(chevronColumn(rect), geo.list)) |chevron| queue_hit(state, chevron, .commit_sheet_file_expand, row.file);
                         }
@@ -578,11 +598,16 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
                     .hunk => {
                         const found = sheet.fileAt(row.file) orelse continue;
                         if (!git_changes.canSelectHunks(found.file)) continue;
-                        queue_hit(state, visible, .commit_sheet_hunk_toggle, (row.file << 16) | row.hunk);
+                        const packed_index = (row.file << 16) | row.hunk;
+                        recordStop(.commit_sheet_hunk_toggle, packed_index, rect, .list);
+                        const shown = visible orelse continue;
+                        queue_hit(state, shown, .commit_sheet_hunk_toggle, packed_index);
                     },
                     else => {},
                 }
             }
+            recordStop(.commit_sheet_message_input, 0, geo.message, .single);
+            recordStop(.commit_sheet_control, @intFromEnum(Control.regenerate), geo.regenerate, .single);
         }
         // Remember the message field so drags and line navigation map onto
         // the same wrap as the frame being drawn.
@@ -604,6 +629,21 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
         if (geo.primary) |rect| queue_hit(state, rect, .commit_sheet_control, @intFromEnum(Control.reload));
     }
     if (sheet.busy == null) queue_hit(state, geo.cancel, .commit_sheet_control, @intFromEnum(Control.cancel));
+
+    // Footer stops, left to right.
+    if (sheet.busy == null) recordStop(.commit_sheet_control, @intFromEnum(Control.cancel), geo.cancel, .footer);
+    switch (sheet.phase) {
+        .ready => if (!locked) {
+            if (geo.new_branch) |rect| recordStop(.commit_sheet_control, @intFromEnum(Control.new_branch), rect, .footer);
+            if (geo.alternate) |rect| recordStop(.commit_sheet_control, @intFromEnum(Control.alternate), rect, .footer);
+            if (geo.primary) |rect| recordStop(.commit_sheet_control, @intFromEnum(Control.primary), rect, .footer);
+        },
+        .result => if (geo.primary) |rect| {
+            if (!sheet.pull_push_busy) recordStop(.commit_sheet_control, @intFromEnum(Control.pull_push), rect, .footer);
+        },
+        .load_error => if (geo.primary) |rect| recordStop(.commit_sheet_control, @intFromEnum(Control.reload), rect, .footer),
+        .loading => {},
+    }
 }
 
 /// Applies a `commit_sheet_control` hit.
@@ -672,6 +712,305 @@ pub fn handleWheel(state: *runtime.AppState, width: f32, height: f32, x: f32, y:
     }
     // The dialog is modal: wheel never reaches the panes underneath.
     return true;
+}
+
+// ------------------------------------------------------------------
+// Keyboard focus
+// ------------------------------------------------------------------
+//
+// Same model as the settings and onboarding modals: `registerHits` rebuilds
+// the Tab stops in visual order every pass, focus is tracked by identity
+// (action + index), and the ring shows only after keyboard input. Tab and
+// Shift+Tab cycle every stop; arrows move within the file list (Up/Down,
+// Left/Right collapse/expand) and along the footer buttons (Left/Right);
+// Enter/Space run the same action as a click.
+
+const Action = runtime.PaletteModalAction;
+
+const StopGroup = enum { single, list, footer };
+
+const FocusStop = struct {
+    action: Action,
+    index: usize,
+    /// Unclipped, so focus can scroll a list row into view.
+    rect: palette.Rect,
+    group: StopGroup,
+};
+
+const FocusRef = struct { action: Action, index: usize };
+
+/// Which dialog the stops belong to; switching resets focus.
+const FocusOwner = enum { none, sheet, confirm };
+
+const MAX_FOCUS_STOPS: usize = 1024;
+
+var focus_stops: [MAX_FOCUS_STOPS]FocusStop = undefined;
+var focus_stop_count: usize = 0;
+var focus_owner: FocusOwner = .none;
+var keyboard_focus: ?FocusRef = null;
+var focus_ring_visible: bool = false;
+/// File list viewport and its scroll range from the last hit pass.
+var focus_list: palette.Rect = .{};
+var focus_list_max_scroll: f32 = 0.0;
+
+fn beginFocusPass(owner: FocusOwner) void {
+    focus_stop_count = 0;
+    if (owner == focus_owner) return;
+    focus_owner = owner;
+    focus_ring_visible = false;
+    // The confirmation starts on its default action, so Enter (and the
+    // first arrow press) works from the moment it appears.
+    keyboard_focus = if (owner == .confirm)
+        .{ .action = .commit_sheet_control, .index = @intFromEnum(Control.confirm_branch) }
+    else
+        null;
+}
+
+fn endFocusPass() void {
+    if (keyboard_focus != null and focusedStopIndex() == null) {
+        keyboard_focus = null;
+        focus_ring_visible = false;
+    }
+}
+
+fn recordStop(action: Action, index: usize, rect: palette.Rect, group: StopGroup) void {
+    if (focus_stop_count >= MAX_FOCUS_STOPS) return;
+    if (rect.w <= 0.0 or rect.h <= 0.0) return;
+    focus_stops[focus_stop_count] = .{ .action = action, .index = index, .rect = rect, .group = group };
+    focus_stop_count += 1;
+}
+
+fn stopIndexFor(action: Action, index: usize) ?usize {
+    for (focus_stops[0..focus_stop_count], 0..) |stop, i| {
+        if (stop.action == action and stop.index == index) return i;
+    }
+    return null;
+}
+
+fn focusedStopIndex() ?usize {
+    const focus = keyboard_focus orelse return null;
+    return stopIndexFor(focus.action, focus.index);
+}
+
+/// The message field counts as focused whenever it holds the caret, even
+/// when it got there by a click.
+fn currentStopIndex(state: *const runtime.AppState) ?usize {
+    if (state.palette_modal_text_focus == .commit_message) {
+        if (stopIndexFor(.commit_sheet_message_input, 0)) |index| return index;
+    }
+    return focusedStopIndex();
+}
+
+fn focusMessageField(state: *runtime.AppState) void {
+    const sheet = state.commitSheet() orelse return;
+    if (sheet.locked()) return;
+    if (state.palette_modal_text_focus != .commit_message) {
+        state.palette_modal_text_focus = .commit_message;
+        state.modal_text_selection_anchor = null;
+        sheet.message_cursor = sheet.message().len;
+    }
+    state.modal_text_drag_active = false;
+}
+
+fn blurMessageField(state: *runtime.AppState) void {
+    if (state.palette_modal_text_focus != .commit_message) return;
+    state.palette_modal_text_focus = .none;
+    state.modal_text_selection_anchor = null;
+    state.modal_text_drag_active = false;
+}
+
+fn setFocus(state: *runtime.AppState, stop_index: usize) void {
+    const stop = focus_stops[stop_index];
+    keyboard_focus = .{ .action = stop.action, .index = stop.index };
+    focus_ring_visible = true;
+    if (stop.action == .commit_sheet_message_input) focusMessageField(state) else blurMessageField(state);
+    if (stop.group == .list) {
+        if (state.commitSheet()) |sheet| {
+            // Scroll just enough to reveal the row plus a small margin.
+            const margin = scaled(4.0);
+            const bottom = stop.rect.y + stop.rect.h;
+            const list_bottom = focus_list.y + focus_list.h;
+            if (stop.rect.y < focus_list.y) {
+                sheet.scroll_y = @max(0.0, sheet.scroll_y - (focus_list.y - stop.rect.y + margin));
+            } else if (bottom > list_bottom) {
+                sheet.scroll_y = @min(focus_list_max_scroll, sheet.scroll_y + bottom - list_bottom + margin);
+            }
+        }
+    }
+    state.markDirty();
+}
+
+/// Tab / Shift+Tab, wrapping at either end.
+fn moveFocus(state: *runtime.AppState, forward: bool) void {
+    const n = focus_stop_count;
+    if (n == 0) return;
+    const start = currentStopIndex(state) orelse {
+        setFocus(state, if (forward) 0 else n - 1);
+        return;
+    };
+    setFocus(state, if (forward) (start + 1) % n else (start + n - 1) % n);
+}
+
+/// Arrow step to the neighboring stop in the same group; stops at the ends.
+fn stepInGroup(state: *runtime.AppState, from: usize, forward: bool) void {
+    const group = focus_stops[from].group;
+    var i = from;
+    while (if (forward) i + 1 < focus_stop_count else i > 0) {
+        i = if (forward) i + 1 else i - 1;
+        if (focus_stops[i].group == group) {
+            setFocus(state, i);
+            return;
+        }
+    }
+    // Already at the edge: still show where focus is.
+    setFocus(state, from);
+}
+
+fn edgeOfGroup(group: StopGroup, first: bool) ?usize {
+    var i: usize = 0;
+    while (i < focus_stop_count) : (i += 1) {
+        const index = if (first) i else focus_stop_count - 1 - i;
+        if (focus_stops[index].group == group) return index;
+    }
+    return null;
+}
+
+/// Runs the same action a click on the stop would.
+fn activateStop(state: *runtime.AppState, stop: FocusStop) void {
+    switch (stop.action) {
+        .commit_sheet_control => applyControl(state, stop.index),
+        .commit_sheet_file_toggle => state.commitSheetToggleFile(stop.index),
+        .commit_sheet_hunk_toggle => applyHunkToggle(state, stop.index),
+        .commit_sheet_message_input => focusMessageField(state),
+        else => {},
+    }
+    state.markDirty();
+}
+
+/// Left/Right on a file row collapses/expands its diff; Left on a hunk
+/// returns to its file.
+fn handleListHorizontal(state: *runtime.AppState, stop: FocusStop, expand: bool) void {
+    const sheet = state.commitSheet() orelse return;
+    switch (stop.action) {
+        .commit_sheet_file_toggle => {
+            const found = sheet.fileAt(stop.index) orelse return;
+            if (!expandable(found.file) or stop.index >= sheet.expanded.len) return;
+            if (sheet.expanded[stop.index] != expand) state.commitSheetToggleExpanded(stop.index);
+        },
+        .commit_sheet_hunk_toggle => if (!expand) {
+            if (stopIndexFor(.commit_sheet_file_toggle, stop.index >> 16)) |file_stop| setFocus(state, file_stop);
+        },
+        else => {},
+    }
+}
+
+/// Keyboard navigation for the dialog and the confirmation. Returns false
+/// for keys it leaves to the caller (message editing, Escape, shortcuts).
+pub fn handleKeyDown(state: *runtime.AppState, event: *const palette.event.KeyEvent) bool {
+    if (event.mod.primary() or event.mod.alt) return false;
+    const key = event.key;
+    if (key == .tab) {
+        moveFocus(state, !event.mod.shift);
+        return true;
+    }
+    // While the message holds the caret, keys edit text.
+    if (state.palette_modal_text_focus == .commit_message) return false;
+    const current = currentStopIndex(state);
+    switch (key) {
+        .@"return", .kp_enter, .space => {
+            const index = current orelse return false;
+            const stop = focus_stops[index];
+            // Space would also arrive as typed text once the field holds
+            // the caret; only Enter enters the message.
+            if (key == .space and stop.action == .commit_sheet_message_input) return true;
+            focus_ring_visible = true;
+            activateStop(state, stop);
+            return true;
+        },
+        .left, .right => {
+            const index = current orelse {
+                if (edgeOfGroup(.footer, key == .left)) |edge| setFocus(state, edge);
+                return true;
+            };
+            const stop = focus_stops[index];
+            switch (stop.group) {
+                .footer => stepInGroup(state, index, key == .right),
+                .list => {
+                    focus_ring_visible = true;
+                    handleListHorizontal(state, stop, key == .right);
+                    state.markDirty();
+                },
+                .single => {},
+            }
+            return true;
+        },
+        .up, .down => {
+            const index = current orelse {
+                if (edgeOfGroup(.list, key == .down)) |edge| setFocus(state, edge);
+                return true;
+            };
+            if (focus_stops[index].group == .list) stepInGroup(state, index, key == .down);
+            return true;
+        },
+        .home, .end => {
+            const index = current orelse return false;
+            const group = focus_stops[index].group;
+            if (group == .single) return false;
+            if (edgeOfGroup(group, key == .home)) |edge| setFocus(state, edge);
+            return true;
+        },
+        else => return false,
+    }
+}
+
+/// A click moves focus to the clicked control without showing the ring, so
+/// a following Tab continues from there.
+pub fn noteClickedHit(action: Action, index: usize) void {
+    focus_ring_visible = false;
+    if (stopIndexFor(action, index) != null) keyboard_focus = .{ .action = action, .index = index };
+}
+
+/// Accent ring around the keyboard-focused control. The message field shows
+/// focus with its own accent border, so it gets none. List rows draw the
+/// ring inside the row so the list viewport does not clip it.
+fn drawFocusRing(state: *runtime.AppState, full: palette.Rect, layout: ?*const Layout) void {
+    if (!focus_ring_visible) return;
+    const index = currentStopIndex(state) orelse return;
+    const stop = focus_stops[index];
+    if (stop.action == .commit_sheet_message_input) return;
+    var rect = stop.rect;
+    var clip = full;
+    if (stop.group == .list) {
+        // Keys may have scrolled the list since the hit pass; place the ring
+        // on the row as drawn this frame.
+        const current = layout orelse return;
+        const sheet = state.commitSheet() orelse return;
+        rect = focusedRowRect(current, sheet, stop) orelse return;
+        clip = current.geo.list;
+    }
+    const ring_w = @max(1.0, @round(scaled(2.0)));
+    const offset: f32 = if (stop.group == .list) -ring_w else ring_w;
+    const left = @round(rect.x - offset);
+    const top = @round(rect.y - offset);
+    const ring: palette.Rect = .{
+        .x = left,
+        .y = top,
+        .w = @round(rect.x + rect.w + offset) - left,
+        .h = @round(rect.y + rect.h + offset) - top,
+    };
+    border(state, ring, theme.accent(), scaled(7.0) + @max(offset, 0.0), ring_w, clip);
+}
+
+fn focusedRowRect(layout: *const Layout, sheet: *const Sheet, stop: FocusStop) ?palette.Rect {
+    for (layout.rows) |row| {
+        const matches = switch (stop.action) {
+            .commit_sheet_file_toggle => row.kind == .file and row.file == stop.index,
+            .commit_sheet_hunk_toggle => row.kind == .hunk and ((row.file << 16) | row.hunk) == stop.index,
+            else => false,
+        };
+        if (matches) return rowRect(row, layout.geo.list, sheet.scroll_y);
+    }
+    return null;
 }
 
 // ------------------------------------------------------------------
@@ -939,6 +1278,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         .load_error => if (geo.primary) |rect| drawActionButton(state, rect, "Retry", true, modal),
         .loading => {},
     }
+    drawFocusRing(state, full, &layout);
 }
 
 fn cardMessage(state: *runtime.AppState, card: palette.Rect, text: []const u8, color: [4]f32) void {
