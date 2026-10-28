@@ -15,6 +15,7 @@ const utils = @import("../utils.zig");
 const provider_cli_version = @import("../providers/cli_version.zig");
 const provider_models = @import("provider_models.zig");
 const provider_setup = @import("provider_setup.zig");
+const provider_controller = @import("provider_controller.zig");
 
 const ModelOption = provider_models.ModelOption;
 const Provider = provider_models.Provider;
@@ -1460,6 +1461,57 @@ pub fn installSettingsProvider(self: anytype, row: usize) void {
         self.setSidebarNotice("Could not open a terminal for the provider installer.");
         self.markDirty();
     };
+}
+
+/// The provider CLI update toast for this frame: the first enabled,
+/// installed provider (Settings order) whose CLI is older than its published
+/// release and that the user has not dismissed this session. Hidden while a
+/// modal owns the window so its clicks cannot land underneath.
+pub fn providerUpdateToastView(self: anytype) ?provider_controller.UpdateToastView {
+    if (self.settings_controller.modal_visible or
+        self.settings_controller.provider_onboarding_visible or
+        self.settings_controller.mcp_onboarding_visible) return null;
+    const snapshot = self.providerReadinessSnapshot();
+    const dismissed = &self.provider_controller.update_toast.dismissed;
+    var view: ?provider_controller.UpdateToastView = null;
+    for (PROVIDER_OPTIONS) |option| {
+        if (!self.app_config.isProviderEnabled(option)) continue;
+        const provider = dbProviderForChatProvider(option);
+        if (dismissed[@intFromEnum(provider)]) continue;
+        if (snapshot.releaseForProvider(provider) != .available) continue;
+        if (!snapshot.installedForProvider(provider)) continue;
+        if (view) |*first| {
+            first.more += 1;
+            continue;
+        }
+        view = .{
+            .provider = provider,
+            .name = provider_setup.displayName(provider),
+            .installed = snapshot.versions[@intFromEnum(provider)],
+            .latest = snapshot.latest_versions[@intFromEnum(provider)],
+        };
+    }
+    return view;
+}
+
+/// × on the update toast: hide it for this provider until Verde restarts.
+pub fn dismissProviderUpdateToast(self: anytype) void {
+    const view = providerUpdateToastView(self) orelse return;
+    self.provider_controller.update_toast.dismissed[@intFromEnum(view.provider)] = true;
+    self.markDirty();
+}
+
+/// Update on the toast: the same command Settings > Providers > Update runs.
+/// The toast steps aside for that provider; the recheck after the command
+/// exits clears the release state if the update took.
+pub fn updateProviderFromToast(self: anytype) void {
+    const view = providerUpdateToastView(self) orelse return;
+    self.provider_controller.update_toast.dismissed[@intFromEnum(view.provider)] = true;
+    const row = for (PROVIDER_OPTIONS, 0..) |option, index| {
+        if (dbProviderForChatProvider(option) == view.provider) break index;
+    } else return;
+    installSettingsProvider(self, row);
+    self.markDirty();
 }
 
 /// First-run checklist button: the same Install / Sign in path as the

@@ -858,6 +858,12 @@ fn syncMouseCursor(state: *AppState, cache: *CursorState) void {
         return;
     }
     if (!modalHitAtMouse(state)) {
+        if (ui_layout.providerUpdateToastSystemCursorAt(mouse_x, mouse_y)) |cursor| {
+            applySystemCursor(cache, cursor);
+            return;
+        }
+    }
+    if (!modalHitAtMouse(state)) {
         if (ui_layout.companionSystemCursorAt(state, mouse_x, mouse_y)) |cursor| {
             applySystemCursor(cache, cursor);
             return;
@@ -2490,6 +2496,11 @@ fn handleEvent(window: *palette.platform.Window, state: *AppState, keyboard: *ke
             // The approval card overlays the gap between transcript and
             // composer, so it must receive clicks before pane/browser routing.
             if (button_event.button == 1 and chat_panel_ui.handleApprovalPaletteMouseButton(state, button_event.x, button_event.y, button_event.down)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            // The provider update card floats over the top-right of the workspace.
+            if (button_event.button == 1 and !modalHitAtMouse(state) and ui_layout.handleProviderUpdateToastMouseButton(state, button_event.x, button_event.y, button_event.down)) {
                 syncWindowTextInput(window, state);
                 return true;
             }

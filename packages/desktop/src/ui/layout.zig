@@ -32,6 +32,8 @@ const companion_controller = @import("../state/companion_controller.zig");
 const cookie_import_controller = @import("../state/cookie_import_controller.zig");
 const profiler = @import("../runtime/profiler.zig");
 const app_config = @import("../app/config.zig");
+const provider_cli_version = @import("../providers/cli_version.zig");
+const utils = @import("../utils.zig");
 
 const RootLayout = struct {
     sidebar: palette.Rect,
@@ -239,6 +241,9 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     agent_prompt_popover.render(state, width, height);
     renderPrefixStatusBar(state, split.content);
     renderPrefixWhichKey(state, split.content);
+    // Same layer as the popover, queued before modals: any dialog or palette
+    // opened over the card covers it.
+    renderProviderUpdateToast(state, split.content);
     state.palette_overlay_batch.restoreZIndex(which_key_z);
     const modal_z = state.palette_overlay_batch.setZIndex(PALETTE_MODAL_Z);
     defer state.palette_overlay_batch.restoreZIndex(modal_z);
@@ -534,6 +539,141 @@ pub fn handleGitToastMouseButton(state: *runtime.AppState, x: f32, y: f32, down:
     };
     if (git_toast_dismissible) state.dismissGitToast();
     return true;
+}
+
+// Provider CLI update card: top-right of the workspace, just below the pane
+// headers so it never covers header icons or the composer's send button.
+// Says which provider CLI is out of date (installed → latest); the Update
+// button or a click anywhere on the card runs the same command as Settings >
+// Providers > Update, and × hides it for this session. State lives in
+// settings_controller (`providerUpdateToastView`); this draws and records
+// hit rects.
+const PROVIDER_UPDATE_TOAST_W_UI: f32 = 340.0;
+const PROVIDER_UPDATE_TOAST_TOP_UI: f32 = 64.0;
+const NF_COD_CLOUD_DOWNLOAD = "\u{EAC2}";
+
+/// Last drawn card geometry, for pointer routing (`handleProviderUpdateToastMouseButton`).
+var provider_update_toast_card: ?palette.Rect = null;
+var provider_update_toast_close: ?palette.Rect = null;
+var provider_update_toast_action: ?palette.Rect = null;
+
+fn renderProviderUpdateToast(state: *runtime.AppState, workspace: palette.Rect) void {
+    provider_update_toast_card = null;
+    provider_update_toast_close = null;
+    provider_update_toast_action = null;
+    const view = state.providerUpdateToastView() orelse return;
+    const pad = theme.scaledUi(GIT_TOAST_PAD_UI);
+    const gap = theme.scaledUi(GIT_TOAST_GAP_UI);
+    const margin = theme.scaledUi(NOTICE_TOAST_MARGIN_UI);
+    const card_w = @min(theme.scaledUi(PROVIDER_UPDATE_TOAST_W_UI), workspace.w - margin * 2.0);
+    if (card_w < theme.scaledUi(200.0)) return;
+    const icon_size = theme.scaledUi(GIT_TOAST_ICON_UI);
+    const title_font = theme.scaledUi(GIT_TOAST_TITLE_FONT_UI);
+    const detail_font = theme.scaledUi(GIT_TOAST_DETAIL_FONT_UI);
+    const title_h = title_font * 1.25;
+    const detail_h = detail_font * 1.25;
+    const close_size = theme.scaledUi(GIT_TOAST_CLOSE_UI);
+    const button_h = theme.scaledUi(GIT_TOAST_BUTTON_H_UI);
+    const button_font = theme.scaledUi(12.5);
+    const button_label = "Update";
+    const button_w = runtime.paletteUiTextPrefixWidth(button_label, button_font, button_label.len) + theme.scaledUi(22.0);
+
+    var title_buf: [96]u8 = undefined;
+    const title = std.fmt.bufPrint(&title_buf, "{s} update available", .{view.name}) catch "Provider update available";
+    var detail_buf: [192]u8 = undefined;
+    const installed = provider_cli_version.shortVersion(view.installed.slice());
+    const latest = view.latest.slice();
+    const more_suffix: []const u8 = if (view.more == 0) "" else if (view.more == 1) " · 1 more provider" else " · more providers";
+    const detail = if (installed.len > 0 and latest.len > 0)
+        std.fmt.bufPrint(&detail_buf, "{s} \u{2192} {s}{s}", .{ installed, latest, more_suffix }) catch ""
+    else
+        std.fmt.bufPrint(&detail_buf, "A newer CLI is published{s}", .{more_suffix}) catch "";
+
+    const text_x_offset = pad + icon_size + gap;
+    const text_w = @max(card_w - text_x_offset - pad - close_size - gap * 0.5, theme.scaledUi(40.0));
+    const text_block_h = title_h + theme.scaledUi(2.0) + detail_h;
+    const card_h = pad * 2.0 + text_block_h + gap + button_h;
+    if (workspace.h < card_h + theme.scaledUi(PROVIDER_UPDATE_TOAST_TOP_UI) + margin) return;
+    const card: palette.Rect = snapRect(.{
+        .x = workspace.x + workspace.w - margin - card_w,
+        .y = workspace.y + theme.scaledUi(PROVIDER_UPDATE_TOAST_TOP_UI),
+        .w = card_w,
+        .h = card_h,
+    });
+    const mouse_x = state.transcript_controller.palette_mouse_x;
+    const mouse_y = state.transcript_controller.palette_mouse_y;
+
+    // Shell: border colour under an inset fill, like the git card.
+    const radius = theme.scaledUi(GIT_TOAST_RADIUS_UI);
+    const inset = theme.scaledUi(1.0);
+    queuePaletteRoundedRect(state, card, paletteColor(theme.accent()), radius);
+    queuePaletteRoundedRect(state, .{ .x = card.x + inset, .y = card.y + inset, .w = card.w - inset * 2.0, .h = card.h - inset * 2.0 }, paletteColor(theme.COLOR_PANEL_ALT), radius - inset);
+
+    const icon_rect: palette.Rect = .{ .x = card.x + pad, .y = card.y + pad + (title_h - icon_size) * 0.5, .w = icon_size, .h = icon_size };
+    // The provider's own logo, as in the model picker; the download glyph
+    // stands in until its texture is loaded.
+    const logo = state.providerLogoTexture(view.provider);
+    if (logo != null and logo.?.valid and logo.?.texture_id != 0) {
+        const cached = logo.?;
+        const r = utils.snapImageRectToPixels(utils.imageRectContain(cached.width, cached.height, icon_rect.x, icon_rect.y, icon_rect.w, icon_rect.h));
+        const tint = theme.providerLogoTint(@tagName(view.provider));
+        state.palette_overlay_batch.image(state.allocator, snapRect(.{ .x = r.x, .y = r.y, .w = r.w, .h = r.h }), palette.TextureId.init(cached.texture_id), .{
+            .x = 0.0,
+            .y = 0.0,
+            .w = 1.0,
+            .h = 1.0,
+        }, .{ .r = tint[0], .g = tint[1], .b = tint[2], .a = tint[3] }, card) catch {};
+    } else {
+        queuePaletteRoleText(state, icon_rect, NF_COD_CLOUD_DOWNLOAD, paletteColor(theme.accent()), icon_size, .icon, card, false);
+    }
+
+    const text_x = card.x + text_x_offset;
+    const text_y = card.y + pad;
+    const text_clip: palette.Rect = .{ .x = text_x, .y = card.y, .w = text_w, .h = card.h };
+    queuePaletteRoleText(state, .{ .x = text_x, .y = text_y, .w = text_w, .h = title_h }, title, paletteColor(theme.COLOR_WHITE), title_font, .ui, text_clip, false);
+    queuePaletteRoleText(state, .{ .x = text_x, .y = text_y + title_h + theme.scaledUi(2.0), .w = text_w, .h = detail_h }, detail, paletteColor(theme.COLOR_TEXT_MUTED), detail_font, .ui, text_clip, false);
+
+    const close: palette.Rect = .{ .x = card.x + card.w - pad - close_size, .y = card.y + pad + (title_h - close_size) * 0.5, .w = close_size, .h = close_size };
+    const close_hovered = pointInRect(mouse_x, mouse_y, close);
+    if (close_hovered) queuePaletteRoundedRect(state, close, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(5.0));
+    const glyph = theme.scaledUi(13.0);
+    queuePaletteRoleText(state, .{ .x = close.x + (close.w - glyph) * 0.5, .y = close.y + (close.h - glyph) * 0.5, .w = glyph, .h = glyph }, NF_COD_CLOSE, paletteColor(if (close_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), glyph, .icon, card, false);
+
+    const button: palette.Rect = snapRect(.{ .x = text_x, .y = card.y + card.h - pad - button_h, .w = button_w, .h = button_h });
+    const button_hovered = pointInRect(mouse_x, mouse_y, card) and !close_hovered;
+    const fill_color = if (button_hovered) theme.raise(theme.accent(), 0.06) else theme.accent();
+    queuePaletteRoundedRect(state, button, paletteColor(fill_color), theme.scaledUi(6.0));
+    const label_w = runtime.paletteUiTextPrefixWidth(button_label, button_font, button_label.len) + button_font * 0.35;
+    queuePaletteRoleText(state, .{
+        .x = button.x + (button.w - label_w) * 0.5,
+        .y = button.y + (button.h - button_font * 1.25) * 0.5,
+        .w = label_w,
+        .h = button_font * 1.25,
+    }, button_label, paletteColor(theme.foregroundOn(fill_color)), button_font, .ui, button, false);
+
+    provider_update_toast_card = card;
+    provider_update_toast_close = close;
+    provider_update_toast_action = button;
+}
+
+/// Pointer input on the provider update card: × dismisses, anything else on
+/// the card (including Update) starts the update. Consumes presses inside it.
+pub fn handleProviderUpdateToastMouseButton(state: *runtime.AppState, x: f32, y: f32, down: bool) bool {
+    const card = provider_update_toast_card orelse return false;
+    if (!pointInRect(x, y, card)) return false;
+    if (!down) return true;
+    if (provider_update_toast_close) |rect| if (pointInRect(x, y, rect)) {
+        state.dismissProviderUpdateToast();
+        return true;
+    };
+    state.updateProviderFromToast();
+    return true;
+}
+
+/// The whole provider update card is clickable.
+pub fn providerUpdateToastSystemCursorAt(x: f32, y: f32) ?palette.platform.CursorShape {
+    const card = provider_update_toast_card orelse return null;
+    return if (pointInRect(x, y, card)) .pointer else null;
 }
 
 // Which-key overlay: while a tmux-style prefix chord is armed, a bottom-anchored

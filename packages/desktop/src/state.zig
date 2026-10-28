@@ -8848,6 +8848,9 @@ pub const AppState = struct {
     pub const selectSettingsNewChatProvider = settings_controller.selectSettingsNewChatProvider;
     pub const toggleSettingsProviderEnabled = settings_controller.toggleSettingsProviderEnabled;
     pub const installSettingsProvider = settings_controller.installSettingsProvider;
+    pub const providerUpdateToastView = settings_controller.providerUpdateToastView;
+    pub const dismissProviderUpdateToast = settings_controller.dismissProviderUpdateToast;
+    pub const updateProviderFromToast = settings_controller.updateProviderFromToast;
     pub const loginSettingsProvider = settings_controller.loginSettingsProvider;
     pub const runProviderOnboardingAction = settings_controller.runProviderOnboardingAction;
 

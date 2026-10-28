@@ -180,6 +180,9 @@ pub const ProviderReadinessSnapshot = struct {
     versions: [PROVIDER_COUNT]ProviderHarnessVersion = @splat(.{}),
     /// Indexed by `Provider`'s enum value. `available` is the only state that offers Update.
     releases: [PROVIDER_COUNT]ProviderRelease = @splat(.unknown),
+    /// Indexed by `Provider`'s enum value. The published version the last
+    /// release lookup compared against; empty when it was not reached.
+    latest_versions: [PROVIDER_COUNT]ProviderHarnessVersion = @splat(.{}),
     /// Indexed by `Provider`'s enum value. True when the PATH binary is owned by
     /// mise, Homebrew, or npm, so Update must not run the official installer.
     package_managed: [PROVIDER_COUNT]bool = @splat(false),
@@ -224,6 +227,10 @@ pub const ProviderReadinessSnapshot = struct {
 
     pub fn releaseForProvider(self: *const ProviderReadinessSnapshot, provider: Provider) ProviderRelease {
         return self.releases[@intFromEnum(provider)];
+    }
+
+    pub fn latestVersionForProvider(self: *const ProviderReadinessSnapshot, provider: Provider) []const u8 {
+        return self.latest_versions[@intFromEnum(provider)].slice();
     }
 
     pub fn packageManagedForProvider(self: *const ProviderReadinessSnapshot, provider: Provider) bool {
@@ -319,6 +326,30 @@ pub const ProviderReadinessState = struct {
     /// Main thread only. Set once the first completed check has re-picked
     /// defaults for chats created while every provider still read "checking".
     startup_defaults_applied: bool = false,
+    /// Main thread only. Wall-clock start of the last check; a long-running
+    /// session rechecks on `PROVIDER_UPDATE_RECHECK_MS` so a CLI release
+    /// published after launch still raises the update toast.
+    last_started_ms: i64 = 0,
+};
+
+/// How often a running Verde looks for newer provider CLIs.
+pub const PROVIDER_UPDATE_RECHECK_MS: i64 = 4 * std.time.ms_per_hour;
+
+/// Main thread only. Per-session state of the "provider CLI update" toast.
+pub const UpdateToastState = struct {
+    /// Indexed by `Provider`. Set by × or by starting the update, so the
+    /// toast does not return for that provider until Verde restarts.
+    dismissed: [PROVIDER_COUNT]bool = @splat(false),
+};
+
+/// What the provider update toast draws this frame.
+pub const UpdateToastView = struct {
+    provider: Provider,
+    name: []const u8,
+    installed: ProviderHarnessVersion,
+    latest: ProviderHarnessVersion,
+    /// Other providers that also have an update waiting behind this one.
+    more: usize = 0,
 };
 
 pub const ProviderThreadOperationKind = enum {
@@ -395,6 +426,7 @@ pub const State = struct {
     custom_acp_model_options: std.ArrayList(ModelOption) = .empty,
     custom_acp_options_hash: ?u64 = null,
     readiness: ProviderReadinessState = .{},
+    update_toast: UpdateToastState = .{},
     thread_operation: ProviderThreadOperationState = .{},
     mcp_sync: McpSyncState = .{},
 };
@@ -603,17 +635,26 @@ const FetchedProvider = struct {
     readiness: ProviderReadiness,
     version: ProviderHarnessVersion = .{},
     release: ProviderRelease = .unknown,
+    latest: ProviderHarnessVersion = .{},
     package_managed: bool = false,
     update_shell: ProviderUpdateShell = .{},
     requirement: ?MissingRequirement = null,
 };
 
-fn releaseForInstalledVersion(provider_name: []const u8, installed: []const u8, plan: *const provider_cli_version.UpdatePlan) ProviderRelease {
-    if (installed.len == 0) return .unknown;
+const ReleaseLookup = struct {
+    release: ProviderRelease = .unknown,
+    latest: ProviderHarnessVersion = .{},
+};
+
+fn releaseForInstalledVersion(provider_name: []const u8, installed: []const u8, plan: *const provider_cli_version.UpdatePlan) ReleaseLookup {
+    if (installed.len == 0) return .{};
     var latest_buf: [HARNESS_VERSION_BYTES]u8 = undefined;
-    const latest = provider_cli_version.fetchPlanLatest(std.heap.page_allocator, provider_name, plan, &latest_buf) orelse return .unknown;
-    const order = provider_cli_version.compareInstalled(installed, latest) orelse return .unknown;
-    return if (order == .lt) .available else .current;
+    const latest = provider_cli_version.fetchPlanLatest(std.heap.page_allocator, provider_name, plan, &latest_buf) orelse return .{};
+    var lookup: ReleaseLookup = .{};
+    lookup.latest.set(latest);
+    const order = provider_cli_version.compareInstalled(installed, latest) orelse return lookup;
+    lookup.release = if (order == .lt) .available else .current;
+    return lookup;
 }
 
 fn fetchProviderReadiness(
@@ -677,6 +718,7 @@ fn publishProviderReadiness(state: *ProviderReadinessState, provider: Provider, 
     const index = @intFromEnum(provider);
     state.snapshot.versions[index] = fetched.version;
     state.snapshot.releases[index] = fetched.release;
+    state.snapshot.latest_versions[index] = fetched.latest;
     state.snapshot.package_managed[index] = fetched.package_managed;
     state.snapshot.update_shells[index] = fetched.update_shell;
     state.snapshot.requirements[index] = fetched.requirement;
@@ -700,16 +742,18 @@ fn computeProviderRelease(
     provider: Provider,
     version: ProviderHarnessVersion,
     plan: provider_cli_version.UpdatePlan,
-    out: *ProviderRelease,
+    out: *ReleaseLookup,
 ) void {
-    const release = releaseForInstalledVersion(@tagName(provider), version.slice(), &plan);
-    out.* = release;
+    const lookup = releaseForInstalledVersion(@tagName(provider), version.slice(), &plan);
+    out.* = lookup;
+    const release = lookup.release;
     if (release == .unknown) return;
     var shell: ProviderUpdateShell = .{};
     shell.set(plan.shellSlice());
     state.mutex.lock();
     const index = @intFromEnum(provider);
     state.snapshot.releases[index] = release;
+    state.snapshot.latest_versions[index] = lookup.latest;
     state.snapshot.package_managed[index] = plan.managed;
     state.snapshot.update_shells[index] = shell;
     if (state.snapshot.versions[index].slice().len == 0) state.snapshot.versions[index] = version;
@@ -733,7 +777,7 @@ fn runProviderReadinessJob(job: ReadinessJob) void {
     // Latest-channel lookup overlaps the daemon auth handshake. Both are
     // network or process waits; running them one after another is most of
     // the multi-second Providers page delay.
-    var release: ProviderRelease = .unknown;
+    var release: ReleaseLookup = .{};
     const release_thread: ?std.Thread = if (local_version.slice().len == 0) null else std.Thread.spawn(.{}, computeProviderRelease, .{
         job.state,
         job.provider,
@@ -763,7 +807,8 @@ fn runProviderReadinessJob(job: ReadinessJob) void {
         }
         fetched.package_managed = plan.managed;
         fetched.update_shell.set(plan.shellSlice());
-        fetched.release = release;
+        fetched.release = release.release;
+        fetched.latest = release.latest;
     }
     publishProviderReadiness(job.state, job.provider, fetched);
 }
@@ -1004,6 +1049,7 @@ fn spawnProviderReadinessCheck(self: anytype) void {
 
     self.provider_controller.readiness.status = .pending;
     self.provider_controller.readiness.generation +%= 1;
+    self.provider_controller.readiness.last_started_ms = platform_runtime.unixTimestampMs();
     // Keep the last versions and Update/Latest labels visible. The worker
     // replaces each row as that provider finishes instead of blanking all
     // eight until the slowest lookup returns.
@@ -1195,8 +1241,16 @@ pub fn pollProviderReadiness(self: anytype) void {
         readiness.status = .idle;
         completed = true;
     }
+    const idle = readiness.status == .idle;
     readiness.mutex.unlock();
-    if (!completed) return;
+    if (!completed) {
+        if (idle and readiness.last_started_ms != 0 and
+            platform_runtime.unixTimestampMs() -| readiness.last_started_ms >= PROVIDER_UPDATE_RECHECK_MS)
+        {
+            spawnProviderReadinessCheck(self);
+        }
+        return;
+    }
 
     self.finishProviderReadinessThread();
     if (!readiness.startup_defaults_applied) {
