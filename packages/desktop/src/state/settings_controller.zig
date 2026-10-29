@@ -211,6 +211,9 @@ pub const ProviderInstallTerminal = struct {
     missing: bool,
     /// Sign-in terminal rather than an install/update.
     login: bool = false,
+    /// Settings > Providers > Update all: one terminal updating every
+    /// outdated provider; `provider` is only the first of them.
+    all: bool = false,
     status: UpdateInstallerTerminalStatus = .running,
 };
 
@@ -1519,6 +1522,98 @@ pub fn updateProviderFromToast(self: anytype) void {
     self.markDirty();
 }
 
+/// Providers whose installed CLI is older than its published release and
+/// that Update can act on: enabled, installed, and not owned by a tool Verde
+/// cannot drive. Settings order.
+fn providerUpdateCandidates(self: anytype, snapshot: *const provider_controller.ProviderReadinessSnapshot, out: *[PROVIDER_OPTIONS.len]app_config.ChatProvider) []const app_config.ChatProvider {
+    var count: usize = 0;
+    for (PROVIDER_OPTIONS) |option| {
+        if (!self.app_config.isProviderEnabled(option)) continue;
+        const provider = dbProviderForChatProvider(option);
+        if (snapshot.releaseForProvider(provider) != .available) continue;
+        if (!snapshot.installedForProvider(provider)) continue;
+        if (snapshot.packageManagedForProvider(provider) and snapshot.updateShellForProvider(provider).len == 0) continue;
+        if (snapshot.updateShellForProvider(provider).len == 0 and providerInstallShell(option) == null) continue;
+        out[count] = option;
+        count += 1;
+    }
+    return out[0..count];
+}
+
+/// How many providers Settings > Providers > Update all would update.
+pub fn providerUpdatesAvailableCount(self: anytype) usize {
+    const snapshot = self.providerReadinessSnapshot();
+    var buf: [PROVIDER_OPTIONS.len]app_config.ChatProvider = undefined;
+    return providerUpdateCandidates(self, &snapshot, &buf).len;
+}
+
+/// Settings > Providers > Update all: runs every outdated provider's own
+/// Update command, one after another, in a single terminal. A failure does
+/// not stop the rest; the terminal exits non-zero if any failed.
+pub fn updateAllSettingsProviders(self: anytype) void {
+    const snapshot = self.providerReadinessSnapshot();
+    var buf: [PROVIDER_OPTIONS.len]app_config.ChatProvider = undefined;
+    const providers = providerUpdateCandidates(self, &snapshot, &buf);
+    if (providers.len == 0) {
+        self.setSidebarNotice("Every provider is already up to date.");
+        self.markDirty();
+        return;
+    }
+    if (providers.len == 1) {
+        for (PROVIDER_OPTIONS, 0..) |option, row| if (option == providers[0]) return installSettingsProvider(self, row);
+    }
+    const windows = @import("builtin").os.tag == .windows;
+    var shell_buf: [4096]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&shell_buf);
+    var overflow = false;
+    if (!windows) writer.writeAll("failed=0") catch {
+        overflow = true;
+    };
+    for (providers) |option| {
+        const provider = dbProviderForChatProvider(option);
+        const custom = snapshot.updateShellForProvider(provider);
+        const shell = if (custom.len > 0) custom else providerInstallShell(option).?;
+        const name = providerDisplayName(option);
+        // Each command runs in its own subshell so an `exit` in one installer
+        // cannot end the run before the next provider.
+        if (windows) {
+            writer.print("{s}Write-Host '==> Updating {s}'; & {{ {s} }}", .{ if (writer.end == 0) "" else "; ", name, shell }) catch {
+                overflow = true;
+            };
+        } else {
+            writer.print("; echo; echo '==> Updating {s}'; ( {s} ) || {{ failed=1; echo '==> {s} update failed'; }}", .{ name, shell, name }) catch {
+                overflow = true;
+            };
+        }
+    }
+    if (!windows) writer.writeAll("; exit $failed") catch {
+        overflow = true;
+    };
+    const combined = writer.buffered();
+    if (overflow) {
+        self.setSidebarNotice("Too many provider updates to run together. Update them one at a time.");
+        self.markDirty();
+        return;
+    }
+    for (providers) |option| self.provider_controller.update_toast.dismissed[@intFromEnum(dbProviderForChatProvider(option))] = true;
+    if (!providerTerminalSupported()) {
+        self.setSidebarNotice(if (self.setClipboardText(combined))
+            "Update command copied. Run it in a terminal on this machine."
+        else
+            "Could not copy the update command.");
+        return;
+    }
+    if (self.project_controller.projects.items.len == 0) {
+        self.openProviderSetupCommand(dbProviderForChatProvider(providers[0]), .update, combined);
+        return;
+    }
+    startProviderTerminal(self, providers[0], combined, false, false, true) catch |err| {
+        log.warn("failed to open provider update terminal: {s}", .{@errorName(err)});
+        self.setSidebarNotice("Could not open a terminal for the provider updates.");
+        self.markDirty();
+    };
+}
+
 /// First-run checklist button: the same Install / Sign in path as the
 /// Settings > Providers row. When that opens a terminal, the checklist steps
 /// aside so the terminal is visible; it reappears on the next readiness check
@@ -1559,6 +1654,10 @@ pub fn loginProvider(self: anytype, provider: app_config.ChatProvider) void {
 }
 
 fn startProviderInstallTerminal(self: anytype, provider: app_config.ChatProvider, shell: []const u8, missing: bool, login: bool) !void {
+    return startProviderTerminal(self, provider, shell, missing, login, false);
+}
+
+fn startProviderTerminal(self: anytype, provider: app_config.ChatProvider, shell: []const u8, missing: bool, login: bool, all: bool) !void {
     if (self.project_controller.projects.items.len == 0) return error.NoProjectSelected;
     self.ensureCurrentProjectWorkspace();
     const project_index = self.project_controller.selected_index;
@@ -1574,7 +1673,7 @@ fn startProviderInstallTerminal(self: anytype, provider: app_config.ChatProvider
         &.{ "bash", "-lc", shell };
     try dock.restartWithProfilePersistent(self.allocator, project_path, .{
         .kind = .custom,
-        .label = if (login) providerLoginTerminalLabel(provider) else providerInstallTerminalLabel(provider, missing),
+        .label = if (all) "Update providers" else if (login) providerLoginTerminalLabel(provider) else providerInstallTerminalLabel(provider, missing),
         .command = command,
     }, self.storage.pref_path, dock_id);
 
@@ -1598,8 +1697,11 @@ fn startProviderInstallTerminal(self: anytype, provider: app_config.ChatProvider
         .provider = provider,
         .missing = missing,
         .login = login,
+        .all = all,
     };
-    self.setSidebarNotice(if (login)
+    self.setSidebarNotice(if (all)
+        "Provider updates opened in a terminal. Verde checks again when they finish."
+    else if (login)
         "Sign-in opened in a terminal. Verde checks again when it exits."
     else
         "Installer opened in a terminal. Check providers again when it finishes.");
@@ -1819,6 +1921,13 @@ pub fn pollProviderInstallTerminal(self: anytype) bool {
 
     var notice_buf: [160]u8 = undefined;
     const name = providerDisplayName(install.provider);
+    if (install.all) {
+        // Some may have updated even if one failed; the recheck shows which.
+        self.setSidebarNotice(if (succeeded) "Provider updates finished. Checking again…" else "Some provider updates failed. Review the terminal for details.");
+        self.startProviderReadinessCheck();
+        self.markDirty();
+        return true;
+    }
     if (install.login) {
         // Exit code is a weak signal for interactive logins (Pi's TUI exits 0
         // either way); the readiness recheck is the real answer.

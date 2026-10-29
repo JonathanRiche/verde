@@ -103,6 +103,7 @@ pub const Control = enum(u8) {
     updates_release_page,
     notifications_toggle,
     providers_recheck,
+    providers_update_all,
     navigation_back_record,
     navigation_back_reset,
     navigation_forward_record,
@@ -356,6 +357,8 @@ const SettingsLayout = struct {
     providers_hint_y: f32,
     providers_update_hint_y: f32,
     providers_recheck: palette.Rect,
+    /// Zero width when no provider has an update waiting.
+    providers_update_all: palette.Rect,
     custom_agents_card: palette.Rect,
     custom_agents_subtitle_y: f32,
     custom_agent_rows: [MAX_CUSTOM_AGENT_ROWS]palette.Rect,
@@ -743,6 +746,14 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .w = buttonWidth(PROVIDERS_RECHECK_LABEL),
         .h = m.row_h,
     };
+    var update_all_label_buf: [32]u8 = undefined;
+    const update_all_label = providersUpdateAllLabel(state, &update_all_label_buf);
+    const providers_update_all: palette.Rect = .{
+        .x = providers_recheck.x + providers_recheck.w + m.inner_gap,
+        .y = providers_recheck.y,
+        .w = if (update_all_label) |label| buttonWidth(label) else 0.0,
+        .h = m.row_h,
+    };
 
     const custom_agents_card: palette.Rect = .{ .x = content_x, .y = providers_card.y + providers_h + m.card_gap, .w = content_w, .h = custom_agents_h };
     const custom_agents_subtitle_y = custom_agents_card.y + m.card_pad + m.title_h + m.inner_gap;
@@ -1068,6 +1079,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .providers_hint_y = providers_hint_y,
         .providers_update_hint_y = providers_update_hint_y,
         .providers_recheck = providers_recheck,
+        .providers_update_all = providers_update_all,
         .custom_agents_card = custom_agents_card,
         .custom_agents_subtitle_y = custom_agents_subtitle_y,
         .custom_agent_rows = custom_agent_rows,
@@ -1653,6 +1665,7 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
             }
         }
         queueControlHit(state, layout.providers_recheck, layout.body_clip, .providers_recheck, queue_hit);
+        if (layout.providers_update_all.w > 0.0) queueControlHit(state, layout.providers_update_all, layout.body_clip, .providers_update_all, queue_hit);
         for (0..layout.custom_agent_count) |index| {
             recordFocusStop(.settings_custom_agent_edit, index, layout.custom_agent_edits[index], layout.body_clip);
             recordFocusStop(.settings_custom_agent_remove, index, layout.custom_agent_removes[index], layout.body_clip);
@@ -2499,6 +2512,10 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
         .providers_recheck => {
             state.startProviderReadinessCheck();
             state.markDirty();
+            return;
+        },
+        .providers_update_all => {
+            state.updateAllSettingsProviders();
             return;
         },
         .provider_update_first, .provider_update_1, .provider_update_2, .provider_update_3, .provider_update_4, .provider_update_5, .provider_update_6, .provider_update_last => {
@@ -3377,6 +3394,18 @@ fn drawProvidersCard(state: *runtime.AppState, layout: SettingsLayout, m: Metric
         .h = m.label_h,
     }, PROVIDERS_UPDATE_HINT, paletteColor(textHint()), theme.scaledUi(12.0), clip);
     drawActionButton(state, layout.providers_recheck, PROVIDERS_RECHECK_LABEL, .secondary, isControlHovered(state, .providers_recheck), clip);
+    var update_all_label_buf: [32]u8 = undefined;
+    if (layout.providers_update_all.w > 0.0) if (providersUpdateAllLabel(state, &update_all_label_buf)) |label| {
+        drawActionButton(state, layout.providers_update_all, label, .primary, isControlHovered(state, .providers_update_all), clip);
+    };
+}
+
+/// "Update all (N)" when two or more providers have an update waiting; one
+/// outdated provider already has its own Update button on its row.
+fn providersUpdateAllLabel(state: *runtime.AppState, buf: []u8) ?[]const u8 {
+    const count = state.providerUpdatesAvailableCount();
+    if (count < 2) return null;
+    return std.fmt.bufPrint(buf, "Update all ({d})", .{count}) catch "Update all";
 }
 
 // ---------------------------------------------------------------------------

@@ -8895,6 +8895,8 @@ pub const AppState = struct {
     pub const providerUpdateToastView = settings_controller.providerUpdateToastView;
     pub const dismissProviderUpdateToast = settings_controller.dismissProviderUpdateToast;
     pub const updateProviderFromToast = settings_controller.updateProviderFromToast;
+    pub const providerUpdatesAvailableCount = settings_controller.providerUpdatesAvailableCount;
+    pub const updateAllSettingsProviders = settings_controller.updateAllSettingsProviders;
     pub const loginSettingsProvider = settings_controller.loginSettingsProvider;
     pub const runProviderOnboardingAction = settings_controller.runProviderOnboardingAction;
 
