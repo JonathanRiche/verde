@@ -39,6 +39,10 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionOnScreen
+import kotlin.math.roundToInt
+import android.os.Handler
+import android.os.Looper
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -48,9 +52,6 @@ import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.window.DialogWindowProvider
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
-import androidx.core.graphics.Insets
-import androidx.core.view.ViewCompat
-import androidx.core.view.WindowInsetsCompat
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
@@ -90,9 +91,9 @@ internal val LocalLiveBar = compositionLocalOf<LiveBarHost?> { null }
 
 /**
  * Call first inside a dialog's or sheet's content. Each of those is its own window over the app, so
- * the docked bar would sit under its scrim: this adds the bar to the top of that window, in the same
- * spot, and lays the dialog out below it so it covers nothing. Being in the dialog's own window, the
- * bar is in its Tab order and TalkBack reading order, and Back and Escape still close the dialog.
+ * the shell's bar would sit under its scrim: this floats the bar at the top of that window too, in
+ * the same spot. Being in the dialog's own window, the bar is in its Tab order and TalkBack reading
+ * order, and Back and Escape still close the dialog.
  */
 @Composable
 internal fun LiveOverModal() {
@@ -102,42 +103,31 @@ internal fun LiveOverModal() {
     val parent = rememberCompositionContext()
     DisposableEffect(view, host) {
         val decor = view.rootView as? FrameLayout
-        val content = decor?.findViewById<ViewGroup>(android.R.id.content)
-        if (decor == null || content == null || decor === host.shellRoot?.rootView) return@DisposableEffect onDispose { }
-        val padding = intArrayOf(content.paddingLeft, content.paddingTop, content.paddingRight, content.paddingBottom)
+        if (decor == null || decor === host.shellRoot?.rootView) return@DisposableEffect onDispose { }
         // A dialog's window wraps its card; it fills the screen while the bar is in it, so the bar
-        // sits where the docked one does. Compose still centers the card and closes on taps beside it.
+        // sits where the shell's does. Compose still centers the card and closes on taps beside it.
         val window = generateSequence(view.parent) { it.parent }.filterIsInstance<DialogWindowProvider>().firstOrNull()?.window
         val size = window?.attributes?.let { it.width to it.height }
-        if (size != null && size != (ViewGroup.LayoutParams.MATCH_PARENT to ViewGroup.LayoutParams.MATCH_PARENT))
-            window.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        val full = ViewGroup.LayoutParams.MATCH_PARENT to ViewGroup.LayoutParams.MATCH_PARENT
+        if (size != null && size != full) window.setLayout(full.first, full.second)
         val bar = ComposeView(view.context).apply {
             setParentCompositionContext(parent)
             setContent { ModalBar(host, decor) }
         }
-        // Content starts below the bar.
-        val fit = View.OnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
-            val barAt = IntArray(2).also { bar.getLocationInWindow(it) }
-            val contentAt = IntArray(2).also { content.getLocationInWindow(it) }
-            val top = maxOf(padding[1], barAt[1] + bar.height - contentAt[1])
-            if (content.paddingTop != top) content.setPadding(padding[0], top, padding[2], padding[3])
-        }
-        bar.addOnLayoutChangeListener(fit)
-        // The bar covers the status bar, so the dialog stops leaving room for it.
-        ViewCompat.setOnApplyWindowInsetsListener(content) { _, insets -> withoutTopInsets(insets) }
         decor.addView(bar, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP))
-        ViewCompat.requestApplyInsets(content)
         onDispose {
-            bar.removeOnLayoutChangeListener(fit)
-            decor.removeView(bar)
-            bar.disposeComposition()
-            ViewCompat.setOnApplyWindowInsetsListener(content, null)
-            content.setPadding(padding[0], padding[1], padding[2], padding[3])
-            ViewCompat.requestApplyInsets(content)
-            if (size != null) window.setLayout(size.first, size.second)
+            // This runs while the dialog is being dismissed, in the middle of Android detaching the
+            // window's views: removing one then crashes that walk. Undo on the next main-loop turn.
+            mainHandler.post {
+                decor.removeView(bar)
+                bar.disposeComposition()
+                if (size != null && size != full && decor.isAttachedToWindow) window.setLayout(size.first, size.second)
+            }
         }
     }
 }
+
+private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
 
 /** The bar in a dialog's window: under the screen's status bar, wherever that window starts. */
 @Composable
@@ -147,24 +137,6 @@ private fun ModalBar(host: LiveBarHost, decor: View) {
     Box(Modifier.onGloballyPositioned { windowTop = IntArray(2).also { decor.getLocationOnScreen(it) }[1] }) {
         host.Bar(with(density) { (host.statusTop - windowTop).coerceAtLeast(0).toDp() })
     }
-}
-
-private val TOP_INSET_TYPES = listOf(WindowInsetsCompat.Type.statusBars(), WindowInsetsCompat.Type.systemBars(),
-    WindowInsetsCompat.Type.displayCutout(), WindowInsetsCompat.Type.captionBar(), WindowInsetsCompat.Type.tappableElement(),
-    WindowInsetsCompat.Type.systemGestures(), WindowInsetsCompat.Type.mandatorySystemGestures())
-
-/** [insets] with nothing at the top: the call bar is there instead. */
-internal fun withoutTopInsets(insets: WindowInsetsCompat): WindowInsetsCompat {
-    val builder = WindowInsetsCompat.Builder(insets)
-    for (type in TOP_INSET_TYPES) {
-        val shown = insets.getInsets(type)
-        builder.setInsets(type, Insets.of(shown.left, 0, shown.right, shown.bottom))
-        if (type != WindowInsetsCompat.Type.displayCutout()) {
-            val stable = insets.getInsetsIgnoringVisibility(type)
-            builder.setInsetsIgnoringVisibility(type, Insets.of(stable.left, 0, stable.right, stable.bottom))
-        }
-    }
-    return builder.build()
 }
 
 /**
@@ -317,10 +289,10 @@ internal fun LivePill(ui: LiveUi, input: Float, output: Float, character: Compan
 internal fun LiveCallBar(ui: LiveUi, input: () -> Float, output: () -> Float, character: CompanionCharacter, name: String, captionsShown: Boolean,
     onExpand: () -> Unit, onSettings: () -> Unit, onCaptions: () -> Unit, onMute: () -> Unit, onEnd: () -> Unit,
     onRetry: () -> Unit, onClose: () -> Unit, modifier: Modifier = Modifier, statusBarHeight: Dp? = null) {
-    // The shell passes the screen's top inset: in a dialog's window or a menu's popup the bar's own
-    // insets aren't the screen's. A dialog's scrim stays behind the status bar so its icons keep their contrast.
-    val top = if (statusBarHeight != null) Modifier.padding(top = statusBarHeight).background(VerdeColors.Background)
-        else Modifier.background(VerdeColors.Background).windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal))
+    // Floats: no backdrop, so only the pill and captions cover what's under them. The shell passes
+    // the screen's top inset: in a dialog's window or a menu's popup the bar's own insets aren't the screen's.
+    val top = if (statusBarHeight != null) Modifier.padding(top = statusBarHeight)
+        else Modifier.windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal))
     Column(modifier.fillMaxWidth().then(top).testTag(LIVE_CALL_BAR)) {
         Box(Modifier.fillMaxWidth().padding(vertical = 6.dp), contentAlignment = Alignment.Center) {
             if (ui.phase == LivePhase.Failed) {
@@ -335,7 +307,18 @@ internal fun LiveCallBar(ui: LiveUi, input: () -> Float, output: () -> Float, ch
             } else LivePill(ui, input(), output(), character, name, captionsShown, onExpand, onSettings, onCaptions, onMute, onEnd,
                 compactCaptions = true)
         }
-        HorizontalDivider(color = VerdeColors.Border)
+    }
+}
+
+/**
+ * Live's call bar floating over the top of the app: the shell draws it after every screen, the
+ * drawer and the bubble, so it is above all of them without taking any of their space. It reports
+ * where it ends on screen for [LiveOverMenu].
+ */
+@Composable
+internal fun LiveShellBar(host: LiveBarHost, statusTop: Int) {
+    Box(Modifier.fillMaxWidth().onGloballyPositioned { host.bottom = (it.positionOnScreen().y + it.size.height).roundToInt() }) {
+        host.Bar(with(LocalDensity.current) { statusTop.toDp() })
     }
 }
 
@@ -403,7 +386,9 @@ private fun LiveDots(ui: LiveUi, level: Float, speaking: Boolean, modifier: Modi
  */
 @Composable
 private fun LiveCaptionsCard(ui: LiveUi, name: String, compact: Boolean, modifier: Modifier) {
-    Column(modifier.background(VerdeColors.PanelAlt, RoundedCornerShape(14.dp)).border(1.dp, VerdeColors.Border, RoundedCornerShape(14.dp))
+    // Compact means floating over the app (the call bar): a shadow lifts it off what's under it.
+    Column(modifier.then(if (compact) Modifier.shadow(6.dp, RoundedCornerShape(14.dp)) else Modifier)
+        .background(VerdeColors.PanelAlt, RoundedCornerShape(14.dp)).border(1.dp, VerdeColors.Border, RoundedCornerShape(14.dp))
         .padding(horizontal = 14.dp, vertical = if (compact) 8.dp else 10.dp).testTag(LIVE_PILL_CAPTIONS), verticalArrangement = Arrangement.spacedBy(4.dp)) {
         val lines = ui.captions.takeLast(2)
         if (lines.isEmpty()) {

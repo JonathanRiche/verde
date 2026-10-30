@@ -3,6 +3,8 @@ package dev.verdeai.app
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -13,8 +15,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.unit.Dp
-import androidx.core.graphics.Insets
-import androidx.core.view.WindowInsetsCompat
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -103,11 +103,34 @@ class LivePillTest {
         }
         compose.onNodeWithText("Close workspace?").assertExists()
         compose.onNodeWithTag(LIVE_CALL_BAR).assertExists()
-        // The bar in the dialog works, and so does the dialog, laid out below it.
+        // The bar in the dialog works, and so does the dialog under it.
         compose.onNodeWithContentDescription("End live voice").performClick()
         compose.onNodeWithText("Close").performClick()
         assertEquals(listOf("end", "confirm"), taps)
         locked = true
+        compose.onNodeWithTag(LIVE_CALL_BAR).assertDoesNotExist()
+    }
+
+    /** Closing a sheet or dialog with the bar in it used to crash Android's window teardown. */
+    @OptIn(ExperimentalMaterial3Api::class)
+    @Test fun closingASheetOrDialogWithTheBarDoesNotCrash() {
+        var sheet by mutableStateOf(true)
+        var dialog by mutableStateOf(true)
+        val host = barHost(mutableListOf())
+        compose.setContent {
+            VerdeTheme {
+                CompositionLocalProvider(LocalLiveBar provides host) {
+                    if (sheet) ModalBottomSheet(onDismissRequest = { sheet = false }) { LiveOverModal(); Text("Companion") }
+                    if (dialog) AlertDialog(onDismissRequest = { dialog = false }, title = { LiveOverModal(); Text("Close?") },
+                        confirmButton = { TextButton(onClick = { dialog = false }) { Text("OK") } })
+                }
+            }
+        }
+        compose.onNodeWithText("Companion").assertExists()
+        sheet = false
+        dialog = false
+        compose.waitForIdle()
+        compose.onNodeWithText("Companion").assertDoesNotExist()
         compose.onNodeWithTag(LIVE_CALL_BAR).assertDoesNotExist()
     }
 
@@ -128,18 +151,6 @@ class LivePillTest {
         // A bar reaching far down the screen: the menu overlaps it, so a copy floats over the menu.
         host.bottom = 100_000
         compose.onNodeWithTag(LIVE_CALL_BAR).assertExists()
-    }
-
-    @Test fun barInsetsDropOnlyTheTop() {
-        val insets = WindowInsetsCompat.Builder()
-            .setInsets(WindowInsetsCompat.Type.statusBars(), Insets.of(0, 60, 0, 0))
-            .setInsets(WindowInsetsCompat.Type.navigationBars(), Insets.of(0, 0, 0, 40))
-            .setInsets(WindowInsetsCompat.Type.ime(), Insets.of(0, 0, 0, 300)).build()
-        val out = withoutTopInsets(insets)
-        assertEquals(0, out.getInsets(WindowInsetsCompat.Type.statusBars()).top)
-        assertEquals(0, out.getInsets(WindowInsetsCompat.Type.systemBars()).top)
-        assertEquals(40, out.getInsets(WindowInsetsCompat.Type.systemBars()).bottom)
-        assertEquals(300, out.getInsets(WindowInsetsCompat.Type.ime()).bottom)
     }
 
     @Test fun statusLabelsFollowPhase() {

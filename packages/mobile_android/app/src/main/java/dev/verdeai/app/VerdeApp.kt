@@ -9,11 +9,8 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.material.icons.Icons
-import androidx.compose.ui.layout.onGloballyPositioned
-import androidx.compose.ui.layout.positionOnScreen
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
-import kotlin.math.roundToInt
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.material.icons.filled.Menu
@@ -189,9 +186,9 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
     val talkError by voice.error.collectAsState()
     // Companion conversations stay behind the bubble: chat lists leave them out.
     val companionThreads = remember(companionState.roster) { companionThreadIds(companionState.roster) }
-    // Live's call bar stays up until the call is ended (or a failed one closed), docked above every
-    // screen, which moves down rather than being covered. Dialogs, sheets (the companion's too) and
-    // menus are windows over all that: LiveOverModal and LiveOverMenu keep the bar on top of them.
+    // Live's call bar stays up until the call is ended (or a failed one closed), floating over the
+    // top of every screen. Dialogs, sheets (the companion's too) and menus are windows over all that:
+    // LiveOverModal and LiveOverMenu keep the bar on top of them.
     val callUp = liveUi.active || liveUi.phase == LivePhase.Failed
     var liveSettings by remember { mutableStateOf(false) }
     val callBarUi: @Composable (Dp) -> Unit = { top ->
@@ -220,13 +217,7 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
         }
     }
     CompositionLocalProvider(LocalHiddenThreads provides companionThreads) {
-    Column(Modifier.fillMaxSize()) {
-    if (callUp) Box(Modifier.onGloballyPositioned { liveBar.bottom = (it.positionOnScreen().y + it.size.height).roundToInt() }) {
-        callBarUi(with(LocalDensity.current) { statusTop.toDp() })
-    }
-    // The bar took the status-bar inset, so screens below don't pad for it again.
-    Box(Modifier.weight(1f).fillMaxWidth()
-        .then(if (callUp) Modifier.consumeWindowInsets(WindowInsets.safeDrawing.only(WindowInsetsSides.Top)) else Modifier)) {
+    Box(Modifier.fillMaxSize()) {
     ModalNavigationDrawer(drawerState = drawer, gesturesEnabled = !pairing && !immersive,
         drawerContent = {
             WorkspaceDrawer(browseState, currentTab, visible = drawer.isOpen || drawer.targetValue == DrawerValue.Open, onClose = { scope.launch { drawer.close() } },
@@ -301,7 +292,8 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
                 stopSpeaking = voice::stopSpeaking, clearError = voice::clearError),
             onOpen = { companionSettings = false; companionOpen = true })
     }
-    }
+    // Last, so it floats above every screen, the drawer and the bubble.
+    if (callUp) LiveShellBar(liveBar, statusTop)
     }
     }
     if (companionOpen && companionState.available) {
