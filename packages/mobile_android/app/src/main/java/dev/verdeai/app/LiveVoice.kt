@@ -131,6 +131,7 @@ internal class LiveVoice(
     @OptIn(ExperimentalCoroutinesApi::class)
     private val audio = LiveAudioLane(Dispatchers.IO.limitedParallelism(1), acquire = { route.acquire() }, release = { route.release() })
     private var job: Job? = null
+    private val hangUp: () -> Unit = { stop() }
     private var signals: Channel<Signal>? = null
     private var socket: WebSocket? = null
     private var protocol: LiveProtocol? = null
@@ -142,6 +143,8 @@ internal class LiveVoice(
     private val saveLock = kotlinx.coroutines.sync.Mutex()
 
     init {
+        // The ongoing-call notification's Hang up, or verde swiped away from Recents.
+        LiveCalls.hangUp = hangUp
         // Saved transcripts that failed (offline, background) go out once the host is ready again.
         viewModelScope.launch {
             browse.map { it.host?.phase == "ready" && it.networkAvailable }.distinctUntilChanged().collect { ready ->
@@ -202,6 +205,8 @@ internal class LiveVoice(
         val record = LiveTranscript(assistantAuthor = liveAssistantAuthor(name))
         transcript = record
         val started = System.currentTimeMillis()
+        // Like a phone call: keeps going while verde is in the background, with a notification to return to it.
+        val call = LiveCalls.started(context, name)
         job = viewModelScope.launch {
             // Long sessions save as they go; every ending (End, background, silence, error) saves the rest.
             val ticker = launch { while (isActive) { delay(LIVE_SAVE_INTERVAL_MS); saveActive() } }
@@ -210,6 +215,7 @@ internal class LiveVoice(
             try { converseLoop(record, started) } finally {
                 ticker.cancel()
                 audio.drop()
+                LiveCalls.ended(context, call)
                 finishTranscript(record)
             }
         }
@@ -509,7 +515,10 @@ internal class LiveVoice(
     }
 
     // The cancelled conversation stops the mic, speaker and route on the audio lane.
-    override fun onCleared() { job?.cancel() }
+    override fun onCleared() {
+        if (LiveCalls.hangUp === hangUp) LiveCalls.hangUp = {}
+        job?.cancel()
+    }
 
     companion object {
         private const val TAG = "VerdeLive"

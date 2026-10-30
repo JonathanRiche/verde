@@ -11,6 +11,9 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- Live voice: communication mode and speaker routing while a live conversation runs. -->
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <!-- Live calls continue while verde is in the background (LiveCallService). -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
     <!-- Android 11+ package visibility for the speech recognizer and text-to-speech services. -->
     <queries>
@@ -57,6 +60,8 @@
             android:excludeFromRecents="true" android:noHistory="true"
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
         <!-- D-14 push. Data-only FCM; the service decrypts through the core and posts the notification. -->
+        <!-- A Live call in the background: microphone foreground service with an ongoing-call notification. -->
+        <service android:name=".LiveCallService" android:exported="false" android:foregroundServiceType="microphone" />
         <service android:name=".VerdeMessagingService" android:exported="false">
             <intent-filter>
                 <action android:name="com.google.firebase.MESSAGING_EVENT" />

@@ -18,6 +18,8 @@ class VerdeApplication : Application() {
     val secureStore by lazy { AndroidSecureStore(this) }
     val viewCache by lazy { AndroidSecureStore(this, "view-cache") }
     internal val signals: AppSignals by lazy { AndroidAppSignals(this) }
+    /** For host connections: a Live call keeps them up while verde is in the background. */
+    internal val coreSignals: AppSignals by lazy { CallAwareSignals(signals, kotlinx.coroutines.MainScope()) }
     /** Process-scoped so rotation and Activity recreation never relock; gates UI only. */
     internal val appLock by lazy { AppLockModel(secureStore, signals.foreground, { deviceSecure(this) }) }
     /** D-14 push; Firebase is initialized here only when this build has its config. */

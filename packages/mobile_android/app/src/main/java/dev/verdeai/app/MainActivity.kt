@@ -35,12 +35,12 @@ class MainActivity : ComponentActivity() {
         val provider = ViewModelProvider(this, object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")
             override fun <T : ViewModel> create(modelClass: Class<T>): T = when (modelClass) {
-                HostsModel::class.java -> HostsModel(app.secureStore, app.signals, cache) { saved ->
+                HostsModel::class.java -> HostsModel(app.secureStore, app.coreSignals, cache) { saved ->
                     CoreHost.create(Config(1, saved.id, saved.label, null, null, 1, "", 0uL),
                         EffectExecutor(app.secureStore, saved.id, socketTrace = ConnectionDiagnostics::socket, terminalTiming = if (ConnectionDiagnostics.enabled) ConnectionDiagnostics::terminal else null),
                         traceMetadata = if (ConnectionDiagnostics.enabled) ConnectionDiagnostics::core else null)
                 }
-                BrowseModel::class.java -> BrowseModel(hosts, cache, app.signals)
+                BrowseModel::class.java -> BrowseModel(hosts, cache, app.coreSignals)
                 NotificationActionsModel::class.java -> NotificationActionsModel(hosts, app.push, lock) { message ->
                     Toast.makeText(app, message, Toast.LENGTH_SHORT).show()
                 }

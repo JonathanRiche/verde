@@ -171,7 +171,8 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
     val shellLifecycle by androidx.lifecycle.compose.LocalLifecycleOwner.current.lifecycle.currentStateFlow.collectAsState()
     val mic = rememberMicPermission()
     LaunchedEffect(shellLifecycle) {
-        if (!shellLifecycle.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) { voice.pause(); live.stop() }
+        // A Live call carries on in the background like a phone call (LiveCallService); talk and read-aloud stop.
+        if (!shellLifecycle.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) voice.pause()
     }
     fun toggleLive() {
         when {
