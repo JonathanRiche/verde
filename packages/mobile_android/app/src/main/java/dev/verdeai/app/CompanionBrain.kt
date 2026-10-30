@@ -72,6 +72,7 @@ internal fun CompanionBrainSheet(companion: CompanionModel, manage: ManageModel,
 
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = VerdeColors.Panel,
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), modifier = Modifier.testTag(COMPANION_BRAIN)) {
+        LiveOverModal()
         Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(bottom = 24.dp)) {
             Text("$name's brain", Modifier.padding(horizontal = 16.dp), style = MaterialTheme.typography.titleLarge)
             Text(brainLabel(providerName, catalog?.let { composerChoiceLabel(it.catalogs.models, draft.model) } ?: draft.model,
@@ -128,7 +129,7 @@ internal fun CompanionBrainSheet(companion: CompanionModel, manage: ManageModel,
     val fromName = providers.find { it.id == threadProvider }?.label ?: PROVIDERS.find { it.first == threadProvider }?.second
     val (dialogTitle, dialogText) = brainSwitchDialog(name, fromName, providerName ?: "another provider")
     if (confirm) AlertDialog(onDismissRequest = { confirm = false },
-        title = { Text(dialogTitle) },
+        title = { LiveOverModal(); Text(dialogTitle) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(dialogText)

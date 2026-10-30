@@ -65,6 +65,7 @@ internal fun QrScanner(onLink: (String) -> Unit, onClose: () -> Unit, onError: (
         }
     }
     Dialog(onDismissRequest=onClose) {
+        LiveOverModal()
         Surface {
             Column(Modifier.padding(16.dp), verticalArrangement=Arrangement.spacedBy(12.dp)) {
                 Text("Scan the verde pairing QR code")

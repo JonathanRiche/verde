@@ -77,6 +77,7 @@ internal fun GitChangesHeader(model: GitChangesModel) {
                             Icon(Icons.Filled.KeyboardArrowDown, "Git actions", tint = color)
                         }
                         DropdownMenu(menu, onDismissRequest = { menu = false }) {
+                            LiveOverMenu()
                             DropdownMenuItem(text = { Text("Commit…") }, enabled = summary.files > 0, onClick = { menu = false; model.open(GitAction.Commit) })
                             DropdownMenuItem(text = { Text("Commit & push") }, enabled = summary.files > 0, onClick = { menu = false; model.open(GitAction.CommitAndPush, true) })
                             DropdownMenuItem(text = { Text("Push") }, enabled = branches.any { it.ahead > 0 && it.hasRemote }, onClick = { menu = false; model.push() })
@@ -110,7 +111,7 @@ internal fun GitChangesLayer(model: GitChangesModel) {
     if (state.preparing || state.confirmingMain) {
         val branches = state.review?.repos.orEmpty().filter { it.branch.isDefault && it.files.any { file -> GitFileKey(it.branch.root, file.path) in state.selected } }.mapNotNull { it.branch.branch }.distinct().joinToString(", ")
         AlertDialog(onDismissRequest = model::dismiss,
-            title = { Text(if (state.confirmingMain) "Commit & push to $branches?" else "Preparing commit…") },
+            title = { LiveOverModal(); Text(if (state.confirmingMain) "Commit & push to $branches?" else "Preparing commit…") },
             text = { Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 if (state.loading || state.generating) LinearProgressIndicator(Modifier.fillMaxWidth())
                 Text(if (state.loading) "Reviewing this chat's changes…" else "${state.fileCount} ${if (state.fileCount == 1) "file" else "files"} · ${state.message.lineSequence().firstOrNull().orEmpty().ifEmpty { "Generating a message…" }}")
@@ -131,6 +132,7 @@ internal fun GitChangesLayer(model: GitChangesModel) {
         ModalBottomSheet(onDismissRequest = model::dismiss,
             sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true, confirmValueChange = { !committing }),
             containerColor = VerdeColors.Panel, modifier = Modifier.testTag("git-sheet")) {
+            LiveOverModal()
             GitCommitSheet(model, state)
         }
     }

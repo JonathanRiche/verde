@@ -113,14 +113,18 @@ internal fun CompanionSheet(
     /** Real-time voice; [onLive] starts or ends it (the shell checks the mic permission). */
     live: LiveVoice? = null,
     onLive: () -> Unit = {},
+    /** Live's full view instead of the conversation (opened from the call bar); the shell owns it. */
+    liveExpanded: Boolean = false,
+    onLiveExpanded: (Boolean) -> Unit = {},
+    /** The call bar's settings button: open the settings sheet over this one. */
+    liveSettings: Boolean = false,
+    onLiveSettingsShown: () -> Unit = {},
     onDismiss: () -> Unit,
 ) {
     val state by companion.state.collectAsState()
     val browseState by browse.state.collectAsState()
     var settings by rememberSaveable { mutableStateOf(settingsRequested) }
-    /** Live voice: the full view instead of the floating pill, and the pill's captions card. */
-    var liveExpanded by rememberSaveable { mutableStateOf(false) }
-    var liveCaptions by rememberSaveable { mutableStateOf(true) }
+    LaunchedEffect(liveSettings) { if (liveSettings) { settings = true; onLiveSettingsShown() } }
     var brainOnly by rememberSaveable { mutableStateOf(false) }
     var confirmNew by rememberSaveable { mutableStateOf(false) }
     var conversations by rememberSaveable { mutableStateOf(false) }
@@ -137,8 +141,6 @@ internal fun CompanionSheet(
     val online = browseState.host?.phase == "ready" && browseState.networkAvailable
     val thread = active?.thread_id?.takeIf { it.isNotEmpty() }
     val liveUi = live?.ui?.collectAsState()?.value
-    // Every call opens as the pill.
-    LaunchedEffect(liveUi?.active) { if (liveUi?.active != true) liveExpanded = false }
     val liveSupported = live?.voice?.collectAsState()?.value?.supported != false
     val transcriptState = transcript?.state?.collectAsState()?.value
     val working = transcriptState?.turn != null || snapshot.pulse.running > 0
@@ -146,6 +148,7 @@ internal fun CompanionSheet(
 
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = VerdeColors.Background,
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), modifier = Modifier.testTag(COMPANION_SHEET)) {
+        LiveOverModal()
         Column(Modifier.fillMaxWidth().fillMaxHeight(.92f)) {
             if (active == null) {
                 CompanionPlaceholder(state, workspaces.any { it.open })
@@ -168,12 +171,11 @@ internal fun CompanionSheet(
             HorizontalDivider(color = VerdeColors.Border)
             Box(Modifier.weight(1f).fillMaxWidth()) {
                 val liveName = active.name.ifBlank { "your companion" }
-                // Live shows as a floating pill over the conversation; the full view (big captions)
-                // opens from the pill, and a failed call opens it so its reason and Try again show.
-                val liveShown = live != null && liveUi != null && (liveUi.active || liveUi.phase == LivePhase.Failed)
-                val liveFull = liveShown && (liveExpanded || liveUi?.phase == LivePhase.Failed)
+                // The call bar (LiveOverModal, above) controls Live and shows a failed call's reason; its
+                // companion, dots or captions open this full view with big captions instead of the conversation.
+                val liveFull = live != null && liveUi?.active == true && liveExpanded
                 when {
-                    liveFull && live != null -> LivePanel(live, liveName, onCollapse = if (liveUi?.phase == LivePhase.Failed) null else ({ liveExpanded = false }))
+                    liveFull && live != null -> LivePanel(live, liveName, onCollapse = { onLiveExpanded(false) })
                     transcript != null && transcriptState != null -> {
                         val knownThreads = workspaces.find { it.workspace_id == active.home_workspace_id }?.threads.orEmpty() +
                             workspaces.filter { it.workspace_id != active.home_workspace_id }.flatMap { it.threads }
@@ -190,14 +192,6 @@ internal fun CompanionSheet(
                     state.view?.can_edit != true -> Centered { Text("${active.name} will be ready when the host is reachable.") }
                     else -> Centered { CircularProgressIndicator(); Text("Waking ${active.name}…") }
                 }
-                if (liveShown && !liveFull && live != null && liveUi != null) {
-                    val input by live.inputLevel.collectAsState()
-                    val output by live.outputLevel.collectAsState()
-                    LivePill(liveUi, input, output, CompanionCharacter.of(active.character), liveName, liveCaptions,
-                        onExpand = { liveExpanded = true }, onSettings = { settings = true },
-                        onCaptions = { liveCaptions = !liveCaptions }, onMute = live::toggleMute, onEnd = live::stop,
-                        modifier = Modifier.align(Alignment.TopCenter).padding(top = 8.dp))
-                }
             }
         }
     }
@@ -209,7 +203,7 @@ internal fun CompanionSheet(
             transcriptState?.thread?.rows?.firstOrNull { it.role == "user" }?.body)
     } ?: "Conversation"
     if (confirmNew && active != null) AlertDialog(onDismissRequest = { confirmNew = false },
-        title = { Text("Start a new conversation?") },
+        title = { LiveOverModal(); Text("Start a new conversation?") },
         text = { Text("${active.name.ifBlank { "Your companion" }} starts fresh. This one stays in Conversations, so you can go back to it.") },
         confirmButton = { TextButton(onClick = { confirmNew = false; companion.newConversation(currentTitle) }) { Text("New conversation") } },
         dismissButton = { TextButton(onClick = { confirmNew = false }) { Text("Cancel") } })
@@ -270,6 +264,7 @@ private fun CompanionHeader(active: CompanionEntry, roster: CompanionRoster?, po
             var menu by remember { mutableStateOf(false) }
             IconButton(onClick = { menu = true }) { Icon(Icons.Filled.MoreVert, contentDescription = "Companion menu") }
             DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                LiveOverMenu()
                 DropdownMenuItem(text = { Text("New conversation") }, enabled = enabled && active.thread_id.isNotEmpty(),
                     onClick = { menu = false; onNewConversation() })
                 DropdownMenuItem(text = { Text("Conversations\u2026") }, onClick = { menu = false; onConversations() })
@@ -577,6 +572,7 @@ internal fun CompanionSettingsSheet(companion: CompanionModel, manage: ManageMod
     LaunchedEffect(Unit) { companion.clearSaveError() }
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = VerdeColors.Panel,
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), modifier = Modifier.testTag(COMPANION_SETTINGS)) {
+        LiveOverModal()
         Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(bottom = 24.dp)) {
             VerdeSection("Companions")
             Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp),
@@ -606,7 +602,7 @@ internal fun CompanionSettingsSheet(companion: CompanionModel, manage: ManageMod
         }
     }
     if (confirmRemove) AlertDialog(onDismissRequest = { confirmRemove = false },
-        title = { Text("Remove ${active.name}?") },
+        title = { LiveOverModal(); Text("Remove ${active.name}?") },
         text = { Text("${active.name}'s conversation stays on the host. You can't undo this here.") },
         confirmButton = { TextButton(onClick = { confirmRemove = false; companion.remove(active.id) }) { Text("Remove", color = MaterialTheme.colorScheme.error) } },
         dismissButton = { TextButton(onClick = { confirmRemove = false }) { Text("Cancel") } })
@@ -709,6 +705,7 @@ private fun ConversationsSheet(active: CompanionEntry, currentTitle: String, com
     val enabled = state.view?.can_edit == true && !state.saving
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = VerdeColors.Panel,
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), modifier = Modifier.testTag(COMPANION_CONVERSATIONS)) {
+        LiveOverModal()
         Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(bottom = 24.dp)) {
             Text("Conversations", Modifier.padding(horizontal = 16.dp), style = MaterialTheme.typography.titleLarge)
             if (active.thread_id.isNotEmpty()) ConversationRow(currentTitle, brainLabel(providerName(active.provider), active.model.ifEmpty { null }, null),
@@ -750,6 +747,7 @@ private fun ConversationRow(title: String, brain: String, detail: String?, curre
             }
         }
         if (onRemove != null) DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+            LiveOverMenu()
             DropdownMenuItem(text = { Text("Remove from list") }, onClick = { menu = false; onRemove() })
         }
     }

@@ -34,6 +34,7 @@ internal fun HostSwitcher(model: HostsModel, onSwitched: () -> Unit, onPairing: 
             Icon(Icons.Filled.ArrowDropDown, contentDescription = "Switch host", tint = VerdeColors.Muted)
         }
         DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            LiveOverMenu()
             state.rows.forEach { row ->
                 val id = row.saved.id
                 val selected = id == state.active

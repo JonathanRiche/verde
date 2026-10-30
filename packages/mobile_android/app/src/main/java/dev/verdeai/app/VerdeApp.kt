@@ -9,6 +9,12 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.material.icons.Icons
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionOnScreen
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalView
+import kotlin.math.roundToInt
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.material.icons.filled.Menu
 import kotlinx.coroutines.launch
@@ -97,15 +103,6 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
         if (tab) nav.tab(route) else nav.navigate(route) { launchSingleTop = true }
         scope.launch { drawer.close() }
     }
-    threadAction?.let { (thread, action) ->
-        key(browseState.hostId, thread.workspace_id, thread.thread_id, action) {
-            ThreadActionDialog(thread, action, manage, onDismiss = { threadAction = null }, onClosed = {
-                threadAction = null
-                if (entry?.arguments?.getString("thread") == thread.thread_id &&
-                    entry?.arguments?.getString("ws") == thread.workspace_id) open(Routes.HOME, tab = true)
-            })
-        }
-    }
     // D-14: a notification opens its thread once its host is the selected one.
     LocalPushControls.current?.let { push ->
         val link by push.links.collectAsState()
@@ -151,9 +148,16 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
     // Real-time voice (phase 2): provider WebSocket from the phone, token minted by the desktop.
     val live: LiveVoice = viewModel(key = "companion-live", factory = viewModelFactory { initializer { LiveVoice(voiceContext, hosts, browse.state, companion) } })
     val liveUi by live.ui.collectAsState()
+    // Levels change every 20 ms in a call: only the bubble ring and the call bar read them (via
+    // lambdas), so the shell itself doesn't recompose at mic rate.
     val liveLevel by live.outputLevel.collectAsState()
     val liveInput by live.inputLevel.collectAsState()
     val liveView by live.voice.collectAsState()
+    // Live's full view in the companion sheet (opened from the call bar) and the bar's captions card.
+    var liveExpanded by rememberSaveable { mutableStateOf(false) }
+    var liveCaptions by rememberSaveable { mutableStateOf(true) }
+    // Every call starts with the conversation, not the full view.
+    LaunchedEffect(liveUi.active) { if (!liveUi.active) liveExpanded = false }
     SideEffect {
         live.companionTranscript = companionTranscript
         live.snapshot = { companionSnapshot(companion.state.value, browse.state.value) }
@@ -185,8 +189,44 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
     val talkError by voice.error.collectAsState()
     // Companion conversations stay behind the bubble: chat lists leave them out.
     val companionThreads = remember(companionState.roster) { companionThreadIds(companionState.roster) }
+    // Live's call bar stays up until the call is ended (or a failed one closed), docked above every
+    // screen, which moves down rather than being covered. Dialogs, sheets (the companion's too) and
+    // menus are windows over all that: LiveOverModal and LiveOverMenu keep the bar on top of them.
+    val callUp = liveUi.active || liveUi.phase == LivePhase.Failed
+    var liveSettings by remember { mutableStateOf(false) }
+    val callBarUi: @Composable (Dp) -> Unit = { top ->
+        val character = CompanionCharacter.of(companionActive?.character)
+        LiveCallBar(liveUi, { liveInput }, { liveLevel }, character, companionActive?.name?.ifBlank { null } ?: character.label, liveCaptions,
+            onExpand = { liveExpanded = true; companionSettings = false; companionOpen = true },
+            onSettings = { liveSettings = true; companionOpen = true },
+            onCaptions = { liveCaptions = !liveCaptions }, onMute = live::toggleMute, onEnd = live::stop,
+            onRetry = ::toggleLive, onClose = live::dismissError, statusBarHeight = top)
+    }
+    val currentCallBar = rememberUpdatedState(callBarUi)
+    val liveBar = remember { LiveBarHost(currentCallBar) }
+    val shellView = LocalView.current
+    // The screen's top inset as the docked bar pads it; not safeDrawing, whose keyboard part would
+    // recompose the shell as the keyboard animates.
+    val statusTop = WindowInsets.systemBars.union(WindowInsets.displayCutout).getTop(LocalDensity.current)
+    SideEffect { liveBar.shellRoot = shellView; liveBar.statusTop = statusTop }
+    CompositionLocalProvider(LocalLiveBar provides liveBar.takeIf { callUp }) {
+    threadAction?.let { (thread, action) ->
+        key(browseState.hostId, thread.workspace_id, thread.thread_id, action) {
+            ThreadActionDialog(thread, action, manage, onDismiss = { threadAction = null }, onClosed = {
+                threadAction = null
+                if (entry?.arguments?.getString("thread") == thread.thread_id &&
+                    entry?.arguments?.getString("ws") == thread.workspace_id) open(Routes.HOME, tab = true)
+            })
+        }
+    }
     CompositionLocalProvider(LocalHiddenThreads provides companionThreads) {
-    Box(Modifier.fillMaxSize()) {
+    Column(Modifier.fillMaxSize()) {
+    if (callUp) Box(Modifier.onGloballyPositioned { liveBar.bottom = (it.positionOnScreen().y + it.size.height).roundToInt() }) {
+        callBarUi(with(LocalDensity.current) { statusTop.toDp() })
+    }
+    // The bar took the status-bar inset, so screens below don't pad for it again.
+    Box(Modifier.weight(1f).fillMaxWidth()
+        .then(if (callUp) Modifier.consumeWindowInsets(WindowInsets.safeDrawing.only(WindowInsetsSides.Top)) else Modifier)) {
     ModalNavigationDrawer(drawerState = drawer, gesturesEnabled = !pairing && !immersive,
         drawerContent = {
             WorkspaceDrawer(browseState, currentTab, visible = drawer.isOpen || drawer.targetValue == DrawerValue.Open, onClose = { scope.launch { drawer.close() } },
@@ -246,8 +286,7 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
             needKeys = companionNow.needKeys, running = companionNow.crewRunning,
             replyAt = thread?.takeIf { !activeTurn(it.status) }?.last_activity_at_ms,
             replyText = { companionActive?.let { companion.latestReply(it.home_workspace_id, it.thread_id) } },
-            live = if (liveView?.supported == false) null else BubbleLive(liveUi.active, maxOf(liveLevel, liveInput),
-                liveUi.captions.lastOrNull()?.text, ::toggleLive),
+            live = if (liveView?.supported == false) null else BubbleLive(liveUi.active, { maxOf(liveLevel, liveInput) }, ::toggleLive),
             talk = if (!voice.available || liveUi.active) null else BubbleTalk(talkState, talkLevel, talkSpeaking, talkError,
                 start = {
                     val model = companionTranscript
@@ -264,6 +303,7 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
     }
     }
     }
+    }
     if (companionOpen && companionState.available) {
         CompanionSheet(hosts, browse, manage, companion,
             onOpenPane = { pane ->
@@ -276,10 +316,13 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
             onActivity = { leaveCompanion(Routes.HOME, tab = true) },
             onCitation = { ws, citation -> leaveCompanion(Routes.file(ws, citation)) },
             settingsRequested = companionSettings,
+            liveSettings = liveSettings, onLiveSettingsShown = { liveSettings = false },
             transcript = companionTranscript, voice = voice,
             onHideBubble = { bubblePrefs.updateHidden(true) },
             live = live, onLive = ::toggleLive,
+            liveExpanded = liveExpanded, onLiveExpanded = { liveExpanded = it },
             onDismiss = { companionOpen = false; companionSettings = false })
+    }
     }
 }
 

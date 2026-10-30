@@ -75,7 +75,7 @@ internal fun AppearanceSettingsSection() {
         Text(settings.mode.label, Modifier.weight(1f))
         ThemeSwatch(VerdeColors)
     }
-    if (choosing) AlertDialog(onDismissRequest = { choosing = false }, title = { Text("Theme") },
+    if (choosing) AlertDialog(onDismissRequest = { choosing = false }, title = { LiveOverModal(); Text("Theme") },
         text = {
             LazyColumn(Modifier.heightIn(max = 420.dp).testTag("appearance-theme-list").selectableGroup()) {
                 items(AppearanceMode.entries, key = { it.name }) { mode ->

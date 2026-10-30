@@ -191,6 +191,7 @@ internal fun Picker(label: String, value: String, choices: List<ChatChoice>, ena
                 Icon(Icons.Filled.ArrowDropDown, contentDescription = null)
             }
             DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+                LiveOverMenu()
                 choices.forEach { choice ->
                     DropdownMenuItem(text = { Text(choice.label) },
                         leadingIcon = if (providerIcons) ({ ProviderGlyph(choice.id) }) else null, enabled = choice.enabled, onClick = { open = false; onPick(choice.id) })
@@ -398,7 +399,7 @@ internal fun WorkspaceActions(state: BrowseState, manage: ManageModel, workspace
             style = MaterialTheme.typography.bodySmall)
     }
     if (closing) {
-        AlertDialog(onDismissRequest = { closing = false }, title = { Text("Close ${workspace.label}?") },
+        AlertDialog(onDismissRequest = { closing = false }, title = { LiveOverModal(); Text("Close ${workspace.label}?") },
             text = { Text("verde stops this workspace's terminals and moves it to Closed. Its chats stay in history, and you can reopen it later.") },
             confirmButton = { TextButton(onClick = { closing = false; intent = manage.close(workspace.workspace_id) }) { Text("Close workspace") } },
             dismissButton = { TextButton(onClick = { closing = false }) { Text("Cancel") } })
@@ -419,7 +420,7 @@ internal fun WorkspaceIdentityDialog(workspace: Workspace, onDismiss: () -> Unit
     val tint = workspaceColor(color ?: autoColor, VerdeColors.Accent, VerdeColors.dark)
     val changed = icon != (if (workspace.icon_custom) workspace.icon_index else null) ||
         color != (if (workspace.color_custom) workspace.color_index else null)
-    AlertDialog(onDismissRequest = onDismiss, title = { Text("Icon and color") },
+    AlertDialog(onDismissRequest = onDismiss, title = { LiveOverModal(); Text("Icon and color") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {

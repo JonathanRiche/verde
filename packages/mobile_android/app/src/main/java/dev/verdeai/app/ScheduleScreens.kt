@@ -122,6 +122,7 @@ internal fun ScheduledSheet(companion: CompanionModel, manage: ManageModel, brow
 
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = VerdeColors.Panel,
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), modifier = Modifier.testTag(SCHEDULED_SHEET)) {
+        LiveOverModal()
         Column(Modifier.fillMaxWidth().fillMaxHeight(.9f)) {
             Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
@@ -177,7 +178,7 @@ internal fun ScheduledSheet(companion: CompanionModel, manage: ManageModel, brow
     confirmDelete?.let { entry ->
         val title = scheduleTitle(entry)
         AlertDialog(onDismissRequest = { confirmDelete = null },
-            title = { Text("Delete “$title”?") },
+            title = { LiveOverModal(); Text("Delete “$title”?") },
             text = { Text("It won't run again. Chats it already started stay on the host.") },
             confirmButton = {
                 TextButton(onClick = { confirmDelete = null; if (expanded == entry.id) expanded = null; companion.deleteSchedule(entry) }) {
@@ -258,6 +259,7 @@ private fun ScheduleRow(entry: ScheduleEntry, state: ScheduleUiState, now: Long,
                     modifier = Modifier.semantics { contentDescription = "$title enabled" })
             }
             DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                LiveOverMenu()
                 DropdownMenuItem(text = { Text("Run now") }, enabled = canEdit && !busy, onClick = { menu = false; onRun() })
                 DropdownMenuItem(text = { Text("Edit") }, enabled = canEdit, onClick = { menu = false; onEdit() })
                 DropdownMenuItem(text = { Text(if (enabled) "Pause" else "Resume") }, enabled = canEdit && entry.id !in state.toggling,
@@ -337,6 +339,7 @@ private fun ScheduleFormSheet(request: ScheduleFormRequest, companion: Companion
 
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = VerdeColors.Panel,
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), modifier = Modifier.testTag(SCHEDULE_FORM)) {
+        LiveOverModal()
         Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(bottom = 24.dp)) {
             Text(if (original == null) "New scheduled task" else "Edit scheduled task", Modifier.padding(horizontal = 16.dp),
                 style = MaterialTheme.typography.titleLarge)
@@ -482,6 +485,7 @@ private fun ScheduleFormSheet(request: ScheduleFormRequest, companion: Companion
                 }) { Text("OK") }
             },
             dismissButton = { TextButton(onClick = { pickDate = false }) { Text("Cancel") } }) {
+            LiveOverModal()
             DatePicker(state = picker)
         }
     }
@@ -506,7 +510,7 @@ private fun ScheduleFormSheet(request: ScheduleFormRequest, companion: Companion
                 }) { Text("OK") }
             },
             dismissButton = { TextButton(onClick = { pickTime = null }) { Text("Cancel") } },
-            text = { TimePicker(state = picker) })
+            text = { LiveOverModal(); TimePicker(state = picker) })
     }
 }
 

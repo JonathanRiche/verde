@@ -329,6 +329,7 @@ private fun DiffFullScreen(path: String, model: DiffFileModel, initialWrap: Bool
         }
     }
     Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        LiveOverModal()
         Surface(Modifier.fillMaxSize().testTag(DIFF_FULL_SCREEN)) {
             Column {
                 VerdeTopBar(showWorkspaceMenu = false,

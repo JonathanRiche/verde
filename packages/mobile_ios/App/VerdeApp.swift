@@ -79,6 +79,8 @@ struct RootView: View {
     @State private var settings = false
     @State private var companionSheet = false
     @State private var companionSettings = false
+    /// The Live call bar's captions and full view, shared with the Companion sheet.
+    @State private var livePill = LivePillState()
 
     @ViewBuilder private var shell: some View {
         let actions = BrowseActions(hosts: { tab = .hosts }, pair: {
@@ -111,7 +113,7 @@ struct RootView: View {
                                          open: { companionSheet = true }, settings: { companionSettings = true })
                         .zIndex(3)
                         .sheet(isPresented: $companionSheet) {
-                            CompanionSheet(model: companion, browse: browse, voice: companionVoice, live: live, open: { route in
+                            CompanionSheet(model: companion, browse: browse, voice: companionVoice, live: live, pill: livePill, open: { route in
                                 companionSheet = false
                                 if tab == .hosts { tab = .home }
                                 drawer = false
@@ -151,6 +153,8 @@ struct RootView: View {
         .environment(\.defaultMinListRowHeight, 44)
         .accessibilityHidden(lock.covered)
         .background(SecurityShield(lock: lock, covered: lock.covered).frame(width: 0, height: 0))
+        .background(LiveCallBar(live: live, companion: companion, pill: livePill, call: live.phase != .idle, covered: lock.covered,
+                                prepare: prepareLiveTarget, present: presentLiveTarget).frame(width: 0, height: 0))
         .sheet(isPresented: $settings) { AppSettings(lock: lock, browse: browse, push: push) }
     }
 
@@ -185,6 +189,7 @@ struct RootView: View {
             routeAfterSwitch = nil
             drawer = false
         }
+        .onChange(of: live.active) { _, active in if !active { livePill.expanded = false } }
         .onChange(of: inbox.pending, initial: true) { _, _ in openNotification() }
         .onChange(of: hosts.loading) { _, _ in openNotification() }
         .onChange(of: visibleThread, initial: true) { _, key in VisibleThread.shared.set(key) }
@@ -211,6 +216,31 @@ struct RootView: View {
            case .thread(let workspace, let thread)? = path.last,
            workspace == conversation.workspace, thread == conversation.thread { return false }
         return true
+    }
+
+    /// The call bar's full view or voice settings: closes the app's own sheets over where it opens
+    /// (the bar then waits for them to go) and reports what it opens over.
+    private func prepareLiveTarget(_ target: LiveBarTarget) -> LiveBarBase {
+        if target == .fullView { livePill.expanded = true }
+        drawer = false
+        if companionSheet {
+            livePill.closeSheetChildren()
+            return .companionSheet
+        }
+        if target == .voiceSettings && companionSettings { return .handled }
+        settings = false
+        companionSettings = false
+        if hosts.pairing != nil { hosts.showPairing(nil) }
+        return .app
+    }
+
+    private func presentLiveTarget(_ target: LiveBarTarget, over base: LiveBarBase) {
+        switch (target, base) {
+        case (.fullView, .app): companionSheet = true
+        case (.voiceSettings, .app): companionSettings = true
+        case (.voiceSettings, .companionSheet): livePill.openVoiceSettings()
+        default: break
+        }
     }
 
     /// A tapped notification or action: switch to its host and open the chat, handing any

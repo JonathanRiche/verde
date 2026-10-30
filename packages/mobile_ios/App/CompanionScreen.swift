@@ -10,6 +10,8 @@ struct CompanionSheet: View {
     let browse: BrowseModel
     let voice: CompanionVoice
     let live: LiveVoice
+    /// The call bar's state: captions and whether the sheet shows the full Live view.
+    let pill: LivePillState
     let open: (BrowseRoute) -> Void
     /// Closes the sheet and shows Home (all activity).
     let showHome: () -> Void
@@ -24,9 +26,6 @@ struct CompanionSheet: View {
     /// The summary strip's open panel; the header's count toggles it too.
     @State private var panel: CompanionPanel?
     @State private var scheduled = false
-    /// Live voice: the full view instead of the floating pill, and the pill's captions card.
-    @State private var liveExpanded = false
-    @State private var liveCaptions = true
 
     var body: some View {
         Group {
@@ -65,6 +64,14 @@ struct CompanionSheet: View {
         }
         // The header's count of enabled tasks; the Scheduled screen keeps it fresh while open.
         .task(id: browse.hostID) { await model.schedules.refresh() }
+        // The call bar opens the full view or voice settings over this sheet's own sheets.
+        .onChange(of: pill.sheetRequest) { _, request in
+            guard let request else { return }
+            conversations = false
+            scheduled = false
+            confirmNew = false
+            if request.voiceSettings { settingsBrain = false; settings = true } else { settings = false }
+        }
     }
 
     private func content(_ active: RosterEntry) -> some View {
@@ -93,20 +100,12 @@ struct CompanionSheet: View {
             }
             CompanionSummary(model: model, open: open, expanded: $panel)
             Divider().overlay(VerdeTheme.border)
-            ZStack(alignment: .top) {
-                if live.active && liveExpanded {
-                    LiveVoiceFullView(live: live, name: active.name) { liveExpanded = false }
-                } else {
-                    conversationArea(active)
-                }
-                // Live floats over the conversation as a pill; it opens into the full view.
-                if live.active && !liveExpanded {
-                    LivePill(live: live, character: active.character, name: active.name, captionsShown: $liveCaptions,
-                             expand: { liveExpanded = true }, openSettings: { settingsBrain = false; settings = true })
-                        .padding(.top, 8)
-                }
+            // The call bar over the app opens the full view here.
+            if live.active && pill.expanded {
+                LiveVoiceFullView(live: live, name: active.name) { pill.expanded = false }
+            } else {
+                conversationArea(active)
             }
-            .onChange(of: live.active) { _, isActive in if !isActive { liveExpanded = false } }
         }
     }
 

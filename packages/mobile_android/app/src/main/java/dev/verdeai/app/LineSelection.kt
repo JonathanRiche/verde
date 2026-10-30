@@ -204,6 +204,7 @@ internal fun AskAgentSheet(
     var instruction by rememberSaveable { mutableStateOf("") }
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = VerdeColors.Panel,
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), modifier = Modifier.testTag(ASK_SHEET_TAG)) {
+        LiveOverModal()
         Column(Modifier.fillMaxWidth().imePadding().padding(horizontal = 16.dp).padding(bottom = 16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("Ask agent", style = MaterialTheme.typography.titleLarge)
             Text("${basename(path)} · ${linesLabel(picked)}", style = MaterialTheme.typography.bodySmall, color = VerdeColors.Muted,

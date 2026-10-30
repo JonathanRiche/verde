@@ -222,6 +222,7 @@ private fun CommitBar(filter: ChangesFilter, owners: List<ChangesFilter.Chat>, o
                     enabled = filter is ChangesFilter.Chat || (filter == ChangesFilter.All && owners.isNotEmpty()),
                     modifier = Modifier.testTag(CHANGES_COMMIT_TAG)) { Text(if (filter is ChangesFilter.Chat) "Commit" else "Commit…") }
                 DropdownMenu(picking, onDismissRequest = { picking = false }) {
+                    LiveOverMenu()
                     owners.forEach { owner ->
                         DropdownMenuItem(text = { Text(owner.title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                             onClick = { picking = false; onCommit(owner.threadId) }, modifier = Modifier.testTag("commit-as-${owner.threadId}"))

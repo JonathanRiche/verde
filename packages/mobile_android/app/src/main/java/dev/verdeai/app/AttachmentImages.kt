@@ -241,6 +241,7 @@ private fun ImageViewer(file: File?, local: ByteArray?, mime: String, label: Str
     var offsetX by remember { mutableFloatStateOf(0f) }
     var offsetY by remember { mutableFloatStateOf(0f) }
     Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        LiveOverModal()
         Box(Modifier.fillMaxSize().background(Color.Black)) {
             bitmap?.let { b ->
                 Image(b.asImageBitmap(), contentDescription = label, contentScale = ContentScale.Fit,

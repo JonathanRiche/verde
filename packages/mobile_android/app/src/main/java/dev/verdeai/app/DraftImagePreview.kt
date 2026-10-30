@@ -25,6 +25,7 @@ internal fun DraftImagePreview(bytes: ByteArray, name: String) {
     Image(decoded.asImageBitmap(), "Preview $name", contentScale = ContentScale.Crop,
         modifier = Modifier.size(64.dp).padding(end = 8.dp).clickable { expanded = true })
     if (expanded) Dialog(onDismissRequest = { expanded = false }) {
+        LiveOverModal()
         Surface(shape = MaterialTheme.shapes.large, color = VerdeColors.Panel) {
             Column(Modifier.padding(12.dp)) {
                 Image(decoded.asImageBitmap(), name, contentScale = ContentScale.Fit,

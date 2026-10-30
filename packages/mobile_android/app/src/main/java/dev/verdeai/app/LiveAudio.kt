@@ -13,6 +13,12 @@ import android.media.MediaRecorder
 import android.media.audiofx.AcousticEchoCanceler
 import android.media.audiofx.NoiseSuppressor
 import android.os.Build
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -187,4 +193,30 @@ internal class LiveAudioRoute(context: Context) {
         val HEADSETS = setOf(AudioDeviceInfo.TYPE_WIRED_HEADSET, AudioDeviceInfo.TYPE_WIRED_HEADPHONES, AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
             AudioDeviceInfo.TYPE_USB_HEADSET, AudioDeviceInfo.TYPE_BLE_HEADSET)
     }
+}
+
+/**
+ * One serial lane for Live's blocking audio work, plus a hold count on the phone's call routing so
+ * overlapping calls (End then Start straight away) share it and only the last one out restores it.
+ * Everything queued runs in order, so an ending call's teardown can't land after the next call's setup
+ * of the same thing.
+ */
+internal class LiveAudioLane(private val dispatcher: CoroutineDispatcher, private val acquire: () -> Unit, private val release: () -> Unit) {
+    /** Calls holding the route; only touched on [dispatcher]. */
+    private var holds = 0
+
+    /** Takes a hold. It runs even if [scope] is cancelled first, so a [drop] always has one to pair with. */
+    fun hold(scope: CoroutineScope): Job = scope.launch(NonCancellable + dispatcher) { if (holds++ == 0) acquire() }
+
+    /** Drops a hold after everything queued before it; runs even when the caller is being cancelled. */
+    suspend fun drop() = withContext(NonCancellable + dispatcher) { if (holds > 0 && --holds == 0) release() }
+
+    /** Runs [block] on the lane; cancellable while it waits its turn. */
+    suspend fun <T> run(block: () -> T): T = withContext(dispatcher) { block() }
+
+    /** Runs [block] on the lane even when the caller is being cancelled (teardown). */
+    suspend fun <T> runAlways(block: () -> T): T = withContext(NonCancellable + dispatcher) { block() }
+
+    /** Queues [block] without waiting for it. */
+    fun launch(scope: CoroutineScope, block: () -> Unit): Job = scope.launch(dispatcher) { block() }
 }

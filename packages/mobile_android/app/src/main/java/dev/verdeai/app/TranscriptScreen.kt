@@ -204,6 +204,7 @@ internal fun TranscriptScreen(
                         Icon(Icons.Filled.MoreVert, contentDescription = "Chat actions", modifier = Modifier.rotate(90f))
                     }
                     DropdownMenu(expanded = chatMenu, onDismissRequest = { chatMenu = false }) {
+                        LiveOverMenu()
                         listOf("Rename chat" to "rename", "Sync chat" to "sync", "Close chat" to "close").forEach { (label, action) ->
                             DropdownMenuItem(text = { Text(label) },
                                 enabled = canEditThread && thread != null &&
@@ -361,6 +362,7 @@ internal fun MessageRow(row: ChatRow, ctx: TranscriptContext) {
             }
         }
         DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+            LiveOverMenu()
             DropdownMenuItem(text = { Text("Copy message") }, onClick = { menu = false; clipboard.setText(AnnotatedString(body)) })
         }
     }
@@ -561,6 +563,7 @@ private fun ChildResultRow(notification: ChildNotification, key: String, ctx: Tr
             }
         }
         DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+            LiveOverMenu()
             DropdownMenuItem(text = { Text("Copy reply") }, onClick = { menu = false; clipboard.setText(AnnotatedString(notification.reply.trim())) })
         }
     }

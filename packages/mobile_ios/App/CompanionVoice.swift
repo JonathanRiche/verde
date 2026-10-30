@@ -217,6 +217,8 @@ final class CompanionVoice {
     private func deactivateIfIdle() {
         guard audioActive, phase == .idle, !synthesizer.isSpeaking else { return }
         audioActive = false
+        // Live voice is taking the session over and deactivates it off the main thread when it ends.
+        guard !suspended else { return }
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 

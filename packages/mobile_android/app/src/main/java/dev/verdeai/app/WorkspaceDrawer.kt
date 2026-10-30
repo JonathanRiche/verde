@@ -193,6 +193,7 @@ private fun WorkspaceSwitcher(all: List<Workspace>, scoped: Workspace?, onScope:
         }
         DropdownMenu(expanded = open, onDismissRequest = { open = false }, containerColor = VerdeColors.PanelAlt,
             modifier = Modifier.widthIn(min = 280.dp, max = 340.dp).testTag("workspace-switcher-menu")) {
+            LiveOverMenu()
             OutlinedTextField(query, { query = it }, singleLine = true, placeholder = { Text("Search workspaces") },
                 leadingIcon = { Icon(Icons.Filled.Search, null) },
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp).testTag("workspace-switcher-search"))
@@ -271,6 +272,7 @@ internal fun DrawerChat(thread: ThreadSummary, active: Boolean, canEdit: Boolean
             }
             .combinedClickable(onClick = onClick, onLongClickLabel = "Chat actions", onLongClick = { menu = true }))
         DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+            LiveOverMenu()
             DropdownMenuItem(text = { Text("Open chat") }, onClick = { menu = false; onClick() })
             DropdownMenuItem(text = { Text("Copy title") }, onClick = { menu = false; clipboard.setText(AnnotatedString(thread.title)) })
             HorizontalDivider()

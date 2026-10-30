@@ -206,6 +206,7 @@ private fun MenuRow(
                 onLongClick = { if (menu.isNotEmpty()) expanded = true }),
         )
         DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            LiveOverMenu()
             menu.forEach { (label, action) ->
                 DropdownMenuItem(text = { Text(label) }, onClick = { expanded = false; action() })
             }

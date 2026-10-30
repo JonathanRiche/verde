@@ -122,6 +122,14 @@ internal class LiveVoice(
     var workspaceLabel: (String) -> String? = { null }
 
     private val client by lazy { OkHttpClient.Builder().pingInterval(20, TimeUnit.SECONDS).build() }
+    /**
+     * Audio setup and teardown (communication mode, focus, routing, AudioTrack/AudioRecord, thread
+     * joins) are blocking binder calls that took the main thread for hundreds of ms around a call's
+     * start and end. They run on this lane instead, one at a time and in order.
+     */
+    private val route by lazy { LiveAudioRoute(context) }
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val audio = LiveAudioLane(Dispatchers.IO.limitedParallelism(1), acquire = { route.acquire() }, release = { route.release() })
     private var job: Job? = null
     private var signals: Channel<Signal>? = null
     private var socket: WebSocket? = null
@@ -193,27 +201,33 @@ internal class LiveVoice(
         val name = companion.state.value.active?.name.orEmpty()
         val record = LiveTranscript(assistantAuthor = liveAssistantAuthor(name))
         transcript = record
+        val started = System.currentTimeMillis()
         job = viewModelScope.launch {
             // Long sessions save as they go; every ending (End, background, silence, error) saves the rest.
             val ticker = launch { while (isActive) { delay(LIVE_SAVE_INTERVAL_MS); saveActive() } }
-            try { converseLoop(record) } finally {
+            // Communication mode and routing come up while the desktop mints the session, not after.
+            audio.hold(this)
+            try { converseLoop(record, started) } finally {
                 ticker.cancel()
+                audio.drop()
                 finishTranscript(record)
             }
         }
     }
 
-    private suspend fun converseLoop(record: LiveTranscript) {
+    private suspend fun converseLoop(record: LiveTranscript, started: Long) {
         run {
             var attempts = 0
             while (currentCoroutineContext().isActive) {
                 val session = createSession() ?: return
+                // Timings only (no ids, tokens or audio): where a slow start spends its time.
+                Log.i(TAG, "live session ready in ${System.currentTimeMillis() - started} ms")
                 val proto = liveProtocol(session) ?: return fail("protocol")
                 mutableUi.update { it.copy(provider = session.provider, voice = session.voice) }
                 val now = System.currentTimeMillis()
                 record.header("\uD83C\uDF99 Live voice \u00b7 ${providerLabel(session.provider)} \u00b7 " +
                     java.text.DateFormat.getTimeInstance(java.text.DateFormat.SHORT).format(java.util.Date(now)), now)
-                when (converse(session, proto)) {
+                when (converse(session, proto, started)) {
                     Ending.Stopped -> { mutableUi.value = LiveUi(); return }
                     Ending.Failed -> return
                     Ending.Reconnect -> {
@@ -308,11 +322,10 @@ internal class LiveVoice(
     }
 
     /** One WebSocket conversation; returns how it ended. */
-    private suspend fun converse(session: VoiceSession, proto: LiveProtocol): Ending {
+    private suspend fun converse(session: VoiceSession, proto: LiveProtocol, started: Long): Ending {
         val channel = Channel<Signal>(Channel.UNLIMITED)
         signals = channel
         protocol = proto
-        val route = LiveAudioRoute(context)
         val speaker = LiveSpeaker(proto.outputRate) { mutableOutput.value = it }
         val request = Request.Builder().url(session.websocket_url).apply {
             if (session.auth == "bearer") header("Authorization", "Bearer ${session.token}")
@@ -339,23 +352,26 @@ internal class LiveVoice(
                 if (now - lastActivity > LIVE_SILENCE_MS) channel.trySend(Signal.Silence)
             }
         }
-        route.acquire()
-        speaker.start()
         var ready = false
+        var capture: LiveMic? = null
         fun goLive() {
             if (ready) return
             ready = true
             mutableUi.update { it.copy(phase = LivePhase.Live, error = null) }
-            val capture = LiveMic(proto.inputRate) { chunk, level ->
+            Log.i(TAG, "live in ${System.currentTimeMillis() - started} ms")
+            val created = LiveMic(proto.inputRate) { chunk, level ->
                 mutableInput.value = level
                 if (level > SPEECH_LEVEL) lastActivity = System.currentTimeMillis()
                 ws.send(proto.audio(chunk))
             }
-            capture.muted = ui.value.muted
-            mic = capture
-            if (!capture.start()) channel.trySend(Signal.Closed("microphone"))
+            created.muted = ui.value.muted
+            capture = created
+            mic = created
+            audio.launch(viewModelScope) { if (!created.start()) channel.trySend(Signal.Closed("microphone")) }
         }
         try {
+            // The socket connects meanwhile; Open waits in the channel.
+            audio.run { speaker.start() }
             for (signal in channel) when (signal) {
                 Signal.Open -> {
                     proto.setup(session).forEach { ws.send(it) }
@@ -394,16 +410,16 @@ internal class LiveVoice(
             return Ending.Stopped
         } finally {
             silence.cancel()
-            signals = null
-            socket = null
-            protocol = null
-            mic?.stop(); mic = null
-            speaker.stop()
+            // Only this conversation's own: after End then Start, the next call may already have set them.
+            if (signals === channel) signals = null
+            if (socket === ws) socket = null
+            if (protocol === proto) protocol = null
+            if (mic === capture) mic = null
             ws.close(1000, null)
-            route.release()
-            mutableInput.value = 0f
-            mutableOutput.value = 0f
             channel.close()
+            audio.runAlways { capture?.stop(); speaker.stop() }
+            // Unless a newer call is already up by now.
+            if (socket == null) { mutableInput.value = 0f; mutableOutput.value = 0f }
         }
     }
 
@@ -492,10 +508,8 @@ internal class LiveVoice(
         }
     }
 
-    override fun onCleared() {
-        job?.cancel()
-        mic?.stop()
-    }
+    // The cancelled conversation stops the mic, speaker and route on the audio lane.
+    override fun onCleared() { job?.cancel() }
 
     companion object {
         private const val TAG = "VerdeLive"

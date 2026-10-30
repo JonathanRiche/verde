@@ -106,7 +106,7 @@ internal fun HostsScreen(model: HostsModel, onUse: () -> Unit = {}, onSecurity: 
     }
     if (adding) AddHostDialog(onAdd={ model.add(it) }, onDismiss={ adding=false })
     renaming?.let { id ->
-        AlertDialog(onDismissRequest={ if (!state.busy) renaming=null }, title={ Text("Rename machine") },
+        AlertDialog(onDismissRequest={ if (!state.busy) renaming=null }, title={ LiveOverModal(); Text("Rename machine") },
             text={ Column(verticalArrangement=Arrangement.spacedBy(12.dp)) {
                 Text("Choose a name you recognize. This name is saved on this phone.",
                     style=MaterialTheme.typography.bodyMedium, color=VerdeColors.Muted)
@@ -121,7 +121,7 @@ internal fun HostsScreen(model: HostsModel, onUse: () -> Unit = {}, onSecurity: 
     confirmation?.let { (id, forget) ->
         val name = state.rows.find { it.saved.id == id }?.saved?.label ?: "host"
         AlertDialog(onDismissRequest={ confirmation=null },
-            title={ Text(if (forget) "Remove $name from this phone?" else "Sign out of $name?") },
+            title={ LiveOverModal(); Text(if (forget) "Remove $name from this phone?" else "Sign out of $name?") },
             text={ Text(if (forget) "This removes the local credential and host trust. This device may remain listed on the desktop until you revoke it there."
                 else "verde will revoke this phone's access to this host and remove its local credential and trust. Other hosts stay paired.") },
             confirmButton={ TextButton(onClick={ confirmation=null; model.signOut(id, forget) }) { Text(if (forget) "Remove anyway" else "Sign out") } },
@@ -133,7 +133,7 @@ internal fun HostsScreen(model: HostsModel, onUse: () -> Unit = {}, onSecurity: 
 @Composable
 internal fun AddHostDialog(onAdd: (String) -> Unit, onDismiss: () -> Unit) {
     var label by rememberSaveable { mutableStateOf("") }
-    AlertDialog(onDismissRequest=onDismiss, title={ Text("Add host") },
+    AlertDialog(onDismissRequest=onDismiss, title={ LiveOverModal(); Text("Add host") },
         text={ OutlinedTextField(label, { label=it.take(128) }, label={ Text("Host name") }, singleLine=true) },
         confirmButton={ TextButton(onClick={ onAdd(label); onDismiss() }) { Text("Continue") } },
         dismissButton={ TextButton(onClick=onDismiss) { Text("Cancel") } })
@@ -178,6 +178,7 @@ private fun HostHeading(row: HostRow, selected: Boolean, enabled: Boolean,
                 Icon(Icons.Filled.MoreVert, contentDescription="Actions for ${row.saved.label}", modifier=Modifier.rotate(90f))
             }
             DropdownMenu(expanded=menu, onDismissRequest={ menu=false }) {
+                LiveOverMenu()
                 DropdownMenuItem(text={ Text("Rename machine") }, leadingIcon={ Icon(Icons.Filled.Edit, contentDescription=null) },
                     onClick={ menu=false; onRename() })
                 onSignOut?.let { signOut ->

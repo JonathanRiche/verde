@@ -23,9 +23,9 @@ struct LiveOrb: View {
     }
 }
 
-/// The floating call bar over the companion conversation (desktop and Grok style): the companion,
+/// The call bar shown over the whole app during a call (desktop and Grok style): the companion,
 /// dots that rise with whoever is talking, then settings, captions, mute and a red end. Tapping the
-/// companion or the dots opens the full view.
+/// companion, the dots or the captions opens the full view in the Companion sheet.
 struct LivePill: View {
     let live: LiveVoice
     let character: CompanionCharacter
@@ -183,7 +183,7 @@ private struct LiveCaptionsCard: View {
     }
 }
 
-/// The full Live view, opened from the pill: the orb, what you and the companion are saying in
+/// The full Live view in the Companion sheet, opened from the pill: the orb, what you and the companion are saying in
 /// big type, provider and voice, Mute and End. The chevron goes back to the pill.
 struct LiveVoiceFullView: View {
     let live: LiveVoice

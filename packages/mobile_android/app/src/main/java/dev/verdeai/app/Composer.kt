@@ -172,6 +172,7 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState,
             SendControl(label = label, enabled = canSend, onClick = composer::submit, modifier = Modifier.testTag(COMPOSER_SEND),
                 onLongClick = if (followup) ({ sendMenu = true }) else null)
             DropdownMenu(expanded = sendMenu, onDismissRequest = { sendMenu = false }) {
+                LiveOverMenu()
                 alternatives.forEach { option ->
                     DropdownMenuItem(text = { Text(followupChoiceLabel(option)) }, onClick = { sendMenu = false; composer.submitAs(option) })
                 }
@@ -352,6 +353,7 @@ private fun CompactSettings(view: ChatComposerView, state: TranscriptState, prov
                 Icon(Icons.Filled.Add, contentDescription = "Attach or change access", tint = VerdeColors.Muted)
             }
             DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                LiveOverMenu()
                 if (c.access.isNotEmpty()) DropdownMenuItem(text = { Text("Access: ${composerChoiceLabel(c.access, s.access) ?: "Access"}") },
                     onClick = { menu = false; onPicker(ComposerPicker.Access) })
                 DropdownMenuItem(text = { Text("Attach photos") }, enabled = attach, onClick = { menu = false; onPhotos() })
@@ -381,6 +383,7 @@ private fun CompactSettings(view: ChatComposerView, state: TranscriptState, prov
             }
         }
         DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+            LiveOverMenu()
             val pickers = buildList {
                 if (fresh) add("Provider: ${PROVIDERS.find { it.first == provider }?.second ?: provider ?: "Provider"}" to ComposerPicker.Provider)
                 add("Model: ${composerChoiceLabel(c.models, s.model ?: c.models.firstOrNull()?.id) ?: "Model"}" to ComposerPicker.Model)
@@ -406,6 +409,7 @@ private fun AttachButton(enabled: Boolean, onPhotos: () -> Unit, onCamera: () ->
             Icon(painterResource(R.drawable.composer_attach), contentDescription = "Attach image", modifier = Modifier.size(18.dp))
         }
         DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+            LiveOverMenu()
             DropdownMenuItem(text = { Text("Photos") }, onClick = { menu = false; onPhotos() })
             DropdownMenuItem(text = { Text("Camera") }, onClick = { menu = false; onCamera() })
             DropdownMenuItem(text = { Text("Image files") }, onClick = { menu = false; onFiles() })
@@ -580,6 +584,7 @@ private fun PickerSheet(kind: ComposerPicker, view: ChatComposerView, provider: 
         ComposerPicker.Speed -> Triple("Speed", c.speeds, s.speed ?: c.speeds.firstOrNull()?.id)
     }
     ModalBottomSheet(onDismissRequest = onDismiss, modifier = Modifier.testTag(COMPOSER_PICKER)) {
+        LiveOverModal()
         Text(title, style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp))
         LazyColumn(Modifier.fillMaxWidth().padding(bottom = 16.dp)) {
             items(choices, key = { it.id }) { choice ->
@@ -614,6 +619,7 @@ private fun PickerSheet(kind: ComposerPicker, view: ChatComposerView, provider: 
 @Composable
 private fun ShellSheet(confirmation: ChatShellConfirmation, composer: ComposerModel) {
     ModalBottomSheet(onDismissRequest = { composer.confirmShell(confirmation, false) }, modifier = Modifier.testTag(COMPOSER_SHELL)) {
+        LiveOverModal()
         Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp).padding(bottom = 24.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("Run this command on the host?", style = MaterialTheme.typography.titleMedium)
             Surface(color = MaterialTheme.colorScheme.surfaceVariant, shape = MaterialTheme.shapes.small) {

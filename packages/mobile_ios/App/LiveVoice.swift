@@ -66,6 +66,14 @@ final class LiveVoice {
     @ObservationIgnored private var socket: URLSessionWebSocketTask?
     @ObservationIgnored private var proto: RealtimeProtocol?
     @ObservationIgnored private var audio: LiveAudio?
+    @ObservationIgnored private let audioSession: LiveAudioSession
+    /// This call's hold on the audio session, from `begin` until teardown hands it back.
+    @ObservationIgnored private var audioToken: Int?
+    @ObservationIgnored private var audioRunning = false
+    /// The provider accepts audio (Gemini after setup; the others at once).
+    @ObservationIgnored private var sessionReady = false
+    /// Releases still running on the audio queue; push-to-talk waits for them.
+    @ObservationIgnored private var releasing = 0
     @ObservationIgnored private var receiver: Task<Void, Never>?
     @ObservationIgnored private var watchdog: Task<Void, Never>?
     @ObservationIgnored private var watchers: [Task<Void, Never>] = []
@@ -80,9 +88,10 @@ final class LiveVoice {
     @ObservationIgnored private var saving = false
     static let saveInterval: TimeInterval = 120
 
-    init(companion: CompanionModel, speech: CompanionVoice) {
+    init(companion: CompanionModel, speech: CompanionVoice, audioSession: LiveAudioSession = .shared) {
         self.companion = companion
         self.speech = speech
+        self.audioSession = audioSession
         let center = NotificationCenter.default
         observers.append(center.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] note in
             let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
@@ -100,19 +109,29 @@ final class LiveVoice {
 
     func start() async {
         guard !active else { return }
+        // Suspended first: push-to-talk and reading aloud stop without deactivating the session on
+        // the main thread, since Live takes it over.
+        speech.suspended = true
         speech.cancel()
         speech.stopSpeaking()
-        speech.suspended = true
         phase = .connecting
         userCaption = ""; assistantCaption = ""; notice = nil; setMuted(false)
         reconnects = 0
         record = nil
         lastSaved = Date()
+        audioRunning = false
+        sessionReady = false
         generation += 1
         let current = generation
+        releaseAudio()
+        // The session activates on the audio queue while permission is checked and the host mints
+        // the provider token; teardown hands it back on every path.
+        audioToken = audioSession.begin()
         guard await AVAudioApplication.requestRecordPermission() else {
-            return fail("Allow Microphone access for verde in Settings to talk live.")
+            if current == generation { fail("Allow Microphone access for verde in Settings to talk live.") }
+            return
         }
+        guard current == generation else { return }
         do {
             let session = try await LiveVoiceClient(browse: companion.browse).createSession(companionID: companion.active?.id)
             guard current == generation else { return }
@@ -129,12 +148,19 @@ final class LiveVoice {
         flushTranscript(final: true)
         teardown()
         phase = .idle
+        resumeSpeechIfIdle()
+    }
+
+    /// Closes a failed call's notice.
+    func dismissFailure() {
+        if failure != nil { phase = .idle }
     }
 
     private func fail(_ message: String) {
         flushTranscript(final: true)
         teardown()
         phase = .failed(message)
+        resumeSpeechIfIdle()
     }
 
     // MARK: Transcript
@@ -179,11 +205,46 @@ final class LiveVoice {
         watchers.forEach { $0.cancel() }; watchers = []
         socket?.cancel(with: .goingAway, reason: nil); socket = nil
         uplink.detach()
-        audio?.stop(); audio = nil
+        audio = nil
+        audioRunning = false
+        sessionReady = false
+        releaseAudio()
         proto = nil
         transcript?.setVisible(false); transcript = nil
-        speech.suspended = false
         inputLevel = 0; outputLevel = 0
+    }
+
+    /// Hands the call's audio back; the engine stops and the session deactivates on the audio queue.
+    private func releaseAudio() {
+        guard let token = audioToken else { return }
+        audioToken = nil
+        releasing += 1
+        audioSession.finish(token) { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                self.releasing -= 1
+                self.resumeSpeechIfIdle()
+            }
+        }
+    }
+
+    /// Push-to-talk and spoken replies come back once no call holds or is still releasing the session.
+    private func resumeSpeechIfIdle() {
+        if !active && releasing == 0 { speech.suspended = false }
+    }
+
+    private func audioStarted(_ started: LiveAudio, _ ok: Bool) {
+        guard started === audio else { return }
+        guard ok else { return fail("Couldn't start the microphone.") }
+        audioRunning = true
+        goLiveIfReady()
+    }
+
+    /// Live once the microphone runs and the provider accepts audio.
+    private func goLiveIfReady() {
+        guard phase == .connecting, audioRunning, sessionReady else { return }
+        phase = .live
+        UIImpactFeedbackGenerator(style: .soft).impactOccurred()
     }
 
     private func connect(_ session: LiveVoiceSession, generation current: Int) throws {
@@ -204,18 +265,22 @@ final class LiveVoice {
                                     providerLabel: providerLabel)
         }
         uplink.attach(socket, proto, ready: !proto.waitsForSetup)
+        sessionReady = !proto.waitsForSetup
         send(proto.setup(instructions: session.instructions, model: session.model, voice: session.voice, tools: session.tools))
         if audio == nil {
-            let audio = LiveAudio()
+            guard let token = audioToken else { throw LiveVoiceError.failed("audio") }
             let uplink = self.uplink
-            audio.onChunk = { chunk in uplink.send(audio: chunk) }
-            audio.onLevel = { [weak self] level in Task { @MainActor in self?.heard(level) } }
+            let audio = LiveAudio(onChunk: { chunk in uplink.send(audio: chunk) },
+                                  onLevel: { [weak self] level in Task { @MainActor in self?.heard(level) } })
             audio.muted = muted
-            try audio.start(inputRate: proto.inputRate)
             self.audio = audio
+            // The engine starts on the audio queue; the UI keeps running meanwhile.
+            audioSession.run(audio, token: token, inputRate: proto.inputRate) { [weak self] ok in
+                Task { @MainActor in self?.audioStarted(audio, ok) }
+            }
         }
         receiver = Task { [weak self] in await self?.receive(socket, generation: current) }
-        if !proto.waitsForSetup { phase = .live }
+        goLiveIfReady()
         lastActivity = Date()
         startWatchdog(current)
     }
@@ -282,10 +347,8 @@ final class LiveVoice {
         switch event {
         case .ready:
             uplink.markReady()
-            if phase == .connecting {
-                phase = .live
-                UIImpactFeedbackGenerator(style: .soft).impactOccurred()
-            }
+            sessionReady = true
+            goLiveIfReady()
         case .audio(let data):
             outputLevel = audio?.play(data) ?? 0
             lastActivity = Date()

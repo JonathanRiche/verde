@@ -227,7 +227,7 @@ internal class BubbleTalk(
 )
 
 /** Live (real-time) voice hooks for the bubble: double-tap starts, tap ends. */
-internal class BubbleLive(val active: Boolean, val level: Float, val caption: String?, val toggle: () -> Unit)
+internal class BubbleLive(val active: Boolean, val level: () -> Float, val toggle: () -> Unit)
 
 /** What the speech chip says while talking: live words, cancel hint, or sending. */
 internal fun talkChip(state: TalkState): String? = when (state) {
@@ -280,9 +280,8 @@ internal fun CompanionBubbleLayer(
     val talkError = talk?.error
     LaunchedEffect(talkError) { if (talkError != null) { delay(BUBBLE_POPUP_MS); talk?.clearError() } }
     if (!shown) return
-    val liveOn = live?.takeIf { it.active }
-    val chip = if (liveOn != null) "Live" + (liveOn.caption?.takeIf { it.isNotBlank() }?.let { " \u00b7 $it" } ?: "")
-        else talk?.let { talkChip(it.state) } ?: talkError ?: popup?.second
+    // While Live the call bar shows status and captions, so the bubble has no Live chip.
+    val chip = talk?.let { talkChip(it.state) } ?: talkError ?: popup?.second
     CompanionBubble(prefs, name, character, pose, needKeys.size, running, chip, talk, live,
         // While Live, a tap ends it; otherwise it opens the sheet.
         onOpen = {
@@ -416,7 +415,7 @@ private fun CompanionBubble(prefs: BubblePrefs, name: String, character: Compani
                 }
                 .testTag(COMPANION_BUBBLE)) {
                 val liveOn = live?.active == true
-                if (liveOn) LiveRing(live?.level ?: 0f) else if (running || talking) RunningRing(reduced)
+                if (liveOn) LiveRing(live?.level?.invoke() ?: 0f) else if (running || talking) RunningRing(reduced)
                 Box(Modifier.align(Alignment.Center).size(50.dp)
                     .background(if (talking) VerdeColors.AccentWash else VerdeColors.Panel, CircleShape)
                     .border(1.dp, if (talking) VerdeColors.Accent else if (count > 0) VerdeColors.Warning else VerdeColors.Border, CircleShape),

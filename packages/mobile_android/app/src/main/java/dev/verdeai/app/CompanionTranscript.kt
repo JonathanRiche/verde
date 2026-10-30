@@ -56,6 +56,7 @@ internal fun VoiceBlock(item: TranscriptItem.Voice, ctx: TranscriptContext, comp
                 Text(item.body, style = if (compact) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.bodyLarge)
             }
             DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                LiveOverMenu()
                 DropdownMenuItem(text = { Text("Copy message") }, onClick = { menu = false; clipboard.setText(AnnotatedString(item.body)) })
             }
         }
@@ -72,6 +73,7 @@ internal fun VoiceBlock(item: TranscriptItem.Voice, ctx: TranscriptContext, comp
             if (item.body.isNotEmpty()) MarkdownText(item.body, ctx.model, ctx.onCitation)
         }
         DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+            LiveOverMenu()
             DropdownMenuItem(text = { Text("Copy message") }, onClick = { menu = false; clipboard.setText(AnnotatedString(item.body)) })
         }
     }
@@ -100,6 +102,7 @@ internal fun VoiceNote(row: ChatRow) {
             Text(row.body, Modifier.weight(1f), style = MaterialTheme.typography.labelSmall, color = VerdeColors.Subtle)
         }
         DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+            LiveOverMenu()
             DropdownMenuItem(text = { Text("Copy message") }, onClick = { menu = false; clipboard.setText(AnnotatedString(row.body)) })
         }
     }
@@ -124,6 +127,7 @@ private fun CompactMessageRow(row: ChatRow, ctx: TranscriptContext) {
                     color = if (row.delivery == "failed") MaterialTheme.colorScheme.error else VerdeColors.Subtle) }
             }
             DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                LiveOverMenu()
                 DropdownMenuItem(text = { Text("Copy message") }, onClick = { menu = false; clipboard.setText(AnnotatedString(row.body)) })
             }
         }
@@ -136,6 +140,7 @@ private fun CompactMessageRow(row: ChatRow, ctx: TranscriptContext) {
             delivery?.let { Text(it, style = MaterialTheme.typography.labelSmall, color = VerdeColors.Subtle) }
         }
         DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+            LiveOverMenu()
             DropdownMenuItem(text = { Text("Copy message") }, onClick = { menu = false; clipboard.setText(AnnotatedString(row.body)) })
         }
     }

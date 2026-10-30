@@ -30,6 +30,7 @@ internal fun ThreadActionDialog(thread: ThreadSummary, action: String, model: Ma
         if (result is JobOutcome.Done) { if (action == "close") onClosed() else onDismiss() }
     }
     Dialog(onDismissRequest = { if (!pending) onDismiss() }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        LiveOverModal()
         Surface(modifier = Modifier.fillMaxWidth(.9f).widthIn(max = 400.dp),
             color = VerdeColors.Panel, shape = MaterialTheme.shapes.large,
             border = BorderStroke(1.dp, VerdeColors.Border)) {
