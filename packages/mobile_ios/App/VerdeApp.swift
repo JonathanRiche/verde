@@ -166,19 +166,21 @@ struct RootView: View {
         .task(id: themeRefreshKey) {
             if !lock.inactive && lock.loaded && !lock.locked { await appearance.refresh(browse) }
         }
-        .onChange(of: lock.locked) { _, _ in hosts.foreground(!lock.inactive && lock.loaded && !lock.locked) }
+        .onChange(of: lock.locked) { _, _ in hostsForeground(!lock.inactive && lock.loaded && !lock.locked) }
         // The shield owns another UIWindow; UIKit notifications keep its lifecycle
         // independent of the covered SwiftUI view's scene environment.
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
             lock.phase(.background)
-            hosts.foreground(false)
+            hostsForeground(false)
             companionVoice.cancel()
             companionVoice.stopSpeaking()
-            live.end()
+            // A Live call carries on in the background like a phone call (background audio); iOS shows
+            // its microphone indicator, which returns to verde. Closing verde ends it.
         }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willTerminateNotification)) { _ in live.end() }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
             lock.phase(.active)
-            hosts.foreground(lock.loaded && !lock.locked)
+            hostsForeground(lock.loaded && !lock.locked)
             Task { await push.refresh() }
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in lock.inactive = true }
@@ -189,16 +191,23 @@ struct RootView: View {
             routeAfterSwitch = nil
             drawer = false
         }
-        .onChange(of: live.active) { _, active in if !active { livePill.expanded = false } }
+        .onChange(of: live.active) { _, active in
+            if !active { livePill.expanded = false }
+            hostsForeground(scenePhase == .active && lock.loaded && !lock.locked)
+        }
         .onChange(of: inbox.pending, initial: true) { _, _ in openNotification() }
         .onChange(of: hosts.loading) { _, _ in openNotification() }
         .onChange(of: visibleThread, initial: true) { _, key in VisibleThread.shared.set(key) }
         .onChange(of: scenePhase, initial: true) { _, phase in
             // `.inactive` (app switcher, system sheets) keeps the current state.
             lock.phase(phase)
-            if phase != .inactive { hosts.foreground(phase == .active && lock.loaded && !lock.locked) }
+            if phase != .inactive { hostsForeground(phase == .active && lock.loaded && !lock.locked) }
         }
     }
+
+    /// Host connections follow the app's foreground, except that a Live call keeps them up in the
+    /// background so the companion's tools and transcript saving keep working, as a call app's would.
+    private func hostsForeground(_ front: Bool) { hosts.foreground(front || live.active) }
 
     /// The chat on screen (`host/workspace/thread`) for foreground notification suppression.
     private var visibleThread: String? {

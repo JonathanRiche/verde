@@ -25,7 +25,9 @@ and [core toolchain](../client_core/docs/ios-toolchain.md).
   crash reports, URLs or analytics. TOFU-pin the host TLS key (or issuer), not
   a rotating leaf certificate, with an explicit re-trust flow.
 - Foreground refreshes auth, opens a ticketed socket and catches up; background
-  closes the socket and stops polling. Network changes use core backoff.
+  closes the socket and stops polling, except while a Live call runs (background
+  audio keeps the call and its host connection up; closing verde ends it).
+  Network changes use core backoff.
 - Push uses native APNs, no Firebase SDK and no App Group. Only the core's
   `vc/1/<host>/push` key records go to the shared Keychain access group
   `$(AppIdentifierPrefix)dev.verdeai.app.shared` (`SharedKeychain`); every other

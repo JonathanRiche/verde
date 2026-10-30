@@ -29,4 +29,6 @@ and [core rules](../client_core/AGENTS.md) when changing the native bridge.
 - Foreground: refresh token if needed, mint ticket, open WS, catch up from the
   cursor, resume tails.
 - Background: close WS within a few seconds and stop polling; push takes over.
+  A Live call is the exception: it keeps the WS up from a microphone foreground
+  service (`LiveCallService`) until the call ends or verde is swiped away.
 - Network change: reconnect with the core's jittered backoff.

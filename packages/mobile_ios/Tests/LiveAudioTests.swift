@@ -205,3 +205,11 @@ final class LiveAudioSessionTests: XCTestCase {
         XCTAssertNil(window.hitTest(CGPoint(x: 100, y: 20), with: nil), "and so do touches above it")
     }
 }
+
+/// A Live call keeps going while verde is in the background, like a phone call.
+final class LiveBackgroundTests: XCTestCase {
+    func testAppDeclaresBackgroundAudio() {
+        let modes = Bundle.main.object(forInfoDictionaryKey: "UIBackgroundModes") as? [String]
+        XCTAssertEqual(modes, ["audio"])
+    }
+}

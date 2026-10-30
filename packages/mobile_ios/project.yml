@@ -64,6 +64,8 @@ targets:
         NSFaceIDUsageDescription: Unlock verde to access your chats and paired hosts.
         NSCameraUsageDescription: Scan a verde pairing QR code or attach a photo to a chat.
         NSMicrophoneUsageDescription: Talk to your verde companion. The microphone is only on while you're talking to it.
+        # A Live call keeps going while verde is in the background, like a phone call.
+        UIBackgroundModes: [audio]
         NSSpeechRecognitionUsageDescription: Turn what you say to your verde companion into a message. Speech is recognized on this iPhone unless you allow server recognition in Companion settings.
         CFBundleURLTypes:
           - CFBundleURLName: dev.verdeai.app.pair
