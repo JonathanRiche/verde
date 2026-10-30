@@ -50,6 +50,9 @@ import android.view.ViewTreeObserver
 import android.widget.FrameLayout
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.window.DialogWindowProvider
+import androidx.core.graphics.Insets
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
@@ -91,9 +94,11 @@ internal val LocalLiveBar = compositionLocalOf<LiveBarHost?> { null }
 
 /**
  * Call first inside a dialog's or sheet's content. Each of those is its own window over the app, so
- * the shell's bar would sit under its scrim: this floats the bar at the top of that window too, in
- * the same spot. Being in the dialog's own window, the bar is in its Tab order and TalkBack reading
- * order, and Back and Escape still close the dialog.
+ * the shell's bar would sit under its scrim: this puts the bar at the top of that window too, in the
+ * same spot. A full-window modal (a bottom sheet such as the Companion, a full-screen viewer) is laid
+ * out below the bar, so its handle and header stay reachable: only its scrim gives way. A card
+ * dialog stays centered with the bar floating over the dim. Being in the dialog's own window, the
+ * bar is in its Tab order and TalkBack reading order, and Back and Escape still close the dialog.
  */
 @Composable
 internal fun LiveOverModal() {
@@ -109,25 +114,65 @@ internal fun LiveOverModal() {
         val window = generateSequence(view.parent) { it.parent }.filterIsInstance<DialogWindowProvider>().firstOrNull()?.window
         val size = window?.attributes?.let { it.width to it.height }
         val full = ViewGroup.LayoutParams.MATCH_PARENT to ViewGroup.LayoutParams.MATCH_PARENT
-        if (size != null && size != full) window.setLayout(full.first, full.second)
+        val card = size != null && size != full
+        if (card) window?.setLayout(full.first, full.second)
         val bar = ComposeView(view.context).apply {
             setParentCompositionContext(parent)
             setContent { ModalBar(host, decor) }
         }
+        val content = decor.findViewById<ViewGroup>(android.R.id.content)?.takeIf { !card }
+        val padding = content?.let { intArrayOf(it.paddingLeft, it.paddingTop, it.paddingRight, it.paddingBottom) }
+        val fit = View.OnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+            if (content == null || padding == null) return@OnLayoutChangeListener
+            val barAt = IntArray(2).also { bar.getLocationInWindow(it) }
+            val contentAt = IntArray(2).also { content.getLocationInWindow(it) }
+            val top = maxOf(padding[1], barAt[1] + bar.height - contentAt[1])
+            if (content.paddingTop != top) content.setPadding(padding[0], top, padding[2], padding[3])
+        }
+        if (content != null) {
+            bar.addOnLayoutChangeListener(fit)
+            // The bar covers the status bar, so the modal stops leaving room for it.
+            ViewCompat.setOnApplyWindowInsetsListener(content) { _, insets -> withoutTopInsets(insets) }
+        }
         decor.addView(bar, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP))
+        content?.let { ViewCompat.requestApplyInsets(it) }
         onDispose {
             // This runs while the dialog is being dismissed, in the middle of Android detaching the
             // window's views: removing one then crashes that walk. Undo on the next main-loop turn.
             mainHandler.post {
+                bar.removeOnLayoutChangeListener(fit)
                 decor.removeView(bar)
                 bar.disposeComposition()
-                if (size != null && size != full && decor.isAttachedToWindow) window.setLayout(size.first, size.second)
+                if (content != null && padding != null) {
+                    ViewCompat.setOnApplyWindowInsetsListener(content, null)
+                    content.setPadding(padding[0], padding[1], padding[2], padding[3])
+                    ViewCompat.requestApplyInsets(content)
+                }
+                if (card && size != null && decor.isAttachedToWindow) window?.setLayout(size.first, size.second)
             }
         }
     }
 }
 
 private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
+
+private val TOP_INSET_TYPES = listOf(WindowInsetsCompat.Type.statusBars(), WindowInsetsCompat.Type.systemBars(),
+    WindowInsetsCompat.Type.displayCutout(), WindowInsetsCompat.Type.captionBar(), WindowInsetsCompat.Type.tappableElement(),
+    WindowInsetsCompat.Type.systemGestures(), WindowInsetsCompat.Type.mandatorySystemGestures())
+
+/** [insets] with nothing at the top: the call bar is there instead. */
+internal fun withoutTopInsets(insets: WindowInsetsCompat): WindowInsetsCompat {
+    val builder = WindowInsetsCompat.Builder(insets)
+    for (type in TOP_INSET_TYPES) {
+        val shown = insets.getInsets(type)
+        builder.setInsets(type, Insets.of(shown.left, 0, shown.right, shown.bottom))
+        if (type != WindowInsetsCompat.Type.displayCutout()) {
+            val stable = insets.getInsetsIgnoringVisibility(type)
+            builder.setInsetsIgnoringVisibility(type, Insets.of(stable.left, 0, stable.right, stable.bottom))
+        }
+    }
+    return builder.build()
+}
 
 /** The bar in a dialog's window: under the screen's status bar, wherever that window starts. */
 @Composable

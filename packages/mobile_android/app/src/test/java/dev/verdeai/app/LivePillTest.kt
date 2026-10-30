@@ -15,6 +15,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.unit.Dp
+import androidx.core.graphics.Insets
+import androidx.core.view.WindowInsetsCompat
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -151,6 +153,18 @@ class LivePillTest {
         // A bar reaching far down the screen: the menu overlaps it, so a copy floats over the menu.
         host.bottom = 100_000
         compose.onNodeWithTag(LIVE_CALL_BAR).assertExists()
+    }
+
+    @Test fun barInsetsDropOnlyTheTop() {
+        val insets = WindowInsetsCompat.Builder()
+            .setInsets(WindowInsetsCompat.Type.statusBars(), Insets.of(0, 60, 0, 0))
+            .setInsets(WindowInsetsCompat.Type.navigationBars(), Insets.of(0, 0, 0, 40))
+            .setInsets(WindowInsetsCompat.Type.ime(), Insets.of(0, 0, 0, 300)).build()
+        val out = withoutTopInsets(insets)
+        assertEquals(0, out.getInsets(WindowInsetsCompat.Type.statusBars()).top)
+        assertEquals(0, out.getInsets(WindowInsetsCompat.Type.systemBars()).top)
+        assertEquals(40, out.getInsets(WindowInsetsCompat.Type.systemBars()).bottom)
+        assertEquals(300, out.getInsets(WindowInsetsCompat.Type.ime()).bottom)
     }
 
     @Test fun statusLabelsFollowPhase() {
