@@ -1,6 +1,9 @@
 package dev.verdeai.app
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
+import androidx.compose.foundation.focusGroup
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -19,6 +22,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
@@ -26,7 +30,14 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
@@ -49,6 +60,7 @@ import dev.verdeai.core.*
 import kotlin.math.roundToInt
 
 internal const val COMPANION_SHEET = "companion-sheet"
+internal const val COMPANION_PANE = "companion-pane"
 internal const val COMPANION_SETTINGS = "companion-settings"
 
 /** Tells [companion] whether Verde is resumed in the foreground (roster and crew polling). */
@@ -119,6 +131,8 @@ internal fun CompanionSheet(
     /** The call bar's settings button: open the settings sheet over this one. */
     liveSettings: Boolean = false,
     onLiveSettingsShown: () -> Unit = {},
+    /** Wide windows show this beside the content instead of as a sheet. */
+    placement: MossPlacement = MossPlacement.Sheet,
     onDismiss: () -> Unit,
 ) {
     val state by companion.state.collectAsState()
@@ -146,13 +160,15 @@ internal fun CompanionSheet(
     val working = transcriptState?.turn != null || snapshot.pulse.running > 0
     val pose = companionPose(online, snapshot.needKeys.isNotEmpty() || transcriptState?.thread?.approval != null, working)
 
-    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = VerdeColors.Background,
-        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), modifier = Modifier.testTag(COMPANION_SHEET)) {
-        LiveOverModal()
-        Column(Modifier.fillMaxWidth().fillMaxHeight(.92f)) {
+    val inPane = placement != MossPlacement.Sheet
+    // In the sidebar's slot the way back to the chat list is one tap: closing Moss restores it.
+    val onChats = onDismiss.takeIf { placement == MossPlacement.SidebarSlot }
+    val onClose = onDismiss.takeIf { placement == MossPlacement.ThirdPane }
+    val panel: @Composable ColumnScope.() -> Unit = panel@{
             if (active == null) {
-                CompanionPlaceholder(state, workspaces.any { it.open })
-                return@Column
+                if (inPane) CompanionPaneControls(onChats, onClose)
+                Box(Modifier.weight(1f)) { CompanionPlaceholder(state, workspaces.any { it.open }) }
+                return@panel
             }
             val handoff = handoffStatus(state.view?.brain_switch)
             val shownStrip = shownPanel(strip, snapshot)
@@ -164,6 +180,7 @@ internal fun CompanionSheet(
                 onNewConversation = { confirmNew = true }, onConversations = { conversations = true },
                 onSwitch = companion::switchTo, onSettings = { settings = true }, onActivity = onActivity, onHideBubble = onHideBubble,
                 liveActive = liveUi?.active == true, onLive = if (live != null && liveSupported) onLive else null,
+                onChats = onChats, onClose = onClose, scheduledButton = !inPane,
                 // Hosts without scheduled tasks hide the entry; the count appears once the list loads.
                 onScheduled = if (schedules.view?.supported != false) ({ scheduled = true }) else null,
                 scheduledCount = schedules.enabledCount.takeIf { schedules.loaded })
@@ -193,7 +210,23 @@ internal fun CompanionSheet(
                     else -> Centered { CircularProgressIndicator(); Text("Waking ${active.name}…") }
                 }
             }
-        }
+    }
+    if (inPane) {
+        BackHandler(onBack = onDismiss)
+        val focus = remember { FocusRequester() }
+        // Keyboard users land in the pane they opened, and Escape closes it.
+        LaunchedEffect(focus) { focus.requestFocus() }
+        Column(Modifier.fillMaxSize().testTag(COMPANION_PANE)
+            .onKeyEvent { event ->
+                val escape = event.key == Key.Escape && event.type == KeyEventType.KeyUp
+                if (escape) onDismiss()
+                escape
+            }
+            .focusRequester(focus).focusable().focusGroup(), content = panel)
+    } else ModalBottomSheet(onDismissRequest = onDismiss, containerColor = VerdeColors.Background,
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), modifier = Modifier.testTag(COMPANION_SHEET)) {
+        LiveOverModal()
+        Column(Modifier.fillMaxWidth().fillMaxHeight(.92f), content = panel)
     }
     if (settings && active != null) CompanionSettingsSheet(companion, manage, browseState, voice, live, transcript) { settings = false }
     // The current conversation's history title: its own title unless generic, else the first thing the user said.
@@ -223,6 +256,22 @@ private fun Centered(content: @Composable ColumnScope.() -> Unit) {
         verticalArrangement = Arrangement.spacedBy(12.dp, Alignment.CenterVertically), content = content)
 }
 
+/** The pane's way out when there's no header yet to carry it (a sheet can be swiped away). */
+@Composable
+private fun CompanionPaneControls(onChats: (() -> Unit)?, onClose: (() -> Unit)?) {
+    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically) {
+        onChats?.let { ChatsButton(it) }
+        Spacer(Modifier.weight(1f))
+        onClose?.let { CloseButton(it) }
+    }
+}
+
+@Composable
+private fun ChatsButton(onClick: () -> Unit) = IconButton(onClick = onClick) { Icon(Icons.Filled.Menu, contentDescription = "Show chats") }
+
+@Composable
+private fun CloseButton(onClick: () -> Unit) = IconButton(onClick = onClick) { Icon(Icons.Filled.Close, contentDescription = "Close companion") }
+
 @Composable
 private fun CompanionPlaceholder(state: CompanionUiState, hasWorkspace: Boolean) {
     Centered {
@@ -239,7 +288,8 @@ private fun CompanionPlaceholder(state: CompanionUiState, hasWorkspace: Boolean)
 private fun CompanionHeader(active: CompanionEntry, roster: CompanionRoster?, pose: CompanionPose, suffix: String?, enabled: Boolean,
     onSwitch: (String) -> Unit, onSettings: () -> Unit, onActivity: () -> Unit, onHideBubble: () -> Unit,
     liveActive: Boolean = false, onLive: (() -> Unit)? = null, onNewConversation: () -> Unit = {}, onConversations: () -> Unit = {},
-    onSuffix: (() -> Unit)? = null, suffixExpanded: Boolean = false, onScheduled: (() -> Unit)? = null, scheduledCount: Int? = null) {
+    onSuffix: (() -> Unit)? = null, suffixExpanded: Boolean = false, onScheduled: (() -> Unit)? = null, scheduledCount: Int? = null,
+    onChats: (() -> Unit)? = null, onClose: (() -> Unit)? = null, scheduledButton: Boolean = true) {
     val character = CompanionCharacter.of(active.character)
     val name = active.name.ifBlank { character.label }
     val suffixColor = when (pose) {
@@ -247,8 +297,9 @@ private fun CompanionHeader(active: CompanionEntry, roster: CompanionRoster?, po
         CompanionPose.Working -> VerdeColors.Accent
         else -> VerdeColors.Muted
     }
-    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).padding(start = 12.dp),
-        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).padding(start = if (onChats != null) 0.dp else 12.dp),
+        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(if (onChats != null) 4.dp else 8.dp)) {
+        onChats?.let { ChatsButton(it) }
         CompanionAvatar(character, pose, size = 28.dp, description = "$name, ${character.label}")
         Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
             Text(name, Modifier.weight(1f, fill = false), style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -258,7 +309,8 @@ private fun CompanionHeader(active: CompanionEntry, roster: CompanionRoster?, po
                     .semantics { if (onSuffix != null) this.selected = suffixExpanded },
                 style = MaterialTheme.typography.bodySmall, color = suffixColor, maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
-        onScheduled?.let { ScheduledButton(scheduledCount, it) }
+        // Tight in a pane; the menu below always has it.
+        if (scheduledButton) onScheduled?.let { ScheduledButton(scheduledCount, it) }
         onLive?.let { LiveButton(liveActive, it) }
         Box {
             var menu by remember { mutableStateOf(false) }
@@ -280,6 +332,7 @@ private fun CompanionHeader(active: CompanionEntry, roster: CompanionRoster?, po
                 DropdownMenuItem(text = { Text("Hide bubble") }, onClick = { menu = false; onHideBubble() })
             }
         }
+        onClose?.let { CloseButton(it) }
     }
 }
 

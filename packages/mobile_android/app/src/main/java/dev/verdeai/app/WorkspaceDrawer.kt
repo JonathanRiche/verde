@@ -13,6 +13,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.draw.rotate
 import androidx.compose.material.icons.filled.Close
@@ -95,7 +96,11 @@ internal fun WorkspaceDrawer(state: BrowseState, currentTab: String, visible: Bo
     onWorkspaceSettings: (String) -> Unit = {}, canManageWorkspaces: Boolean = false, onReopen: (String) -> Unit = {},
     canEditThreads: Boolean = false, onThreadAction: (ThreadSummary, String) -> Unit = { _, _ -> },
     onSettings: (() -> Unit)? = null,
-    onChanges: ((String) -> Unit)? = null, onFiles: ((String) -> Unit)? = null) {
+    onChanges: ((String) -> Unit)? = null, onFiles: ((String) -> Unit)? = null,
+    /** A permanent pane beside the content rather than a modal drawer; [onClose] then collapses it. */
+    persistent: Boolean = false,
+    /** Permanent pane only: Moss and its voice controls, above the tabs. */
+    dock: (@Composable () -> Unit)? = null) {
     var searching by rememberSaveable { mutableStateOf(false) }
     var query by rememberSaveable { mutableStateOf("") }
     val all = state.workspaces?.items.orEmpty()
@@ -106,13 +111,16 @@ internal fun WorkspaceDrawer(state: BrowseState, currentTab: String, visible: Bo
     val filter = query.trim()
     fun matches(value: String) = filter.isEmpty() || value.contains(filter, ignoreCase = true)
     ModalDrawerSheet(drawerContainerColor = VerdeColors.Panel, drawerShape = RoundedCornerShape(0.dp),
-        modifier = Modifier.widthIn(max = 380.dp).fillMaxWidth(.92f).testTag("workspace-drawer")) {
+        windowInsets = if (persistent) WindowInsets.safeDrawing.only(WindowInsetsSides.Start + WindowInsetsSides.Vertical) else DrawerDefaults.windowInsets,
+        modifier = (if (persistent) Modifier.fillMaxSize() else Modifier.widthIn(max = 380.dp).fillMaxWidth(.92f)).testTag("workspace-drawer")) {
         if (visible) {
-            BackHandler { if (searching) { searching = false; query = "" } else onClose() }
+            // A permanent pane isn't a layer: back belongs to the content unless a search is open.
+            BackHandler(enabled = !persistent || searching) { if (searching) { searching = false; query = "" } else onClose() }
             VerdeTopBar(title = { VerdeWordmark() }, showWorkspaceMenu = false,
                 actions = {
                     onSettings?.let { open -> IconButton(onClick = open) { Icon(Icons.Filled.Settings, "Settings") } }
-                    IconButton(onClick = onClose) { Icon(Icons.Filled.Close, "Close workspace drawer") }
+                    if (persistent) IconButton(onClick = onClose) { Icon(Icons.AutoMirrored.Filled.KeyboardArrowLeft, "Collapse sidebar") }
+                    else IconButton(onClick = onClose) { Icon(Icons.Filled.Close, "Close workspace drawer") }
                 })
             val ready = hasContent(state) && !needsPairing(state)
             if (ready) WorkspaceSwitcher(all, scoped, onScope, onWorkspaceSettings, onAddWorkspace, canManageWorkspaces, onReopen)
@@ -129,7 +137,7 @@ internal fun WorkspaceDrawer(state: BrowseState, currentTab: String, visible: Bo
                     Text("Search", color = VerdeColors.Subtle)
                 }
                 if (ready) {
-                    IconButton(onClick = { onNewChat(target?.workspace_id) }) { Icon(Icons.Filled.Add, "New chat") }
+                    if (!persistent) IconButton(onClick = { onNewChat(target?.workspace_id) }) { Icon(Icons.Filled.Add, "New chat") }
                     if (target != null) IconButton(onClick = { onNewTerminal(target.workspace_id) }) {
                         Icon(workspaceIcon(9), "New terminal", Modifier.size(20.dp))
                     }
@@ -163,13 +171,37 @@ internal fun WorkspaceDrawer(state: BrowseState, currentTab: String, visible: Bo
                 }
             }
             HorizontalDivider(color = VerdeColors.Border)
-            Row {
+            if (persistent) {
+                if (ready) FilledTonalButton(onClick = { onNewChat(target?.workspace_id) }, shape = RoundedCornerShape(7.dp),
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp).testTag(SIDEBAR_NEW_CHAT)) {
+                    Icon(Icons.Filled.Add, null, Modifier.size(18.dp))
+                    Text("New chat", Modifier.padding(start = 6.dp))
+                }
+                dock?.invoke()
+                // Each tab takes the width of its label, so "Workspaces" never truncates in 300dp.
+                Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
+                    SidebarTab("Home", currentTab == Routes.HOME) { onTab(Routes.HOME) }
+                    SidebarTab("Workspaces", currentTab == Routes.WORKSPACES) { onTab(Routes.WORKSPACES) }
+                    SidebarTab("Hosts", currentTab == Routes.HOSTS) { onTab(Routes.HOSTS) }
+                }
+            } else Row {
                 DrawerRow("Home", currentTab == Routes.HOME, Modifier.weight(1f)) { onTab(Routes.HOME) }
                 DrawerRow("Workspaces", currentTab == Routes.WORKSPACES, Modifier.weight(1f)) { onTab(Routes.WORKSPACES) }
                 DrawerRow("Hosts", currentTab == Routes.HOSTS, Modifier.weight(1f)) { onTab(Routes.HOSTS) }
             }
         } else Spacer(Modifier.fillMaxHeight())
     }
+}
+
+internal const val SIDEBAR_NEW_CHAT = "sidebar-new-chat"
+
+@Composable
+private fun SidebarTab(label: String, active: Boolean, onClick: () -> Unit) {
+    Text(label, Modifier.padding(vertical = 4.dp).clip(RoundedCornerShape(7.dp))
+        .background(if (active) VerdeColors.AccentWash else VerdeColors.Panel)
+        .semantics { selected = active }.clickable(role = Role.Tab, onClick = onClick)
+        .heightIn(min = 40.dp).wrapContentHeight(Alignment.CenterVertically).padding(horizontal = 10.dp),
+        color = if (active) VerdeColors.AccentHi else VerdeColors.Text, style = MaterialTheme.typography.bodyMedium, maxLines = 1, softWrap = false)
 }
 
 /** Full-width scope trigger plus its context-menu popover (spec "Switcher popover"). */

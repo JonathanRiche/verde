@@ -1,8 +1,19 @@
 package dev.verdeai.app
 
 import android.os.Looper
+import androidx.compose.runtime.Composable
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.requiredWidth
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.test.*
+import androidx.compose.ui.test.junit4.StateRestorationTester
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.ViewModelStore
@@ -36,11 +47,19 @@ class BrowseTest {
     private val signals = FakeSignals()
     private val cores = CopyOnWriteArrayList<BrowseCore>()
     private val core get() = cores.single()
+    private var paneContent by mutableStateOf<(@Composable () -> Unit)?>(null)
 
     private fun await(condition: () -> Boolean) = compose.waitUntil(5000) {
         shadowOf(Looper.getMainLooper()).idle(); condition()
     }
     private fun launch() {
+        createModels()
+        compose.setContent {
+            VerdeApp(hosts, browse, UiClock(now={ NOW }, ticking=false))
+            paneContent?.invoke()
+        }
+    }
+    private fun createModels() {
         store.values[HostsModel.CATALOG_KEY]=CoreJson.encodeToString(HostCatalog(listOf(SavedHost("alpha","Studio")), "alpha"))
         compose.runOnUiThread {
             val provider=ViewModelProvider(models, object : ViewModelProvider.Factory {
@@ -56,14 +75,94 @@ class BrowseTest {
             hosts=provider[HostsModel::class.java]
             browse=provider[BrowseModel::class.java]
         }
-        compose.setContent {
-            VerdeApp(hosts, browse, UiClock(now={ NOW }, ticking=false))
-        }
     }
 
     @After fun cleanup() {
         compose.runOnUiThread { models.clear() }
         await { cores.all { it.freed } }
+    }
+
+    /** The whole shell on the Fold's inner screen: a permanent sidebar, and Moss stays closed by itself. */
+    @Test @Config(qualifiers = "w750dp-h900dp") fun unfoldedWindowDocksTheSidebarAndNeverOpensMoss() {
+        launch()
+        await { !hosts.state.value.loading && browse.state.value.home != null }
+        compose.waitForIdle()
+        compose.onNodeWithTag(SHELL_SIDEBAR).assertExists()
+        compose.onNodeWithTag(SHELL_MOSS).assertDoesNotExist()
+        compose.onNodeWithTag(COMPANION_PANE).assertDoesNotExist()
+        compose.onNodeWithTag(COMPANION_SHEET).assertDoesNotExist()
+        compose.onNodeWithTag(COMPANION_BUBBLE).assertDoesNotExist()
+        compose.onNodeWithContentDescription("Open workspace drawer").assertDoesNotExist()
+        compose.onNodeWithContentDescription("Collapse sidebar").performClick()
+        compose.onNodeWithTag(SHELL_RAIL).assertExists()
+        compose.onNodeWithTag(SHELL_SIDEBAR).assertDoesNotExist()
+        compose.onNodeWithContentDescription("Expand sidebar").performClick()
+        compose.onNodeWithTag(SHELL_SIDEBAR).assertExists()
+    }
+
+    @Test @Config(qualifiers = "w400dp-h800dp") fun phoneWindowKeepsTheModalDrawer() {
+        launch()
+        await { !hosts.state.value.loading && browse.state.value.home != null }
+        compose.waitForIdle()
+        compose.onNodeWithTag(SHELL_SIDEBAR).assertDoesNotExist()
+        compose.onNodeWithTag(SHELL_RAIL).assertDoesNotExist()
+        compose.onNodeWithContentDescription("Open workspace drawer").assertExists()
+        compose.onNodeWithTag(SHELL_CONTENT).assertWidthIsEqualTo(400.dp)
+    }
+
+    /** A fold recreates the activity at another width: the open chat and its draft come back, in the other layout. */
+    @Test @Config(qualifiers = "w1200dp-h900dp") fun foldKeepsTheOpenChatAndDraft() {
+        createModels()
+        var width by mutableIntStateOf(400)
+        val tester = StateRestorationTester(compose)
+        tester.setContent {
+            Box(Modifier.requiredWidth(width.dp)) { VerdeApp(hosts, browse, UiClock(now={ NOW }, ticking=false)) }
+        }
+        await { !hosts.state.value.loading && browse.state.value.home != null }
+        compose.waitForIdle()
+        compose.onAllNodesWithText("Layout chat")[0].performClick()
+        compose.waitForIdle()
+        compose.onNodeWithTag(COMPOSER_FIELD).performTextInput("half a thought")
+        compose.onNodeWithContentDescription("Back").assertExists()
+
+        // Unfold: a permanent sidebar, the same chat and draft.
+        width = 750
+        tester.emulateSavedInstanceStateRestore()
+        compose.onNodeWithTag(SHELL_SIDEBAR).assertExists()
+        compose.onNodeWithTag(COMPOSER_FIELD).assertTextEquals("half a thought")
+        compose.onNodeWithContentDescription("Back").assertDoesNotExist()
+        assertTrue(compose.onAllNodesWithText("Layout chat").fetchSemanticsNodes().size >= 2) // sidebar row and chat header
+
+        // Fold again: the phone layout, still there.
+        width = 400
+        tester.emulateSavedInstanceStateRestore()
+        compose.onNodeWithTag(SHELL_SIDEBAR).assertDoesNotExist()
+        compose.onNodeWithTag(COMPOSER_FIELD).assertTextEquals("half a thought")
+        compose.onNodeWithContentDescription("Back").assertExists()
+    }
+
+    /** The sidebar-slot Moss, before it has a conversation: its way back to the chat list is one tap, and Escape closes it. */
+    @OptIn(ExperimentalTestApi::class)
+    @Test @Config(qualifiers = "w750dp-h900dp") fun mossPaneGivesTheChatListBack() {
+        launch()
+        await { !hosts.state.value.loading && browse.state.value.home != null }
+        var dismissed by mutableStateOf(0)
+        compose.runOnUiThread {
+            val manage = ManageModel(hosts, browse.state)
+            val companion = CompanionModel(hosts, browse.state)
+            paneContent = {
+                AdaptiveShellFrame(ShellPanes(SidebarMode.Hidden, MossPlacement.SidebarSlot), sidebar = {}, rail = {},
+                    moss = { CompanionSheet(hosts, browse, manage, companion, {}, { _, _ -> }, {}, { _, _ -> },
+                        placement = MossPlacement.SidebarSlot, onDismiss = { dismissed++ }) }) {}
+            }
+        }
+        compose.waitForIdle()
+        compose.onNodeWithTag(COMPANION_PANE).assertExists()
+        compose.onNodeWithTag(COMPANION_SHEET).assertDoesNotExist()
+        compose.onNodeWithContentDescription("Show chats").performClick()
+        assertEquals(1, dismissed)
+        compose.onNodeWithTag(COMPANION_PANE).performKeyInput { pressKey(Key.Escape) }
+        assertEquals(2, dismissed)
     }
 
     @Test fun signOutClearsCachedAndShownViews() {

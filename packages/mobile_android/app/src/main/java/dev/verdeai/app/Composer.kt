@@ -54,6 +54,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -200,13 +201,18 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState,
         resizedHeight = ((resizedHeight ?: measuredHeight) + delta).coerceIn(56f, maxFieldHeight.value)
     }
     var composerFocused by remember { mutableStateOf(false) }
+    // Wide windows: one row of controls under a short field, lined up with the capped transcript.
+    val wideRow = !compact && LocalWindowTier.current.wide
+    val dense = compact || wideRow
     Surface(color = VerdeColors.Panel, shape = RoundedCornerShape(14.dp),
         border = BorderStroke(if (composerFocused) 1.5.dp else 1.dp,
             if (composerFocused) VerdeColors.Accent else VerdeColors.PanelMuted),
-        modifier = Modifier.fillMaxWidth().imePadding().padding(horizontal = 8.dp, vertical = 6.dp).testTag(COMPOSER)
+        modifier = Modifier.fillMaxWidth().imePadding()
+            .then(if (wideRow) Modifier.wrapContentWidth(Alignment.CenterHorizontally).widthIn(max = TRANSCRIPT_TEXT_MAX_WIDTH + 16.dp).fillMaxWidth() else Modifier)
+            .padding(horizontal = 8.dp, vertical = 6.dp).testTag(COMPOSER)
             .onFocusChanged { composerFocused = it.hasFocus }.focusGroup()) {
-        Column(Modifier.fillMaxWidth().padding(horizontal = if (compact) 8.dp else 12.dp, vertical = if (compact) 2.dp else 6.dp),
-            verticalArrangement = Arrangement.spacedBy(if (compact) 0.dp else 6.dp)) {
+        Column(Modifier.fillMaxWidth().padding(horizontal = if (dense) 8.dp else 12.dp, vertical = if (dense) 2.dp else 6.dp),
+            verticalArrangement = Arrangement.spacedBy(if (dense) 0.dp else 6.dp)) {
             view?.followup?.let { FollowupCard(it, composer, kind) }
             val notice = composer.notice ?: composerError(view?.error)
             if (notice != null) {
@@ -229,7 +235,7 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState,
                 else permission.launch(Manifest.permission.CAMERA)
             }
             val onFiles = { files.launch(arrayOf("image/*")) }
-            if (compact) {
+            if (dense) {
                 // The input gets the full width; controls sit on one compact row below it.
                 BasicTextField(
                     value = composer.field,
@@ -249,7 +255,14 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState,
                     minLines = 1, maxLines = 6,
                     keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
                 )
-                Row(Modifier.fillMaxWidth().testTag("composer-actions"), verticalAlignment = Alignment.CenterVertically,
+                if (wideRow) WideComposerRow(view?.catalogs, view?.selection, provider,
+                    fresh = state.thread?.rows?.isEmpty() == true && state.turn == null, onPicker = { picker = it },
+                    attach = { AttachButton(enabled = attach, onPhotos = onPhotos, onCamera = onCamera, onFiles = onFiles) },
+                    actions = {
+                        if (running) StopControl(state.stopping, state.canStop, model::stop, Modifier.testTag(COMPOSER_STOP))
+                        sendButton(canSubmit)
+                    })
+                else Row(Modifier.fillMaxWidth().testTag("composer-actions"), verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(2.dp)) {
                     if (view != null) CompactSettings(view, state, provider, attach, onPicker = { picker = it },
                         onPhotos = onPhotos, onCamera = onCamera, onFiles = onFiles, onBrain = onBrain)
@@ -533,10 +546,44 @@ private fun SettingsControls(view: ChatComposerView, state: TranscriptState, pro
     }
 }
 
+/**
+ * The wide-window composer's single row: attach, the settings chips, then send. The model chip takes
+ * only the width its label needs and gives way last, so it truncates only when the row truly runs out.
+ */
+@Composable
+internal fun WideComposerRow(catalogs: ChatCatalogs?, selection: ChatSelection?, provider: String?, fresh: Boolean,
+    onPicker: (ComposerPicker) -> Unit, attach: @Composable () -> Unit, actions: @Composable () -> Unit) {
+    BoxWithConstraints(Modifier.fillMaxWidth()) {
+        // A two-pane chat can be this narrow; everything but the model then shows as an icon.
+        val tight = maxWidth < 480.dp
+        Row(Modifier.fillMaxWidth().testTag("composer-actions"), verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            attach()
+            Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                if (catalogs != null && selection != null) {
+                    val c = catalogs
+                    val s = selection
+                    if (fresh) SettingChip("Provider", PROVIDERS.find { it.first == provider }?.second ?: provider ?: "Provider", provider, compact = tight) { onPicker(ComposerPicker.Provider) }
+                    SettingChip("Model", composerChoiceLabel(c.models, s.model ?: c.models.firstOrNull()?.id) ?: "Model", provider,
+                        modifier = Modifier.weight(1f, fill = false), maxWidth = 360.dp) { onPicker(ComposerPicker.Model) }
+                    if (c.efforts.isNotEmpty()) SettingChip("Effort", composerChoiceLabel(c.efforts, s.effort) ?: "Default", compact = tight,
+                        icon = R.drawable.composer_reasoning,
+                        fill = ((c.efforts.indexOfFirst { it.id == (s.effort ?: "") }.coerceAtLeast(0) + 1).toFloat() / c.efforts.size)) { onPicker(ComposerPicker.Effort) }
+                    if (c.speeds.size > 1) SettingChip("Speed", composerChoiceLabel(c.speeds, s.speed ?: "off") ?: "Standard", compact = tight,
+                        icon = if (s.speed == "on") R.drawable.composer_fast else R.drawable.composer_standard) { onPicker(ComposerPicker.Speed) }
+                    if (c.access.isNotEmpty()) SettingChip("Access", composerChoiceLabel(c.access, s.access) ?: "Access", compact = tight,
+                        icon = if ((s.access ?: c.access.firstOrNull()?.id) == "full_access") R.drawable.composer_unlocked else R.drawable.composer_locked) { onPicker(ComposerPicker.Access) }
+                }
+            }
+            actions()
+        }
+    }
+}
+
 @Composable
 private fun SettingChip(name: String, value: String, provider: String? = null,
     icon: Int? = null, fill: Float = 1f, compact: Boolean = false,
-    modifier: Modifier = Modifier, onClick: () -> Unit) {
+    modifier: Modifier = Modifier, maxWidth: Dp = 220.dp, onClick: () -> Unit) {
     val leading: (@Composable () -> Unit)? = if (provider != null) {
         { ProviderGlyph(provider, Modifier.size(14.dp)) }
     } else icon?.let { resource -> {
@@ -554,7 +601,7 @@ private fun SettingChip(name: String, value: String, provider: String? = null,
         maxLines = 1, overflow = TextOverflow.Ellipsis) },
         shape = RoundedCornerShape(14.dp), border = null,
         colors = AssistChipDefaults.assistChipColors(containerColor = VerdeColors.PanelAlt, labelColor = VerdeColors.Muted),
-        modifier = controlModifier.widthIn(max = 220.dp))
+        modifier = controlModifier.widthIn(max = maxWidth))
 }
 
 /** Shared glyph rendering for toolbar controls and their picker rows. */

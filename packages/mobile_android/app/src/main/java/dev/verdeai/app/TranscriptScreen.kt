@@ -176,6 +176,7 @@ internal fun TranscriptScreen(
     val now = rememberNow(state.turn?.started_at_ms != null)
     val context = TranscriptContext(model, now, onCitation, state.turn?.started_at_ms, threads, onOpenThread, gitChanges)
     val openDrawer = LocalWorkspaceMenu.current
+    val tier = LocalWindowTier.current
     var chatMenu by remember { mutableStateOf(false) }
     Box(Modifier.fillMaxSize()) {
     Column(Modifier.fillMaxSize()) {
@@ -190,7 +191,8 @@ internal fun TranscriptScreen(
             },
             showWorkspaceMenu = false,
             navigationIcon = {
-                Row {
+                // Beside a permanent sidebar neither has a job: chats are switched from the list.
+                if (!tier.docked) Row {
                     IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back") }
                     openDrawer?.let { open ->
                         IconButton(onClick = open) { Icon(Icons.Filled.Menu, contentDescription = "Open workspace drawer") }
@@ -198,6 +200,7 @@ internal fun TranscriptScreen(
                 }
             },
             actions = {
+                if (tier.wide) gitChanges?.let { GitChangesInlineActions(it) }
                 if (onThreadAction != null) Box {
                     val thread = state.thread?.thread
                     IconButton(onClick = { chatMenu = true }, enabled = thread != null) {
@@ -214,7 +217,7 @@ internal fun TranscriptScreen(
                     }
                 }
             })
-        gitChanges?.let { GitChangesHeader(it) }
+        gitChanges?.let { if (tier.wide) GitChangesInlineNotes(it) else GitChangesHeader(it) }
         transcriptBanner(state, now)?.let { banner ->
             BannerCard(banner, onRetry = { if (state.thread?.error != null) model.retry() else onRetryConnection() }, onHosts = onHosts)
         }
@@ -297,7 +300,7 @@ internal fun TranscriptList(items: List<TranscriptItem>, state: TranscriptState,
     Box(Modifier.fillMaxSize()) {
         LazyColumn(Modifier.fillMaxSize().testTag(TRANSCRIPT_LIST), state = list, reverseLayout = true,
             contentPadding = contentPadding, verticalArrangement = Arrangement.spacedBy(spacing, Alignment.Bottom)) {
-            items(reversed, key = { it.key }, contentType = { it::class }) { item -> renderers.Render(item, ctx) }
+            items(reversed, key = { it.key }, contentType = { it::class }) { item -> TranscriptItemFrame(item) { renderers.Render(item, ctx) } }
             item(key = "page-header", contentType = "header") { PageHeader(page, ctx.model) }
         }
         ApprovalBanner(reversed, list, ctx.model.approvals, Modifier.align(Alignment.TopCenter))

@@ -17,11 +17,15 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.PointerInputChange
@@ -240,27 +244,16 @@ internal fun talkChip(state: TalkState): String? = when (state) {
     is TalkState.Finishing -> state.partial.ifBlank { "Sending…" }
 }
 
+/** What the bubble or the dock says right now, and how to dismiss a pop-up. */
+internal class BubbleChip(val text: String?, val clear: () -> Unit)
+
 /**
- * Full-window overlay holding the bubble. It never consumes touches outside the bubble and its
- * speech chip. While [shown] is false nothing is drawn, but needs/replies are still marked seen.
+ * Pop-ups for a [shown] bubble or dock. Runs whether or not either is showing, so needs and replies
+ * are still marked seen while hidden.
  */
 @Composable
-internal fun CompanionBubbleLayer(
-    shown: Boolean,
-    hostId: String?,
-    name: String,
-    character: CompanionCharacter,
-    pose: CompanionPose,
-    needKeys: Set<String>,
-    running: Boolean,
-    replyAt: Long?,
-    replyText: () -> String?,
-    talk: BubbleTalk?,
-    live: BubbleLive? = null,
-    onOpen: () -> Unit,
-) {
-    val context = LocalContext.current
-    val prefs = remember(context) { BubblePrefs.of(context) }
+internal fun rememberBubbleChip(shown: Boolean, hostId: String?, name: String, needKeys: Set<String>, replyAt: Long?,
+    replyText: () -> String?, talk: BubbleTalk?): BubbleChip {
     var seen by remember(hostId) { mutableStateOf(BubbleSeen()) }
     var popup by remember(hostId) { mutableStateOf<Pair<Int, String>?>(null) }
     var serial by remember { mutableIntStateOf(0) }
@@ -279,18 +272,122 @@ internal fun CompanionBubbleLayer(
     LaunchedEffect(shown) { if (!shown) popup = null }
     val talkError = talk?.error
     LaunchedEffect(talkError) { if (talkError != null) { delay(BUBBLE_POPUP_MS); talk?.clearError() } }
-    if (!shown) return
     // While Live the call bar shows status and captions, so the bubble has no Live chip.
-    val chip = talk?.let { talkChip(it.state) } ?: talkError ?: popup?.second
-    CompanionBubble(prefs, name, character, pose, needKeys.size, running, chip, talk, live,
+    return BubbleChip(talk?.let { talkChip(it.state) } ?: talkError ?: popup?.second) { popup = null }
+}
+
+/**
+ * Full-window overlay holding the bubble. It never consumes touches outside the bubble and its
+ * speech chip.
+ */
+@Composable
+internal fun CompanionBubbleLayer(
+    shown: Boolean,
+    chip: BubbleChip,
+    name: String,
+    character: CompanionCharacter,
+    pose: CompanionPose,
+    count: Int,
+    running: Boolean,
+    talk: BubbleTalk?,
+    live: BubbleLive? = null,
+    onOpen: () -> Unit,
+) {
+    val context = LocalContext.current
+    val prefs = remember(context) { BubblePrefs.of(context) }
+    if (!shown) return
+    CompanionBubble(prefs, name, character, pose, count, running, chip.text, talk, live,
         // While Live, a tap ends it; otherwise it opens the sheet.
         onOpen = {
-            popup = null
+            chip.clear()
             talk?.stopSpeaking()
             val ending = live?.takeIf { it.active }
             if (ending != null) ending.toggle() else onOpen()
         },
-        onHide = { popup = null; prefs.updateHidden(true) })
+        onHide = { chip.clear(); prefs.updateHidden(true) })
+}
+
+internal const val COMPANION_DOCK = "companion-dock"
+
+/** Everything the docked Moss shows; the same hooks the floating bubble has. */
+internal class CompanionDockState(val name: String, val character: CompanionCharacter, val pose: CompanionPose, val count: Int,
+    val running: Boolean, val chip: BubbleChip, val talk: BubbleTalk?, val live: BubbleLive?, val opened: Boolean, val onToggle: () -> Unit)
+
+/** Moss in the permanent sidebar instead of floating over content: tap to open, plus talk and Live. */
+@Composable
+internal fun CompanionDock(state: CompanionDockState) {
+    Column(Modifier.fillMaxWidth().padding(horizontal = 8.dp).testTag(COMPANION_DOCK)) {
+        state.chip.text?.let { text ->
+            androidx.compose.foundation.text.selection.SelectionContainer {
+                Text(text, Modifier.padding(horizontal = 8.dp, vertical = 4.dp).testTag(COMPANION_BUBBLE_POPUP),
+                    style = MaterialTheme.typography.bodySmall, color = VerdeColors.Muted, maxLines = 3, overflow = TextOverflow.Ellipsis)
+            }
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Row(Modifier.weight(1f).heightIn(min = 48.dp).clip(RoundedCornerShape(7.dp))
+                .background(if (state.opened) VerdeColors.AccentWash else VerdeColors.Panel)
+                .clickable(role = Role.Button, onClickLabel = if (state.opened) "Close ${state.name}" else "Open ${state.name}", onClick = { dockToggle(state) })
+                .semantics(mergeDescendants = true) { contentDescription = bubbleDescription(state.name, state.count) }
+                .padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                DockAvatar(state)
+                Text(state.name, style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+            state.talk?.let { DockTalk(it, state.name) }
+            state.live?.let { LiveButton(it.active, it.toggle) }
+        }
+    }
+}
+
+/** The dock's vertical form, for the collapsed sidebar's rail. */
+@Composable
+internal fun CompanionRailDock(state: CompanionDockState) {
+    state.live?.let { LiveButton(it.active, it.toggle) }
+    state.talk?.let { DockTalk(it, state.name) }
+    Box(Modifier.size(48.dp).clip(CircleShape)
+        .clickable(role = Role.Button, onClickLabel = if (state.opened) "Close ${state.name}" else "Open ${state.name}", onClick = { dockToggle(state) })
+        .semantics(mergeDescendants = true) { contentDescription = bubbleDescription(state.name, state.count) }
+        .testTag(COMPANION_DOCK), contentAlignment = Alignment.Center) { DockAvatar(state) }
+}
+
+private fun dockToggle(state: CompanionDockState) {
+    state.chip.clear()
+    state.talk?.stopSpeaking()
+    state.onToggle()
+}
+
+@Composable
+private fun DockAvatar(state: CompanionDockState) {
+    val context = LocalContext.current
+    val reduced = remember(context) { reducedMotion(context) }
+    val talking = state.talk != null && state.talk.state !is TalkState.Idle
+    Box(Modifier.size(36.dp), contentAlignment = Alignment.Center) {
+        if (state.running || talking) RunningRing(reduced)
+        CompanionAvatar(state.character, if (talking) CompanionPose.Working else state.pose, size = 28.dp)
+        if (state.count > 0) NeedsBadge(state.count, Modifier.align(Alignment.TopEnd))
+    }
+}
+
+/** Tap to talk and tap again to send, so it works from a hardware keyboard; hold-to-talk stays on Moss's composer. */
+@Composable
+private fun DockTalk(talk: BubbleTalk, name: String) {
+    val listening = talk.state !is TalkState.Idle
+    if (talk.state is TalkState.Listening) IconButton(onClick = talk.cancel) {
+        Icon(Icons.Filled.Close, contentDescription = "Cancel recording", tint = VerdeColors.Muted)
+    }
+    IconButton(onClick = {
+        when {
+            listening -> talk.release()
+            talk.speaking -> talk.stopSpeaking()
+            else -> talk.start()
+        }
+    }) {
+        Icon(painterResource(if (talk.speaking && !listening) R.drawable.ic_waveform else R.drawable.ic_mic),
+            contentDescription = when {
+                listening -> "Stop and send"
+                talk.speaking -> "Stop speaking"
+                else -> "Talk to $name"
+            }, tint = if (listening || talk.speaking) VerdeColors.Accent else VerdeColors.Text, modifier = Modifier.size(20.dp))
+    }
 }
 
 private enum class BubbleGesture { Tap, Drag, Hold }
@@ -422,13 +519,18 @@ private fun CompanionBubble(prefs: BubblePrefs, name: String, character: Compani
                     contentAlignment = Alignment.Center) {
                     CompanionAvatar(character, if (talking) CompanionPose.Working else pose, size = 42.dp)
                 }
-                if (count > 0) Box(Modifier.align(Alignment.TopEnd).defaultMinSize(minWidth = 18.dp, minHeight = 18.dp)
-                    .background(VerdeColors.Danger, CircleShape).border(1.5.dp, VerdeColors.Background, CircleShape)
-                    .padding(horizontal = 4.dp), contentAlignment = Alignment.Center) {
-                    Text(badgeLabel(count), color = VerdeColors.Background, style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, lineHeight = 12.sp))
-                }
+                if (count > 0) NeedsBadge(count, Modifier.align(Alignment.TopEnd))
             }
         }
+    }
+}
+
+@Composable
+private fun NeedsBadge(count: Int, modifier: Modifier = Modifier) {
+    Box(modifier.defaultMinSize(minWidth = 18.dp, minHeight = 18.dp)
+        .background(VerdeColors.Danger, CircleShape).border(1.5.dp, VerdeColors.Background, CircleShape)
+        .padding(horizontal = 4.dp), contentAlignment = Alignment.Center) {
+        Text(badgeLabel(count), color = VerdeColors.Background, style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, lineHeight = 12.sp))
     }
 }
 

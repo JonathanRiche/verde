@@ -54,41 +54,80 @@ internal fun GitChangesHeader(model: GitChangesModel) {
         return
     }
     if (summary.files == 0 && ahead == 0 && state.rejectedRoots.isEmpty()) return
-    var menu by remember { mutableStateOf(false) }
     val writable = access == GitAccess.Writable
-    val label = if (!writable) "Changes" else if (summary.files == 0) "↑$ahead Push" else state.snapshot.settings.action.label
-    val color = if (summary.attention > 0) VerdeColors.Warning else VerdeColors.Accent
     Column(Modifier.fillMaxWidth().background(VerdeColors.Panel).padding(horizontal = 12.dp, vertical = 4.dp)) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Text(if (summary.files > 0) "+${summary.additions}  −${summary.deletions}" else "Unpushed commits",
                 Modifier.weight(1f), style = MaterialTheme.typography.labelMedium, color = VerdeColors.Muted)
-            Surface(shape = RoundedCornerShape(7.dp), border = BorderStroke(1.dp, color.copy(alpha = .5f)), color = color.copy(alpha = .10f)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    TextButton(onClick = {
-                        if (!writable) model.open(GitAction.Commit)
-                        else if (summary.files == 0) model.push()
-                        else model.open(state.snapshot.settings.action, quick = true)
-                    }, enabled = !state.busy && !state.loading && state.snapshot.connected, modifier = Modifier.testTag("git-primary")) {
-                        Text(if (state.checking) "Checking commit…" else if (state.busy) "Working…" else label, color = color)
-                        if (summary.files > 0) Text((summary.files - summary.attention).coerceAtLeast(0).toString(), Modifier.padding(start = 8.dp).background(color.copy(alpha = .16f), CircleShape).padding(horizontal = 6.dp, vertical = 2.dp), color = color)
-                    }
-                    if (writable) Box {
-                        IconButton(onClick = { menu = true }, enabled = !state.busy && !state.loading && state.snapshot.connected, modifier = Modifier.size(44.dp)) {
-                            Icon(Icons.Filled.KeyboardArrowDown, "Git actions", tint = color)
-                        }
-                        DropdownMenu(menu, onDismissRequest = { menu = false }) {
-                            LiveOverMenu()
-                            DropdownMenuItem(text = { Text("Commit…") }, enabled = summary.files > 0, onClick = { menu = false; model.open(GitAction.Commit) })
-                            DropdownMenuItem(text = { Text("Commit & push") }, enabled = summary.files > 0, onClick = { menu = false; model.open(GitAction.CommitAndPush, true) })
-                            DropdownMenuItem(text = { Text("Push") }, enabled = branches.any { it.ahead > 0 && it.hasRemote }, onClick = { menu = false; model.push() })
-                            if (state.rejectedRoots.isNotEmpty()) DropdownMenuItem(text = { Text("Pull & push") }, onClick = { menu = false; model.push(true) })
-                        }
-                    }
-                }
-            }
+            GitPrimaryAction(model, state, access, summary, branches, ahead)
         }
         if (state.canRetry) TextButton(onClick = model::retry) { Text("Check again") }
         if (!writable) Text(access.reason!!, style = MaterialTheme.typography.bodySmall, color = VerdeColors.Subtle)
+    }
+}
+
+/** Wide windows: the diff stat and Commit action sit in the chat header, so the transcript gains the row. */
+@Composable
+internal fun GitChangesInlineActions(model: GitChangesModel) {
+    val state by model.state.collectAsState()
+    val access = state.snapshot.access[model.chat] ?: GitAccess.Unavailable
+    val summary = state.snapshot.summaries[model.chat] ?: GitSummary()
+    val branches = state.snapshot.branches[model.chat].orEmpty()
+    val ahead = branches.filter { it.hasRemote }.sumOf { it.ahead }
+    if (access == GitAccess.Unavailable || access == GitAccess.Remote) return
+    if (summary.files == 0 && ahead == 0 && state.rejectedRoots.isEmpty()) return
+    if (summary.files > 0) Text("+${summary.additions}  −${summary.deletions}", Modifier.padding(end = 8.dp),
+        style = MaterialTheme.typography.labelMedium, color = VerdeColors.Muted, maxLines = 1)
+    GitPrimaryAction(model, state, access, summary, branches, ahead)
+}
+
+/** Wide windows: what doesn't fit a header (why git is limited, a retry) keeps a row, only while it applies. */
+@Composable
+internal fun GitChangesInlineNotes(model: GitChangesModel) {
+    val state by model.state.collectAsState()
+    val access = state.snapshot.access[model.chat] ?: GitAccess.Unavailable
+    val summary = state.snapshot.summaries[model.chat] ?: GitSummary()
+    val ahead = state.snapshot.branches[model.chat].orEmpty().filter { it.hasRemote }.sumOf { it.ahead }
+    if (access == GitAccess.Unavailable) return
+    val active = summary.files > 0 || ahead > 0 || state.rejectedRoots.isNotEmpty()
+    val reason = access.reason?.takeIf { access == GitAccess.Remote || (access != GitAccess.Writable && active) }
+    val retry = state.canRetry && active && access != GitAccess.Remote
+    if (reason == null && !retry) return
+    Column(Modifier.fillMaxWidth().background(VerdeColors.Panel).padding(horizontal = 12.dp, vertical = 4.dp)) {
+        if (retry) TextButton(onClick = model::retry) { Text("Check again") }
+        reason?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = VerdeColors.Subtle) }
+    }
+}
+
+@Composable
+private fun GitPrimaryAction(model: GitChangesModel, state: GitChangesState, access: GitAccess, summary: GitSummary, branches: List<GitBranch>, ahead: Int) {
+    var menu by remember { mutableStateOf(false) }
+    val writable = access == GitAccess.Writable
+    val label = if (!writable) "Changes" else if (summary.files == 0) "↑$ahead Push" else state.snapshot.settings.action.label
+    val color = if (summary.attention > 0) VerdeColors.Warning else VerdeColors.Accent
+    Surface(shape = RoundedCornerShape(7.dp), border = BorderStroke(1.dp, color.copy(alpha = .5f)), color = color.copy(alpha = .10f)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            TextButton(onClick = {
+                if (!writable) model.open(GitAction.Commit)
+                else if (summary.files == 0) model.push()
+                else model.open(state.snapshot.settings.action, quick = true)
+            }, enabled = !state.busy && !state.loading && state.snapshot.connected, modifier = Modifier.testTag("git-primary")) {
+                Text(if (state.checking) "Checking commit…" else if (state.busy) "Working…" else label, color = color)
+                if (summary.files > 0) Text((summary.files - summary.attention).coerceAtLeast(0).toString(), Modifier.padding(start = 8.dp).background(color.copy(alpha = .16f), CircleShape).padding(horizontal = 6.dp, vertical = 2.dp), color = color)
+            }
+            if (writable) Box {
+                IconButton(onClick = { menu = true }, enabled = !state.busy && !state.loading && state.snapshot.connected, modifier = Modifier.size(44.dp)) {
+                    Icon(Icons.Filled.KeyboardArrowDown, "Git actions", tint = color)
+                }
+                DropdownMenu(menu, onDismissRequest = { menu = false }) {
+                    LiveOverMenu()
+                    DropdownMenuItem(text = { Text("Commit…") }, enabled = summary.files > 0, onClick = { menu = false; model.open(GitAction.Commit) })
+                    DropdownMenuItem(text = { Text("Commit & push") }, enabled = summary.files > 0, onClick = { menu = false; model.open(GitAction.CommitAndPush, true) })
+                    DropdownMenuItem(text = { Text("Push") }, enabled = branches.any { it.ahead > 0 && it.hasRemote }, onClick = { menu = false; model.push() })
+                    if (state.rejectedRoots.isNotEmpty()) DropdownMenuItem(text = { Text("Pull & push") }, onClick = { menu = false; model.push(true) })
+                }
+            }
+        }
     }
 }
 

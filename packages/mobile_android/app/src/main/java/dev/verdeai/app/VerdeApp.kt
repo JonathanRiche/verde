@@ -72,7 +72,7 @@ internal fun VerdeApp(hosts: HostsModel, browse: BrowseModel, clock: UiClock = r
         AppearanceSystemBars()
         CompositionLocalProvider(LocalUiClock provides clock, LocalAppLockControls provides lock, LocalGitChangesClient provides gitClient,
             LocalPushControls provides push) {
-            val app = @Composable { if (hostsState.loading) HostsScreen(hosts) else Shell(hosts, browse, hostsState) }
+            val app = @Composable { if (hostsState.loading) HostsScreen(hosts) else AdaptiveWindow { Shell(hosts, browse, hostsState) } }
             if (lock != null) AppLockGate(lock.model, lock.auth, app) else app()
         }
     }
@@ -125,6 +125,12 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
     // Reset per host; survives rotation.
     var companionOpen by rememberSaveable(browseState.hostId) { mutableStateOf(false) }
     var companionSettings by rememberSaveable(browseState.hostId) { mutableStateOf(false) }
+    val tier = LocalWindowTier.current
+    // The user's choice, kept while the window narrows and widens again.
+    var sidebarCollapsed by rememberSaveable { mutableStateOf(false) }
+    val panes = shellPanes(tier, sidebarCollapsed, companionOpen && companionState.available, pairing)
+    // The modal drawer is unused while docked; a saved open state must not scrim the new layout.
+    LaunchedEffect(tier.docked) { if (tier.docked) drawer.snapTo(DrawerValue.Closed) }
     val companionNow = companionSnapshot(companionState, browseState)
     val companionActive = companionNow.active
     val onCompanionThread = route == Routes.THREAD && companionActive != null && companionActive.thread_id.isNotEmpty() &&
@@ -132,7 +138,11 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
     val drawerOpen = drawer.isOpen || drawer.targetValue == DrawerValue.Open
     val bubbleContext = LocalContext.current
     val bubblePrefs = remember(bubbleContext) { BubblePrefs.of(bubbleContext) }
-    fun leaveCompanion(route: String, tab: Boolean = false) { companionOpen = false; open(route, tab) }
+    // A sheet covers what it opens; a pane has it open beside it.
+    fun leaveCompanion(route: String, tab: Boolean = false) {
+        if (panes.moss == MossPlacement.Sheet) companionOpen = false
+        open(route, tab)
+    }
     // Companion voice: one recognizer/TTS for the activity, and the companion chat's model shared
     // by the bubble's hold-to-talk and the sheet.
     val voiceContext = bubbleContext.applicationContext
@@ -217,11 +227,8 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
             })
         }
     }
-    CompositionLocalProvider(LocalHiddenThreads provides companionThreads) {
-    Box(Modifier.fillMaxSize()) {
-    ModalNavigationDrawer(drawerState = drawer, gesturesEnabled = !pairing && !immersive,
-        drawerContent = {
-            WorkspaceDrawer(browseState, currentTab, visible = drawer.isOpen || drawer.targetValue == DrawerValue.Open, onClose = { scope.launch { drawer.close() } },
+    val workspaceDrawer: @Composable (Boolean, Boolean, () -> Unit, (@Composable () -> Unit)?) -> Unit = { persistent, visible, onClose, dock ->
+            WorkspaceDrawer(browseState, currentTab, visible = visible, onClose = onClose,
                 onTab = { open(it, tab = true) },
                 onThread = { ws, thread -> open(Routes.thread(ws, thread)) },
                 onHistory = { open(ManageRoutes.HISTORY) },
@@ -240,64 +247,10 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
                 onThreadAction = { thread, action -> scope.launch {
                     drawer.close()
                     threadAction = thread to action
-                } })
-        }) {
-        Scaffold(
-            contentWindowInsets = WindowInsets.safeDrawing,
-            topBar = {
-                if (!pairing && route in TABS) Box(Modifier.background(VerdeColors.Panel).statusBarsPadding()) {
-                    VerdeTopBar(title = { VerdeWordmark() },
-                        navigationIcon = { IconButton(onClick = { scope.launch { drawer.open() } }) {
-                            Icon(Icons.Filled.Menu, contentDescription = "Open workspace drawer")
-                        } }, actions = {
-                            HostSwitcher(hosts,
-                                // Hosts lists the machines; after a switch, land on the new host's Home.
-                                onSwitched = { if (nav.currentDestination?.route == Routes.HOSTS) nav.tab(Routes.HOME) },
-                                onPairing = { nav.tab(Routes.HOSTS) })
-                        })
-                }
-            },
-        ) { padding ->
-            Box(Modifier.padding(padding).consumeWindowInsets(padding)) {
-                CompositionLocalProvider(LocalWorkspaceMenu provides { scope.launch { drawer.open() }; Unit }) {
-                    Graph(nav, start, hosts, browse, manage) { thread, action -> threadAction = thread to action }
-                }
-            }
-        }
+                } },
+                persistent = persistent, dock = dock)
     }
-    if (companionState.available) {
-        val character = CompanionCharacter.of(companionActive?.character)
-        val name = companionActive?.name?.ifBlank { null } ?: character.label
-        val online = browseState.host?.phase == "ready" && browseState.networkAvailable
-        val thread = companionNow.companionThread
-        CompanionBubbleLayer(
-            shown = !companionOpen && !onCompanionThread && !pairing && !immersive && !drawerOpen && !hostsState.loading &&
-                !bubblePrefs.hidden,
-            hostId = browseState.hostId, name = name, character = character,
-            pose = companionPose(online, companionNow.needKeys.isNotEmpty(), companionNow.crewRunning),
-            needKeys = companionNow.needKeys, running = companionNow.crewRunning,
-            replyAt = thread?.takeIf { !activeTurn(it.status) }?.last_activity_at_ms,
-            replyText = { companionActive?.let { companion.latestReply(it.home_workspace_id, it.thread_id) } },
-            live = if (liveView?.supported == false) null else BubbleLive(liveUi.active, { maxOf(liveLevel, liveInput) }, ::toggleLive),
-            talk = if (!voice.available || liveUi.active) null else BubbleTalk(talkState, talkLevel, talkSpeaking, talkError,
-                start = {
-                    val model = companionTranscript
-                    when {
-                        // No conversation yet: the sheet sets one up first.
-                        model == null -> { companionSettings = false; companionOpen = true; false }
-                        !mic.granted() -> { mic.request(); false }
-                        else -> { voice.press(model, liveDraft = false); true }
-                    }
-                },
-                move = voice::move, release = voice::release, cancel = voice::cancel,
-                stopSpeaking = voice::stopSpeaking, clearError = voice::clearError),
-            onOpen = { companionSettings = false; companionOpen = true })
-    }
-    // Last, so it floats above every screen, the drawer and the bubble.
-    if (callUp) LiveShellBar(liveBar, statusTop)
-    }
-    }
-    if (companionOpen && companionState.available) {
+    val companionPanel: @Composable (MossPlacement) -> Unit = { placement ->
         CompanionSheet(hosts, browse, manage, companion,
             onOpenPane = { pane ->
                 val paneThread = pane.thread_id
@@ -314,8 +267,79 @@ private fun Shell(hosts: HostsModel, browse: BrowseModel, hostsState: HostsState
             onHideBubble = { bubblePrefs.updateHidden(true) },
             live = live, onLive = ::toggleLive,
             liveExpanded = liveExpanded, onLiveExpanded = { liveExpanded = it },
+            placement = placement,
             onDismiss = { companionOpen = false; companionSettings = false })
     }
+    CompositionLocalProvider(LocalHiddenThreads provides companionThreads) {
+    // Moss on a docked window: in the sidebar, or its rail, rather than floating over the content.
+    val companionUp = companionState.available && !bubblePrefs.hidden && !pairing
+    val bubbleShown = companionUp && !tier.docked && !companionOpen && !onCompanionThread && !immersive && !drawerOpen && !hostsState.loading
+    val dockShown = companionUp && tier.docked && panes.moss != MossPlacement.SidebarSlot
+    val companionCharacter = CompanionCharacter.of(companionActive?.character)
+    val companionName = companionActive?.name?.ifBlank { null } ?: companionCharacter.label
+    val companionPoseNow = companionPose(browseState.host?.phase == "ready" && browseState.networkAvailable, companionNow.needKeys.isNotEmpty(), companionNow.crewRunning)
+    val bubbleLive = if (liveView?.supported == false) null else BubbleLive(liveUi.active, { maxOf(liveLevel, liveInput) }, ::toggleLive)
+    val bubbleTalk = if (!voice.available || liveUi.active) null else BubbleTalk(talkState, talkLevel, talkSpeaking, talkError,
+        start = {
+            val model = companionTranscript
+            when {
+                // No conversation yet: the sheet sets one up first.
+                model == null -> { companionSettings = false; companionOpen = true; false }
+                !mic.granted() -> { mic.request(); false }
+                else -> { voice.press(model, liveDraft = false); true }
+            }
+        },
+        move = voice::move, release = voice::release, cancel = voice::cancel,
+        stopSpeaking = voice::stopSpeaking, clearError = voice::clearError)
+    val bubbleChip = rememberBubbleChip(bubbleShown || (dockShown && !companionOpen), browseState.hostId, companionName, companionNow.needKeys,
+        companionNow.companionThread?.takeIf { !activeTurn(it.status) }?.last_activity_at_ms,
+        { companionActive?.let { companion.latestReply(it.home_workspace_id, it.thread_id) } }, bubbleTalk)
+    val dockState = if (dockShown) CompanionDockState(companionName, companionCharacter, companionPoseNow, companionNow.needKeys.size,
+        companionNow.crewRunning, bubbleChip, bubbleTalk, bubbleLive, opened = companionOpen,
+        onToggle = { companionSettings = false; companionOpen = !companionOpen }) else null
+    Box(Modifier.fillMaxSize()) {
+    ModalNavigationDrawer(drawerState = drawer, gesturesEnabled = !pairing && !immersive && !tier.docked,
+        drawerContent = {
+            if (tier.docked) Spacer(Modifier.size(0.dp))
+            else workspaceDrawer(false, drawer.isOpen || drawer.targetValue == DrawerValue.Open, { scope.launch { drawer.close() } }, null)
+        }) {
+        AdaptiveShellFrame(panes,
+            sidebar = { workspaceDrawer(true, true, { sidebarCollapsed = true }, dockState?.let { { CompanionDock(it) } }) },
+            rail = { SidebarRail(onExpand = { sidebarCollapsed = false }, onNewChat = { open(ManageRoutes.newChat(null)) },
+                dock = dockState?.let { { CompanionRailDock(it) } }) },
+            moss = { companionPanel(panes.moss) }) {
+        Scaffold(
+            contentWindowInsets = contentWindowInsets(tier, panes),
+            topBar = {
+                if (!pairing && route in TABS) Box(Modifier.background(VerdeColors.Panel).statusBarsPadding()) {
+                    VerdeTopBar(title = { VerdeWordmark() },
+                        navigationIcon = { if (!tier.docked) IconButton(onClick = { scope.launch { drawer.open() } }) {
+                            Icon(Icons.Filled.Menu, contentDescription = "Open workspace drawer")
+                        } }, actions = {
+                            HostSwitcher(hosts,
+                                // Hosts lists the machines; after a switch, land on the new host's Home.
+                                onSwitched = { if (nav.currentDestination?.route == Routes.HOSTS) nav.tab(Routes.HOME) },
+                                onPairing = { nav.tab(Routes.HOSTS) })
+                        })
+                }
+            },
+        ) { padding ->
+            Box(Modifier.padding(padding).consumeWindowInsets(padding)) {
+                CompositionLocalProvider(LocalWorkspaceMenu provides (if (tier.docked) null else ({ scope.launch { drawer.open() }; Unit }))) {
+                    Graph(nav, start, hosts, browse, manage) { thread, action -> threadAction = thread to action }
+                }
+            }
+        }
+        }
+    }
+    if (companionState.available) CompanionBubbleLayer(bubbleShown, bubbleChip, companionName, companionCharacter, companionPoseNow,
+        companionNow.needKeys.size, companionNow.crewRunning, bubbleTalk, bubbleLive,
+        onOpen = { companionSettings = false; companionOpen = true })
+    // Last, so it floats above every screen, the drawer and the bubble.
+    if (callUp) LiveShellBar(liveBar, statusTop)
+    }
+    }
+    if (panes.moss == MossPlacement.Sheet) companionPanel(MossPlacement.Sheet)
     }
 }
 
@@ -347,7 +371,8 @@ private fun Graph(nav: NavHostController, start: String, hosts: HostsModel, brow
     NavHost(nav, startDestination = start) {
         composable(Routes.HOME) {
             HomeScreen(browse, openPane, openThread, openWorkspace, showHosts, pair,
-                onNewChat = { nav.navigate(ManageRoutes.newChat(null)) }, onHistory = { nav.navigate(ManageRoutes.HISTORY) })
+                // Docked windows have it in the sidebar, not floating over content.
+                onNewChat = if (LocalWindowTier.current.docked) null else ({ nav.navigate(ManageRoutes.newChat(null)) }), onHistory = { nav.navigate(ManageRoutes.HISTORY) })
         }
         composable(Routes.WORKSPACES) { WorkspacesScreen(browse, openWorkspace, showHosts, pair) { nav.navigate(ManageRoutes.ADD_WORKSPACE) } }
         composable(Routes.HOSTS) {

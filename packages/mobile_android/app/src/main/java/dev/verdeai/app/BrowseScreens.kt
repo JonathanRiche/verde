@@ -225,6 +225,9 @@ private fun paneProvider(state: BrowseState, pane: Pane): String? =
     state.workspaces?.items?.find { it.workspace_id == pane.workspace_id }
         ?.let(::workspaceThreads)?.find { it.thread_id == pane.thread_id }?.provider
 
+/** Glyph plus two dots: titles line up whether or not a row has the git dot. */
+private val HOME_LEADING_WIDTH = 49.dp
+
 @Composable
 private fun PaneItem(pane: Pane, now: Long, onOpen: (Pane) -> Unit, provider: String? = null) {
     @Suppress("DEPRECATION") val clipboard = LocalClipboardManager.current
@@ -234,7 +237,7 @@ private fun PaneItem(pane: Pane, now: Long, onOpen: (Pane) -> Unit, provider: St
         add("Copy title" to { clipboard.setText(AnnotatedString(pane.title)) })
     }
     MenuRow(pane.title, paneLine(pane, now), canOpen, { onOpen(pane) }, menu,
-        leading = { Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        leading = { Row(Modifier.widthIn(min = HOME_LEADING_WIDTH), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             if (pane.kind == "chat") ProviderGlyph(provider) else if (pane.provider != null) ProviderGlyph(pane.provider)
             Dot(statusColor(pane.status, pane.attention), paneLabel(pane), activeStatus(pane.status))
         } },
@@ -248,7 +251,7 @@ private fun ThreadItem(thread: ThreadSummary, now: Long, workspaceLabel: String?
         thread.last_activity_at_ms?.let { agoLabel(it, now) })
     MenuRow(thread.title, parts.joinToString(" · ").ifEmpty { null }, true, { onOpen(thread) },
         listOf("Open" to { onOpen(thread) }, "Copy title" to { clipboard.setText(AnnotatedString(thread.title)) }),
-        leading = { Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        leading = { Row(Modifier.widthIn(min = HOME_LEADING_WIDTH), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             ProviderGlyph(thread.provider)
             GitChangesDot(GitChat(thread.workspace_id, thread.thread_id))
             Dot(statusColor(thread.status, thread.status == "waiting_approval"), statusLabel(thread.status), activeStatus(thread.status))
