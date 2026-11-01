@@ -75,9 +75,10 @@ struct PushTarget: Equatable, Sendable {
 final class VisibleThread: @unchecked Sendable {
     static let shared = VisibleThread()
     private let lock = NSLock()
-    private var key: String?
-    var current: String? { lock.lock(); defer { lock.unlock() }; return key }
-    func set(_ value: String?) { lock.lock(); key = value; lock.unlock() }
+    /// More than one on wide windows, where Moss sits beside a chat.
+    private var keys: [String] = []
+    var current: [String] { lock.lock(); defer { lock.unlock() }; return keys }
+    func set(_ value: [String]) { lock.lock(); keys = value; lock.unlock() }
 }
 
 /// Notification interactions waiting for the UI, and forwarding to the host cores.
@@ -97,8 +98,8 @@ final class PushInbox {
 }
 
 /// Foreground presentation: a push for the chat already on screen is not shown again.
-func presentationOptions(for target: PushTarget?, visible: String?) -> UNNotificationPresentationOptions {
-    if let key = target?.threadKey, key == visible { return [] }
+func presentationOptions(for target: PushTarget?, visible: [String]) -> UNNotificationPresentationOptions {
+    if let key = target?.threadKey, visible.contains(key) { return [] }
     return [.banner, .list, .sound]
 }
 

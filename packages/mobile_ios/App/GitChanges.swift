@@ -5,6 +5,7 @@ struct GitChatControls: View {
     let workspace: String
     let thread: String
     let model: GitChangesModel?
+    @Environment(\.adaptive) private var adaptive
     private var controls: some View {
         Group {
             if let model {
@@ -19,6 +20,11 @@ struct GitChatControls: View {
                             HStack(spacing: 4) {
                                 Text(model.canCommit ? model.label : "Changes").lineLimit(1)
                                 if model.change != nil { Text("\(model.mineCount)").monospacedDigit() }
+                                // Wide windows have room for the diff stat in the header.
+                                if adaptive.tier.wide, let change = model.change, change.additions + change.deletions > 0 {
+                                    Text("+\(change.additions)").monospacedDigit().foregroundStyle(VerdeTheme.accent)
+                                    Text("−\(change.deletions)").monospacedDigit().foregroundStyle(VerdeTheme.danger)
+                                }
                             }.padding(.horizontal, 8).padding(.vertical, 7)
                         }.disabled(model.busy)
                         if model.canCommit {

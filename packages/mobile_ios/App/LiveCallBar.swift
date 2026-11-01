@@ -31,6 +31,8 @@ enum LiveBarBase: Sendable {
     case app
     /// The open Companion sheet.
     case companionSheet
+    /// The open Companion pane beside the chat; its own sheets present from the app.
+    case companionPane
 }
 
 /// The call bar: the pill and captions while a call connects or runs, or why it stopped.

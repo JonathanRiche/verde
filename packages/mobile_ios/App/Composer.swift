@@ -32,6 +32,9 @@ struct ChatComposer: View {
     let availableHeight: CGFloat
     var compact: CompactComposer? = nil
     @Environment(\.scenePhase) private var scenePhase
+    /// Wide windows put the setting chips on the attach and send row. The text view keeps its
+    /// place in the tree either way, so crossing the threshold keeps its text and keyboard focus.
+    @Environment(\.adaptive) private var adaptive
     @State private var picker: ComposerPicker?
     @State private var photo: PhotosPickerItem?
     /// The library picker is presented from the composer, not embedded in the attach menu: a
@@ -143,7 +146,7 @@ struct ChatComposer: View {
         VStack(alignment: .leading, spacing: 8) {
             extras
             Capsule().fill(VerdeTheme.border).frame(width: 40, height: 4)
-                .frame(maxWidth: .infinity).frame(height: 24).contentShape(Rectangle())
+                .frame(maxWidth: .infinity).frame(height: adaptive.tier.wide ? 14 : 24).contentShape(Rectangle())
                 .gesture(DragGesture(minimumDistance: 2).onChanged { value in
                     if dragStart == nil { dragStart = promptHeight }
                     resizedHeight = composerPromptHeight((dragStart ?? 56) - value.translation.height, available: availableHeight)
@@ -165,12 +168,14 @@ struct ChatComposer: View {
                     }
                 }
                 .accessibilityIdentifier("composer-field")
-            if visiblePickers.contains(.provider) { settingButton(.provider, compact: false) }
-            HStack(spacing: 4) {
-                ForEach(visiblePickers.filter { $0 != .provider }) { kind in
-                    settingButton(kind, compact: kind == .speed || kind == .access)
-                        .frame(maxWidth: kind == .model ? .infinity : kind == .effort ? 100 : 44)
-                        .layoutPriority(kind == .model ? 0 : 1)
+            if !adaptive.tier.wide {
+                if visiblePickers.contains(.provider) { settingButton(.provider, compact: false) }
+                HStack(spacing: 4) {
+                    ForEach(visiblePickers.filter { $0 != .provider }) { kind in
+                        settingButton(kind, compact: kind == .speed || kind == .access)
+                            .frame(maxWidth: kind == .model ? .infinity : kind == .effort ? 100 : 44)
+                            .layoutPriority(kind == .model ? 0 : 1)
+                    }
                 }
             }
             HStack {
@@ -180,6 +185,15 @@ struct ChatComposer: View {
                     Button("Files", systemImage: "folder") { files = true }
                 } label: { Image(systemName: "paperclip").frame(width: 44, height: 44) }
                     .accessibilityLabel("Attach image").disabled(model.busy || model.pending)
+                if adaptive.tier.wide {
+                    // Full labels when they fit; a tight pane drops effort to its icon first, and
+                    // only with no room left does the model name truncate.
+                    ViewThatFits(in: .horizontal) {
+                        inlineSettings(effortIcon: false)
+                        inlineSettings(effortIcon: true)
+                    }
+                    .layoutPriority(1)
+                }
                 Spacer(minLength: 4)
                 if model.chat.state.turn != nil {
                     Button(action: model.chat.stopTurn) { Image(systemName: "stop.fill").font(.system(size: 10)).foregroundStyle(VerdeTheme.background).frame(width: 44, height: 44).background(VerdeTheme.warning, in: Circle()).modifier(Pulse(active: !model.chat.state.stopping, minimum: 0.74, period: 1.4)) }
@@ -198,6 +212,15 @@ struct ChatComposer: View {
         .background(VerdeTheme.panel, in: RoundedRectangle(cornerRadius: 14))
         .overlay(RoundedRectangle(cornerRadius: 14).stroke(focused ? VerdeTheme.accent : VerdeTheme.mutedPanel, lineWidth: focused ? 1.5 : 1))
         .padding(8)
+    }
+
+    /// Each chip at its natural width: the model neither stretches nor truncates when there is room.
+    private func inlineSettings(effortIcon: Bool) -> some View {
+        HStack(spacing: 4) {
+            ForEach(visiblePickers) { kind in
+                settingButton(kind, compact: kind == .speed || kind == .access || (kind == .effort && effortIcon), stretch: false)
+            }
+        }
     }
 
     /// The input on its own full-width row, then one compact row: "+", the brain chip, the mic,
@@ -367,7 +390,7 @@ struct ChatComposer: View {
     }
     private var promptHeight: CGFloat { composerPromptHeight(resizedHeight ?? 56, available: availableHeight) }
     private func resizePrompt(_ delta: CGFloat) { resizedHeight = composerPromptHeight(promptHeight + delta, available: availableHeight) }
-    private func settingButton(_ kind: ComposerPicker, compact: Bool) -> some View {
+    private func settingButton(_ kind: ComposerPicker, compact: Bool, stretch: Bool = true) -> some View {
         Button { picker = kind } label: {
             HStack(spacing: 6) {
                 if kind == .model { ProviderGlyph(provider: model.displayedSelection?.provider) }
@@ -381,7 +404,7 @@ struct ChatComposer: View {
                 }
                 if !compact { Text(selectionLabel(kind)).lineLimit(1).truncationMode(.tail) }
             }.font(VerdeTheme.ui(12)).padding(.horizontal, compact ? 0 : 10)
-                .frame(maxWidth: kind == .model ? .infinity : nil, minHeight: 44, alignment: kind == .model ? .leading : .center)
+                .frame(maxWidth: kind == .model && stretch ? .infinity : nil, minHeight: 44, alignment: kind == .model ? .leading : .center)
                 .frame(width: compact ? 44 : nil)
                 .background(VerdeTheme.alternate, in: Capsule())
         }.buttonStyle(.plain)

@@ -244,6 +244,7 @@ private struct Gate: View {
 struct HomeScreen: View {
     let model: BrowseModel
     let actions: BrowseActions
+    @Environment(\.adaptive) private var adaptive
     var body: some View {
         let hidden = model.companionThreads
         let panes = visiblePanes(model.state.home?.items ?? [], hidden: hidden)
@@ -274,7 +275,8 @@ struct HomeScreen: View {
             }
         }
         .safeAreaInset(edge: .bottom, alignment: .trailing, spacing: 0) {
-            if gateOpen(model.state), model.state.workspaces?.items.contains(where: \.open) == true {
+            // New chat docks in the permanent sidebar.
+            if !adaptive.tier.docked, gateOpen(model.state), model.state.workspaces?.items.contains(where: \.open) == true {
                 NavigationLink(value: BrowseRoute.newChat(nil)) {
                     Text("New chat").font(VerdeTheme.ui(14, bold: true))
                         .padding(.horizontal, 24).frame(minHeight: 56)
@@ -366,6 +368,7 @@ struct BrowseStack<Root: View>: View {
     let actions: BrowseActions
     @Binding var path: [BrowseRoute]
     @ViewBuilder let root: () -> Root
+    @Environment(\.adaptive) private var adaptive
     var body: some View {
         NavigationStack(path: $path) {
             root().modifier(VerdeNavigation()).navigationDestination(for: BrowseRoute.self) { route in
@@ -384,7 +387,12 @@ struct BrowseStack<Root: View>: View {
                 case .patch(let workspace, let root, let path): PatchRoute(browse: model, workspaceID: workspace, root: root, path: path)
                 case .workspaceFile(let workspace, let root, let path, let absolute):
                     WorkspaceFileRoute(browse: model, workspaceID: workspace, root: root, path: path, absolute: absolute)
-                } }.modifier(VerdeNavigation())
+                } }
+                // The sidebar replaces the route in place; a different route is a different screen.
+                .id(route)
+                .modifier(VerdeNavigation())
+                // The sidebar is the way back from the first screen; back stays for drill-downs.
+                .navigationBarBackButtonHidden(adaptive.tier.docked && path == [route])
             }
         }
         .environment(\.openRoute, { route in path.append(route) })

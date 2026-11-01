@@ -95,6 +95,8 @@ struct CompanionBubbleLayer: View {
     let sheetOpen: Bool
     /// Hidden on the companion's own chat screen, the drawer, etc. (polling continues).
     let visible: Bool
+    /// Moss is docked in the sidebar, whose status needs polling whatever the bubble's setting.
+    var docked = false
     let open: () -> Void
     let settings: () -> Void
 
@@ -116,7 +118,7 @@ struct CompanionBubbleLayer: View {
     @State private var tapTask: Task<Void, Never>?
 
     private var edge: BubbleEdge { BubbleEdge(rawValue: edgeRaw) ?? .trailing }
-    private var pollKey: String { [model.browse.hostID ?? "", String(scenePhase == .active), String(sheetOpen), String(hidden)].joined(separator: "/") }
+    private var pollKey: String { [model.browse.hostID ?? "", String(scenePhase == .active), String(sheetOpen), String(hidden), String(docked)].joined(separator: "/") }
     private var animation: Animation? { reduceMotion || AppearanceSettings.shared.reducedMotion ? nil : .spring(response: 0.32, dampingFraction: 0.82) }
 
     var body: some View {
@@ -137,7 +139,7 @@ struct CompanionBubbleLayer: View {
         .coordinateSpace(.named("companion-bubble"))
         // Polls ~4s with the sheet open, ~8s otherwise, only while the app is active.
         .task(id: pollKey) {
-            guard scenePhase == .active, !hidden || sheetOpen else { return }
+            guard scenePhase == .active, !hidden || sheetOpen || docked else { return }
             await model.poll(every: sheetOpen ? .seconds(4) : .seconds(8))
         }
         .onChange(of: popupSignature, initial: true) { _, _ in notePopup() }

@@ -113,6 +113,7 @@ struct TranscriptBody: View {
     var accessory: AnyView? = nil
     /// The Companion sheet's single-row composer.
     var compactComposer: CompactComposer? = nil
+    @Environment(\.adaptive) private var adaptive
 
     var body: some View {
         GeometryReader { geometry in
@@ -135,6 +136,8 @@ struct TranscriptBody: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 if let accessory { accessory }
                 ChatComposer(model: model.input, availableHeight: geometry.size.height, compact: compactComposer)
+                    // Lines up with the transcript's capped text (the card has 8 points of margin).
+                    .frame(maxWidth: adaptive.tier.wide && compactComposer == nil ? transcriptTextWidth + 16 : .infinity)
             }
         }
         .environment(\.openURL, OpenURLAction { url in
@@ -218,6 +221,7 @@ private struct TranscriptList: View {
     @State private var cardVisible = false
     @State private var settled = false
     @Environment(\.compactChat) private var compact
+    @Environment(\.adaptive) private var adaptive
 
     /// Changes whenever the bottom of the transcript grows (new row, streaming delta, turn state).
     private func tailKey(_ items: [TranscriptItem]) -> String {
@@ -239,6 +243,8 @@ private struct TranscriptList: View {
                             PageHeader(page: page, loadOlder: { model.loadOlder(force: true) }).id(headerID)
                             ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
                                 TranscriptRow(item: item, model: model, turnStartedAt: turn?.started_at_ms)
+                                    .frame(maxWidth: (compact ? nil : transcriptRowCap(item, tier: adaptive.tier)) ?? .infinity, alignment: .leading)
+                                    .frame(maxWidth: .infinity)
                                     .id(item.id)
                                     .onAppear {
                                         if index < prefetchItems { model.loadOlder() }
@@ -269,6 +275,11 @@ private struct TranscriptList: View {
                         settled = true
                     }
                     .accessibilityIdentifier("transcript-list")
+                    // A resize reflows every row; keep the reader on the row they were reading.
+                    .onChange(of: outer.size.width) {
+                        if follow { proxy.scrollTo(bottomID, anchor: .bottom) }
+                        else if let position { proxy.scrollTo(position, anchor: .top) }
+                    }
                     .onPreferenceChange(BottomOffsetKey.self) { maxY in
                         let bottom = maxY - viewport <= bottomSlack
                         if bottom != atBottom { atBottom = bottom }

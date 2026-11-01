@@ -70,6 +70,12 @@ struct RootView: View {
     @State private var tab: RootTab = .home
     @State private var path: [BrowseRoute] = []
     @State private var drawer = false
+    /// The width the shell has; drives the layout from outside its geometry reader too.
+    @State private var windowWidth: CGFloat = 0
+    /// The user hid the permanent sidebar (for a full-width diff or terminal).
+    @AppStorage("layout.sidebar.collapsed") private var sidebarCollapsed = false
+    /// The chat list is showing over Moss in the sidebar slot; Moss stays open behind it.
+    @State private var chatsPeek = false
     /// Drawer scope (nil = All Workspaces); survives drawer open/close, resets per host.
     @State private var workspaceScope: String?
     @Environment(\.accessibilityReduceMotion) private var reducedMotion
@@ -77,6 +83,8 @@ struct RootView: View {
     @State private var lock = AppLock()
     @State private var appearance = AppearanceSettings.shared
     @State private var settings = false
+    /// The user opened Moss: a sheet on narrow windows, a pane on wide ones. Only explicit user
+    /// actions set this, so Moss never opens itself and a resize keeps it as it was.
     @State private var companionSheet = false
     @State private var companionSettings = false
     /// The Live call bar's captions and full view, shared with the Companion sheet.
@@ -88,6 +96,7 @@ struct RootView: View {
             hosts.showPairing(hosts.active)
         })
         GeometryReader { geometry in
+            let panes = panesFor(width: geometry.size.width)
             ZStack(alignment: .leading) {
                 Group {
                     if tab == .hosts { HostsScreen(model: hosts) { tab = .home; path = [] } }
@@ -98,32 +107,40 @@ struct RootView: View {
                         }
                     }
                 }.allowsHitTesting(!drawer).accessibilityHidden(drawer)
+                .padding(.leading, panes.contentLeading).padding(.trailing, panes.contentTrailing)
+                if panes.tier.docked {
+                    workspaceDrawer(permanent: true)
+                        .frame(width: AdaptivePanes.sidebarWidth)
+                        .overlay(alignment: .trailing) { Rectangle().fill(VerdeTheme.border).frame(width: 1) }
+                        // Typing in the composer shouldn't squeeze the list beside it.
+                        .ignoresSafeArea(.keyboard, edges: .bottom)
+                        .adaptivePaneHidden(!panes.showsChats)
+                }
+                if panes.mossMounted {
+                    CompanionPane(name: companion.active?.name ?? "Companion", inSlot: panes.mossInSlot,
+                                  showChats: { chatsPeek = true }, close: { companionSheet = false }) {
+                        companionScreen(docked: true)
+                    }
+                    .frame(width: panes.mossWidth)
+                    .overlay(alignment: panes.mossInSlot ? .trailing : .leading) { Rectangle().fill(VerdeTheme.border).frame(width: 1) }
+                    .offset(x: panes.mossLeading)
+                    .adaptivePaneHidden(!panes.mossVisible)
+                }
                 if drawer {
                     Color.black.opacity(0.5).ignoresSafeArea().onTapGesture { drawer = false }.accessibilityLabel("Close workspace drawer").accessibilityAddTraits(.isButton)
-                    WorkspaceDrawer(browse: browse, selected: path.last, tab: tab, scope: $workspaceScope, close: { drawer = false }, open: { route in
-                        if tab == .hosts { tab = .home }
-                        path.append(route); drawer = false
-                    }, root: { next in tab = next; path = []; drawer = false }, settings: { drawer = false; settings = true })
+                    workspaceDrawer(permanent: false)
                     .allowsHitTesting(true).disabled(false).zIndex(2)
                     .frame(width: min(380, geometry.size.width * 0.92))
                     .transition(.move(edge: .leading))
                 }
                 if companion.available {
-                    CompanionBubbleLayer(model: companion, voice: companionVoice, live: live, sheetOpen: companionSheet, visible: bubbleVisible,
-                                         open: { companionSheet = true }, settings: { companionSettings = true })
+                    CompanionBubbleLayer(model: companion, voice: companionVoice, live: live, sheetOpen: companionSheet, visible: bubbleVisible && !panes.tier.docked,
+                                         docked: panes.tier.docked, open: { companionSheet = true }, settings: { companionSettings = true })
                         .zIndex(3)
-                        .sheet(isPresented: $companionSheet) {
-                            CompanionSheet(model: companion, browse: browse, voice: companionVoice, live: live, pill: livePill, open: { route in
-                                companionSheet = false
-                                if tab == .hosts { tab = .home }
-                                drawer = false
-                                path.append(route)
-                            }, showHome: {
-                                companionSheet = false
-                                drawer = false
-                                tab = .home
-                                path = []
-                            }, onHosts: { companionSheet = false; tab = .hosts })
+                        .sheet(isPresented: Binding(get: { companionSheet && !AdaptiveTier(width: windowWidth).docked },
+                                                    // Growing past the threshold hands Moss to the pane; only a dismissal closes it.
+                                                    set: { if !$0 && !AdaptiveTier(width: windowWidth).docked { companionSheet = false } })) {
+                            companionScreen(docked: false)
                             .presentationDetents([.medium, .large])
                             .presentationDragIndicator(.visible)
                             .preferredColorScheme(appearance.scheme)
@@ -134,13 +151,82 @@ struct RootView: View {
                 }
             }
             .animation(reducedMotion || appearance.reducedMotion ? nil : .easeOut(duration: 0.2), value: drawer)
-            .environment(\.openWorkspaceDrawer, { drawer = true })
+            .animation(reducedMotion || appearance.reducedMotion ? nil : .easeOut(duration: 0.2), value: sidebarCollapsed)
+            .animation(reducedMotion || appearance.reducedMotion ? nil : .easeOut(duration: 0.2), value: chatsPeek)
+            .environment(\.openWorkspaceDrawer, {
+                if currentPanes.tier.docked {
+                    sidebarCollapsed = false
+                    chatsPeek = currentPanes.mossInSlot
+                } else { drawer = true }
+            })
+            .environment(\.adaptive, AdaptiveContext(tier: panes.tier, slotVisible: panes.contentLeading > 0))
+            .onChange(of: geometry.size.width, initial: true) { _, width in windowWidth = width }
+            .onChange(of: panes.tier.docked) { _, docked in if docked { drawer = false } }
+            .onChange(of: companionSheet) { _, open in if !open { chatsPeek = false } }
             .onChange(of: browse.hostID) { workspaceScope = nil }
             .onChange(of: browse.state.workspaces?.items.map(\.workspace_id)) { _, ids in
                 if let scope = workspaceScope, let ids, !ids.contains(scope) { workspaceScope = nil }
             }
             .background(VerdeTheme.background.ignoresSafeArea())
         }
+    }
+
+    private func panesFor(width: CGFloat) -> AdaptivePanes {
+        AdaptivePanes(width: width, sidebarCollapsed: sidebarCollapsed, mossOpen: companionSheet && companion.available, chatsPeek: chatsPeek)
+    }
+    private var currentPanes: AdaptivePanes { panesFor(width: windowWidth) }
+
+    /// The overlay drawer on narrow windows, the permanent sidebar on wide ones.
+    private func workspaceDrawer(permanent: Bool) -> some View {
+        WorkspaceDrawer(browse: browse, selected: path.last, tab: tab, scope: $workspaceScope, close: {
+            drawer = false
+            if permanent { if chatsPeek { chatsPeek = false } else { sidebarCollapsed = true } }
+        }, open: { route in
+            if tab == .hosts { tab = .home }
+            openRoute(route)
+            drawer = false
+        }, root: { next in tab = next; path = []; drawer = false }, settings: { drawer = false; settings = true },
+        permanent: permanent, dock: permanent && companion.available ? AnyView(companionDock) : nil)
+    }
+
+    private var companionDock: some View {
+        CompanionDock(model: companion, voice: companionVoice, live: live, open: companionSheet, toggle: {
+            // Its own pane is beside the list, so the row closes it too.
+            if companionSheet && AdaptiveTier(width: windowWidth) == .triple { companionSheet = false }
+            else { companionSheet = true; chatsPeek = false }
+        }, reveal: {
+            companionSheet = true
+            chatsPeek = false
+        }, settings: { companionSettings = true })
+    }
+
+    /// In a sheet, opening a chat closes Moss so the chat can be seen; beside the chat Moss stays.
+    private func companionScreen(docked: Bool) -> some View {
+        CompanionSheet(model: companion, browse: browse, voice: companionVoice, live: live, pill: livePill, open: { route in
+            if !docked { companionSheet = false }
+            if tab == .hosts { tab = .home }
+            drawer = false
+            openRoute(route)
+        }, showHome: {
+            if !docked { companionSheet = false }
+            drawer = false
+            tab = .home
+            path = []
+        }, onHosts: {
+            if !docked { companionSheet = false }
+            tab = .hosts
+        })
+    }
+
+    /// Replaces the content beside a permanent sidebar without a push animation; pushes otherwise.
+    private func openRoute(_ route: BrowseRoute) {
+        guard currentPanes.tier.docked else {
+            path = adaptivePath(path, opening: route, docked: false)
+            return
+        }
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) { path = adaptivePath(path, opening: route, docked: true) }
     }
 
     private var styled: some View {
@@ -197,7 +283,7 @@ struct RootView: View {
         }
         .onChange(of: inbox.pending, initial: true) { _, _ in openNotification() }
         .onChange(of: hosts.loading) { _, _ in openNotification() }
-        .onChange(of: visibleThread, initial: true) { _, key in VisibleThread.shared.set(key) }
+        .onChange(of: visibleThreads, initial: true) { _, keys in VisibleThread.shared.set(keys) }
         .onChange(of: scenePhase, initial: true) { _, phase in
             // `.inactive` (app switcher, system sheets) keeps the current state.
             lock.phase(phase)
@@ -209,13 +295,19 @@ struct RootView: View {
     /// background so the companion's tools and transcript saving keep working, as a call app's would.
     private func hostsForeground(_ front: Bool) { hosts.foreground(front || live.active) }
 
-    /// The chat on screen (`host/workspace/thread`) for foreground notification suppression.
-    private var visibleThread: String? {
-        // The Companion sheet shows the companion's own chat.
-        if companionSheet { return companion.visibleKey() }
+    /// The chats on screen (`host/workspace/thread`) for foreground notification suppression.
+    private var visibleThreads: [String] {
+        let panes = currentPanes
+        var keys: [String] = []
+        // The Companion sheet shows the companion's own chat, over the main one; its pane sits beside it.
+        if companionSheet {
+            if !panes.tier.docked || panes.mossVisible, let key = companion.visibleKey() { keys.append(key) }
+            if !panes.tier.docked { return keys }
+        }
         guard tab != .hosts, !drawer, !settings, let host = hosts.active,
-              case .thread(let workspace, let thread)? = path.last else { return nil }
-        return [host, workspace, thread].joined(separator: "/")
+              case .thread(let workspace, let thread)? = path.last else { return keys }
+        keys.append([host, workspace, thread].joined(separator: "/"))
+        return keys
     }
 
     /// The bubble stays out of the drawer and off the companion's own chat screen.
@@ -232,6 +324,15 @@ struct RootView: View {
     private func prepareLiveTarget(_ target: LiveBarTarget) -> LiveBarBase {
         if target == .fullView { livePill.expanded = true }
         drawer = false
+        if companionSheet && currentPanes.tier.docked {
+            // The pane is part of the app's main content, so everything over the app closes.
+            chatsPeek = false
+            settings = false
+            companionSettings = false
+            if hosts.pairing != nil { hosts.showPairing(nil) }
+            livePill.closeSheetChildren()
+            return .companionPane
+        }
         if companionSheet {
             livePill.closeSheetChildren()
             return .companionSheet
@@ -247,7 +348,7 @@ struct RootView: View {
         switch (target, base) {
         case (.fullView, .app): companionSheet = true
         case (.voiceSettings, .app): companionSettings = true
-        case (.voiceSettings, .companionSheet): livePill.openVoiceSettings()
+        case (.voiceSettings, .companionSheet), (.voiceSettings, .companionPane): livePill.openVoiceSettings()
         default: break
         }
     }
@@ -268,7 +369,8 @@ struct RootView: View {
         }
         settings = false
         drawer = false
-        companionSheet = false
+        // Moss beside the chat doesn't cover it, so it stays as the user left it.
+        if !currentPanes.tier.docked { companionSheet = false }
         companionSettings = false
         if tab == .hosts { tab = .home }
         if hosts.active != target.hostID {

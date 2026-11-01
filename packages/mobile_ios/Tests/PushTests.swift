@@ -98,9 +98,10 @@ final class PushContentTests: XCTestCase {
         XCTAssertNil(hostOnly?.threadID)
         XCTAssertNil(PushTarget.parse(["verde": ["host_id": "a\u{1}b", "kind": "completed"]], action: ""))
         let target = PushTarget.parse(info, action: UNNotificationDefaultActionIdentifier)
-        XCTAssertEqual(presentationOptions(for: target, visible: "alpha/ws/th"), [])
-        XCTAssertEqual(presentationOptions(for: target, visible: "alpha/ws/other"), [.banner, .list, .sound])
-        XCTAssertEqual(presentationOptions(for: nil, visible: nil), [.banner, .list, .sound])
+        XCTAssertEqual(presentationOptions(for: target, visible: ["alpha/ws/th"]), [])
+        XCTAssertEqual(presentationOptions(for: target, visible: ["alpha/ws/other", "alpha/ws/third"]), [.banner, .list, .sound])
+        XCTAssertEqual(presentationOptions(for: target, visible: ["alpha/ws/other", "alpha/ws/th"]), [])
+        XCTAssertEqual(presentationOptions(for: nil, visible: []), [.banner, .list, .sound])
         let categories = PushTarget.categories()
         let approval = categories.first { $0.identifier == PushCategory.approval }
         XCTAssertEqual(approval?.actions.map(\.identifier), [PushCategory.approveAction, PushCategory.denyAction])

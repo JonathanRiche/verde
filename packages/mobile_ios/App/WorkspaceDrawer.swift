@@ -66,6 +66,11 @@ struct WorkspaceDrawer: View {
     let open: (BrowseRoute) -> Void
     let root: (RootTab) -> Void
     let settings: () -> Void
+    /// A sidebar beside the content rather than a modal overlay.
+    var permanent = false
+    /// Moss's docked controls, above the footer.
+    var dock: AnyView? = nil
+    @Environment(\.verticalSizeClass) private var verticalSize
     @State private var search = ""
     @State private var switching = false
     @State private var workspaceQuery = ""
@@ -84,7 +89,9 @@ struct WorkspaceDrawer: View {
         VStack(spacing: 0) {
             HStack {
                 VerdeWordmark(); Spacer()
-                Button(action: close) { Image(systemName: "xmark").frame(width: 44, height: 44) }.accessibilityLabel("Close workspace drawer")
+                Button(action: close) { Image(systemName: permanent ? "sidebar.left" : "xmark").frame(width: 44, height: 44) }
+                    .accessibilityLabel(permanent ? "Hide sidebar" : "Close workspace drawer")
+                    .keyboardShortcut(permanent ? KeyboardShortcut("\\", modifiers: .command) : nil)
             }.padding(.horizontal, 12)
             if !all.isEmpty { switcher(all, scoped: scoped) }
             HStack(spacing: 4) {
@@ -121,12 +128,26 @@ struct WorkspaceDrawer: View {
                 }.padding(.horizontal, 8)
             }
             Divider().overlay(VerdeTheme.border)
-            HStack {
-                row("Home", icon: "house", selected: selected == nil && tab == .home) { root(.home) }
-                row("Workspaces", icon: "square.stack", selected: selected == nil && tab == .workspaces) { root(.workspaces) }
-            }.padding(.horizontal, 8)
-            row("Settings", icon: "gearshape", action: settings).padding(.horizontal, 8)
-            row(browse.state.row?.saved.label ?? "Hosts", icon: "desktopcomputer", selected: tab == .hosts) { root(.hosts) }.accessibilityIdentifier("drawer-hosts").padding(8)
+            if let dock {
+                dock
+                Divider().overlay(VerdeTheme.border)
+            }
+            if permanent && verticalSize == .compact {
+                // A short window (a phone on its side) needs its height for the list.
+                HStack(spacing: 0) {
+                    footerIcon("Home", icon: "house", selected: selected == nil && tab == .home) { root(.home) }
+                    footerIcon("Workspaces", icon: "square.stack", selected: selected == nil && tab == .workspaces) { root(.workspaces) }
+                    footerIcon("Settings", icon: "gearshape", selected: false, action: settings)
+                    footerIcon(browse.state.row?.saved.label ?? "Hosts", icon: "desktopcomputer", selected: tab == .hosts) { root(.hosts) }
+                }.padding(.horizontal, 8)
+            } else {
+                HStack {
+                    row("Home", icon: "house", selected: selected == nil && tab == .home) { root(.home) }
+                    row("Workspaces", icon: "square.stack", selected: selected == nil && tab == .workspaces) { root(.workspaces) }
+                }.padding(.horizontal, 8)
+                row("Settings", icon: "gearshape", action: settings).padding(.horizontal, 8)
+                row(browse.state.row?.saved.label ?? "Hosts", icon: "desktopcomputer", selected: tab == .hosts) { root(.hosts) }.accessibilityIdentifier("drawer-hosts").padding(8)
+            }
         }
         .background(VerdeTheme.panel).foregroundStyle(VerdeTheme.text)
         .task(id: browse.hostID) {
@@ -143,7 +164,7 @@ struct WorkspaceDrawer: View {
         .alert("Chat action", isPresented: Binding(get: { notice != nil }, set: { if !$0 { notice = nil } })) {
             Button("OK") { notice = nil }
         } message: { Text(notice ?? "") }
-        .accessibilityElement(children: .contain).accessibilityAddTraits(.isModal)
+        .accessibilityElement(children: .contain).accessibilityAddTraits(permanent ? [] : .isModal)
     }
 
     /// Full-width scope trigger plus its context-menu popover (spec "Switcher popover").
@@ -262,6 +283,12 @@ struct WorkspaceDrawer: View {
                 .font(VerdeTheme.ui(13)).padding(.horizontal, 12).frame(minHeight: 44).contentShape(Rectangle())
                 .background(selected ? VerdeTheme.accent.opacity(0.19) : Color.clear, in: RoundedRectangle(cornerRadius: 7))
         }.buttonStyle(.plain).accessibilityAddTraits(selected ? .isSelected : [])
+    }
+    private func footerIcon(_ title: String, icon: String, selected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon).frame(maxWidth: .infinity, minHeight: 44).contentShape(Rectangle())
+                .background(selected ? VerdeTheme.accent.opacity(0.19) : Color.clear, in: RoundedRectangle(cornerRadius: 7))
+        }.buttonStyle(.plain).accessibilityLabel(title).accessibilityAddTraits(selected ? .isSelected : [])
     }
     private func action(_ action: String, _ thread: ThreadSummary, title: String = "") {
         guard let manage, !manage.busy else { return }
