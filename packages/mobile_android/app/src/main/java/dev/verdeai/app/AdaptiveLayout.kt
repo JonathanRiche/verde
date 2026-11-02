@@ -7,6 +7,7 @@ import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.VerticalDivider
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
@@ -98,6 +99,8 @@ internal fun shellPanes(tier: WindowTier, collapsed: Boolean, mossOpen: Boolean,
 @Composable
 internal fun AdaptiveShellFrame(panes: ShellPanes, sidebar: @Composable () -> Unit, rail: @Composable () -> Unit,
     moss: @Composable () -> Unit, content: @Composable () -> Unit) {
+    // These panes sit outside any Surface, whose content color icons and text would otherwise inherit.
+    CompositionLocalProvider(LocalContentColor provides VerdeColors.Text) {
     Row(Modifier.fillMaxSize()) {
         when (panes.sidebar) {
             SidebarMode.Full -> {
@@ -119,6 +122,7 @@ internal fun AdaptiveShellFrame(panes: ShellPanes, sidebar: @Composable () -> Un
             PaneDivider()
             MossPane(MOSS_PANE_WIDTH, WindowInsetsSides.End, moss)
         }
+    }
     }
 }
 

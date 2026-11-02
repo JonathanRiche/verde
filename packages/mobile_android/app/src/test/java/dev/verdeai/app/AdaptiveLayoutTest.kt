@@ -295,6 +295,23 @@ class AdaptiveLayoutTest {
         assertEquals(listOf("send", "cancel"), taps)
     }
 
+    @Test fun sidePanesInheritTheThemeTextColor() {
+        var rail: androidx.compose.ui.graphics.Color? = null
+        var moss: androidx.compose.ui.graphics.Color? = null
+        var text: androidx.compose.ui.graphics.Color? = null
+        compose.setContent {
+            VerdeTheme {
+                text = VerdeColors.Text
+                AdaptiveShellFrame(ShellPanes(SidebarMode.Rail, MossPlacement.SidebarSlot), sidebar = {},
+                    rail = { rail = androidx.compose.material3.LocalContentColor.current },
+                    moss = { moss = androidx.compose.material3.LocalContentColor.current }, content = {})
+            }
+        }
+        compose.waitForIdle()
+        assertEquals(text, rail)
+        assertEquals(text, moss)
+    }
+
     @Test fun railKeepsNewChatExpandAndMoss() {
         val taps = mutableListOf<String>()
         compose.setContent {

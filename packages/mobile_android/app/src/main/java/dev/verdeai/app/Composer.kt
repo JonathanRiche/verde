@@ -264,9 +264,12 @@ internal fun ChatComposer(model: TranscriptModel, state: TranscriptState,
                     })
                 else Row(Modifier.fillMaxWidth().testTag("composer-actions"), verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(2.dp)) {
-                    if (view != null) CompactSettings(view, state, provider, attach, onPicker = { picker = it },
-                        onPhotos = onPhotos, onCamera = onCamera, onFiles = onFiles, onBrain = onBrain)
-                    Spacer(Modifier.weight(1f))
+                    // Weighted so the settings shrink in a narrow pane instead of squeezing send, measured last.
+                    Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                        if (view != null) CompactSettings(view, state, provider, attach, onPicker = { picker = it },
+                            onPhotos = onPhotos, onCamera = onCamera, onFiles = onFiles, onBrain = onBrain)
+                    }
                     inlineAction?.invoke()
                     if (running) StopControl(state.stopping, state.canStop, model::stop, Modifier.testTag(COMPOSER_STOP))
                     sendButton(canSubmit)
